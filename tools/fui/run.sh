@@ -690,9 +690,9 @@ echo "== 19c. BESCHREIBEN IST KUERZER ALS MALEN, IN ZAHLEN =="
 #
 #   painted     demos/fuidemo/main.fi, fn toolbar_painted.
 #   described   tools/fui/gallery9_main.fi, between the marks
-#               ">>> WERKZEUGLEISTE" and "<<< WERKZEUGLEISTE" (the tree)
-#               AND between ">>> LEISTENREGELN" and "<<<
-#               LEISTENREGELN" (its look in the style sheet).
+#               ">>> TOOLBAR" and "<<< TOOLBAR" (the tree)
+#               AND between ">>> BAR RULES" and "<<<
+#               BAR RULES" (its look in the style sheet).
 #
 # WHAT IS NEW IN THIS TAILORING, AND WHY. Until 21.09.2026 there stood
 # on the painted side still the two helpers `setze` and
@@ -739,9 +739,9 @@ ohne_aussehen() {
 }
 awk '/^fn toolbar_painted\(/{p=1} p{print} p&&/^}$/{exit}' \
     demos/fuidemo/main.fi > "$W/gemalt.txt"
-sed -n '/>>> WERKZEUGLEISTE/,/<<< WERKZEUGLEISTE/p' \
+sed -n '/>>> TOOLBAR/,/<<< TOOLBAR/p' \
     tools/fui/gallery9_main.fi > "$W/beschrieben.txt"
-sed -n '/>>> LEISTENREGELN/,/<<< LEISTENREGELN/p' \
+sed -n '/>>> BAR RULES/,/<<< BAR RULES/p' \
     tools/fui/gallery9_main.fi >> "$W/beschrieben.txt"
 ohne_text < "$W/gemalt.txt" > "$W/gemalt_a.txt"
 ohne_text < "$W/beschrieben.txt" > "$W/beschrieben_a.txt"
@@ -758,7 +758,7 @@ echo "  A (ohne Texte): gemalt $gemalt_a, beschrieben $beschrieben_a"
 echo "  B (ohne Texte und Aussehen): gemalt $gemalt_b, beschrieben $beschrieben_b"
 if [ "$gemalt" -lt 40 ] || [ "$beschrieben" -lt 30 ]; then
     echo "  FEHLER: eine der beiden Seiten wurde nicht gefunden."
-    echo "  Es fehlen die Marken WERKZEUGLEISTE/LEISTENREGELN in"
+    echo "  Es fehlen die Marken TOOLBAR/BAR RULES in"
     echo "  tools/fui/gallery9_main.fi oder fn toolbar_painted in"
     echo "  demos/fuidemo/main.fi."
     exit 1
@@ -822,8 +822,8 @@ echo "== 19d. DIESELBE LEISTE, DIESELBE DATEI, ZWEI FASSUNGEN =="
 # 952 AND at 260 points of width (there the clamping of the
 # search field takes effect). What is compared are the marks
 #
-#   >>> LEISTE BESCHRIEBEN ... <<< LEISTE BESCHRIEBEN   (fn werkzeugleiste)
-#   >>> LEISTE GEMALT      ... <<< LEISTE GEMALT        (fn toolbar_painted)
+#   >>> TOOLBAR DESCRIBED ... <<< TOOLBAR DESCRIBED   (fn werkzeugleiste)
+#   >>> TOOLBAR PAINTED   ... <<< TOOLBAR PAINTED     (fn toolbar_painted)
 #
 # both in demos/fuidemo/main.fi. Outside the marks lies in BOTH
 # cases only the check (handing out the rectangles, the
@@ -851,9 +851,9 @@ ohne_aussehen_d() {
         -e 'sheet\.sheet_rule' \
         -e 'sheet\.sheet_name' -e 'var n[a-z]*: \[u8;'
 }
-sed -n '/>>> LEISTE BESCHRIEBEN/,/<<< LEISTE BESCHRIEBEN/p' \
+sed -n '/>>> TOOLBAR DESCRIBED/,/<<< TOOLBAR DESCRIBED/p' \
     demos/fuidemo/main.fi > "$W/leiste_b.txt"
-sed -n '/>>> LEISTE GEMALT/,/<<< LEISTE GEMALT/p' \
+sed -n '/>>> TOOLBAR PAINTED/,/<<< TOOLBAR PAINTED/p' \
     demos/fuidemo/main.fi > "$W/leiste_g.txt"
 ohne_text < "$W/leiste_b.txt" > "$W/leiste_ba.txt"
 ohne_text < "$W/leiste_g.txt" > "$W/leiste_ga.txt"
@@ -872,7 +872,7 @@ if [ "$lb" -lt 30 ] || [ "$lg" -lt 30 ] || [ "$lbb" -lt 12 ] \
     || [ "$lgb" -lt 20 ]; then
     echo "  FEHLER: eine der beiden Fassungen wurde nicht gefunden oder"
     echo "  die Filter haben zu viel weggenommen. Es fehlen die Marken"
-    echo "  LEISTE BESCHRIEBEN / LEISTE GEMALT in demos/fuidemo/main.fi."
+    echo "  TOOLBAR DESCRIBED / TOOLBAR PAINTED in demos/fuidemo/main.fi."
     exit 1
 fi
 # RAW AND A: the description must not be LONGER. More is not
