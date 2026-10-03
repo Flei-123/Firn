@@ -86,6 +86,23 @@ impl Lower<'_> {
         out
     }
 
+    /// r200: the addresses (and types) of the payload fields of ONE variant
+    /// of an enum that own something with a `drop`, in order of declaration.
+    pub(crate) fn variant_drop_addrs(
+        &mut self,
+        base: Val,
+        v: &crate::sema_match::VariantDef,
+    ) -> Vec<(Val, crate::types::Type)> {
+        let mut out = Vec::new();
+        for (off, ty) in v.offsets.iter().zip(v.fields.iter()) {
+            if self.needs_drop(ty) {
+                let a = self.field_addr_at(base, *off);
+                out.push((a, ty.clone()));
+            }
+        }
+        out
+    }
+
     /// Address of the element with the **constant** index `index` in a field
     /// of elements of size `elem_size` starting at `base`.
     ///

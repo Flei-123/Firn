@@ -1755,14 +1755,7 @@ impl<'a> Lower<'a> {
     fn emit_enum_drop(&mut self, addr: Val, def: &crate::sema_match::EnumDef) {
         let mut tag: Option<Val> = None;
         for v in &def.variants {
-            let owned: Vec<(u64, Type)> = v
-                .offsets
-                .iter()
-                .zip(v.fields.iter())
-                .filter(|(_, t)| self.needs_drop(t))
-                .map(|(o, t)| (*o, t.clone()))
-                .collect();
-            if owned.is_empty() {
+            if !v.fields.iter().any(|t| self.needs_drop(t)) {
                 continue;
             }
             let t = match tag {
@@ -1779,8 +1772,9 @@ impl<'a> Lower<'a> {
             let next = self.new_block();
             self.set_term(Term::BrCond { cond: hit, then_bb: body, else_bb: next });
             self.cur = body;
-            for (off, ty) in owned {
-                let a = self.field_addr_at(addr, off);
+            // the addresses of ALL the payload fields that own something are
+            // computed first (layout.rs), then each one is destroyed
+            for (a, ty) in self.variant_drop_addrs(addr, v) {
                 self.emit_drop(a, &ty);
             }
             self.set_term(Term::Br(next));
