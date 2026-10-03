@@ -455,3 +455,119 @@ fn ex_expr(e: &Expr, dg: &mut Diags) {
     }
     children(e, &mut |c| ex_expr(c, dg));
 }
+
+// ---------------------------------------------------------------------------
+// r198 -- hand-over at the call: what a reference may be given to
+// ---------------------------------------------------------------------------
+
+/// Calls every function of `f` on every expression of `b` (closures included).
+fn visit_block(b: &Block, f: &mut dyn FnMut(&Expr)) {
+    for s in &b.stmts {
+        visit_stmt(s, f);
+    }
+}
+
+fn visit_stmt(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
+    match s {
+        Stmt::Let { init, .. } => visit_expr(init, f),
+        Stmt::AssignOp { target, value, .. } | Stmt::Assign { target, value, .. } => {
+            visit_expr(target, f);
+            visit_expr(value, f);
+        }
+        Stmt::Step { target, .. } => visit_expr(target, f),
+        Stmt::If { cond, then, els, .. } => {
+            visit_expr(cond, f);
+            visit_block(then, f);
+            if let Some(e) = els {
+                visit_stmt(e, f);
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            visit_expr(cond, f);
+            visit_block(body, f);
+        }
+        Stmt::Return { value, .. } => {
+            if let Some(v) = value {
+                visit_expr(v, f);
+            }
+        }
+        Stmt::For { start, end, body, .. } => {
+            visit_expr(start, f);
+            visit_expr(end, f);
+            visit_block(body, f);
+        }
+        Stmt::Defer(inner, _, _) => visit_stmt(inner, f),
+        Stmt::Expr(e) => visit_expr(e, f),
+        Stmt::Block(b) => visit_block(b, f),
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Error(_) => {}
+    }
+}
+
+fn visit_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    f(e);
+    if let ExprKind::Lambda(d) = &e.kind {
+        visit_block(&d.body, f);
+        return;
+    }
+    children(e, &mut |c| visit_expr(c, f));
+}
+
+/// The name of a bare reference parameter of the caller, also behind
+/// `&p` / `inout p`.
+fn ref_name_in<'a>(a: &'a Expr, refs: &[String]) -> Option<&'a str> {
+    match &a.kind {
+        ExprKind::Ident(n) if refs.iter().any(|r| r == n) => Some(n.as_str()),
+        ExprKind::Unary(UnOp::AddrOf | UnOp::InoutOf, inner) => ref_name_in(inner, refs),
+        _ => None,
+    }
+}
+
+/// Checks the calls of plain functions against the callee's parameter kinds
+/// (`sigs`: name, kind per parameter, reference parameter names; same file
+/// only):
+/// * an `inout T` parameter is given `inout x`, not a bare `&x`;
+/// * a reference parameter is never handed to a plain pointer parameter:
+///   there the callee could keep it.
+pub fn check_calls(funcs: &[FnDecl], sigs: &[(String, Vec<u8>, Vec<String>)], dg: &mut Diags) {
+    for func in funcs {
+        let own: &[String] = sigs
+            .iter()
+            .find(|s| s.0 == func.name)
+            .map(|s| s.2.as_slice())
+            .unwrap_or(&[]);
+        visit_block(&func.body, &mut |e| {
+            let (callee, args) = match &e.kind {
+                ExprKind::Call(n, args, _) => (n, args),
+                _ => return,
+            };
+            let sig = match sigs.iter().find(|s| &s.0 == callee) {
+                Some(s) => s,
+                None => return,
+            };
+            for (i, a) in args.iter().enumerate() {
+                let kind = match sig.1.get(i) {
+                    Some(k) => *k,
+                    None => continue,
+                };
+                if kind == 2 && matches!(a.kind, ExprKind::Unary(UnOp::AddrOf, _)) {
+                    dg.error_note(
+                        a.span,
+                        format!("argument {} of '{}' is 'inout' and must be passed as 'inout x'", i + 1, callee),
+                        "a bare '&x' would hide that the callee modifies it",
+                    );
+                } else if kind == 0 {
+                    if let Some(n) = ref_name_in(a, own) {
+                        dg.error_note(
+                            a.span,
+                            format!(
+                                "the reference parameter '{}' cannot be handed to a plain pointer parameter of '{}'",
+                                n, callee
+                            ),
+                            "the callee could keep the pointer: declare that parameter '&T' / 'inout T' there",
+                        );
+                    }
+                }
+            }
+        });
+    }
+}

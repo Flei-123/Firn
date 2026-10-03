@@ -61,6 +61,9 @@ pub(crate) struct Parser<'a> {
     /// `inout T` while it parses its list (`refparam.rs`).
     pub(crate) allow_ref_params: bool,
     pub(crate) ref_params: Vec<crate::refparam::RefParam>,
+    /// **r198** -- per plain function: name, kind of every parameter
+    /// (0 plain, 1 `&T`, 2 `inout T`) and its reference parameter names.
+    pub(crate) fn_sigs: Vec<(String, Vec<u8>, Vec<String>)>,
 }
 
 fn starts_stmt(k: &TokKind) -> bool {
@@ -1752,6 +1755,14 @@ compute it",
         let mut body = self.block("at the start of the function body");
         self.recovering = false;
         self.finish_body(&ref_params, &mut body);
+        let kinds: Vec<u8> = params
+            .iter()
+            .map(|p| match ref_params.iter().find(|r| r.name == p.name) {
+                Some(r) => if r.inout { 2 } else { 1 },
+                None => 0,
+            })
+            .collect();
+        self.fn_sigs.push((name.clone(), kinds, ref_params.iter().map(|r| r.name.clone()).collect()));
         prog.funcs.push(FnDecl { name, params, ret, body, span: start, attrs, extern_info: None });
     }
 
@@ -2146,6 +2157,7 @@ compute it",
                 self.bump();
             }
         }
+        crate::refparam::check_calls(&prog.funcs, &self.fn_sigs, self.dg);
         prog.expr_count = self.next_id;
         prog
     }
@@ -2395,6 +2407,7 @@ fn in_expr(
         interp_depth: 1,
         allow_ref_params: false,
         ref_params: Vec::new(),
+        fn_sigs: Vec::new(),
         infer_len_ok: false,
     };
     let e = p.nested_expr();
@@ -2451,6 +2464,7 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         interp_depth: 0,
         allow_ref_params: false,
         ref_params: Vec::new(),
+        fn_sigs: Vec::new(),
         infer_len_ok: false,
     };
     let prog = p.program();
