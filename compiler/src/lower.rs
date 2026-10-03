@@ -1768,13 +1768,13 @@ impl<'a> Lower<'a> {
             let t = match tag {
                 Some(t) => t,
                 None => {
-                    let t = self.load(FTy::I32, addr);
+                    let t = self.load(FTy::U32, addr);
                     tag = Some(t);
                     t
                 }
             };
-            let k = self.constant(FTy::I32, v.tag);
-            let hit = self.push(FTy::Bool, Op::Cmp { op: CmpOp::Eq, ty: FTy::I32, a: t, b: k });
+            let k = self.constant(FTy::U32, v.tag);
+            let hit = self.push(FTy::Bool, Op::Cmp { op: CmpOp::Eq, ty: FTy::U32, a: t, b: k });
             let body = self.new_block();
             let next = self.new_block();
             self.set_term(Term::BrCond { cond: hit, then_bb: body, else_bb: next });

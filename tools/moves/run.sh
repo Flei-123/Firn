@@ -92,7 +92,7 @@ refused=$pass
 # --------------------------------------------------------------- accepted
 accepted=0
 for f in tests/2004_move_ok.fi tests/2005_drop_order.fi tests/2006_drop_methods.fi \
-         tests/2007_drop_error_path.fi tests/2010_*.fi; do
+         tests/2007_drop_error_path.fi tests/2010_*.fi tests/2011_*.fi tests/2012_*.fi; do
     [ -f "$f" ] || continue
     name=$(basename "$f" .fi)
     "$FIRNC" "$f" -o "$WORK/$name.bin" > "$WORK/$name.c0" 2>&1 || { note "$name: firnc0 refused it"; continue; }

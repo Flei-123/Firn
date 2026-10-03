@@ -38,6 +38,7 @@ import ast
 import types
 import diag
 import sema
+import pattern
 
 export { moves_check }
 
@@ -54,6 +55,8 @@ const F_BEHIND_PTR: u32 = 7
 const F_THROWN_AWAY: u32 = 8
 const F_TEMP_LOOKED_INTO: u32 = 9
 const F_BAD_SHAPE: u32 = 10
+const F_IN_MATCH: u32 = 11
+const F_PAYLOAD_BIND: u32 = 12
 
 // the state of a variable: 0 = alive, else the place of the move with the top
 // bit set (a real position can be 0 when it is unknown)
@@ -67,7 +70,9 @@ struct Mv {
     v_nt: Vec[u32],
     v_state: Vec[u64],
     v_loop: Vec[u32],
+    v_cond: Vec[u32],
     loop_depth: u32,
+    cond_depth: u32,
     in_defer: u32,
     // the findings
     f_pos: Vec[u64],
@@ -81,8 +86,8 @@ fn mv_empty() -> Mv {
     return Mv {
         sm: 0, it: 0,
         v_name: vec_new[u32](), v_nt: vec_new[u32](), v_state: vec_new[u64](),
-        v_loop: vec_new[u32](),
-        loop_depth: 0, in_defer: 0,
+        v_loop: vec_new[u32](), v_cond: vec_new[u32](),
+        loop_depth: 0, cond_depth: 0, in_defer: 0,
         f_pos: vec_new[u64](), f_kind: vec_new[u32](), f_name: vec_new[u32](),
         f_at: vec_new[u64](), f_len: vec_new[u32](),
     }
@@ -93,6 +98,7 @@ fn mv_free(m: *mut Mv) {
     vec_free[u32](&(*m).v_nt)
     vec_free[u64](&(*m).v_state)
     vec_free[u32](&(*m).v_loop)
+    vec_free[u32](&(*m).v_cond)
     vec_free[u64](&(*m).f_pos)
     vec_free[u32](&(*m).f_kind)
     vec_free[u32](&(*m).f_name)
@@ -128,6 +134,7 @@ fn declare(m: *mut Mv, name: u32, nt: bool) {
     vec_push[u32](&(*m).v_nt, f)
     vec_push[u64](&(*m).v_state, 0)
     vec_push[u32](&(*m).v_loop, (*m).loop_depth)
+    vec_push[u32](&(*m).v_cond, (*m).cond_depth)
 }
 
 // The innermost variable of this name, or -1.
@@ -147,6 +154,7 @@ fn cut_scope(m: *mut Mv, n: usize) {
     vec_shorten[u32](&(*m).v_nt, n)
     vec_shorten[u64](&(*m).v_state, n)
     vec_shorten[u32](&(*m).v_loop, n)
+    vec_shorten[u32](&(*m).v_cond, n)
 }
 
 // The states of the first `n` variables, as a new vector (the caller frees).
@@ -360,6 +368,8 @@ fn consume(m: *mut Mv, e: u32) {
                 err_at(m, ast.expr_pos(b, e), F_IN_DEFER, nm, 0, name_len(m, nm))
             } else if vec_at[u32](&(*m).v_loop, i) < (*m).loop_depth {
                 err_at(m, ast.expr_pos(b, e), F_IN_LOOP, nm, 0, name_len(m, nm))
+            } else if vec_at[u32](&(*m).v_cond, i) < (*m).cond_depth {
+                err_at(m, ast.expr_pos(b, e), F_IN_MATCH, nm, 0, name_len(m, nm))
             }
             if vec_at[u32](&(*m).v_nt, i) == 1 {
                 vec_set[u64](&(*m).v_state, i, ast.expr_pos(b, e) | MOVED_BIT)
@@ -439,6 +449,74 @@ fn is_method_name(m: *mut Mv, nr: u32) -> bool {
 }
 
 // `e` is looked at, not handed over.
+// r200 (twin of the `match` arm of `moves.rs::Walk::read`): a `match` is a
+// call to a registered body. The arms are alternatives: nothing declared
+// outside may be moved inside, and a pattern may not bind a payload that has
+// a `drop` by value.
+fn match_walk(m: *mut Mv, mi: u32) {
+    let s: *mut sema.Sema = smp(m)
+    let pm: *mut pattern.Pat = sema.sema_mu(s) as *mut pattern.Pat
+    if mi as usize >= pattern.pat_match_count(pm) {
+        return
+    }
+    let subj: u32 = pattern.pat_m_subj(pm, mi)
+    read(m, subj)
+    var ei: u32 = NOTHING
+    let sty: u32 = ty_of(m, subj)
+    let t: *mut types.Types = sema.sema_types(s)
+    if types.ty_kind(t, sty) == types.K_STRUCT {
+        ei = pattern.pat_enum_at_struct(pm, types.ty_a(t, sty))
+    }
+    (*m).cond_depth = (*m).cond_depth + 1
+    let aoff: u32 = pattern.pat_m_aoff(pm, mi)
+    let alen: u32 = pattern.pat_m_alen(pm, mi)
+    var ai: u32 = 0
+    while ai < alen {
+        let pat: u32 = pattern.pat_a_pat(pm, aoff + ai)
+        let mark: usize = vec_len[u32](&(*m).v_name)
+        pattern_binds(m, pm, pat, ei, true)
+        block(m, pattern.pat_a_block(pm, aoff + ai))
+        cut_scope(m, mark)
+        ai = ai + 1
+    }
+    (*m).cond_depth = (*m).cond_depth - 1
+}
+
+// Declares the names a pattern binds (not owning anything) and, at the top
+// level of a variant pattern, refuses the by-value binding of a payload that
+// has a `drop`.
+fn pattern_binds(m: *mut Mv, pm: *mut pattern.Pat, pat: u32, ei: u32, top: bool) {
+    let k: u32 = pattern.pat_mu_kind(pm, pat)
+    if k == pattern.MU_BIND {
+        declare(m, pattern.pat_mu_a(pm, pat), false)
+        return
+    }
+    if k != pattern.MU_VARIANT {
+        return
+    }
+    var roff: u32 = NOTHING
+    if top && ei != NOTHING {
+        let vi: u32 = pattern.pat_variant_find(pm, ei, pattern.pat_mu_b(pm, pat))
+        if vi != NOTHING {
+            roff = pattern.pat_v_roff(pm, vi)
+        }
+    }
+    let soff: u32 = pattern.pat_mu_soff(pm, pat)
+    let slen: u32 = pattern.pat_mu_slen(pm, pat)
+    var j: u32 = 0
+    while j < slen {
+        let sub: u32 = pattern.pat_mu_child(pm, soff + j)
+        if roff != NOTHING && pattern.pat_mu_kind(pm, sub) == pattern.MU_BIND {
+            if sema.sema_needs_drop(smp(m), pattern.pat_rf_ty(pm, roff + j)) {
+                let nr: u32 = pattern.pat_mu_a(pm, sub)
+                err_at(m, pattern.pat_mu_pos(pm, sub), F_PAYLOAD_BIND, nr, 0, name_len(m, nr))
+            }
+        }
+        pattern_binds(m, pm, sub, NOTHING, false)
+        j = j + 1
+    }
+}
+
 fn read(m: *mut Mv, e: u32) {
     let b: *mut ast.Tree = tree(m)
     let a: u32 = ast.e_kind(b, e)
@@ -496,6 +574,11 @@ fn read(m: *mut Mv, e: u32) {
     if a == ast.E_CALL {
         let off: u32 = ast.e_b(b, e)
         let cnt: u32 = ast.e_c(b, e)
+        let cnm: u32 = ast.e_a(b, e)
+        if pattern.pat_is_matchname(names(m), cnm) {
+            match_walk(m, pattern.pat_match_number(names(m), cnm))
+            return
+        }
         if is_each_len(m, ast.e_a(b, e)) {
             // `for x in array`: the length is only looked at.
             var k0: u32 = 0
@@ -630,6 +713,7 @@ fn moves_check(sm: u64, it: u64) -> usize {
             if ast.fn_extern(b, fi) == 0 {
                 cut_scope(&m, 0)
                 m.loop_depth = 0
+                m.cond_depth = 0
                 m.in_defer = 0
                 let closure: bool = is_closure_fn(&m, fi)
                 var k: u32 = 0
@@ -772,6 +856,22 @@ fn build_msg(m: *mut Mv, out: *mut rt.Buf, k: usize) {
         rt.buf_push_bytes(out, (&t13[0]) as u64, 58)
         return
     }
+    if kind == F_IN_MATCH {
+        var t30: [u8; 1] = "'"
+        rt.buf_push_bytes(out, (&t30[0]) as u64, 1)
+        put_name(m, out, nm)
+        var t31: [u8; 31] = "' is moved inside a 'match' arm"
+        rt.buf_push_bytes(out, (&t31[0]) as u64, 31)
+        return
+    }
+    if kind == F_PAYLOAD_BIND {
+        var t32: [u8; 1] = "'"
+        rt.buf_push_bytes(out, (&t32[0]) as u64, 1)
+        put_name(m, out, nm)
+        var t33: [u8; 50] = "' would be a second owner of a value with a 'drop'"
+        rt.buf_push_bytes(out, (&t33[0]) as u64, 50)
+        return
+    }
     var t14: [u8; 11] = "'drop' of '"
     rt.buf_push_bytes(out, (&t14[0]) as u64, 11)
     put_name(m, out, nm)
@@ -831,6 +931,16 @@ fn build_note(m: *mut Mv, out: *mut rt.Buf, k: usize) {
     if kind == F_TEMP_LOOKED_INTO {
         var t26: [u8; 69] = "bind it with 'let' first (it is then dropped at the end of the block)"
         rt.buf_push_bytes(out, (&t26[0]) as u64, 69)
+        return
+    }
+    if kind == F_IN_MATCH {
+        var t34: [u8; 82] = "only one arm would move it: move it before the 'match' or create it inside the arm"
+        rt.buf_push_bytes(out, (&t34[0]) as u64, 82)
+        return
+    }
+    if kind == F_PAYLOAD_BIND {
+        var t35: [u8; 108] = "the enum still owns its payload: bind it with '_' (binding a payload that has a 'drop' is not supported yet)"
+        rt.buf_push_bytes(out, (&t35[0]) as u64, 108)
         return
     }
     var t27: [u8; 65] = "a destructor is written 'fn drop(inout self)' and returns nothing"
