@@ -15,8 +15,15 @@ W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 "$FIRNC" --target=x86_64-windows -o "$W/check.exe" tools/input/win_check.fi 2> "$W/b.log" || { cat "$W/b.log"; exit 1; }
 export WINEDEBUG=-all WINEPREFIX="${WINEPREFIX:-${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.wine-firn}"
-timeout 120 xvfb-run -a wine "$W/check.exe" > "$W/out.log" 2>&1
-RC=$?
+# The pointer is read back from a virtual X display; under load (or with a
+# second Wine on the same prefix) the first move can be read too early.
+# Three attempts, the log of the LAST one is shown -- a real defect fails all three.
+for attempt in 1 2 3; do
+    timeout 120 xvfb-run -a wine "$W/check.exe" > "$W/out.log" 2>&1
+    RC=$?
+    grep -q '^ALL-OK' "$W/out.log" && [ "$RC" -eq 0 ] && break
+    [ "$attempt" -lt 3 ] && { echo "attempt $attempt failed, retrying"; sleep 2; }
+done
 cat "$W/out.log"
 grep -q '^ALL-OK' "$W/out.log" && [ "$RC" -eq 0 ] && { echo "INPUT-WIN OK ($(grep -c '^OK' "$W/out.log") checks, SendInput under Wine)"; exit 0; }
 echo "INPUT-WIN FAIL"

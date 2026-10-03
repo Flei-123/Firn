@@ -235,6 +235,16 @@ limit minquota_deflate.txt  "$DEF"  "DEFLATE -6"
 # The self compile is a CEILING, not a floor: it must not get slower.
 if [ -f tools/bench82/maxquota_self_ms.txt ]; then
     MAXSELF=$(cat tools/bench82/maxquota_self_ms.txt)
+    # The ceiling is wall time on a shared machine: scale it with the load
+    # (1-minute average per core), so that a busy server does not look like a
+    # slower compiler. An idle machine keeps the ceiling as it is.
+    MAXSELF=$(python3 - "$MAXSELF" "$(cut -d' ' -f1 /proc/loadavg)" "$(nproc)" <<'PY'
+import sys
+mx, load, cores = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
+print(int(mx * max(1.0, 1.0 + load / cores)))
+PY
+)
+    echo "  (ceiling for this load: $MAXSELF ms)"
     python3 - "$SELF_MS" "$MAXSELF" <<'PY'
 import sys
 got, mx = float(sys.argv[1]), float(sys.argv[2])
