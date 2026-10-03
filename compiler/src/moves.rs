@@ -491,6 +491,37 @@ impl<'a> Walk<'a> {
     }
 
     /// `e` is looked at, not handed over.
+    /// r200: a pattern may not bind a payload that has a `drop` by value --
+    /// the binding would be a second owner of the value the enum still owns.
+    fn check_payload_binds(&mut self, def: &crate::sema_match::EnumDef, pat: &crate::sema_match::Pattern) {
+        use crate::sema_match::Pattern;
+        match pat {
+            Pattern::Variant { vname, subs, .. } => {
+                let v = match def.variants.iter().find(|v| &v.name == vname) {
+                    Some(v) => v,
+                    None => return,
+                };
+                for (j, sub) in subs.iter().enumerate() {
+                    if let (Pattern::Bind(n, sp), Some(t)) = (sub, v.fields.get(j)) {
+                        if self.nontrivial(t) {
+                            self.err(
+                                *sp,
+                                format!("'{}' would be a second owner of a value with a 'drop'", n),
+                                "the enum still owns its payload: bind it with '_' (binding a payload that has a 'drop' is not supported yet)",
+                            );
+                        }
+                    }
+                }
+            }
+            Pattern::Or(alts, _) => {
+                for a in alts {
+                    self.check_payload_binds(def, a);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn read(&mut self, e: &Expr) {
         match &e.kind {
             ExprKind::Ident(n) => {
@@ -538,8 +569,15 @@ impl<'a> Walk<'a> {
                     .and_then(crate::sema_match::match_info)
                     .unwrap();
                 self.read(&info.subject);
+                let def = match self.ty(&info.subject) {
+                    Some(Type::Struct(i)) => crate::sema_match::enum_by_struct(*i),
+                    _ => None,
+                };
                 self.cond_depth += 1;
                 for arm in &info.arms {
+                    if let Some(def) = &def {
+                        self.check_payload_binds(def, &arm.pat);
+                    }
                     let mark = self.vars.len();
                     let mut names = Vec::new();
                     pattern_names(&arm.pat, &mut names);
