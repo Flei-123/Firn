@@ -231,7 +231,7 @@ pub(crate) fn put_match(idx: usize, m: MatchInfo) {
     })
 }
 
-fn match_index_of(name: &str) -> Option<usize> {
+pub(crate) fn match_index_of(name: &str) -> Option<usize> {
     name.strip_prefix(MATCH_PREFIX).and_then(|s| s.parse::<usize>().ok())
 }
 

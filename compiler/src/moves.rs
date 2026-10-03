@@ -90,6 +90,7 @@ pub(crate) fn hook_check(ck: &mut Checker, prog: &Program) {
             drops: &drops,
             vars: Vec::new(),
             loop_depth: 0,
+            cond_depth: 0,
             in_defer: 0,
             errors: &mut errors,
             moved: &mut moved,
@@ -160,6 +161,8 @@ struct Var {
     state: St,
     /// Loop nesting where it was declared.
     loop_depth: u32,
+    /// `match` nesting where it was declared (r197).
+    cond_depth: u32,
 }
 
 struct Walk<'a> {
@@ -169,6 +172,7 @@ struct Walk<'a> {
     drops: &'a HashSet<usize>,
     vars: Vec<Var>,
     loop_depth: u32,
+    cond_depth: u32,
     in_defer: u32,
     errors: &'a mut Vec<(Span, String, String)>,
     /// Out: identifier expressions that move a variable.
@@ -184,6 +188,7 @@ impl<'a> Walk<'a> {
             nt,
             state: St::Live,
             loop_depth: self.loop_depth,
+            cond_depth: self.cond_depth,
         });
     }
 
@@ -404,6 +409,13 @@ impl<'a> Walk<'a> {
                             "it would be used again in the next round; move it before the loop \
                              or create it inside",
                         );
+                    } else if self.vars[i].cond_depth < self.cond_depth {
+                        self.err(
+                            e.span,
+                            format!("'{}' is moved inside a 'match' arm", n),
+                            "only one arm would move it: move it before the 'match' or create it \
+                             inside the arm",
+                        );
                     }
                     if self.vars[i].nt {
                         self.vars[i].state = St::Moved(e.span);
@@ -515,6 +527,30 @@ impl<'a> Walk<'a> {
                 let sb = self.states(n);
                 self.merge(e.span, n, &before, false, &sa, false, &sb);
             }
+            ExprKind::Call(name, _, _)
+                if crate::sema_match::match_index_of(name)
+                    .and_then(crate::sema_match::match_info)
+                    .is_some() =>
+            {
+                // r197: a `match` is a call to a registered body. The arms are
+                // alternatives: nothing declared outside may be moved inside.
+                let info = crate::sema_match::match_index_of(name)
+                    .and_then(crate::sema_match::match_info)
+                    .unwrap();
+                self.read(&info.subject);
+                self.cond_depth += 1;
+                for arm in &info.arms {
+                    let mark = self.vars.len();
+                    let mut names = Vec::new();
+                    pattern_names(&arm.pat, &mut names);
+                    for n in &names {
+                        self.declare(n, false);
+                    }
+                    self.block(&arm.body);
+                    self.vars.drain(mark..);
+                }
+                self.cond_depth -= 1;
+            }
             ExprKind::Call(name, args, _) if name == crate::foreach::LEN => {
                 // `for x in array`: the length is only looked at.
                 for a in args {
@@ -563,6 +599,7 @@ impl<'a> Walk<'a> {
                     drops: self.drops,
                     vars: Vec::new(),
                     loop_depth: 0,
+                    cond_depth: 0,
                     in_defer: 0,
                     errors: &mut *self.errors,
                     moved: &mut *self.moved,
@@ -578,5 +615,24 @@ impl<'a> Walk<'a> {
             | ExprKind::Int(_)
             | ExprKind::Bool(_) => {}
         }
+    }
+}
+
+/// The names a pattern binds (r197).
+fn pattern_names(p: &crate::sema_match::Pattern, out: &mut Vec<String>) {
+    use crate::sema_match::Pattern;
+    match p {
+        Pattern::Bind(n, _) => out.push(n.clone()),
+        Pattern::Variant { subs, .. } => {
+            for s in subs {
+                pattern_names(s, out);
+            }
+        }
+        Pattern::Or(alts, _) => {
+            for a in alts {
+                pattern_names(a, out);
+            }
+        }
+        _ => {}
     }
 }
