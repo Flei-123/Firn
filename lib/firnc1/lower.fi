@@ -76,6 +76,13 @@ struct Lower {
     d_stmt: Vec[u32] // deferred statements, in order of declaration
     d_err: Vec[u32] // 1 = `errdefer`
     d_limit: Vec[u32] // bounds per block level
+    // ROUND OWN-3 (moves.fi): the destruction of a local that owns a value
+    // with a `drop` is an entry of the same stack: `d_err` = 2, and `d_stmt`
+    // holds an index into `dr_slot` / `dr_ty`. `ms` is the set of slots whose
+    // value has been moved away at the point of the code being produced.
+    dr_slot: Vec[u32]
+    dr_ty: Vec[u32]
+    ms: Vec[u32]
     sret: u32
     mu: u64 // registry of enumerations/pattern matches (0 = none)
     feh: u64 // registry of error sets/unions (0 = none)
@@ -103,6 +110,7 @@ fn low_new(b: u64, it: u64, sm: u64) -> Lower {
         b_limit: vec_new[u32](),
         l_break: vec_new[u32](), l_cont: vec_new[u32](), l_depth: vec_new[u32](),
         d_stmt: vec_new[u32](), d_err: vec_new[u32](), d_limit: vec_new[u32](),
+        dr_slot: vec_new[u32](), dr_ty: vec_new[u32](), ms: vec_new[u32](),
         sret: NONE, mu: 0, feh: 0, gcr: 0, ifr: 0, err: 0, unsuitable: false,
         pin_node: NONE, pin_addr: 0,
         checked: true, msg: rt.buf_new(),
@@ -125,6 +133,9 @@ fn low_free(l: *mut Lower) {
     vec_free[u32](&(*l).d_stmt)
     vec_free[u32](&(*l).d_err)
     vec_free[u32](&(*l).d_limit)
+    vec_free[u32](&(*l).dr_slot)
+    vec_free[u32](&(*l).dr_ty)
+    vec_free[u32](&(*l).ms)
     rt.buf_free(&(*l).msg)
 }
 
@@ -457,6 +468,8 @@ fn defer_level_off(l: *mut Lower) {
         // `errdefer` does NOT run when the block is left normally.
         if vec_at[u32](&(*l).d_err, i) == 0 {
             stmt(l, vec_at[u32](&(*l).d_stmt, i))
+        } else if vec_at[u32](&(*l).d_err, i) == 2 {
+            run_drop(l, vec_at[u32](&(*l).d_stmt, i))
         }
     }
     while vec_len[u32](&(*l).d_stmt) > g as usize {
@@ -480,7 +493,9 @@ fn defer_to_mf(l: *mut Lower, depth: u32, with_error: bool) {
             i = i - 1
             // `errdefer` runs ONLY on the error path (SPEC 5.1) --
             // `lower_defers_to(depth, with_error)` in stage 0.
-            if vec_at[u32](&(*l).d_err, i) == 0 || with_error {
+            if vec_at[u32](&(*l).d_err, i) == 2 {
+                run_drop(l, vec_at[u32](&(*l).d_stmt, i))
+            } else if vec_at[u32](&(*l).d_err, i) == 0 || with_error {
                 stmt(l, vec_at[u32](&(*l).d_stmt, i))
             }
         }
@@ -496,6 +511,207 @@ fn defer_to(l: *mut Lower, depth: u32) {
 // well (`ret_term_error`, round 36).
 fn defer_to_error(l: *mut Lower) {
     defer_to_mf(l, 0, true)
+}
+
+// ------------------------------- ROUND OWN-3: destruction of owned values
+//
+// Twin of `compiler/src/lower.rs` (`Deferred::Drop`, `emit_drop`,
+// `run_drop`, `apply_moves`, `moved_slots`).
+
+fn ms_has(l: *mut Lower, slot: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*l).ms) {
+        if vec_at[u32](&(*l).ms, i) == slot {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn ms_add(l: *mut Lower, slot: u32) {
+    if !ms_has(l, slot) {
+        vec_push[u32](&(*l).ms, slot)
+    }
+}
+
+fn ms_remove(l: *mut Lower, slot: u32) {
+    var i: usize = 0
+    while i < vec_len[u32](&(*l).ms) {
+        if vec_at[u32](&(*l).ms, i) == slot {
+            vec_remove[u32](&(*l).ms, i)
+            return
+        }
+        i = i + 1
+    }
+}
+
+// The local at `slot` owns a value of type `t` with a `drop`: it dies with
+// the block it is declared in.
+fn drop_push(l: *mut Lower, slot: u32, t: u32) {
+    vec_push[u32](&(*l).d_stmt, vec_len[u32](&(*l).dr_slot) as u32)
+    vec_push[u32](&(*l).d_err, 2)
+    vec_push[u32](&(*l).dr_slot, slot)
+    vec_push[u32](&(*l).dr_ty, t)
+}
+
+// A cleanup entry fires: drop, unless the value was moved away.
+fn run_drop(l: *mut Lower, idx: u32) {
+    let slot: u32 = vec_at[u32](&(*l).dr_slot, idx as usize)
+    if !ms_has(l, slot) {
+        emit_drop(l, slot, vec_at[u32](&(*l).dr_ty, idx as usize))
+    }
+}
+
+// Calls `drop` of the value at `addr`: the `drop` of the struct itself
+// first, then the fields in order of declaration (an array: its elements in
+// order).
+fn emit_drop(l: *mut Lower, addr: u32, t: u32) {
+    let k: u32 = types.ty_kind(tf(l), t)
+    if k == types.K_STRUCT {
+        let si: usize = types.ty_a(tf(l), t) as usize
+        if sema.sema_mv_drop(sm(l), si) {
+            var tmp: Vec[u32] = vec_new[u32]()
+            vec_push[u32](&tmp, addr)
+            let aoff: u32 = args_store(l, &tmp)
+            vec_free[u32](&tmp)
+            push_void(l, fir.O_CALL, fir.T_VOID, sema.sema_drop_name(sm(l), si), 0, 0, 0, aoff, 1)
+        }
+        // The addresses of ALL the fields that own something are computed
+        // first (`layout.rs::drop_field_addrs`), then each one is destroyed.
+        var fa: Vec[u32] = vec_new[u32]()
+        var ft_list: Vec[u32] = vec_new[u32]()
+        var f: u32 = 0
+        while f < types.st_flen(tf(l), si) {
+            let fnr: u32 = types.st_foff(tf(l), si) + f
+            let ft: u32 = types.sf_ty(tf(l), fnr)
+            if sema.sema_needs_drop(sm(l), ft) {
+                vec_push[u32](&fa, ptradd_const(l, addr, types.sf_offset(tf(l), fnr)))
+                vec_push[u32](&ft_list, ft)
+            }
+            f = f + 1
+        }
+        var fk: usize = 0
+        while fk < vec_len[u32](&fa) {
+            emit_drop(l, vec_at[u32](&fa, fk), vec_at[u32](&ft_list, fk))
+            fk = fk + 1
+        }
+        vec_free[u32](&fa)
+        vec_free[u32](&ft_list)
+        return
+    }
+    if k == types.K_ARR {
+        let n: u64 = types.ty_n(tf(l), t)
+        if n > 4096 {
+            // an array of more than 4096 values with a `drop` cannot be
+            // destroyed in stage 0
+            (*l).err = (*l).err + 1
+            return
+        }
+        let inner: u32 = types.ty_a(tf(l), t)
+        let esz: u64 = types.size_of(tf(l), inner)
+        var q: u64 = 0
+        while q < n {
+            let a3: u32 = ptradd_const(l, addr, q * esz)
+            emit_drop(l, a3, inner)
+            q = q + 1
+        }
+    }
+}
+
+// The moves of an expression: every identifier the move checker marked.
+fn collect_moved(l: *mut Lower, e: u32) {
+    let b: *mut ast.Tree = tree(l)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_ID {
+        if sema.sema_moved(sm(l), e) {
+            let slot: u32 = search(l, ast.e_a(b, e))
+            if slot != NONE {
+                ms_add(l, slot)
+            }
+        }
+        return
+    }
+    if a == ast.E_FIELD {
+        collect_moved(l, ast.e_a(b, e))
+        return
+    }
+    if a == ast.E_IDX {
+        collect_moved(l, ast.e_a(b, e))
+        collect_moved(l, ast.e_b(b, e))
+        return
+    }
+    if a == ast.E_IFEX {
+        collect_moved(l, ast.e_a(b, e))
+        collect_moved(l, ast.e_b(b, e))
+        collect_moved(l, ast.e_c(b, e))
+        return
+    }
+    if a == ast.E_TEXT || a == ast.E_AS {
+        collect_moved(l, ast.e_a(b, e))
+        return
+    }
+    if a == ast.E_CALL || a == ast.E_SYSCALL || a == ast.E_ALIT {
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            collect_moved(l, ast.child_at(b, ast.e_b(b, e) + k))
+            k = k + 1
+        }
+        return
+    }
+    if a == ast.E_UN {
+        collect_moved(l, ast.e_b(b, e))
+        return
+    }
+    if a == ast.E_BIN {
+        collect_moved(l, ast.e_b(b, e))
+        collect_moved(l, ast.e_c(b, e))
+        return
+    }
+    if a == ast.E_AWDH {
+        collect_moved(l, ast.e_a(b, e))
+        collect_moved(l, ast.e_b(b, e))
+        return
+    }
+    if a == ast.E_SLIT {
+        var q: u32 = 0
+        while q < ast.e_c(b, e) {
+            collect_moved(l, ast.child_at(b, ast.e_b(b, e) + q * 2 + 1))
+            q = q + 1
+        }
+    }
+}
+
+// Records the moves of the statement `i` (its own expressions, not the
+// nested statements) before it is lowered.
+fn apply_moves(l: *mut Lower, i: u32) {
+    if !sema.sema_moved_any(sm(l)) {
+        return
+    }
+    let b: *mut ast.Tree = tree(l)
+    let a: u32 = ast.s_kind(b, i)
+    if a == ast.S_LET || a == ast.S_VAR {
+        collect_moved(l, ast.s_c(b, i))
+        return
+    }
+    if a == ast.S_ZUW || a == ast.S_ZUWOP {
+        collect_moved(l, ast.s_b(b, i))
+        return
+    }
+    if a == ast.S_IF || a == ast.S_WHILE || a == ast.S_EXPR {
+        collect_moved(l, ast.s_a(b, i))
+        return
+    }
+    if a == ast.S_FOR {
+        collect_moved(l, ast.s_b(b, i))
+        collect_moved(l, ast.s_c(b, i))
+        return
+    }
+    if a == ast.S_RET {
+        if ast.s_a(b, i) != ast.NOTHING {
+            collect_moved(l, ast.s_a(b, i))
+        }
+    }
 }
 
 // Is there an active `errdefer` in this function? (`has_errdefer`)
@@ -2515,6 +2731,7 @@ fn stmt(l: *mut Lower, i: u32) {
     }
     let b: *mut ast.Tree = tree(l)
     let a: u32 = ast.s_kind(b, i)
+    apply_moves(l, i)
 
     if a == ast.S_LET || a == ast.S_VAR {
         let init: u32 = ast.s_c(b, i)
@@ -2547,6 +2764,34 @@ fn stmt(l: *mut Lower, i: u32) {
         let slot: u32 = alloca(l, q_size(l, t), q_align(l, t))
         write_after(l, slot, init)
         create_ty(l, ast.s_a(b, i), slot, t)
+        // ROUND OWN-3: the new local owns a value with a `drop`.
+        if sema.sema_needs_drop(sm(l), t) {
+            drop_push(l, slot, t)
+        }
+        return
+    }
+    if a == ast.S_ZUW && sema.sema_needs_drop(sm(l), sema.sema_ty(sm(l), ast.s_a(b, i))) {
+        // ROUND OWN-3: overwriting an owner destroys the old value (unless
+        // it was moved away). The new value is computed first -- it may
+        // read the old one.
+        let target: u32 = ast.s_a(b, i)
+        let t: u32 = sema.sema_ty(sm(l), target)
+        let sz: u64 = q_size(l, t)
+        let tmp: u32 = alloca(l, sz, q_align(l, t))
+        write_after(l, tmp, ast.s_b(b, i))
+        let addr: u32 = address(l, target)
+        var whole: bool = false
+        if ast.e_kind(b, target) == ast.E_ID {
+            whole = true
+        }
+        let already: bool = whole && ms_has(l, addr)
+        if !already {
+            emit_drop(l, addr, t)
+        }
+        copymem(l, addr, tmp, sz)
+        if whole {
+            ms_remove(l, addr)
+        }
         return
     }
     if a == ast.S_ZUW {
@@ -2766,10 +3011,23 @@ fn stmt(l: *mut Lower, i: u32) {
         let els: u32 = new_block(l)
         let join: u32 = new_block(l)
         term(l, fir.TERM_BRCOND, c, then, els)
+        // ROUND OWN-3: which values are moved away AFTER the `if` is what
+        // the branches that do not leave agree on (moves.fi checks they do).
+        let track: bool = sema.sema_moved_any(sm(l))
+        var before: Vec[u32] = vec_new[u32]()
+        var after_then: Vec[u32] = vec_new[u32]()
+        if track {
+            vec_copy[u32](&(*l).ms, &before)
+        }
         (*l).cur = then
         block(l, ast.s_b(b, i))
         if !terminated(l) {
             term(l, fir.TERM_BR, join, 0, 0)
+        }
+        if track {
+            vec_copy[u32](&(*l).ms, &after_then)
+            vec_clear[u32](&(*l).ms)
+            vec_append[u32](&(*l).ms, &before)
         }
         (*l).cur = els
         if ast.s_c(b, i) != ast.NOTHING {
@@ -2778,6 +3036,26 @@ fn stmt(l: *mut Lower, i: u32) {
         if !terminated(l) {
             term(l, fir.TERM_BR, join, 0, 0)
         }
+        if track {
+            let leaves: u32 = sema.sema_leave(sm(l), ast.s_a(b, i))
+            if leaves == 3 {
+                vec_clear[u32](&(*l).ms)
+                vec_append[u32](&(*l).ms, &before)
+            } else if leaves == 1 {
+                // the `then` branch leaves: what the `else` branch left stays
+            } else if leaves == 2 {
+                vec_clear[u32](&(*l).ms)
+                vec_append[u32](&(*l).ms, &after_then)
+            } else {
+                var q: usize = 0
+                while q < vec_len[u32](&after_then) {
+                    ms_add(l, vec_at[u32](&after_then, q))
+                    q = q + 1
+                }
+            }
+        }
+        vec_free[u32](&before)
+        vec_free[u32](&after_then)
         (*l).cur = join
         return
     }
@@ -3705,12 +3983,16 @@ fn low_run(l: *mut Lower) {
             next = 1
         }
         range_on(l)
+        // ROUND OWN-3: the parameters that own a value with a `drop`.
+        var pdr_slot: Vec[u32] = vec_new[u32]()
+        var pdr_ty: Vec[u32] = vec_new[u32]()
         // Parameters get a slot and are stored in the entry block.
         k = 0
         while k < ast.fn_plen(b, i) {
             let pt: u32 = types.param_ty_resolved(tf(l), i, k)
             let ak: u32 = vec_at[u32](&kind, k as usize)
             let pname: u32 = ast.param_name(b, ast.fn_poff(b, i) + k)
+            let owns: bool = sema.sema_needs_drop(sm(l), pt)
             if ak == NONE - 1 {
                 let pf: u32 = vec_at[u32](&(*l).f.p_ty, (poff + next) as usize)
                 var by: u64 = fir.fty_bytes(pf)
@@ -3722,7 +4004,15 @@ fn low_run(l: *mut Lower) {
             } else if ak == NONE {
                 // The caller has already made a copy; its address
                 // IS the parameter slot.
-                create(l, pname, fir.param_value(&(*l).f, (*l).fi, next))
+                let pv: u32 = fir.param_value(&(*l).f, (*l).fi, next)
+                if owns {
+                    // ROUND OWN-3: the callee owns it and destroys it.
+                    create_ty(l, pname, pv, pt)
+                    vec_push[u32](&pdr_slot, pv)
+                    vec_push[u32](&pdr_ty, pt)
+                } else {
+                    create(l, pname, pv)
+                }
                 next = next + 1
             } else {
                 // The slot is padded to whole words, so that the
@@ -3743,7 +4033,13 @@ fn low_run(l: *mut Lower) {
                     w = w + 1
                 }
                 next = next + ak
-                create(l, pname, slot)
+                if owns {
+                    create_ty(l, pname, slot, pt)
+                    vec_push[u32](&pdr_slot, slot)
+                    vec_push[u32](&pdr_ty, pt)
+                } else {
+                    create(l, pname, slot)
+                }
             }
             k = k + 1
         }
@@ -3769,8 +4065,33 @@ fn low_run(l: *mut Lower) {
                 ck2 = ck2 + 1
             }
         }
+        let has_pdr: bool = vec_len[u32](&pdr_slot) > 0
+        if has_pdr {
+            defer_level_on(l)
+            var pk: usize = 0
+            while pk < vec_len[u32](&pdr_slot) {
+                drop_push(l, vec_at[u32](&pdr_slot, pk), vec_at[u32](&pdr_ty, pk))
+                pk = pk + 1
+            }
+        }
+        vec_free[u32](&pdr_slot)
+        vec_free[u32](&pdr_ty)
         block(l, ast.fn_body(b, i))
+        if has_pdr {
+            if !terminated(l) {
+                // falling off the end: the parameters die here
+                defer_level_off(l)
+            } else {
+                // the level is only left, nothing runs (everything that
+                // left earlier has run its drops already)
+                let lim: u32 = vec_last[u32](&(*l).d_limit)
+                vec_pop[u32](&(*l).d_limit)
+                vec_shorten[u32](&(*l).d_stmt, lim as usize)
+                vec_shorten[u32](&(*l).d_err, lim as usize)
+            }
+        }
         range_off(l)
+        vec_clear[u32](&(*l).ms)
         if (*l).unsuitable {
             return
         }

@@ -39,6 +39,7 @@ import iface
 import core
 import nogc
 import escape
+import moves
 
 export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty, sema_widen32,
     sema_types, sema_ty_count, sema_needs_comptime, sema_const_value,
@@ -54,7 +55,12 @@ export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty, sema_widen32,
     sema_static_index, sema_static_count, sema_static_name, sema_static_mut,
     sema_static_align, sema_static_bytes, sema_static_size,
     // Round GAPS (statics.rs::intern_text) -- the octets of a `str` literal.
-    sema_text_static }
+    sema_text_static,
+    // ROUND OWN-3 (moves.fi, twin of compiler/src/moves.rs) -- `drop` and moves.
+    sema_mv_reset, sema_mv_drop_set, sema_mv_drop, sema_has_drops,
+    sema_mv_moved_set, sema_moved, sema_moved_any,
+    sema_leave_set, sema_leave, sema_needs_drop, sema_drop_name,
+    sema_fn_index, sema_recv_by_address }
 
 const NONE: u32 = 4294967295
 
@@ -129,6 +135,11 @@ struct Sema {
     // ROUND 70: the arguments of an interpolation that may be widened
     // (`f"{x}"` with an i32 into `io.fmt_number(... i64)`).
     widen: Vec[u32],
+    // ROUND OWN-3 (moves.fi): per struct 1 = it has a `drop`; per expression
+    // 1 = this identifier MOVES a variable; per `if` condition bit 0 = the
+    // `then` branch leaves, bit 1 = the `else` branch leaves.
+    mv_drop: Vec[u8], mv_moved: Vec[u8], mv_leave: Vec[u8],
+    mv_ndrop: u32, mv_nmoved: u32,
 }
 
 fn sema_new(b: u64, it: u64) -> Sema {
@@ -154,11 +165,16 @@ fn sema_new(b: u64, it: u64) -> Sema {
         cg_name: vec_new[u32](), cg_ty: vec_new[u32](), cg_frame: vec_new[u32](),
         scratch2: rt.buf_new(),
         widen: vec_new[u32](),
+        mv_drop: vec_new[u8](), mv_moved: vec_new[u8](), mv_leave: vec_new[u8](),
+        mv_ndrop: 0, mv_nmoved: 0,
     }
 }
 
 fn sema_free(s: *mut Sema) {
     vec_free[u32](&(*s).widen)
+    vec_free[u8](&(*s).mv_drop)
+    vec_free[u8](&(*s).mv_moved)
+    vec_free[u8](&(*s).mv_leave)
     types.types_free(&(*s).ty)
     vec_free[u32](&(*s).etyp)
     vec_free[u8](&(*s).w32)
@@ -447,6 +463,155 @@ fn sema_widen32(s: *mut Sema, i: u32) -> bool {
         return false
     }
     return vec_at[u8](&(*s).w32, i as usize) == 1 as u8
+}
+
+// ------------------------------------------- ROUND OWN-3: drop and moves
+//
+// What `moves.fi` finds, kept here so that `lower.fi` can read it. Twin of
+// the `drops` / `moved` / `if_leaves` of `compiler/src/sema.rs::TypeInfo`.
+
+// Sizes the three tables (all zero) for `nst` structs and `nex` expressions.
+fn sema_mv_reset(s: *mut Sema, nst: usize, nex: usize) {
+    vec_clear[u8](&(*s).mv_drop)
+    vec_clear[u8](&(*s).mv_moved)
+    vec_clear[u8](&(*s).mv_leave)
+    var i: usize = 0
+    while i < nst {
+        vec_push[u8](&(*s).mv_drop, 0 as u8)
+        i = i + 1
+    }
+    i = 0
+    while i < nex {
+        vec_push[u8](&(*s).mv_moved, 0 as u8)
+        vec_push[u8](&(*s).mv_leave, 0 as u8)
+        i = i + 1
+    }
+    (*s).mv_ndrop = 0
+    (*s).mv_nmoved = 0
+}
+
+fn sema_mv_drop_set(s: *mut Sema, si: usize) {
+    if si < vec_len[u8](&(*s).mv_drop) {
+        vec_set[u8](&(*s).mv_drop, si, 1 as u8)
+        (*s).mv_ndrop = (*s).mv_ndrop + 1
+    }
+}
+
+fn sema_mv_drop(s: *mut Sema, si: usize) -> bool {
+    if si >= vec_len[u8](&(*s).mv_drop) {
+        return false
+    }
+    return vec_at[u8](&(*s).mv_drop, si) == 1 as u8
+}
+
+fn sema_has_drops(s: *mut Sema) -> bool { return (*s).mv_ndrop > 0 }
+
+fn sema_mv_moved_set(s: *mut Sema, e: u32) {
+    if (e as usize) < vec_len[u8](&(*s).mv_moved) {
+        if vec_at[u8](&(*s).mv_moved, e as usize) == 0 as u8 {
+            (*s).mv_nmoved = (*s).mv_nmoved + 1
+        }
+        vec_set[u8](&(*s).mv_moved, e as usize, 1 as u8)
+    }
+}
+
+fn sema_moved(s: *mut Sema, e: u32) -> bool {
+    if (e as usize) >= vec_len[u8](&(*s).mv_moved) {
+        return false
+    }
+    return vec_at[u8](&(*s).mv_moved, e as usize) == 1 as u8
+}
+
+fn sema_moved_any(s: *mut Sema) -> bool { return (*s).mv_nmoved > 0 }
+
+fn sema_leave_set(s: *mut Sema, e: u32, bits: u32) {
+    if (e as usize) < vec_len[u8](&(*s).mv_leave) {
+        vec_set[u8](&(*s).mv_leave, e as usize, bits as u8)
+    }
+}
+
+fn sema_leave(s: *mut Sema, e: u32) -> u32 {
+    if (e as usize) >= vec_len[u8](&(*s).mv_leave) {
+        return 0
+    }
+    return vec_at[u8](&(*s).mv_leave, e as usize) as u32
+}
+
+// Does destroying a value of this type run code? A struct with a `drop`, or
+// a struct / array that contains one (`moves::nontrivial_in`).
+fn needs_drop_d(s: *mut Sema, t: u32, depth: u32) -> bool {
+    if depth > 32 {
+        return false
+    }
+    let k: u32 = types.ty_kind(table(s), t)
+    if k == types.K_STRUCT {
+        let si: usize = types.ty_a(table(s), t) as usize
+        if sema_mv_drop(s, si) {
+            return true
+        }
+        var f: u32 = 0
+        while f < types.st_flen(table(s), si) {
+            if needs_drop_d(s, types.sf_ty(table(s), types.st_foff(table(s), si) + f), depth + 1) {
+                return true
+            }
+            f = f + 1
+        }
+        return false
+    }
+    if k == types.K_ARR {
+        return needs_drop_d(s, types.ty_a(table(s), t), depth + 1)
+    }
+    return false
+}
+
+fn sema_needs_drop(s: *mut Sema, t: u32) -> bool {
+    if (*s).mv_ndrop == 0 {
+        return false
+    }
+    return needs_drop_d(s, t, 0)
+}
+
+// The interned name `Struct__drop` of the destructor of struct `si`.
+fn sema_drop_name(s: *mut Sema, si: usize) -> u32 {
+    var dn: [u8; 4] = "drop"
+    let m: u32 = intern.intern_number(names(s), (&dn[0]) as u64, 4) as u32
+    return method_func(s, types.st_name(table(s), si), m)
+}
+
+// Index of the function with this name in the tree, or NONE.
+fn sema_fn_index(s: *mut Sema, name: u32) -> u32 { return fn_search(s, name) }
+
+// Is the receiver of the method call `e` passed BY ADDRESS (the method wants
+// a pointer and the receiver is a value)? `impls::target_of(..).1`.
+fn sema_recv_by_address(s: *mut Sema, e: u32) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    if ast.e_c(b, e) < 1 {
+        return false
+    }
+    let m: u32 = intern.intern_ab(names(s), ast.e_a(b, e), 7)
+    let recv: u32 = ast.child_at(b, ast.e_b(b, e))
+    let et: u32 = sema_ty(s, recv)
+    if is_error(s, et) {
+        return false
+    }
+    let sn: u32 = recv_struct(s, et)
+    if sn == NONE {
+        return false
+    }
+    if has_if(s) {
+        if iface.if_of_dyn(ifp(s), sn) != NONE {
+            return false
+        }
+    }
+    let f: u32 = method_target(s, sn, m, et)
+    if f == NONE {
+        return false
+    }
+    if ast.fn_plen(b, f as usize) == 0 {
+        return false
+    }
+    let p0: u32 = types.param_ty_resolved(table(s), f as usize, 0)
+    return types.is_ptr(table(s), p0) && !types.is_ptr(table(s), et)
 }
 
 fn tree(s: *mut Sema) -> *mut ast.Tree { return (*s).b as *mut ast.Tree }
@@ -4790,5 +4955,14 @@ fn sema_run(s: *mut Sema) {
     while ek < ef {
         complain(s)
         ek = ek + 1
+    }
+    // 8. ROUND OWN-3: the move checker for values with a `drop` (moves.fi,
+    //    twin of compiler/src/moves.rs). Silent unless the program declares
+    //    a `drop`; it also tells the lowering which names are moved.
+    let mf: usize = moves.moves_check(s as u64, (*s).it)
+    var mk: usize = 0
+    while mk < mf {
+        complain(s)
+        mk = mk + 1
     }
 }

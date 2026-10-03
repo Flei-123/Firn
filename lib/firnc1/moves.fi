@@ -1,0 +1,932 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/firnc1/moves.fi -- THE MOVE CHECKER, WRITTEN IN FIRN (ROUND OWN-3).
+//
+// Twin of `compiler/src/moves.rs` (rounds OWN-1/OWN-2, SPEC 3.3, ROADMAP r18,
+// ported by r192). Both have to reject the same programs with the same
+// words and have to hand the lowering the same facts; everything in here
+// follows the Rust file function by function -- the same order of the walk,
+// the same order of the checks, the same texts.
+//
+// A type is NON-TRIVIAL when destroying a value of it runs code: a struct
+// with `fn drop(inout self)`, or a struct / array that contains one (that
+// question is `sema.sema_needs_drop`). Every other type is trivial and is
+// simply copied -- this pass never looks at it. A program without a single
+// `drop` is not touched at all.
+//
+// A non-trivial value has ONE owner. These uses MOVE it: `let y = x`,
+// `y = x`, `return x`, a call argument (also a receiver taken by value), a
+// field or element of a literal. After a move the name is dead -- reading
+// it, taking `&x` / `inout x` or moving it again is an error. A new value
+// (`x = fresh()`) revives it. The rules are deliberately conservative:
+// a conditional move, a move inside a loop of something declared outside
+// it, a partial move and a move inside `defer` are errors.
+//
+// WHAT IT HANDS ON (all in `sema`): the struct indices that have a `drop`,
+// the identifier expressions that move a variable, and per `if` which
+// branches leave through return/break/continue. With them the lowering
+// knows at every exit which locals still own a value.
+//
+// THE MARKER. The tree keeps where a node STARTS, not where it ends, so the
+// marker under the source line is one character wide here, except for an
+// identifier (its length is known) and for `if`/`fn`. `tools/moves/run.sh`
+// compares everything else octet for octet.
+
+import rt
+import vec
+import intern
+import ast
+import types
+import diag
+import sema
+
+export { moves_check }
+
+const NOTHING: u32 = 4294967295
+
+// the kinds of finding
+const F_USE_MOVED: u32 = 1
+const F_ONE_BRANCH: u32 = 2
+const F_IN_DEFER: u32 = 3
+const F_IN_LOOP: u32 = 4
+const F_FIELD: u32 = 5
+const F_ARRAY_ITEM: u32 = 6
+const F_BEHIND_PTR: u32 = 7
+const F_THROWN_AWAY: u32 = 8
+const F_TEMP_LOOKED_INTO: u32 = 9
+const F_BAD_SHAPE: u32 = 10
+
+// the state of a variable: 0 = alive, else the place of the move with the top
+// bit set (a real position can be 0 when it is unknown)
+const MOVED_BIT: u64 = 9223372036854775808
+
+struct Mv {
+    sm: u64,
+    it: u64,
+    // the variables in scope
+    v_name: Vec[u32],
+    v_nt: Vec[u32],
+    v_state: Vec[u64],
+    v_loop: Vec[u32],
+    loop_depth: u32,
+    in_defer: u32,
+    // the findings
+    f_pos: Vec[u64],
+    f_kind: Vec[u32],
+    f_name: Vec[u32],
+    f_at: Vec[u64],
+    f_len: Vec[u32],
+}
+
+fn mv_empty() -> Mv {
+    return Mv {
+        sm: 0, it: 0,
+        v_name: vec_new[u32](), v_nt: vec_new[u32](), v_state: vec_new[u64](),
+        v_loop: vec_new[u32](),
+        loop_depth: 0, in_defer: 0,
+        f_pos: vec_new[u64](), f_kind: vec_new[u32](), f_name: vec_new[u32](),
+        f_at: vec_new[u64](), f_len: vec_new[u32](),
+    }
+}
+
+fn mv_free(m: *mut Mv) {
+    vec_free[u32](&(*m).v_name)
+    vec_free[u32](&(*m).v_nt)
+    vec_free[u64](&(*m).v_state)
+    vec_free[u32](&(*m).v_loop)
+    vec_free[u64](&(*m).f_pos)
+    vec_free[u32](&(*m).f_kind)
+    vec_free[u32](&(*m).f_name)
+    vec_free[u64](&(*m).f_at)
+    vec_free[u32](&(*m).f_len)
+}
+
+fn smp(m: *mut Mv) -> *mut sema.Sema { return (*m).sm as *mut sema.Sema }
+fn tree(m: *mut Mv) -> *mut ast.Tree { return sema.sema_tree(smp(m)) }
+fn names(m: *mut Mv) -> *mut intern.Interner { return (*m).it as *mut intern.Interner }
+
+// ----------------------------------------------------------------- findings
+
+fn err_at(m: *mut Mv, pos: u64, kind: u32, name: u32, at: u64, len: u32) {
+    vec_push[u64](&(*m).f_pos, pos)
+    vec_push[u32](&(*m).f_kind, kind)
+    vec_push[u32](&(*m).f_name, name)
+    vec_push[u64](&(*m).f_at, at)
+    vec_push[u32](&(*m).f_len, len)
+}
+
+// An identifier is marked over its whole name, like the Rust span does.
+fn name_len(m: *mut Mv, nr: u32) -> u32 {
+    return intern.intern_length(names(m), nr) as u32
+}
+
+// ---------------------------------------------------------------- variables
+
+fn declare(m: *mut Mv, name: u32, nt: bool) {
+    vec_push[u32](&(*m).v_name, name)
+    var f: u32 = 0
+    if nt { f = 1 }
+    vec_push[u32](&(*m).v_nt, f)
+    vec_push[u64](&(*m).v_state, 0)
+    vec_push[u32](&(*m).v_loop, (*m).loop_depth)
+}
+
+// The innermost variable of this name, or -1.
+fn lookup(m: *mut Mv, name: u32) -> i64 {
+    var i: usize = vec_len[u32](&(*m).v_name)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](&(*m).v_name, i) == name {
+            return i as i64
+        }
+    }
+    return 0 - 1
+}
+
+fn cut_scope(m: *mut Mv, n: usize) {
+    vec_shorten[u32](&(*m).v_name, n)
+    vec_shorten[u32](&(*m).v_nt, n)
+    vec_shorten[u64](&(*m).v_state, n)
+    vec_shorten[u32](&(*m).v_loop, n)
+}
+
+// The states of the first `n` variables, as a new vector (the caller frees).
+fn states(m: *mut Mv, n: usize) -> Vec[u64] {
+    var out: Vec[u64] = vec_new[u64]()
+    var i: usize = 0
+    while i < n && i < vec_len[u64](&(*m).v_state) {
+        vec_push[u64](&out, vec_at[u64](&(*m).v_state, i))
+        i = i + 1
+    }
+    return out
+}
+
+fn set_states(m: *mut Mv, s: *mut Vec[u64]) {
+    var i: usize = 0
+    while i < vec_len[u64](s) && i < vec_len[u64](&(*m).v_state) {
+        vec_set[u64](&(*m).v_state, i, vec_at[u64](s, i))
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------ type questions
+
+fn ty_of(m: *mut Mv, e: u32) -> u32 {
+    return sema.sema_ty(smp(m), e)
+}
+
+fn is_nt(m: *mut Mv, e: u32) -> bool {
+    if (e as usize) >= sema.sema_ty_count(smp(m)) {
+        return false
+    }
+    return sema.sema_needs_drop(smp(m), ty_of(m, e))
+}
+
+// ------------------------------------------------------------- statements
+
+// Returns true when the block surely leaves (return/break/continue).
+fn block(m: *mut Mv, bi: u32) -> bool {
+    let b: *mut ast.Tree = tree(m)
+    let mark: usize = vec_len[u32](&(*m).v_name)
+    var leaves: bool = false
+    var k: u32 = 0
+    while k < ast.b_len(b, bi) {
+        if stmt(m, ast.slist_at(b, ast.b_off(b, bi) + k)) {
+            leaves = true
+        }
+        k = k + 1
+    }
+    cut_scope(m, mark)
+    return leaves
+}
+
+fn stmt(m: *mut Mv, i: u32) -> bool {
+    let b: *mut ast.Tree = tree(m)
+    let a: u32 = ast.s_kind(b, i)
+    if a == ast.S_LET || a == ast.S_VAR {
+        let init: u32 = ast.s_c(b, i)
+        consume(m, init)
+        declare(m, ast.s_a(b, i), is_nt(m, init))
+        return false
+    }
+    if a == ast.S_ZUW {
+        let target: u32 = ast.s_a(b, i)
+        consume(m, ast.s_b(b, i))
+        if ast.e_kind(b, target) == ast.E_ID {
+            let vi: i64 = lookup(m, ast.e_a(b, target))
+            if vi >= 0 {
+                // a new value revives the name
+                vec_set[u64](&(*m).v_state, vi as usize, 0)
+                return false
+            }
+        }
+        read(m, target)
+        return false
+    }
+    if a == ast.S_ZUWOP {
+        read(m, ast.s_b(b, i))
+        read(m, ast.s_a(b, i))
+        return false
+    }
+    if a == ast.S_STEP {
+        read(m, ast.s_a(b, i))
+        return false
+    }
+    if a == ast.S_IF {
+        read(m, ast.s_a(b, i))
+        let n: usize = vec_len[u32](&(*m).v_name)
+        var before: Vec[u64] = states(m, n)
+        let then_leaves: bool = block(m, ast.s_b(b, i))
+        var after_then: Vec[u64] = states(m, n)
+        set_states(m, &before)
+        var else_leaves: bool = false
+        if ast.s_c(b, i) != ast.NOTHING {
+            else_leaves = stmt(m, ast.s_c(b, i))
+        }
+        var bits: u32 = 0
+        if then_leaves { bits = bits | 1 }
+        if else_leaves { bits = bits | 2 }
+        sema.sema_leave_set(smp(m), ast.s_a(b, i), bits)
+        var after_else: Vec[u64] = states(m, n)
+        merge(m, ast.stmt_pos(b, i), 2, n, &before, then_leaves, &after_then, else_leaves, &after_else)
+        vec_free[u64](&before)
+        vec_free[u64](&after_then)
+        vec_free[u64](&after_else)
+        return then_leaves && else_leaves
+    }
+    if a == ast.S_WHILE {
+        (*m).loop_depth = (*m).loop_depth + 1
+        read(m, ast.s_a(b, i))
+        block(m, ast.s_b(b, i))
+        (*m).loop_depth = (*m).loop_depth - 1
+        return false
+    }
+    if a == ast.S_FOR {
+        read(m, ast.s_b(b, i))
+        read(m, ast.s_c(b, i))
+        (*m).loop_depth = (*m).loop_depth + 1
+        let mark: usize = vec_len[u32](&(*m).v_name)
+        declare(m, ast.s_a(b, i), false)
+        block(m, ast.s_d(b, i))
+        cut_scope(m, mark)
+        (*m).loop_depth = (*m).loop_depth - 1
+        return false
+    }
+    if a == ast.S_RET {
+        if ast.s_a(b, i) != ast.NOTHING {
+            consume(m, ast.s_a(b, i))
+        }
+        return true
+    }
+    if a == ast.S_BREAK || a == ast.S_CONT {
+        return true
+    }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        (*m).in_defer = (*m).in_defer + 1
+        stmt(m, ast.s_a(b, i))
+        (*m).in_defer = (*m).in_defer - 1
+        return false
+    }
+    if a == ast.S_EXPR {
+        let e: u32 = ast.s_a(b, i)
+        if ast.e_kind(b, e) == ast.E_CALL && is_nt(m, e) {
+            err_at(m, ast.expr_pos(b, e), F_THROWN_AWAY, 0, 0, 1)
+        }
+        consume(m, e)
+        return false
+    }
+    if a == ast.S_BLOCK {
+        return block(m, ast.s_a(b, i))
+    }
+    return false
+}
+
+// The state after an `if`: what the branches that do not leave agree on.
+// `len` is the width of the marker (2 for the keyword `if`, 1 for an
+// `if` expression).
+fn merge(m: *mut Mv, pos: u64, len: u32, n: usize, before: *mut Vec[u64], then_leaves: bool,
+    a: *mut Vec[u64], else_leaves: bool, c: *mut Vec[u64]) {
+    if then_leaves && else_leaves {
+        set_states(m, before)
+        return
+    }
+    if then_leaves {
+        set_states(m, c)
+        return
+    }
+    if else_leaves {
+        set_states(m, a)
+        return
+    }
+    var out: Vec[u64] = vec_new[u64]()
+    var i: usize = 0
+    while i < n {
+        let x: u64 = vec_at[u64](a, i)
+        let y: u64 = vec_at[u64](c, i)
+        if x == 0 && y == 0 {
+            vec_push[u64](&out, 0)
+        } else if x != 0 && y != 0 {
+            vec_push[u64](&out, x)
+        } else {
+            var s: u64 = x
+            if x == 0 { s = y }
+            if vec_at[u32](&(*m).v_nt, i) == 1 {
+                err_at(m, pos, F_ONE_BRANCH, vec_at[u32](&(*m).v_name, i), 0, len)
+            }
+            vec_push[u64](&out, s)
+        }
+        i = i + 1
+    }
+    set_states(m, &out)
+    vec_free[u64](&out)
+}
+
+// ------------------------------------------------------------ expressions
+
+// The value of `e` is handed over: a non-trivial place is MOVED.
+fn consume(m: *mut Mv, e: u32) {
+    let b: *mut ast.Tree = tree(m)
+    if !is_nt(m, e) {
+        read(m, e)
+        return
+    }
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_ID {
+        let nm: u32 = ast.e_a(b, e)
+        let vi: i64 = lookup(m, nm)
+        if vi >= 0 {
+            let i: usize = vi as usize
+            use_var(m, i, ast.expr_pos(b, e), nm)
+            if (*m).in_defer > 0 {
+                err_at(m, ast.expr_pos(b, e), F_IN_DEFER, nm, 0, name_len(m, nm))
+            } else if vec_at[u32](&(*m).v_loop, i) < (*m).loop_depth {
+                err_at(m, ast.expr_pos(b, e), F_IN_LOOP, nm, 0, name_len(m, nm))
+            }
+            if vec_at[u32](&(*m).v_nt, i) == 1 {
+                vec_set[u64](&(*m).v_state, i, ast.expr_pos(b, e) | MOVED_BIT)
+                sema.sema_mv_moved_set(smp(m), e)
+            }
+        }
+        return
+    }
+    if a == ast.E_FIELD {
+        err_at(m, ast.expr_pos(b, e), F_FIELD, 0, 0, 1)
+        read(m, ast.e_a(b, e))
+        return
+    }
+    if a == ast.E_IDX {
+        err_at(m, ast.expr_pos(b, e), F_ARRAY_ITEM, 0, 0, 1)
+        read(m, ast.e_a(b, e))
+        read(m, ast.e_b(b, e))
+        return
+    }
+    if a == ast.E_UN && ast.e_a(b, e) == 3 {
+        err_at(m, ast.expr_pos(b, e), F_BEHIND_PTR, 0, 0, 1)
+        read(m, ast.e_b(b, e))
+        return
+    }
+    if a == ast.E_IFEX {
+        read(m, ast.e_a(b, e))
+        let n: usize = vec_len[u32](&(*m).v_name)
+        var before: Vec[u64] = states(m, n)
+        consume(m, ast.e_b(b, e))
+        var sa: Vec[u64] = states(m, n)
+        set_states(m, &before)
+        consume(m, ast.e_c(b, e))
+        var sb: Vec[u64] = states(m, n)
+        merge(m, ast.expr_pos(b, e), 1, n, &before, false, &sa, false, &sb)
+        vec_free[u64](&before)
+        vec_free[u64](&sa)
+        vec_free[u64](&sb)
+        return
+    }
+    read(m, e)
+}
+
+fn use_var(m: *mut Mv, i: usize, pos: u64, nm: u32) {
+    let st: u64 = vec_at[u64](&(*m).v_state, i)
+    if st != 0 {
+        err_at(m, pos, F_USE_MOVED, nm, st & (MOVED_BIT - 1), name_len(m, nm))
+    }
+}
+
+// A temporary that owns a value with a `drop` is only ever handed over:
+// looking into it (`mk().f`, `mk().m()` with a borrowing receiver) would
+// leave nobody to destroy it.
+fn temp_check(m: *mut Mv, e: u32) {
+    let b: *mut ast.Tree = tree(m)
+    let a: u32 = ast.e_kind(b, e)
+    var temp: bool = true
+    if a == ast.E_ID || a == ast.E_FIELD || a == ast.E_IDX {
+        temp = false
+    }
+    if a == ast.E_UN && ast.e_a(b, e) == 3 {
+        temp = false
+    }
+    if temp && is_nt(m, e) {
+        err_at(m, ast.expr_pos(b, e), F_TEMP_LOOKED_INTO, 0, 0, 1)
+    }
+}
+
+// Is `nr` the name `__each_len` -- the length behind `for x in array`?
+fn is_each_len(m: *mut Mv, nr: u32) -> bool {
+    var w: [u8; 10] = "__each_len"
+    return intern.intern_equal(names(m), nr, (&w[0]) as u64, 10)
+}
+
+fn is_method_name(m: *mut Mv, nr: u32) -> bool {
+    var w: [u8; 7] = "method "
+    return intern.intern_prefix(names(m), nr, (&w[0]) as u64, 7)
+}
+
+// `e` is looked at, not handed over.
+fn read(m: *mut Mv, e: u32) {
+    let b: *mut ast.Tree = tree(m)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_ID {
+        let vi: i64 = lookup(m, ast.e_a(b, e))
+        if vi >= 0 {
+            use_var(m, vi as usize, ast.expr_pos(b, e), ast.e_a(b, e))
+        }
+        return
+    }
+    if a == ast.E_FIELD {
+        temp_check(m, ast.e_a(b, e))
+        read(m, ast.e_a(b, e))
+        return
+    }
+    if a == ast.E_IDX {
+        temp_check(m, ast.e_a(b, e))
+        read(m, ast.e_a(b, e))
+        read(m, ast.e_b(b, e))
+        return
+    }
+    if a == ast.E_UN {
+        read(m, ast.e_b(b, e))
+        return
+    }
+    if a == ast.E_AS || a == ast.E_TEXT {
+        read(m, ast.e_a(b, e))
+        return
+    }
+    if a == ast.E_BIN {
+        read(m, ast.e_b(b, e))
+        read(m, ast.e_c(b, e))
+        return
+    }
+    if a == ast.E_AWDH {
+        consume(m, ast.e_a(b, e))
+        read(m, ast.e_b(b, e))
+        return
+    }
+    if a == ast.E_IFEX {
+        read(m, ast.e_a(b, e))
+        let n: usize = vec_len[u32](&(*m).v_name)
+        var before: Vec[u64] = states(m, n)
+        read(m, ast.e_b(b, e))
+        var sa: Vec[u64] = states(m, n)
+        set_states(m, &before)
+        read(m, ast.e_c(b, e))
+        var sb: Vec[u64] = states(m, n)
+        merge(m, ast.expr_pos(b, e), 1, n, &before, false, &sa, false, &sb)
+        vec_free[u64](&before)
+        vec_free[u64](&sa)
+        vec_free[u64](&sb)
+        return
+    }
+    if a == ast.E_CALL {
+        let off: u32 = ast.e_b(b, e)
+        let cnt: u32 = ast.e_c(b, e)
+        if is_each_len(m, ast.e_a(b, e)) {
+            // `for x in array`: the length is only looked at.
+            var k0: u32 = 0
+            while k0 < cnt {
+                read(m, ast.child_at(b, off + k0))
+                k0 = k0 + 1
+            }
+            return
+        }
+        var by_address: bool = false
+        if is_method_name(m, ast.e_a(b, e)) {
+            by_address = sema.sema_recv_by_address(smp(m), e)
+        }
+        var k: u32 = 0
+        while k < cnt {
+            let arg: u32 = ast.child_at(b, off + k)
+            if k == 0 && by_address {
+                temp_check(m, arg)
+                read(m, arg)
+            } else {
+                consume(m, arg)
+            }
+            k = k + 1
+        }
+        return
+    }
+    if a == ast.E_SYSCALL || a == ast.E_ALIT {
+        var j: u32 = 0
+        while j < ast.e_c(b, e) {
+            consume(m, ast.child_at(b, ast.e_b(b, e) + j))
+            j = j + 1
+        }
+        return
+    }
+    if a == ast.E_SLIT {
+        var q: u32 = 0
+        while q < ast.e_c(b, e) {
+            consume(m, ast.child_at(b, ast.e_b(b, e) + q * 2 + 1))
+            q = q + 1
+        }
+        return
+    }
+    // E_LAMBDA: a closure body is a function of its own in this tree and is
+    // walked as one. Literals: nothing to look at.
+}
+
+// ------------------------------------------------------------------- driver
+
+fn is_closure_fn(m: *mut Mv, fi: usize) -> bool {
+    return sema.sema_is_closure_name(names(m), ast.fn_name(tree(m), fi))
+}
+
+// Does the name end in `__drop`? Then the struct of the prefix, or NOTHING.
+fn drop_owner(m: *mut Mv, nm: u32) -> u32 {
+    let it: *mut intern.Interner = names(m)
+    let n: usize = intern.intern_length(it, nm)
+    if n <= 6 {
+        return NOTHING
+    }
+    var w: [u8; 6] = "__drop"
+    if !rt.mem_eq(intern.intern_ptr(it, nm) + (n - 6) as u64, (&w[0]) as u64, 6) {
+        return NOTHING
+    }
+    let pr: i64 = intern.intern_find(it, intern.intern_ptr(it, nm), n - 6)
+    if pr < 0 {
+        return NOTHING
+    }
+    let si: i32 = types.struct_index(sema.sema_types(smp(m)), pr as u32)
+    if si < 0 {
+        return NOTHING
+    }
+    return si as u32
+}
+
+// 1. the shape of every `drop`
+fn check_shapes(m: *mut Mv) {
+    let b: *mut ast.Tree = tree(m)
+    let t: *mut types.Types = sema.sema_types(smp(m))
+    var fi: usize = 0
+    while fi < ast.fn_count(b) {
+        let si: u32 = drop_owner(m, ast.fn_name(b, fi))
+        if si != NOTHING {
+            var ok: bool = types.ty_kind(t, types.ret_ty_the_func(t, fi)) == types.K_VOID
+            if ast.fn_plen(b, fi) != 1 {
+                ok = false
+            }
+            if ok {
+                let p0: u32 = types.param_ty_resolved(t, fi, 0)
+                if types.ty_kind(t, p0) != types.K_PTR || types.ty_n(t, p0) != 1 {
+                    ok = false
+                } else {
+                    let inner: u32 = types.ty_a(t, p0)
+                    if types.ty_kind(t, inner) != types.K_STRUCT || types.ty_a(t, inner) != si {
+                        ok = false
+                    }
+                }
+            }
+            if !ok {
+                err_at(m, ast.fn_pos(b, fi), F_BAD_SHAPE, types.st_name(t, si as usize), 0, 2)
+            }
+        }
+        fi = fi + 1
+    }
+}
+
+// Returns the number of findings (all of them are printed).
+fn moves_check(sm: u64, it: u64) -> usize {
+    var m: Mv = mv_empty()
+    m.sm = sm
+    m.it = it
+    let s: *mut sema.Sema = smp(&m)
+    let b: *mut ast.Tree = tree(&m)
+    let t: *mut types.Types = sema.sema_types(s)
+
+    // the structs that have a `drop`
+    sema.sema_mv_reset(s, types.st_count(t), sema.sema_ty_count(s))
+    var si: usize = 0
+    while si < types.st_count(t) {
+        if sema.sema_fn_index(s, sema.sema_drop_name(s, si)) != NOTHING {
+            sema.sema_mv_drop_set(s, si)
+        }
+        si = si + 1
+    }
+
+    check_shapes(&m)
+    let shapes: usize = vec_len[u64](&m.f_pos)
+
+    if sema.sema_has_drops(s) {
+        // 2. the moves
+        var fi: usize = 0
+        while fi < ast.fn_count(b) {
+            if ast.fn_extern(b, fi) == 0 {
+                cut_scope(&m, 0)
+                m.loop_depth = 0
+                m.in_defer = 0
+                let closure: bool = is_closure_fn(&m, fi)
+                var k: u32 = 0
+                while k < ast.fn_plen(b, fi) {
+                    var nt: bool = false
+                    if !closure {
+                        nt = sema.sema_needs_drop(s, types.param_ty_resolved(t, fi, k))
+                    }
+                    declare(&m, ast.param_name(b, ast.fn_poff(b, fi) + k), nt)
+                    k = k + 1
+                }
+                block(&m, ast.fn_body(b, fi))
+            }
+            fi = fi + 1
+        }
+    }
+    sort_findings(&m, shapes)
+    let n: usize = vec_len[u64](&m.f_pos)
+    if n > 0 {
+        print_findings(&m)
+    }
+    mv_free(&m)
+    return n
+}
+
+// Sort the findings from `from` on by (file, line, column) -- the packed
+// position compares as a number in exactly that order -- and throw out the
+// duplicates (same place and same message). Insertion sort: it is stable,
+// like the `sort_by_key` of the Rust twin.
+fn sort_findings(m: *mut Mv, from: usize) {
+    var i: usize = from + 1
+    while i < vec_len[u64](&(*m).f_pos) {
+        var j: usize = i
+        while j > from && vec_at[u64](&(*m).f_pos, j - 1) > vec_at[u64](&(*m).f_pos, j) {
+            swap_findings(m, j - 1, j)
+            j = j - 1
+        }
+        i = i + 1
+    }
+    i = from
+    while i + 1 < vec_len[u64](&(*m).f_pos) {
+        if same_finding(m, i, i + 1) {
+            remove_finding(m, i + 1)
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+fn same_finding(m: *mut Mv, a: usize, c: usize) -> bool {
+    if vec_at[u64](&(*m).f_pos, a) != vec_at[u64](&(*m).f_pos, c) {
+        return false
+    }
+    if vec_at[u32](&(*m).f_kind, a) != vec_at[u32](&(*m).f_kind, c) {
+        return false
+    }
+    return vec_at[u32](&(*m).f_name, a) == vec_at[u32](&(*m).f_name, c)
+}
+
+fn swap_findings(m: *mut Mv, a: usize, c: usize) {
+    vec_swap[u64](&(*m).f_pos, a, c)
+    vec_swap[u32](&(*m).f_kind, a, c)
+    vec_swap[u32](&(*m).f_name, a, c)
+    vec_swap[u64](&(*m).f_at, a, c)
+    vec_swap[u32](&(*m).f_len, a, c)
+}
+
+fn remove_finding(m: *mut Mv, i: usize) {
+    vec_remove[u64](&(*m).f_pos, i)
+    vec_remove[u32](&(*m).f_kind, i)
+    vec_remove[u32](&(*m).f_name, i)
+    vec_remove[u64](&(*m).f_at, i)
+    vec_remove[u32](&(*m).f_len, i)
+}
+
+// --------------------------------------------------------------- the texts
+
+fn put_name(m: *mut Mv, out: *mut rt.Buf, nr: u32) {
+    let it: *mut intern.Interner = names(m)
+    rt.buf_push_bytes(out, intern.intern_ptr(it, nr), intern.intern_length(it, nr))
+}
+
+fn build_msg(m: *mut Mv, out: *mut rt.Buf, k: usize) {
+    let kind: u32 = vec_at[u32](&(*m).f_kind, k)
+    let nm: u32 = vec_at[u32](&(*m).f_name, k)
+    if kind == F_USE_MOVED {
+        var t1: [u8; 20] = "use of moved value '"
+        rt.buf_push_bytes(out, (&t1[0]) as u64, 20)
+        put_name(m, out, nm)
+        var t2: [u8; 1] = "'"
+        rt.buf_push_bytes(out, (&t2[0]) as u64, 1)
+        return
+    }
+    if kind == F_ONE_BRANCH {
+        var t3: [u8; 1] = "'"
+        rt.buf_push_bytes(out, (&t3[0]) as u64, 1)
+        put_name(m, out, nm)
+        var t4: [u8; 29] = "' is moved in only one branch"
+        rt.buf_push_bytes(out, (&t4[0]) as u64, 29)
+        return
+    }
+    if kind == F_IN_DEFER {
+        var t5: [u8; 1] = "'"
+        rt.buf_push_bytes(out, (&t5[0]) as u64, 1)
+        put_name(m, out, nm)
+        var t6: [u8; 25] = "' is moved inside 'defer'"
+        rt.buf_push_bytes(out, (&t6[0]) as u64, 25)
+        return
+    }
+    if kind == F_IN_LOOP {
+        var t7: [u8; 1] = "'"
+        rt.buf_push_bytes(out, (&t7[0]) as u64, 1)
+        put_name(m, out, nm)
+        var t8: [u8; 24] = "' is moved inside a loop"
+        rt.buf_push_bytes(out, (&t8[0]) as u64, 24)
+        return
+    }
+    if kind == F_FIELD {
+        var t9: [u8; 36] = "cannot move a field out of its owner"
+        rt.buf_push_bytes(out, (&t9[0]) as u64, 36)
+        return
+    }
+    if kind == F_ARRAY_ITEM {
+        var t10: [u8; 38] = "cannot move an element out of an array"
+        rt.buf_push_bytes(out, (&t10[0]) as u64, 38)
+        return
+    }
+    if kind == F_BEHIND_PTR {
+        var t11: [u8; 42] = "cannot move out of memory behind a pointer"
+        rt.buf_push_bytes(out, (&t11[0]) as u64, 42)
+        return
+    }
+    if kind == F_THROWN_AWAY {
+        var t12: [u8; 56] = "the result of this call owns a value that is thrown away"
+        rt.buf_push_bytes(out, (&t12[0]) as u64, 56)
+        return
+    }
+    if kind == F_TEMP_LOOKED_INTO {
+        var t13: [u8; 58] = "a temporary that owns a value with a 'drop' is looked into"
+        rt.buf_push_bytes(out, (&t13[0]) as u64, 58)
+        return
+    }
+    var t14: [u8; 11] = "'drop' of '"
+    rt.buf_push_bytes(out, (&t14[0]) as u64, 11)
+    put_name(m, out, nm)
+    var t15: [u8; 21] = "' has the wrong shape"
+    rt.buf_push_bytes(out, (&t15[0]) as u64, 21)
+}
+
+fn build_note(m: *mut Mv, out: *mut rt.Buf, k: usize) {
+    let kind: u32 = vec_at[u32](&(*m).f_kind, k)
+    if kind == F_USE_MOVED {
+        let at: u64 = vec_at[u64](&(*m).f_at, k)
+        var t16: [u8; 21] = "it was moved at line "
+        rt.buf_push_bytes(out, (&t16[0]) as u64, 21)
+        rt.buf_push_dec_u64(out, ast.pos_line(at) as u64)
+        var t17: [u8; 1] = ":"
+        rt.buf_push_bytes(out, (&t17[0]) as u64, 1)
+        rt.buf_push_dec_u64(out, ast.pos_col(at) as u64)
+        var t18: [u8; 26] = " and not given a new value"
+        rt.buf_push_bytes(out, (&t18[0]) as u64, 26)
+        return
+    }
+    if kind == F_ONE_BRANCH {
+        var t19: [u8; 124] = "move it in every branch (or leave through return/break/continue in the other): a conditional move would need a run-time flag"
+        rt.buf_push_bytes(out, (&t19[0]) as u64, 124)
+        return
+    }
+    if kind == F_IN_DEFER {
+        var t20: [u8; 59] = "moving a value in a deferred statement is not supported yet"
+        rt.buf_push_bytes(out, (&t20[0]) as u64, 59)
+        return
+    }
+    if kind == F_IN_LOOP {
+        var t21: [u8; 85] = "it would be used again in the next round; move it before the loop or create it inside"
+        rt.buf_push_bytes(out, (&t21[0]) as u64, 85)
+        return
+    }
+    if kind == F_FIELD {
+        var t22: [u8; 75] = "partial moves are not supported: move the whole value or pass '&' / 'inout'"
+        rt.buf_push_bytes(out, (&t22[0]) as u64, 75)
+        return
+    }
+    if kind == F_ARRAY_ITEM {
+        var t23: [u8; 41] = "pass '&' / 'inout' of the element instead"
+        rt.buf_push_bytes(out, (&t23[0]) as u64, 41)
+        return
+    }
+    if kind == F_BEHIND_PTR {
+        var t24: [u8; 34] = "the pointer does not own the value"
+        rt.buf_push_bytes(out, (&t24[0]) as u64, 34)
+        return
+    }
+    if kind == F_THROWN_AWAY {
+        var t25: [u8; 72] = "bind it with 'let' (it is dropped at the end of the block) or pass it on"
+        rt.buf_push_bytes(out, (&t25[0]) as u64, 72)
+        return
+    }
+    if kind == F_TEMP_LOOKED_INTO {
+        var t26: [u8; 69] = "bind it with 'let' first (it is then dropped at the end of the block)"
+        rt.buf_push_bytes(out, (&t26[0]) as u64, 69)
+        return
+    }
+    var t27: [u8; 65] = "a destructor is written 'fn drop(inout self)' and returns nothing"
+    rt.buf_push_bytes(out, (&t27[0]) as u64, 65)
+}
+
+// ------------------------------------------------------------- the output
+//
+// Through `diag.fi`, like every other message of firnc1: the arrow line, the
+// source line, the marker and `= note:` are the SAME code the lexer's
+// messages go through. The source texts are gone by now (`bin/firnc1.fi`
+// lexes every module into one buffer it reuses), so the files are read again
+// here; a finding is rare and a re-read costs nothing.
+fn print_findings(m: *mut Mv) {
+    let b: *mut ast.Tree = tree(m)
+    var d: diag.Diags = diag.diag_new()
+    var src_ptr: Vec[u64] = vec_new[u64]()
+    var src_len: Vec[u64] = vec_new[u64]()
+    var src_file: Vec[u32] = vec_new[u32]()
+    var src_nr: Vec[u32] = vec_new[u32]()
+    var msg: rt.Buf = rt.buf_new()
+    var note: rt.Buf = rt.buf_new()
+    var path: rt.Buf = rt.buf_new()
+    var text: rt.Buf = rt.buf_new()
+
+    var i: usize = 0
+    while i < vec_len[u64](&(*m).f_pos) {
+        let pos: u64 = vec_at[u64](&(*m).f_pos, i)
+        let file: u32 = ast.pos_file(pos)
+        var nr: u32 = NOTHING
+        var k: usize = 0
+        while k < vec_len[u32](&src_file) {
+            if vec_at[u32](&src_file, k) == file {
+                nr = vec_at[u32](&src_nr, k)
+            }
+            k = k + 1
+        }
+        if nr == NOTHING {
+            var fp: u64 = 0
+            var name_n: usize = 0
+            if (file as usize) < ast.file_count(b) {
+                fp = ast.file_ptr(b, file)
+                name_n = ast.file_length(b, file)
+            }
+            rt.buf_clear(&path)
+            rt.buf_push_bytes(&path, fp, name_n)
+            rt.buf_push(&path, 0 as u8)
+            rt.buf_clear(&text)
+            var sp: u64 = 0
+            var sn: usize = 0
+            if rt.read_file(rt.buf_ptr(&path), &text) {
+                sn = rt.buf_len(&text)
+                sp = rt.heap_alloc(sn + 1)
+                if sp != 0 {
+                    rt.mem_copy(sp, rt.buf_ptr(&text), sn)
+                } else {
+                    sn = 0
+                }
+            }
+            nr = diag.diag_file(&d, fp, name_n, sp, sn)
+            vec_push[u64](&src_ptr, sp)
+            vec_push[u64](&src_len, sn as u64)
+            vec_push[u32](&src_file, file)
+            vec_push[u32](&src_nr, nr)
+        }
+        rt.buf_clear(&msg)
+        rt.buf_clear(&note)
+        build_msg(m, &msg, i)
+        build_note(m, &note, i)
+        diag.diag_error_note(&d, nr, ast.pos_line(pos), ast.pos_col(pos),
+            vec_at[u32](&(*m).f_len, i),
+            rt.buf_ptr(&msg), rt.buf_len(&msg),
+            rt.buf_ptr(&note), rt.buf_len(&note))
+        i = i + 1
+    }
+
+    var out: rt.Buf = rt.buf_new()
+    diag.diag_render(&d, &out)
+    rt.write_everything(2, rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+
+    i = 0
+    while i < vec_len[u64](&src_ptr) {
+        let sp2: u64 = vec_at[u64](&src_ptr, i)
+        if sp2 != 0 {
+            rt.heap_free(sp2, vec_at[u64](&src_len, i) as usize + 1)
+        }
+        i = i + 1
+    }
+    vec_free[u64](&src_ptr)
+    vec_free[u64](&src_len)
+    vec_free[u32](&src_file)
+    vec_free[u32](&src_nr)
+    rt.buf_free(&msg)
+    rt.buf_free(&note)
+    rt.buf_free(&path)
+    rt.buf_free(&text)
+    diag.diag_free(&d)
+}

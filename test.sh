@@ -1503,6 +1503,19 @@ else
     grep -E 'FAIL' "$WORK/web_dom.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 71. the move checker and drop in BOTH compilers (tools/moves/run.sh, round OWN-3, r192) =="
+# compiler/src/moves.rs against lib/firnc1/moves.fi: every refused program is
+# refused by both with the same message (the marker width aside), every
+# accepted program with a `drop` builds in both and behaves the same.
+bash tools/moves/run.sh > "$WORK/moves.log" 2>&1 && MVRC=0 || MVRC=$?
+if [ "$MVRC" -eq 0 ]; then
+    ok
+    grep -E '^  (cases|messages identical)' "$WORK/moves.log" | sed 's/^/ /'
+else
+    bad "tools/moves/run.sh failed (see .test-work/moves.log)"
+    grep -E '^FAIL' "$WORK/moves.log" | head -10 | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
