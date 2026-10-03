@@ -2616,8 +2616,8 @@ mod tests {
         let f = ast::FnDecl {
             name: "f".into(),
             params: vec![
-                ast::Param { name: "p".into(), ty: ast::TypeExpr::Named("bool".into(), Span::none()), span: Span::none() },
-                ast::Param { name: "q".into(), ty: ast::TypeExpr::Named("bool".into(), Span::none()), span: Span::none() },
+                ast::Param { name: "p".into(), ty: ast::TypeExpr::Named("bool".into(), Span::none()), span: Span::none(), refk: 0 },
+                ast::Param { name: "q".into(), ty: ast::TypeExpr::Named("bool".into(), Span::none()), span: Span::none(), refk: 0 },
             ],
             ret: None,
             body: blk(vec![
@@ -2680,6 +2680,7 @@ mod tests {
                 name: "n".into(),
                 ty: ast::TypeExpr::Named("i32".into(), Span::none()),
                 span: Span::none(),
+                refk: 0,
             }],
             ret: Some(ast::TypeExpr::Named("i32".into(), Span::none())),
             body: blk(vec![

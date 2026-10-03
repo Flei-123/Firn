@@ -337,7 +337,7 @@ fn index_touches(e: &Expr, p: &Path) -> bool {
 }
 
 /// Calls `f` on every direct sub-expression.
-fn children(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+fn children<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
     match &e.kind {
         ExprKind::Field(b, ..) => f(b),
         ExprKind::Index(b, i) => {
@@ -457,62 +457,85 @@ fn ex_expr(e: &Expr, dg: &mut Diags) {
 }
 
 // ---------------------------------------------------------------------------
-// r198 -- hand-over at the call: what a reference may be given to
+// r198/r199 -- hand-over at the call: what a reference may be given to
 // ---------------------------------------------------------------------------
+//
+// Runs as a sema hook over the WHOLE program (after imports are merged and
+// named), so it sees plain functions, functions of other modules, methods
+// (resolved through the receiver type) and the bodies of methods, generic
+// instances and closures. The parameter kinds come from `Param::refk`.
 
-/// Calls every function of `f` on every expression of `b` (closures included).
-fn visit_block(b: &Block, f: &mut dyn FnMut(&Expr)) {
+use std::collections::HashMap;
+
+use crate::sema::Checker;
+
+/// Calls `f(expr, names)` on every expression of `b` (closures included).
+/// `names` are the reference parameters in scope: those of the enclosing
+/// function plus those of the closures around the expression.
+fn visit_block(b: &Block, own: &mut Vec<String>, f: &mut dyn FnMut(&Expr, &[String])) {
     for s in &b.stmts {
-        visit_stmt(s, f);
+        visit_stmt(s, own, f);
     }
 }
 
-fn visit_stmt(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
+fn visit_stmt(s: &Stmt, own: &mut Vec<String>, f: &mut dyn FnMut(&Expr, &[String])) {
     match s {
-        Stmt::Let { init, .. } => visit_expr(init, f),
+        Stmt::Let { init, .. } => visit_expr(init, own, f),
         Stmt::AssignOp { target, value, .. } | Stmt::Assign { target, value, .. } => {
-            visit_expr(target, f);
-            visit_expr(value, f);
+            visit_expr(target, own, f);
+            visit_expr(value, own, f);
         }
-        Stmt::Step { target, .. } => visit_expr(target, f),
+        Stmt::Step { target, .. } => visit_expr(target, own, f),
         Stmt::If { cond, then, els, .. } => {
-            visit_expr(cond, f);
-            visit_block(then, f);
+            visit_expr(cond, own, f);
+            visit_block(then, own, f);
             if let Some(e) = els {
-                visit_stmt(e, f);
+                visit_stmt(e, own, f);
             }
         }
         Stmt::While { cond, body, .. } => {
-            visit_expr(cond, f);
-            visit_block(body, f);
+            visit_expr(cond, own, f);
+            visit_block(body, own, f);
         }
         Stmt::Return { value, .. } => {
             if let Some(v) = value {
-                visit_expr(v, f);
+                visit_expr(v, own, f);
             }
         }
         Stmt::For { start, end, body, .. } => {
-            visit_expr(start, f);
-            visit_expr(end, f);
-            visit_block(body, f);
+            visit_expr(start, own, f);
+            visit_expr(end, own, f);
+            visit_block(body, own, f);
         }
-        Stmt::Defer(inner, _, _) => visit_stmt(inner, f),
-        Stmt::Expr(e) => visit_expr(e, f),
-        Stmt::Block(b) => visit_block(b, f),
+        Stmt::Defer(inner, _, _) => visit_stmt(inner, own, f),
+        Stmt::Expr(e) => visit_expr(e, own, f),
+        Stmt::Block(b) => visit_block(b, own, f),
         Stmt::Break(_) | Stmt::Continue(_) | Stmt::Error(_) => {}
     }
 }
 
-fn visit_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
-    f(e);
+fn visit_expr(e: &Expr, own: &mut Vec<String>, f: &mut dyn FnMut(&Expr, &[String])) {
+    f(e, own);
     if let ExprKind::Lambda(d) = &e.kind {
-        visit_block(&d.body, f);
+        let mark = own.len();
+        for p in &d.params {
+            if p.refk != 0 {
+                own.push(p.name.clone());
+            }
+        }
+        visit_block(&d.body, own, f);
+        own.drain(mark..);
         return;
     }
-    children(e, &mut |c| visit_expr(c, f));
+    // `children` cannot hand `own` on, so collect first.
+    let mut kids: Vec<&Expr> = Vec::new();
+    children(e, &mut |c| kids.push(c));
+    for c in kids {
+        visit_expr(c, own, f);
+    }
 }
 
-/// The name of a bare reference parameter of the caller, also behind
+/// The name of a bare reference parameter in scope, also behind
 /// `&p` / `inout p`.
 fn ref_name_in<'a>(a: &'a Expr, refs: &[String]) -> Option<&'a str> {
     match &a.kind {
@@ -522,52 +545,79 @@ fn ref_name_in<'a>(a: &'a Expr, refs: &[String]) -> Option<&'a str> {
     }
 }
 
-/// Checks the calls of plain functions against the callee's parameter kinds
-/// (`sigs`: name, kind per parameter, reference parameter names; same file
-/// only):
+/// `// HOOK refcalls` in `sema::Checker::run`: checks the calls against the
+/// callee's parameter kinds:
 /// * an `inout T` parameter is given `inout x`, not a bare `&x`;
 /// * a reference parameter is never handed to a plain pointer parameter:
 ///   there the callee could keep it.
-pub fn check_calls(funcs: &[FnDecl], sigs: &[(String, Vec<u8>, Vec<String>)], dg: &mut Diags) {
-    for func in funcs {
-        let own: &[String] = sigs
-            .iter()
-            .find(|s| s.0 == func.name)
-            .map(|s| s.2.as_slice())
-            .unwrap_or(&[]);
-        visit_block(&func.body, &mut |e| {
+pub(crate) fn hook_calls(ck: &mut Checker, prog: &Program) {
+    let mut sigs: HashMap<&str, &[Param]> = HashMap::new();
+    for f in &prog.funcs {
+        sigs.entry(f.name.as_str()).or_insert(f.params.as_slice());
+    }
+    let mut errors: Vec<(Span, String, String)> = Vec::new();
+    for func in &prog.funcs {
+        let mut own: Vec<String> =
+            func.params.iter().filter(|p| p.refk != 0).map(|p| p.name.clone()).collect();
+        visit_block(&func.body, &mut own, &mut |e, refs| {
             let (callee, args) = match &e.kind {
                 ExprKind::Call(n, args, _) => (n, args),
                 _ => return,
             };
-            let sig = match sigs.iter().find(|s| &s.0 == callee) {
-                Some(s) => s,
+            // a method call: the callee is found through the receiver type
+            let (target, first): (String, usize) = match crate::impls::method_name(callee) {
+                Some(m) => {
+                    let recv = args.first().and_then(|a| ck.expr_types.get(a.id as usize));
+                    match recv.and_then(|t| crate::impls::target_of(&ck.tcx, &ck.fns, m, t)) {
+                        Some((full, _)) => (full, 1),
+                        None => return,
+                    }
+                }
+                None => (callee.clone(), 0),
+            };
+            let params = match sigs.get(target.as_str()) {
+                Some(p) => *p,
                 None => return,
             };
-            for (i, a) in args.iter().enumerate() {
-                let kind = match sig.1.get(i) {
-                    Some(k) => *k,
+            for (i, a) in args.iter().enumerate().skip(first) {
+                let kind = match params.get(i).map(|p| p.refk) {
+                    Some(k) => k,
                     None => continue,
                 };
                 if kind == 2 && matches!(a.kind, ExprKind::Unary(UnOp::AddrOf, _)) {
-                    dg.error_note(
+                    errors.push((
                         a.span,
-                        format!("argument {} of '{}' is 'inout' and must be passed as 'inout x'", i + 1, callee),
-                        "a bare '&x' would hide that the callee modifies it",
-                    );
+                        format!(
+                            "argument {} of '{}' is 'inout' and must be passed as 'inout x'",
+                            i + 1,
+                            display(&target)
+                        ),
+                        "a bare '&x' would hide that the callee modifies it".to_string(),
+                    ));
                 } else if kind == 0 {
-                    if let Some(n) = ref_name_in(a, own) {
-                        dg.error_note(
+                    if let Some(n) = ref_name_in(a, refs) {
+                        errors.push((
                             a.span,
                             format!(
                                 "the reference parameter '{}' cannot be handed to a plain pointer parameter of '{}'",
-                                n, callee
+                                n,
+                                display(&target)
                             ),
-                            "the callee could keep the pointer: declare that parameter '&T' / 'inout T' there",
-                        );
+                            "the callee could keep the pointer: declare that parameter '&T' / 'inout T' there".to_string(),
+                        ));
                     }
                 }
             }
         });
     }
+    errors.sort_by_key(|(s, _, _)| (s.file, s.line, s.col));
+    errors.dedup_by(|a, b| a.0.line == b.0.line && a.0.col == b.0.col && a.1 == b.1);
+    for (span, msg, note) in errors {
+        ck.dg.error_note(span, msg, &note);
+    }
+}
+
+/// The name as the user wrote it (module and method separators undone).
+fn display(name: &str) -> String {
+    name.replace("__", ".")
 }

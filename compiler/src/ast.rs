@@ -364,6 +364,8 @@ pub struct Param {
     pub name: String,
     pub ty: TypeExpr,
     pub span: Span,
+    /// **r199** -- 0 plain, 1 `&T`, 2 `inout T` (the type is then a pointer).
+    pub refk: u8,
 }
 
 /// An attribute `#[attr]` or `#[attr(arg)]` in front of a declaration.
