@@ -424,7 +424,7 @@ impl<'a> Parser<'a> {
             self.sync_item();
             return None;
         }
-        let params = self.params();
+        let (params, ref_params) = self.params_ref();
         self.close(TokKind::RParen, "after the parameter list");
         self.recovering = false;
         let ret = if self.eat(&TokKind::Arrow) {
@@ -448,8 +448,9 @@ impl<'a> Parser<'a> {
             self.sync_item();
             return None;
         }
-        let body = self.block("at the start of the function body");
+        let mut body = self.block("at the start of the function body");
         self.recovering = false;
+        self.finish_body(&ref_params, &mut body);
         Some(FnDecl { name, params, ret, body, span: start, attrs: Vec::new(), extern_info: None })
     }
 

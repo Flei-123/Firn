@@ -12,7 +12,7 @@
 //! Aggregates (structs, arrays) are never FIR values but always addresses
 //! only; copies run through `copymem`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, Expr, ExprKind, Program, Stmt};
 use crate::diag::{Diags, Span};
@@ -60,6 +60,45 @@ fn scalar_fty(t: &Type) -> Option<FTy> {
     })
 }
 
+/// The names of the variables that the expression `e` moves (ROUND OWN-2).
+fn collect_moved(e: &Expr, moved: &HashSet<crate::ast::ExprId>, out: &mut Vec<String>) {
+    if let ExprKind::Ident(n) = &e.kind {
+        if moved.contains(&e.id) {
+            out.push(n.clone());
+        }
+        return;
+    }
+    match &e.kind {
+        ExprKind::Field(b, ..) => collect_moved(b, moved, out),
+        ExprKind::Index(b, i) => {
+            collect_moved(b, moved, out);
+            collect_moved(i, moved, out);
+        }
+        ExprKind::IfElse(c, a, b) => {
+            collect_moved(c, moved, out);
+            collect_moved(a, moved, out);
+            collect_moved(b, moved, out);
+        }
+        ExprKind::Text(_, inner) => collect_moved(inner, moved, out),
+        ExprKind::Call(_, args, _) | ExprKind::Syscall(args) | ExprKind::ArrayLit(args) => {
+            for a in args {
+                collect_moved(a, moved, out);
+            }
+        }
+        ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => collect_moved(a, moved, out),
+        ExprKind::Binary(_, a, b) | ExprKind::ArrayRepeat(a, b) => {
+            collect_moved(a, moved, out);
+            collect_moved(b, moved, out);
+        }
+        ExprKind::StructLit(_, fields, _) => {
+            for (_, a, _) in fields {
+                collect_moved(a, moved, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn is_agg(t: &Type) -> bool {
     matches!(t, Type::Array(..) | Type::Struct(_))
 }
@@ -92,6 +131,16 @@ fn word_fty(w: abi::Word) -> FTy {
     }
 }
 
+/// One entry of the cleanup stack of a block level: a `defer` statement, or
+/// (ROUND OWN-2) the destruction of a local that owns a value with a `drop`.
+#[derive(Clone)]
+pub(crate) enum Deferred {
+    /// `defer` / `errdefer` (the `bool` is true for `errdefer`).
+    Stmt(Stmt, bool),
+    /// `drop` of the value at this address, unless it has been moved away.
+    Drop(Val, Type),
+}
+
 pub(crate) struct Local {
     pub(crate) slot: Val,
     /// Round 58: the source type of the local. `lower_call` reads it to
@@ -120,7 +169,11 @@ pub(crate) struct Lower<'a> {
     /// Deferred statements per block level, in the order of their declaration;
     /// they are executed backwards (SPEC §5.1). The `bool` is `true` for
     /// `errdefer`: the statement then runs ONLY on the error path.
-    pub(crate) defers: Vec<Vec<(Stmt, bool)>>,
+    pub(crate) defers: Vec<Vec<Deferred>>,
+    /// ROUND OWN-2: slots of locals whose value has been moved away at the
+    /// point of the code being produced. Moves are tracked statically in
+    /// source order (`moves.rs` rejects the cases that would need a flag).
+    pub(crate) moved_slots: HashSet<Val>,
     /// Hidden return pointer (`sret`), if the function yields an aggregate
     /// over 8 bytes (see `abi.rs`).
     pub(crate) sret: Option<Val>,
@@ -286,7 +339,7 @@ impl<'a> Lower<'a> {
     /// **Do not use for field accesses** — `layout.rs` exists for that
     /// (`field_addr`, `field_addr_at`, `elem_addr`, `elem_addr_const`).
     /// Direct calls are allowed for ABI word copies only and are marked with
-    /// `// ABI-Wortkopie`; `tools/schichten/run.sh` checks that.
+    /// `// ABI-Wortkopie`; `tools/layers/run.sh` checks that.
     pub(crate) fn ptradd_const(&mut self, base: Val, off: u64) -> Val {
         if off == 0 {
             return base;
@@ -917,7 +970,7 @@ impl<'a> Lower<'a> {
 
     fn lower_unary(&mut self, e: &Expr, op: ast::UnOp, inner: &Expr) -> Option<Val> {
         match op {
-            ast::UnOp::AddrOf => self.lower_addr(inner),
+            ast::UnOp::AddrOf | ast::UnOp::InoutOf => self.lower_addr(inner),
             ast::UnOp::Deref => {
                 let addr = self.lower_expr(inner)?;
                 let ft = self.fty_of(e)?;
@@ -1222,6 +1275,10 @@ impl<'a> Lower<'a> {
         }
         if crate::ct::is_ct_call(name) && !self.info.fns.contains_key(name) {
             return crate::ct::lower_ct_call(self, name, args, span);
+        }
+        // HOOK foreach (round REF4): the length of an array is a constant.
+        if name == crate::foreach::LEN && !self.info.fns.contains_key(name) {
+            return crate::foreach::lower_call(self, args, span);
         }
         // HOOK sizeof: `size_of[T]()` is a constant — at run time nothing of
         // it is left (sizeof.rs)
@@ -1575,13 +1632,16 @@ impl<'a> Lower<'a> {
         // lands in the unreachable block behind the jump and falls victim to
         // the code cleanup. So nothing runs twice.
         let list = self.defers.pop().unwrap_or_default();
-        for (d, only_error) in list.iter().rev() {
-            // `errdefer` does NOT run when leaving the ordinary way.
-            if *only_error {
-                continue;
-            }
-            if self.lower_stmt(d).is_none() {
-                r = None;
+        for entry in list.iter().rev() {
+            match entry {
+                // `errdefer` does NOT run when leaving the ordinary way.
+                Deferred::Stmt(_, true) => {}
+                Deferred::Stmt(d, false) => {
+                    if self.lower_stmt(d).is_none() {
+                        r = None;
+                    }
+                }
+                Deferred::Drop(slot, ty) => self.run_drop(*slot, ty),
             }
         }
         self.leave();
@@ -1619,12 +1679,15 @@ impl<'a> Lower<'a> {
         while i > depth {
             i -= 1;
             let list = self.defers[i].clone();
-            for (d, only_error) in list.iter().rev() {
-                if *only_error && !with_error {
-                    continue;
-                }
-                if self.lower_stmt(d).is_none() {
-                    r = None;
+            for entry in list.iter().rev() {
+                match entry {
+                    Deferred::Stmt(_, only_error) if *only_error && !with_error => {}
+                    Deferred::Stmt(d, _) => {
+                        if self.lower_stmt(d).is_none() {
+                            r = None;
+                        }
+                    }
+                    Deferred::Drop(slot, ty) => self.run_drop(*slot, ty),
                 }
             }
         }
@@ -1633,10 +1696,93 @@ impl<'a> Lower<'a> {
 
     /// Is there any active `errdefer` in this function at all?
     pub(crate) fn has_errdefer(&self) -> bool {
-        self.defers.iter().any(|l| l.iter().any(|(_, only_error)| *only_error))
+        self.defers
+            .iter()
+            .any(|l| l.iter().any(|d| matches!(d, Deferred::Stmt(_, true))))
+    }
+
+    // ---- ROUND OWN-2: destruction of values with a `drop` ---------------
+
+    /// Does destroying a value of this type run code?
+    pub(crate) fn needs_drop(&self, t: &Type) -> bool {
+        self.info.needs_drop(t)
+    }
+
+    /// Calls `drop` of the value at `addr`: the `drop` of the struct itself
+    /// first, then the fields in order of declaration (an array: its
+    /// elements in order).
+    pub(crate) fn emit_drop(&mut self, addr: Val, t: &Type) {
+        match t {
+            Type::Struct(i) => {
+                let info = self.info;
+                if info.drops.contains(i) {
+                    let s = &info.tcx.structs[*i];
+                    let prefix = s.name.strip_prefix("gc ").unwrap_or(&s.name);
+                    let name = format!("{}__drop", prefix);
+                    self.push_void(FTy::Void, Op::Call { name, args: vec![addr] });
+                }
+                for (a, ft) in self.drop_field_addrs(addr, *i) {
+                    self.emit_drop(a, &ft);
+                }
+            }
+            Type::Array(inner, n) => {
+                if *n > 4096 {
+                    self.dg.error(
+                        Span::none(),
+                        "an array of more than 4096 values with a 'drop' cannot be destroyed in stage 0",
+                    );
+                    return;
+                }
+                let esz = self.info.tcx.size_of(inner);
+                for k in 0..*n {
+                    let a = self.elem_addr_const(addr, esz, k);
+                    self.emit_drop(a, inner);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A cleanup entry fires: drop, unless the value was moved away.
+    fn run_drop(&mut self, slot: Val, t: &Type) {
+        if !self.moved_slots.contains(&slot) {
+            self.emit_drop(slot, t);
+        }
+    }
+
+    /// Records the moves of the statement `s` (its own expressions, not the
+    /// nested statements) before it is lowered.
+    fn apply_moves(&mut self, s: &Stmt) {
+        if self.info.moved.is_empty() {
+            return;
+        }
+        let mut names: Vec<String> = Vec::new();
+        {
+            let moved = &self.info.moved;
+            let mut visit = |e: &Expr| collect_moved(e, moved, &mut names);
+            match s {
+                Stmt::Let { init, .. } => visit(init),
+                Stmt::Assign { value, .. } => visit(value),
+                Stmt::AssignOp { value, .. } => visit(value),
+                Stmt::If { cond, .. } | Stmt::While { cond, .. } => visit(cond),
+                Stmt::For { start, end, .. } => {
+                    visit(start);
+                    visit(end);
+                }
+                Stmt::Return { value: Some(v), .. } => visit(v),
+                Stmt::Expr(e) => visit(e),
+                _ => {}
+            }
+        }
+        for n in names {
+            if let Some(slot) = self.lookup(&n) {
+                self.moved_slots.insert(slot);
+            }
+        }
     }
 
     fn lower_stmt(&mut self, s: &Stmt) -> Option<()> {
+        self.apply_moves(s);
         let sp = s.span();
         if !sp.is_none() {
             // ROUND 94: the stamp stays until the next statement sets it --
@@ -1663,6 +1809,35 @@ impl<'a> Lower<'a> {
                 let slot = self.alloca(size, align);
                 self.write_into(slot, init)?;
                 self.declare_ty(name, slot, t.clone());
+                // ROUND OWN-2: the new local owns a value with a `drop`.
+                if self.needs_drop(&t) {
+                    if let Some(list) = self.defers.last_mut() {
+                        list.push(Deferred::Drop(slot, t.clone()));
+                    }
+                }
+                Some(())
+            }
+            Stmt::Assign { target, value, .. } if self.needs_drop(&self.ty_of(target)) => {
+                // ROUND OWN-2: overwriting an owner destroys the old value
+                // (unless it was moved away). The new value is computed
+                // first -- it may read the old one.
+                let t = self.ty_of(target);
+                let (size, align) = self.size_align(&t);
+                let tmp = self.alloca(size, align);
+                self.write_into(tmp, value)?;
+                let addr = self.lower_addr(target)?;
+                let whole = match &target.kind {
+                    ExprKind::Ident(_) => Some(addr),
+                    _ => None,
+                };
+                let already_moved = whole.map(|a| self.moved_slots.contains(&a)).unwrap_or(false);
+                if !already_moved {
+                    self.emit_drop(addr, &t);
+                }
+                self.push_void(FTy::Void, Op::CopyMem { dst: addr, src: tmp, size });
+                if let Some(a) = whole {
+                    self.moved_slots.remove(&a);
+                }
                 Some(())
             }
             Stmt::Assign { target, value, .. } => {
@@ -1821,7 +1996,7 @@ impl<'a> Lower<'a> {
             Stmt::Defer(inner, only_error, span) => {
                 match self.defers.last_mut() {
                     Some(list) => {
-                        list.push(((**inner).clone(), *only_error));
+                        list.push(Deferred::Stmt((**inner).clone(), *only_error));
                         Some(())
                     }
                     None => self.ice(*span, "'defer' outside a block"),
@@ -1829,8 +2004,8 @@ impl<'a> Lower<'a> {
             }
             Stmt::If { cond, then, els, .. } => self.lower_if(cond, then, els.as_deref()),
             Stmt::While { cond, body, .. } => self.lower_while(cond, body),
-            Stmt::For { name, start, end, body, .. } => {
-                self.lower_for(name, start, end, body)
+            Stmt::For { name, start, end, body, inclusive, .. } => {
+                self.lower_for(name, start, end, body, *inclusive)
             }
             Stmt::Break(span) => {
                 let (target, depth) = match self.loops.last() {
@@ -1897,11 +2072,19 @@ impl<'a> Lower<'a> {
         let else_bb = self.new_block();
         let join_bb = self.new_block();
         self.set_term(Term::BrCond { cond: c, then_bb, else_bb });
+        // ROUND OWN-2: which values are moved away AFTER the `if` is what the
+        // branches that do not leave agree on (`moves.rs` checks they agree).
+        let track = !self.info.moved.is_empty();
+        let before = if track { self.moved_slots.clone() } else { HashSet::new() };
 
         self.cur = then_bb;
         self.lower_block(then)?;
         if !self.terminated() {
             self.set_term(Term::Br(join_bb));
+        }
+        let after_then = if track { self.moved_slots.clone() } else { HashSet::new() };
+        if track {
+            self.moved_slots = before.clone();
         }
 
         self.cur = else_bb;
@@ -1910,6 +2093,20 @@ impl<'a> Lower<'a> {
         }
         if !self.terminated() {
             self.set_term(Term::Br(join_bb));
+        }
+        if track {
+            let (then_leaves, else_leaves) =
+                self.info.if_leaves.get(&cond.id).copied().unwrap_or((false, false));
+            let after_else = self.moved_slots.clone();
+            self.moved_slots = if then_leaves && else_leaves {
+                before
+            } else if then_leaves {
+                after_else
+            } else if else_leaves {
+                after_then
+            } else {
+                after_then.union(&after_else).copied().collect()
+            };
         }
 
         self.cur = join_bb;
@@ -1947,6 +2144,7 @@ impl<'a> Lower<'a> {
         start: &Expr,
         end: &Expr,
         body: &ast::Block,
+        inclusive: bool,
     ) -> Option<()> {
         let ty = self.ty_of(start);
         let ft = match scalar_fty(&ty) {
@@ -1971,7 +2169,9 @@ impl<'a> Lower<'a> {
         self.cur = head_bb;
         let iv = self.load(ft, islot);
         let lim = self.load(ft, eslot);
-        let c = self.push(FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: ft, a: iv, b: lim });
+        // ROUND REF2: `..=` includes the end value (`<=`).
+        let cmp = if inclusive { CmpOp::Le } else { CmpOp::Lt };
+        let c = self.push(FTy::Bool, Op::Cmp { op: cmp, ty: ft, a: iv, b: lim });
         self.set_term(Term::BrCond { cond: c, then_bb: body_bb, else_bb: end_bb });
 
         self.cur = body_bb;
@@ -1991,8 +2191,18 @@ impl<'a> Lower<'a> {
 
         self.cur = step_bb;
         let iv2 = self.load(ft, islot);
+        if inclusive {
+            // After the last value (`i == end`) stop BEFORE incrementing:
+            // `0..=255u8` must not wrap around to 0 and loop forever.
+            let lim2 = self.load(ft, eslot);
+            let last = self.push(FTy::Bool, Op::Cmp { op: CmpOp::Eq, ty: ft, a: iv2, b: lim2 });
+            let inc_bb = self.new_block();
+            self.set_term(Term::BrCond { cond: last, then_bb: end_bb, else_bb: inc_bb });
+            self.cur = inc_bb;
+        }
+        let iv3 = if inclusive { self.load(ft, islot) } else { iv2 };
         let one = self.constant(ft, 1);
-        let inc = self.push(ft, Op::Bin(FBin::Add, iv2, one));
+        let inc = self.push(ft, Op::Bin(FBin::Add, iv3, one));
         self.store(ft, islot, inc);
         self.set_term(Term::Br(head_bb));
 
@@ -2119,6 +2329,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         fname: d.name.clone(),
         loops: Vec::new(),
             defers: Vec::new(),
+        moved_slots: HashSet::new(),
         sret: None,
 
         params_done: false,
@@ -2129,6 +2340,8 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         lo.sret = Some(lo.f.param_val(0));
         next = 1;
     }
+    // ROUND OWN-2: parameters that own a value with a `drop` (by value).
+    let mut param_drops: Vec<Deferred> = Vec::new();
     lo.enter();
     // ROUND 64: the parameters carry the line of the `fn` declaration.
     if !d.span.is_none() {
@@ -2148,6 +2361,25 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
                 next += 1;
                 lo.store(ft, slot, pv);
                 lo.declare_ty(&p.name, slot, ty.clone());
+            }
+            Some(ParamKind::Words(n)) if lo.needs_drop(&ty) => {
+                let n = *n;
+                let (size, align) = lo.size_align(&ty);
+                let slot = lo.alloca(size.max(n as u64 * 8), align.max(8));
+                let ws: Vec<Val> = (0..n).map(|k| lo.f.param_val(next + k)).collect();
+                next += n;
+                for (k, w) in ws.iter().enumerate() {
+                    let a = lo.ptradd_const(slot, k as u64 * 8); // ABI-Wortkopie
+                    lo.store(FTy::I64, a, *w);
+                }
+                lo.declare_ty(&p.name, slot, ty.clone());
+                param_drops.push(Deferred::Drop(slot, ty.clone()));
+            }
+            Some(ParamKind::Ref) if lo.needs_drop(&ty) => {
+                let pv = lo.f.param_val(next);
+                next += 1;
+                lo.declare_ty(&p.name, pv, ty.clone());
+                param_drops.push(Deferred::Drop(pv, ty.clone()));
             }
             Some(ParamKind::Words(n)) => {
                 let n = *n;
@@ -2200,7 +2432,15 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
             lo.declare_ty(&c.name, a, c.ty.clone());
         }
     }
-    let ok = lo.lower_block(&d.body).is_some();
+    let has_param_drops = !param_drops.is_empty();
+    if has_param_drops {
+        lo.defers.push(param_drops);
+    }
+    let mut ok = lo.lower_block(&d.body).is_some();
+    if ok && has_param_drops && !lo.terminated() {
+        // falling off the end: the parameters die here
+        ok = lo.lower_defers_to(0, false).is_some();
+    }
     lo.leave();
     if !ok {
         return None;
@@ -2322,6 +2562,7 @@ mod tests {
             statics: HashMap::new(),
             fns: HashMap::new(),
             widen_f32: std::collections::HashSet::new(),
+            ..Default::default()
         };
         for (n, s) in fns {
             ti.fns.insert(n.to_string(), s);

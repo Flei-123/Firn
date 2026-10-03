@@ -254,11 +254,11 @@ impl<'a> Execution<'a> {
                     }
                 }
             }
-            Stmt::For { name, start, end, body, .. } => {
+            Stmt::For { name, start, end, body, inclusive, .. } => {
                 let of = self.expr(start, env, depth)?;
                 let to = self.expr(end, env, depth)?;
                 let mut i = of;
-                while i < to {
+                while if *inclusive { i <= to } else { i < to } {
                     self.steps += 1;
                     if self.steps > MAX_STEPS {
                         return Err((
@@ -279,6 +279,10 @@ impl<'a> Execution<'a> {
                         Flow::Next | Flow::Resume => {}
                         Flow::Abort => return Ok(Flow::Next),
                         Flow::Back(v) => return Ok(Flow::Back(v)),
+                    }
+                    // `..=` stops before incrementing past the end value.
+                    if *inclusive && i == to {
+                        break;
                     }
                     i += 1;
                 }

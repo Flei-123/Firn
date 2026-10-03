@@ -1,12 +1,12 @@
-# Runde FIRN-ENV — Bauzeit-Umgebungsvariablen in der Sprache
+# Round FIRN-ENV — build-time environment variables in the language
 
 *Vorgänger: FIRN-LUECKEN (508f6c796).*
 
-## Der Anlass
+## The occasion
 
-Im OrientOS-Baum steht seit Commit `c3ecd95` eine Markenvariable, gebaut nach
-der Vorlage `/root/projects/freeviewer/src/brand.rs`. In Rust ist das eine
-Zeile:
+In the OrientOS tree there has been a brand variable since commit `c3ecd95`, built after
+the template `/root/projects/freeviewer/src/brand.rs`. In Rust that is one
+line:
 
 ```rust
 pub const NAME: &str = match option_env!("FV_BRAND_NAME") {
@@ -15,70 +15,71 @@ pub const NAME: &str = match option_env!("FV_BRAND_NAME") {
 };
 ```
 
-In Firn ging das nicht. Der Worker musste sich mit `tools/marke-einsetzen.py`
-behelfen: ein Skript, das die Werte vor dem Übersetzen in eine `/tmp`-Kopie des
-Quelltextes schreibt. Sein Kommentar sagt es wörtlich — *„Firn kennt kein
-`option_env!`, also tut es der Bau."* Diese Runde macht daraus Sprache.
+In Firn that was not possible. The worker had to make do with `tools/marke-einsetzen.py`:
+a script that writes the values into a `/tmp` copy of the
+source text before translating. Its comment says it literally — *"Firn has no
+`option_env!`, so the build does it."* This round turns that into language.
 
-## Was es jetzt gibt
+## What there is now
 
-| Schreibweise | ergibt | wenn nicht gesetzt |
+| Notation | yields | if not set |
 |---|---|---|
-| `__env_or("FIRN_X", "Vorgabe")` | `str` | das zweite Argument |
+| `__env_or("FIRN_X", "default")` | `str` | the second argument |
 | `__env_has("FIRN_X")` | `bool` | `false` |
 
-Die Form folgt dem, was die Sprache für `__v128_*` schon benutzt
-(`compiler/src/simd.rs`): eine **Intrinsic-Funktion** mit einem Namen, mit dem
-nichts kollidieren kann. Kein Operator, nichts Implizites. Beide Argumente
-müssen Textliterale sein.
+The form follows what the language already uses for `__v128_*`
+(`compiler/src/simd.rs`): an **intrinsic function** with a name with which
+nothing can collide. No operator, nothing implicit. Both arguments
+must be text literals.
 
-Dazu kommt, weil es ohne nichts nützt:
+In addition comes, because it is useless without:
 
 ```firn
-const NAME: str = __env_or("FIRN_X", "FreeViewer")     // neu: const mit Text
-const VOLL: str = NAME + " " + "1.0"                    // zur Bauzeit gerechnet
+const NAME: str = __env_or("FIRN_X", "FreeViewer")     // new: const with text
+const VOLL: str = NAME + " " + "1.0"                    // computed at build time
 ```
 
-`const` konnte bis zu dieser Runde Ganzzahlen, `bool` und (seit
-FIRN-LUECKEN) Fließkommazahlen. Jetzt auch `str`.
+Until this round `const` could do integers, `bool` and (since
+FIRN-GAPS) floating-point numbers. Now `str` as well.
 
-## Wo das passiert: im Parser
+## Where this happens: in the parser
 
-`__env_or(a, b)` wird **im Parser** zu genau dem Knoten, den ein von Hand
-geschriebenes Textliteral erzeugt (`ExprKind::Text` über dem Array-Literal
-seiner Oktette). Alles hinter dem Parser sieht keinen Unterschied zu einem
-Literal. Das beantwortet drei Forderungen auf einmal:
+`__env_or(a, b)` becomes **in the parser** exactly the node that a hand-written
+text literal produces (`ExprKind::Text` over the array literal
+of its octets). Everything behind the parser sees no difference from a
+literal. That answers three demands at once:
 
-* der Wert funktioniert in `const`, in `static`, in einer Initialisierung und
-  in einer Interpolation, ohne dass eine dieser Stellen einen neuen Fall lernt;
-* ein Programm, das **läuft**, fragt die Umgebung nie wieder — die Oktette
-  stehen im Binärprogramm, genau wie die eines Literals. Nachgeprüft mit
-  `env -i` (`tools/env/run.sh`, Punkt 3);
-* `firnc1` kann dasselbe an derselben Stelle tun
-  (`lib/firnc1/parser.fi::env_call`), also drucken beide Übersetzer bei
-  `--emit=ast-canon` denselben Text (`tools/parser_compare.sh`).
+* the value works in `const`, in `static`, in an initialisation and
+  in an interpolation, without any of these places learning a new case;
+* a program that **runs** never asks the environment again — the octets
+  stand in the binary, exactly like those of a literal. Verified with
+  `env -i` (`tools/env/run.sh`, point 3);
+* `firnc1` can do the same at the same place
+  (`lib/firnc1/parser.fi::env_call`), so both translators print
+  the same text for `--emit=ast-canon`
+  (`tools/parser_compare.sh`).
 
-## Die Grenzen, und warum jede einzelne da ist
+## The limits, and why each one is there
 
-Ein Übersetzer, der **beliebige** Umgebung ins Binärprogramm schreibt, ist ein
-Weg, die Geheimnisse einer Baumaschine in ein ausgeliefertes Programm zu
-bekommen. Deshalb:
+A translator that writes **arbitrary** environment into the binary is a
+way to get the secrets of a build machine into a delivered program.
+Therefore:
 
-1. **Positivliste.** Ein Name wird nur gelesen, wenn er mit einem erlaubten
-   Präfix beginnt. Ohne Option ist das allein `FIRN_`; der Bau nimmt seine
-   eigenen mit `--env-allow=<präfix>` dazu (mehrfach oder kommagetrennt).
-   Ein Name außerhalb der Liste ist ein **Fehler** — immer, egal ob die
-   Variable gesetzt ist oder nicht. Das ist wichtig: ein Fehler, der von der
-   Umgebung abhängt, wäre ein zweiter Weg, auf dem zwei Bauten sich
-   unterscheiden.
-2. **Gestalt des Namens.** `A-Z`, `0-9`, `_`, höchstens 64 Oktette. Nicht weil
-   Kleinbuchstaben technisch schwer wären, sondern weil `__env_or("path", …)`
-   neben `PATH` eine Falle ist.
-3. **Wert.** Höchstens 4096 Oktette, gültiges UTF-8, keine Steuerzeichen. Zu
-   lang oder kein UTF-8 ist ein Fehler und **kein stilles Abschneiden**: ein
-   halbierter Markenname ist schlimmer als ein Bau, der stehen bleibt.
-4. **Protokoll.** `--env-log` druckt jede Lesung mit Wert und Herkunft. Ohne
-   die Option wird nichts gedruckt.
+1. **Positive list.** A name is read only if it begins with an allowed
+   prefix. Without an option that is `FIRN_` alone; the build adds its
+   own with `--env-allow=<prefix>` (several times or comma-separated).
+   A name outside the list is an **error** — always, no matter whether the
+   variable is set or not. That is important: an error that depends on the
+   environment would be a second way in which two builds
+   differ.
+2. **Shape of the name.** `A-Z`, `0-9`, `_`, at most 64 octets. Not because
+   lower case would be technically hard, but because `__env_or("path", …)`
+   next to `PATH` is a trap.
+3. **Value.** At most 4096 octets, valid UTF-8, no control characters. Too
+   long or not UTF-8 is an error and **no silent truncation**: a
+   halved brand name is worse than a build that stops.
+4. **Log.** `--env-log` prints every reading with value and origin. Without
+   the option nothing is printed.
 
 ```
 $ FIRN_TEST_BRAND=OrientOS firnc --env-log tests/1640_env_const.fi -o x
@@ -86,54 +87,54 @@ env: FIRN_TEST_BRAND = "OrientOS" (environment)
 env: FIRN_TEST_BRAND ? true
 ```
 
-Beide Übersetzer drucken diese zwei Zeilen zeichengleich.
+Both translators print these two lines character for character the same.
 
-## Der Fixpunkt
+## The fixed point
 
-`bin/firnc1.fi` benutzt keine der beiden Intrinsics und hat keine
-Positivliste über die Vorgabe hinaus — die Umgebung erreicht die
-Selbstübersetzung also gar nicht. Stufe 2 und Stufe 3 bleiben zeichengleich,
-was immer gesetzt ist. Das ist kein Glück, sondern der Grund, warum die
-Positivliste standardmäßig leer ist.
+`bin/firnc1.fi` uses neither of the two intrinsics and has no
+positive list beyond the default — so the environment does not reach the
+self-translation at all. Stage 2 and stage 3 stay character-identical,
+whatever is set. That is not luck, but the reason why the
+positive list is empty by default.
 
-## Was NICHT geht (ehrlich)
+## What does NOT work (honestly)
 
-* **`static NAME: str = "…"`** geht nicht. Ein `str` ist ein Zeiger und eine
-  Länge; ein Zeiger in einem Datenabschnitt braucht eine Relokation, und die
-  hat Stufe 0 nicht. Die Meldung sagt das sauber. Was geht:
-  `static NAME: [u8; 10] = __env_or(…)` — als Array, mit **exakt** passender
-  Länge.
-* **`[u8; _]` für `static`** geht nicht (Runde 79 hat die Längenableitung nur
-  für `let`/`var` freigeschaltet). Deshalb muss man bei einem Array-`static`
-  die Länge kennen.
-* **`__env_or` mit berechnetem Namen** geht nicht und soll nicht: der Name wird
-  beim Parsen gelesen. Was gerechnet werden muss, gehört in `comptime`.
-* **Kein `__env_int_or`.** Eine Zahl aus der Umgebung wäre dieselbe Faltung mit
-  `ExprKind::Int` statt `Text` — sie ist nicht gebaut, weil sie niemand
-  gebraucht hat.
-* **`comptime` rechnet weiter nur mit `i128`.** Die Zeichenketten dieser Runde
-  liegen in den Konstantenwalks von `sema` (`const_octets`), nicht im
-  `comptime`-Interpreter. Ein `comptime`-Programm kann mit Texten also
-  weiterhin nicht rechnen; `emit_raw` nimmt nach wie vor nur Literale.
+* **`static NAME: str = "…"`** does not work. A `str` is a pointer and a
+  length; a pointer in a data section needs a relocation, and stage 0
+  does not have one. The message says so cleanly. What works:
+  `static NAME: [u8; 10] = __env_or(…)` — as an array, with an **exactly** fitting
+  length.
+* **`[u8; _]` for `static`** does not work (round 79 enabled length inference
+  only for `let`/`var`). That is why with an array `static`
+  you have to know the length.
+* **`__env_or` with a computed name** does not work and should not: the name is
+  read while parsing. What has to be calculated belongs in `comptime`.
+* **No `__env_int_or`.** A number from the environment would be the same folding with
+  `ExprKind::Int` instead of `Text` — it is not built, because nobody
+  needed it.
+* **`comptime` still calculates only with `i128`.** The strings of this round
+  live in the constant walks of `sema` (`const_octets`), not in the
+  `comptime` interpreter. A `comptime` program therefore still cannot
+  calculate with texts; `emit_raw` still takes only literals.
 
-## Für OrientOS: wie die Zeile dort aussieht
+## For OrientOS: what the line looks like there
 
-Nachgewiesen, nicht umgebaut — der Umbau gehört dem OrientOS-Chat.
+Proven, not rebuilt — the rebuild belongs to the OrientOS chat.
 
-Heute (`kernel/marke.fi` + `marke.conf` + `tools/marke-einsetzen.py`):
+Today (`kernel/marke.fi` + `marke.conf` + `tools/marke-einsetzen.py`):
 
 ```firn
 static mut s_produkt: [u8; 32] = "???????????????????????????????\0"
-// … und ein Python-Skript ersetzt die Fragezeichen in einer /tmp-Kopie
+// … and a Python script replaces the question marks in a /tmp copy
 ```
 
-Mit dieser Runde, **im Kernprofil, ohne Sammler** — nachgeprüft mit
+With this round, **in the kernel profile, without a collector** — verified with
 `firnc --profile=kernel -c`:
 
 ```firn
-// Der Text ist ein Zeiger und eine Länge. Jede Struktur dieser Gestalt
-// (Runde 88 nennt sie eine "Sicht" auf `str`) nimmt ein Textliteral --
-// und damit auch ein `__env_or`.
+// The text is a pointer and a length. Every structure of this shape
+// (round 88 calls it a "view" onto `str`) takes a text literal --
+// and thereby also an `__env_or`.
 struct Text { p: *mut u8, n: usize }
 
 fn produkt() -> Text {
@@ -142,37 +143,37 @@ fn produkt() -> Text {
 }
 ```
 
-Im App-Profil geht die kürzere Form, der direkte Zwilling von `brand.rs`:
+In the app profile the shorter form works, the direct twin of `brand.rs`:
 
 ```firn
 const PRODUKT: str = __env_or("OSUM_MARKE_PRODUKT", "OrientOS")
 ```
 
-Der Bauaufruf bekommt eine Option dazu:
+The build call gets an option added:
 
 ```sh
 OSUM_MARKE_PRODUKT="Xoffi OS" firnc --env-allow=OSUM_MARKE_ kernel/marke.fi …
 ```
 
-Damit entfallen `tools/marke-einsetzen.py` (192 Zeilen), die `/tmp`-Kopie des
-Kernbaums und die Fragezeichen-Platzhalter. `marke.conf` kann bleiben, wenn die
-Vorgaben in einer Datei stehen sollen — dann liest der Bau sie und setzt sie als
-Umgebung; die Sprache braucht sie nicht mehr. Der Längentest, den das Skript
-macht (`MAX`/`MAX_URL`), wird überflüssig: ein `Text` trägt seine Länge selbst.
+With that `tools/marke-einsetzen.py` (192 lines), the `/tmp` copy of the
+kernel tree and the question-mark placeholders drop out. `marke.conf` can stay if the
+defaults are to stand in a file — then the build reads it and sets it as
+environment; the language no longer needs it. The length test that the script
+does (`MAX`/`MAX_URL`) becomes superfluous: a `Text` carries its length itself.
 
-## Dateien dieser Runde
+## Files of this round
 
-| Datei | was |
+| File | what |
 |---|---|
-| `compiler/src/env.rs` | neu — Positivliste, Grenzen, Protokoll (6 Modultests) |
+| `compiler/src/env.rs` | new — positive list, limits, log (6 module tests) |
 | `compiler/src/parser.rs` | `env_call`, `literal_octets`, `text_from_octets` |
-| `compiler/src/sema.rs` | `const` mit `str`, `const_octets`, Zahlensperre |
-| `compiler/src/lower.rs` | Textkonstante materialisieren wie ein Literal |
+| `compiler/src/sema.rs` | `const` with `str`, `const_octets`, number lock |
+| `compiler/src/lower.rs` | materialise text constant like a literal |
 | `compiler/src/main.rs` | `--env-allow=`, `--env-log` |
-| `lib/firnc1/parser.fi` | Zwilling: `env_call` und die Grenzen |
-| `lib/firnc1/sema.fi` | Zwilling: `const_octets`, `k_tdata` |
-| `lib/firnc1/lower.fi` | Zwilling: Textkonstante materialisieren |
-| `bin/firnc1.fi` | die zwei Optionen, das Protokoll |
-| `tests/1640_env_const.fi` | der Vorgabefall im Korpus |
-| `tests/neg/1641…1645` | fünf Grenzen, je eine Meldung |
-| `tools/env/run.sh` | beide Übersetzer, beide Fälle, `env -i` |
+| `lib/firnc1/parser.fi` | twin: `env_call` and the limits |
+| `lib/firnc1/sema.fi` | twin: `const_octets`, `k_tdata` |
+| `lib/firnc1/lower.fi` | twin: materialise text constant |
+| `bin/firnc1.fi` | the two options, the log |
+| `tests/1640_env_const.fi` | the default case in the corpus |
+| `tests/neg/1641…1645` | five limits, one message each |
+| `tools/env/run.sh` | both translators, both cases, `env -i` |

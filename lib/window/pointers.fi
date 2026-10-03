@@ -1,0 +1,406 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/window/pointers.fi -- REAL POINTERS FROM A WINDOW (roadmap r111).
+//
+// The window layer (window.fi) knows ONE pointer: EV_MOTION / EV_BUTTON /
+// EV_RELEASE carry a position and nothing else. A phone has up to ten
+// fingers, a tablet a pen, a laptop a mouse next to a touch screen, and
+// lib/fui/event.fi (pointer capture per id, the gesture arena: tap, pan,
+// pinch) wants exactly that: an id, a type, `primary`, a time, a position.
+//
+// This module is the PLATFORM-NEUTRAL half. A back end that has real
+// pointers (Android today; XInput2 touch and WM_POINTER later) calls
+// `pointers_motion` once per system event with what the system says, and
+// the program takes plain records out with `pointers_next` (window.fi:
+// `window.next_pointer`). What it does:
+//
+//   * Android batches: ONE MOVE event carries ALL fingers. This module
+//     turns it into one PK_MOVE per finger that really moved.
+//   * ACTION_POINTER_DOWN / _UP name the finger by INDEX; the id (which
+//     stays the same while the finger is on the glass) is what a program
+//     wants. The index of a finger changes when an earlier one lifts.
+//   * A DOWN for an id that is already down (the system lost the UP)
+//     first cancels the old one -- a program never sees two downs.
+//   * A new sequence (ACTION_DOWN) with fingers still marked down cancels
+//     them first (lost UP / CANCEL).
+//   * `primary` as in the Pointer Events standard: a pointer is primary
+//     when no other pointer OF ITS TYPE was down as it went down.
+//   * Ordering: the other fingers' moves come BEFORE the up / down of the
+//     named finger, so a gesture sees the last positions of the others.
+//
+// Nothing here touches the system: the whole machine is tested with
+// synthetic MotionEvent streams in tools/fui/pointers_main.fi.
+export {
+    Pointer, Pointers, pointers_new, pointers_enable, pointers_enabled,
+    pointers_motion, pointers_single, pointers_next, pointers_down,
+    pointers_dropped, winptr_kind, winptr_coord, winptr_type,
+    WMP_UPDATE, WMP_DOWN, WMP_UP, WMP_CAPTURECHANGED,
+    pointers_tool_type, ptr_blank,
+    PK_DOWN, PK_MOVE, PK_UP, PK_CANCEL,
+    PTR_MOUSE, PTR_TOUCH, PTR_PEN,
+    MA_DOWN, MA_UP, MA_MOVE, MA_CANCEL, MA_POINTER_DOWN, MA_POINTER_UP,
+    POINTERS_MAX,
+}
+
+// Record kinds.
+const PK_DOWN: u32 = 1
+const PK_MOVE: u32 = 2
+const PK_UP: u32 = 3
+const PK_CANCEL: u32 = 4
+
+// Pointer types -- the numbers of fui.event.PT_* (checked by the test).
+const PTR_MOUSE: u32 = 1
+const PTR_TOUCH: u32 = 2
+const PTR_PEN: u32 = 3
+
+// The action codes of an Android MotionEvent (action & ACTION_MASK).
+const MA_DOWN: u32 = 0
+const MA_UP: u32 = 1
+const MA_MOVE: u32 = 2
+const MA_CANCEL: u32 = 3
+const MA_POINTER_DOWN: u32 = 5
+const MA_POINTER_UP: u32 = 6
+
+const POINTERS_MAX: usize = 10
+const RING: usize = 64
+const NONE: usize = 4294967295
+
+struct Pointer {
+    kind: u32,
+    id: u32,
+    ptype: u32,
+    primary: u32,
+    x: f64, // device pixels
+    y: f64,
+    t: i64, // milliseconds
+}
+
+fn ptr_blank() -> Pointer {
+    return Pointer { kind: 0 as u32, id: 0 as u32, ptype: 0 as u32,
+        primary: 0 as u32, x: 0.0, y: 0.0, t: 0 }
+}
+
+struct Slot {
+    used: u32,
+    id: u32,
+    ptype: u32,
+    primary: u32,
+    x: f64,
+    y: f64,
+}
+
+fn slot_blank() -> Slot {
+    return Slot { used: 0 as u32, id: 0 as u32, ptype: 0 as u32,
+        primary: 0 as u32, x: 0.0, y: 0.0 }
+}
+
+struct Pointers {
+    on: bool,
+    ring: [Pointer; 64],
+    head: usize,
+    tail: usize,
+    dropped: usize,
+    st: [Slot; 10],
+}
+
+fn pointers_new() -> Pointers {
+    return Pointers { on: false, ring: [ptr_blank(); 64], head: 0, tail: 0,
+        dropped: 0, st: [slot_blank(); 10] }
+}
+
+// Switch the feed on or off. Off (the default) nothing is recorded, so a
+// program that never asks pays nothing and sees nothing new.
+fn pointers_enable(q: *mut Pointers, on: bool) {
+    (*q).on = on
+    if !on {
+        (*q).head = 0
+        (*q).tail = 0
+        var k: usize = 0
+        while k < 10 {
+            (*q).st[k].used = 0 as u32
+            k = k + 1
+        }
+    }
+}
+
+fn pointers_enabled(q: *mut Pointers) -> bool { return (*q).on }
+
+// How many records the ring lost because nobody took them (oldest first).
+fn pointers_dropped(q: *mut Pointers) -> usize { return (*q).dropped }
+
+// How many pointers are down right now.
+fn pointers_down(q: *mut Pointers) -> usize {
+    var n: usize = 0
+    var k: usize = 0
+    while k < 10 {
+        if (*q).st[k].used != 0 as u32 {
+            n = n + 1
+        }
+        k = k + 1
+    }
+    return n
+}
+
+// Android's AMotionEvent_getToolType: 1 finger, 2 stylus, 3 mouse,
+// 4 eraser, 0 unknown (a finger is the safe guess).
+fn pointers_tool_type(tool: i32) -> u32 {
+    if tool == 3 {
+        return PTR_MOUSE
+    }
+    if tool == 2 || tool == 4 {
+        return PTR_PEN
+    }
+    return PTR_TOUCH
+}
+
+fn push(q: *mut Pointers, kind: u32, s: usize, t: i64) {
+    let n: usize = ((*q).head + 1) % RING
+    if n == (*q).tail {
+        (*q).tail = ((*q).tail + 1) % RING
+        (*q).dropped = (*q).dropped + 1
+    }
+    (*q).ring[(*q).head] = Pointer { kind: kind, id: (*q).st[s].id,
+        ptype: (*q).st[s].ptype, primary: (*q).st[s].primary,
+        x: (*q).st[s].x, y: (*q).st[s].y, t: t }
+    (*q).head = n
+}
+
+// The next record; false = none.
+fn pointers_next(q: *mut Pointers, out: *mut Pointer) -> bool {
+    if (*q).tail == (*q).head {
+        return false
+    }
+    let r: *mut Pointer = &(*q).ring[(*q).tail]
+    (*out).kind = (*r).kind
+    (*out).id = (*r).id
+    (*out).ptype = (*r).ptype
+    (*out).primary = (*r).primary
+    (*out).x = (*r).x
+    (*out).y = (*r).y
+    (*out).t = (*r).t
+    (*q).tail = ((*q).tail + 1) % RING
+    return true
+}
+
+fn slot_of(q: *mut Pointers, id: u32) -> usize {
+    var k: usize = 0
+    while k < 10 {
+        if (*q).st[k].used != 0 as u32 && (*q).st[k].id == id {
+            return k
+        }
+        k = k + 1
+    }
+    return NONE
+}
+
+fn free_slot(q: *mut Pointers) -> usize {
+    var k: usize = 0
+    while k < 10 {
+        if (*q).st[k].used == 0 as u32 {
+            return k
+        }
+        k = k + 1
+    }
+    return NONE
+}
+
+fn count_type(q: *mut Pointers, ptype: u32) -> usize {
+    var n: usize = 0
+    var k: usize = 0
+    while k < 10 {
+        if (*q).st[k].used != 0 as u32 && (*q).st[k].ptype == ptype {
+            n = n + 1
+        }
+        k = k + 1
+    }
+    return n
+}
+
+fn cancel_slot(q: *mut Pointers, s: usize, t: i64) {
+    push(q, PK_CANCEL, s, t)
+    (*q).st[s].used = 0 as u32
+}
+
+fn cancel_all(q: *mut Pointers, t: i64) {
+    var k: usize = 0
+    while k < 10 {
+        if (*q).st[k].used != 0 as u32 {
+            cancel_slot(q, k, t)
+        }
+        k = k + 1
+    }
+}
+
+fn put_down(q: *mut Pointers, id: u32, ptype: u32, x: f64, y: f64, t: i64) {
+    let old: usize = slot_of(q, id)
+    if old != NONE {
+        cancel_slot(q, old, t)
+    }
+    let s: usize = free_slot(q)
+    if s == NONE {
+        return
+    }
+    var primary: u32 = 0 as u32
+    if count_type(q, ptype) == 0 {
+        primary = 1 as u32
+    }
+    (*q).st[s] = Slot { used: 1 as u32, id: id, ptype: ptype,
+        primary: primary, x: x, y: y }
+    push(q, PK_DOWN, s, t)
+}
+
+// One PK_MOVE for every finger of the event (except `skip`) whose position
+// differs from the one the program last saw.
+fn moves(q: *mut Pointers, n: usize, skip: usize, ids: *mut [i32; 10],
+    xs: *mut [f64; 10], ys: *mut [f64; 10], t: i64) {
+    var k: usize = 0
+    while k < n && k < 10 {
+        if k != skip {
+            let s: usize = slot_of(q, (*ids)[k] as u32)
+            if s != NONE {
+                if (*q).st[s].x != (*xs)[k] || (*q).st[s].y != (*ys)[k] {
+                    (*q).st[s].x = (*xs)[k]
+                    (*q).st[s].y = (*ys)[k]
+                    push(q, PK_MOVE, s, t)
+                }
+            }
+        }
+        k = k + 1
+    }
+}
+
+// ONE SYSTEM EVENT. `act` is the masked Android action (MA_*), `idx` the
+// index of the finger the action names (ACTION_POINTER_INDEX; 0 for
+// DOWN / UP / MOVE), `n` how many fingers the event carries, and the four
+// arrays hold id, position (device pixels) and type of each, `t` the time
+// in milliseconds.
+fn pointers_motion(q: *mut Pointers, act: u32, idx: usize, n: usize,
+    ids: *mut [i32; 10], xs: *mut [f64; 10], ys: *mut [f64; 10],
+    types: *mut [u32; 10], t: i64) {
+    if !(*q).on || n == 0 {
+        return
+    }
+    var i: usize = idx
+    if i >= n || i >= 10 {
+        i = 0
+    }
+    if act == MA_DOWN {
+        // a new sequence: whatever is still marked down lost its UP
+        cancel_all(q, t)
+        put_down(q, (*ids)[i] as u32, (*types)[i], (*xs)[i], (*ys)[i], t)
+        moves(q, n, i, ids, xs, ys, t)
+    } else if act == MA_POINTER_DOWN {
+        moves(q, n, i, ids, xs, ys, t)
+        put_down(q, (*ids)[i] as u32, (*types)[i], (*xs)[i], (*ys)[i], t)
+    } else if act == MA_MOVE {
+        moves(q, n, NONE, ids, xs, ys, t)
+    } else if act == MA_POINTER_UP || act == MA_UP {
+        moves(q, n, i, ids, xs, ys, t)
+        let s: usize = slot_of(q, (*ids)[i] as u32)
+        if s != NONE {
+            (*q).st[s].x = (*xs)[i]
+            (*q).st[s].y = (*ys)[i]
+            push(q, PK_UP, s, t)
+            (*q).st[s].used = 0 as u32
+        }
+        if act == MA_UP {
+            // the last finger: nothing may stay down
+            cancel_all(q, t)
+        }
+    } else if act == MA_CANCEL {
+        cancel_all(q, t)
+    }
+}
+
+// ONE POINTER, ONE EVENT -- the shape XInput2 touch (XI_TouchBegin /
+// Update / End) and Win32 WM_POINTER have: every message names ONE pointer
+// by its id. `kind` is PK_DOWN / PK_MOVE / PK_UP / PK_CANCEL, `ptype` a
+// PTR_*, positions in device pixels, `t` in milliseconds.
+//   * DOWN for an id already down cancels the old one first (lost UP).
+//   * MOVE for an id that is not down, or that did not move, is dropped.
+//   * UP / CANCEL for an id that is not down is dropped.
+fn pointers_single(q: *mut Pointers, kind: u32, id: u32, ptype: u32,
+    x: f64, y: f64, t: i64) {
+    if !(*q).on {
+        return
+    }
+    if kind == PK_DOWN {
+        put_down(q, id, ptype, x, y, t)
+        return
+    }
+    let s: usize = slot_of(q, id)
+    if s == NONE {
+        return
+    }
+    if kind == PK_MOVE {
+        if (*q).st[s].x != x || (*q).st[s].y != y {
+            (*q).st[s].x = x
+            (*q).st[s].y = y
+            push(q, PK_MOVE, s, t)
+        }
+    } else if kind == PK_UP {
+        (*q).st[s].x = x
+        (*q).st[s].y = y
+        push(q, PK_UP, s, t)
+        (*q).st[s].used = 0 as u32
+    } else if kind == PK_CANCEL {
+        cancel_slot(q, s, t)
+    }
+}
+
+// ---- WM_POINTER (Windows 8+) as pure functions, so that Linux can check them.
+const WMP_UPDATE: i64 = 581 // WM_POINTERUPDATE 0x0245
+const WMP_DOWN: i64 = 582 // WM_POINTERDOWN 0x0246
+const WMP_UP: i64 = 583 // WM_POINTERUP 0x0247
+const WMP_CAPTURECHANGED: i64 = 588 // WM_POINTERCAPTURECHANGED 0x024C
+
+// wParam of a WM_POINTER* = pointer id (low 16 bits) and the low 16 bits of
+// the pointer flags (high 16): 0x0004 in contact, 0x8000 cancelled. The
+// kind: PK_DOWN / PK_MOVE / PK_UP / PK_CANCEL, or 0 = not for us (a pen
+// that hovers, another message).
+fn winptr_kind(msg: i64, flags: i64) -> u32 {
+    let contact: bool = (flags & 4) != 0
+    if msg == WMP_DOWN {
+        return PK_DOWN
+    }
+    if msg == WMP_UPDATE {
+        if !contact {
+            return 0 as u32
+        }
+        return PK_MOVE
+    }
+    if msg == WMP_UP {
+        if (flags & 32768) != 0 {
+            return PK_CANCEL
+        }
+        return PK_UP
+    }
+    if msg == WMP_CAPTURECHANGED {
+        return PK_CANCEL
+    }
+    return 0 as u32
+}
+
+// lParam: the point in SCREEN pixels, two signed 16-bit halves.
+// `which` 0 = x, 1 = y.
+fn winptr_coord(lp: i64, which: i64) -> i32 {
+    var v: i64 = lp & 65535
+    if which == 1 {
+        v = (lp >> 16) & 65535
+    }
+    if v >= 32768 {
+        v = v - 65536
+    }
+    return v as i32
+}
+
+// POINTER_INPUT_TYPE -> PTR_*: touch (2) and pen (3) are ours; the mouse (4)
+// and the touch pad (5) keep the legacy messages: 0.
+fn winptr_type(t: u32) -> u32 {
+    if t == 2 as u32 {
+        return PTR_TOUCH
+    }
+    if t == 3 as u32 {
+        return PTR_PEN
+    }
+    return 0 as u32
+}

@@ -1,154 +1,154 @@
-# Runde TEMPO 1 — Fliesskomma zu Ende gebracht, und ein Fehler aus XMM 3
+# Round TEMPO 1 — floating point finished, and a bug from XMM 3
 
-Stand 20.09.2026, Zweig `xmm-ra`. Alles hier ist **gelaufen und gemessen**;
-die Befehle stehen dabei.
+State 20.09.2026, branch `xmm-ra`. Everything here has **been run and measured**;
+the commands are given with it.
 
 ## Ausgangslage
 
-Runde XMM 3 hat dem Registerzuteiler Fliesskomma beigebracht. Der MP3-Dekoder
-lief danach 60 s Ton in **0,91 s**, dieselbe Vorlage in C (`minimp3`,
-`gcc -O2 -DMINIMP3_NO_SIMD`) in **0,11 s** — Faktor 8,3. Eine Messung der
-wirklich ausgefuehrten Befehle (`valgrind --tool=callgrind`) sagte, woran es
-liegt: **644 Mio** gegen **75 Mio** Befehle. Es war also nicht die
-Reihenfolge und nicht der Zwischenspeicher, sondern die schiere Menge
-erzeugter Arbeit.
+Round XMM 3 taught the register allocator floating point. The MP3 decoder
+then ran 60 s of sound in **0.91 s**, the same template in C (`minimp3`,
+`gcc -O2 -DMINIMP3_NO_SIMD`) in **0.11 s** — a factor of 8.3. A measurement of
+the instructions really executed (`valgrind --tool=callgrind`) said what
+the cause was: **644 million** against **75 million** instructions. So it was not the
+order and not the cache, but the sheer amount of
+work generated.
 
-`perf` geht in diesem Behaelter nicht (`perf_event_paranoid` liegt fest),
-callgrind schon. Die Zuordnung Adresse -> Funktion kommt aus `nm`.
+`perf` does not work in this container (`perf_event_paranoid` is fixed),
+callgrind does. The mapping address -> function comes from `nm`.
 
-## Was gefunden wurde, in der Reihenfolge der Wirkung
+## What was found, in order of effect
 
-### 1. Ein `-x` schickte die halben Dekoder auf den Grundweg (Uebersetzer)
+### 1. A `-x` sent half the decoders to the basic path (translator)
 
-`FIRN_RA_STATS=1` sagt, welche Funktion keine Registerzuteilung bekommt.
-Antwort: **die sieben heissesten** — `l3_imdct36`, `l3_huffman`,
-`synth_pair`, `scale_pcm` und drei weitere, alle mit demselben Grund
-*„einstellige Rechnung mit Gleitzahl"*. XMM 3 hatte `Op::Un` ausgeschlossen,
-also **jede** Funktion, in der irgendwo ein `-x` auf eine Gleitzahl steht.
+`FIRN_RA_STATS=1` says which function gets no register allocation.
+Answer: **the seven hottest** — `l3_imdct36`, `l3_huffman`,
+`synth_pair`, `scale_pcm` and three more, all with the same reason
+*"one-operand calculation with a floating-point number"*. XMM 3 had excluded `Op::Un`,
+so **every** function in which somewhere a `-x` stands on a floating-point number.
 
-Die Vorzeichenumkehr ist ein Bit: `xorps` gegen eine Maske, die ueber `rax`
-in `xmm1` kommt (SSE hat keine Form mit Konstante). Damit faellt der
-Ausschluss weg; `!` auf eine Gleitzahl bleibt draussen, weil es dafuer
-ueberhaupt keine Bedeutung gibt.
+The sign reversal is a bit: `xorps` against a mask that comes via `rax`
+into `xmm1` (SSE has no form with a constant). With that the
+exclusion drops out; `!` on a floating-point number stays outside, because it
+has no meaning at all.
 
 **644 Mio -> 467 Mio Befehle, 0,91 s -> 0,64 s.**
 
-### 2. Die Adressrechnung des Dekoders hatte einen Sprung (Bibliothek)
+### 2. The address calculation of the decoder had a jump (library)
 
-`lib/ton/mp3.fi` rechnet mit vorzeichenbehafteten Indizes, weil die
-Synthesefilterbank wirklich negative braucht (`zlin[4*(i-16)+2]`). Das stand
-als `if i < 0 { p - (-i)*4 } else { p + i*4 }` — vor **jedem einzelnen**
-Feldzugriff ein Vergleich, ein Sprung und ein phi.
+`lib/ton/mp3.fi` calculates with signed indices, because the
+synthesis filter bank really needs negative ones (`zlin[4*(i-16)+2]`). That stood
+as `if i < 0 { p - (-i)*4 } else { p + i*4 }` — before **every single**
+field access a comparison, a jump and a phi.
 
-Noetig ist der Zweig nicht: Adressen rechnen modulo 2^64, und `i as u64` ist
-bei gleicher Breite eine Umdeutung des Bitmusters (in `dev`, `release-safe`
-und `release-fast` geprueft). `p +% ((i as u64) *% 4)` ist fuer negative `i`
-dasselbe — ohne Sprung. Erst damit kann der Uebersetzer den Zugriff
-ueberhaupt in den Adressteil des Befehls falten.
+The branch is not necessary: addresses calculate modulo 2^64, and `i as u64` is,
+at equal width, a reinterpretation of the bit pattern (checked in `dev`, `release-safe`
+and `release-fast`). `p +% ((i as u64) *% 4)` is for negative `i`
+the same — without a jump. Only with that can the translator fold the
+access into the address part of the instruction at all.
 
 **467 Mio -> 370 Mio, 0,64 s -> 0,37 s.**
 
-### 3. `+%` war fuer jede Optimierung unsichtbar (Uebersetzer)
+### 3. `+%` was invisible to every optimisation (translator)
 
-Und hier zeigte die Messung den eigentlichen Witz: `Op::BinWrapSat { kind:
-Wrap }` und `Op::Bin` bedeuten im FIR **dasselbe** — beide behalten die
-unteren Bits, beide pruefen nichts (gepruefte Rechnung heisst
-`Op::CheckedBin`). Der Unterschied war rein syntaktisch. Nur fragt **jede**
-Optimierung nach `Op::Bin`: gemeinsame Teilausdruecke, Schleifeninvarianten,
-die algebraischen Kuerzungen und vor allem das Falten der Adresse in den
-Befehl (`regalloc::foldable_addresses`). Ein `+%` lief an allen vorbei.
+And here the measurement showed the actual joke: `Op::BinWrapSat { kind:
+Wrap }` and `Op::Bin` mean **the same** in FIR — both keep the
+lower bits, neither checks anything (checked arithmetic is called
+`Op::CheckedBin`). The difference was purely syntactic. Only **every**
+optimisation asks for `Op::Bin`: common subexpressions, loop invariants,
+the algebraic simplifications and above all folding the address into the
+instruction (`regalloc::foldable_addresses`). A `+%` bypassed all of them.
 
-`canon_wrap` schreibt `Wrap` einmal vor allen Paessen in `Op::Bin` um.
-`Sat` bleibt unberuehrt — das Abschneiden ist wirklich etwas anderes.
+`canon_wrap` rewrites `Wrap` once before all passes into `Op::Bin`.
+`Sat` stays untouched — clamping really is something different.
 
 **370 Mio -> 338 Mio, 0,37 s -> 0,34 s.**
 
-### 4. Das Vorzeichen aendert kein Bit (Uebersetzer)
+### 4. The sign changes no bit (translator)
 
-`copy_propagate` liess eine Umwandlung nur verschwinden, wenn beide Seiten
-gleich breit **und gleich vorzeichenbehaftet** waren. Damit blieb aus
-`(i as u64)` ein echtes `mov` stehen — im Dekoder vor jedem Zugriff. Bei
-gleicher Breite ist das Muster identisch; ob es als negativ gelesen wird,
-entscheidet allein die Anweisung, die es benutzt (jede traegt ihren eigenen
-Typ). Bool und Gleitzahlen bleiben getrennt, die **gepruefte** Umwandlung
-ist eine andere Anweisung.
+`copy_propagate` made a conversion disappear only if both sides were
+of equal width **and equally signed**. Thereby a real `mov` stayed behind from
+`(i as u64)` — in the decoder before every access. At
+equal width the pattern is identical; whether it is read as negative
+is decided solely by the instruction that uses it (each carries its own
+type). Bool and floating-point numbers stay separate, the **checked** conversion
+is a different instruction.
 
 ### 5. Drei Kleinigkeiten im Fliesskommaweg (Uebersetzer)
 
-* **Vertauschen statt kopieren:** liegt bei `a + b` / `a * b` der zweite
-  Operand schon im Zielregister, wird getauscht — das spart die Rettung nach
-  `xmm1` und die Kopie des ersten.
-* **Fliesskomma-Parameter** duerfen in ihrem Register bleiben (der Vorspann
-  konnte das laengst; ausgeschlossen waren sie noch aus der Zeit, als dieser
-  Weg kein Fliesskomma ausgab).
-* **`-1.5f` wird gefaltet:** das Vorzeichen einer Konstante ist ein Bit, kein
-  Rechenschritt. Vorher stand in `scale_pcm` — der innersten Schleife —
-  Konstante laden, Maske laden, `xorps`.
+* **Swap instead of copy:** if for `a + b` / `a * b` the second
+  operand already lies in the destination register, it is swapped — that saves the rescue to
+  `xmm1` and the copy of the first.
+* **Floating-point parameters** may stay in their register (the prologue
+  has long been able to do that; they were excluded from the time when this
+  path emitted no floating point).
+* **`-1.5f` is folded:** the sign of a constant is a bit, not a
+  calculation step. Before, in `scale_pcm` — the innermost loop —
+  there stood load constant, load mask, `xorps`.
 
 **338 Mio -> 324 Mio.**
 
-## Und ein falsch erzeugtes Programm aus Runde XMM 3
+## And a wrongly generated program from round XMM 3
 
-`tests/1452_f32_abi.fi` gab **6 statt 0**, in `release-fast` wie in
-`release-safe`. Der Fehler steckte in XMM 3 selbst (mit dem Stand von
-`14f9ee3c` nachgestellt), nicht in dieser Runde — gefunden hat ihn erst der
-volle Testlauf hier.
+`tests/1452_f32_abi.fi` gave **6 instead of 0**, in `release-fast` as in
+`release-safe`. The bug sat in XMM 3 itself (reproduced with the state of
+`14f9ee3c`), not in this round — it was found only by the
+full test run here.
 
-Ursache: `fp_taugt` entschied „darf dieser Wert in ein xmm?" nach der **Art**
-der Anweisung (`Bin`, `Cmp`, `Cast`, `Copy`, `Store`: immer gut). Das ist zu
-grosszuegig. Die Aufrufkonvention kopiert einen Verbund **achtbyteweise**,
-und dabei steht ein `store.u64` mit einem Wert, dessen Typ `f64` ist — ein
-`struct { f32, f32 }` reist als ein Achtbyte in `xmm0`. Diese Anweisung geht
-ueber den Ganzzahlweg, holt ihren Operanden mit `mov`, und wenn der Wert
-inzwischen in einem `xmm` lebte, schrieb sie Unsinn in den Rahmen. Im
-Erzeugten stand woertlich `mov qword ptr [rbp-360], rbp`.
+Cause: `fp_taugt` decided "may this value go into an xmm?" by the **kind**
+of the instruction (`Bin`, `Cmp`, `Cast`, `Copy`, `Store`: always fine). That is too
+generous. The calling convention copies an aggregate **eight bytes at a time**,
+and in doing so there stands a `store.u64` with a value whose type is `f64` — a
+`struct { f32, f32 }` travels as one eight-byte in `xmm0`. This instruction goes
+through the integer path, fetches its operand with `mov`, and if the value
+in the meantime lived in an `xmm`, it wrote nonsense into the frame. In the
+generated code there stood literally `mov qword ptr [rbp-360], rbp`.
 
-Jetzt zaehlt nicht die Art der Anweisung, sondern ob sie **wirklich** im
-Fliesskommaweg steht — also genau die Bedingung, unter der die Ausgabe ihren
-Fliesskommazweig nimmt (`inst.ty.is_float()`, beim Vergleich der Typ des
-Vergleichs, bei der Umwandlung eine der beiden Seiten).
+Now what counts is not the kind of instruction, but whether it **really** stands in the
+floating-point path — that is, exactly the condition under which the output takes its
+floating-point branch (`inst.ty.is_float()`, for the comparison the type of
+the comparison, for the conversion one of the two sides).
 
 ## Die Messung
 
-MP3-Dekoder, 60 s Ton (1,4 MB, 192 kbit/s, Stereo), `release-fast`, kleinste
-von neun Laeufen, dieselbe Maschine:
+MP3 decoder, 60 s of sound (1.4 MB, 192 kbit/s, stereo), `release-fast`, smallest
+of nine runs, same machine:
 
-| | Befehle (callgrind, 8 s Ton) | Zeit (60 s Ton) |
+| | Instructions (callgrind, 8 s of sound) | Time (60 s of sound) |
 |---|---|---|
-| XMM 3 (Ausgangslage) | 644 Mio | 0,91 s |
-| nach dieser Runde | **324 Mio** | **0,31 s** |
-| `minimp3` in C, `gcc -O2` | 75 Mio | 0,11 s |
+| XMM 3 (starting point) | 644 M | 0.91 s |
+| after this round | **324 M** | **0.31 s** |
+| `minimp3` in C, `gcc -O2` | 75 M | 0.11 s |
 
-**Abstand zu C: von 8,3x auf 2,8x.**
+**Distance to C: from 8.3x to 2.8x.**
 
-Richtigkeit: die PCM-Ausgabe ist **bitgleich** zu vorher (`cmp` auf die
-ganze Datei) und bitgleich zu C (`mp3_pruef_main` -> PASS 4/4 ueber vier
-Stroeme: MPEG-1 Stereo, MPEG-2 Mono, MPEG-2.5 8 kHz, kurze Bloecke).
+Correctness: the PCM output is **bit-identical** to before (`cmp` on the
+whole file) and bit-identical to C (`mp3_pruef_main` -> PASS 4/4 over four
+streams: MPEG-1 stereo, MPEG-2 mono, MPEG-2.5 8 kHz, short blocks).
 
-Ganzzahl-Programme aendern sich **nicht**: `bench/instr.sh` zaehlt fuer
-`bubblesort` und `statemachine` denselben Befehl (1 von 1,47 Mrd
-Unterschied, das ist die Startaufsetzung). Diese Runde wirkt auf
-Fliesskomma, auf `+%` und auf Adressrechnung mit vorzeichenbehafteten
-Indizes — nicht auf jede Schleife.
+Integer programs do **not** change: `bench/instr.sh` counts for
+`bubblesort` and `statemachine` the same instruction (1 of 1.47 billion
+difference, that is the start-up setup). This round acts on
+floating point, on `+%` and on address calculation with signed
+indices — not on every loop.
 
-Testreihe: `bash test.sh` ohne neuen Fehler; `1452_f32_abi` ist von FAIL auf
-PASS gegangen. Offen bleiben drei Punkte, die nichts mit dem Erzeuger zu tun
-haben (die englische Namensprobe schlaegt auf `lib/fui/*` an, der
-Selbstlauf-Fixpunkt wollte `tools/gen_gctext.sh` — nachgezogen —, und
-`testdata/test262/subset.sha256` fehlt in diesem Arbeitsbaum).
+Test series: `bash test.sh` without a new error; `1452_f32_abi` went from FAIL to
+PASS. Three points remain open that have nothing to do with the generator
+(the English name probe fires on `lib/fui/*`, the
+self-run fixed point wanted `tools/gen_gctext.sh` — caught up —, and
+`testdata/test262/subset.sha256` is missing in this working tree).
 
-## Was als Naechstes messbar etwas bringen wuerde
+## What would measurably bring something next
 
-1. **Fliesskomma-Zellen in `xmm`.** Eine Schleifenvariable
-   (`Op::Alloca`, als Zelle befoerdert) bekommt heute nur ein
-   Ganzzahlregister und reist bei jedem Zugriff per `movd` hin und her — oder
-   bleibt ganz auf dem Platz. In `synth`, der heissesten Funktion des
-   Dekoders (112 Mio von 324 Mio Befehlen), sind das acht Summen: pro
-   Durchlauf sechzehn Wege in den Rahmen und zurueck.
-2. **Lebensdauern an Aufrufen zerschneiden.** Wer einen Aufruf ueberlebt,
-   bekommt heute gar kein Register (alle sechzehn `xmm` sind
-   caller-saved). In `synth` stehen deshalb drei Basiszeiger auf ihren
-   Plaetzen und werden vor jedem Zugriff neu geholt.
-3. **Drei Operanden (AVX).** `vmulss d, a, b` spart die Kopie, die `mulss`
-   erzwingt — in `synth` stehen 50 solche `movaps`. Braucht einen Schalter
-   fuer die Ziel-CPU; die Grundausstattung bleibt SSE2.
+1. **Floating-point cells in `xmm`.** A loop variable
+   (`Op::Alloca`, promoted as a cell) today gets only an
+   integer register and travels at every access via `movd` back and forth — or
+   stays entirely in its slot. In `synth`, the hottest function of the
+   decoder (112 M of 324 M instructions), these are eight sums: per
+   iteration sixteen trips into the frame and back.
+2. **Cut lifetimes at calls.** Whoever survives a call
+   today gets no register at all (all sixteen `xmm` are
+   caller-saved). In `synth` three base pointers therefore stand in their
+   slots and are fetched anew before every access.
+3. **Three operands (AVX).** `vmulss d, a, b` saves the copy that `mulss`
+   forces — in `synth` there stand 50 such `movaps`. Needs a switch
+   for the target CPU; the baseline stays SSE2.

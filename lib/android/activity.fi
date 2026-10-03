@@ -38,13 +38,14 @@
 //
 // ========================================================= WHAT IS OPEN
 //
-// O1 No soft keyboard composition (IME). Hardware keys and the key events
-//    Android synthesises (`adb shell input text`, simple keyboards) arrive;
-//    a real InputConnection needs a dex class (Certus: lib/android/ime.fi).
+// O1 (closed by r114) The soft keyboard: lib/android/inputmethod.fi makes an
+//    InputConnection out of dex classes built at run time. It is built the
+//    first time a text field wants the keyboard.
 // O2 `onSaveInstanceState` is not answered: a program that wants to keep
 //    state across a process kill writes it into `activity_data_path`.
 import std.rt
 import android.ndk
+import android.inputmethod
 
 export {
     firn_activity_create,
@@ -56,7 +57,7 @@ export {
     activity_keep_alive, activity_kept_alive,
     IDENT_CMD, IDENT_INPUT,
     CMD_NONE, CMD_WINDOW, CMD_RESIZED, CMD_REDRAW, CMD_QUEUE, CMD_CONFIG,
-    CMD_PAUSE, CMD_RESUME, CMD_DESTROY, CMD_FOCUS, CMD_LOWMEM,
+    CMD_PAUSE, CMD_RESUME, CMD_DESTROY, CMD_FOCUS, CMD_LOWMEM, CMD_IME,
 }
 
 // ------------------------------------------------ the looper identities
@@ -77,30 +78,32 @@ const CMD_RESUME: i32 = 7
 const CMD_DESTROY: i32 = 8
 const CMD_FOCUS: i32 = 9
 const CMD_LOWMEM: i32 = 10
+// r114: the keyboard asked something of the text field (lib/android/inputmethod.fi)
+const CMD_IME: i32 = 11
 
 // ---------------------------------------------------- the shared block
 // Raw memory (mmap), never touched by the collector. Offsets in octets.
-const B_ACT: u64 = 0          // ANativeActivity*
-const B_LOOPER: u64 = 8       // the app thread's ALooper
-const B_WIN: u64 = 16         // the window the main thread hands over
-const B_QUEUE: u64 = 24       // the input queue the main thread hands over
-const B_SENT: u64 = 32        // commands written (main thread only)
-const B_ACKED: u64 = 40       // commands taken over (app thread only)
-const B_READY: u64 = 48       // 1 = the app thread listens
-const B_GONE: u64 = 56        // 1 = the program's main has returned
-const B_FD_R: u64 = 64        // command socket, app end
-const B_FD_W: u64 = 72        // command socket, main thread end
-const B_CONFIG: u64 = 80      // AConfiguration* (main thread's copy)
+const B_ACT: u64 = 0 // ANativeActivity*
+const B_LOOPER: u64 = 8 // the app thread's ALooper
+const B_WIN: u64 = 16 // the window the main thread hands over
+const B_QUEUE: u64 = 24 // the input queue the main thread hands over
+const B_SENT: u64 = 32 // commands written (main thread only)
+const B_ACKED: u64 = 40 // commands taken over (app thread only)
+const B_READY: u64 = 48 // 1 = the app thread listens
+const B_GONE: u64 = 56 // 1 = the program's main has returned
+const B_FD_R: u64 = 64 // command socket, app end
+const B_FD_W: u64 = 72 // command socket, main thread end
+const B_CONFIG: u64 = 80 // AConfiguration* (main thread's copy)
 const B_DENSITY: u64 = 88
 const B_NIGHT: u64 = 96
 const B_RESUMED: u64 = 104
-const B_PATH: u64 = 112       // 512 octets: data path, zero terminated
-const B_RECT: u64 = 624       // 4 x i32: the content rectangle (ARect)
-const B_ATTR: u64 = 640       // 128 octets: pthread_attr_t
-const B_TID: u64 = 768        // pthread_t
-const B_KEEP: u64 = 776       // 1 = the program outlives its activity
-const B_ARGV: u64 = 1024      // the argument block `main(start)` gets
-const B_ARGBUF: u64 = 2048    // the argument text
+const B_PATH: u64 = 112 // 512 octets: data path, zero terminated
+const B_RECT: u64 = 624 // 4 x i32: the content rectangle (ARect)
+const B_ATTR: u64 = 640 // 128 octets: pthread_attr_t
+const B_TID: u64 = 768 // pthread_t
+const B_KEEP: u64 = 776 // 1 = the program outlives its activity
+const B_ARGV: u64 = 1024 // the argument block `main(start)` gets
+const B_ARGBUF: u64 = 2048 // the argument text
 const B_BYTES: usize = 8192
 const ARGV_MAX: usize = 60
 const ARGBUF_CAP: usize = 6144
@@ -415,11 +418,11 @@ fn args_build() -> u64 {
     let act: u64 = ld(B_ACT)
     if !found && act != 0 {
         let am: u64 = ndk.peek64(act + ndk.ACT_ASSET_MANAGER)
-        var an: [u8; 9] = "args.txt\0"
+        var asset_name: [u8; 9] = "args.txt\0"
         var a: u64 = 0
         if am != 0 {
-            // AASSET_MODE_BUFFER = 3
-            a = ndk.AAssetManager_open(am, (&an[0]) as u64, 3)
+            let buffer_mode: i32 = 3 // AASSET_MODE_BUFFER
+            a = ndk.AAssetManager_open(am, (&asset_name[0]) as u64, buffer_mode)
         }
         if a != 0 {
             let len: i64 = ndk.AAsset_getLength(a)
@@ -507,7 +510,7 @@ fn send(cmd: i32, sync: bool) {
 }
 
 #[no_gc]
-fn auf_start(a: u64) { }
+fn auf_start(a: u64) {}
 
 #[no_gc]
 fn on_resume(a: u64) {
@@ -522,7 +525,7 @@ fn auf_pause(a: u64) {
 }
 
 #[no_gc]
-fn auf_halt(a: u64) { }
+fn auf_halt(a: u64) {}
 
 // The activity is going away for good. The program got EV_CLOSED; give
 // it two seconds to leave `main`, then END THE PROCESS. A second activity
@@ -685,6 +688,8 @@ fn firn_activity_create(activity: u64, saved: u64, saved_len: usize) {
         st(B_FD_W, fds[1] as u64)
     }
     st(B_ACT, activity)
+    // r114: the input method (nothing is built before a field wants it)
+    inputmethod.ime_activity(activity, ld(B_FD_W) as i32, G_B + B_SENT)
     let copied: bool = path_copy(ndk.peek64(activity + ndk.ACT_EXTERNAL_DATA_PATH))
     if !copied {
         let c2: bool = path_copy(ndk.peek64(activity + ndk.ACT_INTERNAL_DATA_PATH))

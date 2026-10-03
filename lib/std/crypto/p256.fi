@@ -1,0 +1,468 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/crypto/p256.fi -- ECDSA SIGNING on NIST P-256 (FIPS 186-5,
+// SEC 1 4.1.3), with the nonce of RFC 6979.
+//
+// `ecdsa.fi` verifies. A TLS SERVER has to sign: its CertificateVerify is
+// an ECDSA signature over the handshake transcript made with the private
+// key of its certificate, and every browser checks it. This file is that
+// other half, and it is written for a SECRET scalar:
+//
+//   * THE SCALAR MULTIPLICATION IS A MONTGOMERY LADDER over all 256 bits,
+//     with a conditional swap made of masks (`big.select_into`) and no
+//     branch and no memory address that depends on a bit of the scalar.
+//   * THE POINT ADDITION IS COMPLETE. Renes, Costello and Batina,
+//     "Complete addition formulas for prime order elliptic curves"
+//     (EUROCRYPT 2016), algorithm 4 for a = -3, in projective coordinates.
+//     One formula for every pair of points -- P + Q, P + P, P + (-P),
+//     P + O -- so there is no special case to branch on. `ecdsa.fi` uses
+//     Jacobian formulas with checks for the point at infinity; those are
+//     right for public data and wrong for a secret.
+//   * THE NONCE IS DETERMINISTIC (RFC 6979 3.2, HMAC-SHA-256), optionally
+//     hedged with extra random octets (RFC 6979 3.6). A repeated or biased
+//     nonce gives the private key away; a nonce derived from the key and
+//     the message cannot repeat for two different messages.
+//   * k^-1 is computed as k^(n-2) mod n. The exponent is public, the base
+//     is secret, and `big.mont_pow` branches on the exponent only.
+//
+// HONEST
+// P1 P-256 ONLY, SHA-256 hashes (32 octets) only.
+// P2 The field arithmetic is `std.crypto.big` with 32-bit limbs: branch
+//    free in `mont_mul`, `big_add_mod` and `big_sub_mod`, but nobody has
+//    measured this code for timing leaks with a tool such as dudect. It is
+//    written to be constant time; it is not proven to be.
+// P3 A signature costs about 512 complete additions -- see
+//    tools/tls/p256_check.py for the measured time.
+import std.rt
+import std.crypto.big
+import std.crypto.hmac
+
+export {
+    P256_LEN, p256_public, p256_sign, p256_scalar_valid, p256_mult,
+    p256_sig_der, p256_sig_from_der,
+}
+
+const P256_LEN: usize = 32
+
+struct Pt3 {
+    x: big.Big,
+    y: big.Big,
+    z: big.Big,
+}
+
+struct Ctx {
+    mp: big.Mont, // modulo p
+    mn: big.Mont, // modulo n
+    p: big.Big,
+    n: big.Big,
+    pm2: big.Big,
+    nm2: big.Big,
+    bm: big.Big, // b in the Montgomery domain of p
+    gx: big.Big, // the base point, Montgomery domain of p
+    gy: big.Big,
+    ok: bool,
+}
+
+fn pt_new() -> Pt3 {
+    return Pt3 { x: big.big_new(), y: big.big_new(), z: big.big_new() }
+}
+
+fn hexval(c: u8) -> u32 {
+    if c >= 48 as u8 && c <= 57 as u8 { return (c - 48 as u8) as u32 }
+    if c >= 97 as u8 && c <= 102 as u8 { return (c - 87 as u8) as u32 }
+    if c >= 65 as u8 && c <= 70 as u8 { return (c - 55 as u8) as u32 }
+    return 0 as u32
+}
+
+// 64 hex digits -> a 256-bit number.
+fn from_hex(a: *mut big.Big, h: str) {
+    var raw: [u8; 32] = [0; 32]
+    var i: usize = 0
+    while i < 32 && 2 * i + 1 < h.n {
+        let hi: u32 = hexval(*(h.p + 2 * i))
+        let lo: u32 = hexval(*(h.p + 2 * i + 1))
+        raw[i] = ((hi << 4) | lo) as u8
+        i = i + 1
+    }
+    big.big_zero(a)
+    big.big_from_be(a, (&raw[0]) as u64, 32)
+    big.big_set_len(a, 8)
+}
+
+fn ctx_init(c: *mut Ctx) -> bool {
+    (*c).ok = false
+    from_hex(&(*c).p, "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff")
+    from_hex(&(*c).n, "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
+    from_hex(&(*c).pm2, "ffffffff00000001000000000000000000000000fffffffffffffffffffffffd")
+    from_hex(&(*c).nm2, "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc63254f")
+    if !big.mont_init(&(*c).mp, &(*c).p) { return false }
+    if !big.mont_init(&(*c).mn, &(*c).n) { return false }
+    var t: big.Big = big.big_new()
+    from_hex(&t, "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b")
+    big.mont_to(&(*c).mp, &(*c).bm, &t)
+    from_hex(&t, "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")
+    big.mont_to(&(*c).mp, &(*c).gx, &t)
+    from_hex(&t, "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+    big.mont_to(&(*c).mp, &(*c).gy, &t)
+    (*c).ok = true
+    return true
+}
+
+fn ctx_new() -> Ctx {
+    return Ctx { mp: big.mont_new(), mn: big.mont_new(), p: big.big_new(),
+        n: big.big_new(), pm2: big.big_new(), nm2: big.big_new(),
+        bm: big.big_new(), gx: big.big_new(), gy: big.big_new(), ok: false }
+}
+
+// ------------------------------------------------------ The field, mod p
+
+fn fmul(c: *mut Ctx, r: *mut big.Big, a: *mut big.Big, b: *mut big.Big) {
+    big.mont_mul(&(*c).mp, r, a, b)
+}
+
+fn fadd(c: *mut Ctx, r: *mut big.Big, a: *mut big.Big, b: *mut big.Big) {
+    big.big_add_mod(r, a, b, &(*c).p)
+}
+
+fn fsub(c: *mut Ctx, r: *mut big.Big, a: *mut big.Big, b: *mut big.Big) {
+    big.big_sub_mod(r, a, b, &(*c).p)
+}
+
+// r = p + q, complete (RCB 2016, algorithm 4, a = -3). `r` may be `p`
+// or `q`: everything is read into temporaries first.
+fn pt_add(c: *mut Ctx, r: *mut Pt3, p: *mut Pt3, q: *mut Pt3) {
+    var x1: big.Big = (*p).x
+    var y1: big.Big = (*p).y
+    var z1: big.Big = (*p).z
+    var x2: big.Big = (*q).x
+    var y2: big.Big = (*q).y
+    var z2: big.Big = (*q).z
+    var t0: big.Big = big.big_new()
+    var t1: big.Big = big.big_new()
+    var t2: big.Big = big.big_new()
+    var t3: big.Big = big.big_new()
+    var t4: big.Big = big.big_new()
+    var x3: big.Big = big.big_new()
+    var y3: big.Big = big.big_new()
+    var z3: big.Big = big.big_new()
+    fmul(c, &t0, &x1, &x2)
+    fmul(c, &t1, &y1, &y2)
+    fmul(c, &t2, &z1, &z2)
+    fadd(c, &t3, &x1, &y1)
+    fadd(c, &t4, &x2, &y2)
+    fmul(c, &t3, &t3, &t4)
+    fadd(c, &t4, &t0, &t1)
+    fsub(c, &t3, &t3, &t4)
+    fadd(c, &t4, &y1, &z1)
+    fadd(c, &x3, &y2, &z2)
+    fmul(c, &t4, &t4, &x3)
+    fadd(c, &x3, &t1, &t2)
+    fsub(c, &t4, &t4, &x3)
+    fadd(c, &x3, &x1, &z1)
+    fadd(c, &y3, &x2, &z2)
+    fmul(c, &x3, &x3, &y3)
+    fadd(c, &y3, &t0, &t2)
+    fsub(c, &y3, &x3, &y3)
+    fmul(c, &z3, &(*c).bm, &t2)
+    fsub(c, &x3, &y3, &z3)
+    fadd(c, &z3, &x3, &x3)
+    fadd(c, &x3, &x3, &z3)
+    fsub(c, &z3, &t1, &x3)
+    fadd(c, &x3, &t1, &x3)
+    fmul(c, &y3, &(*c).bm, &y3)
+    fadd(c, &t1, &t2, &t2)
+    fadd(c, &t2, &t1, &t2)
+    fsub(c, &y3, &y3, &t2)
+    fsub(c, &y3, &y3, &t0)
+    fadd(c, &t1, &y3, &y3)
+    fadd(c, &y3, &t1, &y3)
+    fadd(c, &t1, &t0, &t0)
+    fadd(c, &t0, &t1, &t0)
+    fsub(c, &t0, &t0, &t2)
+    fmul(c, &t1, &t4, &y3)
+    fmul(c, &t2, &t0, &y3)
+    fmul(c, &y3, &x3, &z3)
+    fadd(c, &y3, &y3, &t2)
+    fmul(c, &x3, &t3, &x3)
+    fsub(c, &x3, &x3, &t1)
+    fmul(c, &z3, &t4, &z3)
+    fmul(c, &t1, &t3, &t0)
+    fadd(c, &z3, &z3, &t1)
+    (*r).x = x3
+    (*r).y = y3
+    (*r).z = z3
+}
+
+// Swaps a and b when mask is all ones, leaves them when it is zero.
+fn big_cswap(a: *mut big.Big, b: *mut big.Big, mask: u64) {
+    var ta: big.Big = *a
+    big.select_into(a, a, b, mask, 8)
+    big.select_into(b, b, &ta, mask, 8)
+}
+
+fn pt_cswap(a: *mut Pt3, b: *mut Pt3, mask: u64) {
+    big_cswap(&(*a).x, &(*b).x, mask)
+    big_cswap(&(*a).y, &(*b).y, mask)
+    big_cswap(&(*a).z, &(*b).z, mask)
+}
+
+// k (32 octets, big endian) times the point (px, py) given in the
+// Montgomery domain. The affine result goes to out_x/out_y as 32 octets
+// each. False when the result is the point at infinity (k = 0 mod n).
+fn ladder(c: *mut Ctx, k: *mut big.Big, px: *mut big.Big, py: *mut big.Big,
+    out_x: u64, out_y: u64) -> bool {
+    var r0: Pt3 = pt_new()
+    big.big_set_len(&r0.x, 8)
+    r0.y = (*c).mp.one
+    big.big_set_len(&r0.z, 8)
+    var r1: Pt3 = pt_new()
+    r1.x = *px
+    r1.y = *py
+    r1.z = (*c).mp.one
+    var i: usize = 256
+    while i > 0 {
+        i = i - 1
+        let bit: u64 = big.big_bit(k, i) as u64
+        let mask: u64 = (0 as u64) -% bit
+        pt_cswap(&r0, &r1, mask)
+        pt_add(c, &r1, &r0, &r1)
+        pt_add(c, &r0, &r0, &r0)
+        pt_cswap(&r0, &r1, mask)
+    }
+    if big.big_is_zero(&r0.z) {
+        return false
+    }
+    var zi: big.Big = big.big_new()
+    big.mont_pow(&(*c).mp, &zi, &r0.z, &(*c).pm2)
+    var ax: big.Big = big.big_new()
+    var ay: big.Big = big.big_new()
+    fmul(c, &ax, &r0.x, &zi)
+    fmul(c, &ay, &r0.y, &zi)
+    var x: big.Big = big.big_new()
+    var y: big.Big = big.big_new()
+    big.mont_from(&(*c).mp, &x, &ax)
+    big.mont_from(&(*c).mp, &y, &ay)
+    big.big_to_be(&x, out_x, 32)
+    big.big_to_be(&y, out_y, 32)
+    return true
+}
+
+// 1 <= d < n ?
+fn p256_scalar_valid(d: u64) -> bool {
+    var c: Ctx = ctx_new()
+    if !ctx_init(&c) { return false }
+    var k: big.Big = big.big_new()
+    big.big_from_be(&k, d, 32)
+    big.big_set_len(&k, 8)
+    if big.big_is_zero(&k) { return false }
+    return big.big_cmp(&k, &c.n) < 0
+}
+
+// The public key of the private scalar d (32 octets): 0x04 || x || y,
+// 65 octets, the uncompressed form of SEC 1 2.3.3.
+fn p256_public(d: u64, out: u64) -> bool {
+    var c: Ctx = ctx_new()
+    if !ctx_init(&c) { return false }
+    var k: big.Big = big.big_new()
+    big.big_from_be(&k, d, 32)
+    big.big_set_len(&k, 8)
+    if big.big_is_zero(&k) || big.big_cmp(&k, &c.n) >= 0 { return false }
+    rt.st8(out, 0, 4 as u8)
+    return ladder(&c, &k, &c.gx, &c.gy, out + 1, out + 33)
+}
+
+// k * (x, y) for an affine point given as 32+32 octets. For tests and for
+// ECDH; the point is NOT checked to lie on the curve here.
+fn p256_mult(k32: u64, x: u64, y: u64, out_x: u64, out_y: u64) -> bool {
+    var c: Ctx = ctx_new()
+    if !ctx_init(&c) { return false }
+    var k: big.Big = big.big_new()
+    big.big_from_be(&k, k32, 32)
+    big.big_set_len(&k, 8)
+    var ax: big.Big = big.big_new()
+    var ay: big.Big = big.big_new()
+    big.big_from_be(&ax, x, 32)
+    big.big_set_len(&ax, 8)
+    big.big_from_be(&ay, y, 32)
+    big.big_set_len(&ay, 8)
+    var mx: big.Big = big.big_new()
+    var my: big.Big = big.big_new()
+    big.mont_to(&c.mp, &mx, &ax)
+    big.mont_to(&c.mp, &my, &ay)
+    return ladder(&c, &k, &mx, &my, out_x, out_y)
+}
+
+// ---------------------------------------------------- RFC 6979 nonces
+
+// K = HMAC_K(V || sep || x || h1 [|| extra]); V = HMAC_K(V)
+fn drbg_step(key: u64, v: u64, sep: i32, x: u64, h1: u64, extra: u64,
+    en: usize) {
+    var m: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&m, v, 32)
+    if sep >= 0 {
+        rt.buf_push(&m, sep as u8)
+        rt.buf_push_bytes(&m, x, 32)
+        rt.buf_push_bytes(&m, h1, 32)
+        if en > 0 {
+            rt.buf_push_bytes(&m, extra, en)
+        }
+    }
+    var nk: [u8; 32] = [0; 32]
+    hmac.hmac_sha256(key, 32, m.ptr, m.len, (&nk[0]) as u64)
+    rt.buf_free(&m)
+    rt.mem_copy(key, (&nk[0]) as u64, 32)
+    hmac.hmac_sha256(key, 32, v, 32, (&nk[0]) as u64)
+    rt.mem_copy(v, (&nk[0]) as u64, 32)
+}
+
+// Signs the 32-octet hash with the private scalar d. r and s go to out_r
+// and out_s, 32 octets each. `extra`/`en`: additional random octets
+// (RFC 6979 3.6); en = 0 gives the plain deterministic nonce of 3.2, which
+// is what the test vectors of RFC 6979 A.2.5 are made with.
+fn p256_sign(d: u64, hash: u64, extra: u64, en: usize, out_r: u64,
+    out_s: u64) -> bool {
+    var c: Ctx = ctx_new()
+    if !ctx_init(&c) { return false }
+    var dk: big.Big = big.big_new()
+    big.big_from_be(&dk, d, 32)
+    big.big_set_len(&dk, 8)
+    if big.big_is_zero(&dk) || big.big_cmp(&dk, &c.n) >= 0 { return false }
+    // e = h1 mod n (h1 < 2^256 < 2n, so one conditional subtraction)
+    var e: big.Big = big.big_new()
+    big.big_from_be(&e, hash, 32)
+    big.big_set_len(&e, 8)
+    var es: big.Big = big.big_new()
+    let borrow: u64 = big.big_sub(&es, &e, &c.n, 8)
+    big.select_into(&e, &e, &es, (0 as u64) -% (1 as u64 - borrow), 8)
+    var h1: [u8; 32] = [0; 32]
+    big.big_to_be(&e, (&h1[0]) as u64, 32)
+    var key: [u8; 32] = [0; 32]
+    var v: [u8; 32] = [0; 32]
+    var i: usize = 0
+    while i < 32 {
+        v[i] = 1 as u8
+        i = i + 1
+    }
+    let kp: u64 = (&key[0]) as u64
+    let vp: u64 = (&v[0]) as u64
+    drbg_step(kp, vp, 0, d, (&h1[0]) as u64, extra, en)
+    drbg_step(kp, vp, 1, d, (&h1[0]) as u64, extra, en)
+    var tries: usize = 0
+    while tries < 64 {
+        tries = tries + 1
+        var t: [u8; 32] = [0; 32]
+        hmac.hmac_sha256(kp, 32, vp, 32, (&t[0]) as u64)
+        rt.mem_copy(vp, (&t[0]) as u64, 32)
+        var k: big.Big = big.big_new()
+        big.big_from_be(&k, vp, 32)
+        big.big_set_len(&k, 8)
+        var ok: bool = !big.big_is_zero(&k) && big.big_cmp(&k, &c.n) < 0
+        if ok {
+            var rx: [u8; 32] = [0; 32]
+            var ry: [u8; 32] = [0; 32]
+            ok = ladder(&c, &k, &c.gx, &c.gy, (&rx[0]) as u64,
+                (&ry[0]) as u64)
+            if ok {
+                // r = x mod n (public)
+                var r: big.Big = big.big_new()
+                big.big_from_be(&r, (&rx[0]) as u64, 32)
+                big.big_set_len(&r, 8)
+                var rs: big.Big = big.big_new()
+                let b2: u64 = big.big_sub(&rs, &r, &c.n, 8)
+                if b2 == 0 as u64 {
+                    r = rs
+                }
+                if !big.big_is_zero(&r) {
+                    // s = k^-1 (e + r d) mod n, in the domain of n
+                    var km: big.Big = big.big_new()
+                    var kinv: big.Big = big.big_new()
+                    var rm: big.Big = big.big_new()
+                    var dm: big.Big = big.big_new()
+                    var em: big.Big = big.big_new()
+                    var t1: big.Big = big.big_new()
+                    var sm: big.Big = big.big_new()
+                    var s: big.Big = big.big_new()
+                    big.mont_to(&c.mn, &km, &k)
+                    big.mont_pow(&c.mn, &kinv, &km, &c.nm2)
+                    big.mont_to(&c.mn, &rm, &r)
+                    big.mont_to(&c.mn, &dm, &dk)
+                    big.mont_to(&c.mn, &em, &e)
+                    big.mont_mul(&c.mn, &t1, &rm, &dm)
+                    big.big_add_mod(&t1, &t1, &em, &c.n)
+                    big.mont_mul(&c.mn, &sm, &kinv, &t1)
+                    big.mont_from(&c.mn, &s, &sm)
+                    if !big.big_is_zero(&s) {
+                        big.big_to_be(&r, out_r, 32)
+                        big.big_to_be(&s, out_s, 32)
+                        return true
+                    }
+                }
+            }
+        }
+        // K = HMAC_K(V || 0x00); V = HMAC_K(V)
+        var m: [u8; 33] = [0; 33]
+        rt.mem_copy((&m[0]) as u64, vp, 32)
+        var nk: [u8; 32] = [0; 32]
+        hmac.hmac_sha256(kp, 32, (&m[0]) as u64, 33, (&nk[0]) as u64)
+        rt.mem_copy(kp, (&nk[0]) as u64, 32)
+        hmac.hmac_sha256(kp, 32, vp, 32, (&nk[0]) as u64)
+        rt.mem_copy(vp, (&nk[0]) as u64, 32)
+    }
+    return false
+}
+
+// ------------------------------------------------ The `DER` form (r, s)
+
+fn push_der_int(b: *mut rt.Buf, p: u64) {
+    var i: usize = 0
+    while i < 31 && rt.ld8(p, i) == 0 as u8 {
+        i = i + 1
+    }
+    let pad: bool = rt.ld8(p, i) >= 128 as u8
+    var len: usize = 32 - i
+    if pad {
+        len = len + 1
+    }
+    rt.buf_push(b, 2 as u8)
+    rt.buf_push(b, len as u8)
+    if pad {
+        rt.buf_push(b, 0 as u8)
+    }
+    rt.buf_push_bytes(b, p + i as u64, 32 - i)
+}
+
+// SEQUENCE { INTEGER r, INTEGER s } -- what TLS and X.509 carry.
+fn p256_sig_der(r: u64, s: u64, out: *mut rt.Buf) {
+    var body: rt.Buf = rt.buf_new()
+    push_der_int(&body, r)
+    push_der_int(&body, s)
+    rt.buf_push(out, 48 as u8)
+    rt.buf_push(out, body.len as u8)
+    rt.buf_push_bytes(out, body.ptr, body.len)
+    rt.buf_free(&body)
+}
+
+fn der_int_to32(p: u64, off: *mut usize, n: usize, out: u64) -> bool {
+    if *off + 2 > n || rt.ld8(p, *off) != 2 as u8 { return false }
+    var len: usize = rt.ld8(p, *off + 1) as usize
+    var at: usize = *off + 2
+    if len == 0 || len > 33 || at + len > n { return false }
+    *off = at + len
+    while len > 32 {
+        if rt.ld8(p, at) != 0 as u8 { return false }
+        at = at + 1
+        len = len - 1
+    }
+    rt.mem_set(out, 0 as u8, 32)
+    rt.mem_copy(out + (32 - len) as u64, p + at as u64, len)
+    return true
+}
+
+// The inverse, for tests: `DER` -> r, s (32 octets each).
+fn p256_sig_from_der(p: u64, n: usize, r: u64, s: u64) -> bool {
+    if n < 8 || rt.ld8(p, 0) != 48 as u8 { return false }
+    if rt.ld8(p, 1) as usize != n - 2 { return false }
+    var off: usize = 2
+    if !der_int_to32(p, &off, n, r) { return false }
+    if !der_int_to32(p, &off, n, s) { return false }
+    return off == n
+}

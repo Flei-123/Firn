@@ -472,19 +472,18 @@ impl Op {
     }
 
     /// All values read.
-    /// **RUNDE TEMPO 10** — jeder Platz, an dem diese Anweisung einen Wert
-    /// LIEST, zum Veraendern.
+    /// **ROUND TEMPO 10** — every place at which this instruction READS a
+    /// value, for modifying.
     ///
-    /// Bis hierher stand diese Tabelle in `mem2reg::replace_uses`, und sie
-    /// ist inzwischen die einzige Stelle, die vollstaendig weiss, welcher
-    /// Operand wo sitzt. Ein zweiter Umschreiber (`split.rs` braucht einen,
-    /// der nur INNERHALB einer Schleife umschreibt) waere eine zweite
-    /// Antwort auf dieselbe Frage gewesen -- also steht sie jetzt hier, und
-    /// beide rufen sie auf.
+    /// Until now this table stood in `mem2reg::replace_uses`, and it is
+    /// meanwhile the only place that fully knows which operand sits
+    /// where. A second rewriter (`split.rs` needs one that only
+    /// rewrites INSIDE a loop) would have been a second answer to the same
+    /// question -- so it stands here now, and both call it.
     ///
-    /// Die unantastbaren Anweisungen (SPEC §9.2: `select`, `barrier`,
-    /// `secure_zero`, Assembler, MMIO) melden NICHTS; ihre Operanden bleiben
-    /// unveraendert, egal wer fragt.
+    /// The untouchable instructions (SPEC §9.2: `select`, `barrier`,
+    /// `secure_zero`, assembler, MMIO) report NOTHING; their operands stay
+    /// unchanged, no matter who asks.
     pub(crate) fn for_each_use_mut(&mut self, mut rep: impl FnMut(&mut Val)) {
         match self {
             Op::Const(_) | Op::Alloca { .. } | Op::GcAddr { .. } | Op::ThreadSelf => {}
@@ -820,17 +819,17 @@ pub struct Func {
     /// functions are lowered one after another, and a stale stamp would
     /// attribute the prologue of the second to the last line of the first.
     pub loc_stamp: Loc,
-    /// **RUNDE TEMPO 10** — Werte, die NICHT verschmolzen werden duerfen.
+    /// **ROUND TEMPO 10** — values that must NOT be merged.
     ///
-    /// `split::nach_zuteilung` schneidet eine Lebensdauer auf, indem es eine
-    /// Kopie in den Vorkopf der Schleife setzt. Das Verschmelzen aus TEMPO 8
-    /// sieht genau diese Kopie und legt beide Werte wieder zusammen — der
-    /// Schnitt waere damit sofort wieder zu. Gemessen: von siebzehn
-    /// Schnitten in `l3_huffman` bekam KEIN EINZIGER ein Register, weil
-    /// jeder vorher wieder verschmolzen wurde.
+    /// `split::nach_zuteilung` cuts up a lifetime by putting a
+    /// copy into the pre-header of the loop. The merging from TEMPO 8
+    /// sees exactly this copy and puts both values together again -- the
+    /// cut would thereby be closed again at once. Measured: of seventeen
+    /// cuts in `l3_huffman` NOT ONE got a register, because
+    /// each was merged again beforehand.
     ///
-    /// Leer in jeder Funktion, die aus dem Vorderteil kommt; nur der
-    /// Zuteiler fuellt sie, und nur fuer seine eigene Zweitfassung.
+    /// Empty in every function that comes from the front end; only the
+    /// allocator fills it, and only for its own second version.
     pub no_coalesce: std::collections::HashSet<Val>,
 }
 

@@ -1,0 +1,1103 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/tls/tls_server.fi -- the SERVER side of TLS 1.3 (RFC 8446).
+//
+// `tls.tls` is the client. This is the other end: it answers a
+// ClientHello, proves possession of a certificate's key with
+// CertificateVerify, and then carries application data -- enough for a
+// browser to open https:// on a Firn program.
+//
+// ========================================================= NO SOCKET HERE
+//
+// The client reads and writes its socket itself and blocks. A server with
+// several connections cannot: it waits on all of them at once (poll) and
+// may block on none. So this file is "sans I/O": the caller hands in the
+// octets that came off the wire and takes out the octets that have to go
+// on it.
+//
+//     var t: tls_server.TlsServer = tls_server.server_new(&cfg)
+//     server.feed(&t, p, n)             // octets from the socket
+//     ... send server.out_ptr(&t), server.out_len(&t), then out_consume ...
+//     ... plaintext: server.app_ptr(&t), server.app_len(&t), app_consume ...
+//     server.send(&t, p, n)             // plaintext -> records in `out`
+//
+// ============================================================== THE FLIGHT
+//
+//     <- ClientHello            + key_share (X25519)
+//     -> ServerHello            + key_share
+//     -> change_cipher_spec     (only for middlebox compatibility)
+//        --- encrypted with the server handshake key ---
+//     -> EncryptedExtensions    (+ ALPN "http/1.1" when asked)
+//     -> Certificate
+//     -> CertificateVerify      ECDSA P-256 / SHA-256 (lib/std/crypto/p256.fi)
+//     -> Finished
+//     <- Finished               checked; then application data both ways
+//
+// A ClientHello without an X25519 share but with X25519 in its groups is
+// answered with ONE HelloRetryRequest (RFC 8446 4.1.4); the transcript
+// then starts with the synthetic message_hash, as 4.4.1 prescribes.
+//
+// ==================================================================== HONEST
+//
+// S1 ONE KEY TYPE: ECDSA on P-256 (signature scheme 0x0403). An RSA
+//    certificate is refused when it is loaded, not at the first handshake.
+// S2 TWO SUITES: TLS_AES_128_GCM_SHA256 and TLS_CHACHA20_POLY1305_SHA256.
+//    The client's order decides. No SHA-384 suite (lib/tls/keys.fi K1).
+// S3 ONE GROUP: X25519.
+// S4 NO SESSION TICKETS, NO PSK, NO 0-RTT. Every connection is a full
+//    handshake; since no ticket is ever issued, no client tries early
+//    data.
+// S5 NO CLIENT CERTIFICATES.
+// S6 KeyUpdate from the client IS handled (both directions when asked).
+import std.rt
+import std.crypto.sha256
+import std.crypto.hmac
+import std.crypto.random
+import std.crypto.x25519
+import std.crypto.chacha
+import std.crypto.gcm
+import std.crypto.p256
+import std.base64
+import tls.keys
+import tls.der
+
+export {
+    TlsConfig, TlsServer,
+    config_new, config_free, config_load_pem, config_set, config_ok,
+    config_chain_count, config_cert_ptr, config_cert_len, config_key_ptr,
+    server_new, server_free, feed, send, close,
+    established, is_closed, failed, alert_sent, alert_got,
+    out_ptr, out_len, out_consume, app_ptr, app_len, app_consume,
+    suite, alpn_is_http11, sni_ptr, sni_len,
+    SUITE_AES128GCM, SUITE_CHACHA20,
+}
+
+const SUITE_AES128GCM: u32 = 4865 // 0x1301
+const SUITE_CHACHA20: u32 = 4867 // 0x1303
+
+const REC_CCS: u32 = 20
+const REC_ALERT: u32 = 21
+const REC_HANDSHAKE: u32 = 22
+const REC_APPDATA: u32 = 23
+
+const HS_CLIENT_HELLO: u32 = 1
+const HS_SERVER_HELLO: u32 = 2
+const HS_ENCRYPTED_EXT: u32 = 8
+const HS_CERTIFICATE: u32 = 11
+const HS_CERT_VERIFY: u32 = 15
+const HS_FINISHED: u32 = 20
+const HS_KEY_UPDATE: u32 = 24
+const HS_MESSAGE_HASH: u32 = 254
+
+// alert descriptions (RFC 8446 6)
+const A_CLOSE_NOTIFY: u32 = 0
+const A_UNEXPECTED: u32 = 10
+const A_BAD_MAC: u32 = 20
+const A_OVERFLOW: u32 = 22
+const A_HANDSHAKE_FAILURE: u32 = 40
+const A_ILLEGAL: u32 = 47
+const A_DECODE: u32 = 50
+const A_DECRYPT: u32 = 51
+const A_PROTOCOL_VERSION: u32 = 70
+const A_INTERNAL: u32 = 80
+const A_MISSING_EXT: u32 = 109
+const A_NO_APP_PROTOCOL: u32 = 120
+
+const ST_HELLO: u32 = 0 // waiting for the (first) ClientHello
+const ST_HELLO2: u32 = 1 // HelloRetryRequest sent, waiting for the second
+const ST_WAIT_FIN: u32 = 2 // our flight is out, waiting for the client's Finished
+const ST_OPEN: u32 = 3
+const ST_CLOSED: u32 = 4
+const ST_FAILED: u32 = 5
+
+const MAX_PLAIN: usize = 16384
+const MAX_CIPHER: usize = 16640 // 2^14 + 256
+const MAX_HANDSHAKE: usize = 65536
+const MAX_CHAIN: usize = 8
+
+// ---------------------------------------------------------------- Config
+
+// The certificate chain (leaf first, `DER`) and the private scalar of the
+// leaf's P-256 key. One config serves every connection.
+struct TlsConfig {
+    blob: rt.Buf,
+    off: [usize; 8],
+    len: [usize; 8],
+    n: usize,
+    key: [u8; 32],
+    ok: bool,
+}
+
+fn config_new() -> TlsConfig {
+    return TlsConfig { blob: rt.buf_new(), off: [0; 8], len: [0; 8], n: 0,
+        key: [0; 32], ok: false }
+}
+
+fn config_free(c: *mut TlsConfig) {
+    rt.mem_set((&(*c).key[0]) as u64, 0 as u8, 32)
+    rt.buf_free(&(*c).blob)
+    (*c).n = 0
+    (*c).ok = false
+}
+
+fn config_ok(c: *mut TlsConfig) -> bool { return (*c).ok }
+fn config_chain_count(c: *mut TlsConfig) -> usize { return (*c).n }
+fn config_cert_ptr(c: *mut TlsConfig, i: usize) -> u64 {
+    return (*c).blob.ptr + (*c).off[i] as u64
+}
+fn config_cert_len(c: *mut TlsConfig, i: usize) -> usize { return (*c).len[i] }
+fn config_key_ptr(c: *mut TlsConfig) -> u64 { return (&(*c).key[0]) as u64 }
+
+fn find(p: u64, n: usize, from: usize, lit: str) -> usize {
+    var i: usize = from
+    while i + lit.n <= n {
+        if rt.mem_eq(p + i as u64, lit.p as u64, lit.n) {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// The public key point (65 octets, 04 x y) inside a certificate's
+// SubjectPublicKeyInfo, found by walking the `DER`. 0 when it is not P-256.
+fn cert_p256_point(p: u64, n: usize) -> u64 {
+    var d: der.Der = der.der_open(p, 0, n)
+    var cert: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&d, der.T_SEQ, &cert) { return 0 }
+    var tbs: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&cert, der.T_SEQ, &tbs) { return 0 }
+    // [0] version (optional), serial, signature, issuer, validity, subject
+    if der.der_peek(&tbs) == 160 as u32 {
+        der.der_skip(&tbs)
+    }
+    var k: usize = 0
+    while k < 5 {
+        if !der.der_skip(&tbs) { return 0 }
+        k = k + 1
+    }
+    var spki: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&tbs, der.T_SEQ, &spki) { return 0 }
+    var alg: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&spki, der.T_SEQ, &alg) { return 0 }
+    var tag: u32 = 0
+    var off: usize = 0
+    var len: usize = 0
+    if !der.der_read(&alg, &tag, &off, &len) { return 0 }
+    // id-ecPublicKey 1.2.840.10045.2.1
+    var ec: [u8; 7] = [42, 134, 72, 206, 61, 2, 1]
+    if tag != der.T_OID || len != 7 || !rt.mem_eq(p + off as u64, (&ec[0]) as u64, 7) {
+        return 0
+    }
+    if !der.der_read(&alg, &tag, &off, &len) { return 0 }
+    // prime256v1 1.2.840.10045.3.1.7
+    var curve: [u8; 8] = [42, 134, 72, 206, 61, 3, 1, 7]
+    if tag != der.T_OID || len != 8 || !rt.mem_eq(p + off as u64, (&curve[0]) as u64, 8) {
+        return 0
+    }
+    if !der.der_read(&spki, &tag, &off, &len) { return 0 }
+    if tag != der.T_BITSTRING || len != 66 || rt.ld8(p, off) != 0 as u8
+    || rt.ld8(p, off + 1) != 4 as u8 {
+        return 0
+    }
+    return p + (off + 1) as u64
+}
+
+// The private scalar out of an "EC PRIVATE KEY" (SEC 1, RFC 5915) or a
+// "PRIVATE KEY" (PKCS #8, RFC 5208) holding one.
+fn key_from_der(p: u64, n: usize, out: u64) -> bool {
+    var d: der.Der = der.der_open(p, 0, n)
+    var top: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&d, der.T_SEQ, &top) { return false }
+    var ver: u64 = 99
+    if !der.der_uint(&top, &ver) { return false }
+    var tag: u32 = 0
+    var off: usize = 0
+    var len: usize = 0
+    if ver == 0 {
+        // PKCS #8: AlgorithmIdentifier, then an OCTET STRING with SEC 1
+        if !der.der_skip(&top) { return false }
+        if !der.der_read(&top, &tag, &off, &len) || tag != der.T_OCTETSTRING {
+            return false
+        }
+        return key_from_der(p + off as u64, len, out)
+    }
+    if ver != 1 { return false }
+    if !der.der_read(&top, &tag, &off, &len) || tag != der.T_OCTETSTRING
+    || len == 0 || len > 32 {
+        return false
+    }
+    rt.mem_set(out, 0 as u8, 32)
+    rt.mem_copy(out + (32 - len) as u64, p + off as u64, len)
+    return true
+}
+
+// Loads the chain and the key from PEM text (they may be one file or two;
+// pass the same text twice). The key has to belong to the first
+// certificate -- checked by recomputing the public point from the scalar,
+// so a mismatched pair is refused HERE and not by every browser later.
+fn config_load_pem(c: *mut TlsConfig, cert: u64, cn: usize, key: u64,
+    kn: usize) -> bool {
+    (*c).ok = false
+    (*c).n = 0
+    rt.buf_clear(&(*c).blob)
+    var at: usize = 0
+    while (*c).n < MAX_CHAIN {
+        let b: usize = find(cert, cn, at, "-----BEGIN CERTIFICATE-----")
+        if b >= cn { break }
+        let body: usize = b + 27
+        let e: usize = find(cert, cn, body, "-----END CERTIFICATE-----")
+        if e >= cn { return false }
+        let before: usize = (*c).blob.len
+        if !base64.decode(cert + body as u64, e - body, &(*c).blob) { return false }
+        (*c).off[(*c).n] = before
+        (*c).len[(*c).n] = (*c).blob.len - before
+        (*c).n = (*c).n + 1
+        at = e + 25
+    }
+    if (*c).n == 0 { return false }
+    var kb: rt.Buf = rt.buf_new()
+    var got: bool = false
+    var b: usize = find(key, kn, 0, "-----BEGIN EC PRIVATE KEY-----")
+    if b < kn {
+        let e: usize = find(key, kn, b + 30, "-----END EC PRIVATE KEY-----")
+        got = e < kn && base64.decode(key + (b + 30) as u64, e - b - 30, &kb)
+    } else {
+        b = find(key, kn, 0, "-----BEGIN PRIVATE KEY-----")
+        if b < kn {
+            let e: usize = find(key, kn, b + 27, "-----END PRIVATE KEY-----")
+            got = e < kn && base64.decode(key + (b + 27) as u64, e - b - 27, &kb)
+        }
+    }
+    if got {
+        got = key_from_der(kb.ptr, kb.len, (&(*c).key[0]) as u64)
+    }
+    rt.mem_set(kb.ptr, 0 as u8, kb.len)
+    rt.buf_free(&kb)
+    if !got { return false }
+    return config_check(c)
+}
+
+// A chain and a key that are already `DER` / a raw scalar (for a
+// certificate made in memory, see tls.selfsigned).
+fn config_set(c: *mut TlsConfig, cert: u64, cn: usize, key32: u64) -> bool {
+    rt.buf_clear(&(*c).blob)
+    rt.buf_push_bytes(&(*c).blob, cert, cn)
+    (*c).off[0] = 0
+    (*c).len[0] = cn
+    (*c).n = 1
+    rt.mem_copy((&(*c).key[0]) as u64, key32, 32)
+    return config_check(c)
+}
+
+fn config_check(c: *mut TlsConfig) -> bool {
+    let pt: u64 = cert_p256_point(config_cert_ptr(c, 0), config_cert_len(c, 0))
+    if pt == 0 { return false }
+    var mine: [u8; 65] = [0; 65]
+    if !p256.p256_public((&(*c).key[0]) as u64, (&mine[0]) as u64) { return false }
+    (*c).ok = rt.mem_eq(pt, (&mine[0]) as u64, 65)
+    return (*c).ok
+}
+
+// ------------------------------------------------------------ Connection
+
+struct TlsServer {
+    cfg: *mut TlsConfig,
+    state: u32,
+    rbuf: rt.Buf, // raw octets not yet cut into records
+    rpos: usize,
+    hsin: rt.Buf, // handshake octets not yet cut into messages
+    hspos: usize,
+    tr: rt.Buf, // the transcript
+    out: rt.Buf, // raw octets for the wire
+    opos: usize,
+    app: rt.Buf, // decrypted application data for the caller
+    apos: usize,
+    suite: u32,
+    keylen: usize,
+    rkey: [u8; 32], // reading: the CLIENT's traffic key
+    riv: [u8; 12],
+    rseq: u64,
+    wkey: [u8; 32], // writing: the SERVER's traffic key
+    wiv: [u8; 12],
+    wseq: u64,
+    rkeys: bool,
+    wkeys: bool,
+    hs_secret: [u8; 32],
+    c_hs: [u8; 32],
+    s_hs: [u8; 32],
+    c_ap: [u8; 32],
+    s_ap: [u8; 32],
+    sid: [u8; 32],
+    sidlen: usize,
+    cshare: [u8; 32],
+    have_share: bool,
+    offers_x25519: bool,
+    offers_1303: bool,
+    ecdsa_ok: bool,
+    v13: bool,
+    alpn_offered: bool,
+    alpn_h11: bool,
+    sni: [u8; 256],
+    snilen: usize,
+    alert_out: u32, // the alert we sent (256 = none)
+    alert_in: u32, // the alert we got (256 = none)
+    retried: bool,
+}
+
+fn server_new(cfg: *mut TlsConfig) -> TlsServer {
+    return TlsServer { cfg: cfg, state: ST_HELLO, rbuf: rt.buf_new(), rpos: 0,
+        hsin: rt.buf_new(), hspos: 0, tr: rt.buf_new(), out: rt.buf_new(),
+        opos: 0, app: rt.buf_new(), apos: 0, suite: 0, keylen: 16,
+        rkey: [0; 32], riv: [0; 12], rseq: 0, wkey: [0; 32], wiv: [0; 12],
+        wseq: 0, rkeys: false, wkeys: false, hs_secret: [0; 32],
+        c_hs: [0; 32], s_hs: [0; 32], c_ap: [0; 32], s_ap: [0; 32],
+        sid: [0; 32], sidlen: 0, cshare: [0; 32], have_share: false,
+        offers_x25519: false, offers_1303: false, ecdsa_ok: false,
+        v13: false, alpn_offered: false, alpn_h11: false, sni: [0; 256],
+        snilen: 0, alert_out: 256, alert_in: 256, retried: false }
+}
+
+fn server_free(t: *mut TlsServer) {
+    rt.buf_free(&(*t).rbuf)
+    rt.buf_free(&(*t).hsin)
+    rt.buf_free(&(*t).tr)
+    rt.buf_free(&(*t).out)
+    rt.buf_free(&(*t).app)
+    rt.mem_set((&(*t).rkey[0]) as u64, 0 as u8, 32)
+    rt.mem_set((&(*t).wkey[0]) as u64, 0 as u8, 32)
+    rt.mem_set((&(*t).hs_secret[0]) as u64, 0 as u8, 32)
+    rt.mem_set((&(*t).c_ap[0]) as u64, 0 as u8, 32)
+    rt.mem_set((&(*t).s_ap[0]) as u64, 0 as u8, 32)
+}
+
+fn established(t: *mut TlsServer) -> bool { return (*t).state == ST_OPEN }
+fn is_closed(t: *mut TlsServer) -> bool { return (*t).state == ST_CLOSED }
+fn failed(t: *mut TlsServer) -> bool { return (*t).state == ST_FAILED }
+fn alert_sent(t: *mut TlsServer) -> u32 { return (*t).alert_out }
+fn alert_got(t: *mut TlsServer) -> u32 { return (*t).alert_in }
+fn suite(t: *mut TlsServer) -> u32 { return (*t).suite }
+fn alpn_is_http11(t: *mut TlsServer) -> bool { return (*t).alpn_h11 }
+fn sni_ptr(t: *mut TlsServer) -> u64 { return (&(*t).sni[0]) as u64 }
+fn sni_len(t: *mut TlsServer) -> usize { return (*t).snilen }
+
+fn out_ptr(t: *mut TlsServer) -> u64 { return (*t).out.ptr + (*t).opos as u64 }
+fn out_len(t: *mut TlsServer) -> usize { return (*t).out.len - (*t).opos }
+fn out_consume(t: *mut TlsServer, n: usize) {
+    (*t).opos = (*t).opos + n
+    if (*t).opos >= (*t).out.len {
+        rt.buf_clear(&(*t).out)
+        (*t).opos = 0
+    }
+}
+
+fn app_ptr(t: *mut TlsServer) -> u64 { return (*t).app.ptr + (*t).apos as u64 }
+fn app_len(t: *mut TlsServer) -> usize { return (*t).app.len - (*t).apos }
+fn app_consume(t: *mut TlsServer, n: usize) {
+    (*t).apos = (*t).apos + n
+    if (*t).apos >= (*t).app.len {
+        rt.buf_clear(&(*t).app)
+        (*t).apos = 0
+    }
+}
+
+// ------------------------------------------------------------ Helpers
+
+fn be16(p: u64, off: usize) -> usize {
+    return ((rt.ld8(p, off) as usize) << 8) | (rt.ld8(p, off + 1) as usize)
+}
+
+fn be24(p: u64, off: usize) -> usize {
+    return ((rt.ld8(p, off) as usize) << 16) | ((rt.ld8(p, off + 1) as usize) << 8)
+    | (rt.ld8(p, off + 2) as usize)
+}
+
+fn push16(b: *mut rt.Buf, v: usize) {
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+    rt.buf_push(b, (v & 255) as u8)
+}
+
+fn push24(b: *mut rt.Buf, v: usize) {
+    rt.buf_push(b, ((v >> 16) & 255) as u8)
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+    rt.buf_push(b, (v & 255) as u8)
+}
+
+fn make_nonce(iv: u64, seq: u64, out: u64) {
+    rt.mem_copy(out, iv, 12)
+    var i: usize = 0
+    while i < 8 {
+        let sh: u64 = ((7 - i) as u64) * 8
+        rt.st8(out, 4 + i, rt.ld8(out, 4 + i) ^ ((seq >> sh) & 255) as u8)
+        i = i + 1
+    }
+}
+
+// Sends a fatal alert (or close_notify) and stops the connection.
+fn fail(t: *mut TlsServer, desc: u32) -> bool {
+    if (*t).state == ST_FAILED || (*t).state == ST_CLOSED {
+        return false
+    }
+    var a: [u8; 2] = [2, 0]
+    a[1] = desc as u8
+    write_record(t, REC_ALERT, (&a[0]) as u64, 2)
+    (*t).alert_out = desc
+    (*t).state = ST_FAILED
+    return false
+}
+
+// One record into `out`: plaintext before the keys, AEAD after them.
+fn write_record(t: *mut TlsServer, kind: u32, p: u64, n: usize) -> bool {
+    if !(*t).wkeys {
+        rt.buf_push(&(*t).out, kind as u8)
+        push16(&(*t).out, 771)
+        push16(&(*t).out, n)
+        rt.buf_push_bytes(&(*t).out, p, n)
+        return true
+    }
+    var inner: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&inner, p, n)
+    rt.buf_push(&inner, kind as u8)
+    let clen: usize = inner.len + 16
+    var head: [u8; 5] = [23, 3, 3, 0, 0]
+    head[3] = ((clen >> 8) & 255) as u8
+    head[4] = (clen & 255) as u8
+    var nonce: [u8; 12] = [0; 12]
+    make_nonce((&(*t).wiv[0]) as u64, (*t).wseq, (&nonce[0]) as u64)
+    rt.buf_push_bytes(&(*t).out, (&head[0]) as u64, 5)
+    let at: usize = (*t).out.len
+    rt.buf_reserve(&(*t).out, at + clen)
+    rt.buf_set_len(&(*t).out, at + clen)
+    var ok: bool = true
+    if (*t).suite == SUITE_CHACHA20 {
+        chacha.aead_seal((&(*t).wkey[0]) as u64, (&nonce[0]) as u64,
+            (&head[0]) as u64, 5, inner.ptr, inner.len, (*t).out.ptr + at as u64)
+    } else {
+        ok = gcm.gcm_seal((&(*t).wkey[0]) as u64, (*t).keylen, (&nonce[0]) as u64,
+            (&head[0]) as u64, 5, inner.ptr, inner.len, (*t).out.ptr + at as u64)
+    }
+    rt.buf_free(&inner)
+    (*t).wseq = (*t).wseq + 1
+    return ok
+}
+
+// Handshake messages go into the transcript and out in records of at
+// most 2^14 octets.
+fn write_handshake(t: *mut TlsServer, msg: *mut rt.Buf) -> bool {
+    rt.buf_push_bytes(&(*t).tr, (*msg).ptr, (*msg).len)
+    var at: usize = 0
+    while at < (*msg).len {
+        var k: usize = (*msg).len - at
+        if k > MAX_PLAIN { k = MAX_PLAIN }
+        if !write_record(t, REC_HANDSHAKE, (*msg).ptr + at as u64, k) { return false }
+        at = at + k
+    }
+    return true
+}
+
+fn set_read_keys(t: *mut TlsServer, secret: u64) -> bool {
+    (*t).rseq = 0
+    (*t).rkeys = true
+    return keys.traffic_keys(secret, (*t).keylen, (&(*t).rkey[0]) as u64,
+        (&(*t).riv[0]) as u64)
+}
+
+fn set_write_keys(t: *mut TlsServer, secret: u64) -> bool {
+    (*t).wseq = 0
+    (*t).wkeys = true
+    return keys.traffic_keys(secret, (*t).keylen, (&(*t).wkey[0]) as u64,
+        (&(*t).wiv[0]) as u64)
+}
+
+// secret' = HKDF-Expand-Label(secret, "traffic upd", "", 32) (RFC 8446 7.2)
+fn next_secret(secret: u64) -> bool {
+    var lit: [u8; 11] = "traffic upd"
+    var empty: [u8; 1] = [0; 1]
+    var nx: [u8; 32] = [0; 32]
+    if !keys.expand_label(secret, (&lit[0]) as u64, 11, (&empty[0]) as u64, 0,
+        (&nx[0]) as u64, 32) {
+        return false
+    }
+    rt.mem_copy(secret, (&nx[0]) as u64, 32)
+    return true
+}
+
+// ------------------------------------------------------------ Feeding
+
+// Hands in raw octets from the wire. Everything that can be answered is
+// answered into `out` at once. False when the connection is over (failed
+// or closed) -- whatever stands in `out` (an alert) should still be sent.
+fn feed(t: *mut TlsServer, p: u64, n: usize) -> bool {
+    if (*t).state == ST_FAILED || (*t).state == ST_CLOSED { return false }
+    rt.buf_push_bytes(&(*t).rbuf, p, n)
+    while (*t).state != ST_FAILED && (*t).state != ST_CLOSED {
+        let have: usize = (*t).rbuf.len - (*t).rpos
+        if have < 5 { break }
+        let base: u64 = (*t).rbuf.ptr + (*t).rpos as u64
+        let kind0: u32 = rt.ld8(base, 0) as u32
+        // Anything but the four record types, or a version octet other
+        // than 3, is not TLS at all -- plain HTTP sent to the TLS port
+        // lands here -- and is refused before its "length" is believed.
+        if kind0 < REC_CCS || kind0 > REC_APPDATA || rt.ld8(base, 1) != 3 as u8 {
+            return fail(t, A_DECODE)
+        }
+        let len: usize = be16(base, 3)
+        if len > MAX_CIPHER { return fail(t, A_OVERFLOW) }
+        if have < 5 + len { break }
+        let kind: u32 = rt.ld8(base, 0) as u32
+        (*t).rpos = (*t).rpos + 5 + len
+        if !record(t, kind, base, len) { break }
+    }
+    // compact
+    if (*t).rpos > 0 {
+        let rest: usize = (*t).rbuf.len - (*t).rpos
+        if rest > 0 {
+            rt.mem_copy((*t).rbuf.ptr, (*t).rbuf.ptr + (*t).rpos as u64, rest)
+        }
+        rt.buf_set_len(&(*t).rbuf, rest)
+        (*t).rpos = 0
+    }
+    return (*t).state != ST_FAILED && (*t).state != ST_CLOSED
+}
+
+fn record(t: *mut TlsServer, kind: u32, head: u64, len: usize) -> bool {
+    let body: u64 = head + 5
+    if kind == REC_CCS {
+        // allowed (and meaningless) only during the handshake, value 1
+        if (*t).state == ST_OPEN || len != 1 || rt.ld8(body, 0) != 1 as u8 {
+            return fail(t, A_UNEXPECTED)
+        }
+        return true
+    }
+    if !(*t).rkeys {
+        if kind == REC_ALERT {
+            return got_alert(t, body, len)
+        }
+        if kind != REC_HANDSHAKE { return fail(t, A_UNEXPECTED) }
+        if len > MAX_PLAIN { return fail(t, A_OVERFLOW) }
+        rt.buf_push_bytes(&(*t).hsin, body, len)
+        return handshake_messages(t)
+    }
+    if kind != REC_APPDATA { return fail(t, A_UNEXPECTED) }
+    if len < 17 { return fail(t, A_DECODE) }
+    var plain: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&plain, len)
+    var nonce: [u8; 12] = [0; 12]
+    make_nonce((&(*t).riv[0]) as u64, (*t).rseq, (&nonce[0]) as u64)
+    var ok: bool = false
+    if (*t).suite == SUITE_CHACHA20 {
+        ok = chacha.aead_open((&(*t).rkey[0]) as u64, (&nonce[0]) as u64, head, 5,
+            body, len, plain.ptr)
+    } else {
+        ok = gcm.gcm_open((&(*t).rkey[0]) as u64, (*t).keylen, (&nonce[0]) as u64,
+            head, 5, body, len, plain.ptr)
+    }
+    if !ok {
+        rt.buf_free(&plain)
+        return fail(t, A_BAD_MAC)
+    }
+    (*t).rseq = (*t).rseq + 1
+    var pn: usize = len - 16
+    while pn > 0 && rt.ld8(plain.ptr, pn - 1) == 0 as u8 {
+        pn = pn - 1
+    }
+    if pn == 0 {
+        rt.buf_free(&plain)
+        return fail(t, A_UNEXPECTED)
+    }
+    let inner: u32 = rt.ld8(plain.ptr, pn - 1) as u32
+    pn = pn - 1
+    if pn > MAX_PLAIN {
+        rt.buf_free(&plain)
+        return fail(t, A_OVERFLOW)
+    }
+    var r: bool = true
+    if inner == REC_APPDATA {
+        if (*t).state != ST_OPEN {
+            r = fail(t, A_UNEXPECTED)
+        } else {
+            rt.buf_push_bytes(&(*t).app, plain.ptr, pn)
+        }
+    } else if inner == REC_HANDSHAKE {
+        rt.buf_push_bytes(&(*t).hsin, plain.ptr, pn)
+        r = handshake_messages(t)
+    } else if inner == REC_ALERT {
+        r = got_alert(t, plain.ptr, pn)
+    } else {
+        r = fail(t, A_UNEXPECTED)
+    }
+    rt.buf_free(&plain)
+    return r
+}
+
+fn got_alert(t: *mut TlsServer, p: u64, n: usize) -> bool {
+    if n != 2 { return fail(t, A_DECODE) }
+    (*t).alert_in = rt.ld8(p, 1) as u32
+    if (*t).alert_in == A_CLOSE_NOTIFY {
+        // answer in kind, then the connection is over
+        if (*t).state == ST_OPEN {
+            var a: [u8; 2] = [1, 0]
+            write_record(t, REC_ALERT, (&a[0]) as u64, 2)
+        }
+        (*t).state = ST_CLOSED
+        return false
+    }
+    (*t).state = ST_FAILED
+    return false
+}
+
+// Cuts `hsin` into whole handshake messages and acts on each.
+fn handshake_messages(t: *mut TlsServer) -> bool {
+    while true {
+        let have: usize = (*t).hsin.len - (*t).hspos
+        if have < 4 { break }
+        let base: u64 = (*t).hsin.ptr + (*t).hspos as u64
+        let blen: usize = be24(base, 1)
+        if blen > MAX_HANDSHAKE { return fail(t, A_DECODE) }
+        if have < 4 + blen { break }
+        let ht: u32 = rt.ld8(base, 0) as u32
+        // copy the message out: acting on it may grow `hsin`
+        var msg: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&msg, base, 4 + blen)
+        (*t).hspos = (*t).hspos + 4 + blen
+        let r: bool = handshake(t, ht, &msg)
+        rt.buf_free(&msg)
+        if !r { return false }
+    }
+    if (*t).hspos > 0 {
+        let rest: usize = (*t).hsin.len - (*t).hspos
+        if rest > 0 {
+            rt.mem_copy((*t).hsin.ptr, (*t).hsin.ptr + (*t).hspos as u64, rest)
+        }
+        rt.buf_set_len(&(*t).hsin, rest)
+        (*t).hspos = 0
+    }
+    return true
+}
+
+fn handshake(t: *mut TlsServer, ht: u32, msg: *mut rt.Buf) -> bool {
+    let st: u32 = (*t).state
+    if st == ST_HELLO || st == ST_HELLO2 {
+        if ht != HS_CLIENT_HELLO { return fail(t, A_UNEXPECTED) }
+        // A handshake message must not straddle a key change (RFC 8446
+        // 5.1): nothing may follow the ClientHello in the same flight.
+        if (*t).hsin.len - (*t).hspos != 0 { return fail(t, A_UNEXPECTED) }
+        return client_hello(t, msg)
+    }
+    if st == ST_WAIT_FIN {
+        if ht != HS_FINISHED { return fail(t, A_UNEXPECTED) }
+        return client_finished(t, msg)
+    }
+    if st == ST_OPEN {
+        if ht != HS_KEY_UPDATE { return fail(t, A_UNEXPECTED) }
+        if (*msg).len != 5 { return fail(t, A_DECODE) }
+        let req: u8 = rt.ld8((*msg).ptr, 4)
+        if req > 1 as u8 { return fail(t, A_ILLEGAL) }
+        if !next_secret((&(*t).c_ap[0]) as u64) { return fail(t, A_INTERNAL) }
+        if !set_read_keys(t, (&(*t).c_ap[0]) as u64) { return fail(t, A_INTERNAL) }
+        if req == 1 as u8 {
+            var ku: [u8; 5] = [24, 0, 0, 1, 0]
+            write_record(t, REC_HANDSHAKE, (&ku[0]) as u64, 5)
+            if !next_secret((&(*t).s_ap[0]) as u64) { return fail(t, A_INTERNAL) }
+            if !set_write_keys(t, (&(*t).s_ap[0]) as u64) { return fail(t, A_INTERNAL) }
+        }
+        return true
+    }
+    return fail(t, A_UNEXPECTED)
+}
+
+// ------------------------------------------------------------ ClientHello
+
+fn client_hello(t: *mut TlsServer, msg: *mut rt.Buf) -> bool {
+    let p: u64 = (*msg).ptr
+    let end: usize = (*msg).len
+    var at: usize = 4
+    if at + 35 > end { return fail(t, A_DECODE) }
+    at = at + 2 + 32 // legacy_version, random
+    let sl: usize = rt.ld8(p, at) as usize
+    at = at + 1
+    if sl > 32 || at + sl > end { return fail(t, A_DECODE) }
+    (*t).sidlen = sl
+    rt.mem_copy((&(*t).sid[0]) as u64, p + at as u64, sl)
+    at = at + sl
+    if at + 2 > end { return fail(t, A_DECODE) }
+    let csl: usize = be16(p, at)
+    at = at + 2
+    if csl % 2 != 0 || at + csl > end { return fail(t, A_DECODE) }
+    var chosen: u32 = 0
+    var k: usize = 0
+    while k < csl {
+        let cs: u32 = be16(p, at + k) as u32
+        if chosen == 0 && (cs == SUITE_AES128GCM || cs == SUITE_CHACHA20) {
+            chosen = cs
+        }
+        k = k + 2
+    }
+    at = at + csl
+    if at + 1 > end { return fail(t, A_DECODE) }
+    let cml: usize = rt.ld8(p, at) as usize
+    at = at + 1
+    if at + cml > end { return fail(t, A_DECODE) }
+    at = at + cml
+    // extensions
+    (*t).have_share = false
+    (*t).v13 = false
+    (*t).ecdsa_ok = false
+    (*t).alpn_offered = false
+    (*t).alpn_h11 = false
+    if at + 2 > end { return fail(t, A_MISSING_EXT) }
+    let el: usize = be16(p, at)
+    at = at + 2
+    if at + el != end { return fail(t, A_DECODE) }
+    while at < end {
+        if at + 4 > end { return fail(t, A_DECODE) }
+        let et: usize = be16(p, at)
+        let elen: usize = be16(p, at + 2)
+        at = at + 4
+        if at + elen > end { return fail(t, A_DECODE) }
+        if !extension(t, et, p, at, elen) { return false }
+        at = at + elen
+    }
+    if !(*t).v13 { return fail(t, A_PROTOCOL_VERSION) }
+    if chosen == 0 || !(*t).ecdsa_ok { return fail(t, A_HANDSHAKE_FAILURE) }
+    if (*t).alpn_offered && !(*t).alpn_h11 { return fail(t, A_NO_APP_PROTOCOL) }
+    if (*t).state == ST_HELLO2 && chosen != (*t).suite {
+        return fail(t, A_ILLEGAL)
+    }
+    (*t).suite = chosen
+    (*t).keylen = 16
+    if chosen == SUITE_CHACHA20 { (*t).keylen = 32 }
+    if !(*t).have_share {
+        if (*t).offers_x25519 && (*t).state == ST_HELLO {
+            return hello_retry(t, msg)
+        }
+        return fail(t, A_HANDSHAKE_FAILURE)
+    }
+    rt.buf_push_bytes(&(*t).tr, (*msg).ptr, (*msg).len)
+    return server_flight(t)
+}
+
+fn extension(t: *mut TlsServer, et: usize, p: u64, at: usize, len: usize) -> bool {
+    if et == 43 { // supported_versions
+        if len < 1 { return fail(t, A_DECODE) }
+        let l: usize = rt.ld8(p, at) as usize
+        if l + 1 != len || l % 2 != 0 { return fail(t, A_DECODE) }
+        var k: usize = 0
+        while k < l {
+            if be16(p, at + 1 + k) == 772 { (*t).v13 = true }
+            k = k + 2
+        }
+        return true
+    }
+    if et == 10 { // supported_groups
+        if len < 2 { return fail(t, A_DECODE) }
+        let l: usize = be16(p, at)
+        if l + 2 != len || l % 2 != 0 { return fail(t, A_DECODE) }
+        var k: usize = 0
+        while k < l {
+            if be16(p, at + 2 + k) == 29 { (*t).offers_x25519 = true }
+            k = k + 2
+        }
+        return true
+    }
+    if et == 51 { // key_share
+        if len < 2 { return fail(t, A_DECODE) }
+        let l: usize = be16(p, at)
+        if l + 2 != len { return fail(t, A_DECODE) }
+        var k: usize = at + 2
+        while k < at + len {
+            if k + 4 > at + len { return fail(t, A_DECODE) }
+            let g: usize = be16(p, k)
+            let kl: usize = be16(p, k + 2)
+            if k + 4 + kl > at + len { return fail(t, A_DECODE) }
+            if g == 29 && kl == 32 && !(*t).have_share {
+                rt.mem_copy((&(*t).cshare[0]) as u64, p + (k + 4) as u64, 32)
+                (*t).have_share = true
+            }
+            k = k + 4 + kl
+        }
+        return true
+    }
+    if et == 13 { // signature_algorithms
+        if len < 2 { return fail(t, A_DECODE) }
+        let l: usize = be16(p, at)
+        if l + 2 != len || l % 2 != 0 { return fail(t, A_DECODE) }
+        var k: usize = 0
+        while k < l {
+            if be16(p, at + 2 + k) == 1027 { (*t).ecdsa_ok = true } // 0x0403
+            k = k + 2
+        }
+        return true
+    }
+    if et == 16 { // ALPN
+        if len < 2 { return fail(t, A_DECODE) }
+        let l: usize = be16(p, at)
+        if l + 2 != len { return fail(t, A_DECODE) }
+        (*t).alpn_offered = true
+        var k: usize = at + 2
+        while k < at + len {
+            let pl: usize = rt.ld8(p, k) as usize
+            if pl == 0 || k + 1 + pl > at + len { return fail(t, A_DECODE) }
+            if pl == 8 && rt.mem_eq(p + (k + 1) as u64, "http/1.1".p as u64, 8) {
+                (*t).alpn_h11 = true
+            }
+            k = k + 1 + pl
+        }
+        return true
+    }
+    if et == 0 { // server_name
+        if len >= 5 && rt.ld8(p, at + 2) == 0 as u8 {
+            let hl: usize = be16(p, at + 3)
+            if hl <= 255 && at + 5 + hl <= at + len {
+                rt.mem_copy((&(*t).sni[0]) as u64, p + (at + 5) as u64, hl)
+                (*t).snilen = hl
+            }
+        }
+        return true
+    }
+    return true
+}
+
+// HelloRetryRequest: a ServerHello with the magic random and a key_share
+// that names only the group (RFC 8446 4.1.3, 4.1.4, 4.4.1).
+fn hello_retry(t: *mut TlsServer, ch1: *mut rt.Buf) -> bool {
+    var h: [u8; 32] = [0; 32]
+    sha256.sha256((*ch1).ptr, (*ch1).len, (&h[0]) as u64)
+    rt.buf_clear(&(*t).tr)
+    rt.buf_push(&(*t).tr, HS_MESSAGE_HASH as u8)
+    push24(&(*t).tr, 32)
+    rt.buf_push_bytes(&(*t).tr, (&h[0]) as u64, 32)
+    var hrr_random: [u8; 32] = [207, 33, 173, 116, 229, 154, 97, 17, 190, 29, 140,
+        2, 30, 101, 184, 145, 194, 162, 17, 22, 122, 187, 140, 94, 7, 158, 9, 226,
+        200, 168, 51, 156]
+    var body: rt.Buf = rt.buf_new()
+    push16(&body, 771)
+    rt.buf_push_bytes(&body, (&hrr_random[0]) as u64, 32)
+    rt.buf_push(&body, (*t).sidlen as u8)
+    rt.buf_push_bytes(&body, (&(*t).sid[0]) as u64, (*t).sidlen)
+    push16(&body, (*t).suite as usize)
+    rt.buf_push(&body, 0 as u8)
+    push16(&body, 12)
+    push16(&body, 43) // supported_versions: 0x0304
+    push16(&body, 2)
+    push16(&body, 772)
+    push16(&body, 51) // key_share: selected_group x25519
+    push16(&body, 2)
+    push16(&body, 29)
+    var msg: rt.Buf = rt.buf_new()
+    rt.buf_push(&msg, HS_SERVER_HELLO as u8)
+    push24(&msg, body.len)
+    rt.buf_push_bytes(&msg, body.ptr, body.len)
+    let ok: bool = write_handshake(t, &msg)
+    rt.buf_free(&body)
+    rt.buf_free(&msg)
+    if (*t).sidlen > 0 {
+        var ccs: [u8; 1] = [1]
+        write_record(t, REC_CCS, (&ccs[0]) as u64, 1)
+    }
+    (*t).state = ST_HELLO2
+    (*t).retried = true
+    return ok
+}
+
+fn server_flight(t: *mut TlsServer) -> bool {
+    // our half of the X25519 exchange
+    var priv: [u8; 32] = [0; 32]
+    var pubk: [u8; 32] = [0; 32]
+    var srnd: [u8; 32] = [0; 32]
+    if !random.random_bytes((&priv[0]) as u64, 32) { return fail(t, A_INTERNAL) }
+    if !random.random_bytes((&srnd[0]) as u64, 32) { return fail(t, A_INTERNAL) }
+    if !x25519.x25519_keypair((&priv[0]) as u64, (&pubk[0]) as u64) {
+        return fail(t, A_INTERNAL)
+    }
+    var shared: [u8; 32] = [0; 32]
+    if !x25519.x25519((&priv[0]) as u64, (&(*t).cshare[0]) as u64,
+        (&shared[0]) as u64) {
+        return fail(t, A_ILLEGAL) // the all-zero result: a low order point
+    }
+    rt.mem_set((&priv[0]) as u64, 0 as u8, 32)
+    // ServerHello
+    var body: rt.Buf = rt.buf_new()
+    push16(&body, 771)
+    rt.buf_push_bytes(&body, (&srnd[0]) as u64, 32)
+    rt.buf_push(&body, (*t).sidlen as u8)
+    rt.buf_push_bytes(&body, (&(*t).sid[0]) as u64, (*t).sidlen)
+    push16(&body, (*t).suite as usize)
+    rt.buf_push(&body, 0 as u8)
+    push16(&body, 46)
+    push16(&body, 43)
+    push16(&body, 2)
+    push16(&body, 772)
+    push16(&body, 51)
+    push16(&body, 36)
+    push16(&body, 29)
+    push16(&body, 32)
+    rt.buf_push_bytes(&body, (&pubk[0]) as u64, 32)
+    var msg: rt.Buf = rt.buf_new()
+    rt.buf_push(&msg, HS_SERVER_HELLO as u8)
+    push24(&msg, body.len)
+    rt.buf_push_bytes(&msg, body.ptr, body.len)
+    write_handshake(t, &msg)
+    if (*t).sidlen > 0 && !(*t).retried {
+        var ccs: [u8; 1] = [1]
+        write_record(t, REC_CCS, (&ccs[0]) as u64, 1)
+    }
+    // handshake keys
+    var early: [u8; 32] = [0; 32]
+    keys.key_schedule_early((&early[0]) as u64)
+    if !keys.key_schedule_handshake((&early[0]) as u64, (&shared[0]) as u64, 32,
+        (&(*t).hs_secret[0]) as u64) {
+        return fail(t, A_INTERNAL)
+    }
+    rt.mem_set((&shared[0]) as u64, 0 as u8, 32)
+    var lc: [u8; 12] = "c hs traffic"
+    var ls: [u8; 12] = "s hs traffic"
+    keys.derive_secret((&(*t).hs_secret[0]) as u64, (&lc[0]) as u64, 12,
+        (*t).tr.ptr, (*t).tr.len, (&(*t).c_hs[0]) as u64)
+    keys.derive_secret((&(*t).hs_secret[0]) as u64, (&ls[0]) as u64, 12,
+        (*t).tr.ptr, (*t).tr.len, (&(*t).s_hs[0]) as u64)
+    set_write_keys(t, (&(*t).s_hs[0]) as u64)
+    set_read_keys(t, (&(*t).c_hs[0]) as u64)
+    // EncryptedExtensions
+    rt.buf_clear(&body)
+    if (*t).alpn_h11 {
+        push16(&body, 15)
+        push16(&body, 16)
+        push16(&body, 11)
+        push16(&body, 9)
+        rt.buf_push(&body, 8 as u8)
+        rt.buf_push_bytes(&body, "http/1.1".p as u64, 8)
+    } else {
+        push16(&body, 0)
+    }
+    rt.buf_clear(&msg)
+    rt.buf_push(&msg, HS_ENCRYPTED_EXT as u8)
+    push24(&msg, body.len)
+    rt.buf_push_bytes(&msg, body.ptr, body.len)
+    write_handshake(t, &msg)
+    // Certificate
+    let cfg: *mut TlsConfig = (*t).cfg
+    rt.buf_clear(&body)
+    rt.buf_push(&body, 0 as u8) // certificate_request_context
+    var total: usize = 0
+    var i: usize = 0
+    while i < (*cfg).n {
+        total = total + 3 + (*cfg).len[i] + 2
+        i = i + 1
+    }
+    push24(&body, total)
+    i = 0
+    while i < (*cfg).n {
+        push24(&body, (*cfg).len[i])
+        rt.buf_push_bytes(&body, config_cert_ptr(cfg, i), (*cfg).len[i])
+        push16(&body, 0)
+        i = i + 1
+    }
+    rt.buf_clear(&msg)
+    rt.buf_push(&msg, HS_CERTIFICATE as u8)
+    push24(&msg, body.len)
+    rt.buf_push_bytes(&msg, body.ptr, body.len)
+    write_handshake(t, &msg)
+    // CertificateVerify (RFC 8446 4.4.3)
+    var content: rt.Buf = rt.buf_new()
+    i = 0
+    while i < 64 {
+        rt.buf_push(&content, 32 as u8)
+        i = i + 1
+    }
+    let label: str = "TLS 1.3, server CertificateVerify"
+    rt.buf_push_bytes(&content, label.p as u64, label.n)
+    rt.buf_push(&content, 0 as u8)
+    var th: [u8; 32] = [0; 32]
+    keys.transcript((*t).tr.ptr, (*t).tr.len, (&th[0]) as u64)
+    rt.buf_push_bytes(&content, (&th[0]) as u64, 32)
+    var digest: [u8; 32] = [0; 32]
+    sha256.sha256(content.ptr, content.len, (&digest[0]) as u64)
+    rt.buf_free(&content)
+    var extra: [u8; 32] = [0; 32]
+    random.random_bytes((&extra[0]) as u64, 32)
+    var r: [u8; 32] = [0; 32]
+    var s: [u8; 32] = [0; 32]
+    if !p256.p256_sign(config_key_ptr(cfg), (&digest[0]) as u64, (&extra[0]) as u64, 32,
+        (&r[0]) as u64, (&s[0]) as u64) {
+        return fail(t, A_INTERNAL)
+    }
+    var sig: rt.Buf = rt.buf_new()
+    p256.p256_sig_der((&r[0]) as u64, (&s[0]) as u64, &sig)
+    rt.buf_clear(&body)
+    push16(&body, 1027)
+    push16(&body, sig.len)
+    rt.buf_push_bytes(&body, sig.ptr, sig.len)
+    rt.buf_free(&sig)
+    rt.buf_clear(&msg)
+    rt.buf_push(&msg, HS_CERT_VERIFY as u8)
+    push24(&msg, body.len)
+    rt.buf_push_bytes(&msg, body.ptr, body.len)
+    write_handshake(t, &msg)
+    // Finished
+    var fkey: [u8; 32] = [0; 32]
+    keys.finished_key((&(*t).s_hs[0]) as u64, (&fkey[0]) as u64)
+    var mac: [u8; 32] = [0; 32]
+    keys.finished_mac((&fkey[0]) as u64, (*t).tr.ptr, (*t).tr.len, (&mac[0]) as u64)
+    rt.buf_clear(&msg)
+    rt.buf_push(&msg, HS_FINISHED as u8)
+    push24(&msg, 32)
+    rt.buf_push_bytes(&msg, (&mac[0]) as u64, 32)
+    write_handshake(t, &msg)
+    rt.buf_free(&body)
+    rt.buf_free(&msg)
+    // application secrets over ClientHello..server Finished
+    var ms: [u8; 32] = [0; 32]
+    if !keys.key_schedule_master((&(*t).hs_secret[0]) as u64, (&ms[0]) as u64) {
+        return fail(t, A_INTERNAL)
+    }
+    var lca: [u8; 12] = "c ap traffic"
+    var lsa: [u8; 12] = "s ap traffic"
+    keys.derive_secret((&ms[0]) as u64, (&lca[0]) as u64, 12, (*t).tr.ptr,
+        (*t).tr.len, (&(*t).c_ap[0]) as u64)
+    keys.derive_secret((&ms[0]) as u64, (&lsa[0]) as u64, 12, (*t).tr.ptr,
+        (*t).tr.len, (&(*t).s_ap[0]) as u64)
+    rt.mem_set((&ms[0]) as u64, 0 as u8, 32)
+    set_write_keys(t, (&(*t).s_ap[0]) as u64)
+    (*t).state = ST_WAIT_FIN
+    return true
+}
+
+fn client_finished(t: *mut TlsServer, msg: *mut rt.Buf) -> bool {
+    if (*msg).len != 36 { return fail(t, A_DECODE) }
+    var fkey: [u8; 32] = [0; 32]
+    keys.finished_key((&(*t).c_hs[0]) as u64, (&fkey[0]) as u64)
+    var mac: [u8; 32] = [0; 32]
+    keys.finished_mac((&fkey[0]) as u64, (*t).tr.ptr, (*t).tr.len, (&mac[0]) as u64)
+    if !hmac.hmac_equal((&mac[0]) as u64, (*msg).ptr + 4, 32) {
+        return fail(t, A_DECRYPT)
+    }
+    rt.buf_push_bytes(&(*t).tr, (*msg).ptr, (*msg).len)
+    set_read_keys(t, (&(*t).c_ap[0]) as u64)
+    rt.mem_set((&(*t).hs_secret[0]) as u64, 0 as u8, 32)
+    (*t).state = ST_OPEN
+    return true
+}
+
+// ------------------------------------------------------------ Sending
+
+// Plaintext of any length -> application data records in `out`.
+fn send(t: *mut TlsServer, p: u64, n: usize) -> bool {
+    if (*t).state != ST_OPEN { return false }
+    var at: usize = 0
+    while at < n {
+        var k: usize = n - at
+        if k > MAX_PLAIN { k = MAX_PLAIN }
+        if !write_record(t, REC_APPDATA, p + at as u64, k) { return false }
+        at = at + k
+    }
+    return true
+}
+
+// close_notify; the connection is over for writing.
+fn close(t: *mut TlsServer) {
+    if (*t).state == ST_OPEN || (*t).state == ST_WAIT_FIN {
+        var a: [u8; 2] = [1, 0]
+        write_record(t, REC_ALERT, (&a[0]) as u64, 2)
+        (*t).state = ST_CLOSED
+    }
+}

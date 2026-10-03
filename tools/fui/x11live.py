@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MPL-2.0
-# tools/fui/x11live.py -- DIE DEMO IN EINEM ECHTEN FENSTER AUF EINEM ECHTEN X-SERVER.
+# tools/fui/x11live.py -- THE DEMO IN A REAL WINDOW ON A REAL X SERVER.
 #
-# WARUM ES DAS GIBT. tools/fui/x11_main.fi rechnet das Protokoll und den Wirt
-# ohne Bildschirm nach. Ob daraus ein FENSTER wird, das man bedienen kann,
-# sagt nur ein X-Server. Also startet dieser Lauf einen eigenen Xvfb, laesst
-# demos/x11demo darauf laufen und bedient sie von AUSSEN -- mit xdotool, wie
-# ein Mensch mit Maus und Tastatur, und mit einer ClientMessage wie ein
-# Fenstermanager. Was geprueft wird, kommt aus drei Quellen, die das
-# Programm nicht faelschen kann:
-#   * dem Server: xwininfo (gibt es das Fenster, wie gross), xwd (was steht
-#     WIRKLICH darin -- nicht im Speicherpuffer des Programms),
-#   * dem Kern: /proc/<pid>/stat (wie viel Rechenzeit im Leerlauf),
-#   * dem Protokoll der Demo (--protokoll): Bilder, Zustand, Knoten.
+# WHY IT EXISTS. tools/fui/x11_main.fi re-calculates the protocol and the host
+# without a screen. Whether a WINDOW comes of it that one can operate
+# is told only by an X server. So this run starts its own Xvfb, lets
+# demos/x11demo run on it and operates it from OUTSIDE -- with xdotool, like
+# a human with mouse and keyboard, and with a ClientMessage like a
+# window manager. What is checked comes from three sources that the
+# program cannot forge:
+#   * the server: xwininfo (whether the window exists, how large), xwd (what really
+#     stands in it -- not in the memory buffer of the program),
+#   * the kernel: /proc/<pid>/stat (how much CPU time at idle),
+#   * the log of the demo (--protokoll): images, state, nodes.
 #
-#     python3 tools/fui/x11live.py <x11demo-programm> <belegordner>
+#     python3 tools/fui/x11live.py <x11demo-program> <proof-folder>
 #
-# Kein Xvfb/xdotool/xwd auf dem Rechner: "SKIP" mit Grund, Rueckgabe 0 --
-# ein fehlender X-Server ist kein Fehler der Demo. Jede andere Abweichung:
-# "WRONG" und Rueckgabe 1.
+# No Xvfb/xdotool/xwd on the machine: "SKIP" with reason, return 0 --
+# a missing X server is no error of the demo. Every other deviation:
+# "WRONG" and return 1.
 import os, shutil, socket, struct, subprocess, sys, time
 
 PROG = sys.argv[1]
@@ -63,8 +63,8 @@ class Server:
         self.n = freie_anzeige()
         self.env = dict(os.environ, DISPLAY=":%d" % self.n)
         self.env.pop("XAUTHORITY", None)
-        # -noreset: sonst setzt Xvfb beim Abgang des letzten Programms alles
-        # zurueck, auch RESOURCE_MANAGER (Xft.dpi).
+        # -noreset: otherwise Xvfb resets everything when the last program
+        # leaves, also RESOURCE_MANAGER (Xft.dpi).
         self.p = subprocess.Popen(["Xvfb", ":%d" % self.n, "-screen", "0",
                                    "%dx%dx24" % (breite, hoehe), "-dpi",
                                    str(dpi), "-nolisten", "tcp", "-noreset"],
@@ -132,7 +132,7 @@ class Demo:
         return x + w // 2, y + h // 2
 
     def ruhig(self, sek=0.6):
-        # Wartet, bis eine ganze Weile kein neues Bild mehr kam.
+        # Waits until for quite a while no new image has come.
         alt = -1
         while True:
             n = self.bilder()
@@ -171,8 +171,8 @@ def xwd(srv, wid, name):
 
 
 def wm_delete(srv, wid):
-    # So schliesst ein Fenstermanager: SendEvent mit einer ClientMessage
-    # WM_PROTOCOLS / WM_DELETE_WINDOW. Roh ueber den Socket, ohne Xlib.
+    # This is how a window manager closes: SendEvent with a ClientMessage
+    # WM_PROTOCOLS / WM_DELETE_WINDOW. Raw over the socket, without Xlib.
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect("/tmp/.X11-unix/X%d" % srv.n)
     s.sendall(struct.pack("<BxHHHHxx", 0x6C, 11, 0, 0, 0))
@@ -226,7 +226,7 @@ try:
     chk("L1", "Bild vom Server hat Text und Flaechen (Farben)", farben > 200,
         farben, "> 200")
 
-    # ---------------------------------------------- DER LEERLAUF
+    # ---------------------------------------------- THE IDLE STATE
     n0 = d.bilder()
     c0 = d.cpu()
     time.sleep(3.0)
@@ -259,7 +259,7 @@ try:
     ok = d.warte(lambda z: (d.letzter_zustand() or [0, 0])[1] == 216)
     chk("L3", "3 Rasten Rad ueber der Liste: 216", ok is not None,
         d.letzter_zustand()[1], 216)
-    bild_r, png_r = xwd(srv, wid, "x11demo-1x-gerollt")
+    bild_r, png_r = xwd(srv, wid, "x11demo-1x-scrolled")
 
     # ---------------------------------------------- TASTATUR
     srv.run("xdotool", "key", "End")
@@ -372,7 +372,7 @@ try:
 finally:
     srv.zu()
 
-# =========================================== 2x auf einem 192-dpi-Schirm
+# =========================================== 2x on a 192-dpi screen
 srv2 = Server(2800, 1800, 192)
 try:
     d3 = Demo(srv2)
@@ -406,7 +406,7 @@ finally:
     srv2.zu()
 
 print("Belege: %s" % ", ".join(os.path.join(BELEG, n) for n in
-      ("x11demo-1x.png", "x11demo-1x-gerollt.png", "x11demo-900x600.png",
+      ("x11demo-1x.png", "x11demo-1x-scrolled.png", "x11demo-900x600.png",
        "x11demo-2x.png")))
 if fehler:
     print("X11 LIVE NOT PASSED (%d von %d falsch)" % (fehler, zahl))

@@ -27,19 +27,19 @@ chain security; negative tests `tests/neg/comptime_file_absolute.fi` and
 
 Terms of use of the data: <https://www.unicode.org/terms_of_use.html>.
 
-# Die Bidi-Dateien (seit 23.09.2026)
+# The bidi files (since 23.09.2026)
 
-`tools/ucd/build_bidi.sh` baut daraus `generated/bidi_tables.fi` (die
-Bidi-Klasse, die arabische Verbindungsart, Spiegel- und Klammerpaare, die
-arabischen Darstellungsformen). Alle vier sind **Unicode 17.0.0**, geholt
-am 2026-09-23, die Summen stehen in `tools/ucd/UCD_BIDI.sha256`.
+`tools/ucd/build_bidi.sh` builds `generated/bidi_tables.fi` from them (the
+bidi class, the Arabic joining type, mirror and bracket pairs, the
+Arabic presentation forms). All four are **Unicode 17.0.0**, fetched
+on 2026-09-23, the sums stand in `tools/ucd/UCD_BIDI.sha256`.
 
-| Datei | URL | Oktette |
+| File | URL | Octets |
 |---|---|---|
 | `DerivedBidiClass.txt` | <https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedBidiClass.txt> | 173,433 |
 | `BidiMirroring.txt` | <https://www.unicode.org/Public/17.0.0/ucd/BidiMirroring.txt> | 26,827 |
 | `BidiBrackets.txt` | <https://www.unicode.org/Public/17.0.0/ucd/BidiBrackets.txt> | 8,891 |
 | `ArabicShaping.txt` | <https://www.unicode.org/Public/17.0.0/ucd/ArabicShaping.txt> | 41,441 |
 
-Neu holen und vergleichen: `bash tools/ucd/build_bidi.sh --fetch`
-(bricht ab, wenn eine Summe nicht mehr passt).
+Fetch again and compare: `bash tools/ucd/build_bidi.sh --fetch`
+(aborts if a sum no longer matches).

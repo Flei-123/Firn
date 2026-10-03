@@ -591,10 +591,10 @@ pub(crate) fn promote_allocas(f: &mut Func) -> usize {
             (true, Some(t)) => t,
             _ => continue,
         };
-        // RUNDE TEMPO 4: `v128` darf jetzt mit. Bis hierher war es
-        // ausgeschlossen, weil die Kopie, die `phi.rs` daraus macht, auf dem
-        // Grundweg als Ganzzahlkopie ausgegeben wurde (acht von sechzehn
-        // Oktetten). Beide Wege koennen sie jetzt.
+        // ROUND TEMPO 4: `v128` may come along now. Until now it was
+        // excluded, because the copy that `phi.rs` makes of it was emitted on the
+        // basic path as an integer copy (eight of sixteen
+        // octets). Both paths can do it now.
         if ty == FTy::Void {
             continue;
         }
@@ -1123,17 +1123,17 @@ pub(crate) fn copy_propagate(f: &mut Func) -> usize {
                     // therefore: as soon as floating point is involved on
                     // ONE side and the types differ, nothing is dropped.
                     let floatswitch = (from.is_float() || i.ty.is_float()) && *from != i.ty;
-                    // RUNDE TEMPO: das VORZEICHEN aendert kein Bit. Bei
-                    // GLEICHER Breite ist `i64 -> u64` (und `i32 -> u32`, und
-                    // `u64 -> ptr`) dieselbe Zahl im selben Muster -- die
-                    // Frage, ob sie als negativ gelesen wird, entscheidet
-                    // allein die Anweisung, die sie benutzt (jede traegt ihren
-                    // eigenen Typ). Bis hierher verlangte diese Stelle
-                    // dieselbe Vorzeichenhaftigkeit, und deshalb blieb aus
-                    // `(i as u64)` ein echtes `mov` stehen -- in der
-                    // Adressrechnung des Tondekoders vor jedem einzelnen
-                    // Feldzugriff. Eine GEPRUEFTE Umwandlung ist etwas
-                    // anderes (`Op::CheckedCast`) und kommt hier nie an.
+                    // ROUND TEMPO: the SIGN changes no bit. At
+                    // EQUAL width `i64 -> u64` (and `i32 -> u32`, and
+                    // `u64 -> ptr`) is the same number in the same pattern -- the
+                    // question whether it is read as negative is decided
+                    // solely by the instruction that uses it (each carries its
+                    // own type). Until now this place demanded
+                    // the same signedness, and that is why a real `mov`
+                    // stayed behind from `(i as u64)` -- in the address
+                    // calculation of the sound decoder before every single
+                    // field access. A CHECKED conversion is something
+                    // different (`Op::CheckedCast`) and never arrives here.
                     if !floatswitch
                         && (*from == i.ty
                             || (from.bits() == i.ty.bits()
@@ -1208,10 +1208,10 @@ pub(crate) fn copy_propagate(f: &mut Func) -> usize {
                 _ => None,
             };
             if let Some(s) = same {
-                // RUNDE TEMPO: gleiche Breite genuegt; das Vorzeichen ist
-                // keine Eigenschaft des Bitmusters, sondern der Anweisung,
-                // die es liest (siehe oben bei `Op::Cast`). Bool und
-                // Gleitzahlen bleiben getrennt.
+                // ROUND TEMPO: equal width suffices; the sign is
+                // not a property of the bit pattern, but of the instruction
+                // that reads it (see above at `Op::Cast`). Bool and
+                // floating-point numbers stay separate.
                 let same_slot_ty = |x: crate::fir::FTy, y: crate::fir::FTy| {
                     x.bits() == y.bits()
                         && x.is_float() == y.is_float()

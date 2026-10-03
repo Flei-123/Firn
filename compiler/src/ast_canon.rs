@@ -156,8 +156,15 @@ fn st(s: &Stmt) -> String {
             Some(v) => format!("(ret {})", ex(v)),
             None => "(ret -)".to_string(),
         },
-        Stmt::For { name, start, end, body, .. } => {
-            format!("(for {} {} {} {})", name, ex(start), ex(end), blk(body))
+        Stmt::For { name, start, end, body, inclusive, .. } => {
+            format!(
+                "(for{} {} {} {} {})",
+                if *inclusive { "=" } else { "" },
+                name,
+                ex(start),
+                ex(end),
+                blk(body)
+            )
         }
         Stmt::Break(_) => "(break)".to_string(),
         Stmt::Continue(_) => "(continue)".to_string(),
@@ -224,6 +231,7 @@ fn ex_core(e: &Expr) -> String {
                 UnOp::Not => "!",
                 UnOp::BitNot => "~",
                 UnOp::AddrOf => "&",
+                UnOp::InoutOf => "inout ",
                 UnOp::Deref => "*",
             },
             ex(a)

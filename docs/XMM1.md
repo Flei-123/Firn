@@ -1,78 +1,78 @@
-# Runde XMM 1 -- Fliesskomma ohne den Umweg ueber `rax`
+# Round XMM 1 -- floating point without the detour via `rax`
 
-Stand 18.09.2026, Zweig `xmm`. Vorgeschichte: `docs/TON2.md` (im Zweig `ton`)
-hat gemessen, dass Firn bei Fliesskomma rund zehnmal langsamer ist als C,
-bei Ganzzahlen dagegen nur knapp dreimal. Der Grund lag im Uebersetzer, nicht
-in der Sprache -- und diese Runde raeumt den ersten, billigsten Teil davon ab.
+State 18.09.2026, branch `xmm`. Background: `docs/TON2.md` (in branch `ton`)
+measured that Firn is about ten times slower than C at floating point,
+but only just three times at integers. The reason lay in the translator, not
+in the language -- and this round clears away the first, cheapest part of it.
 
-## Was falsch war
+## What was wrong
 
-`codegen_x86.rs` hat jeden Fliesskommawert ueber `rax` gefaehrt:
+`codegen_x86.rs` ferried every floating-point value via `rax`:
 
 ```asm
 mov  eax, dword ptr [rbp-40]     ; Slot -> Ganzzahlregister
 movd xmm0, eax                   ; Ganzzahlregister -> SSE-Register
 ```
 
-Und auf dem Rueckweg dasselbe in umgekehrter Richtung. Das sind ZWEI
-Anweisungen je Operand und zwei je Ergebnis -- bei einer Multiplikation
-also sechs statt drei. Der Grund war historisch (Runde 71 hat Fliesskomma
-ueberhaupt erst eingefuehrt und den kuerzesten sicheren Weg genommen), nicht
-technisch: `movss`/`movsd` lesen und schreiben den Speicher unmittelbar.
+And on the way back the same in the opposite direction. That is TWO
+instructions per operand and two per result -- for a multiplication
+that is six instead of three. The reason was historical (round 71 introduced floating point
+in the first place and took the shortest safe way), not
+technical: `movss`/`movsd` read and write memory directly.
 
-## Was jetzt steht
+## What stands now
 
 ```asm
-movss xmm0, dword ptr [rbp-40]   ; eine Anweisung
+movss xmm0, dword ptr [rbp-40]   ; one instruction
 ...
 movss dword ptr [rbp-48], xmm0
 ```
 
-Geaendert sind genau zwei Funktionen (`load_xmm`, `store_xmm`). Alles
-andere -- Rechnung, Reihenfolge, Rundung -- bleibt unberuehrt.
+Exactly two functions are changed (`load_xmm`, `store_xmm`). Everything
+else -- calculation, order, rounding -- stays untouched.
 
-Ein Punkt musste dabei entschieden werden: `movss` schreibt nur vier Oktett
-in einen acht Oktett breiten Platz, die oberen vier behalten ihren alten
-Inhalt. Das ist zulaessig, weil ein `f32`-Platz ausschliesslich als `dword`
-gelesen wird (`load_xmm` mit `single`, `cvtss2sd`, die Argumentuebergabe);
-wer acht Oktett kopiert, kopiert die oberen mit, ohne sie je zu deuten.
+One point had to be decided: `movss` writes only four octets
+into an eight-octet-wide slot, the upper four keep their old
+content. That is permitted because an `f32` slot is read exclusively as `dword`
+(`load_xmm` with `single`, `cvtss2sd`, the argument passing);
+whoever copies eight octets copies the upper ones along, without ever interpreting them.
 
 ## Messung
 
-Alles auf derselben Maschine, `--opt-level=release-fast`:
+All on the same machine, `--opt-level=release-fast`:
 
-| Messfall | vorher | nachher | C zum Vergleich |
+| Measurement case | before | after | C for comparison |
 |---|---|---|---|
-| Messkern `f32` (2 Mio Durchlaeufe) | 0,50 s | **0,35 s** (-30 %) | 0,03 s |
-| MP3-Dekoder, 60 s Audio | 2,07 s | **1,93 s** (-7 %) | 0,34 s |
+| `f32` kernel (2 M iterations) | 0.50 s | **0.35 s** (-30 %) | 0.03 s |
+| MP3 decoder, 60 s of audio | 2.07 s | **1.93 s** (-7 %) | 0.34 s |
 
-Der Dekoder gewinnt weniger, weil er nicht nur rechnet, sondern auch
-Huffman-Bits liest und Tabellen adressiert -- das ist Ganzzahlarbeit und war
-nie betroffen.
+The decoder gains less, because it does not only calculate, but also reads
+Huffman bits and addresses tables -- that is integer work and was
+never affected.
 
-Richtigkeit: `tools/ton_bauen.sh` -> PASS 4/4, die Ausgabe des Dekoders ist
-weiterhin **bitgleich** zur C-Vorlage. Die Testreihe des Repos (`test.sh`)
-laeuft unveraendert durch.
+Correctness: `tools/ton_bauen.sh` -> PASS 4/4, the output of the decoder is
+still **bit-identical** to the C template. The test series of the repo (`test.sh`)
+runs through unchanged.
 
-## Was noch aussteht (Runde XMM 2)
+## What is still outstanding (round XMM 2)
 
-Der grosse Rest liegt weiter da, wo `docs/TON2.md` ihn benannt hat:
-**Fliesskommawerte bleiben zwischen zwei Anweisungen nicht im Register.**
-Jede Rechnung laedt neu aus dem Rahmenplatz und schreibt das Ergebnis
-zurueck. Zwei Wege fuehren da raus:
+The big remainder still lies where `docs/TON2.md` named it:
+**floating-point values do not stay in the register between two instructions.**
+Every calculation loads anew from the frame slot and writes the result
+back. Two ways lead out of that:
 
-1. **Der `xmm`-Wertecache des Basispfads auch fuer Skalare.**
-   `simd.rs` hat ihn bereits vollstaendig -- mit Ruecknahmeplan, Ausspuelen
-   an Blockgrenzen und Verdraengung -- aber fest auf `v128` (16 Oktett,
-   `movdqa`) verdrahtet. Er braucht eine Breite je Eintrag (4/8/16) und die
-   passende Bewegungsanweisung. Kleiner Eingriff, grosser Teil des Ertrags,
-   weil die meisten Zwischenwerte im selben Block gelesen werden.
-2. **Eine zweite Registerklasse im Linear Scan** (`regalloc.rs`).
-   Der saubere Weg, aber der groessere: die Zuteilung muss zwei Pools
-   fuehren, und die Ausgabe des RA-Pfads kennt bisher keine einzige
-   Fliesskomma-Anweisung (Funktionen mit `f32`/`f64` sind dort nie
-   angekommen). Dazu kommt, dass auf System V ALLE `xmm`-Register
-   caller-saved sind: ein Wert, dessen Lebensdauer einen Aufruf kreuzt,
-   braucht Sicherung oder bleibt im Speicher.
+1. **The `xmm` value cache of the basic path also for scalars.**
+   `simd.rs` has it already completely -- with a retraction plan, flushing
+   at block boundaries and displacement -- but hard-wired to `v128` (16 octets,
+   `movdqa`). It needs a width per entry (4/8/16) and the
+   matching move instruction. A small intervention, a large part of the gain,
+   because most intermediate values are read in the same block.
+2. **A second register class in the linear scan** (`regalloc.rs`).
+   The clean way, but the bigger one: the allocation has to keep two pools,
+   and the output of the RA path so far knows not a single
+   floating-point instruction (functions with `f32`/`f64` never
+   arrived there). In addition, on System V ALL `xmm` registers are
+   caller-saved: a value whose lifetime crosses a call
+   needs saving or stays in memory.
 
-Reihenfolge: erst 1, dann messen, dann 2.
+Order: first 1, then measure, then 2.

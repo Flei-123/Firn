@@ -1,23 +1,23 @@
 #!/bin/sh
 # SPDX-License-Identifier: MPL-2.0
-# tools/fui/collect_shots.sh -- DIE BELEGE IN DEN BAUM UEBERNEHMEN.
+# tools/fui/collect_shots.sh -- TAKE THE PROOFS INTO THE TREE.
 #
-# `tools/fui/run.sh --images` malt sechsundzwanzig Bilder nach
-# $BELEGE (Vorgabe: $W/belege). Ausgeliefert wird dieselbe Menge unter
-# .gauntlet-shots/, in LESEREIHENFOLGE nummeriert -- ein Pruefer, der
-# den Lauf nicht startet, soll die Bilder in der Reihenfolge sehen, in
-# der RUN.md sie bespricht.
+# `tools/fui/run.sh --images` paints twenty-six images to
+# $BELEGE (default: $W/belege). The same set is delivered under
+# .gauntlet-shots/, numbered in READING ORDER -- a checker who does not
+# start the run is to see the images in the order in
+# which RUN.md discusses them.
 #
-# Warum dieses Skript und keine Liste in RUN.md: die Zuordnung "welches
-# gemalte Bild wird welche ausgelieferte Nummer" ist eine Tabelle, und
-# eine Tabelle gehoert an EINEN Ort. Stand sie in der Anleitung, wurde
-# beim naechsten neuen Beleg die Anleitung nachgezogen und die Kopie
-# vergessen (oder umgekehrt), und am Ende lieferte der Baum ein Bild
-# aus, das kein Programm mehr malt.
+# Why this script and no list in RUN.md: the assignment "which
+# painted image becomes which delivered number" is a table, and
+# a table belongs in ONE place. If it stood in the manual, then
+# at the next new proof the manual was updated and the copy
+# forgotten (or the other way round), and in the end the tree delivered an image
+# that no program paints any more.
 #
 #     sh tools/fui/collect_shots.sh
 #
-# W und BELEGE wirken wie in run.sh.
+# W and BELEGE act as in run.sh.
 set -e
 cd "$(dirname "$0")/../.."
 W="${W:-/tmp/fui-acceptance}"
@@ -31,7 +31,7 @@ if [ ! -d "$Z" ]; then
 fi
 mkdir -p "$ZIEL"
 
-# Die Tabelle: <ausgelieferter Name ohne .png>:<gemalter Name ohne .png>
+# The table: <delivered name without .png>:<painted name without .png>
 TAFEL="
 01-wave1-grundelemente-hell:fui-wave1-light
 02-wave1-grundelemente-dunkel:fui-wave1-dark

@@ -100,6 +100,13 @@ pub const ATTRS: &[AttrInfo] = &[
         what: "explicit C link name for 'extern fn', e.g. #[link_name(exit)] (SPEC 14.5)",
     },
     AttrInfo {
+        name: "win_callback",
+        target: Target::Func,
+        args: 0,
+        implemented: true,
+        what: "Windows may call this function back: emit the Win64 -> System V thunk (round CERTUS-WINDOWS, win.rs)",
+    },
+    AttrInfo {
         name: "export_c",
         target: Target::Func,
         args: 0,
@@ -302,6 +309,7 @@ mod tests {
         // Round EINBETTEN: plus #[inline] and #[no_inline] -- the explicit
         // will of the programmer about inlining (inline.rs,
         // fir::Func::inline_hint, docs/RUNDE-EINBETTEN.md).
+        // Round WINDOWS: plus #[win_callback] -- the Win64 -> System V thunk.
         let u: Vec<&str> = ATTRS.iter().filter(|a| a.implemented).map(|a| a.name).collect();
         assert_eq!(
             u,
@@ -312,6 +320,7 @@ mod tests {
                 "interrupt",
                 "arch",
                 "link_name",
+                "win_callback",
                 "export_c",
                 "inline",
                 "no_inline",

@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/@linux/fui/apphost.fi -- lib/fui/app.fi IN AN X11 WINDOW.
+//
+// firnc finds this file for `import fui.apphost` when it builds for Linux
+// (compiler/src/target.rs `platform_dir` = "@linux"); the browser build
+// finds lib/@web/fui/apphost.fi instead. Both export the same names --
+// `Hooks`, `hooks_blank`, `hooks_new`, `run`, `PLATFORM` -- and app.fi
+// imports neither of them by name.
+//
+// What this file does: load the font (lib/plat/sysfont.fi: DejaVu Sans),
+// open the window through lib/plat/fuiwin.fi (which sets the scale from
+// Xft.dpi and follows the system's light/dark), route keys and
+// characters to a focused text field first (fuiwin's input hook), and run
+// the loop -- asleep in `poll` while nothing changes, one frame per
+// change, until the window is closed or the program calls app.quit.
+//
+// window.window imports `window.backend`; for a native build that is
+// lib/@linux/window/backend.fi, a link to lib/window/x11.fi -- the program
+// needs no symlink of its own.
+import std.rt
+import font.metrics
+import fui.theme
+import fui.painter
+import fui.editor
+import fui.textbuf
+import window.window
+import plat.fuiwirt
+import plat.fuiwin
+import plat.sysfont
+import plat.envvar
+
+export {
+    Hooks, hooks_blank, hooks_new, hooks_set_audit, hooks_set_buf, hooks_set_edited, run,
+    PLATFORM,
+    PLATFORM_LINUX, PLATFORM_WEB,
+}
+
+const PLATFORM_LINUX: u32 = 1
+const PLATFORM_WEB: u32 = 2
+const PLATFORM: u32 = 1
+const FONTSET_BYTES: usize = 4096
+
+// What the application gives the platform. `ud` goes back into every
+// call; `m` / `host` are its *mut theme.Theme and *mut fuiwirt.Host.
+struct Hooks {
+    ud: u64,
+    m: u64,
+    host: u64,
+    attach: fn(u64, *mut painter.Painter),
+    paint: fn(u64, usize, usize),
+    key: fn(u64, u32, u32) -> bool,
+    text: fn(u64, u32, u32) -> bool,
+    press: fn(u64, f64, f64),
+    act: fn(u64, usize),
+    done: fn(u64) -> bool,
+    field: fn(u64, *mut [f64; 4]) -> bool,
+    title: str,
+    w: usize,
+    h: usize,
+    // THE AUDIT MODE (roadmap r98): with FUI_AUDIT set in the environment
+    // `run` opens NO window; it asks the program for its audit (the
+    // accessibility checks of lib/fui/audit.fi on the tree it just built)
+    // and returns that as the exit code. 0 = no hook.
+    audit: fn(u64) -> i32,
+    has_audit: bool,
+    // THE FOCUSED TEXT FIELD'S BUFFER (r114): a *mut textbuf.TextBuf as u64,
+    // 0 = no field has the focus. A phone's on-screen keyboard follows it and
+    // types into it (window.text_input / window.text_sync).
+    buf: fn(u64) -> u64,
+    // The platform (the on-screen keyboard) changed the focused field's text
+    // or caret: the program wakes its caret (it stands visible again).
+    edited: fn(u64),
+}
+
+fn audit_none(ud: u64) -> i32 {
+    return 0
+}
+
+fn buf_none(ud: u64) -> u64 {
+    return 0
+}
+
+fn edited_none(ud: u64) {
+}
+
+fn attach_none(ud: u64, z: *mut painter.Painter) {
+}
+
+fn paint_none(ud: u64, w: usize, h: usize) {
+}
+
+fn key_none(ud: u64, k: u32, m: u32) -> bool {
+    return false
+}
+
+fn press_none(ud: u64, x: f64, y: f64) {
+}
+
+fn act_none(ud: u64, i: usize) {
+}
+
+fn done_none(ud: u64) -> bool {
+    return true
+}
+
+fn field_none(ud: u64, out: *mut [f64; 4]) -> bool {
+    return false
+}
+
+fn hooks_blank() -> Hooks {
+    return Hooks { ud: 0, m: 0, host: 0, attach: attach_none,
+        paint: paint_none, key: key_none, text: key_none, press: press_none,
+        act: act_none, done: done_none, field: field_none, title: "",
+        w: 0, h: 0, audit: audit_none, has_audit: false, buf: buf_none,
+        edited: edited_none }
+}
+
+fn hooks_new(ud: u64, m: *mut theme.Theme, host: *mut fuiwirt.Host,
+    attach: fn(u64, *mut painter.Painter), paint: fn(u64, usize, usize),
+    key: fn(u64, u32, u32) -> bool, text: fn(u64, u32, u32) -> bool,
+    press: fn(u64, f64, f64), act: fn(u64, usize), done: fn(u64) -> bool,
+    field: fn(u64, *mut [f64; 4]) -> bool,
+    title: str, w: usize, h: usize) -> Hooks {
+    return Hooks { ud: ud, m: m as u64, host: host as u64, attach: attach,
+        paint: paint, key: key, text: text, press: press, act: act,
+        done: done, field: field, title: title, w: w, h: h,
+        audit: audit_none, has_audit: false, buf: buf_none,
+        edited: edited_none }
+}
+
+fn hooks_set_audit(h: *mut Hooks, f: fn(u64) -> i32) {
+    (*h).audit = f
+    (*h).has_audit = true
+}
+
+fn hooks_set_buf(h: *mut Hooks, f: fn(u64) -> u64) {
+    (*h).buf = f
+}
+
+fn hooks_set_edited(h: *mut Hooks, f: fn(u64)) {
+    (*h).edited = f
+}
+
+// The keys of the window system -> the keys of a text field (editor.fi).
+// 0 = none for it.
+fn edit_key(k: u32) -> u32 {
+    if k == window.K_LEFT { return editor.KEY_LEFT }
+    if k == window.K_RIGHT { return editor.KEY_RIGHT }
+    if k == window.K_HOME { return editor.KEY_HOME }
+    if k == window.K_END { return editor.KEY_END }
+    if k == window.K_BACK { return editor.KEY_BACKSPACE }
+    if k == window.K_DELETE { return editor.KEY_DELETE }
+    if k == window.K_RETURN { return editor.KEY_ENTER }
+    if k == window.K_ESCAPE { return editor.KEY_ESC }
+    if k == window.K_TAB { return editor.KEY_TAB }
+    if k == window.K_UP { return editor.KEY_UP }
+    if k == window.K_DOWN { return editor.KEY_DOWN }
+    return 0 as u32
+}
+
+// fuiwin's input hook. The state bits of lib/window (X11 order: shift 1,
+// control 4, alt 8) are editor.fi's bits already.
+// A press happened since the loop last looked: a press into the focused text
+// field asks for the on-screen keyboard again (the user may have put it away
+// with Back while the field kept the focus).
+static mut G_PRESSED: bool = false
+
+fn on_input(ud: u64, kind: u32, a: u32, st: u32, x: f64, y: f64) -> bool {
+    let h: *mut Hooks = ud as *mut Hooks
+    let mods: u32 = st & (editor.MOD_SHIFT | editor.MOD_CTRL | editor.MOD_ALT)
+    if kind == window.EV_KEY {
+        let k: u32 = edit_key(a)
+        if k == 0 as u32 {
+            return false
+        }
+        return (*h).key((*h).ud, k, mods)
+    }
+    if kind == window.EV_CHAR {
+        if a < 32 as u32 || a == 127 as u32 {
+            return false
+        }
+        return (*h).text((*h).ud, a, mods)
+    }
+    if kind == window.EV_BUTTON && a == window.BTN_LEFT {
+        (*h).press((*h).ud, x, y)
+        G_PRESSED = true
+    }
+    return false
+}
+
+fn on_paint(ud: u64, fx: *mut fuiwin.Window) {
+    let h: *mut Hooks = ud as *mut Hooks
+    (*h).paint((*h).ud, fuiwin.window_w(fx), fuiwin.window_h(fx))
+}
+
+fn on_act(ud: u64, fx: *mut fuiwin.Window, node: usize) {
+    let h: *mut Hooks = ud as *mut Hooks
+    (*h).act((*h).ud, node)
+}
+
+fn say(s: str) {
+    rt.write_everything(2, s.p as u64, s.n)
+}
+
+fn run(h: *mut Hooks) -> i32 {
+    if (*h).has_audit && envvar.env_has("FUI_AUDIT") {
+        let f: fn(u64) -> i32 = (*h).audit
+        return f((*h).ud)
+    }
+    let fs: *mut metrics.FontSet =
+    rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fs as u64 == 0 || !sysfont.sysfont_load(fs) {
+        say("fui.app: no font found (DejaVu Sans, fonts-dejavu-core)\n")
+        return 9
+    }
+    let m: *mut theme.Theme = (*h).m as *mut theme.Theme
+    let w: *mut fuiwirt.Host = (*h).host as *mut fuiwirt.Host
+    var fx: fuiwin.Window = fuiwin.window_new()
+    fuiwin.window_set_font(&fx, fs as u64)
+    fuiwin.window_set_escape_closes(&fx, false)
+    fuiwin.window_set_input_hook(&fx, h as u64, on_input)
+    (*h).attach((*h).ud, fuiwin.window_painter(&fx))
+    let t: str = (*h).title
+    if !fuiwin.window_open(&fx, w, m, 0, (*h).w, (*h).h, t.p as u64, t.n) {
+        say("fui.app: no X server reachable ($DISPLAY)\n")
+        return 1
+    }
+    // a router (app.on) sees the mouse as pointer 1; a back end with real
+    // pointers would send every finger (Android fingers; X11 XInput2 touch)
+    let real: bool = fuiwin.window_use_pointers(&fx, w)
+    let f: *mut window.Window = fuiwin.window_window(&fx)
+    if window.theme_known(f) {
+        theme.theme_set_dark(m, window.dark(f))
+        fuiwirt.host_touch(w)
+    }
+    var open: bool = true
+    // r114: the on-screen keyboard follows the focused text field and types
+    // into its buffer (Android; a desktop back end answers false / 0 and
+    // nothing happens)
+    var kbuf: u64 = 0
+    while open && !(*h).done((*h).ud) {
+        let ms: i64 = fuiwirt.host_wait_ms(w)
+        if ms != 0 {
+            let e: bool = window.wait_event(f, ms)
+        }
+        open = fuiwin.window_step(&fx, w, m, on_paint, on_act, h as u64)
+        let tb: u64 = (*h).buf((*h).ud)
+        let pressed: bool = G_PRESSED
+        G_PRESSED = false
+        if tb != 0 as u64 {
+            if tb != kbuf || pressed {
+                kbuf = tb
+                let secret: bool = textbuf.tb_secret(tb as *mut textbuf.TextBuf)
+                let up: bool = window.text_input(f, true, secret, tb)
+            }
+            let got: u32 = window.text_sync(f, tb)
+            if (got & window.TI_CHANGED) != 0 as u32 {
+                (*h).edited((*h).ud)
+                fuiwirt.host_touch(w)
+            }
+            if (got & window.TI_ENTER) != 0 as u32 {
+                let used: bool = (*h).key((*h).ud, editor.KEY_ENTER, 0 as u32)
+                fuiwirt.host_touch(w)
+            }
+        } else if kbuf != 0 as u64 {
+            kbuf = 0
+            let down: bool = window.text_input(f, false, false, 0 as u64)
+        }
+    }
+    if kbuf != 0 as u64 {
+        let down2: bool = window.text_input(f, false, false, 0 as u64)
+    }
+    fuiwin.window_close(&fx)
+    return 0
+}

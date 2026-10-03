@@ -140,7 +140,7 @@ forever.
 ```sh
 bash tools/android/build.sh <firnchat>/src/gui/app.fi --name FirnChat \
     --package org.firn.firnchat --push --pick --args-file firnchat-args.txt
-bash tools/android/firnchat_bild_check.sh <firnchat> <apk>   # 25 checks
+bash tools/android/firnchat_image_check.sh <firnchat> <apk>   # 25 checks
 ```
 
 A NativeActivity cannot receive another app's answer (onActivityResult is a
@@ -186,3 +186,44 @@ pictures), so page and app see the same photos.
 * FIRNCHAT's desktop layout is not a phone layout (fixed side bar).
 * aarch64 still lacks stat/lstat/pipe/rmdir/readlink forms (compile error
   when a program uses them, not a silent guess).
+
+## The on-screen keyboard (r114)
+
+A keyboard never types into a plain `NativeActivity`: the input method asks
+the focused view for an `InputConnection`, the `NativeContentView` answers
+null and Android logs "showSoftInput() ignored: view is not served". So
+`lib/android/inputmethod.fi` builds two Java classes as DEX in memory
+(`lib/android/imedex.fi`: `org.firn.ImeView`, a one pixel view that holds the
+focus, and `org.firn.ImeConn`, an `InputConnection` whose methods are all
+`native`), loads them with an `InMemoryDexClassLoader` and registers Firn
+functions for the natives. It happens the first time a text field takes the
+focus; nothing is built before.
+
+* **Two threads.** Android's main thread owns the views and receives the
+  keyboard's calls (`commitText`, `setComposingText`, `getTextBeforeCursor`,
+  ...). The program lives on the app thread (`lib/android/activity.fi`) and
+  owns the text (`lib/fui/textbuf.fi`). A native method copies its arguments
+  into a request in shared raw memory, wakes the app thread (`CMD_IME`) and
+  waits at most 400 ms; the app thread does the edit on the real `TextBuf`
+  (`ime_serve`) and the answer goes back. What needs the main thread (build,
+  focus, show, hide, `updateSelection`) is posted the other way, one octet
+  into a socket pair whose end hangs in the main looper.
+* **Program side.** `window.text_input(f, on, secret, tb)` and
+  `window.text_sync(f, tb)` (lib/window/window.fi); `fui.app` does it for
+  its text fields (`lib/@linux/fui/apphost.fi`). A desktop back end answers
+  `false` / 0.
+* **Checks.** `tools/android/ime_dex_check.sh` (the SDK's `dexdump` reads the
+  classes, part of `tools/fui/run.sh`), `tools/android/keyboard_check.sh`
+  (emulator: taps the keys of the real keyboard, compares the pixels with
+  the same text arriving as key events) and `tools/android/lifecycle_check.sh`
+  (pause, resume, rotation, screen off).
+* **Not done:** a real phone (the emulator's AOSP keyboard is what was run),
+  more than one line of text, the full-screen extract UI (the flags ask the
+  keyboard not to use it).
+* **A bug it found on the way** (roadmap r113): a call through a `fn(f64, f64,
+  f64, f64)` value at `release-safe` on x86_64 put the floats in the wrong
+  registers (the register allocated path of `Op::CallIndirect` counted every
+  argument as an integer). The GL clear colour arrived as (b, 0, 0, 0) and the
+  Android window kept its old texture. Fixed in `compiler/src/regalloc.rs` (the OrientOS worker found the same bug
+  at the same time through fUi's caret and fixed it identically on main; both
+  tests stay: `tests/2002_calli_float.fi`, `tests/2002_fnval_float.fi`).

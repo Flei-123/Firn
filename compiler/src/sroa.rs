@@ -1,51 +1,51 @@
 // SPDX-License-Identifier: MPL-2.0
-//! **Runde TEMPO 12 -- ein Struct auf dem Stapel wird zu einzelnen Zellen.**
+//! **Round TEMPO 12 -- a struct on the stack becomes individual cells.**
 //!
-//! ## Warum es diesen Pass gibt
+//! ## Why this pass exists
 //!
-//! Der Huffman-Leser des MP3-Dekoders haelt seinen Zustand in einem kleinen
-//! Struct und reicht einen Zeiger darauf an vier Helfer weiter:
+//! The Huffman reader of the MP3 decoder holds its state in a small
+//! struct and passes a pointer to it on to four helpers:
 //!
 //! ```firn
-//! var lage: HuffLage = HuffLage { cache: .., sh: .., next: .. }
-//! let l: *mut HuffLage = &lage
+//! var state: HuffState = HuffState { cache: .., sh: .., next: .. }
+//! let l: *mut HuffState = &state
 //! ... flush_bits(l, w) ... peek_bits(l, 5) ... check_bits(l)
 //! ```
 //!
-//! Nach dem Einbetten der Helfer ist davon nur noch ein `alloca` uebrig,
-//! auf das mit festen Versaetzen geladen und geschrieben wird. `mem2reg`
-//! befoerdert aber nur Zellen, die als GANZES gelesen und geschrieben werden
-//! -- ein `ptradd` auf die Zelle macht sie fuer ihn unantastbar. Also lagen
-//! `cache`, `sh` und `next` die ganze Funktion ueber im Rahmen, und jede
-//! Bitoperation des heissesten Dekoderteils ging durch den Speicher:
-//! `mov -0x1cc0(%rbp),%r8d ... mov %r13d,-0x1cc0(%rbp)`. In C ist genau
-//! dieser Zustand (`bs_cache`, `bs_sh`, `bs_next` in minimp3) eine Handvoll
-//! lokaler Variablen und steht in Registern.
+//! After inlining the helpers only an `alloca` is left of it,
+//! which is loaded from and written to with fixed offsets. But `mem2reg`
+//! promotes only cells that are read and written as a WHOLE
+//! -- a `ptradd` on the cell makes it untouchable for it. So
+//! `cache`, `sh` and `next` lay in the frame the whole function, and every
+//! bit operation of the hottest decoder part went through memory:
+//! `mov -0x1cc0(%rbp),%r8d ... mov %r13d,-0x1cc0(%rbp)`. In C exactly
+//! this state (`bs_cache`, `bs_sh`, `bs_next` in minimp3) is a handful of
+//! local variables and stands in registers.
 //!
-//! ## Was der Pass tut
+//! ## What the pass does
 //!
-//! Ein `alloca`, dessen Adresse NUR so benutzt wird:
+//! An `alloca` whose address is used ONLY like this:
 //!
-//!   * `load`/`store` direkt auf die Zelle (Versatz 0), oder
-//!   * `p = ptradd zelle, K` mit konstantem `K`, und `p` wiederum NUR als
-//!     Adresse eines `load`/`store`,
+//!   * `load`/`store` directly on the cell (offset 0), or
+//!   * `p = ptradd cell, K` with constant `K`, and `p` in turn ONLY as the
+//!     address of a `load`/`store`,
 //!
-//! wird in eine Zelle je Versatz zerlegt. Jede neue Zelle ist wieder ein
-//! gewoehnliches `alloca`, das `mem2reg` in der naechsten Runde befoerdert.
+//! is split into one cell per offset. Each new cell is again an
+//! ordinary `alloca` that `mem2reg` promotes in the next round.
 //!
-//! ## Warum das nichts brechen kann
+//! ## Why this cannot break anything
 //!
-//! Die Adresse verlaesst die Funktion nie (sie wird weder gespeichert noch
-//! uebergeben noch verglichen -- jede solche Benutzung laesst den Pass die
-//! Finger davon lassen). Also kann niemand ausser den aufgezaehlten Zugriffen
-//! den Speicher sehen. Verlangt wird ausserdem, dass alle Zugriffe auf einen
-//! Versatz denselben Typ haben und sich keine zwei Felder ueberlappen -- dann
-//! ist jeder Zugriff genau ein Feld, und ein Feld in einer eigenen Zelle
-//! verhaelt sich wie dasselbe Feld im Struct. Ein `copymem` auf oder von der
-//! Zelle (Struct-Zuweisung als Ganzes) ist eine andere Benutzung und
-//! verhindert den Pass; das ist der naechste Schritt, nicht dieser.
+//! The address never leaves the function (it is neither stored nor
+//! passed nor compared -- every such use makes the pass keep its
+//! hands off). So nobody but the enumerated accesses can
+//! see the memory. It is also required that all accesses to one
+//! offset have the same type and that no two fields overlap -- then
+//! every access is exactly one field, and a field in a cell of its own
+//! behaves like the same field in the struct. A `copymem` to or from the
+//! cell (struct assignment as a whole) is a different use and
+//! prevents the pass; that is the next step, not this one.
 //!
-//! Abschaltbar mit `--no-pass=sroa` oder `FIRN_NO_SROA=1`.
+//! Can be switched off with `--no-pass=sroa` or `FIRN_NO_SROA=1`.
 
 use crate::fir::{Func, Op, Term, Val};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -54,7 +54,7 @@ pub(crate) fn split(f: &mut Func) -> usize {
     if std::env::var_os("FIRN_NO_SROA").is_some() {
         return 0;
     }
-    // Konstanten (fuer die Versaetze).
+    // Constants (for the offsets).
     let mut consts: HashMap<Val, i128> = HashMap::new();
     let mut cells: HashMap<Val, (u64, u64)> = HashMap::new();
     for b in &f.blocks {
@@ -92,7 +92,7 @@ pub(crate) fn split(f: &mut Func) -> usize {
             }
         }
     }
-    // Zelle -> Versatz -> Typ; jede andere Benutzung macht die Zelle bad.
+    // Cell -> offset -> type; every other use makes the cell bad.
     let mut fields: HashMap<Val, BTreeMap<i128, crate::fir::FTy>> = HashMap::new();
     let root = |v: Val| -> Option<(Val, i128)> {
         if cells.contains_key(&v) {
@@ -125,8 +125,8 @@ pub(crate) fn split(f: &mut Func) -> usize {
                     }
                 }
                 Op::PtrAdd { base, .. } if cells.contains_key(base) => {
-                    // schon oben eingeordnet; der Versatz selbst ist keine
-                    // Benutzung einer Zelle
+                    // already classified above; the offset itself is not a
+                    // use of a cell
                 }
                 other => {
                     buf.clear();
@@ -150,7 +150,7 @@ pub(crate) fn split(f: &mut Func) -> usize {
                 bad.insert(z);
             }
         }
-        // phi-Eintraege zaehlen als Benutzung
+        // phi entries count as a use
         for i in &b.insts {
             if let Op::Phi { incoming } = &i.op {
                 for (_, v) in incoming.iter() {
@@ -161,8 +161,8 @@ pub(crate) fn split(f: &mut Func) -> usize {
             }
         }
     }
-    // Auswahl: mindestens ein ptradd (sonst kann mem2reg es schon), keine
-    // Ueberlappung, alles innerhalb der Zelle, kein geheimer Wert.
+    // Selection: at least one ptradd (otherwise mem2reg can already do it), no
+    // overlap, everything inside the cell, no secret value.
     let mut candidates: Vec<Val> = fields
         .iter()
         .filter(|(z, fs)| {
@@ -188,7 +188,7 @@ pub(crate) fn split(f: &mut Func) -> usize {
     if candidates.is_empty() {
         return 0;
     }
-    // Reihenfolge fest (Fixpunkt: zwei Laeufe muessen denselben Text geben).
+    // Fixed order (fixed point: two runs must give the same text).
     candidates.sort_unstable();
     let mut neu: HashMap<(Val, i128), Val> = HashMap::new();
     for z in &candidates {
@@ -220,6 +220,6 @@ pub(crate) fn split(f: &mut Func) -> usize {
             }
         }
     }
-    // Die alten ptradd und die alte Zelle sind jetzt tot; `dce` raeumt sie.
+    // The old ptradd and the old cell are now dead; `dce` clears them.
     candidates.len()
 }

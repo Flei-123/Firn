@@ -41,7 +41,7 @@ sed -i 's/^const SCENE_MAX: usize = 128$/const SCENE_MAX: usize = 1024/
 s/nodes: \[Node; 128\],/nodes: [Node; 1024],/
 s/nodes: \[node_blank(); 128\]/nodes: [node_blank(); 1024]/
 s/s: \[MemoSlot; 128\],/s: [MemoSlot; 1024],/
-s/lines: 0 }; 128\]/lines: 0 }; 1024]/' \
+s/\[memo_slot_blank(); 128\]/[memo_slot_blank(); 1024]/' \
     "$W/lib1024/fui/scene.fi"
 sed -i 's/^const A11Y_MAX: usize = 128$/const A11Y_MAX: usize = 1024/
 s/a: \[Ann; 128\],/a: [Ann; 1024],/

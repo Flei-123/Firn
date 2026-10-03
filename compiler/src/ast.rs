@@ -134,6 +134,8 @@ pub enum UnOp {
     BitNot,
     /// `&x` — address of
     AddrOf,
+    /// `inout x` (ROUND REF) — address of `x` that must be modifiable
+    InoutOf,
     /// `*p` — dereference
     Deref,
 }
@@ -294,6 +296,8 @@ pub enum Stmt {
         start: Expr,
         end: Expr,
         body: Block,
+        /// `start..=end`: the end value is part of the range (ROUND REF2).
+        inclusive: bool,
         /// Position of the loop variable (for error messages)
         name_span: Span,
         span: Span,

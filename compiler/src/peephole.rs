@@ -141,23 +141,23 @@ pub(crate) fn run(f: &mut Func) -> usize {
         }
     }
 
-    // ---- 2b. RUNDE TEMPO 11: die Konstante gehoert nach RECHTS ------------
+    // ---- 2b. ROUND TEMPO 11: the constant belongs on the RIGHT ------------
     //
-    // `4 * i` und `i * 4` sind dasselbe, aber nur die zweite Form sieht der
-    // Erzeuger: er fragt `imm(b)`, und `imm(a)` interessiert ihn nicht. Im
-    // MP3-Dekoder stand deshalb
+    // `4 * i` and `i * 4` are the same, but only the second form is seen by the
+    // generator: it asks `imm(b)`, and `imm(a)` does not interest it. In the
+    // MP3 decoder there therefore stood
     //
     //     mov  $0x4,%r10
     //     imul %r8d,%r10d
     //
-    // wo `lea r10,[r8*4]` haette stehen koennen -- 0,8 Mio Befehle, und
-    // dasselbe fuer `+`, `&`, `|`, `^`.
+    // where `lea r10,[r8*4]` could have stood -- 0.8 million instructions, and
+    // the same for `+`, `&`, `|`, `^`.
     //
-    // Nur GANZZAHLEN. Fuer Gleitzahlen sind `+` und `*` zwar ebenfalls
-    // vertauschbar (beide runden symmetrisch), aber dort hat der Erzeuger
-    // seine eigene Vertauschung an der Stelle, an der er das Zielregister
-    // kennt (Runde TEMPO); zwei Antworten auf dieselbe Frage braucht
-    // niemand.
+    // INTEGERS only. For floating-point numbers `+` and `*` are likewise
+    // commutative (both round symmetrically), but there the generator
+    // has its own swap at the place where it knows the destination register
+    // (round TEMPO); nobody needs two answers to the same
+    // question.
     for b in f.blocks.iter_mut() {
         for i in b.insts.iter_mut() {
             if i.ty.is_float() || i.ty == crate::fir::FTy::V128 {

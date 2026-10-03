@@ -1,0 +1,102 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/http/test_main.fi -- the server tools/http/check.py and the
+// Autobahn run talk to.
+//
+//   test_main <port> [pair] [tls <cert.pem> <key.pem>]
+//
+// First line on stdout: the URL (with the token when paired).
+//   /          a fixed page
+//   /echo      any method: "<METHOD> <body length> <X-Probe header>\n<body>"
+//   /q         the query parameter `a`
+//   /ws        WebSocket echo (text and binary, as they came)
+//   /events    Server-Sent Events, one "tick <n>" every 200 ms
+//   /stop      ends the program (only on 127.0.0.1 tests)
+import std.rt
+import std.io
+import http.server as http
+
+const PAGE: str = "<!doctype html><title>firn</title><p>hello from the Firn HTTP server</p>\n"
+
+fn echo(r: *mut http.Req) {
+    var b: rt.Buf = rt.buf_new()
+    let m: str = http.method(r)
+    rt.buf_push_bytes(&b, m.p as u64, m.n)
+    rt.buf_push(&b, 32 as u8)
+    rt.buf_push_dec_u64(&b, http.body(r).n as u64)
+    rt.buf_push(&b, 32 as u8)
+    let probe: str = http.header(r, "x-probe")
+    rt.buf_push_bytes(&b, probe.p as u64, probe.n)
+    rt.buf_push(&b, 10 as u8)
+    let bd: str = http.body(r)
+    rt.buf_push_bytes(&b, bd.p as u64, bd.n)
+    http.reply(r, 200, "text/plain", str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+}
+
+fn q(r: *mut http.Req) {
+    http.reply(r, 200, "text/plain", http.query_param(r, "a"))
+}
+
+fn stop(r: *mut http.Req) {
+    http.reply(r, 200, "text/plain", "bye\n")
+    http.stop((*r).app)
+}
+
+fn on_ws(w: *mut http.Ws, msg: str) {
+    if (*w).binary {
+        http.ws_send_binary(w, msg.p as u64, msg.n)
+    } else {
+        http.ws_send(w, msg)
+    }
+}
+
+static mut TICKS: u64 = 0
+
+fn tick(a: *mut http.App) {
+    TICKS = TICKS + 1
+    var b: rt.Buf = rt.buf_new()
+    let t: str = "tick "
+    rt.buf_push_bytes(&b, t.p as u64, t.n)
+    rt.buf_push_dec_u64(&b, TICKS)
+    http.sse_send(a, "/events", "", str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+}
+
+fn main(start: u64) -> i32 {
+    var port: u64 = 0
+    let pp: u64 = rt.arg_ptr(start, 1)
+    var i: usize = 0
+    while i < rt.c_length(pp) {
+        port = port * 10 + (rt.ld8(pp, i) - 48 as u8) as u64
+        i = i + 1
+    }
+    var app: http.App = http.app(port as u16)
+    http.set_limits(&app, 1048576, 33554432, 64)
+    var k: usize = 2
+    while k < rt.arg_count(start) {
+        let a: u64 = rt.arg_ptr(start, k)
+        if rt.ld8(a, 0) == 112 as u8 { // pair
+            http.pair(&app)
+        }
+        if rt.ld8(a, 0) == 116 as u8 && k + 2 < rt.arg_count(start) { // tls
+            let c: u64 = rt.arg_ptr(start, k + 1)
+            let kk: u64 = rt.arg_ptr(start, k + 2)
+            if !http.tls_files(&app, str { p: c as *mut u8, n: rt.c_length(c) },
+                str { p: kk as *mut u8, n: rt.c_length(kk) }) {
+                io.eprint_line("tls refused")
+                return 4
+            }
+            k = k + 2
+        }
+        k = k + 1
+    }
+    http.route_text(&app, "/", "text/html; charset=utf-8", PAGE)
+    http.route(&app, "/echo", echo)
+    http.route(&app, "/q", q)
+    http.route(&app, "/stop", stop)
+    http.route_ws(&app, "/ws", on_ws)
+    http.route_sse(&app, "/events")
+    http.every(&app, 200, tick)
+    io.print_line(http.url(&app))
+    return http.serve(&app)
+}

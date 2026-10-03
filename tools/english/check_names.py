@@ -31,7 +31,7 @@ os.chdir(ROOT)
 # sind die Namen der Original-Suite und duerfen nicht umbenannt werden --
 # sonst laeuft der Vergleich gegen die Quelle nicht mehr.
 AUS = ('testdata/', 'tests/data/', 'tools/english/', '.js-work/',
-       '.test-work/')
+       '.test-work/', '.gauntlet-shots/')
 # Ein angehaengter Zaehler versteckt das deutsche Wort: 'pfad2', 'teil1'.
 ZIFFERNSCHWANZ = re.compile(r'[0-9]+$')
 TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')
@@ -48,7 +48,10 @@ ERLAUBT = {'kernel', 'start', 'core', 'min', 'max', 'lib', 'bin', 'src',
            # the English word "attributes" contains the German morpheme
            # "attribut". The checker cannot tell them apart, and renaming the
            # file is not on the table -- so it is named here.
-           'gitattributes'}
+           'gitattributes',
+           # `der` is the ASN.1 encoding (lib/tls/the.fi), `mit` is the MIT
+           # license (LICENSES/MIT.old.txt) -- not German words here.
+           'der', 'mit'}
 # Runde 65: englische GANZE Woerter, in denen ein deutsches Morphem als
 # Zeichenfolge steckt ('absolute' enthaelt 'absolut'). Die Suche im
 # Wortinneren darf hier nicht anschlagen; als ganzes Teil geprueft, nicht

@@ -16,10 +16,10 @@
 //! NAMED function (round 75, a C callback). Everything else went through
 //! memory: Certus' Android port stored the value into a struct field and
 //! read the word back twice (`code_of4`, lib/android/a_main.fi), osum's
-//! kernel symbol table did the same (`kernel/lib/ksym.fi`, "Firn hat keinen
-//! Ausdruck, der eine Funktion in eine Zahl wandelt"), and every driver
+//! kernel symbol table did the same (`kernel/lib/ksym.fi`, "Firn has no
+//! expression that turns a function into a number"), and every driver
 //! table carried stub functions because there was no null (`fs/ext4.fi`,
-//! `fs/vfsops.fi`: "Firn hat keinen Nullzeiger fuer `fn`").
+//! `fs/vfsops.fi`: "Firn has no null pointer for `fn`").
 //!
 //! The rules:
 //! * `f as u64` / `f as usize` is the RECORD address -- the identity of the

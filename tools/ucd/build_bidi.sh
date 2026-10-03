@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# tools/ucd/build_bidi.sh -- DER ERZEUGUNGSSCHRITT FUER generated/bidi_tables.fi.
+# tools/ucd/build_bidi.sh -- THE GENERATION STEP FOR generated/bidi_tables.fi.
 #
-# Dieselbe Reihenfolge wie tools/ucd/build.sh fuer unicode_tables.fi, und
-# aus demselben Grund: eine Tabelle, die aus einer veraenderten Quelle
-# entstand, beweist nichts ueber die UCD.
+# The same order as tools/ucd/build.sh for unicode_tables.fi, and for
+# the same reason: a table that arose from a changed source
+# proves nothing about the UCD.
 #
-#   0. die Dateien sind unveraendert (sha256 gegen UCD_BIDI.sha256 und
-#      UCD.sha256 -- UnicodeData.txt teilt sich dieser Schritt mit build.sh)
-#   1. tools/ucd/pack_bidi.fi baut und liest die fuenf Dateien
-#   2. firnfmt bringt das Ergebnis in die kanonische Form und prueft sie
-#   3. --verify: ein zweites Mal bauen und Oktett fuer Oktett vergleichen;
-#      sonst die Datei einsetzen
-#   4. tools/ucd/probe_bidi.fi fragt die Tabelle ueber lib/str/ucd_bidi.fi
-#      nach JEDEM Codepunkt, und tools/ucd/verify_bidi.py haelt die
-#      Antworten gegen einen eigenen Zerleger der fuenf Dateien
-#   5. GEGENPROBE: eine Zeile der Antworten wird gefaelscht, und die
-#      Pruefung von 4. MUSS anschlagen
-#   6. die Groesse der Tabelle
+#   0. the files are unchanged (sha256 against UCD_BIDI.sha256 and
+#      UCD.sha256 -- UnicodeData.txt is shared by this step with build.sh)
+#   1. tools/ucd/pack_bidi.fi builds and reads the five files
+#   2. firnfmt brings the result into canonical form and checks it
+#   3. --verify: build a second time and compare octet for octet;
+#      otherwise put the file in place
+#   4. tools/ucd/probe_bidi.fi asks the table via lib/str/ucd_bidi.fi
+#      about EVERY code point, and tools/ucd/verify_bidi.py holds the
+#      answers against an own parser of the five files
+#   5. COUNTER-TEST: one row of the answers is forged, and the check
+#      of 4. MUST trip
+#   6. the size of the table
 #
-# Aufruf:  bash tools/ucd/build_bidi.sh [--verify] [--fetch]
+# Call:  bash tools/ucd/build_bidi.sh [--verify] [--fetch]
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
@@ -32,8 +32,8 @@ for a in "$@"; do
     [ "$a" = "--verify" ] && VERIFY=1
     [ "$a" = "--fetch" ] && FETCH=1
 done
-# Der Arbeitsordner als absoluter Pfad: Schritt 1 wechselt nach
-# tools/ucd, und ein relativer Pfad zeigte von dort ins Leere.
+# The working folder as an absolute path: step 1 changes into
+# tools/ucd, and a relative path would point into the void from there.
 case "$WORK" in
     /*) ;;
     *) WORK="$ROOT/$WORK" ;;

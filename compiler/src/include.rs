@@ -10,7 +10,7 @@
 //! Until this round a program that wanted a file's text in its binary had
 //! to generate Firn source from it (`tools/gen_gctext.sh` packs
 //! `lib/gc/gc.fi` into u64 words so that firnc1 can carry it;
-//! docs/LUECKEN.md B21). firnc0 itself does exactly this with Rust's
+//! docs/GAPS.md B21). firnc0 itself does exactly this with Rust's
 //! `include_str!`.
 //!
 //! The rules:

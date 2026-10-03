@@ -16,13 +16,13 @@ set -e
 cd "$(dirname "$0")/../.."
 export FIRNLIB="$(pwd)/lib"
 FIRNC="${FIRNC:-$(pwd)/compiler/target/release/firnc}"
-# DAS FREISTEHEND-ZIEL, UND WAS PASSIERT, WENN ES FEHLT. Frueher stand
-# hier: gibt es "x86_64-none" nicht, dann eben ohne --target. Damit war
-# Abschnitt 1 auf jedem Compiler-Stand ohne Freistehend-Ziel STILL
-# gruen, obwohl seine Ueberschrift etwas anderes behauptete -- genau
-# die Sorte weggelassene Pruefung, gegen die dieser Lauf geschrieben
-# ist. Jetzt wird die Ersatzpruefung BENANNT und selbst geprueft
-# (siehe Abschnitt 1); faellt sie aus, bricht der Lauf ab.
+# THE FREESTANDING TARGET, AND WHAT HAPPENS IF IT IS MISSING. Formerly there stood
+# here: if "x86_64-none" does not exist, then just without --target. That made
+# section 1 SILENTLY green on every compiler state without a freestanding target,
+# although its heading claimed something else -- exactly
+# the sort of omitted check against which this run is written.
+# Now the substitute check is NAMED and itself checked
+# (see section 1); if it fails, the run aborts.
 NONE_T="--target=x86_64-none"
 FREISTEHEND_ZIEL="ja"
 if ! "$FIRNC" --help 2>&1 | grep -q "x86_64-none"; then
@@ -41,16 +41,16 @@ echo "== 1. THE CORE BUILDS FREESTANDING (profile kernel) =="
 # the application. What is checked: that it builds AND that no syscall
 # and no foreign name is left inside.
 #
-# WENN DAS FREISTEHEND-ZIEL FEHLT. Dieser Compiler-Stand kennt nur
-# x86_64-linux und aarch64-linux; ein Ziel "x86_64-none" gibt es (noch)
-# nicht. Das Weglassen von --target darf aber nicht heissen, dass von
-# der Ueberschrift nichts mehr geprueft wird. Also wird an seiner
-# Stelle nachgewiesen, dass das Profil `kernel` ZAEHNE hat: es muss
-# `syscall` und den Import von std.io ABLEHNEN. Ein Profil, das beides
-# durchlaesst, waere ein Etikett, und dann waere "0 syscall
-# instructions" weiter unten nur ein Zufall des Quelltextes. Scheitert
-# dieser Ersatznachweis, ist der Lauf NICHT bestanden -- still
-# weiterlaufen tut er nicht mehr.
+# IF THE FREESTANDING TARGET IS MISSING. This compiler state knows only
+# x86_64-linux and aarch64-linux; a target "x86_64-none" does not exist (yet).
+# Leaving out --target must not mean, however, that nothing of
+# the heading is checked any more. So in its
+# place it is proven that the profile `kernel` has TEETH: it must
+# REJECT `syscall` and the import of std.io. A profile that lets both
+# through would be a label, and then "0 syscall
+# instructions" further below would be a coincidence of the source text. If
+# this substitute proof fails, the run has NOT passed -- it does not
+# silently continue any more.
 if [ "$FREISTEHEND_ZIEL" = "ja" ]; then
     echo "  Freistehend-Ziel x86_64-none vorhanden, es wird gebaut     OK"
 else
@@ -130,12 +130,12 @@ build layout
 
 echo
 echo "== 6. SYMMETRY OF BORDER AND FOCUS RING =="
-# Justins Befund vom 10.09.2026: der Fokusring war oben 6 Zeilen dick
-# und unten 2, und stand oben rechts zwei Punkte ueber. Ursache war
-# der Innenpfad in painter.path_round_ccw (vertauschte Kontrollpunkte,
-# ein Segment endete auf seinem eigenen Anfang). Diese Pruefung ZAEHLT
-# die vier Kantendicken nach -- dieselbe Sorte Asymmetrie hat uns beim
-# Schliesskreuz zwei Runden gekostet.
+# Justin's finding of 10.09.2026: the focus ring was 6 rows thick at the top
+# and 2 at the bottom, and stood two points too high at the top right. The cause was
+# the inner path in painter.path_round_ccw (swapped control points,
+# one segment ended on its own start). This check COUNTS
+# the four edge thicknesses -- the same sort of asymmetry cost us two
+# rounds with the close cross.
 build symmetry
 "$W/symmetry"
 
@@ -178,11 +178,11 @@ build image
 
 echo
 echo "== 10c. DAS PORTIERTE lib/svg IM FIRN-BAUM =="
-# lib/svg kommt aus dem Certus-Baum (13.09.2026, sieben von acht Dateien
-# byte-identisch). Geprueft wird, was bei der Portierung angefasst wurde:
-# raster_finish_evenodd in der NEUEREN raster.fi, ttf.font_outline_m, und
-# der Schrift-Adapter svg/fontsel.fi. Dazu currentColor gegen die
-# Akzentfarbe -- Justins Zusatz vom 13.09.2026.
+# lib/svg comes from the Certus tree (13.09.2026, seven of eight files
+# byte-identical). What is checked is what was touched in the port:
+# raster_finish_evenodd in the NEWER raster.fi, ttf.font_outline_m, and
+# the font adapter svg/fontsel.fi. In addition currentColor against the
+# accent colour -- Justin's addition of 13.09.2026.
 build uisvg
 "$W/uisvg"
 
@@ -190,8 +190,8 @@ echo
 echo "== 10d. THE PICTURE ON THE WIDGET =="
 # Icon left/right/only, the measure, the tint, and the tab and menu entry
 # that paint through the borrowed label.
-build art
-"$W/art"
+build picture
+"$W/picture"
 
 echo
 echo "== 11. THE TEXT VALUES AT THE PIXEL =="
@@ -202,168 +202,167 @@ build text
 
 echo
 echo "== 12. DIE ZEIT: EASINGS, TWEENS, UEBERGAENGE =="
-# Runde UI-WEB: lib/fui/anim.fi. Geprueft werden die Easings an ihren
-# Stuetzstellen (ease-in-out ist bei 0.5 exakt 0.5), die analytisch
-# geloeste Feder (sie kommt zur Ruhe und driftet nicht), der Takt, der
-# nur bei echter Aenderung "neu zeichnen" meldet, und die
-# Farbmischung mit korrektem Alpha.
-# Abschnitt 12b liest die Zahlen AUS DEM RENDER-PFAD: render.Ctx fuehrt
-# seit der Runde FEHLERBEHEBUNG ein Register laufender Uebergaenge
-# (anim.TransReg), und der Bildpunkt in der Mitte des gemalten Knopfes
-# geht ueber drei Bilder von 0x42414D nach 0x52525E. Ohne das Register
-# springt er sofort -- die Gegenprobe steht daneben.
+# Round UI-WEB: lib/fui/anim.fi. What is checked are the easings at their
+# support points (ease-in-out is exactly 0.5 at 0.5), the analytically
+# solved spring (it comes to rest and does not drift), the clock, which
+# reports "redraw" only on a real change, and the
+# colour mixing with correct alpha.
+# Section 12b reads the numbers FROM THE RENDER PATH: render.Ctx has carried
+# a register of running transitions since the round FEHLERBEHEBUNG
+# (anim.TransReg), and the pixel in the middle of the painted button
+# goes over three images from 0x42414D to 0x52525E. Without the register
+# it jumps at once -- the counter-test stands beside it.
 build anim
 "$W/anim"
 
 echo
 echo "== 13. FLEX-LAYOUT AM PIXEL =="
-# Jede Zahl hier ist von Hand gerechnet: Verteilung des freien und des
-# fehlenden Platzes, Klemmung an min/max und die NACHVERTEILUNG, die
-# daraus folgt -- der Ort, an dem eine halbfertige Flexbox eine Luecke
-# am rechten Rand laesst.
+# Every number here is calculated by hand: distribution of the free and of the
+# missing space, clamping to min/max and the REDISTRIBUTION that
+# follows from it -- the place where a half-finished flexbox leaves a gap
+# at the right edge.
 build flex
 "$W/flex"
 
 echo
 echo "== 14. UNSCHAERFE, SCHATTEN, FARBMATRIX =="
-# Der Kastenweichzeichner gegen die Faltung von Hand und dreimal
-# Kasten gegen den kubischen B-Spline (1,3,6,7,6,3,1)/27 -- die
-# analytische Antwort, die eine Gauss-Naeherung geben MUSS.
+# The box blur against the convolution by hand and three times
+# box against the cubic B-spline (1,3,6,7,6,3,1)/27 -- the
+# analytic answer that a Gauss approximation MUST give.
 build effect
 "$W/effect"
-# DIE ZWEITE HAELFTE DERSELBEN PRUEFUNG. Es gibt in diesem Baum zwei
-# Kastenweichzeichner -- lib/paint/painter.blur_line auf
-# DECKUNGSGRADEN (f64) und lib/fui/effect.blur_buffer auf der
-# PREMULTIPLIZIERTEN u8-LEINWAND. Dass das kein zweiter Ort fuer
-# dieselbe Sache ist, steht im Kopf von effect.fi; dass beide bei
-# demselben sigma denselben Tonwert liefern, rechnen die beiden
-# Programme gegen DIESELBE Tabelle nach. Zwei sind es, weil Firn ein
-# Modul nach dem letzten Pfadabschnitt aufloest und `fui.painter` und
-# `paint.painter` darum nicht in ein Programm passen.
+# THE SECOND HALF OF THE SAME CHECK. There are two box blurs in this tree --
+# lib/paint/painter.blur_line on
+# COVERAGE VALUES (f64) and lib/fui/effect.blur_buffer on the
+# PREMULTIPLIED u8 CANVAS. That this is not a second place for
+# the same thing is stated in the head of effect.fi; that both at
+# the same sigma give the same tone value is re-calculated by the two
+# programs against the SAME table. There are two because Firn resolves a
+# module after the last path segment and `fui.painter` and
+# `paint.painter` therefore do not fit into one program.
 build blurref
 "$W/blurref"
 
 echo
 echo "== 15. AFFINE ABBILDUNGEN UND DIE TREFFERPRUEFUNG =="
-# Bekannte Punktbilder, der Stapel, die Kehrabbildung -- und der
-# Klick unter Drehung, der ohne inverse Abbildung danebengeht.
-# Abschnitt 16 dieser Datei geht den NORMALEN Weg: ein um 24 Grad
-# gedrehter Knopf, gemalt mit wave2.draw_any_xf (also ueber
-# render.draw_widget_xf), bedient mit control.mouse_down -- und der
-# Punkt, an dem er gemalt wurde, ist derselbe, an dem er getroffen
-# wird. Ohne transform.tf_bind_panel geht genau dieser Klick daneben,
-# und auch das steht dort als Zahl.
+# Known point images, the stack, the inverse mapping -- and the
+# click under rotation, which without the inverse mapping goes wide.
+# Section 16 of this file goes the NORMAL way: a button rotated by 24
+# degrees, painted with wave2.draw_any_xf (that is via
+# render.draw_widget_xf), operated with control.mouse_down -- and the
+# point at which it was painted is the same one at which it is
+# hit. Without transform.tf_bind_panel exactly this click goes wide,
+# and that too stands there as a number.
 build transform
 "$W/transform"
 
 echo
 echo "== 16. DIE BEDIENUNG: FOKUSKETTE UND ZEIGER =="
-# tools/fui/control_main.fi lag seit seiner Entstehung NEBEN dem
-# Prueflauf: es rechnet nach, aber niemand rief es. Genau so geht eine
-# Pruefung schweigend verloren -- der Grund, aus dem es diese Datei
-# gibt. Also haengt es jetzt hier drin. Wichtig fuer die Runde UI-WEB:
-# hier liegt die Trefferpruefung, auf die lib/fui/transform.fi den Punkt
-# mit der Kehrabbildung zurueckrechnet.
+# tools/fui/control_main.fi lay BESIDE the check run since its creation:
+# it re-calculates, but nobody called it. That is exactly how a
+# check gets silently lost -- the reason why this file
+# exists. So now it hangs in here. Important for the round UI-WEB:
+# here lies the hit test onto which lib/fui/transform.fi calculates the point
+# back with the inverse mapping.
 build control
 "$W/control"
 
 echo
 echo "== 17. DER ZEILENUMBRUCH =="
-# Ebenfalls nachgetragen: der Umbruch pruefte sich selbst, ohne dass
-# der Lauf davon wusste.
+# Likewise added: the wrapping checked itself without the
+# run knowing about it.
 build wrap
 "$W/wrap"
 
 echo
 echo "== 18. DIE BEDIENUNG DES TEXTFELDES =="
-# lib/fui/editor.fi liess sich seit seinem ersten Tag NICHT uebersetzen
-# (eine fehlende `if`-Zeile im Zweig fuer die Ruecktaste), und es fiel
-# nicht auf, weil kein Programm die Datei einband und dieser Lauf sie
-# nicht kannte. Jetzt wird sie gebaut UND gerechnet: Strg+A ersetzt
-# statt anzuhaengen (Justins Adresszeilen-Fehler), die Wortspruenge,
-# Strg+Rueck/Entf mit und ohne Auswahl, Ctrl+Z/Y und die Tasten, die
-# dem Feld nicht gehoeren.
+# lib/fui/editor.fi could NOT be compiled since its first day
+# (a missing `if` line in the branch for backspace), and it did not
+# show because no program included the file and this run did not
+# know it. Now it is built AND calculated: Ctrl+A replaces
+# instead of appending (Justin's address-bar error), the word jumps,
+# Ctrl+Backspace/Del with and without selection, Ctrl+Z/Y and the keys that
+# do not belong to the field.
 build editor
 "$W/editor"
 
 echo
 echo "== 18a. DIE EINGABEMETHODE: CHINESISCH, JAPANISCH, KOREANISCH =="
-# lib/fui/ime.fi mit seinem Anschluss an editor.fi. Nachgerechnet
-# werden Romaji nach Kana (Doppelkonsonant, n-Regel, tch), die
-# Hangul-Silben nach Unicode Kapitel 3.12 (zusammensetzen UND zerlegen,
-# jede Zahl steht ausgerechnet daneben), der wandernde Auslaut, der
-# Vorbearbeitungstext mit dem Schreibzeiger davor und dahinter, die
-# Auswahl, die erst beim Bestaetigen ersetzt wird und beim Abbrechen
-# wiederkommt, die Kandidaten, Pinyin gegen die mitgelieferte Tabelle
-# und die Plattform-Schnittstelle ueber eine nachgeahmte Plattform.
-# Das Bild dazu (Feld mit offener Kandidatenliste) entsteht unten bei
-# --images mit tools/fui/imebeleg_main.fi.
+# lib/fui/ime.fi with its connection to editor.fi. Re-calculated
+# are romaji to kana (double consonant, n rule, tch), the
+# Hangul syllables by Unicode chapter 3.12 (composing AND decomposing,
+# every number stands calculated beside it), the migrating final, the
+# pre-edit text with the write pointer before and behind it, the
+# selection that is replaced only on confirming and comes back on cancelling, the candidates, pinyin against the supplied table
+# and the platform interface via an imitated platform.
+# The image for it (field with open candidate list) arises below
+# at --images with tools/fui/imebeleg_main.fi.
 build ime
 "$W/ime"
 
 echo
 echo "== 18b. DER SCHEIBENKASTEN =="
-# lib/fui/viewport.fi: der Ausschnitt, der mehr Inhalt aufnimmt, als er
-# hoch ist. Nachgerechnet werden die Rechnung ueber Kreuz (ein
-# senkrechter Balken macht einen waagerechten noetig), der sichtbare
-# Ausschnitt, die Klemmung, Anteil und Stellung des Rollbalkens aus dem
-# Verhaeltnis Ausschnitt/Inhalt, `viewport_ensure_visible`, die
-# Trefferpruefung UNTER VERSCHIEBUNG und das kinetische Auslaufen ueber
-# lib/fui/anim.fi. Das harte Clipping wird auf der Leinwand gemessen:
-# kein Bildpunkt ausserhalb des Ausschnitts darf gesetzt sein, und die
-# Gegenprobe OHNE Clip muss derselbe Test rot melden.
+# lib/fui/viewport.fi: the section that takes in more content than it is
+# high. Re-calculated are the cross calculation (a
+# vertical bar makes a horizontal one necessary), the visible
+# section, the clamping, share and position of the scroll bar from the
+# ratio section/content, `viewport_ensure_visible`, the
+# hit test UNDER OFFSET and the kinetic coasting via
+# lib/fui/anim.fi. The hard clipping is measured on the canvas:
+# no pixel outside the section may be set, and the counter-test WITHOUT clip
+# must report the same test red.
 build viewport
 "$W/viewport"
 
 echo
 echo "== 18c. DAS STILBLATT: RANGFOLGE UND VERERBUNG =="
-# lib/fui/sheet.fi. Die Faelle widersprechen sich mit Absicht:
-# Kennung schlaegt Klasse schlaegt Art, bei Gleichstand gewinnt die
-# spaeter geschriebene Regel, und eine ranghohe Regel, die nur die
-# Schriftfarbe nennt, loescht keinen Grund. Dazu die Vererbung UND
-# ihre Grenze -- fuenf Werte gehen ueber (seit 23.09.2026 auch die
-# Schreibrichtung), der Grund nicht.
+# lib/fui/sheet.fi. The cases contradict each other on purpose:
+# id beats class beats kind, on a tie the rule written
+# later wins, and a high-ranking rule that names only the
+# font colour deletes no background. In addition the inheritance AND
+# its limit -- five values pass over (since 23.09.2026 also the
+# writing direction), the background does not.
 build sheet
 "$W/sheet"
 
 echo
 echo "== 18d. DER BESCHRIEBENE BAUM =="
-# lib/fui/scene.fi: Baum, Stil, Messen, Anordnen, Zeichnen -- in
-# dieser Reihenfolge und in getrennten Durchgaengen. Geprueft wird
-# unter anderem, dass beim Zeichnen keine Groesse mehr driftet
-# (`scene_size_drift` ist 0) und dass die Trefferpruefung den obersten
-# Knoten liefert.
+# lib/fui/scene.fi: tree, style, measuring, arranging, painting -- in
+# this order and in separate passes. Checked is, among other things,
+# that no size drifts any more while painting
+# (`scene_size_drift` is 0) and that the hit test delivers the topmost
+# node.
 build scene
 "$W/scene"
 
 echo
 echo "== 18e. DIE BARRIEREFREIHEIT: ROLLE, NAME, ZUSTAND, FOKUS =="
-# lib/fui/a11y.fi: jede der 23 Arten bekommt ihre Rolle, der Name
-# kommt aus der richtigen Quelle (ausdruecklich > eigene Beschriftung >
-# Etikett per Kennung > Kinder), ein Knopf ohne Namen wird GEZAEHLT,
-# Tab laeuft in Baumreihenfolge an gesperrten Elementen vorbei, der
-# Fokus rollt einen Eintrag einer langen Liste in den Ausschnitt (die
-# Verschiebungen aus viewport.fi von Hand nachgerechnet), und der
-# ausgegebene Baum einer bekannten Oberflaeche stimmt Zeile fuer Zeile.
-# Den Nachweis am echten Beispiel fuehrt tools/fui/gallery9_main.fi
-# (Abschnitt 10 dort) in der Galerie weiter unten.
+# lib/fui/a11y.fi: each of the 23 kinds gets its role, the name
+# comes from the right source (explicit > own label >
+# label by id > children), a button without a name is COUNTED,
+# Tab runs in tree order past disabled elements, the
+# focus rolls an entry of a long list into the section (the
+# offsets from viewport.fi re-calculated by hand), and the
+# printed tree of a known surface matches line by line.
+# The proof on the real example is carried on by tools/fui/gallery9_main.fi
+# (section 10 there) in the gallery further below.
 build a11y
 "$W/a11y"
 echo "== 18g. DIE ZWEIRICHTUNGSSCHRIFT: DATEN UND ALGORITHMUS =="
-# Arabisch und Hebraeisch stehen von rechts nach links, Zahlen und
-# lateinische Woerter darin von links nach rechts. Welche Reihenfolge
-# richtig ist, sagt der Unicode-Bidi-Algorithmus (UAX #9), und der steht
-# in lib/fui/bidi.fi. Hier wird zweierlei nachgerechnet:
+# Arabic and Hebrew stand from right to left, numbers and
+# Latin words in them from left to right. Which order is
+# right is told by the Unicode bidi algorithm (UAX #9), and that
+# stands in lib/fui/bidi.fi. Two things are re-calculated here:
 #
-#   1. die Bidi-Tabelle (lib/generated/bidi_tables.fi) entsteht aus der
-#      UCD 17.0.0 Oktett fuer Oktett gleich, und ein zweiter Zerleger
-#      (tools/ucd/verify_bidi.py) haelt sie ueber alle 1.114.112
-#      Codepunkte gegen die Dateien -- samt Gegenprobe mit einer
-#      gefaelschten Zeile;
-#   2. lib/fui/bidi.fi gegen BidiCharacterTest.txt, die Prueffaelle des
-#      Unicode-Konsortiums: 91.707 Absaetze mit erwarteter Absatzebene,
-#      Ebene je Zeichen und Reihenfolge auf dem Schirm. Kein einziger
-#      darf abweichen.
+#   1. the bidi table (lib/generated/bidi_tables.fi) arises from the
+#      UCD 17.0.0 octet for octet identically, and a second parser
+#      (tools/ucd/verify_bidi.py) holds it over all 1,114,112
+#      code points against the files -- including a counter-test with a
+#      forged row;
+#   2. lib/fui/bidi.fi against BidiCharacterTest.txt, the test cases
+#      of the Unicode Consortium: 91,707 paragraphs with expected paragraph level,
+#      level per character and order on the screen. Not a single one
+#      may deviate.
 BIDI_WORK="$W/ucd-bidi" bash tools/ucd/build_bidi.sh --verify > "$W/bidi_build.log" 2>&1 || {
     cat "$W/bidi_build.log"
     echo "  die Bidi-Tabelle ist nicht, was die UCD sagt -- NICHT bestanden"
@@ -372,38 +371,38 @@ BIDI_WORK="$W/ucd-bidi" bash tools/ucd/build_bidi.sh --verify > "$W/bidi_build.l
 grep -E "gleich|Gegenprobe|VERSCHIEDEN|Oktette zur|Laufzeit" "$W/bidi_build.log" | sed 's/^ */  /'
 build bidiconf
 gzip -dc tools/ucd/BidiCharacterTest.txt.gz | "$W/bidiconf"
-# UND VON HAND: tools/fui/bidi_main.fi haelt dieselben Regeln gegen
-# Sollwerte, die ein Mensch mit Bleistift bestimmt hat -- 30 Absaetze
-# (reines RTL, gemischt, Zahlen in arabischem Text, gespiegelte
-# Klammern samt den drei N0-Beispielen aus UAX #9, Isolate), der
-# Zeilenumbruch in gemischtem Text, die Breiten, die der Maler misst
-# (aus der hmtx-Tabelle von DejaVu), die Schreibmarke und die
-# Pfeiltasten im Textfeld, und die arabischen Gestalten ueber GSUB und
-# ueber die Naeherung.
+# AND BY HAND: tools/fui/bidi_main.fi holds the same rules against
+# target values that a human determined with a pencil -- 30 paragraphs
+# (pure RTL, mixed, numbers in Arabic text, mirrored
+# brackets including the three N0 examples from UAX #9, isolates), the
+# line break in mixed text, the widths that the painter measures
+# (from the hmtx table of DejaVu), the caret
+# and the arrow keys in the text field, and the Arabic shapes via GSUB and
+# via the approximation.
 build bidi
 "$W/bidi"
 echo "== 18h. DIE PLATTFORMSCHICHT OHNE BILDSCHIRM (X11 + WIRT) =="
-# lib/window/x11.fi spricht das X11-Protokoll selbst (kein Xlib, kein
-# xcb), lib/plat/fuiwirt.fi gibt die Ereignisse an lib/fui/control.fi.
-# Geprueft wird OHNE X-Server: jede Anfrage Oktett fuer Oktett gegen
-# von Hand bestimmte Werte, jede Antwort gegen echte Mitschnitte eines
-# Xvfb (testdata/x11/, tools/fui/x11_capture.py) und gegen xdpyinfo/
-# xmodmap, dazu die gallery9-Seite bei Massstab 1000/1500/2000, die
-# Bedienung ueber den Wirt und der Leerlauf (0 Bilder ohne Aenderung).
-# `import window.backend` findet die X11-Rueckwand ueber den Verweis
+# lib/window/x11.fi speaks the X11 protocol itself (no Xlib, no
+# xcb), lib/plat/fuiwirt.fi hands the events to lib/fui/control.fi.
+# Checked is WITHOUT an X server: every request octet for octet against
+# values determined by hand, every reply against real captures of an
+# Xvfb (testdata/x11/, tools/fui/x11_capture.py) and against xdpyinfo/
+# xmodmap, in addition the gallery9 page at scale 1000/1500/2000, the
+# operation via the host and the idle state (0 images without change).
+# `import window.backend` finds the X11 backend via the link
 # tools/fui/window/backend.fi.
 build x11
 "$W/x11"
 
 echo
 echo "== 18i. EIN ECHTES FENSTER AUF EINEM ECHTEN X-SERVER =="
-# Dieselbe Seite als Programm (demos/x11demo) auf einem eigenen Xvfb,
-# von aussen bedient: xdotool fuer Maus und Tastatur, eine rohe
-# ClientMessage WM_DELETE_WINDOW zum Schliessen, xwd fuer das Bild VOM
-# SERVER, /proc fuer die Rechenzeit im Leerlauf. Gebaut mit dem
-# Optimierer, weil der Lauf auf Bilder wartet (ein Vollbild braucht mit
-# --opt-level=dev ueber eine Sekunde). Fehlt Xvfb, sagt der Lauf SKIP
-# und warum -- ein fehlender X-Server ist kein Fehler der Demo.
+# The same page as a program (demos/x11demo) on its own Xvfb,
+# operated from outside: xdotool for mouse and keyboard, a raw
+# ClientMessage WM_DELETE_WINDOW for closing, xwd for the image FROM THE
+# SERVER, /proc for the CPU time at idle. Built with the
+# optimiser, because the run waits for images (a full image needs more than a second with
+# --opt-level=dev). If Xvfb is missing, the run says SKIP
+# and why -- a missing X server is no error of the demo.
 "$FIRNC" --opt-level=release-fast -o "$W/x11demo" demos/x11demo/main.fi
 if command -v Xvfb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     python3 tools/fui/x11live.py "$W/x11demo" "${BELEGE:-$W/belege}/x11"
@@ -413,19 +412,19 @@ fi
 
 echo
 echo "== 18j. fUi TEMPO: DER DECKUNGS-CACHE UND DER CLIP AENDERN KEIN OKTETT =="
-# lib/fui/fcache.fi (gerasterter Text und Icons werden aufgehoben) und
-# painter.clip_rows (Formen ausserhalb des Clips werden nicht gerastert):
-# die Galerie-Seite ohne Cache, mit Cache kalt und warm, und ein Streifen
-# unter einem Clip neu gemalt -- jedes Mal dieselben Oktette.
+# lib/fui/fcache.fi (rasterised text and icons are kept) and
+# painter.clip_rows (shapes outside the clip are not rasterised):
+# the gallery page without cache, with cache cold and warm, and a strip
+# repainted under a clip -- every time the same octets.
 "$FIRNC" --opt-level=release-fast -o "$W/tempo" tools/fui/tempo_main.fi
 "$W/tempo" 1240 5
 
 echo
 echo "== 18k. SCHMELZGRUPPE: FORMEN VERSCHMELZEN, WENN SIE SICH NAEHERN =="
-# lib/fui/merge.fi (Prototyp r68): weit auseinander dieselben Oktette wie
-# die blosse Vereinigung, bei k/2 ist die Luecke Tinte, die Kacheln
-# aendern kein Oktett, kein Sprung beim Naeherruecken, eine Feder, die
-# Zeit -- vier Regeln nebeneinander gemessen.
+# lib/fui/merge.fi (prototype r68): far apart the same octets as
+# the plain union, at k/2 the gap is ink, the tiles
+# change no octet, no jump on moving closer, a spring, the
+# time -- four rules measured side by side.
 "$FIRNC" --opt-level=release-fast -o "$W/merge" tools/fui/merge_main.fi
 "$W/merge"
 
@@ -433,16 +432,16 @@ echo
 echo "== 18l. DER SEITEN-LOOK: VERLAUF, LICHT, SCHATTEN, FLUIDE SCHRIFT, ABSAETZE, GRUPPEN =="
 # lib/fui/style.fi (SF_BG_GRAD, SF_BG_GLOW, SF_BOX_SHADOW, SF_FLUID),
 # lib/fui/scene.fi (node_set_text_wrap, node_set_opacity/offset,
-# scene_draw_still/live) und lib/fui/layer.fi -- auf echten Pixeln.
+# scene_draw_still/live) and lib/fui/layer.fi -- on real pixels.
 "$FIRNC" --opt-level=release-fast -o "$W/pagelook" tools/fui/pagelook_main.fi
 "$W/pagelook"
 
 echo
 echo "== 18m. DER APP-BAUM: SZENE ALS DOM, EINMAL KURZ DURCHGEMESSEN =="
-# tools/fui/apptree_main.fi (docs/APP-TREE.md): gallery9 und kuenstliche
-# Baeume bis 128 Knoten -- bauen, stylen, messen, legen, malen, treffen,
-# abfragen, vorlesen. Hier nur EINE Runde: laufen muss es und jeder Knoten
-# braucht einen Namen (unnamed=0); die Zahlen misst tools/fui/apptree.sh.
+# tools/fui/apptree_main.fi (docs/APP-TREE.md): gallery9 and artificial
+# trees up to 128 nodes -- build, style, measure, lay out, paint, hit,
+# query, read aloud. Only ONE round here: it must run and every node
+# needs a name (unnamed=0); the numbers are measured by tools/fui/apptree.sh.
 "$FIRNC" --opt-level=release-fast -o "$W/apptree" tools/fui/apptree_main.fi
 "$W/apptree" 128 1 > "$W/apptree.log" || { cat "$W/apptree.log"; echo "  FAIL: apptree"; exit 1; }
 n=$(grep -c '^apptree tree=' "$W/apptree.log" || true)
@@ -460,20 +459,107 @@ build dom
 "$W/dom"
 
 echo
+echo "== 18o. THE APP TREE: EVENTS, POINTERS, GESTURES, CHANGE RECORDS =="
+# tools/fui/event_main.fi (docs/APP-TREE.md T3, T4, T6): capture -> target
+# -> bubble with stop / stop-now / prevent-default and control.fi as the
+# default action; pointer ids, primary, pointer capture (also across a
+# rebuild); tap, double tap, long press, pan + fling, pinch + rotate with an
+# arena that lets exactly one win and cancels the loser's press; change
+# records by key -- none for a renumbering rebuild, none for a secret.
+# Everything with synthetic event streams.
+build event
+"$W/event"
+
+echo
+echo "== 18o2. REAL POINTERS FROM THE WINDOW LAYER (r111) =="
+# tools/fui/pointers_main.fi: synthetic Android MotionEvent streams through
+# lib/window/pointers.fi -- one record per finger, ids that outlive the
+# index, primary per type, lost UPs cancelled, the ring. (The same stream in
+# a real browser: tools/wasm/touchcheck.py; on an emulator with real
+# fingers: tools/android/pointers_check.sh.)
+build pointers
+"$W/pointers"
+
+echo
+echo "== 18o2b. TOUCH FROM X11 AND WIN32 (r112) =="
+# XInput2 touch (lib/window/x11.fi) and WM_POINTER (lib/window/win32.fi) feed
+# the same records as Android (lib/window/pointers.fi, `pointers_single`).
+# The byte layouts are checked by hand in x11_main (section 12) and
+# pointers_main (sections 8, 9); the handshake runs against a real Xvfb
+# (xinput_main: XInput 2.2 present, XIGetSelectedEvents shows the touch
+# selection). No finger is played in -- the build machine has no uinput.
+# win32.fi must build for the Windows target.
+build xinput
+XINPUT_BIN="$W/xinput" FIRNC="$FIRNC" W="$W" bash tools/fui/xinput.sh
+rm -rf "$W/wn"; mkdir -p "$W/wn/window"
+cp demos/x11demo/main.fi demos/x11demo/gallery9_main.fi "$W/wn/"
+ln -s "$PWD/lib/window/win32.fi" "$W/wn/window/backend.fi"
+"$FIRNC" --target=x86_64-windows -o "$W/wn/w.exe" "$W/wn/main.fi" \
+    && echo "  OK      the window layer builds for Windows (win32.fi)" \
+    || { echo "  FAILED  win32.fi does not build"; exit 1; }
+
+echo
+echo "== 18o2c. THE ON-SCREEN KEYBOARD'S CLASSES (r114) =="
+# lib/android/inputmethod.fi makes an InputConnection out of two classes it
+# writes as dex at run time (lib/android/imedex.fi); the SDK's own dexdump
+# reads the bytes and the script looks at the result. (On an emulator:
+# tools/android/keyboard_check.sh types on the real keyboard,
+# tools/android/lifecycle_check.sh checks pause, rotation and screen off.)
+FIRNC="$FIRNC" W="$W" bash tools/android/ime_dex_check.sh
+echo
+echo "== 18o3. A TRANSITION SURVIVES A REBUILD (r110) =="
+# tools/fui/animkey_main.fi: the transition registry keyed by key path --
+# the button half way to its hover colour keeps its colour when the tree is
+# rebuilt (A and B swap, a node is inserted in front); without the keyer the
+# same rebuild makes it jump (counter-check).
+build animkey
+"$W/animkey"
+
+echo
+echo "== 18p. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
+# lib/fui/app.fi (29.09.2026): the three programs of examples/fui/ build
+# for BOTH platforms from one source -- `import fui.apphost` resolves to
+# lib/@linux/ natively and to lib/@web/ with --target=wasm32-browser --
+# and tools/fui/app_main.fi drives them without a window (layout, clicks,
+# keys, text fields, wrapping, scale 2). The browser half with Chromium:
+# bash tools/wasm/appdemo.sh.
+for ex in hello_window counter form touchpad; do
+    "$FIRNC" --opt-level=dev -o "$W/app_$ex" "examples/fui/$ex.fi"
+    "$FIRNC" --opt-level=dev --target=wasm32-browser -o "$W/app_$ex.wasm" \
+        "examples/fui/$ex.fi"
+done
+echo "  examples/fui/{hello_window,counter,form,touchpad}.fi build native + wasm32   OK"
+build app
+"$W/app"
+
+echo
+echo "== 18p2. THE ACCESSIBILITY AUDIT OF EVERY fUi PROGRAM (r98) =="
+# tools/fui/audit_main.fi shows that lib/fui/audit.fi has teeth (an unnamed
+# button, a duplicate key, a secret in the export are each found);
+# tools/fui/audit.sh then runs every program of examples/fui/*.fi through it
+# (FUI_AUDIT=1: no window, the tree it built, exit code = the result) and
+# requires that a program with a nameless text field FAILS. The programs with
+# a main of their own run the same audit in their own checks: gallery9_main
+# (section 10) and examples/codehub/main.fi (the "audit:" line).
+build audit
+"$W/audit"
+W="$W" sh tools/fui/audit.sh
+
+echo
 echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
-# DER FEHLER, DEN DIESER ABSCHNITT UNMOEGLICH MACHT. lib/fui/editor.fi
-# liess sich einen Monat lang nicht uebersetzen, tools/fui/control_main.fi
-# und wrap_main.fi rechneten fuer niemanden, und tools/fui/preview_main.fi
-# stand ganz ausserhalb: keine dieser Dateien kam in diesem Lauf vor,
-# also fiel nichts auf. Eine Pruefung, die niemand ruft, ist keine.
+# THE ERROR THAT THIS SECTION MAKES IMPOSSIBLE. lib/fui/editor.fi
+# could not be compiled for a month, tools/fui/control_main.fi
+# and wrap_main.fi calculated for nobody, and tools/fui/preview_main.fi
+# stood entirely outside: none of these files appeared in this run,
+# so nothing was noticed. A check that nobody calls is none.
 #
-# Deshalb hier zweierlei, MASCHINELL und nicht nach Gedaechtnis:
-#   1. JEDE Datei tools/fui/*_main.fi und demos/*/main.fi wird
-#      uebersetzt -- auch die Demos ausserhalb von fUi, denn was
-#      niemand baut, hoert irgendwann auf zu bauen.
-#   2. JEDE Datei tools/fui/*_main.fi und demos/fuidemo/main.fi muss in
-#      diesem Skript VORKOMMEN. (Die uebrigen Demos gehoeren anderen
-#      Baeumen; sie werden gebaut, aber nicht hier gerechnet.)
+# Therefore two things here, MECHANICALLY and not from memory:
+#   1. EVERY file tools/fui/*_main.fi and demos/*/main.fi is
+#      compiled -- also the demos outside fUi, because what
+#      nobody builds stops building sooner or later.
+#   2. EVERY file tools/fui/*_main.fi and demos/fuidemo/main.fi must
+#      APPEAR in this script. (The other demos belong to other
+#      trees; they are built, but not calculated here.)
 #   An Android-only program (it imports plat.android, which links against
 #   the NDK: pthread, ANativeActivity) cannot be linked on this host. It
 #   is still built -- as an object for x86_64-android, the first half of
@@ -481,6 +567,10 @@ echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 for f in tools/fui/*_main.fi demos/*/main.fi examples/*/main.fi; do
     if grep -q '^import plat\.android' "$f"; then
         "$FIRNC" --opt-level=dev --target=x86_64-android --pic -c -o "$W/baupruefung.o" "$f" >/dev/null
+    elif grep -q '^import web\.dom' "$f"; then
+        # A browser-only program (lib/web/dom.fi imports its functions
+        # from the page's JavaScript): it is built for wasm32-browser.
+        "$FIRNC" --opt-level=dev --target=wasm32-browser -o "$W/baupruefung.wasm" "$f" >/dev/null
     else
         "$FIRNC" --opt-level=dev -o "$W/baupruefung" "$f" >/dev/null
     fi
@@ -492,15 +582,15 @@ for f in tools/fui/*_main.fi demos/fuidemo/main.fi; do
     case "$f" in
         demos/*) n="fuidemo" ;;
     esac
-    # GESUCHT WIRD DER AUFRUF, NICHT DER NAME. Frueher stand hier
-    # `grep -q "$n"`, und das war eine Wache, die sich selbst betrog:
-    # "anim" steckt in "gallery5" nicht, aber in jedem Kommentar ueber
-    # anim.fi, "image" in "--images", "text" in "kontext". Ein Programm
-    # galt damit als gerufen, sobald sein Name IRGENDWO in dieser Datei
-    # vorkam -- also genau dann auch, wenn niemand es ruft. Gesucht wird
-    # darum die Zeichenkette "$W/<name>", mit der dieses Skript ein
-    # gebautes Programm ausfuehrt, und zwar als fester Text (-F), damit
-    # kein Sonderzeichen sie zu einem Muster macht.
+    # WHAT IS SEARCHED FOR IS THE CALL, NOT THE NAME. Formerly there stood here
+    # `grep -q "$n"`, and that was a guard that cheated itself:
+    # "anim" is not in "gallery5", but in every comment about
+    # anim.fi, "image" in "--images", "text" in "context". A program
+    # counted as called as soon as its name appeared ANYWHERE in this file
+    # -- so also exactly when nobody calls it. What is searched for
+    # is therefore the string "$W/<name>", with which this script executes a
+    # built program, and as a fixed text (-F), so that
+    # no special character makes it a pattern.
     if ! grep -qF "\"\$W/$n\"" "tools/fui/run.sh"; then
         echo "  $f wird in tools/fui/run.sh NICHT gerufen (kein \"\$W/$n\")"
         echo "  -- eine Pruefung, die niemand ruft, ist keine. Haenge sie ein."
@@ -512,17 +602,17 @@ if [ "$fehlt" != "0" ]; then
 fi
 echo "  jede von ihnen wird in diesem Lauf wirklich gerufen       OK"
 
-# EIN ORT FUER floor/ceil/abs, UND NICHT ZWEI. `std.math` und
-# lib/svg/matrix.fi koennen beide abrunden. Solange beide in lib/fui/
-# benutzt wurden, rechneten zwei Module dieselbe Rasterkante mit zwei
-# verschiedenen Abrundungen aus, und die Kante lag um einen Bildpunkt
-# daneben -- der teuerste Fehler dieses Baums ist der zweite Ort fuer
-# dieselbe Sache. Festgeschrieben ist es im Kopf von lib/fui/anim.fi:
-# in lib/fui/ gilt ausschliesslich matrix.m_floor/m_ceil/m_abs. Hier
-# wird der jeweils andere Name maschinell verboten.
+# ONE PLACE FOR floor/ceil/abs, AND NOT TWO. `std.math` and
+# lib/svg/matrix.fi can both round down. As long as both were
+# used in lib/fui/, two modules calculated the same raster edge with two
+# different roundings, and the edge was off by one pixel
+# -- the most expensive error of this tree is the second place for
+# the same thing. It is laid down in the head of lib/fui/anim.fi:
+# in lib/fui/ only matrix.m_floor/m_ceil/m_abs apply. Here
+# the respective other name is forbidden mechanically.
 #
-# Kommentarzeilen sind ausgenommen: der Kopf von anim.fi MUSS den
-# verbotenen Namen nennen duerfen, um ihn zu verbieten.
+# Comment lines are exempt: the head of anim.fi MUST be allowed to name the
+# forbidden name in order to forbid it.
 verboten=$(grep -n "math\.\(floor\|ceil\|abs\|fabs\)" lib/fui/*.fi \
     | grep -v "^[^:]*:[0-9]*: *//" || true)
 if [ -n "$verboten" ]; then
@@ -533,22 +623,22 @@ if [ -n "$verboten" ]; then
 fi
 echo "  floor/ceil/abs kommen in lib/fui/ nur aus svg.matrix        OK"
 
-# KEINE ZIFFER ALS SCHRITTWEITE UEBER EINE STRUKTUR. In
-# demos/fuidemo/main.fi stand dreimal `(i * 32)`, um in ein Feld von
-# `layout.Rect` zu greifen. Das ist heute richtig und morgen falsch:
-# kommt in `Rect` ein Feld dazu, sagt kein Uebersetzer etwas, und ab da
-# wird mitten in ein Rechteck hinein gelesen -- der Fehler faellt als
-# verschobenes Bild auf, nicht als Meldung. Die Schrittweite wird
-# darum GEMESSEN (layout.rect_stride, sheet.sheet_desc_stride, beide
-# nach demselben Muster: Differenz zweier Nachbarn eines echten
-# Feldes), und hier wird die Ziffer maschinell verboten.
+# NO NUMBER AS A STRIDE OVER A STRUCT. In
+# demos/fuidemo/main.fi `(i * 32)` stood three times, to reach into an array of
+# `layout.Rect`. That is right today and wrong tomorrow:
+# if a field is added to `Rect`, no compiler says anything, and from then on
+# it reads into the middle of a rectangle -- the error shows up as a
+# shifted image, not as a message. The stride is therefore
+# MEASURED (layout.rect_stride, sheet.sheet_desc_stride, both
+# by the same pattern: difference of two neighbours of a real
+# field), and here the number is forbidden mechanically.
 #
-# Gesucht werden Zeilen, die eine Zahl mit einem Index malnehmen UND im
-# selben Atemzug auf einen STRUKTURZEIGER (`as *mut modul.Typ`)
-# umdeuten. Die Schrittweiten der Grundtypen (4 fuer u32, 8 fuer i64
-# und f64) bleiben erlaubt: die aendern sich nicht, wenn jemand ein
-# Feld hinzufuegt. Kommentarzeilen sind ausgenommen, denn dieser Text
-# hier darf die verbotene Form nennen duerfen.
+# What is searched for are lines that multiply a number by an index AND in the
+# same breath reinterpret it as a STRUCT POINTER (`as *mut module.Type`).
+# The strides of the basic types (4 for u32, 8 for i64
+# and f64) stay allowed: they do not change when somebody adds a
+# field. Comment lines are exempt, because this text
+# here may name the forbidden form.
 ziffern=$(grep -n -E '\* *[0-9]+\)? *as u64.*as \*mut [a-z_]+\.[A-Z]' \
     demos/*/main.fi tools/fui/*.fi \
     | grep -v "^[^:]*:[0-9]*: *//" || true)
@@ -560,19 +650,19 @@ if [ -n "$ziffern" ]; then
 fi
 echo "  keine Ziffer als Schrittweite in demos/ und tools/fui/     OK"
 
-# JEDER IMPORT WIRD AUCH GERUFEN. In lib/fui/scene.fi stand `import
-# std.rt`, obwohl in der ganzen Datei kein einziges `rt.` vorkam -- und
-# genau so kommt eine Abhaengigkeit in ein Modul, das freistehend
-# gebaut werden soll: nicht durch einen Aufruf, sondern durch eine
-# Zeile, die niemand mehr liest. Das laesst sich maschinell ausschliessen
-# und wird darum maschinell ausgeschlossen: zu JEDEM `import x.y` in
-# lib/fui/*.fi muss im SELBEN Modul `y.` vor einem Buchstaben stehen
-# (klein oder gross -- `rt.buf_new` genauso wie `rt.Buf`).
+# EVERY IMPORT IS ALSO CALLED. In lib/fui/scene.fi `import
+# std.rt` stood, although in the whole file not a single `rt.` occurred -- and
+# that is exactly how a dependency gets into a module that is to be
+# built freestanding: not by a call, but by a line that
+# nobody reads any more. That can be excluded mechanically
+# and is therefore excluded mechanically: for EVERY `import x.y` in
+# lib/fui/*.fi, `y.` must stand before a letter in the SAME module
+# (lower or upper case -- `rt.buf_new` just like `rt.Buf`).
 #
-# Gesucht wird in den Zeilen, die KEIN Kommentar und KEINE Importzeile
-# sind: der Kopf eines Moduls darf ueber `viewport.fi` schreiben, ohne
-# damit einen Import zu rechtfertigen, und `import fui.style` selbst ist
-# kein Gebrauch von `style.`.
+# What is searched are the lines that are NO comment and NO import line:
+# the head of a module may write about `viewport.fi` without
+# justifying an import by it, and `import fui.style` itself is
+# no use of `style.`.
 ungenutzt=0
 for f in lib/fui/*.fi; do
     for mod in $(sed -n 's/^import [a-z0-9_]*\.\([a-z0-9_]*\)[[:space:]]*$/\1/p' \
@@ -593,74 +683,74 @@ echo "  jeder Import in lib/fui/ wird im Modul auch gerufen        OK"
 
 echo
 echo "== 19b. KEINE BESCHRIFTUNG WIRD UNTERWEGS ABGESCHNITTEN =="
-# DER FEHLER, DER "red fixe" HIESS. In tools/fui/gallery_main.fi stand
-# `var t_v3: [u8; 10] = "red fixed "`, gemalt wurden acht Bytes, und im
-# Beleg las ein Pruefer "red fixe". Daneben malten drei Kacheln
-# derselben Datei die ersten zwei Bytes von "12 15 20", also dreimal
-# "12", obwohl die Schrift 12, 15 und 20 Punkt gross war. Beide Bilder
-# haben jede bestehende Pruefung bestanden: die Abmessungen stimmten,
-# die Farbvielfalt stimmte, jedes Band war bemalt -- nur das WORT war
-# kaputt. Ein Beleg mit einem halben Wort belegt das Gegenteil von dem,
-# was er behauptet.
+# THE ERROR THAT WAS CALLED "red fixe". In tools/fui/gallery_main.fi there stood
+# `var t_v3: [u8; 10] = "red fixed "`, eight bytes were painted, and in the
+# proof a checker read "red fixe". Beside it three tiles of
+# the same file painted the first two bytes of "12 15 20", so three times
+# "12", although the font was 12, 15 and 20 points large. Both images
+# passed every existing check: the dimensions were right,
+# the colour variety was right, every band was painted -- only the WORD
+# was broken. A proof with half a word proves the opposite of what
+# it claims.
 #
-# tools/fui/belegpruef_main.fi rechnet das jetzt maschinell nach
-# (Betriebsart --ketten): zu jeder gemalten Kette `(&name[0]) as u64, M`
-# wird die Deklaration `var name: [u8; N] = "..."` gesucht und
-# N - Fuellung <= M <= N gefordert. Hier laeuft die Laengenrechnung ueber
-# JEDE Quelle des Baums -- ohne Schrift ("-") und ohne Breite (0), damit
-# sie auch auf einem Rechner ohne DejaVu laeuft. Die Breitenrechnung mit
-# `render.pref_of` steht weiter unten bei den Belegbildern, wo die
-# Leinwandbreite jedes Blattes bekannt ist.
+# tools/fui/belegpruef_main.fi now re-calculates that mechanically
+# (mode --ketten): for every painted chain `(&name[0]) as u64, M`
+# the declaration `var name: [u8; N] = "..."` is searched for and
+# N - padding <= M <= N is demanded. Here the length calculation runs over
+# EVERY source of the tree -- without font ("-") and without width (0), so that
+# it also runs on a machine without DejaVu. The width calculation with
+# `render.pref_of` stands further below with the proof images, where the
+# canvas width of each sheet is known.
 build belegpruef
 "$W/belegpruef" --ketten - 0 tools/fui/*_main.fi demos/*/main.fi
 
 echo
 echo "== 19c. BESCHREIBEN IST KUERZER ALS MALEN, IN ZAHLEN =="
-# DIE ZAHL, DIE DEN GANZEN AUFWAND RECHTFERTIGT -- UND ZWAR EHRLICH
-# ZUGESCHNITTEN. lib/fui/scene.fi und sheet.fi sind nur dann etwas wert,
-# wenn DASSELBE Stueck Oberflaeche beschrieben kuerzer ist als gemalt.
-# Verglichen wird darum nicht Datei gegen Datei (das waere Aepfel gegen
-# Birnen, tools/fui/gallery9_main.fi zeigt mehr), sondern EIN Stueck,
-# das es zweimal gibt: die Werkzeugleiste -- drei Knoepfe, ein Suchfeld
-# mit grow, ein Knopf im Akzent.
+# THE NUMBER THAT JUSTIFIES THE WHOLE EFFORT -- AND HONESTLY
+# TAILORED. lib/fui/scene.fi and sheet.fi are worth something only if
+# THE SAME piece of surface is shorter when described than when painted.
+# So the comparison is not file against file (that would be apples against
+# pears, tools/fui/gallery9_main.fi shows more), but ONE piece
+# that exists twice: the toolbar -- three buttons, a search field
+# with grow, a button in the accent.
 #
-#   gemalt      demos/fuidemo/main.fi, fn toolbar_painted.
-#   beschrieben tools/fui/gallery9_main.fi, zwischen den Marken
-#               ">>> WERKZEUGLEISTE" und "<<< WERKZEUGLEISTE" (der Baum)
-#               UND zwischen ">>> LEISTENREGELN" und "<<<
-#               LEISTENREGELN" (ihr Aussehen im Stilblatt).
+#   painted     demos/fuidemo/main.fi, fn toolbar_painted.
+#   described   tools/fui/gallery9_main.fi, between the marks
+#               ">>> TOOLBAR" and "<<< TOOLBAR" (the tree)
+#               AND between ">>> BAR RULES" and "<<<
+#               BAR RULES" (its look in the style sheet).
 #
-# WAS AN DIESEM ZUSCHNITT NEU IST, UND WARUM. Bis zum 21.09.2026 standen
-# auf der gemalten Seite noch die beiden Helfer `setze` und
-# `item_von_widget` mit der Begruendung, es gebe sie "nur dafuer" -- das
-# war falsch: `titelzeile` und `dialog` rufen beide, also sind es
-# GETEILTE Zeilen, und wer geteilte Zeilen nur einer Seite zuschlaegt,
-# rechnet sich die Ersparnis schoen. Sie sind heraus. Dafuer zaehlt die
-# beschriebene Seite jetzt AUCH ihr Aussehen mit: die Regel fuer die
-# Klasse `leiste`, den Radius der Knoepfe und den Akzent -- auf der
-# gemalten Seite steht genau das mitten in der Funktion. Dass zwei
-# dieser Regeln zugleich die Kopfzeile einfaerben, wird der
-# beschriebenen Seite dabei voll angerechnet.
+# WHAT IS NEW IN THIS TAILORING, AND WHY. Until 21.09.2026 there stood
+# on the painted side still the two helpers `setze` and
+# `item_von_widget` with the justification that they existed "only for this" -- that
+# was wrong: `titelzeile` and `dialog` both call them, so they are
+# SHARED lines, and whoever assigns shared lines to only one side
+# calculates the saving prettier than it is. They are out. In return the
+# described page now counts ITS LOOK too: the rule for the
+# class `leiste`, the radius of the buttons and the accent -- on the
+# painted side exactly that stands in the middle of the function. That two
+# of these rules also colour the header row is fully charged
+# to the described page.
 #
-# Gezaehlt werden Zeilen mit Code: ohne Leerzeilen, ohne Kommentar. Und
-# gezaehlt wird in DREI Zuschnitten, weil eine einzige Zahl hier
-# zwangslaeufig etwas verschweigt:
+# Counted are lines with code: without blank lines, without comments. And
+# counted in THREE cuts, because a single number necessarily
+# conceals something here:
 #
-#   roh   alles, was in den Marken bzw. in der Funktion steht.
-#   A     ohne die Beschriftungen (Textfelder und das Setzen des
-#         Textes). Die stehen auf der beschriebenen Seite in
-#         `schreibe_texte`, also ausserhalb der Marken -- sie werden
-#         darum auf BEIDEN Seiten abgezogen und nicht einseitig.
-#   B     zusaetzlich ohne das Aussehen (Flaeche, Rand, Farbe, Radius)
-#         auf beiden Seiten. Uebrig bleibt die reine Gliederung, und
-#         genau dort ist die Beschreibung um ein Vielfaches kuerzer:
-#         die Verteilung, das Setzen jedes Rechtecks und die eigene
-#         Zeichenschleife fallen ganz weg.
+#   raw   everything that stands in the marks or in the function.
+#   A     without the labels (text fields and the setting of the
+#         text). On the described side they stand in
+#         `schreibe_texte`, so outside the marks -- they are
+#         therefore deducted on BOTH sides and not one-sidedly.
+#   B     in addition without the look (surface, border, colour, radius)
+#         on both sides. What remains is the pure structure,
+#         and exactly there the description is shorter by a multiple:
+#         the distribution, the setting of each rectangle and the own
+#         drawing loop drop out entirely.
 #
-# Die Grenzen unten sind mit dem heutigen Stand gemessen und mit
-# Spielraum gesetzt; bricht eine, ist entweder eine Marke verrutscht
-# oder die Aussage im Kopf von gallery9_main.fi stimmt nicht mehr -- und
-# eine Zahl, die nicht mehr stimmt, ist schlimmer als keine.
+# The limits below are measured with today's state and set with
+# leeway; if one breaks, either a mark has slipped
+# or the statement in the head of gallery9_main.fi is no longer true -- and
+# a number that is no longer true is worse than none.
 zaehle_code() {
     sed -e 's/^[[:space:]]*//' "$1" | grep -c -v -e '^$' -e '^//'
 }
@@ -675,9 +765,9 @@ ohne_aussehen() {
 }
 awk '/^fn toolbar_painted\(/{p=1} p{print} p&&/^}$/{exit}' \
     demos/fuidemo/main.fi > "$W/gemalt.txt"
-sed -n '/>>> WERKZEUGLEISTE/,/<<< WERKZEUGLEISTE/p' \
+sed -n '/>>> TOOLBAR/,/<<< TOOLBAR/p' \
     tools/fui/gallery9_main.fi > "$W/beschrieben.txt"
-sed -n '/>>> LEISTENREGELN/,/<<< LEISTENREGELN/p' \
+sed -n '/>>> BAR RULES/,/<<< BAR RULES/p' \
     tools/fui/gallery9_main.fi >> "$W/beschrieben.txt"
 ohne_text < "$W/gemalt.txt" > "$W/gemalt_a.txt"
 ohne_text < "$W/beschrieben.txt" > "$W/beschrieben_a.txt"
@@ -694,7 +784,7 @@ echo "  A (ohne Texte): gemalt $gemalt_a, beschrieben $beschrieben_a"
 echo "  B (ohne Texte und Aussehen): gemalt $gemalt_b, beschrieben $beschrieben_b"
 if [ "$gemalt" -lt 40 ] || [ "$beschrieben" -lt 30 ]; then
     echo "  FEHLER: eine der beiden Seiten wurde nicht gefunden."
-    echo "  Es fehlen die Marken WERKZEUGLEISTE/LEISTENREGELN in"
+    echo "  Es fehlen die Marken TOOLBAR/BAR RULES in"
     echo "  tools/fui/gallery9_main.fi oder fn toolbar_painted in"
     echo "  demos/fuidemo/main.fi."
     exit 1
@@ -704,38 +794,38 @@ if [ "$gemalt_b" -lt 30 ] || [ "$beschrieben_b" -lt 15 ]; then
     echo "  weggenommen -- der Zuschnitt B ist damit keine Messung mehr."
     exit 1
 fi
-# DIE ALTE SCHRANKE, WIEDER DA, UND ZWAR AUF DEM ROHWERT. Bis zum
-# 21.09.2026 galt hier "die beschriebene Fassung faellt auf hoechstens
-# die HAELFTE"; am 22.09.2026 wurde sie durch 90 % (A) und 66 % (B)
-# ersetzt, weil der Rohwert damals 42 von 64 war. Eine Pruefung, die
-# man weicher macht, damit der eigene Stand sie besteht, ist keine
-# Pruefung mehr. Also steht sie wieder da, und stattdessen ist die
-# BESCHREIBUNG kuerzer geworden: lib/fui/scene.fi hat mit scene_box,
-# scene_widget, node_set_space, node_set_flexitem und scene_run die
-# Kurzformen bekommen, die ein Baum wirklich braucht, und
-# lib/fui/sheet.fi mit sheet_rule die Regel aus einem Stil.
+# THE OLD BARRIER, BACK AGAIN, ON THE RAW VALUE. Until
+# 21.09.2026 it said here "the described version falls to at most
+# HALF"; on 22.09.2026 it was replaced by 90 % (A) and 66 % (B)
+# because the raw value was then 42 of 64. A check that is
+# made softer so that one's own state passes it is no longer a
+# check. So it stands there again, and instead the
+# DESCRIPTION has become shorter: lib/fui/scene.fi has with scene_box,
+# scene_widget, node_set_space, node_set_flexitem and scene_run received
+# the short forms that a tree really needs, and
+# lib/fui/sheet.fi with sheet_rule the rule from a style.
 #
-# Gemessen am 23.09.2026: 30 von 64 Zeilen, also 47 %. Dazugekommen
-# ist an diesem Tag die GROESSE als Stilwert (style.SF_WIDTH /
-# SF_HEIGHT): Leistenhoehe und Zeilenhoehe stehen jetzt in der Regel
-# und nicht mehr als Zahl an jedem Knoten im Baum.
+# Measured on 23.09.2026: 30 of 64 lines, so 47 %. Added
+# on that day was the SIZE as a style value (style.SF_WIDTH /
+# SF_HEIGHT): bar height and row height now stand in the rule
+# and no longer as a number at every node in the tree.
 if [ $((beschrieben * 2)) -gt "$gemalt" ]; then
     echo "  FEHLER: die beschriebene Fassung faellt nicht auf hoechstens"
     echo "  die Haelfte der gemalten ($beschrieben von $gemalt Zeilen)."
     exit 1
 fi
-# Zuschnitt A: mit dem Aussehen auf beiden Seiten bleibt die
-# Beschreibung kuerzer, aber nicht halb so lang -- ein Stilblatt
-# schreibt Farbe und Radius EINMAL fuer die ganze Seite, in diesem
-# Vergleich zaehlt das trotzdem gegen sie. Gefordert sind hoechstens
-# zwei Drittel (gemessen am 22.09.2026: 30 von 54, also 56 %).
+# Cut A: with the look on both sides the
+# description stays shorter, but not half as long -- a style sheet
+# writes colour and radius ONCE for the whole page, in this
+# comparison that counts against it nevertheless. Demanded are at most
+# two thirds (measured on 22.09.2026: 30 of 54, so 56 %).
 if [ $((beschrieben_a * 3)) -gt $((gemalt_a * 2)) ]; then
     echo "  FEHLER: beschrieben ist mit dem Aussehen nicht mehr kuerzer"
     echo "  als gemalt ($beschrieben_a von $gemalt_a Zeilen)."
     exit 1
 fi
-# Zuschnitt B: die Gliederung selbst. Gefordert ist auch hier
-# hoechstens die Haelfte (gemessen am 23.09.2026: 16 von 46, also
+# Cut B: the structure itself. Demanded here too is at most
+# half (measured on 23.09.2026: 16 of 46, so
 # 35 %).
 if [ $((beschrieben_b * 2)) -gt "$gemalt_b" ]; then
     echo "  FEHLER: die beschriebene Gliederung braucht mehr als die"
@@ -746,37 +836,37 @@ echo "  beschrieben ist in beiden Zuschnitten kuerzer als gemalt   OK"
 
 echo
 echo "== 19d. DIESELBE LEISTE, DIESELBE DATEI, ZWEI FASSUNGEN =="
-# WARUM ES DIESEN ZWEITEN VERGLEICH GIBT. Abschnitt 19c haelt die
-# Werkzeugleiste aus tools/fui/gallery9_main.fi gegen die gemalte aus
-# demos/fuidemo/main.fi. Das ist eine ehrliche Messung, aber sie geht
-# ueber ZWEI Dateien, und ein Pruefer darf zu Recht fragen, ob da noch
-# dasselbe Stueck Oberflaeche verglichen wird.
+# WHY THIS SECOND COMPARISON EXISTS. Section 19c holds the
+# toolbar from tools/fui/gallery9_main.fi against the painted one from
+# demos/fuidemo/main.fi. That is an honest measurement, but it goes
+# over TWO files, and a checker may rightly ask whether the
+# same piece of surface is still being compared.
 #
-# Hier stehen beide Fassungen in EINER Datei, nebeneinander, und sie
-# malen nachweislich dasselbe Bild: `pruefe_leisten` in derselben Datei
-# haelt ihre fuenf Rechtecke ganzzahlig gegeneinander, und zwar bei
-# 952 UND bei 260 Punkten Breite (dort greift die Klemmung des
-# Suchfeldes). Verglichen werden die Marken
+# Here both versions stand in ONE file, side by side, and they demonstrably
+# paint the same image: `pruefe_leisten` in the same file
+# holds their five rectangles against each other as integers, and at
+# 952 AND at 260 points of width (there the clamping of the
+# search field takes effect). What is compared are the marks
 #
-#   >>> LEISTE BESCHRIEBEN ... <<< LEISTE BESCHRIEBEN   (fn werkzeugleiste)
-#   >>> LEISTE GEMALT      ... <<< LEISTE GEMALT        (fn toolbar_painted)
+#   >>> TOOLBAR DESCRIBED ... <<< TOOLBAR DESCRIBED   (fn werkzeugleiste)
+#   >>> TOOLBAR PAINTED   ... <<< TOOLBAR PAINTED     (fn toolbar_painted)
 #
-# beide in demos/fuidemo/main.fi. Ausserhalb der Marken liegt in BEIDEN
-# Faellen nur die Pruefung (das Herausreichen der Rechtecke, die
-# Meldung bei unvollstaendigem Baum) -- kein Stueck Oberflaeche.
+# both in demos/fuidemo/main.fi. Outside the marks lies in BOTH
+# cases only the check (handing out the rectangles, the
+# message on an incomplete tree) -- no piece of surface.
 #
-# DREI ZUSCHNITTE, wie in 19c, und die beiden ersten sagen etwas
-# Unbequemes: fuer EINE Leiste ist die Beschreibung NICHT kuerzer (51
-# gegen 52 Zeilen roh). Das steht hier als Zahl und nicht als Ausrede --
-# ein Stilblatt fuer eine einzige Leiste amortisiert sich nicht, und
-# genau darum zeigt 19c die Seite mit mehreren Kacheln.
+# THREE CUTS, as in 19c, and the first two say something
+# uncomfortable: for ONE bar the description is NOT shorter (51
+# against 52 lines raw). That stands here as a number and not as an excuse --
+# a style sheet for a single bar does not pay off, and
+# that is exactly why 19c shows the page with several tiles.
 #
-# Der dritte Zuschnitt ist der, um den es geht: die GLIEDERUNG. Ohne
-# die Beschriftungen und ohne das Aussehen (auf der gemalten Seite
-# Painter, Farben und Stile; auf der beschriebenen Seite das Stilblatt
-# samt seinen Klassennamen -- das ist dort das Aussehen) bleibt stehen,
-# WAS dasteht. Dort spart die Beschreibung die Messung, die Verteilung,
-# das Setzen jedes Rechtecks und die eigene Zeichenschleife.
+# The third cut is the one that matters: the STRUCTURE. Without
+# the labels and without the look (on the painted side
+# painter, colours and styles; on the described side the style sheet
+# including its class names -- that is the look there) what remains
+# is WHAT stands there. There the description saves the measuring, the distribution,
+# the setting of each rectangle and the own drawing loop.
 ohne_aussehen_d() {
     grep -v -e 'painter\.round_rect' -e 'painter\.round_ring' \
         -e 'theme\.opaque' -e 'theme\.theme_colors' \
@@ -787,9 +877,9 @@ ohne_aussehen_d() {
         -e 'sheet\.sheet_rule' \
         -e 'sheet\.sheet_name' -e 'var n[a-z]*: \[u8;'
 }
-sed -n '/>>> LEISTE BESCHRIEBEN/,/<<< LEISTE BESCHRIEBEN/p' \
+sed -n '/>>> TOOLBAR DESCRIBED/,/<<< TOOLBAR DESCRIBED/p' \
     demos/fuidemo/main.fi > "$W/leiste_b.txt"
-sed -n '/>>> LEISTE GEMALT/,/<<< LEISTE GEMALT/p' \
+sed -n '/>>> TOOLBAR PAINTED/,/<<< TOOLBAR PAINTED/p' \
     demos/fuidemo/main.fi > "$W/leiste_g.txt"
 ohne_text < "$W/leiste_b.txt" > "$W/leiste_ba.txt"
 ohne_text < "$W/leiste_g.txt" > "$W/leiste_ga.txt"
@@ -808,28 +898,28 @@ if [ "$lb" -lt 30 ] || [ "$lg" -lt 30 ] || [ "$lbb" -lt 12 ] \
     || [ "$lgb" -lt 20 ]; then
     echo "  FEHLER: eine der beiden Fassungen wurde nicht gefunden oder"
     echo "  die Filter haben zu viel weggenommen. Es fehlen die Marken"
-    echo "  LEISTE BESCHRIEBEN / LEISTE GEMALT in demos/fuidemo/main.fi."
+    echo "  TOOLBAR DESCRIBED / TOOLBAR PAINTED in demos/fuidemo/main.fi."
     exit 1
 fi
-# ROH UND A: die Beschreibung darf nicht LAENGER sein. Mehr wird hier
-# nicht verlangt, und der Grund steht oben.
-# ROH UND A: hoechstens 80 % -- die Texte und das Aussehen zaehlen
-# hier auf beiden Seiten voll mit, und eine Beschreibung, die ihre
-# fuenf Beschriftungen genauso einzeln hinschreibt wie die gemalte,
-# kann in diesen beiden Zuschnitten gar nicht halb so lang werden
-# (gemessen am 22.09.2026: 40 von 52 roh = 77 %, 30 von 42 ohne
-# Texte = 71 %).
+# RAW AND A: the description must not be LONGER. More is not
+# demanded here, and the reason stands above.
+# RAW AND A: at most 80 % -- the texts and the look count
+# fully on both sides here, and a description that writes down its
+# five labels one by one just like the painted one
+# cannot become half as long in these two cuts
+# (measured on 22.09.2026: 40 of 52 raw = 77 %, 30 of 42 without
+# texts = 71 %).
 if [ $((lb * 5)) -gt $((lg * 4)) ] || [ $((lba * 5)) -gt $((lga * 4)) ]; then
     echo "  FEHLER: die beschriebene Leiste braucht mehr als vier"
     echo "  Fuenftel der gemalten ($lb von $lg roh, $lba von $lga ohne"
     echo "  Texte)."
     exit 1
 fi
-# B: die Gliederung. Auch hier gilt wieder die HAELFTE, dieselbe
-# Schranke wie in 19c -- und sie haelt nicht, weil die Pruefung
-# nachgegeben haette, sondern weil dieselbe Leiste mit scene_box,
-# node_set_space, node_set_flexitem und scene_run jetzt kuerzer
-# beschrieben ist (gemessen am 22.09.2026: 15 von 32, also 47 %).
+# B: the structure. Here too the HALF applies again, the same
+# barrier as in 19c -- and it holds not because the check
+# had given way, but because the same bar with scene_box,
+# node_set_space, node_set_flexitem and scene_run is now described
+# more briefly (measured on 22.09.2026: 15 of 32, so 47 %).
 if [ $((lbb * 2)) -gt "$lgb" ]; then
     echo "  FEHLER: die beschriebene Gliederung braucht mehr als die"
     echo "  Haelfte der gemalten ($lbb von $lgb Zeilen)."
@@ -840,12 +930,12 @@ echo "  dieselbe Leiste beschrieben: Gliederung $lbb von $lgb        OK"
 if [ "$1" = "--images" ]; then
     echo
     echo "== 9. THE GALLERY =="
-    # WOHIN DIE BELEGE GEHEN. Die Vorgabe liegt INNERHALB des
-    # Arbeitsverzeichnisses ($W), nicht unter einem festen Systempfad:
-    # ein Lauf, der ausserhalb seines eigenen Baums schreibt, faellt bei
-    # jedem, der dort keine Rechte hat, auf die Nase -- und zwar erst
-    # nach zwanzig bestandenen Abschnitten. Wer die Bilder woanders
-    # haben will, setzt BELEGE.
+    # WHERE THE PROOFS GO. The default lies INSIDE the
+    # working directory ($W), not under a fixed system path:
+    # a run that writes outside its own tree falls flat on its face for
+    # everybody who has no rights there -- and only
+    # after twenty passed sections. Whoever wants the images elsewhere
+    # sets BELEGE.
     Z="${BELEGE:-$W/belege}"
     if ! mkdir -p "$Z" 2>/dev/null; then
         echo "  FEHLER: das Belegverzeichnis \"$Z\" laesst sich nicht anlegen."
@@ -853,10 +943,10 @@ if [ "$1" = "--images" ]; then
         echo "  beschreibbaren Pfad und starte erneut."
         exit 1
     fi
-    # Anlegen heisst noch nicht beschreiben duerfen (ein vorhandenes,
-    # fremdes Verzeichnis legt mkdir -p klaglos nicht neu an). Also
-    # einmal wirklich schreiben -- lieber hier scheitern als ein Bild
-    # weniger ausliefern und trotzdem "ALL CHECKS PASSED" drucken.
+    # Creating does not yet mean being allowed to write (an existing,
+    # foreign directory is silently not re-created by mkdir -p). So
+    # write once for real -- better to fail here than to deliver one image
+    # fewer and still print "ALL CHECKS PASSED".
     if ! : > "$Z/.schreibprobe" 2>/dev/null; then
         echo "  FEHLER: in \"$Z\" laesst sich nicht schreiben."
         echo "  Der Lauf ist damit NICHT bestanden."
@@ -864,12 +954,12 @@ if [ "$1" = "--images" ]; then
     fi
     rm -f "$Z/.schreibprobe"
 
-    # DIE SCHRIFT, EINMAL UND VORHER. Jedes Belegprogramm bricht seit
-    # dieser Runde mit einem Fehler ab, wenn es keine Schrift laden
-    # kann -- ein Bild ohne einen einzigen Buchstaben belegt nichts.
-    # Hier wird dieselbe Datei EINMAL vorher geprueft, damit der Lauf
-    # nicht erst nach dem zwanzigsten Abschnitt an zehn Programmen
-    # hintereinander scheitert und niemand die Ursache sieht.
+    # THE FONT, ONCE AND BEFOREHAND. Every proof program has since
+    # this round been aborting with an error if it cannot load a font
+    # -- a picture without a single letter proves nothing.
+    # Here the same file is checked ONCE beforehand, so that the run
+    # does not fail only after the twentieth section on ten programs
+    # in a row and nobody sees the cause.
     SCHRIFT="${SCHRIFT:-/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf}"
     if [ ! -r "$SCHRIFT" ]; then
         echo "  FEHLER: die Schrift \"$SCHRIFT\" ist nicht lesbar."
@@ -880,39 +970,39 @@ if [ "$1" = "--images" ]; then
     fi
     echo "  Schrift gefunden: $SCHRIFT"
 
-    # DIE BELEGPRUEFUNG. Sie liest jedes geschriebene PNG WIEDER EIN
-    # und rechnet nach: Abmessungen, Zahl verschiedener Farben, und
-    # dass in JEDEM der sechs waagerechten Baender wirklich etwas
-    # steht. Die Zahlen hinter jedem Aufruf sind Breite, kleinste und
-    # groesste zulaessige Hoehe (drei Belege schneiden ihre Leinwand
-    # auf den Inhalt zu) und die geforderte Farbvielfalt. Die obere
-    # Grenze ist die Leinwand aus dem malenden Programm -- wer sie dort
-    # aendert, traegt die Zahl HIER nach; genau dafuer steht sie da.
+    # THE PROOF CHECK. It reads every written PNG BACK IN
+    # and re-calculates: dimensions, number of distinct colours, and
+    # that in EACH of the six horizontal bands something really
+    # stands. The numbers behind every call are width, smallest and
+    # largest permitted height (three proofs cut their canvas
+    # to the content) and the demanded colour variety. The upper
+    # limit is the canvas from the painting program -- whoever
+    # changes it there enters the number HERE; that is exactly what it stands there for.
     build belegpruef
-    # DIE BELEGE, NACHGERECHNET. Ab Abschnitt 4 kommen zwei weitere
-    # Zahlen dazu, und beide sind ABSICHTLICH je Blatt gesetzt:
+    # THE PROOFS, RE-CALCULATED. From section 4 on, two further
+    # numbers are added, and both are DELIBERATELY set per sheet:
     #
-    #   <rand>   wieviel leerer Streifen unter dem letzten Inhalt noch
-    #            durchgeht. Die Belege dieses Baumes lassen 20 Punkte
-    #            Rand; 40 laesst Luft fuer eine Kantenglaettung und
-    #            faengt trotzdem jede Leinwand, die auf eine Konstante
-    #            statt auf den Inhalt gesetzt ist (gallery6 hatte so
-    #            42 Punkte, siehe dort).
-    #   <seiten> 1 heisst: auch links und rechts muss Luft sein. Zwei
-    #            Blaetter setzen mit Absicht ueber die volle Breite --
-    #            der Verdunkler hinter den Dialogen in fui-wave3 und
-    #            die Trennlinie unter der Titelzeile von fui-demo --,
-    #            die rufen ohne die 1.
+    #   <rand>   how much empty strip under the last content still
+    #            passes. The proofs of this tree leave 20 points of
+    #            margin; 40 leaves room for edge smoothing and still
+    #            catches every canvas that is set to a constant
+    #            instead of to the content (gallery6 had
+    #            42 points like that, see there).
+    #   <seiten> 1 means: air must also be left and right. Two
+    #            sheets set over the full width on purpose --
+    #            the darkener behind the dialogs in fui-wave3 and
+    #            the separator line under the title bar of fui-demo --
+    #            they call without the 1.
     beleg() {
         "$W/belegpruef" "$@"
     }
-    # DIE BESCHRIFTUNGEN GEGEN DIE LEINWAND. Abschnitt 19b rechnet die
-    # Kettenlaengen jeder Quelle nach; hier kommt die zweite Haelfte
-    # dazu, fuer die man die Leinwandbreite des Blattes braucht: jede
-    # gemalte Kette wird mit `render.pref_of` bei 15 Punkt gemessen und
-    # muss in die Breite des Belegs minus zweimal 24 Punkt Rand passen.
-    # Die Breite ist DIESELBE Zahl, die zwei Zeilen weiter an `beleg`
-    # geht -- steht sie einmal falsch, faellt es hier oder dort auf.
+    # THE LABELS AGAINST THE CANVAS. Section 19b re-calculates the
+    # chain lengths of every source; here the second half
+    # is added, for which one needs the canvas width of the sheet: every
+    # painted chain is measured with `render.pref_of` at 15 points and
+    # must fit into the width of the proof minus twice 24 points of margin.
+    # The width is the SAME number that goes to `beleg` two lines further on
+    # -- if it stands wrong once, it is noticed here or there.
     kette() {
         "$W/belegpruef" --ketten "$SCHRIFT" "$2" "tools/fui/$1_main.fi"
     }
@@ -940,10 +1030,10 @@ if [ "$1" = "--images" ]; then
     "$W/gallery4" "$Z/fui-text-dark.png" dark
     beleg "$Z/fui-text-light.png" 1240 600 1180 200 40 1
     beleg "$Z/fui-text-dark.png" 1240 600 1180 200 40 1
-    # BILD UND SVG (Runde BILD+SVG, 13.09.2026). Fuenf Baender: Knopf mit
-    # Icon, Beschriftung mit Bild und Icon-Toolbar, dasselbe SVG je Groesse
-    # NEU gerastert (12..64) samt currentColor=TOK_ACCENT daneben, Bild mit
-    # Transparenz ueber vier Gruenden, Reiter/Menue/Kachel.
+    # IMAGE AND SVG (round BILD+SVG, 13.09.2026). Five bands: button with
+    # icon, label with image and icon toolbar, the same SVG per size
+    # RE-rasterised (12..64) including currentColor=TOK_ACCENT beside it, image with
+    # transparency over four backgrounds, tabs/menu/tile.
     # THE LUCIDE SET: every icon at 16, 24 and 32 (tools/fui/icons_main.fi)
     "$W/icons" "$Z/fui-icons.png" > /dev/null
     build artshow
@@ -952,10 +1042,10 @@ if [ "$1" = "--images" ]; then
     "$W/artshow" "$Z/fui-bild-svg-dunkel.png" dark
     beleg "$Z/fui-bild-svg-hell.png" 900 400 620 200 40 1
     beleg "$Z/fui-bild-svg-dunkel.png" 900 400 620 200 40 1
-    # RUNDE UI-WEB: die vier neuen Faehigkeiten, hell und dunkel.
-    # Eine Bewegung als Phasenreihe, die Flex-Varianten nebeneinander,
-    # Schatten/Glas/Farbmatrix ueber gemustertem Grund, und gedrehte,
-    # skalierte, gescherte Kacheln.
+    # ROUND UI-WEB: the four new capabilities, light and dark.
+    # A movement as a phase series, the flex variants side by side,
+    # shadow/glass/colour matrix over a patterned background, and rotated,
+    # scaled, skewed tiles.
     build gallery5
     kette gallery5 1240
     "$W/gallery5" "$Z/fui-anim-hell.png" light
@@ -980,23 +1070,23 @@ if [ "$1" = "--images" ]; then
     "$W/gallery8" "$Z/fui-transform-dunkel.png" dark
     beleg "$Z/fui-transform-hell.png" 1280 500 760 200 40 1
     beleg "$Z/fui-transform-dunkel.png" 1280 500 760 200 40 1
-    # DIE BESCHRIEBENE OBERFLAECHE. Der Beleg zu lib/fui/scene.fi,
-    # sheet.fi und viewport.fi: eine ganze Seite, die NICHT Aufruf fuer
-    # Aufruf gemalt, sondern als Baum beschrieben und von einem
-    # Stilblatt eingefaerbt wird -- mit einer Liste aus 28 Eintraegen
-    # in einem Scheibenkasten, sichtbar abgeschnitten und mit einem
-    # Rollbalken, dessen Laenge aus dem Verhaeltnis Ausschnitt/Inhalt
-    # kommt. Das Programm rechnet selbst nach, dass ueber und unter
-    # dem Ausschnitt KEIN Punkt der Liste steht (das harte Clipping am
-    # fertigen Bild), dass die Rangfolge der Regeln im Bild steht und
-    # dass kein Text aus seinem Kasten laeuft; sonst schreibt es kein
-    # PNG und der Lauf bleibt daran haengen.
+    # THE DESCRIBED SURFACE. The proof for lib/fui/scene.fi,
+    # sheet.fi and viewport.fi: a whole page that is NOT painted call
+    # by call, but described as a tree and coloured by a
+    # style sheet -- with a list of 28 entries
+    # in a pane box, visibly cut off and with a
+    # scroll bar whose length comes from the ratio section/content.
+    # The program itself re-calculates that above and below
+    # the section NO point of the list stands (the hard clipping on the
+    # finished image), that the ranking of the rules stands in the image and
+    # that no text runs out of its box; otherwise it writes no
+    # PNG and the run gets stuck on it.
     build gallery9
     kette gallery9 1240
-    # Das sechste Argument laesst dieselbe Seite ihren Barrierefreiheits-
-    # Baum (lib/fui/a11y.fi, a11y_dump) als Text neben das Bild legen.
-    # Abschnitt 10 im Programm verlangt dabei, dass jedes der 12
-    # Bedienelemente Rolle und Namen hat; sonst gibt es kein Bild.
+    # The sixth argument lets the same page put its accessibility
+    # tree (lib/fui/a11y.fi, a11y_dump) as text beside the image.
+    # Section 10 in the program demands that each of the 12
+    # controls has role and name; otherwise there is no image.
     "$W/gallery9" "$Z/fui-deklarativ-hell.png" light - 1240 \
         "$Z/fui-deklarativ-a11y.txt"
     if ! grep -q '^    textbox "Im Baum suchen" focusable' \
@@ -1009,77 +1099,80 @@ if [ "$1" = "--images" ]; then
     "$W/gallery9" "$Z/fui-deklarativ-dunkel.png" dark
     beleg "$Z/fui-deklarativ-hell.png" 1240 700 740 200 40 1
     beleg "$Z/fui-deklarativ-dunkel.png" 1240 700 740 200 40 1
-    # UND DIESELBE SEITE SCHMAL. Das ist der eigentliche Beweis der
-    # Beschreibung: NICHTS am Baum und nichts am Stilblatt aendert
-    # sich, nur die Leinwand ist 980 statt 1240 Punkte breit -- die
-    # Karten werden schmaler, die Werkzeugleiste verteilt neu, und die
-    # Seite rechnet ihre eigenen Zusagen noch einmal nach (kein Text
-    # laeuft aus seinem Kasten, kein Punkt aus dem Ausschnitt). Eine
-    # gemalte Fassung muesste dafuer jede Koordinate anfassen.
+    # AND THE SAME PAGE NARROW. That is the actual proof of the
+    # description: NOTHING in the tree and nothing in the style sheet changes,
+    # only the canvas is 980 instead of 1240 points wide -- the
+    # cards become narrower, the toolbar redistributes, and the
+    # page re-calculates its own promises once more (no text
+    # runs out of its box, no point out of the section). A painted
+    # version would have to touch every coordinate for that.
     kette gallery9 980
     "$W/gallery9" "$Z/fui-deklarativ-schmal-hell.png" light - 980
     "$W/gallery9" "$Z/fui-deklarativ-schmal-dunkel.png" dark - 980
     beleg "$Z/fui-deklarativ-schmal-hell.png" 980 700 740 200 40 1
     beleg "$Z/fui-deklarativ-schmal-dunkel.png" 980 700 740 200 40 1
-    # DIE SCHMELZGRUPPE (lib/fui/merge.fi, r68): vier Regeln je eine
-    # Reihe, sechs Abstaende, die Pillen mit Beschriftung; darunter die
-    # Feder alle 100 ms.
+    # THE MERGE GROUP (lib/fui/merge.fi, r68): four rules, one
+    # row each, six distances, the pills with labels; below them the
+    # spring every 100 ms.
     "$W/merge" "$Z/fui-merge.png"
-    # DIE ZWEIRICHTUNGSSCHRIFT (Runde Bidi, 23.09.2026). Arabisch und
-    # Hebraeisch neben Lateinisch, alles ueber den normalen Weg der
-    # Bibliothek: Beschriftungen mit Zahlen und Klammern, dieselbe
-    # Beschriftung mit direction ltr und rtl, Knoepfe, ein Absatz ueber
-    # zwei Zeilen, eine Kuerzung mit den Punkten links, zwei Textfelder
-    # (Schreibmarke am arabischen Textende, Auswahl ueber die
-    # Richtungsgrenze). Das Programm rechnet selbst nach, dass neben
-    # keinem Kasten ein fremder Punkt steht, dass der Text im RTL-Kasten
-    # rechts beginnt und dass der Absatz wirklich zwei Zeilen hat --
-    # sonst schreibt es kein PNG. Die Schrift ist DejaVu Sans, die
-    # arabische und hebraeische Glyphen samt GSUB fuehrt.
+    # fui.app (lib/fui/app.fi): the three examples of examples/fui/ as
+    # app_main paints them -- the native reference tools/wasm/appcheck.py
+    # holds the browser against, pixel for pixel.
+    "$W/app" "$Z" > /dev/null
+    # THE BIDIRECTIONAL TEXT (round Bidi, 23.09.2026). Arabic and
+    # Hebrew next to Latin, everything via the normal way of the
+    # library: labels with numbers and brackets, the same
+    # label with direction ltr and rtl, buttons, a paragraph over
+    # two lines, a truncation with the dots on the left, two text fields
+    # (caret at the Arabic text end, selection across the
+    # direction boundary). The program itself re-calculates that beside
+    # no box a foreign point stands, that the text in the RTL box
+    # begins at the right and that the paragraph really has two lines --
+    # otherwise it writes no PNG. The font is DejaVu Sans, which carries
+    # Arabic and Hebrew glyphs including GSUB.
     build gallery10
     kette gallery10 1000
     "$W/gallery10" "$Z/fui-bidi-hell.png" light
     "$W/gallery10" "$Z/fui-bidi-dunkel.png" dark
     beleg "$Z/fui-bidi-hell.png" 1000 500 900 200 40 1
     beleg "$Z/fui-bidi-dunkel.png" 1000 500 900 200 40 1
-    # DIE UEBERSICHT AUS DER ERSTEN STUNDE. tools/fui/preview_main.fi
-    # malt die Grundelemente in allen Zustaenden; sie lag seit ihrer
-    # Entstehung NEBEN diesem Lauf -- gebaut hat sie niemand, gerechnet
-    # erst recht nicht. Jetzt entsteht ihr Bild hier und wird
-    # nachgerechnet wie jeder andere Beleg.
+    # THE OVERVIEW FROM THE FIRST HOUR. tools/fui/preview_main.fi
+    # paints the basic elements in all states; it lay BESIDE this run since its
+    # creation -- nobody built it, and nobody calculated it either. Now its image arises here and is
+    # re-calculated like every other proof.
     build preview
     kette preview 760
     "$W/preview" "$Z/fui-preview-hell.png" light
     "$W/preview" "$Z/fui-preview-dunkel.png" dark
     beleg "$Z/fui-preview-hell.png" 760 200 240 120 40 1
     beleg "$Z/fui-preview-dunkel.png" 760 200 240 120 40 1
-    # DIE DEMO-ANWENDUNG. Kein Pruefblatt, sondern eine Oberflaeche, wie
-    # ein Anwender sie schreibt: Titelzeile und Werkzeugleiste von
-    # `flex.flex_layout` verteilt, der Hover-Uebergang eines Knopfes aus
-    # `anim.Animator`, der Dialogschatten aus
-    # `effect.drop_shadow_spread`. Sie liegt unter demos/ und nicht
-    # unter tools/fui, weil sie den NORMALEN Weg zeigt -- und sie laeuft
-    # hier mit, damit ein Bruch in einem der drei Module auffliegt,
-    # bevor der naechste Anwender darueber stolpert. Das Programm
-    # rechnet selbst nach, dass seine Phasen sich nicht ueberdecken,
-    # und endet sonst mit einem Fehler (set -e bricht den Lauf ab).
+    # THE DEMO APPLICATION. No test sheet, but a surface as a
+    # user writes it: title bar and toolbar distributed by
+    # `flex.flex_layout`, the hover transition of a button from
+    # `anim.Animator`, the dialog shadow from
+    # `effect.drop_shadow_spread`. It lies under demos/ and not
+    # under tools/fui, because it shows the NORMAL way -- and it runs along
+    # here so that a break in one of the three modules is noticed
+    # before the next user stumbles over it. The program
+    # re-calculates itself that its phases do not overlap,
+    # and otherwise ends with an error (set -e aborts the run).
     "$FIRNC" --opt-level=dev -o "$W/fuidemo" demos/fuidemo/main.fi
     "$W/belegpruef" --ketten "$SCHRIFT" 1000 demos/fuidemo/main.fi
     "$W/fuidemo" "$Z/fui-demo-hell.png" light
     "$W/fuidemo" "$Z/fui-demo-dunkel.png" dark
     beleg "$Z/fui-demo-hell.png" 1000 350 500 200 40 0
     beleg "$Z/fui-demo-dunkel.png" 1000 350 500 200 40 0
-    # DIE EINGABEMETHODE (Runde IME, 23.09.2026). Vier Felder mitten in
-    # einer Eingabe -- Japanisch mit offener Liste, Koreanisch mit der
-    # Silbe im Bau, Chinesisch mit der Liste fuer zhong, und eine
-    # Auswahl, die bis zum Bestaetigen stehen bleibt. Dafuer braucht es
-    # eine Schrift mit CJK-GLYPHEN in TrueType-Umrissen; DejaVu hat
-    # keine, und ein Beleg aus leeren Kaesten belegt nichts. Fehlt sie,
-    # ist der Lauf NICHT bestanden -- dieselbe Regel wie bei $SCHRIFT.
-    # (Noto Sans CJK taugt nicht: CFF-Umrisse, die lib/font/ttf.fi
-    # benannt ablehnt.) Das Programm prueft selbst, dass jedes gezeigte
-    # Zeichen eine Glyphe hat, dass nichts ueberlappt und nichts aus
-    # seinem Kasten laeuft, und schreibt sonst kein PNG.
+    # THE INPUT METHOD (round IME, 23.09.2026). Four fields in the middle of
+    # an input -- Japanese with open list, Korean with the
+    # syllable under construction, Chinese with the list for zhong, and a
+    # selection that stays standing until confirmed. For that it needs
+    # a font with CJK GLYPHS in TrueType outlines; DejaVu has
+    # none, and a proof of empty boxes proves nothing. If it is missing,
+    # the run has NOT passed -- the same rule as for $SCHRIFT.
+    # (Noto Sans CJK is no good: CFF outlines, which lib/font/ttf.fi
+    # rejects by name.) The program itself checks that every shown
+    # character has a glyph, that nothing overlaps and nothing runs out of
+    # its box, and otherwise writes no PNG.
     SCHRIFT_CJK="${SCHRIFT_CJK:-/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc}"
     if [ ! -r "$SCHRIFT_CJK" ]; then
         echo "  FEHLER: die CJK-Schrift \"$SCHRIFT_CJK\" ist nicht lesbar."

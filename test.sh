@@ -17,7 +17,7 @@
 #   6. Proof of the result-location guarantee (tools/result_location/run.sh:
 #      frame sizes in the emitted assembly).
 #   7. Architecture check: field access is separated from the memory location
-#      (tools/schichten/run.sh, a precondition for SoA).
+#      (tools/layers/run.sh, a precondition for SoA).
 #   8. Symbol naming scheme: reserved prefix, room for the
 #      ABI version, modules free of collisions (tools/symbole/run.sh).
 #   8b. The atomic primitive `__atomic_add` really produces a
@@ -407,12 +407,12 @@ else
 fi
 
 echo "== 7. architecture: field access <-> memory location separated =="
-bash tools/schichten/run.sh > "$WORK/layers.log" 2>&1 && SCRC=0 || SCRC=$?
+bash tools/layers/run.sh > "$WORK/layers.log" 2>&1 && SCRC=0 || SCRC=$?
 if [ "$SCRC" -eq 0 ]; then
     ok
     tail -1 "$WORK/layers.log" | sed 's/^/   /'
 else
-    bad "tools/schichten/run.sh failed (see .test-work/layers.log)"
+    bad "tools/layers/run.sh failed (see .test-work/layers.log)"
     tail -20 "$WORK/layers.log" | sed 's/^/   /'
 fi
 
@@ -1426,6 +1426,81 @@ if [ "$LMRC" -eq 0 ]; then
 else
     bad "tools/libmvp/run.sh failed (see .test-work/libmvp.log)"
     grep -E 'FAIL|DIFF' "$WORK/libmvp.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 66. TLS 1.3 client AND server, ECDSA signing (tools/tls/run.sh, round NET-REMOTE) =="
+# Against Python's cryptography, openssl s_server/s_client, curl and
+# Python's ssl -- with the refusals counted as counter-checks.
+bash tools/tls/run.sh > "$WORK/tls.log" 2>&1 && TLSRC=0 || TLSRC=$?
+grep -E '^(CRYPTO|CERT|TLS|P256|TLS SERVER) ' "$WORK/tls.log" | sed 's/^/   /'
+if [ "$TLSRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/tls/run.sh failed (see .test-work/tls.log)"
+    grep -E 'FAIL' "$WORK/tls.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 67. HTTP/1.1 server, WebSocket (Autobahn), SSE, pairing (tools/http/run.sh, round NET-REMOTE) =="
+bash tools/http/run.sh > "$WORK/http.log" 2>&1 && HTRC=0 || HTRC=$?
+grep -E '^(HTTP|WS CLIENT|AUTOBAHN) |Autobahn' "$WORK/http.log" | sed 's/^/   /'
+if [ "$HTRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/http/run.sh failed (see .test-work/http.log)"
+    grep -E 'FAIL' "$WORK/http.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 68. input (uinput in a VM with the real kernel) and examples/phone_remote end to end (round NET-REMOTE) =="
+bash tools/input/run.sh > "$WORK/input.log" 2>&1 && INRC=0 || INRC=$?
+grep -E '^(INPUT|SKIP)|events compared' "$WORK/input.log" | sed 's/^/   /'
+bash tools/phone_remote/run.sh > "$WORK/phone_remote.log" 2>&1 && PRRC2=0 || PRRC2=$?
+grep -E 'PHONE REMOTE|SKIP|builds' "$WORK/phone_remote.log" | sed 's/^/   /'
+if [ "$INRC" -eq 0 ] && [ "$PRRC2" -eq 0 ]; then
+    ok
+else
+    bad "tools/input/run.sh or tools/phone_remote/run.sh failed (see .test-work/input.log, phone_remote.log)"
+    grep -E 'FAIL' "$WORK/input.log" "$WORK/phone_remote.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 69. WINDOWS: the same programs on two operating systems (x86_64-windows, under Wine) =="
+# machine.sh  what the FILE is: PE32+, our own import table, the Win64
+#             thunks, the stack probe, no `syscall` instruction left.
+# run.sh      what the program DOES: every case of tests/ built for both
+#             systems and compared; differences grouped by cause
+#             (tools/windows/causes.txt), floor tools/windows/minquota.txt.
+# net.sh      a TCP client over ws2_32.dll against a fixed-reply server.
+# input/win.sh      lib/input over SendInput, the pointer read back.
+# phone_remote/win.sh  examples/phone_remote as a .exe: pairing, refusals,
+#             and the X server sees the pointer move.
+# All of them SKIP (exit 0) without mingw binutils / Wine / Xvfb.
+WINRC=0
+for t in tools/windows/machine.sh tools/windows/net.sh tools/windows/run.sh tools/input/win.sh tools/phone_remote/win.sh; do
+    lg="$WORK/win_$(basename "$(dirname "$t")")_$(basename "$t" .sh).log"
+    bash "$t" > "$lg" 2>&1 || WINRC=1
+    grep -E '^  (passed|SKIP|RESULT)|^(SKIP|INPUT-WIN)' "$lg" | sed 's/^/   /' || true
+done
+if [ "$WINRC" -eq 0 ]; then
+    ok
+else
+    bad "the windows target failed (see .test-work/win_*.log)"
+    grep -hE 'FAIL' "$WORK"/win_*.log | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 70. web.dom: the page's DOM from Firn in a real browser (lib/web/dom.fi + dom.js) =="
+# examples/dom built for wasm32-browser, driven in headless Chromium: nodes
+# created, real clicks reach the Firn handler, text never parsed as HTML,
+# 5000 list items, no page errors. SKIPs (exit 0) without Playwright.
+DOMRC=0
+for o in --no-opt --opt-level=release-fast; do
+    OPT="$o" bash tools/web/run.sh > "$WORK/web_dom.log" 2>&1 || DOMRC=1
+    grep -E '^(dom:|SKIP)' "$WORK/web_dom.log" | sed "s/^/   $o /" || true
+    [ "$DOMRC" -eq 0 ] || break
+done
+if [ "$DOMRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/web/run.sh failed (see .test-work/web_dom.log)"
+    grep -E 'FAIL' "$WORK/web_dom.log" | head -12 | sed 's/^/   /' || true
 fi
 
 TOTAL=$((PASS + FAIL))

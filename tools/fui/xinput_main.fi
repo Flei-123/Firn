@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/xinput_main.fi -- THE XInput2 HANDSHAKE AGAINST A REAL X SERVER
+// (roadmap r112). It needs an X server (DISPLAY, an Xvfb is enough); the
+// machine has no touch device (no uinput), so no finger can be played in --
+// what is checked is everything up to the first finger:
+//
+//   * the server speaks XInputExtension and XI 2.2 or newer (touch),
+//   * `window.real_pointers` is true, the mouse stays on the old events
+//     (`window.pointer_mouse` is false),
+//   * the server ANSWERS XIGetSelectedEvents with XI_TouchBegin / Update /
+//     End selected on our window -- a BadValue on XISelectEvents would
+//     have left no other trace,
+//   * switching off is ok;
+//   * a TOUCH, played into the receive buffer as the octets the server would
+//     send (backend.inject_wire): TouchBegin / Update / End as GenericEvents
+//     of 80 octets become pointer records (id + 1000, primary, type touch),
+//     the core ButtonPress / MotionNotify / ButtonRelease the server
+//     emulates from the first touch are dropped, a click 600 ms later is a
+//     mouse click again, two fingers keep their ids.
+//
+//     DISPLAY=:77 xinput_main
+import std.rt
+import window.window
+import window.backend
+import window.pointers
+
+static mut G_ERRORS: usize = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn check(name: str, ok: bool) {
+    if ok {
+        say("  OK      ")
+    } else {
+        say("  WRONG   ")
+        G_ERRORS = G_ERRORS + 1
+    }
+    say(name)
+    say("\n")
+}
+
+// ----------------------------------------------------------------------
+// A touch cannot be played into a server here (no uinput), so its octets are
+// put into the receive buffer as the server would have sent them
+// (backend.inject_wire) and run through the REAL event loop: a TouchBegin,
+// TouchUpdate and TouchEnd as GenericEvents of 80 octets (length 12), and
+// the core ButtonPress / MotionNotify / ButtonRelease the server emulates
+// from the first touch.
+fn put32(b: *mut [u8; 80], at: usize, v: u32) {
+    (*b)[at] = (v & 255 as u32) as u8
+    (*b)[at + 1] = ((v >> 8) & 255 as u32) as u8
+    (*b)[at + 2] = ((v >> 16) & 255 as u32) as u8
+    (*b)[at + 3] = ((v >> 24) & 255 as u32) as u8
+}
+
+fn touch(f: *mut window.Window, evtype: u32, id: u32, t: u32, x: u32, y: u32) {
+    var g: [u8; 80] = [0 as u8; 80]
+    g[0] = 35 as u8
+    g[1] = (*f).p.xi_op as u8
+    g[4] = 12 as u8
+    g[8] = evtype as u8
+    put32(&g, 12, t)
+    put32(&g, 16, id)
+    put32(&g, 40, x * 65536 as u32)
+    put32(&g, 44, y * 65536 as u32)
+    backend.inject_wire(&(*f).p, (&g[0]) as u64, 80)
+}
+
+// A core pointer event: code 4 ButtonPress, 5 ButtonRelease, 6 MotionNotify.
+fn core(f: *mut window.Window, code: u32, t: u32, x: u32, y: u32) {
+    var e: [u8; 32] = [0 as u8; 32]
+    e[0] = code as u8
+    e[1] = 1 as u8
+    e[4] = (t & 255 as u32) as u8
+    e[5] = ((t >> 8) & 255 as u32) as u8
+    e[6] = ((t >> 16) & 255 as u32) as u8
+    e[24] = (x & 255 as u32) as u8
+    e[26] = (y & 255 as u32) as u8
+    backend.inject_wire(&(*f).p, (&e[0]) as u64, 32)
+}
+
+// All window events that are there now: how many of kind `want`.
+fn count_events(f: *mut window.Window, want: u32) -> usize {
+    var n: usize = 0
+    var k: u32 = window.next_event(f)
+    while k != window.EV_NONE {
+        if k == want {
+            n = n + 1
+        }
+        k = window.next_event(f)
+    }
+    return n
+}
+
+fn wire_tests(f: *mut window.Window) {
+    var p: pointers.Pointer = pointers.ptr_blank()
+    // a finger down at (30, 40), moves to (35, 41), lifts at (35, 41)
+    touch(f, 18 as u32, 5 as u32, 1000 as u32, 30 as u32, 40 as u32)
+    let b0: usize = count_events(f, window.EV_BUTTON)
+    check("TouchBegin makes no EV_BUTTON", b0 == 0)
+    check("... but a pointer record: down", window.next_pointer(f, (&p) as u64)
+        && p.kind == pointers.PK_DOWN && p.id == 1005 as u32)
+    check("... of type touch, primary, at (30, 40)", p.ptype == pointers.PTR_TOUCH
+        && p.primary == 1 as u32 && p.x == 30.0 && p.y == 40.0 && p.t == 1000)
+    // the server's echo: a core ButtonPress 50 ms later is dropped
+    core(f, 4 as u32, 1050 as u32, 30 as u32, 40 as u32)
+    core(f, 6 as u32, 1060 as u32, 35 as u32, 41 as u32)
+    check("the core echo of the touch is dropped (no EV_BUTTON, no EV_MOTION)",
+        count_events(f, window.EV_BUTTON) == 0)
+    touch(f, 19 as u32, 5 as u32, 1100 as u32, 35 as u32, 41 as u32)
+    count_events(f, window.EV_MOTION)
+    check("TouchUpdate: a move record", window.next_pointer(f, (&p) as u64)
+        && p.kind == pointers.PK_MOVE && p.x == 35.0)
+    touch(f, 20 as u32, 5 as u32, 1200 as u32, 35 as u32, 41 as u32)
+    count_events(f, window.EV_NONE)
+    check("TouchEnd: an up record", window.next_pointer(f, (&p) as u64)
+        && p.kind == pointers.PK_UP)
+    core(f, 5 as u32, 1210 as u32, 35 as u32, 41 as u32)
+    check("the echo of the lift is dropped too (no EV_RELEASE)",
+        count_events(f, window.EV_RELEASE) == 0)
+    // a mouse click 600 ms later is a mouse
+    core(f, 4 as u32, 1800 as u32, 10 as u32, 10 as u32)
+    check("a core ButtonPress 600 ms after the finger is a mouse click",
+        count_events(f, window.EV_BUTTON) == 1)
+    check("... and makes no pointer record", !window.next_pointer(f, (&p) as u64))
+    // two fingers: ids stay apart, the second is not primary
+    touch(f, 18 as u32, 7 as u32, 3000 as u32, 10 as u32, 10 as u32)
+    touch(f, 18 as u32, 8 as u32, 3001 as u32, 60 as u32, 10 as u32)
+    count_events(f, window.EV_NONE)
+    var first: bool = window.next_pointer(f, (&p) as u64) && p.id == 1007 as u32
+    && p.primary == 1 as u32
+    check("two fingers: the first is primary", first)
+    check("... the second is not", window.next_pointer(f, (&p) as u64)
+        && p.id == 1008 as u32 && p.primary == 0 as u32)
+    touch(f, 20 as u32, 7 as u32, 3100 as u32, 10 as u32, 10 as u32)
+    touch(f, 20 as u32, 8 as u32, 3100 as u32, 60 as u32, 10 as u32)
+    count_events(f, window.EV_NONE)
+    check("both lift", window.next_pointer(f, (&p) as u64)
+        && window.next_pointer(f, (&p) as u64))
+}
+
+fn main(start: u64) -> i32 {
+    var f: window.Window = window.window_new()
+    if !window.open_window(&f, 0) {
+        say("no X server (set DISPLAY)\n")
+        return 2
+    }
+    check("window made", window.make(&f, 320, 200))
+    check("window shown", window.show_window(&f))
+    check("server speaks XInput 2.2 (xi_op set)", f.p.xi_op != 0 as u32)
+    check("real_pointers(true) is true", window.real_pointers(&f, true))
+    check("the mouse stays on the old events", !window.pointer_mouse(&f))
+    check("the server reports the touch selection",
+        backend.xi_selected_touch(&f.p))
+    var p: pointers.Pointer = pointers.ptr_blank()
+    check("no pointer record without a finger", !window.next_pointer(&f, (&p) as u64))
+    check("real_pointers(false) is true", window.real_pointers(&f, false))
+    check("... and switches the feed off", !pointers.pointers_enabled(&f.p.pq))
+    check("real_pointers(true) again", window.real_pointers(&f, true))
+    wire_tests(&f)
+    window.close_window(&f)
+    if G_ERRORS == 0 {
+        say("XINPUT PASSED\n")
+        return 0
+    }
+    say("XINPUT FAILED\n")
+    return 1
+}

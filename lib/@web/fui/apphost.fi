@@ -1,0 +1,377 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/@web/fui/apphost.fi -- lib/fui/app.fi IN A BROWSER PAGE.
+//
+// firnc finds this file for `import fui.apphost` when it builds with
+// `--target=wasm32-browser` (compiler/src/target.rs `platform_dir` =
+// "@web"); a native build finds lib/@linux/fui/apphost.fi. Same names on
+// both sides: `Hooks`, `hooks_blank`, `hooks_new`, `run`, `PLATFORM`.
+//
+// The page is lib/plat/web.fi in its APPLICATION MODE (`web_app`): it
+// hands over every pointer, key and text event and asks for a picture when
+// something changed. This file turns those events into the same calls the
+// X11 host makes -- fuiwirt.fi's pointer and keys for focus and clicks,
+// app.fi's key/char hooks for a focused text field -- so a program behaves
+// the same in both places. Positions arrive in CSS pixels and go on in
+// device pixels (devicePixelRatio, which is also the theme's scale); the
+// font is the one the loader (demos/webdemo/firn.js) fetched.
+//
+// A browser tab cannot be closed by its page: after app.quit the page
+// paints its background only and takes no more input. The window title
+// is the page's <title>; `title` is kept for the native side.
+import std.rt
+import fui.theme
+import fui.painter
+import fui.render
+import fui.editor
+import plat.web
+import plat.fuiwirt
+
+export {
+    Hooks, hooks_blank, hooks_new, hooks_set_audit, hooks_set_buf, hooks_set_edited, run,
+    PLATFORM,
+    PLATFORM_LINUX, PLATFORM_WEB,
+}
+
+const PLATFORM_LINUX: u32 = 1
+const PLATFORM_WEB: u32 = 2
+const PLATFORM: u32 = 2
+
+// The same record as lib/@linux/fui/apphost.fi -- see there.
+struct Hooks {
+    ud: u64,
+    m: u64,
+    host: u64,
+    attach: fn(u64, *mut painter.Painter),
+    paint: fn(u64, usize, usize),
+    key: fn(u64, u32, u32) -> bool,
+    text: fn(u64, u32, u32) -> bool,
+    press: fn(u64, f64, f64),
+    act: fn(u64, usize),
+    done: fn(u64) -> bool,
+    field: fn(u64, *mut [f64; 4]) -> bool,
+    title: str,
+    w: usize,
+    h: usize,
+}
+
+fn attach_none(ud: u64, z: *mut painter.Painter) {
+}
+
+fn paint_none(ud: u64, w: usize, h: usize) {
+}
+
+fn key_none(ud: u64, k: u32, m: u32) -> bool {
+    return false
+}
+
+fn press_none(ud: u64, x: f64, y: f64) {
+}
+
+fn act_none(ud: u64, i: usize) {
+}
+
+fn done_none(ud: u64) -> bool {
+    return true
+}
+
+fn field_none(ud: u64, out: *mut [f64; 4]) -> bool {
+    return false
+}
+
+fn hooks_blank() -> Hooks {
+    return Hooks { ud: 0, m: 0, host: 0, attach: attach_none,
+        paint: paint_none, key: key_none, text: key_none, press: press_none,
+        act: act_none, done: done_none, field: field_none, title: "",
+        w: 0, h: 0 }
+}
+
+fn hooks_new(ud: u64, m: *mut theme.Theme, host: *mut fuiwirt.Host,
+    attach: fn(u64, *mut painter.Painter), paint: fn(u64, usize, usize),
+    key: fn(u64, u32, u32) -> bool, text: fn(u64, u32, u32) -> bool,
+    press: fn(u64, f64, f64), act: fn(u64, usize), done: fn(u64) -> bool,
+    field: fn(u64, *mut [f64; 4]) -> bool,
+    title: str, w: usize, h: usize) -> Hooks {
+    return Hooks { ud: ud, m: m as u64, host: host as u64, attach: attach,
+        paint: paint, key: key, text: text, press: press, act: act,
+        done: done, field: field, title: title, w: w, h: h }
+}
+
+// The audit mode (FUI_AUDIT, lib/@linux/fui/apphost.fi) needs an
+// environment; a page has none. The same name so app.fi stays one file.
+fn hooks_set_audit(h: *mut Hooks, f: fn(u64) -> i32) {
+}
+
+// The on-screen keyboard follows the focused text field through the page's
+// hidden field (web_keyboard); a phone's own keyboard has no TextBuf to type
+// into here. The same name so app.fi stays one file (lib/@linux/fui/apphost.fi).
+fn hooks_set_buf(h: *mut Hooks, f: fn(u64) -> u64) {
+}
+
+fn hooks_set_edited(h: *mut Hooks, f: fn(u64)) {
+}
+
+// The page's state between the host's calls.
+static mut G_THEMED: bool = false
+static mut G_KBD: bool = false
+
+fn hooks_of(ud: u64) -> *mut Hooks {
+    return ud as *mut Hooks
+}
+
+fn host_of(h: *mut Hooks) -> *mut fuiwirt.Host {
+    return (*h).host as *mut fuiwirt.Host
+}
+
+// Is the key name at p/n the word `w`?
+fn named(p: u64, n: usize, w: str) -> bool {
+    if n != w.n {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) != rt.ld8(w.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// A DOM key name -> a text field's key (editor.KEY_*), 0 = none.
+fn edit_key(p: u64, n: usize) -> u32 {
+    if named(p, n, "ArrowLeft") { return editor.KEY_LEFT }
+    if named(p, n, "ArrowRight") { return editor.KEY_RIGHT }
+    if named(p, n, "Home") { return editor.KEY_HOME }
+    if named(p, n, "End") { return editor.KEY_END }
+    if named(p, n, "Backspace") { return editor.KEY_BACKSPACE }
+    if named(p, n, "Delete") { return editor.KEY_DELETE }
+    if named(p, n, "Enter") { return editor.KEY_ENTER }
+    if named(p, n, "Escape") { return editor.KEY_ESC }
+    if named(p, n, "Tab") { return editor.KEY_TAB }
+    if named(p, n, "ArrowUp") { return editor.KEY_UP }
+    if named(p, n, "ArrowDown") { return editor.KEY_DOWN }
+    return 0 as u32
+}
+
+// ... and the same name -> the host's key (fuiwirt.KEY_*), 0 = none.
+fn host_key(p: u64, n: usize) -> u32 {
+    if named(p, n, "Tab") { return fuiwirt.KEY_TAB }
+    if named(p, n, "Enter") { return fuiwirt.KEY_RETURN }
+    if named(p, n, "ArrowUp") { return fuiwirt.KEY_UP }
+    if named(p, n, "ArrowDown") { return fuiwirt.KEY_DOWN }
+    if named(p, n, "ArrowLeft") { return fuiwirt.KEY_LEFT }
+    if named(p, n, "ArrowRight") { return fuiwirt.KEY_RIGHT }
+    if named(p, n, "PageUp") { return fuiwirt.KEY_PAGE_UP }
+    if named(p, n, "PageDown") { return fuiwirt.KEY_PAGE_DOWN }
+    if named(p, n, "Home") { return fuiwirt.KEY_HOME }
+    if named(p, n, "End") { return fuiwirt.KEY_END }
+    return 0 as u32
+}
+
+// The DOM's modifier bits (shift 1, ctrl 2, alt 4, meta 8) -> editor.fi's
+// (shift 1, ctrl 4, alt 8). Meta counts as control: Cmd+A on a Mac is
+// Ctrl+A everywhere else.
+fn edit_mods(m: u32) -> u32 {
+    var o: u32 = 0 as u32
+    if (m & web.MOD_SHIFT) != 0 as u32 { o = o | editor.MOD_SHIFT }
+    if (m & (web.MOD_CTRL | web.MOD_META)) != 0 as u32 { o = o | editor.MOD_CTRL }
+    if (m & web.MOD_ALT) != 0 as u32 { o = o | editor.MOD_ALT }
+    return o
+}
+
+// One UTF-8 code point at p[i]; `len` gets its length (0 = broken).
+fn utf8_at(p: u64, n: usize, i: usize, len: *mut usize) -> u32 {
+    let b0: u32 = rt.ld8(p, i) as u32
+    var need: usize = 0
+    var cp: u32 = 0 as u32
+    if b0 < 128 as u32 {
+        *len = 1
+        return b0
+    } else if (b0 & 224 as u32) == 192 as u32 {
+        need = 1
+        cp = b0 & 31 as u32
+    } else if (b0 & 240 as u32) == 224 as u32 {
+        need = 2
+        cp = b0 & 15 as u32
+    } else if (b0 & 248 as u32) == 240 as u32 {
+        need = 3
+        cp = b0 & 7 as u32
+    } else {
+        *len = 0
+        return 0 as u32
+    }
+    if i + need >= n {
+        *len = 0
+        return 0 as u32
+    }
+    var k: usize = 1
+    while k <= need {
+        let b: u32 = rt.ld8(p, i + k) as u32
+        if (b & 192 as u32) != 128 as u32 {
+            *len = 0
+            return 0 as u32
+        }
+        cp = (cp << 6) | (b & 63 as u32)
+        k = k + 1
+    }
+    *len = need + 1
+    return cp
+}
+
+// A character: first the focused text field, else the space bar presses
+// the focused button (fuiwirt).
+fn give_char(h: *mut Hooks, cp: u32, mods: u32) {
+    if cp < 32 as u32 || cp == 127 as u32 {
+        return
+    }
+    if !(*h).text((*h).ud, cp, mods) {
+        let c: u32 = fuiwirt.host_char(host_of(h), cp, mods)
+    }
+}
+
+fn give_text(h: *mut Hooks, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        var l: usize = 0
+        let cp: u32 = utf8_at(p, n, i, &l)
+        if l == 0 {
+            return
+        }
+        give_char(h, cp, 0 as u32)
+        i = i + l
+    }
+}
+
+// A key that is pressed (not released).
+fn give_key(h: *mut Hooks, p: u64, n: usize, dom_mods: u32) {
+    let mods: u32 = edit_mods(dom_mods)
+    let k: u32 = edit_key(p, n)
+    if k != 0 as u32 && (*h).key((*h).ud, k, mods) {
+        return
+    }
+    let hk: u32 = host_key(p, n)
+    if hk != 0 as u32 {
+        var hm: u32 = 0 as u32
+        if (mods & editor.MOD_SHIFT) != 0 as u32 {
+            hm = fuiwirt.MOD_SHIFT
+        }
+        let c: u32 = fuiwirt.host_key(host_of(h), hk, hm)
+        return
+    }
+    // A printable key the canvas got itself (the page's text field does
+    // not have the focus): one code point is a character.
+    var l: usize = 0
+    let cp: u32 = utf8_at(p, n, 0, &l)
+    if l == n && n > 0 {
+        give_char(h, cp, mods)
+    }
+}
+
+// A phone shows its keyboard only for a real text field: while one of
+// ours has the focus, the loader's hidden field lies over it.
+fn follow_keyboard(h: *mut Hooks, w: *mut web.Web) {
+    var b: [f64; 4] = [0.0; 4]
+    let on: bool = (*h).field((*h).ud, &b)
+    if on == G_KBD && !on {
+        return
+    }
+    G_KBD = on
+    let s: f64 = (web.web_scale(w) as f64) / 1000.0
+    web.web_keyboard(on, b[0] / s, b[1] / s, b[2] / s, b[3] / s)
+}
+
+// The time of the last frame, for pointer events whose loader sent none.
+static mut G_NOW: i64 = 0
+
+fn on_event(ud: u64, w: *mut web.Web, e: *mut web.WebEvent) -> bool {
+    let h: *mut Hooks = hooks_of(ud)
+    let host: *mut fuiwirt.Host = host_of(h)
+    let m: *mut theme.Theme = (*h).m as *mut theme.Theme
+    if (*h).done((*h).ud) {
+        return false
+    }
+    let s: f64 = (web.web_scale(w) as f64) / 1000.0
+    let kind: u32 = (*e).kind
+    if kind == web.WE_RESIZE {
+        (*h).attach((*h).ud, render.ctx_painter(web.web_ctx(w)))
+        if !G_THEMED {
+            theme.theme_set_dark(m, web.web_dark(w))
+            G_THEMED = true
+        }
+        fuiwirt.host_set_scale(host, m, web.web_scale(w))
+        fuiwirt.host_resize(host)
+    } else if kind == web.WE_MOVE || kind == web.WE_DOWN
+    || kind == web.WE_UP || kind == web.WE_CANCEL || kind == web.WE_LEAVE {
+        // The pointer as the DOM says it: id, type, isPrimary, timeStamp
+        // (lib/plat/web.fi firn_web_pointer_ex). The router sees every pointer,
+        // the primary one also takes the old way (fuiwirt.host_pointer).
+        var pk: u32 = fuiwirt.PE_MOVE
+        if kind == web.WE_DOWN {
+            pk = fuiwirt.PE_DOWN
+        } else if kind == web.WE_UP {
+            pk = fuiwirt.PE_UP
+        } else if kind == web.WE_CANCEL {
+            pk = fuiwirt.PE_CANCEL
+        } else if kind == web.WE_LEAVE {
+            pk = fuiwirt.PE_LEAVE
+        }
+        var t: i64 = (*e).ms as i64
+        if t == 0 {
+            t = G_NOW
+        }
+        let primary: bool = (*e).primary != 0 as u32
+        if kind == web.WE_DOWN && primary {
+            (*h).press((*h).ud, (*e).x * s, (*e).y * s)
+        }
+        let c: u32 = fuiwirt.host_pointer(host, pk, (*e).pid, (*e).ptype,
+            primary, (*e).x * s, (*e).y * s, t)
+    } else if kind == web.WE_KEY {
+        if (*e).status == 0 as u32 {
+            return false
+        }
+        give_key(h, (*e).p, (*e).n, (*e).mods)
+    } else if kind == web.WE_TEXT {
+        give_text(h, (*e).p, (*e).n)
+    } else if kind == web.WE_TICK {
+        G_NOW = (*e).ms as i64
+        fuiwirt.host_tick(host, (*e).ms as i64)
+    } else {
+        return false
+    }
+    let i: usize = fuiwirt.host_take_activated(host)
+    if i != fuiwirt.KEINER {
+        (*h).act((*h).ud, i)
+    }
+    if (*h).done((*h).ud) {
+        web.web_keyboard(false, 0.0, 0.0, 0.0, 0.0)
+        return true
+    }
+    follow_keyboard(h, w)
+    if fuiwirt.host_wait_ms(host) > 0 {
+        web.web_want_frame(w)
+    }
+    return fuiwirt.host_dirty(host)
+}
+
+fn on_paint(ud: u64, w: *mut web.Web) -> bool {
+    let h: *mut Hooks = hooks_of(ud)
+    (*h).paint((*h).ud, web.web_width(w), web.web_height(w))
+    fuiwirt.host_painted(host_of(h))
+    // the hover under a still pointer after the layout (as natively)
+    let c: u32 = fuiwirt.host_after_layout(host_of(h))
+    if fuiwirt.host_dirty(host_of(h)) {
+        web.web_want_frame(w)
+    }
+    return true
+}
+
+// The page registers itself and returns; everything after this happens
+// when the loader calls (lib/plat/web.fi).
+fn run(h: *mut Hooks) -> i32 {
+    if !web.web_app(h as u64, on_paint, on_event) {
+        return 3
+    }
+    web.web_on_demand(true)
+    web.web_want_cancel(true)
+    return 0
+}

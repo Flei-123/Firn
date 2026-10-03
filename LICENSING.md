@@ -49,6 +49,26 @@ any more.
   `LICENSES/Lucide-ISC.txt`, and `THIRD_PARTY.md` lists it. Both licences
   are permissive and ask only for the notice to travel with the data.
 
+* 29 September 2026: TLS and the cryptography under it came over from the
+  Firn branch `dns-pic` (commit `dd9d62e1`, round B5): `lib/tls/`
+  (`der.fi`, `keys.fi`, `tls.fi`, `x509.fi` and their `*_main.fi`), which
+  carried `GPL-2.0-only`, and `lib/std/crypto/` (`big.fi`, `chacha.fi`,
+  `ecdsa.fi`, `gcm.fi`, `hkdf.fi`, `rsa.fi`, `sha512.fi`, `x25519.fi`,
+  `crypto_main.fi`), which carried `MIT`, plus the checkers
+  `tools/tls/{crypto,cert,tls}_check.py` and `tests/data/tls-chains/`.
+  `git log --all` over these paths shows commits by Justin and no other
+  author. As sole author Justin released them for Firn under MPL-2.0 -- the
+  same step as for `lib/window/` and `lib/svg/`. Only the SPDX line changed
+  and a note of origin was added.
+
+* 30 September 2026: the Windows target came over from the Firn branches
+  `windows` (`fec370f9`) and `certus-windows` (`bf3800f1`):
+  `compiler/src/win.rs`, `compiler/src/win_seam.rs` and `tools/windows/`.
+  The tools still carried `GPL-2.0-only` from the time of the split.
+  `git log` over these paths on both branches shows commits by Justin and
+  no other author. As sole author Justin released them for Firn under
+  MPL-2.0 -- the same step as above. Only the SPDX line changed.
+
 ## Why MPL-2.0
 
 A language is only useful if programs written in it may be closed. The MPL

@@ -57,6 +57,10 @@ pub(crate) struct Parser<'a> {
     /// `let_stmt` switches it on around exactly that call; everywhere else a
     /// `_` is refused in the parser, so `ast::LEN_INFER` never leaves it.
     pub(crate) infer_len_ok: bool,
+    /// **ROUND REF** -- `fn_decl` allows the parameter spellings `&T` and
+    /// `inout T` while it parses its list (`refparam.rs`).
+    pub(crate) allow_ref_params: bool,
+    pub(crate) ref_params: Vec<crate::refparam::RefParam>,
 }
 
 fn starts_stmt(k: &TokKind) -> bool {
@@ -657,7 +661,47 @@ impl<'a> Parser<'a> {
         lhs
     }
 
+    /// **ROUND REF** -- a parameter list in which `x: &T` / `x: inout T` are
+    /// allowed: plain functions, generic templates, methods and closures.
+    pub(crate) fn params_ref(&mut self) -> (Vec<Param>, Vec<crate::refparam::RefParam>) {
+        self.ref_params.clear();
+        self.allow_ref_params = true;
+        let params = self.params();
+        self.allow_ref_params = false;
+        (params, std::mem::take(&mut self.ref_params))
+    }
+
+    /// **ROUND REF** -- after a body: rewrite the reference parameters and
+    /// check that no `inout` is shared inside one call (exactly one).
+    pub(crate) fn finish_body(
+        &mut self,
+        refs: &[crate::refparam::RefParam],
+        body: &mut Block,
+    ) {
+        crate::refparam::desugar(refs, body, &mut self.next_id, self.dg);
+        crate::refparam::check_exclusive(body, self.dg);
+    }
+
+    /// **ROUND REF** -- does the token after the current one begin a type
+    /// (or an operand)? Used to tell the keyword-like `inout T` / `inout x`
+    /// from a variable that happens to be called `inout`.
+    fn next_starts_type(&self) -> bool {
+        matches!(
+            self.toks.get(self.pos + 1).map(|t| &t.kind),
+            Some(TokKind::Ident(_)) | Some(TokKind::Star) | Some(TokKind::LBracket) | Some(TokKind::KwFn)
+        )
+    }
+
     pub(crate) fn unary(&mut self) -> Expr {
+        // ROUND REF: `inout x` as an argument is the address of `x`.
+        if matches!(self.kind(), TokKind::Ident(n) if n == "inout") && self.next_starts_type() {
+            let start = self.bump();
+            self.depth += 1;
+            let inner = self.unary();
+            self.depth -= 1;
+            let sp = Parser::join(start, inner.span);
+            return self.mk(sp, ExprKind::Unary(UnOp::InoutOf, Box::new(inner)));
+        }
         let op = match self.kind() {
             TokKind::Minus => Some(UnOp::Neg),
             TokKind::Not => Some(UnOp::Not),
@@ -1484,10 +1528,29 @@ compute it",
             return Stmt::Error(start);
         }
         let from = self.cond_expr();
+        // ROUND REF4: `for x in array { ... }` -- no `..`, the body follows.
+        if self.at(&TokKind::LBrace) {
+            self.loop_depth += 1;
+            let body = self.block("after 'for ... in array'");
+            self.loop_depth -= 1;
+            return crate::foreach::build(self, name, name_span, from, body, start);
+        }
         if !self.expect(TokKind::DotDot, "between start and end of the range") {
             self.recovering = false;
             self.sync_stmt();
             return Stmt::Error(start);
+        }
+        // ROUND REF2: `start..=end` -- the `=` must follow the `..` directly.
+        let mut inclusive = false;
+        if self.at(&TokKind::Assign) {
+            let dd = self.toks.get(self.pos.wrapping_sub(1)).map(|t| t.span);
+            let eq = self.span();
+            if let Some(d) = dd {
+                if d.line == eq.line && d.col + 2 == eq.col {
+                    self.bump();
+                    inclusive = true;
+                }
+            }
         }
         let to = self.cond_expr();
         if self.recovering {
@@ -1500,7 +1563,7 @@ compute it",
         self.loop_depth += 1;
         let body = self.block("after the range of 'for'");
         self.loop_depth -= 1;
-        Stmt::For { name, start: from, end: to, body, name_span, span: start }
+        Stmt::For { name, start: from, end: to, body, inclusive, name_span, span: start }
     }
 
     /// `break` / `continue`
@@ -1562,9 +1625,35 @@ compute it",
             if !self.expect(TokKind::Colon, "after the parameter name") {
                 break;
             }
+            // ROUND REF: `x: &T` / `x: inout T` (plain functions only).
+            let mut ref_kind: Option<bool> = None;
+            if self.allow_ref_params {
+                if self.at(&TokKind::Amp) {
+                    self.bump();
+                    ref_kind = Some(false);
+                } else if matches!(self.kind(), TokKind::Ident(n) if n == "inout")
+                    && self.next_starts_type()
+                {
+                    self.bump();
+                    ref_kind = Some(true);
+                }
+            }
             let ty = match self.parse_type() {
                 Some(t) => t,
                 None => break,
+            };
+            let ty = match ref_kind {
+                None => ty,
+                Some(inout) => {
+                    let array = matches!(ty, TypeExpr::Array { .. });
+                    self.ref_params.push(crate::refparam::RefParam {
+                        name: name.clone(),
+                        inout,
+                        array,
+                    });
+                    let span = ty.span();
+                    TypeExpr::Ptr { mutable: inout, inner: Box::new(ty), span }
+                }
             };
             out.push(Param { name, ty, span: sp });
             if !self.eat(&TokKind::Comma) {
@@ -1601,7 +1690,7 @@ compute it",
             self.sync_item();
             return;
         }
-        let params = self.params();
+        let (params, ref_params) = self.params_ref();
         self.close(TokKind::RParen, "after the parameter list");
         self.recovering = false;
         let ret = if self.eat(&TokKind::Arrow) {
@@ -1660,8 +1749,9 @@ compute it",
             self.sync_item();
             return;
         }
-        let body = self.block("at the start of the function body");
+        let mut body = self.block("at the start of the function body");
         self.recovering = false;
+        self.finish_body(&ref_params, &mut body);
         prog.funcs.push(FnDecl { name, params, ret, body, span: start, attrs, extern_info: None });
     }
 
@@ -1799,7 +1889,7 @@ compute it",
         }
     }
 
-    /// `import path.module`
+    /// `import path.module` or `import path.module as name`
     fn import_decl(&mut self, prog: &mut Program) {
         let start = self.bump(); // 'import'
         let mut path: Vec<String> = Vec::new();
@@ -1816,8 +1906,24 @@ compute it",
                 break;
             }
         }
-        let alias = match path.last() {
-            Some(a) => a.clone(),
+        // `import http.server as http`: the module is reached under a name
+        // of the program's choosing. Without `as` the name is the last part
+        // of the path, as it always was. The renamer (modules.rs) maps the
+        // alias to the module name of the target file, so nothing else
+        // changes.
+        let mut chosen: Option<String> = None;
+        if self.eat(&TokKind::KwAs) {
+            match self.ident("as the module alias after 'as'") {
+                Some((n, _)) => chosen = Some(n),
+                None => {
+                    self.recovering = false;
+                    self.sync_item();
+                    return;
+                }
+            }
+        }
+        let alias = match chosen.or_else(|| path.last().cloned()) {
+            Some(a) => a,
             None => {
                 self.recovering = false;
                 self.sync_item();
@@ -2287,6 +2393,8 @@ fn in_expr(
         pending_attrs: Vec::new(),
         hoist: Vec::new(),
         interp_depth: 1,
+        allow_ref_params: false,
+        ref_params: Vec::new(),
         infer_len_ok: false,
     };
     let e = p.nested_expr();
@@ -2341,6 +2449,8 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         pending_attrs: Vec::new(),
         hoist: Vec::new(),
         interp_depth: 0,
+        allow_ref_params: false,
+        ref_params: Vec::new(),
         infer_len_ok: false,
     };
     let prog = p.program();
@@ -2410,6 +2520,7 @@ mod tests {
                     UnOp::Not => "!",
                     UnOp::BitNot => "~",
                     UnOp::AddrOf => "&",
+                    UnOp::InoutOf => "inout ",
                     UnOp::Deref => "*",
                 },
                 dump(a)

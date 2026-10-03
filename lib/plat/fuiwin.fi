@@ -1,34 +1,34 @@
 // SPDX-License-Identifier: MPL-2.0
-// lib/plat/fuiwin.fi -- DIE FENSTERSCHLEIFE: lib/window + fUi.
+// lib/plat/fuiwin.fi -- THE WINDOW LOOP: lib/window + fUi.
 //
-// ========================================================= WARUM ES DAS GIBT
+// ========================================================= WHY IT EXISTS
 //
-// lib/window/window.fi kann ein Fenster aufmachen, ein fertiges Bild
-// hineinschieben und Ereignisse herausgeben -- auf X11, Windows,
-// Android und OSUM, je nachdem, welche Rueckwand neben der Wurzeldatei
-// als window/backend.fi liegt. lib/plat/fuiwirt.fi weiss, was ein
-// Ereignis fuer fUi bedeutet. Diese Datei ist das Stueck dazwischen, und
-// sie ist mit Absicht KLEIN:
+// lib/window/window.fi can open a window, push a finished picture
+// into it and hand out events -- on X11, Windows,
+// Android and OSUM, depending on which back end lies next to the root file
+// as window/backend.fi. lib/plat/fuiwirt.fi knows what an
+// event means for fUi. This file is the piece in between, and
+// it is deliberately SMALL:
 //
-//   * EINE WEICHE: jedes EV_* geht an genau eine Funktion des Wirts;
-//     jede Taste mit Bedeutung (window.K_*) wird eine Taste des Wirts.
-//     Welche Taste Escape ist, weiss die Rueckwand (unter X11 aus dem
-//     Keysym, siehe lib/window/x11.fi F1) -- hier steht keine Tabelle.
-//   * DIE LEINWAND: ein canvas.Canvas in Fenstergroesse und ein Painter
-//     darauf. Aendert sich die Groesse (EV_CONFIGURE), werden beide NEU
-//     angelegt und nicht gestreckt -- sonst waere das Bild unscharf.
-//   * DIE SCHLEIFE: warten, solange der Wirt es erlaubt
-//     (`wirt_wait_ms`: -1 = bis ein Ereignis kommt), alle Ereignisse
-//     abholen, den Takt stellen, und NUR wenn der Wirt schmutzig ist:
-//     malen lassen, RGBA -> BGRX, ein PutImage, fertig. Im Leerlauf
-//     steht das Programm in `poll` und verbraucht nichts.
-//   * DER MASSSTAB: `window.uiscale` (aus Xft.dpi bzw. den Millimetern
-//     des Schirms, lib/window/x11.fi L4) geht ueber `wirt_set_scale`
-//     ins Theme -- beim Aufmachen und nach jedem EV_CONFIGURE, denn ein
-//     Fenster kann auf einen anderen Schirm wandern.
+//   * ONE SWITCH: every EV_* goes to exactly one function of the host;
+//     every key with meaning (window.K_*) becomes a key of the host.
+//     Which key is Escape is known by the back end (under X11 from the
+//     keysym, see lib/window/x11.fi F1) -- no table stands here.
+//   * THE CANVAS: a canvas.Canvas in window size and a painter
+//     on it. If the size changes (EV_CONFIGURE), both are created ANEW
+//     and not stretched -- otherwise the picture would be blurry.
+//   * THE LOOP: wait as long as the host allows
+//     (`wirt_wait_ms`: -1 = until an event comes), collect all events,
+//     set the clock, and ONLY if the host is dirty:
+//     have it painted, RGBA -> BGRX, one PutImage, done. When idle
+//     the program stands in `poll` and uses nothing.
+//   * THE SCALE: `window.uiscale` (from Xft.dpi or the millimetres
+//     of the screen, lib/window/x11.fi L4) goes via `wirt_set_scale`
+//     into the theme -- on opening and after every EV_CONFIGURE, because a
+//     window can move to another screen.
 //
-// DIESE DATEI GEHOERT NICHT NACH lib/fui. fUi bleibt ohne Fenster
-// uebersetzbar; wer fUi in einem Fenster will, nimmt lib/plat.
+// THIS FILE DOES NOT BELONG IN lib/fui. fUi stays translatable
+// without a window; whoever wants fUi in a window takes lib/plat.
 import std.rt
 import paint.canvas
 import paint.gl
@@ -36,19 +36,26 @@ import fui.painter
 import fui.theme
 import fui.gpu
 import window.window
+import window.pointers
 import plat.fuiwirt
+import fui.event
 
 export {
     Window, window_new, window_open, window_run, window_close,
     window_canvas, window_painter, window_w, window_h,
     window_window, window_set_font, window_log, window_full,
     window_images, now_ms,
-    // fUi tempo, stage 2b: THE GPU (see "AUF DER GPU" below)
+    // fUi tempo, stage 2b: THE GPU (see "ON THE GPU" below)
     window_set_gpu, window_gpu,
     // OpenPlan LIB-006: the system clipboard for fUi text fields
     window_clip_read, window_clip_write,
     // OpenPlan LIB-005: more than one window
     window_step, window_wait_many,
+    // fUi app layer (lib/fui/app.fi): keys and characters for a text field
+    // first, and Escape that does not close the window
+    window_set_input_hook, window_set_escape_closes,
+    // r111: real pointers (every finger with its id) into the event router
+    window_use_pointers,
 }
 
 struct Window {
@@ -62,37 +69,107 @@ struct Window {
     h: usize,
     // Liefert die Rueckwand Loslassen/Hinein/Hinaus (window.full_input)?
     full: bool,
-    // Eine Zeile je Ereignis und je Bild auf fd 1 -- fuer den Abnahmelauf.
+    // One line per event and per frame on fd 1 -- for the acceptance run.
     log: bool,
     images: u64,
     open: bool,
-    // Escape beendet (die Demo will das; ein Programm mit Dialogen nicht).
+    // Escape ends (the demo wants that; a program with dialogs does not).
     esc_zu: bool,
-    // AUF DER GPU: gewollt (Standard ja), und ob es laeuft; die GL-Tabelle
-    // des Fensters und fUis Renderer darauf
+    // ON THE GPU: wanted (default yes), and whether it runs; the GL table
+    // of the window and fUi's renderer on it
     gpu_will: bool,
     gpu_an: bool,
     gl: gl.GlApi,
     gp: gpu.Gpu,
+    // THE INPUT HOOK (window_set_input_hook): 0 = none
+    hook_on: bool,
+    hook_ud: u64,
+    hook: fn(u64, u32, u32, u32, f64, f64) -> bool,
+    // REAL POINTERS (window_use_pointers): the back end delivers every
+    // finger as a record; `pdown` counts the ones that are down
+    real: bool,
+    // ... and the MOUSE too (Android), or only touch/pen while the mouse
+    // keeps the old events (X11 XInput2, Win32 WM_POINTER)
+    rmouse: bool,
+    pdown: usize,
+}
+
+fn hook_none(ud: u64, kind: u32, a: u32, st: u32, x: f64, y: f64) -> bool {
+    return false
+}
+
+// THE INPUT HOOK. `f(ud, kind, a, state, x, y)` sees every EV_KEY, EV_CHAR
+// and EV_BUTTON before the host does (kind = window.EV_*, a = the key, the
+// code point or the button, state = window.ev_state). For EV_KEY and
+// EV_CHAR an answer of true means "taken" and the host never sees the
+// event -- that is how a focused text field gets its letters, the space
+// bar included. A button is only reported: the host still gets it (focus,
+// press, release stay in ONE place, control.fi).
+fn window_set_input_hook(fx: *mut Window, ud: u64,
+    f: fn(u64, u32, u32, u32, f64, f64) -> bool) {
+    (*fx).hook_on = true
+    (*fx).hook_ud = ud
+    (*fx).hook = f
+}
+
+// REAL POINTERS (roadmap r111). Call after `window_open`, when the program
+// has an event router on the host (fuiwirt.host_set_router -- fui.app does
+// it with its first `app.on`). A back end that has them (Android: every
+// finger with its id, window.real_pointers) then feeds the host through
+// fuiwirt.host_pointer with id, type, primary and time; the old events for
+// the first finger (EV_BUTTON / EV_RELEASE / EV_LEAVE, and EV_MOTION while a
+// pointer is down) are left out, or the finger would act twice. A back end
+// without them (X11, Win32) keeps the one pointer: the mouse, which the
+// router now sees as pointer 1 of type mouse. False = the one pointer.
+fn window_use_pointers(fx: *mut Window, w: *mut fuiwirt.Host) -> bool {
+    (*fx).real = false
+    (*fx).rmouse = false
+    if fuiwirt.host_router(w) as u64 != 0 as u64 {
+        (*fx).real = window.real_pointers(&(*fx).f, true)
+        if (*fx).real {
+            (*fx).rmouse = window.pointer_mouse(&(*fx).f)
+        }
+    }
+    return (*fx).real
+}
+
+// One pointer record of the window layer -> the host.
+fn pointer_record(fx: *mut Window, w: *mut fuiwirt.Host, p: *mut pointers.Pointer) {
+    if (*p).kind == pointers.PK_DOWN {
+        (*fx).pdown = (*fx).pdown + 1
+    } else if ((*p).kind == pointers.PK_UP || (*p).kind == pointers.PK_CANCEL)
+    && (*fx).pdown > 0 {
+        (*fx).pdown = (*fx).pdown - 1
+    }
+    // pointers.PK_* and fuiwirt.PE_* are the same numbers
+    let c: u32 = fuiwirt.host_pointer(w, (*p).kind, (*p).id, (*p).ptype,
+        (*p).primary != 0 as u32, (*p).x, (*p).y, (*p).t)
+}
+
+// Escape closes the window by default (the demos want that); an
+// application with its own Close button does not.
+fn window_set_escape_closes(fx: *mut Window, on: bool) {
+    (*fx).esc_zu = on
 }
 
 fn window_new() -> Window {
     return Window { f: window.window_new(), cv: canvas.canvas_new(),
         z: painter.painter_new(), fm: 0, bgrx: 0, cap: 0, w: 0, h: 0,
         full: false, log: false, images: 0, open: false, esc_zu: true,
-        gpu_will: true, gpu_an: false, gl: gl.gl_api_new(), gp: gpu.gpu_new() }
+        gpu_will: true, gpu_an: false, gl: gl.gl_api_new(), gp: gpu.gpu_new(),
+        hook_on: false, hook_ud: 0, hook: hook_none, real: false, rmouse: false, pdown: 0 }
 }
 
-// ============================================================ AUF DER GPU
+// ============================================================ ON THE GPU
 //
-// fUi tempo, Stufe 2b (24.09.2026). Bietet das Fenster eine GPU an
-// (`window.gpu_open`: heute Android, EGL + OpenGL ES 3), dann liegt die
-// Leinwand auf der GPU (lib/fui/gpu.fi): fUi malt dort hinein, ein Bild
-// endet mit EINER Kopie auf den Schirm und `window.gpu_swap` -- kein
-// RGBA -> BGRX, kein Oktett-fuer-Oktett-Kopieren in den Fensterpuffer.
-// Ohne GPU (X11, Windows, Osum, ein Geraet ohne GLES 3) malt fUi wie
-// bisher im Speicher. `fenster_set_gpu(fx, false)` VOR dem Aufmachen
-// schaltet es ab (zum Vergleichen).
+// fUi tempo, stage 2b (24.09.2026). If the window offers a GPU
+// (`window.gpu_open`: today Android, EGL + OpenGL ES 3), then the
+// canvas lies on the GPU (lib/fui/gpu.fi): fUi paints into it there, a frame
+// ends with ONE copy onto the screen and `window.gpu_swap` -- no
+// RGBA -> BGRX, no octet-by-octet copying into the window buffer.
+// Without a GPU (X11, Windows, Osum, a device without GLES 3) fUi paints as
+// before in memory. `fenster_set_gpu(fx, false)` BEFORE opening
+// switches it off (for comparing).
 fn window_set_gpu(fx: *mut Window, an: bool) {
     (*fx).gpu_will = an
 }
@@ -120,8 +197,8 @@ fn gpu_start(fx: *mut Window) {
     line(fx, (&nm[0]) as u64, 3, 1, (*fx).w as i64, (*fx).h as i64, 0)
 }
 
-// Schreibzugriffe, die an der GPU vorbeigingen (canvas.fi zaehlt sie):
-// ins Protokoll, sobald es neue gibt -- ein Loch im Bild faellt so auf.
+// Write accesses that bypassed the GPU (canvas.fi counts them):
+// into the log as soon as there are new ones -- a hole in the picture is thereby noticed.
 static mut G_HASH: u64 = 0
 
 fn hash_report(fx: *mut Window) {
@@ -153,14 +230,14 @@ fn window_log(fx: *mut Window, an: bool) {
     (*fx).log = an
 }
 
-// Die Uhr, gegen die die Animationen laufen: CLOCK_MONOTONIC in ms.
+// The clock against which the animations run: CLOCK_MONOTONIC in ms.
 fn now_ms() -> i64 {
     var ts: [i64; 2] = [0; 2]
     syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
     return ts[0] * 1000 + ts[1] / 1000000
 }
 
-// Leinwand, Painter und BGRX-Puffer fuer `w` x `h` -- neu, nicht gestreckt.
+// Canvas, painter and BGRX buffer for `w` x `h` -- new, not stretched.
 fn flaechen(fx: *mut Window, w: usize, h: usize) -> bool {
     if (*fx).cap > 0 {
         painter.painter_free(&(*fx).z)
@@ -182,16 +259,16 @@ fn flaechen(fx: *mut Window, w: usize, h: usize) -> bool {
     (*fx).cap = w * h * 4
     (*fx).w = w
     (*fx).h = h
-    // die neue Leinwand wieder auf die GPU (ein Ziel der neuen Groesse)
+    // the new canvas back onto the GPU (a target of the new size)
     if (*fx).gpu_an && !gpu.gpu_attach(&(*fx).gp, &(*fx).cv) {
         (*fx).gpu_an = false
     }
     return true
 }
 
-// AUFMACHEN. `bw`/`bh` sind ENTWURFSPUNKTE: die Startgroesse wird wie
-// jede andere Laenge ueber das Theme umgerechnet, nachdem der Massstab
-// des Schirms bekannt ist. `anzeige` 0 = $DISPLAY.
+// OPENING. `bw`/`bh` are DESIGN POINTS: the start size is converted like
+// every other length via the theme, after the scale
+// of the screen is known. `anzeige` 0 = $DISPLAY.
 // `#[allow_escape]`: the window's address is kept (G_CLIPWIN) for the
 // clipboard functions a text field calls without a context. It is
 // cleared again in `fenster_close`, and a Fenster lives from open to
@@ -205,7 +282,7 @@ fn window_open(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
     fuiwirt.host_set_scale(w, m, window.uiscale(&(*fx).f))
     let pw: usize = theme.theme_px(m, bw)
     let ph: usize = theme.theme_px(m, bh)
-    // Loslassen, Hinein, Hinaus -- VOR dem Fenster bestellen.
+    // Release, enter, leave -- order BEFORE the window.
     (*fx).full = window.full_input(&(*fx).f, true)
     if !window.make(&(*fx).f, pw, ph) {
         return false
@@ -348,7 +425,7 @@ fn line(fx: *mut Window, was: u64, wn: usize, a: i64, b: i64, c: i64,
     rt.buf_free(&t)
 }
 
-// Taste des Fenstersystems -> Taste des Wirts; 0 = keine fuer ihn.
+// Key of the window system -> key of the host; 0 = none for it.
 fn taste(k: u32) -> u32 {
     if k == window.K_TAB { return fuiwirt.KEY_TAB }
     if k == window.K_RETURN { return fuiwirt.KEY_RETURN }
@@ -363,7 +440,7 @@ fn taste(k: u32) -> u32 {
     return 0 as u32
 }
 
-// EIN EREIGNIS -> DER WIRT. false = das Fenster ist zu.
+// ONE EVENT -> THE HOST. false = the window is closed.
 fn fork(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
     k: u32) -> bool {
     let f: *mut window.Window = &(*fx).f
@@ -371,10 +448,18 @@ fn fork(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
     let x: f64 = window.ev_x(f) as f64
     let y: f64 = window.ev_y(f) as f64
     let s: u32 = window.ev_state(f)
+    let routed: bool = fuiwirt.host_router(w) as u64 != 0 as u64
     var nm: [u8; 8] = "ereignis"
     line(fx, (&nm[0]) as u64, 8, k as i64, a as i64, x as i64, y as i64)
     if k == window.EV_CLOSED {
         return false
+    }
+    if (*fx).hook_on && (k == window.EV_KEY || k == window.EV_CHAR
+        || k == window.EV_BUTTON) {
+        let taken: bool = (*fx).hook((*fx).hook_ud, k, a, s, x, y)
+        if taken && k != window.EV_BUTTON {
+            return true
+        }
     }
     if k == window.EV_EXPOSE {
         fuiwirt.host_expose(w)
@@ -386,22 +471,57 @@ fn fork(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
                 return false
             }
         }
-        // Ein anderer Schirm kann eine andere Dichte haben.
+        // Another screen can have a different density.
         fuiwirt.host_set_scale(w, m, window.uiscale(f))
         fuiwirt.host_resize(w)
     } else if k == window.EV_MOTION || k == window.EV_ENTER {
-        let c: u32 = fuiwirt.host_pointer_move(w, x, y)
+        if (*fx).rmouse {
+            // the fingers come as records; a hovering mouse still moves
+            if (*fx).pdown == 0 {
+                let c: u32 = fuiwirt.host_pointer_move(w, x, y)
+            }
+        } else if routed {
+            let c: u32 = fuiwirt.host_pointer(w, fuiwirt.PE_MOVE, 1 as u32,
+                event.PT_MOUSE, true, x, y, now_ms())
+        } else {
+            let c: u32 = fuiwirt.host_pointer_move(w, x, y)
+        }
     } else if k == window.EV_LEAVE {
-        let c: u32 = fuiwirt.host_pointer_leave(w)
+        if (*fx).rmouse {
+            // a finger that lifts is an UP record, not a leave
+        } else if routed {
+            let c: u32 = fuiwirt.host_pointer(w, fuiwirt.PE_LEAVE, 1 as u32,
+                event.PT_MOUSE, true, x, y, now_ms())
+        } else {
+            let c: u32 = fuiwirt.host_pointer_leave(w)
+        }
     } else if k == window.EV_BUTTON {
-        let c: u32 = fuiwirt.host_pointer_down(w, x, y, a)
-        // Ohne Loslassen von der Rueckwand ist ein Klick das Druecken
-        // allein -- ehrlich schlechter, aber bedienbar.
-        if !(*fx).full && a == fuiwirt.BTN_LEFT {
-            let c2: u32 = fuiwirt.host_pointer_up(w, x, y, a)
+        if a == fuiwirt.BTN_LEFT && (*fx).rmouse {
+            // comes as a record
+        } else if a == fuiwirt.BTN_LEFT && routed {
+            let c: u32 = fuiwirt.host_pointer(w, fuiwirt.PE_DOWN, 1 as u32,
+                event.PT_MOUSE, true, x, y, now_ms())
+            if !(*fx).full {
+                let c2: u32 = fuiwirt.host_pointer(w, fuiwirt.PE_UP, 1 as u32,
+                    event.PT_MOUSE, true, x, y, now_ms())
+            }
+        } else {
+            let c: u32 = fuiwirt.host_pointer_down(w, x, y, a)
+            // Without release from the back end a click is the press
+            // alone -- honestly worse, but operable.
+            if !(*fx).full && a == fuiwirt.BTN_LEFT {
+                let c2: u32 = fuiwirt.host_pointer_up(w, x, y, a)
+            }
         }
     } else if k == window.EV_RELEASE {
-        let c: u32 = fuiwirt.host_pointer_up(w, x, y, a)
+        if a == fuiwirt.BTN_LEFT && (*fx).rmouse {
+            // comes as a record
+        } else if a == fuiwirt.BTN_LEFT && routed {
+            let c: u32 = fuiwirt.host_pointer(w, fuiwirt.PE_UP, 1 as u32,
+                event.PT_MOUSE, true, x, y, now_ms())
+        } else {
+            let c: u32 = fuiwirt.host_pointer_up(w, x, y, a)
+        }
     } else if k == window.EV_KEY {
         if a == window.K_ESCAPE && (*fx).esc_zu {
             return false
@@ -419,9 +539,9 @@ fn fork(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
     return true
 }
 
-// DIE SCHLEIFE. `male(ud, fx)` malt die Seite in `fenster_canvas(fx)`
-// (Groesse fenster_w/h); `aktion(ud, fx, knoten)` erfaehrt, welcher
-// Knoten ausgeloest wurde. Kehrt zurueck, wenn das Fenster zu ist.
+// THE LOOP. `male(ud, fx)` paints the page into `fenster_canvas(fx)`
+// (size fenster_w/h); `aktion(ud, fx, knoten)` learns which
+// node was triggered. Returns when the window is closed.
 fn window_run(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
     times: fn(u64, *mut Window), aktion: fn(u64, *mut Window, usize),
     ud: u64) {
@@ -429,8 +549,8 @@ fn window_run(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
     var runs: bool = true
     while runs {
         let ms: i64 = fuiwirt.host_wait_ms(w)
-        // Im Protokoll: wie lange die Schleife jetzt schlafen WILL (-1 =
-        // bis ein Ereignis kommt). Das ist der Beleg fuer den Leerlauf.
+        // In the log: how long the loop now WANTS to sleep (-1 =
+        // until an event comes). That is the proof for idling.
         var dn: [u8; 5] = "warte"
         line(fx, (&dn[0]) as u64, 5, ms, now_ms(), 0, 0)
         if ms != 0 {
@@ -451,6 +571,12 @@ fn window_step(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
     ud: u64) -> bool {
     let f: *mut window.Window = &(*fx).f
     var runs: bool = true
+    if (*fx).real {
+        var pr: pointers.Pointer = pointers.ptr_blank()
+        while window.next_pointer(f, (&pr) as u64) {
+            pointer_record(fx, w, &pr)
+        }
+    }
     var k: u32 = window.next_event(f)
     while k != window.EV_NONE && runs {
         if !fork(fx, w, m, k) {
@@ -473,7 +599,7 @@ fn window_step(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
         var q3: i64 = q0
         var q1: i64 = q0
         if (*fx).gpu_an {
-            // AUF DER GPU: malen, eine Kopie auf den Schirm, tauschen
+            // ON THE GPU: paint, one copy onto the screen, swap
             var pl: [u64; 4] = [0; 4]
             window.gpu_place(f, (&pl[0]) as u64)
             gpu.gpu_frame_begin(&(*fx).gp, pl[2] as i32, pl[3] as i32)
@@ -485,8 +611,8 @@ fn window_step(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
             let ok3: bool = window.gpu_swap(f)
             q3 = now_ms()
             if window.gpu_lost(f) {
-                // der Kontext ist weg und mit ihm jedes GL-Objekt: neu
-                // aufmachen, und alles wird noch einmal gemalt
+                // the context is gone and with it every GL object: open
+                // anew, and everything is painted once more
                 gpu_start(fx)
                 fuiwirt.host_touch(w)
             }
@@ -500,9 +626,9 @@ fn window_step(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
             let ok2: bool = window.present(f)
             q3 = now_ms()
         }
-        // Wo die Zeit eines Bildes bleibt: fUi malen, RGBA->BGRX,
-        // PutImage -- in ms. Gemessen, damit niemand die Plattform
-        // verdaechtigt, wenn der Rasterer langsam ist (und umgekehrt).
+        // Where the time of a frame goes: paint fUi, RGBA->BGRX,
+        // PutImage -- in ms. Measured, so that nobody suspects the platform
+        // when the rasteriser is slow (and the other way round).
         var tn: [u8; 4] = "zeit"
         line(fx, (&tn[0]) as u64, 4, q1 - q0, q2 - q1, q3 - q2, 0)
         fuiwirt.host_painted(w)
@@ -511,9 +637,9 @@ fn window_step(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
         line(fx, (&nm[0]) as u64, 4, (*fx).images as i64,
             (*fx).w as i64, (*fx).h as i64,
             theme.theme_scale(m) as i64)
-        // Nach dem Anordnen kann unter dem stehenden Zeiger ein
-        // anderer Knoten liegen (gerollt) -- das zieht der Wirt nach,
-        // und dann wird noch einmal gemalt.
+        // After arranging, a different node may lie under the standing
+        // pointer (scrolled) -- the host catches up with that,
+        // and then painting happens once more.
         let c: u32 = fuiwirt.host_after_layout(w)
     }
     return window.is_open(f)

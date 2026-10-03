@@ -728,12 +728,12 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             break;
         }
     }
-    // RUNDE TEMPO 10 -- GANZ ZUM SCHLUSS, UND NUR EINMAL.
+    // ROUND TEMPO 10 -- VERY LAST, AND ONLY ONCE.
     //
-    // `split` setzt Kopien ein, die der Zuteiler braucht und jeder andere
-    // Pass fuer Unsinn haelt: `copyprop` wuerde sie in derselben Runde
-    // wieder wegpropagieren, `cse` sie zusammenlegen. Er steht deshalb
-    // hinter der Schleife und laeuft genau einmal.
+    // `split` inserts copies that the allocator needs and every other
+    // pass takes for nonsense: `copyprop` would propagate them away again in the same
+    // round, `cse` would merge them. It therefore stands
+    // behind the loop and runs exactly once.
 }
 
 // ----------------------------------------------- common subexpressions (CSE) ---
@@ -1162,22 +1162,22 @@ fn const_map(f: &Func) -> HashMap<Val, i128> {
     m
 }
 
-/// RUNDE TEMPO -- `+% -% *%` IST GEWOEHNLICHE RECHNUNG.
+/// ROUND TEMPO -- `+% -% *%` IS ORDINARY ARITHMETIC.
 ///
-/// `Op::BinWrapSat { kind: Wrap, .. }` und `Op::Bin` bedeuten im FIR DASSELBE:
-/// beide behalten die unteren Bits, beide pruefen nichts (gepruefte Rechnung
-/// heisst `Op::CheckedBin`). Der Unterschied war rein syntaktisch -- das eine
-/// stand im Quelltext als `+%`, das andere kam aus `+` in `release-fast`.
+/// `Op::BinWrapSat { kind: Wrap, .. }` and `Op::Bin` mean THE SAME in FIR:
+/// both keep the lower bits, neither checks anything (checked arithmetic
+/// is called `Op::CheckedBin`). The difference was purely syntactic -- one
+/// stood in the source as `+%`, the other came from `+` in `release-fast`.
 ///
-/// Das hatte einen messbaren Preis: JEDE Optimierung fragt nach `Op::Bin` --
-/// gemeinsame Teilausdruecke, Schleifeninvarianten, die algebraischen
-/// Kuerzungen und vor allem das FALTEN VON ADRESSEN in den Befehl
-/// (`regalloc::foldable_addresses`). Ein `+%` lief an allen vorbei: aus
-/// `p +% i *% 4` wurden `mov`+`add`+`mov` und ein eigener Zugriff, statt
-/// eines einzigen `movss [base+idx*4]`.
+/// That had a measurable price: EVERY optimisation asks for `Op::Bin` --
+/// common subexpressions, loop invariants, the algebraic
+/// simplifications and above all FOLDING ADDRESSES into the instruction
+/// (`regalloc::foldable_addresses`). A `+%` bypassed all of them: `p +% i *% 4`
+/// became `mov`+`add`+`mov` and an access of its own, instead of
+/// a single `movss [base+idx*4]`.
 ///
-/// Diese Umschrift macht aus dem einen das andere, einmal vor allen Pässen.
-/// `Sat` bleibt unberuehrt -- das Abschneiden ist wirklich etwas anderes.
+/// This rewrite turns the one into the other, once before all passes.
+/// `Sat` stays untouched -- clamping really is something different.
 fn canon_wrap(f: &mut Func) -> bool {
     let mut changed = false;
     for b in f.blocks.iter_mut() {
@@ -1212,12 +1212,12 @@ fn fold_constants(f: &mut Func, st: &mut OptStats) -> bool {
             // integer wise and would turn `1.5 + 1.5` into silent nonsense.
             // Folding floating point needs its own evaluation that is
             // faithful to rounding — that comes with `comptime` (SPEC §8.6).
-            // RUNDE TEMPO -- die EINE Ausnahme: das Vorzeichen einer
-            // Gleitzahl-Konstante. Es ist ein Bit, kein Rechenschritt; das
-            // Kippen ist exakt, fuer jede Zahl, auch fuer 0 und NaN. Ohne
-            // diese Regel stand `-32767.5f` als Rechnung im Programm
-            // (Konstante laden, Vorzeichenmaske laden, xor) -- gemessen im
-            // Tondekoder, in der innersten Schleife.
+            // ROUND TEMPO -- the ONE exception: the sign of a
+            // floating-point constant. It is a bit, not a calculation step; the
+            // flipping is exact, for every number, also for 0 and NaN. Without
+            // this rule `-32767.5f` stood in the program as a calculation
+            // (load constant, load sign mask, xor) -- measured in the
+            // sound decoder, in the innermost loop.
             if ty.is_float() {
                 if let Op::Un(crate::fir::UnOp::Neg, x) = op {
                     if let Some(&c) = consts.get(&x) {

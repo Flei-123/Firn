@@ -131,7 +131,7 @@ a library.
 | Optimizer + measured comparison against Rust | **done, target missed**: median 2.8x-3.4x instead of <= 2x |
 | `secret[T]`, `#[constant_time]`, `u128` | **not started** |
 | `Rc`/`Gc`/`gc class`/`#[no_gc]` | **not started** |
-| `break`/`continue`, `for` | done; `defer`, `drop`, move checker, reference types: not started |
+| `break`/`continue`, `for`, `..=`, `defer`, reference parameters (`&T`/`inout T`, also in generics, methods, closures), `drop` + a conservative move checker | done (rounds REF, REF2, REF3, OWN); open: exclusivity across statements (borrow checker), `drop` for `gc class`/`Rc[T]`, moves in `defer`, port to `firnc1` |
 | Acid test 1 (HTML5 tokenizer) | **not started -- 0 of 6,810 cases** |
 | Acid test 2 (DOM soak test) | **not started** |
 | Test runner with machine-readable output (`W2`) | **done** (`tools/testrunner`, JSON) |

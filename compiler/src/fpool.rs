@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
-//! **Der Vorrat der Gleitzahl-Konstanten** (Runde TEMPO 6).
+//! **The pool of floating-point constants** (round TEMPO 6).
 //!
-//! ## Warum es ihn gibt
+//! ## Why it exists
 //!
-//! SSE hat keine Form mit unmittelbarer Konstante. Bis hierher baute der
-//! Erzeuger jede Gleitzahl-Konstante zur Laufzeit auf:
+//! SSE has no form with an immediate constant. Until now the generator
+//! built every floating-point constant at run time:
 //!
 //! ```text
 //!     mov  eax, 0x3f000000
@@ -13,30 +13,30 @@
 //!     mulss xmm9, xmm10
 //! ```
 //!
-//! Das kostet zwei Befehle **und ein Register**, solange die Konstante
-//! gebraucht wird. In `l3_dct3_9` des Tondekoders sind das sechs Konstanten
-//! -- also sechs der zwoelf `xmm`, die der Zuteiler zu vergeben hat.
+//! That costs two instructions **and a register** for as long as the constant
+//! is needed. In `l3_dct3_9` of the sound decoder these are six constants
+//! -- that is, six of the twelve `xmm` that the allocator has to hand out.
 //!
-//! C macht es anders und besser: die Konstante steht in `.rodata` und ist der
-//! SPEICHEROPERAND der Rechnung.
+//! C does it differently and better: the constant lives in `.rodata` and is the
+//! MEMORY OPERAND of the calculation.
 //!
 //! ```text
 //!     mulss xmm8, dword ptr [rip + .Lfc3]
 //! ```
 //!
-//! Ein Befehl, kein Register. Genau das steht hier: eine Tabelle je
-//! Uebersetzungseinheit, ein Eintrag je Bitmuster und Breite, und die
-//! Adressierung relativ zum Befehlszeiger (`rip`), damit das Programm an
-//! jeder Stelle im Speicher liegen darf.
+//! One instruction, no register. Exactly that is what stands here: one table per
+//! translation unit, one entry per bit pattern and width, and the
+//! addressing relative to the instruction pointer (`rip`), so that the program may lie
+//! anywhere in memory.
 
 use std::cell::RefCell;
 
 thread_local! {
-    /// (Bitmuster, einfach genau?) in der Reihenfolge des ersten Auftretens.
+    /// (bit pattern, single precision?) in the order of first occurrence.
     static POOL: RefCell<Vec<(u64, bool)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Alles vergessen (eine Uebersetzungseinheit je Lauf).
+/// Forget everything (one translation unit per run).
 pub fn reset() {
     POOL.with(|p| p.borrow_mut().clear());
 }
@@ -46,7 +46,7 @@ pub fn any() -> bool {
     POOL.with(|p| !p.borrow().is_empty())
 }
 
-/// Traegt das Bitmuster ein (oder findet es wieder) und liefert die Marke.
+/// Enters the bit pattern (or finds it again) and returns the label.
 pub fn intern(bits: u64, single: bool) -> String {
     POOL.with(|p| {
         let mut p = p.borrow_mut();
@@ -66,13 +66,13 @@ fn label_of(i: usize) -> String {
     format!(".Lfconst{}", i)
 }
 
-/// Der Speicheroperand fuer eine Marke -- `rip`-relativ, damit das Programm
-/// verschieblich bleibt.
+/// The memory operand for a label -- `rip`-relative, so that the program stays
+/// relocatable.
 pub fn operand(label: &str, single: bool) -> String {
     format!("{} ptr [rip + {}]", if single { "dword" } else { "qword" }, label)
 }
 
-/// Der Abschnitt `.rodata` mit allen Eintraegen.
+/// The `.rodata` section with all entries.
 pub fn rodata_asm() -> String {
     let mut out = String::new();
     POOL.with(|p| {

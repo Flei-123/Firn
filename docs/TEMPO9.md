@@ -1,25 +1,25 @@
-# Runde TEMPO 9 — die Schleife, die nur Nullen schreibt
+# Round TEMPO 9 — the loop that only writes zeros
 
-Stand 23.09.2026, Zweig `xmm-ra`. Eine kleine Runde mit einem grossen
-Ergebnis, und sie steht hier vor allem wegen der Messung, die sie ausgeloest
-hat.
+State 23.09.2026, branch `xmm-ra`. A small round with a big
+result, and it stands here above all because of the measurement that it
+triggered.
 
-## Die Messung: je Adresse, nicht je Funktion
+## The measurement: per address, not per function
 
-Bis TEMPO 8 wurde je FUNKTION gezaehlt. Das reicht, solange der Aufwand
-gleichmaessig verteilt ist — und verdeckt alles andere. Diese Runde zaehlt
-mit `valgrind --tool=callgrind --dump-instr=yes` **je Adresse** und ordnet
-die Adressen ueber die **Symboltabelle** (`nm`) zu.
+Until TEMPO 8 counting was done per FUNCTION. That suffices as long as the effort
+is evenly distributed — and hides everything else. This round counts
+with `valgrind --tool=callgrind --dump-instr=yes` **per address** and assigns
+the addresses via the **symbol table** (`nm`).
 
-Die Zuordnung ueber das Disassemblat, die zuerst dastand, liess ein Viertel
-der Befehle unter `??` liegen — und ausgerechnet dort lag das Ergebnis. Der
-Grund: die Positionen in der callgrind-Datei sind ueberwiegend relativ, ein
-einziger nicht verstandener Eintrag verschiebt alle folgenden um ein paar
-Oktette, und ein Vergleich auf Gleichheit trifft dann nichts mehr. Ueber die
-Symboltabelle ist die Funktion trotzdem eindeutig; fuer die Frage "welche
-SORTE Befehl" genuegt der naechste Befehl davor.
+The assignment via the disassembly, which stood there first, left a quarter
+of the instructions under `??` — and of all places the result lay there. The
+reason: the positions in the callgrind file are mostly relative, a
+single entry that is not understood shifts all following ones by a few
+octets, and a comparison for equality then hits nothing any more. Via the
+symbol table the function is unambiguous anyway; for the question "which
+KIND of instruction" the next instruction before it suffices.
 
-Damit sah der MP3-Dekoder (8 s Ton, 160,6 Mio Befehle) so aus:
+With that the MP3 decoder (8 s of sound, 160.6 M instructions) looked like this:
 
 | Funktion | Befehle | Anteil |
 |---|---|---|
@@ -28,22 +28,22 @@ Damit sah der MP3-Dekoder (8 s Ton, 160,6 Mio Befehle) so aus:
 | `l3_imdct36` | 19,7 Mio | 12 % |
 | **`mp3_decode_frame`** | **17,2 Mio** | **11 %** |
 
-`mp3_decode_frame` entscheidet nichts und rechnet nichts — es liest den
-Rahmenkopf und ruft die anderen. Elf Prozent konnten dort nicht stimmen.
+`mp3_decode_frame` decides nothing and calculates nothing — it reads the
+frame header and calls the others. Eleven percent could not be right there.
 
 ## Was dort stand
 
 ```text
 2848362   cmp   $0x1200,%rdx
-2848362   jae   fertig
-2848362   mov   -0x8b0(%rbp),%r11      ; den Zeiger JEDES MAL neu holen
+2848362   jae   done
+2848362   mov   -0x8b0(%rbp),%r11      ; fetch the pointer anew EVERY TIME
 2848362   movb  $0x0,(%r11,%rdx,1)
 2847744   lea   0x1(%rdx),%rdx
-          jmp   kopf
+          jmp   head
 ```
 
-Das ist `rt.mem_set((&(*s).grbuf[0][0]) as u64, 0, 576 * 2 * 4)` — einmal je
-Granulat, 4608 Oktette. `rt.mem_set` ist in Firn geschrieben:
+That is `rt.mem_set((&(*s).grbuf[0][0]) as u64, 0, 576 * 2 * 4)` — once per
+granule, 4608 octets. `rt.mem_set` is written in Firn:
 
 ```firn
 fn mem_set(target: u64, value: u8, n: usize) {
@@ -55,12 +55,12 @@ fn mem_set(target: u64, value: u8, n: usize) {
 }
 ```
 
-Richtig, ueberall verwendbar — und **fuenf Befehle je Oktett**. 14,2 von
-160,6 Millionen Befehlen, nur um ein Feld auf null zu setzen.
+Correct, usable everywhere — and **five instructions per octet**. 14.2 of
+160.6 million instructions, only to set an array to zero.
 
-## Was gebaut wurde
+## What was built
 
-Ein neuer Pass `memset` (`compiler/src/memset.rs`). Er erkennt in FIR
+A new pass `memset` (`compiler/src/memset.rs`). It recognises in FIR
 
 ```text
 P:    br H
@@ -73,52 +73,52 @@ B:    %a = add %base, %i
       br H
 ```
 
-und macht daraus `secure_zero(%base, %n)` im Vorkopf plus `br X`.
+and turns it into `secure_zero(%base, %n)` in the pre-header plus `br X`.
 
-**Warum `secure_zero` und kein neuer Befehl:** `Op::SecureZero` gibt es seit
-`secure_zero(inout buf)` in allen drei Erzeugern — x86 `rep stosb`, aarch64
-achtbyteweise. Es tut exakt das Verlangte, und "eine Frage, eine Antwort"
-heisst hier: keinen zweiten Befehl fuer dieselbe Sache erfinden. Dass
-`secure_zero` zusaetzlich verspricht, nie wegoptimiert zu werden, ist fuer
-diesen Fall staerker als noetig und darum unschaedlich.
+**Why `secure_zero` and no new instruction:** `Op::SecureZero` has existed since
+`secure_zero(inout buf)` in all three generators — x86 `rep stosb`, aarch64
+eight bytes at a time. It does exactly what is demanded, and "one question, one answer"
+means here: do not invent a second instruction for the same thing. That
+`secure_zero` additionally promises never to be optimised away is
+stronger than necessary for this case and therefore harmless.
 
-## Die Bedingungen — eine davon ist gefaehrlich
+## The conditions — one of them is dangerous
 
-Alle stehen im Dateikopf von `memset.rs`. Die wichtigste:
+All stand in the file head of `memset.rs`. The most important:
 
-> **Der Vergleich muss VORZEICHENLOS sein.**
+> **The comparison must be UNSIGNED.**
 
-Bei `i64` kann `n` negativ sein. Die Schleife laeuft dann null Mal.
-`rep stosb` mit `rcx = -1` schreibt den halben Adressraum voll. Das ist kein
-theoretischer Unterschied, sondern der zwischen "nichts tun" und "Rechner
-weg" — und ein Modultest (`the_signed_comparison_stays_a_loop`) haelt ihn
-fest.
+With `i64`, `n` can be negative. The loop then runs zero times.
+`rep stosb` with `rcx = -1` fills half the address space. That is no
+theoretical difference, but the one between "do nothing" and "machine
+gone" — and a module test (`the_signed_comparison_stays_a_loop`) pins it
+down.
 
-Die uebrigen: Rumpf mit genau drei Anweisungen (jede weitere waere eine
-Wirkung, die `rep stosb` nicht hat), Wert konstant 0 und ein Oktett breit,
-Anfang 0, Schrittweite 1, `base` und `n` ausserhalb definiert, nichts aus der
-Schleife wird draussen gelesen. Und: feste Laengen unter sechzehn Oktetten
-bleiben Schleife, weil `rep stosb` eine Anlaufzeit von einigen Dutzend Takten
-hat.
+The others: body with exactly three instructions (every further one would be an
+effect that `rep stosb` does not have), value constant 0 and one octet wide,
+start 0, step 1, `base` and `n` defined outside, nothing from the
+loop is read outside. And: fixed lengths under sixteen octets
+stay a loop, because `rep stosb` has a start-up time of a few dozen
+cycles.
 
-## Das Ergebnis
+## The result
 
-| | Befehle (8 s Ton) |
+| | Instructions (8 s of sound) |
 |---|---|
-| nach TEMPO 8 | 160,6 Mio |
-| **nach TEMPO 9** | **146,3 Mio** |
+| after TEMPO 8 | 160.6 M |
+| **after TEMPO 9** | **146.3 M** |
 
-`mp3_decode_frame` faellt von 17,2 auf 3,0 Mio. Die PCM-Ausgabe ist
-bitgleich. `tests/1700_memset_schleife.fi` prueft die Raender: genau `n`
-Oktette null, davor und dahinter unberuehrt, Laenge 0 schreibt nichts, ein
-Wert ungleich null bleibt eine Schleife, und eine erst zur Laufzeit bekannte
-Laenge funktioniert genauso — der letzte Punkt ist der wichtigste, weil der
-Uebersetzer eine feste Laenge auch ganz ausrechnen koennte.
+`mp3_decode_frame` falls from 17.2 to 3.0 M. The PCM output is
+bit-identical. `tests/1700_memset_loop.fi` checks the edges: exactly `n`
+octets zero, before and behind untouched, length 0 writes nothing, a
+value not equal to zero stays a loop, and a length known only at run time
+works just the same — the last point is the most important, because the
+translator could also calculate a fixed length away entirely.
 
 ## Was daneben liegen blieb
 
-`rt.mem_copy` ist dieselbe Schleife mit einem Lesen dazu und steht mit 3,5
-Mio Befehlen da. Dafuer gibt es `Op::CopyMem` (`rep movsb`) — aber dessen
-Groesse ist eine KONSTANTE im Befehl, keine Laufzeitgroesse, und die Frage
-nach ueberlappenden Bereichen ist eine andere als bei einem Nullsetzen. Das
-waere eine eigene Runde mit eigener Messung.
+`rt.mem_copy` is the same loop with a read added and stands at 3.5
+M instructions. For that there is `Op::CopyMem` (`rep movsb`) — but its
+size is a CONSTANT in the instruction, not a run-time size, and the question
+of overlapping areas is a different one than with zeroing. That
+would be a round of its own with a measurement of its own.

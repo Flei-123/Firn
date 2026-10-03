@@ -307,8 +307,8 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
             load_full(e, fr, B, args[0]);
             e.line(&format!("str {}, [{}]", qn(VA), B));
         }
-        // RUNDE TEMPO 7: nur die untere Haelfte -- `d<n>` ist das
-        // Acht-Oktett-Gesicht desselben Registers.
+        // ROUND TEMPO 7: only the lower half -- `d<n>` is the
+        // eight-octet face of the same register.
         SimdKind::Store64 => {
             vload(e, fr, VA, args[1]);
             load_full(e, fr, B, args[0]);
@@ -370,15 +370,15 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
         SimdKind::Add32 => bin(e, fr, "add", "4s", need(dst)?, args[0], args[1]),
         SimdKind::Add64 => bin(e, fr, "add", "2d", need(dst)?, args[0], args[1]),
         SimdKind::Sub32 => bin(e, fr, "sub", "4s", need(dst)?, args[0], args[1]),
-        // RUNDE TEMPO 4: vier `f32` auf einmal. NEON schreibt die Breite an
-        // den Befehl, x86 in den Namen -- dasselbe Rechnen.
+        // ROUND TEMPO 4: four `f32` at once. NEON writes the width on
+        // the instruction, x86 in the name -- the same calculation.
         SimdKind::AddF32 => bin(e, fr, "fadd", "4s", need(dst)?, args[0], args[1]),
         SimdKind::SubF32 => bin(e, fr, "fsub", "4s", need(dst)?, args[0], args[1]),
         SimdKind::MulF32 => bin(e, fr, "fmul", "4s", need(dst)?, args[0], args[1]),
-        // RUNDE TEMPO 5. `fcvtzs` schneidet zur Null hin ab wie `cvttps2dq`,
-        // `scvtf` wandelt zurueck. Bei den Vergleichen dreht NEON die
-        // Operanden um (`fcmgt d, b, a` ist `a < b`), und `cmpnlt` ist die
-        // Verneinung von `fcmlt` -- deshalb steht sie hier ausgeschrieben.
+        // ROUND TEMPO 5. `fcvtzs` truncates towards zero like `cvttps2dq`,
+        // `scvtf` converts back. For the comparisons NEON swaps the
+        // operands (`fcmgt d, b, a` is `a < b`), and `cmpnlt` is the
+        // negation of `fcmlt` -- that is why it is written out here.
         SimdKind::TruncF32I32 => {
             let d = need(dst)?;
             vload(e, fr, VA, args[0]);

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
-//! **Runde TEMPO 9 — die Schleife, die nur Nullen schreibt.**
+//! **Round TEMPO 9 — the loop that only writes zeros.**
 //!
-//! ## Warum es diesen Pass gibt
+//! ## Why this pass exists
 //!
-//! `rt.mem_set` ist in Firn geschrieben, und zwar so:
+//! `rt.mem_set` is written in Firn, and like this:
 //!
 //! ```firn
 //! fn mem_set(target: u64, value: u8, n: usize) {
@@ -15,81 +15,81 @@
 //! }
 //! ```
 //!
-//! Das ist richtig und ueberall verwendbar — und es kostet **fuenf Befehle
-//! je Oktett**. Gemessen am MP3-Dekoder (`callgrind`, 8 s Ton): der Aufruf
-//! `mem_set(grbuf, 0, 4608)` einmal je Granulat steht fuer **14,2 von 160,6
-//! Millionen Befehlen, also neun Prozent des ganzen Programms** — und zwar
-//! nur, um ein Feld auf null zu setzen.
+//! That is correct and usable everywhere — and it costs **five instructions
+//! per octet**. Measured on the MP3 decoder (`callgrind`, 8 s of sound): the call
+//! `mem_set(grbuf, 0, 4608)` once per granule accounts for **14.2 of 160.6
+//! million instructions, that is nine percent of the whole program** — and only
+//! to set an array to zero.
 //!
 //! ```text
 //!   cmp   $0x1200,%rdx
-//!   jae   fertig
-//!   mov   -0x8b0(%rbp),%r11     ; den Zeiger JEDES MAL neu holen
+//!   jae   done
+//!   mov   -0x8b0(%rbp),%r11     ; fetch the pointer anew EVERY TIME
 //!   movb  $0x0,(%r11,%rdx,1)
 //!   lea   0x1(%rdx),%rdx
-//!   jmp   kopf
+//!   jmp   head
 //! ```
 //!
-//! x86 hat dafuer einen Befehl (`rep stosb`), aarch64 eine kurze Schleife in
-//! Achtbytes. Beide stehen im Erzeuger laengst — als `Op::SecureZero`, das
-//! `secure_zero(inout buf)` bedient. Es tut **genau** das, was hier gebraucht
-//! wird: `size` Oktette ab `addr` auf null. Der Pass muss die Schleife also
-//! nur wiedererkennen und durch diese eine Anweisung ersetzen.
+//! x86 has an instruction for this (`rep stosb`), aarch64 a short loop in
+//! eight-byte units. Both have long stood in the generator — as `Op::SecureZero`, which
+//! serves `secure_zero(inout buf)`. It does **exactly** what is needed
+//! here: `size` octets from `addr` to zero. So the pass only has
+//! to recognise the loop and replace it with this one instruction.
 //!
-//! ## Das Muster
+//! ## The pattern
 //!
-//! Nach `mem2reg` und `licm` sieht die Schleife in FIR immer gleich aus:
+//! After `mem2reg` and `licm` the loop in FIR always looks the same:
 //!
 //! ```text
-//! P:    ...                          <- Vorkopf
+//! P:    ...                          <- pre-header
 //!       br H
 //! H:    %i = phi [P %null, B %i2]
 //!       %c = cmp.lt.uXX %i, %n
 //!       brcond %c, B, X
 //! B:    %a = add %base, %i
-//!       store.u8 %wert, %a
-//!       %i2 = add %i, %eins
+//!       store.u8 %value, %a
+//!       %i2 = add %i, %one
 //!       br H
 //! ```
 //!
-//! Daraus wird `secure_zero(%base, %n)` im Vorkopf und `br X` in `H`; den
-//! Rest raeumt `dce` weg.
+//! From this becomes `secure_zero(%base, %n)` in the pre-header and `br X` in `H`; the
+//! rest is cleared away by `dce`.
 //!
-//! ## Die Bedingungen, und warum jede einzelne noetig ist
+//! ## The conditions, and why each single one is necessary
 //!
-//! * **Der Rumpf enthaelt GENAU diese drei Anweisungen.** Alles andere —
-//!   ein zweiter Speicherzugriff, ein Aufruf, ein Lesen — waere eine Wirkung,
-//!   die `rep stosb` nicht hat.
-//! * **Der geschriebene Wert ist die Konstante 0 und ein Oktett breit.**
-//!   `SecureZero` kann nur Nullen; ein `mem_set(p, 7, n)` bleibt die
-//!   Schleife.
-//! * **Der Vergleich ist VORZEICHENLOS.** Bei `i64` koennte `n` negativ
-//!   sein: die Schleife laeuft dann null Mal, `rep stosb` mit `rcx = -1`
-//!   schriebe dagegen den halben Adressraum voll. Das ist kein theoretischer
-//!   Fall, sondern der Unterschied zwischen "nichts tun" und "Rechner weg".
-//! * **`%base` und `%n` sind ausserhalb der Schleife definiert** (Parameter,
-//!   Konstante oder ein Block, der den Vorkopf beherrscht). Sonst gibt es sie
-//!   im Vorkopf noch gar nicht.
-//! * **Die Schrittweite ist genau 1 und der Anfang genau 0.** Nur dann
-//!   trifft die Schleife jedes Oktett von `base` bis `base+n` und keines
-//!   sonst.
-//! * **`%i`, `%i2` und `%a` werden ausserhalb der Schleife nicht gelesen.**
-//!   Der Endwert von `%i` waere `n`, aber das nachzureichen ist Arbeit fuer
-//!   einen Fall, den es im Bestand nicht gibt.
-//! * **Kleine konstante Laengen bleiben Schleife.** `rep stosb` hat auf
-//!   heutigen Prozessoren eine Anlaufzeit von einigen Dutzend Takten; unter
-//!   sechzehn Oktetten ist die Schleife schneller.
+//! * **The body contains EXACTLY these three instructions.** Anything else —
+//!   a second memory access, a call, a read — would be an effect
+//!   that `rep stosb` does not have.
+//! * **The written value is the constant 0 and one octet wide.**
+//!   `SecureZero` can only do zeros; a `mem_set(p, 7, n)` stays the
+//!   loop.
+//! * **The comparison is UNSIGNED.** With `i64`, `n` could be negative:
+//!   the loop then runs zero times, whereas `rep stosb` with `rcx = -1`
+//!   would fill half the address space. That is not a theoretical
+//!   case, but the difference between "do nothing" and "machine gone".
+//! * **`%base` and `%n` are defined outside the loop** (parameter,
+//!   constant or a block that dominates the pre-header). Otherwise they do not
+//!   exist in the pre-header yet.
+//! * **The step is exactly 1 and the start exactly 0.** Only then
+//!   does the loop hit every octet from `base` to `base+n` and no
+//!   other.
+//! * **`%i`, `%i2` and `%a` are not read outside the loop.**
+//!   The final value of `%i` would be `n`, but supplying that later is work for
+//!   a case that does not exist in the existing code.
+//! * **Small constant lengths stay a loop.** `rep stosb` has a
+//!   start-up time of a few dozen cycles on today's processors; below
+//!   sixteen octets the loop is faster.
 //!
-//! ## Was der Pass NICHT tut
+//! ## What the pass does NOT do
 //!
-//! Er erkennt kein `mem_copy` (dafuer gibt es `Op::CopyMem`, aber die
-//! Schleife dort liest UND schreibt, und die Frage nach Ueberlappung ist eine
-//! andere) und keinen Wert ausser null. Beides waere eine eigene Runde mit
-//! eigener Messung.
+//! It recognises no `mem_copy` (there is `Op::CopyMem` for it, but the
+//! loop there reads AND writes, and the question of overlap is a
+//! different one) and no value other than zero. Both would be a round of their own
+//! with a measurement of their own.
 
 use crate::fir::{BinOp, CmpOp, FTy, Func, Inst, Op, Term, Val};
 
-/// Laufen lassen; liefert die Anzahl der ersetzten Schleifen.
+/// Run it; returns the number of replaced loops.
 pub fn recognise(f: &mut Func) -> usize {
     let nb = f.blocks.len();
     if nb < 3 || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
@@ -106,7 +106,7 @@ pub fn recognise(f: &mut Func) -> usize {
         }
     }
     let dom = crate::mem2reg::dominators(f);
-    // Wo wird welcher Wert definiert? (Block, Anweisung)
+    // Where is which value defined? (block, instruction)
     let nv = f.val_types.len();
     let mut defblock: Vec<Option<usize>> = vec![None; nv];
     for (bi, b) in f.blocks.iter().enumerate() {
@@ -141,17 +141,17 @@ pub fn recognise(f: &mut Func) -> usize {
     }
     let count = plan.len();
     for (p, h, _b, base, n) in plan {
-        // Das Ziel der Schleife ist der Ausgang von `H`.
+        // The target of the loop is the exit of `H`.
         let x = match f.blocks[h].term {
             Term::BrCond { then_bb, else_bb, .. } => {
-                // `then` ist der Rumpf, also ist `else` der Ausgang.
+                // `then` is the body, so `else` is the exit.
                 let body = then_bb;
                 let _ = body;
                 else_bb
             }
             _ => continue,
         };
-        // `secure_zero` ans Ende des Vorkopfs, vor dessen Sprung.
+        // `secure_zero` at the end of the pre-header, before its jump.
         let loc = f.blocks[p].insts.last().map(|i| i.loc).unwrap_or_default();
         f.blocks[p].insts.push(Inst {
             dst: None,
@@ -164,7 +164,7 @@ pub fn recognise(f: &mut Func) -> usize {
     count
 }
 
-/// Passt an `h` das Muster? Liefert `(Vorkopf, Rumpf, base, n)`.
+/// Does the pattern fit at `h`? Returns `(pre-header, body, base, n)`.
 fn pattern(
     f: &Func,
     preds: &[Vec<usize>],
@@ -173,7 +173,7 @@ fn pattern(
     dom: &[Vec<bool>],
     h: usize,
 ) -> Option<(usize, usize, Val, Val)> {
-    // --- der Kopf: ein phi, ein Vergleich, ein bedingter Sprung ----------
+    // --- the head: one phi, one comparison, one conditional jump ---------
     let kb = &f.blocks[h];
     if kb.insts.len() != 2 {
         return None;
@@ -195,7 +195,7 @@ fn pattern(
         _ => return None,
     };
     let (i_val, inc) = iv;
-    // Der Vergleich: `i < n`, VORZEICHENLOS.
+    // The comparison: `i < n`, UNSIGNED.
     let (n_val, cmp_ty) = match (&kb.insts[1].op, kb.insts[1].dst) {
         (Op::Cmp { op: CmpOp::Lt, ty, a, b }, Some(d)) if d == cond && *a == i_val => (*b, *ty),
         _ => return None,
@@ -204,7 +204,7 @@ fn pattern(
         return None;
     }
 
-    // --- der Rumpf: genau drei Anweisungen, Sprung zurueck ---------------
+    // --- the body: exactly three instructions, jump back ----------------
     let rb = &f.blocks[body];
     if rb.insts.len() != 3 || !matches!(rb.term, Term::Br(t) if t as usize == h) {
         return None;
@@ -221,8 +221,8 @@ fn pattern(
         match (&inst.op, inst.dst) {
             (Op::Bin(BinOp::Add, a, b), Some(d)) if *a == i_val || *b == i_val => {
                 let other = if *a == i_val { *b } else { *a };
-                // Die Fortschaltung erkennt man daran, dass ihr Ergebnis auf
-                // der Rueckwaertskante des phi steht.
+                // The increment is recognised by its result being on
+                // the back edge of the phi.
                 if inc.iter().any(|(q, v)| *q as usize == body && *v == d) {
                     if step.is_some() {
                         return None;
@@ -251,7 +251,7 @@ fn pattern(
     if a_used != a_val {
         return None;
     }
-    // Ein Oktett je Durchlauf.
+    // One octet per iteration.
     if store_ty.bits() != 8 {
         return None;
     }
@@ -271,18 +271,18 @@ fn pattern(
     if const_of(f, v_val) != Some(0) {
         return None;
     }
-    // Der Vorkopf muss GENAU EIN Nachfolger haben (sein Sprung geht nach
-    // `h`), sonst schreibt das eingesetzte `secure_zero` auch auf dem Weg,
-    // der die Schleife nie betritt.
+    // The pre-header must have EXACTLY ONE successor (its jump goes to
+    // `h`), otherwise the inserted `secure_zero` also writes on the path
+    // that never enters the loop.
     if !matches!(f.blocks[p].term, Term::Br(t) if t as usize == h) {
         return None;
     }
-    // `h` hat genau zwei Vorgaenger: den Vorkopf und den Rumpf.
+    // `h` has exactly two predecessors: the pre-header and the body.
     if preds[h].len() != 2 || !preds[h].contains(&p) || !preds[h].contains(&body) {
         return None;
     }
 
-    // --- `base` und `n` gibt es im Vorkopf schon ------------------------
+    // --- `base` and `n` already exist in the pre-header ------------------
     for v in [base, n_val] {
         if (v as usize) < npar {
             continue; // Parameter
@@ -296,24 +296,24 @@ fn pattern(
             None => return None,
         }
     }
-    // Weder `base` noch `n` duerfen die Schleifenvariable sein.
+    // Neither `base` nor `n` may be the loop variable.
     if base == i_val || n_val == i_val || base == n_val {
         return None;
     }
 
-    // --- nichts aus der Schleife wird draussen gelesen -------------------
+    // --- nothing from the loop is read outside -----------------------------
     let mut buf = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         if bi == body {
             continue;
         }
         for inst in &b.insts {
-            // Der phi im Kopf liest die Fortschaltung -- das ist die
-            // Rueckwaertskante und zaehlt nicht.
+            // The phi in the head reads the increment -- that is the
+            // back edge and does not count.
             if bi == h && matches!(inst.op, Op::Phi { .. }) {
                 continue;
             }
-            // Der Vergleich im Kopf liest die Schleifenvariable.
+            // The comparison in the head reads the loop variable.
             if bi == h && inst.dst == Some(cond) {
                 continue;
             }
@@ -347,7 +347,7 @@ fn pattern(
     Some((p, body, base, n_val))
 }
 
-/// Wert einer Konstante, wenn der Wert eine ist.
+/// Value of a constant, if the value is one.
 fn const_of(f: &Func, v: Val) -> Option<i128> {
     for b in &f.blocks {
         for i in &b.insts {
@@ -427,15 +427,15 @@ mod tests {
         assert!(matches!(f.blocks[1].term, Term::Br(3)));
     }
 
-    /// DER GEFAEHRLICHE FALL: mit Vorzeichen laeuft die Schleife bei
-    /// negativem `n` null Mal -- `rep stosb` mit `rcx = -1` nicht.
+    /// THE DANGEROUS CASE: with a sign the loop runs zero times for
+    /// negative `n` -- `rep stosb` with `rcx = -1` does not.
     #[test]
     fn the_signed_comparison_stays_a_loop() {
         let mut f = loop_fn(true);
         assert_eq!(recognise(&mut f), 0);
     }
 
-    /// Ein zweiter Speicherzugriff im Rumpf ist keine Nullschleife mehr.
+    /// A second memory access in the body is no longer a zero loop.
     #[test]
     fn a_second_store_in_the_body_is_refused() {
         let mut f = loop_fn(false);

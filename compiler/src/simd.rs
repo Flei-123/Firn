@@ -119,10 +119,10 @@ pub enum SimdKind {
     // --- memory -------------------------------------------------------
     Load,
     Store,
-    /// RUNDE TEMPO 7: nur die UNTERE Haelfte schreiben (acht Oktette). Fuer
-    /// zwei benachbarte `f32`, wie sie die Synthesefilterbank paarweise
-    /// ablegt -- ein Sechzehn-Oktett-Schreiben wuerde die zwei daneben
-    /// mit zerstoeren.
+    /// ROUND TEMPO 7: write only the LOWER half (eight octets). For
+    /// two adjacent `f32`, as the synthesis filter bank stores them in
+    /// pairs -- a sixteen-octet write would destroy the two next to
+    /// them as well.
     Store64,
     // --- construction / extraction ------------------------------------
     Zero,
@@ -144,22 +144,22 @@ pub enum SimdKind {
     Add32,
     Add64,
     Sub32,
-    // --- RUNDE TEMPO 4: Fliesskomma, vier `f32` auf einmal ------------
+    // --- ROUND TEMPO 4: floating point, four `f32` at once ------------
     //
-    // Nur die drei Grundrechnungen, die der Tondekoder braucht, und sie
-    // rechnen JE SPUR genau das, was der einzelne Befehl auch rechnet
-    // (`addps` ist viermal `addss`) -- deshalb bleibt eine ausgerollte
-    // Schleife, die auf vier Spuren umgestellt wird, bitgleich.
+    // Only the three basic operations that the sound decoder needs, and they
+    // calculate PER LANE exactly what the single instruction calculates
+    // (`addps` is four times `addss`) -- therefore an unrolled
+    // loop that is switched to four lanes stays bit-identical.
     AddF32,
     SubF32,
     MulF32,
-    // RUNDE TEMPO 5: wandeln und vergleichen, damit aus vier Gleitzahlen
-    // vier ganze Zahlen werden koennen (`scale_pcm`).
+    // ROUND TEMPO 5: convert and compare, so that four floating-point numbers can
+    // become four integers (`scale_pcm`).
     //
-    // `TruncF32I32` schneidet zur Null hin ab -- genau das, was `as i32` in
-    // Firn tut. `CmpNltF32` ist NICHT die Verneinung von `CmpLtF32`: bei
-    // NaN sind beide Vergleiche "ungeordnet", und `cmpnltps` sagt dann WAHR.
-    // Genau das braucht die Nachbildung der einzelnen Fassung.
+    // `TruncF32I32` truncates towards zero -- exactly what `as i32` does in
+    // Firn. `CmpNltF32` is NOT the negation of `CmpLtF32`: with
+    // NaN both comparisons are "unordered", and `cmpnltps` then says TRUE.
+    // Exactly that is what the emulation of the single version needs.
     TruncF32I32,
     CvtI32F32,
     CmpLtF32,
@@ -541,11 +541,11 @@ const POOL: [&str; 12] = [
 /// own state, and a method would borrow the emitter twice.
 pub(crate) struct XmmCache {
     val: [Option<Val>; 12],
-    /// ROUND XMM2: Breite des Eintrags in Oktett -- 4 (`f32`), 8 (`f64`)
-    /// oder 16 (`v128`). Vorher konnte der Zwischenspeicher nur Vektoren und
-    /// hat alles mit `movdqa` bewegt; mit der Breite je Eintrag halten auch
-    /// SKALARE Fliesskommawerte ihr Register, und genau die kommen in jeder
-    /// Rechnung vor.
+    /// ROUND XMM2: width of the entry in octets -- 4 (`f32`), 8 (`f64`)
+    /// or 16 (`v128`). Before, the cache could only do vectors and
+    /// moved everything with `movdqa`; with the width per entry, SCALAR
+    /// floating-point values also hold their register, and those occur in every
+    /// calculation.
     wid: [u8; 12],
     /// Where the entry belongs when it is written back. For an ordinary
     /// value that is its frame slot, for a promoted cell the storage of its
@@ -555,8 +555,8 @@ pub(crate) struct XmmCache {
     used: [u64; 12],
     /// locked for the instruction currently being emitted
     lock: [bool; 12],
-    /// ROUND XMM2: laeuft gerade ein Ausspuelen? (Schutz gegen Rekursion,
-    /// weil `Emitter::line` das Ausspuelen selbst ausloest.)
+    /// ROUND XMM2: is a flush currently running? (Protection against recursion,
+    /// because `Emitter::line` triggers the flush itself.)
     flushing: bool,
     tick: u64,
     pub(crate) on: bool,
@@ -757,7 +757,7 @@ fn at(off: u64) -> String {
     format!("xmmword ptr [rbp-{}]", off)
 }
 
-/// Die Bewegungsanweisung zur Breite eines Eintrags.
+/// The move instruction for the width of an entry.
 fn mvr(w: u8) -> &'static str {
     match w {
         4 => "movss",
@@ -766,7 +766,7 @@ fn mvr(w: u8) -> &'static str {
     }
 }
 
-/// Der Speicheroperand zur Breite eines Eintrags.
+/// The memory operand for the width of an entry.
 fn at_w(off: u64, w: u8) -> String {
     let p = match w {
         4 => "dword",
@@ -776,11 +776,11 @@ fn at_w(off: u64, w: u8) -> String {
     format!("{} ptr [rbp-{}]", p, off)
 }
 
-/// ROUND XMM2 -- WER AUSSERHALB DIESES ZWISCHENSPEICHERS EINEN PLATZ LIEST,
-/// muss den gueltigen Inhalt vorfinden. Jeder Leseweg ueber ein
-/// GANZZAHLregister (`load_full`) ruft das hier zuerst: steht der Platz noch
-/// schmutzig in einem `xmm`, wird er geschrieben. Der Eintrag bleibt gueltig,
-/// nur eben nicht mehr schmutzig.
+/// ROUND XMM2 -- WHOEVER READS A SLOT OUTSIDE THIS CACHE
+/// must find the valid content. Every read path through an
+/// INTEGER register (`load_full`) calls this first: if the slot still stands
+/// dirty in an `xmm`, it is written. The entry stays valid,
+/// just no longer dirty.
 pub(crate) fn xsync_off(e: &mut Emitter, off: u64) {
     for k in 0..POOL.len() {
         if e.xmm.val[k].is_some() && e.xmm.dirty[k] && e.xmm.off[k] == off {
@@ -791,9 +791,9 @@ pub(crate) fn xsync_off(e: &mut Emitter, off: u64) {
     }
 }
 
-/// Das Gegenstueck: wer einen Platz UNMITTELBAR beschreibt (Ganzzahlweg,
-/// `store_dst`), macht den Zwischenspeicher-Eintrag ungueltig -- sonst
-/// liest die naechste Rechnung einen ueberholten Wert.
+/// The counterpart: whoever writes a slot DIRECTLY (integer path,
+/// `store_dst`) invalidates the cache entry -- otherwise the next
+/// calculation reads an outdated value.
 pub(crate) fn xkill_off(e: &mut Emitter, off: u64) {
     for k in 0..POOL.len() {
         if e.xmm.val[k].is_some() && e.xmm.off[k] == off {
@@ -806,8 +806,8 @@ pub(crate) fn xkill_off(e: &mut Emitter, off: u64) {
 /// Write every dirty register back into its home slot and forget everything.
 /// Called at the end of every basic block and in front of every `call`,
 /// `syscall`, `asm` and thread instruction.
-/// ROUND XMM2: Ausspuelen OHNE Rahmen -- fuer den Aufruf aus `Emitter::line`
-/// heraus, wo kein `Frame` zur Hand ist. `xflush` braucht ihn ohnehin nicht.
+/// ROUND XMM2: flush WITHOUT a frame -- for the call from `Emitter::line`
+/// where no `Frame` is at hand. `xflush` does not need it anyway.
 pub(crate) fn xflush_free(e: &mut Emitter) {
     if e.xmm.flushing {
         return;
@@ -962,11 +962,11 @@ fn xdef_at_w(e: &mut Emitter, fr: &Frame, d: Val, off: u64, w: u8) -> &'static s
     "xmm0"
 }
 
-// ---------------------------------------------------------- Fliesskomma ---
+// ---------------------------------------------------------- Floating point ---
 //
-// ROUND XMM2: dieselbe Buchfuehrung fuer `f32`/`f64`. Ein Wert, der in
-// derselben Grundblockfolge mehrfach gelesen wird, bleibt im Register --
-// vorher lief JEDE Rechnung ueber den Rahmenplatz.
+// ROUND XMM2: the same bookkeeping for `f32`/`f64`. A value that is read several times
+// in the same sequence of basic blocks stays in the register --
+// before, EVERY calculation went through the frame slot.
 
 pub(crate) fn xget_fp(e: &mut Emitter, fr: &Frame, v: Val, single: bool) -> &'static str {
     let off = fr.slot[v as usize];
@@ -978,7 +978,7 @@ pub(crate) fn xdef_fp(e: &mut Emitter, fr: &Frame, d: Val, single: bool) -> &'st
     xdef_at_w(e, fr, d, off, if single { 4 } else { 8 })
 }
 
-/// Bei abgeschaltetem Zwischenspeicher muss das Ergebnis sofort in den Platz.
+/// With the cache switched off the result must go into the slot immediately.
 pub(crate) fn xstore_fp(e: &mut Emitter, fr: &Frame, d: Val, r: &str, single: bool) {
     if !e.xmm.on {
         let w = if single { 4u8 } else { 8u8 };
@@ -987,7 +987,7 @@ pub(crate) fn xstore_fp(e: &mut Emitter, fr: &Frame, d: Val, r: &str, single: bo
     }
 }
 
-/// Register-zu-Register-Kopie eines Fliesskommawerts.
+/// Register-to-register copy of a floating-point value.
 pub(crate) fn xmove(e: &mut Emitter, to: &str, from: &str) {
     if to != from {
         e.line(&format!("movaps {}, {}", to, from));
@@ -1295,13 +1295,13 @@ pub(crate) fn emit_ptr_store(e: &mut Emitter, fr: &Frame, addr: Val, val: Val) {
     e.line(&format!("movdqu xmmword ptr [rax], {}", rv));
 }
 
-/// RUNDE TEMPO 4 -- die KOPIE eines `v128`.
+/// ROUND TEMPO 4 -- the COPY of a `v128`.
 ///
-/// Sie entsteht, seit `mem2reg` auch Vektorvariablen befoerdert: aus den
-/// `phi`-Knoten macht `phi.rs` Kopien. Der Grundweg hatte dafuer nur den
-/// Ganzzahlweg (`mov rax`), und der haette die oberen acht Oktette liegen
-/// lassen. Hier geht sie durch den Zwischenspeicher, wie jede andere
-/// Vektoranweisung auch.
+/// It arises since `mem2reg` also promotes vector variables: from the
+/// `phi` nodes `phi.rs` makes copies. The basic path had only the
+/// integer path for this (`mov rax`), and that would have left the upper eight
+/// octets lying. Here it goes through the cache, like every other
+/// vector instruction.
 pub(crate) fn emit_copy_v128(e: &mut Emitter, fr: &Frame, d: Val, src: Val) {
     let r = xget(e, fr, src);
     let rd = xdef(e, fr, d);

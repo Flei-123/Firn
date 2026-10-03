@@ -45,6 +45,17 @@
 // cross-reference table, and a document ID computed from the content: the
 // same calls give the same octets (a creation date is only written when
 // `created_ms` is set).
+//
+// PDF/A-2b (`opts.pdfa`, ISO 19005-2, level B = visual reproducibility):
+// besides what is written anyway -- every font embedded and cut down, no
+// encryption, a document ID -- the file gets an XMP metadata stream (title,
+// author, subject, tool, dates as in the information dictionary, and the
+// pdfaid:part 2 / conformance B claim), an OutputIntent with the sRGB
+// profile of lib/pdf/srgb.fi (all colours are DeviceRGB, which PDF/A only
+// allows with such an intent), the /Name its optional content
+// configuration needs, and the print flag on every link annotation. Layers
+// stay: PDF/A-2 allows optional content. Checked against veraPDF in
+// tools/libmvp/check_pdf.py.
 
 import std.rt
 import std.vec
@@ -54,6 +65,7 @@ import std.md5
 import std.time
 import font.ttf
 import pdf.ttfsub
+import pdf.srgb
 
 export {
     Pdf, PdfOptions, PdfError,
@@ -96,10 +108,11 @@ struct PdfOptions {
     creator: str,
     created_ms: i64, // 0 = no creation date (reproducible output)
     compress: bool,
+    pdfa: bool, // PDF/A-2b: XMP metadata, an sRGB OutputIntent, ... (see THE FILE)
 }
 
 fn pdf_options_default() -> PdfOptions {
-    return PdfOptions { title: "", author: "", subject: "", creator: "", created_ms: 0, compress: true }
+    return PdfOptions { title: "", author: "", subject: "", creator: "", created_ms: 0, compress: true, pdfa: false }
 }
 
 struct Pdf {
@@ -1195,7 +1208,11 @@ fn pdf_finish(p: *mut Pdf) -> PdfError!usize {
         let num: u32 = obj_new(p)
         vec_push[u32](&ann_obj, num)
         obj_begin(p, num)
-        put(b, "<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect [")
+        put(b, "<< /Type /Annot /Subtype /Link /Border [0 0 0]")
+        if (*p).opts.pdfa {
+            put(b, " /F 4") // print: PDF/A wants the flags
+        }
+        put(b, " /Rect [")
         var q: usize = 0
         while q < 4 {
             if q > 0 { sp(b) }
@@ -1267,10 +1284,24 @@ fn pdf_finish(p: *mut Pdf) -> PdfError!usize {
     obj_end(p)
     // bookmarks
     let outlines: u32 = write_outlines(p)
+    // PDF/A: the XMP packet and the output intent
+    var meta: u32 = 0
+    var intent: u32 = 0
+    if (*p).opts.pdfa {
+        meta = write_xmp(p)
+        intent = write_intent(p)
+    }
     // catalog
     obj_begin(p, (*p).catalog)
     put(b, "<< /Type /Catalog /Pages ")
     put_ref(b, (*p).pages)
+    if meta != 0 {
+        put(b, " /Metadata ")
+        put_ref(b, meta)
+        put(b, " /OutputIntents [")
+        put_ref(b, intent)
+        put(b, "]")
+    }
     if outlines != 0 {
         put(b, " /Outlines ")
         put_ref(b, outlines)
@@ -1284,7 +1315,11 @@ fn pdf_finish(p: *mut Pdf) -> PdfError!usize {
             put_ref(b, vec_at[u32](&(*p).layer_obj, i))
             i = i + 1
         }
-        put(b, "] /D << /Order [")
+        put(b, "] /D << ")
+        if (*p).opts.pdfa {
+            put(b, "/Name (Default) ") // PDF/A: a configuration has a name
+        }
+        put(b, "/Order [")
         i = 0
         while i < vec_len[u32](&(*p).layer_obj) {
             if i > 0 { sp(b) }
@@ -1368,6 +1403,130 @@ fn pdf_finish(p: *mut Pdf) -> PdfError!usize {
     put_int(b, xref as i64)
     put(b, "\n%%EOF\n")
     return (*b).len - (*p).start
+}
+
+// ------------------------------------------------------------ PDF/A
+
+fn xml_text(b: *mut rt.Buf, s: str) {
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = rt.ld8(s.p as u64, i)
+        if c == 38 as u8 {
+            put(b, "&amp;")
+        } else if c == 60 as u8 {
+            put(b, "&lt;")
+        } else if c == 62 as u8 {
+            put(b, "&gt;")
+        } else if c == 34 as u8 {
+            put(b, "&quot;")
+        } else if c < 32 as u8 && c != 9 as u8 && c != 10 as u8 && c != 13 as u8 {
+            rt.buf_push(b, 32 as u8) // not allowed in XML 1.0
+        } else {
+            rt.buf_push(b, c)
+        }
+        i = i + 1
+    }
+}
+
+// <tag>text</tag>
+fn xml_elem(b: *mut rt.Buf, tag: str, text: str) {
+    put(b, "<")
+    put(b, tag)
+    put(b, ">")
+    xml_text(b, text)
+    put(b, "</")
+    put(b, tag)
+    put(b, ">")
+}
+
+// 2026-09-30T12:34:56Z
+fn xmp_date(b: *mut rt.Buf, ms: i64) {
+    let t: time.DateTime = time.civil_from_unix(ms)
+    put_int(b, t.year as i64)
+    var v: [u32; 5] = [t.month, t.day, t.hour, t.minute, t.second]
+    var i: usize = 0
+    while i < 5 {
+        if i == 0 || i == 1 {
+            put(b, "-")
+        } else if i == 2 {
+            put(b, "T")
+        } else {
+            put(b, ":")
+        }
+        if v[i] < 10 {
+            rt.buf_push(b, 48 as u8)
+        }
+        put_int(b, v[i] as i64)
+        i = i + 1
+    }
+    put(b, "Z")
+}
+
+// The XMP metadata stream (ISO 16684-1) of a PDF/A-2b file; its object
+// number. Not compressed: a reader that only looks for the packet finds it.
+fn write_xmp(p: *mut Pdf) -> u32 {
+    var x: rt.Buf = rt.buf_new()
+    put(&x, "<?xpacket begin=\"")
+    rt.buf_push(&x, 239 as u8) // the byte order mark EF BB BF, as the packet header wants it
+    rt.buf_push(&x, 187 as u8)
+    rt.buf_push(&x, 191 as u8)
+    put(&x, "\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n")
+    put(&x, "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n")
+    put(&x, "<rdf:Description rdf:about=\"\" xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\">")
+    put(&x, "<pdfaid:part>2</pdfaid:part><pdfaid:conformance>B</pdfaid:conformance></rdf:Description>\n")
+    put(&x, "<rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">")
+    if (*p).opts.title.n > 0 {
+        put(&x, "<dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">")
+        xml_text(&x, (*p).opts.title)
+        put(&x, "</rdf:li></rdf:Alt></dc:title>")
+    }
+    if (*p).opts.author.n > 0 {
+        put(&x, "<dc:creator><rdf:Seq><rdf:li>")
+        xml_text(&x, (*p).opts.author)
+        put(&x, "</rdf:li></rdf:Seq></dc:creator>")
+    }
+    if (*p).opts.subject.n > 0 {
+        put(&x, "<dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">")
+        xml_text(&x, (*p).opts.subject)
+        put(&x, "</rdf:li></rdf:Alt></dc:description>")
+    }
+    put(&x, "</rdf:Description>\n")
+    put(&x, "<rdf:Description rdf:about=\"\" xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\">")
+    xml_elem(&x, "pdf:Producer", "Firn lib/pdf")
+    put(&x, "</rdf:Description>\n")
+    put(&x, "<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\">")
+    if (*p).opts.creator.n > 0 {
+        xml_elem(&x, "xmp:CreatorTool", (*p).opts.creator)
+    }
+    if (*p).opts.created_ms != 0 {
+        put(&x, "<xmp:CreateDate>")
+        xmp_date(&x, (*p).opts.created_ms)
+        put(&x, "</xmp:CreateDate><xmp:ModifyDate>")
+        xmp_date(&x, (*p).opts.created_ms)
+        put(&x, "</xmp:ModifyDate>")
+    }
+    put(&x, "</rdf:Description>\n</rdf:RDF>\n</x:xmpmeta>\n<?xpacket end=\"w\"?>")
+    let num: u32 = obj_new(p)
+    put_stream(p, num, " /Type /Metadata /Subtype /XML", rt.buf_ptr(&x), rt.buf_len(&x), false)
+    rt.buf_free(&x)
+    return num
+}
+
+// The OutputIntent dictionary with the embedded sRGB profile; its object
+// number.
+fn write_intent(p: *mut Pdf) -> u32 {
+    var icc: rt.Buf = rt.buf_new()
+    srgb.srgb_icc(&icc)
+    let prof: u32 = obj_new(p)
+    put_stream(p, prof, " /N 3", rt.buf_ptr(&icc), rt.buf_len(&icc), true)
+    rt.buf_free(&icc)
+    let num: u32 = obj_new(p)
+    obj_begin(p, num)
+    put(o(p), "<< /Type /OutputIntent /S /GTS_PDFA1 /OutputConditionIdentifier (sRGB) /RegistryName (http://www.color.org) /Info (sRGB) /DestOutputProfile ")
+    put_ref(o(p), prof)
+    put(o(p), " >>")
+    obj_end(p)
+    return num
 }
 
 // The outline tree out of the flat (title, dest, level) list; 0 = none.

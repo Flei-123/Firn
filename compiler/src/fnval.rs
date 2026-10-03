@@ -92,8 +92,17 @@ pub(crate) fn records_asm() -> String {
     let _ = writeln!(out, "{}", crate::target::align(8));
     for k in recs {
         let sym = crate::codegen_x86::label(&k);
+        // ROUND CERTUS-WINDOWS: for a `#[win_callback]` function on the
+        // Windows target the record must point at the Win64 -> System V
+        // thunk, not at the Firn body.
+        let mut code = sym.clone();
+        if crate::target::windows() {
+            if let Some(argc) = crate::win::is_callback(&k) {
+                code = crate::win::note_callback(&sym, argc);
+            }
+        }
         let _ = writeln!(out, "{}{}:", RECORD_LABEL, sym);
-        let _ = writeln!(out, "    .quad {}", sym);
+        let _ = writeln!(out, "    .quad {}", code);
     }
     out
 }
@@ -201,7 +210,7 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     if !p.expect(TokKind::LParen, "after 'fn' in a closure") {
         return Some(p.broken_expr(start));
     }
-    let params: Vec<Param> = p.params();
+    let (params, ref_params) = p.params_ref();
     p.close(TokKind::RParen, "after the parameters of a closure");
     p.recovering = false;
     let ret = if p.eat(&TokKind::Arrow) {
@@ -220,8 +229,9 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     // surrounding condition must not reach into it.
     let saved = p.no_struct_lit;
     p.no_struct_lit = false;
-    let body = p.block("of a closure");
+    let mut body = p.block("of a closure");
     p.no_struct_lit = saved;
+    p.finish_body(&ref_params, &mut body);
     let span = Parser::join(start, body.span);
     let d = LambdaDecl { id: next_id(), heap, params, ret, body, span };
     Some(p.mk(span, ExprKind::Lambda(Box::new(d))))

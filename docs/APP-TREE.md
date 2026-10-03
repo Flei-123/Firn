@@ -358,7 +358,7 @@ Line numbers are for Firn `main` 7fbd6a39.
 | **Host** | `lib/plat/fuiwirt.fi` (W1–W5, 24–50) | Pointer, wheel, Tab/Enter/arrows/page keys, scale, dirty tracking, sleep while idle. No text input (N1, 54). No double click, drag-and-drop or clipboard (N2, 57). `host_touch` (176) only marks the picture dirty; it is not touch input. A raw pointer hook `host_set_hook` (r77) exists **only on branch `fui-codehub`**. |
 | **Touch** | `lib/window/android.fi` `host_input` (1000) · `demos/webdemo/firn.js` (436, 440) | Android turns pointer **index 0** into a mouse (1004); `ACTION_POINTER_DOWN/UP` are ignored. The web host uses Pointer Events with `setPointerCapture` but passes only x, y, buttons and a `MOD_TOUCH` bit — no `pointerId`. So there is **no multi-touch, no pinch/rotate/long press, and no fling** (Firn r71 open). |
 | **Accessibility** | `lib/fui/a11y.fi`: 31 ARIA roles (148), `struct Ann` (157), `a11y_unnamed` (615), `a11y_dump` (1328), bridge plan (1115) | Name computation: explicit, labelled-by (**by node id**, 168), own text, content. Also states, value/range, position in set, and tab order from tree order. `a11y_unnamed` counts unnamed controls. `a11y_dump` writes the whole tree as comparable text, the "oracle" for a future AT-SPI/UIA bridge. The bridge itself is only described (fUi r19). Annotations are indexed by node number, `A11Y_MAX = 128` (100). |
-| **Secrets** | `lib/fui/textbuf.fi` `secret` (80), `tb_copy` (562); `lib/fui/editor.fi` (408) | A password field refuses copy. **But the accessibility export knows no secret**: a textbox's value is its widget text, written verbatim ("Textfeld und Klappfeld: ihr Text ist der WERT", a11y.fi 1283). Whether a password leaks depends on what the app puts into the node. |
+| **Secrets** | `lib/fui/textbuf.fi` `secret` (80), `tb_copy` (562); `lib/fui/editor.fi` (408) | A password field refuses copy. **But the accessibility export knows no secret**: a textbox's value is its widget text, written verbatim (`"Textfeld und Klappfeld: ihr Text ist der WERT"`, a11y.fi 1283). Whether a password leaks depends on what the app puts into the node. |
 | **Identity** | `node_set_id` (551), `scene_find_id` (1455) | Optional `u32` id per node, **not checked for uniqueness**; lookup is linear. The node *number* changes whenever a rebuild adds nodes in a different order. |
 | **Animation** | `lib/fui/anim.fi` (`ANIM_MAX = 32`, 428) | Tweens, springs and transitions; `wait_ms` sleeps when idle. |
 | **Long lists** | `lib/fui/viewport.fi` | A clipped scroll area; the app builds the visible rows (virtualisation by hand). |
@@ -590,6 +590,117 @@ under load, so ±15 %):
   takes 5.1 / 5.4 / 4.6 ms with the memo against 5.5 / 6.0 / 6.3 ms without.
   The pictures are the same octets as main at all three sizes.
 
+### 4.6 Built (30.09.2026, later): typing a password, the style/layout memo, events
+
+- **Typing into a password field (r108).** The field with an editor
+  (`render.draw_textfield`) and the plain buffer field (`draw_field`) paint and
+  measure every typed letter as a bullet — while typing, with the caret and a
+  selection — the same octets as a field that holds bullets; copy is refused.
+  `dom_main` 1b checks it key by key.
+- **Style, box-measure and layout memo per unchanged subtree (r109, the rest
+  of r100)** in `scene.fi`. A node whose parent style key and own description
+  did not change takes its resolved style from the memo; a box whose
+  children's sizes and its own inputs did not change takes its size; a
+  subtree whose layout fingerprint and rectangle did not change is replayed
+  (moved) instead of laid out. `apptree_main` compares every rectangle and
+  style of a memo frame with a frame without memo — also on hover frames with
+  a hover rule that changes colour and padding.
+
+  Measured with `tools/fui/apptree.sh` (build `big`, median of three runs,
+  shared server): tree work per frame (style + measure + layout)
+
+  | nodes | without memo | with memo |
+  |---:|---:|---:|
+  | 123 | 646 µs | 129 µs |
+  | 505 | 3,164 µs | 495 µs |
+  | 1009 | 5,414 µs | **899 µs** |
+
+  At 1009 nodes: style 1,378 → 231 µs, measure 2,569 → 324 µs, layout
+  1,757 → 16 µs. **The goal of ≤ 2 ms tree work at 1000 nodes is reached.**
+
+- **Events through the tree (r94, r95 core, r96)** in `lib/fui/event.fi`,
+  checked by `tools/fui/event_main.fi` (run.sh section 18o) with synthetic
+  event streams only:
+  - *Dispatch:* capture → target → bubble along the path from `scene_hit`;
+    handlers per key (so a rebuild keeps them); `H_STOP`, `H_STOP_NOW`,
+    `H_PREVENT`; at the target capture handlers first. The default action is
+    `control.fi`, unchanged (down/move/up of the primary pointer).
+  - *Pointers:* id, type (mouse/touch/pen), `primary` per type, up to 10 at
+    once; pointer capture per id, implicit for touch and pen, held by key
+    path so it survives a rebuild.
+  - *Gestures with an arena:* tap, double tap (after its second tap, like
+    click/click/dblclick), long press (500 ms, by `ev_tick` or at the up),
+    pan with fling (velocity over the last 100 ms, 50..8000 px/s), pinch with
+    scale and angle, pan → pinch when a second finger comes. A recogniser
+    joins only when someone on the path listens; exactly one wins; a win
+    cancels the press in `control.fi` (`mouse_cancel`), so no click follows.
+    A control that drags (slider, scrollbar) keeps its pointer. Mouse
+    pointers only get tap/double tap.
+  - *Change records:* `obs_observe` once per frame, diffed by key path,
+    batched: ADDED, REMOVED, MOVED (order among keyed siblings), TEXT,
+    VALUE, STATE, FOCUS. A renumbering rebuild gives none. A secret field
+    never gives TEXT or VALUE — not even "changed".
+  - Counter-checks (the test must fail when the code is broken): reversed
+    capture order, no press cancel, no implicit capture, stop-now as stop,
+    no MOVED, no slider exception, no fling threshold, no secret check —
+    each makes `event_main` fail.
+  - **Still open (r95 rest):** the hosts do not deliver pointer ids yet.
+    Android turns pointer 0 into a mouse and ignores `ACTION_POINTER_*`; the
+    web host drops `pointerId`; `fuiwirt` has no router. Until then the
+    gestures run in tests and in programs that feed `event.fi` themselves.
+
+### 4.7 Built (02.10.2026): real pointers from the hosts, transitions by key, the audit
+
+- **Real pointers (r111).** The hosts now deliver what `event.fi` was written
+  for. *Browser:* `firn.js` hands the DOM `pointerId`, `pointerType`, `isPrimary`
+  and `timeStamp` to `firn_web_pointer_ex` (the old `firn_web_pointer` stays for
+  old modules); `pointercancel` is its own event (`WE_CANCEL`, only for pages
+  that ask — others still get an up); a page that handles touch itself gets
+  `touch-action: none`. *Android:* `lib/window/pointers.fi` turns one
+  `AMotionEvent` — which batches all fingers into one MOVE and names the finger
+  of POINTER_DOWN/UP by *index* — into one record per finger with its stable
+  id, tool type, `primary` and time; `window.real_pointers` / `window.next_pointer`
+  hand them to the program, in addition to the old first-finger events.
+  `fuiwirt.host_pointer` feeds every pointer to the router and the primary one
+  also to the old way (hover, press, scroll bars, hook); the router runs in
+  *host mode* (it dispatches and cancels a press that lost the arena but does not
+  run the defaults twice; `H_PREVENT` is honoured). `app.on(a, node, kinds,
+  handler)` gives `fui.app` programs the events; `examples/fui/touchpad.fi` shows
+  them. Checked: `pointers_main` (synthetic Android streams, run.sh 18o2),
+  `tools/wasm/touchcheck.py` (real multi-touch in headless Chromium: tap, pan
+  120 px, pinch 100→160 %, rotation 90°, first finger lifting first, long press,
+  cancel, mouse), and `tools/android/pointers_check.sh` (raw multi-touch on an
+  emulator: ids 0/1, second finger not primary, pinch 100→170 %). With it
+  `fui.app` runs on Android (`lib/@android/fui/apphost.fi` is the Linux host;
+  soft keyboard and lifecycle polish are r87).
+- **Transitions by key path (r110).** The transition registry
+  (`anim.TransReg`) found its entry by the widget's address. After a rebuild
+  the address belongs to another node: the button half way to its hover colour
+  jumped back and its neighbour glowed. `anim.transreg_set_keyer` +
+  `query.query_widget_key` key the entry by the key path (an unkeyed widget
+  still by address). `tools/fui/animkey_main.fi` (18o3) measures the painted
+  pixel: with the keyer the colour after a swap-and-insert rebuild is the same
+  as before (0x4A4A56 at 50 %); without it the button falls back to rest.
+- **The accessibility audit (r98).** `lib/fui/audit.fi` counts operable nodes
+  without a name, duplicate keys under one parent and secrets that reach the
+  export (a canary is put into every secret node for one dump). Every
+  `fui.app` program is run through it with `FUI_AUDIT=1` (no window, exit code
+  = result): `tools/fui/audit.sh`, run.sh 18p2. It found two real gaps at once:
+  the text fields of `form.fi` had no name (now the hint is the name). The
+  programs with their own main call it from their checks (`gallery9_main`,
+  `examples/codehub/main.fi`). A program with a nameless field must fail
+  (`audit_bad.fi`).
+- **The fill rule (Justin, 02.10.2026).** A bordered widget must not have the
+  fill of the ground it sits on. The resting field, the focused field and the
+  button each differ from `base`, `surface` and `surface_raised` — and the resting
+  field from the focused one — by an OKLab distance of at least 0.012
+  (`themefile.check_fill_distinct`; theme files that break it are refused with
+  the pair named; `contrast_main` prints the table for the built-in schemes).
+  It caught the focused field of the dark scheme (it was the page colour), the
+  light one (the white of the raised card), Nord (field = surface, button = raised
+  card), Solarized (field = surface), High Contrast (field = page) and the CodeHub
+  theme; all were moved by one step.
+
 ## 5. The decision
 
 ### 5.1 Options
@@ -790,10 +901,15 @@ under load, so ±15 %):
 | r103 | Accessibility export on demand as pushed updates — base for r19 (AT-SPI/UIA) and the web ARIA mirror (Firn r177) | T7, §5.5, §5.6 |
 | r104 | Action id per control, linked to the OrientOS action bus | §5.3 |
 
-**Status 30.09.2026 (§4.5):** done — r92 (keys, key paths, duplicates,
-focus/hover/press/drag kept by key), r93, r97, r99, r101. Partly done — r100
-(the measure memo; style and layout still run in full). Open — r94, r95, r96,
-r98, r102, r103, r104.
+**Status 30.09.2026 (§4.5, §4.6):** done — r92 (keys, key paths, duplicates,
+focus/hover/press/drag kept by key), r93, r94, r96, r97, r99, r100 (measure,
+style and layout memo: 0.9 ms tree work at 1009 nodes), r101. Partly done —
+r95 (pointer ids, capture, gestures and arena in `event.fi`; the hosts do not
+deliver pointer ids yet). Open — r98, r102, r103, r104.
+
+**Status 02.10.2026 (§4.7):** r111 (web `pointerId`, Android fingers), r110
+(transitions by key path) and r98 (audit of every fUi program) are done; r95 is
+complete with them.
 
 **Linked in the OrientOS roadmap:**
 
