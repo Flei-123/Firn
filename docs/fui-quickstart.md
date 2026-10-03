@@ -134,6 +134,32 @@ fn main() -> i32 {
 Click or Tab into a field and type; Backspace, Delete, the arrows,
 Home/End, Shift+arrows (select), Ctrl+A/C/X/V/Z work (lib/fui/editor.fi).
 
+## Several lines: a text area
+
+`examples/fui/notes.fi` -- `app.textarea(a, hint, rows)` is a field that
+holds several lines, wraps at its box and scrolls:
+
+```firn
+fn main() -> i32 {
+    let a: *mut app.App = app.window("Notes", 420, 360)
+    BOX = app.textarea(a, "Notes", 6)
+    app.row(a)
+    app.button(a, "Count", count)
+    app.button(a, "Clear", clear)
+    app.end(a)
+    INFO = app.label(a, " ", 0)
+    return app.run(a)
+}
+```
+
+Enter is a line break (Ctrl+Enter does nothing here), Up / Down keep their
+column, Home / End mean the visual line (Ctrl: the whole text), PageUp /
+PageDown move a page, the wheel scrolls. A click puts the caret there, a
+drag selects, a double click selects the word, a triple click the paragraph.
+`app.text(a, id)` returns the whole text with LF bytes; 4096 bytes at most.
+`app.lines_of(a, id)` gives the line layout (`fui.textarea`) for programs
+that want the line count or the scroll position.
+
 ## The API
 
 | Call | What it does |
@@ -142,6 +168,7 @@ Home/End, Shift+arrows (select), Ctrl+A/C/X/V/Z work (lib/fui/editor.fi).
 | `app.label(a, text, size) -> id` | a line of text; `size` in points like tkinter (16 pt = 21 px at 96 dpi), 0 = theme default |
 | `app.button(a, text, on_click) -> id` | a push button; `on_click: fn(*mut app.App)` |
 | `app.entry(a, hint) -> id` | a one-line text field with a dimmed hint while empty |
+| `app.textarea(a, hint, rows) -> id` | a text area: several lines, wrapping, scrolling, 4096 bytes |
 | `app.row(a)` / `app.column(a)` / `app.end(a)` | open / close a nested container |
 | `app.spacer(a, w, h) -> id` | empty room |
 | `app.set_text(a, id, text)` / `app.append_text(a, id, text)` | change a label, button or field |
@@ -206,11 +233,13 @@ A `window/backend.fi` next to the program still wins (search step 2).
 
 ## Limits today
 
-* 128 nodes per window, 8 text fields, 256 octets per text.
+* 128 nodes per window, 8 text fields, 256 octets per text (a text area: 4096).
 * One window per program (several windows: `lib/plat/fuiwin.fi`
   `window_step` / `window_wait_many`).
-* A click into a text field focuses it but does not move the caret to the
-  click position.
+* A click into a text field puts the caret at the click; a drag selects. (Shift+click
+  extends nothing yet: the host hook carries no modifier keys.)
+* A text area counts against the same 8 text-field slots; it has no tabs and no
+  bidirectional cursor movement (lines are painted bidi, moved logically).
 * No Windows host yet (fUi roadmap). The Android one has been run on an emulator only, not on a real phone.
 * `firnc1` (the self-hosted compiler) knows the platform directory but
   cannot build fUi programs yet -- use `firnc`.

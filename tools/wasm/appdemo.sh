@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MPL-2.0
 # tools/wasm/appdemo.sh -- THE fui.app EXAMPLES IN THE BROWSER, BUILT AND PROVEN.
 #
-#   1. builds demos/webapp/{hello_window,counter,form,touchpad}.wasm out of the SAME
+#   1. builds demos/webapp/{hello_window,counter,form,touchpad,notes}.wasm out of the SAME
 #      sources the native build takes (examples/fui/*.fi): --target=
 #      wasm32-browser makes `import fui.apphost` find lib/@web/fui/apphost.fi
 #   2. paints the native reference with tools/fui/app_main.fi
@@ -22,7 +22,7 @@ mkdir -p "$W/ref"
 fail=0
 
 echo "== 1. the examples as WebAssembly =="
-for ex in hello_window counter form touchpad; do
+for ex in hello_window counter form touchpad notes; do
     "$FIRNC" --opt-level=release-safe --target=wasm32-browser \
         -o "demos/webapp/$ex.wasm" "examples/fui/$ex.fi" || exit 1
     echo "   demos/webapp/$ex.wasm  $(wc -c < "demos/webapp/$ex.wasm") octets"
