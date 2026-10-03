@@ -1,0 +1,771 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/textarea.fi -- THE TEXT AREA: SEVERAL LINES, WRAPPED, SCROLLED.
+//
+// ===================================================================
+// WHY THIS FILE EXISTS (r45, Welle 2-4; OrientOS notes / editor)
+// ===================================================================
+//
+// lib/fui/editor.fi is the operation of a ONE-line field: its text is a
+// single run, "Home" means the start of the text and Enter commits. A
+// text area is the same buffer (textbuf.fi, with LF bytes in it) plus
+// three things the one-line field has no use for:
+//
+//   * LINES. The text is cut into visual lines: at every LF, and where a
+//     line is wider than the box. `Lines` holds the cut, `ta_relayout`
+//     computes it. The text itself is never changed by wrapping.
+//   * VERTICAL MOVEMENT. Up / Down / PageUp / PageDown keep a GOAL
+//     COLUMN (pixels): a caret that goes down through a short line and
+//     on to a long one comes back to where it started, as in every
+//     editor. Home / End mean the visual line, Ctrl+Home / Ctrl+End the
+//     text.
+//   * A VERTICAL SCROLL, and a mouse that finds the line under it.
+//
+// Everything else -- characters, Backspace, selection, word jumps, undo,
+// clipboard, input method -- is editor.fi, called unchanged. The editor is
+// put into multi-line mode (`editor_set_multiline`): Enter inserts a line
+// break (Ctrl+Enter commits), a paste keeps its line breaks.
+//
+// ==================================================== WHAT IT KNOWS
+//
+// It knows NO screen to ask: widths come from ONE function pointer
+// (`meas(ctx, p, n)`, the same form textbuf.fi uses). `ta_bind_painter`
+// makes it the painter's run width; the test bench hooks in a fixed
+// width per character. That is why the whole movement logic is checked
+// without a window (tools/fui/textarea_main.fi).
+//
+// A CARET AT A SOFT BREAK. Where a long line is cut, position `e` is both
+// "behind the last character of line i" and "before the first of line
+// i+1". It belongs to the NEXT line (that is what `ta_line_of` answers):
+// the caret never hangs on the right edge of a line that is already full.
+// After a LF the position belongs to the line that begins behind it. The
+// consequence: a caret can never stand at the end of a soft-wrapped line,
+// so End and a click past the end stop one character earlier -- before the
+// space the line was cut after.
+//
+// ============================================== WHAT IS NOT HERE
+//
+//   * bidirectional lines move LOGICALLY (the widths are LTR prefixes);
+//     the lines themselves are painted with the full bidi run.
+//   * no tabs (a pasted tab becomes a space, editor.fi), no folding.
+//   * a very long text is laid out on every key and on every frame: fine
+//     for notes and forms, not for a megabyte (then the layout wants a
+//     cache by change -- r45 note).
+import std.rt
+import fui.textbuf
+import fui.editor
+import fui.ime
+import fui.painter
+import fui.render
+import fui.widget
+import fui.style
+import paint.canvas
+
+export {
+    Lines, ta_new, ta_init, ta_free,
+    ta_set_measure, ta_bind_painter, ta_set_view,
+    ta_relayout, ta_line_count, ta_line_start, ta_line_end, ta_line_limit,
+    ta_line_of, ta_x_of, ta_pos_at, ta_pos_at_xy,
+    ta_key, ta_char, ta_mouse_down, ta_mouse_drag, ta_wheel,
+    ta_scroll_y, ta_scroll_to_caret, ta_content_h, ta_row_h, ta_visible_rows,
+    ta_caret_box, ta_draw,
+}
+
+// How many visual lines at most. A text over this many lines is cut: the
+// last line keeps the rest (still editable, just not wrapped further).
+const LINES_MAX: usize = 2048
+
+struct Lines {
+    cap: usize,
+    n: usize, // lines in use (always >= 1 after a layout)
+    start: *mut usize, // first byte of line i
+    end: *mut usize, // behind the last byte (the LF is NOT in the line)
+    width: f64, // wrap width in pixels (<= 0: no wrapping)
+    row_h: f64, // height of one line in pixels
+    view_h: f64, // height of the visible part
+    scroll_y: f64, // pixels scrolled away at the top
+    goal_x: f64, // column kept by Up / Down
+    goal_on: u32,
+    goal_caret: usize, // where the caret stood after the last vertical move
+    meas: fn(u64, u64, usize) -> f64,
+    mctx: u64,
+    z: u64, // *mut painter.Painter, set by ta_bind_painter
+    run: painter.TextRun,
+}
+
+fn meas_none(ctx: u64, p: u64, n: usize) -> f64 { return 0.0 }
+
+#[no_gc]
+fn ta_new() -> Lines {
+    return Lines {
+        cap: 0, n: 0, start: 0 as *mut usize, end: 0 as *mut usize,
+        width: 0.0, row_h: 16.0, view_h: 0.0, scroll_y: 0.0,
+        goal_x: 0.0, goal_on: 0, goal_caret: 0,
+        meas: meas_none, mctx: 0, z: 0, run: painter.run_new(14.0),
+    }
+}
+
+// `cap` lines at most (0 = LINES_MAX). false when memory is short.
+fn ta_init(l: *mut Lines, cap: usize) -> bool {
+    var c: usize = cap
+    if c == 0 || c > LINES_MAX {
+        c = LINES_MAX
+    }
+    (*l).cap = c
+    (*l).start = rt.heap_alloc(c * 8) as *mut usize
+    if (*l).start as usize == 0 {
+        return false
+    }
+    (*l).end = rt.heap_alloc(c * 8) as *mut usize
+    if (*l).end as usize == 0 {
+        return false
+    }
+    (*l).n = 0
+    return true
+}
+
+fn ta_free(l: *mut Lines) {
+    if (*l).start as usize != 0 {
+        rt.heap_free((*l).start as u64, (*l).cap * 8)
+        (*l).start = 0 as *mut usize
+    }
+    if (*l).end as usize != 0 {
+        rt.heap_free((*l).end as u64, (*l).cap * 8)
+        (*l).end = 0 as *mut usize
+    }
+}
+
+// ---- the widths
+
+fn ta_set_measure(l: *mut Lines, m: fn(u64, u64, usize) -> f64, ctx: u64) {
+    (*l).meas = m
+    (*l).mctx = ctx
+}
+
+// The painter's width of a run of text, through the `TextRun` copy kept in
+// the Lines (so a key handler can measure without a drawing context).
+fn meas_painter(ctx: u64, p: u64, n: usize) -> f64 {
+    let l: *mut Lines = ctx as *mut Lines
+    if (*l).z == 0 || n == 0 {
+        return 0.0
+    }
+    return painter.run_width((*l).z as *mut painter.Painter, &(*l).run, p, n)
+}
+
+fn ta_bind_painter(l: *mut Lines, z: *mut painter.Painter,
+    r: *mut painter.TextRun) {
+    (*l).z = z as u64
+    (*l).run = *r
+    (*l).meas = meas_painter
+    (*l).mctx = l as u64
+}
+
+// The box: wrap width, visible height, height of one line (pixels).
+fn ta_set_view(l: *mut Lines, w: f64, h: f64, row_h: f64) {
+    (*l).width = w
+    (*l).view_h = h
+    if row_h >= 1.0 {
+        (*l).row_h = row_h
+    }
+}
+
+// ---- small helpers
+
+fn gs(l: *mut Lines, i: usize) -> usize {
+    return *(((*l).start as u64 + (i * 8) as u64) as *mut usize)
+}
+
+fn ge(l: *mut Lines, i: usize) -> usize {
+    return *(((*l).end as u64 + (i * 8) as u64) as *mut usize)
+}
+
+fn ps(l: *mut Lines, i: usize, v: usize) {
+    *(((*l).start as u64 + (i * 8) as u64) as *mut usize) = v
+}
+
+fn pe(l: *mut Lines, i: usize, v: usize) {
+    *(((*l).end as u64 + (i * 8) as u64) as *mut usize) = v
+}
+
+fn byte_at(t: *mut textbuf.TextBuf, i: usize) -> u8 {
+    if i >= textbuf.tb_len(t) {
+        return 0 as u8
+    }
+    return *((textbuf.tb_ptr(t) + i as u64) as *mut u8)
+}
+
+fn width_of(l: *mut Lines, t: *mut textbuf.TextBuf, a: usize,
+    n: usize) -> f64 {
+    if n == 0 {
+        return 0.0
+    }
+    let f: fn(u64, u64, usize) -> f64 = (*l).meas
+    return f((*l).mctx, textbuf.tb_ptr(t) + a as u64, n)
+}
+
+// The largest character boundary k in [0, rest] whose width from `a` is at
+// most `x` (k == rest when everything fits). Binary search: the width of a
+// prefix only grows with its length.
+fn fit_x(l: *mut Lines, t: *mut textbuf.TextBuf, a: usize, rest: usize,
+    x: f64) -> usize {
+    if width_of(l, t, a, rest) <= x {
+        return rest
+    }
+    var lo: usize = 0
+    var hi: usize = rest
+    while hi - lo > 1 {
+        let mid: usize = (lo + hi) / 2
+        var q: usize = mid
+        while q > lo && !textbuf.tb_is_boundary(t, a + q) {
+            q = q - 1
+        }
+        if q == lo {
+            q = mid
+            while q < hi && !textbuf.tb_is_boundary(t, a + q) {
+                q = q + 1
+            }
+            if q >= hi {
+                break
+            }
+        }
+        if width_of(l, t, a, q) <= x {
+            lo = q
+        } else {
+            hi = q
+        }
+    }
+    return lo
+}
+
+fn find_lf(t: *mut textbuf.TextBuf, from: usize, len: usize) -> usize {
+    var i: usize = from
+    while i < len {
+        if byte_at(t, i) == 10 as u8 {
+            return i
+        }
+        i = i + 1
+    }
+    return len
+}
+
+// ============================================================ THE LAYOUT
+
+fn push_line(l: *mut Lines, a: usize, b: usize) {
+    if (*l).n >= (*l).cap {
+        return
+    }
+    ps(l, (*l).n, a)
+    pe(l, (*l).n, b)
+    (*l).n = (*l).n + 1
+}
+
+// Cut the text into lines for the current width. Always leaves at least
+// one line (an empty text is one empty line), and a text that ends in LF
+// ends in an empty line -- the caret has to be able to stand there.
+fn ta_relayout(l: *mut Lines, ed: *mut editor.Editor) {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    let len: usize = textbuf.tb_len(t)
+    (*l).n = 0
+    var pos: usize = 0
+    while true {
+        if (*l).n + 1 >= (*l).cap {
+            // out of lines: the last one takes the rest of the text
+            ps(l, (*l).n, pos)
+            pe(l, (*l).n, len)
+            (*l).n = (*l).n + 1
+            break
+        }
+        let hend: usize = find_lf(t, pos, len)
+        var seg: usize = pos
+        if hend == seg {
+            push_line(l, seg, seg)
+        }
+        while seg < hend {
+            let rest: usize = hend - seg
+            var end: usize = hend
+            if (*l).width > 0.0 && width_of(l, t, seg, rest) > (*l).width {
+                let k: usize = fit_x(l, t, seg, rest, (*l).width)
+                if k == 0 {
+                    // not even one character fits: take one, so it ends
+                    end = textbuf.tb_next(t, seg)
+                } else {
+                    let brk: usize = seg + k
+                    if byte_at(t, brk) == 32 as u8 {
+                        // the word ended exactly here: the space hangs
+                        // over the edge, the next line starts with a word
+                        end = brk + 1
+                    } else {
+                        // cut after the last space that is inside
+                        end = brk
+                        var j: usize = brk
+                        while j > seg + 1 {
+                            if byte_at(t, j - 1) == 32 as u8 {
+                                end = j
+                                break
+                            }
+                            j = j - 1
+                        }
+                    }
+                }
+                if end <= seg {
+                    end = textbuf.tb_next(t, seg)
+                }
+                if end > hend {
+                    end = hend
+                }
+            }
+            push_line(l, seg, end)
+            seg = end
+        }
+        if hend >= len {
+            break
+        }
+        pos = hend + 1
+    }
+    if (*l).n == 0 {
+        push_line(l, 0, 0)
+    }
+    // the scroll stays inside the text
+    ta_clamp_scroll(l)
+}
+
+fn ta_line_count(l: *mut Lines) -> usize { return (*l).n }
+fn ta_line_start(l: *mut Lines, i: usize) -> usize { return gs(l, i) }
+fn ta_line_end(l: *mut Lines, i: usize) -> usize { return ge(l, i) }
+
+// Is line `i` cut by the wrapping (and not by a LF)? Then the next line
+// starts exactly where this one ends.
+fn is_soft(l: *mut Lines, i: usize) -> bool {
+    return i + 1 < (*l).n && gs(l, i + 1) == ge(l, i)
+}
+
+// The last position the caret may take on line `i` through the keyboard or
+// the mouse (see the head: not behind a soft break).
+fn ta_line_limit(l: *mut Lines, t: *mut textbuf.TextBuf, i: usize) -> usize {
+    let e: usize = ge(l, i)
+    if is_soft(l, i) && e > gs(l, i) {
+        return textbuf.tb_prev(t, e)
+    }
+    return e
+}
+
+// The line a position belongs to: the last one that starts at or before it.
+fn ta_line_of(l: *mut Lines, pos: usize) -> usize {
+    if (*l).n == 0 {
+        return 0
+    }
+    var lo: usize = 0
+    var hi: usize = (*l).n - 1
+    while lo < hi {
+        let mid: usize = (lo + hi + 1) / 2
+        if gs(l, mid) <= pos {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    return lo
+}
+
+// The width in pixels from the start of line `i` to position `pos`.
+fn ta_x_of(l: *mut Lines, t: *mut textbuf.TextBuf, i: usize,
+    pos: usize) -> f64 {
+    let a: usize = gs(l, i)
+    if pos <= a {
+        return 0.0
+    }
+    return width_of(l, t, a, pos - a)
+}
+
+// The position on line `i` closest to the column `x` (pixels from the left
+// edge of the text).
+fn ta_pos_at(l: *mut Lines, t: *mut textbuf.TextBuf, i: usize,
+    x: f64) -> usize {
+    let a: usize = gs(l, i)
+    let b: usize = ta_line_limit(l, t, i)
+    if x <= 0.0 || b <= a {
+        return a
+    }
+    let rest: usize = b - a
+    let k: usize = fit_x(l, t, a, rest, x)
+    if k >= rest {
+        return b
+    }
+    // k is the last boundary at or left of x; the next one may be closer
+    let kn: usize = textbuf.tb_next(t, a + k) - a
+    if kn <= rest {
+        let w0: f64 = width_of(l, t, a, k)
+        let w1: f64 = width_of(l, t, a, kn)
+        if x - w0 > w1 - x {
+            return a + kn
+        }
+    }
+    return a + k
+}
+
+// The position under a point; (x, y) from the top left of the text, BEFORE
+// the scroll is applied (the scroll is added here).
+fn ta_pos_at_xy(l: *mut Lines, ed: *mut editor.Editor, x: f64,
+    y: f64) -> usize {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    var row: f64 = (y + (*l).scroll_y) / (*l).row_h
+    if row < 0.0 {
+        row = 0.0
+    }
+    var i: usize = row as usize
+    if i >= (*l).n {
+        i = (*l).n - 1
+    }
+    return ta_pos_at(l, t, i, x)
+}
+
+// ============================================================== SCROLLING
+
+fn ta_content_h(l: *mut Lines) -> f64 {
+    return ((*l).n as f64) * (*l).row_h
+}
+
+fn ta_row_h(l: *mut Lines) -> f64 { return (*l).row_h }
+
+// How many whole lines are visible (at least 1).
+fn ta_visible_rows(l: *mut Lines) -> usize {
+    let k: usize = ((*l).view_h / (*l).row_h) as usize
+    if k < 1 {
+        return 1
+    }
+    return k
+}
+
+fn ta_scroll_y(l: *mut Lines) -> f64 { return (*l).scroll_y }
+
+fn ta_clamp_scroll(l: *mut Lines) {
+    var mx: f64 = ta_content_h(l) - (*l).view_h
+    if mx < 0.0 {
+        mx = 0.0
+    }
+    if (*l).scroll_y > mx {
+        (*l).scroll_y = mx
+    }
+    if (*l).scroll_y < 0.0 {
+        (*l).scroll_y = 0.0
+    }
+}
+
+// The mouse wheel: `dy` pixels (positive = further down).
+fn ta_wheel(l: *mut Lines, dy: f64) {
+    (*l).scroll_y = (*l).scroll_y + dy
+    ta_clamp_scroll(l)
+}
+
+// Scroll so that the line of the caret is entirely visible.
+fn ta_scroll_to_caret(l: *mut Lines, ed: *mut editor.Editor) {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    let i: usize = ta_line_of(l, textbuf.tb_caret(t))
+    let top: f64 = (i as f64) * (*l).row_h
+    if top < (*l).scroll_y {
+        (*l).scroll_y = top
+    }
+    if top + (*l).row_h > (*l).scroll_y + (*l).view_h {
+        (*l).scroll_y = top + (*l).row_h - (*l).view_h
+    }
+    ta_clamp_scroll(l)
+}
+
+// The caret as a box in the area's own coordinates (top left of the text,
+// scroll applied): the on-screen keyboard and the candidate window of an
+// input method want it. x, y, h.
+fn ta_caret_box(l: *mut Lines, ed: *mut editor.Editor, x: *mut f64,
+    y: *mut f64, h: *mut f64) {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    let car: usize = textbuf.tb_caret(t)
+    let i: usize = ta_line_of(l, car)
+    *x = ta_x_of(l, t, i, car)
+    *y = (i as f64) * (*l).row_h - (*l).scroll_y
+    *h = (*l).row_h
+}
+
+// =============================================================== THE KEYS
+
+// Up / Down / PageUp / PageDown: `delta` lines (negative = up).
+fn move_vertical(l: *mut Lines, ed: *mut editor.Editor, delta: i64,
+    extend: bool) {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    let car: usize = textbuf.tb_caret(t)
+    let i: usize = ta_line_of(l, car)
+    // The goal column is only valid while the caret is where the last
+    // vertical move left it: anything else (a program that set the text,
+    // a click, an edit) moved it and a new column starts here.
+    if (*l).goal_on == 0 || (*l).goal_caret != car {
+        (*l).goal_x = ta_x_of(l, t, i, car)
+        (*l).goal_on = 1
+    }
+    let target: i64 = (i as i64) + delta
+    var pos: usize = 0
+    if target < 0 as i64 {
+        pos = 0
+    } else if (target as usize) >= (*l).n {
+        pos = textbuf.tb_len(t)
+    } else {
+        pos = ta_pos_at(l, t, target as usize, (*l).goal_x)
+    }
+    textbuf.tb_set_caret(t, pos, extend)
+    (*l).goal_caret = textbuf.tb_caret(t)
+    editor.editor_caret_wake(ed)
+    ta_scroll_to_caret(l, ed)
+}
+
+// A key for a text area. Same answers as editor.editor_key (RES_*).
+fn ta_key(l: *mut Lines, ed: *mut editor.Editor, key: u32,
+    mods: u32) -> u32 {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    ta_relayout(l, ed)
+    let extend: bool = (mods & editor.MOD_SHIFT) != 0 as u32
+    let ctrl: bool = (mods & editor.MOD_CTRL) != 0 as u32
+    // a running input method keeps the arrows for its own list
+    if !ime.ime_on(editor.editor_ime(ed)) {
+        if key == editor.KEY_UP {
+            move_vertical(l, ed, 0 as i64 - 1 as i64, extend)
+            return editor.RES_MOVED
+        }
+        if key == editor.KEY_DOWN {
+            move_vertical(l, ed, 1 as i64, extend)
+            return editor.RES_MOVED
+        }
+        if key == editor.KEY_PGUP || key == editor.KEY_PGDN {
+            var rows: i64 = (ta_visible_rows(l) as i64) - 1 as i64
+            if rows < 1 as i64 {
+                rows = 1 as i64
+            }
+            if key == editor.KEY_PGUP {
+                rows = 0 as i64 - rows
+            }
+            move_vertical(l, ed, rows, extend)
+            return editor.RES_MOVED
+        }
+        if key == editor.KEY_HOME || key == editor.KEY_END {
+            (*l).goal_on = 0
+            var pos: usize = 0
+            if key == editor.KEY_HOME {
+                if !ctrl {
+                    pos = gs(l, ta_line_of(l, textbuf.tb_caret(t)))
+                }
+            } else if ctrl {
+                pos = textbuf.tb_len(t)
+            } else {
+                pos = ta_line_limit(l, t, ta_line_of(l, textbuf.tb_caret(t)))
+            }
+            textbuf.tb_set_caret(t, pos, extend)
+            editor.editor_caret_wake(ed)
+            ta_scroll_to_caret(l, ed)
+            return editor.RES_MOVED
+        }
+    }
+    (*l).goal_on = 0
+    let r: u32 = editor.editor_key(ed, key, mods)
+    if r == editor.RES_CHANGED || r == editor.RES_MOVED {
+        ta_relayout(l, ed)
+        ta_scroll_to_caret(l, ed)
+    }
+    return r
+}
+
+// A typed character (also Ctrl+C / V / Z ...): editor.editor_char, plus the
+// layout and the scroll that follow a change.
+fn ta_char(l: *mut Lines, ed: *mut editor.Editor, cp: u32,
+    mods: u32) -> u32 {
+    (*l).goal_on = 0
+    let r: u32 = editor.editor_char(ed, cp, mods)
+    if r == editor.RES_CHANGED || r == editor.RES_MOVED {
+        ta_relayout(l, ed)
+        ta_scroll_to_caret(l, ed)
+    }
+    return r
+}
+
+// ============================================================== THE MOUSE
+
+// Mouse button down at (x, y) from the top left of the text. A single click
+// puts the caret there (Shift extends), a double click selects the word,
+// a triple click the whole paragraph (up to the LF on both sides).
+fn ta_mouse_down(l: *mut Lines, ed: *mut editor.Editor, x: f64, y: f64,
+    now_us: u64, extend: bool) -> u32 {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    ta_relayout(l, ed)
+    (*l).goal_on = 0
+    let n: usize = editor.editor_click(ed, x, now_us)
+    let pos: usize = ta_pos_at_xy(l, ed, x, y)
+    if n >= 3 {
+        let len: usize = textbuf.tb_len(t)
+        var a: usize = pos
+        while a > 0 && byte_at(t, a - 1) != 10 as u8 {
+            a = a - 1
+        }
+        let b: usize = find_lf(t, pos, len)
+        textbuf.tb_set_range(t, b, a)
+        textbuf.tb_set_drag(t, 0 as u32)
+        return editor.RES_MOVED
+    }
+    if n == 2 {
+        textbuf.tb_select_word(t, pos)
+        textbuf.tb_set_drag(t, 0 as u32)
+        return editor.RES_MOVED
+    }
+    textbuf.tb_set_caret(t, pos, extend)
+    textbuf.tb_set_drag(t, 1 as u32)
+    return editor.RES_MOVED
+}
+
+// The mouse moved with the button down: extend the selection and follow it
+// with the scroll when it leaves the box above or below.
+fn ta_mouse_drag(l: *mut Lines, ed: *mut editor.Editor, x: f64,
+    y: f64) -> u32 {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    if textbuf.tb_drag(t) == 0 as u32 {
+        return editor.RES_NONE
+    }
+    ta_relayout(l, ed)
+    let pos: usize = ta_pos_at_xy(l, ed, x, y)
+    textbuf.tb_set_caret(t, pos, true)
+    editor.editor_caret_wake(ed)
+    ta_scroll_to_caret(l, ed)
+    return editor.RES_MOVED
+}
+
+// ============================================================== THE PICTURE
+
+// Surface and border like every element, then -- clipped to the content
+// box -- selection, lines, caret and a thin scroll thumb. `caret_on` comes
+// from editor.editor_caret_tick, as for the one-line field.
+//
+// The wrap width and the visible height are taken from the widget's box
+// HERE, every frame; the layout is redone here too, so the picture always
+// shows the text as it is. The same TextRun paints and measures
+// (`ta_bind_painter`): a caret cannot stand next to its letter.
+fn ta_draw(c: *mut render.Ctx, e0: *mut widget.Widget,
+    ed: *mut editor.Editor, l: *mut Lines, caret_on: bool) {
+    var mw: widget.Widget = *e0
+    let e: *mut widget.Widget = &mw
+    render.draw_base(c, e)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let sz: *mut style.StyleSet = widget.w_styleset(e)
+    let zu: u32 = widget.w_state(e)
+    let kind: u32 = widget.w_kind(e)
+    let px: f64 = render.field_px(c, e)
+    let cx: f64 = render.field_text_x0(c, e)
+    let cw: f64 = widget.w_w(e) - 2.0 * (cx - widget.w_x(e))
+    let pady: f64 = render.pady_of(c, e)
+    let cy: f64 = widget.w_y(e) + pady
+    let ch: f64 = widget.w_h(e) - 2.0 * pady
+    if cw <= 0.0 || ch <= 0.0 {
+        return
+    }
+    var r: painter.TextRun = render.text_run_of(c, e, px)
+    let asc: f64 = painter.font_ascent(z, px)
+    let desc: f64 = painter.font_descent(z, px)
+    let lh: f64 = ((asc + desc + 0.5) as i64) as f64
+    var rh: f64 = (((asc + desc) * 1.25 + 0.5) as i64) as f64
+    if rh < lh + 1.0 {
+        rh = lh + 1.0
+    }
+    ta_bind_painter(l, z, &r)
+    ta_set_view(l, cw, ch, rh)
+    ta_relayout(l, ed)
+
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    let p: u64 = textbuf.tb_ptr(t)
+    var fallback: u32 = render.def_fg(kind)
+    if zu == style.STATE_DISABLED {
+        fallback = style.color_token(style.TOK_TEXT_DISABLED)
+    }
+    let fg: u32 = render.color_of(c, style.resolve_fg(sz, zu, fallback))
+    let sel_bg: u32 = render.color_of(c,
+        style.color_token(style.TOK_SELECTION))
+    let sa: usize = textbuf.tb_sel_a(t)
+    let sb: usize = textbuf.tb_sel_b(t)
+    let has_sel: bool = textbuf.tb_has_sel(t)
+    let len: usize = textbuf.tb_len(t)
+
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    if !canvas.clip_push_rect(cv, cx, cy, cx + cw, cy + ch) {
+        return
+    }
+    var first: usize = 0
+    if (*l).scroll_y > 0.0 {
+        first = ((*l).scroll_y / rh) as usize
+    }
+    var last: usize = (((*l).scroll_y + ch) / rh) as usize
+    if last >= (*l).n {
+        last = (*l).n - 1
+    }
+    let car: usize = textbuf.tb_caret(t)
+    let car_line: usize = ta_line_of(l, car)
+    let pad_in: f64 = (rh - lh) / 2.0
+    var i: usize = first
+    while i <= last {
+        let a: usize = gs(l, i)
+        let b: usize = ge(l, i)
+        let top: f64 = cy + (i as f64) * rh - (*l).scroll_y
+        let base: f64 = painter.text_baseline_mid(z, top, rh, px)
+        if has_sel {
+            // the selected part of this line ...
+            var la: usize = sa
+            if la < a {
+                la = a
+            }
+            var lb: usize = sb
+            if lb > b {
+                lb = b
+            }
+            if lb > la {
+                painter.run_sel_draw(z, &r, cx, top + pad_in, lh, p + a as u64,
+                    b - a, la - a, lb - a, sel_bg)
+            }
+            // ... and the line break behind it: a small block, so a
+            // selected empty line is not invisible
+            if !is_soft(l, i) && b < len && sa <= b && sb > b {
+                var xe: f64 = 0.0
+                if b > a {
+                    xe = width_of(l, t, a, b - a)
+                }
+                painter.surface(z, cx + xe, top + pad_in, px / 3.0, lh, sel_bg)
+            }
+        }
+        if b > a {
+            let e1: f64 = painter.run_draw(z, &r, cx, base, 0.0, fg,
+                p + a as u64, b - a, painter.TEXT_L)
+        }
+        if caret_on && !has_sel && i == car_line && widget.w_is_focus(e) {
+            var kx: f64 = cx
+            if car > a {
+                kx = cx + painter.run_caret_x(z, &r, p + a as u64, b - a,
+                    car - a)
+            }
+            var st: f64 = render.len_of(c, 1)
+            if st < 1.0 {
+                st = 1.0
+            }
+            if kx > cx + cw - st {
+                kx = cx + cw - st
+            }
+            painter.caret_bar(z, kx, top + pad_in, lh, st, fg)
+        }
+        i = i + 1
+    }
+    // the scroll thumb: only when there is something to scroll
+    let total: f64 = ta_content_h(l)
+    if total > ch {
+        var tw: f64 = render.len_of(c, 3)
+        if tw < 2.0 {
+            tw = 2.0
+        }
+        var th: f64 = ch * ch / total
+        if th < tw * 3.0 {
+            th = tw * 3.0
+        }
+        let ty: f64 = cy + (ch - th) * (*l).scroll_y / (total - ch)
+        let tcol: u32 = render.color_of(c,
+            style.color_token(style.TOK_TEXT_MUTED))
+        painter.surface(z, cx + cw - tw, ty, tw, th, tcol)
+    }
+    canvas.clip_pop(cv)
+    render.draw_focus_ring(c, e)
+}

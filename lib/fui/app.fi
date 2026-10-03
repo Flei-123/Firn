@@ -58,8 +58,10 @@
 //   * 128 nodes per window (scene.SCENE_MAX), 8 text fields, 256 octets
 //     per text; beyond that an add returns NONE and changes nothing.
 //   * One window. A second one is lib/plat/fuiwin.fi's window_step.
-//   * A click into a text field focuses it; it does not move the caret
-//     to the click (the caret stays where the keys put it).
+//   * A click into a text field focuses it and puts the caret at the click;
+//     dragging selects, a double click selects the word. A text area
+//     (`textarea`) wraps and scrolls; its wheel and Shift-less clicks work
+//     the same way.
 //   * No Win32 / Android host yet (lib/@win32, lib/@android): the fUi
 //     roadmap has them.
 import std.rt
@@ -73,6 +75,7 @@ import fui.flex
 import fui.widget
 import fui.editor
 import fui.textbuf
+import fui.textarea
 import plat.fuiwirt
 import fui.event
 import fui.audit
@@ -80,14 +83,15 @@ import fui.a11y
 import fui.apphost
 
 export {
-    App, window, label, button, entry, row, column, end, spacer,
+    App, window, label, button, entry, textarea, lines_of, row, column, end, spacer,
     set_text, append_text, set_number, text, number, quit, run,
     set_data, data, set_dark, focus, root, on, audit,
     NONE,
     // the side a host and the tests see (lib/@*/fui/apphost.fi,
     // tools/fui/app_main.fi)
     app_paint, app_attach, app_key, app_char, app_press, app_act,
-    app_done, app_host, app_theme, app_entry_box, app_scene,
+    app_done, app_host, app_theme, app_entry_box, app_entry_buf, app_scene,
+    app_hook,
     ENTRIES_MAX, TEXT_CAP,
 }
 
@@ -101,6 +105,12 @@ const GAP: i64 = 14
 const ROW_GAP: i64 = 10
 const PAD: i64 = 16
 const ENTRY_W: usize = 240
+// a text area: its width and one row's height in design points, the text it
+// holds (bytes; undo steps are as big, so a whole text can always be undone)
+const AREA_W: usize = 320
+const AREA_ROW_PT: usize = 20
+const AREA_PAD_PT: usize = 16
+const AREA_CAP: usize = 4096
 
 struct App {
     sc: scene.Scene,
@@ -123,6 +133,14 @@ struct App {
     ed: [editor.Editor; 8],
     ed_node: [usize; 8],
     hint: [str; 8],
+    // a text area is a slot of the same table (several lines, textarea.fi)
+    area: [bool; 8],
+    lines: [textarea.Lines; 8],
+    // the slot the mouse is dragging a selection in (NONE = none), and the
+    // pointer where it was last seen (the wheel has no position of its own)
+    drag_k: usize,
+    ptr_x: f64,
+    ptr_y: f64,
     n_ed: usize,
     ed_bufs: u64,
     quit: bool,
@@ -160,6 +178,8 @@ fn app_blank() -> App {
         cb: [cb_none; 128], has_cb: [false; 128], texts: 0,
         tlen: [0; 128], wrapped: [false; 128],
         ed: [editor.editor_new(); 8], ed_node: [NONE; 8], hint: [""; 8],
+        area: [false; 8], lines: [textarea.ta_new(); 8], drag_k: NONE,
+        ptr_x: 0.0, ptr_y: 0.0,
         n_ed: 0, ed_bufs: 0, quit: false, user: 0,
         rt: event.router_new(), next_key: 60000 as u32, rt_on: false,
         ax: a11y.a11y_new() }
@@ -194,6 +214,9 @@ fn window(title: str, w: usize, h: usize) -> *mut App {
     (*a).hk = apphost.hooks_new(a as u64, &(*a).m, &(*a).w, app_attach,
         app_paint, app_key, app_char, app_press, app_act, app_done,
         app_entry_box, title, w, h)
+    // the mouse for the text fields: a click puts the caret there, a drag
+    // selects, the wheel scrolls a text area
+    fuiwirt.host_set_hook(&(*a).w, a as u64, app_hook)
     apphost.hooks_set_audit(&(*a).hk, app_audit)
     apphost.hooks_set_buf(&(*a).hk, app_entry_buf)
     apphost.hooks_set_edited(&(*a).hk, app_entry_edited)
@@ -430,6 +453,57 @@ fn entry(a: *mut App, hint: str) -> usize {
     return i
 }
 
+// A text area: several lines of text that wrap at the box and scroll,
+// `rows` lines tall. Enter is a line break (Ctrl+Enter does nothing here);
+// `text` / `set_text` read and write the whole text with its LF bytes. 4096
+// bytes at most. A text area counts against the same eight slots as `entry`.
+fn textarea(a: *mut App, hint: str, rows: usize) -> usize {
+    if (*a).n_ed >= ENTRIES_MAX {
+        return NONE
+    }
+    let i: usize = scene.scene_add(&(*a).sc, parent(a), scene.N_WIDGET)
+    if i == scene.SCENE_NONE {
+        return NONE
+    }
+    let k: usize = (*a).n_ed
+    let buf: u64 = rt.heap_alloc(AREA_CAP)
+    if buf == 0 {
+        return NONE
+    }
+    scene.node_set_widget_kind(&(*a).sc, i, widget.KIND_TEXTBOX)
+    if !editor.editor_init_cap(&(*a).ed[k], buf, AREA_CAP, AREA_CAP) {
+        return NONE
+    }
+    editor.editor_set_multiline(&(*a).ed[k], true)
+    if !textarea.ta_init(&(*a).lines[k], 0) {
+        return NONE
+    }
+    (*a).area[k] = true
+    (*a).ed_node[k] = i
+    (*a).hint[k] = hint
+    (*a).n_ed = k + 1
+    a11y.a11y_set_name(&(*a).ax, i, hint.p as u64, hint.n)
+    var r: usize = rows
+    if r < 2 {
+        r = 2
+    }
+    node_rule(a, i, style.style_set_height(
+            style.style_set_width(style.style_new(), AREA_W),
+            r * AREA_ROW_PT + AREA_PAD_PT))
+    scene.node_set_draw(&(*a).sc, i, a as u64, draw_entry)
+    return i
+}
+
+// The line layout of a text area (textarea.ta_line_count, ta_scroll_y ...);
+// 0 when `id` is not a text area. Valid after the first frame.
+fn lines_of(a: *mut App, id: usize) -> *mut textarea.Lines {
+    let k: usize = slot_of(a, id)
+    if k == NONE || !(*a).area[k] {
+        return 0 as u64 as *mut textarea.Lines
+    }
+    return &(*a).lines[k]
+}
+
 fn slot_of(a: *mut App, i: usize) -> usize {
     var k: usize = 0
     while k < (*a).n_ed {
@@ -451,6 +525,23 @@ fn draw_entry(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
     }
     let ed: *mut editor.Editor = &(*a).ed[k]
     let focus: bool = widget.w_is_focus(e)
+    if (*a).area[k] {
+        textarea.ta_draw(c, e, ed, &(*a).lines[k], focus)
+        let ha: str = (*a).hint[k]
+        if textbuf.tb_len(editor.editor_buf(ed)) == 0 && !focus && ha.n > 0 {
+            let z: *mut painter.Painter = render.ctx_painter(c)
+            let px: f64 = render.field_px(c, e)
+            var r: painter.TextRun = render.text_run_of(c, e, px)
+            let top: f64 = widget.w_y(e) + render.pady_of(c, e)
+            let by: f64 = painter.text_baseline_mid(z, top,
+                textarea.ta_row_h(&(*a).lines[k]), px)
+            let col: u32 = render.color_of(c,
+                style.color_token(style.TOK_TEXT_DISABLED))
+            let x1: f64 = painter.run_draw(z, &r, render.field_text_x0(c, e),
+                by, 0.0, col, ha.p as u64, ha.n, painter.TEXT_L)
+        }
+        return
+    }
     render.draw_textfield(c, e, ed, focus)
     let h: str = (*a).hint[k]
     if textbuf.tb_len(editor.editor_buf(ed)) == 0 && !focus && h.n > 0 {
@@ -684,7 +775,12 @@ fn app_key(ud: u64, key: u32, mods: u32) -> bool {
     if k == NONE {
         return false
     }
-    let r: u32 = editor.editor_key(&(*a).ed[k], key, mods)
+    var r: u32 = 0 as u32
+    if (*a).area[k] {
+        r = textarea.ta_key(&(*a).lines[k], &(*a).ed[k], key, mods)
+    } else {
+        r = editor.editor_key(&(*a).ed[k], key, mods)
+    }
     if r == editor.RES_PASS || r == editor.RES_COMMIT
     || r == editor.RES_CANCEL {
         return false
@@ -700,7 +796,12 @@ fn app_char(ud: u64, cp: u32, mods: u32) -> bool {
     if k == NONE {
         return false
     }
-    let r: u32 = editor.editor_char(&(*a).ed[k], cp, mods)
+    var r: u32 = 0 as u32
+    if (*a).area[k] {
+        r = textarea.ta_char(&(*a).lines[k], &(*a).ed[k], cp, mods)
+    } else {
+        r = editor.editor_char(&(*a).ed[k], cp, mods)
+    }
     if r == editor.RES_PASS {
         return false
     }
@@ -708,8 +809,87 @@ fn app_char(ud: u64, cp: u32, mods: u32) -> bool {
     return true
 }
 
-// A press at (x, y) -- only reported; focus and clicks stay the host's.
+// A press at (x, y) -- only reported; focus and clicks stay the host's (the
+// caret goes to the click through `app_hook`).
 fn app_press(ud: u64, x: f64, y: f64) {
+}
+
+// The text fields' share of the mouse (fuiwirt.host_set_hook, called AFTER the
+// host did its own work, so the click has focused the field already):
+//   down   the caret goes to the click; double click = word, triple click =
+//          line (all of it in a one-line field, the paragraph in an area)
+//   move   with the button down: the selection follows
+//   up     ends the drag
+//   wheel  scrolls the text area under the pointer
+// true = something changed, paint again.
+fn app_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
+    let a: *mut App = ud as *mut App
+    if kind == fuiwirt.HOOK_WHEEL {
+        let k: usize = slot_at(a, (*a).ptr_x, (*a).ptr_y)
+        if k == NONE || !(*a).area[k] {
+            return false
+        }
+        textarea.ta_wheel(&(*a).lines[k], y * 3.0 * textarea.ta_row_h(&(*a).lines[k]))
+        return true
+    }
+    (*a).ptr_x = x
+    (*a).ptr_y = y
+    if kind == fuiwirt.HOOK_UP {
+        if (*a).drag_k == NONE {
+            return false
+        }
+        editor.editor_mouse_up(&(*a).ed[(*a).drag_k])
+        (*a).drag_k = NONE
+        return false
+    }
+    if kind == fuiwirt.HOOK_DOWN {
+        (*a).drag_k = NONE
+        let k: usize = slot_at(a, x, y)
+        if k == NONE {
+            return false
+        }
+        let e: *mut widget.Widget = scene.node_widget(&(*a).sc, (*a).ed_node[k])
+        let c: *mut render.Ctx = &(*a).c
+        let now: u64 = ((*c).ms as u64) * 1000
+        let x0: f64 = render.field_text_x0(c, e)
+        if (*a).area[k] {
+            let y0: f64 = widget.w_y(e) + render.pady_of(c, e)
+            let r: u32 = textarea.ta_mouse_down(&(*a).lines[k], &(*a).ed[k],
+                x - x0, y - y0, now, false)
+        } else {
+            var fm: render.FieldMeas = render.field_meas_new(c, e)
+            let r2: u32 = editor.editor_mouse_down(&(*a).ed[k], x - x0, now,
+                render.field_meas, (&fm) as u64, false)
+        }
+        (*a).drag_k = k
+        return true
+    }
+    if kind == fuiwirt.HOOK_MOVE && (*a).drag_k != NONE {
+        let k: usize = (*a).drag_k
+        let e: *mut widget.Widget = scene.node_widget(&(*a).sc, (*a).ed_node[k])
+        let c: *mut render.Ctx = &(*a).c
+        let x0: f64 = render.field_text_x0(c, e)
+        if (*a).area[k] {
+            let y0: f64 = widget.w_y(e) + render.pady_of(c, e)
+            let r: u32 = textarea.ta_mouse_drag(&(*a).lines[k], &(*a).ed[k],
+                x - x0, y - y0)
+        } else {
+            var fm: render.FieldMeas = render.field_meas_new(c, e)
+            let r2: u32 = editor.editor_mouse_drag(&(*a).ed[k], x - x0,
+                render.field_meas, (&fm) as u64)
+        }
+        return true
+    }
+    return false
+}
+
+// The text field (slot) under a point, NONE if there is none.
+fn slot_at(a: *mut App, x: f64, y: f64) -> usize {
+    let n: usize = scene.scene_hit(&(*a).sc, x, y)
+    if n == scene.SCENE_NONE {
+        return NONE
+    }
+    return slot_of(a, n)
 }
 
 // The host says node `i` was activated (click, Enter, space).

@@ -287,6 +287,17 @@ build editor
 "$W/editor"
 
 echo
+echo "== 18t. DAS MEHRZEILIGE TEXTFELD (lib/fui/textarea.fi) =="
+# The lines, the goal column of Up / Down, Home / End, Enter and paste in
+# multi-line mode, undo of a long text, the mouse and the scroll -- with a
+# fixed width per byte, no window. Counter-checks inside (width 0 does not
+# wrap, a one-line field still commits on Enter, the default undo step has
+# no undo for 600 bytes). The picture and the mouse in a real window:
+# section 18p (app_main, "notes").
+build textarea
+"$W/textarea"
+
+echo
 echo "== 18a. DIE EINGABEMETHODE: CHINESISCH, JAPANISCH, KOREANISCH =="
 # lib/fui/ime.fi with its connection to editor.fi. Re-calculated
 # are romaji to kana (double consonant, n rule, tch), the
@@ -516,6 +527,13 @@ build animkey
 "$W/animkey"
 
 echo
+echo "== 18g. ORPHANED TRANSITION ENTRIES ARE GIVEN BACK (r115) =="
+# a full registry hands the slot of an entry nobody asked for during 2 s to a
+# newcomer; counter-checks: nothing stale = refused, ten live widgets keep theirs
+build transgc
+"$W/transgc"
+
+echo
 echo "== 18p. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
 # lib/fui/app.fi (29.09.2026): the three programs of examples/fui/ build
 # for BOTH platforms from one source -- `import fui.apphost` resolves to
@@ -523,12 +541,12 @@ echo "== 18p. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
 # and tools/fui/app_main.fi drives them without a window (layout, clicks,
 # keys, text fields, wrapping, scale 2). The browser half with Chromium:
 # bash tools/wasm/appdemo.sh.
-for ex in hello_window counter form touchpad; do
+for ex in hello_window counter form touchpad notes; do
     "$FIRNC" --opt-level=dev -o "$W/app_$ex" "examples/fui/$ex.fi"
     "$FIRNC" --opt-level=dev --target=wasm32-browser -o "$W/app_$ex.wasm" \
         "examples/fui/$ex.fi"
 done
-echo "  examples/fui/{hello_window,counter,form,touchpad}.fi build native + wasm32   OK"
+echo "  examples/fui/{hello_window,counter,form,touchpad,notes}.fi build native + wasm32   OK"
 build app
 "$W/app"
 

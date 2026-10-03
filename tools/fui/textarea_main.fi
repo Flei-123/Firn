@@ -1,0 +1,378 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/textarea_main.fi -- THE TEXT AREA, WITHOUT A SCREEN.
+//
+// lib/fui/textarea.fi asks ONE function for widths, so everything it does
+// with lines can be checked with a fixed width per byte (10 pixels): no
+// window, no font. What is checked, each with a counter-check where a wrong
+// answer is plausible:
+//
+//   1. THE LAYOUT: hard breaks, a trailing LF, an empty text, a word
+//      longer than the box, the hanging space, a cut after a space.
+//   2. WHERE A POSITION BELONGS: at a soft break to the next line, at a LF
+//      to the line it ends.
+//   3. COLUMN AND PIXEL: nearest boundary left/right of the middle, never
+//      behind a soft break.
+//   4. UP / DOWN WITH A GOAL COLUMN: down through a short line and on to a
+//      long one comes back to the old column; first line up = start,
+//      last line down = end.
+//   5. HOME / END = visual line, Ctrl = text.
+//   6. ENTER: LF in the area, COMMIT with Ctrl, and the one-line editor
+//      still commits (counter-check: Enter must not change the field).
+//   7. PASTE: line breaks stay in the area (CR LF -> LF), become spaces in
+//      a one-line field.
+//   8. UNDO of a text over 512 bytes (the old step size had none).
+//   9. THE MOUSE: single, double, triple click.
+//  10. THE SCROLL: follows the caret both ways, PageDown moves a page.
+import std.rt
+import fui.textbuf
+import fui.editor
+import fui.textarea
+
+static mut G_ERRORS: usize = 0
+
+fn report(nm: u64, nn: usize, ok: bool, got: i64, want: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, nm, nn)
+    var i: usize = nn
+    while i < 52 {
+        rt.buf_push(&t, 32 as u8)
+        i = i + 1
+    }
+    if ok {
+        var o: [u8; 3] = "OK "
+        rt.buf_push_bytes(&t, (&o[0]) as u64, 3)
+    } else {
+        var f: [u8; 8] = "WRONG   "
+        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
+        G_ERRORS = G_ERRORS + 1
+    }
+    var h1: [u8; 5] = " got "
+    rt.buf_push_bytes(&t, (&h1[0]) as u64, 5)
+    rt.buf_push_dec_i64(&t, got)
+    var h2: [u8; 6] = " want "
+    rt.buf_push_bytes(&t, (&h2[0]) as u64, 6)
+    rt.buf_push_dec_i64(&t, want)
+    rt.buf_push(&t, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn chk(nm: str, got: i64, want: i64) {
+    report(nm.p as u64, nm.n, got == want, got, want)
+}
+
+// 10 pixels per byte
+fn mono(ctx: u64, p: u64, n: usize) -> f64 {
+    return (n as f64) * 10.0
+}
+
+fn put(ed: *mut editor.Editor, s: str, caret: usize) {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    textbuf.tb_set_text(t, s.p as u64, s.n)
+    textbuf.tb_set_range(t, caret, caret)
+}
+
+fn caret(ed: *mut editor.Editor) -> i64 {
+    return textbuf.tb_caret(editor.editor_buf(ed)) as i64
+}
+
+fn tlen(ed: *mut editor.Editor) -> i64 {
+    return textbuf.tb_len(editor.editor_buf(ed)) as i64
+}
+
+// the layout as "a-b|a-b|..." is too much to build in a language without
+// formatting: every line is asked for its two numbers instead
+fn line_a(l: *mut textarea.Lines, i: usize) -> i64 {
+    return textarea.ta_line_start(l, i) as i64
+}
+
+fn line_b(l: *mut textarea.Lines, i: usize) -> i64 {
+    return textarea.ta_line_end(l, i) as i64
+}
+
+fn main(start: u64) -> i32 {
+    var raw: [u8; 4096] = [0; 4096]
+    var ed: editor.Editor = editor.editor_new()
+    if !editor.editor_init_cap(&ed, (&raw[0]) as u64, 4096, 2048) {
+        var oom: [u8; 23] = "editor_init: no memory\n"
+        rt.write_everything(2, (&oom[0]) as u64, 23)
+        return 2
+    }
+    editor.editor_set_multiline(&ed, true)
+    var l: textarea.Lines = textarea.ta_new()
+    if !textarea.ta_init(&l, 0) {
+        return 2
+    }
+    textarea.ta_set_measure(&l, mono, 0)
+    textarea.ta_set_view(&l, 60.0, 48.0, 16.0)
+
+    // ================================================================
+    // 1. THE LAYOUT (box 60 px = 6 bytes, 3 lines visible)
+    // ================================================================
+    put(&ed, "hello world", 0)
+    textarea.ta_relayout(&l, &ed)
+    chk("1 'hello world': 2 lines", textarea.ta_line_count(&l) as i64, 2)
+    chk("1 line 0 = 0..6 (cut after the space)", line_a(&l, 0) * 100 + line_b(&l, 0), 6)
+    chk("1 line 1 = 6..11", line_a(&l, 1) * 100 + line_b(&l, 1), 611)
+
+    put(&ed, "ab\ncd", 0)
+    textarea.ta_relayout(&l, &ed)
+    chk("1 'ab LF cd': 2 lines", textarea.ta_line_count(&l) as i64, 2)
+    chk("1 line 1 starts BEHIND the LF (3..5)", line_a(&l, 1) * 100 + line_b(&l, 1), 305)
+
+    put(&ed, "ab\n", 0)
+    textarea.ta_relayout(&l, &ed)
+    chk("1 text ending in LF: an empty last line", textarea.ta_line_count(&l) as i64, 2)
+    chk("1 ... at 3..3", line_a(&l, 1) * 100 + line_b(&l, 1), 303)
+
+    put(&ed, "", 0)
+    textarea.ta_relayout(&l, &ed)
+    chk("1 empty text: ONE line", textarea.ta_line_count(&l) as i64, 1)
+
+    put(&ed, "abcdefghij", 0)
+    textarea.ta_set_view(&l, 40.0, 48.0, 16.0)
+    textarea.ta_relayout(&l, &ed)
+    chk("1 a word wider than the box: 3 lines of 4", textarea.ta_line_count(&l) as i64, 3)
+    chk("1 ... 0..4", line_a(&l, 0) * 100 + line_b(&l, 0), 4)
+    chk("1 ... 4..8", line_a(&l, 1) * 100 + line_b(&l, 1), 408)
+    chk("1 ... 8..10", line_a(&l, 2) * 100 + line_b(&l, 2), 810)
+
+    put(&ed, "abcd efgh", 0)
+    textarea.ta_relayout(&l, &ed)
+    chk("1 word ends at the edge: the space hangs, 2 lines", textarea.ta_line_count(&l) as i64, 2)
+    chk("1 ... line 0 = 0..5 (with the space)", line_a(&l, 0) * 100 + line_b(&l, 0), 5)
+    chk("1 ... line 1 = 5..9", line_a(&l, 1) * 100 + line_b(&l, 1), 509)
+
+    // counter-check: no wrapping with width 0
+    textarea.ta_set_view(&l, 0.0, 48.0, 16.0)
+    put(&ed, "abcdefghij klmnop", 0)
+    textarea.ta_relayout(&l, &ed)
+    chk("1 counter-check: width 0 = no wrapping", textarea.ta_line_count(&l) as i64, 1)
+    textarea.ta_set_view(&l, 60.0, 48.0, 16.0)
+
+    // ================================================================
+    // 2. WHERE A POSITION BELONGS
+    // ================================================================
+    put(&ed, "hello world", 0)
+    textarea.ta_relayout(&l, &ed)
+    chk("2 position 5 (before the space) is line 0", textarea.ta_line_of(&l, 5) as i64, 0)
+    chk("2 position 6 = the soft break: the NEXT line", textarea.ta_line_of(&l, 6) as i64, 1)
+    put(&ed, "ab\ncd", 0)
+    textarea.ta_relayout(&l, &ed)
+    chk("2 position 2 (on the LF) ends line 0", textarea.ta_line_of(&l, 2) as i64, 0)
+    chk("2 position 3 (behind the LF) is line 1", textarea.ta_line_of(&l, 3) as i64, 1)
+
+    // ================================================================
+    // 3. COLUMN AND PIXEL
+    // ================================================================
+    put(&ed, "hello world", 0)
+    textarea.ta_relayout(&l, &ed)
+    let t: *mut textbuf.TextBuf = editor.editor_buf(&ed)
+    chk("3 x = 26 -> boundary 3", textarea.ta_pos_at(&l, t, 0, 26.0) as i64, 3)
+    chk("3 x = 24 -> boundary 2", textarea.ta_pos_at(&l, t, 0, 24.0) as i64, 2)
+    chk("3 far right on a soft line: 5, NOT 6", textarea.ta_pos_at(&l, t, 0, 900.0) as i64, 5)
+    chk("3 far right on the last line: the end, 11", textarea.ta_pos_at(&l, t, 1, 900.0) as i64, 11)
+    chk("3 x left of everything: line start", textarea.ta_pos_at(&l, t, 1, 0.0 - 5.0) as i64, 6)
+    chk("3 x_of(line 1, 9) = 30 px", textarea.ta_x_of(&l, t, 1, 9) as i64, 30)
+
+    // ================================================================
+    // 4. UP / DOWN WITH A GOAL COLUMN (box wide enough: no wrapping)
+    // ================================================================
+    textarea.ta_set_view(&l, 200.0, 48.0, 16.0)
+    put(&ed, "aaaaaa\nbb\ncccccc", 6)
+    var r: u32 = textarea.ta_key(&l, &ed, editor.KEY_DOWN, 0 as u32)
+    chk("4 Down from column 6 into 'bb': end of 'bb' = 9", caret(&ed), 9)
+    chk("4 ... answer is MOVED", r as i64, editor.RES_MOVED as i64)
+    r = textarea.ta_key(&l, &ed, editor.KEY_DOWN, 0 as u32)
+    chk("4 Down again: the goal column 6 comes back = 16", caret(&ed), 16)
+    r = textarea.ta_key(&l, &ed, editor.KEY_UP, 0 as u32)
+    chk("4 Up: 'bb' again = 9", caret(&ed), 9)
+    r = textarea.ta_key(&l, &ed, editor.KEY_UP, 0 as u32)
+    chk("4 Up: column 6 on line 0 = 6", caret(&ed), 6)
+    r = textarea.ta_key(&l, &ed, editor.KEY_UP, 0 as u32)
+    chk("4 Up on the first line: the start", caret(&ed), 0)
+    put(&ed, "aaaaaa\nbb\ncccccc", 12)
+    r = textarea.ta_key(&l, &ed, editor.KEY_DOWN, 0 as u32)
+    chk("4 Down on the last line: the end", caret(&ed), 16)
+    // another key forgets the goal column
+    put(&ed, "aaaaaa\nbb\ncccccc", 6)
+    r = textarea.ta_key(&l, &ed, editor.KEY_DOWN, 0 as u32)
+    r = textarea.ta_key(&l, &ed, editor.KEY_LEFT, 0 as u32)
+    r = textarea.ta_key(&l, &ed, editor.KEY_DOWN, 0 as u32)
+    chk("4 Left in between resets the goal: column 1 on line 2 = 11", caret(&ed), 11)
+    // Shift extends
+    put(&ed, "aaaaaa\nbb", 2)
+    r = textarea.ta_key(&l, &ed, editor.KEY_DOWN, editor.MOD_SHIFT)
+    chk("4 Shift+Down keeps the anchor at 2", textbuf.tb_anchor(t) as i64, 2)
+    chk("4 ... and moves the caret to 9", caret(&ed), 9)
+
+    // through a soft break
+    textarea.ta_set_view(&l, 60.0, 48.0, 16.0)
+    put(&ed, "hello world", 2)
+    r = textarea.ta_key(&l, &ed, editor.KEY_DOWN, 0 as u32)
+    chk("4 wrapped: Down from column 2 -> 6 + 2 = 8", caret(&ed), 8)
+    r = textarea.ta_key(&l, &ed, editor.KEY_UP, 0 as u32)
+    chk("4 wrapped: Up -> 2", caret(&ed), 2)
+
+    // ================================================================
+    // 5. HOME / END
+    // ================================================================
+    put(&ed, "hello world", 8)
+    r = textarea.ta_key(&l, &ed, editor.KEY_HOME, 0 as u32)
+    chk("5 Home on the wrapped line 1 = 6, not 0", caret(&ed), 6)
+    put(&ed, "hello world", 2)
+    r = textarea.ta_key(&l, &ed, editor.KEY_END, 0 as u32)
+    chk("5 End on the soft line 0 = 5 (before the space)", caret(&ed), 5)
+    put(&ed, "hello world", 8)
+    r = textarea.ta_key(&l, &ed, editor.KEY_END, 0 as u32)
+    chk("5 End on the last line = 11", caret(&ed), 11)
+    r = textarea.ta_key(&l, &ed, editor.KEY_HOME, editor.MOD_CTRL)
+    chk("5 Ctrl+Home = 0", caret(&ed), 0)
+    r = textarea.ta_key(&l, &ed, editor.KEY_END, editor.MOD_CTRL)
+    chk("5 Ctrl+End = 11", caret(&ed), 11)
+    put(&ed, "ab\ncd", 4)
+    r = textarea.ta_key(&l, &ed, editor.KEY_HOME, 0 as u32)
+    chk("5 Home behind a LF = 3", caret(&ed), 3)
+    r = textarea.ta_key(&l, &ed, editor.KEY_UP, 0 as u32)
+    r = textarea.ta_key(&l, &ed, editor.KEY_END, 0 as u32)
+    chk("5 End on a hard line = on the LF = 2", caret(&ed), 2)
+
+    // ================================================================
+    // 6. ENTER
+    // ================================================================
+    put(&ed, "ab", 1)
+    r = textarea.ta_key(&l, &ed, editor.KEY_ENTER, 0 as u32)
+    chk("6 Enter: the text grew by one byte", tlen(&ed), 3)
+    chk("6 ... the caret is behind the LF = 2", caret(&ed), 2)
+    chk("6 ... answer is CHANGED", r as i64, editor.RES_CHANGED as i64)
+    chk("6 ... and the line count is 2", textarea.ta_line_count(&l) as i64, 2)
+    r = textarea.ta_key(&l, &ed, editor.KEY_ENTER, editor.MOD_CTRL)
+    chk("6 Ctrl+Enter commits", r as i64, editor.RES_COMMIT as i64)
+    chk("6 ... and does not change the text", tlen(&ed), 3)
+    // counter-check: the one-line editor
+    var raw1: [u8; 64] = [0; 64]
+    var one: editor.Editor = editor.editor_new()
+    let ok1: bool = editor.editor_init(&one, (&raw1[0]) as u64, 64)
+    put(&one, "ab", 1)
+    let r1: u32 = editor.editor_key(&one, editor.KEY_ENTER, 0 as u32)
+    chk("6 counter-check: a one-line field still commits on Enter", r1 as i64, editor.RES_COMMIT as i64)
+    chk("6 ... and Enter does not touch its text", tlen(&one), 2)
+
+    // ================================================================
+    // 7. PASTE
+    // ================================================================
+    put(&ed, "x\r\ny", 0)
+    var ok2: bool = copy_all(&ed)
+    chk("7 copy of everything worked", ok2 as i64, 1)
+    editor.editor_clear(&ed)
+    ok2 = editor.editor_paste(&ed)
+    chk("7 area: CR LF -> ONE LF, 3 bytes", tlen(&ed), 3)
+    chk("7 ... the middle byte is the LF", textbuf_byte(&ed, 1) as i64, 10)
+    // the one-line field gets the same clipboard text
+    put(&one, "x\r\ny", 0)
+    ok2 = copy_all(&one)
+    editor.editor_clear(&one)
+    ok2 = editor.editor_paste(&one)
+    chk("7 one-line: both breaks become spaces, 4 bytes", tlen(&one), 4)
+    chk("7 ... byte 1 is a space", textbuf_byte(&one, 1) as i64, 32)
+
+    // ================================================================
+    // 8. UNDO OF A LONG TEXT
+    // ================================================================
+    var long: [u8; 600] = [97 as u8; 600]
+    let t2: *mut textbuf.TextBuf = editor.editor_buf(&ed)
+    textbuf.tb_set_text(t2, (&long[0]) as u64, 600)
+    textbuf.tb_set_range(t2, 600, 600)
+    var rc: u32 = textarea.ta_char(&l, &ed, 98 as u32, 0 as u32)
+    chk("8 typing into 600 bytes: 601 bytes", tlen(&ed), 601)
+    rc = textarea.ta_char(&l, &ed, 122 as u32, editor.MOD_CTRL)
+    chk("8 Ctrl+Z gives the 600 bytes back (step size 2048)", tlen(&ed), 600)
+    // counter-check: the default step size has no undo for it
+    var rawd: [u8; 1024] = [0; 1024]
+    var dflt: editor.Editor = editor.editor_new()
+    let ok3: bool = editor.editor_init(&dflt, (&rawd[0]) as u64, 1024)
+    let t3: *mut textbuf.TextBuf = editor.editor_buf(&dflt)
+    textbuf.tb_set_text(t3, (&long[0]) as u64, 600)
+    textbuf.tb_set_range(t3, 600, 600)
+    rc = editor.editor_char(&dflt, 98 as u32, 0 as u32)
+    rc = editor.editor_char(&dflt, 122 as u32, editor.MOD_CTRL)
+    chk("8 counter-check: default step size (512) keeps the 601 bytes", tlen(&dflt), 601)
+    editor.editor_free(&dflt)
+
+    // ================================================================
+    // 9. THE MOUSE
+    // ================================================================
+    textarea.ta_set_view(&l, 200.0, 48.0, 16.0)
+    put(&ed, "alpha beta\ngamma", 0)
+    textarea.ta_relayout(&l, &ed)
+    // line 1 is y 16..32
+    r = textarea.ta_mouse_down(&l, &ed, 22.0, 20.0, 1000000 as u64, false)
+    chk("9 click at (22, line 1) -> 11 + 2 = 13", caret(&ed), 13)
+    r = textarea.ta_mouse_down(&l, &ed, 22.0, 20.0, 1100000 as u64, false)
+    chk("9 double click selects the word 'gamma': 11..16", textbuf.tb_sel_a(t) as i64 * 100 + textbuf.tb_sel_b(t) as i64, 1116)
+    r = textarea.ta_mouse_down(&l, &ed, 22.0, 20.0, 1200000 as u64, false)
+    chk("9 triple click selects the paragraph 11..16", textbuf.tb_sel_a(t) as i64 * 100 + textbuf.tb_sel_b(t) as i64, 1116)
+    r = textarea.ta_mouse_down(&l, &ed, 44.0, 3.0, 5000000 as u64, false)
+    chk("9 a later click on line 0 -> 4", caret(&ed), 4)
+    r = textarea.ta_mouse_down(&l, &ed, 44.0, 3.0, 9000000 as u64, false)
+    r = textarea.ta_mouse_down(&l, &ed, 44.0, 3.0, 9100000 as u64, false)
+    r = textarea.ta_mouse_down(&l, &ed, 44.0, 3.0, 9200000 as u64, false)
+    chk("9 triple click on line 0 selects 0..10 (up to the LF)", textbuf.tb_sel_a(t) as i64 * 100 + textbuf.tb_sel_b(t) as i64, 10)
+    r = textarea.ta_mouse_down(&l, &ed, 10.0, 3.0, 20000000 as u64, false)
+    r = textarea.ta_mouse_drag(&l, &ed, 60.0, 20.0)
+    chk("9 drag to (60, line 1): the caret goes to the end, 16", textbuf.tb_sel_b(t) as i64, 16)
+    chk("9 ... the anchor stays at 1", textbuf.tb_sel_a(t) as i64, 1)
+    textbuf.tb_set_drag(t, 0 as u32)
+    r = textarea.ta_mouse_drag(&l, &ed, 10.0, 3.0)
+    chk("9 counter-check: a drag without the button down does nothing", r as i64, editor.RES_NONE as i64)
+
+    // ================================================================
+    // 10. THE SCROLL (3 lines visible, 16 px each)
+    // ================================================================
+    put(&ed, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10", 0)
+    textarea.ta_relayout(&l, &ed)
+    chk("10 ten lines", textarea.ta_line_count(&l) as i64, 10)
+    chk("10 3 lines visible", textarea.ta_visible_rows(&l) as i64, 3)
+    r = textarea.ta_key(&l, &ed, editor.KEY_END, editor.MOD_CTRL)
+    chk("10 Ctrl+End scrolls so the last line is in view: (10-3) * 16 = 112", textarea.ta_scroll_y(&l) as i64, 112)
+    r = textarea.ta_key(&l, &ed, editor.KEY_HOME, editor.MOD_CTRL)
+    chk("10 Ctrl+Home scrolls back to 0", textarea.ta_scroll_y(&l) as i64, 0)
+    r = textarea.ta_key(&l, &ed, editor.KEY_PGDN, 0 as u32)
+    chk("10 PageDown moves visible - 1 = 2 lines: caret on line 2 (pos 4)", caret(&ed), 4)
+    chk("10 ... the scroll stays 0 (line 2 is the third visible one)", textarea.ta_scroll_y(&l) as i64, 0)
+    r = textarea.ta_key(&l, &ed, editor.KEY_PGDN, 0 as u32)
+    chk("10 PageDown again: line 4 (pos 8)", caret(&ed), 8)
+    chk("10 ... scrolled to show line 4: (4 + 1) * 16 - 48 = 32", textarea.ta_scroll_y(&l) as i64, 32)
+    r = textarea.ta_key(&l, &ed, editor.KEY_PGUP, 0 as u32)
+    chk("10 PageUp: line 2 (pos 4)", caret(&ed), 4)
+    chk("10 ... the scroll follows up: 32", textarea.ta_scroll_y(&l) as i64, 32)
+    textarea.ta_wheel(&l, 1000.0)
+    chk("10 the wheel stops at the end: 112", textarea.ta_scroll_y(&l) as i64, 112)
+    textarea.ta_wheel(&l, 0.0 - 1000.0)
+    chk("10 ... and at the top: 0", textarea.ta_scroll_y(&l) as i64, 0)
+    // a click scrolls nothing, a position far down does
+    r = textarea.ta_mouse_down(&l, &ed, 0.0, 47.0, 40000000 as u64, false)
+    chk("10 click in the third visible row hits line 2 (pos 4)", caret(&ed), 4)
+
+    textarea.ta_free(&l)
+    editor.editor_free(&ed)
+    editor.editor_free(&one)
+
+    var end: [u8; 19] = "\nTEXTAREA PASSED.\n\n"
+    if G_ERRORS != 0 {
+        var bad: [u8; 19] = "\nTEXTAREA FAILED.\n\n"
+        rt.write_everything(2, (&bad[0]) as u64, 19)
+        return 1
+    }
+    rt.write_everything(1, (&end[0]) as u64, 19)
+    return 0
+}
+
+fn textbuf_byte(ed: *mut editor.Editor, i: usize) -> u8 {
+    return *((textbuf.tb_ptr(editor.editor_buf(ed)) + i as u64) as *mut u8)
+}
+
+fn copy_all(ed: *mut editor.Editor) -> bool {
+    textbuf.tb_select_all(editor.editor_buf(ed))
+    return editor.editor_copy(ed)
+}
