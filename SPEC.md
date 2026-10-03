@@ -1470,9 +1470,14 @@ passed on as `inout`, no `inout` of a `let`, no re-declaration of the name.
 be touched by another argument -- `f(inout a, a)`, `f(inout a, &a)`,
 `f(inout a, inout a)` and `f(inout a.x, a.x)` are errors, `f(inout a.x, a.y)` is
 fine (an index counts as the whole array). Purely syntactic, checked in every
-body (`refparam.rs::check_exclusive`). **Not yet checked** (borrow checker,
-ROADMAP r18): exclusivity across statements, and a reference can still be
-copied into a raw pointer. The self-hosted parser (`lib/firnc1/parser.fi`)
+body (`refparam.rs::check_exclusive`). **A reference is second class (round
+BORROW1, r193):** inside the body a reference parameter may only be used as
+`p.f` / `p[i]`, as `*p`, and as an argument of a call (as it is, as `&p` or as
+`inout p`); copying it into a variable, a field or an array, returning it,
+casting it or doing arithmetic on it is an error ("cannot be copied, stored or
+returned"). **Not yet checked** (the rest of the borrow checker, ROADMAP r193):
+exclusivity across statements, and a callee can still turn the reference it was
+handed into a raw pointer. The self-hosted parser (`lib/firnc1/parser.fi`)
 reads reference parameters in all four places and rewrites the body while it
 parses; it does not check the "exactly one" rule or the read-only rule with
 messages (it only counts errors, as everywhere), the negative tests belong to
@@ -1528,11 +1533,18 @@ without a `drop` is not touched by any of this.
   the locals still owning a value are dropped there as well.
 * A temporary that owns a value (`mk().f`, `mk().m()` with a borrowing
   receiver) is an error: bind it with `let` first, so that somebody drops it.
+* **The self-hosted compiler (round OWN-3, r192)** does all of it: the move
+  checker is `lib/firnc1/moves.fi`, the destruction glue sits in
+  `lib/firnc1/lower.fi` (`drop_push`, `emit_drop`, `run_drop`, `apply_moves`),
+  and the FIR of both lowerings is the same text. The messages are the same
+  too, except that firnc1 draws a marker one character wide (its tree knows
+  where a node starts, not where it ends); `tools/moves/run.sh` compares
+  everything else.
 * **Not yet:** `drop` for a `gc class` or `Rc[T]`, moves inside `defer`,
-  partial moves, the self-hosted compiler (`firnc1` treats a file with a `drop` as an
-  extension that is not ported).
+  partial moves.
 * Proof: `tests/2004_move_ok.fi`, `tests/2005_drop_order.fi`,
-  `tests/neg/move_*.fi`, `tests/neg/drop_wrong_shape.fi`.
+  `tests/2010_drop_more.fi`, `tests/neg/move_*.fi`,
+  `tests/neg/drop_*.fi`, `tools/moves/run.sh`.
 
 ### 14.1 Addendum: deliberate deviations of the stage 0 implementation (`firnc0`)
 

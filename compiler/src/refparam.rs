@@ -14,9 +14,15 @@
 //! * Re-declaring the name (`let p`, `var p`, a `for` variable) is an error,
 //!   because the rewrite would then be ambiguous.
 //!
-//! What this deliberately does NOT do (that is the borrow checker, ROADMAP
-//! r18): the rule "exactly one `inout`" is not checked, and a reference may
-//! still be copied into a raw pointer.
+//! **Second class (ROUND BORROW1, r193):** a reference parameter may be used
+//! only as `p.f` / `p[i]`, as `*p`, as an argument of a call (as it is, or as
+//! `&p` / `inout p`). Copying it into a variable, a field or an array,
+//! returning it, casting it or doing arithmetic on it is an error: that is
+//! what stops a reference from outliving the call that lent it.
+//!
+//! What this deliberately does NOT do (the rest of the borrow checker,
+//! ROADMAP r193): a reference handed to a call can still be turned into a raw
+//! pointer by the callee, and exclusivity across statements is not tracked.
 
 use crate::ast::*;
 use crate::diag::{Diags, Span};
@@ -106,6 +112,33 @@ fn write_check(cx: &mut Ctx, target: &Expr) {
     }
 }
 
+/// Is `e` the bare name of a reference parameter?
+fn is_ref_name(cx: &Ctx, e: &Expr) -> bool {
+    matches!(&e.kind, ExprKind::Ident(n) if find(cx, n).is_some())
+}
+
+/// ROUND BORROW1: the bare name of a reference parameter used as a VALUE.
+fn escape_error(cx: &mut Ctx, e: &Expr) {
+    if let ExprKind::Ident(n) = &e.kind {
+        cx.dg.error_note(
+            e.span,
+            format!("the reference parameter '{}' cannot be copied, stored or returned", n),
+            "a reference is second class: use it as '{}.f' or '*{}', pass it to a call as it is, \
+             or take it with '&{}' / 'inout {}'"
+                .replace("{}", n),
+        );
+    }
+}
+
+/// An argument of a call: the bare name of a reference parameter is handed
+/// on as it is.
+fn arg(cx: &mut Ctx, a: &mut Expr) {
+    if is_ref_name(cx, a) {
+        return;
+    }
+    expr(cx, a);
+}
+
 fn stmt(cx: &mut Ctx, s: &mut Stmt) {
     match s {
         Stmt::Let { name, init, span, .. } => {
@@ -113,7 +146,11 @@ fn stmt(cx: &mut Ctx, s: &mut Stmt) {
             expr(cx, init);
         }
         Stmt::AssignOp { target, value, .. } | Stmt::Assign { target, value, .. } => {
-            expr(cx, target);
+            // `p = ...` on the bare name is the business of the ordinary
+            // "parameters cannot be modified" check.
+            if !is_ref_name(cx, target) {
+                expr(cx, target);
+            }
             expr(cx, value);
             write_check(cx, target);
         }
@@ -181,11 +218,18 @@ fn expr(cx: &mut Ctx, e: &mut Expr) {
         }
         ExprKind::Lambda(d) => block(cx, &mut d.body),
         ExprKind::Text(_, inner) => expr(cx, inner),
-        ExprKind::Call(_, args, _) | ExprKind::Syscall(args) | ExprKind::ArrayLit(args) => {
+        ExprKind::Call(_, args, _) => {
+            for a in args {
+                arg(cx, a);
+            }
+        }
+        ExprKind::Syscall(args) | ExprKind::ArrayLit(args) => {
             for a in args {
                 expr(cx, a);
             }
         }
+        // `*p`: the explicit dereference of a reference parameter.
+        ExprKind::Unary(UnOp::Deref, a) if is_ref_name(cx, a) => {}
         // `&p` / `inout p` on a reference parameter passes the reference on
         // (a reborrow); it must not become a pointer to the pointer. A
         // read-only `&T` cannot be handed on as `inout`.
@@ -218,8 +262,13 @@ fn expr(cx: &mut Ctx, e: &mut Expr) {
         ExprKind::Float(..)
         | ExprKind::FloatF32(_)
         | ExprKind::Int(_)
-        | ExprKind::Bool(_)
-        | ExprKind::Ident(_) => {}
+        | ExprKind::Bool(_) => {}
+        // A bare name that gets here is used as a value (ROUND BORROW1).
+        ExprKind::Ident(_) => {
+            if is_ref_name(cx, e) {
+                escape_error(cx, e);
+            }
+        }
     }
 }
 
