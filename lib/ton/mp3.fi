@@ -1,0 +1,2033 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/ton/mp3.fi -- MPEG-1/2/2.5 Layer III (MP3) DEKODER, in Firn.
+//
+// WOFUER. Ohne Dekoder ist eine Tonschicht taub: jeder Internetsender, jede
+// .mp3 auf der Platte und jeder Strom, den ein Radio liefert, ist Layer III.
+// Diese Datei nimmt Oktette und gibt PCM -- 16 Bit, verschachtelt, in der
+// Abtastrate des Stroms. Was danach kommt (Mischer, Geraet), ist nicht ihre
+// Sache; sie macht keinen Systemaufruf und fasst keinen Haufen an.
+//
+// HERKUNFT, KLAR GESAGT. Der Aufbau folgt minimp3 von lieff
+// (https://github.com/lieff/minimp3), veroeffentlicht unter CC0-1.0 -- also
+// gemeinfrei, ohne Bedingung. Das ist kein Zufall und keine Bequemlichkeit:
+// ein MP3-Dekoder ist zu neun Zehnteln TABELLE und zu einem Zehntel Regel,
+// und wer die Tabellen abtippt, tippt sie falsch. Die Tabellen kommen
+// deshalb ueber `tools/mp3_tabellen.py` aus der Vorlage und liegen erzeugt
+// in `mp3_tab.fi`; der Ablauf hier ist neu geschrieben, weil Firn weder
+// Zeigerarithmetik im C-Stil noch globale Variablen hat.
+//
+// PATENTE: die MP3-Patente sind 2017 abgelaufen (Fraunhofer hat das
+// Lizenzprogramm zum 23.04.2017 eingestellt). Deshalb ist das hier
+// ueberhaupt eine vernuenftige Wahl und nicht Opus.
+//
+// ======================================================== WIE MP3 AUFGEBAUT IST
+//
+// Ein Strom ist eine Folge von RAHMEN. Jeder Rahmen beginnt mit vier
+// Oktetten Kopf (elf Einsbits Synchronwort, dann Fassung, Schicht,
+// Bitrate, Abtastrate, Kanalmodus) und traegt 1152 Abtastwerte je Kanal
+// (MPEG-1) bzw. 576 (MPEG-2/2.5). Die Laenge steht NICHT im Kopf -- sie
+// rechnet sich aus Bitrate und Abtastrate, plus ein Polsteroktett, wenn
+// das Polsterbit gesetzt ist.
+//
+// DER HAUPTDATENZEIGER ist die Stelle, an der die meisten selbstgebauten
+// Dekoder scheitern: die Nutzdaten eines Rahmens fangen NICHT hinter
+// seinem Kopf an. `main_data_begin` sagt, wie viele Oktette VOR dem
+// eigenen Kopf die eigenen Daten beginnen -- der Kodierer leiht sich Platz
+// aus den Vorgaengern (Bitreservoir, bis 511 Oktette). Ein Dekoder, der
+// den letzten Rest nicht aufhebt, klingt bei jedem Rahmen kurz falsch.
+//
+// DER WEG EINER GRANULE (576 Frequenzlinien):
+//   1. Seiteninfo lesen (Laengen, Blocktyp, Huffman-Tabellenwahl)
+//   2. Skalenfaktoren lesen und zu Verstaerkungen ausrechnen
+//   3. Huffman entschluesseln und gleich requantisieren (x^(4/3))
+//   4. Stereo aufloesen (Mitte/Seite bzw. Intensitaet)
+//   5. bei kurzen Bloecken umsortieren, sonst Antialias
+//   6. IMDCT je Band (36 oder 3x12 Punkte) mit Ueberlappung zum Vorrahmen
+//   7. Vorzeichenwechsel, dann die Synthesefilterbank (32 Teilbaender ->
+//      32 Abtastwerte, 512-Punkt-Fenster ueber 16 Rahmen Vorgeschichte)
+//
+// ================================================================== EHRLICH
+//
+// E1 NUR LAYER III. Layer I und II sind in der Vorlage vorhanden und hier
+//    WEGGELASSEN -- fuer Radio und Dateien spielt beides keine Rolle. Ein
+//    Rahmen mit Layer I/II wird erkannt und uebersprungen, nicht geraten.
+// E2 KEIN SIMD. Die Vorlage hat SSE- und NEON-Wege; hier steht der
+//    skalare. Das ist etwa zwei- bis dreimal langsamer und exakt dieselbe
+//    Rechnung -- gemessen wird es in `docs/TON1.md`, nicht behauptet.
+// E3 KEIN FREIES FORMAT ohne Nachweis: Rahmen ohne Bitratenangabe werden
+//    ueber den Abstand zweier Koepfe vermessen, wie in der Vorlage.
+// E4 DIE AUSGABE IST i16. Wer Fliesskomma braucht, nimmt `mp3_pcm_f32`.
+// E5 KEIN ID3. Ein Merkblock am Dateianfang wird von der Rahmensuche
+//    einfach ueberlaufen; das kostet Zeit, aber keine Richtigkeit.
+import std.rt
+import ton.mp3_tab
+
+export {
+    Mp3Dec, Mp3Info, Mp3Scratch,
+    mp3_new, mp3_scratch_new, mp3_decode_frame,
+    MAX_SAMPLES_PER_FRAME,
+    hdr_gueltig, hdr_rahmen_oktette, hdr_abtastrate, hdr_kanaele,
+    hdr_bitrate_kbps, hdr_rahmen_abtastwerte,
+}
+
+const MAX_SAMPLES_PER_FRAME: usize = 2304 // 1152 * 2 Kanaele
+const MAX_FREE_FORMAT_FRAME_SIZE: i32 = 2304
+const MAX_FRAME_SYNC_MATCHES: i32 = 10
+const MAX_BITRESERVOIR_BYTES: usize = 511
+const MAINDATA_BYTES: usize = 2815 // 511 + 2304
+const SHORT_BLOCK_TYPE: i32 = 2
+const STOP_BLOCK_TYPE: i32 = 3
+const MODE_MONO: i32 = 3
+const HDR_SIZE: i32 = 4
+const MAX_SCFI: i32 = 44 // MAX_SCF = 255 + (-1)*4 - 210 = 41, dann (41+3) & ~3
+
+// ====================================================================
+// SPEICHER: WO FIRN ANDERS IST ALS C
+// ====================================================================
+//
+// Die Vorlage schiebt ueberall Zeiger weiter (`*dst++`, `scf++`, `left +=
+// sfb[i]`). Firn hat dafuer keine Syntax und soll sie auch nicht haben.
+// Stattdessen wird die ADRESSE eines Feldes genommen und mit einem
+// VORZEICHENBEHAFTETEN Index gerechnet -- negative Indizes kommen in der
+// Synthesefilterbank wirklich vor (`zlin[4*(i-16)+2]`), und ein `usize`
+// waere dort schlicht falsch.
+
+// RUNDE TEMPO: OHNE VERZWEIGUNG. Die Adressrechnung lief bisher ueber ein
+// `if i < 0`, weil ein negativer Index in der Synthesefilterbank wirklich
+// vorkommt. Noetig ist der Zweig nicht: Adressen rechnen modulo 2^64, und
+// `i as u64` ist bei gleicher Breite eine Umdeutung des Bitmusters (in
+// jedem Baustand, gemessen). `p +% (i as u64) *% 4` liefert damit fuer
+// negative i genau dasselbe wie das Abziehen -- ohne Sprung, ohne phi, und
+// erst damit kann der Uebersetzer den Zugriff in den Adressteil des
+// Befehls falten.
+fn adr4(p: u64, i: i64) -> u64 {
+    return p +% ((i as u64) *% 4)
+}
+
+fn lf(p: u64, i: i64) -> f32 {
+    return *(adr4(p, i) as *mut f32)
+}
+
+fn sf(p: u64, i: i64, v: f32) {
+    *(adr4(p, i) as *mut f32) = v
+}
+
+fn adr2(p: u64, i: i64) -> u64 {
+    return p +% ((i as u64) *% 2)
+}
+
+fn s16(p: u64, i: i64, v: i16) {
+    *(adr2(p, i) as *mut i16) = v
+}
+
+fn lb(p: u64, i: i64) -> u8 {
+    return *((p +% (i as u64)) as *mut u8)
+}
+
+fn sb(p: u64, i: i64, v: u8) {
+    *((p +% (i as u64)) as *mut u8) = v
+}
+
+fn minf(a: f32, b: f32) -> f32 {
+    if a < b { return a }
+    return b
+}
+
+fn mini(a: i32, b: i32) -> i32 {
+    if a < b { return a }
+    return b
+}
+
+fn maxi(a: i32, b: i32) -> i32 {
+    if a > b { return a }
+    return b
+}
+
+// ====================================================================
+// DER BITSTROM
+// ====================================================================
+
+struct Bs {
+    buf: u64,
+    pos: i32,
+    limit: i32,
+}
+
+fn bs_init(bs: *mut Bs, daten: u64, oktette: i32) {
+    (*bs).buf = daten
+    (*bs).pos = 0
+    (*bs).limit = oktette * 8
+}
+
+// `n` Bits, hoechstwertiges zuerst. Ueber das Ende hinaus liefert die
+// Funktion Null und laesst `pos` trotzdem weiterlaufen -- der Aufrufer
+// prueft `pos > limit` einmal am Ende statt in jeder Zeile.
+fn get_bits(bs: *mut Bs, n: i32) -> u32 {
+    var cache: u32 = 0 as u32
+    let s: i32 = (*bs).pos & 7
+    var shl: i32 = n + s
+    var p: u64 = (*bs).buf + (((*bs).pos >> 3) as u64)
+    (*bs).pos = (*bs).pos + n
+    if (*bs).pos > (*bs).limit {
+        return 0 as u32
+    }
+    var next: u32 = (lb(p, 0) as u32) & ((255 >> s) as u32)
+    p = p + 1
+    shl = shl - 8
+    while shl > 0 {
+        cache = cache | (next << (shl as u32))
+        next = lb(p, 0) as u32
+        p = p + 1
+        shl = shl - 8
+    }
+    return cache | (next >> ((0 - shl) as u32))
+}
+
+// ====================================================================
+// DER RAHMENKOPF
+// ====================================================================
+
+fn hdr_layer(h: u64) -> i32 {
+    return ((lb(h, 1) as i32) >> 1) & 3
+}
+
+fn hdr_bitrate_idx(h: u64) -> i32 {
+    return (lb(h, 2) as i32) >> 4
+}
+
+fn hdr_sample_rate_idx(h: u64) -> i32 {
+    return ((lb(h, 2) as i32) >> 2) & 3
+}
+
+fn hdr_test_mpeg1(h: u64) -> bool {
+    return ((lb(h, 1) as i32) & 8) != 0
+}
+
+fn hdr_test_not_mpeg25(h: u64) -> bool {
+    return ((lb(h, 1) as i32) & 16) != 0
+}
+
+fn hdr_is_mono(h: u64) -> bool {
+    return ((lb(h, 3) as i32) & 192) == 192
+}
+
+fn hdr_is_ms_stereo(h: u64) -> bool {
+    return ((lb(h, 3) as i32) & 224) == 96
+}
+
+fn hdr_test_i_stereo(h: u64) -> bool {
+    return ((lb(h, 3) as i32) & 16) != 0
+}
+
+fn hdr_is_free_format(h: u64) -> bool {
+    return ((lb(h, 2) as i32) & 240) == 0
+}
+
+fn hdr_is_crc(h: u64) -> bool {
+    return ((lb(h, 1) as i32) & 1) == 0
+}
+
+fn hdr_test_padding(h: u64) -> bool {
+    return ((lb(h, 2) as i32) & 2) != 0
+}
+
+fn hdr_is_frame_576(h: u64) -> bool {
+    return ((lb(h, 1) as i32) & 14) == 2
+}
+
+fn hdr_is_layer_1(h: u64) -> bool {
+    return ((lb(h, 1) as i32) & 6) == 6
+}
+
+// Die Abtastratenkennung, wie der Dekoder sie braucht: 0..2 fuer MPEG-1,
+// 3..5 fuer MPEG-2, 6..8 fuer MPEG-2.5.
+fn hdr_my_sample_rate(h: u64) -> i32 {
+    let b1: i32 = lb(h, 1) as i32
+    return hdr_sample_rate_idx(h) + (((b1 >> 3) & 1) + ((b1 >> 4) & 1)) * 3
+}
+
+fn hdr_gueltig(h: u64) -> bool {
+    let b0: i32 = lb(h, 0) as i32
+    let b1: i32 = lb(h, 1) as i32
+    if b0 != 255 {
+        return false
+    }
+    if (b1 & 240) != 240 && (b1 & 254) != 226 {
+        return false
+    }
+    if hdr_layer(h) == 0 {
+        return false
+    }
+    if hdr_bitrate_idx(h) == 15 {
+        return false
+    }
+    if hdr_sample_rate_idx(h) == 3 {
+        return false
+    }
+    return true
+}
+
+// Zwei Koepfe gehoeren zum selben Strom, wenn Fassung, Schicht und
+// Abtastrate gleich sind. Alles andere (Bitrate, Polster, Kanalmodus) darf
+// sich von Rahmen zu Rahmen aendern -- VBR ist genau das.
+fn hdr_vergleich(h1: u64, h2: u64) -> bool {
+    if !hdr_gueltig(h2) {
+        return false
+    }
+    if (((lb(h1, 1) as i32) ^ (lb(h2, 1) as i32)) & 254) != 0 {
+        return false
+    }
+    if (((lb(h1, 2) as i32) ^ (lb(h2, 2) as i32)) & 12) != 0 {
+        return false
+    }
+    if hdr_is_free_format(h1) != hdr_is_free_format(h2) {
+        return false
+    }
+    return true
+}
+
+fn hdr_bitrate_kbps(t: *mut mp3_tab.Tabs, h: u64) -> i32 {
+    var i: i32 = 0
+    if hdr_test_mpeg1(h) {
+        i = 1
+    }
+    let idx: usize = ((i * 45) + (hdr_layer(h) - 1) * 15 + hdr_bitrate_idx(h)) as usize
+    return 2 * ((*t).halfrate[idx] as i32)
+}
+
+fn hdr_abtastrate(h: u64) -> i32 {
+    var hz: i32 = 44100
+    let idx: i32 = hdr_sample_rate_idx(h)
+    if idx == 1 {
+        hz = 48000
+    }
+    if idx == 2 {
+        hz = 32000
+    }
+    if !hdr_test_mpeg1(h) {
+        hz = hz >> 1
+    }
+    if !hdr_test_not_mpeg25(h) {
+        hz = hz >> 1
+    }
+    return hz
+}
+
+fn hdr_kanaele(h: u64) -> i32 {
+    if hdr_is_mono(h) {
+        return 1
+    }
+    return 2
+}
+
+fn hdr_rahmen_abtastwerte(h: u64) -> i32 {
+    if hdr_is_layer_1(h) {
+        return 384
+    }
+    if hdr_is_frame_576(h) {
+        return 576
+    }
+    return 1152
+}
+
+fn hdr_rahmen_oktette(t: *mut mp3_tab.Tabs, h: u64, frei: i32) -> i32 {
+    var n: i32 = hdr_rahmen_abtastwerte(h) * hdr_bitrate_kbps(t, h) * 125 / hdr_abtastrate(h)
+    if hdr_is_layer_1(h) {
+        n = n & -4
+    }
+    if n == 0 {
+        return frei
+    }
+    return n
+}
+
+fn hdr_polster(h: u64) -> i32 {
+    if !hdr_test_padding(h) {
+        return 0
+    }
+    if hdr_is_layer_1(h) {
+        return 4
+    }
+    return 1
+}
+
+// ====================================================================
+// DIE ZUSTAENDE
+// ====================================================================
+
+struct GrInfo {
+    sfbtab: u64, // Adresse in die Tabellen: Breite jedes Skalenfaktorbandes
+    part_23_length: i32,
+    big_values: i32,
+    scalefac_compress: i32,
+    global_gain: i32,
+    block_type: i32,
+    mixed_block_flag: i32,
+    n_long_sfb: i32,
+    n_short_sfb: i32,
+    table_select: [i32; 3],
+    region_count: [i32; 3],
+    subblock_gain: [i32; 3],
+    preflag: i32,
+    scalefac_scale: i32,
+    count1_table: i32,
+    scfsi: i32,
+}
+
+fn gr_leer() -> GrInfo {
+    return GrInfo {
+        sfbtab: 0, part_23_length: 0, big_values: 0, scalefac_compress: 0,
+        global_gain: 0, block_type: 0, mixed_block_flag: 0, n_long_sfb: 0,
+        n_short_sfb: 0, table_select: [0; 3], region_count: [0; 3],
+        subblock_gain: [0; 3], preflag: 0, scalefac_scale: 0,
+        count1_table: 0, scfsi: 0,
+    }
+}
+
+struct Mp3Dec {
+    mdct_overlap: [[f32; 288]; 2], // 9*32 je Kanal
+    qmf_state: [f32; 960], // 15*2*32
+    reserv: i32,
+    free_format_bytes: i32,
+    header: [u8; 4],
+    reserv_buf: [u8; 511],
+}
+
+fn mp3_new() -> Mp3Dec {
+    return Mp3Dec {
+        mdct_overlap: [[0.0f; 288]; 2],
+        qmf_state: [0.0f; 960],
+        reserv: 0,
+        free_format_bytes: 0,
+        header: [0; 4],
+        reserv_buf: [0; 511],
+    }
+}
+
+// Der Kratzraum ist rund 16 KiB gross. Er steht bewusst NICHT in `Mp3Dec`:
+// zwischen zwei Rahmen muss nichts davon erhalten bleiben, und wer viele
+// Stroeme gleichzeitig dekodiert, will einen Kratzraum, nicht zwanzig.
+struct Mp3Scratch {
+    maindata: [u8; 2815],
+    gr_info: [GrInfo; 4],
+    grbuf: [[f32; 576]; 2],
+    scf: [f32; 40],
+    syn: [[f32; 64]; 33], // (18+15) x 2*32
+    ist_pos: [[u8; 39]; 2],
+    bs: Bs,
+}
+
+fn mp3_scratch_new() -> Mp3Scratch {
+    return Mp3Scratch {
+        maindata: [0; 2815],
+        gr_info: [gr_leer(); 4],
+        grbuf: [[0.0f; 576]; 2],
+        scf: [0.0f; 40],
+        syn: [[0.0f; 64]; 33],
+        ist_pos: [[0; 39]; 2],
+        bs: Bs { buf: 0, pos: 0, limit: 0 },
+    }
+}
+
+struct Mp3Info {
+    frame_bytes: i32,
+    frame_offset: i32,
+    channels: i32,
+    hz: i32,
+    layer: i32,
+    bitrate_kbps: i32,
+}
+
+// ====================================================================
+// SEITENINFO
+// ====================================================================
+
+fn l3_read_side_info(t: *mut mp3_tab.Tabs, bs: *mut Bs, sc: *mut Mp3Scratch, h: u64) -> i32 {
+    var scfsi: u32 = 0 as u32
+    var main_data_begin: i32 = 0
+    var part_23_sum: i32 = 0
+    var sr_idx: i32 = hdr_my_sample_rate(h)
+    if sr_idx != 0 {
+        sr_idx = sr_idx - 1
+    }
+    var gr_count: i32 = 2
+    if hdr_is_mono(h) {
+        gr_count = 1
+    }
+
+    if hdr_test_mpeg1(h) {
+        gr_count = gr_count * 2
+        main_data_begin = get_bits(bs, 9) as i32
+        scfsi = get_bits(bs, 7 + gr_count)
+    } else {
+        main_data_begin = (get_bits(bs, 8 + gr_count) >> (gr_count as u32)) as i32
+    }
+
+    let lang: u64 = (&(*t).scf_long[0]) as u64
+    let kurz: u64 = (&(*t).scf_short[0]) as u64
+    let gemischt: u64 = (&(*t).scf_mixed[0]) as u64
+
+    var k: i32 = 0
+    while k < gr_count {
+        let g: *mut GrInfo = &(*sc).gr_info[k as usize]
+        if hdr_is_mono(h) {
+            scfsi = scfsi << 4
+        }
+        (*g).part_23_length = get_bits(bs, 12) as i32
+        part_23_sum = part_23_sum + (*g).part_23_length
+        (*g).big_values = get_bits(bs, 9) as i32
+        if (*g).big_values > 288 {
+            return -1
+        }
+        (*g).global_gain = get_bits(bs, 8) as i32
+        var nbits: i32 = 9
+        if hdr_test_mpeg1(h) {
+            nbits = 4
+        }
+        (*g).scalefac_compress = get_bits(bs, nbits) as i32
+        (*g).sfbtab = lang + (sr_idx as u64) * 23
+        (*g).n_long_sfb = 22
+        (*g).n_short_sfb = 0
+        var tables: u32 = 0 as u32
+        if get_bits(bs, 1) != 0 as u32 {
+            (*g).block_type = get_bits(bs, 2) as i32
+            if (*g).block_type == 0 {
+                return -1
+            }
+            (*g).mixed_block_flag = get_bits(bs, 1) as i32
+            (*g).region_count[0] = 7
+            (*g).region_count[1] = 255
+            if (*g).block_type == SHORT_BLOCK_TYPE {
+                scfsi = scfsi & 3855 as u32 // 0x0F0F
+                if (*g).mixed_block_flag == 0 {
+                    (*g).region_count[0] = 8
+                    (*g).sfbtab = kurz + (sr_idx as u64) * 40
+                    (*g).n_long_sfb = 0
+                    (*g).n_short_sfb = 39
+                } else {
+                    (*g).sfbtab = gemischt + (sr_idx as u64) * 40
+                    (*g).n_long_sfb = 6
+                    if hdr_test_mpeg1(h) {
+                        (*g).n_long_sfb = 8
+                    }
+                    (*g).n_short_sfb = 30
+                }
+            }
+            tables = get_bits(bs, 10) << 5
+            (*g).subblock_gain[0] = get_bits(bs, 3) as i32
+            (*g).subblock_gain[1] = get_bits(bs, 3) as i32
+            (*g).subblock_gain[2] = get_bits(bs, 3) as i32
+        } else {
+            (*g).block_type = 0
+            (*g).mixed_block_flag = 0
+            tables = get_bits(bs, 15)
+            (*g).region_count[0] = get_bits(bs, 4) as i32
+            (*g).region_count[1] = get_bits(bs, 3) as i32
+            (*g).region_count[2] = 255
+        }
+        (*g).table_select[0] = (tables >> 10) as i32
+        (*g).table_select[1] = ((tables >> 5) & 31 as u32) as i32
+        (*g).table_select[2] = (tables & 31 as u32) as i32
+        if hdr_test_mpeg1(h) {
+            (*g).preflag = get_bits(bs, 1) as i32
+        } else {
+            (*g).preflag = 0
+            if (*g).scalefac_compress >= 500 {
+                (*g).preflag = 1
+            }
+        }
+        (*g).scalefac_scale = get_bits(bs, 1) as i32
+        (*g).count1_table = get_bits(bs, 1) as i32
+        (*g).scfsi = ((scfsi >> 12) & 15 as u32) as i32
+        scfsi = scfsi << 4
+        k = k + 1
+    }
+
+    if part_23_sum + (*bs).pos > (*bs).limit + main_data_begin * 8 {
+        return -1
+    }
+    return main_data_begin
+}
+
+// ====================================================================
+// SKALENFAKTOREN
+// ====================================================================
+
+fn l3_read_scalefactors(scf: u64, ist_pos: u64, scf_size: u64, scf_count: u64,
+                        bs: *mut Bs, scfsi_in: i32) {
+    var scfsi: i32 = scfsi_in
+    var so: i64 = 0 // Schreibstelle in scf / ist_pos
+    var i: i32 = 0
+    while i < 4 {
+        let cnt: i32 = lb(scf_count, i as i64) as i32
+        if cnt == 0 {
+            i = 4
+        } else {
+            if (scfsi & 8) != 0 {
+                rt.mem_copy(adr1(scf, so), adr1(ist_pos, so), cnt as usize)
+            } else {
+                let bits: i32 = lb(scf_size, i as i64) as i32
+                if bits == 0 {
+                    rt.mem_set(adr1(scf, so), 0 as u8, cnt as usize)
+                    rt.mem_set(adr1(ist_pos, so), 0 as u8, cnt as usize)
+                } else {
+                    var max_scf: i32 = -1
+                    if scfsi < 0 {
+                        max_scf = (1 << (bits as u32)) - 1
+                    }
+                    var j: i32 = 0
+                    while j < cnt {
+                        let s: i32 = get_bits(bs, bits) as i32
+                        var ip: u8 = s as u8
+                        if s == max_scf {
+                            ip = 255 as u8
+                        }
+                        sb(ist_pos, so + j as i64, ip)
+                        sb(scf, so + j as i64, s as u8)
+                        j = j + 1
+                    }
+                }
+            }
+            so = so + cnt as i64
+            scfsi = scfsi * 2
+            i = i + 1
+        }
+    }
+    sb(scf, so, 0 as u8)
+    sb(scf, so + 1, 0 as u8)
+    sb(scf, so + 2, 0 as u8)
+}
+
+fn adr1(p: u64, i: i64) -> u64 {
+    return p +% (i as u64)
+}
+
+// y * 2^(-exp_q2/4), in Schritten, damit der Exponent nie ueberlaeuft.
+fn l3_ldexp_q2(y_in: f32, exp_q2_in: i32) -> f32 {
+    var ef: [f32; 4] = [9.31322575e-10f, 7.83145814e-10f, 6.58544508e-10f, 5.53767716e-10f]
+    var y: f32 = y_in
+    var exp_q2: i32 = exp_q2_in
+    var weiter: bool = true
+    while weiter {
+        let e: i32 = mini(30 * 4, exp_q2)
+        y = y * (ef[(e & 3) as usize] * (((1 << 30) >> ((e >> 2) as u32)) as f32))
+        exp_q2 = exp_q2 - e
+        weiter = exp_q2 > 0
+    }
+    return y
+}
+
+fn l3_decode_scalefactors(t: *mut mp3_tab.Tabs, h: u64, ist_pos: u64, bs: *mut Bs,
+                          gr: *mut GrInfo, scf_out: u64, ch: i32) {
+    var scf_size: [u8; 4] = [0; 4]
+    var iscf: [u8; 40] = [0; 40]
+    let scf_size_p: u64 = (&scf_size[0]) as u64
+    let iscf_p: u64 = (&iscf[0]) as u64
+
+    var wahl: i32 = 0
+    if (*gr).n_short_sfb != 0 {
+        wahl = 1
+    }
+    if (*gr).n_long_sfb == 0 {
+        wahl = wahl + 1
+    }
+    var teilung: u64 = (&(*t).partitions[0]) as u64 + (wahl as u64) * 28
+
+    var scf_shift: i32 = (*gr).scalefac_scale + 1
+    var scfsi: i32 = (*gr).scfsi
+
+    if hdr_test_mpeg1(h) {
+        let part: i32 = (*t).scfc_decode[(*gr).scalefac_compress as usize] as i32
+        scf_size[0] = (part >> 2) as u8
+        scf_size[1] = scf_size[0]
+        scf_size[2] = (part & 3) as u8
+        scf_size[3] = scf_size[2]
+    } else {
+        var ist: i32 = 0
+        if hdr_test_i_stereo(h) && ch != 0 {
+            ist = 1
+        }
+        var sfc: i32 = (*gr).scalefac_compress >> (ist as u32)
+        var k: i32 = ist * 3 * 4
+        var modprod: i32 = 1
+        while sfc >= 0 {
+            modprod = 1
+            var i: i32 = 3
+            while i >= 0 {
+                scf_size[i as usize] = (sfc / modprod % ((*t).modulo[(k + i) as usize] as i32)) as u8
+                modprod = modprod * ((*t).modulo[(k + i) as usize] as i32)
+                i = i - 1
+            }
+            sfc = sfc - modprod
+            k = k + 4
+        }
+        teilung = teilung + (k as u64)
+        scfsi = -16
+    }
+
+    l3_read_scalefactors(iscf_p, ist_pos, scf_size_p, teilung, bs, scfsi)
+
+    if (*gr).n_short_sfb != 0 {
+        let sh: i32 = 3 - scf_shift
+        var i: i32 = 0
+        while i < (*gr).n_short_sfb {
+            let b: usize = ((*gr).n_long_sfb + i) as usize
+            iscf[b + 0] = (iscf[b + 0] as i32 + ((*gr).subblock_gain[0] << (sh as u32))) as u8
+            iscf[b + 1] = (iscf[b + 1] as i32 + ((*gr).subblock_gain[1] << (sh as u32))) as u8
+            iscf[b + 2] = (iscf[b + 2] as i32 + ((*gr).subblock_gain[2] << (sh as u32))) as u8
+            i = i + 3
+        }
+    } else {
+        if (*gr).preflag != 0 {
+            var i: usize = 0
+            while i < 10 {
+                iscf[11 + i] = (iscf[11 + i] as i32 + ((*t).preamp[i] as i32)) as u8
+                i = i + 1
+            }
+        }
+    }
+
+    var gain_exp: i32 = (*gr).global_gain + (-1) * 4 - 210
+    if hdr_is_ms_stereo(h) {
+        gain_exp = gain_exp - 2
+    }
+    let gain: f32 = l3_ldexp_q2(((1 << ((MAX_SCFI / 4) as u32)) as f32), MAX_SCFI - gain_exp)
+    var i: i32 = 0
+    let n: i32 = (*gr).n_long_sfb + (*gr).n_short_sfb
+    while i < n {
+        sf(scf_out, i as i64, l3_ldexp_q2(gain, (iscf[i as usize] as i32) << (scf_shift as u32)))
+        i = i + 1
+    }
+}
+
+// x^(4/3) fuer die Requantisierung. Bis 128 aus der Tabelle, darueber
+// ueber eine Reihenentwicklung -- der Fehler bleibt unter einem halben
+// LSB der 16-Bit-Ausgabe, und das ist der Grund, warum die Tabelle nicht
+// 8192 Eintraege hat.
+fn l3_pow_43(t: *mut mp3_tab.Tabs, x_in: i32) -> f32 {
+    var x: i32 = x_in
+    var mult: i32 = 256
+    if x < 129 {
+        return (*t).pow43[(16 + x) as usize]
+    }
+    if x < 1024 {
+        mult = 16
+        x = x << 3
+    }
+    let sign: i32 = (2 * x) & 64
+    let frac: f32 = (((x & 63) - sign) as f32) / (((x & -64) + sign) as f32)
+    let basis: f32 = (*t).pow43[(16 + ((x + sign) >> 6)) as usize]
+    return basis * (1.0f + frac * ((4.0f / 3.0f) + frac * (2.0f / 9.0f))) * (mult as f32)
+}
+
+// ====================================================================
+// HUFFMAN + REQUANTISIERUNG
+// ====================================================================
+//
+// Der gepackte Baum: ein Eintrag < 0 heisst "noch nicht fertig, nimm
+// `leaf & 7` weitere Bits und spring um `leaf >> 3` Eintraege weiter".
+// Ein Eintrag >= 0 traegt oben die Zahl der verbrauchten Bits (>> 8) und
+// unten zwei Werte zu je vier Bits. Alles in EINEM i16-Feld -- deshalb
+// laeuft dieser Dekoder ohne Baum und ohne Zeiger.
+
+struct HuffLage {
+    cache: u32,
+    sh: i32,
+    next: u64,
+}
+
+fn check_bits(l: *mut HuffLage) {
+    while (*l).sh >= 0 {
+        (*l).cache = (*l).cache | ((lb((*l).next, 0) as u32) << ((*l).sh as u32))
+        (*l).next = (*l).next + 1
+        (*l).sh = (*l).sh - 8
+    }
+}
+
+fn peek_bits(l: *mut HuffLage, n: i32) -> i32 {
+    return ((*l).cache >> ((32 - n) as u32)) as i32
+}
+
+fn flush_bits(l: *mut HuffLage, n: i32) {
+    (*l).cache = (*l).cache << (n as u32)
+    (*l).sh = (*l).sh + n
+}
+
+fn cache_negativ(l: *mut HuffLage) -> bool {
+    return ((*l).cache & 2147483648 as u32) != 0 as u32
+}
+
+fn l3_huffman(t: *mut mp3_tab.Tabs, dst_in: u64, bs: *mut Bs, gr: *mut GrInfo,
+              scf_in: u64, layer3gr_limit: i32) {
+    var dst: i64 = 0
+    var scf: i64 = 0
+    var one: f32 = 0.0f
+    var ireg: i32 = 0
+    var big_val_cnt: i32 = (*gr).big_values
+    var sfb: u64 = (*gr).sfbtab
+    var lage: HuffLage = HuffLage {
+        cache: 0 as u32,
+        sh: ((*bs).pos & 7) - 8,
+        next: (*bs).buf + (((*bs).pos / 8) as u64),
+    }
+    let start: u64 = lage.next
+    lage.cache = ((((lb(start, 0) as u32) * 256 as u32 +% (lb(start, 1) as u32)) * 256 as u32
+        +% (lb(start, 2) as u32)) * 256 as u32 +% (lb(start, 3) as u32)) << (((*bs).pos & 7) as u32)
+    lage.next = start + 4
+    let l: *mut HuffLage = &lage
+
+    while big_val_cnt > 0 {
+        let tab_num: i32 = (*gr).table_select[ireg as usize]
+        var sfb_cnt: i32 = (*gr).region_count[ireg as usize]
+        ireg = ireg + 1
+        let cb: i32 = (*t).tabindex[tab_num as usize] as i32
+        let linbits: i32 = (*t).linbits[tab_num as usize] as i32
+
+        var region_fertig: bool = false
+        while !region_fertig {
+            var np: i32 = (lb(sfb, 0) as i32) / 2
+            sfb = sfb + 1
+            var pairs: i32 = mini(big_val_cnt, np)
+            one = lf(scf_in, scf)
+            scf = scf + 1
+            while pairs > 0 {
+                var w: i32 = 5
+                var leaf: i32 = (*t).tabs[(cb + peek_bits(l, w)) as usize] as i32
+                while leaf < 0 {
+                    flush_bits(l, w)
+                    w = leaf & 7
+                    leaf = (*t).tabs[(cb + peek_bits(l, w) - (leaf >> 3)) as usize] as i32
+                }
+                flush_bits(l, leaf >> 8)
+                var j: i32 = 0
+                while j < 2 {
+                    var lsb: i32 = leaf & 15
+                    if linbits != 0 && lsb == 15 {
+                        lsb = lsb + peek_bits(l, linbits)
+                        flush_bits(l, linbits)
+                        check_bits(l)
+                        var v: f32 = one * l3_pow_43(t, lsb)
+                        if cache_negativ(l) {
+                            v = -v
+                        }
+                        sf(dst_in, dst, v)
+                    } else {
+                        var idx: i32 = 16 + lsb
+                        if cache_negativ(l) {
+                            idx = idx - 16
+                        }
+                        sf(dst_in, dst, (*t).pow43[idx as usize] * one)
+                    }
+                    if lsb != 0 {
+                        flush_bits(l, 1)
+                    }
+                    dst = dst + 1
+                    leaf = leaf >> 4
+                    j = j + 1
+                }
+                check_bits(l)
+                pairs = pairs - 1
+            }
+            big_val_cnt = big_val_cnt - np
+            sfb_cnt = sfb_cnt - 1
+            if big_val_cnt <= 0 || sfb_cnt < 0 {
+                region_fertig = true
+            }
+        }
+    }
+
+    // Der count1-Bereich: nur noch Werte -1, 0, +1, in Vierergruppen.
+    var np: i32 = 1 - big_val_cnt
+    var fertig: bool = false
+    while !fertig {
+        var leaf: i32 = 0
+        if (*gr).count1_table != 0 {
+            leaf = (*t).tab33[peek_bits(l, 4) as usize] as i32
+        } else {
+            leaf = (*t).tab32[peek_bits(l, 4) as usize] as i32
+        }
+        if (leaf & 8) == 0 {
+            let versatz: i32 = (leaf >> 3) + (((lage.cache << 4 as u32) >> ((32 - (leaf & 3)) as u32)) as i32)
+            if (*gr).count1_table != 0 {
+                leaf = (*t).tab33[versatz as usize] as i32
+            } else {
+                leaf = (*t).tab32[versatz as usize] as i32
+            }
+        }
+        flush_bits(l, leaf & 7)
+        let bspos: i32 = (((lage.next - (*bs).buf) as i32) * 8) - 24 + lage.sh
+        if bspos > layer3gr_limit {
+            fertig = true
+        } else {
+            var s: i32 = 0
+            while s < 4 && !fertig {
+                if s == 0 || s == 2 {
+                    np = np - 1
+                    if np == 0 {
+                        np = (lb(sfb, 0) as i32) / 2
+                        sfb = sfb + 1
+                        if np == 0 {
+                            fertig = true
+                        } else {
+                            one = lf(scf_in, scf)
+                            scf = scf + 1
+                        }
+                    }
+                }
+                if !fertig {
+                    if (leaf & (128 >> (s as u32))) != 0 {
+                        var v: f32 = one
+                        if cache_negativ(l) {
+                            v = -one
+                        }
+                        sf(dst_in, dst + s as i64, v)
+                        flush_bits(l, 1)
+                    }
+                    s = s + 1
+                }
+            }
+            if !fertig {
+                check_bits(l)
+                dst = dst + 4
+            }
+        }
+    }
+    (*bs).pos = layer3gr_limit
+}
+
+// ====================================================================
+// STEREO
+// ====================================================================
+
+fn l3_midside_stereo(left: u64, n: i32) {
+    // VIER SPUREN AUF EINMAL (Runde TEMPO 4). Je Spur genau dieselbe
+    // Rechnung wie unten -- `addps` ist viermal `addss` --, also bleibt die
+    // Ausgabe bitgleich. Was nicht durch vier teilbar ist, rechnet der
+    // Rest weiter einzeln.
+    var i: i64 = 0
+    let nn: i64 = n as i64
+    while i + 4 <= nn {
+        let va: v128 = __v128_load(adr4(left, i) as *u8)
+        let vb: v128 = __v128_load(adr4(left, i + 576) as *u8)
+        __v128_store(adr4(left, i) as *mut u8, __v128_addf32(va, vb))
+        __v128_store(adr4(left, i + 576) as *mut u8, __v128_subf32(va, vb))
+        i = i + 4
+    }
+    while i < nn {
+        let a: f32 = lf(left, i)
+        let b: f32 = lf(left, i + 576)
+        sf(left, i, a + b)
+        sf(left, i + 576, a - b)
+        i = i + 1
+    }
+}
+
+fn l3_intensity_stereo_band(left: u64, n: i32, kl: f32, kr: f32) {
+    var i: i64 = 0
+    while i < n as i64 {
+        let v: f32 = lf(left, i)
+        sf(left, i + 576, v * kr)
+        sf(left, i, v * kl)
+        i = i + 1
+    }
+}
+
+fn l3_stereo_top_band(right_in: u64, sfb: u64, nbands: i32, max_band: *mut [i32; 3]) {
+    (*max_band)[0] = -1
+    (*max_band)[1] = -1
+    (*max_band)[2] = -1
+    var right: i64 = 0
+    var i: i32 = 0
+    while i < nbands {
+        let breite: i32 = lb(sfb, i as i64) as i32
+        var k: i32 = 0
+        while k < breite {
+            if lf(right_in, right + k as i64) != 0.0f || lf(right_in, right + (k + 1) as i64) != 0.0f {
+                (*max_band)[(i % 3) as usize] = i
+                k = breite
+            } else {
+                k = k + 2
+            }
+        }
+        right = right + breite as i64
+        i = i + 1
+    }
+}
+
+fn l3_stereo_process(t: *mut mp3_tab.Tabs, left_in: u64, ist_pos: u64, sfb: u64,
+                     h: u64, max_band: *mut [i32; 3], mpeg2_sh: i32) {
+    var max_pos: i32 = 64
+    if hdr_test_mpeg1(h) {
+        max_pos = 7
+    }
+    var left: i64 = 0
+    var i: i32 = 0
+    var breite: i32 = lb(sfb, 0) as i32
+    while breite != 0 {
+        let ipos: i32 = lb(ist_pos, i as i64) as i32
+        if i > (*max_band)[(i % 3) as usize] && ipos < max_pos {
+            var s: f32 = 1.0f
+            if hdr_is_ms_stereo(h) {
+                s = 1.41421356f
+            }
+            var kl: f32 = 0.0f
+            var kr: f32 = 0.0f
+            if hdr_test_mpeg1(h) {
+                kl = (*t).pan[(2 * ipos) as usize]
+                kr = (*t).pan[(2 * ipos + 1) as usize]
+            } else {
+                kl = 1.0f
+                kr = l3_ldexp_q2(1.0f, ((ipos + 1) >> 1) << (mpeg2_sh as u32))
+                if (ipos & 1) != 0 {
+                    kl = kr
+                    kr = 1.0f
+                }
+            }
+            l3_intensity_stereo_band(adr4(left_in, left), breite, kl * s, kr * s)
+        } else {
+            if hdr_is_ms_stereo(h) {
+                l3_midside_stereo(adr4(left_in, left), breite)
+            }
+        }
+        left = left + breite as i64
+        i = i + 1
+        breite = lb(sfb, i as i64) as i32
+    }
+}
+
+fn l3_intensity_stereo(t: *mut mp3_tab.Tabs, left: u64, ist_pos: u64, gr: *mut GrInfo,
+                       gr1: *mut GrInfo, h: u64) {
+    var max_band: [i32; 3] = [0; 3]
+    let n_sfb: i32 = (*gr).n_long_sfb + (*gr).n_short_sfb
+    var max_blocks: i32 = 1
+    if (*gr).n_short_sfb != 0 {
+        max_blocks = 3
+    }
+    l3_stereo_top_band(adr4(left, 576), (*gr).sfbtab, n_sfb, &max_band)
+    if (*gr).n_long_sfb != 0 {
+        let m: i32 = maxi(maxi(max_band[0], max_band[1]), max_band[2])
+        max_band[0] = m
+        max_band[1] = m
+        max_band[2] = m
+    }
+    var default_pos: i32 = 0
+    if hdr_test_mpeg1(h) {
+        default_pos = 3
+    }
+    var i: i32 = 0
+    while i < max_blocks {
+        let itop: i32 = n_sfb - max_blocks + i
+        let prev: i32 = itop - max_blocks
+        var v: u8 = default_pos as u8
+        if max_band[i as usize] < prev {
+            v = lb(ist_pos, prev as i64)
+        }
+        sb(ist_pos, itop as i64, v)
+        i = i + 1
+    }
+    l3_stereo_process(t, left, ist_pos, (*gr).sfbtab, h, &max_band, (*gr1).scalefac_compress & 1)
+}
+
+// ====================================================================
+// UMSORTIEREN, ANTIALIAS, IMDCT
+// ====================================================================
+
+fn l3_reorder(grbuf: u64, scratch: u64, sfb_in: u64) {
+    var sfb: u64 = sfb_in
+    var src: i64 = 0
+    var dst: i64 = 0
+    var len: i32 = lb(sfb, 0) as i32
+    while len != 0 {
+        var i: i32 = 0
+        while i < len {
+            sf(scratch, dst, lf(grbuf, src))
+            sf(scratch, dst + 1, lf(grbuf, src + len as i64))
+            sf(scratch, dst + 2, lf(grbuf, src + (2 * len) as i64))
+            dst = dst + 3
+            src = src + 1
+            i = i + 1
+        }
+        src = src + (2 * len) as i64
+        sfb = sfb + 3
+        len = lb(sfb, 0) as i32
+    }
+    rt.mem_copy(grbuf, scratch, (dst as usize) * 4)
+}
+
+fn l3_antialias(t: *mut mp3_tab.Tabs, grbuf_in: u64, nbands_in: i32) {
+    // VIER SPUREN AUF EINMAL (Runde TEMPO 4).
+    //
+    // Die acht Schritte lesen `u` AUFSTEIGEND (18+i) und `d` ABSTEIGEND
+    // (17-i). Beide liegen also je vier Werte nebeneinander im Speicher --
+    // `d` nur in umgekehrter Reihenfolge, und die dreht `__v128_shuffle32`
+    // mit 0x1B (Spuren 3,2,1,0) einmal hin und einmal zurueck. Je Spur
+    // stehen danach genau dieselben Rechnungen wie unten in der einzelnen
+    // Fassung: die Ausgabe bleibt bitgleich.
+    let aa0: u64 = (&(*t).aa[0]) as u64
+    var nbands: i32 = nbands_in
+    var b: i64 = 0
+    while nbands > 0 {
+        var i: i32 = 0
+        while i < 8 {
+            let iu: i64 = b + (18 + i) as i64
+            let id: i64 = b + (14 - i) as i64
+            let vu: v128 = __v128_load(adr4(grbuf_in, iu) as *u8)
+            let vdr: v128 = __v128_load(adr4(grbuf_in, id) as *u8)
+            let vd: v128 = __v128_shuffle32(vdr, 27)
+            let vc0: v128 = __v128_load(adr4(aa0, i as i64) as *u8)
+            let vc1: v128 = __v128_load(adr4(aa0, (8 + i) as i64) as *u8)
+            let nu: v128 = __v128_subf32(__v128_mulf32(vu, vc0), __v128_mulf32(vd, vc1))
+            let nd: v128 = __v128_addf32(__v128_mulf32(vu, vc1), __v128_mulf32(vd, vc0))
+            __v128_store(adr4(grbuf_in, iu) as *mut u8, nu)
+            __v128_store(adr4(grbuf_in, id) as *mut u8, __v128_shuffle32(nd, 27))
+            i = i + 4
+        }
+        b = b + 18
+        nbands = nbands - 1
+    }
+}
+
+fn l3_dct3_9(y: u64) {
+    var s0: f32 = lf(y, 0)
+    var s2: f32 = lf(y, 2)
+    var s4: f32 = lf(y, 4)
+    var s6: f32 = lf(y, 6)
+    var s8: f32 = lf(y, 8)
+    var t0: f32 = s0 + s6 * 0.5f
+    s0 = s0 - s6
+    var t4: f32 = (s4 + s2) * 0.93969262f
+    var t2: f32 = (s8 + s2) * 0.76604444f
+    s6 = (s4 - s8) * 0.17364818f
+    s4 = s4 + (s8 - s2)
+
+    s2 = s0 - s4 * 0.5f
+    sf(y, 4, s4 + s0)
+    s8 = t0 - t2 + s6
+    s0 = t0 - t4 + t2
+    s4 = t0 + t4 - s6
+
+    var s1: f32 = lf(y, 1)
+    var s3: f32 = lf(y, 3)
+    var s5: f32 = lf(y, 5)
+    var s7: f32 = lf(y, 7)
+
+    s3 = s3 * 0.86602540f
+    t0 = (s5 + s1) * 0.98480775f
+    t4 = (s5 - s7) * 0.34202014f
+    t2 = (s1 + s7) * 0.64278761f
+    s1 = (s1 - s5 - s7) * 0.86602540f
+
+    s5 = t0 - s3 - t2
+    s7 = t4 - s3 - t0
+    s3 = t4 + s3 - t2
+
+    sf(y, 0, s4 - s7)
+    sf(y, 1, s2 + s1)
+    sf(y, 2, s0 - s3)
+    sf(y, 3, s8 + s5)
+    sf(y, 5, s8 - s5)
+    sf(y, 6, s0 + s3)
+    sf(y, 7, s2 - s1)
+    sf(y, 8, s4 + s7)
+}
+
+fn l3_imdct36(t: *mut mp3_tab.Tabs, grbuf_in: u64, overlap_in: u64, fenster: u64, nbands: i32) {
+    let twid: u64 = (&(*t).twid9[0]) as u64
+    // RUNDE TEMPO 7: die beiden Hilfsfelder stehen VOR der Schleife. Sie
+    // werden in jedem Durchlauf vollstaendig beschrieben, bevor sie gelesen
+    // werden (`co[0]`/`si[0]` und die vier Schritte darunter decken alle
+    // neun Plaetze ab) -- das Nullsetzen je Band waren achtzehn Schreibbefehle
+    // fuer nichts.
+    var co: [f32; 9] = [0.0f; 9]
+    var si: [f32; 9] = [0.0f; 9]
+    let cop: u64 = (&co[0]) as u64
+    let sip: u64 = (&si[0]) as u64
+    var j: i32 = 0
+    while j < nbands {
+        let grbuf: u64 = adr4(grbuf_in, (j * 18) as i64)
+        let overlap: u64 = adr4(overlap_in, (j * 9) as i64)
+        co[0] = -lf(grbuf, 0)
+        si[0] = lf(grbuf, 17)
+        var i: i32 = 0
+        while i < 4 {
+            si[(8 - 2 * i) as usize] = lf(grbuf, (4 * i + 1) as i64) - lf(grbuf, (4 * i + 2) as i64)
+            co[(1 + 2 * i) as usize] = lf(grbuf, (4 * i + 1) as i64) + lf(grbuf, (4 * i + 2) as i64)
+            si[(7 - 2 * i) as usize] = lf(grbuf, (4 * i + 4) as i64) - lf(grbuf, (4 * i + 3) as i64)
+            co[(2 + 2 * i) as usize] = -(lf(grbuf, (4 * i + 3) as i64) + lf(grbuf, (4 * i + 4) as i64))
+            i = i + 1
+        }
+        l3_dct3_9(cop)
+        l3_dct3_9(sip)
+        si[1] = -si[1]
+        si[3] = -si[3]
+        si[5] = -si[5]
+        si[7] = -si[7]
+
+        // VIER SPUREN AUF EINMAL (Runde TEMPO 5). Alle sieben gelesenen
+        // Reihen laufen mit `i` aufwaerts und liegen nebeneinander; nur die
+        // zweite Ausgabe geht rueckwaerts (`17 - i`), und die dreht
+        // `__v128_shuffle32(.., 0x1B)` um. Neun Werte sind nicht durch vier
+        // teilbar -- der letzte bleibt einzeln.
+        i = 0
+        while i < 8 {
+            let ii: i64 = i as i64
+            let ovl: v128 = __v128_load(adr4(overlap, ii) as *u8)
+            let c: v128 = __v128_load(adr4(cop, ii) as *u8)
+            let sv: v128 = __v128_load(adr4(sip, ii) as *u8)
+            let tw: v128 = __v128_load(adr4(twid, ii) as *u8)
+            let tw9: v128 = __v128_load(adr4(twid, ii + 9) as *u8)
+            let fw: v128 = __v128_load(adr4(fenster, ii) as *u8)
+            let fw9: v128 = __v128_load(adr4(fenster, ii + 9) as *u8)
+            let summe: v128 = __v128_addf32(__v128_mulf32(c, tw9), __v128_mulf32(sv, tw))
+            __v128_store(adr4(overlap, ii) as *mut u8,
+                         __v128_subf32(__v128_mulf32(c, tw), __v128_mulf32(sv, tw9)))
+            __v128_store(adr4(grbuf, ii) as *mut u8,
+                         __v128_subf32(__v128_mulf32(ovl, fw), __v128_mulf32(summe, fw9)))
+            let hoch: v128 = __v128_addf32(__v128_mulf32(ovl, fw9), __v128_mulf32(summe, fw))
+            __v128_store(adr4(grbuf, 14 - ii) as *mut u8, __v128_shuffle32(hoch, 27))
+            i = i + 4
+        }
+        while i < 9 {
+            let ovl: f32 = lf(overlap, i as i64)
+            let c: f32 = co[i as usize]
+            let s: f32 = si[i as usize]
+            let summe: f32 = c * lf(twid, (9 + i) as i64) + s * lf(twid, i as i64)
+            sf(overlap, i as i64, c * lf(twid, i as i64) - s * lf(twid, (9 + i) as i64))
+            sf(grbuf, i as i64, ovl * lf(fenster, i as i64) - summe * lf(fenster, (9 + i) as i64))
+            sf(grbuf, (17 - i) as i64, ovl * lf(fenster, (9 + i) as i64) + summe * lf(fenster, i as i64))
+            i = i + 1
+        }
+        j = j + 1
+    }
+}
+
+fn l3_idct3(x0: f32, x1: f32, x2: f32, dst: u64) {
+    let m1: f32 = x1 * 0.86602540f
+    let a1: f32 = x0 - x2 * 0.5f
+    sf(dst, 1, x0 + x2)
+    sf(dst, 0, a1 + m1)
+    sf(dst, 2, a1 - m1)
+}
+
+fn l3_imdct12(t: *mut mp3_tab.Tabs, x: u64, dst: u64, overlap: u64) {
+    let twid3: u64 = (&(*t).twid3[0]) as u64
+    var co: [f32; 3] = [0.0f; 3]
+    var si: [f32; 3] = [0.0f; 3]
+    let cop: u64 = (&co[0]) as u64
+    let sip: u64 = (&si[0]) as u64
+    l3_idct3(-lf(x, 0), lf(x, 6) + lf(x, 3), lf(x, 12) + lf(x, 9), cop)
+    l3_idct3(lf(x, 15), lf(x, 12) - lf(x, 9), lf(x, 6) - lf(x, 3), sip)
+    si[1] = -si[1]
+    var i: i32 = 0
+    while i < 3 {
+        let ovl: f32 = lf(overlap, i as i64)
+        let summe: f32 = co[i as usize] * lf(twid3, (3 + i) as i64) + si[i as usize] * lf(twid3, i as i64)
+        sf(overlap, i as i64, co[i as usize] * lf(twid3, i as i64) - si[i as usize] * lf(twid3, (3 + i) as i64))
+        sf(dst, i as i64, ovl * lf(twid3, (2 - i) as i64) - summe * lf(twid3, (5 - i) as i64))
+        sf(dst, (5 - i) as i64, ovl * lf(twid3, (5 - i) as i64) + summe * lf(twid3, (2 - i) as i64))
+        i = i + 1
+    }
+}
+
+fn l3_imdct_short(t: *mut mp3_tab.Tabs, grbuf_in: u64, overlap_in: u64, nbands_in: i32) {
+    var nbands: i32 = nbands_in
+    var grbuf: u64 = grbuf_in
+    var overlap: u64 = overlap_in
+    while nbands > 0 {
+        var tmp: [f32; 18] = [0.0f; 18]
+        let tmpp: u64 = (&tmp[0]) as u64
+        rt.mem_copy(tmpp, grbuf, 18 * 4)
+        rt.mem_copy(grbuf, overlap, 6 * 4)
+        l3_imdct12(t, tmpp, adr4(grbuf, 6), adr4(overlap, 6))
+        l3_imdct12(t, adr4(tmpp, 1), adr4(grbuf, 12), adr4(overlap, 6))
+        l3_imdct12(t, adr4(tmpp, 2), overlap, adr4(overlap, 6))
+        overlap = adr4(overlap, 9)
+        grbuf = adr4(grbuf, 18)
+        nbands = nbands - 1
+    }
+}
+
+fn l3_change_sign(grbuf: u64) {
+    var b: i32 = 0
+    var basis: i64 = 18
+    while b < 32 {
+        var i: i32 = 1
+        while i < 18 {
+            sf(grbuf, basis + i as i64, -lf(grbuf, basis + i as i64))
+            i = i + 2
+        }
+        basis = basis + 36
+        b = b + 2
+    }
+}
+
+fn l3_imdct_gr(t: *mut mp3_tab.Tabs, grbuf_in: u64, overlap_in: u64, block_type: i32, n_long_bands: i32) {
+    let fenster0: u64 = (&(*t).fenster[0]) as u64
+    var grbuf: u64 = grbuf_in
+    var overlap: u64 = overlap_in
+    if n_long_bands != 0 {
+        l3_imdct36(t, grbuf, overlap, fenster0, n_long_bands)
+        grbuf = adr4(grbuf, (18 * n_long_bands) as i64)
+        overlap = adr4(overlap, (9 * n_long_bands) as i64)
+    }
+    if block_type == SHORT_BLOCK_TYPE {
+        l3_imdct_short(t, grbuf, overlap, 32 - n_long_bands)
+    } else {
+        var fenster: u64 = fenster0
+        if block_type == STOP_BLOCK_TYPE {
+            fenster = adr4(fenster0, 18)
+        }
+        l3_imdct36(t, grbuf, overlap, fenster, 32 - n_long_bands)
+    }
+}
+
+// ====================================================================
+// BITRESERVOIR
+// ====================================================================
+
+fn l3_save_reservoir(dec: *mut Mp3Dec, s: *mut Mp3Scratch) {
+    var pos: i32 = ((*s).bs.pos + 7) / 8
+    var remains: i32 = (*s).bs.limit / 8 - pos
+    if remains > (MAX_BITRESERVOIR_BYTES as i32) {
+        pos = pos + remains - (MAX_BITRESERVOIR_BYTES as i32)
+        remains = MAX_BITRESERVOIR_BYTES as i32
+    }
+    if remains > 0 {
+        rt.mem_copy((&(*dec).reserv_buf[0]) as u64,
+                    (&(*s).maindata[0]) as u64 + (pos as u64),
+                    remains as usize)
+    }
+    (*dec).reserv = remains
+}
+
+fn l3_restore_reservoir(dec: *mut Mp3Dec, bs: *mut Bs, s: *mut Mp3Scratch, main_data_begin: i32) -> bool {
+    let frame_bytes: i32 = ((*bs).limit - (*bs).pos) / 8
+    let bytes_have: i32 = mini((*dec).reserv, main_data_begin)
+    let quelle: u64 = (&(*dec).reserv_buf[0]) as u64 + (maxi(0, (*dec).reserv - main_data_begin) as u64)
+    let ziel: u64 = (&(*s).maindata[0]) as u64
+    rt.mem_copy(ziel, quelle, mini((*dec).reserv, main_data_begin) as usize)
+    rt.mem_copy(ziel + (bytes_have as u64),
+                (*bs).buf + (((*bs).pos / 8) as u64),
+                frame_bytes as usize)
+    bs_init(&(*s).bs, ziel, bytes_have + frame_bytes)
+    return (*dec).reserv >= main_data_begin
+}
+
+// ====================================================================
+// EINE GRANULE VOLLSTAENDIG
+// ====================================================================
+
+fn l3_decode(t: *mut mp3_tab.Tabs, dec: *mut Mp3Dec, s: *mut Mp3Scratch, gr_base: i32, nch: i32) {
+    let h: u64 = (&(*dec).header[0]) as u64
+    let scf: u64 = (&(*s).scf[0]) as u64
+
+    var ch: i32 = 0
+    while ch < nch {
+        let g: *mut GrInfo = &(*s).gr_info[(gr_base + ch) as usize]
+        let limit: i32 = (*s).bs.pos + (*g).part_23_length
+        l3_decode_scalefactors(t, h, (&(*s).ist_pos[ch as usize][0]) as u64, &(*s).bs, g, scf, ch)
+        l3_huffman(t, (&(*s).grbuf[ch as usize][0]) as u64, &(*s).bs, g, scf, limit)
+        ch = ch + 1
+    }
+
+    let links: u64 = (&(*s).grbuf[0][0]) as u64
+    if hdr_test_i_stereo(h) {
+        l3_intensity_stereo(t, links, (&(*s).ist_pos[1][0]) as u64,
+                            &(*s).gr_info[gr_base as usize],
+                            &(*s).gr_info[(gr_base + 1) as usize], h)
+    } else {
+        if hdr_is_ms_stereo(h) {
+            l3_midside_stereo(links, 576)
+        }
+    }
+
+    ch = 0
+    while ch < nch {
+        let g: *mut GrInfo = &(*s).gr_info[(gr_base + ch) as usize]
+        var aa_bands: i32 = 31
+        var n_long_bands: i32 = 0
+        if (*g).mixed_block_flag != 0 {
+            n_long_bands = 2
+        }
+        if hdr_my_sample_rate(h) == 2 {
+            n_long_bands = n_long_bands * 2
+        }
+        let kanal: u64 = (&(*s).grbuf[ch as usize][0]) as u64
+        if (*g).n_short_sfb != 0 {
+            aa_bands = n_long_bands - 1
+            l3_reorder(adr4(kanal, (n_long_bands * 18) as i64),
+                       (&(*s).syn[0][0]) as u64,
+                       adr1((*g).sfbtab, (*g).n_long_sfb as i64))
+        }
+        l3_antialias(t, kanal, aa_bands)
+        l3_imdct_gr(t, kanal, (&(*dec).mdct_overlap[ch as usize][0]) as u64, (*g).block_type, n_long_bands)
+        l3_change_sign(kanal)
+        ch = ch + 1
+    }
+}
+
+// ====================================================================
+// SYNTHESEFILTERBANK
+// ====================================================================
+
+// EIN WERT AUF ALLE VIER SPUREN (Runde TEMPO 5).
+//
+// Sechzehn Oktette ab `p[i]` holen und Spur 0 vervielfachen. Die Tabellen,
+// aus denen so gelesen wird (`sec`, `win`), haben dafuer vier Werte Polster.
+fn bcast(p: u64, i: i64) -> v128 {
+    return __v128_shuffle32(__v128_load(adr4(p, i) as *u8), 0)
+}
+
+// VIER BAENDER AUF EINMAL.
+//
+// `dct_ii` rechnet je Band EINE Spalte von `grbuf`: der Zugriff ist
+// `grbuf[k + 18*z]`, und fuer vier benachbarte Baender `k..k+3` liegen die
+// vier Werte NEBENEINANDER. Damit ist jede Zeile dieser Umkehrwandlung eine
+// Rechnung auf vier Spuren -- Befehl fuer Befehl dieselbe wie unten in der
+// einzelnen Fassung, in derselben Reihenfolge, also bitgleich.
+// RUNDE TEMPO 7: einmal im Programm statt in jedem Aufruf (siehe
+// `PCM_KONST`). Die letzten drei Werte sind Polster, damit auch der Beiwert
+// mit dem hoechsten Index als 16-Oktett-Ladung gelesen werden darf.
+// RUNDE TEMPO 15: `static` statt `static mut` -- niemand schreibt die Werte,
+// und aus `.rodata` darf der Optimierer die Ladungen aus der Schleife ziehen.
+static DCT_KONST: [f32; 12] = [0.70710677f, 0.50979561f, 0.54119611f, 0.60134488f,
+                                   0.89997619f, 1.30656302f, 2.56291556f, 0.198912367f,
+                                   0.382683432f, 0.0f, 0.0f, 0.0f]
+
+fn dct_ii_4(t: *mut mp3_tab.Tabs, grbuf: u64, k: i32) {
+    let secp: u64 = (&(*t).sec[0]) as u64
+    let kp: u64 = (&DCT_KONST[0]) as u64
+    let c7071: v128 = bcast(kp, 0)
+    let c5098: v128 = bcast(kp, 1)
+    let c5412: v128 = bcast(kp, 2)
+    let c6013: v128 = bcast(kp, 3)
+    let c9000: v128 = bcast(kp, 4)
+    let c1306: v128 = bcast(kp, 5)
+    let c2563: v128 = bcast(kp, 6)
+    let c1989: v128 = bcast(kp, 7)
+    let c3827: v128 = bcast(kp, 8)
+
+    var tt: [f32; 128] = [0.0f; 128]
+    let tp: u64 = (&tt[0]) as u64
+    let y0: i64 = k as i64
+
+    var i: i32 = 0
+    while i < 8 {
+        let x0: v128 = __v128_load(adr4(grbuf, y0 + (i * 18) as i64) as *u8)
+        let x1: v128 = __v128_load(adr4(grbuf, y0 + ((15 - i) * 18) as i64) as *u8)
+        let x2: v128 = __v128_load(adr4(grbuf, y0 + ((16 + i) * 18) as i64) as *u8)
+        let x3: v128 = __v128_load(adr4(grbuf, y0 + ((31 - i) * 18) as i64) as *u8)
+        let t0: v128 = __v128_addf32(x0, x3)
+        let t1: v128 = __v128_addf32(x1, x2)
+        let t2: v128 = __v128_mulf32(__v128_subf32(x1, x2), bcast(secp, (3 * i) as i64))
+        let t3: v128 = __v128_mulf32(__v128_subf32(x0, x3), bcast(secp, (3 * i + 1) as i64))
+        let c2: v128 = bcast(secp, (3 * i + 2) as i64)
+        __v128_store(adr4(tp, (i * 4) as i64) as *mut u8, __v128_addf32(t0, t1))
+        __v128_store(adr4(tp, ((i + 8) * 4) as i64) as *mut u8,
+                     __v128_mulf32(__v128_subf32(t0, t1), c2))
+        __v128_store(adr4(tp, ((i + 16) * 4) as i64) as *mut u8, __v128_addf32(t3, t2))
+        __v128_store(adr4(tp, ((i + 24) * 4) as i64) as *mut u8,
+                     __v128_mulf32(__v128_subf32(t3, t2), c2))
+        i = i + 1
+    }
+    i = 0
+    while i < 4 {
+        let b: i64 = (i * 8 * 4) as i64
+        var x0: v128 = __v128_load(adr4(tp, b + 0 * 4) as *u8)
+        var x1: v128 = __v128_load(adr4(tp, b + 1 * 4) as *u8)
+        var x2: v128 = __v128_load(adr4(tp, b + 2 * 4) as *u8)
+        var x3: v128 = __v128_load(adr4(tp, b + 3 * 4) as *u8)
+        var x4: v128 = __v128_load(adr4(tp, b + 4 * 4) as *u8)
+        var x5: v128 = __v128_load(adr4(tp, b + 5 * 4) as *u8)
+        var x6: v128 = __v128_load(adr4(tp, b + 6 * 4) as *u8)
+        var x7: v128 = __v128_load(adr4(tp, b + 7 * 4) as *u8)
+        var xt: v128 = __v128_subf32(x0, x7)
+        x0 = __v128_addf32(x0, x7)
+        x7 = __v128_subf32(x1, x6)
+        x1 = __v128_addf32(x1, x6)
+        x6 = __v128_subf32(x2, x5)
+        x2 = __v128_addf32(x2, x5)
+        x5 = __v128_subf32(x3, x4)
+        x3 = __v128_addf32(x3, x4)
+        x4 = __v128_subf32(x0, x3)
+        x0 = __v128_addf32(x0, x3)
+        x3 = __v128_subf32(x1, x2)
+        x1 = __v128_addf32(x1, x2)
+        __v128_store(adr4(tp, b + 0 * 4) as *mut u8, __v128_addf32(x0, x1))
+        __v128_store(adr4(tp, b + 4 * 4) as *mut u8,
+                     __v128_mulf32(__v128_subf32(x0, x1), c7071))
+        x5 = __v128_addf32(x5, x6)
+        x6 = __v128_mulf32(__v128_addf32(x6, x7), c7071)
+        x7 = __v128_addf32(x7, xt)
+        x3 = __v128_mulf32(__v128_addf32(x3, x4), c7071)
+        x5 = __v128_subf32(x5, __v128_mulf32(x7, c1989))
+        x7 = __v128_addf32(x7, __v128_mulf32(x5, c3827))
+        x5 = __v128_subf32(x5, __v128_mulf32(x7, c1989))
+        x0 = __v128_subf32(xt, x6)
+        xt = __v128_addf32(xt, x6)
+        __v128_store(adr4(tp, b + 1 * 4) as *mut u8,
+                     __v128_mulf32(__v128_addf32(xt, x7), c5098))
+        __v128_store(adr4(tp, b + 2 * 4) as *mut u8,
+                     __v128_mulf32(__v128_addf32(x4, x3), c5412))
+        __v128_store(adr4(tp, b + 3 * 4) as *mut u8,
+                     __v128_mulf32(__v128_subf32(x0, x5), c6013))
+        __v128_store(adr4(tp, b + 5 * 4) as *mut u8,
+                     __v128_mulf32(__v128_addf32(x0, x5), c9000))
+        __v128_store(adr4(tp, b + 6 * 4) as *mut u8,
+                     __v128_mulf32(__v128_subf32(x4, x3), c1306))
+        __v128_store(adr4(tp, b + 7 * 4) as *mut u8,
+                     __v128_mulf32(__v128_subf32(xt, x7), c2563))
+        i = i + 1
+    }
+    var y: i64 = y0
+    i = 0
+    while i < 7 {
+        let v0: v128 = __v128_load(adr4(tp, (i * 4) as i64) as *u8)
+        let v16: v128 = __v128_load(adr4(tp, ((16 + i) * 4) as i64) as *u8)
+        let v17: v128 = __v128_load(adr4(tp, ((16 + i + 1) * 4) as i64) as *u8)
+        let v24: v128 = __v128_load(adr4(tp, ((24 + i) * 4) as i64) as *u8)
+        let v25: v128 = __v128_load(adr4(tp, ((24 + i + 1) * 4) as i64) as *u8)
+        let v8: v128 = __v128_load(adr4(tp, ((8 + i) * 4) as i64) as *u8)
+        let v9: v128 = __v128_load(adr4(tp, ((8 + i + 1) * 4) as i64) as *u8)
+        __v128_store(adr4(grbuf, y + 0) as *mut u8, v0)
+        __v128_store(adr4(grbuf, y + 18) as *mut u8,
+                     __v128_addf32(__v128_addf32(v16, v24), v25))
+        __v128_store(adr4(grbuf, y + 36) as *mut u8, __v128_addf32(v8, v9))
+        __v128_store(adr4(grbuf, y + 54) as *mut u8,
+                     __v128_addf32(__v128_addf32(v17, v24), v25))
+        y = y + 72
+        i = i + 1
+    }
+    let v7: v128 = __v128_load(adr4(tp, (7 * 4) as i64) as *u8)
+    let v23: v128 = __v128_load(adr4(tp, (23 * 4) as i64) as *u8)
+    let v31: v128 = __v128_load(adr4(tp, (31 * 4) as i64) as *u8)
+    let v15: v128 = __v128_load(adr4(tp, (15 * 4) as i64) as *u8)
+    __v128_store(adr4(grbuf, y + 0) as *mut u8, v7)
+    __v128_store(adr4(grbuf, y + 18) as *mut u8, __v128_addf32(v23, v31))
+    __v128_store(adr4(grbuf, y + 36) as *mut u8, v15)
+    __v128_store(adr4(grbuf, y + 54) as *mut u8, v31)
+}
+
+fn dct_ii(t: *mut mp3_tab.Tabs, grbuf: u64, n: i32) {
+    var k: i32 = 0
+    while k + 4 <= n {
+        dct_ii_4(t, grbuf, k)
+        k = k + 4
+    }
+    while k < n {
+        var tt: [f32; 32] = [0.0f; 32]
+        let tp: u64 = (&tt[0]) as u64
+        let y0: i64 = k as i64
+        var i: i32 = 0
+        while i < 8 {
+            let x0: f32 = lf(grbuf, y0 + (i * 18) as i64)
+            let x1: f32 = lf(grbuf, y0 + ((15 - i) * 18) as i64)
+            let x2: f32 = lf(grbuf, y0 + ((16 + i) * 18) as i64)
+            let x3: f32 = lf(grbuf, y0 + ((31 - i) * 18) as i64)
+            let t0: f32 = x0 + x3
+            let t1: f32 = x1 + x2
+            let t2: f32 = (x1 - x2) * (*t).sec[(3 * i) as usize]
+            let t3: f32 = (x0 - x3) * (*t).sec[(3 * i + 1) as usize]
+            sf(tp, i as i64, t0 + t1)
+            sf(tp, (i + 8) as i64, (t0 - t1) * (*t).sec[(3 * i + 2) as usize])
+            sf(tp, (i + 16) as i64, t3 + t2)
+            sf(tp, (i + 24) as i64, (t3 - t2) * (*t).sec[(3 * i + 2) as usize])
+            i = i + 1
+        }
+        i = 0
+        while i < 4 {
+            let b: i64 = (i * 8) as i64
+            var x0: f32 = lf(tp, b + 0)
+            var x1: f32 = lf(tp, b + 1)
+            var x2: f32 = lf(tp, b + 2)
+            var x3: f32 = lf(tp, b + 3)
+            var x4: f32 = lf(tp, b + 4)
+            var x5: f32 = lf(tp, b + 5)
+            var x6: f32 = lf(tp, b + 6)
+            var x7: f32 = lf(tp, b + 7)
+            var xt: f32 = x0 - x7
+            x0 = x0 + x7
+            x7 = x1 - x6
+            x1 = x1 + x6
+            x6 = x2 - x5
+            x2 = x2 + x5
+            x5 = x3 - x4
+            x3 = x3 + x4
+            x4 = x0 - x3
+            x0 = x0 + x3
+            x3 = x1 - x2
+            x1 = x1 + x2
+            sf(tp, b + 0, x0 + x1)
+            sf(tp, b + 4, (x0 - x1) * 0.70710677f)
+            x5 = x5 + x6
+            x6 = (x6 + x7) * 0.70710677f
+            x7 = x7 + xt
+            x3 = (x3 + x4) * 0.70710677f
+            x5 = x5 - x7 * 0.198912367f
+            x7 = x7 + x5 * 0.382683432f
+            x5 = x5 - x7 * 0.198912367f
+            x0 = xt - x6
+            xt = xt + x6
+            sf(tp, b + 1, (xt + x7) * 0.50979561f)
+            sf(tp, b + 2, (x4 + x3) * 0.54119611f)
+            sf(tp, b + 3, (x0 - x5) * 0.60134488f)
+            sf(tp, b + 5, (x0 + x5) * 0.89997619f)
+            sf(tp, b + 6, (x4 - x3) * 1.30656302f)
+            sf(tp, b + 7, (xt - x7) * 2.56291556f)
+            i = i + 1
+        }
+        var y: i64 = y0
+        i = 0
+        while i < 7 {
+            sf(grbuf, y + 0, tt[i as usize])
+            sf(grbuf, y + 18, tt[(16 + i) as usize] + tt[(24 + i) as usize] + tt[(24 + i + 1) as usize])
+            sf(grbuf, y + 36, tt[(8 + i) as usize] + tt[(8 + i + 1) as usize])
+            sf(grbuf, y + 54, tt[(16 + i + 1) as usize] + tt[(24 + i) as usize] + tt[(24 + i + 1) as usize])
+            y = y + 72
+            i = i + 1
+        }
+        sf(grbuf, y + 0, tt[7])
+        sf(grbuf, y + 18, tt[23] + tt[31])
+        sf(grbuf, y + 36, tt[15])
+        sf(grbuf, y + 54, tt[31])
+        k = k + 1
+    }
+}
+
+// Die Vorlage klemmt VOR der Wandlung und rundet dann "vom Null weg"
+// (`s -= (s < 0)`), damit ein Wert genau zwischen zwei Stufen nicht
+// systematisch zur Null hin wandert. Der untere Anschlag muss ueber i32
+// laufen: `-32768` passt in i16, `0 - 32768` in i16-Arithmetik nicht, und
+// Firn prueft den Ueberlauf (anders als C, das hier still umbricht).
+// VIER ABTASTWERTE AUF EINMAL (Runde TEMPO 5).
+//
+// Dieselbe Rechnung wie unten, Spur fuer Spur -- und die beiden Randfaelle
+// sind AUSDRUECKLICH nachgebildet, nicht der Saettigung ueberlassen:
+//
+//   * `cmpnlt(v, 32766.5)` ist wahr, wenn `v >= 32766.5` ODER `v` keine Zahl
+//     ist. Beides ergibt in der einzelnen Fassung 32767 (bei NaN ueber den
+//     Umweg ueber den Ueberlauf der Wandlung), also hier direkt.
+//   * `cmple(v, -32767.5)` ist der untere Anschlag; bei NaN falsch.
+//
+// Dazwischen ist `floor(v + 0,5)` gefragt: `cvttps2dq` schneidet zur Null
+// hin ab, und wo dabei aufgerundet wurde (`t < zurueckgewandelt`), zieht die
+// Maske genau eins ab. Fuer alle Werte zwischen den Anschlaegen liegt das
+// Ergebnis in [-32767, 32766]; die beiden Klemmen der einzelnen Fassung
+// koennen dort also nie greifen.
+// RUNDE TEMPO 7: die Beiwerte stehen EINMAL im Programm, nicht in jedem
+// Aufruf. Vorher baute `scale_pcm4` zwei Felder auf dem Stapel auf -- zwanzig
+// Werte, jeder mit Laden und Schreiben, bei 1,3 Millionen Aufrufen.
+// RUNDE TEMPO 15: unveraenderlich (`.rodata`), damit `licm` die Ladungen aus
+// der heissen Schleife von `synth` zieht, und auf ACHT Werte gepolstert:
+// `bcast(kp, 1)` und `bcast(kp, 2)` lesen sechzehn Oktette ab dem zweiten
+// und dritten Wert, also ueber das Ende eines Feldes von vier hinaus -- eine
+// solche Ladung darf der Optimierer nicht verschieben (sie liest ein fremdes
+// Objekt). Gemessen: 91,64 -> 90,59 Mio Befehle auf 8 s Ton.
+static PCM_KONST: [f32; 8] = [0.5f, 32766.5f, -32767.5f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f]
+static PCM_GRENZEN: [i32; 8] = [32767, 32767, 32767, 32767,
+                                    0 - 32768, 0 - 32768, 0 - 32768, 0 - 32768]
+
+fn scale_pcm4(src: u64, out: u64) {
+    let kp: u64 = (&PCM_KONST[0]) as u64
+    let gp: u64 = (&PCM_GRENZEN[0]) as u64
+    let v: v128 = __v128_load(src as *u8)
+    let t: v128 = __v128_addf32(v, bcast(kp, 0))
+    let i0: v128 = __v128_trunc_f32_i32(t)
+    // Die einzelne Fassung zieht bei JEDEM negativen Ergebnis eins ab --
+    // auch wenn das Abschneiden gar nichts verworfen hat. Genau das steht
+    // hier: die Maske ist `i0 < 0`, nicht "aufgerundet".
+    let neg: v128 = __v128_cmpgt_i32(__v128_zero(), i0)
+    var r: v128 = __v128_add32(i0, neg)
+    let hoch: v128 = __v128_cmpnlt_f32(v, bcast(kp, 1))
+    let tief: v128 = __v128_cmple_f32(v, bcast(kp, 2))
+    let vhoch: v128 = __v128_load(gp as *u8)
+    let vtief: v128 = __v128_load(adr4(gp, 4) as *u8)
+    r = __v128_or(__v128_and(hoch, vhoch), __v128_andnot(hoch, r))
+    r = __v128_or(__v128_and(tief, vtief), __v128_andnot(tief, r))
+    __v128_store(out as *mut u8, r)
+}
+
+fn scale_pcm(abtast: f32) -> i16 {
+    let unten: i32 = -32768
+    if abtast >= 32766.5f {
+        return 32767 as i16
+    }
+    if abtast <= -32767.5f {
+        return unten as i16
+    }
+    var s: i32 = (abtast + 0.5f) as i32
+    if s < 0 {
+        s = s - 1
+    }
+    if s > 32767 {
+        s = 32767
+    }
+    if s < unten {
+        s = unten
+    }
+    return s as i16
+}
+
+fn synth_pair(pcm: u64, nch: i32, z_in: u64) {
+    var z: u64 = z_in
+    var a: f32 = (lf(z, 14 * 64) - lf(z, 0)) * 29.0f
+    a = a + (lf(z, 1 * 64) + lf(z, 13 * 64)) * 213.0f
+    a = a + (lf(z, 12 * 64) - lf(z, 2 * 64)) * 459.0f
+    a = a + (lf(z, 3 * 64) + lf(z, 11 * 64)) * 2037.0f
+    a = a + (lf(z, 10 * 64) - lf(z, 4 * 64)) * 5153.0f
+    a = a + (lf(z, 5 * 64) + lf(z, 9 * 64)) * 6574.0f
+    a = a + (lf(z, 8 * 64) - lf(z, 6 * 64)) * 37489.0f
+    a = a + lf(z, 7 * 64) * 75038.0f
+    s16(pcm, 0, scale_pcm(a))
+
+    z = adr4(z, 2)
+    a = lf(z, 14 * 64) * 104.0f
+    a = a + lf(z, 12 * 64) * 1567.0f
+    a = a + lf(z, 10 * 64) * 9727.0f
+    a = a + lf(z, 8 * 64) * 64019.0f
+    a = a + lf(z, 6 * 64) * -9975.0f
+    a = a + lf(z, 4 * 64) * -45.0f
+    a = a + lf(z, 2 * 64) * 146.0f
+    a = a + lf(z, 0) * -5.0f
+    s16(pcm, (16 * nch) as i64, scale_pcm(a))
+}
+
+fn synth(t: *mut mp3_tab.Tabs, xl: u64, dstl: u64, nch: i32, lins: u64) {
+    let xr: u64 = adr4(xl, (576 * (nch - 1)) as i64)
+    let dstr: u64 = adr2(dstl, (nch - 1) as i64)
+    let win: u64 = (&(*t).win[0]) as u64
+    let zlin: u64 = adr4(lins, 15 * 64)
+
+    sf(zlin, 4 * 15, lf(xl, 18 * 16))
+    sf(zlin, 4 * 15 + 1, lf(xr, 18 * 16))
+    sf(zlin, 4 * 15 + 2, lf(xl, 0))
+    sf(zlin, 4 * 15 + 3, lf(xr, 0))
+
+    sf(zlin, 4 * 31, lf(xl, 1 + 18 * 16))
+    sf(zlin, 4 * 31 + 1, lf(xr, 1 + 18 * 16))
+    sf(zlin, 4 * 31 + 2, lf(xl, 1))
+    sf(zlin, 4 * 31 + 3, lf(xr, 1))
+
+    synth_pair(dstr, nch, adr4(lins, 4 * 15 + 1))
+    synth_pair(adr2(dstr, (32 * nch) as i64), nch, adr4(lins, 4 * 15 + 64 + 1))
+    synth_pair(dstl, nch, adr4(lins, 4 * 15))
+    synth_pair(adr2(dstl, (32 * nch) as i64), nch, adr4(lins, 4 * 15 + 64))
+
+    // DIE HEISSE SCHLEIFE DES GANZEN DEKODERS. 15 Durchlaeufe mal acht
+    // Fensterhaelften mal vier Stimmen; hier verbringt der Dekoder rund
+    // zwei Drittel seiner Zeit (gemessen, docs/TON1.md). Deshalb steht
+    // hier nichts Elegantes: die vier Summen sind EINZELNE Variablen
+    // statt eines Feldes, die Adressen werden einmal je (i,k) gerechnet
+    // statt viermal, und der Rumpf ist ausgerollt. Die REIHENFOLGE der
+    // Rechnung ist dabei unveraendert -- die Ausgabe bleibt bitgleich.
+    var w: i64 = 0
+    var i: i32 = 14
+    while i >= 0 {
+        // VERZAHNEN STATT ACHT EINZELZUGRIFFE (Runde TEMPO 7).
+        //
+        // Die acht Werte kommen paarweise aus `xl` und `xr` -- und zwar aus
+        // BENACHBARTEN Plaetzen (`A` und `A+1`). `punpckldq` legt zwei solche
+        // Paare genau so ineinander, wie sie hier gebraucht werden:
+        //
+        //     xl: [A, A+1, .., ..]   xr: [A, A+1, .., ..]
+        //     unpacklo32  ->  [xl[A], xr[A], xl[A+1], xr[A+1]]
+        //
+        // Das ist Spur fuer Spur genau die Reihenfolge der vier `sf` unten --
+        // also dieselbe Ausgabe, aber ein Laden, ein Verzahnen, ein Schreiben
+        // statt acht Zugriffen mit acht Indexrechnungen.
+        //
+        // Die zweite Haelfte schreibt in ZWEI Paare an verschiedenen Stellen;
+        // dafuer steht `__v128_store64` (nur die untere Haelfte) und einmal
+        // `shuffle32(.., 0x0E)`, das die oberen zwei Spuren nach unten holt.
+        let a_oben: i64 = (18 * (31 - i)) as i64
+        let vl_oben: v128 = __v128_load(adr4(xl, a_oben) as *u8)
+        let vr_oben: v128 = __v128_load(adr4(xr, a_oben) as *u8)
+        __v128_store(adr4(zlin, (4 * i) as i64) as *mut u8,
+                     __v128_unpacklo32(vl_oben, vr_oben))
+
+        let b_unten: i64 = (18 * (1 + i)) as i64
+        let vl_unten: v128 = __v128_load(adr4(xl, b_unten) as *u8)
+        let vr_unten: v128 = __v128_load(adr4(xr, b_unten) as *u8)
+        let verzahnt: v128 = __v128_unpacklo32(vl_unten, vr_unten)
+        __v128_store64(adr4(zlin, (4 * (i - 16) + 2) as i64) as *mut u8, verzahnt)
+        __v128_store64(adr4(zlin, (4 * (i + 16)) as i64) as *mut u8,
+                       __v128_shuffle32(verzahnt, 14))
+
+        // VIER SPUREN AUF EINMAL (Runde TEMPO 4).
+        //
+        // Die vier Summen a0..a3 rechnen alle dasselbe mit
+        // NEBENEINANDERLIEGENDEN Werten (`zlin[idx+0..3]`) und denselben zwei
+        // Fenstergewichten -- das ist genau die Form, fuer die es `addps`,
+        // `subps` und `mulps` gibt. Jede Spur rechnet dabei Befehl fuer
+        // Befehl, was vorher die einzelne Rechnung gerechnet hat, in
+        // derselben Reihenfolge: die Ausgabe bleibt BITGLEICH (nachgewiesen,
+        // `tools/ton_bauen.sh` und der Vergleich der ganzen PCM-Datei).
+        //
+        // `w` zeigt auf ein Paar (w0, w1) im Fenster; eine Ladung holt beide
+        // und `__v128_shuffle32` zieht jeden auf alle vier Spuren. Deshalb hat
+        // `win` vier Werte Polster (`mp3_tab.fi`) -- die letzte Ladung liest
+        // sechzehn Oktette ab dem vorletzten Paar.
+        var va: v128 = __v128_zero()
+        var vb: v128 = __v128_zero()
+
+        // ZEIGER STATT INDEX (Runde TEMPO 5). Die drei Adressen laufen in
+        // festen Schritten: `zlin` 256 Oktette abwaerts, die zweite dieselben
+        // 256 aufwaerts, das Fensterpaar 8 Oktette weiter. Einmal ausgerechnet
+        // und dann weitergeschaltet spart die ganze Indexrechnung -- gemessen
+        // war sie hier die Haelfte der Arbeit. Dieselben Adressen, also
+        // dieselbe Ausgabe.
+        var pz: u64 = adr4(zlin, (4 * i) as i64)
+        var py: u64 = adr4(zlin, (4 * i - 15 * 64) as i64)
+        var pw: u64 = adr4(win, w)
+        var k: i32 = 0
+        while k < 8 {
+            let vwp: v128 = __v128_load(pw as *u8)
+            let vw0: v128 = __v128_shuffle32(vwp, 0)
+            let vw1: v128 = __v128_shuffle32(vwp, 85)
+            w = w + 2
+            pw = pw +% 8
+            let vz: v128 = __v128_load(pz as *u8)
+            let vy: v128 = __v128_load(py as *u8)
+            pz = pz -% 256
+            py = py +% 256
+            let zw1: v128 = __v128_mulf32(vz, vw1)
+            let yw0: v128 = __v128_mulf32(vy, vw0)
+            let zw0: v128 = __v128_mulf32(vz, vw0)
+            let yw1: v128 = __v128_mulf32(vy, vw1)
+            if k == 0 {
+                vb = __v128_addf32(zw1, yw0)
+                va = __v128_subf32(zw0, yw1)
+            } else {
+                vb = __v128_addf32(vb, __v128_addf32(zw1, yw0))
+                if (k & 1) == 1 {
+                    va = __v128_addf32(va, __v128_subf32(yw1, zw0))
+                } else {
+                    va = __v128_addf32(va, __v128_subf32(zw0, yw1))
+                }
+            }
+            k = k + 1
+        }
+        var af: [f32; 4] = [0.0f; 4]
+        var bf: [f32; 4] = [0.0f; 4]
+        var ai: [i32; 4] = [0; 4]
+        var bi: [i32; 4] = [0; 4]
+        __v128_store((&af[0]) as *mut u8, va)
+        __v128_store((&bf[0]) as *mut u8, vb)
+        scale_pcm4((&af[0]) as u64, (&ai[0]) as u64)
+        scale_pcm4((&bf[0]) as u64, (&bi[0]) as u64)
+
+        s16(dstr, ((15 - i) * nch) as i64, ai[1] as i16)
+        s16(dstr, ((17 + i) * nch) as i64, bi[1] as i16)
+        s16(dstl, ((15 - i) * nch) as i64, ai[0] as i16)
+        s16(dstl, ((17 + i) * nch) as i64, bi[0] as i16)
+        s16(dstr, ((47 - i) * nch) as i64, ai[3] as i16)
+        s16(dstr, ((49 + i) * nch) as i64, bi[3] as i16)
+        s16(dstl, ((47 - i) * nch) as i64, ai[2] as i16)
+        s16(dstl, ((49 + i) * nch) as i64, bi[2] as i16)
+        i = i - 1
+    }
+}
+
+// SECHZEHN OKTETTE JE DURCHLAUF (Runde TEMPO 7).
+//
+// `rt.mem_copy` kopiert acht Oktette je Durchlauf -- richtig und ueberall
+// verwendbar, auch im Kern ohne SSE. Hier geht es um EINEN heissen Fall: die
+// 3840 Oktette Zustand der Synthesefilterbank, zweimal je Granulat. Mit
+// `v128` ist das die Haelfte der Durchlaeufe. Die Laenge ist immer ein
+// Vielfaches von sechzehn; fuer den Rest steht der alte Weg daneben.
+fn kopiere16(ziel: u64, quelle: u64, n: usize) {
+    var i: usize = 0
+    while i + 16 <= n {
+        __v128_store((ziel + (i as u64)) as *mut u8,
+                     __v128_load((quelle + (i as u64)) as *u8))
+        i = i + 16
+    }
+    if i < n {
+        rt.mem_copy(ziel + (i as u64), quelle + (i as u64), n - i)
+    }
+}
+
+fn synth_granule(t: *mut mp3_tab.Tabs, qmf_state: u64, grbuf: u64, nbands: i32, nch: i32, pcm: u64, lins: u64) {
+    var i: i32 = 0
+    while i < nch {
+        dct_ii(t, adr4(grbuf, (576 * i) as i64), nbands)
+        i = i + 1
+    }
+    kopiere16(lins, qmf_state, 15 * 64 * 4)
+    i = 0
+    while i < nbands {
+        synth(t, adr4(grbuf, i as i64), adr2(pcm, (32 * nch * i) as i64), nch, adr4(lins, (i * 64) as i64))
+        i = i + 2
+    }
+    if nch == 1 {
+        i = 0
+        while i < 15 * 64 {
+            sf(qmf_state, i as i64, lf(lins, (nbands * 64 + i) as i64))
+            i = i + 2
+        }
+    } else {
+        kopiere16(qmf_state, adr4(lins, (nbands * 64) as i64), 15 * 64 * 4)
+    }
+}
+
+// ====================================================================
+// RAHMEN FINDEN
+// ====================================================================
+
+fn match_frame(t: *mut mp3_tab.Tabs, hdr: u64, mp3_bytes: i32, frame_bytes: i32) -> bool {
+    var i: i32 = 0
+    var nmatch: i32 = 0
+    while nmatch < MAX_FRAME_SYNC_MATCHES {
+        i = i + hdr_rahmen_oktette(t, adr1(hdr, i as i64), frame_bytes) + hdr_polster(adr1(hdr, i as i64))
+        if i + HDR_SIZE > mp3_bytes {
+            return nmatch > 0
+        }
+        if !hdr_vergleich(hdr, adr1(hdr, i as i64)) {
+            return false
+        }
+        nmatch = nmatch + 1
+    }
+    return true
+}
+
+struct Fund {
+    versatz: i32,
+    frame_bytes: i32,
+    free_format_bytes: i32,
+}
+
+fn find_frame(t: *mut mp3_tab.Tabs, mp3: u64, mp3_bytes: i32, free_format_bytes: i32) -> Fund {
+    var frei: i32 = free_format_bytes
+    var i: i32 = 0
+    while i < mp3_bytes - HDR_SIZE {
+        let h: u64 = adr1(mp3, i as i64)
+        if hdr_gueltig(h) {
+            var frame_bytes: i32 = hdr_rahmen_oktette(t, h, frei)
+            var frame_and_padding: i32 = frame_bytes + hdr_polster(h)
+
+            var k: i32 = HDR_SIZE
+            while frame_bytes == 0 && k < MAX_FREE_FORMAT_FRAME_SIZE && i + 2 * k < mp3_bytes - HDR_SIZE {
+                if hdr_vergleich(h, adr1(h, k as i64)) {
+                    let fb: i32 = k - hdr_polster(h)
+                    let nextfb: i32 = fb + hdr_polster(adr1(h, k as i64))
+                    if i + k + nextfb + HDR_SIZE <= mp3_bytes && hdr_vergleich(h, adr1(h, (k + nextfb) as i64)) {
+                        frame_and_padding = k
+                        frame_bytes = fb
+                        frei = fb
+                    }
+                }
+                k = k + 1
+            }
+
+            var gut: bool = false
+            if frame_bytes != 0 && i + frame_and_padding <= mp3_bytes {
+                gut = match_frame(t, h, mp3_bytes - i, frame_bytes)
+            }
+            if i == 0 && frame_and_padding == mp3_bytes {
+                gut = true
+            }
+            if gut {
+                return Fund { versatz: i, frame_bytes: frame_and_padding, free_format_bytes: frei }
+            }
+            frei = 0
+        }
+        i = i + 1
+    }
+    return Fund { versatz: mp3_bytes, frame_bytes: 0, free_format_bytes: frei }
+}
+
+// ====================================================================
+// DER EINE AUFRUF, DEN DIE WELT SIEHT
+// ====================================================================
+//
+// Gibt die Zahl der Abtastwerte JE KANAL zurueck (0 = kein Rahmen
+// dekodiert). `info.frame_bytes` sagt IMMER, wie viele Oktette der
+// Aufrufer weiterruecken muss -- auch bei 0, damit ein Strom mit Muell
+// vorne nicht stehenbleibt.
+
+fn mp3_decode_frame(t: *mut mp3_tab.Tabs, dec: *mut Mp3Dec, s: *mut Mp3Scratch,
+                    mp3: u64, mp3_bytes: i32, pcm: u64, info: *mut Mp3Info) -> i32 {
+    var i: i32 = 0
+    var frame_size: i32 = 0
+    var erfolg: bool = true
+    let eigener_kopf: u64 = (&(*dec).header[0]) as u64
+
+    if mp3_bytes > 4 && (*dec).header[0] == 255 as u8 && hdr_vergleich(eigener_kopf, mp3) {
+        frame_size = hdr_rahmen_oktette(t, mp3, (*dec).free_format_bytes) + hdr_polster(mp3)
+        if frame_size != mp3_bytes {
+            if frame_size + HDR_SIZE > mp3_bytes || !hdr_vergleich(mp3, adr1(mp3, frame_size as i64)) {
+                frame_size = 0
+            }
+        }
+    }
+    if frame_size == 0 {
+        var k: usize = 0
+        while k < 4 {
+            (*dec).header[k] = 0 as u8
+            k = k + 1
+        }
+        (*dec).reserv = 0
+        (*dec).free_format_bytes = 0
+        rt.mem_set((&(*dec).mdct_overlap[0][0]) as u64, 0 as u8, 288 * 2 * 4)
+        rt.mem_set((&(*dec).qmf_state[0]) as u64, 0 as u8, 960 * 4)
+        let f: Fund = find_frame(t, mp3, mp3_bytes, (*dec).free_format_bytes)
+        i = f.versatz
+        frame_size = f.frame_bytes
+        (*dec).free_format_bytes = f.free_format_bytes
+        if frame_size == 0 || i + frame_size > mp3_bytes {
+            (*info).frame_bytes = i
+            return 0
+        }
+    }
+
+    let hdr: u64 = adr1(mp3, i as i64)
+    rt.mem_copy(eigener_kopf, hdr, 4)
+    (*info).frame_bytes = i + frame_size
+    (*info).frame_offset = i
+    (*info).channels = hdr_kanaele(hdr)
+    (*info).hz = hdr_abtastrate(hdr)
+    (*info).layer = 4 - hdr_layer(hdr)
+    (*info).bitrate_kbps = hdr_bitrate_kbps(t, hdr)
+
+    if pcm == 0 {
+        return hdr_rahmen_abtastwerte(hdr)
+    }
+
+    var bs_frame: Bs = Bs { buf: 0, pos: 0, limit: 0 }
+    bs_init(&bs_frame, adr1(hdr, HDR_SIZE as i64), frame_size - HDR_SIZE)
+    if hdr_is_crc(hdr) {
+        get_bits(&bs_frame, 16)
+    }
+
+    if (*info).layer != 3 {
+        // E1: Layer I/II koennen wir nicht -- Rahmen ueberspringen, nicht raten.
+        return 0
+    }
+
+    let main_data_begin: i32 = l3_read_side_info(t, &bs_frame, s, hdr)
+    if main_data_begin < 0 || bs_frame.pos > bs_frame.limit {
+        (*dec).header[0] = 0 as u8
+        return 0
+    }
+    erfolg = l3_restore_reservoir(dec, &bs_frame, s, main_data_begin)
+    if erfolg {
+        var granulen: i32 = 1
+        if hdr_test_mpeg1(hdr) {
+            granulen = 2
+        }
+        var igr: i32 = 0
+        while igr < granulen {
+            rt.mem_set((&(*s).grbuf[0][0]) as u64, 0 as u8, 576 * 2 * 4)
+            l3_decode(t, dec, s, igr * (*info).channels, (*info).channels)
+            synth_granule(t, (&(*dec).qmf_state[0]) as u64, (&(*s).grbuf[0][0]) as u64, 18,
+                          (*info).channels, adr2(pcm, ((igr * 576) * (*info).channels) as i64),
+                          (&(*s).syn[0][0]) as u64)
+            igr = igr + 1
+        }
+    }
+    l3_save_reservoir(dec, s)
+    if !erfolg {
+        return 0
+    }
+    return hdr_rahmen_abtastwerte(eigener_kopf)
+}
