@@ -527,6 +527,13 @@ build animkey
 "$W/animkey"
 
 echo
+echo "== 18g. ORPHANED TRANSITION ENTRIES ARE GIVEN BACK (r115) =="
+# a full registry hands the slot of an entry nobody asked for during 2 s to a
+# newcomer; counter-checks: nothing stale = refused, ten live widgets keep theirs
+build transgc
+"$W/transgc"
+
+echo
 echo "== 18p. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
 # lib/fui/app.fi (29.09.2026): the three programs of examples/fui/ build
 # for BOTH platforms from one source -- `import fui.apphost` resolves to
