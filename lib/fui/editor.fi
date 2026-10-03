@@ -90,7 +90,8 @@ import fui.textbuf
 import fui.ime
 
 export {
-    Editor, editor_new, editor_init, editor_free,
+    Editor, editor_new, editor_init, editor_init_cap, editor_set_multiline,
+    editor_is_multiline, editor_click, editor_free,
     editor_buf, editor_set_clipboard, editor_set_width, editor_scroll,
     editor_key, editor_char, editor_mouse_down, editor_mouse_drag, editor_mouse_up,
     editor_caret_on, editor_caret_tick, editor_caret_wake,
@@ -102,7 +103,7 @@ export {
     editor_ime_commit, editor_ime_spot, editor_ime_end,
     editor_set_visual, editor_caret_x, editor_is_rtl, editor_visual_on,
     KEY_LEFT, KEY_RIGHT, KEY_HOME, KEY_END, KEY_BACKSPACE, KEY_DELETE, KEY_ENTER,
-    KEY_ESC, KEY_TAB, KEY_UP, KEY_DOWN,
+    KEY_ESC, KEY_TAB, KEY_UP, KEY_DOWN, KEY_PGUP, KEY_PGDN,
     MOD_SHIFT, MOD_CTRL, MOD_ALT,
     RES_NONE, RES_CHANGED, RES_MOVED, RES_COMMIT,
     RES_CANCEL, RES_PASS,
@@ -125,6 +126,8 @@ const KEY_ESC: u32 = 8
 const KEY_TAB: u32 = 9
 const KEY_UP: u32 = 10
 const KEY_DOWN: u32 = 11
+const KEY_PGUP: u32 = 12
+const KEY_PGDN: u32 = 13
 
 // The modifier keys, as a bit mask. Bit 0 and bit 2 are those of X11,
 // which lib/fenster/win32.fi reproduces -- named here outright.
@@ -169,7 +172,9 @@ const UNDO_CAP: usize = 512
 struct Editor {
     tf: textbuf.TextBuf,
     // --- undo
-    u_buf: *mut u8, // UNDO_N * UNDO_CAP
+    u_buf: *mut u8, // UNDO_N * u_cap
+    u_cap: usize, // bytes per undo step (and the internal clipboard)
+    multi: u32, // 1 = several lines (textarea.fi): Enter is a newline
     u_len: [usize; 16],
     u_caret: [usize; 16],
     u_n: usize, // how many levels are in use
@@ -218,7 +223,7 @@ fn vis_rtl_none(c: u64, p: u64, n: usize) -> bool { return false }
 fn editor_new() -> Editor {
     return Editor {
         tf: textbuf.tb_new(),
-        u_buf: 0 as *mut u8, u_len: [0; 16], u_caret: [0; 16],
+        u_buf: 0 as *mut u8, u_cap: UNDO_CAP, multi: 0, u_len: [0; 16], u_caret: [0; 16],
         u_n: 0, u_at: 0, coalescing: 0,
         clip_read: clip_read_none, clip_write: clip_write_none, ab_da: 0,
         ab_buf: 0 as *mut u8, ab_n: 0,
@@ -234,12 +239,22 @@ fn editor_new() -> Editor {
 // `p`/`cap` is the text buffer and belongs to the caller -- the same
 // rule as in textbuf.fi.
 fn editor_init(e: *mut Editor, p: u64, cap: usize) -> bool {
+    return editor_init_cap(e, p, cap, UNDO_CAP)
+}
+
+// The same, with the size of one undo step chosen by the caller: a text
+// area holds more than an address line, and "text over the step size has
+// no undo" would be a trap for exactly the field where undo matters most.
+// 16 steps of `ucap` bytes are allocated, plus `ucap` bytes of internal
+// clipboard.
+fn editor_init_cap(e: *mut Editor, p: u64, cap: usize, ucap: usize) -> bool {
     textbuf.tb_init(&(*e).tf, p, cap)
-    (*e).u_buf = rt.heap_alloc(UNDO_N * UNDO_CAP) as *mut u8
+    (*e).u_cap = ucap
+    (*e).u_buf = rt.heap_alloc(UNDO_N * ucap) as *mut u8
     if (*e).u_buf as usize == 0 {
         return false
     }
-    (*e).ab_buf = rt.heap_alloc(UNDO_CAP) as *mut u8
+    (*e).ab_buf = rt.heap_alloc(ucap) as *mut u8
     if (*e).ab_buf as usize == 0 {
         return false
     }
@@ -248,13 +263,25 @@ fn editor_init(e: *mut Editor, p: u64, cap: usize) -> bool {
     return true
 }
 
+// Several lines: Enter inserts a line break (Ctrl+Enter commits), a paste
+// keeps its line breaks. Set by lib/fui/textarea.fi.
+fn editor_set_multiline(e: *mut Editor, on: bool) {
+    if on {
+        (*e).multi = 1
+    } else {
+        (*e).multi = 0
+    }
+}
+
+fn editor_is_multiline(e: *mut Editor) -> bool { return (*e).multi != 0 }
+
 fn editor_free(e: *mut Editor) {
     if (*e).u_buf as usize != 0 {
-        rt.heap_free((*e).u_buf as u64, UNDO_N * UNDO_CAP)
+        rt.heap_free((*e).u_buf as u64, UNDO_N * (*e).u_cap)
         (*e).u_buf = 0 as *mut u8
     }
     if (*e).ab_buf as usize != 0 {
-        rt.heap_free((*e).ab_buf as u64, UNDO_CAP)
+        rt.heap_free((*e).ab_buf as u64, (*e).u_cap)
         (*e).ab_buf = 0 as *mut u8
     }
 }
@@ -328,7 +355,7 @@ fn editor_push_undo(e: *mut Editor, from_char: bool) {
         return
     }
     let n: usize = textbuf.tb_len(&(*e).tf)
-    if n > UNDO_CAP {
+    if n > (*e).u_cap {
         return
     }
     // Everything after the current position is overtaken: whoever
@@ -338,15 +365,15 @@ fn editor_push_undo(e: *mut Editor, from_char: bool) {
         // The stack is full: the oldest step falls away.
         var i: usize = 1
         while i < UNDO_N {
-            rt.mem_copy(((*e).u_buf as u64) + ((i - 1) * UNDO_CAP) as u64,
-                ((*e).u_buf as u64) + (i * UNDO_CAP) as u64, UNDO_CAP)
+            rt.mem_copy(((*e).u_buf as u64) + ((i - 1) * (*e).u_cap) as u64,
+                ((*e).u_buf as u64) + (i * (*e).u_cap) as u64, (*e).u_cap)
             (*e).u_len[i - 1] = (*e).u_len[i]
             (*e).u_caret[i - 1] = (*e).u_caret[i]
             i = i + 1
         }
         at = UNDO_N - 1
     }
-    rt.mem_copy(((*e).u_buf as u64) + (at * UNDO_CAP) as u64,
+    rt.mem_copy(((*e).u_buf as u64) + (at * (*e).u_cap) as u64,
         textbuf.tb_ptr(&(*e).tf), n)
     (*e).u_len[at] = n
     (*e).u_caret[at] = textbuf.tb_caret(&(*e).tf)
@@ -368,8 +395,8 @@ fn editor_undo(e: *mut Editor) -> bool {
     // and Ctrl+Y would have nothing to return to.
     if (*e).u_at == (*e).u_n {
         let n: usize = textbuf.tb_len(&(*e).tf)
-        if n <= UNDO_CAP && (*e).u_n < UNDO_N {
-            rt.mem_copy(((*e).u_buf as u64) + ((*e).u_n * UNDO_CAP) as u64,
+        if n <= (*e).u_cap && (*e).u_n < UNDO_N {
+            rt.mem_copy(((*e).u_buf as u64) + ((*e).u_n * (*e).u_cap) as u64,
                 textbuf.tb_ptr(&(*e).tf), n)
             (*e).u_len[(*e).u_n] = n
             (*e).u_caret[(*e).u_n] = textbuf.tb_caret(&(*e).tf)
@@ -379,7 +406,7 @@ fn editor_undo(e: *mut Editor) -> bool {
     (*e).u_at = (*e).u_at - 1
     let at: usize = (*e).u_at
     textbuf.tb_set_text(&(*e).tf,
-        ((*e).u_buf as u64) + (at * UNDO_CAP) as u64, (*e).u_len[at])
+        ((*e).u_buf as u64) + (at * (*e).u_cap) as u64, (*e).u_len[at])
     textbuf.tb_set_range(&(*e).tf, (*e).u_caret[at], (*e).u_caret[at])
     (*e).coalescing = 0
     return true
@@ -392,7 +419,7 @@ fn editor_redo(e: *mut Editor) -> bool {
     (*e).u_at = (*e).u_at + 1
     let at: usize = (*e).u_at
     textbuf.tb_set_text(&(*e).tf,
-        ((*e).u_buf as u64) + (at * UNDO_CAP) as u64, (*e).u_len[at])
+        ((*e).u_buf as u64) + (at * (*e).u_cap) as u64, (*e).u_len[at])
     textbuf.tb_set_range(&(*e).tf, (*e).u_caret[at], (*e).u_caret[at])
     (*e).coalescing = 0
     return true
@@ -420,8 +447,8 @@ fn editor_copy(e: *mut Editor) -> bool {
     }
     // The internal clipboard -- better than nothing at all.
     var k: usize = n
-    if k > UNDO_CAP {
-        k = UNDO_CAP
+    if k > (*e).u_cap {
+        k = (*e).u_cap
     }
     rt.mem_copy((*e).ab_buf as u64, von, k)
     (*e).ab_n = k
@@ -440,32 +467,66 @@ fn editor_cut(e: *mut Editor) -> bool {
 }
 
 fn editor_paste(e: *mut Editor) -> bool {
-    var puf: [u8; 512] = [0; 512]
+    var small: [u8; 512] = [0; 512]
+    var pp: u64 = (&small[0]) as u64
+    var cap: usize = 512
+    var big: u64 = 0
+    if (*e).multi != 0 && (*e).u_cap > 512 {
+        big = rt.heap_alloc((*e).u_cap)
+        if big != 0 {
+            pp = big
+            cap = (*e).u_cap
+        }
+    }
     var n: usize = 0
     if (*e).ab_da != 0 {
         let f: fn(u64, usize) -> usize = (*e).clip_read
-        n = f((&puf[0]) as u64, 512)
+        n = f(pp, cap)
     }
     if n == 0 && (*e).ab_n > 0 {
         n = (*e).ab_n
-        rt.mem_copy((&puf[0]) as u64, (*e).ab_buf as u64, n)
+        if n > cap {
+            n = cap
+        }
+        rt.mem_copy(pp, (*e).ab_buf as u64, n)
     }
     if n == 0 {
+        if big != 0 {
+            rt.heap_free(big, (*e).u_cap)
+        }
         return false
     }
-    // LINE BREAKS BECOME SPACES. A one-line field with a line break in
-    // it paints an empty rect -- and an address copied out of a text
-    // file almost always brings one with it.
+    // ONE LINE: LINE BREAKS BECOME SPACES. A one-line field with a line
+    // break in it paints an empty rect -- and an address copied out of a
+    // text file almost always brings one with it.
+    // SEVERAL LINES: they stay, as LF (CR LF and a lone CR become one LF),
+    // so a text copied on Windows does not carry invisible CRs.
     var i: usize = 0
+    var o: usize = 0
     while i < n {
-        let c: u8 = *(((&puf[0]) as u64 + i as u64) as *mut u8)
-        if c == 10 as u8 || c == 13 as u8 || c == 9 as u8 {
-            *(((&puf[0]) as u64 + i as u64) as *mut u8) = 32 as u8
+        var c: u8 = *((pp + i as u64) as *mut u8)
+        if (*e).multi != 0 {
+            if c == 13 as u8 {
+                if i + 1 < n && *((pp + (i + 1) as u64) as *mut u8) == 10 as u8 {
+                    i = i + 1
+                }
+                c = 10 as u8
+            } else if c == 9 as u8 {
+                c = 32 as u8
+            }
+        } else if c == 10 as u8 || c == 13 as u8 || c == 9 as u8 {
+            c = 32 as u8
         }
+        *((pp + o as u64) as *mut u8) = c
+        o = o + 1
         i = i + 1
     }
     editor_push_undo(e, false)
-    return textbuf.tb_insert(&(*e).tf, (&puf[0]) as u64, n)
+    let ok: bool = textbuf.tb_insert(&(*e).tf, pp, o)
+    if big != 0 {
+        rt.heap_free(big, (*e).u_cap)
+    }
+    return ok
 }
 
 // ============================================================= THE KEYS
@@ -553,6 +614,11 @@ fn editor_key(e: *mut Editor, key: u32, mods: u32) -> u32 {
         return RES_CHANGED
     }
     if key == KEY_ENTER {
+        if (*e).multi != 0 && !ctrl {
+            editor_push_undo(e, false)
+            let okn: bool = textbuf.tb_insert_cp(t, 10 as u32)
+            return RES_CHANGED
+        }
         return RES_COMMIT
     }
     if key == KEY_ESC {
@@ -801,6 +867,26 @@ fn editor_mouse_drag(e: *mut Editor, x: f64,
     textbuf.tb_set_caret(t, pos, true)
     editor_caret_wake(e)
     return RES_MOVED
+}
+
+// The click count only: 1, 2, 3 ... for clicks within DOUBLE_US and 4 pixels
+// of each other. A text area finds its character position itself (it knows
+// the lines) and uses this for single / double / triple click.
+fn editor_click(e: *mut Editor, x: f64, now_us: u64) -> usize {
+    editor_caret_wake(e)
+    editor_ime_end(e)
+    var dx: f64 = x - (*e).click_x
+    if dx < 0.0 {
+        dx = 0.0 - dx
+    }
+    if now_us - (*e).click_time < DOUBLE_US && dx < 4.0 {
+        (*e).click_n = (*e).click_n + 1
+    } else {
+        (*e).click_n = 1
+    }
+    (*e).click_time = now_us
+    (*e).click_x = x
+    return (*e).click_n
 }
 
 fn editor_mouse_up(e: *mut Editor) -> u32 {
