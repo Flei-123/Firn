@@ -541,14 +541,23 @@ echo "== 18p. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
 # and tools/fui/app_main.fi drives them without a window (layout, clicks,
 # keys, text fields, wrapping, scale 2). The browser half with Chromium:
 # bash tools/wasm/appdemo.sh.
-for ex in hello_window counter form touchpad notes; do
+for ex in hello_window counter form touchpad notes files; do
     "$FIRNC" --opt-level=dev -o "$W/app_$ex" "examples/fui/$ex.fi"
     "$FIRNC" --opt-level=dev --target=wasm32-browser -o "$W/app_$ex.wasm" \
         "examples/fui/$ex.fi"
 done
-echo "  examples/fui/{hello_window,counter,form,touchpad,notes}.fi build native + wasm32   OK"
+echo "  examples/fui/{hello_window,counter,form,touchpad,notes,files}.fi build native + wasm32   OK"
 build app
 "$W/app"
+
+echo
+echo "== 18p3. ZEILEN MIT SYMBOLEN (lib/fui/listrow.fi, r129) =="
+# Listenzeile = Symbol links, Text, Detail und Badge rechts, als Knoten im
+# Szenenbaum: Lage, Treffer, Hover, Auswahl (eine zugleich), gesperrte Zeile,
+# schmale Liste (der Text weicht), hell + dunkel. fui.app: app.list /
+# app.list_item (examples/fui/files.fi, geprueft in app_main). docs/fui-list-rows.md
+build listrow
+"$W/listrow"
 
 echo
 echo "== 18p2. THE ACCESSIBILITY AUDIT OF EVERY fUi PROGRAM (r98) =="

@@ -76,6 +76,9 @@ import fui.widget
 import fui.editor
 import fui.textbuf
 import fui.textarea
+import fui.listrow
+import fui.anim
+import fui.query
 import plat.fuiwirt
 import fui.event
 import fui.audit
@@ -84,6 +87,7 @@ import fui.apphost
 
 export {
     App, window, label, button, entry, textarea, lines_of, row, column, end, spacer,
+    list, list_item, chosen,
     set_text, append_text, set_number, text, number, quit, run,
     set_data, data, set_dark, focus, root, on, audit,
     NONE,
@@ -111,6 +115,8 @@ const AREA_W: usize = 320
 const AREA_ROW_PT: usize = 20
 const AREA_PAD_PT: usize = 16
 const AREA_CAP: usize = 4096
+// a finger moves this far (pixels) before it is a swipe and no longer a tap
+const TOUCH_SLOP: f64 = 8.0
 
 struct App {
     sc: scene.Scene,
@@ -139,6 +145,12 @@ struct App {
     // the slot the mouse is dragging a selection in (NONE = none), and the
     // pointer where it was last seen (the wheel has no position of its own)
     drag_k: usize,
+    // a finger on a text area (r127): it scrolls instead of selecting; a tap
+    // that did not move puts the caret. touch_k = NONE: no finger down there
+    touch_k: usize,
+    touch_x: f64,
+    touch_y: f64,
+    touch_moved: bool,
     ptr_x: f64,
     ptr_y: f64,
     n_ed: usize,
@@ -150,6 +162,10 @@ struct App {
     rt: event.Router,
     next_key: u32,
     rt_on: bool,
+    // the hover/press transitions of the buttons (r126), bound to c and the host
+    tr: anim.TransReg,
+    // lists with rows (list / list_item): the rules are in the sheet
+    lists_on: bool,
     // what the program says for accessibility: a text field is named by its
     // hint (the grey text in the empty field)
     ax: a11y.A11y,
@@ -179,10 +195,11 @@ fn app_blank() -> App {
         tlen: [0; 128], wrapped: [false; 128],
         ed: [editor.editor_new(); 8], ed_node: [NONE; 8], hint: [""; 8],
         area: [false; 8], lines: [textarea.ta_new(); 8], drag_k: NONE,
+        touch_k: NONE, touch_x: 0.0, touch_y: 0.0, touch_moved: false,
         ptr_x: 0.0, ptr_y: 0.0,
         n_ed: 0, ed_bufs: 0, quit: false, user: 0,
-        rt: event.router_new(), next_key: 60000 as u32, rt_on: false,
-        ax: a11y.a11y_new() }
+        rt: event.router_new(), next_key: 60000 as u32, rt_on: false, lists_on: false,
+        ax: a11y.a11y_new(), tr: anim.transreg_new() }
 }
 
 // ============================================================ THE WINDOW
@@ -200,6 +217,11 @@ fn window(title: str, w: usize, h: usize) -> *mut App {
     (*a).texts = rt.heap_alloc(scene.SCENE_MAX * TEXT_CAP)
     (*a).ed_bufs = rt.heap_alloc(ENTRIES_MAX * TEXT_CAP)
     (*a).w = fuiwirt.host_new(&(*a).sc, &(*a).c)
+    // buttons glide between rest, hover and press; a node's key path (or its
+    // address) names the transition, so it stays with its button
+    (*a).tr = anim.transreg_new()
+    anim.transreg_set_keyer(&(*a).tr, (&(*a).sc) as u64, query.query_widget_key)
+    fuiwirt.host_set_transitions(&(*a).w, &(*a).tr)
     let root: usize = scene.scene_box(&(*a).sc, scene.SCENE_NONE, 0 as u32,
         flex.FLEX_COLUMN, flex.JUSTIFY_CENTER, flex.AL_CENTER)
     scene.node_set_gap(&(*a).sc, root, GAP, GAP)
@@ -363,6 +385,129 @@ fn spacer(a: *mut App, w: usize, h: usize) -> usize {
     }
     scene.node_set_size(&(*a).sc, i, w as f64, h as f64)
     return i
+}
+
+// ============================================================ LISTS
+
+// A LIST OF ROWS. The rows after this stand one below the other, until `end`:
+//
+//     app.list(a)
+//     app.list_item(a, "folder", "Documents", "12 items", "3", open_docs)
+//     app.list_item(a, "pencil", "notes.txt", "2 KB", "", open_notes)
+//     app.end(a)
+//
+// Every row has a symbol on the left (the name of a Lucide icon, "" = none),
+// its text, and on the right an optional detail text and badge ("" = none).
+// A click on a row chooses it (one at a time) and runs its handler; the row
+// under the mouse is highlighted (lib/fui/listrow.fi describes the look and
+// the keys). 24 rows are about what the 128 nodes of a window hold.
+fn list(a: *mut App) -> usize {
+    if (*a).depth >= STACK_MAX {
+        return NONE
+    }
+    if !(*a).lists_on {
+        listrow.listrow_rules(&(*a).sh)
+        (*a).lists_on = true
+    }
+    let l: usize = listrow.listrow_list(&(*a).sc, parent(a))
+    if l == scene.SCENE_NONE {
+        return NONE
+    }
+    a11y.a11y_set_role(&(*a).ax, l, a11y.ROLE_LIST)
+    (*a).stack[(*a).depth] = l
+    (*a).depth = (*a).depth + 1
+    return l
+}
+
+// One row in the open list. Returns its node. The texts are copied into the
+// window, so they may be temporary. `on_pick(a)` runs when the row is
+// clicked; `chosen(a, list)` then says which one it was.
+fn list_item(a: *mut App, icon: str, text: str, detail: str, badge: str,
+    on_pick: fn(*mut App)) -> usize {
+    let l: usize = parent(a)
+    if (*a).depth < 2 || !scene.node_has_class(&(*a).sc, l, listrow.listrow_names().list) {
+        return NONE
+    }
+    var r: listrow.Row = listrow.row_new((*a).next_key, text)
+    (*a).next_key = (*a).next_key + 1 as u32
+    if icon.n > 0 {
+        r.icon = listrow.icon_named(icon)
+    }
+    r.detail = detail
+    r.badge = badge
+    let z: usize = listrow.listrow_add(&(*a).sc, l, &r)
+    if z == scene.SCENE_NONE {
+        return NONE
+    }
+    // the texts live in the window: the text nodes are the children that
+    // are text (text, then detail, then badge, in this order)
+    var k: usize = 0
+    var c: usize = scene.scene_first_child(&(*a).sc, z)
+    while c != scene.SCENE_NONE {
+        if scene.node_kind(&(*a).sc, c) == scene.N_TEXT {
+            if k == 0 {
+                keep_text(a, c, text, 0)
+            } else if k == 1 && detail.n > 0 {
+                keep_text(a, c, detail, 0)
+            } else {
+                keep_text(a, c, badge, 0)
+            }
+            k = k + 1
+        }
+        c = scene.scene_next_sibling(&(*a).sc, c)
+    }
+    (*a).cb[z] = on_pick
+    (*a).has_cb[z] = true
+    a11y.a11y_set_role(&(*a).ax, z, a11y.ROLE_LISTITEM)
+    a11y.a11y_set_name(&(*a).ax, z, text.p as u64, text.n)
+    return z
+}
+
+// The chosen row of a list (the node `list` returned), NONE if none.
+fn chosen(a: *mut App, l: usize) -> usize {
+    let key: u32 = listrow.listrow_selected(&(*a).sc, l)
+    if key == 0 as u32 {
+        return NONE
+    }
+    return listrow.listrow_row_of(&(*a).sc, l, key)
+}
+
+// The pointer's part (app_hook): the row under it is highlighted (key 0: no
+// row), and a press on a row chooses it. True when the page changed.
+fn lists_hover(a: *mut App, key: u32) -> bool {
+    var changed: bool = false
+    let cl: u32 = listrow.listrow_names().list
+    var i: usize = 0
+    while i < scene.scene_count(&(*a).sc) {
+        if scene.node_has_class(&(*a).sc, i, cl) {
+            if listrow.listrow_hover(&(*a).sc, i, key) {
+                changed = true
+            }
+        }
+        i = i + 1
+    }
+    return changed
+}
+
+// Choose the row with `key` and run its handler. False when there is none.
+fn lists_pick(a: *mut App, key: u32) -> bool {
+    let cl: u32 = listrow.listrow_names().list
+    var i: usize = 0
+    while i < scene.scene_count(&(*a).sc) {
+        if scene.node_has_class(&(*a).sc, i, cl) {
+            let z: usize = listrow.listrow_row_of(&(*a).sc, i, key)
+            if z != scene.SCENE_NONE {
+                let ch: bool = listrow.listrow_select(&(*a).sc, i, key)
+                if (*a).has_cb[z] {
+                    let f: fn(*mut App) = (*a).cb[z]
+                    f(a)
+                }
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
 }
 
 // ============================================================ WIDGETS
@@ -668,6 +813,9 @@ fn app_scene(a: *mut App) -> *mut scene.Scene { return &(*a).sc }
 fn app_attach(ud: u64, z: *mut painter.Painter) {
     let a: *mut App = ud as *mut App
     (*a).c = render.ctx_new(&(*a).m, z)
+    // a new Ctx has no transitions: bind the registry again (r126); the
+    // buttons it already knows keep their entries
+    anim.transreg_bind(&(*a).tr, &(*a).c)
 }
 
 // One frame of `w` x `h` device pixels into the attached painter.
@@ -679,6 +827,7 @@ fn app_paint(ud: u64, w: usize, h: usize) {
         return
     }
     fit_labels(a, w)
+    anim.transreg_new_frame(&(*a).tr)
     scene.scene_run(&(*a).sc, &(*a).c, &(*a).sh, 0.0, 0.0, w as f64,
         h as f64)
 }
@@ -822,6 +971,24 @@ fn app_press(ud: u64, x: f64, y: f64) {
 //   up     ends the drag
 //   wheel  scrolls the text area under the pointer
 // true = something changed, paint again.
+// The mouse (or a tap) goes down in text slot `k` at (x, y): the caret goes
+// to that place; a text area takes it line by line.
+fn press_field(a: *mut App, k: usize, x: f64, y: f64) {
+    let e: *mut widget.Widget = scene.node_widget(&(*a).sc, (*a).ed_node[k])
+    let c: *mut render.Ctx = &(*a).c
+    let now: u64 = ((*c).ms as u64) * 1000
+    let x0: f64 = render.field_text_x0(c, e)
+    if (*a).area[k] {
+        let y0: f64 = widget.w_y(e) + render.pady_of(c, e)
+        let r: u32 = textarea.ta_mouse_down(&(*a).lines[k], &(*a).ed[k],
+            x - x0, y - y0, now, false)
+    } else {
+        var fm: render.FieldMeas = render.field_meas_new(c, e)
+        let r2: u32 = editor.editor_mouse_down(&(*a).ed[k], x - x0, now,
+            render.field_meas, (&fm) as u64, false)
+    }
+}
+
 fn app_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     let a: *mut App = ud as *mut App
     if kind == fuiwirt.HOOK_WHEEL {
@@ -834,7 +1001,36 @@ fn app_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     }
     (*a).ptr_x = x
     (*a).ptr_y = y
+    if (*a).lists_on {
+        if kind == fuiwirt.HOOK_LEAVE {
+            if lists_hover(a, 0 as u32) {
+                return true
+            }
+        }
+        if kind == fuiwirt.HOOK_MOVE {
+            if lists_hover(a, listrow.listrow_hit(&(*a).sc, x, y)) {
+                return true
+            }
+        }
+        if kind == fuiwirt.HOOK_DOWN {
+            let key: u32 = listrow.listrow_hit(&(*a).sc, x, y)
+            if key != 0 as u32 && lists_pick(a, key) {
+                (*a).drag_k = NONE
+                return true
+            }
+        }
+    }
     if kind == fuiwirt.HOOK_UP {
+        if (*a).touch_k != NONE {
+            let tk: usize = (*a).touch_k
+            (*a).touch_k = NONE
+            if !(*a).touch_moved {
+                press_field(a, tk, x, y)
+                editor.editor_mouse_up(&(*a).ed[tk])
+                return true
+            }
+            return false
+        }
         if (*a).drag_k == NONE {
             return false
         }
@@ -844,24 +1040,32 @@ fn app_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     }
     if kind == fuiwirt.HOOK_DOWN {
         (*a).drag_k = NONE
+        (*a).touch_k = NONE
         let k: usize = slot_at(a, x, y)
         if k == NONE {
             return false
         }
-        let e: *mut widget.Widget = scene.node_widget(&(*a).sc, (*a).ed_node[k])
-        let c: *mut render.Ctx = &(*a).c
-        let now: u64 = ((*c).ms as u64) * 1000
-        let x0: f64 = render.field_text_x0(c, e)
-        if (*a).area[k] {
-            let y0: f64 = widget.w_y(e) + render.pady_of(c, e)
-            let r: u32 = textarea.ta_mouse_down(&(*a).lines[k], &(*a).ed[k],
-                x - x0, y - y0, now, false)
-        } else {
-            var fm: render.FieldMeas = render.field_meas_new(c, e)
-            let r2: u32 = editor.editor_mouse_down(&(*a).ed[k], x - x0, now,
-                render.field_meas, (&fm) as u64, false)
+        // A FINGER ON A TEXT AREA scrolls it: the caret waits for the lift
+        // (a tap that did not move), so a swipe never selects a word.
+        if (*a).area[k] && fuiwirt.host_pointer_type(&(*a).w) == event.PT_TOUCH {
+            (*a).touch_k = k
+            (*a).touch_x = x
+            (*a).touch_y = y
+            (*a).touch_moved = false
+            return false
         }
+        press_field(a, k, x, y)
         (*a).drag_k = k
+        return true
+    }
+    if kind == fuiwirt.HOOK_MOVE && (*a).touch_k != NONE {
+        let dy: f64 = y - (*a).touch_y
+        if !(*a).touch_moved && dy < TOUCH_SLOP && dy > 0.0 - TOUCH_SLOP {
+            return false
+        }
+        (*a).touch_moved = true
+        (*a).touch_y = y
+        textarea.ta_wheel(&(*a).lines[(*a).touch_k], 0.0 - dy)
         return true
     }
     if kind == fuiwirt.HOOK_MOVE && (*a).drag_k != NONE {

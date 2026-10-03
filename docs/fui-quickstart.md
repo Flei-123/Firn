@@ -160,6 +160,16 @@ drag selects, a double click selects the word, a triple click the paragraph.
 `app.lines_of(a, id)` gives the line layout (`fui.textarea`) for programs
 that want the line count or the scroll position.
 
+
+## A list of rows with symbols
+
+`examples/fui/files.fi` -- `app.list(a)` opens a list, `app.list_item(a, icon,
+text, detail, badge, on_pick)` adds a row with a Lucide symbol on the left and
+an optional detail and badge on the right; a click chooses the row and runs
+its handler. The full API (also for scene-tree programs) is in
+`docs/fui-list-rows.md`.
+
+
 ## The API
 
 | Call | What it does |

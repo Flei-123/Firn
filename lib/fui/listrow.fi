@@ -1,0 +1,385 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/listrow.fi -- LIST ROWS WITH SYMBOLS (fUi, roadmap r129).
+//
+// ========================================================= WHAT
+//
+// One row of a list: a SYMBOL on the left, the TEXT, and on the right an
+// optional DETAIL text (a size, a date) and an optional BADGE (a count, a
+// "new"). A list of such rows is what a file explorer, a settings page
+// and a mail list all are. The rows are nodes of a scene tree
+// (lib/fui/scene.fi) coloured by a style sheet (lib/fui/sheet.fi), so they
+// measure, wrap, align and scale like any other part of a fUi page --
+// nothing here paints or measures by hand except the symbol itself.
+//
+//     [icon] Documents                      12 items  [3]
+//     [icon] Pictures                       7 items
+//     [icon] notes.txt                      2 KB
+//
+// ========================================================= THE USE
+//
+//     var sh: sheet.Sheet = sheet.sheet_new()
+//     listrow.listrow_rules(&sh)                      // once
+//     let list: usize = listrow.listrow_list(&sc, parent)
+//     var r: listrow.Row = listrow.row_new(1, "Documents")
+//     r.icon = listrow.icon_named("folder")          // a Lucide name, or ICON_NONE
+//     r.detail = "12 items"
+//     r.badge = "3"
+//     listrow.listrow_add(&sc, list, &r)
+//     ...
+//     listrow.listrow_select(&sc, list, 2)            // choose row with key 2
+//     let key: u32 = listrow.listrow_hit(&sc, px, py) // which row is there? 0 = none
+//     listrow.listrow_hover(&sc, list, key)           // the row under the pointer
+//
+// A ROW IS NAMED BY A KEY (a number >= 1 the caller picks: a file number,
+// a table index + 1). It becomes the node id of the row, so the event
+// router (lib/fui/event.fi, `on`), the accessibility tree (a11y) and
+// `scene_find_id` find the row by it. Rows of one list have different keys.
+//
+// TEXTS ARE NOT COPIED. A node holds the pointer, so a text has to live
+// longer than the tree -- a string literal, a `static`, or a buffer of the
+// caller's. (Same rule as scene.node_set_text.)
+//
+// ========================================================= THE LOOK
+//
+// Only theme tokens, no colour of its own:
+//   row            transparent, radius 6, text TOK_TEXT
+//   row, hovered   TOK_BUTTON_HOVER (listrow_hover)
+//   row, chosen    TOK_SELECTION with TOK_SELECTION_TEXT (listrow_select);
+//                  the detail turns to the selection text too, the badge
+//                  swaps its two colours so it stays visible
+//   row, disabled  TOK_TEXT_DISABLED, listrow_hit does not report it
+//   symbol         the text colour of the row, 16 x 16 points, a Lucide
+//                  icon (lib/fui/lucide.fi) drawn by lib/fui/icons.fi
+//   detail         TOK_TEXT_MUTED, 13 points
+//   badge          TOK_ACCENT with TOK_TEXT_ON_ACCENT, a pill, 12 points
+// An application changes the look with rules of its own in its sheet,
+// written after `listrow_rules`: the class names are the ones in
+// `listrow_names`.
+import fui.style
+import fui.sheet
+import fui.scene
+import fui.flex
+import fui.render
+import fui.widget
+import fui.icons
+import fui.lucide
+
+export {
+    Row, row_new, icon_named, ICON_NONE,
+    listrow_rules, listrow_names, ListRowNames,
+    listrow_list, listrow_add, listrow_select, listrow_selected,
+    listrow_hover, listrow_hit, listrow_row_of, listrow_key_of,
+    listrow_disable,
+}
+
+const ICON_NONE: i64 = 0 - 1
+const ICON_PT: f64 = 16.0
+
+static NM_LIST: [u8; 8] = "row-list"
+static NM_ROW: [u8; 3] = "row"
+static NM_SEL: [u8; 7] = "row-sel"
+static NM_OFF: [u8; 7] = "row-off"
+static NM_ICON: [u8; 8] = "row-icon"
+static NM_TEXT: [u8; 8] = "row-text"
+static NM_DETAIL: [u8; 10] = "row-detail"
+static NM_BADGE: [u8; 9] = "row-badge"
+
+struct ListRowNames {
+    list: u32,
+    row: u32,
+    sel: u32,
+    off: u32,
+    icon: u32,
+    text: u32,
+    detail: u32,
+    badge: u32,
+}
+
+fn listrow_names() -> ListRowNames {
+    return ListRowNames {
+        list: sheet.sheet_name((&NM_LIST[0]) as u64, 8),
+        row: sheet.sheet_name((&NM_ROW[0]) as u64, 3),
+        sel: sheet.sheet_name((&NM_SEL[0]) as u64, 7),
+        off: sheet.sheet_name((&NM_OFF[0]) as u64, 7),
+        icon: sheet.sheet_name((&NM_ICON[0]) as u64, 8),
+        text: sheet.sheet_name((&NM_TEXT[0]) as u64, 8),
+        detail: sheet.sheet_name((&NM_DETAIL[0]) as u64, 10),
+        badge: sheet.sheet_name((&NM_BADGE[0]) as u64, 9),
+    }
+}
+
+// The id of a Lucide icon by its name ("folder", "file-text", "settings");
+// ICON_NONE when there is none of that name.
+fn icon_named(name: str) -> i64 {
+    return lucide.lucide_find(name.p as u64, name.n)
+}
+
+// ONE ROW. `key` >= 1 names it; `icon` is a Lucide id or ICON_NONE; an
+// empty `detail` / `badge` leaves that part out.
+struct Row {
+    key: u32,
+    icon: i64,
+    text: str,
+    detail: str,
+    badge: str,
+    selected: bool,
+    disabled: bool,
+}
+
+fn row_new(key: u32, text: str) -> Row {
+    return Row { key: key, icon: ICON_NONE, text: text, detail: "", badge: "",
+        selected: false, disabled: false }
+}
+
+// THE RULES, into the sheet of the application.
+fn listrow_rules(sh: *mut sheet.Sheet) {
+    let k: ListRowNames = listrow_names()
+    // the list: a bare column, no surface of its own -- it sits on whatever
+    // the page is (a card, the window), so no fill can equal its ground
+    var s0: style.Style = style.style_new()
+    s0 = style.style_set_fg(s0, style.color_token(style.TOK_TEXT))
+    let r0: usize = sheet.sheet_rule(sh, sheet.sel_class(k.list), s0)
+    // a row: transparent, rounded, the text colour for everything inside
+    var s1: style.Style = style.style_new()
+    s1 = style.style_set_radius(s1, 6)
+    s1 = style.style_set_fg(s1, style.color_token(style.TOK_TEXT))
+    let r1: usize = sheet.sheet_rule(sh, sheet.sel_class(k.row), s1)
+    // hovered
+    var s2: style.Style = style.style_new()
+    s2 = style.style_set_bg(s2, style.color_token(style.TOK_BUTTON_HOVER))
+    let r2: usize = sheet.sheet_rule(sh,
+        sheet.sel_with_state(sheet.sel_class(k.row), style.STATE_HOVER), s2)
+    // chosen
+    var s3: style.Style = style.style_new()
+    s3 = style.style_set_bg(s3, style.color_token(style.TOK_SELECTION))
+    s3 = style.style_set_fg(s3, style.color_token(style.TOK_SELECTION_TEXT))
+    let r3: usize = sheet.sheet_rule(sh,
+        sheet.sel_with_class(sheet.sel_class(k.row), k.sel), s3)
+    // disabled
+    var s4: style.Style = style.style_new()
+    s4 = style.style_set_fg(s4, style.color_token(style.TOK_TEXT_DISABLED))
+    let r4: usize = sheet.sheet_rule(sh,
+        sheet.sel_with_class(sheet.sel_class(k.row), k.off), s4)
+    // the text and the symbol take what the row says; no padding of their own
+    var s5: style.Style = style.style_new()
+    s5 = style.style_set_pad(s5, 0, 0)
+    s5 = style.style_set_align(s5, style.ALIGN_LEFT)
+    let r5: usize = sheet.sheet_rule(sh, sheet.sel_class(k.text), s5)
+    // the detail: quiet and small -- and the selection colour in a chosen row
+    var s6: style.Style = style.style_new()
+    s6 = style.style_set_fg(s6, style.color_token(style.TOK_TEXT_MUTED))
+    s6 = style.style_set_font(s6, 0, 13)
+    s6 = style.style_set_pad(s6, 0, 0)
+    s6 = style.style_set_align(s6, style.ALIGN_LEFT)
+    let r6: usize = sheet.sheet_rule(sh, sheet.sel_class(k.detail), s6)
+    var s7: style.Style = style.style_new()
+    s7 = style.style_set_fg(s7, style.color_token(style.TOK_SELECTION_TEXT))
+    let r7: usize = sheet.sheet_rule(sh,
+        sheet.sel_within_class(sheet.sel_class(k.detail), k.sel), s7)
+    // the badge: a small pill; in a chosen row the colours swap so it
+    // does not melt into the selection
+    var s8: style.Style = style.style_new()
+    s8 = style.style_set_bg(s8, style.color_token(style.TOK_ACCENT))
+    s8 = style.style_set_fg(s8, style.color_token(style.TOK_TEXT_ON_ACCENT))
+    s8 = style.style_set_radius(s8, 10)
+    s8 = style.style_set_font(s8, 0, 12)
+    s8 = style.style_set_pad(s8, 7, 1)
+    let r8: usize = sheet.sheet_rule(sh, sheet.sel_class(k.badge), s8)
+    var s9: style.Style = style.style_new()
+    s9 = style.style_set_bg(s9, style.color_token(style.TOK_SELECTION_TEXT))
+    s9 = style.style_set_fg(s9, style.color_token(style.TOK_SELECTION))
+    let r9: usize = sheet.sheet_rule(sh,
+        sheet.sel_within_class(sheet.sel_class(k.badge), k.sel), s9)
+}
+
+// The symbol painter: a Lucide icon in the row's text colour, centred in
+// its 16 x 16 box. `ud` is the icon id.
+fn paint_icon(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let col: u32 = render.color_of(c, style.resolve_fg(widget.w_styleset(e),
+            widget.w_state(e), style.color_token(style.TOK_TEXT)))
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    var side: f64 = w
+    if h < side {
+        side = h
+    }
+    icons.icon_stroke(render.ctx_painter(c), ud as i64,
+        widget.w_x(e) + (w - side) * 0.5, widget.w_y(e) + (h - side) * 0.5,
+        side, col, icons.STROKE_DEFAULT)
+}
+
+// THE LIST: a column that stretches its rows over its width. Under `parent`
+// (scene.SCENE_NONE = root).
+fn listrow_list(sc: *mut scene.Scene, parent: usize) -> usize {
+    let k: ListRowNames = listrow_names()
+    let l: usize = scene.scene_box(sc, parent, k.list, flex.FLEX_COLUMN,
+        flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_gap(sc, l, 0, 2)
+    return l
+}
+
+// ADD A ROW at the end of `list`; its node, or SCENE_NONE when the tree is
+// full or the key is 0.
+fn listrow_add(sc: *mut scene.Scene, list: usize, r: *mut Row) -> usize {
+    if (*r).key == 0 as u32 {
+        return scene.SCENE_NONE
+    }
+    let k: ListRowNames = listrow_names()
+    let z: usize = scene.scene_box(sc, list, k.row, flex.FLEX_ROW,
+        flex.JUSTIFY_START, flex.AL_CENTER)
+    if z == scene.SCENE_NONE {
+        return z
+    }
+    scene.node_set_padding(sc, z, 8, 5, 10, 5)
+    scene.node_set_gap(sc, z, 10, 0)
+    scene.node_set_id(sc, z, (*r).key)
+    if (*r).selected {
+        let a: bool = scene.node_add_class(sc, z, k.sel)
+    }
+    if (*r).disabled {
+        let b: bool = scene.node_add_class(sc, z, k.off)
+        scene.node_set_state(sc, z, style.STATE_DISABLED)
+    }
+    if (*r).icon >= 0 as i64 {
+        let ic: usize = scene.scene_add(sc, z, scene.N_BOX)
+        let c1: bool = scene.node_add_class(sc, ic, k.icon)
+        scene.node_set_size(sc, ic, ICON_PT, ICON_PT)
+        scene.node_set_grow(sc, ic, 0, 0)
+        scene.node_set_draw(sc, ic, (*r).icon as u64, paint_icon)
+    }
+    let tx: usize = scene.scene_add(sc, z, scene.N_TEXT)
+    let c2: bool = scene.node_add_class(sc, tx, k.text)
+    scene.node_set_text(sc, tx, (*r).text.p as u64, (*r).text.n)
+    // the text takes the free width; it may shrink (and cut off) before the
+    // right side does
+    // (a text's own minimum is its whole width; 24 points lets it give way)
+    scene.node_set_flexitem(sc, tx, 1000, 1000, 24, 0)
+    if (*r).detail.n > 0 {
+        let dt: usize = scene.scene_add(sc, z, scene.N_TEXT)
+        let c3: bool = scene.node_add_class(sc, dt, k.detail)
+        scene.node_set_text(sc, dt, (*r).detail.p as u64, (*r).detail.n)
+        scene.node_set_grow(sc, dt, 0, 0)
+    }
+    if (*r).badge.n > 0 {
+        let bd: usize = scene.scene_add(sc, z, scene.N_TEXT)
+        let c4: bool = scene.node_add_class(sc, bd, k.badge)
+        scene.node_set_text(sc, bd, (*r).badge.p as u64, (*r).badge.n)
+        scene.node_set_grow(sc, bd, 0, 0)
+    }
+    return z
+}
+
+// The node of the row with this key under `list`, or SCENE_NONE.
+fn listrow_row_of(sc: *mut scene.Scene, list: usize, key: u32) -> usize {
+    var z: usize = scene.scene_first_child(sc, list)
+    while z != scene.SCENE_NONE {
+        if scene.node_id(sc, z) == key {
+            return z
+        }
+        z = scene.scene_next_sibling(sc, z)
+    }
+    return scene.SCENE_NONE
+}
+
+// The key of the row that holds node `i` (the row itself or anything in
+// it), 0 when it is in no row. `list` is the list node.
+fn listrow_key_of(sc: *mut scene.Scene, list: usize, i: usize) -> u32 {
+    var n: usize = i
+    while n != scene.SCENE_NONE {
+        if scene.scene_parent(sc, n) == list {
+            return scene.node_id(sc, n)
+        }
+        n = scene.scene_parent(sc, n)
+    }
+    return 0 as u32
+}
+
+// CHOOSE the row with `key` (0 = none): only one row of the list is chosen.
+// True when the choice changed (the page has to be painted again).
+fn listrow_select(sc: *mut scene.Scene, list: usize, key: u32) -> bool {
+    let k: ListRowNames = listrow_names()
+    var changed: bool = false
+    var z: usize = scene.scene_first_child(sc, list)
+    while z != scene.SCENE_NONE {
+        let want: bool = key != 0 as u32 && scene.node_id(sc, z) == key
+        let has: bool = scene.node_has_class(sc, z, k.sel)
+        if want && !has {
+            let a: bool = scene.node_add_class(sc, z, k.sel)
+            changed = true
+        }
+        if !want && has {
+            let b: bool = scene.node_remove_class(sc, z, k.sel)
+            changed = true
+        }
+        z = scene.scene_next_sibling(sc, z)
+    }
+    return changed
+}
+
+// The key of the chosen row, 0 when none.
+fn listrow_selected(sc: *mut scene.Scene, list: usize) -> u32 {
+    let k: ListRowNames = listrow_names()
+    var z: usize = scene.scene_first_child(sc, list)
+    while z != scene.SCENE_NONE {
+        if scene.node_has_class(sc, z, k.sel) {
+            return scene.node_id(sc, z)
+        }
+        z = scene.scene_next_sibling(sc, z)
+    }
+    return 0 as u32
+}
+
+// MARK the row with `key` as the one under the pointer (0 = none).
+// Disabled rows are never marked. True when something changed.
+fn listrow_hover(sc: *mut scene.Scene, list: usize, key: u32) -> bool {
+    var changed: bool = false
+    var z: usize = scene.scene_first_child(sc, list)
+    while z != scene.SCENE_NONE {
+        let cur: u32 = scene.node_state(sc, z)
+        if cur != style.STATE_DISABLED {
+            var want: u32 = style.STATE_NORMAL
+            if key != 0 as u32 && scene.node_id(sc, z) == key {
+                want = style.STATE_HOVER
+            }
+            if cur != want {
+                scene.node_set_state(sc, z, want)
+                changed = true
+            }
+        }
+        z = scene.scene_next_sibling(sc, z)
+    }
+    return changed
+}
+
+// Switch a row off or on again.
+fn listrow_disable(sc: *mut scene.Scene, list: usize, key: u32, off: bool) {
+    let k: ListRowNames = listrow_names()
+    let z: usize = listrow_row_of(sc, list, key)
+    if z == scene.SCENE_NONE {
+        return
+    }
+    if off {
+        let a: bool = scene.node_add_class(sc, z, k.off)
+        scene.node_set_state(sc, z, style.STATE_DISABLED)
+    } else {
+        let b: bool = scene.node_remove_class(sc, z, k.off)
+        scene.node_set_state(sc, z, style.STATE_NORMAL)
+    }
+}
+
+// WHICH ROW is at (px, py): its key, 0 for none -- and 0 for a disabled
+// row. `list` is not needed: a node with a key under a row-list is a row.
+fn listrow_hit(sc: *mut scene.Scene, px: f64, py: f64) -> u32 {
+    let k: ListRowNames = listrow_names()
+    var i: usize = scene.scene_hit(sc, px, py)
+    while i != scene.SCENE_NONE {
+        if scene.node_has_class(sc, i, k.row) {
+            if scene.node_state(sc, i) == style.STATE_DISABLED {
+                return 0 as u32
+            }
+            return scene.node_id(sc, i)
+        }
+        i = scene.scene_parent(sc, i)
+    }
+    return 0 as u32
+}

@@ -160,7 +160,7 @@ def click(x, y):
     mouse("mouseMoved", x, y)
     mouse("mousePressed", x, y, button="left", buttons=1, clickCount=1)
     mouse("mouseReleased", x, y, button="left", buttons=0, clickCount=1)
-    time.sleep(0.15)
+    time.sleep(0.4)  # the hover glide of a button runs 120 ms (r126)
 
 
 def key(k, code=None, vk=0, text=None):
@@ -237,6 +237,19 @@ try:
     d = diff(n1, ref("app-notes-counted.png"))
     verdict(diff(n0, n1) > 0, "typing two lines (Enter between them) and Count change the picture")
     verdict(d == 0, "notes with two lines + Count vs native app-notes-counted.png: %d px differ" % d)
+
+    print("== files.wasm (380 x 300): a list of rows with symbols ==")
+    ok = load("files.wasm", 380, 300)
+    verdict(ok, "the module starts")
+    f0 = b.shot(380, 300, "web-files-empty")
+    d = diff(f0, ref("app-files.png"))
+    verdict(d == 0, "file list vs native app-files.png: %d px differ" % d)
+    click(190, 110)
+    click(190, 138)
+    f1 = b.shot(380, 300, "web-files-chosen")
+    d = diff(f1, ref("app-files-chosen.png"))
+    verdict(diff(f0, f1) > 0, "two clicks on rows change the picture")
+    verdict(d == 0, "second row chosen vs native app-files-chosen.png: %d px differ" % d)
 finally:
     b.close()
     server.terminate()

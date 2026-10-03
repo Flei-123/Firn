@@ -74,7 +74,8 @@ export {
     MergeGroup, MERGE_MAX, MODE_SMOOTH, MODE_SMOOTH3, MODE_SUM, MODE_FACING,
     merge_new, merge_clear, merge_set_mode, merge_mode, merge_set_k,
     merge_add_rect, merge_add_circle, merge_count, merge_field,
-    merge_paint, merge_paint_tiles,
+    merge_paint, merge_paint_tiles, merge_set_color, merge_color,
+    merge_paint_colors, merge_paint_colors_tiles, merge_color_at,
     merge_tiles_full, merge_tiles_edge, merge_tiles_empty, merge_evals,
 }
 
@@ -94,6 +95,7 @@ struct MergeGroup {
     hw: [f64; 16], // half width / half height
     hh: [f64; 16],
     rad: [f64; 16], // corner radius, clamped to the shorter half side
+    col: [u32; 16], // colour of each shape (alpha 255 = opaque), r72
     k: f64, // the melt distance in pixels
     mode: u32,
     // what the last paint did -- measured, not guessed
@@ -107,7 +109,7 @@ struct MergeGroup {
 fn merge_new(k: f64) -> MergeGroup {
     return MergeGroup {
         n: 0, cx: [0.0; 16], cy: [0.0; 16], hw: [0.0; 16], hh: [0.0; 16],
-        rad: [0.0; 16], k: k, mode: MODE_FACING,
+        rad: [0.0; 16], col: [4278190080 as u32; 16], k: k, mode: MODE_FACING,
         t_full: 0, t_edge: 0, t_empty: 0, evals: 0,
     }
 }
@@ -162,6 +164,7 @@ fn merge_add_rect(g: *mut MergeGroup, x: f64, y: f64, w: f64, h: f64,
         rr = 0.0
     }
     (*g).rad[i] = rr
+    (*g).col[i] = 4278190080 as u32
     (*g).n = i + 1
     return true
 }
@@ -395,6 +398,105 @@ fn cov_of(d: f64) -> f64 {
     return c
 }
 
+// COLOUR PER SHAPE (r72). `merge_set_color` gives shape i its own colour
+// (alpha as everywhere in fUi: 0 = opaque); `merge_paint_colors` then paints
+// the group with them. Far apart each shape is exactly its own colour; in
+// the neck the colours MIX by distance: a point's weight for shape i is
+// (1 - (d_i - d_min) / reach)^2, clamped at 0, d the signed distance to the
+// shape and d_min the smallest of all -- the nearest shape always weighs 1,
+// one that is a full reach further away weighs 0, and in the middle of a
+// neck between two equal distances the two colours are half and half.
+fn merge_set_color(g: *mut MergeGroup, i: usize, col: u32) {
+    if i < (*g).n {
+        (*g).col[i] = painter.mit_alpha(col)
+    }
+}
+
+fn merge_color(g: *mut MergeGroup, i: usize) -> u32 {
+    if i >= (*g).n {
+        return 0 as u32
+    }
+    return (*g).col[i]
+}
+
+// The colour of the point (px, py): the weighted mix, ARGB (255 = opaque).
+#[allow_fp]
+fn merge_color_at(g: *mut MergeGroup, px: f64, py: f64) -> u32 {
+    var d: [f64; 16] = [0.0; 16]
+    var m: f64 = 1.0e18
+    var j: usize = 0
+    var i: usize = 0
+    while i < (*g).n {
+        d[i] = sd_box(g, i, px, py)
+        if d[i] < m {
+            m = d[i]
+            j = i
+        }
+        i = i + 1
+    }
+    let reach: f64 = reach_of(g)
+    var sw: f64 = 0.0
+    var sa: f64 = 0.0
+    var sr: f64 = 0.0
+    var sg: f64 = 0.0
+    var sb: f64 = 0.0
+    i = 0
+    while i < (*g).n {
+        var w: f64 = 0.0
+        if i == j {
+            w = 1.0
+        } else if reach > 0.0 {
+            let t: f64 = 1.0 - (d[i] - m) / reach
+            if t > 0.0 {
+                w = t * t
+            }
+        }
+        if w > 0.0 {
+            let c: u32 = (*g).col[i]
+            sw = sw + w
+            sa = sa + w * (((c >> 24) & 255 as u32) as f64)
+            sr = sr + w * (((c >> 16) & 255 as u32) as f64)
+            sg = sg + w * (((c >> 8) & 255 as u32) as f64)
+            sb = sb + w * ((c & 255 as u32) as f64)
+        }
+        i = i + 1
+    }
+    return ((sa / sw + 0.5) as u32) << 24 as u32
+    | ((sr / sw + 0.5) as u32) << 16 as u32
+    | ((sg / sw + 0.5) as u32) << 8 as u32
+    | ((sb / sw + 0.5) as u32)
+}
+
+// Is the whole square around (mx, my) (half diagonal hd, in pixels)
+// dominated by ONE shape -- every other one further away than the reach
+// even at the worst point of the square? Its index, or -1. Each shape's
+// distance is 1-Lipschitz, so the difference of two moves by at most
+// 2 hd across the square.
+#[allow_fp]
+fn pure_of(g: *mut MergeGroup, mx: f64, my: f64, hd: f64) -> i64 {
+    var m: f64 = 1.0e18
+    var j: usize = 0
+    var i: usize = 0
+    var d: [f64; 16] = [0.0; 16]
+    while i < (*g).n {
+        d[i] = sd_box(g, i, mx, my)
+        if d[i] < m {
+            m = d[i]
+            j = i
+        }
+        i = i + 1
+    }
+    let reach: f64 = reach_of(g)
+    i = 0
+    while i < (*g).n {
+        if i != j && d[i] - m - 2.0 * hd < reach {
+            return 0 as i64 - 1 as i64
+        }
+        i = i + 1
+    }
+    return j as i64
+}
+
 // Paint the group in `col` (alpha as everywhere in fUi: 0 = opaque).
 #[allow_fp]
 fn merge_paint(z: *mut painter.Painter, g: *mut MergeGroup, col: u32) {
@@ -404,6 +506,24 @@ fn merge_paint(z: *mut painter.Painter, g: *mut MergeGroup, col: u32) {
 #[allow_fp]
 fn merge_paint_tiles(z: *mut painter.Painter, g: *mut MergeGroup, col: u32,
     tiles: bool) {
+    paint_all(z, g, col, tiles, false)
+}
+
+// The group with the colour of each shape (merge_set_color).
+#[allow_fp]
+fn merge_paint_colors(z: *mut painter.Painter, g: *mut MergeGroup) {
+    paint_all(z, g, 0 as u32, true, true)
+}
+
+#[allow_fp]
+fn merge_paint_colors_tiles(z: *mut painter.Painter, g: *mut MergeGroup,
+    tiles: bool) {
+    paint_all(z, g, 0 as u32, tiles, true)
+}
+
+#[allow_fp]
+fn paint_all(z: *mut painter.Painter, g: *mut MergeGroup, col: u32,
+    tiles: bool, multi: bool) {
     (*g).t_full = 0
     (*g).t_edge = 0
     (*g).t_empty = 0
@@ -418,8 +538,12 @@ fn merge_paint_tiles(z: *mut painter.Painter, g: *mut MergeGroup, col: u32,
         // own (not melted) -- visible, never missing.
         var j: usize = 0
         while j < (*g).n {
+            var cj: u32 = col
+            if multi {
+                cj = (*g).col[j]
+            }
             painter.round_rect(z, (*g).cx[j] - (*g).hw[j], (*g).cy[j] - (*g).hh[j],
-                2.0 * (*g).hw[j], 2.0 * (*g).hh[j], (*g).rad[j], col)
+                2.0 * (*g).hw[j], 2.0 * (*g).hh[j], (*g).rad[j], cj)
             j = j + 1
         }
         return
@@ -483,7 +607,7 @@ fn merge_paint_tiles(z: *mut painter.Painter, g: *mut MergeGroup, col: u32,
             if tx1 > ix1 {
                 tx1 = ix1
             }
-            paint_block(cv, g, c, tx, ty, tx1, ty1, lip, tiles)
+            paint_block(cv, g, c, tx, ty, tx1, ty1, lip, tiles, multi)
             tx = tx1
         }
         ty = ty1
@@ -493,7 +617,9 @@ fn merge_paint_tiles(z: *mut painter.Painter, g: *mut MergeGroup, col: u32,
 // One block [x0, x1) x [y0, y1): skipped, filled, split or walked.
 #[allow_fp]
 fn paint_block(cv: *mut canvas.Canvas, g: *mut MergeGroup, c: u32, x0: usize,
-    y0: usize, x1: usize, y1: usize, lip: f64, tiles: bool) {
+    y0: usize, x1: usize, y1: usize, lip: f64, tiles: bool, multi: bool) {
+    // multi-colour: the one shape that owns the whole block, if any
+    var own: i64 = 0 as i64 - 1 as i64
     if tiles {
         // centre of the pixel centres, and their half diagonal
         let mx: f64 = ((x0 + x1) as f64) * 0.5
@@ -502,6 +628,9 @@ fn paint_block(cv: *mut canvas.Canvas, g: *mut MergeGroup, c: u32, x0: usize,
         let hy: f64 = ((y1 - y0) as f64 - 1.0) * 0.5
         let hd: f64 = lip * __sqrt(hx * hx + hy * hy)
         let dc: f64 = merge_field(g, mx, my)
+        if multi {
+            own = pure_of(g, mx, my, __sqrt(hx * hx + hy * hy))
+        }
         if dc - hd >= 0.5 {
             (*g).t_empty = (*g).t_empty + 1
             return
@@ -511,20 +640,27 @@ fn paint_block(cv: *mut canvas.Canvas, g: *mut MergeGroup, c: u32, x0: usize,
             // every pixel has coverage 1: one rectangle on whole pixels
             // (the same octets as the walk below, tools/fui/merge_main.fi
             // check 3)
-            canvas.canvas_fill_rect(cv, x0 as f64, y0 as f64, x1 as f64, y1 as f64, c)
-            return
+            if !multi {
+                canvas.canvas_fill_rect(cv, x0 as f64, y0 as f64, x1 as f64, y1 as f64, c)
+                return
+            }
+            if own >= 0 as i64 {
+                canvas.canvas_fill_rect(cv, x0 as f64, y0 as f64, x1 as f64, y1 as f64,
+                    (*g).col[own as usize])
+                return
+            }
         }
         if x1 - x0 > SMALL || y1 - y0 > SMALL {
             let xm: usize = x0 + (x1 - x0 + 1) / 2
             let ym: usize = y0 + (y1 - y0 + 1) / 2
-            paint_block(cv, g, c, x0, y0, xm, ym, lip, tiles)
+            paint_block(cv, g, c, x0, y0, xm, ym, lip, tiles, multi)
             if x1 > xm {
-                paint_block(cv, g, c, xm, y0, x1, ym, lip, tiles)
+                paint_block(cv, g, c, xm, y0, x1, ym, lip, tiles, multi)
             }
             if y1 > ym {
-                paint_block(cv, g, c, x0, ym, xm, y1, lip, tiles)
+                paint_block(cv, g, c, x0, ym, xm, y1, lip, tiles, multi)
                 if x1 > xm {
-                    paint_block(cv, g, c, xm, ym, x1, y1, lip, tiles)
+                    paint_block(cv, g, c, xm, ym, x1, y1, lip, tiles, multi)
                 }
             }
             return
@@ -538,7 +674,17 @@ fn paint_block(cv: *mut canvas.Canvas, g: *mut MergeGroup, c: u32, x0: usize,
             let d: f64 = merge_field(g, (xx as f64) + 0.5, (yy as f64) + 0.5)
             let cov: f64 = cov_of(d)
             if cov > 0.0 {
-                canvas.canvas_blend(cv, xx, yy, c, cov)
+                if multi {
+                    var pc: u32 = 0 as u32
+                    if own >= 0 as i64 {
+                        pc = (*g).col[own as usize]
+                    } else {
+                        pc = merge_color_at(g, (xx as f64) + 0.5, (yy as f64) + 0.5)
+                    }
+                    canvas.canvas_blend(cv, xx, yy, pc, cov)
+                } else {
+                    canvas.canvas_blend(cv, xx, yy, c, cov)
+                }
             }
             xx = xx + 1
         }
