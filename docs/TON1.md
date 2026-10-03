@@ -1,141 +1,142 @@
-# Runde TON 1 -- der MP3-Dekoder (`lib/ton/mp3.fi`)
+# Round TON 1 -- the MP3 decoder (`lib/ton/mp3.fi`)
 
-Stand 18.09.2026, Zweig `ton`. Alles hier ist **gelaufen**, nicht geschaetzt;
-die Befehle stehen darunter und lassen sich nachfahren.
+State 18.09.2026, branch `ton`. Everything here was **run**, not estimated;
+the commands are below and can be repeated.
 
-## Warum diese Runde
+## Why this round
 
-Firn hat Netz, TLS und HTTP, aber keinen Ton: `lib/media/audio.fi` in Certus
-hat eine Rueckwand fuer Win32 (`waveOut`) und sonst Stille. Fuer alles, was
-mit Klang zu tun hat -- Radio, Datei, Strom -- fehlt zuerst der **Dekoder**.
-Ohne ihn ist jede Tonschicht taub, weil praktisch alles, was ueber das Netz
-kommt, MPEG-1/2 Layer III ist.
+Firn has network, TLS and HTTP, but no sound: `lib/media/audio.fi` in Certus
+has a back end for Win32 (`waveOut`) and silence otherwise. For everything
+to do with sound -- radio, file, stream -- the first thing missing is the **decoder**.
+Without it every audio layer is deaf, because practically everything that
+comes over the network is MPEG-1/2 Layer III.
 
-Diese Runde baut genau den einen Baustein: Oktette rein, PCM raus.
-Kein Systemaufruf, kein Haufen, keine Geraeteabhaengigkeit.
+This round builds exactly that one building block: octets in, PCM out.
+No system call, no heap, no device dependency.
 
-## Was gebaut wurde
+## What was built
 
-| Datei | Zeilen | Inhalt |
+| File | Lines | Content |
 |---|---|---|
-| `lib/ton/mp3.fi` | ~1500 | der Dekoder: Rahmensuche, Seiteninfo, Skalenfaktoren, Huffman, Stereo, IMDCT, Synthesefilterbank |
-| `lib/ton/mp3_tab.fi` | 415 | die Tabellen, **erzeugt** von `tools/mp3_tabellen.py` |
-| `lib/ton/mp3_main.fi` | 90 | Messtreiber: `.mp3` -> `.pcm` + eine Kennzahlzeile |
-| `lib/ton/mp3_pruef_main.fi` | 150 | Selbsttest gegen festgehaltene Pruefsummen |
-| `tools/mp3_tabellen.py` | 190 | Tabellenerzeuger aus der Vorlage |
-| `tools/mp3_vergleich.py` | 60 | misst zwei PCM-Dateien gegeneinander (max, RMS, SNR) |
+| `lib/ton/mp3.fi` | ~1500 | the decoder: frame search, side info, scale factors, Huffman, stereo, IMDCT, synthesis filter bank |
+| `lib/ton/mp3_tab.fi` | 415 | the tables, **generated** by `tools/mp3_tables.py` |
+| `lib/ton/mp3_main.fi` | 90 | measuring driver: `.mp3` -> `.pcm` + one line of figures |
+| `lib/ton/mp3_check_main.fi` | 150 | self-test against recorded checksums |
+| `tools/mp3_tables.py` | 190 | table generator from the original |
+| `tools/mp3_compare.py` | 60 | measures two PCM files against each other (max, RMS, SNR) |
 
-Herkunft: der Aufbau folgt **minimp3** (lieff, CC0-1.0). Die Tabellen kommen
-aus der Vorlage durch den Erzeuger, der Ablauf ist neu geschrieben -- Firn
-hat weder globale Variablen noch Zeigerarithmetik im C-Stil.
+Origin: the structure follows **minimp3** (lieff, CC0-1.0). The tables come
+from the original through the generator, the flow is newly written -- Firn
+has neither global variables nor C-style pointer arithmetic.
 
-## Das Ergebnis: bitgenau
+## The result: bit-exact
 
-Verglichen wird gegen dieselbe Vorlage, in C uebersetzt (`gcc -O2
--DMINIMP3_NO_SIMD -DMINIMP3_ONLY_MP3`). "Bitgenau" heisst: jedes einzelne
-16-Bit-Wort identisch.
+The comparison is against the same original, compiled as C (`gcc -O2
+-DMINIMP3_NO_SIMD -DMINIMP3_ONLY_MP3`). "Bit-exact" means: every single
+16-bit word identical.
 
-| Probe | Format | Rahmen | Ergebnis |
+| Sample | Format | Frames | Result |
 |---|---|---|---|
-| Sinus 440/3000 Hz | MPEG-1, 44,1 kHz, Stereo, 128 kbit/s | 117 | **bitgenau** |
-| rosa Rauschen | MPEG-1, 44,1 kHz, Mono, 64 kbit/s | 79 | **bitgenau** |
-| weisses Rauschen | MPEG-1, 32 kHz, Stereo, 192 kbit/s | 58 | **bitgenau** |
-| Sinus | MPEG-2, 24 kHz, Mono, 48 kbit/s | 87 | **bitgenau** |
-| VBR-Material | MPEG-1, 44,1 kHz, Stereo, VBR q2 | 194 | **bitgenau** |
-| weisses Rauschen | MPEG-1, 44,1 kHz, Stereo, 320 kbit/s | 117 | **bitgenau** |
-| Sinus | MPEG-1, 48 kHz, Joint Stereo, 96 kbit/s | 169 | **bitgenau** |
-| Impulse (kurze Bloecke) | MPEG-1, 44,1 kHz, Mono, 128 kbit/s | 156 | **bitgenau** |
-| Sinus | **MPEG-2.5**, 8 kHz, Mono, 32 kbit/s | 45 | **bitgenau** |
-| **echter Radiostrom** (MangoRadio, 31 s) | MPEG-1, 44,1 kHz, Stereo, 128 kbit/s | 1210 | **bitgenau** |
+| sine 440/3000 Hz | MPEG-1, 44.1 kHz, stereo, 128 kbit/s | 117 | **bit-exact** |
+| pink noise | MPEG-1, 44.1 kHz, mono, 64 kbit/s | 79 | **bit-exact** |
+| white noise | MPEG-1, 32 kHz, stereo, 192 kbit/s | 58 | **bit-exact** |
+| sine | MPEG-2, 24 kHz, mono, 48 kbit/s | 87 | **bit-exact** |
+| VBR material | MPEG-1, 44.1 kHz, stereo, VBR q2 | 194 | **bit-exact** |
+| white noise | MPEG-1, 44.1 kHz, stereo, 320 kbit/s | 117 | **bit-exact** |
+| sine | MPEG-1, 48 kHz, joint stereo, 96 kbit/s | 169 | **bit-exact** |
+| impulses (short blocks) | MPEG-1, 44.1 kHz, mono, 128 kbit/s | 156 | **bit-exact** |
+| sine | **MPEG-2.5**, 8 kHz, mono, 32 kbit/s | 45 | **bit-exact** |
+| **real radio stream** (MangoRadio, 31 s) | MPEG-1, 44.1 kHz, stereo, 128 kbit/s | 1210 | **bit-exact** |
 
-Gegen **ffmpeg** (voellig andere Umsetzung) auf demselben Radiostrom:
-SNR 66,4 dB, groesste Abweichung 310 von 32768, 0,47 % der Werte ungleich.
-Das ist der normale Abstand zwischen zwei erlaubten MP3-Dekodern -- die
-Norm gibt einen Fehlerspielraum vor, keinen exakten Bitstand.
+Against **ffmpeg** (a completely different implementation) on the same radio stream:
+SNR 66.4 dB, largest deviation 310 of 32768, 0.47 % of the values unequal.
+That is the normal distance between two permitted MP3 decoders -- the
+standard prescribes an error margin, not an exact bit state.
 
-### Was auf dem Weg dorthin falsch war
+### What was wrong on the way there
 
-Drei Fehler, alle drei durch Messen gefunden, nicht durch Lesen:
+Three errors, all three found by measuring, not by reading:
 
-1. **`MAX_SCFI` falsch ausgerechnet** (232 statt 44). Ergebnis: `1 << 58`
-   in einem `i32`, die Verstaerkung wurde 0, der Dekoder lieferte
-   **vollstaendige Stille** bei formal richtigen Rahmenzahlen. Lehre: eine
-   Ausgabe, die genau die richtige LAENGE hat, ist noch kein Beweis.
-2. **`s4 += s8 - s2`** war als `s4 + s8 - s2` geschrieben. In
-   Fliesskomma ist das nicht dasselbe: ein ULP Unterschied, der erst dann
-   sichtbar wird, wenn ein Wert dicht an einer Quantisierungsstufe liegt.
-   Wirkung: 0,02 % der Abtastwerte um genau 1 daneben.
-3. **`b[j] += vz*w1 + vy*w0`** in der Synthesefilterbank, ebenfalls als
-   `b + vz*w1 + vy*w0` geschrieben -- dieselbe Falle, gleiche Wirkung.
+1. **`MAX_SCFI` computed wrong** (232 instead of 44). Result: `1 << 58`
+   in an `i32`, the gain became 0, the decoder delivered
+   **complete silence** with formally correct frame counts. Lesson: an
+   output with exactly the right LENGTH is not yet a proof.
+2. **`s4 += s8 - s2`** was written as `s4 + s8 - s2`. In
+   floating point that is not the same: one ULP of difference, which only becomes
+   visible when a value lies close to a quantisation step.
+   Effect: 0.02 % of the samples off by exactly 1.
+3. **`b[j] += vz*w1 + vy*w0`** in the synthesis filter bank, likewise written as
+   `b + vz*w1 + vy*w0` -- the same trap, the same effect.
 
-Nach (2) und (3) war der Abstand **null**. Der Zwischenstand davor
-(SNR 110 dB, maximal 1 LSB) waere hoerbar nicht zu unterscheiden gewesen --
-umso mehr ein Grund, ihn nicht als "richtig" durchgehen zu lassen.
+After (2) and (3) the distance was **zero**. The intermediate state before that
+(SNR 110 dB, at most 1 LSB) would have been audibly indistinguishable --
+all the more reason not to let it pass as "correct".
 
-## Robustheit
+## Robustness
 
-* 200 kB **Zufallsoktette**: 0 Rahmen, kein Absturz, wie die Vorlage.
-* 5 kB Muell **vor** einem gueltigen Strom: bitgenau, Rahmensuche findet ein.
-* **abgeschnittene** Datei (20 kB von 49 kB): 47 Rahmen, bitgenau.
-* **ID3v2**-Kopf davor: bitgenau (der Merkblock wird ueberlaufen).
-* **150 zufaellig verfaelschte** Stroeme (1-40 gekippte Oktette je Lauf):
-  **0 Abstuerze**, 147 davon bitgenau. Die drei Abweichungen entstehen dort,
-  wo der Huffman-Leser bei kaputten Daten ueber das Rahmenende hinausliest --
-  das tut die Vorlage auch, nur liegt hinter dem Puffer bei ihr ein anderes
-  Feld. Kein Zugriff ausserhalb des eigenen Kratzraums.
+* 200 kB of **random octets**: 0 frames, no crash, like the original.
+* 5 kB of junk **before** a valid stream: bit-exact, the frame search finds it.
+* **truncated** file (20 kB of 49 kB): 47 frames, bit-exact.
+* **ID3v2** header in front: bit-exact (the tag block is run over).
+* **150 randomly corrupted** streams (1-40 flipped octets per run):
+  **0 crashes**, 147 of them bit-exact. The three deviations arise where
+  the Huffman reader reads past the frame end on broken data --
+  the original does that too, only that behind the buffer it has a different
+  field. No access outside the own scratch space.
 
-## Tempo -- der ehrliche Teil
+## Speed -- the honest part
 
-60 s Audio (MPEG-1, 44,1 kHz, Stereo, 192 kbit/s), AMD EPYC, dieselbe Maschine:
+60 s of audio (MPEG-1, 44.1 kHz, stereo, 192 kbit/s), AMD EPYC, same machine:
 
-| | Zeit | Echtzeitfaktor |
+| | Time | Real-time factor |
 |---|---|---|
-| Firn (dieser Dekoder) | 3,3 s | ~18x |
-| C-Vorlage, skalar, `-O2` | 0,34 s | ~176x |
+| Firn (this decoder) | 3.3 s | ~18x |
+| C original, scalar, `-O2` | 0.34 s | ~176x |
 
-**Rund zehnmal langsamer als C.** Das reicht fuer Radio mit grossem Abstand
-(ein Strom braucht 1x Echtzeit), ist aber kein guter Wert, und der Grund ist
-bekannt: jeder Speicherzugriff laeuft ueber die Hilfsfunktionen `lf`/`sf`
-mit `adr4`, also ueber einen echten Aufruf samt Verzweigung fuer den
-negativen Index. Das ist die Stelle fuer Runde TON 2 -- erst messen, dann
-inlinen.
+**About ten times slower than C.** That is enough for radio by a wide margin
+(a stream needs 1x real time), but it is not a good value, and the reason is
+known: every memory access goes through the helper functions `lf`/`sf`
+with `adr4`, that is, through a real call including a branch for the
+negative index. That is the place for round TON 2 -- measure first, then
+inline.
 
-## Bekannte Grenzen
+## Known limits
 
-* **Nur Layer III.** Layer I/II werden erkannt und uebersprungen.
-* **Kein SIMD.**
-* **Ausgabe i16**, verschachtelt.
-* Kein Gapless-Zuschnitt (LAME/Xing-Kopf wird nicht ausgewertet): am Anfang
-  bleiben die Vorlaufwerte des Kodierers stehen, wie bei der Vorlage.
+* **Layer III only.** Layers I/II are recognised and skipped.
+* **No SIMD.**
+* **Output i16**, interleaved.
+* No gapless trimming (the LAME/Xing header is not evaluated): at the start
+  the encoder's lead-in values stay, as with the original.
 
-## Selbst nachfahren
+## Repeating it yourself
 
 ```sh
 FIRNC=/root/firn/compiler/target/release/firnc
 FIRNLIB=$PWD/lib $FIRNC -o /tmp/mp3 lib/ton/mp3_main.fi
-FIRNLIB=$PWD/lib $FIRNC -o /tmp/mp3pruef lib/ton/mp3_pruef_main.fi
+FIRNLIB=$PWD/lib $FIRNC -o /tmp/mp3check lib/ton/mp3_check_main.fi
 
-# Selbsttest (ohne fremde Werkzeuge)
-/tmp/mp3pruef testdata/ton/stereo44.mp3 testdata/ton/mono24.mp3 \
-              testdata/ton/mono8.mp3 testdata/ton/kurzbloecke.mp3
+# self-test (without foreign tools)
+/tmp/mp3check testdata/ton/stereo44.mp3 testdata/ton/mono24.mp3 \
+              testdata/ton/mono8.mp3 testdata/ton/shortblocks.mp3
 
-# Eine Datei dekodieren und anhoeren
-/tmp/mp3 irgendwas.mp3 /tmp/x.pcm
+# decode a file and listen to it
+/tmp/mp3 something.mp3 /tmp/x.pcm
 ffplay -f s16le -ar 44100 -ch_layout stereo /tmp/x.pcm
 ```
 
-Die Tabellen neu erzeugen (nur noetig, wenn die Vorlage sich aendert):
+Regenerating the tables (only needed if the original changes):
 
 ```sh
 curl -L -o /tmp/minimp3.h https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h
-python3 tools/mp3_tabellen.py /tmp/minimp3.h > lib/ton/mp3_tab.fi
+python3 tools/mp3_tables.py /tmp/minimp3.h > lib/ton/mp3_tab.fi
+firnfmt -w lib/ton/mp3_tab.fi   # the repository keeps the canonical form
 ```
 
-## Was als Naechstes kommt
+## What comes next
 
-1. **TON 2 -- Tempo**: `lf`/`sf` inlinen, Messung gegen diese Zahlen.
-2. **TON 3 -- Ausgabe**: Rueckwand fuer Linux (ALSA) und Android (AAudio),
-   damit aus PCM wirklich Ton wird.
-3. **TON 4 -- Strom**: HTTP/Icecast-Anbindung, Ringpuffer, Nachschub-Weg
-   ohne Aussetzer.
-4. Danach erst die Mischerschicht im Sinn von Aulos (Stimmen, Busse, Kurven).
+1. **TON 2 -- speed**: inline `lf`/`sf`, measurement against these figures.
+2. **TON 3 -- output**: back end for Linux (ALSA) and Android (AAudio),
+   so that PCM really becomes sound.
+3. **TON 4 -- stream**: HTTP/Icecast connection, ring buffer, a refill path
+   without dropouts.
+4. Only then the mixer layer in the sense of Aulos (voices, buses, curves).

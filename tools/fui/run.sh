@@ -552,10 +552,10 @@ build app
 
 echo
 echo "== 18p3. ZEILEN MIT SYMBOLEN (lib/fui/listrow.fi, r129) =="
-# Listenzeile = Symbol links, Text, Detail und Badge rechts, als Knoten im
-# Szenenbaum: Lage, Treffer, Hover, Auswahl (eine zugleich), gesperrte Zeile,
-# schmale Liste (der Text weicht), hell + dunkel. fui.app: app.list /
-# app.list_item (examples/fui/files.fi, geprueft in app_main). docs/fui-list-rows.md
+# List row = symbol left, text, detail and badge right, as a node in the
+# scene tree: position, hit, hover, selection (one at a time), disabled row,
+# narrow list (the text yields), light + dark. fui.app: app.list /
+# app.list_item (examples/fui/files.fi, checked in app_main). docs/fui-list-rows.md
 build listrow
 "$W/listrow"
 

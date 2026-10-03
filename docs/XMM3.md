@@ -73,7 +73,7 @@ The decoder is at 3.8x; what is still missing there is no longer
 floating-point work, but Huffman bits and address calculation.
 
 Correctness: the output of the decoder is still **bit-identical**
-(`tools/ton_bauen.sh` -> PASS 4/4), and the floating-point tests of the repo
+(`tools/ton_build.sh` -> PASS 4/4), and the floating-point tests of the repo
 (1101-1104, 1182, 1453, 111, 1002) pass in `dev` as in
 `release-fast`.
 

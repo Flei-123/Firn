@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MPL-2.0
-"""mp3_vergleich.py -- misst zwei PCM-Dateien (s16le) gegeneinander.
+"""mp3_compare.py -- misst zwei PCM-Dateien (s16le) gegeneinander.
 
 Gibt aus: Zahl der Werte, groesster Absolutfehler, quadratisches Mittel
 des Fehlers und den Signal-Rausch-Abstand in dB. Bit-genau heisst

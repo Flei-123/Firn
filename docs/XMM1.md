@@ -50,7 +50,7 @@ The decoder gains less, because it does not only calculate, but also reads
 Huffman bits and addresses tables -- that is integer work and was
 never affected.
 
-Correctness: `tools/ton_bauen.sh` -> PASS 4/4, the output of the decoder is
+Correctness: `tools/ton_build.sh` -> PASS 4/4, the output of the decoder is
 still **bit-identical** to the C template. The test series of the repo (`test.sh`)
 runs through unchanged.
 

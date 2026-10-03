@@ -22,7 +22,7 @@ the standard library and the code generator were written from scratch.
 
 The one place that follows an outside implementation is the MP3 decoder in
 `lib/ton/`: its tables are GENERATED from minimp3 (CC0-1.0, i.e. dedicated
-to the public domain) by `tools/mp3_tabellen.py`, and the decoding steps
+to the public domain) by `tools/mp3_tables.py`, and the decoding steps
 follow the same structure. CC0 carries no conditions -- attribution is given
 here because it is honest, not because it is required. The Firn code itself
 is MPL-2.0 like the rest of the repository. See `docs/TON1.md`.

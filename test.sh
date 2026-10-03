@@ -1516,6 +1516,19 @@ else
     grep -E '^FAIL' "$WORK/moves.log" | head -10 | sed 's/^/   /'
 fi
 
+echo "== 72. the MP3 decoder in Firn: bit-exact against recorded checksums (tools/ton_build.sh, round TON) =="
+# lib/ton/mp3.fi decodes four streams (stereo 44.1 kHz, mono 24 kHz, mono 8 kHz,
+# short blocks); the PCM checksum has to equal the one recorded from a run
+# against minimp3 (C). No foreign tool needed.
+bash tools/ton_build.sh > "$WORK/ton.log" 2>&1 && TNRC=0 || TNRC=$?
+if [ "$TNRC" -eq 0 ]; then
+    ok
+    grep -E 'PASS' "$WORK/ton.log" | sed 's/^/   /'
+else
+    bad "tools/ton_build.sh failed (see .test-work/ton.log)"
+    tail -n 8 "$WORK/ton.log" | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

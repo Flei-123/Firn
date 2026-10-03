@@ -122,7 +122,7 @@ of nine runs, same machine:
 **Distance to C: from 8.3x to 2.8x.**
 
 Correctness: the PCM output is **bit-identical** to before (`cmp` on the
-whole file) and bit-identical to C (`mp3_pruef_main` -> PASS 4/4 over four
+whole file) and bit-identical to C (`mp3_check_main` -> PASS 4/4 over four
 streams: MPEG-1 stereo, MPEG-2 mono, MPEG-2.5 8 kHz, short blocks).
 
 Integer programs do **not** change: `bench/instr.sh` counts for

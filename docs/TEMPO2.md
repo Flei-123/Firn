@@ -110,7 +110,7 @@ MP3-Dekoder, 60 s Ton (192 kbit/s, Stereo), `release-fast`:
 **2.3x** against the same C without vectorisation. Against `-O0` Firn is
 faster.
 
-A pure `f32` calculation kernel (four sums, eight window pairs, `bench/kern.c`
+A pure `f32` calculation kernel (four sums, eight window pairs, `bench/inner_loop.c`
 against the same loop in Firn):
 
 | | Zeit |
