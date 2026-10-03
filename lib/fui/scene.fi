@@ -86,7 +86,7 @@ export {
     memo_style_hits, memo_style_misses, memo_box_hits, memo_box_misses,
     memo_layout_hits, memo_layout_misses,
     node_set_grow, node_set_base, node_set_bounds, node_set_align_self,
-    node_set_size, node_set_viewport, node_viewport,
+    node_set_size, node_set_viewport, node_viewport, node_set_merge,
     node_set_draw, node_style, node_decl,
     node_pref_w, node_pref_h, node_x, node_y, node_w, node_h,
     scene_style, scene_measure, scene_layout, scene_draw, scene_run,
@@ -116,6 +116,7 @@ import fui.uisvg
 import fui.sheet
 import fui.viewport
 import fui.layer
+import fui.merge
 import fui.painter
 import fui.theme
 import paint.canvas
@@ -274,6 +275,11 @@ struct Node {
     // NOT PAINTED, NOT HIT (node_set_hidden) -- CSS `visibility: hidden`:
     // the node keeps its room in the layout, only its picture is gone.
     hidden: u32,
+    // MERGE GROUP (node_set_merge): the melt distance in design points of the
+    // group this node's children form (0 = none), and whether THIS node's
+    // surface is painted by its parent's group (set each frame by the parent)
+    merge_k: usize,
+    no_fill: u32,
     // ---- 30.09.2026: the page look
     // OPACITY OF THE WHOLE SUBTREE (0..255, node_set_opacity) and its
     // OFFSET in design points (node_set_offset) -- CSS `opacity` and
@@ -376,7 +382,7 @@ fn node_blank() -> Node {
         fix_w: 0.0, fix_h: 0.0,
         pw: 0.0, ph: 0.0, mw: 0.0, mh: 0.0,
         x: 0.0, y: 0.0, w: 0.0, h: 0.0, vp: 0,
-        dr: draw_none, du: 0, has_dr: 0 as u32, hidden: 0 as u32,
+        dr: draw_none, du: 0, has_dr: 0 as u32, hidden: 0 as u32, merge_k: 0, no_fill: 0 as u32,
         alpha: 255 as u32, off_x: 0.0, off_y: 0.0, live: 0 as u32,
         wrap: 0, avail: 0.0 - 1.0, lines: 1, res_p: 0, res_n: 0,
         ink: 0.0 - 1.0, bx0: 0.0, by0: 0.0, bx1: 0.0, by1: 0.0,
@@ -1991,6 +1997,8 @@ fn scene_layout(sc: *mut Scene, c: *mut render.Ctx, x: f64, y: f64,
 // worse than both.
 fn draw_self(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     let nd: *mut Node = &(*sc).nodes[i]
+    // a member of a merge group has no surface of its own: the group painted it
+    (*c).nobg = (*nd).no_fill
     let e: *mut widget.Widget = &(*nd).e
     let kind: u32 = (*nd).kind
     let umgeformt: bool = sheet.decl_has(&(*nd).d,
@@ -2028,9 +2036,59 @@ fn draw_self(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
             wave3.draw_any(c, e)
         }
     }
+    (*c).nobg = 0 as u32
     if (*nd).has_dr != 0 as u32 {
         let f: fn(u64, *mut render.Ctx, *mut widget.Widget) = (*nd).dr
         f((*nd).du, c, e)
+    }
+}
+
+// MERGE GROUP (r70). The children of a node with `node_set_merge(k)` are one
+// shape: their surfaces are painted together by lib/fui/merge.fi -- far apart
+// each looks like itself, closer than k they melt into a neck -- and then
+// each child paints only its content (text, icon) on top. The colour is the
+// first child's surface (per-shape colours are r72); borders and shadows of
+// the members are not painted, a group has one outline. More than
+// merge.MERGE_MAX children: the rest keep their own surface.
+fn draw_merge_bg(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
+    let nd: *mut Node = &(*sc).nodes[i]
+    var g: merge.MergeGroup = merge.merge_new(render.len_of(c, (*nd).merge_k))
+    var col: u32 = 0 as u32
+    var have: bool = false
+    var k: usize = (*nd).first
+    while k != SCENE_NONE {
+        let ch: *mut Node = &(*sc).nodes[k]
+        (*ch).no_fill = 0 as u32
+        if (*ch).hidden == 0 as u32 && (*ch).w > 0.0 && (*ch).h > 0.0 {
+            if merge.merge_add_rect(&g, (*ch).x, (*ch).y, (*ch).w, (*ch).h,
+                render.radius_of(c, &(*ch).e)) {
+                (*ch).no_fill = 1 as u32
+                if !have {
+                    col = render.fill_of(c, &(*ch).e)
+                    have = true
+                }
+            }
+        }
+        k = (*ch).next
+    }
+    if have {
+        merge.merge_paint(render.ctx_painter(c), &g, col)
+    }
+}
+
+// Make the children of `i` one merge group: shapes closer than `k` design
+// points melt together. 0 turns it off again.
+fn node_set_merge(sc: *mut Scene, i: usize, k: usize) {
+    if i >= (*sc).n {
+        return
+    }
+    (*sc).nodes[i].merge_k = k
+    if k == 0 {
+        var c: usize = (*sc).nodes[i].first
+        while c != SCENE_NONE {
+            (*sc).nodes[c].no_fill = 0 as u32
+            c = (*sc).nodes[c].next
+        }
     }
 }
 
@@ -2149,6 +2207,9 @@ fn draw_plain(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
         viewport.viewport_draw_bars(c, v)
     } else {
         draw_self(sc, c, i)
+        if (*nd).merge_k > 0 {
+            draw_merge_bg(sc, c, i)
+        }
         var k: usize = (*nd).first
         while k != SCENE_NONE {
             draw_node(sc, c, k)
