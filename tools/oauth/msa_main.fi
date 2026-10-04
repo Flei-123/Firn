@@ -1,0 +1,279 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/oauth/msa_main.fi -- lib/auth/msa.fi as a program for
+// tools/oauth/check_msa.py, driven line by line over standard input/output.
+//
+//   CFG client_id <id>        CFG base <url>   (all five hosts become <url>/...,
+//                                               the paths of tools/oauth/fake_msa.py)
+//   DEVICE                    start, print the code, wait, run the chain
+//   DEVICE_START / DEVICE_POLL
+//   CHAIN                     the chain with the Microsoft access token held
+//   ENSURE <skew>             REFRESH       CLEAR     SESSION
+//   SAVE|LOAD|DEL <svc> <key>
+//   XERR <number>             UUID <32 hex>
+//   BODY xbl <token> | BODY xsts <token> | BODY mc <uhs> <xsts>
+//   LIVE_XBL | LIVE_XSTS | LIVE_MC | LIVE_DEVICE <client id>   the real hosts,
+//                             with bogus credentials (the refusals are the test)
+//   CANCELIN <ms>             QUIT
+// Every command ends with a line with a single dot.
+import std.rt
+import std.str
+import std.time
+import auth.oauth
+import auth.msa
+
+const KIND_CANCEL: u64 = 5152
+
+static mut CANCEL_FLAG: u64 = 0
+static mut CANCEL_MS: u64 = 0
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == KIND_CANCEL {
+        time.sleep_ms(CANCEL_MS)
+        CANCEL_FLAG = 1
+    }
+    return 0
+}
+
+fn out_str(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+fn read_line(b: *mut rt.Buf) -> bool {
+    rt.buf_clear(b)
+    var ch: [u8; 1] = [0; 1]
+    while true {
+        let r: i64 = syscall(0, 0, (&ch[0]) as i64, 1, 0, 0, 0)
+        if r <= 0 {
+            return (*b).len > 0
+        }
+        if ch[0] == 10 as u8 {
+            return true
+        }
+        if ch[0] != 13 as u8 {
+            rt.buf_push(b, ch[0])
+        }
+    }
+    return false
+}
+
+fn view(p: u64, s: usize, e: usize) -> str {
+    return str { p: rt.ptr_of(p + s as u64), n: e - s }
+}
+
+fn word(p: u64, n: usize, from: usize, e: *mut usize) -> usize {
+    var i: usize = from
+    while i < n && rt.ld8(p, i) == 32 as u8 {
+        i = i + 1
+    }
+    var k: usize = i
+    while k < n && rt.ld8(p, k) != 32 as u8 {
+        k = k + 1
+    }
+    *e = k
+    return i
+}
+
+fn num(s: str) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < s.length() {
+        v = v * 10 + (s.chars(i) - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
+
+fn result(out: *mut rt.Buf, m: *mut msa.Msa, code: i64) {
+    let o: *mut oauth.OAuth = msa.msa_oauth(m)
+    out_str(out, "RESULT ")
+    rt.buf_push_dec_u64(out, code as u64)
+    rt.buf_push(out, 32 as u8)
+    out_str(out, msa.msa_error_text(code))
+    out_str(out, " step=")
+    out_str(out, msa.msa_step(m))
+    out_str(out, " xerr=")
+    rt.buf_push_dec_u64(out, msa.msa_xerr(m))
+    out_str(out, " http=")
+    rt.buf_push_dec_u64(out, oauth.oauth_last_status(o) as u64)
+    out_str(out, " net=")
+    rt.buf_push_dec_u64(out, oauth.oauth_net_error(o) as u64)
+    out_str(out, " err=")
+    out_str(out, oauth.oauth_err_code(o))
+    out_str(out, " desc=")
+    out_str(out, oauth.oauth_err_desc(o))
+    rt.buf_push(out, 10 as u8)
+}
+
+fn session_line(out: *mut rt.Buf, s: *mut msa.MsaSession) {
+    out_str(out, "SESSION ok=")
+    if (*s).ok { out_str(out, "1") } else { out_str(out, "0") }
+    out_str(out, " uuid=")
+    out_str(out, (*s).uuid)
+    out_str(out, " name=")
+    out_str(out, (*s).name)
+    out_str(out, " mc=")
+    out_str(out, (*s).mc_token)
+    out_str(out, " owns=")
+    if (*s).owns { out_str(out, "1") } else { out_str(out, "0") }
+    out_str(out, " exp=")
+    rt.buf_push_dec_i64(out, (*s).mc_expires_at - oauth.oa_now())
+    out_str(out, " uhs=")
+    out_str(out, (*s).uhs)
+    rt.buf_push(out, 10 as u8)
+    out_str(out, "MS access=")
+    out_str(out, (*s).ms.access)
+    out_str(out, " refresh=")
+    out_str(out, (*s).ms.refresh)
+    rt.buf_push(out, 10 as u8)
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var m: msa.Msa = msa.msa_new("azure-client-id")
+    msa.msa_init(&m)
+    oauth.oauth_set_cancel(msa.msa_oauth(&m), (&CANCEL_FLAG) as u64)
+    var s: msa.MsaSession = msa.msa_session_new()
+    var da: oauth.DeviceAuth = oauth.deviceauth_new()
+    var line: rt.Buf = rt.buf_new()
+    var out: rt.Buf = rt.buf_new()
+    while read_line(&line) {
+        let p: u64 = line.ptr
+        let n: usize = line.len
+        var ce: usize = 0
+        let cs: usize = word(p, n, 0, &ce)
+        let cmd: str = view(p, cs, ce)
+        var rs: usize = ce
+        while rs < n && rt.ld8(p, rs) == 32 as u8 {
+            rs = rs + 1
+        }
+        let rest: str = view(p, rs, n)
+        if cmd == "QUIT" {
+            break
+        } else if cmd == "CFG" {
+            var ke: usize = 0
+            let ks: usize = word(p, n, rs, &ke)
+            var vs: usize = ke
+            while vs < n && rt.ld8(p, vs) == 32 as u8 {
+                vs = vs + 1
+            }
+            let key: str = view(p, ks, ke)
+            let val: str = __str_copy(view(p, vs, n))
+            if key == "client_id" {
+                m.oa.client_id = val
+            } else if key == "base" {
+                var ep: msa.MsaEndpoints = msa.msa_endpoints_default()
+                ep.device_url = val + "/devicecode"
+                ep.token_url = val + "/token"
+                ep.auth_url = val + "/authorize"
+                ep.xbl_url = val + "/xbl/user/authenticate"
+                ep.xsts_url = val + "/xsts/authorize"
+                ep.mc_login_url = val + "/mc/authentication/login_with_xbox"
+                ep.mc_entitlements_url = val + "/mc/entitlements/mcstore"
+                ep.mc_profile_url = val + "/mc/minecraft/profile"
+                msa.msa_set_endpoints(&m, ep)
+            }
+        } else if cmd == "DEVICE_START" {
+            let r: i64 = msa.msa_device_start(&m, &da)
+            result(&out, &m, r)
+            if r == oauth.OA_OK {
+                out_str(&out, "DEVICE ")
+                out_str(&out, da.user_code)
+                out_str(&out, " ")
+                out_str(&out, da.verification_uri)
+                rt.buf_push(&out, 10 as u8)
+            }
+        } else if cmd == "DEVICE_POLL" {
+            result(&out, &m, msa.msa_device_poll_once(&m, &da, &s))
+            session_line(&out, &s)
+        } else if cmd == "DEVICE" {
+            s = msa.msa_session_new()
+            let r: i64 = msa.msa_device_start(&m, &da)
+            if r != oauth.OA_OK {
+                result(&out, &m, r)
+            } else {
+                out_str(&out, "DEVICE ")
+                out_str(&out, da.user_code)
+                out_str(&out, " ")
+                out_str(&out, da.verification_uri)
+                rt.buf_push(&out, 10 as u8)
+                rt.write_everything(1, out.ptr, out.len)
+                rt.buf_clear(&out)
+                result(&out, &m, msa.msa_device_wait(&m, &da, &s))
+                session_line(&out, &s)
+            }
+        } else if cmd == "CHAIN" {
+            result(&out, &m, msa.msa_chain(&m, &s))
+            session_line(&out, &s)
+        } else if cmd == "ENSURE" {
+            result(&out, &m, msa.msa_ensure(&m, &s, num(rest) as i64))
+            session_line(&out, &s)
+        } else if cmd == "REFRESH" {
+            result(&out, &m, msa.msa_refresh(&m, &s))
+            session_line(&out, &s)
+        } else if cmd == "CLEAR" {
+            s = msa.msa_session_new()
+        } else if cmd == "SESSION" {
+            session_line(&out, &s)
+        } else if cmd == "SAVE" || cmd == "LOAD" || cmd == "DEL" {
+            var se: usize = 0
+            let ss: usize = word(p, n, rs, &se)
+            var ke2: usize = 0
+            let ks2: usize = word(p, n, se, &ke2)
+            let svc: str = __str_copy(view(p, ss, se))
+            let key: str = __str_copy(view(p, ks2, n))
+            var ok: bool = false
+            if cmd == "SAVE" { ok = msa.msa_save(svc, key, &s) }
+            else if cmd == "LOAD" { s = msa.msa_session_new(); ok = msa.msa_load(svc, key, &s) }
+            else { ok = msa.msa_delete(svc, key) }
+            out_str(&out, "STORE ")
+            if ok { out_str(&out, "1") } else { out_str(&out, "0") }
+            rt.buf_push(&out, 10 as u8)
+            session_line(&out, &s)
+        } else if cmd == "XERR" {
+            out_str(&out, "XERR ")
+            out_str(&out, msa.msa_xerr_text(num(rest)))
+            rt.buf_push(&out, 10 as u8)
+        } else if cmd == "UUID" {
+            out_str(&out, "UUID ")
+            out_str(&out, msa.msa_uuid_dashed(rest))
+            rt.buf_push(&out, 10 as u8)
+        } else if cmd == "BODY" {
+            var we: usize = 0
+            let ws: usize = word(p, n, rs, &we)
+            var w2e: usize = 0
+            let w2: usize = word(p, n, we, &w2e)
+            var w3e: usize = 0
+            let w3: usize = word(p, n, w2e, &w3e)
+            let kind: str = view(p, ws, we)
+            out_str(&out, "BODY ")
+            if kind == "xbl" { msa.msa_xbl_body(__str_copy(view(p, w2, w2e)), &out) }
+            else if kind == "xsts" { msa.msa_xsts_body(__str_copy(view(p, w2, w2e)), &out) }
+            else { msa.msa_login_with_xbox_body(__str_copy(view(p, w2, w2e)), __str_copy(view(p, w3, w3e)), &out) }
+            rt.buf_push(&out, 10 as u8)
+        } else if cmd == "LIVE_XBL" {
+            var xbl: str = ""
+            var uhs: str = ""
+            result(&out, &m, msa.msa_xbl_authenticate(&m, "not-a-real-token", &xbl, &uhs))
+        } else if cmd == "LIVE_XSTS" {
+            var xsts: str = ""
+            var uhs: str = ""
+            result(&out, &m, msa.msa_xsts_authorize(&m, "not-a-real-xbl-token", &xsts, &uhs))
+        } else if cmd == "LIVE_MC" {
+            var tok: str = ""
+            var exp: i64 = 0
+            result(&out, &m, msa.msa_minecraft_login(&m, "123", "not-a-real-xsts-token", &tok, &exp))
+        } else if cmd == "LIVE_DEVICE" {
+            m.oa.client_id = __str_copy(rest)
+            result(&out, &m, msa.msa_device_start(&m, &da))
+        } else if cmd == "CANCELIN" {
+            CANCEL_FLAG = 0
+            CANCEL_MS = num(rest)
+            thread_start(KIND_CANCEL, 0)
+        }
+        out_str(&out, ".\n")
+        rt.write_everything(1, out.ptr, out.len)
+        rt.buf_clear(&out)
+    }
+    msa.msa_free(&m)
+    return 0 as i32
+}

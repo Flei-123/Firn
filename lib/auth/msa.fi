@@ -1,0 +1,659 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/auth/msa.fi -- auth.msa: the Microsoft login chain for Minecraft: Java
+// Edition, on top of auth.oauth.
+//
+//     Microsoft account (OAuth 2.0, device code or browser)
+//       -> Xbox Live user token            user.auth.xboxlive.com
+//       -> XSTS token for Minecraft        xsts.auth.xboxlive.com
+//       -> Minecraft access token          api.minecraftservices.com/authentication/login_with_xbox
+//       -> does the account own the game?  .../entitlements/mcstore
+//       -> profile (uuid, name)            .../minecraft/profile
+//
+//     import auth.msa
+//     var m: msa.Msa = msa.msa_new("<the Azure application's client id>")
+//     msa.msa_init(&m)
+//     var da: oauth.DeviceAuth = oauth.deviceauth_new()
+//     msa.msa_device_start(&m, &da)            // show da.user_code and da.verification_uri
+//     var s: msa.MsaSession = msa.msa_session_new()
+//     let r: i64 = msa.msa_device_wait(&m, &da, &s)   // the whole chain
+//     // s.mc_token, s.uuid, s.name are what the game's command line needs
+//     msa.msa_save("mylauncher", "account-1", &s)
+//     ...
+//     msa.msa_load("mylauncher", "account-1", &s)
+//     msa.msa_ensure(&m, &s, 300)              // refreshes whatever has run out
+//
+// THE CLIENT ID. Microsoft has no anonymous client ids: a program registers
+// an application in the Azure portal (personal accounts, public client, the
+// "device code" and loopback redirect options on, the permission
+// `XboxLive.signin`) and, for Minecraft services, has it approved by Mojang
+// (https://aka.ms/AppRegInfo). This library has NO client id built in and no
+// secret of any kind.
+//
+// HONEST
+//   M1  PROTOCOL CODE, TESTED AGAINST A STAND-IN. tools/oauth/check_msa.py
+//       runs the chain against tools/oauth/fake_msa.py (a server written from
+//       the published protocol, checking every header, body and the order).
+//       The real endpoints were reached WITHOUT credentials only (a bogus
+//       client id and a bogus token get the refusals the protocol promises:
+//       tools/oauth/check_msa.py section L, skipped without a route). A full
+//       real login has NOT been run -- there is no registered client id here.
+//   M2  ENDPOINTS: the default is the current Microsoft identity platform,
+//       login.microsoftonline.com/consumers (TLS 1.3, works with net.http).
+//       The old login.live.com endpoints speak TLS 1.2 only and need the
+//       TLS 1.2 client of the transport layer (auth.oauth O2); they can be
+//       set with `msa_set_endpoints` once it exists.
+//   M3  THE XSTS ERRORS (HTTP 401 with an `XErr` number) are mapped for the
+//       numbers that are documented widely: no Xbox account (2148916233),
+//       Xbox Live banned (2148916227), not available in the country
+//       (2148916235), adult verification (2148916236/7), child account that
+//       needs a family (2148916238). Any other number is returned as it is.
+//   M4  OWNERSHIP is read from the `mcstore` entitlements
+//       (`product_minecraft`/`game_minecraft`). Accounts that play through
+//       Game Pass may show no such item; then the PROFILE decides (a profile
+//       exists only for an account that has a game licence): `owns` says what
+//       the entitlements said, `has_profile` what the profile said.
+//   M5  The Minecraft access token lives 24 hours (`expires_in`). The XBL and
+//       XSTS tokens are not kept beyond the chain (their lifetime is 14 and
+//       16 hours but nothing needs them again); a refresh redoes them.
+//   M6  Not here: skins and capes (the profile's lists are not parsed),
+//       name changes, the Mojang-account (pre-2021) login, Xbox Live friends.
+//   M7  The session holds tokens in `str` on the garbage collected heap that
+//       cannot be wiped (std.secret S3); `msa_save` stores them in the keyring.
+import std.rt
+import std.str
+import std.json
+import std.secret
+import std.base64
+import auth.oauth
+
+export {
+    Msa, MsaSession, MsaEndpoints,
+    msa_new, msa_init, msa_free, msa_session_new, msa_set_endpoints,
+    msa_endpoints_default, msa_set_scope, msa_oauth,
+    msa_device_start, msa_device_wait, msa_device_poll_once, msa_login_browser,
+    msa_chain, msa_xbl_authenticate, msa_xsts_authorize, msa_minecraft_login,
+    msa_entitlements, msa_profile, msa_refresh, msa_ensure,
+    msa_save, msa_load, msa_delete, msa_session_to_json, msa_session_from_json,
+    msa_valid, msa_uuid_dashed, msa_error_text, msa_xerr_text,
+    msa_xerr, msa_step, msa_parse_token_claims, msa_login_with_xbox_body,
+    msa_xbl_body, msa_xsts_body,
+    MSA_OK, MSA_XERR, MSA_NOT_OWNED, MSA_NO_PROFILE, MSA_MC_REFUSED,
+    XERR_NO_ACCOUNT, XERR_BANNED, XERR_COUNTRY, XERR_ADULT1, XERR_ADULT2, XERR_CHILD,
+}
+
+const MSA_OK: i64 = 0
+const MSA_XERR: i64 = 101 // XSTS refused: Msa.xerr has the number
+const MSA_NOT_OWNED: i64 = 102 // no licence and no profile
+const MSA_NO_PROFILE: i64 = 103 // a licence but no profile yet (create one on minecraft.net)
+const MSA_MC_REFUSED: i64 = 104 // api.minecraftservices.com did not accept the Xbox token
+
+const XERR_BANNED: u64 = 2148916227
+const XERR_NO_ACCOUNT: u64 = 2148916233
+const XERR_COUNTRY: u64 = 2148916235
+const XERR_ADULT1: u64 = 2148916236
+const XERR_ADULT2: u64 = 2148916237
+const XERR_CHILD: u64 = 2148916238
+
+struct MsaEndpoints {
+    device_url: str,
+    token_url: str,
+    auth_url: str, // authorize (the browser flow)
+    xbl_url: str,
+    xsts_url: str,
+    mc_login_url: str,
+    mc_entitlements_url: str,
+    mc_profile_url: str,
+}
+
+struct Msa {
+    oa: oauth.OAuth,
+    ep: MsaEndpoints,
+    xerr: u64,
+    step: str, // "xbl", "xsts", "minecraft", "entitlements", "profile" -- where the chain stopped
+}
+
+struct MsaSession {
+    ms: oauth.Tokens, // the Microsoft tokens (refresh_token is the long-lived one)
+    uhs: str, // the Xbox user hash
+    mc_token: str, // the Minecraft access token
+    mc_expires_at: i64, // unix seconds
+    uuid: str, // 32 hex digits, no dashes
+    name: str,
+    owns: bool, // the entitlements listed the game
+    has_profile: bool,
+    ok: bool,
+}
+
+fn msa_endpoints_default() -> MsaEndpoints {
+    return MsaEndpoints {
+        device_url: "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode",
+        token_url: "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+        auth_url: "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize",
+        xbl_url: "https://user.auth.xboxlive.com/user/authenticate",
+        xsts_url: "https://xsts.auth.xboxlive.com/xsts/authorize",
+        mc_login_url: "https://api.minecraftservices.com/authentication/login_with_xbox",
+        mc_entitlements_url: "https://api.minecraftservices.com/entitlements/mcstore",
+        mc_profile_url: "https://api.minecraftservices.com/minecraft/profile" }
+}
+
+fn apply_endpoints(m: *mut Msa) {
+    oauth.oauth_set_endpoints(&(*m).oa, (*m).ep.auth_url, (*m).ep.token_url, (*m).ep.device_url, "")
+}
+
+fn msa_new(client_id: str) -> Msa {
+    var m: Msa = Msa { oa: oauth.oauth_new(client_id), ep: msa_endpoints_default(), xerr: 0, step: "" }
+    oauth.oauth_set_scope(&m.oa, "XboxLive.signin offline_access")
+    oauth.oauth_set_verify_id_token(&m.oa, false) // the id_token is not what this chain is for
+    apply_endpoints(&m)
+    return m
+}
+
+fn msa_init(m: *mut Msa) -> bool { return oauth.oauth_init(&(*m).oa) }
+fn msa_free(m: *mut Msa) { oauth.oauth_free(&(*m).oa) }
+fn msa_oauth(m: *mut Msa) -> *mut oauth.OAuth { return &(*m).oa }
+fn msa_xerr(m: *mut Msa) -> u64 { return (*m).xerr }
+fn msa_step(m: *mut Msa) -> str { return (*m).step }
+fn msa_set_scope(m: *mut Msa, s: str) { oauth.oauth_set_scope(&(*m).oa, s) }
+fn msa_set_endpoints(m: *mut Msa, ep: MsaEndpoints) {
+    (*m).ep = ep
+    apply_endpoints(m)
+}
+
+fn msa_session_new() -> MsaSession {
+    return MsaSession { ms: oauth.tokens_new(), uhs: "", mc_token: "", mc_expires_at: 0,
+        uuid: "", name: "", owns: false, has_profile: false, ok: false }
+}
+
+fn msa_error_text(code: i64) -> str {
+    if code == MSA_XERR { return "xsts_refused" }
+    if code == MSA_NOT_OWNED { return "not_owned" }
+    if code == MSA_NO_PROFILE { return "no_profile" }
+    if code == MSA_MC_REFUSED { return "minecraft_refused" }
+    return oauth.oauth_error_text(code)
+}
+
+// What an XSTS `XErr` number means, in words for the user ("" if unknown).
+fn msa_xerr_text(x: u64) -> str {
+    if x == XERR_NO_ACCOUNT {
+        return "This Microsoft account has no Xbox account. Sign in once at xbox.com (create a gamertag), then try again."
+    }
+    if x == XERR_BANNED { return "Xbox Live has banned this account." }
+    if x == XERR_COUNTRY { return "Xbox Live is not available in the country of this account." }
+    if x == XERR_ADULT1 || x == XERR_ADULT2 {
+        return "The account needs adult verification on the Xbox site."
+    }
+    if x == XERR_CHILD {
+        return "This is a child account: an adult has to add it to a Microsoft family first."
+    }
+    return ""
+}
+
+// ----------------------------------------------------------- request bodies
+
+fn put(w: *mut json.JsonWriter, name: str) {
+    json.jw_key(w, name.p as u64, name.length())
+}
+
+fn put_str(w: *mut json.JsonWriter, name: str, v: str) {
+    put(w, name)
+    json.jw_string(w, v.p as u64, v.length())
+}
+
+// {"Properties":{"AuthMethod":"RPS","SiteName":"user.auth.xboxlive.com",
+//  "RpsTicket":"d=<access token>"},"RelyingParty":"http://auth.xboxlive.com","TokenType":"JWT"}
+fn msa_xbl_body(ms_access: str, out: *mut rt.Buf) {
+    var w: json.JsonWriter = json.jw_new(out, false)
+    json.jw_begin_object(&w)
+    put(&w, "Properties")
+    json.jw_begin_object(&w)
+    put_str(&w, "AuthMethod", "RPS")
+    put_str(&w, "SiteName", "user.auth.xboxlive.com")
+    put_str(&w, "RpsTicket", "d=" + ms_access)
+    json.jw_end(&w)
+    put_str(&w, "RelyingParty", "http://auth.xboxlive.com")
+    put_str(&w, "TokenType", "JWT")
+    json.jw_end(&w)
+    json.jw_free(&w)
+}
+
+// {"Properties":{"SandboxId":"RETAIL","UserTokens":["<xbl>"]},
+//  "RelyingParty":"rp://api.minecraftservices.com/","TokenType":"JWT"}
+fn msa_xsts_body(xbl_token: str, out: *mut rt.Buf) {
+    var w: json.JsonWriter = json.jw_new(out, false)
+    json.jw_begin_object(&w)
+    put(&w, "Properties")
+    json.jw_begin_object(&w)
+    put_str(&w, "SandboxId", "RETAIL")
+    put(&w, "UserTokens")
+    json.jw_begin_array(&w)
+    json.jw_string(&w, xbl_token.p as u64, xbl_token.length())
+    json.jw_end(&w)
+    json.jw_end(&w)
+    put_str(&w, "RelyingParty", "rp://api.minecraftservices.com/")
+    put_str(&w, "TokenType", "JWT")
+    json.jw_end(&w)
+    json.jw_free(&w)
+}
+
+// {"identityToken":"XBL3.0 x=<uhs>;<xsts token>"}
+fn msa_login_with_xbox_body(uhs: str, xsts_token: str, out: *mut rt.Buf) {
+    var w: json.JsonWriter = json.jw_new(out, false)
+    json.jw_begin_object(&w)
+    put_str(&w, "identityToken", "XBL3.0 x=" + uhs + ";" + xsts_token)
+    json.jw_end(&w)
+    json.jw_free(&w)
+}
+
+// ----------------------------------------------------------- the steps
+
+fn json_hdr() -> str {
+    return "Accept: application/json\r\n"
+}
+
+fn bearer_hdr(tok: str) -> str {
+    return "Authorization: Bearer " + tok + "\r\nAccept: application/json\r\n"
+}
+
+// Posts JSON to `target`, parses the answer into `d`. OA_OK when a JSON
+// object came back (read `m.oa.last_status`).
+fn post_json(m: *mut Msa, target: str, body: *mut rt.Buf, d: *mut json.Json) -> i64 {
+    var st: u32 = 0 as u32
+    let rc: i64 = oauth.oa_request(&(*m).oa, 1 as u32, target, (*body).ptr, (*body).len,
+        "application/json", json_hdr(), &st)
+    if rc != oauth.OA_OK {
+        return rc
+    }
+    let ok: bool = json.json_parse(d, (*m).oa.body.ptr, (*m).oa.body.len) catch false
+    if !ok || json.json_kind(d, json.json_root(d)) != json.JSON_OBJECT {
+        return oauth.OA_PROTOCOL
+    }
+    return oauth.OA_OK
+}
+
+// {"Token": "...", "DisplayClaims": {"xui": [{"uhs": "..."}]}} -> token, uhs
+fn read_xbox(d: *mut json.Json, token: *mut str, uhs: *mut str) -> bool {
+    let root: u32 = json.json_root(d)
+    *token = oauth.oa_json_str(d, root, "Token")
+    let dc: u32 = json.json_get(d, root, "DisplayClaims".p as u64, 13)
+    *uhs = ""
+    if dc != json.JSON_NONE && json.json_kind(d, dc) == json.JSON_OBJECT {
+        let xui: u32 = json.json_get(d, dc, "xui".p as u64, 3)
+        if xui != json.JSON_NONE && json.json_kind(d, xui) == json.JSON_ARRAY {
+            let first: u32 = json.json_child(d, xui)
+            if first != json.JSON_NONE && json.json_kind(d, first) == json.JSON_OBJECT {
+                *uhs = oauth.oa_json_str(d, first, "uhs")
+            }
+        }
+    }
+    return (*token).length() > 0 && (*uhs).length() > 0
+}
+
+// Step 1. Returns the Xbox Live user token in `xbl` (and the user hash).
+fn msa_xbl_authenticate(m: *mut Msa, ms_access: str, xbl: *mut str, uhs: *mut str) -> i64 {
+    (*m).step = "xbl"
+    var body: rt.Buf = rt.buf_new()
+    msa_xbl_body(ms_access, &body)
+    var d: json.Json = json.json_new()
+    var rc: i64 = post_json(m, (*m).ep.xbl_url, &body, &d)
+    rt.buf_free(&body)
+    if rc == oauth.OA_OK {
+        if (*m).oa.last_status != 200 as u32 {
+            rc = oauth.OA_HTTP
+        } else if !read_xbox(&d, xbl, uhs) {
+            rc = oauth.OA_PROTOCOL
+        }
+    }
+    json.json_free(&d)
+    return rc
+}
+
+// Step 2. A 401 carries `XErr`: MSA_XERR (Msa.xerr, msa_xerr_text).
+fn msa_xsts_authorize(m: *mut Msa, xbl: str, xsts: *mut str, uhs: *mut str) -> i64 {
+    (*m).step = "xsts"
+    (*m).xerr = 0
+    var body: rt.Buf = rt.buf_new()
+    msa_xsts_body(xbl, &body)
+    var d: json.Json = json.json_new()
+    var rc: i64 = post_json(m, (*m).ep.xsts_url, &body, &d)
+    rt.buf_free(&body)
+    if rc == oauth.OA_OK {
+        if (*m).oa.last_status == 401 as u32 {
+            let nd: u32 = json.json_get(&d, json.json_root(&d), "XErr".p as u64, 4)
+            if nd != json.JSON_NONE && json.json_kind(&d, nd) == json.JSON_NUMBER {
+                // 2148916233 does not fit a 32 bit integer; the parser keeps 64
+                (*m).xerr = json.json_int(&d, nd) as u64
+                rc = MSA_XERR
+            } else {
+                rc = oauth.OA_HTTP
+            }
+        } else if (*m).oa.last_status != 200 as u32 {
+            rc = oauth.OA_HTTP
+        } else if !read_xbox(&d, xsts, uhs) {
+            rc = oauth.OA_PROTOCOL
+        }
+    }
+    json.json_free(&d)
+    return rc
+}
+
+// Step 3. The Minecraft access token and its expiry.
+fn msa_minecraft_login(m: *mut Msa, uhs: str, xsts: str, token: *mut str, expires_at: *mut i64) -> i64 {
+    (*m).step = "minecraft"
+    var body: rt.Buf = rt.buf_new()
+    msa_login_with_xbox_body(uhs, xsts, &body)
+    var d: json.Json = json.json_new()
+    var rc: i64 = post_json(m, (*m).ep.mc_login_url, &body, &d)
+    rt.buf_free(&body)
+    if rc == oauth.OA_OK {
+        if (*m).oa.last_status == 401 as u32 || (*m).oa.last_status == 403 as u32 {
+            rc = MSA_MC_REFUSED
+        } else if (*m).oa.last_status != 200 as u32 {
+            rc = oauth.OA_HTTP
+        } else {
+            let root: u32 = json.json_root(&d)
+            *token = oauth.oa_json_str(&d, root, "access_token")
+            let ei: i64 = oauth.oa_json_int(&d, root, "expires_in", 86400)
+            *expires_at = oauth.oa_now() + ei
+            if (*token).length() == 0 {
+                rc = oauth.OA_PROTOCOL
+            }
+        }
+    }
+    json.json_free(&d)
+    return rc
+}
+
+// Step 4. `owns` = the account has `product_minecraft` or `game_minecraft`.
+fn msa_entitlements(m: *mut Msa, mc_token: str, owns: *mut bool) -> i64 {
+    (*m).step = "entitlements"
+    *owns = false
+    var st: u32 = 0 as u32
+    var rc: i64 = oauth.oa_request(&(*m).oa, 0 as u32, (*m).ep.mc_entitlements_url, 0, 0, "",
+        bearer_hdr(mc_token), &st)
+    if rc != oauth.OA_OK {
+        return rc
+    }
+    if st == 401 as u32 || st == 403 as u32 {
+        return MSA_MC_REFUSED
+    }
+    if st != 200 as u32 {
+        return oauth.OA_HTTP
+    }
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, (*m).oa.body.ptr, (*m).oa.body.len) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return oauth.OA_PROTOCOL
+    }
+    let items: u32 = json.json_get(&d, json.json_root(&d), "items".p as u64, 5)
+    if items != json.JSON_NONE && json.json_kind(&d, items) == json.JSON_ARRAY {
+        var c: u32 = json.json_child(&d, items)
+        while c != json.JSON_NONE {
+            if json.json_kind(&d, c) == json.JSON_OBJECT {
+                let nm: str = oauth.oa_json_str(&d, c, "name")
+                if nm == "product_minecraft" || nm == "game_minecraft" {
+                    *owns = true
+                }
+            }
+            c = json.json_next(&d, c)
+        }
+    }
+    json.json_free(&d)
+    return oauth.OA_OK
+}
+
+// Step 5. MSA_NO_PROFILE for a 404 (no profile yet).
+fn msa_profile(m: *mut Msa, mc_token: str, uuid: *mut str, name: *mut str) -> i64 {
+    (*m).step = "profile"
+    var st: u32 = 0 as u32
+    var rc: i64 = oauth.oa_request(&(*m).oa, 0 as u32, (*m).ep.mc_profile_url, 0, 0, "",
+        bearer_hdr(mc_token), &st)
+    if rc != oauth.OA_OK {
+        return rc
+    }
+    if st == 404 as u32 {
+        return MSA_NO_PROFILE
+    }
+    if st == 401 as u32 || st == 403 as u32 {
+        return MSA_MC_REFUSED
+    }
+    if st != 200 as u32 {
+        return oauth.OA_HTTP
+    }
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, (*m).oa.body.ptr, (*m).oa.body.len) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return oauth.OA_PROTOCOL
+    }
+    *uuid = oauth.oa_json_str(&d, json.json_root(&d), "id")
+    *name = oauth.oa_json_str(&d, json.json_root(&d), "name")
+    json.json_free(&d)
+    if (*uuid).length() != 32 || (*name).length() == 0 {
+        return oauth.OA_PROTOCOL
+    }
+    return oauth.OA_OK
+}
+
+// Everything after the Microsoft login: Xbox, XSTS, Minecraft, ownership,
+// profile. `s.ms.access` has to be a valid Microsoft access token.
+fn msa_chain(m: *mut Msa, s: *mut MsaSession) -> i64 {
+    var xbl: str = ""
+    var uhs: str = ""
+    var xsts: str = ""
+    var uhs2: str = ""
+    (*s).ok = false
+    var rc: i64 = msa_xbl_authenticate(m, (*s).ms.access, &xbl, &uhs)
+    if rc != oauth.OA_OK { return rc }
+    rc = msa_xsts_authorize(m, xbl, &xsts, &uhs2)
+    if rc != oauth.OA_OK { return rc }
+    var mct: str = ""
+    var exp: i64 = 0
+    rc = msa_minecraft_login(m, uhs2, xsts, &mct, &exp)
+    if rc != oauth.OA_OK { return rc }
+    var owns: bool = false
+    rc = msa_entitlements(m, mct, &owns)
+    if rc != oauth.OA_OK { return rc }
+    var uuid: str = ""
+    var name: str = ""
+    rc = msa_profile(m, mct, &uuid, &name)
+    if rc == MSA_NO_PROFILE && !owns {
+        return MSA_NOT_OWNED
+    }
+    if rc != oauth.OA_OK { return rc }
+    (*s).uhs = uhs2
+    (*s).mc_token = mct
+    (*s).mc_expires_at = exp
+    (*s).owns = owns
+    (*s).has_profile = true
+    (*s).uuid = uuid
+    (*s).name = name
+    (*s).ok = true
+    return MSA_OK
+}
+
+// ----------------------------------------------------------- the logins
+
+fn msa_device_start(m: *mut Msa, da: *mut oauth.DeviceAuth) -> i64 {
+    return oauth.oauth_device_start(&(*m).oa, da)
+}
+
+fn msa_device_poll_once(m: *mut Msa, da: *mut oauth.DeviceAuth, s: *mut MsaSession) -> i64 {
+    let rc: i64 = oauth.oauth_device_poll_once(&(*m).oa, da, &(*s).ms)
+    if rc != oauth.OA_OK {
+        return rc
+    }
+    return msa_chain(m, s)
+}
+
+// Waits for the user, then runs the chain.
+fn msa_device_wait(m: *mut Msa, da: *mut oauth.DeviceAuth, s: *mut MsaSession) -> i64 {
+    let rc: i64 = oauth.oauth_device_wait(&(*m).oa, da, &(*s).ms)
+    if rc != oauth.OA_OK {
+        return rc
+    }
+    return msa_chain(m, s)
+}
+
+// The browser flow (Authorization Code + PKCE, loopback redirect). The
+// Azure application needs `http://localhost` (any port) as a redirect URI;
+// set `msa_oauth(&m)` redirect host to "localhost".
+fn msa_login_browser(m: *mut Msa, s: *mut MsaSession, timeout_ms: u64) -> i64 {
+    oauth.oauth_set_redirect_host(&(*m).oa, "localhost")
+    let rc: i64 = oauth.oauth_login_loopback(&(*m).oa, &(*s).ms, timeout_ms)
+    if rc != oauth.OA_OK {
+        return rc
+    }
+    return msa_chain(m, s)
+}
+
+// Renews the Microsoft tokens with the refresh token and redoes the chain.
+fn msa_refresh(m: *mut Msa, s: *mut MsaSession) -> i64 {
+    let rc: i64 = oauth.oauth_refresh(&(*m).oa, &(*s).ms)
+    if rc != oauth.OA_OK {
+        return rc
+    }
+    return msa_chain(m, s)
+}
+
+fn msa_valid(s: *mut MsaSession, skew: i64) -> bool {
+    return (*s).ok && (*s).mc_token.length() > 0 && (*s).mc_expires_at - oauth.oa_now() > skew
+}
+
+// Good for at least `skew` more seconds? Else: the chain with the Microsoft
+// access token if that is still good, else a refresh and the chain.
+fn msa_ensure(m: *mut Msa, s: *mut MsaSession, skew: i64) -> i64 {
+    if msa_valid(s, skew) {
+        return MSA_OK
+    }
+    if oauth.tokens_valid(&(*s).ms, 60) {
+        let rc: i64 = msa_chain(m, s)
+        if rc == MSA_OK {
+            return rc
+        }
+    }
+    return msa_refresh(m, s)
+}
+
+// 32 hex digits -> 8-4-4-4-12 (what the game's --uuid takes).
+fn msa_uuid_dashed(u: str) -> str {
+    if u.length() != 32 {
+        return u
+    }
+    return u.part(0, 8) + "-" + u.part(8, 4) + "-" + u.part(12, 4) + "-" + u.part(16, 4) + "-" + u.part(20, 12)
+}
+
+// The claims of a Minecraft/Xbox JWT (not verified: the token is only read
+// for its expiry or subject by the launcher) -- a copy of the payload JSON.
+fn msa_parse_token_claims(token: str) -> str {
+    var i: usize = 0
+    var d1: usize = 0
+    while i < token.length() && token.chars(i) != 46 as u8 {
+        i = i + 1
+    }
+    d1 = i
+    i = i + 1
+    var d2: usize = i
+    while d2 < token.length() && token.chars(d2) != 46 as u8 {
+        d2 = d2 + 1
+    }
+    if d1 >= token.length() || d2 >= token.length() {
+        return ""
+    }
+    var out: rt.Buf = rt.buf_new()
+    let seg: str = token.part(d1 + 1, d2 - d1 - 1)
+    // base64url -> bytes with the standard decoder (it takes either alphabet)
+    var tmp: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&tmp, seg.p as u64, seg.length())
+    var dec: rt.Buf = rt.buf_new()
+    let ok: bool = base64.decode(tmp.ptr, tmp.len, &dec)
+    var res: str = ""
+    if ok {
+        res = __str_copy(str { p: rt.buf_data(&dec), n: dec.len })
+    }
+    rt.buf_free(&out)
+    rt.buf_free(&tmp)
+    rt.buf_free(&dec)
+    return res
+}
+
+// ----------------------------------------------------------- the keyring
+
+// {"ms_access":..,"ms_refresh":..,"ms_expires_at":N,"mc_access":..,
+//  "mc_expires_at":N,"uhs":..,"uuid":..,"name":..,"owns":bool}
+fn msa_session_to_json(s: *mut MsaSession, out: *mut rt.Buf) {
+    var w: json.JsonWriter = json.jw_new(out, false)
+    json.jw_begin_object(&w)
+    put_str(&w, "ms_access", (*s).ms.access)
+    put_str(&w, "ms_refresh", (*s).ms.refresh)
+    put(&w, "ms_expires_at")
+    json.jw_int(&w, (*s).ms.expires_at)
+    put_str(&w, "ms_scope", (*s).ms.scope)
+    put_str(&w, "mc_access", (*s).mc_token)
+    put(&w, "mc_expires_at")
+    json.jw_int(&w, (*s).mc_expires_at)
+    put_str(&w, "uhs", (*s).uhs)
+    put_str(&w, "uuid", (*s).uuid)
+    put_str(&w, "name", (*s).name)
+    put(&w, "owns")
+    json.jw_bool(&w, (*s).owns)
+    json.jw_end(&w)
+    json.jw_free(&w)
+}
+
+fn msa_session_from_json(text: str, s: *mut MsaSession) -> bool {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, text.p as u64, text.length()) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return false
+    }
+    let root: u32 = json.json_root(&d)
+    var n: MsaSession = msa_session_new()
+    n.ms.access = oauth.oa_json_str(&d, root, "ms_access")
+    n.ms.refresh = oauth.oa_json_str(&d, root, "ms_refresh")
+    n.ms.expires_at = oauth.oa_json_int(&d, root, "ms_expires_at", 0)
+    n.ms.scope = oauth.oa_json_str(&d, root, "ms_scope")
+    n.ms.ok = n.ms.access.length() > 0 || n.ms.refresh.length() > 0
+    n.mc_token = oauth.oa_json_str(&d, root, "mc_access")
+    n.mc_expires_at = oauth.oa_json_int(&d, root, "mc_expires_at", 0)
+    n.uhs = oauth.oa_json_str(&d, root, "uhs")
+    n.uuid = oauth.oa_json_str(&d, root, "uuid")
+    n.name = oauth.oa_json_str(&d, root, "name")
+    let on: u32 = json.json_get(&d, root, "owns".p as u64, 4)
+    n.owns = on != json.JSON_NONE && json.json_bool(&d, on)
+    n.has_profile = n.uuid.length() == 32 && n.name.length() > 0
+    n.ok = n.has_profile && n.mc_token.length() > 0
+    json.json_free(&d)
+    if !n.ms.ok {
+        return false
+    }
+    *s = n
+    return true
+}
+
+fn msa_save(service: str, key: str, s: *mut MsaSession) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    msa_session_to_json(s, &b)
+    let ok: bool = secret.secret_set_bytes(service, key, b.ptr, b.len) catch false
+    rt.mem_set(b.ptr, 0 as u8, b.len)
+    rt.buf_free(&b)
+    return ok
+}
+
+fn msa_load(service: str, key: str, s: *mut MsaSession) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = secret.secret_get_into(service, key, &b) catch 0
+    var ok: bool = false
+    if n > 0 {
+        ok = msa_session_from_json(str { p: rt.buf_data(&b), n: b.len }, s)
+    }
+    rt.mem_set(b.ptr, 0 as u8, b.cap)
+    rt.buf_free(&b)
+    return ok
+}
+
+fn msa_delete(service: str, key: str) -> bool {
+    let ok: bool = secret.secret_delete(service, key) catch false
+    return ok
+}
