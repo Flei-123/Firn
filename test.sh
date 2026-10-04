@@ -1688,26 +1688,6 @@ else
     grep -E 'FAIL|Traceback' "$WORK/download.log" "$WORK/oauth.log" | head -12 | sed 's/^/   /' || true
 fi
 
-echo "== 81. the desktop libraries against programs nobody here wrote (tools/desktop/run.sh, round DESKTOP) =="
-# net.dbus (every D-Bus type both ways against libdbus), desktop.tray (a StatusNotifierWatcher and a dbusmenu
-# client in libdbus), desktop.notify (a notification server in libdbus), desktop.autostart (the Desktop Entry
-# spec's reading and GLib), audio (a real pulseaudio read back with parec/pactl, ffmpeg for the decoder),
-# files dropped on a window (XDND from GTK 3 and from python-xlib), the clipboard against GTK 3's, the
-# command line channel of appkit.single_instance (tests/2221) -- and the Windows builds under Wine (tray with
-# the icon read off the screen, balloons, the Run key read by MSVCRT, waveOut into ALSA's file plugin,
-# the Windows clipboard against GTK, WM_DROPFILES, ReadDirectoryChangesW, named pipes). Parts whose tools
-# are missing SKIP (exit 0 for them). Linux only: DESKTOP_WINDOWS=0 skips the Wine half.
-if [ "${DESKTOP_WINDOWS:-1}" = "1" ]; then
-    bash tools/desktop/run.sh > "$WORK/desktop.log" 2>&1 && DKRC=0 || DKRC=$?
-else
-    bash tools/desktop/run.sh linux > "$WORK/desktop.log" 2>&1 && DKRC=0 || DKRC=$?
-fi
-if [ "$DKRC" -eq 0 ]; then
-    ok
-    grep -E '^(  SKIP|desktop:)' "$WORK/desktop.log" | sed 's/^/   /'
-else
-    bad "tools/desktop/run.sh failed (see .test-work/desktop.log)"
-    grep -E 'FAIL' "$WORK/desktop.log" | head -12 | sed 's/^/   /'
 echo "== 81. compression: zstd, xz/LZMA2, Brotli, bzip2, LZ4, gzip against libzstd, liblzma, libbrotli, libbz2, liblz4, zlib (tools/compress/run.sh) =="
 # lib/compress has its own positive tests (tests/2180..2189, in every build level above). This section holds it against
 # the reference implementations in BOTH directions -- a corpus compressed by them and decoded here (whole buffer and
@@ -1736,6 +1716,28 @@ if [ "$DBRC" -eq 0 ]; then
 else
     bad "tools/db/run.sh failed (see .test-work/db.log)"
     grep -E 'FAIL|FAILED|Traceback' "$WORK/db.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 83. the desktop libraries against programs nobody here wrote (tools/desktop/run.sh, round DESKTOP) =="
+# net.dbus (every D-Bus type both ways against libdbus), desktop.tray (a StatusNotifierWatcher and a dbusmenu
+# client in libdbus), desktop.notify (a notification server in libdbus), desktop.autostart (the Desktop Entry
+# spec's reading and GLib), audio (a real pulseaudio read back with parec/pactl, ffmpeg for the decoder),
+# files dropped on a window (XDND from GTK 3 and from python-xlib), the clipboard against GTK 3's, the
+# command line channel of appkit.single_instance (tests/2221) -- and the Windows builds under Wine (tray with
+# the icon read off the screen, balloons, the Run key read by MSVCRT, waveOut into ALSA's file plugin,
+# the Windows clipboard against GTK, WM_DROPFILES, ReadDirectoryChangesW, named pipes). Parts whose tools
+# are missing SKIP (exit 0 for them). Linux only: DESKTOP_WINDOWS=0 skips the Wine half.
+if [ "${DESKTOP_WINDOWS:-1}" = "1" ]; then
+    bash tools/desktop/run.sh > "$WORK/desktop.log" 2>&1 && DKRC=0 || DKRC=$?
+else
+    bash tools/desktop/run.sh linux > "$WORK/desktop.log" 2>&1 && DKRC=0 || DKRC=$?
+fi
+if [ "$DKRC" -eq 0 ]; then
+    ok
+    grep -E '^(  SKIP|desktop:)' "$WORK/desktop.log" | sed 's/^/   /'
+else
+    bad "tools/desktop/run.sh failed (see .test-work/desktop.log)"
+    grep -E 'FAIL' "$WORK/desktop.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
