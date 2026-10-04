@@ -556,6 +556,9 @@ def body(tmp):
        "deb" not in sh.replace("hello_1.2.3_amd64.deb", ""), "store-add.sh commands (only the store arts)")
     ok("--aenderungen 'Release notes'" in sh, "release notes go into the commands")
     ok(run("bash", "-n", j("dist", "store-add.sh")).returncode == 0, "store-add.sh parses")
+    r = subprocess.run([sys.executable, os.path.join(PACK, "pack.py"), "manifest", *APP, "--dir", j("dist"), *args2,
+                        "--key", j("no-such-key")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    ok(r.returncode != 0 and b"does not exist" in r.stdout and b"Traceback" not in r.stdout, "a missing key file is a clear error, not a traceback")
     # without a key the manifest says so and still has hashes
     r = subprocess.run([sys.executable, os.path.join(PACK, "pack.py"), "manifest", *APP, "--dir", j("dist"), *args2],
                        env=dict(os.environ, PACK_SIGN_KEY="", ORIENTSTORE_SCHLUESSEL=""), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

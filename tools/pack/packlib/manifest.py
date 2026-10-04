@@ -30,6 +30,8 @@ def load_key(path=None):
     path = path or os.environ.get("PACK_SIGN_KEY") or os.environ.get("ORIENTSTORE_SCHLUESSEL")
     if not path:
         return None
+    if not os.path.isfile(path):
+        raise PackError("the signing key file %s does not exist (PACK_SIGN_KEY / --key / ORIENTSTORE_SCHLUESSEL)" % path)
     raw = common.read(path)
     if len(raw) == 32:
         return raw

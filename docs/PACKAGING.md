@@ -17,7 +17,7 @@ cd myapp && bash package.sh   # = tools/pack/all.sh: every package into dist/<ve
 | platform | what you get | how it is checked here |
 |---|---|---|
 | Windows | `setup.exe` (installer + uninstaller), the program with its icon, a portable zip, an NSIS script | **under Wine**: silent and window install, shortcuts, registry entry, upgrade, uninstall, cancel; not on a real Windows |
-| Linux | `.deb`, `.tar.gz` + `install.sh`, a real **AppImage**, a self-extracting `.run`, the raw program | `dpkg-deb`, `dpkg -i` in a Debian container, `unsquashfs`, the AppImage runtime (`--appimage-extract`, extract-and-run), run |
+| Linux | `.deb`, `.rpm`, `.tar.gz` + `install.sh`, a real **AppImage**, a self-extracting `.run`, the raw program | `dpkg-deb`, `dpkg -i` and `rpm -i` in a Debian container, `unsquashfs`, the AppImage runtime (`--appimage-extract`, extract-and-run), run |
 | macOS | `.app` bundle, zip, `.dmg`, `sign-and-notarize.sh` | structure only (script + `plistlib`, `xorriso`); **nothing run on a Mac, nothing signed**; Firn has no macOS target, so the program must be given |
 | Android | signed APK with launcher icons | `tools/android/build.sh` (existing); the APK build is run by `tests` when the SDK/NDK is there |
 | OrientOS | `.opk` store package | byte for byte against OrientOS's own `opk.py`; **never run on OrientOS** |
@@ -40,7 +40,7 @@ failed. The output (`dist/<version>/`):
 
 ```
 ID-VERSION-linux-x86_64          the raw program        (store art `bin`)
-ID-VERSION-linux-x86_64.deb  .tar.gz
+ID-VERSION-linux-x86_64.deb  .tar.gz   ID-VERSION-1.x86_64.rpm
 ID-VERSION-x86_64.AppImage       real AppImage          (store art `appimage`)
 ID-VERSION-x86_64.run            self-extracting        (same, when no runtime is available)
 ID-VERSION-windows-x86_64.exe    program + icon         (store art `exe`: what the updater serves)
@@ -151,6 +151,7 @@ Still never seen on a real Windows (DPI, Segoe UI metrics, the title bar).
   icon caches when the tools exist) and `data.tar.xz` (or `--compress gz`); root:root, fixed times, so the same inputs give the same bytes.
   `Depends:` from `pack.ini` (the X11 window loads DejaVu Sans: `fonts-dejavu-core | fonts-dejavu`). `.desktop` file + icons in the hicolor theme.
   Architecture from the ELF header (`amd64`, `arm64`).
+* **`.rpm`** (`packlib/rpm.py`): lead, signature header (size, MD5, SHA-1 and SHA-256 of the header), header with the region tag (so rpm 4.x does not call it a "v3" package), the file list as parallel arrays (SHA-256 digests, directory indexes), `rpmlib(CompressedFileNames)` / `PayloadFilesHavePrefix` requirements, and a gzip'd `cpio` (newc) payload. Checked with rpm 4.20 in a container: `rpm -K` (digests OK), `-qip`, `-qlp`, `rpm --root R -i`, `-V`, `-e`, and the installed program runs. Not signed with a key.
 * **tar.gz**: `bin/`, `share/`, `install.sh [--prefix DIR]` (default `~/.local`, patches `Exec=`, refreshes caches), `uninstall.sh`.
 * **AppImage** (type 2): the official runtime (downloaded once to `~/.cache/firn-pack/`, or `--runtime FILE` / `$APPIMAGE_RUNTIME`)
   followed by a **SquashFS 4.0 image written by `packlib/squashfs.py`** (directories, files, symlinks, gzip blocks, no fragments/xattrs;
@@ -205,8 +206,8 @@ This is a second layer next to the catalog signature `store add-app` makes -- it
 | `tests/2201_pack_icons.fi` | PNG encoder round trip, resampler, `.ico`, `.icns` |
 | `tests/2202_pack_payload.fi` | trailer, SHA-256, truncation / damage / lying lengths, `.pack/info` |
 | `tests/2203_pack_install.fi` | install, list, upgrade, uninstall, user files, `..` entry, no program, damaged payload |
-| `tools/pack/test/checks.py` | every writer against an independent reader (dpkg-deb, `dpkg -i` in a container, unsquashfs, the AppImage runtime, opk.py, makensis, xorriso, own parsers): ~165 checks |
-| `tools/pack/test/windows.sh` | under Wine: installer, shortcuts (own reader **and** Wine's shell), registry, upgrade, `sync_version`, uninstall (+ leftovers), the windows (xdotool), NSIS setup, portable zip, the template window |
+| `tools/pack/test/checks.py` | every writer against an independent reader (dpkg-deb, `dpkg -i` and `rpm -i` in a container, unsquashfs, the AppImage runtime, opk.py, the store's `opkleser`, makensis, xorriso, a throw-away store, own parsers): ~175 checks |
+| `tools/pack/test/windows.sh` | under Wine (65 checks): installer, shortcuts (own reader **and** Wine's shell), registry, upgrade, `sync_version`, uninstall (+ leftovers), the windows (xdotool, screenshots), cancel, the error window, NSIS setup, portable zip, the template window |
 
 `test.sh` section 77 runs the unit tests (via the normal list) and `tools/pack/test/run.sh`; `PACK_WINE=1` adds the Wine run.
 
@@ -214,8 +215,8 @@ This is a second layer next to the catalog signature `store add-app` makes -- it
 
 * **No real Windows**: FLEI-ONE is online but cannot reach this server and the helper writes text only, so no exe can be put on it. Everything
   Windows is Wine. Not seen: Explorer showing the shortcut icon, SmartScreen (the files are **not Authenticode-signed**), Defender, High-DPI, per-machine installs.
-* **No macOS** (above), **no OrientOS** run, **no RPM** (roadmap), **no MSI**, no Authenticode signing (needs a certificate -- `signtool` on the exe/setup would be one more step), no Android arm64 run (emulator is x86_64).
+* **No macOS** (above), **no OrientOS** run, **no MSI**, no Authenticode signing (needs a certificate -- `signtool` on the exe/setup would be one more step), no Android arm64 run (emulator is x86_64).
 * A **real AppImage needs a runtime** from the network once (cached); offline, `all.sh` serves the self-extracting `.run` under the `appimage` art instead and says so.
 * The `.dmg` is an ISO/HFS+ image, uncompressed and unverified on macOS.
 * The installer is per-user only. It does not close a running copy of the program (the write fails with the file's name instead).
-* Roadmap entries cover RPM, Authenticode, an installer language list beyond en/de, delta updates for installers.
+* The Android APK step is `tools/pack/android.sh`; its icon resources (`--icon-res`) were added to `tools/android/build.sh`. Roadmap entries cover Authenticode, a real-Windows run, per-machine installs, apt/yum repositories, macOS and OrientOS runs.
