@@ -1,0 +1,145 @@
+// expect_exit: 0
+// tests/2202_pack_payload.fi -- lib/pack/payload.fi: the trailer of an installer / self-extracting
+// program, its SHA-256 check, the refusals (truncated, damaged, wrong lengths, no magic) and the
+// `.pack/info` text.
+import std.rt
+import std.io
+import zip.zip
+import pack.payload
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+fn report(label: str, total: i64, fails: i64) {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, label.p as u64, label.n)
+    rt.buf_push_dec_i64(&b, total)
+    rt.buf_push_bytes(&b, " fails: ".p as u64, 8)
+    rt.buf_push_dec_i64(&b, fails)
+    io.print_line_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+fn add(w: *mut zip.ZipWriter, name: str, text: str) {
+    zip.zip_add(w, name, text.p as u64, text.n, true) catch false
+}
+
+// stub bytes + zip + trailer, in `out`
+fn make_exe(out: *mut rt.Buf, info: str) -> usize {
+    var z: rt.Buf = rt.buf_new()
+    var w: zip.ZipWriter = zip.zip_writer_new(&z)
+    add(&w, ".pack/info", info)
+    add(&w, "app.exe", "MZ pretend program")
+    zip.zip_finish(&w) catch 0
+    zip.zip_writer_free(&w)
+    rt.buf_clear(out)
+    var i: usize = 0
+    while i < 1000 {
+        rt.buf_push(out, (i % 251) as u8)
+        i = i + 1
+    }
+    rt.buf_push_bytes(out, rt.buf_ptr(&z), rt.buf_len(&z))
+    payload.trailer_make(out, 1000, rt.buf_len(&z), rt.buf_ptr(&z))
+    let zl: usize = rt.buf_len(&z)
+    rt.buf_free(&z)
+    return zl
+}
+
+const INFO_OK: str = "id=my-app\nname=My App\nversion=1.2.3\nvendor=FleiTec\nexe=app.exe\nicon=app.ico\nurl=https://example.org/\ndesktop=0\nlaunch=1\n"
+
+#[allow_escape]
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    var exe: rt.Buf = rt.buf_new()
+    let zl: usize = make_exe(&exe, INFO_OK)
+    let n: usize = rt.buf_len(&exe)
+    let p: u64 = rt.buf_ptr(&exe)
+    check(&t, "trailer is 64 octets after the payload", n == 1000 + zl + 64)
+    check(&t, "magic FIRNPAK1", rt.mem_eq(p + (n - 64) as u64, "FIRNPAK1".p as u64, 8))
+    var pl: payload.Payload = payload.Payload { off: 0, len: 0 }
+    check(&t, "payload_find", payload.payload_find(p, n, &pl))
+    check(&t, "offset is the size of the program", pl.off == 1000)
+    check(&t, "length is the size of the zip", pl.len == zl)
+
+    // info
+    var inf: payload.Info = payload.Info { id: "", name: "", version: "", vendor: "", exe: "", icon: "",
+        url: "", desktop: true, launch: false }
+    check(&t, "info_from_payload", payload.info_from_payload(p + pl.off as u64, pl.len, &inf))
+    check(&t, "id", inf.id == "my-app")
+    check(&t, "name with a blank", inf.name == "My App")
+    check(&t, "version", inf.version == "1.2.3")
+    check(&t, "vendor", inf.vendor == "FleiTec")
+    check(&t, "exe", inf.exe == "app.exe")
+    check(&t, "icon", inf.icon == "app.ico")
+    check(&t, "url", inf.url == "https://example.org/")
+    check(&t, "desktop=0", !inf.desktop)
+    check(&t, "launch=1", inf.launch)
+
+    // refusals: one flipped octet in the payload
+    var bad: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&bad, p, n)
+    rt.st8(rt.buf_ptr(&bad), 1000 + 20, rt.ld8(rt.buf_ptr(&bad), 1000 + 20) ^ 1 as u8)
+    check(&t, "a flipped octet is refused (SHA-256)", !payload.payload_find(rt.buf_ptr(&bad), n, &pl))
+    // truncated at the end
+    check(&t, "truncated: no trailer", !payload.payload_find(p, n - 10, &pl))
+    // truncated in front (offset no longer fits)
+    check(&t, "bytes cut in front: lengths do not add up", !payload.payload_find(p + 10 as u64, n - 10, &pl))
+    // appended garbage after the trailer
+    var more: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&more, p, n)
+    rt.buf_push(&more, 0 as u8)
+    check(&t, "garbage after the trailer is refused", !payload.payload_find(rt.buf_ptr(&more), n + 1, &pl))
+    // wrong declared length
+    var lie: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&lie, p, n)
+    rt.st8(rt.buf_ptr(&lie), n - 64 + 16, rt.ld8(rt.buf_ptr(&lie), n - 64 + 16) + 1 as u8)
+    check(&t, "a length that lies is refused", !payload.payload_find(rt.buf_ptr(&lie), n, &pl))
+    // nothing at all
+    check(&t, "an empty file", !payload.payload_find(p, 0, &pl))
+    check(&t, "a short file", !payload.payload_find(p, 50, &pl))
+
+    // info refusals
+    var e2: rt.Buf = rt.buf_new()
+    make_exe(&e2, "id=x\nname=X\nversion=1\n")
+    var pl2: payload.Payload = payload.Payload { off: 0, len: 0 }
+    check(&t, "payload still found", payload.payload_find(rt.buf_ptr(&e2), rt.buf_len(&e2), &pl2))
+    check(&t, "info without exe= is refused", !payload.info_from_payload(rt.buf_ptr(&e2) + pl2.off as u64, pl2.len, &inf))
+    var e3: rt.Buf = rt.buf_new()
+    make_exe(&e3, "id=../evil\nname=X\nversion=1\nexe=a.exe\n")
+    var pl3: payload.Payload = payload.Payload { off: 0, len: 0 }
+    payload.payload_find(rt.buf_ptr(&e3), rt.buf_len(&e3), &pl3)
+    check(&t, "an id with a slash is refused", !payload.info_from_payload(rt.buf_ptr(&e3) + pl3.off as u64, pl3.len, &inf))
+    var e4: rt.Buf = rt.buf_new()
+    make_exe(&e4, "# comment\r\nid=a\r\nname=A\r\nversion=2\r\nexe=a.exe\r\n")
+    var pl4: payload.Payload = payload.Payload { off: 0, len: 0 }
+    payload.payload_find(rt.buf_ptr(&e4), rt.buf_len(&e4), &pl4)
+    check(&t, "CRLF lines and comments", payload.info_from_payload(rt.buf_ptr(&e4) + pl4.off as u64, pl4.len, &inf) &&
+        inf.id == "a" && inf.name == "A" && inf.version == "2")
+    var e5: rt.Buf = rt.buf_new()
+    make_exe(&e5, "id=a\nname=A\nversion=2\nexe=a.exe\n")
+    var pl5: payload.Payload = payload.Payload { off: 0, len: 0 }
+    payload.payload_find(rt.buf_ptr(&e5), rt.buf_len(&e5), &pl5)
+    // a plain zip without .pack/info
+    var z6: rt.Buf = rt.buf_new()
+    var w6: zip.ZipWriter = zip.zip_writer_new(&z6)
+    add(&w6, "only.txt", "hi")
+    zip.zip_finish(&w6) catch 0
+    check(&t, "a zip without .pack/info is refused", !payload.info_from_payload(rt.buf_ptr(&z6), rt.buf_len(&z6), &inf))
+
+    report("payload checks: ", t.total, t.fails)
+    if t.fails != 0 {
+        return 1
+    }
+    return 0
+}

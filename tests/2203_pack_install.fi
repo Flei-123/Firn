@@ -1,0 +1,204 @@
+// expect_exit: 0
+// tests/2203_pack_install.fi -- lib/pack/install.fi without Windows: install into a folder, the
+// list of what was made, upgrade in place (a file the new version no longer has goes away, user
+// files stay), uninstall (only what the list names), and the refusals (no payload, a name that
+// leaves the folder, the program missing from the payload). Registry and shortcuts are Windows
+// only (tools/pack/test/windows.sh runs those under Wine).
+import std.rt
+import std.io
+import std.fs
+import std.dir
+import zip.zip
+import pack.payload
+import pack.install
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+fn report(label: str, total: i64, fails: i64) {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, label.p as u64, label.n)
+    rt.buf_push_dec_i64(&b, total)
+    rt.buf_push_bytes(&b, " fails: ".p as u64, 8)
+    rt.buf_push_dec_i64(&b, fails)
+    io.print_line_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+fn add(w: *mut zip.ZipWriter, name: str, text: str) {
+    zip.zip_add(w, name, text.p as u64, text.n, true) catch false
+}
+
+// a pretend installer: 4000 octets of "stub", the zip, the trailer
+fn make_installer(out: *mut rt.Buf, version: str, with_old: bool, with_exe: bool, evil: bool) {
+    var z: rt.Buf = rt.buf_new()
+    var w: zip.ZipWriter = zip.zip_writer_new(&z)
+    add(&w, ".pack/info", "id=demo\nname=Demo App\nversion=" + version + "\nvendor=FleiTec\nexe=demo.exe\n")
+    if with_exe {
+        add(&w, "demo.exe", "MZ the program " + version)
+    }
+    zip.zip_add_dir(&w, "docs") catch false
+    add(&w, "docs/readme.txt", "read me " + version)
+    if with_old {
+        add(&w, "old.dat", "only in version 1")
+    } else {
+        add(&w, "new.dat", "only in version 2")
+    }
+    if evil {
+        // the writer would refuse "../evil.txt": write "xx/evil.txt" and patch the name
+        // in both headers afterwards (same length, the CRC does not cover the name)
+        add(&w, "xx/evil.txt", "x")
+    }
+    zip.zip_finish(&w) catch 0
+    zip.zip_writer_free(&w)
+    if evil {
+        var k: usize = 0
+        while k + 11 <= rt.buf_len(&z) {
+            if rt.mem_eq(rt.buf_ptr(&z) + k as u64, "xx/evil.txt".p as u64, 11) {
+                rt.st8(rt.buf_ptr(&z), k, 46 as u8)
+                rt.st8(rt.buf_ptr(&z), k + 1, 46 as u8)
+            }
+            k = k + 1
+        }
+    }
+    rt.buf_clear(out)
+    var i: usize = 0
+    while i < 4000 {
+        rt.buf_push(out, (i % 241) as u8)
+        i = i + 1
+    }
+    rt.buf_push_bytes(out, rt.buf_ptr(&z), rt.buf_len(&z))
+    payload.trailer_make(out, 4000, rt.buf_len(&z), rt.buf_ptr(&z))
+    rt.buf_free(&z)
+}
+
+fn slurp(path: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    fs.read_file(path, &b) catch 0
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn scratch() -> str {
+    var b: rt.Buf = rt.buf_new()
+    let head: str = "/tmp/firn_pack_2203_"
+    rt.buf_push_bytes(&b, head.p as u64, head.length())
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+// run the whole installer state machine; the phase it ended in
+fn run_install(exe: *mut rt.Buf, dir: str, lg: *mut install.Logger) -> u32 {
+    var ins: install.Installer = install.inst_new(lg)
+    if !install.inst_open(&ins, rt.buf_ptr(exe), rt.buf_len(exe), false, false) {
+        install.inst_free(&ins)
+        return install.PH_FAILED
+    }
+    ins.registry = false
+    if !install.inst_begin(&ins, dir) {
+        install.inst_free(&ins)
+        return install.PH_FAILED
+    }
+    var ph: u32 = install.PH_EXTRACT
+    var guard: usize = 0
+    while ph < install.PH_DONE && guard < 1000 {
+        ph = install.inst_step(&ins)
+        guard = guard + 1
+    }
+    install.inst_free(&ins)
+    return ph
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let base: str = scratch()
+    fs.remove_tree(base) catch false
+    fs.mkdir_all(base) catch false
+    let dir: str = base + "/app dir"
+    var lg: install.Logger = install.logger_new("")
+
+    // ---- version 1 into a folder with a blank in its name
+    var v1: rt.Buf = rt.buf_new()
+    make_installer(&v1, "1.0.0", true, true, false)
+    check(&t, "install v1", run_install(&v1, dir, &lg) == install.PH_DONE)
+    check(&t, "the program is there", slurp(dir + "/demo.exe") == "MZ the program 1.0.0")
+    check(&t, "a file in a folder", slurp(dir + "/docs/readme.txt") == "read me 1.0.0")
+    check(&t, "old.dat", slurp(dir + "/old.dat") == "only in version 1")
+    var up: rt.Buf = rt.buf_new()
+    let un: usize = fs.read_file(dir + "/uninstall.exe", &up) catch 0
+    check(&t, "uninstall.exe has the size of the stub (4000)", un == 4000)
+    var lb: rt.Buf = rt.buf_new()
+    fs.read_file(dir + "/.pack/install.txt", &lb) catch 0
+    check(&t, "list: id", install.manifest_field(&lb, "id") == "demo")
+    check(&t, "list: version", install.manifest_field(&lb, "version") == "1.0.0")
+    check(&t, "list: name", install.manifest_field(&lb, "name") == "Demo App")
+    check(&t, "list: folder", install.manifest_field(&lb, "dir") == dir)
+
+    // ---- the user puts a file of their own in the folder
+    let mine: str = "my own notes"
+    fs.write_file(dir + "/notes.txt", mine.p as u64, mine.n) catch 0
+
+    // ---- version 2 over it: old.dat goes, new.dat comes, notes.txt stays
+    var v2: rt.Buf = rt.buf_new()
+    make_installer(&v2, "2.0.0", false, true, false)
+    check(&t, "upgrade to v2", run_install(&v2, dir, &lg) == install.PH_DONE)
+    check(&t, "the program is the new one", slurp(dir + "/demo.exe") == "MZ the program 2.0.0")
+    check(&t, "new.dat", slurp(dir + "/new.dat") == "only in version 2")
+    check(&t, "old.dat is gone", !fs.exists(dir + "/old.dat"))
+    check(&t, "the user's file stays", slurp(dir + "/notes.txt") == "my own notes")
+
+    // ---- uninstall (stage 2 = the work itself; this process is not inside the folder)
+    check(&t, "uninstall", install.uninstall_run(base + "/elsewhere/uninstall.exe", dir, true, false, &lg) == 0 as u32)
+    check(&t, "the program is removed", !fs.exists(dir + "/demo.exe"))
+    check(&t, "the folder with its file is removed", !fs.exists(dir + "/docs"))
+    check(&t, "the list is removed", !fs.exists(dir + "/.pack/install.txt"))
+    check(&t, "the user's file survives the uninstall", slurp(dir + "/notes.txt") == "my own notes")
+    check(&t, "so does the folder that holds it", fs.is_dir(dir))
+    // nothing to uninstall twice
+    check(&t, "uninstall without a list fails", install.uninstall_run(base + "/elsewhere/uninstall.exe", dir, true, false, &lg) != 0 as u32)
+
+    // ---- refusals
+    var evil: rt.Buf = rt.buf_new()
+    make_installer(&evil, "3.0.0", true, true, true)
+    check(&t, "a zip entry '../evil.txt' is refused", run_install(&evil, base + "/e1", &lg) == install.PH_FAILED)
+    check(&t, "nothing was written outside", !fs.exists(base + "/evil.txt") && !fs.exists("/tmp/evil.txt"))
+    var noexe: rt.Buf = rt.buf_new()
+    make_installer(&noexe, "3.0.0", true, false, false)
+    check(&t, "a payload without the program is refused", run_install(&noexe, base + "/e2", &lg) == install.PH_FAILED)
+    check(&t, "nothing was made for it", !fs.exists(base + "/e2/demo.exe"))
+    var junk: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 5000 {
+        rt.buf_push(&junk, (i % 7) as u8)
+        i = i + 1
+    }
+    check(&t, "a file with no payload is refused", run_install(&junk, base + "/e3", &lg) == install.PH_FAILED)
+    // a damaged payload
+    var dmg: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&dmg, rt.buf_ptr(&v1), rt.buf_len(&v1))
+    rt.st8(rt.buf_ptr(&dmg), 4100, rt.ld8(rt.buf_ptr(&dmg), 4100) ^ 255 as u8)
+    check(&t, "a damaged payload is refused before anything is written", run_install(&dmg, base + "/e4", &lg) == install.PH_FAILED
+        && !fs.exists(base + "/e4"))
+
+    fs.remove_tree(base) catch false
+    report("install checks: ", t.total, t.fails)
+    if t.fails != 0 {
+        return 1
+    }
+    return 0
+}

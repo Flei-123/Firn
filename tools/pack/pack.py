@@ -21,6 +21,8 @@ Commands
   mac-dmg         disk image (xorriso)              --exe macho --out X.dmg [--icns F] [--allow-any]
   mac-sign-script the codesign/notarize commands    --out sign.sh
   opk             OrientOS store package            --exe start --out X.opk [--icon-png F]
+  manifest        release manifest + store-add.sh   --dir DIST --artifact art:platform:file[:store] ...
+  verify          check a manifest's signatures     --manifest FILE
 
 Every command prints the output path on the last line of stdout.
 """
@@ -31,7 +33,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from packlib import common, win, linux, mac, osum   # noqa: E402
+from packlib import common, win, linux, mac, osum, manifest   # noqa: E402
 from packlib.common import PackError, App  # noqa: E402
 
 
@@ -73,7 +75,7 @@ def cmd_win_nsis(a):
     import subprocess
     app = app_of(a)
     os.makedirs(a.outdir, exist_ok=True)
-    exe_name = os.path.basename(a.exe)
+    exe_name = app.exe if app.exe.endswith(".exe") else app.exe + ".exe"
     shutil.copyfile(a.exe, os.path.join(a.outdir, exe_name))
     ico_name = ""
     if a.ico:
@@ -139,6 +141,48 @@ def cmd_opk(a):
     print(out)
 
 
+def cmd_manifest(a):
+    app = app_of(a)
+    arts = []
+    for spec in a.artifact:
+        parts = spec.split(":")
+        if len(parts) < 3:
+            raise PackError("--artifact art:platform:file[:store]  (got %r)" % spec)
+        store = parts[-1] == "store"
+        file_ = ":".join(parts[2:-1] if store else parts[2:])
+        if not os.path.isfile(file_):
+            raise PackError("no such artifact file: %s" % file_)
+        arts.append({"art": parts[0], "platform": parts[1], "file": file_, "store": store})
+    man = manifest.build(app, arts, a.key, a.dir)
+    import json
+    common.write(os.path.join(a.dir, "manifest.json"), (json.dumps(man, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    common.write(os.path.join(a.dir, "store-add.sh"),
+                 manifest.store_commands(man, a.notes or "", a.channel, a.dir).encode("utf-8"), 0o755)
+    print(os.path.join(a.dir, "manifest.json"))
+
+
+def cmd_verify(a):
+    import json
+    man = json.loads(common.read(a.manifest).decode("utf-8"))
+    pub = man.get("signing_key")
+    if not pub:
+        raise PackError("the manifest is unsigned")
+    bad = 0
+    base = os.path.dirname(os.path.abspath(a.manifest))
+    for e in man["artifacts"]:
+        ok = manifest.verify_entry(e, pub, man["id"], man["version"])
+        p = os.path.join(base, e["file"])
+        same = os.path.isfile(p) and common.sha256_file(p) == e["sha256"]
+        print("%-10s %-18s signature %s, file %s" % (e["art"], e["platform"], "ok" if ok else "BAD",
+                                                   "ok" if same else "CHANGED/MISSING"))
+        bad += (not ok) + (not same)
+    if a.key_expected and a.key_expected != pub:
+        print("signing key is NOT the expected one")
+        bad += 1
+    if bad:
+        raise PackError("%d problems" % bad)
+
+
 def main(argv):
     ap = argparse.ArgumentParser(prog="pack.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -194,6 +238,12 @@ def main(argv):
     p = sub.add_parser("opk"); add_app_args(p); p.add_argument("--exe", required=True)
     p.add_argument("--out", required=True); p.add_argument("--icon-png"); p.add_argument("--files")
     p.add_argument("--keys"); p.set_defaults(fn=cmd_opk)
+
+    p = sub.add_parser("manifest"); add_app_args(p); p.add_argument("--dir", required=True)
+    p.add_argument("--artifact", action="append", default=[]); p.add_argument("--key")
+    p.add_argument("--notes"); p.add_argument("--channel", default="stabil"); p.set_defaults(fn=cmd_manifest)
+    p = sub.add_parser("verify"); p.add_argument("--manifest", required=True)
+    p.add_argument("--key-expected"); p.set_defaults(fn=cmd_verify)
 
     a = ap.parse_args(argv)
     try:
