@@ -1,0 +1,2107 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/select.fi -- SELECT: name resolution, join loop, aggregates, sorting.
+//
+// A `SelIter` is one SELECT (or one compound of SELECTs) ready to run:
+//   sel_setup   resolves names against the schema, expands `*`, finds aggregates,
+//               plans the access path of every FROM item
+//   sel_start   (re)starts it (evaluates LIMIT/OFFSET, runs a materialising query)
+//   sel_next    produces the next result row into `out` (text valid until the next call)
+//
+// A plain SELECT STREAMS: each step advances the join loop. A SELECT with
+// aggregates, GROUP BY, DISTINCT, ORDER BY or a compound operator is MATERIALISED
+// on start (rows into a RowSet, sorted) and then drained.
+//
+// SUB-SELECTS in expressions (`x IN (SELECT ..)`, `EXISTS (..)`, `(SELECT ..)`) and in FROM
+// are SelIters of their own, registered in the statement. An uncorrelated one is
+// evaluated once and cached; a correlated one runs again for every outer row.
+//
+// HONEST NOTES
+//   S1 The join is a nested loop; an index or the rowid is used where a WHERE or ON
+//      condition allows (plan.fi); nothing reorders the tables.
+//   S2 ORDER BY always sorts (no use of an index for the order); GROUP BY sorts.
+//   S3 With GROUP BY or aggregates, a plain column in the select list takes its
+//      value from the FIRST row of the group (SQLite: an arbitrary row).
+//   S4 Output order without ORDER BY is the order of the scan (rowid or index order);
+//      SQLite's may differ -- use ORDER BY.
+//   S5 RIGHT / FULL / NATURAL JOIN, WITH, window functions: Unsupported (parser).
+
+import std.rt
+import db.dberr
+import db.util as ut
+import db.record as rc
+import db.arena as ar
+import db.value as vl
+import db.dbcore as dc
+import db.btree as bx
+import db.sqlast as ax
+import db.sqllex as tk
+import db.expr as ex
+import db.rowset as rs
+import db.plan as pl
+
+export {
+    SelIter, sel_new, sel_free, sel_setup, sel_start, sel_next, sel_close, sel_ncols, sel_name,
+    compile_subs, sub_hook_addr, resolve_full, sel_nout, sel_col_type_hint,
+}
+
+struct Acc {
+    kind: u32,
+    cnt: i64,
+    isum: i64,
+    fsum: f64,
+    approx: bool,
+    ovfl: bool,
+    has: bool,
+    best: rc.Val,
+    cat: rt.Buf,
+}
+
+struct SelIter {
+    db: *mut dc.Db,
+    stmt: *mut dc.Stmt,
+    ast: *mut ax.Ast,
+    node: i32,
+    scope: ex.Scope,
+    cx: ex.Ctx,
+    nsrc: usize,
+    src: [pl.Source; 8],
+    rows: [ex.RowRef; 8],
+    sub_it: [u64; 8], // FROM sub-selects (SelIter addresses), 0 = a table
+    sub_rs: [rs.RowSet; 8],
+    // result columns
+    ncols: usize, // visible
+    nout: usize, // visible + hidden ORDER BY columns
+    res: rt.Buf, // i32 expression node per output column
+    names: rt.Buf, // (address, length) per visible column
+    out: u64, // nout Vals of the current row
+    // clauses
+    where_n: i32,
+    distinct: bool,
+    ngroup: usize,
+    group: rt.Buf, // i32 nodes
+    having: i32,
+    okeys: rt.Buf, // SortKeys
+    nokeys: usize,
+    limit_n: i32,
+    offset_n: i32,
+    limit: i64,
+    offset: i64,
+    has_limit: bool,
+    // aggregates
+    nagg: usize,
+    aggs: rt.Buf, // i32 nodes of aggregate calls
+    nbare: usize,
+    bare: rt.Buf, // i32 nodes of plain columns used after aggregation
+    has_agg: bool,
+    agg_distinct: [bool; 16],
+    // the pieces of a compound select
+    ncore: usize,
+    cores: rt.Buf, // u64 addresses of SelIters (compound only)
+    core_ops: rt.Buf, // u32 compound operator linking core i to the result so far
+    // run state
+    state: u32, // 0 not started, 1 streaming, 2 draining, 3 done
+    level: i32,
+    pre_done: bool,
+    materialise: bool,
+    rs: rs.RowSet,
+    pos: usize,
+    skipped: i64,
+    emitted: i64,
+    arena: ar.Arena, // values of the output row (draining)
+    tmp: ar.Arena, // scratch of one evaluation
+    garena: ar.Arena, // scratch of one group
+    pre: rt.Buf, // conjuncts without any source (evaluated once)
+    // sub-select behaviour
+    correlated: bool,
+    cached: bool,
+    cache_rs: rs.RowSet,
+    cache_val: rc.Val,
+    cache_has: bool,
+    kind: u32, // which expression uses it: N_SUBQ, N_EXISTS, N_IN_SELECT, or 0 (statement)
+    opened: bool,
+    tail: bool, // ORDER BY / LIMIT of this node apply to it (false for the members of a compound)
+    have_text: bool,
+    text_p: u64,
+    text_n: usize,
+    set_up: bool,
+}
+
+fn sub_hook_addr() -> u64 {
+    return eval_sub as u64
+}
+
+fn sz_of_seliter() -> usize {
+    return sel_sz_of[SelIter]()
+}
+
+fn sel_sz_of[T: Any]() -> usize {
+    return size_of[T]()
+}
+
+fn sz_of_acc() -> usize {
+    return sel_sz_of[Acc]()
+}
+
+fn sz_of_sortkey2() -> usize {
+    return sel_sz_of[rs.SortKey]()
+}
+
+fn selit_blank(db: *mut dc.Db, stmt: *mut dc.Stmt, ast: *mut ax.Ast) -> SelIter {
+    return SelIter { db: db, stmt: stmt, ast: ast, node: -1, scope: ex.scope_new(),
+        cx: ex.ctx_new(db, ast, 0 as *mut ar.Arena), nsrc: 0,
+        src: [pl.source_new(), pl.source_new(), pl.source_new(), pl.source_new(), pl.source_new(), pl.source_new(),
+            pl.source_new(), pl.source_new()],
+        rows: [ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: false }, ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: false },
+            ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: false }, ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: false },
+            ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: false }, ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: false },
+            ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: false }, ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: false }],
+        sub_it: [0; 8],
+        sub_rs: [rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new()],
+        ncols: 0, nout: 0, res: rt.buf_new(), names: rt.buf_new(), out: 0, where_n: -1, distinct: false,
+        ngroup: 0, group: rt.buf_new(), having: -1, okeys: rt.buf_new(), nokeys: 0, limit_n: -1, offset_n: -1,
+        limit: -1, offset: 0, has_limit: false, nagg: 0, aggs: rt.buf_new(), nbare: 0, bare: rt.buf_new(),
+        has_agg: false, agg_distinct: [false; 16], ncore: 0, cores: rt.buf_new(), core_ops: rt.buf_new(), state: 0,
+        level: -1, pre_done: false, materialise: false, rs: rs.rs_new(), pos: 0, skipped: 0, emitted: 0,
+        arena: ar.arena_new(), tmp: ar.arena_new(), garena: ar.arena_new(), pre: rt.buf_new(), correlated: false,
+        cached: false, cache_rs: rs.rs_new(), cache_val: rc.val_null(), cache_has: false, kind: 0, opened: false,
+        tail: true, have_text: false, text_p: 0, text_n: 0, set_up: false }
+}
+
+fn sel_new(db: *mut dc.Db, stmt: *mut dc.Stmt, ast: *mut ax.Ast) -> *mut SelIter {
+    let p: u64 = rt.heap_alloc(sz_of_seliter() + 64)
+    if p == 0 {
+        return 0 as *mut SelIter
+    }
+    let it: *mut SelIter = p as *mut SelIter
+    *it = selit_blank(db, stmt, ast)
+    return it
+}
+
+fn sel_free(it: *mut SelIter) {
+    if (it as u64) == 0 {
+        return
+    }
+    var i: usize = 0
+    while i < 8 {
+        pl.src_free(&(*it).src[i])
+        if (*it).sub_it[i] != 0 {
+            sel_free((*it).sub_it[i] as *mut SelIter)
+        }
+        rs.rs_free(&(*it).sub_rs[i])
+        i = i + 1
+    }
+    var c: usize = 0
+    while c < (*it).ncore {
+        sel_free(rt.ld64(rt.buf_ptr(&(*it).cores), c) as *mut SelIter)
+        c = c + 1
+    }
+    rt.buf_free(&(*it).res)
+    rt.buf_free(&(*it).names)
+    rt.buf_free(&(*it).group)
+    rt.buf_free(&(*it).okeys)
+    rt.buf_free(&(*it).aggs)
+    rt.buf_free(&(*it).bare)
+    rt.buf_free(&(*it).cores)
+    rt.buf_free(&(*it).core_ops)
+    rt.buf_free(&(*it).pre)
+    rs.rs_free(&(*it).rs)
+    rs.rs_free(&(*it).cache_rs)
+    ar.arena_free(&(*it).arena)
+    ar.arena_free(&(*it).tmp)
+    ar.arena_free(&(*it).garena)
+    if (*it).out != 0 {
+        rt.heap_free((*it).out, ((*it).nout + 1) * 40)
+    }
+    rt.heap_free(it as u64, sz_of_seliter() + 64)
+}
+
+fn sel_ncols(it: *mut SelIter) -> usize {
+    return (*it).ncols
+}
+
+fn sel_nout(it: *mut SelIter) -> usize {
+    return (*it).nout
+}
+
+fn sel_name(it: *mut SelIter, i: usize, p: *mut u64, n: *mut usize) {
+    *p = rt.ld64(rt.buf_ptr(&(*it).names), 2 * i)
+    *n = rt.ld64(rt.buf_ptr(&(*it).names), 2 * i + 1) as usize
+}
+
+fn sel_col_type_hint(it: *mut SelIter, i: usize) -> i64 {
+    return -1
+}
+
+fn buf_push_i32(b: *mut rt.Buf, v: i32) {
+    let at: usize = rt.buf_len(b)
+    rt.buf_reserve(b, at + 4)
+    rt.st32(rt.buf_ptr(b) + (at as u64), 0, v as% u32)
+    rt.buf_set_len(b, at + 4)
+}
+
+fn buf_i32(b: *mut rt.Buf, i: usize) -> i32 {
+    return rt.ld32(rt.buf_ptr(b), i) as% i32
+}
+
+fn buf_push_u64(b: *mut rt.Buf, v: u64) {
+    let at: usize = rt.buf_len(b)
+    rt.buf_reserve(b, at + 8)
+    rt.st64(rt.buf_ptr(b) + (at as u64), 0, v)
+    rt.buf_set_len(b, at + 8)
+}
+
+fn text_msg(a: str, p: u64, n: usize) -> str {
+    var b: rt.Buf = rt.buf_new()
+    ut.put_text(&b, a)
+    rt.buf_push_bytes(&b, p, n)
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+// ------------------------------------------------------------ sub-selects
+// Resolves the names of an expression tree AND registers the sub-selects in it.
+fn resolve_full(it: *mut SelIter, sc: *mut ex.Scope, n: i32, agg_ok: bool) -> DbError!bool {
+    if n < 0 {
+        return true
+    }
+    try ex.resolve_expr(sc, (*it).ast, n, agg_ok, false)
+    try compile_subs(it, sc, n)
+    return true
+}
+
+// walks an expression and compiles every sub-select found (kinds N_SUBQ, N_EXISTS, N_IN_SELECT)
+fn compile_subs(it: *mut SelIter, sc: *mut ex.Scope, n: i32) -> DbError!bool {
+    if n < 0 {
+        return true
+    }
+    let ast: *mut ax.Ast = (*it).ast
+    let nd: *mut ax.Node = ax.ast_n(ast, n)
+    let k: u32 = (*nd).kind
+    if k == ax.N_SUBQ || k == ax.N_EXISTS || k == ax.N_IN_SELECT {
+        var selnode: i32 = (*nd).a
+        if k == ax.N_IN_SELECT {
+            try compile_subs(it, sc, (*nd).a)
+            selnode = (*nd).b
+        }
+        if (*nd).d >= 0 {
+            return true
+        }
+        let sub: *mut SelIter = sel_new((*it).db, (*it).stmt, ast)
+        if (sub as u64) == 0 {
+            return dberr.fail(DbError::NoMemory, "out of memory")
+        }
+        (*sub).kind = k
+        let saved: i32 = ex.outer_depth_get()
+        ex.outer_depth_set(0)
+        let r: DbError!bool = sel_setup(sub, selnode, sc)
+        let seen: i32 = ex.outer_depth_get()
+        let ok: bool = r catch false
+        if !ok {
+            sel_free(sub)
+            return r
+        }
+        // refs that go beyond the sub-select's own parent are the parent's own correlation
+        var carry: i32 = seen - 1
+        if carry < saved {
+            carry = saved
+        }
+        ex.outer_depth_set(carry)
+        (*sub).correlated = seen >= 1
+        if k == ax.N_IN_SELECT || k == ax.N_SUBQ {
+            if (*sub).ncols != 1 {
+                sel_free(sub)
+                return dberr.fail(DbError::Sql, "sub-select returns more than 1 column")
+            }
+        }
+        let idx: usize = rt.buf_len(&(*(*it).stmt).subs) / 8
+        buf_push_u64(&(*(*it).stmt).subs, sub as u64)
+        (*ax.ast_n(ast, n)).d = idx as i32
+        return true
+    }
+    if k == ax.N_COL || k == ax.N_INT || k == ax.N_REAL || k == ax.N_STR || k == ax.N_BLOB || k == ax.N_NULL
+        || k == ax.N_PARAM {
+        return true
+    }
+    if k == ax.N_FUNC {
+        var a: i32 = (*nd).a
+        while a >= 0 {
+            try compile_subs(it, sc, a)
+            a = (*ax.ast_n(ast, a)).next
+        }
+        return true
+    }
+    if k == ax.N_IN_LIST {
+        try compile_subs(it, sc, (*nd).a)
+        var b: i32 = (*nd).b
+        while b >= 0 {
+            try compile_subs(it, sc, b)
+            b = (*ax.ast_n(ast, b)).next
+        }
+        return true
+    }
+    if k == ax.N_CASE {
+        try compile_subs(it, sc, (*nd).a)
+        var w: i32 = (*nd).b
+        while w >= 0 {
+            try compile_subs(it, sc, (*ax.ast_n(ast, w)).a)
+            try compile_subs(it, sc, (*ax.ast_n(ast, w)).b)
+            w = (*ax.ast_n(ast, w)).next
+        }
+        try compile_subs(it, sc, (*nd).c)
+        return true
+    }
+    try compile_subs(it, sc, (*nd).a)
+    try compile_subs(it, sc, (*nd).b)
+    try compile_subs(it, sc, (*nd).c)
+    return true
+}
+
+fn has_subs(ast: *mut ax.Ast, n: i32) -> bool {
+    if n < 0 {
+        return false
+    }
+    let nd: *mut ax.Node = ax.ast_n(ast, n)
+    let k: u32 = (*nd).kind
+    if k == ax.N_SUBQ || k == ax.N_EXISTS || k == ax.N_IN_SELECT {
+        return true
+    }
+    if k == ax.N_COL || k == ax.N_INT || k == ax.N_REAL || k == ax.N_STR || k == ax.N_BLOB || k == ax.N_NULL
+        || k == ax.N_PARAM {
+        return false
+    }
+    if k == ax.N_FUNC {
+        var a: i32 = (*nd).a
+        while a >= 0 {
+            if has_subs(ast, a) {
+                return true
+            }
+            a = (*ax.ast_n(ast, a)).next
+        }
+        return false
+    }
+    if k == ax.N_IN_LIST {
+        var b: i32 = (*nd).b
+        while b >= 0 {
+            if has_subs(ast, b) {
+                return true
+            }
+            b = (*ax.ast_n(ast, b)).next
+        }
+        return has_subs(ast, (*nd).a)
+    }
+    if k == ax.N_CASE {
+        var w: i32 = (*nd).b
+        while w >= 0 {
+            if has_subs(ast, (*ax.ast_n(ast, w)).a) || has_subs(ast, (*ax.ast_n(ast, w)).b) {
+                return true
+            }
+            w = (*ax.ast_n(ast, w)).next
+        }
+        return has_subs(ast, (*nd).a) || has_subs(ast, (*nd).c)
+    }
+    return has_subs(ast, (*nd).a) || has_subs(ast, (*nd).b) || has_subs(ast, (*nd).c)
+}
+
+// ------------------------------------------------------------- setup
+fn mk_col(ast: *mut ax.Ast, src: i32, col: i32, np: u64, nn: usize) -> DbError!i32 {
+    let n: i32 = ax.ast_add(ast, ax.N_COL)
+    if n < 0 {
+        return dberr.fail(DbError::NoMemory, "out of memory")
+    }
+    let nd: *mut ax.Node = ax.ast_n(ast, n)
+    (*nd).b = src
+    (*nd).c = col
+    (*nd).d = 0
+    (*nd).sp = np
+    (*nd).sn = nn
+    return n
+}
+
+fn src_alias_eq(sc: *mut ex.Scope, i: usize, p: u64, n: usize) -> bool {
+    return dc.name_eq((*sc).src[i].alias_p, (*sc).src[i].alias_n, p, n)
+}
+
+// Result columns: the expressions, `*` expanded.
+fn setup_result_columns(it: *mut SelIter, sel: *mut ax.Node) -> DbError!bool {
+    let ast: *mut ax.Ast = (*it).ast
+    let sc: *mut ex.Scope = &(*it).scope
+    let db: *mut dc.Db = (*it).db
+    var c: i32 = (*sel).a
+    var first_star: bool = true
+    while c >= 0 {
+        let cn: *mut ax.Node = ax.ast_n(ast, c)
+        if (*cn).flag == 1 {
+            // * or t.*
+            var matched: bool = false
+            var si: usize = 0
+            while si < (*it).nsrc {
+                if (*cn).sn2 > 0 && !src_alias_eq(sc, si, (*cn).sp2, (*cn).sn2) {
+                    si = si + 1
+                    continue
+                }
+                matched = true
+                let info: *mut ex.SrcInfo = &(*sc).src[si]
+                var ci: usize = 0
+                while ci < (*info).ncols {
+                    // a USING column of a later table is not repeated
+                    var skip: bool = false
+                    if si > 0 && using_hidden(it, si, ci) {
+                        skip = true
+                    }
+                    if !skip {
+                        var np: u64 = 0
+                        var nn: usize = 0
+                        if (*info).tbl >= 0 {
+                            let col: *mut dc.Column = ((*info).cols as *mut dc.Column) + ci
+                            np = (*col).name_p
+                            nn = (*col).name_n
+                        } else {
+                            np = rt.ld64((*info).colnames, 2 * ci)
+                            nn = rt.ld64((*info).colnames, 2 * ci + 1) as usize
+                        }
+                        let colnode: i32 = try mk_col(ast, si as i32, ci as i32, np, nn)
+                        buf_push_i32(&(*it).res, colnode)
+                        buf_push_u64(&(*it).names, np)
+                        buf_push_u64(&(*it).names, nn as u64)
+                        (*it).ncols = (*it).ncols + 1
+                    }
+                    ci = ci + 1
+                }
+                si = si + 1
+            }
+            if !matched {
+                if (*cn).sn2 > 0 {
+                    return dberr.fail(DbError::NoSuchTable, text_msg("no such table: ", (*cn).sp2, (*cn).sn2))
+                }
+                return dberr.fail(DbError::Sql, "no tables specified")
+            }
+        } else {
+            try resolve_full(it, sc, (*cn).a, true)
+            buf_push_i32(&(*it).res, (*cn).a)
+            let en: *mut ax.Node = ax.ast_n(ast, (*cn).a)
+            var np2: u64 = 0
+            var nn2: usize = 0
+            if (*cn).sn > 0 {
+                np2 = (*cn).sp
+                nn2 = (*cn).sn
+            } else if (*en).kind == ax.N_COL {
+                np2 = (*en).sp
+                nn2 = (*en).sn
+            } else if !ex.expr_text_name(rt.buf_ptr(&(*(*it).stmt).sql), rt.buf_len(&(*(*it).stmt).sql), cn, &np2, &nn2) {
+                np2 = "?".p as u64
+                nn2 = 1
+            }
+            buf_push_u64(&(*it).names, np2)
+            buf_push_u64(&(*it).names, nn2 as u64)
+            (*it).ncols = (*it).ncols + 1
+        }
+        c = (*cn).next
+    }
+    return true
+}
+
+// is column ci of source si one named in the USING clause of its join?
+fn using_hidden(it: *mut SelIter, si: usize, ci: usize) -> bool {
+    let ast: *mut ax.Ast = (*it).ast
+    // find the N_SOURCE node of source si
+    var n: i32 = (*ax.ast_n(ast, (*it).node)).b
+    var k: usize = 0
+    while n >= 0 && k < si {
+        n = (*ax.ast_n(ast, n)).next
+        k = k + 1
+    }
+    if n < 0 {
+        return false
+    }
+    var u: i32 = (*ax.ast_n(ast, n)).b
+    let info: *mut ex.SrcInfo = &(*it).scope.src[si]
+    while u >= 0 {
+        let un: *mut ax.Node = ax.ast_n(ast, u)
+        if (*info).tbl >= 0 {
+            let col: *mut dc.Column = ((*info).cols as *mut dc.Column) + ci
+            if dc.name_eq((*col).name_p, (*col).name_n, (*un).sp, (*un).sn) {
+                return true
+            }
+        }
+        u = (*un).next
+    }
+    return false
+}
+
+fn find_result_alias(it: *mut SelIter, p: u64, n: usize) -> i64 {
+    var i: usize = 0
+    while i < (*it).ncols {
+        let np: u64 = rt.ld64(rt.buf_ptr(&(*it).names), 2 * i)
+        let nn: usize = rt.ld64(rt.buf_ptr(&(*it).names), 2 * i + 1) as usize
+        if dc.name_eq(np, nn, p, n) {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn mk_name_node(ast: *mut ax.Ast, p: u64, n: usize) -> i32 {
+    return -1
+}
+
+// The SortKey of an ORDER BY term for output column `col`
+fn push_okey(it: *mut SelIter, col: usize, desc: bool, nulls: i32, coll: u32) {
+    let sz: usize = sz_of_sortkey2()
+    let at: usize = rt.buf_len(&(*it).okeys)
+    rt.buf_reserve(&(*it).okeys, at + sz)
+    let k: *mut rs.SortKey = ((rt.buf_ptr(&(*it).okeys) + (at as u64)) as *mut rs.SortKey)
+    *k = rs.SortKey { col: col, desc: desc, nulls: nulls, coll: coll }
+    rt.buf_set_len(&(*it).okeys, at + sz)
+    (*it).nokeys = (*it).nokeys + 1
+}
+
+fn setup_order_by(it: *mut SelIter, sel: *mut ax.Node, compound: bool) -> DbError!bool {
+    let ast: *mut ax.Ast = (*it).ast
+    let sc: *mut ex.Scope = &(*it).scope
+    var t: i32 = (*sel).f
+    while t >= 0 {
+        let tn: *mut ax.Node = ax.ast_n(ast, t)
+        let en: *mut ax.Node = ax.ast_n(ast, (*tn).a)
+        var col: i64 = -1
+        if (*en).kind == ax.N_INT {
+            if (*en).ival < 1 || (*en).ival > ((*it).ncols as i64) {
+                return dberr.fail(DbError::Sql, "ORDER BY term out of range - should be between 1 and the number of result columns")
+            }
+            col = (*en).ival - 1
+        } else if (*en).kind == ax.N_COL && (*en).sn2 == 0 {
+            col = find_result_alias(it, (*en).sp, (*en).sn)
+        }
+        if col < 0 && compound {
+            return dberr.fail(DbError::Sql, "ORDER BY term does not match any column in the result set")
+        }
+        var coll: u32 = 0
+        if col < 0 {
+            // an expression: a hidden output column
+            try resolve_full(it, sc, (*tn).a, true)
+            col = ((*it).ncols + ((*it).nout - (*it).ncols)) as i64
+            buf_push_i32(&(*it).res, (*tn).a)
+            (*it).nout = (*it).nout + 1
+            var cx0: ex.Ctx = ex.ctx_new((*it).db, ast, &(*it).tmp)
+            cx0.scope = sc
+            coll = ex.expr_coll(&cx0, (*tn).a)
+        } else {
+            var cx1: ex.Ctx = ex.ctx_new((*it).db, ast, &(*it).tmp)
+            cx1.scope = sc
+            let rn: i32 = buf_i32(&(*it).res, col as usize)
+            if !compound {
+                coll = ex.expr_coll(&cx1, rn)
+            }
+        }
+        push_okey(it, col as usize, (*tn).flag == 1, (*tn).op as i32, coll)
+        t = (*tn).next
+    }
+    return true
+}
+
+fn find_agg_nodes(it: *mut SelIter, n: i32, in_agg: bool) {
+    if n < 0 {
+        return
+    }
+    let ast: *mut ax.Ast = (*it).ast
+    let nd: *mut ax.Node = ax.ast_n(ast, n)
+    let k: u32 = (*nd).kind
+    if k == ax.N_FUNC && ex.is_aggregate_id((*nd).op) {
+        if (*nd).d < 0 {
+            let slot: usize = (*it).nagg
+            (*nd).d = slot as i32
+            buf_push_i32(&(*it).aggs, n)
+            (*it).nagg = slot + 1
+            if slot < 16 {
+                (*it).agg_distinct[slot] = (*nd).flag == 1
+            }
+        }
+        return
+    }
+    if k == ax.N_COL {
+        if (*nd).d == 0 && (*nd).e < 0 {
+            let slot: usize = (*it).nbare
+            (*nd).e = slot as i32
+            buf_push_i32(&(*it).bare, n)
+            (*it).nbare = slot + 1
+        }
+        return
+    }
+    if k == ax.N_INT || k == ax.N_REAL || k == ax.N_STR || k == ax.N_BLOB || k == ax.N_NULL || k == ax.N_PARAM {
+        return
+    }
+    if k == ax.N_FUNC {
+        var a: i32 = (*nd).a
+        while a >= 0 {
+            find_agg_nodes(it, a, in_agg)
+            a = (*ax.ast_n(ast, a)).next
+        }
+        return
+    }
+    if k == ax.N_IN_LIST {
+        find_agg_nodes(it, (*nd).a, in_agg)
+        var b: i32 = (*nd).b
+        while b >= 0 {
+            find_agg_nodes(it, b, in_agg)
+            b = (*ax.ast_n(ast, b)).next
+        }
+        return
+    }
+    if k == ax.N_CASE {
+        find_agg_nodes(it, (*nd).a, in_agg)
+        var w: i32 = (*nd).b
+        while w >= 0 {
+            find_agg_nodes(it, (*ax.ast_n(ast, w)).a, in_agg)
+            find_agg_nodes(it, (*ax.ast_n(ast, w)).b, in_agg)
+            w = (*ax.ast_n(ast, w)).next
+        }
+        find_agg_nodes(it, (*nd).c, in_agg)
+        return
+    }
+    if k == ax.N_IN_SELECT {
+        find_agg_nodes(it, (*nd).a, in_agg)
+        return
+    }
+    if k == ax.N_EXISTS || k == ax.N_SUBQ {
+        return
+    }
+    find_agg_nodes(it, (*nd).a, in_agg)
+    find_agg_nodes(it, (*nd).b, in_agg)
+    find_agg_nodes(it, (*nd).c, in_agg)
+}
+
+// Builds `a = b` between two columns (the USING clause)
+fn mk_eq(ast: *mut ax.Ast, l: i32, r: i32) -> DbError!i32 {
+    let n: i32 = ax.ast_add(ast, ax.N_BINARY)
+    if n < 0 {
+        return dberr.fail(DbError::NoMemory, "out of memory")
+    }
+    let nd: *mut ax.Node = ax.ast_n(ast, n)
+    (*nd).op = ax.OP_EQ
+    (*nd).a = l
+    (*nd).b = r
+    return n
+}
+
+
+// An unqualified name that is no column of any source but the alias of a result column
+// stands for that column's expression (SQLite allows this in WHERE, GROUP BY, HAVING).
+fn subst_aliases(it: *mut SelIter, n: i32) {
+    if n < 0 {
+        return
+    }
+    let ast: *mut ax.Ast = (*it).ast
+    let nd: *mut ax.Node = ax.ast_n(ast, n)
+    let k: u32 = (*nd).kind
+    if k == ax.N_COL {
+        if (*nd).sn2 > 0 {
+            return
+        }
+        var si: usize = 0
+        while si < (*it).nsrc {
+            if find_col_in(&(*it).scope, si, (*nd).sp, (*nd).sn) != -1 {
+                return
+            }
+            let info: *mut ex.SrcInfo = &(*it).scope.src[si]
+            if (*info).hidden_rowid && (dc.name_eq((*nd).sp, (*nd).sn, "rowid".p as u64, 5)
+                || dc.name_eq((*nd).sp, (*nd).sn, "oid".p as u64, 3) || dc.name_eq((*nd).sp, (*nd).sn, "_rowid_".p as u64, 7)) {
+                return
+            }
+            si = si + 1
+        }
+        let a: i64 = find_result_alias(it, (*nd).sp, (*nd).sn)
+        if a >= 0 {
+            let target: i32 = buf_i32(&(*it).res, a as usize)
+            if target != n {
+                let nxt: i32 = (*nd).next
+                *nd = *ax.ast_n(ast, target)
+                (*nd).next = nxt
+            }
+        }
+        return
+    }
+    if k == ax.N_INT || k == ax.N_REAL || k == ax.N_STR || k == ax.N_BLOB || k == ax.N_NULL || k == ax.N_PARAM
+        || k == ax.N_EXISTS || k == ax.N_SUBQ {
+        return
+    }
+    if k == ax.N_FUNC {
+        var a2: i32 = (*nd).a
+        while a2 >= 0 {
+            subst_aliases(it, a2)
+            a2 = (*ax.ast_n(ast, a2)).next
+        }
+        return
+    }
+    if k == ax.N_IN_LIST {
+        subst_aliases(it, (*nd).a)
+        var b: i32 = (*nd).b
+        while b >= 0 {
+            subst_aliases(it, b)
+            b = (*ax.ast_n(ast, b)).next
+        }
+        return
+    }
+    if k == ax.N_CASE {
+        subst_aliases(it, (*nd).a)
+        var w: i32 = (*nd).b
+        while w >= 0 {
+            subst_aliases(it, (*ax.ast_n(ast, w)).a)
+            subst_aliases(it, (*ax.ast_n(ast, w)).b)
+            w = (*ax.ast_n(ast, w)).next
+        }
+        subst_aliases(it, (*nd).c)
+        return
+    }
+    subst_aliases(it, (*nd).a)
+    subst_aliases(it, (*nd).b)
+    subst_aliases(it, (*nd).c)
+}
+
+// Sets up one SELECT core (no compound): sources, columns, clauses, plan.
+fn setup_core(it: *mut SelIter, node: i32, parent: *mut ex.Scope, tail: bool) -> DbError!bool {
+    let ast: *mut ax.Ast = (*it).ast
+    let db: *mut dc.Db = (*it).db
+    let sc: *mut ex.Scope = &(*it).scope
+    (*it).node = node
+    (*it).tail = tail
+    (*sc).parent = parent
+    let sel: *mut ax.Node = ax.ast_n(ast, node)
+    // ---- FROM
+    var f: i32 = (*sel).b
+    var nsrc: usize = 0
+    while f >= 0 {
+        if nsrc >= 8 {
+            return dberr.fail(DbError::TooBig, "too many tables in a join (at most 8)")
+        }
+        let fnn: *mut ax.Node = ax.ast_n(ast, f)
+        let s: *mut pl.Source = &(*it).src[nsrc]
+        let info: *mut ex.SrcInfo = &(*sc).src[nsrc]
+        (*s).join = (*fnn).op
+        (*s).on = (*fnn).a
+        if (*fnn).c >= 0 {
+            let child: *mut SelIter = sel_new(db, (*it).stmt, ast)
+            if (child as u64) == 0 {
+                return dberr.fail(DbError::NoMemory, "out of memory")
+            }
+            let r: DbError!bool = sel_setup(child, (*fnn).c, 0 as *mut ex.Scope)
+            let ok: bool = r catch false
+            if !ok {
+                sel_free(child)
+                return r
+            }
+            (*it).sub_it[nsrc] = child as u64
+            (*info).tbl = -1
+            (*info).alias_p = (*fnn).sp2
+            (*info).alias_n = (*fnn).sn2
+            (*info).name_p = (*fnn).sp2
+            (*info).name_n = (*fnn).sn2
+            (*info).ncols = (*child).ncols
+            (*info).colnames = rt.buf_ptr(&(*child).names)
+            (*info).hidden_rowid = false
+            (*s).mode = pl.SCAN_SUB
+            (*s).ncols = (*child).ncols
+        } else {
+            let ti: i64 = dc.find_table(&(*db).schema, (*fnn).sp, (*fnn).sn)
+            if ti < 0 {
+                return dberr.fail(DbError::NoSuchTable, text_msg("no such table: ", (*fnn).sp, (*fnn).sn))
+            }
+            let t: *mut dc.Table = dc.table_at(&(*db).schema, ti as usize)
+            if (*t).bad {
+                return dberr.fail(DbError::Unsupported, text_msg("table cannot be used: ", (*t).msg_p, (*t).msg_n))
+            }
+            (*s).tbl = ti as i32
+            (*s).ncols_table = (*t).ncols
+            (*info).tbl = ti as i32
+            (*info).name_p = (*t).name_p
+            (*info).name_n = (*t).name_n
+            if (*fnn).sn2 > 0 {
+                (*info).alias_p = (*fnn).sp2
+                (*info).alias_n = (*fnn).sn2
+            } else {
+                (*info).alias_p = (*t).name_p
+                (*info).alias_n = (*t).name_n
+            }
+            (*info).ncols = (*t).ncols
+            (*info).cols = (*t).cols
+            (*info).rowid_col = (*t).rowid_col
+            (*info).hidden_rowid = true
+            (*s).mode = pl.SCAN_FULL
+            (*s).rowid_col = (*t).rowid_col
+        }
+        nsrc = nsrc + 1
+        (*it).nsrc = nsrc
+        (*sc).n = nsrc
+        f = (*fnn).next
+    }
+    if nsrc == 0 {
+        (*it).nsrc = 0
+    }
+    // row references for evaluation
+    var ri: usize = 0
+    while ri < nsrc {
+        (*it).rows[ri] = ex.RowRef { vals: 0, ncols: (*it).src[ri].ncols_table, rowid: 0, valid: false }
+        ri = ri + 1
+    }
+    // ---- result columns
+    try setup_result_columns(it, sel)
+    (*it).nout = (*it).ncols
+    if (*sel).flag == 1 {
+        (*it).distinct = true
+    }
+    // ---- WHERE
+    (*it).where_n = (*sel).c
+    subst_aliases(it, (*sel).c)
+    try resolve_full(it, sc, (*sel).c, false)
+    // ---- GROUP BY
+    var g: i32 = (*sel).d
+    while g >= 0 {
+        let gn: *mut ax.Node = ax.ast_n(ast, g)
+        var target: i32 = g
+        if (*gn).kind == ax.N_INT {
+            if (*gn).ival < 1 || (*gn).ival > ((*it).ncols as i64) {
+                return dberr.fail(DbError::Sql, "GROUP BY term out of range")
+            }
+            target = buf_i32(&(*it).res, ((*gn).ival - 1) as usize)
+        } else if (*gn).kind == ax.N_COL && (*gn).sn2 == 0 {
+            // a column of the tables first; else a result alias
+            let r: DbError!bool = ex.resolve_expr(sc, ast, g, false, false)
+            let ok: bool = r catch false
+            if !ok {
+                let a: i64 = find_result_alias(it, (*gn).sp, (*gn).sn)
+                if a < 0 {
+                    return r
+                }
+                target = buf_i32(&(*it).res, a as usize)
+            }
+        } else {
+            try resolve_full(it, sc, g, false)
+        }
+        buf_push_i32(&(*it).group, target)
+        (*it).ngroup = (*it).ngroup + 1
+        g = (*gn).next
+    }
+    // ---- HAVING
+    (*it).having = (*sel).e
+    subst_aliases(it, (*sel).e)
+    try resolve_full(it, sc, (*sel).e, true)
+    // ---- ORDER BY (the head of a compound handles it for the compound)
+    if tail {
+        try setup_order_by(it, sel, false)
+        (*it).limit_n = (*sel).g
+        (*it).offset_n = (*sel).h
+        try resolve_full(it, sc, (*sel).g, false)
+        try resolve_full(it, sc, (*sel).h, false)
+    }
+    // ---- aggregates and plain columns after aggregation
+    var o: usize = 0
+    while o < (*it).nout {
+        find_agg_nodes(it, buf_i32(&(*it).res, o), false)
+        o = o + 1
+    }
+    find_agg_nodes(it, (*it).having, false)
+    (*it).has_agg = (*it).nagg > 0 || (*it).ngroup > 0 || (*it).having >= 0
+    if (*it).nagg > 16 {
+        return dberr.fail(DbError::TooBig, "too many aggregate functions in a query (at most 16)")
+    }
+    if !(*it).has_agg {
+        // plain queries do not use the "bare column" slots
+    }
+    // ---- ON / USING / WHERE conjuncts per level and the access paths
+    try plan_joins(it, sel)
+    (*it).materialise = (*it).has_agg || (*it).distinct || (*it).nokeys > 0
+    (*it).set_up = true
+    return true
+}
+
+fn all_filters(it: *mut SelIter, out: *mut i32, count: *mut usize, cap: usize) {
+    split_and_into(it, (*it).where_n, out, count, cap)
+}
+
+fn split_and_into(it: *mut SelIter, n: i32, out: *mut i32, count: *mut usize, cap: usize) {
+    pl.split_and((*it).ast, n, out, count, cap)
+}
+
+// Assigns conjuncts to levels and picks the access path of every source.
+fn plan_joins(it: *mut SelIter, sel: *mut ax.Node) -> DbError!bool {
+    let ast: *mut ax.Ast = (*it).ast
+    let sc: *mut ex.Scope = &(*it).scope
+    let nsrc: usize = (*it).nsrc
+    var wc: [i32; 64] = [-1; 64]
+    var nwc: usize = 0
+    pl.split_and(ast, (*it).where_n, &wc[0], &nwc, 64)
+    // the expression tree of every level gets its ON conjuncts first
+    var lv: usize = 0
+    // per level: conjuncts that may narrow its access path
+    var cand: [i32; 64] = [-1; 64]
+    while lv < nsrc {
+        let s: *mut pl.Source = &(*it).src[lv]
+        (*s).nfilt = 0
+        (*s).npost = 0
+        var ncand: usize = 0
+        // ON conjuncts
+        var oc: [i32; 32] = [-1; 32]
+        var noc: usize = 0
+        if (*s).on >= 0 {
+            try resolve_full(it, sc, (*s).on, false)
+            pl.split_and(ast, (*s).on, &oc[0], &noc, 32)
+        }
+        // USING columns: left.col = right.col
+        var un: i32 = -1
+        {
+            var fnode: i32 = (*sel).b
+            var k: usize = 0
+            while fnode >= 0 && k < lv {
+                fnode = (*ax.ast_n(ast, fnode)).next
+                k = k + 1
+            }
+            if fnode >= 0 {
+                un = (*ax.ast_n(ast, fnode)).b
+            }
+        }
+        while un >= 0 {
+            let unn: *mut ax.Node = ax.ast_n(ast, un)
+            // the right column in this source, the left column in an earlier one
+            let rcol: i64 = find_col_in(sc, lv, (*unn).sp, (*unn).sn)
+            var lsrc: i64 = -1
+            var lcol: i64 = -1
+            var q: usize = 0
+            while q < lv && lsrc < 0 {
+                let c: i64 = find_col_in(sc, q, (*unn).sp, (*unn).sn)
+                if c != -1 {
+                    lsrc = q as i64
+                    lcol = c
+                }
+                q = q + 1
+            }
+            if rcol == -1 || lsrc < 0 {
+                return dberr.fail(DbError::Sql, text_msg("cannot join using column ", (*unn).sp, (*unn).sn))
+            }
+            var rci: i32 = rcol as i32
+            if rcol == -2 {
+                rci = -1
+            }
+            var lci: i32 = lcol as i32
+            if lcol == -2 {
+                lci = -1
+            }
+            let ln: i32 = try mk_col(ast, lsrc as i32, lci, (*unn).sp, (*unn).sn)
+            let rn: i32 = try mk_col(ast, lv as i32, rci, (*unn).sp, (*unn).sn)
+            let eq: i32 = try mk_eq(ast, ln, rn)
+            if noc < 32 {
+                oc[noc] = eq
+                noc = noc + 1
+            }
+            un = (*unn).next
+        }
+        let left: bool = (*s).join == ax.JOIN_LEFT
+        var i: usize = 0
+        while i < noc {
+            let c: i32 = oc[i]
+            i = i + 1
+            if left {
+                // a LEFT JOIN's own condition is tested before the null row is made
+                if (*s).nfilt < 24 {
+                    (*s).filt[(*s).nfilt] = c
+                    (*s).nfilt = (*s).nfilt + 1
+                }
+                if ncand < 64 {
+                    cand[ncand] = c
+                    ncand = ncand + 1
+                }
+            } else {
+                let ml: i32 = pl.max_level_of(ast, c)
+                var at: usize = lv
+                if ml >= 0 && (ml as usize) < lv {
+                    at = ml as usize
+                }
+                // an inner join's condition is a WHERE condition
+                if wc_push(it, at, c) && at == lv && ncand < 64 {
+                    cand[ncand] = c
+                    ncand = ncand + 1
+                }
+            }
+        }
+        lv = lv + 1
+    }
+    // WHERE conjuncts to the lowest level that has all they need
+    var wi: usize = 0
+    while wi < nwc {
+        let c: i32 = wc[wi]
+        wi = wi + 1
+        let ml: i32 = pl.max_level_of(ast, c)
+        if nsrc == 0 {
+            buf_push_i32(&(*it).pre, c)
+            continue
+        }
+        var at: usize = 0
+        if ml >= 0 {
+            at = ml as usize
+        }
+        if at >= nsrc {
+            at = nsrc - 1
+        }
+        let s: *mut pl.Source = &(*it).src[at]
+        if (*s).join == ax.JOIN_LEFT {
+            if (*s).npost < 8 {
+                (*s).post[(*s).npost] = c
+                (*s).npost = (*s).npost + 1
+            }
+        } else {
+            if (*s).nfilt < 24 {
+                (*s).filt[(*s).nfilt] = c
+                (*s).nfilt = (*s).nfilt + 1
+            }
+        }
+    }
+    // access paths: from the conjuncts that apply at the level (and cannot be
+    // pushed in from a LEFT JOIN's WHERE)
+    var l2: usize = 0
+    while l2 < nsrc {
+        let s: *mut pl.Source = &(*it).src[l2]
+        if (*s).tbl >= 0 && (*s).mode != pl.SCAN_SUB {
+            var narrow: [i32; 48] = [-1; 48]
+            var nn: usize = 0
+            var fi: usize = 0
+            while fi < (*s).nfilt && nn < 48 {
+                narrow[nn] = (*s).filt[fi]
+                nn = nn + 1
+                fi = fi + 1
+            }
+            (*it).cx.scope = sc
+            (*it).cx.ast = ast
+            (*it).cx.db = (*it).db
+            try pl.plan_level(&(*it).cx, s, l2, &narrow[0], nn)
+        }
+        l2 = l2 + 1
+    }
+    // the columns each source must decode
+    var m: usize = 0
+    while m < nsrc {
+        let s: *mut pl.Source = &(*it).src[m]
+        var o: usize = 0
+        while o < (*it).nout {
+            pl.mark_used(ast, buf_i32(&(*it).res, o), &(*it).src[0], nsrc)
+            o = o + 1
+        }
+        m = m + 1
+    }
+    pl.mark_used(ast, (*it).where_n, &(*it).src[0], nsrc)
+    pl.mark_used(ast, (*it).having, &(*it).src[0], nsrc)
+    var gi: usize = 0
+    while gi < (*it).ngroup {
+        pl.mark_used(ast, buf_i32(&(*it).group, gi), &(*it).src[0], nsrc)
+        gi = gi + 1
+    }
+    var ai: usize = 0
+    while ai < nsrc {
+        let s: *mut pl.Source = &(*it).src[ai]
+        pl.mark_used(ast, (*s).on, &(*it).src[0], nsrc)
+        var x: usize = 0
+        while x < (*s).nfilt {
+            pl.mark_used(ast, (*s).filt[x], &(*it).src[0], nsrc)
+            x = x + 1
+        }
+        x = 0
+        while x < (*s).npost {
+            pl.mark_used(ast, (*s).post[x], &(*it).src[0], nsrc)
+            x = x + 1
+        }
+        x = 0
+        while x < (*s).n_eq {
+            pl.mark_used(ast, (*s).eq[x], &(*it).src[0], nsrc)
+            x = x + 1
+        }
+        pl.mark_used(ast, (*s).lo, &(*it).src[0], nsrc)
+        pl.mark_used(ast, (*s).hi, &(*it).src[0], nsrc)
+        ai = ai + 1
+    }
+    // sub-selects (correlated ones read outer columns): decode everything
+    var anysub: bool = (rt.buf_len(&(*(*it).stmt).subs) > 0)
+    if anysub {
+        var z: usize = 0
+        while z < nsrc {
+            if (*it).src[z].tbl >= 0 {
+                pl.mark_all_used(&(*it).src[z], (*it).src[z].ncols_table)
+            }
+            z = z + 1
+        }
+    }
+    return true
+}
+
+fn wc_push(it: *mut SelIter, at: usize, c: i32) -> bool {
+    let s: *mut pl.Source = &(*it).src[at]
+    if (*s).join == ax.JOIN_LEFT {
+        if (*s).npost < 8 {
+            (*s).post[(*s).npost] = c
+            (*s).npost = (*s).npost + 1
+            return false
+        }
+        return false
+    }
+    if (*s).nfilt < 24 {
+        (*s).filt[(*s).nfilt] = c
+        (*s).nfilt = (*s).nfilt + 1
+        return true
+    }
+    return false
+}
+
+fn find_col_in(sc: *mut ex.Scope, i: usize, p: u64, n: usize) -> i64 {
+    let info: *mut ex.SrcInfo = &(*sc).src[i]
+    if (*info).tbl >= 0 {
+        var c: usize = 0
+        while c < (*info).ncols {
+            let col: *mut dc.Column = ((*info).cols as *mut dc.Column) + c
+            if dc.name_eq((*col).name_p, (*col).name_n, p, n) {
+                return c as i64
+            }
+            c = c + 1
+        }
+        return -1
+    }
+    var c2: usize = 0
+    while c2 < (*info).ncols {
+        if dc.name_eq(rt.ld64((*info).colnames, 2 * c2), rt.ld64((*info).colnames, 2 * c2 + 1) as usize, p, n) {
+            return c2 as i64
+        }
+        c2 = c2 + 1
+    }
+    return -1
+}
+
+// Sets up a whole SELECT statement (also a compound).
+fn sel_setup(it: *mut SelIter, node: i32, parent: *mut ex.Scope) -> DbError!bool {
+    let ast: *mut ax.Ast = (*it).ast
+    let head: *mut ax.Node = ax.ast_n(ast, node)
+    (*it).node = node
+    (*it).cx.stmt = (*it).stmt as u64
+    (*it).cx.subq = sub_hook_addr()
+    if (*head).ival < 0 {
+        try setup_core(it, node, parent, true)
+        let outn: usize = (*it).nout
+        // storage for the output row
+        (*it).out = rt.heap_alloc((outn + 1) * 40)
+        (*it).cx.scope = &(*it).scope
+        return true
+    }
+    // a compound: every member is a core of its own
+    var n: i32 = node
+    var idx: usize = 0
+    while n >= 0 {
+        let core: *mut SelIter = sel_new((*it).db, (*it).stmt, ast)
+        if (core as u64) == 0 {
+            return dberr.fail(DbError::NoMemory, "out of memory")
+        }
+        buf_push_u64(&(*it).cores, core as u64)
+        (*it).ncore = (*it).ncore + 1
+        (*core).cx.stmt = (*it).stmt as u64
+        (*core).cx.subq = sub_hook_addr()
+        let r: DbError!bool = setup_core(core, n, parent, false)
+        let ok: bool = r catch false
+        if !ok {
+            return r
+        }
+        (*core).out = rt.heap_alloc(((*core).nout + 1) * 40)
+        (*core).cx.scope = &(*core).scope
+        let nd: *mut ax.Node = ax.ast_n(ast, n)
+        buf_push_i32(&(*it).core_ops, (*nd).op as i32)
+        if idx > 0 {
+            let c0: *mut SelIter = rt.ld64(rt.buf_ptr(&(*it).cores), 0) as *mut SelIter
+            if (*core).ncols != (*c0).ncols {
+                return dberr.fail(DbError::Sql, "SELECTs to the left and right of a compound operator do not have the same number of result columns")
+            }
+        }
+        idx = idx + 1
+        n = (*nd).ival as i32
+    }
+    // the result columns are the first member's
+    let c0: *mut SelIter = rt.ld64(rt.buf_ptr(&(*it).cores), 0) as *mut SelIter
+    (*it).ncols = (*c0).ncols
+    (*it).nout = (*it).ncols
+    var i: usize = 0
+    while i < (*it).ncols {
+        buf_push_u64(&(*it).names, rt.ld64(rt.buf_ptr(&(*c0).names), 2 * i))
+        buf_push_u64(&(*it).names, rt.ld64(rt.buf_ptr(&(*c0).names), 2 * i + 1))
+        buf_push_i32(&(*it).res, -1)
+        i = i + 1
+    }
+    // ORDER BY and LIMIT of the whole compound
+    (*it).scope.n = 0
+    (*it).tail = true
+    try setup_order_by_compound(it, head)
+    (*it).limit_n = (*head).g
+    (*it).offset_n = (*head).h
+    try resolve_full(it, &(*it).scope, (*head).g, false)
+    try resolve_full(it, &(*it).scope, (*head).h, false)
+    (*it).out = rt.heap_alloc(((*it).nout + 1) * 40)
+    (*it).cx.scope = &(*it).scope
+    (*it).materialise = true
+    (*it).set_up = true
+    return true
+}
+
+fn setup_order_by_compound(it: *mut SelIter, head: *mut ax.Node) -> DbError!bool {
+    return setup_order_by(it, head, true)
+}
+
+// ----------------------------------------------------------------- running
+fn eval_limit(it: *mut SelIter, n: i32, out: *mut i64) -> DbError!bool {
+    if n < 0 {
+        return false
+    }
+    ar.arena_reset(&(*it).tmp)
+    let v: rc.Val = try ex.eval(&(*it).cx, n)
+    var vv: rc.Val = v
+    if v.t == 0 {
+        return false
+    }
+    *out = vl.val_to_int(&vv)
+    return true
+}
+
+fn setup_ctx(it: *mut SelIter) {
+    let db: *mut dc.Db = (*it).db
+    (*it).cx.db = db
+    (*it).cx.ast = (*it).ast
+    (*it).cx.arena = &(*it).tmp
+    (*it).cx.scope = &(*it).scope
+    (*it).cx.rows = ((&(*it).rows[0]) as u64)
+    (*it).cx.params = rt.buf_ptr(&(*(*it).stmt).params)
+    (*it).cx.nparams = (*(*it).stmt).nparams
+    (*it).cx.stmt = (*it).stmt as u64
+    (*it).cx.subq = sub_hook_addr()
+}
+
+fn sel_close(it: *mut SelIter) {
+    var i: usize = 0
+    while i < (*it).nsrc {
+        pl.src_reset(&(*it).src[i])
+        i = i + 1
+    }
+    var c: usize = 0
+    while c < (*it).ncore {
+        sel_close(rt.ld64(rt.buf_ptr(&(*it).cores), c) as *mut SelIter)
+        c = c + 1
+    }
+    (*it).state = 0
+    (*it).opened = false
+}
+
+fn sel_start(it: *mut SelIter) -> DbError!bool {
+    setup_ctx(it)
+    (*it).state = 0
+    (*it).level = -1
+    (*it).pre_done = false
+    (*it).pos = 0
+    (*it).skipped = 0
+    (*it).emitted = 0
+    (*it).limit = -1
+    (*it).offset = 0
+    (*it).has_limit = false
+    rs.rs_clear(&(*it).rs)
+    ar.arena_reset(&(*it).arena)
+    var lim: i64 = 0
+    if (*it).tail {
+        let got: bool = try eval_limit(it, (*it).limit_n, &lim)
+        if got && lim >= 0 {
+            (*it).limit = lim
+            (*it).has_limit = true
+        }
+        var off: i64 = 0
+        let got2: bool = try eval_limit(it, (*it).offset_n, &off)
+        if got2 && off > 0 {
+            (*it).offset = off
+        }
+    }
+    var i: usize = 0
+    while i < (*it).nsrc {
+        pl.src_reset(&(*it).src[i])
+        // FROM sub-selects are materialised again for every run
+        if (*it).sub_it[i] != 0 {
+            let child: *mut SelIter = (*it).sub_it[i] as *mut SelIter
+            (*child).cx.parent = 0 as *mut ex.Ctx
+            try drain_into(child, &(*it).sub_rs[i], (*child).ncols)
+            (*it).src[i].sub = (&(*it).sub_rs[i]) as u64
+        }
+        i = i + 1
+    }
+    if (*it).ncore > 0 {
+        try run_compound(it)
+        (*it).state = 2
+        return true
+    }
+    if (*it).materialise {
+        try run_materialise(it)
+        (*it).state = 2
+        return true
+    }
+    (*it).state = 1
+    return true
+}
+
+// runs a select to its end and keeps the visible columns of every row
+fn drain_into(sub: *mut SelIter, r: *mut rs.RowSet, ncols: usize) -> DbError!bool {
+    rs.rs_clear(r)
+    try sel_start(sub)
+    while true {
+        let ok: bool = try sel_next(sub)
+        if !ok {
+            break
+        }
+        try rs.rs_add(r, (*sub).out as *mut rc.Val, ncols)
+    }
+    return true
+}
+
+fn project(it: *mut SelIter) -> DbError!bool {
+    let out: *mut rc.Val = (*it).out as *mut rc.Val
+    var i: usize = 0
+    while i < (*it).nout {
+        let v: rc.Val = try ex.eval(&(*it).cx, buf_i32(&(*it).res, i))
+        *(out + i) = v
+        i = i + 1
+    }
+    return true
+}
+
+fn filters_pass(it: *mut SelIter, list: *mut i32, n: usize) -> DbError!bool {
+    var i: usize = 0
+    while i < n {
+        let t: i64 = try ex.eval_truth(&(*it).cx, *(list + i))
+        if t != 1 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Produces the next combination of rows of the sources that passes every condition.
+fn join_next(it: *mut SelIter) -> DbError!bool {
+    let nsrc: usize = (*it).nsrc
+    let cx: *mut ex.Ctx = &(*it).cx
+    ar.arena_reset(&(*it).tmp)
+    if nsrc == 0 {
+        if (*it).pre_done {
+            return false
+        }
+        (*it).pre_done = true
+        let pn: usize = rt.buf_len(&(*it).pre) / 4
+        var i: usize = 0
+        while i < pn {
+            let t: i64 = try ex.eval_truth(cx, buf_i32(&(*it).pre, i))
+            if t != 1 {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    var lv: i32 = (*it).level
+    if lv < 0 {
+        // the very first call: constant conditions, then level 0
+        let pn: usize = rt.buf_len(&(*it).pre) / 4
+        var i: usize = 0
+        while i < pn {
+            let t: i64 = try ex.eval_truth(cx, buf_i32(&(*it).pre, i))
+            if t != 1 {
+                (*it).level = -2
+                return false
+            }
+            i = i + 1
+        }
+        lv = 0
+        (*it).src[0].state = 0
+    }
+    if lv == -2 {
+        return false
+    }
+    while true {
+        if lv < 0 {
+            (*it).level = -2
+            return false
+        }
+        let s: *mut pl.Source = &(*it).src[lv as usize]
+        let r: *mut ex.RowRef = &(*it).rows[lv as usize]
+        if (*s).state == 0 {
+            try pl.src_open(cx, s)
+            (*s).state = 1
+            (*s).matched = false
+        }
+        if (*s).state == 3 {
+            (*s).state = 0
+            lv = lv - 1
+            continue
+        }
+        let got: bool = try pl.src_advance(cx, s)
+        if got {
+            (*r).vals = (*s).vals
+            (*r).ncols = (*s).ncols
+            (*r).rowid = (*s).rowid
+            (*r).valid = true
+            let ok: bool = try filters_pass(it, &(*s).filt[0], (*s).nfilt)
+            if !ok {
+                ar.arena_reset(&(*it).tmp)
+                continue
+            }
+            (*s).matched = true
+            let ok2: bool = try filters_pass(it, &(*s).post[0], (*s).npost)
+            if !ok2 {
+                ar.arena_reset(&(*it).tmp)
+                continue
+            }
+            if (lv as usize) == nsrc - 1 {
+                (*it).level = lv
+                return true
+            }
+            lv = lv + 1
+            (*it).src[lv as usize].state = 0
+            continue
+        }
+        // this level has no more rows
+        if (*s).join == ax.JOIN_LEFT && !(*s).matched {
+            (*s).matched = true
+            (*r).valid = false
+            pl.src_clear_row(s)
+            (*s).state = 3
+            let ok3: bool = try filters_pass(it, &(*s).post[0], (*s).npost)
+            if !ok3 {
+                continue
+            }
+            if (lv as usize) == nsrc - 1 {
+                (*it).level = lv
+                return true
+            }
+            lv = lv + 1
+            (*it).src[lv as usize].state = 0
+            continue
+        }
+        (*s).state = 0
+        lv = lv - 1
+    }
+    return false
+}
+
+fn sel_next(it: *mut SelIter) -> DbError!bool {
+    if (*it).state == 0 {
+        try sel_start(it)
+    }
+    if (*it).state == 1 {
+        while true {
+            if (*it).has_limit && (*it).emitted >= (*it).limit {
+                (*it).state = 3
+                return false
+            }
+            let ok: bool = try join_next(it)
+            if !ok {
+                (*it).state = 3
+                return false
+            }
+            if (*it).skipped < (*it).offset {
+                (*it).skipped = (*it).skipped + 1
+                continue
+            }
+            try project(it)
+            (*it).emitted = (*it).emitted + 1
+            return true
+        }
+    }
+    if (*it).state == 2 {
+        if (*it).has_limit && (*it).emitted >= (*it).limit {
+            (*it).state = 3
+            return false
+        }
+        while (*it).skipped < (*it).offset && (*it).pos < rs.rs_count(&(*it).rs) {
+            (*it).skipped = (*it).skipped + 1
+            (*it).pos = (*it).pos + 1
+        }
+        if (*it).pos >= rs.rs_count(&(*it).rs) {
+            (*it).state = 3
+            return false
+        }
+        let out: *mut rc.Val = (*it).out as *mut rc.Val
+        var i: usize = 0
+        while i < (*it).nout {
+            *(out + i) = rc.val_null()
+            i = i + 1
+        }
+        try rs.rs_get(&(*it).rs, (*it).pos, out, (*it).nout)
+        (*it).pos = (*it).pos + 1
+        (*it).emitted = (*it).emitted + 1
+        return true
+    }
+    return false
+}
+
+// ------------------------------------------------------ materialising run
+fn sort_if_needed(it: *mut SelIter) -> DbError!bool {
+    if (*it).nokeys > 0 {
+        try rs.rs_sort(&(*it).rs, (rt.buf_ptr(&(*it).okeys)) as *mut rs.SortKey, (*it).nokeys)
+    }
+    return true
+}
+
+fn run_materialise(it: *mut SelIter) -> DbError!bool {
+    if (*it).has_agg {
+        try run_aggregate(it)
+    } else {
+        let out: *mut rc.Val = (*it).out as *mut rc.Val
+        while true {
+            let ok: bool = try join_next(it)
+            if !ok {
+                break
+            }
+            try project(it)
+            try rs.rs_add(&(*it).rs, out, (*it).nout)
+        }
+    }
+    if (*it).distinct {
+        try rs.rs_dedupe(&(*it).rs, (*it).ncols)
+    }
+    try sort_if_needed(it)
+    return true
+}
+
+fn acc_init(a: *mut Acc, kind: u32) {
+    (*a).kind = kind
+    (*a).cnt = 0
+    (*a).isum = 0
+    (*a).fsum = 0.0
+    (*a).approx = false
+    (*a).ovfl = false
+    (*a).has = false
+    (*a).best = rc.val_null()
+    rt.buf_clear(&(*a).cat)
+}
+
+fn acc_update(a: *mut Acc, v: *mut rc.Val, star: bool, sep_p: u64, sep_n: usize, has_sep: bool, ga: *mut ar.Arena) {
+    let f: u32 = (*a).kind
+    if f == ex.F_COUNT {
+        if star || (*v).t != 0 {
+            (*a).cnt = (*a).cnt + 1
+        }
+        return
+    }
+    if (*v).t == 0 {
+        return
+    }
+    if f == ex.F_SUM || f == ex.F_TOTAL || f == ex.F_AVG {
+        (*a).cnt = (*a).cnt + 1
+        if (*v).t == 1 {
+            let x: i64 = (*v).i
+            let s: i64 = (*a).isum +% x
+            if ((((*a).isum ^ s) & (x ^ s)) < 0) {
+                (*a).ovfl = true
+            }
+            (*a).isum = s
+            (*a).fsum = (*a).fsum + (x as f64)
+        } else {
+            (*a).approx = true
+            (*a).fsum = (*a).fsum + vl.val_to_real(v)
+        }
+        return
+    }
+    if f == ex.F_MIN_A || f == ex.F_MAX_A {
+        if !(*a).has {
+            (*a).best = *v
+            if (*v).t == 3 || (*v).t == 4 {
+                (*a).best.p = ar.arena_copy(ga, (*v).p, (*v).n)
+            }
+            (*a).has = true
+            return
+        }
+        let c: i64 = vl.sql_compare(v, &(*a).best, 0)
+        if (f == ex.F_MIN_A && c < 0) || (f == ex.F_MAX_A && c > 0) {
+            (*a).best = *v
+            if (*v).t == 3 || (*v).t == 4 {
+                (*a).best.p = ar.arena_copy(ga, (*v).p, (*v).n)
+            }
+        }
+        return
+    }
+    if f == ex.F_GROUP_CONCAT {
+        if (*a).has {
+            if has_sep {
+                rt.buf_push_bytes(&(*a).cat, sep_p, sep_n)
+            } else {
+                rt.buf_push(&(*a).cat, 44 as u8)
+            }
+        }
+        vl.val_text_into(v, &(*a).cat)
+        (*a).has = true
+        return
+    }
+}
+
+fn acc_result(a: *mut Acc, ga: *mut ar.Arena) -> DbError!rc.Val {
+    let f: u32 = (*a).kind
+    if f == ex.F_COUNT {
+        return rc.val_int((*a).cnt)
+    }
+    if f == ex.F_SUM {
+        if (*a).cnt == 0 {
+            return rc.val_null()
+        }
+        if (*a).approx {
+            return rc.val_real((*a).fsum)
+        }
+        if (*a).ovfl {
+            return dberr.fail(DbError::Sql, "integer overflow")
+        }
+        return rc.val_int((*a).isum)
+    }
+    if f == ex.F_TOTAL {
+        return rc.val_real((*a).fsum)
+    }
+    if f == ex.F_AVG {
+        if (*a).cnt == 0 {
+            return rc.val_null()
+        }
+        return rc.val_real((*a).fsum / ((*a).cnt as f64))
+    }
+    if f == ex.F_MIN_A || f == ex.F_MAX_A {
+        if !(*a).has {
+            return rc.val_null()
+        }
+        return (*a).best
+    }
+    if f == ex.F_GROUP_CONCAT {
+        if !(*a).has {
+            return rc.val_null()
+        }
+        let p: u64 = ar.arena_copy(ga, rt.buf_ptr(&(*a).cat), rt.buf_len(&(*a).cat))
+        return rc.val_text(p, rt.buf_len(&(*a).cat))
+    }
+    return rc.val_null()
+}
+
+// input record per joined row: [group exprs][aggregate arguments (+separator)][plain columns]
+fn run_aggregate(it: *mut SelIter) -> DbError!bool {
+    let G: usize = (*it).ngroup
+    let A: usize = (*it).nagg
+    let B: usize = (*it).nbare
+    // columns of the input record
+    let argcols: usize = 2 * A
+    let total: usize = G + argcols + B
+    var input: rs.RowSet = rs.rs_new()
+    var vals: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&vals, (total + 4) * 40)
+    let vp: *mut rc.Val = (rt.buf_ptr(&vals)) as *mut rc.Val
+    let cx: *mut ex.Ctx = &(*it).cx
+    // ---- collect
+    while true {
+        let ok: bool = try join_next(it)
+        if !ok {
+            break
+        }
+        var c: usize = 0
+        while c < G {
+            *(vp + c) = try ex.eval(cx, buf_i32(&(*it).group, c))
+            c = c + 1
+        }
+        var k: usize = 0
+        while k < A {
+            let an: *mut ax.Node = ax.ast_n((*it).ast, buf_i32(&(*it).aggs, k))
+            var arg: rc.Val = rc.val_int(1)
+            var sep: rc.Val = rc.val_null()
+            if ((*an).flag & 2) == 0 && (*an).a >= 0 {
+                arg = try ex.eval(cx, (*an).a)
+                let a2: i32 = (*ax.ast_n((*it).ast, (*an).a)).next
+                if a2 >= 0 {
+                    sep = try ex.eval(cx, a2)
+                }
+            }
+            *(vp + G + 2 * k) = arg
+            *(vp + G + 2 * k + 1) = sep
+            k = k + 1
+        }
+        var b: usize = 0
+        while b < B {
+            *(vp + G + argcols + b) = try ex.eval(cx, buf_i32(&(*it).bare, b))
+            b = b + 1
+        }
+        try rs.rs_add(&input, vp, total)
+        ar.arena_reset(&(*it).tmp)
+    }
+    // ---- sort by the group key
+    if G > 0 {
+        var keys: rt.Buf = rt.buf_new()
+        rt.buf_reserve(&keys, G * sz_of_sortkey2() + 8)
+        var c2: usize = 0
+        while c2 < G {
+            let sk: *mut rs.SortKey = ((rt.buf_ptr(&keys)) as *mut rs.SortKey) + c2
+            *sk = rs.SortKey { col: c2, desc: false, nulls: 0, coll: 0 }
+            c2 = c2 + 1
+        }
+        try rs.rs_sort(&input, (rt.buf_ptr(&keys)) as *mut rs.SortKey, G)
+        rt.buf_free(&keys)
+    }
+    // ---- one pass over the groups
+    var accs: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&accs, (A + 1) * sz_of_acc())
+    var aggres: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&aggres, (A + 1) * 40)
+    var barev: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&barev, (B + 1) * 40)
+    var dsets: [rs.RowSet; 16] = [rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new(),
+        rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new(), rs.rs_new()]
+    var k0: usize = 0
+    while k0 < A {
+        let a: *mut Acc = ((rt.buf_ptr(&accs)) as *mut Acc) + k0
+        (*a).cat = rt.buf_new()
+        acc_init(a, (*ax.ast_n((*it).ast, buf_i32(&(*it).aggs, k0))).op)
+        k0 = k0 + 1
+    }
+    let n: usize = rs.rs_count(&input)
+    var i: usize = 0
+    var first_pass: bool = true
+    let out: *mut rc.Val = (*it).out as *mut rc.Val
+    var rowv: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&rowv, (total + 4) * 40)
+    let rv: *mut rc.Val = (rt.buf_ptr(&rowv)) as *mut rc.Val
+    while i < n || (first_pass && n == 0 && G == 0) {
+        first_pass = false
+        let start: usize = i
+        // the group's rows: [start, end)
+        var end: usize = start
+        if n > 0 {
+            end = start + 1
+            if G > 0 {
+                while end < n {
+                    var same: bool = true
+                    var c3: usize = 0
+                    while c3 < G && same {
+                        let x: rc.Val = try rs.rs_column(&input, start, c3)
+                        let y: rc.Val = try rs.rs_column(&input, end, c3)
+                        var xx: rc.Val = x
+                        var yy: rc.Val = y
+                        if rc.val_compare(&xx, &yy) != 0 {
+                            same = false
+                        }
+                        c3 = c3 + 1
+                    }
+                    if !same {
+                        break
+                    }
+                    end = end + 1
+                }
+            } else {
+                end = n
+            }
+        }
+        ar.arena_reset(&(*it).garena)
+        var q: usize = 0
+        while q < A {
+            let a: *mut Acc = ((rt.buf_ptr(&accs)) as *mut Acc) + q
+            acc_init(a, (*a).kind)
+            rs.rs_clear(&dsets[q])
+            q = q + 1
+        }
+        var bv: *mut rc.Val = (rt.buf_ptr(&barev)) as *mut rc.Val
+        var z: usize = 0
+        while z < B {
+            *(bv + z) = rc.val_null()
+            z = z + 1
+        }
+        var r: usize = start
+        while r < end {
+            let got: usize = try rs.rs_get(&input, r, rv, total)
+            var kk: usize = 0
+            while kk < A {
+                let a: *mut Acc = ((rt.buf_ptr(&accs)) as *mut Acc) + kk
+                let an: *mut ax.Node = ax.ast_n((*it).ast, buf_i32(&(*it).aggs, kk))
+                let star: bool = ((*an).flag & 2) != 0
+                var argv: *mut rc.Val = rv + (G + 2 * kk)
+                var sepv: *mut rc.Val = rv + (G + 2 * kk + 1)
+                if (*an).flag == 1 && !star {
+                    // DISTINCT: collect, add later
+                    if (*argv).t != 0 {
+                        try rs.rs_add(&dsets[kk], argv, 1)
+                    }
+                } else {
+                    var hs: bool = (*sepv).t != 0
+                    acc_update(a, argv, star, (*sepv).p, (*sepv).n, hs, &(*it).garena)
+                }
+                kk = kk + 1
+            }
+            if r == start {
+                var b2: usize = 0
+                while b2 < B {
+                    var v: rc.Val = *(rv + (G + argcols + b2))
+                    if v.t == 3 || v.t == 4 {
+                        v.p = ar.arena_copy(&(*it).garena, v.p, v.n)
+                    }
+                    *(bv + b2) = v
+                    b2 = b2 + 1
+                }
+            }
+            r = r + 1
+        }
+        // DISTINCT aggregates
+        var d: usize = 0
+        while d < A {
+            let an2: *mut ax.Node = ax.ast_n((*it).ast, buf_i32(&(*it).aggs, d))
+            if (*an2).flag == 1 && ((*an2).flag & 2) == 0 {
+                try rs.rs_dedupe(&dsets[d], 1)
+                let a: *mut Acc = ((rt.buf_ptr(&accs)) as *mut Acc) + d
+                var m: usize = 0
+                var tmpv: [rc.Val; 1] = [rc.val_null()]
+                while m < rs.rs_count(&dsets[d]) {
+                    try rs.rs_get(&dsets[d], m, &tmpv[0], 1)
+                    acc_update(a, &tmpv[0], false, 0, 0, false, &(*it).garena)
+                    m = m + 1
+                }
+            }
+            d = d + 1
+        }
+        // results
+        var ares: *mut rc.Val = (rt.buf_ptr(&aggres)) as *mut rc.Val
+        var f: usize = 0
+        while f < A {
+            let a: *mut Acc = ((rt.buf_ptr(&accs)) as *mut Acc) + f
+            *(ares + f) = try acc_result(a, &(*it).garena)
+            f = f + 1
+        }
+        (*it).cx.agg = rt.buf_ptr(&aggres)
+        (*it).cx.bare = rt.buf_ptr(&barev)
+        var keep: bool = true
+        if (*it).having >= 0 {
+            let t: i64 = try ex.eval_truth(cx, (*it).having)
+            keep = t == 1
+        }
+        if keep {
+            try project(it)
+            try rs.rs_add(&(*it).rs, out, (*it).nout)
+        }
+        (*it).cx.agg = 0
+        (*it).cx.bare = 0
+        ar.arena_reset(&(*it).tmp)
+        if n == 0 {
+            break
+        }
+        i = end
+    }
+    var fa: usize = 0
+    while fa < A {
+        let fap: *mut Acc = ((rt.buf_ptr(&accs)) as *mut Acc) + fa
+        rt.buf_free(&(*fap).cat)
+        fa = fa + 1
+    }
+    rs.rs_free(&input)
+    rt.buf_free(&vals)
+    rt.buf_free(&accs)
+    rt.buf_free(&aggres)
+    rt.buf_free(&barev)
+    rt.buf_free(&rowv)
+    var fr: usize = 0
+    while fr < 16 {
+        rs.rs_free(&dsets[fr])
+        fr = fr + 1
+    }
+    return true
+}
+
+fn run_compound(it: *mut SelIter) -> DbError!bool {
+    let ncols: usize = (*it).ncols
+    var acc: rs.RowSet = rs.rs_new()
+    var part: rs.RowSet = rs.rs_new()
+    var c: usize = 0
+    while c < (*it).ncore {
+        let core: *mut SelIter = rt.ld64(rt.buf_ptr(&(*it).cores), c) as *mut SelIter
+        (*core).cx.parent = 0 as *mut ex.Ctx
+        if c == 0 {
+            try drain_into(core, &acc, ncols)
+        } else {
+            let op: u32 = buf_i32(&(*it).core_ops, c) as u32
+            try drain_into(core, &part, ncols)
+            if op == ax.CO_UNION_ALL {
+                var i: usize = 0
+                var v: rt.Buf = rt.buf_new()
+                rt.buf_reserve(&v, ncols * 40 + 8)
+                while i < rs.rs_count(&part) {
+                    try rs.rs_get(&part, i, (rt.buf_ptr(&v)) as *mut rc.Val, ncols)
+                    try rs.rs_add(&acc, (rt.buf_ptr(&v)) as *mut rc.Val, ncols)
+                    i = i + 1
+                }
+                rt.buf_free(&v)
+            } else if op == ax.CO_UNION {
+                var i: usize = 0
+                var v: rt.Buf = rt.buf_new()
+                rt.buf_reserve(&v, ncols * 40 + 8)
+                while i < rs.rs_count(&part) {
+                    try rs.rs_get(&part, i, (rt.buf_ptr(&v)) as *mut rc.Val, ncols)
+                    try rs.rs_add(&acc, (rt.buf_ptr(&v)) as *mut rc.Val, ncols)
+                    i = i + 1
+                }
+                rt.buf_free(&v)
+                try rs.rs_dedupe(&acc, ncols)
+            } else if op == ax.CO_INTERSECT {
+                try rs.rs_remove_rows_not_in(&acc, &part, ncols, true)
+                try rs.rs_dedupe(&acc, ncols)
+            } else {
+                try rs.rs_remove_rows_not_in(&acc, &part, ncols, false)
+                try rs.rs_dedupe(&acc, ncols)
+            }
+        }
+        c = c + 1
+    }
+    // the result becomes the iterator's rowset, sorted
+    rs.rs_clear(&(*it).rs)
+    var i2: usize = 0
+    var v2: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&v2, ncols * 40 + 8)
+    while i2 < rs.rs_count(&acc) {
+        try rs.rs_get(&acc, i2, (rt.buf_ptr(&v2)) as *mut rc.Val, ncols)
+        try rs.rs_add(&(*it).rs, (rt.buf_ptr(&v2)) as *mut rc.Val, ncols)
+        i2 = i2 + 1
+    }
+    rt.buf_free(&v2)
+    rs.rs_free(&acc)
+    rs.rs_free(&part)
+    try sort_if_needed(it)
+    return true
+}
+
+// --------------------------------------------------------- sub-select hook
+// (cx, node, out Val) -> 0 or an error number
+fn eval_sub(cxa: u64, nda: u64, outa: u64) -> i64 {
+    let cx: *mut ex.Ctx = cxa as *mut ex.Ctx
+    let nd: *mut ax.Node = nda as *mut ax.Node
+    let r: DbError!bool = eval_sub_inner(cx, nd, outa as *mut rc.Val)
+    let ok: bool = r catch false
+    if ok {
+        return 0
+    }
+    // the error code: the kind is recovered from the message holder
+    return dberr_code_of(r)
+}
+
+fn dberr_code_of(r: DbError!bool) -> i64 {
+    last_code = 18
+    let tmp: bool = r catch | e | (code_set(e))
+    return last_code
+}
+
+static mut last_code: i64 = 18
+
+fn code_set(e: DbError) -> bool {
+    last_code = dberr.to_code(e)
+    return false
+}
+
+fn eval_sub_inner(cx: *mut ex.Ctx, nd: *mut ax.Node, out: *mut rc.Val) -> DbError!bool {
+    let stmt: *mut dc.Stmt = (*cx).stmt as *mut dc.Stmt
+    let idx: i32 = (*nd).d
+    if idx < 0 {
+        return dberr.fail(DbError::Misuse, "sub-select was not compiled")
+    }
+    let sub: *mut SelIter = rt.ld64(rt.buf_ptr(&(*stmt).subs), idx as usize) as *mut SelIter
+    let k: u32 = (*nd).kind
+    if k == ax.N_SUBQ {
+        if (*sub).cached && !(*sub).correlated {
+            *out = (*sub).cache_val
+            return true
+        }
+        (*sub).cx.parent = cx
+        try sel_start(sub)
+        var got: bool = try sel_next(sub)
+        var v: rc.Val = rc.val_null()
+        if got {
+            v = *((*sub).out as *mut rc.Val)
+            if v.t == 3 || v.t == 4 {
+                v.p = ar.arena_copy(&(*stmt).sub_arena, v.p, v.n)
+            }
+        }
+        sel_close(sub)
+        if !(*sub).correlated {
+            (*sub).cached = true
+            (*sub).cache_val = v
+        }
+        if (*sub).correlated {
+            // the arena of the statement keeps growing for a correlated scalar: reuse per call
+        }
+        *out = v
+        return true
+    }
+    if k == ax.N_EXISTS {
+        if (*sub).cached && !(*sub).correlated {
+            *out = (*sub).cache_val
+            return true
+        }
+        (*sub).cx.parent = cx
+        try sel_start(sub)
+        let got2: bool = try sel_next(sub)
+        sel_close(sub)
+        var r: rc.Val = rc.val_int(0)
+        if got2 {
+            r = rc.val_int(1)
+        }
+        if !(*sub).correlated {
+            (*sub).cached = true
+            (*sub).cache_val = r
+        }
+        *out = r
+        return true
+    }
+    // x [NOT] IN (SELECT ..)
+    let x: rc.Val = try ex.eval(cx, (*nd).a)
+    if !((*sub).cached && !(*sub).correlated) {
+        (*sub).cx.parent = cx
+        rs.rs_clear(&(*sub).cache_rs)
+        try drain_into(sub, &(*sub).cache_rs, 1)
+        sel_close(sub)
+        if !(*sub).correlated {
+            (*sub).cached = true
+        }
+    }
+    let cnt: usize = rs.rs_count(&(*sub).cache_rs)
+    var neg: bool = (*nd).flag == 1
+    if cnt == 0 {
+        if neg {
+            *out = rc.val_int(1)
+        } else {
+            *out = rc.val_int(0)
+        }
+        return true
+    }
+    if x.t == 0 {
+        *out = rc.val_null()
+        return true
+    }
+    var saw_null: bool = false
+    var i: usize = 0
+    let aff: i64 = ex.expr_aff(cx, (*nd).a)
+    let coll: u32 = ex.expr_coll(cx, (*nd).a)
+    var tmpv: [rc.Val; 1] = [rc.val_null()]
+    while i < cnt {
+        try rs.rs_get(&(*sub).cache_rs, i, &tmpv[0], 1)
+        if tmpv[0].t == 0 {
+            saw_null = true
+        } else {
+            var xx: rc.Val = x
+            var c: i64 = 0
+            ex.compare_aff(cx, &xx, aff, &tmpv[0], -1, coll, &c)
+            if c == 0 {
+                if neg {
+                    *out = rc.val_int(0)
+                } else {
+                    *out = rc.val_int(1)
+                }
+                return true
+            }
+        }
+        i = i + 1
+    }
+    if saw_null {
+        *out = rc.val_null()
+        return true
+    }
+    if neg {
+        *out = rc.val_int(1)
+    } else {
+        *out = rc.val_int(0)
+    }
+    return true
+}

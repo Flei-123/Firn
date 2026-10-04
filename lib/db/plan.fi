@@ -1,0 +1,982 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/plan.fi -- one FROM item at run time: how its rows are found and loaded.
+//
+// A `Source` is a table (or a materialised sub-select) in a join. The planner picks
+// ONE way to walk it for the current rows of the outer sources:
+//   SCAN_FULL         every row in rowid order
+//   SCAN_ROWID_EQ     rowid = expression
+//   SCAN_ROWID_RANGE  rowid between bounds
+//   SCAN_INDEX        an index: equality on its first n_eq columns, optionally a range
+//                     on the next one
+//   SCAN_SUB          the rows of a materialised sub-select
+//   SCAN_NONE         no FROM: one empty row
+// The conditions that were used to narrow the walk are STILL tested as filters, so
+// a mistake in the narrowing can only cost speed, never a wrong row -- except one
+// that skips rows, which is why an index is used only when the comparison of the
+// query and the order of the index agree (affinity and collation, `aff_ok`).
+
+import std.rt
+import db.dberr
+import db.util as ut
+import db.record as rc
+import db.arena as ar
+import db.value as vl
+import db.dbcore as dc
+import db.pager as pgr
+import db.btree as bx
+import db.sqlast as ax
+import db.expr as ex
+import db.rowset as rs
+
+export {
+    Source, source_new, src_reset, src_free, src_open, src_advance, src_load_row, src_clear_row,
+    plan_level, split_and, max_level_of, mark_used, mark_all_used, find_rowid_col,
+    SCAN_FULL, SCAN_ROWID_EQ, SCAN_ROWID_RANGE, SCAN_INDEX, SCAN_SUB, SCAN_NONE,
+    MAX_FILT,
+}
+
+const SCAN_FULL: u32 = 0
+const SCAN_ROWID_EQ: u32 = 1
+const SCAN_ROWID_RANGE: u32 = 2
+const SCAN_INDEX: u32 = 3
+const SCAN_SUB: u32 = 4
+const SCAN_NONE: u32 = 5
+
+const MAX_FILT: usize = 24
+
+struct Source {
+    tbl: i32, // schema table (-1: sub-select or none)
+    join: u32,
+    on: i32,
+    mode: u32,
+    index: i32,
+    n_eq: usize,
+    eq: [i32; 8],
+    has_lo: bool,
+    lo: i32,
+    lo_incl: bool,
+    has_hi: bool,
+    hi: i32,
+    hi_incl: bool,
+    nfilt: usize,
+    filt: [i32; 24],
+    npost: usize,
+    post: [i32; 8],
+    // run time
+    cur: bx.Cursor,
+    icur: bx.Cursor,
+    fresh: bool, // advance() has not been called since open()
+    done: bool,
+    empty: bool, // a NULL key: nothing can match
+    rowid: i64,
+    vals: u64, // ncols Vals
+    ncols: usize,
+    used: [u64; 32],
+    nused_max: usize, // decode up to this many columns
+    arena: ar.Arena, // text and blobs of the current row
+    karena: ar.Arena, // the values of the seek keys
+    kv_lo: [rc.Val; 9],
+    kv_hi: [rc.Val; 9],
+    lok: rc.UKey,
+    hik: rc.UKey,
+    seek_gt: bool,
+    sub: u64, // RowSet address for SCAN_SUB
+    sub_pos: usize,
+    state: u32, // join state: 0 needs open, 1 scanning, 2 null extension pending, 3 exhausted
+    matched: bool,
+    rowid_col: i32,
+    ncols_table: usize,
+}
+
+fn val_blank() -> rc.Val {
+    return rc.val_null()
+}
+
+fn source_new() -> Source {
+    return Source { tbl: -1, join: 0, on: -1, mode: SCAN_NONE, index: -1, n_eq: 0, eq: [-1; 8], has_lo: false, lo: -1,
+        lo_incl: false, has_hi: false, hi: -1, hi_incl: false, nfilt: 0, filt: [-1; 24], npost: 0, post: [-1; 8],
+        cur: bx.cur_new(0, false), icur: bx.cur_new(0, true), fresh: true, done: false, empty: false, rowid: 0,
+        vals: 0, ncols: 0, used: [0; 32], nused_max: 0, arena: ar.arena_new(), karena: ar.arena_new(),
+        kv_lo: [val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank()],
+        kv_hi: [val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank(), val_blank()],
+        lok: rc.ukey_new(0, 0, 0), hik: rc.ukey_new(0, 0, 0), seek_gt: false, sub: 0, sub_pos: 0, state: 0,
+        matched: false, rowid_col: -1, ncols_table: 0 }
+}
+
+fn src_reset(s: *mut Source) {
+    ar.arena_reset(&(*s).arena)
+    ar.arena_reset(&(*s).karena)
+    (*s).fresh = true
+    (*s).done = false
+    (*s).state = 0
+    (*s).matched = false
+}
+
+fn src_free(s: *mut Source) {
+    ar.arena_free(&(*s).arena)
+    ar.arena_free(&(*s).karena)
+    if (*s).vals != 0 {
+        rt.heap_free((*s).vals, (*s).ncols * 40)
+        (*s).vals = 0
+    }
+}
+
+// ---------------------------------------------------------------- analysis
+fn find_rowid_col(t: *mut dc.Table) -> i32 {
+    return (*t).rowid_col
+}
+
+// the highest source index an expression refers to (depth 0), -1 if none
+fn max_level_of(ast: *mut ax.Ast, n: i32) -> i32 {
+    if n < 0 {
+        return -1
+    }
+    let nd: *mut ax.Node = ax.ast_n(ast, n)
+    let k: u32 = (*nd).kind
+    if k == ax.N_COL {
+        if (*nd).d == 0 {
+            return (*nd).b
+        }
+        return -1
+    }
+    if k == ax.N_INT || k == ax.N_REAL || k == ax.N_STR || k == ax.N_BLOB || k == ax.N_NULL || k == ax.N_PARAM {
+        return -1
+    }
+    var m: i32 = -1
+    if k == ax.N_FUNC {
+        var a: i32 = (*nd).a
+        while a >= 0 {
+            let l: i32 = max_level_of(ast, a)
+            if l > m {
+                m = l
+            }
+            a = (*ax.ast_n(ast, a)).next
+        }
+        return m
+    }
+    if k == ax.N_IN_LIST {
+        var b: i32 = (*nd).b
+        while b >= 0 {
+            let l: i32 = max_level_of(ast, b)
+            if l > m {
+                m = l
+            }
+            b = (*ax.ast_n(ast, b)).next
+        }
+        let la: i32 = max_level_of(ast, (*nd).a)
+        if la > m {
+            m = la
+        }
+        return m
+    }
+    if k == ax.N_CASE {
+        var w: i32 = (*nd).b
+        while w >= 0 {
+            let l1: i32 = max_level_of(ast, (*ax.ast_n(ast, w)).a)
+            let l2: i32 = max_level_of(ast, (*ax.ast_n(ast, w)).b)
+            if l1 > m {
+                m = l1
+            }
+            if l2 > m {
+                m = l2
+            }
+            w = (*ax.ast_n(ast, w)).next
+        }
+        let l3: i32 = max_level_of(ast, (*nd).a)
+        let l4: i32 = max_level_of(ast, (*nd).c)
+        if l3 > m {
+            m = l3
+        }
+        if l4 > m {
+            m = l4
+        }
+        return m
+    }
+    if k == ax.N_IN_SELECT {
+        return max_level_of(ast, (*nd).a)
+    }
+    if k == ax.N_EXISTS || k == ax.N_SUBQ {
+        // a sub-select may use any outer column: treat it as needing everything
+        return 7
+    }
+    let l5: i32 = max_level_of(ast, (*nd).a)
+    let l6: i32 = max_level_of(ast, (*nd).b)
+    let l7: i32 = max_level_of(ast, (*nd).c)
+    m = l5
+    if l6 > m {
+        m = l6
+    }
+    if l7 > m {
+        m = l7
+    }
+    return m
+}
+
+// the AND-chain of an expression as a list of conjuncts
+fn split_and(ast: *mut ax.Ast, n: i32, out: *mut i32, count: *mut usize, cap: usize) {
+    if n < 0 {
+        return
+    }
+    let nd: *mut ax.Node = ax.ast_n(ast, n)
+    if (*nd).kind == ax.N_BINARY && (*nd).op == ax.OP_AND {
+        split_and(ast, (*nd).a, out, count, cap)
+        split_and(ast, (*nd).b, out, count, cap)
+        return
+    }
+    if *count < cap {
+        *(out + *count) = n
+        *count = *count + 1
+    }
+}
+
+// marks the columns an expression reads, in the sources' bitmaps
+fn mark_used(ast: *mut ax.Ast, n: i32, srcs: *mut Source, nsrc: usize) {
+    if n < 0 {
+        return
+    }
+    let nd: *mut ax.Node = ax.ast_n(ast, n)
+    let k: u32 = (*nd).kind
+    if k == ax.N_COL {
+        if (*nd).d == 0 && (*nd).c >= 0 && ((*nd).b as usize) < nsrc {
+            let s: *mut Source = srcs + ((*nd).b as usize)
+            let c: usize = (*nd).c as usize
+            if c < 2048 {
+                (*s).used[c / 64] = (*s).used[c / 64] | (1 << ((c % 64) as u64))
+                if c + 1 > (*s).nused_max {
+                    (*s).nused_max = c + 1
+                }
+            }
+        }
+        return
+    }
+    if k == ax.N_FUNC {
+        var a: i32 = (*nd).a
+        while a >= 0 {
+            mark_used(ast, a, srcs, nsrc)
+            a = (*ax.ast_n(ast, a)).next
+        }
+        return
+    }
+    if k == ax.N_IN_LIST {
+        mark_used(ast, (*nd).a, srcs, nsrc)
+        var b: i32 = (*nd).b
+        while b >= 0 {
+            mark_used(ast, b, srcs, nsrc)
+            b = (*ax.ast_n(ast, b)).next
+        }
+        return
+    }
+    if k == ax.N_CASE {
+        mark_used(ast, (*nd).a, srcs, nsrc)
+        var w: i32 = (*nd).b
+        while w >= 0 {
+            mark_used(ast, (*ax.ast_n(ast, w)).a, srcs, nsrc)
+            mark_used(ast, (*ax.ast_n(ast, w)).b, srcs, nsrc)
+            w = (*ax.ast_n(ast, w)).next
+        }
+        mark_used(ast, (*nd).c, srcs, nsrc)
+        return
+    }
+    if k == ax.N_IN_SELECT {
+        mark_used(ast, (*nd).a, srcs, nsrc)
+        return
+    }
+    if k == ax.N_EXISTS || k == ax.N_SUBQ {
+        return
+    }
+    mark_used(ast, (*nd).a, srcs, nsrc)
+    mark_used(ast, (*nd).b, srcs, nsrc)
+    mark_used(ast, (*nd).c, srcs, nsrc)
+}
+
+fn mark_all_used(s: *mut Source, ncols: usize) {
+    var i: usize = 0
+    while i < 32 {
+        (*s).used[i] = ~(0 as u64)
+        i = i + 1
+    }
+    (*s).nused_max = ncols
+}
+
+// ----------------------------------------------------------------- planning
+fn is_numeric(a: i64) -> bool {
+    return a == 2 || a == 3 || a == 4
+}
+
+fn is_none(a: i64) -> bool {
+    return a == -1 || a == 0
+}
+
+// may an index on a column of affinity `col` answer a comparison with an
+// expression of affinity `other`? (the comparison must convert the OTHER side only)
+fn aff_ok(col: i64, other: i64) -> bool {
+    if is_numeric(col) {
+        return true
+    }
+    if col == 1 {
+        return !is_numeric(other)
+    }
+    return is_none(other)
+}
+
+// Chooses how to walk source `level`. `conj`/`nconj`: the conjuncts that may narrow it.
+fn plan_level(cx: *mut ex.Ctx, s: *mut Source, level: usize, conj: *mut i32, nconj: usize) -> DbError!bool {
+    (*s).mode = SCAN_FULL
+    (*s).index = -1
+    (*s).n_eq = 0
+    (*s).has_lo = false
+    (*s).has_hi = false
+    if (*s).tbl < 0 {
+        return true
+    }
+    let db: *mut dc.Db = (*cx).db
+    let sc: *mut dc.Schema = &(*db).schema
+    let t: *mut dc.Table = dc.table_at(sc, (*s).tbl as usize)
+    let ast: *mut ax.Ast = (*cx).ast
+    // candidate predicates per column (columns below 64 only); -1 rowid is slot 64
+    var eqc: [i32; 65] = [-1; 65]
+    var loc: [i32; 65] = [-1; 65]
+    var hic: [i32; 65] = [-1; 65]
+    var lo_incl: [bool; 65] = [false; 65]
+    var hi_incl: [bool; 65] = [false; 65]
+    var ci: usize = 0
+    while ci < nconj {
+        let n: i32 = *(conj + ci)
+        ci = ci + 1
+        let nd: *mut ax.Node = ax.ast_n(ast, n)
+        if (*nd).kind == ax.N_BETWEEN && (*nd).flag == 0 {
+            // x BETWEEN lo AND hi == x >= lo AND x <= hi
+            let xn: *mut ax.Node = ax.ast_n(ast, (*nd).a)
+            if (*xn).kind == ax.N_COL && (*xn).d == 0 && (*xn).b == (level as i32) {
+                var slot: usize = 64
+                if (*xn).c >= 0 {
+                    slot = (*xn).c as usize
+                }
+                if slot <= 64 && max_level_of(ast, (*nd).b) < (level as i32) && max_level_of(ast, (*nd).c) < (level as i32)
+                    && ex.expr_coll(cx, (*nd).a) == 0 {
+                    var okc: i64 = -1
+                    if (*xn).c >= 0 {
+                        let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + slot
+                        okc = (*col).aff
+                    } else {
+                        okc = 3
+                    }
+                    if aff_ok(okc, ex.expr_aff(cx, (*nd).b)) && aff_ok(okc, ex.expr_aff(cx, (*nd).c)) {
+                        if loc[slot] < 0 {
+                            loc[slot] = (*nd).b
+                            lo_incl[slot] = true
+                        }
+                        if hic[slot] < 0 {
+                            hic[slot] = (*nd).c
+                            hi_incl[slot] = true
+                        }
+                    }
+                }
+            }
+            continue
+        }
+        if (*nd).kind != ax.N_BINARY {
+            continue
+        }
+        let op: u32 = (*nd).op
+        if !(op == ax.OP_EQ || op == ax.OP_LT || op == ax.OP_LE || op == ax.OP_GT || op == ax.OP_GE) {
+            continue
+        }
+        var colnode: i32 = -1
+        var other: i32 = -1
+        var eop: u32 = op
+        let an: *mut ax.Node = ax.ast_n(ast, (*nd).a)
+        let bn: *mut ax.Node = ax.ast_n(ast, (*nd).b)
+        if (*an).kind == ax.N_COL && (*an).d == 0 && (*an).b == (level as i32)
+            && max_level_of(ast, (*nd).b) < (level as i32) {
+            colnode = (*nd).a
+            other = (*nd).b
+        } else if (*bn).kind == ax.N_COL && (*bn).d == 0 && (*bn).b == (level as i32)
+            && max_level_of(ast, (*nd).a) < (level as i32) {
+            colnode = (*nd).b
+            other = (*nd).a
+            // flip: E < col  means  col > E
+            if op == ax.OP_LT { eop = ax.OP_GT }
+            else if op == ax.OP_LE { eop = ax.OP_GE }
+            else if op == ax.OP_GT { eop = ax.OP_LT }
+            else if op == ax.OP_GE { eop = ax.OP_LE }
+        } else {
+            continue
+        }
+        let cn: *mut ax.Node = ax.ast_n(ast, colnode)
+        var slot2: usize = 64
+        if (*cn).c >= 0 {
+            slot2 = (*cn).c as usize
+        }
+        if slot2 > 64 {
+            continue
+        }
+        if ex.expr_coll(cx, (*nd).a) != 0 || ex.expr_coll(cx, (*nd).b) != 0 {
+            continue
+        }
+        var caff: i64 = 3
+        if (*cn).c >= 0 {
+            let col2: *mut dc.Column = ((*t).cols as *mut dc.Column) + slot2
+            caff = (*col2).aff
+        }
+        if !aff_ok(caff, ex.expr_aff(cx, other)) {
+            continue
+        }
+        if eop == ax.OP_EQ {
+            if eqc[slot2] < 0 {
+                eqc[slot2] = other
+            }
+        } else if eop == ax.OP_GT || eop == ax.OP_GE {
+            if loc[slot2] < 0 {
+                loc[slot2] = other
+                lo_incl[slot2] = eop == ax.OP_GE
+            }
+        } else {
+            if hic[slot2] < 0 {
+                hic[slot2] = other
+                hi_incl[slot2] = eop == ax.OP_LE
+            }
+        }
+    }
+    // the rowid: the INTEGER PRIMARY KEY column is the rowid too
+    if (*t).rowid_col >= 0 && ((*t).rowid_col as usize) < 64 {
+        let rc2: usize = (*t).rowid_col as usize
+        if eqc[64] < 0 && eqc[rc2] >= 0 {
+            eqc[64] = eqc[rc2]
+        }
+        if loc[64] < 0 && loc[rc2] >= 0 {
+            loc[64] = loc[rc2]
+            lo_incl[64] = lo_incl[rc2]
+        }
+        if hic[64] < 0 && hic[rc2] >= 0 {
+            hic[64] = hic[rc2]
+            hi_incl[64] = hi_incl[rc2]
+        }
+    }
+    if eqc[64] >= 0 {
+        (*s).mode = SCAN_ROWID_EQ
+        (*s).eq[0] = eqc[64]
+        (*s).n_eq = 1
+        return true
+    }
+    var best_score: i64 = 0
+    var best_idx: i32 = -1
+    var best_neq: usize = 0
+    var best_range: bool = false
+    var ixn: usize = dc.schema_index_count(sc)
+    var k: usize = 0
+    while k < ixn {
+        let ix: *mut dc.Index = dc.index_at(sc, k)
+        k = k + 1
+        if (*ix).table != (*s).tbl || (*ix).bad {
+            continue
+        }
+        var neq: usize = 0
+        while neq < (*ix).ncols {
+            let col: i32 = (*ix).cols[neq]
+            if col < 0 || col >= 64 || eqc[col as usize] < 0 {
+                break
+            }
+            neq = neq + 1
+        }
+        var range: bool = false
+        if neq < (*ix).ncols {
+            let col2: i32 = (*ix).cols[neq]
+            if col2 >= 0 && col2 < 64 && ((*ix).desc >> (neq as u64)) & 1 == 0 && (loc[col2 as usize] >= 0 || hic[col2 as usize] >= 0) {
+                range = true
+            }
+        }
+        if neq == 0 && !range {
+            continue
+        }
+        var score: i64 = (neq as i64) * 10 + 20
+        if neq == 0 {
+            score = 10
+        }
+        if range {
+            score = score + 3
+        }
+        if (*ix).unique && neq == (*ix).ncols {
+            score = score + 40
+        }
+        if score > best_score {
+            best_score = score
+            best_idx = (k - 1) as i32
+            best_neq = neq
+            best_range = range
+        }
+    }
+    // a rowid range is worth more than a bare index range, less than an index equality
+    if (loc[64] >= 0 || hic[64] >= 0) && best_score < 25 {
+        (*s).mode = SCAN_ROWID_RANGE
+        if loc[64] >= 0 {
+            (*s).has_lo = true
+            (*s).lo = loc[64]
+            (*s).lo_incl = lo_incl[64]
+        }
+        if hic[64] >= 0 {
+            (*s).has_hi = true
+            (*s).hi = hic[64]
+            (*s).hi_incl = hi_incl[64]
+        }
+        return true
+    }
+    if best_idx >= 0 {
+        let ix2: *mut dc.Index = dc.index_at(sc, best_idx as usize)
+        (*s).mode = SCAN_INDEX
+        (*s).index = best_idx
+        (*s).n_eq = best_neq
+        var q: usize = 0
+        while q < best_neq {
+            (*s).eq[q] = eqc[(*ix2).cols[q] as usize]
+            q = q + 1
+        }
+        if best_range {
+            let col3: usize = (*ix2).cols[best_neq] as usize
+            if loc[col3] >= 0 {
+                (*s).has_lo = true
+                (*s).lo = loc[col3]
+                (*s).lo_incl = lo_incl[col3]
+            }
+            if hic[col3] >= 0 {
+                (*s).has_hi = true
+                (*s).hi = hic[col3]
+                (*s).hi_incl = hi_incl[col3]
+            }
+        }
+        return true
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- running
+// Evaluates a key expression, applies the column affinity and keeps a copy in the key arena.
+fn key_value(cx: *mut ex.Ctx, s: *mut Source, n: i32, aff: i64, out: *mut rc.Val) -> DbError!bool {
+    let v: rc.Val = try ex.eval(cx, n)
+    var w: rc.Val = v
+    if w.t != 0 {
+        vl.apply_affinity(&w, aff, &(*s).karena)
+        if w.t == 3 || w.t == 4 {
+            w.p = ar.arena_copy(&(*s).karena, w.p, w.n)
+        }
+    }
+    *out = w
+    return true
+}
+
+// Prepares the walk for the current rows of the outer sources (called whenever the
+// outer sources moved). The first `src_advance` positions on the first candidate.
+fn src_open(cx: *mut ex.Ctx, s: *mut Source) -> DbError!bool {
+    (*s).fresh = true
+    (*s).done = false
+    (*s).empty = false
+    (*s).sub_pos = 0
+    ar.arena_reset(&(*s).karena)
+    let db: *mut dc.Db = (*cx).db
+    let sc: *mut dc.Schema = &(*db).schema
+    if (*s).mode == SCAN_NONE || (*s).mode == SCAN_SUB || (*s).tbl < 0 {
+        return true
+    }
+    let t: *mut dc.Table = dc.table_at(sc, (*s).tbl as usize)
+    if (*s).mode == SCAN_FULL {
+        (*s).cur = bx.cur_new((*t).root, false)
+        return true
+    }
+    if (*s).mode == SCAN_ROWID_EQ {
+        (*s).cur = bx.cur_new((*t).root, false)
+        var kv: rc.Val = rc.val_null()
+        try key_value(cx, s, (*s).eq[0], 3, &kv)
+        if kv.t != 1 {
+            (*s).empty = true
+            if kv.t == 2 {
+                // a REAL that is a whole number is an integer for the rowid
+                var i: i64 = 0
+                if vl.real_to_int_exact(kv.f, &i) {
+                    (*s).kv_lo[0] = rc.val_int(i)
+                    (*s).empty = false
+                }
+            }
+        } else {
+            (*s).kv_lo[0] = kv
+        }
+        return true
+    }
+    if (*s).mode == SCAN_ROWID_RANGE {
+        (*s).cur = bx.cur_new((*t).root, false)
+        (*s).kv_lo[0] = rc.val_int(vl.int_min())
+        (*s).kv_hi[0] = rc.val_int(9223372036854775807)
+        (*s).seek_gt = false
+        if (*s).has_lo {
+            var kv: rc.Val = rc.val_null()
+            try key_value(cx, s, (*s).lo, 3, &kv)
+            if kv.t == 0 {
+                (*s).empty = true
+            } else if kv.t == 1 {
+                (*s).kv_lo[0] = kv
+            } else if kv.t == 2 {
+                // a fractional bound: >= 2.5 means >= 3, > 2.5 means >= 3
+                var f: f64 = kv.f
+                if f != f {
+                    (*s).empty = true
+                } else if f >= 9223372036854775808.0 {
+                    (*s).empty = true
+                } else if f < -9223372036854775808.0 {
+                } else {
+                    var i: i64 = 0
+                    if vl.real_to_int_exact(f, &i) {
+                        (*s).kv_lo[0] = rc.val_int(i)
+                        (*s).seek_gt = !(*s).lo_incl
+                    } else {
+                        let fl: i64 = f as i64
+                        if f > 0.0 {
+                            (*s).kv_lo[0] = rc.val_int(fl)
+                            (*s).seek_gt = true
+                        } else {
+                            (*s).kv_lo[0] = rc.val_int(fl)
+                            (*s).seek_gt = false
+                        }
+                    }
+                }
+            } else {
+                // a text or blob bound: no integer rowid is above it (blobs/text sort after numbers)
+                (*s).empty = true
+            }
+            if kv.t == 1 {
+                (*s).seek_gt = !(*s).lo_incl
+            }
+        }
+        if (*s).has_hi {
+            var kv2: rc.Val = rc.val_null()
+            try key_value(cx, s, (*s).hi, 3, &kv2)
+            if kv2.t == 0 {
+                (*s).empty = true
+            } else if kv2.t == 1 {
+                (*s).kv_hi[0] = kv2
+                if !(*s).hi_incl {
+                    if kv2.i == vl.int_min() {
+                        (*s).empty = true
+                    } else {
+                        (*s).kv_hi[0] = rc.val_int(kv2.i - 1)
+                    }
+                }
+            } else if kv2.t == 2 {
+                let f2: f64 = kv2.f
+                if f2 != f2 || f2 < -9223372036854775808.0 {
+                    (*s).empty = true
+                } else if f2 >= 9223372036854775808.0 {
+                } else {
+                    var i2: i64 = 0
+                    if vl.real_to_int_exact(f2, &i2) {
+                        if (*s).hi_incl {
+                            (*s).kv_hi[0] = rc.val_int(i2)
+                        } else if i2 == vl.int_min() {
+                            (*s).empty = true
+                        } else {
+                            (*s).kv_hi[0] = rc.val_int(i2 - 1)
+                        }
+                    } else {
+                        var fl2: i64 = f2 as i64
+                        if f2 < 0.0 {
+                            fl2 = fl2 - 1
+                        }
+                        (*s).kv_hi[0] = rc.val_int(fl2)
+                    }
+                }
+            }
+            // a text/blob upper bound: every integer is below it
+        }
+        return true
+    }
+    // SCAN_INDEX
+    let ix: *mut dc.Index = dc.index_at(sc, (*s).index as usize)
+    (*s).icur = bx.cur_new((*ix).root, true)
+    (*s).cur = bx.cur_new((*t).root, false)
+    var q: usize = 0
+    while q < (*s).n_eq {
+        var kv3: rc.Val = rc.val_null()
+        let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + ((*ix).cols[q] as usize)
+        try key_value(cx, s, (*s).eq[q], (*col).aff, &kv3)
+        if kv3.t == 0 {
+            (*s).empty = true
+        }
+        (*s).kv_lo[q] = kv3
+        (*s).kv_hi[q] = kv3
+        q = q + 1
+    }
+    var nlo: usize = (*s).n_eq
+    var nhi: usize = (*s).n_eq
+    (*s).seek_gt = false
+    if (*s).has_lo || (*s).has_hi {
+        let col2: *mut dc.Column = ((*t).cols as *mut dc.Column) + ((*ix).cols[(*s).n_eq] as usize)
+        if (*s).has_lo {
+            var kv4: rc.Val = rc.val_null()
+            try key_value(cx, s, (*s).lo, (*col2).aff, &kv4)
+            if kv4.t == 0 {
+                (*s).empty = true
+            }
+            (*s).kv_lo[(*s).n_eq] = kv4
+            nlo = nlo + 1
+            (*s).seek_gt = !(*s).lo_incl
+        } else {
+            // only an upper bound: start after the NULL entries
+            (*s).kv_lo[(*s).n_eq] = rc.val_null()
+            nlo = nlo + 1
+            (*s).seek_gt = true
+        }
+        if (*s).has_hi {
+            var kv5: rc.Val = rc.val_null()
+            try key_value(cx, s, (*s).hi, (*col2).aff, &kv5)
+            if kv5.t == 0 {
+                (*s).empty = true
+            }
+            (*s).kv_hi[(*s).n_eq] = kv5
+            nhi = nhi + 1
+        }
+    }
+    (*s).lok = rc.ukey_new(((&(*s).kv_lo[0]) as u64), nlo, (*ix).desc)
+    (*s).hik = rc.ukey_new(((&(*s).kv_hi[0]) as u64), nhi, (*ix).desc)
+    return true
+}
+
+// Loads the row at the table cursor (or by rowid) into the source's value array.
+fn src_load_payload(cx: *mut ex.Ctx, s: *mut Source, p: u64, n: usize) -> DbError!bool {
+    let db: *mut dc.Db = (*cx).db
+    let sc: *mut dc.Schema = &(*db).schema
+    let t: *mut dc.Table = dc.table_at(sc, (*s).tbl as usize)
+    let ncols: usize = (*t).ncols
+    if (*s).vals == 0 {
+        (*s).vals = rt.heap_alloc(ncols * 40 + 40)
+        (*s).ncols = ncols
+        if (*s).vals == 0 {
+            return dberr.fail(DbError::NoMemory, "out of memory")
+        }
+    }
+    ar.arena_reset(&(*s).arena)
+    let vals: *mut rc.Val = (*s).vals as *mut rc.Val
+    var want: usize = (*s).nused_max
+    if want > ncols {
+        want = ncols
+    }
+    // the record may be shorter (a column added later) or longer than the table
+    var got: usize = 0
+    if want > 0 {
+        got = try rc.rec_decode(p, n, vals, want)
+    }
+    var i: usize = 0
+    while i < got {
+        let v: *mut rc.Val = vals + i
+        if ((*s).used[i / 64] >> ((i % 64) as u64)) & 1 == 0 {
+            *v = rc.val_null()
+        } else if (*v).t == 3 || (*v).t == 4 {
+            (*v).p = ar.arena_copy(&(*s).arena, (*v).p, (*v).n)
+        } else if (*v).t == 1 {
+            // a whole REAL is stored as an integer: a REAL column reads it back as a REAL
+            let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + i
+            if (*col).aff == 4 {
+                *v = rc.val_real((*v).i as f64)
+            }
+        }
+        i = i + 1
+    }
+    // columns beyond the record: their DEFAULT (ALTER TABLE ADD COLUMN)
+    while i < ncols {
+        let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + i
+        var dv: rc.Val = rc.val_null()
+        if (*col).dflt >= 0 && ((*s).used[i / 64] >> ((i % 64) as u64)) & 1 == 1 {
+            // constant expressions only
+            var scope0: ex.Scope = ex.scope_new()
+            var cx0: ex.Ctx = ex.ctx_new(db, &(*db).schema.ast, &(*s).arena)
+            cx0.scope = &scope0
+            dv = try ex.eval(&cx0, (*col).dflt)
+            if dv.t == 3 || dv.t == 4 {
+                dv.p = ar.arena_copy(&(*s).arena, dv.p, dv.n)
+            }
+        }
+        *(vals + i) = dv
+        i = i + 1
+    }
+    if (*t).rowid_col >= 0 {
+        let rcol: usize = (*t).rowid_col as usize
+        if rcol < ncols {
+            *(vals + rcol) = rc.val_int((*s).rowid)
+        }
+    }
+    return true
+}
+
+// Positions on the next candidate row and loads it. False at the end.
+fn src_advance(cx: *mut ex.Ctx, s: *mut Source) -> DbError!bool {
+    let db: *mut dc.Db = (*cx).db
+    let bt: *mut bx.Bt = &(*db).bt
+    let sc: *mut dc.Schema = &(*db).schema
+    let m: u32 = (*s).mode
+    if (*s).done || (*s).empty {
+        return false
+    }
+    if m == SCAN_NONE {
+        if (*s).fresh {
+            (*s).fresh = false
+            return true
+        }
+        (*s).done = true
+        return false
+    }
+    if m == SCAN_SUB {
+        let r: *mut rs.RowSet = (*s).sub as *mut rs.RowSet
+        if (*s).sub_pos >= rs.rs_count(r) {
+            (*s).done = true
+            return false
+        }
+        if (*s).vals == 0 {
+            (*s).vals = rt.heap_alloc((*s).ncols * 40 + 40)
+        }
+        ar.arena_reset(&(*s).arena)
+        let vals: *mut rc.Val = (*s).vals as *mut rc.Val
+        var k: usize = 0
+        while k < (*s).ncols {
+            *(vals + k) = rc.val_null()
+            k = k + 1
+        }
+        let got: usize = try rs.rs_get(r, (*s).sub_pos, vals, (*s).ncols)
+        var i: usize = 0
+        while i < got {
+            let v: *mut rc.Val = vals + i
+            if (*v).t == 3 || (*v).t == 4 {
+                (*v).p = ar.arena_copy(&(*s).arena, (*v).p, (*v).n)
+            }
+            i = i + 1
+        }
+        (*s).sub_pos = (*s).sub_pos + 1
+        (*s).rowid = (*s).sub_pos as i64
+        return true
+    }
+    let t: *mut dc.Table = dc.table_at(sc, (*s).tbl as usize)
+    var pl: bx.Payload = bx.Payload { p: 0, n: 0 }
+    if m == SCAN_FULL {
+        var ok: bool = false
+        if (*s).fresh {
+            (*s).fresh = false
+            ok = try bx.bt_first(bt, &(*s).cur)
+        } else {
+            ok = try bx.bt_next(bt, &(*s).cur)
+        }
+        if !ok {
+            (*s).done = true
+            return false
+        }
+        (*s).rowid = try bx.bt_rowid(bt, &(*s).cur)
+        pl = try bx.bt_payload(bt, &(*s).cur)
+        try src_load_payload(cx, s, pl.p, pl.n)
+        return true
+    }
+    if m == SCAN_ROWID_EQ {
+        if !(*s).fresh {
+            (*s).done = true
+            return false
+        }
+        (*s).fresh = false
+        let found: bool = try bx.bt_table_find(bt, (*t).root, (*s).kv_lo[0].i, &pl)
+        if !found {
+            (*s).done = true
+            return false
+        }
+        (*s).rowid = (*s).kv_lo[0].i
+        try src_load_payload(cx, s, pl.p, pl.n)
+        return true
+    }
+    if m == SCAN_ROWID_RANGE {
+        var ok2: bool = false
+        if (*s).fresh {
+            (*s).fresh = false
+            var mode: i64 = bx.SEEK_GE
+            if (*s).seek_gt {
+                mode = bx.SEEK_GT
+            }
+            ok2 = try bx.bt_table_seek(bt, &(*s).cur, (*s).kv_lo[0].i, mode)
+        } else {
+            ok2 = try bx.bt_next(bt, &(*s).cur)
+        }
+        if !ok2 {
+            (*s).done = true
+            return false
+        }
+        let rid: i64 = try bx.bt_rowid(bt, &(*s).cur)
+        if rid > (*s).kv_hi[0].i {
+            (*s).done = true
+            return false
+        }
+        (*s).rowid = rid
+        pl = try bx.bt_payload(bt, &(*s).cur)
+        try src_load_payload(cx, s, pl.p, pl.n)
+        return true
+    }
+    // SCAN_INDEX
+    var ok3: bool = false
+    if (*s).fresh {
+        (*s).fresh = false
+        var mode2: i64 = bx.SEEK_GE
+        if (*s).seek_gt {
+            mode2 = bx.SEEK_GT
+        }
+        ok3 = try bx.bt_index_seek(bt, &(*s).icur, &(*s).lok, mode2)
+    } else {
+        ok3 = try bx.bt_next(bt, &(*s).icur)
+    }
+    if !ok3 {
+        (*s).done = true
+        return false
+    }
+    let ip: bx.Payload = try bx.bt_payload(bt, &(*s).icur)
+    // past the upper bound?
+    if (*s).hik.n > 0 {
+        let c: i64 = try rc.rec_compare_key(ip.p, ip.n, &(*s).hik)
+        if c > 0 || (c == 0 && (*s).has_hi && !(*s).hi_incl) {
+            (*s).done = true
+            return false
+        }
+    }
+    // the rowid is the last column of the index record
+    let ncol: usize = rc.rec_column_count(ip.p, ip.n)
+    if ncol == 0 {
+        return dberr.fail(DbError::Corrupt, "index record without columns")
+    }
+    let rv: rc.Val = try rc.rec_column(ip.p, ip.n, ncol - 1)
+    if rv.t != 1 {
+        return dberr.fail(DbError::Corrupt, "index entry without a rowid")
+    }
+    (*s).rowid = rv.i
+    let found2: bool = try bx.bt_table_find(bt, (*t).root, rv.i, &pl)
+    if !found2 {
+        return dberr.fail(DbError::Corrupt, "row missing from the table: index points to a rowid that does not exist")
+    }
+    try src_load_payload(cx, s, pl.p, pl.n)
+    return true
+}
+
+// the row of the source as "no row" (LEFT JOIN without a match)
+fn src_clear_row(s: *mut Source) {
+    if (*s).vals != 0 {
+        let vals: *mut rc.Val = (*s).vals as *mut rc.Val
+        var i: usize = 0
+        while i < (*s).ncols {
+            *(vals + i) = rc.val_null()
+            i = i + 1
+        }
+    }
+}
+
+// loads the table row with this rowid (UPDATE and DELETE use it); false if gone
+fn src_load_row(cx: *mut ex.Ctx, s: *mut Source, rowid: i64) -> DbError!bool {
+    let db: *mut dc.Db = (*cx).db
+    let bt: *mut bx.Bt = &(*db).bt
+    let sc: *mut dc.Schema = &(*db).schema
+    let t: *mut dc.Table = dc.table_at(sc, (*s).tbl as usize)
+    var pl: bx.Payload = bx.Payload { p: 0, n: 0 }
+    let found: bool = try bx.bt_table_find(bt, (*t).root, rowid, &pl)
+    if !found {
+        return false
+    }
+    (*s).rowid = rowid
+    try src_load_payload(cx, s, pl.p, pl.n)
+    return true
+}

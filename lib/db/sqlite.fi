@@ -1,0 +1,652 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/sqlite.fi -- the embedded SQL database: a SQLite 3 compatible file.
+//
+//     import db.sqlite
+//     var d: *mut dc.Db = sqlite.db_open("cache.db", sqlite.OPEN_CREATE) catch |e| ...
+//     sqlite.db_exec(d, "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, name TEXT)") catch |e| ...
+//     var st: *mut dc.Stmt = sqlite.db_prepare(d, "INSERT INTO t(name) VALUES (?)") catch |e| ...
+//     sqlite.stmt_bind_text(st, 1, "x") catch |e| ...
+//     sqlite.stmt_step(st) catch |e| ...                // true = a row, false = done
+//     sqlite.stmt_finalize(st)
+//     sqlite.db_close(d)
+//
+// The file is a SQLite 3 database in every respect (page format, B-trees, record
+// format, rollback journal, locks): SQLite reads what this library writes and the other
+// way round, and a process killed in the middle of a commit leaves a hot journal that
+// either one rolls back. `docs/DB.md` has the SQL that is supported and the honest list
+// of what is not.
+//
+// RESULTS: `stmt_column_text` and `stmt_column_blob` answer views into the current row;
+// they are valid until the next `stmt_step`, `stmt_reset` or `stmt_finalize`.
+//
+// ERRORS: every function answers `DbError!...`; `last_error_message()` has the text of
+// the last one ("no such table: t", "UNIQUE constraint failed: t.id", ...).
+
+import std.rt
+import db.dberr
+import db.util as ut
+import db.record as rc
+import db.arena as ar
+import db.value as vl
+import db.dbcore as dc
+import db.pager as pgr
+import db.btree as bx
+import db.sqlast as ax
+import db.sqllex as tk
+import db.sqlparse as sp
+import db.expr as ex
+import db.select as sl
+import db.schema as sch
+import db.dml as dm
+import db.ddl as dd
+
+export {
+    db_open, db_close, db_exec, db_prepare, stmt_step, stmt_reset, stmt_finalize,
+    stmt_bind_null, stmt_bind_int, stmt_bind_real, stmt_bind_text, stmt_bind_blob, stmt_clear_bindings,
+    stmt_param_count, stmt_column_count, stmt_column_name, stmt_column_type, stmt_column_int,
+    stmt_column_real, stmt_column_text, stmt_column_blob, stmt_column_is_null,
+    db_last_insert_rowid, db_changes, db_total_changes, db_begin, db_commit, db_rollback,
+    db_set_busy_timeout, db_set_synchronous, db_in_transaction, db_set_cache_pages,
+    last_error_message, db_set_crash_point, db_stat_reads, db_stat_writes, db_stat_syncs,
+    db_query_int, db_query_text,
+    OPEN_READONLY, OPEN_CREATE, OPEN_READWRITE,
+    COL_NULL, COL_INT, COL_REAL, COL_TEXT, COL_BLOB,
+}
+
+const OPEN_READONLY: i64 = 1
+const OPEN_READWRITE: i64 = 2
+const OPEN_CREATE: i64 = 6
+
+const COL_NULL: i64 = 0
+const COL_INT: i64 = 1
+const COL_REAL: i64 = 2
+const COL_TEXT: i64 = 3
+const COL_BLOB: i64 = 4
+
+fn last_error_message() -> str {
+    return dberr.last_message()
+}
+
+// -------------------------------------------------------------- connection
+// Opens (and creates, with OPEN_CREATE) a database file.
+fn db_open(path: str, flags: i64) -> DbError!*mut dc.Db {
+    let p: u64 = rt.heap_alloc(dc.sz_of_db() + 64)
+    if p == 0 {
+        return dberr.fail(DbError::NoMemory, "out of memory")
+    }
+    let d: *mut dc.Db = p as *mut dc.Db
+    *d = dc.db_new()
+    (*d).bt.pg = &(*d).pg
+    let readonly: bool = (flags & 1) == 1 && (flags & 2) == 0
+    let create: bool = (flags & 4) == 4
+    let r: DbError!bool = pgr.pager_open(&(*d).pg, path, create, readonly, 4096, 1000)
+    let ok: bool = r catch false
+    if !ok {
+        rt.heap_free(p, dc.sz_of_db() + 64)
+        try r
+        return dberr.fail(DbError::Misuse, "unreachable")
+    }
+    pgr.pager_set_busy(&(*d).pg, 2000)
+    (*d).is_open = true
+    (*d).readonly = readonly
+    // a file that exists must be a database: read the header now
+    let r2: DbError!bool = pgr.pager_begin_read(&(*d).pg)
+    let ok2: bool = r2 catch false
+    if !ok2 {
+        pgr.pager_close(&(*d).pg)
+        rt.heap_free(p, dc.sz_of_db() + 64)
+        try r2
+        return dberr.fail(DbError::Misuse, "unreachable")
+    }
+    pgr.pager_end_read(&(*d).pg)
+    return d
+}
+
+fn db_close(d: *mut dc.Db) {
+    if (d as u64) == 0 || !(*d).is_open {
+        return
+    }
+    if (*d).in_txn {
+        pgr.pager_rollback(&(*d).pg) catch false
+    }
+    pgr.pager_close(&(*d).pg)
+    dc.schema_free(&(*d).schema)
+    ar.arena_free(&(*d).temp)
+    bx.bt_free(&(*d).bt)
+    (*d).is_open = false
+    rt.heap_free(d as u64, dc.sz_of_db() + 64)
+}
+
+fn db_last_insert_rowid(d: *mut dc.Db) -> i64 {
+    return (*d).last_rowid
+}
+
+fn db_changes(d: *mut dc.Db) -> i64 {
+    return (*d).changes
+}
+
+fn db_total_changes(d: *mut dc.Db) -> i64 {
+    return (*d).total_changes
+}
+
+fn db_in_transaction(d: *mut dc.Db) -> bool {
+    return (*d).in_txn
+}
+
+fn db_set_busy_timeout(d: *mut dc.Db, ms: i64) {
+    pgr.pager_set_busy(&(*d).pg, ms)
+}
+
+// 2 = FULL (default): fsync at every commit step. 0 = OFF: no fsync (a killed process
+// is still safe, a power cut is not).
+fn db_set_synchronous(d: *mut dc.Db, mode: i32) {
+    pgr.pager_set_sync(&(*d).pg, mode)
+}
+
+fn db_set_cache_pages(d: *mut dc.Db, n: usize) {
+    (*d).pg.cache_req = n
+}
+
+// Test hook: kill this process (SIGKILL) at the n-th commit event.
+fn db_set_crash_point(d: *mut dc.Db, n: i64) {
+    pgr.pager_set_crash(&(*d).pg, n)
+}
+
+fn db_stat_reads(d: *mut dc.Db) -> u64 {
+    return (*d).pg.n_reads
+}
+
+fn db_stat_writes(d: *mut dc.Db) -> u64 {
+    return (*d).pg.n_writes
+}
+
+fn db_stat_syncs(d: *mut dc.Db) -> u64 {
+    return (*d).pg.n_syncs
+}
+
+// ---------------------------------------------------------------- statements
+fn stmt_alloc(d: *mut dc.Db) -> DbError!*mut dc.Stmt {
+    let p: u64 = rt.heap_alloc(dc.sz_of_stmt() + 64)
+    if p == 0 {
+        return dberr.fail(DbError::NoMemory, "out of memory")
+    }
+    let st: *mut dc.Stmt = p as *mut dc.Stmt
+    *st = dc.Stmt { db: d, sql: rt.buf_new(), ast: ax.ast_new(), root: -1, kind: 0, nparams: 0, params: rt.buf_new(),
+        parena: ar.arena_new(), state: dc.ST_FRESH, gen: 0, it: 0, ncols: 0, out: 0, out_arena: ar.arena_new(),
+        changes: 0, started_read: false, pos: 0, subs: rt.buf_new(), sub_arena: ar.arena_new(), plan: 0 }
+    return st
+}
+
+// Parses the first statement of `sql`. `st.pos` is where the next one starts.
+fn db_prepare(d: *mut dc.Db, sql: str) -> DbError!*mut dc.Stmt {
+    if !(*d).is_open {
+        return dberr.fail(DbError::Misuse, "the database is closed")
+    }
+    let n: usize = sql.length()
+    if n > (*d).max_sql {
+        return dberr.fail(DbError::TooBig, "statement too long")
+    }
+    let st: *mut dc.Stmt = try stmt_alloc(d)
+    rt.buf_push_bytes(&(*st).sql, sql.p as u64, n)
+    rt.buf_push(&(*st).sql, 0 as u8)
+    var ps: sp.Parser = sp.parser_new(&(*st).ast, rt.buf_ptr(&(*st).sql), n)
+    let r: DbError!i32 = sp.parse_stmt(&ps)
+    let ok: bool = (r catch -9) != -9
+    if !ok {
+        stmt_free(st)
+        try r
+        return dberr.fail(DbError::Misuse, "unreachable")
+    }
+    let root: i32 = r catch -1
+    (*st).root = root
+    (*st).pos = sp.parser_pos(&ps)
+    if root >= 0 {
+        (*st).kind = (*ax.ast_n(&(*st).ast, root)).kind
+    }
+    (*st).nparams = (*st).ast.nparams
+    var np: usize = ((*st).nparams as usize) * 40 + 40
+    rt.buf_reserve(&(*st).params, np)
+    ut.zero_bytes(rt.buf_ptr(&(*st).params), np)
+    rt.buf_set_len(&(*st).params, np)
+    return st
+}
+
+fn stmt_free(st: *mut dc.Stmt) {
+    rt.buf_free(&(*st).sql)
+    ax.ast_free(&(*st).ast)
+    rt.buf_free(&(*st).params)
+    ar.arena_free(&(*st).parena)
+    ar.arena_free(&(*st).out_arena)
+    ar.arena_free(&(*st).sub_arena)
+    var i: usize = 0
+    let n: usize = rt.buf_len(&(*st).subs) / 8
+    while i < n {
+        sl.sel_free(rt.ld64(rt.buf_ptr(&(*st).subs), i) as *mut sl.SelIter)
+        i = i + 1
+    }
+    rt.buf_free(&(*st).subs)
+    if (*st).it != 0 {
+        sl.sel_free((*st).it as *mut sl.SelIter)
+    }
+    dm.plan_free(st)
+    rt.heap_free(st as u64, dc.sz_of_stmt() + 64)
+}
+
+fn stmt_end_read(st: *mut dc.Stmt) {
+    let d: *mut dc.Db = (*st).db
+    if (*st).started_read {
+        (*st).started_read = false
+        (*d).readers = (*d).readers - 1
+        if (*d).readers == 0 && !(*d).in_txn && (*d).pg.state == 1 {
+            pgr.pager_end_read(&(*d).pg)
+        }
+    }
+}
+
+// Back to the start: the statement can run again with the same bindings.
+fn stmt_reset(st: *mut dc.Stmt) {
+    if (*st).it != 0 {
+        sl.sel_close((*st).it as *mut sl.SelIter)
+    }
+    stmt_end_read(st)
+    (*st).state = dc.ST_FRESH
+    (*st).out = 0
+}
+
+fn stmt_finalize(st: *mut dc.Stmt) {
+    if (st as u64) == 0 {
+        return
+    }
+    stmt_reset(st)
+    stmt_free(st)
+}
+
+fn stmt_param_count(st: *mut dc.Stmt) -> i32 {
+    return (*st).nparams
+}
+
+fn param_slot(st: *mut dc.Stmt, idx: i32) -> DbError!*mut rc.Val {
+    if idx < 1 || idx > (*st).nparams {
+        return dberr.fail(DbError::Range, "parameter index out of range")
+    }
+    return ((rt.buf_ptr(&(*st).params)) as *mut rc.Val) + ((idx - 1) as usize)
+}
+
+fn stmt_bind_null(st: *mut dc.Stmt, idx: i32) -> DbError!bool {
+    let s: *mut rc.Val = try param_slot(st, idx)
+    *s = rc.val_null()
+    return true
+}
+
+fn stmt_bind_int(st: *mut dc.Stmt, idx: i32, v: i64) -> DbError!bool {
+    let s: *mut rc.Val = try param_slot(st, idx)
+    *s = rc.val_int(v)
+    return true
+}
+
+fn stmt_bind_real(st: *mut dc.Stmt, idx: i32, v: f64) -> DbError!bool {
+    let s: *mut rc.Val = try param_slot(st, idx)
+    if v != v {
+        *s = rc.val_null()
+    } else {
+        *s = rc.val_real(v)
+    }
+    return true
+}
+
+// the text is copied
+fn stmt_bind_text(st: *mut dc.Stmt, idx: i32, v: str) -> DbError!bool {
+    let s: *mut rc.Val = try param_slot(st, idx)
+    let n: usize = v.length()
+    let p: u64 = ar.arena_copy(&(*st).parena, v.p as u64, n)
+    *s = rc.val_text(p, n)
+    return true
+}
+
+// the octets are copied
+fn stmt_bind_blob(st: *mut dc.Stmt, idx: i32, p: u64, n: usize) -> DbError!bool {
+    let s: *mut rc.Val = try param_slot(st, idx)
+    let q: u64 = ar.arena_copy(&(*st).parena, p, n)
+    *s = rc.val_blob(q, n)
+    return true
+}
+
+fn stmt_clear_bindings(st: *mut dc.Stmt) {
+    let np: usize = ((*st).nparams as usize) * 40 + 40
+    ut.zero_bytes(rt.buf_ptr(&(*st).params), np)
+    ar.arena_reset(&(*st).parena)
+}
+
+// ------------------------------------------------------------- transactions
+fn txn_begin(d: *mut dc.Db, mode: u32) -> DbError!bool {
+    if (*d).in_txn {
+        return dberr.fail(DbError::Misuse, "cannot start a transaction within a transaction")
+    }
+    (*d).in_txn = true
+    (*d).txn_write = false
+    if mode >= 1 {
+        let r: DbError!bool = txn_upgrade(d)
+        let ok: bool = r catch false
+        if !ok {
+            (*d).in_txn = false
+            return r
+        }
+    }
+    return true
+}
+
+// the transaction needs to write: take the write lock now
+fn txn_upgrade(d: *mut dc.Db) -> DbError!bool {
+    try pgr.pager_begin_write(&(*d).pg)
+    (*d).txn_write = true
+    return true
+}
+
+fn txn_commit(d: *mut dc.Db) -> DbError!bool {
+    if !(*d).in_txn {
+        return dberr.fail(DbError::Misuse, "cannot commit - no transaction is active")
+    }
+    (*d).pg.hold_read = (*d).readers
+    let r: DbError!bool = pgr.pager_commit(&(*d).pg)
+    let ok: bool = r catch false
+    if !ok {
+        // a failed commit (busy) leaves the transaction open for a retry or a rollback
+        return r
+    }
+    (*d).in_txn = false
+    (*d).txn_write = false
+    return true
+}
+
+fn txn_rollback(d: *mut dc.Db) -> DbError!bool {
+    if !(*d).in_txn {
+        return dberr.fail(DbError::Misuse, "cannot rollback - no transaction is active")
+    }
+    (*d).pg.hold_read = (*d).readers
+    pgr.pager_rollback(&(*d).pg) catch false
+    (*d).in_txn = false
+    (*d).txn_write = false
+    (*d).schema.loaded = false
+    return true
+}
+
+fn db_begin(d: *mut dc.Db) -> DbError!bool {
+    return try txn_begin(d, 0)
+}
+
+fn db_commit(d: *mut dc.Db) -> DbError!bool {
+    return try txn_commit(d)
+}
+
+fn db_rollback(d: *mut dc.Db) -> DbError!bool {
+    return try txn_rollback(d)
+}
+
+// ---------------------------------------------------------------- stepping
+fn compile_select(st: *mut dc.Stmt) -> DbError!bool {
+    let d: *mut dc.Db = (*st).db
+    if (*st).it != 0 && (*st).gen == (*d).schema_gen {
+        return true
+    }
+    if (*st).it != 0 {
+        sl.sel_free((*st).it as *mut sl.SelIter)
+        (*st).it = 0
+    }
+    // the sub-selects of the old plan
+    var i: usize = 0
+    let n: usize = rt.buf_len(&(*st).subs) / 8
+    while i < n {
+        i = i + 1
+    }
+    rt.buf_clear(&(*st).subs)
+    let it: *mut sl.SelIter = sl.sel_new(d, st, &(*st).ast)
+    if (it as u64) == 0 {
+        return dberr.fail(DbError::NoMemory, "out of memory")
+    }
+    let r: DbError!bool = sl.sel_setup(it, (*st).root, 0 as *mut ex.Scope)
+    let ok: bool = r catch false
+    if !ok {
+        sl.sel_free(it)
+        return r
+    }
+    (*st).it = it as u64
+    (*st).ncols = sl.sel_ncols(it)
+    (*st).gen = (*d).schema_gen
+    return true
+}
+
+fn begin_read_for(st: *mut dc.Stmt) -> DbError!bool {
+    let d: *mut dc.Db = (*st).db
+    if !(*st).started_read {
+        try pgr.pager_begin_read(&(*d).pg)
+        (*d).readers = (*d).readers + 1
+        (*st).started_read = true
+    }
+    try sch.ensure_schema(d)
+    return true
+}
+
+fn step_select(st: *mut dc.Stmt) -> DbError!bool {
+    let d: *mut dc.Db = (*st).db
+    if (*st).state == dc.ST_FRESH {
+        try begin_read_for(st)
+        let r: DbError!bool = compile_select(st)
+        let ok: bool = r catch false
+        if !ok {
+            stmt_end_read(st)
+            return r
+        }
+        let it: *mut sl.SelIter = (*st).it as *mut sl.SelIter
+        let r2: DbError!bool = sl.sel_start(it)
+        let ok2: bool = r2 catch false
+        if !ok2 {
+            stmt_end_read(st)
+            return r2
+        }
+        (*st).state = dc.ST_RUNNING
+        (*st).changes = 0
+    }
+    if (*st).state != dc.ST_RUNNING {
+        return false
+    }
+    let it2: *mut sl.SelIter = (*st).it as *mut sl.SelIter
+    let r3: DbError!bool = sl.sel_next(it2)
+    if dberr.failed_bool(r3) {
+        stmt_end_read(st)
+        (*st).state = dc.ST_DONE
+        (*st).out = 0
+        return r3
+    }
+    let got: bool = r3 catch false
+    if got {
+        (*st).out = (*it2).out
+        return true
+    }
+    stmt_end_read(st)
+    (*st).state = dc.ST_DONE
+    (*st).out = 0
+    return false
+}
+
+// Runs the statement to its next row. True: a row is ready (read it with the
+// stmt_column_* functions). False: the statement is done.
+fn stmt_step(st: *mut dc.Stmt) -> DbError!bool {
+    let d: *mut dc.Db = (*st).db
+    if !(*d).is_open {
+        return dberr.fail(DbError::Misuse, "the database is closed")
+    }
+    if (*st).root < 0 {
+        return false
+    }
+    let k: u32 = (*st).kind
+    if k == ax.N_SELECT {
+        return try step_select(st)
+    }
+    if (*st).state == dc.ST_DONE {
+        return false
+    }
+    (*st).state = dc.ST_DONE
+    if k == ax.N_BEGIN {
+        try txn_begin(d, (*ax.ast_n(&(*st).ast, (*st).root)).op)
+        return false
+    }
+    if k == ax.N_COMMIT {
+        try txn_commit(d)
+        return false
+    }
+    if k == ax.N_ROLLBACK {
+        try txn_rollback(d)
+        return false
+    }
+    let more: bool = try run_other(st)
+    if more {
+        (*st).state = dc.ST_RUNNING
+    }
+    return more
+}
+
+fn run_other(st: *mut dc.Stmt) -> DbError!bool {
+    return dberr.fail(DbError::Unsupported, "statement kind not available yet")
+}
+
+// ------------------------------------------------------------------ columns
+fn stmt_column_count(st: *mut dc.Stmt) -> usize {
+    return (*st).ncols
+}
+
+fn stmt_column_name(st: *mut dc.Stmt, i: usize) -> str {
+    if (*st).it == 0 || i >= (*st).ncols {
+        return ""
+    }
+    var p: u64 = 0
+    var n: usize = 0
+    sl.sel_name((*st).it as *mut sl.SelIter, i, &p, &n)
+    return str { p: p as *mut u8, n: n }
+}
+
+fn col_slot(st: *mut dc.Stmt, i: usize) -> *mut rc.Val {
+    if (*st).out == 0 || i >= (*st).ncols {
+        return 0 as *mut rc.Val
+    }
+    return ((*st).out as *mut rc.Val) + i
+}
+
+fn stmt_column_type(st: *mut dc.Stmt, i: usize) -> i64 {
+    let v: *mut rc.Val = col_slot(st, i)
+    if (v as u64) == 0 {
+        return 0
+    }
+    return (*v).t
+}
+
+fn stmt_column_is_null(st: *mut dc.Stmt, i: usize) -> bool {
+    return stmt_column_type(st, i) == 0
+}
+
+fn stmt_column_int(st: *mut dc.Stmt, i: usize) -> i64 {
+    let v: *mut rc.Val = col_slot(st, i)
+    if (v as u64) == 0 {
+        return 0
+    }
+    return vl.val_to_int(v)
+}
+
+fn stmt_column_real(st: *mut dc.Stmt, i: usize) -> f64 {
+    let v: *mut rc.Val = col_slot(st, i)
+    if (v as u64) == 0 {
+        return 0.0
+    }
+    return vl.val_to_real(v)
+}
+
+// the value as text (numbers are formatted); "" for NULL; valid until the next step
+fn stmt_column_text(st: *mut dc.Stmt, i: usize) -> str {
+    let v: *mut rc.Val = col_slot(st, i)
+    if (v as u64) == 0 || (*v).t == 0 {
+        return ""
+    }
+    if (*v).t == 3 || (*v).t == 4 {
+        return str { p: (*v).p as *mut u8, n: (*v).n }
+    }
+    var t: rc.Val = rc.val_null()
+    vl.val_to_text(v, &(*st).out_arena, &t)
+    return str { p: t.p as *mut u8, n: t.n }
+}
+
+fn stmt_column_blob(st: *mut dc.Stmt, i: usize, p: *mut u64, n: *mut usize) {
+    let v: *mut rc.Val = col_slot(st, i)
+    *p = 0
+    *n = 0
+    if (v as u64) == 0 || (*v).t == 0 {
+        return
+    }
+    if (*v).t == 3 || (*v).t == 4 {
+        *p = (*v).p
+        *n = (*v).n
+        return
+    }
+    var t: rc.Val = rc.val_null()
+    vl.val_to_text(v, &(*st).out_arena, &t)
+    *p = t.p
+    *n = t.n
+}
+
+// ------------------------------------------------------------------ helpers
+// Runs every statement of `sql` (no parameters), ignoring result rows.
+fn db_exec(d: *mut dc.Db, sql: str) -> DbError!bool {
+    var rest: str = sql
+    while true {
+        let st: *mut dc.Stmt = try db_prepare(d, rest)
+        if (*st).root < 0 {
+            stmt_finalize(st)
+            break
+        }
+        var more: bool = true
+        while more {
+            let r: DbError!bool = stmt_step(st)
+            if dberr.failed_bool(r) {
+                stmt_finalize(st)
+                return r
+            }
+            more = r catch false
+        }
+        let next: usize = (*st).pos
+        stmt_finalize(st)
+        if next >= rest.length() {
+            break
+        }
+        rest = str { p: ((rest.p as u64) + (next as u64)) as *mut u8, n: rest.length() - next }
+    }
+    return true
+}
+
+// The first column of the first row as an integer (`dflt` if there is no row).
+fn db_query_int(d: *mut dc.Db, sql: str, dflt: i64) -> DbError!i64 {
+    let st: *mut dc.Stmt = try db_prepare(d, sql)
+    let r: DbError!bool = stmt_step(st)
+    if dberr.failed_bool(r) {
+        stmt_finalize(st)
+        try r
+    }
+    var out: i64 = dflt
+    if (r catch false) {
+        out = stmt_column_int(st, 0)
+    }
+    stmt_finalize(st)
+    return out
+}
+
+fn db_query_text(d: *mut dc.Db, sql: str) -> DbError!str {
+    let st: *mut dc.Stmt = try db_prepare(d, sql)
+    let r: DbError!bool = stmt_step(st)
+    if dberr.failed_bool(r) {
+        stmt_finalize(st)
+        try r
+    }
+    var out: str = ""
+    if (r catch false) {
+        out = __str_copy(stmt_column_text(st, 0))
+    }
+    stmt_finalize(st)
+    return out
+}

@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/db/sql_probe.fi -- runs the statements of a script (one per line) on a database
+// and prints the result in a canonical form that check_sql.py compares with SQLite:
+//
+//     sql_probe <db> <script> [crash_point]
+//
+// per statement: "R <v>|<v>|.." for every row (I:int R:hexbits T:hexoctets B:hexoctets N),
+// then "OK" or "E <message>". The statements of a line are run as one script (db_exec
+// semantics) only if the line has no result; a line with a SELECT shows its rows.
+import std.rt
+import std.io
+import std.fs
+import db.dberr
+import db.dbcore as dc
+import db.sqlite as sq
+import db.record as rc
+
+fn put_hex(out: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push_hex_u64(out, rt.ld8(p, i) as u64, 2)
+        i = i + 1
+    }
+}
+
+fn enc_col(st: *mut dc.Stmt, i: usize, out: *mut rt.Buf) {
+    let t: i64 = sq.stmt_column_type(st, i)
+    if t == 0 {
+        rt.buf_push(out, 78 as u8)
+    } else if t == 1 {
+        rt.buf_push(out, 73 as u8)
+        rt.buf_push(out, 58 as u8)
+        rt.buf_push_dec_i64(out, sq.stmt_column_int(st, i))
+    } else if t == 2 {
+        rt.buf_push(out, 82 as u8)
+        rt.buf_push(out, 58 as u8)
+        let f: f64 = sq.stmt_column_real(st, i)
+        rt.buf_push_hex_u64(out, rc.bits_of_f64(f), 16)
+    } else {
+        if t == 3 {
+            rt.buf_push(out, 84 as u8)
+        } else {
+            rt.buf_push(out, 66 as u8)
+        }
+        rt.buf_push(out, 58 as u8)
+        var p: u64 = 0
+        var n: usize = 0
+        sq.stmt_column_blob(st, i, &p, &n)
+        put_hex(out, p, n)
+    }
+}
+
+fn run_line(d: *mut dc.Db, line: str, out: *mut rt.Buf) -> DbError!bool {
+    var rest: str = line
+    while true {
+        let st: *mut dc.Stmt = try sq.db_prepare(d, rest)
+        let isend: bool = (*st).root < 0
+        if isend {
+            sq.stmt_finalize(st)
+            break
+        }
+        while true {
+            let r: DbError!bool = sq.stmt_step(st)
+            if dberr.failed_bool(r) {
+                sq.stmt_finalize(st)
+                return r
+            }
+            if !(r catch false) {
+                break
+            }
+            rt.buf_push(out, 82 as u8)
+            rt.buf_push(out, 32 as u8)
+            var c: usize = 0
+            while c < sq.stmt_column_count(st) {
+                if c > 0 {
+                    rt.buf_push(out, 124 as u8)
+                }
+                enc_col(st, c, out)
+                c = c + 1
+            }
+            rt.buf_push(out, 10 as u8)
+        }
+        let next: usize = (*st).pos
+        sq.stmt_finalize(st)
+        if next >= rest.length() {
+            break
+        }
+        rest = str { p: ((rest.p as u64) + (next as u64)) as *mut u8, n: rest.length() - next }
+    }
+    return true
+}
+
+fn main(start: u64) -> i32 {
+    let a1: u64 = rt.arg_ptr(start, 1)
+    let a2: u64 = rt.arg_ptr(start, 2)
+    let path: str = str { p: rt.ptr_of(a1), n: rt.c_length(a1) }
+    let script: str = str { p: rt.ptr_of(a2), n: rt.c_length(a2) }
+    let d: *mut dc.Db = sq.db_open(path, sq.OPEN_CREATE) catch | e | (0 as *mut dc.Db)
+    if (d as u64) == 0 {
+        io.print("E open: ")
+        io.print_line(sq.last_error_message())
+        return 1
+    }
+    if rt.arg_count(start) > 3 {
+        let a3: u64 = rt.arg_ptr(start, 3)
+        var v: i64 = 0
+        var i: usize = 0
+        let n3: usize = rt.c_length(a3)
+        while i < n3 {
+            v = v * 10 + ((rt.ld8(a3, i) as i64) - 48)
+            i = i + 1
+        }
+        sq.db_set_crash_point(d, v)
+    }
+    var data: rt.Buf = rt.buf_new()
+    fs.read_file(script, &data) catch 0
+    var pos: usize = 0
+    let n: usize = rt.buf_len(&data)
+    while pos < n {
+        var e: usize = pos
+        while e < n && rt.ld8(rt.buf_ptr(&data), e) != 10 as u8 {
+            e = e + 1
+        }
+        let line: str = str { p: rt.ptr_of(rt.buf_ptr(&data) + (pos as u64)), n: e - pos }
+        pos = e + 1
+        if line.length() == 0 {
+            continue
+        }
+        var out: rt.Buf = rt.buf_new()
+        let r: DbError!bool = run_line(d, line, &out)
+        if dberr.failed_bool(r) {
+            rt.buf_push_bytes(&out, "E ".p as u64, 2)
+            let m: str = sq.last_error_message()
+            rt.buf_push_bytes(&out, m.p as u64, m.length())
+            rt.buf_push(&out, 10 as u8)
+        } else {
+            rt.buf_push_bytes(&out, "OK\n".p as u64, 3)
+        }
+        io.print_bytes(rt.buf_ptr(&out), rt.buf_len(&out))
+        rt.buf_free(&out)
+    }
+    sq.db_close(d)
+    return 0
+}
