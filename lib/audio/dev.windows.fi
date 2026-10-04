@@ -21,7 +21,7 @@
 import std.rt
 import std.time
 
-export { Dev, dev_open, dev_is_open, dev_writable, dev_write, dev_drain, dev_flush, dev_close, dev_null }
+export { Dev, dev_open, dev_is_open, dev_writable, dev_write, dev_drain, dev_flush, dev_pause, dev_close, dev_null }
 
 extern fn waveOutOpen(ph: u64, dev: u64, fmt: u64, cb: u64, inst: u64, flags: u64) -> u32;
 extern fn waveOutClose(h: u64) -> u32;
@@ -29,6 +29,8 @@ extern fn waveOutPrepareHeader(h: u64, hdr: u64, size: u64) -> u32;
 extern fn waveOutUnprepareHeader(h: u64, hdr: u64, size: u64) -> u32;
 extern fn waveOutWrite(h: u64, hdr: u64, size: u64) -> u32;
 extern fn waveOutReset(h: u64) -> u32;
+extern fn waveOutPause(h: u64) -> u32;
+extern fn waveOutRestart(h: u64) -> u32;
 
 const NBUF: usize = 6
 const HDR: usize = 48 // sizeof(WAVEHDR) on x64
@@ -41,13 +43,15 @@ struct Dev {
     cap: usize, // octets per buffer
     busy: [bool; 6],
     next: usize,
+    cur: i64, // the buffer being filled (not handed over yet), -1 = none
+    fill: usize, // octets in it
     channels: u32,
     open: bool,
 }
 
 fn dev_null() -> Dev {
     return Dev { hwo: 0 as u64, hdrs: 0 as u64, data: 0 as u64, cap: 0, busy: [false; 6], next: 0,
-        channels: 2 as u32, open: false }
+        cur: -1, fill: 0, channels: 2 as u32, open: false }
 }
 
 fn put16(p: *mut u8, i: usize, v: u32) {
@@ -139,18 +143,61 @@ fn free_slot(d: *mut Dev) -> i64 {
     return -1
 }
 
-// Frames that fit into ONE buffer, when one is free right now (0 = all are playing).
+// Hands the buffer being filled to the system.
+fn submit(d: *mut Dev) -> bool {
+    if (*d).cur < 0 {
+        return true
+    }
+    let i: usize = (*d).cur as usize
+    let hp: u64 = (*d).hdrs + (i * HDR) as u64
+    rt.st32(hp, 2, (*d).fill as u32)
+    (*d).cur = -1
+    let n: usize = (*d).fill
+    (*d).fill = 0
+    if n == 0 {
+        return true
+    }
+    if waveOutWrite((*d).hwo, hp, HDR as u64) != 0 as u32 {
+        (*d).open = false
+        return false
+    }
+    (*d).busy[i] = true
+    (*d).next = (i + 1) % NBUF
+    return true
+}
+
+fn any_busy(d: *mut Dev) -> bool {
+    collect(d)
+    var i: usize = 0
+    while i < NBUF {
+        if (*d).busy[i] {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Frames that fit right now without waiting: what is left of the buffer being filled, else a whole
+// buffer when one is free, else none (all are playing).
 fn dev_writable(d: *mut Dev) -> usize {
     if !(*d).open {
         return 0
     }
+    let fb: usize = (*d).channels as usize * 2
+    if (*d).cur >= 0 {
+        return ((*d).cap - (*d).fill) / fb
+    }
     if free_slot(d) < 0 {
         return 0
     }
-    return (*d).cap / ((*d).channels as usize * 2)
+    return (*d).cap / fb
 }
 
-// Hands over `frames` frames; waits for a free buffer when all are playing.
+// Takes `frames` frames. Small writes are collected into one buffer until it is full (many tiny
+// writes would otherwise use up the six buffers and let the device run dry); a partial buffer goes
+// out at once when nothing else is playing, so a slow writer is never held back. Waits for a free
+// buffer when all are playing.
 fn dev_write(d: *mut Dev, p: u64, frames: usize) -> bool {
     if !(*d).open {
         return false
@@ -160,33 +207,39 @@ fn dev_write(d: *mut Dev, p: u64, frames: usize) -> bool {
     var at: u64 = p
     var waited: u32 = 0
     while left > 0 {
-        let s: i64 = free_slot(d)
-        if s < 0 {
-            time.sleep_ms(2 as u64)
-            waited = waited + 1 as u32
-            if waited > 30000 as u32 { // a minute without a single buffer finished: the device is stuck
-                (*d).open = false
-                return false
+        if (*d).cur < 0 {
+            let s: i64 = free_slot(d)
+            if s < 0 {
+                time.sleep_ms(2 as u64)
+                waited = waited + 1 as u32
+                if waited > 30000 as u32 { // a minute without a single buffer finished: the device is stuck
+                    (*d).open = false
+                    return false
+                }
+                continue
             }
-            continue
+            (*d).cur = s
+            (*d).fill = 0
         }
         waited = 0
-        let i: usize = s as usize
+        let i: usize = (*d).cur as usize
         var n: usize = left
-        if n > (*d).cap {
-            n = (*d).cap
+        if n > (*d).cap - (*d).fill {
+            n = (*d).cap - (*d).fill
         }
-        let hp: u64 = (*d).hdrs + (i * HDR) as u64
-        rt.mem_copy((*d).data + (i * (*d).cap) as u64, at, n)
-        rt.st32(hp, 2, n as u32)
-        if waveOutWrite((*d).hwo, hp, HDR as u64) != 0 as u32 {
-            (*d).open = false
-            return false
-        }
-        (*d).busy[i] = true
-        (*d).next = (i + 1) % NBUF
+        rt.mem_copy((*d).data + (i * (*d).cap + (*d).fill) as u64, at, n)
+        (*d).fill = (*d).fill + n
         at = at + n as u64
         left = left - n
+        if (*d).fill >= (*d).cap {
+            if !submit(d) {
+                return false
+            }
+        }
+    }
+    // a partial buffer: out at once when the device would otherwise run dry
+    if (*d).cur >= 0 && !any_busy(d) {
+        return submit(d)
     }
     return true
 }
@@ -196,18 +249,12 @@ fn dev_drain(d: *mut Dev) -> bool {
     if !(*d).open {
         return false
     }
+    if !submit(d) {
+        return false
+    }
     var spins: u32 = 0
     while spins < 30000 as u32 {
-        collect(d)
-        var any: bool = false
-        var i: usize = 0
-        while i < NBUF {
-            if (*d).busy[i] {
-                any = true
-            }
-            i = i + 1
-        }
-        if !any {
+        if !any_busy(d) {
             return true
         }
         time.sleep_ms(2 as u64)
@@ -221,9 +268,24 @@ fn dev_flush(d: *mut Dev) -> bool {
     if !(*d).open {
         return false
     }
+    (*d).cur = -1
+    (*d).fill = 0
     let r: u32 = waveOutReset((*d).hwo)
     collect(d)
     return r == 0 as u32
+}
+
+// Holds the playing (on) or lets it go on (off); the queued buffers stay.
+fn dev_pause(d: *mut Dev, on: bool) -> bool {
+    if !(*d).open {
+        return false
+    }
+    // what is only half filled must not wait for a resume that never comes: queue it first
+    if on {
+        submit(d)
+        return waveOutPause((*d).hwo) == 0 as u32
+    }
+    return waveOutRestart((*d).hwo) == 0 as u32
 }
 
 fn dev_close(d: *mut Dev) {
