@@ -1,0 +1,294 @@
+// expect_exit: 0
+// tests/2186_compress_auto.fi -- lib/compress/auto.fi: one door for every
+// format. Detection by content over the fixtures of the other tests (and over
+// things that must NOT be taken for a format), whole-buffer decoding of all
+// formats through one call, formats that have no magic asked for by name,
+// compression with the four encoders, and the streaming reader opened on a
+// descriptor without knowing what is inside.
+import compress.common
+import compress.auto
+import std.rt
+import std.io
+import std.fs
+
+const PLAIN: str = __include_str("data/compress/plain.bin")
+const WORDS: str = __include_str("data/compress/words.bin")
+const F_GZ: str = __include_str("data/compress/plain.gz")
+const F_ZST: str = __include_str("data/compress/plain.zst")
+const F_ZST_MULTI: str = __include_str("data/compress/plain_multi.zst")
+const F_XZ: str = __include_str("data/compress/plain.xz")
+const F_BZ2: str = __include_str("data/compress/plain.bz2")
+const F_LZ4: str = __include_str("data/compress/plain.lz4")
+const F_LZ4_MULTI: str = __include_str("data/compress/plain_multi.lz4")
+const F_BR: str = __include_str("data/compress/plain_q5.br")
+const F_LZMA: str = __include_str("data/compress/plain.lzma")
+const F_ZLIB: str = __include_str("data/compress/plain.zlib")
+const F_DEFLATE: str = __include_str("data/compress/plain.deflate")
+const F_EMPTY_ZST: str = __include_str("data/compress/empty.zst")
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+static mut code: u32 = 0
+
+fn why(e: CompressError) -> usize {
+    if e == CompressError::Data { code = 1 }
+    if e == CompressError::Format { code = 2 }
+    if e == CompressError::Checksum { code = 3 }
+    if e == CompressError::Truncated { code = 4 }
+    if e == CompressError::TooLarge { code = 5 }
+    if e == CompressError::OutOfMemory { code = 6 }
+    if e == CompressError::Unsupported { code = 7 }
+    if e == CompressError::Dictionary { code = 8 }
+    if e == CompressError::Io { code = 9 }
+    return 0
+}
+
+fn is_plain(b: *mut rt.Buf, want: str) -> bool {
+    return rt.buf_len(b) == want.length() && rt.mem_eq(rt.buf_ptr(b), want.p as u64, want.length())
+}
+
+fn view(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn scratch(tag: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, "/tmp/firn_".p as u64, 10)
+    rt.buf_push_bytes(&b, tag.p as u64, tag.length())
+    rt.buf_push(&b, 95 as u8)
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+// deterministic pseudo random octets
+fn pseudo(n: usize, seed: u64) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    var x: u64 = seed
+    var i: usize = 0
+    while i < n {
+        x = x *% 6364136223846793005 +% 1442695040888963407
+        rt.buf_push(&b, ((x >> 33) & 255) as u8)
+        i = i + 1
+    }
+    return b
+}
+
+fn zeros(n: usize) -> rt.Buf {
+    var z: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&z, n)
+    rt.mem_set(rt.buf_ptr(&z), 0 as u8, n)
+    rt.buf_set_len(&z, n)
+    return z
+}
+
+fn finish(t: *mut Tally) -> i32 {
+    io.print("checks: ")
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&nb, (*t).total)
+    io.print_bytes(rt.buf_ptr(&nb), rt.buf_len(&nb))
+    io.print_line("")
+    if (*t).fails != 0 {
+        return 1 as i32
+    }
+    return 0
+}
+
+fn dec(z: str, max: usize, out: *mut rt.Buf) -> u32 {
+    code = 0
+    auto.decompress_limited(z.p as u64, z.length(), max, out) catch | e | (why(e))
+    return code
+}
+
+fn decodes_to(t: *mut Tally, what: str, z: str, want: str) {
+    var out: rt.Buf = rt.buf_new()
+    let c: u32 = dec(z, 0, &out)
+    check(t, what, c == 0 as u32 && is_plain(&out, want))
+    rt.buf_free(&out)
+}
+
+fn kind_of(z: str) -> u32 {
+    return auto.detect(z.p as u64, z.length())
+}
+
+// auto-detected streaming decode from a descriptor; `kind_out` receives the kind
+fn stream_dec(path: str, z: str, piece: usize, max: usize, kind_out: *mut u32, out: *mut rt.Buf) -> u32 {
+    code = 0
+    fs.write_file(path, z.p as u64, z.length()) catch 0
+    let fd: i64 = fs.open_read(path) catch -1
+    if fd < 0 {
+        return 99 as u32
+    }
+    var d: auto.AutoDec = auto.auto_dec_open_fd(fd) catch | e | (open_why(e))
+    if code != 0 as u32 {
+        fs.close_fd(fd)
+        return code
+    }
+    *kind_out = auto.auto_dec_kind(&d)
+    if max > 0 {
+        auto.auto_dec_set_limit(&d, max)
+    }
+    let tmp: u64 = rt.heap_alloc(piece)
+    while true {
+        let k: usize = auto.auto_dec_read(&d, tmp, piece) catch | e | (why(e))
+        if code != 0 as u32 || k == 0 {
+            break
+        }
+        rt.buf_push_bytes(out, tmp, k)
+    }
+    rt.heap_free(tmp, piece)
+    auto.auto_dec_close(&d)
+    fs.close_fd(fd)
+    return code
+}
+
+fn open_why(e: CompressError) -> auto.AutoDec {
+    why(e)
+    return auto.AutoDec { kind: 0, h: 0, hsize: 0, max: 0 }
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let path: str = scratch("auto2186")
+
+    // A. detection
+    check(&t, "detect gzip", kind_of(F_GZ) == auto.KIND_GZIP)
+    check(&t, "detect zstd", kind_of(F_ZST) == auto.KIND_ZSTD && kind_of(F_ZST_MULTI) == auto.KIND_ZSTD)
+    check(&t, "detect xz", kind_of(F_XZ) == auto.KIND_XZ)
+    check(&t, "detect bzip2", kind_of(F_BZ2) == auto.KIND_BZIP2)
+    check(&t, "detect lz4", kind_of(F_LZ4) == auto.KIND_LZ4 && kind_of(F_LZ4_MULTI) == auto.KIND_LZ4)
+    check(&t, "detect zip", kind_of("PK\x03\x04rest of a local file header") == auto.KIND_ZIP && kind_of("PK\x05\x06") == auto.KIND_ZIP)
+    check(&t, "brotli, .lzma, zlib and raw deflate have no magic: unknown", kind_of(F_BR) == auto.KIND_UNKNOWN
+        && kind_of(F_LZMA) == auto.KIND_UNKNOWN && kind_of(F_DEFLATE) == auto.KIND_UNKNOWN)
+    check(&t, "plain text, empty and short inputs are unknown", kind_of("just some text, nothing compressed") == auto.KIND_UNKNOWN
+        && kind_of("") == auto.KIND_UNKNOWN && kind_of("\x1f") == auto.KIND_UNKNOWN && kind_of("BZ") == auto.KIND_UNKNOWN)
+    check(&t, "BZh followed by text is not bzip2", kind_of("BZh9 is a nice string of text") == auto.KIND_UNKNOWN)
+    var g: [u8; 8] = [0x1f, 0x8b, 7, 0, 0, 0, 0, 0]
+    check(&t, "1f 8b with another method is not gzip", auto.detect((&g[0]) as u64, 8) == auto.KIND_UNKNOWN)
+    // skippable frames: zstd and lz4 share the magic, what follows decides
+    var sk: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&sk, "\x50\x2a\x4d\x18\x04\x00\x00\x00abcd".p as u64, 12)
+    rt.buf_push_bytes(&sk, F_LZ4.p as u64, F_LZ4.length())
+    check(&t, "a skippable frame before an lz4 frame is lz4", kind_of(view(&sk)) == auto.KIND_LZ4)
+    var sk2: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&sk2, "\x50\x2a\x4d\x18\x04\x00\x00\x00abcd".p as u64, 12)
+    rt.buf_push_bytes(&sk2, F_ZST.p as u64, F_ZST.length())
+    check(&t, "a skippable frame before a zstd frame is zstd", kind_of(view(&sk2)) == auto.KIND_ZSTD)
+    rt.buf_free(&sk2)
+    rt.buf_free(&sk)
+    check(&t, "names", auto.kind_name(auto.KIND_ZSTD) == "zstd" && auto.kind_name(auto.KIND_BZIP2) == "bzip2"
+        && auto.kind_name(77 as u32) == "unknown" && auto.kind_extension(auto.KIND_GZIP) == "gz"
+        && auto.kind_extension(auto.KIND_XZ) == "xz" && auto.kind_extension(auto.KIND_LZ4) == "lz4")
+
+    // B. whole buffer, any format through one call
+    decodes_to(&t, "auto: gzip", F_GZ, PLAIN)
+    decodes_to(&t, "auto: zstd", F_ZST, PLAIN)
+    decodes_to(&t, "auto: zstd, frames and a skippable frame", F_ZST_MULTI, PLAIN)
+    decodes_to(&t, "auto: xz", F_XZ, PLAIN)
+    decodes_to(&t, "auto: bzip2", F_BZ2, PLAIN)
+    decodes_to(&t, "auto: lz4", F_LZ4, PLAIN)
+    decodes_to(&t, "auto: lz4, frames and a skippable frame", F_LZ4_MULTI, PLAIN)
+    decodes_to(&t, "auto: an empty zstd frame", F_EMPTY_ZST, "")
+    var o: rt.Buf = rt.buf_new()
+    check(&t, "unknown content is Format", dec("this is not compressed", 0, &o) == 2 as u32)
+    rt.buf_clear(&o)
+    check(&t, "a zip is an archive: Unsupported", dec("PK\x03\x04xxxxxxxxxxxxxxxxxxxx", 0, &o) == 7 as u32)
+    // by name
+    code = 0
+    auto.decompress_as(auto.KIND_BROTLI, F_BR.p as u64, F_BR.length(), 0, &o) catch | e | (why(e))
+    check(&t, "by name: brotli", code == 0 as u32 && is_plain(&o, PLAIN))
+    rt.buf_clear(&o)
+    auto.decompress_as(auto.KIND_LZMA, F_LZMA.p as u64, F_LZMA.length(), 0, &o) catch | e | (why(e))
+    check(&t, "by name: .lzma", code == 0 as u32 && is_plain(&o, PLAIN))
+    rt.buf_clear(&o)
+    auto.decompress_as(auto.KIND_ZLIB, F_ZLIB.p as u64, F_ZLIB.length(), 0, &o) catch | e | (why(e))
+    check(&t, "by name: zlib", code == 0 as u32 && is_plain(&o, PLAIN))
+    rt.buf_clear(&o)
+    auto.decompress_as(auto.KIND_DEFLATE, F_DEFLATE.p as u64, F_DEFLATE.length(), 0, &o) catch | e | (why(e))
+    check(&t, "by name: raw deflate", code == 0 as u32 && is_plain(&o, PLAIN))
+    rt.buf_clear(&o)
+    // limits go through
+    check(&t, "limit == size - 1 is TooLarge for every format",
+        dec(F_GZ, PLAIN.length() - 1, &o) == 5 as u32 && dec(F_ZST, PLAIN.length() - 1, &o) == 5 as u32
+        && dec(F_XZ, PLAIN.length() - 1, &o) == 5 as u32 && dec(F_BZ2, PLAIN.length() - 1, &o) == 5 as u32
+        && dec(F_LZ4, PLAIN.length() - 1, &o) == 5 as u32)
+    rt.buf_clear(&o)
+
+    // C. compression with the four encoders, read back by auto
+    var kinds: [u32; 4] = [auto.KIND_GZIP, auto.KIND_ZSTD, auto.KIND_XZ, auto.KIND_LZ4]
+    var ki: usize = 0
+    while ki < 4 {
+        var lvl: u32 = 0
+        while lvl < 3 {
+            var z: rt.Buf = rt.buf_new()
+            code = 0
+            auto.compress(kinds[ki], PLAIN.p as u64, PLAIN.length(), lvl * 3, &z) catch | e | (why(e))
+            var back: rt.Buf = rt.buf_new()
+            let c: u32 = dec(view(&z), 0, &back)
+            check(&t, "auto.compress then auto.decompress", code == 0 as u32 && c == 0 as u32 && is_plain(&back, PLAIN)
+                && auto.detect(rt.buf_ptr(&z), rt.buf_len(&z)) == kinds[ki] && rt.buf_len(&z) < PLAIN.length())
+            rt.buf_free(&back)
+            rt.buf_free(&z)
+            lvl = lvl + 1
+        }
+        ki = ki + 1
+    }
+    var nz: rt.Buf = rt.buf_new()
+    code = 0
+    auto.compress(auto.KIND_BZIP2, PLAIN.p as u64, PLAIN.length(), 0, &nz) catch | e | (why(e))
+    check(&t, "bzip2 and brotli have no encoder: Unsupported", code == 7 as u32)
+    rt.buf_free(&nz)
+
+    // D. streaming: the format is found in the descriptor's first octets
+    var pieces: [usize; 3] = [1, 97, 65536]
+    var pi: usize = 0
+    while pi < 3 {
+        var s2: rt.Buf = rt.buf_new()
+        var k: u32 = 0
+        check(&t, "stream: gzip", stream_dec(path, F_GZ, pieces[pi], 0, &k, &s2) == 0 as u32 && is_plain(&s2, PLAIN) && k == auto.KIND_GZIP)
+        rt.buf_clear(&s2)
+        check(&t, "stream: zstd", stream_dec(path, F_ZST_MULTI, pieces[pi], 0, &k, &s2) == 0 as u32 && is_plain(&s2, PLAIN) && k == auto.KIND_ZSTD)
+        rt.buf_clear(&s2)
+        check(&t, "stream: xz", stream_dec(path, F_XZ, pieces[pi], 0, &k, &s2) == 0 as u32 && is_plain(&s2, PLAIN) && k == auto.KIND_XZ)
+        rt.buf_clear(&s2)
+        check(&t, "stream: bzip2", stream_dec(path, F_BZ2, pieces[pi], 0, &k, &s2) == 0 as u32 && is_plain(&s2, PLAIN) && k == auto.KIND_BZIP2)
+        rt.buf_clear(&s2)
+        check(&t, "stream: lz4", stream_dec(path, F_LZ4_MULTI, pieces[pi], 0, &k, &s2) == 0 as u32 && is_plain(&s2, PLAIN) && k == auto.KIND_LZ4)
+        rt.buf_clear(&s2)
+        check(&t, "stream: a limit on the stream", stream_dec(path, F_ZST, pieces[pi], 1000, &k, &s2) == 5 as u32 && rt.buf_len(&s2) <= 1000)
+        rt.buf_clear(&s2)
+        check(&t, "stream: unknown content is Format", stream_dec(path, "no compression here, just words and words", pieces[pi], 0, &k, &s2) == 2 as u32)
+        rt.buf_clear(&s2)
+        check(&t, "stream: an empty file is Truncated", stream_dec(path, "", pieces[pi], 0, &k, &s2) == 4 as u32)
+        rt.buf_free(&s2)
+        pi = pi + 1
+    }
+    var mem: auto.AutoDec = auto.auto_dec_open_mem(F_XZ.p as u64, F_XZ.length()) catch | e | (open_why(e))
+    var mo: rt.Buf = rt.buf_new()
+    var tmp: u64 = rt.heap_alloc(1000)
+    var kk: usize = 1
+    while kk > 0 {
+        kk = auto.auto_dec_read(&mem, tmp, 1000) catch 0
+        rt.buf_push_bytes(&mo, tmp, kk)
+    }
+    rt.heap_free(tmp, 1000)
+    auto.auto_dec_close(&mem)
+    check(&t, "stream from memory", is_plain(&mo, PLAIN))
+    rt.buf_free(&mo)
+    rt.buf_free(&o)
+    fs.remove(path) catch false
+    return finish(&t)
+}

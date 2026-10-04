@@ -220,6 +220,48 @@ w("words.bin", words)
 w("words.br", brotli.compress(words, quality=11, mode=brotli.MODE_TEXT))
 w("empty.br", brotli.compress(b""))
 
+
+class BitW:
+    """LSB-first bit writer (the order of Brotli)"""
+    def __init__(self):
+        self.bits = []
+
+    def put(self, v, n):
+        for i in range(n):
+            self.bits.append((v >> i) & 1)
+
+    def align(self):
+        while len(self.bits) % 8:
+            self.bits.append(0)
+
+    def raw(self, data):
+        self.align()
+        for b in data:
+            self.put(b, 8)
+
+    def done(self):
+        self.align()
+        out = bytearray()
+        for i in range(0, len(self.bits), 8):
+            out.append(sum(b << k for k, b in enumerate(self.bits[i:i + 8])))
+        return bytes(out)
+
+
+# a stream made only of uncompressed and metadata meta-blocks (WBITS = 24, then 16 in a second file)
+raw1, raw2 = plain[:300], plain[300:400]
+bw = BitW()
+bw.put(1, 1); bw.put(7, 3)          # WBITS: 17 + 7 = 24
+bw.put(0, 1); bw.put(0, 2); bw.put(len(raw1) - 1, 16); bw.put(1, 1); bw.raw(raw1)   # stored meta-block
+bw.put(0, 1); bw.put(3, 2); bw.put(0, 1); bw.put(1, 2); bw.put(19, 8); bw.raw(b"metadata is skipped!")  # metadata
+bw.put(0, 1); bw.put(0, 2); bw.put(len(raw2) - 1, 16); bw.put(1, 1); bw.raw(raw2)   # stored again
+bw.put(1, 1); bw.put(1, 1)          # the last, empty meta-block
+w("stored.br", bw.done())
+w("stored.bin", raw1 + raw2)
+bw = BitW()
+bw.put(0, 1)                         # WBITS 16
+bw.put(1, 1); bw.put(1, 1)           # an empty stream
+w("tiny_empty.br", bw.done())
+
 # ---------------------------------------------------------------------------- gzip / zlib / deflate
 w("plain.gz", gzip.compress(plain, 6, mtime=0))
 b = io.BytesIO()
@@ -232,6 +274,41 @@ w("plain.deflate", c.compress(plain) + c.flush())
 c = zlib.compressobj(6, zlib.DEFLATED, -15, 9, zlib.Z_FIXED)
 w("plain_fixed.deflate", c.compress(plain[:3000]) + c.flush())
 w("plain_stored.gz", gzip.compress(plain[:20000], 0, mtime=0))
+# a gzip stream whose second member refers to the first member's data (a preset dictionary):
+# every inflater must refuse it -- a gzip member has a window of its own
+m1 = b"hello world, hello world, hello world!!"
+tail = b"hello world, hello world"
+co = zlib.compressobj(9, zlib.DEFLATED, -15, 9, zlib.Z_DEFAULT_STRATEGY, m1)
+raw2 = co.compress(tail) + co.flush()
+hdr = bytes([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3])
+w("crossmember.gz", gzip.compress(m1, 6, mtime=0) + hdr + raw2 + struct.pack("<II", zlib.crc32(tail), len(tail)))
+
+# ------------------------------------------------------------------ a small tar in every compression
+import tarfile
+tb = io.BytesIO()
+with tarfile.open(fileobj=tb, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+    def add(name, data=b"", mode=0o644, typ=tarfile.REGTYPE, link=""):
+        ti = tarfile.TarInfo(name)
+        ti.size = len(data) if typ == tarfile.REGTYPE else 0
+        ti.mode = mode
+        ti.mtime = 1700000000
+        ti.type = typ
+        ti.linkname = link
+        tf.addfile(ti, io.BytesIO(data) if typ == tarfile.REGTYPE else None)
+    add("pkg/", mode=0o755, typ=tarfile.DIRTYPE)
+    add("pkg/bin/", mode=0o755, typ=tarfile.DIRTYPE)
+    add("pkg/bin/run", b"#!/bin/sh\necho hello from the archive\n", mode=0o755)
+    add("pkg/bin/run-link", typ=tarfile.SYMTYPE, link="run")
+    add("pkg/readme.txt", plain[:3000])
+    add("pkg/data/", mode=0o755, typ=tarfile.DIRTYPE)
+    add("pkg/data/blob.bin", rb)
+tar_bytes = tb.getvalue()
+w("pack.tar", tar_bytes)
+w("pack.tar.zst", zstd(["-3"], tar_bytes))
+w("pack.tar.xz", lzma.compress(tar_bytes, preset=3))
+w("pack.tar.bz2", bz2.compress(tar_bytes, 9))
+w("pack.tar.lz4", lf.compress(tar_bytes, content_checksum=True))
+w("pack.tar.gz", gzip.compress(tar_bytes, 6, mtime=0))
 
 sys.stderr.write("fixtures in %s: %d files, %d octets\n" % (
     out, len(os.listdir(out)), sum(os.path.getsize(os.path.join(out, f)) for f in os.listdir(out))))
