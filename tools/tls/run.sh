@@ -13,6 +13,9 @@
 #      signature                                      (p256_check.py)
 #   5. the TLS SERVER against openssl s_client, curl and Python's ssl,
 #      HelloRetryRequest, KeyUpdate, and the refusals (server_check.py)
+#   6. the TLS 1.2 half of the client: suites x groups x signature schemes
+#      against openssl, 512 KiB through Python's ssl, man-in-the-middle and
+#      hostile-server counter-checks, a fuzz run, real hosts (tls12_check.py)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 FIRNC="${FIRNC:-$(pwd)/compiler/target/release/firnc}"
@@ -34,4 +37,5 @@ python3 tools/tls/cert_check.py "$WORK/x509" 2>&1 | tail -3 || rc=1
 python3 tools/tls/tls_check.py "$WORK/tls" 2>&1 | tail -3 || rc=1
 python3 tools/tls/p256_check.py "$WORK/p256" 2>&1 | tail -3 || rc=1
 python3 tools/tls/server_check.py "$WORK/tlsserver" "$WORK/srv" 2>&1 | tail -2 || rc=1
+python3 tools/tls/tls12_check.py "$WORK/tls" 2>&1 | tail -6 || rc=1
 exit $rc

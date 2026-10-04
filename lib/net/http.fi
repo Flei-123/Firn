@@ -24,12 +24,19 @@
 //
 // WHAT IS NOT, AND WHY IT IS SAID HERE RATHER THAN FOUND OUT LATER
 //
-//   TLS WITHOUT ROOTS. `https://` goes through lib/tls/tls.fi (TLS 1.3,
-//   certificate chain and host name checked against the system's roots,
-//   lib/tls/trust*.fi). Where the system has no usable roots the request
-//   is REFUSED with `HttpError::Tls` -- never downgraded to http:// and
-//   never sent unverified. There is no switch that turns the check off.
-//   TLS 1.2 servers are not reachable (tls.fi offers 1.3 only).
+//   TLS WITHOUT ROOTS. `https://` goes through lib/tls/tls.fi (TLS 1.3 and
+//   TLS 1.2, certificate chain and host name checked against the system's
+//   roots, lib/tls/trust*.fi). Where the system has no usable roots the
+//   request is REFUSED with `HttpError::Tls` -- never downgraded to http://
+//   and never sent unverified. There is no switch that turns the check off.
+//
+//   TLS VERSIONS. The ONE ClientHello offers 1.3 and 1.2; the server picks
+//   (`client_tls_version` says what it picked: 772 or 771). There is no
+//   second attempt with an older version after a failure -- that "fallback"
+//   is what downgrade attacks use -- and a server that picks 1.2 although it
+//   speaks 1.3 is refused (`Downgrade`, tls_err 16). TLS 1.0 and 1.1 servers
+//   are not reachable. `client_set_tls_max(c, 771)` offers 1.2 only, for the
+//   rare server that cannot cope with a ClientHello that mentions 1.3.
 //
 //   NAMES. A host that is not a numeric address is resolved by
 //   lib/net/dns.fi (resolv.conf / GetNetworkParams, hosts file, UDP with
@@ -63,6 +70,7 @@ export {
     client_set_keepalive, client_set_max_redirects,
     client_resolver, client_add_trust_pem, client_set_system_trust,
     client_tls_error, client_tls_verify, client_tls_roots, client_is_tls,
+    client_tls_version, client_set_tls_max,
     client_jar, client_cache,
     client_sockets, client_reused, client_requests, client_redirects,
     resp_new, resp_init, resp_free, resp_reset,
@@ -133,6 +141,8 @@ struct Client {
     store_ready: bool, // the system roots have been loaded (or tried)
     sys_trust: bool, // load the system roots on the first https
     tls_err: u32, // tls_err_num of the last failed handshake, 0 = none
+    tls_ver: u32, // 772 / 771: what the last successful handshake negotiated
+    tls_max: u32, // 772 (default) or 771: the highest version offered
     tls_verify: u32, // x509 verdict of the last handshake
 }
 
@@ -282,7 +292,7 @@ fn client_new() -> Client {
         res: dns.resolver_new(), res_ready: false,
         tc: tls.tls_new(), is_tls: false, ctls: false,
         store: x509.store_new(), store_ready: false, sys_trust: true,
-        tls_err: 0 as u32, tls_verify: 0 as u32,
+        tls_err: 0 as u32, tls_ver: 0 as u32, tls_max: 772 as u32, tls_verify: 0 as u32,
     }
 }
 
@@ -340,13 +350,23 @@ fn client_set_system_trust(c: *mut Client, on: bool) { (*c).sys_trust = on }
 
 // Why the last TLS handshake failed: tls_err_num of its error (1 Io,
 // 2 Closed, 3 Protocol, 4 Version, 5 Group, 6 Suite, 7 Retry, 8 Alert,
-// 9 Certificate, 10 Signature, ...), 100 when there were no roots at all,
+// 9 Certificate, 10 Signature, ... 16 Downgrade), 100 when there were no roots at all,
 // 101 for a host name too long for SNI; 0 when it did not fail.
 fn client_tls_error(c: *mut Client) -> u32 { return (*c).tls_err }
 // The x509 verdict of the last handshake (x509.V_OK, V_NAME, V_EXPIRED, ...).
 fn client_tls_verify(c: *mut Client) -> u32 { return (*c).tls_verify }
 fn client_tls_roots(c: *mut Client) -> usize { return x509.store_count(&(*c).store) }
 fn client_is_tls(c: *mut Client) -> bool { return (*c).is_tls }
+// The TLS version of the last successful https handshake: 772 (1.3), 771 (1.2), 0 = none yet.
+fn client_tls_version(c: *mut Client) -> u32 { return (*c).tls_ver }
+// 771: offer TLS 1.2 only; anything else: 1.3 and 1.2 (the default).
+fn client_set_tls_max(c: *mut Client, v: u32) {
+    if v == 771 as u32 {
+        (*c).tls_max = 771 as u32
+    } else {
+        (*c).tls_max = 772 as u32
+    }
+}
 
 fn client_now(c: *mut Client) -> u64 {
     if (*c).now_fixed != 0 as u64 {
@@ -461,6 +481,7 @@ fn tls_open(c: *mut Client, hp: u64, hn: usize) -> bool {
         return false
     }
     (*c).tls_err = 0 as u32
+    tls.tls_set_max_version(&(*c).tc, (*c).tls_max)
     let ok: bool = tls.tls_handshake(&(*c).tc)
     catch | e | hs_fail(c, tls.tls_err_num(e))
     (*c).tls_verify = tls.tls_verify_reason(&(*c).tc)
@@ -470,6 +491,7 @@ fn tls_open(c: *mut Client, hp: u64, hn: usize) -> bool {
         return false
     }
     (*c).is_tls = true
+    (*c).tls_ver = tls.tls_version(&(*c).tc)
     return true
 }
 
