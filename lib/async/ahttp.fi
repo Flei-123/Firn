@@ -1,0 +1,918 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/async/ahttp.fi -- an HTTP/1.1 client that never blocks: requests run
+// on the event loop and answer through a callback.
+//
+//     import async.loop
+//     import async.ahttp
+//
+//     fn done(r: *mut ahttp.Request, ud: u64) {
+//         if ahttp.areq_error(r) != 0 { ... return }
+//         let status: u32 = ahttp.areq_status(r)
+//         // ahttp.areq_body_ptr(r) .. areq_body_len(r)
+//     }                                     // `r` is freed when this returns
+//
+//     var a: ahttp.AClient = ahttp.aclient_new()
+//     ahttp.aclient_init(&a, &l)
+//     ahttp.aclient_get_str(&a, "https://example.com/", 15000, done, 0)
+//     loop.run(&l)
+//
+// It SHARES the parts of net.http that are not about waiting: the request
+// is written by `http.build_request` (headers, cookies of the jar, gzip),
+// the response head by `http.parse_head`, `Content-Type` by
+// `http.split_content_type`, `Content-Encoding: gzip/deflate` by
+// `http.undo_encoding`, cookies by `http.harvest_cookies`, and the answer is
+// an ordinary `http.Response` (`areq_response`) so every `resp_*` accessor
+// of net.http works on it. What it adds is the framing as a PUSH parser: the
+// head, then `Content-Length`, `Transfer-Encoding: chunked` or "until the
+// peer closes", fed with whatever the stream has delivered so far. https
+// goes through the non-blocking TLS handshake of async.stream; the roots,
+// jar, redirect limit and gzip switch are those of the embedded
+// `net.http.Client` (`aclient_http`), so one program configures both clients
+// the same way.
+//
+// HOW ONE REQUEST GOES (the states are `P_*` below)
+//   resolve -> connect (stream_open[_tls]) -> write request -> HEAD ->
+//   BODY(len | chunked | close) -> finish: decode, cookies, then either
+//   a redirect (a NEW connection, same rules as net.http: 303 and 301/302 of
+//   a POST become GET, 307/308 keep method and body, loop and hop limit)
+//   or the callback.
+//
+// ERRORS. `areq_error` is 0 or one of the numbers of `net.http.err_num`
+// (1 Url, 2 Scheme, 3 Tls, 4 Resolve, 5 Connect, 6 Send, 7 Recv, 8 Closed,
+// 9 Status, 10 Header, 11 Body, 12 Encoding, 13 TooManyRedirects,
+// 14 RedirectLoop, 15 TooLarge, 16 OutOfMemory) or, new here,
+// AE_TIMEOUT (100: the idle or the total time ran out) / AE_CANCELLED (101).
+// `areq_error_name` spells either kind. For a Tls error `areq_tls_error`
+// holds the tls.tls_err_num (9 = the certificate was refused).
+//
+// ==================================================================== HONEST
+//
+// H1  ONE REQUEST, ONE CONNECTION. Every request sends `Connection: close`
+//     and opens its own socket; there is no keep-alive pool and no
+//     pipelining. 1000 requests are 1000 handshakes.
+// H2  NAMES ARE RESOLVED BLOCKING (lib/net/dns.fi, UDP with a timeout,
+//     TTL cache): the first lookup of a name stalls the loop for its
+//     duration. Numeric addresses and `localhost` never block. Only the
+//     first address of an answer is tried, then the next ones in order when
+//     the connect fails.
+// H3  NO RESPONSE CACHE and no conditional requests; that stays in the
+//     blocking client. Cookies and redirects are handled.
+// H4  THE BODY IS HELD IN MEMORY (limit `BODY_MAX` = 32 MiB, `areq_set_max_body`
+//     lowers it). A download to a file belongs to a streaming API, not here.
+// H5  `Expect: 100-continue` is not sent; a 1xx answer is skipped.
+// H6  TLS 1.3 only, as net.http (T-notes of lib/tls/tls.fi apply).
+// H7  An https request needs roots: the system's (unless
+//     `client_set_system_trust(false)`) plus `client_add_trust_pem`. None at
+//     all is a refusal (error 3), never an unverified connection.
+import std.rt
+import std.net
+import net.url
+import net.http
+import net.dns
+import tls.x509
+import tls.trust
+import async.loop
+import async.stream
+
+export {
+    AClient, Request,
+    AE_TIMEOUT, AE_CANCELLED,
+    aclient_new, aclient_init, aclient_free, aclient_http,
+    aclient_request, aclient_get, aclient_get_str, aclient_post,
+    areq_error, areq_tls_error, areq_status, areq_body_ptr, areq_body_len,
+    areq_header, areq_response, areq_final_url_ptr, areq_final_url_len,
+    areq_hops, areq_is_tls, areq_cancel, areq_set_max_body, areq_error_name,
+    areq_elapsed_ms, aclient_active, aclient_completed,
+}
+
+const AE_TIMEOUT: u32 = 100
+const AE_CANCELLED: u32 = 101
+
+const P_CONNECT: u32 = 1
+const P_HEAD: u32 = 2
+const P_BODY_LEN: u32 = 3
+const P_CHUNK_SIZE: u32 = 4
+const P_CHUNK_DATA: u32 = 5
+const P_CHUNK_CRLF: u32 = 6
+const P_CHUNK_TRAILER: u32 = 7
+const P_BODY_CLOSE: u32 = 8
+const P_DONE: u32 = 9
+
+struct AClient {
+    c: http.Client,
+    l: *mut loop.Loop,
+    active: usize,
+    completed: u64,
+}
+
+struct Request {
+    a: *mut AClient,
+    cur: url.Url,
+    meth: rt.Buf,
+    body: rt.Buf,
+    ctype: rt.Buf,
+    chain: rt.Buf, // URLs seen (loop guard): u32 length + octets
+    r: http.Response,
+    st: *mut stream.Stream,
+    phase: u32,
+    cb: fn(*mut Request, u64),
+    ud: u64,
+    err: u32,
+    tlserr: u32,
+    hops: u32,
+    timeout_ms: i64,
+    deadline_timer: u64,
+    t0: i64,
+    t_end: i64,
+    scan: usize, // where the search for CRLFCRLF goes on
+    remaining: usize, // octets of the current body / chunk still to come
+    maxbody: usize,
+    addrs: [u32; 8],
+    naddr: usize,
+    iaddr: usize,
+    port: u16,
+    secure: bool,
+    is_tls_done: bool,
+    gone: bool, // freed or being freed: ignore late events
+    defer_pending: bool, // deferred_fail will still look at this request
+    busy: u32,
+}
+
+// `size_of` needs a generic parameter outside the root file (see stream.fi).
+fn ah_obj_alloc[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+fn ah_obj_free[T](p: u64) {
+    rt.heap_free(p, size_of[T]())
+}
+
+// ------------------------------------------------------------------ Client
+
+fn aclient_new() -> AClient {
+    return AClient { c: http.client_new(), l: 0 as *mut loop.Loop, active: 0, completed: 0 }
+}
+
+// Sets up the embedded blocking client as a CONFIGURATION holder: jar, roots,
+// limits. No cache, no keep-alive (H1, H3).
+fn aclient_init(a: *mut AClient, l: *mut loop.Loop) -> bool {
+    (*a).l = l
+    if !http.client_init(&(*a).c) {
+        return false
+    }
+    (*a).c.keep_alive = false
+    (*a).c.use_cache = false
+    return true
+}
+
+fn aclient_free(a: *mut AClient) {
+    http.client_free(&(*a).c)
+}
+
+// The embedded net.http client: `client_add_trust_pem`,
+// `client_set_system_trust`, `client_set_max_redirects`, `client_set_gzip`,
+// `client_jar` ... all apply.
+fn aclient_http(a: *mut AClient) -> *mut http.Client {
+    return &(*a).c
+}
+
+fn aclient_active(a: *mut AClient) -> usize { return (*a).active }
+fn aclient_completed(a: *mut AClient) -> u64 { return (*a).completed }
+
+// ---------------------------------------------------------------- Accessors
+
+fn areq_error(r: *mut Request) -> u32 { return (*r).err }
+fn areq_tls_error(r: *mut Request) -> u32 { return (*r).tlserr }
+fn areq_status(r: *mut Request) -> u32 { return (*r).r.status }
+fn areq_body_ptr(r: *mut Request) -> u64 { return (*r).r.body.ptr }
+fn areq_body_len(r: *mut Request) -> usize { return (*r).r.body.len }
+fn areq_response(r: *mut Request) -> *mut http.Response { return &(*r).r }
+fn areq_final_url_ptr(r: *mut Request) -> u64 { return (&(*r).r.final_url[0]) as u64 }
+fn areq_final_url_len(r: *mut Request) -> usize { return (*r).r.nfinal }
+fn areq_hops(r: *mut Request) -> u32 { return (*r).hops }
+fn areq_is_tls(r: *mut Request) -> bool { return (*r).secure }
+fn areq_set_max_body(r: *mut Request, n: usize) { (*r).maxbody = n }
+fn areq_elapsed_ms(r: *mut Request) -> i64 {
+    var e: i64 = (*r).t_end
+    if e == 0 {
+        e = loop.mono_ms()
+    }
+    return e - (*r).t0
+}
+
+// The value of a response header (case-insensitive), length 0 = none.
+fn areq_header(r: *mut Request, name: u64, n: usize, at: *mut u64) -> usize {
+    return http.resp_header(&(*r).r, name, n, at)
+}
+
+fn areq_error_name(code: u32, out: *mut rt.Buf) {
+    if code == AE_TIMEOUT {
+        rt.buf_push_bytes(out, "Timeout".p as u64, 7)
+        return
+    }
+    if code == AE_CANCELLED {
+        rt.buf_push_bytes(out, "Cancelled".p as u64, 9)
+        return
+    }
+    if code == 0 {
+        rt.buf_push_bytes(out, "Ok".p as u64, 2)
+        return
+    }
+    http.err_name_of(http.err_of(code), out)
+}
+
+// ----------------------------------------------------------------- Starting
+
+fn aclient_get_str(a: *mut AClient, u: str, timeout_ms: i64,
+    cb: fn(*mut Request, u64), ud: u64) -> *mut Request {
+    return aclient_get(a, u.p as u64, u.n, timeout_ms, cb, ud)
+}
+
+fn aclient_get(a: *mut AClient, u: u64, n: usize, timeout_ms: i64,
+    cb: fn(*mut Request, u64), ud: u64) -> *mut Request {
+    return aclient_request(a, "GET".p as u64, 3, u, n, 0 as u64, 0, 0 as u64, 0, timeout_ms, cb, ud)
+}
+
+fn aclient_post(a: *mut AClient, u: u64, n: usize, body: u64, nb: usize,
+    ctype: u64, nct: usize, timeout_ms: i64,
+    cb: fn(*mut Request, u64), ud: u64) -> *mut Request {
+    return aclient_request(a, "POST".p as u64, 4, u, n, body, nb, ctype, nct, timeout_ms, cb, ud)
+}
+
+// `timeout_ms`: the TOTAL time of the request (redirects included); 0 = none.
+// The idle time (nothing read or written) is the embedded client's
+// `client_set_timeout`. The callback is called exactly once -- also when
+// starting fails (then from the NEXT round of the loop, never inside this
+// call). Returns 0 only when there is no memory for the request itself.
+fn aclient_request(a: *mut AClient, method: u64, nm: usize, u: u64, n: usize,
+    body: u64, nb: usize, ctype: u64, nct: usize, timeout_ms: i64,
+    cb: fn(*mut Request, u64), ud: u64) -> *mut Request {
+    let p: u64 = ah_obj_alloc[Request]()
+    if p == 0 {
+        return 0 as *mut Request
+    }
+    let rq: *mut Request = p as *mut Request
+    *rq = Request { a: a, cur: url.url_new(), meth: rt.buf_new(), body: rt.buf_new(),
+        ctype: rt.buf_new(), chain: rt.buf_new(), r: http.resp_new(),
+        st: 0 as *mut stream.Stream, phase: P_CONNECT, cb: cb, ud: ud, err: 0,
+        tlserr: 0, hops: 0, timeout_ms: timeout_ms, deadline_timer: 0,
+        t0: loop.mono_ms(), t_end: 0, scan: 0, remaining: 0, maxbody: http.BODY_MAX,
+        addrs: [0; 8], naddr: 0, iaddr: 0, port: 0 as u16, secure: false,
+        is_tls_done: false, gone: false, defer_pending: false, busy: 0 }
+    rt.buf_push_bytes(&(*rq).meth, method, nm)
+    rt.buf_push_bytes(&(*rq).body, body, nb)
+    rt.buf_push_bytes(&(*rq).ctype, ctype, nct)
+    (*a).active = (*a).active + 1
+    if !url.url_parse(u, n, &(*rq).cur) {
+        (*rq).err = 1
+        (*rq).defer_pending = true
+        loop.defer_call((*a).l, deferred_fail, p)
+        return rq
+    }
+    if timeout_ms > 0 {
+        (*rq).deadline_timer = loop.timer_after((*a).l, timeout_ms, on_deadline, p)
+    }
+    if !begin(rq) {
+        (*rq).defer_pending = true
+        loop.defer_call((*a).l, deferred_fail, p)
+    }
+    return rq
+}
+
+// A failure found while starting is reported from the loop, not from inside
+// the call that started it.
+fn deferred_fail(l: *mut loop.Loop, ud: u64) {
+    let rq: *mut Request = ud as *mut Request
+    (*rq).defer_pending = false
+    if (*rq).gone {
+        if (*rq).busy == 0 {
+            release(rq)
+        }
+        return
+    }
+    finish(rq)
+}
+
+fn on_deadline(l: *mut loop.Loop, ud: u64) {
+    let rq: *mut Request = ud as *mut Request
+    (*rq).deadline_timer = 0
+    if (*rq).gone || (*rq).phase == P_DONE {
+        return
+    }
+    fail(rq, AE_TIMEOUT)
+}
+
+// Resolves the host and opens the stream for `cur`. false = (*rq).err is set.
+fn begin(rq: *mut Request) -> bool {
+    let a: *mut AClient = (*rq).a
+    if !url.url_is_http(&(*rq).cur) && !url.url_is_https(&(*rq).cur) {
+        (*rq).err = 2
+        return false
+    }
+    (*rq).secure = url.url_is_https(&(*rq).cur)
+    (*rq).port = url.url_port(&(*rq).cur)
+    (*rq).naddr = http.addrs_of_host(&(*a).c, url.url_host_ptr(&(*rq).cur),
+        url.url_host_len(&(*rq).cur), &(*rq).addrs)
+    if (*rq).naddr == 0 {
+        (*rq).err = 4
+        return false
+    }
+    (*rq).iaddr = 0
+    return connect_next(rq)
+}
+
+fn connect_next(rq: *mut Request) -> bool {
+    let a: *mut AClient = (*rq).a
+    let addr: u32 = (*rq).addrs[(*rq).iaddr]
+    (*rq).phase = P_CONNECT
+    (*rq).scan = 0
+    rt.buf_clear(&(*rq).r.raw)
+    var s: *mut stream.Stream = 0 as *mut stream.Stream
+    let idle: i64 = (*a).c.timeout_ms as i64
+    if (*rq).secure {
+        if !(*a).c.store_ready {
+            if (*a).c.sys_trust {
+                trust.trust_load_system(&(*a).c.store)
+            }
+            (*a).c.store_ready = true
+        }
+        if x509.store_count(&(*a).c.store) == 0 {
+            (*rq).err = 3
+            (*rq).tlserr = 100 as u32 // no roots
+            return false
+        }
+        let hn: usize = url.url_host_len(&(*rq).cur)
+        let hs: str = str { p: url.url_host_ptr(&(*rq).cur) as *mut u8, n: hn }
+        s = stream.stream_open_tls((*a).l, addr, (*rq).port, hs, &(*a).c.store,
+            http.client_now(&(*a).c), idle, on_stream, rq as u64)
+    } else {
+        s = stream.stream_open((*a).l, addr, (*rq).port, idle, on_stream, rq as u64)
+    }
+    if s as u64 == 0 {
+        (*rq).err = 5
+        return false
+    }
+    (*rq).st = s
+    return true
+}
+
+// -------------------------------------------------------------- The stream
+
+fn on_stream(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    let rq: *mut Request = ud as *mut Request
+    if (*rq).gone || s != (*rq).st {
+        return // an old stream (before a redirect / after a cancel)
+    }
+    (*rq).busy = (*rq).busy + 1
+    handle(rq, s, kind, arg)
+    (*rq).busy = (*rq).busy - 1
+    if (*rq).busy == 0 && (*rq).gone {
+        release(rq)
+    }
+}
+
+fn handle(rq: *mut Request, s: *mut stream.Stream, kind: u32, arg: i64) {
+    if kind == stream.SE_CONNECTED {
+        send_request(rq, s)
+    } else if kind == stream.SE_DATA {
+        feed(rq, s)
+    } else if kind == stream.SE_CLOSED {
+        (*rq).st = 0 as *mut stream.Stream
+        on_closed(rq, s, arg)
+    }
+}
+
+fn send_request(rq: *mut Request, s: *mut stream.Stream) {
+    let a: *mut AClient = (*rq).a
+    var req: rt.Buf = rt.buf_new()
+    http.build_request(&(*a).c, &(*rq).cur, (*rq).meth.ptr, (*rq).meth.len,
+        (*rq).body.ptr, (*rq).body.len, (*rq).ctype.ptr, (*rq).ctype.len,
+        0 as u64, 0, 0 as u64, 0, &req)
+    let ok: bool = stream.stream_write(s, req.ptr, req.len)
+    rt.buf_free(&req)
+    if !ok {
+        fail(rq, 6)
+        return
+    }
+    (*rq).phase = P_HEAD
+    (*rq).scan = 0
+    (*rq).is_tls_done = true
+}
+
+fn on_closed(rq: *mut Request, s: *mut stream.Stream, reason: i64) {
+    if (*rq).phase == P_DONE {
+        return
+    }
+    if (*rq).phase == P_BODY_CLOSE && reason == stream.CL_EOF {
+        finish_response(rq)
+        return
+    }
+    if (*rq).phase == P_CONNECT {
+        if reason == stream.CL_TIMEOUT {
+            (*rq).err = AE_TIMEOUT
+        } else if reason == stream.CL_TLS {
+            (*rq).err = 3
+            (*rq).tlserr = stream.stream_tls_error(s)
+        } else {
+            // a connect that failed: the next address, if the answer had more
+            if (*rq).iaddr + 1 < (*rq).naddr {
+                (*rq).iaddr = (*rq).iaddr + 1
+                if connect_next(rq) {
+                    return
+                }
+                finish(rq)
+                return
+            }
+            (*rq).err = 5
+        }
+        finish(rq)
+        return
+    }
+    if reason == stream.CL_TIMEOUT {
+        (*rq).err = AE_TIMEOUT
+    } else if reason == stream.CL_TLS {
+        (*rq).err = 3
+        (*rq).tlserr = stream.stream_tls_error(s)
+    } else if reason == stream.CL_EOF {
+        (*rq).err = 8 // closed in the middle of a message
+    } else {
+        (*rq).err = 7
+    }
+    finish(rq)
+}
+
+// ----------------------------------------------------------- The push parser
+
+fn find_crlfcrlf(p: u64, n: usize, from: usize) -> usize {
+    var i: usize = from
+    while i + 4 <= n {
+        if rt.ld8(p, i) == 13 as u8 && rt.ld8(p, i + 1) == 10 as u8 &&
+        rt.ld8(p, i + 2) == 13 as u8 && rt.ld8(p, i + 3) == 10 as u8 {
+            return i + 4
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn hexv(ch: u8) -> i32 {
+    if ch >= 48 as u8 && ch <= 57 as u8 {
+        return (ch - 48 as u8) as i32
+    }
+    if ch >= 97 as u8 && ch <= 102 as u8 {
+        return (ch - 97 as u8) as i32 + 10
+    }
+    if ch >= 65 as u8 && ch <= 70 as u8 {
+        return (ch - 65 as u8) as i32 + 10
+    }
+    return 0 - 1
+}
+
+// Takes `n` octets of the stream's input into the body.
+fn take_body(rq: *mut Request, s: *mut stream.Stream, n: usize) -> bool {
+    if (*rq).r.body.len + n > (*rq).maxbody {
+        fail(rq, 15)
+        return false
+    }
+    rt.buf_push_bytes(&(*rq).r.body, stream.stream_in_ptr(s), n)
+    stream.stream_consume(s, n)
+    return true
+}
+
+// Called whenever input has arrived. Goes on as far as the input allows.
+fn feed(rq: *mut Request, s: *mut stream.Stream) {
+    while !(*rq).gone && (*rq).phase != P_DONE && (*rq).st == s {
+        let have: usize = stream.stream_in_len(s)
+        let p: u64 = stream.stream_in_ptr(s)
+        if (*rq).phase == P_HEAD {
+            let end: usize = find_crlfcrlf(p, have, (*rq).scan)
+            if end == 0 {
+                if have > http.HDR_MAX {
+                    fail(rq, 10)
+                    return
+                }
+                (*rq).scan = 0
+                if have > 3 {
+                    (*rq).scan = have - 3
+                }
+                return
+            }
+            rt.buf_clear(&(*rq).r.raw)
+            rt.buf_push_bytes(&(*rq).r.raw, p, end)
+            stream.stream_consume(s, end)
+            (*rq).scan = 0
+            let okp: bool = http.parse_head(&(*rq).r) catch |e| set_err(rq, http.err_num(e))
+            if !okp {
+                finish(rq)
+                return
+            }
+            if (*rq).r.status < 200 as u32 && (*rq).r.status != 101 as u32 {
+                continue // 1xx: the real answer follows (H5)
+            }
+            if !start_body(rq) {
+                return
+            }
+            continue
+        }
+        if (*rq).phase == P_BODY_LEN {
+            var k: usize = (*rq).remaining
+            if have < k {
+                k = have
+            }
+            if k > 0 {
+                if !take_body(rq, s, k) {
+                    return
+                }
+                (*rq).remaining = (*rq).remaining - k
+            }
+            if (*rq).remaining == 0 {
+                finish_response(rq)
+                return
+            }
+            return
+        }
+        if (*rq).phase == P_BODY_CLOSE {
+            if have > 0 {
+                if !take_body(rq, s, have) {
+                    return
+                }
+            }
+            return
+        }
+        // --- chunked
+        if (*rq).phase == P_CHUNK_SIZE || (*rq).phase == P_CHUNK_TRAILER ||
+        (*rq).phase == P_CHUNK_CRLF {
+            // one line: up to LF
+            var le: usize = 0
+            var i: usize = 0
+            while i < have {
+                if rt.ld8(p, i) == 10 as u8 {
+                    le = i + 1
+                    break
+                }
+                i = i + 1
+            }
+            if le == 0 {
+                if have > 8192 {
+                    fail(rq, 11)
+                }
+                return
+            }
+            var ll: usize = le - 1
+            if ll > 0 && rt.ld8(p, ll - 1) == 13 as u8 {
+                ll = ll - 1
+            }
+            if (*rq).phase == P_CHUNK_CRLF {
+                if ll != 0 {
+                    fail(rq, 11)
+                    return
+                }
+                stream.stream_consume(s, le)
+                (*rq).phase = P_CHUNK_SIZE
+                continue
+            }
+            if (*rq).phase == P_CHUNK_TRAILER {
+                stream.stream_consume(s, le)
+                if ll == 0 {
+                    (*rq).r.wire = (*rq).r.body.len
+                    finish_response(rq)
+                    return
+                }
+                continue
+            }
+            // the chunk size line: hex digits, then an optional extension
+            var size: usize = 0
+            var any: bool = false
+            var q: usize = 0
+            while q < ll {
+                let ch: u8 = rt.ld8(p, q)
+                if ch == 59 as u8 || ch == 32 as u8 || ch == 9 as u8 {
+                    break
+                }
+                let v: i32 = hexv(ch)
+                if v < 0 {
+                    fail(rq, 11)
+                    return
+                }
+                any = true
+                size = size * 16 + v as usize
+                if size > (*rq).maxbody {
+                    fail(rq, 15)
+                    return
+                }
+                q = q + 1
+            }
+            if !any {
+                fail(rq, 11)
+                return
+            }
+            stream.stream_consume(s, le)
+            if size == 0 {
+                (*rq).phase = P_CHUNK_TRAILER
+            } else {
+                (*rq).r.chunks = (*rq).r.chunks + 1 as u32
+                (*rq).remaining = size
+                (*rq).phase = P_CHUNK_DATA
+            }
+            continue
+        }
+        if (*rq).phase == P_CHUNK_DATA {
+            var k2: usize = (*rq).remaining
+            if have < k2 {
+                k2 = have
+            }
+            if k2 > 0 {
+                if !take_body(rq, s, k2) {
+                    return
+                }
+                (*rq).remaining = (*rq).remaining - k2
+            }
+            if (*rq).remaining == 0 {
+                (*rq).phase = P_CHUNK_CRLF
+                continue
+            }
+            return
+        }
+        return
+    }
+}
+
+// `catch |e| set_err(rq, http.err_num(e))`: parks the error number and
+// answers false (an error type of another module cannot be named here).
+fn set_err(rq: *mut Request, n: u32) -> bool {
+    (*rq).err = n
+    return false
+}
+
+// The head is parsed: decide how long the body is (RFC 9112 6.3).
+fn start_body(rq: *mut Request) -> bool {
+    let r: *mut http.Response = &(*rq).r
+    var h_te: [u8; 17] = "Transfer-Encoding"
+    var h_cl: [u8; 14] = "Content-Length"
+    var h_cn: [u8; 10] = "Connection"
+    var at: u64 = 0
+    let nte: usize = http.resp_header(r, (&h_te[0]) as u64, 17, &at)
+    var chunked: bool = false
+    if nte > 0 {
+        var ck: [u8; 7] = "chunked"
+        if nte >= 7 && http.ci_eq(at + (nte - 7) as u64, 7, (&ck[0]) as u64, 7) {
+            chunked = true
+        } else {
+            fail(rq, 11)
+            return false
+        }
+    }
+    var clen: usize = 0
+    var have_clen: bool = false
+    var atc: u64 = 0
+    let ncl: usize = http.resp_header(r, (&h_cl[0]) as u64, 14, &atc)
+    if ncl > 0 {
+        var acc: usize = 0
+        var any: bool = false
+        var i: usize = 0
+        while i < ncl {
+            let ch: u8 = rt.ld8(atc, i)
+            if ch < 48 as u8 || ch > 57 as u8 {
+                any = false
+                break
+            }
+            any = true
+            acc = acc * 10 + (ch - 48 as u8) as usize
+            if acc > (*rq).maxbody {
+                fail(rq, 15)
+                return false
+            }
+            i = i + 1
+        }
+        if !any {
+            fail(rq, 10)
+            return false
+        }
+        clen = acc
+        have_clen = true
+    }
+    let bodyless: bool = (*r).status < 200 as u32 || (*r).status == 204 as u32 ||
+    (*r).status == 304 as u32 || (*r).status == 101 as u32
+    var is_head: bool = false
+    if http.ci_eq((*rq).meth.ptr, (*rq).meth.len, "HEAD".p as u64, 4) {
+        is_head = true
+    }
+    (*r).keep = false
+    if bodyless || is_head {
+        (*r).wire = 0
+        finish_response(rq)
+        return false
+    }
+    if chunked {
+        (*rq).phase = P_CHUNK_SIZE
+    } else if have_clen {
+        (*rq).remaining = clen
+        (*r).wire = clen
+        (*rq).phase = P_BODY_LEN
+        if clen == 0 {
+            finish_response(rq)
+            return false
+        }
+    } else {
+        (*rq).phase = P_BODY_CLOSE
+    }
+    return true
+}
+
+// -------------------------------------------------------- Finishing
+
+fn finish_response(rq: *mut Request) {
+    let r: *mut http.Response = &(*rq).r
+    var h_ce: [u8; 16] = "Content-Encoding"
+    var atE: u64 = 0
+    let nce: usize = http.resp_header(r, (&h_ce[0]) as u64, 16, &atE)
+    if nce > 0 && (*r).body.len > 0 {
+        let oke: bool = http.undo_encoding(r, atE, nce) catch |e| set_err(rq, http.err_num(e))
+        if !oke {
+            finish(rq)
+            return
+        }
+    }
+    http.split_content_type(r)
+    http.harvest_cookies(&(*(*rq).a).c, r, &(*rq).cur)
+    // a redirect?
+    if http.status_is_redirect((*r).status) {
+        var h_loc: [u8; 8] = "Location"
+        var atl: u64 = 0
+        let nloc: usize = http.resp_header(r, (&h_loc[0]) as u64, 8, &atl)
+        if nloc > 0 {
+            follow(rq, atl, nloc)
+            return
+        }
+    }
+    record_final(rq)
+    finish(rq)
+}
+
+fn record_final(rq: *mut Request) {
+    var key: rt.Buf = rt.buf_new()
+    url.url_write(&(*rq).cur, &key)
+    var fl: usize = key.len
+    if fl > 768 {
+        fl = 768
+    }
+    rt.mem_copy((&(*rq).r.final_url[0]) as u64, key.ptr, fl)
+    (*rq).r.nfinal = fl
+    (*rq).r.hops = (*rq).hops
+    rt.buf_free(&key)
+}
+
+fn follow(rq: *mut Request, loc: u64, nloc: usize) {
+    let a: *mut AClient = (*rq).a
+    if (*rq).hops >= (*a).c.max_redirects {
+        (*rq).err = 13
+        finish(rq)
+        return
+    }
+    var next: url.Url = url.url_new()
+    if !url.url_parse_rel(&(*rq).cur, loc, nloc, &next) {
+        (*rq).err = 1
+        finish(rq)
+        return
+    }
+    // loop guard: has this URL been fetched on the way here?
+    var key: rt.Buf = rt.buf_new()
+    url.url_write(&next, &key)
+    var i: usize = 0
+    var seen: bool = false
+    while i + 4 <= (*rq).chain.len {
+        let l: usize = rt.ld8((*rq).chain.ptr, i) as usize | ((rt.ld8((*rq).chain.ptr, i + 1) as usize) << 8)
+        if l == key.len && rt.mem_eq((*rq).chain.ptr + (i + 4) as u64, key.ptr, l) {
+            seen = true
+        }
+        i = i + 4 + l
+    }
+    if !seen {
+        // the URL we are on counts too (A -> B -> A is a loop)
+        var cur_key: rt.Buf = rt.buf_new()
+        url.url_write(&(*rq).cur, &cur_key)
+        if cur_key.len == key.len && rt.mem_eq(cur_key.ptr, key.ptr, key.len) {
+            seen = true
+        }
+        if (*rq).chain.len == 0 {
+            rt.buf_push(&(*rq).chain, (cur_key.len & 255) as u8)
+            rt.buf_push(&(*rq).chain, ((cur_key.len >> 8) & 255) as u8)
+            rt.buf_push(&(*rq).chain, 0 as u8)
+            rt.buf_push(&(*rq).chain, 0 as u8)
+            rt.buf_push_bytes(&(*rq).chain, cur_key.ptr, cur_key.len)
+        }
+        rt.buf_free(&cur_key)
+    }
+    if seen {
+        rt.buf_free(&key)
+        (*rq).err = 14
+        finish(rq)
+        return
+    }
+    rt.buf_push(&(*rq).chain, (key.len & 255) as u8)
+    rt.buf_push(&(*rq).chain, ((key.len >> 8) & 255) as u8)
+    rt.buf_push(&(*rq).chain, 0 as u8)
+    rt.buf_push(&(*rq).chain, 0 as u8)
+    rt.buf_push_bytes(&(*rq).chain, key.ptr, key.len)
+    rt.buf_free(&key)
+    // 303, and 301/302 of a POST: GET without a body (as net.http)
+    let st: u32 = (*rq).r.status
+    if st == 303 as u32 || st == 301 as u32 || st == 302 as u32 {
+        if http.ci_eq((*rq).meth.ptr, (*rq).meth.len, "POST".p as u64, 4) {
+            rt.buf_clear(&(*rq).meth)
+            rt.buf_push_bytes(&(*rq).meth, "GET".p as u64, 3)
+            rt.buf_clear(&(*rq).body)
+            rt.buf_clear(&(*rq).ctype)
+        }
+    }
+    (*rq).cur = next
+    (*rq).hops = (*rq).hops + 1
+    (*a).c.redirects = (*a).c.redirects + 1
+    // the old connection goes (its close event is ignored: st != rq.st)
+    let old: *mut stream.Stream = (*rq).st
+    (*rq).st = 0 as *mut stream.Stream
+    if old as u64 != 0 {
+        stream.stream_abort(old)
+    }
+    http.resp_reset(&(*rq).r)
+    rt.buf_clear(&(*rq).r.raw)
+    (*rq).err = 0
+    if !begin(rq) {
+        finish(rq)
+    }
+}
+
+fn fail(rq: *mut Request, code: u32) {
+    if (*rq).phase == P_DONE || (*rq).gone {
+        return
+    }
+    (*rq).err = code
+    finish(rq)
+}
+
+// The end of every request: stops the stream and the timer, tells the
+// program ONCE, frees the request (unless a callback of ours is on the stack).
+fn finish(rq: *mut Request) {
+    if (*rq).phase == P_DONE {
+        return
+    }
+    (*rq).phase = P_DONE
+    (*rq).t_end = loop.mono_ms()
+    let a: *mut AClient = (*rq).a
+    if (*rq).deadline_timer != 0 {
+        loop.timer_cancel((*a).l, (*rq).deadline_timer)
+        (*rq).deadline_timer = 0
+    }
+    let old: *mut stream.Stream = (*rq).st
+    (*rq).st = 0 as *mut stream.Stream
+    if old as u64 != 0 {
+        stream.stream_close(old)
+    }
+    if (*rq).err != 0 {
+        (*rq).r.status = 0
+    } else if (*rq).r.nfinal == 0 {
+        record_final(rq)
+    }
+    (*a).active = (*a).active - 1
+    (*a).completed = (*a).completed + 1
+    (*rq).busy = (*rq).busy + 1
+    let cb: fn(*mut Request, u64) = (*rq).cb
+    cb(rq, (*rq).ud)
+    (*rq).busy = (*rq).busy - 1
+    (*rq).gone = true
+    if (*rq).busy == 0 && !(*rq).defer_pending {
+        release(rq)
+    }
+}
+
+// Silent: no callback. The request is gone afterwards.
+fn areq_cancel(rq: *mut Request) {
+    if (*rq).phase == P_DONE || (*rq).gone {
+        return
+    }
+    let a: *mut AClient = (*rq).a
+    (*rq).phase = P_DONE
+    if (*rq).deadline_timer != 0 {
+        loop.timer_cancel((*a).l, (*rq).deadline_timer)
+        (*rq).deadline_timer = 0
+    }
+    let old: *mut stream.Stream = (*rq).st
+    (*rq).st = 0 as *mut stream.Stream
+    if old as u64 != 0 {
+        stream.stream_abort(old)
+    }
+    (*a).active = (*a).active - 1
+    (*rq).gone = true
+    if (*rq).busy == 0 && !(*rq).defer_pending {
+        release(rq)
+    }
+}
+
+fn release(rq: *mut Request) {
+    rt.buf_free(&(*rq).meth)
+    rt.buf_free(&(*rq).body)
+    rt.buf_free(&(*rq).ctype)
+    rt.buf_free(&(*rq).chain)
+    http.resp_free(&(*rq).r)
+    ah_obj_free[Request](rq as u64)
+}
