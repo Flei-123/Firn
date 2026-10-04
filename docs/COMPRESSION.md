@@ -81,7 +81,21 @@ libbz2, libbrotli, liblz4 (Python's `lz4`), zlib/gzip:
 | dictionaries | zstd dictionaries trained by `zstd --train` and raw-content dictionaries, both directions, at levels 1/3/7/19; wrong and missing dictionary id; damaged dictionaries |
 | hostile | every cut of a stream (must be an error), 120 flipped-bit copies and 60 junk inputs per format (an answer or an error, never a crash or a hang), a 64 MiB zeros bomb under limits of 1 MiB, exactly 64 MiB and one octet less |
 
-`tests/2180` .. `2188` run in every build level of `test.sh` (and on AArch64):
+Two more tools hold the claims that are about behaviour over time and size:
+
+* `tools/compress/fuzz.py` mutates the fixtures (bit flips, overwrites with 0/0xFF/0x7FFFFFFF,
+  deletions, insertions, duplicated stretches, splices of two streams, truncation) and runs the probe whole
+  buffer and streaming on a **release-safe** build, where an arithmetic overflow or an index out of
+  range traps: 240,000 probe runs (3 seeds x 40,000 mutations x 2 modes) gave an answer or an
+  `ERROR` every time -- no crash, no hang, no limit passed.
+* `tools/compress/memtest.py` decodes 300 MiB of output per format through the streaming API with
+  the output thrown away and prints the peak resident set: **zstd 3 MiB, xz 6 MiB, gzip < 1 MiB,
+  bzip2 4 MiB, lz4 8 MiB, Brotli 8 MiB** -- window + one unit, the output size does not matter
+  (octet count and xxHash64 of the 300 MiB are checked against the generator's).
+  `tests/2189` is the leak test: 150 rounds of every decoder and encoder, the error paths too,
+  must not move the resident set or leave a descriptor open.
+
+`tests/2180` .. `2189` run in every build level of `test.sh` (and on AArch64):
 fixtures made by the reference tools (`tools/compress/gen_fixtures.py`,
 deterministic, ~320 KB), refusals, the encoders' round trips at every level and
 switch, the streaming readers from a descriptor, the integrations, and
@@ -130,6 +144,14 @@ switch, the streaming readers from a descriptor, the integrations, and
 * **net.http**: `Accept-Encoding: gzip, br, zstd` is sent when gzip is on
   (`client_set_gzip`); br and zstd bodies are refused above 256 MiB decoded
   (`HttpError::Encoding`).
+
+## What it costs to use
+
+No dead-code elimination in the linker: a program that imports `std.tar` or `std.extract` now
+carries all decoders (**+420 KB**: the 608 KB test binary of `tests/2071` became 1.0 MB, compile
+time +1.2 s); a program that imports `net.http` carries Brotli and zstd (**+245 KB** of the 581 KB
+`http_main`, 125 KB of it the Brotli dictionary). A program that wants one format only imports
+that module (`compress.zstd`) and pays for that one.
 
 ## Compiler findings (and what the library does about them)
 
