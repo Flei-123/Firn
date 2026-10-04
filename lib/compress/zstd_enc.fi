@@ -1,0 +1,2097 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/compress/zstd_enc.fi -- a Zstandard encoder (RFC 8878), compatible with
+// libzstd: its frames are read by `zstd -d`, python-zstandard and every
+// other decoder; held against them in tools/compress/check.py.
+//
+//     import compress.zstd_enc
+//     zstd_enc.zstd_compress(p, n, 3, &out) catch |e| ...              // levels 1..19
+//     zstd_enc.zstd_compress_dict(p, n, 3, dict, dictlen, &out) catch |e| ...
+//
+//     var e: zstd_enc.ZstdEnc = zstd_enc.zstd_enc_new(3, true)         // streaming
+//     zstd_enc.zstd_enc_write(&e, p, n, &out)  // output may be drained and cleared
+//     zstd_enc.zstd_enc_finish(&e, &out)
+//     zstd_enc.zstd_enc_free(&e)
+//
+// WHAT IT DOES
+//   * Levels 1-2: ONE hash table of 5 octet sequences, greedy, the step grows
+//     over data that does not compress ("fast"). Levels 3-4: a hash CHAIN of
+//     4 octet sequences, greedy. Levels 5-19: the chain with LAZY matching
+//     (a match is only taken when the next position has none that is better;
+//     levels 8+ look two positions ahead) and a search depth that grows with
+//     the level (4 .. 512). Repeat offsets are tried at every position and
+//     the encoder expresses an offset as a repeat code whenever it equals one
+//     (the "special rule" for literal length 0 included).
+//   * Per block: raw, run-length, or compressed -- whichever is smallest.
+//     Literals: raw, RLE, or Huffman (1 or 4 streams, code lengths limited to
+//     11 bits, weights stored directly or FSE compressed, the previous block's
+//     table reused when it still fits). Sequences: for each of the three
+//     symbol kinds the cheapest of predefined table, RLE, a fresh FSE table
+//     and the previous block's table.
+//   * Frames: content size when known (whole buffer), an optional XXH64
+//     checksum, a window of 2^19..2^23 octets by level (smaller when the
+//     input is), dictionary id when a dictionary is used.
+//
+// HONEST
+//   E1 NOT zstd's search: no binary-tree matcher, no optimal parsing (levels
+//      12+ of libzstd), no long-distance matching. The ratio is that of
+//      zstd's "fast .. lazy2" family and below libzstd's at the same level;
+//      measured numbers in docs/COMPRESSION.md.
+//   E2 With a dictionary the content is used as history and the dictionary's
+//      repeat offsets seed the encoder; its entropy tables are NOT reused as
+//      "repeat" tables (the first block always states its own tables).
+//   E3 Streaming: input is held in a window of 2^wlog octets plus one block.
+//      The frame header of a streaming encoder carries no content size.
+import std.rt
+import compress.common
+import compress.zstd
+
+export {
+    ZstdEnc, zstd_enc_new, zstd_enc_new_dict, zstd_enc_write, zstd_enc_finish, zstd_enc_free,
+    zstd_enc_set_features, zstd_enc_set_content_size,
+    zstd_compress, zstd_compress_dict, zstd_compress_bound,
+}
+
+// ====================================================================
+// A bit writer for the backward streams (filled LSB first; the decoder reads
+// from the end)
+// ====================================================================
+
+struct BitW {
+    p: u64, // output octets (capacity reserved by the caller)
+    len: usize,
+    acc: u64,
+    nb: usize,
+}
+
+fn bw_new(p: u64) -> BitW {
+    return BitW { p: p, len: 0, acc: 0, nb: 0 }
+}
+
+fn bw_add(w: *mut BitW, v: u64, n: usize) {
+    if n == 0 {
+        return
+    }
+    (*w).acc = (*w).acc | ((v & (((1 as u64) << (n as u64)) - 1)) << ((*w).nb as u64))
+    (*w).nb = (*w).nb + n
+    while (*w).nb >= 8 {
+        rt.st8((*w).p, (*w).len, ((*w).acc & 0xFF) as u8)
+        (*w).len = (*w).len + 1
+        (*w).acc = (*w).acc >> 8
+        (*w).nb = (*w).nb - 8
+    }
+}
+
+// Sentinel bit, then the last partial octet. Returns the stream length.
+fn bw_close(w: *mut BitW) -> usize {
+    bw_add(w, 1, 1)
+    if (*w).nb > 0 {
+        rt.st8((*w).p, (*w).len, ((*w).acc & 0xFF) as u8)
+        (*w).len = (*w).len + 1
+        (*w).acc = 0
+        (*w).nb = 0
+    }
+    return (*w).len
+}
+
+// ====================================================================
+// FSE compression tables (RFC 8878 4.1; FSE_buildCTable)
+// ====================================================================
+
+struct FseCT {
+    tab: [u16; 512], // next states, sorted by symbol
+    dnb: [i64; 256], // deltaNbBits
+    dfs: [i32; 256], // deltaFindState
+    log: u32,
+}
+
+fn fct_new() -> FseCT {
+    return FseCT { tab: [0; 512], dnb: [0; 256], dfs: [0; 256], log: 0 }
+}
+
+fn fct_build(t: *mut FseCT, nc: *mut zstd.NCount) -> bool {
+    let log: u32 = (*nc).log
+    if log > 9 {
+        return false
+    }
+    let size: usize = (1 as usize) << (log as usize)
+    let mask: usize = size - 1
+    var cumul: [u32; 258] = [0; 258]
+    var tsym: [u8; 512] = [0; 512]
+    var high: usize = size - 1
+    let ns: usize = (*nc).nsym
+    var s: usize = 0
+    while s < ns {
+        let c: i32 = (*nc).norm[s]
+        if c == -1 {
+            cumul[s + 1] = cumul[s] + 1
+            tsym[high] = s as u8
+            if high > 0 {
+                high = high - 1
+            }
+        } else {
+            cumul[s + 1] = cumul[s] + (c as u32)
+        }
+        s = s + 1
+    }
+    let step: usize = (size >> 1) + (size >> 3) + 3
+    var pos: usize = 0
+    s = 0
+    while s < ns {
+        let c: i32 = (*nc).norm[s]
+        var i: i32 = 0
+        while i < c {
+            tsym[pos] = s as u8
+            pos = (pos + step) & mask
+            while pos > high {
+                pos = (pos + step) & mask
+            }
+            i = i + 1
+        }
+        s = s + 1
+    }
+    if pos != 0 {
+        return false
+    }
+    var u: usize = 0
+    while u < size {
+        let sy: usize = tsym[u] as usize
+        (*t).tab[cumul[sy] as usize] = (size + u) as u16
+        cumul[sy] = cumul[sy] + 1
+        u = u + 1
+    }
+    var total: i32 = 0
+    s = 0
+    while s < ns {
+        let c: i32 = (*nc).norm[s]
+        if c == 0 {
+            (*t).dnb[s] = ((log as i64) << 16) - ((1 as i64) << (log as i64))
+            (*t).dfs[s] = 0
+        } else if c == -1 || c == 1 {
+            (*t).dnb[s] = ((log as i64) << 16) - ((1 as i64) << (log as i64))
+            (*t).dfs[s] = total - 1
+            total = total + 1
+        } else {
+            let maxbits: u32 = log - zstd.highbit32((c - 1) as u32)
+            let minstate: i64 = (c as i64) << (maxbits as i64)
+            (*t).dnb[s] = ((maxbits as i64) << 16) - minstate
+            (*t).dfs[s] = total - c
+            total = total + c
+        }
+        s = s + 1
+    }
+    (*t).log = log
+    return true
+}
+
+// The state of a symbol that opens a stream (no bits are written).
+fn fct_init(t: *mut FseCT, sym: usize) -> usize {
+    let nbo: i64 = ((*t).dnb[sym] + 32768) >> 16
+    let value: i64 = (nbo << 16) - (*t).dnb[sym]
+    return (*t).tab[(((value >> nbo) as i32) + (*t).dfs[sym]) as usize] as usize
+}
+
+fn fct_encode(w: *mut BitW, t: *mut FseCT, state: *mut usize, sym: usize) {
+    let st: usize = *state
+    let nbo: i64 = ((st as i64) + (*t).dnb[sym]) >> 16
+    bw_add(w, st as u64, nbo as usize)
+    *state = (*t).tab[(((st as i64) >> nbo) as i32 + (*t).dfs[sym]) as usize] as usize
+}
+
+fn fct_flush(w: *mut BitW, t: *mut FseCT, state: usize) {
+    bw_add(w, state as u64, (*t).log as usize)
+}
+
+// ====================================================================
+// Normalising counts and writing a table description (FSE_normalizeCount,
+// FSE_writeNCount)
+// ====================================================================
+
+// Scales `cnt[0..nsym)` (sum `total`) to a distribution of 2^log cells in
+// which every symbol that occurs keeps at least one cell. false when that is
+// impossible (more distinct symbols than cells).
+fn fse_normalize(nc: *mut zstd.NCount, cnt: u64, nsym: usize, total: u64, log: u32) -> bool {
+    let size: i64 = (1 as i64) << (log as i64)
+    var distinct: i64 = 0
+    var s: usize = 0
+    while s < nsym {
+        if rt.ld32(cnt, s) > 0 {
+            distinct = distinct + 1
+        }
+        s = s + 1
+    }
+    if distinct > size || total == 0 {
+        return false
+    }
+    var sum: i64 = 0
+    var big: usize = 0
+    var bigv: i64 = 0
+    s = 0
+    while s < nsym {
+        let c: u64 = rt.ld32(cnt, s) as u64
+        var v: i64 = 0
+        if c > 0 {
+            v = ((c * (size as u64) * 2 + total) / (total * 2)) as i64
+            if v < 1 {
+                v = 1
+            }
+        }
+        (*nc).norm[s] = v as i32
+        sum = sum + v
+        if v > bigv {
+            bigv = v
+            big = s
+        }
+        s = s + 1
+    }
+    var diff: i64 = size - sum
+    // the largest symbol absorbs the difference; when it cannot, take from the others
+    while diff != 0 {
+        if diff > 0 {
+            (*nc).norm[big] = (*nc).norm[big] + (diff as i32)
+            diff = 0
+        } else {
+            var room: i64 = ((*nc).norm[big] as i64) - 1
+            if room >= -diff {
+                (*nc).norm[big] = (*nc).norm[big] + (diff as i32)
+                diff = 0
+            } else {
+                (*nc).norm[big] = 1
+                diff = diff + room
+                // find the next largest
+                var nb2: usize = 0
+                var nv: i32 = 1
+                s = 0
+                while s < nsym {
+                    if (*nc).norm[s] > nv {
+                        nv = (*nc).norm[s]
+                        nb2 = s
+                    }
+                    s = s + 1
+                }
+                if nv <= 1 {
+                    return false
+                }
+                big = nb2
+            }
+        }
+    }
+    (*nc).nsym = nsym
+    (*nc).log = log
+    // trim trailing zero symbols from the description
+    while (*nc).nsym > 0 && (*nc).norm[(*nc).nsym - 1] == 0 {
+        (*nc).nsym = (*nc).nsym - 1
+    }
+    return true
+}
+
+// Writes the description of `nc` to `dst`; returns its length in octets.
+fn fse_write_ncount(nc: *mut zstd.NCount, dst: u64) -> usize {
+    let log: u32 = (*nc).log
+    var w: BitW = bw_new(dst)
+    bw_add(&w, (log - 5) as u64, 4)
+    var remaining: i32 = ((1 as i32) << (log as i32)) + 1
+    var threshold: i32 = (1 as i32) << (log as i32)
+    var nbbits: usize = (log as usize) + 1
+    var s: usize = 0
+    while remaining > 1 && s < (*nc).nsym {
+        let c: i32 = (*nc).norm[s]
+        let maxv: i32 = (2 * threshold - 1) - remaining
+        if c < 0 {
+            remaining = remaining + c
+        } else {
+            remaining = remaining - c
+        }
+        var v: i32 = c + 1
+        if v >= threshold {
+            v = v + maxv
+        }
+        if v < maxv {
+            bw_add(&w, v as u64, nbbits - 1)
+        } else {
+            bw_add(&w, v as u64, nbbits)
+        }
+        s = s + 1
+        if c == 0 {
+            // the repeat field: how many more zeros follow
+            var z: usize = 0
+            while s + z < (*nc).nsym && (*nc).norm[s + z] == 0 {
+                z = z + 1
+            }
+            s = s + z
+            while z >= 3 {
+                bw_add(&w, 3, 2)
+                z = z - 3
+            }
+            bw_add(&w, z as u64, 2)
+        }
+        while remaining < threshold {
+            nbbits = nbbits - 1
+            threshold = threshold / 2
+        }
+    }
+    // flush the partial octet (no sentinel in a description)
+    if w.nb > 0 {
+        rt.st8(w.p, w.len, (w.acc & 0xFF) as u8)
+        w.len = w.len + 1
+    }
+    return w.len
+}
+
+// ====================================================================
+// HUFFMAN (RFC 8878 4.2): code lengths limited to 11 bits, the weights
+// description, and the streams
+// ====================================================================
+
+const HUF_MAXBITS: u32 = 11
+
+struct HufEnc {
+    freq: [u32; 256],
+    len: [u8; 256],
+    code: [u16; 256],
+    maxbits: u32,
+    hs: usize, // highest used symbol
+    valid: bool,
+}
+
+fn huf_new() -> HufEnc {
+    return HufEnc { freq: [0; 256], len: [0; 256], code: [0; 256], maxbits: 0, hs: 0, valid: false }
+}
+
+// Huffman code lengths for h.freq, no longer than HUF_MAXBITS, as a
+// COMPLETE code (the format cannot describe an incomplete one). false when
+// fewer than two symbols occur.
+fn huf_build(h: *mut HufEnc) -> bool {
+    var idx: [u16; 256] = [0; 256]
+    var n: usize = 0
+    var s: usize = 0
+    while s < 256 {
+        (*h).len[s] = 0 as u8
+        if (*h).freq[s] > 0 {
+            idx[n] = s as u16
+            n = n + 1
+        }
+        s = s + 1
+    }
+    if n < 2 {
+        return false
+    }
+    // insertion sort by (frequency, symbol)
+    var i: usize = 1
+    while i < n {
+        let v: u16 = idx[i]
+        let fv: u32 = (*h).freq[v as usize]
+        var j: usize = i
+        while j > 0 && (*h).freq[idx[j - 1] as usize] > fv {
+            idx[j] = idx[j - 1]
+            j = j - 1
+        }
+        idx[j] = v
+        i = i + 1
+    }
+    // two-queue Huffman: leaves 0..n-1 in order, internal nodes n..2n-2 created in order
+    var nf: [u64; 512] = [0; 512]
+    var parent: [u16; 512] = [0; 512]
+    i = 0
+    while i < n {
+        nf[i] = (*h).freq[idx[i] as usize] as u64
+        i = i + 1
+    }
+    var q1: usize = 0
+    var q2: usize = n
+    var next: usize = n
+    var made: usize = 0
+    while made < n - 1 {
+        var a: usize = 0
+        var b: usize = 0
+        // smallest
+        if q1 < n && (q2 >= next || nf[q1] <= nf[q2]) {
+            a = q1
+            q1 = q1 + 1
+        } else {
+            a = q2
+            q2 = q2 + 1
+        }
+        if q1 < n && (q2 >= next || nf[q1] <= nf[q2]) {
+            b = q1
+            q1 = q1 + 1
+        } else {
+            b = q2
+            q2 = q2 + 1
+        }
+        nf[next] = nf[a] + nf[b]
+        parent[a] = next as u16
+        parent[b] = next as u16
+        next = next + 1
+        made = made + 1
+    }
+    var depth: [u8; 512] = [0; 512]
+    var k: usize = next - 1
+    while k > 0 {
+        k = k - 1
+        depth[k] = depth[parent[k] as usize] + 1 as u8
+    }
+    var maxl: u32 = 0
+    i = 0
+    while i < n {
+        let l: u32 = depth[i] as u32
+        (*h).len[idx[i] as usize] = l as u8
+        if l > maxl {
+            maxl = l
+        }
+        i = i + 1
+    }
+    if maxl > HUF_MAXBITS {
+        // clamp, then repair the Kraft sum: lengthen cheap symbols until the
+        // sum fits, then shorten frequent ones into the slack
+        let lim: u32 = HUF_MAXBITS
+        let unit: u64 = (1 as u64) << (lim as u64)
+        var kraft: u64 = 0
+        i = 0
+        while i < n {
+            let sy: usize = idx[i] as usize
+            if (*h).len[sy] as u32 > lim {
+                (*h).len[sy] = lim as u8
+            }
+            kraft = kraft + ((1 as u64) << ((lim - ((*h).len[sy] as u32)) as u64))
+            i = i + 1
+        }
+        while kraft > unit {
+            // lengthen the least frequent symbol that is shorter than lim
+            var pick: usize = 256
+            i = 0
+            while i < n {
+                let sy: usize = idx[i] as usize
+                if ((*h).len[sy] as u32) < lim {
+                    if pick == 256 || (*h).freq[sy] < (*h).freq[pick] {
+                        pick = sy
+                    }
+                }
+                i = i + 1
+            }
+            if pick == 256 {
+                return false
+            }
+            kraft = kraft - ((1 as u64) << ((lim - ((*h).len[pick] as u32) - 1) as u64))
+            (*h).len[pick] = (*h).len[pick] + 1 as u8
+        }
+        while kraft < unit {
+            // shorten the most frequent symbol whose gain still fits
+            let room: u64 = unit - kraft
+            var pick: usize = 256
+            i = 0
+            while i < n {
+                let sy: usize = idx[i] as usize
+                let l: u32 = (*h).len[sy] as u32
+                if l > 1 {
+                    let gain: u64 = (1 as u64) << ((lim - l) as u64)
+                    if gain <= room {
+                        if pick == 256 || (*h).freq[sy] > (*h).freq[pick] {
+                            pick = sy
+                        }
+                    }
+                }
+                i = i + 1
+            }
+            if pick == 256 {
+                return false
+            }
+            kraft = kraft + ((1 as u64) << ((lim - ((*h).len[pick] as u32)) as u64))
+            (*h).len[pick] = (*h).len[pick] - 1 as u8
+        }
+        maxl = 0
+        i = 0
+        while i < n {
+            let l: u32 = (*h).len[idx[i] as usize] as u32
+            if l > maxl {
+                maxl = l
+            }
+            i = i + 1
+        }
+    }
+    (*h).maxbits = maxl
+    var hs: usize = 0
+    s = 0
+    while s < 256 {
+        if (*h).len[s] > 0 as u8 {
+            hs = s
+        }
+        s = s + 1
+    }
+    (*h).hs = hs
+    // canonical codes in the layout of the decoder's table
+    var acc: u32 = 0
+    var w: u32 = 1
+    while w <= maxl {
+        s = 0
+        while s < 256 {
+            let l: u32 = (*h).len[s] as u32
+            if l > 0 && (maxl + 1 - l) == w {
+                (*h).code[s] = (acc >> (w - 1)) as u16
+                acc = acc + ((1 as u32) << (w - 1))
+            }
+            s = s + 1
+        }
+        w = w + 1
+    }
+    (*h).valid = true
+    return true
+}
+
+// The size in octets of the coded literals for these frequencies (streams
+// only, no table).
+fn huf_cost_bits(h: *mut HufEnc) -> u64 {
+    var bits: u64 = 0
+    var s: usize = 0
+    while s < 256 {
+        bits = bits + ((*h).freq[s] as u64) * ((*h).len[s] as u64)
+        s = s + 1
+    }
+    return bits
+}
+
+// Does the table (from an earlier block) have a code for every symbol that
+// occurs in `freq`?
+fn huf_covers(h: *mut HufEnc, freq: *mut HufEnc) -> bool {
+    if !(*h).valid {
+        return false
+    }
+    var s: usize = 0
+    while s < 256 {
+        if (*freq).freq[s] > 0 && (*h).len[s] == 0 as u8 {
+            return false
+        }
+        s = s + 1
+    }
+    return true
+}
+
+// Writes the tree description to dst (direct nibbles or FSE compressed,
+// whichever is shorter); returns its length, 0 on failure.
+#[allow_escape]
+fn huf_write_table(h: *mut HufEnc, dst: u64) -> usize {
+    let nw: usize = (*h).hs // weights of symbols 0..hs-1; the last one is implied
+    if nw == 0 {
+        return 0
+    }
+    var wts: [u8; 256] = [0; 256]
+    var i: usize = 0
+    while i < nw {
+        let l: u32 = (*h).len[i] as u32
+        if l > 0 {
+            wts[i] = ((*h).maxbits + 1 - l) as u8
+        }
+        i = i + 1
+    }
+    // direct form
+    var direct: usize = 0
+    if nw <= 128 {
+        direct = 1 + (nw + 1) / 2
+    }
+    // FSE form (needs more than two weights)
+    var fse: usize = 0
+    var tmp: [u8; 160] = [0; 160]
+    if nw > 2 {
+        var cnt: [u32; 16] = [0; 16]
+        var maxsym: usize = 0
+        i = 0
+        while i < nw {
+            let w: usize = wts[i] as usize
+            cnt[w] = cnt[w] + 1
+            if w > maxsym {
+                maxsym = w
+            }
+            i = i + 1
+        }
+        var log: u32 = zstd.highbit32((nw - 1) as u32)
+        if log > 6 {
+            log = 6
+        }
+        if log < 5 {
+            log = 5
+        }
+        var nc: zstd.NCount = zstd.NCount { norm: [0; 256], nsym: 0, log: 0 }
+        var ok: bool = false
+        // a table log wide enough for the distinct weights
+        while log <= 6 && !ok {
+            ok = fse_normalize(&nc, (&cnt[0]) as u64, maxsym + 1, nw as u64, log)
+            if !ok {
+                log = log + 1
+            }
+        }
+        if ok {
+            var ct: FseCT = fct_new()
+            if fct_build(&ct, &nc) {
+                let hl: usize = fse_write_ncount(&nc, (&tmp[0]) as u64 + 0)
+                var body: [u8; 256] = [0; 256]
+                var w: BitW = bw_new((&body[0]) as u64)
+                var st1: usize = 0
+                var st2: usize = 0
+                var k: usize = nw
+                // the last two weights open the two states
+                if nw % 2 == 1 {
+                    st1 = fct_init(&ct, wts[nw - 1] as usize)
+                    st2 = fct_init(&ct, wts[nw - 2] as usize)
+                    // symbol nw-3 (even index) is encoded with state 1
+                    fct_encode(&w, &ct, &st1, wts[nw - 3] as usize)
+                    k = nw - 3
+                } else {
+                    st2 = fct_init(&ct, wts[nw - 1] as usize)
+                    st1 = fct_init(&ct, wts[nw - 2] as usize)
+                    k = nw - 2
+                }
+                // symbols k-1 down to 0 alternate: odd index -> state 2, even -> state 1
+                while k > 0 {
+                    k = k - 1
+                    if k % 2 == 0 {
+                        fct_encode(&w, &ct, &st1, wts[k] as usize)
+                    } else {
+                        fct_encode(&w, &ct, &st2, wts[k] as usize)
+                    }
+                }
+                fct_flush(&w, &ct, st2)
+                fct_flush(&w, &ct, st1)
+                let bl: usize = bw_close(&w)
+                if hl + bl < 128 {
+                    fse = 1 + hl + bl
+                    if (direct == 0 || fse < direct) {
+                        rt.st8(dst, 0, (hl + bl) as u8)
+                        rt.mem_copy(dst + 1, (&tmp[0]) as u64, hl)
+                        rt.mem_copy(dst + 1 + hl as u64, (&body[0]) as u64, bl)
+                        return fse
+                    }
+                }
+            }
+        }
+    }
+    if direct == 0 {
+        return 0
+    }
+    rt.st8(dst, 0, (127 + nw) as u8)
+    i = 0
+    while i < nw {
+        let b: u8 = wts[i]
+        if i % 2 == 0 {
+            rt.st8(dst, 1 + i / 2, b << 4)
+        } else {
+            rt.st8(dst, 1 + i / 2, rt.ld8(dst, 1 + i / 2) | b)
+        }
+        i = i + 1
+    }
+    return direct
+}
+
+// One Huffman stream of src[0..n) into dst; returns its length.
+fn huf_encode_stream(h: *mut HufEnc, src: u64, n: usize, dst: u64) -> usize {
+    var w: BitW = bw_new(dst)
+    var i: usize = n
+    while i > 0 {
+        i = i - 1
+        let s: usize = rt.ld8(src, i) as usize
+        bw_add(&w, (*h).code[s] as u64, (*h).len[s] as usize)
+    }
+    return bw_close(&w)
+}
+
+// ====================================================================
+// THE ENCODER STATE
+// ====================================================================
+
+const BLOCK: usize = 131072
+const SEQ_CAP: usize = 40000
+const FEAT_HUF: u32 = 1
+const FEAT_FSE: u32 = 2
+const FEAT_ALL: u32 = 3
+
+struct ZstdEnc {
+    level: u32,
+    feat: u32,
+    wlog: u32,
+    wsize: usize,
+    // the window: history plus input not yet compressed
+    win: rt.Buf,
+    owned: bool, // false: `win` points at the caller's input (whole-buffer path)
+    blk: usize, // start of the next block in `win`
+    // match finder
+    mode: u32, // 0 = one hash table (fast), 1 = hash chains
+    ht: u64,
+    hlog: u32,
+    chain: u64,
+    cmask: usize,
+    depth: u32,
+    lazy: u32,
+    // the block being built
+    sll: u64,
+    sml: u64,
+    sof: u64,
+    nseq: usize,
+    lits: u64,
+    nlits: usize,
+    body: rt.Buf,
+    codes: u64, // three u8 arrays of SEQ_CAP: LL, OF, ML codes
+    // the frame
+    started: bool,
+    has_fcs: bool,
+    fcs: u64,
+    chk: bool,
+    single: bool,
+    xxh: common.Xxh64,
+    rep1: u32,
+    rep2: u32,
+    rep3: u32,
+    dictid: u32,
+    // what the decoder will remember from earlier blocks ("repeat" modes)
+    pll: zstd.NCount,
+    pof: zstd.NCount,
+    pml: zstd.NCount,
+    pll_ok: bool,
+    pof_ok: bool,
+    pml_ok: bool,
+    phuf: HufEnc,
+    ready: bool,
+    failed: bool,
+}
+
+fn zstd_enc_new(level: u32, checksum: bool) -> ZstdEnc {
+    var lv: u32 = level
+    if lv < 1 {
+        lv = 3
+    }
+    if lv > 19 {
+        lv = 19
+    }
+    var e: ZstdEnc = ZstdEnc { level: lv, feat: FEAT_ALL, wlog: 19, wsize: 0, win: rt.buf_new(),
+        owned: true, blk: 0, mode: 0, ht: 0, hlog: 16, chain: 0, cmask: 0, depth: 0, lazy: 0,
+        sll: 0, sml: 0, sof: 0, nseq: 0, lits: 0, nlits: 0, body: rt.buf_new(), codes: 0,
+        started: false, has_fcs: false, fcs: 0, chk: checksum, single: false, xxh: common.xxh64_new(0),
+        rep1: 1, rep2: 4, rep3: 8, dictid: 0,
+        pll: zstd.NCount { norm: [0; 256], nsym: 0, log: 0 },
+        pof: zstd.NCount { norm: [0; 256], nsym: 0, log: 0 },
+        pml: zstd.NCount { norm: [0; 256], nsym: 0, log: 0 },
+        pll_ok: false, pof_ok: false, pml_ok: false, phuf: huf_new(), ready: false, failed: false }
+    // level -> parameters
+    if lv <= 2 {
+        e.mode = 0
+        e.wlog = 19
+        e.hlog = 16
+        if lv == 2 {
+            e.hlog = 17
+        }
+    } else {
+        e.mode = 1
+        e.hlog = 17
+        if lv <= 4 {
+            e.wlog = 20
+            e.depth = 4
+            e.lazy = 0
+            if lv == 4 {
+                e.depth = 8
+            }
+        } else if lv <= 7 {
+            e.wlog = 21
+            e.depth = 16
+            e.lazy = 1
+            if lv >= 6 {
+                e.depth = 32
+            }
+        } else if lv <= 12 {
+            e.wlog = 21
+            e.hlog = 18
+            e.depth = 64
+            e.lazy = 2
+            if lv >= 10 {
+                e.depth = 128
+            }
+        } else {
+            e.wlog = 22
+            e.hlog = 19
+            e.depth = 256
+            e.lazy = 2
+            if lv >= 16 {
+                e.wlog = 23
+                e.depth = 512
+            }
+        }
+    }
+    return e
+}
+
+// Test hook: which entropy coders may be used (1 = Huffman literals, 2 = FSE
+// sequence tables); 0 gives raw literals and predefined tables only.
+fn zstd_enc_set_features(e: *mut ZstdEnc, mask: u32) {
+    (*e).feat = mask
+}
+
+fn zstd_enc_free(e: *mut ZstdEnc) {
+    if (*e).owned {
+        rt.buf_free(&(*e).win)
+    }
+    rt.buf_free(&(*e).body)
+    if (*e).ht != 0 {
+        rt.heap_free((*e).ht, ((1 as usize) << ((*e).hlog as usize)) * 4)
+        (*e).ht = 0
+    }
+    if (*e).chain != 0 {
+        rt.heap_free((*e).chain, ((*e).cmask + 1) * 4)
+        (*e).chain = 0
+    }
+    if (*e).sll != 0 {
+        rt.heap_free((*e).sll, SEQ_CAP * 4)
+        rt.heap_free((*e).sml, SEQ_CAP * 4)
+        rt.heap_free((*e).sof, SEQ_CAP * 4)
+        rt.heap_free((*e).lits, BLOCK + 64)
+        rt.heap_free((*e).codes, SEQ_CAP * 3)
+        (*e).sll = 0
+    }
+    (*e).ready = false
+}
+
+// Allocates the tables once the window size is known.
+fn enc_prepare(e: *mut ZstdEnc) -> bool {
+    if (*e).ready {
+        return true
+    }
+    (*e).wsize = (1 as usize) << ((*e).wlog as usize)
+    (*e).cmask = (*e).wsize - 1
+    (*e).ht = rt.heap_alloc(((1 as usize) << ((*e).hlog as usize)) * 4)
+    if (*e).mode == 1 {
+        (*e).chain = rt.heap_alloc((*e).wsize * 4)
+    }
+    (*e).sll = rt.heap_alloc(SEQ_CAP * 4)
+    (*e).sml = rt.heap_alloc(SEQ_CAP * 4)
+    (*e).sof = rt.heap_alloc(SEQ_CAP * 4)
+    (*e).lits = rt.heap_alloc(BLOCK + 64)
+    (*e).codes = rt.heap_alloc(SEQ_CAP * 3)
+    if (*e).ht == 0 || (*e).sll == 0 || (*e).sml == 0 || (*e).sof == 0 || (*e).lits == 0 || (*e).codes == 0
+        || ((*e).mode == 1 && (*e).chain == 0) {
+        (*e).failed = true
+        return false
+    }
+    (*e).ready = true
+    return true
+}
+
+// ====================================================================
+// MATCH FINDING
+// ====================================================================
+
+fn match_len(buf: u64, a: usize, b: usize, limit: usize) -> usize {
+    // octets in common of buf[a..] and buf[b..], at most `limit`
+    var n: usize = 0
+    while n + 8 <= limit && common.ld64le(buf, a + n) == common.ld64le(buf, b + n) {
+        n = n + 8
+    }
+    while n < limit && rt.ld8(buf, a + n) == rt.ld8(buf, b + n) {
+        n = n + 1
+    }
+    return n
+}
+
+fn add_seq(e: *mut ZstdEnc, buf: u64, anchor: usize, ip: usize, ml: usize, off: usize) {
+    let ll: usize = ip - anchor
+    rt.mem_copy((*e).lits + (*e).nlits as u64, buf + anchor as u64, ll)
+    (*e).nlits = (*e).nlits + ll
+    rt.st32((*e).sll, (*e).nseq, ll as u32)
+    rt.st32((*e).sml, (*e).nseq, ml as u32)
+    rt.st32((*e).sof, (*e).nseq, off as u32)
+    (*e).nseq = (*e).nseq + 1
+}
+
+fn add_tail(e: *mut ZstdEnc, buf: u64, anchor: usize, end: usize) {
+    rt.mem_copy((*e).lits + (*e).nlits as u64, buf + anchor as u64, end - anchor)
+    (*e).nlits = (*e).nlits + (end - anchor)
+}
+
+fn off_bits(off: usize, rep1: usize, rep2: usize) -> usize {
+    if off == rep1 || off == rep2 {
+        return 1
+    }
+    return zstd.highbit32((off + 1) as u32) as usize
+}
+
+// Levels 1-2: one hash table of 5 octet sequences, greedy.
+fn find_fast(e: *mut ZstdEnc, start: usize, end: usize) {
+    let buf: u64 = (*e).win.ptr
+    let buflen: usize = (*e).win.len
+    let hshift: u64 = (64 - (*e).hlog) as u64
+    let ht: u64 = (*e).ht
+    let maxd: usize = (*e).wsize
+    var anchor: usize = start
+    var ip: usize = start
+    var rep: usize = (*e).rep1 as usize
+    while ip + 8 <= buflen && ip + 5 <= end {
+        let v: u64 = common.ld64le(buf, ip)
+        let h: usize = (((v << 24) *% 0x9E3779B185EBCA87) >> hshift) as usize
+        let cand: usize = rt.ld32(ht, h) as usize
+        rt.st32(ht, h, (ip + 1) as u32)
+        var off: usize = 0
+        var mlen: usize = 0
+        if rep <= ip && rep > 0 && common.ld32le(buf, ip - rep) == (v & 0xFFFFFFFF) as u32 {
+            off = rep
+            mlen = match_len(buf, ip, ip - rep, end - ip)
+        }
+        if mlen < 5 && cand != 0 {
+            let c: usize = cand - 1
+            if ip - c <= maxd && common.ld32le(buf, c) == (v & 0xFFFFFFFF) as u32 {
+                let l2: usize = match_len(buf, ip, c, end - ip)
+                if l2 > mlen {
+                    mlen = l2
+                    off = ip - c
+                }
+            }
+        }
+        if mlen >= 4 && (mlen >= 5 || off == rep) {
+            var p: usize = ip
+            var r: usize = ip - off
+            while p > anchor && r > 0 && rt.ld8(buf, p - 1) == rt.ld8(buf, r - 1) {
+                p = p - 1
+                r = r - 1
+                mlen = mlen + 1
+            }
+            add_seq(e, buf, anchor, p, mlen, off)
+            rep = off
+            ip = p + mlen
+            anchor = ip
+            // keep the table warm with the two positions before the end
+            if ip >= 2 && ip + 6 <= buflen {
+                let v2: u64 = common.ld64le(buf, ip - 2)
+                rt.st32(ht, (((v2 << 24) *% 0x9E3779B185EBCA87) >> hshift) as usize, (ip - 1) as u32)
+            }
+        } else {
+            ip = ip + 1 + ((ip - anchor) >> 6)
+        }
+    }
+    add_tail(e, buf, anchor, end)
+}
+
+fn hash4(v: u32, bits: u32) -> usize {
+    return ((v *% 2654435761) >> (32 - bits)) as usize
+}
+
+// Inserts positions from..to into the hash chains.
+fn chain_insert(e: *mut ZstdEnc, from: usize, to: usize) {
+    let buf: u64 = (*e).win.ptr
+    let buflen: usize = (*e).win.len
+    var p: usize = from
+    while p < to && p + 4 <= buflen {
+        let h: usize = hash4(common.ld32le(buf, p), (*e).hlog)
+        let head: u32 = rt.ld32((*e).ht, h)
+        rt.st32((*e).chain, p & (*e).cmask, head)
+        rt.st32((*e).ht, h, (p + 1) as u32)
+        p = p + 1
+    }
+}
+
+// The best match at `ip` among the chain, the last two offsets; returns its
+// length (0 = none) and the offset in `off`.
+fn chain_find(e: *mut ZstdEnc, ip: usize, end: usize, rep1: usize, rep2: usize, off: *mut usize) -> usize {
+    let buf: u64 = (*e).win.ptr
+    let buflen: usize = (*e).win.len
+    if ip + 4 > buflen || ip + 4 > end {
+        return 0
+    }
+    let maxl: usize = end - ip
+    let seq: u32 = common.ld32le(buf, ip)
+    var best: usize = 3
+    var boff: usize = 0
+    var bgain: i64 = 0 - 1000
+    // the repeat offsets
+    var r: usize = 0
+    while r < 2 {
+        var ro: usize = rep1
+        if r == 1 {
+            ro = rep2
+        }
+        if ro > 0 && ro <= ip && ro <= (*e).wsize && common.ld32le(buf, ip - ro) == seq {
+            let l: usize = match_len(buf, ip, ip - ro, maxl)
+            let g: i64 = (l as i64) * 4 - 1
+            if l >= 4 && g > bgain {
+                best = l
+                boff = ro
+                bgain = g
+            }
+        }
+        r = r + 1
+    }
+    let h: usize = hash4(seq, (*e).hlog)
+    var cand: usize = rt.ld32((*e).ht, h) as usize
+    var left: u32 = (*e).depth
+    while cand != 0 && left > 0 {
+        let c: usize = cand - 1
+        if c >= ip || ip - c > (*e).wsize {
+            break
+        }
+        if best < maxl && rt.ld8(buf, c + best) == rt.ld8(buf, ip + best) && common.ld32le(buf, c) == seq {
+            let l: usize = match_len(buf, ip, c, maxl)
+            let g: i64 = (l as i64) * 4 - (zstd.highbit32((ip - c + 1) as u32) as i64)
+            if l >= 4 && g > bgain {
+                best = l
+                boff = ip - c
+                bgain = g
+                if l >= maxl || l >= 256 {
+                    break
+                }
+            }
+        }
+        let nx: usize = rt.ld32((*e).chain, c & (*e).cmask) as usize
+        if nx >= cand {
+            break
+        }
+        cand = nx
+        left = left - 1
+    }
+    if boff == 0 || best < 4 {
+        return 0
+    }
+    *off = boff
+    return best
+}
+
+fn gain_of(len: usize, off: usize, rep1: usize, rep2: usize) -> i64 {
+    return (len as i64) * 4 - (off_bits(off, rep1, rep2) as i64)
+}
+
+// Levels 3-19: hash chains, greedy or lazy.
+fn find_chain(e: *mut ZstdEnc, start: usize, end: usize) {
+    let buf: u64 = (*e).win.ptr
+    var anchor: usize = start
+    var ip: usize = start
+    var ins: usize = start
+    var rep1: usize = (*e).rep1 as usize
+    var rep2: usize = (*e).rep2 as usize
+    // positions of the history before this block are already inserted
+    while ip + 4 <= end && ip + 4 <= (*e).win.len {
+        if ins < ip {
+            chain_insert(e, ins, ip)
+            ins = ip
+        }
+        var off: usize = 0
+        var len: usize = chain_find(e, ip, end, rep1, rep2, &off)
+        if len == 0 {
+            // nothing here: skip faster the longer the dry spell
+            let nip: usize = ip + 1 + ((ip - anchor) >> 8)
+            chain_insert(e, ins, ip + 1)
+            ins = ip + 1
+            ip = nip
+            continue
+        }
+        // lazy: is the next position (or the one after) better?
+        var lz: u32 = (*e).lazy
+        while lz > 0 && ip + 5 <= end {
+            // the match at ip is already in the table
+            chain_insert(e, ins, ip + 1)
+            if ins < ip + 1 {
+                ins = ip + 1
+            }
+            var off1: usize = 0
+            let len1: usize = chain_find(e, ip + 1, end, rep1, rep2, &off1)
+            if len1 > 0 && gain_of(len1, off1, rep1, rep2) > gain_of(len, off, rep1, rep2) + 4 {
+                ip = ip + 1
+                len = len1
+                off = off1
+                lz = (*e).lazy
+                if lz > 0 {
+                    lz = lz - 0
+                }
+                continue
+            }
+            if lz >= 2 && ip + 6 <= end {
+                chain_insert(e, ins, ip + 2)
+                if ins < ip + 2 {
+                    ins = ip + 2
+                }
+                var off2: usize = 0
+                let len2: usize = chain_find(e, ip + 2, end, rep1, rep2, &off2)
+                if len2 > 0 && gain_of(len2, off2, rep1, rep2) > gain_of(len, off, rep1, rep2) + 7 {
+                    ip = ip + 2
+                    len = len2
+                    off = off2
+                    continue
+                }
+            }
+            break
+        }
+        // catch up backwards
+        var p: usize = ip
+        var r: usize = ip - off
+        while p > anchor && r > 0 && rt.ld8(buf, p - 1) == rt.ld8(buf, r - 1) {
+            p = p - 1
+            r = r - 1
+            len = len + 1
+        }
+        add_seq(e, buf, anchor, p, len, off)
+        rep2 = rep1
+        if off != rep1 {
+            rep1 = off
+        }
+        ip = p + len
+        anchor = ip
+        chain_insert(e, ins, ip)
+        if ins < ip {
+            ins = ip
+        }
+    }
+    add_tail(e, buf, anchor, end)
+}
+
+// ====================================================================
+// LITERALS AND SEQUENCES SECTIONS
+// ====================================================================
+
+// ~256 * log2(n) for n >= 1 (a mantissa approximation, good to ~0.01 bit)
+fn lg256(n: u32) -> u64 {
+    let hb: u32 = zstd.highbit32(n)
+    let m: u32 = n - ((1 as u32) << hb)
+    let frac: u64 = (((m as u64) << 8) >> (hb as u64))
+    let corr: u64 = (frac * (256 - frac) * 89) >> 16
+    return (hb as u64) * 256 + frac + corr
+}
+
+fn put_lit_header(body: *mut rt.Buf, typ: u32, n: usize) {
+    if n < 32 {
+        rt.buf_push(body, ((n << 3) as u32 | typ) as u8)
+    } else if n < 4096 {
+        let v: u32 = typ | 4 | ((n as u32) << 4)
+        rt.buf_push(body, (v & 0xFF) as u8)
+        rt.buf_push(body, ((v >> 8) & 0xFF) as u8)
+    } else {
+        let v: u32 = typ | 12 | ((n as u32) << 4)
+        rt.buf_push(body, (v & 0xFF) as u8)
+        rt.buf_push(body, ((v >> 8) & 0xFF) as u8)
+        rt.buf_push(body, ((v >> 16) & 0xFF) as u8)
+    }
+}
+
+fn lit_header_len(n: usize) -> usize {
+    if n < 32 {
+        return 1
+    }
+    if n < 4096 {
+        return 2
+    }
+    return 3
+}
+
+// Appends the literals section for e.lits[0..nlits). `hq` receives the
+// Huffman table the decoder will hold afterwards (valid only when `*hq_set`).
+#[allow_escape]
+fn enc_literals(e: *mut ZstdEnc, body: *mut rt.Buf, hq: *mut HufEnc, hq_set: *mut bool) {
+    let n: usize = (*e).nlits
+    let lits: u64 = (*e).lits
+    *hq_set = false
+    if n == 0 {
+        rt.buf_push(body, 0 as u8)
+        return
+    }
+    var cur: HufEnc = huf_new()
+    var i: usize = 0
+    while i < n {
+        let s: usize = rt.ld8(lits, i) as usize
+        cur.freq[s] = cur.freq[s] + 1
+        i = i + 1
+    }
+    var distinct: usize = 0
+    i = 0
+    while i < 256 {
+        if cur.freq[i] > 0 {
+            distinct = distinct + 1
+        }
+        i = i + 1
+    }
+    if distinct == 1 && n >= 2 {
+        put_lit_header(body, 1, n)
+        rt.buf_push(body, rt.ld8(lits, 0))
+        return
+    }
+    let raw_total: usize = lit_header_len(n) + n
+    if ((*e).feat & FEAT_HUF) != 0 && n >= 40 && distinct >= 2 {
+        // candidate 1: a fresh table
+        var fresh: bool = huf_build(&cur)
+        var tab: [u8; 140] = [0; 140]
+        var tlen: usize = 0
+        var bits_new: u64 = 0
+        if fresh {
+            tlen = huf_write_table(&cur, (&tab[0]) as u64)
+            if tlen == 0 {
+                fresh = false
+            } else {
+                bits_new = huf_cost_bits(&cur)
+            }
+        }
+        // candidate 2: the table of the previous block
+        var reuse: bool = false
+        var bits_old: u64 = 0
+        if huf_covers(&(*e).phuf, &cur) {
+            var s2: usize = 0
+            while s2 < 256 {
+                bits_old = bits_old + (cur.freq[s2] as u64) * ((*e).phuf.len[s2] as u64)
+                s2 = s2 + 1
+            }
+            reuse = true
+        }
+        let streams_extra: usize = if n < 256 { 0 } else { 9 }
+        var est_new: usize = 0xFFFFFFFFFFFFFFFF
+        var est_old: usize = 0xFFFFFFFFFFFFFFFF
+        if fresh {
+            est_new = tlen + ((bits_new + 7) / 8) as usize + streams_extra
+        }
+        if reuse {
+            est_old = ((bits_old + 7) / 8) as usize + streams_extra
+        }
+        var use_old: bool = false
+        var est: usize = est_new
+        if reuse && est_old <= est_new {
+            use_old = true
+            est = est_old
+        }
+        if (fresh || reuse) && est + 4 < n {
+            // encode for real
+            var tbl: *mut HufEnc = &cur
+            if use_old {
+                tbl = &(*e).phuf
+            }
+            let start: usize = (*body).len
+            let cap: usize = 5 + tlen + n + 64
+            common.buf_ensure(body, start + cap)
+            let base: u64 = (*body).ptr + start as u64
+            var at: usize = 5 // payload starts after a 5 octet header slot
+            if !use_old {
+                rt.mem_copy(base + at as u64, (&tab[0]) as u64, tlen)
+                at = at + tlen
+            }
+            var csize: usize = 0
+            var four: bool = n >= 256
+            if !four {
+                let sl: usize = huf_encode_stream(tbl, lits, n, base + at as u64)
+                at = at + sl
+            } else {
+                let seg: usize = (n + 3) / 4
+                let jt: usize = at
+                at = at + 6
+                var k: usize = 0
+                var sizes: [usize; 4] = [0; 4]
+                while k < 4 {
+                    var cnt: usize = seg
+                    if k == 3 {
+                        cnt = n - 3 * seg
+                    }
+                    sizes[k] = huf_encode_stream(tbl, lits + (k * seg) as u64, cnt, base + at as u64)
+                    at = at + sizes[k]
+                    k = k + 1
+                }
+                // the jump table: sizes of the first three streams
+                var q: usize = 0
+                while q < 3 {
+                    rt.st8(base, jt + 2 * q, (sizes[q] & 0xFF) as u8)
+                    rt.st8(base, jt + 2 * q + 1, ((sizes[q] >> 8) & 0xFF) as u8)
+                    q = q + 1
+                }
+            }
+            csize = at - 5
+            // the header: type 2 (new table) or 3 (the old one), size format, sizes
+            let typ: u32 = if use_old { 3 } else { 2 }
+            var hl: usize = 0
+            var hdr: [u8; 5] = [0; 5]
+            if csize < 1024 && n < 1024 {
+                var sf: u32 = 1
+                if !four {
+                    sf = 0
+                }
+                let v: u32 = typ | (sf << 2) | ((n as u32) << 4) | ((csize as u32) << 14)
+                hdr[0] = (v & 0xFF) as u8
+                hdr[1] = ((v >> 8) & 0xFF) as u8
+                hdr[2] = ((v >> 16) & 0xFF) as u8
+                hl = 3
+            } else if csize < 16384 && n < 16384 {
+                let v: u32 = typ | (2 << 2) | ((n as u32) << 4) | ((csize as u32) << 18)
+                hdr[0] = (v & 0xFF) as u8
+                hdr[1] = ((v >> 8) & 0xFF) as u8
+                hdr[2] = ((v >> 16) & 0xFF) as u8
+                hdr[3] = ((v >> 24) & 0xFF) as u8
+                hl = 4
+            } else {
+                let v: u64 = (typ as u64) | (3 << 2) | ((n as u64) << 4) | ((csize as u64) << 22)
+                hdr[0] = (v & 0xFF) as u8
+                hdr[1] = ((v >> 8) & 0xFF) as u8
+                hdr[2] = ((v >> 16) & 0xFF) as u8
+                hdr[3] = ((v >> 24) & 0xFF) as u8
+                hdr[4] = ((v >> 32) & 0xFF) as u8
+                hl = 5
+            }
+            if hl + csize < raw_total {
+                // slide the payload down next to the header
+                rt.mem_copy(base + hl as u64, base + 5, csize)
+                var j: usize = 0
+                while j < hl {
+                    rt.st8(base, j, hdr[j])
+                    j = j + 1
+                }
+                (*body).len = start + hl + csize
+                if !use_old {
+                    *hq = cur
+                } else {
+                    *hq = (*e).phuf
+                }
+                *hq_set = true
+                return
+            }
+            (*body).len = start
+        }
+    }
+    put_lit_header(body, 0, n)
+    common.buf_append_bytes(body, lits, n)
+}
+
+fn ll_code(ll: u32) -> usize {
+    if ll < 16 {
+        return ll as usize
+    }
+    if ll >= 64 {
+        return (zstd.highbit32(ll) + 19) as usize
+    }
+    var c: usize = 24
+    while zstd.ll_base(c) > ll {
+        c = c - 1
+    }
+    return c
+}
+
+fn ml_code(ml: u32) -> usize {
+    if ml < 35 {
+        return (ml - 3) as usize
+    }
+    var c: usize = 52
+    while zstd.ml_base(c) > ml {
+        c = c - 1
+    }
+    return c
+}
+
+struct SeqKind {
+    mode: u32,
+    ct: FseCT,
+    nc: zstd.NCount,
+    hdr: [u8; 96],
+    hlen: usize,
+}
+
+fn kind_new() -> SeqKind {
+    return SeqKind { mode: 0, ct: fct_new(), nc: zstd.NCount { norm: [0; 256], nsym: 0, log: 0 },
+        hdr: [0; 96], hlen: 0 }
+}
+
+// the cost in 1/256 bits of coding `cnt` with the distribution `nc`
+fn table_cost(cnt: u64, nsym: usize, nc: *mut zstd.NCount) -> u64 {
+    var total: u64 = 0
+    var s: usize = 0
+    while s < nsym {
+        let c: u32 = rt.ld32(cnt, s)
+        if c > 0 {
+            if s >= (*nc).nsym {
+                return 0xFFFFFFFFFFFFFFFF
+            }
+            var p: i32 = (*nc).norm[s]
+            if p == 0 {
+                return 0xFFFFFFFFFFFFFFFF
+            }
+            if p < 0 {
+                p = 1
+            }
+            total = total + (c as u64) * (((*nc).log as u64) * 256 - lg256(p as u32))
+        }
+        s = s + 1
+    }
+    return total
+}
+
+// Chooses mode and table for one of the three symbol kinds (0 = literal
+// lengths, 1 = offsets, 2 = match lengths).
+#[allow_escape]
+fn pick_table(e: *mut ZstdEnc, kind: usize, cnt: u64, nsym: usize, nseq: usize, prev: *mut zstd.NCount,
+    prev_ok: bool, k: *mut SeqKind) {
+    var maxlog: u32 = 9
+    if kind == 1 {
+        maxlog = 8
+    }
+    // distinct symbols
+    var distinct: usize = 0
+    var only: usize = 0
+    var s: usize = 0
+    while s < nsym {
+        if rt.ld32(cnt, s) > 0 {
+            distinct = distinct + 1
+            only = s
+        }
+        s = s + 1
+    }
+    // predefined
+    var pd: zstd.NCount = zstd.NCount { norm: [0; 256], nsym: 0, log: 0 }
+    var pn: usize = 36
+    pd.log = 6
+    if kind == 1 {
+        pn = 29
+        pd.log = 5
+    } else if kind == 2 {
+        pn = 53
+    }
+    s = 0
+    while s < pn {
+        pd.norm[s] = zstd.fse_predef_norm(kind, s)
+        s = s + 1
+    }
+    pd.nsym = pn
+    var best_cost: u64 = table_cost(cnt, nsym, &pd)
+    var best_mode: u32 = 0
+    if prev_ok {
+        let cr: u64 = table_cost(cnt, nsym, prev)
+        if cr < best_cost {
+            best_cost = cr
+            best_mode = 3
+        }
+    }
+    if distinct == 1 {
+        // a run of one symbol: the table is one octet
+        let c2: u64 = 8 * 256
+        if c2 < best_cost {
+            best_cost = c2
+            best_mode = 1
+        }
+    }
+    var cust: zstd.NCount = zstd.NCount { norm: [0; 256], nsym: 0, log: 0 }
+    var cust_ok: bool = false
+    var chl: usize = 0
+    if ((*e).feat & FEAT_FSE) != 0 && distinct >= 2 && nseq >= 8 {
+        // a table log that fits the number of sequences
+        var log: u32 = zstd.highbit32((nseq - 1) as u32) + 1
+        if log > maxlog {
+            log = maxlog
+        }
+        var minlog: u32 = zstd.highbit32((distinct - 1) as u32) + 1
+        if minlog < 5 {
+            minlog = 5
+        }
+        if log < minlog {
+            log = minlog
+        }
+        if log < 5 {
+            log = 5
+        }
+        if log <= maxlog && fse_normalize(&cust, cnt, nsym, nseq as u64, log) {
+            chl = fse_write_ncount(&cust, (&(*k).hdr[0]) as u64)
+            let cc: u64 = ((chl as u64) * 8 * 256) + table_cost(cnt, nsym, &cust)
+            if cc < best_cost {
+                best_cost = cc
+                best_mode = 2
+                cust_ok = true
+            }
+        }
+    }
+    (*k).mode = best_mode
+    (*k).hlen = 0
+    if best_mode == 0 {
+        (*k).nc = pd
+    } else if best_mode == 3 {
+        (*k).nc = *prev
+    } else if best_mode == 1 {
+        (*k).hdr[0] = only as u8
+        (*k).hlen = 1
+    } else {
+        (*k).nc = cust
+        (*k).hlen = chl
+    }
+    if best_mode != 1 {
+        fct_build(&(*k).ct, &(*k).nc)
+    }
+    let _unused: bool = cust_ok
+}
+
+// Appends the sequences section for the block's sequences and updates the
+// pending state (`q*`, repeat offsets).
+#[allow_escape]
+fn enc_sequences(e: *mut ZstdEnc, body: *mut rt.Buf, qll: *mut zstd.NCount, qof: *mut zstd.NCount,
+    qml: *mut zstd.NCount, qok: *mut u32, qrep: *mut [u32; 3]) {
+    let nseq: usize = (*e).nseq
+    // the number of sequences
+    if nseq < 128 {
+        rt.buf_push(body, nseq as u8)
+    } else if nseq < 32512 {
+        rt.buf_push(body, ((nseq >> 8) + 128) as u8)
+        rt.buf_push(body, (nseq & 0xFF) as u8)
+    } else {
+        rt.buf_push(body, 255 as u8)
+        let v: usize = nseq - 32512
+        rt.buf_push(body, (v & 0xFF) as u8)
+        rt.buf_push(body, ((v >> 8) & 0xFF) as u8)
+    }
+    if nseq == 0 {
+        return
+    }
+    let llc: u64 = (*e).codes
+    let ofc: u64 = (*e).codes + SEQ_CAP as u64
+    let mlc: u64 = (*e).codes + (2 * SEQ_CAP) as u64
+    var hll: [u32; 40] = [0; 40]
+    var hof: [u32; 32] = [0; 32]
+    var hml: [u32; 56] = [0; 56]
+    var r1: u32 = (*e).rep1
+    var r2: u32 = (*e).rep2
+    var r3: u32 = (*e).rep3
+    var i: usize = 0
+    while i < nseq {
+        let ll: u32 = rt.ld32((*e).sll, i)
+        let ml: u32 = rt.ld32((*e).sml, i)
+        let off: u32 = rt.ld32((*e).sof, i)
+        var ov: u32 = off + 3
+        if ll != 0 {
+            if off == r1 {
+                ov = 1
+            } else if off == r2 {
+                ov = 2
+            } else if off == r3 {
+                ov = 3
+            }
+        } else {
+            if off == r2 {
+                ov = 1
+            } else if off == r3 {
+                ov = 2
+            } else if r1 > 1 && off == r1 - 1 {
+                ov = 3
+            }
+        }
+        // the decoder's bookkeeping
+        if ov > 3 {
+            r3 = r2
+            r2 = r1
+            r1 = off
+        } else {
+            var idx: u32 = ov
+            if ll == 0 {
+                idx = idx + 1
+            }
+            if idx == 2 {
+                r2 = r1
+                r1 = off
+            } else if idx >= 3 {
+                r3 = r2
+                r2 = r1
+                r1 = off
+            }
+        }
+        rt.st32((*e).sof, i, ov)
+        let lc: usize = ll_code(ll)
+        let mc: usize = ml_code(ml)
+        let oc: usize = zstd.highbit32(ov) as usize
+        rt.st8(llc, i, lc as u8)
+        rt.st8(ofc, i, oc as u8)
+        rt.st8(mlc, i, mc as u8)
+        hll[lc] = hll[lc] + 1
+        hof[oc] = hof[oc] + 1
+        hml[mc] = hml[mc] + 1
+        i = i + 1
+    }
+    (*qrep)[0] = r1
+    (*qrep)[1] = r2
+    (*qrep)[2] = r3
+    var kl: SeqKind = kind_new()
+    var ko: SeqKind = kind_new()
+    var km: SeqKind = kind_new()
+    pick_table(e, 0, (&hll[0]) as u64, 36, nseq, &(*e).pll, (*e).pll_ok, &kl)
+    pick_table(e, 1, (&hof[0]) as u64, 32, nseq, &(*e).pof, (*e).pof_ok, &ko)
+    pick_table(e, 2, (&hml[0]) as u64, 53, nseq, &(*e).pml, (*e).pml_ok, &km)
+    rt.buf_push(body, ((kl.mode << 6) | (ko.mode << 4) | (km.mode << 2)) as u8)
+    common.buf_append_bytes(body, (&kl.hdr[0]) as u64, kl.hlen)
+    common.buf_append_bytes(body, (&ko.hdr[0]) as u64, ko.hlen)
+    common.buf_append_bytes(body, (&km.hdr[0]) as u64, km.hlen)
+    // what the decoder will hold afterwards: an RLE table is not repeatable here
+    var ok: u32 = 0
+    if kl.mode != 1 {
+        *qll = kl.nc
+        ok = ok | 1
+    }
+    if ko.mode != 1 {
+        *qof = ko.nc
+        ok = ok | 2
+    }
+    if km.mode != 1 {
+        *qml = km.nc
+        ok = ok | 4
+    }
+    *qok = ok
+    // the bit stream
+    let cap: usize = nseq * 10 + 64
+    common.buf_ensure(body, (*body).len + cap)
+    var w: BitW = bw_new((*body).ptr + (*body).len as u64)
+    let last: usize = nseq - 1
+    var sl: usize = 0
+    var so: usize = 0
+    var sm: usize = 0
+    if kl.mode != 1 {
+        sl = fct_init(&kl.ct, rt.ld8(llc, last) as usize)
+    }
+    if ko.mode != 1 {
+        so = fct_init(&ko.ct, rt.ld8(ofc, last) as usize)
+    }
+    if km.mode != 1 {
+        sm = fct_init(&km.ct, rt.ld8(mlc, last) as usize)
+    }
+    var pos: usize = last + 1
+    while pos > 0 {
+        pos = pos - 1
+        let lc: usize = rt.ld8(llc, pos) as usize
+        let oc: usize = rt.ld8(ofc, pos) as usize
+        let mc: usize = rt.ld8(mlc, pos) as usize
+        if pos != last {
+            if ko.mode != 1 {
+                fct_encode(&w, &ko.ct, &so, oc)
+            }
+            if km.mode != 1 {
+                fct_encode(&w, &km.ct, &sm, mc)
+            }
+            if kl.mode != 1 {
+                fct_encode(&w, &kl.ct, &sl, lc)
+            }
+        }
+        bw_add(&w, (rt.ld32((*e).sll, pos) - zstd.ll_base(lc)) as u64, zstd.ll_bits(lc) as usize)
+        bw_add(&w, (rt.ld32((*e).sml, pos) - zstd.ml_base(mc)) as u64, zstd.ml_bits(mc) as usize)
+        bw_add(&w, (rt.ld32((*e).sof, pos) - ((1 as u32) << (oc as u32))) as u64, oc)
+    }
+    if km.mode != 1 {
+        fct_flush(&w, &km.ct, sm)
+    }
+    if ko.mode != 1 {
+        fct_flush(&w, &ko.ct, so)
+    }
+    if kl.mode != 1 {
+        fct_flush(&w, &kl.ct, sl)
+    }
+    let n: usize = bw_close(&w)
+    (*body).len = (*body).len + n
+}
+
+// ====================================================================
+// BLOCKS AND FRAMES
+// ====================================================================
+
+fn put24(out: *mut rt.Buf, v: u32) {
+    rt.buf_push(out, (v & 0xFF) as u8)
+    rt.buf_push(out, ((v >> 8) & 0xFF) as u8)
+    rt.buf_push(out, ((v >> 16) & 0xFF) as u8)
+}
+
+fn all_same(buf: u64, start: usize, end: usize) -> bool {
+    let first: u8 = rt.ld8(buf, start)
+    var i: usize = start + 1
+    while i < end {
+        if rt.ld8(buf, i) != first {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Compresses win[start..end) as one block and appends it to `out`.
+#[allow_escape]
+fn enc_block(e: *mut ZstdEnc, out: *mut rt.Buf, start: usize, end: usize, last: bool) {
+    let size: usize = end - start
+    let buf: u64 = (*e).win.ptr
+    var lastbit: u32 = 0
+    if last {
+        lastbit = 1
+    }
+    common.buf_ensure(out, (*out).len + size + 64)
+    if size == 0 {
+        put24(out, lastbit)
+        return
+    }
+    if size >= 4 && all_same(buf, start, end) {
+        put24(out, ((size as u32) << 3) | 2 | lastbit)
+        rt.buf_push(out, rt.ld8(buf, start))
+        // keep the match tables in step so later blocks can refer to this one
+        if (*e).mode == 1 {
+            chain_insert(e, start, end)
+        }
+        return
+    }
+    (*e).nseq = 0
+    (*e).nlits = 0
+    if size >= 16 {
+        if (*e).mode == 0 {
+            find_fast(e, start, end)
+        } else {
+            find_chain(e, start, end)
+        }
+    } else {
+        add_tail(e, buf, start, end)
+    }
+    rt.buf_clear(&(*e).body)
+    var hq: HufEnc = huf_new()
+    var hq_set: bool = false
+    enc_literals(e, &(*e).body, &hq, &hq_set)
+    var qll: zstd.NCount = zstd.NCount { norm: [0; 256], nsym: 0, log: 0 }
+    var qof: zstd.NCount = zstd.NCount { norm: [0; 256], nsym: 0, log: 0 }
+    var qml: zstd.NCount = zstd.NCount { norm: [0; 256], nsym: 0, log: 0 }
+    var qok: u32 = 0
+    var qrep: [u32; 3] = [0; 3]
+    enc_sequences(e, &(*e).body, &qll, &qof, &qml, &qok, &qrep)
+    if (*e).body.len < size {
+        put24(out, (((*e).body.len as u32) << 3) | 4 | lastbit)
+        common.buf_append_bytes(out, (*e).body.ptr, (*e).body.len)
+        // what the decoder remembers now
+        if (*e).nseq > 0 {
+            (*e).rep1 = qrep[0]
+            (*e).rep2 = qrep[1]
+            (*e).rep3 = qrep[2]
+            (*e).pll_ok = (qok & 1) != 0
+            (*e).pof_ok = (qok & 2) != 0
+            (*e).pml_ok = (qok & 4) != 0
+            if (*e).pll_ok {
+                (*e).pll = qll
+            }
+            if (*e).pof_ok {
+                (*e).pof = qof
+            }
+            if (*e).pml_ok {
+                (*e).pml = qml
+            }
+        }
+        if hq_set {
+            (*e).phuf = hq
+        }
+    } else {
+        put24(out, ((size as u32) << 3) | lastbit)
+        common.buf_append_bytes(out, buf + start as u64, size)
+    }
+}
+
+fn enc_start(e: *mut ZstdEnc, out: *mut rt.Buf) {
+    let mut_single: bool = (*e).single
+    var fhd: u32 = 0
+    var fsz: usize = 0
+    if (*e).has_fcs {
+        if mut_single {
+            if (*e).fcs < 256 {
+                fsz = 1
+            } else if (*e).fcs < 65792 {
+                fhd = fhd | (1 << 6)
+                fsz = 2
+            } else if (*e).fcs < 4294967296 {
+                fhd = fhd | (2 << 6)
+                fsz = 4
+            } else {
+                fhd = fhd | (3 << 6)
+                fsz = 8
+            }
+        } else {
+            if (*e).fcs >= 256 && (*e).fcs < 65792 {
+                fhd = fhd | (1 << 6)
+                fsz = 2
+            } else if (*e).fcs < 4294967296 {
+                fhd = fhd | (2 << 6)
+                fsz = 4
+            } else {
+                fhd = fhd | (3 << 6)
+                fsz = 8
+            }
+        }
+    }
+    if mut_single {
+        fhd = fhd | 32
+    }
+    if (*e).chk {
+        fhd = fhd | 4
+    }
+    var dsz: usize = 0
+    if (*e).dictid != 0 {
+        if (*e).dictid < 256 {
+            fhd = fhd | 1
+            dsz = 1
+        } else if (*e).dictid < 65536 {
+            fhd = fhd | 2
+            dsz = 2
+        } else {
+            fhd = fhd | 3
+            dsz = 4
+        }
+    }
+    common.buf_ensure(out, (*out).len + 32)
+    rt.buf_push(out, 0x28 as u8)
+    rt.buf_push(out, 0xB5 as u8)
+    rt.buf_push(out, 0x2F as u8)
+    rt.buf_push(out, 0xFD as u8)
+    rt.buf_push(out, fhd as u8)
+    if !mut_single {
+        rt.buf_push(out, (((*e).wlog - 10) << 3) as u8)
+    }
+    var i: usize = 0
+    while i < dsz {
+        rt.buf_push(out, (((*e).dictid >> ((i * 8) as u32)) & 0xFF) as u8)
+        i = i + 1
+    }
+    var v: u64 = (*e).fcs
+    if fsz == 2 {
+        v = v - 256
+    }
+    i = 0
+    while i < fsz {
+        rt.buf_push(out, ((v >> ((i * 8) as u64)) & 0xFF) as u8)
+        i = i + 1
+    }
+    (*e).started = true
+}
+
+// Drops history the window no longer needs and rebases the match tables.
+fn enc_compact(e: *mut ZstdEnc) {
+    if !(*e).owned || (*e).blk < 2 * (*e).wsize {
+        return
+    }
+    let cut: usize = (*e).wsize * (((*e).blk - (*e).wsize) / (*e).wsize)
+    if cut == 0 {
+        return
+    }
+    let rest: usize = (*e).win.len - cut
+    rt.mem_copy((*e).win.ptr, (*e).win.ptr + cut as u64, rest)
+    (*e).win.len = rest
+    (*e).blk = (*e).blk - cut
+    var i: usize = 0
+    let hn: usize = (1 as usize) << ((*e).hlog as usize)
+    while i < hn {
+        let v: u32 = rt.ld32((*e).ht, i)
+        if v != 0 {
+            if (v as usize) <= cut {
+                rt.st32((*e).ht, i, 0)
+            } else {
+                rt.st32((*e).ht, i, v - (cut as u32))
+            }
+        }
+        i = i + 1
+    }
+    if (*e).mode == 1 {
+        i = 0
+        while i < (*e).wsize {
+            let v: u32 = rt.ld32((*e).chain, i)
+            if v != 0 {
+                if (v as usize) <= cut {
+                    rt.st32((*e).chain, i, 0)
+                } else {
+                    rt.st32((*e).chain, i, v - (cut as u32))
+                }
+            }
+            i = i + 1
+        }
+    }
+}
+
+// Compresses full blocks (all of it when `fin`), appending to `out`.
+fn enc_blocks(e: *mut ZstdEnc, out: *mut rt.Buf, fin: bool) {
+    if !(*e).started {
+        enc_start(e, out)
+    }
+    while true {
+        let avail: usize = (*e).win.len - (*e).blk
+        if avail >= BLOCK || (fin && avail > 0) {
+            var sz: usize = avail
+            if sz > BLOCK {
+                sz = BLOCK
+            }
+            let islast: bool = fin && sz == avail
+            enc_block(e, out, (*e).blk, (*e).blk + sz, islast)
+            (*e).blk = (*e).blk + sz
+            if islast {
+                return
+            }
+            enc_compact(e)
+        } else {
+            break
+        }
+    }
+    if fin {
+        // no input left, or none at all: an empty last block closes the frame
+        enc_block(e, out, (*e).blk, (*e).blk, true)
+    }
+}
+
+// Loads a dictionary: its content becomes history, a zstd dictionary also
+// supplies the repeat offsets and the id.
+fn enc_load_dict(e: *mut ZstdEnc, dict: u64, dictlen: usize) -> bool {
+    if !enc_prepare(e) {
+        return false
+    }
+    var at: usize = 0
+    var cl: usize = dictlen
+    if dictlen >= 8 && common.ld32le(dict, 0) == 0xEC30A437 {
+        (*e).dictid = common.ld32le(dict, 4)
+        // entropy tables, then three offsets, then the content: let the
+        // decoder module find where the content starts
+        var d: zstd.ZstdDec = zstd.zstd_dec_open_mem(0, 0)
+        zstd.zstd_dec_set_dict(&d, dict, dictlen)
+        let off: usize = zstd.zstd_dict_content_offset(&d)
+        zstd.zstd_dec_close(&d)
+        if off == 0 || off > dictlen {
+            return false
+        }
+        (*e).rep1 = common.ld32le(dict, off - 12)
+        (*e).rep2 = common.ld32le(dict, off - 8)
+        (*e).rep3 = common.ld32le(dict, off - 4)
+        at = off
+        cl = dictlen - off
+    }
+    // only the last window's worth can be reached
+    if cl > (*e).wsize {
+        at = at + (cl - (*e).wsize)
+        cl = (*e).wsize
+    }
+    if !common.buf_append_bytes(&(*e).win, dict + at as u64, cl) {
+        return false
+    }
+    (*e).blk = cl
+    if (*e).mode == 1 {
+        chain_insert(e, 0, cl)
+    } else {
+        var p: usize = 0
+        let hshift: u64 = (64 - (*e).hlog) as u64
+        while p + 8 <= cl {
+            let v: u64 = common.ld64le((*e).win.ptr, p)
+            rt.st32((*e).ht, (((v << 24) *% 0x9E3779B185EBCA87) >> hshift) as usize, (p + 1) as u32)
+            p = p + 1
+        }
+    }
+    return true
+}
+
+fn zstd_enc_new_dict(level: u32, checksum: bool, dict: u64, dictlen: usize) -> ZstdEnc {
+    var e: ZstdEnc = zstd_enc_new(level, checksum)
+    if dictlen > 0 {
+        if !enc_load_dict(&e, dict, dictlen) {
+            e.failed = true
+        }
+    }
+    return e
+}
+
+// For a streaming encoder whose caller knows the total size: puts it in the
+// frame header. The caller must then write exactly that many octets.
+fn zstd_enc_set_content_size(e: *mut ZstdEnc, n: u64) {
+    (*e).has_fcs = true
+    (*e).fcs = n
+}
+
+// Appends `n` octets of input; completed blocks go to `out`.
+fn zstd_enc_write(e: *mut ZstdEnc, p: u64, n: usize, out: *mut rt.Buf) {
+    if !enc_prepare(e) {
+        return
+    }
+    if (*e).dictid == 0 && !(*e).started && (*e).win.len == 0 {
+        (*e).single = false
+    }
+    if (*e).chk {
+        common.xxh64_update(&(*e).xxh, p, n)
+    }
+    var at: usize = 0
+    while at < n {
+        var k: usize = n - at
+        if k > BLOCK {
+            k = BLOCK
+        }
+        common.buf_append_bytes(&(*e).win, p + at as u64, k)
+        at = at + k
+        enc_blocks(e, out, false)
+    }
+}
+
+// Writes what is left, the last block and the checksum.
+fn zstd_enc_finish(e: *mut ZstdEnc, out: *mut rt.Buf) {
+    if !enc_prepare(e) {
+        return
+    }
+    enc_blocks(e, out, true)
+    if (*e).chk {
+        let h: u64 = common.xxh64_final(&(*e).xxh)
+        common.buf_ensure(out, (*out).len + 4)
+        var i: usize = 0
+        while i < 4 {
+            rt.buf_push(out, ((h >> ((i * 8) as u64)) & 0xFF) as u8)
+            i = i + 1
+        }
+    }
+}
+
+fn zstd_compress_bound(n: usize) -> usize {
+    return n + (n >> 7) + 128
+}
+
+fn ceil_log2(n: usize) -> u32 {
+    var l: u32 = 0
+    while ((1 as usize) << (l as usize)) < n && l < 40 {
+        l = l + 1
+    }
+    return l
+}
+
+fn zstd_compress(src: u64, n: usize, level: u32, out: *mut rt.Buf) -> CompressError!usize {
+    return try zstd_compress_dict(src, n, level, 0, 0, out)
+}
+
+fn zstd_compress_dict(src: u64, n: usize, level: u32, dict: u64, dictlen: usize,
+    out: *mut rt.Buf) -> CompressError!usize {
+    let before: usize = (*out).len
+    var e: ZstdEnc = zstd_enc_new(level, true)
+    defer zstd_enc_free(&e)
+    if n >= 2147483648 || dictlen > 0 {
+        // big or with a dictionary: through the window (a copy of the input)
+        if dictlen > 0 {
+            if !enc_load_dict(&e, dict, dictlen) {
+                return CompressError::Dictionary
+            }
+        }
+        if n < 2147483648 {
+            zstd_enc_set_content_size(&e, n as u64)
+        }
+        zstd_enc_write(&e, src, n, out)
+        zstd_enc_finish(&e, out)
+        if e.failed {
+            return CompressError::OutOfMemory
+        }
+        return (*out).len - before
+    }
+    // zero copy: the window IS the input
+    let cl: u32 = ceil_log2(n)
+    e.single = n <= ((1 as usize) << (e.wlog as usize))
+    if e.single {
+        e.wlog = cl
+        if e.wlog < 10 {
+            e.wlog = 10
+        }
+    }
+    if e.hlog > e.wlog + 1 {
+        e.hlog = e.wlog + 1
+    }
+    if e.hlog < 8 {
+        e.hlog = 8
+    }
+    e.has_fcs = true
+    e.fcs = n as u64
+    if !enc_prepare(&e) {
+        return CompressError::OutOfMemory
+    }
+    e.owned = false
+    e.win = rt.Buf { ptr: src, len: n, cap: 0 }
+    if (*out).len + zstd_compress_bound(n) > (*out).cap {
+        common.buf_ensure(out, (*out).len + zstd_compress_bound(n))
+    }
+    if e.chk {
+        common.xxh64_update(&e.xxh, src, n)
+    }
+    enc_blocks(&e, out, true)
+    if e.chk {
+        let h: u64 = common.xxh64_final(&e.xxh)
+        var i: usize = 0
+        while i < 4 {
+            rt.buf_push(out, ((h >> ((i * 8) as u64)) & 0xFF) as u8)
+            i = i + 1
+        }
+    }
+    if e.failed {
+        return CompressError::OutOfMemory
+    }
+    return (*out).len - before
+}
