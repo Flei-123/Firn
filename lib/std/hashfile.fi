@@ -1,0 +1,413 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/hashfile.fi -- std.hashfile: hash a file while streaming it, hex in
+// and out, and a download target that appears atomically and only if the
+// hash is right.
+//
+// WHY. A launcher downloads hundreds of files (client jar, libraries,
+// assets, a Java runtime) and every one comes with a digest from a manifest:
+// SHA-1 from Mojang, SHA-256 from Adoptium, SHA-512 from Modrinth. Three
+// things are needed and none was in std: (1) a digest of a file of any size
+// without reading it into memory, (2) hex text both ways, (3) a way to
+// write the download so that a crash, a dropped connection or a wrong
+// digest never leaves a half file at the final name.
+//
+//     import std.hashfile
+//     let hex: str = hashfile.hash_file_hex("/tmp/x.jar", hashfile.HASH_SHA1) catch |e| ...
+//     let ok: bool = hashfile.verify_file_hex(path, hashfile.HASH_SHA256, want) catch |e| ...
+//
+//     var d: hashfile.Download = hashfile.download_begin(dest, hashfile.HASH_SHA256, 420 as u32) catch |e| ...
+//     hashfile.download_write(&d, chunk_ptr, chunk_len) catch |e| ...   // as data arrives
+//     hashfile.download_commit(&d, want_hex) catch |e| ...              // verify, fsync, rename
+//
+// ALGORITHMS: MD5 (16 octets), SHA-1 (20), SHA-256 (32), SHA-512 (64). MD5
+// and SHA-1 are BROKEN as collision resistant hashes (see std.md5 and
+// std.crypto.sha1): they are here because manifests prescribe them. Against
+// an adversary who can choose both file and manifest only SHA-256/512 mean
+// anything; against a corrupted download every one of them is enough.
+//
+// THE DOWNLOAD TARGET. `download_begin` creates `<dest>.tmp-<pid>-<n>` NEXT
+// TO the destination (O_EXCL, so a leftover or a planted link is never
+// reused or followed). `download_write` appends and feeds the hasher in the
+// same pass. `download_commit` flushes the file, compares the digest with
+// the expected hex (if one is given), renames over `dest` (atomic on one
+// volume) and flushes the directory. On ANY failure the temporary file is
+// removed and `dest` is untouched: it is either the old file or the new
+// verified one, never a half one. `download_abort` is the same removal
+// for a caller that gives up.
+//
+// HONEST
+//   H1 THE COMPARISON IS NOT CONSTANT TIME. Expected digests are public
+//      manifest values, not secrets, so timing says nothing here.
+//   H2 THE EXPECTED HEX MAY BE UPPER OR LOWER CASE; it must have exactly
+//      the digest length, else it is `BadHex` (not a silent mismatch).
+//   H3 ONE PASS, NO RESUME. A broken download starts again from zero; there
+//      is no Range support in this layer.
+//   H4 Permission bits only apply on Linux (Windows ignores the mode).
+//   H5 `hash_file` follows symbolic links, like `open(2)`.
+
+import std.rt
+import std.fs
+import std.md5
+import std.crypto.sha1
+import std.crypto.sha256
+import std.crypto.sha512
+
+export {
+    HashError, Hasher, Download,
+    HASH_NONE, HASH_MD5, HASH_SHA1, HASH_SHA256, HASH_SHA512,
+    hash_len, hasher_new, hasher_update, hasher_final,
+    hex_encode, hex_string, hex_decode, hash_bytes_hex,
+    hash_file, hash_file_hex, verify_file_hex,
+    download_begin, download_write, download_commit, download_abort,
+    download_size,
+}
+
+error HashError {
+    NotFound, // the file does not exist
+    Permission,
+    Exists, // download_begin: the temporary name is taken (try again)
+    NoSpace,
+    Io, // everything else; `std.fs.last_errno` has the number
+    BadAlgo, // not one of HASH_*
+    BadHex, // the expected digest is not hex or has the wrong length
+    Mismatch, // download_commit: the digest differs (the temporary file is removed)
+    Finished, // a Download that was already committed or aborted
+}
+
+const HASH_NONE: u32 = 0
+const HASH_MD5: u32 = 1
+const HASH_SHA1: u32 = 2
+const HASH_SHA256: u32 = 3
+const HASH_SHA512: u32 = 4
+
+// digest length in octets (0 = unknown algorithm / HASH_NONE)
+fn hash_len(algo: u32) -> usize {
+    if algo == HASH_MD5 { return 16 }
+    if algo == HASH_SHA1 { return 20 }
+    if algo == HASH_SHA256 { return 32 }
+    if algo == HASH_SHA512 { return 64 }
+    return 0
+}
+
+struct Hasher {
+    algo: u32,
+    m_md5: md5.Md5,
+    m_sha1: sha1.Sha1,
+    m_sha256: sha256.Sha256,
+    m_sha512: sha512.Sha512,
+}
+
+// A hasher for `algo`; an unknown algorithm gives a hasher that ignores
+// everything (check `hash_len(algo) > 0` first).
+fn hasher_new(algo: u32) -> Hasher {
+    return Hasher { algo: algo, m_md5: md5.md5_new(), m_sha1: sha1.sha1_new(),
+        m_sha256: sha256.sha256_new(), m_sha512: sha512.sha512_new() }
+}
+
+fn hasher_update(h: *mut Hasher, p: u64, n: usize) {
+    if (*h).algo == HASH_MD5 {
+        md5.md5_update(&(*h).m_md5, p, n)
+    } else if (*h).algo == HASH_SHA1 {
+        sha1.sha1_update(&(*h).m_sha1, p, n)
+    } else if (*h).algo == HASH_SHA256 {
+        sha256.sha256_update(&(*h).m_sha256, p, n)
+    } else if (*h).algo == HASH_SHA512 {
+        sha512.sha512_update(&(*h).m_sha512, p, n)
+    }
+}
+
+// Writes `hash_len(algo)` octets to `out` (which must have room for 64).
+fn hasher_final(h: *mut Hasher, out: u64) {
+    if (*h).algo == HASH_MD5 {
+        md5.md5_final(&(*h).m_md5, out)
+    } else if (*h).algo == HASH_SHA1 {
+        sha1.sha1_final(&(*h).m_sha1, out)
+    } else if (*h).algo == HASH_SHA256 {
+        sha256.sha256_final(&(*h).m_sha256, out)
+    } else if (*h).algo == HASH_SHA512 {
+        sha512.sha512_final(&(*h).m_sha512, out)
+    }
+}
+
+// ------------------------------------------------------------------ hex
+
+fn hex_digit(v: u8) -> u8 {
+    if v < 10 as u8 {
+        return 48 as u8 + v
+    }
+    return 87 as u8 + v // 'a' - 10
+}
+
+// Appends the lower case hex of `n` octets at `p` to `out`.
+fn hex_encode(p: u64, n: usize, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < n {
+        let b: u8 = rt.ld8(p, i)
+        rt.buf_push(out, hex_digit(b >> 4))
+        rt.buf_push(out, hex_digit(b & 15 as u8))
+        i = i + 1
+    }
+}
+
+// The lower case hex of `n` octets at `p` as a string (copied to the heap).
+fn hex_string(p: u64, n: usize) -> str {
+    var b: rt.Buf = rt.buf_new()
+    hex_encode(p, n, &b)
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn hex_value(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 { return (c - 48 as u8) as i32 }
+    if c >= 97 as u8 && c <= 102 as u8 { return (c - 87 as u8) as i32 }
+    if c >= 65 as u8 && c <= 70 as u8 { return (c - 55 as u8) as i32 }
+    return -1
+}
+
+// Hex text (either case, even length) to octets at `out`, at most `max`
+// of them; the answer is the number of octets, or -1 for a character that
+// is no hex digit, an odd length, or more than `max` octets.
+fn hex_decode(s: str, out: u64, max: usize) -> i64 {
+    let n: usize = s.length()
+    if n % 2 != 0 || n / 2 > max {
+        return -1
+    }
+    var i: usize = 0
+    while i < n / 2 {
+        let hi: i32 = hex_value(s.chars(i * 2))
+        let lo: i32 = hex_value(s.chars(i * 2 + 1))
+        if hi < 0 || lo < 0 {
+            return -1
+        }
+        rt.st8(out, i, ((hi * 16 + lo) as u32) as u8)
+        i = i + 1
+    }
+    return (n / 2) as i64
+}
+
+// The digest of `n` octets in memory as lower case hex ("" for an unknown
+// algorithm).
+fn hash_bytes_hex(algo: u32, p: u64, n: usize) -> str {
+    if hash_len(algo) == 0 {
+        return ""
+    }
+    var h: Hasher = hasher_new(algo)
+    hasher_update(&h, p, n)
+    var d: [u8; 64] = [0; 64]
+    hasher_final(&h, (&d[0]) as u64)
+    return hex_string((&d[0]) as u64, hash_len(algo))
+}
+
+// ----------------------------------------------------------- files
+
+fn map_fs(e: FsError, err: *mut u32) -> usize {
+    if e == FsError::NotFound {
+        *err = 1 as u32
+    } else if e == FsError::Permission {
+        *err = 2 as u32
+    } else if e == FsError::Exists {
+        *err = 3 as u32
+    } else if e == FsError::NoSpace {
+        *err = 4 as u32
+    } else {
+        *err = 5 as u32
+    }
+    return 0
+}
+
+fn err_of(code: u32) -> HashError {
+    if code == 1 as u32 { return HashError::NotFound }
+    if code == 2 as u32 { return HashError::Permission }
+    if code == 3 as u32 { return HashError::Exists }
+    if code == 4 as u32 { return HashError::NoSpace }
+    return HashError::Io
+}
+
+// Streams the file through the hasher of `algo` (64 KiB at a time, memory
+// use does not depend on the file size) and writes the digest to `out`
+// (room for 64 octets); the answer is the digest length.
+fn hash_file(path: str, algo: u32, out: u64) -> HashError!usize {
+    if hash_len(algo) == 0 {
+        return HashError::BadAlgo
+    }
+    var code: u32 = 0
+    let fd: i64 = fs.open_read(path) catch | e | (map_fs_i(e, &code))
+    if code != 0 as u32 {
+        return err_of(code)
+    }
+    var h: Hasher = hasher_new(algo)
+    var buf: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&buf, 65536)
+    if buf.cap < 65536 {
+        rt.buf_free(&buf)
+        fs.close_fd(fd)
+        return HashError::Io
+    }
+    var fail: u32 = 0
+    var done: bool = false
+    while !done {
+        let n: usize = fs.read_fd(fd, rt.buf_ptr(&buf), 65536) catch | e | (map_fs(e, &fail))
+        if fail != 0 as u32 {
+            done = true
+        } else if n == 0 {
+            done = true
+        } else {
+            hasher_update(&h, rt.buf_ptr(&buf), n)
+        }
+    }
+    rt.buf_free(&buf)
+    fs.close_fd(fd)
+    if fail != 0 as u32 {
+        return err_of(fail)
+    }
+    hasher_final(&h, out)
+    return hash_len(algo)
+}
+
+fn map_fs_i(e: FsError, code: *mut u32) -> i64 {
+    map_fs(e, code)
+    return -1
+}
+
+// The digest of a file as lower case hex.
+fn hash_file_hex(path: str, algo: u32) -> HashError!str {
+    var d: [u8; 64] = [0; 64]
+    let n: usize = try hash_file(path, algo, (&d[0]) as u64)
+    return hex_string((&d[0]) as u64, n)
+}
+
+// Whether the file has the digest `expected` (hex, either case). A wrong
+// digest is `false`; a hex string of the wrong length or with a bad
+// character is `HashError::BadHex`.
+fn verify_file_hex(path: str, algo: u32, expected: str) -> HashError!bool {
+    let dl: usize = hash_len(algo)
+    if dl == 0 {
+        return HashError::BadAlgo
+    }
+    var want: [u8; 64] = [0; 64]
+    let wn: i64 = hex_decode(expected, (&want[0]) as u64, 64)
+    if wn != dl as i64 {
+        return HashError::BadHex
+    }
+    var d: [u8; 64] = [0; 64]
+    try hash_file(path, algo, (&d[0]) as u64)
+    return rt.mem_eq((&d[0]) as u64, (&want[0]) as u64, dl)
+}
+
+// ------------------------------------------------------ download target
+
+struct Download {
+    fd: i64,
+    tmp: str,
+    dest: str,
+    hasher: Hasher,
+    hashing: bool,
+    written: u64,
+    open: bool, // false after commit/abort
+}
+
+// Starts a download to `dest`: creates the temporary file next to it with
+// the permission bits `mode` (420 = 0644; 493 = 0755 for a program). `algo`
+// = HASH_NONE writes without hashing.
+fn download_begin(dest: str, algo: u32, mode: u32) -> HashError!Download {
+    if algo != HASH_NONE && hash_len(algo) == 0 {
+        return HashError::BadAlgo
+    }
+    let tmp: str = fs.temp_name_for(dest)
+    var code: u32 = 0
+    let fd: i64 = fs.create_excl(tmp, mode) catch | e | (map_fs_i(e, &code))
+    if code != 0 as u32 {
+        return err_of(code)
+    }
+    return Download { fd: fd, tmp: tmp, dest: dest, hasher: hasher_new(algo),
+        hashing: algo != HASH_NONE, written: 0, open: true }
+}
+
+// Appends `n` octets (and hashes them). On a write error the download is
+// aborted (temporary file removed) before the error is returned.
+fn download_write(d: *mut Download, p: u64, n: usize) -> HashError!bool {
+    if !(*d).open {
+        return HashError::Finished
+    }
+    var fail: u32 = 0
+    let ok: bool = fs.write_fd_all((*d).fd, p, n) catch | e | (map_fs_b(e, &fail))
+    if fail != 0 as u32 {
+        download_abort(d)
+        return err_of(fail)
+    }
+    if (*d).hashing {
+        hasher_update(&(*d).hasher, p, n)
+    }
+    (*d).written = (*d).written + n as u64
+    return ok
+}
+
+fn map_fs_b(e: FsError, err: *mut u32) -> bool {
+    map_fs(e, err)
+    return false
+}
+
+// Octets written so far.
+fn download_size(d: *mut Download) -> u64 {
+    return (*d).written
+}
+
+// Gives up: closes and removes the temporary file; `dest` is untouched.
+fn download_abort(d: *mut Download) {
+    if !(*d).open {
+        return
+    }
+    (*d).open = false
+    fs.close_fd((*d).fd)
+    fs.remove((*d).tmp) catch false
+}
+
+// Finishes the download: flush, verify, rename over `dest`, flush the
+// directory. `expected` is the hex digest the file must have ("" = do not
+// check; only meaningful if `download_begin` got an algorithm). Wrong
+// digest: the temporary file is removed and the answer is
+// `HashError::Mismatch`; `dest` is untouched. The answer is the number of
+// octets in the finished file.
+fn download_commit(d: *mut Download, expected: str) -> HashError!u64 {
+    if !(*d).open {
+        return HashError::Finished
+    }
+    if expected.length() > 0 {
+        let dl: usize = hash_len((*d).hasher.algo)
+        var want: [u8; 64] = [0; 64]
+        let wn: i64 = hex_decode(expected, (&want[0]) as u64, 64)
+        if dl == 0 || !(*d).hashing || wn != dl as i64 {
+            download_abort(d)
+            return HashError::BadHex
+        }
+        var got: [u8; 64] = [0; 64]
+        hasher_final(&(*d).hasher, (&got[0]) as u64)
+        if !rt.mem_eq((&got[0]) as u64, (&want[0]) as u64, dl) {
+            download_abort(d)
+            return HashError::Mismatch
+        }
+    }
+    var fail: u32 = 0
+    fs.sync_fd((*d).fd) catch | e | (map_fs_b(e, &fail))
+    fs.close_fd((*d).fd)
+    if fail != 0 as u32 {
+        (*d).open = false
+        fs.remove((*d).tmp) catch false
+        return err_of(fail)
+    }
+    (*d).open = false
+    fs.rename((*d).tmp, (*d).dest) catch | e | (map_fs_b(e, &fail))
+    if fail != 0 as u32 {
+        fs.remove((*d).tmp) catch false
+        return err_of(fail)
+    }
+    var parent: str = fs.path_parent((*d).dest)
+    if parent.length() == 0 {
+        parent = "."
+    }
+    // the rename is only durable once the directory is flushed; a failure
+    // here does not undo the (already complete) file
+    fs.fsync_dir(parent) catch false
+    return (*d).written
+}

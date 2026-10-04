@@ -45,9 +45,11 @@ import str
 export {
     FsError, FileInfo,
     mkdir, mkdir_all, rename, remove, remove_tree, symlink,
-    stat, lstat, exists, is_dir, is_file,
+    stat, lstat, readlink, exists, is_dir, is_file,
     fsync_file, fsync_dir,
     read_file, write_file, append_file, write_atomic,
+    write_file_mode, write_atomic_mode, chmod, open_read, read_fd, close_fd,
+    temp_name_for, create_excl, write_fd_all, sync_fd,
     temp_dir, path_join, path_parent, path_name, last_errno,
     KIND_OTHER, KIND_FILE, KIND_DIR, KIND_LINK,
 }
@@ -86,11 +88,13 @@ const FS_SYS_OPEN: i64 = 2
 const FS_SYS_CLOSE: i64 = 3
 const FS_SYS_GETPID: i64 = 39
 const FS_SYS_FSYNC: i64 = 74
+const FS_SYS_CHMOD: i64 = 90
 const FS_SYS_RENAME: i64 = 82
 const FS_SYS_MKDIR: i64 = 83
 const FS_SYS_UNLINK: i64 = 87
 const FS_SYS_UNLINKAT: i64 = 263
 const FS_SYS_SYMLINKAT: i64 = 266
+const FS_SYS_READLINKAT: i64 = 267
 const FS_SYS_STATX: i64 = 332
 
 const FS_AT_FDCWD: i64 = -100
@@ -377,6 +381,32 @@ fn lstat(path: str) -> FsError!FileInfo {
     return stat_with(path, FS_AT_SYMLINK_NOFOLLOW)
 }
 
+// The target a symbolic link points to (the link itself is read, not what
+// it points at). Linux only; on Windows the answer is an error.
+fn readlink(path: str) -> FsError!str {
+    var c: rt.Buf = rt.buf_new()
+    if !cpath(path, &c) {
+        rt.buf_free(&c)
+        return FsError::Invalid
+    }
+    var out: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&out, 4097)
+    if out.cap < 4097 {
+        rt.buf_free(&c)
+        rt.buf_free(&out)
+        return FsError::NoSpace
+    }
+    let r: i64 = syscall(FS_SYS_READLINKAT, FS_AT_FDCWD, rt.buf_ptr(&c) as i64, rt.buf_ptr(&out) as i64, 4096, 0, 0)
+    rt.buf_free(&c)
+    if r < 0 {
+        rt.buf_free(&out)
+        return fs_error(r)
+    }
+    let s: str = __str_copy(str { p: rt.buf_data(&out), n: r as usize })
+    rt.buf_free(&out)
+    return s
+}
+
 fn exists(path: str) -> bool {
     let info: FileInfo = stat(path) catch FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
     return info.kind != 255 as u8
@@ -472,8 +502,8 @@ fn write_fd(fd: i64, p: u64, n: usize) -> i64 {
     return 0
 }
 
-fn write_mode(path: str, p: u64, n: usize, flags: i64) -> FsError!usize {
-    let fd: i64 = try open_c(path, flags, FS_MODE_FILE)
+fn write_mode(path: str, p: u64, n: usize, flags: i64, mode: i64) -> FsError!usize {
+    let fd: i64 = try open_c(path, flags, mode)
     let r: i64 = write_fd(fd, p, n)
     let cr: i64 = syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
     if r < 0 {
@@ -488,17 +518,17 @@ fn write_mode(path: str, p: u64, n: usize, flags: i64) -> FsError!usize {
 // Creates or truncates the file and writes `n` octets (NOT durable by
 // itself -- see `write_atomic`).
 fn write_file(path: str, p: u64, n: usize) -> FsError!usize {
-    return try write_mode(path, p, n, FS_O_TRUNC)
+    return try write_mode(path, p, n, FS_O_TRUNC, FS_MODE_FILE)
 }
 
 // Appends `n` octets (creates the file if it is missing).
 fn append_file(path: str, p: u64, n: usize) -> FsError!usize {
-    return try write_mode(path, p, n, FS_O_APPEND)
+    return try write_mode(path, p, n, FS_O_APPEND, FS_MODE_FILE)
 }
 
-// Replaces `path` with `n` octets so that a crash leaves either the old or
-// the new content (see the head of the file).
-fn write_atomic(path: str, p: u64, n: usize) -> FsError!bool {
+// A name for a temporary file NEXT TO `path` ("<path>.tmp-<pid>-<n>"): same
+// directory = same volume, so renaming it over `path` stays atomic.
+fn temp_name_for(path: str) -> str {
     let pid: i64 = syscall(FS_SYS_GETPID, 0, 0, 0, 0, 0, 0)
     fs_counter = fs_counter + 1
     var t: rt.Buf = rt.buf_new()
@@ -510,7 +540,48 @@ fn write_atomic(path: str, p: u64, n: usize) -> FsError!bool {
     rt.buf_push_dec_u64(&t, fs_counter)
     let tmp: str = __str_copy(str { p: rt.buf_data(&t), n: rt.buf_len(&t) })
     rt.buf_free(&t)
-    let fd: i64 = try open_c(tmp, FS_O_EXCL, FS_MODE_FILE)
+    return tmp
+}
+
+// Creates a NEW file (never follows a link, never reuses a file) opened for
+// writing; the answer is the descriptor. Pair with `write_fd_all`,
+// `sync_fd` and `close_fd`.
+fn create_excl(path: str, mode: u32) -> FsError!i64 {
+    return try open_c(path, FS_O_EXCL, mode as i64)
+}
+
+// Writes all `n` octets (short writes are continued).
+fn write_fd_all(fd: i64, p: u64, n: usize) -> FsError!bool {
+    let r: i64 = write_fd(fd, p, n)
+    if r < 0 {
+        return fs_error(r)
+    }
+    return true
+}
+
+// Flushes the file behind `fd` (does not close it).
+fn sync_fd(fd: i64) -> FsError!bool {
+    let r: i64 = syscall(FS_SYS_FSYNC, fd, 0, 0, 0, 0, 0)
+    if r < 0 {
+        return fs_error(r)
+    }
+    return true
+}
+
+// Replaces `path` with `n` octets so that a crash leaves either the old or
+// the new content (see the head of the file).
+fn write_atomic(path: str, p: u64, n: usize) -> FsError!bool {
+    return try write_atomic_mode(path, p, n, 420 as u32)
+}
+
+// Like `write_atomic`, with the permission bits the new file is CREATED
+// with (the temporary file gets them from the start, so there is no moment
+// at which a secret is readable by others; the umask still applies). An
+// existing target keeps nothing of its old mode: the rename replaces it.
+// On Windows the bits are ignored.
+fn write_atomic_mode(path: str, p: u64, n: usize, mode: u32) -> FsError!bool {
+    let tmp: str = temp_name_for(path)
+    let fd: i64 = try open_c(tmp, FS_O_EXCL, mode as i64)
     var r: i64 = write_fd(fd, p, n)
     if r == 0 {
         r = syscall(FS_SYS_FSYNC, fd, 0, 0, 0, 0, 0)
@@ -535,6 +606,55 @@ fn write_atomic(path: str, p: u64, n: usize) -> FsError!bool {
         parent = "."
     }
     return try fsync_dir(parent)
+}
+
+// Creates the file with the permission bits `mode` (0o644 = 420) and
+// writes `n` octets. `exclusive` = the file must not exist yet
+// (`FsError::Exists` otherwise, and a symbolic link in its place is never
+// followed -- O_EXCL refuses it); not exclusive = create or overwrite.
+fn write_file_mode(path: str, p: u64, n: usize, mode: u32, exclusive: bool) -> FsError!usize {
+    var flags: i64 = FS_O_TRUNC
+    if exclusive {
+        flags = FS_O_EXCL
+    }
+    return try write_mode(path, p, n, flags, mode as i64)
+}
+
+// Sets the permission bits of a file or directory (the lower 12 bits of
+// `mode`). Linux only: on Windows there is no such call and the answer is
+// an error that a caller extracting an archive simply ignores.
+fn chmod(path: str, mode: u32) -> FsError!bool {
+    var c: rt.Buf = rt.buf_new()
+    if !cpath(path, &c) {
+        rt.buf_free(&c)
+        return FsError::Invalid
+    }
+    let r: i64 = syscall(FS_SYS_CHMOD, rt.buf_ptr(&c) as i64, (mode & 4095 as u32) as i64, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    if r < 0 {
+        return fs_error(r)
+    }
+    return true
+}
+
+// A file descriptor to read the file from; pair it with `read_fd` and
+// `close_fd` (streaming: `read_file` loads everything, these do not).
+fn open_read(path: str) -> FsError!i64 {
+    return try open_c(path, FS_O_READ, 0)
+}
+
+// Reads up to `n` octets into `p`; the answer is the number read, 0 at the
+// end of the file.
+fn read_fd(fd: i64, p: u64, n: usize) -> FsError!usize {
+    let r: i64 = syscall(FS_SYS_READ, fd, p as i64, n as i64, 0, 0, 0)
+    if r < 0 {
+        return fs_error(r)
+    }
+    return r as usize
+}
+
+fn close_fd(fd: i64) {
+    syscall(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
 }
 
 // ------------------------------------------------------------ Paths

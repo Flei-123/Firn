@@ -1,0 +1,222 @@
+// expect_exit: 0
+// tests/2070_std_hashfile.fi -- std.hashfile: streaming file hashes (md5, sha1,
+// sha256, sha512) against digests from Python's hashlib, hex both ways, and
+// the atomic download target (verify, rename, never a half file).
+import std.hashfile
+import std.fs
+import std.dir
+import std.rt
+import std.osinfo
+import std.io
+import std.str
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+fn scratch() -> str {
+    var b: rt.Buf = rt.buf_new()
+    let head: str = "/tmp/firn_hashfile_2070_"
+    rt.buf_push_bytes(&b, head.p as u64, head.length())
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+// the number of entries in a directory
+fn count_entries(path: str) -> usize {
+    var n: usize = 0
+    var d: dir.Dir = dir.open(path)
+    while dir.next(&d) {
+        n = n + 1
+    }
+    dir.close(&d)
+    return n
+}
+
+fn pattern(n: usize, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(out, ((i * 7 + 3) & 255) as u8)
+        i = i + 1
+    }
+}
+
+fn read_all(path: str, out: *mut rt.Buf) -> bool {
+    let n: usize = fs.read_file(path, out) catch 0
+    return n > 0 || rt.buf_len(out) == 0
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let win: bool = osinfo.is_windows()
+    let root: str = scratch()
+    fs.remove_tree(root) catch false
+    fs.mkdir_all(root) catch false
+
+    // --- A. one-shot digests of memory (RFC / FIPS vectors, hashlib)
+    let abc: str = "abc"
+    check(&t, "md5 abc", hashfile.hash_bytes_hex(hashfile.HASH_MD5, abc.p as u64, 3) == "900150983cd24fb0d6963f7d28e17f72")
+    check(&t, "sha1 abc", hashfile.hash_bytes_hex(hashfile.HASH_SHA1, abc.p as u64, 3) == "a9993e364706816aba3e25717850c26c9cd0d89d")
+    check(&t, "sha256 abc", hashfile.hash_bytes_hex(hashfile.HASH_SHA256, abc.p as u64, 3) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    check(&t, "sha512 abc", hashfile.hash_bytes_hex(hashfile.HASH_SHA512, abc.p as u64, 3) == "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+    check(&t, "md5 empty", hashfile.hash_bytes_hex(hashfile.HASH_MD5, 0, 0) == "d41d8cd98f00b204e9800998ecf8427e")
+    check(&t, "sha1 empty", hashfile.hash_bytes_hex(hashfile.HASH_SHA1, 0, 0) == "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    check(&t, "sha256 empty", hashfile.hash_bytes_hex(hashfile.HASH_SHA256, 0, 0) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    check(&t, "unknown algorithm gives \"\"", hashfile.hash_bytes_hex(99 as u32, abc.p as u64, 3) == "")
+    check(&t, "hash_len", hashfile.hash_len(hashfile.HASH_MD5) == 16 && hashfile.hash_len(hashfile.HASH_SHA1) == 20
+        && hashfile.hash_len(hashfile.HASH_SHA256) == 32 && hashfile.hash_len(hashfile.HASH_SHA512) == 64
+        && hashfile.hash_len(0 as u32) == 0)
+
+    // --- B. a 200,003 octet file: crosses the 64 KiB read chunks and every
+    //        block boundary; the digests come from hashlib
+    var data: rt.Buf = rt.buf_new()
+    pattern(200003, &data)
+    let f: str = root + "/pattern.bin"
+    fs.write_file(f, rt.buf_ptr(&data), rt.buf_len(&data)) catch 0
+    check(&t, "file md5", (hashfile.hash_file_hex(f, hashfile.HASH_MD5) catch "ERR") == "71ea1a2345bc501090ed0f67ced13f5e")
+    check(&t, "file sha1", (hashfile.hash_file_hex(f, hashfile.HASH_SHA1) catch "ERR") == "6c230f475fe8f1a43020fea87ddab2933a0f83f9")
+    check(&t, "file sha256", (hashfile.hash_file_hex(f, hashfile.HASH_SHA256) catch "ERR") == "aaa1137a572394ab285096ae86aa5e48fac554adfe277fe868729e38f469329d")
+    check(&t, "file sha512", (hashfile.hash_file_hex(f, hashfile.HASH_SHA512) catch "ERR") == "594166a10cd9ef09995d415dc75e284b4eb3d148d846e14d46ad12fdc3fd8b74ba98006a6c0cf9f3e0d2278386bc840ef7c5281b971aa2c2e79c1522490d7021")
+    check(&t, "file digest equals the in-memory digest", (hashfile.hash_file_hex(f, hashfile.HASH_SHA256) catch "ERR") == hashfile.hash_bytes_hex(hashfile.HASH_SHA256, rt.buf_ptr(&data), rt.buf_len(&data)))
+    // the empty file
+    let e: str = root + "/empty.bin"
+    fs.write_file(e, 0, 0) catch 0
+    check(&t, "empty file sha256", (hashfile.hash_file_hex(e, hashfile.HASH_SHA256) catch "ERR") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    // errors
+    var nf: bool = false
+    hashfile.hash_file_hex(root + "/missing", hashfile.HASH_SHA1) catch | er | (flag_s(er == HashError::NotFound, &nf))
+    check(&t, "a missing file is NotFound", nf)
+    var ba: bool = false
+    hashfile.hash_file_hex(f, 77 as u32) catch | er | (flag_s(er == HashError::BadAlgo, &ba))
+    check(&t, "an unknown algorithm is BadAlgo", ba)
+
+    // --- C. hex
+    var raw: [u8; 8] = [0; 8]
+    check(&t, "hex_decode lower", hashfile.hex_decode("00ff10ab", (&raw[0]) as u64, 8) == 4 && raw[0] == 0 as u8 && raw[1] == 255 as u8 && raw[2] == 16 as u8 && raw[3] == 171 as u8)
+    check(&t, "hex_decode upper", hashfile.hex_decode("00FF10AB", (&raw[0]) as u64, 8) == 4 && raw[1] == 255 as u8)
+    check(&t, "hex_decode odd length", hashfile.hex_decode("abc", (&raw[0]) as u64, 8) == -1)
+    check(&t, "hex_decode bad digit", hashfile.hex_decode("zz", (&raw[0]) as u64, 8) == -1)
+    check(&t, "hex_decode too long", hashfile.hex_decode("0011223344", (&raw[0]) as u64, 4) == -1)
+    check(&t, "hex_decode empty", hashfile.hex_decode("", (&raw[0]) as u64, 8) == 0)
+    var enc: [u8; 3] = [1, 171, 255]
+    check(&t, "hex_string", hashfile.hex_string((&enc[0]) as u64, 3) == "01abff")
+
+    // --- D. verify
+    check(&t, "verify true", hashfile.verify_file_hex(f, hashfile.HASH_SHA256, "aaa1137a572394ab285096ae86aa5e48fac554adfe277fe868729e38f469329d") catch false)
+    check(&t, "verify true, upper case", hashfile.verify_file_hex(f, hashfile.HASH_SHA256, "AAA1137A572394AB285096AE86AA5E48FAC554ADFE277FE868729E38F469329D") catch false)
+    check(&t, "verify false", !(hashfile.verify_file_hex(f, hashfile.HASH_SHA256, "aaa1137a572394ab285096ae86aa5e48fac554adfe277fe868729e38f469329e") catch true))
+    var bh: bool = false
+    hashfile.verify_file_hex(f, hashfile.HASH_SHA256, "aaa1") catch | er | (flag(er == HashError::BadHex, &bh))
+    check(&t, "a short digest is BadHex, not a mismatch", bh)
+
+    // --- E. the download target
+    let dest: str = root + "/dl/client.jar"
+    fs.mkdir_all(root + "/dl") catch false
+    fs.write_file(dest, abc.p as u64, 3) catch 0 // an OLD version of the file
+    var d: hashfile.Download = hashfile.download_begin(dest, hashfile.HASH_SHA256, 493 as u32) catch | er | (dl_dummy())
+    // the temporary file exists NEXT to it while the download runs; dest is still the old one
+    check(&t, "temp file appears next to dest", count_entries(root + "/dl") == 2)
+    var old: rt.Buf = rt.buf_new()
+    read_all(dest, &old)
+    check(&t, "dest is untouched while downloading", rt.buf_len(&old) == 3)
+    // three chunks, odd sizes
+    hashfile.download_write(&d, rt.buf_ptr(&data), 1000) catch false
+    hashfile.download_write(&d, rt.buf_ptr(&data) + 1000, 99999) catch false
+    hashfile.download_write(&d, rt.buf_ptr(&data) + 100999, 99004) catch false
+    check(&t, "download_size", hashfile.download_size(&d) == 200003)
+    let committed: u64 = hashfile.download_commit(&d, "aaa1137a572394ab285096ae86aa5e48fac554adfe277fe868729e38f469329d") catch 0
+    check(&t, "commit returns the size", committed == 200003)
+    check(&t, "no temp file left after commit", count_entries(root + "/dl") == 1)
+    var got: rt.Buf = rt.buf_new()
+    read_all(dest, &got)
+    check(&t, "dest is the new content", rt.buf_len(&got) == 200003 && rt.mem_eq(rt.buf_ptr(&got), rt.buf_ptr(&data), 200003))
+    let info: fs.FileInfo = fs.stat(dest) catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    check(&t, "mode 0755 was applied", win || (info.mode == 493 as u32))
+    var fin: bool = false
+    hashfile.download_commit(&d, "") catch | er | (flag_u(er == HashError::Finished, &fin))
+    check(&t, "committing twice is Finished", fin)
+
+    // a wrong digest: Mismatch, the OLD file stays, no temp file
+    var d2: hashfile.Download = hashfile.download_begin(dest, hashfile.HASH_SHA256, 420 as u32) catch | er | (dl_dummy())
+    hashfile.download_write(&d2, abc.p as u64, 3) catch false
+    var mm: bool = false
+    hashfile.download_commit(&d2, "aaa1137a572394ab285096ae86aa5e48fac554adfe277fe868729e38f469329d") catch | er | (flag_u(er == HashError::Mismatch, &mm))
+    check(&t, "a wrong digest is Mismatch", mm)
+    check(&t, "after Mismatch: no temp file", count_entries(root + "/dl") == 1)
+    var still: rt.Buf = rt.buf_new()
+    read_all(dest, &still)
+    check(&t, "after Mismatch: dest is still the earlier content", rt.buf_len(&still) == 200003)
+
+    // a digest of the wrong length
+    var d3: hashfile.Download = hashfile.download_begin(dest, hashfile.HASH_SHA1, 420 as u32) catch | er | (dl_dummy())
+    var bh2: bool = false
+    hashfile.download_commit(&d3, "abcd") catch | er | (flag_u(er == HashError::BadHex, &bh2))
+    check(&t, "commit with a short digest is BadHex and cleans up", bh2 && count_entries(root + "/dl") == 1)
+
+    // abort
+    var d4: hashfile.Download = hashfile.download_begin(root + "/dl/other.bin", hashfile.HASH_NONE, 420 as u32) catch | er | (dl_dummy())
+    hashfile.download_write(&d4, abc.p as u64, 3) catch false
+    hashfile.download_abort(&d4)
+    check(&t, "abort leaves nothing", count_entries(root + "/dl") == 1 && !fs.exists(root + "/dl/other.bin"))
+    var fin2: bool = false
+    hashfile.download_write(&d4, abc.p as u64, 3) catch | er | (flag(er == HashError::Finished, &fin2))
+    check(&t, "writing after abort is Finished", fin2)
+
+    // no hashing, no expected digest: just the atomic write
+    var d5: hashfile.Download = hashfile.download_begin(root + "/dl/plain.txt", hashfile.HASH_NONE, 420 as u32) catch | er | (dl_dummy())
+    hashfile.download_write(&d5, abc.p as u64, 3) catch false
+    let sz5: u64 = hashfile.download_commit(&d5, "") catch 0
+    check(&t, "plain atomic download", sz5 == 3 && fs.is_file(root + "/dl/plain.txt"))
+
+    // a destination in a directory that does not exist
+    var nodir: bool = false
+    hashfile.download_begin(root + "/nodir/x", hashfile.HASH_NONE, 420 as u32) catch | er | (flag_d(er == HashError::NotFound, &nodir))
+    check(&t, "download into a missing directory is NotFound", nodir)
+
+    fs.remove_tree(root) catch false
+    io.print("checks: ")
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, t.total)
+    io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    io.print_line("")
+    if t.fails != 0 {
+        return 1 as i32
+    }
+    return 0
+}
+
+fn flag(cond: bool, out: *mut bool) -> bool {
+    *out = cond
+    return false
+}
+
+fn flag_s(cond: bool, out: *mut bool) -> str {
+    *out = cond
+    return ""
+}
+
+fn flag_u(cond: bool, out: *mut bool) -> u64 {
+    *out = cond
+    return 0
+}
+
+fn flag_d(cond: bool, out: *mut bool) -> hashfile.Download {
+    *out = cond
+    return dl_dummy()
+}
+
+fn dl_dummy() -> hashfile.Download {
+    return hashfile.Download { fd: -1, tmp: "", dest: "", hasher: hashfile.hasher_new(0 as u32), hashing: false, written: 0, open: false }
+}

@@ -44,3 +44,17 @@ The compiler learned three more system calls for AArch64 on the way
 (`unlinkat`, `symlinkat`, `statx`; `compiler/src/syscalls.rs`), and
 `lib/svg/` became MPL-2.0 (LICENSING.md), which OpenPlan (GPL-3.0) needed
 to use fUi.
+
+## Libraries for FleiLauncher (std)
+
+A Minecraft launcher in Firn/fUi needs to unpack Java runtimes, verify and
+atomically write downloads, and keep tokens. Details, safety rules and the
+honest limits: [STD_ARCHIVES.md](STD_ARCHIVES.md).
+
+| module | what it does | held against |
+|---|---|---|
+| `std.tar` (`lib/std/tar.fi`) | tar reader (ustar, V7, GNU long names, pax), tar writer, `tar_add_tree`, tar.gz with a size limit on the inflated stream, safe extraction with mode bits | GNU tar 1.34 and Python `tarfile`, both directions; fourteen hostile archives |
+| `std.extract` (`lib/std/extract.fi`) | `extract_archive(path, dest)`: .zip, .tar.gz/.tgz, .tar found by content, `strip` for the Adoptium top directory, modes (0755 for `bin/java`) | Info-ZIP, `zipfile`, GNU tar |
+| `std.safefs` (`lib/std/safefs.fi`) | the shared rules: names, link targets, nothing written through a link, Windows names | the hostile archives above |
+| `std.hashfile` (`lib/std/hashfile.fi`) | streaming md5/sha1/sha256/sha512 of a file, hex, `Download` (temporary file, verify, fsync, atomic rename) | Python `hashlib` |
+| `std.secret` (`lib/std/secret.fi`) | keyring `secret_set/get/delete(service, key)`: Credential Manager on Windows, ChaCha20-Poly1305 file on Linux (machine-bound or Argon2id password) | Python `cryptography` + PyNaCl; the real Credential Manager (Wine and a Windows 11 machine) |

@@ -1,0 +1,336 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/extract.fi -- std.extract: unpack an archive into a directory, the
+// format found out by itself: .zip, .tar.gz / .tgz, plain .tar.
+//
+// THE JOB THIS FILE EXISTS FOR: a launcher downloads a Java runtime from
+// Adoptium. The Windows build is a .zip, the Linux build is a .tar.gz, and
+// the program must not care:
+//
+//     import std.extract
+//     let st: safefs.ExtractStats = extract.extract_archive(path, "/opt/fleilauncher/java") catch |e| ...
+//
+// Adoptium archives have ONE top-level directory ("jdk-21.0.4+7-jre/"); to
+// get `bin/java` directly under the target use `strip: 1`:
+//
+//     var o: safefs.ExtractOptions = safefs.extract_options_default()
+//     o.strip = 1
+//     extract.extract_archive_opts(path, dest, o, tar.tar_limits_default()) catch |e| ...
+//
+// THE FORMAT IS DECIDED BY THE CONTENT, not by the file name: "PK\3\4" (or
+// the empty-zip "PK\5\6") is ZIP, "1f 8b" is gzip (and what is inside must
+// be a tar), "ustar" at octet 257 or a valid tar header checksum at octet 0
+// is plain tar. The name is only a fallback for a tar without the magic. A
+// ".zip" that is really a tar.gz is unpacked as what it is.
+//
+// SAFETY is the one of std.safefs for both formats (names, links, nothing
+// written through a link, everything judged before the first byte is
+// written -- for ZIP the names and link targets, see HONEST E2) and the
+// size limits of `TarLimits` (entries, one file, all content, the inflated
+// size). Modes: files get the permission bits of the archive entry (tar
+// always; ZIP when it was made on Unix: Info-ZIP, Python, jar), so `bin/java`
+// comes out 0755; a ZIP made on Windows gives 0644.
+//
+// HONEST
+//   E1 WHOLE ARCHIVE IN MEMORY (see std.tar T1); a ZIP entry is inflated one
+//      at a time.
+//   E2 ZIP: names are checked for all entries before writing, but a ZIP
+//      CONTENT error (bad CRC, a broken deflate stream) is found while
+//      writing -- the files before it are already on disk. A tar is
+//      validated completely first, except for its headers' checksum, which
+//      is checked while reading (before any write).
+//   E3 ZIP symbolic links (Unix mode 0o120000, content = target) are
+//      supported and checked like tar links; ZIP has no hard links.
+//   E4 NOT PRESERVED: owners, times, extended attributes -- see std.tar T2.
+
+import std.rt
+import std.fs
+import std.osinfo
+import std.safefs
+import std.tar
+import std.vec
+import std.map
+import zip.zip
+
+export {
+    FORMAT_UNKNOWN, FORMAT_ZIP, FORMAT_TARGZ, FORMAT_TAR,
+    detect_format, extract_archive, extract_archive_opts, extract_memory,
+}
+
+const FORMAT_UNKNOWN: u32 = 0
+const FORMAT_ZIP: u32 = 1
+const FORMAT_TARGZ: u32 = 2
+const FORMAT_TAR: u32 = 3
+
+fn ends_with(s: str, tail: str) -> bool {
+    if s.length() < tail.length() {
+        return false
+    }
+    var i: usize = 0
+    let off: usize = s.length() - tail.length()
+    while i < tail.length() {
+        var a: u8 = s.chars(off + i)
+        var b: u8 = tail.chars(i)
+        if a >= 65 as u8 && a <= 90 as u8 {
+            a = a + 32 as u8
+        }
+        if a != b {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Which format is this? Content first (see the head of the file); `name`
+// (may be "") only decides a tar that carries no magic.
+fn detect_format(p: u64, n: usize, name: str) -> u32 {
+    if n >= 4 && rt.ld8(p, 0) == 80 as u8 && rt.ld8(p, 1) == 75 as u8 {
+        let c: u8 = rt.ld8(p, 2)
+        let d: u8 = rt.ld8(p, 3)
+        if (c == 3 as u8 && d == 4 as u8) || (c == 5 as u8 && d == 6 as u8) {
+            return FORMAT_ZIP
+        }
+    }
+    if n >= 2 && rt.ld8(p, 0) == 31 as u8 && rt.ld8(p, 1) == 139 as u8 {
+        return FORMAT_TARGZ
+    }
+    if n >= 512 {
+        if rt.ld8(p, 257) == 117 as u8 && rt.ld8(p, 258) == 115 as u8 && rt.ld8(p, 259) == 116 as u8
+            && rt.ld8(p, 260) == 97 as u8 && rt.ld8(p, 261) == 114 as u8 {
+            return FORMAT_TAR
+        }
+        if ends_with(name, ".tar") {
+            return FORMAT_TAR
+        }
+    }
+    return FORMAT_UNKNOWN
+}
+
+// Unpacks the archive file `path` into `dest` (created if needed) with the
+// default options and limits.
+fn extract_archive(path: str, dest: str) -> ArchiveError!safefs.ExtractStats {
+    return try extract_archive_opts(path, dest, safefs.extract_options_default(), tar.tar_limits_default())
+}
+
+fn note_fs(e: FsError, why: *mut ArchiveError, bad: *mut bool) -> usize {
+    *why = safefs.sf_fs_error(e)
+    *bad = true
+    return 0
+}
+
+fn extract_archive_opts(path: str, dest: str, opts: safefs.ExtractOptions, lim: tar.TarLimits) -> ArchiveError!safefs.ExtractStats {
+    var buf: rt.Buf = rt.buf_new()
+    var bad: bool = false
+    var why: ArchiveError = ArchiveError::Io
+    let got: usize = fs.read_file(path, &buf) catch | e | (note_fs(e, &why, &bad))
+    if bad {
+        rt.buf_free(&buf)
+        return why
+    }
+    if got as u64 > lim.max_archive_size as u64 {
+        rt.buf_free(&buf)
+        return ArchiveError::TooLarge
+    }
+    var failed: bool = false
+    let st: safefs.ExtractStats = extract_memory(rt.buf_ptr(&buf), got, path, dest, opts, lim) catch | ae | (note_st(ae, &why, &failed))
+    rt.buf_free(&buf)
+    if failed {
+        return why
+    }
+    return st
+}
+
+fn note_st(e: ArchiveError, why: *mut ArchiveError, failed: *mut bool) -> safefs.ExtractStats {
+    *why = e
+    *failed = true
+    return safefs.ExtractStats { files: 0, dirs: 0, links: 0, bytes: 0 }
+}
+
+// The same for an archive that is already in memory; `name_hint` is only
+// used for a tar without magic (may be "").
+fn extract_memory(p: u64, n: usize, name_hint: str, dest: str, opts: safefs.ExtractOptions, lim: tar.TarLimits) -> ArchiveError!safefs.ExtractStats {
+    let fmt: u32 = detect_format(p, n, name_hint)
+    if fmt == FORMAT_ZIP {
+        return try extract_zip(p, n, dest, opts, lim)
+    }
+    if fmt == FORMAT_TARGZ || fmt == FORMAT_TAR {
+        var scratch: rt.Buf = rt.buf_new()
+        var failed: bool = false
+        var why: ArchiveError = ArchiveError::Io
+        var r: tar.TarReader = tar.tar_open_auto(p, n, lim, &scratch) catch | e | (note_tr(e, &why, &failed))
+        if failed {
+            rt.buf_free(&scratch)
+            return why
+        }
+        let st: safefs.ExtractStats = tar.tar_extract_all(&r, dest, opts) catch | e2 | (note_st(e2, &why, &failed))
+        tar.tar_reader_free(&r)
+        rt.buf_free(&scratch)
+        if failed {
+            return why
+        }
+        return st
+    }
+    return ArchiveError::NotArchive
+}
+
+fn note_tr(e: ArchiveError, why: *mut ArchiveError, failed: *mut bool) -> tar.TarReader {
+    *why = e
+    *failed = true
+    return tar.TarReader { data: 0, n: 0, names: rt.buf_new(), entries: vec_new[tar.TarEntry]() }
+}
+
+// ------------------------------------------------------------ ZIP
+
+fn zip_to_archive(e: ZipError) -> ArchiveError {
+    if e == ZipError::NotZip { return ArchiveError::NotArchive }
+    if e == ZipError::Corrupt { return ArchiveError::Corrupt }
+    if e == ZipError::Unsupported { return ArchiveError::Unsupported }
+    if e == ZipError::Encrypted { return ArchiveError::Unsupported }
+    if e == ZipError::UnsafeName { return ArchiveError::UnsafeName }
+    if e == ZipError::Duplicate { return ArchiveError::Duplicate }
+    if e == ZipError::TooLarge { return ArchiveError::TooLarge }
+    if e == ZipError::Checksum { return ArchiveError::Checksum }
+    if e == ZipError::OutOfMemory { return ArchiveError::OutOfMemory }
+    return ArchiveError::Corrupt
+}
+
+fn note_zr(e: ZipError, why: *mut ArchiveError, failed: *mut bool) -> zip.ZipReader {
+    *why = zip_to_archive(e)
+    *failed = true
+    return zip.zip_reader_empty()
+}
+
+fn note_zn(e: ZipError, why: *mut ArchiveError, failed: *mut bool) -> usize {
+    *why = zip_to_archive(e)
+    *failed = true
+    return 0
+}
+
+// the content of a symlink entry as a string (copied), or "" on failure
+fn zip_link_target(z: *mut zip.ZipReader, i: usize, why: *mut ArchiveError, failed: *mut bool) -> str {
+    var b: rt.Buf = rt.buf_new()
+    zip.zip_extract(z, i, &b) catch | e | (note_zn(e, why, failed))
+    var t: str = ""
+    if !*failed {
+        t = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    }
+    rt.buf_free(&b)
+    return t
+}
+
+fn extract_zip(p: u64, n: usize, dest: str, opts: safefs.ExtractOptions, lim: tar.TarLimits) -> ArchiveError!safefs.ExtractStats {
+    let windows: bool = osinfo.is_windows()
+    var failed: bool = false
+    var why: ArchiveError = ArchiveError::Io
+    let zl: zip.ZipLimits = zip.ZipLimits { max_entries: lim.max_entries,
+        max_entry_size: lim.max_entry_size, max_total_size: lim.max_total_size }
+    var z: zip.ZipReader = zip.zip_reader_open_limits(p, n, zl) catch | e | (note_zr(e, &why, &failed))
+    if failed {
+        return why
+    }
+    let count: usize = zip.zip_entry_count(&z)
+
+    // ---- pass 1: names (Windows rules, case-folded duplicates), link targets
+    var seen: Map[u64, u64] = map_new[u64, u64]()
+    var i: usize = 0
+    var fail: u32 = 0 // 1 UnsafeName 2 UnsafeLink 4 Duplicate
+    while i < count && fail == 0 && !failed {
+        let rel: str = safefs.sf_strip(safefs.sf_clean(zip.zip_entry_name(&z, i)), opts.strip)
+        if safefs.sf_trim_slash(rel).length() > 0 {
+            if !safefs.sf_name_ok(rel, windows) {
+                fail = 1
+            } else {
+                let h: u64 = safefs.sf_hash_name(rel, windows)
+                if map_has[u64, u64](&seen, h) {
+                    // the reader refused exact duplicates; this catches
+                    // "A" vs "a" on Windows (and a stripped-name clash)
+                    fail = 4
+                } else {
+                    map_set[u64, u64](&seen, h, 1)
+                }
+                if fail == 0 && zip.zip_entry_is_symlink(&z, i) {
+                    let t: str = zip_link_target(&z, i, &why, &failed)
+                    if !failed && !safefs.sf_link_ok(t, safefs.sf_depth(rel), windows) {
+                        fail = 2
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    map_free[u64, u64](&seen)
+    if failed {
+        zip.zip_reader_free(&z)
+        return why
+    }
+    if fail != 0 {
+        zip.zip_reader_free(&z)
+        if fail == 1 { return ArchiveError::UnsafeName }
+        if fail == 2 { return ArchiveError::UnsafeLink }
+        return ArchiveError::Duplicate
+    }
+
+    // ---- pass 2: write
+    var stats: safefs.ExtractStats = safefs.ExtractStats { files: 0, dirs: 0, links: 0, bytes: 0 }
+    var bad: bool = false
+    fs.mkdir_all(dest) catch | er | (note_mkdir(er, &why, &bad))
+    if bad {
+        zip.zip_reader_free(&z)
+        return why
+    }
+    var w: safefs.SfWalker = safefs.sf_walker_new(dest)
+    var content: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < count && !failed {
+        let rel: str = safefs.sf_strip(safefs.sf_clean(zip.zip_entry_name(&z, k)), opts.strip)
+        let relt: str = safefs.sf_trim_slash(rel)
+        if relt.length() > 0 {
+            let umode: u32 = zip.zip_entry_mode(&z, k)
+            if zip.zip_entry_is_dir(&z, k) {
+                var dm: u32 = 493 as u32
+                if umode != 0 as u32 {
+                    dm = umode & 511 as u32
+                }
+                safefs.sf_make_dir(&w, relt, dm) catch | ae | (note_ae2(ae, &why, &failed))
+                stats.dirs = stats.dirs + 1
+            } else if zip.zip_entry_is_symlink(&z, k) {
+                let t: str = zip_link_target(&z, k, &why, &failed)
+                if !failed {
+                    safefs.sf_make_symlink(&w, relt, t, opts.overwrite) catch | ae | (note_ae2(ae, &why, &failed))
+                    stats.links = stats.links + 1
+                }
+            } else {
+                rt.buf_clear(&content)
+                zip.zip_extract(&z, k, &content) catch | e | (note_zn(e, &why, &failed))
+                if !failed {
+                    var fm: u32 = 420 as u32
+                    if umode != 0 as u32 {
+                        fm = umode & 511 as u32
+                    }
+                    safefs.sf_write_file(&w, relt, rt.buf_ptr(&content), rt.buf_len(&content), fm, opts.overwrite) catch | ae | (note_ae2(ae, &why, &failed))
+                    stats.files = stats.files + 1
+                    stats.bytes = stats.bytes + rt.buf_len(&content) as u64
+                }
+            }
+        }
+        k = k + 1
+    }
+    rt.buf_free(&content)
+    zip.zip_reader_free(&z)
+    if failed {
+        return why
+    }
+    return stats
+}
+
+fn note_mkdir(e: FsError, why: *mut ArchiveError, bad: *mut bool) -> bool {
+    *why = safefs.sf_fs_error(e)
+    *bad = true
+    return false
+}
+
+fn note_ae2(e: ArchiveError, why: *mut ArchiveError, failed: *mut bool) -> bool {
+    *why = e
+    *failed = true
+    return false
+}

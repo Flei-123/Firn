@@ -1,0 +1,584 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/safefs.fi -- std.safefs: the safe-extraction primitives that
+// std.tar and std.extract share: name and link rules, "strip N components",
+// and the writers that put an entry on disk without ever following a link
+// out of the target directory.
+//
+// WHY A MODULE OF ITS OWN. Unpacking an archive from the network is the
+// classic way to lose a machine: a name like "../../.ssh/authorized_keys"
+// ("zip slip"), an absolute name, a symbolic link "x -> /etc" followed by
+// the file "x/passwd", or a link that points out through another link. The
+// rules that stop those must be the SAME for .tar and .zip, so they live
+// here once and both extractors call them.
+//
+// THE RULES
+//   NAMES (`sf_name_ok`): relative, "/" as separator, no "." or ".."
+//     component, no empty component (only a trailing "/" for a directory),
+//     no backslash, no zero octet, at most 4096 octets. On Windows
+//     additionally: none of < > : " | ? * or a control character (":" is
+//     how an alternate data stream is addressed), no component that ends in
+//     "." or " " (Windows drops those silently), no DOS device names (CON,
+//     PRN, AUX, NUL, COM1-9, LPT1-9, with or without an extension).
+//   LINK TARGETS (`sf_link_ok`): relative, no backslash/zero octet, and ".."
+//     may only stand at the START ("../../x"), at most as many times as
+//     the link is deep. So "a/b/l -> ../../x" is fine (it stays inside),
+//     "l -> a/../../x" and "l -> ../x" (from the top) are refused. Because
+//     no ".." follows a normal component, a chain of links can never
+//     assemble a path that leaves the directory (see the proof sketch in
+//     docs/STD_ARCHIVES.md).
+//   NO WRITE THROUGH A LINK: before an entry is written every directory on
+//     its way is looked at with lstat; a symbolic link (or a file) where a
+//     directory is expected is `UnsafePath`. The final component is created
+//     with O_EXCL (a link is never followed); an existing entry is refused
+//     (`Exists`) or, with `overwrite`, unlinked first -- never written
+//     through.
+//
+// HONEST
+//   S1 NOT SAFE AGAINST A RACE: another process that changes the target
+//      directory WHILE the extraction runs (replacing a directory by a link
+//      between our lstat and our open) can still win. The directory must
+//      not be writable by an attacker -- like with every tar.
+//   S2 `chmod` is applied after the file is written and is ignored when it
+//      fails (always the case on Windows, which has no mode bits).
+//   S3 Case-insensitive duplicates are only detected on Windows. On Linux
+//      "A" and "a" are two files, as they are for the file system.
+
+import std.rt
+import std.fs
+import std.osinfo
+
+export {
+    ArchiveError, ExtractOptions, ExtractStats, SfWalker,
+    extract_options_default,
+    sf_name_ok, sf_link_ok, sf_clean, sf_strip, sf_depth, sf_trim_slash,
+    sf_walker_new, sf_ensure_dirs, sf_make_dir, sf_write_file, sf_make_symlink,
+    sf_hash_name, sf_names_equal, sf_fs_error,
+}
+
+// One error set for every archive format of std (tar, extract). Error types
+// share one name space, hence the plain names.
+error ArchiveError {
+    NotArchive, // not a recognised archive (no tar header, no zip, ...)
+    Corrupt, // a header or an offset that contradicts the file
+    Truncated, // the archive ends in the middle of an entry
+    Unsupported, // a feature this reader does not do (sparse files, encryption, ...)
+    Checksum, // header or content checksum does not match
+    TooLarge, // over the limits (entries, sizes, name length)
+    OutOfMemory,
+    UnsafeName, // see the head of the file
+    UnsafeLink, // a link target that could leave the directory
+    UnsafePath, // a symbolic link or file where a directory must be
+    UnsafeType, // device node, fifo, ...: refused, not extracted
+    Duplicate, // the same name twice
+    BadLink, // a hard link to something that is not an earlier file
+    NotFound, // file system: no such file or directory
+    Permission,
+    Exists, // file system: the entry exists and `overwrite` is off
+    IsDir, // a directory where a file should go
+    NoSpace,
+    Io,
+}
+
+struct ExtractOptions {
+    strip: usize, // leading path components to drop (tar --strip-components)
+    overwrite: bool, // replace existing files and links (never directories)
+}
+
+fn extract_options_default() -> ExtractOptions {
+    return ExtractOptions { strip: 0, overwrite: false }
+}
+
+struct ExtractStats {
+    files: u64,
+    dirs: u64,
+    links: u64, // symbolic links
+    bytes: u64, // file content written
+}
+
+// ------------------------------------------------------------ names
+
+fn sf_reserved(s: str, start: usize, len: usize) -> bool {
+    // the stem: up to the first "."
+    var stem: usize = len
+    var i: usize = 0
+    while i < len {
+        if s.chars(start + i) == 46 as u8 {
+            stem = i
+            break
+        }
+        i = i + 1
+    }
+    if stem == 3 {
+        var u: [u8; 3] = [0; 3]
+        i = 0
+        while i < 3 {
+            var c: u8 = s.chars(start + i)
+            if c >= 97 as u8 && c <= 122 as u8 {
+                c = c - 32 as u8
+            }
+            u[i] = c
+            i = i + 1
+        }
+        // CON PRN AUX NUL
+        if u[0] == 67 as u8 && u[1] == 79 as u8 && u[2] == 78 as u8 { return true }
+        if u[0] == 80 as u8 && u[1] == 82 as u8 && u[2] == 78 as u8 { return true }
+        if u[0] == 65 as u8 && u[1] == 85 as u8 && u[2] == 88 as u8 { return true }
+        if u[0] == 78 as u8 && u[1] == 85 as u8 && u[2] == 76 as u8 { return true }
+        return false
+    }
+    if stem == 4 {
+        var u: [u8; 4] = [0; 4]
+        i = 0
+        while i < 4 {
+            var c: u8 = s.chars(start + i)
+            if c >= 97 as u8 && c <= 122 as u8 {
+                c = c - 32 as u8
+            }
+            u[i] = c
+            i = i + 1
+        }
+        let digit: bool = u[3] >= 49 as u8 && u[3] <= 57 as u8
+        // COM1-9
+        if u[0] == 67 as u8 && u[1] == 79 as u8 && u[2] == 77 as u8 && digit { return true }
+        // LPT1-9
+        if u[0] == 76 as u8 && u[1] == 80 as u8 && u[2] == 84 as u8 && digit { return true }
+    }
+    return false
+}
+
+// Whether `name` is a name this library will write: see the head of the
+// file. `windows` adds the Windows rules (callers pass `osinfo.is_windows()`).
+fn sf_name_ok(name: str, windows: bool) -> bool {
+    let n: usize = name.length()
+    if n == 0 || n > 4096 {
+        return false
+    }
+    if name.chars(0) == 47 as u8 {
+        return false // absolute
+    }
+    var start: usize = 0
+    var i: usize = 0
+    while i <= n {
+        var c: u8 = 47 as u8
+        if i < n {
+            c = name.chars(i)
+        }
+        if c == 0 as u8 || c == 92 as u8 {
+            return false // zero octet, backslash
+        }
+        if windows && i < n {
+            if c < 32 as u8 || c == 58 as u8 || c == 60 as u8 || c == 62 as u8 || c == 34 as u8 || c == 124 as u8 || c == 63 as u8 || c == 42 as u8 {
+                return false
+            }
+        }
+        if c == 47 as u8 {
+            let len: usize = i - start
+            if len == 0 && i != n {
+                return false // "a//b"
+            }
+            if len == 1 && name.chars(start) == 46 as u8 {
+                return false
+            }
+            if len == 2 && name.chars(start) == 46 as u8 && name.chars(start + 1) == 46 as u8 {
+                return false
+            }
+            if windows && len > 0 {
+                let last: u8 = name.chars(start + len - 1)
+                if last == 46 as u8 || last == 32 as u8 {
+                    return false
+                }
+                if sf_reserved(name, start, len) {
+                    return false
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Whether a symbolic link whose own directory is `depth` levels below the
+// extraction root may point at `target` (see the head of the file).
+fn sf_link_ok(target: str, depth: usize, windows: bool) -> bool {
+    let n: usize = target.length()
+    if n == 0 || n > 4096 {
+        return false
+    }
+    if target.chars(0) == 47 as u8 {
+        return false
+    }
+    var seen_normal: bool = false
+    var ups: usize = 0
+    var start: usize = 0
+    var i: usize = 0
+    while i <= n {
+        var c: u8 = 47 as u8
+        if i < n {
+            c = target.chars(i)
+        }
+        if c == 0 as u8 || c == 92 as u8 {
+            return false
+        }
+        if windows && c == 58 as u8 {
+            return false
+        }
+        if c == 47 as u8 {
+            let len: usize = i - start
+            if len == 2 && target.chars(start) == 46 as u8 && target.chars(start + 1) == 46 as u8 {
+                if seen_normal {
+                    return false
+                }
+                ups = ups + 1
+                if ups > depth {
+                    return false
+                }
+            } else if len == 0 || (len == 1 && target.chars(start) == 46 as u8) {
+                // "a//b" and "./": no effect
+            } else {
+                seen_normal = true
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Drops leading "./" (any number); "." alone and "./" give "". The result
+// is a view into `name`.
+fn sf_clean(name: str) -> str {
+    var at: usize = 0
+    let n: usize = name.length()
+    while at < n {
+        if name.chars(at) == 46 as u8 && (at + 1 == n || name.chars(at + 1) == 47 as u8) {
+            at = at + 1
+            if at < n {
+                at = at + 1 // the "/"
+            }
+        } else if name.chars(at) == 47 as u8 && at > 0 {
+            // "./" followed by more slashes: ".//a"
+            at = at + 1
+        } else {
+            break
+        }
+    }
+    return name.part(at, n - at)
+}
+
+// Removes ONE trailing "/" ("a/b/" -> "a/b").
+fn sf_trim_slash(name: str) -> str {
+    let n: usize = name.length()
+    if n > 0 && name.chars(n - 1) == 47 as u8 {
+        return name.part(0, n - 1)
+    }
+    return name
+}
+
+// Drops the first `k` path components ("jdk-21/bin/java", 1 -> "bin/java").
+// "" if the name has no more than `k` components.
+fn sf_strip(name: str, k: usize) -> str {
+    if k == 0 {
+        return name
+    }
+    var at: usize = 0
+    let n: usize = name.length()
+    var dropped: usize = 0
+    while dropped < k {
+        while at < n && name.chars(at) != 47 as u8 {
+            at = at + 1
+        }
+        if at >= n {
+            return name.part(n, 0)
+        }
+        at = at + 1 // the "/"
+        dropped = dropped + 1
+    }
+    return name.part(at, n - at)
+}
+
+// Directory depth of an entry name: "a" 0, "a/b" 1, "a/b/" 1.
+fn sf_depth(name: str) -> usize {
+    let t: str = sf_trim_slash(name)
+    var d: usize = 0
+    var i: usize = 0
+    while i < t.length() {
+        if t.chars(i) == 47 as u8 {
+            d = d + 1
+        }
+        i = i + 1
+    }
+    return d
+}
+
+// FNV-1a over the name (without trailing "/"), lower-cased when `fold`
+// (Windows): the key for duplicate detection.
+fn sf_hash_name(name: str, fold: bool) -> u64 {
+    let t: str = sf_trim_slash(name)
+    var h: u64 = 14695981039346656037
+    var i: usize = 0
+    while i < t.length() {
+        var c: u8 = t.chars(i)
+        if fold && c >= 65 as u8 && c <= 90 as u8 {
+            c = c + 32 as u8
+        }
+        h = (h ^ c as u64) *% 1099511628211
+        i = i + 1
+    }
+    return h
+}
+
+// Same name (ignoring one trailing "/", and the case when `fold`)?
+fn sf_names_equal(a: str, b: str, fold: bool) -> bool {
+    let x: str = sf_trim_slash(a)
+    let y: str = sf_trim_slash(b)
+    if x.length() != y.length() {
+        return false
+    }
+    var i: usize = 0
+    while i < x.length() {
+        var c: u8 = x.chars(i)
+        var d: u8 = y.chars(i)
+        if fold {
+            if c >= 65 as u8 && c <= 90 as u8 { c = c + 32 as u8 }
+            if d >= 65 as u8 && d <= 90 as u8 { d = d + 32 as u8 }
+        }
+        if c != d {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------ errors
+
+fn sf_fs_error(e: FsError) -> ArchiveError {
+    if e == FsError::NotFound { return ArchiveError::NotFound }
+    if e == FsError::Permission { return ArchiveError::Permission }
+    if e == FsError::Exists { return ArchiveError::Exists }
+    if e == FsError::IsDir { return ArchiveError::IsDir }
+    if e == FsError::NoSpace { return ArchiveError::NoSpace }
+    if e == FsError::NotDir { return ArchiveError::UnsafePath }
+    return ArchiveError::Io
+}
+
+// records a file system error in `why`/`bad`; the catch handlers below
+// cannot `return`, so they note the error and the caller returns it
+fn note(e: FsError, why: *mut ArchiveError, bad: *mut bool) -> bool {
+    *why = sf_fs_error(e)
+    *bad = true
+    return false
+}
+
+fn note_info(e: FsError, why: *mut ArchiveError, bad: *mut bool) -> fs.FileInfo {
+    *why = sf_fs_error(e)
+    *bad = true
+    return fs.FileInfo { kind: fs.KIND_OTHER, mode: 0 as u32, size: 0, mtime_ns: 0 }
+}
+
+// ------------------------------------------------------------ the walker
+
+struct SfWalker {
+    dest: str, // the extraction root, no trailing "/"
+    verified: str, // the directory chain (relative) that was checked last
+    windows: bool,
+}
+
+fn sf_walker_new(dest: str) -> SfWalker {
+    var d: str = dest
+    while d.length() > 1 && d.chars(d.length() - 1) == 47 as u8 {
+        d = d.part(0, d.length() - 1)
+    }
+    return SfWalker { dest: d, verified: "", windows: osinfo.is_windows() }
+}
+
+fn full_path(w: *mut SfWalker, rel: str) -> str {
+    if rel.length() == 0 {
+        return (*w).dest
+    }
+    if (*w).dest == "/" {
+        return "/" + rel
+    }
+    return (*w).dest + "/" + rel
+}
+
+// number of leading bytes of `a` and `b` that make up the same directory
+// components (a component counts only if it is complete in both)
+fn common_dirs(a: str, b: str) -> usize {
+    var i: usize = 0
+    var last: usize = 0
+    while i < a.length() && i < b.length() && a.chars(i) == b.chars(i) {
+        if a.chars(i) == 47 as u8 {
+            last = i + 1
+        }
+        i = i + 1
+    }
+    // all of `a` matched and `b` continues with "/" (or both end)
+    if i == a.length() && (i == b.length() || b.chars(i) == 47 as u8) {
+        return a.length()
+    }
+    if i == b.length() && i < a.length() && a.chars(i) == 47 as u8 {
+        return b.length()
+    }
+    return last
+}
+
+// Makes sure the (relative) directory `rel_dir` exists below the root as a
+// chain of REAL directories: missing ones are created (0755), a symbolic
+// link or a file on the way is `UnsafePath`.
+fn sf_ensure_dirs(w: *mut SfWalker, rel_dir: str) -> ArchiveError!bool {
+    if rel_dir.length() == 0 {
+        return true
+    }
+    let have: usize = common_dirs((*w).verified, rel_dir)
+    var at: usize = have
+    if at < rel_dir.length() && at > 0 && rel_dir.chars(at) == 47 as u8 {
+        at = at + 1
+    }
+    let n: usize = rel_dir.length()
+    // `at` is the start of the first component not yet checked
+    while at < n {
+        var e: usize = at
+        while e < n && rel_dir.chars(e) != 47 as u8 {
+            e = e + 1
+        }
+        let sub: str = rel_dir.part(0, e)
+        let cur: str = full_path(w, sub)
+        var bad: bool = false
+        var why: ArchiveError = ArchiveError::Io
+        var made: bool = false
+        let info: fs.FileInfo = fs.lstat(cur) catch | er | (note_info_nf(er, &why, &bad, &made))
+        if bad {
+            return why
+        }
+        if made {
+            fs.mkdir(cur) catch | er | (note(er, &why, &bad))
+            if bad {
+                // somebody created it meanwhile: fine if it is a real directory
+                let again: fs.FileInfo = fs.lstat(cur) catch | er2 | (note_info(er2, &why, &bad))
+                if again.kind != fs.KIND_DIR {
+                    return ArchiveError::UnsafePath
+                }
+            }
+        } else if info.kind != fs.KIND_DIR {
+            return ArchiveError::UnsafePath
+        }
+        at = e + 1
+    }
+    (*w).verified = rel_dir
+    return true
+}
+
+// "does not exist" is not an error here: `made` says "create it"
+fn note_info_nf(e: FsError, why: *mut ArchiveError, bad: *mut bool, made: *mut bool) -> fs.FileInfo {
+    if e == FsError::NotFound {
+        *made = true
+    } else {
+        *why = sf_fs_error(e)
+        *bad = true
+    }
+    return fs.FileInfo { kind: fs.KIND_OTHER, mode: 0 as u32, size: 0, mtime_ns: 0 }
+}
+
+// the parent directory part of a relative name: "a/b/c" -> "a/b", "a" -> ""
+fn rel_parent(rel: str) -> str {
+    var i: usize = rel.length()
+    while i > 0 && rel.chars(i - 1) != 47 as u8 {
+        i = i - 1
+    }
+    if i == 0 {
+        return rel.part(0, 0)
+    }
+    return rel.part(0, i - 1)
+}
+
+// Creates the directory `rel` (no trailing "/"); an existing real directory
+// is fine. `mode` is applied with the owner's rwx added (so the extraction
+// can go on), ignoring failure.
+fn sf_make_dir(w: *mut SfWalker, rel: str, mode: u32) -> ArchiveError!bool {
+    try sf_ensure_dirs(w, rel_parent(rel))
+    let full: str = full_path(w, rel)
+    var bad: bool = false
+    var why: ArchiveError = ArchiveError::Io
+    var made: bool = false
+    let info: fs.FileInfo = fs.lstat(full) catch | er | (note_info_nf(er, &why, &bad, &made))
+    if bad {
+        return why
+    }
+    if made {
+        fs.mkdir(full) catch | er | (note(er, &why, &bad))
+        if bad {
+            return why
+        }
+    } else if info.kind != fs.KIND_DIR {
+        return ArchiveError::UnsafePath
+    }
+    fs.chmod(full, (mode & 511 as u32) | 448 as u32) catch false
+    return true
+}
+
+// clears the way for a file or link at `full`: nothing there is fine; a
+// directory is `IsDir`; anything else is `Exists` unless `overwrite`
+fn clear_way(full: str, overwrite: bool) -> ArchiveError!bool {
+    var bad: bool = false
+    var why: ArchiveError = ArchiveError::Io
+    var missing: bool = false
+    let info: fs.FileInfo = fs.lstat(full) catch | er | (note_info_nf(er, &why, &bad, &missing))
+    if bad {
+        return why
+    }
+    if missing {
+        return true
+    }
+    if info.kind == fs.KIND_DIR {
+        return ArchiveError::IsDir
+    }
+    if !overwrite {
+        return ArchiveError::Exists
+    }
+    fs.remove(full) catch | er | (note(er, &why, &bad))
+    if bad {
+        return why
+    }
+    return true
+}
+
+// Writes the file `rel` with `n` octets from `p`. Mode: the permission
+// bits of the entry (setuid/setgid/sticky are never set).
+fn sf_write_file(w: *mut SfWalker, rel: str, p: u64, n: usize, mode: u32, overwrite: bool) -> ArchiveError!bool {
+    try sf_ensure_dirs(w, rel_parent(rel))
+    let full: str = full_path(w, rel)
+    try clear_way(full, overwrite)
+    let m: u32 = mode & 511 as u32
+    var bad: bool = false
+    var why: ArchiveError = ArchiveError::Io
+    // created with the mode (the umask may remove bits), then set exactly
+    let wrote: usize = fs.write_file_mode(full, p, n, m, true) catch | er | (note_n(er, &why, &bad))
+    if bad {
+        return why
+    }
+    fs.chmod(full, m) catch false
+    return true
+}
+
+fn note_n(e: FsError, why: *mut ArchiveError, bad: *mut bool) -> usize {
+    *why = sf_fs_error(e)
+    *bad = true
+    return 0
+}
+
+// Creates the symbolic link `rel` -> `target` (the caller has checked the
+// target with `sf_link_ok`).
+fn sf_make_symlink(w: *mut SfWalker, rel: str, target: str, overwrite: bool) -> ArchiveError!bool {
+    try sf_ensure_dirs(w, rel_parent(rel))
+    let full: str = full_path(w, rel)
+    try clear_way(full, overwrite)
+    var bad: bool = false
+    var why: ArchiveError = ArchiveError::Io
+    fs.symlink(target, full) catch | er | (note(er, &why, &bad))
+    if bad {
+        return why
+    }
+    return true
+}

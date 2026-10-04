@@ -1,0 +1,319 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/stdarchive/probe.fi -- std.tar, std.extract, std.hashfile and
+// std.secret as a command line program, so that GNU tar, Python's tarfile,
+// the sha*sum tools and Python's `cryptography` can be asked the same
+// questions.
+//
+//     probe list <archive>                  one line per entry (kind, mode, size, mtime, name, link)
+//     probe extract <archive> <dest> [strip] [overwrite]
+//                                           std.extract.extract_archive_opts; prints the stats or the refusal
+//     probe pack <dir> <out> [prefix]       tar the tree; out ending in .gz/.tgz is gzipped
+//     probe hash <file> <md5|sha1|sha256|sha512>
+//     probe vault-set <file> <service> <key> <value> [password]
+//     probe vault-get <file> <service> <key> [password]
+//     probe vault-del <file> <service> <key> [password]
+//     probe secret-set <service> <key> <value>      the simple API (HOME decides the file)
+//     probe secret-get <service> <key>
+//     probe secret-del <service> <key>
+//
+// tools/stdarchive/check.py is the other side.
+import std.tar
+import std.extract
+import std.hashfile
+import std.secret
+import std.safefs
+import std.fs
+import std.io
+import std.rt
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: rt.ptr_of(p), n: rt.c_length(p) }
+}
+
+fn err_name(e: ArchiveError) -> str {
+    if e == ArchiveError::NotArchive { return "NotArchive" }
+    if e == ArchiveError::Corrupt { return "Corrupt" }
+    if e == ArchiveError::Truncated { return "Truncated" }
+    if e == ArchiveError::Unsupported { return "Unsupported" }
+    if e == ArchiveError::Checksum { return "Checksum" }
+    if e == ArchiveError::TooLarge { return "TooLarge" }
+    if e == ArchiveError::OutOfMemory { return "OutOfMemory" }
+    if e == ArchiveError::UnsafeName { return "UnsafeName" }
+    if e == ArchiveError::UnsafeLink { return "UnsafeLink" }
+    if e == ArchiveError::UnsafePath { return "UnsafePath" }
+    if e == ArchiveError::UnsafeType { return "UnsafeType" }
+    if e == ArchiveError::Duplicate { return "Duplicate" }
+    if e == ArchiveError::BadLink { return "BadLink" }
+    if e == ArchiveError::NotFound { return "NotFound" }
+    if e == ArchiveError::Permission { return "Permission" }
+    if e == ArchiveError::Exists { return "Exists" }
+    if e == ArchiveError::IsDir { return "IsDir" }
+    if e == ArchiveError::NoSpace { return "NoSpace" }
+    return "Io"
+}
+
+fn secret_err_name(e: SecretError) -> str {
+    if e == SecretError::NotFound { return "NotFound" }
+    if e == SecretError::Unavailable { return "Unavailable" }
+    if e == SecretError::TooLarge { return "TooLarge" }
+    if e == SecretError::Invalid { return "Invalid" }
+    if e == SecretError::WrongKey { return "WrongKey" }
+    if e == SecretError::Corrupt { return "Corrupt" }
+    if e == SecretError::Denied { return "Denied" }
+    if e == SecretError::NoSpace { return "NoSpace" }
+    return "Io"
+}
+
+fn pnum(v: u64) {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&b, v)
+    io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+fn refuse(e: ArchiveError, flag: *mut bool) -> usize {
+    io.print("REFUSED ")
+    io.print_line(err_name(e))
+    *flag = true
+    return 0
+}
+
+fn kind_name(k: u32) -> str {
+    if k == tar.TAR_FILE { return "file" }
+    if k == tar.TAR_DIR { return "dir" }
+    if k == tar.TAR_SYMLINK { return "symlink" }
+    if k == tar.TAR_HARDLINK { return "hardlink" }
+    return "other"
+}
+
+fn dummy_reader(e: ArchiveError, flag: *mut bool) -> tar.TarReader {
+    refuse(e, flag)
+    return tar.TarReader { data: 0, n: 0, names: rt.buf_new(), entries: vec_new[tar.TarEntry]() }
+}
+
+fn cmd_list(path: str) -> i32 {
+    var src: rt.Buf = rt.buf_new()
+    var failed: bool = false
+    fs.read_file(path, &src) catch 0
+    var scratch: rt.Buf = rt.buf_new()
+    var r: tar.TarReader = tar.tar_open_auto(rt.buf_ptr(&src), rt.buf_len(&src), tar.tar_limits_default(), &scratch) catch | e | (dummy_reader(e, &failed))
+    if failed {
+        return 2 as i32
+    }
+    var i: usize = 0
+    var line: rt.Buf = rt.buf_new()
+    while i < tar.tar_entry_count(&r) {
+        rt.buf_clear(&line)
+        let k: str = kind_name(tar.tar_entry_kind(&r, i))
+        rt.buf_push_bytes(&line, k.p as u64, k.length())
+        rt.buf_push(&line, 32 as u8)
+        rt.buf_push_dec_u64(&line, tar.tar_entry_mode(&r, i) as u64)
+        rt.buf_push(&line, 32 as u8)
+        rt.buf_push_dec_u64(&line, tar.tar_entry_size(&r, i))
+        rt.buf_push(&line, 32 as u8)
+        rt.buf_push_dec_i64(&line, tar.tar_entry_mtime(&r, i))
+        rt.buf_push(&line, 9 as u8)
+        let nm: str = tar.tar_entry_name(&r, i)
+        rt.buf_push_bytes(&line, nm.p as u64, nm.length())
+        rt.buf_push(&line, 9 as u8)
+        let ln: str = tar.tar_entry_link(&r, i)
+        rt.buf_push_bytes(&line, ln.p as u64, ln.length())
+        rt.buf_push(&line, 10 as u8)
+        io.print_bytes(rt.buf_ptr(&line), rt.buf_len(&line))
+        i = i + 1
+    }
+    return 0
+}
+
+fn dummy_stats(e: ArchiveError, flag: *mut bool) -> safefs.ExtractStats {
+    refuse(e, flag)
+    return safefs.ExtractStats { files: 0, dirs: 0, links: 0, bytes: 0 }
+}
+
+fn dec(s: str) -> usize {
+    var v: usize = 0
+    var i: usize = 0
+    while i < s.length() {
+        v = v * 10 + (s.chars(i) - 48 as u8) as usize
+        i = i + 1
+    }
+    return v
+}
+
+fn cmd_extract(start: u64) -> i32 {
+    var o: safefs.ExtractOptions = safefs.extract_options_default()
+    if rt.arg_count(start) > 4 {
+        o.strip = dec(arg(start, 4))
+    }
+    if rt.arg_count(start) > 5 && arg(start, 5) == "overwrite" {
+        o.overwrite = true
+    }
+    var failed: bool = false
+    let st: safefs.ExtractStats = extract.extract_archive_opts(arg(start, 2), arg(start, 3), o, tar.tar_limits_default()) catch | e | (dummy_stats(e, &failed))
+    if failed {
+        return 2 as i32
+    }
+    io.print("OK files=")
+    pnum(st.files as u64)
+    io.print(" dirs=")
+    pnum(st.dirs as u64)
+    io.print(" links=")
+    pnum(st.links as u64)
+    io.print(" bytes=")
+    pnum(st.bytes as u64)
+    io.print_line("")
+    return 0
+}
+
+fn ends_with(s: str, tail: str) -> bool {
+    if s.length() < tail.length() {
+        return false
+    }
+    var i: usize = 0
+    while i < tail.length() {
+        if s.chars(s.length() - tail.length() + i) != tail.chars(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn refuse_n(e: ArchiveError, flag: *mut bool) -> u64 {
+    refuse(e, flag)
+    return 0
+}
+
+fn cmd_pack(start: u64) -> i32 {
+    let dirp: str = arg(start, 2)
+    let outp: str = arg(start, 3)
+    var prefix: str = ""
+    if rt.arg_count(start) > 4 {
+        prefix = arg(start, 4)
+    }
+    var out: rt.Buf = rt.buf_new()
+    var w: tar.TarWriter = tar.tar_writer_new(&out)
+    var failed: bool = false
+    let n: u64 = tar.tar_add_tree(&w, dirp, prefix) catch | e | (refuse_n(e, &failed))
+    if failed {
+        return 2 as i32
+    }
+    tar.tar_finish(&w) catch 0
+    var data: rt.Buf = rt.buf_new()
+    if ends_with(outp, ".gz") || ends_with(outp, ".tgz") {
+        tar.targz_compress(rt.buf_ptr(&out), rt.buf_len(&out), 6, &data) catch 0
+    } else {
+        rt.buf_push_bytes(&data, rt.buf_ptr(&out), rt.buf_len(&out))
+    }
+    fs.write_file(outp, rt.buf_ptr(&data), rt.buf_len(&data)) catch 0
+    io.print("OK entries=")
+    pnum(n as u64)
+    io.print_line("")
+    return 0
+}
+
+fn algo_of(s: str) -> u32 {
+    if s == "md5" { return hashfile.HASH_MD5 }
+    if s == "sha1" { return hashfile.HASH_SHA1 }
+    if s == "sha256" { return hashfile.HASH_SHA256 }
+    if s == "sha512" { return hashfile.HASH_SHA512 }
+    return hashfile.HASH_NONE
+}
+
+fn cmd_hash(start: u64) -> i32 {
+    let hex: str = hashfile.hash_file_hex(arg(start, 2), algo_of(arg(start, 3))) catch "ERROR"
+    io.print_line(hex)
+    return 0
+}
+
+fn vault_dummy(e: SecretError, flag: *mut bool) -> secret.Vault {
+    io.print("ERROR ")
+    io.print_line(secret_err_name(e))
+    *flag = true
+    return secret.Vault { path: "", kdf: 0 as u32, key: [0 as u8; 32], salt: [0 as u8; 16], m_kib: 0 as u32, t: 0 as u32 }
+}
+
+fn open_vault(start: u64, pwi: usize, failed: *mut bool) -> secret.Vault {
+    if rt.arg_count(start) > pwi {
+        // a small Argon2 so that the check is quick: 256 KiB, 1 pass
+        return secret.vault_open_password_params(arg(start, 2), arg(start, pwi), 256 as u32, 1 as u32) catch | e | (vault_dummy(e, failed))
+    }
+    return secret.vault_open_machine(arg(start, 2)) catch | e | (vault_dummy(e, failed))
+}
+
+fn sbool(e: SecretError, flag: *mut bool) -> bool {
+    io.print("ERROR ")
+    io.print_line(secret_err_name(e))
+    *flag = true
+    return false
+}
+
+fn sn(e: SecretError, flag: *mut bool) -> usize {
+    io.print("ERROR ")
+    io.print_line(secret_err_name(e))
+    *flag = true
+    return 0
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        io.print_line("usage: probe list|extract|pack|hash|vault-set|vault-get|vault-del|secret-set|secret-get|secret-del ...")
+        return 1 as i32
+    }
+    let cmd: str = arg(start, 1)
+    if cmd == "list" { return cmd_list(arg(start, 2)) }
+    if cmd == "extract" { return cmd_extract(start) }
+    if cmd == "pack" { return cmd_pack(start) }
+    if cmd == "hash" { return cmd_hash(start) }
+    var failed: bool = false
+    if cmd == "vault-set" {
+        var v: secret.Vault = open_vault(start, 6, &failed)
+        if failed { return 2 as i32 }
+        let val: str = arg(start, 5)
+        secret.vault_set(&v, arg(start, 3), arg(start, 4), val.p as u64, val.length()) catch | e | (sbool(e, &failed))
+        if failed { return 2 as i32 }
+        io.print_line("OK")
+        return 0
+    }
+    if cmd == "vault-get" {
+        var v: secret.Vault = open_vault(start, 5, &failed)
+        if failed { return 2 as i32 }
+        var b: rt.Buf = rt.buf_new()
+        secret.vault_get_into(&v, arg(start, 3), arg(start, 4), &b) catch | e | (sn(e, &failed))
+        if failed { return 2 as i32 }
+        io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+        io.print_line("")
+        return 0
+    }
+    if cmd == "vault-del" {
+        var v: secret.Vault = open_vault(start, 5, &failed)
+        if failed { return 2 as i32 }
+        let r: bool = secret.vault_delete(&v, arg(start, 3), arg(start, 4)) catch | e | (sbool(e, &failed))
+        if failed { return 2 as i32 }
+        if r { io.print_line("OK removed") } else { io.print_line("OK absent") }
+        return 0
+    }
+    if cmd == "secret-set" {
+        let val: str = arg(start, 4)
+        secret.secret_set(arg(start, 2), arg(start, 3), val) catch | e | (sbool(e, &failed))
+        if failed { return 2 as i32 }
+        io.print_line("OK")
+        return 0
+    }
+    if cmd == "secret-get" {
+        var b: rt.Buf = rt.buf_new()
+        secret.secret_get_into(arg(start, 2), arg(start, 3), &b) catch | e | (sn(e, &failed))
+        if failed { return 2 as i32 }
+        io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+        io.print_line("")
+        return 0
+    }
+    if cmd == "secret-del" {
+        let r: bool = secret.secret_delete(arg(start, 2), arg(start, 3)) catch | e | (sbool(e, &failed))
+        if failed { return 2 as i32 }
+        if r { io.print_line("OK removed") } else { io.print_line("OK absent") }
+        return 0
+    }
+    return 1 as i32
+}

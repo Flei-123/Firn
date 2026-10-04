@@ -1,0 +1,130 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/windows/wincred.fi -- std.secret on the Windows target: the Credential
+// Manager roundtrip (set, get, replace, a value that needs several
+// credentials, delete, NotFound). Prints "wincred: N checks, 0 failed" and
+// exits 0 when everything holds. Run by tools/windows/wincred.sh under Wine,
+// and by hand on a real Windows machine (the credentials it makes are named
+// "firn-wincred-test/..." and are removed again).
+import std.secret
+import std.io
+import std.rt
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+fn code_of(e: SecretError) -> u32 {
+    if e == SecretError::NotFound { return 1 as u32 }
+    if e == SecretError::TooLarge { return 3 as u32 }
+    if e == SecretError::Invalid { return 4 as u32 }
+    return 99 as u32
+}
+
+fn bflag(e: SecretError, code: *mut u32) -> bool {
+    *code = code_of(e)
+    return false
+}
+
+fn sflag(e: SecretError, code: *mut u32) -> str {
+    *code = code_of(e)
+    return ""
+}
+
+fn nflag(e: SecretError, code: *mut u32) -> usize {
+    *code = code_of(e)
+    return 0
+}
+
+fn fill(b: *mut rt.Buf, n: usize, seed: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(b, ((i * 7 + seed) & 255) as u8)
+        i = i + 1
+    }
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    var code: u32 = 0
+    check(&t, "the backend is the Credential Manager", secret.secret_backend() == "wincred")
+    let svc: str = "firn-wincred-test"
+
+    secret.secret_set(svc, "short", "hello wincred") catch | e | (bflag(e, &code))
+    check(&t, "set", code == 0 as u32)
+    check(&t, "get", (secret.secret_get(svc, "short") catch "FAIL") == "hello wincred")
+    secret.secret_set(svc, "short", "replaced") catch | e | (bflag(e, &code))
+    check(&t, "replace", (secret.secret_get(svc, "short") catch "FAIL") == "replaced")
+    secret.secret_set(svc, "Übersicht Ω", "wert ü") catch | e | (bflag(e, &code))
+    check(&t, "Unicode names and values", (secret.secret_get(svc, "Übersicht Ω") catch "FAIL") == "wert ü")
+
+    // sizes around the chunk boundary of the backend (2000), the 2560 limit of one credential, and 64 KiB
+    var sizes: [usize; 7] = [0, 1999, 2000, 2001, 4000, 5000, 65536]
+    var si: usize = 0
+    while si < 7 {
+        var b: rt.Buf = rt.buf_new()
+        fill(&b, sizes[si], si)
+        code = 0
+        secret.secret_set_bytes(svc, "sized", rt.buf_ptr(&b), rt.buf_len(&b)) catch | e | (bflag(e, &code))
+        var o: rt.Buf = rt.buf_new()
+        let n: usize = secret.secret_get_into(svc, "sized", &o) catch | e | (nflag(e, &code))
+        check(&t, "round trip of a value with a size from the table", code == 0 as u32 && n == sizes[si] && rt.buf_len(&o) == sizes[si]
+            && rt.mem_eq(rt.buf_ptr(&o), rt.buf_ptr(&b), sizes[si]))
+        si = si + 1
+    }
+    // a shorter value replaces a longer one (the stale chunks must not leak into it)
+    var big: rt.Buf = rt.buf_new()
+    fill(&big, 9000, 3)
+    secret.secret_set_bytes(svc, "shrink", rt.buf_ptr(&big), 9000) catch | e | (bflag(e, &code))
+    secret.secret_set(svc, "shrink", "tiny") catch | e | (bflag(e, &code))
+    check(&t, "a shorter value replaces a longer one", (secret.secret_get(svc, "shrink") catch "FAIL") == "tiny")
+
+    code = 0
+    secret.secret_get(svc, "never-set") catch | e | (sflag(e, &code))
+    check(&t, "a missing secret is NotFound", code == 1 as u32)
+    var huge: rt.Buf = rt.buf_new()
+    fill(&huge, 65537, 1)
+    code = 0
+    secret.secret_set_bytes(svc, "huge", rt.buf_ptr(&huge), 65537) catch | e | (bflag(e, &code))
+    check(&t, "65537 octets are TooLarge", code == 3 as u32)
+
+    var keys: [str; 4] = ["short", "Übersicht Ω", "sized", "shrink"]
+    var ki: usize = 0
+    var removed_all: bool = true
+    while ki < 4 {
+        let r: bool = secret.secret_delete(svc, keys[ki]) catch false
+        if !r {
+            removed_all = false
+        }
+        ki = ki + 1
+    }
+    check(&t, "delete removes every key (chunks included)", removed_all)
+    let again: bool = secret.secret_delete(svc, "short") catch true
+    check(&t, "delete again: false, not an error", !again)
+    code = 0
+    secret.secret_get(svc, "sized") catch | e | (sflag(e, &code))
+    check(&t, "after delete: NotFound", code == 1 as u32)
+
+    io.print("wincred: ")
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&nb, t.total)
+    io.print_bytes(rt.buf_ptr(&nb), rt.buf_len(&nb))
+    io.print(" checks, ")
+    var fb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&fb, t.fails)
+    io.print_bytes(rt.buf_ptr(&fb), rt.buf_len(&fb))
+    io.print_line(" failed")
+    if t.fails != 0 {
+        return 1 as i32
+    }
+    return 0
+}

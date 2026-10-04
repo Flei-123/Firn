@@ -175,6 +175,8 @@ const TABLE: &[(i64, A64)] = &[
     (62, A64::Direct(129)),          // kill
     (63, A64::Direct(160)),          // uname
     (72, A64::Direct(25)),           // fcntl     (std.process: close-on-exec, non-blocking)
+    // std.secret takes an advisory lock on its vault (flock, 73 on x86-64).
+    (73, A64::Direct(32)),           // flock
     (74, A64::Direct(82)), // fsync (Firn r64)
     (79, A64::Direct(17)),           // getcwd
     (80, A64::Direct(49)),           // chdir     (std.process: the working directory of a child)
@@ -225,6 +227,7 @@ const TABLE: &[(i64, A64)] = &[
     // record has ONE layout on every machine (struct stat has two).
     (263, A64::Direct(35)),          // unlinkat
     (266, A64::Direct(36)),          // symlinkat (std.fs.symlink)
+    (267, A64::Direct(78)),          // readlinkat (std.fs.readlink)
     (288, A64::Direct(242)),         // accept4
     (293, A64::Direct(59)),          // pipe2     (std.process)
     (318, A64::Direct(278)),         // getrandom
@@ -342,6 +345,7 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (62, "kill", Wasm::Missing(NO_PROCESSES)),
     (63, "uname", Wasm::Missing("a browser page has no kernel to name")),
     (72, "fcntl", Wasm::Missing(NO_FILES)),
+    (73, "flock", Wasm::Missing(NO_FILES)),
     (74, "fsync", Wasm::Missing(NO_FILES)),
     (79, "getcwd", Wasm::Missing(NO_FILES)),
     (80, "chdir", Wasm::Missing(NO_FILES)),
@@ -369,6 +373,7 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (262, "newfstatat", Wasm::Missing(NO_FILES)),
     (263, "unlinkat", Wasm::Missing(NO_FILES)),
     (266, "symlinkat", Wasm::Missing(NO_FILES)),
+    (267, "readlinkat", Wasm::Missing(NO_FILES)),
     (288, "accept4", Wasm::Missing(NO_SOCKETS)),
     (293, "pipe2", Wasm::Missing(NO_FILES)),
     (318, "getrandom", Wasm::Getrandom),

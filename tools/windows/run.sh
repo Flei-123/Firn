@@ -37,6 +37,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 export FIRNLIB="$ROOT/lib"
+export LC_ALL=${LC_ALL:-C.UTF-8}   # Wine creates UTF-8 file names only in a UTF-8 locale
 
 FIRNC="$ROOT/compiler/target/release/firnc"
 WORK="$ROOT/.win-work"

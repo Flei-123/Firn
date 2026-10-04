@@ -1,0 +1,1227 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/tar.fi -- std.tar: TAR archives (ustar, pax, GNU long names),
+// tar.gz, read AND write, and a safe extraction into a directory.
+//
+// WHY. Adoptium ships its Java runtimes for Linux as .tar.gz, and half the
+// Unix world ships sources and tools that way. ZIP (lib/zip) was there;
+// tar was not.
+//
+//     import std.tar
+//     var scratch: rt.Buf = rt.buf_new()                 // holds the inflated tar
+//     var r: tar.TarReader = tar.tar_open_auto(p, n, tar.tar_limits_default(), &scratch) catch |e| ...
+//     var i: usize = 0
+//     while i < tar.tar_entry_count(&r) {
+//         let name: str = tar.tar_entry_name(&r, i)
+//         i = i + 1
+//     }
+//     let st: safefs.ExtractStats = tar.tar_extract_all(&r, "/opt/java", safefs.extract_options_default()) catch |e| ...
+//     tar.tar_reader_free(&r)
+//     rt.buf_free(&scratch)
+//
+// WHAT IS READ
+//   * ustar (POSIX.1-1988) with the `prefix` field, V7 (no magic), the GNU
+//     format's long-name/long-link entries ('L', 'K'), and pax (POSIX.1-2001)
+//     extended headers ('x') with the keys `path`, `linkpath`, `size` and
+//     `mtime`; pax global headers ('g') are skipped.
+//   * sizes in octal or in the GNU base-256 form (files over 8 GiB).
+//   * entry kinds: file ('0', NUL, '7'), directory, symbolic link, hard link;
+//     everything else (device nodes, fifos, volume labels, ...) is LISTED
+//     as `TAR_OTHER` and REFUSED by `tar_extract_all`.
+//   * gzip: `tar_open_auto` recognises 1f 8b and inflates with a size limit.
+//
+// WHAT AN EXTRACTION REFUSES (all before the first byte is written -- an
+// archive with one bad entry changes nothing on disk): unsafe names and link
+// targets, a name twice, device nodes, hard links to anything but an earlier
+// file, sparse files, over-limit sizes. The rules are in lib/std/safefs.fi.
+// Modes: the permission bits of the entry (setuid/setgid/sticky dropped) are
+// set on files -- that is how a `bin/java` stays executable (0755);
+// directories get mode | 0700 so the extraction can continue.
+//
+// WHAT IS WRITTEN: ustar headers; names that do not fit (over 100 octets
+// without a usable "/" split) and link targets over 100 octets go into a pax
+// record, so GNU tar, bsdtar and Python's tarfile all read it. Sizes over
+// 8 GiB go into a pax record. The archive ends with two zero blocks and is
+// padded to a multiple of 10,240 octets like GNU tar does.
+//
+// HONEST
+//   T1 WHOLE ARCHIVE IN MEMORY. The reader works on octets in memory (the
+//      DEFLATE decoder of std has no streaming mode, see deflate.fi D1); a
+//      tar.gz is inflated completely into `scratch` first. A 300 MiB JDK
+//      needs about that much memory plus the compressed file. The limits
+//      (`TarLimits`) bound what a hostile archive can make you allocate.
+//   T2 NOT PRESERVED: owner and group, modification times (listed through
+//      `tar_entry_mtime`, never applied), extended attributes, ACLs, sparse
+//      files (refused). Directory modes are applied as mode | 0700 only.
+//   T3 A GLOBAL PAX HEADER IS IGNORED, even if it carries `path`.
+//   T4 ONE ARCHIVE PER STREAM: reading stops at the first zero block; data
+//      after it (concatenated archives) is not read.
+//   T5 A NAME TWICE IS REFUSED (`Duplicate`), although GNU tar would
+//      extract both and let the last win. Archives made by `tar -r` that
+//      replace entries need a tool that merges them first.
+//   T6 THE WRITER stores no owner (uid/gid 0, empty names) and clamps a
+//      modification time outside 0 .. 8589934591 to 0.
+
+import std.rt
+import std.vec
+import std.map
+import std.deflate
+import std.osinfo
+import std.fs
+import std.dir
+import std.safefs
+
+export {
+    TarReader, TarEntry, TarLimits, TarWriter,
+    TAR_FILE, TAR_DIR, TAR_SYMLINK, TAR_HARDLINK, TAR_OTHER,
+    tar_limits_default, tar_reader_open, tar_reader_open_limits, tar_reader_free,
+    tar_open_auto, targz_inflate, targz_compress,
+    tar_entry_count, tar_entry_name, tar_entry_link, tar_entry_kind,
+    tar_entry_mode, tar_entry_size, tar_entry_mtime, tar_entry_data,
+    tar_find, tar_extract, tar_extract_all, tar_name_is_safe,
+    tar_writer_new, tar_add_file, tar_add_dir, tar_add_symlink, tar_add_tree, tar_finish,
+}
+
+const TAR_FILE: u32 = 1
+const TAR_DIR: u32 = 2
+const TAR_SYMLINK: u32 = 3
+const TAR_HARDLINK: u32 = 4
+const TAR_OTHER: u32 = 5
+
+struct TarLimits {
+    max_entries: usize,
+    max_entry_size: u64, // one file, in octets
+    max_total_size: u64, // all file content together
+    max_archive_size: usize, // the tar stream; for tar.gz the INFLATED size
+}
+
+fn tar_limits_default() -> TarLimits {
+    // 500,000 entries, 2 GiB per file, 4 GiB of content, 4 GiB of tar stream:
+    // far above a JDK (about 3,000 entries, 300 MiB), far below what fills a disk
+    return TarLimits { max_entries: 500000, max_entry_size: 2147483648,
+        max_total_size: 4294967296, max_archive_size: 4294967296 }
+}
+
+struct TarEntry {
+    name_off: usize, // in `names`
+    name_len: usize,
+    link_off: usize, // in `names`
+    link_len: usize,
+    kind: u32,
+    mode: u32, // permission bits only (0o7777)
+    size: u64, // content octets (0 for everything but files)
+    mtime: i64,
+    data: usize, // offset of the content in the archive
+}
+
+struct TarReader {
+    data: u64,
+    n: usize,
+    names: rt.Buf, // every name and link target, copied (prefix + name joined, pax applied)
+    entries: Vec[TarEntry],
+}
+
+// ------------------------------------------------------------ octets
+
+// A numeric header field: octal text, or the GNU base-256 form. -1 for
+// anything that is neither (or does not fit in 62 bits).
+fn num_field(p: u64, off: usize, len: usize) -> i64 {
+    let b0: u8 = rt.ld8(p, off)
+    if (b0 & 128 as u8) != 0 as u8 {
+        if (b0 & 64 as u8) != 0 as u8 {
+            return -1 // negative
+        }
+        var v: u64 = (b0 & 63 as u8) as u64
+        var i: usize = 1
+        while i < len {
+            if v >= 72057594037927936 {
+                return -1 // would pass 2^62
+            }
+            v = (v << 8) | rt.ld8(p, off + i) as u64
+            i = i + 1
+        }
+        if v > 4611686018427387904 {
+            return -1
+        }
+        return v as i64
+    }
+    var i: usize = 0
+    while i < len && rt.ld8(p, off + i) == 32 as u8 {
+        i = i + 1
+    }
+    var v: u64 = 0
+    while i < len {
+        let c: u8 = rt.ld8(p, off + i)
+        if c >= 48 as u8 && c <= 55 as u8 {
+            if v >= 576460752303423488 {
+                return -1
+            }
+            v = v * 8 + (c - 48 as u8) as u64
+        } else if c == 0 as u8 || c == 32 as u8 {
+            break
+        } else {
+            return -1
+        }
+        i = i + 1
+    }
+    return v as i64
+}
+
+fn block_is_zero(p: u64) -> bool {
+    var i: usize = 0
+    while i < 512 {
+        if rt.ld8(p, i) != 0 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// the header checksum: the sum of all 512 octets with the checksum field
+// taken as eight blanks; `signed` = the variant of old Sun/NeXT tars that
+// summed as signed char
+fn header_sum(p: u64, signed: bool) -> i64 {
+    var s: i64 = 0
+    var i: usize = 0
+    while i < 512 {
+        var c: i64 = rt.ld8(p, i) as i64
+        if i >= 148 && i < 156 {
+            c = 32
+        } else if signed && c >= 128 {
+            c = c - 256
+        }
+        s = s + c
+        i = i + 1
+    }
+    return s
+}
+
+fn field_len(p: u64, off: usize, max: usize) -> usize {
+    var n: usize = 0
+    while n < max && rt.ld8(p, off + n) != 0 as u8 {
+        n = n + 1
+    }
+    return n
+}
+
+fn round512(n: u64) -> u64 {
+    return (n + 511) / 512 * 512
+}
+
+// ------------------------------------------------------------ pax
+
+struct Pending {
+    have_path: bool,
+    path_off: usize, // absolute offsets in the archive
+    path_len: usize,
+    have_link: bool,
+    link_off: usize,
+    link_len: usize,
+    have_size: bool,
+    size: u64,
+    have_mtime: bool,
+    mtime: i64,
+}
+
+fn pending_new() -> Pending {
+    return Pending { have_path: false, path_off: 0, path_len: 0, have_link: false,
+        link_off: 0, link_len: 0, have_size: false, size: 0, have_mtime: false, mtime: 0 }
+}
+
+fn key_is(p: u64, off: usize, len: usize, key: str) -> bool {
+    if len != key.length() {
+        return false
+    }
+    var i: usize = 0
+    while i < len {
+        if rt.ld8(p, off + i) != key.chars(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// decimal digits only; false on anything else or overflow
+fn dec_value(p: u64, off: usize, len: usize, out: *mut u64) -> bool {
+    if len == 0 {
+        return false
+    }
+    var v: u64 = 0
+    var i: usize = 0
+    while i < len {
+        let c: u8 = rt.ld8(p, off + i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return false
+        }
+        if v > 1844674407370955160 {
+            return false
+        }
+        v = v * 10 + (c - 48 as u8) as u64
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+// One pax data block at `base`+`start`, `len` octets: records "<len> key=value\n".
+fn pax_parse(p: u64, start: usize, len: usize, st: *mut Pending) -> bool {
+    var pos: usize = 0
+    while pos < len {
+        var l: u64 = 0
+        var i: usize = pos
+        while i < len && rt.ld8(p, start + i) >= 48 as u8 && rt.ld8(p, start + i) <= 57 as u8 {
+            l = l * 10 + (rt.ld8(p, start + i) - 48 as u8) as u64
+            if l > len as u64 {
+                return false
+            }
+            i = i + 1
+        }
+        if i == pos || i >= len || rt.ld8(p, start + i) != 32 as u8 {
+            return false
+        }
+        let rec_end: usize = pos + l as usize
+        if rec_end > len || rec_end <= i + 1 || rt.ld8(p, start + rec_end - 1) != 10 as u8 {
+            return false
+        }
+        let ks: usize = i + 1
+        var eq: usize = ks
+        while eq < rec_end - 1 && rt.ld8(p, start + eq) != 61 as u8 {
+            eq = eq + 1
+        }
+        if eq >= rec_end - 1 {
+            return false // no "=": a malformed record
+        }
+        let klen: usize = eq - ks
+        let vs: usize = start + eq + 1
+        let vlen: usize = rec_end - 1 - (eq + 1)
+        if key_is(p, start + ks, klen, "path") {
+            (*st).have_path = true
+            (*st).path_off = vs
+            (*st).path_len = vlen
+        } else if key_is(p, start + ks, klen, "linkpath") {
+            (*st).have_link = true
+            (*st).link_off = vs
+            (*st).link_len = vlen
+        } else if key_is(p, start + ks, klen, "size") {
+            var v: u64 = 0
+            if !dec_value(p, vs, vlen, &v) || v > 4611686018427387904 {
+                return false
+            }
+            (*st).have_size = true
+            (*st).size = v
+        } else if key_is(p, start + ks, klen, "mtime") {
+            // seconds, maybe with a fraction ("1700000000.123456"); a
+            // negative time is taken as 0
+            var ip: usize = 0
+            while ip < vlen && rt.ld8(p, vs + ip) != 46 as u8 {
+                ip = ip + 1
+            }
+            var v: u64 = 0
+            if dec_value(p, vs, ip, &v) && v <= 4611686018427387904 {
+                (*st).have_mtime = true
+                (*st).mtime = v as i64
+            }
+        }
+        pos = rec_end
+    }
+    return true
+}
+
+// ------------------------------------------------------------ reading
+
+fn tar_reader_open(p: u64, n: usize) -> ArchiveError!TarReader {
+    return try tar_reader_open_limits(p, n, tar_limits_default())
+}
+
+fn names_push(r: *mut TarReader, p: u64, off: usize, len: usize) -> usize {
+    let at: usize = rt.buf_len(&(*r).names)
+    rt.buf_push_bytes(&(*r).names, p + off as u64, len)
+    return at
+}
+
+fn tar_reader_open_limits(p: u64, n: usize, lim: TarLimits) -> ArchiveError!TarReader {
+    if n < 512 {
+        if n == 0 {
+            return ArchiveError::NotArchive
+        }
+        return ArchiveError::NotArchive
+    }
+    if n > lim.max_archive_size {
+        return ArchiveError::TooLarge
+    }
+    var r: TarReader = TarReader { data: p, n: n, names: rt.buf_new(), entries: vec_new[TarEntry]() }
+    var pend: Pending = pending_new()
+    var pos: usize = 0
+    var total: u64 = 0
+    var fail: u32 = 0 // 0 fine; 1 Corrupt; 2 Truncated; 3 TooLarge; 4 Unsupported; 5 Checksum; 6 NotArchive; 7 OutOfMemory
+    var done: bool = false
+    while !done && fail == 0 {
+        if pos == n {
+            break // an archive without the zero blocks at the end: tolerated
+        }
+        if pos + 512 > n {
+            fail = 2
+            break
+        }
+        let h: u64 = p + pos as u64
+        if block_is_zero(h) {
+            break
+        }
+        // the header checksum
+        let want: i64 = num_field(h, 148, 8)
+        if want < 0 || (header_sum(h, false) != want && header_sum(h, true) != want) {
+            if vec_len[TarEntry](&r.entries) == 0 && !pend.have_path && pos == 0 {
+                fail = 6
+            } else {
+                fail = 5
+            }
+            break
+        }
+        let typ: u8 = rt.ld8(h, 156)
+        var sz: i64 = num_field(h, 124, 12)
+        if sz < 0 {
+            fail = 1
+            break
+        }
+        let data_off: usize = pos + 512
+        // --- metadata entries: pax, GNU long names
+        if typ == 120 as u8 || typ == 103 as u8 || typ == 76 as u8 || typ == 75 as u8 {
+            // 'x' 'g' 'L' 'K'
+            if sz as u64 > 1048576 {
+                fail = 3 // a megabyte of "metadata" is not metadata
+                break
+            }
+            if data_off as u64 + sz as u64 > n as u64 {
+                fail = 2
+                break
+            }
+            if typ == 120 as u8 {
+                if !pax_parse(p, data_off, sz as usize, &pend) {
+                    fail = 1
+                    break
+                }
+            } else if typ == 76 as u8 || typ == 75 as u8 {
+                // the name, NUL terminated inside the data
+                var ln: usize = 0
+                while ln < sz as usize && rt.ld8(p, data_off + ln) != 0 as u8 {
+                    ln = ln + 1
+                }
+                if typ == 76 as u8 {
+                    pend.have_path = true
+                    pend.path_off = data_off
+                    pend.path_len = ln
+                } else {
+                    pend.have_link = true
+                    pend.link_off = data_off
+                    pend.link_len = ln
+                }
+            }
+            var next: u64 = data_off as u64 + round512(sz as u64)
+            if next > n as u64 {
+                next = n as u64
+            }
+            pos = next as usize
+        } else {
+            // --- a real entry
+            if typ == 83 as u8 {
+                fail = 4 // 'S' sparse
+                break
+            }
+            var kind: u32 = TAR_OTHER
+            if typ == 48 as u8 || typ == 0 as u8 || typ == 55 as u8 {
+                kind = TAR_FILE
+            } else if typ == 53 as u8 {
+                kind = TAR_DIR
+            } else if typ == 50 as u8 {
+                kind = TAR_SYMLINK
+            } else if typ == 49 as u8 {
+                kind = TAR_HARDLINK
+            }
+            if pend.have_size {
+                if pend.size > 4611686018427387904 {
+                    fail = 1
+                    break
+                }
+                sz = pend.size as i64
+            }
+            // data follows only for files and unknown kinds (as GNU tar and
+            // Python's tarfile read it); links and directories carry none
+            var skip: bool = false
+            if kind == TAR_FILE || kind == TAR_OTHER {
+                skip = true
+            } else {
+                sz = 0
+            }
+            if skip && (data_off as u64 > n as u64 || sz as u64 > n as u64 - data_off as u64) {
+                fail = 2
+                break
+            }
+            if vec_len[TarEntry](&r.entries) >= lim.max_entries {
+                fail = 3
+                break
+            }
+            if kind == TAR_FILE {
+                if sz as u64 > lim.max_entry_size {
+                    fail = 3
+                    break
+                }
+                total = total + sz as u64
+                if total > lim.max_total_size {
+                    fail = 3
+                    break
+                }
+            }
+            let mode: i64 = num_field(h, 100, 8)
+            if mode < 0 {
+                fail = 1
+                break
+            }
+            var mt: i64 = num_field(h, 136, 12)
+            if mt < 0 {
+                mt = 0
+            }
+            if pend.have_mtime {
+                mt = pend.mtime
+            }
+            // the name
+            let nf: usize = field_len(h, 0, 100)
+            var name_off: usize = 0
+            var name_len: usize = 0
+            if pend.have_path {
+                name_len = pend.path_len
+                if name_len > 4096 {
+                    fail = 3
+                    break
+                }
+                name_off = names_push(&r, p, pend.path_off, pend.path_len)
+            } else {
+                // POSIX ustar: "prefix/name"; the GNU format uses these
+                // octets for other things, so only for magic "ustar\0" "00"
+                var pf: usize = 0
+                let posix: bool = rt.ld8(h, 257) == 117 as u8 && rt.ld8(h, 258) == 115 as u8
+                    && rt.ld8(h, 259) == 116 as u8 && rt.ld8(h, 260) == 97 as u8
+                    && rt.ld8(h, 261) == 114 as u8 && rt.ld8(h, 262) == 0 as u8
+                if posix {
+                    pf = field_len(h, 345, 155)
+                }
+                name_off = rt.buf_len(&r.names)
+                if pf > 0 {
+                    rt.buf_push_bytes(&r.names, h + 345, pf)
+                    rt.buf_push(&r.names, 47 as u8)
+                }
+                rt.buf_push_bytes(&r.names, h, nf)
+                name_len = rt.buf_len(&r.names) - name_off
+            }
+            var link_off: usize = 0
+            var link_len: usize = 0
+            if kind == TAR_SYMLINK || kind == TAR_HARDLINK {
+                if pend.have_link {
+                    link_len = pend.link_len
+                    if link_len > 4096 {
+                        fail = 3
+                        break
+                    }
+                    link_off = names_push(&r, p, pend.link_off, pend.link_len)
+                } else {
+                    link_len = field_len(h, 157, 100)
+                    link_off = names_push(&r, h, 157, link_len)
+                }
+            }
+            vec_push[TarEntry](&r.entries, TarEntry { name_off: name_off, name_len: name_len,
+                link_off: link_off, link_len: link_len, kind: kind,
+                mode: (mode as u64 & 4095) as u32, size: sz as u64, mtime: mt, data: data_off })
+            pend = pending_new()
+            var next: u64 = data_off as u64
+            if skip {
+                next = data_off as u64 + round512(sz as u64)
+            }
+            if next > n as u64 {
+                next = n as u64
+            }
+            pos = next as usize
+        }
+    }
+    if rt.buf_len(&r.names) > 0 && r.names.cap < rt.buf_len(&r.names) {
+        fail = 7
+    }
+    if fail != 0 {
+        tar_reader_free(&r)
+        if fail == 2 { return ArchiveError::Truncated }
+        if fail == 3 { return ArchiveError::TooLarge }
+        if fail == 4 { return ArchiveError::Unsupported }
+        if fail == 5 { return ArchiveError::Checksum }
+        if fail == 6 { return ArchiveError::NotArchive }
+        if fail == 7 { return ArchiveError::OutOfMemory }
+        return ArchiveError::Corrupt
+    }
+    return r
+}
+
+fn tar_reader_free(r: *mut TarReader) {
+    vec_free[TarEntry](&(*r).entries)
+    rt.buf_free(&(*r).names)
+}
+
+fn tar_entry_count(r: *mut TarReader) -> usize {
+    return vec_len[TarEntry](&(*r).entries)
+}
+
+fn ent_at(r: *mut TarReader, i: usize) -> *mut TarEntry {
+    return vec_elem_ptr[TarEntry](&(*r).entries, i)
+}
+
+// The name as stored (a view into the reader; a leading "./" is kept).
+fn tar_entry_name(r: *mut TarReader, i: usize) -> str {
+    let e: *mut TarEntry = ent_at(r, i)
+    return str { p: rt.ptr_of(rt.buf_ptr(&(*r).names) + (*e).name_off as u64), n: (*e).name_len }
+}
+
+// The target of a symbolic or hard link ("" for other kinds).
+fn tar_entry_link(r: *mut TarReader, i: usize) -> str {
+    let e: *mut TarEntry = ent_at(r, i)
+    return str { p: rt.ptr_of(rt.buf_ptr(&(*r).names) + (*e).link_off as u64), n: (*e).link_len }
+}
+
+fn tar_entry_kind(r: *mut TarReader, i: usize) -> u32 {
+    return (*ent_at(r, i)).kind
+}
+
+fn tar_entry_mode(r: *mut TarReader, i: usize) -> u32 {
+    return (*ent_at(r, i)).mode
+}
+
+fn tar_entry_size(r: *mut TarReader, i: usize) -> u64 {
+    return (*ent_at(r, i)).size
+}
+
+fn tar_entry_mtime(r: *mut TarReader, i: usize) -> i64 {
+    return (*ent_at(r, i)).mtime
+}
+
+// Address of the content of a file entry inside the archive octets (valid
+// as long as the archive memory is; length = `tar_entry_size`).
+fn tar_entry_data(r: *mut TarReader, i: usize) -> u64 {
+    return (*r).data + (*ent_at(r, i)).data as u64
+}
+
+// Index of the entry whose name equals `name` ("./" and one trailing "/"
+// are ignored on both sides), or -1.
+fn tar_find(r: *mut TarReader, name: str) -> i64 {
+    let want: str = safefs.sf_trim_slash(safefs.sf_clean(name))
+    var i: usize = 0
+    let n: usize = tar_entry_count(r)
+    while i < n {
+        if safefs.sf_trim_slash(safefs.sf_clean(tar_entry_name(r, i))) == want {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Appends the content of file entry `i` to `out`; the answer is its length.
+// Other kinds are `Unsupported`.
+fn tar_extract(r: *mut TarReader, i: usize, out: *mut rt.Buf) -> ArchiveError!usize {
+    if i >= tar_entry_count(r) {
+        return ArchiveError::Corrupt
+    }
+    let e: *mut TarEntry = ent_at(r, i)
+    if (*e).kind != TAR_FILE {
+        return ArchiveError::Unsupported
+    }
+    let n: usize = (*e).size as usize
+    let before: usize = (*out).len
+    rt.buf_reserve(out, before + n)
+    if (*out).cap < before + n {
+        return ArchiveError::OutOfMemory
+    }
+    rt.buf_push_bytes(out, (*r).data + (*e).data as u64, n)
+    return n
+}
+
+// Whether a caller's own entry name would be accepted for extraction (see
+// std.safefs; the Windows rules apply when built for Windows).
+fn tar_name_is_safe(name: str) -> bool {
+    return safefs.sf_name_ok(safefs.sf_clean(name), osinfo.is_windows())
+}
+
+// ------------------------------------------------------------ gzip
+
+fn gz_fail(d: DeflateError, why: *mut u32) -> usize {
+    if d == DeflateError::TooLarge {
+        *why = 3 as u32
+    } else if d == DeflateError::OutOfMemory {
+        *why = 7 as u32
+    } else if d == DeflateError::Truncated {
+        *why = 2 as u32
+    } else if d == DeflateError::Checksum {
+        *why = 5 as u32
+    } else {
+        *why = 1 as u32
+    }
+    return 0
+}
+
+fn gz_error(why: u32) -> ArchiveError {
+    if why == 2 as u32 { return ArchiveError::Truncated }
+    if why == 3 as u32 { return ArchiveError::TooLarge }
+    if why == 5 as u32 { return ArchiveError::Checksum }
+    if why == 7 as u32 { return ArchiveError::OutOfMemory }
+    return ArchiveError::Corrupt
+}
+
+// Inflates a .gz into `out` (appended) producing at most `max` octets (0 =
+// no limit; a gzip bomb is `TooLarge`). The answer is the inflated length.
+fn targz_inflate(src: u64, n: usize, max: usize, out: *mut rt.Buf) -> ArchiveError!usize {
+    var why: u32 = 0
+    let before: usize = (*out).len
+    let got: usize = deflate.gzip_decompress_limited(src, n, max, out) catch | d | (gz_fail(d, &why))
+    if why != 0 as u32 {
+        rt.buf_set_len(out, before)
+        return gz_error(why)
+    }
+    return got
+}
+
+// Compresses a finished tar stream to .gz (appended to `out`).
+fn targz_compress(src: u64, n: usize, level: usize, out: *mut rt.Buf) -> ArchiveError!usize {
+    var why: u32 = 0
+    let before: usize = (*out).len
+    let got: usize = deflate.gzip_compress(src, n, level, out) catch | d | (gz_fail(d, &why))
+    if why != 0 as u32 {
+        rt.buf_set_len(out, before)
+        return gz_error(why)
+    }
+    return got
+}
+
+// Opens a tar or a tar.gz: a gzip stream (1f 8b) is inflated into `scratch`
+// first (the caller owns and frees it AFTER the reader), plain tar is read
+// in place. `scratch` is untouched for plain tar.
+fn tar_open_auto(p: u64, n: usize, lim: TarLimits, scratch: *mut rt.Buf) -> ArchiveError!TarReader {
+    if n >= 2 && rt.ld8(p, 0) == 31 as u8 && rt.ld8(p, 1) == 139 as u8 {
+        // one octet more than allowed, so that exactly-at-the-limit passes
+        // and anything beyond is TooLarge
+        let got: usize = try targz_inflate(p, n, lim.max_archive_size, scratch)
+        return try tar_reader_open_limits(rt.buf_ptr(scratch), got, lim)
+    }
+    return try tar_reader_open_limits(p, n, lim)
+}
+
+// ------------------------------------------------------------ extraction
+
+fn tar_extract_all(r: *mut TarReader, dest: str, opts: safefs.ExtractOptions) -> ArchiveError!safefs.ExtractStats {
+    let windows: bool = osinfo.is_windows()
+    let count: usize = tar_entry_count(r)
+
+    // ---- pass 1: judge everything before touching the disk
+    var names: Map[u64, u64] = map_new[u64, u64]() // name hash -> entry index + 1 (all kept entries)
+    var files: Map[u64, u64] = map_new[u64, u64]() // name hash -> index + 1 (earlier FILE entries, for hard links)
+    var fail: u32 = 0 // 1 UnsafeName 2 UnsafeLink 3 UnsafeType 4 Duplicate 5 BadLink
+    var i: usize = 0
+    while i < count && fail == 0 {
+        let e: *mut TarEntry = ent_at(r, i)
+        let rel: str = safefs.sf_strip(safefs.sf_clean(tar_entry_name(r, i)), opts.strip)
+        let relt: str = safefs.sf_trim_slash(rel)
+        if relt.length() == 0 {
+            i = i + 1
+        } else {
+            if (*e).kind == TAR_OTHER {
+                fail = 3
+            } else if !safefs.sf_name_ok(rel, windows) {
+                fail = 1
+            } else {
+                let h: u64 = safefs.sf_hash_name(rel, windows)
+                if map_has[u64, u64](&names, h) {
+                    let other: usize = map_get[u64, u64](&names, h) as usize - 1
+                    let orel: str = safefs.sf_strip(safefs.sf_clean(tar_entry_name(r, other)), opts.strip)
+                    if safefs.sf_names_equal(orel, rel, windows) {
+                        fail = 4
+                    }
+                } else {
+                    map_set[u64, u64](&names, h, (i + 1) as u64)
+                }
+                if fail == 0 && (*e).kind == TAR_SYMLINK {
+                    if !safefs.sf_link_ok(tar_entry_link(r, i), safefs.sf_depth(rel), windows) {
+                        fail = 2
+                    }
+                }
+                if fail == 0 && (*e).kind == TAR_HARDLINK {
+                    let lrel: str = safefs.sf_strip(safefs.sf_clean(tar_entry_link(r, i)), opts.strip)
+                    let lh: u64 = safefs.sf_hash_name(lrel, windows)
+                    if !safefs.sf_name_ok(lrel, windows) {
+                        fail = 5
+                    } else if !map_has[u64, u64](&files, lh) {
+                        fail = 5
+                    } else {
+                        let t: usize = map_get[u64, u64](&files, lh) as usize - 1
+                        let trel: str = safefs.sf_strip(safefs.sf_clean(tar_entry_name(r, t)), opts.strip)
+                        if !safefs.sf_names_equal(trel, lrel, windows) {
+                            fail = 5
+                        }
+                    }
+                }
+                if fail == 0 && (*e).kind == TAR_FILE {
+                    map_set[u64, u64](&files, h, (i + 1) as u64)
+                }
+            }
+            i = i + 1
+        }
+    }
+    map_free[u64, u64](&names)
+    if fail != 0 {
+        map_free[u64, u64](&files)
+        if fail == 1 { return ArchiveError::UnsafeName }
+        if fail == 2 { return ArchiveError::UnsafeLink }
+        if fail == 3 { return ArchiveError::UnsafeType }
+        if fail == 4 { return ArchiveError::Duplicate }
+        return ArchiveError::BadLink
+    }
+
+    // ---- pass 2: write
+    var stats: safefs.ExtractStats = safefs.ExtractStats { files: 0, dirs: 0, links: 0, bytes: 0 }
+    var bad: bool = false
+    var why: ArchiveError = ArchiveError::Io
+    fs.mkdir_all(dest) catch | er | (note_mk(er, &why, &bad))
+    if bad {
+        map_free[u64, u64](&files)
+        return why
+    }
+    var w: safefs.SfWalker = safefs.sf_walker_new(dest)
+    map_clear[u64, u64](&files)
+    var k: usize = 0
+    var err: u32 = 0
+    while k < count && err == 0 {
+        let e: *mut TarEntry = ent_at(r, k)
+        let rel: str = safefs.sf_strip(safefs.sf_clean(tar_entry_name(r, k)), opts.strip)
+        let relt: str = safefs.sf_trim_slash(rel)
+        if relt.length() > 0 {
+            if (*e).kind == TAR_DIR {
+                let ok: bool = safefs.sf_make_dir(&w, relt, (*e).mode) catch | ae | (note_ae(ae, &why, &err))
+                stats.dirs = stats.dirs + 1
+            } else if (*e).kind == TAR_FILE {
+                let ok: bool = safefs.sf_write_file(&w, relt, tar_entry_data(r, k), (*e).size as usize, (*e).mode, opts.overwrite) catch | ae | (note_ae(ae, &why, &err))
+                if err == 0 {
+                    map_set[u64, u64](&files, safefs.sf_hash_name(rel, windows), (k + 1) as u64)
+                    stats.files = stats.files + 1
+                    stats.bytes = stats.bytes + (*e).size
+                }
+            } else if (*e).kind == TAR_HARDLINK {
+                // a hard link is written as a copy of the earlier file
+                let lrel: str = safefs.sf_strip(safefs.sf_clean(tar_entry_link(r, k)), opts.strip)
+                let t: usize = map_get[u64, u64](&files, safefs.sf_hash_name(lrel, windows)) as usize - 1
+                let ok: bool = safefs.sf_write_file(&w, relt, tar_entry_data(r, t), (*ent_at(r, t)).size as usize, (*ent_at(r, t)).mode, opts.overwrite) catch | ae | (note_ae(ae, &why, &err))
+                if err == 0 {
+                    map_set[u64, u64](&files, safefs.sf_hash_name(rel, windows), (k + 1) as u64)
+                    stats.files = stats.files + 1
+                    stats.bytes = stats.bytes + (*ent_at(r, t)).size
+                }
+            } else if (*e).kind == TAR_SYMLINK {
+                let ok: bool = safefs.sf_make_symlink(&w, relt, tar_entry_link(r, k), opts.overwrite) catch | ae | (note_ae(ae, &why, &err))
+                stats.links = stats.links + 1
+            }
+        }
+        k = k + 1
+    }
+    map_free[u64, u64](&files)
+    if err != 0 {
+        return why
+    }
+    return stats
+}
+
+fn note_mk(e: FsError, why: *mut ArchiveError, bad: *mut bool) -> bool {
+    *why = safefs.sf_fs_error(e)
+    *bad = true
+    return false
+}
+
+fn note_ae(e: ArchiveError, why: *mut ArchiveError, err: *mut u32) -> bool {
+    *why = e
+    *err = 1 as u32
+    return false
+}
+
+// ------------------------------------------------------------ writing
+
+struct TarWriter {
+    out: u64, // *mut rt.Buf as a number (the caller owns the buffer)
+    start: usize, // where the archive begins in `out`
+    finished: bool,
+}
+
+// A writer that APPENDS the archive to `out`.
+fn tar_writer_new(out: *mut rt.Buf) -> TarWriter {
+    return TarWriter { out: out as u64, start: (*out).len, finished: false }
+}
+
+fn w_out(w: *mut TarWriter) -> *mut rt.Buf {
+    return (*w).out as *mut rt.Buf
+}
+
+// `v` as `len - 1` octal digits (zero padded) and a NUL
+fn put_octal(h: u64, off: usize, len: usize, v: u64) {
+    var x: u64 = v
+    var i: usize = len - 1
+    rt.st8(h, off + i, 0 as u8)
+    while i > 0 {
+        i = i - 1
+        rt.st8(h, off + i, (48 + (x & 7)) as u8)
+        x = x >> 3
+    }
+}
+
+fn put_text(h: u64, off: usize, s: str, max: usize) {
+    var n: usize = s.length()
+    if n > max {
+        n = max
+    }
+    var i: usize = 0
+    while i < n {
+        rt.st8(h, off + i, s.chars(i))
+        i = i + 1
+    }
+}
+
+// finishes the checksum of the 512 octet header at `h` and appends it
+fn emit_header(w: *mut TarWriter, h: u64) {
+    var i: usize = 148
+    while i < 156 {
+        rt.st8(h, i, 32 as u8)
+        i = i + 1
+    }
+    var s: u64 = 0
+    i = 0
+    while i < 512 {
+        s = s + rt.ld8(h, i) as u64
+        i = i + 1
+    }
+    // six octal digits, NUL, blank
+    var x: u64 = s
+    i = 6
+    while i > 0 {
+        i = i - 1
+        rt.st8(h, 148 + i, (48 + (x & 7)) as u8)
+        x = x >> 3
+    }
+    rt.st8(h, 154, 0 as u8)
+    rt.st8(h, 155, 32 as u8)
+    rt.buf_push_bytes(w_out(w), h, 512)
+}
+
+fn push_zeros(out: *mut rt.Buf, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(out, 0 as u8)
+        i = i + 1
+    }
+}
+
+// one pax record "<len> key=value\n" (len counts itself)
+fn pax_record(b: *mut rt.Buf, key: str, val_p: u64, val_n: usize) {
+    let body: usize = 1 + key.length() + 1 + val_n + 1 // blank, key, '=', value, '\n'
+    var digits: usize = 1
+    var total: usize = body + digits
+    // the length includes its own digits: iterate until stable
+    var again: bool = true
+    while again {
+        var d: usize = 1
+        var t: usize = total
+        while t >= 10 {
+            t = t / 10
+            d = d + 1
+        }
+        if d == digits {
+            again = false
+        } else {
+            digits = d
+            total = body + digits
+        }
+    }
+    rt.buf_push_dec_u64(b, total as u64)
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_bytes(b, key.p as u64, key.length())
+    rt.buf_push(b, 61 as u8)
+    rt.buf_push_bytes(b, val_p, val_n)
+    rt.buf_push(b, 10 as u8)
+}
+
+fn add_entry(w: *mut TarWriter, name: str, link: str, typ: u8, p: u64, n: usize, mode: u32, mtime: i64) -> ArchiveError!bool {
+    if (*w).finished {
+        return ArchiveError::Unsupported
+    }
+    var full: str = name
+    if typ == 53 as u8 && !(full.length() > 0 && full.chars(full.length() - 1) == 47 as u8) {
+        full = full + "/"
+    }
+    if !safefs.sf_name_ok(full, false) {
+        return ArchiveError::UnsafeName
+    }
+    let out: *mut rt.Buf = w_out(w)
+    rt.buf_reserve(out, (*out).len + 3 * 512 + n + 1024 + full.length() + link.length())
+    if (*out).cap < (*out).len + n + 2048 {
+        return ArchiveError::OutOfMemory
+    }
+    // where does the name go?
+    var name_part: str = full
+    var prefix_part: str = ""
+    var use_pax_path: bool = false
+    if full.length() > 100 {
+        // split at a "/" so that prefix <= 155 and name <= 100
+        var k: usize = 0
+        var found: bool = false
+        while k < full.length() && !found {
+            if full.chars(k) == 47 as u8 && k <= 155 && full.length() - k - 1 <= 100 && full.length() - k - 1 > 0 {
+                found = true
+            } else {
+                k = k + 1
+            }
+        }
+        if found {
+            prefix_part = full.part(0, k)
+            name_part = full.part(k + 1, full.length() - k - 1)
+        } else {
+            use_pax_path = true
+        }
+    }
+    let use_pax_link: bool = link.length() > 100
+    let use_pax_size: bool = n as u64 >= 8589934592
+    if use_pax_path || use_pax_link || use_pax_size {
+        var rec: rt.Buf = rt.buf_new()
+        if use_pax_path {
+            pax_record(&rec, "path", full.p as u64, full.length())
+        }
+        if use_pax_link {
+            pax_record(&rec, "linkpath", link.p as u64, link.length())
+        }
+        if use_pax_size {
+            var sb: rt.Buf = rt.buf_new()
+            rt.buf_push_dec_u64(&sb, n as u64)
+            pax_record(&rec, "size", rt.buf_ptr(&sb), rt.buf_len(&sb))
+            rt.buf_free(&sb)
+        }
+        var ph: [u8; 512] = [0; 512]
+        let hp: u64 = (&ph[0]) as u64
+        let pname: str = "PaxHeader/entry"
+        put_text(hp, 0, pname, 100)
+        put_octal(hp, 100, 8, 420)
+        put_octal(hp, 108, 8, 0)
+        put_octal(hp, 116, 8, 0)
+        put_octal(hp, 124, 12, rt.buf_len(&rec) as u64)
+        put_octal(hp, 136, 12, 0)
+        ph[156] = 120 as u8 // 'x'
+        put_text(hp, 257, "ustar", 5)
+        ph[263] = 48 as u8
+        ph[264] = 48 as u8
+        emit_header(w, hp)
+        rt.buf_push_bytes(out, rt.buf_ptr(&rec), rt.buf_len(&rec))
+        push_zeros(out, (round512(rt.buf_len(&rec) as u64) - rt.buf_len(&rec) as u64) as usize)
+        rt.buf_free(&rec)
+    }
+    var hd: [u8; 512] = [0; 512]
+    let h: u64 = (&hd[0]) as u64
+    put_text(h, 0, name_part, 100)
+    put_octal(h, 100, 8, (mode & 4095 as u32) as u64)
+    put_octal(h, 108, 8, 0)
+    put_octal(h, 116, 8, 0)
+    var sz: u64 = 0
+    if typ == 48 as u8 && !use_pax_size {
+        sz = n as u64
+    }
+    put_octal(h, 124, 12, sz)
+    var mt: u64 = 0
+    if mtime > 0 && mtime <= 8589934591 {
+        mt = mtime as u64
+    }
+    put_octal(h, 136, 12, mt)
+    hd[156] = typ
+    put_text(h, 157, link, 100)
+    put_text(h, 257, "ustar", 5)
+    hd[263] = 48 as u8
+    hd[264] = 48 as u8
+    put_octal(h, 329, 8, 0)
+    put_octal(h, 337, 8, 0)
+    put_text(h, 345, prefix_part, 155)
+    emit_header(w, h)
+    if typ == 48 as u8 {
+        rt.buf_push_bytes(out, p, n)
+        push_zeros(out, (round512(n as u64) - n as u64) as usize)
+    }
+    return true
+}
+
+// Adds a regular file with `n` octets at `p`.
+fn tar_add_file(w: *mut TarWriter, name: str, p: u64, n: usize, mode: u32, mtime: i64) -> ArchiveError!bool {
+    return try add_entry(w, name, "", 48 as u8, p, n, mode, mtime)
+}
+
+// Adds a directory entry ("/" is appended to the name if missing).
+fn tar_add_dir(w: *mut TarWriter, name: str, mode: u32, mtime: i64) -> ArchiveError!bool {
+    return try add_entry(w, name, "", 53 as u8, 0, 0, mode, mtime)
+}
+
+// Adds a symbolic link `name` -> `target` (the target is written as given;
+// a reader checks it with `sf_link_ok` when it extracts).
+fn tar_add_symlink(w: *mut TarWriter, name: str, target: str, mtime: i64) -> ArchiveError!bool {
+    return try add_entry(w, name, target, 50 as u8, 0, 0, 511 as u32, mtime)
+}
+
+
+// ---- a whole directory
+
+// byte-wise "a < b"
+fn str_less(a: str, b: str) -> bool {
+    var i: usize = 0
+    while i < a.length() && i < b.length() {
+        if a.chars(i) != b.chars(i) {
+            return a.chars(i) < b.chars(i)
+        }
+        i = i + 1
+    }
+    return a.length() < b.length()
+}
+
+fn note_fs_e(e: FsError, why: *mut ArchiveError, bad: *mut bool) -> usize {
+    *why = safefs.sf_fs_error(e)
+    *bad = true
+    return 0
+}
+
+fn note_fs_i(e: FsError, why: *mut ArchiveError, bad: *mut bool) -> fs.FileInfo {
+    *why = safefs.sf_fs_error(e)
+    *bad = true
+    return fs.FileInfo { kind: fs.KIND_OTHER, mode: 0 as u32, size: 0, mtime_ns: 0 }
+}
+
+fn note_fs_s(e: FsError, why: *mut ArchiveError, bad: *mut bool) -> str {
+    *why = safefs.sf_fs_error(e)
+    *bad = true
+    return ""
+}
+
+// Adds the directory `root` and everything below it to the archive, with
+// names "<prefix>/<relative path>" (`prefix` = "" puts the entries at the
+// top). Entries of one directory go in byte-wise name order, so the same
+// tree gives the same archive. Regular files, directories and symbolic
+// links are stored (links are NOT followed); other kinds (fifos, sockets,
+// devices) are skipped. The answer is the number of entries added. A file
+// is read completely into memory (one at a time).
+//
+// `#[allow_escape]`: `d.name` (a view into the frame's directory block) is
+// copied by `+` into the GC heap before it is kept.
+#[allow_escape]
+fn tar_add_tree(w: *mut TarWriter, root: str, prefix: str) -> ArchiveError!u64 {
+    var count: u64 = 0
+    if prefix.length() > 0 {
+        var bad: bool = false
+        var why: ArchiveError = ArchiveError::Io
+        let info: fs.FileInfo = fs.lstat(root) catch | e | (note_fs_i(e, &why, &bad))
+        if bad {
+            return why
+        }
+        try tar_add_dir(w, prefix, info.mode, info.mtime_ns / 1000000000)
+        count = 1
+    }
+    let sub: u64 = try add_tree_dir(w, root, prefix)
+    return count + sub
+}
+
+#[allow_escape]
+fn add_tree_dir(w: *mut TarWriter, dirpath: str, prefix: str) -> ArchiveError!u64 {
+    var names: Vec[str] = vec_new[str]()
+    var d: dir.Dir = dir.open(dirpath)
+    if !dir.is_open(&d) {
+        vec_free[str](&names)
+        return ArchiveError::NotFound
+    }
+    while dir.next(&d) {
+        vec_push[str](&names, "" + d.name)
+    }
+    dir.close(&d)
+    // insertion sort, byte-wise
+    var i: usize = 1
+    let n: usize = vec_len[str](&names)
+    while i < n {
+        var j: usize = i
+        while j > 0 && str_less(*vec_elem_ptr[str](&names, j), *vec_elem_ptr[str](&names, j - 1)) {
+            vec_swap[str](&names, j, j - 1)
+            j = j - 1
+        }
+        i = i + 1
+    }
+    var count: u64 = 0
+    var k: usize = 0
+    var bad: bool = false
+    var why: ArchiveError = ArchiveError::Io
+    while k < n && !bad {
+        let name: str = *vec_elem_ptr[str](&names, k)
+        let full: str = fs.path_join(dirpath, name)
+        var rel: str = name
+        if prefix.length() > 0 {
+            rel = prefix + "/" + name
+        }
+        let info: fs.FileInfo = fs.lstat(full) catch | e | (note_fs_i(e, &why, &bad))
+        if !bad {
+            if info.kind == fs.KIND_DIR {
+                var ok: bool = tar_add_dir(w, rel, info.mode, info.mtime_ns / 1000000000) catch | e2 | (note_arch(e2, &why, &bad))
+                count = count + 1
+                if !bad {
+                    let sub: u64 = add_tree_dir(w, full, rel) catch | e3 | (note_arch_n(e3, &why, &bad))
+                    count = count + sub
+                }
+            } else if info.kind == fs.KIND_FILE {
+                var content: rt.Buf = rt.buf_new()
+                fs.read_file(full, &content) catch | e | (note_fs_e(e, &why, &bad))
+                if !bad {
+                    tar_add_file(w, rel, rt.buf_ptr(&content), rt.buf_len(&content), info.mode, info.mtime_ns / 1000000000) catch | e2 | (note_arch(e2, &why, &bad))
+                    count = count + 1
+                }
+                rt.buf_free(&content)
+            } else if info.kind == fs.KIND_LINK {
+                let target: str = fs.readlink(full) catch | e | (note_fs_s(e, &why, &bad))
+                if !bad {
+                    tar_add_symlink(w, rel, target, info.mtime_ns / 1000000000) catch | e2 | (note_arch(e2, &why, &bad))
+                    count = count + 1
+                }
+            }
+        }
+        k = k + 1
+    }
+    vec_free[str](&names)
+    if bad {
+        return why
+    }
+    return count
+}
+
+fn note_arch(e: ArchiveError, why: *mut ArchiveError, bad: *mut bool) -> bool {
+    *why = e
+    *bad = true
+    return false
+}
+
+fn note_arch_n(e: ArchiveError, why: *mut ArchiveError, bad: *mut bool) -> u64 {
+    *why = e
+    *bad = true
+    return 0
+}
+
+// Ends the archive (two zero blocks, padded to 10,240 octets); the answer
+// is the length of the whole archive in `out`.
+fn tar_finish(w: *mut TarWriter) -> ArchiveError!usize {
+    if (*w).finished {
+        return ArchiveError::Unsupported
+    }
+    let out: *mut rt.Buf = w_out(w)
+    rt.buf_reserve(out, (*out).len + 20480)
+    if (*out).cap < (*out).len + 20480 {
+        return ArchiveError::OutOfMemory
+    }
+    push_zeros(out, 1024)
+    let len: usize = (*out).len - (*w).start
+    let padded: usize = (len + 10239) / 10240 * 10240
+    push_zeros(out, padded - len)
+    (*w).finished = true
+    return (*out).len - (*w).start
+}

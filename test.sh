@@ -1474,7 +1474,7 @@ echo "== 69. WINDOWS: the same programs on two operating systems (x86_64-windows
 #             and the X server sees the pointer move.
 # All of them SKIP (exit 0) without mingw binutils / Wine / Xvfb.
 WINRC=0
-for t in tools/windows/machine.sh tools/windows/net.sh tools/windows/run.sh tools/input/win.sh tools/phone_remote/win.sh; do
+for t in tools/windows/machine.sh tools/windows/net.sh tools/windows/run.sh tools/windows/wincred.sh tools/input/win.sh tools/phone_remote/win.sh; do
     lg="$WORK/win_$(basename "$(dirname "$t")")_$(basename "$t" .sh).log"
     bash "$t" > "$lg" 2>&1 || WINRC=1
     grep -E '^  (passed|SKIP|RESULT)|^(SKIP|INPUT-WIN)' "$lg" | sed 's/^/   /' || true
@@ -1540,6 +1540,20 @@ if [ "$MLRC" -eq 0 ]; then
 else
     bad "tools/manifest-lint/run.sh failed (see .test-work/manifest-lint.log)"
     tail -n 8 "$WORK/manifest-lint.log" | sed 's/^/   /'
+fi
+
+echo "== 74. archives, file hashes and the keyring against other implementations (tools/stdarchive/run.sh) =="
+# std.tar, std.extract, std.safefs, std.hashfile and std.secret have their own positive tests (tests/2070..2073, in
+# every build level above). This section holds them against programs nobody here wrote: GNU tar and Python's
+# tarfile in both directions, fourteen hostile archives that must be refused whole, Info-ZIP and zipfile, hashlib,
+# and Python's `cryptography` + PyNaCl for the encrypted vault (docs/STD_ARCHIVES.md).
+bash tools/stdarchive/run.sh > "$WORK/stdarchive.log" 2>&1 && SARC=0 || SARC=$?
+if [ "$SARC" -eq 0 ]; then
+    ok
+    tail -n 1 "$WORK/stdarchive.log" | sed 's/^/   /'
+else
+    bad "tools/stdarchive/run.sh failed (see .test-work/stdarchive.log)"
+    grep -E 'FAIL|Traceback|Error' "$WORK/stdarchive.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

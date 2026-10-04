@@ -257,6 +257,18 @@ const KNOWN: &[(&str, &str, u32)] = &[
     // value `AppsUseLightTheme`. `RegGetValueW` does opening, reading and
     // closing in one call.
     ("RegGetValueW", "ADVAPI32.dll", 7),
+    // --- advapi32: the Credential Manager (std.secret_os) --------------
+    // The keyring of Windows: generic credentials, kept per user by the
+    // system and protected with the user's logon secret (DPAPI). Round
+    // STD-SECRET. They are bound HERE because an indirect call through
+    // GetProcAddress is System V, not Win64 (see `GetModuleFileNameW`
+    // below): the arguments would land in rdi/rsi and the call would fail.
+    // CredWriteW(credential*, flags), CredReadW(target, type, flags,
+    // credential**), CredDeleteW(target, type, flags), CredFree(buffer).
+    ("CredWriteW", "ADVAPI32.dll", 2),
+    ("CredReadW", "ADVAPI32.dll", 4),
+    ("CredDeleteW", "ADVAPI32.dll", 3),
+    ("CredFree", "ADVAPI32.dll", 1),
     // --- dwmapi: THE TITLE BAR (round CERTUS C-039) -------------------
     // Justin, 18.09.2026: "the window bar at the top does not fit the
     // style either". Certus painted its shell dark, while Windows

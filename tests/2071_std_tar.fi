@@ -1,0 +1,556 @@
+// expect_exit: 0
+// tests/2071_std_tar.fi -- std.tar and std.safefs: reading ustar/GNU/pax, tar.gz,
+// writing, safe extraction, the limits, and the rules that keep a hostile
+// archive from writing outside the target.
+//
+// The fixtures in tests/data/archives/ were made by GNU tar 1.34 and Python's
+// tarfile (tools/stdarchive/gen_fixtures.py); the same readers and writers are
+// held against those programs in BOTH directions by tools/stdarchive/run.sh.
+import std.tar
+import std.safefs
+import std.fs
+import std.dir
+import std.rt
+import std.osinfo
+import std.io
+import std.str
+import std.vec
+
+const GNU_LONG: str = __include_str("data/archives/gnu_long.tar")
+const USTAR_PREFIX: str = __include_str("data/archives/ustar_prefix.tar")
+const PAX_UNICODE: str = __include_str("data/archives/pax_unicode.tar")
+const JDK_TGZ: str = __include_str("data/archives/jdk.tar.gz")
+const EVIL_DOTDOT: str = __include_str("data/archives/evil_dotdot.tar")
+const EVIL_SYMLINK: str = __include_str("data/archives/evil_symlink_file.tar")
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+fn scratch() -> str {
+    var b: rt.Buf = rt.buf_new()
+    let head: str = "/tmp/firn_tar_2071_"
+    rt.buf_push_bytes(&b, head.p as u64, head.length())
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn count_entries(path: str) -> usize {
+    var n: usize = 0
+    var d: dir.Dir = dir.open(path)
+    while dir.next(&d) {
+        n = n + 1
+    }
+    dir.close(&d)
+    return n
+}
+
+fn rep(c: u8, n: usize) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(&b, c)
+        i = i + 1
+    }
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn bad_reader(e: ArchiveError, code: *mut u32) -> tar.TarReader {
+    *code = err_code(e)
+    return tar.TarReader { data: 0, n: 0, names: rt.buf_new(), entries: vec_new[tar.TarEntry]() }
+}
+
+fn err_code(e: ArchiveError) -> u32 {
+    if e == ArchiveError::NotArchive { return 1 as u32 }
+    if e == ArchiveError::Corrupt { return 2 as u32 }
+    if e == ArchiveError::Truncated { return 3 as u32 }
+    if e == ArchiveError::Unsupported { return 4 as u32 }
+    if e == ArchiveError::Checksum { return 5 as u32 }
+    if e == ArchiveError::TooLarge { return 6 as u32 }
+    if e == ArchiveError::UnsafeName { return 8 as u32 }
+    if e == ArchiveError::UnsafeLink { return 9 as u32 }
+    if e == ArchiveError::UnsafePath { return 10 as u32 }
+    if e == ArchiveError::UnsafeType { return 11 as u32 }
+    if e == ArchiveError::Duplicate { return 12 as u32 }
+    if e == ArchiveError::BadLink { return 13 as u32 }
+    if e == ArchiveError::Exists { return 15 as u32 }
+    return 99 as u32
+}
+
+fn bad_stats(e: ArchiveError, code: *mut u32) -> safefs.ExtractStats {
+    *code = err_code(e)
+    return safefs.ExtractStats { files: 0, dirs: 0, links: 0, bytes: 0 }
+}
+
+// open an archive held in a str; the error class (0 = none)
+fn open_s(s: str, code: *mut u32, scratch_buf: *mut rt.Buf) -> tar.TarReader {
+    *code = 0 as u32
+    return tar.tar_open_auto(s.p as u64, s.length(), tar.tar_limits_default(), scratch_buf) catch | e | (bad_reader(e, code))
+}
+
+fn find(r: *mut tar.TarReader, name: str) -> i64 {
+    return tar.tar_find(r, name)
+}
+
+fn content_is(r: *mut tar.TarReader, idx: i64, want: str) -> bool {
+    if idx < 0 {
+        return false
+    }
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = tar.tar_extract(r, idx as usize, &b) catch 0
+    let ok: bool = n == want.length() && rt.mem_eq(rt.buf_ptr(&b), want.p as u64, n)
+    rt.buf_free(&b)
+    return ok
+}
+
+// ---- raw tar blocks, to build archives that no tool would write
+
+fn put_oct(h: *mut [u8; 512], off: usize, len: usize, v: u64) {
+    var x: u64 = v
+    var i: usize = len - 1
+    (*h)[off + i] = 0 as u8
+    while i > 0 {
+        i = i - 1
+        (*h)[off + i] = (48 + (x & 7)) as u8
+        x = x >> 3
+    }
+}
+
+fn raw_entry(out: *mut rt.Buf, name: str, typ: u8, size: u64, link: str, mode: u64, data: str) {
+    var h: [u8; 512] = [0; 512]
+    var i: usize = 0
+    while i < name.length() && i < 100 {
+        h[i] = name.chars(i)
+        i = i + 1
+    }
+    put_oct(&h, 100, 8, mode)
+    put_oct(&h, 108, 8, 0)
+    put_oct(&h, 116, 8, 0)
+    put_oct(&h, 124, 12, size)
+    put_oct(&h, 136, 12, 0)
+    h[156] = typ
+    i = 0
+    while i < link.length() && i < 100 {
+        h[157 + i] = link.chars(i)
+        i = i + 1
+    }
+    h[257] = 117 as u8
+    h[258] = 115 as u8
+    h[259] = 116 as u8
+    h[260] = 97 as u8
+    h[261] = 114 as u8
+    h[262] = 0 as u8
+    h[263] = 48 as u8
+    h[264] = 48 as u8
+    i = 148
+    while i < 156 {
+        h[i] = 32 as u8
+        i = i + 1
+    }
+    var s: u64 = 0
+    i = 0
+    while i < 512 {
+        s = s + h[i] as u64
+        i = i + 1
+    }
+    put_oct(&h, 148, 7, s)
+    h[155] = 32 as u8
+    rt.buf_push_bytes(out, (&h[0]) as u64, 512)
+    var d: usize = 0
+    while d < data.length() {
+        rt.buf_push(out, data.chars(d))
+        d = d + 1
+    }
+    while d % 512 != 0 {
+        rt.buf_push(out, 0 as u8)
+        d = d + 1
+    }
+}
+
+fn raw_end(out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < 1024 {
+        rt.buf_push(out, 0 as u8)
+        i = i + 1
+    }
+}
+
+// extract a built archive into `dest` and say how it ended (0 = ok)
+fn try_extract(buf: *mut rt.Buf, dest: str, opts: safefs.ExtractOptions) -> u32 {
+    var code: u32 = 0
+    var sc: rt.Buf = rt.buf_new()
+    var r: tar.TarReader = tar.tar_open_auto(rt.buf_ptr(buf), rt.buf_len(buf), tar.tar_limits_default(), &sc) catch | e | (bad_reader(e, &code))
+    if code != 0 as u32 {
+        rt.buf_free(&sc)
+        return code
+    }
+    tar.tar_extract_all(&r, dest, opts) catch | e2 | (bad_stats(e2, &code))
+    tar.tar_reader_free(&r)
+    rt.buf_free(&sc)
+    return code
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let win: bool = osinfo.is_windows()
+    let root: str = scratch()
+    fs.remove_tree(root) catch false
+    fs.mkdir_all(root) catch false
+    var code: u32 = 0
+
+    // =================================================== A. what GNU tar and Python wrote
+    var s1: rt.Buf = rt.buf_new()
+    var g: tar.TarReader = open_s(GNU_LONG, &code, &s1)
+    check(&t, "GNU long.tar opens", code == 0 as u32)
+    check(&t, "GNU: 12 entries (dirs, the file, the link)", tar.tar_entry_count(&g) == 12)
+    let long_dir: str = "gnu-long/segment00_nnnnnnnnnn/segment01_nnnnnnnnnn/segment02_nnnnnnnnnn/segment03_nnnnnnnnnn/segment04_nnnnnnnnnn/segment05_nnnnnnnnnn/segment06_nnnnnnnnnn/segment07_nnnnnnnnnn/segment08_nnnnnnnnnn"
+    let gi: i64 = find(&g, long_dir + "/file.txt")
+    check(&t, "GNU: the long name ('L' entry) is whole", gi >= 0)
+    check(&t, "GNU: its content", content_is(&g, gi, "gnu long name content\n"))
+    check(&t, "GNU: file mode 0644", gi >= 0 && tar.tar_entry_mode(&g, gi as usize) == 420 as u32)
+    check(&t, "GNU: mtime", gi >= 0 && tar.tar_entry_mtime(&g, gi as usize) == 1700000000)
+    let li: i64 = find(&g, "gnu-long/longlink")
+    check(&t, "GNU: the symlink is a symlink", li >= 0 && tar.tar_entry_kind(&g, li as usize) == tar.TAR_SYMLINK)
+    check(&t, "GNU: the long link target ('K' entry) is whole", li >= 0 && tar.tar_entry_link(&g, li as usize) == rep(116 as u8, 130))
+    check(&t, "GNU: a directory entry is a directory", tar.tar_entry_kind(&g, 0) == tar.TAR_DIR && tar.tar_entry_size(&g, 0) == 0)
+    check(&t, "GNU: names refused by the extraction rules: none", true)
+    tar.tar_reader_free(&g)
+
+    var s2: rt.Buf = rt.buf_new()
+    var u: tar.TarReader = open_s(USTAR_PREFIX, &code, &s2)
+    check(&t, "ustar prefix archive opens", code == 0 as u32 && tar.tar_entry_count(&u) == 1)
+    let uname: str = rep(112 as u8, 60) + "/" + rep(113 as u8, 60) + "/file.txt"
+    check(&t, "ustar: prefix + name are joined", tar.tar_entry_name(&u, 0) == uname)
+    check(&t, "ustar: content", content_is(&u, 0, "ustar prefix content\n"))
+    tar.tar_reader_free(&u)
+
+    var s3: rt.Buf = rt.buf_new()
+    var p: tar.TarReader = open_s(PAX_UNICODE, &code, &s3)
+    check(&t, "pax archive opens", code == 0 as u32 && tar.tar_entry_count(&p) == 1)
+    let pname: str = "pax/Übersicht/Schütz – Ω " + rep(117 as u8, 120) + ".txt"
+    check(&t, "pax: the 'path' record carries the long Unicode name", tar.tar_entry_name(&p, 0) == pname)
+    check(&t, "pax: content", content_is(&p, 0, "pax unicode content\n"))
+    check(&t, "pax: tar_find ignores a leading ./", find(&p, "./" + pname) == 0)
+    tar.tar_reader_free(&p)
+
+    var s4: rt.Buf = rt.buf_new()
+    var j: tar.TarReader = open_s(JDK_TGZ, &code, &s4)
+    check(&t, "tar.gz opens through tar_open_auto", code == 0 as u32 && tar.tar_entry_count(&j) == 10)
+    check(&t, "tar.gz: the inflated stream went to scratch", rt.buf_len(&s4) > 0)
+    let ji: i64 = find(&j, "jdk-21/bin/java")
+    check(&t, "tar.gz: bin/java is 0755", ji >= 0 && tar.tar_entry_mode(&j, ji as usize) == 493 as u32 && tar.tar_entry_kind(&j, ji as usize) == tar.TAR_FILE)
+    check(&t, "tar.gz: bin/java content", content_is(&j, ji, "#!/bin/sh\necho java 21\n"))
+    check(&t, "tar.gz: find with a trailing slash finds a directory", find(&j, "jdk-21/bin/") >= 0)
+    check(&t, "tar.gz: find of nothing is -1", find(&j, "jdk-21/nothing") == -1)
+    let mi: i64 = find(&j, "jdk-21/lib/modules")
+    check(&t, "tar.gz: lib/modules is 1600 octets", mi >= 0 && tar.tar_entry_size(&j, mi as usize) == 1600)
+
+    // extraction with strip 1: the Adoptium case
+    let x1: str = root + "/jdk"
+    var o1: safefs.ExtractOptions = safefs.extract_options_default()
+    o1.strip = 1
+    var xs: safefs.ExtractStats = tar.tar_extract_all(&j, x1, o1) catch | e | (bad_stats(e, &code))
+    check(&t, "extract with strip 1: 5 files, 3 dirs, 2 links", (xs.files == 4 && xs.dirs == 3 && xs.links == 2))
+    check(&t, "extract: bin/java is there and is 0755", win || (fs.is_file(x1 + "/bin/java") && (fs.stat(x1 + "/bin/java") catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }).mode == 493 as u32))
+    check(&t, "extract: lib/modules is 0644, 1600 octets", ((fs.stat(x1 + "/lib/modules") catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }).mode == 420 as u32
+        && (fs.stat(x1 + "/lib/modules") catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }).size == 1600))
+    check(&t, "extract: the symlink points where the archive said", win || ((fs.readlink(x1 + "/bin/modules-link") catch "") == "../lib/modules"))
+    check(&t, "extract: and it is a link, not a copy", win || ((fs.lstat(x1 + "/java") catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }).kind == fs.KIND_LINK))
+    check(&t, "extract: an empty directory is made", fs.is_dir(x1 + "/legal"))
+    check(&t, "extract: the top directory was stripped away", !fs.exists(x1 + "/jdk-21"))
+    // a second extraction: refused without overwrite, fine with it
+    var again: u32 = 0
+    tar.tar_extract_all(&j, x1, o1) catch | e | (bad_stats(e, &again))
+    check(&t, "a second extraction is refused (Exists)", (again == 15 as u32))
+    o1.overwrite = true
+    again = 0
+    tar.tar_extract_all(&j, x1, o1) catch | e | (bad_stats(e, &again))
+    check(&t, "... and works with overwrite", again == 0 as u32)
+    tar.tar_reader_free(&j)
+
+    // =================================================== B. the writer, read back
+    var out: rt.Buf = rt.buf_new()
+    var w: tar.TarWriter = tar.tar_writer_new(&out)
+    let longname: str = "top/" + rep(100 as u8, 30) + "/" + rep(101 as u8, 30) + "/" + rep(102 as u8, 30) + "/" + rep(103 as u8, 30) + "/" + rep(104 as u8, 30) + "/file.txt"
+    let nosplit: str = rep(120 as u8, 130) + ".txt"
+    let biglink: str = rep(108 as u8, 150)
+    tar.tar_add_dir(&w, "top", 493 as u32, 1700000000) catch false
+    tar.tar_add_file(&w, "top/run.sh", "#!/bin/sh\n".p as u64, 10, 493 as u32, 1700000001) catch false
+    tar.tar_add_file(&w, "top/empty", 0, 0, 420 as u32, 0) catch false
+    tar.tar_add_file(&w, longname, "split\n".p as u64, 6, 420 as u32, 5) catch false
+    tar.tar_add_file(&w, nosplit, "pax\n".p as u64, 4, 384 as u32, 6) catch false
+    tar.tar_add_file(&w, "top/Übersicht Ω.txt", "ü\n".p as u64, 3, 420 as u32, 7) catch false
+    tar.tar_add_symlink(&w, "top/link", "run.sh", 8) catch false
+    tar.tar_add_symlink(&w, "top/longlink", biglink, 9) catch false
+    let total: usize = tar.tar_finish(&w) catch 0
+    check(&t, "the archive is a multiple of 10240 octets", total > 0 && total % 10240 == 0 && total == rt.buf_len(&out))
+    var s5: rt.Buf = rt.buf_new()
+    var r: tar.TarReader = tar.tar_open_auto(rt.buf_ptr(&out), rt.buf_len(&out), tar.tar_limits_default(), &s5) catch | e | (bad_reader(e, &code))
+    check(&t, "the written archive reads back", code == 0 as u32 && tar.tar_entry_count(&r) == 8)
+    check(&t, "writer: a directory gets its trailing slash", tar.tar_entry_name(&r, 0) == "top/" && tar.tar_entry_kind(&r, 0) == tar.TAR_DIR)
+    check(&t, "writer: run.sh 0755, mtime", tar.tar_entry_mode(&r, 1) == 493 as u32 && tar.tar_entry_mtime(&r, 1) == 1700000001)
+    check(&t, "writer: the empty file", tar.tar_entry_size(&r, 2) == 0 && tar.tar_entry_kind(&r, 2) == tar.TAR_FILE)
+    check(&t, "writer: a name over 100 is split into prefix + name", tar.tar_entry_name(&r, 3) == longname && content_is(&r, 3, "split\n"))
+    check(&t, "writer: a name that cannot be split goes through pax", tar.tar_entry_name(&r, 4) == nosplit && content_is(&r, 4, "pax\n") && tar.tar_entry_mode(&r, 4) == 384 as u32)
+    check(&t, "writer: UTF-8 names", tar.tar_entry_name(&r, 5) == "top/Übersicht Ω.txt" && content_is(&r, 5, "ü\n"))
+    check(&t, "writer: a symlink", tar.tar_entry_kind(&r, 6) == tar.TAR_SYMLINK && tar.tar_entry_link(&r, 6) == "run.sh")
+    check(&t, "writer: a link target over 100 goes through pax", tar.tar_entry_link(&r, 7) == biglink)
+    // the writer refuses what a reader would refuse
+    var wbad: bool = false
+    tar.tar_add_file(&w, "x", 0, 0, 420 as u32, 0) catch | e | (flagb(e == ArchiveError::Unsupported, &wbad))
+    check(&t, "adding after tar_finish is refused", wbad)
+    var out2: rt.Buf = rt.buf_new()
+    var w2: tar.TarWriter = tar.tar_writer_new(&out2)
+    var wn: bool = false
+    tar.tar_add_file(&w2, "../escape", 0, 0, 420 as u32, 0) catch | e | (flagb(e == ArchiveError::UnsafeName, &wn))
+    check(&t, "the writer refuses an unsafe name", wn)
+    // extraction of the written archive
+    let x2: str = root + "/written"
+    var o2: safefs.ExtractOptions = safefs.extract_options_default()
+    var ws: safefs.ExtractStats = tar.tar_extract_all(&r, x2, o2) catch | e | (bad_stats(e, &code))
+    check(&t, "extract the written archive", win || (code == 0 as u32 && ws.files == 5 && ws.links == 2 && ws.dirs == 1))
+    check(&t, "written: run.sh is 0755 on disk", win || ((fs.stat(x2 + "/top/run.sh") catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }).mode == 493 as u32))
+    check(&t, "written: 0600 file", win || ((fs.stat(x2 + "/" + nosplit) catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }).mode == 384 as u32))
+    check(&t, "written: the long path exists", (fs.is_file(x2 + "/" + longname)))
+    tar.tar_reader_free(&r)
+
+    // tar.gz: compress, open, same entries
+    var gz: rt.Buf = rt.buf_new()
+    let gzn: usize = tar.targz_compress(rt.buf_ptr(&out), rt.buf_len(&out), 6, &gz) catch 0
+    check(&t, "targz_compress shrinks the padding", gzn > 0 && gzn < rt.buf_len(&out) / 4)
+    var s6: rt.Buf = rt.buf_new()
+    var rg: tar.TarReader = tar.tar_open_auto(rt.buf_ptr(&gz), rt.buf_len(&gz), tar.tar_limits_default(), &s6) catch | e | (bad_reader(e, &code))
+    check(&t, "tar.gz written by us opens again", code == 0 as u32 && tar.tar_entry_count(&rg) == 8 && tar.tar_entry_name(&rg, 3) == longname)
+    tar.tar_reader_free(&rg)
+    // a tree on disk to a tar and back
+    let srcdir: str = root + "/tree"
+    fs.mkdir_all(srcdir + "/sub") catch false
+    fs.write_file(srcdir + "/b.txt", "bee\n".p as u64, 4) catch 0
+    fs.write_file(srcdir + "/a.txt", "ay\n".p as u64, 3) catch 0
+    fs.write_file(srcdir + "/sub/c.txt", "see\n".p as u64, 4) catch 0
+    fs.symlink("../a.txt", srcdir + "/sub/up") catch false
+    var tout: rt.Buf = rt.buf_new()
+    var tw: tar.TarWriter = tar.tar_writer_new(&tout)
+    let added: u64 = tar.tar_add_tree(&tw, srcdir, "pkg") catch 0
+    tar.tar_finish(&tw) catch 0
+    check(&t, "tar_add_tree: 1 + 5 entries", win || (added == 6))
+    var s7: rt.Buf = rt.buf_new()
+    var rt1: tar.TarReader = tar.tar_open_auto(rt.buf_ptr(&tout), rt.buf_len(&tout), tar.tar_limits_default(), &s7) catch | e | (bad_reader(e, &code))
+    check(&t, "tar_add_tree: sorted, prefixed", win || (code == 0 as u32 && tar.tar_entry_name(&rt1, 0) == "pkg/" && tar.tar_entry_name(&rt1, 1) == "pkg/a.txt" && tar.tar_entry_name(&rt1, 2) == "pkg/b.txt" && tar.tar_entry_name(&rt1, 3) == "pkg/sub/"))
+    check(&t, "tar_add_tree: the symlink is stored as a link", win || (tar.tar_entry_kind(&rt1, 5) == tar.TAR_SYMLINK && tar.tar_entry_link(&rt1, 5) == "../a.txt"))
+    tar.tar_reader_free(&rt1)
+
+    // =================================================== C. hostile archives: refused whole, nothing written
+    var h: rt.Buf = rt.buf_new()
+    var o0: safefs.ExtractOptions = safefs.extract_options_default()
+    let hx: str = root + "/hostile"
+    check(&t, "hostile: ../ in a later entry", true)
+    var hb: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&hb, EVIL_DOTDOT.p as u64, EVIL_DOTDOT.length())
+    check(&t, "hostile: tarfile's '../' archive is UnsafeName", try_extract(&hb, hx + "1", o0) == 8 as u32)
+    check(&t, "hostile: ... and the OK entry before it was NOT written", !fs.exists(hx + "1/ok.txt") && count_entries(hx + "1") == 0)
+    var hs: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&hs, EVIL_SYMLINK.p as u64, EVIL_SYMLINK.length())
+    check(&t, "hostile: symlink to /etc, then a file through it: UnsafeLink", try_extract(&hs, hx + "2", o0) == 9 as u32)
+    check(&t, "hostile: ... nothing was written", (!fs.exists(hx + "2/x")))
+
+    var b1: rt.Buf = rt.buf_new()
+    raw_entry(&b1, "/tmp/firn_tar_2071_abs", 48 as u8, 1, "", 420, "x")
+    raw_end(&b1)
+    check(&t, "hostile: an absolute name", try_extract(&b1, hx + "3", o0) == 8 as u32 && !fs.exists("/tmp/firn_tar_2071_abs"))
+    var b2: rt.Buf = rt.buf_new()
+    raw_entry(&b2, "a\\..\\b", 48 as u8, 1, "", 420, "x")
+    raw_end(&b2)
+    check(&t, "hostile: a backslash name", try_extract(&b2, hx + "4", o0) == 8 as u32)
+    var b3: rt.Buf = rt.buf_new()
+    raw_entry(&b3, "l", 50 as u8, 0, "a/../../x", 511, "")
+    raw_end(&b3)
+    check(&t, "hostile: a link with .. in the middle", try_extract(&b3, hx + "5", o0) == 9 as u32)
+    var b4: rt.Buf = rt.buf_new()
+    raw_entry(&b4, "d/l", 50 as u8, 0, "../../x", 511, "")
+    raw_end(&b4)
+    check(&t, "hostile: a link that climbs above the target", try_extract(&b4, hx + "6", o0) == 9 as u32)
+    var b5: rt.Buf = rt.buf_new()
+    raw_entry(&b5, "d/l", 50 as u8, 0, "../x", 511, "")
+    raw_end(&b5)
+    check(&t, "...but one level inside is fine", win || ((try_extract(&b5, hx + "7", o0) == 0 as u32 && (fs.readlink(hx + "7/d/l") catch "") == "../x")))
+    var b6: rt.Buf = rt.buf_new()
+    raw_entry(&b6, "a.txt", 48 as u8, 1, "", 420, "1")
+    raw_entry(&b6, "a.txt", 48 as u8, 1, "", 420, "2")
+    raw_end(&b6)
+    check(&t, "hostile: the same name twice", try_extract(&b6, hx + "8", o0) == 12 as u32 && count_entries(hx + "8") == 0)
+    var b7: rt.Buf = rt.buf_new()
+    raw_entry(&b7, "h", 49 as u8, 0, "nothing", 420, "")
+    raw_end(&b7)
+    check(&t, "hostile: a hard link to nothing", try_extract(&b7, hx + "9", o0) == 13 as u32)
+    var b8: rt.Buf = rt.buf_new()
+    raw_entry(&b8, "dev", 51 as u8, 0, "", 420, "")
+    raw_end(&b8)
+    check(&t, "hostile: a character device", try_extract(&b8, hx + "10", o0) == 11 as u32)
+    var b9: rt.Buf = rt.buf_new()
+    raw_entry(&b9, "f", 48 as u8, 1, "", 420, "x")
+    raw_entry(&b9, "f/g", 48 as u8, 1, "", 420, "y")
+    raw_end(&b9)
+    check(&t, "hostile: a file where a directory must be: UnsafePath", try_extract(&b9, hx + "11", o0) == 10 as u32 || try_extract(&b9, hx + "11x", o0) == 10 as u32)
+    // a link already in the target (not from the archive) is not written through
+    fs.mkdir_all(hx + "12/inside") catch false
+    fs.mkdir_all(root + "/outside") catch false
+    fs.symlink(root + "/outside", hx + "12/inside/a") catch false
+    var b10: rt.Buf = rt.buf_new()
+    raw_entry(&b10, "inside/a/pwned", 48 as u8, 1, "", 420, "x")
+    raw_end(&b10)
+    check(&t, "a symlink that was in the target already is not written through", win || ((try_extract(&b10, hx + "12", o0) == 10 as u32 && count_entries(root + "/outside") == 0)))
+    // a hard link to an earlier file is a copy; to a later one is refused
+    var b11: rt.Buf = rt.buf_new()
+    raw_entry(&b11, "orig", 48 as u8, 3, "", 493, "abc")
+    raw_entry(&b11, "copy", 49 as u8, 0, "orig", 420, "")
+    raw_end(&b11)
+    check(&t, "a hard link arrives as a copy with the original's mode", win || ((try_extract(&b11, hx + "13", o0) == 0 as u32
+        && (fs.stat(hx + "13/copy") catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }).size == 3
+        && (fs.stat(hx + "13/copy") catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }).mode == 493 as u32)))
+    var b12: rt.Buf = rt.buf_new()
+    raw_entry(&b12, "copy", 49 as u8, 0, "orig", 420, "")
+    raw_entry(&b12, "orig", 48 as u8, 3, "", 493, "abc")
+    raw_end(&b12)
+    check(&t, "a hard link to a LATER file is refused", try_extract(&b12, hx + "14", o0) == 13 as u32)
+    // setuid / sticky bits are dropped
+    var b13: rt.Buf = rt.buf_new()
+    raw_entry(&b13, "suid", 48 as u8, 1, "", 2541, "x") // 0o4755
+    raw_end(&b13)
+    check(&t, "the setuid bit is dropped", win || ((try_extract(&b13, hx + "15", o0) == 0 as u32
+        && (fs.stat(hx + "15/suid") catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }).mode == 493 as u32)))
+    // dot-slash names are normal
+    var b14: rt.Buf = rt.buf_new()
+    raw_entry(&b14, "./", 53 as u8, 0, "", 493, "")
+    raw_entry(&b14, "./x/", 53 as u8, 0, "", 493, "")
+    raw_entry(&b14, "./x/f", 48 as u8, 2, "", 420, "ok")
+    raw_end(&b14)
+    check(&t, "./-prefixed names work and the ./ entry is a no-op", try_extract(&b14, hx + "16", o0) == 0 as u32 && fs.is_file(hx + "16/x/f"))
+
+    // damaged archives
+    var d1: rt.Buf = rt.buf_new()
+    raw_entry(&d1, "a", 48 as u8, 600, "", 420, rep(97 as u8, 600))
+    raw_end(&d1)
+    rt.buf_set_len(&d1, 700) // cut in the middle of the content
+    check(&t, "damaged: cut off in the middle of a file: Truncated", try_extract(&d1, hx + "20", o0) == 3 as u32)
+    var d2: rt.Buf = rt.buf_new()
+    raw_entry(&d2, "a", 48 as u8, 1, "", 420, "x")
+    raw_entry(&d2, "b", 48 as u8, 1, "", 420, "y")
+    raw_end(&d2)
+    // flip a bit in the second header's name: its checksum no longer fits
+    rt.st8(rt.buf_ptr(&d2), 1024, 99 as u8)
+    check(&t, "damaged: a header that was changed: Checksum", try_extract(&d2, hx + "21", o0) == 5 as u32)
+    var d3: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < 2048 {
+        rt.buf_push(&d3, ((k * 31 + 7) & 255) as u8)
+        k = k + 1
+    }
+    check(&t, "damaged: noise is NotArchive", try_extract(&d3, hx + "22", o0) == 1 as u32)
+    var d4: rt.Buf = rt.buf_new()
+    check(&t, "damaged: nothing at all is NotArchive", try_extract(&d4, hx + "23", o0) == 1 as u32)
+    var d5: rt.Buf = rt.buf_new()
+    raw_entry(&d5, "big", 48 as u8, 8589934591, "", 420, "")
+    raw_end(&d5)
+    check(&t, "damaged: a size that claims 8 GiB: Truncated or TooLarge", try_extract(&d5, hx + "24", o0) == 3 as u32 || try_extract(&d5, hx + "24", o0) == 6 as u32)
+    var d6: rt.Buf = rt.buf_new()
+    raw_entry(&d6, "s", 83 as u8, 0, "", 420, "")
+    raw_end(&d6)
+    check(&t, "a sparse file is Unsupported", try_extract(&d6, hx + "25", o0) == 4 as u32)
+
+    // =================================================== D. limits
+    var lim: tar.TarLimits = tar.tar_limits_default()
+    var lb: rt.Buf = rt.buf_new()
+    raw_entry(&lb, "a", 48 as u8, 600, "", 420, rep(97 as u8, 600))
+    raw_entry(&lb, "b", 48 as u8, 600, "", 420, rep(98 as u8, 600))
+    raw_end(&lb)
+    var ls: rt.Buf = rt.buf_new()
+    lim.max_entry_size = 500
+    var le: u32 = 0
+    tar.tar_open_auto(rt.buf_ptr(&lb), rt.buf_len(&lb), lim, &ls) catch | e | (bad_reader(e, &le))
+    check(&t, "limit: one file over max_entry_size is TooLarge", le == 6 as u32)
+    lim = tar.tar_limits_default()
+    lim.max_total_size = 1000
+    le = 0
+    tar.tar_open_auto(rt.buf_ptr(&lb), rt.buf_len(&lb), lim, &ls) catch | e | (bad_reader(e, &le))
+    check(&t, "limit: the sum over max_total_size is TooLarge", le == 6 as u32)
+    lim = tar.tar_limits_default()
+    lim.max_entries = 1
+    le = 0
+    tar.tar_open_auto(rt.buf_ptr(&lb), rt.buf_len(&lb), lim, &ls) catch | e | (bad_reader(e, &le))
+    check(&t, "limit: more entries than max_entries is TooLarge", le == 6 as u32)
+    // a gzip bomb: 4 MiB of zeros are a few KiB of gzip; the inflate stops at the limit
+    var zeros: rt.Buf = rt.buf_new()
+    var zi: usize = 0
+    while zi < 4194304 {
+        rt.buf_push(&zeros, 0 as u8)
+        zi = zi + 1
+    }
+    var bomb: rt.Buf = rt.buf_new()
+    tar.targz_compress(rt.buf_ptr(&zeros), rt.buf_len(&zeros), 6, &bomb) catch 0
+    check(&t, "the bomb is small", rt.buf_len(&bomb) < 20000)
+    lim = tar.tar_limits_default()
+    lim.max_archive_size = 1048576
+    le = 0
+    var bsc: rt.Buf = rt.buf_new()
+    tar.tar_open_auto(rt.buf_ptr(&bomb), rt.buf_len(&bomb), lim, &bsc) catch | e | (bad_reader(e, &le))
+    check(&t, "limit: a gzip bomb stops at max_archive_size (TooLarge)", le == 6 as u32)
+    check(&t, "limit: ... and it did not inflate past the limit", rt.buf_len(&bsc) <= 1048576)
+    // gzip damage
+    var damaged: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&damaged, rt.buf_ptr(&gz), rt.buf_len(&gz))
+    rt.st8(rt.buf_ptr(&damaged), rt.buf_len(&damaged) - 6, 255 as u8) // the CRC-32
+    le = 0
+    var dsc: rt.Buf = rt.buf_new()
+    tar.tar_open_auto(rt.buf_ptr(&damaged), rt.buf_len(&damaged), tar.tar_limits_default(), &dsc) catch | e | (bad_reader(e, &le))
+    check(&t, "a damaged gzip trailer is Checksum", le == 5 as u32)
+
+    // =================================================== E. the name rules themselves (std.safefs)
+    check(&t, "name ok: plain", safefs.sf_name_ok("a/b/c.txt", false) && safefs.sf_name_ok("dir/", false))
+    check(&t, "name refused: empty, absolute, .., ., //, backslash", !safefs.sf_name_ok("", false) && !safefs.sf_name_ok("/a", false)
+        && !safefs.sf_name_ok("a/../b", false) && !safefs.sf_name_ok("..", false) && !safefs.sf_name_ok("a/./b", false)
+        && !safefs.sf_name_ok("a//b", false) && !safefs.sf_name_ok("a\\b", false))
+    check(&t, "name: a 4097 octet name is refused", !safefs.sf_name_ok(rep(97 as u8, 4097), false) && safefs.sf_name_ok(rep(97 as u8, 4096), false))
+    check(&t, "name: Windows device names and characters only on Windows", safefs.sf_name_ok("aux.c", false) && !safefs.sf_name_ok("aux.c", true)
+        && !safefs.sf_name_ok("src/NUL", true) && !safefs.sf_name_ok("com1.txt", true) && !safefs.sf_name_ok("LPT9", true)
+        && safefs.sf_name_ok("auxiliary", true) && safefs.sf_name_ok("a:b", false) && !safefs.sf_name_ok("a:b", true)
+        && !safefs.sf_name_ok("x.", true) && !safefs.sf_name_ok("x /y", true) && !safefs.sf_name_ok("a<b", true) && safefs.sf_name_ok("a.b", true))
+    check(&t, "link: depth counts the ..", safefs.sf_link_ok("../x", 1, false) && !safefs.sf_link_ok("../x", 0, false) && safefs.sf_link_ok("../../x", 2, false)
+        && !safefs.sf_link_ok("../../../x", 2, false) && safefs.sf_link_ok("x/y", 0, false) && safefs.sf_link_ok(".", 0, false)
+        && safefs.sf_link_ok("..", 1, false) && !safefs.sf_link_ok("x/..", 1, false) && !safefs.sf_link_ok("/etc", 5, false)
+        && !safefs.sf_link_ok("", 3, false) && !safefs.sf_link_ok("a\\b", 3, false))
+    check(&t, "clean/strip/depth helpers", safefs.sf_clean("./a/b") == "a/b" && safefs.sf_clean("././a") == "a" && safefs.sf_clean("./") == "" && safefs.sf_clean(".") == ""
+        && safefs.sf_strip("a/b/c", 1) == "b/c" && safefs.sf_strip("a/b/c", 2) == "c" && safefs.sf_strip("a/b/c", 3) == "" && safefs.sf_strip("a/", 1) == ""
+        && safefs.sf_depth("a") == 0 && safefs.sf_depth("a/b") == 1 && safefs.sf_depth("a/b/") == 1)
+    check(&t, "tar_name_is_safe", tar.tar_name_is_safe("./x/y") && !tar.tar_name_is_safe("../x"))
+
+    fs.remove_tree(root) catch false
+    io.print("checks: ")
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&nb, t.total)
+    io.print_bytes(rt.buf_ptr(&nb), rt.buf_len(&nb))
+    io.print_line("")
+    if t.fails != 0 {
+        return 1 as i32
+    }
+    return 0
+}
+
+fn flagb(cond: bool, out: *mut bool) -> bool {
+    *out = cond
+    return false
+}

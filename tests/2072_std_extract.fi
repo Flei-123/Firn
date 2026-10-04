@@ -1,0 +1,206 @@
+// expect_exit: 0
+// tests/2072_std_extract.fi -- std.extract: one call unpacks .zip and .tar.gz,
+// the format found by content; modes, links, strip, refusals.
+//
+// jdk.zip (Info-ZIP) and jdk.tar.gz (GNU tar) hold the SAME miniature JDK
+// (tests/data/archives, made by tools/stdarchive/gen_fixtures.py), so the two
+// extractions must give the same tree. slip.zip is a "zip slip" archive.
+import std.extract
+import std.safefs
+import std.tar
+import std.fs
+import std.dir
+import std.rt
+import std.osinfo
+import std.io
+import std.str
+
+const JDK_ZIP: str = __include_str("data/archives/jdk.zip")
+const JDK_TGZ: str = __include_str("data/archives/jdk.tar.gz")
+const SLIP_ZIP: str = __include_str("data/archives/slip.zip")
+const GNU_LONG: str = __include_str("data/archives/gnu_long.tar")
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+fn scratch() -> str {
+    var b: rt.Buf = rt.buf_new()
+    let head: str = "/tmp/firn_extract_2072_"
+    rt.buf_push_bytes(&b, head.p as u64, head.length())
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn count_entries(path: str) -> usize {
+    var n: usize = 0
+    var d: dir.Dir = dir.open(path)
+    while dir.next(&d) {
+        n = n + 1
+    }
+    dir.close(&d)
+    return n
+}
+
+fn err_code(e: ArchiveError) -> u32 {
+    if e == ArchiveError::NotArchive { return 1 as u32 }
+    if e == ArchiveError::Corrupt { return 2 as u32 }
+    if e == ArchiveError::TooLarge { return 6 as u32 }
+    if e == ArchiveError::UnsafeName { return 8 as u32 }
+    if e == ArchiveError::UnsafeLink { return 9 as u32 }
+    if e == ArchiveError::NotFound { return 14 as u32 }
+    if e == ArchiveError::Exists { return 15 as u32 }
+    return 99 as u32
+}
+
+fn bad_stats(e: ArchiveError, code: *mut u32) -> safefs.ExtractStats {
+    *code = err_code(e)
+    return safefs.ExtractStats { files: 0, dirs: 0, links: 0, bytes: 0 }
+}
+
+fn info(path: str) -> fs.FileInfo {
+    return fs.lstat(path) catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+}
+
+fn mem(s: str, dest: str, o: safefs.ExtractOptions, code: *mut u32) -> safefs.ExtractStats {
+    *code = 0 as u32
+    return extract.extract_memory(s.p as u64, s.length(), "", dest, o, tar.tar_limits_default()) catch | e | (bad_stats(e, code))
+}
+
+fn same_file(a: str, b: str) -> bool {
+    var x: rt.Buf = rt.buf_new()
+    var y: rt.Buf = rt.buf_new()
+    fs.read_file(a, &x) catch 0
+    fs.read_file(b, &y) catch 0
+    let ok: bool = rt.buf_len(&x) == rt.buf_len(&y) && rt.mem_eq(rt.buf_ptr(&x), rt.buf_ptr(&y), rt.buf_len(&x))
+    rt.buf_free(&x)
+    rt.buf_free(&y)
+    return ok
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let win: bool = osinfo.is_windows()
+    let root: str = scratch()
+    fs.remove_tree(root) catch false
+    fs.mkdir_all(root) catch false
+    var code: u32 = 0
+
+    // --- A. the format is found by content
+    check(&t, "detect: zip", extract.detect_format(JDK_ZIP.p as u64, JDK_ZIP.length(), "whatever") == extract.FORMAT_ZIP)
+    check(&t, "detect: tar.gz", extract.detect_format(JDK_TGZ.p as u64, JDK_TGZ.length(), "x.zip") == extract.FORMAT_TARGZ)
+    check(&t, "detect: tar (GNU magic)", extract.detect_format(GNU_LONG.p as u64, GNU_LONG.length(), "") == extract.FORMAT_TAR)
+    var noise: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 2000 {
+        rt.buf_push(&noise, ((i * 13 + 5) & 255) as u8)
+        i = i + 1
+    }
+    check(&t, "detect: noise is unknown", extract.detect_format(rt.buf_ptr(&noise), rt.buf_len(&noise), "a.zip") == extract.FORMAT_UNKNOWN)
+    var emptyzip: [u8; 22] = [80, 75, 5, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    check(&t, "detect: an empty zip (PK 5 6)", extract.detect_format((&emptyzip[0]) as u64, 22, "") == extract.FORMAT_ZIP)
+
+    // --- B. both archives hold the same JDK; strip 1 is the Adoptium case
+    var o: safefs.ExtractOptions = safefs.extract_options_default()
+    o.strip = 1
+    let dz: str = root + "/from-zip"
+    let dt: str = root + "/from-tgz"
+    let sz: safefs.ExtractStats = mem(JDK_ZIP, dz, o, &code)
+    check(&t, "zip: extracted", code == 0 as u32)
+    check(&t, "zip: 4 files, 3 dirs, 2 links", sz.files == 4 && sz.dirs == 3 && sz.links == 2)
+    let st: safefs.ExtractStats = mem(JDK_TGZ, dt, o, &code)
+    check(&t, "tar.gz: extracted", code == 0 as u32)
+    check(&t, "tar.gz: 4 files, 3 dirs, 2 links", st.files == 4 && st.dirs == 3 && st.links == 2)
+    check(&t, "same byte count", sz.bytes == st.bytes && sz.bytes == 23 + 23 + 1600 + 22)
+    var pairs: [str; 4] = ["bin/java", "bin/keytool", "lib/modules", "release"]
+    var k: usize = 0
+    while k < 4 {
+        check(&t, "same content: " + pairs[k], same_file(dz + "/" + pairs[k], dt + "/" + pairs[k]) && fs.is_file(dz + "/" + pairs[k]))
+        check(&t, "same mode: " + pairs[k], win || info(dz + "/" + pairs[k]).mode == info(dt + "/" + pairs[k]).mode)
+        k = k + 1
+    }
+    check(&t, "zip: bin/java is executable (0755) -- a Unix zip keeps the mode", win || (info(dz + "/bin/java").mode == 493 as u32))
+    check(&t, "tar.gz: bin/java is executable (0755)", win || (info(dt + "/bin/java").mode == 493 as u32))
+    check(&t, "zip: lib/modules is 0644", win || (info(dz + "/lib/modules").mode == 420 as u32))
+    check(&t, "zip: the symlink is a link to ../lib/modules", win || (info(dz + "/bin/modules-link").kind == fs.KIND_LINK && (fs.readlink(dz + "/bin/modules-link") catch "") == "../lib/modules"))
+    check(&t, "tar.gz: the symlink is a link to ../lib/modules", win || (info(dt + "/bin/modules-link").kind == fs.KIND_LINK && (fs.readlink(dt + "/bin/modules-link") catch "") == "../lib/modules"))
+    check(&t, "zip: java -> bin/java", win || ((fs.readlink(dz + "/java") catch "") == "bin/java"))
+    check(&t, "the empty dir legal/ exists in both", fs.is_dir(dz + "/legal") && fs.is_dir(dt + "/legal"))
+    check(&t, "no jdk-21 directory was made (stripped)", !fs.exists(dz + "/jdk-21") && !fs.exists(dt + "/jdk-21"))
+    check(&t, "the same top-level entries", win || (count_entries(dz) == count_entries(dt) && count_entries(dz) == 5))
+
+    // --- C. without strip the top directory stays
+    let d0: str = root + "/nostrip"
+    mem(JDK_ZIP, d0, safefs.extract_options_default(), &code)
+    check(&t, "without strip: jdk-21/bin/java", code == 0 as u32 && fs.is_file(d0 + "/jdk-21/bin/java"))
+
+    // --- D. from a file on disk, by the path
+    let fz: str = root + "/download.zip"
+    fs.write_file(fz, JDK_ZIP.p as u64, JDK_ZIP.length()) catch 0
+    code = 0
+    let ds: str = root + "/via-file"
+    let r: safefs.ExtractStats = extract.extract_archive(fz, ds) catch | e | (bad_stats(e, &code))
+    check(&t, "extract_archive(path, dest)", code == 0 as u32 && r.files == 4 && fs.is_file(ds + "/jdk-21/lib/modules"))
+    // a tar.gz that is called .zip is unpacked as what it is
+    let fd: str = root + "/disguised.zip"
+    fs.write_file(fd, JDK_TGZ.p as u64, JDK_TGZ.length()) catch 0
+    code = 0
+    let r2: safefs.ExtractStats = extract.extract_archive(fd, root + "/disguised") catch | e | (bad_stats(e, &code))
+    check(&t, "format by content: tar.gz named .zip", code == 0 as u32 && r2.files == 4)
+    // a missing file, a file that is no archive
+    code = 0
+    extract.extract_archive(root + "/nothing.zip", root + "/n1") catch | e | (bad_stats(e, &code))
+    check(&t, "a missing archive is NotFound", code == 14 as u32)
+    let ft: str = root + "/text.zip"
+    fs.write_file(ft, "this is not an archive at all\n".p as u64, 30) catch 0
+    code = 0
+    extract.extract_archive(ft, root + "/n2") catch | e | (bad_stats(e, &code))
+    check(&t, "a text file is NotArchive", code == 1 as u32)
+
+    // --- E. refusals, nothing written
+    code = 0
+    mem(SLIP_ZIP, root + "/slip", safefs.extract_options_default(), &code)
+    check(&t, "zip slip: UnsafeName", code == 8 as u32)
+    check(&t, "zip slip: nothing written (the ok.txt before ../evil.txt neither)", !fs.exists(root + "/slip/ok.txt") && !fs.exists(root + "/evil.txt"))
+    // a second extraction into the same directory
+    code = 0
+    mem(JDK_ZIP, dz, o, &code)
+    check(&t, "zip into an occupied directory: Exists", code == 15 as u32)
+    o.overwrite = true
+    code = 0
+    mem(JDK_ZIP, dz, o, &code)
+    check(&t, "... with overwrite it works", code == 0 as u32)
+    // limits reach the zip reader
+    var lim: tar.TarLimits = tar.tar_limits_default()
+    lim.max_entry_size = 100
+    code = 0
+    extract.extract_memory(JDK_ZIP.p as u64, JDK_ZIP.length(), "", root + "/lim", safefs.extract_options_default(), lim) catch | e | (bad_stats(e, &code))
+    check(&t, "limits: a zip entry over max_entry_size is TooLarge", code == 6 as u32)
+    code = 0
+    extract.extract_memory(JDK_TGZ.p as u64, JDK_TGZ.length(), "", root + "/lim2", safefs.extract_options_default(), lim) catch | e | (bad_stats(e, &code))
+    check(&t, "limits: and a tar entry too", code == 6 as u32)
+    check(&t, "limits: nothing was written", !fs.exists(root + "/lim") && !fs.exists(root + "/lim2"))
+
+    fs.remove_tree(root) catch false
+    io.print("checks: ")
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&nb, t.total)
+    io.print_bytes(rt.buf_ptr(&nb), rt.buf_len(&nb))
+    io.print_line("")
+    if t.fails != 0 {
+        return 1 as i32
+    }
+    return 0
+}
