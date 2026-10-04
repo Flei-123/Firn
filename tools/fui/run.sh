@@ -729,6 +729,12 @@ ungenutzt=0
 for f in lib/fui/*.fi; do
     for mod in $(sed -n 's/^import [a-z0-9_]*\.\([a-z0-9_]*\)[[:space:]]*$/\1/p' \
         "$f"); do
+        # std.vec is used through its GENERIC names (`Vec[T]`, `vec_push[T]`):
+        # Firn cannot qualify a generic with its module, so no "vec." can stand
+        if [ "$mod" = "vec" ] && grep -v -e '^[[:space:]]*//' -e '^import ' "$f" \
+            | grep -q 'Vec\['; then
+            continue
+        fi
         if ! grep -v -e '^[[:space:]]*//' -e '^import ' "$f" \
             | grep -q "$mod\.[A-Za-z]"; then
             echo "  $f: import ...$mod, aber kein \"$mod.\" im Modul --"
