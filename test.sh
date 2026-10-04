@@ -1554,7 +1554,7 @@ if [ "$SARC" -eq 0 ]; then
 else
     bad "tools/stdarchive/run.sh failed (see .test-work/stdarchive.log)"
     grep -E 'FAIL|Traceback|Error' "$WORK/stdarchive.log" | head -12 | sed 's/^/   /'
-echo "== 74. DNS resolver and https by name (tools/dns/run.sh, round DNS) =="
+echo "== 75. DNS resolver and https by name (tools/dns/run.sh, round DNS) =="
 # lib/net/dns.fi against a fake DNS server in Python (what the server saw is
 # counted from its log), against the real network when there is one, https by
 # name against a hermetic Python TLS server (counter-checks: no roots, other
