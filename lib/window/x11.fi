@@ -101,7 +101,7 @@ export {
     r_notify, r_stay_alive, r_in_front,
     r_notify_at, r_notify_shown, r_notify_cancel,
     r_pick_image, r_pick_poll, r_pick_take, r_image_decode,
-    r_clip_set, r_clip_get, r_clip_types, r_clip_clear, r_event_fd,
+    r_clip_set, r_clip_get, r_clip_types, r_clip_clear, r_event_fd, r_drop_accept, r_drop_take,
     // fUi tempo, stage 2b: THE GPU (only Android has it so far)
     r_gpu_open, r_gpu_swap, r_gpu_close, r_gpu_place, r_gpu_lost,
     r_dragging,
@@ -231,6 +231,27 @@ struct Platte {
     clip_atom: [u32; 8],
     clip_mime: [str; 8],
     clip_data: [rt.Buf; 8],
+    // FILES DROPPED ON THE WINDOW (desktop round): XDND, version 5. The atoms,
+    // whether the program accepts drops, the drag in progress (source window,
+    // protocol version, does it offer text/uri-list), the paths received.
+    a_xaware: u32,
+    a_xenter: u32,
+    a_xpos: u32,
+    a_xstatus: u32,
+    a_xleave: u32,
+    a_xdrop: u32,
+    a_xfin: u32,
+    a_xsel: u32,
+    a_xtypes: u32,
+    a_xcopy: u32,
+    a_urilist: u32,
+    a_xprop: u32,
+    dnd_on: bool,
+    dnd_src: u32,
+    dnd_ver: u32,
+    dnd_ok: bool,
+    drop: rt.Buf,
+    drop_n: usize,
 }
 
 fn surface_new() -> Platte {
@@ -243,6 +264,9 @@ fn surface_new() -> Platte {
         clip_own: false, mask: 0, prop_events: false, incr_win: [0 as u32; 4], incr_prop: [0 as u32; 4],
         incr_type: [0 as u32; 4], incr_slot: [0 as u32; 4], incr_off: [0; 4], incr_on: [false; 4], clip_n: 0, clip_atom: [0 as u32; 8], clip_mime: ["", "", "", "", "", "", "", ""],
         clip_data: [rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new(), rt.buf_new()],
+        a_xaware: 0, a_xenter: 0, a_xpos: 0, a_xstatus: 0, a_xleave: 0, a_xdrop: 0, a_xfin: 0, a_xsel: 0,
+        a_xtypes: 0, a_xcopy: 0, a_urilist: 0, a_xprop: 0, dnd_on: false, dnd_src: 0, dnd_ver: 0, dnd_ok: false,
+        drop: rt.buf_new(), drop_n: 0,
         a_protocols: 0, a_delete: 0, dpi: 96, dark: false,
         dark_known: false, dark_us: 0, inj: 0, gift: 0, fail: 0,
         spos: 0, ein_n: 0, ein_hook: in_nothing, ein_ud: 0,
@@ -1663,6 +1687,19 @@ fn fetch_atoms(x: *mut Platte) {
     (*x).a_plain = atom_str(x, "text/plain;charset=utf-8")
     (*x).a_firn = atom_str(x, "FIRN_CLIPBOARD")
     (*x).a_incr = atom_str(x, "INCR")
+    // XDND
+    (*x).a_xaware = atom_str(x, "XdndAware")
+    (*x).a_xenter = atom_str(x, "XdndEnter")
+    (*x).a_xpos = atom_str(x, "XdndPosition")
+    (*x).a_xstatus = atom_str(x, "XdndStatus")
+    (*x).a_xleave = atom_str(x, "XdndLeave")
+    (*x).a_xdrop = atom_str(x, "XdndDrop")
+    (*x).a_xfin = atom_str(x, "XdndFinished")
+    (*x).a_xsel = atom_str(x, "XdndSelection")
+    (*x).a_xtypes = atom_str(x, "XdndTypeList")
+    (*x).a_xcopy = atom_str(x, "XdndActionCopy")
+    (*x).a_urilist = atom_str(x, "text/uri-list")
+    (*x).a_xprop = atom_str(x, "FIRN_XDND")
 }
 
 fn atom_str(x: *mut Platte, s: str) -> u32 {
@@ -2503,6 +2540,23 @@ fn r_next(x: *mut Platte, k: *mut u32, a: *mut u32, ox: *mut u32,
         // `want` may just have moved the buffer -- the place is
         // therefore determined AFRESH and not taken from `p` above.
         // Replies (1) and errors (0) are not events.
+        if code == 33 as u8 { // ClientMessage: XDND, or WM_DELETE_WINDOW further down
+            let q: u64 = (*x).rb.ptr + ((*x).rpos - consume) as u64
+            var ev: [u8; 32] = [0 as u8; 32]
+            rt.mem_copy((&ev[0]) as u64, q, 32)
+            let xr: u32 = xdnd_message(x, (&ev[0]) as u64)
+            if xr == 1 as u32 {
+                continue
+            }
+            if xr == 2 as u32 {
+                *k = window.EV_DROP
+                *a = (*x).drop_n as u32
+                *ox = 0 as u32
+                *oy = 0 as u32
+                *os = 0 as u32
+                return true
+            }
+        }
         if code == 30 as u8 { // SelectionRequest: somebody wants our clipboard
             let q: u64 = (*x).rb.ptr + ((*x).rpos - consume) as u64
             var ev: [u8; 32] = [0 as u8; 32]
@@ -2897,6 +2951,10 @@ fn wait_record(x: *mut Platte, kind: u32, seq: u32, ms: i64, out: *mut rt.Buf) -
                     hit = true
                 }
                 if kind == 2 && code == 31 as u8 && ld32le(p, 8) == (*x).win && ld32le(p, 12) == (*x).a_clipboard {
+                    hit = true
+                }
+                // the answer to our ConvertSelection of the XDND selection
+                if kind == 6 && code == 31 as u8 && ld32le(p, 8) == (*x).win && ld32le(p, 12) == (*x).a_xsel {
                     hit = true
                 }
                 // a new value of our property (the next INCR piece)
@@ -3442,4 +3500,312 @@ fn r_event_fd(x: *mut Platte) -> i32 {
         return -1 as i32
     }
     return net.conn_fd(&(*x).c)
+}
+
+// ======================================================================
+// FILES DROPPED ON THE WINDOW -- XDND (desktop round)
+// ======================================================================
+//
+// The X Drag-and-Drop protocol, version 5, the TARGET's half. The window
+// carries the property XdndAware = 5. A source (a file manager) that finds it
+// sends client messages while the mouse moves over the window:
+//
+//   XdndEnter     a drag has come in: source window, version, the first three
+//                 types offered (more: the source's property XdndTypeList)
+//   XdndPosition  the pointer moved: answered with XdndStatus ("I accept /
+//                 I do not", and the action: copy)
+//   XdndLeave     it went away again
+//   XdndDrop      the user let go: ConvertSelection(XdndSelection, text/uri-list)
+//                 asks the source for the list, the answer arrives as
+//                 SelectionNotify and a property; then XdndFinished
+//
+// Only text/uri-list is asked for; the paths are the `file://` URIs of the
+// local machine, percent-decoded (a file:// with another host name is not a
+// local file and is skipped). Others types (text, a browser's links) are not
+// accepted: the Status says no, and the pointer shows the "forbidden" cursor.
+//
+// HONEST: the list comes in ONE property; an INCR transfer (a list of many
+// thousands of files) is not handled and the drop is refused. While the list
+// is fetched the program waits at most two seconds for the source.
+
+fn send_client_message(x: *mut Platte, dest: u32, mtype: u32, d0: u32, d1: u32, d2: u32,
+    d3: u32, d4: u32) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 25 as u8) // SendEvent
+    rt.buf_push(&r, 0 as u8) // propagate: no
+    put16(&r, 11 as u32)
+    put32(&r, dest)
+    put32(&r, 0 as u32) // event mask: none (delivered to the window's creator)
+    rt.buf_push(&r, 33 as u8) // ClientMessage
+    rt.buf_push(&r, 32 as u8) // format
+    put16(&r, 0 as u32)
+    put32(&r, dest)
+    put32(&r, mtype)
+    put32(&r, d0)
+    put32(&r, d1)
+    put32(&r, d2)
+    put32(&r, d3)
+    put32(&r, d4)
+    let ok: bool = send_request(x, &r)
+    rt.buf_free(&r)
+    return ok
+}
+
+// GetProperty(20) of `prop` of ANY window; the value into `out`.
+fn get_prop_any(x: *mut Platte, win: u32, prop: u32, del: bool, out: *mut rt.Buf, typ: *mut u32) -> bool {
+    var g: rt.Buf = rt.buf_new()
+    rt.buf_push(&g, 20 as u8)
+    if del {
+        rt.buf_push(&g, 1 as u8)
+    } else {
+        rt.buf_push(&g, 0 as u8)
+    }
+    put16(&g, 6 as u32)
+    put32(&g, win)
+    put32(&g, prop)
+    put32(&g, 0 as u32) // AnyPropertyType
+    put32(&g, 0 as u32)
+    put32(&g, 65536 as u32)
+    if !send_request(x, &g) {
+        rt.buf_free(&g)
+        return false
+    }
+    rt.buf_free(&g)
+    var rep: rt.Buf = rt.buf_new()
+    if !wait_record(x, 1 as u32, (*x).seq, 2000, &rep) {
+        rt.buf_free(&rep)
+        return false
+    }
+    let rp: u64 = rt.buf_ptr(&rep)
+    let format: u32 = rt.ld8(rp, 1) as u32
+    *typ = ld32le(rp, 8)
+    var count: usize = ld32le(rp, 16) as usize
+    if format == 16 { count = count * 2 }
+    if format == 32 { count = count * 4 }
+    if 32 + count > rt.buf_len(&rep) {
+        rt.buf_free(&rep)
+        return false
+    }
+    rt.buf_push_bytes(out, rp + 32, count)
+    rt.buf_free(&rep)
+    return true
+}
+
+fn hexv(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return (c - 87 as u8) as i32
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return (c - 55 as u8) as i32
+    }
+    return -1
+}
+
+// A text/uri-list (RFC 2483: one URI per line, CRLF, `#` comments) into local
+// paths, each followed by a NUL. The answer is how many paths were taken.
+fn uris_to_paths(p: u64, n: usize, out: *mut rt.Buf) -> usize {
+    var count: usize = 0
+    var i: usize = 0
+    while i < n {
+        var j: usize = i
+        while j < n && rt.ld8(p, j) != 10 as u8 {
+            j = j + 1
+        }
+        var e: usize = j
+        if e > i && rt.ld8(p, e - 1) == 13 as u8 {
+            e = e - 1
+        }
+        let ln: str = str { p: (p + i as u64) as *mut u8, n: e - i }
+        i = j + 1
+        if ln.length() < 6 || ln.chars(0) == 35 as u8 || ln.part(0, 5) != "file:" {
+            continue
+        }
+        var at: usize = 5
+        if ln.length() >= 7 && ln.chars(5) == 47 as u8 && ln.chars(6) == 47 as u8 {
+            // file://host/path: the host must be empty or this machine
+            var h: usize = 7
+            while h < ln.length() && ln.chars(h) != 47 as u8 {
+                h = h + 1
+            }
+            let host: str = ln.part(7, h - 7)
+            if host.length() != 0 && host != "localhost" {
+                continue
+            }
+            at = h
+        }
+        if at >= ln.length() || ln.chars(at) != 47 as u8 {
+            continue
+        }
+        var path: rt.Buf = rt.buf_new()
+        var good: bool = true
+        var k: usize = at
+        while k < ln.length() {
+            let c: u8 = ln.chars(k)
+            if c == 37 as u8 && k + 2 < ln.length() + 0 && hexv(ln.chars(k + 1)) >= 0 && hexv(ln.chars(k + 2)) >= 0 {
+                let v: i32 = hexv(ln.chars(k + 1)) * 16 + hexv(ln.chars(k + 2))
+                if v == 0 {
+                    good = false
+                }
+                rt.buf_push(&path, v as u8)
+                k = k + 3
+            } else {
+                rt.buf_push(&path, c)
+                k = k + 1
+            }
+        }
+        if good && rt.buf_len(&path) > 0 {
+            rt.buf_push_bytes(out, rt.buf_ptr(&path), rt.buf_len(&path))
+            rt.buf_push(out, 0 as u8)
+            count = count + 1
+        }
+        rt.buf_free(&path)
+    }
+    return count
+}
+
+// A window of ours that takes (or no longer takes) dropped files.
+fn r_drop_accept(x: *mut Platte, on: bool) -> bool {
+    if !(*x).open || (*x).win == 0 || (*x).a_xaware == 0 {
+        return false
+    }
+    var r: rt.Buf = rt.buf_new()
+    if on {
+        var ver: [u32; 1] = [5 as u32]
+        req_change_property(&r, (*x).win, (*x).a_xaware, 4 as u32, 32 as u32, (&ver[0]) as u64, 4)
+    } else {
+        rt.buf_push(&r, 19 as u8) // DeleteProperty
+        rt.buf_push(&r, 0 as u8)
+        put16(&r, 3 as u32)
+        put32(&r, (*x).win)
+        put32(&r, (*x).a_xaware)
+    }
+    let ok: bool = send_request(x, &r)
+    rt.buf_free(&r)
+    (*x).dnd_on = on && ok
+    (*x).dnd_src = 0
+    return ok
+}
+
+// The paths of the drops since the last call: NUL terminated, appended to `out`.
+fn r_drop_take(x: *mut Platte, out: *mut rt.Buf) -> usize {
+    let n: usize = (*x).drop_n
+    if n > 0 {
+        rt.buf_push_bytes(out, rt.buf_ptr(&(*x).drop), rt.buf_len(&(*x).drop))
+    }
+    rt.buf_clear(&(*x).drop)
+    (*x).drop_n = 0
+    return n
+}
+
+// One ClientMessage (32 octets at `ev`). 0 = not an XDND message (the caller goes
+// on), 1 = taken care of, 2 = a drop arrived: its paths wait for `r_drop_take`.
+fn xdnd_message(x: *mut Platte, ev: u64) -> u32 {
+    let mt: u32 = ld32le(ev, 8)
+    if mt == 0 as u32 || (mt != (*x).a_xenter && mt != (*x).a_xpos && mt != (*x).a_xleave && mt != (*x).a_xdrop) {
+        return 0 as u32
+    }
+    if !(*x).dnd_on {
+        return 1 as u32
+    }
+    let src: u32 = ld32le(ev, 12)
+    let d1: u32 = ld32le(ev, 16)
+    let d2: u32 = ld32le(ev, 20)
+    let d3: u32 = ld32le(ev, 24)
+    let d4: u32 = ld32le(ev, 28)
+    if mt == (*x).a_xenter {
+        (*x).dnd_src = src
+        (*x).dnd_ver = d1 >> 24
+        (*x).dnd_ok = false
+        if (*x).dnd_ver > 5 as u32 {
+            (*x).dnd_ver = 5 as u32
+        }
+        // three types in the message, more in the source's XdndTypeList
+        if d2 == (*x).a_urilist || d3 == (*x).a_urilist || d4 == (*x).a_urilist {
+            (*x).dnd_ok = true
+        }
+        if (d1 & 1 as u32) != 0 as u32 && !(*x).dnd_ok {
+            var list: rt.Buf = rt.buf_new()
+            var typ: u32 = 0
+            if get_prop_any(x, src, (*x).a_xtypes, false, &list, &typ) {
+                var i: usize = 0
+                while i + 4 <= rt.buf_len(&list) {
+                    if ld32le(rt.buf_ptr(&list), i) == (*x).a_urilist {
+                        (*x).dnd_ok = true
+                    }
+                    i = i + 4
+                }
+            }
+            rt.buf_free(&list)
+        }
+        return 1 as u32
+    }
+    if mt == (*x).a_xpos {
+        var accept: bool = (*x).dnd_ok && (*x).dnd_src == src
+        var flags: u32 = 0
+        var action: u32 = 0
+        if accept {
+            flags = 1 as u32
+            action = (*x).a_xcopy
+        }
+        send_client_message(x, src, (*x).a_xstatus, (*x).win, flags, 0 as u32, 0 as u32, action)
+        return 1 as u32
+    }
+    if mt == (*x).a_xleave {
+        (*x).dnd_src = 0
+        (*x).dnd_ok = false
+        return 1 as u32
+    }
+    // XdndDrop
+    var accepted: bool = false
+    if (*x).dnd_ok && (*x).dnd_src == src {
+        var r: rt.Buf = rt.buf_new()
+        rt.buf_push(&r, 24 as u8) // ConvertSelection
+        rt.buf_push(&r, 0 as u8)
+        put16(&r, 6 as u32)
+        put32(&r, (*x).win)
+        put32(&r, (*x).a_xsel)
+        put32(&r, (*x).a_urilist)
+        put32(&r, (*x).a_xprop)
+        put32(&r, d2) // the time stamp of the drop
+        if send_request(x, &r) {
+            var nev: rt.Buf = rt.buf_new()
+            let got: bool = wait_record(x, 6 as u32, 0 as u32, 2000, &nev)
+            var prop: u32 = 0
+            if got {
+                prop = ld32le(rt.buf_ptr(&nev), 20)
+            }
+            rt.buf_free(&nev)
+            if got && prop != 0 as u32 {
+                var data: rt.Buf = rt.buf_new()
+                var typ: u32 = 0
+                if get_prop_any(x, (*x).win, (*x).a_xprop, true, &data, &typ) && typ != (*x).a_incr {
+                    let n: usize = uris_to_paths(rt.buf_ptr(&data), rt.buf_len(&data), &(*x).drop)
+                    if n > 0 {
+                        (*x).drop_n = (*x).drop_n + n
+                        accepted = true
+                    }
+                }
+                rt.buf_free(&data)
+            }
+        }
+        rt.buf_free(&r)
+    }
+    if (*x).dnd_ver >= 2 as u32 {
+        var act: u32 = 0
+        var fl: u32 = 0
+        if accepted {
+            fl = 1 as u32
+            act = (*x).a_xcopy
+        }
+        send_client_message(x, src, (*x).a_xfin, (*x).win, fl, act, 0 as u32, 0 as u32)
+    }
+    (*x).dnd_src = 0
+    (*x).dnd_ok = false
+    if accepted {
+        return 2 as u32
+    }
+    return 1 as u32
 }
