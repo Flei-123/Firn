@@ -6,7 +6,9 @@
 # and prints the CRC-32 table that tests/2080_webp.fi and tests/2081_gif.fi
 # compare against: the CRC-32 of Pillow's RGBA octets of the same file.
 import os, random, sys, zlib
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from PIL import Image, ImageDraw
+import pngmake
 repo = sys.argv[1] if len(sys.argv) > 1 else "."
 rng = random.Random(7)
 
@@ -70,6 +72,41 @@ same.save(idir + "/same.png"); same.save(idir + "/same.webp", lossless=True)
 Image.open(gd + "/pal16.gif").save(idir + "/same.gif")
 shapes(24, 16, "RGBA").save(idir + "/rgba.png")
 shapes(24, 16).quantize(16).save(idir + "/palette.png")
+
+# tests/data/png: every colour type / depth / interlace the PNG decoder takes,
+# written by pngmake.py; the expectation is computed from the samples, not by
+# a decoder. The CRC-32 table for tests/2083_png.fi is printed below.
+pdir = os.path.join(repo, "tests/data/png")
+os.makedirs(pdir, exist_ok=True)
+prng = random.Random(21)
+pal16 = [tuple(prng.randrange(256) for _ in range(3)) for _ in range(16)]
+png_cases = [
+    ("pal8_trns", 3, 8, 20, 13, False, pal16 * 4, bytes([0, 40, 128, 255, 7, 99])),
+    ("pal4_i", 3, 4, 19, 11, True, pal16, None),
+    ("pal2", 3, 2, 17, 5, False, pal16[:4], bytes([200, 100])),
+    ("pal1", 3, 1, 9, 9, False, pal16[:2], None),
+    ("grey2", 0, 2, 13, 7, False, None, None),
+    ("grey4_i", 0, 4, 21, 9, True, None, None),
+    ("grey8_key", 0, 8, 16, 8, False, None, "key"),
+    ("grey16", 0, 16, 11, 6, False, None, None),
+    ("rgb8_key", 2, 8, 14, 9, False, None, "key"),
+    ("rgb16", 2, 16, 10, 7, False, None, None),
+    ("la8", 4, 8, 12, 12, False, None, None),
+    ("la16_i", 4, 16, 9, 13, True, None, None),
+    ("rgba8_i", 6, 8, 23, 17, True, None, None),
+    ("rgba16", 6, 16, 8, 8, False, None, None),
+]
+print("-- png")
+for (name, ct, dp, w, h, il, plte, trns) in png_cases:
+    data, samples = pngmake.make(prng, ct, dp, w, h, il, plte, None if trns == "key" else trns)
+    if trns == "key":
+        nch = pngmake.CH[ct]
+        k = samples[3][2 * nch:2 * nch + nch]
+        trns = b"".join(__import__("struct").pack(">H", v) for v in k)
+        data, samples = pngmake.make(prng, ct, dp, w, h, il, plte, trns, samples)
+    open(os.path.join(pdir, name + ".png"), "wb").write(data)
+    print("%-12s %2dx%-2d ct %d depth %2d %s crc %d" % (name + ".png", w, h, ct, dp, "interlaced" if il else "          ",
+          zlib.crc32(pngmake.expect(ct, dp, w, h, samples, plte, trns))))
 
 def norm(b):
     b = bytearray(b)

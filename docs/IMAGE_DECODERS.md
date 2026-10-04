@@ -6,7 +6,7 @@ Modrinth serves mod icons as WebP (most), PNG and GIF; screenshots are PNG.
 | module | formats | API |
 |---|---|---|
 | `lib/jpeg/jpeg.fi` | JPEG | `jpeg_decode(p, n, &im)` |
-| `lib/paint/png.fi` | PNG (grey/RGB/grey+alpha/RGBA, 8 bit, no interlace) | `decode_png` |
+| `lib/paint/png.fi` | PNG: every colour type and bit depth (palette, grey 1..16, RGB, RGBA, 16 bit), tRNS, Adam7 | `decode_png`, `decode_png_limited` |
 | `lib/webp/webp.fi` | WebP lossy, lossless, alpha, animated | `webp_decode`, `webp_decode_anim`, `webp_info` |
 | `lib/gif/gif.fi` | GIF87a, GIF89a | `gif_decode`, `gif_decode_anim`, `gif_info` |
 | `lib/fui/uiimagedec.fi` | all four | `image_from_bytes(p, n, &decoded, &view)` |
@@ -53,11 +53,14 @@ times ten); players show anything under 20 ms as 100 ms, the decoder does not.
 
 ## Held against Pillow
 
-`tools/libmvp/run.sh` (section 65 of `test.sh`): `check_webp.py` and
-`check_gif.py` compare every octet with Pillow (libwebp / libgif). WebP: 991
+`tools/libmvp/run.sh` (section 65 of `test.sh`): `check_png.py`,
+`check_webp.py` and `check_gif.py` compare every octet with Pillow (libwebp / libgif). WebP: 991
 files, lossless and lossy identical, no tolerance, 40 animations muxed by hand
 with random offsets and blend/dispose flags compared frame by frame. The
-Modrinth icons are downloaded for the run (`fetch_modrinth.py`), never
+PNG: 185 generated files (every colour type and depth, Adam7, all filters,
+tRNS in all its forms; their expected pixels come from the samples, not from a
+decoder) plus the 307 PNGs among the Modrinth icons (239 of them palette
+PNGs), identical to Pillow. The Modrinth icons are downloaded for the run (`fetch_modrinth.py`), never
 committed; offline they are skipped. GIF: where Pillow and a browser differ
 (disposal 2 of a frame without transparency, the colour of transparent
 pixels after the first frame) the decoder does what a browser does; the list
@@ -65,9 +68,10 @@ is at the top of `check_gif.py`.
 
 ## Not done / honest
 
-* `lib/paint/png.fi` takes neither palette PNGs, 16-bit samples nor Adam7
-  interlacing; many Modrinth icons are palette PNGs. A full PNG decoder is on
-  the roadmap.
+* PNG: gamma, sRGB and ICC chunks are ignored; 16-bit samples keep their high
+  octet (what browsers do); an APNG shows its default image. A tRNS colour
+  key at a depth other than 8 follows libpng (the original sample is compared),
+  not Pillow, which compares the raw key with the already scaled sample.
 * The colour profile (ICC) of a WebP is ignored; GIF plain-text and
   application extensions other than NETSCAPE2.0 are skipped.
 * WebP lossy decoding is libwebp's default ("fancy" upsampling, no dithering).

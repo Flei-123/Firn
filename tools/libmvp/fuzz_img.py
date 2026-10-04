@@ -6,12 +6,27 @@
 # file (bit flips, 0x00/0xFF/random octets, up to 16 hits). The probe must
 # end normally with "OK" or "ERROR <kind>" in 20 s -- a crash, a panic of a
 # release-safe build or a hang fails. With ANIM=1 in the environment the
-# probe is asked for every frame. Deterministic (seed 1).
-import os, random, subprocess, sys, tempfile
+# probe is asked for every frame; with FIXCRC=1 (PNG) the chunk CRCs are
+# repaired after the damage so that it reaches the decoder. Deterministic
+# (seed 1).
+import os, random, struct, subprocess, sys, tempfile, zlib
 from concurrent.futures import ThreadPoolExecutor
 probe, per_file, files = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
 tmp = tempfile.mkdtemp()
 anim = ["anim"] if os.environ.get("ANIM") else []
+fixcrc = bool(os.environ.get("FIXCRC"))   # PNG: repair the chunk CRCs after the damage
+
+def repair(b):
+    # a PNG whose chunks carry the right CRC again, so that the damage
+    # reaches the decoder behind the checksum
+    b = bytearray(b); off = 8
+    while off + 12 <= len(b):
+        n = struct.unpack(">I", b[off:off + 4])[0]
+        if off + 12 + n > len(b): break
+        crc = zlib.crc32(bytes(b[off + 4:off + 8 + n])) & 0xffffffff
+        b[off + 8 + n:off + 12 + n] = struct.pack(">I", crc)
+        off += 12 + n
+    return bytes(b)
 
 def run(job):
     i, data, tag = job
@@ -41,7 +56,7 @@ for f in files:
         for _ in range(rng.choice([1, 1, 2, 4, 16])):
             p = rng.randrange(len(b))
             b[p] = rng.choice([0, 255, rng.randrange(256), b[p] ^ (1 << rng.randrange(8))])
-        jobs.append((len(jobs), bytes(b), "%s damaged" % os.path.basename(f)))
+        jobs.append((len(jobs), repair(b) if fixcrc else bytes(b), "%s damaged" % os.path.basename(f)))
 bad = ok = refused = 0
 with ThreadPoolExecutor(8) as ex:
     for tag, res, isbad in ex.map(run, jobs):

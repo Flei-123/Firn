@@ -26,7 +26,8 @@ import std.deflate
 import paint.canvas
 
 export {
-    write_ppm, write_png, Image, image_new, image_free, decode_png,
+    write_ppm, write_png, Image, image_new, image_free, decode_png, decode_png_limited,
+    PNG_MAX_PIXELS,
     image_width, image_height, image_pixel, image_ok,
 }
 
@@ -345,156 +346,389 @@ fn rd_be32(p: u64, off: usize) -> u32 {
     ((rt.ld8(p, off + 2) as u32) << 8) | (rt.ld8(p, off + 3) as u32)
 }
 
-// Colour types 0 (grey), 2 (RGB), 4 (grey+alpha) and 6 (RGBA) at eight
-// bits, without interlacing. A palette (type 3) and sixteen bit samples
-// are refused rather than guessed at -- named in docs/ROUNDB3.md.
+// PNG IN: every colour type and bit depth the specification has, Adam7
+// interlacing, and the transparency chunks. Written for the pictures a
+// launcher meets (Modrinth mod icons: 78 % are palette PNGs, the rest grey,
+// RGB and RGBA), held against Pillow (libpng) by tools/libmvp/check_png.py.
+//
+//   colour type 0 grey          1, 2, 4, 8, 16 bits   (+ tRNS colour key)
+//   colour type 2 RGB           8, 16 bits            (+ tRNS colour key)
+//   colour type 3 palette       1, 2, 4, 8 bits       (PLTE + tRNS alpha)
+//   colour type 4 grey + alpha  8, 16 bits
+//   colour type 6 RGBA          8, 16 bits
+//   interlace method 0 and 1 (Adam7)
+//
+// The result is STRAIGHT RGBA, 8 bits per channel. Samples of 16 bits keep
+// their high octet (libpng's strip_16, what browsers do); samples of 1, 2
+// and 4 bits grey are scaled to 0..255 (v * 255 / (2^bits - 1)); an index
+// beyond the palette is black; gamma, sRGB and ICC chunks are ignored, an
+// APNG shows its default image (the IDAT frames).
+//
+// HOSTILE INPUT: the size is checked against `max_pixels` before any pixel
+// memory is asked for; the decompressed data is limited to exactly what the
+// header promises (a small file cannot inflate to gigabytes); every chunk
+// that is used must have the right CRC-32; anything cut, inconsistent or
+// unknown gives `false` and no picture.
+const PNG_MAX_PIXELS: u64 = 16777216
+
 fn decode_png(src: u64, n: usize, im: *mut Image) -> bool {
+    return decode_png_limited(src, n, PNG_MAX_PIXELS, im)
+}
+
+// the sample `i` of a row at `depth` bits (1, 2, 4, 8 or 16)
+#[no_gc]
+fn smp(line: *mut u8, i: usize, depth: u32) -> u32 {
+    if depth == 8 as u32 {
+        return at(line, i)
+    }
+    if depth == 16 as u32 {
+        return (at(line, i * 2) << 8) | at(line, i * 2 + 1)
+    }
+    let bit: usize = i * (depth as usize)
+    let sh: u32 = 8 as u32 - depth - ((bit & 7) as u32)
+    return (at(line, bit >> 3) >> sh) & ((1 as u32 << depth) - 1 as u32)
+}
+
+// a sample as 0..255: 16 bits keep the high octet, fewer than 8 are scaled
+#[no_gc]
+fn to8(v: u32, depth: u32) -> u32 {
+    if depth == 16 as u32 {
+        return v >> 8
+    }
+    if depth == 8 as u32 {
+        return v
+    }
+    return v * 255 as u32 / ((1 as u32 << depth) - 1 as u32)
+}
+
+fn decode_png_limited(src: u64, n: usize, max_pixels: u64, im: *mut Image) -> bool {
     (*im).ok = 0
-    if n < 8 {
+    if n < 33 {
         return false
     }
-    if rt.ld8(src, 0) as u32 != 137 as u32 || rt.ld8(src, 1) as u32 != 80 as u32 {
+    // 89 50 4E 47 0D 0A 1A 0A
+    if rt.ld8(src, 0) as u32 != 137 as u32 || rt.ld8(src, 1) as u32 != 80 as u32 ||
+    rt.ld8(src, 2) as u32 != 78 as u32 || rt.ld8(src, 3) as u32 != 71 as u32 ||
+    rt.ld8(src, 4) as u32 != 13 as u32 || rt.ld8(src, 5) as u32 != 10 as u32 ||
+    rt.ld8(src, 6) as u32 != 26 as u32 || rt.ld8(src, 7) as u32 != 10 as u32 {
         return false
     }
+    var crctab: deflate.CrcTable = deflate.crc_table()
     var off: usize = 8
     var w: usize = 0
     var h: usize = 0
     var ctype: u32 = 0
     var depth: u32 = 0
+    var interlace: u32 = 0
+    var pal: [u8; 768] = [0; 768]
+    var pal_n: usize = 0
+    var trns: [u8; 256] = [0; 256]
+    var trns_n: usize = 0
     var idat: rt.Buf = rt.buf_new()
     var seen_ihdr: bool = false
-    while off + 8 <= n {
+    var seen_idat: bool = false
+    var seen_iend: bool = false
+    var ok: bool = true
+    while ok && !seen_iend && off + 12 <= n {
         let len: usize = rd_be32(src, off) as usize
         let t0: u32 = rt.ld8(src, off + 4) as u32
         let t1: u32 = rt.ld8(src, off + 5) as u32
         let t2: u32 = rt.ld8(src, off + 6) as u32
         let t3: u32 = rt.ld8(src, off + 7) as u32
         let body: usize = off + 8
-        if body + len > n {
+        if len > 2147483647 || body + len + 4 > n {
+            ok = false
             break
         }
-        if t0 == 73 as u32 && t1 == 72 as u32 && t2 == 68 as u32 &&
-        t3 == 82 as u32 {
+        let is_ihdr: bool = t0 == 73 as u32 && t1 == 72 as u32 && t2 == 68 as u32 && t3 == 82 as u32
+        let is_plte: bool = t0 == 80 as u32 && t1 == 76 as u32 && t2 == 84 as u32 && t3 == 69 as u32
+        let is_trns: bool = t0 == 116 as u32 && t1 == 82 as u32 && t2 == 78 as u32 && t3 == 83 as u32
+        let is_idat: bool = t0 == 73 as u32 && t1 == 68 as u32 && t2 == 65 as u32 && t3 == 84 as u32
+        let is_iend: bool = t0 == 73 as u32 && t1 == 69 as u32 && t2 == 78 as u32 && t3 == 68 as u32
+        if !seen_ihdr && !is_ihdr {
+            ok = false // IHDR comes first
+            break
+        }
+        if is_ihdr || is_plte || is_trns || is_idat {
+            // the CRC-32 over the type and the data
+            let c: u32 = deflate.crc32_more(&crctab, 0 as u32, src + (off + 4) as u64, len + 4)
+            if c != rd_be32(src, body + len) {
+                ok = false
+                break
+            }
+        }
+        if is_ihdr {
+            if seen_ihdr || len != 13 {
+                ok = false
+                break
+            }
             w = rd_be32(src, body) as usize
             h = rd_be32(src, body + 4) as usize
             depth = rt.ld8(src, body + 8) as u32
             ctype = rt.ld8(src, body + 9) as u32
-            if rt.ld8(src, body + 12) as u32 != 0 as u32 {
-                return false // interlaced
+            interlace = rt.ld8(src, body + 12) as u32
+            if rt.ld8(src, body + 10) as u32 != 0 as u32 || rt.ld8(src, body + 11) as u32 != 0 as u32 ||
+            interlace > 1 as u32 {
+                ok = false
+                break
             }
             seen_ihdr = true
-        } else if t0 == 73 as u32 && t1 == 68 as u32 && t2 == 65 as u32 &&
-        t3 == 84 as u32 {
+        } else if is_plte {
+            if seen_idat || len % 3 != 0 || len == 0 || len > 768 {
+                ok = false
+                break
+            }
+            pal_n = len / 3
             var i: usize = 0
             while i < len {
-                rt.buf_push(&idat, rt.ld8(src, body + i))
+                pal[i] = rt.ld8(src, body + i)
                 i = i + 1
             }
-        } else if t0 == 73 as u32 && t1 == 69 as u32 && t2 == 78 as u32 &&
-        t3 == 68 as u32 {
-            break
+        } else if is_trns {
+            if seen_idat || len > 256 {
+                ok = false
+                break
+            }
+            trns_n = len
+            var i: usize = 0
+            while i < len {
+                trns[i] = rt.ld8(src, body + i)
+                i = i + 1
+            }
+        } else if is_idat {
+            seen_idat = true
+            if rt.buf_len(&idat) + len > 1073741824 {
+                ok = false
+                break
+            }
+            rt.buf_push_bytes(&idat, src + body as u64, len)
+        } else if is_iend {
+            seen_iend = true
         }
         off = body + len + 4
     }
-    if !seen_ihdr || w == 0 || h == 0 || depth != 8 as u32 {
+    if !ok || !seen_ihdr || !seen_idat || w == 0 || h == 0 {
+        rt.buf_free(&idat)
         return false
     }
-    var comps: usize = 4
+    // the colour type and depth must go together
+    var channels: usize = 0
     if ctype == 0 as u32 {
-        comps = 1
+        channels = 1
+        if depth != 1 as u32 && depth != 2 as u32 && depth != 4 as u32 && depth != 8 as u32 && depth != 16 as u32 {
+            ok = false
+        }
     } else if ctype == 2 as u32 {
-        comps = 3
+        channels = 3
+        if depth != 8 as u32 && depth != 16 as u32 { ok = false }
+    } else if ctype == 3 as u32 {
+        channels = 1
+        if depth != 1 as u32 && depth != 2 as u32 && depth != 4 as u32 && depth != 8 as u32 { ok = false }
+        if pal_n == 0 { ok = false }
     } else if ctype == 4 as u32 {
-        comps = 2
-    } else if ctype != 6 as u32 {
-        return false // a palette; not decoded here
+        channels = 2
+        if depth != 8 as u32 && depth != 16 as u32 { ok = false }
+    } else if ctype == 6 as u32 {
+        channels = 4
+        if depth != 8 as u32 && depth != 16 as u32 { ok = false }
+    } else {
+        ok = false
+    }
+    if !ok || (w as u64) * (h as u64) > max_pixels || w > 65535 * 16 || h > 65535 * 16 {
+        rt.buf_free(&idat)
+        return false
+    }
+    let bits: usize = channels * (depth as usize) // bits per pixel
+    var bpp: usize = bits / 8 // bytes per pixel for the filters
+    if bpp == 0 {
+        bpp = 1
+    }
+    // the passes: Adam7 (7 passes) or the one pass over the whole picture
+    var npass: usize = 1
+    // Adam7: x0, y0, dx, dy of the seven passes; without interlacing the
+    // first pass is the whole picture
+    var sx: [usize; 7] = [0, 4, 0, 2, 0, 1, 0]
+    var dx: [usize; 7] = [8, 8, 4, 4, 2, 2, 1]
+    var sy: [usize; 7] = [0, 0, 4, 0, 2, 0, 1]
+    var dy: [usize; 7] = [8, 8, 8, 4, 4, 2, 2]
+    if interlace == 1 as u32 {
+        npass = 7
+    } else {
+        dx[0] = 1
+        dy[0] = 1
+    }
+    // how many raw octets the header promises (and so the most we inflate)
+    var expect: usize = 0
+    var q: usize = 0
+    while q < npass {
+        let pw: usize = (w + dx[q] - 1 - sx[q]) / dx[q]
+        let ph: usize = (h + dy[q] - 1 - sy[q]) / dy[q]
+        if w > sx[q] && h > sy[q] && pw > 0 && ph > 0 {
+            expect = expect + ((pw * bits + 7) / 8 + 1) * ph
+        }
+        q = q + 1
+    }
+    // zlib: CMF (deflate, window <= 32K), FLG (check bits, no dictionary)
+    let zn: usize = rt.buf_len(&idat)
+    let zp: u64 = rt.buf_ptr(&idat)
+    if zn < 3 || (rt.ld8(zp, 0) as u32 & 15 as u32) != 8 as u32 ||
+    (rt.ld8(zp, 0) as u32 >> 4) > 7 as u32 || (((rt.ld8(zp, 0) as u32) << 8) + (rt.ld8(zp, 1) as u32)) % 31 as u32 != 0 as u32 ||
+    (rt.ld8(zp, 1) as u32 & 32 as u32) != 0 as u32 {
+        rt.buf_free(&idat)
+        return false
     }
     var raw: rt.Buf = rt.buf_new()
-    let got: usize = deflate.zlib_decompress(rt.buf_ptr(&idat),
-        rt.buf_len(&idat), &raw) catch 0
-    let stride: usize = w * comps
-    if got < (stride + 1) * h {
+    let got: usize = deflate.inflate_limited(zp + 2, zn - 2, expect, &raw) catch 0
+    rt.buf_free(&idat)
+    if got < expect {
+        rt.buf_free(&raw)
         return false
     }
-    (*im).cap = w * h * 4
-    (*im).px = mem.heap_alloc((*im).cap)
-    if (*im).px as usize == 0 {
+    let cap: usize = w * h * 4
+    let px: *mut u8 = mem.heap_alloc(cap)
+    if px as usize == 0 {
+        rt.buf_free(&raw)
         return false
     }
+    let maxrow: usize = (w * bits + 7) / 8
+    let line: *mut u8 = mem.heap_alloc(maxrow + 8)
+    let prev: *mut u8 = mem.heap_alloc(maxrow + 8)
+    if line as usize == 0 || prev as usize == 0 {
+        mem.heap_free(px, cap)
+        mem.heap_free(line, maxrow + 8)
+        mem.heap_free(prev, maxrow + 8)
+        rt.buf_free(&raw)
+        return false
+    }
+    // tRNS colour key of a grey or RGB picture (16-bit sample values)
+    var key_on: bool = false
+    var kr: u32 = 0
+    var kg: u32 = 0
+    var kb: u32 = 0
+    if ctype == 0 as u32 && trns_n >= 2 {
+        key_on = true
+        kr = ((trns[0] as u32) << 8) | (trns[1] as u32)
+    } else if ctype == 2 as u32 && trns_n >= 6 {
+        key_on = true
+        kr = ((trns[0] as u32) << 8) | (trns[1] as u32)
+        kg = ((trns[2] as u32) << 8) | (trns[3] as u32)
+        kb = ((trns[4] as u32) << 8) | (trns[5] as u32)
+    }
+    let rawp: u64 = rt.buf_ptr(&raw)
+    var rp: usize = 0 // read position in the raw data
+    var bad: bool = false
+    q = 0
+    while q < npass && !bad {
+        let pw: usize = (w + dx[q] - 1 - sx[q]) / dx[q]
+        let ph: usize = (h + dy[q] - 1 - sy[q]) / dy[q]
+        if w <= sx[q] || h <= sy[q] || pw == 0 || ph == 0 {
+            q = q + 1
+            continue
+        }
+        let rowb: usize = (pw * bits + 7) / 8
+        var i0: usize = 0
+        while i0 < rowb + 8 {
+            *((prev as u64 + i0 as u64) as *mut u8) = 0 as u8
+            i0 = i0 + 1
+        }
+        var y: usize = 0
+        while y < ph && !bad {
+            let f: u32 = rt.ld8(rawp, rp) as u32
+            if f > 4 as u32 {
+                bad = true
+                break
+            }
+            var i: usize = 0
+            while i < rowb {
+                let x0: u32 = rt.ld8(rawp, rp + 1 + i) as u32
+                var a: u32 = 0
+                var c: u32 = 0
+                if i >= bpp {
+                    a = at(line, i - bpp)
+                    c = at(prev, i - bpp)
+                }
+                let b: u32 = at(prev, i)
+                var v: u32 = x0
+                if f == 1 as u32 {
+                    v = (x0 + a) & 255 as u32
+                } else if f == 2 as u32 {
+                    v = (x0 + b) & 255 as u32
+                } else if f == 3 as u32 {
+                    v = (x0 + (a + b) / 2) & 255 as u32
+                } else if f == 4 as u32 {
+                    v = (x0 + (paeth(a as i32, b as i32, c as i32) as u32)) & 255 as u32
+                }
+                *((line as u64 + i as u64) as *mut u8) = v as u8
+                i = i + 1
+            }
+            rp = rp + rowb + 1
+            // the pixels of this row, into their places
+            let oy: usize = sy[q] + y * dy[q]
+            var x: usize = 0
+            while x < pw {
+                var r: u32 = 0
+                var g: u32 = 0
+                var bl: u32 = 0
+                var al: u32 = 255
+                if ctype == 0 as u32 {
+                    let v: u32 = smp(line, x, depth)
+                    r = to8(v, depth)
+                    g = r
+                    bl = r
+                    if key_on && v == kr { al = 0 }
+                } else if ctype == 2 as u32 {
+                    let vr: u32 = smp(line, x * 3, depth)
+                    let vg: u32 = smp(line, x * 3 + 1, depth)
+                    let vb: u32 = smp(line, x * 3 + 2, depth)
+                    r = to8(vr, depth)
+                    g = to8(vg, depth)
+                    bl = to8(vb, depth)
+                    if key_on && vr == kr && vg == kg && vb == kb { al = 0 }
+                } else if ctype == 3 as u32 {
+                    let idx: usize = smp(line, x, depth) as usize
+                    if idx < pal_n {
+                        r = pal[idx * 3] as u32
+                        g = pal[idx * 3 + 1] as u32
+                        bl = pal[idx * 3 + 2] as u32
+                    }
+                    if idx < trns_n {
+                        al = trns[idx] as u32
+                    }
+                } else if ctype == 4 as u32 {
+                    r = to8(smp(line, x * 2, depth), depth)
+                    g = r
+                    bl = r
+                    al = to8(smp(line, x * 2 + 1, depth), depth)
+                } else {
+                    r = to8(smp(line, x * 4, depth), depth)
+                    g = to8(smp(line, x * 4 + 1, depth), depth)
+                    bl = to8(smp(line, x * 4 + 2, depth), depth)
+                    al = to8(smp(line, x * 4 + 3, depth), depth)
+                }
+                let ox: usize = sx[q] + x * dx[q]
+                let o: u64 = px as u64 + ((oy * w + ox) * 4) as u64
+                *(o as *mut u8) = r as u8
+                *((o + 1) as *mut u8) = g as u8
+                *((o + 2) as *mut u8) = bl as u8
+                *((o + 3) as *mut u8) = al as u8
+                x = x + 1
+            }
+            mem.mem_copy(prev, line, rowb)
+            y = y + 1
+        }
+        q = q + 1
+    }
+    mem.heap_free(line, maxrow + 8)
+    mem.heap_free(prev, maxrow + 8)
+    rt.buf_free(&raw)
+    if bad {
+        mem.heap_free(px, cap)
+        return false
+    }
+    (*im).px = px
+    (*im).cap = cap
     (*im).w = w
     (*im).h = h
-    let rawp: u64 = rt.buf_ptr(&raw)
-    let line: *mut u8 = mem.heap_alloc(stride)
-    let prev: *mut u8 = mem.heap_alloc(stride)
-    var y: usize = 0
-    while y < h {
-        let rb: u64 = rawp + ((stride + 1) * y) as u64
-        let f: u32 = rt.ld8(rb, 0) as u32
-        var i: usize = 0
-        while i < stride {
-            let x0: u32 = rt.ld8(rb, 1 + i) as u32
-            var a: u32 = 0
-            if i >= comps {
-                a = at(line, i - comps)
-            }
-            let b: u32 = at(prev, i)
-            var c: u32 = 0
-            if i >= comps {
-                c = at(prev, i - comps)
-            }
-            var v: u32 = x0
-            if f == 1 as u32 {
-                v = (x0 + a) & 255 as u32
-            } else if f == 2 as u32 {
-                v = (x0 + b) & 255 as u32
-            } else if f == 3 as u32 {
-                v = (x0 + (a + b) / 2) & 255 as u32
-            } else if f == 4 as u32 {
-                v = (x0 + (paeth(a as i32, b as i32, c as i32) as u32)) &
-                255 as u32
-            }
-            *((line as u64 + i as u64) as *mut u8) = v as u8
-            i = i + 1
-        }
-        var x: usize = 0
-        while x < w {
-            var r: u32 = 0
-            var g: u32 = 0
-            var bl: u32 = 0
-            var al: u32 = 255
-            if comps == 1 {
-                r = at(line, x)
-                g = r
-                bl = r
-            } else if comps == 2 {
-                r = at(line, x * 2)
-                g = r
-                bl = r
-                al = at(line, x * 2 + 1)
-            } else if comps == 3 {
-                r = at(line, x * 3)
-                g = at(line, x * 3 + 1)
-                bl = at(line, x * 3 + 2)
-            } else {
-                r = at(line, x * 4)
-                g = at(line, x * 4 + 1)
-                bl = at(line, x * 4 + 2)
-                al = at(line, x * 4 + 3)
-            }
-            let p: u64 = (*im).px as u64 + ((y * w + x) * 4) as u64
-            *(p as *mut u8) = r as u8
-            *((p + 1) as *mut u8) = g as u8
-            *((p + 2) as *mut u8) = bl as u8
-            *((p + 3) as *mut u8) = al as u8
-            x = x + 1
-        }
-        mem.mem_copy(prev, line, stride)
-        y = y + 1
-    }
-    mem.heap_free(line, stride)
-    mem.heap_free(prev, stride)
-    rt.buf_free(&raw)
-    rt.buf_free(&idat)
     (*im).ok = 1
     return true
 }

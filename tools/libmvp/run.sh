@@ -9,6 +9,9 @@
 #   lib/regex Python's re on 20,000 random patterns plus a fixed corpus
 #   lib/i18n  ICU (PyICU): plural rules, numbers and dates in 8 languages
 #   lib/jpeg  Pillow (libjpeg-turbo): the same RGBA octets for 46 files
+#   lib/paint/png.fi (PNG in)  Pillow (libpng) + the samples of PNGs written
+#             here: every colour type and bit depth, Adam7, tRNS; 185 generated
+#             files and the Modrinth PNGs (mostly palette); hostile-input fuzz
 #   lib/webp  Pillow (libwebp): the same RGBA octets, lossless and lossy, for
 #             ~150 generated files, 40 hand-muxed animations and the Modrinth
 #             icons (downloaded; skipped when offline); hostile-input fuzz
@@ -33,7 +36,7 @@ for t in time_probe zip_probe pdf_probe regex_probe i18n_probe jpeg_probe print_
 done
 # the WebP and GIF probes are built release-safe: an overflow in the decoder
 # is a trap here, which the fuzz run reports as a crash
-for t in webp_probe gif_probe; do
+for t in png_probe webp_probe gif_probe; do
     "$FIRNC" --opt-level=release-safe -o "$W/$t" "tools/libmvp/$t.fi" > "$W/$t.log" 2>&1 || { echo "  FAIL $t does not build"; grep -v RWX "$W/$t.log" | head -5; rc=1; }
 done
 [ $rc -eq 0 ] || exit 1
@@ -50,10 +53,14 @@ python3 tools/libmvp/check_i18n.py "$W/i18n_probe" || rc=1
 echo "-- lib/jpeg"
 mkdir -p "$W/jpeg"
 python3 tools/libmvp/check_jpeg.py "$W/jpeg_probe" "$W/jpeg" || rc=1
-echo "-- lib/webp"
-mkdir -p "$W/webp"
+echo "-- lib/paint/png.fi (PNG in)"
+mkdir -p "$W/png"
 MODR="${MODRINTH_CACHE:-$W/modrinth}"
 python3 tools/libmvp/fetch_modrinth.py "$MODR" 250 || true
+python3 tools/libmvp/check_png.py "$W/png_probe" "$W/png" tests/data/img tests/data/png "$MODR" || rc=1
+FIXCRC=1 python3 tools/libmvp/fuzz_img.py "$W/png_probe" 200 tests/data/png/pal8_trns.png tests/data/png/rgba8_i.png tests/data/png/grey4_i.png tests/data/png/rgb16.png tests/data/img/same.png || rc=1
+echo "-- lib/webp"
+mkdir -p "$W/webp"
 python3 tools/libmvp/check_webp.py "$W/webp_probe" "$W/webp" tests/data/webp "$MODR" || rc=1
 python3 tools/libmvp/fuzz_img.py "$W/webp_probe" 150 tests/data/webp/ll_rgba.webp tests/data/webp/lossy_alpha.webp tests/data/webp/ll_pal.webp tests/data/webp/lossy_q5.webp tests/data/webp/logo-blue.webp || rc=1
 ANIM=1 python3 tools/libmvp/fuzz_img.py "$W/webp_probe" 150 tests/data/webp/anim_ll.webp tests/data/webp/anim_lossy.webp || rc=1
