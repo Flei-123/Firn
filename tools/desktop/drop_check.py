@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: MPL-2.0
 # tools/desktop/drop_check.py -- files dropped on a Firn window on a real X server (Xvfb): XDND.
 #
-#   usage: drop_check.py <drop_main binary>
+#   usage: drop_check.py <drop_main binary> [wine]
+#   with `wine` the binary is the Windows build, run under Wine (whose X11 driver is an XDND target
+#   that turns the drop into WM_DROPFILES): the same drops, the paths come back as Windows paths (Z:\...).
 #
 # Two sources that are not our code:
 #   * GTK 3 -- a real toolkit's drag source, driven by xdotool (mouse down, move, up) like a
@@ -25,6 +27,7 @@ for tool in ("Xvfb", "xdotool"):
         sys.exit(0)
 
 binary = sys.argv[1]
+WINE = len(sys.argv) > 2 and sys.argv[2] == "wine"
 here = os.path.dirname(os.path.abspath(__file__))
 
 def free_display():
@@ -45,12 +48,22 @@ time.sleep(0.3)
 
 procs = [xvfb]
 try:
-    prog = subprocess.Popen([binary], stdout=subprocess.PIPE, text=True, env=env, bufsize=1)
+    if WINE:
+        env["WINEPREFIX"] = os.environ.get("WINEPREFIX", os.path.expanduser("~/.wine-firn"))
+        env["WINEDEBUG"] = "-all"
+    prog = subprocess.Popen((["wine", "explorer", "/desktop=firn,800x600"] if WINE else []) + [binary], stdout=subprocess.PIPE, text=True, env=env, bufsize=1)
     procs.append(prog)
     first = prog.stdout.readline().strip()
+    def host(p):          # what the program reports for the Unix path p
+        return ("Z:" + p.replace("/", "\\")) if WINE else p
     check("the window comes up and accepts drops (READY)", first == "READY", first)
     time.sleep(0.5)
-    win_id = int(subprocess.run(["xdotool", "search", "--name", "firn-drop-test"], capture_output=True, text=True, env=env).stdout.split()[0])
+    for _ in range(50):
+        found = subprocess.run(["xdotool", "search", "--name", "firn-drop-test"], capture_output=True, text=True, env=env).stdout.split()
+        if found:
+            break
+        time.sleep(0.2)
+    win_id = int(found[0])
 
     d = display.Display()
     A = lambda s: d.intern_atom(s)
@@ -80,7 +93,7 @@ try:
             break
         got.append(l.rstrip("\n"))
     check("GTK drag: one drop of 3 files", "DROP 3" in got, got)
-    check("GTK drag: the paths, percent decoding and UTF-8 right", [g[5:] for g in got if g.startswith("PATH ")] == files, got)
+    check("GTK drag: the paths, percent decoding and UTF-8 right", [g[5:] for g in got if g.startswith("PATH ")] == [host(f) for f in files], got)
     time.sleep(0.3)
 
     # ------------------------------------------------ 2. a source written from the specification
@@ -219,7 +232,7 @@ try:
     for i in drops:
         chunks.append([l[5:] for l in lines[i + 1:i + 1 + int(lines[i].split()[1])] if l.startswith("PATH ")])
     check("drops 2-4: exactly the four local files, decoded (%20, UTF-8, %25; NUL, remote, http, comments dropped)",
-          chunks[1:] == [WANT, WANT, WANT], chunks)
+          chunks[1:] == [[host(w) for w in WANT]] * 3, chunks)
     check("DROP counts say 4 for the spec source", [lines[i] for i in drops][1:] == ["DROP 4"] * 3, [lines[i] for i in drops])
 finally:
     for p in procs[::-1]:
