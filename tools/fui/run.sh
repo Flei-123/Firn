@@ -606,10 +606,20 @@ echo "         the kit in the accessibility tree, touch gestures, right-to-left,
 #   touch      tap / double tap / long press / pan / fling / pinch, the grid and the Markdown view
 #   kitrtl     every kit part mirrored: hit functions, decorations, keys; the default untouched
 #   qrview     the QR widget's pixels and that the painted picture reads back
-for t in richtext mdextras anim kita11y touch kitrtl qrview; do
-    build $t
-    "$W/$t" | tail -n 3
-done
+build richtext
+"$W/richtext" | tail -n 3
+build mdextras
+"$W/mdextras" | tail -n 3
+build anim
+"$W/anim" | tail -n 3
+build kita11y
+"$W/kita11y" | tail -n 3
+build touch
+"$W/touch" | tail -n 3
+build kitrtl
+"$W/kitrtl" | tail -n 3
+build qrview
+"$W/qrview" | tail -n 3
 
 echo
 echo "== 18p2. THE ACCESSIBILITY AUDIT OF EVERY fUi PROGRAM (r98) =="
