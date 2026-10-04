@@ -1,0 +1,814 @@
+// SPDX-License-Identifier: MPL-2.0
+// Origin: OrientOS lib/crypto/ed25519.fi (round UPDATE, same author), lifted into
+// the Firn library as std.crypto.ed25519 and released under MPL-2.0 by its sole
+// author Justin (see LICENSING.md). Changes against the original: the imports
+// (std.crypto.big / std.crypto.sha512) and the SHA-512 calls of this library
+// (sha512_new / sha512_update / sha512_final / sha512); nothing else.
+// WHY IT IS IN THE FIRN LIBRARY: lib/appkit checks the signature of a store
+// catalog (the Fleitec store signs index.json and entry.json with Ed25519).
+// lib/std/crypto/ed25519.fi -- Ed25519 signatures (RFC 8032), round UPDATE.
+//
+// WHY THIS FILE EXISTS. Round UPDATE builds the path by which this system
+// replaces its own software over the network. TLS 1.3 (`/bin/fetch`,
+// round HWNET) proves who the SERVER is; it says nothing about who built
+// the package. A package that is only protected by the transport belongs
+// to whoever can redirect the connection -- a compromised mirror, a
+// captive portal, a CA that should not have signed. So every package
+// carries a signature over its own content, and the signature scheme the
+// PLAN format (`pkg/opk.py` of OrientOS, format 2) names is Ed25519.
+//
+// Not "a signature scheme". Ed25519, with SHA-512, over the curve
+// Curve25519 in its Edwards form. This repository had X25519 (the key
+// exchange, `lib/crypto/x25519.fi`), ECDSA over P-256 and RSA, all from
+// round B5 of the Firn library -- and no Ed25519 at all. Same field,
+// different curve shape, different arithmetic, different hash.
+//
+// ============================================================== THE CURVE
+//
+// Edwards25519 is `-x^2 + y^2 = 1 + d*x^2*y^2` over p = 2^255 - 19, with
+//
+//     d = -121665/121666 mod p
+//
+// and a prime order subgroup of order L = 2^252 + 27742317777372353535851937790883648493
+// with cofactor 8. It is birationally equivalent to the Montgomery curve
+// `lib/crypto/x25519.fi` walks, which is why both files share ONE field
+// arithmetic (`lib/crypto/big.fi`, Montgomery multiplication modulo p)
+// and why this one adds only the group law on top.
+//
+// THE POINT REPRESENTATION is extended coordinates (Hisil-Wong-Carter-
+// Dawson): a point is (X : Y : Z : T) with x = X/Z, y = Y/Z and
+// x*y = T/Z. The addition law used here is `add-2008-hwcd-3`, and the one
+// property that makes this file short is that for a = -1 (a SQUARE modulo
+// p, since p = 1 mod 4) and d a NON-square, the Edwards addition law is
+// COMPLETE: it is correct for every pair of points on the curve, including
+// P + P, including the neutral element, with no exceptional case. So
+// there is exactly ONE point routine in this file. Doubling is `add(P,P)`.
+// That costs about a third more field multiplications than a dedicated
+// doubling and removes the entire class of bug where an implementation
+// takes the wrong branch for a point it did not expect -- which is where
+// the exploitable mistakes in curve code live.
+//
+// ============================================================ WHAT IT DOES
+//
+// RFC 8032 5.1, PureEdDSA (Ed25519), NOT Ed25519ph and NOT Ed25519ctx.
+// The prehashed variant hashes the message first and signs the digest;
+// the context variant mixes a domain string in. Both change the bits on
+// the wire, neither is what the PLAN format uses, and an untested code
+// path in signature verification is worse than an absent one.
+//
+//   KEY:    h = SHA-512(seed); a = clamp(h[0..32]); A = encode(a*B)
+//   SIGN:   r = SHA-512(h[32..64] || M) mod L      -- deterministic
+//           R = encode(r*B)
+//           k = SHA-512(R || A || M) mod L
+//           S = (r + k*a) mod L
+//           signature = R || S
+//   VERIFY: reject unless S < L; decode A and R; k as above;
+//           check [S]B == R + [k]A
+//
+// THE NONCE IS DERIVISTIC AND THAT IS THE POINT. ECDSA needs a random
+// number per signature and leaks the private key outright if it ever
+// repeats one -- which is how the PlayStation 3 was broken. Ed25519 has no
+// random number in it at all: `r` is a hash of the message and of the
+// second half of the seed, so the same message signs to the same octets
+// forever and there is no entropy source to get wrong. This system signs
+// packages on a build machine, not on the device, but the property is
+// what makes the signing tool auditable: the test suite can check a
+// signature against a literal from the RFC, which is impossible for
+// randomised ECDSA.
+//
+// THE CLAMPING (RFC 8032 5.1.5) is the same three bit operations as
+// X25519 and for the same reasons, written down in `lib/crypto/x25519.fi`.
+//
+// THE VERIFICATION EQUATION here is the COFACTORLESS one,
+// [S]B - [k]A - R = 0, rather than RFC 8032's optional [8]-multiplied
+// form. RFC 8032 5.1.7 permits either. The cofactorless check is strictly
+// STRICTER: everything it accepts, the cofactored check accepts too. It is
+// what libsodium and the Go standard library do, it is what the vectors
+// this file is measured against expect, and for a package signature -- one
+// key, one signer, no protocol that needs signature malleability -- the
+// stricter rule is the right one. Note S3 below says what this does NOT
+// give you.
+//
+// ==================================================================== HONEST
+//
+// E1 THE SCALAR MULTIPLICATION IS CONSTANT TIME IN THE SCALAR, and this
+//    matters for `ed25519_sign` alone, where the scalar is the private
+//    key. Per bit, the SAME two point additions run in the SAME order
+//    (`R = R+R` then `T = R+P`), and which of the two results survives is
+//    a branch-free masked select (`pt_select`, built on `big.select_into`,
+//    the same primitive the X25519 ladder uses). No jump and no memory
+//    address depends on a scalar bit. The loop runs 256 times regardless
+//    of the scalar, so a small scalar is not faster.
+// E2 WHAT IS *NOT* CONSTANT TIME: `pt_decompress` (its square root is
+//    `big.mont_pow`, which walks a PUBLIC exponent bit by bit -- the
+//    exponent is the fixed constant (p-5)/8, identical for every call),
+//    and the final inversion in `pt_compress` (exponent p-2, likewise
+//    fixed and public). Both are used on PUBLIC data only: decompression
+//    happens in verification, compression on a result that is about to be
+//    published. `big.big_cmp` stops at the first differing limb and is
+//    used on the public scalar S and on field elements that are already
+//    output. This is the same boundary `lib/crypto/big.fi` draws in its
+//    note B1.
+// E3 THE HASH REDUCTION `sc_reduce_wide` IS BRANCH-FREE BUT SLOW. It walks
+//    the 512 bit hash bit by bit, doubling modulo L and adding the bit
+//    (1024 modular additions of eight limbs). The alternative is the
+//    hand-written Barrett reduction of ref10's `sc_reduce`, which is two
+//    hundred lines of index arithmetic with 24 magic constants that only
+//    its author can check. This one is four lines and it is measured
+//    against Python for all 1024 official vectors. It is not on any hot
+//    path: two calls per signature.
+// E4 NO BATCH VERIFICATION, no precomputed base point tables, no
+//    signature of a hash (Ed25519ph). The base point multiplication in
+//    signing therefore costs the same as any other -- about 512 point
+//    additions. Measured cost is in docs/UPDATE.md.
+// E5 THE SEED IS NOT WIPED. `ed25519_sign` leaves the expanded private
+//    scalar on its own stack frame. This file has no allocator and no way
+//    to know what its caller does next; a caller that signs on a machine
+//    where that matters must clear its own memory. Named here because an
+//    unnamed one would be a lie by omission.
+
+import std.crypto.big
+import std.crypto.sha512
+
+export {
+    Ctx, ctx_new, ctx_init,
+    ed25519_public, ed25519_sign, ed25519_verify,
+    SEED_LEN, PUB_LEN, SIG_LEN,
+}
+
+const SEED_LEN: usize = 32
+const PUB_LEN: usize = 32
+const SIG_LEN: usize = 64
+
+// The two routines this file used to take from `std.rt`. A kernel has no
+// `std.rt`; loading and storing one octet is not worth a dependency.
+fn ld8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+fn st8(p: u64, i: usize, v: u8) {
+    *((p + i as u64) as *mut u8) = v
+}
+
+// A point in extended coordinates, with every coordinate IN THE
+// MONTGOMERY DOMAIN of the field context. Nothing here ever mixes the two
+// domains: values enter through `f_in` and leave through `f_out`.
+struct Pt {
+    x: big.Big,
+    y: big.Big,
+    z: big.Big,
+    t: big.Big,
+}
+
+// Everything the arithmetic needs that is expensive to build: the two
+// Montgomery contexts (modulo p for the field, modulo L for the scalars)
+// and the curve constant 2d in the field's domain.
+//
+// It is a CALLER-OWNED value and not a module static, for the reason
+// `lib/crypto/blake2s.fi` writes down: this file is linked into the
+// kernel, into ring 3 programs and into a hosted test runner, and global
+// mutable state in that position is a bug waiting for a second thread.
+// Building it costs two `mont_init`s (about a thousand doublings) against
+// the thousand point additions of a signature, so caching it in a global
+// would buy nothing.
+struct Ctx {
+    fc: big.Mont,  // modulo p = 2^255 - 19
+    sc: big.Mont,  // modulo L, the group order
+    d2: big.Big,   // 2*d, in the field's Montgomery domain
+    ok: bool,
+}
+
+fn ctx_new() -> Ctx {
+    return Ctx { fc: big.mont_new(), sc: big.mont_new(),
+        d2: big.big_new(), ok: false }
+}
+
+// 32 little-endian octets into a number, exactly as in
+// `lib/crypto/x25519.fi`.
+fn from_le(a: *mut big.Big, p: u64) {
+    big.big_zero(a)
+    var i: usize = 0
+    while i < 32 {
+        let limb: usize = i / 4
+        let sh: u64 = ((i % 4) as u64) * 8
+        (*a).d[limb] = (((*a).d[limb] as u64)
+            | ((ld8(p, i) as u64) << sh)) as u32
+        i = i + 1
+    }
+    (*a).n = 8
+}
+
+fn to_le(a: *mut big.Big, out: u64) {
+    var i: usize = 0
+    while i < 32 {
+        let limb: usize = i / 4
+        let sh: u64 = ((i % 4) as u64) * 8
+        var v: u64 = 0
+        if limb < (*a).n {
+            v = (*a).d[limb] as u64
+        }
+        st8(out, i, ((v >> sh) & 255 as u64) as u8)
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------ constants
+//
+// Every constant is written as its 32 little-endian octets -- the same
+// form the RFC prints and the form a reader can check against Python in
+// one line -- and turned into a number by the same `from_le` that reads a
+// public key off the wire. No limb literals: a mistyped limb is invisible,
+// a mistyped octet is not.
+
+fn c_p(m: *mut big.Big) {
+    big.big_zero(m)
+    (*m).d[0] = 4294967277 as u32 // 2^32 - 19
+    var i: usize = 1
+    while i < 7 {
+        (*m).d[i] = 4294967295 as u32
+        i = i + 1
+    }
+    (*m).d[7] = 2147483647 as u32 // 2^31 - 1
+    (*m).n = 8
+}
+
+// L = 2^252 + 27742317777372353535851937790883648493
+fn c_l(m: *mut big.Big) {
+    var a: [u8; 32] = [
+        237, 211, 245, 92, 26, 99, 18, 88,
+        214, 156, 247, 162, 222, 249, 222, 20,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 16,
+    ]
+    from_le(m, (&a[0]) as u64)
+}
+
+// 2*d mod p
+fn c_d2(m: *mut big.Big) {
+    var a: [u8; 32] = [
+        89, 241, 178, 38, 148, 155, 214, 235,
+        86, 177, 131, 130, 154, 20, 224, 0,
+        48, 209, 243, 238, 242, 128, 142, 25,
+        231, 252, 223, 86, 220, 217, 6, 36,
+    ]
+    from_le(m, (&a[0]) as u64)
+}
+
+// d = -121665/121666 mod p
+fn c_d(m: *mut big.Big) {
+    var a: [u8; 32] = [
+        163, 120, 89, 19, 202, 77, 235, 117,
+        171, 216, 65, 65, 77, 10, 112, 0,
+        152, 232, 121, 119, 121, 64, 199, 140,
+        115, 254, 111, 43, 238, 108, 3, 82,
+    ]
+    from_le(m, (&a[0]) as u64)
+}
+
+// sqrt(-1) mod p = 2^((p-1)/4)
+fn c_i(m: *mut big.Big) {
+    var a: [u8; 32] = [
+        176, 160, 14, 74, 39, 27, 238, 196,
+        120, 228, 47, 173, 6, 24, 67, 47,
+        167, 215, 251, 61, 153, 0, 77, 43,
+        11, 223, 193, 79, 128, 36, 131, 43,
+    ]
+    from_le(m, (&a[0]) as u64)
+}
+
+// (p-5)/8, the exponent of the square root candidate
+fn c_p58(m: *mut big.Big) {
+    var a: [u8; 32] = [
+        253, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 15,
+    ]
+    from_le(m, (&a[0]) as u64)
+}
+
+// p-2, the exponent of the inversion
+fn c_pm2(m: *mut big.Big) {
+    var a: [u8; 32] = [
+        235, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 127,
+    ]
+    from_le(m, (&a[0]) as u64)
+}
+
+// The base point B (RFC 8032 5.1: y = 4/5, x the even root).
+fn c_bx(m: *mut big.Big) {
+    var a: [u8; 32] = [
+        26, 213, 37, 143, 96, 45, 86, 201,
+        178, 167, 37, 149, 96, 199, 44, 105,
+        92, 220, 214, 253, 49, 226, 164, 192,
+        254, 83, 110, 205, 211, 54, 105, 33,
+    ]
+    from_le(m, (&a[0]) as u64)
+}
+
+fn c_by(m: *mut big.Big) {
+    var a: [u8; 32] = [
+        88, 102, 102, 102, 102, 102, 102, 102,
+        102, 102, 102, 102, 102, 102, 102, 102,
+        102, 102, 102, 102, 102, 102, 102, 102,
+        102, 102, 102, 102, 102, 102, 102, 102,
+    ]
+    from_le(m, (&a[0]) as u64)
+}
+
+fn ctx_init(c: *mut Ctx) -> bool {
+    var p: big.Big = big.big_new()
+    c_p(&p)
+    if !big.mont_init(&(*c).fc, &p) {
+        return false
+    }
+    var l: big.Big = big.big_new()
+    c_l(&l)
+    if !big.mont_init(&(*c).sc, &l) {
+        return false
+    }
+    var d2: big.Big = big.big_new()
+    c_d2(&d2)
+    big.mont_to(&(*c).fc, &(*c).d2, &d2)
+    (*c).ok = true
+    return true
+}
+
+// ------------------------------------------------------- field shorthand
+
+fn f_mul(c: *mut Ctx, r: *mut big.Big, a: *mut big.Big, b: *mut big.Big) {
+    big.mont_mul(&(*c).fc, r, a, b)
+}
+
+fn f_add(c: *mut Ctx, r: *mut big.Big, a: *mut big.Big, b: *mut big.Big) {
+    big.big_add_mod(r, a, b, big.mont_modulus(&(*c).fc))
+}
+
+fn f_sub(c: *mut Ctx, r: *mut big.Big, a: *mut big.Big, b: *mut big.Big) {
+    big.big_sub_mod(r, a, b, big.mont_modulus(&(*c).fc))
+}
+
+// into the Montgomery domain
+fn f_in(c: *mut Ctx, r: *mut big.Big, a: *mut big.Big) {
+    big.mont_to(&(*c).fc, r, a)
+}
+
+fn f_out(c: *mut Ctx, r: *mut big.Big, a: *mut big.Big) {
+    big.mont_from(&(*c).fc, r, a)
+}
+
+fn f_zero(c: *mut Ctx, r: *mut big.Big) {
+    big.big_zero(r)
+    let ok: bool = big.big_set_len(r, 8)
+}
+
+fn f_one(c: *mut Ctx, r: *mut big.Big) {
+    big.big_copy(r, big.mont_one(&(*c).fc))
+}
+
+fn f_is_zero(a: *mut big.Big) -> bool {
+    return big.big_is_zero(a)
+}
+
+fn f_eq(a: *mut big.Big, b: *mut big.Big) -> bool {
+    return big.big_cmp(a, b) == 0
+}
+
+// ------------------------------------------------------------ the group
+
+fn pt_new() -> Pt {
+    return Pt { x: big.big_new(), y: big.big_new(), z: big.big_new(),
+        t: big.big_new() }
+}
+
+// The neutral element (0 : 1 : 1 : 0).
+fn pt_identity(c: *mut Ctx, r: *mut Pt) {
+    f_zero(c, &(*r).x)
+    f_one(c, &(*r).y)
+    f_one(c, &(*r).z)
+    f_zero(c, &(*r).t)
+}
+
+fn pt_copy(r: *mut Pt, a: *mut Pt) {
+    big.big_copy(&(*r).x, &(*a).x)
+    big.big_copy(&(*r).y, &(*a).y)
+    big.big_copy(&(*r).z, &(*a).z)
+    big.big_copy(&(*r).t, &(*a).t)
+}
+
+// r = s when mask is all ones, r = t when it is zero. Branch-free, and it
+// is the ONLY place the scalar reaches in `pt_scalarmul` (E1).
+fn pt_select(r: *mut Pt, t: *mut Pt, s: *mut Pt, mask: u64) {
+    big.select_into(&(*r).x, &(*t).x, &(*s).x, mask, 8)
+    big.select_into(&(*r).y, &(*t).y, &(*s).y, mask, 8)
+    big.select_into(&(*r).z, &(*t).z, &(*s).z, mask, 8)
+    big.select_into(&(*r).t, &(*t).t, &(*s).t, mask, 8)
+}
+
+// The complete addition law, `add-2008-hwcd-3` for a = -1:
+//
+//   A = (Y1-X1)*(Y2-X2)   B = (Y1+X1)*(Y2+X2)
+//   C = T1*2d*T2          D = Z1*2*Z2
+//   E = B-A   F = D-C   G = D+C   H = B+A
+//   X3 = E*F  Y3 = G*H  T3 = E*H  Z3 = F*G
+//
+// `r` may alias `a` or `b`: every product is computed into a local before
+// anything is written back.
+fn pt_add(c: *mut Ctx, r: *mut Pt, a: *mut Pt, b: *mut Pt) {
+    var t0: big.Big = big.big_new()
+    var t1: big.Big = big.big_new()
+    var aa: big.Big = big.big_new()
+    var bb: big.Big = big.big_new()
+    var cc: big.Big = big.big_new()
+    var dd: big.Big = big.big_new()
+    var ee: big.Big = big.big_new()
+    var ff: big.Big = big.big_new()
+    var gg: big.Big = big.big_new()
+    var hh: big.Big = big.big_new()
+
+    f_sub(c, &t0, &(*a).y, &(*a).x)
+    f_sub(c, &t1, &(*b).y, &(*b).x)
+    f_mul(c, &aa, &t0, &t1)
+
+    f_add(c, &t0, &(*a).y, &(*a).x)
+    f_add(c, &t1, &(*b).y, &(*b).x)
+    f_mul(c, &bb, &t0, &t1)
+
+    f_mul(c, &t0, &(*a).t, &(*c).d2)
+    f_mul(c, &cc, &t0, &(*b).t)
+
+    f_mul(c, &t0, &(*a).z, &(*b).z)
+    f_add(c, &dd, &t0, &t0)
+
+    f_sub(c, &ee, &bb, &aa)
+    f_sub(c, &ff, &dd, &cc)
+    f_add(c, &gg, &dd, &cc)
+    f_add(c, &hh, &bb, &aa)
+
+    f_mul(c, &(*r).x, &ee, &ff)
+    f_mul(c, &(*r).y, &gg, &hh)
+    f_mul(c, &(*r).t, &ee, &hh)
+    f_mul(c, &(*r).z, &ff, &gg)
+}
+
+// r = k * P, with `k` the 32 little-endian octets of the scalar. See E1:
+// the loop is 256 iterations long whatever `k` is, both additions always
+// run, and the bit only drives a masked select.
+fn pt_scalarmul(c: *mut Ctx, r: *mut Pt, p: *mut Pt, k: u64) {
+    var acc: Pt = pt_new()
+    pt_identity(c, &acc)
+    var dbl: Pt = pt_new()
+    var sum: Pt = pt_new()
+    var i: usize = 256
+    while i > 0 {
+        i = i - 1
+        pt_add(c, &dbl, &acc, &acc)
+        pt_add(c, &sum, &dbl, p)
+        let bit: u64 = ((ld8(k, i / 8) as u64) >> ((i % 8) as u64)) & 1
+        let mask: u64 = (0 as u64) -% bit
+        pt_select(&acc, &dbl, &sum, mask)
+    }
+    pt_copy(r, &acc)
+}
+
+// z^-1 by Fermat: z^(p-2). The exponent is the public constant (E2).
+fn f_inv(c: *mut Ctx, r: *mut big.Big, a: *mut big.Big) {
+    var e: big.Big = big.big_new()
+    c_pm2(&e)
+    big.mont_pow(&(*c).fc, r, a, &e)
+}
+
+// RFC 8032 5.1.2: the y coordinate in 32 little-endian octets, with the
+// low bit of x in the top bit.
+fn pt_compress(c: *mut Ctx, p: *mut Pt, out: u64) {
+    var zi: big.Big = big.big_new()
+    f_inv(c, &zi, &(*p).z)
+    var xr: big.Big = big.big_new()
+    var yr: big.Big = big.big_new()
+    f_mul(c, &xr, &(*p).x, &zi)
+    f_mul(c, &yr, &(*p).y, &zi)
+    var xp: big.Big = big.big_new()
+    var yp: big.Big = big.big_new()
+    f_out(c, &xp, &xr)
+    f_out(c, &yp, &yr)
+    to_le(&yp, out)
+    let sign: u8 = (((xp.d[0] as u64) & 1) << 7) as u8
+    st8(out, 31, (ld8(out, 31) as u64 | (sign as u64)) as u8)
+}
+
+// RFC 8032 5.1.3, and it REFUSES rather than guesses:
+//   * y must be a canonical field element (below p),
+//   * x^2 = (y^2-1)/(d*y^2+1) must have a square root,
+//   * x = 0 with the sign bit set is the one encoding that is rejected
+//     outright, because it is a second name for a point that already has
+//     one.
+fn pt_decompress(c: *mut Ctx, r: *mut Pt, inp: u64) -> bool {
+    var raw: [u8; 32] = [0; 32]
+    var i: usize = 0
+    while i < 32 {
+        raw[i] = ld8(inp, i)
+        i = i + 1
+    }
+    let sign: u64 = ((raw[31] as u64) >> 7) & 1
+    raw[31] = ((raw[31] as u64) & 127) as u8
+
+    var y: big.Big = big.big_new()
+    from_le(&y, (&raw[0]) as u64)
+    var p: big.Big = big.big_new()
+    c_p(&p)
+    if big.big_cmp(&y, &p) >= 0 {
+        return false // not a canonical encoding
+    }
+
+    var ym: big.Big = big.big_new()
+    f_in(c, &ym, &y)
+    var one: big.Big = big.big_new()
+    f_one(c, &one)
+    var y2: big.Big = big.big_new()
+    f_mul(c, &y2, &ym, &ym)
+    var u: big.Big = big.big_new()
+    f_sub(c, &u, &y2, &one)          // u = y^2 - 1
+    var dn: big.Big = big.big_new()
+    c_d(&dn)
+    var dm: big.Big = big.big_new()
+    f_in(c, &dm, &dn)
+    var v: big.Big = big.big_new()
+    f_mul(c, &v, &dm, &y2)
+    f_add(c, &v, &v, &one)           // v = d*y^2 + 1
+
+    // x = u*v^3 * (u*v^7)^((p-5)/8)
+    var v2: big.Big = big.big_new()
+    f_mul(c, &v2, &v, &v)
+    var v3: big.Big = big.big_new()
+    f_mul(c, &v3, &v2, &v)
+    var v7: big.Big = big.big_new()
+    f_mul(c, &v7, &v3, &v3)
+    f_mul(c, &v7, &v7, &v)
+    var uv7: big.Big = big.big_new()
+    f_mul(c, &uv7, &u, &v7)
+    var e: big.Big = big.big_new()
+    c_p58(&e)
+    var pw: big.Big = big.big_new()
+    big.mont_pow(&(*c).fc, &pw, &uv7, &e)
+    var x: big.Big = big.big_new()
+    f_mul(c, &x, &u, &v3)
+    f_mul(c, &x, &x, &pw)
+
+    // v*x^2 must be u; if it is -u, multiply by sqrt(-1); otherwise there
+    // is no root and the encoding is not a point.
+    var x2: big.Big = big.big_new()
+    f_mul(c, &x2, &x, &x)
+    var vx2: big.Big = big.big_new()
+    f_mul(c, &vx2, &v, &x2)
+    if !f_eq(&vx2, &u) {
+        var nu: big.Big = big.big_new()
+        var z0: big.Big = big.big_new()
+        f_zero(c, &z0)
+        f_sub(c, &nu, &z0, &u)
+        if !f_eq(&vx2, &nu) {
+            return false
+        }
+        var iv: big.Big = big.big_new()
+        c_i(&iv)
+        var im: big.Big = big.big_new()
+        f_in(c, &im, &iv)
+        f_mul(c, &x, &x, &im)
+        f_mul(c, &x2, &x, &x)
+        f_mul(c, &vx2, &v, &x2)
+        if !f_eq(&vx2, &u) {
+            return false
+        }
+    }
+
+    var xp: big.Big = big.big_new()
+    f_out(c, &xp, &x)
+    if f_is_zero(&xp) && sign == 1 {
+        return false
+    }
+    if (((xp.d[0] as u64) & 1)) != sign {
+        var z0: big.Big = big.big_new()
+        f_zero(c, &z0)
+        f_sub(c, &x, &z0, &x)
+    }
+
+    big.big_copy(&(*r).x, &x)
+    big.big_copy(&(*r).y, &ym)
+    f_one(c, &(*r).z)
+    f_mul(c, &(*r).t, &x, &ym)
+    return true
+}
+
+fn pt_eq(c: *mut Ctx, a: *mut Pt, b: *mut Pt) -> bool {
+    // X1*Z2 == X2*Z1 and Y1*Z2 == Y2*Z1
+    var l0: big.Big = big.big_new()
+    var r0: big.Big = big.big_new()
+    f_mul(c, &l0, &(*a).x, &(*b).z)
+    f_mul(c, &r0, &(*b).x, &(*a).z)
+    if !f_eq(&l0, &r0) {
+        return false
+    }
+    f_mul(c, &l0, &(*a).y, &(*b).z)
+    f_mul(c, &r0, &(*b).y, &(*a).z)
+    return f_eq(&l0, &r0)
+}
+
+fn pt_base(c: *mut Ctx, r: *mut Pt) {
+    var bx: big.Big = big.big_new()
+    var by: big.Big = big.big_new()
+    c_bx(&bx)
+    c_by(&by)
+    f_in(c, &(*r).x, &bx)
+    f_in(c, &(*r).y, &by)
+    f_one(c, &(*r).z)
+    f_mul(c, &(*r).t, &(*r).x, &(*r).y)
+}
+
+// ------------------------------------------------------------ scalars
+
+// r = (the 512 bit little-endian number at `h`) mod L. See E3: bit by bit,
+// no branch on the data.
+fn sc_reduce_wide(c: *mut Ctx, r: *mut big.Big, h: u64) {
+    let m: *mut big.Big = big.mont_modulus(&(*c).sc)
+    big.big_zero(r)
+    let ok: bool = big.big_set_len(r, 8)
+    var bit: big.Big = big.big_new()
+    let ok2: bool = big.big_set_len(&bit, 8)
+    var i: usize = 512
+    while i > 0 {
+        i = i - 1
+        big.big_add_mod(r, r, r, m)
+        let b: u64 = ((ld8(h, i / 8) as u64) >> ((i % 8) as u64)) & 1
+        bit.d[0] = b as u32
+        big.big_add_mod(r, r, &bit, m)
+    }
+}
+
+// r = (a + b*cf) mod L, all three below L on entry.
+fn sc_muladd(c: *mut Ctx, r: *mut big.Big, a: *mut big.Big,
+    b: *mut big.Big, cf: *mut big.Big) {
+    var bm: big.Big = big.big_new()
+    var cm: big.Big = big.big_new()
+    big.mont_to(&(*c).sc, &bm, b)
+    big.mont_to(&(*c).sc, &cm, cf)
+    var pm: big.Big = big.big_new()
+    big.mont_mul(&(*c).sc, &pm, &bm, &cm)
+    var pr: big.Big = big.big_new()
+    big.mont_from(&(*c).sc, &pr, &pm)
+    big.big_add_mod(r, a, &pr, big.mont_modulus(&(*c).sc))
+}
+
+// ---------------------------------------------------------- the scheme
+
+// h = SHA-512(seed); a = clamp(h[0..32]) as a number, prefix = h[32..64].
+fn expand(seed: u64, a_out: u64, prefix: u64) {
+    var h: [u8; 64] = [0; 64]
+    sha512.sha512(seed, SEED_LEN, (&h[0]) as u64)
+    h[0] = ((h[0] as u64) & 248) as u8
+    h[31] = ((h[31] as u64) & 127) as u8
+    h[31] = ((h[31] as u64) | 64) as u8
+    var i: usize = 0
+    while i < 32 {
+        st8(a_out, i, h[i])
+        st8(prefix, i, h[32 + i])
+        i = i + 1
+    }
+}
+
+// The public key of a 32 octet seed.
+fn ed25519_public(c: *mut Ctx, seed: u64, out: u64) -> bool {
+    if !(*c).ok {
+        return false
+    }
+    var a: [u8; 32] = [0; 32]
+    var pre: [u8; 32] = [0; 32]
+    expand(seed, (&a[0]) as u64, (&pre[0]) as u64)
+    var b: Pt = pt_new()
+    pt_base(c, &b)
+    var ap: Pt = pt_new()
+    pt_scalarmul(c, &ap, &b, (&a[0]) as u64)
+    pt_compress(c, &ap, out)
+    return true
+}
+
+// RFC 8032 5.1.6. `sig` receives 64 octets: R || S.
+fn ed25519_sign(c: *mut Ctx, seed: u64, msg: u64, mlen: usize,
+    sig: u64) -> bool {
+    if !(*c).ok {
+        return false
+    }
+    var a: [u8; 32] = [0; 32]
+    var pre: [u8; 32] = [0; 32]
+    expand(seed, (&a[0]) as u64, (&pre[0]) as u64)
+
+    var bp: Pt = pt_new()
+    pt_base(c, &bp)
+    var ap: Pt = pt_new()
+    pt_scalarmul(c, &ap, &bp, (&a[0]) as u64)
+    var apub: [u8; 32] = [0; 32]
+    pt_compress(c, &ap, (&apub[0]) as u64)
+
+    // r = SHA-512(prefix || M) mod L
+    var hs: sha512.Sha512 = sha512.sha512_new()
+    sha512.sha512_update(&hs, (&pre[0]) as u64, 32)
+    sha512.sha512_update(&hs, msg, mlen)
+    var hb: [u8; 64] = [0; 64]
+    sha512.sha512_final(&hs, (&hb[0]) as u64)
+    var rr: big.Big = big.big_new()
+    sc_reduce_wide(c, &rr, (&hb[0]) as u64)
+    var rbytes: [u8; 32] = [0; 32]
+    to_le(&rr, (&rbytes[0]) as u64)
+
+    // R = r*B
+    var rp: Pt = pt_new()
+    pt_scalarmul(c, &rp, &bp, (&rbytes[0]) as u64)
+    var rc: [u8; 32] = [0; 32]
+    pt_compress(c, &rp, (&rc[0]) as u64)
+
+    // k = SHA-512(R || A || M) mod L
+    hs = sha512.sha512_new()
+    sha512.sha512_update(&hs, (&rc[0]) as u64, 32)
+    sha512.sha512_update(&hs, (&apub[0]) as u64, 32)
+    sha512.sha512_update(&hs, msg, mlen)
+    sha512.sha512_final(&hs, (&hb[0]) as u64)
+    var kk: big.Big = big.big_new()
+    sc_reduce_wide(c, &kk, (&hb[0]) as u64)
+
+    // S = (r + k*a) mod L
+    var an: big.Big = big.big_new()
+    from_le(&an, (&a[0]) as u64)
+    var anr: big.Big = big.big_new()
+    let okm: bool = big.big_mod(&anr, &an, big.mont_modulus(&(*c).sc))
+    var ss: big.Big = big.big_new()
+    sc_muladd(c, &ss, &rr, &kk, &anr)
+
+    var i: usize = 0
+    while i < 32 {
+        st8(sig, i, rc[i])
+        i = i + 1
+    }
+    var sb: [u8; 32] = [0; 32]
+    to_le(&ss, (&sb[0]) as u64)
+    i = 0
+    while i < 32 {
+        st8(sig, 32 + i, sb[i])
+        i = i + 1
+    }
+    return true
+}
+
+// RFC 8032 5.1.7. `false` means DO NOT USE THIS PACKAGE -- there is no
+// second, weaker answer.
+fn ed25519_verify(c: *mut Ctx, pub_key: u64, msg: u64, mlen: usize,
+    sig: u64) -> bool {
+    if !(*c).ok {
+        return false
+    }
+    // S must be a canonical scalar. An S >= L is a different encoding of
+    // the same signature and accepting it makes signatures malleable.
+    var sb: [u8; 32] = [0; 32]
+    var i: usize = 0
+    while i < 32 {
+        sb[i] = ld8(sig, 32 + i)
+        i = i + 1
+    }
+    var ss: big.Big = big.big_new()
+    from_le(&ss, (&sb[0]) as u64)
+    if big.big_cmp(&ss, big.mont_modulus(&(*c).sc)) >= 0 {
+        return false
+    }
+
+    var ap: Pt = pt_new()
+    if !pt_decompress(c, &ap, pub_key) {
+        return false
+    }
+    var rp: Pt = pt_new()
+    if !pt_decompress(c, &rp, sig) {
+        return false
+    }
+
+    // k = SHA-512(R || A || M) mod L
+    var hs: sha512.Sha512 = sha512.sha512_new()
+    sha512.sha512_update(&hs, sig, 32)
+    sha512.sha512_update(&hs, pub_key, 32)
+    sha512.sha512_update(&hs, msg, mlen)
+    var hb: [u8; 64] = [0; 64]
+    sha512.sha512_final(&hs, (&hb[0]) as u64)
+    var kk: big.Big = big.big_new()
+    sc_reduce_wide(c, &kk, (&hb[0]) as u64)
+    var kb: [u8; 32] = [0; 32]
+    to_le(&kk, (&kb[0]) as u64)
+
+    // [S]B == R + [k]A
+    var bp: Pt = pt_new()
+    pt_base(c, &bp)
+    var lhs: Pt = pt_new()
+    pt_scalarmul(c, &lhs, &bp, (&sb[0]) as u64)
+    var ka: Pt = pt_new()
+    pt_scalarmul(c, &ka, &ap, (&kb[0]) as u64)
+    var rhs: Pt = pt_new()
+    pt_add(c, &rhs, &rp, &ka)
+    return pt_eq(c, &lhs, &rhs)
+}

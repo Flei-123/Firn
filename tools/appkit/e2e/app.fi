@@ -1,0 +1,244 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/appkit/e2e/app.fi -- THE TEST PROGRAM of the update end-to-end run
+// (tools/appkit/e2e.sh). A command line program built on lib/appkit; the
+// script builds it several times with different FIRN_E2E_* values (version,
+// store address, behaviour) and drives it against a local test store.
+//
+//   app version            print the compiled-in version
+//   app check [mode]       check the store, print the answer
+//   app fetch [mode]       check, then download and verify
+//   app fetchcancel [mode] fetch, cancel while it downloads
+//   app update             check, download, apply, start the new version,
+//                          supervise it (the whole flow, blocking)
+//   app run                a normal start: boot bookkeeping, then confirm
+//                          after a second (behaviour crash/hang: do not)
+//   app state              print what the state file holds
+//   mode: thread | process | blocking (default thread)
+//
+// Every answer is one line "KEY value ..." so the script can compare text.
+import std.rt
+import std.io
+import std.time
+import appkit.appinfo
+import appkit.platform
+import appkit.update
+import appkit.log
+import appkit.config
+import appkit.util
+
+const VERSION: str = __env_or("FIRN_E2E_VERSION", "1.0.0")
+const STORE_URL: str = __env_or("FIRN_E2E_STORE", "http://127.0.0.1:8099/")
+const STORE_KEY: str = __env_or("FIRN_E2E_KEY", "0000000000000000000000000000000000000000000000000000000000000000")
+const CHANNEL: str = __env_or("FIRN_E2E_CHANNEL", "stabil")
+const BEHAVIOR: str = __env_or("FIRN_E2E_BEHAVIOR", "good")
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    return update.thread_dispatch(kind, arg)
+}
+
+fn say(label: str, v: str) {
+    io.print(label)
+    io.print(" ")
+    io.print_line(v)
+}
+
+fn say_num(label: str, v: u64) {
+    var b: rt.Buf = rt.buf_new()
+    util.buf_push_str(&b, label)
+    rt.buf_push(&b, 32 as u8)
+    rt.buf_push_dec_u64(&b, v)
+    rt.buf_push(&b, 10 as u8)
+    io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+fn mode_of(i: usize) -> u32 {
+    let m: str = update.update_user_arg(i)
+    if m == "process" { return update.RUN_PROCESS }
+    if m == "blocking" { return update.RUN_BLOCKING }
+    return update.RUN_THREAD
+}
+
+fn wait_done(u: *mut update.Updater) {
+    var last_done: u64 = 0
+    var guard: u64 = 0
+    while guard < 4000 {
+        let changed: bool = update.update_poll(u)
+        let s: *mut update.Status = update.update_status(u)
+        if changed && (*s).phase == update.PH_DOWNLOADING && (*s).done != last_done {
+            last_done = (*s).done
+            var b: rt.Buf = rt.buf_new()
+            util.buf_push_str(&b, "PROGRESS ")
+            rt.buf_push_dec_u64(&b, (*s).done)
+            rt.buf_push(&b, 32 as u8)
+            rt.buf_push_dec_u64(&b, (*s).total)
+            rt.buf_push(&b, 10 as u8)
+            io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+            rt.buf_free(&b)
+        }
+        if !update.update_busy(u) {
+            // one more poll: a worker process may have written its last file
+            update.update_poll(u)
+            if !update.update_busy(u) { break }
+        }
+        time.sleep_ms(20)
+        guard = guard + 1
+    }
+    let s2: *mut update.Status = update.update_status(u)
+    if (*s2).total > 0 as u64 && (*s2).phase == update.PH_READY {
+        var b: rt.Buf = rt.buf_new()
+        util.buf_push_str(&b, "PROGRESS ")
+        rt.buf_push_dec_u64(&b, (*s2).done)
+        rt.buf_push(&b, 32 as u8)
+        rt.buf_push_dec_u64(&b, (*s2).total)
+        rt.buf_push(&b, 10 as u8)
+        io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+        rt.buf_free(&b)
+    }
+}
+
+fn report(u: *mut update.Updater) {
+    let s: *mut update.Status = update.update_status(u)
+    var b: rt.Buf = rt.buf_new()
+    util.buf_push_str(&b, "RESULT ")
+    util.buf_push_str(&b, update.status_text((*s).phase))
+    util.buf_push_str(&b, " err=")
+    rt.buf_push_dec_u64(&b, (*s).err)
+    util.buf_push_str(&b, " ver=")
+    util.buf_push_str(&b, update.status_version(s))
+    util.buf_push_str(&b, " size=")
+    rt.buf_push_dec_u64(&b, (*s).size)
+    util.buf_push_str(&b, " rollback=")
+    rt.buf_push_dec_u64(&b, (*s).rollback)
+    rt.buf_push(&b, 10 as u8)
+    io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    if (*s).nerr > 0 {
+        say("ERRTEXT", update.status_error(s))
+    }
+}
+
+fn main(start: u64) -> i32 {
+    platform.plat_init(start)
+    var spec: appinfo.AppSpec = appinfo.AppSpec { id: "e2eapp", name: "E2E App",
+        vendor: "FirnE2E", version: VERSION, build: 0, channel: CHANNEL,
+        store_url: STORE_URL, store_key: STORE_KEY, android_id: "org.firn.e2eapp" }
+    if !appinfo.appinfo_init(spec) {
+        say("FATAL", "appinfo_init failed")
+        return 2
+    }
+    let u: *mut update.Updater = update.update_new()
+    if !update.update_init(u) {
+        say("FATAL", "update_init failed")
+        return 2
+    }
+    update.update_set_verify_tls(u, false)
+    var logdir: rt.Buf = rt.buf_new()
+    platform.plat_dir(platform.DIR_LOG, appinfo.app_id(), appinfo.app_vendor(), &logdir)
+    log.log_open(util.buf_to_str_copy(&logdir), "e2e", log.LOG_DEBUG, 262144, 2)
+    rt.buf_free(&logdir)
+    update.update_boot(u)
+    let cmd: str = update.update_user_arg(1)
+    if cmd == "version" {
+        say("VERSION", VERSION)
+        return 0
+    }
+    if cmd == "run" {
+        say("RUNNING", VERSION)
+        if update.update_started_after_update() { say("STARTED", "after-update") }
+        if update.update_started_after_rollback() { say("STARTED", "after-rollback") }
+        if BEHAVIOR == "crash" {
+            say("BEHAVIOR", "crash")
+            return 3
+        }
+        if BEHAVIOR == "hang" {
+            say("BEHAVIOR", "hang")
+            time.sleep_ms(600000)
+            return 0
+        }
+        time.sleep_ms(500)
+        update.update_mark_healthy(u)
+        say("HEALTHY", VERSION)
+        return 0
+    }
+    if cmd == "check" || cmd == "fetch" {
+        var op: u32 = update.OP_CHECK
+        if cmd == "fetch" { op = update.OP_FETCH }
+        if !update.update_start(u, op, mode_of(2)) {
+            say("FATAL", "update_start failed")
+            return 2
+        }
+        wait_done(u)
+        report(u)
+        return 0
+    }
+    if cmd == "fetchcancel" {
+        if !update.update_start(u, update.OP_FETCH, mode_of(2)) {
+            say("FATAL", "update_start failed")
+            return 2
+        }
+        // wait until the download runs, let it run a moment, then cancel
+        var guard: u64 = 0
+        while guard < 600 {
+            update.update_poll(u)
+            let s: *mut update.Status = update.update_status(u)
+            if (*s).phase == update.PH_DOWNLOADING && (*s).done > 0 as u64 { break }
+            if !update.update_busy(u) { break }
+            time.sleep_ms(20)
+            guard = guard + 1
+        }
+        time.sleep_ms(300)
+        update.update_cancel(u)
+        wait_done(u)
+        report(u)
+        return 0
+    }
+    if cmd == "update" {
+        if !update.update_start(u, update.OP_FETCH, mode_of(2)) {
+            say("FATAL", "update_start failed")
+            return 2
+        }
+        wait_done(u)
+        report(u)
+        let s: *mut update.Status = update.update_status(u)
+        if (*s).phase != update.PH_READY {
+            return 1
+        }
+        var args: util.Args = util.args_new()
+        util.args_push(&args, "run")
+        let rc: u32 = update.update_apply(u, &args)
+        say_num("APPLY", rc as u64)
+        if rc != platform.AP_OK {
+            report(u)
+            return 1
+        }
+        let healthy: bool = update.update_supervise(u)
+        if healthy { say("SUPERVISE", "healthy") } else { say("SUPERVISE", "rolledback") }
+        return 0
+    }
+    if cmd == "state" {
+        let st: *mut config.Config = update.update_state(u)
+        var b: rt.Buf = rt.buf_new()
+        var i: usize = 0
+        while i < config.config_count(st) {
+            let k: str = config.config_key_at(st, i)
+            util.buf_push_str(&b, "STATE ")
+            util.buf_push_str(&b, k)
+            rt.buf_push(&b, 61 as u8)
+            var v: rt.Buf = rt.buf_new()
+            if config.get_str(st, k, "", &v) {
+                rt.buf_push_bytes(&b, rt.buf_ptr(&v), rt.buf_len(&v))
+            } else {
+                rt.buf_push_dec_i64(&b, config.get_int(st, k, 0))
+            }
+            rt.buf_free(&v)
+            rt.buf_push(&b, 10 as u8)
+            i = i + 1
+        }
+        io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+        rt.buf_free(&b)
+        return 0
+    }
+    say("USAGE", "version|check|fetch|update|run|state")
+    return 2
+}

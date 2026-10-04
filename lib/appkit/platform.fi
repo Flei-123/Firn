@@ -1,0 +1,586 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/platform.fi -- THE PLATFORM LAYER, Linux (and any POSIX).
+//
+// ONE INTERFACE, ONE FILE PER PLATFORM. Every appkit module that touches
+// the operating system calls the `plat_*` functions below and nothing
+// else. The same names with the same meaning exist in:
+//
+//   lib/appkit/platform.fi            Linux (this file; the default)
+//   lib/appkit/platform.windows.fi    Windows  (the compiler picks it for
+//                                     --target=x86_64-windows, the module
+//                                     twin rule of modules.rs)
+//   lib/@android/appkit/platform.fi   Android  (picked for the Android
+//                                     targets, the platform directory rule)
+//   lib/appkit/platform_macos.fi      macOS    (UNTESTED: Firn has no macOS
+//                                     target; see docs/APPKIT.md)
+//   lib/appkit/platform_osum.fi       OrientOS (UNTESTED here; written
+//                                     against the OrientOS tree)
+//
+// tools/appkit/platforms.sh checks that all five export the same names.
+//
+// THE CONTRACT (what a platform file provides)
+//   plat_init(start)                  remember the start block (argv, env)
+//   plat_os() / plat_arch() / plat_id() / plat_art()
+//        "linux" / "x86_64" / "linux-x86_64" / "bin"|"appimage"
+//        -- plat_id is the catalog's platform name, plat_art the package
+//        kind this platform installs
+//   plat_argc() / plat_arg(i)         the command line
+//   plat_env_get(name, out)           an environment variable
+//   plat_dir(kind, app, vendor, out)  config / data / state / cache / log
+//   plat_exe_path(out)                the file to replace on an update
+//   plat_self_pid() / plat_pid_alive(pid) / plat_kill(pid)
+//   plat_spawn_detached(path, args)   start a program, do not wait
+//   plat_lock(path) / plat_unlock(h)  the single instance lock
+//   plat_apply(newf, exe, backup)     put `newf` in place of `exe`, keeping
+//        the old one as `backup` (an atomic rename where the OS has one)
+//   plat_rollback(exe, backup)        put the backup back
+//   plat_can_write_beside(exe)        may the update be staged next to exe?
+//   plat_swap_kind()                  SWAP_FILES or SWAP_INSTALLER
+//   plat_stage_path(exe, out)         where the downloaded file is kept until
+//        it is applied (next to the executable, so the rename stays on one
+//        volume; Android/OrientOS: a cache file)
+//   plat_threads()                    does thread_start work here?
+//   plat_can_self_update()            may this program replace itself?
+//   plat_install_hint()               a sentence for the user when it may not
+//   plat_exit(code)
+//
+// LINUX NOTES
+//   * the executable is `readlink /proc/self/exe`; when it was replaced on
+//     disk the kernel appends " (deleted)", which is cut off. A program
+//     started from an AppImage reports $APPIMAGE instead (the AppImage
+//     file is what an update replaces, not the FUSE mount).
+//   * files that are replaced are replaced by `rename`: the running process
+//     keeps its old inode, so replacing a running binary is safe on Linux.
+//   * the backup is a COPY, not a hard link: it works on every file system.
+//   * syscalls used beyond std.fs: readlink 89, fcntl 72, fork 57,
+//     execve 59, wait4 61, kill 62, setsid 112, uname 63, getpid 39.
+//     (aarch64 needs 72/112 in compiler/src/syscalls.rs -- the std.process
+//     round adds them -- and 89, which this round adds.)
+import std.rt
+import std.fs
+import std.time
+import appkit.util
+
+export {
+    plat_init, plat_os, plat_arch, plat_id, plat_art, plat_argc, plat_arg,
+    plat_env_get, plat_dir, plat_exe_path, plat_self_pid, plat_pid_alive,
+    plat_kill, plat_spawn_detached, plat_lock, plat_unlock, plat_apply,
+    plat_rollback, plat_can_write_beside, plat_threads,
+    plat_can_self_update, plat_install_hint, plat_exit, plat_sleep_ms,
+    plat_file_copy, plat_chmod_exec, plat_path_sep, plat_stage_path,
+    plat_swap_kind, SWAP_FILES, SWAP_INSTALLER,
+    DIR_CONFIG, DIR_DATA, DIR_STATE, DIR_CACHE, DIR_LOG,
+    AP_OK, AP_NO_NEW, AP_BACKUP, AP_RENAME, AP_PERM, AP_UNSUPPORTED,
+    AP_STAGED,
+}
+
+const DIR_CONFIG: u32 = 0
+const DIR_DATA: u32 = 1
+const DIR_STATE: u32 = 2
+const DIR_CACHE: u32 = 3
+const DIR_LOG: u32 = 4
+
+// results of plat_apply / plat_rollback
+const AP_OK: u32 = 0
+const AP_NO_NEW: u32 = 1 // the downloaded file is not there
+const AP_BACKUP: u32 = 2 // the backup could not be made
+const AP_RENAME: u32 = 3 // the swap itself failed
+const AP_PERM: u32 = 4 // no right to write there
+const AP_UNSUPPORTED: u32 = 5 // this platform does not self-update this way
+const AP_STAGED: u32 = 6 // handed to the system; it finishes without us
+
+// how an update is put in place on this platform
+const SWAP_FILES: u32 = 0 // the program file is replaced (Linux, Windows, macOS)
+const SWAP_INSTALLER: u32 = 1 // the system installs it (Android PackageInstaller, OrientOS opk)
+
+const SYS_READLINK: i64 = 89
+const SYS_FCNTL: i64 = 72
+const SYS_FORK: i64 = 57
+const SYS_EXECVE: i64 = 59
+const SYS_WAIT4: i64 = 61
+const SYS_KILL: i64 = 62
+const SYS_SETSID: i64 = 112
+const SYS_UNAME: i64 = 63
+const SYS_GETPID: i64 = 39
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const SYS_READ: i64 = 0
+const SYS_WRITE: i64 = 1
+const SYS_CHMOD: i64 = 90
+const O_RDONLY: i64 = 0
+const O_RDWR_CREAT: i64 = 66 // O_RDWR | O_CREAT
+const O_WRITE_NEW: i64 = 577 // O_WRONLY | O_CREAT | O_TRUNC
+const F_SETLK: i64 = 6
+
+static mut G_START: u64 = 0
+static mut G_ARCH: [u8; 16] = [0; 16]
+static mut G_NARCH: usize = 0
+static mut G_ID: [u8; 32] = [0; 32]
+static mut G_NID: usize = 0
+
+fn plat_init(start: u64) {
+    G_START = start
+}
+
+fn plat_os() -> str {
+    return "linux"
+}
+
+fn plat_path_sep() -> str {
+    return "/"
+}
+
+fn plat_argc() -> usize {
+    return rt.arg_count(G_START)
+}
+
+// argument `i` (0 = the program name) as a view of the start block
+fn plat_arg(i: usize) -> str {
+    let p: u64 = rt.arg_ptr(G_START, i)
+    if p == 0 as u64 {
+        return ""
+    }
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+// the machine name of the kernel, normalised: x86_64, aarch64, arm, x86
+fn plat_arch() -> str {
+    if G_NARCH == 0 {
+        var u: [u8; 390] = [0; 390]
+        let r: i64 = syscall(SYS_UNAME, (&u[0]) as i64, 0, 0, 0, 0, 0)
+        var n: usize = 0
+        if r >= 0 {
+            while n < 64 && u[260 + n] != 0 as u8 {
+                n = n + 1
+            }
+        }
+        var m: str = str { p: (&u[260]) as *mut u8, n: n }
+        var out: str = "x86_64"
+        if m == "aarch64" || m == "arm64" {
+            out = "aarch64"
+        } else if m == "x86_64" || m == "amd64" {
+            out = "x86_64"
+        } else if util.starts_with(m, "armv") {
+            out = "arm"
+        } else if m == "i686" || m == "i386" || m == "i586" {
+            out = "x86"
+        } else if n > 0 {
+            out = "x86_64"
+        }
+        rt.mem_copy((&G_ARCH[0]) as u64, out.p as u64, out.n)
+        G_NARCH = out.n
+    }
+    return str { p: (&G_ARCH[0]) as *mut u8, n: G_NARCH }
+}
+
+// the platform name used in the catalog's `plattformen`
+fn plat_id() -> str {
+    if G_NID == 0 {
+        let a: str = plat_arch()
+        rt.mem_copy((&G_ID[0]) as u64, "linux-".p as u64, 6)
+        rt.mem_copy((&G_ID[0]) as u64 + 6 as u64, a.p as u64, a.n)
+        G_NID = 6 + a.n
+    }
+    return str { p: (&G_ID[0]) as *mut u8, n: G_NID }
+}
+
+// the package kind this program installs: an AppImage updates as an
+// AppImage, everything else as a plain binary
+fn plat_art() -> str {
+    var b: rt.Buf = rt.buf_new()
+    let appimage: bool = plat_env_get("APPIMAGE", &b) && rt.buf_len(&b) > 0
+    rt.buf_free(&b)
+    if appimage {
+        return "appimage"
+    }
+    return "bin"
+}
+
+// ------------------------------------------------------------ environment
+
+// value of NAME from the process environment (the start block's envp)
+fn plat_env_get(name: str, out: *mut rt.Buf) -> bool {
+    if G_START == 0 as u64 {
+        return false
+    }
+    let argc: usize = rt.arg_count(G_START)
+    var i: usize = argc + 2
+    while true {
+        let p: u64 = rt.ld64(G_START, i)
+        if p == 0 as u64 {
+            return false
+        }
+        let n: usize = rt.c_length(p)
+        if n > name.n && rt.ld8(p, name.n) == 61 as u8 && rt.mem_eq(p, name.p as u64, name.n) {
+            rt.buf_clear(out)
+            rt.buf_push_bytes(out, p + name.n as u64 + 1 as u64, n - name.n - 1)
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn env_or(name: str, dflt: str, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    var v: rt.Buf = rt.buf_new()
+    if plat_env_get(name, &v) && rt.buf_len(&v) > 0 {
+        rt.buf_push_bytes(out, rt.buf_ptr(&v), rt.buf_len(&v))
+    } else {
+        rt.buf_push_bytes(out, dflt.p as u64, dflt.n)
+    }
+    rt.buf_free(&v)
+}
+
+// ------------------------------------------------------------ directories
+
+// Where this program keeps `kind` of data, WITHOUT creating it. XDG rules:
+//   config  $XDG_CONFIG_HOME or ~/.config          /<app>
+//   data    $XDG_DATA_HOME   or ~/.local/share     /<app>
+//   state   $XDG_STATE_HOME  or ~/.local/state     /<app>
+//   cache   $XDG_CACHE_HOME  or ~/.cache           /<app>
+//   log     <state>/logs
+// `app` is the directory name; `vendor` is not used on Linux.
+fn plat_dir(kind: u32, app: str, vendor: str, out: *mut rt.Buf) -> bool {
+    var home: rt.Buf = rt.buf_new()
+    env_or("HOME", "", &home)
+    var base: rt.Buf = rt.buf_new()
+    var ok: bool = true
+    var xdg: str = "XDG_CONFIG_HOME"
+    var rel: str = "/.config"
+    if kind == DIR_DATA {
+        xdg = "XDG_DATA_HOME"
+        rel = "/.local/share"
+    } else if kind == DIR_STATE || kind == DIR_LOG {
+        xdg = "XDG_STATE_HOME"
+        rel = "/.local/state"
+    } else if kind == DIR_CACHE {
+        xdg = "XDG_CACHE_HOME"
+        rel = "/.cache"
+    }
+    var x: rt.Buf = rt.buf_new()
+    if plat_env_get(xdg, &x) && rt.buf_len(&x) > 0 && rt.ld8(rt.buf_ptr(&x), 0) == 47 as u8 {
+        rt.buf_push_bytes(&base, rt.buf_ptr(&x), rt.buf_len(&x))
+    } else if rt.buf_len(&home) > 0 {
+        rt.buf_push_bytes(&base, rt.buf_ptr(&home), rt.buf_len(&home))
+        util.buf_push_str(&base, rel)
+    } else {
+        ok = false
+    }
+    rt.buf_free(&x)
+    rt.buf_free(&home)
+    if ok {
+        rt.buf_clear(out)
+        rt.buf_push_bytes(out, rt.buf_ptr(&base), rt.buf_len(&base))
+        rt.buf_push(out, 47 as u8)
+        util.buf_push_str(out, app)
+        if kind == DIR_LOG {
+            util.buf_push_str(out, "/logs")
+        }
+    }
+    rt.buf_free(&base)
+    return ok
+}
+
+// ----------------------------------------------------------- the program
+
+// The file an update replaces. Cuts the " (deleted)" the kernel appends
+// to /proc/self/exe once the file was replaced by an update; an AppImage
+// reports its own file via $APPIMAGE.
+fn plat_exe_path(out: *mut rt.Buf) -> bool {
+    var ai: rt.Buf = rt.buf_new()
+    if plat_env_get("APPIMAGE", &ai) && rt.buf_len(&ai) > 0 {
+        rt.buf_clear(out)
+        rt.buf_push_bytes(out, rt.buf_ptr(&ai), rt.buf_len(&ai))
+        rt.buf_free(&ai)
+        return true
+    }
+    rt.buf_free(&ai)
+    var path: [u8; _] = "/proc/self/exe\0"
+    var buf: [u8; 4096] = [0; 4096]
+    let n: i64 = syscall(SYS_READLINK, (&path[0]) as i64, (&buf[0]) as i64, 4095, 0, 0, 0)
+    if n <= 0 {
+        return false
+    }
+    var len: usize = n as usize
+    let s: str = str { p: (&buf[0]) as *mut u8, n: len }
+    if util.ends_with(s, " (deleted)") {
+        len = len - 10
+    }
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, (&buf[0]) as u64, len)
+    return true
+}
+
+fn plat_self_pid() -> i64 {
+    return syscall(SYS_GETPID, 0, 0, 0, 0, 0, 0)
+}
+
+fn plat_pid_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false
+    }
+    let r: i64 = syscall(SYS_KILL, pid, 0, 0, 0, 0, 0)
+    return r == 0 || r == -1
+}
+
+fn plat_kill(pid: i64) -> bool {
+    if pid <= 1 {
+        return false
+    }
+    return syscall(SYS_KILL, pid, 9, 0, 0, 0, 0) == 0
+}
+
+fn plat_sleep_ms(ms: u64) {
+    time.sleep_ms(ms)
+}
+
+fn plat_exit(code: i64) {
+    rt.finish(code)
+}
+
+// A new process, detached: double fork, the grandchild execs and is
+// adopted by init; the caller never has to wait. The environment is the
+// caller's (the start block's envp), so DISPLAY and friends arrive.
+// `args` are the arguments AFTER the program name (argv[0] is `path`).
+fn plat_spawn_detached(path: str, args: *mut util.Args) -> bool {
+    // everything the child needs is built BEFORE the fork
+    var cpath: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&cpath, path.p as u64, path.n)
+    rt.buf_push(&cpath, 0 as u8)
+    let na: usize = util.args_count(args)
+    var argv: rt.Buf = rt.buf_new()
+    // argv[0] .. argv[na] then the terminating null
+    var slots: usize = na + 2
+    var okv: bool = util.buf_room(&argv, slots * 8)
+    var envp: u64 = 0
+    if G_START != 0 as u64 {
+        envp = G_START + ((rt.arg_count(G_START) + 2) * 8) as u64
+    }
+    var okp: bool = okv
+    if okp {
+        rt.buf_set_len(&argv, slots * 8)
+        var base: u64 = rt.buf_ptr(&argv)
+        rt.st64(base, 0, rt.buf_ptr(&cpath))
+        var at: u64 = rt.buf_ptr(&(*args).buf)
+        var k: usize = 0
+        while k < na {
+            rt.st64(base, k + 1, at)
+            at = at + rt.c_length(at) as u64 + 1 as u64
+            k = k + 1
+        }
+        rt.st64(base, na + 1, 0 as u64)
+        let pid: i64 = syscall(SYS_FORK, 0, 0, 0, 0, 0, 0)
+        if pid < 0 {
+            okp = false
+        } else if pid == 0 {
+            // child 1: new session, fork again, exit at once
+            syscall(SYS_SETSID, 0, 0, 0, 0, 0, 0)
+            let pid2: i64 = syscall(SYS_FORK, 0, 0, 0, 0, 0, 0)
+            if pid2 == 0 {
+                syscall(SYS_EXECVE, rt.buf_ptr(&cpath) as i64, base as i64, envp as i64, 0, 0, 0)
+                rt.finish(127)
+            }
+            rt.finish(0)
+        } else {
+            var status: i32 = 0
+            syscall(SYS_WAIT4, pid, (&status) as i64, 0, 0, 0, 0)
+        }
+    }
+    rt.buf_free(&argv)
+    rt.buf_free(&cpath)
+    return okp
+}
+
+// ------------------------------------------------------------ the lock
+
+struct FlockRec {
+    l_type: i16,
+    l_whence: i16,
+    pad: i32,
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+    pad2: i32,
+}
+
+// The single instance lock: an exclusive POSIX record lock on `path`
+// (created if need be), held until the process dies or plat_unlock. The
+// kernel drops it when the process ends -- a crash leaves no stale lock.
+// Returns the file handle (>= 0), -1 when another process holds it, -2 on
+// any other error. The holder's pid is written into the file.
+fn plat_lock(path: str) -> i64 {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    let fd: i64 = syscall(SYS_OPEN, rt.buf_ptr(&c) as i64, O_RDWR_CREAT | 524288, 420, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return -2
+    }
+    var l: FlockRec = FlockRec { l_type: 1 as i16, l_whence: 0 as i16, pad: 0 as i32,
+        l_start: 0, l_len: 0, l_pid: 0 as i32, pad2: 0 as i32 }
+    let r: i64 = syscall(SYS_FCNTL, fd, F_SETLK, (&l) as i64, 0, 0, 0)
+    if r < 0 {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        if r == -11 || r == -13 {
+            return -1
+        }
+        return -2
+    }
+    var t: rt.Buf = rt.buf_new()
+    util.push_dec_pad(&t, plat_self_pid() as u64, 10)
+    rt.buf_push(&t, 10 as u8)
+    // rewrite from the start; the record lock covers the whole file
+    syscall(8, fd, 0, 0, 0, 0, 0)
+    syscall(SYS_WRITE, fd, rt.buf_ptr(&t) as i64, rt.buf_len(&t) as i64, 0, 0, 0)
+    rt.buf_free(&t)
+    return fd
+}
+
+fn plat_unlock(h: i64) {
+    if h >= 0 {
+        syscall(SYS_CLOSE, h, 0, 0, 0, 0, 0)
+    }
+}
+
+// --------------------------------------------------------- files for update
+
+fn plat_chmod_exec(path: str) -> bool {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    let r: i64 = syscall(SYS_CHMOD, rt.buf_ptr(&c) as i64, 493, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    return r >= 0
+}
+
+// Copies src to dst (created/truncated, mode 0755 when `exec`).
+fn plat_file_copy(src: str, dst: str) -> bool {
+    var a: rt.Buf = rt.buf_new()
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&a, src.p as u64, src.n)
+    rt.buf_push(&a, 0 as u8)
+    rt.buf_push_bytes(&b, dst.p as u64, dst.n)
+    rt.buf_push(&b, 0 as u8)
+    let in_fd: i64 = syscall(SYS_OPEN, rt.buf_ptr(&a) as i64, O_RDONLY | 524288, 0, 0, 0, 0)
+    if in_fd < 0 {
+        rt.buf_free(&a)
+        rt.buf_free(&b)
+        return false
+    }
+    let out_fd: i64 = syscall(SYS_OPEN, rt.buf_ptr(&b) as i64, O_WRITE_NEW | 524288, 493, 0, 0, 0)
+    rt.buf_free(&a)
+    rt.buf_free(&b)
+    if out_fd < 0 {
+        syscall(SYS_CLOSE, in_fd, 0, 0, 0, 0, 0)
+        return false
+    }
+    var chunk: rt.Buf = rt.buf_new()
+    var ok: bool = util.buf_room(&chunk, 65536)
+    while ok {
+        let n: i64 = syscall(SYS_READ, in_fd, rt.buf_ptr(&chunk) as i64, 65536, 0, 0, 0)
+        if n < 0 {
+            if n == -4 {
+                continue
+            }
+            ok = false
+            break
+        }
+        if n == 0 {
+            break
+        }
+        var done: usize = 0
+        while done < n as usize {
+            let w: i64 = syscall(SYS_WRITE, out_fd, (rt.buf_ptr(&chunk) + done as u64) as i64, (n as usize - done) as i64, 0, 0, 0)
+            if w <= 0 {
+                if w == -4 {
+                    continue
+                }
+                ok = false
+                break
+            }
+            done = done + w as usize
+        }
+    }
+    rt.buf_free(&chunk)
+    if ok {
+        syscall(74, out_fd, 0, 0, 0, 0, 0)
+    }
+    syscall(SYS_CLOSE, in_fd, 0, 0, 0, 0, 0)
+    syscall(SYS_CLOSE, out_fd, 0, 0, 0, 0, 0)
+    return ok
+}
+
+fn plat_can_write_beside(exe: str) -> bool {
+    let probe: str = exe + ".appkit-probe"
+    let wrote: usize = fs.write_file(probe, "x".p as u64, 1) catch 0
+    let ok: bool = wrote == 1
+    if ok {
+        let rm: bool = fs.remove(probe) catch false
+    }
+    return ok
+}
+
+// Puts `newf` in place of `exe`; the old file stays as `backup`.
+// A running Linux binary can be replaced by rename (the process keeps its
+// inode). The backup is a copy, so it works on any file system and the
+// moment of replacement is ONE rename.
+fn plat_apply(newf: str, exe: str, backup: str) -> u32 {
+    if !fs.is_file(newf) {
+        return AP_NO_NEW
+    }
+    if !plat_file_copy(exe, backup) {
+        return AP_BACKUP
+    }
+    if !plat_chmod_exec(newf) {
+        return AP_PERM
+    }
+    let ok: bool = fs.rename(newf, exe) catch | e | false
+    if !ok {
+        if fs.last_errno() == 13 || fs.last_errno() == 1 || fs.last_errno() == 30 {
+            return AP_PERM
+        }
+        return AP_RENAME
+    }
+    return AP_OK
+}
+
+fn plat_rollback(exe: str, backup: str) -> u32 {
+    if !fs.is_file(backup) {
+        return AP_NO_NEW
+    }
+    let ok: bool = fs.rename(backup, exe) catch | e | false
+    if !ok {
+        return AP_RENAME
+    }
+    return AP_OK
+}
+
+fn plat_swap_kind() -> u32 {
+    return SWAP_FILES
+}
+
+// the downloaded file waits next to the executable: same directory, same
+// volume, so applying it is one rename
+fn plat_stage_path(exe: str, out: *mut rt.Buf) -> bool {
+    if exe.n == 0 {
+        return false
+    }
+    rt.buf_clear(out)
+    util.buf_push_str(out, exe)
+    util.buf_push_str(out, ".new")
+    return true
+}
+
+fn plat_threads() -> bool {
+    return true
+}
+
+fn plat_can_self_update() -> bool {
+    return true
+}
+
+fn plat_install_hint() -> str {
+    return "The program file is in a folder you may not change. Install it in a folder of your own (for example ~/.local/bin) to let it update itself."
+}

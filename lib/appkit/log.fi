@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/log.fi -- a LOG FILE with levels and rotation.
+//
+//     log.log_open(dir, "app", log.LOG_INFO, 524288, 3)   // once, at start
+//     log.log_info("update", "checking the store")
+//     log.log_error("update", "signature does not match")
+//     log.log_close()
+//
+// One line per call, appended with ONE write(2) (an O_APPEND write of a
+// short line is atomic on POSIX, so the UI thread and the update thread can
+// both log without interleaving inside a line):
+//
+//     2026-10-04T12:41:03.127Z INFO  update: checking the store
+//
+// ROTATION. When the file would grow past `max_bytes` it becomes
+// `<name>.log.1`, the old `.1` becomes `.2`, ... up to `keep` files; the
+// oldest is deleted. A rotation by two threads at once can lose a line; it
+// cannot corrupt a file.
+//
+// The logger is a module-wide singleton (static storage): logging has to be
+// callable from every module without passing a handle around, and from a
+// crash handler. Before `log_open` (or when it fails) every call is a
+// no-op; nothing here can make the program fail.
+import std.rt
+import std.fs
+import std.time
+import appkit.util
+
+export {
+    log_open, log_close, log_set_level, log_level, log_write, log_debug,
+    log_info, log_warn, log_error, log_path, log_tail, log_mirror_stderr,
+    LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR,
+}
+
+const LOG_DEBUG: u32 = 0
+const LOG_INFO: u32 = 1
+const LOG_WARN: u32 = 2
+const LOG_ERROR: u32 = 3
+
+const O_APPEND_CREATE: i64 = 525377 // O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC
+
+static mut L_FD: i64 = -1
+static mut L_LEVEL: u32 = 1
+static mut L_PATH: [u8; 512] = [0; 512]
+static mut L_NPATH: usize = 0
+static mut L_SIZE: u64 = 0
+static mut L_MAX: u64 = 524288
+static mut L_KEEP: u32 = 3
+static mut L_STDERR: bool = false
+
+fn log_path() -> str {
+    return str { p: (&L_PATH[0]) as *mut u8, n: L_NPATH }
+}
+
+fn log_level() -> u32 {
+    return L_LEVEL
+}
+
+fn log_set_level(l: u32) {
+    L_LEVEL = l
+}
+
+fn log_mirror_stderr(on: bool) {
+    L_STDERR = on
+}
+
+fn open_file() -> bool {
+    if L_NPATH == 0 {
+        return false
+    }
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, (&L_PATH[0]) as u64, L_NPATH)
+    rt.buf_push(&c, 0 as u8)
+    let fd: i64 = syscall(2, rt.buf_ptr(&c) as i64, O_APPEND_CREATE, 420, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return false
+    }
+    L_FD = fd
+    let info: fs.FileInfo = fs.stat(log_path()) catch | e | fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0 as u64, mtime_ns: 0 }
+    L_SIZE = info.size
+    return true
+}
+
+// Starts logging to <dir>/<name>.log. `level` is the lowest level written.
+// Returns false (and logs nothing) when the file cannot be opened.
+fn log_open(dir: str, name: str, level: u32, max_bytes: u64, keep: u32) -> bool {
+    log_close()
+    if dir.n == 0 || name.n == 0 || dir.n + name.n + 6 > 511 {
+        return false
+    }
+    let made: bool = fs.mkdir_all(dir) catch false
+    var p: rt.Buf = rt.buf_new()
+    util.buf_push_str(&p, dir)
+    if dir.n > 0 && rt.ld8(dir.p as u64, dir.n - 1) != 47 as u8 {
+        rt.buf_push(&p, 47 as u8)
+    }
+    util.buf_push_str(&p, name)
+    util.buf_push_str(&p, ".log")
+    if rt.buf_len(&p) > 511 {
+        rt.buf_free(&p)
+        return false
+    }
+    rt.mem_copy((&L_PATH[0]) as u64, rt.buf_ptr(&p), rt.buf_len(&p))
+    L_NPATH = rt.buf_len(&p)
+    rt.buf_free(&p)
+    L_LEVEL = level
+    L_MAX = max_bytes
+    if L_MAX < 4096 as u64 {
+        L_MAX = 4096
+    }
+    L_KEEP = keep
+    return open_file()
+}
+
+fn log_close() {
+    if L_FD >= 0 {
+        syscall(3, L_FD, 0, 0, 0, 0, 0)
+        L_FD = -1
+    }
+}
+
+// path of the k-th rotated file: <name>.log.k
+fn rotated(k: u32, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, (&L_PATH[0]) as u64, L_NPATH)
+    rt.buf_push(out, 46 as u8)
+    rt.buf_push_dec_u64(out, k as u64)
+}
+
+fn rotate() {
+    log_close()
+    var k: u32 = L_KEEP
+    var a: rt.Buf = rt.buf_new()
+    var b: rt.Buf = rt.buf_new()
+    if k == 0 {
+        // no history: start over
+        fs.remove(log_path()) catch false
+    } else {
+        // drop the oldest, shift the rest up, current -> .1
+        rotated(k, &a)
+        fs.remove(util.buf_to_str_copy(&a)) catch false
+        while k > 1 {
+            rotated(k - 1, &a)
+            rotated(k, &b)
+            let s: str = util.buf_to_str_copy(&a)
+            if fs.exists(s) {
+                fs.rename(s, util.buf_to_str_copy(&b)) catch false
+            }
+            k = k - 1
+        }
+        rotated(1, &b)
+        fs.rename(log_path(), util.buf_to_str_copy(&b)) catch false
+    }
+    rt.buf_free(&a)
+    rt.buf_free(&b)
+    open_file()
+}
+
+fn level_name(l: u32) -> str {
+    if l == LOG_DEBUG { return "DEBUG" }
+    if l == LOG_INFO { return "INFO " }
+    if l == LOG_WARN { return "WARN " }
+    return "ERROR"
+}
+
+fn log_write(level: u32, tag: str, msg: str) {
+    if level < L_LEVEL {
+        return
+    }
+    var line: rt.Buf = rt.buf_new()
+    let now: i64 = time.now_unix_ms()
+    let t: time.DateTime = time.civil_from_unix(now)
+    util.push_dec_pad(&line, t.year as u64, 4)
+    rt.buf_push(&line, 45 as u8)
+    util.push_dec_pad(&line, t.month as u64, 2)
+    rt.buf_push(&line, 45 as u8)
+    util.push_dec_pad(&line, t.day as u64, 2)
+    rt.buf_push(&line, 84 as u8)
+    util.push_dec_pad(&line, t.hour as u64, 2)
+    rt.buf_push(&line, 58 as u8)
+    util.push_dec_pad(&line, t.minute as u64, 2)
+    rt.buf_push(&line, 58 as u8)
+    util.push_dec_pad(&line, t.second as u64, 2)
+    rt.buf_push(&line, 46 as u8)
+    util.push_dec_pad(&line, t.ms as u64, 3)
+    rt.buf_push(&line, 90 as u8)
+    rt.buf_push(&line, 32 as u8)
+    util.buf_push_str(&line, level_name(level))
+    rt.buf_push(&line, 32 as u8)
+    util.buf_push_str(&line, tag)
+    util.buf_push_str(&line, ": ")
+    // one line: a newline inside the message becomes a space
+    var i: usize = 0
+    while i < msg.n {
+        var ch: u8 = rt.ld8(msg.p as u64, i)
+        if ch == 10 as u8 || ch == 13 as u8 {
+            ch = 32 as u8
+        }
+        rt.buf_push(&line, ch)
+        i = i + 1
+    }
+    rt.buf_push(&line, 10 as u8)
+    if L_FD >= 0 {
+        if L_SIZE + rt.buf_len(&line) as u64 > L_MAX {
+            rotate()
+        }
+        if L_FD >= 0 {
+            let w: i64 = syscall(1, L_FD, rt.buf_ptr(&line) as i64, rt.buf_len(&line) as i64, 0, 0, 0)
+            if w > 0 {
+                L_SIZE = L_SIZE + w as u64
+            }
+        }
+    }
+    if L_STDERR {
+        syscall(1, 2, rt.buf_ptr(&line) as i64, rt.buf_len(&line) as i64, 0, 0, 0)
+    }
+    rt.buf_free(&line)
+}
+
+fn log_debug(tag: str, msg: str) { log_write(LOG_DEBUG, tag, msg) }
+fn log_info(tag: str, msg: str) { log_write(LOG_INFO, tag, msg) }
+fn log_warn(tag: str, msg: str) { log_write(LOG_WARN, tag, msg) }
+fn log_error(tag: str, msg: str) { log_write(LOG_ERROR, tag, msg) }
+
+// The last `max` octets of the current log file (cut at a line start),
+// appended to `out`. For a crash report.
+fn log_tail(max: usize, out: *mut rt.Buf) -> bool {
+    if L_NPATH == 0 {
+        return false
+    }
+    var all: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(log_path(), &all) catch 4294967295
+    if n == 4294967295 {
+        rt.buf_free(&all)
+        return false
+    }
+    var from: usize = 0
+    if n > max {
+        from = n - max
+        // start at the next line
+        while from < n && rt.ld8(rt.buf_ptr(&all), from - 1) != 10 as u8 {
+            from = from + 1
+        }
+    }
+    rt.buf_push_bytes(out, rt.buf_ptr(&all) + from as u64, n - from)
+    rt.buf_free(&all)
+    return true
+}
