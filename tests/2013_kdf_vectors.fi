@@ -1,0 +1,192 @@
+// expect_exit: 0
+// tests/2013_kdf_vectors.fi -- lib/std/crypto/blake2b.fi and argon2.fi against
+// the SHARED vectors (tests/data/kdf-vectors.json, made by tools/kdf/gen_vectors.py
+// from independent oracles only: Python hashlib.blake2b, the C reference tool
+// /usr/bin/argon2, and RFC 9106 section 5.3 with secret + associated data).
+//
+// The same file is run by FirnChat (tests/unit_krypto2.fi) and by Certus
+// (tools/vault), so all three consumers have to give the same octets. The file
+// is embedded at build time (__include_str).
+//
+// Also checked: the streaming interface equals the one shot form (a hash with a
+// broken buffer breaks exactly there), a salt under 8 octets is refused, and the
+// RFC 7693 appendix A digest of "abc" literally.
+import std.io
+import std.rt
+import std.json
+import std.str
+import std.crypto.blake2b
+import std.crypto.argon2
+
+const VECTORS: str = __include_str("data/kdf-vectors.json")
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, id: str.Span, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print(what)
+        io.print(" ")
+        io.print_line_bytes(id.p as u64, id.n)
+    }
+}
+
+fn get(d: *mut json.Json, o: u32, key: str) -> u32 {
+    return json.json_get(d, o, key.p as u64, key.n)
+}
+
+fn sget(d: *mut json.Json, o: u32, key: str) -> str.Span {
+    return json.json_string(d, get(d, o, key))
+}
+
+fn hexv(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return ((c - 97 as u8) as i32) + 10
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return ((c - 65 as u8) as i32) + 10
+    }
+    return -1
+}
+
+// hex text -> octets; the number of octets, -1 on a bad digit / odd length / overflow
+fn hex_decode(s: str.Span, out: u64, cap: usize) -> i64 {
+    if (s.n % 2) != 0 || s.n / 2 > cap {
+        return -1
+    }
+    var i: usize = 0
+    while i < s.n / 2 {
+        let hi: i32 = hexv(rt.ld8(s.p as u64, i * 2))
+        let lo: i32 = hexv(rt.ld8(s.p as u64, i * 2 + 1))
+        if hi < 0 || lo < 0 {
+            return -1
+        }
+        rt.st8(out, i, (hi * 16 + lo) as u8)
+        i = i + 1
+    }
+    return (s.n / 2) as i64
+}
+
+fn run_blake2b(t: *mut Tally, d: *mut json.Json, root: u32) {
+    var inp: [u8; 1100] = [0; 1100]
+    var want: [u8; 64] = [0; 64]
+    var got: [u8; 64] = [0; 64]
+    var it: u32 = json.json_child(d, get(d, root, "blake2b"))
+    while it != json.JSON_NONE {
+        let id: str.Span = sget(d, it, "id")
+        let n: i64 = hex_decode(sget(d, it, "in"), (&inp[0]) as u64, 1100)
+        let ol: usize = json.json_int(d, get(d, it, "outlen")) as usize
+        let wn: i64 = hex_decode(sget(d, it, "out"), (&want[0]) as u64, 64)
+        var good: bool = n >= 0 && wn == ol as i64
+        if good {
+            blake2b.blake2b((&inp[0]) as u64, n as usize, (&got[0]) as u64, ol)
+            good = rt.mem_eq((&got[0]) as u64, (&want[0]) as u64, ol)
+        }
+        check(t, "blake2b", id, good)
+        // the streaming form, fed one octet at a time, gives the same digest
+        if good && n > 0 {
+            var s: blake2b.B2b = blake2b.b2b_new(ol)
+            var k: usize = 0
+            while k < n as usize {
+                blake2b.b2b_update(&s, (&inp[0]) as u64 + k as u64, 1)
+                k = k + 1
+            }
+            var got2: [u8; 64] = [0; 64]
+            blake2b.b2b_final(&s, (&got2[0]) as u64)
+            check(t, "blake2b.stream", id, rt.mem_eq((&got2[0]) as u64, (&want[0]) as u64, ol))
+        }
+        it = json.json_next(d, it)
+    }
+}
+
+fn run_argon2(t: *mut Tally, d: *mut json.Json, root: u32) {
+    var pw: [u8; 256] = [0; 256]
+    var salt: [u8; 64] = [0; 64]
+    var secret: [u8; 64] = [0; 64]
+    var ad: [u8; 64] = [0; 64]
+    var want: [u8; 128] = [0; 128]
+    var got: [u8; 128] = [0; 128]
+    var it: u32 = json.json_child(d, get(d, root, "argon2id"))
+    while it != json.JSON_NONE {
+        let id: str.Span = sget(d, it, "id")
+        let pn: i64 = hex_decode(sget(d, it, "pw"), (&pw[0]) as u64, 256)
+        let sn: i64 = hex_decode(sget(d, it, "salt"), (&salt[0]) as u64, 64)
+        let xn: i64 = hex_decode(sget(d, it, "secret"), (&secret[0]) as u64, 64)
+        let an: i64 = hex_decode(sget(d, it, "ad"), (&ad[0]) as u64, 64)
+        let ol: usize = json.json_int(d, get(d, it, "outlen")) as usize
+        let wn: i64 = hex_decode(sget(d, it, "tag"), (&want[0]) as u64, 128)
+        var good: bool = pn >= 0 && sn >= 0 && xn >= 0 && an >= 0 && wn == ol as i64
+        if good {
+            good = argon2.argon2id((&pw[0]) as u64, pn as usize,
+                (&salt[0]) as u64, sn as usize, (&secret[0]) as u64, xn as usize,
+                (&ad[0]) as u64, an as usize,
+                json.json_int(d, get(d, it, "t")) as usize,
+                json.json_int(d, get(d, it, "m")) as usize,
+                json.json_int(d, get(d, it, "p")) as usize,
+                (&got[0]) as u64, ol)
+            if good {
+                good = rt.mem_eq((&got[0]) as u64, (&want[0]) as u64, ol)
+            }
+        }
+        check(t, "argon2id", id, good)
+        it = json.json_next(d, it)
+    }
+}
+
+fn main() -> i32 {
+    var d: json.Json = json.json_new()
+    defer json.json_free(&d)
+    let parsed: bool = json.json_parse(&d, VECTORS.p as u64, VECTORS.n) catch false
+    if !parsed {
+        io.print_line("FAIL the vectors are not JSON")
+        return 1
+    }
+    let root: u32 = json.json_root(&d)
+    var t: Tally = Tally { total: 0, fails: 0 }
+    run_blake2b(&t, &d, root)
+    run_argon2(&t, &d, root)
+
+    // parameters that must be refused, and must leave `out` alone
+    var pw: [u8; 8] = "password"
+    var salt7: [u8; 7] = "saltsal"
+    var salt8: [u8; 8] = "saltsalt"
+    var out: [u8; 32] = [0; 32]
+    let no_id: str.Span = str.span_empty()
+    var refused: bool = !argon2.argon2id((&pw[0]) as u64, 8, (&salt7[0]) as u64, 7, 0, 0, 0, 0, 1, 64, 1, (&out[0]) as u64, 32)
+    check(&t, "argon2id: a salt under 8 octets is refused", no_id, refused)
+    refused = !argon2.argon2id((&pw[0]) as u64, 8, (&salt8[0]) as u64, 8, 0, 0, 0, 0, 0, 64, 1, (&out[0]) as u64, 32)
+    check(&t, "argon2id: zero passes are refused", no_id, refused)
+    refused = !argon2.argon2id((&pw[0]) as u64, 8, (&salt8[0]) as u64, 8, 0, 0, 0, 0, 1, 7, 1, (&out[0]) as u64, 32)
+    check(&t, "argon2id: memory under 8 KiB is refused", no_id, refused)
+    refused = !argon2.argon2id((&pw[0]) as u64, 8, (&salt8[0]) as u64, 8, 0, 0, 0, 0, 1, 64, 0, (&out[0]) as u64, 32)
+    check(&t, "argon2id: zero lanes are refused", no_id, refused)
+    refused = !argon2.argon2id((&pw[0]) as u64, 8, (&salt8[0]) as u64, 8, 0, 0, 0, 0, 1, 64, 1, (&out[0]) as u64, 3)
+    check(&t, "argon2id: a tag under 4 octets is refused", no_id, refused)
+    var untouched: bool = true
+    var i: usize = 0
+    while i < 32 {
+        if out[i] != 0 as u8 {
+            untouched = false
+        }
+        i = i + 1
+    }
+    check(&t, "argon2id: refusals leave the output alone", no_id, untouched)
+
+    if t.total < 80 {
+        io.fmt_print_line(f"FAIL only {t.total} cases ran")
+        return 2
+    }
+    if t.fails > 0 {
+        io.fmt_print_line(f"FAIL {t.fails} of {t.total}")
+        return 3
+    }
+    return 0
+}

@@ -1,0 +1,181 @@
+// SPDX-License-Identifier: MPL-2.0
+// Origin: FirnChat src/krypto/blake2b.fi (same author), moved into the standard
+// library so that FirnChat and Certus share ONE implementation (audit item 2).
+// lib/std/crypto/blake2b.fi -- BLAKE2b (RFC 7693), unkeyed, 1..64 octets out.
+//
+// Why it is here: Argon2 (lib/std/crypto/argon2.fi) is built from nothing but
+// BLAKE2b -- H0, H' and the tag. It is also a fast general purpose hash.
+// Portable on purpose: no SIMD, no CPU feature test, so it runs unchanged in
+// the WASM build of the browser clients.
+//
+// Streaming: b2b_new(outlen), b2b_update(...) any number of times, b2b_final.
+// One shot: blake2b(p, n, out, outlen).
+//
+// PROVEN in tests/2013_kdf_vectors.fi against RFC 7693 appendix A and against
+// Python hashlib.blake2b: 57 inputs (0..1000 octets, every block border, digest
+// sizes 1/16/32/64), vectors in tests/data/kdf-vectors.json
+// (generator tools/kdf/gen_vectors.py).
+//
+// ARITHMETIC: Firn traps on overflow; BLAKE2 adds modulo 2^64 on purpose, so
+// every such site uses the wrapping operators `+%` / `*%`.
+import std.rt
+
+export { B2b, b2b_new, b2b_update, b2b_final, blake2b, B2B_BLOCK,
+    B2B_OUT_MAX }
+
+const B2B_BLOCK: usize = 128
+const B2B_OUT_MAX: usize = 64
+
+const IV0: u64 = 0x6a09e667f3bcc908
+const IV1: u64 = 0xbb67ae8584caa73b
+const IV2: u64 = 0x3c6ef372fe94f82b
+const IV3: u64 = 0xa54ff53a5f1d36f1
+const IV4: u64 = 0x510e527fade682d1
+const IV5: u64 = 0x9b05688c2b3e6c1f
+const IV6: u64 = 0x1f83d9abfb41bd6b
+const IV7: u64 = 0x5be0cd19137e2179
+
+struct B2b {
+    h: [u64; 8],
+    t: u64, // octets compressed so far (the high word stays 0: < 2^64)
+    buf: [u8; 128],
+    used: usize,
+    outlen: usize,
+}
+
+fn rotr64(x: u64, n: u64) -> u64 {
+    return (x >> n) | (x << (64 as u64 - n))
+}
+
+fn b2b_new(outlen: usize) -> B2b {
+    var n: usize = outlen
+    if n == 0 || n > B2B_OUT_MAX {
+        n = B2B_OUT_MAX
+    }
+    var s: B2b = B2b { h: [IV0, IV1, IV2, IV3, IV4, IV5, IV6, IV7], t: 0,
+        buf: [0; 128], used: 0, outlen: n }
+    // parameter block word 0: digest length, key length 0, fanout 1, depth 1
+    s.h[0] = s.h[0] ^ (16842752 as u64 | n as u64) // 0x01010000 | n
+    return s
+}
+
+fn sigma_table() -> [u8; 160] {
+    var s: [u8; 160] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3,
+        11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4,
+        7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8,
+        9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13,
+        2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9,
+        12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11,
+        13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10,
+        6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5,
+        10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0
+    ]
+    return s
+}
+
+fn gmix(v: *mut [u64; 16], a: usize, b: usize, c: usize, d: usize, x: u64,
+    y: u64) {
+    (*v)[a] = (*v)[a] +% (*v)[b] +% x
+    (*v)[d] = rotr64((*v)[d] ^ (*v)[a], 32)
+    (*v)[c] = (*v)[c] +% (*v)[d]
+    (*v)[b] = rotr64((*v)[b] ^ (*v)[c], 24)
+    (*v)[a] = (*v)[a] +% (*v)[b] +% y
+    (*v)[d] = rotr64((*v)[d] ^ (*v)[a], 16)
+    (*v)[c] = (*v)[c] +% (*v)[d]
+    (*v)[b] = rotr64((*v)[b] ^ (*v)[c], 63)
+}
+
+fn le64(p: u64, off: usize) -> u64 {
+    var v: u64 = 0
+    var i: usize = 8
+    while i > 0 {
+        i = i - 1
+        v = (v << 8) | (rt.ld8(p, off + i) as u64)
+    }
+    return v
+}
+
+fn compress(s: *mut B2b, blk: u64, last: bool) {
+    var m: [u64; 16] = [0; 16]
+    var i: usize = 0
+    while i < 16 {
+        m[i] = le64(blk, i * 8)
+        i = i + 1
+    }
+    var v: [u64; 16] = [0; 16]
+    i = 0
+    while i < 8 {
+        v[i] = (*s).h[i]
+        i = i + 1
+    }
+    v[8] = IV0
+    v[9] = IV1
+    v[10] = IV2
+    v[11] = IV3
+    v[12] = IV4 ^ (*s).t
+    v[13] = IV5
+    v[14] = IV6
+    v[15] = IV7
+    if last {
+        v[14] = v[14] ^ 0xffffffffffffffff
+    }
+    let sg: [u8; 160] = sigma_table()
+    var r: usize = 0
+    while r < 12 {
+        let o: usize = (r % 10) * 16
+        gmix(&v, 0, 4, 8, 12, m[sg[o] as usize], m[sg[o + 1] as usize])
+        gmix(&v, 1, 5, 9, 13, m[sg[o + 2] as usize], m[sg[o + 3] as usize])
+        gmix(&v, 2, 6, 10, 14, m[sg[o + 4] as usize], m[sg[o + 5] as usize])
+        gmix(&v, 3, 7, 11, 15, m[sg[o + 6] as usize], m[sg[o + 7] as usize])
+        gmix(&v, 0, 5, 10, 15, m[sg[o + 8] as usize], m[sg[o + 9] as usize])
+        gmix(&v, 1, 6, 11, 12, m[sg[o + 10] as usize], m[sg[o + 11] as usize])
+        gmix(&v, 2, 7, 8, 13, m[sg[o + 12] as usize], m[sg[o + 13] as usize])
+        gmix(&v, 3, 4, 9, 14, m[sg[o + 14] as usize], m[sg[o + 15] as usize])
+        r = r + 1
+    }
+    i = 0
+    while i < 8 {
+        (*s).h[i] = (*s).h[i] ^ v[i] ^ v[i + 8]
+        i = i + 1
+    }
+}
+
+// A full buffer is compressed only when MORE input arrives: the last
+// block has to go through `compress` with the final flag, and nobody knows
+// which block is the last one before `b2b_final`.
+fn b2b_update(s: *mut B2b, p: u64, n: usize) {
+    var at: usize = 0
+    while at < n {
+        if (*s).used == B2B_BLOCK {
+            (*s).t = (*s).t + B2B_BLOCK as u64
+            compress(s, (&(*s).buf[0]) as u64, false)
+            (*s).used = 0
+        }
+        (*s).buf[(*s).used] = rt.ld8(p, at)
+        (*s).used = (*s).used + 1
+        at = at + 1
+    }
+}
+
+fn b2b_final(s: *mut B2b, out: u64) {
+    (*s).t = (*s).t + (*s).used as u64
+    var i: usize = (*s).used
+    while i < B2B_BLOCK {
+        (*s).buf[i] = 0 as u8
+        i = i + 1
+    }
+    compress(s, (&(*s).buf[0]) as u64, true)
+    var k: usize = 0
+    while k < (*s).outlen {
+        rt.st8(out, k, (((*s).h[k / 8] >> ((k % 8) as u64 * 8)) & 255 as u64) as u8)
+        k = k + 1
+    }
+}
+
+fn blake2b(p: u64, n: usize, out: u64, outlen: usize) {
+    var s: B2b = b2b_new(outlen)
+    b2b_update(&s, p, n)
+    b2b_final(&s, out)
+}

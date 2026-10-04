@@ -1,0 +1,416 @@
+// SPDX-License-Identifier: MPL-2.0
+// Origin: FirnChat src/krypto/argon2.fi (same author), moved into the standard
+// library so that FirnChat and Certus share ONE implementation (audit item 2).
+// lib/std/crypto/argon2.fi -- Argon2id, version 1.3 (RFC 9106).
+//
+// WHAT IT IS FOR. FIRNCHAT's key backup ("Sicherung", src/sicherung.fi)
+// turns a passphrase into the key that seals the device keys. The server
+// keeps the sealed blob, so whoever runs the server can try passphrases
+// offline for as long as he likes. A plain hash would let him try billions
+// a second on a graphics card; Argon2id makes every single try cost a
+// fixed amount of MEMORY (m KiB, filled and read back in a data dependent
+// order) and TIME (t passes). Memory is what graphics cards and ASICs are
+// short of per core -- that is the whole point of a memory hard function.
+//
+// THE ALGORITHM, as RFC 9106 section 3 writes it:
+//   H0      = BLAKE2b-512 over the parameters, the password, the salt, the
+//             secret and the associated data, each with its length
+//   B[l][0] = H'(H0 || 0 || l),  B[l][1] = H'(H0 || 1 || l)   (1024 each)
+//   every further block = G(previous block, a reference block), where the
+//             reference is chosen by the pseudo random rules of section 3.4:
+//             in the first half of the first pass independent of the data
+//             (Argon2i, against timing side channels), afterwards from the
+//             previous block (Argon2d, against trade-off attacks)
+//   tag     = H'(xor of the last block of every lane)
+// G is the BLAKE2b round without the message, on a 1 KiB block seen as an
+// 8x8 matrix of 16 octet registers, first row by row, then column by
+// column, with the multiplication-hardened mix of section 3.6.
+//
+// Lanes are computed one after another in every slice -- the result is
+// the one a parallel implementation gives, only slower; FIRNCHAT uses one
+// lane anyway.
+//
+// PROVEN in tests/2013_kdf_vectors.fi: the Argon2id vector of RFC 9106 section
+// 5.3 (4 lanes, 32 KiB, 3 passes, secret and data) and 12 parameter sets (1..5
+// lanes, 8 KiB..64 MiB, 1..4 passes, tags of 4..100 octets, m that is not a
+// multiple of 4p) against the C reference tool /usr/bin/argon2
+// (tests/data/kdf-vectors.json, generator tools/kdf/gen_vectors.py).
+//
+// LIMITS of this function: lanes 1..64, memory 8 lanes .. 4 GiB, salt >= 8 octets,
+// tag 4..1024 octets. A caller that reads the parameters from a FILE (a vault
+// header, a backup) must apply its own, much lower limits before calling --
+// a hostile file must not be able to ask for 4 GiB.
+import std.rt
+import std.crypto.blake2b
+
+export { argon2id }
+
+const ARGON2_VERSION: u64 = 19 // 0x13
+const ARGON2_ID: u64 = 2
+const BLOCK_WORDS: usize = 128 // 1024 octets
+const M32: u64 = 4294967295
+
+struct Argon {
+    mem: u64, // m' blocks of 1024 octets
+    blocks: usize,
+    lanes: usize,
+    lane_len: usize,
+    seg_len: usize,
+    passes: usize,
+}
+
+fn put_le32(p: u64, off: usize, v: u64) {
+    rt.st8(p, off, (v & 255 as u64) as u8)
+    rt.st8(p, off + 1, ((v >> 8) & 255 as u64) as u8)
+    rt.st8(p, off + 2, ((v >> 16) & 255 as u64) as u8)
+    rt.st8(p, off + 3, ((v >> 24) & 255 as u64) as u8)
+}
+
+fn b2_le32(s: *mut blake2b.B2b, v: u64) {
+    var b: [u8; 4] = [0; 4]
+    put_le32((&b[0]) as u64, 0, v)
+    blake2b.b2b_update(s, (&b[0]) as u64, 4)
+}
+
+// H'(X) with T octets out (RFC 9106 section 3.3).
+fn hprime(x: u64, xn: usize, out: u64, outlen: usize) {
+    if outlen <= 64 {
+        var s: blake2b.B2b = blake2b.b2b_new(outlen)
+        b2_le32(&s, outlen as u64)
+        blake2b.b2b_update(&s, x, xn)
+        blake2b.b2b_final(&s, out)
+        return
+    }
+    let r: usize = (outlen + 31) / 32 - 2
+    var v: [u8; 64] = [0; 64]
+    var w: [u8; 64] = [0; 64]
+    var s1: blake2b.B2b = blake2b.b2b_new(64)
+    b2_le32(&s1, outlen as u64)
+    blake2b.b2b_update(&s1, x, xn)
+    blake2b.b2b_final(&s1, (&v[0]) as u64)
+    var pos: usize = 0
+    var k: usize = 0
+    while k < 32 {
+        rt.st8(out, pos + k, v[k])
+        k = k + 1
+    }
+    pos = 32
+    var i: usize = 1
+    while i < r {
+        blake2b.blake2b((&v[0]) as u64, 64, (&w[0]) as u64, 64)
+        k = 0
+        while k < 64 {
+            v[k] = w[k]
+            k = k + 1
+        }
+        k = 0
+        while k < 32 {
+            rt.st8(out, pos + k, v[k])
+            k = k + 1
+        }
+        pos = pos + 32
+        i = i + 1
+    }
+    let last: usize = outlen - 32 * r
+    blake2b.blake2b((&v[0]) as u64, 64, (&w[0]) as u64, last)
+    k = 0
+    while k < last {
+        rt.st8(out, pos + k, w[k])
+        k = k + 1
+    }
+}
+
+fn rotr64(x: u64, n: u64) -> u64 {
+    return (x >> n) | (x << (64 as u64 - n))
+}
+
+fn fbla(x: u64, y: u64) -> u64 {
+    return x +% y +% (((x & M32) *% (y & M32)) *% 2)
+}
+
+fn gb(r: *mut [u64; 128], a: usize, b: usize, c: usize, d: usize) {
+    var va: u64 = (*r)[a]
+    var vb: u64 = (*r)[b]
+    var vc: u64 = (*r)[c]
+    var vd: u64 = (*r)[d]
+    va = fbla(va, vb)
+    vd = rotr64(vd ^ va, 32)
+    vc = fbla(vc, vd)
+    vb = rotr64(vb ^ vc, 24)
+    va = fbla(va, vb)
+    vd = rotr64(vd ^ va, 16)
+    vc = fbla(vc, vd)
+    vb = rotr64(vb ^ vc, 63)
+    (*r)[a] = va
+    (*r)[b] = vb
+    (*r)[c] = vc
+    (*r)[d] = vd
+}
+
+// One BLAKE2b round without message over the 16 words x[0..16] of r.
+fn round16(r: *mut [u64; 128], x: *mut [usize; 16]) {
+    gb(r, (*x)[0], (*x)[4], (*x)[8], (*x)[12])
+    gb(r, (*x)[1], (*x)[5], (*x)[9], (*x)[13])
+    gb(r, (*x)[2], (*x)[6], (*x)[10], (*x)[14])
+    gb(r, (*x)[3], (*x)[7], (*x)[11], (*x)[15])
+    gb(r, (*x)[0], (*x)[5], (*x)[10], (*x)[15])
+    gb(r, (*x)[1], (*x)[6], (*x)[11], (*x)[12])
+    gb(r, (*x)[2], (*x)[7], (*x)[8], (*x)[13])
+    gb(r, (*x)[3], (*x)[4], (*x)[9], (*x)[14])
+}
+
+// P over the rows (16 consecutive words each), then over the columns
+// (word pairs 2i, 2i+1 of every row).
+fn permute(r: *mut [u64; 128]) {
+    var x: [usize; 16] = [0; 16]
+    var i: usize = 0
+    while i < 8 {
+        var j: usize = 0
+        while j < 16 {
+            x[j] = 16 * i + j
+            j = j + 1
+        }
+        round16(r, &x)
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        var j: usize = 0
+        while j < 8 {
+            x[2 * j] = 2 * i + 16 * j
+            x[2 * j + 1] = 2 * i + 16 * j + 1
+            j = j + 1
+        }
+        round16(r, &x)
+        i = i + 1
+    }
+}
+
+// next = G(prev, ref) [xor next, from the second pass on].
+fn fill_block(a: *mut Argon, prev: usize, refb: usize, next: usize,
+    with_xor: bool) {
+    let mem: u64 = (*a).mem
+    var r: [u64; 128] = [0; 128]
+    var tmp: [u64; 128] = [0; 128]
+    let po: usize = prev * BLOCK_WORDS
+    let ro: usize = refb * BLOCK_WORDS
+    let no: usize = next * BLOCK_WORDS
+    var i: usize = 0
+    while i < BLOCK_WORDS {
+        let v: u64 = rt.ld64(mem, ro + i) ^ rt.ld64(mem, po + i)
+        r[i] = v
+        if with_xor {
+            tmp[i] = v ^ rt.ld64(mem, no + i)
+        } else {
+            tmp[i] = v
+        }
+        i = i + 1
+    }
+    permute(&r)
+    i = 0
+    while i < BLOCK_WORDS {
+        rt.st64(mem, no + i, tmp[i] ^ r[i])
+        i = i + 1
+    }
+}
+
+// G(0, x) in place: x = P(x) xor x.
+fn g_zero(x: *mut [u64; 128]) {
+    var r: [u64; 128] = [0; 128]
+    var i: usize = 0
+    while i < BLOCK_WORDS {
+        r[i] = (*x)[i]
+        i = i + 1
+    }
+    permute(&r)
+    i = 0
+    while i < BLOCK_WORDS {
+        (*x)[i] = (*x)[i] ^ r[i]
+        i = i + 1
+    }
+}
+
+fn next_addresses(addr: *mut [u64; 128], input: *mut [u64; 128]) {
+    (*input)[6] = (*input)[6] + 1
+    var i: usize = 0
+    while i < BLOCK_WORDS {
+        (*addr)[i] = (*input)[i]
+        i = i + 1
+    }
+    g_zero(addr)
+    g_zero(addr)
+}
+
+fn index_alpha(a: *mut Argon, pass: usize, slice: usize, index: usize,
+    pr32: u64, same_lane: bool) -> usize {
+    let seg: usize = (*a).seg_len
+    var ras: usize = 0
+    if pass == 0 {
+        if slice == 0 {
+            ras = index - 1
+        } else if same_lane {
+            ras = slice * seg + index - 1
+        } else if index == 0 {
+            ras = slice * seg - 1
+        } else {
+            ras = slice * seg
+        }
+    } else {
+        if same_lane {
+            ras = (*a).lane_len - seg + index - 1
+        } else if index == 0 {
+            ras = (*a).lane_len - seg - 1
+        } else {
+            ras = (*a).lane_len - seg
+        }
+    }
+    var rel: u64 = (pr32 * pr32) >> 32
+    rel = ras as u64 - 1 - ((ras as u64 * rel) >> 32)
+    var start: usize = 0
+    if pass != 0 && slice != 3 {
+        start = (slice + 1) * seg
+    }
+    return ((start as u64 + rel) % (*a).lane_len as u64) as usize
+}
+
+fn fill_segment(a: *mut Argon, pass: usize, lane: usize, slice: usize) {
+    let indep: bool = pass == 0 && slice < 2
+    var input: [u64; 128] = [0; 128]
+    var addr: [u64; 128] = [0; 128]
+    if indep {
+        input[0] = pass as u64
+        input[1] = lane as u64
+        input[2] = slice as u64
+        input[3] = (*a).blocks as u64
+        input[4] = (*a).passes as u64
+        input[5] = ARGON2_ID
+    }
+    var start: usize = 0
+    if pass == 0 && slice == 0 {
+        start = 2
+        if indep {
+            next_addresses(&addr, &input)
+        }
+    }
+    let ll: usize = (*a).lane_len
+    var curr: usize = lane * ll + slice * (*a).seg_len + start
+    var prev: usize = curr + ll - 1
+    if curr % ll != 0 {
+        prev = curr - 1
+    }
+    var i: usize = start
+    while i < (*a).seg_len {
+        if curr % ll == 1 {
+            prev = curr - 1
+        }
+        var pr: u64 = 0
+        if indep {
+            if i % 128 == 0 {
+                next_addresses(&addr, &input)
+            }
+            pr = addr[i % 128]
+        } else {
+            pr = rt.ld64((*a).mem, prev * BLOCK_WORDS)
+        }
+        var ref_lane: usize = lane
+        if !(pass == 0 && slice == 0) {
+            ref_lane = ((pr >> 32) % (*a).lanes as u64) as usize
+        }
+        let ref_index: usize = index_alpha(a, pass, slice, i, pr & M32,
+            ref_lane == lane)
+        fill_block(a, prev, ref_lane * ll + ref_index, curr, pass != 0)
+        curr = curr + 1
+        prev = prev + 1
+        i = i + 1
+    }
+}
+
+// The whole function. `m_kib` is the memory in KiB (at least 8 per lane),
+// `t` the number of passes (at least 1). false: bad parameters or no
+// memory -- `out` is untouched then.
+fn argon2id(pwd: u64, pwdn: usize, salt: u64, saltn: usize, secret: u64,
+    secretn: usize, ad: u64, adn: usize, t: usize, m_kib: usize,
+    lanes: usize, out: u64, outlen: usize) -> bool {
+    if lanes == 0 || lanes > 64 || t == 0 || outlen < 4 || outlen > 1024
+        || m_kib < 8 * lanes || m_kib > 4194304 || saltn < 8 {
+        return false
+    }
+    let blocks: usize = 4 * lanes * (m_kib / (4 * lanes))
+    var a: Argon = Argon { mem: 0, blocks: blocks, lanes: lanes,
+        lane_len: blocks / lanes, seg_len: blocks / lanes / 4, passes: t }
+    a.mem = rt.heap_alloc(blocks * 1024)
+    if a.mem == 0 {
+        return false
+    }
+    // H0
+    var h0: [u8; 72] = [0; 72]
+    var s: blake2b.B2b = blake2b.b2b_new(64)
+    b2_le32(&s, lanes as u64)
+    b2_le32(&s, outlen as u64)
+    b2_le32(&s, m_kib as u64)
+    b2_le32(&s, t as u64)
+    b2_le32(&s, ARGON2_VERSION)
+    b2_le32(&s, ARGON2_ID)
+    b2_le32(&s, pwdn as u64)
+    blake2b.b2b_update(&s, pwd, pwdn)
+    b2_le32(&s, saltn as u64)
+    blake2b.b2b_update(&s, salt, saltn)
+    b2_le32(&s, secretn as u64)
+    blake2b.b2b_update(&s, secret, secretn)
+    b2_le32(&s, adn as u64)
+    blake2b.b2b_update(&s, ad, adn)
+    blake2b.b2b_final(&s, (&h0[0]) as u64)
+    // the first two blocks of every lane
+    var l: usize = 0
+    while l < lanes {
+        put_le32((&h0[0]) as u64, 64, 0 as u64)
+        put_le32((&h0[0]) as u64, 68, l as u64)
+        hprime((&h0[0]) as u64, 72, a.mem + (l * a.lane_len * 1024) as u64, 1024)
+        put_le32((&h0[0]) as u64, 64, 1 as u64)
+        hprime((&h0[0]) as u64, 72,
+            a.mem + ((l * a.lane_len + 1) * 1024) as u64, 1024)
+        l = l + 1
+    }
+    var pass: usize = 0
+    while pass < t {
+        var slice: usize = 0
+        while slice < 4 {
+            l = 0
+            while l < lanes {
+                fill_segment(&a, pass, l, slice)
+                l = l + 1
+            }
+            slice = slice + 1
+        }
+        pass = pass + 1
+    }
+    // the xor of the last block of every lane, then H'
+    var fin: [u64; 128] = [0; 128]
+    l = 0
+    while l < lanes {
+        let off: usize = (l * a.lane_len + a.lane_len - 1) * BLOCK_WORDS
+        var i: usize = 0
+        while i < BLOCK_WORDS {
+            fin[i] = fin[i] ^ rt.ld64(a.mem, off + i)
+            i = i + 1
+        }
+        l = l + 1
+    }
+    var fb: [u8; 1024] = [0; 1024]
+    var i: usize = 0
+    while i < BLOCK_WORDS {
+        var k: usize = 0
+        while k < 8 {
+            fb[i * 8 + k] = ((fin[i] >> (k as u64 * 8)) & 255 as u64) as u8
+            k = k + 1
+        }
+        i = i + 1
+    }
+    hprime((&fb[0]) as u64, 1024, out, outlen)
+    // nothing of the password's trace stays in memory that is handed back
+    rt.mem_set(a.mem, 0 as u8, blocks * 1024)
+    rt.heap_free(a.mem, blocks * 1024)
+    rt.mem_set((&fb[0]) as u64, 0 as u8, 1024)
+    rt.mem_set((&h0[0]) as u64, 0 as u8, 72)
+    return true
+}
