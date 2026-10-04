@@ -1,0 +1,339 @@
+// expect_exit: 0
+// tests/2180_compress_lz4.fi -- lib/compress/lz4.fi: frames made by Python's
+// lz4 (default, HC linked blocks with block checksums, 64 KiB independent
+// blocks without size and checksum, a skippable frame in between, an empty
+// frame, a block with a dictionary), decoded octet for octet; the encoder's
+// frames read back by the decoder in every block size and with every checksum
+// switch; refusals (cut, flipped, wrong magic, wrong checksums, a size
+// limit); the streaming reader and writer; xxHash32/64 against published
+// vectors. tools/compress/check.py holds the same code against python-lz4
+// in BOTH directions over a much larger corpus.
+import compress.common
+import compress.lz4
+import std.rt
+import std.io
+import std.fs
+
+const PLAIN: str = __include_str("data/compress/plain.bin")
+const REC: str = __include_str("data/compress/record.bin")
+const REC2: str = __include_str("data/compress/record2.bin")
+const F_DEFAULT: str = __include_str("data/compress/plain.lz4")
+const F_CCHK: str = __include_str("data/compress/plain_cchk.lz4")
+const F_HC: str = __include_str("data/compress/plain_hc_linked.lz4")
+const F_64K: str = __include_str("data/compress/plain_nosize_64k.lz4")
+const F_MULTI: str = __include_str("data/compress/plain_multi.lz4")
+const F_EMPTY: str = __include_str("data/compress/empty.lz4")
+const F_DICTBLK: str = __include_str("data/compress/record2_dict.lz4block")
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+static mut code: u32 = 0
+
+fn why(e: CompressError) -> usize {
+    if e == CompressError::Data { code = 1 }
+    if e == CompressError::Format { code = 2 }
+    if e == CompressError::Checksum { code = 3 }
+    if e == CompressError::Truncated { code = 4 }
+    if e == CompressError::TooLarge { code = 5 }
+    if e == CompressError::OutOfMemory { code = 6 }
+    if e == CompressError::Unsupported { code = 7 }
+    if e == CompressError::Dictionary { code = 8 }
+    if e == CompressError::Io { code = 9 }
+    return 0
+}
+
+// 0 = decoded, else an error code (1 Data 2 Format 3 Checksum 4 Truncated 5 TooLarge)
+fn dec(z: str, max: usize, out: *mut rt.Buf) -> u32 {
+    code = 0
+    lz4.lz4_frame_decompress_limited(z.p as u64, z.length(), max, out) catch | e | (why(e))
+    return code
+}
+
+fn is_plain(b: *mut rt.Buf, want: str) -> bool {
+    return rt.buf_len(b) == want.length() && rt.mem_eq(rt.buf_ptr(b), want.p as u64, want.length())
+}
+
+fn decodes_to(t: *mut Tally, what: str, z: str, want: str) {
+    var out: rt.Buf = rt.buf_new()
+    let c: u32 = dec(z, 0, &out)
+    check(t, what, c == 0 as u32 && is_plain(&out, want))
+    rt.buf_free(&out)
+}
+
+fn scratch() -> str {
+    var b: rt.Buf = rt.buf_new()
+    let head: str = "/tmp/firn_lz4_2180_"
+    rt.buf_push_bytes(&b, head.p as u64, head.length())
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+// a streamed decode of the compressed octets through a descriptor, `piece` octets at a time
+fn stream_dec(path: str, z: str, piece: usize, out: *mut rt.Buf) -> u32 {
+    code = 0
+    fs.write_file(path, z.p as u64, z.length()) catch 0
+    let fd: i64 = fs.open_read(path) catch -1
+    if fd < 0 {
+        return 99 as u32
+    }
+    var d: lz4.Lz4Dec = lz4.lz4_dec_open_fd(fd)
+    let tmp: u64 = rt.heap_alloc(piece)
+    while true {
+        let k: usize = lz4.lz4_dec_read(&d, tmp, piece) catch | e | (why(e))
+        if code != 0 as u32 || k == 0 {
+            break
+        }
+        rt.buf_push_bytes(out, tmp, k)
+    }
+    rt.heap_free(tmp, piece)
+    lz4.lz4_dec_close(&d)
+    fs.close_fd(fd)
+    return code
+}
+
+fn pseudo(n: usize, seed: u64) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    var x: u64 = seed
+    var i: usize = 0
+    while i < n {
+        x = x *% 6364136223846793005 +% 1442695040888963407
+        rt.buf_push(&b, ((x >> 33) & 255) as u8)
+        i = i + 1
+    }
+    return b
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let path: str = scratch()
+
+    // A. the checksums against published values (xxHash by Yann Collet)
+    var v: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 1000 {
+        rt.buf_push(&v, ((i * 37 + 11) % 251) as u8)
+        i = i + 1
+    }
+    let vp: u64 = rt.buf_ptr(&v)
+    check(&t, "xxh32 empty / 1 / 15 / 16 / 100 / 1000 octets",
+        common.xxh32(vp, 0, 0) == 0x2cc5d05 && common.xxh32(vp, 1, 0) == 0x3fe5a29d
+        && common.xxh32(vp, 15, 0) == 0xe16bdd01 && common.xxh32(vp, 16, 0) == 0x2b5bbdd9
+        && common.xxh32(vp, 100, 0) == 0x6db49f6c && common.xxh32(vp, 1000, 0) == 0xad40e3d)
+    check(&t, "xxh64 empty / 1 / 31 / 32 / 33 / 100 / 1000 octets",
+        common.xxh64(vp, 0, 0) == 0xef46db3751d8e999 && common.xxh64(vp, 1, 0) == 0xf592c0c7639c4cb6
+        && common.xxh64(vp, 31, 0) == 0x1dc0df26850864d4 && common.xxh64(vp, 32, 0) == 0x3207e1454aca04af
+        && common.xxh64(vp, 33, 0) == 0x72d764e14938ec2e && common.xxh64(vp, 100, 0) == 0x5299eb7592ca4649
+        && common.xxh64(vp, 1000, 0) == 0xf3e831061114885c)
+    check(&t, "xxh seeds", common.xxh32("abc".p as u64, 3, 7) == 0x57cfd434 && common.xxh64("abc".p as u64, 3, 7) == 0x9e755206156676d7)
+    // streaming hashes in odd pieces equal the one-shot value
+    var s32: common.Xxh32 = common.xxh32_new(0)
+    var s64: common.Xxh64 = common.xxh64_new(0)
+    var at: usize = 0
+    var step: usize = 1
+    while at < 1000 {
+        var k: usize = step
+        if at + k > 1000 {
+            k = 1000 - at
+        }
+        common.xxh32_update(&s32, vp + at as u64, k)
+        common.xxh64_update(&s64, vp + at as u64, k)
+        at = at + k
+        step = step + 3
+    }
+    check(&t, "xxh streaming = one shot", common.xxh32_final(&s32) == 0xad40e3d && common.xxh64_final(&s64) == 0xf3e831061114885c)
+    rt.buf_free(&v)
+
+    // B. frames made by python-lz4
+    decodes_to(&t, "default frame", F_DEFAULT, PLAIN)
+    decodes_to(&t, "content checksum", F_CCHK, PLAIN)
+    decodes_to(&t, "HC, linked blocks, block checksums", F_HC, PLAIN)
+    decodes_to(&t, "64 KiB independent blocks, no size, no checksum", F_64K, PLAIN)
+    decodes_to(&t, "two frames and a skippable frame between them", F_MULTI, PLAIN)
+    decodes_to(&t, "an empty frame", F_EMPTY, "")
+
+    // C. the block format with a dictionary
+    var bo: rt.Buf = rt.buf_new()
+    let blen: usize = lz4.lz4_block_decompress_dict(F_DICTBLK.p as u64, F_DICTBLK.length(), 4096, REC.p as u64, REC.length(), &bo) catch 0
+    check(&t, "block with a dictionary", blen == REC2.length() && is_plain(&bo, REC2))
+    rt.buf_clear(&bo)
+    code = 0
+    lz4.lz4_block_decompress(F_DICTBLK.p as u64, F_DICTBLK.length(), 4096, &bo) catch | e | (why(e))
+    check(&t, "the same block without the dictionary is Data (offset in front of the output)", code == 1 as u32)
+    rt.buf_free(&bo)
+
+    // D. refusals
+    var o: rt.Buf = rt.buf_new()
+    check(&t, "bad magic is Format", dec("hello, this is not lz4 at all", 0, &o) == 2 as u32)
+    rt.buf_clear(&o)
+    check(&t, "empty input is Truncated", dec("", 0, &o) == 4 as u32)
+    var cuts: usize = 0
+    var bad: usize = 0
+    var c: usize = 0
+    while c < F_DEFAULT.length() {
+        rt.buf_clear(&o)
+        let r: u32 = dec(str { p: F_DEFAULT.p, n: c }, 0, &o)
+        cuts = cuts + 1
+        if r == 0 as u32 {
+            bad = bad + 1
+        }
+        c = c + 61
+    }
+    check(&t, "every cut of a frame is refused", bad == 0 && cuts > 100)
+    // damage: the content checksum (the last 4 octets), a block checksum, the header checksum
+    var dmg: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&dmg, F_CCHK.p as u64, F_CCHK.length())
+    rt.st8(rt.buf_ptr(&dmg), F_CCHK.length() - 1, rt.ld8(rt.buf_ptr(&dmg), F_CCHK.length() - 1) ^ 1 as u8)
+    rt.buf_clear(&o)
+    check(&t, "a flipped content checksum is Checksum", dec(str { p: rt.buf_data(&dmg), n: rt.buf_len(&dmg) }, 0, &o) == 3 as u32)
+    rt.buf_clear(&dmg)
+    rt.buf_push_bytes(&dmg, F_DEFAULT.p as u64, F_DEFAULT.length())
+    rt.st8(rt.buf_ptr(&dmg), 6, rt.ld8(rt.buf_ptr(&dmg), 6) ^ 1 as u8) // the header checksum octet region
+    rt.buf_clear(&o)
+    let r6: u32 = dec(str { p: rt.buf_data(&dmg), n: rt.buf_len(&dmg) }, 0, &o)
+    check(&t, "a damaged descriptor is refused", r6 == 3 as u32 || r6 == 2 as u32)
+    rt.buf_clear(&dmg)
+    rt.buf_push_bytes(&dmg, F_HC.p as u64, F_HC.length())
+    rt.st8(rt.buf_ptr(&dmg), 40, rt.ld8(rt.buf_ptr(&dmg), 40) ^ 4 as u8) // inside the first block
+    rt.buf_clear(&o)
+    check(&t, "damage inside a block with block checksums is Checksum", dec(str { p: rt.buf_data(&dmg), n: rt.buf_len(&dmg) }, 0, &o) == 3 as u32)
+    rt.buf_free(&dmg)
+    // size limits: exact fits, one less does not, and nothing past the limit is written
+    rt.buf_clear(&o)
+    check(&t, "limit == size passes", dec(F_DEFAULT, PLAIN.length(), &o) == 0 as u32 && is_plain(&o, PLAIN))
+    rt.buf_clear(&o)
+    check(&t, "limit == size - 1 is TooLarge and writes nothing past it",
+        dec(F_DEFAULT, PLAIN.length() - 1, &o) == 5 as u32 && rt.buf_len(&o) <= PLAIN.length() - 1)
+    rt.buf_clear(&o)
+    check(&t, "limit 100 is TooLarge", dec(F_64K, 100, &o) == 5 as u32 && rt.buf_len(&o) <= 100)
+    // a bomb: 8 MiB of zeros in a few KiB, limited
+    var zero: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&zero, 8388608)
+    rt.mem_set(rt.buf_ptr(&zero), 0 as u8, 8388608)
+    rt.buf_set_len(&zero, 8388608)
+    var bz: rt.Buf = rt.buf_new()
+    lz4.lz4_frame_compress(rt.buf_ptr(&zero), 8388608, &bz) catch 0
+    check(&t, "8 MiB of zeros shrink below 64 KiB", rt.buf_len(&bz) < 65536)
+    rt.buf_clear(&o)
+    check(&t, "the bomb under a 1 MiB limit is TooLarge", dec(str { p: rt.buf_data(&bz), n: rt.buf_len(&bz) }, 1048576, &o) == 5 as u32
+        && rt.buf_len(&o) <= 1048576)
+    rt.buf_clear(&o)
+    check(&t, "the bomb at its exact size passes", dec(str { p: rt.buf_data(&bz), n: rt.buf_len(&bz) }, 8388608, &o) == 0 as u32
+        && rt.buf_len(&o) == 8388608)
+    rt.buf_free(&bz)
+    rt.buf_free(&zero)
+    rt.buf_free(&o)
+
+    // E. the encoder: every block size and checksum setting, and what does not compress
+    var sizes: [u32; 4] = [4, 5, 6, 7]
+    var si: usize = 0
+    while si < 4 {
+        var flag: u32 = 0
+        while flag < 4 {
+            var z: rt.Buf = rt.buf_new()
+            lz4.lz4_frame_compress_opts(PLAIN.p as u64, PLAIN.length(), sizes[si], (flag & 1) != 0, (flag & 2) != 0,
+                (flag & 1) != 0, &z) catch 0
+            var back: rt.Buf = rt.buf_new()
+            let r: u32 = dec(str { p: rt.buf_data(&z), n: rt.buf_len(&z) }, 0, &back)
+            check(&t, "own frame, block id / flags decode", r == 0 as u32 && is_plain(&back, PLAIN) && rt.buf_len(&z) < PLAIN.length())
+            rt.buf_free(&back)
+            rt.buf_free(&z)
+            flag = flag + 1
+        }
+        si = si + 1
+    }
+    // sizes around the block edges and the minimum match distance
+    var n: usize = 0
+    var bad2: usize = 0
+    while n < 70 {
+        var src: rt.Buf = pseudo(n, 7 + n as u64)
+        var j: usize = 0
+        while j < n {
+            // make it compressible: most octets from a small alphabet
+            rt.st8(rt.buf_ptr(&src), j, rt.ld8(rt.buf_ptr(&src), j) % 3 as u8)
+            j = j + 1
+        }
+        var z: rt.Buf = rt.buf_new()
+        lz4.lz4_frame_compress(rt.buf_ptr(&src), n, &z) catch 0
+        var back: rt.Buf = rt.buf_new()
+        let r: u32 = dec(str { p: rt.buf_data(&z), n: rt.buf_len(&z) }, 0, &back)
+        if r != 0 as u32 || rt.buf_len(&back) != n || !rt.mem_eq(rt.buf_ptr(&back), rt.buf_ptr(&src), n) {
+            bad2 = bad2 + 1
+        }
+        rt.buf_free(&back)
+        rt.buf_free(&z)
+        rt.buf_free(&src)
+        n = n + 1
+    }
+    check(&t, "own frames for every size 0..69", bad2 == 0)
+    var rnd: rt.Buf = pseudo(100000, 99)
+    var zr: rt.Buf = rt.buf_new()
+    lz4.lz4_frame_compress(rt.buf_ptr(&rnd), 100000, &zr) catch 0
+    check(&t, "incompressible data grows by a few octets at most (stored block)", rt.buf_len(&zr) < 100000 + 64)
+    var rb: rt.Buf = rt.buf_new()
+    check(&t, "...and reads back", dec(str { p: rt.buf_data(&zr), n: rt.buf_len(&zr) }, 0, &rb) == 0 as u32
+        && rt.buf_len(&rb) == 100000 && rt.mem_eq(rt.buf_ptr(&rb), rt.buf_ptr(&rnd), 100000))
+    rt.buf_free(&rb)
+    rt.buf_free(&zr)
+    rt.buf_free(&rnd)
+
+    // F. streaming: the decoder from a descriptor and the encoder in pieces
+    var pieces: [usize; 4] = [1, 7, 1000, 100000]
+    var pi: usize = 0
+    while pi < 4 {
+        var so: rt.Buf = rt.buf_new()
+        let r1: u32 = stream_dec(path, F_HC, pieces[pi], &so)
+        check(&t, "stream-decode HC/linked in pieces", r1 == 0 as u32 && is_plain(&so, PLAIN))
+        rt.buf_clear(&so)
+        let r2: u32 = stream_dec(path, F_MULTI, pieces[pi], &so)
+        check(&t, "stream-decode two frames + skippable", r2 == 0 as u32 && is_plain(&so, PLAIN))
+        rt.buf_free(&so)
+        pi = pi + 1
+    }
+    var cs: [usize; 3] = [1, 333, 40000]
+    var ci: usize = 0
+    while ci < 3 {
+        var e: lz4.Lz4Enc = lz4.lz4_enc_new(5, true, true, 0)
+        var z: rt.Buf = rt.buf_new()
+        var p: usize = 0
+        while p < PLAIN.length() {
+            var k: usize = PLAIN.length() - p
+            if k > cs[ci] {
+                k = cs[ci]
+            }
+            lz4.lz4_enc_write(&e, (PLAIN.p as u64) + p as u64, k, &z)
+            p = p + k
+        }
+        lz4.lz4_enc_finish(&e, &z)
+        lz4.lz4_enc_free(&e)
+        var back: rt.Buf = rt.buf_new()
+        check(&t, "stream-encode in pieces", dec(str { p: rt.buf_data(&z), n: rt.buf_len(&z) }, 0, &back) == 0 as u32 && is_plain(&back, PLAIN))
+        rt.buf_free(&back)
+        rt.buf_free(&z)
+        ci = ci + 1
+    }
+    fs.remove(path) catch false
+
+    io.print("checks: ")
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&nb, t.total)
+    io.print_bytes(rt.buf_ptr(&nb), rt.buf_len(&nb))
+    io.print_line("")
+    if t.fails != 0 {
+        return 1 as i32
+    }
+    return 0
+}
