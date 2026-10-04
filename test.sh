@@ -1647,20 +1647,6 @@ if [ "$PKRC" -eq 0 ]; then
 else
     bad "tools/pack/test failed (see .test-work/pack*.log)"
     grep -E 'FAIL' "$WORK"/pack*.log | head -12 | sed 's/^/   /'
-echo "== 81. compression: zstd, xz/LZMA2, Brotli, bzip2, LZ4, gzip against libzstd, liblzma, libbrotli, libbz2, liblz4, zlib (tools/compress/run.sh) =="
-# lib/compress has its own positive tests (tests/2180..2188, in every build level above). This section holds it against
-# the reference implementations in BOTH directions -- a corpus compressed by them and decoded here (whole buffer and
-# streaming from a descriptor), what the encoders here write read back by them, zstd dictionaries trained by
-# `zstd --train`, every cut and 180 damaged copies per format, a 64 MiB bomb under limits -- in dev-fast, release-fast
-# and release-safe, then net.http's Content-Encoding br/zstd against python's http.server, then the AArch64 build under
-# qemu and the Windows build under Wine (docs/COMPRESSION.md).
-bash tools/compress/run.sh > "$WORK/compress.log" 2>&1 && CMPRC=0 || CMPRC=$?
-if [ "$CMPRC" -eq 0 ]; then
-    ok
-    grep -E '^(checks:|http checks:|   SKIP)' "$WORK/compress.log" | sed 's/^/   /'
-else
-    bad "tools/compress/run.sh failed (see .test-work/compress.log)"
-    grep -E 'FAIL|Traceback|Error' "$WORK/compress.log" | head -12 | sed 's/^/   /'
 fi
 
 echo "== 79. UI extras: QR codes against qrcodegen / python-qrcode / ZXing-C++, and the human texts against ICU (tools/qr/, tools/uiextras/) =="
@@ -1700,6 +1686,22 @@ if [ "$DLRC" -eq 0 ] && [ "$OARC" -eq 0 ]; then
 else
     bad "tools/download/run.sh or tools/oauth/run.sh failed (see .test-work/download.log, oauth.log)"
     grep -E 'FAIL|Traceback' "$WORK/download.log" "$WORK/oauth.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 81. compression: zstd, xz/LZMA2, Brotli, bzip2, LZ4, gzip against libzstd, liblzma, libbrotli, libbz2, liblz4, zlib (tools/compress/run.sh) =="
+# lib/compress has its own positive tests (tests/2180..2189, in every build level above). This section holds it against
+# the reference implementations in BOTH directions -- a corpus compressed by them and decoded here (whole buffer and
+# streaming from a descriptor), what the encoders here write read back by them, zstd dictionaries trained by
+# `zstd --train`, every cut and 180 damaged copies per format, a 64 MiB bomb under limits -- in dev-fast, release-fast
+# and release-safe, then net.http's Content-Encoding br/zstd against python's http.server, then the AArch64 build under
+# qemu and the Windows build under Wine (docs/COMPRESSION.md).
+bash tools/compress/run.sh > "$WORK/compress.log" 2>&1 && CMPRC=0 || CMPRC=$?
+if [ "$CMPRC" -eq 0 ]; then
+    ok
+    grep -E '^(checks:|http checks:|   SKIP)' "$WORK/compress.log" | sed 's/^/   /'
+else
+    bad "tools/compress/run.sh failed (see .test-work/compress.log)"
+    grep -E 'FAIL|Traceback|Error' "$WORK/compress.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
