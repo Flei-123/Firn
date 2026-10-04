@@ -1,0 +1,1470 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/auth/oauth.fi -- auth.oauth: an OAuth 2.0 / OpenID Connect CLIENT for
+// programs that run on the user's machine (a launcher, an updater, a sync
+// tool). Built on net.http, lib/http/server.fi, auth.jose, std.secret and
+// std.shell.
+//
+//     import auth.oauth
+//     var o: oauth.OAuth = oauth.oauth_new("my-client-id")
+//     oauth.oauth_init(&o)
+//     oauth.oauth_discover(&o, "https://accounts.example.com")        // or set the endpoints
+//     oauth.oauth_set_scope(&o, "openid profile offline_access")
+//
+//     // 1. a browser on this machine: Authorization Code + PKCE, loopback redirect
+//     var tok: oauth.Tokens = oauth.tokens_new()
+//     let r: i64 = oauth.oauth_login_loopback(&o, &tok, 300000)       // opens the browser
+//
+//     // 2. no browser here (or a TV): the device code flow
+//     var da: oauth.DeviceAuth = oauth.deviceauth_new()
+//     oauth.oauth_device_start(&o, &da)       // show da.user_code and da.verification_uri
+//     let r2: i64 = oauth.oauth_device_wait(&o, &da, &tok)
+//
+//     oauth.tokens_save("myapp", "account-1", &tok)                   // std.secret
+//     oauth.oauth_ensure_fresh(&o, &tok, 60)                          // refresh when it runs out
+//
+// WHAT IS IN HERE
+//   * discovery (`/.well-known/openid-configuration`, the `issuer` must be the
+//     one asked for), or the endpoints set by hand
+//   * Authorization Code + PKCE (RFC 7636, S256 only) with a LOOPBACK redirect
+//     (RFC 8252 7.3): a one-shot HTTP server on 127.0.0.1 and a random port,
+//     the browser opened through std.shell.open_url (or your own opener),
+//     `state` checked in constant time, the page shown to the user
+//   * the DEVICE AUTHORIZATION GRANT (RFC 8628) with `authorization_pending`,
+//     `slow_down` (+5 s), `expired_token`, `access_denied`, a cancel flag
+//   * refresh tokens (RFC 6749 6; a missing new refresh_token keeps the old)
+//   * `id_token` checked with the provider's JWKS (auth.jose): signature,
+//     issuer, audience, expiry, nonce; the JWKS is fetched on the first use
+//     and once more when a token names a `kid` that is not in it
+//   * the token set kept in the keyring (std.secret): Windows Credential
+//     Manager, else an encrypted file (see std.secret HONEST S1)
+//   * userinfo and token revocation (RFC 7009)
+//   * form encoding, percent decoding and a few JSON readers, exported for
+//     auth.msa
+//
+// HONEST
+//   O1  ENDPOINTS MUST BE https. http is accepted only for a loopback host
+//       (127.0.0.1, localhost) -- the tests and local identity
+//       servers. There is no switch for anything else.
+//   O2  net.http speaks TLS 1.3 only. A provider that offers TLS 1.2 only
+//       (login.live.com, the old Microsoft endpoint) is NOT reachable until
+//       the TLS 1.2 client lands; `login.microsoftonline.com` is (see auth.msa).
+//   O3  THE LOOPBACK SERVER serves ONE login at a time per process (a
+//       global points at its state). It listens on 127.0.0.1 only, accepts
+//       the redirect path only, and takes the FIRST request that carries the
+//       right `state`; everything else gets 400/404 and the wait goes on.
+//       Other programs of the same user can still connect to the port: the
+//       code is useless without the PKCE verifier, which never leaves this
+//       process. It is single-threaded, so the calling thread is busy for
+//       the whole wait (run the login on a worker thread; `cancel` ends it).
+//   O4  Not here: the implicit flow, ROPC (password grant), client
+//       authentication by JWT/mTLS, DPoP, PAR, JARM, token introspection,
+//       dynamic client registration. `client_secret` (Basic or in the body)
+//       is supported but a desktop program cannot keep one secret: prefer
+//       public clients with PKCE.
+//   O5  Tokens are `str` on the garbage collected heap; they cannot be wiped
+//       from memory (std.secret S3).
+//   O6  One OAuth value is one client with one connection: not thread safe.
+//   O7  NO RETRY of failed requests; the caller decides (a refresh that fails
+//       with OA_NET is worth another try, one with OA_INVALID_GRANT is not).
+import std.rt
+import std.io
+import std.json
+import std.str
+import std.time
+import std.secret
+import std.shell
+import std.base64
+import std.crypto.sha256
+import std.crypto.random
+import std.crypto.hmac
+import net.http
+import net.url
+import http.server as lb
+import auth.jose
+
+export {
+    OAuth, Tokens, DeviceAuth, Pkce,
+    oauth_new, oauth_init, oauth_free, oauth_discover,
+    oauth_set_endpoints, oauth_set_issuer, oauth_set_secret, oauth_set_scope,
+    oauth_set_opener, oauth_set_cancel, oauth_set_redirect_host,
+    oauth_set_extra_auth, oauth_set_extra_token, oauth_set_basic_auth,
+    oauth_set_revocation, oauth_set_userinfo, oauth_set_verify_id_token,
+    oauth_set_timeout, oauth_set_loopback_port, oauth_set_page,
+    oauth_add_trust_pem, oauth_set_system_trust, oauth_set_leeway,
+    oauth_device_start, oauth_device_poll_once, oauth_device_wait,
+    oauth_login_loopback, oauth_auth_url, oauth_exchange_code,
+    oauth_complete_redirect, oauth_refresh, oauth_ensure_fresh,
+    oauth_fetch_jwks, oauth_verify_id_token, oauth_userinfo, oauth_revoke,
+    oauth_error_text, oauth_last_status, oauth_err_code, oauth_err_desc,
+    oauth_net_error,
+    pkce_new, pkce_challenge_of, pkce_free,
+    tokens_new, tokens_valid, tokens_expires_in, tokens_save, tokens_load,
+    tokens_delete, tokens_to_json, tokens_from_json,
+    deviceauth_new,
+    pct_encode, pct_decode, form_add, form_add_str, oa_request, oa_json_str,
+    oa_json_int, oa_endpoint_ok, oa_now, oa_cancelled, oa_sleep,
+    OA_OK, OA_NET, OA_HTTP, OA_PROTOCOL, OA_DENIED, OA_EXPIRED, OA_PENDING,
+    OA_SLOW_DOWN, OA_CANCELLED, OA_TIMEOUT, OA_INVALID_GRANT, OA_STATE,
+    OA_CONFIG, OA_TOKEN_INVALID, OA_ERROR, OA_BROWSER, OA_NOTOKEN,
+}
+
+const OA_OK: i64 = 0
+const OA_NET: i64 = 1 // could not talk to the server (OAuth.net_err has the net.http error)
+const OA_HTTP: i64 = 2 // an HTTP status that is no OAuth answer (OAuth.last_status)
+const OA_PROTOCOL: i64 = 3 // an answer that does not have the shape the RFC demands
+const OA_DENIED: i64 = 4 // the user said no (access_denied)
+const OA_EXPIRED: i64 = 5 // the device code / the login timed out at the server
+const OA_PENDING: i64 = 6 // device flow: not yet
+const OA_SLOW_DOWN: i64 = 7 // device flow: ask less often (already applied)
+const OA_CANCELLED: i64 = 8 // the cancel flag
+const OA_TIMEOUT: i64 = 9 // our own deadline
+const OA_INVALID_GRANT: i64 = 10 // the refresh token / code is no longer good
+const OA_STATE: i64 = 11 // the `state` of a redirect did not match
+const OA_CONFIG: i64 = 12 // a missing or unusable endpoint / client id
+const OA_TOKEN_INVALID: i64 = 13 // the id_token failed auth.jose (err_desc: why)
+const OA_ERROR: i64 = 14 // another OAuth `error` (err_code, err_desc)
+const OA_BROWSER: i64 = 15 // the browser could not be opened / the port not bound
+const OA_NOTOKEN: i64 = 16 // no refresh token to use
+
+const GRANT_DEVICE: str = "urn:ietf:params:oauth:grant-type:device_code"
+
+struct OAuth {
+    cl: http.Client,
+    client_id: str,
+    client_secret: str,
+    basic_auth: bool, // send the secret in an Authorization header
+    issuer: str,
+    auth_url: str,
+    token_url: str,
+    device_url: str,
+    jwks_url: str,
+    userinfo_url: str,
+    revoke_url: str,
+    scope: str,
+    extra_auth: str, // "name=value&..." (already encoded) added to the authorize URL
+    extra_token: str, // ... added to every token request body
+    redirect_host: str, // "127.0.0.1" (default) or "localhost"
+    redirect_path: str, // "/callback"
+    loopback_port: u16, // 0 = a random one
+    opener: fn(str) -> bool,
+    page_ok: str, // HTML after a successful login
+    page_fail: str,
+    cancel: u64, // address of a u64 another thread sets, 0 = none
+    timeout_ms: u64,
+    verify_id: bool,
+    leeway: i64,
+    keys: jose.Jwks,
+    keys_ok: bool,
+    keys_tried_ms: u64,
+    // the last answer
+    last_status: u32,
+    net_err: u32,
+    err_code: str,
+    err_desc: str,
+    body: rt.Buf,
+}
+
+struct Tokens {
+    access: str,
+    refresh: str,
+    id_token: str,
+    token_type: str,
+    scope: str,
+    expires_at: i64, // unix seconds, 0 = unknown
+    issued_at: i64,
+    ok: bool,
+}
+
+struct DeviceAuth {
+    device_code: str,
+    user_code: str,
+    verification_uri: str,
+    verification_uri_complete: str, // "" when the server sends none
+    expires_in: i64,
+    interval: i64, // seconds between polls (grows on slow_down)
+    started: i64, // unix seconds
+    ok: bool,
+}
+
+struct Pkce {
+    verifier: str,
+    challenge: str,
+    state: str,
+    nonce: str,
+}
+
+fn open_default(u: str) -> bool {
+    let ok: bool = shell.open_url(u) catch false
+    return ok
+}
+
+fn oauth_new(client_id: str) -> OAuth {
+    return OAuth { cl: http.client_new(), client_id: client_id, client_secret: "",
+        basic_auth: false, issuer: "", auth_url: "", token_url: "", device_url: "",
+        jwks_url: "", userinfo_url: "", revoke_url: "", scope: "", extra_auth: "",
+        extra_token: "", redirect_host: "127.0.0.1", redirect_path: "/callback",
+        loopback_port: 0 as u16, opener: open_default, page_ok: "", page_fail: "",
+        cancel: 0, timeout_ms: 20000, verify_id: true, leeway: 60,
+        keys: jose.jwks_new(), keys_ok: false, keys_tried_ms: 0, last_status: 0 as u32,
+        net_err: 0 as u32, err_code: "", err_desc: "", body: rt.buf_new() }
+}
+
+// Prepares the HTTP client (cookie jar, connection). false = no memory.
+fn oauth_init(o: *mut OAuth) -> bool {
+    if !http.client_init(&(*o).cl) {
+        return false
+    }
+    http.client_set_cache(&(*o).cl, false)
+    http.client_set_gzip(&(*o).cl, false)
+    http.client_set_timeout(&(*o).cl, (*o).timeout_ms)
+    return true
+}
+
+fn oauth_free(o: *mut OAuth) {
+    http.client_free(&(*o).cl)
+    jose.jwks_free(&(*o).keys)
+    rt.buf_free(&(*o).body)
+}
+
+fn oauth_set_endpoints(o: *mut OAuth, auth: str, token: str, device: str, jwks: str) {
+    (*o).auth_url = auth
+    (*o).token_url = token
+    (*o).device_url = device
+    (*o).jwks_url = jwks
+}
+
+fn oauth_set_issuer(o: *mut OAuth, iss: str) { (*o).issuer = iss }
+fn oauth_set_userinfo(o: *mut OAuth, u: str) { (*o).userinfo_url = u }
+fn oauth_set_revocation(o: *mut OAuth, u: str) { (*o).revoke_url = u }
+fn oauth_set_scope(o: *mut OAuth, s: str) { (*o).scope = s }
+fn oauth_set_secret(o: *mut OAuth, s: str) { (*o).client_secret = s }
+fn oauth_set_basic_auth(o: *mut OAuth, on: bool) { (*o).basic_auth = on }
+// "a=b&c=d", encoded by the caller
+fn oauth_set_extra_auth(o: *mut OAuth, s: str) { (*o).extra_auth = s }
+fn oauth_set_extra_token(o: *mut OAuth, s: str) { (*o).extra_token = s }
+fn oauth_set_redirect_host(o: *mut OAuth, h: str) { (*o).redirect_host = h }
+fn oauth_set_loopback_port(o: *mut OAuth, p: u16) { (*o).loopback_port = p }
+fn oauth_set_opener(o: *mut OAuth, f: fn(str) -> bool) { (*o).opener = f }
+// The ADDRESS of a u64 that another thread sets to non-zero to stop a wait.
+fn oauth_set_cancel(o: *mut OAuth, flag: u64) { (*o).cancel = flag }
+fn oauth_set_verify_id_token(o: *mut OAuth, on: bool) { (*o).verify_id = on }
+fn oauth_set_leeway(o: *mut OAuth, s: i64) { (*o).leeway = s }
+fn oauth_set_page(o: *mut OAuth, ok_html: str, fail_html: str) {
+    (*o).page_ok = ok_html
+    (*o).page_fail = fail_html
+}
+fn oauth_set_timeout(o: *mut OAuth, ms: u64) {
+    (*o).timeout_ms = ms
+    http.client_set_timeout(&(*o).cl, ms)
+}
+// A private CA (PEM text) for a local identity server over https.
+fn oauth_add_trust_pem(o: *mut OAuth, pem: str) -> usize {
+    return http.client_add_trust_pem(&(*o).cl, pem.p as u64, pem.length())
+}
+fn oauth_set_system_trust(o: *mut OAuth, on: bool) {
+    http.client_set_system_trust(&(*o).cl, on)
+}
+
+fn oauth_last_status(o: *mut OAuth) -> u32 { return (*o).last_status }
+fn oauth_err_code(o: *mut OAuth) -> str { return (*o).err_code }
+fn oauth_err_desc(o: *mut OAuth) -> str { return (*o).err_desc }
+// the net.http error number (http.err_num) of the last OA_NET
+fn oauth_net_error(o: *mut OAuth) -> u32 { return (*o).net_err }
+
+fn oauth_error_text(code: i64) -> str {
+    if code == OA_OK { return "ok" }
+    if code == OA_NET { return "network" }
+    if code == OA_HTTP { return "http" }
+    if code == OA_PROTOCOL { return "protocol" }
+    if code == OA_DENIED { return "denied" }
+    if code == OA_EXPIRED { return "expired" }
+    if code == OA_PENDING { return "pending" }
+    if code == OA_SLOW_DOWN { return "slow_down" }
+    if code == OA_CANCELLED { return "cancelled" }
+    if code == OA_TIMEOUT { return "timeout" }
+    if code == OA_INVALID_GRANT { return "invalid_grant" }
+    if code == OA_STATE { return "state" }
+    if code == OA_CONFIG { return "config" }
+    if code == OA_TOKEN_INVALID { return "token_invalid" }
+    if code == OA_ERROR { return "error" }
+    if code == OA_BROWSER { return "browser" }
+    if code == OA_NOTOKEN { return "no_token" }
+    return "unknown"
+}
+
+// ------------------------------------------------------------ small tools
+
+fn oa_now() -> i64 {
+    return (time.now_unix_ms() / 1000) as i64
+}
+
+fn oa_cancelled(o: *mut OAuth) -> bool {
+    if (*o).cancel == 0 {
+        return false
+    }
+    return *((*o).cancel as *mut u64) != 0
+}
+
+// Sleeps `ms` in slices; false when cancelled.
+fn oa_sleep(o: *mut OAuth, ms: u64) -> bool {
+    var left: u64 = ms
+    while left > 0 {
+        if oa_cancelled(o) {
+            return false
+        }
+        var s: u64 = 50
+        if left < s {
+            s = left
+        }
+        time.sleep_ms(s)
+        left = left - s
+    }
+    return !oa_cancelled(o)
+}
+
+fn unreserved(c: u8) -> bool {
+    return (c >= 48 as u8 && c <= 57 as u8) || (c >= 65 as u8 && c <= 90 as u8) ||
+    (c >= 97 as u8 && c <= 122 as u8) || c == 45 as u8 || c == 46 as u8 ||
+    c == 95 as u8 || c == 126 as u8
+}
+
+fn hexd(v: u8) -> u8 {
+    if v < 10 as u8 {
+        return 48 as u8 + v
+    }
+    return 55 as u8 + v
+}
+
+// RFC 3986 percent encoding of the octets at `p` (everything but
+// A-Z a-z 0-9 - . _ ~), appended to `out`.
+fn pct_encode(p: u64, n: usize, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if unreserved(c) {
+            rt.buf_push(out, c)
+        } else {
+            rt.buf_push(out, 37 as u8)
+            rt.buf_push(out, hexd(c >> 4))
+            rt.buf_push(out, hexd(c & 15 as u8))
+        }
+        i = i + 1
+    }
+}
+
+fn hexv(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 { return (c - 48 as u8) as i32 }
+    if c >= 97 as u8 && c <= 102 as u8 { return (c - 87 as u8) as i32 }
+    if c >= 65 as u8 && c <= 70 as u8 { return (c - 55 as u8) as i32 }
+    return -1
+}
+
+// Decodes %XX (and '+' as a space when `plus`) into `out`; false on a
+// broken escape.
+fn pct_decode(p: u64, n: usize, plus: bool, out: *mut rt.Buf) -> bool {
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 37 as u8 {
+            if i + 2 >= n {
+                return false
+            }
+            let h: i32 = hexv(rt.ld8(p, i + 1))
+            let l: i32 = hexv(rt.ld8(p, i + 2))
+            if h < 0 || l < 0 {
+                return false
+            }
+            rt.buf_push(out, (h * 16 + l) as u8)
+            i = i + 3
+        } else if c == 43 as u8 && plus {
+            rt.buf_push(out, 32 as u8)
+            i = i + 1
+        } else {
+            rt.buf_push(out, c)
+            i = i + 1
+        }
+    }
+    return true
+}
+
+// "name=value" with value percent-encoded, joined by '&'.
+fn form_add(out: *mut rt.Buf, name: str, p: u64, n: usize) {
+    if (*out).len > 0 {
+        rt.buf_push(out, 38 as u8)
+    }
+    rt.buf_push_bytes(out, name.p as u64, name.length())
+    rt.buf_push(out, 61 as u8)
+    pct_encode(p, n, out)
+}
+
+fn form_add_str(out: *mut rt.Buf, name: str, value: str) {
+    form_add(out, name, value.p as u64, value.length())
+}
+
+// A string member of a JSON object, copied to the heap; "" if absent.
+fn oa_json_str(d: *mut json.Json, obj: u32, name: str) -> str {
+    let nd: u32 = json.json_get(d, obj, name.p as u64, name.length())
+    if nd == json.JSON_NONE || json.json_kind(d, nd) != json.JSON_STRING {
+        return ""
+    }
+    let s: str.Span = json.json_string(d, nd)
+    return __str_copy(str { p: s.p, n: s.n })
+}
+
+fn oa_json_int(d: *mut json.Json, obj: u32, name: str, dflt: i64) -> i64 {
+    let nd: u32 = json.json_get(d, obj, name.p as u64, name.length())
+    if nd == json.JSON_NONE {
+        return dflt
+    }
+    if json.json_kind(d, nd) == json.JSON_NUMBER {
+        if json.json_is_int(d, nd) {
+            return json.json_int(d, nd)
+        }
+        return json.json_number(d, nd) as i64
+    }
+    if json.json_kind(d, nd) == json.JSON_STRING {
+        // some servers send numbers as strings
+        let s: str.Span = json.json_string(d, nd)
+        var v: i64 = 0
+        var i: usize = 0
+        if s.n == 0 {
+            return dflt
+        }
+        while i < s.n {
+            let c: u8 = *(s.p + i)
+            if c < 48 as u8 || c > 57 as u8 {
+                return dflt
+            }
+            v = v * 10 + (c - 48 as u8) as i64
+            i = i + 1
+        }
+        return v
+    }
+    return dflt
+}
+
+// https, or http for a loopback host only (O1).
+fn oa_endpoint_ok(u: str) -> bool {
+    if u.length() < 8 {
+        return false
+    }
+    var pu: url.Url = url.url_new()
+    if !url.url_parse(u.p as u64, u.length(), &pu) {
+        return false
+    }
+    if url.url_is_https(&pu) {
+        return true
+    }
+    if !url.url_is_http(&pu) {
+        return false
+    }
+    let h: u64 = url.url_host_ptr(&pu)
+    let n: usize = url.url_host_len(&pu)
+    var lh: [u8; 9] = "localhost"
+    var l4: [u8; 9] = "127.0.0.1"
+    return url.ci_equal(h, n, (&lh[0]) as u64, 9) || url.ci_equal(h, n, (&l4[0]) as u64, 9)
+}
+
+// ------------------------------------------------------------ HTTP
+
+// One request. method: 0 GET, 1 POST. `extra` = header lines ("Name: v\r\n..."),
+// `ctype` the Content-Type of a body. The body of the answer is left in
+// OAuth.body; the answer is the HTTP status, or 0 when the exchange failed
+// (OAuth.net_err). Endpoints are checked against O1 first (status 0 and
+// net_err 0 then: a refusal, not a network failure).
+fn oa_request(o: *mut OAuth, method: u32, target: str, body: u64, nb: usize,
+    ctype: str, extra: str, status_out: *mut u32) -> i64 {
+    *status_out = 0 as u32
+    (*o).net_err = 0 as u32
+    (*o).last_status = 0 as u32
+    rt.buf_clear(&(*o).body)
+    if !oa_endpoint_ok(target) {
+        return OA_CONFIG
+    }
+    http.client_set_headers(&(*o).cl, extra.p as u64, extra.length())
+    var r: http.Response = http.resp_new()
+    var ne: u32 = 0 as u32
+    if method == 0 as u32 {
+        ne = http.http_get_num(&(*o).cl, target.p as u64, target.length(), &r)
+    } else {
+        ne = http.http_post_num(&(*o).cl, target.p as u64, target.length(), body, nb,
+            ctype.p as u64, ctype.length(), &r)
+    }
+    http.client_clear_headers(&(*o).cl)
+    if ne != 0 as u32 {
+        http.client_close(&(*o).cl)
+        http.resp_free(&r)
+        (*o).net_err = ne
+        return OA_NET
+    }
+    (*o).last_status = http.resp_status(&r)
+    *status_out = (*o).last_status
+    rt.buf_push_bytes(&(*o).body, http.resp_body_ptr(&r), http.resp_body_len(&r))
+    http.resp_free(&r)
+    return OA_OK
+}
+
+fn basic_header(o: *mut OAuth, out: *mut rt.Buf) {
+    // RFC 6749 2.3.1: id and secret are form-encoded, then Basic
+    var pair: rt.Buf = rt.buf_new()
+    pct_encode((*o).client_id.p as u64, (*o).client_id.length(), &pair)
+    rt.buf_push(&pair, 58 as u8)
+    pct_encode((*o).client_secret.p as u64, (*o).client_secret.length(), &pair)
+    var b64: rt.Buf = rt.buf_new()
+    base64.encode(pair.ptr, pair.len, &b64)
+    rt.buf_push_bytes(out, "Authorization: Basic ".p as u64, 21)
+    rt.buf_push_bytes(out, b64.ptr, b64.len)
+    rt.buf_push_bytes(out, "\r\n".p as u64, 2)
+    rt.buf_free(&pair)
+    rt.buf_free(&b64)
+}
+
+// POST a form to `target` with the client's credentials; JSON answer parsed
+// into `d`. Returns OA_OK when a JSON object came back (any status: the
+// caller reads `error`), else OA_NET / OA_PROTOCOL / OA_CONFIG.
+fn post_form(o: *mut OAuth, target: str, form: *mut rt.Buf, d: *mut json.Json) -> i64 {
+    if (*o).client_secret.length() > 0 {
+        if (*o).basic_auth {
+            // the secret travels in the header only
+        } else {
+            form_add_str(form, "client_secret", (*o).client_secret)
+        }
+    }
+    if (*o).extra_token.length() > 0 {
+        rt.buf_push(form, 38 as u8)
+        rt.buf_push_bytes(form, (*o).extra_token.p as u64, (*o).extra_token.length())
+    }
+    var hdr: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&hdr, "Accept: application/json\r\n".p as u64, 26)
+    if (*o).client_secret.length() > 0 && (*o).basic_auth {
+        basic_header(o, &hdr)
+    }
+    var st: u32 = 0 as u32
+    let rc: i64 = oa_request(o, 1 as u32, target, (*form).ptr, (*form).len,
+        "application/x-www-form-urlencoded", str { p: rt.buf_data(&hdr), n: hdr.len }, &st)
+    rt.buf_free(&hdr)
+    if rc != OA_OK {
+        return rc
+    }
+    let ok: bool = json.json_parse(d, (*o).body.ptr, (*o).body.len) catch false
+    if !ok || json.json_kind(d, json.json_root(d)) != json.JSON_OBJECT {
+        return OA_PROTOCOL
+    }
+    return OA_OK
+}
+
+// Fills err_code/err_desc from an OAuth error object; the code for it.
+fn read_error(o: *mut OAuth, d: *mut json.Json) -> i64 {
+    let root: u32 = json.json_root(d)
+    (*o).err_code = oa_json_str(d, root, "error")
+    (*o).err_desc = oa_json_str(d, root, "error_description")
+    let c: str = (*o).err_code
+    if c == "authorization_pending" { return OA_PENDING }
+    if c == "slow_down" { return OA_SLOW_DOWN }
+    if c == "access_denied" || c == "authorization_declined" { return OA_DENIED }
+    if c == "expired_token" || c == "code_expired" { return OA_EXPIRED }
+    if c == "invalid_grant" { return OA_INVALID_GRANT }
+    if c.length() > 0 { return OA_ERROR }
+    return OA_PROTOCOL
+}
+
+fn tokens_new() -> Tokens {
+    return Tokens { access: "", refresh: "", id_token: "", token_type: "",
+        scope: "", expires_at: 0, issued_at: 0, ok: false }
+}
+
+fn deviceauth_new() -> DeviceAuth {
+    return DeviceAuth { device_code: "", user_code: "", verification_uri: "",
+        verification_uri_complete: "", expires_in: 0, interval: 5, started: 0, ok: false }
+}
+
+// The token endpoint's answer -> Tokens. `keep` is the old set: a refresh
+// answer without refresh_token / scope / id_token keeps the old ones.
+fn read_tokens(o: *mut OAuth, d: *mut json.Json, out: *mut Tokens, keep: *mut Tokens) -> i64 {
+    let root: u32 = json.json_root(d)
+    let at: str = oa_json_str(d, root, "access_token")
+    if at.length() == 0 {
+        return read_error(o, d)
+    }
+    let now: i64 = oa_now()
+    var t: Tokens = tokens_new()
+    t.access = at
+    t.refresh = oa_json_str(d, root, "refresh_token")
+    t.id_token = oa_json_str(d, root, "id_token")
+    t.token_type = oa_json_str(d, root, "token_type")
+    t.scope = oa_json_str(d, root, "scope")
+    let ei: i64 = oa_json_int(d, root, "expires_in", 0)
+    t.issued_at = now
+    if ei > 0 {
+        t.expires_at = now + ei
+    }
+    if keep != 0 as *mut Tokens {
+        if t.refresh.length() == 0 { t.refresh = (*keep).refresh }
+        if t.scope.length() == 0 { t.scope = (*keep).scope }
+        if t.id_token.length() == 0 { t.id_token = (*keep).id_token }
+    }
+    t.ok = true
+    *out = t
+    return OA_OK
+}
+
+// ------------------------------------------------------------ Discovery
+
+fn trim_slash(s: str) -> str {
+    var n: usize = s.length()
+    while n > 0 && s.chars(n - 1) == 47 as u8 {
+        n = n - 1
+    }
+    return s.part(0, n)
+}
+
+// Reads `<issuer>/.well-known/openid-configuration` and sets the endpoints.
+// The `issuer` in the document has to be the one asked for (OIDC Discovery 4.3).
+// For an issuer URL that has a path (Microsoft: /consumers/v2.0) the well-known
+// part is appended to the whole URL.
+fn oauth_discover(o: *mut OAuth, issuer: str) -> i64 {
+    let base: str = trim_slash(issuer)
+    let target: str = base + "/.well-known/openid-configuration"
+    var st: u32 = 0 as u32
+    let rc: i64 = oa_request(o, 0 as u32, target, 0, 0, "", "Accept: application/json\r\n", &st)
+    if rc != OA_OK {
+        return rc
+    }
+    if st != 200 as u32 {
+        return OA_HTTP
+    }
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, (*o).body.ptr, (*o).body.len) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return OA_PROTOCOL
+    }
+    let root: u32 = json.json_root(&d)
+    let got: str = oa_json_str(&d, root, "issuer")
+    if trim_slash(got) != base {
+        json.json_free(&d)
+        (*o).err_code = "issuer_mismatch"
+        (*o).err_desc = got
+        return OA_PROTOCOL
+    }
+    (*o).issuer = got
+    (*o).auth_url = oa_json_str(&d, root, "authorization_endpoint")
+    (*o).token_url = oa_json_str(&d, root, "token_endpoint")
+    (*o).device_url = oa_json_str(&d, root, "device_authorization_endpoint")
+    (*o).jwks_url = oa_json_str(&d, root, "jwks_uri")
+    (*o).userinfo_url = oa_json_str(&d, root, "userinfo_endpoint")
+    (*o).revoke_url = oa_json_str(&d, root, "revocation_endpoint")
+    json.json_free(&d)
+    if (*o).token_url.length() == 0 {
+        return OA_PROTOCOL
+    }
+    return OA_OK
+}
+
+// ------------------------------------------------------------ Device flow
+
+// RFC 8628 3.1/3.2: asks for a device code. Show `user_code` and
+// `verification_uri` (or open `verification_uri_complete`) to the user, then
+// call oauth_device_wait.
+fn oauth_device_start(o: *mut OAuth, da: *mut DeviceAuth) -> i64 {
+    *da = deviceauth_new()
+    if (*o).device_url.length() == 0 || (*o).client_id.length() == 0 {
+        return OA_CONFIG
+    }
+    var form: rt.Buf = rt.buf_new()
+    form_add_str(&form, "client_id", (*o).client_id)
+    if (*o).scope.length() > 0 {
+        form_add_str(&form, "scope", (*o).scope)
+    }
+    var d: json.Json = json.json_new()
+    var rc: i64 = post_form(o, (*o).device_url, &form, &d)
+    rt.buf_free(&form)
+    if rc != OA_OK {
+        json.json_free(&d)
+        return rc
+    }
+    let root: u32 = json.json_root(&d)
+    let dc: str = oa_json_str(&d, root, "device_code")
+    let uc: str = oa_json_str(&d, root, "user_code")
+    var vu: str = oa_json_str(&d, root, "verification_uri")
+    if vu.length() == 0 {
+        vu = oa_json_str(&d, root, "verification_url") // Google's spelling
+    }
+    if dc.length() == 0 || uc.length() == 0 || vu.length() == 0 {
+        rc = read_error(o, &d)
+        if rc == OA_PENDING || rc == OA_SLOW_DOWN {
+            rc = OA_PROTOCOL
+        }
+        json.json_free(&d)
+        return rc
+    }
+    (*da).device_code = dc
+    (*da).user_code = uc
+    (*da).verification_uri = vu
+    (*da).verification_uri_complete = oa_json_str(&d, root, "verification_uri_complete")
+    (*da).expires_in = oa_json_int(&d, root, "expires_in", 900)
+    (*da).interval = oa_json_int(&d, root, "interval", 5)
+    if (*da).interval < 1 {
+        (*da).interval = 5
+    }
+    (*da).started = oa_now()
+    (*da).ok = true
+    json.json_free(&d)
+    return OA_OK
+}
+
+// One poll of the token endpoint. OA_OK (tokens in `out`), OA_PENDING,
+// OA_SLOW_DOWN (`interval` already raised by 5 s), or a final answer
+// (OA_DENIED, OA_EXPIRED, ...).
+fn oauth_device_poll_once(o: *mut OAuth, da: *mut DeviceAuth, out: *mut Tokens) -> i64 {
+    if (*o).token_url.length() == 0 || !(*da).ok {
+        return OA_CONFIG
+    }
+    var form: rt.Buf = rt.buf_new()
+    form_add_str(&form, "grant_type", GRANT_DEVICE)
+    form_add_str(&form, "device_code", (*da).device_code)
+    form_add_str(&form, "client_id", (*o).client_id)
+    var d: json.Json = json.json_new()
+    let rc: i64 = post_form(o, (*o).token_url, &form, &d)
+    rt.buf_free(&form)
+    if rc != OA_OK {
+        json.json_free(&d)
+        return rc
+    }
+    var res: i64 = read_tokens(o, &d, out, 0 as *mut Tokens)
+    json.json_free(&d)
+    if res == OA_SLOW_DOWN {
+        (*da).interval = (*da).interval + 5
+    }
+    if res == OA_OK {
+        res = finish_login(o, out, "")
+    }
+    return res
+}
+
+// Polls until the user has approved, refused, or the code has run out; sleeps
+// `interval` seconds between polls (cancel-aware). OA_TIMEOUT when our own
+// clock says `expires_in` is over, OA_EXPIRED when the server says so.
+fn oauth_device_wait(o: *mut OAuth, da: *mut DeviceAuth, out: *mut Tokens) -> i64 {
+    if !(*da).ok {
+        return OA_CONFIG
+    }
+    let deadline: i64 = (*da).started + (*da).expires_in
+    while true {
+        if !oa_sleep(o, ((*da).interval * 1000) as u64) {
+            return OA_CANCELLED
+        }
+        if oa_now() > deadline + 1 {
+            return OA_TIMEOUT
+        }
+        let r: i64 = oauth_device_poll_once(o, da, out)
+        if r != OA_PENDING && r != OA_SLOW_DOWN {
+            return r
+        }
+    }
+    return OA_ERROR
+}
+
+// ------------------------------------------------------------ PKCE
+
+fn random_b64(nbytes: usize) -> str {
+    var raw: [u8; 64] = [0; 64]
+    var n: usize = nbytes
+    if n > 64 {
+        n = 64
+    }
+    if !random.random_bytes((&raw[0]) as u64, n) {
+        return ""
+    }
+    var b: rt.Buf = rt.buf_new()
+    base64.encode_url((&raw[0]) as u64, n, &b)
+    // no padding
+    while b.len > 0 && rt.ld8(b.ptr, b.len - 1) == 61 as u8 {
+        rt.buf_set_len(&b, b.len - 1)
+    }
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+// S256: BASE64URL(SHA256(verifier)), no padding (RFC 7636 4.2).
+fn pkce_challenge_of(verifier: str) -> str {
+    var h: [u8; 32] = [0; 32]
+    sha256.sha256(verifier.p as u64, verifier.length(), (&h[0]) as u64)
+    var b: rt.Buf = rt.buf_new()
+    base64.encode_url((&h[0]) as u64, 32, &b)
+    while b.len > 0 && rt.ld8(b.ptr, b.len - 1) == 61 as u8 {
+        rt.buf_set_len(&b, b.len - 1)
+    }
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+// A fresh verifier (43 characters = 256 bits), its challenge, a `state` and
+// a `nonce`. false when the system has no random source.
+fn pkce_new(pk: *mut Pkce) -> bool {
+    (*pk).verifier = random_b64(32)
+    (*pk).state = random_b64(24)
+    (*pk).nonce = random_b64(24)
+    if (*pk).verifier.length() == 0 || (*pk).state.length() == 0 {
+        return false
+    }
+    (*pk).challenge = pkce_challenge_of((*pk).verifier)
+    return true
+}
+
+fn pkce_free(pk: *mut Pkce) {
+    (*pk).verifier = ""
+    (*pk).challenge = ""
+    (*pk).state = ""
+    (*pk).nonce = ""
+}
+
+// The URL to send the user to.
+fn oauth_auth_url(o: *mut OAuth, pk: *mut Pkce, redirect: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    form_add_str(&b, "response_type", "code")
+    form_add_str(&b, "client_id", (*o).client_id)
+    form_add_str(&b, "redirect_uri", redirect)
+    if (*o).scope.length() > 0 {
+        form_add_str(&b, "scope", (*o).scope)
+    }
+    form_add_str(&b, "state", (*pk).state)
+    form_add_str(&b, "code_challenge", (*pk).challenge)
+    form_add_str(&b, "code_challenge_method", "S256")
+    if (*pk).nonce.length() > 0 {
+        form_add_str(&b, "nonce", (*pk).nonce)
+    }
+    if (*o).extra_auth.length() > 0 {
+        rt.buf_push(&b, 38 as u8)
+        rt.buf_push_bytes(&b, (*o).extra_auth.p as u64, (*o).extra_auth.length())
+    }
+    var sep: str = "?"
+    var i: usize = 0
+    while i < (*o).auth_url.length() {
+        if (*o).auth_url.chars(i) == 63 as u8 {
+            sep = "&"
+        }
+        i = i + 1
+    }
+    let u: str = (*o).auth_url + sep + __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    rt.buf_free(&b)
+    return u
+}
+
+// ------------------------------------------------------------ Code exchange
+
+// An id_token that came with the tokens is checked now (O's verify switch).
+fn finish_login(o: *mut OAuth, t: *mut Tokens, nonce: str) -> i64 {
+    if (*o).verify_id && (*t).id_token.length() > 0 && (*o).issuer.length() > 0 &&
+    (*o).jwks_url.length() > 0 {
+        let r: i64 = oauth_verify_id_token(o, t, nonce)
+        if r != OA_OK {
+            (*t).ok = false
+            return r
+        }
+    }
+    return OA_OK
+}
+
+fn oauth_exchange_code(o: *mut OAuth, code: str, redirect: str, verifier: str,
+    nonce: str, out: *mut Tokens) -> i64 {
+    if (*o).token_url.length() == 0 || (*o).client_id.length() == 0 {
+        return OA_CONFIG
+    }
+    var form: rt.Buf = rt.buf_new()
+    form_add_str(&form, "grant_type", "authorization_code")
+    form_add_str(&form, "code", code)
+    form_add_str(&form, "redirect_uri", redirect)
+    form_add_str(&form, "client_id", (*o).client_id)
+    form_add_str(&form, "code_verifier", verifier)
+    var d: json.Json = json.json_new()
+    var rc: i64 = post_form(o, (*o).token_url, &form, &d)
+    rt.buf_free(&form)
+    if rc != OA_OK {
+        json.json_free(&d)
+        return rc
+    }
+    rc = read_tokens(o, &d, out, 0 as *mut Tokens)
+    json.json_free(&d)
+    if rc == OA_OK {
+        rc = finish_login(o, out, nonce)
+    }
+    return rc
+}
+
+fn query_value(q: str, name: str, out: *mut rt.Buf) -> bool {
+    // q = "a=1&b=2" (raw); finds name, decodes its value into out
+    var i: usize = 0
+    let n: usize = q.length()
+    while i < n {
+        var e: usize = i
+        while e < n && q.chars(e) != 38 as u8 {
+            e = e + 1
+        }
+        var eq: usize = i
+        while eq < e && q.chars(eq) != 61 as u8 {
+            eq = eq + 1
+        }
+        if eq - i == name.length() && rt.mem_eq(q.p as u64 + i as u64, name.p as u64, name.length()) {
+            rt.buf_clear(out)
+            if eq < e {
+                return pct_decode(q.p as u64 + (eq + 1) as u64, e - eq - 1, true, out)
+            }
+            return true
+        }
+        i = e + 1
+    }
+    return false
+}
+
+// For programs that cannot run a loopback server (or tests): `redirected` is
+// the URL the browser ended up on (pasted by the user), `redirect` the
+// redirect_uri that was sent. Checks `state`, exchanges the code.
+fn oauth_complete_redirect(o: *mut OAuth, pk: *mut Pkce, redirect: str, redirected: str,
+    out: *mut Tokens) -> i64 {
+    var qs: usize = 0
+    while qs < redirected.length() && redirected.chars(qs) != 63 as u8 {
+        qs = qs + 1
+    }
+    if qs >= redirected.length() {
+        return OA_PROTOCOL
+    }
+    var q: str = redirected.ab(qs + 1)
+    // a fragment is not part of the query
+    var hs: usize = 0
+    while hs < q.length() && q.chars(hs) != 35 as u8 {
+        hs = hs + 1
+    }
+    q = q.part(0, hs)
+    var st: rt.Buf = rt.buf_new()
+    var code: rt.Buf = rt.buf_new()
+    var err: rt.Buf = rt.buf_new()
+    var rc: i64 = OA_PROTOCOL
+    if !query_value(q, "state", &st) || st.len != (*pk).state.length() ||
+    !hmac.hmac_equal(st.ptr, (*pk).state.p as u64, st.len) {
+        rc = OA_STATE
+    } else if query_value(q, "error", &err) {
+        (*o).err_code = __str_copy(str { p: rt.buf_data(&err), n: err.len })
+        var dsc: rt.Buf = rt.buf_new()
+        if query_value(q, "error_description", &dsc) {
+            (*o).err_desc = __str_copy(str { p: rt.buf_data(&dsc), n: dsc.len })
+        }
+        rt.buf_free(&dsc)
+        rc = OA_ERROR
+        if (*o).err_code == "access_denied" {
+            rc = OA_DENIED
+        }
+    } else if query_value(q, "code", &code) && code.len > 0 {
+        rc = oauth_exchange_code(o, __str_copy(str { p: rt.buf_data(&code), n: code.len }),
+            redirect, (*pk).verifier, (*pk).nonce, out)
+    }
+    rt.buf_free(&st)
+    rt.buf_free(&code)
+    rt.buf_free(&err)
+    return rc
+}
+
+// ------------------------------------------------------------ Loopback server
+
+// The state of the one login in progress; the handler finds it here.
+static mut LB_STATE: u64 = 0
+
+const LB_STATE_WORDS: usize = 20
+const LS_GOT: usize = 0 // 1 = a good callback arrived
+const LS_BAD: usize = 1 // callbacks refused so far
+const LS_ERRCODE: usize = 2 // 1 = the redirect carried an error
+// then three Bufs (ptr,len,cap): state-expected, code, error
+const LS_EXPECT: usize = 4
+const LS_CODE: usize = 7
+const LS_ERRTXT: usize = 10
+const LS_PAGE_OK: usize = 13 // the HTML pages, in memory of their own
+const LS_PAGE_FAIL: usize = 16
+
+fn ls_buf(st: u64, at: usize) -> *mut rt.Buf {
+    return (st + (at * 8) as u64) as *mut rt.Buf
+}
+
+fn lb_page(title: str, msg: str) -> str {
+    return "<!doctype html><html><head><meta charset=\"utf-8\"><title>" + title +
+    "</title><style>body{font-family:system-ui,sans-serif;background:#10141a;color:#e8ecf1;display:flex;" +
+    "align-items:center;justify-content:center;height:100vh;margin:0}div{max-width:30em;padding:2em;" +
+    "text-align:center}h1{font-size:1.4em}</style></head><body><div><h1>" + title + "</h1><p>" + msg +
+    "</p></div></body></html>"
+}
+
+fn page_ok(st: u64) -> str {
+    let b: *mut rt.Buf = ls_buf(st, LS_PAGE_OK)
+    return str { p: rt.buf_data(b), n: (*b).len }
+}
+
+fn page_fail(st: u64) -> str {
+    let b: *mut rt.Buf = ls_buf(st, LS_PAGE_FAIL)
+    return str { p: rt.buf_data(b), n: (*b).len }
+}
+
+fn on_callback(r: *mut lb.Req) {
+    let st: u64 = LB_STATE
+    if st == 0 {
+        lb.reply(r, 404, "text/plain", "no login in progress\n")
+        return
+    }
+    if lb.method(r) != "GET" {
+        lb.reply(r, 405, "text/plain", "GET only\n")
+        return
+    }
+    if rt.ld64(st, LS_GOT) != 0 {
+        lb.reply(r, 410, "text/html; charset=utf-8", page_fail(st))
+        return
+    }
+    let q: str = lb.query(r)
+    var got_state: rt.Buf = rt.buf_new()
+    var okstate: bool = false
+    if query_value(q, "state", &got_state) {
+        let exp: *mut rt.Buf = ls_buf(st, LS_EXPECT)
+        okstate = got_state.len == (*exp).len && got_state.len > 0 &&
+        hmac.hmac_equal(got_state.ptr, (*exp).ptr, got_state.len)
+    }
+    rt.buf_free(&got_state)
+    if !okstate {
+        rt.st64(st, LS_BAD, rt.ld64(st, LS_BAD) + 1)
+        lb.reply(r, 400, "text/html; charset=utf-8", page_fail(st))
+        return
+    }
+    var err: rt.Buf = rt.buf_new()
+    if query_value(q, "error", &err) {
+        var dsc: rt.Buf = rt.buf_new()
+        query_value(q, "error_description", &dsc)
+        let eb: *mut rt.Buf = ls_buf(st, LS_ERRTXT)
+        rt.buf_push_bytes(eb, err.ptr, err.len)
+        rt.buf_push(eb, 10 as u8)
+        rt.buf_push_bytes(eb, dsc.ptr, dsc.len)
+        rt.buf_free(&dsc)
+        rt.st64(st, LS_ERRCODE, 1)
+        rt.st64(st, LS_GOT, 1)
+        rt.buf_free(&err)
+        lb.reply(r, 200, "text/html; charset=utf-8", page_fail(st))
+        return
+    }
+    rt.buf_free(&err)
+    let cb: *mut rt.Buf = ls_buf(st, LS_CODE)
+    if !query_value(q, "code", cb) || (*cb).len == 0 {
+        rt.st64(st, LS_BAD, rt.ld64(st, LS_BAD) + 1)
+        lb.reply(r, 400, "text/html; charset=utf-8", page_fail(st))
+        return
+    }
+    rt.st64(st, LS_GOT, 1)
+    lb.reply(r, 200, "text/html; charset=utf-8", page_ok(st))
+}
+
+fn on_other(r: *mut lb.Req) {
+    lb.reply(r, 404, "text/plain", "not here\n")
+}
+
+fn port_text(p: u64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&b, p)
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+// Authorization Code + PKCE through the browser on this machine. Binds
+// 127.0.0.1 (a random port, or the one set), opens the authorize URL with
+// the opener, waits up to `timeout_ms` for the redirect, checks `state`,
+// exchanges the code, verifies the id_token. Blocks the calling thread (O3).
+#[allow_escape]
+fn oauth_login_loopback(o: *mut OAuth, out: *mut Tokens, timeout_ms: u64) -> i64 {
+    if (*o).auth_url.length() == 0 || (*o).token_url.length() == 0 || (*o).client_id.length() == 0 {
+        return OA_CONFIG
+    }
+    if !oa_endpoint_ok((*o).auth_url) {
+        return OA_CONFIG
+    }
+    if LB_STATE != 0 {
+        return OA_BROWSER // another login is running in this process
+    }
+    var pk: Pkce = Pkce { verifier: "", challenge: "", state: "", nonce: "" }
+    if !pkce_new(&pk) {
+        return OA_CONFIG
+    }
+    var pg_ok: str = (*o).page_ok
+    if pg_ok.length() == 0 {
+        pg_ok = lb_page("Signed in", "You can close this window and go back to the program.")
+    }
+    var pg_fail: str = (*o).page_fail
+    if pg_fail.length() == 0 {
+        pg_fail = lb_page("Sign-in failed", "The program did not get a valid answer. You can close this window and try again.")
+    }
+    // the state block (not on the GC heap: the handler reads it through a global)
+    let st: u64 = rt.heap_alloc(LB_STATE_WORDS * 8)
+    if st == 0 {
+        return OA_BROWSER
+    }
+    rt.mem_set(st, 0 as u8, LB_STATE_WORDS * 8)
+    *ls_buf(st, LS_EXPECT) = rt.buf_new()
+    *ls_buf(st, LS_CODE) = rt.buf_new()
+    *ls_buf(st, LS_ERRTXT) = rt.buf_new()
+    rt.buf_push_bytes(ls_buf(st, LS_EXPECT), pk.state.p as u64, pk.state.length())
+    *ls_buf(st, LS_PAGE_OK) = rt.buf_new()
+    *ls_buf(st, LS_PAGE_FAIL) = rt.buf_new()
+    rt.buf_push_bytes(ls_buf(st, LS_PAGE_OK), pg_ok.p as u64, pg_ok.length())
+    rt.buf_push_bytes(ls_buf(st, LS_PAGE_FAIL), pg_fail.p as u64, pg_fail.length())
+    LB_STATE = st
+
+    // ---- bind
+    var port: u64 = (*o).loopback_port as u64
+    var app: lb.App = lb.app(0 as u16)
+    var bound: bool = false
+    var tries: u32 = 0 as u32
+    while !bound && tries < 60 as u32 {
+        if (*o).loopback_port == 0 as u16 {
+            port = 49152 + random.random_u64() % 16000
+        }
+        app = lb.app(port as u16)
+        app.addr = std_net_local()
+        lb.set_quiet(&app, true)
+        lb.route(&app, (*o).redirect_path, on_callback)
+        bound = lb.step(&app, 0)
+        if !bound && (*o).loopback_port != 0 as u16 {
+            break
+        }
+        tries = tries + 1 as u32
+    }
+    var rc: i64 = OA_OK
+    var redirect: str = ""
+    if !bound {
+        rc = OA_BROWSER
+    } else {
+        redirect = "http://" + (*o).redirect_host + ":" + port_text(port) + (*o).redirect_path
+        let u: str = oauth_auth_url(o, &pk, redirect)
+        if !(*o).opener(u) {
+            rc = OA_BROWSER
+        }
+    }
+    // ---- wait
+    if rc == OA_OK {
+        let t0: u64 = time.monotonic_ns()
+        var waiting: bool = true
+        while waiting {
+            lb.step(&app, 100)
+            if rt.ld64(st, LS_GOT) != 0 {
+                waiting = false
+            } else if oa_cancelled(o) {
+                rc = OA_CANCELLED
+                waiting = false
+            } else if (time.monotonic_ns() - t0) / 1000000 > timeout_ms {
+                rc = OA_TIMEOUT
+                waiting = false
+            }
+        }
+        // let the answer to the browser leave
+        var k: u32 = 0 as u32
+        while k < 3 as u32 {
+            lb.step(&app, 20)
+            k = k + 1 as u32
+        }
+    }
+    if bound {
+        lb.close_server(&app)
+    }
+    // ---- the result
+    if rc == OA_OK {
+        if rt.ld64(st, LS_ERRCODE) != 0 {
+            let eb: *mut rt.Buf = ls_buf(st, LS_ERRTXT)
+            let all: str = __str_copy(str { p: rt.buf_data(eb), n: (*eb).len })
+            var nl: usize = 0
+            while nl < all.length() && all.chars(nl) != 10 as u8 {
+                nl = nl + 1
+            }
+            (*o).err_code = all.part(0, nl)
+            (*o).err_desc = all.ab(nl + 1)
+            rc = OA_ERROR
+            if (*o).err_code == "access_denied" {
+                rc = OA_DENIED
+            }
+        } else {
+            let cb: *mut rt.Buf = ls_buf(st, LS_CODE)
+            let code: str = __str_copy(str { p: rt.buf_data(cb), n: (*cb).len })
+            rc = oauth_exchange_code(o, code, redirect, pk.verifier, pk.nonce, out)
+        }
+    }
+    LB_STATE = 0
+    rt.buf_free(ls_buf(st, LS_EXPECT))
+    rt.buf_free(ls_buf(st, LS_CODE))
+    rt.buf_free(ls_buf(st, LS_ERRTXT))
+    rt.buf_free(ls_buf(st, LS_PAGE_OK))
+    rt.buf_free(ls_buf(st, LS_PAGE_FAIL))
+    rt.heap_free(st, LB_STATE_WORDS * 8)
+    pkce_free(&pk)
+    return rc
+}
+
+fn std_net_local() -> u32 {
+    return 2130706433 as u32 // 127.0.0.1
+}
+
+// ------------------------------------------------------------ Refresh
+
+fn oauth_refresh(o: *mut OAuth, t: *mut Tokens) -> i64 {
+    if (*t).refresh.length() == 0 {
+        return OA_NOTOKEN
+    }
+    if (*o).token_url.length() == 0 || (*o).client_id.length() == 0 {
+        return OA_CONFIG
+    }
+    var form: rt.Buf = rt.buf_new()
+    form_add_str(&form, "grant_type", "refresh_token")
+    form_add_str(&form, "refresh_token", (*t).refresh)
+    form_add_str(&form, "client_id", (*o).client_id)
+    if (*o).scope.length() > 0 {
+        form_add_str(&form, "scope", (*o).scope)
+    }
+    var d: json.Json = json.json_new()
+    var rc: i64 = post_form(o, (*o).token_url, &form, &d)
+    rt.buf_free(&form)
+    if rc != OA_OK {
+        json.json_free(&d)
+        return rc
+    }
+    var fresh: Tokens = tokens_new()
+    rc = read_tokens(o, &d, &fresh, t)
+    json.json_free(&d)
+    if rc == OA_OK {
+        // a refreshed id_token is checked; a kept one was checked before
+        if fresh.id_token != (*t).id_token {
+            rc = finish_login(o, &fresh, "")
+        }
+        if rc == OA_OK {
+            *t = fresh
+        }
+    }
+    return rc
+}
+
+// Makes sure the access token is good for at least `skew` more seconds:
+// a refresh when it is not (and when there is no expiry known, nothing).
+fn oauth_ensure_fresh(o: *mut OAuth, t: *mut Tokens, skew: i64) -> i64 {
+    if !(*t).ok {
+        return OA_NOTOKEN
+    }
+    if (*t).expires_at == 0 || (*t).expires_at - oa_now() > skew {
+        return OA_OK
+    }
+    return oauth_refresh(o, t)
+}
+
+fn tokens_valid(t: *mut Tokens, skew: i64) -> bool {
+    return (*t).ok && (*t).access.length() > 0 &&
+    ((*t).expires_at == 0 || (*t).expires_at - oa_now() > skew)
+}
+
+fn tokens_expires_in(t: *mut Tokens) -> i64 {
+    if (*t).expires_at == 0 {
+        return -1
+    }
+    return (*t).expires_at - oa_now()
+}
+
+// ------------------------------------------------------------ id_token / JWKS
+
+// (Re)loads the provider's keys. false: could not be fetched or is no JWKS.
+fn oauth_fetch_jwks(o: *mut OAuth) -> bool {
+    if (*o).jwks_url.length() == 0 {
+        return false
+    }
+    var st: u32 = 0 as u32
+    let rc: i64 = oa_request(o, 0 as u32, (*o).jwks_url, 0, 0, "", "Accept: application/json\r\n", &st)
+    if rc != OA_OK || st != 200 as u32 {
+        return false
+    }
+    var fresh: jose.Jwks = jose.jwks_new()
+    let n: i64 = jose.jwks_parse(&fresh, str { p: rt.buf_data(&(*o).body), n: (*o).body.len })
+    if n < 0 {
+        jose.jwks_free(&fresh)
+        return false
+    }
+    jose.jwks_free(&(*o).keys)
+    (*o).keys = fresh
+    (*o).keys_ok = true
+    (*o).keys_tried_ms = time.monotonic_ns() / 1000000
+    return true
+}
+
+// Checks Tokens.id_token against issuer, client id, `nonce` ("" = not
+// checked) and the JWKS. OA_OK or OA_TOKEN_INVALID (err_desc = the reason
+// of auth.jose, "nokey" when the keys could not be had).
+fn oauth_verify_id_token(o: *mut OAuth, t: *mut Tokens, nonce: str) -> i64 {
+    if (*t).id_token.length() == 0 {
+        (*o).err_desc = "no id_token"
+        return OA_TOKEN_INVALID
+    }
+    var j: jose.Jwt = jose.jwt_new()
+    if jose.jwt_decode(&j, (*t).id_token) != jose.JWT_OK {
+        jose.jwt_free(&j)
+        (*o).err_desc = "malformed"
+        return OA_TOKEN_INVALID
+    }
+    if !(*o).keys_ok && !oauth_fetch_jwks(o) {
+        jose.jwt_free(&j)
+        (*o).err_desc = "nokey"
+        return OA_TOKEN_INVALID
+    }
+    // an unknown kid: the provider may have rotated; look once more (at most
+    // once a minute)
+    if j.nkid > 0 && !jose.jwks_has_kid(&(*o).keys, jose.jwt_kid(&j)) {
+        let nowms: u64 = time.monotonic_ns() / 1000000
+        if nowms - (*o).keys_tried_ms > 60000 {
+            oauth_fetch_jwks(o)
+        }
+    }
+    var pol: jose.Policy = jose.policy((*o).issuer, (*o).client_id)
+    jose.policy_nonce(&pol, nonce)
+    jose.policy_leeway(&pol, (*o).leeway)
+    let why: i64 = jose.jwt_check(&j, &(*o).keys, &pol)
+    jose.jwt_free(&j)
+    if why != jose.JWT_OK {
+        (*o).err_code = "invalid_id_token"
+        (*o).err_desc = jose.jwt_reason_name(why)
+        return OA_TOKEN_INVALID
+    }
+    return OA_OK
+}
+
+// ------------------------------------------------------------ userinfo / revoke
+
+// GET the userinfo endpoint with the access token; the JSON text is appended
+// to `out`. OA_OK for 200.
+fn oauth_userinfo(o: *mut OAuth, t: *mut Tokens, out: *mut rt.Buf) -> i64 {
+    if (*o).userinfo_url.length() == 0 {
+        return OA_CONFIG
+    }
+    var st: u32 = 0 as u32
+    let hdr: str = "Authorization: Bearer " + (*t).access + "\r\nAccept: application/json\r\n"
+    let rc: i64 = oa_request(o, 0 as u32, (*o).userinfo_url, 0, 0, "", hdr, &st)
+    if rc != OA_OK {
+        return rc
+    }
+    if st == 401 as u32 {
+        return OA_INVALID_GRANT
+    }
+    if st != 200 as u32 {
+        return OA_HTTP
+    }
+    rt.buf_push_bytes(out, (*o).body.ptr, (*o).body.len)
+    return OA_OK
+}
+
+// RFC 7009. `refresh` = revoke the refresh token (else the access token).
+fn oauth_revoke(o: *mut OAuth, t: *mut Tokens, refresh: bool) -> i64 {
+    if (*o).revoke_url.length() == 0 {
+        return OA_CONFIG
+    }
+    var form: rt.Buf = rt.buf_new()
+    if refresh {
+        form_add_str(&form, "token", (*t).refresh)
+        form_add_str(&form, "token_type_hint", "refresh_token")
+    } else {
+        form_add_str(&form, "token", (*t).access)
+        form_add_str(&form, "token_type_hint", "access_token")
+    }
+    form_add_str(&form, "client_id", (*o).client_id)
+    var d: json.Json = json.json_new()
+    var hdr: rt.Buf = rt.buf_new()
+    if (*o).client_secret.length() > 0 {
+        if (*o).basic_auth {
+            basic_header(o, &hdr)
+        } else {
+            form_add_str(&form, "client_secret", (*o).client_secret)
+        }
+    }
+    var st: u32 = 0 as u32
+    let rc: i64 = oa_request(o, 1 as u32, (*o).revoke_url, form.ptr, form.len,
+        "application/x-www-form-urlencoded", str { p: rt.buf_data(&hdr), n: hdr.len }, &st)
+    rt.buf_free(&hdr)
+    rt.buf_free(&form)
+    json.json_free(&d)
+    if rc != OA_OK {
+        return rc
+    }
+    if st == 200 as u32 {
+        return OA_OK
+    }
+    return OA_HTTP
+}
+
+// ------------------------------------------------------------ Token store
+
+// {"access_token":..,"refresh_token":..,"id_token":..,"token_type":..,
+//  "scope":..,"expires_at":N,"issued_at":N}
+fn tokens_to_json(t: *mut Tokens, out: *mut rt.Buf) {
+    var w: json.JsonWriter = json.jw_new(out, false)
+    json.jw_begin_object(&w)
+    json.jw_key(&w, "access_token".p as u64, 12)
+    json.jw_string(&w, (*t).access.p as u64, (*t).access.length())
+    json.jw_key(&w, "refresh_token".p as u64, 13)
+    json.jw_string(&w, (*t).refresh.p as u64, (*t).refresh.length())
+    json.jw_key(&w, "id_token".p as u64, 8)
+    json.jw_string(&w, (*t).id_token.p as u64, (*t).id_token.length())
+    json.jw_key(&w, "token_type".p as u64, 10)
+    json.jw_string(&w, (*t).token_type.p as u64, (*t).token_type.length())
+    json.jw_key(&w, "scope".p as u64, 5)
+    json.jw_string(&w, (*t).scope.p as u64, (*t).scope.length())
+    json.jw_key(&w, "expires_at".p as u64, 10)
+    json.jw_int(&w, (*t).expires_at)
+    json.jw_key(&w, "issued_at".p as u64, 9)
+    json.jw_int(&w, (*t).issued_at)
+    json.jw_end(&w)
+    json.jw_free(&w)
+}
+
+fn tokens_from_json(text: str, t: *mut Tokens) -> bool {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, text.p as u64, text.length()) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return false
+    }
+    let root: u32 = json.json_root(&d)
+    var n: Tokens = tokens_new()
+    n.access = oa_json_str(&d, root, "access_token")
+    n.refresh = oa_json_str(&d, root, "refresh_token")
+    n.id_token = oa_json_str(&d, root, "id_token")
+    n.token_type = oa_json_str(&d, root, "token_type")
+    n.scope = oa_json_str(&d, root, "scope")
+    n.expires_at = oa_json_int(&d, root, "expires_at", 0)
+    n.issued_at = oa_json_int(&d, root, "issued_at", 0)
+    json.json_free(&d)
+    n.ok = n.access.length() > 0 || n.refresh.length() > 0
+    *t = n
+    return n.ok
+}
+
+// Keeps the token set in the keyring under (service, key): the Windows
+// Credential Manager, else the encrypted file of std.secret.
+fn tokens_save(service: str, key: str, t: *mut Tokens) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    tokens_to_json(t, &b)
+    let ok: bool = secret.secret_set_bytes(service, key, b.ptr, b.len) catch false
+    rt.mem_set(b.ptr, 0 as u8, b.len)
+    rt.buf_free(&b)
+    return ok
+}
+
+fn tokens_load(service: str, key: str, t: *mut Tokens) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = secret.secret_get_into(service, key, &b) catch 0
+    var ok: bool = false
+    if n > 0 {
+        ok = tokens_from_json(str { p: rt.buf_data(&b), n: b.len }, t)
+    }
+    rt.mem_set(b.ptr, 0 as u8, b.cap)
+    rt.buf_free(&b)
+    return ok
+}
+
+fn tokens_delete(service: str, key: str) -> bool {
+    let ok: bool = secret.secret_delete(service, key) catch false
+    return ok
+}
