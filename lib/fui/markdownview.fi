@@ -67,6 +67,7 @@ import fui.icons
 import fui.lucide
 import fui.icon
 import fui.uiimage
+import fui.uianim
 import fui.kitcolor
 import fui.syntaxcolor
 import fui.editor
@@ -81,7 +82,7 @@ export {
     mdv_content_height, mdv_offset, mdv_set_offset, mdv_item_count,
     mdv_link_rect, mdv_tick, mdv_doc, mdv_set_highlight,
     mdv_select_all, mdv_clear_selection, mdv_has_selection, mdv_selection_text, mdv_copy,
-    mdv_set_clipboard, mdv_char, mdv_item_text, mdv_double_click, mdv_set_time, mdv_selection_range,
+    mdv_set_clipboard, mdv_char, mdv_item_text, mdv_next_ms, mdv_double_click, mdv_set_time, mdv_selection_range,
     BR_NONE, BR_PARA, BR_LINE, BR_CELL,
     IMG_PENDING, IMG_READY, IMG_FAILED,
 }
@@ -135,6 +136,10 @@ struct ImgInfo {
     w: usize,
     h: usize,
     stride: usize,
+    // an ANIMATED picture (lib/fui/uianim.fi): the address of an `uianim.Animation` the caller
+    // keeps alive, or 0. With one, `w` and `h` are still the size to lay out (the canvas), and the
+    // view paints the frame the animation shows now; `mdv_tick` advances it.
+    anim: u64,
 }
 
 // one drawn thing, in content coordinates
@@ -336,9 +341,51 @@ fn mdv_hover_link(v: *mut MdView) -> u32 {
     return (*v).hover
 }
 
+// The clock of the view: scrolling momentum and the ANIMATED pictures (every image that came
+// with an `ImgInfo.anim` advances to the frame `now_ms` says). True when the picture changed and
+// the program has to repaint.
 fn mdv_tick(v: *mut MdView, now_ms: i64) -> bool {
     (*v).now_ms = now_ms
-    return viewport.viewport_tick(&(*v).vp, now_ms)
+    var changed: bool = viewport.viewport_tick(&(*v).vp, now_ms)
+    let n: usize = vec_len[Item](&(*v).items)
+    var i: usize = 0
+    while i < n {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+        if (*it).kind == IT_IMAGE && (*it).extra == 100 as i64 {
+            let q: u64 = rt.buf_ptr(&(*v).vpool) + ((*it).tok2 as u64)
+            let an: u64 = rt.ld64(q, 4)
+            if an != 0 {
+                if uianim.anim_tick(an as *mut uianim.Animation, now_ms) {
+                    changed = true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return changed
+}
+
+// Milliseconds until an animated picture of the view next changes (-1: none does) -- what the
+// host sleeps for instead of repainting every frame.
+fn mdv_next_ms(v: *mut MdView, now_ms: i64) -> i64 {
+    var best: i64 = 0 - 1
+    let n: usize = vec_len[Item](&(*v).items)
+    var i: usize = 0
+    while i < n {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+        if (*it).kind == IT_IMAGE && (*it).extra == 100 as i64 {
+            let q: u64 = rt.buf_ptr(&(*v).vpool) + ((*it).tok2 as u64)
+            let an: u64 = rt.ld64(q, 4)
+            if an != 0 {
+                let t: i64 = uianim.anim_next_ms(an as *mut uianim.Animation, now_ms)
+                if t >= 0 && (best < 0 || t < best) {
+                    best = t
+                }
+            }
+        }
+        i = i + 1
+    }
+    return best
 }
 
 // The clock (ms) for telling a double click from two clicks; `mdv_tick` sets it too.
@@ -679,7 +726,7 @@ fn collect_text(d: *mut doc.Doc, n: u32, out: *mut rt.Buf) {
 fn flow_image(l: *mut L, n: u32, flags: u32, size: f64, link: u32) {
     let v: *mut MdView = (*l).v
     let u: doc.Slice = doc.node_url(&(*v).d, n)
-    var info: ImgInfo = ImgInfo { px: 0, w: 0, h: 0, stride: 0 }
+    var info: ImgInfo = ImgInfo { px: 0, w: 0, h: 0, stride: 0, anim: 0 }
     var st: u32 = IMG_PENDING
     if (*v).has_img_cb && u.n > 0 {
         let f: fn(u64, u64, usize, *mut ImgInfo) -> u32 = (*v).img_cb
@@ -741,11 +788,11 @@ fn flow_image(l: *mut L, n: u32, flags: u32, size: f64, link: u32) {
     it.n = alt_n as u32
     it.extra = (st as i64)
     if ready {
-        // keep the pixel description in the view's pool: 4 words
+        // keep the pixel description in the view's pool: 5 words (the last: the animation)
         it.extra = 100
         it.tok2 = rt.buf_len(&(*v).vpool) as u32
-        var rec: [u64; 4] = [info.px, info.w as u64, info.h as u64, info.stride as u64]
-        rt.buf_push_bytes(&(*v).vpool, (&rec[0]) as u64, 32)
+        var rec: [u64; 5] = [info.px, info.w as u64, info.h as u64, info.stride as u64, info.anim]
+        rt.buf_push_bytes(&(*v).vpool, (&rec[0]) as u64, 40)
     }
     (*l).last = push_item(l, it)
     (*l).x = (*l).x + w
@@ -1478,6 +1525,10 @@ fn paint_image(v: *mut MdView, c: *mut render.Ctx, it: *mut Item, x: f64, y: f64
         let q: u64 = rt.buf_ptr(&(*v).vpool) + ((*it).tok2 as u64)
         var im: uiimage.Image = uiimage.image_wrap(rt.ld64(q, 0), rt.ld64(q, 1) as usize,
             rt.ld64(q, 2) as usize, rt.ld64(q, 3) as usize)
+        if rt.ld64(q, 4) != 0 {
+            // an animation: the frame it shows now
+            im = uianim.anim_frame_image(rt.ld64(q, 4) as *mut uianim.Animation)
+        }
         uiimage.image_draw_rect(z, &im, x, y, (*it).w, (*it).h, 0)
         return
     }
