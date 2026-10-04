@@ -1,0 +1,743 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/compress/bz2.fi -- a bzip2 decoder (one or several streams in a row).
+//
+//     import compress.bz2
+//     bz2.bz2_decompress_limited(p, n, 1 << 30, &out) catch |e| ...   // whole buffer
+//
+//     var d: bz2.Bz2Dec = bz2.bz2_dec_open_fd(fd)                      // streaming
+//     let k: usize = bz2.bz2_dec_read(&d, buf, 65536) catch |e| ...    // 0 = end
+//     bz2.bz2_dec_close(&d)
+//
+// FORMAT (bzip2 1.0, Julian Seward): "BZh" + level '1'..'9' (block size level *
+// 100,000), then blocks -- magic 0x314159265359, a CRC-32 (the MSB-first one,
+// polynomial 0x04C11DB7), a "randomised" bit, the BWT origin pointer, the
+// byte map, the Huffman tables (2..6 of them, switched every 50 symbols by
+// the selectors) and the symbols (zero runs as RUNA/RUNB, then
+// move-to-front) -- and the end mark 0x177245385090 with the combined CRC.
+// A block is undone in three steps: Huffman/MTF/RLE2 -> the BWT column, the
+// inverse BWT walk (a table of u32: byte in the low 8 bits, link in the high
+// 24), and the initial run-length decoding (4 equal bytes + a count byte).
+//
+// MEMORY. The block table is `level * 100,000 * 4` octets (3.6 MB for -9).
+// The inverse BWT walk is RESUMABLE: it stops after about 1 MiB of output and
+// carries on in the next step, so a streaming reader holds "one block table +
+// ~1 MiB", even for a block whose run-length expansion is huge.
+//
+// CHECKS. The block CRC and the combined stream CRC are verified
+// (`CompressError::Checksum`); a block that decodes past its bounds, a bad
+// Huffman table, a selector out of range or an origin pointer outside the
+// block is `Data`; a cut stream is `Truncated`; output beyond `max` is
+// `TooLarge` and nothing beyond `max` is written.
+//
+// HONEST
+//   B1 Streams in a row are decoded (bzip2 -d does, so does Python). Bytes
+//      after the last stream that do not start a new "BZh1".."BZh9" are
+//      IGNORED, like Python's bz2.decompress (and unlike a strict reader);
+//      a first stream that is not bzip2 is `Format`.
+//   B2 The obsolete "randomised" blocks (bzip2 0.9.0, never written since)
+//      are decoded; the 512 entry table is copied from libbz2 (BSD-style
+//      bzip2 license, see THIRD_PARTY.md). A hand-made block carries the
+//      test for it (tests/2182_bz2.fi).
+//   B3 No encoder.
+import std.rt
+import compress.common
+
+export {
+    Bz2Dec, bz2_dec_open_mem, bz2_dec_open_fd, bz2_dec_read, bz2_dec_close,
+    bz2_decompress, bz2_decompress_limited,
+}
+
+const MAXSEL: usize = 18002
+const EMIT_SLICE: usize = 1048576
+const BLOCK_MAGIC_HI: u32 = 0x314159
+const BLOCK_MAGIC_LO: u32 = 0x265359
+const END_MAGIC_HI: u32 = 0x177245
+const END_MAGIC_LO: u32 = 0x385090
+
+// libbz2's table for the obsolete "randomised" blocks (BZ2_rNums)
+static RNUMS: [u16; 512] = [
+    619, 720, 127, 481, 931, 816, 813, 233, 566, 247, 985, 724, 205, 454, 863, 491,
+    741, 242, 949, 214, 733, 859, 335, 708, 621, 574, 73, 654, 730, 472, 419, 436,
+    278, 496, 867, 210, 399, 680, 480, 51, 878, 465, 811, 169, 869, 675, 611, 697,
+    867, 561, 862, 687, 507, 283, 482, 129, 807, 591, 733, 623, 150, 238, 59, 379,
+    684, 877, 625, 169, 643, 105, 170, 607, 520, 932, 727, 476, 693, 425, 174, 647,
+    73, 122, 335, 530, 442, 853, 695, 249, 445, 515, 909, 545, 703, 919, 874, 474,
+    882, 500, 594, 612, 641, 801, 220, 162, 819, 984, 589, 513, 495, 799, 161, 604,
+    958, 533, 221, 400, 386, 867, 600, 782, 382, 596, 414, 171, 516, 375, 682, 485,
+    911, 276, 98, 553, 163, 354, 666, 933, 424, 341, 533, 870, 227, 730, 475, 186,
+    263, 647, 537, 686, 600, 224, 469, 68, 770, 919, 190, 373, 294, 822, 808, 206,
+    184, 943, 795, 384, 383, 461, 404, 758, 839, 887, 715, 67, 618, 276, 204, 918,
+    873, 777, 604, 560, 951, 160, 578, 722, 79, 804, 96, 409, 713, 940, 652, 934,
+    970, 447, 318, 353, 859, 672, 112, 785, 645, 863, 803, 350, 139, 93, 354, 99,
+    820, 908, 609, 772, 154, 274, 580, 184, 79, 626, 630, 742, 653, 282, 762, 623,
+    680, 81, 927, 626, 789, 125, 411, 521, 938, 300, 821, 78, 343, 175, 128, 250,
+    170, 774, 972, 275, 999, 639, 495, 78, 352, 126, 857, 956, 358, 619, 580, 124,
+    737, 594, 701, 612, 669, 112, 134, 694, 363, 992, 809, 743, 168, 974, 944, 375,
+    748, 52, 600, 747, 642, 182, 862, 81, 344, 805, 988, 739, 511, 655, 814, 334,
+    249, 515, 897, 955, 664, 981, 649, 113, 974, 459, 893, 228, 433, 837, 553, 268,
+    926, 240, 102, 654, 459, 51, 686, 754, 806, 760, 493, 403, 415, 394, 687, 700,
+    946, 670, 656, 610, 738, 392, 760, 799, 887, 653, 978, 321, 576, 617, 626, 502,
+    894, 679, 243, 440, 680, 879, 194, 572, 640, 724, 926, 56, 204, 700, 707, 151,
+    457, 449, 797, 195, 791, 558, 945, 679, 297, 59, 87, 824, 713, 663, 412, 693,
+    342, 606, 134, 108, 571, 364, 631, 212, 174, 643, 304, 329, 343, 97, 430, 751,
+    497, 314, 983, 374, 822, 928, 140, 206, 73, 263, 980, 736, 876, 478, 430, 305,
+    170, 514, 364, 692, 829, 82, 855, 953, 676, 246, 369, 970, 294, 750, 807, 827,
+    150, 790, 288, 923, 804, 378, 215, 828, 592, 281, 565, 555, 710, 82, 896, 831,
+    547, 261, 524, 462, 293, 465, 502, 56, 661, 821, 976, 991, 658, 869, 905, 758,
+    745, 193, 768, 550, 608, 933, 378, 286, 215, 979, 792, 961, 61, 688, 793, 644,
+    986, 403, 106, 366, 905, 644, 372, 567, 466, 434, 645, 210, 389, 550, 919, 135,
+    780, 773, 635, 389, 707, 100, 626, 958, 165, 504, 920, 176, 193, 713, 857, 265,
+    203, 50, 668, 108, 645, 990, 626, 197, 510, 357, 358, 850, 858, 364, 936, 638
+]
+
+struct Bz2Dec {
+    src: common.Source,
+    out: rt.Buf, // the streaming buffer (not used by the whole-buffer call)
+    drained: usize,
+    bitbuf: u64,
+    bitcnt: usize,
+    padbits: usize, // virtual zero bits at the low end of bitbuf (the input ended)
+    state: u32, // 0 stream header, 1 block header / end mark, 2 emitting a block, 9 finished
+    streams: u32,
+    level: usize,
+    tt: u64, // u32[level * 100000]
+    ttcap: usize,
+    nblock: usize,
+    origptr: usize,
+    // the Huffman tables of the block being read
+    ngroups: usize,
+    nsel: usize,
+    selector: [u8; 18002],
+    clen: [u8; 1548],
+    lim: [i32; 138],
+    bas: [i32; 138],
+    perm: [u16; 1548],
+    minlen: [u8; 6],
+    seq: [u8; 256],
+    yy: [u8; 256],
+    unz: [u32; 256],
+    cft: [u32; 257],
+    crc_tab: [u32; 256],
+    // the block being emitted
+    bcrc: u32, // the CRC the block header promised
+    crc: u32, // running CRC of the block's output (not yet inverted)
+    combined: u32,
+    randomised: bool,
+    rntogo: i32,
+    rntpos: usize,
+    tpos: usize,
+    ni: usize,
+    run: u32,
+    prev: i32,
+    max: usize, // 0 = no limit
+    produced: usize,
+}
+
+fn dec_new(s: common.Source) -> Bz2Dec {
+    var d: Bz2Dec = Bz2Dec { src: s, out: rt.buf_new(), drained: 0, bitbuf: 0, bitcnt: 0, padbits: 0,
+        state: 0, streams: 0, level: 0, tt: 0, ttcap: 0, nblock: 0, origptr: 0, ngroups: 0, nsel: 0,
+        selector: [0; 18002], clen: [0; 1548], lim: [0; 138], bas: [0; 138], perm: [0; 1548],
+        minlen: [0; 6], seq: [0; 256], yy: [0; 256], unz: [0; 256], cft: [0; 257], crc_tab: [0; 256],
+        bcrc: 0, crc: 0, combined: 0, randomised: false, rntogo: 0, rntpos: 0, tpos: 0, ni: 0,
+        run: 0, prev: -1, max: 0, produced: 0 }
+    var i: usize = 0
+    while i < 256 {
+        var c: u32 = (i as u32) << 24
+        var k: usize = 0
+        while k < 8 {
+            if (c & 0x80000000) != 0 {
+                c = (c << 1) ^ 0x04C11DB7
+            } else {
+                c = c << 1
+            }
+            k = k + 1
+        }
+        d.crc_tab[i] = c
+        i = i + 1
+    }
+    return d
+}
+
+fn bz2_dec_open_mem(p: u64, n: usize) -> Bz2Dec {
+    return dec_new(common.src_mem(p, n))
+}
+
+fn bz2_dec_open_fd(fd: i64) -> Bz2Dec {
+    return dec_new(common.src_fd(fd))
+}
+
+fn bz2_dec_close(d: *mut Bz2Dec) {
+    common.src_free(&(*d).src)
+    rt.buf_free(&(*d).out)
+    if (*d).tt != 0 {
+        rt.heap_free((*d).tt, (*d).ttcap)
+        (*d).tt = 0
+    }
+}
+
+// Refills the bit buffer to at least 57 bits; past the end of the input it
+// appends zero bits and counts them in `padbits`.
+fn fill(d: *mut Bz2Dec) {
+    while (*d).bitcnt <= 56 {
+        let b: i32 = common.src_byte(&(*d).src)
+        if b < 0 {
+            (*d).padbits = (*d).padbits + 8
+            (*d).bitbuf = (*d).bitbuf << 8
+        } else {
+            (*d).bitbuf = ((*d).bitbuf << 8) | (b as u64)
+        }
+        (*d).bitcnt = (*d).bitcnt + 8
+    }
+}
+
+// Have bits been consumed that the input never had?
+fn exhausted(d: *mut Bz2Dec) -> bool {
+    return (*d).bitcnt < (*d).padbits
+}
+
+// 1..32 bits, most significant first.
+fn bits(d: *mut Bz2Dec, n: usize) -> u32 {
+    if (*d).bitcnt < n {
+        fill(d)
+    }
+    let v: u64 = ((*d).bitbuf >> ((*d).bitcnt - n) as u64) & (((1 as u64) << (n as u64)) - 1)
+    (*d).bitcnt = (*d).bitcnt - n
+    return v as u32
+}
+
+fn bit(d: *mut Bz2Dec) -> bool {
+    return bits(d, 1) != 0
+}
+
+// One Huffman symbol of table `g`, or -1.
+fn next_sym(d: *mut Bz2Dec, g: usize) -> i32 {
+    if (*d).bitcnt < 24 {
+        fill(d)
+    }
+    let peek: u32 = (((*d).bitbuf >> ((*d).bitcnt - 20) as u64) & 0xFFFFF) as u32
+    var zn: usize = (*d).minlen[g] as usize
+    while zn <= 20 {
+        let v: i32 = (peek >> ((20 - zn) as u32)) as i32
+        if v <= (*d).lim[g * 23 + zn] {
+            let idx: i32 = v - (*d).bas[g * 23 + zn]
+            if idx < 0 || idx >= 258 {
+                return -1
+            }
+            (*d).bitcnt = (*d).bitcnt - zn
+            return (*d).perm[g * 258 + (idx as usize)] as i32
+        }
+        zn = zn + 1
+    }
+    return -1
+}
+
+// libbz2's BZ2_hbCreateDecodeTables for table `g` over `alpha` symbols.
+fn build_tables(d: *mut Bz2Dec, g: usize, alpha: usize) {
+    var minl: usize = 32
+    var maxl: usize = 0
+    var i: usize = 0
+    while i < alpha {
+        let l: usize = (*d).clen[g * 258 + i] as usize
+        if l > maxl {
+            maxl = l
+        }
+        if l < minl {
+            minl = l
+        }
+        i = i + 1
+    }
+    (*d).minlen[g] = minl as u8
+    var pp: usize = 0
+    var l: usize = minl
+    while l <= maxl {
+        var j: usize = 0
+        while j < alpha {
+            if (*d).clen[g * 258 + j] as usize == l {
+                (*d).perm[g * 258 + pp] = j as u16
+                pp = pp + 1
+            }
+            j = j + 1
+        }
+        l = l + 1
+    }
+    var b: [i32; 23] = [0; 23]
+    i = 0
+    while i < alpha {
+        let li: usize = (*d).clen[g * 258 + i] as usize
+        b[li + 1] = b[li + 1] + 1
+        i = i + 1
+    }
+    i = 1
+    while i < 23 {
+        b[i] = b[i] + b[i - 1]
+        i = i + 1
+    }
+    var vec: i32 = 0
+    i = 0
+    while i < 23 {
+        (*d).lim[g * 23 + i] = -1
+        i = i + 1
+    }
+    i = minl
+    while i <= maxl {
+        vec = vec + (b[i + 1] - b[i])
+        (*d).lim[g * 23 + i] = vec - 1
+        vec = vec * 2
+        i = i + 1
+    }
+    i = minl + 1
+    while i <= maxl {
+        (*d).bas[g * 23 + i] = (((*d).lim[g * 23 + i - 1] + 1) * 2) - b[i]
+        i = i + 1
+    }
+    (*d).bas[g * 23 + minl] = b[minl]
+    // libbz2 leaves base[minLen] = cumulative count of shorter codes (0)
+    (*d).bas[g * 23 + minl] = 0
+}
+
+// Reads the block header after its magic and decodes the symbols into `tt`
+// (byte in the low 8 bits), then links the inverse BWT.
+fn read_block(d: *mut Bz2Dec) -> CompressError!bool {
+    (*d).bcrc = bits(d, 32)
+    (*d).randomised = bit(d)
+    (*d).origptr = bits(d, 24) as usize
+    // the byte map
+    var in_use: [bool; 256] = [false; 256]
+    let used16: u32 = bits(d, 16)
+    var i: usize = 0
+    while i < 16 {
+        if ((used16 >> ((15 - i) as u32)) & 1) != 0 {
+            let w: u32 = bits(d, 16)
+            var j: usize = 0
+            while j < 16 {
+                if ((w >> ((15 - j) as u32)) & 1) != 0 {
+                    in_use[i * 16 + j] = true
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    var nin: usize = 0
+    i = 0
+    while i < 256 {
+        if in_use[i] {
+            (*d).seq[nin] = i as u8
+            nin = nin + 1
+        }
+        i = i + 1
+    }
+    if nin == 0 {
+        return CompressError::Data
+    }
+    let alpha: usize = nin + 2
+    let ng: usize = bits(d, 3) as usize
+    if ng < 2 || ng > 6 {
+        return CompressError::Data
+    }
+    let nsel: usize = bits(d, 15) as usize
+    if nsel < 1 {
+        return CompressError::Data
+    }
+    if exhausted(d) {
+        return CompressError::Truncated
+    }
+    // selectors, move-to-front coded in unary
+    var sel_mtf: [u8; 6] = [0, 1, 2, 3, 4, 5]
+    i = 0
+    while i < nsel {
+        var j: usize = 0
+        while bit(d) {
+            j = j + 1
+            if j >= ng {
+                return CompressError::Data
+            }
+        }
+        if i < MAXSEL {
+            let v: u8 = sel_mtf[j]
+            var k: usize = j
+            while k > 0 {
+                sel_mtf[k] = sel_mtf[k - 1]
+                k = k - 1
+            }
+            sel_mtf[0] = v
+            (*d).selector[i] = v
+        }
+        if exhausted(d) {
+            return CompressError::Truncated
+        }
+        i = i + 1
+    }
+    var nsel_used: usize = nsel
+    if nsel_used > MAXSEL {
+        nsel_used = MAXSEL
+    }
+    (*d).nsel = nsel_used
+    (*d).ngroups = ng
+    // the coding tables, delta coded
+    var t: usize = 0
+    while t < ng {
+        var curr: i32 = bits(d, 5) as i32
+        i = 0
+        while i < alpha {
+            while true {
+                if curr < 1 || curr > 20 {
+                    return CompressError::Data
+                }
+                if !bit(d) {
+                    break
+                }
+                if !bit(d) {
+                    curr = curr + 1
+                } else {
+                    curr = curr - 1
+                }
+            }
+            (*d).clen[t * 258 + i] = curr as u8
+            i = i + 1
+        }
+        if exhausted(d) {
+            return CompressError::Truncated
+        }
+        build_tables(d, t, alpha)
+        t = t + 1
+    }
+    // the symbols
+    let nmax: usize = (*d).level * 100000
+    let eob: i32 = (nin as i32) + 1
+    i = 0
+    while i < 256 {
+        (*d).unz[i] = 0
+        (*d).yy[i] = i as u8
+        i = i + 1
+    }
+    var nblock: usize = 0
+    var gno: usize = 0
+    var gpos: usize = 0
+    var g: usize = 0
+    var in_run: bool = false
+    var es: usize = 0
+    var nn: usize = 1
+    var first: bool = true
+    while true {
+        if gpos == 0 {
+            if !first {
+                gno = gno + 1
+            }
+            first = false
+            if gno >= (*d).nsel {
+                return CompressError::Data
+            }
+            gpos = 50
+            g = (*d).selector[gno] as usize
+            if exhausted(d) {
+                return CompressError::Truncated
+            }
+        }
+        gpos = gpos - 1
+        let sym: i32 = next_sym(d, g)
+        if sym < 0 {
+            if exhausted(d) {
+                return CompressError::Truncated
+            }
+            return CompressError::Data
+        }
+        if sym <= 1 {
+            if !in_run {
+                in_run = true
+                es = 0
+                nn = 1
+            }
+            if sym == 0 {
+                es = es + nn
+            } else {
+                es = es + 2 * nn
+            }
+            nn = nn * 2
+            if nn >= 2097152 {
+                return CompressError::Data
+            }
+            continue
+        }
+        if in_run {
+            in_run = false
+            let uc: u8 = (*d).seq[(*d).yy[0] as usize]
+            if nblock + es > nmax {
+                return CompressError::Data
+            }
+            (*d).unz[uc as usize] = (*d).unz[uc as usize] + (es as u32)
+            var k: usize = 0
+            while k < es {
+                rt.st32((*d).tt, nblock + k, uc as u32)
+                k = k + 1
+            }
+            nblock = nblock + es
+        }
+        if sym == eob {
+            break
+        }
+        if nblock >= nmax {
+            return CompressError::Data
+        }
+        let m: usize = (sym - 1) as usize
+        let uc: u8 = (*d).yy[m]
+        var k: usize = m
+        while k > 0 {
+            (*d).yy[k] = (*d).yy[k - 1]
+            k = k - 1
+        }
+        (*d).yy[0] = uc
+        let b: u8 = (*d).seq[uc as usize]
+        rt.st32((*d).tt, nblock, b as u32)
+        (*d).unz[b as usize] = (*d).unz[b as usize] + 1
+        nblock = nblock + 1
+    }
+    if exhausted(d) {
+        return CompressError::Truncated
+    }
+    if (*d).origptr >= nblock {
+        return CompressError::Data
+    }
+    (*d).nblock = nblock
+    // the inverse BWT: link every position to the next
+    (*d).cft[0] = 0
+    i = 1
+    while i <= 256 {
+        (*d).cft[i] = (*d).cft[i - 1] + (*d).unz[i - 1]
+        i = i + 1
+    }
+    i = 0
+    while i < nblock {
+        let uc: usize = (rt.ld32((*d).tt, i) & 0xFF) as usize
+        let at: usize = (*d).cft[uc] as usize
+        (*d).cft[uc] = (*d).cft[uc] + 1
+        rt.st32((*d).tt, at, rt.ld32((*d).tt, at) | ((i as u32) << 8))
+        i = i + 1
+    }
+    (*d).tpos = (rt.ld32((*d).tt, (*d).origptr) >> 8) as usize
+    (*d).ni = 0
+    (*d).run = 0
+    (*d).prev = -1
+    (*d).crc = 0xFFFFFFFF
+    (*d).rntogo = 0
+    (*d).rntpos = 0
+    return true
+}
+
+// Emits up to ~1 MiB of the current block; true when the block is done.
+fn emit_slice(d: *mut Bz2Dec, out: *mut rt.Buf) -> CompressError!bool {
+    let start: usize = (*out).len
+    if !common.buf_ensure(out, start + EMIT_SLICE + 512) {
+        return CompressError::OutOfMemory
+    }
+    let dst: u64 = (*out).ptr
+    var op: usize = start
+    var left: usize = 0xFFFFFFFFFFFFFFFF
+    if (*d).max > 0 {
+        left = (*d).max - (*d).produced
+    }
+    let tt: u64 = (*d).tt
+    var tpos: usize = (*d).tpos
+    var ni: usize = (*d).ni
+    let nb: usize = (*d).nblock
+    var run: u32 = (*d).run
+    var prev: i32 = (*d).prev
+    let rnd: bool = (*d).randomised
+    while ni < nb && op - start < EMIT_SLICE {
+        let e: u32 = rt.ld32(tt, tpos)
+        var ch: u32 = e & 0xFF
+        tpos = (e >> 8) as usize
+        ni = ni + 1
+        if rnd {
+            if (*d).rntogo == 0 {
+                (*d).rntogo = RNUMS[(*d).rntpos] as i32
+                (*d).rntpos = (*d).rntpos + 1
+                if (*d).rntpos == 512 {
+                    (*d).rntpos = 0
+                }
+            }
+            (*d).rntogo = (*d).rntogo - 1
+            if (*d).rntogo == 1 {
+                ch = ch ^ 1
+            }
+        }
+        if run == 4 {
+            // `ch` is the repeat count of the run of four
+            let cnt: usize = ch as usize
+            if op - start + cnt > left {
+                return CompressError::TooLarge
+            }
+            var k: usize = 0
+            while k < cnt {
+                rt.st8(dst, op + k, prev as u8)
+                k = k + 1
+            }
+            op = op + cnt
+            run = 0
+            prev = -1
+            continue
+        }
+        if (ch as i32) == prev {
+            run = run + 1
+        } else {
+            run = 1
+            prev = ch as i32
+        }
+        if op - start + 1 > left {
+            return CompressError::TooLarge
+        }
+        rt.st8(dst, op, ch as u8)
+        op = op + 1
+    }
+    (*d).tpos = tpos
+    (*d).ni = ni
+    (*d).run = run
+    (*d).prev = prev
+    // CRC over what was written
+    var c: u32 = (*d).crc
+    var q: usize = start
+    while q < op {
+        c = (c << 8) ^ (*d).crc_tab[(((c >> 24) ^ (rt.ld8(dst, q) as u32)) & 0xFF) as usize]
+        q = q + 1
+    }
+    (*d).crc = c
+    (*out).len = op
+    (*d).produced = (*d).produced + (op - start)
+    return ni >= nb
+}
+
+// One step: false when the whole input is decoded.
+fn bz2_step(d: *mut Bz2Dec, out: *mut rt.Buf) -> CompressError!bool {
+    if (*d).state == 9 {
+        return false
+    }
+    if (*d).state == 0 {
+        if (*d).streams > 0 {
+            // another stream? (a byte boundary: the end mark was byte aligned)
+            if (*d).bitcnt >= (*d).padbits + 8 {
+                // bytes already in the bit buffer
+            } else if common.src_at_end(&(*d).src) && (*d).bitcnt <= (*d).padbits {
+                (*d).state = 9
+                return false
+            }
+        } else {
+            if common.src_at_end(&(*d).src) && (*d).bitcnt <= (*d).padbits {
+                if common.src_failed(&(*d).src) {
+                    return CompressError::Io
+                }
+                return CompressError::Truncated
+            }
+        }
+        let b0: u32 = bits(d, 8)
+        let b1: u32 = bits(d, 8)
+        let b2: u32 = bits(d, 8)
+        let lv: u32 = bits(d, 8)
+        if b0 != 0x42 || b1 != 0x5A || b2 != 0x68 || lv < 0x31 || lv > 0x39 {
+            if (*d).streams > 0 {
+                (*d).state = 9 // trailing garbage is ignored (B1)
+                return false
+            }
+            if exhausted(d) {
+                return CompressError::Truncated
+            }
+            return CompressError::Format
+        }
+        if exhausted(d) {
+            return CompressError::Truncated
+        }
+        (*d).level = (lv - 0x30) as usize
+        let need: usize = (*d).level * 100000 * 4
+        if (*d).ttcap < need {
+            if (*d).tt != 0 {
+                rt.heap_free((*d).tt, (*d).ttcap)
+            }
+            (*d).tt = rt.heap_alloc(need)
+            (*d).ttcap = need
+            if (*d).tt == 0 {
+                (*d).ttcap = 0
+                return CompressError::OutOfMemory
+            }
+        }
+        (*d).combined = 0
+        (*d).state = 1
+        return true
+    }
+    if (*d).state == 1 {
+        let hi: u32 = bits(d, 24)
+        let lo: u32 = bits(d, 24)
+        if hi == BLOCK_MAGIC_HI && lo == BLOCK_MAGIC_LO {
+            try read_block(d)
+            (*d).state = 2
+            return true
+        }
+        if hi == END_MAGIC_HI && lo == END_MAGIC_LO {
+            let want: u32 = bits(d, 32)
+            if exhausted(d) {
+                return CompressError::Truncated
+            }
+            if want != (*d).combined {
+                return CompressError::Checksum
+            }
+            // the stream ends on a byte boundary
+            (*d).bitcnt = (*d).bitcnt - ((*d).bitcnt % 8)
+            (*d).streams = (*d).streams + 1
+            (*d).state = 0
+            return true
+        }
+        if exhausted(d) {
+            return CompressError::Truncated
+        }
+        return CompressError::Data
+    }
+    // state 2: emit
+    let done: bool = try emit_slice(d, out)
+    if done {
+        let crc: u32 = (*d).crc ^ 0xFFFFFFFF
+        if crc != (*d).bcrc {
+            return CompressError::Checksum
+        }
+        (*d).combined = (((*d).combined << 1) | ((*d).combined >> 31)) ^ crc
+        (*d).state = 1
+    }
+    return true
+}
+
+fn bz2_decompress(src: u64, n: usize, out: *mut rt.Buf) -> CompressError!usize {
+    return try bz2_decompress_limited(src, n, 0, out)
+}
+
+fn bz2_decompress_limited(src: u64, n: usize, max: usize, out: *mut rt.Buf) -> CompressError!usize {
+    var d: Bz2Dec = bz2_dec_open_mem(src, n)
+    defer bz2_dec_close(&d)
+    d.max = max
+    let before: usize = (*out).len
+    while true {
+        let more: bool = try bz2_step(&d, out)
+        if !more {
+            break
+        }
+    }
+    return (*out).len - before
+}
+
+// Up to `n` decoded octets into `dst`; 0 = end of the stream.
+fn bz2_dec_read(d: *mut Bz2Dec, dst: u64, n: usize) -> CompressError!usize {
+    while (*d).drained >= (*d).out.len && (*d).state != 9 {
+        // bzip2 never reaches back into earlier output: nothing to keep
+        let cut: usize = common.buf_compact(&(*d).out, (*d).drained, 0)
+        (*d).drained = (*d).drained - cut
+        let more: bool = try bz2_step(d, &(*d).out)
+        if !more {
+            break
+        }
+    }
+    var k: usize = (*d).out.len - (*d).drained
+    if k > n {
+        k = n
+    }
+    if k > 0 {
+        rt.mem_copy(dst, (*d).out.ptr + (*d).drained as u64, k)
+        (*d).drained = (*d).drained + k
+    }
+    return k
+}
