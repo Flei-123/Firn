@@ -291,12 +291,12 @@ if command -v makensis >/dev/null 2>&1; then
     check "the NSIS setup installs the program" "[ -f $NINST/hello.exe ] && [ -f $NINST/uninstall.exe ]"
     check "...with the registry entry" "[ \"\$(regval DisplayVersion)\" = '1.0.0' ] && [ \"\$(regval Publisher)\" = 'FleiTec' ]"
     # NSIS asks the system for the folders (not the registry values the other tests point elsewhere)
-    NSM=$WINEPREFIX/drive_c/users/root/AppData/Roaming/Microsoft/Windows/Start\ Menu/Programs/Hello\ App.lnk
-    NSD=$(readlink -f "$WINEPREFIX/drive_c/users/root/Desktop")/Hello\ App.lnk
-    check "...and the shortcuts" "[ -f $NSM ] && [ -f $NSD ]"
+    NSM="$WINEPREFIX/drive_c/users/root/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Hello App.lnk"
+    NSD="$(readlink -f "$WINEPREFIX/drive_c/users/root/Desktop")/Hello App.lnk"
+    check "...and the shortcuts" "[ -f \"$NSM\" ] && [ -f \"$NSD\" ]"
     session s7 "$(winp "$NINST")\\uninstall.exe /S _?=$(winp "$NINST")" "reg query \"$UK\" > $(winp "$T/q.txt") 2>&1"
     sleep 2
-    check "the NSIS uninstaller removes the entry and the shortcuts" "! grep -q DisplayName $T/q.txt && [ ! -f $NSM ] && [ ! -f $NSD ]"
+    check "the NSIS uninstaller removes the entry and the shortcuts" "! grep -q DisplayName $T/q.txt && [ ! -f \"$NSM\" ] && [ ! -f \"$NSD\" ]"
     rm -rf "$NINST"
 else
     echo "SKIP: makensis not installed"

@@ -111,3 +111,20 @@ honest gaps: [APPKIT.md](APPKIT.md).
 The store side (`store add-app`: `exe`, `bin`, `appimage`, `macos-app`
 packages, per-platform channel pointers, `mindestFassung`) is in the
 orientstore repository, `docs/KATALOG-FORMAT.md`.
+
+## Packaging (lib/pack, tools/pack)
+
+What turns a built program into the files people install it with, on every platform, without the platform's
+own packaging tools: [PACKAGING.md](PACKAGING.md). `bash package.sh` in a project from `tools/newapp.sh`
+(= `tools/pack/all.sh APP-DIR VERSION`) writes `dist/<version>/`: `.deb`, `.rpm`, `.tar.gz`, a real AppImage and a self-extracting
+`.run`, the Windows `setup.exe` (installer + uninstaller + Start Menu/Desktop shortcuts + "Apps & features" entry), the
+program with its icon, a portable zip and an NSIS script, `.app`/`.zip`/`.dmg` (structure only), an APK, an OrientOS `.opk`,
+all icon sizes, and `manifest.json` (SHA-256 + Ed25519 per file) with the `store add-app` commands.
+
+| module | what it does | held against |
+|---|---|---|
+| `pack.lnk` (`lib/pack/lnk.fi`) | Windows shortcuts (.lnk) written and read as plain octets (no COM): ID list, LinkInfo, Unicode strings | `tests/2200`; an independent reader (`tools/pack/test/lnkread.py`); Wine's shell starts the program through them |
+| `pack.icons` (`lib/pack/icons.fi`, `tools/pack/icons.fi`) | PNG encoder, resampler, `.ico` and `.icns` writers; one SVG/PNG -> every size, Android mipmaps, hicolor theme | `tests/2201`; read back by `lib/paint/png.fi`, PIL, `unsquashfs`-free parsers in `checks.py` |
+| `pack.payload`, `pack.install`, `pack.installed`, `pack.winreg` (+ `winreg.windows.fi`) | a zip appended to a program behind a hashed trailer; the installer state machine (extract, list, upgrade, shortcuts, `HKCU\...\Uninstall`, uninstaller that deletes itself); the registry writers (new `advapi32` imports in `compiler/src/win.rs`) | `tests/2202`, `tests/2203` (without Windows); `tools/pack/test/windows.sh` under Wine, window included |
+| `tools/pack/pack.py` (`packlib/`) | zip, deb, rpm, tar, SquashFS + AppImage, plist/.app/.dmg, OPKG, PE icon resource, NSIS script, manifest + signatures; Python standard library only | `tools/pack/test/checks.py`: ~170 checks against dpkg-deb, `dpkg -i` / `rpm -i` in a container, unsquashfs, the AppImage runtime, OrientOS's `opk.py`, makensis, xorriso |
+| `tools/pack/stub/selfx.fi` | the self-extracting Linux program (unpack once to the cache, `execve`, `$APPIMAGE` set so appkit updates the file itself) | `checks.py`: run, cached start, damaged file refused |

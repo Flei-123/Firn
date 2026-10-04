@@ -8,6 +8,7 @@
 # build.sh, build-windows.sh, build-android.sh). Output: APP-DIR/dist/VERSION/
 #
 #   linux     ID-VERSION-linux-x86_64.deb        .deb (dpkg -i)
+#             ID-VERSION-1.x86_64.rpm            .rpm (rpm -i)
 #             ID-VERSION-linux-x86_64.tar.gz     tarball with install.sh / uninstall.sh
 #             ID-VERSION-x86_64.AppImage         a real AppImage (runtime + squashfs), when a runtime
 #                                                is there (downloaded once, or --runtime FILE) ...
@@ -102,6 +103,7 @@ if has linux; then
       ARCH=x86_64
       $PACK deb "${APPARGS[@]}" --exe "$EXE" --out "$OUT/$ID-$VERSION-linux-$ARCH.deb" "${ICONARG[@]}" \
           --depends "$(ini depends)" >/dev/null
+      $PACK rpm "${APPARGS[@]}" --exe "$EXE" --out "$OUT/$ID-$VERSION-1.$ARCH.rpm" "${ICONARG[@]}" >/dev/null
       $PACK tar "${APPARGS[@]}" --exe "$EXE" --out "$OUT/$ID-$VERSION-linux-$ARCH.tar.gz" "${ICONARG[@]}" >/dev/null
       $PACK selfextract "${APPARGS[@]}" --stub "$BUILD/selfx" --exe "$EXE" --out "$OUT/$ID-$VERSION-$ARCH.run" \
           "${ICONARG[@]}" >/dev/null
@@ -110,16 +112,17 @@ if has linux; then
         EXE=$APP/build/$ID
         art "bin:linux-x86_64:$OUT/$ID-$VERSION-linux-x86_64:store"
         art "deb:linux-x86_64:$OUT/$ID-$VERSION-linux-x86_64.deb"
+        art "rpm:linux-x86_64:$OUT/$ID-$VERSION-1.x86_64.rpm"
         art "tar:linux-x86_64:$OUT/$ID-$VERSION-linux-x86_64.tar.gz"
         RT=(); [ -n "$RUNTIME" ] && RT=(--runtime "$RUNTIME")
         if $PACK appimage "${APPARGS[@]}" --exe "$EXE" --out "$OUT/$ID-$VERSION-x86_64.AppImage" "${ICONARG[@]}" \
                 ${RT[@]+"${RT[@]}"} >/dev/null 2>"$OUT/appimage.log"; then
             art "appimage:linux-x86_64:$OUT/$ID-$VERSION-x86_64.AppImage:store"
             art "selfextract:linux-x86_64:$OUT/$ID-$VERSION-x86_64.run"
-            say "linux       deb, tar.gz, AppImage (real), .run (self-extracting), raw program"
+            say "linux       deb, rpm, tar.gz, AppImage (real), .run (self-extracting), raw program"
         else
             art "appimage:linux-x86_64:$OUT/$ID-$VERSION-x86_64.run:store"
-            say "linux       deb, tar.gz, .run (self-extracting; served to the updater as the 'appimage' art), raw program -- no real AppImage: $(tail -1 "$OUT/appimage.log")"
+            say "linux       deb, rpm, tar.gz, .run (self-extracting; served to the updater as the 'appimage' art), raw program -- no real AppImage: $(tail -1 "$OUT/appimage.log")"
         fi
         rm -f "$OUT/appimage.log"
     } || { say "linux       FAILED"; FAILS=$((FAILS+1)); }

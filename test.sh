@@ -1621,6 +1621,27 @@ if [ "$ASRC" -eq 0 ]; then
 else
     bad "tools/async/run.sh failed (see .test-work/async.log)"
     grep -E 'FAIL' "$WORK/async.log" | head -12 | sed 's/^/   /'
+echo "== 77. packaging: installers, packages, icons (tools/pack/, lib/pack/, docs/PACKAGING.md) =="
+# lib/pack's unit tests are in tests/2200-2203 (section 3): the shortcut writer, the icon formats, the
+# installer payload, a whole install / upgrade / uninstall without Windows. Here: tools/pack/test/run.sh
+# builds the Firn parts (icons tool, installer stub, self-extract stub) and runs checks.py -- every writer
+# (.deb, .rpm, tar.gz, SquashFS/AppImage, self-extracting .run, .opk, .app/.dmg, zip, NSIS script, PE icon
+# resource, manifest + Ed25519 signatures) against an independent reader: dpkg-deb, `dpkg -i` and `rpm -i` in
+# a container, unsquashfs, the AppImage runtime, OrientOS's opk.py byte for byte, the store's opkleser, makensis,
+# xorriso, a store tool in a throw-away repository. PACK_WINE=1 adds windows.sh: the Windows installer under
+# Wine (silent and window install, shortcuts read by an independent parser and started by Wine's shell,
+# the registry entry, upgrade, uninstall and its leftovers, cancel, NSIS, the portable zip; PACK_WINE_APP=1 also
+# the appkit template's window on the Win32 back end). Readers that are not installed SKIP.
+bash tools/pack/test/run.sh > "$WORK/pack.log" 2>&1 && PKRC=0 || PKRC=$?
+if [ "${PACK_WINE:-0}" = "1" ]; then
+    PACK_WINE=1 PACK_WINE_APP=${PACK_WINE_APP:-1} bash tools/pack/test/run.sh > "$WORK/pack_wine.log" 2>&1 || PKRC=1
+fi
+if [ "$PKRC" -eq 0 ]; then
+    ok
+    grep -E '^(pack checks:|windows.sh:|SKIP)' "$WORK"/pack*.log | sed 's/^/   /'
+else
+    bad "tools/pack/test failed (see .test-work/pack*.log)"
+    grep -E 'FAIL' "$WORK"/pack*.log | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

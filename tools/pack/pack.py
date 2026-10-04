@@ -14,6 +14,7 @@ Commands
   win-nsis        NSIS script (+ build if makensis) --exe app.exe --outdir DIR [--ico F]
   pe-icon         put an .ico into a Windows exe    --exe in.exe --ico F --out out.exe
   deb             Debian package                    --exe prog --out X.deb [--icons DIR] [--depends D]
+  rpm             RPM package                       --exe prog --out X.rpm [--icons DIR]
   tar             tar.gz with install.sh            --exe prog --out X.tar.gz [--icons DIR]
   selfextract     self-extracting program           --stub selfx --exe prog --out X.run [--icons DIR]
   appimage        AppImage (runtime + squashfs)     --exe prog --out X.AppImage [--runtime F] [--icons DIR]
@@ -33,7 +34,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from packlib import common, win, linux, mac, osum, manifest   # noqa: E402
+from packlib import common, win, linux, mac, osum, manifest, rpm as rpmmod   # noqa: E402
 from packlib.common import PackError, App  # noqa: E402
 
 
@@ -97,6 +98,11 @@ def cmd_win_nsis(a):
 def cmd_deb(a):
     app = app_of(a)
     print(linux.deb(app, a.exe, a.out, a.icons, app.arch or None, app.depends or None, a.compress))
+
+
+def cmd_rpm(a):
+    app = app_of(a)
+    print(rpmmod.rpm(app, a.exe, a.out, a.icons, app.arch or None))
 
 
 def cmd_tar(a):
@@ -220,6 +226,8 @@ def main(argv):
     p.set_defaults(fn=cmd_deb)
     p = sub.add_parser("tar"); add_app_args(p); exe_arg(p); p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_tar)
+    p = sub.add_parser("rpm"); add_app_args(p); exe_arg(p); p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_rpm)
     p = sub.add_parser("selfextract"); add_app_args(p); exe_arg(p, True); p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_selfextract)
     p = sub.add_parser("appimage"); add_app_args(p); exe_arg(p); p.add_argument("--out", required=True)

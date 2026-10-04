@@ -34,6 +34,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.dirname(HERE)
 sys.path.insert(0, PACK)
 from packlib import common, linux, mac, manifest, osum, squashfs, win   # noqa: E402
+from packlib.rpm import rpm as linux_rpm   # noqa: E402
 
 TOTAL = FAILS = SKIPS = 0
 
@@ -202,6 +203,41 @@ def body(tmp):
             skip("docker image %s not here" % img)
     else:
         skip("docker not available")
+
+    # --------------------------------------------------------------- rpm
+    rc, out = pack("rpm", *APP, "--exe", hello, "--out", j("hello-1.2.3-1.x86_64.rpm"), "--icons", ic)
+    ok(rc == 0, "rpm is written: " + out[-200:])
+    rp = common.read(j("hello-1.2.3-1.x86_64.rpm"))
+    ok(rp[:4] == b"\xed\xab\xee\xdb" and rp[96:100] == b"\x8e\xad\xe8\x01", "rpm lead and signature header magic")
+    sh_n, sh_s = struct.unpack(">II", rp[96 + 8:96 + 16])
+    hpos = 96 + 16 + sh_n * 16 + sh_s
+    hpos += -hpos % 8
+    ok(rp[hpos:hpos + 4] == b"\x8e\xad\xe8\x01", "the header follows the signature header (8-aligned)")
+    rpm2 = common.read(j("hello-1.2.3-1.x86_64.rpm"))
+    ok(rpm2 == common.read(linux_rpm(common.App(id="hello", name="Hello App", version="1.2.3", vendor="FleiTec", summary="Says hello",
+                                                  description="First line.\\nSecond line."), hello, j("rpm2.rpm"), ic)), "deterministic rpm")
+    if have("rpm"):
+        r = run("rpm", "-qip", j("hello-1.2.3-1.x86_64.rpm"))
+        ok(b"Name        : hello" in r.stdout and b"Version     : 1.2.3" in r.stdout, "rpm -qip")
+        ok(b"digests OK" in run("rpm", "-K", j("hello-1.2.3-1.x86_64.rpm")).stdout, "rpm -K digests")
+    elif have("docker") and os.environ.get("PACK_DOCKER", "1") == "1" and run("docker", "image", "inspect", "jarvis-pyrun:latest").returncode == 0:
+        r = run("docker", "run", "--rm", "-v", tmp + ":/pk:ro", "jarvis-pyrun:latest", "sh", "-c",
+                "apt-get update >/dev/null 2>&1; apt-get install -y rpm >/dev/null 2>&1 || exit 77; "
+                "rpm -K /pk/hello-1.2.3-1.x86_64.rpm; rpm -qlp /pk/hello-1.2.3-1.x86_64.rpm | wc -l; "
+                "mkdir -p /r/var/lib/rpm; rpm --root /r --initdb; "
+                "rpm --root /r -i --nodeps --noscripts /pk/hello-1.2.3-1.x86_64.rpm 2>&1; "
+                "/r/usr/bin/hello /tmp/m.txt >/dev/null; cat /tmp/m.txt; rpm --root /r -V hello && echo verify-ok; "
+                "rpm --root /r -e --nodeps hello 2>/dev/null; ls /r/usr/bin | wc -l")
+        t = r.stdout.decode()
+        if r.returncode == 77:
+            skip("rpm could not be installed in the container (no network?)")
+        else:
+            ok("digests OK" in t and "deprecated" not in t, "rpm -K digests, no 'v3 package' warning: " + t[:200])
+            ok("hello from the packaged program" in t, "rpm -i installs it and the program runs: " + t[:300])
+            ok("verify-ok" in t, "rpm -V finds every file as packaged")
+            ok(t.strip().endswith("0"), "rpm -e removes it")
+    else:
+        skip("no rpm and no container to run it")
 
     # --------------------------------------------------------------- tar
     rc, out = pack("tar", *APP, "--exe", hello, "--out", j("hello.tar.gz"), "--icons", ic)
