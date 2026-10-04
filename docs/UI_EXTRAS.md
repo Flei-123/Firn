@@ -5,7 +5,7 @@ open, each with a test and, where another implementation exists, held against it
 Everything is in `lib/`, tested in `tests/2240-2242` (library) and `tools/fui/*_main.fi`
 (painted pixels, synthetic pointer streams), run by `tools/fui/run.sh` section 18q;
 the parts held against other programs (`tools/qr/run.sh`, `tools/uiextras/run.sh`) are
-`test.sh` section 77.
+`test.sh` section 79.
 
 | # | what | where | proof |
 |---|---|---|---|

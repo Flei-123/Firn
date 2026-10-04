@@ -1642,7 +1642,7 @@ if [ "$PKRC" -eq 0 ]; then
 else
     bad "tools/pack/test failed (see .test-work/pack*.log)"
     grep -E 'FAIL' "$WORK"/pack*.log | head -12 | sed 's/^/   /'
-echo "== 77. UI extras: QR codes against qrcodegen / python-qrcode / ZXing-C++, and the human texts against ICU (tools/qr/, tools/uiextras/) =="
+echo "== 79. UI extras: QR codes against qrcodegen / python-qrcode / ZXing-C++, and the human texts against ICU (tools/qr/, tools/uiextras/) =="
 # The fUi parts of the same wave (rich text, selection and copy, highlighting, animated pictures,
 # the kit in the accessibility tree, touch, right to left, the QR widget) are section 18q of
 # tools/fui/run.sh; their library tests are tests/2240-2242 (section 3). Here the two that are
