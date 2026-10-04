@@ -55,6 +55,12 @@ def run_probe(op, fmt, data, arg=None, timeout=120, dict_path=None):
         cmd.append("dict.bin")
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=timeout, cwd=W)
+        # a runner (Wine, qemu) now and then fails to start a process on a busy machine: no output,
+        # no message. Ask again; a real crash of the probe repeats and is reported.
+        tries = 0
+        while RUNNER and r.returncode != 0 and not r.stdout and not r.stderr and tries < 3:
+            tries += 1
+            r = subprocess.run(cmd, capture_output=True, timeout=timeout, cwd=W)
     except subprocess.TimeoutExpired:
         return "TIMEOUT", b""
     if r.returncode != 0:
