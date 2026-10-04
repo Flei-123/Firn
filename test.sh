@@ -1559,7 +1559,7 @@ echo "== 74. DNS resolver and https by name (tools/dns/run.sh, round DNS) =="
 # counted from its log), against the real network when there is one, https by
 # name against a hermetic Python TLS server (counter-checks: no roots, other
 # name, other CA) and against piston-meta.mojang.com / api.modrinth.com; then
-# the Windows build under Wine. tests/2060 and tests/2061 are in section 3.
+# the Windows build under Wine. tests/2090 and tests/2091 are in section 3.
 bash tools/dns/run.sh > "$WORK/dns.log" 2>&1 && DNRC=0 || DNRC=$?
 grep -E '^DNS |SKIP' "$WORK/dns.log" | sed 's/^/   /'
 if [ "$DNRC" -eq 0 ]; then

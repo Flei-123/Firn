@@ -10,8 +10,8 @@
 #      TLS server and against the real internet (piston-meta.mojang.com,
 #      api.modrinth.com, badssl.com for the refusals)
 #
-# The in-process half of the proof is in tests/2060 (the wire format against
-# real answers and hostile messages) and tests/2061 (a DNS server inside the
+# The in-process half of the proof is in tests/2090 (the wire format against
+# real answers and hostile messages) and tests/2091 (a DNS server inside the
 # test process, UDP and TCP over 127.0.0.1); test.sh runs both.
 #
 # No route to the internet: the live parts SKIP, the hermetic ones run.
