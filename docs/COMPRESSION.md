@@ -69,9 +69,11 @@ every format.
 ## What was held against what
 
 `tools/compress/check.py` (section 81 of `test.sh`, `tools/compress/run.sh`)
-runs the library, compiled in the four build levels, the AArch64 build under
-`qemu-aarch64` and the Windows build under Wine, against programs nobody here
-wrote -- libzstd (the `zstd` command), liblzma (`xz` and Python `lzma`),
+runs the library, compiled in dev-fast, release-fast and release-safe (the full corpus
+in dev-fast: 18,800 comparisons), the AArch64 build under `qemu-aarch64` (a reduced corpus:
+5,900 comparisons) and the Windows build under Wine (a smoke test of the platform seam: every
+format decoded and encoded on a few small inputs -- each probe call is a Wine process start),
+against programs nobody here wrote -- libzstd (the `zstd` command), liblzma (`xz` and Python `lzma`),
 libbz2, libbrotli, liblz4 (Python's `lz4`), zlib/gzip:
 
 | direction | what |
