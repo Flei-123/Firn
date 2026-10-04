@@ -1,0 +1,222 @@
+// expect_exit: 0
+// tests/2060_markdown.fi -- lib/markdown against implementations nobody here wrote.
+//
+//   1. THE COMMONMARK SPEC 0.31.2: all 652 examples of spec.json
+//      (tests/data/commonmark-spec-0.31.2.json, CC BY-SA 4.0, see
+//      THIRD_PARTY.md) -- markdown in, HTML out, byte for byte, with the
+//      parser in CommonMark mode (raw HTML kept, no GFM extensions).
+//   2. GFM: 37 cases (tables, strikethrough) whose HTML comes from
+//      markdown-it-py 4.2.0 with `table` and `strikethrough` enabled
+//      (tests/data/markdown-gfm-cases.json; `<s>` is written `<del>`, the
+//      GFM tag, one case with a single `~` left out -- GFM allows it,
+//      markdown-it does not).
+//   3. The default mode (what Modrinth / GitHub descriptions need): tree
+//      dumps for raw HTML turned into text/images/links, task items, bare
+//      URLs, autolinks, reference links; the ESCAPE mode; the safe renderer.
+//   4. Limits: absurd nesting and pathological input finish and stay bounded.
+import std.io
+import std.rt
+import std.json
+import std.str
+import markdown.doc
+import markdown.md
+import markdown.html
+
+const SPEC: str = __include_str("data/commonmark-spec-0.31.2.json")
+const GFM: str = __include_str("data/markdown-gfm-cases.json")
+
+fn get(d: *mut json.Json, o: u32, key: str) -> u32 {
+    return json.json_get(d, o, key.p as u64, key.n)
+}
+
+fn span_is_buf(b: *mut rt.Buf, s: str.Span) -> bool {
+    if rt.buf_len(b) != s.n {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(b), s.p as u64, s.n)
+}
+
+fn buf_is(b: *mut rt.Buf, s: str) -> bool {
+    if rt.buf_len(b) != s.n {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(b), s.p as u64, s.n)
+}
+
+// Run every {markdown, html} case of a JSON array; the number that failed.
+fn run_cases(text: str, o: doc.Opts, label: str, want_count: usize) -> i64 {
+    var j: json.Json = json.json_new()
+    defer json.json_free(&j)
+    let ok: bool = json.json_parse(&j, text.p as u64, text.n) catch false
+    if !ok {
+        io.print_line("FAIL cases are not JSON")
+        return 1000000
+    }
+    var fails: i64 = 0
+    var count: usize = 0
+    var it: u32 = json.json_child(&j, json.json_root(&j))
+    while it != json.JSON_NONE {
+        let src: str.Span = json.json_string(&j, get(&j, it, "markdown"))
+        let want: str.Span = json.json_string(&j, get(&j, it, "html"))
+        var out: rt.Buf = rt.buf_new()
+        var d: doc.Doc = md.parse_bytes(src.p as u64, src.n, o)
+        html.render(&d, &out, false)
+        doc.doc_free(&d)
+        count = count + 1
+        if !span_is_buf(&out, want) {
+            fails = fails + 1
+            var nb: rt.Buf = rt.buf_new()
+            rt.buf_push_bytes(&nb, "FAIL ".p as u64, 5)
+            rt.buf_push_bytes(&nb, label.p as u64, label.n)
+            rt.buf_push_bytes(&nb, " #".p as u64, 2)
+            rt.buf_push_dec_u64(&nb, count as u64)
+            io.print_line_bytes(rt.buf_ptr(&nb), rt.buf_len(&nb))
+            rt.buf_free(&nb)
+        }
+        rt.buf_free(&out)
+        it = json.json_next(&j, it)
+    }
+    if count != want_count {
+        io.print("FAIL ")
+        io.print(label)
+        io.print_line(": wrong number of cases")
+        return fails + 1
+    }
+    return fails
+}
+
+fn dump_is(src: str, o: doc.Opts, want: str) -> bool {
+    var d: doc.Doc = md.parse(src, o)
+    var out: rt.Buf = rt.buf_new()
+    html.dump(&d, &out)
+    let same: bool = buf_is(&out, want)
+    if !same {
+        io.print("FAIL dump of: ")
+        io.print_line(src)
+        io.print_line_bytes(rt.buf_ptr(&out), rt.buf_len(&out))
+    }
+    rt.buf_free(&out)
+    doc.doc_free(&d)
+    return same
+}
+
+fn html_is(src: str, o: doc.Opts, safe: bool, want: str) -> bool {
+    var d: doc.Doc = md.parse(src, o)
+    var out: rt.Buf = rt.buf_new()
+    html.render(&d, &out, safe)
+    let same: bool = buf_is(&out, want)
+    if !same {
+        io.print("FAIL html of: ")
+        io.print_line(src)
+        io.print_line_bytes(rt.buf_ptr(&out), rt.buf_len(&out))
+    }
+    rt.buf_free(&out)
+    doc.doc_free(&d)
+    return same
+}
+
+fn repeat(out: *mut rt.Buf, s: str, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push_bytes(out, s.p as u64, s.n)
+        i = i + 1
+    }
+}
+
+fn main() -> i32 {
+    var bad: i64 = 0
+    // 1. the spec
+    bad = bad + run_cases(SPEC, doc.opts_commonmark(), "spec", 652)
+    // 2. GFM against markdown-it
+    var g: doc.Opts = doc.opts_commonmark()
+    g.tables = true
+    g.strike = true
+    bad = bad + run_cases(GFM, g, "gfm", 37)
+
+    // 3. the default mode
+    let o: doc.Opts = doc.opts_default()
+    if !dump_is("<p align=\"center\">\n  <img src=\"https://x/y.png\" alt=\"Logo\" width=\"100\">\n</p>\n", o,
+        "document\n  paragraph\n    image url=https://x/y.png\n      text \"Logo\"\n") {
+        bad = bad + 1
+    }
+    if !dump_is("<a href=\"https://site\"><img src=\"b.svg\" alt=\"badge\"></a> x<br>y <b>bold</b>\n", o,
+        "document\n  paragraph\n    link url=https://site\n      image url=b.svg\n        text \"badge\"\n    text \" x\"\n    linebreak\n    text \"y bold\"\n") {
+        bad = bad + 1
+    }
+    if !dump_is("<!-- hidden -->\n\n<script>alert(1)</script>\n\nshown\n", o,
+        "document\n  paragraph\n    text \"shown\"\n") {
+        bad = bad + 1
+    }
+    if !dump_is("- [ ] todo\n- [x] done\n- [X] Done\n- [x]nospace\n", o,
+        "document\n  list bullet tight\n    item task=open\n      paragraph\n        text \"todo\"\n    item task=done\n      paragraph\n        text \"done\"\n    item task=done\n      paragraph\n        text \"Done\"\n    item\n      paragraph\n        text \"[x]nospace\"\n") {
+        bad = bad + 1
+    }
+    if !dump_is("see https://example.com/a?b=1, www.foo.org/x). <me@x.io> http://\n", o,
+        "document\n  paragraph\n    text \"see \"\n    link url=https://example.com/a?b=1\n      text \"https://example.com/a?b=1\"\n    text \", \"\n    link url=http://www.foo.org/x\n      text \"www.foo.org/x\"\n    text \"). \"\n    link url=mailto:me@x.io\n      text \"me@x.io\"\n    text \" http://\"\n") {
+        bad = bad + 1
+    }
+    if !dump_is("[ref]: http://r.example \"T\"\n\nsee [ref], ![i][ref], [Ref][]\n", o,
+        "document\n  paragraph\n    text \"see \"\n    link url=http://r.example title=T\n      text \"ref\"\n    text \", \"\n    image url=http://r.example title=T\n      text \"i\"\n    text \", \"\n    link url=http://r.example title=T\n      text \"Ref\"\n") {
+        bad = bad + 1
+    }
+    if !dump_is("| a | b |\n|:-|-:|\n| 1 | 2 |\n", o,
+        "document\n  table\n    table_row header\n      table_cell left\n        text \"a\"\n      table_cell right\n        text \"b\"\n    table_row\n      table_cell left\n        text \"1\"\n      table_cell right\n        text \"2\"\n") {
+        bad = bad + 1
+    }
+    // the ESCAPE mode shows tags as text
+    var e: doc.Opts = doc.opts_default()
+    e.html = doc.HTML_ESCAPE
+    if !html_is("a <b>x</b> c\n\n<div>y</div>\n", e, false,
+        "<p>a &lt;b&gt;x&lt;/b&gt; c</p>\n<p>&lt;div&gt;y&lt;/div&gt;</p>\n") {
+        bad = bad + 1
+    }
+    // the safe renderer empties dangerous targets
+    if !html_is("[a](javascript:alert(1)) [b](https://ok.example) ![c](data:text/html,x)\n", doc.opts_commonmark(), true,
+        "<p><a href=\"\">a</a> <a href=\"https://ok.example\">b</a> <img src=\"\" alt=\"c\" /></p>\n") {
+        bad = bad + 1
+    }
+    if !html_is("[a](javascript:alert(1))\n", doc.opts_commonmark(), false,
+        "<p><a href=\"javascript:alert(1)\">a</a></p>\n") {
+        bad = bad + 1
+    }
+
+    // 4. limits: nothing crashes, nothing grows without bound
+    var big: rt.Buf = rt.buf_new()
+    repeat(&big, ">", 5000)
+    repeat(&big, " x\n", 1)
+    var d1: doc.Doc = md.parse_bytes(rt.buf_ptr(&big), rt.buf_len(&big), o)
+    var h1: rt.Buf = rt.buf_new()
+    html.render(&d1, &h1, true)
+    if rt.buf_len(&h1) == 0 {
+        io.print_line("FAIL deep quote produced nothing")
+        bad = bad + 1
+    }
+    doc.doc_free(&d1)
+    rt.buf_free(&h1)
+    rt.buf_clear(&big)
+    repeat(&big, "*a ", 4000)
+    repeat(&big, "b", 1)
+    repeat(&big, " a*", 4000)
+    var d2: doc.Doc = md.parse_bytes(rt.buf_ptr(&big), rt.buf_len(&big), o)
+    var h2: rt.Buf = rt.buf_new()
+    html.render(&d2, &h2, true)
+    if rt.buf_len(&h2) == 0 {
+        io.print_line("FAIL deep emphasis produced nothing")
+        bad = bad + 1
+    }
+    doc.doc_free(&d2)
+    rt.buf_free(&h2)
+    rt.buf_clear(&big)
+    repeat(&big, "[", 20000)
+    repeat(&big, "![", 20000)
+    repeat(&big, "`", 20001)
+    var d3: doc.Doc = md.parse_bytes(rt.buf_ptr(&big), rt.buf_len(&big), o)
+    doc.doc_free(&d3)
+    rt.buf_free(&big)
+
+    if bad > 0 {
+        io.fmt_print_line(f"FAIL {bad} checks")
+        return 1
+    }
+    return 0
+}

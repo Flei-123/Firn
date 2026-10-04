@@ -1,0 +1,838 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/markdown/scan.fi -- the small scanners the Markdown parser is built from.
+//
+// Character classes (ASCII and the Unicode ranges CommonMark needs for
+// emphasis flanking), UTF-8 decoding, entity decoding, the inline HTML
+// grammar, autolinks and link label normalisation. Nothing here knows the
+// AST: every function reads octets at (p, n) -- an address and a length, the
+// form lib/std/rt.fi uses -- and answers a length or a number.
+//
+// HONEST NOTES
+//   * Named entities: the 2,125 names of HTML5 that end in `;`
+//     (lib/markdown/entities.txt, made with Python's html.entities.html5:
+//     "name codepoint [codepoint]" per line, sorted, binary-searched through
+//     an index built on first use). The legacy names without `;` are not
+//     references in CommonMark. Numeric references are complete.
+//   * Case folding of link labels: ASCII, Latin-1, Latin Extended-A, Greek and
+//     Cyrillic simple folds, and ß/ẞ -> ss. Other scripts compare as written.
+//   * Unicode classes are ranges, not the full tables: punctuation (General
+//     Punctuation, Latin-1 punctuation, CJK punctuation, fullwidth forms)
+//     and the Zs spaces.
+import std.rt
+
+export {
+    is_space, is_ws, is_alpha, is_digit, is_alnum, is_punct, lower,
+    cp_at, cp_len, is_uni_ws, is_uni_punct, push_cp,
+    entity_decode, html_tag_len, uri_autolink_len, email_autolink_len,
+    label_normalize, starts_with_ci, hex_val, blank_from,
+    unescape_into, scan_dest, scan_title, scan_label, skip_ws, NOPOS,
+}
+
+const NOPOS: usize = 18446744073709551615
+
+const ENTITIES: str = __include_str("entities.txt")
+
+fn is_space(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8
+}
+
+// space, tab, LF, CR, FF, VT
+fn is_ws(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8 || c == 10 as u8 || c == 13 as u8
+        || c == 12 as u8 || c == 11 as u8
+}
+
+fn is_alpha(c: u8) -> bool {
+    return (c >= 65 as u8 && c <= 90 as u8) || (c >= 97 as u8 && c <= 122 as u8)
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+fn is_alnum(c: u8) -> bool {
+    return is_alpha(c) || is_digit(c)
+}
+
+// ASCII punctuation, exactly the CommonMark list.
+fn is_punct(c: u8) -> bool {
+    return (c >= 33 as u8 && c <= 47 as u8) || (c >= 58 as u8 && c <= 64 as u8)
+        || (c >= 91 as u8 && c <= 96 as u8) || (c >= 123 as u8 && c <= 126 as u8)
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+fn hex_val(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return ((c - 97 as u8) as i32) + 10
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return ((c - 65 as u8) as i32) + 10
+    }
+    return -1
+}
+
+// ASCII case-insensitive prefix test: does (p, n) at i start with `s`?
+fn starts_with_ci(p: u64, n: usize, i: usize, s: str) -> bool {
+    if i + s.n > n {
+        return false
+    }
+    var k: usize = 0
+    while k < s.n {
+        if lower(rt.ld8(p, i + k)) != lower(rt.ld8(s.p as u64, k)) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// Is everything from `i` to the end of the line (or text) space, tab or CR?
+fn blank_from(p: u64, n: usize, i: usize) -> bool {
+    var k: usize = i
+    while k < n {
+        let c: u8 = rt.ld8(p, k)
+        if c == 10 as u8 {
+            return true
+        }
+        if !is_space(c) && c != 13 as u8 {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------------ UTF-8
+
+// The octet length of the UTF-8 sequence starting at i (1 for a bad lead).
+fn cp_len(p: u64, n: usize, i: usize) -> usize {
+    let c: u8 = rt.ld8(p, i)
+    var want: usize = 1
+    if c >= 240 as u8 && c < 248 as u8 {
+        want = 4
+    } else if c >= 224 as u8 {
+        want = 3
+    } else if c >= 192 as u8 {
+        want = 2
+    }
+    if c >= 248 as u8 {
+        return 1
+    }
+    if i + want > n {
+        return 1
+    }
+    var k: usize = 1
+    while k < want {
+        let d: u8 = rt.ld8(p, i + k)
+        if d < 128 as u8 || d >= 192 as u8 {
+            return 1
+        }
+        k = k + 1
+    }
+    return want
+}
+
+// The code point at i; a bad sequence gives U+FFFD.
+fn cp_at(p: u64, n: usize, i: usize) -> u32 {
+    let c: u8 = rt.ld8(p, i)
+    if c < 128 as u8 {
+        return c as u32
+    }
+    let l: usize = cp_len(p, n, i)
+    if l == 1 {
+        return 65533 as u32
+    }
+    if l == 2 {
+        return (((c as u32) & 31 as u32) << 6 as u32) | ((rt.ld8(p, i + 1) as u32) & 63 as u32)
+    }
+    if l == 3 {
+        return (((c as u32) & 15 as u32) << 12 as u32)
+            | (((rt.ld8(p, i + 1) as u32) & 63 as u32) << 6 as u32)
+            | ((rt.ld8(p, i + 2) as u32) & 63 as u32)
+    }
+    return (((c as u32) & 7 as u32) << 18 as u32)
+        | (((rt.ld8(p, i + 1) as u32) & 63 as u32) << 12 as u32)
+        | (((rt.ld8(p, i + 2) as u32) & 63 as u32) << 6 as u32)
+        | ((rt.ld8(p, i + 3) as u32) & 63 as u32)
+}
+
+fn push_cp(b: *mut rt.Buf, cp: u32) {
+    if cp < 128 as u32 {
+        rt.buf_push(b, cp as u8)
+    } else if cp < 2048 as u32 {
+        rt.buf_push(b, (192 as u32 | (cp >> 6 as u32)) as u8)
+        rt.buf_push(b, (128 as u32 | (cp & 63 as u32)) as u8)
+    } else if cp < 65536 as u32 {
+        rt.buf_push(b, (224 as u32 | (cp >> 12 as u32)) as u8)
+        rt.buf_push(b, (128 as u32 | ((cp >> 6 as u32) & 63 as u32)) as u8)
+        rt.buf_push(b, (128 as u32 | (cp & 63 as u32)) as u8)
+    } else {
+        rt.buf_push(b, (240 as u32 | (cp >> 18 as u32)) as u8)
+        rt.buf_push(b, (128 as u32 | ((cp >> 12 as u32) & 63 as u32)) as u8)
+        rt.buf_push(b, (128 as u32 | ((cp >> 6 as u32) & 63 as u32)) as u8)
+        rt.buf_push(b, (128 as u32 | (cp & 63 as u32)) as u8)
+    }
+}
+
+// Unicode whitespace (category Zs, plus the ASCII ones).
+fn is_uni_ws(cp: u32) -> bool {
+    if cp < 128 as u32 {
+        return is_ws(cp as u8)
+    }
+    return cp == 160 as u32 || cp == 5760 as u32
+        || (cp >= 8192 as u32 && cp <= 8202 as u32) || cp == 8239 as u32
+        || cp == 8287 as u32 || cp == 12288 as u32
+}
+
+// Unicode punctuation as far as the ranges below go (see the header).
+fn is_uni_punct(cp: u32) -> bool {
+    if cp < 128 as u32 {
+        return is_punct(cp as u8)
+    }
+    if (cp >= 162 as u32 && cp <= 165 as u32) || cp == 161 as u32 || cp == 167 as u32 || cp == 171 as u32 || cp == 182 as u32
+        || cp == 183 as u32 || cp == 187 as u32 || cp == 191 as u32 {
+        return true
+    }
+    // General Punctuation (dashes, quotes, bullets, ...) without the spaces
+    if cp >= 8208 as u32 && cp <= 8231 as u32 {
+        return true
+    }
+    if cp >= 8240 as u32 && cp <= 8286 as u32 {
+        return true
+    }
+    // CJK symbols and punctuation, fullwidth forms
+    if cp >= 12289 as u32 && cp <= 12291 as u32 {
+        return true
+    }
+    if cp >= 12296 as u32 && cp <= 12305 as u32 {
+        return true
+    }
+    if cp >= 65281 as u32 && cp <= 65295 as u32 {
+        return true
+    }
+    // currency symbols block (the euro sign is Sc, which CommonMark treats as punctuation)
+    if cp >= 8352 as u32 && cp <= 8399 as u32 {
+        return true
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- entities
+
+fn parse_dec(p: u64, n: usize, i: usize, stop: usize) -> i64 {
+    var v: i64 = 0
+    var k: usize = i
+    while k < stop {
+        v = v * 10 + ((rt.ld8(p, k) - 48 as u8) as i64)
+        k = k + 1
+    }
+    return v
+}
+
+// A character reference at i (the octet is '&'). Returns the number of
+// octets it covers (including '&' and ';') and appends the UTF-8 of what
+// it stands for to `out`; 0 and nothing appended when it is not a valid
+// reference. Numeric references: 1..7 decimal or 1..6 hex digits; NUL and
+// out-of-range values become U+FFFD (the spec's rule).
+fn entity_decode(p: u64, n: usize, i: usize, out: *mut rt.Buf) -> usize {
+    if i + 2 >= n || rt.ld8(p, i) != 38 as u8 {
+        return 0
+    }
+    if rt.ld8(p, i + 1) == 35 as u8 {
+        var k: usize = i + 2
+        var hex: bool = false
+        if k < n && (rt.ld8(p, k) == 120 as u8 || rt.ld8(p, k) == 88 as u8) {
+            hex = true
+            k = k + 1
+        }
+        let d0: usize = k
+        var v: i64 = 0
+        while k < n {
+            let c: u8 = rt.ld8(p, k)
+            if hex && hex_val(c) >= 0 {
+                v = v * 16 + (hex_val(c) as i64)
+            } else if !hex && is_digit(c) {
+                v = v * 10 + ((c - 48 as u8) as i64)
+            } else {
+                break
+            }
+            if v > 2000000 {
+                v = 2000000
+            }
+            k = k + 1
+        }
+        let nd: usize = k - d0
+        if nd == 0 || (hex && nd > 6) || (!hex && nd > 7) {
+            return 0
+        }
+        if k >= n || rt.ld8(p, k) != 59 as u8 {
+            return 0
+        }
+        var cp: u32 = v as u32
+        if v == 0 || v > 1114111 || (v >= 55296 && v <= 57343) {
+            cp = 65533 as u32
+        }
+        push_cp(out, cp)
+        return k + 1 - i
+    }
+    // named: &name;
+    var e: usize = i + 1
+    while e < n && is_alnum(rt.ld8(p, e)) && e - i < 34 {
+        e = e + 1
+    }
+    if e >= n || rt.ld8(p, e) != 59 as u8 || e == i + 1 {
+        return 0
+    }
+    let nl: usize = e - (i + 1)
+    entity_index()
+    // binary search over the sorted lines of the table
+    var lo: usize = 0
+    var hi: usize = ENT_N
+    let tp: u64 = ENTITIES.p as u64
+    while lo < hi {
+        let mid: usize = (lo + hi) / 2
+        let ls: usize = ENT_IDX[mid] as usize
+        var sp: usize = ls
+        while rt.ld8(tp, sp) != 32 as u8 {
+            sp = sp + 1
+        }
+        // compare the name at ls..sp with p[i+1 .. e]
+        var cmp: i64 = 0
+        var q: usize = 0
+        while cmp == 0 && (ls + q < sp || q < nl) {
+            if ls + q >= sp {
+                cmp = -1
+            } else if q >= nl {
+                cmp = 1
+            } else {
+                let a1: u8 = rt.ld8(tp, ls + q)
+                let b1: u8 = rt.ld8(p, i + 1 + q)
+                if a1 < b1 {
+                    cmp = -1
+                } else if a1 > b1 {
+                    cmp = 1
+                }
+            }
+            q = q + 1
+        }
+        if cmp == 0 {
+            // the code points: one or two numbers after the name
+            var k: usize = sp + 1
+            while k < ENTITIES.n && rt.ld8(tp, k) != 10 as u8 {
+                var v: u32 = 0
+                while k < ENTITIES.n && is_digit(rt.ld8(tp, k)) {
+                    v = v * 10 as u32 + ((rt.ld8(tp, k) - 48 as u8) as u32)
+                    k = k + 1
+                }
+                push_cp(out, v)
+                if k < ENTITIES.n && rt.ld8(tp, k) == 32 as u8 {
+                    k = k + 1
+                }
+            }
+            return e + 1 - i
+        }
+        if cmp < 0 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return 0
+}
+
+// The start of every line of the entity table, built on first use.
+static mut ENT_IDX: [u32; 2200] = [0 as u32; 2200]
+static mut ENT_N: usize = 0
+
+fn entity_index() {
+    if ENT_N > 0 {
+        return
+    }
+    let tp: u64 = ENTITIES.p as u64
+    var pos: usize = 0
+    var cnt: usize = 0
+    while pos < ENTITIES.n && cnt < 2200 {
+        ENT_IDX[cnt] = pos as u32
+        cnt = cnt + 1
+        while pos < ENTITIES.n && rt.ld8(tp, pos) != 10 as u8 {
+            pos = pos + 1
+        }
+        pos = pos + 1
+    }
+    ENT_N = cnt
+}
+
+// ------------------------------------------------------------- inline HTML
+
+fn is_tag_name_start(c: u8) -> bool {
+    return is_alpha(c)
+}
+
+fn is_tag_name_char(c: u8) -> bool {
+    return is_alnum(c) || c == 45 as u8
+}
+
+// Skip whitespace (incl. newlines) from k; returns the new index.
+fn skip_ws(p: u64, n: usize, k: usize) -> usize {
+    var i: usize = k
+    while i < n && is_ws(rt.ld8(p, i)) {
+        i = i + 1
+    }
+    return i
+}
+
+// The length of the inline HTML construct that starts at i (octet '<'), or
+// 0: open tag, closing tag, comment, processing instruction, declaration,
+// CDATA -- the grammar of CommonMark 0.31 section 6.6.
+fn html_tag_len(p: u64, n: usize, i: usize) -> usize {
+    if i + 2 >= n || rt.ld8(p, i) != 60 as u8 {
+        return 0
+    }
+    let c1: u8 = rt.ld8(p, i + 1)
+    // closing tag </name ws* >
+    if c1 == 47 as u8 {
+        var k: usize = i + 2
+        if k >= n || !is_tag_name_start(rt.ld8(p, k)) {
+            return 0
+        }
+        while k < n && is_tag_name_char(rt.ld8(p, k)) {
+            k = k + 1
+        }
+        k = skip_ws(p, n, k)
+        if k < n && rt.ld8(p, k) == 62 as u8 {
+            return k + 1 - i
+        }
+        return 0
+    }
+    // comment <!-- ... -->  (text must not start with > or ->)
+    if c1 == 33 as u8 {
+        if i + 3 < n && rt.ld8(p, i + 2) == 45 as u8 && rt.ld8(p, i + 3) == 45 as u8 {
+            var k: usize = i + 4
+            if k < n && rt.ld8(p, k) == 62 as u8 {
+                return k + 1 - i
+            }
+            if k + 1 < n && rt.ld8(p, k) == 45 as u8 && rt.ld8(p, k + 1) == 62 as u8 {
+                return k + 2 - i
+            }
+            while k + 2 < n {
+                if rt.ld8(p, k) == 45 as u8 && rt.ld8(p, k + 1) == 45 as u8
+                    && rt.ld8(p, k + 2) == 62 as u8 {
+                    return k + 3 - i
+                }
+                k = k + 1
+            }
+            return 0
+        }
+        // CDATA
+        if starts_with_ci(p, n, i, "<![CDATA[") {
+            var k: usize = i + 9
+            while k + 2 < n {
+                if rt.ld8(p, k) == 93 as u8 && rt.ld8(p, k + 1) == 93 as u8
+                    && rt.ld8(p, k + 2) == 62 as u8 {
+                    return k + 3 - i
+                }
+                k = k + 1
+            }
+            return 0
+        }
+        // declaration <!LETTER ... >
+        if is_alpha(rt.ld8(p, i + 2)) {
+            var k: usize = i + 3
+            while k < n && rt.ld8(p, k) != 62 as u8 {
+                k = k + 1
+            }
+            if k < n {
+                return k + 1 - i
+            }
+        }
+        return 0
+    }
+    // processing instruction <? ... ?>
+    if c1 == 63 as u8 {
+        var k: usize = i + 2
+        while k + 1 < n {
+            if rt.ld8(p, k) == 63 as u8 && rt.ld8(p, k + 1) == 62 as u8 {
+                return k + 2 - i
+            }
+            k = k + 1
+        }
+        return 0
+    }
+    // open tag <name attr* ws* /? >
+    if !is_tag_name_start(c1) {
+        return 0
+    }
+    var k: usize = i + 2
+    while k < n && is_tag_name_char(rt.ld8(p, k)) {
+        k = k + 1
+    }
+    while true {
+        let before: usize = k
+        k = skip_ws(p, n, k)
+        if k >= n {
+            return 0
+        }
+        let c: u8 = rt.ld8(p, k)
+        if c == 62 as u8 {
+            return k + 1 - i
+        }
+        if c == 47 as u8 {
+            if k + 1 < n && rt.ld8(p, k + 1) == 62 as u8 {
+                return k + 2 - i
+            }
+            return 0
+        }
+        // an attribute needs whitespace before it
+        if k == before {
+            return 0
+        }
+        // name: [A-Za-z_:][A-Za-z0-9_.:-]*
+        if !(is_alpha(c) || c == 95 as u8 || c == 58 as u8) {
+            return 0
+        }
+        k = k + 1
+        while k < n {
+            let d: u8 = rt.ld8(p, k)
+            if is_alnum(d) || d == 95 as u8 || d == 46 as u8 || d == 58 as u8 || d == 45 as u8 {
+                k = k + 1
+            } else {
+                break
+            }
+        }
+        // optional value
+        let save: usize = k
+        let k2: usize = skip_ws(p, n, k)
+        if k2 < n && rt.ld8(p, k2) == 61 as u8 {
+            var v: usize = skip_ws(p, n, k2 + 1)
+            if v >= n {
+                return 0
+            }
+            let q: u8 = rt.ld8(p, v)
+            if q == 34 as u8 || q == 39 as u8 {
+                v = v + 1
+                while v < n && rt.ld8(p, v) != q {
+                    v = v + 1
+                }
+                if v >= n {
+                    return 0
+                }
+                k = v + 1
+            } else {
+                let v0: usize = v
+                while v < n {
+                    let d: u8 = rt.ld8(p, v)
+                    if is_ws(d) || d == 34 as u8 || d == 39 as u8 || d == 61 as u8
+                        || d == 60 as u8 || d == 62 as u8 || d == 96 as u8 {
+                        break
+                    }
+                    v = v + 1
+                }
+                if v == v0 {
+                    return 0
+                }
+                k = v
+            }
+        } else {
+            k = save
+        }
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------- autolinks
+
+// `<scheme:rest>`: the length of the inside (between the angle brackets),
+// 0 if it is no absolute URI. i points just after '<'; the caller checks '>'.
+fn uri_autolink_len(p: u64, n: usize, i: usize) -> usize {
+    var k: usize = i
+    if k >= n || !is_alpha(rt.ld8(p, k)) {
+        return 0
+    }
+    k = k + 1
+    while k < n {
+        let c: u8 = rt.ld8(p, k)
+        if is_alnum(c) || c == 43 as u8 || c == 46 as u8 || c == 45 as u8 {
+            k = k + 1
+        } else {
+            break
+        }
+    }
+    let sl: usize = k - i
+    if sl < 2 || sl > 32 || k >= n || rt.ld8(p, k) != 58 as u8 {
+        return 0
+    }
+    k = k + 1
+    while k < n {
+        let c: u8 = rt.ld8(p, k)
+        if c == 62 as u8 {
+            return k - i
+        }
+        if c <= 32 as u8 || c == 60 as u8 {
+            return 0
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+fn email_local_ok(c: u8) -> bool {
+    return is_alnum(c) || c == 46 as u8 || c == 33 as u8 || c == 35 as u8 || c == 36 as u8
+        || c == 37 as u8 || c == 38 as u8 || c == 39 as u8 || c == 42 as u8 || c == 43 as u8
+        || c == 47 as u8 || c == 61 as u8 || c == 63 as u8 || c == 94 as u8 || c == 95 as u8
+        || c == 96 as u8 || c == 123 as u8 || c == 124 as u8 || c == 125 as u8
+        || c == 126 as u8 || c == 45 as u8
+}
+
+// `<local@domain>`: the length of the inside, 0 if it is not an e-mail.
+fn email_autolink_len(p: u64, n: usize, i: usize) -> usize {
+    var k: usize = i
+    while k < n && email_local_ok(rt.ld8(p, k)) {
+        k = k + 1
+    }
+    if k == i || k >= n || rt.ld8(p, k) != 64 as u8 {
+        return 0
+    }
+    k = k + 1
+    // domain: label (. label)*, label = alnum ([alnum-]{0,61} alnum)?
+    var labels: usize = 0
+    while true {
+        let l0: usize = k
+        if k >= n || !is_alnum(rt.ld8(p, k)) {
+            return 0
+        }
+        while k < n && (is_alnum(rt.ld8(p, k)) || rt.ld8(p, k) == 45 as u8) {
+            k = k + 1
+        }
+        if rt.ld8(p, k - 1) == 45 as u8 || k - l0 > 63 {
+            return 0
+        }
+        labels = labels + 1
+        if k < n && rt.ld8(p, k) == 46 as u8 {
+            k = k + 1
+            continue
+        }
+        break
+    }
+    if k >= n || rt.ld8(p, k) != 62 as u8 || labels < 1 {
+        return 0
+    }
+    return k - i
+}
+
+// ----------------------------------------------------------------- labels
+
+// The simple case fold of one code point (see the header for the ranges).
+fn fold_cp(cp: u32) -> u32 {
+    if cp >= 65 as u32 && cp <= 90 as u32 {
+        return cp + 32 as u32
+    }
+    if cp < 128 as u32 {
+        return cp
+    }
+    if cp >= 192 as u32 && cp <= 222 as u32 && cp != 215 as u32 {
+        return cp + 32 as u32
+    }
+    if cp >= 913 as u32 && cp <= 937 as u32 && cp != 930 as u32 {
+        return cp + 32 as u32
+    }
+    if cp == 962 as u32 {
+        return 963 as u32
+    }
+    if cp >= 1040 as u32 && cp <= 1071 as u32 {
+        return cp + 32 as u32
+    }
+    if cp >= 1024 as u32 && cp <= 1039 as u32 {
+        return cp + 80 as u32
+    }
+    if cp >= 256 as u32 && cp <= 311 as u32 && cp % 2 as u32 == 0 as u32 {
+        return cp + 1 as u32
+    }
+    if cp >= 330 as u32 && cp <= 375 as u32 && cp % 2 as u32 == 0 as u32 {
+        return cp + 1 as u32
+    }
+    if ((cp >= 313 as u32 && cp <= 328 as u32) || (cp >= 377 as u32 && cp <= 382 as u32))
+        && cp % 2 as u32 == 1 as u32 {
+        return cp + 1 as u32
+    }
+    if cp == 376 as u32 {
+        return 255 as u32
+    }
+    return cp
+}
+
+// The normal form of a link label: case folded, runs of whitespace
+// collapsed to one space, no leading or trailing whitespace. Appended to `out`.
+fn label_normalize(p: u64, n: usize, out: *mut rt.Buf) {
+    var pending: bool = false
+    var started: bool = false
+    var i: usize = 0
+    while i < n {
+        let l: usize = cp_len(p, n, i)
+        let cp: u32 = cp_at(p, n, i)
+        if is_uni_ws(cp) {
+            if started {
+                pending = true
+            }
+        } else {
+            if pending {
+                rt.buf_push(out, 32 as u8)
+                pending = false
+            }
+            started = true
+            if cp == 223 as u32 || cp == 7838 as u32 {
+                rt.buf_push(out, 115 as u8)
+                rt.buf_push(out, 115 as u8)
+            } else if cp < 128 as u32 {
+                rt.buf_push(out, lower(cp as u8))
+            } else {
+                push_cp(out, fold_cp(cp))
+            }
+        }
+        i = i + l
+    }
+}
+
+// ------------------------------------------- backslash escapes and the like
+
+// Append s[a..b] to `out` with backslash escapes (\ before ASCII punctuation)
+// and character references resolved: the text of a link destination, a
+// title or an info string.
+fn unescape_into(p: u64, a: usize, b: usize, out: *mut rt.Buf) {
+    var i: usize = a
+    while i < b {
+        let c: u8 = rt.ld8(p, i)
+        if c == 92 as u8 && i + 1 < b && is_punct(rt.ld8(p, i + 1)) {
+            rt.buf_push(out, rt.ld8(p, i + 1))
+            i = i + 2
+        } else if c == 38 as u8 {
+            let l: usize = entity_decode(p, b, i, out)
+            if l > 0 {
+                i = i + l
+            } else {
+                rt.buf_push(out, c)
+                i = i + 1
+            }
+        } else {
+            rt.buf_push(out, c)
+            i = i + 1
+        }
+    }
+}
+
+// A link destination starting at k: `<...>` or a run without spaces and
+// control characters in which parentheses balance. The unescaped text is
+// appended to `out`; the answer is the index after it, NOPOS if invalid.
+fn scan_dest(p: u64, n: usize, k: usize, out: *mut rt.Buf) -> usize {
+    if k < n && rt.ld8(p, k) == 60 as u8 {
+        var i: usize = k + 1
+        while i < n {
+            let c: u8 = rt.ld8(p, i)
+            if c == 10 as u8 || c == 60 as u8 {
+                return NOPOS
+            }
+            if c == 92 as u8 && i + 1 < n && is_punct(rt.ld8(p, i + 1)) {
+                i = i + 2
+                continue
+            }
+            if c == 62 as u8 {
+                unescape_into(p, k + 1, i, out)
+                return i + 1
+            }
+            i = i + 1
+        }
+        return NOPOS
+    }
+    var i: usize = k
+    var depth: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 92 as u8 && i + 1 < n && is_punct(rt.ld8(p, i + 1)) {
+            i = i + 2
+            continue
+        }
+        if c == 40 as u8 {
+            depth = depth + 1
+        } else if c == 41 as u8 {
+            if depth == 0 {
+                break
+            }
+            depth = depth - 1
+        } else if c <= 32 as u8 {
+            break
+        }
+        i = i + 1
+    }
+    if depth != 0 {
+        return NOPOS
+    }
+    unescape_into(p, k, i, out)
+    return i
+}
+
+// A link title starting at k (the opening quote or parenthesis).
+fn scan_title(p: u64, n: usize, k: usize, out: *mut rt.Buf) -> usize {
+    if k >= n {
+        return NOPOS
+    }
+    let o: u8 = rt.ld8(p, k)
+    var cl: u8 = o
+    if o == 40 as u8 {
+        cl = 41 as u8
+    } else if o != 34 as u8 && o != 39 as u8 {
+        return NOPOS
+    }
+    var i: usize = k + 1
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 92 as u8 && i + 1 < n && is_punct(rt.ld8(p, i + 1)) {
+            i = i + 2
+            continue
+        }
+        if c == cl {
+            unescape_into(p, k + 1, i, out)
+            return i + 1
+        }
+        if c == 40 as u8 && o == 40 as u8 {
+            return NOPOS
+        }
+        i = i + 1
+    }
+    return NOPOS
+}
+
+// A link label starting at k ('['): the index after the matching ']',
+// NOPOS if a bracket is not escaped inside, or there are more than 999
+// octets. `[]` is a label of length 2 (the caller decides what it means).
+fn scan_label(p: u64, n: usize, k: usize) -> usize {
+    if k >= n || rt.ld8(p, k) != 91 as u8 {
+        return NOPOS
+    }
+    var i: usize = k + 1
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 92 as u8 && i + 1 < n && is_punct(rt.ld8(p, i + 1)) {
+            i = i + 2
+            continue
+        }
+        if c == 91 as u8 {
+            return NOPOS
+        }
+        if c == 93 as u8 {
+            if i - k > 999 {
+                return NOPOS
+            }
+            return i + 1
+        }
+        i = i + 1
+    }
+    return NOPOS
+}

@@ -1,0 +1,1474 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/markdown/block.fi -- THE BLOCK PARSER.
+//
+// Reads the source line by line and builds the block tree: paragraphs,
+// ATX and Setext headings, thematic breaks, indented and fenced code,
+// block quotes, bullet and ordered lists (tight or loose, nested), HTML
+// blocks, link reference definitions, GFM pipe tables and task list items.
+// The raw text of every paragraph, heading and table cell is then handed
+// to lib/markdown/inline.fi.
+//
+// THE ALGORITHM is the one in the CommonMark spec's appendix, "A parsing
+// strategy" (commonmark.js `blocks.js` is the reference implementation of
+// it): for each line, walk down the chain of OPEN blocks and let each say
+// whether the line continues it (`>` for a quote, enough indent for a list
+// item, a closing fence ...); the deepest block that agrees is the last
+// MATCHED container. Then try to START new blocks inside it. What is left
+// of the line is text: it goes to the open leaf (a lazy continuation of a
+// paragraph keeps its blocks open), or opens a paragraph. Blocks that did
+// not match are closed. Tabs are counted in columns (stops at multiples of
+// 4), a tab that is only partly used becomes spaces in code.
+//
+// Only ONE leaf block is open at any time, so its text is collected in one
+// buffer (`cur`) and moved into the document's pool when the block closes.
+import std.rt
+import std.vec
+import markdown.scan
+import markdown.doc
+import markdown.inline
+
+export { parse }
+
+struct P {
+    d: *mut doc.Doc,
+    line: u64,
+    ln: usize,
+    off: usize,
+    col: usize,
+    nns: usize,
+    nnc: usize,
+    indent: usize,
+    blank: bool,
+    partial: bool,
+    tip: u32,
+    oldtip: u32,
+    last_matched: u32,
+    all_closed: bool,
+    line_no: usize,
+    cur: rt.Buf,
+    no_add: bool,
+    tmp: rt.Buf,
+    tmp2: rt.Buf,
+    cells: Vec[usize],
+    aligns: Vec[i64],
+}
+
+const CODE_INDENT: usize = 4
+
+// How deep block containers (quotes, lists) may nest; beyond it the markers
+// are plain text, so no reader needs unbounded recursion.
+const MAX_DEPTH: usize = 100
+
+fn depth_of(p: *mut P, n: u32) -> usize {
+    var k: usize = 0
+    var c: u32 = n
+    while c != doc.NIL && c != 0 as u32 {
+        k = k + 1
+        c = doc.node_parent((*p).d, c)
+    }
+    return k
+}
+
+// Parse the document text (src, n) into `d` (a fresh Doc).
+fn parse(d: *mut doc.Doc, src: u64, n: usize) {
+    var p: P = P { d: d, line: src, ln: 0, off: 0, col: 0, nns: 0, nnc: 0, indent: 0,
+        blank: false, partial: false, tip: 0 as u32, oldtip: 0 as u32,
+        last_matched: 0 as u32, all_closed: true, line_no: 0, cur: rt.buf_new(),
+        no_add: false, tmp: rt.buf_new(), tmp2: rt.buf_new(),
+        cells: vec_new[usize](), aligns: vec_new[i64]() }
+    defer rt.buf_free(&p.cur)
+    defer rt.buf_free(&p.tmp)
+    defer rt.buf_free(&p.tmp2)
+    defer vec_free[usize](&p.cells)
+    defer vec_free[i64](&p.aligns)
+    let root: *mut doc.Node = doc.node_at(d, 0 as u32)
+    (*root).open = true
+    var i: usize = 0
+    while i < n {
+        // one line: up to \n, \r\n or a lone \r
+        var e: usize = i
+        while e < n {
+            let c: u8 = rt.ld8(src, e)
+            if c == 10 as u8 || c == 13 as u8 {
+                break
+            }
+            e = e + 1
+        }
+        p.line = src + (i as u64)
+        p.ln = e - i
+        incorporate_line(&p)
+        i = e
+        if i < n && rt.ld8(src, i) == 13 as u8 {
+            i = i + 1
+            if i < n && rt.ld8(src, i) == 10 as u8 {
+                i = i + 1
+            }
+        } else if i < n {
+            i = i + 1
+        }
+    }
+    // close everything
+    while p.tip != 0 as u32 {
+        finalize(&p, p.tip)
+    }
+    finalize_doc(&p)
+    resolve_inlines(&p)
+}
+
+// ------------------------------------------------------------ line helpers
+
+fn lc(p: *mut P, i: usize) -> u8 {
+    if i >= (*p).ln {
+        return 0 as u8
+    }
+    return rt.ld8((*p).line, i)
+}
+
+fn find_next_nonspace(p: *mut P) {
+    var i: usize = (*p).off
+    var cols: usize = (*p).col
+    while i < (*p).ln {
+        let c: u8 = rt.ld8((*p).line, i)
+        if c == 32 as u8 {
+            i = i + 1
+            cols = cols + 1
+        } else if c == 9 as u8 {
+            i = i + 1
+            cols = cols + (4 - (cols % 4))
+        } else {
+            break
+        }
+    }
+    (*p).blank = i >= (*p).ln
+    (*p).nns = i
+    (*p).nnc = cols
+    (*p).indent = cols - (*p).col
+}
+
+fn advance_next_nonspace(p: *mut P) {
+    (*p).off = (*p).nns
+    (*p).col = (*p).nnc
+    (*p).partial = false
+}
+
+// Advance by `count` characters or, with `columns`, by `count` columns
+// (a tab may be used only in part).
+fn advance_offset(p: *mut P, count: usize, columns: bool) {
+    var cnt: usize = count
+    while cnt > 0 && (*p).off < (*p).ln {
+        let c: u8 = rt.ld8((*p).line, (*p).off)
+        if c == 9 as u8 {
+            let to_tab: usize = 4 - ((*p).col % 4)
+            if columns {
+                (*p).partial = to_tab > cnt
+                var adv: usize = to_tab
+                if cnt < adv {
+                    adv = cnt
+                }
+                (*p).col = (*p).col + adv
+                if !(*p).partial {
+                    (*p).off = (*p).off + 1
+                }
+                cnt = cnt - adv
+            } else {
+                (*p).partial = false
+                (*p).col = (*p).col + to_tab
+                (*p).off = (*p).off + 1
+                cnt = cnt - 1
+            }
+        } else {
+            (*p).partial = false
+            (*p).off = (*p).off + 1
+            (*p).col = (*p).col + 1
+            cnt = cnt - 1
+        }
+    }
+}
+
+// Add the rest of the line (from the offset) to the open leaf.
+fn add_line(p: *mut P) {
+    if (*p).partial {
+        (*p).off = (*p).off + 1
+        let to_tab: usize = 4 - ((*p).col % 4)
+        var k: usize = 0
+        while k < to_tab {
+            rt.buf_push(&(*p).cur, 32 as u8)
+            k = k + 1
+        }
+    }
+    if (*p).off < (*p).ln {
+        rt.buf_push_bytes(&(*p).cur, (*p).line + ((*p).off as u64), (*p).ln - (*p).off)
+    }
+    rt.buf_push(&(*p).cur, 10 as u8)
+}
+
+// ------------------------------------------------------------ tree helpers
+
+fn kind_of(p: *mut P, n: u32) -> u32 {
+    return doc.node_kind((*p).d, n)
+}
+
+fn can_contain(parent: u32, child: u32) -> bool {
+    if parent == doc.K_DOC || parent == doc.K_QUOTE || parent == doc.K_ITEM {
+        return child != doc.K_ITEM
+    }
+    if parent == doc.K_LIST {
+        return child == doc.K_ITEM
+    }
+    return false
+}
+
+fn accepts_lines(k: u32) -> bool {
+    return k == doc.K_PARA || k == doc.K_CODE_BLOCK || k == doc.K_HTML_BLOCK
+}
+
+// A new open block under the tip (closing tips that cannot hold it).
+fn add_child(p: *mut P, kind: u32) -> u32 {
+    while !can_contain(kind_of(p, (*p).tip), kind) {
+        finalize(p, (*p).tip)
+    }
+    let nd: u32 = doc.node_new((*p).d, kind)
+    let q: *mut doc.Node = doc.node_at((*p).d, nd)
+    (*q).open = true
+    (*q).x3 = (*p).line_no as i64
+    doc.append_child((*p).d, (*p).tip, nd)
+    (*p).tip = nd
+    return nd
+}
+
+fn close_unmatched(p: *mut P) {
+    if !(*p).all_closed {
+        while (*p).oldtip != (*p).last_matched {
+            let par: u32 = doc.node_parent((*p).d, (*p).oldtip)
+            finalize(p, (*p).oldtip)
+            (*p).oldtip = par
+        }
+        (*p).all_closed = true
+    }
+}
+
+// --------------------------------------------------------------- finalizing
+
+fn ends_with_blank(d: *mut doc.Doc, n: u32) -> bool {
+    var b: u32 = n
+    while b != doc.NIL {
+        if (*doc.node_at(d, b)).blank_end {
+            return true
+        }
+        let k: u32 = doc.node_kind(d, b)
+        if k == doc.K_LIST || k == doc.K_ITEM {
+            b = doc.node_last(d, b)
+        } else {
+            break
+        }
+    }
+    return false
+}
+
+// Close block `n`: it is no longer open, its text goes to the pool.
+fn finalize(p: *mut P, n: u32) {
+    let d: *mut doc.Doc = (*p).d
+    let par: u32 = doc.node_parent(d, n)
+    let q: *mut doc.Node = doc.node_at(d, n)
+    (*q).open = false
+    let k: u32 = (*q).kind
+    if k == doc.K_PARA {
+        finish_paragraph(p, n)
+    } else if k == doc.K_CODE_BLOCK {
+        finish_code(p, n)
+    } else if k == doc.K_HTML_BLOCK {
+        var len: usize = rt.buf_len(&(*p).cur)
+        // the closing line break is not part of the text
+        if len > 0 && rt.buf_at(&(*p).cur, len - 1) == 10 as u8 {
+            len = len - 1
+        }
+        doc.set_text(d, n, rt.buf_ptr(&(*p).cur), len)
+        rt.buf_clear(&(*p).cur)
+    } else if k == doc.K_LIST {
+        // tight unless a blank line separates items or their children
+        var tight: bool = true
+        var item: u32 = doc.node_first(d, n)
+        while item != doc.NIL && tight {
+            if ends_with_blank(d, item) && doc.node_next(d, item) != doc.NIL {
+                tight = false
+                break
+            }
+            var sub: u32 = doc.node_first(d, item)
+            while sub != doc.NIL {
+                if ends_with_blank(d, sub) && (doc.node_next(d, item) != doc.NIL
+                    || doc.node_next(d, sub) != doc.NIL) {
+                    tight = false
+                    break
+                }
+                sub = doc.node_next(d, sub)
+            }
+            item = doc.node_next(d, item)
+        }
+        let q2: *mut doc.Node = doc.node_at(d, n)
+        if tight {
+            (*q2).c = 1
+        } else {
+            (*q2).c = 0
+        }
+    }
+    (*p).tip = par
+    if par == doc.NIL {
+        (*p).tip = 0 as u32
+    }
+}
+
+fn finalize_doc(p: *mut P) {
+}
+
+// Link reference definitions at the start of a paragraph's text are
+// removed from it (and recorded); the text that is left is trimmed.
+fn finish_paragraph(p: *mut P, n: u32) {
+    let d: *mut doc.Doc = (*p).d
+    let sp: u64 = rt.buf_ptr(&(*p).cur)
+    let len: usize = rt.buf_len(&(*p).cur)
+    var start: usize = 0
+    while start < len && rt.ld8(sp, start) == 91 as u8 {
+        let used: usize = parse_ref_def(p, sp + (start as u64), len - start)
+        if used == 0 {
+            break
+        }
+        start = start + used
+    }
+    // trim
+    var a: usize = start
+    var b: usize = len
+    while a < b && scan.is_ws(rt.ld8(sp, a)) {
+        a = a + 1
+    }
+    while b > a && scan.is_ws(rt.ld8(sp, b - 1)) {
+        b = b - 1
+    }
+    if a >= b {
+        // nothing but definitions: no paragraph
+        doc.unlink(d, n)
+    } else {
+        doc.set_text(d, n, sp + (a as u64), b - a)
+    }
+    rt.buf_clear(&(*p).cur)
+}
+
+// One reference definition at the start of (s, n). Returns how many octets
+// it covers (through its line end), 0 if there is none.
+fn parse_ref_def(p: *mut P, s: u64, n: usize) -> usize {
+    let le: usize = scan.scan_label(s, n, 0)
+    if le == scan.NOPOS || le >= n || rt.ld8(s, le) != 58 as u8 {
+        return 0
+    }
+    // the label must hold something that is not whitespace
+    var any: bool = false
+    var q: usize = 1
+    while q + 1 < le {
+        if !scan.is_ws(rt.ld8(s, q)) {
+            any = true
+        }
+        q = q + 1
+    }
+    if !any {
+        return 0
+    }
+    // after the colon: spaces, at most one line end, spaces
+    var i: usize = le + 1
+    while i < n && scan.is_space(rt.ld8(s, i)) {
+        i = i + 1
+    }
+    if i < n && rt.ld8(s, i) == 10 as u8 {
+        i = i + 1
+        while i < n && scan.is_space(rt.ld8(s, i)) {
+            i = i + 1
+        }
+    }
+    if i >= n {
+        return 0
+    }
+    rt.buf_clear(&(*p).tmp)
+    let bare_start: usize = i
+    let de: usize = scan.scan_dest(s, n, i, &(*p).tmp)
+    if de == scan.NOPOS {
+        return 0
+    }
+    if de == bare_start {
+        // an empty bare destination is no destination
+        return 0
+    }
+    // end of the destination line?
+    var j: usize = de
+    while j < n && scan.is_space(rt.ld8(s, j)) {
+        j = j + 1
+    }
+    let dest_line_ok: bool = j >= n || rt.ld8(s, j) == 10 as u8
+    var line_end: usize = j
+    if j < n {
+        line_end = j + 1
+    }
+    // a title: needs whitespace before it, may start on the next line
+    var t0: usize = j
+    if t0 < n && rt.ld8(s, t0) == 10 as u8 {
+        t0 = t0 + 1
+        while t0 < n && scan.is_space(rt.ld8(s, t0)) {
+            t0 = t0 + 1
+        }
+    }
+    rt.buf_clear(&(*p).tmp2)
+    var have_title: bool = false
+    var title_end: usize = 0
+    if t0 < n && t0 > de && (rt.ld8(s, t0) == 34 as u8 || rt.ld8(s, t0) == 39 as u8 || rt.ld8(s, t0) == 40 as u8) {
+        let te: usize = scan.scan_title(s, n, t0, &(*p).tmp2)
+        if te != scan.NOPOS {
+            var m: usize = te
+            while m < n && scan.is_space(rt.ld8(s, m)) {
+                m = m + 1
+            }
+            if m >= n || rt.ld8(s, m) == 10 as u8 {
+                have_title = true
+                title_end = m
+                if m < n {
+                    title_end = m + 1
+                }
+            }
+        }
+    }
+    var used: usize = 0
+    if have_title {
+        used = title_end
+    } else if dest_line_ok {
+        used = line_end
+        rt.buf_clear(&(*p).tmp2)
+    } else {
+        return 0
+    }
+    var nl: rt.Buf = rt.buf_new()
+    scan.label_normalize(s + 1, le - 2, &nl)
+    doc.ref_add((*p).d, rt.buf_ptr(&nl), rt.buf_len(&nl), rt.buf_ptr(&(*p).tmp),
+        rt.buf_len(&(*p).tmp), rt.buf_ptr(&(*p).tmp2), rt.buf_len(&(*p).tmp2))
+    rt.buf_free(&nl)
+    return used
+}
+
+fn finish_code(p: *mut P, n: u32) {
+    let d: *mut doc.Doc = (*p).d
+    var len: usize = rt.buf_len(&(*p).cur)
+    let sp: u64 = rt.buf_ptr(&(*p).cur)
+    let q: *mut doc.Node = doc.node_at(d, n)
+    if (*q).x1 == 0 as i64 {
+        // indented: trailing blank lines are not part of the code
+        while len > 0 {
+            // the last line is s[ls..len-1] (len-1 is its '\n')
+            var ls: usize = len - 1
+            while ls > 0 && rt.ld8(sp, ls - 1) != 10 as u8 {
+                ls = ls - 1
+            }
+            var blank: bool = true
+            var z: usize = ls
+            while z + 1 < len {
+                if !scan.is_ws(rt.ld8(sp, z)) {
+                    blank = false
+                    break
+                }
+                z = z + 1
+            }
+            if blank {
+                len = ls
+            } else {
+                break
+            }
+        }
+    }
+    doc.set_text(d, n, sp, len)
+    rt.buf_clear(&(*p).cur)
+}
+
+// ---------------------------------------------------------- the container checks
+
+// 0: the line continues the block, 1: it does not, 2: the line is used up.
+fn continue_block(p: *mut P, n: u32) -> u32 {
+    let d: *mut doc.Doc = (*p).d
+    let k: u32 = doc.node_kind(d, n)
+    if k == doc.K_QUOTE {
+        if (*p).indent <= 3 && lc(p, (*p).nns) == 62 as u8 {
+            advance_next_nonspace(p)
+            advance_offset(p, 1, false)
+            if scan.is_space(lc(p, (*p).off)) {
+                advance_offset(p, 1, true)
+            }
+            return 0 as u32
+        }
+        return 1 as u32
+    }
+    if k == doc.K_ITEM {
+        let q: *mut doc.Node = doc.node_at(d, n)
+        if (*p).blank {
+            if (*q).first == doc.NIL {
+                return 1 as u32
+            }
+            advance_next_nonspace(p)
+        } else if (*p).indent as i64 >= (*q).x1 + (*q).x2 {
+            advance_offset(p, ((*q).x1 + (*q).x2) as usize, true)
+        } else {
+            return 1 as u32
+        }
+        return 0 as u32
+    }
+    if k == doc.K_LIST {
+        return 0 as u32
+    }
+    if k == doc.K_HEADING || k == doc.K_THEMATIC {
+        return 1 as u32
+    }
+    if k == doc.K_CODE_BLOCK {
+        let q: *mut doc.Node = doc.node_at(d, n)
+        if (*q).x1 != 0 as i64 {
+            // fenced: x1 = fence char, x2 = fence length, x3 holds the offset in `a`
+            let fc: u8 = (*q).x1 as u8
+            if (*p).indent <= 3 && lc(p, (*p).nns) == fc {
+                var e: usize = (*p).nns
+                while e < (*p).ln && lc(p, e) == fc {
+                    e = e + 1
+                }
+                let run: usize = e - (*p).nns
+                if run >= 3 && run as i64 >= (*q).x2 && scan.blank_from((*p).line, (*p).ln, e) {
+                    finalize(p, n)
+                    return 2 as u32
+                }
+            }
+            var skip: i64 = (*q).a
+            while skip > 0 && scan.is_space(lc(p, (*p).off)) && (*p).off < (*p).ln {
+                advance_offset(p, 1, true)
+                skip = skip - 1
+            }
+        } else {
+            if (*p).indent >= CODE_INDENT {
+                advance_offset(p, CODE_INDENT, true)
+            } else if (*p).blank {
+                advance_next_nonspace(p)
+            } else {
+                return 1 as u32
+            }
+        }
+        return 0 as u32
+    }
+    if k == doc.K_HTML_BLOCK {
+        let q: *mut doc.Node = doc.node_at(d, n)
+        if (*p).blank && ((*q).x1 == 6 as i64 || (*q).x1 == 7 as i64) {
+            return 1 as u32
+        }
+        return 0 as u32
+    }
+    if k == doc.K_PARA {
+        if (*p).blank {
+            return 1 as u32
+        }
+        return 0 as u32
+    }
+    if k == doc.K_TABLE {
+        if (*p).blank {
+            return 1 as u32
+        }
+        return 0 as u32
+    }
+    return 1 as u32
+}
+
+// ---------------------------------------------------------------- the line
+
+fn incorporate_line(p: *mut P) {
+    let d: *mut doc.Doc = (*p).d
+    (*p).line_no = (*p).line_no + 1
+    (*p).all_closed = true
+    var container: u32 = 0 as u32
+    (*p).oldtip = (*p).tip
+    (*p).off = 0
+    (*p).col = 0
+    (*p).blank = false
+    (*p).partial = false
+    (*p).no_add = false
+    // 1. which open blocks does the line continue?
+    while true {
+        let lastc: u32 = doc.node_last(d, container)
+        if lastc == doc.NIL || !(*doc.node_at(d, lastc)).open {
+            break
+        }
+        container = lastc
+        find_next_nonspace(p)
+        let r: u32 = continue_block(p, container)
+        if r == 2 as u32 {
+            return
+        }
+        if r == 1 as u32 {
+            container = doc.node_parent(d, container)
+            break
+        }
+    }
+    (*p).all_closed = container == (*p).oldtip
+    (*p).last_matched = container
+    var matched_leaf: bool = kind_of(p, container) != doc.K_PARA && accepts_lines(kind_of(p, container))
+    // 2. can a new block start here?
+    while !matched_leaf {
+        find_next_nonspace(p)
+        var res: u32 = block_starts(p, container)
+        if res == 1 as u32 {
+            container = (*p).tip
+        } else if res == 2 as u32 {
+            container = (*p).tip
+            matched_leaf = true
+        } else {
+            advance_next_nonspace(p)
+            break
+        }
+    }
+    // 3. what remains is text
+    if !(*p).all_closed && !(*p).blank && kind_of(p, (*p).tip) == doc.K_PARA {
+        add_line(p)
+    } else {
+        close_unmatched(p)
+        let lastchild: u32 = doc.node_last(d, container)
+        if (*p).blank && lastchild != doc.NIL {
+            (*doc.node_at(d, lastchild)).blank_end = true
+        }
+        let t: u32 = kind_of(p, container)
+        var item_fresh: bool = false
+        if t == doc.K_ITEM && doc.node_first(d, container) == doc.NIL
+            && (*doc.node_at(d, container)).x3 == (*p).line_no as i64 {
+            item_fresh = true
+        }
+        var fenced: bool = false
+        if t == doc.K_CODE_BLOCK && (*doc.node_at(d, container)).x1 != 0 as i64 {
+            fenced = true
+        }
+        let last_blank: bool = (*p).blank && !(t == doc.K_QUOTE || fenced || item_fresh)
+        var cont: u32 = container
+        while cont != doc.NIL {
+            (*doc.node_at(d, cont)).blank_end = last_blank
+            cont = doc.node_parent(d, cont)
+        }
+        if t == doc.K_TABLE && !(*p).blank && !(*p).no_add {
+            table_row(p, container)
+        } else if accepts_lines(t) {
+            if !(*p).no_add {
+                add_line(p)
+            }
+            if t == doc.K_HTML_BLOCK {
+                let ty: i64 = (*doc.node_at(d, container)).x1
+                if ty >= 1 as i64 && ty <= 5 as i64 && html_end(p, ty) {
+                    finalize(p, container)
+                }
+            }
+        } else if (*p).off < (*p).ln && !(*p).blank {
+            let para: u32 = add_child(p, doc.K_PARA)
+            advance_next_nonspace(p)
+            add_line(p)
+        }
+    }
+}
+
+// ------------------------------------------------------------ block starts
+
+fn block_starts(p: *mut P, container: u32) -> u32 {
+    let d: *mut doc.Doc = (*p).d
+    let o: doc.Opts = doc.doc_opts(d)
+    let indented: bool = (*p).indent >= CODE_INDENT
+    let c0: u8 = lc(p, (*p).nns)
+    let ck: u32 = kind_of(p, container)
+    if !indented {
+        // block quote
+        if c0 == 62 as u8 && depth_of(p, container) < MAX_DEPTH {
+            advance_next_nonspace(p)
+            advance_offset(p, 1, false)
+            if scan.is_space(lc(p, (*p).off)) {
+                advance_offset(p, 1, true)
+            }
+            close_unmatched(p)
+            let q: u32 = add_child(p, doc.K_QUOTE)
+            return 1 as u32
+        }
+        // ATX heading
+        if c0 == 35 as u8 {
+            var e: usize = (*p).nns
+            while e < (*p).ln && lc(p, e) == 35 as u8 {
+                e = e + 1
+            }
+            let lv: usize = e - (*p).nns
+            if lv <= 6 && (e >= (*p).ln || scan.is_space(lc(p, e))) {
+                advance_next_nonspace(p)
+                advance_offset(p, e - (*p).nns, false)
+                close_unmatched(p)
+                let h: u32 = add_child(p, doc.K_HEADING)
+                (*doc.node_at(d, h)).a = lv as i64
+                atx_content(p, h)
+                advance_offset(p, (*p).ln - (*p).off, false)
+                return 2 as u32
+            }
+        }
+        // fenced code
+        if c0 == 96 as u8 || c0 == 126 as u8 {
+            var e: usize = (*p).nns
+            while e < (*p).ln && lc(p, e) == c0 {
+                e = e + 1
+            }
+            let run: usize = e - (*p).nns
+            var ok: bool = run >= 3
+            if ok && c0 == 96 as u8 {
+                // the info string of a backtick fence holds no backtick
+                var z: usize = e
+                while z < (*p).ln {
+                    if lc(p, z) == 96 as u8 {
+                        ok = false
+                        break
+                    }
+                    z = z + 1
+                }
+            }
+            if ok {
+                close_unmatched(p)
+                let cb: u32 = add_child(p, doc.K_CODE_BLOCK)
+                let q: *mut doc.Node = doc.node_at(d, cb)
+                (*q).x1 = c0 as i64
+                (*q).x2 = run as i64
+                (*q).a = (*p).indent as i64
+                // the info string: the rest of the line, trimmed, unescaped
+                var a: usize = e
+                var b: usize = (*p).ln
+                while a < b && scan.is_space(lc(p, a)) {
+                    a = a + 1
+                }
+                while b > a && scan.is_space(lc(p, b - 1)) {
+                    b = b - 1
+                }
+                rt.buf_clear(&(*p).tmp)
+                scan.unescape_into((*p).line, a, b, &(*p).tmp)
+                doc.set_url(d, cb, rt.buf_ptr(&(*p).tmp), rt.buf_len(&(*p).tmp))
+                advance_next_nonspace(p)
+                advance_offset(p, (*p).ln - (*p).off, false)
+                (*p).no_add = true
+                return 2 as u32
+            }
+        }
+        // HTML block
+        if c0 == 60 as u8 {
+            let ty: u32 = html_block_type(p)
+            if ty > 0 as u32 && (ty < 7 as u32 || (ck != doc.K_PARA
+                && !(!(*p).all_closed && !(*p).blank && kind_of(p, (*p).tip) == doc.K_PARA))) {
+                close_unmatched(p)
+                let hb: u32 = add_child(p, doc.K_HTML_BLOCK)
+                (*doc.node_at(d, hb)).x1 = ty as i64
+                return 2 as u32
+            }
+        }
+        // Setext heading
+        if ck == doc.K_PARA && (c0 == 61 as u8 || c0 == 45 as u8) {
+            var e: usize = (*p).nns
+            while e < (*p).ln && lc(p, e) == c0 {
+                e = e + 1
+            }
+            if scan.blank_from((*p).line, (*p).ln, e) {
+                close_unmatched(p)
+                // reference definitions at the start of the paragraph go first
+                // (and stay gone: the text is shortened even if no heading follows)
+                let sp: u64 = rt.buf_ptr(&(*p).cur)
+                var len: usize = rt.buf_len(&(*p).cur)
+                var start: usize = 0
+                while start < len && rt.ld8(sp, start) == 91 as u8 {
+                    let used: usize = parse_ref_def(p, sp + (start as u64), len - start)
+                    if used == 0 {
+                        break
+                    }
+                    start = start + used
+                }
+                if start > 0 {
+                    rt.mem_copy(sp, sp + (start as u64), len - start)
+                    len = len - start
+                    rt.buf_set_len(&(*p).cur, len)
+                }
+                var a: usize = 0
+                var b: usize = len
+                while a < b && scan.is_ws(rt.ld8(sp, a)) {
+                    a = a + 1
+                }
+                while b > a && scan.is_ws(rt.ld8(sp, b - 1)) {
+                    b = b - 1
+                }
+                if a < b {
+                    let q: *mut doc.Node = doc.node_at(d, container)
+                    (*q).kind = doc.K_HEADING
+                    if c0 == 61 as u8 {
+                        (*q).a = 1
+                    } else {
+                        (*q).a = 2
+                    }
+                    doc.set_text(d, container, sp + (a as u64), b - a)
+                    rt.buf_clear(&(*p).cur)
+                    (*p).tip = container
+                    advance_offset(p, (*p).ln - (*p).off, false)
+                    return 2 as u32
+                }
+            }
+        }
+        // thematic break
+        if c0 == 42 as u8 || c0 == 45 as u8 || c0 == 95 as u8 {
+            var cnt: usize = 0
+            var ok: bool = true
+            var z: usize = (*p).nns
+            while z < (*p).ln {
+                let c: u8 = lc(p, z)
+                if c == c0 {
+                    cnt = cnt + 1
+                } else if !scan.is_space(c) {
+                    ok = false
+                    break
+                }
+                z = z + 1
+            }
+            if ok && cnt >= 3 {
+                close_unmatched(p)
+                let tb: u32 = add_child(p, doc.K_THEMATIC)
+                advance_offset(p, (*p).ln - (*p).off, false)
+                return 2 as u32
+            }
+        }
+        // GFM table: the delimiter row under a one-line header
+        if o.tables && ck == doc.K_PARA && (c0 == 124 as u8 || c0 == 45 as u8 || c0 == 58 as u8) {
+            if table_start(p, container) {
+                return 2 as u32
+            }
+        }
+    }
+    // list item
+    if (!indented || ck == doc.K_LIST) && depth_of(p, container) < MAX_DEPTH {
+        let r: u32 = list_item_start(p, container)
+        if r != 0 as u32 {
+            return r
+        }
+    }
+    // indented code
+    if indented && kind_of(p, (*p).tip) != doc.K_PARA && !(*p).blank {
+        advance_offset(p, CODE_INDENT, true)
+        close_unmatched(p)
+        let cb: u32 = add_child(p, doc.K_CODE_BLOCK)
+        return 2 as u32
+    }
+    return 0 as u32
+}
+
+// The content of an ATX heading: the rest of the line without the closing
+// sequence of #, trimmed.
+fn atx_content(p: *mut P, h: u32) {
+    var a: usize = (*p).off
+    var b: usize = (*p).ln
+    while a < b && scan.is_space(lc(p, a)) {
+        a = a + 1
+    }
+    while b > a && scan.is_space(lc(p, b - 1)) {
+        b = b - 1
+    }
+    // closing sequence: `#`s preceded by a space (or the whole content)
+    var e: usize = b
+    while e > a && lc(p, e - 1) == 35 as u8 {
+        e = e - 1
+    }
+    if e < b {
+        if e == a {
+            b = a
+        } else if scan.is_space(lc(p, e - 1)) {
+            b = e
+            while b > a && scan.is_space(lc(p, b - 1)) {
+                b = b - 1
+            }
+        }
+    }
+    doc.set_text((*p).d, h, (*p).line + (a as u64), b - a)
+}
+
+// ------------------------------------------------------------------- lists
+
+// Try to read a list marker at the next non-space. On success the offset is
+// behind the marker and its spaces, and the data is in (kind, ...).
+// Returns 0 if there is none, else 1.
+fn list_item_start(p: *mut P, container: u32) -> u32 {
+    let d: *mut doc.Doc = (*p).d
+    if (*p).indent >= 4 {
+        return 0 as u32
+    }
+    let ck: u32 = kind_of(p, container)
+    let c0: u8 = lc(p, (*p).nns)
+    var ordered: bool = false
+    var mlen: usize = 0
+    var start: i64 = 0
+    var mark: u8 = 0 as u8
+    if c0 == 42 as u8 || c0 == 43 as u8 || c0 == 45 as u8 {
+        mark = c0
+        mlen = 1
+    } else if scan.is_digit(c0) {
+        var e: usize = (*p).nns
+        while e < (*p).ln && scan.is_digit(lc(p, e)) && e - (*p).nns < 9 {
+            start = start * 10 + ((lc(p, e) - 48 as u8) as i64)
+            e = e + 1
+        }
+        let dl: u8 = lc(p, e)
+        if e < (*p).ln && (dl == 46 as u8 || dl == 41 as u8) {
+            ordered = true
+            mark = dl
+            mlen = e + 1 - (*p).nns
+            if ck == doc.K_PARA && start != 1 {
+                return 0 as u32
+            }
+        } else {
+            return 0 as u32
+        }
+    } else {
+        return 0 as u32
+    }
+    // a space, tab or the line end must follow
+    let after: usize = (*p).nns + mlen
+    if after < (*p).ln && !scan.is_space(lc(p, after)) {
+        return 0 as u32
+    }
+    // an item that interrupts a paragraph must not be empty
+    if ck == doc.K_PARA && scan.blank_from((*p).line, (*p).ln, after) {
+        return 0 as u32
+    }
+    // it is a match: take the marker and work out the padding
+    let marker_offset: usize = (*p).indent
+    advance_next_nonspace(p)
+    advance_offset(p, mlen, true)
+    let sp_col: usize = (*p).col
+    let sp_off: usize = (*p).off
+    while true {
+        advance_offset(p, 1, true)
+        if !((*p).col - sp_col < 5 && scan.is_space(lc(p, (*p).off))) {
+            break
+        }
+    }
+    let blank_item: bool = (*p).off >= (*p).ln
+    let after_sp: usize = (*p).col - sp_col
+    var padding: usize = 0
+    if after_sp >= 5 || after_sp < 1 || blank_item {
+        padding = mlen + 1
+        (*p).col = sp_col
+        (*p).off = sp_off
+        if scan.is_space(lc(p, (*p).off)) {
+            advance_offset(p, 1, true)
+        }
+    } else {
+        padding = mlen + after_sp
+    }
+    close_unmatched(p)
+    // a new list, unless this item continues the open one
+    var need_list: bool = true
+    if ck == doc.K_LIST {
+        let lq: *mut doc.Node = doc.node_at(d, container)
+        let lord: bool = (*lq).b == 1 as i64
+        if lord == ordered && (*lq).x1 == mark as i64 {
+            need_list = false
+        }
+    }
+    if need_list {
+        let l: u32 = add_child(p, doc.K_LIST)
+        let lq: *mut doc.Node = doc.node_at(d, l)
+        if ordered {
+            (*lq).b = 1
+        } else {
+            (*lq).b = 0
+        }
+        (*lq).a = start
+        (*lq).x1 = mark as i64
+        (*lq).c = 1
+    }
+    let it: u32 = add_child(p, doc.K_ITEM)
+    let iq: *mut doc.Node = doc.node_at(d, it)
+    (*iq).x1 = marker_offset as i64
+    (*iq).x2 = padding as i64
+    return 1 as u32
+}
+
+// ---------------------------------------------------------------- HTML blocks
+
+fn block_tag_names() -> str {
+    return " address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link main menu menuitem nav noframes ol optgroup option p param section source summary table tbody td tfoot th thead title tr track ul "
+}
+
+// Which kind (1..7) of HTML block starts at the next non-space, 0 if none.
+fn html_block_type(p: *mut P) -> u32 {
+    let s: u64 = (*p).line
+    let n: usize = (*p).ln
+    let i: usize = (*p).nns
+    // 1: <script, <pre, <style, <textarea followed by space, > or the end
+    var k: usize = 0
+    while k < 4 {
+        var nm: str = "<script"
+        if k == 1 {
+            nm = "<pre"
+        } else if k == 2 {
+            nm = "<style"
+        } else if k == 3 {
+            nm = "<textarea"
+        }
+        if scan.starts_with_ci(s, n, i, nm) {
+            let e: usize = i + nm.n
+            if e >= n || scan.is_space(rt.ld8(s, e)) || rt.ld8(s, e) == 62 as u8 {
+                return 1 as u32
+            }
+        }
+        k = k + 1
+    }
+    if scan.starts_with_ci(s, n, i, "<!--") {
+        return 2 as u32
+    }
+    if scan.starts_with_ci(s, n, i, "<?") {
+        return 3 as u32
+    }
+    if scan.starts_with_ci(s, n, i, "<![CDATA[") {
+        return 5 as u32
+    }
+    if i + 2 < n && rt.ld8(s, i + 1) == 33 as u8 && scan.is_alpha(rt.ld8(s, i + 2)) {
+        return 4 as u32
+    }
+    // 6: a block-level tag name
+    var j: usize = i + 1
+    if j < n && rt.ld8(s, j) == 47 as u8 {
+        j = j + 1
+    }
+    let n0: usize = j
+    while j < n && scan.is_alnum(rt.ld8(s, j)) {
+        j = j + 1
+    }
+    if j > n0 {
+        let after_ok: bool = j >= n || scan.is_space(rt.ld8(s, j)) || rt.ld8(s, j) == 62 as u8
+            || (rt.ld8(s, j) == 47 as u8 && j + 1 < n && rt.ld8(s, j + 1) == 62 as u8)
+        if after_ok {
+            // is it in the list?
+            let tl: str = block_tag_names()
+            var q: usize = 0
+            while q < tl.n {
+                // names are separated by single spaces
+                var e: usize = q + 1
+                while e < tl.n && rt.ld8(tl.p as u64, e) != 32 as u8 {
+                    e = e + 1
+                }
+                let nl: usize = e - (q + 1)
+                if nl == j - n0 {
+                    var same: bool = true
+                    var z: usize = 0
+                    while z < nl {
+                        if scan.lower(rt.ld8(tl.p as u64, q + 1 + z)) != scan.lower(rt.ld8(s, n0 + z)) {
+                            same = false
+                            break
+                        }
+                        z = z + 1
+                    }
+                    if same {
+                        return 6 as u32
+                    }
+                }
+                q = e
+            }
+        }
+    }
+    // 7: a complete open or closing tag alone on its line
+    let tl: usize = scan.html_tag_len(s, n, i)
+    if tl > 0 && scan.blank_from(s, n, i + tl) {
+        // the tag must not be script, style, pre
+        if !(scan.starts_with_ci(s, n, i, "<script") || scan.starts_with_ci(s, n, i, "<style")
+            || scan.starts_with_ci(s, n, i, "<pre")) {
+            return 7 as u32
+        }
+    }
+    return 0 as u32
+}
+
+// Does the line (from the offset) hold the end condition of HTML block type 1..5?
+fn html_end(p: *mut P, ty: i64) -> bool {
+    let s: u64 = (*p).line
+    let n: usize = (*p).ln
+    var i: usize = (*p).off
+    while i < n {
+        if ty == 1 as i64 {
+            if scan.starts_with_ci(s, n, i, "</script>") || scan.starts_with_ci(s, n, i, "</pre>")
+                || scan.starts_with_ci(s, n, i, "</style>") || scan.starts_with_ci(s, n, i, "</textarea>") {
+                return true
+            }
+        } else if ty == 2 as i64 {
+            if scan.starts_with_ci(s, n, i, "-->") {
+                return true
+            }
+        } else if ty == 3 as i64 {
+            if scan.starts_with_ci(s, n, i, "?>") {
+                return true
+            }
+        } else if ty == 4 as i64 {
+            if rt.ld8(s, i) == 62 as u8 {
+                return true
+            }
+        } else if ty == 5 as i64 {
+            if scan.starts_with_ci(s, n, i, "]]>") {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ------------------------------------------------------------------- tables
+
+// Split a table row: the (start, end) of every cell is pushed on `cells`
+// (trimmed). Leading and trailing pipes are optional; `\|` does not split.
+fn split_row(p: *mut P, a0: usize, b0: usize) {
+    vec_clear[usize](&(*p).cells)
+    var a: usize = a0
+    var b: usize = b0
+    while a < b && scan.is_space(lc(p, a)) {
+        a = a + 1
+    }
+    while b > a && scan.is_space(lc(p, b - 1)) {
+        b = b - 1
+    }
+    if a < b && lc(p, a) == 124 as u8 {
+        a = a + 1
+    }
+    // a trailing unescaped pipe
+    if b > a && lc(p, b - 1) == 124 as u8 {
+        var bs: usize = 0
+        var z: usize = b - 1
+        while z > a && lc(p, z - 1) == 92 as u8 {
+            bs = bs + 1
+            z = z - 1
+        }
+        if bs % 2 == 0 {
+            b = b - 1
+        }
+    }
+    var cs: usize = a
+    var i: usize = a
+    while i <= b {
+        if i == b || lc(p, i) == 124 as u8 {
+            var x: usize = cs
+            var y: usize = i
+            while x < y && scan.is_space(lc(p, x)) {
+                x = x + 1
+            }
+            while y > x && scan.is_space(lc(p, y - 1)) {
+                y = y - 1
+            }
+            vec_push[usize](&(*p).cells, x)
+            vec_push[usize](&(*p).cells, y)
+            cs = i + 1
+        } else if lc(p, i) == 92 as u8 {
+            i = i + 1
+        }
+        i = i + 1
+    }
+}
+
+// Is the line at the next non-space a delimiter row (`| --- | :-: |`)?
+// On success the alignments are in p.aligns.
+fn delimiter_row(p: *mut P) -> bool {
+    let a: usize = (*p).nns
+    var has_pipe: bool = false
+    var i: usize = a
+    while i < (*p).ln {
+        let c: u8 = lc(p, i)
+        if !(c == 124 as u8 || c == 45 as u8 || c == 58 as u8 || scan.is_space(c)) {
+            return false
+        }
+        if c == 124 as u8 {
+            has_pipe = true
+        }
+        i = i + 1
+    }
+    split_row(p, a, (*p).ln)
+    let nc: usize = vec_len[usize](&(*p).cells) / 2
+    if nc == 0 {
+        return false
+    }
+    vec_clear[i64](&(*p).aligns)
+    var k: usize = 0
+    while k < nc {
+        let s: usize = vec_at[usize](&(*p).cells, k * 2)
+        let e: usize = vec_at[usize](&(*p).cells, k * 2 + 1)
+        if e <= s {
+            return false
+        }
+        var left: bool = false
+        var right: bool = false
+        var x: usize = s
+        var y: usize = e
+        if lc(p, x) == 58 as u8 {
+            left = true
+            x = x + 1
+        }
+        if y > x && lc(p, y - 1) == 58 as u8 {
+            right = true
+            y = y - 1
+        }
+        if y <= x {
+            return false
+        }
+        var z: usize = x
+        while z < y {
+            if lc(p, z) != 45 as u8 {
+                return false
+            }
+            z = z + 1
+        }
+        var al: i64 = doc.ALIGN_NONE
+        if left && right {
+            al = doc.ALIGN_CENTER
+        } else if left {
+            al = doc.ALIGN_LEFT
+        } else if right {
+            al = doc.ALIGN_RIGHT
+        }
+        vec_push[i64](&(*p).aligns, al)
+        k = k + 1
+    }
+    // a lone `---` is a Setext underline / thematic break, not a table
+    if !has_pipe && nc == 1 {
+        // a single column needs a pipe somewhere; the header row is checked by the caller
+        return true
+    }
+    return true
+}
+
+// The paragraph's last line is a header row and this line is the delimiter
+// row with as many cells: the paragraph becomes a table.
+fn table_start(p: *mut P, para: u32) -> bool {
+    let d: *mut doc.Doc = (*p).d
+    if !delimiter_row(p) {
+        return false
+    }
+    let ncols: usize = vec_len[i64](&(*p).aligns)
+    var delim_pipe: bool = false
+    var z2: usize = (*p).nns
+    while z2 < (*p).ln {
+        if lc(p, z2) == 124 as u8 {
+            delim_pipe = true
+        }
+        z2 = z2 + 1
+    }
+    // the header row is the last line of the paragraph text
+    let sp: u64 = rt.buf_ptr(&(*p).cur)
+    var len: usize = rt.buf_len(&(*p).cur)
+    if len > 0 && rt.ld8(sp, len - 1) == 10 as u8 {
+        len = len - 1
+    }
+    var ls: usize = len
+    while ls > 0 && rt.ld8(sp, ls - 1) != 10 as u8 {
+        ls = ls - 1
+    }
+    var hdr: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&hdr, sp + (ls as u64), len - ls)
+    let save_line: u64 = (*p).line
+    let save_ln: usize = (*p).ln
+    (*p).line = rt.buf_ptr(&hdr)
+    (*p).ln = rt.buf_len(&hdr)
+    split_row(p, 0, (*p).ln)
+    let hn: usize = vec_len[usize](&(*p).cells) / 2
+    var pipe_in_header: bool = false
+    var z: usize = 0
+    while z < (*p).ln {
+        if lc(p, z) == 124 as u8 {
+            pipe_in_header = true
+        }
+        z = z + 1
+    }
+    if hn != ncols || (!pipe_in_header && !delim_pipe) {
+        (*p).line = save_line
+        (*p).ln = save_ln
+        rt.buf_free(&hdr)
+        return false
+    }
+    // the lines before the header row stay a paragraph; the table follows
+    close_unmatched(p)
+    let tbl: u32 = doc.node_new(d, doc.K_TABLE)
+    let tq: *mut doc.Node = doc.node_at(d, tbl)
+    (*tq).open = true
+    (*tq).x3 = (*p).line_no as i64
+    doc.insert_after(d, para, tbl)
+    rt.buf_set_len(&(*p).cur, ls)
+    finalize(p, para)
+    (*p).tip = tbl
+    emit_row(p, tbl, true, 0 as u64, 0)
+    (*p).line = save_line
+    (*p).ln = save_ln
+    rt.buf_free(&hdr)
+    advance_offset(p, (*p).ln - (*p).off, false)
+    (*p).no_add = true
+    return true
+}
+
+// A body row of the open table: the line from the offset.
+fn table_row(p: *mut P, tbl: u32) {
+    split_row(p, (*p).off, (*p).ln)
+    emit_row(p, tbl, false, 0 as u64, 0)
+}
+
+// Make a TROW under `tbl` from the cells in p.cells (positions in p.line).
+fn emit_row(p: *mut P, tbl: u32, header: bool, unused: u64, unused2: usize) {
+    let d: *mut doc.Doc = (*p).d
+    let row: u32 = doc.node_new(d, doc.K_TROW)
+    if header {
+        (*doc.node_at(d, row)).b = 1
+    }
+    doc.append_child(d, tbl, row)
+    let ncols: usize = vec_len[i64](&(*p).aligns)
+    let have: usize = vec_len[usize](&(*p).cells) / 2
+    var k: usize = 0
+    while k < ncols {
+        let cell: u32 = doc.node_new(d, doc.K_TCELL)
+        (*doc.node_at(d, cell)).a = vec_at[i64](&(*p).aligns, k)
+        if header {
+            (*doc.node_at(d, cell)).b = 1
+        }
+        doc.append_child(d, row, cell)
+        if k < have {
+            let s: usize = vec_at[usize](&(*p).cells, k * 2)
+            let e: usize = vec_at[usize](&(*p).cells, k * 2 + 1)
+            // `\|` is a pipe in a cell
+            rt.buf_clear(&(*p).tmp2)
+            var i: usize = s
+            while i < e {
+                let c: u8 = lc(p, i)
+                if c == 92 as u8 && i + 1 < e && lc(p, i + 1) == 124 as u8 {
+                    rt.buf_push(&(*p).tmp2, 124 as u8)
+                    i = i + 2
+                } else {
+                    rt.buf_push(&(*p).tmp2, c)
+                    i = i + 1
+                }
+            }
+            doc.set_text(d, cell, rt.buf_ptr(&(*p).tmp2), rt.buf_len(&(*p).tmp2))
+        }
+        k = k + 1
+    }
+}
+
+// ----------------------------------------------------------- the inline pass
+
+fn resolve_inlines(p: *mut P) {
+    let d: *mut doc.Doc = (*p).d
+    let o: doc.Opts = doc.doc_opts(d)
+    let count: usize = doc.doc_count(d)
+    var buf: rt.Buf = rt.buf_new()
+    var i: usize = 1
+    while i < count {
+        let n: u32 = i as u32
+        let k: u32 = doc.node_kind(d, n)
+        i = i + 1
+        // HTML blocks are text for the inline parser unless kept raw
+        if k == doc.K_HTML_BLOCK && o.html != doc.HTML_RAW {
+            if !html_block_visible(p, n) {
+                doc.unlink(d, n)
+                continue
+            }
+            (*doc.node_at(d, n)).kind = doc.K_PARA
+            parse_text_of(p, &buf, n)
+            trim_breaks(d, n)
+            if doc.node_first(d, n) == doc.NIL {
+                doc.unlink(d, n)
+            }
+            continue
+        }
+        if k == doc.K_PARA || k == doc.K_HEADING || k == doc.K_TCELL {
+            if o.tasks && k == doc.K_PARA {
+                task_marker(p, n)
+            }
+            parse_text_of(p, &buf, n)
+        }
+    }
+    rt.buf_free(&buf)
+}
+
+// Copy the node's text out of the pool and parse it as inlines.
+fn parse_text_of(p: *mut P, buf: *mut rt.Buf, n: u32) {
+    let d: *mut doc.Doc = (*p).d
+    let sl: doc.Slice = doc.node_text(d, n)
+    if sl.n == 0 {
+        return
+    }
+    rt.buf_clear(buf)
+    rt.buf_push_bytes(buf, sl.p, sl.n)
+    inline.inline_parse(d, n, rt.buf_ptr(buf), rt.buf_len(buf))
+}
+
+// In IGNORE mode the comments, declarations and script/style bodies of an
+// HTML block are dropped; ESCAPE keeps everything as text.
+fn html_block_visible(p: *mut P, n: u32) -> bool {
+    let d: *mut doc.Doc = (*p).d
+    let o: doc.Opts = doc.doc_opts(d)
+    if o.html == doc.HTML_ESCAPE {
+        return true
+    }
+    let ty: i64 = (*doc.node_at(d, n)).x1
+    if ty >= 2 as i64 && ty <= 5 as i64 {
+        return false
+    }
+    if ty == 1 as i64 {
+        let sl: doc.Slice = doc.node_text(d, n)
+        var i: usize = 0
+        while i < sl.n && scan.is_space(rt.ld8(sl.p, i)) {
+            i = i + 1
+        }
+        if scan.starts_with_ci(sl.p, sl.n, i, "<script") || scan.starts_with_ci(sl.p, sl.n, i, "<style") {
+            return false
+        }
+    }
+    return true
+}
+
+// Soft and hard breaks at the start or end of a (converted HTML) paragraph go.
+fn trim_breaks(d: *mut doc.Doc, n: u32) {
+    while true {
+        let f: u32 = doc.node_first(d, n)
+        if f != doc.NIL && (doc.node_kind(d, f) == doc.K_SOFTBREAK || doc.node_kind(d, f) == doc.K_HARDBREAK) {
+            doc.unlink(d, f)
+        } else {
+            break
+        }
+    }
+    while true {
+        let l: u32 = doc.node_last(d, n)
+        if l != doc.NIL && (doc.node_kind(d, l) == doc.K_SOFTBREAK || doc.node_kind(d, l) == doc.K_HARDBREAK) {
+            doc.unlink(d, l)
+        } else {
+            break
+        }
+    }
+}
+
+// GFM task list item: the first paragraph of an item starts with `[ ]` or `[x]`.
+fn task_marker(p: *mut P, n: u32) {
+    let d: *mut doc.Doc = (*p).d
+    let par: u32 = doc.node_parent(d, n)
+    if par == doc.NIL || doc.node_kind(d, par) != doc.K_ITEM || doc.node_first(d, par) != n {
+        return
+    }
+    let sl: doc.Slice = doc.node_text(d, n)
+    if sl.n < 3 || rt.ld8(sl.p, 0) != 91 as u8 || rt.ld8(sl.p, 2) != 93 as u8 {
+        return
+    }
+    let m: u8 = rt.ld8(sl.p, 1)
+    var state: i64 = 0
+    if m == 32 as u8 {
+        state = 1
+    } else if m == 120 as u8 || m == 88 as u8 {
+        state = 2
+    } else {
+        return
+    }
+    // a space (or the end) must follow, and something should be written
+    if sl.n > 3 && !scan.is_space(rt.ld8(sl.p, 3)) && rt.ld8(sl.p, 3) != 10 as u8 {
+        return
+    }
+    var skip: usize = 3
+    while skip < sl.n && scan.is_ws(rt.ld8(sl.p, skip)) {
+        skip = skip + 1
+    }
+    (*doc.node_at(d, par)).a = state
+    let q: *mut doc.Node = doc.node_at(d, n)
+    (*q).txt = (*q).txt + (skip as u32)
+    (*q).txt_n = (*q).txt_n - (skip as u32)
+}

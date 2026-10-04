@@ -1,0 +1,426 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/markdown/doc.fi -- THE MARKDOWN TREE.
+//
+// A document is an ARENA: every node sits in one growing array and is named
+// by its index (a u32; NIL = no node). The tree links are indices too
+// (parent, first, last, next, prev), so there are no pointers to chase and
+// no destructors to run -- `doc_free` gives everything back at once. All
+// the text lives in ONE octet pool; a node holds (offset, length) pairs
+// into it. Whoever reads a node's text gets a `Slice` (address + length)
+// that is valid until the next thing is added to the document -- copy it
+// out if you need it longer, or simply do not parse while you read.
+//
+// THE NODES (kinds)
+//   blocks   DOC, PARA, HEADING (a = level 1..6), THEMATIC, CODE_BLOCK
+//            (text = the code, url = the info string), QUOTE,
+//            LIST (b = 1 ordered / 0 bullet, a = start number, c = 1 tight),
+//            ITEM (a = task state: 0 none, 1 open `[ ]`, 2 done `[x]`),
+//            HTML_BLOCK (text = the raw HTML), TABLE, TROW (b = 1 header
+//            row), TCELL (a = alignment 0 none, 1 left, 2 center, 3 right)
+//   inlines  TEXT (text), SOFTBREAK, HARDBREAK, CODE (text), EMPH, STRONG,
+//            STRIKE, LINK (url, title), IMAGE (url, title; its children
+//            are the alt text), HTML_INLINE (text = the raw tag)
+// Adjacent TEXT nodes are possible (an unmatched `*` is a TEXT of its own);
+// a reader that cares joins them.
+//
+// WHAT IS SAFE TO RENDER. Nothing in a Doc is "HTML": CODE, TEXT and the
+// attribute-like slots are plain text, and it is the renderer's job to
+// escape (lib/markdown/html.fi does; lib/fui/markdownview.fi draws glyphs).
+// HTML_BLOCK / HTML_INLINE only exist when the parser was asked to keep raw
+// HTML (HTML_RAW); in the default mode (HTML_IGNORE) tags are dropped, the
+// text between them stays, and <br>, <img> and <a> are turned into
+// HARDBREAK, IMAGE and LINK nodes.
+import std.rt
+import std.vec
+
+export {
+    Doc, Node, Slice, Ref, Opts,
+    NIL, K_DOC, K_PARA, K_HEADING, K_THEMATIC, K_CODE_BLOCK, K_QUOTE, K_LIST,
+    K_ITEM, K_HTML_BLOCK, K_TABLE, K_TROW, K_TCELL,
+    K_TEXT, K_SOFTBREAK, K_HARDBREAK, K_CODE, K_EMPH, K_STRONG, K_STRIKE,
+    K_LINK, K_IMAGE, K_HTML_INLINE,
+    HTML_IGNORE, HTML_ESCAPE, HTML_RAW,
+    ALIGN_NONE, ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT,
+    opts_default, opts_commonmark,
+    doc_new, doc_free, doc_root, doc_count, doc_opts,
+    node_new, node_at, node_kind, node_parent, node_first, node_last,
+    node_next, node_prev, node_a, node_b, node_c, node_is_block,
+    node_text, node_url, node_title, node_child_count,
+    set_text, set_url, set_title, set_text_slice,
+    pool_add, pool_len, pool_ptr,
+    append_child, unlink, insert_after, insert_before, move_children,
+    ref_add, ref_find, kind_name, slice_eq,
+}
+
+const NIL: u32 = 4294967295
+
+const K_DOC: u32 = 0
+const K_PARA: u32 = 1
+const K_HEADING: u32 = 2
+const K_THEMATIC: u32 = 3
+const K_CODE_BLOCK: u32 = 4
+const K_QUOTE: u32 = 5
+const K_LIST: u32 = 6
+const K_ITEM: u32 = 7
+const K_HTML_BLOCK: u32 = 8
+const K_TABLE: u32 = 9
+const K_TROW: u32 = 10
+const K_TCELL: u32 = 11
+const K_TEXT: u32 = 16
+const K_SOFTBREAK: u32 = 17
+const K_HARDBREAK: u32 = 18
+const K_CODE: u32 = 19
+const K_EMPH: u32 = 20
+const K_STRONG: u32 = 21
+const K_STRIKE: u32 = 22
+const K_LINK: u32 = 23
+const K_IMAGE: u32 = 24
+const K_HTML_INLINE: u32 = 25
+
+const HTML_IGNORE: u32 = 0
+const HTML_ESCAPE: u32 = 1
+const HTML_RAW: u32 = 2
+
+const ALIGN_NONE: i64 = 0
+const ALIGN_LEFT: i64 = 1
+const ALIGN_CENTER: i64 = 2
+const ALIGN_RIGHT: i64 = 3
+
+// What the parser is asked to do.
+//   html      HTML_IGNORE (default), HTML_ESCAPE (tags become literal text),
+//             HTML_RAW (nodes kept as they are; trusted input only)
+//   tables    GFM pipe tables
+//   strike    GFM ~~strikethrough~~
+//   autolink  GFM bare URLs (http://, https://, www.) become links
+//   tasks     GFM task list items `- [ ]` / `- [x]`
+struct Opts {
+    html: u32,
+    tables: bool,
+    strike: bool,
+    autolink: bool,
+    tasks: bool,
+}
+
+// The default: what GitHub and Modrinth descriptions need.
+fn opts_default() -> Opts {
+    return Opts { html: HTML_IGNORE, tables: true, strike: true, autolink: true, tasks: true }
+}
+
+// Plain CommonMark with raw HTML kept: what the spec examples are written for.
+fn opts_commonmark() -> Opts {
+    return Opts { html: HTML_RAW, tables: false, strike: false, autolink: false, tasks: false }
+}
+
+struct Node {
+    kind: u32,
+    parent: u32,
+    first: u32,
+    last: u32,
+    next: u32,
+    prev: u32,
+    a: i64,
+    b: i64,
+    c: i64,
+    txt: u32,
+    txt_n: u32,
+    url: u32,
+    url_n: u32,
+    tit: u32,
+    tit_n: u32,
+    // parse time only
+    open: bool,
+    blank_end: bool,
+    x1: i64,
+    x2: i64,
+    x3: i64,
+}
+
+// A link reference definition: label (normalised), destination, title.
+struct Ref {
+    lab: u32,
+    lab_n: u32,
+    url: u32,
+    url_n: u32,
+    tit: u32,
+    tit_n: u32,
+}
+
+struct Slice {
+    p: u64,
+    n: usize,
+}
+
+struct Doc {
+    nodes: Vec[Node],
+    pool: rt.Buf,
+    refs: Vec[Ref],
+    opts: Opts,
+}
+
+fn doc_new(o: Opts) -> Doc {
+    var d: Doc = Doc { nodes: vec_new[Node](), pool: rt.buf_new(), refs: vec_new[Ref](), opts: o }
+    // node 0 is the document
+    let r: u32 = node_new(&d, K_DOC)
+    return d
+}
+
+fn doc_free(d: *mut Doc) {
+    vec_free[Node](&(*d).nodes)
+    vec_free[Ref](&(*d).refs)
+    rt.buf_free(&(*d).pool)
+}
+
+fn doc_root(d: *mut Doc) -> u32 {
+    return 0 as u32
+}
+
+fn doc_count(d: *mut Doc) -> usize {
+    return vec_len[Node](&(*d).nodes)
+}
+
+fn doc_opts(d: *mut Doc) -> Opts {
+    return (*d).opts
+}
+
+// A new, unlinked node.
+fn node_new(d: *mut Doc, kind: u32) -> u32 {
+    let i: u32 = vec_len[Node](&(*d).nodes) as u32
+    vec_push[Node](&(*d).nodes, Node { kind: kind, parent: NIL, first: NIL, last: NIL,
+        next: NIL, prev: NIL, a: 0, b: 0, c: 0, txt: 0 as u32, txt_n: 0 as u32,
+        url: 0 as u32, url_n: 0 as u32, tit: 0 as u32, tit_n: 0 as u32,
+        open: false, blank_end: false, x1: 0, x2: 0, x3: 0 })
+    return i
+}
+
+// The node's record. The pointer is only good until the next node_new.
+fn node_at(d: *mut Doc, n: u32) -> *mut Node {
+    return vec_elem_ptr[Node](&(*d).nodes, n as usize)
+}
+
+fn node_kind(d: *mut Doc, n: u32) -> u32 { return (*node_at(d, n)).kind }
+fn node_parent(d: *mut Doc, n: u32) -> u32 { return (*node_at(d, n)).parent }
+fn node_first(d: *mut Doc, n: u32) -> u32 { return (*node_at(d, n)).first }
+fn node_last(d: *mut Doc, n: u32) -> u32 { return (*node_at(d, n)).last }
+fn node_next(d: *mut Doc, n: u32) -> u32 { return (*node_at(d, n)).next }
+fn node_prev(d: *mut Doc, n: u32) -> u32 { return (*node_at(d, n)).prev }
+fn node_a(d: *mut Doc, n: u32) -> i64 { return (*node_at(d, n)).a }
+fn node_b(d: *mut Doc, n: u32) -> i64 { return (*node_at(d, n)).b }
+fn node_c(d: *mut Doc, n: u32) -> i64 { return (*node_at(d, n)).c }
+
+fn node_is_block(d: *mut Doc, n: u32) -> bool {
+    return node_kind(d, n) < K_TEXT
+}
+
+fn node_child_count(d: *mut Doc, n: u32) -> usize {
+    var k: usize = 0
+    var c: u32 = node_first(d, n)
+    while c != NIL {
+        k = k + 1
+        c = node_next(d, c)
+    }
+    return k
+}
+
+// ----------------------------------------------------------------- the pool
+
+fn pool_len(d: *mut Doc) -> usize {
+    return rt.buf_len(&(*d).pool)
+}
+
+fn pool_ptr(d: *mut Doc) -> u64 {
+    return rt.buf_ptr(&(*d).pool)
+}
+
+// Copy `n` octets from address `p` into the pool; the offset they got.
+fn pool_add(d: *mut Doc, p: u64, n: usize) -> u32 {
+    let off: usize = rt.buf_len(&(*d).pool)
+    rt.buf_push_bytes(&(*d).pool, p, n)
+    return off as u32
+}
+
+fn set_text(d: *mut Doc, n: u32, p: u64, len: usize) {
+    let off: u32 = pool_add(d, p, len)
+    let q: *mut Node = node_at(d, n)
+    (*q).txt = off
+    (*q).txt_n = len as u32
+}
+
+fn set_text_slice(d: *mut Doc, n: u32, off: u32, len: u32) {
+    let q: *mut Node = node_at(d, n)
+    (*q).txt = off
+    (*q).txt_n = len
+}
+
+fn set_url(d: *mut Doc, n: u32, p: u64, len: usize) {
+    let off: u32 = pool_add(d, p, len)
+    let q: *mut Node = node_at(d, n)
+    (*q).url = off
+    (*q).url_n = len as u32
+}
+
+fn set_title(d: *mut Doc, n: u32, p: u64, len: usize) {
+    let off: u32 = pool_add(d, p, len)
+    let q: *mut Node = node_at(d, n)
+    (*q).tit = off
+    (*q).tit_n = len as u32
+}
+
+fn node_text(d: *mut Doc, n: u32) -> Slice {
+    let q: *mut Node = node_at(d, n)
+    return Slice { p: pool_ptr(d) + ((*q).txt as u64), n: (*q).txt_n as usize }
+}
+
+fn node_url(d: *mut Doc, n: u32) -> Slice {
+    let q: *mut Node = node_at(d, n)
+    return Slice { p: pool_ptr(d) + ((*q).url as u64), n: (*q).url_n as usize }
+}
+
+fn node_title(d: *mut Doc, n: u32) -> Slice {
+    let q: *mut Node = node_at(d, n)
+    return Slice { p: pool_ptr(d) + ((*q).tit as u64), n: (*q).tit_n as usize }
+}
+
+fn slice_eq(a: Slice, s: str) -> bool {
+    if a.n != s.n {
+        return false
+    }
+    return rt.mem_eq(a.p, s.p as u64, a.n)
+}
+
+// ------------------------------------------------------------ tree surgery
+
+fn unlink(d: *mut Doc, n: u32) {
+    let q: *mut Node = node_at(d, n)
+    let par: u32 = (*q).parent
+    let pv: u32 = (*q).prev
+    let nx: u32 = (*q).next
+    if pv != NIL {
+        (*node_at(d, pv)).next = nx
+    } else if par != NIL {
+        (*node_at(d, par)).first = nx
+    }
+    if nx != NIL {
+        (*node_at(d, nx)).prev = pv
+    } else if par != NIL {
+        (*node_at(d, par)).last = pv
+    }
+    (*q).parent = NIL
+    (*q).prev = NIL
+    (*q).next = NIL
+}
+
+fn append_child(d: *mut Doc, parent: u32, child: u32) {
+    unlink(d, child)
+    let last: u32 = (*node_at(d, parent)).last
+    let c: *mut Node = node_at(d, child)
+    (*c).parent = parent
+    (*c).prev = last
+    (*c).next = NIL
+    if last != NIL {
+        (*node_at(d, last)).next = child
+    } else {
+        (*node_at(d, parent)).first = child
+    }
+    (*node_at(d, parent)).last = child
+}
+
+fn insert_after(d: *mut Doc, at: u32, n: u32) {
+    unlink(d, n)
+    let par: u32 = (*node_at(d, at)).parent
+    let nx: u32 = (*node_at(d, at)).next
+    let q: *mut Node = node_at(d, n)
+    (*q).parent = par
+    (*q).prev = at
+    (*q).next = nx
+    (*node_at(d, at)).next = n
+    if nx != NIL {
+        (*node_at(d, nx)).prev = n
+    } else if par != NIL {
+        (*node_at(d, par)).last = n
+    }
+}
+
+fn insert_before(d: *mut Doc, at: u32, n: u32) {
+    unlink(d, n)
+    let par: u32 = (*node_at(d, at)).parent
+    let pv: u32 = (*node_at(d, at)).prev
+    let q: *mut Node = node_at(d, n)
+    (*q).parent = par
+    (*q).next = at
+    (*q).prev = pv
+    (*node_at(d, at)).prev = n
+    if pv != NIL {
+        (*node_at(d, pv)).next = n
+    } else if par != NIL {
+        (*node_at(d, par)).first = n
+    }
+}
+
+// Move the siblings that follow `from` (exclusive) up to and including
+// `to`'s predecessor... simpler: move every sibling strictly between
+// `from` and `to` (both exclusive; to = NIL means "to the end") under `dst`.
+fn move_children(d: *mut Doc, from: u32, to: u32, dst: u32) {
+    var c: u32 = node_next(d, from)
+    while c != NIL && c != to {
+        let nx: u32 = node_next(d, c)
+        append_child(d, dst, c)
+        c = nx
+    }
+}
+
+// ------------------------------------------------------------- reference defs
+
+// Add a definition; the FIRST definition of a label wins (spec 4.7). The
+// label must already be normalised (scan.label_normalize).
+fn ref_add(d: *mut Doc, lab: u64, lab_n: usize, url: u64, url_n: usize,
+    tit: u64, tit_n: usize) {
+    if ref_find(d, lab, lab_n) != NIL {
+        return
+    }
+    let a: u32 = pool_add(d, lab, lab_n)
+    let b: u32 = pool_add(d, url, url_n)
+    let c: u32 = pool_add(d, tit, tit_n)
+    vec_push[Ref](&(*d).refs, Ref { lab: a, lab_n: lab_n as u32, url: b,
+        url_n: url_n as u32, tit: c, tit_n: tit_n as u32 })
+}
+
+// The index of the definition for a normalised label, NIL if none.
+fn ref_find(d: *mut Doc, lab: u64, lab_n: usize) -> u32 {
+    var i: usize = 0
+    let n: usize = vec_len[Ref](&(*d).refs)
+    while i < n {
+        let r: *mut Ref = vec_elem_ptr[Ref](&(*d).refs, i)
+        if (*r).lab_n as usize == lab_n
+            && rt.mem_eq(pool_ptr(d) + ((*r).lab as u64), lab, lab_n) {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NIL
+}
+
+fn kind_name(k: u32) -> str {
+    if k == K_DOC { return "document" }
+    if k == K_PARA { return "paragraph" }
+    if k == K_HEADING { return "heading" }
+    if k == K_THEMATIC { return "thematic_break" }
+    if k == K_CODE_BLOCK { return "code_block" }
+    if k == K_QUOTE { return "block_quote" }
+    if k == K_LIST { return "list" }
+    if k == K_ITEM { return "item" }
+    if k == K_HTML_BLOCK { return "html_block" }
+    if k == K_TABLE { return "table" }
+    if k == K_TROW { return "table_row" }
+    if k == K_TCELL { return "table_cell" }
+    if k == K_TEXT { return "text" }
+    if k == K_SOFTBREAK { return "softbreak" }
+    if k == K_HARDBREAK { return "linebreak" }
+    if k == K_CODE { return "code" }
+    if k == K_EMPH { return "emph" }
+    if k == K_STRONG { return "strong" }
+    if k == K_STRIKE { return "strike" }
+    if k == K_LINK { return "link" }
+    if k == K_IMAGE { return "image" }
+    if k == K_HTML_INLINE { return "html_inline" }
+    return "?"
+}

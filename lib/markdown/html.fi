@@ -1,0 +1,469 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/markdown/html.fi -- THE TREE AS HTML (and as a debugging dump).
+//
+// The output follows the reference renderer of CommonMark (commonmark.js):
+// the same line breaks, `<pre><code class="language-x">`, `<hr />`, tight
+// lists without `<p>`, text escaped as `& < > "`, link and image targets
+// percent-encoded the way `mdurl.encode` does. GFM adds `<table>` (alignment
+// as `style="text-align:..."`, the form markdown-it writes), `<del>` and
+// task list checkboxes.
+//
+// SAFE MODE (`safe = true`): a link or image whose target starts with
+// `javascript:`, `vbscript:`, `file:` or `data:` (images may use
+// data:image/png|gif|jpeg|webp) is written with an empty target. The spec
+// examples are checked with safe = false.
+import std.rt
+import markdown.scan
+import markdown.doc
+
+export { render, render_node, escape_into, dump }
+
+fn cr(out: *mut rt.Buf) {
+    let n: usize = rt.buf_len(out)
+    if n > 0 && rt.buf_at(out, n - 1) != 10 as u8 {
+        rt.buf_push(out, 10 as u8)
+    }
+}
+
+fn lit(out: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(out, s.p as u64, s.n)
+}
+
+// Append (p, n) with the four HTML specials replaced.
+fn escape_into(out: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 38 as u8 {
+            lit(out, "&amp;")
+        } else if c == 60 as u8 {
+            lit(out, "&lt;")
+        } else if c == 62 as u8 {
+            lit(out, "&gt;")
+        } else if c == 34 as u8 {
+            lit(out, "&quot;")
+        } else {
+            rt.buf_push(out, c)
+        }
+        i = i + 1
+    }
+}
+
+fn hexc(v: usize) -> u8 {
+    if v < 10 {
+        return (48 + v) as u8
+    }
+    return (55 + v) as u8
+}
+
+fn url_safe_char(c: u8) -> bool {
+    if scan.is_alnum(c) {
+        return true
+    }
+    // mdurl.encode's default `exclude` set: ;/?:@&=+$,-_.!~*'()#
+    return c == 59 as u8 || c == 47 as u8 || c == 63 as u8 || c == 58 as u8 || c == 64 as u8
+        || c == 38 as u8 || c == 61 as u8 || c == 43 as u8 || c == 36 as u8 || c == 44 as u8
+        || c == 45 as u8 || c == 95 as u8 || c == 46 as u8 || c == 33 as u8 || c == 126 as u8
+        || c == 42 as u8 || c == 39 as u8 || c == 40 as u8 || c == 41 as u8 || c == 35 as u8
+}
+
+// A link target for an attribute: percent-encoded, existing %XX kept, then
+// HTML-escaped.
+fn url_into(out: *mut rt.Buf, p: u64, n: usize) {
+    var enc: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 37 as u8 && i + 2 < n && scan.hex_val(rt.ld8(p, i + 1)) >= 0
+            && scan.hex_val(rt.ld8(p, i + 2)) >= 0 {
+            rt.buf_push(&enc, c)
+        } else if url_safe_char(c) {
+            rt.buf_push(&enc, c)
+        } else {
+            rt.buf_push(&enc, 37 as u8)
+            rt.buf_push(&enc, hexc((c as usize) >> 4))
+            rt.buf_push(&enc, hexc((c as usize) & 15))
+        }
+        i = i + 1
+    }
+    escape_into(out, rt.buf_ptr(&enc), rt.buf_len(&enc))
+    rt.buf_free(&enc)
+}
+
+fn unsafe_url(p: u64, n: usize, image: bool) -> bool {
+    var i: usize = 0
+    while i < n && scan.is_ws(rt.ld8(p, i)) {
+        i = i + 1
+    }
+    if scan.starts_with_ci(p, n, i, "javascript:") || scan.starts_with_ci(p, n, i, "vbscript:")
+        || scan.starts_with_ci(p, n, i, "file:") {
+        return true
+    }
+    if scan.starts_with_ci(p, n, i, "data:") {
+        if image && (scan.starts_with_ci(p, n, i, "data:image/png") || scan.starts_with_ci(p, n, i, "data:image/gif")
+            || scan.starts_with_ci(p, n, i, "data:image/jpeg") || scan.starts_with_ci(p, n, i, "data:image/webp")) {
+            return false
+        }
+        return true
+    }
+    return false
+}
+
+// The plain text of a subtree (the alt text of an image).
+fn plain_text(d: *mut doc.Doc, n: u32, out: *mut rt.Buf) {
+    var c: u32 = doc.node_first(d, n)
+    while c != doc.NIL {
+        let k: u32 = doc.node_kind(d, c)
+        if k == doc.K_TEXT || k == doc.K_CODE {
+            let t: doc.Slice = doc.node_text(d, c)
+            escape_into(out, t.p, t.n)
+        } else if k == doc.K_SOFTBREAK || k == doc.K_HARDBREAK {
+            rt.buf_push(out, 10 as u8)
+        } else if k == doc.K_IMAGE || k == doc.K_LINK || k == doc.K_EMPH || k == doc.K_STRONG
+            || k == doc.K_STRIKE {
+            plain_text(d, c, out)
+        }
+        c = doc.node_next(d, c)
+    }
+}
+
+fn render_children(d: *mut doc.Doc, n: u32, out: *mut rt.Buf, safe: bool) {
+    var c: u32 = doc.node_first(d, n)
+    while c != doc.NIL {
+        render_node(d, c, out, safe)
+        c = doc.node_next(d, c)
+    }
+}
+
+fn open_tag(out: *mut rt.Buf, t: str) {
+    rt.buf_push(out, 60 as u8)
+    lit(out, t)
+    rt.buf_push(out, 62 as u8)
+}
+
+fn close_tag(out: *mut rt.Buf, t: str) {
+    lit(out, "</")
+    lit(out, t)
+    rt.buf_push(out, 62 as u8)
+}
+
+fn heading_tag(level: i64, close: bool, out: *mut rt.Buf) {
+    if close {
+        lit(out, "</h")
+    } else {
+        lit(out, "<h")
+    }
+    rt.buf_push(out, (48 + level) as u8)
+    rt.buf_push(out, 62 as u8)
+}
+
+fn align_attr(out: *mut rt.Buf, a: i64) {
+    if a == doc.ALIGN_LEFT {
+        lit(out, " style=\"text-align:left\"")
+    } else if a == doc.ALIGN_CENTER {
+        lit(out, " style=\"text-align:center\"")
+    } else if a == doc.ALIGN_RIGHT {
+        lit(out, " style=\"text-align:right\"")
+    }
+}
+
+// The whole document into `out`.
+fn render(d: *mut doc.Doc, out: *mut rt.Buf, safe: bool) {
+    render_children(d, 0 as u32, out, safe)
+}
+
+fn render_node(d: *mut doc.Doc, n: u32, out: *mut rt.Buf, safe: bool) {
+    let k: u32 = doc.node_kind(d, n)
+    if k == doc.K_PARA {
+        let par: u32 = doc.node_parent(d, n)
+        var tight: bool = false
+        if par != doc.NIL && doc.node_kind(d, par) == doc.K_ITEM {
+            let gp: u32 = doc.node_parent(d, par)
+            if gp != doc.NIL && doc.node_kind(d, gp) == doc.K_LIST && doc.node_c(d, gp) == 1 as i64 {
+                tight = true
+            }
+        }
+        if tight {
+            render_children(d, n, out, safe)
+        } else {
+            cr(out)
+            open_tag(out, "p")
+            render_children(d, n, out, safe)
+            close_tag(out, "p")
+            cr(out)
+        }
+    } else if k == doc.K_HEADING {
+        cr(out)
+        heading_tag(doc.node_a(d, n), false, out)
+        render_children(d, n, out, safe)
+        heading_tag(doc.node_a(d, n), true, out)
+        cr(out)
+    } else if k == doc.K_THEMATIC {
+        cr(out)
+        lit(out, "<hr />")
+        cr(out)
+    } else if k == doc.K_CODE_BLOCK {
+        cr(out)
+        lit(out, "<pre><code")
+        let info: doc.Slice = doc.node_url(d, n)
+        if info.n > 0 {
+            // the language is the first word of the info string
+            var e: usize = 0
+            while e < info.n && !scan.is_ws(rt.ld8(info.p, e)) {
+                e = e + 1
+            }
+            lit(out, " class=\"language-")
+            escape_into(out, info.p, e)
+            lit(out, "\"")
+        }
+        rt.buf_push(out, 62 as u8)
+        let t: doc.Slice = doc.node_text(d, n)
+        escape_into(out, t.p, t.n)
+        lit(out, "</code></pre>")
+        cr(out)
+    } else if k == doc.K_QUOTE {
+        cr(out)
+        open_tag(out, "blockquote")
+        cr(out)
+        render_children(d, n, out, safe)
+        cr(out)
+        close_tag(out, "blockquote")
+        cr(out)
+    } else if k == doc.K_LIST {
+        cr(out)
+        if doc.node_b(d, n) == 1 as i64 {
+            lit(out, "<ol")
+            if doc.node_a(d, n) != 1 as i64 {
+                lit(out, " start=\"")
+                rt.buf_push_dec_i64(out, doc.node_a(d, n))
+                lit(out, "\"")
+            }
+            lit(out, ">")
+        } else {
+            open_tag(out, "ul")
+        }
+        cr(out)
+        render_children(d, n, out, safe)
+        cr(out)
+        if doc.node_b(d, n) == 1 as i64 {
+            close_tag(out, "ol")
+        } else {
+            close_tag(out, "ul")
+        }
+        cr(out)
+    } else if k == doc.K_ITEM {
+        open_tag(out, "li")
+        let ts: i64 = doc.node_a(d, n)
+        if ts == 1 as i64 {
+            lit(out, "<input type=\"checkbox\" disabled=\"\" /> ")
+        } else if ts == 2 as i64 {
+            lit(out, "<input type=\"checkbox\" checked=\"\" disabled=\"\" /> ")
+        }
+        render_children(d, n, out, safe)
+        close_tag(out, "li")
+        cr(out)
+    } else if k == doc.K_HTML_BLOCK {
+        cr(out)
+        let t: doc.Slice = doc.node_text(d, n)
+        rt.buf_push_bytes(out, t.p, t.n)
+        cr(out)
+    } else if k == doc.K_TABLE {
+        cr(out)
+        open_tag(out, "table")
+        cr(out)
+        var row: u32 = doc.node_first(d, n)
+        var in_body: bool = false
+        while row != doc.NIL {
+            if doc.node_b(d, row) == 1 as i64 {
+                open_tag(out, "thead")
+                cr(out)
+            } else if !in_body {
+                open_tag(out, "tbody")
+                cr(out)
+                in_body = true
+            }
+            open_tag(out, "tr")
+            cr(out)
+            var cell: u32 = doc.node_first(d, row)
+            while cell != doc.NIL {
+                var tag: str = "td"
+                if doc.node_b(d, row) == 1 as i64 {
+                    tag = "th"
+                }
+                rt.buf_push(out, 60 as u8)
+                lit(out, tag)
+                align_attr(out, doc.node_a(d, cell))
+                rt.buf_push(out, 62 as u8)
+                render_children(d, cell, out, safe)
+                close_tag(out, tag)
+                cr(out)
+                cell = doc.node_next(d, cell)
+            }
+            close_tag(out, "tr")
+            cr(out)
+            if doc.node_b(d, row) == 1 as i64 {
+                close_tag(out, "thead")
+                cr(out)
+            }
+            row = doc.node_next(d, row)
+        }
+        if in_body {
+            close_tag(out, "tbody")
+            cr(out)
+        }
+        close_tag(out, "table")
+        cr(out)
+    } else if k == doc.K_TEXT {
+        let t: doc.Slice = doc.node_text(d, n)
+        escape_into(out, t.p, t.n)
+    } else if k == doc.K_SOFTBREAK {
+        rt.buf_push(out, 10 as u8)
+    } else if k == doc.K_HARDBREAK {
+        lit(out, "<br />\n")
+    } else if k == doc.K_CODE {
+        open_tag(out, "code")
+        let t: doc.Slice = doc.node_text(d, n)
+        escape_into(out, t.p, t.n)
+        close_tag(out, "code")
+    } else if k == doc.K_EMPH {
+        open_tag(out, "em")
+        render_children(d, n, out, safe)
+        close_tag(out, "em")
+    } else if k == doc.K_STRONG {
+        open_tag(out, "strong")
+        render_children(d, n, out, safe)
+        close_tag(out, "strong")
+    } else if k == doc.K_STRIKE {
+        open_tag(out, "del")
+        render_children(d, n, out, safe)
+        close_tag(out, "del")
+    } else if k == doc.K_LINK {
+        let u: doc.Slice = doc.node_url(d, n)
+        lit(out, "<a href=\"")
+        if !(safe && unsafe_url(u.p, u.n, false)) {
+            url_into(out, u.p, u.n)
+        }
+        lit(out, "\"")
+        let t: doc.Slice = doc.node_title(d, n)
+        if t.n > 0 {
+            lit(out, " title=\"")
+            escape_into(out, t.p, t.n)
+            lit(out, "\"")
+        }
+        rt.buf_push(out, 62 as u8)
+        render_children(d, n, out, safe)
+        close_tag(out, "a")
+    } else if k == doc.K_IMAGE {
+        let u: doc.Slice = doc.node_url(d, n)
+        lit(out, "<img src=\"")
+        if !(safe && unsafe_url(u.p, u.n, true)) {
+            url_into(out, u.p, u.n)
+        }
+        lit(out, "\" alt=\"")
+        plain_text(d, n, out)
+        lit(out, "\"")
+        let t: doc.Slice = doc.node_title(d, n)
+        if t.n > 0 {
+            lit(out, " title=\"")
+            escape_into(out, t.p, t.n)
+            lit(out, "\"")
+        }
+        lit(out, " />")
+    } else if k == doc.K_HTML_INLINE {
+        let t: doc.Slice = doc.node_text(d, n)
+        rt.buf_push_bytes(out, t.p, t.n)
+    }
+}
+
+// ----------------------------------------------------------------- the dump
+
+fn dump_node(d: *mut doc.Doc, n: u32, depth: usize, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < depth {
+        lit(out, "  ")
+        i = i + 1
+    }
+    let k: u32 = doc.node_kind(d, n)
+    lit(out, doc.kind_name(k))
+    if k == doc.K_HEADING {
+        lit(out, " level=")
+        rt.buf_push_dec_i64(out, doc.node_a(d, n))
+    } else if k == doc.K_LIST {
+        if doc.node_b(d, n) == 1 as i64 {
+            lit(out, " ordered start=")
+            rt.buf_push_dec_i64(out, doc.node_a(d, n))
+        } else {
+            lit(out, " bullet")
+        }
+        if doc.node_c(d, n) == 1 as i64 {
+            lit(out, " tight")
+        } else {
+            lit(out, " loose")
+        }
+    } else if k == doc.K_ITEM {
+        if doc.node_a(d, n) == 1 as i64 {
+            lit(out, " task=open")
+        } else if doc.node_a(d, n) == 2 as i64 {
+            lit(out, " task=done")
+        }
+    } else if k == doc.K_TCELL {
+        if doc.node_a(d, n) == doc.ALIGN_LEFT {
+            lit(out, " left")
+        } else if doc.node_a(d, n) == doc.ALIGN_CENTER {
+            lit(out, " center")
+        } else if doc.node_a(d, n) == doc.ALIGN_RIGHT {
+            lit(out, " right")
+        }
+    } else if k == doc.K_TROW {
+        if doc.node_b(d, n) == 1 as i64 {
+            lit(out, " header")
+        }
+    }
+    if k == doc.K_TEXT || k == doc.K_CODE || k == doc.K_CODE_BLOCK || k == doc.K_HTML_BLOCK
+        || k == doc.K_HTML_INLINE {
+        lit(out, " \"")
+        let t: doc.Slice = doc.node_text(d, n)
+        var j: usize = 0
+        while j < t.n {
+            let c: u8 = rt.ld8(t.p, j)
+            if c == 10 as u8 {
+                lit(out, "\\n")
+            } else if c == 34 as u8 {
+                lit(out, "\\\"")
+            } else {
+                rt.buf_push(out, c)
+            }
+            j = j + 1
+        }
+        lit(out, "\"")
+    }
+    if k == doc.K_LINK || k == doc.K_IMAGE || k == doc.K_CODE_BLOCK {
+        let u: doc.Slice = doc.node_url(d, n)
+        if u.n > 0 {
+            if k == doc.K_CODE_BLOCK {
+                lit(out, " info=")
+            } else {
+                lit(out, " url=")
+            }
+            rt.buf_push_bytes(out, u.p, u.n)
+        }
+    }
+    if k == doc.K_LINK || k == doc.K_IMAGE {
+        let t: doc.Slice = doc.node_title(d, n)
+        if t.n > 0 {
+            lit(out, " title=")
+            rt.buf_push_bytes(out, t.p, t.n)
+        }
+    }
+    rt.buf_push(out, 10 as u8)
+    var c: u32 = doc.node_first(d, n)
+    while c != doc.NIL {
+        dump_node(d, c, depth + 1, out)
+        c = doc.node_next(d, c)
+    }
+}
+
+// An indented outline of the tree, one node per line (for tests and bug reports).
+fn dump(d: *mut doc.Doc, out: *mut rt.Buf) {
+    dump_node(d, 0 as u32, 0, out)
+}

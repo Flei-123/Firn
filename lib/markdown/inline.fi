@@ -1,0 +1,960 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/markdown/inline.fi -- THE INLINE PARSER.
+//
+// Turns the raw text of one block (a paragraph, a heading, a table cell)
+// into inline nodes under that block: text, soft and hard breaks, code
+// spans, emphasis, strong, GFM strikethrough, links (inline, reference,
+// autolinks, GFM bare URLs), images, and raw HTML as the options ask.
+//
+// THE ALGORITHM is the one CommonMark describes in its appendix (and
+// commonmark.js implements): one left-to-right scan that emits text and
+// pushes *delimiter runs* (`*`, `_`, `~`) and *brackets* (`[`, `![`) on two
+// stacks; a `]` looks back for its bracket and tries to complete a link;
+// `process_emphasis` then pairs the delimiters, nearest opener first, with
+// the "multiple of 3" rule and the `openers_bottom` memo that keeps it
+// linear in the common case. Delimiter entries are only MARKED dead (the
+// stack is a Vec, not a linked list), so a scan back skips them.
+import std.rt
+import std.vec
+import markdown.scan
+import markdown.doc
+
+export { inline_parse }
+
+struct Delim {
+    node: u32,
+    ch: u8,
+    cnt: usize,
+    orig: usize,
+    can_open: bool,
+    can_close: bool,
+    dead: bool,
+}
+
+struct Bracket {
+    node: u32,
+    image: bool,
+    active: bool,
+    dbottom: usize,
+    // source index just after the '[' (or '![')
+    pos: usize,
+}
+
+struct IP {
+    d: *mut doc.Doc,
+    s: u64,
+    n: usize,
+    pos: usize,
+    block: u32,
+    delims: Vec[Delim],
+    brs: Vec[Bracket],
+    dest: rt.Buf,
+    title: rt.Buf,
+    tmp: rt.Buf,
+    // an open HTML <a href> in HTML_IGNORE mode (a LINK node that has not
+    // taken its children yet), NIL if none
+    anchor: u32,
+}
+
+// Parse the inlines of the block `block` out of the text (p, n); the nodes
+// are appended under `block`. The text is a COPY owned by the caller.
+fn inline_parse(d: *mut doc.Doc, block: u32, p: u64, n: usize) {
+    var ip: IP = IP { d: d, s: p, n: n, pos: 0, block: block, delims: vec_new[Delim](),
+        brs: vec_new[Bracket](), dest: rt.buf_new(), title: rt.buf_new(),
+        tmp: rt.buf_new(), anchor: doc.NIL }
+    defer vec_free[Delim](&ip.delims)
+    defer vec_free[Bracket](&ip.brs)
+    defer rt.buf_free(&ip.dest)
+    defer rt.buf_free(&ip.title)
+    defer rt.buf_free(&ip.tmp)
+    while ip.pos < ip.n {
+        step(&ip)
+    }
+    process_emphasis(&ip, 0)
+    close_anchor(&ip)
+    merge_text(d, block, &ip.tmp)
+}
+
+// Neighbouring TEXT nodes become one (an unmatched `*`, an entity, a
+// bracket that did not make a link all leave pieces behind).
+fn merge_text(d: *mut doc.Doc, parent: u32, tmp: *mut rt.Buf) {
+    var c: u32 = doc.node_first(d, parent)
+    while c != doc.NIL {
+        let k: u32 = doc.node_kind(d, c)
+        if k == doc.K_TEXT {
+            var e: u32 = doc.node_next(d, c)
+            var cnt: usize = 1
+            while e != doc.NIL && doc.node_kind(d, e) == doc.K_TEXT {
+                cnt = cnt + 1
+                e = doc.node_next(d, e)
+            }
+            if cnt > 1 {
+                rt.buf_clear(tmp)
+                var x: u32 = c
+                while x != e {
+                    let t: doc.Slice = doc.node_text(d, x)
+                    rt.buf_push_bytes(tmp, t.p, t.n)
+                    x = doc.node_next(d, x)
+                }
+                doc.set_text(d, c, rt.buf_ptr(tmp), rt.buf_len(tmp))
+                x = doc.node_next(d, c)
+                while x != e {
+                    let nx: u32 = doc.node_next(d, x)
+                    doc.unlink(d, x)
+                    x = nx
+                }
+            }
+            c = e
+        } else {
+            if doc.node_first(d, c) != doc.NIL {
+                merge_text(d, c, tmp)
+            }
+            c = doc.node_next(d, c)
+        }
+    }
+}
+
+// ------------------------------------------------------------------ helpers
+
+// How deep inline nodes may nest (emphasis in emphasis in a link ...). Deeper
+// pairs stay literal text, so no reader needs unbounded recursion.
+const MAX_NEST: i64 = 64
+
+// The deepest nesting among the siblings strictly between `from` and `to`
+// (to = NIL: to the end); containers carry their depth in x3.
+fn depth_between(d: *mut doc.Doc, from: u32, to: u32) -> i64 {
+    var m: i64 = 0
+    var c: u32 = doc.node_next(d, from)
+    while c != doc.NIL && c != to {
+        let x: i64 = (*doc.node_at(d, c)).x3
+        if x > m {
+            m = x
+        }
+        c = doc.node_next(d, c)
+    }
+    return m
+}
+
+fn ch_at(ip: *mut IP, i: usize) -> u8 {
+    return rt.ld8((*ip).s, i)
+}
+
+fn add_node(ip: *mut IP, kind: u32) -> u32 {
+    let nd: u32 = doc.node_new((*ip).d, kind)
+    doc.append_child((*ip).d, (*ip).block, nd)
+    return nd
+}
+
+// A TEXT node of the octets s[a..b] (nothing if empty); its index or NIL.
+fn add_text(ip: *mut IP, a: usize, b: usize) -> u32 {
+    if b <= a {
+        return doc.NIL
+    }
+    let nd: u32 = add_node(ip, doc.K_TEXT)
+    doc.set_text((*ip).d, nd, (*ip).s + (a as u64), b - a)
+    return nd
+}
+
+fn add_text_buf(ip: *mut IP, bf: *mut rt.Buf) -> u32 {
+    let nd: u32 = add_node(ip, doc.K_TEXT)
+    doc.set_text((*ip).d, nd, rt.buf_ptr(bf), rt.buf_len(bf))
+    return nd
+}
+
+// The code point that ENDS just before index i (U+000A at the start).
+fn cp_before(ip: *mut IP, i: usize) -> u32 {
+    if i == 0 {
+        return 10 as u32
+    }
+    var k: usize = i - 1
+    var back: usize = 0
+    while k > 0 && back < 3 {
+        let c: u8 = ch_at(ip, k)
+        if c >= 128 as u8 && c < 192 as u8 {
+            k = k - 1
+            back = back + 1
+        } else {
+            break
+        }
+    }
+    return scan.cp_at((*ip).s, (*ip).n, k)
+}
+
+fn cp_after(ip: *mut IP, i: usize) -> u32 {
+    if i >= (*ip).n {
+        return 10 as u32
+    }
+    return scan.cp_at((*ip).s, (*ip).n, i)
+}
+
+// ------------------------------------------------------------------- the scan
+
+fn is_special(c: u8, strike: bool) -> bool {
+    return c == 10 as u8 || c == 92 as u8 || c == 96 as u8 || c == 42 as u8 || c == 95 as u8
+        || c == 91 as u8 || c == 93 as u8 || c == 33 as u8 || c == 60 as u8 || c == 38 as u8
+        || (strike && c == 126 as u8)
+}
+
+fn step(ip: *mut IP) {
+    let c: u8 = ch_at(ip, (*ip).pos)
+    let o: doc.Opts = doc.doc_opts((*ip).d)
+    if c == 10 as u8 {
+        newline(ip)
+        return
+    }
+    if c == 92 as u8 {
+        backslash(ip)
+        return
+    }
+    if c == 96 as u8 {
+        backticks(ip)
+        return
+    }
+    if c == 42 as u8 || c == 95 as u8 || (c == 126 as u8 && o.strike) {
+        delim_run(ip, c)
+        return
+    }
+    if c == 91 as u8 {
+        let nd: u32 = add_text(ip, (*ip).pos, (*ip).pos + 1)
+        vec_push[Bracket](&(*ip).brs, Bracket { node: nd, image: false, active: true,
+            dbottom: vec_len[Delim](&(*ip).delims), pos: (*ip).pos + 1 })
+        (*ip).pos = (*ip).pos + 1
+        return
+    }
+    if c == 33 as u8 {
+        if (*ip).pos + 1 < (*ip).n && ch_at(ip, (*ip).pos + 1) == 91 as u8 {
+            let nd: u32 = add_text(ip, (*ip).pos, (*ip).pos + 2)
+            vec_push[Bracket](&(*ip).brs, Bracket { node: nd, image: true, active: true,
+                dbottom: vec_len[Delim](&(*ip).delims), pos: (*ip).pos + 2 })
+            (*ip).pos = (*ip).pos + 2
+            return
+        }
+        let t: u32 = add_text(ip, (*ip).pos, (*ip).pos + 1)
+        (*ip).pos = (*ip).pos + 1
+        return
+    }
+    if c == 93 as u8 {
+        close_bracket(ip)
+        return
+    }
+    if c == 60 as u8 {
+        if angle(ip) {
+            return
+        }
+        let t: u32 = add_text(ip, (*ip).pos, (*ip).pos + 1)
+        (*ip).pos = (*ip).pos + 1
+        return
+    }
+    if c == 38 as u8 {
+        rt.buf_clear(&(*ip).tmp)
+        let l: usize = scan.entity_decode((*ip).s, (*ip).n, (*ip).pos, &(*ip).tmp)
+        if l > 0 {
+            let t: u32 = add_text_buf(ip, &(*ip).tmp)
+            (*ip).pos = (*ip).pos + l
+        } else {
+            let t: u32 = add_text(ip, (*ip).pos, (*ip).pos + 1)
+            (*ip).pos = (*ip).pos + 1
+        }
+        return
+    }
+    // a run of ordinary text (and, with the GFM option, a bare URL)
+    if o.autolink && autolink_at(ip) {
+        return
+    }
+    var e: usize = (*ip).pos + 1
+    while e < (*ip).n {
+        let d: u8 = ch_at(ip, e)
+        if is_special(d, o.strike) {
+            break
+        }
+        if o.autolink && (d == 104 as u8 || d == 119 as u8 || d == 72 as u8 || d == 87 as u8) {
+            // only where a URL could start: after whitespace or `*_~(`
+            let b: u8 = ch_at(ip, e - 1)
+            if scan.is_ws(b) || b == 42 as u8 || b == 95 as u8 || b == 126 as u8 || b == 40 as u8 {
+                break
+            }
+        }
+        e = e + 1
+    }
+    // a text run that ends at a line end loses its trailing spaces (they
+    // belong to the break) -- newline() decides hard or soft
+    var b: usize = e
+    if e < (*ip).n && ch_at(ip, e) == 10 as u8 {
+        while b > (*ip).pos && ch_at(ip, b - 1) == 32 as u8 {
+            b = b - 1
+        }
+    }
+    let t: u32 = add_text(ip, (*ip).pos, b)
+    // the trailing spaces (b < e) are dropped here; newline() counts them
+    // back in the source
+    (*ip).pos = e
+}
+
+// A line end: a hard break after two or more spaces (counted back in the
+// source), a soft break otherwise; the spaces of the next line are skipped.
+fn newline(ip: *mut IP) {
+    var sp: usize = 0
+    var k: usize = (*ip).pos
+    while k > 0 && ch_at(ip, k - 1) == 32 as u8 {
+        sp = sp + 1
+        k = k - 1
+    }
+    if sp >= 2 {
+        let h: u32 = add_node(ip, doc.K_HARDBREAK)
+    } else {
+        let h: u32 = add_node(ip, doc.K_SOFTBREAK)
+    }
+    (*ip).pos = (*ip).pos + 1
+    while (*ip).pos < (*ip).n && scan.is_space(ch_at(ip, (*ip).pos)) {
+        (*ip).pos = (*ip).pos + 1
+    }
+}
+
+fn backslash(ip: *mut IP) {
+    let i: usize = (*ip).pos
+    if i + 1 < (*ip).n {
+        let d: u8 = ch_at(ip, i + 1)
+        if d == 10 as u8 {
+            let h: u32 = add_node(ip, doc.K_HARDBREAK)
+            (*ip).pos = i + 2
+            while (*ip).pos < (*ip).n && scan.is_space(ch_at(ip, (*ip).pos)) {
+                (*ip).pos = (*ip).pos + 1
+            }
+            return
+        }
+        if scan.is_punct(d) {
+            let t: u32 = add_text(ip, i + 1, i + 2)
+            (*ip).pos = i + 2
+            return
+        }
+    }
+    let t: u32 = add_text(ip, i, i + 1)
+    (*ip).pos = i + 1
+}
+
+// A code span: a run of N backticks to the next run of exactly N.
+fn backticks(ip: *mut IP) {
+    let i: usize = (*ip).pos
+    var e: usize = i
+    while e < (*ip).n && ch_at(ip, e) == 96 as u8 {
+        e = e + 1
+    }
+    let run: usize = e - i
+    var k: usize = e
+    while k < (*ip).n {
+        if ch_at(ip, k) == 96 as u8 {
+            var m: usize = k
+            while m < (*ip).n && ch_at(ip, m) == 96 as u8 {
+                m = m + 1
+            }
+            if m - k == run {
+                // content s[e..k]: line endings become spaces
+                rt.buf_clear(&(*ip).tmp)
+                var q: usize = e
+                while q < k {
+                    var c: u8 = ch_at(ip, q)
+                    if c == 10 as u8 {
+                        c = 32 as u8
+                    }
+                    rt.buf_push(&(*ip).tmp, c)
+                    q = q + 1
+                }
+                var start: usize = 0
+                var len: usize = rt.buf_len(&(*ip).tmp)
+                // one space is stripped from both ends when both are there
+                // and the span is not all spaces
+                if len >= 2 && rt.buf_at(&(*ip).tmp, 0) == 32 as u8
+                    && rt.buf_at(&(*ip).tmp, len - 1) == 32 as u8 {
+                    var allsp: bool = true
+                    var z: usize = 0
+                    while z < len {
+                        if rt.buf_at(&(*ip).tmp, z) != 32 as u8 {
+                            allsp = false
+                            break
+                        }
+                        z = z + 1
+                    }
+                    if !allsp {
+                        start = 1
+                        len = len - 2
+                    }
+                }
+                let nd: u32 = add_node(ip, doc.K_CODE)
+                doc.set_text((*ip).d, nd, rt.buf_ptr(&(*ip).tmp) + (start as u64), len)
+                (*ip).pos = m
+                return
+            }
+            k = m
+        } else {
+            k = k + 1
+        }
+    }
+    // no closer: the backticks are text
+    let t: u32 = add_text(ip, i, e)
+    (*ip).pos = e
+}
+
+// -------------------------------------------------------------- delimiters
+
+fn delim_run(ip: *mut IP, c: u8) {
+    let i: usize = (*ip).pos
+    var e: usize = i
+    while e < (*ip).n && ch_at(ip, e) == c {
+        e = e + 1
+    }
+    let run: usize = e - i
+    if c == 126 as u8 && run > 2 {
+        let t: u32 = add_text(ip, i, e)
+        (*ip).pos = e
+        return
+    }
+    let before: u32 = cp_before(ip, i)
+    let after: u32 = cp_after(ip, e)
+    let a_ws: bool = scan.is_uni_ws(after)
+    let a_p: bool = scan.is_uni_punct(after)
+    let b_ws: bool = scan.is_uni_ws(before)
+    let b_p: bool = scan.is_uni_punct(before)
+    let left: bool = !a_ws && (!a_p || b_ws || b_p)
+    let right: bool = !b_ws && (!b_p || a_ws || a_p)
+    var can_open: bool = left
+    var can_close: bool = right
+    if c == 95 as u8 {
+        can_open = left && (!right || b_p)
+        can_close = right && (!left || a_p)
+    }
+    let nd: u32 = add_text(ip, i, e)
+    vec_push[Delim](&(*ip).delims, Delim { node: nd, ch: c, cnt: run, orig: run,
+        can_open: can_open, can_close: can_close, dead: false })
+    (*ip).pos = e
+}
+
+fn class_of(c: u8) -> usize {
+    if c == 42 as u8 {
+        return 0
+    }
+    if c == 95 as u8 {
+        return 1
+    }
+    return 2
+}
+
+fn dp(ip: *mut IP, i: usize) -> *mut Delim {
+    return vec_elem_ptr[Delim](&(*ip).delims, i)
+}
+
+// Pair the delimiters above `bottom` and drop them from the stack.
+fn process_emphasis(ip: *mut IP, bottom: usize) {
+    var ob: [usize; 18] = [0; 18]
+    var q: usize = 0
+    while q < 18 {
+        ob[q] = bottom
+        q = q + 1
+    }
+    var ci: usize = bottom
+    while ci < vec_len[Delim](&(*ip).delims) {
+        let c: *mut Delim = dp(ip, ci)
+        if (*c).dead || !(*c).can_close {
+            ci = ci + 1
+            continue
+        }
+        var open_bit: usize = 0
+        if (*c).can_open {
+            open_bit = 1
+        }
+        let key: usize = class_of((*c).ch) * 6 + ((*c).orig % 3) * 2 + open_bit
+        let lim: usize = ob[key]
+        var oi: usize = ci
+        var found: bool = false
+        while oi > lim {
+            oi = oi - 1
+            let op: *mut Delim = dp(ip, oi)
+            if (*op).dead || (*op).ch != (*c).ch || !(*op).can_open {
+                continue
+            }
+            var odd: bool = false
+            if (*c).ch != 126 as u8 {
+                odd = ((*c).can_open || (*op).can_close) && (*c).orig % 3 != 0
+                    && ((*op).orig + (*c).orig) % 3 == 0
+            }
+            if !odd {
+                found = true
+                break
+            }
+        }
+        if !found {
+            ob[key] = ci
+            if !(*c).can_open {
+                (*c).dead = true
+            }
+            ci = ci + 1
+            continue
+        }
+        let op: *mut Delim = dp(ip, oi)
+        let nest: i64 = depth_between((*ip).d, (*op).node, (*c).node) + 1
+        if nest > MAX_NEST {
+            // too deep: the opener stays literal, the closer is given up
+            ob[key] = ci
+            (*c).dead = true
+            ci = ci + 1
+            continue
+        }
+        var use: usize = 1
+        if (*c).cnt >= 2 && (*op).cnt >= 2 {
+            use = 2
+        }
+        var kind: u32 = doc.K_EMPH
+        if (*c).ch == 126 as u8 {
+            kind = doc.K_STRIKE
+        } else if use == 2 {
+            kind = doc.K_STRONG
+        }
+        let em: u32 = doc.node_new((*ip).d, kind)
+        (*doc.node_at((*ip).d, em)).x3 = nest
+        let onode: u32 = (*op).node
+        let cnode: u32 = (*c).node
+        doc.move_children((*ip).d, onode, cnode, em)
+        doc.insert_after((*ip).d, onode, em)
+        // shrink the two text nodes
+        (*op).cnt = (*op).cnt - use
+        (*c).cnt = (*c).cnt - use
+        let on: *mut doc.Node = doc.node_at((*ip).d, onode)
+        (*on).txt_n = (*on).txt_n - (use as u32)
+        let cn: *mut doc.Node = doc.node_at((*ip).d, cnode)
+        (*cn).txt = (*cn).txt + (use as u32)
+        (*cn).txt_n = (*cn).txt_n - (use as u32)
+        // everything between opener and closer is out of play
+        var z: usize = oi + 1
+        while z < ci {
+            (*dp(ip, z)).dead = true
+            z = z + 1
+        }
+        if (*op).cnt == 0 {
+            doc.unlink((*ip).d, onode)
+            (*op).dead = true
+        }
+        if (*c).cnt == 0 {
+            doc.unlink((*ip).d, cnode)
+            (*c).dead = true
+            ci = ci + 1
+        }
+    }
+    // the stack above `bottom` is gone
+    vec_shorten[Delim](&(*ip).delims, bottom)
+}
+
+// ---------------------------------------------------------------- brackets
+
+fn bp(ip: *mut IP, i: usize) -> *mut Bracket {
+    return vec_elem_ptr[Bracket](&(*ip).brs, i)
+}
+
+fn pop_bracket(ip: *mut IP) {
+    vec_shorten[Bracket](&(*ip).brs, vec_len[Bracket](&(*ip).brs) - 1)
+}
+
+// Is there a `[` or `]` (unescaped) in s[a..b]?
+fn has_bracket(ip: *mut IP, a: usize, b: usize) -> bool {
+    var i: usize = a
+    while i < b {
+        let c: u8 = ch_at(ip, i)
+        if c == 92 as u8 && i + 1 < b {
+            i = i + 2
+            continue
+        }
+        if c == 91 as u8 || c == 93 as u8 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn close_bracket(ip: *mut IP) {
+    let start: usize = (*ip).pos
+    let after: usize = start + 1
+    let nb: usize = vec_len[Bracket](&(*ip).brs)
+    if nb == 0 {
+        let t: u32 = add_text(ip, start, after)
+        (*ip).pos = after
+        return
+    }
+    let op: *mut Bracket = bp(ip, nb - 1)
+    if !(*op).active {
+        pop_bracket(ip)
+        let t: u32 = add_text(ip, start, after)
+        (*ip).pos = after
+        return
+    }
+    let is_image: bool = (*op).image
+    let onode: u32 = (*op).node
+    let dbottom: usize = (*op).dbottom
+    let open_pos: usize = (*op).pos
+    rt.buf_clear(&(*ip).dest)
+    rt.buf_clear(&(*ip).title)
+    var matched: bool = false
+    var have_title: bool = false
+    var next: usize = after
+    // 1. inline link: ( dest "title" )
+    if after < (*ip).n && ch_at(ip, after) == 40 as u8 {
+        var k: usize = scan.skip_ws((*ip).s, (*ip).n, after + 1)
+        var ok: bool = true
+        let dk: usize = scan.scan_dest((*ip).s, (*ip).n, k, &(*ip).dest)
+        if dk == scan.NOPOS {
+            ok = false
+        } else {
+            let t0: usize = scan.skip_ws((*ip).s, (*ip).n, dk)
+            k = dk
+            if t0 > dk && t0 < (*ip).n
+                && (ch_at(ip, t0) == 34 as u8 || ch_at(ip, t0) == 39 as u8 || ch_at(ip, t0) == 40 as u8) {
+                let tk: usize = scan.scan_title((*ip).s, (*ip).n, t0, &(*ip).title)
+                if tk == scan.NOPOS {
+                    ok = false
+                } else {
+                    have_title = true
+                    k = scan.skip_ws((*ip).s, (*ip).n, tk)
+                }
+            } else {
+                k = t0
+            }
+            if ok && (k >= (*ip).n || ch_at(ip, k) != 41 as u8) {
+                ok = false
+            }
+        }
+        if ok {
+            matched = true
+            next = k + 1
+        } else {
+            rt.buf_clear(&(*ip).dest)
+            rt.buf_clear(&(*ip).title)
+            have_title = false
+        }
+    }
+    // 2. reference link: [text][label], [text][], [text]
+    if !matched {
+        var rl_a: usize = 0
+        var rl_b: usize = 0
+        var have_label: bool = false
+        var lend: usize = after
+        if after < (*ip).n && ch_at(ip, after) == 91 as u8 {
+            let le: usize = scan.scan_label((*ip).s, (*ip).n, after)
+            if le != scan.NOPOS && le - after > 2 {
+                rl_a = after + 1
+                rl_b = le - 1
+                have_label = true
+                lend = le
+            } else if le != scan.NOPOS {
+                // `[]`: collapsed, the text is the label
+                lend = le
+                if !has_bracket(ip, open_pos, start) {
+                    rl_a = open_pos
+                    rl_b = start
+                    have_label = true
+                }
+            }
+        } else if !has_bracket(ip, open_pos, start) {
+            rl_a = open_pos
+            rl_b = start
+            have_label = true
+        }
+        if have_label {
+            rt.buf_clear(&(*ip).tmp)
+            scan.label_normalize((*ip).s + (rl_a as u64), rl_b - rl_a, &(*ip).tmp)
+            if rt.buf_len(&(*ip).tmp) > 0 {
+                let ri: u32 = doc.ref_find((*ip).d, rt.buf_ptr(&(*ip).tmp), rt.buf_len(&(*ip).tmp))
+                if ri != doc.NIL {
+                    let r: *mut doc.Ref = vec_elem_ptr[doc.Ref](&(*(*ip).d).refs, ri as usize)
+                    let pp: u64 = doc.pool_ptr((*ip).d)
+                    rt.buf_push_bytes(&(*ip).dest, pp + ((*r).url as u64), (*r).url_n as usize)
+                    rt.buf_push_bytes(&(*ip).title, pp + ((*r).tit as u64), (*r).tit_n as usize)
+                    have_title = (*r).tit_n > 0 as u32
+                    matched = true
+                    next = lend
+                }
+            }
+        }
+    }
+    let lnest: i64 = depth_between((*ip).d, onode, doc.NIL) + 1
+    if matched && lnest > MAX_NEST {
+        matched = false
+    }
+    if !matched {
+        pop_bracket(ip)
+        let t: u32 = add_text(ip, start, after)
+        (*ip).pos = after
+        return
+    }
+    // a link or an image: the nodes after the opener become its children
+    var kind: u32 = doc.K_LINK
+    if is_image {
+        kind = doc.K_IMAGE
+    }
+    let ln: u32 = doc.node_new((*ip).d, kind)
+    (*doc.node_at((*ip).d, ln)).x3 = lnest
+    doc.move_children((*ip).d, onode, doc.NIL, ln)
+    doc.append_child((*ip).d, (*ip).block, ln)
+    doc.set_url((*ip).d, ln, rt.buf_ptr(&(*ip).dest), rt.buf_len(&(*ip).dest))
+    if have_title {
+        doc.set_title((*ip).d, ln, rt.buf_ptr(&(*ip).title), rt.buf_len(&(*ip).title))
+    }
+    // the opener's own text node goes
+    doc.unlink((*ip).d, onode)
+    process_emphasis(ip, dbottom)
+    pop_bracket(ip)
+    if !is_image {
+        // a link cannot hold a link: every earlier `[` is switched off
+        var z: usize = 0
+        while z < vec_len[Bracket](&(*ip).brs) {
+            let b2: *mut Bracket = bp(ip, z)
+            if !(*b2).image {
+                (*b2).active = false
+            }
+            z = z + 1
+        }
+    }
+    (*ip).pos = next
+}
+
+// ------------------------------------------------- autolinks and raw HTML
+
+// '<' at pos: `<scheme:...>`, `<user@host>`, or an HTML construct. True when
+// something was consumed.
+fn angle(ip: *mut IP) -> bool {
+    let i: usize = (*ip).pos
+    let ul: usize = scan.uri_autolink_len((*ip).s, (*ip).n, i + 1)
+    if ul > 0 {
+        link_to(ip, i + 1, i + 1 + ul, false)
+        (*ip).pos = i + 2 + ul
+        return true
+    }
+    let el: usize = scan.email_autolink_len((*ip).s, (*ip).n, i + 1)
+    if el > 0 {
+        link_to(ip, i + 1, i + 1 + el, true)
+        (*ip).pos = i + 2 + el
+        return true
+    }
+    let hl: usize = scan.html_tag_len((*ip).s, (*ip).n, i)
+    if hl > 0 {
+        html_inline(ip, i, hl)
+        (*ip).pos = i + hl
+        return true
+    }
+    return false
+}
+
+// A LINK node whose text is s[a..b]; `mail` adds the mailto: prefix, `www`
+// (a GFM bare URL without a scheme) adds http://.
+fn link_to(ip: *mut IP, a: usize, b: usize, mail: bool) {
+    let ln: u32 = add_node(ip, doc.K_LINK)
+    rt.buf_clear(&(*ip).dest)
+    if mail {
+        rt.buf_push_bytes(&(*ip).dest, "mailto:".p as u64, 7)
+    }
+    rt.buf_push_bytes(&(*ip).dest, (*ip).s + (a as u64), b - a)
+    doc.set_url((*ip).d, ln, rt.buf_ptr(&(*ip).dest), rt.buf_len(&(*ip).dest))
+    let nd: u32 = doc.node_new((*ip).d, doc.K_TEXT)
+    doc.set_text((*ip).d, nd, (*ip).s + (a as u64), b - a)
+    doc.append_child((*ip).d, ln, nd)
+}
+
+fn html_inline(ip: *mut IP, a: usize, l: usize) {
+    let o: doc.Opts = doc.doc_opts((*ip).d)
+    if o.html == doc.HTML_RAW {
+        let nd: u32 = add_node(ip, doc.K_HTML_INLINE)
+        doc.set_text((*ip).d, nd, (*ip).s + (a as u64), l)
+        return
+    }
+    if o.html == doc.HTML_ESCAPE {
+        let t: u32 = add_text(ip, a, a + l)
+        return
+    }
+    // HTML_IGNORE: the tag disappears; <br>, <img> and <a> keep their sense
+    let p: u64 = (*ip).s
+    let n: usize = (*ip).n
+    if scan.starts_with_ci(p, a + l, a, "<br") && l >= 4 {
+        let c: u8 = rt.ld8(p, a + 3)
+        if c == 62 as u8 || c == 47 as u8 || scan.is_ws(c) {
+            let h: u32 = add_node(ip, doc.K_HARDBREAK)
+        }
+        return
+    }
+    if scan.starts_with_ci(p, a + l, a, "<img") && l >= 5 && (scan.is_ws(rt.ld8(p, a + 4)) || rt.ld8(p, a + 4) == 47 as u8) {
+        let im: u32 = add_node(ip, doc.K_IMAGE)
+        rt.buf_clear(&(*ip).dest)
+        if attr_value(p, a, a + l, "src", &(*ip).dest) {
+            doc.set_url((*ip).d, im, rt.buf_ptr(&(*ip).dest), rt.buf_len(&(*ip).dest))
+        }
+        rt.buf_clear(&(*ip).title)
+        if attr_value(p, a, a + l, "alt", &(*ip).title) {
+            let at: u32 = doc.node_new((*ip).d, doc.K_TEXT)
+            doc.set_text((*ip).d, at, rt.buf_ptr(&(*ip).title), rt.buf_len(&(*ip).title))
+            doc.append_child((*ip).d, im, at)
+        }
+        rt.buf_clear(&(*ip).title)
+        if attr_value(p, a, a + l, "title", &(*ip).title) {
+            doc.set_title((*ip).d, im, rt.buf_ptr(&(*ip).title), rt.buf_len(&(*ip).title))
+        }
+        return
+    }
+    if scan.starts_with_ci(p, a + l, a, "<a") && l >= 3 && scan.is_ws(rt.ld8(p, a + 2)) {
+        close_anchor(ip)
+        rt.buf_clear(&(*ip).dest)
+        if attr_value(p, a, a + l, "href", &(*ip).dest) {
+            let ln: u32 = add_node(ip, doc.K_LINK)
+            doc.set_url((*ip).d, ln, rt.buf_ptr(&(*ip).dest), rt.buf_len(&(*ip).dest))
+            (*ip).anchor = ln
+        }
+        return
+    }
+    if scan.starts_with_ci(p, a + l, a, "</a") {
+        close_anchor(ip)
+        return
+    }
+}
+
+// The siblings after the open <a> become its children.
+fn close_anchor(ip: *mut IP) {
+    if (*ip).anchor == doc.NIL {
+        return
+    }
+    let ln: u32 = (*ip).anchor
+    (*ip).anchor = doc.NIL
+    doc.move_children((*ip).d, ln, doc.NIL, ln)
+}
+
+// The value of attribute `name` inside the tag s[a..b], decoded into `out`.
+fn attr_value(p: u64, a: usize, b: usize, name: str, out: *mut rt.Buf) -> bool {
+    var i: usize = a + 1
+    // skip the tag name
+    while i < b && !scan.is_ws(rt.ld8(p, i)) && rt.ld8(p, i) != 62 as u8 && rt.ld8(p, i) != 47 as u8 {
+        i = i + 1
+    }
+    while i < b {
+        i = scan.skip_ws(p, b, i)
+        if i >= b || rt.ld8(p, i) == 62 as u8 || rt.ld8(p, i) == 47 as u8 {
+            if i < b && rt.ld8(p, i) == 47 as u8 {
+                i = i + 1
+                continue
+            }
+            return false
+        }
+        let n0: usize = i
+        while i < b && !scan.is_ws(rt.ld8(p, i)) && rt.ld8(p, i) != 61 as u8
+            && rt.ld8(p, i) != 62 as u8 && rt.ld8(p, i) != 47 as u8 {
+            i = i + 1
+        }
+        let n1: usize = i
+        i = scan.skip_ws(p, b, i)
+        var v0: usize = i
+        var v1: usize = i
+        var has_val: bool = false
+        if i < b && rt.ld8(p, i) == 61 as u8 {
+            i = scan.skip_ws(p, b, i + 1)
+            if i < b {
+                let q: u8 = rt.ld8(p, i)
+                if q == 34 as u8 || q == 39 as u8 {
+                    v0 = i + 1
+                    i = v0
+                    while i < b && rt.ld8(p, i) != q {
+                        i = i + 1
+                    }
+                    v1 = i
+                    i = i + 1
+                } else {
+                    v0 = i
+                    while i < b && !scan.is_ws(rt.ld8(p, i)) && rt.ld8(p, i) != 62 as u8 {
+                        i = i + 1
+                    }
+                    v1 = i
+                }
+                has_val = true
+            }
+        }
+        // does the name match?
+        if n1 - n0 == name.n && scan.starts_with_ci(p, b, n0, name) && has_val {
+            scan.unescape_into(p, v0, v1, out)
+            return true
+        }
+    }
+    return false
+}
+
+// GFM bare URLs: http://, https:// and www. -- at pos, only where a URL can
+// start (the caller's text run broke here). The URL runs to whitespace or
+// '<'; trailing punctuation and unmatched ')' are not part of it.
+fn autolink_at(ip: *mut IP) -> bool {
+    let i: usize = (*ip).pos
+    let p: u64 = (*ip).s
+    let n: usize = (*ip).n
+    if i > 0 {
+        let b: u8 = ch_at(ip, i - 1)
+        if !(scan.is_ws(b) || b == 42 as u8 || b == 95 as u8 || b == 126 as u8 || b == 40 as u8) {
+            return false
+        }
+    }
+    var www: bool = false
+    var skip: usize = 0
+    if scan.starts_with_ci(p, n, i, "https://") {
+        skip = 8
+    } else if scan.starts_with_ci(p, n, i, "http://") {
+        skip = 7
+    } else if scan.starts_with_ci(p, n, i, "www.") {
+        www = true
+        skip = 4
+    } else {
+        return false
+    }
+    var e: usize = i + skip
+    if e >= n || !scan.is_alnum(ch_at(ip, e)) {
+        return false
+    }
+    while e < n {
+        let c: u8 = ch_at(ip, e)
+        if scan.is_ws(c) || c == 60 as u8 {
+            break
+        }
+        e = e + 1
+    }
+    // trailing punctuation and unbalanced ')'
+    while e > i + skip {
+        let c: u8 = ch_at(ip, e - 1)
+        if c == 63 as u8 || c == 33 as u8 || c == 46 as u8 || c == 44 as u8 || c == 58 as u8
+            || c == 42 as u8 || c == 95 as u8 || c == 126 as u8 || c == 39 as u8 || c == 34 as u8
+            || c == 59 as u8 {
+            e = e - 1
+        } else if c == 41 as u8 {
+            var open: usize = 0
+            var close: usize = 0
+            var q: usize = i
+            while q < e {
+                if ch_at(ip, q) == 40 as u8 {
+                    open = open + 1
+                } else if ch_at(ip, q) == 41 as u8 {
+                    close = close + 1
+                }
+                q = q + 1
+            }
+            if close > open {
+                e = e - 1
+            } else {
+                break
+            }
+        } else {
+            break
+        }
+    }
+    if e <= i + skip {
+        return false
+    }
+    let ln: u32 = add_node(ip, doc.K_LINK)
+    rt.buf_clear(&(*ip).dest)
+    if www {
+        rt.buf_push_bytes(&(*ip).dest, "http://".p as u64, 7)
+    }
+    rt.buf_push_bytes(&(*ip).dest, p + (i as u64), e - i)
+    doc.set_url((*ip).d, ln, rt.buf_ptr(&(*ip).dest), rt.buf_len(&(*ip).dest))
+    let nd: u32 = doc.node_new((*ip).d, doc.K_TEXT)
+    doc.set_text((*ip).d, nd, p + (i as u64), e - i)
+    doc.append_child((*ip).d, ln, nd)
+    (*ip).pos = e
+    return true
+}
