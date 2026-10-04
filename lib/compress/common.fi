@@ -1,0 +1,581 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/compress/common.fi -- what the compression formats share: ONE error
+// set, an input source that is either memory or a file descriptor read in
+// chunks (`Source`), the helpers every decoder needs to keep a sliding window
+// in a growing buffer, and the checksums of the formats (xxHash32/64 for
+// zstd and lz4, CRC-64 for xz; CRC-32 and SHA-256 come from std).
+//
+// WHY ONE ERROR SET. Firn's `try` demands the same error set on both sides
+// and error set names are program-wide (SPEC 14.1 F2/F3), so every module of
+// lib/compress returns `CompressError` and the facade (`compress.auto`) can
+// pass them on with a plain `try`.
+//
+// STREAMING DESIGN (used by all decoders). A decoder is a state machine that
+// decodes ONE UNIT per step (a zstd block <= 128 KiB, an LZMA2 chunk <= 2 MiB,
+// a bzip2 block <= 900 KB, an LZ4 block <= 4 MiB, a brotli meta-block <= 16
+// MiB) from a `Source` into a growing output buffer. The whole-buffer API
+// loops over steps; the streaming API lets the caller drain the buffer
+// between steps and `buf_compact` keeps only the window the format may still
+// reach back into. Memory is therefore "window + one unit", never the whole
+// output. The input is never held as a whole either when the source is a file
+// descriptor: `src_take` hands out contiguous bytes from a 64 KiB refill
+// buffer (or a scratch copy when a unit straddles two reads).
+import std.rt
+import std.deflate
+import std.crypto.sha256
+
+export {
+    CompressError,
+    Source, src_mem, src_fd, src_free, src_byte, src_read, src_take, src_skip,
+    src_at_end, src_consumed, src_failed,
+    ld16le, ld32le, ld64le, st32le, st64le,
+    buf_compact, buf_ensure, buf_append_bytes,
+    Xxh32, xxh32_new, xxh32_update, xxh32_final, xxh32,
+    Xxh64, xxh64_new, xxh64_update, xxh64_final, xxh64,
+    Crc64, crc64_new, crc64_update, crc64_final, crc64,
+    crc32_of, crc32_update_of,
+    sha256_of,
+}
+
+error CompressError {
+    Data, // the stream contradicts its format
+    Format, // not the format (magic/header), or a header this reader does not take
+    Checksum, // a CRC / xxHash / SHA-256 does not match
+    Truncated, // the input ended in the middle of something
+    TooLarge, // more output than the caller allowed -- nothing beyond the limit is written
+    OutOfMemory,
+    Unsupported, // valid per the format, but beyond this reader (window above the cap, a filter we lack)
+    Dictionary, // a dictionary is required / does not match
+    Io, // the read from a file descriptor failed
+}
+
+// ====================================================================
+// SOURCE
+// ====================================================================
+
+const SRC_CHUNK: usize = 65536
+
+// Memory (`src_mem`) or a file descriptor (`src_fd`). `p`/`n`/`pos` describe
+// the CURRENT chunk; for memory that is everything.
+struct Source {
+    p: u64,
+    n: usize,
+    pos: usize,
+    fd: i64, // -1 = memory
+    own: u64, // the refill buffer of a descriptor source
+    scratch: rt.Buf, // a unit that straddles two refills (src_take)
+    eof: bool,
+    failed: bool,
+    before: u64, // octets of earlier chunks
+}
+
+fn src_mem(p: u64, n: usize) -> Source {
+    return Source { p: p, n: n, pos: 0, fd: -1, own: 0, scratch: rt.buf_new(),
+        eof: true, failed: false, before: 0 }
+}
+
+fn src_fd(fd: i64) -> Source {
+    let b: u64 = rt.heap_alloc(SRC_CHUNK)
+    var s: Source = Source { p: b, n: 0, pos: 0, fd: fd, own: b, scratch: rt.buf_new(),
+        eof: false, failed: false, before: 0 }
+    if b == 0 {
+        s.eof = true
+        s.failed = true
+    }
+    return s
+}
+
+fn src_free(s: *mut Source) {
+    if (*s).own != 0 {
+        rt.heap_free((*s).own, SRC_CHUNK)
+        (*s).own = 0
+    }
+    rt.buf_free(&(*s).scratch)
+    (*s).p = 0
+    (*s).n = 0
+    (*s).pos = 0
+    (*s).eof = true
+}
+
+// Did a read from the descriptor fail (as opposed to a clean end)?
+fn src_failed(s: *mut Source) -> bool {
+    return (*s).failed
+}
+
+// Next chunk; false at the end of the input. Only called with the current
+// chunk spent.
+fn src_refill(s: *mut Source) -> bool {
+    if (*s).eof || (*s).fd < 0 {
+        return false
+    }
+    while true {
+        let r: i64 = syscall(0, (*s).fd, (*s).own as i64, SRC_CHUNK as i64, 0, 0, 0)
+        if r == 0 - 4 {
+            continue // EINTR
+        }
+        if r < 0 {
+            (*s).eof = true
+            (*s).failed = true
+            return false
+        }
+        if r == 0 {
+            (*s).eof = true
+            return false
+        }
+        (*s).before = (*s).before + (*s).n as u64
+        (*s).p = (*s).own
+        (*s).n = r as usize
+        (*s).pos = 0
+        return true
+    }
+    return false
+}
+
+// One octet, or -1 at the end of the input.
+fn src_byte(s: *mut Source) -> i32 {
+    if (*s).pos < (*s).n {
+        let v: u8 = rt.ld8((*s).p, (*s).pos)
+        (*s).pos = (*s).pos + 1
+        return v as i32
+    }
+    if !src_refill(s) {
+        return -1
+    }
+    let v: u8 = rt.ld8((*s).p, 0)
+    (*s).pos = 1
+    return v as i32
+}
+
+// True when no octet is left (may read ahead one chunk of a descriptor).
+fn src_at_end(s: *mut Source) -> bool {
+    if (*s).pos < (*s).n {
+        return false
+    }
+    return !src_refill(s)
+}
+
+// Octets consumed so far.
+fn src_consumed(s: *mut Source) -> u64 {
+    return (*s).before + (*s).pos as u64
+}
+
+// Copies up to `want` octets to `dst`; fewer only at the end of the input.
+fn src_read(s: *mut Source, dst: u64, want: usize) -> usize {
+    var got: usize = 0
+    while got < want {
+        if (*s).pos >= (*s).n {
+            if !src_refill(s) {
+                return got
+            }
+        }
+        var k: usize = (*s).n - (*s).pos
+        if k > want - got {
+            k = want - got
+        }
+        rt.mem_copy(dst + got as u64, (*s).p + (*s).pos as u64, k)
+        (*s).pos = (*s).pos + k
+        got = got + k
+    }
+    return got
+}
+
+// Skips up to `want` octets; returns how many were skipped.
+fn src_skip(s: *mut Source, want: usize) -> usize {
+    var got: usize = 0
+    while got < want {
+        if (*s).pos >= (*s).n {
+            if !src_refill(s) {
+                return got
+            }
+        }
+        var k: usize = (*s).n - (*s).pos
+        if k > want - got {
+            k = want - got
+        }
+        (*s).pos = (*s).pos + k
+        got = got + k
+    }
+    return got
+}
+
+// `want` contiguous octets, or 0 when the input has fewer left. The pointer
+// is valid until the next call on this source. For memory it points INTO the
+// input (no copy); for a descriptor into the chunk or a scratch copy.
+fn src_take(s: *mut Source, want: usize) -> u64 {
+    if want == 0 {
+        return 1
+    }
+    if (*s).n - (*s).pos >= want {
+        let r: u64 = (*s).p + (*s).pos as u64
+        (*s).pos = (*s).pos + want
+        return r
+    }
+    if (*s).fd < 0 {
+        return 0
+    }
+    rt.buf_clear(&(*s).scratch)
+    rt.buf_reserve(&(*s).scratch, want)
+    if (*s).scratch.cap < want {
+        return 0
+    }
+    let got: usize = src_read(s, (*s).scratch.ptr, want)
+    if got < want {
+        return 0
+    }
+    (*s).scratch.len = want
+    return (*s).scratch.ptr
+}
+
+// ====================================================================
+// Little endian loads and stores at BYTE offsets (rt.ld32 indexes by words)
+// ====================================================================
+
+fn ld16le(p: u64, off: usize) -> u32 {
+    return (rt.ld8(p, off) as u32) | ((rt.ld8(p, off + 1) as u32) << 8)
+}
+
+fn ld32le(p: u64, off: usize) -> u32 {
+    return *((p + off as u64) as *mut u32)
+}
+
+fn ld64le(p: u64, off: usize) -> u64 {
+    return *((p + off as u64) as *mut u64)
+}
+
+fn st32le(p: u64, off: usize, v: u32) {
+    *((p + off as u64) as *mut u32) = v
+}
+
+fn st64le(p: u64, off: usize, v: u64) {
+    *((p + off as u64) as *mut u64) = v
+}
+
+// ====================================================================
+// Buffer helpers
+// ====================================================================
+
+// Makes room for `total` octets in all (not "additional"). false = no memory.
+fn buf_ensure(b: *mut rt.Buf, total: usize) -> bool {
+    if (*b).cap >= total {
+        return true
+    }
+    rt.buf_reserve(b, total)
+    return (*b).cap >= total
+}
+
+fn buf_append_bytes(b: *mut rt.Buf, p: u64, n: usize) -> bool {
+    if !buf_ensure(b, (*b).len + n) {
+        return false
+    }
+    rt.mem_copy((*b).ptr + (*b).len as u64, p, n)
+    (*b).len = (*b).len + n
+    return true
+}
+
+// Streaming: the first `drained` octets have been handed to the consumer.
+// Keeps the last `keep` octets of the buffer (the window a distance may still
+// reach) and moves them to the front. Returns how many octets were removed
+// from the front; the caller subtracts that from `drained` and from every
+// offset it keeps into the buffer. Does nothing when fewer than `keep`
+// octets are drained.
+fn buf_compact(b: *mut rt.Buf, drained: usize, keep: usize) -> usize {
+    if drained <= keep {
+        return 0
+    }
+    let cut: usize = drained - keep
+    let rest: usize = (*b).len - cut
+    // target < source: a forward copy is safe even though the ranges overlap
+    rt.mem_copy((*b).ptr, (*b).ptr + cut as u64, rest)
+    (*b).len = rest
+    return cut
+}
+
+// ====================================================================
+// xxHash32 / xxHash64 (Yann Collet, BSD-2-Clause; algorithm re-written)
+// ====================================================================
+
+const X32_P1: u32 = 0x9E3779B1
+const X32_P2: u32 = 0x85EBCA77
+const X32_P3: u32 = 0xC2B2AE3D
+const X32_P4: u32 = 0x27D4EB2F
+const X32_P5: u32 = 0x165667B1
+
+fn rotl32(x: u32, n: u32) -> u32 {
+    return (x << n) | (x >> (32 - n))
+}
+
+struct Xxh32 {
+    v1: u32, v2: u32, v3: u32, v4: u32,
+    total: u64,
+    mem: [u8; 16],
+    used: usize,
+    seed: u32,
+}
+
+fn xxh32_new(seed: u32) -> Xxh32 {
+    return Xxh32 { v1: seed +% X32_P1 +% X32_P2, v2: seed +% X32_P2, v3: seed,
+        v4: seed -% X32_P1, total: 0, mem: [0; 16], used: 0, seed: seed }
+}
+
+fn x32_round(acc: u32, lane: u32) -> u32 {
+    return rotl32(acc +% (lane *% X32_P2), 13) *% X32_P1
+}
+
+fn xxh32_update(s: *mut Xxh32, p: u64, n: usize) {
+    (*s).total = (*s).total + n as u64
+    var at: usize = 0
+    if (*s).used > 0 {
+        while at < n && (*s).used < 16 {
+            (*s).mem[(*s).used] = rt.ld8(p, at)
+            (*s).used = (*s).used + 1
+            at = at + 1
+        }
+        if (*s).used == 16 {
+            let m: u64 = (&(*s).mem[0]) as u64
+            (*s).v1 = x32_round((*s).v1, ld32le(m, 0))
+            (*s).v2 = x32_round((*s).v2, ld32le(m, 4))
+            (*s).v3 = x32_round((*s).v3, ld32le(m, 8))
+            (*s).v4 = x32_round((*s).v4, ld32le(m, 12))
+            (*s).used = 0
+        }
+    }
+    if n - at >= 16 {
+        var v1: u32 = (*s).v1
+        var v2: u32 = (*s).v2
+        var v3: u32 = (*s).v3
+        var v4: u32 = (*s).v4
+        while n - at >= 16 {
+            v1 = x32_round(v1, ld32le(p, at))
+            v2 = x32_round(v2, ld32le(p, at + 4))
+            v3 = x32_round(v3, ld32le(p, at + 8))
+            v4 = x32_round(v4, ld32le(p, at + 12))
+            at = at + 16
+        }
+        (*s).v1 = v1
+        (*s).v2 = v2
+        (*s).v3 = v3
+        (*s).v4 = v4
+    }
+    while at < n {
+        (*s).mem[(*s).used] = rt.ld8(p, at)
+        (*s).used = (*s).used + 1
+        at = at + 1
+    }
+}
+
+fn xxh32_final(s: *mut Xxh32) -> u32 {
+    var h: u32 = 0
+    if (*s).total >= 16 {
+        h = rotl32((*s).v1, 1) +% rotl32((*s).v2, 7) +% rotl32((*s).v3, 12) +% rotl32((*s).v4, 18)
+    } else {
+        h = (*s).seed +% X32_P5
+    }
+    h = h +% (((*s).total & 0xFFFFFFFF) as u32)
+    let m: u64 = (&(*s).mem[0]) as u64
+    var i: usize = 0
+    while i + 4 <= (*s).used {
+        h = rotl32(h +% (ld32le(m, i) *% X32_P3), 17) *% X32_P4
+        i = i + 4
+    }
+    while i < (*s).used {
+        h = rotl32(h +% ((rt.ld8(m, i) as u32) *% X32_P5), 11) *% X32_P1
+        i = i + 1
+    }
+    h = h ^ (h >> 15)
+    h = h *% X32_P2
+    h = h ^ (h >> 13)
+    h = h *% X32_P3
+    h = h ^ (h >> 16)
+    return h
+}
+
+fn xxh32(p: u64, n: usize, seed: u32) -> u32 {
+    var s: Xxh32 = xxh32_new(seed)
+    xxh32_update(&s, p, n)
+    return xxh32_final(&s)
+}
+
+const X64_P1: u64 = 0x9E3779B185EBCA87
+const X64_P2: u64 = 0xC2B2AE3D27D4EB4F
+const X64_P3: u64 = 0x165667B19E3779F9
+const X64_P4: u64 = 0x85EBCA77C2B2AE63
+const X64_P5: u64 = 0x27D4EB2F165667C5
+
+fn rotl64(x: u64, n: u64) -> u64 {
+    return (x << n) | (x >> (64 - n))
+}
+
+struct Xxh64 {
+    v1: u64, v2: u64, v3: u64, v4: u64,
+    total: u64,
+    mem: [u8; 32],
+    used: usize,
+    seed: u64,
+}
+
+fn xxh64_new(seed: u64) -> Xxh64 {
+    return Xxh64 { v1: seed +% X64_P1 +% X64_P2, v2: seed +% X64_P2, v3: seed,
+        v4: seed -% X64_P1, total: 0, mem: [0; 32], used: 0, seed: seed }
+}
+
+fn x64_round(acc: u64, lane: u64) -> u64 {
+    return rotl64(acc +% (lane *% X64_P2), 31) *% X64_P1
+}
+
+fn x64_merge(acc: u64, v: u64) -> u64 {
+    return ((acc ^ x64_round(0, v)) *% X64_P1) +% X64_P4
+}
+
+fn xxh64_update(s: *mut Xxh64, p: u64, n: usize) {
+    (*s).total = (*s).total + n as u64
+    var at: usize = 0
+    if (*s).used > 0 {
+        while at < n && (*s).used < 32 {
+            (*s).mem[(*s).used] = rt.ld8(p, at)
+            (*s).used = (*s).used + 1
+            at = at + 1
+        }
+        if (*s).used == 32 {
+            let m: u64 = (&(*s).mem[0]) as u64
+            (*s).v1 = x64_round((*s).v1, ld64le(m, 0))
+            (*s).v2 = x64_round((*s).v2, ld64le(m, 8))
+            (*s).v3 = x64_round((*s).v3, ld64le(m, 16))
+            (*s).v4 = x64_round((*s).v4, ld64le(m, 24))
+            (*s).used = 0
+        }
+    }
+    if n - at >= 32 {
+        var v1: u64 = (*s).v1
+        var v2: u64 = (*s).v2
+        var v3: u64 = (*s).v3
+        var v4: u64 = (*s).v4
+        while n - at >= 32 {
+            v1 = x64_round(v1, ld64le(p, at))
+            v2 = x64_round(v2, ld64le(p, at + 8))
+            v3 = x64_round(v3, ld64le(p, at + 16))
+            v4 = x64_round(v4, ld64le(p, at + 24))
+            at = at + 32
+        }
+        (*s).v1 = v1
+        (*s).v2 = v2
+        (*s).v3 = v3
+        (*s).v4 = v4
+    }
+    while at < n {
+        (*s).mem[(*s).used] = rt.ld8(p, at)
+        (*s).used = (*s).used + 1
+        at = at + 1
+    }
+}
+
+fn xxh64_final(s: *mut Xxh64) -> u64 {
+    var h: u64 = 0
+    if (*s).total >= 32 {
+        h = rotl64((*s).v1, 1) +% rotl64((*s).v2, 7) +% rotl64((*s).v3, 12) +% rotl64((*s).v4, 18)
+        h = x64_merge(h, (*s).v1)
+        h = x64_merge(h, (*s).v2)
+        h = x64_merge(h, (*s).v3)
+        h = x64_merge(h, (*s).v4)
+    } else {
+        h = (*s).seed +% X64_P5
+    }
+    h = h +% (*s).total
+    let m: u64 = (&(*s).mem[0]) as u64
+    var i: usize = 0
+    while i + 8 <= (*s).used {
+        h = h ^ x64_round(0, ld64le(m, i))
+        h = (rotl64(h, 27) *% X64_P1) +% X64_P4
+        i = i + 8
+    }
+    if i + 4 <= (*s).used {
+        h = h ^ ((ld32le(m, i) as u64) *% X64_P1)
+        h = (rotl64(h, 23) *% X64_P2) +% X64_P3
+        i = i + 4
+    }
+    while i < (*s).used {
+        h = h ^ ((rt.ld8(m, i) as u64) *% X64_P5)
+        h = rotl64(h, 11) *% X64_P1
+        i = i + 1
+    }
+    h = h ^ (h >> 33)
+    h = h *% X64_P2
+    h = h ^ (h >> 29)
+    h = h *% X64_P3
+    h = h ^ (h >> 32)
+    return h
+}
+
+fn xxh64(p: u64, n: usize, seed: u64) -> u64 {
+    var s: Xxh64 = xxh64_new(seed)
+    xxh64_update(&s, p, n)
+    return xxh64_final(&s)
+}
+
+// ====================================================================
+// CRC-64/XZ (ECMA-182 polynomial, reflected 0xC96C5795D7870F42, init and
+// xor-out all ones) -- the "CRC64" check of the xz container.
+// ====================================================================
+
+struct Crc64 {
+    t: [u64; 256],
+    crc: u64,
+}
+
+fn crc64_new() -> Crc64 {
+    var c: Crc64 = Crc64 { t: [0; 256], crc: 0xFFFFFFFFFFFFFFFF }
+    var i: usize = 0
+    while i < 256 {
+        var v: u64 = i as u64
+        var k: usize = 0
+        while k < 8 {
+            if (v & 1) != 0 {
+                v = (v >> 1) ^ 0xC96C5795D7870F42
+            } else {
+                v = v >> 1
+            }
+            k = k + 1
+        }
+        c.t[i] = v
+        i = i + 1
+    }
+    return c
+}
+
+fn crc64_update(c: *mut Crc64, p: u64, n: usize) {
+    var v: u64 = (*c).crc
+    var i: usize = 0
+    while i < n {
+        let idx: usize = ((v ^ (rt.ld8(p, i) as u64)) & 0xFF) as usize
+        v = (v >> 8) ^ (*c).t[idx]
+        i = i + 1
+    }
+    (*c).crc = v
+}
+
+fn crc64_final(c: *mut Crc64) -> u64 {
+    return (*c).crc ^ 0xFFFFFFFFFFFFFFFF
+}
+
+fn crc64(p: u64, n: usize) -> u64 {
+    var c: Crc64 = crc64_new()
+    crc64_update(&c, p, n)
+    return crc64_final(&c)
+}
+
+// ====================================================================
+// CRC-32 and SHA-256 from std, in the shape the decoders want
+// ====================================================================
+
+fn crc32_of(p: u64, n: usize) -> u32 {
+    return deflate.crc32(p, n)
+}
+
+// Continues a CRC-32: `crc` is what the last call returned (0 to start).
+fn crc32_update_of(tab: *mut deflate.CrcTable, crc: u32, p: u64, n: usize) -> u32 {
+    return deflate.crc32_more(tab, crc, p, n)
+}
+
+// SHA-256 of a buffer into 32 octets at `out`.
+fn sha256_of(p: u64, n: usize, out: u64) {
+    sha256.sha256(p, n, out)
+}

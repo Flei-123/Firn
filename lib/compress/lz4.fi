@@ -1,0 +1,856 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/compress/lz4.fi -- LZ4: block format, frame format (decoder and encoder),
+// the legacy frame (decoder), skippable frames, linked blocks, dictionaries,
+// and a streaming reader/writer on top.
+//
+//     import compress.lz4
+//     lz4.lz4_frame_compress(p, n, &out) catch |e| ...        // frame, 4 MiB blocks
+//     lz4.lz4_frame_decompress_limited(p, n, 1 << 30, &out) catch |e| ...
+//
+//     var d: lz4.Lz4Dec = lz4.lz4_dec_open_fd(fd)             // streaming
+//     let k: usize = lz4.lz4_dec_read(&d, buf, 65536) catch |e| ...   // 0 = end
+//     lz4.lz4_dec_close(&d)
+//
+// WHAT THE ENCODER IS. The LZ4 "fast" algorithm (one hash table of 4 octet
+// sequences, greedy, the search step grows on data that does not compress),
+// the same family as liblz4's level 1 -- not LZ4HC. Frames are written with
+// independent blocks of up to 4 MiB (a block never refers to an earlier one,
+// so a decoder needs no window), a content checksum, optionally the content
+// size. Output decodes with liblz4, the lz4 command and Python's `lz4`.
+//
+// WHAT THE DECODER TAKES. Frames of any block size and flags (linked or
+// independent blocks, block and content checksums, content size, a DictID
+// together with a dictionary the caller supplies), several frames in a row,
+// skippable frames (0x184D2A50..5F) and the legacy frame (0x184C2102). A bad
+// header checksum, a block checksum or the content checksum is
+// `CompressError::Checksum`; an offset that reaches in front of the output
+// (or the dictionary) is `Data`; more output than `max` is `TooLarge` and
+// nothing beyond `max` is written.
+//
+// HONEST
+//   L1 No LZ4HC encoder (levels above 1 of the lz4 command) -- ratio of the
+//      "fast" family only.
+//   L2 The checksum of the DictID is not verified against the dictionary
+//      (liblz4 does not either); a frame that names a dictionary needs one.
+//   L3 Streaming decode memory is "64 KiB window + one block" (at most
+//      4 MiB + 64 KiB), legacy frames 8 MiB per block.
+import std.rt
+import compress.common
+
+export {
+    Lz4Dec, lz4_dec_open_mem, lz4_dec_open_fd, lz4_dec_set_dict, lz4_dec_read, lz4_dec_close,
+    Lz4Enc, lz4_enc_new, lz4_enc_write, lz4_enc_finish, lz4_enc_free,
+    lz4_frame_decompress, lz4_frame_decompress_limited, lz4_frame_decompress_dict,
+    lz4_frame_compress, lz4_frame_compress_opts,
+    lz4_block_compress, lz4_block_bound,
+    lz4_block_decompress, lz4_block_decompress_dict,
+    lz4_is_frame,
+    LZ4_MAGIC,
+}
+
+const LZ4_MAGIC: u32 = 0x184D2204
+const LZ4_LEGACY: u32 = 0x184C2102
+const LZ4_SKIP_LO: u32 = 0x184D2A50
+const LZ4_SKIP_HI: u32 = 0x184D2A5F
+const LZ4_WINDOW: usize = 65536
+const MFLIMIT: usize = 12
+const LASTLITERALS: usize = 5
+
+fn lz4_is_frame(p: u64, n: usize) -> bool {
+    if n < 4 {
+        return false
+    }
+    let m: u32 = common.ld32le(p, 0)
+    return m == LZ4_MAGIC || m == LZ4_LEGACY || (m >= LZ4_SKIP_LO && m <= LZ4_SKIP_HI)
+}
+
+// ====================================================================
+// BLOCK DECODER
+// ====================================================================
+
+// Decodes one block `src[0..n)` into the buffer at `dst` starting at offset
+// `pos`. `hist` is the first offset a match may reach back to; `cap_end` the
+// offset the output may not pass (the caller reserved the room); `limited`
+// says that `cap_end` comes from the caller's limit rather than the block
+// size. `dict`/`dictlen` are history in front of `hist`. Returns the new end.
+fn block_decode(src: u64, n: usize, dst: u64, pos: usize, hist: usize, cap_end: usize,
+    limited: bool, dict: u64, dictlen: usize) -> CompressError!usize {
+    var ip: usize = 0
+    var op: usize = pos
+    while true {
+        if ip >= n {
+            return CompressError::Truncated
+        }
+        let token: u32 = rt.ld8(src, ip) as u32
+        ip = ip + 1
+        var lit: usize = (token >> 4) as usize
+        if lit == 15 {
+            while true {
+                if ip >= n {
+                    return CompressError::Truncated
+                }
+                let b: usize = rt.ld8(src, ip) as usize
+                ip = ip + 1
+                lit = lit + b
+                if lit > 1073741824 {
+                    return CompressError::Data
+                }
+                if b != 255 {
+                    break
+                }
+            }
+        }
+        if lit > n - ip {
+            return CompressError::Truncated
+        }
+        if lit > cap_end - op {
+            if limited {
+                return CompressError::TooLarge
+            }
+            return CompressError::Data
+        }
+        rt.mem_copy(dst + op as u64, src + ip as u64, lit)
+        ip = ip + lit
+        op = op + lit
+        if ip == n {
+            return op // the last sequence has only literals
+        }
+        if n - ip < 2 {
+            return CompressError::Truncated
+        }
+        let off: usize = (rt.ld8(src, ip) as usize) | ((rt.ld8(src, ip + 1) as usize) << 8)
+        ip = ip + 2
+        if off == 0 {
+            return CompressError::Data
+        }
+        var mlen: usize = (token & 15) as usize
+        if mlen == 15 {
+            while true {
+                if ip >= n {
+                    return CompressError::Truncated
+                }
+                let b: usize = rt.ld8(src, ip) as usize
+                ip = ip + 1
+                mlen = mlen + b
+                if mlen > 1073741824 {
+                    return CompressError::Data
+                }
+                if b != 255 {
+                    break
+                }
+            }
+        }
+        mlen = mlen + 4
+        if mlen > cap_end - op {
+            if limited {
+                return CompressError::TooLarge
+            }
+            return CompressError::Data
+        }
+        if off <= op - hist {
+            // inside the output
+            let from: usize = op - off
+            if off >= 8 {
+                rt.mem_copy(dst + op as u64, dst + from as u64, mlen)
+            } else {
+                var k: usize = 0
+                while k < mlen {
+                    rt.st8(dst, op + k, rt.ld8(dst, from + k))
+                    k = k + 1
+                }
+            }
+            op = op + mlen
+        } else {
+            // reaches into the dictionary
+            let need: usize = off - (op - hist)
+            if need > dictlen {
+                return CompressError::Data
+            }
+            var k: usize = 0
+            var dp: usize = dictlen - need
+            while k < mlen && dp < dictlen {
+                rt.st8(dst, op + k, rt.ld8(dict, dp))
+                dp = dp + 1
+                k = k + 1
+            }
+            // the rest continues in the output itself, from `hist`
+            while k < mlen {
+                rt.st8(dst, op + k, rt.ld8(dst, op + k - off))
+                k = k + 1
+            }
+            op = op + mlen
+        }
+    }
+    return CompressError::Data
+}
+
+// Raw block (no frame) into `out` (appended). `max` is the exact upper bound
+// of the decoded size the caller allows (LZ4 blocks do not carry their size).
+fn lz4_block_decompress(src: u64, n: usize, max: usize, out: *mut rt.Buf) -> CompressError!usize {
+    return try lz4_block_decompress_dict(src, n, max, 0, 0, out)
+}
+
+fn lz4_block_decompress_dict(src: u64, n: usize, max: usize, dict: u64, dictlen: usize,
+    out: *mut rt.Buf) -> CompressError!usize {
+    let start: usize = (*out).len
+    if !common.buf_ensure(out, start + max) {
+        return CompressError::OutOfMemory
+    }
+    let e: usize = try block_decode(src, n, (*out).ptr, start, start, start + max, false, dict, dictlen)
+    (*out).len = e
+    return e - start
+}
+
+// ====================================================================
+// BLOCK ENCODER
+// ====================================================================
+
+fn lz4_block_bound(n: usize) -> usize {
+    return n + n / 255 + 16
+}
+
+fn emit_len(out: *mut rt.Buf, v: usize) {
+    var r: usize = v
+    while r >= 255 {
+        rt.buf_push(out, 255 as u8)
+        r = r - 255
+    }
+    rt.buf_push(out, r as u8)
+}
+
+fn emit_seq(out: *mut rt.Buf, src: u64, anchor: usize, lit: usize, off: usize, mlen: usize, has_match: bool) {
+    var tok: u32 = 0
+    if lit >= 15 {
+        tok = 15 << 4
+    } else {
+        tok = (lit as u32) << 4
+    }
+    if has_match {
+        if mlen - 4 >= 15 {
+            tok = tok | 15
+        } else {
+            tok = tok | ((mlen - 4) as u32)
+        }
+    }
+    rt.buf_push(out, tok as u8)
+    if lit >= 15 {
+        emit_len(out, lit - 15)
+    }
+    common.buf_append_bytes(out, src + anchor as u64, lit)
+    if has_match {
+        rt.buf_push(out, (off & 255) as u8)
+        rt.buf_push(out, ((off >> 8) & 255) as u8)
+        if mlen - 4 >= 15 {
+            emit_len(out, mlen - 4 - 15)
+        }
+    }
+}
+
+fn hash4(v: u32, bits: u32) -> usize {
+    return ((v *% 2654435761) >> (32 - bits)) as usize
+}
+
+// Compresses `src[0..n)` as ONE block, appended to `out`. Blocks are
+// independent (offsets never reach in front of `src`). `accel` >= 1 skips
+// faster over data that does not compress (1 = default).
+fn lz4_block_compress(src: u64, n: usize, out: *mut rt.Buf) -> usize {
+    return block_compress_accel(src, n, out, 1)
+}
+
+fn block_compress_accel(src: u64, n: usize, out: *mut rt.Buf, accel: usize) -> usize {
+    let start: usize = (*out).len
+    common.buf_ensure(out, start + lz4_block_bound(n))
+    if n < MFLIMIT + 1 {
+        emit_seq(out, src, 0, n, 0, 0, false)
+        return (*out).len - start
+    }
+    var bits: u32 = 16
+    if n < 4096 {
+        bits = 10
+    } else if n < 65536 {
+        bits = 13
+    }
+    let tsize: usize = (1 as usize) << (bits as usize)
+    let tab: u64 = rt.heap_alloc(tsize * 4)
+    if tab == 0 {
+        emit_seq(out, src, 0, n, 0, 0, false) // no memory: store as literals
+        return (*out).len - start
+    }
+    let mflimit: usize = n - MFLIMIT
+    let matchlimit: usize = n - LASTLITERALS
+    var anchor: usize = 0
+    var ip: usize = 0
+    var searches: usize = accel << 6
+    while ip < mflimit {
+        let seq: u32 = common.ld32le(src, ip)
+        let h: usize = hash4(seq, bits)
+        let ref: usize = rt.ld32(tab, h) as usize
+        rt.st32(tab, h, ip as u32)
+        if ref < ip && ip - ref <= 65535 && common.ld32le(src, ref) == seq {
+            var r: usize = ref
+            var p: usize = ip
+            while p > anchor && r > 0 && rt.ld8(src, p - 1) == rt.ld8(src, r - 1) {
+                p = p - 1
+                r = r - 1
+            }
+            var mlen: usize = 4
+            while p + mlen + 8 <= matchlimit
+                && common.ld64le(src, p + mlen) == common.ld64le(src, r + mlen) {
+                mlen = mlen + 8
+            }
+            while p + mlen < matchlimit && rt.ld8(src, p + mlen) == rt.ld8(src, r + mlen) {
+                mlen = mlen + 1
+            }
+            emit_seq(out, src, anchor, p - anchor, p - r, mlen, true)
+            ip = p + mlen
+            anchor = ip
+            searches = accel << 6
+            if ip >= mflimit {
+                break
+            }
+            // keep the table warm with the position two octets back
+            let hb: usize = hash4(common.ld32le(src, ip - 2), bits)
+            rt.st32(tab, hb, (ip - 2) as u32)
+        } else {
+            ip = ip + (searches >> 6)
+            searches = searches + 1
+        }
+    }
+    rt.heap_free(tab, tsize * 4)
+    emit_seq(out, src, anchor, n - anchor, 0, 0, false)
+    return (*out).len - start
+}
+
+// ====================================================================
+// FRAME DECODER (a resumable state machine, one block per step)
+// ====================================================================
+
+struct Lz4Dec {
+    src: common.Source,
+    out: rt.Buf, // the streaming buffer (unused by the whole-buffer API)
+    drained: usize,
+    state: u32, // 0 = between frames, 1 = blocks of a frame, 3 = legacy blocks, 9 = finished
+    frames: u32,
+    linked: bool,
+    bchk: bool,
+    cchk: bool,
+    bmax: usize,
+    hash: common.Xxh32,
+    base: usize, // first offset of the output a match may reach (stream start)
+    limit: usize, // 0 = none
+    produced: usize,
+    dict: u64,
+    dictlen: usize,
+    pending: bool, // `pmagic` holds a word already read
+    pmagic: u32,
+    opened: bool,
+}
+
+fn dec_new(s: common.Source) -> Lz4Dec {
+    return Lz4Dec { src: s, out: rt.buf_new(), drained: 0, state: 0, frames: 0, linked: false,
+        bchk: false, cchk: false, bmax: 0, hash: common.xxh32_new(0), base: 0, limit: 0,
+        produced: 0, dict: 0, dictlen: 0, pending: false, pmagic: 0, opened: false }
+}
+
+fn lz4_dec_open_mem(p: u64, n: usize) -> Lz4Dec {
+    return dec_new(common.src_mem(p, n))
+}
+
+fn lz4_dec_open_fd(fd: i64) -> Lz4Dec {
+    return dec_new(common.src_fd(fd))
+}
+
+// The dictionary of frames that name one (the bytes stay the caller's).
+fn lz4_dec_set_dict(d: *mut Lz4Dec, dict: u64, dictlen: usize) {
+    (*d).dict = dict
+    (*d).dictlen = dictlen
+}
+
+fn lz4_dec_close(d: *mut Lz4Dec) {
+    common.src_free(&(*d).src)
+    rt.buf_free(&(*d).out)
+}
+
+fn rd32(d: *mut Lz4Dec) -> CompressError!u32 {
+    let p: u64 = common.src_take(&(*d).src, 4)
+    if p == 0 {
+        if common.src_failed(&(*d).src) {
+            return CompressError::Io
+        }
+        return CompressError::Truncated
+    }
+    return common.ld32le(p, 0)
+}
+
+fn bmax_of(id: u32) -> usize {
+    if id == 4 {
+        return 65536
+    }
+    if id == 5 {
+        return 262144
+    }
+    if id == 6 {
+        return 1048576
+    }
+    return 4194304
+}
+
+// Reads the frame descriptor after the magic.
+fn read_descriptor(d: *mut Lz4Dec) -> CompressError!bool {
+    let hp: u64 = common.src_take(&(*d).src, 2)
+    if hp == 0 {
+        return CompressError::Truncated
+    }
+    var desc: [u8; 16] = [0; 16]
+    desc[0] = rt.ld8(hp, 0)
+    desc[1] = rt.ld8(hp, 1)
+    let flg: u32 = desc[0] as u32
+    let bd: u32 = desc[1] as u32
+    if (flg >> 6) != 1 {
+        return CompressError::Format
+    }
+    if (flg & 2) != 0 || (bd & 0x8F) != 0 {
+        return CompressError::Format
+    }
+    let bid: u32 = (bd >> 4) & 7
+    if bid < 4 {
+        return CompressError::Format
+    }
+    var len: usize = 2
+    if (flg & 8) != 0 {
+        let q: u64 = common.src_take(&(*d).src, 8)
+        if q == 0 {
+            return CompressError::Truncated
+        }
+        var i: usize = 0
+        while i < 8 {
+            desc[len + i] = rt.ld8(q, i)
+            i = i + 1
+        }
+        len = len + 8
+    }
+    var has_dict: bool = false
+    if (flg & 1) != 0 {
+        let q: u64 = common.src_take(&(*d).src, 4)
+        if q == 0 {
+            return CompressError::Truncated
+        }
+        var i: usize = 0
+        while i < 4 {
+            desc[len + i] = rt.ld8(q, i)
+            i = i + 1
+        }
+        len = len + 4
+        has_dict = true
+    }
+    let hc: i32 = common.src_byte(&(*d).src)
+    if hc < 0 {
+        return CompressError::Truncated
+    }
+    let want: u32 = (common.xxh32((&desc[0]) as u64, len, 0) >> 8) & 255
+    if (hc as u32) != want {
+        return CompressError::Checksum
+    }
+    if has_dict && (*d).dict == 0 && (*d).dictlen == 0 {
+        return CompressError::Dictionary
+    }
+    (*d).linked = (flg & 32) == 0
+    (*d).bchk = (flg & 16) != 0
+    (*d).cchk = (flg & 4) != 0
+    (*d).bmax = bmax_of(bid)
+    (*d).hash = common.xxh32_new(0)
+    return true
+}
+
+// Reserves room and decodes one block `bp[0..bn)` appended to `out`.
+fn decode_into(d: *mut Lz4Dec, out: *mut rt.Buf, bp: u64, bn: usize, stored: bool,
+    bmax: usize) -> CompressError!bool {
+    let start: usize = (*out).len
+    var room: usize = bmax
+    var limited: bool = false
+    if (*d).limit > 0 {
+        if (*d).produced >= (*d).limit {
+            // nothing more may be written; an empty block is still fine
+            if bn == 0 {
+                return true
+            }
+        }
+        let left: usize = (*d).limit - (*d).produced
+        if left < room {
+            room = left
+            limited = true
+        }
+    }
+    if stored {
+        if bn > room {
+            if limited {
+                return CompressError::TooLarge
+            }
+            return CompressError::Data
+        }
+        if !common.buf_append_bytes(out, bp, bn) {
+            return CompressError::OutOfMemory
+        }
+    } else {
+        if !common.buf_ensure(out, start + room) {
+            return CompressError::OutOfMemory
+        }
+        // history: the window for linked blocks, nothing for independent ones
+        var hist: usize = (*d).base
+        if (*d).linked {
+            if start > (*d).base + LZ4_WINDOW {
+                hist = start - LZ4_WINDOW
+            }
+        } else {
+            hist = start
+        }
+        var dictp: u64 = (*d).dict
+        var dl: usize = (*d).dictlen
+        if dl > LZ4_WINDOW {
+            dictp = dictp + (dl - LZ4_WINDOW) as u64
+            dl = LZ4_WINDOW
+        }
+        let e: usize = try block_decode(bp, bn, (*out).ptr, start, hist, start + room, limited,
+            dictp, dl)
+        (*out).len = e
+    }
+    let got: usize = (*out).len - start
+    (*d).produced = (*d).produced + got
+    if (*d).cchk {
+        common.xxh32_update(&(*d).hash, (*out).ptr + start as u64, got)
+    }
+    return true
+}
+
+// One step: returns true while there is more to decode, false at the end of
+// the input. Bytes are appended to `out`.
+fn lz4_step(d: *mut Lz4Dec, out: *mut rt.Buf) -> CompressError!bool {
+    if (*d).state == 9 {
+        return false
+    }
+    if (*d).state == 0 {
+        var magic: u32 = 0
+        if (*d).pending {
+            magic = (*d).pmagic
+            (*d).pending = false
+        } else {
+            if common.src_at_end(&(*d).src) {
+                if common.src_failed(&(*d).src) {
+                    return CompressError::Io
+                }
+                if (*d).frames == 0 {
+                    return CompressError::Truncated
+                }
+                (*d).state = 9
+                return false
+            }
+            magic = try rd32(d)
+        }
+        if magic == LZ4_MAGIC {
+            try read_descriptor(d)
+            (*d).state = 1
+            (*d).frames = (*d).frames + 1
+            return true
+        }
+        if magic >= LZ4_SKIP_LO && magic <= LZ4_SKIP_HI {
+            let sz: u32 = try rd32(d)
+            let k: usize = common.src_skip(&(*d).src, sz as usize)
+            if k < (sz as usize) {
+                return CompressError::Truncated
+            }
+            (*d).frames = (*d).frames + 1
+            return true
+        }
+        if magic == LZ4_LEGACY {
+            (*d).state = 3
+            (*d).bmax = 8388608
+            (*d).cchk = false
+            (*d).bchk = false
+            (*d).linked = false
+            (*d).frames = (*d).frames + 1
+            return true
+        }
+        return CompressError::Format
+    }
+    if (*d).state == 1 {
+        let w: u32 = try rd32(d)
+        if w == 0 {
+            // end mark
+            if (*d).cchk {
+                let want: u32 = try rd32(d)
+                if common.xxh32_final(&(*d).hash) != want {
+                    return CompressError::Checksum
+                }
+            }
+            (*d).state = 0
+            return true
+        }
+        let stored: bool = (w & 0x80000000) != 0
+        let bn: usize = (w & 0x7FFFFFFF) as usize
+        if bn > (*d).bmax {
+            return CompressError::Data
+        }
+        let bp: u64 = common.src_take(&(*d).src, bn)
+        if bp == 0 {
+            if common.src_failed(&(*d).src) {
+                return CompressError::Io
+            }
+            return CompressError::Truncated
+        }
+        if (*d).bchk {
+            // the block checksum follows the block; src_take may invalidate
+            // `bp` when it refills, so verify before reading it
+            let hv: u32 = common.xxh32(bp, bn, 0)
+            let want: u32 = try rd32(d)
+            if hv != want {
+                return CompressError::Checksum
+            }
+        }
+        try decode_into(d, out, bp, bn, stored, (*d).bmax)
+        return true
+    }
+    // legacy frame: [u32 compressed size][block]... until the next magic
+    let w: u32 = try rd32_or_end(d)
+    if w == 0xFFFFFFFF {
+        (*d).state = 9
+        return false
+    }
+    if w == LZ4_MAGIC || w == LZ4_LEGACY || (w >= LZ4_SKIP_LO && w <= LZ4_SKIP_HI) {
+        (*d).pending = true
+        (*d).pmagic = w
+        (*d).state = 0
+        return true
+    }
+    let bn: usize = w as usize
+    if bn > lz4_block_bound(8388608) {
+        return CompressError::Data
+    }
+    let bp: u64 = common.src_take(&(*d).src, bn)
+    if bp == 0 {
+        return CompressError::Truncated
+    }
+    try decode_into(d, out, bp, bn, false, 8388608)
+    return true
+}
+
+// The next u32, or the sentinel 0xFFFFFFFF at a clean end of the input (a
+// real block size is never that large).
+fn rd32_or_end(d: *mut Lz4Dec) -> CompressError!u32 {
+    if common.src_at_end(&(*d).src) {
+        if common.src_failed(&(*d).src) {
+            return CompressError::Io
+        }
+        return 0xFFFFFFFF
+    }
+    return try rd32(d)
+}
+
+// ---------------------------------------------------------- whole buffer
+
+fn lz4_frame_decompress(src: u64, n: usize, out: *mut rt.Buf) -> CompressError!usize {
+    return try lz4_frame_decompress_dict(src, n, 0, 0, 0, out)
+}
+
+fn lz4_frame_decompress_limited(src: u64, n: usize, max: usize, out: *mut rt.Buf) -> CompressError!usize {
+    return try lz4_frame_decompress_dict(src, n, max, 0, 0, out)
+}
+
+fn lz4_frame_decompress_dict(src: u64, n: usize, max: usize, dict: u64, dictlen: usize,
+    out: *mut rt.Buf) -> CompressError!usize {
+    var d: Lz4Dec = lz4_dec_open_mem(src, n)
+    d.limit = max
+    d.base = (*out).len
+    d.dict = dict
+    d.dictlen = dictlen
+    let before: usize = (*out).len
+    while true {
+        let more: bool = try lz4_step(&d, out)
+        if !more {
+            break
+        }
+    }
+    return (*out).len - before
+}
+
+// ---------------------------------------------------------------- streaming
+
+// Up to `n` decoded octets into `dst`; 0 = end of the stream.
+fn lz4_dec_read(d: *mut Lz4Dec, dst: u64, n: usize) -> CompressError!usize {
+    while (*d).drained >= (*d).out.len && (*d).state != 9 {
+        let cut: usize = common.buf_compact(&(*d).out, (*d).drained, LZ4_WINDOW)
+        (*d).drained = (*d).drained - cut
+        if (*d).base > cut {
+            (*d).base = (*d).base - cut
+        } else {
+            (*d).base = 0
+        }
+        let more: bool = try lz4_step(d, &(*d).out)
+        if !more {
+            break
+        }
+    }
+    var k: usize = (*d).out.len - (*d).drained
+    if k > n {
+        k = n
+    }
+    if k > 0 {
+        rt.mem_copy(dst, (*d).out.ptr + (*d).drained as u64, k)
+        (*d).drained = (*d).drained + k
+    }
+    return k
+}
+
+// ====================================================================
+// FRAME ENCODER (streaming; the whole-buffer call wraps it)
+// ====================================================================
+
+struct Lz4Enc {
+    bid: u32, // 4..7
+    cchk: bool,
+    bchk: bool,
+    pending: rt.Buf,
+    hash: common.Xxh32,
+    started: bool,
+    csize: u64, // content size to announce (0 = do not)
+    accel: usize,
+}
+
+// `block_id` 4 = 64 KiB .. 7 = 4 MiB; `content_size` 0 = not announced
+// (a streaming writer cannot know it).
+fn lz4_enc_new(block_id: u32, content_checksum: bool, block_checksum: bool, content_size: u64) -> Lz4Enc {
+    var b: u32 = block_id
+    if b < 4 {
+        b = 4
+    }
+    if b > 7 {
+        b = 7
+    }
+    return Lz4Enc { bid: b, cchk: content_checksum, bchk: block_checksum, pending: rt.buf_new(),
+        hash: common.xxh32_new(0), started: false, csize: content_size, accel: 1 }
+}
+
+fn lz4_enc_free(e: *mut Lz4Enc) {
+    rt.buf_free(&(*e).pending)
+}
+
+fn put32(out: *mut rt.Buf, v: u32) {
+    rt.buf_push(out, (v & 255) as u8)
+    rt.buf_push(out, ((v >> 8) & 255) as u8)
+    rt.buf_push(out, ((v >> 16) & 255) as u8)
+    rt.buf_push(out, ((v >> 24) & 255) as u8)
+}
+
+fn enc_header(e: *mut Lz4Enc, out: *mut rt.Buf) {
+    var flg: u32 = 0x60 // version 01, independent blocks
+    if (*e).bchk {
+        flg = flg | 16
+    }
+    if (*e).csize != 0 {
+        flg = flg | 8
+    }
+    if (*e).cchk {
+        flg = flg | 4
+    }
+    var desc: [u8; 10] = [0; 10]
+    desc[0] = flg as u8
+    desc[1] = (((*e).bid) << 4) as u8
+    var len: usize = 2
+    if (*e).csize != 0 {
+        var i: usize = 0
+        while i < 8 {
+            desc[2 + i] = (((*e).csize >> ((i * 8) as u64)) & 255) as u8
+            i = i + 1
+        }
+        len = 10
+    }
+    put32(out, LZ4_MAGIC)
+    common.buf_append_bytes(out, (&desc[0]) as u64, len)
+    rt.buf_push(out, ((common.xxh32((&desc[0]) as u64, len, 0) >> 8) & 255) as u8)
+    (*e).started = true
+}
+
+fn enc_block(e: *mut Lz4Enc, p: u64, n: usize, out: *mut rt.Buf) {
+    let at: usize = (*out).len
+    put32(out, 0) // size, patched below
+    let k: usize = block_compress_accel(p, n, out, (*e).accel)
+    if k >= n {
+        // does not shrink: store it
+        (*out).len = at + 4
+        common.buf_append_bytes(out, p, n)
+        common.st32le((*out).ptr, at, (n as u32) | 0x80000000)
+        if (*e).bchk {
+            put32(out, common.xxh32(p, n, 0))
+        }
+    } else {
+        common.st32le((*out).ptr, at, k as u32)
+        if (*e).bchk {
+            put32(out, common.xxh32((*out).ptr + (at + 4) as u64, k, 0))
+        }
+    }
+}
+
+// Appends `n` octets of input; completed blocks go to `out`.
+fn lz4_enc_write(e: *mut Lz4Enc, p: u64, n: usize, out: *mut rt.Buf) {
+    if !(*e).started {
+        enc_header(e, out)
+    }
+    if (*e).cchk {
+        common.xxh32_update(&(*e).hash, p, n)
+    }
+    let bs: usize = bmax_of((*e).bid)
+    var at: usize = 0
+    // top up a partial block first
+    if (*e).pending.len > 0 {
+        var k: usize = bs - (*e).pending.len
+        if k > n {
+            k = n
+        }
+        common.buf_append_bytes(&(*e).pending, p, k)
+        at = k
+        if (*e).pending.len == bs {
+            enc_block(e, (*e).pending.ptr, bs, out)
+            rt.buf_clear(&(*e).pending)
+        }
+    }
+    while n - at >= bs {
+        enc_block(e, p + at as u64, bs, out)
+        at = at + bs
+    }
+    if at < n {
+        common.buf_append_bytes(&(*e).pending, p + at as u64, n - at)
+    }
+}
+
+// Flushes the last block, writes the end mark and the content checksum.
+fn lz4_enc_finish(e: *mut Lz4Enc, out: *mut rt.Buf) {
+    if !(*e).started {
+        enc_header(e, out)
+    }
+    if (*e).pending.len > 0 {
+        enc_block(e, (*e).pending.ptr, (*e).pending.len, out)
+        rt.buf_clear(&(*e).pending)
+    }
+    put32(out, 0)
+    if (*e).cchk {
+        put32(out, common.xxh32_final(&(*e).hash))
+    }
+}
+
+fn lz4_frame_compress(src: u64, n: usize, out: *mut rt.Buf) -> CompressError!usize {
+    return try lz4_frame_compress_opts(src, n, 7, true, false, true, out)
+}
+
+// `block_id` 4..7, checksums, and whether the frame announces its content size.
+fn lz4_frame_compress_opts(src: u64, n: usize, block_id: u32, content_checksum: bool,
+    block_checksum: bool, announce_size: bool, out: *mut rt.Buf) -> CompressError!usize {
+    var cs: u64 = 0
+    if announce_size {
+        cs = n as u64
+    }
+    let before: usize = (*out).len
+    var e: Lz4Enc = lz4_enc_new(block_id, content_checksum, block_checksum, cs)
+    lz4_enc_write(&e, src, n, out)
+    lz4_enc_finish(&e, out)
+    lz4_enc_free(&e)
+    return (*out).len - before
+}
