@@ -1,0 +1,333 @@
+// expect_exit: 0
+// tests/2240_qr.fi -- lib/qr: the encoder against known answers, the decoder
+// against the encoder.
+//
+// The six known answers (version, mask and an FNV-1a hash of the module
+// matrix in reading order) were computed with Project Nayuki's reference
+// encoder (qrcodegen, Python), NOT with this library: numeric at L, alphanumeric
+// at Q, a URL at M, 300 octets at H (version 18, alignment patterns and
+// version information), 2000 octets at L (version 33), and a forced version 40
+// with a forced mask. tools/qr/run.sh holds the encoder against that reference
+// for thousands more, and against ZXing-C++ reading every code back.
+//
+// The decoder: every code is decoded from its module matrix, then with damaged
+// modules (the Reed-Solomon step must repair them and say so), then from RGBA
+// pixels (upright, turned a quarter, shifted inside a larger picture), and the
+// refusals (a blank picture, a matrix of the wrong size, too much damage).
+import qr.qr
+import qr.qrdec
+import std.rt
+import std.io
+
+static mut seed: u64 = 20240042
+static mut bad: i32 = 0
+
+fn rnd() -> u32 {
+    seed = seed *% 6364136223846793005 +% 1442695040888963407
+    return ((seed >> 33) & 2147483647) as u32
+}
+
+fn fail(what: str) {
+    io.print_line(what)
+    bad = bad + 1
+}
+
+fn failf(m: io.Fmt) {
+    io.fmt_print_line(m)
+    bad = bad + 1
+}
+
+fn fnv(q: *mut qr.QrCode) -> u32 {
+    var h: u32 = 2166136261 as u32
+    let n: i64 = qr.qr_size(q) as i64
+    var y: i64 = 0
+    while y < n {
+        var x: i64 = 0
+        while x < n {
+            if qr.qr_dark(q, x, y) {
+                h = h ^ 1 as u32
+            }
+            h = h *% 16777619 as u32
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return h
+}
+
+fn pattern(n: usize, mul: u32, add: u32) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(&b, (((i as u32) * mul + add) & 255 as u32) as u8)
+        i++
+    }
+    return b
+}
+
+fn known(name: str, p: u64, n: usize, mode: u32, ecc: u32, minv: u32, maxv: u32, mask: i32,
+        version: u32, want_mask: u32, hash: u32) -> bool {
+    var q: qr.QrCode = qr.qr_new()
+    let ok: bool = qr.qr_encode(p, n, mode, ecc, minv, maxv, mask, false, &q) catch false
+    if !ok {
+        failf(f"FAIL {name}: encoding refused")
+        return false
+    }
+    var good: bool = true
+    if qr.qr_version(&q) != version || qr.qr_mask(&q) != want_mask {
+        failf(f"FAIL {name}: version {qr.qr_version(&q)} mask {qr.qr_mask(&q)}, wanted {version} {want_mask}")
+        good = false
+    }
+    if fnv(&q) != hash {
+        failf(f"FAIL {name}: the module matrix differs from the reference")
+        good = false
+    }
+    // the decoder must give the data back, from the matrix as it is
+    var r: qrdec.QrResult = qrdec.qrdec_result_new()
+    let dok: bool = qrdec.qrdec_modules(&q, &r) catch false
+    if !dok || rt.buf_len(&r.payload) != n || !rt.mem_eq(rt.buf_ptr(&r.payload), p, n) {
+        failf(f"FAIL {name}: the decoder did not return the data")
+        good = false
+    }
+    if r.corrected != 0 as u32 {
+        failf(f"FAIL {name}: an intact code needed corrections")
+        good = false
+    }
+    qrdec.qrdec_result_free(&r)
+    qr.qr_free(&q)
+    return good
+}
+
+// flips `count` random data modules (never a function module)
+fn damage(q: *mut qr.QrCode, count: i64) {
+    let n: i64 = qr.qr_size(q) as i64
+    var done: i64 = 0
+    while done < count {
+        let x: i64 = (rnd() as i64) % n
+        let y: i64 = (rnd() as i64) % n
+        if !qr.qr_is_function(q, x, y) {
+            let at: usize = (y * n + x) as usize
+            let base: u64 = rt.buf_ptr(&(*q).modules)
+            rt.st8(base, at, rt.ld8(base, at) ^ 1 as u8)
+            done = done + 1
+        }
+    }
+}
+
+fn roundtrip(version_min: u32, ecc: u32, len: usize, flip: bool) -> bool {
+    var data: rt.Buf = pattern(len, 31 as u32, rnd())
+    var q: qr.QrCode = qr.qr_new()
+    let ok: bool = qr.qr_encode(rt.buf_ptr(&data), len, qr.QR_MODE_BYTE, ecc, version_min, 40 as u32,
+        0 - 1, false, &q) catch false
+    if !ok {
+        rt.buf_free(&data)
+        return true // nothing of this size at this level -- not a failure of the decoder
+    }
+    var copy_dmg: i64 = 0
+    if flip {
+        // about a sixth of the error correction codewords: always repairable
+        // when spread at random over the blocks
+        let blocks: i64 = qr.qr_num_blocks(qr.qr_version(&q), ecc) as i64
+        let per: i64 = qr.qr_ecc_codewords_per_block(qr.qr_version(&q), ecc) as i64
+        copy_dmg = blocks * per / 6
+        damage(&q, copy_dmg)
+    }
+    var r: qrdec.QrResult = qrdec.qrdec_result_new()
+    let dok: bool = qrdec.qrdec_modules(&q, &r) catch false
+    var good: bool = true
+    if !dok || rt.buf_len(&r.payload) != len || !rt.mem_eq(rt.buf_ptr(&r.payload), rt.buf_ptr(&data), len) {
+        failf(f"FAIL roundtrip version {qr.qr_version(&q)} ecc {ecc} len {len} flip {flip}")
+        good = false
+    } else {
+        if flip && copy_dmg > 0 && r.corrected == 0 as u32 {
+            failf(f"FAIL roundtrip version {qr.qr_version(&q)}: damage not reported")
+            good = false
+        }
+    }
+    qrdec.qrdec_result_free(&r)
+    qr.qr_free(&q)
+    rt.buf_free(&data)
+    return good
+}
+
+// RGBA pixels of a code, upright; `turn` quarter turns; `pad` extra white
+// octets around it (a larger picture); returns the side in `side`.
+fn picture(q: *mut qr.QrCode, scale: u32, turn: i64, pad: usize, out: *mut rt.Buf, side: *mut usize) {
+    var base: rt.Buf = rt.buf_new()
+    let s: u32 = qr.qr_to_rgba(q, 4 as u32, scale, 255 as u32 | (255 as u32 << 24), 0xFFFFFFFF as u32, &base)
+    let n: usize = s as usize
+    let total: usize = n + 2 * pad
+    rt.buf_clear(out)
+    rt.buf_reserve(out, total * total * 4)
+    var y: usize = 0
+    while y < total {
+        var x: usize = 0
+        while x < total {
+            var v: u32 = 0xFFFFFFFF as u32
+            if x >= pad && y >= pad && x < pad + n && y < pad + n {
+                var sx: usize = x - pad
+                var sy: usize = y - pad
+                var k: i64 = 0
+                while k < turn {
+                    // one quarter turn clockwise: (sx, sy) of the result = (sy, n - 1 - sx) of the source
+                    let nx: usize = sy
+                    let ny: usize = n - 1 - sx
+                    sx = nx
+                    sy = ny
+                    k = k + 1
+                }
+                v = rt.ld32(rt.buf_ptr(&base), sy * n + sx)
+            }
+            rt.buf_push(out, (v & 255 as u32) as u8)
+            rt.buf_push(out, ((v >> 8) & 255 as u32) as u8)
+            rt.buf_push(out, ((v >> 16) & 255 as u32) as u8)
+            rt.buf_push(out, ((v >> 24) & 255 as u32) as u8)
+            x++
+        }
+        y++
+    }
+    *side = total
+    rt.buf_free(&base)
+}
+
+fn read_picture(px: *mut rt.Buf, side: usize, p: u64, n: usize) -> bool {
+    var r: qrdec.QrResult = qrdec.qrdec_result_new()
+    let ok: bool = qrdec.qrdec_rgba(rt.buf_ptr(px), side, side, &r) catch false
+    var good: bool = ok && rt.buf_len(&r.payload) == n && rt.mem_eq(rt.buf_ptr(&r.payload), p, n)
+    qrdec.qrdec_result_free(&r)
+    return good
+}
+
+fn main() -> i32 {
+    // ---------------------------------------------------------------- known answers
+    var ok: bool = true
+    let num: str = "0123456789"
+    if !known("numeric L", num.p as u64, num.n, qr.QR_MODE_AUTO, qr.QR_ECC_L, 1 as u32, 40 as u32, 0 - 1,
+        1 as u32, 3 as u32, 1131980539 as u32) { ok = false }
+    let aln: str = "HELLO WORLD"
+    if !known("alnum Q", aln.p as u64, aln.n, qr.QR_MODE_AUTO, qr.QR_ECC_Q, 1 as u32, 40 as u32, 0 - 1,
+        1 as u32, 0 as u32, 4025879585 as u32) { ok = false }
+    let url: str = "https://example.org/a?b=c"
+    if !known("url M", url.p as u64, url.n, qr.QR_MODE_AUTO, qr.QR_ECC_M, 1 as u32, 40 as u32, 0 - 1,
+        2 as u32, 2 as u32, 234717727 as u32) { ok = false }
+    var b300: rt.Buf = pattern(300, 7 as u32, 3 as u32)
+    if !known("300 octets H", rt.buf_ptr(&b300), 300, qr.QR_MODE_AUTO, qr.QR_ECC_H, 1 as u32, 40 as u32, 0 - 1,
+        18 as u32, 3 as u32, 512811314 as u32) { ok = false }
+    rt.buf_free(&b300)
+    var b2000: rt.Buf = pattern(2000, 13 as u32, 5 as u32)
+    if !known("2000 octets L", rt.buf_ptr(&b2000), 2000, qr.QR_MODE_AUTO, qr.QR_ECC_L, 1 as u32, 40 as u32, 0 - 1,
+        33 as u32, 4 as u32, 1601315262 as u32) { ok = false }
+    rt.buf_free(&b2000)
+    let x1: str = "x"
+    if !known("version 40 H mask 5", x1.p as u64, x1.n, qr.QR_MODE_AUTO, qr.QR_ECC_H, 40 as u32, 40 as u32, 5,
+        40 as u32, 5 as u32, 2535930873 as u32) { ok = false }
+
+    // ---------------------------------------------------------------- refusals of the encoder
+    var q: qr.QrCode = qr.qr_new()
+    var big: rt.Buf = pattern(3000, 1 as u32, 0 as u32)
+    var refused: bool = false
+    qr.qr_encode(rt.buf_ptr(&big), 3000, qr.QR_MODE_AUTO, qr.QR_ECC_H, 1 as u32, 40 as u32, 0 - 1, false, &q) catch | e | (mark(&refused))
+    if !refused {
+        fail("FAIL 3000 octets at H must not fit")
+    }
+    refused = false
+    qr.qr_encode(rt.buf_ptr(&big), 10, qr.QR_MODE_NUMERIC, qr.QR_ECC_L, 1 as u32, 40 as u32, 0 - 1, false, &q) catch | e | (mark(&refused))
+    if !refused {
+        fail("FAIL octets that are not digits must not encode as numeric")
+    }
+    rt.buf_free(&big)
+    qr.qr_free(&q)
+
+    // ---------------------------------------------------------------- decoder from matrices
+    var v: u32 = 1 as u32
+    var cases: i32 = 0
+    while v <= 40 as u32 {
+        var e: u32 = 0 as u32
+        while e < 4 as u32 {
+            // sizes up to what the version holds, and a short one
+            let cap: usize = qr.qr_capacity_bytes(v, e) as usize
+            if !roundtrip(v, e, cap, false) { ok = false }
+            if !roundtrip(v, e, cap, true) { ok = false }
+            if cap > 4 {
+                if !roundtrip(v, e, cap / 3, true) { ok = false }
+            }
+            cases = cases + 3
+            e = e + 1 as u32
+        }
+        v = v + 7 as u32
+    }
+
+    // ---------------------------------------------------------------- the pictures
+    var data: rt.Buf = pattern(40, 11 as u32, 1 as u32)
+    var qq: qr.QrCode = qr.qr_new()
+    qr.qr_encode(rt.buf_ptr(&data), 40, qr.QR_MODE_BYTE, qr.QR_ECC_M, 1 as u32, 40 as u32, 0 - 1, false, &qq) catch false
+    var px: rt.Buf = rt.buf_new()
+    var side: usize = 0
+    var t: i64 = 0
+    while t < 4 {
+        picture(&qq, 4 as u32, t, 0, &px, &side)
+        if !read_picture(&px, side, rt.buf_ptr(&data), 40) {
+            failf(f"FAIL picture turned {t} quarters")
+            ok = false
+        }
+        picture(&qq, 3 as u32, t, 57, &px, &side)
+        if !read_picture(&px, side, rt.buf_ptr(&data), 40) {
+            failf(f"FAIL picture turned {t} quarters inside a larger one")
+            ok = false
+        }
+        t = t + 1
+    }
+    // a blank picture and a wrong matrix size are refused, not misread
+    var blank: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < 200 * 200 * 4 {
+        rt.buf_push(&blank, 255 as u8)
+        k++
+    }
+    var rr: qrdec.QrResult = qrdec.qrdec_result_new()
+    refused = false
+    qrdec.qrdec_rgba(rt.buf_ptr(&blank), 200, 200, &rr) catch | e | (mark2(&refused))
+    if !refused {
+        fail("FAIL a blank picture decoded to something")
+    }
+    var wrong: qr.QrCode = qr.qr_new()
+    wrong.size = 22 as u32
+    refused = false
+    qrdec.qrdec_modules(&wrong, &rr) catch | e | (mark2(&refused))
+    if !refused {
+        fail("FAIL a 22x22 matrix decoded to something")
+    }
+    // far too much damage: the decoder must say so, never return wrong data
+    var q3: qr.QrCode = qr.qr_new()
+    qr.qr_encode(rt.buf_ptr(&data), 40, qr.QR_MODE_BYTE, qr.QR_ECC_L, 1 as u32, 40 as u32, 0 - 1, false, &q3) catch false
+    damage(&q3, 150)
+    refused = false
+    let got: bool = qrdec.qrdec_modules(&q3, &rr) catch | e | (mark2(&refused))
+    if !refused && (rt.buf_len(&rr.payload) != 40 || !rt.mem_eq(rt.buf_ptr(&rr.payload), rt.buf_ptr(&data), 40)) {
+        fail("FAIL a destroyed code decoded to the wrong data")
+    }
+    qrdec.qrdec_result_free(&rr)
+    qr.qr_free(&q3)
+    qr.qr_free(&qq)
+    qr.qr_free(&wrong)
+    rt.buf_free(&data)
+    rt.buf_free(&px)
+    rt.buf_free(&blank)
+
+    if bad > 0 || !ok {
+        io.fmt_print_line(f"FAIL {bad} checks")
+        return 1
+    }
+    io.fmt_print_line(f"qr: ok ({cases} matrix round trips)")
+    return 0
+}
+
+fn mark(b: *mut bool) -> bool {
+    *b = true
+    return false
+}
+
+fn mark2(b: *mut bool) -> bool {
+    *b = true
+    return false
+}
