@@ -55,6 +55,8 @@ struct Dml {
     rec: rt.Buf,
     keyrec: rt.Buf,
     kv: u64, // key values
+    vals_n: usize, // bytes allocated for vals / exc
+    dsrc: pl.Source, // reads the rows that are deleted or replaced
     mode: u32,
     changes: i64,
     hook: i32,
@@ -110,19 +112,20 @@ fn dml_new(db: *mut dc.Db, st: *mut dc.Stmt) -> Dml {
         cxc: ex.ctx_new(db, &(*db).schema.ast, 0 as *mut ar.Arena),
         rr: [ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: true }, ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: true }],
         arena: ar.arena_new(), nidx: 0, idx: [-1; 16], vals: 0, exc: 0, rec: rt.buf_new(), keyrec: rt.buf_new(),
-        kv: 0, mode: ax.CF_ABORT, changes: 0, hook: 0 }
+        kv: 0, vals_n: 0, dsrc: pl.source_new(), mode: ax.CF_ABORT, changes: 0, hook: 0 }
     return dv
 }
 
 fn dml_free(e: *mut Dml) {
+    pl.src_free(&(*e).dsrc)
     ar.arena_free(&(*e).arena)
     rt.buf_free(&(*e).rec)
     rt.buf_free(&(*e).keyrec)
     if (*e).vals != 0 {
-        rt.heap_free((*e).vals, 2100 * 40)
+        rt.heap_free((*e).vals, (*e).vals_n)
     }
     if (*e).exc != 0 {
-        rt.heap_free((*e).exc, 2100 * 40)
+        rt.heap_free((*e).exc, (*e).vals_n)
     }
     if (*e).kv != 0 {
         rt.heap_free((*e).kv, 40 * 40)
@@ -175,9 +178,10 @@ fn dml_start(e: *mut Dml, name_p: u64, name_n: usize, with_excluded: bool) -> Db
         (*ix).qual_only = true
         (*e).scope.n = 2
     }
-    (*e).vals = rt.heap_alloc(2100 * 40)
+    (*e).vals_n = ((*t).ncols + 4) * 40
+    (*e).vals = rt.heap_alloc((*e).vals_n)
     if with_excluded {
-        (*e).exc = rt.heap_alloc(2100 * 40)
+        (*e).exc = rt.heap_alloc(((*t).ncols + 4) * 40)
     }
     (*e).kv = rt.heap_alloc(40 * 40)
     if (*e).vals == 0 || (*e).kv == 0 {
@@ -386,29 +390,22 @@ fn unique_msg(e: *mut Dml, ix: *mut dc.Index) -> str {
 fn delete_row_by_id(e: *mut Dml, rowid: i64) -> DbError!bool {
     let db: *mut dc.Db = (*e).db
     let t: *mut dc.Table = table_of(e)
-    var s: pl.Source = pl.source_new()
-    s.tbl = (*e).tidx
-    s.ncols_table = (*t).ncols
-    pl.mark_all_used(&s, (*t).ncols)
-    let found: bool = try pl.src_load_row(&(*e).cx, &s, rowid)
+    let s: *mut pl.Source = &(*e).dsrc
+    (*s).tbl = (*e).tidx
+    (*s).ncols_table = (*t).ncols
+    pl.mark_all_used(s, (*t).ncols)
+    let found: bool = try pl.src_load_row(&(*e).cx, s, rowid)
     if !found {
-        pl.src_free(&s)
         return false
     }
-    let vals: *mut rc.Val = s.vals as *mut rc.Val
+    let vals: *mut rc.Val = (*s).vals as *mut rc.Val
     var i: usize = 0
     while i < (*e).nidx {
         let ix: *mut dc.Index = dc.index_at(&(*db).schema, (*e).idx[i] as usize)
-        let r: DbError!bool = index_remove(e, ix, vals, rowid)
-        if dberr.failed_bool(r) {
-            pl.src_free(&s)
-            return r
-        }
+        try index_remove(e, ix, vals, rowid)
         i = i + 1
     }
-    let r2: DbError!bool = bx.bt_table_delete(&(*db).bt, (*t).root, rowid)
-    pl.src_free(&s)
-    try r2
+    try bx.bt_table_delete(&(*db).bt, (*t).root, rowid)
     return true
 }
 
@@ -559,6 +556,28 @@ fn seq_store(db: *mut dc.Db, tp: u64, tn: usize, value: i64) -> DbError!bool {
 }
 
 // ------------------------------------------------------------------ INSERT
+
+// "table t has 3 columns but 2 values were supplied" / "2 values for 3 columns"
+fn count_msg(t: *mut dc.Table, explicit: bool, expected: usize, got: usize) -> str {
+    var b: rt.Buf = rt.buf_new()
+    if explicit {
+        rt.buf_push_dec_u64(&b, got as u64)
+        ut.put_text(&b, " values for ")
+        rt.buf_push_dec_u64(&b, expected as u64)
+        ut.put_text(&b, " columns")
+    } else {
+        ut.put_text(&b, "table ")
+        rt.buf_push_bytes(&b, (*t).name_p, (*t).name_n)
+        ut.put_text(&b, " has ")
+        rt.buf_push_dec_u64(&b, expected as u64)
+        ut.put_text(&b, " columns but ")
+        rt.buf_push_dec_u64(&b, got as u64)
+        ut.put_text(&b, " values were supplied")
+    }
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
 fn column_map(e: *mut Dml, ins: *mut ax.Node, map: *mut i32, nmapped: *mut usize) -> DbError!bool {
     let t: *mut dc.Table = table_of(e)
     let ast: *mut ax.Ast = &(*(*e).st).ast
@@ -682,30 +701,30 @@ fn insert_inner(e: *mut Dml, st: *mut dc.Stmt) -> DbError!bool {
     try dml_start(e, (*ins).sp, (*ins).sn, upsert >= 0)
     let t: *mut dc.Table = table_of(e)
     (*e).mode = (*ins).op
-    var map: [i32; 2000] = [-1; 2000]
+    var mapbuf: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&mapbuf, ((*t).ncols + 4) * 4)
     var nmapped: usize = 0
-    try column_map(e, ins, &map[0], &nmapped)
-    var dummy_it: *mut sl.SelIter = sl.sel_new(db, st, ast)
-    if (dummy_it as u64) == 0 {
-        return dberr.fail(DbError::NoMemory, "out of memory")
+    let cm: DbError!bool = column_map(e, ins, (rt.buf_ptr(&mapbuf)) as *mut i32, &nmapped)
+    if dberr.failed_bool(cm) {
+        rt.buf_free(&mapbuf)
+        try cm
     }
-    // the sub-selects of the statement are compiled once and kept in the statement
-    let r: DbError!bool = insert_rows(e, st, ins, &map[0], nmapped, dummy_it, upsert)
-    sl.sel_free(dummy_it)
-    try r
+    let ir: DbError!bool = insert_rows(e, st, ins, (rt.buf_ptr(&mapbuf)) as *mut i32, nmapped, upsert)
+    rt.buf_free(&mapbuf)
+    try ir
     return true
 }
 
 #[allow_escape]
 fn insert_rows(e: *mut Dml, st: *mut dc.Stmt, ins: *mut ax.Node, map: *mut i32, nmapped: usize,
-    it: *mut sl.SelIter, upsert: i32) -> DbError!bool {
+    upsert: i32) -> DbError!bool {
     let db: *mut dc.Db = (*e).db
     let ast: *mut ax.Ast = &(*st).ast
     let t: *mut dc.Table = table_of(e)
     let mut_vals: *mut rc.Val = (*e).vals as *mut rc.Val
     var es: ex.Scope = ex.scope_new()
     var srcbuf: rt.Buf = rt.buf_new()
-    rt.buf_reserve(&srcbuf, 2100 * 40)
+    rt.buf_reserve(&srcbuf, ((*t).ncols + 8) * 40)
     let src: *mut rc.Val = (rt.buf_ptr(&srcbuf)) as *mut rc.Val
     var changes: i64 = 0
     var last: i64 = (*db).last_rowid
@@ -730,13 +749,13 @@ fn insert_rows(e: *mut Dml, st: *mut dc.Stmt, ins: *mut ax.Node, map: *mut i32, 
             var cnt: usize = 0
             var x: i32 = (*rn).a
             while x >= 0 {
-                try sl.resolve_full(it, &es, x, false)
+                try sl.resolve_stmt(db, st, &es, x, false)
                 x = (*ax.ast_n(ast, x)).next
             }
             x = (*rn).a
             while x >= 0 {
-                if cnt >= 2000 {
-                    return dberr.fail(DbError::TooBig, "too many values")
+                if cnt >= (*t).ncols + 8 {
+                    return dberr.fail(DbError::Sql, count_msg(t, (*ins).a >= 0, nmapped, cnt + 1))
                 }
                 // VALUES expressions see no row
                 (*e).rr[0].valid = false
@@ -746,7 +765,7 @@ fn insert_rows(e: *mut Dml, st: *mut dc.Stmt, ins: *mut ax.Node, map: *mut i32, 
                 x = (*ax.ast_n(ast, x)).next
             }
             if cnt != nmapped {
-                return dberr.fail(DbError::Sql, text_msg2("table ", (*t).name_p, (*t).name_n, " has a different number of columns than values supplied", 0, 0))
+                return dberr.fail(DbError::Sql, count_msg(t, (*ins).a >= 0, nmapped, cnt))
             }
             var explicit2: bool = false
             let rowid: i64 = try build_new_row(e, map, src, cnt, &explicit2)
@@ -778,12 +797,12 @@ fn insert_rows(e: *mut Dml, st: *mut dc.Stmt, ins: *mut ax.Node, map: *mut i32, 
         }
         if ncol != nmapped {
             rs.rs_free(&rows)
-            return dberr.fail(DbError::Sql, text_msg2("table ", (*t).name_p, (*t).name_n, " has a different number of columns than the SELECT supplies", 0, 0))
+            return dberr.fail(DbError::Sql, count_msg(t, (*ins).a >= 0, nmapped, ncol))
         }
         var i: usize = 0
         while i < rs.rs_count(&rows) {
             ar.arena_reset(&(*e).arena)
-            let got: DbError!usize = rs.rs_get(&rows, i, src, 2000)
+            let got: DbError!usize = rs.rs_get(&rows, i, src, (*t).ncols + 8)
             if dberr.failed_usize(got) {
                 rs.rs_free(&rows)
                 try got
@@ -858,15 +877,13 @@ fn prepare_upsert(e: *mut Dml, upsert: i32) -> DbError!bool {
     let st: *mut dc.Stmt = (*e).st
     let ast: *mut ax.Ast = &(*st).ast
     let un: *mut ax.Node = ax.ast_n(ast, upsert)
-    let it: *mut sl.SelIter = sl.sel_new((*e).db, st, ast)
     var s: i32 = (*un).b
     while s >= 0 {
         let sn: *mut ax.Node = ax.ast_n(ast, s)
-        try sl.resolve_full(it, &(*e).scope, (*sn).a, false)
+        try sl.resolve_stmt((*e).db, st, &(*e).scope, (*sn).a, false)
         s = (*sn).next
     }
-    try sl.resolve_full(it, &(*e).scope, (*un).c, false)
-    sl.sel_free(it)
+    try sl.resolve_stmt((*e).db, st, &(*e).scope, (*un).c, false)
     return true
 }
 
@@ -1177,7 +1194,6 @@ fn update_inner(e: *mut Dml, st: *mut dc.Stmt) -> DbError!bool {
     try dml_start(e, (*un).sp, (*un).sn, false)
     let t: *mut dc.Table = table_of(e)
     (*e).mode = (*un).op
-    let it: *mut sl.SelIter = sl.sel_new(db, st, ast)
     // resolve SET targets and expressions, and WHERE
     var targets: [i32; 64] = [-1; 64]
     var nt: usize = 0
@@ -1186,33 +1202,24 @@ fn update_inner(e: *mut Dml, st: *mut dc.Stmt) -> DbError!bool {
         let sn: *mut ax.Node = ax.ast_n(ast, s)
         let ci: i64 = dc.find_column(t, (*sn).sp, (*sn).sn)
         if ci == -1 {
-            sl.sel_free(it)
             return dberr.fail(DbError::NoSuchColumn, text_msg2("no such column: ", (*sn).sp, (*sn).sn, "", 0, 0))
         }
         var ct: i32 = ci as i32
         if ci == -2 {
             if (*t).rowid_col < 0 {
-                sl.sel_free(it)
                 return dberr.fail(DbError::Unsupported, "UPDATE of the hidden rowid is not supported")
             }
             ct = (*t).rowid_col
         }
         if nt >= 64 {
-            sl.sel_free(it)
             return dberr.fail(DbError::TooBig, "too many columns in SET")
         }
         targets[nt] = ct
         nt = nt + 1
-        let rr: DbError!bool = sl.resolve_full(it, &(*e).scope, (*sn).a, false)
-        if dberr.failed_bool(rr) {
-            sl.sel_free(it)
-            try rr
-        }
+        try sl.resolve_stmt(db, st, &(*e).scope, (*sn).a, false)
         s = (*sn).next
     }
-    let wr: DbError!bool = sl.resolve_full(it, &(*e).scope, (*un).b, false)
-    sl.sel_free(it)
-    try wr
+    try sl.resolve_stmt(db, st, &(*e).scope, (*un).b, false)
     var ids: rt.Buf = rt.buf_new()
     let cr: DbError!bool = collect_rowids(e, (*un).b, &ids)
     if dberr.failed_bool(cr) {
@@ -1358,10 +1365,7 @@ fn delete_inner(e: *mut Dml, st: *mut dc.Stmt) -> DbError!bool {
         (*db).total_changes = (*db).total_changes + n
         return true
     }
-    let it: *mut sl.SelIter = sl.sel_new(db, st, ast)
-    let wr: DbError!bool = sl.resolve_full(it, &(*e).scope, (*dn).a, false)
-    sl.sel_free(it)
-    try wr
+    try sl.resolve_stmt(db, st, &(*e).scope, (*dn).a, false)
     var ids: rt.Buf = rt.buf_new()
     let cr: DbError!bool = collect_rowids(e, (*dn).a, &ids)
     if dberr.failed_bool(cr) {

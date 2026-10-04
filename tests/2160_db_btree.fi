@@ -1,0 +1,264 @@
+// expect_exit: 0
+// tests/2160_db_btree.fi -- lib/db/pager + lib/db/btree on their own, no SQL:
+// a new file, a table tree and an index tree filled in pseudo-random order with payloads from
+// 0 to 9000 octets (overflow pages), read back in order, half of them deleted (merges, the
+// root losing a level), the freelist reused, a rollback, a statement savepoint, a reopen.
+// Every tree is walked by `bt_check` (key order, cell bounds, no overlap, equal depth).
+import std.rt
+import std.io
+import std.fs
+import db.dberr
+import db.pager as pgr
+import db.btree as bx
+import db.record as rc
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+fn scratch_path() -> str {
+    var b: rt.Buf = rt.buf_new()
+    let head: str = "/tmp/firn_db_2160_"
+    rt.buf_push_bytes(&b, head.p as u64, head.length())
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn rowid_of(i: i64) -> i64 {
+    return ((i * 2654435761) % 4294967296) + 1
+}
+
+fn len_of(i: i64, maxlen: i64) -> i64 {
+    return (i * 31 + 7) % maxlen
+}
+
+// the record of row i: (NULL, text of len_of(i) letters)
+fn make_row(i: i64, maxlen: i64, text: *mut rt.Buf, rec: *mut rt.Buf) {
+    rt.buf_clear(text)
+    let n: i64 = len_of(i, maxlen)
+    var j: i64 = 0
+    while j < n {
+        rt.buf_push(text, (97 + (i + j) % 26) as u8)
+        j = j + 1
+    }
+    var v: [rc.Val; 2] = [rc.val_null(), rc.val_text(rt.buf_ptr(text), rt.buf_len(text))]
+    rt.buf_clear(rec)
+    rc.rec_encode(&v[0], 2, rec)
+}
+
+fn tree_ok(bt: *mut bx.Bt, root: u32, index: bool) -> bool {
+    var st: bx.CheckStats = bx.CheckStats { pages: 0, cells: 0, leaf_depth: 0, problems: 0, bytes_free: 0 }
+    let ok: bool = bx.bt_check(bt, root, index, &st) catch false
+    return ok
+}
+
+fn run(t: *mut Tally, path: str, page_size: usize, cache: usize, n: i64, maxlen: i64) -> bool {
+    var pg: pgr.Pager = pgr.pager_new()
+    pgr.pager_open(&pg, path, true, false, page_size, cache) catch false
+    pgr.pager_set_sync(&pg, 0)
+    var bt: bx.Bt = bx.bt_new(&pg)
+    check(t, "begin write", pgr.pager_begin_write(&pg) catch false)
+    check(t, "init new file", pgr.pager_init_new(&pg) catch false)
+    let troot: u32 = bx.bt_create(&bt, false) catch 0
+    let iroot: u32 = bx.bt_create(&bt, true) catch 0
+    check(t, "roots", troot >= 2 && iroot > troot)
+    var text: rt.Buf = rt.buf_new()
+    var rec: rt.Buf = rt.buf_new()
+    var irec: rt.Buf = rt.buf_new()
+    var gone: bx.Payload = bx.Payload { p: 0, n: 0 }
+    // ---- fill
+    var i: i64 = 0
+    var bad: i64 = 0
+    while i < n {
+        make_row(i, maxlen, &text, &rec)
+        let a: bool = bx.bt_table_insert(&bt, troot, rowid_of(i), rt.buf_ptr(&rec), rt.buf_len(&rec)) catch false
+        var iv: [rc.Val; 2] = [rc.val_text(rt.buf_ptr(&text), rt.buf_len(&text)), rc.val_int(rowid_of(i))]
+        var uk: rc.UKey = rc.ukey_new((&iv[0]) as u64, 2, 0)
+        rt.buf_clear(&irec)
+        rc.rec_encode(&iv[0], 2, &irec)
+        let b: bool = bx.bt_index_insert(&bt, iroot, &uk, rt.buf_ptr(&irec), rt.buf_len(&irec)) catch false
+        if !a || !b {
+            bad = bad + 1
+        }
+        i = i + 1
+    }
+    check(t, "all inserted", bad == 0)
+    check(t, "table tree valid", tree_ok(&bt, troot, false))
+    check(t, "index tree valid", tree_ok(&bt, iroot, true))
+    check(t, "table count", (bx.bt_count(&bt, troot, false) catch -1) == n)
+    check(t, "index count", (bx.bt_count(&bt, iroot, true) catch -1) == n)
+    // ---- read back in rowid order: strictly rising, each payload as written
+    var cur: bx.Cursor = bx.cur_new(troot, false)
+    var ok: bool = bx.bt_first(&bt, &cur) catch false
+    var last: i64 = 0
+    var seen: i64 = 0
+    var order_ok: bool = true
+    var payload_ok: bool = true
+    while ok {
+        let r: i64 = bx.bt_rowid(&bt, &cur) catch 0
+        if r <= last {
+            order_ok = false
+        }
+        last = r
+        seen = seen + 1
+        ok = bx.bt_next(&bt, &cur) catch false
+    }
+    check(t, "rowids rise", order_ok)
+    check(t, "all rows seen", seen == n)
+    // a sample of exact lookups
+    var k: i64 = 0
+    while k < n {
+        make_row(k, maxlen, &text, &rec)
+        var pl: bx.Payload = bx.Payload { p: 0, n: 0 }
+        let f: bool = bx.bt_table_find(&bt, troot, rowid_of(k), &pl) catch false
+        if !f || pl.n != rt.buf_len(&rec) || !same_bytes(pl.p, rt.buf_ptr(&rec), pl.n) {
+            payload_ok = false
+        }
+        k = k + 7
+    }
+    check(t, "payloads exact", payload_ok)
+    // ---- the index in key order: texts do not fall
+    var icur: bx.Cursor = bx.cur_new(iroot, true)
+    var iok: bool = bx.bt_first(&bt, &icur) catch false
+    var inorder: bool = true
+    var prev: [rc.Val; 2] = [rc.val_null(), rc.val_null()]
+    var prev_buf: rt.Buf = rt.buf_new()
+    var first_row: bool = true
+    while iok {
+        let pl2: bx.Payload = bx.bt_payload(&bt, &icur) catch gone
+        var cv: [rc.Val; 2] = [rc.val_null(), rc.val_null()]
+        rc.rec_decode(pl2.p, pl2.n, &cv[0], 2) catch 0
+        if !first_row {
+            var c: i64 = rc.val_compare(&prev[0], &cv[0])
+            if c == 0 {
+                c = rc.val_compare(&prev[1], &cv[1])
+            }
+            if c >= 0 {
+                inorder = false
+            }
+        }
+        first_row = false
+        rt.buf_clear(&prev_buf)
+        rt.buf_push_bytes(&prev_buf, pl2.p, pl2.n)
+        rc.rec_decode(rt.buf_ptr(&prev_buf), rt.buf_len(&prev_buf), &prev[0], 2) catch 0
+        iok = bx.bt_next(&bt, &icur) catch false
+    }
+    check(t, "index in key order", inorder)
+    // ---- delete the odd half (index entries through their keys)
+    var d: i64 = 1
+    var dbad: i64 = 0
+    while d < n {
+        make_row(d, maxlen, &text, &rec)
+        var iv2: [rc.Val; 2] = [rc.val_text(rt.buf_ptr(&text), rt.buf_len(&text)), rc.val_int(rowid_of(d))]
+        var uk2: rc.UKey = rc.ukey_new((&iv2[0]) as u64, 2, 0)
+        let a2: bool = bx.bt_table_delete(&bt, troot, rowid_of(d)) catch false
+        let b2: bool = bx.bt_index_delete(&bt, iroot, &uk2) catch false
+        if !a2 || !b2 {
+            dbad = dbad + 1
+        }
+        d = d + 2
+    }
+    check(t, "all deleted", dbad == 0)
+    check(t, "table tree valid after deletes", tree_ok(&bt, troot, false))
+    check(t, "index tree valid after deletes", tree_ok(&bt, iroot, true))
+    check(t, "table count after", (bx.bt_count(&bt, troot, false) catch -1) == (n + 1) / 2)
+    check(t, "index count after", (bx.bt_count(&bt, iroot, true) catch -1) == (n + 1) / 2)
+    check(t, "a deleted row is gone", !(bx.bt_table_find(&bt, troot, rowid_of(1), &gone) catch true))
+    // ---- commit, close, reopen, read
+    check(t, "commit", pgr.pager_commit(&pg) catch false)
+    pgr.pager_close(&pg)
+    var pg2: pgr.Pager = pgr.pager_new()
+    pgr.pager_open(&pg2, path, false, false, page_size, cache) catch false
+    var bt2: bx.Bt = bx.bt_new(&pg2)
+    check(t, "reopen read", pgr.pager_begin_read(&pg2) catch false)
+    check(t, "count after reopen", (bx.bt_count(&bt2, troot, false) catch -1) == (n + 1) / 2)
+    check(t, "table tree valid after reopen", tree_ok(&bt2, troot, false))
+    check(t, "index tree valid after reopen", tree_ok(&bt2, iroot, true))
+    pgr.pager_end_read(&pg2)
+    // ---- the freelist is reused: refill the deleted rows, the file does not grow much
+    check(t, "begin write 2", pgr.pager_begin_write(&pg2) catch false)
+    let pages_before: u32 = pgr.pager_page_count(&pg2)
+    var r2: i64 = 1
+    var rbad: i64 = 0
+    while r2 < n {
+        make_row(r2, maxlen, &text, &rec)
+        let a3: bool = bx.bt_table_insert(&bt2, troot, rowid_of(r2), rt.buf_ptr(&rec), rt.buf_len(&rec)) catch false
+        if !a3 {
+            rbad = rbad + 1
+        }
+        r2 = r2 + 2
+    }
+    check(t, "refilled", rbad == 0)
+    let pages_after: u32 = pgr.pager_page_count(&pg2)
+    check(t, "freelist reused (pages before/after)", pages_after <= pages_before + pages_before / 4 + 4)
+    check(t, "tree valid after refill", tree_ok(&bt2, troot, false))
+    // ---- a rollback undoes everything since the begin
+    check(t, "rollback", pgr.pager_rollback(&pg2) catch false)
+    check(t, "begin read 3", pgr.pager_begin_read(&pg2) catch false)
+    check(t, "count after rollback", (bx.bt_count(&bt2, troot, false) catch -1) == (n + 1) / 2)
+    check(t, "page count after rollback", pgr.pager_page_count(&pg2) == pages_before)
+    pgr.pager_end_read(&pg2)
+    // ---- a statement savepoint inside a transaction
+    check(t, "begin write 3", pgr.pager_begin_write(&pg2) catch false)
+    make_row(1, maxlen, &text, &rec)
+    bx.bt_table_insert(&bt2, troot, rowid_of(1), rt.buf_ptr(&rec), rt.buf_len(&rec)) catch false
+    pgr.pager_stmt_begin(&pg2)
+    var s: i64 = 3
+    while s < 200 {
+        make_row(s, maxlen, &text, &rec)
+        bx.bt_table_insert(&bt2, troot, rowid_of(s), rt.buf_ptr(&rec), rt.buf_len(&rec)) catch false
+        s = s + 2
+    }
+    check(t, "statement rollback", pgr.pager_stmt_rollback(&pg2) catch false)
+    check(t, "count after statement rollback", (bx.bt_count(&bt2, troot, false) catch -1) == (n + 1) / 2 + 1)
+    check(t, "tree valid after statement rollback", tree_ok(&bt2, troot, false))
+    check(t, "commit 3", pgr.pager_commit(&pg2) catch false)
+    pgr.pager_close(&pg2)
+    bx.bt_free(&bt)
+    bx.bt_free(&bt2)
+    rt.buf_free(&text)
+    rt.buf_free(&rec)
+    rt.buf_free(&irec)
+    rt.buf_free(&prev_buf)
+    fs.remove(path) catch false
+    return true
+}
+
+fn same_bytes(a: u64, b: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(a, i) != rt.ld8(b, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let path: str = scratch_path()
+    // small pages and a small cache force deep trees, splits and spills; the large page size and long
+    // payloads the other end
+    run(&t, path, 512, 64, 1200, 300)
+    run(&t, path, 1024, 100, 900, 3000)
+    run(&t, path, 4096, 200, 1500, 9000)
+    run(&t, path, 65536, 64, 800, 20)
+    io.fmt_print_line(io.fmt_number(io.fmt_text(io.fmt_number(io.fmt_text(io.fmt_new(), "checks ".p as u64, 7), t.total), " failed ".p as u64, 8), t.fails))
+    if t.fails != 0 {
+        return 1
+    }
+    return 0
+}

@@ -1,0 +1,100 @@
+// expect_exit: 0
+// tests/2164_db_readsqlite.fi -- lib/db reads and changes a database that SQLite made
+// (tests/data/db/sample.db, tools/db/make_sample.py: 512 octet pages, so the trees are
+// several levels deep; an overflow value of 6000 octets; NULL, REAL, BLOB, unicode;
+// an index and a descending index; a dropped table, so a freelist; user_version 42).
+// The expected answers were asked of SQLite itself.
+import std.rt
+import std.io
+import std.fs
+import db.dberr
+import db.dbcore as dc
+import db.sqlite as sq
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, got: str, want: str) {
+    (*t).total = (*t).total + 1
+    if !got.equal(want) {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print(what)
+        io.print(": got [")
+        io.print(got)
+        io.print("] want [")
+        io.print(want)
+        io.print_line("]")
+    }
+}
+
+fn q(d: *mut dc.Db, sql: str) -> str {
+    return sq.db_query_all(d, sql) catch | e | (sq.last_error_message())
+}
+
+fn scratch_path() -> str {
+    var b: rt.Buf = rt.buf_new()
+    let head: str = "/tmp/firn_db_2164_"
+    rt.buf_push_bytes(&b, head.p as u64, head.length())
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    // a private copy of the sample
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file("tests/data/db/sample.db", &data) catch 0
+    if n == 0 {
+        io.print_line("FAIL cannot read tests/data/db/sample.db")
+        return 1
+    }
+    let path: str = scratch_path()
+    fs.write_file(path, rt.buf_ptr(&data), n) catch 0
+    let d: *mut dc.Db = sq.db_open(path, sq.OPEN_CREATE) catch | e | (0 as *mut dc.Db)
+    if (d as u64) == 0 {
+        io.print_line("FAIL cannot open the sample")
+        return 2
+    }
+    check(&t, "row count", q(d, "SELECT count(*) FROM cities"), "241")
+    check(&t, "sum with NULLs", q(d, "SELECT sum(pop) FROM cities"), "11382066")
+    check(&t, "index lookup", q(d, "SELECT count(*) FROM cities WHERE country = 'AT'"), "41")
+    check(&t, "unicode order", q(d, "SELECT name FROM countries ORDER BY name"), "Austria;France;Germany;Italy;Switzerland;日本")
+    check(&t, "group by", q(d, "SELECT country, count(*), sum(pop) FROM cities GROUP BY country ORDER BY country"),
+        "AT|41|1938267;CH|40|1909718;DE|40|1823712;FR|40|1995724;IT|40|1797008;JP|40|1917637")
+    check(&t, "NULL test", q(d, "SELECT id, name FROM cities WHERE pop IS NULL ORDER BY id LIMIT 3"), "17|Theta17;34|Épsilon34;51|Beta51")
+    check(&t, "overflow value", q(d, "SELECT length(name) FROM cities WHERE id = 1000"), "6000")
+    check(&t, "descending index", q(d, "SELECT pop FROM cities ORDER BY pop DESC LIMIT 3"), "99819;99638;98897")
+    check(&t, "blob", q(d, "SELECT hex(flag) FROM cities WHERE id = 5"), "052300FF")
+    check(&t, "blob as text", q(d, "SELECT flag FROM cities WHERE id = 10"), "x'0a4600ff'")
+    check(&t, "user_version", q(d, "PRAGMA user_version"), "42")
+    check(&t, "page_count", q(d, "PRAGMA page_count"), "49")
+    check(&t, "freelist", q(d, "PRAGMA freelist_count"), "7")
+    check(&t, "integrity of SQLite's file", q(d, "PRAGMA integrity_check"), "ok")
+    check(&t, "schema", q(d, "SELECT type, name FROM sqlite_master ORDER BY name"),
+        "table|cities;index|cities_country;index|cities_pop;table|countries;index|sqlite_autoindex_countries_1")
+    check(&t, "real column", q(d, "SELECT area FROM countries ORDER BY code"), "83879.0;41285.5;357022.0;NULL;301340.0;377975.0")
+    // changes, as a program would make them
+    check(&t, "insert", q(d, "INSERT INTO cities(country, name, pop) VALUES ('AT', 'Neustadt', 12345)"), "")
+    check(&t, "new rowid", q(d, "SELECT max(id) FROM cities"), "1001")
+    check(&t, "update", q(d, "UPDATE cities SET pop = pop + 1 WHERE country = 'CH'"), "")
+    check(&t, "update result", q(d, "SELECT sum(pop) FROM cities WHERE country = 'CH'"), "1909756")
+    check(&t, "delete", q(d, "DELETE FROM cities WHERE id > 100 AND id < 1000"), "")
+    check(&t, "after delete", q(d, "SELECT count(*) FROM cities"), "102")
+    check(&t, "create", q(d, "CREATE TABLE visits(id INTEGER PRIMARY KEY, city INTEGER, at INTEGER)"), "")
+    check(&t, "bulk", q(d, "INSERT INTO visits(city, at) SELECT id, id * 10 FROM cities"), "")
+    check(&t, "join", q(d, "SELECT count(*), sum(v.at) FROM visits v JOIN cities c ON c.id = v.city WHERE c.country = 'DE'"), "17|8330")
+    check(&t, "integrity after", q(d, "PRAGMA integrity_check"), "ok")
+    check(&t, "user_version kept", q(d, "PRAGMA user_version"), "42")
+    sq.db_close(d)
+    fs.remove(path) catch false
+    io.fmt_print_line(io.fmt_number(io.fmt_number(io.fmt_text(io.fmt_new(), "checks ".p as u64, 7), t.total), t.fails))
+    if t.fails != 0 {
+        return 1
+    }
+    return 0
+}
