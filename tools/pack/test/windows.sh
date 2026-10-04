@@ -52,6 +52,14 @@ Xvfb $DISP -screen 0 1024x768x24 >/dev/null 2>&1 &
 XPID=$!
 sleep 1
 export DISPLAY=$DISP
+# A window created while Wine's server is still cold (its explorer has not loaded the X driver yet) fails
+# with "no driver could be loaded" -- a Wine start-up race, not the programs'. A server that stays up
+# (`wineserver -p`) and one window of Wine's own (notepad, closed by `timeout`) make every later start warm.
+wineserver -k 2>/dev/null; sleep 1
+wineserver -p
+wine cmd /c exit >/dev/null 2>&1
+( timeout 6 wine notepad >/dev/null 2>&1 )
+sleep 1
 
 # ---- build
 P="python3 $ROOT/tools/pack/pack.py"
