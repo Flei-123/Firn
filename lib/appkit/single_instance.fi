@@ -12,6 +12,21 @@
 // The kernel drops it when the process ends, however it ends -- a crash
 // leaves no stale lock, which a pid file cannot promise.
 //
+// HANDING THE COMMAND LINE OVER (desktop round, `docs/DESKTOP.md`). The second
+// copy usually has a reason to start: a file was double-clicked, a link opened.
+// Instead of only saying "already running" it can pass its arguments to the
+// first copy:
+//
+//     first copy:   if single.single_acquire(0) == SI_OK { single.single_listen() }
+//                   ... in the event loop:  if single.single_poll(0, &msg) { open(single.single_item(&msg, 1)) }
+//     second copy:  if single.single_acquire(0) == SI_HELD { single.single_send_args(1); exit }
+//
+// The channel is a local socket next to the lock file (a named pipe on
+// Windows), reachable by the same user only. A message is the current
+// directory followed by the arguments, each as a NUL-terminated item (item 0
+// is the directory). The sender waits for the first copy's acknowledgement, so
+// `single_send_args` returning true means "the other copy has it".
+//
 // WAITING. A program that has just updated itself is started while the old
 // copy is still closing its window. `single_acquire(wait_ms)` retries every
 // 100 ms for that long; the updater's restart passes a few seconds.
@@ -21,7 +36,11 @@ import appkit.util
 import appkit.appinfo
 import appkit.platform
 
-export { single_acquire, single_release, single_held, SI_OK, SI_HELD, SI_ERROR }
+export {
+    single_acquire, single_release, single_held, SI_OK, SI_HELD, SI_ERROR,
+    single_listen, single_poll, single_send_args, single_send_text, single_item, single_stop_listening,
+    single_endpoint,
+}
 
 const SI_OK: u32 = 0
 const SI_HELD: u32 = 1 // another copy is running
@@ -79,4 +98,250 @@ fn single_release() {
 
 fn single_held() -> bool {
     return G_HANDLE >= 0
+}
+
+// ------------------------------------------------- the command line channel
+
+static mut G_LISTENER: i64 = -1
+static mut G_EP: [u8; 160] = [0; 160]
+static mut G_EP_N: usize = 0
+
+const MAGIC: u32 = 827605318 // "FIN1" read as a little endian number
+const MAX_MSG: usize = 65536
+
+fn endpoint_name(out: *mut rt.Buf) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    if !lock_path(&p) {
+        rt.buf_free(&p)
+        return false
+    }
+    let ok: bool = platform.plat_ipc_name(util.buf_to_str_copy(&p), out)
+    rt.buf_free(&p)
+    return ok
+}
+
+// The name of the channel (for tests and messages).
+fn single_endpoint(out: *mut rt.Buf) -> bool {
+    return endpoint_name(out)
+}
+
+// Starts listening. Call it only after `single_acquire` said SI_OK: the lock
+// is what makes a socket that is already there stale.
+fn single_listen() -> bool {
+    if G_LISTENER >= 0 {
+        return true
+    }
+    if G_HANDLE < 0 {
+        return false
+    }
+    var ep: rt.Buf = rt.buf_new()
+    if !endpoint_name(&ep) || rt.buf_len(&ep) > 159 {
+        rt.buf_free(&ep)
+        return false
+    }
+    let l: i64 = platform.plat_ipc_listen(util.buf_to_str_copy(&ep))
+    if l >= 0 {
+        rt.mem_copy((&G_EP[0]) as u64, rt.buf_ptr(&ep), rt.buf_len(&ep))
+        G_EP_N = rt.buf_len(&ep)
+        G_LISTENER = l
+    }
+    rt.buf_free(&ep)
+    return l >= 0
+}
+
+fn single_stop_listening() {
+    if G_LISTENER >= 0 {
+        platform.plat_ipc_unlisten(G_LISTENER, str { p: (&G_EP[0]) as *mut u8, n: G_EP_N })
+        G_LISTENER = -1
+    }
+}
+
+fn put_le32(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 16) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 24) & 255 as u32) as u8)
+}
+
+fn get_le32(p: u64) -> u32 {
+    return (rt.ld8(p, 0) as u32) | ((rt.ld8(p, 1) as u32) << 8) | ((rt.ld8(p, 2) as u32) << 16)
+        | ((rt.ld8(p, 3) as u32) << 24)
+}
+
+// Reads exactly `n` octets (each wait at most 2 s). false = the peer left or stalled.
+fn read_exact(c: i64, dst: u64, n: usize) -> bool {
+    var got: usize = 0
+    while got < n {
+        let r: i64 = platform.plat_ipc_read(c, dst + got as u64, n - got, 2000)
+        if r <= 0 {
+            return false
+        }
+        got = got + r as usize
+    }
+    return true
+}
+
+// Waits up to `ms` for a copy to hand over its command line. true = `out`
+// holds the message: the directory and then the arguments, each followed by a NUL.
+fn single_poll(ms: i64, out: *mut rt.Buf) -> bool {
+    if G_LISTENER < 0 {
+        return false
+    }
+    let c: i64 = platform.plat_ipc_accept(G_LISTENER, ms)
+    if c < 0 {
+        return false
+    }
+    var head: [u8; 8] = [0; 8]
+    var ok: bool = read_exact(c, (&head[0]) as u64, 8)
+    var n: u32 = 0
+    if ok {
+        n = get_le32((&head[4]) as u64)
+        ok = get_le32((&head[0]) as u64) == MAGIC && (n as usize) <= MAX_MSG
+    }
+    rt.buf_clear(out)
+    if ok {
+        var tmp: rt.Buf = rt.buf_new()
+        rt.buf_reserve(&tmp, n as usize + 1)
+        var got: usize = 0
+        var chunk: [u8; 2048] = [0; 2048]
+        while ok && got < n as usize {
+            var want: usize = n as usize - got
+            if want > 2048 {
+                want = 2048
+            }
+            ok = read_exact(c, (&chunk[0]) as u64, want)
+            if ok {
+                rt.buf_push_bytes(&tmp, (&chunk[0]) as u64, want)
+                got = got + want
+            }
+        }
+        // payload: u32 count, then count * (u32 length, octets) -> NUL separated items
+        if ok {
+            let base: u64 = rt.buf_ptr(&tmp)
+            let total: usize = rt.buf_len(&tmp)
+            var pos: usize = 4
+            ok = total >= 4
+            var count: u32 = 0
+            if ok {
+                count = get_le32(base)
+            }
+            var i: u32 = 0
+            while ok && i < count {
+                if pos + 4 > total {
+                    ok = false
+                } else {
+                    let l: usize = get_le32(base + pos as u64) as usize
+                    pos = pos + 4
+                    if pos + l > total {
+                        ok = false
+                    } else {
+                        rt.buf_push_bytes(out, base + pos as u64, l)
+                        rt.buf_push(out, 0 as u8)
+                        pos = pos + l
+                    }
+                }
+                i = i + 1 as u32
+            }
+        }
+        rt.buf_free(&tmp)
+    }
+    if ok {
+        var ack: [u8; 1] = [75]
+        platform.plat_ipc_write(c, (&ack[0]) as u64, 1)
+    } else {
+        rt.buf_clear(out)
+    }
+    platform.plat_ipc_close(c)
+    return ok
+}
+
+// Item `i` of a message from `single_poll` (0 = the sender's directory, 1.. = its arguments).
+fn single_item(msg: *mut rt.Buf, i: usize) -> str {
+    let n: usize = rt.buf_len(msg)
+    let p: u64 = rt.buf_ptr(msg)
+    var idx: usize = 0
+    var start: usize = 0
+    var k: usize = 0
+    while k < n {
+        if rt.ld8(p, k) == 0 as u8 {
+            if idx == i {
+                return str { p: (p + start as u64) as *mut u8, n: k - start }
+            }
+            idx = idx + 1
+            start = k + 1
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+// Hands `items` (the directory first, then the arguments, each followed by a
+// NUL) to the running copy. true = the other copy acknowledged it.
+fn single_send_text(items: str) -> bool {
+    var ep: rt.Buf = rt.buf_new()
+    if !endpoint_name(&ep) {
+        rt.buf_free(&ep)
+        return false
+    }
+    let c: i64 = platform.plat_ipc_connect(util.buf_to_str_copy(&ep))
+    rt.buf_free(&ep)
+    if c < 0 {
+        return false
+    }
+    var payload: rt.Buf = rt.buf_new()
+    var count: u32 = 0
+    var i: usize = 0
+    var start: usize = 0
+    var body: rt.Buf = rt.buf_new()
+    while i < items.length() {
+        if items.chars(i) == 0 as u8 {
+            put_le32(&body, (i - start) as u32)
+            rt.buf_push_bytes(&body, items.p as u64 + start as u64, i - start)
+            count = count + 1 as u32
+            start = i + 1
+        }
+        i = i + 1
+    }
+    put_le32(&payload, count)
+    rt.buf_push_bytes(&payload, rt.buf_ptr(&body), rt.buf_len(&body))
+    rt.buf_free(&body)
+    var msg: rt.Buf = rt.buf_new()
+    put_le32(&msg, MAGIC)
+    put_le32(&msg, rt.buf_len(&payload) as u32)
+    rt.buf_push_bytes(&msg, rt.buf_ptr(&payload), rt.buf_len(&payload))
+    var ok: bool = rt.buf_len(&payload) <= MAX_MSG
+    if ok {
+        ok = platform.plat_ipc_write(c, rt.buf_ptr(&msg), rt.buf_len(&msg))
+    }
+    rt.buf_free(&msg)
+    rt.buf_free(&payload)
+    if ok {
+        var ack: [u8; 1] = [0]
+        let r: i64 = platform.plat_ipc_read(c, (&ack[0]) as u64, 1, 3000)
+        ok = r == 1 && ack[0] == 75 as u8
+    }
+    platform.plat_ipc_close(c)
+    return ok
+}
+
+// Hands this copy's current directory and its arguments from index `first`
+// on (1 = everything after the program name) to the running copy.
+fn single_send_args(first: usize) -> bool {
+    var items: rt.Buf = rt.buf_new()
+    var cwd: rt.Buf = rt.buf_new()
+    if platform.plat_cwd(&cwd) {
+        rt.buf_push_bytes(&items, rt.buf_ptr(&cwd), rt.buf_len(&cwd))
+    }
+    rt.buf_free(&cwd)
+    rt.buf_push(&items, 0 as u8)
+    var i: usize = first
+    while i < platform.plat_argc() {
+        let a: str = platform.plat_arg(i)
+        rt.buf_push_bytes(&items, a.p as u64, a.length())
+        rt.buf_push(&items, 0 as u8)
+        i = i + 1
+    }
+    let ok: bool = single_send_text(util.buf_to_str_copy(&items))
+    rt.buf_free(&items)
+    return ok
 }

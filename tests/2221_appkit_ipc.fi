@@ -1,0 +1,215 @@
+// expect_exit: 0
+// tests/2221_appkit_ipc.fi -- appkit.single_instance: the second copy hands its command line to the first.
+// The program starts ITSELF as the second copy (`argv[0] --second ...`).
+//
+//   A  the first copy listens; nothing arrives -> quiet
+//   B  a second copy sends 4 arguments (blank in one, UTF-8, an empty one): item 0 = its directory
+//   C  a message of 50 000 octets (several reads), an oversized one (> 64 KiB) is refused
+//   D  garbage and a client that sends nothing do not hang or break the listener
+//   E  after single_stop_listening: the socket is gone and a second copy's send fails
+//   F  a stale socket file of a dead copy is replaced
+import std.rt
+import std.str
+import std.fs
+import std.process
+import appkit.appinfo
+import appkit.platform
+import appkit.single_instance
+import appkit.util
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+// a start block whose environment holds APPKIT_HOME=<home>
+fn fake_start(home: str, env: *mut rt.Buf, a0: *mut [u8; 2], block: *mut [u64; 8]) {
+    util.buf_push_str(env, "APPKIT_HOME=")
+    util.buf_push_str(env, home)
+    rt.buf_push(env, 0 as u8)
+    (*block)[0] = 1
+    (*block)[1] = (&(*a0)[0]) as u64
+    (*block)[2] = 0
+    (*block)[3] = rt.buf_ptr(env)
+    (*block)[4] = 0
+}
+
+fn init_app(start: u64) -> bool {
+    platform.plat_init(start)
+    var spec: appinfo.AppSpec = appinfo.AppSpec { id: "ipctest", name: "Ipc Test", vendor: "V", version: "1.0.0",
+        build: 0, channel: "stabil", store_url: "http://127.0.0.1/",
+        store_key: "0000000000000000000000000000000000000000000000000000000000000000", android_id: "" }
+    return appinfo.appinfo_ready() || appinfo.appinfo_init(spec)
+}
+
+#[allow_escape]
+fn second_main(start: u64) -> i32 {
+    // the child: its environment is the real one with APPKIT_HOME set by the parent
+    if !init_app(start) { return 10 }
+    let r: u32 = single_instance.single_acquire(0 as u64)
+    if r != single_instance.SI_HELD { return 11 }
+    var first: usize = 3
+    if arg(start, 2) == "big" {
+        // a message of 50 000 octets in one argument
+        var b: rt.Buf = rt.buf_new()
+        var k: usize = 0
+        while k < 50000 {
+            rt.buf_push(&b, (97 + k % 26) as u8)
+            k = k + 1
+        }
+        var items: rt.Buf = rt.buf_new()
+        rt.buf_push(&items, 47 as u8)
+        rt.buf_push(&items, 0 as u8)
+        rt.buf_push_bytes(&items, rt.buf_ptr(&b), rt.buf_len(&b))
+        rt.buf_push(&items, 0 as u8)
+        if single_instance.single_send_text(util.buf_to_str_copy(&items)) { return 0 }
+        return 12
+    }
+    if arg(start, 2) == "huge" {
+        var items: rt.Buf = rt.buf_new()
+        rt.buf_push(&items, 47 as u8)
+        rt.buf_push(&items, 0 as u8)
+        var k: usize = 0
+        while k < 70000 {
+            rt.buf_push(&items, 120 as u8)
+            k = k + 1
+        }
+        rt.buf_push(&items, 0 as u8)
+        if single_instance.single_send_text(util.buf_to_str_copy(&items)) { return 13 }
+        return 0 // refused, as it must be
+    }
+    if single_instance.single_send_args(first) { return 0 }
+    return 14
+}
+
+fn spawn_second(me: str, home: str, mode: str, a: str, b: str, c: str, d: str) -> process.Child {
+    var cmd: process.Command = process.command(me)
+    process.add_arg(&cmd, "--second")
+    process.add_arg(&cmd, mode)
+    if mode == "args" {
+        process.add_arg(&cmd, a)
+        process.add_arg(&cmd, b)
+        process.add_arg(&cmd, c)
+        process.add_arg(&cmd, d)
+    }
+    process.set_env(&cmd, "APPKIT_HOME", home)
+    let ch: process.Child = process.spawn(&cmd) catch | e | process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1,
+        done: true, code: 99, sig: 0, own: true }
+    process.command_free(&cmd)
+    return ch
+}
+
+// polls until a message arrives (or ~6 s)
+fn await_message(out: *mut rt.Buf) -> bool {
+    var i: u32 = 0
+    while i < 30 as u32 {
+        if single_instance.single_poll(200, out) { return true }
+        i = i + 1 as u32
+    }
+    return false
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) >= 3 && arg(start, 1) == "--second" {
+        return second_main(start)
+    }
+    let me: str = arg(start, 0)
+    var homeb: rt.Buf = rt.buf_new()
+    util.buf_push_str(&homeb, "/tmp/firn_ipc_2221_")
+    rt.buf_push_dec_i64(&homeb, syscall(39, 0, 0, 0, 0, 0, 0))
+    let home: str = util.buf_to_str_copy(&homeb)
+    fs.remove_tree(home) catch false
+    fs.mkdir_all(home) catch false
+    var env: rt.Buf = rt.buf_new()
+    var a0: [u8; 2] = "t\0"
+    var block: [u64; 8] = [0; 8]
+    fake_start(home, &env, &a0, &block)
+    if !init_app((&block[0]) as u64) { return 1 }
+
+    // A
+    if single_instance.single_listen() { return 2 } // not before the lock is held
+    if single_instance.single_acquire(0 as u64) != single_instance.SI_OK { return 3 }
+    if !single_instance.single_listen() { return 4 }
+    var msg: rt.Buf = rt.buf_new()
+    if single_instance.single_poll(30, &msg) { return 5 }
+
+    // B
+    var ch: process.Child = spawn_second(me, home, "args", "hello world", "\u{fc}ber", "", "--flag=1")
+    if !await_message(&msg) { return 6 }
+    if process.wait(&ch) != 0 { return 7 }
+    process.close(&ch)
+    if single_instance.single_item(&msg, 1) != "hello world" { return 8 }
+    if single_instance.single_item(&msg, 2) != "\u{fc}ber" { return 9 }
+    if single_instance.single_item(&msg, 3) != "" { return 10 }
+    if single_instance.single_item(&msg, 4) != "--flag=1" { return 11 }
+    if single_instance.single_item(&msg, 5) != "" { return 12 }
+    if single_instance.single_item(&msg, 0).length() == 0 || single_instance.single_item(&msg, 0).chars(0) != 47 as u8 { return 13 }
+
+    // C
+    var ch2: process.Child = spawn_second(me, home, "big", "", "", "", "")
+    if !await_message(&msg) { return 14 }
+    if process.wait(&ch2) != 0 { return 15 }
+    process.close(&ch2)
+    let big: str = single_instance.single_item(&msg, 1)
+    if big.length() != 50000 { return 16 }
+    var k: usize = 0
+    while k < 50000 {
+        if big.chars(k) != (97 + k % 26) as u8 { return 17 }
+        k = k + 1
+    }
+    var ch3: process.Child = spawn_second(me, home, "huge", "", "", "", "")
+    var seen: bool = false
+    var t: u32 = 0
+    while t < 15 as u32 {
+        if single_instance.single_poll(200, &msg) { seen = true }
+        t = t + 1 as u32
+    }
+    if seen { return 18 }
+    if process.wait(&ch3) != 0 { return 19 }
+    process.close(&ch3)
+
+    // D: garbage, then a silent client, then a good message
+    var ep: rt.Buf = rt.buf_new()
+    if !single_instance.single_endpoint(&ep) { return 20 }
+    let epn: str = util.buf_to_str_copy(&ep)
+    let g: i64 = platform.plat_ipc_connect(epn)
+    if g < 0 { return 21 }
+    var junk: [u8; 16] = [1; 16]
+    platform.plat_ipc_write(g, (&junk[0]) as u64, 16)
+    if single_instance.single_poll(1000, &msg) { return 22 }
+    platform.plat_ipc_close(g)
+    let s: i64 = platform.plat_ipc_connect(epn)
+    if s < 0 { return 23 }
+    if single_instance.single_poll(500, &msg) { return 24 } // stalls for 2 s at most, then gives up
+    platform.plat_ipc_close(s)
+    var ch4: process.Child = spawn_second(me, home, "args", "again", "", "", "")
+    if !await_message(&msg) { return 25 }
+    if process.wait(&ch4) != 0 { return 26 }
+    process.close(&ch4)
+    if single_instance.single_item(&msg, 1) != "again" { return 27 }
+
+    // E
+    single_instance.single_stop_listening()
+    if fs.exists(epn) { return 28 }
+    var ch5: process.Child = spawn_second(me, home, "args", "nobody home", "", "", "")
+    let rc5: i32 = process.wait(&ch5)
+    process.close(&ch5)
+    if rc5 != 14 { return 29 } // single_send_args reported false
+
+    // F: a stale socket file
+    let stale: i32 = platform.plat_ipc_listen(epn) as i32
+    if stale < 0 { return 30 }
+    platform.plat_ipc_close(stale as i64) // closed without removing the file: a dead copy's leftover
+    if !fs.exists(epn) { return 31 }
+    if !single_instance.single_listen() { return 32 }
+    var ch6: process.Child = spawn_second(me, home, "args", "after stale", "", "", "")
+    if !await_message(&msg) { return 33 }
+    if process.wait(&ch6) != 0 { return 34 }
+    process.close(&ch6)
+    if single_instance.single_item(&msg, 1) != "after stale" { return 35 }
+    single_instance.single_stop_listening()
+    single_instance.single_release()
+    fs.remove_tree(home) catch false
+    return 0
+}

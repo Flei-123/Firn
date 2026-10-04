@@ -34,6 +34,14 @@
 //   plat_spawned_alive(token) / plat_kill_spawned(token)
 //   plat_lock(path) / plat_unlock(h)  the single instance lock
 //   plat_lock_held(path)              is that lock held by a LIVE process?
+//   plat_ipc_name(lock, out)          the name of this program's local message
+//        endpoint, from the lock file's path (Linux: a Unix socket next to
+//        it; Windows: a named pipe)
+//   plat_ipc_listen(name) / plat_ipc_accept(l, ms) / plat_ipc_unlisten(l, name)
+//   plat_ipc_connect(name)            a connection to a running copy, or -1
+//   plat_ipc_read(c, p, n, ms) / plat_ipc_write(c, p, n) / plat_ipc_close(c)
+//        -- bytes between two copies of the program, same user only
+//   plat_cwd(out)                     the current directory
 //   plat_apply(newf, exe, backup)     put `newf` in place of `exe`, keeping
 //        the old one as `backup` (an atomic rename where the OS has one)
 //   plat_rollback(exe, backup)        put the backup back
@@ -63,6 +71,7 @@ import std.rt
 import std.fs
 import std.time
 import std.process
+import net.unix
 import appkit.util
 
 export {
@@ -70,6 +79,8 @@ export {
     plat_env_get, plat_dir, plat_exe_path, plat_self_pid, plat_spawned_alive,
     plat_kill_spawned, plat_spawn_detached, plat_lock, plat_unlock, plat_lock_held,
     plat_apply,
+    plat_ipc_name, plat_ipc_listen, plat_ipc_accept, plat_ipc_connect, plat_ipc_read,
+    plat_ipc_write, plat_ipc_close, plat_ipc_unlisten, plat_cwd,
     plat_rollback, plat_can_write_beside, plat_threads,
     plat_worker_process,
     plat_can_self_update, plat_install_hint, plat_exit, plat_sleep_ms,
@@ -493,6 +504,151 @@ fn plat_unlock(h: i64) {
     if h >= 0 {
         syscall(SYS_CLOSE, h, 0, 0, 0, 0, 0)
     }
+}
+
+// ------------------------------------------------- talking to a running copy
+//
+// A Unix socket in the state directory (`instance.sock`, next to the lock
+// file); a path longer than 107 octets (sockaddr_un) falls back to an
+// abstract name made from a hash of it. The socket accepts only connections
+// whose peer is the same user (SO_PEERCRED). The caller holds the instance
+// lock, so a socket file that is already there is stale and is replaced.
+
+fn hash_name(path: str) -> u64 {
+    var h: u64 = 14695981039346656037 as u64
+    var i: usize = 0
+    while i < path.n {
+        h = (h ^ (path.chars(i) as u64)) * 1099511628211 as u64
+        i = i + 1
+    }
+    return h
+}
+
+// The endpoint name for the lock file at `lock`. "@name" = abstract.
+fn plat_ipc_name(lock: str, out: *mut rt.Buf) -> bool {
+    rt.buf_clear(out)
+    // <state>/instance.lock -> <state>/instance.sock
+    if util.ends_with(lock, ".lock") && lock.n + 0 <= 102 {
+        rt.buf_push_bytes(out, lock.p as u64, lock.n - 5)
+        util.buf_push_str(out, ".sock")
+        return true
+    }
+    util.buf_push_str(out, "@firn-instance-")
+    rt.buf_push_dec_u64(out, unix.getuid_now() as u64)
+    rt.buf_push(out, 45 as u8)
+    rt.buf_push_hex_u64(out, hash_name(lock), 16)
+    return true
+}
+
+fn ipc_addr(name: str, abstract: *mut bool) -> str {
+    if name.n > 1 && name.chars(0) == 64 as u8 {
+        *abstract = true
+        return name.part(1, name.n - 1)
+    }
+    *abstract = false
+    return name
+}
+
+// Returns the listener handle (a descriptor), -1 on failure.
+fn plat_ipc_listen(name: str) -> i64 {
+    var ab: bool = false
+    let addr: str = ipc_addr(name, &ab)
+    if !ab {
+        // a leftover socket file of a dead copy (we hold the lock): remove it, nothing else
+        let info: fs.FileInfo = fs.lstat(addr) catch fs.FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+        if info.kind == fs.KIND_OTHER {
+            fs.remove(addr) catch false
+        }
+    }
+    let fd: i32 = unix.unix_listen(addr, ab, 8)
+    if fd < 0 {
+        return -1
+    }
+    return fd as i64
+}
+
+// A connection: its descriptor; -1 = nothing within `ms`, -2 = failed.
+// Connections from another user are closed at once.
+fn plat_ipc_accept(l: i64, ms: i64) -> i64 {
+    let w: i32 = unix.fd_wait(l as i32, unix.WAIT_READ, ms)
+    if w == 0 {
+        return -1
+    }
+    if w < 0 {
+        return -2
+    }
+    let c: i32 = unix.unix_accept(l as i32)
+    if c < 0 {
+        return -2
+    }
+    if unix.unix_peer_uid(c) != unix.getuid_now() {
+        unix.fd_close(c)
+        return -1
+    }
+    return c as i64
+}
+
+fn plat_ipc_unlisten(l: i64, name: str) {
+    if l >= 0 {
+        unix.fd_close(l as i32)
+    }
+    var ab: bool = false
+    let addr: str = ipc_addr(name, &ab)
+    if !ab {
+        fs.remove(addr) catch false
+    }
+}
+
+fn plat_ipc_connect(name: str) -> i64 {
+    var ab: bool = false
+    let addr: str = ipc_addr(name, &ab)
+    let fd: i32 = unix.unix_connect(addr, ab)
+    if fd < 0 {
+        return -1
+    }
+    return fd as i64
+}
+
+// Reads up to `n` octets, waiting at most `ms`. > 0 = octets read,
+// 0 = the peer closed, -1 = nothing yet (timeout), -2 = error.
+fn plat_ipc_read(c: i64, p: u64, n: usize, ms: i64) -> i64 {
+    let w: i32 = unix.fd_wait(c as i32, unix.WAIT_READ, ms)
+    if w == 0 {
+        return -1
+    }
+    if w < 0 {
+        return -2
+    }
+    let r: i64 = unix.fd_recv(c as i32, p, n)
+    if r < 0 {
+        return -2
+    }
+    return r
+}
+
+fn plat_ipc_write(c: i64, p: u64, n: usize) -> bool {
+    return unix.fd_send_all(c as i32, p, n)
+}
+
+fn plat_ipc_close(c: i64) {
+    if c >= 0 {
+        unix.fd_close(c as i32)
+    }
+}
+
+fn plat_cwd(out: *mut rt.Buf) -> bool {
+    var b: [u8; 4096] = [0; 4096]
+    let r: i64 = syscall(79, (&b[0]) as i64, 4096, 0, 0, 0, 0)
+    if r <= 0 {
+        return false
+    }
+    rt.buf_clear(out)
+    var n: usize = 0
+    while n < 4096 && b[n] != 0 as u8 {
+        n = n + 1
+    }
+    rt.buf_push_bytes(out, (&b[0]) as u64, n)
+    return true
 }
 
 // --------------------------------------------------------- files for update
