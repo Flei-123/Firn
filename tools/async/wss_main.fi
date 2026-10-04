@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/async/wss_main.fi -- the WebSocket client against a REAL wss:// echo
+// service (system roots, DNS by name, TLS 1.3, the server's own framing).
+//
+//   wss_main <url>          e.g. wss://echo.websocket.org/
+//
+// Sends a short text, 5000 octets of text, 70000 octets of binary (in
+// fragments of 16384), a ping, then closes. Prints "ok <what>" per step and
+// "WSS OK <ms>" at the end (exit 0), or "FAIL <step>" (exit 1; exit 3 when
+// the service cannot be reached at all -- tools/async/run.sh treats that as
+// a skip, not as a failure of the client).
+import std.rt
+import std.io
+import async.loop
+import async.wsc
+import ws.ws
+
+static mut stage: u32 = 0
+static mut t0: i64 = 0
+static mut failed: bool = false
+static mut unreachable: bool = true
+static mut finished: bool = false
+
+fn say(s: str) {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, s.p as u64, s.n)
+    rt.buf_push(&b, 10 as u8)
+    rt.write_everything(1, b.ptr, b.len)
+    rt.buf_free(&b)
+}
+
+fn pat(i: usize) -> u8 {
+    // printable, so that it can travel as text
+    return (97 + (i * 7 + (i >> 5)) % 26) as u8
+}
+
+fn fill_text(p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.st8(p, i, pat(i))
+        i = i + 1
+    }
+}
+
+fn is_greeting(c: *mut wsc.WsClient) -> bool {
+    // echo.websocket.org opens with "Request served by <id>"
+    return wsc.wsc_msg_len(c) > 17 && rt.mem_eq(wsc.wsc_msg_ptr(c), "Request served by".p as u64, 17)
+}
+
+fn fail(c: *mut wsc.WsClient, what: str) {
+    say("FAIL")
+    say(what)
+    failed = true
+    wsc.wsc_abort(c)
+}
+
+fn next(c: *mut wsc.WsClient) {
+    if stage == 0 {
+        wsc.wsc_send_str(c, "hello-firn-1234567890")
+    } else if stage == 1 {
+        let p: u64 = rt.heap_alloc(5000)
+        fill_text(p, 5000)
+        wsc.wsc_send_text(c, p, 5000)
+        rt.heap_free(p, 5000)
+    } else if stage == 2 {
+        let p2: u64 = rt.heap_alloc(70000)
+        fill_text(p2, 70000)
+        wsc.wsc_send_binary(c, p2, 70000)
+        rt.heap_free(p2, 70000)
+    } else if stage == 3 {
+        wsc.wsc_ping(c, "ping-firn".p as u64, 9)
+    } else {
+        wsc.wsc_close(c, 1000)
+    }
+}
+
+fn on_ws(c: *mut wsc.WsClient, ud: u64, kind: u32, arg: u32) {
+    if kind == wsc.WE_OPEN {
+        unreachable = false
+        say("ok open")
+        next(c)
+    } else if kind == wsc.WE_MESSAGE {
+        if is_greeting(c) {
+            return
+        }
+        let n: usize = wsc.wsc_msg_len(c)
+        let p: u64 = wsc.wsc_msg_ptr(c)
+        if stage == 0 {
+            if n == 21 && arg == ws.OP_TEXT && rt.mem_eq(p, "hello-firn-1234567890".p as u64, 21) {
+                say("ok echo short text")
+                stage = 1
+                next(c)
+            } else {
+                fail(c, "short text")
+            }
+        } else if stage == 1 {
+            var good: bool = n == 5000 && arg == ws.OP_TEXT
+            var i: usize = 0
+            while good && i < n {
+                if rt.ld8(p, i) != pat(i) { good = false }
+                i = i + 1
+            }
+            if good {
+                say("ok echo 5000 octets of text")
+                stage = 2
+                next(c)
+            } else {
+                fail(c, "5000 text")
+            }
+        } else if stage == 2 {
+            var good2: bool = n == 70000 && arg == ws.OP_BINARY
+            var k: usize = 0
+            while good2 && k < n {
+                if rt.ld8(p, k) != pat(k) { good2 = false }
+                k = k + 1
+            }
+            if good2 {
+                say("ok echo 70000 octets of binary, sent in fragments")
+                stage = 3
+                next(c)
+            } else {
+                fail(c, "70000 binary")
+            }
+        }
+    } else if kind == wsc.WE_PONG {
+        if stage == 3 && wsc.wsc_msg_len(c) == 9 && rt.mem_eq(wsc.wsc_msg_ptr(c), "ping-firn".p as u64, 9) {
+            say("ok pong with the payload")
+            stage = 4
+            next(c)
+        }
+    } else if kind == wsc.WE_CLOSE {
+        if stage == 4 {
+            if arg == 1000 || arg == 1005 {
+                say("ok closing handshake")
+                finished = true
+            } else {
+                say("FAIL close code")
+                failed = true
+            }
+        } else {
+            failed = true
+        }
+    } else if kind == wsc.WE_ERROR {
+        if unreachable {
+            say("unreachable")
+        } else {
+            say("FAIL error")
+            failed = true
+        }
+    }
+}
+
+fn t_stop(l: *mut loop.Loop, ud: u64) { loop.stop(l) }
+
+fn t_check(l: *mut loop.Loop, ud: u64) {
+    if finished || failed || (unreachable && wsc.wsc_error(ud as *mut wsc.WsClient) != 0) {
+        loop.stop(l)
+    }
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 { return 2 }
+    var l: loop.Loop = loop.loop_new()
+    if !loop.loop_init(&l) { return 2 }
+    let c: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 0)
+    wsc.wsc_use_system_trust(c)
+    wsc.wsc_set_fragment_size(c, 16384)
+    wsc.wsc_set_connect_timeout(c, 8000)
+    t0 = loop.mono_ms()
+    let up: u64 = rt.arg_ptr(start, 1)
+    if !wsc.wsc_connect(c, up, rt.c_length(up)) { return 2 }
+    loop.timer_after(&l, 30000, t_stop, 0)
+    loop.timer_every(&l, 20, t_check, c as u64)
+    loop.run(&l)
+    if finished && !failed {
+        var b: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&b, "WSS OK ".p as u64, 7)
+        rt.buf_push_dec_i64(&b, loop.mono_ms() - t0)
+        rt.buf_push(&b, 10 as u8)
+        rt.write_everything(1, b.ptr, b.len)
+        rt.buf_free(&b)
+        return 0
+    }
+    if unreachable {
+        return 3
+    }
+    return 1
+}

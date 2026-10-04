@@ -88,7 +88,7 @@ export {
     // OpenPlan LIB-006: the system clipboard
     clipboard_set, clipboard_get, clipboard_types, clipboard_clear,
     // OpenPlan LIB-005: waiting for several windows at once
-    wait_any,
+    wait_any, wait_any_fd,
     // fUi tempo, stage 2b: THE GPU (see the end of this file)
     gpu_open, gpu_swap, gpu_close, gpu_place, gpu_lost,
     EV_NONE, EV_EXPOSE, EV_KEY, EV_CHAR, EV_BUTTON, EV_MOTION,
@@ -467,6 +467,21 @@ fn wait_event(f: *mut Window, ms: i64) -> bool {
 // watched with one `poll`; otherwise the windows are asked in turn in
 // slices of 10 ms.
 fn wait_any(ws: *mut [u64; 8], n: usize, ms: i64) -> i64 {
+    return wait_any_fd(ws, n, 0 - 1, ms)
+}
+
+// ROUND ASYNC. The same, and ONE MORE descriptor is watched: `xfd`, the
+// descriptor of an event loop (`async.loop.loop_fd`) or of anything else a
+// program waits for besides its windows -- a socket, a pipe. The answer is
+// the index of a window with an event, -1 when `ms` passed, or -2 when `xfd`
+// became READABLE (the program then serves whatever it stands for, e.g.
+// `loop.run_once(&l, 0)`, and comes back). A window with an event waiting
+// wins over `xfd`, so a busy network cannot starve the UI of its input.
+// `xfd` < 0 is `wait_any`. Where the backend has no descriptor (Windows) the
+// extra descriptor is looked at between the 10 ms slices, so it is served
+// within 10 ms; a loop without a pollable descriptor (`loop_fd` = -1) is
+// served by the caller after every wait.
+fn wait_any_fd(ws: *mut [u64; 8], n: usize, xfd: i32, ms: i64) -> i64 {
     var i: usize = 0
     while i < n {
         if backend.r_pending(&(*((*ws)[i] as *mut Window)).p) {
@@ -474,8 +489,8 @@ fn wait_any(ws: *mut [u64; 8], n: usize, ms: i64) -> i64 {
         }
         i = i + 1
     }
-    var pfd: [i32; 16] = [0; 16]
-    var all_fds: bool = n > 0
+    var pfd: [i32; 18] = [0; 18]
+    var all_fds: bool = n > 0 || xfd >= 0
     i = 0
     while i < n {
         let fd: i32 = backend.r_event_fd(&(*((*ws)[i] as *mut Window)).p)
@@ -485,6 +500,15 @@ fn wait_any(ws: *mut [u64; 8], n: usize, ms: i64) -> i64 {
         pfd[i * 2] = fd
         pfd[i * 2 + 1] = 1 // POLLIN
         i = i + 1
+    }
+    var xp: [i32; 2] = [xfd, 1]
+    if xfd >= 0 {
+        pfd[n * 2] = xfd
+        pfd[n * 2 + 1] = 1
+    }
+    var nfds: usize = n
+    if xfd >= 0 {
+        nfds = n + 1
     }
     let start: i64 = now_ms()
     while true {
@@ -497,11 +521,11 @@ fn wait_any(ws: *mut [u64; 8], n: usize, ms: i64) -> i64 {
         }
         if all_fds {
             i = 0
-            while i < n {
+            while i < nfds {
                 pfd[i * 2 + 1] = 1
                 i = i + 1
             }
-            let r: i64 = syscall(7, (&pfd[0]) as i64, n as i64, left, 0, 0, 0)
+            let r: i64 = syscall(7, (&pfd[0]) as i64, nfds as i64, left, 0, 0, 0)
             if r > 0 {
                 i = 0
                 while i < n {
@@ -513,6 +537,9 @@ fn wait_any(ws: *mut [u64; 8], n: usize, ms: i64) -> i64 {
                     }
                     i = i + 1
                 }
+                if xfd >= 0 && (pfd[n * 2 + 1] >> 16) != 0 {
+                    return 0 - 2
+                }
             }
         } else {
             i = 0
@@ -523,6 +550,13 @@ fn wait_any(ws: *mut [u64; 8], n: usize, ms: i64) -> i64 {
                 }
                 if backend.r_wait(&(*((*ws)[i] as *mut Window)).p, slice) {
                     return i as i64
+                }
+                // the extra descriptor between the slices
+                if xfd >= 0 {
+                    xp[1] = 1
+                    if syscall(7, (&xp[0]) as i64, 1, 0, 0, 0, 0) > 0 && (xp[1] >> 16) != 0 {
+                        return 0 - 2
+                    }
                 }
                 i = i + 1
             }

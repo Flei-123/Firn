@@ -1,0 +1,147 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/async/ui_probe.fi -- a window and the event loop in ONE thread:
+// network results, timers and results of worker threads reach the UI thread
+// while the window is idle, and the window's own events are not delayed.
+//
+// Prints READY; then one line for each thing that arrives:
+//   NET <status>      an HTTP answer from an in-process server (async.ahttp)
+//   POST <n>          a result a worker thread posted (async.post bridge)
+//   TIMER <n>         a periodic timer (every 100 ms, stops after 3)
+//   CLOSED / DONE     the window was closed; ROUNDS <n> = loop rounds in all
+// tools/async/check_ui.py drives it with python-xlib on an Xvfb.
+import window.window
+import std.io
+import std.rt
+import std.net
+import std.pool
+import async.loop
+import async.stream
+import async.ahttp
+import async.post
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == pool.WORKER_KIND {
+        return pool.worker_main(arg)
+    }
+    return 0
+}
+
+static mut timers_seen: i64 = 0
+static mut timer_h: u64 = 0
+static mut ui_tid: i64 = 0
+
+fn say(tag: str, n: i64) {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, tag.p as u64, tag.n)
+    rt.buf_push(&b, 32 as u8)
+    rt.buf_push_dec_i64(&b, n)
+    rt.buf_push(&b, 10 as u8)
+    rt.write_everything(1, b.ptr, b.len)
+    rt.buf_free(&b)
+}
+
+fn on_tick(l: *mut loop.Loop, ud: u64) {
+    timers_seen = timers_seen + 1
+    say("TIMER", timers_seen)
+    if timers_seen == 3 {
+        loop.timer_cancel(l, timer_h)
+    }
+}
+
+// the server: one canned answer per connection
+fn srv_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    if kind == stream.SE_DATA {
+        stream.stream_consume(s, stream.stream_in_len(s))
+        stream.stream_write_str(s, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        stream.stream_close(s)
+    }
+}
+
+fn on_conn(l: *mut loop.Loop, ud: u64, c: net.Conn) {
+    stream.stream_adopt(l, c, 5000, srv_event, 0)
+}
+
+fn on_http(r: *mut ahttp.Request, ud: u64) {
+    say("NET", ahttp.areq_status(r) as i64)
+}
+
+fn slow_work(arg: u64) -> u64 {
+    var ts: [i64; 2] = [0, 150000000]
+    syscall(35, (&ts[0]) as i64, 0, 0, 0, 0, 0)
+    return arg * 2
+}
+
+fn on_work(l: *mut loop.Loop, ud: u64, result: u64) {
+    // runs on the UI thread
+    say("POST", result as i64)
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var w: window.Window = window.window_new()
+    if !window.open_window(&w, 0) {
+        io.print_line("NOWINDOW")
+        return 1 as i32
+    }
+    window.make(&w, 240, 160)
+    let t: str = "Firn Async UI"
+    window.title(&w, t.p as u64, t.n)
+    window.show_window(&w)
+    window.fill(&w, window.rgb_to_bgrx(2263842 as u32), 0, 0, window.width(&w), window.height(&w))
+    window.present(&w)
+
+    var l: loop.Loop = loop.loop_new()
+    if !loop.loop_init(&l) {
+        return 2 as i32
+    }
+    var br: post.Bridge = post.bridge_new(&l, 2, 8)
+    let acc: *mut stream.Acceptor = stream.acceptor_new(&l, net.ADDR_LOCAL, 0 as u16, 8, on_conn, 0)
+    var a: ahttp.AClient = ahttp.aclient_new()
+    ahttp.aclient_init(&a, &l)
+    var url: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&url, "http://127.0.0.1:".p as u64, 17)
+    rt.buf_push_dec_u64(&url, stream.acceptor_port(acc) as u64)
+    rt.buf_push_bytes(&url, "/".p as u64, 1)
+
+    io.print_line("READY")
+    timer_h = loop.timer_every(&l, 100, on_tick, 0)
+    ahttp.aclient_get(&a, url.ptr, url.len, 5000, on_http, 0)
+    post.bridge_call(&br, slow_work, 21, on_work, 0)
+
+    var ws: [u64; 8] = [(&w) as u64, 0, 0, 0, 0, 0, 0, 0]
+    var open: bool = true
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    let until: i64 = ts[0] + 30
+    while open {
+        // sleep until the window has an event, the loop has something (its
+        // descriptor), or the next timer is due
+        let ms: i64 = loop.embed_wait_ms(&l, 1000)
+        let hit: i64 = window.wait_any_fd(&ws, 1, loop.loop_fd(&l), ms)
+        loop.run_once(&l, 0)
+        syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+        if ts[0] > until {
+            io.print_line("TIMEOUT")
+            return 3 as i32
+        }
+        if hit == 0 {
+            var k: u32 = window.next_event(&w)
+            while k != window.EV_NONE {
+                if k == window.EV_EXPOSE {
+                    window.fill(&w, window.rgb_to_bgrx(2263842 as u32), 0, 0, window.width(&w), window.height(&w))
+                    window.present(&w)
+                }
+                if k == window.EV_CLOSED {
+                    open = false
+                    io.print_line("CLOSED")
+                }
+                k = window.next_event(&w)
+            }
+        }
+    }
+    say("ROUNDS", loop.stat_rounds(&l) as i64)
+    post.bridge_free(&br)
+    window.close_window(&w)
+    io.print_line("DONE")
+    return 0 as i32
+}
