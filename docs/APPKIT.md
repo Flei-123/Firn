@@ -15,7 +15,7 @@ cd fleilauncher && bash build.sh && build/fleilauncher
 | platform | status |
 |---|---|
 | Linux x86-64 | **tested**: unit tests, `tools/appkit/e2e.sh` (60 checks), the generated program built and started, a dry-run release |
-| Windows x86-64 | **tested under Wine** (`E2E_TARGET=windows`, same 60 checks, worker process instead of a thread); not yet on a real Windows machine |
+| Windows x86-64 | **tested under Wine** (`E2E_TARGET=windows`, same 60 checks, worker process instead of a thread); **not on a real Windows machine**: FLEI-ONE is online but cannot reach this server and the helper can only write text files, so no executable can be put on it (the same gap as roadmap r211) |
 | Android x86-64 | **tested on the emulator** (`tools/appkit/android_check.sh`, API 35): download, hash refusal, hand-over to the PackageInstaller, the question and its answer, replacement, refusal of a foreign key |
 | Android arm64 | compiles and links (APK builds, receiver symbol exported); **not run** (no arm64 emulator or phone here) |
 | Linux aarch64 | compiles; not run |
@@ -324,9 +324,12 @@ the same signatures and that each type-checks.
   (OS-owned), no download off the app thread, a program that also uses
   `lib/plat/android/push.fi` / `pick.fi` needs one `classes.dex` with all three
   classes (`servicedex_main.fi` and `installdex_main.fi` write one each).
-* **Windows**: tested under Wine only; no threads in Firn, so a worker process
-  is used; no Authenticode check of the new file (the store's hash and
-  signature are the trust).
+* **Windows**: tested under Wine only (see the table at the top); no threads
+  in Firn, so a worker process is used; no Authenticode check of the new file
+  (the store's hash and signature are the trust). The renames of an update are
+  retried for a few seconds, and so is the re-hash of the downloaded file,
+  because a virus scanner (Defender) can hold a fresh file for a moment --
+  written from what Windows is known to do, never seen here.
 * **Linux aarch64**: compiles; the AArch64 syscall table has what appkit needs
   (`readlinkat` is used instead of `readlink`), never run.
 * **All**: hidden/encrypted store channels, HTTP range/resume, proxies, IPv6

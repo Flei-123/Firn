@@ -25,6 +25,7 @@ import time
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True)
+    ap.add_argument("--host", default="127.0.0.1")   # 0.0.0.0 / a LAN address: a test from another machine
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--chunked", action="store_true")
     ap.add_argument("--slow-ms", type=int, default=0)
@@ -102,7 +103,7 @@ def main():
         daemon_threads = True
         allow_reuse_address = True
 
-    srv = S(("127.0.0.1", a.port), H)
+    srv = S((a.host, a.port), H)
     print("PORT %d" % srv.server_address[1], flush=True)
     srv.serve_forever()
 
