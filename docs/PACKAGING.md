@@ -143,7 +143,7 @@ The appkit template's window had never opened on Windows: `lib/@linux/window/bac
 `target::platform_dir()` is `@windows` for `--target=x86_64-windows`; `lib/@windows/` holds the Win32 backend link
 and the (shared) `apphost`, and `lib/plat/sysfont.fi` also tries `C:/Windows/Fonts/segoeui.ttf`, `arial.ttf`, `tahoma.ttf`.
 Result under Wine on Xvfb: the template's `--selftest` opens its window and draws 30 frames; the installer's window is drawn and clicked.
-Still never seen on a real Windows (DPI, Segoe UI metrics, the title bar).
+Still never seen on a real Windows (DPI, Segoe UI metrics, the title bar). Under Wine the *first* window after a cold wineserver can fail with "no driver could be loaded" (Wine's explorer has not loaded the X driver yet; the program then prints `fui.app: no X server reachable`): `windows.sh` keeps a server up (`wineserver -p`) and opens one window of Wine's own first.
 
 ## 4. Linux
 
