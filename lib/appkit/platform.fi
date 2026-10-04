@@ -28,8 +28,10 @@
 //   plat_env_get(name, out)           an environment variable
 //   plat_dir(kind, app, vendor, out)  config / data / state / cache / log
 //   plat_exe_path(out)                the file to replace on an update
-//   plat_self_pid() / plat_pid_alive(pid) / plat_kill(pid)
-//   plat_spawn_detached(path, args)   start a program, do not wait
+//   plat_self_pid()
+//   plat_spawn_detached(path, args)   start a program, do not wait; returns a
+//                                     token (>= 0) or -1
+//   plat_spawned_alive(token) / plat_kill_spawned(token)
 //   plat_lock(path) / plat_unlock(h)  the single instance lock
 //   plat_lock_held(path)              is that lock held by a LIVE process?
 //   plat_apply(newf, exe, backup)     put `newf` in place of `exe`, keeping
@@ -54,19 +56,19 @@
 //   * files that are replaced are replaced by `rename`: the running process
 //     keeps its old inode, so replacing a running binary is safe on Linux.
 //   * the backup is a COPY, not a hard link: it works on every file system.
-//   * syscalls used beyond std.fs: readlink 89, fcntl 72, fork 57,
-//     execve 59, wait4 61, kill 62, setsid 112, uname 63, getpid 39.
-//     (aarch64 needs 72/112 in compiler/src/syscalls.rs -- the std.process
-//     round adds them -- and 89, which this round adds.)
+//   * syscalls used beyond std.fs / std.process: readlink 89, fcntl 72,
+//     uname 63, getpid 39 (aarch64 has them since the std.process and
+//     std.archive rounds: fcntl, readlinkat).
 import std.rt
 import std.fs
 import std.time
+import std.process
 import appkit.util
 
 export {
     plat_init, plat_os, plat_arch, plat_id, plat_art, plat_argc, plat_arg,
-    plat_env_get, plat_dir, plat_exe_path, plat_self_pid, plat_pid_alive,
-    plat_kill, plat_spawn_detached, plat_lock, plat_unlock, plat_lock_held,
+    plat_env_get, plat_dir, plat_exe_path, plat_self_pid, plat_spawned_alive,
+    plat_kill_spawned, plat_spawn_detached, plat_lock, plat_unlock, plat_lock_held,
     plat_apply,
     plat_rollback, plat_can_write_beside, plat_threads,
     plat_can_self_update, plat_install_hint, plat_exit, plat_sleep_ms,
@@ -338,21 +340,6 @@ fn plat_self_pid() -> i64 {
     return syscall(SYS_GETPID, 0, 0, 0, 0, 0, 0)
 }
 
-fn plat_pid_alive(pid: i64) -> bool {
-    if pid <= 0 {
-        return false
-    }
-    let r: i64 = syscall(SYS_KILL, pid, 0, 0, 0, 0, 0)
-    return r == 0 || r == -1
-}
-
-fn plat_kill(pid: i64) -> bool {
-    if pid <= 1 {
-        return false
-    }
-    return syscall(SYS_KILL, pid, 9, 0, 0, 0, 0) == 0
-}
-
 fn plat_sleep_ms(ms: u64) {
     time.sleep_ms(ms)
 }
@@ -361,57 +348,75 @@ fn plat_exit(code: i64) {
     rt.finish(code)
 }
 
-// A new process, detached: double fork, the grandchild execs and is
-// adopted by init; the caller never has to wait. The environment is the
-// caller's (the start block's envp), so DISPLAY and friends arrive.
-// `args` are the arguments AFTER the program name (argv[0] is `path`).
-fn plat_spawn_detached(path: str, args: *mut util.Args) -> bool {
-    // everything the child needs is built BEFORE the fork
-    var cpath: rt.Buf = rt.buf_new()
-    rt.buf_push_bytes(&cpath, path.p as u64, path.n)
-    rt.buf_push(&cpath, 0 as u8)
-    let na: usize = util.args_count(args)
-    var argv: rt.Buf = rt.buf_new()
-    // argv[0] .. argv[na] then the terminating null
-    var slots: usize = na + 2
-    var okv: bool = util.buf_room(&argv, slots * 8)
-    var envp: u64 = 0
-    if G_START != 0 as u64 {
-        envp = G_START + ((rt.arg_count(G_START) + 2) * 8) as u64
+// ---- spawned programs: std.process does the double fork (Linux) or
+// CreateProcessW with DETACHED_PROCESS (Windows) and keeps the pid / the
+// process handle, so the updater's supervisor can ask whether the new
+// version is still alive and end it if it hangs. A token (0..3) names one.
+const SPAWN_SLOTS: usize = 4
+static mut G_CHILDREN: u64 = 0
+static mut G_NEXT_SLOT: usize = 0
+
+// `size_of[T]()` written inside a module cannot name the module's own types;
+// through a generic wrapper it can (see update.fi).
+fn plat_size_of[T: Any]() -> usize {
+    return size_of[T]()
+}
+
+fn child_slot(i: usize) -> *mut process.Child {
+    let sz: usize = plat_size_of[process.Child]()
+    if G_CHILDREN == 0 as u64 {
+        G_CHILDREN = rt.heap_alloc(sz * SPAWN_SLOTS)
     }
-    var okp: bool = okv
-    if okp {
-        rt.buf_set_len(&argv, slots * 8)
-        var base: u64 = rt.buf_ptr(&argv)
-        rt.st64(base, 0, rt.buf_ptr(&cpath))
-        var at: u64 = rt.buf_ptr(&(*args).buf)
-        var k: usize = 0
-        while k < na {
-            rt.st64(base, k + 1, at)
-            at = at + rt.c_length(at) as u64 + 1 as u64
-            k = k + 1
-        }
-        rt.st64(base, na + 1, 0 as u64)
-        let pid: i64 = syscall(SYS_FORK, 0, 0, 0, 0, 0, 0)
-        if pid < 0 {
-            okp = false
-        } else if pid == 0 {
-            // child 1: new session, fork again, exit at once
-            syscall(SYS_SETSID, 0, 0, 0, 0, 0, 0)
-            let pid2: i64 = syscall(SYS_FORK, 0, 0, 0, 0, 0, 0)
-            if pid2 == 0 {
-                syscall(SYS_EXECVE, rt.buf_ptr(&cpath) as i64, base as i64, envp as i64, 0, 0, 0)
-                rt.finish(127)
-            }
-            rt.finish(0)
-        } else {
-            var status: i32 = 0
-            syscall(SYS_WAIT4, pid, (&status) as i64, 0, 0, 0, 0)
-        }
+    return (G_CHILDREN + (i * sz) as u64) as *mut process.Child
+}
+
+fn dummy_child(failed: *mut bool) -> process.Child {
+    *failed = true
+    return process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1,
+        done: true, code: 0, sig: 0, own: false }
+}
+
+// Starts `path` with `args` (the arguments AFTER the program name), detached:
+// the caller never waits for it and it outlives the caller. Returns a token
+// (>= 0) for plat_spawned_alive / plat_kill_spawned, or -1 when it did not
+// start.
+fn plat_spawn_detached(path: str, args: *mut util.Args) -> i64 {
+    var c: process.Command = process.command(path)
+    var at: u64 = rt.buf_ptr(&(*args).buf)
+    var k: usize = 0
+    while k < util.args_count(args) {
+        let n: usize = rt.c_length(at)
+        process.add_arg(&c, str { p: at as *mut u8, n: n })
+        at = at + n as u64 + 1 as u64
+        k = k + 1
     }
-    rt.buf_free(&argv)
-    rt.buf_free(&cpath)
-    return okp
+    process.set_detach(&c, true)
+    process.set_no_window(&c, true)
+    var failed: bool = false
+    let ch: process.Child = process.spawn(&c) catch | e | dummy_child(&failed)
+    process.command_free(&c)
+    if failed {
+        return -1
+    }
+    let i: usize = G_NEXT_SLOT
+    G_NEXT_SLOT = (G_NEXT_SLOT + 1) % SPAWN_SLOTS
+    *child_slot(i) = ch
+    return i as i64
+}
+
+fn plat_spawned_alive(token: i64) -> bool {
+    if token < 0 || token >= SPAWN_SLOTS as i64 {
+        return false
+    }
+    return process.is_running(child_slot(token as usize))
+}
+
+fn plat_kill_spawned(token: i64) -> bool {
+    if token < 0 || token >= SPAWN_SLOTS as i64 {
+        return false
+    }
+    process.kill(child_slot(token as usize))
+    return true
 }
 
 // ------------------------------------------------------------ the lock

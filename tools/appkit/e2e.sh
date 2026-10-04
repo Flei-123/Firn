@@ -24,7 +24,7 @@
 #   FIRNC=... ORIENTSTORE_TOOL=... bash tools/appkit/e2e.sh
 #
 # On Windows there are no threads in Firn: the "thread" runs fall back to the
-# worker process, and a hung new version is rolled back but not killed.
+# worker process.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
@@ -383,8 +383,7 @@ out=$(run "$APP" version)
 expect "the program on disk is 1.1.0 again" "$out" "VERSION 1.1.0"
 sleep 1
 if [ "$TARGET" = windows ]; then
-    echo "  --    (Windows: the hung new version is not killed -- no OpenProcess in the import table)"
-    wineserver -k 2>/dev/null
+    if ps -eo args | grep -q '[i]nst.app\.exe'; then bad "the hung new version is still running"; wineserver -k 2>/dev/null; else ok "the hung new version was stopped"; fi
 elif pgrep -f "$W/inst/app" >/dev/null 2>&1; then bad "the hung new version is still running"; pkill -f "$W/inst/app"; else ok "the hung new version was stopped"; fi
 
 echo

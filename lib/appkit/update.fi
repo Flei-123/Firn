@@ -184,11 +184,11 @@ struct Updater {
     resolver: fn(u64, usize, *mut u32) -> bool,
     started_ms: u64,
     last_cancel_check_ms: u64,
+    new_token: i64, // the program update_apply started (platform.plat_spawned_alive)
 }
 
 static mut G_UPDATER: u64 = 0
 static mut G_RESTARTED: bool = false
-static mut G_RUN_LOCK: i64 = -1
 static mut G_ROLLEDBACK_START: bool = false
 
 // ------------------------------------------------------------ the object
@@ -196,12 +196,12 @@ static mut G_ROLLEDBACK_START: bool = false
 // `size_of[T]()` written inside a module cannot name the module's own
 // struct (the compiler qualifies the type later than it reads the call);
 // through a generic wrapper it can.
-fn size_of_local[T: Any]() -> usize {
+fn upd_size_of[T: Any]() -> usize {
     return size_of[T]()
 }
 
 fn update_new() -> *mut Updater {
-    let n: usize = size_of_local[Updater]()
+    let n: usize = upd_size_of[Updater]()
     let p: u64 = rt.heap_alloc(n)
     if p == 0 as u64 {
         return 0 as *mut Updater
@@ -214,6 +214,7 @@ fn update_new() -> *mut Updater {
     (*u).verify_tls = true
     (*u).resolver = fetch.resolve_basic
     (*u).mode = RUN_AUTO
+    (*u).new_token = -1
     (*u).ok = false
     G_UPDATER = p
     return u
@@ -1205,10 +1206,10 @@ fn update_start(u: *mut Updater, op: u32, mode: u32) -> bool {
     // remove a stale status file so the UI never reads an old answer
     fs.remove(status_path_str(u)) catch false
     (*u).publish_file = false
-    let ok: bool = platform.plat_spawn_detached(util.buf_to_str_copy(&exe), &args)
+    let tok: i64 = platform.plat_spawn_detached(util.buf_to_str_copy(&exe), &args)
     util.args_free(&args)
     rt.buf_free(&exe)
-    if !ok {
+    if tok < 0 {
         return false
     }
     (*u).mode = RUN_PROCESS
@@ -1447,10 +1448,11 @@ fn update_apply(u: *mut Updater, restart_args: *mut util.Args) -> u32 {
         at = at + rt.c_length(at) as u64 + 1 as u64
         k = k + 1
     }
-    let started: bool = platform.plat_spawn_detached(exe_s, &a)
+    let started_tok: i64 = platform.plat_spawn_detached(exe_s, &a)
     util.args_free(&a)
     util.args_free(&empty)
-    if !started {
+    (*u).new_token = started_tok
+    if started_tok < 0 {
         log.log_error("update", "could not start the new version; rolling back")
         platform.plat_rollback(exe_s, bak_s)
         config.remove_key(&(*u).state, "pending.state")
@@ -1474,43 +1476,30 @@ fn update_supervise(u: *mut Updater) -> bool {
     let limit: i64 = config.get_int(&(*u).settings, "update.healthy_s", DEFAULT_HEALTHY_S)
     let t0: u64 = now_ms()
     var hp: rt.Buf = rt.buf_new()
-    var pp: rt.Buf = rt.buf_new()
     state_file(u, "healthy", &hp)
-    state_file(u, "running.pid", &pp)
     let healthy_path: str = util.buf_to_str_copy(&hp)
-    let pid_path: str = util.buf_to_str_copy(&pp)
     rt.buf_free(&hp)
-    rt.buf_free(&pp)
     var healthy: bool = false
-    var new_pid: i64 = 0
-    var seen_held: bool = false
     var reason: str = "no confirmation in time"
-    var lp: rt.Buf = rt.buf_new()
-    state_file(u, "running.lock", &lp)
-    let lock_path: str = util.buf_to_str_copy(&lp)
-    rt.buf_free(&lp)
+    // The new process was started by this process (platform token): once it
+    // is gone without having confirmed, there is no point in waiting out the
+    // rest of the time. (A little grace first: a program that confirms and
+    // then ends at once -- a test, a tool -- leaves its marker before the
+    // process disappears, and the marker is looked at first.)
     while true {
         if fs.exists(healthy_path) {
             healthy = true
             break
         }
-        // The new process takes `running.lock` in update_boot and holds it
-        // for as long as it lives. Once it has been seen holding it and the
-        // lock is free again without a confirmation, it died: no point in
-        // waiting out the rest of the time.
-        let held: bool = platform.plat_lock_held(lock_path)
-        if held {
-            seen_held = true
-        } else if seen_held && !fs.exists(healthy_path) {
-            reason = "the new version exited"
+        if (*u).new_token >= 0 && !platform.plat_spawned_alive((*u).new_token) {
+            platform.plat_sleep_ms(150)
+            if fs.exists(healthy_path) {
+                healthy = true
+            } else {
+                reason = "the new version exited"
+            }
             break
         }
-        var pb: rt.Buf = rt.buf_new()
-        let n: usize = fs.read_file(pid_path, &pb) catch 0
-        if n > 0 {
-            new_pid = num_at(rt.buf_ptr(&pb), n) as i64
-        }
-        rt.buf_free(&pb)
         if (now_ms() - t0) / 1000 as u64 >= limit as u64 {
             break
         }
@@ -1521,8 +1510,10 @@ fn update_supervise(u: *mut Updater) -> bool {
         return true
     }
     log.log_error("update", "rolling back: " + reason)
-    if new_pid > 0 {
-        platform.plat_kill(new_pid)
+    if (*u).new_token >= 0 {
+        // a version that hangs is ended; one that already exited is not
+        // a problem
+        platform.plat_kill_spawned((*u).new_token)
         platform.plat_sleep_ms(300)
     }
     var exe: rt.Buf = rt.buf_new()
@@ -1593,29 +1584,6 @@ fn update_boot(u: *mut Updater) -> u32 {
         worker_run(u, op)
         platform.plat_exit(0)
     }
-    // every normal start holds running.lock for as long as it lives: that is
-    // how an old version supervising an update sees the new one die
-    var rl: rt.Buf = rt.buf_new()
-    state_file(u, "running.lock", &rl)
-    var tries_l: u32 = 0
-    while tries_l < 4 && G_RUN_LOCK < 0 {
-        G_RUN_LOCK = platform.plat_lock(util.buf_to_str_copy(&rl))
-        if G_RUN_LOCK == -1 {
-            platform.plat_sleep_ms(60)
-        } else if G_RUN_LOCK == -2 {
-            break
-        }
-        tries_l = tries_l + 1
-    }
-    rt.buf_free(&rl)
-    // a process that was started by an update announces itself
-    var pp: rt.Buf = rt.buf_new()
-    state_file(u, "running.pid", &pp)
-    var t: rt.Buf = rt.buf_new()
-    rt.buf_push_dec_u64(&t, platform.plat_self_pid() as u64)
-    fs.write_atomic(util.buf_to_str_copy(&pp), rt.buf_ptr(&t), rt.buf_len(&t)) catch false
-    rt.buf_free(&t)
-    rt.buf_free(&pp)
     var ps: rt.Buf = rt.buf_new()
     config.get_str(&(*u).state, "pending.state", "", &ps)
     if util.buf_eq_str(&ps, "applied") && !restarted {
