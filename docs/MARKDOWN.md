@@ -62,6 +62,11 @@ markers beyond stay literal), so no reader needs unbounded recursion.
 * `tools/fui/mdview_main.fi` (section 18p4 of `tools/fui/run.sh`): the view,
   pixel by pixel, light and dark, wide and narrow.
 
+The fixtures are reproducible: `tools/markdown/gen_gfm_cases.py` (needs
+`pip install markdown-it-py`) writes `markdown-gfm-cases.json`,
+`tools/markdown/gen_entities.py` writes `lib/markdown/entities.txt`; the spec
+file is `spec.json` of https://spec.commonmark.org/0.31.2/ unchanged.
+
 ## Honest limits
 
 * One difference from markdown-it, on purpose: a single `~` also strikes
