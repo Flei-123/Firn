@@ -79,6 +79,7 @@ download.dl_free(&d)
 | Linux x86-64 | **tested**: tests/2140 in every build level, `tools/download/run.sh` (99 checks) |
 | Linux aarch64 | tests/2140 compiles and **passes under qemu-aarch64** (threads, sockets, files); the Python checks were not run on it |
 | Windows x86-64 | **tested under Wine** (`check.py` sections A, C, D, E, F, I); not on a real Windows machine. Paths should use `/` (`fs.path_parent` splits on `/` only; the Windows seam accepts it) |
+| Wine, a caveat | across ~700 driver runs under Wine, three (two inside `check.py` section C, one in a loop of 40) ended with exit 0/-9 and NO output while other Wine or build jobs were running; 450 later runs, also under 8 busy-loop processes, did not reproduce it. Cause unknown (a trivial `W 2`/`X` run without downloads never failed in 300 runs). Treat a lone empty Wine run as a flake, a repeated one as a bug |
 | macOS, OrientOS, Android | not built or run. The module only uses `net.http`, `std.pool`, `std.fs`, `std.hashfile`; it works wherever those do. Nothing in it is a stub, nothing was tried |
 
 ## Tests
