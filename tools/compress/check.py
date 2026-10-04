@@ -21,7 +21,8 @@ Prints one line per group and a total; exit code 1 on any failure.
 import os, sys, subprocess, random, tempfile, shutil, time, struct, zlib
 
 PROBE = os.path.abspath(sys.argv[1])
-FMTS = sys.argv[2:] or ["lz4", "zstd", "xz", "bz2", "br"]
+FMTS = sys.argv[2:] or ["lz4", "zstd", "xz", "lzma", "bz2", "br"]
+PARTS = os.environ.get("CHECK_PARTS", "decode,encode,hostile").split(",")
 W = tempfile.mkdtemp(prefix="compress-check-")
 import atexit
 atexit.register(lambda: shutil.rmtree(W, ignore_errors=True))
@@ -111,6 +112,23 @@ def corpus():
     # skewed alphabet (Huffman-friendly) and 4-symbol data
     items.append(("skew", bytes(rnd.choices(range(256), weights=[2 ** (-i / 12) for i in range(256)], k=300000))))
     items.append(("dna", bytes(rnd.choices(b"ACGT", k=200000))))
+    # machine-code-like data for the BCJ filters: random with branch patterns of every architecture
+    mix = bytearray(rnd.getrandbits(8) for _ in range(160000))
+    for i in range(0, len(mix) - 16, 16):
+        k = rnd.randrange(8)
+        if k == 0:    # x86 call/jmp with a 00/FF high byte
+            mix[i] = rnd.choice((0xE8, 0xE9)); mix[i + 4] = rnd.choice((0, 0xFF))
+        elif k == 1:  # ARM bl
+            mix[i + 3] = 0xEB
+        elif k == 2:  # Thumb bl pair
+            mix[i + 1] = 0xF0 | (mix[i + 1] & 7); mix[i + 3] = 0xF8 | (mix[i + 3] & 7)
+        elif k == 3:  # PowerPC bl
+            mix[i] = 0x48 | (mix[i] & 3); mix[i + 3] = (mix[i + 3] & 0xFC) | 1
+        elif k == 4:  # SPARC call
+            mix[i] = 0x40; mix[i + 1] &= 0x3F
+        elif k == 5:  # x86 with E8 close to another
+            mix[i] = 0xE8; mix[i + 1] = 0; mix[i + 2] = 0; mix[i + 3] = 0xE8; mix[i + 4] = 0xFF; mix[i + 8] = 0xE9
+    items.append(("bcjmix", bytes(mix)))
     return items
 
 
@@ -158,6 +176,14 @@ def ref_compressors(fmt):
         out.append(("xz-x86+lzma2", lambda d: lzma.compress(d, format=lzma.FORMAT_XZ,
                                                            filters=[{"id": lzma.FILTER_X86},
                                                                     {"id": lzma.FILTER_LZMA2, "preset": 4}])))
+        for fname, fid in (("ppc", lzma.FILTER_POWERPC), ("ia64", lzma.FILTER_IA64), ("arm", lzma.FILTER_ARM),
+                           ("armthumb", lzma.FILTER_ARMTHUMB), ("sparc", lzma.FILTER_SPARC)):
+            out.append(("xz-%s+lzma2" % fname, (lambda fid: lambda d: lzma.compress(d, format=lzma.FORMAT_XZ, filters=[
+                {"id": fid}, {"id": lzma.FILTER_LZMA2, "preset": 1}]))(fid)))
+        out.append(("xz-delta+x86+lzma2", lambda d: lzma.compress(d, format=lzma.FORMAT_XZ, filters=[
+            {"id": lzma.FILTER_DELTA, "dist": 2}, {"id": lzma.FILTER_X86}, {"id": lzma.FILTER_LZMA2, "preset": 1}])))
+        out.append(("xz-arm64+lzma2", lambda d: subprocess.run(["xz", "-c", "--arm64", "--lzma2=preset=1"], input=d,
+                                                               capture_output=True).stdout))
         out.append(("xz-lc0lp2pb0", lambda d: lzma.compress(d, format=lzma.FORMAT_XZ,
                                                            filters=[{"id": lzma.FILTER_LZMA2, "preset": 2, "lc": 0,
                                                                      "lp": 2, "pb": 0}])))
@@ -215,7 +241,7 @@ def group(fmt):
     items = corpus()
     n0 = len(FAILS)
     # ---- decode: reference compressors -> ours
-    for label, comp in ref_compressors(fmt):
+    for label, comp in (ref_compressors(fmt) if "decode" in PARTS else []):
         for name, data in items:
             if len(data) > (1 << 20) and ("9e" in label or "-19" in label or "22" in label or "hc12" in label
                                          or "q11" in label or "q9" in label):
@@ -234,7 +260,7 @@ def group(fmt):
     print("  %-4s decode (reference -> lib)        %s" % (fmt, "ok" if len(FAILS) == n0 else "FAILED"))
     n1 = len(FAILS)
     # ---- encode: ours -> reference
-    if ENC_ENABLED.get(fmt):
+    if ENC_ENABLED.get(fmt) and "encode" in PARTS:
         for lv in ENC_LEVELS[fmt]:
             for name, data in items:
                 st, z = run_probe("c", fmt, data, lv)
@@ -264,6 +290,9 @@ def group(fmt):
         print("  %-4s encode (lib -> reference)        %s" % (fmt, "ok" if len(FAILS) == n1 else "FAILED"))
     n2 = len(FAILS)
     # ---- hostile inputs
+    if "hostile" not in PARTS:
+        print("  %-4s (hostile skipped)" % fmt)
+        return
     comp = ref_compressors(fmt)[0][1]
     rnd = random.Random(7)
     base = dict(items)
