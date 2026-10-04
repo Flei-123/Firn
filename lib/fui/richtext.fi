@@ -1,0 +1,1235 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/richtext.fi -- RICH TEXT: a paragraph of styled spans (bold, italic,
+// underline, strike, code, colour, link), wrapped to a width, painted, hit-tested,
+// SELECTABLE and COPYABLE. Also the SELECTABLE LABEL: a RichText without spans.
+//
+//     var r: richtext.RichText = richtext.rt_new()
+//     richtext.rt_append(&r, "Hello ", 0, 0, 0)
+//     richtext.rt_append(&r, "world", richtext.RT_BOLD, 0, 0)
+//     richtext.rt_append(&r, " (docs)", 0, 0, 1)            // link id 1
+//     richtext.rt_set_link_cb(&r, 0, on_link)               // fn(ud, link_id)
+//     // every frame:
+//     richtext.rt_paint(&r, ctx, x, y, w)                    // lays out at w if needed
+//     // input: rt_pointer_move / _down / _up, rt_double_click, rt_char (Ctrl+C, Ctrl+A)
+//
+// WHAT IT DOES
+//   * Spans: `rt_add_span(start, end, flags, colour, link)` on the text (octet
+//     offsets into the UTF-8 text); overlapping spans add their flags, the last
+//     colour wins. `rt_append` is text and one span in one call.
+//   * Layout: greedy line breaking at blanks, a hard break at "\n", a word wider
+//     than the line is cut where the line is full; a word made of several styles
+//     ("**bo**ld") stays together. Left, centre or right alignment; a paragraph
+//     whose first strong character is right-to-left (or `rt_set_dir`) starts on the
+//     right, and the pieces of each line run right to left (every piece is painted
+//     by lib/fui/painter.fi's bidi path, which orders the characters inside it).
+//   * Links: the accent as readable text (kitcolor.accent_text), underlined under
+//     the pointer; a click that goes down and up on the same link calls the callback.
+//   * Selection: mouse drag, double click = word, triple click = paragraph (up to
+//     the "\n"), Ctrl+A = all, Ctrl+C = copy the selected octets to the clipboard
+//     (a `fn(u64, usize) -> bool` the host gives, the same as editor.fi's; without
+//     one the copy stays in `rt_selection_text`). The selection is drawn in the
+//     theme's selection colour behind the text.
+//
+// HONEST NOTES
+//   * The selection is by OCTET offsets of the logical text. In a right-to-left
+//     paragraph the order of the pieces on a line is mirrored, but a piece with
+//     mixed directions inside is ordered by the painter -- a selection across a
+//     direction change inside one piece is drawn in as many rectangles as the
+//     painter makes (run_sel_draw).
+//   * No inline images, no nested styles beyond the flags; tabs count as four blanks.
+//   * Everything is in device points (render.len_of for the base size); a layout is
+//     redone when the width, the base size, the scale or the text changes.
+import std.rt
+import std.vec
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.kitcolor
+import fui.editor
+
+export {
+    RichText, rt_new, rt_free, rt_clear, rt_set_text, rt_append, rt_add_span, rt_text_len,
+    rt_set_size, rt_set_align, rt_set_dir, rt_set_link_cb, rt_set_clipboard, rt_set_color_token,
+    rt_layout, rt_height, rt_line_count, rt_paint, rt_set_time,
+    rt_pointer_move, rt_pointer_down, rt_pointer_up, rt_pointer_leave, rt_double_click,
+    rt_char, rt_select, rt_select_all, rt_clear_selection, rt_has_selection, rt_selection,
+    rt_selection_text, rt_copy, rt_link_at, rt_pos_at, rt_caret_x, rt_word_at,
+    RT_BOLD, RT_ITALIC, RT_UNDERLINE, RT_STRIKE, RT_CODE, RT_MUTED,
+    RT_ALIGN_LEFT, RT_ALIGN_CENTER, RT_ALIGN_RIGHT,
+    RT_DIR_AUTO, RT_DIR_LTR, RT_DIR_RTL,
+}
+
+const RT_BOLD: u32 = 1
+const RT_ITALIC: u32 = 2
+const RT_UNDERLINE: u32 = 4
+const RT_STRIKE: u32 = 8
+const RT_CODE: u32 = 16
+const RT_MUTED: u32 = 32
+
+const RT_ALIGN_LEFT: u32 = 0
+const RT_ALIGN_CENTER: u32 = 1
+const RT_ALIGN_RIGHT: u32 = 2
+
+const RT_DIR_AUTO: u32 = 0
+const RT_DIR_LTR: u32 = 1
+const RT_DIR_RTL: u32 = 2
+
+const NIL: u32 = 4294967295
+// the link colour is no theme token: the accent as text on the ground
+const KIND_WORD: u32 = 0
+const KIND_SPACE: u32 = 1
+const KIND_BREAK: u32 = 2
+
+struct RtSpan {
+    start: usize,
+    end: usize,
+    flags: u32,
+    color: u32, // 0 = the theme's text; else 0xAARRGGBB with a non-zero alpha
+    link: u32, // 0 = none; ids are the caller's
+}
+
+// a style = what a stretch of text is drawn with
+struct RtStyle {
+    flags: u32,
+    color: u32,
+    link: u32,
+}
+
+// a word, a run of blanks or a hard break, in ONE style
+struct RtPiece {
+    start: u32, // octet offset into the text
+    len: u32,
+    kind: u32,
+    style: u32,
+    x: f64, // from the left edge of the paragraph box
+    w: f64,
+    line: u32,
+}
+
+struct RtLine {
+    first: u32, // first piece
+    count: u32,
+    y: f64, // top
+    asc: f64,
+    desc: f64,
+    h: f64,
+    start: u32, // the octets it covers: start .. end (blanks at its end included)
+    end: u32,
+}
+
+struct RichText {
+    text: rt.Buf,
+    spans: Vec[RtSpan],
+    styles: Vec[RtStyle],
+    pieces: Vec[RtPiece],
+    lines: Vec[RtLine],
+    sid: rt.Buf, // per octet of the text: its style id (u32)
+    base_pt: usize,
+    align: u32,
+    dir: u32,
+    tok_text: u32, // the theme token of plain text (style.TOK_TEXT by default)
+    // layout validity
+    dirty: bool,
+    lay_w: f64,
+    lay_scale: usize,
+    height: f64,
+    rtl: bool, // the paragraph direction found in the last layout
+    // where it was painted last (for pointer input)
+    ox: f64,
+    oy: f64,
+    // links
+    link_ud: u64,
+    link_cb: fn(u64, u32),
+    has_link_cb: bool,
+    hover: u32,
+    press: u32,
+    // selection (octet offsets; sa == sf: none)
+    sa: usize,
+    sf: usize,
+    dragging: bool,
+    // multi click detection
+    now_ms: i64,
+    last_down_ms: i64,
+    last_x: f64,
+    last_y: f64,
+    clicks: u32,
+    // clipboard
+    clip_write: fn(u64, usize) -> bool,
+    has_clip: bool,
+}
+
+fn cb_link_none(ud: u64, id: u32) {
+}
+
+fn clip_none(p: u64, n: usize) -> bool {
+    return false
+}
+
+fn rt_new() -> RichText {
+    return RichText { text: rt.buf_new(), spans: vec_new[RtSpan](), styles: vec_new[RtStyle](),
+        pieces: vec_new[RtPiece](), lines: vec_new[RtLine](), sid: rt.buf_new(),
+        base_pt: 15, align: RT_ALIGN_LEFT, dir: RT_DIR_AUTO, tok_text: style.TOK_TEXT,
+        dirty: true, lay_w: 0.0, lay_scale: 0, height: 0.0, rtl: false, ox: 0.0, oy: 0.0,
+        link_ud: 0, link_cb: cb_link_none, has_link_cb: false, hover: 0 as u32, press: 0 as u32,
+        sa: 0, sf: 0, dragging: false, now_ms: 0, last_down_ms: -100000, last_x: 0.0, last_y: 0.0,
+        clicks: 0 as u32, clip_write: clip_none, has_clip: false }
+}
+
+fn rt_free(r: *mut RichText) {
+    rt.buf_free(&(*r).text)
+    vec_free[RtSpan](&(*r).spans)
+    vec_free[RtStyle](&(*r).styles)
+    vec_free[RtPiece](&(*r).pieces)
+    vec_free[RtLine](&(*r).lines)
+    rt.buf_free(&(*r).sid)
+}
+
+fn rt_clear(r: *mut RichText) {
+    rt.buf_clear(&(*r).text)
+    vec_clear[RtSpan](&(*r).spans)
+    (*r).sa = 0
+    (*r).sf = 0
+    (*r).dirty = true
+}
+
+// Plain text (the spans go).
+fn rt_set_text(r: *mut RichText, s: str) {
+    rt_clear(r)
+    rt.buf_push_bytes(&(*r).text, s.p as u64, s.n)
+}
+
+fn rt_text_len(r: *mut RichText) -> usize {
+    return rt.buf_len(&(*r).text)
+}
+
+// Adds `s` to the text with one span over it (flags 0, colour 0, link 0 = plain).
+fn rt_append(r: *mut RichText, s: str, flags: u32, color: u32, link: u32) {
+    let a: usize = rt.buf_len(&(*r).text)
+    rt.buf_push_bytes(&(*r).text, s.p as u64, s.n)
+    if flags != 0 as u32 || color != 0 as u32 || link != 0 as u32 {
+        vec_push[RtSpan](&(*r).spans, RtSpan { start: a, end: a + s.n, flags: flags, color: color, link: link })
+    }
+    (*r).dirty = true
+}
+
+// A span over octets [start, end) of the text.
+fn rt_add_span(r: *mut RichText, start: usize, end: usize, flags: u32, color: u32, link: u32) {
+    if end <= start {
+        return
+    }
+    vec_push[RtSpan](&(*r).spans, RtSpan { start: start, end: end, flags: flags, color: color, link: link })
+    (*r).dirty = true
+}
+
+fn rt_set_size(r: *mut RichText, pt: usize) {
+    (*r).base_pt = pt
+    (*r).dirty = true
+}
+
+fn rt_set_align(r: *mut RichText, a: u32) {
+    (*r).align = a
+}
+
+// RT_DIR_AUTO: the first strong character decides (P2 of UAX #9); LTR / RTL force it.
+fn rt_set_dir(r: *mut RichText, d: u32) {
+    (*r).dir = d
+    (*r).dirty = true
+}
+
+// The theme token plain text is drawn in (style.TOK_TEXT by default).
+fn rt_set_color_token(r: *mut RichText, tok: u32) {
+    (*r).tok_text = tok
+}
+
+fn rt_set_link_cb(r: *mut RichText, ud: u64, f: fn(u64, u32)) {
+    (*r).link_ud = ud
+    (*r).link_cb = f
+    (*r).has_link_cb = true
+}
+
+// The clipboard of the platform: `write(ptr, n)` puts n UTF-8 octets on it.
+fn rt_set_clipboard(r: *mut RichText, write: fn(u64, usize) -> bool) {
+    (*r).clip_write = write
+    (*r).has_clip = true
+}
+
+// The clock (milliseconds) for telling a double click from two single ones.
+fn rt_set_time(r: *mut RichText, now_ms: i64) {
+    (*r).now_ms = now_ms
+}
+
+// ------------------------------------------------------------------ styles
+
+fn style_id(r: *mut RichText, flags: u32, color: u32, link: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[RtStyle](&(*r).styles) {
+        let s: *mut RtStyle = vec_elem_ptr[RtStyle](&(*r).styles, i)
+        if (*s).flags == flags && (*s).color == color && (*s).link == link {
+            return i as u32
+        }
+        i = i + 1
+    }
+    vec_push[RtStyle](&(*r).styles, RtStyle { flags: flags, color: color, link: link })
+    return (vec_len[RtStyle](&(*r).styles) - 1) as u32
+}
+
+// the style of every octet, from the spans
+fn build_sid(r: *mut RichText) {
+    let n: usize = rt.buf_len(&(*r).text)
+    vec_clear[RtStyle](&(*r).styles)
+    rt.buf_clear(&(*r).sid)
+    rt.buf_reserve(&(*r).sid, n * 4 + 4)
+    var plain: u32 = style_id(r, 0 as u32, 0 as u32, 0 as u32)
+    var i: usize = 0
+    while i < n {
+        var fl: u32 = 0
+        var col: u32 = 0
+        var lk: u32 = 0
+        var k: usize = 0
+        while k < vec_len[RtSpan](&(*r).spans) {
+            let s: *mut RtSpan = vec_elem_ptr[RtSpan](&(*r).spans, k)
+            if i >= (*s).start && i < (*s).end {
+                fl = fl | (*s).flags
+                if (*s).color != 0 as u32 {
+                    col = (*s).color
+                }
+                if (*s).link != 0 as u32 {
+                    lk = (*s).link
+                }
+            }
+            k = k + 1
+        }
+        let id: u32 = style_id(r, fl, col, lk)
+        rt.buf_push(&(*r).sid, (id & 255 as u32) as u8)
+        rt.buf_push(&(*r).sid, ((id >> 8) & 255 as u32) as u8)
+        rt.buf_push(&(*r).sid, ((id >> 16) & 255 as u32) as u8)
+        rt.buf_push(&(*r).sid, ((id >> 24) & 255 as u32) as u8)
+        i = i + 1
+    }
+}
+
+fn sid_at(r: *mut RichText, i: usize) -> u32 {
+    return rt.ld32(rt.buf_ptr(&(*r).sid), i)
+}
+
+// ----------------------------------------------------------------- measuring
+
+fn mk_run(flags: u32, size: f64) -> painter.TextRun {
+    var r: painter.TextRun = painter.run_new(size)
+    if (flags & RT_BOLD) != 0 as u32 {
+        r = painter.run_set_weight(r, 700)
+    }
+    if (flags & RT_ITALIC) != 0 as u32 {
+        r = painter.run_set_slant(r, 1)
+    }
+    return r
+}
+
+// The monospace face for code when the program put one in font slot 1.
+fn font_enter(z: *mut painter.Painter, flags: u32) -> u64 {
+    if (flags & RT_CODE) != 0 as u32 {
+        let f: u64 = painter.painter_font_slot(z, 1)
+        if f != 0 {
+            let old: u64 = painter.painter_font(z)
+            painter.painter_set_font(z, f)
+            return old
+        }
+    }
+    return 0
+}
+
+fn font_leave(z: *mut painter.Painter, old: u64) {
+    if old != 0 {
+        painter.painter_set_font(z, old)
+    }
+}
+
+fn is_blank(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8
+}
+
+fn cp_len(p: u64, n: usize, at: usize) -> usize {
+    let c: u8 = rt.ld8(p, at)
+    var k: usize = 1
+    if c >= 240 as u8 {
+        k = 4
+    } else if c >= 224 as u8 {
+        k = 3
+    } else if c >= 192 as u8 {
+        k = 2
+    }
+    if at + k > n {
+        k = n - at
+    }
+    return k
+}
+
+fn piece_width(z: *mut painter.Painter, flags: u32, size: f64, p: u64, n: usize, kind: u32) -> f64 {
+    var r: painter.TextRun = mk_run(flags, size)
+    let old: u64 = font_enter(z, flags)
+    var w: f64 = 0.0
+    if kind == KIND_SPACE {
+        // blanks: a tab is four spaces
+        var sp: [u8; 1] = [32 as u8]
+        let one: f64 = painter.run_width(z, &r, (&sp[0]) as u64, 1)
+        var cnt: f64 = 0.0
+        var i: usize = 0
+        while i < n {
+            if rt.ld8(p, i) == 9 as u8 {
+                cnt = cnt + 4.0
+            } else {
+                cnt = cnt + 1.0
+            }
+            i = i + 1
+        }
+        w = one * cnt
+    } else {
+        w = painter.run_width(z, &r, p, n)
+    }
+    font_leave(z, old)
+    return w
+}
+
+// is the paragraph right-to-left (the first strong character, or `dir`)?
+fn para_is_rtl(r: *mut RichText, z: *mut painter.Painter) -> bool {
+    if (*r).dir == RT_DIR_RTL {
+        return true
+    }
+    if (*r).dir == RT_DIR_LTR {
+        return false
+    }
+    var run: painter.TextRun = painter.run_new(10.0)
+    return painter.run_para_rtl(z, &run, rt.buf_ptr(&(*r).text), rt.buf_len(&(*r).text))
+}
+
+fn push_piece(r: *mut RichText, start: usize, len: usize, kind: u32, style_i: u32, w: f64) {
+    vec_push[RtPiece](&(*r).pieces, RtPiece { start: start as u32, len: len as u32, kind: kind,
+        style: style_i, x: 0.0, w: w, line: 0 as u32 })
+}
+
+fn line_metrics(z: *mut painter.Painter, flags: u32, size: f64, asc: *mut f64, desc: *mut f64) {
+    let old: u64 = font_enter(z, flags)
+    let a: f64 = painter.font_ascent(z, size)
+    let d: f64 = painter.font_descent(z, size)
+    font_leave(z, old)
+    if a > *asc {
+        *asc = a
+    }
+    if d > *desc {
+        *desc = d
+    }
+}
+
+// Lays the text out at `width` (device points). Idempotent for the same inputs.
+fn rt_layout(r: *mut RichText, c: *mut render.Ctx, width: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let sc: usize = theme.theme_scale(render.ctx_theme(c))
+    if !(*r).dirty && width == (*r).lay_w && sc == (*r).lay_scale {
+        return
+    }
+    vec_clear[RtPiece](&(*r).pieces)
+    vec_clear[RtLine](&(*r).lines)
+    build_sid(r)
+    let n: usize = rt.buf_len(&(*r).text)
+    let p: u64 = rt.buf_ptr(&(*r).text)
+    let size: f64 = render.len_of(c, (*r).base_pt)
+    (*r).rtl = para_is_rtl(r, z)
+    // 1. the pieces
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        let sid: u32 = sid_at(r, i)
+        let st: *mut RtStyle = vec_elem_ptr[RtStyle](&(*r).styles, sid as usize)
+        var fl: u32 = (*st).flags
+        var fsz: f64 = size
+        if (fl & RT_CODE) != 0 as u32 {
+            fsz = size * 0.92
+        }
+        if ch == 10 as u8 {
+            push_piece(r, i, 1, KIND_BREAK, sid, 0.0)
+            i = i + 1
+        } else if is_blank(ch) {
+            let s: usize = i
+            while i < n && is_blank(rt.ld8(p, i)) && sid_at(r, i) == sid {
+                i = i + 1
+            }
+            push_piece(r, s, i - s, KIND_SPACE, sid, piece_width(z, fl, fsz, p + s as u64, i - s, KIND_SPACE))
+        } else {
+            let s: usize = i
+            while i < n && !is_blank(rt.ld8(p, i)) && rt.ld8(p, i) != 10 as u8 && sid_at(r, i) == sid {
+                i = i + 1
+            }
+            push_piece(r, s, i - s, KIND_WORD, sid, piece_width(z, fl, fsz, p + s as u64, i - s, KIND_WORD))
+        }
+    }
+    // 2. the lines (greedy)
+    var line_first: usize = 0
+    var x: f64 = 0.0
+    var asc: f64 = 0.0
+    var desc: f64 = 0.0
+    var k: usize = 0
+    var line_idx: u32 = 0
+    var piece_count: usize = vec_len[RtPiece](&(*r).pieces)
+    // the height of an empty paragraph: one line of the base size
+    line_metrics(z, 0 as u32, size, &asc, &desc)
+    let base_asc: f64 = asc
+    let base_desc: f64 = desc
+    var y: f64 = 0.0
+    var lead: f64 = size * 0.25
+    asc = 0.0
+    desc = 0.0
+    while k < piece_count {
+        let pc: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, k)
+        let st: *mut RtStyle = vec_elem_ptr[RtStyle](&(*r).styles, (*pc).style as usize)
+        var fsz: f64 = size
+        if ((*st).flags & RT_CODE) != 0 as u32 {
+            fsz = size * 0.92
+        }
+        if (*pc).kind == KIND_BREAK {
+            (*pc).x = x
+            (*pc).line = line_idx
+            line_metrics(z, (*st).flags, fsz, &asc, &desc)
+            k = k + 1
+            // close the line
+            close_line(r, line_first, k, y, asc, desc, base_asc, base_desc, lead)
+            y = y + line_h(asc, desc, base_asc, base_desc, lead)
+            line_first = k
+            x = 0.0
+            asc = 0.0
+            desc = 0.0
+            line_idx = line_idx + 1
+            continue
+        }
+        if (*pc).kind == KIND_SPACE {
+            // blanks hang at the end of a line: they never cause a break
+            (*pc).x = x
+            (*pc).line = line_idx
+            x = x + (*pc).w
+            line_metrics(z, (*st).flags, fsz, &asc, &desc)
+            k = k + 1
+            continue
+        }
+        // a word: the whole run of word pieces up to the next blank or break
+        var seq_w: f64 = 0.0
+        var e: usize = k
+        while e < piece_count {
+            let q: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, e)
+            if (*q).kind != KIND_WORD {
+                break
+            }
+            seq_w = seq_w + (*q).w
+            e = e + 1
+        }
+        if x > 0.0 && x + seq_w > width && width > 0.0 {
+            // break before the word
+            close_line(r, line_first, k, y, asc, desc, base_asc, base_desc, lead)
+            y = y + line_h(asc, desc, base_asc, base_desc, lead)
+            line_first = k
+            x = 0.0
+            asc = 0.0
+            desc = 0.0
+            line_idx = line_idx + 1
+        }
+        // place the pieces of the word; one wider than a line is cut
+        while k < e {
+            let q: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, k)
+            let qst: *mut RtStyle = vec_elem_ptr[RtStyle](&(*r).styles, (*q).style as usize)
+            var qsz: f64 = size
+            if ((*qst).flags & RT_CODE) != 0 as u32 {
+                qsz = size * 0.92
+            }
+            if x + (*q).w > width && width > 0.0 && (*q).w > 0.0 {
+                // how much of this piece fits the room left (at least one character)
+                var room: f64 = width - x
+                if room < 1.0 && x > 0.0 {
+                    close_line(r, line_first, k, y, asc, desc, base_asc, base_desc, lead)
+                    y = y + line_h(asc, desc, base_asc, base_desc, lead)
+                    line_first = k
+                    x = 0.0
+                    asc = 0.0
+                    desc = 0.0
+                    line_idx = line_idx + 1
+                    room = width
+                }
+                var rr: painter.TextRun = mk_run((*qst).flags, qsz)
+                let old: u64 = font_enter(z, (*qst).flags)
+                var take: usize = painter.run_fits_upto(z, &rr, p + (*q).start as u64, (*q).len as usize, room)
+                if take == 0 {
+                    take = cp_len(p, n, (*q).start as usize)
+                }
+                font_leave(z, old)
+                if take < (*q).len as usize {
+                    // split the piece: [start, start+take) here, the rest after it
+                    let rest_start: usize = (*q).start as usize + take
+                    let rest_len: usize = (*q).len as usize - take
+                    let old2: u64 = font_enter(z, (*qst).flags)
+                    let w1: f64 = painter.run_width(z, &rr, p + (*q).start as u64, take)
+                    let w2: f64 = painter.run_width(z, &rr, p + rest_start as u64, rest_len)
+                    font_leave(z, old2)
+                    (*q).len = take as u32
+                    (*q).w = w1
+                    (*q).x = x
+                    (*q).line = line_idx
+                    line_metrics(z, (*qst).flags, qsz, &asc, &desc)
+                    let sty: u32 = (*q).style
+                    // insert the rest as the next piece (the vector may move: do not use q after this)
+                    vec_insert[RtPiece](&(*r).pieces, k + 1, RtPiece { start: rest_start as u32, len: rest_len as u32,
+                        kind: KIND_WORD, style: sty, x: 0.0, w: w2, line: 0 as u32 })
+                    piece_count = piece_count + 1
+                    e = e + 1
+                    k = k + 1
+                    close_line(r, line_first, k, y, asc, desc, base_asc, base_desc, lead)
+                    y = y + line_h(asc, desc, base_asc, base_desc, lead)
+                    line_first = k
+                    x = 0.0
+                    asc = 0.0
+                    desc = 0.0
+                    line_idx = line_idx + 1
+                    continue
+                }
+            }
+            (*q).x = x
+            (*q).line = line_idx
+            x = x + (*q).w
+            line_metrics(z, (*qst).flags, qsz, &asc, &desc)
+            k = k + 1
+        }
+    }
+    if line_first < piece_count || vec_len[RtLine](&(*r).lines) == 0 {
+        close_line(r, line_first, piece_count, y, asc, desc, base_asc, base_desc, lead)
+        y = y + line_h(asc, desc, base_asc, base_desc, lead)
+    }
+    (*r).height = y
+    // 3. alignment and direction: shift every line (right-to-left: mirror the pieces)
+    var li: usize = 0
+    while li < vec_len[RtLine](&(*r).lines) {
+        let ln: *mut RtLine = vec_elem_ptr[RtLine](&(*r).lines, li)
+        // the visible width: hanging blanks at the line end do not count
+        var vis: f64 = 0.0
+        var q: usize = (*ln).first as usize
+        let qe: usize = ((*ln).first + (*ln).count) as usize
+        var last_word: usize = qe
+        while q < qe {
+            let pc: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, q)
+            if (*pc).kind == KIND_WORD {
+                last_word = q
+            }
+            q = q + 1
+        }
+        if last_word < qe {
+            let lw: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, last_word)
+            vis = (*lw).x + (*lw).w
+        }
+        var shift: f64 = 0.0
+        var align: u32 = (*r).align
+        if (*r).rtl && align == RT_ALIGN_LEFT {
+            align = RT_ALIGN_RIGHT // in an RTL paragraph "start" is the right edge
+        } else if (*r).rtl && align == RT_ALIGN_RIGHT {
+            align = RT_ALIGN_LEFT
+        }
+        if align == RT_ALIGN_CENTER {
+            shift = (width - vis) / 2.0
+        } else if align == RT_ALIGN_RIGHT {
+            shift = width - vis
+        }
+        if shift < 0.0 {
+            shift = 0.0
+        }
+        if (*r).rtl {
+            // mirror: the first piece stands at the right end of the line's visible part
+            q = (*ln).first as usize
+            while q < qe {
+                let pc: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, q)
+                (*pc).x = vis - ((*pc).x + (*pc).w)
+                if (*pc).x < 0.0 - 100000.0 {
+                    (*pc).x = 0.0
+                }
+                q = q + 1
+            }
+        }
+        q = (*ln).first as usize
+        while q < qe {
+            let pc: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, q)
+            (*pc).x = (*pc).x + shift
+            q = q + 1
+        }
+        li = li + 1
+    }
+    (*r).dirty = false
+    (*r).lay_w = width
+    (*r).lay_scale = sc
+}
+
+fn line_h(asc: f64, desc: f64, basea: f64, based: f64, lead: f64) -> f64 {
+    var a: f64 = asc
+    var d: f64 = desc
+    if a == 0.0 && d == 0.0 {
+        a = basea
+        d = based
+    }
+    return a + d + lead
+}
+
+fn close_line(r: *mut RichText, first: usize, end: usize, y: f64, asc: f64, desc: f64,
+        basea: f64, based: f64, lead: f64) {
+    var a: f64 = asc
+    var d: f64 = desc
+    if a == 0.0 && d == 0.0 {
+        a = basea
+        d = based
+    }
+    var start: u32 = 0 as u32
+    var stop: u32 = 0 as u32
+    if end > first {
+        let f: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, first)
+        let l: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, end - 1)
+        start = (*f).start
+        stop = (*l).start + (*l).len
+    } else {
+        // an empty last line (text ends with "\n", or no text at all)
+        start = rt.buf_len(&(*r).text) as u32
+        stop = start
+    }
+    vec_push[RtLine](&(*r).lines, RtLine { first: first as u32, count: (end - first) as u32, y: y + lead / 2.0,
+        asc: a, desc: d, h: a + d + lead, start: start, end: stop })
+}
+
+fn rt_height(r: *mut RichText) -> f64 {
+    return (*r).height
+}
+
+fn rt_line_count(r: *mut RichText) -> usize {
+    return vec_len[RtLine](&(*r).lines)
+}
+
+// ------------------------------------------------------------------ painting
+
+fn text_color(r: *mut RichText, c: *mut render.Ctx, st: *mut RtStyle) -> u32 {
+    if (*st).link != 0 as u32 {
+        let m: *mut theme.Theme = render.ctx_theme(c)
+        let f: *mut theme.Colors = theme.theme_colors(m)
+        return theme.opaque(kitcolor.accent_text(m, (*f).base))
+    }
+    if (*st).color != 0 as u32 {
+        return (*st).color
+    }
+    if ((*st).flags & RT_MUTED) != 0 as u32 {
+        return render.color_of(c, style.color_token(style.TOK_TEXT_MUTED))
+    }
+    return render.color_of(c, style.color_token((*r).tok_text))
+}
+
+// Paints the text with its top left at (x, y), laid out at width `w` (a layout is
+// made if the width, scale or text changed). Remembers (x, y) for pointer input.
+fn rt_paint(r: *mut RichText, c: *mut render.Ctx, x: f64, y: f64, w: f64) {
+    rt_layout(r, c, w)
+    (*r).ox = x
+    (*r).oy = y
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let size: f64 = render.len_of(c, (*r).base_pt)
+    let p: u64 = rt.buf_ptr(&(*r).text)
+    let selcol: u32 = render.color_of(c, style.color_token(style.TOK_SELECTION))
+    let lo: usize = sel_lo(r)
+    let hi: usize = sel_hi(r)
+    var li: usize = 0
+    while li < vec_len[RtLine](&(*r).lines) {
+        let ln: *mut RtLine = vec_elem_ptr[RtLine](&(*r).lines, li)
+        var q: usize = (*ln).first as usize
+        let qe: usize = ((*ln).first + (*ln).count) as usize
+        // pass 1: the selection behind the text
+        if hi > lo {
+            var k: usize = q
+            while k < qe {
+                let pc: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, k)
+                let ps: usize = (*pc).start as usize
+                let pe: usize = ps + (*pc).len as usize
+                if pe > lo && ps < hi && (*pc).kind != KIND_BREAK {
+                    let st: *mut RtStyle = vec_elem_ptr[RtStyle](&(*r).styles, (*pc).style as usize)
+                    var fsz: f64 = size
+                    if ((*st).flags & RT_CODE) != 0 as u32 {
+                        fsz = size * 0.92
+                    }
+                    var a: usize = 0
+                    if lo > ps {
+                        a = lo - ps
+                    }
+                    var b: usize = pe - ps
+                    if hi < pe {
+                        b = hi - ps
+                    }
+                    var rr: painter.TextRun = mk_run((*st).flags, fsz)
+                    let old: u64 = font_enter(z, (*st).flags)
+                    if (*pc).kind == KIND_SPACE {
+                        // blanks: a rectangle over the part of their width
+                        let part: f64 = (*pc).w * ((b - a) as f64) / ((*pc).len as f64)
+                        let off: f64 = (*pc).w * (a as f64) / ((*pc).len as f64)
+                        painter.surface(z, x + (*pc).x + off, y + (*ln).y, part, (*ln).h, selcol)
+                    } else {
+                        painter.run_sel_draw(z, &rr, x + (*pc).x, y + (*ln).y, (*ln).h, p + ps as u64, (*pc).len as usize,
+                            a, b, selcol)
+                    }
+                    font_leave(z, old)
+                }
+                k = k + 1
+            }
+            // the line break at the end of a selected line: a short bar so it shows
+        }
+        // pass 2: the text
+        while q < qe {
+            let pc: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, q)
+            if (*pc).kind == KIND_WORD {
+                let st: *mut RtStyle = vec_elem_ptr[RtStyle](&(*r).styles, (*pc).style as usize)
+                var fsz: f64 = size
+                if ((*st).flags & RT_CODE) != 0 as u32 {
+                    fsz = size * 0.92
+                }
+                var rr: painter.TextRun = mk_run((*st).flags, fsz)
+                let old: u64 = font_enter(z, (*st).flags)
+                let base_y: f64 = y + (*ln).y + (*ln).asc
+                let col: u32 = text_color(r, c, st)
+                painter.run_draw(z, &rr, x + (*pc).x, base_y, (*pc).w + 2.0, col, p + (*pc).start as u64, (*pc).len as usize,
+                    painter.TEXT_L)
+                font_leave(z, old)
+                if ((*st).flags & RT_STRIKE) != 0 as u32 {
+                    painter.surface(z, x + (*pc).x, base_y - (*ln).asc * 0.35, (*pc).w, render.len_of(c, 1), col)
+                }
+                var under: bool = ((*st).flags & RT_UNDERLINE) != 0 as u32
+                if (*st).link != 0 as u32 && (*st).link == (*r).hover {
+                    under = true
+                }
+                if under {
+                    painter.surface(z, x + (*pc).x, base_y + render.len_of(c, 2), (*pc).w, render.len_of(c, 1), col)
+                }
+            }
+            q = q + 1
+        }
+        li = li + 1
+    }
+}
+
+// ---------------------------------------------------------------- hit testing
+
+// The line under a y (relative to the top of the text), the nearest one when outside.
+fn line_at(r: *mut RichText, ry: f64) -> usize {
+    let n: usize = vec_len[RtLine](&(*r).lines)
+    if n == 0 {
+        return 0
+    }
+    var li: usize = 0
+    while li < n {
+        let ln: *mut RtLine = vec_elem_ptr[RtLine](&(*r).lines, li)
+        if ry < (*ln).y + (*ln).h {
+            return li
+        }
+        li = li + 1
+    }
+    return n - 1
+}
+
+// The octet offset under a point (window coordinates; the last paint's origin).
+// Outside the text it is the nearest end of the nearest line.
+fn rt_pos_at(r: *mut RichText, c: *mut render.Ctx, x: f64, y: f64) -> usize {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let n: usize = rt.buf_len(&(*r).text)
+    if vec_len[RtLine](&(*r).lines) == 0 {
+        return 0
+    }
+    let size: f64 = render.len_of(c, (*r).base_pt)
+    let rx: f64 = x - (*r).ox
+    let li: usize = line_at(r, y - (*r).oy)
+    let ln: *mut RtLine = vec_elem_ptr[RtLine](&(*r).lines, li)
+    let p: u64 = rt.buf_ptr(&(*r).text)
+    var best: usize = (*ln).start as usize
+    var found: bool = false
+    var q: usize = (*ln).first as usize
+    let qe: usize = ((*ln).first + (*ln).count) as usize
+    // the nearest piece in x
+    var bestd: f64 = 1000000000.0
+    while q < qe {
+        let pc: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, q)
+        if (*pc).kind != KIND_BREAK {
+            var d: f64 = 0.0
+            if rx < (*pc).x {
+                d = (*pc).x - rx
+            } else if rx > (*pc).x + (*pc).w {
+                d = rx - ((*pc).x + (*pc).w)
+            }
+            if d < bestd {
+                bestd = d
+                found = true
+                let st: *mut RtStyle = vec_elem_ptr[RtStyle](&(*r).styles, (*pc).style as usize)
+                var fsz: f64 = size
+                if ((*st).flags & RT_CODE) != 0 as u32 {
+                    fsz = size * 0.92
+                }
+                let ps: usize = (*pc).start as usize
+                if (*pc).kind == KIND_SPACE {
+                    // by the share of the width
+                    var share: f64 = 0.0
+                    if (*pc).w > 0.0 {
+                        share = (rx - (*pc).x) / (*pc).w
+                    }
+                    if share < 0.0 {
+                        share = 0.0
+                    }
+                    if share > 1.0 {
+                        share = 1.0
+                    }
+                    best = ps + ((share * ((*pc).len as f64) + 0.5) as usize)
+                } else {
+                    var rr: painter.TextRun = mk_run((*st).flags, fsz)
+                    let old: u64 = font_enter(z, (*st).flags)
+                    let k: usize = painter.run_hit(z, &rr, p + ps as u64, (*pc).len as usize, rx - (*pc).x)
+                    font_leave(z, old)
+                    best = ps + k
+                }
+            }
+        }
+        q = q + 1
+    }
+    if !found {
+        best = (*ln).start as usize
+    }
+    // never past the end of the text, never into the middle of a character
+    if best > n {
+        best = n
+    }
+    while best > 0 && best < n && (rt.ld8(p, best) & 192 as u8) == 128 as u8 {
+        best = best - 1
+    }
+    return best
+}
+
+// The x (relative to the origin of the last paint) of an octet offset, and the line's top/height.
+fn rt_caret_x(r: *mut RichText, c: *mut render.Ctx, pos: usize, y: *mut f64, h: *mut f64) -> f64 {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let size: f64 = render.len_of(c, (*r).base_pt)
+    let p: u64 = rt.buf_ptr(&(*r).text)
+    var li: usize = 0
+    while li < vec_len[RtLine](&(*r).lines) {
+        let ln: *mut RtLine = vec_elem_ptr[RtLine](&(*r).lines, li)
+        if pos <= (*ln).end as usize || li + 1 == vec_len[RtLine](&(*r).lines) {
+            *y = (*ln).y
+            *h = (*ln).h
+            var q: usize = (*ln).first as usize
+            let qe: usize = ((*ln).first + (*ln).count) as usize
+            while q < qe {
+                let pc: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, q)
+                let ps: usize = (*pc).start as usize
+                if pos >= ps && pos <= ps + (*pc).len as usize && (*pc).kind != KIND_BREAK {
+                    let st: *mut RtStyle = vec_elem_ptr[RtStyle](&(*r).styles, (*pc).style as usize)
+                    var fsz: f64 = size
+                    if ((*st).flags & RT_CODE) != 0 as u32 {
+                        fsz = size * 0.92
+                    }
+                    if (*pc).kind == KIND_SPACE {
+                        return (*pc).x + (*pc).w * ((pos - ps) as f64) / ((*pc).len as f64)
+                    }
+                    var rr: painter.TextRun = mk_run((*st).flags, fsz)
+                    let old: u64 = font_enter(z, (*st).flags)
+                    let cx: f64 = painter.run_caret_x(z, &rr, p + ps as u64, (*pc).len as usize, pos - ps)
+                    font_leave(z, old)
+                    return (*pc).x + cx
+                }
+                q = q + 1
+            }
+            return 0.0
+        }
+        li = li + 1
+    }
+    *y = 0.0
+    *h = 0.0
+    return 0.0
+}
+
+// The link under a point (0 = none).
+fn rt_link_at(r: *mut RichText, c: *mut render.Ctx, x: f64, y: f64) -> u32 {
+    if vec_len[RtLine](&(*r).lines) == 0 {
+        return 0 as u32
+    }
+    let rx: f64 = x - (*r).ox
+    let ry: f64 = y - (*r).oy
+    if ry < 0.0 || ry > (*r).height || rx < 0.0 {
+        return 0 as u32
+    }
+    let li: usize = line_at(r, ry)
+    let ln: *mut RtLine = vec_elem_ptr[RtLine](&(*r).lines, li)
+    if ry < (*ln).y || ry >= (*ln).y + (*ln).h {
+        return 0 as u32
+    }
+    var q: usize = (*ln).first as usize
+    let qe: usize = ((*ln).first + (*ln).count) as usize
+    while q < qe {
+        let pc: *mut RtPiece = vec_elem_ptr[RtPiece](&(*r).pieces, q)
+        if (*pc).kind == KIND_WORD && rx >= (*pc).x && rx < (*pc).x + (*pc).w {
+            let st: *mut RtStyle = vec_elem_ptr[RtStyle](&(*r).styles, (*pc).style as usize)
+            return (*st).link
+        }
+        q = q + 1
+    }
+    return 0 as u32
+}
+
+// ----------------------------------------------------------------- selection
+
+fn sel_lo(r: *mut RichText) -> usize {
+    if (*r).sa < (*r).sf {
+        return (*r).sa
+    }
+    return (*r).sf
+}
+
+fn sel_hi(r: *mut RichText) -> usize {
+    if (*r).sa < (*r).sf {
+        return (*r).sf
+    }
+    return (*r).sa
+}
+
+fn rt_has_selection(r: *mut RichText) -> bool {
+    return (*r).sa != (*r).sf
+}
+
+fn rt_clear_selection(r: *mut RichText) {
+    (*r).sa = 0
+    (*r).sf = 0
+    (*r).dragging = false
+}
+
+fn rt_select(r: *mut RichText, a: usize, b: usize) {
+    let n: usize = rt.buf_len(&(*r).text)
+    var x: usize = a
+    var y: usize = b
+    if x > n {
+        x = n
+    }
+    if y > n {
+        y = n
+    }
+    (*r).sa = x
+    (*r).sf = y
+}
+
+fn rt_select_all(r: *mut RichText) {
+    (*r).sa = 0
+    (*r).sf = rt.buf_len(&(*r).text)
+}
+
+// The selection as octet offsets (lo, hi).
+fn rt_selection(r: *mut RichText, lo: *mut usize, hi: *mut usize) {
+    *lo = sel_lo(r)
+    *hi = sel_hi(r)
+}
+
+// Appends the selected text to `out`; its length.
+fn rt_selection_text(r: *mut RichText, out: *mut rt.Buf) -> usize {
+    let lo: usize = sel_lo(r)
+    let hi: usize = sel_hi(r)
+    if hi <= lo {
+        return 0
+    }
+    rt.buf_push_bytes(out, rt.buf_ptr(&(*r).text) + lo as u64, hi - lo)
+    return hi - lo
+}
+
+// Copy the selection to the clipboard (Ctrl+C). False when nothing is selected or the platform
+// refused (the text is then still available through `rt_selection_text`).
+fn rt_copy(r: *mut RichText) -> bool {
+    let lo: usize = sel_lo(r)
+    let hi: usize = sel_hi(r)
+    if hi <= lo || !(*r).has_clip {
+        return false
+    }
+    let f: fn(u64, usize) -> bool = (*r).clip_write
+    return f(rt.buf_ptr(&(*r).text) + lo as u64, hi - lo)
+}
+
+// character classes for a word: 0 blank, 1 word (letters, digits, _, any non-ASCII), 2 other
+fn cclass(c: u8) -> u32 {
+    if c == 32 as u8 || c == 9 as u8 || c == 10 as u8 {
+        return 0 as u32
+    }
+    if (c >= 48 as u8 && c <= 57 as u8) || (c >= 65 as u8 && c <= 90 as u8) || (c >= 97 as u8 && c <= 122 as u8)
+        || c == 95 as u8 || c >= 128 as u8 {
+        return 1 as u32
+    }
+    return 2 as u32
+}
+
+// The word around octet offset `pos`: lo..hi of the run of the same class.
+fn rt_word_at(r: *mut RichText, pos: usize, lo: *mut usize, hi: *mut usize) {
+    let n: usize = rt.buf_len(&(*r).text)
+    let p: u64 = rt.buf_ptr(&(*r).text)
+    var at: usize = pos
+    if at >= n {
+        if n == 0 {
+            *lo = 0
+            *hi = 0
+            return
+        }
+        at = n - 1
+    }
+    let cl: u32 = cclass(rt.ld8(p, at))
+    var a: usize = at
+    while a > 0 && cclass(rt.ld8(p, a - 1)) == cl {
+        a = a - 1
+    }
+    var b: usize = at + 1
+    while b < n && cclass(rt.ld8(p, b)) == cl {
+        b = b + 1
+    }
+    *lo = a
+    *hi = b
+}
+
+// the paragraph (up to the hard breaks) around `pos`
+fn para_at(r: *mut RichText, pos: usize, lo: *mut usize, hi: *mut usize) {
+    let n: usize = rt.buf_len(&(*r).text)
+    let p: u64 = rt.buf_ptr(&(*r).text)
+    var a: usize = pos
+    if a > n {
+        a = n
+    }
+    while a > 0 && rt.ld8(p, a - 1) != 10 as u8 {
+        a = a - 1
+    }
+    var b: usize = pos
+    while b < n && rt.ld8(p, b) != 10 as u8 {
+        b = b + 1
+    }
+    *lo = a
+    *hi = b
+}
+
+// Ctrl+A and Ctrl+C: `cp` is the character (or the control character 1 / 3), `mods` as editor.MOD_*.
+// True when it was one of these keys.
+fn rt_char(r: *mut RichText, cp: u32, mods: u32) -> bool {
+    var k: u32 = 0
+    if cp >= 1 as u32 && cp <= 26 as u32 {
+        k = cp + 96 as u32
+    } else if (mods & editor.MOD_CTRL) != 0 as u32 {
+        if cp >= 65 as u32 && cp <= 90 as u32 {
+            k = cp + 32 as u32
+        } else if cp >= 97 as u32 && cp <= 122 as u32 {
+            k = cp
+        }
+    }
+    if k == 97 as u32 {
+        rt_select_all(r)
+        return true
+    }
+    if k == 99 as u32 {
+        let ok: bool = rt_copy(r)
+        return true
+    }
+    return false
+}
+
+// --------------------------------------------------------------- pointer input
+
+fn rt_pointer_move(r: *mut RichText, c: *mut render.Ctx, x: f64, y: f64) -> bool {
+    var changed: bool = false
+    if (*r).dragging {
+        let p: usize = rt_pos_at(r, c, x, y)
+        if p != (*r).sf {
+            (*r).sf = p
+            changed = true
+        }
+        return changed
+    }
+    let h: u32 = rt_link_at(r, c, x, y)
+    if h != (*r).hover {
+        (*r).hover = h
+        changed = true
+    }
+    return changed
+}
+
+fn rt_pointer_leave(r: *mut RichText) -> bool {
+    if (*r).hover != 0 as u32 {
+        (*r).hover = 0 as u32
+        return true
+    }
+    return false
+}
+
+fn near(a: f64, b: f64) -> bool {
+    var d: f64 = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < 6.0
+}
+
+// A press. A press on a link waits for its release; anywhere else it starts a selection
+// (the double click selects the word, the third click the paragraph). True when the
+// picture changed or the press was taken.
+fn rt_pointer_down(r: *mut RichText, c: *mut render.Ctx, x: f64, y: f64) -> bool {
+    (*r).press = rt_link_at(r, c, x, y)
+    let pos: usize = rt_pos_at(r, c, x, y)
+    // click counting
+    if (*r).now_ms - (*r).last_down_ms <= 450 && near(x, (*r).last_x) && near(y, (*r).last_y) {
+        (*r).clicks = (*r).clicks + 1
+    } else {
+        (*r).clicks = 1
+    }
+    (*r).last_down_ms = (*r).now_ms
+    (*r).last_x = x
+    (*r).last_y = y
+    if (*r).clicks >= 3 {
+        var a: usize = 0
+        var b: usize = 0
+        para_at(r, pos, &a, &b)
+        (*r).sa = a
+        (*r).sf = b
+        (*r).dragging = false
+        return true
+    }
+    if (*r).clicks == 2 {
+        var a: usize = 0
+        var b: usize = 0
+        rt_word_at(r, pos, &a, &b)
+        (*r).sa = a
+        (*r).sf = b
+        (*r).dragging = false
+        return true
+    }
+    (*r).sa = pos
+    (*r).sf = pos
+    (*r).dragging = true
+    return true
+}
+
+// An explicit double click (for hosts that count clicks themselves): selects the word at (x, y).
+fn rt_double_click(r: *mut RichText, c: *mut render.Ctx, x: f64, y: f64) {
+    let pos: usize = rt_pos_at(r, c, x, y)
+    var a: usize = 0
+    var b: usize = 0
+    rt_word_at(r, pos, &a, &b)
+    (*r).sa = a
+    (*r).sf = b
+    (*r).dragging = false
+}
+
+// A release. Ends a drag; when it ends a click on a link (down and up on the same link, no drag),
+// the link callback runs; true then.
+fn rt_pointer_up(r: *mut RichText, c: *mut render.Ctx, x: f64, y: f64) -> bool {
+    (*r).dragging = false
+    let p: u32 = (*r).press
+    (*r).press = 0 as u32
+    if p == 0 as u32 {
+        return false
+    }
+    if (*r).sa != (*r).sf {
+        return false // it was a drag over text, not a click
+    }
+    if rt_link_at(r, c, x, y) != p {
+        return false
+    }
+    if (*r).has_link_cb {
+        let f: fn(u64, u32) = (*r).link_cb
+        f((*r).link_ud, p)
+    }
+    return true
+}

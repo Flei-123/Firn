@@ -68,6 +68,8 @@ import fui.lucide
 import fui.icon
 import fui.uiimage
 import fui.kitcolor
+import fui.syntaxcolor
+import highlight.highlight
 
 export {
     MdView, ImgInfo, mdv_new, mdv_free, mdv_set_markdown, mdv_set_base_size,
@@ -76,7 +78,7 @@ export {
     mdv_wheel, mdv_key, mdv_pointer_move, mdv_pointer_down, mdv_pointer_up,
     mdv_pointer_leave, mdv_link_count, mdv_link_url, mdv_hover_link,
     mdv_content_height, mdv_offset, mdv_set_offset, mdv_item_count,
-    mdv_link_rect, mdv_tick, mdv_doc,
+    mdv_link_rect, mdv_tick, mdv_doc, mdv_set_highlight,
     IMG_PENDING, IMG_READY, IMG_FAILED,
 }
 
@@ -85,6 +87,10 @@ const NIL: u32 = 4294967295
 // A colour that is no theme token: the accent as TEXT on the page ground
 // (kitcolor.accent_text -- the launcher green is too light for a white page).
 const TOK_LINK: u32 = 1000
+
+// The colours of syntax highlighting: TOK_SYN + highlight.TK_* (a token that is not
+// a theme token either: the colour depends on the code ground, syntaxcolor.fi).
+const TOK_SYN: u32 = 1100
 
 const IMG_PENDING: u32 = 0
 const IMG_READY: u32 = 1
@@ -168,6 +174,10 @@ struct MdView {
     img_cb: fn(u64, u64, usize, *mut ImgInfo) -> u32,
     has_img_cb: bool,
     drag_bar: bool,
+    // syntax highlighting of fenced code (lib/highlight): on by default
+    hl: highlight.Highlighter,
+    hl_on: bool,
+    hl_spans: Vec[highlight.HlSpan],
 }
 
 fn cb_link_none(ud: u64, p: u64, n: usize) {
@@ -186,6 +196,7 @@ fn mdv_new() -> MdView {
         total_h: 0.0, dirty: true, hover: NIL, press: NIL,
         link_ud: 0, link_cb: cb_link_none, has_link_cb: false,
         img_ud: 0, img_cb: cb_img_none, has_img_cb: false, drag_bar: false,
+        hl: highlight.hl_new(), hl_on: true, hl_spans: vec_new[highlight.HlSpan](),
     }
 }
 
@@ -194,7 +205,17 @@ fn mdv_free(v: *mut MdView) {
     vec_free[Item](&(*v).items)
     vec_free[LinkRec](&(*v).link_tab)
     rt.buf_free(&(*v).vpool)
+    highlight.hl_free(&(*v).hl)
+    vec_free[highlight.HlSpan](&(*v).hl_spans)
     (*v).has_doc = false
+}
+
+// Syntax highlighting of fenced code blocks whose info string names a language
+// lib/highlight knows (json, toml, ini, firn, sh, md, yaml, java/js/c/rust...).
+// On by default; `false` draws every code block in the plain code colour.
+fn mdv_set_highlight(v: *mut MdView, on: bool) {
+    (*v).hl_on = on
+    (*v).dirty = true
 }
 
 // Replace the text. The scroll position goes back to the top.
@@ -306,6 +327,7 @@ struct L {
     last: usize,
     at_start: bool,
     align: i64,
+    tok_over: u32, // NIL, or the token every word placed gets (syntax colours)
 }
 
 fn px(l: *mut L, pt: usize) -> f64 {
@@ -529,6 +551,9 @@ fn place_word(l: *mut L, pool: u32, off: u32, n: usize, flags: u32, size: f64, l
         }
         if link != NIL {
             it.tok = TOK_LINK
+        }
+        if (*l).tok_over != NIL {
+            it.tok = (*l).tok_over
         }
         (*l).last = push_item(l, it)
         (*l).x = (*l).x + tw
@@ -910,6 +935,22 @@ fn lay_block(l: *mut L, n: u32, x0: f64, w: f64, tight: bool, flags: u32) {
     }
 }
 
+// the first span that ends after octet `pos` (spans tile the text, sorted)
+fn hl_first_span(spans: *mut Vec[highlight.HlSpan], pos: usize) -> usize {
+    var lo: usize = 0
+    var hi: usize = vec_len[highlight.HlSpan](spans)
+    while lo < hi {
+        let mid: usize = (lo + hi) / 2
+        let sp: *mut highlight.HlSpan = vec_elem_ptr[highlight.HlSpan](spans, mid)
+        if (*sp).start + (*sp).len <= pos {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return lo
+}
+
 fn lay_code(l: *mut L, n: u32, x0: f64, w: f64) {
     let d: *mut doc.Doc = &(*(*l).v).d
     let base: f64 = (*l).base
@@ -920,6 +961,19 @@ fn lay_code(l: *mut L, n: u32, x0: f64, w: f64) {
     let toff: u32 = (*q).txt
     let bg: usize = add_rect(l, IT_RECT, x0, (*l).y, w, 0.0, style.TOK_SURFACE, px(l, 6))
     let y0: f64 = (*l).y
+    // the language of a fenced block: its info string
+    var hl_lang: u32 = highlight.HL_NONE
+    if (*(*l).v).hl_on {
+        let info: doc.Slice = doc.node_url(d, n)
+        if info.n > 0 {
+            hl_lang = highlight.hl_language(str { p: rt.ptr_of(info.p), n: info.n })
+        }
+    }
+    if hl_lang != highlight.HL_NONE {
+        if !highlight.hl_tokenize(&(*(*l).v).hl, hl_lang, t.p, t.n, &(*(*l).v).hl_spans) {
+            hl_lang = highlight.HL_NONE
+        }
+    }
     (*l).y = (*l).y + pad
     // line by line; every line may wrap
     var i: usize = 0
@@ -941,7 +995,29 @@ fn lay_code(l: *mut L, n: u32, x0: f64, w: f64) {
         (*l).at_start = true
         (*l).last = (*l).line_start
         if e > i {
-            place_word(l, 0 as u32, toff + (i as u32), e - i, FL_CODE, size, NIL)
+            if hl_lang != highlight.HL_NONE {
+                // the line as pieces of one kind each (a piece never crosses a line end)
+                var si: usize = hl_first_span(&(*(*l).v).hl_spans, i)
+                var at: usize = i
+                while at < e && si < vec_len[highlight.HlSpan](&(*(*l).v).hl_spans) {
+                    let sp: *mut highlight.HlSpan = vec_elem_ptr[highlight.HlSpan](&(*(*l).v).hl_spans, si)
+                    var pe: usize = (*sp).start + (*sp).len
+                    if pe > e {
+                        pe = e
+                    }
+                    if pe > at {
+                        if (*sp).kind != highlight.TK_PLAIN {
+                            (*l).tok_over = TOK_SYN + (*sp).kind
+                        }
+                        place_word(l, 0 as u32, toff + (at as u32), pe - at, FL_CODE, size, NIL)
+                        (*l).tok_over = NIL
+                        at = pe
+                    }
+                    si = si + 1
+                }
+            } else {
+                place_word(l, 0 as u32, toff + (i as u32), e - i, FL_CODE, size, NIL)
+            }
         } else {
             // an empty line still takes a line
             var it: Item = new_item(IT_TEXT)
@@ -1199,7 +1275,7 @@ fn mdv_layout(v: *mut MdView, c: *mut render.Ctx, width: f64) {
     }
     var ly: L = L { c: c, z: render.ctx_painter(c), v: v, base: render.len_of(c, (*v).base_pt),
         y: 0.0, left: 0.0, right: 0.0, x: 0.0, line_y: 0.0, line_start: 0, pend: false,
-        last: 0, at_start: true, align: doc.ALIGN_NONE }
+        last: 0, at_start: true, align: doc.ALIGN_NONE, tok_over: NIL }
     let pad: f64 = render.len_of(c, (*v).pad_pt)
     ly.y = pad
     lay_children(&ly, 0 as u32, pad, width - 2.0 * pad, false, 0 as u32)
@@ -1215,6 +1291,12 @@ fn tokc(c: *mut render.Ctx, tok: u32) -> u32 {
         let m: *mut theme.Theme = render.ctx_theme(c)
         let f: *mut theme.Colors = theme.theme_colors(m)
         return theme.opaque(kitcolor.accent_text(m, (*f).base))
+    }
+    if tok >= TOK_SYN && tok < TOK_SYN + highlight.TK_COUNT {
+        // the ground of a code block is the surface token
+        let m: *mut theme.Theme = render.ctx_theme(c)
+        let ground: u32 = render.color_of(c, style.color_token(style.TOK_SURFACE)) & 16777215 as u32
+        return theme.opaque(syntaxcolor.syntax_color(m, tok - TOK_SYN, ground))
     }
     return render.color_of(c, style.color_token(tok))
 }
