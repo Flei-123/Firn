@@ -68,7 +68,7 @@ every format.
 
 ## What was held against what
 
-`tools/compress/check.py` (section 80 of `test.sh`, `tools/compress/run.sh`)
+`tools/compress/check.py` (section 81 of `test.sh`, `tools/compress/run.sh`)
 runs the library, compiled in the four build levels, the AArch64 build under
 `qemu-aarch64` and the Windows build under Wine, against programs nobody here
 wrote -- libzstd (the `zstd` command), liblzma (`xz` and Python `lzma`),

@@ -33,7 +33,7 @@
 #      `call`, a call through a function value is exactly one `call rax`,
 #      a closure without captures allocates nothing -- in both compilers
 #      and with counter-checks (tools/fnval/run.sh).
-#  80. Compression (tools/compress/run.sh): lib/compress against libzstd, liblzma, libbrotli, libbz2,
+#  81. Compression (tools/compress/run.sh): lib/compress against libzstd, liblzma, libbrotli, libbz2,
 #      liblz4 and zlib in both directions, hostile inputs, dictionaries, net.http Content-Encoding,
 #      the AArch64 build under qemu and the Windows build under Wine (docs/COMPRESSION.md).
 #   9. HTML5 tokenizer (lib/html/, in Firn) against the official
@@ -1647,7 +1647,7 @@ if [ "$PKRC" -eq 0 ]; then
 else
     bad "tools/pack/test failed (see .test-work/pack*.log)"
     grep -E 'FAIL' "$WORK"/pack*.log | head -12 | sed 's/^/   /'
-echo "== 80. compression: zstd, xz/LZMA2, Brotli, bzip2, LZ4, gzip against libzstd, liblzma, libbrotli, libbz2, liblz4, zlib (tools/compress/run.sh) =="
+echo "== 81. compression: zstd, xz/LZMA2, Brotli, bzip2, LZ4, gzip against libzstd, liblzma, libbrotli, libbz2, liblz4, zlib (tools/compress/run.sh) =="
 # lib/compress has its own positive tests (tests/2180..2188, in every build level above). This section holds it against
 # the reference implementations in BOTH directions -- a corpus compressed by them and decoded here (whole buffer and
 # streaming from a descriptor), what the encoders here write read back by them, zstd dictionaries trained by
