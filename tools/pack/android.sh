@@ -53,4 +53,5 @@ if [ -n "$ICONS" ] && [ -d "$ICONS/android/res" ]; then ICON_ARGS=(--icon-res "$
 bash "$ROOT/tools/android/build.sh" "$APP/src/main.fi" --name "$NAME" --package "$PKG" \
     --version-code "$VCODE" --version-name "$VERSION" ${EXTRA[@]+"${EXTRA[@]}"} ${ICON_ARGS[@]+"${ICON_ARGS[@]}"} \
     --out "$OUT"
+rm -f "$OUT.idsig"        # apksigner's v4 side file: not needed, not shipped
 echo "$OUT"

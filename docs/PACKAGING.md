@@ -19,7 +19,7 @@ cd myapp && bash package.sh   # = tools/pack/all.sh: every package into dist/<ve
 | Windows | `setup.exe` (installer + uninstaller), the program with its icon, a portable zip, an NSIS script | **under Wine**: silent and window install, shortcuts, registry entry, upgrade, uninstall, cancel; not on a real Windows |
 | Linux | `.deb`, `.rpm`, `.tar.gz` + `install.sh`, a real **AppImage**, a self-extracting `.run`, the raw program | `dpkg-deb`, `dpkg -i` and `rpm -i` in a Debian container, `unsquashfs`, the AppImage runtime (`--appimage-extract`, extract-and-run), run |
 | macOS | `.app` bundle, zip, `.dmg`, `sign-and-notarize.sh` | structure only (script + `plistlib`, `xorriso`); **nothing run on a Mac, nothing signed**; Firn has no macOS target, so the program must be given |
-| Android | signed APK with launcher icons | `tools/android/build.sh` (existing); the APK build is run by `tests` when the SDK/NDK is there |
+| Android | signed APK with launcher icons | `tools/pack/test/android.sh` (12 checks: `aapt2 dump badging`, `apksigner verify`, the mipmaps in the APK) when the SDK/NDK is there; not installed on a device here |
 | OrientOS | `.opk` store package | byte for byte against OrientOS's own `opk.py`; **never run on OrientOS** |
 | all | `manifest.json` (SHA-256 + Ed25519 per file), `store-add.sh` | signatures verified, a throw-away store takes the commands |
 
@@ -207,6 +207,7 @@ This is a second layer next to the catalog signature `store add-app` makes -- it
 | `tests/2202_pack_payload.fi` | trailer, SHA-256, truncation / damage / lying lengths, `.pack/info` |
 | `tests/2203_pack_install.fi` | install, list, upgrade, uninstall, user files, `..` entry, no program, damaged payload |
 | `tools/pack/test/checks.py` | every writer against an independent reader (dpkg-deb, `dpkg -i` and `rpm -i` in a container, unsquashfs, the AppImage runtime, opk.py, the store's `opkleser`, makensis, xorriso, a throw-away store, own parsers): ~175 checks |
+| `tools/pack/test/android.sh` | a project from `newapp.sh` -> signed APK: package id, version code, adaptive launcher icon, mipmaps, v3 signature, both ABIs (SDK/NDK needed) |
 | `tools/pack/test/windows.sh` | under Wine (65 checks): installer, shortcuts (own reader **and** Wine's shell), registry, upgrade, `sync_version`, uninstall (+ leftovers), the windows (xdotool, screenshots), cancel, the error window, NSIS setup, portable zip, the template window |
 
 `test.sh` section 77 runs the unit tests (via the normal list) and `tools/pack/test/run.sh`; `PACK_WINE=1` adds the Wine run.

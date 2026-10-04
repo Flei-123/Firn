@@ -3,6 +3,7 @@
 # tools/pack/test/run.sh -- the packaging tests.
 #
 #   bash tools/pack/test/run.sh            checks.py (every writer against an independent reader)
+#   PACK_ANDROID=1 ...                    ... and android.sh (an APK with launcher icons; needs the SDK/NDK)
 #   PACK_WINE=1 bash tools/pack/test/run.sh    ... and windows.sh (installer, shortcuts, registry,
 #                                                uninstaller, the window -- under Wine on Xvfb)
 #
@@ -25,5 +26,9 @@ python3 "$ROOT/tools/pack/test/checks.py" --tmp "$W/checks" || RC=1
 if [ "${PACK_WINE:-0}" = "1" ]; then
     echo "== windows.sh (Wine)"
     PACK_W=$W bash "$ROOT/tools/pack/test/windows.sh" || RC=1
+fi
+if [ "${PACK_ANDROID:-0}" = "1" ]; then
+    echo "== android.sh"
+    bash "$ROOT/tools/pack/test/android.sh" || RC=1
 fi
 exit ${RC:-0}
