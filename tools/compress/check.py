@@ -21,6 +21,10 @@ Prints one line per group and a total; exit code 1 on any failure.
 import os, sys, subprocess, random, tempfile, shutil, time, struct, zlib
 
 PROBE = os.path.abspath(sys.argv[1])
+# RUNNER: a program that runs the probe (qemu-aarch64 for an AArch64 build, wine for a
+# Windows build); CHECK_QUICK=1: a small corpus and fewer hostile cases (for the slow runners)
+RUNNER = os.environ.get("RUNNER", "").split()
+QUICK = bool(os.environ.get("CHECK_QUICK"))
 FMTS = sys.argv[2:] or ["lz4", "zstd", "xz", "lzma", "bz2", "br", "gz", "zlib", "deflate", "auto"]
 PARTS = os.environ.get("CHECK_PARTS", "decode,encode,hostile").split(",")
 W = tempfile.mkdtemp(prefix="compress-check-")
@@ -44,11 +48,13 @@ def run_probe(op, fmt, data, arg=None, timeout=120, dict_path=None):
         f.write(data)
     if os.path.exists(fo):
         os.remove(fo)
-    cmd = [PROBE, op, fmt, fi, fo] + ([str(arg if arg is not None else 0)] if (arg is not None or dict_path) else [])
+    # relative names, working directory W: the same call works for a Windows build under Wine
+    cmd = RUNNER + [PROBE, op, fmt, "in.bin", "out.bin"] + ([str(arg if arg is not None else 0)] if (arg is not None or dict_path) else [])
     if dict_path:
-        cmd.append(dict_path)
+        shutil.copyfile(dict_path, os.path.join(W, "dict.bin"))
+        cmd.append("dict.bin")
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout, cwd=W)
     except subprocess.TimeoutExpired:
         return "TIMEOUT", b""
     if r.returncode != 0:
@@ -71,6 +77,20 @@ def check(name, cond, detail=""):
 # ------------------------------------------------------------- corpus
 
 def corpus():
+    items = corpus_full()
+    if not QUICK:
+        return items
+    keep = {"empty": None, "rand1": None, "rand3": None, "rand12": None, "rand13": None, "a1": None, "abab": 20000,
+            "text600k": 60000, "source": 60000, "runs": 40000, "dna": 30000, "bcjmix": 40000, "skew": 40000,
+            "elf3M": 80000, "random100k": 30000, "zeros1M": 200000, "sparse": 40000}
+    out = []
+    for name, data in items:
+        if name in keep:
+            out.append((name, data if keep[name] is None else data[: keep[name]]))
+    return out
+
+
+def corpus_full():
     rnd = random.Random(20261004)
     items = []
     items.append(("empty", b""))
@@ -296,7 +316,7 @@ def group(fmt):
             check("decode %s %s" % (label, name), st.startswith("OK") and got == data,
                   "-> %s (%d vs %d octets)" % (st, len(got), len(data)))
             if len(z) < 300000 or name in ("text600k",):
-                for piece in ((1, 4093, 65537) if fmt != "lzma" else ()):
+                for piece in (((4093,) if QUICK else (1, 4093, 65537)) if fmt != "lzma" else ()):
                     if piece == 1 and len(z) > 20000:
                         continue
                     st, got = run_probe("ds", fmt, z, piece)
@@ -319,7 +339,7 @@ def group(fmt):
                     continue
                 check("encode(%s) %s" % (lv, name), back == data, "reference reads back %d vs %d octets" % (len(back), len(data)))
                 if fmt != "lzma" and (lv is None or lv == ENC_LEVELS[fmt][-1]):
-                    for chunk in (1, 4097, 1 << 20):
+                    for chunk in ((4097,) if QUICK else (1, 4097, 1 << 20)):
                         if chunk == 1 and len(data) > 3000:
                             continue
                         st, z2 = run_probe("cs", fmt, data, chunk)
@@ -344,30 +364,31 @@ def group(fmt):
     for name in ("text600k", "elf3M", "runs"):
         data = base[name][:40000]
         z = comp(data)
-        step = max(1, len(z) // 150)
+        step = max(1, len(z) // (30 if QUICK else 150))
         for cut in list(range(0, min(len(z), 40))) + list(range(40, len(z), step)):
             st, got = run_probe("d", fmt, z[:cut])
             check("cut %s at %d/%d" % (name, cut, len(z)), st.startswith("ERROR"), "-> %s" % st)
-        for _ in range(120):
+        for _ in range(20 if QUICK else 120):
             zz = bytearray(z)
             for _k in range(rnd.choice((1, 1, 2, 5))):
                 zz[rnd.randrange(len(zz))] ^= 1 << rnd.randrange(8)
             st, got = run_probe("d", fmt, bytes(zz))
             check("flip %s" % name, st.startswith("OK") or st.startswith("ERROR"), "-> %s" % st)
-        for _ in range(60):
+        for _ in range(10 if QUICK else 60):
             junk = bytes(rnd.getrandbits(8) for _ in range(rnd.randint(1, 300)))
             if rnd.random() < 0.7:
                 junk = z[: rnd.randint(1, 12)] + junk
             st, got = run_probe("d", fmt, junk)
             check("junk %s" % name, st.startswith("OK") or st.startswith("ERROR"), "-> %s" % st)
     # bomb: 64 MiB of zeros under a 1 MiB limit
-    zeros = bytes(64 << 20)
+    big = (4 << 20) if QUICK else (64 << 20)
+    zeros = bytes(big)
     z = comp(zeros)
     st, got = run_probe("d", fmt, z, 1 << 20)
     check("bomb limited", st == "ERROR TooLarge" and len(got) == 0, "-> %s" % st)
-    st, got = run_probe("d", fmt, z, 64 << 20)
-    check("bomb exact limit", st.startswith("OK") and len(got) == 64 << 20, "-> %s" % st)
-    st, got = run_probe("d", fmt, z, (64 << 20) - 1)
+    st, got = run_probe("d", fmt, z, big)
+    check("bomb exact limit", st.startswith("OK") and len(got) == big, "-> %s" % st)
+    st, got = run_probe("d", fmt, z, big - 1)
     check("bomb one under", st == "ERROR TooLarge", "-> %s" % st)
     print("  %-4s hostile (cuts, flips, junk, bomb) %s   [%.0f s]" % (fmt, "ok" if len(FAILS) == n2 else "FAILED",
                                                                     time.time() - t0))
@@ -406,7 +427,7 @@ def zstd_dict_group():
     for label, dp, has_id in tests:
         dd = open(dp, "rb").read()
         for name, data in [("sample0", samples[0]), ("sample7", samples[7]), ("empty", b""),
-                           ("10samples", b"".join(samples[100:110])), ("big", big), ("short", b"{}")]:
+                           ("10samples", b"".join(samples[100:110])), ("big", big), ("short", b"{}")][: (3 if QUICK else 6)]:
             # reference compresses with the dictionary -> we decode with it
             args = ["zstd", "-q", "-c", "-D", dp, "-3"]
             z = subprocess.run(args, input=data, capture_output=True).stdout

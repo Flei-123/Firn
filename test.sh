@@ -33,6 +33,9 @@
 #      `call`, a call through a function value is exactly one `call rax`,
 #      a closure without captures allocates nothing -- in both compilers
 #      and with counter-checks (tools/fnval/run.sh).
+#  80. Compression (tools/compress/run.sh): lib/compress against libzstd, liblzma, libbrotli, libbz2,
+#      liblz4 and zlib in both directions, hostile inputs, dictionaries, net.http Content-Encoding,
+#      the AArch64 build under qemu and the Windows build under Wine (docs/COMPRESSION.md).
 #   9. HTML5 tokenizer (lib/html/, in Firn) against the official
 #      html5lib test suite: the exact quota out of 6,810 cases, the limit in
 #      tools/tokenizer/minquota.txt (tools/tokenizer/run.sh).
@@ -1644,6 +1647,20 @@ if [ "$PKRC" -eq 0 ]; then
 else
     bad "tools/pack/test failed (see .test-work/pack*.log)"
     grep -E 'FAIL' "$WORK"/pack*.log | head -12 | sed 's/^/   /'
+echo "== 80. compression: zstd, xz/LZMA2, Brotli, bzip2, LZ4, gzip against libzstd, liblzma, libbrotli, libbz2, liblz4, zlib (tools/compress/run.sh) =="
+# lib/compress has its own positive tests (tests/2180..2188, in every build level above). This section holds it against
+# the reference implementations in BOTH directions -- a corpus compressed by them and decoded here (whole buffer and
+# streaming from a descriptor), what the encoders here write read back by them, zstd dictionaries trained by
+# `zstd --train`, every cut and 180 damaged copies per format, a 64 MiB bomb under limits -- in dev-fast, release-fast
+# and release-safe, then net.http's Content-Encoding br/zstd against python's http.server, then the AArch64 build under
+# qemu and the Windows build under Wine (docs/COMPRESSION.md).
+bash tools/compress/run.sh > "$WORK/compress.log" 2>&1 && CMPRC=0 || CMPRC=$?
+if [ "$CMPRC" -eq 0 ]; then
+    ok
+    grep -E '^(checks:|http checks:|   SKIP)' "$WORK/compress.log" | sed 's/^/   /'
+else
+    bad "tools/compress/run.sh failed (see .test-work/compress.log)"
+    grep -E 'FAIL|Traceback|Error' "$WORK/compress.log" | head -12 | sed 's/^/   /'
 fi
 
 echo "== 79. UI extras: QR codes against qrcodegen / python-qrcode / ZXing-C++, and the human texts against ICU (tools/qr/, tools/uiextras/) =="

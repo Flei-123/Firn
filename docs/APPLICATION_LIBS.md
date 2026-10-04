@@ -54,8 +54,8 @@ honest limits: [STD_ARCHIVES.md](STD_ARCHIVES.md).
 
 | module | what it does | held against |
 |---|---|---|
-| `std.tar` (`lib/std/tar.fi`) | tar reader (ustar, V7, GNU long names, pax), tar writer, `tar_add_tree`, tar.gz with a size limit on the inflated stream, safe extraction with mode bits | GNU tar 1.34 and Python `tarfile`, both directions; fourteen hostile archives |
-| `std.extract` (`lib/std/extract.fi`) | `extract_archive(path, dest)`: .zip, .tar.gz/.tgz, .tar found by content, `strip` for the Adoptium top directory, modes (0755 for `bin/java`) | Info-ZIP, `zipfile`, GNU tar |
+| `std.tar` (`lib/std/tar.fi`) | tar reader (ustar, V7, GNU long names, pax), tar writer, `tar_add_tree`, tar.gz and (round COMPRESS) tar.zst / tar.xz / tar.bz2 / tar.lz4 with a size limit on the inflated stream, safe extraction with mode bits | GNU tar 1.34 and Python `tarfile`, both directions; fourteen hostile archives |
+| `std.extract` (`lib/std/extract.fi`) | `extract_archive(path, dest)`: .zip, .tar.gz/.tgz, .tar.zst/.xz/.bz2/.lz4, .tar found by content, `strip` for the Adoptium top directory, modes (0755 for `bin/java`) | Info-ZIP, `zipfile`, GNU tar |
 | `std.safefs` (`lib/std/safefs.fi`) | the shared rules: names, link targets, nothing written through a link, Windows names | the hostile archives above |
 | `std.hashfile` (`lib/std/hashfile.fi`) | streaming md5/sha1/sha256/sha512 of a file, hex, `Download` (temporary file, verify, fsync, atomic rename) | Python `hashlib` |
 | `std.secret` (`lib/std/secret.fi`) | keyring `secret_set/get/delete(service, key)`: Credential Manager on Windows, ChaCha20-Poly1305 file on Linux (machine-bound or Argon2id password) | Python `cryptography` + PyNaCl; the real Credential Manager (Wine and a Windows 11 machine) |
@@ -171,3 +171,25 @@ account. Details, tests and the honest limits: [DOWNLOAD.md](DOWNLOAD.md),
 | `auth.oauth` (`lib/auth/oauth.fi`) | OAuth 2.0 / OIDC client: discovery, device code flow, authorization code + PKCE with a loopback redirect server and the system browser, refresh, id_token check with the JWKS, userinfo, revocation, tokens in `std.secret` | a Python provider that checks PKCE, redirect URI, single-use codes, rotating refresh tokens and the polling interval (97 checks, three build stages, Wine); RFC 7636 appendix B |
 | `auth.msa` (`lib/auth/msa.fi`) | Microsoft account -> Xbox Live -> XSTS -> Minecraft services -> ownership -> profile, XSTS error texts, session in the keyring, `msa_ensure` | a Python stand-in that checks every header and body (64 checks); the real hosts with bogus credentials (TLS 1.3 path proven); **no real login** (no client id here) |
 | `appkit.fleitec_login` (`lib/appkit/fleitec_login.fi`) | "Sign in with Fleitec-ID": the five login answers and three `me` answers of docs/FLEITEC-ID.md, token in the keyring | `tests/2153` against an in-process ID server; not run against the real server |
+
+## Compression formats (round COMPRESS, [COMPRESSION.md](COMPRESSION.md))
+
+zstd, xz/LZMA2, Brotli, bzip2, LZ4 and a streaming gzip/zlib/DEFLATE inflater,
+with one door (`compress.auto`: magic-octet detection, whole buffer and
+streaming), and the two places that needed them: `.tar.zst`/`.tar.xz`/
+`.tar.bz2`/`.tar.lz4` in `std.tar`/`std.extract` (Adoptium, Modrinth packs and
+Linux packages) and `Content-Encoding: br`/`zstd` in `net.http`.
+
+| module | what it does | held against |
+|---|---|---|
+| `compress.zstd`, `zstd_enc` | RFC 8878 in full incl. dictionaries and streaming; encoder levels 1-19 with Huffman literals, FSE tables, repeat offsets, dictionaries | libzstd (`zstd` command): corpus x levels 1-22/--long/small windows/dictionaries, both directions, every cut and damaged copy, a 64 MiB bomb under limits |
+| `compress.lzma`, `lzma_enc` | LZMA2, `.xz` (CRC-32/64, SHA-256, filters delta/x86/PPC/IA-64/ARM/Thumb/SPARC/ARM64, several streams), `.lzma`; encoder presets 0-9 | liblzma (`xz`, Python `lzma`), both directions |
+| `compress.brotli` | RFC 7932 in full incl. the static dictionary and transforms | libbrotli (Python `brotli`): qualities 0-11, windows 10-24 |
+| `compress.bz2` | bzip2 (several streams, randomised blocks) | libbz2 (Python `bz2`) |
+| `compress.lz4` | LZ4 blocks and frames (linked, checksums, dictionaries, skippable, legacy) and an encoder | liblz4 (Python `lz4`), both directions |
+| `compress.gzip` | streaming gzip (several members)/zlib/DEFLATE | zlib/gzip |
+| `compress.auto` | detection by content and one decompress/compress API | all of the above |
+
+Every decoder takes a size limit and refuses with `TooLarge` before writing
+past it; every format has a streaming reader whose memory is "window + one
+unit". Linux, AArch64 (qemu) and Windows (Wine), all four build levels.

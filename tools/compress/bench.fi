@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/compress/bench.fi -- throughput of lib/compress, in process.
+//
+//     bench <corpus> [name=file ...]
+//
+// <corpus> is the uncompressed data. For every encoder the corpus is
+// compressed (best of 3 runs) and the result decoded (best of 3); for every
+// `name=file` pair (name: lz4 zstd xz bz2 br gz) the file -- made by a
+// reference tool from the same corpus -- is decoded with this library
+// (best of 3) and compared with the corpus. Output, one line each:
+//
+//     ENC <name> <in> <out> <ms>      DEC <name> <out> <ms> <ok 0|1>
+//
+// tools/compress/bench.py turns it into the table of docs/COMPRESSION.md.
+// Build with --opt-level=release-fast.
+import compress.common
+import compress.lz4
+import compress.zstd
+import compress.zstd_enc
+import compress.lzma
+import compress.lzma_enc
+import compress.bz2
+import compress.brotli
+import compress.gzip
+import std.deflate
+import std.fs
+import std.io
+import std.rt
+import std.time
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: rt.ptr_of(p), n: rt.c_length(p) }
+}
+
+fn say(tag: str, name: str, a: u64, b: u64, c: u64) {
+    var m: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&m, tag.p as u64, tag.length())
+    rt.buf_push(&m, 32 as u8)
+    rt.buf_push_bytes(&m, name.p as u64, name.length())
+    rt.buf_push(&m, 32 as u8)
+    rt.buf_push_dec_u64(&m, a)
+    rt.buf_push(&m, 32 as u8)
+    rt.buf_push_dec_u64(&m, b)
+    rt.buf_push(&m, 32 as u8)
+    rt.buf_push_dec_u64(&m, c)
+    io.print_line_bytes(rt.buf_ptr(&m), rt.buf_len(&m))
+    rt.buf_free(&m)
+}
+
+fn ms_since(t0: u64) -> u64 {
+    return (time.monotonic_ns() - t0) / 1000
+}
+
+// 0 = lz4 1 = zstd 2 = xz 3 = bz2 4 = br 5 = gz (the decoders in this library)
+fn decode(kind: usize, p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    var ok: bool = true
+    if kind == 0 {
+        lz4.lz4_frame_decompress(p, n, out) catch 0
+    } else if kind == 1 {
+        zstd.zstd_decompress(p, n, out) catch 0
+    } else if kind == 2 {
+        lzma.xz_decompress(p, n, out) catch 0
+    } else if kind == 3 {
+        bz2.bz2_decompress(p, n, out) catch 0
+    } else if kind == 4 {
+        brotli.brotli_decompress(p, n, out) catch 0
+    } else {
+        gzip.gz_decompress(p, n, gzip.GZ_GZIP, out) catch 0
+    }
+    return ok
+}
+
+fn kind_of(name: str) -> usize {
+    if name == "lz4" { return 0 }
+    if name == "zstd" { return 1 }
+    if name == "xz" { return 2 }
+    if name == "bz2" { return 3 }
+    if name == "br" { return 4 }
+    return 5
+}
+
+fn best_decode(name: str, z: u64, zn: usize, corpus: u64, cn: usize) {
+    var best: u64 = 0xFFFFFFFFFFFFFFFF
+    var ok: u64 = 1
+    var r: usize = 0
+    while r < 3 {
+        var out: rt.Buf = rt.buf_new()
+        let t0: u64 = time.monotonic_ns()
+        decode(kind_of(name), z, zn, &out)
+        let us: u64 = ms_since(t0)
+        if us < best {
+            best = us
+        }
+        if rt.buf_len(&out) != cn || !rt.mem_eq(rt.buf_ptr(&out), corpus, cn) {
+            ok = 0
+        }
+        rt.buf_free(&out)
+        r = r + 1
+    }
+    say("DEC", name, cn as u64, best, ok)
+}
+
+// one encoder: kind 0 lz4, 1 zstd (level), 2 xz (preset)
+fn encode_once(kind: usize, level: u32, p: u64, n: usize, out: *mut rt.Buf) {
+    if kind == 0 {
+        lz4.lz4_frame_compress(p, n, out) catch 0
+    } else if kind == 1 {
+        zstd_enc.zstd_compress(p, n, level, out) catch 0
+    } else if kind == 2 {
+        lzma_enc.xz_compress(p, n, level, out) catch 0
+    } else {
+        deflate.gzip_compress(p, n, level as usize, out) catch 0
+    }
+}
+
+fn bench_enc(label: str, kind: usize, level: u32, corpus: u64, cn: usize, decname: str) {
+    var best: u64 = 0xFFFFFFFFFFFFFFFF
+    var zlen: usize = 0
+    var keep: rt.Buf = rt.buf_new()
+    var r: usize = 0
+    while r < 3 {
+        var out: rt.Buf = rt.buf_new()
+        let t0: u64 = time.monotonic_ns()
+        encode_once(kind, level, corpus, cn, &out)
+        let us: u64 = ms_since(t0)
+        if us < best {
+            best = us
+        }
+        zlen = rt.buf_len(&out)
+        if r == 2 {
+            rt.buf_push_bytes(&keep, rt.buf_ptr(&out), rt.buf_len(&out))
+        }
+        rt.buf_free(&out)
+        r = r + 1
+    }
+    say("ENC", label, cn as u64, zlen as u64, best)
+    if decname.length() > 0 {
+        // and the decoder on what the encoder made
+        var lab: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&lab, label.p as u64, label.length())
+        rt.buf_push_bytes(&lab, "/own".p as u64, 4)
+        best_decode_labelled(str { p: rt.buf_data(&lab), n: rt.buf_len(&lab) }, decname, rt.buf_ptr(&keep), rt.buf_len(&keep), corpus, cn)
+        rt.buf_free(&lab)
+    }
+    rt.buf_free(&keep)
+}
+
+fn best_decode_labelled(label: str, decname: str, z: u64, zn: usize, corpus: u64, cn: usize) {
+    var best: u64 = 0xFFFFFFFFFFFFFFFF
+    var ok: u64 = 1
+    var r: usize = 0
+    while r < 3 {
+        var out: rt.Buf = rt.buf_new()
+        let t0: u64 = time.monotonic_ns()
+        decode(kind_of(decname), z, zn, &out)
+        let us: u64 = ms_since(t0)
+        if us < best {
+            best = us
+        }
+        if rt.buf_len(&out) != cn || !rt.mem_eq(rt.buf_ptr(&out), corpus, cn) {
+            ok = 0
+        }
+        rt.buf_free(&out)
+        r = r + 1
+    }
+    say("DEC", label, cn as u64, best, ok)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        io.print_line("usage: bench <corpus> [name=file ...]")
+        return 2
+    }
+    var corpus: rt.Buf = rt.buf_new()
+    fs.read_file(arg(start, 1), &corpus) catch 0
+    let cp: u64 = rt.buf_ptr(&corpus)
+    let cn: usize = rt.buf_len(&corpus)
+    // the encoders (microseconds in the last column)
+    bench_enc("lz4", 0, 0, cp, cn, "lz4")
+    bench_enc("zstd-1", 1, 1, cp, cn, "zstd")
+    bench_enc("zstd-3", 1, 3, cp, cn, "zstd")
+    bench_enc("zstd-9", 1, 9, cp, cn, "zstd")
+    bench_enc("zstd-19", 1, 19, cp, cn, "zstd")
+    bench_enc("xz-1", 2, 1, cp, cn, "xz")
+    bench_enc("xz-6", 2, 6, cp, cn, "xz")
+    bench_enc("gzip-6", 3, 6, cp, cn, "gz")
+    // the reference tools' files
+    var i: usize = 2
+    while i < rt.arg_count(start) {
+        let a: str = arg(start, i)
+        var eq: usize = 0
+        while eq < a.length() && rt.ld8(a.p as u64, eq) != 61 as u8 {
+            eq = eq + 1
+        }
+        let name: str = __str_copy(str { p: a.p, n: eq })
+        var z: rt.Buf = rt.buf_new()
+        fs.read_file(str { p: ((a.p as u64) + (eq + 1) as u64) as *mut u8, n: a.length() - eq - 1 }, &z) catch 0
+        best_decode(name, rt.buf_ptr(&z), rt.buf_len(&z), cp, cn)
+        rt.buf_free(&z)
+        i = i + 1
+    }
+    return 0
+}

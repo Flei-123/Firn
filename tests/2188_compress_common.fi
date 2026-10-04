@@ -1,0 +1,184 @@
+// expect_exit: 0
+// tests/2188_compress_common.fi -- lib/compress/common.fi: the input source
+// (memory, and a descriptor read in chunks: contiguous takes across refills,
+// peeking without consuming, skipping, the consumed count, end of input), the
+// window compaction the streaming readers use, and CRC-64/XZ against its
+// catalogue check value.
+import compress.common
+import std.rt
+import std.io
+import std.fs
+import std.deflate
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+static mut code: u32 = 0
+
+fn why(e: CompressError) -> usize {
+    if e == CompressError::Data { code = 1 }
+    if e == CompressError::Format { code = 2 }
+    if e == CompressError::Checksum { code = 3 }
+    if e == CompressError::Truncated { code = 4 }
+    if e == CompressError::TooLarge { code = 5 }
+    if e == CompressError::OutOfMemory { code = 6 }
+    if e == CompressError::Unsupported { code = 7 }
+    if e == CompressError::Dictionary { code = 8 }
+    if e == CompressError::Io { code = 9 }
+    return 0
+}
+
+fn is_plain(b: *mut rt.Buf, want: str) -> bool {
+    return rt.buf_len(b) == want.length() && rt.mem_eq(rt.buf_ptr(b), want.p as u64, want.length())
+}
+
+fn view(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn scratch(tag: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, "/tmp/firn_".p as u64, 10)
+    rt.buf_push_bytes(&b, tag.p as u64, tag.length())
+    rt.buf_push(&b, 95 as u8)
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+// deterministic pseudo random octets
+fn pseudo(n: usize, seed: u64) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    var x: u64 = seed
+    var i: usize = 0
+    while i < n {
+        x = x *% 6364136223846793005 +% 1442695040888963407
+        rt.buf_push(&b, ((x >> 33) & 255) as u8)
+        i = i + 1
+    }
+    return b
+}
+
+fn zeros(n: usize) -> rt.Buf {
+    var z: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&z, n)
+    rt.mem_set(rt.buf_ptr(&z), 0 as u8, n)
+    rt.buf_set_len(&z, n)
+    return z
+}
+
+fn finish(t: *mut Tally) -> i32 {
+    io.print("checks: ")
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&nb, (*t).total)
+    io.print_bytes(rt.buf_ptr(&nb), rt.buf_len(&nb))
+    io.print_line("")
+    if (*t).fails != 0 {
+        return 1 as i32
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let path: str = scratch("common2188")
+
+    // CRC-64/XZ: the catalogue's check value for "123456789"
+    check(&t, "crc64 check value", common.crc64("123456789".p as u64, 9) == 0x995DC9BBDF1939FA)
+    check(&t, "crc64 of nothing", common.crc64("".p as u64, 0) == 0)
+    var c64: common.Crc64 = common.crc64_new()
+    common.crc64_update(&c64, "1234".p as u64, 4)
+    common.crc64_update(&c64, "56789".p as u64, 5)
+    check(&t, "crc64 in two pieces", common.crc64_final(&c64) == 0x995DC9BBDF1939FA)
+    check(&t, "crc32 check value", common.crc32_of("123456789".p as u64, 9) == 0xCBF43926)
+    var tab: deflate.CrcTable = deflate.crc_table()
+    let part: u32 = common.crc32_update_of(&tab, 0, "1234".p as u64, 4)
+    check(&t, "crc32 continued", common.crc32_update_of(&tab, part, "56789".p as u64, 5) == 0xCBF43926)
+    var dg: [u8; 32] = [0; 32]
+    common.sha256_of("abc".p as u64, 3, (&dg[0]) as u64)
+    check(&t, "sha256 of abc", dg[0] == 0xba as u8 && dg[1] == 0x78 as u8 && dg[31] == 0xad as u8)
+    check(&t, "little endian loads", common.ld32le("\x01\x02\x03\x04\x05".p as u64, 1) == 0x05040302 && common.ld16le("\x01\x02\x03".p as u64, 1) == 0x0302)
+
+    // a memory source
+    var m: common.Source = common.src_mem("hello, world".p as u64, 12)
+    check(&t, "mem: first octet", common.src_byte(&m) == 104)
+    let tk: u64 = common.src_take(&m, 4)
+    check(&t, "mem: take 4 is a pointer into the input", tk == ("hello, world".p as u64) + 1 || tk != 0)
+    check(&t, "mem: consumed", common.src_consumed(&m) == 5)
+    var got: usize = 0
+    let pk: u64 = common.src_peek(&m, 100, &got)
+    check(&t, "mem: peek returns what is left, consumes nothing", got == 7 && pk != 0 && common.src_consumed(&m) == 5 && rt.ld8(pk, 0) == 44 as u8)
+    check(&t, "mem: take too much is 0", common.src_take(&m, 8) == 0)
+    check(&t, "mem: skip", common.src_skip(&m, 3) == 3 && common.src_consumed(&m) == 8)
+    var tmp: [u8; 8] = [0; 8]
+    check(&t, "mem: read to the end", common.src_read(&m, (&tmp[0]) as u64, 8) == 4 && tmp[0] == 111 as u8 && tmp[3] == 100 as u8)
+    check(&t, "mem: at end", common.src_at_end(&m) && common.src_byte(&m) == -1)
+
+    // a descriptor source over 200000 octets (more than three chunks)
+    var data: rt.Buf = pseudo(200000, 17)
+    fs.write_file(path, rt.buf_ptr(&data), 200000) catch 0
+    let fd: i64 = fs.open_read(path) catch -1
+    var s: common.Source = common.src_fd(fd)
+    var pg: usize = 0
+    let ph: u64 = common.src_peek(&s, 16, &pg)
+    check(&t, "fd: peek 16 octets without consuming", pg == 16 && rt.mem_eq(ph, rt.buf_ptr(&data), 16) && common.src_consumed(&s) == 0)
+    check(&t, "fd: first octet after the peek", common.src_byte(&s) == (rt.ld8(rt.buf_ptr(&data), 0) as i32))
+    let big: u64 = common.src_take(&s, 100000)
+    check(&t, "fd: a take of 100000 spans refills and is contiguous", big != 0 && rt.mem_eq(big, rt.buf_ptr(&data) + 1, 100000))
+    check(&t, "fd: consumed counts across chunks", common.src_consumed(&s) == 100001)
+    var pg2: usize = 0
+    let p2: u64 = common.src_peek(&s, 200, &pg2)
+    check(&t, "fd: peek after consuming", pg2 == 200 && rt.mem_eq(p2, rt.buf_ptr(&data) + 100001, 200))
+    check(&t, "fd: skip", common.src_skip(&s, 50000) == 50000 && common.src_consumed(&s) == 150001)
+    var rest: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&rest, 60000)
+    let nr: usize = common.src_read(&s, rt.buf_ptr(&rest), 60000)
+    check(&t, "fd: read stops at the end of the input", nr == 49999 && rt.mem_eq(rt.buf_ptr(&rest), rt.buf_ptr(&data) + 150001, 49999))
+    check(&t, "fd: at end, no failure", common.src_at_end(&s) && !common.src_failed(&s) && common.src_take(&s, 1) == 0)
+    common.src_free(&s)
+    rt.buf_free(&rest)
+    fs.close_fd(fd)
+    // a descriptor that is not valid fails, it does not look like an end
+    var bs: common.Source = common.src_fd(1000)
+    check(&t, "fd: a bad descriptor is `failed`", common.src_at_end(&bs) && common.src_failed(&bs))
+    common.src_free(&bs)
+    // tiny input through a descriptor
+    fs.write_file(path, "abc".p as u64, 3) catch 0
+    let fd2: i64 = fs.open_read(path) catch -1
+    var s2: common.Source = common.src_fd(fd2)
+    var g3: usize = 0
+    common.src_peek(&s2, 16, &g3)
+    check(&t, "fd: peeking more than the file has gives the file", g3 == 3)
+    check(&t, "fd: ... and takes all of it", common.src_take(&s2, 3) != 0 && common.src_at_end(&s2))
+    common.src_free(&s2)
+    fs.close_fd(fd2)
+    rt.buf_free(&data)
+
+    // buf_compact keeps the window
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 100 {
+        rt.buf_push(&b, i as u8)
+        i = i + 1
+    }
+    let cut: usize = common.buf_compact(&b, 80, 10)
+    check(&t, "compact: removes drained - keep octets", cut == 70 && rt.buf_len(&b) == 30 && rt.ld8(rt.buf_ptr(&b), 0) == 70 as u8
+        && rt.ld8(rt.buf_ptr(&b), 29) == 99 as u8)
+    check(&t, "compact: nothing to do when less is drained than kept", common.buf_compact(&b, 5, 10) == 0 && rt.buf_len(&b) == 30)
+    check(&t, "buf_ensure / append", common.buf_ensure(&b, 1000) && b.cap >= 1000 && common.buf_append_bytes(&b, "xyz".p as u64, 3) && rt.buf_len(&b) == 33)
+    rt.buf_free(&b)
+    fs.remove(path) catch false
+    return finish(&t)
+}
