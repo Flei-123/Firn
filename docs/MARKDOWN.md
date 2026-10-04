@@ -53,7 +53,7 @@ markers beyond stay literal), so no reader needs unbounded recursion.
 
 ## What proves it
 
-* `tests/2060_markdown.fi`: **all 652 examples of the CommonMark 0.31.2 spec**
+* `tests/2090_markdown.fi`: **all 652 examples of the CommonMark 0.31.2 spec**
   (`tests/data/commonmark-spec-0.31.2.json`), markdown in, HTML out, byte for
   byte; 37 GFM cases whose expected HTML comes from markdown-it-py 4.2.0
   (`tests/data/markdown-gfm-cases.json`); the default-mode tree dumps; the

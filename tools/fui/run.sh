@@ -567,7 +567,7 @@ echo "== 18p4. MARKDOWN VIEW (lib/fui/markdownview.fi on lib/markdown) =="
 # images (ready / pending / failed through the hook), click on a link calls
 # the callback, release elsewhere does not, wheel and keys scroll, narrow
 # views wrap, WCAG 2 contrast of every pair. The parser itself is held
-# against the CommonMark spec (tests/2060_markdown.fi, 652 examples).
+# against the CommonMark spec (tests/2090_markdown.fi, 652 examples).
 build mdview
 "$W/mdview"
 
