@@ -1,0 +1,730 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/pulse.fi -- audio.pulse: a PulseAudio native-protocol client (playback only). Linux.
+//
+//     import audio.pulse
+//
+//     var p: pulse.Pulse = pulse.pulse_connect("My App")
+//     if pulse.pulse_is_open(&p) && pulse.pulse_open_stream(&p, 44100, 2, "Music") {
+//         pulse.pulse_write(&p, pcm_ptr, pcm_bytes)           // signed 16 bit little endian, interleaved
+//         pulse.pulse_drain(&p)                               // returns when everything has been played
+//     }
+//     pulse.pulse_close(&p)
+//
+// WHY PULSEAUDIO'S PROTOCOL AND NOT /dev/snd. Talking to the ALSA kernel
+// device needs the hw_params dance (a few dozen ioctls on a struct of 600+
+// octets), a mixer, format negotiation per card, and exclusive access: on a
+// desktop the sound server already owns the card. PulseAudio's native protocol
+// is a Unix socket and a simple tagged binary format; PipeWire (the default
+// on current Linux desktops) serves the same protocol through `pipewire-pulse`.
+// So this one client reaches both servers, with mixing and per-application
+// volume done by the server.
+//
+// THE PROTOCOL as used here (version 15 is announced, so the server does not
+// expect any field a newer version added): every packet is a 20 octet
+// descriptor (length, channel, offset hi, offset lo, flags; all big endian)
+// plus the payload. Channel 0xFFFFFFFF is the control channel: a payload of
+// TAGSTRUCT items (`L` u32, `t` string, `N` null string, `a` sample spec,
+// `m` channel map, `v` volume, `P` property list, `x` bytes, `0`/`1` booleans).
+// AUTH (command 8, protocol version and the 256 octet cookie), SET_CLIENT_NAME
+// (9), CREATE_PLAYBACK_STREAM (3), DRAIN_PLAYBACK_STREAM (12),
+// DELETE_PLAYBACK_STREAM (4). The server grants room with REQUEST (61, bytes);
+// audio goes out as packets on the stream's channel. `pulse_write` honours
+// that grant (it blocks until the server has asked for more), which is the
+// whole flow control.
+//
+// HONEST
+// P1  Playback only, signed 16 bit little endian PCM (1 or 2 channels; the
+//     server converts to whatever the card needs). No recording, no
+//     listing of devices, no volume commands: the VOLUME is applied to the
+//     samples by `audio.pcm` before they are sent (identical on every
+//     back end and testable bit for bit).
+// P2  No shared memory transport (memfd/SHM): the samples travel through the
+//     socket. Fine for music; not for low latency work.
+// P3  The default server is found as PulseAudio's own client library finds it:
+//     `PULSE_SERVER` (`unix:/path` or a path), else `$XDG_RUNTIME_DIR/pulse/native`,
+//     else `/run/user/<uid>/pulse/native`, else `/var/run/pulse/native`. TCP
+//     servers are not supported. The cookie is `PULSE_COOKIE`, else
+//     `~/.config/pulse/cookie`, else `~/.pulse-cookie`; none found = 256 zero
+//     octets, which a server accepts for a client of the same user (it checks
+//     the Unix socket's peer credentials).
+// P4  Blocking: `pulse_write` waits while the server's buffer is full (that is
+//     playing time); a program that must not block uses `pulse_writable` to
+//     ask how many octets fit right now.
+// P5  Tested against a real `pulseaudio` daemon (module-pipe-sink, so the PCM
+//     that came out of the sink is checksummed, and `pactl` reads the stream
+//     back) and not against PipeWire.
+import std.rt
+import std.str
+import std.env
+import net.unix
+
+export {
+    Pulse, pulse_null, pulse_flush, pulse_connect, pulse_connect_path, pulse_is_open, pulse_open_stream, pulse_write,
+    pulse_writable, pulse_drain, pulse_close, pulse_stream_open, pulse_error,
+    PA_OK, PA_NO_SERVER, PA_AUTH, PA_PROTOCOL, PA_STREAM, PA_KILLED, PA_IO,
+}
+
+const PA_OK: i32 = 0
+const PA_NO_SERVER: i32 = 1
+const PA_AUTH: i32 = 2
+const PA_PROTOCOL: i32 = 3
+const PA_STREAM: i32 = 4 // the server refused the stream
+const PA_KILLED: i32 = 5 // the server ended our stream
+const PA_IO: i32 = 6
+
+const CMD_ERROR: u32 = 0
+const CMD_REPLY: u32 = 2
+const CMD_CREATE_PLAYBACK_STREAM: u32 = 3
+const CMD_DELETE_PLAYBACK_STREAM: u32 = 4
+const CMD_AUTH: u32 = 8
+const CMD_SET_CLIENT_NAME: u32 = 9
+const CMD_DRAIN_PLAYBACK_STREAM: u32 = 12
+const CMD_FLUSH_PLAYBACK_STREAM: u32 = 42
+const CMD_REQUEST: u32 = 61
+const CMD_PLAYBACK_STREAM_KILLED: u32 = 64
+
+const VERSION: u32 = 15
+const CONTROL: u32 = 4294967295
+const CHUNK: usize = 16384
+
+struct Pulse {
+    fd: i32,
+    tag: u32,
+    version: u32, // negotiated
+    chan: u32, // the stream's channel number
+    stream: u32, // sink input index
+    has_stream: bool,
+    requested: usize, // octets the server still wants
+    rate: u32,
+    channels: u32,
+    err: i32,
+    pk: rt.Buf, // scratch for incoming payloads
+}
+
+// A connection that is not one (what a `Pulse` holds before `pulse_connect`).
+fn pulse_null() -> Pulse {
+    return Pulse { fd: -1, tag: 0 as u32, version: 0 as u32, chan: 0 as u32, stream: 0 as u32,
+        has_stream: false, requested: 0, rate: 0 as u32, channels: 0 as u32, err: PA_NO_SERVER,
+        pk: rt.buf_new() }
+}
+
+fn pulse_is_open(p: *mut Pulse) -> bool {
+    return (*p).fd >= 0
+}
+
+fn pulse_stream_open(p: *mut Pulse) -> bool {
+    return (*p).fd >= 0 && (*p).has_stream
+}
+
+fn pulse_error(p: *mut Pulse) -> i32 {
+    return (*p).err
+}
+
+// ---------------------------------------------------------- tagstruct
+
+fn put_be32(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, ((v >> 24) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 16) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, (v & 255 as u32) as u8)
+}
+
+fn get_be32(p: u64) -> u32 {
+    return ((rt.ld8(p, 0) as u32) << 24) | ((rt.ld8(p, 1) as u32) << 16) | ((rt.ld8(p, 2) as u32) << 8)
+        | (rt.ld8(p, 3) as u32)
+}
+
+fn ts_u32(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, 76 as u8) // 'L'
+    put_be32(b, v)
+}
+
+fn ts_str(b: *mut rt.Buf, s: str) {
+    rt.buf_push(b, 116 as u8) // 't'
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+    rt.buf_push(b, 0 as u8)
+}
+
+fn ts_null(b: *mut rt.Buf) {
+    rt.buf_push(b, 78 as u8) // 'N'
+}
+
+fn ts_bool(b: *mut rt.Buf, v: bool) {
+    if v {
+        rt.buf_push(b, 49 as u8)
+    } else {
+        rt.buf_push(b, 48 as u8)
+    }
+}
+
+fn ts_bytes(b: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push(b, 120 as u8) // 'x'
+    put_be32(b, n as u32)
+    rt.buf_push_bytes(b, p, n)
+}
+
+fn ts_sample_spec(b: *mut rt.Buf, rate: u32, channels: u32) {
+    rt.buf_push(b, 97 as u8) // 'a'
+    rt.buf_push(b, 3 as u8) // PA_SAMPLE_S16LE
+    rt.buf_push(b, channels as u8)
+    put_be32(b, rate)
+}
+
+fn ts_channel_map(b: *mut rt.Buf, channels: u32) {
+    rt.buf_push(b, 109 as u8) // 'm'
+    rt.buf_push(b, channels as u8)
+    if channels == 1 as u32 {
+        rt.buf_push(b, 0 as u8) // MONO
+    } else {
+        rt.buf_push(b, 1 as u8) // FRONT_LEFT
+        rt.buf_push(b, 2 as u8) // FRONT_RIGHT
+    }
+}
+
+fn ts_cvolume(b: *mut rt.Buf, channels: u32, v: u32) {
+    rt.buf_push(b, 118 as u8) // 'v'
+    rt.buf_push(b, channels as u8)
+    var i: u32 = 0
+    while i < channels {
+        put_be32(b, v)
+        i = i + 1 as u32
+    }
+}
+
+// A property list with one string entry (the value includes its NUL).
+fn ts_proplist1(b: *mut rt.Buf, key: str, val: str) {
+    rt.buf_push(b, 80 as u8) // 'P'
+    ts_str(b, key)
+    ts_u32(b, (val.length() + 1) as u32)
+    rt.buf_push(b, 120 as u8)
+    put_be32(b, (val.length() + 1) as u32)
+    rt.buf_push_bytes(b, val.p as u64, val.length())
+    rt.buf_push(b, 0 as u8)
+    ts_null(b)
+}
+
+fn ts_proplist2(b: *mut rt.Buf, k1: str, v1: str, k2: str, v2: str) {
+    rt.buf_push(b, 80 as u8)
+    ts_str(b, k1)
+    ts_u32(b, (v1.length() + 1) as u32)
+    rt.buf_push(b, 120 as u8)
+    put_be32(b, (v1.length() + 1) as u32)
+    rt.buf_push_bytes(b, v1.p as u64, v1.length())
+    rt.buf_push(b, 0 as u8)
+    ts_str(b, k2)
+    ts_u32(b, (v2.length() + 1) as u32)
+    rt.buf_push(b, 120 as u8)
+    put_be32(b, (v2.length() + 1) as u32)
+    rt.buf_push_bytes(b, v2.p as u64, v2.length())
+    rt.buf_push(b, 0 as u8)
+    ts_null(b)
+}
+
+// Reads the next `L` item at `*pos`. 0xFFFFFFFF with `*ok` = false when it is not one.
+fn rd_u32(p: u64, n: usize, pos: *mut usize, ok: *mut bool) -> u32 {
+    if *pos + 5 > n || rt.ld8(p, *pos) != 76 as u8 {
+        *ok = false
+        return 4294967295 as u32
+    }
+    let v: u32 = get_be32(p + (*pos + 1) as u64)
+    *pos = *pos + 5
+    return v
+}
+
+// ------------------------------------------------------------ packets
+
+fn send_packet(p: *mut Pulse, channel: u32, payload: u64, n: usize) -> bool {
+    var d: rt.Buf = rt.buf_new()
+    put_be32(&d, n as u32)
+    put_be32(&d, channel)
+    put_be32(&d, 0 as u32)
+    put_be32(&d, 0 as u32)
+    put_be32(&d, 0 as u32)
+    var ok: bool = unix.fd_send_all((*p).fd, rt.buf_ptr(&d), 20)
+    rt.buf_free(&d)
+    if ok && n > 0 {
+        ok = unix.fd_send_all((*p).fd, payload, n)
+    }
+    if !ok {
+        (*p).err = PA_IO
+        unix.fd_close((*p).fd)
+        (*p).fd = -1
+    }
+    return ok
+}
+
+fn next_tag(p: *mut Pulse) -> u32 {
+    (*p).tag = (*p).tag + 1 as u32
+    return (*p).tag
+}
+
+fn read_full(fd: i32, dst: u64, n: usize) -> bool {
+    var got: usize = 0
+    while got < n {
+        if unix.fd_wait(fd, unix.WAIT_READ, 10000) != 1 {
+            return false
+        }
+        let r: i64 = unix.fd_recv(fd, dst + got as u64, n - got)
+        if r <= 0 {
+            return false
+        }
+        got = got + r as usize
+    }
+    return true
+}
+
+// Reads one packet into `pk` (the payload) and returns its channel; the
+// control payload stays in `pk`. 0xFFFFFFFE = nothing within `ms`, 0xFFFFFFFD = broken.
+fn read_packet(p: *mut Pulse, ms: i64) -> u32 {
+    if (*p).fd < 0 {
+        return 4294967293 as u32
+    }
+    let w: i32 = unix.fd_wait((*p).fd, unix.WAIT_READ, ms)
+    if w == 0 {
+        return 4294967294 as u32
+    }
+    var d: [u8; 20] = [0; 20]
+    if w < 0 || !read_full((*p).fd, (&d[0]) as u64, 20) {
+        (*p).err = PA_IO
+        unix.fd_close((*p).fd)
+        (*p).fd = -1
+        return 4294967293 as u32
+    }
+    let len: u32 = get_be32((&d[0]) as u64)
+    let chan: u32 = get_be32((&d[4]) as u64)
+    if len > 16777216 as u32 {
+        (*p).err = PA_PROTOCOL
+        unix.fd_close((*p).fd)
+        (*p).fd = -1
+        return 4294967293 as u32
+    }
+    rt.buf_clear(&(*p).pk)
+    rt.buf_reserve(&(*p).pk, len as usize + 1)
+    var left: usize = len as usize
+    var chunk: [u8; 4096] = [0; 4096]
+    while left > 0 {
+        var want: usize = left
+        if want > 4096 {
+            want = 4096
+        }
+        if !read_full((*p).fd, (&chunk[0]) as u64, want) {
+            (*p).err = PA_IO
+            unix.fd_close((*p).fd)
+            (*p).fd = -1
+            return 4294967293 as u32
+        }
+        rt.buf_push_bytes(&(*p).pk, (&chunk[0]) as u64, want)
+        left = left - want
+    }
+    return chan
+}
+
+// Handles a control packet that is not a reply: REQUEST and KILLED matter.
+fn handle_async(p: *mut Pulse) {
+    let base: u64 = rt.buf_ptr(&(*p).pk)
+    let n: usize = rt.buf_len(&(*p).pk)
+    var pos: usize = 0
+    var ok: bool = true
+    let cmd: u32 = rd_u32(base, n, &pos, &ok)
+    if !ok {
+        return
+    }
+    if cmd == CMD_REQUEST {
+        rd_u32(base, n, &pos, &ok) // tag (-1)
+        let ch: u32 = rd_u32(base, n, &pos, &ok)
+        let bytes: u32 = rd_u32(base, n, &pos, &ok)
+        if ok && (*p).has_stream && ch == (*p).chan {
+            (*p).requested = (*p).requested + bytes as usize
+        }
+    } else if cmd == CMD_PLAYBACK_STREAM_KILLED {
+        (*p).err = PA_KILLED
+        (*p).has_stream = false
+    }
+}
+
+// Waits for the reply to `tag`; everything else that arrives meanwhile is handled.
+// true = REPLY; the payload (after command and tag) starts at `*start` in `pk`.
+fn wait_reply(p: *mut Pulse, tag: u32, start: *mut usize) -> bool {
+    var tries: u32 = 0
+    while tries < 200 {
+        let ch: u32 = read_packet(p, 10000)
+        if ch == 4294967293 as u32 || ch == 4294967294 as u32 {
+            return false
+        }
+        if ch != CONTROL {
+            continue // audio for a record stream: not ours
+        }
+        let base: u64 = rt.buf_ptr(&(*p).pk)
+        let n: usize = rt.buf_len(&(*p).pk)
+        var pos: usize = 0
+        var ok: bool = true
+        let cmd: u32 = rd_u32(base, n, &pos, &ok)
+        let t: u32 = rd_u32(base, n, &pos, &ok)
+        if ok && (cmd == CMD_REPLY || cmd == CMD_ERROR) && t == tag {
+            if cmd == CMD_ERROR {
+                return false
+            }
+            *start = pos
+            return true
+        }
+        handle_async(p)
+        tries = tries + 1
+    }
+    return false
+}
+
+// ---------------------------------------------------------- connecting
+
+fn read_cookie(out: *mut rt.Buf) {
+    var path: rt.Buf = rt.buf_new()
+    var got: bool = false
+    var b: rt.Buf = rt.buf_new()
+    if env.get_into("PULSE_COOKIE", &b) && rt.buf_len(&b) > 0 {
+        rt.buf_push_bytes(&path, rt.buf_ptr(&b), rt.buf_len(&b))
+        got = true
+    }
+    rt.buf_free(&b)
+    var home: rt.Buf = rt.buf_new()
+    if !got && env.get_into("HOME", &home) && rt.buf_len(&home) > 0 {
+        rt.buf_push_bytes(&path, rt.buf_ptr(&home), rt.buf_len(&home))
+        let a: str = "/.config/pulse/cookie"
+        rt.buf_push_bytes(&path, a.p as u64, a.length())
+    }
+    rt.buf_free(&home)
+    rt.buf_push(&path, 0 as u8)
+    var data: rt.Buf = rt.buf_new()
+    var okf: bool = false
+    if rt.buf_len(&path) > 1 {
+        okf = rt.read_file(rt.buf_ptr(&path), &data)
+    }
+    if !okf || rt.buf_len(&data) < 256 {
+        // the older place
+        rt.buf_free(&data)
+        data = rt.buf_new()
+        var home2: rt.Buf = rt.buf_new()
+        if env.get_into("HOME", &home2) && rt.buf_len(&home2) > 0 {
+            rt.buf_clear(&path)
+            rt.buf_push_bytes(&path, rt.buf_ptr(&home2), rt.buf_len(&home2))
+            let a2: str = "/.pulse-cookie"
+            rt.buf_push_bytes(&path, a2.p as u64, a2.length())
+            rt.buf_push(&path, 0 as u8)
+            okf = rt.read_file(rt.buf_ptr(&path), &data)
+        }
+        rt.buf_free(&home2)
+    }
+    var i: usize = 0
+    while i < 256 {
+        if okf && i < rt.buf_len(&data) {
+            rt.buf_push(out, rt.buf_at(&data, i))
+        } else {
+            rt.buf_push(out, 0 as u8)
+        }
+        i = i + 1
+    }
+    rt.buf_free(&data)
+    rt.buf_free(&path)
+}
+
+fn exists_sock(path: str) -> bool {
+    let fd: i32 = unix.unix_connect(path, false)
+    if fd >= 0 {
+        unix.fd_close(fd)
+        return true
+    }
+    return false
+}
+
+// Connects to the default server (see P3), authenticates and names the client.
+fn pulse_connect(app: str) -> Pulse {
+    var p: Pulse = pulse_null()
+    var path: rt.Buf = rt.buf_new()
+    var sv: rt.Buf = rt.buf_new()
+    if env.get_into("PULSE_SERVER", &sv) && rt.buf_len(&sv) > 0 {
+        var s: str = str { p: rt.buf_data(&sv), n: rt.buf_len(&sv) }
+        // the first server of the list, "unix:" prefix optional
+        var e: usize = 0
+        while e < s.length() && s.chars(e) != 32 as u8 {
+            e = e + 1
+        }
+        s = s.part(0, e)
+        if s.length() > 5 && s.part(0, 5) == "unix:" {
+            s = s.part(5, s.length() - 5)
+        }
+        if s.length() > 0 && s.chars(0) == 47 as u8 {
+            rt.buf_push_bytes(&path, s.p as u64, s.length())
+        }
+    }
+    rt.buf_free(&sv)
+    if rt.buf_len(&path) == 0 {
+        var xr: rt.Buf = rt.buf_new()
+        if env.get_into("XDG_RUNTIME_DIR", &xr) && rt.buf_len(&xr) > 0 {
+            rt.buf_push_bytes(&path, rt.buf_ptr(&xr), rt.buf_len(&xr))
+            let a: str = "/pulse/native"
+            rt.buf_push_bytes(&path, a.p as u64, a.length())
+        }
+        rt.buf_free(&xr)
+        if rt.buf_len(&path) == 0 || !exists_sock(str { p: rt.buf_data(&path), n: rt.buf_len(&path) }) {
+            rt.buf_clear(&path)
+            let a1: str = "/run/user/"
+            rt.buf_push_bytes(&path, a1.p as u64, a1.length())
+            rt.buf_push_dec_u64(&path, unix.getuid_now() as u64)
+            let a2: str = "/pulse/native"
+            rt.buf_push_bytes(&path, a2.p as u64, a2.length())
+            if !exists_sock(str { p: rt.buf_data(&path), n: rt.buf_len(&path) }) {
+                rt.buf_clear(&path)
+                let a3: str = "/var/run/pulse/native"
+                rt.buf_push_bytes(&path, a3.p as u64, a3.length())
+            }
+        }
+    }
+    let ok: bool = connect_to(&p, str { p: rt.buf_data(&path), n: rt.buf_len(&path) }, app)
+    rt.buf_free(&path)
+    return p
+}
+
+// Same, to a given socket path.
+fn pulse_connect_path(path: str, app: str) -> Pulse {
+    var p: Pulse = pulse_null()
+    let ok: bool = connect_to(&p, path, app)
+    return p
+}
+
+fn connect_to(p: *mut Pulse, path: str, app: str) -> bool {
+    let fd: i32 = unix.unix_connect(path, false)
+    if fd < 0 {
+        (*p).err = PA_NO_SERVER
+        return false
+    }
+    (*p).fd = fd
+    (*p).err = PA_OK
+    // AUTH
+    var b: rt.Buf = rt.buf_new()
+    let tag: u32 = next_tag(p)
+    ts_u32(&b, CMD_AUTH)
+    ts_u32(&b, tag)
+    ts_u32(&b, VERSION)
+    var cookie: rt.Buf = rt.buf_new()
+    read_cookie(&cookie)
+    ts_bytes(&b, rt.buf_ptr(&cookie), rt.buf_len(&cookie))
+    rt.buf_free(&cookie)
+    var okp: bool = send_packet(p, CONTROL, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    var start: usize = 0
+    if !okp || !wait_reply(p, tag, &start) {
+        if (*p).fd >= 0 {
+            (*p).err = PA_AUTH
+            unix.fd_close((*p).fd)
+            (*p).fd = -1
+        }
+        return false
+    }
+    var pos: usize = start
+    var ok: bool = true
+    let sver: u32 = rd_u32(rt.buf_ptr(&(*p).pk), rt.buf_len(&(*p).pk), &pos, &ok) & 65535 as u32
+    if !ok || sver < 13 as u32 {
+        (*p).err = PA_PROTOCOL
+        unix.fd_close((*p).fd)
+        (*p).fd = -1
+        return false
+    }
+    (*p).version = VERSION
+    if sver < VERSION {
+        (*p).version = sver
+    }
+    // SET_CLIENT_NAME
+    var c: rt.Buf = rt.buf_new()
+    let tag2: u32 = next_tag(p)
+    ts_u32(&c, CMD_SET_CLIENT_NAME)
+    ts_u32(&c, tag2)
+    ts_proplist1(&c, "application.name", app)
+    okp = send_packet(p, CONTROL, rt.buf_ptr(&c), rt.buf_len(&c))
+    rt.buf_free(&c)
+    if !okp || !wait_reply(p, tag2, &start) {
+        if (*p).fd >= 0 {
+            (*p).err = PA_PROTOCOL
+            unix.fd_close((*p).fd)
+            (*p).fd = -1
+        }
+        return false
+    }
+    return true
+}
+
+// Creates the playback stream (S16LE, `rate` Hz, 1 or 2 channels).
+fn pulse_open_stream(p: *mut Pulse, rate: u32, channels: u32, media_name: str) -> bool {
+    if (*p).fd < 0 || (*p).has_stream || (channels != 1 as u32 && channels != 2 as u32)
+    || rate < 8000 as u32 || rate > 192000 as u32 {
+        return false
+    }
+    var b: rt.Buf = rt.buf_new()
+    let tag: u32 = next_tag(p)
+    ts_u32(&b, CMD_CREATE_PLAYBACK_STREAM)
+    ts_u32(&b, tag)
+    ts_sample_spec(&b, rate, channels)
+    ts_channel_map(&b, channels)
+    ts_u32(&b, CONTROL) // sink index: default
+    ts_null(&b) // sink name
+    ts_u32(&b, CONTROL) // maxlength
+    ts_bool(&b, false) // corked
+    // tlength: a quarter of a second keeps `drain` short and the grant steady
+    ts_u32(&b, rate * channels * 2 / 4)
+    ts_u32(&b, CONTROL) // prebuf
+    ts_u32(&b, CONTROL) // minreq
+    ts_u32(&b, 0 as u32) // sync id
+    ts_cvolume(&b, channels, 65536 as u32)
+    // v12: no_remap, no_remix, fix_format, fix_rate, fix_channels, no_move, variable_rate
+    ts_bool(&b, false)
+    ts_bool(&b, false)
+    ts_bool(&b, false)
+    ts_bool(&b, false)
+    ts_bool(&b, false)
+    ts_bool(&b, false)
+    ts_bool(&b, false)
+    // v13: muted, adjust_latency, proplist
+    ts_bool(&b, false)
+    ts_bool(&b, false)
+    ts_proplist2(&b, "media.name", media_name, "media.role", "music")
+    // v14: volume_set, early_requests
+    ts_bool(&b, true)
+    ts_bool(&b, false)
+    // v15: muted_set, dont_inhibit_auto_suspend, fail_on_suspend
+    ts_bool(&b, false)
+    ts_bool(&b, false)
+    ts_bool(&b, false)
+    let sent: bool = send_packet(p, CONTROL, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    var start: usize = 0
+    if !sent || !wait_reply(p, tag, &start) {
+        if (*p).fd >= 0 {
+            (*p).err = PA_STREAM
+        }
+        return false
+    }
+    var pos: usize = start
+    var ok: bool = true
+    let base: u64 = rt.buf_ptr(&(*p).pk)
+    let n: usize = rt.buf_len(&(*p).pk)
+    let ch: u32 = rd_u32(base, n, &pos, &ok)
+    let idx: u32 = rd_u32(base, n, &pos, &ok)
+    let req: u32 = rd_u32(base, n, &pos, &ok)
+    if !ok {
+        (*p).err = PA_PROTOCOL
+        return false
+    }
+    (*p).chan = ch
+    (*p).stream = idx
+    (*p).requested = req as usize
+    (*p).rate = rate
+    (*p).channels = channels
+    (*p).has_stream = true
+    return true
+}
+
+// Drains control packets that are already there, then reports how many octets
+// the server wants right now.
+fn pulse_writable(p: *mut Pulse) -> usize {
+    while (*p).fd >= 0 && (*p).has_stream {
+        let ch: u32 = read_packet(p, 0)
+        if ch == 4294967294 as u32 || ch == 4294967293 as u32 {
+            break
+        }
+        if ch == CONTROL {
+            handle_async(p)
+        }
+    }
+    return (*p).requested
+}
+
+// Sends `n` octets of PCM (a whole number of frames); waits for the server's
+// grant when it has none. false = the connection or the stream is gone.
+fn pulse_write(p: *mut Pulse, data: u64, n: usize) -> bool {
+    if (*p).fd < 0 || !(*p).has_stream {
+        return false
+    }
+    var done: usize = 0
+    while done < n {
+        if (*p).requested == 0 {
+            let ch: u32 = read_packet(p, 10000)
+            if ch == 4294967294 as u32 {
+                (*p).err = PA_IO
+                return false
+            }
+            if ch == 4294967293 as u32 {
+                return false
+            }
+            if ch == CONTROL {
+                handle_async(p)
+            }
+            if !(*p).has_stream || (*p).fd < 0 {
+                return false
+            }
+            continue
+        }
+        var m: usize = n - done
+        if m > (*p).requested {
+            m = (*p).requested
+        }
+        if m > CHUNK {
+            m = CHUNK
+        }
+        if !send_packet(p, (*p).chan, data + done as u64, m) {
+            return false
+        }
+        done = done + m
+        (*p).requested = (*p).requested - m
+    }
+    return true
+}
+
+// Waits until everything written has been played.
+fn pulse_drain(p: *mut Pulse) -> bool {
+    if (*p).fd < 0 || !(*p).has_stream {
+        return false
+    }
+    var b: rt.Buf = rt.buf_new()
+    let tag: u32 = next_tag(p)
+    ts_u32(&b, CMD_DRAIN_PLAYBACK_STREAM)
+    ts_u32(&b, tag)
+    ts_u32(&b, (*p).chan)
+    let sent: bool = send_packet(p, CONTROL, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    var start: usize = 0
+    return sent && wait_reply(p, tag, &start)
+}
+
+// Throws away what the server has not played yet (a quick stop).
+fn pulse_flush(p: *mut Pulse) -> bool {
+    if (*p).fd < 0 || !(*p).has_stream {
+        return false
+    }
+    var b: rt.Buf = rt.buf_new()
+    let tag: u32 = next_tag(p)
+    ts_u32(&b, CMD_FLUSH_PLAYBACK_STREAM)
+    ts_u32(&b, tag)
+    ts_u32(&b, (*p).chan)
+    let sent: bool = send_packet(p, CONTROL, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    var start: usize = 0
+    return sent && wait_reply(p, tag, &start)
+}
+
+fn pulse_close(p: *mut Pulse) {
+    if (*p).fd >= 0 && (*p).has_stream {
+        var b: rt.Buf = rt.buf_new()
+        let tag: u32 = next_tag(p)
+        ts_u32(&b, CMD_DELETE_PLAYBACK_STREAM)
+        ts_u32(&b, tag)
+        ts_u32(&b, (*p).chan)
+        if send_packet(p, CONTROL, rt.buf_ptr(&b), rt.buf_len(&b)) {
+            var start: usize = 0
+            wait_reply(p, tag, &start)
+        }
+        rt.buf_free(&b)
+    }
+    (*p).has_stream = false
+    if (*p).fd >= 0 {
+        unix.fd_close((*p).fd)
+        (*p).fd = -1
+    }
+    rt.buf_free(&(*p).pk)
+}

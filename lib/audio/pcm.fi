@@ -1,0 +1,134 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/pcm.fi -- audio.pcm: what is common to every audio back end.
+//
+//     import audio.pcm
+//
+//     pcm.pcm_scale(samples_ptr, count_values, 50)        // 50 % volume, in place, signed 16 bit
+//     var w: rt.Buf = rt.buf_new()
+//     pcm.wav_header(&w, 44100, 2, data_bytes)            // 44 octets of RIFF/WAVE
+//     let c: u32 = pcm.crc32_update(0 as u32, ptr, n)     // CRC-32 (zlib's), to compare PCM bit for bit
+//
+// PCM here is signed 16 bit little endian, interleaved. The VOLUME is applied
+// to the samples by `pcm_scale`, so it means the same on every back end
+// (PulseAudio, waveOut, a file) and can be tested exactly:
+//
+//     out = trunc(in * gain / 65536)        gain = percent * 65536 / 100
+//
+// truncating toward zero, then clamped to -32768 .. 32767 (a gain above 100 %
+// can clip). 100 % leaves the samples untouched, bit for bit.
+import std.rt
+
+export { pcm_gain, pcm_scale, wav_header, crc32_update, crc32 }
+
+// 65536 = 1.0; `percent` 0 .. 400
+fn pcm_gain(percent: u32) -> u32 {
+    var p: u32 = percent
+    if p > 400 as u32 {
+        p = 400 as u32
+    }
+    return p * 65536 as u32 / 100 as u32
+}
+
+// Scales `count` 16 bit values at `p` in place.
+fn pcm_scale(p: u64, count: usize, percent: u32) {
+    let g: u32 = pcm_gain(percent)
+    if g == 65536 as u32 {
+        return
+    }
+    var i: usize = 0
+    while i < count {
+        let a: u64 = p + (i * 2) as u64
+        let lo: u32 = rt.ld8(a, 0) as u32
+        let hi: u32 = rt.ld8(a, 1) as u32
+        var v: i64 = ((hi << 8) | lo) as i64
+        if v >= 32768 {
+            v = v - 65536
+        }
+        var o: i64 = v * (g as i64) / 65536
+        if o > 32767 {
+            o = 32767
+        }
+        if o < -32768 {
+            o = -32768
+        }
+        if o < 0 {
+            o = o + 65536
+        }
+        rt.st8(a, 0, (o & 255) as u8)
+        rt.st8(a, 1, ((o >> 8) & 255) as u8)
+        i = i + 1
+    }
+}
+
+fn put_le32(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 16) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 24) & 255 as u32) as u8)
+}
+
+fn put_le16(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+}
+
+fn put_tag(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+// The 44 octet header of a PCM WAVE file (16 bit) for `data_bytes` octets of samples.
+fn wav_header(b: *mut rt.Buf, rate: u32, channels: u32, data_bytes: u32) {
+    put_tag(b, "RIFF")
+    put_le32(b, 36 as u32 + data_bytes)
+    put_tag(b, "WAVE")
+    put_tag(b, "fmt ")
+    put_le32(b, 16 as u32)
+    put_le16(b, 1 as u32) // PCM
+    put_le16(b, channels)
+    put_le32(b, rate)
+    put_le32(b, rate * channels * 2 as u32)
+    put_le16(b, channels * 2 as u32)
+    put_le16(b, 16 as u32)
+    put_tag(b, "data")
+    put_le32(b, data_bytes)
+}
+
+static mut CRC_TABLE: [u32; 256] = [0; 256]
+static mut CRC_READY: bool = false
+
+fn crc_init() {
+    var n: u32 = 0
+    while n < 256 as u32 {
+        var c: u32 = n
+        var k: u32 = 0
+        while k < 8 as u32 {
+            if (c & 1 as u32) != 0 as u32 {
+                c = 3988292384 as u32 ^ (c >> 1)
+            } else {
+                c = c >> 1
+            }
+            k = k + 1 as u32
+        }
+        CRC_TABLE[n as usize] = c
+        n = n + 1 as u32
+    }
+    CRC_READY = true
+}
+
+// CRC-32 as zlib computes it (`crc32_update(0, ...)` first, then the running value).
+fn crc32_update(crc: u32, p: u64, n: usize) -> u32 {
+    if !CRC_READY {
+        crc_init()
+    }
+    var c: u32 = crc ^ 4294967295 as u32
+    var i: usize = 0
+    while i < n {
+        c = CRC_TABLE[((c ^ (rt.ld8(p, i) as u32)) & 255 as u32) as usize] ^ (c >> 8)
+        i = i + 1
+    }
+    return c ^ 4294967295 as u32
+}
+
+fn crc32(p: u64, n: usize) -> u32 {
+    return crc32_update(0 as u32, p, n)
+}

@@ -1,0 +1,259 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/player.fi -- audio.player: play an MP3 held in memory through audio.sink.
+//
+//     import audio.player
+//
+//     // all in one call, blocking until the end:
+//     player.play_mp3("My App", bytes_ptr, bytes_len, 80)       // 80 % volume; false = could not play
+//
+//     // or from an event loop, without ever blocking:
+//     var p: player.Player = player.player_new()
+//     player.player_play_mp3(&p, "My App", bytes_ptr, bytes_len)
+//     player.player_set_volume(&p, 70)
+//     while player.player_pump(&p, 10) == player.ST_PLAYING { ... draw a frame, handle events ... }
+//     player.player_stop(&p)                                     // also: player_pause(&p, true)
+//
+// The decoder is `ton.mp3` (MPEG-1/2 Layer III, checked against ffmpeg); the
+// output is `audio.sink` (PulseAudio, waveOut, a file -- see FIRN_AUDIO there).
+// `player_pump` decodes frames and hands them over as long as the device has
+// room, for at most `budget_ms` milliseconds, and returns the state; it never
+// sleeps, so it can sit inside a program's frame loop. `play_mp3` is that loop
+// with a short sleep when the device is full.
+//
+// HONEST
+// A1  MP3 only (the one decoder the project has). The bytes are COPIED when
+//     playback starts, so the caller may free its buffer at once.
+// A2  Not threaded: playback only advances while `player_pump` is called. A
+//     program that stops calling it for longer than the device's buffer (a
+//     quarter of a second on PulseAudio) hears a gap. `play_mp3` blocks the
+//     caller until the end. A background thread would need the program's
+//     `__thread_work` hook (see std.pool) and does not exist on Windows yet.
+// A3  ID3v2 tags and junk before the first frame are skipped by the decoder's
+//     frame search; no seeking, no gapless information (LAME/Xing delay
+//     is not trimmed), no resampling: the device (server) converts the rate.
+// A4  Position is counted in frames handed to the device, not in what has
+//     already come out of the speakers (a quarter second ahead at most).
+import std.rt
+import std.str
+import std.time
+import audio.sink
+import ton.mp3
+import ton.mp3_tab
+
+export {
+    Player, player_new, player_free, player_play_mp3, player_pump, player_stop, player_pause,
+    player_set_volume, player_state, player_position_ms, player_crc, play_mp3, player_sink_kind,
+    ST_IDLE, ST_PLAYING, ST_PAUSED, ST_FINISHED, ST_ERROR,
+}
+
+const ST_IDLE: u32 = 0
+const ST_PLAYING: u32 = 1
+const ST_PAUSED: u32 = 2
+const ST_FINISHED: u32 = 3
+const ST_ERROR: u32 = 4 // no sink, or nothing decodable
+
+struct Player {
+    tabs: mp3_tab.Tabs,
+    dec: mp3.Mp3Dec,
+    scr: mp3.Mp3Scratch,
+    pcm: [i16; 2304],
+    data: rt.Buf,
+    app: rt.Buf,
+    pos: usize,
+    state: u32,
+    percent: u32,
+    sink: sink.Sink,
+    sink_open: bool,
+    hz: u32,
+    channels: u32,
+    frames: u64, // PCM frames handed to the sink
+    pend: usize, // decoded frames not handed over yet
+    pend_off: usize, // ... starting at this frame of `pcm`
+    decoded_any: bool,
+}
+
+fn player_new() -> Player {
+    return Player { tabs: mp3_tab.tabs_new(), dec: mp3.mp3_new(), scr: mp3.mp3_scratch_new(),
+        pcm: [0; 2304], data: rt.buf_new(), app: rt.buf_new(), pos: 0, state: ST_IDLE, percent: 100 as u32,
+        sink: sink.sink_open_file("", 44100 as u32, 2 as u32, false), sink_open: false,
+        hz: 0 as u32, channels: 0 as u32, frames: 0 as u64, pend: 0, pend_off: 0, decoded_any: false }
+}
+
+fn player_free(p: *mut Player) {
+    player_stop(p)
+    rt.buf_free(&(*p).data)
+    rt.buf_free(&(*p).app)
+}
+
+fn player_state(p: *mut Player) -> u32 {
+    return (*p).state
+}
+
+fn player_sink_kind(p: *mut Player) -> u32 {
+    return sink.sink_kind(&(*p).sink)
+}
+
+// CRC-32 of every PCM octet handed to the device so far (after the volume).
+fn player_crc(p: *mut Player) -> u32 {
+    return sink.sink_crc(&(*p).sink)
+}
+
+fn player_position_ms(p: *mut Player) -> u64 {
+    if (*p).hz == 0 as u32 {
+        return 0 as u64
+    }
+    return (*p).frames * 1000 as u64 / ((*p).hz as u64)
+}
+
+fn player_set_volume(p: *mut Player, percent: u32) {
+    (*p).percent = percent
+    if (*p).sink_open {
+        sink.sink_set_volume(&(*p).sink, percent)
+    }
+}
+
+// Starts a new song. The sink is opened with the first decoded frame (only
+// then the sample rate is known). Stops what played before.
+fn player_play_mp3(p: *mut Player, app: str, data: u64, n: usize) -> bool {
+    player_stop(p)
+    if n < 4 {
+        (*p).state = ST_ERROR
+        return false
+    }
+    (*p).tabs = mp3_tab.tabs_new()
+    (*p).dec = mp3.mp3_new()
+    rt.buf_clear(&(*p).data)
+    rt.buf_push_bytes(&(*p).data, data, n)
+    rt.buf_clear(&(*p).app)
+    rt.buf_push_bytes(&(*p).app, app.p as u64, app.length())
+    (*p).pos = 0
+    (*p).frames = 0 as u64
+    (*p).pend = 0
+    (*p).pend_off = 0
+    (*p).hz = 0 as u32
+    (*p).decoded_any = false
+    (*p).state = ST_PLAYING
+    return true
+}
+
+fn player_pause(p: *mut Player, on: bool) {
+    if on && (*p).state == ST_PLAYING {
+        (*p).state = ST_PAUSED
+    } else if !on && (*p).state == ST_PAUSED {
+        (*p).state = ST_PLAYING
+    }
+}
+
+// Quick stop: unplayed audio is dropped, the device is released.
+fn player_stop(p: *mut Player) {
+    if (*p).sink_open {
+        sink.sink_flush(&(*p).sink)
+        sink.sink_close(&(*p).sink)
+        (*p).sink_open = false
+    }
+    if (*p).state == ST_PLAYING || (*p).state == ST_PAUSED {
+        (*p).state = ST_IDLE
+    }
+}
+
+fn now_ms() -> u64 {
+    return time.monotonic_ns() / 1000000 as u64
+}
+
+// Decodes and hands over frames while the device has room, for at most
+// `budget_ms`. Returns the state.
+fn player_pump(p: *mut Player, budget_ms: u64) -> u32 {
+    if (*p).state != ST_PLAYING {
+        return (*p).state
+    }
+    let start: u64 = now_ms()
+    let total: usize = rt.buf_len(&(*p).data)
+    let base: u64 = rt.buf_ptr(&(*p).data)
+    var info: mp3.Mp3Info = mp3.Mp3Info { frame_bytes: 0, frame_offset: 0, channels: 0, hz: 0, layer: 0,
+        bitrate_kbps: 0 }
+    while (*p).state == ST_PLAYING {
+        if (*p).pend > 0 {
+            // hand over what the device takes right now (a part of a frame is fine)
+            let room: usize = sink.sink_writable(&(*p).sink)
+            if !sink.sink_is_open(&(*p).sink) {
+                (*p).state = ST_ERROR // the device went away
+                (*p).sink_open = false
+                return ST_ERROR
+            }
+            if room == 0 {
+                return ST_PLAYING // the device is full: come back later
+            }
+            var k: usize = (*p).pend
+            if k > room {
+                k = room
+            }
+            let at: u64 = (&(*p).pcm[0]) as u64 + ((*p).pend_off * (*p).channels as usize * 2) as u64
+            if !sink.sink_write(&(*p).sink, at, k) {
+                (*p).state = ST_ERROR
+                (*p).sink_open = false
+                return ST_ERROR
+            }
+            (*p).frames = (*p).frames + k as u64
+            (*p).pend = (*p).pend - k
+            (*p).pend_off = (*p).pend_off + k
+        } else if (*p).pos >= total {
+            // end of data: let the device play out
+            if (*p).sink_open {
+                sink.sink_drain(&(*p).sink)
+                sink.sink_close(&(*p).sink)
+                (*p).sink_open = false
+            }
+            if (*p).decoded_any {
+                (*p).state = ST_FINISHED
+            } else {
+                (*p).state = ST_ERROR
+            }
+            return (*p).state
+        } else {
+            let n: i32 = mp3.mp3_decode_frame(&(*p).tabs, &(*p).dec, &(*p).scr, base + (*p).pos as u64,
+                (total - (*p).pos) as i32, (&(*p).pcm[0]) as u64, &info)
+            if info.frame_bytes == 0 {
+                (*p).pos = total // no more frames in the rest
+            } else {
+                (*p).pos = (*p).pos + info.frame_bytes as usize
+            }
+            if n > 0 {
+                if !(*p).sink_open {
+                    (*p).hz = info.hz as u32
+                    (*p).channels = info.channels as u32
+                    (*p).sink = sink.sink_open(str { p: rt.buf_data(&(*p).app), n: rt.buf_len(&(*p).app) },
+                        (*p).hz, (*p).channels)
+                    if !sink.sink_is_open(&(*p).sink) {
+                        (*p).state = ST_ERROR
+                        return ST_ERROR
+                    }
+                    sink.sink_set_volume(&(*p).sink, (*p).percent)
+                    (*p).sink_open = true
+                }
+                (*p).decoded_any = true
+                (*p).pend = n as usize
+                (*p).pend_off = 0
+            }
+        }
+        if now_ms() - start >= budget_ms {
+            return (*p).state
+        }
+    }
+    return (*p).state
+}
+
+// Plays a whole MP3 and returns when it is over. true = it played to the end.
+fn play_mp3(app: str, data: u64, n: usize, percent: u32) -> bool {
+    var p: Player = player_new()
+    player_set_volume(&p, percent)
+    if !player_play_mp3(&p, app, data, n) {
+        player_free(&p)
+        return false
+    }
+    while player_pump(&p, 20 as u64) == ST_PLAYING {
+        time.sleep_ms(2 as u64)
+    }
+    let ok: bool = player_state(&p) == ST_FINISHED
+    player_free(&p)
+    return ok
+}
