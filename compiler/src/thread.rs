@@ -271,9 +271,63 @@ pub(crate) fn lower_thread_call(
 /// The local label `1:` is a **numeric** label of the assembler: `jnz 1f`
 /// jumps forward to the next `1:`. That way this sequence needs no counter
 /// and may appear as often as you like in the same module.
-pub(crate) fn spawn_unsupported(e: &mut crate::codegen_x86::Emitter) {
-    e.raw("    # windows: clone(2) has no equivalent -- ENOSYS");
-    e.line("mov rax, -38");
+/// Offsets inside the thread block (`lib/gc/gc.fi`, FT_*) that the Windows
+/// sequence and the Windows thread entry read and write. A unit test below
+/// checks them against the Firn source.
+pub(crate) const WIN_TCB_TID: u32 = 16;
+pub(crate) const WIN_TCB_STACK_SIZE: u32 = 32;
+pub(crate) const WIN_TCB_BOTTOM: u32 = 40;
+
+/// `TEB.TlsSlots[0]` on x86-64 Windows (and Wine): the first of the 64
+/// thread local slots sits at `gs:[0x1480]`.
+const WIN_TEB_TLS: u32 = 0x1480;
+
+/// **Round WIN-THREADS** -- `Op::ThreadSpawn` on Windows. Precondition
+/// (same registers as the Linux sequence): `rdi` = the thread block,
+/// `rsi` = upper end of the stack the creator mapped (UNUSED here: the
+/// thread runs on the stack Windows reserves for it), `rdx` = the TID word.
+/// Postcondition: `rax` = 1 (a thread was created) or a negative error.
+///
+/// The TID word is set to 1 BEFORE the thread exists: it plays the role of
+/// the kernel's `CLONE_PARENT_SETTID` (non-zero while the thread lives) and
+/// the thread entry (`win::thread_main_asm`) zeroes it and wakes the
+/// waiters when the thread is done (`CLONE_CHILD_CLEARTID`).
+///
+/// The stack size comes out of the thread block (`FT_STAPELN`), so
+/// `thread_stack_set` keeps working; it is passed as a RESERVATION
+/// (`STACK_SIZE_PARAM_IS_A_RESERVATION`), Windows commits on demand.
+pub(crate) fn spawn_sequence_windows(e: &mut crate::codegen_x86::Emitter) {
+    let create = crate::win::note("CreateThread").expect("CreateThread is known");
+    let close = crate::win::note("CloseHandle").expect("CloseHandle is known");
+    crate::win::note_thread_main();
+    e.raw("    # windows: CreateThread(NULL, stack, thread_main, tcb, RESERVATION, NULL)");
+    e.line("mov dword ptr [rdx], 1");
+    e.line(&format!("mov rsi, qword ptr [rdi+{}]", WIN_TCB_STACK_SIZE));
+    e.line("mov rcx, rdi");
+    e.line(&format!("lea rdx, [rip + {}]", crate::win::THREAD_MAIN));
+    e.line("xor edi, edi");
+    e.line("mov r8d, 65536");
+    e.line("xor r9d, r9d");
+    e.line(&format!("call {}", create));
+    e.line("test rax, rax");
+    e.line("jz 1f");
+    e.line("mov rdi, rax");
+    e.line(&format!("call {}", close));
+    e.line("mov eax, 1");
+    e.line("jmp 2f");
+    e.raw("1:");
+    e.line("mov rax, -12");
+    e.raw("2:");
+}
+
+/// `Op::ThreadSelf` on Windows: the thread block pointer out of a TLS slot,
+/// read straight from the TEB (one load for the slot number, one for the
+/// value -- no call). The slot number is `__win_tlsidx`, a static of the
+/// seam that `arch_prctl(ARCH_SET_FS, tcb)` fills (`win_seam.rs`).
+/// Precondition: none. Postcondition: `rax` = thread block.
+pub(crate) fn self_sequence_windows(e: &mut crate::codegen_x86::Emitter) {
+    e.line(&format!("mov rax, qword ptr [rip + {}]", crate::statics::label_of("__win_tlsidx")));
+    e.line(&format!("mov rax, qword ptr gs:[rax*8+{}]", WIN_TEB_TLS));
 }
 
 pub(crate) fn spawn_sequence(e: &mut crate::codegen_x86::Emitter) {
@@ -358,4 +412,21 @@ pub(crate) fn cas_sequence(e: &mut crate::codegen_x86::Emitter) {
 /// the thread block. Precondition: none. Postcondition: `rax` = thread block.
 pub(crate) fn self_sequence(e: &mut crate::codegen_x86::Emitter) {
     e.line("mov rax, qword ptr fs:0");
+}
+
+#[cfg(test)]
+mod win_tests {
+    use super::*;
+
+    /// The Windows sequence and the Windows thread entry hard-code three
+    /// offsets of the thread block; they have to be the ones `lib/gc/gc.fi`
+    /// declares.
+    #[test]
+    fn the_windows_offsets_are_the_ones_of_the_thread_block() {
+        let gc = include_str!("../../lib/gc/gc.fi");
+        for (name, v) in [("FT_TID", WIN_TCB_TID), ("FT_STAPELN", WIN_TCB_STACK_SIZE), ("FT_BOTTOM", WIN_TCB_BOTTOM)] {
+            let want = format!("const {}: u64 = {}\n", name, v);
+            assert!(gc.contains(&want), "gc.fi does not say `{}`", want.trim());
+        }
+    }
 }

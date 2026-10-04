@@ -206,7 +206,9 @@ const TABLE: &[(i64, A64)] = &[
     (107, A64::Direct(175)),         // geteuid
     // ROUND C-059: stood until now between 13 and 14 and thereby broke
     // the sorting of the table (a test of its own). Only moved.
+    (109, A64::Direct(154)),         // setpgid   (std.process: set_group)
     (112, A64::Direct(157)),         // setsid    (std.process: detach)
+    (121, A64::Direct(155)),         // getpgid   (std.process: the group is verified)
     (128, A64::Direct(137)),         // rt_sigtimedwait (std.process: swallow a SIGPIPE)
     (131, A64::Direct(132)),         // sigaltstack -- eigener Signalstapel
     (158, A64::SetThreadPointer),    // arch_prctl(ARCH_SET_FS) -> msr tpidr_el0
@@ -357,7 +359,9 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (97, "getrlimit", Wasm::Missing("a browser page has no resource limits")),
     (102, "getuid", Wasm::Missing("a browser page has no users")),
     (107, "geteuid", Wasm::Missing("a browser page has no users")),
+    (109, "setpgid", Wasm::Missing(NO_PROCESSES)),
     (112, "setsid", Wasm::Missing(NO_PROCESSES)),
+    (121, "getpgid", Wasm::Missing(NO_PROCESSES)),
     (128, "rt_sigtimedwait", Wasm::Missing(NO_SIGNALS)),
     (131, "sigaltstack", Wasm::Missing(NO_SIGNALS)),
     (158, "arch_prctl", Wasm::Missing(NO_THREADS)),

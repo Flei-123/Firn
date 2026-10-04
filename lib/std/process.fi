@@ -32,6 +32,11 @@
 //     process.set_detach(&c, true)
 //     process.spawn(&c)
 //
+//     // (d) stop it AND everything it started (a launcher script's java)
+//     process.set_group(&c, true)
+//     var ch: process.Child = process.spawn(&c) catch | e | ...
+//     process.kill_tree(&ch)
+//
 // The same names and the same behaviour exist on Windows
 // (`process.windows.fi`, chosen by `--target=x86_64-windows`); the
 // differences are listed under HONEST.
@@ -74,8 +79,8 @@
 //     directory of the CALLER (not of the child) -- `set_cwd` does not
 //     change what `command("./run.sh")` means.
 // P3  `terminate` is SIGTERM, `kill` is SIGKILL. Only the child receives it;
-//     grandchildren (a launcher script's `java`) survive a `kill`. A process
-//     group kill is not offered.
+//     grandchildren (a launcher script's `java`) survive a `kill`. For the
+//     whole tree see P9.
 // P4  The exit code of a child killed by a signal is 128 + signal number
 //     (`term_signal` tells the signal itself).
 // P5  `no_window` has no meaning on Linux and is accepted.
@@ -87,6 +92,23 @@
 //     (chdir, dup2) is the whole point.
 // P8  wait with timeout polls `wait4(WNOHANG)` every 1..10 ms. There is no
 //     SIGCHLD handler and no pidfd.
+// P9  PROCESS GROUPS. `set_group(c, true)` makes the child the leader of a
+//     new process group (`setpgid(0, 0)` between fork and exec); `kill_tree`
+//     and `terminate_tree` are `kill(-pgid, SIGKILL/SIGTERM)`: every process
+//     of the group gets it, the grandchildren too. A detached child (P1)
+//     is in a group of its own anyway (`setsid`), so the two calls work on it
+//     without `set_group`. What it does NOT catch: a descendant that left the
+//     group itself (`setsid`, `setpgid`, a daemon that double-forks); only a
+//     cgroup would, and that needs privileges. The group id stays in
+//     `Child.h` (0 = no group); once the whole group has ended the number
+//     can be reused by an unrelated process, so do not call `kill_tree` on a
+//     child that was reaped long ago and whose descendants are gone. A grouped
+//     child is no longer in the terminal's foreground group: Ctrl+C in the
+//     launcher's terminal does not reach it.
+// P10 `set_kill_with_launcher` (the whole tree dies when the launcher ends)
+//     has no Linux counterpart that covers a tree (`PR_SET_PDEATHSIG` fires
+//     per thread and reaches only the child): it is accepted and does
+//     nothing here; `kill_with_launcher_supported()` says false.
 
 import rt
 import str
@@ -99,11 +121,11 @@ export {
     STDIO_INHERIT, STDIO_PIPE, STDIO_NULL,
     command, command_free, add_arg, set_cwd, set_env, unset_env, clear_env,
     set_stdin, set_stdout, set_stderr, merge_stderr,
-    set_no_window, set_detach,
+    set_no_window, set_detach, set_group, set_kill_with_launcher, kill_with_launcher_supported,
     spawn, run, run_capture, run_io, communicate,
     write_in, close_in, read_out, read_err, read_out_nb, read_err_nb,
     wait, wait_timeout, try_wait, is_running, exit_code, term_signal, pid_of,
-    kill, terminate, close,
+    kill, terminate, kill_tree, terminate_tree, is_grouped, close,
     last_errno,
 }
 
@@ -137,13 +159,15 @@ struct Command {
     err_mode: u8,
     no_window: bool,
     detach: bool,
+    group: bool, // the child leads a process group of its own (set_group)
+    kill_close: bool, // Windows only: the tree dies with the launcher
     bad: bool, // a NUL octet or an empty program name was given
 }
 
 // A started child. The descriptors are -1 when not piped.
 struct Child {
     pid: i64,
-    h: u64, // the process handle (Windows); 0 here
+    h: u64, // Windows: the process handle. Here: the process group id (0 = none)
     in_fd: i64,
     out_fd: i64,
     err_fd: i64,
@@ -168,6 +192,8 @@ const SYS_KILL: i64 = 62
 const SYS_FCNTL: i64 = 72
 const SYS_CHDIR: i64 = 80
 const SYS_SETSID: i64 = 112
+const SYS_SETPGID: i64 = 109
+const SYS_GETPGID: i64 = 121
 const SYS_RT_SIGTIMEDWAIT: i64 = 128
 const SYS_CLOCK_GETTIME: i64 = 228
 const SYS_PIPE2: i64 = 293
@@ -220,7 +246,8 @@ fn command(program: str) -> Command {
     var c: Command = Command {
         program: rt.buf_new(), args: rt.buf_new(), nargs: 0, cwd: rt.buf_new(),
         envs: rt.buf_new(), env_clear: false, in_mode: 0 as u8, out_mode: 0 as u8,
-        err_mode: 0 as u8, no_window: false, detach: false, bad: false,
+        err_mode: 0 as u8, no_window: false, detach: false, group: false,
+        kill_close: false, bad: false,
     }
     if program.length() == 0 || !push_cstr(&c.program, program) {
         c.bad = true
@@ -385,6 +412,27 @@ fn set_detach(c: *mut Command, on: bool) {
     (*c).detach = on
 }
 
+// The child leads a NEW PROCESS GROUP (Linux: setpgid; Windows: a job
+// object), so that `kill_tree` / `terminate_tree` reach it and everything it
+// starts. See P9.
+fn set_group(c: *mut Command, on: bool) {
+    (*c).group = on
+}
+
+// Windows: the child (and its tree) is killed when the launcher ends or
+// `close` is called on the Child -- implies `set_group`. Linux: no effect (P10).
+fn set_kill_with_launcher(c: *mut Command, on: bool) {
+    (*c).kill_close = on
+    if on {
+        (*c).group = true
+    }
+}
+
+// Can `set_kill_with_launcher` do what it says on this platform?
+fn kill_with_launcher_supported() -> bool {
+    return false
+}
+
 // ---------------------------------------------------------- The helpers
 
 fn now_ms() -> u64 {
@@ -515,6 +563,11 @@ fn child_run(c: *mut Command, exe: u64, argv: u64, envp: u64, in_c: i64, out_c: 
             syscall(SYS_WRITE, pidpipe, (&gp[0]) as i64, 4, 0, 0, 0)
             rt.finish(0)
         }
+    }
+    if (*c).group && !(*c).detach {
+        // a group of its own: pgid = our pid. The caller waits for the exec
+        // report before it returns, so the group exists when `spawn` returns.
+        syscall(SYS_SETPGID, 0, 0, 0, 0, 0, 0)
     }
     if rt.buf_len(&(*c).cwd) > 0 {
         let r: i64 = syscall(SYS_CHDIR, rt.buf_ptr(&(*c).cwd) as i64, 0, 0, 0, 0, 0)
@@ -737,9 +790,18 @@ fn spawn(c: *mut Command) -> ProcError!Child {
         proc_errno = 5
         return ProcError::Exec
     }
+    // The group id, verified: `kill(-1, ..)` would hit every process we may
+    // signal, so a number that is not really the group of the child is not
+    // kept. (A detached child is in the group of its middle process: setsid.)
+    var pgid: u64 = 0
+    if (*c).detach || (*c).group {
+        if kid > 1 && syscall(SYS_GETPGID, child_pid, 0, 0, 0, 0, 0) == kid {
+            pgid = kid as u64
+        }
+    }
     // a pipe that the caller keeps must never block it by accident
     return Child {
-        pid: child_pid, h: 0, in_fd: pin[1] as i64, out_fd: pout[0] as i64,
+        pid: child_pid, h: pgid, in_fd: pin[1] as i64, out_fd: pout[0] as i64,
         err_fd: perr[0] as i64, done: false, code: 0, sig: 0, own: own,
     }
 }
@@ -961,6 +1023,30 @@ fn terminate(ch: *mut Child) {
     if !(*ch).done && (*ch).pid > 0 {
         syscall(SYS_KILL, (*ch).pid, SIGTERM, 0, 0, 0, 0)
     }
+}
+
+// Has the child a process group that `kill_tree` can address?
+fn is_grouped(ch: *mut Child) -> bool {
+    return (*ch).h > 1
+}
+
+// SIGKILL to the child's whole process group (P9). true = the signal went
+// out. A child without a group gets a plain `kill` and the answer is false.
+fn kill_tree(ch: *mut Child) -> bool {
+    if (*ch).h > 1 {
+        return syscall(SYS_KILL, 0 - ((*ch).h as i64), SIGKILL, 0, 0, 0, 0) == 0
+    }
+    kill(ch)
+    return false
+}
+
+// SIGTERM to the whole group; the same rules.
+fn terminate_tree(ch: *mut Child) -> bool {
+    if (*ch).h > 1 {
+        return syscall(SYS_KILL, 0 - ((*ch).h as i64), SIGTERM, 0, 0, 0, 0) == 0
+    }
+    terminate(ch)
+    return false
 }
 
 // Closes the caller's ends of the pipes. The child is NOT stopped and NOT

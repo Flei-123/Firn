@@ -11,7 +11,7 @@ parallel. None of that existed as a library. Everything here is Firn, no libc.
 | `std.process` | `lib/std/process.fi`, `process.windows.fi` | commands, pipes, wait/kill/detach |
 | `std.shell` | `lib/std/shell.fi` + `shellos.fi` / `shellos.windows.fi` | open URL/path, reveal, directories, Java discovery |
 | `std.env` | `lib/std/env.fi`, `env.windows.fi` | read the environment, `which` |
-| `std.pool` | `lib/std/pool.fi`, `pool.windows.fi` | worker threads + job queue |
+| `std.pool` | `lib/std/pool.fi` (real threads on Windows too since round WIN-THREADS) | worker threads + job queue |
 | `std.cmdline` | `lib/std/cmdline.fi` | Windows command line quoting/splitting, UTF-8 <-> UTF-16 (pure) |
 | `std.envblock` | `lib/std/envblock.fi` | merge of the child's environment (pure) |
 
@@ -121,9 +121,9 @@ argument and calls the program's own `fn __thread_work`; there can be only one
 per program. The queue is a thread channel; job records come from slabs of the
 pool and are recycled. `tests/2065`: 5000 jobs each exactly once, 8 sleeping
 jobs finish in parallel, a queue of 4 with 2000 jobs, GC allocation on 4
-workers, 25 repetitions in all four optimisation levels. **No threads on the
-Windows target yet** (the runtime is `clone` + `futex`): `pool.windows.fi`
-keeps the API and runs each job inside `submit` (`worker_count` says 0).
+workers, 25 repetitions in all four optimisation levels. Windows: since round
+WIN-THREADS the same `pool.fi` runs on real threads there (the former
+`pool.windows.fi`, which ran each job inside `submit`, is gone).
 
 ## Compiler changes
 

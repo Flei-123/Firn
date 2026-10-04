@@ -173,6 +173,12 @@ extern fn CreateSymbolicLinkW(link: u64, target: u64, flags: i64) -> i32;
 extern fn CreateDirectoryW(p: u64, sa: i64) -> i32;
 extern fn MoveFileExW(a: u64, b: u64, fl: i64) -> i32;
 extern fn SystemFunction036(buf: u64, n: i64) -> i32;
+// ROUND WIN-THREADS: the thread runtime's futex and thread block pointer.
+extern fn TlsAlloc() -> i32;
+extern fn TlsSetValue(i: i64, v: i64) -> i32;
+extern fn WaitOnAddress(a: u64, cmp: u64, n: i64, ms: i64) -> i32;
+extern fn WakeByAddressSingle(a: u64);
+extern fn WakeByAddressAll(a: u64);
 
 // 0 = free, 1 = file handle, 2 = socket, 3 = a file that only exists here
 static mut __win_kind: [i64; 256] = [0; 256]
@@ -187,6 +193,16 @@ static mut __win_tmp: u64 = 0
 static mut __win_freq: i64 = 0
 static mut __win_wsa: i64 = 0
 static mut __win_argp: u64 = 0
+// ROUND WIN-THREADS. The TLS slot that holds the thread block pointer (the
+// Windows twin of `fs:0`): `Op::ThreadSelf` reads TEB.TlsSlots[__win_tlsidx]
+// (compiler/src/thread.rs). Filled by arch_prctl(ARCH_SET_FS).
+static mut __win_tlsidx: u64 = 0
+static mut __win_tlsset: i64 = 0
+// ONE lock for every call that works in the shared scratch pages
+// (`__win_path`, `__win_tmp`) -- paths, directories, stat. Calls that may
+// BLOCK (read, write, recv, accept, connect, poll, sleep, futex) never take
+// it: they work in locals only.
+static mut __win_lock: [u64; 1] = [0; 1]
 
 // --------------------------------------------------------- raw memory
 fn __win_ld8(p: u64, i: i64) -> i64 {
@@ -481,10 +497,12 @@ fn __win_nonblock(s: i64, on: i64) {
 }
 
 fn __win_slot(kind: i64, h: i64) -> i64 {
+    // Claimed with a compare-and-swap: `socket` and `accept` run without the
+    // seam lock, `open` runs with it -- two threads must never get one slot.
     var i: i64 = 3
     while i < 256 {
-        if __win_kind[i as usize] == 0 {
-            __win_kind[i as usize] = kind
+        let cell: *mut u64 = (&__win_kind[i as usize]) as *mut u64
+        if __atomic_swap(cell, 0, kind as u64) == (0 as u64) {
             __win_hnd[i as usize] = h
             __win_nb[i as usize] = 0
             return i
@@ -640,8 +658,8 @@ fn __win_write(fd: i64, buf: u64, n: i64) -> i64 {
         }
         return r
     }
-    let done: u64 = __win_tmp + 256
-    __win_st64(done, 0, 0)
+    var dn: [i64; 1] = [0; 1]
+    let done: u64 = (&dn[0]) as u64
     let ok: i32 = WriteFile(__win_handle(fd), buf, n, done, 0)
     if ok == 0 {
         return __win_errno()
@@ -681,8 +699,8 @@ fn __win_read(fd: i64, buf: u64, n: i64) -> i64 {
         }
         return r
     }
-    let done: u64 = __win_tmp + 264
-    __win_st64(done, 0, 0)
+    var dn: [i64; 1] = [0; 1]
+    let done: u64 = (&dn[0]) as u64
     let ok: i32 = ReadFile(__win_handle(fd), buf, n, done, 0)
     if ok == 0 {
         // A pipe whose writer is gone reads as end of file on Linux.
@@ -807,15 +825,17 @@ fn __win_prot(p: i64) -> i64 {
 fn __win_clock(id: i64, ts: u64) -> i64 {
     if id == 0 {
         // CLOCK_REALTIME: FILETIME is 100 ns units since 1601.
-        GetSystemTimeAsFileTime(__win_tmp + 128)
-        let ft: i64 = __win_ld64(__win_tmp + 128, 0)
+        var ftb: [i64; 1] = [0; 1]
+        GetSystemTimeAsFileTime((&ftb[0]) as u64)
+        let ft: i64 = ftb[0]
         let u: i64 = ft - 116444736000000000
         __win_st64(ts, 0, u / 10000000)
         __win_st64(ts, 1, (u % 10000000) * 100)
         return 0
     }
-    QueryPerformanceCounter(__win_tmp + 136)
-    let c: i64 = __win_ld64(__win_tmp + 136, 0)
+    var qpc: [i64; 1] = [0; 1]
+    QueryPerformanceCounter((&qpc[0]) as u64)
+    let c: i64 = qpc[0]
     let f: i64 = __win_freq
     __win_st64(ts, 0, c / f)
     __win_st64(ts, 1, (c % f) * 1000000000 / f)
@@ -824,7 +844,8 @@ fn __win_clock(id: i64, ts: u64) -> i64 {
 
 fn __win_wsa_up() {
     if __win_wsa == 0 {
-        WSAStartup(514, __win_tmp + 512)
+        var wd: [i64; 64] = [0; 64]
+        WSAStartup(514, (&wd[0]) as u64)
         __win_wsa = 1
     }
 }
@@ -900,11 +921,11 @@ fn __win_af_to_win(af: i64) -> i64 {
 // A sockaddr on its way OUT: if it is v6, its family octets have to say 23.
 // Everything else is copied unchanged. The copy goes into scratch, because
 // the caller's buffer belongs to the caller.
-fn __win_sa_out(a: u64, n: i64) -> u64 {
+fn __win_sa_out(a: u64, n: i64, d: u64) -> u64 {
     if n <= 0 { return a }
     let fam: i64 = __win_ld16(a, 0)
     if fam != 10 { return a }
-    let d: u64 = __win_tmp + 1024
+    if n > 128 { return a }
     var i: i64 = 0
     while i < n {
         __win_st8(d, i, __win_ld8(a, i))
@@ -954,9 +975,15 @@ fn __win_poll(fds: u64, nfds: i64, ms: i64) -> i64 {
         if ms > 0 { Sleep(ms) }
         return 0
     }
-    let rd: u64 = __win_tmp + 2048
-    let wr: u64 = __win_tmp + 3072
-    let ex: u64 = __win_tmp + 4096
+    // fd_set = {u32 count, pad, SOCKET[64]} = 520 octets; locals, so that
+    // two threads can wait at the same time without the seam lock.
+    var rdb: [i64; 66] = [0; 66]
+    var wrb: [i64; 66] = [0; 66]
+    var exb: [i64; 66] = [0; 66]
+    var tvb: [i64; 2] = [0; 2]
+    let rd: u64 = (&rdb[0]) as u64
+    let wr: u64 = (&wrb[0]) as u64
+    let ex: u64 = (&exb[0]) as u64
     __win_fdset_clear(rd)
     __win_fdset_clear(wr)
     __win_fdset_clear(ex)
@@ -995,14 +1022,14 @@ fn __win_poll(fds: u64, nfds: i64, ms: i64) -> i64 {
     }
     if ready > 0 {
         // something is ready already -- ask without waiting
-        let tv0: u64 = __win_tmp + 5120
+        let tv0: u64 = (&tvb[0]) as u64
         __win_st64(tv0, 0, 0)
         __win_st64(tv0, 1, 0)
         __win_ws_select(0, rd, wr, ex, tv0)
     } else {
         var tvp: u64 = 0
         if ms >= 0 {
-            let tv: u64 = __win_tmp + 5120
+            let tv: u64 = (&tvb[0]) as u64
             __win_st64(tv, 0, ms / 1000)
             __win_st64(tv, 1, (ms % 1000) * 1000)
             tvp = tv
@@ -1222,6 +1249,58 @@ fn __win_statx(path: u64, flags: i64, buf: u64) -> i64 {
 }
 
 fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) -> i64 {
+    if __win_scratch_call(nr) {
+        // ROUND WIN-THREADS: the calls below work in the shared scratch
+        // pages; one at a time. (None of them waits for something that
+        // another thread has to provide.)
+        var spins: i64 = 0
+        while __atomic_swap((&__win_lock[0]) as *mut u64, 0, 1) != (0 as u64) {
+            spins = spins + 1
+            if spins > 64 {
+                SwitchToThread()
+            }
+        }
+        let r: i64 = __win_syscall_one(nr, a1, a2, a3, a4, a5, a6)
+        __win_lock[0] = 0
+        return r
+    }
+    return __win_syscall_one(nr, a1, a2, a3, a4, a5, a6)
+}
+
+// The calls that use `__win_path` / `__win_tmp`: open, openat, getdents64,
+// statx, unlinkat, symlinkat, access, unlink, getcwd, mkdir, rename, dup,
+// dup2.
+fn __win_scratch_call(nr: i64) -> bool {
+    if nr == 2 || nr == 257 || nr == 217 || nr == 332 || nr == 263 || nr == 266 {
+        return true
+    }
+    if nr == 21 || nr == 87 || nr == 79 || nr == 83 || nr == 82 || nr == 32 || nr == 33 {
+        return true
+    }
+    return false
+}
+
+fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) -> i64 {
+    if nr == 202 {
+        // futex(addr, op, val): the thread runtime's wait and wake. WAIT
+        // sleeps while the 32 bit word at `addr` still holds `val` (it
+        // returns at once if it does not); WAKE wakes one or all.
+        let op: i64 = a2 & 127
+        if op == 0 {
+            var cmp: [i64; 1] = [a3]
+            WaitOnAddress(a1 as u64, (&cmp[0]) as u64, 4, 4294967295)
+            return 0
+        }
+        if op == 1 {
+            if a3 == 1 {
+                WakeByAddressSingle(a1 as u64)
+            } else {
+                WakeByAddressAll(a1 as u64)
+            }
+            return 0
+        }
+        return 0 - 38
+    }
     if nr == 217 {
         return __win_getdents(a1, a2 as u64, a3)
     }
@@ -1296,7 +1375,8 @@ fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) 
         return 0
     }
     if nr == 10 {
-        if VirtualProtect(a1 as u64, a2 as u64, __win_prot(a3), __win_tmp + 144) == 0 {
+        var oldp: [i64; 1] = [0; 1]
+        if VirtualProtect(a1 as u64, a2 as u64, __win_prot(a3), (&oldp[0]) as u64) == 0 {
             return __win_errno()
         }
         return 0
@@ -1323,10 +1403,11 @@ fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) 
         if __win_kind_of(a1) != 1 {
             return 0 - 9
         }
-        if SetFilePointerEx(__win_handle(a1), a2, __win_tmp + 152, a3) == 0 {
+        var np: [i64; 1] = [0; 1]
+        if SetFilePointerEx(__win_handle(a1), a2, (&np[0]) as u64, a3) == 0 {
             return __win_errno()
         }
-        return __win_ld64(__win_tmp + 152, 0)
+        return np[0]
     }
     if nr == 24 {
         SwitchToThread()
@@ -1411,7 +1492,8 @@ fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) 
         if __win_kind_of(a1) != 2 {
             return 0 - 88
         }
-        if connect(__win_handle(a1), __win_sa_out(a2 as u64, a3), a3) != 0 {
+        var sab: [i64; 16] = [0; 16]
+        if connect(__win_handle(a1), __win_sa_out(a2 as u64, a3, (&sab[0]) as u64), a3) != 0 {
             return __win_sockerrno()
         }
         return 0
@@ -1428,7 +1510,8 @@ fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) 
         if __win_kind_of(a1) != 2 {
             return 0 - 88
         }
-        let sa: u64 = __win_sa_out(a5 as u64, a6)
+        var sab: [i64; 16] = [0; 16]
+        let sa: u64 = __win_sa_out(a5 as u64, a6, (&sab[0]) as u64)
         let r: i64 = sendto(__win_handle(a1), a2 as u64, a3, a4, sa, a6) as i64
         if r < 0 {
             return __win_sockerrno()
@@ -1517,7 +1600,8 @@ fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) 
         if __win_kind_of(a1) != 2 {
             return 0 - 88
         }
-        if bind(__win_handle(a1), __win_sa_out(a2 as u64, a3), a3) != 0 {
+        var sab: [i64; 16] = [0; 16]
+        if bind(__win_handle(a1), __win_sa_out(a2 as u64, a3, (&sab[0]) as u64), a3) != 0 {
             return __win_sockerrno()
         }
         return 0
@@ -1585,8 +1669,8 @@ fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) 
             if opt == 20 || opt == 21 {
                 let sec: i64 = __win_ld64(val, 0)
                 let usec: i64 = __win_ld64(val, 1)
-                let ms: u64 = __win_tmp + 184
-                __win_st64(ms, 0, 0)
+                var msb: [i64; 1] = [0; 1]
+                let ms: u64 = (&msb[0]) as u64
                 let q: *mut u32 = ms as *mut u32
                 *q = (sec * 1000 + usec / 1000) as u32
                 val = ms
@@ -1601,7 +1685,25 @@ fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) 
         return 0
     }
     if nr == 158 {
-        // arch_prctl(ARCH_SET_FS): Windows keeps its own thread block.
+        // arch_prctl(ARCH_SET_FS, p): the thread block pointer of THIS
+        // thread goes into a TLS slot (the slot is allocated by the first
+        // call, which is the main thread's). `Op::ThreadSelf` reads the
+        // slot straight out of the TEB. Slots 0..63 only: the TEB keeps
+        // those inline, which is what makes the read one instruction.
+        if a1 != 4098 {
+            return 0 - 22
+        }
+        if __win_tlsset == 0 {
+            let ix: i64 = (TlsAlloc() as i64) & 4294967295
+            if ix >= 64 {
+                return 0 - 12
+            }
+            __win_tlsidx = ix as u64
+            __win_tlsset = 1
+        }
+        if TlsSetValue(__win_tlsidx as i64, a2) == 0 {
+            return 0 - 12
+        }
         return 0
     }
     return 0 - 38
