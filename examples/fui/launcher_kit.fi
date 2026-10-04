@@ -1,0 +1,909 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/fui/launcher_kit.fi -- THE APP KIT IN ONE WINDOW (lib/fui/kit.fi).
+//
+// A small launcher-style program that shows every part of the kit:
+//
+//   * the sidebar (Home / Mods / Docs / Settings; active mark, badge,
+//     collapsible with Ctrl+B)
+//   * a tab bar with symbols and a count badge, a search field with a
+//     clear button, a grid of cards (picture, avatar or symbol; hover,
+//     selection, arrow keys, wheel)
+//   * buttons (primary / secondary / ghost / danger)
+//   * progress bars with a label that reads on the fill AND the track,
+//     an indeterminate one, an error one
+//   * toasts (info / success / warning / error, an action, a close button)
+//   * a modal dialog with a focus trap (Tab, Shift+Tab, Enter, Escape)
+//   * a scrolling Markdown page (fui.markdownview): links raise a toast,
+//     one image is "loaded" through the image hook, the others are placeholders
+//
+//     firnc -o /tmp/launcher_kit examples/fui/launcher_kit.fi && /tmp/launcher_kit
+//     firnc --target=wasm32-browser -o launcher_kit.wasm examples/fui/launcher_kit.fi
+//
+// Keys: Tab = nav / content, Up / Down = move in the sidebar, / = search,
+// Alt+Left / Alt+Right = tabs, arrows = tiles, Ctrl+B = collapse the sidebar,
+// Escape = clear the search / close the dialog.
+//
+// The window is immediate mode: every frame `paint` draws everything from the
+// state below, and the rectangles of the buttons it drew are remembered for
+// the next click (`btn`). There is no scene tree, so the accessibility audit
+// (FUI_AUDIT=1) has nothing to name -- the kit is not yet announced to a
+// screen reader; that is on the fUi roadmap.
+import std.rt
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.scene
+import fui.anim
+import fui.editor
+import fui.kit
+import fui.kitcolor
+import fui.lucide
+import fui.viewport
+import fui.markdownview
+import fui.apphost
+import fui.audit
+import fui.a11y
+import fui.flex
+import fui.widget
+import markdown.doc
+import plat.fuiwirt
+
+const NAV_N: usize = 8
+const TILES_N: usize = 8
+const BTN_MAX: usize = 24
+const PAGE_HOME: usize = 0
+const PAGE_MODS: usize = 1
+const PAGE_DOCS: usize = 2
+const PAGE_SETTINGS: usize = 3
+
+// the ids of the buttons
+const B_PLAY: u32 = 1
+const B_DIALOG: u32 = 2
+const B_TOAST: u32 = 3
+const B_DARK: u32 = 4
+const B_LIGHT: u32 = 5
+const B_COLLAPSE: u32 = 6
+const B_T_INFO: u32 = 7
+const B_T_OK: u32 = 8
+const B_T_WARN: u32 = 9
+const B_T_ERR: u32 = 10
+const B_DELETE: u32 = 11
+const B_CANCEL: u32 = 12
+const B_CONFIRM: u32 = 13
+const B_FOLDER: u32 = 14
+
+const README: str = "# Launcher kit\n\nThis page is **Markdown**, laid out by `fui.markdownview`: *italic*, ~~strike~~, `inline code` and [a link](https://modrinth.com/mod/sodium \"Sodium on Modrinth\") that raises a toast.\n\n![pixel](pixel.png) ![late](late.png) ![bad](bad.png)\n\n## What is in the kit\n\n- the **sidebar** and the **tab bar**\n- a **tile grid** with avatars\n  - hover, selection, arrow keys\n- [x] toasts\n- [x] a modal dialog with a focus trap\n- [ ] touch gestures\n\n1. Open **Mods**\n2. Press `/` and type\n3. Pick a tile\n\n> Every colour comes from the theme; the accent #1bd96a is darkened for text on a white page.\n\n```\nfn main() -> i32 {\n    return app.run(a)\n}\n```\n\n| Part | Keys | Notes |\n|:-----|:----:|------:|\n| Sidebar | Up / Down | collapses with Ctrl+B |\n| Tiles | arrows | wheel scrolls |\n| Dialog | Tab, Esc | the focus cannot leave |\n\n---\n\nSee https://github.com/ for more."
+
+struct Demo {
+    m: theme.Theme,
+    c: render.Ctx,
+    sc: scene.Scene,
+    w: fuiwirt.Host,
+    hk: apphost.Hooks,
+    tr: anim.TransReg,
+    gen: anim.Animator,
+    quit: bool,
+    // geometry of the last frame (device points)
+    win_w: f64,
+    win_h: f64,
+    // navigation
+    page: usize,
+    tab: usize,
+    collapsed: bool,
+    nav_focus: bool,
+    nav_hover: usize,
+    tab_hover: usize,
+    // the parts
+    search: kit.Search,
+    search_hover_clear: bool,
+    tiles: [kit.Tile; 8],
+    grid: kit.TileGrid,
+    toasts: kit.Toasts,
+    modal: kit.Modal,
+    modal_hover_close: bool,
+    md: markdownview.MdView,
+    // the buttons the last frame drew
+    nb: usize,
+    bx: [f64; 24],
+    by: [f64; 24],
+    bw: [f64; 24],
+    bh: [f64; 24],
+    bid: [u32; 24],
+    hover_btn: u32,
+    down_btn: u32,
+    // time
+    now: i64,
+    want_frames: bool,
+    // the pointer
+    ptr_x: f64,
+    ptr_y: f64,
+    // toast ids for actions
+    last_toast: u32,
+    // the names of the operable parts, for the accessibility audit
+    ax: a11y.A11y,
+}
+
+static mut PIXELS: [u32; 2560] = [0 as u32; 2560]
+
+fn demo_size() -> usize {
+    var probe: [Demo; 2] = [demo_blank(), demo_blank()]
+    return ((&probe[1]) as usize) - ((&probe[0]) as usize)
+}
+
+fn tile_blank() -> kit.Tile {
+    return kit.Tile { title: "", sub: "", badge: "", icon: kit.ICON_NONE, seed: 0 as u32, px: 0, w: 0, h: 0, stride: 0 }
+}
+
+fn demo_blank() -> Demo {
+    return Demo {
+        m: theme.theme_new(true),
+        c: render.ctx_new(0 as u64 as *mut theme.Theme, 0 as u64 as *mut painter.Painter),
+        sc: scene.scene_new(),
+        w: fuiwirt.host_new(0 as u64 as *mut scene.Scene, 0 as u64 as *mut render.Ctx),
+        hk: apphost.hooks_blank(),
+        tr: anim.transreg_new(),
+        gen: anim.animator_new(),
+        quit: false, win_w: 0.0, win_h: 0.0,
+        page: PAGE_HOME, tab: 0, collapsed: false, nav_focus: true,
+        nav_hover: kit.NONE, tab_hover: kit.NONE,
+        search: kit.search_new(), search_hover_clear: false,
+        tiles: [tile_blank(); 8], grid: kit.grid_new(),
+        toasts: kit.toasts_new(), modal: kit.modal_new(), modal_hover_close: false,
+        md: markdownview.mdv_new(),
+        nb: 0, bx: [0.0; 24], by: [0.0; 24], bw: [0.0; 24], bh: [0.0; 24], bid: [0 as u32; 24],
+        hover_btn: 0 as u32, down_btn: 0 as u32,
+        now: 0, want_frames: false, ptr_x: 0.0, ptr_y: 0.0, last_toast: 0 as u32,
+        ax: a11y.a11y_new(),
+    }
+}
+
+// ------------------------------------------------------------ the data
+
+fn nav_items(d: *mut Demo, out: *mut [kit.NavItem; 8]) {
+    (*out)[0] = kit.NavItem { icon: kit.ICON_NONE, label: "LIBRARY", badge: 0, header: true }
+    (*out)[1] = kit.NavItem { icon: lucide.HOUSE, label: "Home", badge: 0, header: false }
+    (*out)[2] = kit.NavItem { icon: lucide.PACKAGE, label: "Mods", badge: 3, header: false }
+    (*out)[3] = kit.NavItem { icon: lucide.FILE_TEXT, label: "Docs", badge: 0, header: false }
+    (*out)[4] = kit.NavItem { icon: kit.ICON_NONE, label: "SYSTEM", badge: 0, header: true }
+    (*out)[5] = kit.NavItem { icon: lucide.SETTINGS, label: "Settings", badge: 0, header: false }
+    (*out)[6] = kit.NavItem { icon: lucide.TERMINAL, label: "Console", badge: 0, header: false }
+    (*out)[7] = kit.NavItem { icon: lucide.SERVER, label: "Servers", badge: 0, header: false }
+}
+
+// nav index <-> page
+fn nav_page(i: usize) -> usize {
+    if i == 1 {
+        return PAGE_HOME
+    }
+    if i == 2 {
+        return PAGE_MODS
+    }
+    if i == 3 {
+        return PAGE_DOCS
+    }
+    return PAGE_SETTINGS
+}
+
+fn page_nav(page: usize) -> usize {
+    if page == PAGE_HOME {
+        return 1
+    }
+    if page == PAGE_MODS {
+        return 2
+    }
+    if page == PAGE_DOCS {
+        return 3
+    }
+    return 5
+}
+
+fn fill_tiles(d: *mut Demo) {
+    var i: usize = 0
+    while i < 64 * 40 {
+        // a green-to-blue gradient, RGBA bytes (red first)
+        let x: usize = i % 64
+        let r: u32 = (27 + x * 20 / 64) as u32
+        let g: u32 = (217 - x * 120 / 64) as u32
+        let b: u32 = (106 + x * 140 / 64) as u32
+        PIXELS[i] = 0xFF000000 as u32 | (b << 16 as u32) | (g << 8 as u32) | r
+        i = i + 1
+    }
+    (*d).tiles[0] = kit.Tile { title: "Sodium", sub: "Rendering - 12M", badge: "Mod", icon: kit.ICON_NONE, seed: 0 as u32, px: 0, w: 0, h: 0, stride: 0 }
+    (*d).tiles[1] = kit.Tile { title: "Fabric API", sub: "Library - 40M", badge: "Mod", icon: kit.ICON_NONE, seed: 1 as u32, px: 0, w: 0, h: 0, stride: 0 }
+    (*d).tiles[2] = kit.Tile { title: "Iris Shaders", sub: "Shaders", badge: "Mod", icon: lucide.SPARKLES, seed: 2 as u32, px: 0, w: 0, h: 0, stride: 0 }
+    (*d).tiles[3] = kit.Tile { title: "Lithium", sub: "Optimization", badge: "Mod", icon: kit.ICON_NONE, seed: 3 as u32, px: 0, w: 0, h: 0, stride: 0 }
+    (*d).tiles[4] = kit.Tile { title: "Gradient pack", sub: "has its own picture", badge: "Pack", icon: kit.ICON_NONE, seed: 4 as u32, px: (&PIXELS[0]) as u64, w: 64, h: 40, stride: 256 }
+    (*d).tiles[5] = kit.Tile { title: "Mod Menu", sub: "Utility", badge: "Mod", icon: kit.ICON_NONE, seed: 5 as u32, px: 0, w: 0, h: 0, stride: 0 }
+    (*d).tiles[6] = kit.Tile { title: "Xaero's Minimap", sub: "A very long subtitle that is cut", badge: "Mod", icon: lucide.LAYOUT_GRID, seed: 6 as u32, px: 0, w: 0, h: 0, stride: 0 }
+    (*d).tiles[7] = kit.Tile { title: "Create", sub: "Technology", badge: "Mod", icon: kit.ICON_NONE, seed: 7 as u32, px: 0, w: 0, h: 0, stride: 0 }
+}
+
+// the image hook of the Markdown page: "pixel.png" (9 octets) is there
+fn on_image(ud: u64, url: u64, n: usize, info: *mut markdownview.ImgInfo) -> u32 {
+    if n == 9 {
+        (*info).px = (&PIXELS[0]) as u64
+        (*info).w = 64
+        (*info).h = 40
+        (*info).stride = 256
+        return markdownview.IMG_READY
+    }
+    if n == 7 {
+        return markdownview.IMG_FAILED
+    }
+    return markdownview.IMG_PENDING
+}
+
+// the text is copied into the toast; the compiler cannot see that through the call
+#[allow_escape]
+fn on_link(ud: u64, url: u64, n: usize) {
+    let d: *mut Demo = ud as *mut Demo
+    var text: [u8; 96] = [0 as u8; 96]
+    let pre: str = "Open: "
+    var k: usize = 0
+    while k < pre.n {
+        text[k] = rt.ld8(pre.p as u64, k)
+        k = k + 1
+    }
+    var i: usize = 0
+    while i < n && k < 90 {
+        text[k] = rt.ld8(url, i)
+        k = k + 1
+        i = i + 1
+    }
+    let s: str = str { p: (&text[0]) as *mut u8, n: k }
+    (*d).last_toast = kit.toast_push(&(*d).toasts, kit.TK_INFO, s, "Copy", (*d).now, 5000 as i64)
+}
+
+fn toast(d: *mut Demo, kind: u32, text: str, action: str) {
+    (*d).last_toast = kit.toast_push(&(*d).toasts, kind, text, action, (*d).now, 5000 as i64)
+}
+
+// ------------------------------------------------------------ the platform
+
+fn demo_attach(ud: u64, z: *mut painter.Painter) {
+    let d: *mut Demo = ud as *mut Demo
+    (*d).c = render.ctx_new(&(*d).m, z)
+    anim.transreg_bind(&(*d).tr, &(*d).c)
+}
+
+// one button: draws it, remembers where it is, returns its width
+fn btn(d: *mut Demo, id: u32, x: f64, y: f64, label: str, icon_id: i64, kind: u32) -> f64 {
+    let c: *mut render.Ctx = &(*d).c
+    let w: f64 = kit.button_width(c, label, icon_id)
+    let h: f64 = kit.button_height(c)
+    var st: u32 = 0 as u32
+    if (*d).hover_btn == id {
+        st = st | kit.ST_HOVER
+    }
+    if (*d).down_btn == id {
+        st = st | kit.ST_ACTIVE
+    }
+    // while the dialog is open the background buttons are not hovered
+    if kit.modal_blocks(&(*d).modal) && id != B_CANCEL && id != B_CONFIRM {
+        st = 0 as u32
+    }
+    if kit.modal_blocks(&(*d).modal) && (id == B_CANCEL || id == B_CONFIRM) {
+        var focus_idx: usize = 0
+        if id == B_CONFIRM {
+            focus_idx = 1
+        }
+        if kit.modal_focus(&(*d).modal) == focus_idx {
+            st = st | kit.ST_FOCUS
+        }
+    }
+    kit.button_draw(c, x, y, w, h, label, icon_id, kind, st)
+    if (*d).nb < BTN_MAX {
+        let k: usize = (*d).nb
+        (*d).bx[k] = x
+        (*d).by[k] = y
+        (*d).bw[k] = w
+        (*d).bh[k] = h
+        (*d).bid[k] = id
+        (*d).nb = k + 1
+    }
+    return w
+}
+
+fn button_at(d: *mut Demo, px: f64, py: f64) -> u32 {
+    var i: usize = 0
+    while i < (*d).nb {
+        if px >= (*d).bx[i] && px < (*d).bx[i] + (*d).bw[i] && py >= (*d).by[i] && py < (*d).by[i] + (*d).bh[i] {
+            return (*d).bid[i]
+        }
+        i = i + 1
+    }
+    return 0 as u32
+}
+
+fn title(d: *mut Demo, x: f64, y: f64, s: str) {
+    let c: *mut render.Ctx = &(*d).c
+    kit.draw_label(c, x, y, kit.ln(c, 40), kit.ln(c, 24), 700, kit.tokc(c, style.TOK_TEXT), s, 0.0)
+}
+
+fn page_home(d: *mut Demo, x0: f64, w: f64) {
+    let c: *mut render.Ctx = &(*d).c
+    let pad: f64 = kit.ln(c, 24)
+    var y: f64 = kit.ln(c, 24)
+    title(d, x0 + pad, y, "Home")
+    y = y + kit.ln(c, 56)
+    var x: f64 = x0 + pad
+    x = x + btn(d, B_PLAY, x, y, "Play", lucide.PLAY, kit.BTN_PRIMARY) + kit.ln(c, 8)
+    x = x + btn(d, B_DIALOG, x, y, "Delete profile...", lucide.TRASH, kit.BTN_SECONDARY) + kit.ln(c, 8)
+    x = x + btn(d, B_TOAST, x, y, "Show a toast", lucide.BELL, kit.BTN_GHOST) + kit.ln(c, 8)
+    x = x + btn(d, B_FOLDER, x, y, "Folder", kit.ICON_NONE, kit.BTN_SECONDARY)
+    y = y + kit.ln(c, 60)
+    // the search field
+    kit.search_draw(c, &(*d).search, x0 + pad, y, kit.ln(c, 360), kit.ln(c, 40), "Search mods (press /)", (*d).search_hover_clear)
+    y = y + kit.ln(c, 72)
+    // progress: a determinate one that counts, an unknown one, a failed one
+    let bw: f64 = w - 2.0 * pad
+    kit.draw_label(c, x0 + pad, y, kit.ln(c, 20), kit.ln(c, 12), 700, kit.tokc(c, style.TOK_TEXT_MUTED), "UPDATING GAME FILES", 0.0)
+    y = y + kit.ln(c, 24)
+    var pm: i64 = ((*d).now / 40) % 1100
+    if pm > 1000 as i64 {
+        pm = 1000
+    }
+    kit.progress_draw(c, x0 + pad, y, bw, kit.progress_height(c, true), pm, "", (*d).now, kit.PB_NORMAL)
+    y = y + kit.ln(c, 40)
+    kit.progress_draw(c, x0 + pad, y, bw, kit.progress_height(c, true), -1, "Resolving mods...", (*d).now, kit.PB_NORMAL)
+    y = y + kit.ln(c, 40)
+    kit.progress_draw(c, x0 + pad, y, bw, kit.progress_height(c, true), 640 as i64, "Upload failed - 64 %", (*d).now, kit.PB_ERROR)
+    y = y + kit.ln(c, 40)
+    kit.progress_draw(c, x0 + pad, y, bw, kit.progress_height(c, false), 300 as i64, "", (*d).now, kit.PB_SUCCESS)
+    (*d).want_frames = true
+}
+
+fn page_mods(d: *mut Demo, x0: f64, w: f64, h: f64) {
+    let c: *mut render.Ctx = &(*d).c
+    var tabs: [kit.Tab; 3] = [
+        kit.Tab { icon: lucide.PACKAGE, label: "Installed", badge: 3 },
+        kit.Tab { icon: lucide.DOWNLOAD, label: "Browse", badge: 0 },
+        kit.Tab { icon: lucide.CIRCLE_CHECK, label: "Updates", badge: 0 }]
+    kit.tabbar_draw(c, (&tabs[0]) as *mut kit.Tab, 3, (*d).tab, (*d).tab_hover, !(*d).nav_focus && !kit.search_has_focus(&(*d).search), x0, 0.0, w)
+    let pad: f64 = kit.ln(c, 16)
+    let ty: f64 = kit.tabbar_height(c) + kit.ln(c, 12)
+    kit.search_draw(c, &(*d).search, x0 + pad, ty, kit.ln(c, 360), kit.ln(c, 40), "Search mods (press /)", (*d).search_hover_clear)
+    let gy: f64 = ty + kit.ln(c, 52)
+    kit.grid_set_rect(&(*d).grid, x0, gy, w, h - gy)
+    kit.grid_paint(c, &(*d).grid, (&(*d).tiles[0]) as *mut kit.Tile, TILES_N)
+}
+
+fn page_docs(d: *mut Demo, x0: f64, w: f64, h: f64) {
+    markdownview.mdv_set_rect(&(*d).md, x0, 0.0, w, h)
+    markdownview.mdv_paint(&(*d).md, &(*d).c)
+}
+
+fn page_settings(d: *mut Demo, x0: f64, w: f64) {
+    let c: *mut render.Ctx = &(*d).c
+    let pad: f64 = kit.ln(c, 24)
+    var y: f64 = kit.ln(c, 24)
+    title(d, x0 + pad, y, "Settings")
+    y = y + kit.ln(c, 56)
+    kit.draw_label(c, x0 + pad, y, kit.ln(c, 20), kit.ln(c, 12), 700, kit.tokc(c, style.TOK_TEXT_MUTED), "APPEARANCE", 0.0)
+    y = y + kit.ln(c, 28)
+    var x: f64 = x0 + pad
+    x = x + btn(d, B_DARK, x, y, "Dark", lucide.MOON, kit.BTN_SECONDARY) + kit.ln(c, 8)
+    x = x + btn(d, B_LIGHT, x, y, "Light", lucide.SUN, kit.BTN_SECONDARY) + kit.ln(c, 8)
+    x = x + btn(d, B_COLLAPSE, x, y, "Collapse sidebar", lucide.LAYOUT_GRID, kit.BTN_GHOST)
+    y = y + kit.ln(c, 64)
+    kit.draw_label(c, x0 + pad, y, kit.ln(c, 20), kit.ln(c, 12), 700, kit.tokc(c, style.TOK_TEXT_MUTED), "TOASTS", 0.0)
+    y = y + kit.ln(c, 28)
+    x = x0 + pad
+    x = x + btn(d, B_T_INFO, x, y, "Info", lucide.INFO, kit.BTN_SECONDARY) + kit.ln(c, 8)
+    x = x + btn(d, B_T_OK, x, y, "Success", lucide.CIRCLE_CHECK, kit.BTN_SECONDARY) + kit.ln(c, 8)
+    x = x + btn(d, B_T_WARN, x, y, "Warning", lucide.TRIANGLE_ALERT, kit.BTN_SECONDARY) + kit.ln(c, 8)
+    x = x + btn(d, B_T_ERR, x, y, "Error", lucide.CIRCLE_ALERT, kit.BTN_SECONDARY)
+    y = y + kit.ln(c, 64)
+    kit.draw_label(c, x0 + pad, y, kit.ln(c, 20), kit.ln(c, 12), 700, kit.tokc(c, style.TOK_TEXT_MUTED), "DANGER ZONE", 0.0)
+    y = y + kit.ln(c, 28)
+    let w2: f64 = btn(d, B_DELETE, x0 + pad, y, "Delete profile...", lucide.TRASH, kit.BTN_DANGER)
+}
+
+fn draw_modal(d: *mut Demo) {
+    let c: *mut render.Ctx = &(*d).c
+    let m: *mut kit.Modal = &(*d).modal
+    if !kit.modal_blocks(m) {
+        return
+    }
+    kit.modal_draw(c, m, (*d).win_w, (*d).win_h, (*d).now, (*d).modal_hover_close)
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var cw: f64 = 0.0
+    var ch: f64 = 0.0
+    kit.modal_content_rect(c, m, (*d).win_w, (*d).win_h, &cx, &cy, &cw, &ch)
+    kit.draw_label(c, cx, cy + kit.ln(c, 4), kit.ln(c, 20), kit.ln(c, 14), 400, kit.tokc(c, style.TOK_TEXT), "This removes the profile and its 42 files.", cw)
+    kit.draw_label(c, cx, cy + kit.ln(c, 28), kit.ln(c, 20), kit.ln(c, 14), 400, kit.tokc(c, style.TOK_TEXT_MUTED), "Tab moves between the buttons, Esc closes.", cw)
+    // the two buttons, right-aligned at the bottom of the content area
+    let bh: f64 = kit.button_height(c)
+    let wc: f64 = kit.button_width(c, "Cancel", kit.ICON_NONE)
+    let wd: f64 = kit.button_width(c, "Delete", lucide.TRASH)
+    let by: f64 = cy + ch - bh
+    let w1: f64 = btn(d, B_CONFIRM, cx + cw - wd, by, "Delete", lucide.TRASH, kit.BTN_DANGER)
+    let w2: f64 = btn(d, B_CANCEL, cx + cw - wd - kit.ln(c, 8) - wc, by, "Cancel", kit.ICON_NONE, kit.BTN_SECONDARY)
+    if kit.modal_animating(m, (*d).now) {
+        (*d).want_frames = true
+    }
+}
+
+fn demo_paint(ud: u64, w: usize, h: usize) {
+    let d: *mut Demo = ud as *mut Demo
+    kitcolor.kit_apply(&(*d).m)
+    let c: *mut render.Ctx = &(*d).c
+    let f: *mut theme.Colors = theme.theme_colors(&(*d).m)
+    painter.painter_clear(render.ctx_painter(c), theme.opaque((*f).base))
+    if (*d).quit {
+        return
+    }
+    anim.transreg_new_frame(&(*d).tr)
+    (*d).now = render.ctx_time(c)
+    (*d).win_w = w as f64
+    (*d).win_h = h as f64
+    (*d).nb = 0
+    (*d).want_frames = false
+    // the sidebar
+    var items: [kit.NavItem; 8] = [kit.NavItem { icon: kit.ICON_NONE, label: "", badge: 0, header: false }; 8]
+    nav_items(d, &items)
+    let ip: *mut kit.NavItem = (&items[0]) as *mut kit.NavItem
+    let nw: f64 = kit.nav_width(c, (*d).collapsed)
+    let hover: usize = (*d).nav_hover
+    kit.nav_draw(c, ip, NAV_N, page_nav((*d).page), hover, (*d).nav_focus && !kit.modal_blocks(&(*d).modal), 0.0, 0.0, nw, h as f64, (*d).collapsed)
+    let x0: f64 = nw
+    let pw: f64 = (w as f64) - nw
+    if (*d).page == PAGE_HOME {
+        page_home(d, x0, pw)
+    } else if (*d).page == PAGE_MODS {
+        page_mods(d, x0, pw, h as f64)
+    } else if (*d).page == PAGE_DOCS {
+        page_docs(d, x0, pw, h as f64)
+    } else {
+        page_settings(d, x0, pw)
+    }
+    // the search caret blinks while the field has the focus
+    if kit.search_has_focus(&(*d).search) {
+        (*d).want_frames = true
+        let b: bool = kit.search_blink(&(*d).search, ((*d).now as u64) * 1000)
+    }
+    // toasts on top of the page, the dialog on top of everything
+    if kit.toasts_tick(&(*d).toasts, (*d).now) {
+        (*d).want_frames = true
+    }
+    kit.toasts_draw(c, &(*d).toasts, (*d).win_w, (*d).win_h, (*d).now)
+    draw_modal(d)
+    // ask for more frames while something moves
+    if (*d).want_frames {
+        anim.animator_clear(&(*d).gen)
+        let k: usize = anim.animator_add(&(*d).gen, anim.anim_new((*d).now, 100, 0.0, 1.0, anim.easing_linear()))
+    }
+}
+
+// ------------------------------------------------------------ the actions
+
+fn goto_page(d: *mut Demo, page: usize) {
+    (*d).page = page
+    if page != PAGE_MODS {
+        let g: bool = kit.grid_leave(&(*d).grid)
+    }
+}
+
+fn run_button(d: *mut Demo, id: u32) {
+    if id == B_PLAY {
+        toast(d, kit.TK_SUCCESS, "Launching Minecraft 1.21.4 (Fabric)", "")
+    } else if id == B_DIALOG || id == B_DELETE {
+        kit.modal_open(&(*d).modal, "Delete profile", 420, 148, 2, (*d).now)
+    } else if id == B_TOAST || id == B_T_INFO {
+        toast(d, kit.TK_INFO, "Fabric Loader 0.16.9 is available", "Update")
+    } else if id == B_T_OK {
+        toast(d, kit.TK_SUCCESS, "Profile saved", "")
+    } else if id == B_T_WARN {
+        toast(d, kit.TK_WARNING, "3 mods need a newer game version", "Show")
+    } else if id == B_T_ERR {
+        toast(d, kit.TK_ERROR, "Download failed: connection reset by peer", "Retry")
+    } else if id == B_DARK {
+        theme.theme_set_dark(&(*d).m, true)
+        kitcolor.kit_apply(&(*d).m)
+    } else if id == B_LIGHT {
+        theme.theme_set_dark(&(*d).m, false)
+        kitcolor.kit_apply(&(*d).m)
+    } else if id == B_COLLAPSE {
+        (*d).collapsed = !(*d).collapsed
+    } else if id == B_FOLDER {
+        toast(d, kit.TK_INFO, "Opening the game folder...", "")
+    } else if id == B_CANCEL {
+        kit.modal_close(&(*d).modal)
+    } else if id == B_CONFIRM {
+        kit.modal_close(&(*d).modal)
+        toast(d, kit.TK_SUCCESS, "Profile deleted", "Undo")
+    }
+}
+
+// a press at (x, y)
+fn demo_press(ud: u64, x: f64, y: f64) {
+    let d: *mut Demo = ud as *mut Demo
+    let c: *mut render.Ctx = &(*d).c
+    fuiwirt.host_touch(&(*d).w)
+    (*d).ptr_x = x
+    (*d).ptr_y = y
+    // the toasts are on top of everything but the dialog
+    if !kit.modal_blocks(&(*d).modal) {
+        var tid: u32 = 0 as u32
+        var part: u32 = 0 as u32
+        if kit.toasts_hit(c, &(*d).toasts, (*d).win_w, (*d).win_h, x, y, &tid, &part) {
+            if part == kit.TOAST_PART_CLOSE || part == kit.TOAST_PART_ACTION {
+                kit.toast_dismiss(&(*d).toasts, tid, (*d).now)
+            }
+            return
+        }
+    }
+    // the dialog: its buttons, its close button, a click on the scrim
+    if kit.modal_blocks(&(*d).modal) {
+        let hit: u32 = kit.modal_hit(c, &(*d).modal, (*d).win_w, (*d).win_h, x, y)
+        if hit == kit.MODAL_HIT_CLOSE || hit == kit.MODAL_HIT_SCRIM {
+            kit.modal_close(&(*d).modal)
+            return
+        }
+        let b: u32 = button_at(d, x, y)
+        if b == B_CANCEL || b == B_CONFIRM {
+            (*d).down_btn = b
+        }
+        return
+    }
+    // the search field
+    let search_x: f64 = kit.nav_width(c, (*d).collapsed) + kit.ln(c, 16)
+    var sy: f64 = 0.0
+    if (*d).page == PAGE_MODS {
+        sy = kit.tabbar_height(c) + kit.ln(c, 12)
+    } else if (*d).page == PAGE_HOME {
+        sy = kit.ln(c, 24) + kit.ln(c, 56) + kit.ln(c, 60)
+        // the Home page uses a 24 point margin
+    }
+    if (*d).page == PAGE_MODS || (*d).page == PAGE_HOME {
+        var sx: f64 = search_x
+        if (*d).page == PAGE_HOME {
+            sx = kit.nav_width(c, (*d).collapsed) + kit.ln(c, 24)
+        }
+        let r: u32 = kit.search_press(c, &(*d).search, sx, sy, kit.ln(c, 360), kit.ln(c, 40), x, y, ((*d).now as u64) * 1000)
+        if r != kit.SEARCH_HIT_NONE {
+            (*d).nav_focus = false
+            return
+        }
+        kit.search_focus(&(*d).search, false)
+    }
+    // the sidebar
+    var items: [kit.NavItem; 8] = [kit.NavItem { icon: kit.ICON_NONE, label: "", badge: 0, header: false }; 8]
+    nav_items(d, &items)
+    let nw: f64 = kit.nav_width(c, (*d).collapsed)
+    let ni: usize = kit.nav_hit(c, (&items[0]) as *mut kit.NavItem, NAV_N, 0.0, 0.0, nw, (*d).collapsed, x, y)
+    if ni != kit.NONE {
+        let pg: usize = nav_page(ni)
+        goto_page(d, pg)
+        (*d).nav_focus = true
+        return
+    }
+    // the tab bar and the tiles
+    if (*d).page == PAGE_MODS {
+        var tabs: [kit.Tab; 3] = [
+            kit.Tab { icon: lucide.PACKAGE, label: "Installed", badge: 3 },
+            kit.Tab { icon: lucide.DOWNLOAD, label: "Browse", badge: 0 },
+            kit.Tab { icon: lucide.CIRCLE_CHECK, label: "Updates", badge: 0 }]
+        let ti: usize = kit.tabbar_hit(c, (&tabs[0]) as *mut kit.Tab, 3, nw, 0.0, (*d).win_w - nw, x, y)
+        if ti != kit.NONE {
+            (*d).tab = ti
+            (*d).nav_focus = false
+            return
+        }
+        if kit.grid_bar_press(c, &(*d).grid, x, y) {
+            return
+        }
+        let gi: usize = kit.grid_hit(&(*d).grid, x, y, TILES_N)
+        if gi != kit.NONE {
+            kit.grid_select(&(*d).grid, gi)
+            (*d).nav_focus = false
+            toast(d, kit.TK_INFO, (*d).tiles[gi].title, "Open")
+            return
+        }
+    }
+    if (*d).page == PAGE_DOCS {
+        let took: bool = markdownview.mdv_pointer_down(&(*d).md, c, x, y)
+        (*d).nav_focus = false
+        return
+    }
+    // the buttons
+    let b: u32 = button_at(d, x, y)
+    if b != 0 as u32 {
+        (*d).down_btn = b
+    }
+}
+
+// the pointer: move, leave, release, wheel
+fn demo_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
+    let d: *mut Demo = ud as *mut Demo
+    let c: *mut render.Ctx = &(*d).c
+    (*d).ptr_x = x
+    (*d).ptr_y = y
+    let nw: f64 = kit.nav_width(c, (*d).collapsed)
+    if kind == fuiwirt.HOOK_WHEEL {
+        if kit.modal_blocks(&(*d).modal) {
+            return false
+        }
+        if (*d).page == PAGE_MODS {
+            kit.grid_wheel(&(*d).grid, y)
+            return true
+        }
+        if (*d).page == PAGE_DOCS {
+            markdownview.mdv_wheel(&(*d).md, y)
+            return true
+        }
+        return false
+    }
+    if kind == fuiwirt.HOOK_LEAVE {
+        let a: bool = kit.grid_leave(&(*d).grid)
+        let b: bool = markdownview.mdv_pointer_leave(&(*d).md)
+        (*d).nav_hover = kit.NONE
+        (*d).hover_btn = 0 as u32
+        (*d).tab_hover = kit.NONE
+        return true
+    }
+    if kind == fuiwirt.HOOK_UP {
+        let down: u32 = (*d).down_btn
+        (*d).down_btn = 0 as u32
+        if down != 0 as u32 && button_at(d, x, y) == down {
+            run_button(d, down)
+        }
+        if kit.modal_blocks(&(*d).modal) {
+            return true
+        }
+        kit.grid_bar_release(&(*d).grid)
+        let up: bool = markdownview.mdv_pointer_up(&(*d).md, c, x, y)
+        return true
+    }
+    if kind == fuiwirt.HOOK_MOVE {
+        var changed: bool = false
+        // dragging a scrollbar
+        if (*d).page == PAGE_MODS && kit.grid_bar_drag(c, &(*d).grid, x, y) {
+            return true
+        }
+        if kit.modal_blocks(&(*d).modal) {
+            let hc: bool = kit.modal_hit(c, &(*d).modal, (*d).win_w, (*d).win_h, x, y) == kit.MODAL_HIT_CLOSE
+            if hc != (*d).modal_hover_close {
+                (*d).modal_hover_close = hc
+                changed = true
+            }
+            let hb: u32 = button_at(d, x, y)
+            if hb != (*d).hover_btn {
+                (*d).hover_btn = hb
+                changed = true
+            }
+            return changed
+        }
+        var items: [kit.NavItem; 8] = [kit.NavItem { icon: kit.ICON_NONE, label: "", badge: 0, header: false }; 8]
+        nav_items(d, &items)
+        let ni: usize = kit.nav_hit(c, (&items[0]) as *mut kit.NavItem, NAV_N, 0.0, 0.0, nw, (*d).collapsed, x, y)
+        if ni != (*d).nav_hover {
+            (*d).nav_hover = ni
+            changed = true
+        }
+        let hb: u32 = button_at(d, x, y)
+        if hb != (*d).hover_btn {
+            (*d).hover_btn = hb
+            changed = true
+        }
+        if (*d).page == PAGE_MODS {
+            var tabs: [kit.Tab; 3] = [
+                kit.Tab { icon: lucide.PACKAGE, label: "Installed", badge: 3 },
+                kit.Tab { icon: lucide.DOWNLOAD, label: "Browse", badge: 0 },
+                kit.Tab { icon: lucide.CIRCLE_CHECK, label: "Updates", badge: 0 }]
+            let ti: usize = kit.tabbar_hit(c, (&tabs[0]) as *mut kit.Tab, 3, nw, 0.0, (*d).win_w - nw, x, y)
+            if ti != (*d).tab_hover {
+                (*d).tab_hover = ti
+                changed = true
+            }
+            if kit.grid_move(&(*d).grid, x, y, TILES_N) {
+                changed = true
+            }
+        }
+        if (*d).page == PAGE_DOCS {
+            if markdownview.mdv_pointer_move(&(*d).md, c, x, y) {
+                changed = true
+            }
+        }
+        return changed
+    }
+    return false
+}
+
+// a key (editor.KEY_*)
+fn demo_key(ud: u64, key: u32, mods: u32) -> bool {
+    let d: *mut Demo = ud as *mut Demo
+    fuiwirt.host_touch(&(*d).w)
+    // the dialog owns the keyboard while it is open: the focus cannot leave it
+    if kit.modal_blocks(&(*d).modal) {
+        let r: u32 = kit.modal_key(&(*d).modal, key, mods)
+        if r == kit.MODAL_KEY_CLOSE {
+            kit.modal_close(&(*d).modal)
+        } else if r == kit.MODAL_KEY_ACTIVATE {
+            if kit.modal_focus(&(*d).modal) == 1 {
+                run_button(d, B_CONFIRM)
+            } else {
+                run_button(d, B_CANCEL)
+            }
+        }
+        return true
+    }
+    if kit.search_has_focus(&(*d).search) {
+        if key == editor.KEY_TAB || key == editor.KEY_ENTER {
+            kit.search_focus(&(*d).search, false)
+            return true
+        }
+        let r: u32 = kit.search_key(&(*d).search, key, mods)
+        if r == editor.RES_PASS {
+            kit.search_focus(&(*d).search, false)
+        }
+        return true
+    }
+    // Alt+arrows: the tabs
+    if (mods & editor.MOD_ALT) != 0 as u32 && (*d).page == PAGE_MODS {
+        (*d).tab = kit.tabbar_key(3, (*d).tab, key)
+        return true
+    }
+    if key == editor.KEY_TAB {
+        (*d).nav_focus = !(*d).nav_focus
+        return true
+    }
+    if (*d).nav_focus {
+        var items: [kit.NavItem; 8] = [kit.NavItem { icon: kit.ICON_NONE, label: "", badge: 0, header: false }; 8]
+        nav_items(d, &items)
+        let cur: usize = page_nav((*d).page)
+        let nx: usize = kit.nav_key((&items[0]) as *mut kit.NavItem, NAV_N, cur, key)
+        if nx != cur {
+            goto_page(d, nav_page(nx))
+        }
+        return true
+    }
+    if (*d).page == PAGE_MODS {
+        let moved: bool = kit.grid_key(&(*d).grid, key, TILES_N)
+        return moved
+    }
+    if (*d).page == PAGE_DOCS {
+        var vk: u32 = 0 as u32
+        if key == editor.KEY_UP {
+            vk = viewport.VP_UP
+        } else if key == editor.KEY_DOWN {
+            vk = viewport.VP_DOWN
+        } else if key == editor.KEY_PGUP {
+            vk = viewport.VP_PAGE_UP
+        } else if key == editor.KEY_PGDN {
+            vk = viewport.VP_PAGE_DOWN
+        } else if key == editor.KEY_HOME {
+            vk = viewport.VP_HOME
+        } else if key == editor.KEY_END {
+            vk = viewport.VP_END
+        }
+        if vk != 0 as u32 {
+            return markdownview.mdv_key(&(*d).md, vk)
+        }
+    }
+    return false
+}
+
+// a typed character
+fn demo_text(ud: u64, cp: u32, mods: u32) -> bool {
+    let d: *mut Demo = ud as *mut Demo
+    fuiwirt.host_touch(&(*d).w)
+    if kit.modal_blocks(&(*d).modal) {
+        return true
+    }
+    if kit.search_has_focus(&(*d).search) {
+        let r: u32 = kit.search_char(&(*d).search, cp, mods)
+        return true
+    }
+    if (mods & editor.MOD_CTRL) != 0 as u32 {
+        // Ctrl+B: the sidebar (the character arrives as 2)
+        if cp == 98 as u32 || cp == 66 as u32 || cp == 2 as u32 {
+            (*d).collapsed = !(*d).collapsed
+            return true
+        }
+        return false
+    }
+    if cp == 47 as u32 && ((*d).page == PAGE_MODS || (*d).page == PAGE_HOME) {
+        kit.search_focus(&(*d).search, true)
+        (*d).nav_focus = false
+        return true
+    }
+    return false
+}
+
+fn demo_act(ud: u64, i: usize) {
+}
+
+fn demo_done(ud: u64) -> bool {
+    let d: *mut Demo = ud as *mut Demo
+    return (*d).quit
+}
+
+fn demo_field(ud: u64, out: *mut [f64; 4]) -> bool {
+    return false
+}
+
+// THE AUDIT. The window is immediate mode, so there is no scene tree for
+// lib/fui/audit.fi to read -- and a screen reader cannot read what is painted.
+// What CAN be checked is that every operable part the program offers has a
+// name: a node per part (buttons, sidebar items, tabs, tiles, the search
+// field) is built here, named with the very strings the frame paints, and the
+// audit of lib/fui/audit.fi runs over that. A part added to the window
+// without being added here is not covered -- the honest limit.
+fn audit_node(d: *mut Demo, root: usize, kind: u32, label: str) {
+    let n: usize = scene.scene_widget(&(*d).sc, root, kind, label.p as u64, label.n)
+    if n != scene.SCENE_NONE {
+        a11y.a11y_set_name(&(*d).ax, n, label.p as u64, label.n)
+    }
+}
+
+fn demo_audit(ud: u64) -> i32 {
+    let d: *mut Demo = ud as *mut Demo
+    let root: usize = scene.scene_box(&(*d).sc, scene.SCENE_NONE, 0 as u32, flex.FLEX_COLUMN,
+        flex.JUSTIFY_START, flex.AL_START)
+    var items: [kit.NavItem; 8] = [kit.NavItem { icon: kit.ICON_NONE, label: "", badge: 0, header: false }; 8]
+    nav_items(d, &items)
+    var i: usize = 0
+    while i < NAV_N {
+        if !items[i].header {
+            audit_node(d, root, widget.KIND_BUTTON, items[i].label)
+        }
+        i = i + 1
+    }
+    audit_node(d, root, widget.KIND_TAB, "Installed")
+    audit_node(d, root, widget.KIND_TAB, "Browse")
+    audit_node(d, root, widget.KIND_TAB, "Updates")
+    audit_node(d, root, widget.KIND_TEXTBOX, "Search mods")
+    var t: usize = 0
+    while t < TILES_N {
+        audit_node(d, root, widget.KIND_TILE, (*d).tiles[t].title)
+        t = t + 1
+    }
+    audit_node(d, root, widget.KIND_BUTTON, "Play")
+    audit_node(d, root, widget.KIND_BUTTON, "Delete profile")
+    audit_node(d, root, widget.KIND_BUTTON, "Show a toast")
+    audit_node(d, root, widget.KIND_BUTTON, "Folder")
+    audit_node(d, root, widget.KIND_BUTTON, "Dark")
+    audit_node(d, root, widget.KIND_BUTTON, "Light")
+    audit_node(d, root, widget.KIND_BUTTON, "Collapse sidebar")
+    audit_node(d, root, widget.KIND_BUTTON, "Cancel")
+    audit_node(d, root, widget.KIND_BUTTON, "Delete")
+    var ra: audit.Audit = audit.audit_tree_ax(&(*d).sc, &(*d).ax)
+    var b: rt.Buf = rt.buf_new()
+    audit.audit_line(&ra, &b)
+    rt.write_everything(1, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    if audit.audit_ok(&ra) {
+        return 0
+    }
+    return 1
+}
+
+fn main() -> i32 {
+    let n: usize = demo_size()
+    let p: u64 = rt.heap_alloc(n)
+    if p == 0 {
+        return 12
+    }
+    let d: *mut Demo = p as *mut Demo
+    *d = demo_blank()
+    kitcolor.kit_theme(&(*d).m, true)
+    fill_tiles(d)
+    markdownview.mdv_set_markdown(&(*d).md, README, doc.opts_default())
+    markdownview.mdv_set_link_cb(&(*d).md, d as u64, on_link)
+    markdownview.mdv_set_image_cb(&(*d).md, 0, on_image)
+    markdownview.mdv_set_background(&(*d).md, style.TOK_BASE)
+    kit.grid_select(&(*d).grid, kit.NONE)
+    // the host: the empty scene, the clock (transitions), frame requests (animator)
+    (*d).w = fuiwirt.host_new(&(*d).sc, &(*d).c)
+    fuiwirt.host_set_transitions(&(*d).w, &(*d).tr)
+    fuiwirt.host_set_animator(&(*d).w, &(*d).gen)
+    fuiwirt.host_set_hook(&(*d).w, d as u64, demo_hook)
+    fuiwirt.host_bind(&(*d).w)
+    (*d).hk = apphost.hooks_new(d as u64, &(*d).m, &(*d).w, demo_attach, demo_paint, demo_key,
+        demo_text, demo_press, demo_act, demo_done, demo_field, "fUi launcher kit", 960, 640)
+    apphost.hooks_set_audit(&(*d).hk, demo_audit)
+    return apphost.run(&(*d).hk)
+}

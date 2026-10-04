@@ -59,3 +59,15 @@ honest limits: [STD_ARCHIVES.md](STD_ARCHIVES.md).
 | `std.safefs` (`lib/std/safefs.fi`) | the shared rules: names, link targets, nothing written through a link, Windows names | the hostile archives above |
 | `std.hashfile` (`lib/std/hashfile.fi`) | streaming md5/sha1/sha256/sha512 of a file, hex, `Download` (temporary file, verify, fsync, atomic rename) | Python `hashlib` |
 | `std.secret` (`lib/std/secret.fi`) | keyring `secret_set/get/delete(service, key)`: Credential Manager on Windows, ChaCha20-Poly1305 file on Linux (machine-bound or Argon2id password) | Python `cryptography` + PyNaCl; the real Credential Manager (Wine and a Windows 11 machine) |
+
+## Libraries for the launcher (FleiLauncher, 04.10.2026)
+
+The first program to need them is a Minecraft launcher in Firn / fUi; they are
+general. Each has a positive test in `tests/` or a check in `tools/fui/run.sh`.
+
+| module | what it does | held against |
+|---|---|---|
+| `lib/markdown` (`md.fi`, `doc.fi`, `block.fi`, `inline.fi`, `html.fi`; `docs/MARKDOWN.md`) | CommonMark 0.31 plus GFM tables, strikethrough, task items and bare URLs, into an arena tree; raw HTML ignored, escaped or kept (default: ignored, `<br>`/`<img>`/`<a>` kept in sense); HTML writer with a safe mode | the CommonMark spec: **all 652 examples** byte for byte, and 37 GFM cases from markdown-it-py (`tests/2060_markdown.fi`); pathological input bounded |
+| `lib/fui/markdownview.fi` | a scrolling Markdown view: wrapped text, headings, lists, quotes, code, tables, task boxes, links with a click callback, images through an async hook (placeholder, ready, failed) | `tools/fui/mdview_main.fi`: pixels in light and dark, wide and narrow, WCAG 2 contrast |
+| `lib/fui/kit.fi`, `lib/fui/kitcolor.fi` (`docs/fui-kit.md`) | button, toasts, modal with focus trap, tab bar and sidebar with symbols, tile grid with avatars, search field with clear button, progress bar with a label that reads on fill and track; the launcher accent as readable text on any ground | `tools/fui/kit_main.fi` (pixels, hit functions, focus ring, icon-free variants, every colour pair), `tools/fui/kitlive.py` (the example in a real window on Xvfb) |
+

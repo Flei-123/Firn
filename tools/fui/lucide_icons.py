@@ -52,6 +52,11 @@ WANTED = [
     "eye", "eye-off", "smartphone", "monitor", "globe", "mail", "phone",
     "star", "heart", "house", "folder", "download", "upload",
     "external-link", "link", "qr-code",
+    # a launcher and its kit (lib/fui/kit.fi, examples/fui/launcher_kit.fi)
+    "play", "package", "puzzle", "layout-grid", "library", "triangle-alert",
+    "loader-circle", "folder-open", "gamepad-2", "server", "hard-drive",
+    "circle-x", "file-text", "rocket", "sparkles", "layers", "list",
+    "terminal", "box",
 ]
 
 

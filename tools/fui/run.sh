@@ -541,12 +541,12 @@ echo "== 18p. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
 # and tools/fui/app_main.fi drives them without a window (layout, clicks,
 # keys, text fields, wrapping, scale 2). The browser half with Chromium:
 # bash tools/wasm/appdemo.sh.
-for ex in hello_window counter form touchpad notes files; do
+for ex in hello_window counter form touchpad notes files launcher_kit; do
     "$FIRNC" --opt-level=dev -o "$W/app_$ex" "examples/fui/$ex.fi"
     "$FIRNC" --opt-level=dev --target=wasm32-browser -o "$W/app_$ex.wasm" \
         "examples/fui/$ex.fi"
 done
-echo "  examples/fui/{hello_window,counter,form,touchpad,notes,files}.fi build native + wasm32   OK"
+echo "  examples/fui/{hello_window,counter,form,touchpad,notes,files,launcher_kit}.fi build native + wasm32   OK"
 build app
 "$W/app"
 
@@ -558,6 +558,41 @@ echo "== 18p3. ZEILEN MIT SYMBOLEN (lib/fui/listrow.fi, r129) =="
 # app.list_item (examples/fui/files.fi, checked in app_main). docs/fui-list-rows.md
 build listrow
 "$W/listrow"
+
+echo
+echo "== 18p4. MARKDOWN VIEW (lib/fui/markdownview.fi on lib/markdown) =="
+# A Markdown document laid out and painted with the real font and theme, read
+# back pixel by pixel: heading rule, link colour (accent as readable text on
+# light AND dark), code block, quote bar, table borders, task boxes, bullets,
+# images (ready / pending / failed through the hook), click on a link calls
+# the callback, release elsewhere does not, wheel and keys scroll, narrow
+# views wrap, WCAG 2 contrast of every pair. The parser itself is held
+# against the CommonMark spec (tests/2060_markdown.fi, 652 examples).
+build mdview
+"$W/mdview"
+
+echo
+echo "== 18p5. THE APP KIT (lib/fui/kit.fi): button, toasts, modal + focus trap, tabs, sidebar, tile grid, search, progress =="
+# Every part painted into a canvas in light and dark, pixels read back,
+# the *_hit functions asked against the picture, the focus ring walked
+# round the dialog, the icon-free variants, narrow widths, and the WCAG 2
+# contrast of every colour pair (4.5:1 text, 3:1 graphics) with the
+# launcher accent #1bd96a (docs/fui-kit.md).
+build kit
+"$W/kit"
+
+echo
+echo "== 18p6. THE LAUNCHER KIT IN A REAL WINDOW (Xvfb, xdotool, xwd) =="
+# examples/fui/launcher_kit runs on its own X server and is operated from
+# outside; what is checked is what the server shows, plus the CPU it used while
+# idle. The window is built optimised (a dev build paints a dialog in 200 ms).
+# No Xvfb / xdotool / xwd / PIL: SKIP, not an error.
+"$FIRNC" --opt-level=release-fast -o "$W/launcher_kit" examples/fui/launcher_kit.fi
+if command -v python3 >/dev/null 2>&1; then
+    python3 tools/fui/kitlive.py "$W/launcher_kit" "${BELEGE:-$W/belege}/kit"
+else
+    echo "  SKIP: no python3"
+fi
 
 echo
 echo "== 18p2. THE ACCESSIBILITY AUDIT OF EVERY fUi PROGRAM (r98) =="
@@ -1167,6 +1202,12 @@ if [ "$1" = "--images" ]; then
     # paints the basic elements in all states; it lay BESIDE this run since its
     # creation -- nobody built it, and nobody calculated it either. Now its image arises here and is
     # re-calculated like every other proof.
+    # THE MARKDOWN VIEW AND THE APP KIT: their pictures (light, dark, narrow,
+    # icon-free) are written by the checks of sections 18p4 / 18p5 themselves;
+    # they fill the canvas edge to edge on purpose (a window, not a sheet), so
+    # they do not go through `beleg`.
+    "$W/mdview" "$Z" > /dev/null
+    "$W/kit" "$Z" > /dev/null
     build preview
     kette preview 760
     "$W/preview" "$Z/fui-preview-hell.png" light
