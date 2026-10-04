@@ -31,11 +31,12 @@ build x509 lib/tls/x509_main.fi
 build tls lib/tls/tls_main.fi
 build p256 tools/tls/p256_main.fi
 build tlsserver tools/tls/server_main.fi
+build tls12nb tools/tls/tls12_nb_main.fi
 [ $rc -eq 0 ] || exit 1
 python3 tools/tls/crypto_check.py "$WORK/cry" 2>&1 | tail -2 || rc=1
 python3 tools/tls/cert_check.py "$WORK/x509" 2>&1 | tail -3 || rc=1
 python3 tools/tls/tls_check.py "$WORK/tls" 2>&1 | tail -3 || rc=1
 python3 tools/tls/p256_check.py "$WORK/p256" 2>&1 | tail -3 || rc=1
 python3 tools/tls/server_check.py "$WORK/tlsserver" "$WORK/srv" 2>&1 | tail -2 || rc=1
-python3 tools/tls/tls12_check.py "$WORK/tls" 2>&1 | tail -6 || rc=1
+python3 tools/tls/tls12_check.py "$WORK/tls" "$WORK/tls12nb" 2>&1 | tail -6 || rc=1
 exit $rc

@@ -23,6 +23,12 @@ held against implementations this repository did not write.
      handshake short; garbage; an expired / wrong-name / unknown-issuer
      certificate; the strict mode (`require_ems`) against a server that has
      no extended master secret is covered by the real hosts of part E.
+  G  NON-BLOCKING MODE (round ASYNC's handshake machine, TLS 1.2 path): a proxy
+     hands the server's octets to the client one to seven at a time; the
+     client (`tools/tls/tls12_nb_main.fi`, a poll loop around
+     `tls_handshake_step` and `tls_read`) has to survive a `WouldBlock` in the
+     middle of every record and still return the whole page, for TLS 1.2 and
+     for TLS 1.3.
   E  REAL HOSTS, when there is a route: login.live.com, badssl.com's
      tls-v1-2 (an old nginx with no extended master secret), the refusals
      expired / wrong.host / self-signed / untrusted-root, and the TLS 1.0 /
@@ -41,6 +47,7 @@ import threading
 import time
 
 BINARY = os.path.abspath(sys.argv[1])
+NB_BINARY = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else None   # tls12_nb_main
 PASS = 0
 FAIL = []
 SKIP = []
@@ -52,6 +59,14 @@ def ok(title, good, got=""):
         PASS += 1
     else:
         FAIL.append((title, got))
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
 
 
 def run_openssl(*a):
@@ -158,7 +173,7 @@ def part_a(d, ca):
     for kind in ("rsa", "ec"):
         for (cipher, num) in suites[kind]:
             for group in ("X25519", "P-256"):
-                port += 1
+                port = free_port()
                 s = Server(d, port, kind + ".crt", kind + ".key",
                            ["-tls1_2", "-cipher", cipher, "-curves", group])
                 got = tls_main("127.0.0.1", port, "localhost", ca, "/")
@@ -168,14 +183,14 @@ def part_a(d, ca):
                    and got.get("VERIFY") == "OK" and got.get("STATUS", "").startswith("HTTP/1.")
                    and int(got.get("BYTES", "0")) > 1000, str(got))
         for sg in sigs[kind]:
-            port += 1
+            port = free_port()
             s = Server(d, port, kind + ".crt", kind + ".key", ["-tls1_2", "-sigalgs", sg])
             got = tls_main("127.0.0.1", port, "localhost", ca, "/")
             s.stop()
             ok("A %s signed with %s" % (kind, sg), got.get("VERSION") == "771" and got.get("VERIFY") == "OK"
                and got.get("STATUS", "").startswith("HTTP/1."), str(got))
     # B: one server, both versions
-    port += 1
+    port = free_port()
     s = Server(d, port, "rsa.crt", "rsa.key", [])
     got = tls_main("127.0.0.1", port, "localhost", ca, "/")
     ok("B a TLS 1.3 server gets TLS 1.3", got.get("VERSION") == "772" and got.get("VERIFY") == "OK", str(got))
@@ -185,7 +200,7 @@ def part_a(d, ca):
        and got.get("VERIFY") == "OK", str(got))
     s.stop()
     # a TLS 1.2 ONLY server and a client that offers both: the old "refused" case is now a success
-    port += 1
+    port = free_port()
     s = Server(d, port, "rsa.crt", "rsa.key", ["-tls1_2"])
     got = tls_main("127.0.0.1", port, "localhost", ca, "/")
     ok("B a TLS 1.2-only server is reachable by the default client", got.get("VERSION") == "771", str(got))
@@ -201,7 +216,7 @@ def part_c(d, ca):
                               ("ECDHE-RSA-CHACHA20-POLY1305", "52392", "rsa"),
                               ("ECDHE-ECDSA-AES128-GCM-SHA256", "49195", "ec"),
                               ("ECDHE-ECDSA-CHACHA20-POLY1305", "52393", "ec")):
-        port += 1
+        port = free_port()
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ctx.maximum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(os.path.join(d, cert + ".crt"), os.path.join(d, cert + ".key"))
@@ -354,7 +369,7 @@ def part_d(d, ca):
         return body
 
     # --- a clean run through the proxy (the proxy itself changes nothing)
-    port += 1
+    port = free_port()
     mitm_case(d, ca, port, "control: the proxy alone does not break the handshake",
               ["-tls1_2"], passthrough, {"VERSION": "771", "VERIFY": "OK"})
 
@@ -365,10 +380,10 @@ def part_d(d, ca):
                 if t == 12:
                     body[off + 4 + ln - 3] ^= 1  # inside the signature
         return body
-    port += 1
+    port = free_port()
     mitm_case(d, ca, port, "a flipped bit in the ServerKeyExchange signature (RSA) is refused",
               ["-tls1_2"], flip_ske, {"ERRSignature": ""})
-    port += 1
+    port = free_port()
     mitm_case(d, ca, port, "... and (ECDSA)", ["-tls1_2"], flip_ske, {"ERRSignature": ""}, cert="ec")
 
     # --- the share inside the signed parameters
@@ -378,7 +393,7 @@ def part_d(d, ca):
                 if t == 12:
                     body[off + 4 + 6] ^= 0x10  # inside the ephemeral public key
         return body
-    port += 1
+    port = free_port()
     mitm_case(d, ca, port, "a changed ephemeral key (signature no longer matches)", ["-tls1_2"],
               flip_share, {"ERRSignature": ""})
 
@@ -389,13 +404,13 @@ def part_d(d, ca):
                 body[4 + 2 + 24:4 + 2 + 32] = b"DOWNGRD" + bytes([last])
             return body
         return f
-    port += 1
+    port = free_port()
     mitm_case(d, ca, port, "DOWNGRD\\x01 in the ServerHello random (client offered 1.3)",
               ["-tls1_2"], sentinel(1), {"ERRDowngrade": ""})
-    port += 1
+    port = free_port()
     mitm_case(d, ca, port, "DOWNGRD\\x00 in the ServerHello random", ["-tls1_2"], sentinel(0),
               {"ERRDowngrade": ""})
-    port += 1
+    port = free_port()
     # ... but not when the client offered only 1.2: the check would then refuse every
     # modern server that was simply asked for 1.2 (the signature fails afterwards, which
     # is what the proxy's change causes -- the point is that it is NOT Downgrade)
@@ -413,7 +428,7 @@ def part_d(d, ca):
     def set_version(body):
         body[4] = 3
         body[5] = 2  # 0x0302: TLS 1.1
-    port += 1
+    port = free_port()
     mitm_case(d, ca, port, "a ServerHello with version TLS 1.1 is refused", ["-tls1_2"], edit_sh(set_version),
               {"ERRVersion": ""})
 
@@ -422,7 +437,7 @@ def part_d(d, ca):
         at = 4 + 2 + 32 + 1 + sidlen
         body[at] = 0x00
         body[at + 1] = 0x2F  # TLS_RSA_WITH_AES_128_CBC_SHA: not offered
-    port += 1
+    port = free_port()
     mitm_case(d, ca, port, "a cipher suite that was not offered is refused", ["-tls1_2"], edit_sh(set_suite),
               {"ERRSuite": ""})
 
@@ -431,7 +446,7 @@ def part_d(d, ca):
         at = 4 + 2 + 32 + 1 + sidlen
         body[at] = 0x13
         body[at + 1] = 0x01
-    port += 1
+    port = free_port()
     mitm_case(d, ca, port, "a TLS 1.3 suite in a hello without supported_versions is refused", ["-tls1_2"],
               edit_sh(set_tls13_suite), {"ERRVersion": ""})
 
@@ -439,7 +454,7 @@ def part_d(d, ca):
         sidlen = body[4 + 2 + 32]
         at = 4 + 2 + 32 + 1 + sidlen + 2
         body[at] = 1
-    port += 1
+    port = free_port()
     mitm_case(d, ca, port, "a non-zero compression method is refused", ["-tls1_2"], edit_sh(set_compression),
               {"ERRProtocol": ""})
 
@@ -451,7 +466,7 @@ def part_d(d, ca):
         if ct == 22 and n >= 2:
             return None
         return body
-    port += 1
+    port = free_port()
     mitm_case(d, ca, port, "the server's flight cut after the ServerHello: an error, no hang", ["-tls1_2"],
               cut_after_hello, {}, any_err=("ERRClosed", "ERRIo"))
 
@@ -459,7 +474,7 @@ def part_d(d, ca):
         if ct == 22 and n == 2:
             return bytearray(os.urandom(300))
         return body
-    port += 1
+    port = free_port()
     mitm_case(d, ca, port, "garbage where the Certificate belongs is an error", ["-tls1_2"], garbage_instead, {},
               any_err=("ERRProtocol", "ERRCertificate", "ERRTooLarge", "ERRClosed", "ERRIo", "ERRUnsupported"))
     # the garbage case only needs "an error and no crash": check ERR*
@@ -479,10 +494,10 @@ def part_d(d, ca):
                 body[len(body) // 2] ^= 1
             return body
         return f
-    port += 1
+    port = free_port()
     mitm_case(d, ca, port, "a flipped bit in the server's Finished is refused (Decrypt)", ["-tls1_2"],
               flip_encrypted("finished"), {"ERRDecrypt": ""})
-    port += 1
+    port = free_port()
     s = Server(d, port, "rsa.crt", "rsa.key", ["-tls1_2"])
     m = Mitm(port + 500, port, flip_encrypted("app"))
     m.start()
@@ -495,12 +510,12 @@ def part_d(d, ca):
     for (title, cert, host, want) in (
             ("an expired certificate", "old", "localhost", {"ERRCertificate": "", "VERIFY": "EXPIRED"}),
             ("a name that does not match", "rsa", "wrong.test", {"ERRCertificate": "", "VERIFY": "NAME"})):
-        port += 1
+        port = free_port()
         s = Server(d, port, cert + ".crt", cert + ".key", ["-tls1_2"])
         got = tls_main("127.0.0.1", port, host, ca, "/")
         s.stop()
         ok("D TLS 1.2: " + title + " is refused", all(got.get(k) == v for k, v in want.items()), str(got))
-    port += 1
+    port = free_port()
     empty = os.path.join(d, "empty.pem")
     open(empty, "w").close()
     s = Server(d, port, "rsa.crt", "rsa.key", ["-tls1_2"])
@@ -510,7 +525,7 @@ def part_d(d, ca):
        and got.get("ERRCertificate") == "", str(got))
 
     # --- a raw hostile server: a ServerHello that echoes the session id of the ClientHello
-    port += 1
+    port = free_port()
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
@@ -543,7 +558,7 @@ def part_d(d, ca):
        "ERRProtocol" in got, str(got))
 
     # --- raw: a record header that claims more than any record can hold
-    port += 1
+    port = free_port()
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
@@ -586,7 +601,7 @@ def part_f(d, ca):
     ended = 0
     for i in range(160):
         cert = "rsa" if i % 2 == 0 else "ec"
-        port += 1
+        port = free_port()
         target = rnd.randrange(1, 5)   # which handshake record of the server (1-based)
         pos = rnd.random()
         val = rnd.randrange(256)
@@ -611,6 +626,91 @@ def part_f(d, ca):
             crashed.append((i, cert, target, pos, val, rc))
     ok("F 160 mutated server flights: every run ENDS with a verdict (no signal, no hang)",
        not crashed, "first: %s" % (crashed[:3],))
+
+
+# ------------------------------------------------------------------ Part G
+class Dribble(threading.Thread):
+    """Forwards the client's octets at once and the SERVER's in pieces of 1 to 7
+    octets with a short pause in between."""
+
+    def __init__(self, to_port):
+        super().__init__(daemon=True)
+        self.srv = socket.socket()
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(("127.0.0.1", 0))
+        self.port = self.srv.getsockname()[1]
+        self.srv.listen(1)
+        self.to_port = to_port
+
+    def run(self):
+        import random
+        rnd = random.Random(99)
+        try:
+            self.srv.settimeout(20)
+            c, _ = self.srv.accept()
+            s = socket.create_connection(("127.0.0.1", self.to_port), timeout=5)
+        except OSError:
+            return
+
+        def up():
+            try:
+                while True:
+                    d = c.recv(65536)
+                    if not d:
+                        break
+                    s.sendall(d)
+            except OSError:
+                pass
+        threading.Thread(target=up, daemon=True).start()
+        try:
+            c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            while True:
+                d = s.recv(65536)
+                if not d:
+                    break
+                i = 0
+                while i < len(d):
+                    k = rnd.randint(1, 7)
+                    c.sendall(d[i:i + k])
+                    i += k
+                    time.sleep(0.0003)
+        except OSError:
+            pass
+        finally:
+            try:
+                c.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            time.sleep(0.2)
+            c.close()
+            s.close()
+
+
+def part_g(d, ca):
+    if NB_BINARY is None or not os.path.exists(NB_BINARY):
+        SKIP.append("G no tls12_nb binary given")
+        return
+    for (title, extra, ver) in (("TLS 1.2", ["-tls1_2"], "771"), ("TLS 1.3", [], "772")):
+        for cert in ("rsa", "ec"):
+            port = free_port()
+            s = Server(d, port, cert + ".crt", cert + ".key", extra)
+            m = Dribble(port)
+            m.start()
+            try:
+                r = subprocess.run([NB_BINARY, "127.0.0.1", str(m.port), "localhost", ca],
+                                   capture_output=True, timeout=120)
+                out = {}
+                for line in r.stdout.decode(errors="replace").split("\n"):
+                    if " " in line:
+                        k, v = line.split(" ", 1)
+                        out[k] = v.strip()
+            except subprocess.TimeoutExpired:
+                out = {"TIMEOUT": ""}
+            s.stop()
+            ok("G non-blocking, octets in pieces of 1-7 (%s, %s certificate): the whole page, %s"
+               % (title, cert, ver),
+               out.get("VERSION") == ver and out.get("STATUS", "").startswith("HTTP/1.")
+               and int(out.get("BYTES", "0")) > 1000 and int(out.get("WOULDBLOCK", "0")) > 50, str(out))
 
 
 # ------------------------------------------------------------------ Part E
@@ -688,6 +788,7 @@ def main():
         part_c(d, ca)
         part_d(d, ca)
         part_f(d, ca)
+        part_g(d, ca)
         part_e()
     finally:
         import shutil

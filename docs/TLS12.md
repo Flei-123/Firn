@@ -16,7 +16,12 @@ logs in against Microsoft has to reach it. The client now speaks both.
 * **Suites** (RFC 5289, RFC 7905): ECDHE-ECDSA and ECDHE-RSA with
   AES-128-GCM-SHA256 (`c02b`, `c02f`), AES-256-GCM-SHA384 (`c02c`, `c030`) and
   ChaCha20-Poly1305-SHA256 (`cca9`, `cca8`). Groups X25519 and secp256r1.
-* **Handshake** (`handshake12` in `tls.fi`): ServerHello, Certificate,
+* **Non-blocking mode** (round ASYNC's state machine, `tls_handshake_step`): the
+  TLS 1.2 handshake is a state machine as well (`handshake12_step`, steps 5 and
+  6; the flags and the certificates live in the `Tls` struct), so `WouldBlock`
+  in the middle of any record loses nothing; `read_record12` follows the same
+  rules (N3, N4).
+* **Handshake** (`handshake12_step` / `send_flight12` in `tls.fi`): ServerHello, Certificate,
   ServerKeyExchange (signature over both randoms and the share, RSA PKCS#1,
   RSA-PSS or ECDSA), optional CertificateRequest (answered with an empty
   Certificate), ServerHelloDone; then ClientKeyExchange, ChangeCipherSpec,
@@ -82,6 +87,10 @@ handshake is left out of the transcript and ignored).
     record; expired / wrong-name / empty-store certificates.
   * **F** fuzz: 160 server flights with one random byte replaced; every run has
     to end with a verdict (no signal, no time-out).
+  * **G** non-blocking: a proxy hands the server's octets over one to seven at a
+    time; `tools/tls/tls12_nb_main.fi` (a `poll` loop around
+    `tls_handshake_step` / `tls_read`) must still fetch the whole page, over
+    TLS 1.2 and TLS 1.3 (the async tests of round ASYNC cover 1.3 only).
   * **E** real hosts when there is a route: `login.live.com`,
     `tls-v1-2.badssl.com:1012` (the body equals curl's), the refusals
     expired / wrong.host / self-signed / untrusted-root with the right
@@ -111,3 +120,8 @@ handshake is left out of the transcript and ignored).
   nothing about revocation is checked in either version.
 * **X7 The `Tls` struct grew** (about 400 octets of 1.2 state); code that
   copies one by value pays that.
+* **X8 The ChangeCipherSpec of the TLS 1.3 compatibility mode moved**: it is
+  now sent right after the ServerHello (before our encrypted flight, RFC 8446
+  D.4 allows both places) instead of right after the ClientHello, because a TLS
+  1.2 server treats a ChangeCipherSpec in the middle of its first flight as a
+  protocol error.
