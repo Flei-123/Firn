@@ -129,12 +129,13 @@ def run(spec, timeout=300, expect_rc=0):
     """spec: list of lines. Returns Report (the LAST X/I report)."""
     r = subprocess.run(RUNNER + [DL], input='\n'.join(spec) + '\n', capture_output=True,
                        text=True, timeout=timeout)
-    if RUNNER and r.returncode == -9:
+    complete = r.stdout.endswith('\n.\n')
+    if RUNNER and r.returncode == -9 and complete:
         # Wine kills the host process of ANY program that joined a thread in about
-        # 1 % of the runs (tools/windows/thread_exit_race.sh shows it with a thread
-        # that returns 7); nothing of this library. The run is repeated once.
-        r = subprocess.run(RUNNER + [DL], input='\n'.join(spec) + '\n', capture_output=True,
-                           text=True, timeout=timeout)
+        # 1 % of the runs, after all the work and all the output
+        # (tools/windows/thread_exit_race.sh shows it with a thread that returns 7);
+        # nothing of this library. A complete report is a result, so it counts.
+        r.returncode = 0
     rep = Report()
     rep.rc = r.returncode
     rep.raw = r.stdout
