@@ -142,6 +142,7 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("listen", "WS2_32.dll", 2),
     ("accept", "WS2_32.dll", 3),
     ("setsockopt", "WS2_32.dll", 5),
+    ("getsockopt", "WS2_32.dll", 5),
     ("getsockname", "WS2_32.dll", 3),
     ("ioctlsocket", "WS2_32.dll", 3),
     // --- ws2_32: what round CERTUS-WINDOWS had to add ------------------

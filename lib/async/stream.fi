@@ -1,0 +1,798 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/async/stream.fi -- non-blocking TCP and TLS streams on the event loop.
+//
+// A STREAM is one connection that the loop reads and writes for you:
+//
+//     fn on_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+//         if kind == stream.SE_CONNECTED {
+//             stream.stream_write(s, "ping".p as u64, 4)
+//         } else if kind == stream.SE_DATA {
+//             // the octets stand in stream_in_ptr(s) .. stream_in_len(s)
+//             stream.stream_consume(s, stream.stream_in_len(s))
+//         } else if kind == stream.SE_CLOSED {
+//             // arg = reason (CL_*); `s` is invalid once this call returns
+//         }
+//     }
+//     let s: *mut stream.Stream = stream.stream_open(&l, addr, port, 5000, on_event, 0)
+//
+// ONE CALLBACK, FOUR KINDS
+//   SE_CONNECTED  the TCP connect (and for `stream_open_tls` the TLS
+//                 handshake) is done; writing before this is allowed too
+//                 (the octets wait)
+//   SE_DATA       new octets are in the input buffer. They STAY there until
+//                 `stream_consume`: a parser that needs more simply returns
+//                 and is called again when more has arrived
+//   SE_DRAINED    everything written so far has gone to the kernel
+//   SE_CLOSED     the stream is finished; `arg` is the reason:
+//                   CL_EOF      the peer closed in an orderly way
+//                   CL_LOCAL    `stream_close` / `stream_abort`
+//                   CL_TIMEOUT  the timeout of `stream_set_timeout` ran out
+//                   CL_ERROR    socket error (`stream_errno`)
+//                   CL_CONNECT  the connect failed (`stream_errno`)
+//                   CL_TLS      the TLS handshake or a record failed
+//                               (`stream_tls_error` = tls.tls_err_num)
+//                   CL_MEMORY   out of memory
+//                 The Stream is freed by the library right after this call
+//                 returns -- do not touch the pointer afterwards.
+//
+// BACKPRESSURE. Input: when the unread input exceeds `max_in` (4 MiB,
+// `stream_set_max_in`) the stream stops reading until the program consumes;
+// the kernel's window then closes and the peer slows down. Output:
+// `stream_write` always accepts (the buffer grows); look at
+// `stream_out_pending` and wait for SE_DRAINED when you produce faster than
+// the network takes.
+//
+// TIMEOUT is one number per stream: it covers the connect, the TLS handshake
+// and every later silence. Any octet read or written moves the deadline; a
+// stream that is silent for `ms` is closed with CL_TIMEOUT. One timer per
+// stream, re-armed lazily (activity only changes a number).
+//
+// ==================================================================== HONEST
+//
+// S1  TLS CLIENT ONLY. Servers get plain streams (`acceptor_new`); TLS in
+//     front of a Firn server is lib/http/server.fi's job (sans-I/O server).
+// S2  THE TLS HANDSHAKE COMPUTES ON THE LOOP THREAD: X25519/P-256 and the
+//     certificate chain cost several milliseconds, during which nothing else
+//     in the loop runs. 1000 simultaneous https connections are 1000 such
+//     pauses.
+// S3  NUMERIC ADDRESSES. Names are resolved by the caller (lib/net/dns.fi
+//     blocks; the TTL cache makes repeat lookups free). The HTTP client of
+//     this directory does it for you and says so.
+// S4  The input buffer is a plain byte buffer: `stream_consume` moves the
+//     remaining octets down when a lot has been consumed. A parser that
+//     consumes in tiny pieces from a huge buffer pays for that copy.
+// S5  A stream belongs to the loop thread (loop.fi A1).
+import std.rt
+import std.net
+import tls.tls
+import tls.x509
+import async.loop
+
+export {
+    Stream, Acceptor,
+    SE_CONNECTED, SE_DATA, SE_DRAINED, SE_CLOSED,
+    CL_EOF, CL_LOCAL, CL_TIMEOUT, CL_ERROR, CL_CONNECT, CL_TLS, CL_MEMORY,
+    stream_open, stream_open_tls, stream_adopt,
+    stream_write, stream_write_str, stream_close, stream_abort,
+    stream_in_ptr, stream_in_len, stream_consume,
+    stream_out_pending, stream_set_timeout, stream_set_max_in,
+    stream_set_callback, stream_set_ud, stream_ud, stream_pause_read,
+    stream_errno, stream_tls_error, stream_is_secure, stream_is_open,
+    stream_bytes_in, stream_bytes_out, stream_fd, stream_loop,
+    stream_peer, stream_peer_port,
+    acceptor_new, acceptor_port, acceptor_close, acceptor_count,
+}
+
+const SE_CONNECTED: u32 = 1
+const SE_DATA: u32 = 2
+const SE_DRAINED: u32 = 3
+const SE_CLOSED: u32 = 4
+
+const CL_EOF: i64 = 0
+const CL_LOCAL: i64 = 1
+const CL_TIMEOUT: i64 = 2
+const CL_ERROR: i64 = 3
+const CL_CONNECT: i64 = 4
+const CL_TLS: i64 = 5
+const CL_MEMORY: i64 = 6
+
+const ST_CONNECTING: u32 = 1
+const ST_TLS: u32 = 2
+const ST_OPEN: u32 = 3
+const ST_CLOSING: u32 = 4
+const ST_DEAD: u32 = 5
+
+// the answer of `catch` when a read/write failed (a count can never be this)
+const NB_ERR: usize = 18446744073709551615
+const RD_CHUNK: usize = 16384
+const READ_BUDGET: usize = 262144 // octets per event: fairness between streams
+const TLS_OUT_HIGH: usize = 131072
+
+struct Stream {
+    l: *mut loop.Loop,
+    conn: net.Conn,
+    h: u64, // watch handle
+    state: u32,
+    cb: fn(*mut Stream, u64, u32, i64),
+    ud: u64,
+    inb: rt.Buf,
+    inpos: usize,
+    outb: rt.Buf,
+    outpos: usize,
+    secure: bool,
+    t: tls.Tls,
+    store: *mut x509.Store,
+    host: [u8; 256],
+    hostlen: usize,
+    now: u64,
+    reason: i64,
+    errno: i64,
+    tlserr: u32,
+    timeout_ms: i64,
+    deadline: i64,
+    timer: u64,
+    paused: bool,
+    max_in: usize,
+    bytes_in: u64,
+    bytes_out: u64,
+    busy: u32, // inside a user callback
+    want_drain: bool, // SE_DRAINED is due
+    interest: u32,
+}
+
+struct Acceptor {
+    l: *mut loop.Loop,
+    lst: net.Listener,
+    h: u64,
+    cb: fn(*mut loop.Loop, u64, net.Conn),
+    ud: u64,
+    accepted: u64,
+}
+
+// -------------------------------------------------------------- Creation
+
+// `size_of` only knows the types of the root file, but a generic parameter
+// is substituted before it is asked (lib/std/json.fi says the same).
+fn obj_alloc[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+fn obj_free[T](p: u64) {
+    rt.heap_free(p, size_of[T]())
+}
+
+fn stream_alloc(l: *mut loop.Loop, cb: fn(*mut Stream, u64, u32, i64), ud: u64) -> *mut Stream {
+    let p: u64 = obj_alloc[Stream]()
+    if p == 0 {
+        return 0 as *mut Stream
+    }
+    let s: *mut Stream = p as *mut Stream
+    *s = Stream { l: l, conn: net.conn_from_fd(0 - 1), h: 0, state: ST_CONNECTING,
+        cb: cb, ud: ud, inb: rt.buf_new(), inpos: 0, outb: rt.buf_new(), outpos: 0,
+        secure: false, t: tls.tls_new(), store: 0 as *mut x509.Store,
+        host: [0; 256], hostlen: 0, now: 0, reason: 0, errno: 0, tlserr: 0,
+        timeout_ms: 0, deadline: 0, timer: 0, paused: false, max_in: 4194304,
+        bytes_in: 0, bytes_out: 0, busy: 0, want_drain: false, interest: 0 }
+    return s
+}
+
+fn stream_release(s: *mut Stream) {
+    rt.buf_free(&(*s).inb)
+    rt.buf_free(&(*s).outb)
+    tls.tls_free(&(*s).t)
+    obj_free[Stream](s as u64)
+}
+
+// A plain connection to addr:port. `timeout_ms` 0 = none. Returns 0 when
+// the socket could not even be created; every later failure is reported as
+// SE_CLOSED with CL_CONNECT.
+fn stream_open(l: *mut loop.Loop, addr: u32, port: u16, timeout_ms: i64,
+    cb: fn(*mut Stream, u64, u32, i64), ud: u64) -> *mut Stream {
+    var pending: bool = false
+    var err: i64 = 0
+    let c: net.Conn = net.connect_nb(addr, port, &pending, &err) catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&c) {
+        return 0 as *mut Stream
+    }
+    let s: *mut Stream = stream_alloc(l, cb, ud)
+    if s as u64 == 0 {
+        var cc: net.Conn = c
+        net.close(&cc)
+        return s
+    }
+    (*s).conn = c
+    net.set_no_delay(&(*s).conn, true) catch false
+    (*s).state = ST_CONNECTING
+    (*s).timeout_ms = timeout_ms
+    if !start_watch(s, loop.EV_WRITE) {
+        var cc2: net.Conn = (*s).conn
+        net.close(&cc2)
+        stream_release(s)
+        return 0 as *mut Stream
+    }
+    arm_timeout(s)
+    return s
+}
+
+// Same, then a TLS 1.3 handshake with `host` as the name the certificate
+// must carry. `store` (the roots) must stay alive as long as the stream.
+fn stream_open_tls(l: *mut loop.Loop, addr: u32, port: u16, host: str,
+    store: *mut x509.Store, now: u64, timeout_ms: i64,
+    cb: fn(*mut Stream, u64, u32, i64), ud: u64) -> *mut Stream {
+    if host.n > 255 {
+        return 0 as *mut Stream
+    }
+    let s: *mut Stream = stream_open(l, addr, port, timeout_ms, cb, ud)
+    if s as u64 == 0 {
+        return s
+    }
+    (*s).secure = true
+    (*s).store = store
+    (*s).now = now
+    (*s).hostlen = host.n
+    var i: usize = 0
+    while i < host.n {
+        (*s).host[i] = *(host.p + i)
+        i = i + 1
+    }
+    return s
+}
+
+// Takes over a connection that is open already (accepted, or connected the
+// blocking way). It must be non-blocking; `stream_adopt` makes it so.
+fn stream_adopt(l: *mut loop.Loop, c: net.Conn, timeout_ms: i64,
+    cb: fn(*mut Stream, u64, u32, i64), ud: u64) -> *mut Stream {
+    let s: *mut Stream = stream_alloc(l, cb, ud)
+    if s as u64 == 0 {
+        return s
+    }
+    (*s).conn = c
+    net.set_nonblocking(&(*s).conn, true) catch false
+    net.set_no_delay(&(*s).conn, true) catch false
+    (*s).state = ST_OPEN
+    (*s).timeout_ms = timeout_ms
+    if !start_watch(s, loop.EV_READ) {
+        stream_release(s)
+        return 0 as *mut Stream
+    }
+    arm_timeout(s)
+    return s
+}
+
+fn start_watch(s: *mut Stream, ev: u32) -> bool {
+    (*s).interest = ev
+    (*s).h = loop.watch_add((*s).l, (*s).conn.fd, ev, on_fd, s as u64)
+    return (*s).h != 0
+}
+
+// ------------------------------------------------------------ Accessors
+
+fn stream_in_ptr(s: *mut Stream) -> u64 { return (*s).inb.ptr + (*s).inpos as u64 }
+fn stream_in_len(s: *mut Stream) -> usize { return (*s).inb.len - (*s).inpos }
+fn stream_out_pending(s: *mut Stream) -> usize {
+    var n: usize = (*s).outb.len - (*s).outpos
+    if (*s).secure {
+        n = n + tls.tls_out_pending(&(*s).t)
+    }
+    return n
+}
+fn stream_errno(s: *mut Stream) -> i64 { return (*s).errno }
+fn stream_tls_error(s: *mut Stream) -> u32 { return (*s).tlserr }
+fn stream_is_secure(s: *mut Stream) -> bool { return (*s).secure }
+fn stream_is_open(s: *mut Stream) -> bool { return (*s).state == ST_OPEN }
+fn stream_bytes_in(s: *mut Stream) -> u64 { return (*s).bytes_in }
+fn stream_bytes_out(s: *mut Stream) -> u64 { return (*s).bytes_out }
+fn stream_fd(s: *mut Stream) -> i32 { return (*s).conn.fd }
+fn stream_loop(s: *mut Stream) -> *mut loop.Loop { return (*s).l }
+fn stream_peer(s: *mut Stream) -> u32 { return (*s).conn.peer }
+fn stream_peer_port(s: *mut Stream) -> u16 { return (*s).conn.peer_port }
+fn stream_ud(s: *mut Stream) -> u64 { return (*s).ud }
+fn stream_set_ud(s: *mut Stream, ud: u64) { (*s).ud = ud }
+fn stream_set_max_in(s: *mut Stream, n: usize) { (*s).max_in = n }
+
+// A new owner for the events (a protocol layer taking over a stream).
+fn stream_set_callback(s: *mut Stream, cb: fn(*mut Stream, u64, u32, i64), ud: u64) {
+    (*s).cb = cb
+    (*s).ud = ud
+}
+
+// ----------------------------------------------------------------- Events
+
+fn emit(s: *mut Stream, kind: u32, arg: i64) {
+    (*s).busy = (*s).busy + 1
+    let cb: fn(*mut Stream, u64, u32, i64) = (*s).cb
+    cb(s, (*s).ud, kind, arg)
+    (*s).busy = (*s).busy - 1
+    if (*s).busy == 0 && (*s).state == ST_DEAD {
+        stream_release(s)
+    }
+}
+
+// Final: removes the watch and the timer, closes the socket, tells the
+// program once, frees the stream when no user callback is running.
+fn close_now(s: *mut Stream, reason: i64) {
+    if (*s).state == ST_DEAD {
+        return
+    }
+    (*s).reason = reason
+    if (*s).h != 0 {
+        loop.watch_del((*s).l, (*s).h)
+        (*s).h = 0
+    }
+    if (*s).timer != 0 {
+        loop.timer_cancel((*s).l, (*s).timer)
+        (*s).timer = 0
+    }
+    if (*s).secure && tls.tls_established(&(*s).t) && reason == CL_LOCAL {
+        tls.tls_close(&(*s).t) // close_notify, best effort
+    }
+    net.close(&(*s).conn)
+    (*s).state = ST_DEAD
+    emit(s, SE_CLOSED, reason)
+}
+
+fn fail_errno(s: *mut Stream, reason: i64) {
+    (*s).errno = 0 - (net.conn_error(&(*s).conn) as i64)
+    close_now(s, reason)
+}
+
+// --------------------------------------------------------------- Timeouts
+
+fn arm_timeout(s: *mut Stream) {
+    if (*s).timeout_ms <= 0 {
+        (*s).deadline = 0
+        return
+    }
+    (*s).deadline = loop.mono_ms() + (*s).timeout_ms
+    if (*s).timer == 0 {
+        (*s).timer = loop.timer_after((*s).l, (*s).timeout_ms, on_timer, s as u64)
+    }
+}
+
+// Activity: only a number changes.
+fn touch(s: *mut Stream) {
+    if (*s).timeout_ms > 0 {
+        (*s).deadline = loop.mono_ms() + (*s).timeout_ms
+    }
+}
+
+fn on_timer(l: *mut loop.Loop, ud: u64) {
+    let s: *mut Stream = ud as *mut Stream
+    (*s).timer = 0
+    if (*s).state == ST_DEAD || (*s).deadline == 0 {
+        return
+    }
+    let left: i64 = (*s).deadline - loop.mono_ms()
+    if left > 0 {
+        (*s).timer = loop.timer_after(l, left, on_timer, ud)
+        return
+    }
+    close_now(s, CL_TIMEOUT)
+}
+
+// 0 switches the timeout off.
+fn stream_set_timeout(s: *mut Stream, ms: i64) {
+    (*s).timeout_ms = ms
+    if ms <= 0 {
+        (*s).deadline = 0
+        return
+    }
+    (*s).deadline = loop.mono_ms() + ms
+    if (*s).timer == 0 {
+        (*s).timer = loop.timer_after((*s).l, ms, on_timer, s as u64)
+    }
+}
+
+// --------------------------------------------------------------- Interest
+
+fn want_events(s: *mut Stream) -> u32 {
+    var ev: u32 = 0
+    if (*s).state == ST_CONNECTING {
+        return loop.EV_WRITE
+    }
+    if (*s).state == ST_TLS {
+        ev = loop.EV_READ
+        if tls.tls_out_pending(&(*s).t) > 0 {
+            ev = ev | loop.EV_WRITE
+        }
+        return ev
+    }
+    if (*s).state == ST_OPEN {
+        if !(*s).paused && ((*s).inb.len - (*s).inpos) < (*s).max_in {
+            ev = loop.EV_READ
+        }
+    }
+    if stream_out_pending(s) > 0 {
+        ev = ev | loop.EV_WRITE
+    }
+    return ev
+}
+
+fn sync_interest(s: *mut Stream) {
+    if (*s).state == ST_DEAD || (*s).h == 0 {
+        return
+    }
+    let ev: u32 = want_events(s)
+    if ev != (*s).interest {
+        loop.watch_mod((*s).l, (*s).h, ev)
+        (*s).interest = ev
+    }
+}
+
+fn stream_pause_read(s: *mut Stream, on: bool) {
+    (*s).paused = on
+    sync_interest(s)
+}
+
+// Throws away the first `n` unread octets.
+fn stream_consume(s: *mut Stream, n: usize) {
+    var k: usize = n
+    let have: usize = (*s).inb.len - (*s).inpos
+    if k > have {
+        k = have
+    }
+    (*s).inpos = (*s).inpos + k
+    if (*s).inpos == (*s).inb.len {
+        rt.buf_clear(&(*s).inb)
+        (*s).inpos = 0
+    } else if (*s).inpos > 65536 && (*s).inpos * 2 > (*s).inb.len {
+        // S4: close the gap once more than half of the buffer is dead
+        let rest: usize = (*s).inb.len - (*s).inpos
+        rt.mem_copy((*s).inb.ptr, (*s).inb.ptr + (*s).inpos as u64, rest)
+        rt.buf_set_len(&(*s).inb, rest)
+        (*s).inpos = 0
+    }
+    sync_interest(s) // reading may resume
+}
+
+// ------------------------------------------------------------------ Output
+
+// Moves queued octets towards the socket. false = the stream failed and is
+// gone (close_now ran).
+fn flush(s: *mut Stream) -> bool {
+    if (*s).state == ST_CONNECTING || (*s).state == ST_TLS || (*s).state == ST_DEAD {
+        return true
+    }
+    if (*s).secure {
+        if !tls.tls_flush(&(*s).t) {
+            (*s).tlserr = 1
+            close_now(s, CL_ERROR)
+            return false
+        }
+        while (*s).outpos < (*s).outb.len && tls.tls_out_pending(&(*s).t) < TLS_OUT_HIGH {
+            var chunk: usize = (*s).outb.len - (*s).outpos
+            if chunk > 16384 {
+                chunk = 16384
+            }
+            let ok: bool = tls.tls_write(&(*s).t, (*s).outb.ptr + (*s).outpos as u64, chunk) catch false
+            if !ok {
+                (*s).tlserr = 1
+                close_now(s, CL_TLS)
+                return false
+            }
+            (*s).outpos = (*s).outpos + chunk
+            (*s).bytes_out = (*s).bytes_out + chunk as u64
+        }
+        if !tls.tls_flush(&(*s).t) {
+            (*s).tlserr = 1
+            close_now(s, CL_ERROR)
+            return false
+        }
+    } else {
+        while (*s).outpos < (*s).outb.len {
+            (*s).conn.err = 0
+            let k: usize = net.write_nb(&(*s).conn, (*s).outb.ptr + (*s).outpos as u64,
+                (*s).outb.len - (*s).outpos) catch NB_ERR
+            if k == NB_ERR {
+                if net.conn_error(&(*s).conn) == 0 - 11 {
+                    break
+                }
+                fail_errno(s, CL_ERROR)
+                return false
+            }
+            (*s).outpos = (*s).outpos + k
+            (*s).bytes_out = (*s).bytes_out + k as u64
+            touch(s)
+        }
+    }
+    if (*s).outpos == (*s).outb.len && (*s).outpos > 0 {
+        rt.buf_clear(&(*s).outb)
+        (*s).outpos = 0
+    }
+    return true
+}
+
+// Queues octets. Allowed in every state before the end (they leave once the
+// connection is up).
+fn stream_write(s: *mut Stream, p: u64, n: usize) -> bool {
+    if (*s).state == ST_DEAD || (*s).state == ST_CLOSING || n == 0 {
+        return (*s).state != ST_DEAD && (*s).state != ST_CLOSING
+    }
+    rt.buf_push_bytes(&(*s).outb, p, n)
+    if (*s).outb.len < n {
+        return false
+    }
+    if (*s).state == ST_OPEN {
+        (*s).want_drain = true
+        if !flush(s) {
+            return false
+        }
+        sync_interest(s)
+    }
+    return true
+}
+
+fn stream_write_str(s: *mut Stream, t: str) -> bool {
+    return stream_write(s, t.p as u64, t.n)
+}
+
+// Graceful: what is queued is sent first, then the stream closes with
+// CL_LOCAL (a TLS stream says close_notify).
+fn stream_close(s: *mut Stream) {
+    if (*s).state == ST_DEAD || (*s).state == ST_CLOSING {
+        return
+    }
+    if (*s).state != ST_OPEN || stream_out_pending(s) == 0 {
+        close_now(s, CL_LOCAL)
+        return
+    }
+    (*s).state = ST_CLOSING
+    sync_interest(s)
+}
+
+// At once; queued octets are lost.
+fn stream_abort(s: *mut Stream) {
+    close_now(s, CL_LOCAL)
+}
+
+// ------------------------------------------------------------------ Reading
+
+fn read_some(s: *mut Stream) {
+    var got: usize = 0
+    var total: usize = 0
+    while total < READ_BUDGET && ((*s).inb.len - (*s).inpos) < (*s).max_in {
+        let have: usize = (*s).inb.len
+        rt.buf_reserve(&(*s).inb, have + RD_CHUNK)
+        if (*s).inb.cap < have + RD_CHUNK {
+            close_now(s, CL_MEMORY)
+            return
+        }
+        var k: usize = 0
+        var would_block: bool = false
+        if (*s).secure {
+            let r: usize = tls.tls_read(&(*s).t, (*s).inb.ptr + have as u64, RD_CHUNK) catch NB_ERR
+            if r == NB_ERR {
+                // WouldBlock is the normal end of a burst; anything else is final
+                if tls.tls_closed(&(*s).t) {
+                    (*s).tlserr = tls.tls_alert_desc(&(*s).t)
+                    close_now(s, CL_TLS)
+                    return
+                }
+                would_block = true
+            } else {
+                k = r
+            }
+        } else {
+            (*s).conn.err = 0
+            let r2: usize = net.read_nb(&(*s).conn, (*s).inb.ptr + have as u64, RD_CHUNK) catch NB_ERR
+            if r2 == NB_ERR {
+                if net.conn_error(&(*s).conn) == 0 - 11 {
+                    would_block = true
+                } else {
+                    fail_errno(s, CL_ERROR)
+                    return
+                }
+            } else {
+                k = r2
+            }
+        }
+        if would_block {
+            break
+        }
+        if k == 0 {
+            // end of stream: deliver what is there, then close
+            if (*s).inb.len - (*s).inpos > 0 && got > 0 {
+                emit(s, SE_DATA, ((*s).inb.len - (*s).inpos) as i64)
+            }
+            if (*s).state != ST_DEAD {
+                close_now(s, CL_EOF)
+            }
+            return
+        }
+        rt.buf_set_len(&(*s).inb, have + k)
+        (*s).bytes_in = (*s).bytes_in + k as u64
+        got = got + k
+        total = total + k
+        touch(s)
+    }
+    if got > 0 {
+        emit(s, SE_DATA, ((*s).inb.len - (*s).inpos) as i64)
+    }
+}
+
+// ------------------------------------------------------------ The fd event
+
+// The loop's callback. While it runs `busy` is raised, so that a close
+// somewhere inside (which tells the program and would free the stream)
+// frees it only HERE, after the last access.
+fn on_fd(l: *mut loop.Loop, ud: u64, ev: u32) {
+    let s: *mut Stream = ud as *mut Stream
+    (*s).busy = (*s).busy + 1
+    on_fd_inner(s, ev)
+    (*s).busy = (*s).busy - 1
+    if (*s).busy == 0 && (*s).state == ST_DEAD {
+        stream_release(s)
+    }
+}
+
+fn on_fd_inner(s: *mut Stream, ev: u32) {
+    if (*s).state == ST_DEAD {
+        return
+    }
+    if (*s).state == ST_CONNECTING {
+        var e: i64 = 0
+        let ok: bool = net.connect_finish(&(*s).conn, &e) catch false
+        if !ok {
+            (*s).errno = e
+            close_now(s, CL_CONNECT)
+            return
+        }
+        touch(s)
+        if (*s).secure {
+            tls.tls_set_nonblocking(&(*s).t, true)
+            if !tls.tls_init(&(*s).t, &(*s).conn, (*s).store, (&(*s).host[0]) as u64,
+                (*s).hostlen, (*s).now) {
+                close_now(s, CL_TLS)
+                return
+            }
+            (*s).state = ST_TLS
+            tls_step(s)
+            return
+        }
+        (*s).state = ST_OPEN
+        sync_interest(s)
+        emit(s, SE_CONNECTED, 0)
+        if (*s).state == ST_DEAD {
+            return
+        }
+        if (*s).outb.len > (*s).outpos {
+            if !flush(s) {
+                return
+            }
+        }
+        sync_interest(s)
+        return
+    }
+    if (*s).state == ST_TLS {
+        tls_step(s)
+        return
+    }
+    // ST_OPEN and ST_CLOSING
+    if (ev & (loop.EV_WRITE)) != 0 {
+        let before: usize = stream_out_pending(s)
+        if !flush(s) {
+            return
+        }
+        if stream_out_pending(s) == 0 {
+            if (*s).state == ST_CLOSING {
+                close_now(s, CL_LOCAL)
+                return
+            }
+            if (*s).want_drain && before > 0 {
+                (*s).want_drain = false
+                emit(s, SE_DRAINED, 0)
+                if (*s).state == ST_DEAD {
+                    return
+                }
+            }
+        }
+    }
+    if (*s).state == ST_OPEN && (ev & (loop.EV_READ | loop.EV_ERR | loop.EV_HUP)) != 0 {
+        read_some(s)
+        if (*s).state == ST_DEAD {
+            return
+        }
+    }
+    // a write that finished synchronously (stream_write flushed it all)
+    if (*s).state == ST_OPEN && (*s).want_drain && stream_out_pending(s) == 0 {
+        (*s).want_drain = false
+        emit(s, SE_DRAINED, 0)
+        if (*s).state == ST_DEAD {
+            return
+        }
+    }
+    sync_interest(s)
+}
+
+fn tls_step(s: *mut Stream) {
+    let done: bool = tls.tls_handshake_step(&(*s).t) catch |e| tls.tls_note_error(&(*s).tlserr, e)
+    if !done {
+        // WouldBlock (tlserr stays 0): wait for more octets. Anything else
+        // is final.
+        if (*s).tlserr != 0 {
+            close_now(s, CL_TLS)
+            return
+        }
+        if !tls.tls_flush(&(*s).t) {
+            close_now(s, CL_ERROR)
+            return
+        }
+        touch(s)
+        sync_interest(s)
+        return
+    }
+    touch(s)
+    (*s).state = ST_OPEN
+    if !tls.tls_flush(&(*s).t) {
+        close_now(s, CL_ERROR)
+        return
+    }
+    sync_interest(s)
+    emit(s, SE_CONNECTED, 0)
+    if (*s).state == ST_DEAD {
+        return
+    }
+    if (*s).outb.len > (*s).outpos {
+        if !flush(s) {
+            return
+        }
+    }
+    // octets that arrived together with the last handshake record
+    read_some(s)
+    if (*s).state != ST_DEAD {
+        sync_interest(s)
+    }
+}
+
+// ---------------------------------------------------------------- Acceptor
+
+// Listens on addr:port (port 0 = the kernel picks one: `acceptor_port`).
+// For every connection `cb(loop, ud, conn)` is called with a non-blocking
+// connection; hand it to `stream_adopt`. 0 = could not listen.
+fn acceptor_new(l: *mut loop.Loop, addr: u32, port: u16, backlog: i32,
+    cb: fn(*mut loop.Loop, u64, net.Conn), ud: u64) -> *mut Acceptor {
+    let lst: net.Listener = net.listener_new_nb(addr, port, backlog) catch net.listener_from_fd(0 - 1)
+    if !net.listener_is_open(&lst) {
+        return 0 as *mut Acceptor
+    }
+    let p: u64 = obj_alloc[Acceptor]()
+    if p == 0 {
+        var l2: net.Listener = lst
+        net.close_listener(&l2)
+        return 0 as *mut Acceptor
+    }
+    let a: *mut Acceptor = p as *mut Acceptor
+    *a = Acceptor { l: l, lst: lst, h: 0, cb: cb, ud: ud, accepted: 0 }
+    (*a).h = loop.watch_add(l, net.listener_fd(&(*a).lst), loop.EV_READ, on_accept, p)
+    if (*a).h == 0 {
+        net.close_listener(&(*a).lst)
+        obj_free[Acceptor](p)
+        return 0 as *mut Acceptor
+    }
+    return a
+}
+
+fn on_accept(l: *mut loop.Loop, ud: u64, ev: u32) {
+    let a: *mut Acceptor = ud as *mut Acceptor
+    var n: usize = 0
+    while n < 128 {
+        let c: net.Conn = net.accept_nb(&(*a).lst) catch net.conn_from_fd(0 - 1)
+        if !net.conn_is_open(&c) {
+            break // WouldBlock, or a failed accept: the next event tells
+        }
+        (*a).accepted = (*a).accepted + 1
+        let cb: fn(*mut loop.Loop, u64, net.Conn) = (*a).cb
+        cb(l, (*a).ud, c)
+        n = n + 1
+    }
+}
+
+fn acceptor_port(a: *mut Acceptor) -> u16 { return net.listener_port(&(*a).lst) }
+fn acceptor_count(a: *mut Acceptor) -> u64 { return (*a).accepted }
+
+// Stops listening and frees the acceptor (streams already accepted live on).
+fn acceptor_close(a: *mut Acceptor) {
+    loop.watch_del((*a).l, (*a).h)
+    net.close_listener(&(*a).lst)
+    obj_free[Acceptor](a as u64)
+}

@@ -1,0 +1,347 @@
+// expect_exit: 0
+// tests/2120_async_loop.fi -- async.loop: timers, defer, watches, wake-up.
+// Both backends (epoll and poll) run the same checks.
+//
+// A  timers fire in order of their time, equal times in the order they were set
+// B  a cancelled timer never fires; cancel twice is harmless; a stale handle is ignored
+// C  timer_every repeats and can cancel itself; no early firing
+// D  defer_call runs in the NEXT round, never inside the caller
+// E  a timer set by a callback with 0 ms does not run in the same round
+// F  watches: accept, connect, read, write through the loop; a watch deleted
+//    by another callback in the same round gets no stale event
+// G  wake() makes a sleeping loop return (and is counted)
+// H  loop_fd() of the epoll backend is readable when a watch is ready
+// I  run() returns by itself when nothing is left
+import std.rt
+import std.net
+import async.loop
+
+static mut order: [u32; 16] = [0; 16]
+static mut norder: usize = 0
+static mut hits: u32 = 0
+static mut fails: u32 = 0
+static mut deferred_a: u32 = 0
+static mut deferred_b: u32 = 0
+static mut round_seen: u64 = 0
+
+fn check(ok: bool, code: u32) {
+    if !ok {
+        fails = fails + 1
+        let m: [u8; 5] = "FAIL "
+        syscall(1, 2, (&m[0]) as i64, 5, 0, 0, 0)
+        var d: [u8; 4] = [48, 48, 48, 10]
+        d[0] = (48 + (code / 100) % 10) as u8
+        d[1] = (48 + (code / 10) % 10) as u8
+        d[2] = (48 + code % 10) as u8
+        syscall(1, 2, (&d[0]) as i64, 4, 0, 0, 0)
+    }
+}
+
+fn note(ud: u64) {
+    if norder < 16 {
+        order[norder] = ud as u32
+        norder = norder + 1
+    }
+}
+
+fn t_note(l: *mut loop.Loop, ud: u64) { note(ud) }
+
+fn t_hit(l: *mut loop.Loop, ud: u64) { hits = hits + 1 }
+
+fn t_never(l: *mut loop.Loop, ud: u64) { fails = fails + 1 }
+
+fn t_stop(l: *mut loop.Loop, ud: u64) { loop.stop(l) }
+
+// ---- C
+static mut every_h: u64 = 0
+static mut every_n: u32 = 0
+static mut every_t0: i64 = 0
+static mut every_early: bool = false
+
+fn t_every(l: *mut loop.Loop, ud: u64) {
+    every_n = every_n + 1
+    // the 1st firing after >= 20 ms, the 3rd after >= 60 ms
+    let el: i64 = loop.mono_ms() - every_t0
+    if el + 2 < (every_n as i64) * 20 {
+        every_early = true
+    }
+    if every_n == 3 {
+        loop.timer_cancel(l, every_h)
+    }
+}
+
+// ---- D / E
+fn d_second(l: *mut loop.Loop, ud: u64) {
+    deferred_b = deferred_b + 1
+    round_seen = loop.stat_rounds(l)
+}
+
+fn d_first(l: *mut loop.Loop, ud: u64) {
+    deferred_a = deferred_a + 1
+    // queued from inside a deferred call: must run in a LATER round
+    loop.defer_call(l, d_second, 0)
+    if deferred_b != 0 {
+        fails = fails + 1
+    }
+}
+
+static mut zero_round: u64 = 0
+static mut zero_fired_round: u64 = 0
+
+fn z_inner(l: *mut loop.Loop, ud: u64) {
+    zero_fired_round = loop.stat_rounds(l)
+}
+
+fn z_outer(l: *mut loop.Loop, ud: u64) {
+    zero_round = loop.stat_rounds(l)
+    loop.timer_after(l, 0, z_inner, 0)
+}
+
+// ---- F
+struct Pair {
+    lst: net.Listener,
+    srv: net.Conn,
+    cli: net.Conn,
+    got_srv: u32,
+    got_cli: u32,
+    accepted: bool,
+    h_lst: u64,
+    h_srv: u64,
+    h_cli: u64,
+    stale: u32,
+    wrote: bool,
+    connected: bool,
+}
+
+fn on_listen(l: *mut loop.Loop, ud: u64, ev: u32) {
+    let p: *mut Pair = ud as *mut Pair
+    let c: net.Conn = net.accept_nb(&(*p).lst) catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&c) {
+        return
+    }
+    (*p).srv = c
+    (*p).accepted = true
+    (*p).h_srv = loop.watch_add(l, c.fd, loop.EV_READ, on_srv, ud)
+    loop.watch_mod(l, (*p).h_lst, 0)
+}
+
+fn on_srv(l: *mut loop.Loop, ud: u64, ev: u32) {
+    let p: *mut Pair = ud as *mut Pair
+    var buf: [u8; 64] = [0; 64]
+    let n: usize = net.read_nb(&(*p).srv, (&buf[0]) as u64, 64) catch 0
+    if n > 0 {
+        (*p).got_srv = (*p).got_srv + n as u32
+        // answer, then delete the CLIENT's watch from here: if the client
+        // socket is ready in this very round it must not be called again
+        net.write_nb(&(*p).srv, (&buf[0]) as u64, n) catch 0
+    }
+}
+
+fn on_cli(l: *mut loop.Loop, ud: u64, ev: u32) {
+    let p: *mut Pair = ud as *mut Pair
+    if !(*p).connected {
+        // writable: the connect is finished
+        var e: i64 = 0
+        let ok: bool = net.connect_finish(&(*p).cli, &e) catch false
+        if !ok {
+            fails = fails + 1
+            loop.stop(l)
+            return
+        }
+        (*p).connected = true
+        loop.watch_mod(l, (*p).h_cli, loop.EV_READ)
+        let msg: [u8; 5] = "hello"
+        net.write_nb(&(*p).cli, (&msg[0]) as u64, 5) catch 0
+        return
+    }
+    var buf: [u8; 64] = [0; 64]
+    let n: usize = net.read_nb(&(*p).cli, (&buf[0]) as u64, 64) catch 0
+    if n > 0 {
+        (*p).got_cli = (*p).got_cli + n as u32
+        loop.stop(l)
+    }
+}
+
+// ---- G
+static mut woke_ok: bool = false
+
+fn w_check(l: *mut loop.Loop, ud: u64) {
+    woke_ok = loop.stat_wakes(l) >= 1
+    loop.stop(l)
+}
+
+fn w_wake(l: *mut loop.Loop, ud: u64) {
+    loop.wake(l)
+}
+
+#[allow_escape]
+fn suite(force_poll: bool) {
+    var l: loop.Loop = loop.loop_new()
+    var ok: bool = false
+    if force_poll {
+        ok = loop.loop_init_poll(&l)
+    } else {
+        ok = loop.loop_init(&l)
+    }
+    check(ok, 1)
+    if force_poll {
+        check(!loop.is_epoll(&l), 3)
+    }
+
+    // ---- A: order
+    norder = 0
+    loop.timer_after(&l, 30, t_note, 30)
+    loop.timer_after(&l, 10, t_note, 10)
+    loop.timer_after(&l, 20, t_note, 21)
+    loop.timer_after(&l, 20, t_note, 22)
+    loop.timer_after(&l, 20, t_note, 23)
+    let t0: i64 = loop.mono_ms()
+    loop.run(&l)
+    let el: i64 = loop.mono_ms() - t0
+    check(norder == 5, 10)
+    check(order[0] == 10 && order[1] == 21 && order[2] == 22 && order[3] == 23 && order[4] == 30, 11)
+    check(el >= 29 && el < 400, 12)
+    check(loop.timer_count(&l) == 0, 13)
+
+    // ---- B: cancel
+    hits = 0
+    let hc: u64 = loop.timer_after(&l, 10, t_never, 0)
+    let hk: u64 = loop.timer_after(&l, 15, t_hit, 0)
+    check(loop.timer_cancel(&l, hc), 20)
+    check(!loop.timer_cancel(&l, hc), 21)
+    check(!loop.timer_cancel(&l, 0), 22)
+    loop.run(&l)
+    check(hits == 1, 23)
+    check(!loop.timer_cancel(&l, hk), 24) // already fired
+
+    // ---- C: every
+    every_n = 0
+    every_early = false
+    every_t0 = loop.mono_ms()
+    every_h = loop.timer_every(&l, 20, t_every, 0)
+    loop.run(&l)
+    check(every_n == 3, 30)
+    check(!every_early, 31)
+
+    // ---- D: defer
+    deferred_a = 0
+    deferred_b = 0
+    loop.defer_call(&l, d_first, 0)
+    check(deferred_a == 0, 40)
+    let r0: u64 = loop.stat_rounds(&l)
+    loop.run(&l)
+    check(deferred_a == 1 && deferred_b == 1, 41)
+    check(round_seen > r0 + 1, 42)
+
+    // ---- E: a 0 ms timer set by a callback runs in a later round
+    loop.timer_after(&l, 0, z_outer, 0)
+    loop.run(&l)
+    check(zero_fired_round > zero_round, 50)
+
+    // ---- F: sockets through the loop
+    var p: Pair = Pair { lst: net.listener_from_fd(0 - 1), srv: net.conn_from_fd(0 - 1),
+        cli: net.conn_from_fd(0 - 1), got_srv: 0, got_cli: 0, accepted: false,
+        h_lst: 0, h_srv: 0, h_cli: 0, stale: 0, wrote: false, connected: false }
+    p.lst = net.listener_new_nb(net.ADDR_LOCAL, 0 as u16, 16) catch net.listener_from_fd(0 - 1)
+    check(net.listener_is_open(&p.lst), 60)
+    p.h_lst = loop.watch_add(&l, net.listener_fd(&p.lst), loop.EV_READ, on_listen, (&p) as u64)
+    check(p.h_lst != 0, 61)
+    var pending: bool = false
+    var err: i64 = 0
+    p.cli = net.connect_nb(net.ADDR_LOCAL, net.listener_port(&p.lst), &pending, &err) catch net.conn_from_fd(0 - 1)
+    check(net.conn_is_open(&p.cli), 62)
+    p.h_cli = loop.watch_add(&l, p.cli.fd, loop.EV_WRITE, on_cli, (&p) as u64)
+    check(p.h_cli != 0, 63)
+    let safety: u64 = loop.timer_after(&l, 3000, t_stop, 0) // never hangs the test
+    check(loop.watch_count(&l) == 2, 64)
+    loop.run(&l)
+    check(p.accepted && p.connected, 65)
+    check(p.got_srv == 5 && p.got_cli == 5, 66)
+    check(loop.timer_cancel(&l, safety), 68) // the safety timer is still pending
+    loop.watch_del(&l, p.h_srv)
+    loop.watch_del(&l, p.h_cli)
+    loop.watch_del(&l, p.h_lst)
+    loop.watch_del(&l, p.h_lst) // twice is harmless
+    check(loop.watch_count(&l) == 0, 67)
+
+    // stale events: two readable watches, the first deletes the second
+    var q: Pair = Pair { lst: net.listener_from_fd(0 - 1), srv: net.conn_from_fd(0 - 1),
+        cli: net.conn_from_fd(0 - 1), got_srv: 0, got_cli: 0, accepted: false,
+        h_lst: 0, h_srv: 0, h_cli: 0, stale: 0, wrote: false, connected: false }
+    let lst2: net.Listener = net.listener_new_nb(net.ADDR_LOCAL, 0 as u16, 16) catch net.listener_from_fd(0 - 1)
+    q.lst = lst2
+    var pend2: bool = false
+    var e2: i64 = 0
+    var ca: net.Conn = net.connect_nb(net.ADDR_LOCAL, net.listener_port(&q.lst), &pend2, &e2) catch net.conn_from_fd(0 - 1)
+    var cb: net.Conn = net.connect_nb(net.ADDR_LOCAL, net.listener_port(&q.lst), &pend2, &e2) catch net.conn_from_fd(0 - 1)
+    check(net.conn_is_open(&ca) && net.conn_is_open(&cb), 70)
+    // two pending connections: the listener watch fires once per accept;
+    // use two listeners' worth by watching the listener twice is not possible,
+    // so watch the two CLIENT sockets for writability (both are writable at once)
+    q.h_srv = loop.watch_add(&l, ca.fd, loop.EV_WRITE, on_stale_del, (&q) as u64)
+    q.h_cli = loop.watch_add(&l, cb.fd, loop.EV_WRITE, on_stale_del, (&q) as u64)
+    loop.run_once(&l, 100)
+    // both sockets are writable in the same round; whichever callback comes
+    // first deletes BOTH watches, so the second event must be dropped
+    check(q.stale == 1, 71)
+    loop.watch_del(&l, q.h_srv)
+    loop.watch_del(&l, q.h_cli)
+    net.close(&ca)
+    net.close(&cb)
+    net.close_listener(&q.lst)
+    net.close(&p.srv)
+    net.close(&p.cli)
+    net.close_listener(&p.lst)
+
+    // ---- G: wake
+    woke_ok = false
+    loop.timer_after(&l, 10, w_wake, 0)
+    loop.timer_after(&l, 40, w_check, 0)
+    loop.run(&l)
+    check(woke_ok, 80)
+
+    // ---- H: loop_fd is readable when a watch is ready
+    if loop.is_epoll(&l) {
+        let lf: i32 = loop.loop_fd(&l)
+        check(lf >= 0, 90)
+        var lst3: net.Listener = net.listener_new_nb(net.ADDR_LOCAL, 0 as u16, 4) catch net.listener_from_fd(0 - 1)
+        let hl: u64 = loop.watch_add(&l, net.listener_fd(&lst3), loop.EV_READ, on_nop, 0)
+        var pp: [i32; 2] = [lf, 1]
+        var r0b: i64 = syscall(7, (&pp[0]) as i64, 1, 0, 0, 0, 0)
+        check(r0b == 0, 91) // nothing ready
+        var pend3: bool = false
+        var e3: i64 = 0
+        var cc: net.Conn = net.connect_nb(net.ADDR_LOCAL, net.listener_port(&lst3), &pend3, &e3) catch net.conn_from_fd(0 - 1)
+        pp[1] = 1
+        var r1b: i64 = syscall(7, (&pp[0]) as i64, 1, 1000, 0, 0, 0)
+        check(r1b == 1, 92) // the loop's descriptor says: look
+        loop.watch_del(&l, hl)
+        net.close(&cc)
+        net.close_listener(&lst3)
+    }
+
+    // ---- I: run() with nothing registered returns at once
+    let t1: i64 = loop.mono_ms()
+    loop.run(&l)
+    check(loop.mono_ms() - t1 < 100, 95)
+
+    loop.loop_free(&l)
+}
+
+fn on_nop(l: *mut loop.Loop, ud: u64, ev: u32) { }
+
+fn on_stale_del(l: *mut loop.Loop, ud: u64, ev: u32) {
+    let q: *mut Pair = ud as *mut Pair
+    (*q).stale = (*q).stale + 1
+    loop.watch_del(l, (*q).h_srv)
+    loop.watch_del(l, (*q).h_cli)
+}
+
+fn main() -> i32 {
+    suite(false)
+    suite(true)
+    if fails != 0 {
+        return 1
+    }
+    return 0
+}

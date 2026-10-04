@@ -84,6 +84,7 @@ pub const BASELINE: &[&str] = &[
     "accept",
     "setsockopt",
     "getsockname",
+    "getsockopt",
     // ROUND CERTUS-WINDOWS: the address carrying forms and `select`.
     "sendto",
     "recvfrom",
@@ -154,6 +155,7 @@ extern fn shutdown(s: i64, how: i64) -> i32;
 extern fn bind(s: i64, a: u64, n: i64) -> i32;
 extern fn listen(s: i64, back: i64) -> i32;
 extern fn accept(s: i64, a: u64, n: u64) -> i64;
+extern fn getsockopt(s: i64, lvl: i64, opt: i64, val: u64, len: u64) -> i32;
 extern fn setsockopt(s: i64, lvl: i64, opt: i64, v: u64, n: i64) -> i32;
 extern fn getsockname(s: i64, a: u64, n: u64) -> i32;
 extern fn sendto(s: i64, b: u64, n: i64, f: i64, a: u64, al: i64) -> i32;
@@ -1681,6 +1683,39 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
         }
         if setsockopt(__win_handle(a1), lvl, opt, val, len) != 0 {
             return __win_sockerrno()
+        }
+        return 0
+    }
+    if nr == 55 {
+        // getsockopt(fd, level, name, value, lenp). Only what the event
+        // loop needs: SO_ERROR (the result of a non-blocking connect),
+        // mapped to the Linux errno numbers like every other socket error.
+        if __win_kind_of(a1) != 2 {
+            return 0 - 88
+        }
+        var glvl: i64 = a2
+        var gopt: i64 = a3
+        if glvl == 1 {
+            glvl = 65535
+            if gopt == 4 { gopt = 4103 } // SO_ERROR 0x1007
+            if gopt == 2 { gopt = 4 }
+            if gopt == 9 { gopt = 8 }
+        }
+        if getsockopt(__win_handle(a1), glvl, gopt, a4 as u64, a5 as u64) != 0 {
+            return __win_sockerrno()
+        }
+        if a2 == 1 && a3 == 4 {
+            // the VALUE is a Windows error code: turn it into an errno
+            let vp: *mut i32 = a4 as *mut i32
+            let w: i64 = (*vp) as i64
+            if w == 10061 { *vp = 111 }
+            if w == 10060 { *vp = 110 }
+            if w == 10065 { *vp = 113 }
+            if w == 10051 { *vp = 101 }
+            if w == 10054 { *vp = 104 }
+            if w == 10053 { *vp = 103 }
+            if w == 10035 { *vp = 11 }
+            if w == 10048 { *vp = 98 }
         }
         return 0
     }
