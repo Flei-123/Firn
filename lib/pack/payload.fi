@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/pack/payload.fi -- the installer's payload: a ZIP appended to the
+// installer program, found again through a 64 octet trailer.
+//
+//   [ installer program ][ payload.zip ][ trailer, 64 octets ]
+//
+//   trailer   0   8   "FIRNPAK1"
+//             8   8   payload offset  (u64 little endian) = size of the program
+//             16  8   payload length  (u64)
+//             24  32  SHA-256 of the payload
+//             56  8   zero
+//
+// The program part is what `uninstall.exe` is made of (the installer without
+// payload and trailer), so the uninstaller is only a few hundred KiB.
+//
+// The payload is an ordinary ZIP (deflate) with the program's files and one
+// text entry, `.pack/info`, one `key=value` per line:
+//
+//   id=myapp                         store/registry key (letters, digits, -)
+//   name=My App                      shown to people
+//   version=1.2.3
+//   vendor=FleiTec                   Publisher in "Apps & features"
+//   exe=myapp.exe                    the program, relative to the install dir
+//   icon=myapp.ico                   optional, relative; shortcuts show it
+//   url=https://example.org/         optional, "About" link
+//   desktop=1                        desktop shortcut checked by default (0/1)
+//   launch=1                         "start it now" offered at the end (0/1)
+//
+// tools/pack/pack.py writes both (`pack.py win-installer`); `payload_find`
+// is what the installer does first: it refuses a file with no trailer, a
+// wrong length or a hash that does not match -- a truncated download never
+// installs half a program.
+import std.rt
+import std.crypto.sha256
+import zip.zip
+import appkit.util
+
+export {
+    Payload, Info, payload_find, trailer_make, info_parse, info_from_payload,
+    TRAILER_SIZE,
+}
+
+const TRAILER_SIZE: usize = 64
+
+struct Payload {
+    off: usize,
+    len: usize,
+}
+
+struct Info {
+    id: str,
+    name: str,
+    version: str,
+    vendor: str,
+    exe: str,
+    icon: str,
+    url: str,
+    desktop: bool,
+    launch: bool,
+}
+
+fn info_blank() -> Info {
+    return Info { id: "", name: "", version: "", vendor: "", exe: "", icon: "", url: "",
+        desktop: true, launch: true }
+}
+
+fn le64(p: u64, off: usize) -> u64 {
+    var v: u64 = 0 as u64
+    var i: usize = 8
+    while i > 0 {
+        i = i - 1
+        v = (v << 8) | (rt.ld8(p, off + i) as u64)
+    }
+    return v
+}
+
+fn put_le64(b: *mut rt.Buf, v: u64) {
+    var i: usize = 0
+    while i < 8 {
+        rt.buf_push(b, ((v >> (8 * i as u64)) & 255 as u64) as u8)
+        i = i + 1
+    }
+}
+
+// the 64 octets for a payload of `len` octets that starts at `off` (its
+// SHA-256 is computed here)
+fn trailer_make(out: *mut rt.Buf, off: usize, len: usize, payload: u64) {
+    rt.buf_push_bytes(out, "FIRNPAK1".p as u64, 8)
+    put_le64(out, off as u64)
+    put_le64(out, len as u64)
+    var h: [u8; 32] = [0 as u8; 32]
+    sha256.sha256(payload, len, (&h[0]) as u64)
+    rt.buf_push_bytes(out, (&h[0]) as u64, 32)
+    put_le64(out, 0 as u64)
+}
+
+// Locate and check the payload of the file p[0, n): magic, bounds, SHA-256.
+fn payload_find(p: u64, n: usize, out: *mut Payload) -> bool {
+    if n < TRAILER_SIZE + 22 {
+        return false
+    }
+    let t: u64 = p + (n - TRAILER_SIZE) as u64
+    if !rt.mem_eq(t, "FIRNPAK1".p as u64, 8) {
+        return false
+    }
+    let off: u64 = le64(t, 8)
+    let len: u64 = le64(t, 16)
+    if off > n as u64 || len > n as u64 || off + len + TRAILER_SIZE as u64 != n as u64 {
+        return false
+    }
+    var h: [u8; 32] = [0 as u8; 32]
+    sha256.sha256(p + off, len as usize, (&h[0]) as u64)
+    if !rt.mem_eq((&h[0]) as u64, t + 24 as u64, 32) {
+        return false
+    }
+    (*out).off = off as usize
+    (*out).len = len as usize
+    return true
+}
+
+fn trim_end(s: str) -> str {
+    var n: usize = s.n
+    while n > 0 && (rt.ld8(s.p as u64, n - 1) == 13 as u8 || rt.ld8(s.p as u64, n - 1) == 32 as u8) {
+        n = n - 1
+    }
+    return str { p: s.p, n: n }
+}
+
+fn copy_str(s: str) -> str {
+    return __str_copy(s)
+}
+
+fn is_true(v: str) -> bool {
+    return v == "1" || v == "yes" || v == "true"
+}
+
+// parse the text of `.pack/info`; false when id, name, version or exe is missing
+fn info_parse(p: u64, n: usize, out: *mut Info) -> bool {
+    var inf: Info = info_blank()
+    var at: usize = 0
+    while at < n {
+        var e: usize = at
+        while e < n && rt.ld8(p, e) != 10 as u8 {
+            e = e + 1
+        }
+        let line: str = trim_end(str { p: (p + at as u64) as *mut u8, n: e - at })
+        let eq: usize = util.find_byte(line, 61 as u8)
+        if eq < line.n && line.n > 0 && rt.ld8(line.p as u64, 0) != 35 as u8 {
+            let k: str = str { p: line.p, n: eq }
+            let v: str = copy_str(str { p: (line.p as u64 + (eq + 1) as u64) as *mut u8, n: line.n - eq - 1 })
+            if k == "id" { inf.id = v }
+            else if k == "name" { inf.name = v }
+            else if k == "version" { inf.version = v }
+            else if k == "vendor" { inf.vendor = v }
+            else if k == "exe" { inf.exe = v }
+            else if k == "icon" { inf.icon = v }
+            else if k == "url" { inf.url = v }
+            else if k == "desktop" { inf.desktop = is_true(v) }
+            else if k == "launch" { inf.launch = is_true(v) }
+        }
+        at = e + 1
+    }
+    if inf.id.n == 0 || inf.name.n == 0 || inf.version.n == 0 || inf.exe.n == 0 {
+        return false
+    }
+    // the id becomes a registry key and a file name: letters, digits, '-', '_', '.'
+    var i: usize = 0
+    while i < inf.id.n {
+        let c: u8 = rt.ld8(inf.id.p as u64, i)
+        let ok: bool = (c >= 48 as u8 && c <= 57 as u8) || (c >= 97 as u8 && c <= 122 as u8) ||
+            (c >= 65 as u8 && c <= 90 as u8) || c == 45 as u8 || c == 95 as u8 || c == 46 as u8
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    *out = inf
+    return true
+}
+
+// read `.pack/info` out of the payload zip p[0, n)
+fn info_from_payload(p: u64, n: usize, out: *mut Info) -> bool {
+    var failed: bool = false
+    var z: zip.ZipReader = zip.zip_reader_open(p, n) catch | e | (zr_fail(e, &failed))
+    if failed {
+        return false
+    }
+    let idx: i64 = zip.zip_find(&z, ".pack/info")
+    if idx < 0 {
+        zip.zip_reader_free(&z)
+        return false
+    }
+    var text: rt.Buf = rt.buf_new()
+    zip.zip_extract(&z, idx as usize, &text) catch | e2 | (zn_fail(e2, &failed))
+    var ok: bool = false
+    if !failed {
+        ok = info_parse(rt.buf_ptr(&text), rt.buf_len(&text), out)
+    }
+    rt.buf_free(&text)
+    zip.zip_reader_free(&z)
+    return ok
+}
+
+fn zr_fail(e: ZipError, failed: *mut bool) -> zip.ZipReader {
+    *failed = true
+    return zip.zip_reader_empty()
+}
+
+fn zn_fail(e: ZipError, failed: *mut bool) -> usize {
+    *failed = true
+    return 0
+}

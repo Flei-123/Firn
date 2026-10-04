@@ -1,0 +1,416 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/pack/lnk.fi -- Windows shortcuts (.lnk) written as plain octets.
+//
+// No COM, no IShellLink, no Windows: the Shell Link format is a documented
+// binary layout ([MS-SHLLINK]), so a program can write the file itself -- on
+// Windows (the installer does) and on Linux (a build script can make a
+// shortcut for a zip). Round trip: `lnk_read` reads back what `lnk_build`
+// wrote.
+//
+//     var s: lnk.LnkSpec = lnk.lnk_spec("C:\\Users\\me\\App\\app.exe")
+//     s.workdir = "C:\\Users\\me\\App"
+//     s.desc = "My App"
+//     var out: rt.Buf = rt.buf_new()
+//     lnk.lnk_build(&out, &s)            // -> the octets of "My App.lnk"
+//
+// WHAT IS IN THE FILE
+//   header (76)          flags, show command (1 = normal), no times
+//   LinkTargetIDList     My Computer / drive / one item per path component,
+//                        only when the whole target is plain ASCII (an item
+//                        stores its name as ANSI; Explorer rebuilds the list
+//                        from the path when it is missing)
+//   LinkInfo             volume (fixed drive) + local base path, ANSI and
+//                        UTF-16 -- this is what resolves the target
+//   StringData           (UTF-16) description, working directory, arguments,
+//                        icon location
+//   no ExtraData         (the terminal block only), link tracking is off
+//
+// Paths are absolute with a drive letter (`C:\...`, slashes are turned into
+// backslashes); a UNC target is refused (`lnk_build` returns false).
+//
+// NOT SEEN ON A REAL WINDOWS: the layout follows the specification and is
+// read back here (tests/2200) and by Wine's own shell link code
+// (tools/pack/test_windows.sh); that Explorer shows exactly the icon and
+// text is only established for Wine.
+import std.rt
+import appkit.util
+
+export {
+    LnkSpec, lnk_spec, lnk_build, lnk_read,
+    LNK_TARGET, LNK_DESC, LNK_WORKDIR, LNK_ARGS, LNK_ICON,
+}
+
+const LNK_TARGET: u32 = 0
+const LNK_DESC: u32 = 1
+const LNK_WORKDIR: u32 = 2
+const LNK_ARGS: u32 = 3
+const LNK_ICON: u32 = 4
+
+const LF_IDLIST: u32 = 1
+const LF_LINKINFO: u32 = 2
+const LF_NAME: u32 = 4
+const LF_WORKDIR: u32 = 16
+const LF_ARGS: u32 = 32
+const LF_ICON: u32 = 64
+const LF_UNICODE: u32 = 128
+const LF_NOTRACK: u32 = 262144
+
+struct LnkSpec {
+    target: str,
+    args: str,
+    workdir: str,
+    icon: str,
+    desc: str,
+    icon_index: i32,
+    show: u32,
+}
+
+fn lnk_spec(target: str) -> LnkSpec {
+    return LnkSpec { target: target, args: "", workdir: "", icon: "", desc: "",
+        icon_index: 0, show: 1 as u32 }
+}
+
+fn w8(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255 as u32) as u8)
+}
+
+fn w16(b: *mut rt.Buf, v: u32) {
+    w8(b, v)
+    w8(b, v >> 8)
+}
+
+fn w32(b: *mut rt.Buf, v: u32) {
+    w16(b, v & 65535 as u32)
+    w16(b, v >> 16)
+}
+
+fn wzero(b: *mut rt.Buf, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(b, 0 as u8)
+        i = i + 1
+    }
+}
+
+fn put32_at(b: *mut rt.Buf, off: usize, v: u32) {
+    let p: u64 = rt.buf_ptr(b)
+    rt.st8(p, off, (v & 255 as u32) as u8)
+    rt.st8(p, off + 1, ((v >> 8) & 255 as u32) as u8)
+    rt.st8(p, off + 2, ((v >> 16) & 255 as u32) as u8)
+    rt.st8(p, off + 3, ((v >> 24) & 255 as u32) as u8)
+}
+
+fn put16_at(b: *mut rt.Buf, off: usize, v: u32) {
+    let p: u64 = rt.buf_ptr(b)
+    rt.st8(p, off, (v & 255 as u32) as u8)
+    rt.st8(p, off + 1, ((v >> 8) & 255 as u32) as u8)
+}
+
+fn ld32(p: u64, off: usize) -> u32 {
+    return (rt.ld8(p, off) as u32) | ((rt.ld8(p, off + 1) as u32) << 8) |
+        ((rt.ld8(p, off + 2) as u32) << 16) | ((rt.ld8(p, off + 3) as u32) << 24)
+}
+
+fn ld16(p: u64, off: usize) -> u32 {
+    return (rt.ld8(p, off) as u32) | ((rt.ld8(p, off + 1) as u32) << 8)
+}
+
+// slashes -> backslashes
+fn backslash(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < s.n {
+        var c: u8 = rt.ld8(s.p as u64, i)
+        if c == 47 as u8 {
+            c = 92 as u8
+        }
+        rt.buf_push(out, c)
+        i = i + 1
+    }
+}
+
+fn is_ascii(p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) >= 128 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// UTF-16 text with a count (StringData), no terminator
+fn w_counted(b: *mut rt.Buf, s: str) {
+    var tmp: rt.Buf = rt.buf_new()
+    let units: usize = util.utf8_to_utf16(s.p as u64, s.n, &tmp)
+    w16(b, units as u32)
+    rt.buf_push_bytes(b, rt.buf_ptr(&tmp), rt.buf_len(&tmp))
+    rt.buf_free(&tmp)
+}
+
+// UTF-16 text with a zero unit
+fn w_wide0(b: *mut rt.Buf, p: u64, n: usize) {
+    util.utf8_to_utf16(p, n, b)
+    w16(b, 0 as u32)
+}
+
+// ANSI text with a zero octet; octets above 127 become '?'
+fn w_ansi0(b: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        var c: u8 = rt.ld8(p, i)
+        if c >= 128 as u8 {
+            c = 63 as u8
+        }
+        rt.buf_push(b, c)
+        i = i + 1
+    }
+    rt.buf_push(b, 0 as u8)
+}
+
+// one ItemID of a path component (file or folder), name in ANSI
+fn w_item(b: *mut rt.Buf, p: u64, n: usize, is_dir: bool) {
+    var len: usize = 2 + 1 + 1 + 4 + 2 + 2 + 2 + n + 1
+    var pad: usize = 0
+    if len % 2 == 1 {
+        pad = 1
+    }
+    len = len + pad
+    w16(b, len as u32)
+    if is_dir {
+        w8(b, 49 as u32)
+    } else {
+        w8(b, 50 as u32)
+    }
+    w8(b, 0 as u32)
+    w32(b, 0 as u32)        // file size (not recorded)
+    w16(b, 33 as u32)       // DOS date 1980-01-01
+    w16(b, 0 as u32)        // DOS time
+    if is_dir {
+        w16(b, 16 as u32)   // FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        w16(b, 32 as u32)   // FILE_ATTRIBUTE_ARCHIVE
+    }
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(b, rt.ld8(p, i))
+        i = i + 1
+    }
+    rt.buf_push(b, 0 as u8)
+    if pad == 1 {
+        rt.buf_push(b, 0 as u8)
+    }
+}
+
+fn w_guid_computer(b: *mut rt.Buf) {
+    let clsid: [u8; 16] = [0xE0 as u8, 0x4F as u8, 0xD0 as u8, 0x20 as u8, 0xEA as u8, 0x3A as u8,
+        0x69 as u8, 0x10 as u8, 0xA2 as u8, 0xD8 as u8, 0x08 as u8, 0x00 as u8, 0x2B as u8,
+        0x30 as u8, 0x30 as u8, 0x9D as u8]
+    var i: usize = 0
+    while i < 16 {
+        rt.buf_push(b, clsid[i])
+        i = i + 1
+    }
+}
+
+// the ItemID list of `C:\a\b\c.exe` (without its own size field)
+fn w_idlist_items(b: *mut rt.Buf, path: u64, n: usize) {
+    // My Computer
+    w16(b, 20 as u32)
+    w8(b, 31 as u32)
+    w8(b, 80 as u32)
+    w_guid_computer(b)
+    // the drive: "C:\" in a 25 octet item
+    w16(b, 25 as u32)
+    w8(b, 47 as u32)
+    rt.buf_push(b, rt.ld8(path, 0))
+    rt.buf_push(b, 58 as u8)
+    rt.buf_push(b, 92 as u8)
+    wzero(b, 19)
+    // the components after "C:\"
+    var start: usize = 3
+    var k: usize = 3
+    while k <= n {
+        if k == n || rt.ld8(path, k) == 92 as u8 {
+            if k > start {
+                let last: bool = k == n
+                w_item(b, path + start as u64, k - start, !last)
+            }
+            start = k + 1
+        }
+        k = k + 1
+    }
+    w16(b, 0 as u32)
+}
+
+fn w_shell_link_guid(b: *mut rt.Buf) {
+    let guid: [u8; 16] = [1 as u8, 0x14 as u8, 2 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8,
+        0xC0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0x46 as u8]
+    var i: usize = 0
+    while i < 16 {
+        rt.buf_push(b, guid[i])
+        i = i + 1
+    }
+}
+
+fn lnk_build(out: *mut rt.Buf, s: *mut LnkSpec) -> bool {
+    var tg: rt.Buf = rt.buf_new()
+    backslash((*s).target, &tg)
+    let tp: u64 = rt.buf_ptr(&tg)
+    let tn: usize = rt.buf_len(&tg)
+    // an absolute path with a drive letter: X:\...
+    if tn < 4 || rt.ld8(tp, 1) != 58 as u8 || rt.ld8(tp, 2) != 92 as u8 {
+        rt.buf_free(&tg)
+        return false
+    }
+    let d: u8 = rt.ld8(tp, 0)
+    if !((d >= 65 as u8 && d <= 90 as u8) || (d >= 97 as u8 && d <= 122 as u8)) {
+        rt.buf_free(&tg)
+        return false
+    }
+    var wd: rt.Buf = rt.buf_new()
+    backslash((*s).workdir, &wd)
+    var ic: rt.Buf = rt.buf_new()
+    backslash((*s).icon, &ic)
+    let with_ids: bool = is_ascii(tp, tn) && tn <= 1024
+    var flags: u32 = LF_LINKINFO | LF_UNICODE | LF_NOTRACK
+    if with_ids { flags = flags | LF_IDLIST }
+    if (*s).desc.n > 0 { flags = flags | LF_NAME }
+    if rt.buf_len(&wd) > 0 { flags = flags | LF_WORKDIR }
+    if (*s).args.n > 0 { flags = flags | LF_ARGS }
+    if rt.buf_len(&ic) > 0 { flags = flags | LF_ICON }
+    rt.buf_clear(out)
+    // header
+    w32(out, 76 as u32)
+    w_shell_link_guid(out)
+    w32(out, flags)
+    w32(out, 32 as u32)          // FILE_ATTRIBUTE_ARCHIVE
+    wzero(out, 24)               // creation, access, write time
+    w32(out, 0 as u32)           // target size
+    w32(out, (*s).icon_index as u32)
+    w32(out, (*s).show)
+    wzero(out, 12)               // hot key + reserved
+    // LinkTargetIDList
+    if with_ids {
+        let at: usize = rt.buf_len(out)
+        w16(out, 0 as u32)
+        w_idlist_items(out, tp, tn)
+        put16_at(out, at, (rt.buf_len(out) - at - 2) as u32)
+    }
+    // LinkInfo
+    let li: usize = rt.buf_len(out)
+    w32(out, 0 as u32)           // size, patched below
+    w32(out, 36 as u32)          // header size (with the Unicode offsets)
+    w32(out, 1 as u32)           // VolumeIDAndLocalBasePath
+    w32(out, 36 as u32)          // VolumeID offset
+    w32(out, 0 as u32)           // local base path offset (patched)
+    w32(out, 0 as u32)           // common network relative link
+    w32(out, 0 as u32)           // common path suffix offset (patched)
+    w32(out, 0 as u32)           // local base path, Unicode (patched)
+    w32(out, 0 as u32)           // common path suffix, Unicode (patched)
+    // VolumeID: fixed drive, no label
+    w32(out, 17 as u32)
+    w32(out, 3 as u32)
+    w32(out, 0 as u32)
+    w32(out, 16 as u32)
+    w8(out, 0 as u32)
+    put32_at(out, li + 16, (rt.buf_len(out) - li) as u32)
+    w_ansi0(out, tp, tn)
+    put32_at(out, li + 24, (rt.buf_len(out) - li) as u32)
+    w8(out, 0 as u32)            // common path suffix (empty)
+    put32_at(out, li + 28, (rt.buf_len(out) - li) as u32)
+    w_wide0(out, tp, tn)
+    put32_at(out, li + 32, (rt.buf_len(out) - li) as u32)
+    w16(out, 0 as u32)
+    put32_at(out, li, (rt.buf_len(out) - li) as u32)
+    // StringData
+    if (*s).desc.n > 0 { w_counted(out, (*s).desc) }
+    if rt.buf_len(&wd) > 0 {
+        w_counted(out, str { p: rt.buf_data(&wd), n: rt.buf_len(&wd) })
+    }
+    if (*s).args.n > 0 { w_counted(out, (*s).args) }
+    if rt.buf_len(&ic) > 0 {
+        w_counted(out, str { p: rt.buf_data(&ic), n: rt.buf_len(&ic) })
+    }
+    // ExtraData: the terminal block
+    w32(out, 0 as u32)
+    rt.buf_free(&tg)
+    rt.buf_free(&wd)
+    rt.buf_free(&ic)
+    return true
+}
+
+fn bit_of(field: u32) -> u32 {
+    if field == LNK_WORKDIR { return LF_WORKDIR }
+    if field == LNK_ARGS { return LF_ARGS }
+    if field == LNK_ICON { return LF_ICON }
+    return LF_NAME
+}
+
+// Read one field back. `which` is LNK_TARGET .. LNK_ICON; the text is
+// appended to `out` as UTF-8. False when the octets are not a shortcut this
+// module understands (wrong header, truncated, a field that is not there).
+fn lnk_read(p: u64, n: usize, which: u32, out: *mut rt.Buf) -> bool {
+    if n < 76 || ld32(p, 0) != 76 as u32 {
+        return false
+    }
+    var gb: rt.Buf = rt.buf_new()
+    w_shell_link_guid(&gb)
+    if !rt.mem_eq(p + 4 as u64, rt.buf_ptr(&gb), 16) {
+        rt.buf_free(&gb)
+        return false
+    }
+    rt.buf_free(&gb)
+    let flags: u32 = ld32(p, 20)
+    var at: usize = 76
+    if (flags & LF_IDLIST) != 0 as u32 {
+        if at + 2 > n { return false }
+        at = at + 2 + ld16(p, at) as usize
+    }
+    if (flags & LF_LINKINFO) != 0 as u32 {
+        if at + 4 > n { return false }
+        let size: usize = ld32(p, at) as usize
+        if size < 28 || at + size > n { return false }
+        if which == LNK_TARGET {
+            let hs: u32 = ld32(p, at + 4)
+            let lf: u32 = ld32(p, at + 8)
+            if (lf & 1 as u32) == 0 as u32 { return false }
+            if hs >= 36 as u32 {
+                let uo: usize = ld32(p, at + 28) as usize
+                if uo != 0 && at + uo < n {
+                    util.utf16_to_utf8(p + (at + uo) as u64, (n - at - uo) / 2, true, out)
+                    return true
+                }
+            }
+            let ao: usize = ld32(p, at + 16) as usize
+            var k: usize = at + ao
+            while k < n && rt.ld8(p, k) != 0 as u8 {
+                rt.buf_push(out, rt.ld8(p, k))
+                k = k + 1
+            }
+            return true
+        }
+        at = at + size
+    } else if which == LNK_TARGET {
+        return false
+    }
+    // StringData in the order of the flags
+    var field: u32 = LNK_DESC
+    while field <= LNK_ICON {
+        let bit: u32 = bit_of(field)
+        if (flags & bit) != 0 as u32 {
+            if at + 2 > n { return false }
+            let units: usize = ld16(p, at) as usize
+            if at + 2 + units * 2 > n { return false }
+            if field == which {
+                util.utf16_to_utf8(p + (at + 2) as u64, units, false, out)
+                return true
+            }
+            at = at + 2 + units * 2
+        } else if field == which {
+            return false
+        }
+        field = field + 1 as u32
+    }
+    return false
+}

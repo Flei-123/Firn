@@ -1,0 +1,255 @@
+// expect_exit: 0
+// tests/2201_pack_icons.fi -- lib/pack/icons.fi: the PNG encoder (read back
+// by lib/paint/png.fi), the resampler (a flat colour stays flat, alpha does
+// not bleed colour), the .ico directory, the .icns container.
+import std.rt
+import std.io
+import paint.png
+import pack.icons
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+fn report(label: str, total: i64, fails: i64) {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, label.p as u64, label.n)
+    rt.buf_push_dec_i64(&b, total)
+    rt.buf_push_bytes(&b, " fails: ".p as u64, 8)
+    rt.buf_push_dec_i64(&b, fails)
+    io.print_line_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+fn u16le(p: u64, off: usize) -> u32 {
+    return (rt.ld8(p, off) as u32) | ((rt.ld8(p, off + 1) as u32) << 8)
+}
+
+fn u32le(p: u64, off: usize) -> u32 {
+    return u16le(p, off) | (u16le(p, off + 2) << 16)
+}
+
+fn u32be(p: u64, off: usize) -> u32 {
+    return ((rt.ld8(p, off) as u32) << 24) | ((rt.ld8(p, off + 1) as u32) << 16) |
+        ((rt.ld8(p, off + 2) as u32) << 8) | (rt.ld8(p, off + 3) as u32)
+}
+
+// a w x h picture: left half red, right half translucent blue; the
+// transparent corner pixel hides a green colour that must never show
+fn make(w: usize, h: usize, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    var y: usize = 0
+    while y < h {
+        var x: usize = 0
+        while x < w {
+            if x == 0 && y == 0 {
+                rt.buf_push(out, 0 as u8)
+                rt.buf_push(out, 255 as u8)
+                rt.buf_push(out, 0 as u8)
+                rt.buf_push(out, 0 as u8)
+            } else if x < w / 2 {
+                rt.buf_push(out, 255 as u8)
+                rt.buf_push(out, 0 as u8)
+                rt.buf_push(out, 0 as u8)
+                rt.buf_push(out, 255 as u8)
+            } else {
+                rt.buf_push(out, 0 as u8)
+                rt.buf_push(out, 0 as u8)
+                rt.buf_push(out, 255 as u8)
+                rt.buf_push(out, 128 as u8)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+
+    // ---- PNG encode -> decode, pixel for pixel
+    var src: rt.Buf = rt.buf_new()
+    make(37, 23, &src)
+    var pngb: rt.Buf = rt.buf_new()
+    check(&t, "png_encode", icons.png_encode(rt.buf_ptr(&src), 37, 23, &pngb))
+    let pp: u64 = rt.buf_ptr(&pngb)
+    check(&t, "PNG signature", rt.ld8(pp, 0) == 137 as u8 && rt.ld8(pp, 1) == 80 as u8 && rt.ld8(pp, 7) == 10 as u8)
+    var im: png.Image = png.image_new()
+    check(&t, "decodes", png.decode_png(pp, rt.buf_len(&pngb), &im))
+    check(&t, "size back", png.image_width(&im) == 37 && png.image_height(&im) == 23)
+    var same: bool = true
+    var y: usize = 0
+    while y < 23 {
+        var x: usize = 0
+        while x < 37 {
+            let v: u32 = png.image_pixel(&im, x, y)
+            let o: usize = (y * 37 + x) * 4
+            let r: u32 = rt.ld8(rt.buf_ptr(&src), o) as u32
+            let g: u32 = rt.ld8(rt.buf_ptr(&src), o + 1) as u32
+            let b: u32 = rt.ld8(rt.buf_ptr(&src), o + 2) as u32
+            let a: u32 = rt.ld8(rt.buf_ptr(&src), o + 3) as u32
+            if ((v >> 24) & 255 as u32) != a || ((v >> 16) & 255 as u32) != r ||
+                ((v >> 8) & 255 as u32) != g || (v & 255 as u32) != b {
+                same = false
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    check(&t, "every pixel back unchanged (alpha 0 keeps its colour)", same)
+    png.image_free(&im)
+    check(&t, "zero size refused", !icons.png_encode(rt.buf_ptr(&src), 0, 5, &pngb))
+
+    // ---- resample
+    var flat: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 64 * 64 {
+        rt.buf_push(&flat, 10 as u8)
+        rt.buf_push(&flat, 200 as u8)
+        rt.buf_push(&flat, 30 as u8)
+        rt.buf_push(&flat, 255 as u8)
+        i = i + 1
+    }
+    var small: rt.Buf = rt.buf_new()
+    check(&t, "downscale", icons.resample(rt.buf_ptr(&flat), 64, 64, &small, 16, 16))
+    check(&t, "downscaled length", rt.buf_len(&small) == 16 * 16 * 4)
+    var ok_flat: bool = true
+    i = 0
+    while i < 16 * 16 {
+        let o: usize = i * 4
+        if rt.ld8(rt.buf_ptr(&small), o) != 10 as u8 || rt.ld8(rt.buf_ptr(&small), o + 1) != 200 as u8 ||
+            rt.ld8(rt.buf_ptr(&small), o + 2) != 30 as u8 || rt.ld8(rt.buf_ptr(&small), o + 3) != 255 as u8 {
+            ok_flat = false
+        }
+        i = i + 1
+    }
+    check(&t, "a flat colour stays exactly flat when shrunk", ok_flat)
+    var big: rt.Buf = rt.buf_new()
+    check(&t, "upscale", icons.resample(rt.buf_ptr(&flat), 64, 64, &big, 200, 200))
+    var ok_up: bool = true
+    i = 0
+    while i < 200 * 200 {
+        if rt.ld8(rt.buf_ptr(&big), i * 4 + 1) != 200 as u8 || rt.ld8(rt.buf_ptr(&big), i * 4 + 3) != 255 as u8 {
+            ok_up = false
+        }
+        i = i + 1
+    }
+    check(&t, "a flat colour stays exactly flat when enlarged", ok_up)
+    // the picture with a transparent corner holding green: shrunk 2x, the corner's
+    // hidden green must not tint the neighbours (premultiplied averaging)
+    var half: rt.Buf = rt.buf_new()
+    icons.resample(rt.buf_ptr(&src), 37, 23, &half, 18, 11)
+    var tint: bool = false
+    i = 0
+    while i < 18 * 11 {
+        let o: usize = i * 4
+        if rt.ld8(rt.buf_ptr(&half), o + 3) > 0 as u8 && rt.ld8(rt.buf_ptr(&half), o + 1) > 40 as u8 {
+            tint = true
+        }
+        i = i + 1
+    }
+    check(&t, "transparent pixels do not bleed their colour", !tint)
+    check(&t, "zero target refused", !icons.resample(rt.buf_ptr(&flat), 64, 64, &small, 0, 4))
+
+    // ---- fit_square
+    var sq: rt.Buf = rt.buf_new()
+    let side: usize = icons.fit_square(rt.buf_ptr(&src), 37, 23, &sq)
+    check(&t, "fit_square side", side == 37 && rt.buf_len(&sq) == 37 * 37 * 4)
+    check(&t, "fit_square pads with transparency", rt.ld8(rt.buf_ptr(&sq), 3) == 0 as u8 &&
+        rt.ld8(rt.buf_ptr(&sq), (36 * 37 + 36) * 4 + 3) == 0 as u8)
+
+    // ---- ICO
+    var set: icons.IconSet = icons.iconset_new()
+    var p16: rt.Buf = rt.buf_new()
+    var p256: rt.Buf = rt.buf_new()
+    var p512: rt.Buf = rt.buf_new()
+    var px: rt.Buf = rt.buf_new()
+    make(16, 16, &px)
+    icons.png_encode(rt.buf_ptr(&px), 16, 16, &p16)
+    make(256, 256, &px)
+    icons.png_encode(rt.buf_ptr(&px), 256, 256, &p256)
+    make(512, 512, &px)
+    icons.png_encode(rt.buf_ptr(&px), 512, 512, &p512)
+    check(&t, "add 256 first", icons.iconset_add(&set, 256 as u32, rt.buf_ptr(&p256), rt.buf_len(&p256)))
+    check(&t, "add 16", icons.iconset_add(&set, 16 as u32, rt.buf_ptr(&p16), rt.buf_len(&p16)))
+    check(&t, "add 512", icons.iconset_add(&set, 512 as u32, rt.buf_ptr(&p512), rt.buf_len(&p512)))
+    check(&t, "the same size twice is refused", !icons.iconset_add(&set, 16 as u32, rt.buf_ptr(&p16), rt.buf_len(&p16)))
+    var ico: rt.Buf = rt.buf_new()
+    check(&t, "ico_build", icons.ico_build(&set, &ico))
+    let ip: u64 = rt.buf_ptr(&ico)
+    check(&t, "ICONDIR: reserved 0, type 1, count 2 (512 does not fit)",
+        u16le(ip, 0) == 0 as u32 && u16le(ip, 2) == 1 as u32 && u16le(ip, 4) == 2 as u32)
+    check(&t, "entries ascending: 16 first", rt.ld8(ip, 6) == 16 as u8 && rt.ld8(ip, 7) == 16 as u8)
+    check(&t, "256 is written as 0", rt.ld8(ip, 22) == 0 as u8 && rt.ld8(ip, 23) == 0 as u8)
+    check(&t, "32 bits per pixel", u16le(ip, 12) == 32 as u32)
+    check(&t, "entry size is the PNG size", u32le(ip, 14) as usize == rt.buf_len(&p16))
+    check(&t, "first image at offset 38", u32le(ip, 18) == 38 as u32)
+    check(&t, "second image follows the first", u32le(ip, 34) as usize == 38 + rt.buf_len(&p16))
+    check(&t, "the image at the offset is the PNG", rt.ld8(ip, 38) == 137 as u8 && rt.ld8(ip, 39) == 80 as u8)
+    check(&t, "total length", rt.buf_len(&ico) == 38 + rt.buf_len(&p16) + rt.buf_len(&p256))
+    var none: icons.IconSet = icons.iconset_new()
+    icons.iconset_add(&none, 512 as u32, rt.buf_ptr(&p512), rt.buf_len(&p512))
+    var noico: rt.Buf = rt.buf_new()
+    check(&t, "ico of only large sizes is refused", !icons.ico_build(&none, &noico))
+
+    // ---- ICNS
+    var icns: rt.Buf = rt.buf_new()
+    check(&t, "icns_build", icons.icns_build(&set, &icns))
+    let np: u64 = rt.buf_ptr(&icns)
+    check(&t, "icns magic", rt.ld8(np, 0) == 105 as u8 && rt.ld8(np, 1) == 99 as u8 &&
+        rt.ld8(np, 2) == 110 as u8 && rt.ld8(np, 3) == 115 as u8)
+    check(&t, "icns total length", u32be(np, 4) as usize == rt.buf_len(&icns))
+    // walk the entries: icp4 (16), ic08 (256), ic09 (512), ic13 (256 @2x), ic14 (512 @2x)
+    var at: usize = 8
+    var seen: usize = 0
+    var walk_ok: bool = true
+    var has_icp4: bool = false
+    var has_ic14: bool = false
+    while at + 8 <= rt.buf_len(&icns) {
+        let len: usize = u32be(np, at + 4) as usize
+        if len < 8 || at + len > rt.buf_len(&icns) {
+            walk_ok = false
+            at = rt.buf_len(&icns)
+        } else {
+            if rt.ld8(np, at) == 105 as u8 && rt.ld8(np, at + 1) == 99 as u8 && rt.ld8(np, at + 2) == 112 as u8 &&
+                rt.ld8(np, at + 3) == 52 as u8 {
+                has_icp4 = true
+            }
+            if rt.ld8(np, at) == 105 as u8 && rt.ld8(np, at + 1) == 99 as u8 && rt.ld8(np, at + 2) == 49 as u8 &&
+                rt.ld8(np, at + 3) == 52 as u8 {
+                has_ic14 = true
+            }
+            // each payload is a PNG
+            if rt.ld8(np, at + 8) != 137 as u8 || rt.ld8(np, at + 9) != 80 as u8 {
+                walk_ok = false
+            }
+            seen = seen + 1
+            at = at + len
+        }
+    }
+    check(&t, "icns entries tile the file exactly", walk_ok && at == rt.buf_len(&icns))
+    check(&t, "icns has 5 entries for 16, 256 and 512", seen == 5)
+    check(&t, "icp4 present", has_icp4)
+    check(&t, "ic14 (256@2x is the 512 image) present", has_ic14)
+    var noicns: icons.IconSet = icons.iconset_new()
+    var weird: rt.Buf = rt.buf_new()
+    icons.iconset_add(&noicns, 20 as u32, rt.buf_ptr(&p16), rt.buf_len(&p16))
+    check(&t, "icns of an unknown size only is refused", !icons.icns_build(&noicns, &weird))
+
+    report("icons checks: ", t.total, t.fails)
+    if t.fails != 0 {
+        return 1
+    }
+    return 0
+}

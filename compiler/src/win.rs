@@ -284,6 +284,23 @@ const KNOWN: &[(&str, &str, u32)] = &[
     // value `AppsUseLightTheme`. `RegGetValueW` does opening, reading and
     // closing in one call.
     ("RegGetValueW", "ADVAPI32.dll", 7),
+    // --- advapi32: WRITING the registry (lib/pack/winreg.fi) -----------
+    // Round PACK: an installer writes HKCU\Software\Microsoft\Windows\
+    // CurrentVersion\Uninstall\<id> (the "Apps & features" entry) and its
+    // uninstaller removes it again. Bound here because an indirect call
+    // through GetProcAddress is System V, not Win64 (see GetModuleFileNameW).
+    // RegCreateKeyExW(hkey, sub, 0, class, options, sam, sa, *result, *disp),
+    // RegSetValueExW(hkey, name, 0, type, data, bytes), RegCloseKey,
+    // RegDeleteTreeW(hkey, sub) (Vista and later; Wine has it),
+    // RegOpenKeyExW(hkey, sub, options, sam, *result).
+    ("RegCreateKeyExW", "ADVAPI32.dll", 9),
+    ("RegSetValueExW", "ADVAPI32.dll", 6),
+    ("RegCloseKey", "ADVAPI32.dll", 1),
+    ("RegDeleteTreeW", "ADVAPI32.dll", 2),
+    ("RegOpenKeyExW", "ADVAPI32.dll", 5),
+    // The shell is told that shortcuts / associations changed so that the
+    // new icons show without a restart of Explorer.
+    ("SHChangeNotify", "SHELL32.dll", 4),
     // --- advapi32: the Credential Manager (std.secret_os) --------------
     // The keyring of Windows: generic credentials, kept per user by the
     // system and protected with the user's logon secret (DPAPI). Round
