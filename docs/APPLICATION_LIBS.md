@@ -89,3 +89,24 @@ honest gaps: [APPKIT.md](APPKIT.md).
 The store side (`store add-app`: `exe`, `bin`, `appimage`, `macos-app`
 packages, per-platform channel pointers, `mindestFassung`) is in the
 orientstore repository, `docs/KATALOG-FORMAT.md`.
+
+## The desktop libraries (round DESKTOP)
+
+A program that lives on somebody's desktop: tray icon and menu, notifications, files dropped on its window,
+the clipboard, sound, a watcher for folders, starting at login, a second copy that hands its command line to
+the first. One interface per module, a file per platform (Linux and Windows real and checked; macOS, Android,
+OrientOS stubs). The full map, how each piece is held against something nobody here wrote, and what is *not*
+verified (no real desktop, Windows only under Wine): [DESKTOP.md](DESKTOP.md).
+
+| module | what it does | held against |
+|---|---|---|
+| `net.dbus`, `net.unix` (`lib/net/`) | a D-Bus client **and service**: SASL EXTERNAL, every type with the alignment rules, calls/replies/errors/signals, the queue, `RequestName`, `AddMatch`; Unix sockets with exact address lengths | libdbus (dbus-python): 18 values both ways, 1 MiB, errors |
+| `desktop.tray` | notification-area icon + flat menu: StatusNotifierItem + dbusmenu (Linux), `Shell_NotifyIconW` (Windows); events by `tray_poll` | a StatusNotifierWatcher and dbusmenu client in libdbus (49 checks); Wine's shell, the icon read off the screen |
+| `desktop.notify` | notifications (`org.freedesktop.Notifications`; a balloon/toast on Windows) with actions, urgency, replace, close, the signals back | a notification server in libdbus; Wine's shell |
+| `window.drop_accept/drop_take`, `EV_DROP`, `desktop.filedrop` | files dropped on a window: XDND v5 (target side), `WM_DROPFILES` | GTK 3 as a real drag source driven with xdotool; a python-xlib source; a real `HDROP` |
+| `window.clipboard_*` on Windows | `CF_UNICODETEXT`, `CF_HDROP`, registered formats | GTK 3's clipboard through Wine's X bridge, both ways |
+| `audio.pcm`, `audio.pulse`, `audio.dev`, `audio.sink`, `audio.player` | PCM output: a PulseAudio native-protocol client, waveOut, file/null sinks, volume, `play_mp3` / `player_pump` on `ton.mp3` | the plain decoder byte for byte, zlib CRC-32, ffmpeg (SNR), a real pulseaudio read back by `parec`/`pactl`; waveOut into ALSA's file plugin |
+| `desktop.watch` | folder change events (inotify / `ReadDirectoryChangesW`), recursive | `tests/2220` on Linux and under Wine |
+| `desktop.autostart` | start at login (XDG autostart / the Run key) | GLib's `gio launch`, Python's reading of the spec; MSVCRT's argv parser |
+| `appkit.single_instance` (`single_listen`, `single_poll`, `single_send_args`) | the second copy hands its directory and arguments to the first (Unix socket / named pipe, same user) | `tests/2221`: two real processes, on Linux and under Wine |
+
