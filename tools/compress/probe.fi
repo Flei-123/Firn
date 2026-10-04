@@ -17,6 +17,7 @@ import compress.lz4
 import compress.bz2
 import compress.zstd
 import compress.zstd_enc
+import compress.lzma
 import std.fs
 import std.io
 import std.rt
@@ -62,7 +63,7 @@ fn same(a: str, b: str) -> bool {
 
 // ---------------------------------------------------------------- formats
 
-fn whole_decode(fmt: str, p: u64, n: usize, limit: usize, out: *mut rt.Buf) -> CompressError!usize {
+fn whole_decode(fmt: str, p: u64, n: usize, limit: usize, dict: u64, dictlen: usize, out: *mut rt.Buf) -> CompressError!usize {
     if same(fmt, "lz4") {
         return try lz4.lz4_frame_decompress_limited(p, n, limit, out)
     }
@@ -70,12 +71,18 @@ fn whole_decode(fmt: str, p: u64, n: usize, limit: usize, out: *mut rt.Buf) -> C
         return try bz2.bz2_decompress_limited(p, n, limit, out)
     }
     if same(fmt, "zstd") {
-        return try zstd.zstd_decompress_limited(p, n, limit, out)
+        return try zstd.zstd_decompress_dict(p, n, limit, dict, dictlen, out)
+    }
+    if same(fmt, "xz") {
+        return try lzma.xz_decompress_limited(p, n, limit, out)
+    }
+    if same(fmt, "lzma") {
+        return try lzma.lzma_alone_decompress_limited(p, n, limit, out)
     }
     return CompressError::Unsupported
 }
 
-fn whole_encode(fmt: str, p: u64, n: usize, level: usize, out: *mut rt.Buf) -> CompressError!usize {
+fn whole_encode(fmt: str, p: u64, n: usize, level: usize, dict: u64, dictlen: usize, out: *mut rt.Buf) -> CompressError!usize {
     if same(fmt, "lz4") {
         return try lz4.lz4_frame_compress(p, n, out)
     }
@@ -84,13 +91,13 @@ fn whole_encode(fmt: str, p: u64, n: usize, level: usize, out: *mut rt.Buf) -> C
         if lv == 0 {
             lv = 3
         }
-        return try zstd_enc.zstd_compress(p, n, lv as u32, out)
+        return try zstd_enc.zstd_compress_dict(p, n, lv as u32, dict, dictlen, out)
     }
     return CompressError::Unsupported
 }
 
 // streaming decode from a descriptor into `out`, `piece` octets at a time
-fn stream_decode(fmt: str, fd: i64, piece: usize, out: *mut rt.Buf) -> CompressError!usize {
+fn stream_decode(fmt: str, fd: i64, piece: usize, dict: u64, dictlen: usize, out: *mut rt.Buf) -> CompressError!usize {
     let tmp: u64 = rt.heap_alloc(piece)
     if tmp == 0 {
         return CompressError::OutOfMemory
@@ -110,8 +117,25 @@ fn stream_decode(fmt: str, fd: i64, piece: usize, out: *mut rt.Buf) -> CompressE
         rt.heap_free(tmp, piece)
         return total
     }
+    if same(fmt, "xz") {
+        var d: lzma.XzDec = lzma.xz_dec_open_fd(fd)
+        while true {
+            let k: usize = lzma.xz_dec_read(&d, tmp, piece) catch |e| (stream_fail_xz(e, &d))
+            if k == 0 {
+                break
+            }
+            rt.buf_push_bytes(out, tmp, k)
+            total = total + k
+        }
+        lzma.xz_dec_close(&d)
+        rt.heap_free(tmp, piece)
+        return total
+    }
     if same(fmt, "zstd") {
         var d: zstd.ZstdDec = zstd.zstd_dec_open_fd(fd)
+        if dictlen > 0 {
+            zstd.zstd_dec_set_dict(&d, dict, dictlen)
+        }
         while true {
             let k: usize = zstd.zstd_dec_read(&d, tmp, piece) catch |e| (stream_fail_zstd(e, &d))
             if k == 0 {
@@ -149,6 +173,13 @@ fn stream_fail_zstd(e: CompressError, d: *mut zstd.ZstdDec) -> usize {
     return 0
 }
 
+fn stream_fail_xz(e: CompressError, d: *mut lzma.XzDec) -> usize {
+    kind(e)
+    lzma.xz_dec_close(d)
+    rt.finish(0)
+    return 0
+}
+
 fn stream_fail(e: CompressError, d: *mut lz4.Lz4Dec) -> usize {
     kind(e)
     lz4.lz4_dec_close(d)
@@ -163,7 +194,7 @@ fn stream_fail_bz2(e: CompressError, d: *mut bz2.Bz2Dec) -> usize {
     return 0
 }
 
-fn stream_encode(fmt: str, p: u64, n: usize, chunk: usize, out: *mut rt.Buf) -> CompressError!usize {
+fn stream_encode(fmt: str, p: u64, n: usize, chunk: usize, dict: u64, dictlen: usize, out: *mut rt.Buf) -> CompressError!usize {
     if same(fmt, "lz4") {
         var e: lz4.Lz4Enc = lz4.lz4_enc_new(5, true, true, 0)
         var at: usize = 0
@@ -180,7 +211,7 @@ fn stream_encode(fmt: str, p: u64, n: usize, chunk: usize, out: *mut rt.Buf) -> 
         return rt.buf_len(out)
     }
     if same(fmt, "zstd") {
-        var e: zstd_enc.ZstdEnc = zstd_enc.zstd_enc_new(3, true)
+        var e: zstd_enc.ZstdEnc = zstd_enc.zstd_enc_new_dict(3, true, dict, dictlen)
         var at: usize = 0
         while at < n {
             var k: usize = n - at
@@ -210,6 +241,10 @@ fn main(start: u64) -> i32 {
         a = num(arg(start, 5))
         have_arg = true
     }
+    var dictb: rt.Buf = rt.buf_new()
+    if rt.arg_count(start) > 6 {
+        fs.read_file(arg(start, 6), &dictb) catch 0
+    }
     var out: rt.Buf = rt.buf_new()
     var ok: bool = true
     var n: usize = 0
@@ -223,21 +258,21 @@ fn main(start: u64) -> i32 {
         if have_arg && a > 0 {
             piece = a
         }
-        n = stream_decode(fmt, fd, piece, &out) catch |e| (fail(e, &ok))
+        n = stream_decode(fmt, fd, piece, rt.buf_ptr(&dictb), rt.buf_len(&dictb), &out) catch |e| (fail(e, &ok))
         fs.close_fd(fd)
     } else {
         var data: rt.Buf = rt.buf_new()
         fs.read_file(arg(start, 3), &data) catch 0
         if same(op, "d") {
-            n = whole_decode(fmt, rt.buf_ptr(&data), rt.buf_len(&data), a, &out) catch |e| (fail(e, &ok))
+            n = whole_decode(fmt, rt.buf_ptr(&data), rt.buf_len(&data), a, rt.buf_ptr(&dictb), rt.buf_len(&dictb), &out) catch |e| (fail(e, &ok))
         } else if same(op, "c") {
-            n = whole_encode(fmt, rt.buf_ptr(&data), rt.buf_len(&data), a, &out) catch |e| (fail(e, &ok))
+            n = whole_encode(fmt, rt.buf_ptr(&data), rt.buf_len(&data), a, rt.buf_ptr(&dictb), rt.buf_len(&dictb), &out) catch |e| (fail(e, &ok))
         } else if same(op, "cs") {
             var chunk: usize = 4097
             if have_arg && a > 0 {
                 chunk = a
             }
-            n = stream_encode(fmt, rt.buf_ptr(&data), rt.buf_len(&data), chunk, &out) catch |e| (fail(e, &ok))
+            n = stream_encode(fmt, rt.buf_ptr(&data), rt.buf_len(&data), chunk, rt.buf_ptr(&dictb), rt.buf_len(&dictb), &out) catch |e| (fail(e, &ok))
         } else {
             io.print_line("ERROR op")
             return 2

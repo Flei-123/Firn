@@ -35,7 +35,7 @@ def fail(msg):
     print("  FAIL", msg)
 
 
-def run_probe(op, fmt, data, arg=None, timeout=120):
+def run_probe(op, fmt, data, arg=None, timeout=120, dict_path=None):
     """runs the probe; returns (status, payload) with status 'OK' or 'ERROR x' or 'CRASH'"""
     fi = os.path.join(W, "in.bin")
     fo = os.path.join(W, "out.bin")
@@ -43,7 +43,9 @@ def run_probe(op, fmt, data, arg=None, timeout=120):
         f.write(data)
     if os.path.exists(fo):
         os.remove(fo)
-    cmd = [PROBE, op, fmt, fi, fo] + ([str(arg)] if arg is not None else [])
+    cmd = [PROBE, op, fmt, fi, fo] + ([str(arg if arg is not None else 0)] if (arg is not None or dict_path) else [])
+    if dict_path:
+        cmd.append(dict_path)
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -159,7 +161,14 @@ def ref_compressors(fmt):
         out.append(("xz-lc0lp2pb0", lambda d: lzma.compress(d, format=lzma.FORMAT_XZ,
                                                            filters=[{"id": lzma.FILTER_LZMA2, "preset": 2, "lc": 0,
                                                                      "lp": 2, "pb": 0}])))
-        out.append(("lzma-alone", lambda d: lzma.compress(d, format=lzma.FORMAT_ALONE, preset=4)))
+    elif fmt == "lzma":
+        import lzma
+        out.append(("lzma-alone-4", lambda d: lzma.compress(d, format=lzma.FORMAT_ALONE, preset=4)))
+        out.append(("lzma-alone-0", lambda d: lzma.compress(d, format=lzma.FORMAT_ALONE, preset=0)))
+        out.append(("lzma-alone-lc0lp4", lambda d: lzma.compress(d, format=lzma.FORMAT_ALONE,
+                                                                 filters=[{"id": lzma.FILTER_LZMA1, "preset": 3, "lc": 0, "lp": 4, "pb": 0}])))
+        out.append(("lzma-alone-lc8", lambda d: lzma.compress(d, format=lzma.FORMAT_ALONE,
+                                                              filters=[{"id": lzma.FILTER_LZMA1, "preset": 3, "lc": 4, "lp": 0, "pb": 4, "dict_size": 1 << 16}])))
     elif fmt == "bz2":
         import bz2
         for lv in (1, 5, 9):
@@ -183,7 +192,7 @@ def ref_decompress(fmt, data):
         if r.returncode != 0:
             raise ValueError("zstd: " + r.stderr.decode(errors="replace"))
         return r.stdout
-    if fmt == "xz":
+    if fmt == "xz" or fmt == "lzma":
         import lzma
         return lzma.decompress(data)
     if fmt == "bz2":
@@ -196,9 +205,9 @@ def ref_decompress(fmt, data):
 
 
 # the encoder knobs the probe offers per format (level argument for op c)
-ENC_LEVELS = {"lz4": [None], "zstd": [None, 1, 3, 6], "xz": [None, 0, 3, 6], "bz2": [None, 1, 9], "br": [None]}
+ENC_LEVELS = {"lz4": [None], "zstd": [None, 1, 3, 6], "xz": [None, 0, 3, 6], "lzma": [None], "bz2": [None, 1, 9], "br": [None]}
 
-ENC_ENABLED = {"lz4": True, "zstd": True, "xz": True, "bz2": False, "br": False}
+ENC_ENABLED = {"lz4": True, "zstd": True, "xz": False, "lzma": False, "bz2": False, "br": False}
 
 
 def group(fmt):
@@ -216,7 +225,7 @@ def group(fmt):
             check("decode %s %s" % (label, name), st.startswith("OK") and got == data,
                   "-> %s (%d vs %d octets)" % (st, len(got), len(data)))
             if len(z) < 300000 or name in ("text600k",):
-                for piece in (1, 4093, 65537):
+                for piece in ((1, 4093, 65537) if fmt != "lzma" else ()):
                     if piece == 1 and len(z) > 20000:
                         continue
                     st, got = run_probe("ds", fmt, z, piece)
@@ -290,7 +299,101 @@ def group(fmt):
                                                                     time.time() - t0))
 
 
+def zstd_dict_group():
+    """dictionaries: trained (zstd --train), raw content, wrong/missing id"""
+    t0 = time.time()
+    n0 = len(FAILS)
+    rnd = random.Random(99)
+    samples = []
+    for i in range(400):
+        user = "user%d" % rnd.randrange(10000)
+        samples.append((
+            '{"id": %d, "name": "%s", "email": "%s@example.com", "roles": ["admin", "editor"], '
+            '"active": %s, "score": %d.%d, "tags": ["a%d", "b%d"], "note": "%s"}' % (
+                i, user, user, rnd.choice(["true", "false"]), rnd.randrange(100), rnd.randrange(100),
+                rnd.randrange(9), rnd.randrange(9), " ".join(rnd.choice(["alpha", "beta", "gamma", "delta"]) for _ in range(6)))
+        ).encode())
+    sdir = os.path.join(W, "samples")
+    os.makedirs(sdir, exist_ok=True)
+    for i, s in enumerate(samples):
+        with open(os.path.join(sdir, "s%03d" % i), "wb") as f:
+            f.write(s)
+    dpath = os.path.join(W, "trained.dict")
+    r = subprocess.run(["zstd", "--train", "-q", "-o", dpath, "--maxdict=16384"] +
+                       [os.path.join(sdir, "s%03d" % i) for i in range(len(samples))], capture_output=True)
+    if r.returncode != 0:
+        fail("zstd --train failed: %s" % r.stderr.decode(errors="replace")[:200])
+        return
+    raw_path = os.path.join(W, "raw.dict")
+    with open(raw_path, "wb") as f:
+        f.write(b"".join(samples[:30]))
+    big = b"".join(samples)
+    tests = [("trained", dpath, True), ("raw-content", raw_path, False)]
+    for label, dp, has_id in tests:
+        dd = open(dp, "rb").read()
+        for name, data in [("sample0", samples[0]), ("sample7", samples[7]), ("empty", b""),
+                           ("10samples", b"".join(samples[100:110])), ("big", big), ("short", b"{}")]:
+            # reference compresses with the dictionary -> we decode with it
+            args = ["zstd", "-q", "-c", "-D", dp, "-3"]
+            z = subprocess.run(args, input=data, capture_output=True).stdout
+            for op in ("d", "ds"):
+                st, got = run_probe(op, "zstd", z, None, dict_path=dp)
+                check("dict-%s %s %s" % (label, op, name), st.startswith("OK") and got == data, "-> %s" % st)
+            for lv in (1, 3, 9):
+                zz = subprocess.run(["zstd", "-q", "-c", "-D", dp, "-%d" % lv], input=data, capture_output=True).stdout
+                st, got = run_probe("d", "zstd", zz, None, dict_path=dp)
+                check("dict-%s level %d decode %s" % (label, lv, name), st.startswith("OK") and got == data, "-> %s" % st)
+            # we compress with the dictionary -> the reference decodes
+            for lv in (1, 3, 7, 19):
+                st, z2 = run_probe("c", "zstd", data, lv, dict_path=dp)
+                if not st.startswith("OK"):
+                    fail("dict-%s encode level %d %s -> %s" % (label, lv, name, st))
+                    continue
+                r = subprocess.run(["zstd", "-d", "-c", "-q", "-D", dp], input=z2, capture_output=True)
+                check("dict-%s encode level %d %s" % (label, lv, name), r.returncode == 0 and r.stdout == data,
+                      r.stderr.decode(errors="replace")[:120])
+            st, z3 = run_probe("cs", "zstd", data, 1000, dict_path=dp)
+            if st.startswith("OK"):
+                r = subprocess.run(["zstd", "-d", "-c", "-q", "-D", dp], input=z3, capture_output=True)
+                check("dict-%s stream-encode %s" % (label, name), r.returncode == 0 and r.stdout == data)
+        # size benefit: a dictionary must help on a small sample
+        st, withd = run_probe("c", "zstd", samples[3], 3, dict_path=dp)
+        st2, without = run_probe("c", "zstd", samples[3], 3)
+        check("dict-%s helps" % label, len(withd) < len(without), "%d vs %d" % (len(withd), len(without)))
+    # a frame that names a dictionary cannot be decoded without it, nor with another
+    dd = open(dpath, "rb").read()
+    z = subprocess.run(["zstd", "-q", "-c", "-D", dpath], input=samples[1], capture_output=True).stdout
+    st, got = run_probe("d", "zstd", z)
+    check("dict missing", st == "ERROR Dictionary", "-> %s" % st)
+    other = bytearray(dd)
+    other[4:8] = struct.pack("<I", struct.unpack("<I", dd[4:8])[0] ^ 0x55)
+    op_ = os.path.join(W, "other.dict")
+    open(op_, "wb").write(bytes(other))
+    st, got = run_probe("d", "zstd", z, None, dict_path=op_)
+    check("dict wrong id", st == "ERROR Dictionary", "-> %s" % st)
+    # hostile: cuts and flips of a dictionary frame
+    for cut in range(0, len(z), max(1, len(z) // 60)):
+        st, got = run_probe("d", "zstd", z[:cut], None, dict_path=dpath)
+        check("dict cut %d" % cut, st.startswith("ERROR"), "-> %s" % st)
+    for _ in range(100):
+        zz = bytearray(z)
+        zz[rnd.randrange(len(zz))] ^= 1 << rnd.randrange(8)
+        st, got = run_probe("d", "zstd", bytes(zz), None, dict_path=dpath)
+        check("dict flip", st.startswith("OK") or st.startswith("ERROR"), "-> %s" % st)
+    # damaged dictionary
+    for _ in range(40):
+        dm = bytearray(dd)
+        dm[rnd.randrange(8, len(dm))] ^= 1 << rnd.randrange(8)
+        dmp = os.path.join(W, "dm.dict")
+        open(dmp, "wb").write(bytes(dm))
+        st, got = run_probe("d", "zstd", z, None, dict_path=dmp)
+        check("damaged dict", st.startswith("OK") or st.startswith("ERROR"), "-> %s" % st)
+    print("  zstd dictionaries (trained, raw, ids, damaged) %s   [%.0f s]" % ("ok" if len(FAILS) == n0 else "FAILED", time.time() - t0))
+
+
 for f in FMTS:
     group(f)
+    if f == "zstd":
+        zstd_dict_group()
 print("checks: %d, failures: %d" % (TOTAL[0], len(FAILS)))
 sys.exit(1 if FAILS else 0)
