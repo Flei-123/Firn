@@ -252,6 +252,14 @@ const KNOWN: &[(&str, &str, u32)] = &[
     // exported under, and Microsoft's own header only gives it the other
     // one through a macro.
     ("SystemFunction036", "ADVAPI32.dll", 2),
+    // --- crypt32: THE WINDOWS TRUST STORE (round DNS) ------------------
+    // `lib/tls/trust.windows.fi` hands the machine's root certificates to
+    // the TLS client: `CertOpenSystemStoreW(0, L"ROOT")`, then
+    // `CertEnumCertificatesInStore` until it returns NULL; every
+    // `CERT_CONTEXT` carries the DER encoding of one certificate.
+    ("CertOpenSystemStoreW", "CRYPT32.dll", 2),
+    ("CertEnumCertificatesInStore", "CRYPT32.dll", 2),
+    ("CertCloseStore", "CRYPT32.dll", 2),
     // --- advapi32: the system setting light/dark -----------------------
     // HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize,
     // value `AppsUseLightTheme`. `RegGetValueW` does opening, reading and

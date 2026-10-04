@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/tls/trust.windows.fi -- THE SYSTEM'S ROOT CERTIFICATES, on Windows
+// (round DNS). The Linux twin is trust.fi.
+//
+// Windows keeps its trusted roots in the certificate store, not in a file.
+// `CertOpenSystemStoreW(0, L"ROOT")` opens the machine's "Trusted Root
+// Certification Authorities", `CertEnumCertificatesInStore` walks it, and
+// each `CERT_CONTEXT` holds the DER of one certificate:
+//
+//     CERT_CONTEXT (x64)
+//       0   DWORD dwCertEncodingType
+//       8   BYTE* pbCertEncoded
+//       16  DWORD cbCertEncoded
+//       ...
+//
+// The store is enumerated for "ROOT" and for "AuthRoot" (the roots Windows
+// downloaded on demand through its own update channel). Then a PEM bundle
+// named `cacert.pem` next to the program is read, if there is one -- see W3.
+//
+// HONEST
+//   W1 ENUMERATING THE STORE IS NOT WHAT CHAIN BUILDING DOES. Windows adds
+//      many roots lazily, when a chain first needs them; a root that
+//      Windows would fetch on demand is not in the store yet and is not
+//      here either. That is why W3 exists.
+//   W2 At most 256 roots (x509 MAX_STORE). The machine stores together hold
+//      a few dozen to ~150.
+//   W3 `cacert.pem` (the Mozilla bundle, as curl ships it) in the CURRENT
+//      DIRECTORY is added after the store. A launcher that wants https to
+//      work on every machine ships that file.
+import std.rt
+import tls.x509
+
+export { trust_load_system }
+
+extern fn CertOpenSystemStoreW(prov: i64, name: u64) -> i64;
+extern fn CertEnumCertificatesInStore(h: i64, prev: i64) -> i64;
+extern fn CertCloseStore(h: i64, flags: i64) -> i32;
+
+fn load_store(store: *mut x509.Store, name: u64) -> usize {
+    let h: i64 = CertOpenSystemStoreW(0, name)
+    if h == 0 {
+        return 0
+    }
+    var taken: usize = 0
+    var ctx: i64 = 0
+    var guard: usize = 0
+    while guard < 1024 {
+        ctx = CertEnumCertificatesInStore(h, ctx)
+        if ctx == 0 {
+            break
+        }
+        let der: u64 = rt.ld64(ctx as u64, 1) // offset 8
+        let len: usize = rt.ld32(ctx as u64, 4) as usize // offset 16
+        if der != 0 as u64 && x509.store_add_der(store, der, len) {
+            taken = taken + 1
+        }
+        guard = guard + 1
+    }
+    CertCloseStore(h, 0)
+    return taken
+}
+
+fn trust_load_system(store: *mut x509.Store) -> usize {
+    var root: [u16; 5] = u"ROOT\0"
+    var auth: [u16; 9] = u"AuthRoot\0"
+    var n: usize = load_store(store, (&root[0]) as u64)
+    n = n + load_store(store, (&auth[0]) as u64)
+    var path: [u8; 11] = "cacert.pem\0"
+    var buf: rt.Buf = rt.buf_new()
+    if rt.read_file((&path[0]) as u64, &buf) {
+        n = n + x509.store_load_pem(store, buf.ptr, buf.len)
+    }
+    rt.buf_free(&buf)
+    return n
+}

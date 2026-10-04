@@ -11,8 +11,11 @@ Every case names the RULE it checks. The counter-checks are in the list
 and marked; without them "the client fetched a page" would prove almost
 nothing:
 
-  * an `https://` URL must be REFUSED with `Tls` -- not downgraded, not
-    silently failed. Reached twice: typed in, and through a redirect.
+  * an `https://` URL is NEVER fetched as plain http. Typed in, against a
+    port that speaks plain HTTP: `Tls` (the handshake fails, nothing is
+    downgraded). Through a redirect to a name that cannot exist
+    (`example.invalid`, RFC 6761): `Resolve`. (Round DNS: until then both
+    were refused outright; real https is checked by tools/dns/run.sh.)
   * a chunked body whose last chunk never comes must NOT be reported as
     a successful fetch.
   * with the cache switched OFF the second fetch of the same URL must
@@ -110,11 +113,13 @@ def main():
         get("/notrailer", "COUNTER-CHECK: a chunked body whose last chunk "
             "never comes is not a successful fetch", ERR_ANY=True)
         get("/status/404", "a status code that is not 200", STATUS="404")
-        get("/tohttps", "COUNTER-CHECK: the TLS boundary reached through "
-            "a REDIRECT, not typed in", ERR="Tls")
-        jobs.append("G https://example.com/")
-        checks.append((len(jobs) - 1, "https://example.com/",
-                       "COUNTER-CHECK: the TLS boundary, typed in",
+        get("/tohttps", "COUNTER-CHECK: a redirect to https:// is followed "
+            "as https -- the name does not exist, so Resolve, and not an "
+            "http fetch", ERR="Resolve")
+        jobs.append("G " + base.replace("http://", "https://") + "/plain")
+        checks.append((len(jobs) - 1, "https:// to a plain-http port",
+                       "COUNTER-CHECK: TLS against a server that speaks "
+                       "http fails in the handshake, it is not downgraded",
                        {"ERR": "Tls"}))
 
         # POST and the method rules of a redirect

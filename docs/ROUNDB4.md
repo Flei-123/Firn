@@ -330,6 +330,11 @@ into three divisions with no case distinction.
 
 ## 3. TLS, and what leaving it out means
 
+> **Update, round DNS (October 2026):** both boundaries described below have
+> been closed. `https://` goes through `lib/tls/tls.fi` and a name is resolved
+> by `lib/net/dns.fi`; see [DNS.md](DNS.md). What follows is the state of
+> round B4 and stays as the record of why it was drawn there.
+
 **`https://` is refused**, with `HttpError::Tls`. It is not silently
 downgraded to `http://`, not silently failed, and not faked with a
 plaintext connection to port 443. The boundary is one function,

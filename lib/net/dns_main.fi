@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/dns_main.fi -- the resolver as a PROGRAM (root file, round DNS).
+//
+//     dns_main [-s <ipv4>[:<port>]] [-6] [-r <n>] [-w <ms>] <name>...
+//
+//   -s   use only this name server (default: the system's)
+//   -6   ask for AAAA instead of A
+//   -r   retries            -w   timeout of the first attempt in ms
+//
+// One line per name, in the order given:
+//
+//     <name> OK <via> <ttl> <cnames> <address> [<address> ...]
+//     <name> ERR <variant>
+//
+// `via` is numeric/localhost/hosts/cache/udp/tcp. A name is asked TWICE when
+// it is repeated on the command line -- the second answer then says `cache`.
+// tools/dns/run.sh drives this against a fake server, and against the real
+// network when there is a route, comparing with `getent`/`dig`.
+import std.rt
+import std.net
+import net.dns
+
+fn say(out: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(out, p, n)
+}
+
+fn num(out: *mut rt.Buf, v: u64) {
+    rt.buf_push_dec_u64(out, v)
+}
+
+fn via_name(v: u32, out: *mut rt.Buf) {
+    var a: [u8; 7] = "numeric"
+    var b: [u8; 9] = "localhost"
+    var c: [u8; 5] = "hosts"
+    var d: [u8; 5] = "cache"
+    var e: [u8; 3] = "udp"
+    var f: [u8; 3] = "tcp"
+    var g: [u8; 4] = "none"
+    if v == dns.VIA_NUMERIC { say(out, (&a[0]) as u64, 7) }
+    else if v == dns.VIA_LOCALHOST { say(out, (&b[0]) as u64, 9) }
+    else if v == dns.VIA_HOSTS { say(out, (&c[0]) as u64, 5) }
+    else if v == dns.VIA_CACHE { say(out, (&d[0]) as u64, 5) }
+    else if v == dns.VIA_UDP { say(out, (&e[0]) as u64, 3) }
+    else if v == dns.VIA_TCP { say(out, (&f[0]) as u64, 3) }
+    else { say(out, (&g[0]) as u64, 4) }
+}
+
+fn quad(out: *mut rt.Buf, a: u32) {
+    net.ipv4_text(a, out)
+}
+
+fn hex6(out: *mut rt.Buf, p: *mut [u8; 64], k: usize) {
+    var hx: [u8; 16] = "0123456789abcdef"
+    var i: usize = 0
+    while i < 16 {
+        let b: u8 = (*p)[k * 16 + i]
+        rt.buf_push(out, hx[(b >> 4) as usize])
+        rt.buf_push(out, hx[(b & 15 as u8) as usize])
+        if i % 2 == 1 && i < 15 {
+            rt.buf_push(out, 58 as u8)
+        }
+        i = i + 1
+    }
+}
+
+fn parse_u32(p: u64, n: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        if ch < 48 as u8 || ch > 57 as u8 {
+            break
+        }
+        v = v * 10 as u32 + (ch - 48 as u8) as u32
+        i = i + 1
+    }
+    return v
+}
+
+fn main(start: u64) -> i32 {
+    var res: dns.Resolver = dns.resolver_new()
+    if !dns.resolver_init(&res) {
+        return 2
+    }
+    var qtype: u32 = dns.T_A
+    var out: rt.Buf = rt.buf_new()
+    var asked: usize = 0
+    let argc: usize = rt.arg_count(start)
+    var i: usize = 1
+    while i < argc {
+        let ap: u64 = rt.arg_ptr(start, i)
+        let an: usize = rt.c_length(ap)
+        if an == 2 && rt.ld8(ap, 0) == 45 as u8 {
+            let opt: u8 = rt.ld8(ap, 1)
+            if opt == 54 as u8 { // -6
+                qtype = dns.T_AAAA
+            } else if i + 1 < argc {
+                let vp: u64 = rt.arg_ptr(start, i + 1)
+                let vn: usize = rt.c_length(vp)
+                if opt == 115 as u8 { // -s ip[:port]
+                    var colon: usize = vn
+                    var k: usize = 0
+                    while k < vn {
+                        if rt.ld8(vp, k) == 58 as u8 {
+                            colon = k
+                        }
+                        k = k + 1
+                    }
+                    var ip: u32 = 0
+                    if dns.dns_parse_ipv4(vp, colon, &ip) {
+                        dns.resolver_clear_servers(&res)
+                        dns.resolver_add_server(&res, ip)
+                        if colon < vn {
+                            dns.resolver_set_port(&res,
+                                parse_u32(vp + (colon + 1) as u64, vn - colon - 1) as u16)
+                        }
+                    }
+                } else if opt == 114 as u8 { // -r
+                    dns.resolver_set_retries(&res, parse_u32(vp, vn))
+                } else if opt == 119 as u8 { // -w
+                    dns.resolver_set_timeout(&res, parse_u32(vp, vn) as u64)
+                }
+                i = i + 1
+            }
+        } else {
+            var o: dns.Resolved = dns.resolved_new()
+            let ok: bool = dns.dns_resolve(&res, ap, an, qtype, &o) catch false
+            say(&out, ap, an)
+            if ok {
+                var okw: [u8; 4] = " OK "
+                say(&out, (&okw[0]) as u64, 4)
+                via_name(o.via, &out)
+                rt.buf_push(&out, 32 as u8)
+                num(&out, o.ttl as u64)
+                rt.buf_push(&out, 32 as u8)
+                num(&out, o.cnames as u64)
+                var k2: usize = 0
+                while k2 < o.n {
+                    rt.buf_push(&out, 32 as u8)
+                    quad(&out, o.addr[k2])
+                    k2 = k2 + 1
+                }
+                var k3: usize = 0
+                while k3 < o.n6 {
+                    rt.buf_push(&out, 32 as u8)
+                    hex6(&out, &o.addr6, k3)
+                    k3 = k3 + 1
+                }
+            } else {
+                var er: [u8; 5] = " ERR "
+                say(&out, (&er[0]) as u64, 5)
+                dns.dns_err_name(dns.resolver_last_error(&res), &out)
+            }
+            rt.buf_push(&out, 10 as u8)
+            asked = asked + 1
+        }
+        i = i + 1
+    }
+    rt.write_everything(1, out.ptr, out.len)
+    rt.buf_free(&out)
+    dns.resolver_free(&res)
+    if asked == 0 {
+        return 2
+    }
+    return 0
+}

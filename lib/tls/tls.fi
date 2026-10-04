@@ -42,14 +42,18 @@
 // ========================================================== WHAT IS OFFERED
 //
 // Two cipher suites -- `TLS_AES_128_GCM_SHA256` (mandatory, RFC 8446 9.1)
-// and `TLS_CHACHA20_POLY1305_SHA256` -- and one group, X25519. That is a
-// deliberately narrow offer. Every group and suite in a ClientHello is a
-// code path that has to be right; three groups and five suites would be
-// fifteen combinations to test and one of them would be wrong. X25519 is
-// supported by every TLS 1.3 server there is, so the narrow offer costs
-// nothing measurable and the acceptance run says so: it drives this client
-// against `openssl s_server` AND against real hosts on the public
-// internet.
+// and `TLS_CHACHA20_POLY1305_SHA256` -- and TWO groups, X25519 and
+// secp256r1. That is a deliberately narrow offer. Every group and suite in
+// a ClientHello is a code path that has to be right.
+//
+// secp256r1 was added in round DNS because X25519 alone is NOT enough: the
+// Mojang launcher meta host (piston-meta.mojang.com, Azure Front Door)
+// has no X25519 and answers an X25519-only ClientHello with
+// handshake_failure -- measured with `openssl s_client -groups X25519`.
+// Both key shares go out in the first flight (the way Go and Chrome do),
+// so no HelloRetryRequest is needed. The secp256r1 shared secret is the
+// X coordinate of d*Q (RFC 8446 7.4.2) and the server's point is checked to
+// lie on the curve first (`ecdsa.point_valid`).
 //
 // ==================================================================== HONEST
 //
@@ -84,6 +88,7 @@ import std.crypto.chacha
 import std.crypto.gcm
 import std.crypto.rsa
 import std.crypto.ecdsa
+import std.crypto.p256
 import tls.keys
 import tls.x509
 
@@ -176,6 +181,9 @@ struct Tls {
     s_hs_secret: [u8; 32],
     priv: [u8; 32],
     pub_key: [u8; 32],
+    p256_priv: [u8; 32], // the secp256r1 share, offered next to X25519
+    p256_pub: [u8; 65], // 04 || X || Y
+    group: u32, // the group the server chose: 29 X25519, 23 secp256r1
     established: bool,
     truncated: bool,
     closed: bool,
@@ -199,6 +207,7 @@ fn tls_new() -> Tls {
         skey: [0; 32], siv: [0; 12], sseq: 0, have_keys: false,
         hs_secret: [0; 32], ms_secret: [0; 32], c_hs_secret: [0; 32],
         s_hs_secret: [0; 32], priv: [0; 32], pub_key: [0; 32],
+        p256_priv: [0; 32], p256_pub: [0; 65], group: 0 as u32,
         established: false, truncated: false, closed: false,
         verify: x509.V_PARSE, chain_depth: 0, ncerts: 0, alert_desc: 0,
         now: 0, records_in: 0, records_out: 0, hs_bytes: 0 }
@@ -575,9 +584,10 @@ fn build_client_hello(t: *mut Tls, out: *mut rt.Buf) -> bool {
     rt.buf_push_bytes(&ext, (&(*t).host[0]) as u64, (*t).hostlen)
     // supported_groups (10)
     push16(&ext, 10 as u32)
+    push16(&ext, 6 as u32)
     push16(&ext, 4 as u32)
-    push16(&ext, 2 as u32)
     push16(&ext, 29 as u32) // x25519
+    push16(&ext, 23 as u32) // secp256r1
     // signature_algorithms (13)
     push16(&ext, 13 as u32)
     push16(&ext, 16 as u32)
@@ -595,12 +605,19 @@ fn build_client_hello(t: *mut Tls, out: *mut rt.Buf) -> bool {
     rt.buf_push(&ext, 2 as u8)
     push16(&ext, 772 as u32) // 0x0304 = TLS 1.3
     // key_share (51)
+    // BOTH shares are sent, so that a server that has only one of the two
+    // groups answers with its ServerHello directly -- Azure Front Door
+    // (piston-meta.mojang.com) has no X25519 and would otherwise need a
+    // HelloRetryRequest, which T4 does not do.
     push16(&ext, 51 as u32)
-    push16(&ext, 38 as u32)
-    push16(&ext, 36 as u32)
+    push16(&ext, 107 as u32)
+    push16(&ext, 105 as u32)
     push16(&ext, 29 as u32)
     push16(&ext, 32 as u32)
     rt.buf_push_bytes(&ext, (&(*t).pub_key[0]) as u64, 32)
+    push16(&ext, 23 as u32)
+    push16(&ext, 65 as u32)
+    rt.buf_push_bytes(&ext, (&(*t).p256_pub[0]) as u64, 65)
     // application_layer_protocol_negotiation (16)
     var http11: [u8; 8] = "http/1.1"
     push16(&ext, 16 as u32)
@@ -689,13 +706,22 @@ fn parse_server_hello(t: *mut Tls, p: u64, off: usize, len: usize,
             if elen2 < 4 {
                 return TlsError::Protocol
             }
-            if be16(p, at) != 29 as u32 {
+            let grp: u32 = be16(p, at)
+            if grp != 29 as u32 && grp != 23 as u32 {
                 return TlsError::Group
             }
             let klen: usize = be16(p, at + 2) as usize
-            if klen != 32 || at + 4 + klen > eend {
+            if at + 4 + klen > eend {
                 return TlsError::Group
             }
+            if grp == 29 as u32 && klen != 32 {
+                return TlsError::Group
+            }
+            // an uncompressed point: 04 || X || Y
+            if grp == 23 as u32 && (klen != 65 || rt.ld8(p, at + 4) != 4 as u8) {
+                return TlsError::Group
+            }
+            (*t).group = grp
             *share = at + 4
             saw_share = true
         }
@@ -718,7 +744,22 @@ fn install_handshake_keys(t: *mut Tls, secret_hash: u64) -> bool {
     var early: [u8; 32] = [0; 32]
     keys.key_schedule_early((&early[0]) as u64)
     var shared: [u8; 32] = [0; 32]
-    if !x25519.x25519((&(*t).priv[0]) as u64, secret_hash,
+    if (*t).group == 23 as u32 {
+        // ECDHE on secp256r1 (RFC 8446 7.4.2): the shared secret is the X
+        // coordinate of d * Q. The peer's point is checked to lie on the
+        // curve first -- a point off the curve makes the multiplication
+        // leak the private scalar (invalid curve attack).
+        var curve: ecdsa.Curve = ecdsa.curve_new_p256()
+        if !ecdsa.point_valid(&curve, secret_hash + 1 as u64,
+            secret_hash + 33 as u64) {
+            return false
+        }
+        var yy: [u8; 32] = [0; 32]
+        if !p256.p256_mult((&(*t).p256_priv[0]) as u64, secret_hash + 1 as u64,
+            secret_hash + 33 as u64, (&shared[0]) as u64, (&yy[0]) as u64) {
+            return false
+        }
+    } else if !x25519.x25519((&(*t).priv[0]) as u64, secret_hash,
         (&shared[0]) as u64) {
         return false
     }
@@ -931,6 +972,23 @@ fn tls_handshake(t: *mut Tls) -> TlsError!bool {
     }
     if !x25519.x25519_base((&(*t).priv[0]) as u64,
         (&(*t).pub_key[0]) as u64) {
+        return TlsError::Random
+    }
+    // the secp256r1 share: a scalar in 1 .. n-1 (a draw outside is
+    // astronomically rare, but it is checked, not assumed)
+    var drawn: bool = false
+    var tries: usize = 0
+    while !drawn && tries < 8 {
+        if !random.random_bytes((&(*t).p256_priv[0]) as u64, 32) {
+            return TlsError::Random
+        }
+        if p256.p256_scalar_valid((&(*t).p256_priv[0]) as u64) {
+            drawn = true
+        }
+        tries = tries + 1
+    }
+    if !drawn || !p256.p256_public((&(*t).p256_priv[0]) as u64,
+        (&(*t).p256_pub[0]) as u64) {
         return TlsError::Random
     }
     var ch: rt.Buf = rt.buf_new()
