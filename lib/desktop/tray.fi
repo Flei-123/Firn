@@ -1,0 +1,988 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/desktop/tray.fi -- desktop.tray: a notification-area (system tray) icon with a menu. Linux.
+//
+//     import desktop.tray
+//
+//     var t: tray.Tray = tray.tray_new("org.example.app", "Example")
+//     tray.tray_set_icon_name(&t, "mail-unread")                  // or tray.tray_set_icon_rgba(...)
+//     tray.tray_set_tooltip(&t, "Example", "2 new messages")
+//     tray.tray_menu_add(&t, 1, "Open", tray.ITEM_ENABLED)
+//     tray.tray_menu_separator(&t)
+//     tray.tray_menu_add(&t, 2, "Quit", tray.ITEM_ENABLED)
+//     if !tray.tray_show(&t) { ... there is no tray on this desktop ... }
+//     var ev: tray.TrayEvent = tray.tray_event_zero()
+//     while tray.tray_poll(&t, 1000, &ev) {                        // pull style: no callbacks, no threads
+//         if ev.kind == tray.EV_MENU && ev.id == 2 { break }
+//         if ev.kind == tray.EV_ACTIVATE { ... show the window ... }
+//     }
+//     tray.tray_close(&t)
+//
+// The same names exist in `tray.windows.fi` (Shell_NotifyIconW) and in the
+// stubs `tray_macos.fi` / `lib/@android/desktop/tray.fi` / `tray_osum.fi`;
+// `tools/desktop/platforms.py` checks that all of them export the same names.
+//
+// HOW IT WORKS ON LINUX. The StatusNotifierItem specification (the one KDE,
+// the GNOME AppIndicator extension, Xfce, Cinnamon, LXQt, MATE and Budgie
+// implement): the program owns the bus name `org.kde.StatusNotifierItem-<pid>-<n>`,
+// exports `/StatusNotifierItem` (interface `org.kde.StatusNotifierItem`:
+// the properties Id, Title, Status, IconName, IconPixmap, ToolTip, Menu ...,
+// the methods Activate, SecondaryActivate, ContextMenu, Scroll) and the menu
+// as `com.canonical.dbusmenu` on `/MenuBar` (GetLayout, GetGroupProperties,
+// Event, AboutToShow ...), and tells the `org.kde.StatusNotifierWatcher` about
+// itself. The desktop draws the icon and the menu; a click arrives as a method
+// call, which `tray_poll` turns into an event. All of it rides on `net.dbus`.
+//
+// HONEST
+// T1  A desktop without a StatusNotifierWatcher (plain X11 window managers,
+//     GNOME without the AppIndicator extension) has no tray for this: `tray_show`
+//     returns false. The program keeps listening and registers by itself when a
+//     watcher appears later (`NameOwnerChanged`). The old XEMBED system tray
+//     (a `_NET_SYSTEM_TRAY` window and an X11 client message) is NOT implemented:
+//     D-Bus turned out to be a few hundred lines on top of net.dbus, so the
+//     fallback was not needed to reach KDE/GNOME/Xfce/etc.; it would be a
+//     separate back end if a window manager that only has XEMBED must be served.
+// T2  The menu is flat (one level, items, separators, check marks). No
+//     sub-menus, no icons per item, no shortcuts shown.
+// T3  The program must call `tray_poll` regularly (a few times per second at
+//     least), or the desktop's questions (GetLayout, Properties) go unanswered
+//     and the icon appears empty or the menu does not open. A program with its
+//     own event loop calls `tray_poll(&t, 0, &ev)`; `tray_fd` is the descriptor
+//     to wait for.
+// T4  Tested against a Python implementation of the watcher and the menu
+//     client on a private bus (`tools/desktop/run.sh`, dbus-python, i.e.
+//     libdbus -- not against a real desktop: none is installed on the build machine).
+// T5  `tray_set_icon_rgba` takes straight (non-premultiplied) RGBA like every
+//     other Firn image API and sends ARGB32 in network order, as the
+//     specification wants. Several sizes can be added; the desktop picks one.
+import std.rt
+import std.str
+import net.dbus
+import net.unix
+
+export {
+    Tray, TrayEvent,
+    tray_new, tray_close, tray_event_zero,
+    tray_set_icon_name, tray_set_icon_rgba, tray_clear_icons, tray_set_tooltip, tray_set_title,
+    tray_set_status,
+    tray_menu_clear, tray_menu_add, tray_menu_separator, tray_menu_set_checked,
+    tray_menu_set_enabled, tray_menu_set_label,
+    tray_show, tray_hide, tray_visible, tray_poll, tray_fd, tray_balloon,
+    tray_available,
+    EV_NONE, EV_ACTIVATE, EV_SECONDARY, EV_MENU, EV_CONTEXT, EV_SCROLL, EV_BALLOON_CLICK, EV_BALLOON_CLOSED,
+    ITEM_ENABLED, ITEM_CHECKABLE, ITEM_CHECKED, ITEM_HIDDEN,
+    STATUS_ACTIVE, STATUS_PASSIVE, STATUS_ATTENTION,
+}
+
+const EV_NONE: u32 = 0
+const EV_ACTIVATE: u32 = 1 // the primary click (left button)
+const EV_SECONDARY: u32 = 2 // middle click
+const EV_MENU: u32 = 3 // a menu item was chosen: `id`
+const EV_CONTEXT: u32 = 4 // the context menu was asked for (x, y); the desktop shows ours itself
+const EV_SCROLL: u32 = 5 // the wheel over the icon: `x` = delta, `y` = 0 vertical / 1 horizontal
+const EV_BALLOON_CLICK: u32 = 6 // Windows only
+const EV_BALLOON_CLOSED: u32 = 7 // Windows only
+
+const ITEM_ENABLED: u32 = 1
+const ITEM_CHECKABLE: u32 = 2
+const ITEM_CHECKED: u32 = 4
+const ITEM_HIDDEN: u32 = 8
+const ITEM_SEPARATOR: u32 = 16
+
+const STATUS_PASSIVE: u32 = 0
+const STATUS_ACTIVE: u32 = 1
+const STATUS_ATTENTION: u32 = 2
+
+struct TrayEvent {
+    kind: u32,
+    id: u32,
+    x: i32,
+    y: i32,
+}
+
+fn tray_event_zero() -> TrayEvent {
+    return TrayEvent { kind: 0 as u32, id: 0 as u32, x: 0, y: 0 }
+}
+
+struct Tray {
+    bus: dbus.Bus,
+    shown: bool, // the program wants the icon (tray_show called, tray_hide not)
+    registered: bool, // the watcher knows us
+    named: bool, // we own our bus name
+    started: bool,
+    status: u32,
+    revision: u32, // the menu layout revision
+    app_id: rt.Buf,
+    title: rt.Buf,
+    icon_name: rt.Buf,
+    tip_title: rt.Buf,
+    tip_text: rt.Buf,
+    svc: rt.Buf, // our bus name
+    pix: rt.Buf, // icons: records (u32 w, u32 h, ARGB octets)
+    menu: rt.Buf, // records: u32 id, u32 flags, u32 label length, label octets padded to 4
+    events: rt.Buf, // queued TrayEvent records of 16 octets
+}
+
+fn copy_into(b: *mut rt.Buf, s: str) {
+    rt.buf_clear(b)
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+fn view(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn tray_new(app_id: str, title: str) -> Tray {
+    var t: Tray = Tray { bus: dbus.bus_new(), shown: false, registered: false, named: false,
+        started: false, status: STATUS_ACTIVE, revision: 1 as u32,
+        app_id: rt.buf_new(), title: rt.buf_new(), icon_name: rt.buf_new(),
+        tip_title: rt.buf_new(), tip_text: rt.buf_new(), svc: rt.buf_new(), pix: rt.buf_new(),
+        menu: rt.buf_new(), events: rt.buf_new() }
+    copy_into(&t.app_id, app_id)
+    copy_into(&t.title, title)
+    return t
+}
+
+fn tray_close(t: *mut Tray) {
+    dbus.bus_free(&(*t).bus)
+    rt.buf_free(&(*t).app_id)
+    rt.buf_free(&(*t).title)
+    rt.buf_free(&(*t).icon_name)
+    rt.buf_free(&(*t).tip_title)
+    rt.buf_free(&(*t).tip_text)
+    rt.buf_free(&(*t).svc)
+    rt.buf_free(&(*t).pix)
+    rt.buf_free(&(*t).menu)
+    rt.buf_free(&(*t).events)
+    (*t).shown = false
+    (*t).registered = false
+    (*t).named = false
+}
+
+fn tray_fd(t: *mut Tray) -> i32 {
+    return dbus.bus_fd(&(*t).bus)
+}
+
+fn tray_visible(t: *mut Tray) -> bool {
+    return (*t).shown && (*t).registered
+}
+
+// ----------------------------------------------------------- the state
+
+const ITEM_PATH: str = "/StatusNotifierItem"
+const MENU_PATH: str = "/MenuBar"
+const IF_ITEM: str = "org.kde.StatusNotifierItem"
+const IF_MENU: str = "com.canonical.dbusmenu"
+const IF_PROPS: str = "org.freedesktop.DBus.Properties"
+const WATCHER: str = "org.kde.StatusNotifierWatcher"
+
+fn emit_signal(t: *mut Tray, path: str, iface: str, member: str, sig: str, body: *mut rt.Buf) {
+    if (*t).registered {
+        dbus.bus_signal(&(*t).bus, path, iface, member, sig, body)
+    }
+}
+
+fn tray_set_title(t: *mut Tray, title: str) {
+    copy_into(&(*t).title, title)
+    emit_signal(t, ITEM_PATH, IF_ITEM, "NewTitle", "", 0 as *mut rt.Buf)
+}
+
+fn tray_set_icon_name(t: *mut Tray, name: str) {
+    copy_into(&(*t).icon_name, name)
+    emit_signal(t, ITEM_PATH, IF_ITEM, "NewIcon", "", 0 as *mut rt.Buf)
+}
+
+fn tray_clear_icons(t: *mut Tray) {
+    rt.buf_clear(&(*t).pix)
+    emit_signal(t, ITEM_PATH, IF_ITEM, "NewIcon", "", 0 as *mut rt.Buf)
+}
+
+fn put_u32(b: *mut rt.Buf, v: u32) {
+    var le: [u8; 4] = [0; 4]
+    le[0] = (v & 255 as u32) as u8
+    le[1] = ((v >> 8) & 255 as u32) as u8
+    le[2] = ((v >> 16) & 255 as u32) as u8
+    le[3] = ((v >> 24) & 255 as u32) as u8
+    rt.buf_push_bytes(b, (&le[0]) as u64, 4)
+}
+
+fn get_u32(p: u64) -> u32 {
+    return (rt.ld8(p, 0) as u32) | ((rt.ld8(p, 1) as u32) << 8) | ((rt.ld8(p, 2) as u32) << 16)
+        | ((rt.ld8(p, 3) as u32) << 24)
+}
+
+// Adds a picture: `rgba` points at w*h*4 octets (R, G, B, A, straight alpha).
+fn tray_set_icon_rgba(t: *mut Tray, w: u32, h: u32, rgba: u64) -> bool {
+    if w == 0 as u32 || h == 0 as u32 || w > 512 as u32 || h > 512 as u32 {
+        return false
+    }
+    let n: usize = (w as usize) * (h as usize)
+    put_u32(&(*t).pix, w)
+    put_u32(&(*t).pix, h)
+    var p: usize = 0
+    while p < n {
+        let r: u8 = rt.ld8(rgba, p * 4)
+        let g: u8 = rt.ld8(rgba, p * 4 + 1)
+        let b: u8 = rt.ld8(rgba, p * 4 + 2)
+        let a: u8 = rt.ld8(rgba, p * 4 + 3)
+        rt.buf_push(&(*t).pix, a)
+        rt.buf_push(&(*t).pix, r)
+        rt.buf_push(&(*t).pix, g)
+        rt.buf_push(&(*t).pix, b)
+        p = p + 1
+    }
+    emit_signal(t, ITEM_PATH, IF_ITEM, "NewIcon", "", 0 as *mut rt.Buf)
+    return true
+}
+
+fn tray_set_tooltip(t: *mut Tray, title: str, text: str) {
+    copy_into(&(*t).tip_title, title)
+    copy_into(&(*t).tip_text, text)
+    emit_signal(t, ITEM_PATH, IF_ITEM, "NewToolTip", "", 0 as *mut rt.Buf)
+}
+
+fn status_text(s: u32) -> str {
+    if s == STATUS_PASSIVE {
+        return "Passive"
+    }
+    if s == STATUS_ATTENTION {
+        return "NeedsAttention"
+    }
+    return "Active"
+}
+
+fn tray_set_status(t: *mut Tray, s: u32) {
+    (*t).status = s
+    var body: rt.Buf = rt.buf_new()
+    dbus.w_str(&body, status_text(s))
+    emit_signal(t, ITEM_PATH, IF_ITEM, "NewStatus", "s", &body)
+    rt.buf_free(&body)
+}
+
+// ------------------------------------------------------------ the menu
+//
+// Records in `menu`: u32 id, u32 flags, u32 label length, label (padded to 4).
+
+fn tray_menu_clear(t: *mut Tray) {
+    rt.buf_clear(&(*t).menu)
+    menu_changed(t)
+}
+
+fn menu_changed(t: *mut Tray) {
+    (*t).revision = (*t).revision + 1 as u32
+    var body: rt.Buf = rt.buf_new()
+    dbus.w_u32(&body, (*t).revision)
+    dbus.w_i32(&body, 0)
+    emit_signal(t, MENU_PATH, IF_MENU, "LayoutUpdated", "ui", &body)
+    rt.buf_free(&body)
+}
+
+// Ids must be > 0 and unique (0 is the invisible root).
+fn tray_menu_add(t: *mut Tray, id: u32, label: str, flags: u32) -> bool {
+    if id == 0 as u32 {
+        return false
+    }
+    put_u32(&(*t).menu, id)
+    put_u32(&(*t).menu, flags)
+    put_u32(&(*t).menu, label.length() as u32)
+    rt.buf_push_bytes(&(*t).menu, label.p as u64, label.length())
+    while rt.buf_len(&(*t).menu) % 4 != 0 {
+        rt.buf_push(&(*t).menu, 0 as u8)
+    }
+    menu_changed(t)
+    return true
+}
+
+fn tray_menu_separator(t: *mut Tray) {
+    // separators get ids from the top of the range so they never clash
+    var n: u32 = 2147483000 as u32
+    let p: u64 = rt.buf_ptr(&(*t).menu)
+    var off: usize = 0
+    while off < rt.buf_len(&(*t).menu) {
+        let id: u32 = get_u32(p + off as u64)
+        let fl: u32 = get_u32(p + off as u64 + 4)
+        let ll: usize = get_u32(p + off as u64 + 8) as usize
+        if (fl & ITEM_SEPARATOR) != 0 as u32 && id >= n {
+            n = id + 1 as u32
+        }
+        off = off + 12 + (ll + 3) / 4 * 4
+    }
+    put_u32(&(*t).menu, n)
+    put_u32(&(*t).menu, ITEM_SEPARATOR | ITEM_ENABLED)
+    put_u32(&(*t).menu, 0 as u32)
+    menu_changed(t)
+}
+
+// Finds a record; returns its offset or the length when absent.
+fn menu_find(t: *mut Tray, id: u32) -> usize {
+    let p: u64 = rt.buf_ptr(&(*t).menu)
+    var off: usize = 0
+    while off < rt.buf_len(&(*t).menu) {
+        let ll: usize = get_u32(p + off as u64 + 8) as usize
+        if get_u32(p + off as u64) == id {
+            return off
+        }
+        off = off + 12 + (ll + 3) / 4 * 4
+    }
+    return rt.buf_len(&(*t).menu)
+}
+
+fn menu_set_flag(t: *mut Tray, id: u32, flag: u32, on: bool) -> bool {
+    let off: usize = menu_find(t, id)
+    if off >= rt.buf_len(&(*t).menu) {
+        return false
+    }
+    let q: u64 = rt.buf_ptr(&(*t).menu) + off as u64 + 4
+    var fl: u32 = get_u32(q)
+    if on {
+        fl = fl | flag
+    } else {
+        fl = fl & (~flag)
+    }
+    var le: [u8; 4] = [0; 4]
+    le[0] = (fl & 255 as u32) as u8
+    le[1] = ((fl >> 8) & 255 as u32) as u8
+    le[2] = ((fl >> 16) & 255 as u32) as u8
+    le[3] = ((fl >> 24) & 255 as u32) as u8
+    rt.mem_copy(q, (&le[0]) as u64, 4)
+    return true
+}
+
+fn tray_menu_set_checked(t: *mut Tray, id: u32, on: bool) -> bool {
+    if !menu_set_flag(t, id, ITEM_CHECKED, on) {
+        return false
+    }
+    if on {
+        menu_set_flag(t, id, ITEM_CHECKABLE, true)
+    }
+    menu_changed(t)
+    return true
+}
+
+fn tray_menu_set_enabled(t: *mut Tray, id: u32, on: bool) -> bool {
+    if !menu_set_flag(t, id, ITEM_ENABLED, on) {
+        return false
+    }
+    menu_changed(t)
+    return true
+}
+
+// Changing a label rebuilds the record (labels differ in length).
+fn tray_menu_set_label(t: *mut Tray, id: u32, label: str) -> bool {
+    let off: usize = menu_find(t, id)
+    let total: usize = rt.buf_len(&(*t).menu)
+    if off >= total {
+        return false
+    }
+    let p: u64 = rt.buf_ptr(&(*t).menu)
+    let fl: u32 = get_u32(p + off as u64 + 4)
+    let ll: usize = get_u32(p + off as u64 + 8) as usize
+    let rec: usize = 12 + (ll + 3) / 4 * 4
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&nb, p, off)
+    put_u32(&nb, id)
+    put_u32(&nb, fl)
+    put_u32(&nb, label.length() as u32)
+    rt.buf_push_bytes(&nb, label.p as u64, label.length())
+    while rt.buf_len(&nb) % 4 != 0 {
+        rt.buf_push(&nb, 0 as u8)
+    }
+    rt.buf_push_bytes(&nb, p + (off + rec) as u64, total - off - rec)
+    rt.buf_clear(&(*t).menu)
+    rt.buf_push_bytes(&(*t).menu, rt.buf_ptr(&nb), rt.buf_len(&nb))
+    rt.buf_free(&nb)
+    menu_changed(t)
+    return true
+}
+
+// ----------------------------------------------------- property values
+
+fn w_dict_key(b: *mut rt.Buf, key: str) {
+    dbus.w_struct_begin(b)
+    dbus.w_str(b, key)
+}
+
+fn w_pixmaps(b: *mut rt.Buf, t: *mut Tray) {
+    // a(iiay)
+    let at: usize = dbus.w_array_begin(b, 8)
+    let p: u64 = rt.buf_ptr(&(*t).pix)
+    var off: usize = 0
+    while off < rt.buf_len(&(*t).pix) {
+        let w: u32 = get_u32(p + off as u64)
+        let h: u32 = get_u32(p + off as u64 + 4)
+        let n: usize = (w as usize) * (h as usize) * 4
+        dbus.w_struct_begin(b)
+        dbus.w_i32(b, dbus.bits_i32(w))
+        dbus.w_i32(b, dbus.bits_i32(h))
+        dbus.w_u32(b, n as u32)
+        rt.buf_push_bytes(b, p + off as u64 + 8, n)
+        off = off + 8 + n
+    }
+    dbus.w_array_end(b, at, 8)
+}
+
+fn w_empty_array(b: *mut rt.Buf, align: usize) {
+    let at: usize = dbus.w_array_begin(b, align)
+    dbus.w_array_end(b, at, align)
+}
+
+// Writes the VARIANT (signature + value) of an item property. false = unknown name.
+fn item_prop(b: *mut rt.Buf, t: *mut Tray, name: str) -> bool {
+    if name == "Category" {
+        dbus.w_variant(b, "s")
+        dbus.w_str(b, "ApplicationStatus")
+    } else if name == "Id" {
+        dbus.w_variant(b, "s")
+        dbus.w_str(b, view(&(*t).app_id))
+    } else if name == "Title" {
+        dbus.w_variant(b, "s")
+        dbus.w_str(b, view(&(*t).title))
+    } else if name == "Status" {
+        dbus.w_variant(b, "s")
+        dbus.w_str(b, status_text((*t).status))
+    } else if name == "WindowId" {
+        dbus.w_variant(b, "u")
+        dbus.w_u32(b, 0 as u32)
+    } else if name == "IconName" {
+        dbus.w_variant(b, "s")
+        dbus.w_str(b, view(&(*t).icon_name))
+    } else if name == "IconPixmap" {
+        dbus.w_variant(b, "a(iiay)")
+        w_pixmaps(b, t)
+    } else if name == "OverlayIconName" || name == "AttentionIconName" || name == "AttentionMovieName"
+    || name == "IconThemePath" {
+        dbus.w_variant(b, "s")
+        dbus.w_str(b, "")
+    } else if name == "OverlayIconPixmap" || name == "AttentionIconPixmap" {
+        dbus.w_variant(b, "a(iiay)")
+        w_empty_array(b, 8)
+    } else if name == "ToolTip" {
+        dbus.w_variant(b, "(sa(iiay)ss)")
+        dbus.w_struct_begin(b)
+        dbus.w_str(b, "")
+        w_empty_array(b, 8)
+        dbus.w_str(b, view(&(*t).tip_title))
+        dbus.w_str(b, view(&(*t).tip_text))
+    } else if name == "ItemIsMenu" {
+        dbus.w_variant(b, "b")
+        dbus.w_bool(b, false)
+    } else if name == "Menu" {
+        dbus.w_variant(b, "o")
+        dbus.w_path(b, MENU_PATH)
+    } else {
+        return false
+    }
+    return true
+}
+
+fn item_prop_name(i: usize) -> str {
+    if i == 0 { return "Category" }
+    if i == 1 { return "Id" }
+    if i == 2 { return "Title" }
+    if i == 3 { return "Status" }
+    if i == 4 { return "WindowId" }
+    if i == 5 { return "IconName" }
+    if i == 6 { return "IconPixmap" }
+    if i == 7 { return "OverlayIconName" }
+    if i == 8 { return "OverlayIconPixmap" }
+    if i == 9 { return "AttentionIconName" }
+    if i == 10 { return "AttentionIconPixmap" }
+    if i == 11 { return "AttentionMovieName" }
+    if i == 12 { return "ToolTip" }
+    if i == 13 { return "ItemIsMenu" }
+    if i == 14 { return "Menu" }
+    return "IconThemePath"
+}
+
+fn menu_prop(b: *mut rt.Buf, name: str) -> bool {
+    if name == "Version" {
+        dbus.w_variant(b, "u")
+        dbus.w_u32(b, 3 as u32)
+    } else if name == "TextDirection" {
+        dbus.w_variant(b, "s")
+        dbus.w_str(b, "ltr")
+    } else if name == "Status" {
+        dbus.w_variant(b, "s")
+        dbus.w_str(b, "normal")
+    } else if name == "IconThemePath" {
+        dbus.w_variant(b, "as")
+        w_empty_array(b, 4)
+    } else {
+        return false
+    }
+    return true
+}
+
+fn menu_prop_name(i: usize) -> str {
+    if i == 0 { return "Version" }
+    if i == 1 { return "TextDirection" }
+    if i == 2 { return "Status" }
+    return "IconThemePath"
+}
+
+// ----------------------------------------------------- menu item layout
+
+// a{sv} of one record at `off`
+fn w_item_props(b: *mut rt.Buf, t: *mut Tray, off: usize) {
+    let p: u64 = rt.buf_ptr(&(*t).menu) + off as u64
+    let fl: u32 = get_u32(p + 4)
+    let ll: usize = get_u32(p + 8) as usize
+    let at: usize = dbus.w_array_begin(b, 8)
+    if (fl & ITEM_SEPARATOR) != 0 as u32 {
+        w_dict_key(b, "type")
+        dbus.w_variant(b, "s")
+        dbus.w_str(b, "separator")
+    } else {
+        w_dict_key(b, "label")
+        dbus.w_variant(b, "s")
+        dbus.w_str(b, str { p: (p + 12) as *mut u8, n: ll })
+        if (fl & ITEM_ENABLED) == 0 as u32 {
+            w_dict_key(b, "enabled")
+            dbus.w_variant(b, "b")
+            dbus.w_bool(b, false)
+        }
+        if (fl & ITEM_CHECKABLE) != 0 as u32 || (fl & ITEM_CHECKED) != 0 as u32 {
+            w_dict_key(b, "toggle-type")
+            dbus.w_variant(b, "s")
+            dbus.w_str(b, "checkmark")
+            w_dict_key(b, "toggle-state")
+            dbus.w_variant(b, "i")
+            if (fl & ITEM_CHECKED) != 0 as u32 {
+                dbus.w_i32(b, 1)
+            } else {
+                dbus.w_i32(b, 0)
+            }
+        }
+    }
+    if (fl & ITEM_HIDDEN) != 0 as u32 {
+        w_dict_key(b, "visible")
+        dbus.w_variant(b, "b")
+        dbus.w_bool(b, false)
+    }
+    dbus.w_array_end(b, at, 8)
+}
+
+// (ia{sv}av) for item `id` (0 = the root with all children)
+fn w_layout(b: *mut rt.Buf, t: *mut Tray, id: u32, with_children: bool) -> bool {
+    dbus.w_struct_begin(b)
+    if id == 0 as u32 {
+        dbus.w_i32(b, 0)
+        let at: usize = dbus.w_array_begin(b, 8)
+        w_dict_key(b, "children-display")
+        dbus.w_variant(b, "s")
+        dbus.w_str(b, "submenu")
+        dbus.w_array_end(b, at, 8)
+        let ca: usize = dbus.w_array_begin(b, 1)
+        if with_children {
+            let p: u64 = rt.buf_ptr(&(*t).menu)
+            var off: usize = 0
+            while off < rt.buf_len(&(*t).menu) {
+                let ll: usize = get_u32(p + off as u64 + 8) as usize
+                dbus.w_variant(b, "(ia{sv}av)")
+                dbus.w_struct_begin(b)
+                dbus.w_i32(b, dbus.bits_i32(get_u32(p + off as u64)))
+                w_item_props(b, t, off)
+                w_empty_array(b, 1)
+                off = off + 12 + (ll + 3) / 4 * 4
+            }
+        }
+        dbus.w_array_end(b, ca, 1)
+        return true
+    }
+    let off: usize = menu_find(t, id)
+    if off >= rt.buf_len(&(*t).menu) {
+        return false
+    }
+    dbus.w_i32(b, dbus.bits_i32(id))
+    w_item_props(b, t, off)
+    w_empty_array(b, 1)
+    return true
+}
+
+// ------------------------------------------------------------ events
+
+fn push_event(t: *mut Tray, kind: u32, id: u32, x: i32, y: i32) {
+    put_u32(&(*t).events, kind)
+    put_u32(&(*t).events, id)
+    put_u32(&(*t).events, dbus.i32_bits(x))
+    put_u32(&(*t).events, dbus.i32_bits(y))
+}
+
+fn pop_event(t: *mut Tray, ev: *mut TrayEvent) -> bool {
+    let n: usize = rt.buf_len(&(*t).events)
+    if n < 16 {
+        return false
+    }
+    let p: u64 = rt.buf_ptr(&(*t).events)
+    (*ev).kind = get_u32(p)
+    (*ev).id = get_u32(p + 4)
+    (*ev).x = dbus.bits_i32(get_u32(p + 8))
+    (*ev).y = dbus.bits_i32(get_u32(p + 12))
+    rt.mem_copy(p, p + 16, n - 16)
+    rt.buf_set_len(&(*t).events, n - 16)
+    return true
+}
+
+// ------------------------------------------------------------ the service
+
+const INTROSPECT_ITEM: str = "<node><interface name=\"org.kde.StatusNotifierItem\"><method name=\"ContextMenu\"><arg type=\"i\" direction=\"in\"/><arg type=\"i\" direction=\"in\"/></method><method name=\"Activate\"><arg type=\"i\" direction=\"in\"/><arg type=\"i\" direction=\"in\"/></method><method name=\"SecondaryActivate\"><arg type=\"i\" direction=\"in\"/><arg type=\"i\" direction=\"in\"/></method><method name=\"Scroll\"><arg type=\"i\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/></method><property name=\"Category\" type=\"s\" access=\"read\"/><property name=\"Id\" type=\"s\" access=\"read\"/><property name=\"Title\" type=\"s\" access=\"read\"/><property name=\"Status\" type=\"s\" access=\"read\"/><property name=\"IconName\" type=\"s\" access=\"read\"/><property name=\"IconPixmap\" type=\"a(iiay)\" access=\"read\"/><property name=\"ToolTip\" type=\"(sa(iiay)ss)\" access=\"read\"/><property name=\"ItemIsMenu\" type=\"b\" access=\"read\"/><property name=\"Menu\" type=\"o\" access=\"read\"/><signal name=\"NewIcon\"/><signal name=\"NewTitle\"/><signal name=\"NewToolTip\"/><signal name=\"NewStatus\"><arg type=\"s\"/></signal></interface><interface name=\"org.freedesktop.DBus.Properties\"><method name=\"Get\"><arg type=\"s\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/><arg type=\"v\" direction=\"out\"/></method><method name=\"GetAll\"><arg type=\"s\" direction=\"in\"/><arg type=\"a{sv}\" direction=\"out\"/></method></interface></node>"
+
+const INTROSPECT_MENU: str = "<node><interface name=\"com.canonical.dbusmenu\"><method name=\"GetLayout\"><arg type=\"i\" direction=\"in\"/><arg type=\"i\" direction=\"in\"/><arg type=\"as\" direction=\"in\"/><arg type=\"u\" direction=\"out\"/><arg type=\"(ia{sv}av)\" direction=\"out\"/></method><method name=\"GetGroupProperties\"><arg type=\"ai\" direction=\"in\"/><arg type=\"as\" direction=\"in\"/><arg type=\"a(ia{sv})\" direction=\"out\"/></method><method name=\"Event\"><arg type=\"i\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/><arg type=\"v\" direction=\"in\"/><arg type=\"u\" direction=\"in\"/></method><method name=\"AboutToShow\"><arg type=\"i\" direction=\"in\"/><arg type=\"b\" direction=\"out\"/></method><property name=\"Version\" type=\"u\" access=\"read\"/><property name=\"TextDirection\" type=\"s\" access=\"read\"/><property name=\"Status\" type=\"s\" access=\"read\"/><signal name=\"LayoutUpdated\"><arg type=\"u\"/><arg type=\"i\"/></signal></interface></node>"
+
+fn unknown_method(t: *mut Tray, m: *mut dbus.Msg) {
+    dbus.bus_reply_error(&(*t).bus, m, "org.freedesktop.DBus.Error.UnknownMethod", "unknown method")
+}
+
+fn handle_props(t: *mut Tray, m: *mut dbus.Msg, is_item: bool) {
+    var rd: dbus.Rd = dbus.msg_body(m)
+    let member: str = (*m).f.member
+    let iface: str = dbus.rd_str(&rd)
+    let want_item: bool = iface == IF_ITEM
+    let want_menu: bool = iface == IF_MENU
+    if !rd.ok || !((is_item && want_item) || (!is_item && want_menu)) {
+        dbus.bus_reply_error(&(*t).bus, m, "org.freedesktop.DBus.Error.UnknownInterface", "unknown interface")
+        return
+    }
+    var body: rt.Buf = rt.buf_new()
+    if member == "Get" {
+        let name: str = dbus.rd_str(&rd)
+        var ok: bool = false
+        if rd.ok {
+            if is_item {
+                ok = item_prop(&body, t, name)
+            } else {
+                ok = menu_prop(&body, name)
+            }
+        }
+        if ok {
+            dbus.bus_reply(&(*t).bus, m, "v", &body)
+        } else {
+            dbus.bus_reply_error(&(*t).bus, m, "org.freedesktop.DBus.Error.UnknownProperty", "unknown property")
+        }
+    } else if member == "GetAll" {
+        let at: usize = dbus.w_array_begin(&body, 8)
+        var i: usize = 0
+        if is_item {
+            while i < 16 {
+                w_dict_key(&body, item_prop_name(i))
+                item_prop(&body, t, item_prop_name(i))
+                i = i + 1
+            }
+        } else {
+            while i < 4 {
+                w_dict_key(&body, menu_prop_name(i))
+                menu_prop(&body, menu_prop_name(i))
+                i = i + 1
+            }
+        }
+        dbus.w_array_end(&body, at, 8)
+        dbus.bus_reply(&(*t).bus, m, "a{sv}", &body)
+    } else {
+        dbus.bus_reply_error(&(*t).bus, m, "org.freedesktop.DBus.Error.PropertyReadOnly", "read only")
+    }
+    rt.buf_free(&body)
+}
+
+fn handle_item_call(t: *mut Tray, m: *mut dbus.Msg) {
+    let member: str = (*m).f.member
+    var rd: dbus.Rd = dbus.msg_body(m)
+    if member == "Activate" || member == "SecondaryActivate" || member == "ContextMenu" {
+        let x: i32 = dbus.rd_i32(&rd)
+        let y: i32 = dbus.rd_i32(&rd)
+        var kind: u32 = EV_ACTIVATE
+        if member == "SecondaryActivate" {
+            kind = EV_SECONDARY
+        } else if member == "ContextMenu" {
+            kind = EV_CONTEXT
+        }
+        push_event(t, kind, 0 as u32, x, y)
+        dbus.bus_reply(&(*t).bus, m, "", 0 as *mut rt.Buf)
+    } else if member == "Scroll" {
+        let delta: i32 = dbus.rd_i32(&rd)
+        let orient: str = dbus.rd_str(&rd)
+        var o: i32 = 0
+        if orient == "horizontal" {
+            o = 1
+        }
+        push_event(t, EV_SCROLL, 0 as u32, delta, o)
+        dbus.bus_reply(&(*t).bus, m, "", 0 as *mut rt.Buf)
+    } else {
+        unknown_method(t, m)
+    }
+}
+
+fn pad8(n: usize) -> usize {
+    return (n + 7) / 8 * 8
+}
+
+fn handle_menu_call(t: *mut Tray, m: *mut dbus.Msg) {
+    let member: str = (*m).f.member
+    var rd: dbus.Rd = dbus.msg_body(m)
+    var body: rt.Buf = rt.buf_new()
+    if member == "GetLayout" {
+        let parent: i32 = dbus.rd_i32(&rd)
+        let depth: i32 = dbus.rd_i32(&rd)
+        dbus.w_u32(&body, (*t).revision)
+        if parent < 0 || !w_layout(&body, t, parent as u32, depth != 0) {
+            dbus.bus_reply_error(&(*t).bus, m, "com.canonical.dbusmenu.Error", "no such item")
+        } else {
+            dbus.bus_reply(&(*t).bus, m, "u(ia{sv}av)", &body)
+        }
+    } else if member == "GetGroupProperties" {
+        // a(ia{sv}): the properties of the asked ids (all of them when the list is empty)
+        let end: usize = dbus.rd_array_begin(&rd, 4)
+        var ids: rt.Buf = rt.buf_new()
+        while dbus.rd_array_more(&rd, end) {
+            put_u32(&ids, dbus.rd_u32(&rd))
+        }
+        let at: usize = dbus.w_array_begin(&body, 8)
+        let p: u64 = rt.buf_ptr(&(*t).menu)
+        var off: usize = 0
+        while off < rt.buf_len(&(*t).menu) {
+            let id: u32 = get_u32(p + off as u64)
+            let ll: usize = get_u32(p + off as u64 + 8) as usize
+            var take: bool = rt.buf_len(&ids) == 0
+            var k: usize = 0
+            while k < rt.buf_len(&ids) {
+                if get_u32(rt.buf_ptr(&ids) + k as u64) == id {
+                    take = true
+                }
+                k = k + 4
+            }
+            if take {
+                dbus.w_struct_begin(&body)
+                dbus.w_i32(&body, dbus.bits_i32(id))
+                w_item_props(&body, t, off)
+            }
+            off = off + 12 + (ll + 3) / 4 * 4
+        }
+        dbus.w_array_end(&body, at, 8)
+        rt.buf_free(&ids)
+        dbus.bus_reply(&(*t).bus, m, "a(ia{sv})", &body)
+    } else if member == "GetProperty" {
+        let id: i32 = dbus.rd_i32(&rd)
+        let name: str = dbus.rd_str(&rd)
+        dbus.w_variant(&body, "s")
+        dbus.w_str(&body, name)
+        dbus.bus_reply(&(*t).bus, m, "v", &body)
+    } else if member == "Event" {
+        let id: i32 = dbus.rd_i32(&rd)
+        let ev: str = dbus.rd_str(&rd)
+        if rd.ok && ev == "clicked" && id > 0 {
+            push_event(t, EV_MENU, id as u32, 0, 0)
+        }
+        dbus.bus_reply(&(*t).bus, m, "", 0 as *mut rt.Buf)
+    } else if member == "EventGroup" {
+        // a(isvu) -> ai (ids that do not exist; none)
+        let end: usize = dbus.rd_array_begin(&rd, 8)
+        while dbus.rd_array_more(&rd, end) {
+            rd.pos = pad8(rd.pos)
+            let id: i32 = dbus.rd_i32(&rd)
+            let ev: str = dbus.rd_str(&rd)
+            let vs: str = dbus.rd_sig(&rd)
+            var i: usize = 0
+            dbus.rd_skip_value(&rd, vs, &i)
+            dbus.rd_u32(&rd)
+            if rd.ok && ev == "clicked" && id > 0 {
+                push_event(t, EV_MENU, id as u32, 0, 0)
+            }
+        }
+        w_empty_array(&body, 4)
+        dbus.bus_reply(&(*t).bus, m, "ai", &body)
+    } else if member == "AboutToShow" {
+        dbus.w_bool(&body, false)
+        dbus.bus_reply(&(*t).bus, m, "b", &body)
+    } else if member == "AboutToShowGroup" {
+        w_empty_array(&body, 4)
+        w_empty_array(&body, 4)
+        dbus.bus_reply(&(*t).bus, m, "aiai", &body)
+    } else {
+        unknown_method(t, m)
+    }
+    rt.buf_free(&body)
+}
+
+fn register_with_watcher(t: *mut Tray) -> bool {
+    if !dbus.bus_name_owned(&(*t).bus, WATCHER) {
+        return false
+    }
+    var f: dbus.Fields = dbus.fields_call(WATCHER, "/StatusNotifierWatcher", WATCHER,
+        "RegisterStatusNotifierItem", "s")
+    var body: rt.Buf = rt.buf_new()
+    dbus.w_str(&body, view(&(*t).svc))
+    var reply: dbus.Msg = dbus.msg_new()
+    let rc: i32 = dbus.bus_call(&(*t).bus, &f, &body, &reply, 5000)
+    rt.buf_free(&body)
+    dbus.msg_free(&reply)
+    (*t).registered = rc == 0
+    return rc == 0
+}
+
+fn handle_message(t: *mut Tray, m: *mut dbus.Msg) {
+    if dbus.msg_is_signal(m) {
+        // NameOwnerChanged for the watcher: register again when a new one appears
+        if (*m).f.member == "NameOwnerChanged" && (*m).f.iface == "org.freedesktop.DBus" {
+            var rd: dbus.Rd = dbus.msg_body(m)
+            let name: str = dbus.rd_str(&rd)
+            let old: str = dbus.rd_str(&rd)
+            let nw: str = dbus.rd_str(&rd)
+            if rd.ok && name == WATCHER {
+                if nw.length() > 0 {
+                    if (*t).shown {
+                        register_with_watcher(t)
+                    }
+                } else {
+                    (*t).registered = false
+                }
+            }
+        }
+        return
+    }
+    if !dbus.msg_is_call(m) {
+        return
+    }
+    let path: str = (*m).f.path
+    let iface: str = (*m).f.iface
+    let member: str = (*m).f.member
+    if iface == "org.freedesktop.DBus.Peer" {
+        if member == "Ping" {
+            dbus.bus_reply(&(*t).bus, m, "", 0 as *mut rt.Buf)
+        } else {
+            var body: rt.Buf = rt.buf_new()
+            dbus.w_str(&body, "00000000000000000000000000000000")
+            dbus.bus_reply(&(*t).bus, m, "s", &body)
+            rt.buf_free(&body)
+        }
+        return
+    }
+    if iface == "org.freedesktop.DBus.Introspectable" && member == "Introspect" {
+        var body: rt.Buf = rt.buf_new()
+        if path == ITEM_PATH {
+            dbus.w_str(&body, INTROSPECT_ITEM)
+        } else if path == MENU_PATH {
+            dbus.w_str(&body, INTROSPECT_MENU)
+        } else {
+            dbus.w_str(&body, "<node><node name=\"StatusNotifierItem\"/><node name=\"MenuBar\"/></node>")
+        }
+        dbus.bus_reply(&(*t).bus, m, "s", &body)
+        rt.buf_free(&body)
+        return
+    }
+    if path == ITEM_PATH {
+        if iface == IF_PROPS {
+            handle_props(t, m, true)
+        } else if iface == IF_ITEM {
+            handle_item_call(t, m)
+        } else {
+            unknown_method(t, m)
+        }
+    } else if path == MENU_PATH {
+        if iface == IF_PROPS {
+            handle_props(t, m, false)
+        } else if iface == IF_MENU {
+            handle_menu_call(t, m)
+        } else {
+            unknown_method(t, m)
+        }
+    } else {
+        dbus.bus_reply_error(&(*t).bus, m, "org.freedesktop.DBus.Error.UnknownObject", "no such object")
+    }
+}
+
+// Starts serving (connect, own the name, listen for the watcher) and registers.
+// false = no session bus, or no tray host on this desktop (the program keeps
+// serving; it becomes visible when a host appears).
+fn tray_show(t: *mut Tray) -> bool {
+    (*t).shown = true
+    if !dbus.bus_is_open(&(*t).bus) {
+        if !dbus.bus_connect_session(&(*t).bus) {
+            return false
+        }
+    }
+    if !(*t).started {
+        let pid: i64 = syscall(39, 0, 0, 0, 0, 0, 0)
+        var nm: rt.Buf = rt.buf_new()
+        let pre: str = "org.kde.StatusNotifierItem-"
+        rt.buf_push_bytes(&nm, pre.p as u64, pre.length())
+        rt.buf_push_dec_u64(&nm, pid as u64)
+        let post: str = "-1"
+        rt.buf_push_bytes(&nm, post.p as u64, post.length())
+        copy_into(&(*t).svc, view(&nm))
+        rt.buf_free(&nm)
+        let r: i32 = dbus.bus_request_name(&(*t).bus, view(&(*t).svc), dbus.REQ_DO_NOT_QUEUE)
+        (*t).named = r == dbus.NAME_PRIMARY as i32
+        dbus.bus_add_match(&(*t).bus,
+            "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.kde.StatusNotifierWatcher'")
+        (*t).started = true
+    }
+    return register_with_watcher(t)
+}
+
+fn tray_hide(t: *mut Tray) {
+    (*t).shown = false
+    if (*t).named {
+        dbus.bus_release_name(&(*t).bus, view(&(*t).svc))
+        (*t).named = false
+    }
+    (*t).registered = false
+    (*t).started = false
+}
+
+// Is there a tray host (a StatusNotifierWatcher) on this session? Opens its
+// own short connection.
+fn tray_available() -> bool {
+    var b: dbus.Bus = dbus.bus_new()
+    if !dbus.bus_connect_session(&b) {
+        return false
+    }
+    let r: bool = dbus.bus_name_owned(&b, WATCHER)
+    dbus.bus_free(&b)
+    return r
+}
+
+fn now_ms() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000 + (ts[1] as u64) / 1000000
+}
+
+// Serves the bus for up to `ms` milliseconds and returns the next event (true) or
+// false when nothing happened. `ms` = 0 only looks; < 0 waits for an event.
+fn tray_poll(t: *mut Tray, ms: i64, ev: *mut TrayEvent) -> bool {
+    if pop_event(t, ev) {
+        return true
+    }
+    if !dbus.bus_is_open(&(*t).bus) {
+        return false
+    }
+    var m: dbus.Msg = dbus.msg_new()
+    let start: u64 = now_ms()
+    var left: i64 = ms
+    var got: bool = false
+    var go: bool = true
+    while go {
+        let r: i32 = dbus.bus_recv(&(*t).bus, &m, left)
+        if r != 1 {
+            go = false
+        } else {
+            handle_message(t, &m)
+            if pop_event(t, ev) {
+                got = true
+                go = false
+            } else if ms >= 0 {
+                let used: i64 = (now_ms() - start) as i64
+                if used >= ms {
+                    go = false
+                } else {
+                    left = ms - used
+                }
+            }
+        }
+    }
+    dbus.msg_free(&m)
+    return got
+}
+
+// Linux has no balloon on a tray icon: use desktop.notify. Always false here.
+fn tray_balloon(t: *mut Tray, title: str, text: str) -> bool {
+    return false
+}

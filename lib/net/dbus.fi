@@ -1,0 +1,1290 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/dbus.fi -- net.dbus: a minimal D-Bus client (and service) in Firn.
+//
+//     import net.dbus
+//
+//     var bus: dbus.Bus = dbus.bus_new()
+//     if !dbus.bus_connect_session(&bus) { ... no bus ... }
+//
+//     // call a method: org.freedesktop.Notifications.GetServerInformation()
+//     var f: dbus.Fields = dbus.fields_call("org.freedesktop.Notifications",
+//         "/org/freedesktop/Notifications", "org.freedesktop.Notifications",
+//         "GetServerInformation", "")
+//     var reply: dbus.Msg = dbus.msg_new()
+//     let r: i32 = dbus.bus_call(&bus, &f, 0 as *mut rt.Buf, &reply, 2000)   // 0 ok, 2 error reply
+//     var rd: dbus.Rd = dbus.msg_body(&reply)
+//     let name: str = dbus.rd_str(&rd)
+//     dbus.msg_free(&reply)
+//
+//     // serve: own a name, answer calls, send signals
+//     dbus.bus_request_name(&bus, "org.example.App", 0)
+//     while dbus.bus_recv(&bus, &m, 1000) == 1 { ... dbus.bus_reply(&bus, &m, "", 0 as *mut rt.Buf) ... }
+//
+// WHAT IT IS. The wire protocol of the D-Bus specification, written from the
+// specification: the SASL handshake (`AUTH EXTERNAL`, no file descriptor
+// passing), the message header with its field array, marshalling of every
+// basic type, arrays, structs, dictionary entries and variants with the
+// alignment rules, and the unmarshalling the same way, plus a generic
+// "skip a value by its signature". Method call/return/error/signal.
+// It is the base for the desktop libraries: org.freedesktop.Notifications
+// (`desktop.notify`), the StatusNotifierItem tray icon (`desktop.tray`) and,
+// later, the Secret Service (Roadmap r204).
+//
+// HOW IT RUNS. Single threaded and pull style: the caller decides when to
+// listen (`bus_recv` with a timeout, or `bus_pump` with a handler). While a
+// `bus_call` waits for its reply, everything else that arrives (signals,
+// calls for the program's own objects) is QUEUED and comes out of `bus_recv`
+// afterwards in order -- nothing is lost and nothing is dispatched
+// re-entrantly.
+//
+// HONEST
+// D1  Linux only (a Unix socket). Windows and macOS have no D-Bus in this
+//     sense; the desktop libraries use the native APIs there.
+// D2  Little endian peers only ('l'). A big endian message is refused. Every
+//     D-Bus daemon on a machine speaks the machine's own order.
+// D3  No file descriptor passing (type `h` is read as a number and not
+//     opened), no `GetAll` caching, no name watching helpers beyond
+//     `bus_name_owned`; no `Introspect` generator (services write their XML).
+// D4  Messages are limited to 16 MiB (the specification allows 128 MiB); a
+//     bigger one closes the connection.
+// D5  DOUBLES: `w_f64_bits` takes the IEEE bits as `u64` -- there is no
+//     bit cast between `f64` and `u64` in the language yet.
+// D6  Blocking sends: a peer that does not read stalls `bus_send`. Messages a
+//     program sends are small; the bus daemon buffers.
+// D7  The address is the FIRST `unix:` entry of the address list (`path=` or
+//     `abstract=`; `%xx` escapes are decoded). `tcp:` and `nonce-tcp:` are
+//     not supported.
+import std.rt
+import std.str
+import std.env
+import net.unix
+
+export {
+    Bus, Msg, Rd, Fields,
+    bus_new, bus_free, bus_connect_session, bus_connect_system, bus_connect_address,
+    bus_is_open, bus_unique_name, bus_fd, bus_close,
+    bus_call, bus_send, bus_signal, bus_reply, bus_reply_error, bus_recv, bus_pump,
+    bus_request_name, bus_release_name, bus_add_match, bus_name_owned,
+    msg_new, msg_free, msg_body, msg_is_call, msg_is_signal, msg_is_error,
+    fields_call, fields_signal, fields_reply, fields_error,
+    // marshalling
+    w_pad, w_byte, w_bool, w_i16, w_u16, w_i32, w_u32, w_i64, w_u64, w_f64_bits,
+    w_str, w_path, w_sig, w_array_begin, w_array_end, w_struct_begin, w_variant,
+    // unmarshalling
+    rd_new, rd_align, rd_byte, rd_bool, rd_i16, rd_u16, rd_i32, rd_u32, rd_i64, rd_u64,
+    rd_f64_bits, rd_str, rd_path, rd_sig, rd_array_begin, rd_array_more, rd_skip_value,
+    rd_skip_sig, rd_ok, rd_left,
+    sig_skip, type_align, i16_bits, bits_i16, i32_bits, bits_i32, i64_bits, bits_i64,
+    MSG_CALL, MSG_RETURN, MSG_ERROR, MSG_SIGNAL,
+    FLAG_NO_REPLY, FLAG_NO_AUTO_START,
+    NAME_PRIMARY, NAME_IN_QUEUE, NAME_EXISTS, NAME_ALREADY,
+    REQ_ALLOW_REPLACE, REQ_REPLACE_EXISTING, REQ_DO_NOT_QUEUE,
+    MAX_MESSAGE,
+}
+
+const MSG_CALL: u8 = 1
+const MSG_RETURN: u8 = 2
+const MSG_ERROR: u8 = 3
+const MSG_SIGNAL: u8 = 4
+const FLAG_NO_REPLY: u8 = 1
+const FLAG_NO_AUTO_START: u8 = 2
+
+const NAME_PRIMARY: u32 = 1
+const NAME_IN_QUEUE: u32 = 2
+const NAME_EXISTS: u32 = 3
+const NAME_ALREADY: u32 = 4
+const REQ_ALLOW_REPLACE: u32 = 1
+const REQ_REPLACE_EXISTING: u32 = 2
+const REQ_DO_NOT_QUEUE: u32 = 4
+
+const MAX_MESSAGE: usize = 16777216
+
+// ------------------------------------------------------------ raw octets
+//
+// Signed <-> unsigned REINTERPRETATION. `as` between the two is a CHECKED
+// conversion in the debug and safe builds (a negative number as unsigned
+// panics), which is right for arithmetic and wrong for the wire format, so
+// the bits are moved explicitly.
+
+fn i16_bits(v: i16) -> u16 {
+    return ((v as i64) & 65535) as u16
+}
+
+fn bits_i16(v: u16) -> i16 {
+    let w: i64 = v as i64
+    if w >= 32768 {
+        return (w - 65536) as i16
+    }
+    return w as i16
+}
+
+fn i32_bits(v: i32) -> u32 {
+    return ((v as i64) & 4294967295) as u32
+}
+
+fn bits_i32(v: u32) -> i32 {
+    let w: i64 = v as i64
+    if w >= 2147483648 {
+        return (w - 4294967296) as i32
+    }
+    return w as i32
+}
+
+fn i64_bits(v: i64) -> u64 {
+    if v >= 0 {
+        return v as u64
+    }
+    // v + 2^63 is non-negative: set the top bit by hand
+    return ((v + 9223372036854775807 + 1) as u64) | 9223372036854775808
+}
+
+fn bits_i64(v: u64) -> i64 {
+    if v < 9223372036854775808 {
+        return v as i64
+    }
+    return ((v - 9223372036854775808) as i64) - 9223372036854775807 - 1
+}
+
+fn put32(p: u64, v: u32) {
+    *(p as *mut u8) = (v & 255) as u8
+    *((p + 1) as *mut u8) = ((v >> 8) & 255) as u8
+    *((p + 2) as *mut u8) = ((v >> 16) & 255) as u8
+    *((p + 3) as *mut u8) = ((v >> 24) & 255) as u8
+}
+
+fn get32(p: u64) -> u32 {
+    return (rt.ld8(p, 0) as u32) | ((rt.ld8(p, 1) as u32) << 8)
+        | ((rt.ld8(p, 2) as u32) << 16) | ((rt.ld8(p, 3) as u32) << 24)
+}
+
+fn pad_to(n: usize, a: usize) -> usize {
+    return (n + a - 1) / a * a
+}
+
+// ------------------------------------------------------------- the writer
+//
+// Every writer function appends to one rt.Buf and aligns by the buffer's
+// length. A BODY is marshalled into a buffer of its own that starts at 0:
+// the header is always a multiple of 8 long, so alignment relative to the
+// body start equals alignment relative to the message start.
+
+fn w_pad(b: *mut rt.Buf, a: usize) {
+    while rt.buf_len(b) % a != 0 {
+        rt.buf_push(b, 0 as u8)
+    }
+}
+
+fn w_byte(b: *mut rt.Buf, v: u8) {
+    rt.buf_push(b, v)
+}
+
+fn w_u16(b: *mut rt.Buf, v: u16) {
+    w_pad(b, 2)
+    rt.buf_push(b, (v & 255) as u8)
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+}
+
+fn w_i16(b: *mut rt.Buf, v: i16) {
+    w_u16(b, i16_bits(v))
+}
+
+fn w_u32(b: *mut rt.Buf, v: u32) {
+    w_pad(b, 4)
+    rt.buf_push(b, (v & 255) as u8)
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+    rt.buf_push(b, ((v >> 16) & 255) as u8)
+    rt.buf_push(b, ((v >> 24) & 255) as u8)
+}
+
+fn w_i32(b: *mut rt.Buf, v: i32) {
+    w_u32(b, i32_bits(v))
+}
+
+fn w_bool(b: *mut rt.Buf, v: bool) {
+    if v {
+        w_u32(b, 1 as u32)
+    } else {
+        w_u32(b, 0 as u32)
+    }
+}
+
+fn w_u64(b: *mut rt.Buf, v: u64) {
+    w_pad(b, 8)
+    w_u32_raw(b, (v & 4294967295) as u32)
+    w_u32_raw(b, (v >> 32) as u32)
+}
+
+fn w_u32_raw(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255) as u8)
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+    rt.buf_push(b, ((v >> 16) & 255) as u8)
+    rt.buf_push(b, ((v >> 24) & 255) as u8)
+}
+
+fn w_i64(b: *mut rt.Buf, v: i64) {
+    w_u64(b, i64_bits(v))
+}
+
+fn w_f64_bits(b: *mut rt.Buf, bits: u64) {
+    w_u64(b, bits)
+}
+
+// STRING (s) and OBJECT_PATH (o): u32 length, the octets, a NUL.
+fn w_str(b: *mut rt.Buf, s: str) {
+    w_u32(b, s.length() as u32)
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+    rt.buf_push(b, 0 as u8)
+}
+
+fn w_path(b: *mut rt.Buf, s: str) {
+    w_str(b, s)
+}
+
+// SIGNATURE (g): u8 length, the octets, a NUL.
+fn w_sig(b: *mut rt.Buf, s: str) {
+    rt.buf_push(b, s.length() as u8)
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+    rt.buf_push(b, 0 as u8)
+}
+
+// ARRAY: u32 byte length (of the elements, NOT of the padding before the
+// first one), padding to the element's alignment, the elements.
+// Returns the offset of the LENGTH field; hand it, with the same alignment,
+// to `w_array_end` once the elements are written.
+fn w_array_begin(b: *mut rt.Buf, elem_align: usize) -> usize {
+    w_u32(b, 0 as u32)
+    let at: usize = rt.buf_len(b) - 4
+    w_pad(b, elem_align)
+    return at
+}
+
+fn w_array_end(b: *mut rt.Buf, at: usize, elem_align: usize) {
+    let start: usize = pad_to(at + 4, elem_align)
+    let n: usize = rt.buf_len(b) - start
+    put32(rt.buf_ptr(b) + at as u64, n as u32)
+}
+
+// A STRUCT or a DICT_ENTRY starts on an 8 octet boundary.
+fn w_struct_begin(b: *mut rt.Buf) {
+    w_pad(b, 8)
+}
+
+// VARIANT: the signature of the value, then the value itself.
+fn w_variant(b: *mut rt.Buf, sig: str) {
+    w_sig(b, sig)
+}
+
+// ------------------------------------------------------------- the reader
+
+struct Rd {
+    p: u64,
+    n: usize,
+    pos: usize,
+    ok: bool,
+}
+
+fn rd_new(p: u64, n: usize) -> Rd {
+    return Rd { p: p, n: n, pos: 0, ok: true }
+}
+
+fn rd_ok(r: *mut Rd) -> bool {
+    return (*r).ok
+}
+
+fn rd_left(r: *mut Rd) -> usize {
+    return (*r).n - (*r).pos
+}
+
+// Aligns relative to the start of the region (the message body start, or the
+// message start for the header: both are 8-aligned in the message).
+fn rd_align(r: *mut Rd, a: usize) {
+    let np: usize = pad_to((*r).pos, a)
+    if np > (*r).n {
+        (*r).ok = false
+        (*r).pos = (*r).n
+        return
+    }
+    (*r).pos = np
+}
+
+fn rd_take(r: *mut Rd, n: usize) -> u64 {
+    if !(*r).ok || (*r).pos + n > (*r).n {
+        (*r).ok = false
+        return 0 as u64
+    }
+    let a: u64 = (*r).p + (*r).pos as u64
+    (*r).pos = (*r).pos + n
+    return a
+}
+
+fn rd_byte(r: *mut Rd) -> u8 {
+    let a: u64 = rd_take(r, 1)
+    if a == 0 as u64 {
+        return 0 as u8
+    }
+    return *(a as *mut u8)
+}
+
+fn rd_u16(r: *mut Rd) -> u16 {
+    rd_align(r, 2)
+    let a: u64 = rd_take(r, 2)
+    if a == 0 as u64 {
+        return 0 as u16
+    }
+    return (rt.ld8(a, 0) as u16) | ((rt.ld8(a, 1) as u16) << 8)
+}
+
+fn rd_i16(r: *mut Rd) -> i16 {
+    return bits_i16(rd_u16(r))
+}
+
+fn rd_u32(r: *mut Rd) -> u32 {
+    rd_align(r, 4)
+    let a: u64 = rd_take(r, 4)
+    if a == 0 as u64 {
+        return 0 as u32
+    }
+    return get32(a)
+}
+
+fn rd_i32(r: *mut Rd) -> i32 {
+    return bits_i32(rd_u32(r))
+}
+
+fn rd_bool(r: *mut Rd) -> bool {
+    let v: u32 = rd_u32(r)
+    if v > 1 as u32 {
+        (*r).ok = false
+    }
+    return v == 1 as u32
+}
+
+fn rd_u64(r: *mut Rd) -> u64 {
+    rd_align(r, 8)
+    let a: u64 = rd_take(r, 8)
+    if a == 0 as u64 {
+        return 0 as u64
+    }
+    return (get32(a) as u64) | ((get32(a + 4) as u64) << 32)
+}
+
+fn rd_i64(r: *mut Rd) -> i64 {
+    return bits_i64(rd_u64(r))
+}
+
+fn rd_f64_bits(r: *mut Rd) -> u64 {
+    return rd_u64(r)
+}
+
+// A string as a VIEW into the message (valid as long as the message is).
+fn rd_str(r: *mut Rd) -> str {
+    let n: u32 = rd_u32(r)
+    if !(*r).ok {
+        return ""
+    }
+    let a: u64 = rd_take(r, n as usize + 1)
+    if a == 0 as u64 {
+        return ""
+    }
+    if *((a + n as u64) as *mut u8) != 0 as u8 {
+        (*r).ok = false
+        return ""
+    }
+    return str { p: a as *mut u8, n: n as usize }
+}
+
+fn rd_path(r: *mut Rd) -> str {
+    return rd_str(r)
+}
+
+fn rd_sig(r: *mut Rd) -> str {
+    let n: u8 = rd_byte(r)
+    if !(*r).ok {
+        return ""
+    }
+    let a: u64 = rd_take(r, n as usize + 1)
+    if a == 0 as u64 {
+        return ""
+    }
+    if *((a + n as u64) as *mut u8) != 0 as u8 {
+        (*r).ok = false
+        return ""
+    }
+    return str { p: a as *mut u8, n: n as usize }
+}
+
+// ARRAY: reads the length, aligns to the element, returns the END offset of
+// the elements; loop with `rd_array_more(r, end)`. Elements that are
+// structs/dict entries start at 8 anyway (`elem_align` = 8).
+fn rd_array_begin(r: *mut Rd, elem_align: usize) -> usize {
+    let n: u32 = rd_u32(r)
+    rd_align(r, elem_align)
+    if !(*r).ok {
+        return 0
+    }
+    let end: usize = (*r).pos + n as usize
+    if end > (*r).n {
+        (*r).ok = false
+        return 0
+    }
+    return end
+}
+
+fn rd_array_more(r: *mut Rd, end: usize) -> bool {
+    return (*r).ok && (*r).pos < end
+}
+
+// The alignment of a type by its first signature character.
+fn type_align(c: u8) -> usize {
+    if c == 121 as u8 || c == 103 as u8 || c == 118 as u8 { // y g v
+        return 1
+    }
+    if c == 110 as u8 || c == 113 as u8 { // n q
+        return 2
+    }
+    if c == 120 as u8 || c == 116 as u8 || c == 100 as u8 || c == 40 as u8 || c == 123 as u8 { // x t d ( {
+        return 8
+    }
+    return 4 // b i u h s o a
+}
+
+// Advances `*i` over ONE complete type of `sig` (no data involved).
+fn sig_skip(sig: str, i: *mut usize) {
+    if *i >= sig.length() {
+        return
+    }
+    let c: u8 = sig.chars(*i)
+    *i = *i + 1
+    if c == 97 as u8 { // a
+        sig_skip(sig, i)
+        return
+    }
+    if c == 40 as u8 { // (
+        while *i < sig.length() && sig.chars(*i) != 41 as u8 {
+            sig_skip(sig, i)
+        }
+        *i = *i + 1
+        return
+    }
+    if c == 123 as u8 { // {
+        while *i < sig.length() && sig.chars(*i) != 125 as u8 {
+            sig_skip(sig, i)
+        }
+        *i = *i + 1
+        return
+    }
+}
+
+// Skips ONE value of the type at `sig[*i]` in the data, advancing both.
+fn rd_skip_value(r: *mut Rd, sig: str, i: *mut usize) {
+    if !(*r).ok || *i >= sig.length() {
+        (*r).ok = false
+        return
+    }
+    let c: u8 = sig.chars(*i)
+    if c == 121 as u8 { // y
+        rd_byte(r)
+        *i = *i + 1
+    } else if c == 98 as u8 || c == 117 as u8 || c == 105 as u8 || c == 104 as u8 { // b u i h
+        rd_u32(r)
+        *i = *i + 1
+    } else if c == 110 as u8 || c == 113 as u8 { // n q
+        rd_u16(r)
+        *i = *i + 1
+    } else if c == 120 as u8 || c == 116 as u8 || c == 100 as u8 { // x t d
+        rd_u64(r)
+        *i = *i + 1
+    } else if c == 115 as u8 || c == 111 as u8 { // s o
+        rd_str(r)
+        *i = *i + 1
+    } else if c == 103 as u8 { // g
+        rd_sig(r)
+        *i = *i + 1
+    } else if c == 118 as u8 { // v
+        let vs: str = rd_sig(r)
+        var j: usize = 0
+        rd_skip_value(r, vs, &j)
+        *i = *i + 1
+    } else if c == 97 as u8 { // a
+        let elem_at: usize = *i + 1
+        var after: usize = elem_at
+        sig_skip(sig, &after)
+        let ea: usize = type_align(sig.chars(elem_at))
+        let end: usize = rd_array_begin(r, ea)
+        if (*r).ok {
+            // the elements are skipped by their total byte length
+            (*r).pos = end
+        }
+        *i = after
+    } else if c == 40 as u8 || c == 123 as u8 { // ( {
+        rd_align(r, 8)
+        var close: u8 = 41 as u8
+        if c == 123 as u8 {
+            close = 125 as u8
+        }
+        *i = *i + 1
+        while (*r).ok && *i < sig.length() && sig.chars(*i) != close {
+            rd_skip_value(r, sig, i)
+        }
+        *i = *i + 1
+    } else {
+        (*r).ok = false
+    }
+}
+
+// Skips every value of a whole signature.
+fn rd_skip_sig(r: *mut Rd, sig: str) {
+    var i: usize = 0
+    while (*r).ok && i < sig.length() {
+        rd_skip_value(r, sig, &i)
+    }
+}
+
+// --------------------------------------------------------------- messages
+
+// The header fields of a message; empty strings = absent.
+struct Fields {
+    kind: u8,
+    flags: u8,
+    path: str,
+    iface: str,
+    member: str,
+    errname: str,
+    dest: str,
+    sender: str,
+    sig: str,
+    reply_serial: u32,
+    serial: u32,
+}
+
+fn fields_empty(kind: u8) -> Fields {
+    return Fields { kind: kind, flags: 0 as u8, path: "", iface: "", member: "", errname: "",
+        dest: "", sender: "", sig: "", reply_serial: 0 as u32, serial: 0 as u32 }
+}
+
+fn fields_call(dest: str, path: str, iface: str, member: str, sig: str) -> Fields {
+    var f: Fields = fields_empty(MSG_CALL)
+    f.dest = dest
+    f.path = path
+    f.iface = iface
+    f.member = member
+    f.sig = sig
+    return f
+}
+
+fn fields_signal(path: str, iface: str, member: str, sig: str) -> Fields {
+    var f: Fields = fields_empty(MSG_SIGNAL)
+    f.path = path
+    f.iface = iface
+    f.member = member
+    f.sig = sig
+    return f
+}
+
+fn fields_reply(to: *mut Msg, sig: str) -> Fields {
+    var f: Fields = fields_empty(MSG_RETURN)
+    f.dest = (*to).f.sender
+    f.reply_serial = (*to).f.serial
+    f.sig = sig
+    return f
+}
+
+fn fields_error(to: *mut Msg, name: str) -> Fields {
+    var f: Fields = fields_empty(MSG_ERROR)
+    f.dest = (*to).f.sender
+    f.reply_serial = (*to).f.serial
+    f.errname = name
+    f.sig = "s"
+    return f
+}
+
+// A received message: the raw octets (owned) and the parsed header fields as
+// views into them.
+struct Msg {
+    buf: rt.Buf,
+    f: Fields,
+    body_off: usize,
+    body_len: usize,
+}
+
+fn msg_new() -> Msg {
+    return Msg { buf: rt.buf_new(), f: fields_empty(0 as u8), body_off: 0, body_len: 0 }
+}
+
+fn msg_free(m: *mut Msg) {
+    rt.buf_free(&(*m).buf)
+    (*m).f = fields_empty(0 as u8)
+    (*m).body_off = 0
+    (*m).body_len = 0
+}
+
+fn msg_is_call(m: *mut Msg) -> bool {
+    return (*m).f.kind == MSG_CALL
+}
+
+fn msg_is_signal(m: *mut Msg) -> bool {
+    return (*m).f.kind == MSG_SIGNAL
+}
+
+fn msg_is_error(m: *mut Msg) -> bool {
+    return (*m).f.kind == MSG_ERROR
+}
+
+// A reader over the body (its signature is `m.f.sig`).
+fn msg_body(m: *mut Msg) -> Rd {
+    return rd_new(rt.buf_ptr(&(*m).buf) + (*m).body_off as u64, (*m).body_len)
+}
+
+// Builds a complete message (header + body) into `out`.
+fn build_message(out: *mut rt.Buf, f: *mut Fields, serial: u32, body: *mut rt.Buf) {
+    var h: rt.Buf = rt.buf_new()
+    var blen: usize = 0
+    if body as u64 != 0 as u64 {
+        blen = rt.buf_len(body)
+    }
+    // fixed part: endian, type, flags, version, body length, serial, then the field array
+    rt.buf_push(&h, 108 as u8) // 'l'
+    rt.buf_push(&h, (*f).kind)
+    rt.buf_push(&h, (*f).flags)
+    rt.buf_push(&h, 1 as u8)
+    w_u32(&h, blen as u32)
+    w_u32(&h, serial)
+    let start: usize = w_array_begin(&h, 8)
+    field_str(&h, 1 as u8, 111 as u8, (*f).path) // PATH 'o'
+    field_str(&h, 2 as u8, 115 as u8, (*f).iface) // INTERFACE
+    field_str(&h, 3 as u8, 115 as u8, (*f).member) // MEMBER
+    field_str(&h, 4 as u8, 115 as u8, (*f).errname) // ERROR_NAME
+    if (*f).kind == MSG_RETURN || (*f).kind == MSG_ERROR {
+        w_pad(&h, 8)
+        rt.buf_push(&h, 5 as u8) // REPLY_SERIAL
+        w_sig(&h, "u")
+        w_u32(&h, (*f).reply_serial)
+    }
+    field_str(&h, 6 as u8, 115 as u8, (*f).dest) // DESTINATION
+    if (*f).sig.length() > 0 {
+        w_pad(&h, 8)
+        rt.buf_push(&h, 8 as u8) // SIGNATURE
+        w_sig(&h, "g")
+        w_sig(&h, (*f).sig)
+    }
+    w_array_end(&h, start, 8)
+    w_pad(&h, 8)
+    rt.buf_push_bytes(out, rt.buf_ptr(&h), rt.buf_len(&h))
+    if blen > 0 {
+        rt.buf_push_bytes(out, rt.buf_ptr(body), blen)
+    }
+    rt.buf_free(&h)
+}
+
+fn field_str(h: *mut rt.Buf, code: u8, ty: u8, v: str) {
+    if v.length() == 0 {
+        return
+    }
+    w_pad(h, 8)
+    rt.buf_push(h, code)
+    rt.buf_push(h, 1 as u8)
+    rt.buf_push(h, ty)
+    rt.buf_push(h, 0 as u8)
+    w_str(h, v)
+}
+
+// Parses the header of the message held in `m.buf`. false = malformed.
+fn parse_message(m: *mut Msg) -> bool {
+    let p: u64 = rt.buf_ptr(&(*m).buf)
+    let n: usize = rt.buf_len(&(*m).buf)
+    if n < 16 || *(p as *mut u8) != 108 as u8 || *((p + 3) as *mut u8) != 1 as u8 {
+        return false
+    }
+    var f: Fields = fields_empty(*((p + 1) as *mut u8))
+    f.flags = *((p + 2) as *mut u8)
+    let blen: u32 = get32(p + 4)
+    f.serial = get32(p + 8)
+    let flen: u32 = get32(p + 12)
+    let hend: usize = pad_to(16 + flen as usize, 8)
+    if hend + blen as usize != n {
+        return false
+    }
+    var r: Rd = rd_new(p, 16 + flen as usize)
+    r.pos = 16
+    while r.ok && r.pos < 16 + flen as usize {
+        rd_align(&r, 8)
+        if r.pos >= 16 + flen as usize {
+            break
+        }
+        let code: u8 = rd_byte(&r)
+        let vs: str = rd_sig(&r)
+        if !r.ok || vs.length() != 1 {
+            return false
+        }
+        let t: u8 = vs.chars(0)
+        if t == 115 as u8 || t == 111 as u8 { // s o
+            let s: str = rd_str(&r)
+            if code == 1 as u8 {
+                f.path = s
+            } else if code == 2 as u8 {
+                f.iface = s
+            } else if code == 3 as u8 {
+                f.member = s
+            } else if code == 4 as u8 {
+                f.errname = s
+            } else if code == 6 as u8 {
+                f.dest = s
+            } else if code == 7 as u8 {
+                f.sender = s
+            }
+        } else if t == 117 as u8 { // u
+            let v: u32 = rd_u32(&r)
+            if code == 5 as u8 {
+                f.reply_serial = v
+            }
+        } else if t == 103 as u8 { // g
+            let s: str = rd_sig(&r)
+            if code == 8 as u8 {
+                f.sig = s
+            }
+        } else {
+            var j: usize = 0
+            rd_skip_value(&r, vs, &j)
+        }
+    }
+    if !r.ok {
+        return false
+    }
+    (*m).f = f
+    (*m).body_off = hend
+    (*m).body_len = blen as usize
+    return true
+}
+
+// --------------------------------------------------------------- the bus
+
+struct Bus {
+    fd: i32,
+    serial: u32,
+    pending: rt.Buf, // queued raw messages: u32 length + octets, in arrival order
+    name: [u8; 64],
+    name_n: usize,
+}
+
+fn bus_new() -> Bus {
+    return Bus { fd: -1, serial: 0 as u32, pending: rt.buf_new(), name: [0; 64], name_n: 0 }
+}
+
+fn bus_is_open(b: *mut Bus) -> bool {
+    return (*b).fd >= 0
+}
+
+fn bus_fd(b: *mut Bus) -> i32 {
+    return (*b).fd
+}
+
+fn bus_unique_name(b: *mut Bus) -> str {
+    return str { p: (&(*b).name[0]) as *mut u8, n: (*b).name_n }
+}
+
+fn bus_close(b: *mut Bus) {
+    if (*b).fd >= 0 {
+        unix.fd_close((*b).fd)
+        (*b).fd = -1
+    }
+}
+
+fn bus_free(b: *mut Bus) {
+    bus_close(b)
+    rt.buf_free(&(*b).pending)
+}
+
+fn hex_digit(v: u32) -> u8 {
+    if v < 10 as u32 {
+        return (48 as u32 + v) as u8
+    }
+    return (87 as u32 + v) as u8
+}
+
+fn from_hex(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return (c - 87 as u8) as i32
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return (c - 55 as u8) as i32
+    }
+    return -1
+}
+
+// Finds `key=` in a transport entry ("path=/x,guid=ab") and decodes %xx.
+fn addr_value(entry: str, key: str, out: *mut rt.Buf) -> bool {
+    var i: usize = 0
+    while i < entry.length() {
+        var j: usize = i
+        while j < entry.length() && entry.chars(j) != 44 as u8 {
+            j = j + 1
+        }
+        let item: str = entry.part(i, j - i)
+        if item.length() > key.length() + 1 && item.part(0, key.length()) == key
+        && item.chars(key.length()) == 61 as u8 {
+            var k: usize = key.length() + 1
+            while k < item.length() {
+                let c: u8 = item.chars(k)
+                if c == 37 as u8 && k + 2 < item.length() + 0 && from_hex(item.chars(k + 1)) >= 0
+                && from_hex(item.chars(k + 2)) >= 0 {
+                    rt.buf_push(out, (from_hex(item.chars(k + 1)) * 16 + from_hex(item.chars(k + 2))) as u8)
+                    k = k + 3
+                } else {
+                    rt.buf_push(out, c)
+                    k = k + 1
+                }
+            }
+            return rt.buf_len(out) > 0
+        }
+        i = j + 1
+    }
+    return false
+}
+
+fn bus_connect_session(b: *mut Bus) -> bool {
+    var a: rt.Buf = rt.buf_new()
+    var ok: bool = false
+    if env.get_into("DBUS_SESSION_BUS_ADDRESS", &a) && rt.buf_len(&a) > 0 {
+        ok = bus_connect_address(b, str { p: rt.buf_data(&a), n: rt.buf_len(&a) })
+    } else {
+        // the default of systemd's user session
+        var xr: rt.Buf = rt.buf_new()
+        if env.get_into("XDG_RUNTIME_DIR", &xr) && rt.buf_len(&xr) > 0 {
+            rt.buf_clear(&a)
+            let pre: str = "unix:path="
+            rt.buf_push_bytes(&a, pre.p as u64, pre.length())
+            rt.buf_push_bytes(&a, rt.buf_ptr(&xr), rt.buf_len(&xr))
+            let post: str = "/bus"
+            rt.buf_push_bytes(&a, post.p as u64, post.length())
+            ok = bus_connect_address(b, str { p: rt.buf_data(&a), n: rt.buf_len(&a) })
+        }
+        rt.buf_free(&xr)
+    }
+    rt.buf_free(&a)
+    return ok
+}
+
+fn bus_connect_system(b: *mut Bus) -> bool {
+    var a: rt.Buf = rt.buf_new()
+    var ok: bool = false
+    if env.get_into("DBUS_SYSTEM_BUS_ADDRESS", &a) && rt.buf_len(&a) > 0 {
+        ok = bus_connect_address(b, str { p: rt.buf_data(&a), n: rt.buf_len(&a) })
+    } else {
+        ok = bus_connect_address(b, "unix:path=/var/run/dbus/system_bus_socket")
+    }
+    rt.buf_free(&a)
+    return ok
+}
+
+// Connects to the first `unix:` entry of an address list, authenticates with
+// EXTERNAL and says Hello. true = the bus is usable and has a unique name.
+fn bus_connect_address(b: *mut Bus, addr: str) -> bool {
+    if (*b).fd >= 0 {
+        return true
+    }
+    // pick the first unix: entry
+    var i: usize = 0
+    var fd: i32 = -1
+    while i < addr.length() && fd < 0 {
+        var j: usize = i
+        while j < addr.length() && addr.chars(j) != 59 as u8 {
+            j = j + 1
+        }
+        let entry: str = addr.part(i, j - i)
+        if entry.length() > 5 && entry.part(0, 5) == "unix:" {
+            let rest: str = entry.part(5, entry.length() - 5)
+            var path: rt.Buf = rt.buf_new()
+            if addr_value(rest, "path", &path) {
+                fd = unix.unix_connect(str { p: rt.buf_data(&path), n: rt.buf_len(&path) }, false)
+            } else {
+                rt.buf_clear(&path)
+                if addr_value(rest, "abstract", &path) {
+                    fd = unix.unix_connect(str { p: rt.buf_data(&path), n: rt.buf_len(&path) }, true)
+                }
+            }
+            rt.buf_free(&path)
+        }
+        i = j + 1
+    }
+    if fd < 0 {
+        return false
+    }
+    // SASL: a NUL octet, then AUTH EXTERNAL <hex of the decimal uid>
+    var line: rt.Buf = rt.buf_new()
+    rt.buf_push(&line, 0 as u8)
+    let au: str = "AUTH EXTERNAL "
+    rt.buf_push_bytes(&line, au.p as u64, au.length())
+    var uid: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&uid, unix.getuid_now() as u64)
+    var k: usize = 0
+    while k < rt.buf_len(&uid) {
+        let c: u32 = rt.buf_at(&uid, k) as u32
+        rt.buf_push(&line, hex_digit(c >> 4))
+        rt.buf_push(&line, hex_digit(c & 15 as u32))
+        k = k + 1
+    }
+    rt.buf_free(&uid)
+    rt.buf_push(&line, 13 as u8)
+    rt.buf_push(&line, 10 as u8)
+    let sent: bool = unix.fd_send_all(fd, rt.buf_ptr(&line), rt.buf_len(&line))
+    rt.buf_free(&line)
+    if !sent {
+        unix.fd_close(fd)
+        return false
+    }
+    // the answer line: "OK <guid>\r\n"
+    var ans: [u8; 256] = [0; 256]
+    var n: usize = 0
+    var done: bool = false
+    while !done && n < 255 {
+        if unix.fd_wait(fd, unix.WAIT_READ, 3000) != 1 {
+            break
+        }
+        let r: i64 = unix.fd_recv(fd, (&ans[n]) as u64, 1)
+        if r != 1 {
+            break
+        }
+        n = n + 1
+        if n >= 2 && ans[n - 2] == 13 as u8 && ans[n - 1] == 10 as u8 {
+            done = true
+        }
+    }
+    if !done || n < 4 || ans[0] != 79 as u8 || ans[1] != 75 as u8 { // "OK"
+        unix.fd_close(fd)
+        return false
+    }
+    let begin: str = "BEGIN\r\n"
+    if !unix.fd_send_all(fd, begin.p as u64, begin.length()) {
+        unix.fd_close(fd)
+        return false
+    }
+    (*b).fd = fd
+    (*b).serial = 0 as u32
+    // Hello
+    var f: Fields = fields_call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus", "Hello", "")
+    var reply: Msg = msg_new()
+    let rc: i32 = bus_call(b, &f, 0 as *mut rt.Buf, &reply, 5000)
+    if rc != 0 {
+        msg_free(&reply)
+        bus_close(b)
+        return false
+    }
+    var rd: Rd = msg_body(&reply)
+    let nm: str = rd_str(&rd)
+    var okn: bool = rd.ok && nm.length() > 0 && nm.length() < 64
+    if okn {
+        var q: usize = 0
+        while q < nm.length() {
+            (*b).name[q] = nm.chars(q)
+            q = q + 1
+        }
+        (*b).name_n = nm.length()
+    }
+    msg_free(&reply)
+    if !okn {
+        bus_close(b)
+        return false
+    }
+    return true
+}
+
+fn next_serial(b: *mut Bus) -> u32 {
+    (*b).serial = (*b).serial + 1 as u32
+    if (*b).serial == 0 as u32 {
+        (*b).serial = 1 as u32
+    }
+    return (*b).serial
+}
+
+// Sends one message; returns its serial (0 = failed).
+fn bus_send(b: *mut Bus, f: *mut Fields, body: *mut rt.Buf) -> u32 {
+    if (*b).fd < 0 {
+        return 0 as u32
+    }
+    let serial: u32 = next_serial(b)
+    var out: rt.Buf = rt.buf_new()
+    build_message(&out, f, serial, body)
+    let ok: bool = unix.fd_send_all((*b).fd, rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+    if !ok {
+        bus_close(b)
+        return 0 as u32
+    }
+    return serial
+}
+
+fn bus_signal(b: *mut Bus, path: str, iface: str, member: str, sig: str, body: *mut rt.Buf) -> bool {
+    var f: Fields = fields_signal(path, iface, member, sig)
+    return bus_send(b, &f, body) != 0 as u32
+}
+
+// Answers a method call (a no-reply call is not answered).
+fn bus_reply(b: *mut Bus, to: *mut Msg, sig: str, body: *mut rt.Buf) -> bool {
+    if ((*to).f.flags & FLAG_NO_REPLY) != 0 as u8 {
+        return true
+    }
+    var f: Fields = fields_reply(to, sig)
+    return bus_send(b, &f, body) != 0 as u32
+}
+
+fn bus_reply_error(b: *mut Bus, to: *mut Msg, name: str, text: str) -> bool {
+    if ((*to).f.flags & FLAG_NO_REPLY) != 0 as u8 {
+        return true
+    }
+    var f: Fields = fields_error(to, name)
+    var body: rt.Buf = rt.buf_new()
+    w_str(&body, text)
+    let ok: bool = bus_send(b, &f, &body) != 0 as u32
+    rt.buf_free(&body)
+    return ok
+}
+
+fn now_ms() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000 + (ts[1] as u64) / 1000000
+}
+
+// Reads one raw message from the socket into `out` (cleared first).
+// 1 = got one, 0 = nothing within `timeout_ms` (< 0: wait forever), -1 = broken.
+fn read_raw(b: *mut Bus, out: *mut rt.Buf, timeout_ms: i64) -> i32 {
+    rt.buf_clear(out)
+    if (*b).fd < 0 {
+        return -1
+    }
+    let w: i32 = unix.fd_wait((*b).fd, unix.WAIT_READ, timeout_ms)
+    if w == 0 {
+        return 0
+    }
+    if w < 0 {
+        return -1
+    }
+    var head: [u8; 16] = [0; 16]
+    var got: usize = 0
+    while got < 16 {
+        let r: i64 = unix.fd_recv((*b).fd, (&head[got]) as u64, 16 - got)
+        if r <= 0 {
+            bus_close(b)
+            return -1
+        }
+        got = got + r as usize
+        if got < 16 && unix.fd_wait((*b).fd, unix.WAIT_READ, 5000) != 1 {
+            bus_close(b)
+            return -1
+        }
+    }
+    if head[0] != 108 as u8 {
+        bus_close(b)
+        return -1
+    }
+    let blen: u32 = get32((&head[4]) as u64)
+    let flen: u32 = get32((&head[12]) as u64)
+    let total: usize = pad_to(16 + flen as usize, 8) + blen as usize
+    if total > MAX_MESSAGE || flen as usize > MAX_MESSAGE {
+        bus_close(b)
+        return -1
+    }
+    rt.buf_reserve(out, total)
+    rt.buf_push_bytes(out, (&head[0]) as u64, 16)
+    var chunk: [u8; 4096] = [0; 4096]
+    while rt.buf_len(out) < total {
+        var want: usize = total - rt.buf_len(out)
+        if want > 4096 {
+            want = 4096
+        }
+        if unix.fd_wait((*b).fd, unix.WAIT_READ, 5000) != 1 {
+            bus_close(b)
+            return -1
+        }
+        let r: i64 = unix.fd_recv((*b).fd, (&chunk[0]) as u64, want)
+        if r <= 0 {
+            bus_close(b)
+            return -1
+        }
+        rt.buf_push_bytes(out, (&chunk[0]) as u64, r as usize)
+    }
+    return 1
+}
+
+fn queue_push(b: *mut Bus, raw: *mut rt.Buf) {
+    w_u32_raw(&(*b).pending, rt.buf_len(raw) as u32)
+    rt.buf_push_bytes(&(*b).pending, rt.buf_ptr(raw), rt.buf_len(raw))
+}
+
+// Takes the oldest queued message into `m`. false = none queued.
+fn queue_pop(b: *mut Bus, m: *mut Msg) -> bool {
+    let total: usize = rt.buf_len(&(*b).pending)
+    if total < 4 {
+        return false
+    }
+    let base: u64 = rt.buf_ptr(&(*b).pending)
+    let n: usize = get32(base) as usize
+    rt.buf_clear(&(*m).buf)
+    rt.buf_push_bytes(&(*m).buf, base + 4, n)
+    let rest: usize = total - 4 - n
+    rt.mem_copy(base, base + 4 + n as u64, rest)
+    rt.buf_set_len(&(*b).pending, rest)
+    return parse_message(m)
+}
+
+// The next message for the program: queued ones first, then the socket.
+// 1 = `m` filled, 0 = timeout, -1 = connection broken.
+fn bus_recv(b: *mut Bus, m: *mut Msg, timeout_ms: i64) -> i32 {
+    while rt.buf_len(&(*b).pending) >= 4 {
+        if queue_pop(b, m) {
+            return 1
+        }
+    }
+    var raw: rt.Buf = rt.buf_new()
+    var res: i32 = 0
+    var again: bool = true
+    while again {
+        again = false
+        let r: i32 = read_raw(b, &raw, timeout_ms)
+        if r < 0 {
+            res = -1
+        } else if r == 1 {
+            rt.buf_clear(&(*m).buf)
+            rt.buf_push_bytes(&(*m).buf, rt.buf_ptr(&raw), rt.buf_len(&raw))
+            if parse_message(m) {
+                res = 1
+            } else {
+                // a malformed message: drop it and keep listening
+                again = true
+            }
+        }
+    }
+    rt.buf_free(&raw)
+    return res
+}
+
+// A method call and its reply. `body` may be 0 (no arguments).
+// 0 = method return in `reply`; 2 = error reply in `reply` (see `reply.f.errname`
+// and the text as the first string of its body); -1 = connection broken;
+// -2 = no answer within `timeout_ms`.
+fn bus_call(b: *mut Bus, f: *mut Fields, body: *mut rt.Buf, reply: *mut Msg, timeout_ms: i64) -> i32 {
+    let serial: u32 = bus_send(b, f, body)
+    if serial == 0 as u32 {
+        return -1
+    }
+    let deadline: u64 = now_ms() + timeout_ms as u64
+    var raw: rt.Buf = rt.buf_new()
+    var res: i32 = -2
+    var go: bool = true
+    while go {
+        var left: i64 = 0
+        let now: u64 = now_ms()
+        if now < deadline {
+            left = (deadline - now) as i64
+        }
+        let r: i32 = read_raw(b, &raw, left)
+        if r < 0 {
+            res = -1
+            go = false
+        } else if r == 0 {
+            go = false
+        } else {
+            // look at the header without keeping the parse: is it our answer?
+            var tmp: Msg = msg_new()
+            rt.buf_push_bytes(&tmp.buf, rt.buf_ptr(&raw), rt.buf_len(&raw))
+            if parse_message(&tmp)
+            && (tmp.f.kind == MSG_RETURN || tmp.f.kind == MSG_ERROR) && tmp.f.reply_serial == serial {
+                msg_free(reply)
+                *reply = tmp
+                if tmp.f.kind == MSG_RETURN {
+                    res = 0
+                } else {
+                    res = 2
+                }
+                go = false
+            } else {
+                queue_push(b, &raw)
+                msg_free(&tmp)
+            }
+        }
+    }
+    rt.buf_free(&raw)
+    return res
+}
+
+// Waits up to `timeout_ms` for one message and hands it to `handler(ctx, bus, msg)`
+// (return value ignored). 1 = a message was handled, 0 = timeout, -1 = broken.
+fn bus_pump(b: *mut Bus, timeout_ms: i64, handler: fn(u64, *mut Bus, *mut Msg) -> bool, ctx: u64) -> i32 {
+    var m: Msg = msg_new()
+    let r: i32 = bus_recv(b, &m, timeout_ms)
+    if r == 1 {
+        handler(ctx, b, &m)
+    }
+    msg_free(&m)
+    return r
+}
+
+// ------------------------------------------------------ bus daemon helpers
+
+// RequestName. The reply code (NAME_PRIMARY ...), or a negative number on failure.
+fn bus_request_name(b: *mut Bus, name: str, flags: u32) -> i32 {
+    var f: Fields = fields_call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus", "RequestName", "su")
+    var body: rt.Buf = rt.buf_new()
+    w_str(&body, name)
+    w_u32(&body, flags)
+    var reply: Msg = msg_new()
+    let rc: i32 = bus_call(b, &f, &body, &reply, 5000)
+    rt.buf_free(&body)
+    var out: i32 = -1
+    if rc == 0 {
+        var rd: Rd = msg_body(&reply)
+        let v: u32 = rd_u32(&rd)
+        if rd.ok {
+            out = v as i32
+        }
+    }
+    msg_free(&reply)
+    return out
+}
+
+fn bus_release_name(b: *mut Bus, name: str) -> bool {
+    var f: Fields = fields_call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus", "ReleaseName", "s")
+    var body: rt.Buf = rt.buf_new()
+    w_str(&body, name)
+    var reply: Msg = msg_new()
+    let rc: i32 = bus_call(b, &f, &body, &reply, 5000)
+    rt.buf_free(&body)
+    msg_free(&reply)
+    return rc == 0
+}
+
+fn bus_add_match(b: *mut Bus, rule: str) -> bool {
+    var f: Fields = fields_call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus", "AddMatch", "s")
+    var body: rt.Buf = rt.buf_new()
+    w_str(&body, rule)
+    var reply: Msg = msg_new()
+    let rc: i32 = bus_call(b, &f, &body, &reply, 5000)
+    rt.buf_free(&body)
+    msg_free(&reply)
+    return rc == 0
+}
+
+// Does somebody own this name right now?
+fn bus_name_owned(b: *mut Bus, name: str) -> bool {
+    var f: Fields = fields_call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus", "NameHasOwner", "s")
+    var body: rt.Buf = rt.buf_new()
+    w_str(&body, name)
+    var reply: Msg = msg_new()
+    let rc: i32 = bus_call(b, &f, &body, &reply, 5000)
+    rt.buf_free(&body)
+    var out: bool = false
+    if rc == 0 {
+        var rd: Rd = msg_body(&reply)
+        out = rd_bool(&rd) && rd.ok
+    }
+    msg_free(&reply)
+    return out
+}
