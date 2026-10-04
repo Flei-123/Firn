@@ -405,7 +405,7 @@ def group(fmt):
     comp = ref_compressors(fmt)[0][1]
     rnd = random.Random(7)
     base = dict(items)
-    for name in ("text600k", "elf3M", "runs"):
+    for name in [n for n in ("text600k", "elf3M", "runs") if n in base]:
         data = base[name][:40000]
         z = comp(data)
         step = max(1, len(z) // (10 if QUICK >= 2 else 30 if QUICK else 150))
