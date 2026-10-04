@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/dev.windows.fi -- audio.dev, Windows: waveOut (winmm.dll).
+//
+// The same names as lib/audio/dev.fi (Linux, PulseAudio); the compiler picks this
+// file for --target=x86_64-windows. waveOut is the oldest and simplest Windows
+// audio API and it still works on every version through the audio engine:
+// the program hands over buffers (WAVEHDR), the system plays them in order and
+// marks each header done. Six buffers go round; `dev_write` waits for a free one
+// (that wait is the playing time, the whole flow control), `dev_writable` says
+// whether one is free right now.
+//
+// HONEST
+// V1  waveOut, not WASAPI: a latency of about six buffers (150 ms at 44.1 kHz with
+//     MP3 frames of 26 ms), no exclusive mode, no device choice (the default device
+//     through WAVE_MAPPER), no change of the default device while playing.
+// V2  Tested under Wine with its PulseAudio driver (the samples that came out of
+//     the sound server compared with the decoder's PCM) and not on a real
+//     Windows machine (none can be reached from the build machine).
+// V3  No callback or event: done headers are found by polling WAVEHDR.dwFlags
+//     every 2 ms while waiting. A program that never writes sees no CPU use.
+import std.rt
+import std.time
+
+export { Dev, dev_open, dev_is_open, dev_writable, dev_write, dev_drain, dev_flush, dev_close, dev_null }
+
+extern fn waveOutOpen(ph: u64, dev: u64, fmt: u64, cb: u64, inst: u64, flags: u64) -> u32;
+extern fn waveOutClose(h: u64) -> u32;
+extern fn waveOutPrepareHeader(h: u64, hdr: u64, size: u64) -> u32;
+extern fn waveOutUnprepareHeader(h: u64, hdr: u64, size: u64) -> u32;
+extern fn waveOutWrite(h: u64, hdr: u64, size: u64) -> u32;
+extern fn waveOutReset(h: u64) -> u32;
+
+const NBUF: usize = 6
+const HDR: usize = 48 // sizeof(WAVEHDR) on x64
+const WHDR_DONE: u32 = 1
+
+struct Dev {
+    hwo: u64,
+    hdrs: u64, // NBUF headers
+    data: u64, // NBUF buffers of `cap` octets
+    cap: usize, // octets per buffer
+    busy: [bool; 6],
+    next: usize,
+    channels: u32,
+    open: bool,
+}
+
+fn dev_null() -> Dev {
+    return Dev { hwo: 0 as u64, hdrs: 0 as u64, data: 0 as u64, cap: 0, busy: [false; 6], next: 0,
+        channels: 2 as u32, open: false }
+}
+
+fn put16(p: *mut u8, i: usize, v: u32) {
+    *((p as u64 + i as u64) as *mut u8) = (v & 255 as u32) as u8
+    *((p as u64 + (i + 1) as u64) as *mut u8) = ((v >> 8) & 255 as u32) as u8
+}
+
+fn put32(p: *mut u8, i: usize, v: u32) {
+    put16(p, i, v & 65535 as u32)
+    put16(p, i + 2, v >> 16)
+}
+
+fn dev_open(app: str, rate: u32, channels: u32) -> Dev {
+    var d: Dev = dev_null()
+    d.channels = channels
+    if (channels != 1 as u32 && channels != 2 as u32) || rate < 8000 as u32 || rate > 192000 as u32 {
+        return d
+    }
+    // WAVEFORMATEX: tag 1 (PCM), channels, rate, bytes per second, block align, bits, cbSize
+    var fmt: [u8; 18] = [0; 18]
+    put16(&fmt[0], 0, 1 as u32)
+    put16(&fmt[0], 2, channels)
+    put32(&fmt[0], 4, rate)
+    put32(&fmt[0], 8, rate * channels * 2 as u32)
+    put16(&fmt[0], 12, channels * 2 as u32)
+    put16(&fmt[0], 14, 16 as u32)
+    put16(&fmt[0], 16, 0 as u32)
+    var h: [u64; 1] = [0]
+    // WAVE_MAPPER (-1), no callback
+    let r: u32 = waveOutOpen((&h[0]) as u64, 4294967295 as u64, (&fmt[0]) as u64, 0 as u64, 0 as u64, 0 as u64)
+    if r != 0 as u32 || h[0] == 0 as u64 {
+        return d
+    }
+    d.hwo = h[0]
+    // a buffer is 100 ms of audio
+    d.cap = ((rate / 10 as u32) * channels * 2 as u32) as usize
+    d.hdrs = rt.heap_alloc(NBUF * HDR)
+    d.data = rt.heap_alloc(NBUF * d.cap)
+    if d.hdrs == 0 as u64 || d.data == 0 as u64 {
+        waveOutClose(d.hwo)
+        return dev_null()
+    }
+    rt.mem_set(d.hdrs, 0 as u8, NBUF * HDR)
+    var i: usize = 0
+    while i < NBUF {
+        let hp: u64 = d.hdrs + (i * HDR) as u64
+        rt.st64(hp, 0, d.data + (i * d.cap) as u64) // lpData
+        rt.st32(hp, 2, d.cap as u32) // dwBufferLength (8 / 4)
+        if waveOutPrepareHeader(d.hwo, hp, HDR as u64) != 0 as u32 {
+            waveOutClose(d.hwo)
+            return dev_null()
+        }
+        i = i + 1
+    }
+    d.open = true
+    return d
+}
+
+fn dev_is_open(d: *mut Dev) -> bool {
+    return (*d).open
+}
+
+fn done(d: *mut Dev, i: usize) -> bool {
+    let hp: u64 = (*d).hdrs + (i * HDR) as u64
+    return (rt.ld32(hp, 6) & WHDR_DONE) != 0 as u32 // dwFlags at octet 24
+}
+
+// Marks the buffers the system has finished with as free again.
+fn collect(d: *mut Dev) {
+    var i: usize = 0
+    while i < NBUF {
+        if (*d).busy[i] && done(d, i) {
+            (*d).busy[i] = false
+        }
+        i = i + 1
+    }
+}
+
+fn free_slot(d: *mut Dev) -> i64 {
+    collect(d)
+    var k: usize = 0
+    while k < NBUF {
+        let i: usize = ((*d).next + k) % NBUF
+        if !(*d).busy[i] {
+            return i as i64
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// Frames that fit into ONE buffer, when one is free right now (0 = all are playing).
+fn dev_writable(d: *mut Dev) -> usize {
+    if !(*d).open {
+        return 0
+    }
+    if free_slot(d) < 0 {
+        return 0
+    }
+    return (*d).cap / ((*d).channels as usize * 2)
+}
+
+// Hands over `frames` frames; waits for a free buffer when all are playing.
+fn dev_write(d: *mut Dev, p: u64, frames: usize) -> bool {
+    if !(*d).open {
+        return false
+    }
+    let fb: usize = (*d).channels as usize * 2
+    var left: usize = frames * fb
+    var at: u64 = p
+    var waited: u32 = 0
+    while left > 0 {
+        let s: i64 = free_slot(d)
+        if s < 0 {
+            time.sleep_ms(2 as u64)
+            waited = waited + 1 as u32
+            if waited > 30000 as u32 { // a minute without a single buffer finished: the device is stuck
+                (*d).open = false
+                return false
+            }
+            continue
+        }
+        waited = 0
+        let i: usize = s as usize
+        var n: usize = left
+        if n > (*d).cap {
+            n = (*d).cap
+        }
+        let hp: u64 = (*d).hdrs + (i * HDR) as u64
+        rt.mem_copy((*d).data + (i * (*d).cap) as u64, at, n)
+        rt.st32(hp, 2, n as u32)
+        if waveOutWrite((*d).hwo, hp, HDR as u64) != 0 as u32 {
+            (*d).open = false
+            return false
+        }
+        (*d).busy[i] = true
+        (*d).next = (i + 1) % NBUF
+        at = at + n as u64
+        left = left - n
+    }
+    return true
+}
+
+// Waits until every buffer has been played.
+fn dev_drain(d: *mut Dev) -> bool {
+    if !(*d).open {
+        return false
+    }
+    var spins: u32 = 0
+    while spins < 30000 as u32 {
+        collect(d)
+        var any: bool = false
+        var i: usize = 0
+        while i < NBUF {
+            if (*d).busy[i] {
+                any = true
+            }
+            i = i + 1
+        }
+        if !any {
+            return true
+        }
+        time.sleep_ms(2 as u64)
+        spins = spins + 1 as u32
+    }
+    return false
+}
+
+// Drops what is queued (a quick stop).
+fn dev_flush(d: *mut Dev) -> bool {
+    if !(*d).open {
+        return false
+    }
+    let r: u32 = waveOutReset((*d).hwo)
+    collect(d)
+    return r == 0 as u32
+}
+
+fn dev_close(d: *mut Dev) {
+    if (*d).hwo != 0 as u64 {
+        waveOutReset((*d).hwo)
+        var i: usize = 0
+        while i < NBUF {
+            waveOutUnprepareHeader((*d).hwo, (*d).hdrs + (i * HDR) as u64, HDR as u64)
+            i = i + 1
+        }
+        waveOutClose((*d).hwo)
+        (*d).hwo = 0 as u64
+    }
+    if (*d).hdrs != 0 as u64 {
+        rt.heap_free((*d).hdrs, NBUF * HDR)
+        rt.heap_free((*d).data, NBUF * (*d).cap)
+        (*d).hdrs = 0 as u64
+        (*d).data = 0 as u64
+    }
+    (*d).open = false
+}

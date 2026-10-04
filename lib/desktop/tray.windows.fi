@@ -1,0 +1,795 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/desktop/tray.windows.fi -- desktop.tray, Windows: Shell_NotifyIconW.
+//
+// The same names, types and meaning as lib/desktop/tray.fi (Linux); see there for the
+// usage. The compiler picks this file for --target=x86_64-windows.
+//
+// HOW IT WORKS. The program owns a hidden top-level window (class `FirnTrayWnd`) and
+// asks the shell for a notification icon that reports to it: Shell_NotifyIconW(NIM_ADD)
+// with a callback message (WM_APP + 1). The window procedure (`#[win_callback]`) turns the
+// mouse messages into events: a left click is EV_ACTIVATE, a middle click EV_SECONDARY, a right
+// click builds a popup menu from the items and shows it (TrackPopupMenu); the chosen item arrives as
+// WM_COMMAND and becomes EV_MENU. `tray_poll` pumps the window's messages (the program has no other
+// message loop for it) and returns the next event. A balloon (`tray_balloon`, used by
+// desktop.notify) is NIF_INFO; Windows 10/11 shows it as a toast. NIN_BALLOONUSERCLICK and
+// NIN_BALLOONTIMEOUT become EV_BALLOON_CLICK / EV_BALLOON_CLOSED.
+// When Explorer restarts the shell announces "TaskbarCreated" and the icon is added again.
+//
+// HONEST
+// T1  A program that already has a window of its own (fUi) still calls `tray_poll`; its
+//     message pump and this one both run on the same thread, which is how Windows
+//     wants it. `tray_poll(t, 0, ev)` only looks.
+// T2  The Tray must not be MOVED or copied after `tray_show` (the window procedure
+//     keeps its address). Declare it once, as a `var`, and pass `&t`.
+// T3  The icon is made from the last picture given to `tray_set_icon_rgba` (straight
+//     alpha RGBA, 16 x 16 or 32 x 32 is best); without one it is the system's
+//     default application icon. `tray_set_icon_name` has no meaning here and does nothing.
+// T4  The tooltip is `title`, a line break and `text`, cut to 127 characters (the shell's limit).
+// T5  Tested under Wine against a program that plays Explorer: Shell_NotifyIconW itself
+//     is checked there (what was sent), and the clicks are posted to the window as the
+//     shell would. Not on a real Windows desktop: none can be reached from the build machine.
+// T6  Windows hides icons of new programs in the overflow area until the user
+//     drags them out (Windows 11) -- nothing a program can change.
+import std.rt
+import std.str
+import std.cmdline
+
+export {
+    Tray, TrayEvent,
+    tray_new, tray_close, tray_event_zero,
+    tray_set_icon_name, tray_set_icon_rgba, tray_clear_icons, tray_set_tooltip, tray_set_title,
+    tray_set_status,
+    tray_menu_clear, tray_menu_add, tray_menu_separator, tray_menu_set_checked,
+    tray_menu_set_enabled, tray_menu_set_label,
+    tray_show, tray_hide, tray_visible, tray_poll, tray_fd, tray_balloon,
+    tray_available, tray_rebind,
+    EV_NONE, EV_ACTIVATE, EV_SECONDARY, EV_MENU, EV_CONTEXT, EV_SCROLL, EV_BALLOON_CLICK, EV_BALLOON_CLOSED,
+    ITEM_ENABLED, ITEM_CHECKABLE, ITEM_CHECKED, ITEM_HIDDEN,
+    STATUS_ACTIVE, STATUS_PASSIVE, STATUS_ATTENTION,
+}
+
+extern fn RegisterClassW(c: u64) -> i32;
+extern fn CreateWindowExW(ex: i64, cls: u64, name: u64, style: i64, x: i64, y: i64, w: i64, h: i64,
+    parent: i64, menu: i64, inst: i64, param: i64) -> i64;
+extern fn DestroyWindow(h: i64) -> i32;
+extern fn DefWindowProcW(h: i64, m: i64, wp: i64, lp: i64) -> i64;
+extern fn PeekMessageW(m: u64, h: i64, lo: i64, hi: i64, rm: i64) -> i32;
+extern fn TranslateMessage(m: u64) -> i32;
+extern fn DispatchMessageW(m: u64) -> i64;
+extern fn GetModuleHandleW(n: i64) -> i64;
+extern fn SetWindowLongPtrW(h: i64, idx: i64, v: i64) -> i64;
+extern fn GetWindowLongPtrW(h: i64, idx: i64) -> i64;
+extern fn MsgWaitForMultipleObjectsEx(n: i64, hp: u64, ms: i64, mask: i64, fl: i64) -> i32;
+extern fn Shell_NotifyIconW(msg: i64, data: u64) -> i32;
+extern fn CreatePopupMenu() -> i64;
+extern fn AppendMenuW(menu: i64, flags: i64, id: i64, item: u64) -> i32;
+extern fn TrackPopupMenu(menu: i64, flags: i64, x: i64, y: i64, res: i64, hwnd: i64, rc: u64) -> i32;
+extern fn DestroyMenu(menu: i64) -> i32;
+extern fn SetForegroundWindow(h: i64) -> i32;
+extern fn PostMessageW(h: i64, m: i64, wp: i64, lp: i64) -> i32;
+extern fn GetCursorPos(p: u64) -> i32;
+extern fn RegisterWindowMessageW(s: u64) -> i32;
+extern fn CreateIconIndirect(info: u64) -> i64;
+extern fn DestroyIcon(h: i64) -> i32;
+extern fn LoadIconW(inst: i64, name: i64) -> i64;
+extern fn CreateDIBSection(dc: i64, bi: u64, mode: i64, bits: u64, sec: i64, off: i64) -> i64;
+extern fn CreateBitmap(w: i64, h: i64, planes: i64, bpp: i64, bits: u64) -> i64;
+extern fn DeleteObject(o: i64) -> i32;
+extern fn GetDC(h: i64) -> i64;
+extern fn ReleaseDC(h: i64, dc: i64) -> i32;
+
+const EV_NONE: u32 = 0
+const EV_ACTIVATE: u32 = 1
+const EV_SECONDARY: u32 = 2
+const EV_MENU: u32 = 3
+const EV_CONTEXT: u32 = 4
+const EV_SCROLL: u32 = 5
+const EV_BALLOON_CLICK: u32 = 6
+const EV_BALLOON_CLOSED: u32 = 7
+
+const ITEM_ENABLED: u32 = 1
+const ITEM_CHECKABLE: u32 = 2
+const ITEM_CHECKED: u32 = 4
+const ITEM_HIDDEN: u32 = 8
+const ITEM_SEPARATOR: u32 = 16
+
+const STATUS_PASSIVE: u32 = 0
+const STATUS_ACTIVE: u32 = 1
+const STATUS_ATTENTION: u32 = 2
+
+const WM_NULL: i64 = 0
+const WM_COMMAND: i64 = 273
+const WM_LBUTTONUP: i64 = 514
+const WM_RBUTTONUP: i64 = 517
+const WM_MBUTTONUP: i64 = 520
+const WM_CONTEXTMENU: i64 = 123
+const TRAYMSG: i64 = 32769 // WM_APP + 1
+const NIN_BALLOONTIMEOUT: i64 = 1028
+const NIN_BALLOONUSERCLICK: i64 = 1029
+
+const NIM_ADD: i64 = 0
+const NIM_MODIFY: i64 = 1
+const NIM_DELETE: i64 = 2
+
+struct TrayEvent {
+    kind: u32,
+    id: u32,
+    x: i32,
+    y: i32,
+}
+
+fn tray_event_zero() -> TrayEvent {
+    return TrayEvent { kind: 0 as u32, id: 0 as u32, x: 0, y: 0 }
+}
+
+struct Tray {
+    hwnd: i64,
+    hicon: i64,
+    own_icon: bool, // hicon was made by us (and has to be destroyed)
+    shown: bool,
+    added: bool, // the shell has the icon
+    status: u32,
+    taskbar_msg: u32,
+    app_id: rt.Buf,
+    tip: rt.Buf, // UTF-16 of "title\ntext", cut
+    pix: rt.Buf, // the last picture: u32 w, u32 h, RGBA octets
+    menu: rt.Buf, // records: u32 id, u32 flags, u32 label length, label padded to 4 (UTF-8)
+    events: rt.Buf, // 16 octets each
+    uid: u32,
+}
+
+fn tray_new(app_id: str, title: str) -> Tray {
+    var t: Tray = Tray { hwnd: 0, hicon: 0, own_icon: false, shown: false, added: false,
+        status: STATUS_ACTIVE, taskbar_msg: 0 as u32, app_id: rt.buf_new(), tip: rt.buf_new(),
+        pix: rt.buf_new(), menu: rt.buf_new(), events: rt.buf_new(), uid: 1 as u32 }
+    rt.buf_push_bytes(&t.app_id, app_id.p as u64, app_id.length())
+    set_tip(&t, title, "")
+    return t
+}
+
+fn put_u32(b: *mut rt.Buf, v: u32) {
+    var le: [u8; 4] = [0; 4]
+    le[0] = (v & 255 as u32) as u8
+    le[1] = ((v >> 8) & 255 as u32) as u8
+    le[2] = ((v >> 16) & 255 as u32) as u8
+    le[3] = ((v >> 24) & 255 as u32) as u8
+    rt.buf_push_bytes(b, (&le[0]) as u64, 4)
+}
+
+fn get_u32(p: u64) -> u32 {
+    return (rt.ld8(p, 0) as u32) | ((rt.ld8(p, 1) as u32) << 8) | ((rt.ld8(p, 2) as u32) << 16)
+        | ((rt.ld8(p, 3) as u32) << 24)
+}
+
+// For desktop.notify, which keeps a Tray inside its own struct and so may move it: tell the window
+// where the Tray is now. (A program that declares its Tray once never needs this.)
+fn tray_rebind(t: *mut Tray) {
+    if (*t).hwnd != 0 {
+        SetWindowLongPtrW((*t).hwnd, 0 - 21, (t as usize) as i64)
+    }
+}
+
+fn tray_fd(t: *mut Tray) -> i32 {
+    return -1
+}
+
+fn tray_visible(t: *mut Tray) -> bool {
+    return (*t).shown && (*t).added
+}
+
+fn tray_available() -> bool {
+    return true
+}
+
+// ------------------------------------------------------------ the window
+
+#[win_callback]
+fn tray_wndproc(hwnd: u64, msg: u64, wp: u64, lp: u64) -> u64 {
+    let m: i64 = msg as i64
+    let sp: i64 = GetWindowLongPtrW(hwnd as i64, 0 - 21)
+    if sp != 0 {
+        let t: *mut Tray = sp as *mut Tray
+        if m == TRAYMSG {
+            on_tray_message(t, wp as i64, lp as i64)
+            return 0 as u64
+        }
+        if m == WM_COMMAND {
+            on_command(t, (wp as i64) & 65535)
+            return 0 as u64
+        }
+        if (*t).taskbar_msg != 0 as u32 && m == (*t).taskbar_msg as i64 {
+            // Explorer restarted: the shell forgot our icon
+            (*t).added = false
+            if (*t).shown {
+                add_icon(t)
+            }
+            return 0 as u64
+        }
+    }
+    return DefWindowProcW(hwnd as i64, m, wp as i64, lp as i64) as u64
+}
+
+struct Holder4 {
+    f: fn(u64, u64, u64, u64) -> u64,
+}
+
+fn code_of4(f: fn(u64, u64, u64, u64) -> u64) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut Holder4 = (&roh[0]) as *mut Holder4
+    (*h).f = f
+    return *((roh[0]) as *mut u64)
+}
+
+static mut G_CLASS: bool = false
+
+fn ensure_class() -> bool {
+    if G_CLASS {
+        return true
+    }
+    let inst: i64 = GetModuleHandleW(0)
+    var cls: [u16; 12] = u"FirnTrayWnd\0"
+    var wc: [u8; 72] = [0; 72]
+    let p: u64 = (&wc[0]) as u64
+    rt.st64(p, 1, code_of4(tray_wndproc))
+    rt.st64(p, 3, inst as u64)
+    rt.st64(p, 8, (&cls[0]) as u64)
+    if RegisterClassW(p) == 0 {
+        return false
+    }
+    G_CLASS = true
+    return true
+}
+
+fn make_window(t: *mut Tray) -> bool {
+    if (*t).hwnd != 0 {
+        return true
+    }
+    if !ensure_class() {
+        return false
+    }
+    var cls: [u16; 12] = u"FirnTrayWnd\0"
+    var title: [u16; 12] = u"FirnTrayWnd\0"
+    let inst: i64 = GetModuleHandleW(0)
+    // a hidden top-level window (WS_OVERLAPPED, never shown): it must be top-level to
+    // receive the broadcast "TaskbarCreated"
+    let h: i64 = CreateWindowExW(0, (&cls[0]) as u64, (&title[0]) as u64, 0, 0, 0, 0, 0, 0, 0, inst, 0)
+    if h == 0 {
+        return false
+    }
+    (*t).hwnd = h
+    SetWindowLongPtrW(h, 0 - 21, (t as usize) as i64)
+    var tb: [u16; 15] = u"TaskbarCreated\0"
+    (*t).taskbar_msg = RegisterWindowMessageW((&tb[0]) as u64) as u32
+    return true
+}
+
+// ------------------------------------------------------- the icon itself
+
+// NOTIFYICONDATAW (x64, Vista+): 976 octets. Offsets: cbSize 0, hWnd 8, uID 16, uFlags 20,
+// uCallbackMessage 24, hIcon 32, szTip[128] 40, dwState 296, dwStateMask 300, szInfo[256] 304,
+// uTimeout/uVersion 816, szInfoTitle[64] 820, dwInfoFlags 948, guidItem 952, hBalloonIcon 968.
+const NID_SIZE: usize = 976
+
+fn nid_base(t: *mut Tray, d: u64, flags: u32) {
+    rt.mem_set(d, 0 as u8, NID_SIZE)
+    rt.st32(d, 0, NID_SIZE as u32)
+    rt.st64(d, 1, (*t).hwnd as u64)
+    rt.st32(d, 4, (*t).uid)
+    rt.st32(d, 5, flags)
+    rt.st32(d, 6, TRAYMSG as u32)
+    rt.st64(d, 4, (*t).hicon as u64)
+}
+
+fn default_icon() -> i64 {
+    return LoadIconW(0, 32512) // IDI_APPLICATION
+}
+
+fn make_icon(t: *mut Tray) {
+    if (*t).own_icon && (*t).hicon != 0 {
+        DestroyIcon((*t).hicon)
+    }
+    (*t).hicon = 0
+    (*t).own_icon = false
+    if rt.buf_len(&(*t).pix) >= 8 {
+        let base: u64 = rt.buf_ptr(&(*t).pix)
+        let w: u32 = get_u32(base)
+        let h: u32 = get_u32(base + 4)
+        var bi: [u8; 48] = [0; 48]
+        let b: u64 = (&bi[0]) as u64
+        rt.st32(b, 0, 40 as u32)
+        rt.st32(b, 1, w)
+        rt.st32(b, 2, (4294967296 - (h as u64)) as u32) // a negative height: rows from the top
+        rt.st16(b, 6, 1 as u16)
+        rt.st16(b, 7, 32 as u16)
+        var bits: [u64; 1] = [0]
+        let dc: i64 = GetDC(0)
+        let hbm: i64 = CreateDIBSection(dc, b, 0, (&bits[0]) as u64, 0, 0)
+        ReleaseDC(0, dc)
+        let mask: i64 = CreateBitmap(w as i64, h as i64, 1, 1, 0 as u64)
+        if hbm != 0 && mask != 0 && bits[0] != 0 as u64 {
+            // BGRA, straight alpha, from RGBA
+            var i: usize = 0
+            let n: usize = (w as usize) * (h as usize)
+            while i < n {
+                let s: u64 = base + 8 + (i * 4) as u64
+                let o: u64 = bits[0] + (i * 4) as u64
+                rt.st8(o, 0, rt.ld8(s, 2))
+                rt.st8(o, 1, rt.ld8(s, 1))
+                rt.st8(o, 2, rt.ld8(s, 0))
+                rt.st8(o, 3, rt.ld8(s, 3))
+                i = i + 1
+            }
+            // ICONINFO: fIcon 4, xHotspot 4, yHotspot 4, pad 4, hbmMask 8, hbmColor 8
+            var ii: [u64; 4] = [0; 4]
+            let q: u64 = (&ii[0]) as u64
+            rt.st32(q, 0, 1 as u32)
+            rt.st64(q, 2, mask as u64)
+            rt.st64(q, 3, hbm as u64)
+            let ic: i64 = CreateIconIndirect(q)
+            if ic != 0 {
+                (*t).hicon = ic
+                (*t).own_icon = true
+            }
+        }
+        if hbm != 0 {
+            DeleteObject(hbm)
+        }
+        if mask != 0 {
+            DeleteObject(mask)
+        }
+    }
+    if (*t).hicon == 0 {
+        (*t).hicon = default_icon()
+    }
+}
+
+fn add_icon(t: *mut Tray) -> bool {
+    if !make_window(t) {
+        return false
+    }
+    if (*t).hicon == 0 {
+        make_icon(t)
+    }
+    var d: [u8; 976] = [0; 976]
+    let p: u64 = (&d[0]) as u64
+    nid_base(t, p, 1 as u32 | 2 as u32 | 4 as u32) // NIF_MESSAGE | NIF_ICON | NIF_TIP
+    let n: usize = rt.buf_len(&(*t).tip)
+    var k: usize = n
+    if k > 254 {
+        k = 254
+    }
+    rt.mem_copy(p + 40, rt.buf_ptr(&(*t).tip), k)
+    let ok: bool = Shell_NotifyIconW(NIM_ADD, p) != 0
+    (*t).added = ok
+    return ok
+}
+
+fn modify_icon(t: *mut Tray) {
+    if !(*t).added {
+        return
+    }
+    var d: [u8; 976] = [0; 976]
+    let p: u64 = (&d[0]) as u64
+    nid_base(t, p, 1 as u32 | 2 as u32 | 4 as u32)
+    var k: usize = rt.buf_len(&(*t).tip)
+    if k > 254 {
+        k = 254
+    }
+    rt.mem_copy(p + 40, rt.buf_ptr(&(*t).tip), k)
+    Shell_NotifyIconW(NIM_MODIFY, p)
+}
+
+fn set_tip(t: *mut Tray, title: str, text: str) {
+    rt.buf_clear(&(*t).tip)
+    var line: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&line, title.p as u64, title.length())
+    if text.length() > 0 {
+        rt.buf_push(&line, 10 as u8)
+        rt.buf_push_bytes(&line, text.p as u64, text.length())
+    }
+    cmdline.utf8_to_utf16(rt.buf_ptr(&line), rt.buf_len(&line), &(*t).tip)
+    rt.buf_free(&line)
+    // at most 127 units, then the terminating zero (the buffer is zeroed: no push needed)
+    if rt.buf_len(&(*t).tip) > 254 {
+        rt.buf_set_len(&(*t).tip, 254)
+    }
+}
+
+// ----------------------------------------------------------- the setters
+
+fn tray_set_title(t: *mut Tray, title: str) {
+    set_tip(t, title, "")
+    modify_icon(t)
+}
+
+fn tray_set_icon_name(t: *mut Tray, name: str) {
+    // theme icon names do not exist on Windows
+}
+
+fn tray_clear_icons(t: *mut Tray) {
+    rt.buf_clear(&(*t).pix)
+    make_icon(t)
+    modify_icon(t)
+}
+
+fn tray_set_icon_rgba(t: *mut Tray, w: u32, h: u32, rgba: u64) -> bool {
+    if w == 0 as u32 || h == 0 as u32 || w > 512 as u32 || h > 512 as u32 {
+        return false
+    }
+    rt.buf_clear(&(*t).pix)
+    put_u32(&(*t).pix, w)
+    put_u32(&(*t).pix, h)
+    rt.buf_push_bytes(&(*t).pix, rgba, (w as usize) * (h as usize) * 4)
+    if (*t).added || (*t).hicon != 0 {
+        make_icon(t)
+        modify_icon(t)
+    }
+    return true
+}
+
+fn tray_set_tooltip(t: *mut Tray, title: str, text: str) {
+    set_tip(t, title, text)
+    modify_icon(t)
+}
+
+fn tray_set_status(t: *mut Tray, s: u32) {
+    let before: u32 = (*t).status
+    (*t).status = s
+    if (*t).shown {
+        // Passive = hidden icon, as the SNI status means it
+        if s == STATUS_PASSIVE && (*t).added {
+            remove_icon(t)
+        } else if s != STATUS_PASSIVE && !(*t).added {
+            add_icon(t)
+        }
+    }
+}
+
+// ------------------------------------------------------------- the menu
+
+fn tray_menu_clear(t: *mut Tray) {
+    rt.buf_clear(&(*t).menu)
+}
+
+fn pad_buf4(b: *mut rt.Buf) {
+    while rt.buf_len(b) % 4 != 0 {
+        rt.buf_push(b, 0 as u8)
+    }
+}
+
+fn tray_menu_add(t: *mut Tray, id: u32, label: str, flags: u32) -> bool {
+    if id == 0 as u32 {
+        return false
+    }
+    put_u32(&(*t).menu, id)
+    put_u32(&(*t).menu, flags)
+    put_u32(&(*t).menu, label.length() as u32)
+    rt.buf_push_bytes(&(*t).menu, label.p as u64, label.length())
+    pad_buf4(&(*t).menu)
+    return true
+}
+
+fn tray_menu_separator(t: *mut Tray) {
+    put_u32(&(*t).menu, 2147483647 as u32)
+    put_u32(&(*t).menu, ITEM_SEPARATOR | ITEM_ENABLED)
+    put_u32(&(*t).menu, 0 as u32)
+}
+
+fn menu_find(t: *mut Tray, id: u32) -> usize {
+    let p: u64 = rt.buf_ptr(&(*t).menu)
+    var off: usize = 0
+    while off < rt.buf_len(&(*t).menu) {
+        let ll: usize = get_u32(p + off as u64 + 8) as usize
+        if get_u32(p + off as u64) == id {
+            return off
+        }
+        off = off + 12 + (ll + 3) / 4 * 4
+    }
+    return rt.buf_len(&(*t).menu)
+}
+
+fn menu_set_flag(t: *mut Tray, id: u32, flag: u32, on: bool) -> bool {
+    let off: usize = menu_find(t, id)
+    if off >= rt.buf_len(&(*t).menu) {
+        return false
+    }
+    let q: u64 = rt.buf_ptr(&(*t).menu) + off as u64 + 4
+    var fl: u32 = get_u32(q)
+    if on {
+        fl = fl | flag
+    } else {
+        fl = fl & (~flag)
+    }
+    rt.st8(q, 0, (fl & 255 as u32) as u8)
+    rt.st8(q, 1, ((fl >> 8) & 255 as u32) as u8)
+    rt.st8(q, 2, ((fl >> 16) & 255 as u32) as u8)
+    rt.st8(q, 3, ((fl >> 24) & 255 as u32) as u8)
+    return true
+}
+
+fn tray_menu_set_checked(t: *mut Tray, id: u32, on: bool) -> bool {
+    if !menu_set_flag(t, id, ITEM_CHECKED, on) {
+        return false
+    }
+    if on {
+        menu_set_flag(t, id, ITEM_CHECKABLE, true)
+    }
+    return true
+}
+
+fn tray_menu_set_enabled(t: *mut Tray, id: u32, on: bool) -> bool {
+    return menu_set_flag(t, id, ITEM_ENABLED, on)
+}
+
+fn tray_menu_set_label(t: *mut Tray, id: u32, label: str) -> bool {
+    let off: usize = menu_find(t, id)
+    let total: usize = rt.buf_len(&(*t).menu)
+    if off >= total {
+        return false
+    }
+    let p: u64 = rt.buf_ptr(&(*t).menu)
+    let fl: u32 = get_u32(p + off as u64 + 4)
+    let ll: usize = get_u32(p + off as u64 + 8) as usize
+    let rec: usize = 12 + (ll + 3) / 4 * 4
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&nb, p, off)
+    put_u32(&nb, id)
+    put_u32(&nb, fl)
+    put_u32(&nb, label.length() as u32)
+    rt.buf_push_bytes(&nb, label.p as u64, label.length())
+    pad_buf4(&nb)
+    rt.buf_push_bytes(&nb, p + (off + rec) as u64, total - off - rec)
+    rt.buf_clear(&(*t).menu)
+    rt.buf_push_bytes(&(*t).menu, rt.buf_ptr(&nb), rt.buf_len(&nb))
+    rt.buf_free(&nb)
+    return true
+}
+
+// ------------------------------------------------------------ the events
+
+// Signed <-> unsigned reinterpretation (`as` between them is a checked conversion).
+fn i32_bits(v: i32) -> u32 {
+    return ((v as i64) & 4294967295) as u32
+}
+
+fn bits_i32(v: u32) -> i32 {
+    let w: i64 = v as i64
+    if w >= 2147483648 {
+        return (w - 4294967296) as i32
+    }
+    return w as i32
+}
+
+fn push_event(t: *mut Tray, kind: u32, id: u32, x: i32, y: i32) {
+    put_u32(&(*t).events, kind)
+    put_u32(&(*t).events, id)
+    put_u32(&(*t).events, i32_bits(x))
+    put_u32(&(*t).events, i32_bits(y))
+}
+
+fn pop_event(t: *mut Tray, ev: *mut TrayEvent) -> bool {
+    let n: usize = rt.buf_len(&(*t).events)
+    if n < 16 {
+        return false
+    }
+    let p: u64 = rt.buf_ptr(&(*t).events)
+    (*ev).kind = get_u32(p)
+    (*ev).id = get_u32(p + 4)
+    let xr: u32 = get_u32(p + 8)
+    let yr: u32 = get_u32(p + 12)
+    (*ev).x = bits_i32(xr)
+    (*ev).y = bits_i32(yr)
+    rt.mem_copy(p, p + 16, n - 16)
+    rt.buf_set_len(&(*t).events, n - 16)
+    return true
+}
+
+// The nth (1-based) visible item of the menu records -> its id; 0 = none.
+fn id_of_command(t: *mut Tray, cmd: i64) -> u32 {
+    let p: u64 = rt.buf_ptr(&(*t).menu)
+    var off: usize = 0
+    var k: i64 = 0
+    while off < rt.buf_len(&(*t).menu) {
+        let ll: usize = get_u32(p + off as u64 + 8) as usize
+        let fl: u32 = get_u32(p + off as u64 + 4)
+        if (fl & ITEM_HIDDEN) == 0 as u32 && (fl & ITEM_SEPARATOR) == 0 as u32 {
+            k = k + 1
+            if k == cmd {
+                return get_u32(p + off as u64)
+            }
+        }
+        off = off + 12 + (ll + 3) / 4 * 4
+    }
+    return 0 as u32
+}
+
+fn on_command(t: *mut Tray, cmd: i64) {
+    let id: u32 = id_of_command(t, cmd)
+    if id != 0 as u32 {
+        push_event(t, EV_MENU, id, 0, 0)
+    }
+}
+
+fn show_menu(t: *mut Tray, x: i32, y: i32) {
+    if rt.buf_len(&(*t).menu) == 0 {
+        return
+    }
+    let hm: i64 = CreatePopupMenu()
+    if hm == 0 {
+        return
+    }
+    let p: u64 = rt.buf_ptr(&(*t).menu)
+    var off: usize = 0
+    var k: i64 = 0
+    while off < rt.buf_len(&(*t).menu) {
+        let ll: usize = get_u32(p + off as u64 + 8) as usize
+        let fl: u32 = get_u32(p + off as u64 + 4)
+        if (fl & ITEM_HIDDEN) == 0 as u32 {
+            if (fl & ITEM_SEPARATOR) != 0 as u32 {
+                AppendMenuW(hm, 2048, 0, 0 as u64) // MF_SEPARATOR
+            } else {
+                k = k + 1
+                var flags: i64 = 0 // MF_STRING
+                if (fl & ITEM_ENABLED) == 0 as u32 {
+                    flags = flags | 3 // MF_GRAYED | MF_DISABLED
+                }
+                if (fl & ITEM_CHECKED) != 0 as u32 {
+                    flags = flags | 8 // MF_CHECKED
+                }
+                var w: rt.Buf = rt.buf_new()
+                cmdline.utf8_to_utf16(p + off as u64 + 12, ll, &w)
+                rt.buf_push(&w, 0 as u8)
+                rt.buf_push(&w, 0 as u8)
+                AppendMenuW(hm, flags, k, rt.buf_ptr(&w))
+                rt.buf_free(&w)
+            }
+        }
+        off = off + 12 + (ll + 3) / 4 * 4
+    }
+    // the documented dance: the window must be foreground or the menu does not close when
+    // the user clicks elsewhere; a WM_NULL afterwards. The chosen item arrives as WM_COMMAND.
+    SetForegroundWindow((*t).hwnd)
+    TrackPopupMenu(hm, 2 as i64, x as i64, y as i64, 0, (*t).hwnd, 0 as u64) // TPM_RIGHTBUTTON
+    PostMessageW((*t).hwnd, WM_NULL, 0, 0)
+    DestroyMenu(hm)
+}
+
+fn on_tray_message(t: *mut Tray, wp: i64, lp: i64) {
+    let ev: i64 = lp & 65535
+    var pt: [i32; 2] = [0; 2]
+    GetCursorPos((&pt[0]) as u64)
+    if ev == WM_LBUTTONUP {
+        push_event(t, EV_ACTIVATE, 0 as u32, pt[0], pt[1])
+    } else if ev == WM_MBUTTONUP {
+        push_event(t, EV_SECONDARY, 0 as u32, pt[0], pt[1])
+    } else if ev == WM_RBUTTONUP {
+        push_event(t, EV_CONTEXT, 0 as u32, pt[0], pt[1])
+        show_menu(t, pt[0], pt[1])
+    } else if ev == NIN_BALLOONUSERCLICK {
+        push_event(t, EV_BALLOON_CLICK, 0 as u32, 0, 0)
+    } else if ev == NIN_BALLOONTIMEOUT {
+        push_event(t, EV_BALLOON_CLOSED, 0 as u32, 0, 0)
+    }
+}
+
+// ------------------------------------------------------ show, hide, poll
+
+fn tray_show(t: *mut Tray) -> bool {
+    (*t).shown = true
+    if !make_window(t) {
+        return false
+    }
+    // the window keeps the address of `t`
+    SetWindowLongPtrW((*t).hwnd, 0 - 21, (t as usize) as i64)
+    if (*t).status == STATUS_PASSIVE {
+        return true
+    }
+    if (*t).added {
+        return true
+    }
+    return add_icon(t)
+}
+
+fn remove_icon(t: *mut Tray) {
+    if (*t).added {
+        var d: [u8; 976] = [0; 976]
+        nid_base(t, (&d[0]) as u64, 0 as u32)
+        Shell_NotifyIconW(NIM_DELETE, (&d[0]) as u64)
+        (*t).added = false
+    }
+}
+
+fn tray_hide(t: *mut Tray) {
+    (*t).shown = false
+    remove_icon(t)
+}
+
+fn tray_close(t: *mut Tray) {
+    remove_icon(t)
+    if (*t).hwnd != 0 {
+        SetWindowLongPtrW((*t).hwnd, 0 - 21, 0)
+        DestroyWindow((*t).hwnd)
+        (*t).hwnd = 0
+    }
+    if (*t).own_icon && (*t).hicon != 0 {
+        DestroyIcon((*t).hicon)
+    }
+    (*t).hicon = 0
+    (*t).shown = false
+    rt.buf_free(&(*t).app_id)
+    rt.buf_free(&(*t).tip)
+    rt.buf_free(&(*t).pix)
+    rt.buf_free(&(*t).menu)
+    rt.buf_free(&(*t).events)
+}
+
+// Runs the window's messages. true = at least one message was handled.
+fn pump(t: *mut Tray) -> bool {
+    var any: bool = false
+    var msg: [u8; 48] = [0; 48]
+    while PeekMessageW((&msg[0]) as u64, 0, 0, 0, 1) != 0 { // PM_REMOVE
+        any = true
+        TranslateMessage((&msg[0]) as u64)
+        DispatchMessageW((&msg[0]) as u64)
+    }
+    return any
+}
+
+// Pumps the messages for up to `ms` milliseconds and returns the next event.
+fn tray_poll(t: *mut Tray, ms: i64, ev: *mut TrayEvent) -> bool {
+    if pop_event(t, ev) {
+        return true
+    }
+    if (*t).hwnd == 0 {
+        return false
+    }
+    pump(t)
+    if pop_event(t, ev) {
+        return true
+    }
+    if ms == 0 {
+        return false
+    }
+    var left: i64 = ms
+    var step: i64 = 10
+    while ms < 0 || left > 0 {
+        // wait for input (a posted message wakes it) at most `step` ms, then look again
+        MsgWaitForMultipleObjectsEx(0, 0 as u64, step, 1279, 4) // QS_ALLINPUT, MWMO_INPUTAVAILABLE
+        pump(t)
+        if pop_event(t, ev) {
+            return true
+        }
+        if ms >= 0 {
+            left = left - step
+        }
+    }
+    return false
+}
+
+// Shows a balloon (a toast on Windows 10/11) from the tray icon. The icon has to be shown.
+fn tray_balloon(t: *mut Tray, title: str, text: str) -> bool {
+    if !(*t).added {
+        return false
+    }
+    var d: [u8; 976] = [0; 976]
+    let p: u64 = (&d[0]) as u64
+    nid_base(t, p, 16 as u32) // NIF_INFO
+    var tb: rt.Buf = rt.buf_new()
+    cmdline.utf8_to_utf16(title.p as u64, title.length(), &tb)
+    var k: usize = rt.buf_len(&tb)
+    if k > 126 {
+        k = 126 // 63 units, the title's limit
+    }
+    rt.mem_copy(p + 820, rt.buf_ptr(&tb), k)
+    rt.buf_free(&tb)
+    var xb: rt.Buf = rt.buf_new()
+    cmdline.utf8_to_utf16(text.p as u64, text.length(), &xb)
+    var j: usize = rt.buf_len(&xb)
+    if j > 510 {
+        j = 510 // 255 units
+    }
+    rt.mem_copy(p + 304, rt.buf_ptr(&xb), j)
+    rt.buf_free(&xb)
+    rt.st32(p, 237, 1 as u32) // dwInfoFlags: NIIF_INFO, at octet 948
+    return Shell_NotifyIconW(NIM_MODIFY, p) != 0
+}

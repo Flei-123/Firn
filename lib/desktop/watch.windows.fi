@@ -1,0 +1,411 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/desktop/watch.windows.fi -- desktop.watch, Windows: ReadDirectoryChangesW.
+//
+// The same names and meaning as lib/desktop/watch.fi (Linux, inotify); the compiler picks this
+// file for --target=x86_64-windows. Each watched folder is opened with FILE_LIST_DIRECTORY
+// and a read is kept pending (overlapped, with an event); `watch_poll` waits on the events,
+// reads the FILE_NOTIFY_INFORMATION records and turns them into the same events.
+//
+// DIFFERENCES FROM LINUX, honestly
+// W1  Windows does not say whether the entry is a folder: `is_dir` comes from a stat of the path
+//     made after the event (false for something already deleted).
+// W2  A rename comes as two records (old name, new name); they get one `cookie` made here. A
+//     move out of or into the tree is a lone DELETED/CREATED, as Windows reports it.
+// W3  ATTRIB is not reported separately: a change of attributes is MODIFIED.
+// W4  There are up to four watched folders per Watcher (one 32 KiB buffer and one pending
+//     read each). `recursive` is the system's own subtree watch (no per-folder watches, no
+//     race with new folders as on Linux).
+// W5  When the buffer overflows (too many changes while the program was busy) the system
+//     gives an empty answer: OVERFLOW. Changes in the short time between one answer and the next
+//     read are queued by the file system driver for the handle (the read is re-issued before the
+//     records are looked at), not invented.
+// W6  A watched folder that disappears ends its read with an error (the documented behaviour):
+//     ROOT_GONE; the code also looks at the folder's existence when it is quiet. UNVERIFIED: under
+//     Wine the deleted folder stays "delete pending" while the watch holds it open and nothing
+//     is reported (tests/2220 skips this check on Windows).
+// W7  Tested under Wine (which implements ReadDirectoryChangesW with inotify), the same
+//     test program as on Linux (tests/2220); not on a real Windows machine.
+import std.rt
+import std.str
+import std.fs
+import std.cmdline
+
+export {
+    Watcher, WatchEvent,
+    watch_new, watch_add, watch_poll, watch_event_path, watch_event_zero, watch_close, watch_fd,
+    EV_NONE, EV_CREATED, EV_MODIFIED, EV_DELETED, EV_RENAMED_FROM, EV_RENAMED_TO, EV_ATTRIB,
+    EV_OVERFLOW, EV_ROOT_GONE,
+}
+
+extern fn CreateFileW(name: u64, access: i64, share: i64, sec: u64, disp: i64, flags: i64, tmpl: i64) -> i64;
+extern fn CloseHandle(h: i64) -> i32;
+extern fn CreateEventW(sec: u64, manual: i64, initial: i64, name: u64) -> i64;
+extern fn ResetEvent(h: i64) -> i32;
+extern fn WaitForSingleObject(h: i64, ms: i64) -> i32;
+extern fn GetOverlappedResult(h: i64, ov: u64, bytes: u64, wait: i64) -> i32;
+extern fn CancelIo(h: i64) -> i32;
+extern fn ReadDirectoryChangesW(h: i64, buf: u64, len: i64, sub: i64, filter: i64, ret: u64, ov: u64, cb: u64) -> i32;
+extern fn Sleep(ms: i64);
+
+const EV_NONE: u32 = 0
+const EV_CREATED: u32 = 1
+const EV_MODIFIED: u32 = 2
+const EV_DELETED: u32 = 3
+const EV_RENAMED_FROM: u32 = 4
+const EV_RENAMED_TO: u32 = 5
+const EV_ATTRIB: u32 = 6
+const EV_OVERFLOW: u32 = 7
+const EV_ROOT_GONE: u32 = 8
+
+const NROOT: usize = 4
+const BUF: usize = 32768
+
+struct WatchEvent {
+    kind: u32,
+    is_dir: bool,
+    cookie: u32,
+}
+
+fn watch_event_zero() -> WatchEvent {
+    return WatchEvent { kind: 0 as u32, is_dir: false, cookie: 0 as u32 }
+}
+
+struct Watcher {
+    n: usize,
+    h: [i64; 4], // directory handles
+    ev: [i64; 4], // events
+    sub: [bool; 4],
+    pend: [bool; 4], // a read is pending
+    gone: [bool; 4], // ROOT_GONE was reported
+    ov: rt.Buf, // 4 OVERLAPPED of 32 octets
+    buf: rt.Buf, // 4 read buffers of BUF octets
+    root: rt.Buf, // records: u32 length, UTF-8 root path padded to 4 (4 of them in order)
+    queue: rt.Buf, // decoded events waiting: u32 kind, u32 is_dir, u32 cookie, u32 length, path padded to 4
+    path: rt.Buf,
+    cookie: u32,
+}
+
+fn watch_new() -> Watcher {
+    var w: Watcher = Watcher { n: 0, h: [0; 4], ev: [0; 4], sub: [false; 4], pend: [false; 4], gone: [false; 4], ov: rt.buf_new(),
+        buf: rt.buf_new(), root: rt.buf_new(), queue: rt.buf_new(), path: rt.buf_new(), cookie: 0 as u32 }
+    rt.buf_reserve(&w.ov, NROOT * 32)
+    rt.buf_set_len(&w.ov, NROOT * 32)
+    rt.mem_set(rt.buf_ptr(&w.ov), 0 as u8, NROOT * 32)
+    rt.buf_reserve(&w.buf, NROOT * BUF)
+    rt.buf_set_len(&w.buf, NROOT * BUF)
+    return w
+}
+
+// There is no descriptor to wait on: Windows waits on the events inside `watch_poll`.
+fn watch_fd(w: *mut Watcher) -> i32 {
+    return -1
+}
+
+fn put_u32(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 16) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 24) & 255 as u32) as u8)
+}
+
+fn get_u32(p: u64) -> u32 {
+    return (rt.ld8(p, 0) as u32) | ((rt.ld8(p, 1) as u32) << 8) | ((rt.ld8(p, 2) as u32) << 16)
+        | ((rt.ld8(p, 3) as u32) << 24)
+}
+
+fn pad_buf4(b: *mut rt.Buf) {
+    while rt.buf_len(b) % 4 != 0 {
+        rt.buf_push(b, 0 as u8)
+    }
+}
+
+fn ov_of(w: *mut Watcher, i: usize) -> u64 {
+    return rt.buf_ptr(&(*w).ov) + (i * 32) as u64
+}
+
+fn buf_of(w: *mut Watcher, i: usize) -> u64 {
+    return rt.buf_ptr(&(*w).buf) + (i * BUF) as u64
+}
+
+// FILE_NOTIFY_CHANGE_FILE_NAME | DIR_NAME | ATTRIBUTES | SIZE | LAST_WRITE | CREATION
+const FILTER: i64 = 1 | 2 | 4 | 8 | 16 | 64
+
+fn issue(w: *mut Watcher, i: usize) -> bool {
+    ResetEvent((*w).ev[i])
+    rt.mem_set(ov_of(w, i), 0 as u8, 32)
+    rt.st64(ov_of(w, i), 3, (*w).ev[i] as u64) // hEvent at octet 24
+    var sub: i64 = 0
+    if (*w).sub[i] {
+        sub = 1
+    }
+    let ok: bool = ReadDirectoryChangesW((*w).h[i], buf_of(w, i), BUF as i64, sub, FILTER, 0 as u64, ov_of(w, i), 0 as u64) != 0
+    (*w).pend[i] = ok
+    return ok
+}
+
+fn watch_add(w: *mut Watcher, path: str, recursive: bool) -> bool {
+    if (*w).n >= NROOT || path.length() == 0 {
+        return false
+    }
+    var wp: rt.Buf = rt.buf_new()
+    cmdline.utf8_to_utf16_path(path.p as u64, path.length(), &wp)
+    rt.buf_push(&wp, 0 as u8)
+    rt.buf_push(&wp, 0 as u8)
+    // FILE_LIST_DIRECTORY, share read|write|delete, OPEN_EXISTING, BACKUP_SEMANTICS | OVERLAPPED
+    let h: i64 = CreateFileW(rt.buf_ptr(&wp), 1, 7, 0 as u64, 3, 33554432 | 1073741824, 0)
+    rt.buf_free(&wp)
+    if h == 0 - 1 || h == 0 {
+        return false
+    }
+    let ev: i64 = CreateEventW(0 as u64, 1, 0, 0 as u64)
+    if ev == 0 {
+        CloseHandle(h)
+        return false
+    }
+    let i: usize = (*w).n
+    (*w).h[i] = h
+    (*w).ev[i] = ev
+    (*w).sub[i] = recursive
+    if !issue(w, i) {
+        CloseHandle(ev)
+        CloseHandle(h)
+        return false
+    }
+    // remember the path (without a trailing separator)
+    var p: str = path
+    while p.length() > 1 && (p.chars(p.length() - 1) == 92 as u8 || p.chars(p.length() - 1) == 47 as u8) {
+        p = p.part(0, p.length() - 1)
+    }
+    put_u32(&(*w).root, p.length() as u32)
+    rt.buf_push_bytes(&(*w).root, p.p as u64, p.length())
+    pad_buf4(&(*w).root)
+    (*w).n = i + 1
+    return true
+}
+
+fn root_of(w: *mut Watcher, i: usize, out: *mut rt.Buf) {
+    let base: u64 = rt.buf_ptr(&(*w).root)
+    var off: usize = 0
+    var k: usize = 0
+    while off < rt.buf_len(&(*w).root) {
+        let l: usize = get_u32(base + off as u64) as usize
+        if k == i {
+            rt.buf_push_bytes(out, base + off as u64 + 4, l)
+            return
+        }
+        off = off + 4 + (l + 3) / 4 * 4
+        k = k + 1
+    }
+}
+
+fn queue_push(w: *mut Watcher, kind: u32, is_dir: bool, cookie: u32, path: str) {
+    put_u32(&(*w).queue, kind)
+    if is_dir {
+        put_u32(&(*w).queue, 1 as u32)
+    } else {
+        put_u32(&(*w).queue, 0 as u32)
+    }
+    put_u32(&(*w).queue, cookie)
+    put_u32(&(*w).queue, path.length() as u32)
+    rt.buf_push_bytes(&(*w).queue, path.p as u64, path.length())
+    pad_buf4(&(*w).queue)
+}
+
+fn is_dir_path(p: str) -> bool {
+    let info: fs.FileInfo = fs.lstat(p) catch fs.FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    return info.kind == fs.KIND_DIR
+}
+
+// The records read into `data` (n octets) of root `i` become queued events.
+fn decode(w: *mut Watcher, i: usize, data: u64, n: usize) {
+    var root: rt.Buf = rt.buf_new()
+    root_of(w, i, &root)
+    var off: usize = 0
+    var go: bool = true
+    var pending_cookie: u32 = 0
+    while go && off + 12 <= n {
+        let next: usize = get_u32(data + off as u64) as usize
+        let action: u32 = get_u32(data + off as u64 + 4)
+        let nbytes: usize = get_u32(data + off as u64 + 8) as usize
+        if off + 12 + nbytes > n {
+            break
+        }
+        var name: rt.Buf = rt.buf_new()
+        cmdline.utf16_to_utf8(data + off as u64 + 12, nbytes / 2, &name)
+        var full: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&full, rt.buf_ptr(&root), rt.buf_len(&root))
+        rt.buf_push(&full, 92 as u8)
+        rt.buf_push_bytes(&full, rt.buf_ptr(&name), rt.buf_len(&name))
+        let fullp: str = str { p: rt.buf_data(&full), n: rt.buf_len(&full) }
+        var kind: u32 = 0
+        var cookie: u32 = 0
+        if action == 1 as u32 {
+            kind = EV_CREATED
+        } else if action == 2 as u32 {
+            kind = EV_DELETED
+        } else if action == 3 as u32 {
+            kind = EV_MODIFIED
+        } else if action == 4 as u32 {
+            kind = EV_RENAMED_FROM
+            (*w).cookie = (*w).cookie + 1 as u32
+            pending_cookie = (*w).cookie
+            cookie = pending_cookie
+        } else if action == 5 as u32 {
+            kind = EV_RENAMED_TO
+            cookie = pending_cookie
+            if cookie == 0 as u32 {
+                (*w).cookie = (*w).cookie + 1 as u32
+                cookie = (*w).cookie
+            }
+            pending_cookie = 0 as u32
+        }
+        if kind != 0 as u32 {
+            var d: bool = false
+            if kind != EV_DELETED && kind != EV_RENAMED_FROM {
+                d = is_dir_path(fullp)
+            }
+            queue_push(w, kind, d, cookie, fullp)
+        }
+        rt.buf_free(&full)
+        rt.buf_free(&name)
+        if next == 0 {
+            go = false
+        } else {
+            off = off + next
+        }
+    }
+    rt.buf_free(&root)
+}
+
+fn queue_take(w: *mut Watcher, ev: *mut WatchEvent) -> bool {
+    let total: usize = rt.buf_len(&(*w).queue)
+    if total < 16 {
+        return false
+    }
+    let p: u64 = rt.buf_ptr(&(*w).queue)
+    let l: usize = get_u32(p + 12) as usize
+    let rec: usize = 16 + (l + 3) / 4 * 4
+    (*ev).kind = get_u32(p)
+    (*ev).is_dir = get_u32(p + 4) == 1 as u32
+    (*ev).cookie = get_u32(p + 8)
+    rt.buf_clear(&(*w).path)
+    rt.buf_push_bytes(&(*w).path, p + 16, l)
+    rt.mem_copy(p, p + rec as u64, total - rec)
+    rt.buf_set_len(&(*w).queue, total - rec)
+    return true
+}
+
+fn watch_event_path(w: *mut Watcher) -> str {
+    return str { p: rt.buf_data(&(*w).path), n: rt.buf_len(&(*w).path) }
+}
+
+// Looks at every root whose read has finished.
+fn collect(w: *mut Watcher) {
+    var i: usize = 0
+    while i < (*w).n {
+        if (*w).pend[i] && WaitForSingleObject((*w).ev[i], 0) == 0 {
+            (*w).pend[i] = false
+            var got: [u32; 1] = [0]
+            let ok: bool = GetOverlappedResult((*w).h[i], ov_of(w, i), (&got[0]) as u64, 0) != 0
+            if !ok {
+                // the folder is gone (or the handle broke)
+                var root: rt.Buf = rt.buf_new()
+                root_of(w, i, &root)
+                if !(*w).gone[i] {
+                    (*w).gone[i] = true
+                    queue_push(w, EV_ROOT_GONE, true, 0 as u32, str { p: rt.buf_data(&root), n: rt.buf_len(&root) })
+                }
+                rt.buf_free(&root)
+            } else if got[0] == 0 as u32 {
+                var root: rt.Buf = rt.buf_new()
+                root_of(w, i, &root)
+                queue_push(w, EV_OVERFLOW, false, 0 as u32, str { p: rt.buf_data(&root), n: rt.buf_len(&root) })
+                rt.buf_free(&root)
+                issue(w, i)
+            } else {
+                // copy the answer out, re-issue the read FIRST, then decode the copy
+                var copy: rt.Buf = rt.buf_new()
+                rt.buf_push_bytes(&copy, buf_of(w, i), got[0] as usize)
+                let again: bool = issue(w, i)
+                decode(w, i, rt.buf_ptr(&copy), rt.buf_len(&copy))
+                rt.buf_free(&copy)
+                if !again {
+                    // the read cannot be renewed: the folder is gone (a deleted folder ends its watch)
+                    var root: rt.Buf = rt.buf_new()
+                    root_of(w, i, &root)
+                    if !(*w).gone[i] {
+                        (*w).gone[i] = true
+                        queue_push(w, EV_ROOT_GONE, true, 0 as u32, str { p: rt.buf_data(&root), n: rt.buf_len(&root) })
+                    }
+                    rt.buf_free(&root)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Looks whether the folder of each watch still exists; reports ROOT_GONE once. true = queued something.
+fn root_check(w: *mut Watcher) -> bool {
+    var any: bool = false
+    var i: usize = 0
+    while i < (*w).n {
+        if !(*w).gone[i] {
+            var root: rt.Buf = rt.buf_new()
+            root_of(w, i, &root)
+            if !fs.exists(str { p: rt.buf_data(&root), n: rt.buf_len(&root) }) {
+                (*w).gone[i] = true
+                queue_push(w, EV_ROOT_GONE, true, 0 as u32, str { p: rt.buf_data(&root), n: rt.buf_len(&root) })
+                any = true
+            }
+            rt.buf_free(&root)
+        }
+        i = i + 1
+    }
+    return any
+}
+
+fn watch_poll(w: *mut Watcher, ms: i64, ev: *mut WatchEvent) -> bool {
+    if queue_take(w, ev) {
+        return true
+    }
+    var left: i64 = ms
+    while true {
+        collect(w)
+        if queue_take(w, ev) {
+            return true
+        }
+        if ms == 0 || (ms > 0 && left <= 0) {
+            // quiet: has a watched folder disappeared without the system saying so? (Wine, and
+            // a folder that was deleted while its read was between two answers)
+            if root_check(w) && queue_take(w, ev) {
+                return true
+            }
+            return false
+        }
+        Sleep(5)
+        if ms > 0 {
+            left = left - 5
+        }
+    }
+    return false
+}
+
+fn watch_close(w: *mut Watcher) {
+    var i: usize = 0
+    while i < (*w).n {
+        if (*w).pend[i] {
+            CancelIo((*w).h[i])
+            WaitForSingleObject((*w).ev[i], 200) // the cancelled read must not write into freed memory
+        }
+        CloseHandle((*w).ev[i])
+        CloseHandle((*w).h[i])
+        i = i + 1
+    }
+    (*w).n = 0
+    rt.buf_free(&(*w).ov)
+    rt.buf_free(&(*w).buf)
+    rt.buf_free(&(*w).root)
+    rt.buf_free(&(*w).queue)
+    rt.buf_free(&(*w).path)
+}

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
-// lib/audio/sink.fi -- audio.sink: where PCM goes. Linux: PulseAudio (or PipeWire's pulse
-// server) or a file. The same names exist in `sink.windows.fi` (waveOut), the
-// stubs `sink_macos.fi`, `lib/@android/audio/sink.fi` and `sink_osum.fi`.
+// lib/audio/sink.fi -- audio.sink: where PCM goes: the platform's sound device (audio.dev:
+// PulseAudio or waveOut) or a file. One file for every platform; what differs is `audio.dev`.
 //
 //     import audio.sink
 //
@@ -19,7 +18,7 @@
 // `pulse` or unset (the sound server). That is what makes playback testable
 // on a machine without a sound card: the test points it at a file or at a
 // PulseAudio daemon whose sink is a pipe, and checks the PCM CRC-32.
-// `sink_open_file` and `sink_open_pulse` choose without the environment.
+// `sink_open_file` and `sink_open_device` choose without the environment.
 //
 // HONEST
 // K1  The file and null sinks do not wait (they are as fast as the CPU);
@@ -35,28 +34,27 @@ import std.str
 import std.env
 import std.fs
 import audio.pcm
-import audio.pulse
+import audio.dev
 
 export {
-    Sink, sink_open, sink_open_file, sink_open_pulse, sink_is_open, sink_write, sink_writable,
+    Sink, sink_open, sink_open_file, sink_open_device, sink_is_open, sink_write, sink_writable,
     sink_drain, sink_flush, sink_close, sink_set_volume, sink_volume, sink_crc, sink_bytes, sink_kind,
     sink_rate, sink_channels,
-    KIND_NONE, KIND_FILE, KIND_RAW, KIND_NULL, KIND_PULSE, KIND_WINMM,
+    KIND_NONE, KIND_FILE, KIND_RAW, KIND_NULL, KIND_DEVICE,
 }
 
 const KIND_NONE: u32 = 0
 const KIND_FILE: u32 = 1 // WAVE file
 const KIND_RAW: u32 = 2 // bare samples
 const KIND_NULL: u32 = 3
-const KIND_PULSE: u32 = 4
-const KIND_WINMM: u32 = 5
+const KIND_DEVICE: u32 = 4 // the platform's sound device: PulseAudio, waveOut (audio.dev)
 
 struct Sink {
     kind: u32,
     rate: u32,
     channels: u32,
     percent: u32,
-    pulse: pulse.Pulse,
+    dev: dev.Dev,
     mem: rt.Buf, // file/raw: the samples so far
     path: rt.Buf,
     total: u64, // octets accepted
@@ -67,7 +65,7 @@ struct Sink {
 
 fn sink_new(kind: u32, rate: u32, channels: u32) -> Sink {
     return Sink { kind: kind, rate: rate, channels: channels, percent: 100 as u32,
-        pulse: pulse.pulse_null(),
+        dev: dev.dev_null(),
         mem: rt.buf_new(), path: rt.buf_new(), total: 0 as u64, crc: 0 as u32,
         scratch: rt.buf_new(), open: false }
 }
@@ -106,17 +104,13 @@ fn sink_open_file(path: str, rate: u32, channels: u32, wav: bool) -> Sink {
     return s
 }
 
-fn sink_open_pulse(app: str, rate: u32, channels: u32) -> Sink {
-    var s: Sink = sink_new(KIND_PULSE, rate, channels)
+fn sink_open_device(app: str, rate: u32, channels: u32) -> Sink {
+    var s: Sink = sink_new(KIND_DEVICE, rate, channels)
     if !format_ok(rate, channels) {
         return s
     }
-    s.pulse = pulse.pulse_connect(app)
-    if pulse.pulse_is_open(&s.pulse) && pulse.pulse_open_stream(&s.pulse, rate, channels, app) {
-        s.open = true
-    } else {
-        pulse.pulse_close(&s.pulse)
-    }
+    s.dev = dev.dev_open(app, rate, channels)
+    s.open = dev.dev_is_open(&s.dev)
     return s
 }
 
@@ -143,7 +137,7 @@ fn sink_open(app: str, rate: u32, channels: u32) -> Sink {
         }
     }
     rt.buf_free(&e)
-    return sink_open_pulse(app, rate, channels)
+    return sink_open_device(app, rate, channels)
 }
 
 // Percent, 0 .. 400 (above 100 can clip). Applies to what is written from now on.
@@ -164,13 +158,13 @@ fn sink_writable(s: *mut Sink) -> usize {
     if !(*s).open {
         return 0
     }
-    if (*s).kind == KIND_PULSE {
-        let n: usize = pulse.pulse_writable(&(*s).pulse)
-        if !pulse.pulse_stream_open(&(*s).pulse) {
+    if (*s).kind == KIND_DEVICE {
+        let n: usize = dev.dev_writable(&(*s).dev)
+        if !dev.dev_is_open(&(*s).dev) {
             (*s).open = false // the server went away or ended the stream
             return 0
         }
-        return n / ((*s).channels as usize * 2)
+        return n
     }
     return 1 << 20
 }
@@ -191,8 +185,8 @@ fn sink_write(s: *mut Sink, p: u64, frames: usize) -> bool {
     }
     (*s).crc = pcm.crc32_update((*s).crc, src, bytes)
     (*s).total = (*s).total + bytes as u64
-    if (*s).kind == KIND_PULSE {
-        if !pulse.pulse_write(&(*s).pulse, src, bytes) {
+    if (*s).kind == KIND_DEVICE {
+        if !dev.dev_write(&(*s).dev, src, frames) {
             (*s).open = false
             return false
         }
@@ -209,8 +203,8 @@ fn sink_drain(s: *mut Sink) -> bool {
     if !(*s).open {
         return false
     }
-    if (*s).kind == KIND_PULSE {
-        return pulse.pulse_drain(&(*s).pulse)
+    if (*s).kind == KIND_DEVICE {
+        return dev.dev_drain(&(*s).dev)
     }
     if (*s).kind == KIND_FILE || (*s).kind == KIND_RAW {
         return write_out(s)
@@ -233,8 +227,8 @@ fn write_out(s: *mut Sink) -> bool {
 
 // Drops what has been written but not played yet (a quick stop).
 fn sink_flush(s: *mut Sink) -> bool {
-    if (*s).open && (*s).kind == KIND_PULSE {
-        return pulse.pulse_flush(&(*s).pulse)
+    if (*s).open && (*s).kind == KIND_DEVICE {
+        return dev.dev_flush(&(*s).dev)
     }
     return (*s).open
 }
@@ -252,8 +246,8 @@ fn sink_close(s: *mut Sink) {
     if (*s).open && ((*s).kind == KIND_FILE || (*s).kind == KIND_RAW) {
         write_out(s)
     }
-    if (*s).kind == KIND_PULSE {
-        pulse.pulse_close(&(*s).pulse)
+    if (*s).kind == KIND_DEVICE {
+        dev.dev_close(&(*s).dev)
     }
     (*s).open = false
     rt.buf_free(&(*s).mem)
