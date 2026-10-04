@@ -8,7 +8,7 @@
 #    back) and by lib/db (same), and the invariants must hold: money is conserved, the
 #    log counts match, integrity_check is ok -- the transaction is all there or all gone.
 # 2. KILLED FROM OUTSIDE: kill -9 at random moments of a long run of transactions.
-import os, random, shutil, signal, sqlite3, subprocess, sys, tempfile, time
+import os, random, shutil, sqlite3, subprocess, sys, tempfile, time
 
 probe = sys.argv[1]
 RUNNER = os.environ.get("RUNNER", "").split()
@@ -198,7 +198,7 @@ with tempfile.TemporaryDirectory() as d:
         p = subprocess.Popen(RUNNER + [probe, work, sc], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(random.uniform(0.02, 0.35))
         if p.poll() is None:
-            p.send_signal(signal.SIGKILL)
+            p.kill()  # SIGKILL on POSIX, TerminateProcess on Windows
             kills += 1
         p.wait()
         shutil.rmtree(dd)

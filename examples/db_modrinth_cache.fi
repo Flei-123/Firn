@@ -1,0 +1,246 @@
+// expect_exit: 0
+// examples/db_modrinth_cache.fi -- a local cache for Modrinth search results, the way a
+// Minecraft launcher keeps one (FleiLauncher is the first user of lib/db).
+//
+//   search    one row per (query, facets, page): the JSON answer and when it was fetched;
+//             a row younger than the time-to-live is served without a request
+//   project   what the answers told about each mod; searched locally (offline) with LIKE,
+//             the most downloaded first (an index in descending order)
+//
+// Shows: a schema that is created on first use and carries a version (PRAGMA user_version),
+// prepared statements with bound parameters (a search text is DATA, never SQL -- the program
+// tries an injection and the table survives), UPSERT, a transaction around a batch, pruning
+// old rows, and the data being there after the file is closed and opened again.
+// The network is not touched: the "answers" are strings.
+import std.rt
+import std.io
+import std.fs
+import db.dberr
+import db.dbcore as dc
+import db.sqlite as sq
+
+struct Cache {
+    d: *mut dc.Db,
+    get: *mut dc.Stmt,
+    put: *mut dc.Stmt,
+    proj: *mut dc.Stmt,
+}
+
+
+// a + b as a new string (Firn has no string concatenation operator)
+fn join(a: str, b: str) -> str {
+    var buf: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&buf, a.p as u64, a.length())
+    rt.buf_push_bytes(&buf, b.p as u64, b.length())
+    let r: str = __str_copy(str { p: rt.buf_data(&buf), n: rt.buf_len(&buf) })
+    rt.buf_free(&buf)
+    return r
+}
+
+fn die(e: DbError) -> bool {
+    io.eprint("cache error: ")
+    io.eprint_line(sq.last_error_message())
+    return false
+}
+
+fn cache_open(path: str) -> Cache {
+    let d: *mut dc.Db = sq.db_open(path, sq.OPEN_CREATE) catch | e | (0 as *mut dc.Db)
+    var c: Cache = Cache { d: d, get: 0 as *mut dc.Stmt, put: 0 as *mut dc.Stmt, proj: 0 as *mut dc.Stmt }
+    if (d as u64) == 0 {
+        die(DbError::Io)
+        return c
+    }
+    sq.db_set_synchronous(d, 0)
+    // created on first use; an old file is left as it is
+    let version: i64 = sq.db_query_int(d, "PRAGMA user_version", 0) catch 0
+    if version == 0 {
+        sq.db_exec(d, "BEGIN") catch false
+        sq.db_exec(d, "CREATE TABLE IF NOT EXISTS search(query TEXT NOT NULL, facets TEXT NOT NULL DEFAULT '', page INTEGER NOT NULL DEFAULT 0, fetched INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(query, facets, page))") catch false
+        sq.db_exec(d, "CREATE TABLE IF NOT EXISTS project(id TEXT PRIMARY KEY, slug TEXT NOT NULL, title TEXT NOT NULL, description TEXT, downloads INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL, icon_url TEXT)") catch false
+        sq.db_exec(d, "CREATE INDEX IF NOT EXISTS project_slug ON project(slug)") catch false
+        sq.db_exec(d, "CREATE INDEX IF NOT EXISTS project_downloads ON project(downloads DESC)") catch false
+        sq.db_exec(d, "PRAGMA user_version = 1") catch false
+        sq.db_exec(d, "COMMIT") catch false
+    }
+    c.get = sq.db_prepare(d, "SELECT body FROM search WHERE query = ?1 AND facets = ?2 AND page = ?3 AND fetched >= ?4") catch | e | (0 as *mut dc.Stmt)
+    c.put = sq.db_prepare(d, "INSERT INTO search(query, facets, page, fetched, body) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(query, facets, page) DO UPDATE SET fetched = excluded.fetched, body = excluded.body") catch | e | (0 as *mut dc.Stmt)
+    c.proj = sq.db_prepare(d, "INSERT INTO project(id, slug, title, description, downloads, updated, icon_url) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET slug = excluded.slug, title = excluded.title, description = excluded.description, downloads = excluded.downloads, updated = excluded.updated, icon_url = excluded.icon_url") catch | e | (0 as *mut dc.Stmt)
+    return c
+}
+
+fn cache_close(c: *mut Cache) {
+    sq.stmt_finalize((*c).get)
+    sq.stmt_finalize((*c).put)
+    sq.stmt_finalize((*c).proj)
+    sq.db_close((*c).d)
+}
+
+// The cached answer if it is not older than `ttl` seconds, else "".
+fn cache_get(c: *mut Cache, query: str, facets: str, page: i64, now: i64, ttl: i64) -> str {
+    let st: *mut dc.Stmt = (*c).get
+    sq.stmt_bind_text(st, 1, query) catch false
+    sq.stmt_bind_text(st, 2, facets) catch false
+    sq.stmt_bind_int(st, 3, page) catch false
+    sq.stmt_bind_int(st, 4, now - ttl) catch false
+    var out: str = ""
+    if sq.stmt_step(st) catch false {
+        out = __str_copy(sq.stmt_column_text(st, 0))
+    }
+    sq.stmt_reset(st)
+    return out
+}
+
+// Stores an answer (replaces the older one of the same search).
+fn cache_put(c: *mut Cache, query: str, facets: str, page: i64, now: i64, body: str) {
+    let st: *mut dc.Stmt = (*c).put
+    sq.stmt_bind_text(st, 1, query) catch false
+    sq.stmt_bind_text(st, 2, facets) catch false
+    sq.stmt_bind_int(st, 3, page) catch false
+    sq.stmt_bind_int(st, 4, now) catch false
+    sq.stmt_bind_text(st, 5, body) catch false
+    sq.stmt_step(st) catch | e | (die(e))
+    sq.stmt_reset(st)
+}
+
+fn project_put(c: *mut Cache, id: str, slug: str, title: str, desc: str, downloads: i64, updated: i64) {
+    let st: *mut dc.Stmt = (*c).proj
+    sq.stmt_bind_text(st, 1, id) catch false
+    sq.stmt_bind_text(st, 2, slug) catch false
+    sq.stmt_bind_text(st, 3, title) catch false
+    sq.stmt_bind_text(st, 4, desc) catch false
+    sq.stmt_bind_int(st, 5, downloads) catch false
+    sq.stmt_bind_int(st, 6, updated) catch false
+    sq.stmt_bind_null(st, 7) catch false
+    sq.stmt_step(st) catch | e | (die(e))
+    sq.stmt_reset(st)
+}
+
+// the titles of the projects matching a text, most downloaded first
+fn search_local(c: *mut Cache, text: str, limit: i64) -> str {
+    let st: *mut dc.Stmt = sq.db_prepare((*c).d, "SELECT title FROM project WHERE title LIKE ?1 OR slug LIKE ?1 OR description LIKE ?1 ORDER BY downloads DESC, id LIMIT ?2") catch | e | (0 as *mut dc.Stmt)
+    sq.stmt_bind_text(st, 1, join(join("%", text), "%")) catch false
+    sq.stmt_bind_int(st, 2, limit) catch false
+    var out: str = ""
+    while sq.stmt_step(st) catch false {
+        if out.length() > 0 {
+            out = join(out, ", ")
+        }
+        out = join(out, sq.stmt_column_text(st, 0))
+    }
+    sq.stmt_finalize(st)
+    return out
+}
+
+// Deletes answers fetched before `cutoff`; the number removed.
+fn prune(c: *mut Cache, cutoff: i64) -> i64 {
+    let st: *mut dc.Stmt = sq.db_prepare((*c).d, "DELETE FROM search WHERE fetched < ?1") catch | e | (0 as *mut dc.Stmt)
+    sq.stmt_bind_int(st, 1, cutoff) catch false
+    sq.stmt_step(st) catch false
+    sq.stmt_finalize(st)
+    return sq.db_changes((*c).d)
+}
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn expect(t: *mut Tally, what: str, got: str, want: str) {
+    (*t).total = (*t).total + 1
+    if !got.equal(want) {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print(what)
+        io.print(": got [")
+        io.print(got)
+        io.print("] want [")
+        io.print(want)
+        io.print_line("]")
+    } else {
+        io.print("ok   ")
+        io.print_line(what)
+    }
+}
+
+fn check_num(t: *mut Tally, what: str, got: i64, want: i64) {
+    (*t).total = (*t).total + 1
+    if got != want {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+fn scratch_path() -> str {
+    var b: rt.Buf = rt.buf_new()
+    let head: str = "/tmp/firn_modrinth_cache_"
+    rt.buf_push_bytes(&b, head.p as u64, head.length())
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let path: str = scratch_path()
+    var c: Cache = cache_open(path)
+    if (c.d as u64) == 0 {
+        return 2
+    }
+    // answers, fetched at different times (seconds since some start)
+    cache_put(&c, "sodium", "[\"categories:fabric\"]", 0, 1000, "{\"hits\":[{\"slug\":\"sodium\"}],\"total_hits\":1}")
+    cache_put(&c, "lithium", "[\"categories:fabric\"]", 0, 1100, "{\"hits\":[{\"slug\":\"lithium\"}],\"total_hits\":1}")
+    cache_put(&c, "shaders", "", 1, 1150, "{\"hits\":[],\"total_hits\":0}")
+    expect(&t, "a fresh answer is served", cache_get(&c, "sodium", "[\"categories:fabric\"]", 0, 1200, 300), "{\"hits\":[{\"slug\":\"sodium\"}],\"total_hits\":1}")
+    expect(&t, "an answer older than the ttl is not", cache_get(&c, "sodium", "[\"categories:fabric\"]", 0, 1400, 300), "")
+    expect(&t, "another page is another search", cache_get(&c, "shaders", "", 0, 1200, 300), "")
+    // the same search again: replaced, not duplicated
+    cache_put(&c, "sodium", "[\"categories:fabric\"]", 0, 1390, "{\"hits\":[{\"slug\":\"sodium\"}],\"total_hits\":2}")
+    expect(&t, "the replaced answer is the new one", cache_get(&c, "sodium", "[\"categories:fabric\"]", 0, 1400, 300), "{\"hits\":[{\"slug\":\"sodium\"}],\"total_hits\":2}")
+    expect(&t, "still one row per search", sq.db_query_all(c.d, "SELECT count(*) FROM search") catch "?", "3")
+    // a search text is data: this one tries to drop the table
+    cache_put(&c, "x'; DROP TABLE search; --", "", 0, 1300, "{}")
+    expect(&t, "an injection attempt is stored as text", sq.db_query_all(c.d, "SELECT count(*), max(query) FROM search WHERE query LIKE '%DROP%'") catch "?", "1|x'; DROP TABLE search; --")
+    expect(&t, "the table is still there", sq.db_query_all(c.d, "SELECT count(*) FROM search") catch "?", "4")
+    // projects, a batch inside one transaction
+    sq.db_begin(c.d) catch false
+    project_put(&c, "AANobbMI", "sodium", "Sodium", "A modern rendering engine for Minecraft", 51000000, 1000)
+    project_put(&c, "gvQqBUqZ", "lithium", "Lithium", "A modern game logic optimization mod", 38000000, 1010)
+    project_put(&c, "YL57xq9U", "iris", "Iris Shaders", "A modern shaders mod for Minecraft", 29000000, 1020)
+    project_put(&c, "P7dR8mSH", "fabric-api", "Fabric API", "Essential hooks for modding", 75000000, 1030)
+    project_put(&c, "9s6osm5g", "cloth-config", "Cloth Config API", "Configuration screens", 41000000, 1040)
+    sq.db_commit(c.d) catch false
+    expect(&t, "most downloaded first", search_local(&c, "modern", 10), "Sodium, Lithium, Iris Shaders")
+    expect(&t, "a limit", search_local(&c, "modern", 2), "Sodium, Lithium")
+    expect(&t, "by slug", search_local(&c, "fabric", 10), "Fabric API")
+    expect(&t, "nothing found", search_local(&c, "nosuchmod", 10), "")
+    // a new download count for a known project: updated in place
+    project_put(&c, "AANobbMI", "sodium", "Sodium", "A modern rendering engine for Minecraft", 80000000, 2000)
+    expect(&t, "an upsert updates", sq.db_query_all(c.d, "SELECT downloads, updated FROM project WHERE slug = 'sodium'") catch "?", "80000000|2000")
+    expect(&t, "no duplicate project", sq.db_query_all(c.d, "SELECT count(*) FROM project") catch "?", "5")
+    expect(&t, "the order follows the new count", search_local(&c, "", 3), "Sodium, Fabric API, Cloth Config API")
+    // pruning
+    let removed: i64 = prune(&c, 1250)
+    expect(&t, "number pruned", sq.db_query_all(c.d, "SELECT count(*) FROM search") catch "?", "2")
+    check_num(&t, "pruned rows reported", removed, 2)
+    // close, open again: everything is there, the version is kept
+    cache_close(&c)
+    var c2: Cache = cache_open(path)
+    expect(&t, "the version survives", sq.db_query_all(c2.d, "PRAGMA user_version") catch "?", "1")
+    expect(&t, "projects survive", search_local(&c2, "api", 10), "Fabric API, Cloth Config API")
+    expect(&t, "an answer survives", cache_get(&c2, "sodium", "[\"categories:fabric\"]", 0, 1400, 300), "{\"hits\":[{\"slug\":\"sodium\"}],\"total_hits\":2}")
+    expect(&t, "integrity", sq.db_query_all(c2.d, "PRAGMA integrity_check") catch "?", "ok")
+    cache_close(&c2)
+    fs.remove(path) catch false
+    var f: io.Fmt = io.fmt_new()
+    f = io.fmt_text(f, "checks ".p as u64, 7)
+    f = io.fmt_number(f, t.total)
+    f = io.fmt_text(f, ", failed ".p as u64, 9)
+    f = io.fmt_number(f, t.fails)
+    io.fmt_print_line(f)
+    if t.fails != 0 {
+        return 1
+    }
+    return 0
+}

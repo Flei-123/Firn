@@ -9,7 +9,11 @@
 # What must hold: it never crashes (signal), never panics (an arithmetic trap), never hangs
 # (timeout), never uses much memory; it answers an error or an answer. This is not about
 # the answer being right: the file is wrong.
-import multiprocessing, os, random, resource, shutil, sqlite3, struct, subprocess, sys, tempfile
+import multiprocessing, os, random, shutil, sqlite3, struct, subprocess, sys, tempfile
+try:
+    import resource  # POSIX only; on Windows no memory limit is set
+except ImportError:
+    resource = None
 
 probe = sys.argv[1]
 ROUNDS = int(sys.argv[2]) if len(sys.argv) > 2 else 400
@@ -117,7 +121,8 @@ def one(args):
         p = os.path.join(d, "h.db")
         open(p, "wb").write(mutate(data, rnd))
         try:
-            r = subprocess.run(RUNNER + [probe, p, qpath], capture_output=True, timeout=30, preexec_fn=limit)
+            r = subprocess.run(RUNNER + [probe, p, qpath], capture_output=True, timeout=30,
+                               **({"preexec_fn": limit} if resource else {}))
         except subprocess.TimeoutExpired:
             return (seed, src, "TIMEOUT", "")
         out = r.stdout.decode("utf-8", "replace")
