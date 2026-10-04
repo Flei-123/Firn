@@ -38,7 +38,7 @@ class App(object):
 
     FIELDS = ("id", "name", "version", "vendor", "summary", "description", "url",
               "license", "category", "exe", "icon", "android_id", "maintainer",
-              "desktop", "launch", "arch")
+              "desktop", "launch", "arch", "depends")
 
     def __init__(self, **kw):
         self.id = ""
@@ -56,7 +56,8 @@ class App(object):
         self.maintainer = ""
         self.desktop = "1"
         self.launch = "1"
-        self.arch = "x86_64"
+        self.arch = ""
+        self.depends = ""
         for k, v in kw.items():
             if k in self.FIELDS and v is not None:
                 setattr(self, k, v)

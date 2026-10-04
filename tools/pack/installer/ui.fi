@@ -1,0 +1,635 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/pack/installer/ui.fi -- the window of the installer and uninstaller.
+//
+// fUi in immediate mode, the same structure as templates/app/src/ui.fi:
+// every frame `ui_paint` draws the window from the state in `Ui`, the
+// buttons it drew are remembered and a click is matched against them.
+//
+//   install:   WELCOME (folder, two check boxes) -> WORKING (one payload
+//              entry per slice of a frame, a progress bar) -> DONE (start it?)
+//              or ERROR (the message, nothing half-installed is hidden)
+//   uninstall: CONFIRM -> UNWORK (the temp copy works, this window waits)
+//              -> DONE
+//
+// The texts are English and German (the system language, plat_locale).
+import std.rt
+import std.time
+import std.process
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.scene
+import fui.anim
+import fui.editor
+import fui.widget
+import fui.kit
+import fui.kitcolor
+import fui.lucide
+import fui.icons
+import fui.apphost
+import plat.fuiwirt
+import appkit.platform
+import appkit.util
+import pack.install
+
+export { run, MODE_INSTALL, MODE_UNINSTALL }
+
+const MODE_INSTALL: u32 = 0
+const MODE_UNINSTALL: u32 = 1
+
+const S_WELCOME: usize = 0
+const S_WORKING: usize = 1
+const S_DONE: usize = 2
+const S_ERROR: usize = 3
+const S_CONFIRM: usize = 4
+const S_UNWORK: usize = 5
+
+const B_INSTALL: u32 = 1
+const B_CANCEL: u32 = 2
+const B_FINISH: u32 = 3
+const B_STARTMENU: u32 = 4
+const B_DESKTOP: u32 = 5
+const B_LAUNCH: u32 = 6
+const B_UNINSTALL: u32 = 7
+const BTN_MAX: usize = 16
+
+struct Ui {
+    m: theme.Theme,
+    c: render.Ctx,
+    sc: scene.Scene,
+    w: fuiwirt.Host,
+    hk: apphost.Hooks,
+    tr: anim.TransReg,
+    gen: anim.Animator,
+    quit: bool,
+    win_w: f64,
+    win_h: f64,
+    state: usize,
+    mode: u32,
+    now: i64,
+    first_ms: i64,
+    want_frames: bool,
+    nb: usize,
+    bx: [f64; 16],
+    by: [f64; 16],
+    bw: [f64; 16],
+    bh: [f64; 16],
+    bid: [u32; 16],
+    hover_btn: u32,
+    down_btn: u32,
+    field: kit.Search,
+    field_x: f64,
+    field_y: f64,
+    field_w: f64,
+    field_h: f64,
+    sm: bool,
+    dt: bool,
+    launch: bool,
+    de: bool,
+    inst: *mut install.Installer,
+    lg: *mut install.Logger,
+    self_path: str,
+    target: str,
+    name: str,
+    version: str,
+    vendor: str,
+    msg: str,
+    ch: process.Child,
+    ch_open: bool,
+    result: i32,
+    started_launch: bool,
+}
+
+fn ui_size() -> usize {
+    var probe: [Ui; 2] = [ui_blank(), ui_blank()]
+    return ((&probe[1]) as usize) - ((&probe[0]) as usize)
+}
+
+fn ui_blank() -> Ui {
+    return Ui {
+        m: theme.theme_new(true),
+        c: render.ctx_new(0 as u64 as *mut theme.Theme, 0 as u64 as *mut painter.Painter),
+        sc: scene.scene_new(),
+        w: fuiwirt.host_new(0 as u64 as *mut scene.Scene, 0 as u64 as *mut render.Ctx),
+        hk: apphost.hooks_blank(),
+        tr: anim.transreg_new(),
+        gen: anim.animator_new(),
+        quit: false, win_w: 0.0, win_h: 0.0, state: S_WELCOME, mode: MODE_INSTALL, now: 0, first_ms: 0,
+        want_frames: false, nb: 0, bx: [0.0; 16], by: [0.0; 16], bw: [0.0; 16], bh: [0.0; 16],
+        bid: [0 as u32; 16], hover_btn: 0 as u32, down_btn: 0 as u32,
+        field: kit.search_new(), field_x: 0.0, field_y: 0.0, field_w: 0.0, field_h: 0.0,
+        sm: true, dt: true, launch: true, de: false,
+        inst: 0 as u64 as *mut install.Installer, lg: 0 as u64 as *mut install.Logger,
+        self_path: "", target: "", name: "", version: "", vendor: "", msg: "",
+        ch: process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1, done: true, code: 0, sig: 0, own: false },
+        ch_open: false, result: 0, started_launch: false,
+    }
+}
+
+// ------------------------------------------------------------------ texts
+
+fn t(d: *mut Ui, en: str, de: str) -> str {
+    if (*d).de {
+        return de
+    }
+    return en
+}
+
+// ---------------------------------------------------------------- drawing
+
+fn btn(d: *mut Ui, id: u32, x: f64, y: f64, label: str, icon_id: i64, kind: u32) -> f64 {
+    let c: *mut render.Ctx = &(*d).c
+    let w: f64 = kit.button_width(c, label, icon_id)
+    let h: f64 = kit.button_height(c)
+    var st: u32 = 0 as u32
+    if (*d).hover_btn == id {
+        st = st | kit.ST_HOVER
+    }
+    if (*d).down_btn == id {
+        st = st | kit.ST_ACTIVE
+    }
+    kit.button_draw(c, x, y, w, h, label, icon_id, kind, st)
+    remember(d, id, x, y, w, h)
+    return w
+}
+
+fn remember(d: *mut Ui, id: u32, x: f64, y: f64, w: f64, h: f64) {
+    if (*d).nb < BTN_MAX {
+        let k: usize = (*d).nb
+        (*d).bx[k] = x
+        (*d).by[k] = y
+        (*d).bw[k] = w
+        (*d).bh[k] = h
+        (*d).bid[k] = id
+        (*d).nb = k + 1
+    }
+}
+
+fn button_at(d: *mut Ui, px: f64, py: f64) -> u32 {
+    var i: usize = 0
+    while i < (*d).nb {
+        if px >= (*d).bx[i] && px < (*d).bx[i] + (*d).bw[i] && py >= (*d).by[i] && py < (*d).by[i] + (*d).bh[i] {
+            return (*d).bid[i]
+        }
+        i = i + 1
+    }
+    return 0 as u32
+}
+
+// a check box with its label; the whole row is the click target
+fn check(d: *mut Ui, id: u32, x: f64, y: f64, label: str, on: bool) {
+    let c: *mut render.Ctx = &(*d).c
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let s: f64 = kit.ln(c, 20)
+    if on {
+        painter.round_rect(z, x, y, s, s, kit.ln(c, 5), kit.tokc(c, style.TOK_ACCENT))
+        icons.icon_stroke(z, lucide.CHECK, x + kit.ln(c, 2), y + kit.ln(c, 2), s - kit.ln(c, 4), kit.tokc(c, style.TOK_TEXT_ON_ACCENT), icons.STROKE_DEFAULT)
+    } else {
+        painter.round_ring(z, x, y, s, s, kit.ln(c, 5), kit.ln(c, 1), kit.tokc(c, style.TOK_BORDER))
+    }
+    let tw: f64 = kit.text_width(c, kit.ln(c, 14), 400, label)
+    kit.draw_label(c, x + s + kit.ln(c, 10), y, s, kit.ln(c, 14), 400, kit.tokc(c, style.TOK_TEXT), label, 0.0)
+    remember(d, id, x, y, s + kit.ln(c, 10) + tw, s)
+}
+
+fn text(d: *mut Ui, x: f64, y: f64, s: str, size: usize, weight: usize, muted: bool, w: f64) {
+    let c: *mut render.Ctx = &(*d).c
+    var tok: u32 = style.TOK_TEXT
+    if muted {
+        tok = style.TOK_TEXT_MUTED
+    }
+    kit.draw_label(c, x, y, kit.ln(c, size + 10), kit.ln(c, size), weight, kit.tokc(c, tok), s, w)
+}
+
+// words wrapped to w, at most `lines` lines; returns the height used
+fn para(d: *mut Ui, x: f64, y: f64, w: f64, s: str, lines: usize) -> f64 {
+    let c: *mut render.Ctx = &(*d).c
+    let lh: f64 = kit.ln(c, 22)
+    var yy: f64 = y
+    var n: usize = 0
+    var a: usize = 0
+    while a < s.n && n < lines {
+        var e: usize = a
+        var last: usize = a
+        while e < s.n {
+            var we: usize = e
+            while we < s.n && rt.ld8(s.p as u64, we) != 32 as u8 {
+                we = we + 1
+            }
+            let part: str = str { p: (s.p as u64 + a as u64) as *mut u8, n: we - a }
+            if kit.text_width(c, kit.ln(c, 14), 400, part) > w && last > a {
+                break
+            }
+            last = we
+            e = we
+            while e < s.n && rt.ld8(s.p as u64, e) == 32 as u8 {
+                e = e + 1
+            }
+        }
+        if last == a {
+            last = s.n
+        }
+        let seg: str = str { p: (s.p as u64 + a as u64) as *mut u8, n: last - a }
+        kit.draw_label(c, x, yy, lh, kit.ln(c, 14), 400, kit.tokc(c, style.TOK_TEXT), seg, w)
+        yy = yy + lh
+        n = n + 1
+        a = last
+        while a < s.n && rt.ld8(s.p as u64, a) == 32 as u8 {
+            a = a + 1
+        }
+    }
+    return yy - y
+}
+
+// the text field: the editor of lib/fui/editor.fi, padded like a text box
+fn field_widget(c: *mut render.Ctx, focus: bool, x: f64, y: f64, w: f64, h: f64) -> widget.Widget {
+    var e: widget.Widget = widget.widget_new(widget.KIND_TEXTBOX)
+    widget.w_place(&e, x, y, w, h)
+    var st: style.Style = style.style_new()
+    st = style.style_set_pad(st, 12, 8)
+    st = style.style_set_radius(st, 8)
+    widget.w_set_style(&e, st)
+    widget.w_set_focus(&e, focus)
+    return e
+}
+
+fn draw_field(d: *mut Ui, x: f64, y: f64, w: f64, h: f64) {
+    let c: *mut render.Ctx = &(*d).c
+    (*d).field_x = x
+    (*d).field_y = y
+    (*d).field_w = w
+    (*d).field_h = h
+    var e: widget.Widget = field_widget(c, kit.search_has_focus(&(*d).field), x, y, w, h)
+    render.draw_textfield(c, &e, &(*d).field.ed, kit.search_has_focus(&(*d).field) && editor.editor_caret_on(&(*d).field.ed))
+}
+
+// ----------------------------------------------------------------- frames
+
+fn header(d: *mut Ui, w: f64) -> f64 {
+    let c: *mut render.Ctx = &(*d).c
+    let pad: f64 = kit.ln(c, 28)
+    kit.avatar_draw(c, pad, pad, kit.ln(c, 56), 3 as u32, (*d).name, kit.ICON_NONE)
+    text(d, pad + kit.ln(c, 72), pad - kit.ln(c, 2), (*d).name, 22, 700, false, w - pad * 2.0 - kit.ln(c, 72))
+    var sub: str = t(d, "Version ", "Version ") + (*d).version
+    if (*d).vendor.n > 0 {
+        sub = sub + "  ·  " + (*d).vendor
+    }
+    text(d, pad + kit.ln(c, 72), pad + kit.ln(c, 30), sub, 14, 400, true, w - pad * 2.0 - kit.ln(c, 72))
+    return pad + kit.ln(c, 56) + kit.ln(c, 28)
+}
+
+fn dec(v: u64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&b, v)
+    let s: str = util.buf_to_str_copy(&b)
+    rt.buf_free(&b)
+    return s
+}
+
+fn slice_work(d: *mut Ui) {
+    // as many payload entries as fit in about 12 ms of a frame
+    let t0: i64 = time.now_unix_ms()
+    var ph: u32 = install.PH_EXTRACT
+    while true {
+        ph = install.inst_step((*d).inst)
+        if ph == install.PH_FAILED {
+            (*d).msg = install.inst_error((*d).inst)
+            (*d).state = S_ERROR
+            (*d).result = 3
+            return
+        }
+        if ph == install.PH_DONE {
+            (*d).state = S_DONE
+            return
+        }
+        if time.now_unix_ms() - t0 >= 12 as i64 {
+            return
+        }
+    }
+}
+
+fn watch_uninstall(d: *mut Ui) {
+    if (*d).ch_open && !process.is_running(&(*d).ch) {
+        (*d).result = process.exit_code(&(*d).ch)
+        process.close(&(*d).ch)
+        (*d).ch_open = false
+        if (*d).result == 0 {
+            (*d).state = S_DONE
+        } else {
+            (*d).msg = t(d, "The removal did not finish. See the log file for details.",
+                "Die Deinstallation wurde nicht beendet. Details stehen in der Protokolldatei.")
+            (*d).state = S_ERROR
+        }
+    }
+}
+
+fn ui_attach(ud: u64, z: *mut painter.Painter) {
+    let d: *mut Ui = ud as *mut Ui
+    (*d).c = render.ctx_new(&(*d).m, z)
+    anim.transreg_bind(&(*d).tr, &(*d).c)
+}
+
+fn ui_paint(ud: u64, w: usize, h: usize) {
+    let d: *mut Ui = ud as *mut Ui
+    kitcolor.kit_apply(&(*d).m)
+    let c: *mut render.Ctx = &(*d).c
+    let f: *mut theme.Colors = theme.theme_colors(&(*d).m)
+    painter.painter_clear(render.ctx_painter(c), theme.opaque((*f).base))
+    if (*d).quit {
+        return
+    }
+    anim.transreg_new_frame(&(*d).tr)
+    (*d).now = render.ctx_time(c)
+    if (*d).first_ms == 0 as i64 {
+        (*d).first_ms = (*d).now
+    }
+    (*d).win_w = w as f64
+    (*d).win_h = h as f64
+    (*d).nb = 0
+    (*d).want_frames = false
+    let pad: f64 = kit.ln(c, 28)
+    let bh: f64 = kit.button_height(c)
+    let by: f64 = (h as f64) - pad - bh
+    var y: f64 = header(d, w as f64)
+    let inner: f64 = (w as f64) - 2.0 * pad
+    let st: usize = (*d).state
+    if st == S_WELCOME {
+        text(d, pad, y, t(d, "INSTALL LOCATION", "INSTALLATIONSORDNER"), 12, 700, true, 0.0)
+        y = y + kit.ln(c, 24)
+        draw_field(d, pad, y, inner, kit.ln(c, 40))
+        if kit.search_blink(&(*d).field, ((*d).now as u64) * 1000 as u64) {
+            (*d).want_frames = true
+        }
+        if kit.search_has_focus(&(*d).field) {
+            (*d).want_frames = true
+        }
+        y = y + kit.ln(c, 40) + kit.ln(c, 20)
+        check(d, B_STARTMENU, pad, y, t(d, "Start Menu shortcut", "Verknüpfung im Startmenü"), (*d).sm)
+        y = y + kit.ln(c, 30)
+        check(d, B_DESKTOP, pad, y, t(d, "Desktop shortcut", "Verknüpfung auf dem Desktop"), (*d).dt)
+        var x: f64 = (w as f64) - pad
+        let iw: f64 = kit.button_width(c, t(d, "Install", "Installieren"), kit.ICON_NONE)
+        x = x - iw
+        btn(d, B_INSTALL, x, by, t(d, "Install", "Installieren"), kit.ICON_NONE, kit.BTN_PRIMARY)
+        let cw: f64 = kit.button_width(c, t(d, "Cancel", "Abbrechen"), kit.ICON_NONE)
+        btn(d, B_CANCEL, x - kit.ln(c, 8) - cw, by, t(d, "Cancel", "Abbrechen"), kit.ICON_NONE, kit.BTN_SECONDARY)
+    } else if st == S_WORKING {
+        slice_work(d)
+        if (*d).state == S_WORKING {
+            text(d, pad, y, t(d, "Installing...", "Installiere..."), 16, 700, false, 0.0)
+            y = y + kit.ln(c, 40)
+            kit.progress_draw(c, pad, y, inner, kit.ln(c, 24), install.inst_permille((*d).inst) as i64, "", 0 as i64, 0 as u32)
+            (*d).want_frames = true
+        }
+    } else if st == S_UNWORK {
+        watch_uninstall(d)
+        text(d, pad, y, t(d, "Removing...", "Entferne..."), 16, 700, false, 0.0)
+        y = y + kit.ln(c, 40)
+        kit.progress_draw(c, pad, y, inner, kit.ln(c, 24), -1 as i64, "", (*d).now - (*d).first_ms, 0 as u32)
+        (*d).want_frames = true
+    } else if st == S_CONFIRM {
+        y = y + para(d, pad, y, inner, t(d, "Remove ", "Möchten Sie ") + (*d).name + t(d, " from this computer?",
+            " von diesem Computer entfernen?"), 3)
+        y = y + kit.ln(c, 8)
+        text(d, pad, y, (*d).target, 13, 400, true, inner)
+        var x2: f64 = (w as f64) - pad
+        let uw: f64 = kit.button_width(c, t(d, "Uninstall", "Deinstallieren"), kit.ICON_NONE)
+        x2 = x2 - uw
+        btn(d, B_UNINSTALL, x2, by, t(d, "Uninstall", "Deinstallieren"), kit.ICON_NONE, kit.BTN_DANGER)
+        let cw2: f64 = kit.button_width(c, t(d, "Cancel", "Abbrechen"), kit.ICON_NONE)
+        btn(d, B_CANCEL, x2 - kit.ln(c, 8) - cw2, by, t(d, "Cancel", "Abbrechen"), kit.ICON_NONE, kit.BTN_SECONDARY)
+    } else if st == S_DONE {
+        var done_text: str = (*d).name + t(d, " is installed.", " ist installiert.")
+        if (*d).mode == MODE_UNINSTALL {
+            done_text = (*d).name + t(d, " was removed.", " wurde entfernt.")
+        }
+        text(d, pad, y, done_text, 16, 700, false, inner)
+        y = y + kit.ln(c, 40)
+        if (*d).mode == MODE_INSTALL && (*d).launch {
+            check(d, B_LAUNCH, pad, y, t(d, "Start ", "") + (*d).name + t(d, "", " starten"), (*d).started_launch)
+        }
+        let fw: f64 = kit.button_width(c, t(d, "Finish", "Fertig"), kit.ICON_NONE)
+        btn(d, B_FINISH, (w as f64) - pad - fw, by, t(d, "Finish", "Fertig"), kit.ICON_NONE, kit.BTN_PRIMARY)
+    } else {
+        text(d, pad, y, t(d, "Something went wrong", "Es ist etwas schiefgegangen"), 16, 700, false, inner)
+        y = y + kit.ln(c, 36)
+        para(d, pad, y, inner, (*d).msg, 5)
+        let xw: f64 = kit.button_width(c, t(d, "Close", "Schließen"), kit.ICON_NONE)
+        btn(d, B_FINISH, (w as f64) - pad - xw, by, t(d, "Close", "Schließen"), kit.ICON_NONE, kit.BTN_SECONDARY)
+    }
+    if (*d).want_frames {
+        anim.animator_clear(&(*d).gen)
+        anim.animator_add(&(*d).gen, anim.anim_new((*d).now, 100, 0.0, 1.0, anim.easing_linear()))
+    }
+}
+
+// -------------------------------------------------------------- the actions
+
+fn field_text(d: *mut Ui) -> str {
+    return __str_copy(str { p: kit.search_text_ptr(&(*d).field) as *mut u8, n: kit.search_text_len(&(*d).field) })
+}
+
+fn start_install(d: *mut Ui) {
+    let dir: str = field_text(d)
+    if dir.n == 0 {
+        (*d).msg = t(d, "Choose a folder.", "Bitte einen Ordner angeben.")
+        (*d).state = S_ERROR
+        return
+    }
+    (*(*d).inst).desktop = (*d).dt
+    (*(*d).inst).startmenu = (*d).sm
+    if !install.inst_begin((*d).inst, dir) {
+        (*d).msg = install.inst_error((*d).inst)
+        (*d).state = S_ERROR
+        (*d).result = 3
+        return
+    }
+    (*d).state = S_WORKING
+}
+
+fn start_uninstall(d: *mut Ui) {
+    if install.uninstall_start((*d).self_path, (*d).target, false, (*d).lg, &(*d).ch) {
+        (*d).ch_open = true
+        (*d).first_ms = (*d).now
+        (*d).state = S_UNWORK
+    } else {
+        (*d).msg = t(d, "The uninstaller could not be started.", "Der Deinstallierer konnte nicht gestartet werden.")
+        (*d).state = S_ERROR
+        (*d).result = 4
+    }
+}
+
+fn run_button(d: *mut Ui, id: u32) {
+    if id == B_INSTALL {
+        start_install(d)
+    } else if id == B_UNINSTALL {
+        start_uninstall(d)
+    } else if id == B_CANCEL {
+        (*d).result = 1
+        (*d).quit = true
+    } else if id == B_FINISH {
+        (*d).quit = true
+    } else if id == B_STARTMENU {
+        (*d).sm = !(*d).sm
+    } else if id == B_DESKTOP {
+        (*d).dt = !(*d).dt
+    } else if id == B_LAUNCH {
+        (*d).started_launch = !(*d).started_launch
+    }
+}
+
+fn ui_press(ud: u64, x: f64, y: f64) {
+    let d: *mut Ui = ud as *mut Ui
+    let c: *mut render.Ctx = &(*d).c
+    fuiwirt.host_touch(&(*d).w)
+    let b: u32 = button_at(d, x, y)
+    if b != 0 as u32 {
+        (*d).down_btn = b
+        return
+    }
+    if (*d).state == S_WELCOME {
+        if x >= (*d).field_x && y >= (*d).field_y && x < (*d).field_x + (*d).field_w && y < (*d).field_y + (*d).field_h {
+            kit.search_focus(&(*d).field, true)
+            var e: widget.Widget = field_widget(c, true, (*d).field_x, (*d).field_y, (*d).field_w, (*d).field_h)
+            var fm: render.FieldMeas = render.field_meas_new(c, &e)
+            editor.editor_mouse_down(&(*d).field.ed, x - render.field_text_x0(c, &e), ((*d).now as u64) * 1000 as u64,
+                render.field_meas, (&fm) as u64, false)
+        } else {
+            kit.search_focus(&(*d).field, false)
+        }
+    }
+}
+
+fn ui_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
+    let d: *mut Ui = ud as *mut Ui
+    if kind == fuiwirt.HOOK_LEAVE {
+        (*d).hover_btn = 0 as u32
+        return true
+    }
+    if kind == fuiwirt.HOOK_UP {
+        let down: u32 = (*d).down_btn
+        (*d).down_btn = 0 as u32
+        if down != 0 as u32 && button_at(d, x, y) == down {
+            run_button(d, down)
+        }
+        return true
+    }
+    if kind == fuiwirt.HOOK_MOVE {
+        let hb: u32 = button_at(d, x, y)
+        if hb != (*d).hover_btn {
+            (*d).hover_btn = hb
+            return true
+        }
+        return false
+    }
+    return false
+}
+
+fn ui_key(ud: u64, key: u32, mods: u32) -> bool {
+    let d: *mut Ui = ud as *mut Ui
+    fuiwirt.host_touch(&(*d).w)
+    if (*d).state == S_WELCOME && kit.search_has_focus(&(*d).field) {
+        if key == editor.KEY_ENTER {
+            start_install(d)
+            return true
+        }
+        if key == editor.KEY_ESC {
+            kit.search_focus(&(*d).field, false)
+            return true
+        }
+        let r: u32 = editor.editor_key(&(*d).field.ed, key, mods)
+        return r != 0 as u32
+    }
+    if key == editor.KEY_ESC && ((*d).state == S_WELCOME || (*d).state == S_CONFIRM) {
+        (*d).result = 1
+        (*d).quit = true
+        return true
+    }
+    if key == editor.KEY_ENTER {
+        if (*d).state == S_WELCOME { start_install(d); return true }
+        if (*d).state == S_CONFIRM { start_uninstall(d); return true }
+        if (*d).state == S_DONE || (*d).state == S_ERROR { (*d).quit = true; return true }
+    }
+    return false
+}
+
+fn ui_text(ud: u64, cp: u32, mods: u32) -> bool {
+    let d: *mut Ui = ud as *mut Ui
+    fuiwirt.host_touch(&(*d).w)
+    if (*d).state == S_WELCOME && kit.search_has_focus(&(*d).field) {
+        let r: u32 = editor.editor_char(&(*d).field.ed, cp, mods)
+        return r != 0 as u32
+    }
+    return false
+}
+
+fn ui_act(ud: u64, i: usize) {
+}
+
+fn ui_done(ud: u64) -> bool {
+    let d: *mut Ui = ud as *mut Ui
+    return (*d).quit
+}
+
+fn ui_field(ud: u64, out: *mut [f64; 4]) -> bool {
+    return false
+}
+
+// Opens the window and runs until it is closed. Returns 0 when the work was
+// done, 1 when the user cancelled, 3/4 on failure (the installer's exit codes).
+// `launch` tells main to start the program afterwards (the check box).
+fn run(mode: u32, ins: *mut install.Installer, lg: *mut install.Logger, self_path: str, target: str,
+    name: str, version: str, vendor: str, default_dir: str, can_launch: bool, launch_out: *mut bool) -> i32 {
+    let n: usize = ui_size()
+    let p: u64 = rt.heap_alloc(n)
+    if p == 0 as u64 {
+        return 12
+    }
+    let d: *mut Ui = p as *mut Ui
+    *d = ui_blank()
+    (*d).mode = mode
+    (*d).inst = ins
+    (*d).lg = lg
+    (*d).self_path = self_path
+    (*d).target = target
+    (*d).name = name
+    (*d).version = version
+    (*d).vendor = vendor
+    (*d).launch = can_launch
+    (*d).started_launch = can_launch
+    var loc: rt.Buf = rt.buf_new()
+    platform.plat_locale(&loc)
+    (*d).de = util.buf_eq_str(&loc, "de")
+    rt.buf_free(&loc)
+    if mode == MODE_INSTALL {
+        (*d).state = S_WELCOME
+        kit.search_set_text(&(*d).field, default_dir)
+    } else {
+        (*d).state = S_CONFIRM
+    }
+    kitcolor.kit_theme(&(*d).m, true)
+    (*d).w = fuiwirt.host_new(&(*d).sc, &(*d).c)
+    fuiwirt.host_set_transitions(&(*d).w, &(*d).tr)
+    fuiwirt.host_set_animator(&(*d).w, &(*d).gen)
+    fuiwirt.host_set_hook(&(*d).w, d as u64, ui_hook)
+    fuiwirt.host_bind(&(*d).w)
+    var title_text: str = name + " - " + t(d, "Setup", "Setup")
+    if mode == MODE_UNINSTALL {
+        title_text = name + " - " + t(d, "Uninstall", "Deinstallation")
+    }
+    (*d).hk = apphost.hooks_new(d as u64, &(*d).m, &(*d).w, ui_attach, ui_paint, ui_key,
+        ui_text, ui_press, ui_act, ui_done, ui_field, title_text, 540, 380)
+    let rc: i32 = apphost.run(&(*d).hk)
+    *launch_out = (*d).started_launch && (*d).state == S_DONE && mode == MODE_INSTALL
+    if rc != 0 {
+        return rc
+    }
+    if (*d).state == S_DONE {
+        return 0
+    }
+    if (*d).result == 0 {
+        return 1
+    }
+    return (*d).result
+}

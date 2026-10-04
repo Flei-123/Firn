@@ -53,9 +53,9 @@ import pack.payload
 
 export {
     Logger, logger_new, logline,
-    Installer, inst_new, inst_open, inst_step, inst_permille, inst_error, inst_free, inst_launch,
+    Installer, inst_new, inst_open, inst_begin, inst_step, inst_permille, inst_error, inst_free, inst_launch,
     PH_EXTRACT, PH_FINISH, PH_DONE, PH_FAILED,
-    default_dir, uninstall_run, sync_version, winpath, fpath, uninstall_key, current_install_dir,
+    default_dir, manifest_field, uninstall_run, uninstall_start, sync_version, winpath, fpath, uninstall_key, current_install_dir,
 }
 
 const PH_EXTRACT: u32 = 0
@@ -261,9 +261,9 @@ fn fs_fail_n(e: FsError, failed: *mut bool) -> usize {
     return 0
 }
 
-// Check the payload of exe p[0, n), open it, prepare the walk.
-// `dir` "" = the default directory.
-fn inst_open(ins: *mut Installer, exe_p: u64, exe_n: usize, dir: str, desktop: bool, startmenu: bool) -> bool {
+// Check the payload of exe p[0, n) and open it; nothing is written yet.
+// `ins.dir` is the default directory afterwards; `inst_begin` takes the real one.
+fn inst_open(ins: *mut Installer, exe_p: u64, exe_n: usize, desktop: bool, startmenu: bool) -> bool {
     (*ins).exe_p = exe_p
     (*ins).exe_n = exe_n
     if !payload.payload_find(exe_p, exe_n, &(*ins).pl) {
@@ -276,12 +276,7 @@ fn inst_open(ins: *mut Installer, exe_p: u64, exe_n: usize, dir: str, desktop: b
     (*ins).desktop = desktop
     (*ins).startmenu = startmenu
     (*ins).launch = (*ins).info.launch
-    if dir.n > 0 {
-        (*ins).dir = fpath(dir)
-    } else {
-        (*ins).dir = default_dir(&(*ins).info)
-    }
-    logline((*ins).lg, "install " + (*ins).info.name + " " + (*ins).info.version + " into " + (*ins).dir)
+    (*ins).dir = default_dir(&(*ins).info)
     var failed: bool = false
     (*ins).z = zip.zip_reader_open(zp, (*ins).pl.len) catch | e | (zr_fail(e, &failed))
     if failed {
@@ -315,6 +310,18 @@ fn inst_open(ins: *mut Installer, exe_p: u64, exe_n: usize, dir: str, desktop: b
         return fail(ins, "the payload does not contain the program " + (*ins).info.exe)
     }
     (*ins).total_bytes = total
+    (*ins).phase = PH_EXTRACT
+    return true
+}
+
+// Create the directory, look for an older install, write the list's head.
+// `dir` "" = the default. After this `inst_step` does the work.
+fn inst_begin(ins: *mut Installer, dir: str) -> bool {
+    var failed: bool = false
+    if dir.n > 0 {
+        (*ins).dir = fpath(dir)
+    }
+    logline((*ins).lg, "install " + (*ins).info.name + " " + (*ins).info.version + " into " + (*ins).dir)
     fs.mkdir_all((*ins).dir) catch | e2 | (fs_fail(e2, &failed))
     if failed {
         return fail(ins, "cannot create " + (*ins).dir)
@@ -654,6 +661,10 @@ fn parent_of(p: str) -> str {
     return str { p: p.p, n: i }
 }
 
+fn manifest_field(text: *mut rt.Buf, key: str) -> str {
+    return field_of(text, key)
+}
+
 fn field_of(text: *mut rt.Buf, key: str) -> str {
     var i: usize = 0
     var line: str = ""
@@ -748,9 +759,12 @@ fn uninstall_run(self_path: str, dir: str, stage2: bool, wait: bool, lg: *mut Lo
                 tmp2 = parent_of(self_path)
             }
             let bat: str = fpath(tmp2) + "/pack-clean-" + dec(platform.plat_self_pid() as u64) + ".cmd"
-            let script: str = "@echo off\r\nping -n 3 127.0.0.1 >nul\r\ndel /f /q \"" + winpath(self_path) +
-                "\"\r\ndel /f /q \"" + winpath(dir) + "\\uninstall.exe\"\r\nrmdir \"" + winpath(dir) +
-                "\"\r\ndel /f /q \"%~f0\"\r\n"
+            // the window of stage 1 may still be open: retry for up to two minutes
+            let up: str = winpath(dir) + "\\uninstall.exe"
+            let script: str = "@echo off\r\nset n=0\r\n:retry\r\nping -n 2 127.0.0.1 >nul\r\ndel /f /q \"" +
+                winpath(self_path) + "\" >nul 2>&1\r\ndel /f /q \"" + up + "\" >nul 2>&1\r\nif exist \"" + up +
+                "\" (\r\n  set /a n+=1\r\n  if %n% lss 120 goto retry\r\n)\r\nrmdir \"" + winpath(dir) +
+                "\" >nul 2>&1\r\n(goto) 2>nul & del /f /q \"%~f0\"\r\n"
             let w: usize = fs.write_file(bat, script.p as u64, script.n) catch 0
             if w == script.n {
                 var c: process.Command = process.command("cmd.exe")
@@ -770,7 +784,24 @@ fn uninstall_run(self_path: str, dir: str, stage2: bool, wait: bool, lg: *mut Lo
         }
         return rc
     }
-    // stage 1: a copy in the temp folder
+    // stage 1: a copy in the temp folder, started; in silent mode we wait for it
+    var ch: process.Child = process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1,
+        done: true, code: 0, sig: 0, own: false }
+    if !uninstall_start(self_path, dir, wait, lg, &ch) {
+        return 1 as u32
+    }
+    if wait {
+        let code: i32 = process.wait(&ch)
+        process.close(&ch)
+        return code as u32
+    }
+    process.close(&ch)
+    return 0 as u32
+}
+
+// Stage 1 on its own (the window uses it and watches the child): copy this
+// program into the temp folder and start the copy as stage 2.
+fn uninstall_start(self_path: str, dir: str, silent: bool, lg: *mut Logger, ch: *mut process.Child) -> bool {
     var tmp: str = env("TEMP")
     if tmp.n == 0 {
         tmp = env("TMP")
@@ -782,27 +813,23 @@ fn uninstall_run(self_path: str, dir: str, stage2: bool, wait: bool, lg: *mut Lo
     let copy: str = tmp + "/pack-uninstall-" + dec(platform.plat_self_pid() as u64) + ".exe"
     if !platform.plat_file_copy(self_path, copy) {
         logline(lg, "ERROR cannot copy the uninstaller to " + copy)
-        return 1 as u32
+        return false
     }
     var c2: process.Command = process.command(copy)
     process.add_arg(&c2, "/uninstall-stage2")
     process.add_arg(&c2, dir)
-    if wait {
-        process.add_arg(&c2, "/S")
+    process.add_arg(&c2, "/S")
+    if (*lg).path.n > 0 {
+        process.add_arg(&c2, "--log")
+        process.add_arg(&c2, (*lg).path)
     }
     var failed2: bool = false
-    var ch: process.Child = process.spawn(&c2) catch | e | (spawn_fail(e, &failed2))
+    *ch = process.spawn(&c2) catch | e | (spawn_fail(e, &failed2))
     process.command_free(&c2)
     if failed2 {
         logline(lg, "ERROR cannot start the uninstaller copy")
-        return 1 as u32
+        return false
     }
     logline(lg, "stage 2 started: " + copy)
-    if wait {
-        let code: i32 = process.wait(&ch)
-        process.close(&ch)
-        return code as u32
-    }
-    process.close(&ch)
-    return 0 as u32
+    return true
 }

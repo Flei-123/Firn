@@ -13,7 +13,14 @@ Commands
   win-installer   setup.exe (stub + zip payload)    --stub setup-stub.exe --exe app.exe --out X.exe [--ico F]
   win-nsis        NSIS script (+ build if makensis) --exe app.exe --outdir DIR [--ico F]
   pe-icon         put an .ico into a Windows exe    --exe in.exe --ico F --out out.exe
-  (more below as they are added)
+  deb             Debian package                    --exe prog --out X.deb [--icons DIR] [--depends D]
+  tar             tar.gz with install.sh            --exe prog --out X.tar.gz [--icons DIR]
+  selfextract     self-extracting program           --stub selfx --exe prog --out X.run [--icons DIR]
+  appimage        AppImage (runtime + squashfs)     --exe prog --out X.AppImage [--runtime F] [--icons DIR]
+  mac-app         .app bundle (dir) and zip         --exe macho --outdir D [--icns F] [--allow-any]
+  mac-dmg         disk image (xorriso)              --exe macho --out X.dmg [--icns F] [--allow-any]
+  mac-sign-script the codesign/notarize commands    --out sign.sh
+  opk             OrientOS store package            --exe start --out X.opk [--icon-png F]
 
 Every command prints the output path on the last line of stdout.
 """
@@ -24,7 +31,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from packlib import common, win          # noqa: E402
+from packlib import common, win, linux, mac, osum   # noqa: E402
 from packlib.common import PackError, App  # noqa: E402
 
 
@@ -85,6 +92,53 @@ def cmd_win_nsis(a):
         print(nsi)
 
 
+def cmd_deb(a):
+    app = app_of(a)
+    print(linux.deb(app, a.exe, a.out, a.icons, app.arch or None, app.depends or None, a.compress))
+
+
+def cmd_tar(a):
+    app = app_of(a)
+    print(linux.tarball(app, a.exe, a.out, a.icons, app.arch or None))
+
+
+def cmd_selfextract(a):
+    app = app_of(a)
+    print(linux.selfextract(app, a.stub, a.exe, a.out, a.icons))
+
+
+def cmd_appimage(a):
+    app = app_of(a)
+    print(linux.appimage(app, a.exe, a.out, a.icons, a.runtime, app.arch or None))
+
+
+def cmd_mac_app(a):
+    app = app_of(a)
+    d = mac.bundle_dir(app, a.exe, a.icns, a.outdir, a.allow_any, a.min_os)
+    z = mac.bundle_zip(app, a.exe, a.icns, os.path.join(a.outdir, "%s-%s-macos.zip" % (app.id, app.version)),
+                       a.allow_any, a.min_os)
+    sys.stderr.write("pack: bundle %s\n" % d)
+    print(z)
+
+
+def cmd_mac_dmg(a):
+    app = app_of(a)
+    print(mac.dmg(app, a.exe, a.icns, a.out, a.allow_any, a.min_os))
+
+
+def cmd_mac_sign(a):
+    app = app_of(a)
+    common.write(a.out, mac.sign_script(app).encode("utf-8"), 0o755)
+    print(a.out)
+
+
+def cmd_opk(a):
+    app = app_of(a)
+    out, h = osum.opk(app, a.exe, a.out, a.icon_png, extra_dir=a.files, keys=a.keys)
+    sys.stderr.write("pack: content hash %s\n" % h)
+    print(out)
+
+
 def main(argv):
     ap = argparse.ArgumentParser(prog="pack.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -110,6 +164,36 @@ def main(argv):
     p.add_argument("--exe", required=True); p.add_argument("--ico", required=True)
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_pe_icon)
+
+    def exe_arg(p, stub=False):
+        p.add_argument("--exe", required=True)
+        p.add_argument("--icons", help="the output directory of tools/pack/icons")
+        if stub:
+            p.add_argument("--stub", required=True)
+
+    p = sub.add_parser("deb"); add_app_args(p); exe_arg(p)
+    p.add_argument("--out", required=True); p.add_argument("--compress", default="xz", choices=["xz", "gz"])
+    p.set_defaults(fn=cmd_deb)
+    p = sub.add_parser("tar"); add_app_args(p); exe_arg(p); p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_tar)
+    p = sub.add_parser("selfextract"); add_app_args(p); exe_arg(p, True); p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_selfextract)
+    p = sub.add_parser("appimage"); add_app_args(p); exe_arg(p); p.add_argument("--out", required=True)
+    p.add_argument("--runtime"); p.set_defaults(fn=cmd_appimage)
+
+    def mac_args(p):
+        add_app_args(p)
+        p.add_argument("--exe", required=True); p.add_argument("--icns")
+        p.add_argument("--allow-any", action="store_true"); p.add_argument("--min-os", default="11.0")
+    p = sub.add_parser("mac-app"); mac_args(p); p.add_argument("--outdir", required=True)
+    p.set_defaults(fn=cmd_mac_app)
+    p = sub.add_parser("mac-dmg"); mac_args(p); p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_mac_dmg)
+    p = sub.add_parser("mac-sign-script"); add_app_args(p); p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_mac_sign)
+    p = sub.add_parser("opk"); add_app_args(p); p.add_argument("--exe", required=True)
+    p.add_argument("--out", required=True); p.add_argument("--icon-png"); p.add_argument("--files")
+    p.add_argument("--keys"); p.set_defaults(fn=cmd_opk)
 
     a = ap.parse_args(argv)
     try:
