@@ -24,7 +24,7 @@ PROBE = os.path.abspath(sys.argv[1])
 # RUNNER: a program that runs the probe (qemu-aarch64 for an AArch64 build, wine for a
 # Windows build); CHECK_QUICK=1: a small corpus and fewer hostile cases (for the slow runners)
 RUNNER = os.environ.get("RUNNER", "").split()
-QUICK = bool(os.environ.get("CHECK_QUICK"))
+QUICK = int(os.environ.get("CHECK_QUICK") or 0)   # 1: reduced corpus; 2: tiny (for Wine)
 FMTS = sys.argv[2:] or ["lz4", "zstd", "xz", "lzma", "bz2", "br", "gz", "zlib", "deflate", "auto"]
 PARTS = os.environ.get("CHECK_PARTS", "decode,encode,hostile").split(",")
 W = tempfile.mkdtemp(prefix="compress-check-")
@@ -86,6 +86,10 @@ def corpus():
     items = corpus_full()
     if not QUICK:
         return items
+    if QUICK >= 2:
+        keep = {"empty": None, "rand1": None, "a1": None, "abab": 6000, "text600k": 30000, "runs": 20000, "bcjmix": 12000,
+                "dna": 10000, "sparse": 10000}
+        return [(n, d if keep[n] is None else d[: keep[n]]) for n, d in items if n in keep]
     keep = {"empty": None, "rand1": None, "rand3": None, "rand12": None, "rand13": None, "a1": None, "abab": 20000,
             "text600k": 60000, "source": 60000, "runs": 40000, "dna": 30000, "bcjmix": 40000, "skew": 40000,
             "elf3M": 80000, "random100k": 30000, "zeros1M": 200000, "sparse": 40000}
@@ -343,7 +347,10 @@ def group(fmt):
     items = corpus()
     n0 = len(FAILS)
     # ---- decode: reference compressors -> ours
-    for label, comp in (ref_compressors(fmt) if "decode" in PARTS else []):
+    refs = ref_compressors(fmt) if "decode" in PARTS else []
+    if QUICK >= 2:
+        refs = refs[:: max(1, len(refs) // 3)][:3]
+    for label, comp in refs:
         for name, data in items:
             if len(data) > (1 << 20) and ("9e" in label or "-19" in label or "22" in label or "hc12" in label
                                          or "q11" in label or "q9" in label):
@@ -363,7 +370,7 @@ def group(fmt):
     n1 = len(FAILS)
     # ---- encode: ours -> reference
     if ENC_ENABLED.get(fmt) and "encode" in PARTS:
-        for lv in ENC_LEVELS[fmt]:
+        for lv in (ENC_LEVELS[fmt][:2] if QUICK >= 2 else ENC_LEVELS[fmt]):
             for name, data in items:
                 st, z = run_probe("c", fmt, data, lv)
                 if not st.startswith("OK"):
@@ -401,24 +408,24 @@ def group(fmt):
     for name in ("text600k", "elf3M", "runs"):
         data = base[name][:40000]
         z = comp(data)
-        step = max(1, len(z) // (30 if QUICK else 150))
+        step = max(1, len(z) // (10 if QUICK >= 2 else 30 if QUICK else 150))
         for cut in list(range(0, min(len(z), 40))) + list(range(40, len(z), step)):
             st, got = run_probe("d", fmt, z[:cut])
             check("cut %s at %d/%d" % (name, cut, len(z)), st.startswith("ERROR"), "-> %s" % st)
-        for _ in range(20 if QUICK else 120):
+        for _ in range(5 if QUICK >= 2 else 20 if QUICK else 120):
             zz = bytearray(z)
             for _k in range(rnd.choice((1, 1, 2, 5))):
                 zz[rnd.randrange(len(zz))] ^= 1 << rnd.randrange(8)
             st, got = run_probe("d", fmt, bytes(zz))
             check("flip %s" % name, st.startswith("OK") or st.startswith("ERROR"), "-> %s" % st)
-        for _ in range(10 if QUICK else 60):
+        for _ in range(3 if QUICK >= 2 else 10 if QUICK else 60):
             junk = bytes(rnd.getrandbits(8) for _ in range(rnd.randint(1, 300)))
             if rnd.random() < 0.7:
                 junk = z[: rnd.randint(1, 12)] + junk
             st, got = run_probe("d", fmt, junk)
             check("junk %s" % name, st.startswith("OK") or st.startswith("ERROR"), "-> %s" % st)
     # bomb: 64 MiB of zeros under a 1 MiB limit
-    big = (4 << 20) if QUICK else (64 << 20)
+    big = (2 << 20) if QUICK >= 2 else (4 << 20) if QUICK else (64 << 20)
     zeros = bytes(big)
     z = comp(zeros)
     st, got = run_probe("d", fmt, z, 1 << 20)
@@ -464,7 +471,7 @@ def zstd_dict_group():
     for label, dp, has_id in tests:
         dd = open(dp, "rb").read()
         for name, data in [("sample0", samples[0]), ("sample7", samples[7]), ("empty", b""),
-                           ("10samples", b"".join(samples[100:110])), ("big", big), ("short", b"{}")][: (3 if QUICK else 6)]:
+                           ("10samples", b"".join(samples[100:110])), ("big", big), ("short", b"{}")][: (2 if QUICK >= 2 else 3 if QUICK else 6)]:
             # reference compresses with the dictionary -> we decode with it
             args = ["zstd", "-q", "-c", "-D", dp, "-3"]
             z = subprocess.run(args, input=data, capture_output=True).stdout
@@ -504,16 +511,16 @@ def zstd_dict_group():
     st, got = run_probe("d", "zstd", z, None, dict_path=op_)
     check("dict wrong id", st == "ERROR Dictionary", "-> %s" % st)
     # hostile: cuts and flips of a dictionary frame
-    for cut in range(0, len(z), max(1, len(z) // 60)):
+    for cut in range(0, len(z), max(1, len(z) // (12 if QUICK >= 2 else 60))):
         st, got = run_probe("d", "zstd", z[:cut], None, dict_path=dpath)
         check("dict cut %d" % cut, st.startswith("ERROR"), "-> %s" % st)
-    for _ in range(100):
+    for _ in range(8 if QUICK >= 2 else 100):
         zz = bytearray(z)
         zz[rnd.randrange(len(zz))] ^= 1 << rnd.randrange(8)
         st, got = run_probe("d", "zstd", bytes(zz), None, dict_path=dpath)
         check("dict flip", st.startswith("OK") or st.startswith("ERROR"), "-> %s" % st)
     # damaged dictionary
-    for _ in range(40):
+    for _ in range(4 if QUICK >= 2 else 40):
         dm = bytearray(dd)
         dm[rnd.randrange(8, len(dm))] ^= 1 << rnd.randrange(8)
         dmp = os.path.join(W, "dm.dict")

@@ -37,6 +37,21 @@ def mbs(n, secs):
     return n / secs / 1e6
 
 
+def machine():
+    cpu = "?"
+    try:
+        for line in open("/proc/cpuinfo"):
+            if line.startswith("model name"):
+                cpu = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    load = os.getloadavg()
+    return "%s, %d CPUs, load average %.1f %.1f %.1f when it started, %s" % (
+        cpu, os.cpu_count(), load[0], load[1], load[2], time.strftime("%Y-%m-%d"))
+
+
+print("Measured on: %s." % machine())
 try:
     for corpus in CORPORA:
         data = open(corpus, "rb").read()

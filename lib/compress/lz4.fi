@@ -223,16 +223,16 @@ fn lz4_block_bound(n: usize) -> usize {
     return n + n / 255 + 16
 }
 
-fn emit_len(out: *mut rt.Buf, v: usize) {
-    var r: usize = v
-    while r >= 255 {
-        rt.buf_push(out, 255 as u8)
-        r = r - 255
-    }
-    rt.buf_push(out, r as u8)
-}
-
-fn emit_seq(out: *mut rt.Buf, src: u64, anchor: usize, lit: usize, off: usize, mlen: usize, has_match: bool) {
+// Writes one sequence (token, literals, and when `has_match` the offset and
+// the match length) at the end of `out`. The caller has reserved
+// lz4_block_bound() + 32 octets, which is more than any valid encoding takes, so
+// nothing is checked here; `nsrc` is the length of `src` (a literal run is moved
+// in words only when 8 octets past it are still inside the input).
+#[inline]
+fn emit_seq(out: *mut rt.Buf, src: u64, nsrc: usize, anchor: usize, lit: usize, off: usize, mlen: usize,
+    has_match: bool) {
+    let dst: u64 = (*out).ptr
+    var op: usize = (*out).len
     var tok: u32 = 0
     if lit >= 15 {
         tok = 15 << 4
@@ -246,18 +246,44 @@ fn emit_seq(out: *mut rt.Buf, src: u64, anchor: usize, lit: usize, off: usize, m
             tok = tok | ((mlen - 4) as u32)
         }
     }
-    rt.buf_push(out, tok as u8)
+    rt.st8(dst, op, tok as u8)
+    op = op + 1
     if lit >= 15 {
-        emit_len(out, lit - 15)
+        var r: usize = lit - 15
+        while r >= 255 {
+            rt.st8(dst, op, 255 as u8)
+            op = op + 1
+            r = r - 255
+        }
+        rt.st8(dst, op, r as u8)
+        op = op + 1
     }
-    common.buf_append_bytes(out, src + anchor as u64, lit)
+    if anchor + lit + 8 <= nsrc {
+        var k: usize = 0
+        while k < lit {
+            common.st64le(dst, op + k, common.ld64le(src, anchor + k))
+            k = k + 8
+        }
+    } else {
+        rt.mem_copy(dst + op as u64, src + anchor as u64, lit)
+    }
+    op = op + lit
     if has_match {
-        rt.buf_push(out, (off & 255) as u8)
-        rt.buf_push(out, ((off >> 8) & 255) as u8)
+        rt.st8(dst, op, (off & 255) as u8)
+        rt.st8(dst, op + 1, ((off >> 8) & 255) as u8)
+        op = op + 2
         if mlen - 4 >= 15 {
-            emit_len(out, mlen - 4 - 15)
+            var r: usize = mlen - 4 - 15
+            while r >= 255 {
+                rt.st8(dst, op, 255 as u8)
+                op = op + 1
+                r = r - 255
+            }
+            rt.st8(dst, op, r as u8)
+            op = op + 1
         }
     }
+    (*out).len = op
 }
 
 fn hash4(v: u32, bits: u32) -> usize {
@@ -273,9 +299,9 @@ fn lz4_block_compress(src: u64, n: usize, out: *mut rt.Buf) -> usize {
 
 fn block_compress_accel(src: u64, n: usize, out: *mut rt.Buf, accel: usize) -> usize {
     let start: usize = (*out).len
-    common.buf_ensure(out, start + lz4_block_bound(n))
+    common.buf_ensure(out, start + lz4_block_bound(n) + 32)
     if n < MFLIMIT + 1 {
-        emit_seq(out, src, 0, n, 0, 0, false)
+        emit_seq(out, src, n, 0, n, 0, 0, false)
         return (*out).len - start
     }
     var bits: u32 = 16
@@ -287,7 +313,7 @@ fn block_compress_accel(src: u64, n: usize, out: *mut rt.Buf, accel: usize) -> u
     let tsize: usize = (1 as usize) << (bits as usize)
     let tab: u64 = rt.heap_alloc(tsize * 4)
     if tab == 0 {
-        emit_seq(out, src, 0, n, 0, 0, false) // no memory: store as literals
+        emit_seq(out, src, n, 0, n, 0, 0, false) // no memory: store as literals
         return (*out).len - start
     }
     let mflimit: usize = n - MFLIMIT
@@ -315,7 +341,7 @@ fn block_compress_accel(src: u64, n: usize, out: *mut rt.Buf, accel: usize) -> u
             while p + mlen < matchlimit && rt.ld8(src, p + mlen) == rt.ld8(src, r + mlen) {
                 mlen = mlen + 1
             }
-            emit_seq(out, src, anchor, p - anchor, p - r, mlen, true)
+            emit_seq(out, src, n, anchor, p - anchor, p - r, mlen, true)
             ip = p + mlen
             anchor = ip
             searches = accel << 6
@@ -331,7 +357,7 @@ fn block_compress_accel(src: u64, n: usize, out: *mut rt.Buf, accel: usize) -> u
         }
     }
     rt.heap_free(tab, tsize * 4)
-    emit_seq(out, src, anchor, n - anchor, 0, 0, false)
+    emit_seq(out, src, n, anchor, n - anchor, 0, 0, false)
     return (*out).len - start
 }
 
