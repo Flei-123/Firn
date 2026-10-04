@@ -194,6 +194,22 @@ def ref_compressors(fmt):
         out.append(("zstd-1-ultra22", z(22, "--ultra")))
         out.append(("zstd-3-small-window", z(3, "--zstd=wlog=10")))
         out.append(("zstd-3-nosize", z(3, "--no-check", "--no-dictID")))
+        try:  # python-zstandard (when installed): another libzstd front end, long distance matching, streaming writer
+            import zstandard as zs
+            out.append(("pyzstd-5-chk", lambda d: zs.ZstdCompressor(level=5, write_checksum=True).compress(d)))
+            out.append(("pyzstd-ldm", lambda d: zs.ZstdCompressor(compression_params=zs.ZstdCompressionParameters.from_level(
+                3, enable_ldm=True, window_log=24, ldm_hash_log=14)).compress(d)))
+
+            def pystream(d):
+                import io as _io
+                b = _io.BytesIO()
+                with zs.ZstdCompressor(level=4, write_content_size=False).stream_writer(b, closefd=False) as w:
+                    for i in range(0, len(d), 50000):
+                        w.write(d[i:i + 50000])
+                return b.getvalue()
+            out.append(("pyzstd-stream", pystream))
+        except ImportError:
+            pass
     elif fmt == "xz":
         import lzma
         out.append(("xz-6", lambda d: lzma.compress(d, preset=6)))

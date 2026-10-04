@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/compress/memtest.fi -- streaming decode with the output thrown away:
+//
+//     memtest <fmt> <file>      fmt: auto lz4 zstd xz bz2 br gz
+//
+// prints "BYTES <n> XXH64 <hex> HWM <kB>": how much came out, the xxHash64 of
+// all of it, and the process' peak resident set. tools/compress/memtest.py
+// uses it to show that the streaming readers hold "window + one unit", not the
+// output (a gigabyte of output through a few MiB of memory).
+import compress.common
+import compress.auto
+import compress.gzip
+import compress.brotli
+import std.fs
+import std.io
+import std.rt
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: rt.ptr_of(p), n: rt.c_length(p) }
+}
+
+fn hwm_kb() -> u64 {
+    var b: rt.Buf = rt.buf_new()
+    fs.read_file("/proc/self/status", &b) catch 0
+    let p: u64 = rt.buf_ptr(&b)
+    let n: usize = rt.buf_len(&b)
+    var i: usize = 0
+    var v: u64 = 0
+    while i + 6 < n {
+        if rt.ld8(p, i) == 86 as u8 && rt.ld8(p, i + 1) == 109 as u8 && rt.ld8(p, i + 2) == 72 as u8
+            && rt.ld8(p, i + 3) == 87 as u8 && rt.ld8(p, i + 4) == 77 as u8 {
+            var k: usize = i + 5
+            while k < n && (rt.ld8(p, k) < 48 as u8 || rt.ld8(p, k) > 57 as u8) {
+                k = k + 1
+            }
+            while k < n && rt.ld8(p, k) >= 48 as u8 && rt.ld8(p, k) <= 57 as u8 {
+                v = v * 10 + ((rt.ld8(p, k) - 48 as u8) as u64)
+                k = k + 1
+            }
+            break
+        }
+        i = i + 1
+    }
+    rt.buf_free(&b)
+    return v
+}
+
+fn bail(e: CompressError) -> usize {
+    io.print_line("ERROR")
+    rt.finish(1)
+    return 0
+}
+
+fn dummy(e: CompressError) -> auto.AutoDec {
+    bail(e)
+    return auto.AutoDec { kind: 0, h: 0, hsize: 0, max: 0 }
+}
+
+fn main(start: u64) -> i32 {
+    let fmt: str = arg(start, 1)
+    let fd: i64 = fs.open_read(arg(start, 2)) catch -1
+    if fd < 0 {
+        io.print_line("ERROR open")
+        return 1
+    }
+    var h: common.Xxh64 = common.xxh64_new(0)
+    var total: u64 = 0
+    let tmp: u64 = rt.heap_alloc(65536)
+    if fmt == "gz" {
+        var d: gzip.GzDec = gzip.gz_dec_open_fd(fd, gzip.GZ_AUTO)
+        while true {
+            let k: usize = gzip.gz_dec_read(&d, tmp, 65536) catch | e | (bail(e))
+            if k == 0 { break }
+            common.xxh64_update(&h, tmp, k)
+            total = total + (k as u64)
+        }
+        gzip.gz_dec_close(&d)
+    } else if fmt == "br" {
+        var d: brotli.BrDec = brotli.brotli_dec_open_fd(fd)
+        while true {
+            let k: usize = brotli.brotli_dec_read(&d, tmp, 65536) catch | e | (bail(e))
+            if k == 0 { break }
+            common.xxh64_update(&h, tmp, k)
+            total = total + (k as u64)
+        }
+        brotli.brotli_dec_close(&d)
+    } else {
+        var d: auto.AutoDec = auto.auto_dec_open_fd(fd) catch | e | (dummy(e))
+        while true {
+            let k: usize = auto.auto_dec_read(&d, tmp, 65536) catch | e | (bail(e))
+            if k == 0 { break }
+            common.xxh64_update(&h, tmp, k)
+            total = total + (k as u64)
+        }
+        auto.auto_dec_close(&d)
+    }
+    var m: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&m, "BYTES ".p as u64, 6)
+    rt.buf_push_dec_u64(&m, total)
+    rt.buf_push_bytes(&m, " XXH64 ".p as u64, 7)
+    rt.buf_push_hex_u64(&m, common.xxh64_final(&h), 1)
+    rt.buf_push_bytes(&m, " HWM ".p as u64, 5)
+    rt.buf_push_dec_u64(&m, hwm_kb())
+    io.print_line_bytes(rt.buf_ptr(&m), rt.buf_len(&m))
+    return 0
+}

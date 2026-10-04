@@ -64,7 +64,7 @@ struct GzDec {
     lt: [u16; 1120], // literal/length tree (alphabet 288)
     dt: [u16; 640], // distance tree (alphabet 32)
     crc: u32, // running CRC-32 of the member's output (not inverted)
-    ctab: deflate.CrcTable,
+    ctab: common.Crc32,
     adler: u32,
     mlen: u64, // member output size
     max: usize,
@@ -74,7 +74,7 @@ struct GzDec {
 
 fn dec_new(s: common.Source, kind: u32) -> GzDec {
     return GzDec { b: bitio.bits_new(s), out: rt.buf_new(), drained: 0, kind: kind, state: 0, members: 0,
-        last: false, left: 0, nodist: false, lt: [0; 1120], dt: [0; 640], crc: 0, ctab: deflate.crc_table(),
+        last: false, left: 0, nodist: false, lt: [0; 1120], dt: [0; 640], crc: 0, ctab: common.crc32_new(),
         adler: 1, mlen: 0, max: 0, produced: 0, total: 0 }
 }
 
@@ -361,69 +361,145 @@ fn fixed_trees(d: *mut GzDec) -> bool {
 
 // Decodes symbols of the current Huffman block until ~SLICE octets were
 // produced or the block ends. true = the block is complete.
+//
+// The hot loop keeps the bit buffer in locals and refills it eight octets at a
+// time straight from the input chunk (`bits` above `bc` are the NEXT octets of the
+// stream, so refilling again ORs in the same bits); the generic reader is only
+// called near the end of the input and for codes longer than 8 bits. One
+// iteration needs at most 15 + 5 + 15 + 13 = 48 bits, so refilling to 48 once at
+// the top is enough.
 fn run_huffman(d: *mut GzDec, out: *mut rt.Buf, room: usize, limited: bool) -> CompressError!bool {
     let start: usize = (*out).len
-    var budget: usize = SLICE
-    while true {
-        if (*out).len - start >= budget {
-            return false
-        }
-        let s: u32 = bitio.tree_sym(&(*d).b, (&(*d).lt[0]) as u64)
-        if s == 0xFFFFFFFF {
-            return CompressError::Data
-        }
-        if s < 256 {
-            if (*d).max > 0 && (*d).produced + ((*out).len - start) + 1 > (*d).max {
-                return CompressError::TooLarge
+    if !common.buf_ensure(out, start + SLICE + 600) {
+        return CompressError::OutOfMemory
+    }
+    let dst: u64 = (*out).ptr
+    var op: usize = start
+    var bb: u64 = (*d).b.bitbuf
+    var bc: usize = (*d).b.bitcnt
+    let lt: u64 = (&(*d).lt[0]) as u64
+    let dt: u64 = (&(*d).dt[0]) as u64
+    let sp: *mut common.Source = &(*d).b.src
+    let mlen0: u64 = (*d).mlen
+    var left: usize = 0xFFFFFFFFFFFFFFFF
+    if (*d).max > 0 {
+        left = (*d).max - (*d).produced
+    }
+    var err: u32 = 0 // 1 Data, 2 TooLarge
+    var fin: bool = false
+    while op - start < SLICE {
+        if bc < 48 {
+            if (*sp).n - (*sp).pos >= 8 {
+                let w: u64 = common.ld64le((*sp).p, (*sp).pos)
+                bb = bb | (w << (bc as u64))
+                let take: usize = (63 - bc) >> 3
+                (*sp).pos = (*sp).pos + take
+                bc = bc + take * 8
+            } else {
+                (*d).b.bitbuf = bb
+                (*d).b.bitcnt = bc
+                bitio.b_fill(&(*d).b)
+                bb = (*d).b.bitbuf
+                bc = (*d).b.bitcnt
             }
-            rt.buf_push(out, s as u8)
+        }
+        var sym: u32 = rt.ld16(lt, bitio.T_FAST + ((bb & 255) as usize)) as u32
+        if sym != 0 {
+            let l: u32 = sym >> 10
+            bb = bb >> (l as u64)
+            bc = bc - (l as usize)
+            sym = sym & 1023
+        } else {
+            (*d).b.bitbuf = bb
+            (*d).b.bitcnt = bc
+            sym = bitio.tree_sym(&(*d).b, lt)
+            bb = (*d).b.bitbuf
+            bc = (*d).b.bitcnt
+            if sym == 0xFFFFFFFF {
+                err = 1
+                break
+            }
+        }
+        if sym < 256 {
+            if op - start + 1 > left {
+                err = 2
+                break
+            }
+            rt.st8(dst, op, sym as u8)
+            op = op + 1
             continue
         }
-        if s == 256 {
-            if bitio.b_exhausted(&(*d).b) {
-                return bad_input(d)
-            }
-            return true
+        if sym == 256 {
+            fin = true
+            break
         }
-        let li: usize = (s as usize) - 257
-        if li >= 29 {
-            return CompressError::Data
+        let li: usize = (sym as usize) - 257
+        if li >= 29 || (*d).nodist {
+            err = 1
+            break
         }
-        let len: usize = (LBASE[li] as usize) + (bitio.b_bits(&(*d).b, LEXT[li] as usize) as usize)
-        if (*d).nodist {
-            return CompressError::Data
+        let eb: usize = LEXT[li] as usize
+        let len: usize = (LBASE[li] as usize) + ((bb & (((1 as u64) << (eb as u64)) - 1)) as usize)
+        bb = bb >> (eb as u64)
+        bc = bc - eb
+        var ds: u32 = rt.ld16(dt, bitio.T_FAST + ((bb & 255) as usize)) as u32
+        if ds != 0 {
+            let l: u32 = ds >> 10
+            bb = bb >> (l as u64)
+            bc = bc - (l as usize)
+            ds = ds & 1023
+        } else {
+            (*d).b.bitbuf = bb
+            (*d).b.bitcnt = bc
+            ds = bitio.tree_sym(&(*d).b, dt)
+            bb = (*d).b.bitbuf
+            bc = (*d).b.bitcnt
         }
-        let ds: u32 = bitio.tree_sym(&(*d).b, (&(*d).dt[0]) as u64)
-        if ds == 0xFFFFFFFF || ds >= 30 {
-            return CompressError::Data
+        if ds >= 30 {
+            err = 1
+            break
         }
-        let dist: usize = (DBASE[ds as usize] as usize) + (bitio.b_bits(&(*d).b, DEXT[ds as usize] as usize) as usize)
-        if bitio.b_exhausted(&(*d).b) {
-            return bad_input(d)
+        let deb: usize = DEXT[ds as usize] as usize
+        let dist: usize = (DBASE[ds as usize] as usize) + ((bb & (((1 as u64) << (deb as u64)) - 1)) as usize)
+        bb = bb >> (deb as u64)
+        bc = bc - deb
+        // the distance may reach back at most to the start of this member's output we hold
+        if (dist as u64) > mlen0 + ((op - start) as u64) || dist > op {
+            err = 1
+            break
         }
-        // the distance may reach back at most to the start of the output we hold
-        if (dist as u64) > (*d).mlen + (((*out).len - start) as u64) || dist > (*out).len {
-            return CompressError::Data
+        if op - start + len > left {
+            err = 2
+            break
         }
-        if (*d).max > 0 && (*d).produced + ((*out).len - start) + len > (*d).max {
-            return CompressError::TooLarge
-        }
-        if !common.buf_ensure(out, (*out).len + len) {
-            return CompressError::OutOfMemory
-        }
-        let o: usize = (*out).len
         if dist >= 8 {
-            rt.mem_copy((*out).ptr + o as u64, (*out).ptr + (o - dist) as u64, len)
+            var k: usize = 0
+            while k < len {
+                common.st64le(dst, op + k, common.ld64le(dst, op - dist + k))
+                k = k + 8
+            }
         } else {
             var k: usize = 0
             while k < len {
-                rt.st8((*out).ptr, o + k, rt.ld8((*out).ptr, o + k - dist))
+                rt.st8(dst, op + k, rt.ld8(dst, op + k - dist))
                 k = k + 1
             }
         }
-        (*out).len = o + len
+        op = op + len
     }
-    return false
+    (*d).b.bitbuf = bb
+    (*d).b.bitcnt = bc
+    (*out).len = op
+    if err == 1 {
+        return CompressError::Data
+    }
+    if err == 2 {
+        return CompressError::TooLarge
+    }
+    if bitio.b_exhausted(&(*d).b) {
+        return bad_input(d)
+    }
+    return fin
 }
 
 fn finish_slice(d: *mut GzDec, out: *mut rt.Buf, start: usize) {
@@ -435,7 +511,7 @@ fn finish_slice(d: *mut GzDec, out: *mut rt.Buf, start: usize) {
     (*d).total = (*d).total + (got as u64)
     (*d).mlen = (*d).mlen + (got as u64)
     if (*d).kind == GZ_GZIP {
-        (*d).crc = deflate.crc32_more(&(*d).ctab, (*d).crc, (*out).ptr + start as u64, got)
+        (*d).crc = common.crc32_more(&(*d).ctab, (*d).crc, (*out).ptr + start as u64, got)
     } else if (*d).kind == GZ_ZLIB {
         (*d).adler = deflate.adler32_more((*d).adler, (*out).ptr + start as u64, got)
     }
