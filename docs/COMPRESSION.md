@@ -173,7 +173,55 @@ that module (`compress.zstd`) and pays for that one.
 
 ## Numbers
 
-@@BENCH@@
+MB/s of the UNCOMPRESSED data, best of three, on a machine that was busy with other jobs (load average
+27-31 on 20 CPUs: the absolute numbers are low and noisy, the reference libraries in the same minute
+are the yardstick). Reference = the C libraries behind Python's `lz4`, `zstandard`, `lzma`, `gzip`,
+`bz2` and `brotli` modules. "ratio" = compressed / original (smaller is better), "right" = what
+the library decoded is the corpus, octet for octet. Built with `--opt-level=release-fast`;
+`tools/compress/bench.py` makes the table (`corp_text`: the repository's own docs, `corp_bin`: the first
+4 MB of the compiler binary).
+
+Measured on: AMD EPYC 7571 32-Core Processor, 20 CPUs, load average 31.1 19.4 16.3 when it started, 2026-10-04.
+
+### corp_text (2271016 octets)
+
+| codec | compress: lib | reference | ratio lib | reference | decompress: lib | reference | right |
+|---|---:|---:|---:|---:|---:|---:|:--:|
+| lz4 | 93.4 | 122.3 | 0.572 | 0.615 | 430.4 | 341.2 | yes |
+| zstd-1 | 40.6 | 92.4 | 0.416 | 0.435 | 112.4 | 574.2 | yes |
+| zstd-3 | 18.1 | 86.7 | 0.382 | 0.374 | 110.9 | 460.1 | yes |
+| zstd-9 | 1.1 | 23.3 | 0.329 | 0.336 | 112.8 | 415.3 | yes |
+| zstd-19 | 0.3 | 1.5 | 0.322 | 0.306 | 112.0 | 482.3 | yes |
+| xz-1 | 4.7 | 6.8 | 0.358 | 0.357 | 19.2 | 36.1 | yes |
+| xz-6 | 1.2 | 1.4 | 0.335 | 0.299 | 21.5 | 40.8 | yes |
+| gzip-6 | 7.3 | 14.5 | 0.384 | 0.385 | 125.8 | 159.8 | yes |
+| bzip2 -9 | -- | 8.3 | -- | 0.302 | 8.2 | 12.1 | yes |
+| brotli 6 | -- | 7.6 | -- | 0.332 | 59.0 | 216.8 | yes |
+
+### corp_bin (4000000 octets)
+
+| codec | compress: lib | reference | ratio lib | reference | decompress: lib | reference | right |
+|---|---:|---:|---:|---:|---:|---:|:--:|
+| lz4 | 93.1 | 318.1 | 0.559 | 0.587 | 455.0 | 1246.1 | yes |
+| zstd-1 | 45.6 | 238.7 | 0.444 | 0.468 | 116.9 | 603.2 | yes |
+| zstd-3 | 8.3 | 89.1 | 0.409 | 0.416 | 107.4 | 504.1 | yes |
+| zstd-9 | 1.4 | 23.0 | 0.373 | 0.381 | 69.8 | 538.0 | yes |
+| zstd-19 | 0.7 | 1.6 | 0.371 | 0.347 | 116.7 | 313.8 | yes |
+| xz-1 | 4.4 | 7.4 | 0.359 | 0.358 | 19.3 | 23.0 | yes |
+| xz-6 | 1.7 | 1.8 | 0.350 | 0.323 | 19.6 | 30.7 | yes |
+| gzip-6 | 6.9 | 14.2 | 0.419 | 0.421 | 104.9 | 81.1 | yes |
+| bzip2 -9 | -- | 7.7 | -- | 0.384 | 14.3 | 13.6 | yes |
+| brotli 6 | -- | 7.3 | -- | 0.373 | 61.6 | 179.0 | yes |
+
+Reading it honestly: the decoders of gzip, LZ4 and bzip2 are within 1-3x of the C libraries (LZ4's
+word-move copies even beat the Python binding here), xz decodes at about half of liblzma's speed, Brotli at
+a third, **zstd at a fifth** (110 MB/s against 460-600); the encoders are 2-5x slower than the C ones except
+at the highest levels (zstd-19 is 5x slower, xz-6 is as slow as liblzma's because it searches less) and
+their ratio is the one named in the notes above. Where the time goes in zstd: the Firn backend keeps
+the values of a big function in stack slots, and the sequence loop is big (`docs/BENCHMARKS.md`
+tells the same story for other code); making it smaller is on the roadmap. The gzip loop shows what
+that is worth: keeping the bit buffer in locals took 2.2x off its instruction count.
+
 
 ## Files
 
