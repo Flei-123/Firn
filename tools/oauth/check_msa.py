@@ -369,9 +369,6 @@ def test_h(srv, tmp):
     check(r.result == 14 and r.err == 'unauthorized_client' and 'AADSTS700016' in r.desc,
           'unknown application: the OAuth error is passed on', r.lines)
     s.close()
-    if os.environ.get('RUNNER'):
-        skip('cancel flag: the Windows runtime has no threads to set it')
-        return
     s = fresh(srv)
     s.cmd('CANCELIN 1500')
     t0 = time.time()
@@ -396,6 +393,13 @@ def test_l(tmp):
     check(r.net == 0 and r.http in (400, 401) and r.result in (2, 3, 101), 'xsts.auth.xboxlive.com: a bogus user token is refused (HTTP %d, result %s)' % (r.http, r.name), r.lines)
     r = s.cmd('LIVE_MC')
     check(r.net == 0 and r.result == 104 or (r.net == 0 and r.http in (400, 401, 403)), 'api.minecraftservices.com: a bogus identity token is refused (HTTP %d, %s)' % (r.http, r.name), r.lines)
+    # the old endpoints, TLS 1.2 only: reachable once net.http has a TLS 1.2 client
+    r = s.cmd('LIVE_LIVECOM ' + str(uuid.uuid4()))
+    if r.result == 1 and r.net == 3:
+        skip('login.live.com needs TLS 1.2: this net.http offers 1.3 only (HttpError::Tls)')
+    else:
+        check(r.result == 14 and r.net == 0 and r.http == 400,
+              'login.live.com (TLS 1.2): the device endpoint answers a made-up client with an OAuth error (%s)' % r.err, r.lines)
     s.close()
 
 

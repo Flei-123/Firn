@@ -352,15 +352,12 @@ def test_d(idp, tmp):
     r = s3.cmd('LOGIN 1500')
     el = time.time() - t0
     check(r.result == 9 and 1.2 < el < 4, 'nobody comes: OA_TIMEOUT after 1.5 s (%.1f s)' % el, r.lines)
-    # cancel (the flag is set by a thread of the driver; the Windows runtime has none yet)
-    if os.environ.get('RUNNER'):
-        skip('cancel flag: the Windows runtime has no threads to set it')
-    else:
-        s3.cmd('CANCELIN 700')
-        t0 = time.time()
-        r = s3.cmd('LOGIN 20000')
-        el = time.time() - t0
-        check(r.result == 8 and el < 5, 'cancel flag: OA_CANCELLED after %.1f s' % el, r.lines)
+    # cancel (the flag is set by a thread of the driver)
+    s3.cmd('CANCELIN 700')
+    t0 = time.time()
+    r = s3.cmd('LOGIN 20000')
+    el = time.time() - t0
+    check(r.result == 8 and el < 5, 'cancel flag: OA_CANCELLED after %.1f s' % el, r.lines)
     s3.close()
     # the browser cannot be opened
     s4 = Session(on_open=lambda u: None)
@@ -424,17 +421,14 @@ def test_e(idp, tmp):
     check(r.result in (5, 9), 'a code that ran out: OA_EXPIRED/OA_TIMEOUT (%s)' % r.name, r.lines)
     s3.close()
     # cancel the wait
-    if os.environ.get('RUNNER'):
-        skip('cancel flag: the Windows runtime has no threads to set it')
-    else:
-        idp.reset()
-        s4 = Session()
-        configure(s4, idp)
-        s4.cmd('CANCELIN 1500')
-        t0 = time.time()
-        r = s4.cmd('DEVICE', timeout=30)
-        check(r.result == 8 and time.time() - t0 < 6, 'cancel flag ends the wait: OA_CANCELLED', r.lines)
-        s4.close()
+    idp.reset()
+    s4 = Session()
+    configure(s4, idp)
+    s4.cmd('CANCELIN 1500')
+    t0 = time.time()
+    r = s4.cmd('DEVICE', timeout=30)
+    check(r.result == 8 and time.time() - t0 < 6, 'cancel flag ends the wait: OA_CANCELLED', r.lines)
+    s4.close()
     # a device endpoint that answers an OAuth error
     idp.reset()
     s5 = Session()

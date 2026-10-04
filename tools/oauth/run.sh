@@ -65,7 +65,7 @@ if [ -n "$WINE" ] && command -v x86_64-w64-mingw32-ld >/dev/null 2>&1; then
     done
     if [ "$WB" = 1 ]; then
         ROOT=$(pwd)
-        (cd "$WORK" && RUNNER="$WINE" python3 "$ROOT/tools/oauth/check.py" "$WORK/oauth_main.exe" a b c d f g h i k > "$WORK/wo.log" 2>&1) || { rc=1; grep -v "^  OK" "$WORK/wo.log" | head -20; }
+        (cd "$WORK" && RUNNER="$WINE" python3 "$ROOT/tools/oauth/check.py" "$WORK/oauth_main.exe" a b c d e f g h i k > "$WORK/wo.log" 2>&1) || { rc=1; grep -v "^  OK" "$WORK/wo.log" | head -20; }
         (cd "$WORK" && RUNNER="$WINE" python3 "$ROOT/tools/oauth/check_msa.py" "$WORK/msa_main.exe" a b c d e f h > "$WORK/wm.log" 2>&1) || { rc=1; grep -v "^  OK" "$WORK/wm.log" | head -20; }
         echo "   windows: $(tail -1 "$WORK/wo.log") | $(tail -1 "$WORK/wm.log")"
     fi
