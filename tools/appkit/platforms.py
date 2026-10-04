@@ -40,6 +40,13 @@ FILES = [
 ]
 
 
+# entry points a platform file may export on top of the contract: the
+# system calls them, the rest of appkit does not
+EXTRA = {
+    "android": {"Java_org_firn_FirnInstall_onReceive"},
+}
+
+
 def read(path):
     return open(os.path.join(ROOT, path), encoding="utf-8").read()
 
@@ -123,7 +130,7 @@ def main():
         for n in sorted(ref_names - names):
             print("  FAIL  %-8s does not export %s" % (name, n))
             ok = False
-        for n in sorted(names - ref_names):
+        for n in sorted(names - ref_names - EXTRA.get(name, set())):
             print("  FAIL  %-8s exports %s, which the reference does not" % (name, n))
             ok = False
         for n in sorted(ref_names & names):

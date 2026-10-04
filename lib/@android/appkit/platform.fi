@@ -1,0 +1,980 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/@android/appkit/platform.fi -- THE PLATFORM LAYER, Android.
+//
+// The compiler picks this file instead of lib/appkit/platform.fi for the
+// Android targets (the platform directory rule, compiler/src/target.rs).
+// It exports the names platform.fi documents (read that header for the
+// contract) and one more: the receiver the system calls back.
+//
+// ANDROID IS DIFFERENT IN FIVE WAYS, and each shows in this file:
+//
+//   * NO SELF-REPLACEMENT. A program is an APK, not a file beside the
+//     program: the system installs updates. `plat_swap_kind` answers
+//     SWAP_INSTALLER and `plat_apply` hands the downloaded APK to Android's
+//     PackageInstaller: a session is created, the APK is streamed into it
+//     and `commit` gives the system an IntentSender to answer to. The
+//     answer arrives as a broadcast at org.firn.FirnInstall -- a class Firn
+//     writes into classes.dex (tools/appkit/installdex_main.fi, no Java).
+//     When Android needs the user's yes it sends a "pending user action"
+//     intent, which the receiver starts; on success the system replaces the
+//     app and ends this process. The OS owns the rollback: there is no
+//     backup file to put back (plat_rollback answers AP_UNSUPPORTED).
+//   * NO SECOND PROCESS. A program cannot start its own file as a worker:
+//     plat_spawn_detached answers -1 and plat_worker_process is false.
+//   * NO THREADS OF OUR OWN. `thread_start` replaces the thread pointer of
+//     the calling thread (arch_prctl / tpidr_el0), and on Android that
+//     register belongs to bionic -- JNI, errno and the C library would be
+//     blind afterwards. plat_threads is false, so update.fi runs its check
+//     and download on the app thread (RUN_BLOCKING; the progress callback is
+//     called from there, so a program can keep its window alive).
+//   * DIRECTORIES: everything lives in the app's files directory
+//     (lib/android/activity.fi: activity_data_path, where the host also
+//     puts args.txt and stdout.txt). There is no environment (the host's
+//     start block has none).
+//   * THE PLATFORM NAMES the catalog uses are android-arm64,
+//     android-x86_64, android-arm, android-x86 (not the kernel's names), the
+//     package kind is `apk`.
+//
+// WHAT THE MANIFEST NEEDS (templates/app/build-android.sh does it all):
+// INTERNET, REQUEST_INSTALL_PACKAGES, UPDATE_PACKAGES_WITHOUT_USER_ACTION
+// and <receiver android:name="org.firn.FirnInstall" android:exported="false">.
+// The first update after an install from elsewhere (adb, a browser) asks the
+// user once; an app that installed itself is updated silently on Android 12+.
+//
+// STATUS: the Linux half (directories, lock, locale) is the Linux file's
+// code; the PackageInstaller half is written against the SDK documentation
+// and measured on the x86-64 emulator (tools/appkit/android_check.sh).
+import std.rt
+import std.fs
+import std.time
+import android.ndk
+import android.activity
+import android.jnicall
+import appkit.util
+
+export {
+    plat_init, plat_os, plat_arch, plat_id, plat_art, plat_argc, plat_arg,
+    plat_env_get, plat_dir, plat_exe_path, plat_self_pid, plat_spawned_alive,
+    plat_kill_spawned, plat_spawn_detached, plat_lock, plat_unlock, plat_lock_held,
+    plat_apply, plat_rollback, plat_can_write_beside, plat_threads,
+    plat_worker_process, plat_can_self_update, plat_install_hint, plat_exit,
+    plat_sleep_ms, plat_file_copy, plat_chmod_exec, plat_path_sep,
+    plat_stage_path, plat_locale, plat_swap_kind, SWAP_FILES, SWAP_INSTALLER,
+    DIR_CONFIG, DIR_DATA, DIR_STATE, DIR_CACHE, DIR_LOG,
+    AP_OK, AP_NO_NEW, AP_BACKUP, AP_RENAME, AP_PERM, AP_UNSUPPORTED,
+    AP_STAGED,
+    Java_org_firn_FirnInstall_onReceive,
+}
+
+const DIR_CONFIG: u32 = 0
+const DIR_DATA: u32 = 1
+const DIR_STATE: u32 = 2
+const DIR_CACHE: u32 = 3
+const DIR_LOG: u32 = 4
+
+const AP_OK: u32 = 0
+const AP_NO_NEW: u32 = 1
+const AP_BACKUP: u32 = 2
+const AP_RENAME: u32 = 3
+const AP_PERM: u32 = 4
+const AP_UNSUPPORTED: u32 = 5
+const AP_STAGED: u32 = 6
+
+const SWAP_FILES: u32 = 0
+const SWAP_INSTALLER: u32 = 1
+
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const SYS_READ: i64 = 0
+const SYS_WRITE: i64 = 1
+const SYS_LSEEK: i64 = 8
+const SYS_GETPID: i64 = 39
+const SYS_UNAME: i64 = 63
+const SYS_FCNTL: i64 = 72
+const SYS_GETCWD: i64 = 79
+const O_RDONLY: i64 = 0
+const O_RDWR_CREAT: i64 = 66 // O_RDWR | O_CREAT
+const O_WRITE_NEW: i64 = 577 // O_WRONLY | O_CREAT | O_TRUNC
+const O_CLOEXEC: i64 = 524288
+const F_SETLK: i64 = 6
+
+// PackageInstaller.EXTRA_STATUS values the receiver looks at
+const STATUS_PENDING_USER_ACTION: i32 = -1
+const STATUS_SUCCESS: i32 = 0
+
+static mut G_START: u64 = 0
+static mut G_ARCH: [u8; 16] = [0; 16]
+static mut G_NARCH: usize = 0
+static mut G_ID: [u8; 32] = [0; 32]
+static mut G_NID: usize = 0
+
+fn plat_init(start: u64) {
+    G_START = start
+}
+
+fn plat_os() -> str {
+    return "android"
+}
+
+fn plat_path_sep() -> str {
+    return "/"
+}
+
+fn plat_argc() -> usize {
+    return rt.arg_count(G_START)
+}
+
+fn plat_arg(i: usize) -> str {
+    let p: u64 = rt.arg_ptr(G_START, i)
+    if p == 0 as u64 {
+        return ""
+    }
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+// The machine as the catalog names an Android platform, after "android-":
+// arm64, x86_64, arm, x86.
+fn plat_arch() -> str {
+    if G_NARCH == 0 {
+        var u: [u8; 390] = [0; 390]
+        let r: i64 = syscall(SYS_UNAME, (&u[0]) as i64, 0, 0, 0, 0, 0)
+        var n: usize = 0
+        if r >= 0 {
+            while n < 64 && u[260 + n] != 0 as u8 {
+                n = n + 1
+            }
+        }
+        let m: str = str { p: (&u[260]) as *mut u8, n: n }
+        var out: str = "x86_64"
+        if m == "aarch64" || m == "arm64" || m == "armv8l" {
+            out = "arm64"
+        } else if util.starts_with(m, "armv") {
+            out = "arm"
+        } else if m == "i686" || m == "i386" || m == "i586" {
+            out = "x86"
+        }
+        rt.mem_copy((&G_ARCH[0]) as u64, out.p as u64, out.n)
+        G_NARCH = out.n
+    }
+    return str { p: (&G_ARCH[0]) as *mut u8, n: G_NARCH }
+}
+
+fn plat_id() -> str {
+    if G_NID == 0 {
+        let a: str = plat_arch()
+        rt.mem_copy((&G_ID[0]) as u64, "android-".p as u64, 8)
+        rt.mem_copy((&G_ID[0]) as u64 + 8 as u64, a.p as u64, a.n)
+        G_NID = 8 + a.n
+    }
+    return str { p: (&G_ID[0]) as *mut u8, n: G_NID }
+}
+
+fn plat_art() -> str {
+    return "apk"
+}
+
+// The host's start block carries no environment, so this finds nothing
+// unless a program built its own start block with one.
+fn plat_env_get(name: str, out: *mut rt.Buf) -> bool {
+    if G_START == 0 as u64 {
+        return false
+    }
+    var i: usize = rt.arg_count(G_START) + 2
+    while true {
+        let p: u64 = rt.ld64(G_START, i)
+        if p == 0 as u64 {
+            return false
+        }
+        let n: usize = rt.c_length(p)
+        if n > name.n && rt.ld8(p, name.n) == 61 as u8 && rt.mem_eq(p, name.p as u64, name.n) {
+            rt.buf_clear(out)
+            rt.buf_push_bytes(out, p + name.n as u64 + 1 as u64, n - name.n - 1)
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// the app's files directory: the host's data path, else the working
+// directory the host set, else "."
+fn files_dir(out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    let p: u64 = activity.activity_data_path()
+    if p != 0 as u64 {
+        rt.buf_push_bytes(out, p, rt.c_length(p))
+        return
+    }
+    var cwd: [u8; 512] = [0; 512]
+    let r: i64 = syscall(SYS_GETCWD, (&cwd[0]) as i64, 511, 0, 0, 0, 0)
+    if r > 0 {
+        rt.buf_push_bytes(out, (&cwd[0]) as u64, rt.c_length((&cwd[0]) as u64))
+    } else {
+        rt.buf_push(out, 46 as u8)
+    }
+}
+
+// the base all directories hang under: $APPKIT_HOME (a test hook; only set
+// where a program built an environment), else the files directory
+fn base_dir(out: *mut rt.Buf) {
+    var ov: rt.Buf = rt.buf_new()
+    if plat_env_get("APPKIT_HOME", &ov) && rt.buf_len(&ov) > 0 {
+        rt.buf_clear(out)
+        rt.buf_push_bytes(out, rt.buf_ptr(&ov), rt.buf_len(&ov))
+    } else {
+        files_dir(out)
+    }
+    rt.buf_free(&ov)
+}
+
+// <files>/{config,data,state,cache,logs}/<app>
+fn plat_dir(kind: u32, app: str, vendor: str, out: *mut rt.Buf) -> bool {
+    var base: rt.Buf = rt.buf_new()
+    base_dir(&base)
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, rt.buf_ptr(&base), rt.buf_len(&base))
+    rt.buf_free(&base)
+    rt.buf_push(out, 47 as u8)
+    if kind == DIR_CONFIG { util.buf_push_str(out, "config") }
+    else if kind == DIR_DATA { util.buf_push_str(out, "data") }
+    else if kind == DIR_STATE { util.buf_push_str(out, "state") }
+    else if kind == DIR_CACHE { util.buf_push_str(out, "cache") }
+    else { util.buf_push_str(out, "logs") }
+    rt.buf_push(out, 47 as u8)
+    util.buf_push_str(out, app)
+    return true
+}
+
+// there is no program file to replace
+fn plat_exe_path(out: *mut rt.Buf) -> bool {
+    return false
+}
+
+fn plat_self_pid() -> i64 {
+    return syscall(SYS_GETPID, 0, 0, 0, 0, 0, 0)
+}
+
+fn plat_spawned_alive(token: i64) -> bool {
+    return false
+}
+
+fn plat_kill_spawned(token: i64) -> bool {
+    return false
+}
+
+// An Android app cannot start its own code as another process.
+fn plat_spawn_detached(path: str, args: *mut util.Args) -> i64 {
+    return -1
+}
+
+fn plat_sleep_ms(ms: u64) {
+    time.sleep_ms(ms)
+}
+
+fn plat_exit(code: i64) {
+    rt.finish(code)
+}
+
+// ------------------------------------------------------------------ locks
+
+struct FlockRec {
+    l_type: i16,
+    l_whence: i16,
+    pad: i32,
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+    pad2: i32,
+}
+
+// POSIX record lock in the app's own directory (Android is a Linux kernel);
+// the same code as platform.fi. -1 = held by another process, -2 = error.
+fn plat_lock(path: str) -> i64 {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    let fd: i64 = syscall(SYS_OPEN, rt.buf_ptr(&c) as i64, O_RDWR_CREAT | O_CLOEXEC, 420, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return -2
+    }
+    var l: FlockRec = FlockRec { l_type: 1 as i16, l_whence: 0 as i16, pad: 0 as i32,
+        l_start: 0, l_len: 0, l_pid: 0 as i32, pad2: 0 as i32 }
+    let r: i64 = syscall(SYS_FCNTL, fd, F_SETLK, (&l) as i64, 0, 0, 0)
+    if r < 0 {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        if r == -11 || r == -13 {
+            return -1
+        }
+        return -2
+    }
+    var t: rt.Buf = rt.buf_new()
+    util.push_dec_pad(&t, plat_self_pid() as u64, 10)
+    rt.buf_push(&t, 10 as u8)
+    syscall(SYS_LSEEK, fd, 0, 0, 0, 0, 0)
+    syscall(SYS_WRITE, fd, rt.buf_ptr(&t) as i64, rt.buf_len(&t) as i64, 0, 0, 0)
+    rt.buf_free(&t)
+    return fd
+}
+
+fn plat_unlock(h: i64) {
+    if h >= 0 {
+        syscall(SYS_CLOSE, h, 0, 0, 0, 0, 0)
+    }
+}
+
+fn plat_lock_held(path: str) -> bool {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    let fd: i64 = syscall(SYS_OPEN, rt.buf_ptr(&c) as i64, O_RDONLY | O_CLOEXEC, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return false
+    }
+    var l: FlockRec = FlockRec { l_type: 1 as i16, l_whence: 0 as i16, pad: 0 as i32,
+        l_start: 0, l_len: 0, l_pid: 0 as i32, pad2: 0 as i32 }
+    let r: i64 = syscall(SYS_FCNTL, fd, 5, (&l) as i64, 0, 0, 0)
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    if r < 0 {
+        return false
+    }
+    return l.l_type != 2 as i16
+}
+
+// ------------------------------------------------------------ small files
+
+fn plat_chmod_exec(path: str) -> bool {
+    return true
+}
+
+fn plat_file_copy(src: str, dst: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(src, &b) catch 4294967295
+    if n == 4294967295 {
+        rt.buf_free(&b)
+        return false
+    }
+    let w: usize = fs.write_file(dst, rt.buf_ptr(&b), rt.buf_len(&b)) catch 4294967295
+    let ok: bool = w == rt.buf_len(&b)
+    rt.buf_free(&b)
+    return ok
+}
+
+fn plat_can_write_beside(exe: str) -> bool {
+    return true
+}
+
+fn plat_swap_kind() -> u32 {
+    return SWAP_INSTALLER
+}
+
+// The downloaded APK waits in <files>/cache/update.apk; the directory is
+// made here. `exe` is not used on Android.
+fn plat_stage_path(exe: str, out: *mut rt.Buf) -> bool {
+    var base: rt.Buf = rt.buf_new()
+    base_dir(&base)
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, rt.buf_ptr(&base), rt.buf_len(&base))
+    rt.buf_free(&base)
+    util.buf_push_str(out, "/cache")
+    let made: bool = fs.mkdir_all(util.buf_to_str_copy(out)) catch false
+    util.buf_push_str(out, "/update.apk")
+    return true
+}
+
+// No `thread_start` on Android (see the header): the check and the
+// download run on the app thread.
+fn plat_threads() -> bool {
+    return false
+}
+
+fn plat_worker_process() -> bool {
+    return false
+}
+
+fn plat_can_self_update() -> bool {
+    return true
+}
+
+fn plat_install_hint() -> str {
+    return "Allow this app to install updates: Settings > Apps > Special app access > Install unknown apps."
+}
+
+// ---------------------------------------------------------------- raw text
+// Everything below runs where the collector must not: the receiver on
+// Android's main thread, the JNI code on the app thread. #[no_gc] is
+// transitive, so these helpers stand here and not in std.rt.
+
+#[no_gc]
+fn raw_length(p: u64) -> usize {
+    var n: usize = 0
+    while *((p + n as u64) as *mut u8) != 0 as u8 {
+        n = n + 1
+    }
+    return n
+}
+
+#[no_gc]
+fn raw_copy(z: u64, q: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        *((z + i as u64) as *mut u8) = *((q + i as u64) as *mut u8)
+        i = i + 1
+    }
+}
+
+// The app's JNI environment (attaching this thread if need be) and its
+// activity object (a Context). 0 = no host (no activity yet).
+#[no_gc]
+fn jni_ctx(ctx_out: *mut u64) -> u64 {
+    let act: u64 = activity.activity_pointer()
+    if act == 0 {
+        return 0
+    }
+    let env: u64 = jnicall.j_env(ndk.peek64(act + 8))
+    let ctx: u64 = ndk.peek64(act + 24)
+    if env == 0 || ctx == 0 {
+        return 0
+    }
+    *ctx_out = ctx
+    return env
+}
+
+// ---------------------------------------------------------------- locale
+
+// Locale.getDefault().getLanguage() ("de", "en", ...): two letters into
+// out[0..2]
+#[no_gc]
+fn locale_into(out: *mut u8) -> bool {
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 {
+        return false
+    }
+    var c_loc: [u8; _] = "java/util/Locale\0"
+    var n_get: [u8; _] = "getDefault\0"
+    var s_get: [u8; _] = "()Ljava/util/Locale;\0"
+    var n_lang: [u8; _] = "getLanguage\0"
+    var s_lang: [u8; _] = "()Ljava/lang/String;\0"
+    let cls: u64 = jnicall.j_class(env, (&c_loc[0]) as u64)
+    if cls == 0 {
+        return false
+    }
+    let loc: u64 = jnicall.j_sobj(env, cls,
+        jnicall.j_smethod(env, cls, (&n_get[0]) as u64, (&s_get[0]) as u64), 0)
+    jnicall.j_del(env, cls)
+    if loc == 0 {
+        return false
+    }
+    let lc: u64 = jnicall.j_obj_class(env, loc)
+    let js: u64 = jnicall.j_obj(env, loc,
+        jnicall.j_method(env, lc, (&n_lang[0]) as u64, (&s_lang[0]) as u64), 0)
+    jnicall.j_del(env, lc)
+    jnicall.j_del(env, loc)
+    if js == 0 {
+        return false
+    }
+    let chars: u64 = jnicall.j_utf_chars(env, js)
+    var ok: bool = false
+    if chars != 0 {
+        let a: u8 = *(chars as *mut u8)
+        let b: u8 = *((chars + 1) as *mut u8)
+        if a >= 97 as u8 && a <= 122 as u8 && b >= 97 as u8 && b <= 122 as u8 {
+            *out = a
+            *((out as u64 + 1) as *mut u8) = b
+            ok = true
+        }
+        jnicall.j_utf_release(env, js, chars)
+    }
+    jnicall.j_del(env, js)
+    return ok
+}
+
+fn plat_locale(out: *mut rt.Buf) -> bool {
+    var two: [u8; 2] = [0 as u8; 2]
+    rt.buf_clear(out)
+    if locale_into(&two[0]) {
+        rt.buf_push(out, two[0])
+        rt.buf_push(out, two[1])
+        return true
+    }
+    util.buf_push_str(out, "en")
+    return false
+}
+
+// ------------------------------------------------------- the installation
+
+// PackageInstaller.abandonSession(sid): a session that failed must not stay
+// open (Android keeps a few and then refuses new ones).
+#[no_gc]
+fn session_abandon(env: u64, pi: u64, sid: i32) {
+    var n_ab: [u8; _] = "abandonSession\0"
+    var s_ab: [u8; _] = "(I)V\0"
+    var a: [u64; 2] = [0; 2]
+    a[0] = sid as u64
+    let k: u64 = jnicall.j_obj_class(env, pi)
+    let r: bool = jnicall.j_void(env, pi, jnicall.j_method(env, k, (&n_ab[0]) as u64, (&s_ab[0]) as u64),
+        (&a[0]) as u64)
+    jnicall.j_del(env, k)
+}
+
+// The PackageInstaller of this app (a local reference), 0 when Android has none.
+#[no_gc]
+fn installer_of(env: u64, ctx: u64) -> u64 {
+    var n_gpm: [u8; _] = "getPackageManager\0"
+    var s_gpm: [u8; _] = "()Landroid/content/pm/PackageManager;\0"
+    var n_gpi: [u8; _] = "getPackageInstaller\0"
+    var s_gpi: [u8; _] = "()Landroid/content/pm/PackageInstaller;\0"
+    let kc: u64 = jnicall.j_obj_class(env, ctx)
+    let pm: u64 = jnicall.j_obj(env, ctx,
+        jnicall.j_method(env, kc, (&n_gpm[0]) as u64, (&s_gpm[0]) as u64), 0)
+    jnicall.j_del(env, kc)
+    if pm == 0 {
+        return 0
+    }
+    let kp: u64 = jnicall.j_obj_class(env, pm)
+    let pi: u64 = jnicall.j_obj(env, pm,
+        jnicall.j_method(env, kp, (&n_gpi[0]) as u64, (&s_gpi[0]) as u64), 0)
+    jnicall.j_del(env, kp)
+    jnicall.j_del(env, pm)
+    return pi
+}
+
+// A new full-install session; its id in *sid_out. 0 on failure.
+// Android 12+ is asked for NO user action: it is granted when this app is
+// the installer of record of itself, else the user is asked once.
+#[no_gc]
+fn session_create(env: u64, pi: u64, sdk: i32, size: u64, sid_out: *mut i32) -> bool {
+    var c_sp: [u8; _] = "android/content/pm/PackageInstaller$SessionParams\0"
+    var n_init: [u8; _] = "<init>\0"
+    var s_ii: [u8; _] = "(I)V\0"
+    var n_sru: [u8; _] = "setRequireUserAction\0"
+    var s_sru: [u8; _] = "(I)V\0"
+    var n_ssz: [u8; _] = "setSize\0"
+    var s_ssz: [u8; _] = "(J)V\0"
+    var n_cs: [u8; _] = "createSession\0"
+    var s_cs: [u8; _] = "(Landroid/content/pm/PackageInstaller$SessionParams;)I\0"
+    var a: [u64; 2] = [0; 2]
+    let ap: u64 = (&a[0]) as u64
+    let ksp: u64 = jnicall.j_class(env, (&c_sp[0]) as u64)
+    if ksp == 0 {
+        return false
+    }
+    a[0] = 1 // MODE_FULL_INSTALL
+    let params: u64 = jnicall.j_new(env, ksp,
+        jnicall.j_method(env, ksp, (&n_init[0]) as u64, (&s_ii[0]) as u64), ap)
+    if params == 0 {
+        jnicall.j_del(env, ksp)
+        return false
+    }
+    a[0] = size
+    jnicall.j_void(env, params, jnicall.j_method(env, ksp, (&n_ssz[0]) as u64, (&s_ssz[0]) as u64), ap)
+    if sdk >= 31 {
+        a[0] = 2 // USER_ACTION_NOT_REQUIRED
+        jnicall.j_void(env, params,
+            jnicall.j_method(env, ksp, (&n_sru[0]) as u64, (&s_sru[0]) as u64), ap)
+    }
+    jnicall.j_del(env, ksp)
+    let kp: u64 = jnicall.j_obj_class(env, pi)
+    a[0] = params
+    let sid: i32 = jnicall.j_int(env, pi,
+        jnicall.j_method(env, kp, (&n_cs[0]) as u64, (&s_cs[0]) as u64), ap)
+    jnicall.j_del(env, kp)
+    jnicall.j_del(env, params)
+    if sid <= 0 {
+        return false
+    }
+    *sid_out = sid
+    return true
+}
+
+// Streams the file at `path` (zero terminated, `size` octets) into the
+// session as "update.apk": 64 KiB at a time through a Java byte[].
+#[no_gc]
+fn session_write(env: u64, pi: u64, session: u64, path: u64, size: u64) -> bool {
+    var n_os: [u8; _] = "openWrite\0"
+    var s_os: [u8; _] = "(Ljava/lang/String;JJ)Ljava/io/OutputStream;\0"
+    var c_os: [u8; _] = "java/io/OutputStream\0"
+    var n_wr: [u8; _] = "write\0"
+    var s_wr: [u8; _] = "([BII)V\0"
+    var n_fs: [u8; _] = "fsync\0"
+    var s_fs: [u8; _] = "(Ljava/io/OutputStream;)V\0"
+    var n_cl: [u8; _] = "close\0"
+    var s_v: [u8; _] = "()V\0"
+    var apkname: [u8; _] = "update.apk\0"
+    var a: [u64; 4] = [0; 4]
+    let ap: u64 = (&a[0]) as u64
+    let ks: u64 = jnicall.j_obj_class(env, session)
+    let jname: u64 = jnicall.j_str(env, (&apkname[0]) as u64)
+    a[0] = jname
+    a[1] = 0
+    a[2] = size
+    let out: u64 = jnicall.j_obj(env, session,
+        jnicall.j_method(env, ks, (&n_os[0]) as u64, (&s_os[0]) as u64), ap)
+    jnicall.j_del(env, jname)
+    if out == 0 {
+        jnicall.j_del(env, ks)
+        return false
+    }
+    let ko: u64 = jnicall.j_class(env, (&c_os[0]) as u64)
+    let m_write: u64 = jnicall.j_method(env, ko, (&n_wr[0]) as u64, (&s_wr[0]) as u64)
+    let m_close: u64 = jnicall.j_method(env, ko, (&n_cl[0]) as u64, (&s_v[0]) as u64)
+    let fd: i64 = syscall(SYS_OPEN, path as i64, O_RDONLY | O_CLOEXEC, 0, 0, 0, 0)
+    var ok: bool = fd >= 0 && m_write != 0
+    let jbuf: u64 = jnicall.j_new_bytes(env, 65536)
+    let cbuf: u64 = rt.heap_alloc(65536)
+    if jbuf == 0 || cbuf == 0 {
+        ok = false
+    }
+    var total: u64 = 0
+    while ok {
+        let n: i64 = syscall(SYS_READ, fd, cbuf as i64, 65536, 0, 0, 0)
+        if n < 0 {
+            if n == -4 {
+                continue
+            }
+            ok = false
+            break
+        }
+        if n == 0 {
+            break
+        }
+        if !jnicall.j_bytes_set(env, jbuf, 0, n as usize, cbuf) {
+            ok = false
+            break
+        }
+        a[0] = jbuf
+        a[1] = 0
+        a[2] = n as u64
+        if !jnicall.j_void(env, out, m_write, ap) {
+            ok = false
+            break
+        }
+        total = total + n as u64
+    }
+    if fd >= 0 {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    }
+    if cbuf != 0 {
+        rt.heap_free(cbuf, 65536)
+    }
+    if ok && total != size {
+        ok = false
+    }
+    if ok {
+        a[0] = out
+        jnicall.j_void(env, session, jnicall.j_method(env, ks, (&n_fs[0]) as u64, (&s_fs[0]) as u64), ap)
+    }
+    jnicall.j_void(env, out, m_close, 0)
+    jnicall.j_del(env, jbuf)
+    jnicall.j_del(env, ko)
+    jnicall.j_del(env, out)
+    jnicall.j_del(env, ks)
+    return ok
+}
+
+// session.commit(sender): `sender` names org.firn.FirnInstall -- the system
+// reports back there. False when Android refused.
+#[no_gc]
+fn session_commit(env: u64, ctx: u64, session: u64, sid: i32) -> bool {
+    var c_in: [u8; _] = "android/content/Intent\0"
+    var c_pe: [u8; _] = "android/app/PendingIntent\0"
+    var n_init: [u8; _] = "<init>\0"
+    var s_v: [u8; _] = "()V\0"
+    var n_gpn: [u8; _] = "getPackageName\0"
+    var s_str: [u8; _] = "()Ljava/lang/String;\0"
+    var n_scn: [u8; _] = "setClassName\0"
+    var s_scn: [u8; _] = "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;\0"
+    var n_gb: [u8; _] = "getBroadcast\0"
+    var s_gb: [u8; _] = "(Landroid/content/Context;ILandroid/content/Intent;I)Landroid/app/PendingIntent;\0"
+    var n_gis: [u8; _] = "getIntentSender\0"
+    var s_gis: [u8; _] = "()Landroid/content/IntentSender;\0"
+    var n_cm: [u8; _] = "commit\0"
+    var s_cm: [u8; _] = "(Landroid/content/IntentSender;)V\0"
+    var recv: [u8; _] = "org.firn.FirnInstall\0"
+    var a: [u64; 4] = [0; 4]
+    let ap: u64 = (&a[0]) as u64
+    let kin: u64 = jnicall.j_class(env, (&c_in[0]) as u64)
+    let intent: u64 = jnicall.j_new(env, kin,
+        jnicall.j_method(env, kin, (&n_init[0]) as u64, (&s_v[0]) as u64), 0)
+    let kc: u64 = jnicall.j_obj_class(env, ctx)
+    let pkg: u64 = jnicall.j_obj(env, ctx,
+        jnicall.j_method(env, kc, (&n_gpn[0]) as u64, (&s_str[0]) as u64), 0)
+    jnicall.j_del(env, kc)
+    let jrecv: u64 = jnicall.j_str(env, (&recv[0]) as u64)
+    a[0] = pkg
+    a[1] = jrecv
+    let named: u64 = jnicall.j_obj(env, intent,
+        jnicall.j_method(env, kin, (&n_scn[0]) as u64, (&s_scn[0]) as u64), ap)
+    jnicall.j_del(env, kin)
+    jnicall.j_del(env, jrecv)
+    jnicall.j_del(env, pkg)
+    jnicall.j_del(env, named)
+    if intent == 0 {
+        return false
+    }
+    let kpe: u64 = jnicall.j_class(env, (&c_pe[0]) as u64)
+    a[0] = ctx
+    a[1] = sid as u64
+    a[2] = intent
+    a[3] = 167772160 // FLAG_MUTABLE | FLAG_UPDATE_CURRENT: the system adds its extras
+    let pend: u64 = jnicall.j_sobj(env, kpe,
+        jnicall.j_smethod(env, kpe, (&n_gb[0]) as u64, (&s_gb[0]) as u64), ap)
+    jnicall.j_del(env, kpe)
+    jnicall.j_del(env, intent)
+    if pend == 0 {
+        return false
+    }
+    let kpd: u64 = jnicall.j_obj_class(env, pend)
+    let sender: u64 = jnicall.j_obj(env, pend,
+        jnicall.j_method(env, kpd, (&n_gis[0]) as u64, (&s_gis[0]) as u64), 0)
+    jnicall.j_del(env, kpd)
+    jnicall.j_del(env, pend)
+    if sender == 0 {
+        return false
+    }
+    let ks: u64 = jnicall.j_obj_class(env, session)
+    a[0] = sender
+    let ok: bool = jnicall.j_void(env, session,
+        jnicall.j_method(env, ks, (&n_cm[0]) as u64, (&s_cm[0]) as u64), ap)
+    jnicall.j_del(env, ks)
+    jnicall.j_del(env, sender)
+    return ok
+}
+
+// Streams the APK at `path` (zero terminated) into a PackageInstaller
+// session and commits it. AP_STAGED: the system has it and answers through
+// FirnInstall. AP_NO_NEW: no such file. AP_PERM: Android refused the
+// session or the commit (the Java exception is in logcat). AP_UNSUPPORTED:
+// no host / no JNI.
+#[no_gc]
+fn install_session(path: u64, size: u64) -> u32 {
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 {
+        return AP_UNSUPPORTED
+    }
+    let act: u64 = activity.activity_pointer()
+    let sdk: i32 = ndk.peek32(act + ndk.ACT_SDK_VERSION)
+    let pi: u64 = installer_of(env, ctx)
+    if pi == 0 {
+        return AP_UNSUPPORTED
+    }
+    var sid: i32 = 0
+    if !session_create(env, pi, sdk, size, &sid) {
+        jnicall.j_del(env, pi)
+        return AP_PERM
+    }
+    var n_os: [u8; _] = "openSession\0"
+    var s_os: [u8; _] = "(I)Landroid/content/pm/PackageInstaller$Session;\0"
+    var n_cl: [u8; _] = "close\0"
+    var s_v: [u8; _] = "()V\0"
+    var a: [u64; 2] = [0; 2]
+    a[0] = sid as u64
+    let kp: u64 = jnicall.j_obj_class(env, pi)
+    let session: u64 = jnicall.j_obj(env, pi,
+        jnicall.j_method(env, kp, (&n_os[0]) as u64, (&s_os[0]) as u64), (&a[0]) as u64)
+    jnicall.j_del(env, kp)
+    if session == 0 {
+        session_abandon(env, pi, sid)
+        jnicall.j_del(env, pi)
+        return AP_PERM
+    }
+    var rc: u32 = AP_STAGED
+    if !session_write(env, pi, session, path, size) {
+        rc = AP_NO_NEW
+    } else if !session_commit(env, ctx, session, sid) {
+        rc = AP_PERM
+    }
+    let ks: u64 = jnicall.j_obj_class(env, session)
+    jnicall.j_void(env, session, jnicall.j_method(env, ks, (&n_cl[0]) as u64, (&s_v[0]) as u64), 0)
+    jnicall.j_del(env, ks)
+    jnicall.j_del(env, session)
+    if rc != AP_STAGED {
+        session_abandon(env, pi, sid)
+    }
+    jnicall.j_del(env, pi)
+    return rc
+}
+
+// Hands the downloaded APK to the system's installer. `exe` and `backup`
+// are not used on Android.
+fn plat_apply(newf: str, exe: str, backup: str) -> u32 {
+    if !fs.is_file(newf) {
+        return AP_NO_NEW
+    }
+    var failed: bool = false
+    let info: fs.FileInfo = fs.stat(newf) catch | e | fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0 as u64, mtime_ns: 0 }
+    if info.size == 0 as u64 {
+        return AP_NO_NEW
+    }
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, newf.p as u64, newf.n)
+    rt.buf_push(&c, 0 as u8)
+    let rc: u32 = install_session(rt.buf_ptr(&c), info.size)
+    rt.buf_free(&c)
+    return rc
+}
+
+// The system owns the replacement; there is no backup file here.
+fn plat_rollback(exe: str, backup: str) -> u32 {
+    return AP_UNSUPPORTED
+}
+
+// --------------------------------------------------------- the answer
+
+// What the receiver writes about a finished (or failed) installation:
+// <files>/install-status.txt = "status=<n>\nmessage=<text>\n". The next
+// start of the program (or a test) reads it; Android's own dialog already
+// told the user.
+#[no_gc]
+fn status_file(status: i32, msg: u64) {
+    let dp: u64 = activity.activity_data_path()
+    if dp == 0 {
+        return
+    }
+    var path: [u8; 640] = [0 as u8; 640]
+    let n: usize = raw_length(dp)
+    if n > 500 {
+        return
+    }
+    var tail: [u8; _] = "/install-status.txt\0"
+    raw_copy((&path[0]) as u64, dp, n)
+    raw_copy((&path[0]) as u64 + n as u64, (&tail[0]) as u64, 20)
+    var text: [u8; 320] = [0 as u8; 320]
+    var pre: [u8; _] = "status=\0"
+    raw_copy((&text[0]) as u64, (&pre[0]) as u64, 7)
+    var m: usize = 7
+    var v: i64 = status as i64
+    if v < 0 {
+        text[m] = 45 as u8
+        m = m + 1
+        v = 0 - v
+    }
+    var digits: [u8; 12] = [0 as u8; 12]
+    var dn: usize = 0
+    if v == 0 {
+        digits[0] = 48 as u8
+        dn = 1
+    }
+    while v > 0 && dn < 11 {
+        digits[dn] = 48 as u8 + (v % 10) as u8
+        v = v / 10
+        dn = dn + 1
+    }
+    while dn > 0 {
+        dn = dn - 1
+        text[m] = digits[dn]
+        m = m + 1
+    }
+    text[m] = 10 as u8
+    m = m + 1
+    if msg != 0 {
+        var pm: [u8; _] = "message=\0"
+        raw_copy((&text[0]) as u64 + m as u64, (&pm[0]) as u64, 8)
+        m = m + 8
+        var k: usize = 0
+        while k < 240 && *((msg + k as u64) as *mut u8) != 0 as u8 {
+            var ch: u8 = *((msg + k as u64) as *mut u8)
+            if ch < 32 as u8 {
+                ch = 32 as u8
+            }
+            text[m] = ch
+            m = m + 1
+            k = k + 1
+        }
+        text[m] = 10 as u8
+        m = m + 1
+    }
+    let fd: i64 = syscall(SYS_OPEN, (&path[0]) as i64, O_WRITE_NEW, 420, 0, 0, 0)
+    if fd >= 0 {
+        syscall(SYS_WRITE, fd, (&text[0]) as i64, m as i64, 0, 0, 0)
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    }
+}
+
+// org.firn.FirnInstall.onReceive(Context, Intent) -- the system's answer to
+// the install session. Runs on Android's MAIN thread: no collector, no Firn
+// allocation, only fixed buffers and raw system calls.
+//
+//   STATUS_PENDING_USER_ACTION (-1): Android needs the user's yes (or the
+//     "install unknown apps" switch); the intent carries the confirmation
+//     activity (EXTRA_INTENT), started here.
+//   anything else (0 = installed; the system replaces the app next, 1..7 =
+//     a failure): status and Android's message go to logcat (tag "appkit")
+//     and to install-status.txt.
+#[export_c]
+#[no_gc]
+fn Java_org_firn_FirnInstall_onReceive(env: u64, this: u64, ctx: u64, intent: u64) {
+    var n_gie: [u8; _] = "getIntExtra\0"
+    var s_gie: [u8; _] = "(Ljava/lang/String;I)I\0"
+    var n_gse: [u8; _] = "getStringExtra\0"
+    var s_gse: [u8; _] = "(Ljava/lang/String;)Ljava/lang/String;\0"
+    var n_gpe: [u8; _] = "getParcelableExtra\0"
+    var s_gpe: [u8; _] = "(Ljava/lang/String;)Landroid/os/Parcelable;\0"
+    var n_afl: [u8; _] = "addFlags\0"
+    var s_afl: [u8; _] = "(I)Landroid/content/Intent;\0"
+    var n_sa: [u8; _] = "startActivity\0"
+    var s_sa: [u8; _] = "(Landroid/content/Intent;)V\0"
+    var k_status: [u8; _] = "android.content.pm.extra.STATUS\0"
+    var k_msg: [u8; _] = "android.content.pm.extra.STATUS_MESSAGE\0"
+    var k_extra: [u8; _] = "android.intent.extra.INTENT\0"
+    var tag: [u8; _] = "appkit\0"
+    var l_pending: [u8; _] = "install: the system asks the user\0"
+    var l_done: [u8; _] = "install: the system answered\0"
+    var a: [u64; 2] = [0; 2]
+    let ap: u64 = (&a[0]) as u64
+    if env == 0 || intent == 0 {
+        return
+    }
+    let kin: u64 = jnicall.j_obj_class(env, intent)
+    let jk: u64 = jnicall.j_str(env, (&k_status[0]) as u64)
+    a[0] = jk
+    a[1] = 4294966297 // -999: "no status in the intent"
+    let status: i32 = jnicall.j_int(env, intent,
+        jnicall.j_method(env, kin, (&n_gie[0]) as u64, (&s_gie[0]) as u64), ap)
+    jnicall.j_del(env, jk)
+    if status == STATUS_PENDING_USER_ACTION {
+        ndk.log_write(ndk.LOG_INFO, (&tag[0]) as u64, (&l_pending[0]) as u64)
+        let jx: u64 = jnicall.j_str(env, (&k_extra[0]) as u64)
+        a[0] = jx
+        let confirm: u64 = jnicall.j_obj(env, intent,
+            jnicall.j_method(env, kin, (&n_gpe[0]) as u64, (&s_gpe[0]) as u64), ap)
+        jnicall.j_del(env, jx)
+        if confirm != 0 {
+            let kc: u64 = jnicall.j_obj_class(env, confirm)
+            a[0] = 268435456 // FLAG_ACTIVITY_NEW_TASK: a receiver has no task
+            let r: u64 = jnicall.j_obj(env, confirm,
+                jnicall.j_method(env, kc, (&n_afl[0]) as u64, (&s_afl[0]) as u64), ap)
+            jnicall.j_del(env, r)
+            jnicall.j_del(env, kc)
+            let kx: u64 = jnicall.j_obj_class(env, ctx)
+            a[0] = confirm
+            jnicall.j_void(env, ctx,
+                jnicall.j_method(env, kx, (&n_sa[0]) as u64, (&s_sa[0]) as u64), ap)
+            jnicall.j_del(env, kx)
+            jnicall.j_del(env, confirm)
+        }
+        jnicall.j_del(env, kin)
+        return
+    }
+    // a final answer: keep what Android said
+    ndk.log_write(ndk.LOG_INFO, (&tag[0]) as u64, (&l_done[0]) as u64)
+    let jm: u64 = jnicall.j_str(env, (&k_msg[0]) as u64)
+    a[0] = jm
+    let jtext: u64 = jnicall.j_obj(env, intent,
+        jnicall.j_method(env, kin, (&n_gse[0]) as u64, (&s_gse[0]) as u64), ap)
+    jnicall.j_del(env, jm)
+    var chars: u64 = 0
+    if jtext != 0 {
+        chars = jnicall.j_utf_chars(env, jtext)
+    }
+    status_file(status, chars)
+    if chars != 0 {
+        ndk.log_write(ndk.LOG_INFO, (&tag[0]) as u64, chars)
+        jnicall.j_utf_release(env, jtext, chars)
+    }
+    jnicall.j_del(env, jtext)
+    jnicall.j_del(env, kin)
+}
