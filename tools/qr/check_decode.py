@@ -204,7 +204,7 @@ try:
         tot[1] += c[1]
         tot[2] += c[2]
     print("%-10s %6d %6d %6d   (wrong payloads: %d)" % ("total", tot[0], tot[1], tot[2], wrong))
-    floors = {"clean": 1.0, "rotated": 0.97, "warped": 0.85, "blurred": 0.7, "cluttered": 0.9, "damaged": 0.9}
+    floors = {"clean": 1.0, "rotated": 0.97, "warped": 0.9, "blurred": 0.85, "cluttered": 0.97, "damaged": 0.97}
     fail = wrong > 0
     if "--floor" in sys.argv:
         for cat, c in cats.items():

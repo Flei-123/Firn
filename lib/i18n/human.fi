@@ -1,0 +1,786 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/i18n/human.fi -- the texts a user interface shows about time, size and
+// lists, in the eight languages of lib/i18n (en, de, fr, it, es, pl, cs, ru):
+//
+//     "vor 5 Minuten" / "5 minutes ago" / "in 2 Stunden"     format_relative
+//     "12,3 MB" / "12.3 MB" / "12,3 Mo"                      format_bytes
+//     "Freitag, 25. September 2026 um 15:45"                 format_datetime
+//     "57 %" / "57%"                                         format_percent
+//     "A, B und C" / "A, B, and C" / "A, B ou C"             format_list
+//     the same date in another zone                          format_in_zone
+//
+//     import i18n.human
+//     human.format_relative("de", now_ms - then_ms * -1)     // negative = in the past
+//     human.format_bytes("fr", 12345678, false)              // "12,3 Mo" (narrow no-break space)
+//     human.format_datetime("en", t, human.DATE_MEDIUM, human.TIME_SHORT) // "Sep 25, 2026, 3:45 PM"
+//
+// A FACADE over `std.time` (calendar, TZif zones) and `i18n.i18n` (plural rules,
+// numbers): all LOCALE DATA of this file -- the relative-time templates for every
+// unit and plural category, the byte units, percent, list joiners, date and time
+// patterns, weekday names -- is the generated block at the end, written by
+// tools/uiextras/gen_human.py out of ICU 72.1 (CLDR 42), and the whole file is
+// held against ICU (PyICU) by tools/uiextras/check_human.py and
+// tests/2241_human.fi.
+//
+// WHICH UNIT FOR A TIME DISTANCE (a rule of this library, not of CLDR): under 5 s
+// "now"; then seconds under a minute, minutes under an hour, hours under a day,
+// days under a week, weeks under 30 days, months of 30 days under 360 days, then
+// years of 365 days; the count is cut down (never rounded up), so "59 minutes"
+// is not "1 hour" and "23 hours" is not "1 day". The words and plural forms
+// of the chosen unit are ICU's (RelativeDateTimeFormatter.formatNumeric).
+//
+// BYTES are SI (1 kB = 1000 B, the way ICU names them and the way disks and
+// downloads are sold); `binary` counts in 1024 and writes KiB/MiB/... with the
+// number in the language's format (ICU has no localized IEC units). One decimal
+// at most, a trailing ".0" dropped, round-half-even like ICU: 2250 B is "2.2 kB".
+//
+// HONEST NOTES
+//   * Only the eight languages; any other tag formats like English (as lib/i18n).
+//   * Dates are the proleptic Gregorian calendar, Arabic digits, years 1..9999
+//     (no era), week days from std.time (Sunday = 0).
+//   * Zone NAMES ("CEST") are not given -- TZif has abbreviations, but they are
+//     not localized and not unique; the offset is ("UTC+02:00").
+//   * `format_relative` has no "yesterday"/"tomorrow" words (numeric form only);
+//     ICU's "auto" form is not reproduced.
+//   * Right-to-left languages are not in the eight; `format_list` and the others
+//     insert no direction marks.
+
+import std.rt
+import std.time
+import i18n.i18n
+
+export {
+    format_relative, format_relative_to, format_bytes, format_percent, format_list,
+    format_datetime, format_date_style, format_time, format_offset, format_in_zone,
+    weekday_name,
+    DATE_NONE, DATE_SHORT_STYLE, DATE_MEDIUM_STYLE, DATE_LONG_STYLE, DATE_FULL_STYLE,
+    TIME_NONE, TIME_SHORT, TIME_MEDIUM,
+    DATE_SHORT, DATE_MEDIUM, DATE_LONG, DATE_FULL, DATE_ISO_STYLE,
+}
+
+// date styles: the same numbers as i18n (ISO 0, SHORT 1, MEDIUM 2, LONG 3) and FULL
+const DATE_ISO_STYLE: u32 = 0
+const DATE_SHORT_STYLE: u32 = 1
+const DATE_MEDIUM_STYLE: u32 = 2
+const DATE_LONG_STYLE: u32 = 3
+const DATE_FULL_STYLE: u32 = 4
+const DATE_NONE: u32 = 9
+const DATE_SHORT: u32 = 1
+const DATE_MEDIUM: u32 = 2
+const DATE_LONG: u32 = 3
+const DATE_FULL: u32 = 4
+const TIME_NONE: u32 = 9
+const TIME_SHORT: u32 = 1
+const TIME_MEDIUM: u32 = 2
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn to_str(b: *mut rt.Buf) -> str {
+    let s: str = __str_copy(str { p: rt.buf_data(b), n: rt.buf_len(b) })
+    rt.buf_free(b)
+    return s
+}
+
+// field `k` (0-based) of a "|"-separated list
+fn field(list: str, k: u32) -> str {
+    var start: usize = 0
+    var seen: u32 = 0
+    var i: usize = 0
+    while i <= list.n {
+        if i == list.n || rt.ld8(list.p as u64, i) == 124 as u8 {
+            if seen == k {
+                return str { p: rt.ptr_of(list.p as u64 + start as u64), n: i - start }
+            }
+            seen = seen + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// `tpl` with every "{0}" replaced by `val`
+fn fill1(tpl: str, val: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < tpl.n {
+        if i + 2 < tpl.n && rt.ld8(tpl.p as u64, i) == 123 as u8 && rt.ld8(tpl.p as u64, i + 1) == 48 as u8
+            && rt.ld8(tpl.p as u64, i + 2) == 125 as u8 {
+            put(&b, val)
+            i = i + 3
+        } else {
+            rt.buf_push(&b, rt.ld8(tpl.p as u64, i))
+            i = i + 1
+        }
+    }
+    return to_str(&b)
+}
+
+// the template of a plural `cat` (0 zero .. 5 other) at field group `base * 6`;
+// a missing category falls back to "other", then to "one"
+fn pick(list: str, base: u32, cat: u32) -> str {
+    var t: str = field(list, base * 6 + cat)
+    if t.n == 0 {
+        t = field(list, base * 6 + 5)
+    }
+    if t.n == 0 {
+        t = field(list, base * 6 + 1)
+    }
+    return t
+}
+
+// i18n.format_number (held against ICU's legacy NumberFormat) groups every
+// number of 1000 and more; ICU's current NumberFormatter -- what a modern
+// interface follows -- applies CLDR's "minimumGroupingDigits": Spanish and
+// Polish group only from five integer digits on ("1234", "12 345"). This writes
+// the number the second way.
+fn num_fmt(lang: str, l: u32, v: f64, frac: u32) -> str {
+    let s: str = i18n.format_number(lang, v, frac)
+    if l != 4 && l != 5 {
+        return s
+    }
+    // the first group separator after exactly one digit (after an optional "-")
+    var i: usize = 0
+    if s.n > 0 && rt.ld8(s.p as u64, 0) == 45 as u8 {
+        i = 1
+    }
+    if i + 1 < s.n && rt.ld8(s.p as u64, i) >= 48 as u8 && rt.ld8(s.p as u64, i) <= 57 as u8 {
+        // the separator is one of "." (es) or U+00A0 (pl, two octets C2 A0)
+        let c1: u8 = rt.ld8(s.p as u64, i + 1)
+        var sep: usize = 0
+        if l == 4 && c1 == 46 as u8 {
+            sep = 1
+        }
+        if l == 5 && c1 == 194 as u8 && i + 2 < s.n && rt.ld8(s.p as u64, i + 2) == 160 as u8 {
+            sep = 2
+        }
+        if sep > 0 {
+            // four integer digits: exactly three digits follow the separator and then no digit
+            var k: usize = i + 1 + sep
+            var d: usize = 0
+            while k < s.n && rt.ld8(s.p as u64, k) >= 48 as u8 && rt.ld8(s.p as u64, k) <= 57 as u8 {
+                d = d + 1
+                k = k + 1
+            }
+            if d == 3 {
+                var b: rt.Buf = rt.buf_new()
+                var q: usize = 0
+                while q < s.n {
+                    if q == i + 1 {
+                        q = q + sep
+                    } else {
+                        rt.buf_push(&b, rt.ld8(s.p as u64, q))
+                        q = q + 1
+                    }
+                }
+                return to_str(&b)
+            }
+        }
+    }
+    return s
+}
+
+fn dec_str(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    if v < 0 {
+        rt.buf_push(&b, 45 as u8)
+    }
+    var x: i64 = v
+    if x < 0 {
+        x = 0 - x
+    }
+    var d: [u8; 20] = [0 as u8; 20]
+    var n: usize = 0
+    if x == 0 {
+        d[0] = 48 as u8
+        n = 1
+    }
+    while x > 0 {
+        d[n] = (48 + x % 10) as u8
+        n = n + 1
+        x = x / 10
+    }
+    while n > 0 {
+        n = n - 1
+        rt.buf_push(&b, d[n])
+    }
+    return to_str(&b)
+}
+
+// ------------------------------------------------------------- relative time
+
+// "5 minutes ago" / "in 5 minutes": `delta_ms` is (then - now), negative for
+// the past. See the header for the unit rule.
+fn format_relative(lang: str, delta_ms: i64) -> str {
+    let l: u32 = i18n.language_id(lang)
+    var a: i64 = delta_ms
+    var dir: u32 = 1 // future
+    if a < 0 {
+        a = 0 - a
+        dir = 0
+    }
+    if a < 5000 {
+        return data_now(l)
+    }
+    let secs: i64 = a / 1000
+    var unit: u32 = 0
+    var count: i64 = secs
+    if secs >= 60 {
+        let mins: i64 = secs / 60
+        unit = 1
+        count = mins
+        if mins >= 60 {
+            let hours: i64 = mins / 60
+            unit = 2
+            count = hours
+            if hours >= 24 {
+                let days: i64 = hours / 24
+                unit = 3
+                count = days
+                if days >= 7 {
+                    unit = 4
+                    count = days / 7
+                    if days >= 30 {
+                        unit = 5
+                        count = days / 30
+                        if days >= 360 {
+                            unit = 6
+                            count = days / 365
+                            if count < 1 {
+                                count = 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let cat: u32 = i18n.plural_category(lang, count as f64)
+    let tpl: str = pick(data_rel(l), unit * 2 + dir, cat)
+    return fill1(tpl, num_fmt(lang, l, count as f64, 0 as u32))
+}
+
+fn format_relative_to(lang: str, now_ms: i64, then_ms: i64) -> str {
+    return format_relative(lang, then_ms - now_ms)
+}
+
+// -------------------------------------------------------------------- bytes
+
+fn pow1000(k: u32) -> u64 {
+    var v: u64 = 1
+    var i: u32 = 0
+    while i < k {
+        v = v * 1000
+        i = i + 1
+    }
+    return v
+}
+
+// n / div rounded half to even, to tenths: n * 10 / div, exact
+fn tenths(n: u64, div: u64) -> u64 {
+    // n * 10 / div without overflowing: split n = q * div + r
+    let q: u64 = n / div
+    let r: u64 = n % div
+    // r * 10 / div: r < div <= 10^15 for the units used, r * 10 fits
+    let rr: u64 = r * 10
+    var t: u64 = q * 10 + rr / div
+    let rem: u64 = rr % div
+    let twice: u64 = rem * 2
+    if twice > div || (twice == div && t % 2 == 1) {
+        t = t + 1
+    }
+    return t
+}
+
+// "12.3 MB": see the header. `binary` counts in 1024 and writes IEC units.
+fn format_bytes(lang: str, n: u64, binary: bool) -> str {
+    let l: u32 = i18n.language_id(lang)
+    var unit: u32 = 0
+    var t: u64 = 0 // tenths of the unit (unit 0: the byte count itself is used)
+    if binary {
+        // powers of 1024: shift by 10 bits
+        var k: u32 = 0
+        while k < 5 && (n >> ((k as u64 + 1) * 10)) != 0 {
+            k = k + 1
+        }
+        unit = k
+        if k > 0 {
+            let div: u64 = 1 << (k as u64 * 10)
+            t = tenths(n, div)
+            if t >= 10000 && k < 5 {
+                unit = k + 1
+                t = tenths(n, 1 << (unit as u64 * 10))
+            }
+        }
+    } else {
+        var k: u32 = 0
+        while k < 5 && n >= pow1000(k + 1) {
+            k = k + 1
+        }
+        unit = k
+        if k > 0 {
+            t = tenths(n, pow1000(k))
+            if t >= 10000 && k < 5 {
+                unit = k + 1
+                t = tenths(n, pow1000(unit))
+            }
+        }
+    }
+    var frac: u32 = 0
+    if unit > 0 && t % 10 != 0 {
+        frac = 1
+    }
+    var value: f64 = (t / 10) as f64
+    if unit > 0 {
+        value = (t as f64) / 10.0
+    } else {
+        value = n as f64
+    }
+    let num: str = num_fmt(lang, l, value, frac)
+    if binary && unit > 0 {
+        var b: rt.Buf = rt.buf_new()
+        put(&b, num)
+        put(&b, " ")
+        put(&b, field("B|KiB|MiB|GiB|TiB|PiB", unit))
+        return to_str(&b)
+    }
+    var cat: u32 = 0
+    if unit == 0 {
+        cat = i18n.plural_category(lang, n as f64)
+    } else {
+        cat = i18n.plural_category_v(lang, value, frac)
+    }
+    let tpl: str = pick(data_bytes(l), unit, cat)
+    return fill1(tpl, num)
+}
+
+// ------------------------------------------------------------------ percent
+
+// `ratio` 0.57 -> "57%" (en) / "57 %" (de, with a no-break space), `frac` fraction digits
+fn format_percent(lang: str, ratio: f64, frac: u32) -> str {
+    let l: u32 = i18n.language_id(lang)
+    return fill1(data_percent(l), num_fmt(lang, l, ratio * 100.0, frac))
+}
+
+// -------------------------------------------------------------------- lists
+
+// "A, B, and C" / "A und B": `items` is the list in ONE text, the items
+// separated by the octet `sep` (a `str` cannot sit in a Vec); `or_list` joins
+// with "or". The joiners per language are `data_list_and` / `data_list_or`:
+// pair | start | middle | end of 3+.
+fn format_list(lang: str, items: str, sep: u8, or_list: bool) -> str {
+    let l: u32 = i18n.language_id(lang)
+    var j: str = data_list_and(l)
+    if or_list {
+        j = data_list_or(l)
+    }
+    // the items as views into `items`
+    var n: usize = 1
+    var i: usize = 0
+    if items.n == 0 {
+        return ""
+    }
+    while i < items.n {
+        if rt.ld8(items.p as u64, i) == sep {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    var b: rt.Buf = rt.buf_new()
+    var a: usize = 0
+    var k: usize = 0
+    i = 0
+    while i <= items.n {
+        if i == items.n || rt.ld8(items.p as u64, i) == sep {
+            put(&b, str { p: rt.ptr_of(items.p as u64 + a as u64), n: i - a })
+            if n == 2 && k == 0 {
+                put(&b, field(j, 0))
+            }
+            if n >= 3 {
+                if k + 2 == n {
+                    put(&b, field(j, 3))
+                } else {
+                    if k + 2 < n {
+                        if k == 0 {
+                            put(&b, field(j, 1))
+                        } else {
+                            put(&b, field(j, 2))
+                        }
+                    }
+                }
+            }
+            k = k + 1
+            a = i + 1
+        }
+        i = i + 1
+    }
+    return to_str(&b)
+}
+
+// -------------------------------------------------------------- date and time
+
+fn put_dec(b: *mut rt.Buf, v: i64, width: u32) {
+    var digits: [u8; 20] = [0 as u8; 20]
+    var n: u32 = 0
+    var x: i64 = v
+    if x < 0 {
+        rt.buf_push(b, 45 as u8)
+        x = 0 - x
+    }
+    while x > 0 || n == 0 {
+        digits[n as usize] = (48 + x % 10) as u8
+        x = x / 10
+        n = n + 1
+    }
+    while n < width {
+        digits[n as usize] = 48 as u8
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        rt.buf_push(b, digits[n as usize])
+    }
+}
+
+// the language's weekday name (0 = Sunday), full or abbreviated
+fn weekday_name(lang: str, wd: u32, abbr: bool) -> str {
+    let l: u32 = i18n.language_id(lang)
+    if abbr {
+        return field(data_weekdays_abbr(l), wd)
+    }
+    return field(data_weekdays(l), wd)
+}
+
+fn month_name(l: u32, m: u32, abbr: bool) -> str {
+    if abbr {
+        return field(months_abbr(l), m - 1)
+    }
+    return field(months_full(l), m - 1)
+}
+
+// Writes `t` by an ICU-style pattern: y yy M MM MMM MMMM d dd E EEE EEEE H HH h hh m mm s ss a
+// and 'quoted' text ('' is a quote).
+fn run_pattern(b: *mut rt.Buf, lang: str, l: u32, t: time.DateTime, pat: str) {
+    var i: usize = 0
+    let p: u64 = pat.p as u64
+    while i < pat.n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 39 as u8 {
+            if i + 1 < pat.n && rt.ld8(p, i + 1) == 39 as u8 {
+                rt.buf_push(b, 39 as u8)
+                i = i + 2
+                continue
+            }
+            i = i + 1
+            while i < pat.n && rt.ld8(p, i) != 39 as u8 {
+                rt.buf_push(b, rt.ld8(p, i))
+                i = i + 1
+            }
+            i = i + 1
+            continue
+        }
+        let letter: bool = (c >= 97 as u8 && c <= 122 as u8) || (c >= 65 as u8 && c <= 90 as u8)
+        if !letter {
+            rt.buf_push(b, c)
+            i = i + 1
+            continue
+        }
+        var run: u32 = 0
+        while i < pat.n && rt.ld8(p, i) == c {
+            run = run + 1
+            i = i + 1
+        }
+        if c == 121 as u8 { // y
+            if run == 2 {
+                put_dec(b, (t.year % 100) as i64, 2)
+            } else {
+                put_dec(b, t.year as i64, run)
+            }
+        } else if c == 77 as u8 { // M
+            if run >= 4 {
+                put(b, month_name(l, t.month, false))
+            } else if run == 3 {
+                put(b, month_name(l, t.month, true))
+            } else {
+                put_dec(b, t.month as i64, run)
+            }
+        } else if c == 100 as u8 { // d
+            put_dec(b, t.day as i64, run)
+        } else if c == 69 as u8 { // E
+            put(b, weekday_name(lang, time.weekday(t) % 7 as u32, run < 4))
+        } else if c == 72 as u8 { // H
+            put_dec(b, t.hour as i64, run)
+        } else if c == 104 as u8 { // h
+            var h: u32 = t.hour % 12
+            if h == 0 {
+                h = 12
+            }
+            put_dec(b, h as i64, run)
+        } else if c == 109 as u8 { // m
+            put_dec(b, t.minute as i64, run)
+        } else if c == 115 as u8 { // s
+            put_dec(b, t.second as i64, run)
+        } else if c == 97 as u8 { // a
+            if t.hour < 12 {
+                put(b, field(data_ampm(l), 0))
+            } else {
+                put(b, field(data_ampm(l), 1))
+            }
+        } else {
+            // a letter this library does not know stays as it is
+            var k: u32 = 0
+            while k < run {
+                rt.buf_push(b, c)
+                k = k + 1
+            }
+        }
+    }
+}
+
+// style 4 FULL, 3 LONG, 2 MEDIUM, 1 SHORT -> position in the pattern list
+fn date_slot(style: u32) -> u32 {
+    if style == DATE_FULL {
+        return 0
+    }
+    if style == DATE_LONG {
+        return 1
+    }
+    if style == DATE_MEDIUM {
+        return 2
+    }
+    return 3
+}
+
+// The date and/or time of `t` (its fields as they are -- the offset is the
+// caller's business) in `lang`: `dstyle` one of DATE_NONE, DATE_ISO_STYLE,
+// DATE_SHORT, DATE_MEDIUM, DATE_LONG, DATE_FULL; `tstyle` one of TIME_NONE,
+// TIME_SHORT, TIME_MEDIUM.
+fn format_datetime(lang: str, t: time.DateTime, dstyle: u32, tstyle: u32) -> str {
+    let l: u32 = i18n.language_id(lang)
+    let pats: str = data_patterns(l)
+    var b: rt.Buf = rt.buf_new()
+    if dstyle == DATE_ISO_STYLE {
+        // 2026-09-25 [15:45[:30]] -- the same in every language
+        put(&b, time.format_date(t))
+        if tstyle != TIME_NONE {
+            rt.buf_push(&b, 32 as u8)
+            if tstyle == TIME_MEDIUM {
+                run_pattern(&b, lang, l, t, "HH:mm:ss")
+            } else {
+                run_pattern(&b, lang, l, t, "HH:mm")
+            }
+        }
+        return to_str(&b)
+    }
+    if dstyle == DATE_NONE && tstyle == TIME_NONE {
+        return ""
+    }
+    if tstyle == TIME_NONE {
+        run_pattern(&b, lang, l, t, field(pats, date_slot(dstyle)))
+        return to_str(&b)
+    }
+    if dstyle == DATE_NONE {
+        var ts: u32 = 5
+        if tstyle == TIME_MEDIUM {
+            ts = 4
+        }
+        run_pattern(&b, lang, l, t, field(pats, ts))
+        return to_str(&b)
+    }
+    var ts2: u32 = 1
+    if tstyle == TIME_MEDIUM {
+        ts2 = 0
+    }
+    run_pattern(&b, lang, l, t, field(pats, 6 + date_slot(dstyle) * 2 + ts2))
+    return to_str(&b)
+}
+
+fn format_date_style(lang: str, t: time.DateTime, dstyle: u32) -> str {
+    return format_datetime(lang, t, dstyle, TIME_NONE)
+}
+
+fn format_time(lang: str, t: time.DateTime, tstyle: u32) -> str {
+    return format_datetime(lang, t, DATE_NONE, tstyle)
+}
+
+// "+02:00", "-09:30", "UTC" for 0 -> into a text like "UTC+02:00"
+fn format_offset(offset_min: i32) -> str {
+    var b: rt.Buf = rt.buf_new()
+    put(&b, "UTC")
+    if offset_min == 0 {
+        return to_str(&b)
+    }
+    var m: i64 = offset_min as i64
+    if m < 0 {
+        rt.buf_push(&b, 45 as u8)
+        m = 0 - m
+    } else {
+        rt.buf_push(&b, 43 as u8)
+    }
+    put_dec(&b, m / 60, 2)
+    rt.buf_push(&b, 58 as u8)
+    put_dec(&b, m % 60, 2)
+    return to_str(&b)
+}
+
+// The instant `ms` (since 1970, UTC) as the wall clock of a zone loaded with
+// `time.tz_load` (a TZif file such as /usr/share/zoneinfo/Europe/Vienna): the
+// offset is taken from the file at that instant (DST included, POSIX rule for
+// the far future), the fields are those of the zone, `offset_min` is set.
+// A zone that was not loaded gives UTC.
+fn format_in_zone(lang: str, tz: *mut time.Tz, ms: i64, dstyle: u32, tstyle: u32) -> str {
+    var off: i32 = 0 as i32
+    off = time.tz_offset_min(tz, ms) catch 0 as i32
+    var t: time.DateTime = time.civil_from_unix(ms + (off as i64) * 60000)
+    t.offset_min = off
+    return format_datetime(lang, t, dstyle, tstyle)
+}
+
+// month names are those of lib/i18n (CLDR format forms, genitive where the
+// language has one); written out here because i18n keeps them private
+fn months_full(l: u32) -> str {
+    if l == 0 { return "January|February|March|April|May|June|July|August|September|October|November|December" }
+    if l == 1 { return "Januar|Februar|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember" }
+    if l == 2 { return "janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre" }
+    if l == 3 { return "gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre" }
+    if l == 4 { return "enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre" }
+    if l == 5 { return "stycznia|lutego|marca|kwietnia|maja|czerwca|lipca|sierpnia|września|października|listopada|grudnia" }
+    if l == 6 { return "ledna|února|března|dubna|května|června|července|srpna|září|října|listopadu|prosince" }
+    return "января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря"
+}
+
+fn months_abbr(l: u32) -> str {
+    if l == 0 { return "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec" }
+    if l == 1 { return "Jan.|Feb.|März|Apr.|Mai|Juni|Juli|Aug.|Sept.|Okt.|Nov.|Dez." }
+    if l == 2 { return "janv.|févr.|mars|avr.|mai|juin|juil.|août|sept.|oct.|nov.|déc." }
+    if l == 3 { return "gen|feb|mar|apr|mag|giu|lug|ago|set|ott|nov|dic" }
+    if l == 4 { return "ene|feb|mar|abr|may|jun|jul|ago|sept|oct|nov|dic" }
+    if l == 5 { return "sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|lis|gru" }
+    if l == 6 { return "led|úno|bře|dub|kvě|čvn|čvc|srp|zář|říj|lis|pro" }
+    return "янв.|февр.|мар.|апр.|мая|июн.|июл.|авг.|сент.|окт.|нояб.|дек."
+}
+
+// BEGIN GENERATED (tools/uiextras/gen_human.py, ICU 72.1)
+
+// relative time: 7 units (second..year) x past/future x 6 plural categories (zero one two few many other), `{0}` = the count
+fn data_rel(l: u32) -> str {
+    if l == 1 { return "|vor {0} Sekunde||||vor {0} Sekunden||in {0} Sekunde||||in {0} Sekunden||vor {0} Minute||||vor {0} Minuten||in {0} Minute||||in {0} Minuten||vor {0} Stunde||||vor {0} Stunden||in {0} Stunde||||in {0} Stunden||vor {0} Tag||||vor {0} Tagen||in {0} Tag||||in {0} Tagen||vor {0} Woche||||vor {0} Wochen||in {0} Woche||||in {0} Wochen||vor {0} Monat||||vor {0} Monaten||in {0} Monat||||in {0} Monaten||vor {0} Jahr||||vor {0} Jahren||in {0} Jahr||||in {0} Jahren" }
+    if l == 2 { return "|il y a {0} seconde||||il y a {0} secondes||dans {0} seconde||||dans {0} secondes||il y a {0} minute||||il y a {0} minutes||dans {0} minute||||dans {0} minutes||il y a {0} heure||||il y a {0} heures||dans {0} heure||||dans {0} heures||il y a {0} jour||||il y a {0} jours||dans {0} jour||||dans {0} jours||il y a {0} semaine||||il y a {0} semaines||dans {0} semaine||||dans {0} semaines||il y a {0} mois||||il y a {0} mois||dans {0} mois||||dans {0} mois||il y a {0} an||||il y a {0} ans||dans {0} an||||dans {0} ans" }
+    if l == 3 { return "|{0} secondo fa||||{0} secondi fa||tra {0} secondo||||tra {0} secondi||{0} minuto fa||||{0} minuti fa||tra {0} minuto||||tra {0} minuti||{0} ora fa||||{0} ore fa||tra {0} ora||||tra {0} ore||{0} giorno fa||||{0} giorni fa||tra {0} giorno||||tra {0} giorni||{0} settimana fa||||{0} settimane fa||tra {0} settimana||||tra {0} settimane||{0} mese fa||||{0} mesi fa||tra {0} mese||||tra {0} mesi||{0} anno fa||||{0} anni fa||tra {0} anno||||tra {0} anni" }
+    if l == 4 { return "|hace {0} segundo||||hace {0} segundos||dentro de {0} segundo||||dentro de {0} segundos||hace {0} minuto||||hace {0} minutos||dentro de {0} minuto||||dentro de {0} minutos||hace {0} hora||||hace {0} horas||dentro de {0} hora||||dentro de {0} horas||hace {0} día||||hace {0} días||dentro de {0} día||||dentro de {0} días||hace {0} semana||||hace {0} semanas||dentro de {0} semana||||dentro de {0} semanas||hace {0} mes||||hace {0} meses||dentro de {0} mes||||dentro de {0} meses||hace {0} año||||hace {0} años||dentro de {0} año||||dentro de {0} años" }
+    if l == 5 { return "|{0} sekundę temu||{0} sekundy temu|{0} sekund temu|||za {0} sekundę||za {0} sekundy|za {0} sekund|||{0} minutę temu||{0} minuty temu|{0} minut temu|||za {0} minutę||za {0} minuty|za {0} minut|||{0} godzinę temu||{0} godziny temu|{0} godzin temu|||za {0} godzinę||za {0} godziny|za {0} godzin|||{0} dzień temu||{0} dni temu|{0} dni temu|||za {0} dzień||za {0} dni|za {0} dni|||{0} tydzień temu||{0} tygodnie temu|{0} tygodni temu|||za {0} tydzień||za {0} tygodnie|za {0} tygodni|||{0} miesiąc temu||{0} miesiące temu|{0} miesięcy temu|||za {0} miesiąc||za {0} miesiące|za {0} miesięcy|||{0} rok temu||{0} lata temu|{0} lat temu|||za {0} rok||za {0} lata|za {0} lat|" }
+    if l == 6 { return "|před {0} sekundou||před {0} sekundami||před {0} sekundami||za {0} sekundu||za {0} sekundy||za {0} sekund||před {0} minutou||před {0} minutami||před {0} minutami||za {0} minutu||za {0} minuty||za {0} minut||před {0} hodinou||před {0} hodinami||před {0} hodinami||za {0} hodinu||za {0} hodiny||za {0} hodin||před {0} dnem||před {0} dny||před {0} dny||za {0} den||za {0} dny||za {0} dní||před {0} týdnem||před {0} týdny||před {0} týdny||za {0} týden||za {0} týdny||za {0} týdnů||před {0} měsícem||před {0} měsíci||před {0} měsíci||za {0} měsíc||za {0} měsíce||za {0} měsíců||před {0} rokem||před {0} lety||před {0} lety||za {0} rok||za {0} roky||za {0} let" }
+    if l == 7 { return "|{0} секунду назад||{0} секунды назад|{0} секунд назад|||через {0} секунду||через {0} секунды|через {0} секунд|||{0} минуту назад||{0} минуты назад|{0} минут назад|||через {0} минуту||через {0} минуты|через {0} минут|||{0} час назад||{0} часа назад|{0} часов назад|||через {0} час||через {0} часа|через {0} часов|||{0} день назад||{0} дня назад|{0} дней назад|||через {0} день||через {0} дня|через {0} дней|||{0} неделю назад||{0} недели назад|{0} недель назад|||через {0} неделю||через {0} недели|через {0} недель|||{0} месяц назад||{0} месяца назад|{0} месяцев назад|||через {0} месяц||через {0} месяца|через {0} месяцев|||{0} год назад||{0} года назад|{0} лет назад|||через {0} год||через {0} года|через {0} лет|" }
+    return "|{0} second ago||||{0} seconds ago||in {0} second||||in {0} seconds||{0} minute ago||||{0} minutes ago||in {0} minute||||in {0} minutes||{0} hour ago||||{0} hours ago||in {0} hour||||in {0} hours||{0} day ago||||{0} days ago||in {0} day||||in {0} days||{0} week ago||||{0} weeks ago||in {0} week||||in {0} weeks||{0} month ago||||{0} months ago||in {0} month||||in {0} months||{0} year ago||||{0} years ago||in {0} year||||in {0} years"
+}
+
+// the word for "now"
+fn data_now(l: u32) -> str {
+    if l == 1 { return "vorgestern" }
+    if l == 2 { return "avant-hier" }
+    if l == 3 { return "l’altro ieri" }
+    if l == 4 { return "anteayer" }
+    if l == 5 { return "przedwczoraj" }
+    if l == 6 { return "předevčírem" }
+    if l == 7 { return "позавчера" }
+    return ""
+}
+
+// byte units: B kB MB GB TB PB x 6 plural categories, `{0}` = the number (ICU short width)
+fn data_bytes(l: u32) -> str {
+    if l == 1 { return "|{0}\u{A0}Byte||||{0} Byte||{0} kB||||{0} kB||{0} MB||||{0} MB||{0}\u{A0}GB||||{0}\u{A0}GB||{0} TB||||{0} TB||{0} PB||||{0} PB" }
+    if l == 2 { return "|{0}\u{202F}o||||{0}\u{202F}o||{0}\u{202F}ko||||{0}\u{202F}ko||{0}\u{202F}Mo||||{0}\u{202F}Mo||{0}\u{202F}Go||||{0}\u{202F}Go||{0}\u{202F}To||||{0}\u{202F}To||{0}\u{202F}Po||||{0}\u{202F}Po" }
+    if l == 3 { return "|{0} byte||||{0} byte||{0} kB||||{0} kB||{0} MB||||{0} MB||{0} GB||||{0} GB||{0} TB||||{0} TB||{0} PB||||{0} PB" }
+    if l == 4 { return "|{0} B||||{0} B||{0} kB||||{0} kB||{0} MB||||{0} MB||{0} GB||||{0} GB||{0} TB||||{0} TB||{0} PB||||{0} PB" }
+    if l == 5 { return "|{0} B||{0} B|{0} B|{0} B||{0} kB||{0} kB|{0} kB|{0} kB||{0} MB||{0} MB|{0} MB|{0} MB||{0} GB||{0} GB|{0} GB|{0} GB||{0} TB||{0} TB|{0} TB|{0} TB||{0} PB||{0} PB|{0} PB|{0} PB" }
+    if l == 6 { return "|{0} B||{0} B|{0} B|{0} B||{0} kB||{0} kB|{0} kB|{0} kB||{0} MB||{0} MB|{0} MB|{0} MB||{0} GB||{0} GB|{0} GB|{0} GB||{0} TB||{0} TB|{0} TB|{0} TB||{0} PB||{0} PB|{0} PB|{0} PB" }
+    if l == 7 { return "|{0} Б||{0} Б|{0} Б|{0} Б||{0} кБ||{0} кБ|{0} кБ|{0} кБ||{0} МБ||{0} МБ|{0} МБ|{0} МБ||{0} ГБ||{0} ГБ|{0} ГБ|{0} ГБ||{0} ТБ||{0} ТБ|{0} ТБ|{0} ТБ||{0} ПБ||{0} ПБ|{0} ПБ|{0} ПБ" }
+    return "|{0} byte||||{0} byte||{0} kB||||{0} kB||{0} MB||||{0} MB||{0} GB||||{0} GB||{0} TB||||{0} TB||{0} PB||||{0} PB"
+}
+
+// percent: `{0}` = the number
+fn data_percent(l: u32) -> str {
+    if l == 1 { return "{0}\u{A0}%" }
+    if l == 2 { return "{0}\u{A0}%" }
+    if l == 3 { return "{0}%" }
+    if l == 4 { return "{0}\u{A0}%" }
+    if l == 5 { return "{0}%" }
+    if l == 6 { return "{0}\u{A0}%" }
+    if l == 7 { return "{0}\u{A0}%" }
+    return "{0}%"
+}
+
+// "and" list: pair | start | middle | end(of 3+) | end(of 3)  -- the text BETWEEN items
+fn data_list_and(l: u32) -> str {
+    if l == 1 { return " und |, |, | und | und " }
+    if l == 2 { return " et |, |, | et | et " }
+    if l == 3 { return " e |, |, | e | e " }
+    if l == 4 { return " y |, |, | y | y " }
+    if l == 5 { return " i |, |, | i | i " }
+    if l == 6 { return " a\u{A0}|, |, | a\u{A0}| a\u{A0}" }
+    if l == 7 { return " и |, |, | и | и " }
+    return " and |, |, |, and |, and "
+}
+
+// "or" list, the same (from Babel: PyICU cannot ask ICU for it)
+fn data_list_or(l: u32) -> str {
+    if l == 1 { return " oder |, |, | oder | oder " }
+    if l == 2 { return " ou |, |, | ou | ou " }
+    if l == 3 { return " o |, |, | o | o " }
+    if l == 4 { return " o |, |, | o | o " }
+    if l == 5 { return " lub |, |, | lub | lub " }
+    if l == 6 { return " nebo |, |, | nebo | nebo " }
+    if l == 7 { return " или |, |, | или | или " }
+    return " or |, |, |, or |, or "
+}
+
+// date/time patterns: date FULL LONG MEDIUM SHORT | time MEDIUM SHORT | date x time (FULL, LONG, MEDIUM, SHORT) x (MEDIUM, SHORT)
+fn data_patterns(l: u32) -> str {
+    if l == 1 { return "EEEE, d. MMMM y|d. MMMM y|dd.MM.y|dd.MM.yy|HH:mm:ss|HH:mm|EEEE, d. MMMM y 'um' HH:mm:ss|EEEE, d. MMMM y 'um' HH:mm|d. MMMM y 'um' HH:mm:ss|d. MMMM y 'um' HH:mm|dd.MM.y, HH:mm:ss|dd.MM.y, HH:mm|dd.MM.yy, HH:mm:ss|dd.MM.yy, HH:mm" }
+    if l == 2 { return "EEEE d MMMM y|d MMMM y|d MMM y|dd/MM/y|HH:mm:ss|HH:mm|EEEE d MMMM y 'à' HH:mm:ss|EEEE d MMMM y 'à' HH:mm|d MMMM y 'à' HH:mm:ss|d MMMM y 'à' HH:mm|d MMM y, HH:mm:ss|d MMM y, HH:mm|dd/MM/y HH:mm:ss|dd/MM/y HH:mm" }
+    if l == 3 { return "EEEE d MMMM y|d MMMM y|d MMM y|dd/MM/yy|HH:mm:ss|HH:mm|EEEE d MMMM y 'alle' 'ore' HH:mm:ss|EEEE d MMMM y 'alle' 'ore' HH:mm|d MMMM y 'alle' 'ore' HH:mm:ss|d MMMM y 'alle' 'ore' HH:mm|d MMM y, HH:mm:ss|d MMM y, HH:mm|dd/MM/yy, HH:mm:ss|dd/MM/yy, HH:mm" }
+    if l == 4 { return "EEEE, d 'de' MMMM 'de' y|d 'de' MMMM 'de' y|d MMM y|d/M/yy|H:mm:ss|H:mm|EEEE, d 'de' MMMM 'de' y, H:mm:ss|EEEE, d 'de' MMMM 'de' y, H:mm|d 'de' MMMM 'de' y, H:mm:ss|d 'de' MMMM 'de' y, H:mm|d MMM y, H:mm:ss|d MMM y, H:mm|d/M/yy, H:mm:ss|d/M/yy, H:mm" }
+    if l == 5 { return "EEEE, d MMMM y|d MMMM y|d MMM y|d.MM.y|HH:mm:ss|HH:mm|EEEE, d MMMM y HH:mm:ss|EEEE, d MMMM y HH:mm|d MMMM y HH:mm:ss|d MMMM y HH:mm|d MMM y, HH:mm:ss|d MMM y, HH:mm|d.MM.y, HH:mm:ss|d.MM.y, HH:mm" }
+    if l == 6 { return "EEEE d. MMMM y|d. MMMM y|d. M. y|dd.MM.yy|H:mm:ss|H:mm|EEEE d. MMMM y 'v' H:mm:ss|EEEE d. MMMM y 'v' H:mm|d. MMMM y 'v' H:mm:ss|d. MMMM y 'v' H:mm|d. M. y H:mm:ss|d. M. y H:mm|dd.MM.yy H:mm:ss|dd.MM.yy H:mm" }
+    if l == 7 { return "EEEE, d MMMM y\u{202F}'г'.|d MMMM y\u{202F}'г'.|d MMM y\u{202F}'г'.|dd.MM.y|HH:mm:ss|HH:mm|EEEE, d MMMM y\u{202F}'г'. 'в' HH:mm:ss|EEEE, d MMMM y\u{202F}'г'. 'в' HH:mm|d MMMM y\u{202F}'г'. 'в' HH:mm:ss|d MMMM y\u{202F}'г'. 'в' HH:mm|d MMM y\u{202F}'г'., HH:mm:ss|d MMM y\u{202F}'г'., HH:mm|dd.MM.y, HH:mm:ss|dd.MM.y, HH:mm" }
+    return "EEEE, MMMM d, y|MMMM d, y|MMM d, y|M/d/yy|h:mm:ss\u{202F}a|h:mm\u{202F}a|EEEE, MMMM d, y 'at' h:mm:ss\u{202F}a|EEEE, MMMM d, y 'at' h:mm\u{202F}a|MMMM d, y 'at' h:mm:ss\u{202F}a|MMMM d, y 'at' h:mm\u{202F}a|MMM d, y, h:mm:ss\u{202F}a|MMM d, y, h:mm\u{202F}a|M/d/yy, h:mm:ss\u{202F}a|M/d/yy, h:mm\u{202F}a"
+}
+
+// weekday names, Sunday first
+fn data_weekdays(l: u32) -> str {
+    if l == 1 { return "Sonntag|Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag" }
+    if l == 2 { return "dimanche|lundi|mardi|mercredi|jeudi|vendredi|samedi" }
+    if l == 3 { return "domenica|lunedì|martedì|mercoledì|giovedì|venerdì|sabato" }
+    if l == 4 { return "domingo|lunes|martes|miércoles|jueves|viernes|sábado" }
+    if l == 5 { return "niedziela|poniedziałek|wtorek|środa|czwartek|piątek|sobota" }
+    if l == 6 { return "neděle|pondělí|úterý|středa|čtvrtek|pátek|sobota" }
+    if l == 7 { return "воскресенье|понедельник|вторник|среда|четверг|пятница|суббота" }
+    return "Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday"
+}
+
+// abbreviated weekday names, Sunday first
+fn data_weekdays_abbr(l: u32) -> str {
+    if l == 1 { return "So.|Mo.|Di.|Mi.|Do.|Fr.|Sa." }
+    if l == 2 { return "dim.|lun.|mar.|mer.|jeu.|ven.|sam." }
+    if l == 3 { return "dom|lun|mar|mer|gio|ven|sab" }
+    if l == 4 { return "dom|lun|mar|mié|jue|vie|sáb" }
+    if l == 5 { return "niedz.|pon.|wt.|śr.|czw.|pt.|sob." }
+    if l == 6 { return "ne|po|út|st|čt|pá|so" }
+    if l == 7 { return "вс|пн|вт|ср|чт|пт|сб" }
+    return "Sun|Mon|Tue|Wed|Thu|Fri|Sat"
+}
+
+// AM|PM
+fn data_ampm(l: u32) -> str {
+    if l == 1 { return "AM|PM" }
+    if l == 2 { return "AM|PM" }
+    if l == 3 { return "AM|PM" }
+    if l == 4 { return "a.\u{A0}m.|p.\u{A0}m." }
+    if l == 5 { return "AM|PM" }
+    if l == 6 { return "dop.|odp." }
+    if l == 7 { return "AM|PM" }
+    return "AM|PM"
+}
+// END GENERATED
