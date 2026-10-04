@@ -75,7 +75,8 @@ plat_init(start) -> appinfo_init -> update_new/update_init -> update_boot
 * a program that runs the update in a **thread** defines the dispatcher the
   language wants in the program itself:
   `fn __thread_work(kind: u64, arg: u64) -> u64 { return update.thread_dispatch(kind, arg) }`
-* the UI calls `update_start(u, OP_CHECK | OP_FETCH, RUN_AUTO)` and then
+* the UI calls `update_start(u, OP_CHECK, RUN_AUTO)` (check) or
+  `update_start(u, OP_FETCH, RUN_AUTO)` (check and download) and then
   `update_poll(u)` every frame; `update_status(u)` has the phase, progress,
   version, notes and an error code (`err_text`, `status_error`).
   `update_cancel` stops a download. `update_apply` replaces the program.
@@ -151,7 +152,7 @@ fetch     download to <exe>.new (next to the program), SHA-256 + size from
 apply     keep the old file as <exe>.old, rename the new one over the program
           (one rename), start it with --appkit-restarted
 confirm   the new program calls update_mark_healthy()
-rollback  no confirmation within update.healthy_s seconds (default 30) or the
+rollback  no confirmation within update.healthy_s seconds (default 45) or the
           new process died: the old file goes back and starts again
 ```
 
@@ -187,8 +188,10 @@ frame, read `update_status`.
 
 **Settings** (the program's `settings.json`; keys the updater reads):
 `update.auto` (check by itself, default on), `update.interval_h` (hours
-between automatic checks), `update.channel`, `update.follow_rollback`,
-`update.healthy_s`, `update.store` (another store address, e.g. a test store).
+between automatic checks, default 24), `update.channel`,
+`update.follow_rollback` (default off), `update.healthy_s` (default 45),
+`update.store` (another store address, e.g. a test store). The template adds
+`update.auto_download` (download what the automatic check finds, default off).
 
 **State** (`state.json`): `seen.revision`, `seen.timestamp`, `entry.seen`,
 `check.last`, `pending.*` (the update in flight: `state` = applied | confirmed |
@@ -241,9 +244,9 @@ channels of the store format are not implemented in the client.
 
 The store's **private key never lives in a project**: the store tool reads it
 from `$ORIENTSTORE_SCHLUESSEL` or from the store directory it publishes into.
-`tools/appkit/newapp_test.sh` generates a program, builds it, starts it under
-Xvfb (with a self-test that clicks through the pages) and runs a dry-run
-release.
+`tools/appkit/newapp_test.sh` generates a program, builds it (Linux, and the
+Android APK when the Android build tools are there), starts it under Xvfb
+(`--selftest`: 30 frames and a clean exit) and runs a dry-run release.
 
 ## 7. Platform layer
 
@@ -350,7 +353,20 @@ the same signatures and that each type-checks.
 | `tools/appkit/platforms.py` | the five platform files agree and type-check |
 | `tools/appkit/e2e.sh` | 60 checks against a local store: check (thread/process/blocking), progress, wrong hash, wrong signature, wrong key, changed catalog, expired entry, older catalog, the old catalog-only way, channels, the floor, chunked/redirect/cut-off/slow, cancel, the real replacement, confirmation, **rollback** after a crash and after a hang; `E2E_TARGET=windows` runs it under Wine |
 | `tools/appkit/android_check.sh` | on the emulator: platform and JNI locale, check, hash and signature refusals, the PackageInstaller hand-over, the user's no (status 3) and yes, the next update, a foreign key (status 5) |
-| `tools/appkit/newapp_test.sh` | generate, build, run under Xvfb, dry-run release |
+| `tools/appkit/newapp_test.sh` | generate, build (Linux, and the Android APK), run under Xvfb, dry-run release |
+| `tools/appkit/winkit.sh` + `tools/appkit/winkit/run.py` | **a kit for another machine**: a zip with the test programs, three signed catalogs and a Python script that plays the store and runs the same story (33 checks); see below |
+
+**A real Windows PC.** The end-to-end run needs bash, this tree and the store
+tool, and this server cannot put files on a Windows machine. So
+`bash tools/appkit/winkit.sh windows` makes `build/appkit-windows-kit.zip`
+(about 2.4 MB): the programs built for Windows, a store made on the spot
+(throw-away key, three signed catalogs, good for 14 days) and `run.py`. On the
+PC: unzip, `py run.py` (Python 3 is all it needs; it plays the store on
+127.0.0.1 itself and keeps every program's files in a temporary folder).
+Each check prints `ok` or `FAIL`, the exit code says it all. The same kit was
+run here under Wine (`KIT_RUNNER=wine python3 run.py`) and, built for Linux,
+on Linux (`winkit.sh linux`): 33 checks each. Windows Defender may need the
+folder allowed (unsigned test programs).
 
 `test.sh` section 76 runs the platform check, the end-to-end run and the
 generator test (the Windows run with `APPKIT_E2E_WINDOWS=1`, the Android run

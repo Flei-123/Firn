@@ -196,6 +196,9 @@ press() {  # press <regex>: tap that button if it is there
 }
 # did the receiver see "the system asks the user" since the last logcat -c?
 asked_count() { $ADB logcat -d -s appkit:I 2>/dev/null | grep -c 'the system asks the user'; }
+# A loaded software emulator makes System UI miss Android's five seconds and
+# Android asks "isn't responding": that dialog covers the one we wait for.
+anr() { press '^wait$' && echo "   (dismissed an \"isn't responding\" dialog of the emulator)"; return 0; }
 screen_text() {
     $ADB shell uiautomator dump /sdcard/appkit-ui.xml >/dev/null 2>&1
     $ADB shell cat /sdcard/appkit-ui.xml 2>/dev/null | python3 -c '
@@ -259,12 +262,19 @@ $ADB shell appops set $PKG REQUEST_INSTALL_PACKAGES deny >/dev/null 2>&1
 run_app update
 wait_for '^APPLY' 90
 expect "the APK was handed to the PackageInstaller (staged)" "$(app_out)" "APPLY 6"
-for i in $(seq 1 30); do
+for i in $(seq 1 40); do
     sleep 1
     txt=$(screen_text)
     case "$txt" in *CANCEL*|*Cancel*) break ;; esac
+    anr >/dev/null
 done
-if press '^cancel$'; then ok "the system asked and the dialog was cancelled"; else bad "no system dialog to cancel" "$(screen_text)"; fi
+cancelled=0
+for i in 1 2 3 4 5; do
+    if press '^cancel$'; then cancelled=1; break; fi
+    anr >/dev/null
+    sleep 2
+done
+if [ "$cancelled" = 1 ]; then ok "the system asked and the dialog was cancelled"; else bad "no system dialog to cancel" "$(screen_text)"; fi
 for i in $(seq 1 20); do
     $ADB shell "test -f $FILES/install-status.txt" 2>/dev/null && break
     sleep 1
@@ -287,6 +297,7 @@ for i in $(seq 1 90); do
     v=$(installed_version)
     [ "$v" = 0.2.0 ] && break
     if press '^(update|install)$'; then asked=1; fi
+    anr >/dev/null
     sleep 1
 done
 # Android decides whether to ask: an app that updates ITSELF with
@@ -317,6 +328,7 @@ for i in $(seq 1 90); do
     v=$(installed_version)
     [ "$v" = 0.2.1 ] && break
     if press '^(update|install)$'; then asked=1; fi
+    anr >/dev/null
     sleep 1
 done
 expect "Android replaced the program: 0.2.1" "$(installed_version)" "0.2.1"
@@ -335,6 +347,7 @@ expect "the other-key update downloads fine (the store signed it)" "$(app_out)" 
 for i in $(seq 1 60); do
     $ADB shell "test -f $FILES/install-status.txt" 2>/dev/null && break
     press '^(update|install)$' >/dev/null 2>&1
+    anr >/dev/null
     sleep 1
 done
 st=$($ADB shell "cat $FILES/install-status.txt 2>/dev/null" | tr -d '\r')

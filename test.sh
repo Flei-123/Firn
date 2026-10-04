@@ -1588,6 +1588,11 @@ echo "== 76. appkit: the platform files agree, and the update runs end to end ag
 python3 tools/appkit/platforms.py > "$WORK/appkit_platforms.log" 2>&1 && AKRC=0 || AKRC=$?
 bash tools/appkit/e2e.sh > "$WORK/appkit_e2e.log" 2>&1 || AKRC=1
 bash tools/appkit/newapp_test.sh > "$WORK/appkit_newapp.log" 2>&1 || AKRC=1
+# the kit for another machine (tools/appkit/winkit.sh): built for Linux and run here
+( kitdir=$(mktemp -d "${TMPDIR:-/tmp}/appkit-kit.XXXXXX") && trap 'rm -rf "$kitdir"' EXIT \
+  && bash tools/appkit/winkit.sh linux "$kitdir/kit.zip" \
+  && python3 -c "import sys,zipfile;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$kitdir/kit.zip" "$kitdir" \
+  && python3 "$kitdir/appkit-kit/run.py" ) > "$WORK/appkit_kit.log" 2>&1 || AKRC=1
 if [ "${APPKIT_E2E_WINDOWS:-0}" = "1" ]; then
     E2E_TARGET=windows bash tools/appkit/e2e.sh > "$WORK/appkit_e2e_win.log" 2>&1 || AKRC=1
 fi
@@ -1597,7 +1602,7 @@ fi
 if [ "$AKRC" -eq 0 ]; then
     ok
     tail -n 1 "$WORK/appkit_platforms.log" | sed 's/^/   /'
-    grep -E '^(appkit e2e:|newapp:|SKIP)' "$WORK/appkit_e2e.log" "$WORK/appkit_newapp.log" | sed 's/^/   /'
+    grep -E '^(appkit e2e:|newapp:|appkit kit:|SKIP)' "$WORK/appkit_e2e.log" "$WORK/appkit_newapp.log" "$WORK/appkit_kit.log" | sed 's/^/   /'
 else
     bad "tools/appkit failed (see .test-work/appkit_*.log)"
     grep -E 'FAIL' "$WORK"/appkit_*.log | head -12 | sed 's/^/   /'
