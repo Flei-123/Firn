@@ -9,6 +9,8 @@
 #   3. loads each module into a headless Chromium: the first picture has to
 #      be the native one pixel for pixel, then the page is operated with
 #      mouse and keyboard (tools/wasm/appcheck.py)
+#   4. real pointers (tools/wasm/touchcheck.py)
+#   5. the launcher kit as a page (tools/wasm/kitcheck.py)
 #
 # Needs: chromium, python3 with PIL, numpy and websocket-client.
 # Usage: bash tools/wasm/appdemo.sh      (exit 0 = all of it held)
@@ -37,6 +39,16 @@ W="$W/shots" python3 tools/wasm/appcheck.py demos/webapp "$W/ref" || fail=1
 
 echo "== 4. real pointers: touch with several fingers, mouse (r111) =="
 python3 tools/wasm/touchcheck.py demos/webapp || fail=1
+
+echo "== 5. the launcher kit (examples/fui/launcher_kit.fi) in the browser =="
+# One source, two platforms: tools/fui/kitlive.py proves the native window on an
+# Xvfb, tools/wasm/kitcheck.py the same program as a page -- sidebar, tabs,
+# tiles, toast, the dialog with its focus trap, the Markdown page and the wheel,
+# read off the browser's screenshots. The module is built into $W, not into
+# demos/webapp (it is 1 MB and nobody should have to commit it).
+"$FIRNC" --opt-level=release-safe --target=wasm32-browser \
+    -o "$W/launcher_kit.wasm" examples/fui/launcher_kit.fi || exit 1
+W="$W/shots-kit" python3 tools/wasm/kitcheck.py "$W/launcher_kit.wasm" demos/webapp || fail=1
 
 [ "$fail" = "0" ] && echo "APPDEMO PASSED" || echo "APPDEMO FAILED"
 exit $fail
