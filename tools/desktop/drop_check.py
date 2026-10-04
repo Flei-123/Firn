@@ -92,7 +92,7 @@ try:
         if not l:
             break
         got.append(l.rstrip("\n"))
-    check("GTK drag: one drop of 3 files", "DROP 3" in got, got)
+    check("GTK drag: one drop of 3 files", got.count("DROP") == 1 and len([g for g in got if g.startswith("PATH ")]) == 3, got)
     check("GTK drag: the paths, percent decoding and UTF-8 right", [g[5:] for g in got if g.startswith("PATH ")] == [host(f) for f in files], got)
     time.sleep(0.3)
 
@@ -226,14 +226,18 @@ try:
     prog.terminate()
     rest = prog.stdout.read()
     lines = got + rest.splitlines()
-    drops = [i for i, l in enumerate(lines) if l.startswith("DROP")]
+    drops = [i for i, l in enumerate(lines) if l == "DROP"]
     check("the program saw 4 drops (GTK, list, type list, last) and no more", len(drops) == 4, lines)
     chunks = []
     for i in drops:
-        chunks.append([l[5:] for l in lines[i + 1:i + 1 + int(lines[i].split()[1])] if l.startswith("PATH ")])
+        c = []
+        j = i + 1
+        while j < len(lines) and lines[j].startswith("PATH "):
+            c.append(lines[j][5:])
+            j += 1
+        chunks.append(c)
     check("drops 2-4: exactly the four local files, decoded (%20, UTF-8, %25; NUL, remote, http, comments dropped)",
           chunks[1:] == [[host(w) for w in WANT]] * 3, chunks)
-    check("DROP counts say 4 for the spec source", [lines[i] for i in drops][1:] == ["DROP 4"] * 3, [lines[i] for i in drops])
 finally:
     for p in procs[::-1]:
         try:
