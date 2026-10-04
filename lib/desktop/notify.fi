@@ -1,0 +1,369 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/desktop/notify.fi -- desktop.notify: native desktop notifications. Linux.
+//
+//     import desktop.notify
+//
+//     var n: notify.Notifier = notify.notify_open("Example")
+//     if notify.notify_ready(&n) {
+//         var note: notify.Note = notify.note_new("Download finished", "mod.jar, 4.2 MiB")
+//         note.icon = "emblem-downloads"
+//         note.actions = "open\nShow file\n"                       // key, label, key, label ...
+//         let id: u32 = notify.notify_show(&n, &note)              // 0 = not shown
+//         var ev: notify.NotifyEvent = notify.notify_event_zero()
+//         while notify.notify_poll(&n, 5000, &ev) {                // clicks and closes
+//             if ev.kind == notify.EV_ACTION && ev.id == id { ... notify.notify_event_key(&n) == "open" ... }
+//             if ev.kind == notify.EV_CLOSED { break }
+//         }
+//     }
+//     notify.notify_close_bus(&n)
+//
+// One-shot: `notify.notify_once("Example", "Title", "Text")`.
+//
+// ON LINUX the freedesktop.org Desktop Notifications Specification over
+// `net.dbus`: `org.freedesktop.Notifications.Notify` (summary, body, icon name
+// or file, actions, hints urgency/category/desktop-entry, timeout),
+// `CloseNotification`, `GetCapabilities`, `GetServerInformation`, and the signals
+// `ActionInvoked` and `NotificationClosed`. The same names exist in
+// `notify.windows.fi` (a tray balloon, which Windows 10/11 shows as a toast) and
+// in the stubs `notify_macos.fi`, `lib/@android/desktop/notify.fi`,
+// `notify_osum.fi`; `tools/desktop/platforms.py` compares the export lists.
+//
+// HONEST
+// N1  What the notification looks like is the notification daemon's business.
+//     `notify_capabilities` tells what it supports ("actions", "body-markup",
+//     "persistence" ...); actions are sent only when the server offers
+//     "actions" and ignored otherwise.
+// N2  Replies and signals are handled when the program calls `notify_poll` (or
+//     `notify_show`/`notify_close`, which read the bus while they wait). No
+//     threads: a program that never polls never hears about clicks.
+// N3  Tested against a Python implementation of the notification server
+//     (dbus-python, libdbus) on a private bus, not against GNOME/KDE's own
+//     daemons: none runs on the build machine.
+// N4  macOS and Android: macOS has `notify_macos.fi` (an UNTESTED stub: Firn
+//     has no macOS target); Android notifications exist in the window layer
+//     (`window.notify`, FIRN r64, through the Push service) and are not
+//     duplicated here; OrientOS has no notification service yet.
+import std.rt
+import std.str
+import net.dbus
+
+export {
+    Notifier, Note, NotifyEvent,
+    notify_open, notify_close_bus, notify_ready, notify_server_info, notify_capabilities,
+    notify_show, notify_close, notify_poll, notify_event_key, notify_event_zero,
+    note_new, notify_once, notify_fd,
+    EV_NONE, EV_ACTION, EV_CLOSED,
+    CLOSED_EXPIRED, CLOSED_DISMISSED, CLOSED_BY_CALL, CLOSED_UNDEFINED,
+    URGENCY_DEFAULT, URGENCY_LOW, URGENCY_NORMAL, URGENCY_CRITICAL,
+    TIMEOUT_DEFAULT, TIMEOUT_NEVER,
+}
+
+const EV_NONE: u32 = 0
+const EV_ACTION: u32 = 1 // an action (or the default action, the body) was clicked: `id`, `notify_event_key`
+const EV_CLOSED: u32 = 2 // gone: `id`, `reason`
+
+const CLOSED_EXPIRED: u32 = 1
+const CLOSED_DISMISSED: u32 = 2
+const CLOSED_BY_CALL: u32 = 3
+const CLOSED_UNDEFINED: u32 = 4
+
+const URGENCY_DEFAULT: i32 = -1
+const URGENCY_LOW: i32 = 0
+const URGENCY_NORMAL: i32 = 1
+const URGENCY_CRITICAL: i32 = 2
+
+const TIMEOUT_DEFAULT: i32 = -1
+const TIMEOUT_NEVER: i32 = 0
+
+const DEST: str = "org.freedesktop.Notifications"
+const PATH: str = "/org/freedesktop/Notifications"
+
+struct Note {
+    summary: str,
+    body: str,
+    icon: str, // an icon theme name or a file path / file:// URI; "" = none
+    actions: str, // "key\nLabel\nkey2\nLabel2\n"
+    category: str, // "email.arrived", "transfer.complete", ...
+    desktop_entry: str, // the .desktop file name without the suffix
+    urgency: i32,
+    timeout_ms: i32, // TIMEOUT_DEFAULT, TIMEOUT_NEVER or milliseconds
+    replaces: u32, // the id of a notification to update in place (0 = new)
+}
+
+fn note_new(summary: str, body: str) -> Note {
+    return Note { summary: summary, body: body, icon: "", actions: "", category: "", desktop_entry: "",
+        urgency: URGENCY_DEFAULT, timeout_ms: TIMEOUT_DEFAULT, replaces: 0 as u32 }
+}
+
+struct NotifyEvent {
+    kind: u32,
+    id: u32,
+    reason: u32,
+}
+
+fn notify_event_zero() -> NotifyEvent {
+    return NotifyEvent { kind: 0 as u32, id: 0 as u32, reason: 0 as u32 }
+}
+
+struct Notifier {
+    bus: dbus.Bus,
+    app: rt.Buf,
+    key: rt.Buf, // the action key of the last EV_ACTION
+    can_actions: bool,
+    ok: bool,
+}
+
+fn notify_open(app: str) -> Notifier {
+    var n: Notifier = Notifier { bus: dbus.bus_new(), app: rt.buf_new(), key: rt.buf_new(),
+        can_actions: false, ok: false }
+    rt.buf_push_bytes(&n.app, app.p as u64, app.length())
+    if dbus.bus_connect_session(&n.bus) {
+        dbus.bus_add_match(&n.bus, "type='signal',interface='org.freedesktop.Notifications'")
+        // is a notification server there?
+        n.ok = dbus.bus_name_owned(&n.bus, DEST)
+        if n.ok {
+            var caps: rt.Buf = rt.buf_new()
+            notify_capabilities(&n, &caps)
+            n.can_actions = has_line(&caps, "actions")
+            rt.buf_free(&caps)
+        }
+    }
+    return n
+}
+
+fn has_line(b: *mut rt.Buf, what: str) -> bool {
+    let all: str = str { p: rt.buf_data(b), n: rt.buf_len(b) }
+    var i: usize = 0
+    while i < all.length() {
+        var j: usize = i
+        while j < all.length() && all.chars(j) != 10 as u8 {
+            j = j + 1
+        }
+        if all.part(i, j - i) == what {
+            return true
+        }
+        i = j + 1
+    }
+    return false
+}
+
+fn notify_close_bus(n: *mut Notifier) {
+    dbus.bus_free(&(*n).bus)
+    rt.buf_free(&(*n).app)
+    rt.buf_free(&(*n).key)
+    (*n).ok = false
+}
+
+// Is there a bus AND a notification server?
+fn notify_ready(n: *mut Notifier) -> bool {
+    return (*n).ok && dbus.bus_is_open(&(*n).bus)
+}
+
+fn notify_fd(n: *mut Notifier) -> i32 {
+    return dbus.bus_fd(&(*n).bus)
+}
+
+// "name\nvendor\nversion\nspec version\n" of the server.
+fn notify_server_info(n: *mut Notifier, out: *mut rt.Buf) -> bool {
+    var f: dbus.Fields = dbus.fields_call(DEST, PATH, DEST, "GetServerInformation", "")
+    var reply: dbus.Msg = dbus.msg_new()
+    let rc: i32 = dbus.bus_call(&(*n).bus, &f, 0 as *mut rt.Buf, &reply, 3000)
+    var ok: bool = false
+    if rc == 0 {
+        var rd: dbus.Rd = dbus.msg_body(&reply)
+        var k: u32 = 0
+        while k < 4 as u32 {
+            let s: str = dbus.rd_str(&rd)
+            rt.buf_push_bytes(out, s.p as u64, s.length())
+            rt.buf_push(out, 10 as u8)
+            k = k + 1 as u32
+        }
+        ok = rd.ok
+    }
+    dbus.msg_free(&reply)
+    return ok
+}
+
+// The capability names, one per line, into `out`. Returns how many.
+fn notify_capabilities(n: *mut Notifier, out: *mut rt.Buf) -> usize {
+    var f: dbus.Fields = dbus.fields_call(DEST, PATH, DEST, "GetCapabilities", "")
+    var reply: dbus.Msg = dbus.msg_new()
+    let rc: i32 = dbus.bus_call(&(*n).bus, &f, 0 as *mut rt.Buf, &reply, 3000)
+    var count: usize = 0
+    if rc == 0 {
+        var rd: dbus.Rd = dbus.msg_body(&reply)
+        let end: usize = dbus.rd_array_begin(&rd, 4)
+        while dbus.rd_array_more(&rd, end) {
+            let s: str = dbus.rd_str(&rd)
+            if !rd.ok {
+                break
+            }
+            rt.buf_push_bytes(out, s.p as u64, s.length())
+            rt.buf_push(out, 10 as u8)
+            count = count + 1
+        }
+    }
+    dbus.msg_free(&reply)
+    return count
+}
+
+// Shows a notification. Returns its id, 0 when it could not be shown.
+fn notify_show(n: *mut Notifier, note: *mut Note) -> u32 {
+    if !notify_ready(n) {
+        return 0 as u32
+    }
+    var f: dbus.Fields = dbus.fields_call(DEST, PATH, DEST, "Notify", "susssasa{sv}i")
+    var body: rt.Buf = rt.buf_new()
+    dbus.w_str(&body, str { p: rt.buf_data(&(*n).app), n: rt.buf_len(&(*n).app) })
+    dbus.w_u32(&body, (*note).replaces)
+    dbus.w_str(&body, (*note).icon)
+    dbus.w_str(&body, (*note).summary)
+    dbus.w_str(&body, (*note).body)
+    // actions: as -- pairs of key, label (only when the server can show them)
+    let aat: usize = dbus.w_array_begin(&body, 4)
+    if (*n).can_actions {
+        let a: str = (*note).actions
+        var i: usize = 0
+        while i < a.length() {
+            var j: usize = i
+            while j < a.length() && a.chars(j) != 10 as u8 {
+                j = j + 1
+            }
+            dbus.w_str(&body, a.part(i, j - i))
+            i = j + 1
+        }
+    }
+    dbus.w_array_end(&body, aat, 4)
+    // hints: a{sv}
+    let hat: usize = dbus.w_array_begin(&body, 8)
+    if (*note).urgency >= 0 {
+        dbus.w_struct_begin(&body)
+        dbus.w_str(&body, "urgency")
+        dbus.w_variant(&body, "y")
+        dbus.w_byte(&body, (*note).urgency as u8)
+    }
+    if (*note).category.length() > 0 {
+        dbus.w_struct_begin(&body)
+        dbus.w_str(&body, "category")
+        dbus.w_variant(&body, "s")
+        dbus.w_str(&body, (*note).category)
+    }
+    if (*note).desktop_entry.length() > 0 {
+        dbus.w_struct_begin(&body)
+        dbus.w_str(&body, "desktop-entry")
+        dbus.w_variant(&body, "s")
+        dbus.w_str(&body, (*note).desktop_entry)
+    }
+    dbus.w_array_end(&body, hat, 8)
+    dbus.w_i32(&body, (*note).timeout_ms)
+    var reply: dbus.Msg = dbus.msg_new()
+    let rc: i32 = dbus.bus_call(&(*n).bus, &f, &body, &reply, 5000)
+    rt.buf_free(&body)
+    var id: u32 = 0 as u32
+    if rc == 0 {
+        var rd: dbus.Rd = dbus.msg_body(&reply)
+        let v: u32 = dbus.rd_u32(&rd)
+        if rd.ok {
+            id = v
+        }
+    }
+    dbus.msg_free(&reply)
+    return id
+}
+
+fn notify_close(n: *mut Notifier, id: u32) -> bool {
+    if !notify_ready(n) {
+        return false
+    }
+    var f: dbus.Fields = dbus.fields_call(DEST, PATH, DEST, "CloseNotification", "u")
+    var body: rt.Buf = rt.buf_new()
+    dbus.w_u32(&body, id)
+    var reply: dbus.Msg = dbus.msg_new()
+    let rc: i32 = dbus.bus_call(&(*n).bus, &f, &body, &reply, 3000)
+    rt.buf_free(&body)
+    dbus.msg_free(&reply)
+    return rc == 0
+}
+
+fn now_ms() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000 + (ts[1] as u64) / 1000000
+}
+
+// The action key of the last EV_ACTION event returned by `notify_poll`.
+fn notify_event_key(n: *mut Notifier) -> str {
+    return str { p: rt.buf_data(&(*n).key), n: rt.buf_len(&(*n).key) }
+}
+
+// Waits up to `ms` milliseconds (0 = look, < 0 = wait) for a click or a close
+// of a notification and fills `ev`. Also drains events that arrived while a
+// call was waiting for its reply.
+fn notify_poll(n: *mut Notifier, ms: i64, ev: *mut NotifyEvent) -> bool {
+    if !dbus.bus_is_open(&(*n).bus) {
+        return false
+    }
+    var m: dbus.Msg = dbus.msg_new()
+    let start: u64 = now_ms()
+    var left: i64 = ms
+    var got: bool = false
+    var go: bool = true
+    while go {
+        let r: i32 = dbus.bus_recv(&(*n).bus, &m, left)
+        if r != 1 {
+            go = false
+        } else {
+            if dbus.msg_is_signal(&m) && m.f.iface == DEST {
+                var rd: dbus.Rd = dbus.msg_body(&m)
+                if m.f.member == "ActionInvoked" {
+                    let id: u32 = dbus.rd_u32(&rd)
+                    let key: str = dbus.rd_str(&rd)
+                    if rd.ok {
+                        rt.buf_clear(&(*n).key)
+                        rt.buf_push_bytes(&(*n).key, key.p as u64, key.length())
+                        (*ev).kind = EV_ACTION
+                        (*ev).id = id
+                        (*ev).reason = 0 as u32
+                        got = true
+                        go = false
+                    }
+                } else if m.f.member == "NotificationClosed" {
+                    let id: u32 = dbus.rd_u32(&rd)
+                    let why: u32 = dbus.rd_u32(&rd)
+                    if rd.ok {
+                        (*ev).kind = EV_CLOSED
+                        (*ev).id = id
+                        (*ev).reason = why
+                        got = true
+                        go = false
+                    }
+                }
+            } else if dbus.msg_is_call(&m) {
+                if m.f.iface == "org.freedesktop.DBus.Peer" && m.f.member == "Ping" {
+                    dbus.bus_reply(&(*n).bus, &m, "", 0 as *mut rt.Buf)
+                } else {
+                    dbus.bus_reply_error(&(*n).bus, &m, "org.freedesktop.DBus.Error.UnknownMethod", "no methods")
+                }
+            }
+            if go && ms >= 0 {
+                let used: i64 = (now_ms() - start) as i64
+                if used >= ms {
+                    go = false
+                } else {
+                    left = ms - used
+                }
+            }
+        }
+    }
+    dbus.msg_free(&m)
+    return got
+}
+
+// One shot: show a notification and leave. true = the server accepted it.
+fn notify_once(app: str, summary: str, body: str) -> bool {
+    var n: Notifier = notify_open(app)
+    var note: Note = note_new(summary, body)
+    let id: u32 = notify_show(&n, &note)
+    notify_close_bus(&n)
+    return id != 0 as u32
+}
