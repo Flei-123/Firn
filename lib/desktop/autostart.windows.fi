@@ -1,0 +1,271 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/desktop/autostart.windows.fi -- desktop.autostart, Windows: the Run key of the user.
+//
+// The same names and meaning as lib/desktop/autostart.fi (Linux); the compiler picks this file for
+// --target=x86_64-windows. The entry is a value named `app_id` under
+// HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run whose data is the command line
+// (the program quoted when its path has blanks, each argument quoted by the C runtime's rules,
+// std.cmdline.win_quote_arg), so the shell starts the program with exactly the arguments given.
+// Nothing needs administrator rights.
+//
+// `autostart_set_in(dir, ...)` and the other `_in` functions take a registry key path under HKCU
+// in place of Linux's folder (the tests use `Software\FirnTest\Run`).
+//
+// HONEST
+// S1  `app_id` is the value's name: letters, digits, `.`, `_`, `-` only, as on Linux.
+// S2  Since Windows 8 the user can switch an entry off in Task Manager, which is recorded in
+//     HKCU\...\Explorer\StartupApproved\Run. `autostart_is_enabled` honours it (an entry with a
+//     disabled approval is not enabled); `autostart_set` deletes that approval, which is what
+//     enables the entry again. Only for the real Run key.
+// S3  Tested under Wine: the values written are read back with Wine's `reg query`, and the registered
+//     command line is run through `cmd /c`, whose C runtime splits the arguments (an independent
+//     parser: MSVCRT's, which `tools/desktop/argv_dump.c` prints). Not on a real Windows machine.
+import std.rt
+import std.str
+import std.cmdline
+
+export {
+    autostart_set, autostart_set_in, autostart_remove, autostart_remove_in, autostart_is_enabled,
+    autostart_is_enabled_in, autostart_dir, autostart_command_in, exec_quote,
+}
+
+extern fn RegCreateKeyExW(key: i64, sub: u64, res: i64, cls: u64, opt: i64, sam: i64, sec: u64, out: u64, disp: u64) -> i32;
+extern fn RegOpenKeyExW(key: i64, sub: u64, opt: i64, sam: i64, out: u64) -> i32;
+extern fn RegSetValueExW(h: i64, name: u64, res: i64, typ: i64, data: u64, cb: i64) -> i32;
+extern fn RegQueryValueExW(h: i64, name: u64, res: u64, typ: u64, data: u64, cb: u64) -> i32;
+extern fn RegDeleteValueW(h: i64, name: u64) -> i32;
+extern fn RegCloseKey(h: i64) -> i32;
+
+const HKCU: i64 = 2147483649 // 0x80000001
+const KEY_ALL: i64 = 131103 // KEY_READ | KEY_WRITE (0x2001F)
+const RUN_KEY: str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+const APPROVED_KEY: str = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
+
+fn id_ok(app_id: str) -> bool {
+    if app_id.length() == 0 || app_id.length() > 120 {
+        return false
+    }
+    var i: usize = 0
+    while i < app_id.length() {
+        let c: u8 = app_id.chars(i)
+        let ok: bool = (c >= 48 as u8 && c <= 57 as u8) || (c >= 65 as u8 && c <= 90 as u8)
+            || (c >= 97 as u8 && c <= 122 as u8) || c == 46 as u8 || c == 95 as u8 || c == 45 as u8
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return app_id.chars(0) != 46 as u8
+}
+
+fn wide(s: str, out: *mut rt.Buf) {
+    cmdline.utf8_to_utf16(s.p as u64, s.length(), out)
+    rt.buf_push(out, 0 as u8)
+    rt.buf_push(out, 0 as u8)
+}
+
+fn no_ctl(s: str) -> bool {
+    var i: usize = 0
+    while i < s.length() {
+        let c: u8 = s.chars(i)
+        if c < 32 as u8 || c == 127 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The Run key's path, `Software\Microsoft\Windows\CurrentVersion\Run`.
+fn autostart_dir(out: *mut rt.Buf) -> bool {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, RUN_KEY.p as u64, RUN_KEY.length())
+    return true
+}
+
+// One argument as the C runtime wants it (used for the program too).
+fn exec_quote(out: *mut rt.Buf, s: str) {
+    cmdline.win_quote_arg(s, out)
+}
+
+// Opens (creating when `create`) the key; 0 = failed.
+fn open_key(path: str, create: bool) -> i64 {
+    var wp: rt.Buf = rt.buf_new()
+    wide(path, &wp)
+    var h: [i64; 1] = [0]
+    var r: i32 = 0
+    if create {
+        r = RegCreateKeyExW(HKCU, rt.buf_ptr(&wp), 0, 0 as u64, 0, KEY_ALL, 0 as u64, (&h[0]) as u64, 0 as u64)
+    } else {
+        r = RegOpenKeyExW(HKCU, rt.buf_ptr(&wp), 0, KEY_ALL, (&h[0]) as u64)
+    }
+    rt.buf_free(&wp)
+    if r != 0 {
+        return 0
+    }
+    return h[0]
+}
+
+fn command_line(exe: str, args: str, out: *mut rt.Buf) -> bool {
+    if exe.length() == 0 || !no_ctl(exe) {
+        return false
+    }
+    exec_quote(out, exe)
+    var i: usize = 0
+    var more: bool = args.length() > 0
+    while more {
+        var j: usize = i
+        while j < args.length() && args.chars(j) != 10 as u8 {
+            j = j + 1
+        }
+        let a: str = args.part(i, j - i)
+        if !no_ctl(a) {
+            return false
+        }
+        rt.buf_push(out, 32 as u8)
+        exec_quote(out, a)
+        more = j < args.length()
+        i = j + 1
+    }
+    return true
+}
+
+// Makes (or replaces) the entry under the key `dir` (a path below HKCU).
+fn autostart_set_in(dir: str, app_id: str, name: str, exe: str, args: str) -> bool {
+    if !id_ok(app_id) || name.length() == 0 {
+        return false
+    }
+    var line: rt.Buf = rt.buf_new()
+    if !command_line(exe, args, &line) {
+        rt.buf_free(&line)
+        return false
+    }
+    var wl: rt.Buf = rt.buf_new()
+    wide(str { p: rt.buf_data(&line), n: rt.buf_len(&line) }, &wl)
+    rt.buf_free(&line)
+    let h: i64 = open_key(dir, true)
+    var ok: bool = false
+    if h != 0 {
+        var wn: rt.Buf = rt.buf_new()
+        wide(app_id, &wn)
+        ok = RegSetValueExW(h, rt.buf_ptr(&wn), 0, 1, rt.buf_ptr(&wl), rt.buf_len(&wl) as i64) == 0
+        rt.buf_free(&wn)
+        RegCloseKey(h)
+    }
+    rt.buf_free(&wl)
+    return ok
+}
+
+fn is_run_key(dir: str) -> bool {
+    return dir == RUN_KEY
+}
+
+// Deletes the "disabled in Task Manager" approval of an entry, if there is one.
+fn clear_approval(app_id: str) {
+    let h: i64 = open_key(APPROVED_KEY, false)
+    if h != 0 {
+        var wn: rt.Buf = rt.buf_new()
+        wide(app_id, &wn)
+        RegDeleteValueW(h, rt.buf_ptr(&wn))
+        rt.buf_free(&wn)
+        RegCloseKey(h)
+    }
+}
+
+fn autostart_set(app_id: str, name: str, exe: str, args: str) -> bool {
+    let ok: bool = autostart_set_in(RUN_KEY, app_id, name, exe, args)
+    if ok {
+        clear_approval(app_id)
+    }
+    return ok
+}
+
+// true = the entry is not there any more.
+fn autostart_remove_in(dir: str, app_id: str) -> bool {
+    if !id_ok(app_id) {
+        return false
+    }
+    let h: i64 = open_key(dir, false)
+    if h == 0 {
+        return true // no such key: no such entry
+    }
+    var wn: rt.Buf = rt.buf_new()
+    wide(app_id, &wn)
+    let r: i32 = RegDeleteValueW(h, rt.buf_ptr(&wn))
+    rt.buf_free(&wn)
+    RegCloseKey(h)
+    return r == 0 || r == 2 // ERROR_FILE_NOT_FOUND
+}
+
+fn autostart_remove(app_id: str) -> bool {
+    let ok: bool = autostart_remove_in(RUN_KEY, app_id)
+    if ok {
+        clear_approval(app_id)
+    }
+    return ok
+}
+
+// The registered command line of an entry (UTF-8) into `out`.
+fn autostart_command_in(dir: str, app_id: str, out: *mut rt.Buf) -> bool {
+    if !id_ok(app_id) {
+        return false
+    }
+    let h: i64 = open_key(dir, false)
+    if h == 0 {
+        return false
+    }
+    var wn: rt.Buf = rt.buf_new()
+    wide(app_id, &wn)
+    var data: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&data, 66000)
+    var size: [u32; 1] = [65536 as u32]
+    var typ: [u32; 1] = [0 as u32]
+    let r: i32 = RegQueryValueExW(h, rt.buf_ptr(&wn), 0 as u64, (&typ[0]) as u64, rt.buf_ptr(&data), (&size[0]) as u64)
+    rt.buf_free(&wn)
+    RegCloseKey(h)
+    var ok: bool = false
+    if r == 0 && typ[0] == 1 as u32 && size[0] >= 2 as u32 {
+        cmdline.utf16_to_utf8(rt.buf_ptr(&data), (size[0] as usize) / 2, out)
+        // the stored data ends with a zero unit
+        while rt.buf_len(out) > 0 && rt.buf_at(out, rt.buf_len(out) - 1) == 0 as u8 {
+            rt.buf_set_len(out, rt.buf_len(out) - 1)
+        }
+        ok = rt.buf_len(out) > 0
+    }
+    rt.buf_free(&data)
+    return ok
+}
+
+// Is the approval of the entry "disabled"? (First octet of the binary value: 3 = disabled by the user.)
+fn approval_disabled(app_id: str) -> bool {
+    let h: i64 = open_key(APPROVED_KEY, false)
+    if h == 0 {
+        return false
+    }
+    var wn: rt.Buf = rt.buf_new()
+    wide(app_id, &wn)
+    var data: [u8; 16] = [0; 16]
+    var size: [u32; 1] = [16 as u32]
+    var typ: [u32; 1] = [0 as u32]
+    let r: i32 = RegQueryValueExW(h, rt.buf_ptr(&wn), 0 as u64, (&typ[0]) as u64, (&data[0]) as u64, (&size[0]) as u64)
+    rt.buf_free(&wn)
+    RegCloseKey(h)
+    return r == 0 && size[0] >= 1 as u32 && (data[0] & 1 as u8) == 1 as u8
+}
+
+fn autostart_is_enabled_in(dir: str, app_id: str) -> bool {
+    var out: rt.Buf = rt.buf_new()
+    let ok: bool = autostart_command_in(dir, app_id, &out)
+    rt.buf_free(&out)
+    if !ok {
+        return false
+    }
+    if is_run_key(dir) && approval_disabled(app_id) {
+        return false
+    }
+    return true
+}
+
+fn autostart_is_enabled(app_id: str) -> bool {
+    return autostart_is_enabled_in(RUN_KEY, app_id)
+}

@@ -12,6 +12,9 @@ import std.rt
 import std.str
 import std.fs
 import std.process
+import std.env
+import std.shell
+import std.time
 import appkit.appinfo
 import appkit.platform
 import appkit.single_instance
@@ -20,18 +23,6 @@ import appkit.util
 fn arg(start: u64, i: usize) -> str {
     let p: u64 = rt.arg_ptr(start, i)
     return str { p: p as *mut u8, n: rt.c_length(p) }
-}
-
-// a start block whose environment holds APPKIT_HOME=<home>
-fn fake_start(home: str, env: *mut rt.Buf, a0: *mut [u8; 2], block: *mut [u64; 8]) {
-    util.buf_push_str(env, "APPKIT_HOME=")
-    util.buf_push_str(env, home)
-    rt.buf_push(env, 0 as u8)
-    (*block)[0] = 1
-    (*block)[1] = (&(*a0)[0]) as u64
-    (*block)[2] = 0
-    (*block)[3] = rt.buf_ptr(env)
-    (*block)[4] = 0
 }
 
 fn init_app(start: u64) -> bool {
@@ -115,17 +106,32 @@ fn main(start: u64) -> i32 {
         return second_main(start)
     }
     let me: str = arg(start, 0)
+    if !env.has("APPKIT_HOME") {
+        // the first copy runs with its own state directory: start ourselves with APPKIT_HOME set
+        var hb: rt.Buf = rt.buf_new()
+        util.buf_push_str(&hb, shell.temp_dir())
+        rt.buf_push(&hb, env.DIR_SEP)
+        util.buf_push_str(&hb, "firn_ipc_2221_")
+        rt.buf_push_dec_u64(&hb, time.monotonic_ns() / 1000 as u64)
+        let hm: str = util.buf_to_str_copy(&hb)
+        fs.remove_tree(hm) catch false
+        fs.mkdir_all(hm) catch false
+        var cmd: process.Command = process.command(me)
+        process.add_arg(&cmd, "--first")
+        process.set_env(&cmd, "APPKIT_HOME", hm)
+        let ch: process.Child = process.spawn(&cmd) catch | e | process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1,
+            done: true, code: 99, sig: 0, own: true }
+        process.command_free(&cmd)
+        var chm: process.Child = ch
+        let rc: i32 = process.wait(&chm)
+        process.close(&chm)
+        fs.remove_tree(hm) catch false
+        return rc
+    }
     var homeb: rt.Buf = rt.buf_new()
-    util.buf_push_str(&homeb, "/tmp/firn_ipc_2221_")
-    rt.buf_push_dec_i64(&homeb, syscall(39, 0, 0, 0, 0, 0, 0))
+    env.get_into("APPKIT_HOME", &homeb)
     let home: str = util.buf_to_str_copy(&homeb)
-    fs.remove_tree(home) catch false
-    fs.mkdir_all(home) catch false
-    var env: rt.Buf = rt.buf_new()
-    var a0: [u8; 2] = "t\0"
-    var block: [u64; 8] = [0; 8]
-    fake_start(home, &env, &a0, &block)
-    if !init_app((&block[0]) as u64) { return 1 }
+    if !init_app(start) { return 1 }
 
     // A
     if single_instance.single_listen() { return 2 } // not before the lock is held
@@ -144,7 +150,7 @@ fn main(start: u64) -> i32 {
     if single_instance.single_item(&msg, 3) != "" { return 10 }
     if single_instance.single_item(&msg, 4) != "--flag=1" { return 11 }
     if single_instance.single_item(&msg, 5) != "" { return 12 }
-    if single_instance.single_item(&msg, 0).length() == 0 || single_instance.single_item(&msg, 0).chars(0) != 47 as u8 { return 13 }
+    if single_instance.single_item(&msg, 0).length() == 0 { return 13 }
 
     // C
     var ch2: process.Child = spawn_second(me, home, "big", "", "", "", "")
@@ -198,10 +204,13 @@ fn main(start: u64) -> i32 {
     if rc5 != 14 { return 29 } // single_send_args reported false
 
     // F: a stale socket file
-    let stale: i32 = platform.plat_ipc_listen(epn) as i32
-    if stale < 0 { return 30 }
-    platform.plat_ipc_close(stale as i64) // closed without removing the file: a dead copy's leftover
-    if !fs.exists(epn) { return 31 }
+    if env.DIR_SEP == 47 as u8 {
+        // (a Unix socket file; a Windows pipe vanishes with its last handle, nothing is left over)
+        let stale: i32 = platform.plat_ipc_listen(epn) as i32
+        if stale < 0 { return 30 }
+        platform.plat_ipc_close(stale as i64) // closed without removing the file: a dead copy's leftover
+        if !fs.exists(epn) { return 31 }
+    }
     if !single_instance.single_listen() { return 32 }
     var ch6: process.Child = spawn_second(me, home, "args", "after stale", "", "", "")
     if !await_message(&msg) { return 33 }
@@ -210,6 +219,5 @@ fn main(start: u64) -> i32 {
     if single_instance.single_item(&msg, 1) != "after stale" { return 35 }
     single_instance.single_stop_listening()
     single_instance.single_release()
-    fs.remove_tree(home) catch false
     return 0
 }

@@ -73,6 +73,15 @@ extern fn CreateFileW(name: u64, access: i64, share: i64, sa: u64, disp: i64,
     flags: i64, tmpl: i64) -> i64;
 extern fn WriteFile(h: i64, buf: u64, n: i64, written: u64, ov: u64) -> i32;
 extern fn GetLastError() -> i32;
+extern fn ReadFile(h: i64, buf: u64, n: i64, read: u64, ov: u64) -> i32;
+extern fn PeekNamedPipe(h: i64, buf: u64, n: i64, read: u64, avail: u64, left: u64) -> i32;
+extern fn CreateNamedPipeW(name: u64, mode: i64, pmode: i64, max: i64, out: i64, inb: i64, timeout: i64, sa: u64) -> i64;
+extern fn ConnectNamedPipe(h: i64, ov: u64) -> i32;
+extern fn DisconnectNamedPipe(h: i64) -> i32;
+extern fn WaitNamedPipeW(name: u64, ms: i64) -> i32;
+extern fn SetNamedPipeHandleState(h: i64, mode: u64, maxc: u64, timeout: u64) -> i32;
+extern fn FlushFileBuffers(h: i64) -> i32;
+extern fn GetCurrentDirectoryW(n: i64, buf: u64) -> i32;
 extern fn GetEnvironmentStringsW() -> u64;
 extern fn FreeEnvironmentStringsW(p: u64) -> i32;
 extern fn GetCurrentProcessId() -> i32;
@@ -581,42 +590,191 @@ fn plat_install_hint() -> str {
 }
 
 // ------------------------------------------------- talking to a running copy
-// NOT IMPLEMENTED on this platform (WINDOWS PLACEHOLDER): no endpoint can be made, so
-// `single_listen` answers false and `single_send_*` answers false. The lock
-// and "already running" still work.
+//
+// A NAMED PIPE, `\\.\pipe\firn-instance-<hash of the lock file's path>`: one instance, byte mode,
+// remote clients refused (PIPE_REJECT_REMOTE_CLIENTS), the first creator owns the name
+// (FILE_FLAG_FIRST_PIPE_INSTANCE: a program that squats on it makes `plat_ipc_listen` fail instead of
+// being talked to). The default security of a pipe lets only its creator, the administrators and the
+// system WRITE to it, which is what keeps another user from handing a command line to this copy.
+// The listening instance is in no-wait mode so that `plat_ipc_accept` can wait with a timeout; a
+// connected instance is switched to wait mode and read with PeekNamedPipe first, so no read blocks
+// beyond the time given. One client at a time: a second one gets ERROR_PIPE_BUSY and waits for the
+// pipe (`WaitNamedPipeW`) -- the same serial behaviour as the Unix socket's accept.
+
+fn hash_name(path: str) -> u64 {
+    // two 32 bit FNV-style hashes side by side (a 64 bit product would overflow the checked arithmetic)
+    var h1: u64 = 2166136261 as u64
+    var h2: u64 = 3735928559 as u64
+    var i: usize = 0
+    while i < path.n {
+        let c: u64 = path.chars(i) as u64
+        h1 = ((h1 ^ c) * 16777619 as u64) & 4294967295 as u64
+        h2 = (((h2 ^ (c + 37 as u64)) * 2654435761 as u64) >> 3) & 4294967295 as u64
+        i = i + 1
+    }
+    return (h1 << 32) | h2
+}
 
 fn plat_ipc_name(lock: str, out: *mut rt.Buf) -> bool {
     rt.buf_clear(out)
-    return false
+    util.buf_push_str(out, "\\\\.\\pipe\\firn-instance-")
+    rt.buf_push_hex_u64(out, hash_name(lock), 16)
+    return true
 }
 
+fn pipe_wide(name: str, out: *mut rt.Buf) {
+    util.utf8_to_utf16(name.p as u64, name.n, out)
+    rt.buf_push(out, 0 as u8)
+    rt.buf_push(out, 0 as u8)
+}
+
+static mut G_PIPE_NAME: [u8; 160] = [0; 160]
+static mut G_PIPE_N: usize = 0
+
+// Creates the pipe. The handle, -1 on failure.
 fn plat_ipc_listen(name: str) -> i64 {
-    return -1
+    var w: rt.Buf = rt.buf_new()
+    pipe_wide(name, &w)
+    // PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE; PIPE_TYPE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS
+    let h: i64 = CreateNamedPipeW(rt.buf_ptr(&w), 3 | 524288, 1 | 8, 1, 4096, 65536 + 4096, 0, 0 as u64)
+    rt.buf_free(&w)
+    if h == 0 - 1 || h == 0 {
+        return -1
+    }
+    return h
 }
 
 fn plat_ipc_accept(l: i64, ms: i64) -> i64 {
-    return -2
-}
-
-fn plat_ipc_unlisten(l: i64, name: str) {
-}
-
-fn plat_ipc_connect(name: str) -> i64 {
+    var waited: i64 = 0
+    while true {
+        let r: i32 = ConnectNamedPipe(l, 0 as u64)
+        var connected: bool = r != 0
+        if !connected {
+            let e: i32 = GetLastError()
+            if e == 535 { // ERROR_PIPE_CONNECTED: the client was faster than this call
+                connected = true
+            } else if e == 232 { // ERROR_NO_DATA: the last client is still closing
+                DisconnectNamedPipe(l)
+            } else if e != 536 { // anything but ERROR_PIPE_LISTENING
+                return -2
+            }
+        }
+        if connected {
+            var mode: [u32; 1] = [0 as u32] // PIPE_WAIT
+            SetNamedPipeHandleState(l, (&mode[0]) as u64, 0 as u64, 0 as u64)
+            return l
+        }
+        if ms >= 0 && waited >= ms {
+            return -1
+        }
+        time.sleep_ms(5 as u64)
+        waited = waited + 5
+    }
     return -1
 }
 
+fn plat_ipc_unlisten(l: i64, name: str) {
+    if l >= 0 {
+        CloseHandle(l)
+    }
+}
+
+// A connection to the running copy; -1 = nobody listens.
+fn plat_ipc_connect(name: str) -> i64 {
+    var w: rt.Buf = rt.buf_new()
+    pipe_wide(name, &w)
+    var tries: u32 = 0
+    var out: i64 = -1
+    while tries < 5 as u32 {
+        // GENERIC_READ | GENERIC_WRITE, no sharing, OPEN_EXISTING
+        let h: i64 = CreateFileW(rt.buf_ptr(&w), 3221225472 as i64, 0, 0 as u64, 3, 0, 0)
+        if h != 0 - 1 && h != 0 {
+            out = h
+            tries = 99 as u32
+        } else {
+            let e: i32 = GetLastError()
+            if e == 231 { // ERROR_PIPE_BUSY: another copy is being served; wait for the pipe
+                WaitNamedPipeW(rt.buf_ptr(&w), 2000)
+                tries = tries + 1 as u32
+            } else {
+                tries = 99 as u32
+            }
+        }
+    }
+    rt.buf_free(&w)
+    return out
+}
+
+// > 0 = octets read, 0 = the other side closed, -1 = nothing within `ms`, -2 = error.
 fn plat_ipc_read(c: i64, p: u64, n: usize, ms: i64) -> i64 {
+    var waited: i64 = 0
+    while true {
+        var avail: [u32; 1] = [0 as u32]
+        if PeekNamedPipe(c, 0 as u64, 0, 0 as u64, (&avail[0]) as u64, 0 as u64) == 0 {
+            return 0 // broken pipe: the other side is gone
+        }
+        if avail[0] > 0 as u32 {
+            var got: [u32; 1] = [0 as u32]
+            var want: usize = n
+            if want > avail[0] as usize {
+                want = avail[0] as usize
+            }
+            if ReadFile(c, p, want as i64, (&got[0]) as u64, 0 as u64) == 0 {
+                return -2
+            }
+            return got[0] as i64
+        }
+        if ms >= 0 && waited >= ms {
+            return -1
+        }
+        time.sleep_ms(2 as u64)
+        waited = waited + 2
+    }
     return -2
 }
 
 fn plat_ipc_write(c: i64, p: u64, n: usize) -> bool {
-    return false
+    var done: usize = 0
+    while done < n {
+        var w: [u32; 1] = [0 as u32]
+        if WriteFile(c, p + done as u64, (n - done) as i64, (&w[0]) as u64, 0 as u64) == 0 || w[0] == 0 as u32 {
+            return false
+        }
+        done = done + w[0] as usize
+    }
+    return true
 }
 
+// Closes a connection. For the server's instance: wait until the client has read what was
+// written, then free the pipe for the next client (no-wait mode again). For a client: CloseHandle.
 fn plat_ipc_close(c: i64) {
+    if c < 0 {
+        return
+    }
+    // a server instance answers ConnectNamedPipe with "already connected"; a client handle fails
+    // DisconnectNamedPipe. Flush first in both cases: harmless for a client.
+    FlushFileBuffers(c)
+    if DisconnectNamedPipe(c) != 0 {
+        var mode: [u32; 1] = [1 as u32] // back to PIPE_NOWAIT for the next accept
+        SetNamedPipeHandleState(c, (&mode[0]) as u64, 0 as u64, 0 as u64)
+        // listen again at once, so that a client that comes before the next `plat_ipc_accept`
+        // finds a pipe that takes it (not ERROR_PIPE_BUSY)
+        ConnectNamedPipe(c, 0 as u64)
+    } else {
+        CloseHandle(c)
+    }
 }
 
 fn plat_cwd(out: *mut rt.Buf) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&b, 65536)
+    let n: i32 = GetCurrentDirectoryW(32000, rt.buf_ptr(&b))
+    if n <= 0 {
+        rt.buf_free(&b)
+        return false
+    }
     rt.buf_clear(out)
-    return false
+    util.utf16_to_utf8(rt.buf_ptr(&b), n as usize, false, out)
+    rt.buf_free(&b)
+    return true
 }
