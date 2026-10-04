@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/vfsos.fi -- the operating system half of the database file layer
+// (Linux and the other systems with POSIX calls). `vfsos.windows.fi` is
+// picked instead of this file by `--target=x86_64-windows`. Nothing in here
+// is meant to be called directly -- use `db.pager`.
+//
+// WHAT IT OFFERS (every answer is 0 or a positive count on success and a
+// NEGATIVE errno-like number on failure; `OS_BUSY` = 1 is "somebody else holds
+// a conflicting lock"):
+//   os_open / os_close            open a file read-write (create) or read-only
+//   os_read / os_write            at an absolute offset (lseek + read/write)
+//   os_sync / os_truncate / os_size
+//   os_lock / os_unlock           byte-range locks: the SAME ranges and the
+//                                 same protocol as SQLite's unix VFS, so a
+//                                 SQLite process and a Firn process on one
+//                                 file exclude each other correctly
+//   os_check_lock                 does ANOTHER process hold a write lock on a range?
+//   os_delete / os_exists / os_sync_dir / os_sleep_ms
+//
+// HONEST (V1) POSIX record locks belong to the PROCESS, not to the file
+// descriptor: a second `os_open` of the same file in one process would get
+// the lock of the first one for free, and closing either descriptor would
+// drop all locks. So this layer keeps a table of the files this process has
+// open (device and inode) and refuses a second open of the same file with
+// `OS_LOCKED` (-200). One connection per file per process; up to 64 files.
+
+import std.rt
+
+export {
+    os_open, os_close, os_read, os_write, os_sync, os_truncate, os_size,
+    os_lock, os_unlock, os_check_lock, os_delete, os_exists, os_sync_dir,
+    os_sleep_ms, os_random, os_kill_self,
+    OS_BUSY, OS_LOCKED, OS_LOCK_SHARED, OS_LOCK_EXCLUSIVE,
+}
+
+const OS_BUSY: i64 = 1
+const OS_LOCKED: i64 = -200
+const OS_LOCK_SHARED: i64 = 0
+const OS_LOCK_EXCLUSIVE: i64 = 1
+
+const SYS_READ: i64 = 0
+const SYS_WRITE: i64 = 1
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const SYS_LSEEK: i64 = 8
+const SYS_GETPID: i64 = 39
+const SYS_NANOSLEEP: i64 = 35
+const SYS_KILL: i64 = 62
+const SYS_FCNTL: i64 = 72
+const SYS_FSYNC: i64 = 74
+const SYS_FTRUNCATE: i64 = 77
+const SYS_UNLINK: i64 = 87
+const SYS_STATX: i64 = 332
+const SYS_GETRANDOM: i64 = 318
+
+const O_RDONLY_CLOEXEC: i64 = 524288 // 0x80000
+const O_RDWR_CLOEXEC: i64 = 524290 // 0x80002
+const O_RDWR_CREAT_CLOEXEC: i64 = 524354 // 0x80042
+const O_DIR: i64 = 524288
+
+const F_GETLK: i64 = 5
+const F_SETLK: i64 = 6
+const F_RDLCK: i64 = 0
+const F_WRLCK: i64 = 1
+const F_UNLCK: i64 = 2
+
+// the files of this process: device (major<<32 | minor) and inode; a slot
+// is free when open_fd is 0 (it holds fd + 1)
+static mut open_dev: [u64; 64] = [0; 64]
+static mut open_ino: [u64; 64] = [0; 64]
+static mut open_fd: [i64; 64] = [0; 64]
+
+// A `struct flock` is 32 octets: type i16 @0, whence i16 @2, start i64 @8,
+// len i64 @16, pid i32 @24.
+fn flock_call(fd: i64, cmd: i64, ltype: i64, start: i64, len: i64) -> i64 {
+    var fl: [u64; 4] = [0; 4]
+    rt.st16((&fl[0]) as u64, 0, ltype as u16)
+    rt.st16((&fl[0]) as u64, 1, 0 as u16)
+    fl[1] = start as u64
+    fl[2] = len as u64
+    let r: i64 = syscall(SYS_FCNTL, fd, cmd, (&fl[0]) as i64, 0, 0, 0)
+    return r
+}
+
+fn path_c(path: str, c: *mut rt.Buf) -> bool {
+    let n: usize = path.length()
+    if n == 0 {
+        return false
+    }
+    rt.buf_push_bytes(c, path.p as u64, n)
+    rt.buf_push(c, 0 as u8)
+    return true
+}
+
+// (device, inode) of an open descriptor through statx(fd, "", AT_EMPTY_PATH)
+fn file_id(fd: i64, dev: *mut u64, ino: *mut u64) -> bool {
+    var buf: [u64; 32] = [0; 32]
+    var empty: [u8; 1] = [0]
+    let r: i64 = syscall(SYS_STATX, fd, (&empty[0]) as i64, 4096, 2047, (&buf[0]) as i64, 0)
+    if r < 0 {
+        return false
+    }
+    *ino = buf[4]
+    let dmaj: u64 = rt.ld32((&buf[0]) as u64, 34) as u64
+    let dmin: u64 = rt.ld32((&buf[0]) as u64, 35) as u64
+    *dev = (dmaj << 32) | dmin
+    return true
+}
+
+// Opens `path` read-write (create = true makes it if needed) or read-only.
+// The answer is the descriptor, or a negative error. A file this process has
+// open already answers OS_LOCKED.
+fn os_open(path: str, create: bool, readonly: bool) -> i64 {
+    var c: rt.Buf = rt.buf_new()
+    if !path_c(path, &c) {
+        rt.buf_free(&c)
+        return -22
+    }
+    var flags: i64 = O_RDWR_CLOEXEC
+    if create {
+        flags = O_RDWR_CREAT_CLOEXEC
+    }
+    if readonly {
+        flags = O_RDONLY_CLOEXEC
+    }
+    let fd: i64 = syscall(SYS_OPEN, rt.buf_ptr(&c) as i64, flags, 420, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return fd
+    }
+    var dev: u64 = 0
+    var ino: u64 = 0
+    if file_id(fd, &dev, &ino) {
+        var slot: i64 = -1
+        var i: usize = 0
+        while i < 64 {
+            if open_dev[i] == dev && open_ino[i] == ino && open_fd[i] != 0 {
+                syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+                return OS_LOCKED
+            }
+            if open_fd[i] == 0 && slot < 0 {
+                slot = i as i64
+            }
+            i = i + 1
+        }
+        if slot < 0 {
+            syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+            return -24
+        }
+        open_dev[slot as usize] = dev
+        open_ino[slot as usize] = ino
+        open_fd[slot as usize] = fd + 1
+    }
+    return fd
+}
+
+fn os_close(fd: i64) {
+    var i: usize = 0
+    while i < 64 {
+        if open_fd[i] == fd + 1 {
+            open_fd[i] = 0
+            open_dev[i] = 0
+            open_ino[i] = 0
+        }
+        i = i + 1
+    }
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+}
+
+// Reads up to n octets at `off`; answers the count (short only at the end).
+fn os_read(fd: i64, off: u64, p: u64, n: usize) -> i64 {
+    let s: i64 = syscall(SYS_LSEEK, fd, off as i64, 0, 0, 0, 0)
+    if s < 0 {
+        return s
+    }
+    var done: usize = 0
+    while done < n {
+        let r: i64 = syscall(SYS_READ, fd, (p + done as u64) as i64, (n - done) as i64, 0, 0, 0)
+        if r < 0 {
+            return r
+        }
+        if r == 0 {
+            break
+        }
+        done = done + r as usize
+    }
+    return done as i64
+}
+
+// Writes all n octets at `off`; 0 or a negative error.
+fn os_write(fd: i64, off: u64, p: u64, n: usize) -> i64 {
+    let s: i64 = syscall(SYS_LSEEK, fd, off as i64, 0, 0, 0, 0)
+    if s < 0 {
+        return s
+    }
+    var done: usize = 0
+    while done < n {
+        let r: i64 = syscall(SYS_WRITE, fd, (p + done as u64) as i64, (n - done) as i64, 0, 0, 0)
+        if r < 0 {
+            return r
+        }
+        if r == 0 {
+            return -28
+        }
+        done = done + r as usize
+    }
+    return 0
+}
+
+fn os_sync(fd: i64) -> i64 {
+    return syscall(SYS_FSYNC, fd, 0, 0, 0, 0, 0)
+}
+
+fn os_truncate(fd: i64, size: u64) -> i64 {
+    return syscall(SYS_FTRUNCATE, fd, size as i64, 0, 0, 0, 0)
+}
+
+fn os_size(fd: i64) -> i64 {
+    return syscall(SYS_LSEEK, fd, 0, 2, 0, 0, 0)
+}
+
+// A byte-range lock without waiting. kind: OS_LOCK_SHARED / OS_LOCK_EXCLUSIVE.
+// 0 = got it, OS_BUSY = somebody else holds a conflicting lock.
+fn os_lock(fd: i64, kind: i64, start: u64, len: u64) -> i64 {
+    var t: i64 = F_RDLCK
+    if kind == OS_LOCK_EXCLUSIVE {
+        t = F_WRLCK
+    }
+    let r: i64 = flock_call(fd, F_SETLK, t, start as i64, len as i64)
+    if r == 0 {
+        return 0
+    }
+    if r == -11 || r == -13 {
+        return OS_BUSY
+    }
+    return r
+}
+
+fn os_unlock(fd: i64, start: u64, len: u64) -> i64 {
+    return flock_call(fd, F_SETLK, F_UNLCK, start as i64, len as i64)
+}
+
+// Does another process hold a write lock that overlaps the range?
+fn os_check_lock(fd: i64, start: u64, len: u64) -> bool {
+    var fl: [u64; 4] = [0; 4]
+    rt.st16((&fl[0]) as u64, 0, F_WRLCK as u16)
+    fl[1] = start
+    fl[2] = len
+    let r: i64 = syscall(SYS_FCNTL, fd, F_GETLK, (&fl[0]) as i64, 0, 0, 0)
+    if r < 0 {
+        return false
+    }
+    return rt.ld16((&fl[0]) as u64, 0) != F_UNLCK as u16
+}
+
+fn os_delete(path: str) -> i64 {
+    var c: rt.Buf = rt.buf_new()
+    if !path_c(path, &c) {
+        rt.buf_free(&c)
+        return -22
+    }
+    let r: i64 = syscall(SYS_UNLINK, rt.buf_ptr(&c) as i64, 0, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    return r
+}
+
+fn os_exists(path: str) -> bool {
+    var c: rt.Buf = rt.buf_new()
+    if !path_c(path, &c) {
+        rt.buf_free(&c)
+        return false
+    }
+    let fd: i64 = syscall(SYS_OPEN, rt.buf_ptr(&c) as i64, O_RDONLY_CLOEXEC, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return false
+    }
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return true
+}
+
+// Flushes a directory so a create/delete inside it survives a power cut.
+fn os_sync_dir(path: str) -> i64 {
+    var c: rt.Buf = rt.buf_new()
+    if !path_c(path, &c) {
+        rt.buf_free(&c)
+        return -22
+    }
+    let fd: i64 = syscall(SYS_OPEN, rt.buf_ptr(&c) as i64, O_DIR, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return fd
+    }
+    let r: i64 = syscall(SYS_FSYNC, fd, 0, 0, 0, 0, 0)
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return r
+}
+
+fn os_sleep_ms(ms: i64) {
+    var ts: [i64; 2] = [ms / 1000, (ms % 1000) * 1000000]
+    syscall(SYS_NANOSLEEP, (&ts[0]) as i64, 0, 0, 0, 0, 0)
+}
+
+// n random octets (the journal nonce); false if the system has none
+fn os_random(p: u64, n: usize) -> bool {
+    let r: i64 = syscall(SYS_GETRANDOM, p as i64, n as i64, 0, 0, 0, 0)
+    return r == n as i64
+}
+
+// SIGKILL to ourselves: what a power cut does to the process (tests).
+fn os_kill_self() {
+    let pid: i64 = syscall(SYS_GETPID, 0, 0, 0, 0, 0, 0)
+    syscall(SYS_KILL, pid, 9, 0, 0, 0, 0)
+}
