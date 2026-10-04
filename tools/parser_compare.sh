@@ -72,7 +72,13 @@ while IFS= read -r f; do
         noncore=$((noncore+1))
         continue
     fi
-    if [ "$rc" -eq 0 ] && cmp -s "$TMPD"/parv_a.txt "$TMPD"/parv_b.txt; then
+    # `_fsegNN` are temporaries the parser names after a running node count (text
+    # interpolation); the count differs wherever the two parsers build a different
+    # NUMBER of helper nodes for the same tree (e.g. `__include_str`). The tree
+    # itself is compared exactly, only these names are numbered alike.
+    sed -E 's/_fseg[0-9]+/_fseg#/g' "$TMPD"/parv_a.txt > "$TMPD"/parv_a.n
+    sed -E 's/_fseg[0-9]+/_fseg#/g' "$TMPD"/parv_b.txt > "$TMPD"/parv_b.n
+    if [ "$rc" -eq 0 ] && cmp -s "$TMPD"/parv_a.n "$TMPD"/parv_b.n; then
         same=$((same+1))
         continue
     fi

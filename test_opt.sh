@@ -163,7 +163,9 @@ done <<< "$PATTERNS"
 # ------------------------------------------------------------------ (e) ---
 echo "== Registerzuteilung im Assembler =="
 ASM="$WORK/regalloc_loop.s"
-"$FIRNC" $LVL --emit=asm -o "$ASM" tests/opt/regalloc_loop.fi
+# FIRN_KEEP_ALL=1: `sum` is inlined into `main` at this level and the x86 pruning would drop the now
+# unreachable copy whose loop block this check reads
+FIRN_KEEP_ALL=1 "$FIRNC" $LVL --emit=asm -o "$ASM" tests/opt/regalloc_loop.fi
 BODY=$(awk '/^\.Lsum__bb2:/{f=1;next} /^\.Lsum__bb3:/{f=0} f' "$ASM")
 if [ -z "$BODY" ]; then
     bad "regalloc: Schleifenblock .Lsum__bb2 nicht gefunden"
