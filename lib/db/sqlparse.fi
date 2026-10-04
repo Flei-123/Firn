@@ -409,6 +409,9 @@ fn parse_primary(ps: *mut Parser) -> DbError!i32 {
     if k == tk.TK_INT {
         let n: i32 = try mk(ps, ax.N_INT)
         (*ax.ast_n((*ps).ast, n)).ival = (*t).ival
+        if (*t).esc {
+            (*ax.ast_n((*ps).ast, n)).flag = 2
+        }
         advance(ps)
         return n
     }
@@ -511,6 +514,7 @@ fn parse_primary(ps: *mut Parser) -> DbError!i32 {
             }
             if code == tk.K_TRUE || code == tk.K_FALSE {
                 let n: i32 = try mk(ps, ax.N_INT)
+                (*ax.ast_n((*ps).ast, n)).flag = 1
                 if code == tk.K_TRUE {
                     (*ax.ast_n((*ps).ast, n)).ival = 1
                 }
@@ -557,13 +561,30 @@ fn parse_primary(ps: *mut Parser) -> DbError!i32 {
                 return unsupported("CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP")
             }
             if code != 0 && hard_reserved(code) {
-                return syntax(ps)
+                // LIKE( and GLOB( are also function names
+                var fn_ok: bool = false
+                if code == tk.K_LIKE || code == tk.K_GLOB {
+                    let sl: tk.Lexer = (*ps).lx
+                    var nt: tk.Token = (*ps).tok
+                    tk.lex_next(&(*ps).lx, &nt)
+                    fn_ok = nt.kind == tk.TK_OP && nt.code == tk.P_LPAREN
+                    (*ps).lx = sl
+                }
+                if !fn_ok {
+                    return syntax(ps)
+                }
             }
         }
         // a name: column, table.column or a function call
         var p1: u64 = 0
         var n1: usize = 0
-        try parse_name(ps, &p1, &n1)
+        if !(*t).quoted && (code == tk.K_LIKE || code == tk.K_GLOB) {
+            p1 = (*t).p
+            n1 = (*t).n
+            advance(ps)
+        } else {
+            try parse_name(ps, &p1, &n1)
+        }
         if is_op(ps, tk.P_LPAREN) {
             advance(ps)
             let f: i32 = try mk(ps, ax.N_FUNC)
@@ -642,7 +663,7 @@ fn hex_val(c: u8) -> u32 {
     return (c as u32) - 65 + 10
 }
 
-fn parse_unary(ps: *mut Parser) -> DbError!i32 {
+fn parse_unary(ps: *mut Parser, negated: bool) -> DbError!i32 {
     (*ps).depth = (*ps).depth + 1
     if (*ps).depth > 200 {
         return dberr.fail(DbError::TooBig, "expression tree is too deep")
@@ -651,14 +672,17 @@ fn parse_unary(ps: *mut Parser) -> DbError!i32 {
     if is_op(ps, tk.P_MINUS) || is_op(ps, tk.P_PLUS) || is_op(ps, tk.P_TILDE) {
         let c: u32 = (*ps).tok.code
         advance(ps)
-        let e: i32 = try parse_unary(ps)
+        let e: i32 = try parse_unary(ps, c == tk.P_MINUS)
         // -literal folds into the literal
         let en: *mut ax.Node = ax.ast_n((*ps).ast, e)
-        if c == tk.P_MINUS && (*en).kind == ax.N_INT && (*en).ival != 0 - 9223372036854775807 - 1 {
+        if c == tk.P_MINUS && (*en).kind == ax.N_INT && (*en).flag == 2 {
+            (*en).flag = 0
+            r = e
+        } else if c == tk.P_MINUS && (*en).kind == ax.N_INT && (*en).ival != 0 - 9223372036854775807 - 1 {
             (*en).ival = 0 - (*en).ival
             r = e
         } else if c == tk.P_MINUS && (*en).kind == ax.N_REAL {
-            (*en).fval = 0.0 - (*en).fval
+            (*en).fval = -(*en).fval
             r = e
         } else {
             let n: i32 = try mk(ps, ax.N_UNARY)
@@ -676,6 +700,13 @@ fn parse_unary(ps: *mut Parser) -> DbError!i32 {
     } else {
         let p: i32 = try parse_primary(ps)
         r = p
+        let pn: *mut ax.Node = ax.ast_n((*ps).ast, p)
+        if (*pn).kind == ax.N_INT && (*pn).flag == 2 && !negated {
+            // 9223372036854775808 without a minus sign is a REAL
+            (*pn).kind = ax.N_REAL
+            (*pn).flag = 0
+            (*pn).fval = 9223372036854775808.0
+        }
     }
     // postfix COLLATE
     while is_kw(ps, tk.K_COLLATE) {
@@ -855,7 +886,7 @@ fn parse_expr(ps: *mut Parser, minp: u32) -> DbError!i32 {
         (*nn).a = e
         left = n
     } else {
-        let u: i32 = try parse_unary(ps)
+        let u: i32 = try parse_unary(ps, false)
         left = u
     }
     while true {
@@ -1559,7 +1590,7 @@ fn parse_default_value(ps: *mut Parser) -> DbError!i32 {
         return e
     }
     if is_op(ps, tk.P_PLUS) || is_op(ps, tk.P_MINUS) {
-        let u: i32 = try parse_unary(ps)
+        let u: i32 = try parse_unary(ps, false)
         return u
     }
     if (*ps).tok.kind == tk.TK_INT || (*ps).tok.kind == tk.TK_FLOAT || (*ps).tok.kind == tk.TK_STR
@@ -2051,7 +2082,7 @@ fn parse_stmt_inner(ps: *mut Parser) -> DbError!i32 {
                 advance(ps)
                 (*ax.ast_n((*ps).ast, s)).a = n
             } else {
-                let e: i32 = try parse_unary(ps)
+                let e: i32 = try parse_unary(ps, false)
                 (*ax.ast_n((*ps).ast, s)).a = e
             }
             if paren {
