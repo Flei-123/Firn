@@ -66,7 +66,8 @@ def lines(path):
 
 try:
     # ---- a program without any shell: the shell refuses the icon
-    f0 = os.path.join(td, "noshell.out")
+    subprocess.run(["wineserver", "-k"], env=env)       # no explorer left over from an earlier check
+    time.sleep(1.5)
     r = subprocess.run(["wine", tray_exe], capture_output=True, text=True, env=env, timeout=60)
     check("without a shell tray the program learns it (SHOWN no)", "SHOWN no" in r.stdout, (r.stdout, r.stderr[-200:]))
     subprocess.run(["wineserver", "-k"], env=env)
