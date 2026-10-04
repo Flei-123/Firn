@@ -269,6 +269,15 @@ S = ["CREATE TABLE u(k TEXT PRIMARY KEY, n INTEGER DEFAULT 0, note TEXT)",
      "SELECT * FROM u ORDER BY k"]
 scenario("upsert", S, True)
 
+# DEFAULT CURRENT_TIMESTAMP and friends
+S = ["CREATE TABLE ts(id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP, d TEXT DEFAULT CURRENT_DATE, t TEXT DEFAULT CURRENT_TIME, n INTEGER DEFAULT (strftime('%s', 'now')))",
+     "INSERT INTO ts DEFAULT VALUES",
+     "INSERT INTO ts(id) VALUES (5), (6)",
+     "SELECT id, typeof(at), length(at), at LIKE '____-__-__ __:__:__', length(d), d = date(at), length(t), t = time(at), typeof(n), abs(n - strftime('%s', 'now')) < 5 FROM ts ORDER BY id",
+     "SELECT date('now') = CURRENT_DATE, datetime('now', 'localtime') IS NOT NULL, julianday('now') > 2460000",
+     "UPDATE ts SET at = 'x', d = 'y', t = 'z', n = 0"]
+scenario("current timestamp defaults", S, True)
+
 # a random workload
 S = ["CREATE TABLE r(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL)",
      "CREATE INDEX r_a ON r(a)", "CREATE UNIQUE INDEX r_b ON r(b)", "CREATE INDEX r_ac ON r(a, c)"]
