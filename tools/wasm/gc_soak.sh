@@ -20,7 +20,11 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 export FIRNLIB="$(pwd)/lib"
 FIRNC=${FIRNC:-compiler/target/release/firnc}
-W=${W:-/tmp/firn-wasm-gc-soak}
+# an own work directory per run (parallel workers shared the fixed /tmp name); removed at the end unless W= is given
+if [ -z "${W:-}" ]; then
+    W=$(mktemp -d "${TMPDIR:-/tmp}/firn-wasm-gc-soak.XXXXXX")
+    trap 'rm -rf "$W"' EXIT
+fi
 mkdir -p "$W"
 fail=0
 
