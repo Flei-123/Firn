@@ -59,7 +59,7 @@ export {
     pager_set_busy, pager_set_sync, pager_stmt_begin, pager_stmt_end,
     pager_stmt_rollback, pager_in_write, pager_page_count, pager_usable,
     pager_page_size, pager_init_new, pager_set_max_pages, pager_freelist_count,
-    pager_purge_cache, pager_is_open, pager_header_valid,
+    pager_purge_cache, pager_is_open, pager_header_valid, pager_set_cache_size,
     PAGER_PENDING_BYTE, PAGER_MAX_PAGE_SIZE,
 }
 
@@ -1357,8 +1357,13 @@ fn pager_end_read(pg: *mut Pager) {
     }
 }
 
-// Needs a read transaction. Takes the RESERVED lock: from now on nobody
-// else can write; readers still can, until the commit.
+// Takes the RESERVED lock (starting the read transaction if there is none): from now on
+// nobody else can write; readers still can, until the commit.
+//
+// DEADLOCK RULE (SQLite's too): a connection that holds a SHARED lock and waits for
+// RESERVED would keep the writer that holds RESERVED from getting EXCLUSIVE. So when the
+// transaction starts from nothing, a busy RESERVED lock means: give the SHARED lock back,
+// wait, start again. When a read transaction is open already the answer is Busy at once.
 fn pager_begin_write(pg: *mut Pager) -> DbError!bool {
     if (*pg).state == 2 {
         return true
@@ -1369,18 +1374,36 @@ fn pager_begin_write(pg: *mut Pager) -> DbError!bool {
     if (*pg).nowrite {
         return dberr.fail(DbError::Unsupported, "auto-vacuum databases are read only here")
     }
-    var started: bool = false
-    if (*pg).state == 0 {
-        try pager_begin_read(pg)
-        started = true
-    }
-    let r: DbError!bool = lock_wait(pg, LOCK_RESERVED)
-    let r_ok: bool = r catch false
-    if !r_ok {
-        if started {
-            pager_end_read(pg)
+    var waited: i64 = 0
+    var step: i64 = 1
+    var fresh: bool = (*pg).state == 0
+    while true {
+        if (*pg).state == 0 {
+            try pager_begin_read(pg)
         }
-        return r
+        let r: i64 = lock_try_reserved(pg)
+        if r == 0 {
+            (*pg).lock = LOCK_RESERVED
+            break
+        }
+        if r != vfsos.OS_BUSY {
+            if fresh {
+                pager_end_read(pg)
+            }
+            return os_fail(r, "cannot lock the database file")
+        }
+        if !fresh || waited >= (*pg).busy_ms {
+            if fresh {
+                pager_end_read(pg)
+            }
+            return dberr.fail(DbError::Busy, "database is locked")
+        }
+        pager_end_read(pg)
+        vfsos.os_sleep_ms(step)
+        waited = waited + step
+        if step < 50 {
+            step = step * 2
+        }
     }
     (*pg).state = 2
     (*pg).orig_pages = (*pg).db_pages
@@ -1500,4 +1523,14 @@ fn pager_rollback(pg: *mut Pager) -> DbError!bool {
         return dberr.fail(DbError::Io, "rollback failed: the journal could not be replayed")
     }
     return true
+}
+
+// A new cache size in pages. While no transaction is open the cache is dropped and
+// made again at the next one; during one the new size is used from then on.
+fn pager_set_cache_size(pg: *mut Pager, n: usize) {
+    (*pg).cache_req = n
+    if (*pg).state == 0 && (*pg).cache_mem != 0 {
+        cache_free(pg)
+        (*pg).have_header = false
+    }
 }
