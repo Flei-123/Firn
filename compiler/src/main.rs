@@ -6,6 +6,7 @@
 //! `as` and `ld` get used EXCLUSIVELY as assembler/linker.
 
 mod abi;
+mod archsel;
 mod ast;
 mod ast_canon;
 mod layout_canon;
@@ -906,6 +907,9 @@ fn run(opts: &Options) -> i32 {
     }
 
     tm.mark("comptime");
+    // --- #[arch(...)]: keep the definitions of the active machine only.
+    // Before anything looks at a type or a register name (archsel.rs).
+    archsel::select(&mut prog, &mut dg);
     // --- Monomorphization of generic templates (module types) ---
     mono::expand(&mut prog, &mut dg);
     tm.mark("mono");

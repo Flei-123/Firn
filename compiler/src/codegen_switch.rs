@@ -184,7 +184,9 @@ fn emit_table(
         }
         k += 1;
     }
-    e.raw(".text");
+    // With function sections the function lives in `.text.<name>`:
+    // `.previous` returns there (and to `.text` otherwise).
+    e.raw(if crate::codegen_x86::function_sections() { ".previous" } else { ".text" });
 }
 
 /// Unique label for a table inside the output.
