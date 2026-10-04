@@ -1621,6 +1621,8 @@ if [ "$ASRC" -eq 0 ]; then
 else
     bad "tools/async/run.sh failed (see .test-work/async.log)"
     grep -E 'FAIL' "$WORK/async.log" | head -12 | sed 's/^/   /'
+fi
+
 echo "== 78. packaging: installers, packages, icons (tools/pack/, lib/pack/, docs/PACKAGING.md) =="
 # lib/pack's unit tests are in tests/2200-2203 (section 3): the shortcut writer, the icon formats, the
 # installer payload, a whole install / upgrade / uninstall without Windows. Here: tools/pack/test/run.sh
@@ -1662,6 +1664,9 @@ else
     grep -E 'FAIL|DIFF|Traceback|Error' "$WORK/qr_run.log" "$WORK/uiextras_run.log" | head -12 | sed 's/^/   /'
 echo "== 77. downloads and sign-in: net.download, auth.jose/oauth/msa, appkit.fleitec_login (tools/download/, tools/oauth/) =="
 echo "== 78. downloads and sign-in: net.download, auth.jose/oauth/msa, appkit.fleitec_login (tools/download/, tools/oauth/) =="
+fi
+
+echo "== 79. downloads and sign-in: net.download, auth.jose/oauth/msa, appkit.fleitec_login (tools/download/, tools/oauth/) =="
 # tests/2140 (download manager against an in-process server), tests/2150-2153 (JWT against tokens signed
 # by Python's cryptography, OAuth units, the Microsoft chain's bodies, Sign in with Fleitec-ID against
 # an in-process ID server) are in section 3. Here: the Python-side servers that misbehave on purpose.
