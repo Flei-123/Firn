@@ -1,0 +1,2137 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/btree.fi -- the B-trees of the SQLite 3 file format: table trees
+// (key = rowid, all rows in the leaves) and index trees (key = a record, entries
+// in leaves AND interior pages), read and WRITE, with overflow pages.
+//
+// The page layout, cell formats and the overflow rules are the file format's
+// (https://www.sqlite.org/fileformat2.html): page types 2 / 5 / 10 / 13, cell
+// pointer array growing down from the header, cell content growing up from the
+// end of the page, a cell is at least 4 octets, payloads that do not fit are
+// continued on overflow pages.
+//
+// HOW IT WRITES
+//   * a cell goes into a page if there is room (after a defragmentation if the
+//     free space is scattered); a page is always left COMPACT by this library
+//     (no free blocks of its own making);
+//   * a page that overflows, or falls below a third full, is BALANCED with up
+//     to two neighbours: all their cells (and the divider cells of the parent)
+//     are gathered, laid out again on the fewest pages, and the new dividers
+//     go to the parent, which may itself overflow or underflow, up to the root
+//     (a root that overflows gets a new level, a root with one child loses one);
+//   * deleting from an index page that is not a leaf swaps in the predecessor.
+//
+// HONEST NOTES
+//   B1 A page that overflows is rebuilt from a list of cells in memory; the
+//      work per balance is a few page copies. Sequential appends take the
+//      cheap path (the cell goes in at the end) and balance once per page.
+//   B2 THE ROOT PAGE NUMBER of a tree never changes (the schema stores it).
+//   B3 Interior key choice: a table divider is the largest rowid of the left
+//      page (what SQLite does); an index divider is the entry itself (moved
+//      up, as the format requires).
+//   B4 Depth limit 20 like SQLite; deeper (or a cycle) is `Corrupt`.
+//   B5 Hostile pages: every cell offset, size, child number and overflow
+//      chain is checked before use; a cycle or a chain longer than the file
+//      is `Corrupt`, never a loop or a crash.
+
+import std.rt
+import db.dberr
+import db.util
+import db.pager
+import db.record
+
+export {
+    Bt, Cursor, Payload, bt_new, bt_free, cur_new, cur_valid,
+    bt_create, bt_clear, bt_drop,
+    bt_first, bt_last, bt_next, bt_prev, bt_table_seek, bt_index_seek,
+    bt_rowid, bt_payload, bt_table_insert, bt_table_delete, bt_index_insert,
+    bt_index_delete, bt_max_rowid, bt_table_find, bt_count,
+    bt_check, CheckStats, bt_page_flags_ok,
+    SEEK_GE, SEEK_GT, MAX_DEPTH,
+}
+
+const MAX_DEPTH: usize = 20
+
+// Local copies of the byte helpers: the compiler does not inline across modules.
+#[inline]
+fn b8(p: u64, off: usize) -> u64 {
+    return (*((p + off as u64) as *mut u8)) as u64
+}
+
+#[inline]
+fn b16(p: u64, off: usize) -> u64 {
+    return ((*((p + off as u64) as *mut u8)) as u64) << 8 | ((*((p + (off + 1) as u64) as *mut u8)) as u64)
+}
+
+#[inline]
+fn b32(p: u64, off: usize) -> u64 {
+    return ((*((p + off as u64) as *mut u8)) as u64) << 24 | ((*((p + (off + 1) as u64) as *mut u8)) as u64) << 16
+        | ((*((p + (off + 2) as u64) as *mut u8)) as u64) << 8 | ((*((p + (off + 3) as u64) as *mut u8)) as u64)
+}
+
+#[inline]
+fn w8(p: u64, off: usize, v: u64) {
+    *((p + off as u64) as *mut u8) = (v & 255) as u8
+}
+
+#[inline]
+fn w16(p: u64, off: usize, v: u64) {
+    *((p + off as u64) as *mut u8) = ((v >> 8) & 255) as u8
+    *((p + (off + 1) as u64) as *mut u8) = (v & 255) as u8
+}
+
+#[inline]
+fn w32(p: u64, off: usize, v: u64) {
+    *((p + off as u64) as *mut u8) = ((v >> 24) & 255) as u8
+    *((p + (off + 1) as u64) as *mut u8) = ((v >> 16) & 255) as u8
+    *((p + (off + 2) as u64) as *mut u8) = ((v >> 8) & 255) as u8
+    *((p + (off + 3) as u64) as *mut u8) = (v & 255) as u8
+}
+const SEEK_GE: i64 = 0
+const SEEK_GT: i64 = 1
+
+#[inline]
+fn usable_of(bt: *mut Bt) -> usize {
+    return (*(*bt).pg).usable
+}
+
+// ------------------------------------------------------------ cell lists
+struct CellList {
+    data: rt.Buf,
+    meta: rt.Buf, // per cell: offset u32, length u32 (little endian)
+    n: usize,
+    right: u32,
+}
+
+fn cl_new() -> CellList {
+    return CellList { data: rt.buf_new(), meta: rt.buf_new(), n: 0, right: 0 }
+}
+
+fn cl_free(l: *mut CellList) {
+    rt.buf_free(&(*l).data)
+    rt.buf_free(&(*l).meta)
+    (*l).n = 0
+}
+
+fn cl_clear(l: *mut CellList) {
+    rt.buf_clear(&(*l).data)
+    rt.buf_clear(&(*l).meta)
+    (*l).n = 0
+    (*l).right = 0
+}
+
+fn cl_push(l: *mut CellList, p: u64, n: usize) {
+    let off: usize = rt.buf_len(&(*l).data)
+    rt.buf_push_bytes(&(*l).data, p, n)
+    let at: usize = rt.buf_len(&(*l).meta)
+    rt.buf_reserve(&(*l).meta, at + 8)
+    let m: u64 = rt.buf_ptr(&(*l).meta) + (at as u64)
+    rt.st32(m, 0, off as u32)
+    rt.st32(m, 1, n as u32)
+    rt.buf_set_len(&(*l).meta, at + 8)
+    (*l).n = (*l).n + 1
+}
+
+#[inline]
+fn cl_len(l: *mut CellList, i: usize) -> usize {
+    return rt.ld32(rt.buf_ptr(&(*l).meta), 2 * i + 1) as usize
+}
+
+#[inline]
+fn cl_ptr(l: *mut CellList, i: usize) -> u64 {
+    return rt.buf_ptr(&(*l).data) + (rt.ld32(rt.buf_ptr(&(*l).meta), 2 * i) as u64)
+}
+
+// the space a cell takes on a page, with its pointer
+#[inline]
+fn cl_cost(l: *mut CellList, i: usize) -> usize {
+    var n: usize = cl_len(l, i)
+    if n < 4 {
+        n = 4
+    }
+    return n + 2
+}
+
+// ------------------------------------------------------------ the context
+struct Bt {
+    pg: *mut pager.Pager,
+    gather: CellList,
+    pend: CellList,
+    pend_active: bool,
+    pend_flags: u64,
+    scratch: rt.Buf,
+    tmp: rt.Buf,
+    cellbuf: rt.Buf,
+    cellbuf2: rt.Buf,
+}
+
+fn bt_new(pg: *mut pager.Pager) -> Bt {
+    return Bt { pg: pg, gather: cl_new(), pend: cl_new(), pend_active: false, pend_flags: 0,
+        scratch: rt.buf_new(), tmp: rt.buf_new(), cellbuf: rt.buf_new(), cellbuf2: rt.buf_new() }
+}
+
+fn bt_free(bt: *mut Bt) {
+    cl_free(&(*bt).gather)
+    cl_free(&(*bt).pend)
+    rt.buf_free(&(*bt).scratch)
+    rt.buf_free(&(*bt).tmp)
+    rt.buf_free(&(*bt).cellbuf)
+    rt.buf_free(&(*bt).cellbuf2)
+}
+
+struct Cursor {
+    root: u32,
+    index: bool,
+    depth: usize,
+    pages: [u32; 24],
+    idx: [i32; 24],
+    on: bool,
+}
+
+#[inline]
+fn cur_new(root: u32, index: bool) -> Cursor {
+    return Cursor { root: root, index: index, depth: 0, pages: [0; 24], idx: [0; 24], on: false }
+}
+
+fn cur_valid(c: *mut Cursor) -> bool {
+    return (*c).on
+}
+
+struct Payload {
+    p: u64,
+    n: usize,
+}
+
+struct PageInfo {
+    pgno: u32,
+    d: u64,
+    h: usize, // 100 on page 1, else 0
+    flags: u64,
+    leaf: bool,
+    ncells: usize,
+    cstart: usize,
+    right: u32,
+    arr: usize, // offset of the cell pointer array
+    arr_end: usize,
+}
+
+struct CellInfo {
+    size: usize, // octets on the page (at least 4)
+    plen: u64,
+    local: usize,
+    key: i64,
+    child: u32,
+    ovfl: u32,
+    pay_off: usize,
+}
+
+fn pinfo_new() -> PageInfo {
+    return PageInfo { pgno: 0, d: 0, h: 0, flags: 0, leaf: false, ncells: 0, cstart: 0, right: 0,
+        arr: 0, arr_end: 0 }
+}
+
+fn cinfo_new() -> CellInfo {
+    return CellInfo { size: 0, plen: 0, local: 0, key: 0, child: 0, ovfl: 0, pay_off: 0 }
+}
+
+fn bt_page_flags_ok(fl: u64) -> bool {
+    return fl == 2 || fl == 5 || fl == 10 || fl == 13
+}
+
+fn page_info(bt: *mut Bt, pgno: u32, d: u64, out: *mut PageInfo) -> DbError!bool {
+    let u: usize = usable_of(bt)
+    var h: usize = 0
+    if pgno == 1 {
+        h = 100
+    }
+    let fl: u64 = b8(d, h)
+    if !bt_page_flags_ok(fl) {
+        return dberr.fail(DbError::Corrupt, "invalid b-tree page type")
+    }
+    let leaf: bool = (fl & 8) != 0
+    var hs: usize = 12
+    if leaf {
+        hs = 8
+    }
+    let nc: usize = b16(d, h + 3) as usize
+    var cs: usize = b16(d, h + 5) as usize
+    if cs == 0 {
+        cs = 65536
+    }
+    let arr_end: usize = h + hs + 2 * nc
+    if arr_end > u || cs > u || cs < arr_end {
+        return dberr.fail(DbError::Corrupt, "b-tree page header is damaged")
+    }
+    (*out).pgno = pgno
+    (*out).d = d
+    (*out).h = h
+    (*out).flags = fl
+    (*out).leaf = leaf
+    (*out).ncells = nc
+    (*out).cstart = cs
+    (*out).right = 0
+    if !leaf {
+        (*out).right = b32(d, h + 8) as u32
+    }
+    (*out).arr = h + hs
+    (*out).arr_end = arr_end
+    return true
+}
+
+#[inline]
+fn cell_off(bt: *mut Bt, info: *mut PageInfo, i: usize) -> DbError!usize {
+    let u: usize = usable_of(bt)
+    let o: usize = b16((*info).d, (*info).arr + 2 * i) as usize
+    if o < (*info).arr_end || o + 4 > u {
+        return dberr.fail(DbError::Corrupt, "cell offset out of range")
+    }
+    return o
+}
+
+#[inline]
+fn max_local_of(flags: u64, u: usize) -> usize {
+    if flags == 13 {
+        return u - 35
+    }
+    return ((u - 12) * 64 / 255) - 23
+}
+
+#[inline]
+fn min_local_of(u: usize) -> usize {
+    return ((u - 12) * 32 / 255) - 23
+}
+
+fn local_size(flags: u64, u: usize, plen: u64, ovfl: *mut bool) -> usize {
+    let mx: usize = max_local_of(flags, u)
+    if plen <= (mx as u64) {
+        *ovfl = false
+        return plen as usize
+    }
+    let mn: usize = min_local_of(u)
+    let k: usize = mn + (((plen - (mn as u64)) % ((u - 4) as u64)) as usize)
+    *ovfl = true
+    if k <= mx {
+        return k
+    }
+    return mn
+}
+
+fn cell_parse(bt: *mut Bt, info: *mut PageInfo, off: usize, ci: *mut CellInfo) -> DbError!bool {
+    let u: usize = usable_of(bt)
+    let d: u64 = (*info).d
+    let fl: u64 = (*info).flags
+    (*ci).child = 0
+    (*ci).ovfl = 0
+    (*ci).key = 0
+    (*ci).plen = 0
+    (*ci).local = 0
+    if fl == 5 {
+        if u - off < 5 {
+            return dberr.fail(DbError::Corrupt, "cell runs past the end of the page")
+        }
+        (*ci).child = b32(d, off) as u32
+        var key: u64 = 0
+        let n: usize = util.varint_get(d + ((off + 4) as u64), u - off - 4, &key)
+        if n == 0 {
+            return dberr.fail(DbError::Corrupt, "cell runs past the end of the page")
+        }
+        (*ci).key = key as i64
+        (*ci).size = 4 + n
+        (*ci).pay_off = 0
+        return true
+    }
+    var p: usize = off
+    if fl == 2 {
+        (*ci).child = b32(d, off) as u32
+        p = off + 4
+    }
+    var plen: u64 = 0
+    let n1: usize = util.varint_get(d + (p as u64), u - p, &plen)
+    if n1 == 0 || plen > 2147483647 {
+        return dberr.fail(DbError::Corrupt, "payload size is damaged")
+    }
+    p = p + n1
+    if fl == 13 {
+        var key: u64 = 0
+        let n2: usize = util.varint_get(d + (p as u64), u - p, &key)
+        if n2 == 0 {
+            return dberr.fail(DbError::Corrupt, "cell runs past the end of the page")
+        }
+        (*ci).key = key as i64
+        p = p + n2
+    }
+    var ovf: bool = false
+    let local: usize = local_size(fl, u, plen, &ovf)
+    var total: usize = p - off + local
+    if ovf {
+        total = total + 4
+    }
+    if off + total > u {
+        return dberr.fail(DbError::Corrupt, "cell runs past the end of the page")
+    }
+    (*ci).plen = plen
+    (*ci).local = local
+    (*ci).pay_off = p
+    if ovf {
+        (*ci).ovfl = b32(d, p + local) as u32
+    }
+    if total < 4 {
+        total = 4
+    }
+    (*ci).size = total
+    return true
+}
+
+// The rowid of cell `off` of a table page (leaf or interior) without the rest of the parse.
+// Interior: [child 4][rowid varint]; leaf: [payload size varint][rowid varint]...
+#[inline]
+fn table_key_at(bt: *mut Bt, info: *mut PageInfo, off: usize, key: *mut i64) -> bool {
+    let u: usize = usable_of(bt)
+    let d: u64 = (*info).d
+    var p: usize = off
+    if !(*info).leaf {
+        p = off + 4
+    } else {
+        // skip the payload size
+        var i: usize = 0
+        while p < u && i < 9 {
+            let b: u64 = b8(d, p)
+            p = p + 1
+            i = i + 1
+            if b < 128 {
+                break
+            }
+        }
+    }
+    if p >= u {
+        return false
+    }
+    let b0: u64 = b8(d, p)
+    if b0 < 128 {
+        *key = b0 as i64
+        return true
+    }
+    var v: u64 = 0
+    let n: usize = util.varint_get(d + (p as u64), u - p, &v)
+    if n == 0 {
+        return false
+    }
+    *key = v as i64
+    return true
+}
+
+// The whole payload of a cell: a pointer into the page if it is all local,
+// else the pieces joined in bt.scratch (valid until the next call).
+fn payload_get(bt: *mut Bt, info: *mut PageInfo, ci: *mut CellInfo, out: *mut Payload) -> DbError!bool {
+    let d: u64 = (*info).d
+    if (*ci).ovfl == 0 {
+        (*out).p = d + ((*ci).pay_off as u64)
+        (*out).n = (*ci).local
+        return true
+    }
+    let pg: *mut pager.Pager = (*bt).pg
+    let u: usize = pager.pager_usable(pg)
+    rt.buf_clear(&(*bt).scratch)
+    rt.buf_reserve(&(*bt).scratch, ((*ci).plen as usize) + 8)
+    rt.buf_push_bytes(&(*bt).scratch, d + ((*ci).pay_off as u64), (*ci).local)
+    var remaining: u64 = (*ci).plen - ((*ci).local as u64)
+    var pno: u32 = (*ci).ovfl
+    var hops: u64 = 0
+    let maxhops: u64 = (*ci).plen / ((u - 4) as u64) + 2
+    while remaining > 0 {
+        if pno < 2 || pno > pager.pager_page_count(pg) || hops > maxhops {
+            return dberr.fail(DbError::Corrupt, "overflow chain is damaged")
+        }
+        let od: u64 = try pager.pager_get(pg, pno)
+        let next: u32 = b32(od, 0) as u32
+        var take: usize = u - 4
+        if (take as u64) > remaining {
+            take = remaining as usize
+        }
+        rt.buf_push_bytes(&(*bt).scratch, od + 4, take)
+        remaining = remaining - (take as u64)
+        pno = next
+        hops = hops + 1
+    }
+    (*out).p = rt.buf_ptr(&(*bt).scratch)
+    (*out).n = rt.buf_len(&(*bt).scratch)
+    return true
+}
+
+// ----------------------------------------------------------- page layout
+fn page_free_total(bt: *mut Bt, info: *mut PageInfo) -> DbError!usize {
+    let u: usize = usable_of(bt)
+    let d: u64 = (*info).d
+    let h: usize = (*info).h
+    var total: usize = (*info).cstart - (*info).arr_end
+    total = total + (b8(d, h + 7) as usize)
+    var fb: usize = b16(d, h + 1) as usize
+    var guard: usize = 0
+    var last: usize = 0
+    while fb != 0 {
+        if fb < (*info).cstart || fb + 4 > u || fb <= last || guard > u / 4 {
+            return dberr.fail(DbError::Corrupt, "free block list is damaged")
+        }
+        total = total + (b16(d, fb + 2) as usize)
+        last = fb
+        fb = b16(d, fb) as usize
+        guard = guard + 1
+    }
+    return total
+}
+
+// Rewrites the cells of a page back to back at the end (writable page).
+fn page_defrag(bt: *mut Bt, info: *mut PageInfo) -> DbError!bool {
+    let u: usize = usable_of(bt)
+    let d: u64 = (*info).d
+    let n: usize = (*info).ncells
+    // tmp: the cells (at most u octets), then one u32 size per cell
+    rt.buf_clear(&(*bt).tmp)
+    rt.buf_reserve(&(*bt).tmp, u + 4 * n + 16)
+    let tp: u64 = rt.buf_ptr(&(*bt).tmp)
+    var ci: CellInfo = cinfo_new()
+    var total: usize = 0
+    var i: usize = 0
+    while i < n {
+        let o: usize = try cell_off(bt, info, i)
+        try cell_parse(bt, info, o, &ci)
+        if total + ci.size > u || total + ci.size + (*info).arr_end > u {
+            return dberr.fail(DbError::Corrupt, "cells overlap")
+        }
+        util.move_bytes(tp + (total as u64), d + (o as u64), ci.size)
+        rt.st32(tp + (u as u64), i, ci.size as u32)
+        total = total + ci.size
+        i = i + 1
+    }
+    var cs: usize = u
+    var src: usize = 0
+    i = 0
+    while i < n {
+        let sz: usize = rt.ld32(tp + (u as u64), i) as usize
+        cs = cs - sz
+        util.move_bytes(d + (cs as u64), tp + (src as u64), sz)
+        w16(d, (*info).arr + 2 * i, cs as u64)
+        src = src + sz
+        i = i + 1
+    }
+    util.zero_bytes(d + ((*info).arr_end as u64), cs - (*info).arr_end)
+    w16(d, (*info).h + 5, (cs % 65536) as u64)
+    w16(d, (*info).h + 1, 0)
+    w8(d, (*info).h + 7, 0)
+    (*info).cstart = cs
+    return true
+}
+
+// Puts a cell at index `idx` if there is room; false (nothing changed) if not.
+fn page_try_insert(bt: *mut Bt, info: *mut PageInfo, idx: usize, cell: u64, len: usize) -> DbError!bool {
+    let u: usize = usable_of(bt)
+    let d: u64 = (*info).d
+    var csz: usize = len
+    if csz < 4 {
+        csz = 4
+    }
+    let need: usize = csz + 2
+    var gap: usize = (*info).cstart - (*info).arr_end
+    if gap < need {
+        let total: usize = try page_free_total(bt, info)
+        if total < need {
+            return false
+        }
+        try page_defrag(bt, info)
+        gap = (*info).cstart - (*info).arr_end
+        if gap < need {
+            return false
+        }
+    }
+    let cs: usize = (*info).cstart - csz
+    util.move_bytes(d + (cs as u64), cell, len)
+    if len < csz {
+        util.zero_bytes(d + ((cs + len) as u64), csz - len)
+    }
+    // shift the pointers at idx.. up by one slot
+    let n: usize = (*info).ncells
+    let a: u64 = d + ((*info).arr as u64)
+    util.move_bytes(a + ((idx + 1) * 2) as u64, a + (idx * 2) as u64, (n - idx) * 2)
+    w16(d, (*info).arr + 2 * idx, cs as u64)
+    (*info).ncells = n + 1
+    (*info).arr_end = (*info).arr_end + 2
+    (*info).cstart = cs
+    w16(d, (*info).h + 3, (n + 1) as u64)
+    w16(d, (*info).h + 5, (cs % 65536) as u64)
+    return true
+}
+
+// Removes the cell at `idx` and leaves the page compact.
+fn page_remove(bt: *mut Bt, info: *mut PageInfo, idx: usize) -> DbError!bool {
+    let d: u64 = (*info).d
+    let n: usize = (*info).ncells
+    let o: usize = try cell_off(bt, info, idx)
+    var ci: CellInfo = cinfo_new()
+    try cell_parse(bt, info, o, &ci)
+    let a: u64 = d + ((*info).arr as u64)
+    util.move_bytes(a + (idx * 2) as u64, a + ((idx + 1) * 2) as u64, (n - idx - 1) * 2)
+    (*info).ncells = n - 1
+    (*info).arr_end = (*info).arr_end - 2
+    w16(d, (*info).h + 3, (n - 1) as u64)
+    // the pointer array shrank: the freed slot is zeroed
+    w16(d, (*info).arr_end, 0)
+    if o == (*info).cstart && b16(d, (*info).h + 1) == 0 && b8(d, (*info).h + 7) == 0 {
+        (*info).cstart = (*info).cstart + ci.size
+        util.zero_bytes(d + (o as u64), ci.size)
+        w16(d, (*info).h + 5, ((*info).cstart % 65536) as u64)
+        return true
+    }
+    // a hole in the middle: a defragmentation closes it (the removed cell
+    // is no longer reachable, so its space counts as free)
+    try page_defrag_after_remove(bt, info)
+    return true
+}
+
+fn page_defrag_after_remove(bt: *mut Bt, info: *mut PageInfo) -> DbError!bool {
+    return page_defrag(bt, info)
+}
+
+// Writes a fresh page from cells [from, to) of a list. `flags` the page
+// type; `right` the right-most child for an interior page. Page 1 keeps
+// its first 100 octets.
+fn page_build(bt: *mut Bt, pgno: u32, d: u64, flags: u64, l: *mut CellList, from: usize, to: usize,
+    right: u32) -> DbError!bool {
+    let u: usize = usable_of(bt)
+    var h: usize = 0
+    if pgno == 1 {
+        h = 100
+    }
+    let ps: usize = pager.pager_page_size((*bt).pg)
+    util.zero_bytes(d + (h as u64), ps - h)
+    w8(d, h, flags)
+    let leaf: bool = (flags & 8) != 0
+    var hs: usize = 12
+    if leaf {
+        hs = 8
+    } else {
+        w32(d, h + 8, right as u64)
+    }
+    let arr: usize = h + hs
+    var cs: usize = u
+    var i: usize = from
+    var k: usize = 0
+    while i < to {
+        var n: usize = cl_len(l, i)
+        var csz: usize = n
+        if csz < 4 {
+            csz = 4
+        }
+        if cs < arr + 2 * (k + 1) + csz {
+            return dberr.fail(DbError::Corrupt, "internal error: cells do not fit the page")
+        }
+        cs = cs - csz
+        util.move_bytes(d + (cs as u64), cl_ptr(l, i), n)
+        w16(d, arr + 2 * k, cs as u64)
+        k = k + 1
+        i = i + 1
+    }
+    w16(d, h + 3, k as u64)
+    w16(d, h + 5, (cs % 65536) as u64)
+    return true
+}
+
+// the cells of a page, appended to a list (padded sizes), plus its right child
+fn page_to_list(bt: *mut Bt, info: *mut PageInfo, l: *mut CellList) -> DbError!bool {
+    var ci: CellInfo = cinfo_new()
+    var i: usize = 0
+    while i < (*info).ncells {
+        let o: usize = try cell_off(bt, info, i)
+        try cell_parse(bt, info, o, &ci)
+        cl_push(l, (*info).d + (o as u64), ci.size)
+        i = i + 1
+    }
+    return true
+}
+
+// ----------------------------------------------------- overflow chains
+fn free_overflow(bt: *mut Bt, first: u32, plen: u64, local: usize) -> DbError!bool {
+    if first == 0 {
+        return true
+    }
+    let pg: *mut pager.Pager = (*bt).pg
+    let u: usize = pager.pager_usable(pg)
+    var remaining: u64 = plen - (local as u64)
+    var pno: u32 = first
+    var hops: u64 = 0
+    let maxhops: u64 = plen / ((u - 4) as u64) + 2
+    while remaining > 0 && pno != 0 {
+        if pno < 2 || pno > pager.pager_page_count(pg) || hops > maxhops {
+            return dberr.fail(DbError::Corrupt, "overflow chain is damaged")
+        }
+        let od: u64 = try pager.pager_get(pg, pno)
+        let next: u32 = b32(od, 0) as u32
+        var take: u64 = ((u - 4) as u64)
+        if take > remaining {
+            take = remaining
+        }
+        remaining = remaining - take
+        try pager.pager_free_page(pg, pno)
+        pno = next
+        hops = hops + 1
+    }
+    return true
+}
+
+// Builds a leaf-form cell ([payload size][rowid for tables][local payload][overflow page])
+// into `out`; allocates the overflow chain.
+fn build_cell(bt: *mut Bt, table: bool, rowid: i64, data: u64, n: usize, out: *mut rt.Buf) -> DbError!bool {
+    let pg: *mut pager.Pager = (*bt).pg
+    let u: usize = pager.pager_usable(pg)
+    var fl: u64 = 10
+    if table {
+        fl = 13
+    }
+    rt.buf_clear(out)
+    rt.buf_reserve(out, 32 + n)
+    var hdr: [u8; 24] = [0; 24]
+    var hl: usize = util.varint_put((&hdr[0]) as u64, n as u64)
+    if table {
+        hl = hl + util.varint_put(((&hdr[0]) as u64) + (hl as u64), rowid as u64)
+    }
+    rt.buf_push_bytes(out, (&hdr[0]) as u64, hl)
+    var ovf: bool = false
+    let local: usize = local_size(fl, u, n as u64, &ovf)
+    rt.buf_push_bytes(out, data, local)
+    if !ovf {
+        return true
+    }
+    var done: usize = local
+    var first: u32 = 0
+    var prev: u32 = 0
+    while done < n {
+        let p: u32 = try pager.pager_alloc_page(pg)
+        if first == 0 {
+            first = p
+        } else {
+            let pd: u64 = try pager.pager_write(pg, prev)
+            w32(pd, 0, p as u64)
+        }
+        let od: u64 = try pager.pager_write(pg, p)
+        w32(od, 0, 0)
+        var take: usize = u - 4
+        if take > n - done {
+            take = n - done
+        }
+        util.move_bytes(od + 4, data + (done as u64), take)
+        done = done + take
+        prev = p
+    }
+    util.buf_put_be32(out, first as u64)
+    return true
+}
+
+// -------------------------------------------------------------- descending
+fn child_at(bt: *mut Bt, info: *mut PageInfo, i: usize) -> DbError!u32 {
+    var c: u32 = 0
+    if i < (*info).ncells {
+        let o: usize = try cell_off(bt, info, i)
+        c = b32((*info).d, o) as u32
+    } else {
+        c = (*info).right
+    }
+    if c < 2 || c > pager.pager_page_count((*bt).pg) {
+        return dberr.fail(DbError::Corrupt, "child page number out of range")
+    }
+    return c
+}
+
+fn load_level(bt: *mut Bt, cur: *mut Cursor, depth: usize, info: *mut PageInfo) -> DbError!bool {
+    let pno: u32 = (*cur).pages[depth]
+    let d: u64 = try pager.pager_get((*bt).pg, pno)
+    try page_info(bt, pno, d, info)
+    return true
+}
+
+// Positions on the first entry (false if the tree is empty).
+fn bt_first(bt: *mut Bt, cur: *mut Cursor) -> DbError!bool {
+    pager.pager_next_op((*bt).pg)
+    (*cur).on = false
+    (*cur).depth = 0
+    (*cur).pages[0] = (*cur).root
+    var info: PageInfo = pinfo_new()
+    while true {
+        let dp: usize = (*cur).depth
+        try load_level(bt, cur, dp, &info)
+        if info.leaf {
+            if info.ncells == 0 {
+                return false
+            }
+            (*cur).idx[dp] = 0
+            (*cur).on = true
+            return true
+        }
+        if dp + 1 >= MAX_DEPTH {
+            return dberr.fail(DbError::Corrupt, "b-tree is too deep (or has a cycle)")
+        }
+        let c: u32 = try child_at(bt, &info, 0)
+        (*cur).idx[dp] = 0
+        (*cur).depth = dp + 1
+        (*cur).pages[dp + 1] = c
+    }
+    return false
+}
+
+fn bt_last(bt: *mut Bt, cur: *mut Cursor) -> DbError!bool {
+    pager.pager_next_op((*bt).pg)
+    (*cur).on = false
+    (*cur).depth = 0
+    (*cur).pages[0] = (*cur).root
+    var info: PageInfo = pinfo_new()
+    while true {
+        let dp: usize = (*cur).depth
+        try load_level(bt, cur, dp, &info)
+        if info.leaf {
+            if info.ncells == 0 {
+                return false
+            }
+            (*cur).idx[dp] = (info.ncells - 1) as i32
+            (*cur).on = true
+            return true
+        }
+        if dp + 1 >= MAX_DEPTH {
+            return dberr.fail(DbError::Corrupt, "b-tree is too deep (or has a cycle)")
+        }
+        let c: u32 = try child_at(bt, &info, info.ncells)
+        (*cur).idx[dp] = info.ncells as i32
+        (*cur).depth = dp + 1
+        (*cur).pages[dp + 1] = c
+    }
+    return false
+}
+
+// descends from level `dp` (whose page is set and whose idx is the child to
+// take) to the leftmost entry below it
+fn descend_leftmost(bt: *mut Bt, cur: *mut Cursor, info: *mut PageInfo) -> DbError!bool {
+    while true {
+        let dp: usize = (*cur).depth
+        try load_level(bt, cur, dp, info)
+        if (*info).leaf {
+            if (*info).ncells == 0 {
+                return dberr.fail(DbError::Corrupt, "empty leaf page below an interior page")
+            }
+            (*cur).idx[dp] = 0
+            return true
+        }
+        if dp + 1 >= MAX_DEPTH {
+            return dberr.fail(DbError::Corrupt, "b-tree is too deep (or has a cycle)")
+        }
+        let c: u32 = try child_at(bt, info, 0)
+        (*cur).idx[dp] = 0
+        (*cur).depth = dp + 1
+        (*cur).pages[dp + 1] = c
+    }
+    return false
+}
+
+fn descend_rightmost(bt: *mut Bt, cur: *mut Cursor, info: *mut PageInfo) -> DbError!bool {
+    while true {
+        let dp: usize = (*cur).depth
+        try load_level(bt, cur, dp, info)
+        if (*info).leaf {
+            if (*info).ncells == 0 {
+                return dberr.fail(DbError::Corrupt, "empty leaf page below an interior page")
+            }
+            (*cur).idx[dp] = ((*info).ncells - 1) as i32
+            return true
+        }
+        if dp + 1 >= MAX_DEPTH {
+            return dberr.fail(DbError::Corrupt, "b-tree is too deep (or has a cycle)")
+        }
+        let c: u32 = try child_at(bt, info, (*info).ncells)
+        (*cur).idx[dp] = (*info).ncells as i32
+        (*cur).depth = dp + 1
+        (*cur).pages[dp + 1] = c
+    }
+    return false
+}
+
+// The next entry in key order (false at the end).
+fn bt_next(bt: *mut Bt, cur: *mut Cursor) -> DbError!bool {
+    if !(*cur).on {
+        return false
+    }
+    pager.pager_next_op((*bt).pg)
+    var info: PageInfo = pinfo_new()
+    var dp: usize = (*cur).depth
+    try load_level(bt, cur, dp, &info)
+    if info.leaf {
+        let ni: i32 = (*cur).idx[dp] + 1
+        if (ni as usize) < info.ncells {
+            (*cur).idx[dp] = ni
+            return true
+        }
+        // climb until an ancestor has something after the child we left
+        while true {
+            if dp == 0 {
+                (*cur).on = false
+                return false
+            }
+            dp = dp - 1
+            (*cur).depth = dp
+            try load_level(bt, cur, dp, &info)
+            let c: i32 = (*cur).idx[dp]
+            if (c as usize) < info.ncells {
+                if (*cur).index {
+                    // the entry between the two subtrees
+                    return true
+                }
+                (*cur).idx[dp] = c + 1
+                let nc: u32 = try child_at(bt, &info, (c + 1) as usize)
+                (*cur).depth = dp + 1
+                (*cur).pages[dp + 1] = nc
+                try descend_leftmost(bt, cur, &info)
+                return true
+            }
+        }
+    }
+    // standing on an entry of an interior index page: the leftmost entry
+    // of the subtree right of it
+    let c: i32 = (*cur).idx[dp] + 1
+    (*cur).idx[dp] = c
+    let nc: u32 = try child_at(bt, &info, c as usize)
+    (*cur).depth = dp + 1
+    (*cur).pages[dp + 1] = nc
+    try descend_leftmost(bt, cur, &info)
+    return true
+}
+
+fn bt_prev(bt: *mut Bt, cur: *mut Cursor) -> DbError!bool {
+    if !(*cur).on {
+        return false
+    }
+    pager.pager_next_op((*bt).pg)
+    var info: PageInfo = pinfo_new()
+    var dp: usize = (*cur).depth
+    try load_level(bt, cur, dp, &info)
+    if info.leaf {
+        let ci: i32 = (*cur).idx[dp]
+        if ci > 0 {
+            (*cur).idx[dp] = ci - 1
+            return true
+        }
+        while true {
+            if dp == 0 {
+                (*cur).on = false
+                return false
+            }
+            dp = dp - 1
+            (*cur).depth = dp
+            try load_level(bt, cur, dp, &info)
+            let c: i32 = (*cur).idx[dp]
+            if c > 0 {
+                if (*cur).index {
+                    (*cur).idx[dp] = c - 1
+                    return true
+                }
+                (*cur).idx[dp] = c - 1
+                let nc: u32 = try child_at(bt, &info, (c - 1) as usize)
+                (*cur).depth = dp + 1
+                (*cur).pages[dp + 1] = nc
+                try descend_rightmost(bt, cur, &info)
+                return true
+            }
+        }
+    }
+    // on an interior index entry: the rightmost entry of the subtree left of it
+    let c: i32 = (*cur).idx[dp]
+    let nc: u32 = try child_at(bt, &info, c as usize)
+    (*cur).depth = dp + 1
+    (*cur).pages[dp + 1] = nc
+    try descend_rightmost(bt, cur, &info)
+    return true
+}
+
+// The rowid of the entry under a table cursor.
+fn bt_rowid(bt: *mut Bt, cur: *mut Cursor) -> DbError!i64 {
+    if !(*cur).on {
+        return dberr.fail(DbError::Misuse, "cursor is not on a row")
+    }
+    var info: PageInfo = pinfo_new()
+    let dp: usize = (*cur).depth
+    try load_level(bt, cur, dp, &info)
+    let o: usize = try cell_off(bt, &info, (*cur).idx[dp] as usize)
+    var ci: CellInfo = cinfo_new()
+    try cell_parse(bt, &info, o, &ci)
+    return ci.key
+}
+
+// The payload (the record) under the cursor. Valid until the next call
+// that touches the tree.
+fn bt_payload(bt: *mut Bt, cur: *mut Cursor) -> DbError!Payload {
+    if !(*cur).on {
+        return dberr.fail(DbError::Misuse, "cursor is not on a row")
+    }
+    var info: PageInfo = pinfo_new()
+    let dp: usize = (*cur).depth
+    try load_level(bt, cur, dp, &info)
+    let o: usize = try cell_off(bt, &info, (*cur).idx[dp] as usize)
+    var ci: CellInfo = cinfo_new()
+    try cell_parse(bt, &info, o, &ci)
+    var pl: Payload = Payload { p: 0, n: 0 }
+    try payload_get(bt, &info, &ci, &pl)
+    return pl
+}
+
+// Lowest entry with rowid >= `rowid` (SEEK_GE) or > (SEEK_GT). True if there is one.
+fn bt_table_seek(bt: *mut Bt, cur: *mut Cursor, rowid: i64, mode: i64) -> DbError!bool {
+    pager.pager_next_op((*bt).pg)
+    (*cur).on = false
+    (*cur).depth = 0
+    (*cur).pages[0] = (*cur).root
+    var info: PageInfo = pinfo_new()
+    var ci: CellInfo = cinfo_new()
+    while true {
+        let dp: usize = (*cur).depth
+        try load_level(bt, cur, dp, &info)
+        // binary search: first cell whose key is >= rowid (or > rowid)
+        var lo: usize = 0
+        var hi: usize = info.ncells
+        while lo < hi {
+            let mid: usize = (lo + hi) / 2
+            let o: usize = try cell_off(bt, &info, mid)
+            var key: i64 = 0
+            if !table_key_at(bt, &info, o, &key) {
+                return dberr.fail(DbError::Corrupt, "cell runs past the end of the page")
+            }
+            var before: bool = key < rowid
+            if mode == SEEK_GT {
+                before = key <= rowid
+            }
+            if before {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        if info.leaf {
+            if lo < info.ncells {
+                (*cur).idx[dp] = lo as i32
+                (*cur).on = true
+                return true
+            }
+            if info.ncells == 0 {
+                return false
+            }
+            (*cur).idx[dp] = (info.ncells - 1) as i32
+            (*cur).on = true
+            let more: bool = try bt_next(bt, cur)
+            return more
+        }
+        if dp + 1 >= MAX_DEPTH {
+            return dberr.fail(DbError::Corrupt, "b-tree is too deep (or has a cycle)")
+        }
+        let c: u32 = try child_at(bt, &info, lo)
+        (*cur).idx[dp] = lo as i32
+        (*cur).depth = dp + 1
+        (*cur).pages[dp + 1] = c
+    }
+    return false
+}
+
+// Lowest entry of an index not before the key (compared over key.n columns):
+// SEEK_GE: entry >= key, SEEK_GT: entry > key.
+fn bt_index_seek(bt: *mut Bt, cur: *mut Cursor, key: *mut record.UKey, mode: i64) -> DbError!bool {
+    pager.pager_next_op((*bt).pg)
+    (*cur).on = false
+    (*cur).depth = 0
+    (*cur).pages[0] = (*cur).root
+    var info: PageInfo = pinfo_new()
+    var ci: CellInfo = cinfo_new()
+    var pl: Payload = Payload { p: 0, n: 0 }
+    while true {
+        let dp: usize = (*cur).depth
+        try load_level(bt, cur, dp, &info)
+        var lo: usize = 0
+        var hi: usize = info.ncells
+        while lo < hi {
+            let mid: usize = (lo + hi) / 2
+            let o: usize = try cell_off(bt, &info, mid)
+            try cell_parse(bt, &info, o, &ci)
+            try payload_get(bt, &info, &ci, &pl)
+            let r: i64 = try record.rec_compare_key(pl.p, pl.n, key)
+            var before: bool = r < 0
+            if mode == SEEK_GT {
+                before = r <= 0
+            }
+            if before {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        if info.leaf {
+            if lo < info.ncells {
+                (*cur).idx[dp] = lo as i32
+                (*cur).on = true
+                return true
+            }
+            if info.ncells == 0 {
+                return false
+            }
+            (*cur).idx[dp] = (info.ncells - 1) as i32
+            (*cur).on = true
+            let more: bool = try bt_next(bt, cur)
+            return more
+        }
+        if dp + 1 >= MAX_DEPTH {
+            return dberr.fail(DbError::Corrupt, "b-tree is too deep (or has a cycle)")
+        }
+        let c: u32 = try child_at(bt, &info, lo)
+        (*cur).idx[dp] = lo as i32
+        (*cur).depth = dp + 1
+        (*cur).pages[dp + 1] = c
+    }
+    return false
+}
+
+// The row with this rowid: true and the payload, or false.
+fn bt_table_find(bt: *mut Bt, root: u32, rowid: i64, out: *mut Payload) -> DbError!bool {
+    var cur: Cursor = cur_new(root, false)
+    let ok: bool = try bt_table_seek(bt, &cur, rowid, SEEK_GE)
+    if !ok {
+        return false
+    }
+    let k: i64 = try bt_rowid(bt, &cur)
+    if k != rowid {
+        return false
+    }
+    *out = try bt_payload(bt, &cur)
+    return true
+}
+
+// The largest rowid, 0 for an empty table.
+fn bt_max_rowid(bt: *mut Bt, root: u32) -> DbError!i64 {
+    var cur: Cursor = cur_new(root, false)
+    let ok: bool = try bt_last(bt, &cur)
+    if !ok {
+        return 0
+    }
+    return try bt_rowid(bt, &cur)
+}
+
+fn bt_count(bt: *mut Bt, root: u32, index: bool) -> DbError!i64 {
+    var cur: Cursor = cur_new(root, index)
+    var n: i64 = 0
+    var ok: bool = try bt_first(bt, &cur)
+    while ok {
+        n = n + 1
+        ok = try bt_next(bt, &cur)
+    }
+    return n
+}
+
+// ------------------------------------------------------------- creating
+// A new empty tree; the answer is its root page.
+fn bt_create(bt: *mut Bt, index: bool) -> DbError!u32 {
+    let pg: *mut pager.Pager = (*bt).pg
+    pager.pager_next_op(pg)
+    let p: u32 = try pager.pager_alloc_page(pg)
+    let d: u64 = try pager.pager_write(pg, p)
+    var fl: u64 = 13
+    if index {
+        fl = 10
+    }
+    util.zero_bytes(d, pager.pager_page_size(pg))
+    w8(d, 0, fl)
+    w16(d, 5, (pager.pager_usable(pg) % 65536) as u64)
+    return p
+}
+
+fn free_subtree(bt: *mut Bt, pno: u32, depth: usize, keep_root: bool) -> DbError!bool {
+    if depth >= MAX_DEPTH {
+        return dberr.fail(DbError::Corrupt, "b-tree is too deep (or has a cycle)")
+    }
+    let pg: *mut pager.Pager = (*bt).pg
+    pager.pager_next_op(pg)
+    let d: u64 = try pager.pager_get(pg, pno)
+    var info: PageInfo = pinfo_new()
+    try page_info(bt, pno, d, &info)
+    var ci: CellInfo = cinfo_new()
+    var i: usize = 0
+    let n: usize = info.ncells
+    // children first (their numbers are read before anything is freed)
+    while i < n {
+        pager.pager_next_op(pg)
+        let d2: u64 = try pager.pager_get(pg, pno)
+        info.d = d2
+        let o: usize = try cell_off(bt, &info, i)
+        try cell_parse(bt, &info, o, &ci)
+        if !info.leaf {
+            try free_subtree(bt, ci.child, depth + 1, false)
+        }
+        if ci.ovfl != 0 {
+            try free_overflow(bt, ci.ovfl, ci.plen, ci.local)
+        }
+        i = i + 1
+    }
+    if !info.leaf {
+        pager.pager_next_op(pg)
+        let d3: u64 = try pager.pager_get(pg, pno)
+        info.d = d3
+        let c: u32 = try child_at(bt, &info, n)
+        try free_subtree(bt, c, depth + 1, false)
+    }
+    if keep_root {
+        pager.pager_next_op(pg)
+        let wd: u64 = try pager.pager_write(pg, pno)
+        var fl: u64 = 13
+        if info.flags == 2 || info.flags == 10 {
+            fl = 10
+        }
+        var h: usize = 0
+        if pno == 1 {
+            h = 100
+        }
+        util.zero_bytes(wd + (h as u64), pager.pager_page_size(pg) - h)
+        w8(wd, h, fl)
+        w16(wd, h + 5, (pager.pager_usable(pg) % 65536) as u64)
+        return true
+    }
+    try pager.pager_free_page(pg, pno)
+    return true
+}
+
+// Deletes every entry; the root page stays (an empty leaf).
+fn bt_clear(bt: *mut Bt, root: u32) -> DbError!bool {
+    return free_subtree(bt, root, 0, true)
+}
+
+// Frees the whole tree including the root.
+fn bt_drop(bt: *mut Bt, root: u32) -> DbError!bool {
+    return free_subtree(bt, root, 0, false)
+}
+
+// ------------------------------------------------------------- balancing
+fn underfull(bt: *mut Bt, info: *mut PageInfo) -> DbError!bool {
+    if (*info).ncells == 0 {
+        return true
+    }
+    let u: usize = usable_of(bt)
+    let free: usize = try page_free_total(bt, info)
+    return free > (u * 2 / 3)
+}
+
+// the child page number at index i of an interior page (i == ncells: right)
+fn raw_child(bt: *mut Bt, info: *mut PageInfo, i: usize) -> DbError!u32 {
+    return child_at(bt, info, i)
+}
+
+fn rewrite_u32_at(p: u64, off: usize, v: u32) {
+    w32(p, off, v as u64)
+}
+
+// A cell of an interior parent as it must look in a child level.
+// kind of the child level: 5 (table interior), 2 (index interior), 10 (index leaf)
+fn divider_down(bt: *mut Bt, pinfo: *mut PageInfo, i: usize, child_flags: u64, left_right: u32,
+    gather: *mut CellList) -> DbError!bool {
+    let o: usize = try cell_off(bt, pinfo, i)
+    var ci: CellInfo = cinfo_new()
+    try cell_parse(bt, pinfo, o, &ci)
+    let src: u64 = (*pinfo).d + (o as u64)
+    if child_flags == 5 {
+        // [child 4][rowid varint]
+        var tmp: [u8; 16] = [0; 16]
+        w32((&tmp[0]) as u64, 0, left_right as u64)
+        let n: usize = util.varint_put(((&tmp[0]) as u64) + 4, ci.key as u64)
+        cl_push(gather, (&tmp[0]) as u64, 4 + n)
+        return true
+    }
+    if child_flags == 2 {
+        // the same bytes with a new left child
+        cl_push(gather, src, ci.size)
+        let p: u64 = cl_ptr(gather, (*gather).n - 1)
+        w32(p, 0, left_right as u64)
+        return true
+    }
+    // an index leaf: the entry without its child pointer
+    cl_push(gather, src + 4, ci.size - 4)
+    return true
+}
+
+// key (rowid) of a table leaf cell held in a list
+fn list_cell_rowid(l: *mut CellList, i: usize) -> i64 {
+    var plen: u64 = 0
+    let n1: usize = util.varint_get(cl_ptr(l, i), cl_len(l, i), &plen)
+    var key: u64 = 0
+    util.varint_get(cl_ptr(l, i) + (n1 as u64), cl_len(l, i) - n1, &key)
+    return key as i64
+}
+
+// Balances the page at `level` (with up to two neighbours) under its parent.
+// The page's content is bt.pend when bt.pend_active, else what is on the page.
+// Afterwards the PARENT is either rewritten, or (if it no longer fits) is
+// the new pending page.
+fn balance_nonroot(bt: *mut Bt, cur: *mut Cursor, level: usize) -> DbError!bool {
+    let pg: *mut pager.Pager = (*bt).pg
+    let u: usize = pager.pager_usable(pg)
+    let ppno: u32 = (*cur).pages[level - 1]
+    let c: usize = (*cur).idx[level - 1] as usize
+    let child_pno: u32 = (*cur).pages[level]
+    let pd: u64 = try pager.pager_get(pg, ppno)
+    var pinfo: PageInfo = pinfo_new()
+    try page_info(bt, ppno, pd, &pinfo)
+    let ncp: usize = pinfo.ncells
+    let nchild: usize = ncp + 1
+    if c > ncp {
+        return dberr.fail(DbError::Corrupt, "cursor path is inconsistent")
+    }
+    if nchild == 1 && !(*bt).pend_active {
+        return true
+    }
+    var nb: usize = 3
+    if nchild < 3 {
+        nb = nchild
+    }
+    var i0: usize = 0
+    if c >= 1 {
+        i0 = c - 1
+    }
+    if i0 + nb > nchild {
+        i0 = nchild - nb
+    }
+    var spno: [u32; 3] = [0; 3]
+    var j: usize = 0
+    while j < nb {
+        spno[j] = try child_at(bt, &pinfo, i0 + j)
+        j = j + 1
+    }
+    // the first sibling's flags decide the family
+    var flags: u64 = 0
+    if (*bt).pend_active && spno[0] == child_pno {
+        flags = (*bt).pend_flags
+    } else {
+        let sd0: u64 = try pager.pager_get(pg, spno[0])
+        var si0: PageInfo = pinfo_new()
+        try page_info(bt, spno[0], sd0, &si0)
+        flags = si0.flags
+    }
+    let leaf: bool = (flags & 8) != 0
+    let table_leaf: bool = flags == 13
+    // ---- gather
+    cl_clear(&(*bt).gather)
+    var rights: [u32; 3] = [0; 3]
+    var jj: usize = 0
+    // the pending list must survive: it is read below into `gather`
+    while jj < nb {
+        if (*bt).pend_active && spno[jj] == child_pno {
+            var k: usize = 0
+            while k < (*bt).pend.n {
+                cl_push(&(*bt).gather, cl_ptr(&(*bt).pend, k), cl_len(&(*bt).pend, k))
+                k = k + 1
+            }
+            rights[jj] = (*bt).pend.right
+        } else {
+            let sd: u64 = try pager.pager_get(pg, spno[jj])
+            var si: PageInfo = pinfo_new()
+            try page_info(bt, spno[jj], sd, &si)
+            if si.flags != flags {
+                return dberr.fail(DbError::Corrupt, "sibling pages are of different types")
+            }
+            try page_to_list(bt, &si, &(*bt).gather)
+            rights[jj] = si.right
+        }
+        if jj + 1 < nb && !table_leaf {
+            try divider_down(bt, &pinfo, i0 + jj, flags, rights[jj], &(*bt).gather)
+        }
+        jj = jj + 1
+    }
+    let g: *mut CellList = &(*bt).gather
+    let total_n: usize = (*g).n
+    // ---- plan the new pages: boundaries
+    let hs: usize = if leaf { 8 } else { 12 }
+    let cap: usize = u - hs
+    // prefix sums of the costs
+    rt.buf_clear(&(*bt).tmp)
+    rt.buf_reserve(&(*bt).tmp, (total_n + 2) * 8)
+    let pre: u64 = rt.buf_ptr(&(*bt).tmp)
+    var run: usize = 0
+    var q: usize = 0
+    while q < total_n {
+        util.wr64(pre, q * 8, run as u64)
+        run = run + cl_cost(g, q)
+        q = q + 1
+    }
+    util.wr64(pre, total_n * 8, run as u64)
+    // boundaries: at most 6 pages
+    var bnd: [usize; 8] = [0; 8]
+    var k: usize = 0
+    var s: usize = 0
+    while true {
+        var t: usize = s
+        let base: u64 = util.rd64(pre, s * 8)
+        while t < total_n && (util.rd64(pre, (t + 1) * 8) - base) <= (cap as u64) {
+            t = t + 1
+        }
+        if t == total_n {
+            break
+        }
+        if t == s {
+            return dberr.fail(DbError::Corrupt, "a cell does not fit an empty page")
+        }
+        if table_leaf {
+            bnd[k] = t
+            k = k + 1
+            s = t
+        } else {
+            // cell t is promoted; the last page must keep at least one cell
+            if t + 1 == total_n {
+                t = t - 1
+                if t == s {
+                    return dberr.fail(DbError::Corrupt, "cannot split the page")
+                }
+            }
+            bnd[k] = t
+            k = k + 1
+            s = t + 1
+        }
+        if k >= 6 {
+            return dberr.fail(DbError::Corrupt, "too many pages after a balance")
+        }
+    }
+    let npages: usize = k + 1
+    // starts and ends of page j
+    // table leaf: page j = [st(j), en(j)), st(0)=0, st(j)=bnd[j-1], en(j)=bnd[j], en(last)=N
+    // others: st(j)=bnd[j-1]+1, en(j)=bnd[j] (the promoted cell), en(last)=N
+    // ---- even out from the right
+    var bi: usize = npages - 1
+    while bi >= 1 {
+        let ib: usize = bi - 1
+        var again: bool = true
+        while again {
+            again = false
+            let b: usize = bnd[ib]
+            var left_start: usize = 0
+            if ib > 0 {
+                if table_leaf {
+                    left_start = bnd[ib - 1]
+                } else {
+                    left_start = bnd[ib - 1] + 1
+                }
+            }
+            var right_end: usize = total_n
+            if bi < npages - 1 {
+                right_end = bnd[bi]
+            }
+            let nb2: usize = b - 1
+            if nb2 <= left_start {
+                break
+            }
+            var lsz: usize = 0
+            var rsz: usize = 0
+            if table_leaf {
+                lsz = (util.rd64(pre, nb2 * 8) - util.rd64(pre, left_start * 8)) as usize
+                rsz = (util.rd64(pre, right_end * 8) - util.rd64(pre, nb2 * 8)) as usize
+            } else {
+                lsz = (util.rd64(pre, nb2 * 8) - util.rd64(pre, left_start * 8)) as usize
+                rsz = (util.rd64(pre, right_end * 8) - util.rd64(pre, (nb2 + 1) * 8)) as usize
+            }
+            if rsz <= lsz && rsz <= cap {
+                bnd[ib] = nb2
+                again = true
+            }
+        }
+        bi = bi - 1
+    }
+    // ---- pages to use
+    var newp: [u32; 8] = [0; 8]
+    var u2: usize = 0
+    while u2 < npages {
+        if u2 < nb {
+            newp[u2] = spno[u2]
+        } else {
+            newp[u2] = try pager.pager_alloc_page(pg)
+        }
+        u2 = u2 + 1
+    }
+    var f2: usize = npages
+    while f2 < nb {
+        try pager.pager_free_page(pg, spno[f2])
+        f2 = f2 + 1
+    }
+    // ---- write the pages and collect the dividers into a list (cellbuf2 holds them)
+    var divs: CellList = cl_new()
+    var pj: usize = 0
+    while pj < npages {
+        var st: usize = 0
+        if pj > 0 {
+            if table_leaf {
+                st = bnd[pj - 1]
+            } else {
+                st = bnd[pj - 1] + 1
+            }
+        }
+        var en: usize = total_n
+        if pj < npages - 1 {
+            en = bnd[pj]
+        }
+        var right: u32 = 0
+        if !leaf {
+            if pj < npages - 1 {
+                // the promoted cell's child pointer
+                right = b32(cl_ptr(g, bnd[pj]), 0) as u32
+            } else {
+                right = rights[nb - 1]
+            }
+        }
+        let wd: u64 = try pager.pager_write(pg, newp[pj])
+        try page_build(bt, newp[pj], wd, flags, g, st, en, right)
+        if pj < npages - 1 {
+            // the divider that goes up
+            var tmp: [u8; 16] = [0; 16]
+            if table_leaf {
+                let key: i64 = list_cell_rowid(g, en - 1)
+                w32((&tmp[0]) as u64, 0, newp[pj] as u64)
+                let n: usize = util.varint_put(((&tmp[0]) as u64) + 4, key as u64)
+                cl_push(&divs, (&tmp[0]) as u64, 4 + n)
+            } else if flags == 5 {
+                var key2: u64 = 0
+                util.varint_get(cl_ptr(g, bnd[pj]) + 4, cl_len(g, bnd[pj]) - 4, &key2)
+                w32((&tmp[0]) as u64, 0, newp[pj] as u64)
+                let n2: usize = util.varint_put(((&tmp[0]) as u64) + 4, key2)
+                cl_push(&divs, (&tmp[0]) as u64, 4 + n2)
+            } else if flags == 2 {
+                cl_push(&divs, cl_ptr(g, bnd[pj]), cl_len(g, bnd[pj]))
+                w32(cl_ptr(&divs, divs.n - 1), 0, newp[pj] as u64)
+            } else {
+                // index leaf cell: prefix the child pointer
+                let cl: usize = cl_len(g, bnd[pj])
+                var cb: rt.Buf = rt.buf_new()
+                rt.buf_reserve(&cb, cl + 8)
+                util.buf_put_be32(&cb, newp[pj] as u64)
+                rt.buf_push_bytes(&cb, cl_ptr(g, bnd[pj]), cl)
+                cl_push(&divs, rt.buf_ptr(&cb), rt.buf_len(&cb))
+                rt.buf_free(&cb)
+            }
+        }
+        pj = pj + 1
+    }
+    // ---- the new content of the parent
+    cl_clear(&(*bt).pend)
+    var pi: usize = 0
+    var dummy: CellInfo = cinfo_new()
+    while pi < i0 {
+        let o: usize = try cell_off(bt, &pinfo, pi)
+        try cell_parse(bt, &pinfo, o, &dummy)
+        cl_push(&(*bt).pend, pinfo.d + (o as u64), dummy.size)
+        pi = pi + 1
+    }
+    var dv: usize = 0
+    while dv < divs.n {
+        cl_push(&(*bt).pend, cl_ptr(&divs, dv), cl_len(&divs, dv))
+        dv = dv + 1
+    }
+    var new_right: u32 = pinfo.right
+    var rest: usize = i0 + nb - 1
+    if rest < ncp {
+        let o2: usize = try cell_off(bt, &pinfo, rest)
+        try cell_parse(bt, &pinfo, o2, &dummy)
+        cl_push(&(*bt).pend, pinfo.d + (o2 as u64), dummy.size)
+        w32(cl_ptr(&(*bt).pend, (*bt).pend.n - 1), 0, newp[npages - 1] as u64)
+        rest = rest + 1
+        while rest < ncp {
+            let o3: usize = try cell_off(bt, &pinfo, rest)
+            try cell_parse(bt, &pinfo, o3, &dummy)
+            cl_push(&(*bt).pend, pinfo.d + (o3 as u64), dummy.size)
+            rest = rest + 1
+        }
+    } else {
+        new_right = newp[npages - 1]
+    }
+    (*bt).pend.right = new_right
+    cl_free(&divs)
+    (*bt).pend_flags = pinfo.flags
+    // does it fit the parent?
+    var cost: usize = 0
+    var ci2: usize = 0
+    while ci2 < (*bt).pend.n {
+        cost = cost + cl_cost(&(*bt).pend, ci2)
+        ci2 = ci2 + 1
+    }
+    let pcap: usize = u - pinfo.h - 12
+    if cost <= pcap {
+        let wp: u64 = try pager.pager_write(pg, ppno)
+        try page_build(bt, ppno, wp, pinfo.flags, &(*bt).pend, 0, (*bt).pend.n, (*bt).pend.right)
+        (*bt).pend_active = false
+    } else {
+        (*bt).pend_active = true
+    }
+    return true
+}
+
+// A root with pending content: push the content into a new child and split it.
+fn balance_deeper(bt: *mut Bt, cur: *mut Cursor) -> DbError!bool {
+    let pg: *mut pager.Pager = (*bt).pg
+    let root: u32 = (*cur).pages[0]
+    let c0: u32 = try pager.pager_alloc_page(pg)
+    let wd: u64 = try pager.pager_write(pg, root)
+    var rfl: u64 = 5
+    if (*bt).pend_flags == 10 || (*bt).pend_flags == 2 {
+        rfl = 2
+    }
+    var empty: CellList = cl_new()
+    try page_build(bt, root, wd, rfl, &empty, 0, 0, c0)
+    cl_free(&empty)
+    (*cur).depth = 1
+    (*cur).pages[0] = root
+    (*cur).idx[0] = 0
+    (*cur).pages[1] = c0
+    try balance_nonroot(bt, cur, 1)
+    return true
+}
+
+// A root without cells and one child: pull the child up (if it fits).
+fn balance_shallower(bt: *mut Bt, root: u32) -> DbError!bool {
+    let pg: *mut pager.Pager = (*bt).pg
+    let u: usize = pager.pager_usable(pg)
+    while true {
+        let rd: u64 = try pager.pager_get(pg, root)
+        var ri: PageInfo = pinfo_new()
+        try page_info(bt, root, rd, &ri)
+        if ri.leaf || ri.ncells != 0 {
+            return true
+        }
+        let child: u32 = try child_at(bt, &ri, 0)
+        let cd: u64 = try pager.pager_get(pg, child)
+        var ci: PageInfo = pinfo_new()
+        try page_info(bt, child, cd, &ci)
+        cl_clear(&(*bt).gather)
+        try page_to_list(bt, &ci, &(*bt).gather)
+        var cost: usize = 0
+        var i: usize = 0
+        while i < (*bt).gather.n {
+            cost = cost + cl_cost(&(*bt).gather, i)
+            i = i + 1
+        }
+        var hs: usize = 12
+        if ci.leaf {
+            hs = 8
+        }
+        if cost > u - ri.h - hs {
+            return true
+        }
+        let wd: u64 = try pager.pager_write(pg, root)
+        try page_build(bt, root, wd, ci.flags, &(*bt).gather, 0, (*bt).gather.n, ci.right)
+        try pager.pager_free_page(pg, child)
+    }
+    return true
+}
+
+// After an insert that did not fit (pending content at `depth`) or a
+// delete (the page at `depth` may be too empty): rebalance upwards.
+fn balance(bt: *mut Bt, cur: *mut Cursor, depth: usize) -> DbError!bool {
+    let pg: *mut pager.Pager = (*bt).pg
+    var level: usize = depth
+    while true {
+        if level == 0 {
+            if (*bt).pend_active {
+                try balance_deeper(bt, cur)
+                level = 1
+                continue
+            }
+            try balance_shallower(bt, (*cur).pages[0])
+            return true
+        }
+        if !(*bt).pend_active {
+            let d: u64 = try pager.pager_get(pg, (*cur).pages[level])
+            var info: PageInfo = pinfo_new()
+            try page_info(bt, (*cur).pages[level], d, &info)
+            let uf: bool = try underfull(bt, &info)
+            if !uf {
+                return true
+            }
+        }
+        try balance_nonroot(bt, cur, level)
+        level = level - 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------- inserting
+// descends for a table insert; leaves the path in the cursor; the leaf's idx
+// is the lower bound of rowid (== ncells if after all)
+fn descend_table(bt: *mut Bt, cur: *mut Cursor, rowid: i64, info: *mut PageInfo, found: *mut bool) -> DbError!bool {
+    (*cur).on = false
+    (*cur).depth = 0
+    (*cur).pages[0] = (*cur).root
+    var ci: CellInfo = cinfo_new()
+    while true {
+        let dp: usize = (*cur).depth
+        try load_level(bt, cur, dp, info)
+        var lo: usize = 0
+        var hi: usize = (*info).ncells
+        while lo < hi {
+            let mid: usize = (lo + hi) / 2
+            let o: usize = try cell_off(bt, info, mid)
+            var key: i64 = 0
+            if !table_key_at(bt, info, o, &key) {
+                return dberr.fail(DbError::Corrupt, "cell runs past the end of the page")
+            }
+            if key < rowid {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        if (*info).leaf {
+            (*cur).idx[dp] = lo as i32
+            *found = false
+            if lo < (*info).ncells {
+                let o2: usize = try cell_off(bt, info, lo)
+                try cell_parse(bt, info, o2, &ci)
+                if ci.key == rowid {
+                    *found = true
+                }
+            }
+            return true
+        }
+        if dp + 1 >= MAX_DEPTH {
+            return dberr.fail(DbError::Corrupt, "b-tree is too deep (or has a cycle)")
+        }
+        let c: u32 = try child_at(bt, info, lo)
+        (*cur).idx[dp] = lo as i32
+        (*cur).depth = dp + 1
+        (*cur).pages[dp + 1] = c
+    }
+    return false
+}
+
+// Puts a cell at `idx` of the page at the cursor's depth (pending + balance if full).
+fn insert_at_level(bt: *mut Bt, cur: *mut Cursor, info: *mut PageInfo, idx: usize, cell: u64, len: usize) -> DbError!bool {
+    let pg: *mut pager.Pager = (*bt).pg
+    let dp: usize = (*cur).depth
+    let wd: u64 = try pager.pager_write(pg, (*info).pgno)
+    (*info).d = wd
+    let ok: bool = try page_try_insert(bt, info, idx, cell, len)
+    if ok {
+        return true
+    }
+    // appending to the right-most leaf of a table tree: the new cell gets a page of its own and
+    // the old page stays full (SQLite's balance_quick); the divider goes to the parent
+    if (*info).flags == 13 && idx == (*info).ncells && dp > 0 {
+        var rightmost: bool = true
+        var lv: usize = 0
+        while lv < dp {
+            let ppno: u32 = (*cur).pages[lv]
+            let pdq: u64 = try pager.pager_get(pg, ppno)
+            var pinfq: PageInfo = pinfo_new()
+            try page_info(bt, ppno, pdq, &pinfq)
+            if (*cur).idx[lv] as usize != pinfq.ncells {
+                rightmost = false
+            }
+            lv = lv + 1
+        }
+        if rightmost {
+            let ppno2: u32 = (*cur).pages[dp - 1]
+            let pd2: u64 = try pager.pager_get(pg, ppno2)
+            var pinf2: PageInfo = pinfo_new()
+            try page_info(bt, ppno2, pd2, &pinf2)
+            // the divider: [old leaf][rowid of its last cell]
+            var lastkey: i64 = 0
+            let lo: usize = try cell_off(bt, info, (*info).ncells - 1)
+            if !table_key_at(bt, info, lo, &lastkey) {
+                return dberr.fail(DbError::Corrupt, "cell runs past the end of the page")
+            }
+            var dv: [u8; 16] = [0; 16]
+            w32((&dv[0]) as u64, 0, (*info).pgno as u64)
+            let dn: usize = util.varint_put(((&dv[0]) as u64) + 4, lastkey as u64)
+            let pwd: u64 = try pager.pager_write(pg, ppno2)
+            pinf2.d = pwd
+            let room: bool = try page_try_insert(bt, &pinf2, pinf2.ncells, (&dv[0]) as u64, 4 + dn)
+            if room {
+                let np: u32 = try pager.pager_alloc_page(pg)
+                // the new leaf holds just the new cell
+                var one: CellList = cl_new()
+                cl_push(&one, cell, len)
+                let nd: u64 = try pager.pager_write(pg, np)
+                let br: DbError!bool = page_build(bt, np, nd, 13, &one, 0, 1, 0)
+                cl_free(&one)
+                try br
+                // the parent's right pointer
+                let pwd2: u64 = try pager.pager_write(pg, ppno2)
+                w32(pwd2, pinf2.h + 8, np as u64)
+                return true
+            }
+        }
+    }
+    // overflow: the page content plus the new cell becomes the pending list
+    cl_clear(&(*bt).pend)
+    var ci: CellInfo = cinfo_new()
+    var i: usize = 0
+    while i <= (*info).ncells {
+        if i == idx {
+            cl_push(&(*bt).pend, cell, len)
+        }
+        if i < (*info).ncells {
+            let o: usize = try cell_off(bt, info, i)
+            try cell_parse(bt, info, o, &ci)
+            cl_push(&(*bt).pend, (*info).d + (o as u64), ci.size)
+        }
+        i = i + 1
+    }
+    (*bt).pend.right = (*info).right
+    (*bt).pend_flags = (*info).flags
+    (*bt).pend_active = true
+    try balance(bt, cur, dp)
+    return true
+}
+
+// Removes the cell at the cursor's leaf idx, freeing its overflow pages; balances.
+fn delete_at_leaf(bt: *mut Bt, cur: *mut Cursor, info: *mut PageInfo) -> DbError!bool {
+    let pg: *mut pager.Pager = (*bt).pg
+    let dp: usize = (*cur).depth
+    let idx: usize = (*cur).idx[dp] as usize
+    let o: usize = try cell_off(bt, info, idx)
+    var ci: CellInfo = cinfo_new()
+    try cell_parse(bt, info, o, &ci)
+    if ci.ovfl != 0 {
+        try free_overflow(bt, ci.ovfl, ci.plen, ci.local)
+        // the page frame may have been recycled: fetch again
+        let d2: u64 = try pager.pager_get(pg, (*info).pgno)
+        try page_info(bt, (*info).pgno, d2, info)
+    }
+    let wd: u64 = try pager.pager_write(pg, (*info).pgno)
+    (*info).d = wd
+    try page_remove(bt, info, idx)
+    (*bt).pend_active = false
+    try balance(bt, cur, dp)
+    return true
+}
+
+// Inserts (or replaces) the row `rowid` with the record at (data, n).
+fn bt_table_insert(bt: *mut Bt, root: u32, rowid: i64, data: u64, n: usize) -> DbError!bool {
+    let pg: *mut pager.Pager = (*bt).pg
+    pager.pager_next_op(pg)
+    (*bt).pend_active = false
+    var cur: Cursor = cur_new(root, false)
+    var info: PageInfo = pinfo_new()
+    var found: bool = false
+    try descend_table(bt, &cur, rowid, &info, &found)
+    if found {
+        // replace: delete the old cell, then insert (the leaf may need a split)
+        let idx: usize = cur.idx[cur.depth] as usize
+        let o: usize = try cell_off(bt, &info, idx)
+        var oc: CellInfo = cinfo_new()
+        try cell_parse(bt, &info, o, &oc)
+        if oc.ovfl != 0 {
+            try free_overflow(bt, oc.ovfl, oc.plen, oc.local)
+            let d2: u64 = try pager.pager_get(pg, info.pgno)
+            try page_info(bt, info.pgno, d2, &info)
+        }
+        let wd: u64 = try pager.pager_write(pg, info.pgno)
+        info.d = wd
+        try page_remove(bt, &info, idx)
+    }
+    try build_cell(bt, true, rowid, data, n, &(*bt).cellbuf)
+    // building the overflow chain may have used cache frames: reload the leaf
+    pager.pager_next_op(pg)
+    let ld: u64 = try pager.pager_get(pg, cur.pages[cur.depth])
+    try page_info(bt, cur.pages[cur.depth], ld, &info)
+    try insert_at_level(bt, &cur, &info, cur.idx[cur.depth] as usize, rt.buf_ptr(&(*bt).cellbuf), rt.buf_len(&(*bt).cellbuf))
+    return true
+}
+
+fn bt_table_delete(bt: *mut Bt, root: u32, rowid: i64) -> DbError!bool {
+    let pg: *mut pager.Pager = (*bt).pg
+    pager.pager_next_op(pg)
+    (*bt).pend_active = false
+    var cur: Cursor = cur_new(root, false)
+    var info: PageInfo = pinfo_new()
+    var found: bool = false
+    try descend_table(bt, &cur, rowid, &info, &found)
+    if !found {
+        return false
+    }
+    try delete_at_leaf(bt, &cur, &info)
+    return true
+}
+
+// Descends for an index key: the path is left in the cursor; `found` says
+// whether an entry equal over key.n columns exists at the final (page, idx);
+// the final page may be interior (found there) or a leaf.
+fn descend_index(bt: *mut Bt, cur: *mut Cursor, key: *mut record.UKey, info: *mut PageInfo, found: *mut bool) -> DbError!bool {
+    (*cur).on = false
+    (*cur).depth = 0
+    (*cur).pages[0] = (*cur).root
+    var ci: CellInfo = cinfo_new()
+    var pl: Payload = Payload { p: 0, n: 0 }
+    *found = false
+    while true {
+        let dp: usize = (*cur).depth
+        try load_level(bt, cur, dp, info)
+        var lo: usize = 0
+        var hi: usize = (*info).ncells
+        var eq: bool = false
+        while lo < hi {
+            let mid: usize = (lo + hi) / 2
+            let o: usize = try cell_off(bt, info, mid)
+            try cell_parse(bt, info, o, &ci)
+            try payload_get(bt, info, &ci, &pl)
+            let r: i64 = try record.rec_compare_key(pl.p, pl.n, key)
+            if r == 0 {
+                lo = mid
+                hi = mid
+                eq = true
+            } else if r < 0 {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        (*cur).idx[dp] = lo as i32
+        if eq {
+            *found = true
+            return true
+        }
+        if (*info).leaf {
+            return true
+        }
+        if dp + 1 >= MAX_DEPTH {
+            return dberr.fail(DbError::Corrupt, "b-tree is too deep (or has a cycle)")
+        }
+        let c: u32 = try child_at(bt, info, lo)
+        (*cur).depth = dp + 1
+        (*cur).pages[dp + 1] = c
+    }
+    return false
+}
+
+// Inserts the index record at (data, n); `key` describes the same record
+// (all its columns). False if an equal entry exists already.
+fn bt_index_insert(bt: *mut Bt, root: u32, key: *mut record.UKey, data: u64, n: usize) -> DbError!bool {
+    let pg: *mut pager.Pager = (*bt).pg
+    pager.pager_next_op(pg)
+    (*bt).pend_active = false
+    var cur: Cursor = cur_new(root, true)
+    var info: PageInfo = pinfo_new()
+    var found: bool = false
+    try descend_index(bt, &cur, key, &info, &found)
+    if found {
+        return false
+    }
+    try build_cell(bt, false, 0, data, n, &(*bt).cellbuf)
+    pager.pager_next_op(pg)
+    let ld: u64 = try pager.pager_get(pg, cur.pages[cur.depth])
+    try page_info(bt, cur.pages[cur.depth], ld, &info)
+    try insert_at_level(bt, &cur, &info, cur.idx[cur.depth] as usize, rt.buf_ptr(&(*bt).cellbuf), rt.buf_len(&(*bt).cellbuf))
+    return true
+}
+
+// Deletes the entry equal to `key` (over key.n columns, normally all of them).
+fn bt_index_delete(bt: *mut Bt, root: u32, key: *mut record.UKey) -> DbError!bool {
+    let pg: *mut pager.Pager = (*bt).pg
+    pager.pager_next_op(pg)
+    (*bt).pend_active = false
+    var cur: Cursor = cur_new(root, true)
+    var info: PageInfo = pinfo_new()
+    var found: bool = false
+    try descend_index(bt, &cur, key, &info, &found)
+    if !found {
+        return false
+    }
+    if info.leaf {
+        try delete_at_leaf(bt, &cur, &info)
+        return true
+    }
+    // an entry of an interior page: take the predecessor out of its leaf and
+    // put it in the place of this entry
+    let dp: usize = cur.depth
+    let idx: usize = cur.idx[dp] as usize
+    var saved: rt.Buf = rt.buf_new()
+    // the predecessor: rightmost entry of the left subtree
+    var pc: Cursor = cur
+    let lc: u32 = try child_at(bt, &info, idx)
+    pc.depth = dp + 1
+    pc.pages[dp + 1] = lc
+    pc.idx[dp] = idx as i32
+    var pinf: PageInfo = pinfo_new()
+    try descend_rightmost(bt, &pc, &pinf)
+    pc.on = true
+    let pl: Payload = try bt_payload(bt, &pc)
+    rt.buf_push_bytes(&saved, pl.p, pl.n)
+    // remove that predecessor from the tree (normal leaf delete with balance)
+    try delete_at_leaf(bt, &pc, &pinf)
+    // find the original entry again: it may have moved
+    pager.pager_next_op(pg)
+    (*bt).pend_active = false
+    var cur2: Cursor = cur_new(root, true)
+    var info2: PageInfo = pinfo_new()
+    var found2: bool = false
+    try descend_index(bt, &cur2, key, &info2, &found2)
+    if !found2 {
+        rt.buf_free(&saved)
+        return dberr.fail(DbError::Corrupt, "index entry vanished during a delete")
+    }
+    var pkey: record.UKey = record.UKey { n: 0, desc: (*key).desc, vals: 0 }
+    if info2.leaf {
+        try delete_at_leaf(bt, &cur2, &info2)
+        // the predecessor goes back in as an ordinary entry
+        var vals: rt.Buf = rt.buf_new()
+        rt.buf_reserve(&vals, 2000 * 40)
+        let nc: usize = try record.rec_decode(rt.buf_ptr(&saved), rt.buf_len(&saved), (rt.buf_ptr(&vals)) as *mut record.Val, 2000)
+        pkey.n = nc
+        pkey.vals = rt.buf_ptr(&vals)
+        let r: DbError!bool = bt_index_insert(bt, root, &pkey, rt.buf_ptr(&saved), rt.buf_len(&saved))
+        rt.buf_free(&vals)
+        rt.buf_free(&saved)
+        try r
+        return true
+    }
+    // still an interior entry: replace its cell by [old left child][predecessor]
+    let dp2: usize = cur2.depth
+    let idx2: usize = cur2.idx[dp2] as usize
+    let o: usize = try cell_off(bt, &info2, idx2)
+    var oc: CellInfo = cinfo_new()
+    try cell_parse(bt, &info2, o, &oc)
+    let left_child: u32 = oc.child
+    if oc.ovfl != 0 {
+        try free_overflow(bt, oc.ovfl, oc.plen, oc.local)
+        let d3: u64 = try pager.pager_get(pg, info2.pgno)
+        try page_info(bt, info2.pgno, d3, &info2)
+    }
+    let wd: u64 = try pager.pager_write(pg, info2.pgno)
+    info2.d = wd
+    try page_remove(bt, &info2, idx2)
+    try build_cell(bt, false, 0, rt.buf_ptr(&saved), rt.buf_len(&saved), &(*bt).cellbuf)
+    // prefix the child pointer
+    rt.buf_clear(&(*bt).cellbuf2)
+    util.buf_put_be32(&(*bt).cellbuf2, left_child as u64)
+    rt.buf_push_bytes(&(*bt).cellbuf2, rt.buf_ptr(&(*bt).cellbuf), rt.buf_len(&(*bt).cellbuf))
+    rt.buf_free(&saved)
+    pager.pager_next_op(pg)
+    let d4: u64 = try pager.pager_get(pg, cur2.pages[dp2])
+    try page_info(bt, cur2.pages[dp2], d4, &info2)
+    try insert_at_level(bt, &cur2, &info2, idx2, rt.buf_ptr(&(*bt).cellbuf2), rt.buf_len(&(*bt).cellbuf2))
+    return true
+}
+
+// -------------------------------------------------------- self checking
+struct CheckStats {
+    pages: u64,
+    cells: u64,
+    leaf_depth: i64,
+    problems: u64,
+    bytes_free: u64,
+}
+
+fn check_note(st: *mut CheckStats, s: str) {
+    (*st).problems = (*st).problems + 1
+    if (*st).problems == 1 {
+        dberr.set_message(s)
+    }
+}
+
+// Walks a tree and checks: page types, cell bounds, no overlap, key order
+// (table: rowids rise; index: records rise), all leaves at one depth, child
+// numbers in range. The first problem is in dberr.last_message().
+fn check_page(bt: *mut Bt, pno: u32, depth: usize, index: bool, lo: *mut i64, has_lo: *mut bool,
+    st: *mut CheckStats, hi_key: i64, has_hi: bool) -> DbError!bool {
+    if depth >= MAX_DEPTH {
+        check_note(st, "tree too deep")
+        return true
+    }
+    let pg: *mut pager.Pager = (*bt).pg
+    pager.pager_next_op(pg)
+    let d: u64 = try pager.pager_get(pg, pno)
+    var info: PageInfo = pinfo_new()
+    try page_info(bt, pno, d, &info)
+    (*st).pages = (*st).pages + 1
+    let u: usize = pager.pager_usable(pg)
+    // cell extents must not overlap
+    var seen: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&seen, u + 8)
+    util.zero_bytes(rt.buf_ptr(&seen), u + 8)
+    rt.buf_set_len(&seen, u)
+    var ci: CellInfo = cinfo_new()
+    var i: usize = 0
+    var prev_key: i64 = 0
+    var have_prev: bool = false
+    while i < info.ncells {
+        let o: usize = try cell_off(bt, &info, i)
+        try cell_parse(bt, &info, o, &ci)
+        var b: usize = 0
+        while b < ci.size {
+            if o + b >= u || rt.ld8(rt.buf_ptr(&seen), o + b) != 0 as u8 {
+                check_note(st, "overlapping cells")
+                break
+            }
+            rt.st8(rt.buf_ptr(&seen), o + b, 1 as u8)
+            b = b + 1
+        }
+        if o < info.cstart {
+            check_note(st, "cell below the content start")
+        }
+        (*st).cells = (*st).cells + 1
+        if !index {
+            if info.leaf {
+                if have_prev && ci.key <= prev_key {
+                    check_note(st, "rowids do not rise")
+                }
+                if has_hi && ci.key > hi_key {
+                    check_note(st, "rowid above the divider")
+                }
+                prev_key = ci.key
+                have_prev = true
+            }
+        }
+        i = i + 1
+    }
+    rt.buf_free(&seen)
+    let fr: usize = try page_free_total(bt, &info)
+    (*st).bytes_free = (*st).bytes_free + (fr as u64)
+    if info.leaf {
+        if (*st).leaf_depth < 0 {
+            (*st).leaf_depth = depth as i64
+        } else if (*st).leaf_depth != depth as i64 {
+            check_note(st, "leaves at different depths")
+        }
+        return true
+    }
+    // interior: children
+    var j: usize = 0
+    var last_key: i64 = 0
+    var has_last: bool = false
+    while j <= info.ncells {
+        pager.pager_next_op(pg)
+        let d2: u64 = try pager.pager_get(pg, pno)
+        info.d = d2
+        let c: u32 = try child_at(bt, &info, j)
+        var key: i64 = 0
+        var khi: bool = false
+        if j < info.ncells {
+            let o: usize = try cell_off(bt, &info, j)
+            try cell_parse(bt, &info, o, &ci)
+            key = ci.key
+            khi = true
+            if !index {
+                if has_last && key <= last_key {
+                    check_note(st, "divider keys do not rise")
+                }
+                last_key = key
+                has_last = true
+            }
+        }
+        if !index {
+            try check_page(bt, c, depth + 1, index, lo, has_lo, st, key, khi)
+        } else {
+            try check_page(bt, c, depth + 1, index, lo, has_lo, st, 0, false)
+        }
+        j = j + 1
+    }
+    return true
+}
+
+fn bt_check(bt: *mut Bt, root: u32, index: bool, st: *mut CheckStats) -> DbError!bool {
+    (*st).pages = 0
+    (*st).cells = 0
+    (*st).leaf_depth = -1
+    (*st).problems = 0
+    (*st).bytes_free = 0
+    var lo: i64 = 0
+    var has_lo: bool = false
+    try check_page(bt, root, 0, index, &lo, &has_lo, st, 0, false)
+    return (*st).problems == 0
+}

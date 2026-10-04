@@ -32,6 +32,7 @@ Details per platform and the list of what is missing: [section 7](#7-platform-la
 | `update` | the updater: check, download, verify, replace, confirm, roll back; background worker; the status the UI reads |
 | `catalog` | the store's `entry.json` and catalog: signature, freshness, hashes, choosing the build of this platform, comparing versions |
 | `fetch` | one streamed HTTP(S) GET with SHA-256 on the way, progress and cancel (names through `net.dns`, https through `tls.trust`) |
+| `fleitec_login` | "Sign in with Fleitec-ID": login / me / logout against the ID server, token in the keyring (see [OAUTH.md](OAUTH.md)) |
 | `version` | semantic versions (`1.2.3`, `1.2.3-beta.1`) and their order |
 | `config` | settings in one small JSON file, atomic save |
 | `log` | a log file with levels and rotation |
@@ -338,6 +339,22 @@ the same signatures and that each type-checks.
 * **All**: hidden/encrypted store channels, HTTP range/resume, proxies, IPv6
   and delta (`diffs`) downloads are not implemented; a download restarts from
   zero.
+
+### Packaging and the update
+
+Installers and packages are in [PACKAGING.md](PACKAGING.md). What they change for the updater:
+
+* **installed by `setup.exe`** (per user, `%LOCALAPPDATA%\Programs\<name>`): the folder is the user's, so the update is the rename
+  of section 4 as before; after an update `installed.sync_version(id, version)` (`lib/pack/installed.fi`, the template calls it once the
+  new version is healthy) rewrites `DisplayVersion` in "Apps & features".
+* **portable**: a file `portable.txt` next to the program keeps config, data, state, cache and logs in `<program folder>/data/...`
+  (`plat_dir`; Linux and Windows).
+* **AppImage / self-extracting `.run`**: `$APPIMAGE` is the file; `plat_art()` is `appimage`, `plat_exe_path()` is `$APPIMAGE`, so the
+  update replaces the AppImage itself.
+* the Windows exe that the store serves is the one with the icon patched in (`pack.py pe-icon`), the same file the installer carries.
+* **fUi windows on Windows**: the Win32 back end and a system font are now chosen for `--target=x86_64-windows`
+  (`lib/@windows/`, `target::platform_dir`); before, the template's window died with "no X server reachable" under Wine.
+  Still not seen on a real Windows.
 
 ## 8. Tests
 

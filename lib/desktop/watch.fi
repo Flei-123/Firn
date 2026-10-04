@@ -1,0 +1,443 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/desktop/watch.fi -- desktop.watch: be told when files in a folder change. Linux (inotify).
+//
+//     import desktop.watch
+//
+//     var w: watch.Watcher = watch.watch_new()
+//     watch.watch_add(&w, "/home/me/mods", true)             // true = the folders below it too
+//     var ev: watch.WatchEvent = watch.watch_event_zero()
+//     while watch.watch_poll(&w, 1000, &ev) {                 // waits up to 1000 ms; false = quiet
+//         // ev.kind: CREATED, MODIFIED, DELETED, RENAMED_FROM, RENAMED_TO, ATTRIB, OVERFLOW, ROOT_GONE
+//         // ev.is_dir, ev.cookie (links RENAMED_FROM with its RENAMED_TO), watch.watch_event_path(&w)
+//     }
+//     watch.watch_close(&w)
+//
+// The same names exist in `watch.windows.fi` (ReadDirectoryChangesW) and in the
+// stubs `watch_macos.fi` (FSEvents would be the API), `lib/@android/desktop/watch.fi`
+// (FileObserver) and `watch_osum.fi`; `tools/desktop/platforms.py` checks the export lists.
+//
+// WHAT IT REPORTS. The path is the full path of the entry (`<watched folder>/<name>`),
+// valid until the next `watch_poll`. A write is MODIFIED (inotify's IN_MODIFY and
+// IN_CLOSE_WRITE both become MODIFIED, so a program that copies a file gets one or
+// two events, not a guaranteed count -- debounce if it matters). A rename inside
+// the watched tree is RENAMED_FROM + RENAMED_TO with the same `cookie`; a move out
+// of the tree is a lone RENAMED_FROM, a move in a lone RENAMED_TO.
+//
+// HONEST
+// W1  RECURSIVE watching adds an inotify watch per folder, at the time a folder
+//     appears. Between the folder's creation and the new watch, files may be
+//     created that inotify never reports; the library scans the new folder and
+//     makes CREATED events for what it finds there, so nothing is missed -- but
+//     an entry can be reported twice (once by the scan, once by inotify).
+// W2  The kernel's limit `fs.inotify.max_user_watches` (8192 on older systems,
+//     often 65536+ now) bounds the number of folders. When it is hit,
+//     `watch_add` returns false (or an OVERFLOW event appears for the folders
+//     that did not fit).
+// W3  The queue of the kernel can overflow when the program is slow: OVERFLOW
+//     tells to rescan. No events are invented to repair that.
+// W4  A watched folder that is deleted or moved away gives ROOT_GONE (for the
+//     folder you added) and its watch ends.
+// W5  Links are not followed (IN_DONT_FOLLOW). Network file systems report only
+//     the changes made by this machine.
+import std.rt
+import std.str
+import std.dir
+import net.unix
+
+export {
+    Watcher, WatchEvent,
+    watch_new, watch_add, watch_poll, watch_event_path, watch_event_zero, watch_close, watch_fd,
+    EV_NONE, EV_CREATED, EV_MODIFIED, EV_DELETED, EV_RENAMED_FROM, EV_RENAMED_TO, EV_ATTRIB,
+    EV_OVERFLOW, EV_ROOT_GONE,
+}
+
+const EV_NONE: u32 = 0
+const EV_CREATED: u32 = 1
+const EV_MODIFIED: u32 = 2
+const EV_DELETED: u32 = 3
+const EV_RENAMED_FROM: u32 = 4
+const EV_RENAMED_TO: u32 = 5
+const EV_ATTRIB: u32 = 6
+const EV_OVERFLOW: u32 = 7
+const EV_ROOT_GONE: u32 = 8
+
+const SYS_INOTIFY_INIT1: i64 = 294
+const SYS_INOTIFY_ADD_WATCH: i64 = 254
+const SYS_INOTIFY_RM_WATCH: i64 = 255
+
+const IN_MODIFY: u32 = 2
+const IN_ATTRIB: u32 = 4
+const IN_CLOSE_WRITE: u32 = 8
+const IN_MOVED_FROM: u32 = 64
+const IN_MOVED_TO: u32 = 128
+const IN_CREATE: u32 = 256
+const IN_DELETE: u32 = 512
+const IN_DELETE_SELF: u32 = 1024
+const IN_MOVE_SELF: u32 = 2048
+const IN_Q_OVERFLOW: u32 = 16384
+const IN_IGNORED: u32 = 32768
+const IN_ONLYDIR: u32 = 16777216
+const IN_DONT_FOLLOW: u32 = 33554432
+const IN_ISDIR: u32 = 1073741824
+const IN_NONBLOCK_CLOEXEC: i64 = 526336 // O_NONBLOCK | O_CLOEXEC
+
+const MASK: u32 = 2 | 4 | 8 | 64 | 128 | 256 | 512 | 1024 | 2048 | 16777216 | 33554432
+
+struct WatchEvent {
+    kind: u32,
+    is_dir: bool,
+    cookie: u32,
+}
+
+fn watch_event_zero() -> WatchEvent {
+    return WatchEvent { kind: 0 as u32, is_dir: false, cookie: 0 as u32 }
+}
+
+struct Watcher {
+    fd: i32,
+    recursive: bool,
+    dirs: rt.Buf, // records: i32 wd, u32 flags (1 = a root), u32 path length, path padded to 4
+    raw: rt.Buf, // inotify bytes read, not consumed yet
+    raw_at: usize,
+    queue: rt.Buf, // synthetic events: u32 kind, u32 is_dir, u32 path length, path padded to 4
+    path: rt.Buf, // the path of the event last returned
+}
+
+fn watch_new() -> Watcher {
+    let fd: i64 = syscall(SYS_INOTIFY_INIT1, IN_NONBLOCK_CLOEXEC, 0, 0, 0, 0, 0)
+    var w: Watcher = Watcher { fd: -1, recursive: false, dirs: rt.buf_new(), raw: rt.buf_new(), raw_at: 0,
+        queue: rt.buf_new(), path: rt.buf_new() }
+    if fd >= 0 {
+        w.fd = fd as i32
+    }
+    return w
+}
+
+fn watch_fd(w: *mut Watcher) -> i32 {
+    return (*w).fd
+}
+
+fn put_u32(b: *mut rt.Buf, v: u32) {
+    var le: [u8; 4] = [0; 4]
+    le[0] = (v & 255 as u32) as u8
+    le[1] = ((v >> 8) & 255 as u32) as u8
+    le[2] = ((v >> 16) & 255 as u32) as u8
+    le[3] = ((v >> 24) & 255 as u32) as u8
+    rt.buf_push_bytes(b, (&le[0]) as u64, 4)
+}
+
+fn get_u32(p: u64) -> u32 {
+    return (rt.ld8(p, 0) as u32) | ((rt.ld8(p, 1) as u32) << 8) | ((rt.ld8(p, 2) as u32) << 16)
+        | ((rt.ld8(p, 3) as u32) << 24)
+}
+
+fn pad_buf4(b: *mut rt.Buf) {
+    while rt.buf_len(b) % 4 != 0 {
+        rt.buf_push(b, 0 as u8)
+    }
+}
+
+// Adds ONE inotify watch for `path`; records it. false = refused by the kernel.
+fn add_one(w: *mut Watcher, path: str, root: bool) -> bool {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.length())
+    rt.buf_push(&c, 0 as u8)
+    let wd: i64 = syscall(SYS_INOTIFY_ADD_WATCH, (*w).fd as i64, rt.buf_ptr(&c) as i64, MASK as i64, 0, 0, 0)
+    rt.buf_free(&c)
+    if wd < 0 {
+        return false
+    }
+    // a second add of the same directory gives the same wd: keep one record
+    let p: u64 = rt.buf_ptr(&(*w).dirs)
+    var off: usize = 0
+    while off < rt.buf_len(&(*w).dirs) {
+        let l: usize = get_u32(p + off as u64 + 8) as usize
+        if get_u32(p + off as u64) == wd as u32 {
+            return true
+        }
+        off = off + 12 + (l + 3) / 4 * 4
+    }
+    put_u32(&(*w).dirs, wd as u32)
+    var fl: u32 = 0
+    if root {
+        fl = 1 as u32
+    }
+    put_u32(&(*w).dirs, fl)
+    put_u32(&(*w).dirs, path.length() as u32)
+    rt.buf_push_bytes(&(*w).dirs, path.p as u64, path.length())
+    pad_buf4(&(*w).dirs)
+    return true
+}
+
+fn join(out: *mut rt.Buf, a: str, b: str) {
+    rt.buf_push_bytes(out, a.p as u64, a.length())
+    if a.length() > 0 && a.chars(a.length() - 1) != 47 as u8 {
+        rt.buf_push(out, 47 as u8)
+    }
+    rt.buf_push_bytes(out, b.p as u64, b.length())
+}
+
+fn queue_push(w: *mut Watcher, kind: u32, is_dir: bool, path: str) {
+    put_u32(&(*w).queue, kind)
+    if is_dir {
+        put_u32(&(*w).queue, 1 as u32)
+    } else {
+        put_u32(&(*w).queue, 0 as u32)
+    }
+    put_u32(&(*w).queue, path.length() as u32)
+    rt.buf_push_bytes(&(*w).queue, path.p as u64, path.length())
+    pad_buf4(&(*w).queue)
+}
+
+// Adds watches for `path` and, when `recursive`, for every folder below it
+// (to a depth of 64). `emit` = also queue CREATED for what is found (a folder
+// that appeared while we were not watching it yet).
+fn add_tree(w: *mut Watcher, path: str, recursive: bool, root: bool, emit: bool, depth: u32) -> bool {
+    if !add_one(w, path, root) {
+        return false
+    }
+    if !recursive || depth >= 64 as u32 {
+        return true
+    }
+    // collect the children first: `dir` hands out views into one block
+    var kids: rt.Buf = rt.buf_new() // records: u32 is_dir, u32 length, name padded
+    var d: dir.Dir = dir.open(path)
+    while dir.is_open(&d) && dir.next(&d) {
+        let isd: bool = d.kind == dir.KIND_DIR
+        var n: str = d.name
+        put_u32(&kids, 0 as u32)
+        if isd {
+            put_u32(&kids, 1 as u32)
+        } else {
+            put_u32(&kids, 0 as u32)
+        }
+        put_u32(&kids, n.length() as u32)
+        rt.buf_push_bytes(&kids, n.p as u64, n.length())
+        pad_buf4(&kids)
+    }
+    dir.close(&d)
+    let p: u64 = rt.buf_ptr(&kids)
+    var off: usize = 0
+    while off < rt.buf_len(&kids) {
+        let isd: bool = get_u32(p + off as u64 + 4) == 1 as u32
+        let l: usize = get_u32(p + off as u64 + 8) as usize
+        let name: str = str { p: (p + off as u64 + 12) as *mut u8, n: l }
+        var full: rt.Buf = rt.buf_new()
+        join(&full, path, name)
+        let fs: str = str { p: rt.buf_data(&full), n: rt.buf_len(&full) }
+        if emit {
+            queue_push(w, EV_CREATED, isd, fs)
+        }
+        if isd {
+            add_tree(w, fs, true, false, emit, depth + 1 as u32)
+        }
+        rt.buf_free(&full)
+        off = off + 12 + (l + 3) / 4 * 4
+    }
+    rt.buf_free(&kids)
+    return true
+}
+
+fn watch_add(w: *mut Watcher, path: str, recursive: bool) -> bool {
+    if (*w).fd < 0 || path.length() == 0 {
+        return false
+    }
+    if recursive {
+        (*w).recursive = true
+    }
+    return add_tree(w, path, recursive, true, false, 0 as u32)
+}
+
+fn dir_of(w: *mut Watcher, wd: u32, out: *mut rt.Buf, root: *mut bool) -> bool {
+    let p: u64 = rt.buf_ptr(&(*w).dirs)
+    var off: usize = 0
+    while off < rt.buf_len(&(*w).dirs) {
+        let l: usize = get_u32(p + off as u64 + 8) as usize
+        if get_u32(p + off as u64) == wd {
+            rt.buf_push_bytes(out, p + off as u64 + 12, l)
+            *root = (get_u32(p + off as u64 + 4) & 1 as u32) != 0 as u32
+            return true
+        }
+        off = off + 12 + (l + 3) / 4 * 4
+    }
+    return false
+}
+
+fn forget_wd(w: *mut Watcher, wd: u32) {
+    let total: usize = rt.buf_len(&(*w).dirs)
+    let p: u64 = rt.buf_ptr(&(*w).dirs)
+    var off: usize = 0
+    while off < total {
+        let l: usize = get_u32(p + off as u64 + 8) as usize
+        let rec: usize = 12 + (l + 3) / 4 * 4
+        if get_u32(p + off as u64) == wd {
+            rt.mem_copy(p + off as u64, p + (off + rec) as u64, total - off - rec)
+            rt.buf_set_len(&(*w).dirs, total - rec)
+            return
+        }
+        off = off + rec
+    }
+}
+
+fn set_event(w: *mut Watcher, ev: *mut WatchEvent, kind: u32, is_dir: bool, cookie: u32, path: str) {
+    rt.buf_clear(&(*w).path)
+    rt.buf_push_bytes(&(*w).path, path.p as u64, path.length())
+    (*ev).kind = kind
+    (*ev).is_dir = is_dir
+    (*ev).cookie = cookie
+}
+
+// The full path of the event last returned (valid until the next `watch_poll`).
+fn watch_event_path(w: *mut Watcher) -> str {
+    return str { p: rt.buf_data(&(*w).path), n: rt.buf_len(&(*w).path) }
+}
+
+// Takes one event out of the synthetic queue. false = empty.
+fn queue_take(w: *mut Watcher, ev: *mut WatchEvent) -> bool {
+    let total: usize = rt.buf_len(&(*w).queue)
+    if total < 12 {
+        return false
+    }
+    let p: u64 = rt.buf_ptr(&(*w).queue)
+    let l: usize = get_u32(p + 8) as usize
+    let rec: usize = 12 + (l + 3) / 4 * 4
+    set_event(w, ev, get_u32(p), get_u32(p + 4) == 1 as u32, 0 as u32, str { p: (p + 12) as *mut u8, n: l })
+    rt.mem_copy(p, p + rec as u64, total - rec)
+    rt.buf_set_len(&(*w).queue, total - rec)
+    return true
+}
+
+// Looks for the next event in the bytes already read. true = `ev` filled.
+fn next_from_raw(w: *mut Watcher, ev: *mut WatchEvent) -> bool {
+    while (*w).raw_at + 16 <= rt.buf_len(&(*w).raw) {
+        let base: u64 = rt.buf_ptr(&(*w).raw) + (*w).raw_at as u64
+        let wd: u32 = get_u32(base)
+        let mask: u32 = get_u32(base + 4)
+        let cookie: u32 = get_u32(base + 8)
+        let nlen: usize = get_u32(base + 12) as usize
+        if (*w).raw_at + 16 + nlen > rt.buf_len(&(*w).raw) {
+            break
+        }
+        // the name is NUL padded to nlen
+        var n: usize = 0
+        while n < nlen && rt.ld8(base + 16, n) != 0 as u8 {
+            n = n + 1
+        }
+        let name: str = str { p: (base + 16) as *mut u8, n: n }
+        (*w).raw_at = (*w).raw_at + 16 + nlen
+        if (mask & IN_Q_OVERFLOW) != 0 as u32 {
+            set_event(w, ev, EV_OVERFLOW, false, 0 as u32, "")
+            return true
+        }
+        var parent: rt.Buf = rt.buf_new()
+        var is_root: bool = false
+        let known: bool = dir_of(w, wd, &parent, &is_root)
+        if (mask & IN_IGNORED) != 0 as u32 {
+            forget_wd(w, wd)
+            rt.buf_free(&parent)
+            continue
+        }
+        if !known {
+            rt.buf_free(&parent)
+            continue
+        }
+        let pdir: str = str { p: rt.buf_data(&parent), n: rt.buf_len(&parent) }
+        let isd: bool = (mask & IN_ISDIR) != 0 as u32
+        var full: rt.Buf = rt.buf_new()
+        if name.length() > 0 {
+            join(&full, pdir, name)
+        } else {
+            rt.buf_push_bytes(&full, pdir.p as u64, pdir.length())
+        }
+        let fs: str = str { p: rt.buf_data(&full), n: rt.buf_len(&full) }
+        var kind: u32 = 0
+        if (mask & (IN_DELETE_SELF | IN_MOVE_SELF)) != 0 as u32 {
+            if is_root {
+                kind = EV_ROOT_GONE
+            } else {
+                kind = 0 as u32 // a sub folder: its parent reports the delete / move
+            }
+        } else if (mask & IN_CREATE) != 0 as u32 {
+            kind = EV_CREATED
+        } else if (mask & IN_MOVED_TO) != 0 as u32 {
+            kind = EV_RENAMED_TO
+        } else if (mask & IN_MOVED_FROM) != 0 as u32 {
+            kind = EV_RENAMED_FROM
+        } else if (mask & IN_DELETE) != 0 as u32 {
+            kind = EV_DELETED
+        } else if (mask & (IN_MODIFY | IN_CLOSE_WRITE)) != 0 as u32 {
+            kind = EV_MODIFIED
+        } else if (mask & IN_ATTRIB) != 0 as u32 {
+            kind = EV_ATTRIB
+        }
+        if kind != 0 as u32 {
+            set_event(w, ev, kind, isd, cookie, fs)
+            // a new folder (created or moved in) under a recursive watch: watch it, scan it
+            if (kind == EV_CREATED || kind == EV_RENAMED_TO) && isd && (*w).recursive {
+                // the event must be handed out first: copy the path, add, queue the scan
+                var keep: rt.Buf = rt.buf_new()
+                rt.buf_push_bytes(&keep, fs.p as u64, fs.length())
+                add_tree(w, str { p: rt.buf_data(&keep), n: rt.buf_len(&keep) }, true, false, true, 0 as u32)
+                rt.buf_free(&keep)
+            }
+            rt.buf_free(&full)
+            rt.buf_free(&parent)
+            return true
+        }
+        rt.buf_free(&full)
+        rt.buf_free(&parent)
+    }
+    return false
+}
+
+// Waits up to `ms` milliseconds (0 = look only, < 0 = wait) for the next event.
+fn watch_poll(w: *mut Watcher, ms: i64, ev: *mut WatchEvent) -> bool {
+    if (*w).fd < 0 {
+        return false
+    }
+    var waited: bool = false
+    while true {
+        if next_from_raw(w, ev) {
+            return true
+        }
+        if queue_take(w, ev) {
+            return true
+        }
+        // all raw bytes used: read more
+        rt.buf_clear(&(*w).raw)
+        (*w).raw_at = 0
+        var tmp: [u8; 4096] = [0; 4096]
+        var r: i64 = unix.fd_read((*w).fd, (&tmp[0]) as u64, 4096)
+        if r == unix.ERR_AGAIN {
+            if waited || ms == 0 {
+                return false
+            }
+            let wr: i32 = unix.fd_wait((*w).fd, unix.WAIT_READ, ms)
+            waited = true
+            if wr <= 0 {
+                return false
+            }
+            continue
+        }
+        if r <= 0 {
+            return false
+        }
+        rt.buf_push_bytes(&(*w).raw, (&tmp[0]) as u64, r as usize)
+        waited = false
+        if ms > 0 {
+            waited = false
+        }
+    }
+    return false
+}
+
+fn watch_close(w: *mut Watcher) {
+    if (*w).fd >= 0 {
+        unix.fd_close((*w).fd)
+        (*w).fd = -1
+    }
+    rt.buf_free(&(*w).dirs)
+    rt.buf_free(&(*w).raw)
+    rt.buf_free(&(*w).queue)
+    rt.buf_free(&(*w).path)
+}

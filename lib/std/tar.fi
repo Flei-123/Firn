@@ -28,6 +28,8 @@
 //     everything else (device nodes, fifos, volume labels, ...) is LISTED
 //     as `TAR_OTHER` and REFUSED by `tar_extract_all`.
 //   * gzip: `tar_open_auto` recognises 1f 8b and inflates with a size limit.
+//     zstd, xz, bzip2 and lz4 (tar.zst, tar.xz, tar.bz2, tar.lz4; found by their
+//     magic) go the same way through lib/compress (compress.auto), also with the limit.
 //
 // WHAT AN EXTRACTION REFUSES (all before the first byte is written -- an
 // archive with one bad entry changes nothing on disk): unsafe names and link
@@ -65,6 +67,8 @@ import std.rt
 import std.vec
 import std.map
 import std.deflate
+import compress.common
+import compress.auto
 import std.osinfo
 import std.fs
 import std.dir
@@ -74,7 +78,7 @@ export {
     TarReader, TarEntry, TarLimits, TarWriter,
     TAR_FILE, TAR_DIR, TAR_SYMLINK, TAR_HARDLINK, TAR_OTHER,
     tar_limits_default, tar_reader_open, tar_reader_open_limits, tar_reader_free,
-    tar_open_auto, targz_inflate, targz_compress,
+    tar_open_auto, targz_inflate, targz_compress, tarz_inflate, is_tarz_kind,
     tar_entry_count, tar_entry_name, tar_entry_link, tar_entry_kind,
     tar_entry_mode, tar_entry_size, tar_entry_mtime, tar_entry_data,
     tar_find, tar_extract, tar_extract_all, tar_name_is_safe,
@@ -671,6 +675,42 @@ fn gz_error(why: u32) -> ArchiveError {
     return ArchiveError::Corrupt
 }
 
+// The other compressed formats (zstd, xz, bzip2, lz4 -- by their magic): a
+// CompressError becomes the matching ArchiveError.
+fn comp_fail(e: CompressError, why: *mut u32) -> usize {
+    if e == CompressError::TooLarge {
+        *why = 3 as u32
+    } else if e == CompressError::OutOfMemory {
+        *why = 7 as u32
+    } else if e == CompressError::Truncated || e == CompressError::Io {
+        *why = 2 as u32
+    } else if e == CompressError::Checksum {
+        *why = 5 as u32
+    } else {
+        *why = 1 as u32
+    }
+    return 0
+}
+
+// Decompresses a .tar.zst / .tar.xz / .tar.bz2 / .tar.lz4 (found by content)
+// into `out` (appended), at most `max` octets (0 = no limit).
+fn tarz_inflate(src: u64, n: usize, max: usize, out: *mut rt.Buf) -> ArchiveError!usize {
+    var why: u32 = 0
+    let before: usize = (*out).len
+    let kind: u32 = auto.detect(src, n)
+    let got: usize = auto.decompress_as(kind, src, n, max, out) catch | e | (comp_fail(e, &why))
+    if why != 0 as u32 {
+        rt.buf_set_len(out, before)
+        return gz_error(why)
+    }
+    return got
+}
+
+// Does `kind` (a compress.auto kind) name a compressed tar format handled by tarz_inflate?
+fn is_tarz_kind(kind: u32) -> bool {
+    return kind == auto.KIND_ZSTD || kind == auto.KIND_XZ || kind == auto.KIND_BZIP2 || kind == auto.KIND_LZ4
+}
+
 // Inflates a .gz into `out` (appended) producing at most `max` octets (0 =
 // no limit; a gzip bomb is `TooLarge`). The answer is the inflated length.
 fn targz_inflate(src: u64, n: usize, max: usize, out: *mut rt.Buf) -> ArchiveError!usize {
@@ -704,6 +744,10 @@ fn tar_open_auto(p: u64, n: usize, lim: TarLimits, scratch: *mut rt.Buf) -> Arch
         // one octet more than allowed, so that exactly-at-the-limit passes
         // and anything beyond is TooLarge
         let got: usize = try targz_inflate(p, n, lim.max_archive_size, scratch)
+        return try tar_reader_open_limits(rt.buf_ptr(scratch), got, lim)
+    }
+    if is_tarz_kind(auto.detect(p, n)) {
+        let got: usize = try tarz_inflate(p, n, lim.max_archive_size, scratch)
         return try tar_reader_open_limits(rt.buf_ptr(scratch), got, lim)
     }
     return try tar_reader_open_limits(p, n, lim)

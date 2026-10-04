@@ -1,804 +1,293 @@
 // SPDX-License-Identifier: MPL-2.0
-// tools/fui/anim_main.fi -- TIME IS RE-CALCULATED.
+// tools/fui/anim_main.fi -- THE CHECK OF lib/fui/uianim.fi (animated GIF and WebP in fUi).
 //
-// An animation does not fall over loudly. It runs a little wrong,
-// and "a little wrong" cannot be seen in a motion -- you only feel
-// that the surface seems cheap. So here NUMBERS stand against
-// expected values worked out by hand:
+// The frames and delays of the test pictures come from Pillow (the expectation below is
+// Pillow's, not this library's): for every frame the CRC-32 of its RGBA octets, for every
+// frame its delay, and the loop count. The clock is then run millisecond by millisecond and
+// the frame on screen is compared with the frame a table of the cumulative delays says:
+// the first tick starts the show, a delay under 20 ms is 100 ms for a GIF (0 for 100 in the
+// last frame of anim.gif), loops end on the last frame (anim_ll.webp: 3 passes), forever
+// loops wrap, pause and resume keep the time the frame had left, a program stopped for ten
+// minutes jumps to the right frame and does not play the missed ones. Then the Markdown
+// view: an image whose hook gives an animation changes its pixels with `mdv_tick`, and
+// `mdv_next_ms` says when.
 //
-//   1. The sample points of every easing (linear, ease-in/out/in-out,
-//      steps, spring) -- the symmetry points are known exactly.
-//   2. The Newton inversion of the Bezier curve: y(x) at a point whose
-//      t can be determined by hand.
-//   3. The spring swings out AND does not drift (that is the error an
-//      Euler step makes).
-//   4. The clock reports "changed" only when something really
-//      changed -- on-demand drawing hangs on that.
-//   5. Colour mixing with alpha: no grey intermediate tone.
-//   6. Delay, repetition and `alternate` at counted points in time --
-//      an animation that reverses one cycle too early or too late
-//      cannot be seen in a still picture.
-//   7. THE TRANSITION AT THE WIDGET: that `trans_from_widget` fetches
-//      the same target values that `render` would paint at rest, and that
-//      the intermediate state really lies between the two.
+//     firnc -o /tmp/anim tools/fui/anim_main.fi && /tmp/anim     (run from the repository root)
 import std.rt
+import std.io
+import std.deflate
 import paint.canvas
+import font.metrics
 import fui.theme
-import fui.style
-import fui.widget
 import fui.painter
 import fui.render
-import fui.anim
+import fui.style
+import fui.viewport
+import fui.markdownview
+import fui.uianim
+import fui.uiimage
+import markdown.doc
+import plat.sysfont
 
-static mut G_ERRORS: usize = 0
+static mut BAD: usize = 0
+static mut CHECKS: usize = 0
+static mut ANIM_PTR: u64 = 0
 
-// THE COLOUR IN THE MIDDLE OF THE PAINTED BUTTON, as 0xRRGGBB. The
-// button of sections 12/12b lies at (8,8) and is 48x32 large,
-// so its centre is (32,24). There the opacity is full, the
-// pixel carries the colour unfalsified.
-fn mid(cv: *mut canvas.Canvas) -> i64 {
-    let p: u32 = canvas.canvas_get(cv, 32, 24)
-    return ((canvas.color_r(p) << 16) | (canvas.color_g(p) << 8) |
-        canvas.color_b(p)) as i64
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
 }
 
-// ================================= THE PHASE ROW OF THE PROOF IMAGES
-//
-// tools/fui/gallery5_main.fi draws every easing as nine marks on
-// a track. A proof is only good if you also see the nine phases
-// INDIVIDUALLY -- on 20.09.2026 with the spring three marks lay
-// on top of each other, because the overshoot of the spring was cut off
-// at 1.12. So that this does not return, the calculation of the gallery stands
-// here once more and is re-calculated: the same constants,
-// the same scaling to the whole value range of the row.
-const PH: usize = 9
-const BAHN_X: f64 = 150.0
-const BAHN_W: f64 = 1066.0
-const MARK_W: f64 = 14.0
-// The required minimum gap. One MARK WIDTH was not enough: two
-// marks that lie exactly their own width apart do not touch,
-// but between them there remains no background that would be wide enough to
-// SEE it -- in the picture the two then read as one block. Required are therefore
-// mark width plus six points: six points of visible background between every two phases.
-// The track in gallery5_main.fi was stretched to 1066 points for that
-// and the mark narrowed to 14 points.
-// (MARKE_W + 6) * 100, in hundredths of a point.
-const GAP: i64 = 2000
-
-// The nine x positions of a row, as gallery5 paints them.
-fn phases_x(e: anim.Easing, xs: *mut f64, vs: *mut f64) {
-    var a: anim.Animation = anim.anim_new(0, 1000, 0.0, 1.0, e)
-    var lo: f64 = 0.0
-    var hi: f64 = 1.0
-    var k: usize = 0
-    while k < PH {
-        let v: f64 = anim.anim_value(&a, ((k * 1000) / (PH - 1)) as i64)
-        if v < lo {
-            lo = v
-        }
-        if v > hi {
-            hi = v
-        }
-        k = k + 1
-    }
-    let span: f64 = hi - lo
-    var i: usize = 0
-    while i < PH {
-        let v: f64 = anim.anim_value(&a, ((i * 1000) / (PH - 1)) as i64)
-        let anteil: f64 = (v - lo) / span
-        // Firn stage 0 knows no index on a pointer; the
-        // stride of eight bytes is therefore calculated by hand.
-        let pv: *mut f64 = ((vs as u64) + (i * 8) as u64) as *mut f64
-        let px: *mut f64 = ((xs as u64) + (i * 8) as u64) as *mut f64
-        *pv = v
-        *px = BAHN_X + 12.0 + anteil * (BAHN_W - MARK_W - 24.0)
-        i = i + 1
-    }
-}
-
-// The smallest distance of ANY TWO phases, in hundredths of a
-// point. Phases with the same value (a staircase stands still) do not count
-// -- they rightly stand at the same place; all others
-// must lie at least MARKE_W + 6 points apart.
-fn min_distance(e: anim.Easing) -> i64 {
-    var xs: [f64; 9] = [0.0; 9]
-    var vs: [f64; 9] = [0.0; 9]
-    phases_x(e, &xs[0], &vs[0])
-    var best: f64 = 100000.0
-    var i: usize = 0
-    while i < PH {
-        var j: usize = i + 1
-        while j < PH {
-            if vs[i] != vs[j] {
-                var d: f64 = xs[j] - xs[i]
-                if d < 0.0 {
-                    d = 0.0 - d
-                }
-                if d < best {
-                    best = d
-                }
-            }
-            j = j + 1
-        }
-        i = i + 1
-    }
-    return (best * 100.0) as i64
-}
-
-// How many pairs really stand on the same value? With steps(5)
-// there are exactly three (0/0, 200/200, 600/600) -- that is the statement
-// of a staircase and no error; with every continuous curve it is zero.
-fn same_pairs(e: anim.Easing) -> i64 {
-    var xs: [f64; 9] = [0.0; 9]
-    var vs: [f64; 9] = [0.0; 9]
-    phases_x(e, &xs[0], &vs[0])
-    var n: i64 = 0
-    var i: usize = 0
-    while i < PH {
-        var j: usize = i + 1
-        while j < PH {
-            if vs[i] == vs[j] {
-                n = n + 1
-            }
-            j = j + 1
-        }
-        i = i + 1
-    }
-    return n
-}
-
-fn report(nm: u64, nn: usize, ok: bool, a: i64, b: i64) {
-    var t: rt.Buf = rt.buf_new()
-    rt.buf_push_bytes(&t, nm, nn)
-    var i: usize = nn
-    while i < 46 {
-        rt.buf_push(&t, 32 as u8)
-        i = i + 1
-    }
+fn check(ok: bool, what: io.Fmt) {
+    CHECKS = CHECKS + 1
     if ok {
-        var o: [u8; 4] = "OK  "
-        rt.buf_push_bytes(&t, (&o[0]) as u64, 4)
+        say("  ok    ")
     } else {
-        var f: [u8; 8] = "WRONG   "
-        rt.buf_push_bytes(&t, (&f[0]) as u64, 8)
-        G_ERRORS = G_ERRORS + 1
+        say("  WRONG ")
+        BAD = BAD + 1
     }
-    var g: [u8; 4] = "got "
-    rt.buf_push_bytes(&t, (&g[0]) as u64, 4)
-    rt.buf_push_dec_i64(&t, a)
-    var w: [u8; 6] = " want "
-    rt.buf_push_bytes(&t, (&w[0]) as u64, 6)
-    rt.buf_push_dec_i64(&t, b)
-    rt.buf_push(&t, 10 as u8)
-    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
-    rt.buf_free(&t)
+    io.fmt_print_line(what)
 }
 
-// Thousandths, so that f64 can be checked as a whole number.
-fn milli(x: f64) -> i64 {
-    return (x * 1000.0 + 0.5) as i64
+fn load(path: str, out: *mut rt.Buf) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&p, path.p as u64, path.n)
+    rt.buf_push(&p, 0 as u8)
+    let ok: bool = rt.read_file(rt.buf_ptr(&p), out)
+    rt.buf_free(&p)
+    return ok
 }
 
-// The largest distance of a channel from an expected triple.
-fn abw(c: u32, r: i64, g: i64, b: i64) -> i64 {
-    var d: i64 = abs((((c >> 16) & 255 as u32) as i64) - r)
-    let e: i64 = abs((((c >> 8) & 255 as u32) as i64) - g)
-    let f: i64 = abs(((c & 255 as u32) as i64) - b)
-    if e > d { d = e }
-    if f > d { d = f }
-    return d
+fn frame_crc(a: *mut uianim.Animation, i: usize) -> u32 {
+    uianim.anim_set_frame(a, i)
+    var im: uiimage.Image = uianim.anim_frame_image(a)
+    return deflate.crc32(im.px, uianim.anim_width(a) * uianim.anim_height(a) * 4)
 }
 
-fn abs(x: i64) -> i64 {
-    if x < 0 {
-        return 0 - x
+// the frame a cumulative table says is on screen `t` ms after the first tick, with `loops`
+// passes (0 = forever); `delays` are the PLAYED delays
+fn expect_frame(delays: *mut [i64; 8], n: usize, loops: u32, t: i64) -> usize {
+    var total: i64 = 0
+    var i: usize = 0
+    while i < n {
+        total = total + (*delays)[i]
+        i = i + 1
     }
-    return x
+    if loops != 0 as u32 && t >= total * (loops as i64) {
+        return n - 1
+    }
+    var r: i64 = t % total
+    i = 0
+    while i < n {
+        if r < (*delays)[i] {
+            return i
+        }
+        r = r - (*delays)[i]
+        i = i + 1
+    }
+    return n - 1
 }
 
-// The COLOURFULNESS of a colour as the distance of the largest from the smallest
-// channel. Zero means grey -- and exactly that is the error that a
-// mix from blue to yellow makes in sRGB.
-fn bunt(c: u32) -> i64 {
-    let r: i64 = ((c >> 16) & 255 as u32) as i64
-    let g: i64 = ((c >> 8) & 255 as u32) as i64
-    let b: i64 = (c & 255 as u32) as i64
-    var hi: i64 = r
-    var lo: i64 = r
-    if g > hi { hi = g }
-    if b > hi { hi = b }
-    if g < lo { lo = g }
-    if b < lo { lo = b }
-    return hi - lo
+// runs the clock for `span` ms in steps of `step` and counts the frames that differ from the table
+fn run_clock(a: *mut uianim.Animation, delays: *mut [i64; 8], n: usize, loops: u32, span: i64, step: i64, start: i64) -> usize {
+    uianim.anim_reset(a)
+    uianim.anim_tick(a, start)
+    var wrong: usize = 0
+    var t: i64 = 0
+    while t <= span {
+        uianim.anim_tick(a, start + t)
+        if uianim.anim_frame_index(a) != expect_frame(delays, n, loops, t) {
+            wrong = wrong + 1
+        }
+        t = t + step
+    }
+    return wrong
+}
+
+fn run_file(path: str, w: usize, h: usize, count: usize, loops: u32, crcs: *mut [u32; 8], delays: *mut [i64; 8], total: i64) {
+    var data: rt.Buf = rt.buf_new()
+    if !load(path, &data) {
+        check(false, f"{path}: readable (run from the repository root)")
+        return
+    }
+    var a: uianim.Animation = uianim.anim_new()
+    check(uianim.anim_from_bytes(rt.buf_ptr(&data), rt.buf_len(&data), &a), f"{path}: decodes")
+    check(uianim.anim_count(&a) == count && uianim.anim_width(&a) == w && uianim.anim_height(&a) == h,
+        f"{path}: {count} frames of {w} x {h}")
+    check(uianim.anim_loops(&a) == loops, f"{path}: loop count {loops}")
+    var bad: usize = 0
+    var i: usize = 0
+    while i < count {
+        if frame_crc(&a, i) != (*crcs)[i] {
+            bad = bad + 1
+        }
+        i = i + 1
+    }
+    check(bad == 0, f"{path}: every frame's pixels are Pillow's ({count} frames)")
+    var dok: bool = true
+    i = 0
+    while i < count {
+        if uianim.anim_delay_ms(&a, i) != (*delays)[i] {
+            dok = false
+        }
+        i = i + 1
+    }
+    check(dok && uianim.anim_total_ms(&a) == total, f"{path}: the played delays and the pass length ({total} ms)")
+    // the clock, 1 ms steps over four passes
+    let wrong: usize = run_clock(&a, delays, count, loops, total * 4 + 50, 1, 1000)
+    check(wrong == 0, f"{path}: the frame on screen follows the delays for 4 passes (1 ms steps), {wrong} wrong")
+    // coarse steps (a slow program ticking every 37 ms) land on the same frames
+    let wrong2: usize = run_clock(&a, delays, count, loops, total * 4 + 50, 37, 5)
+    check(wrong2 == 0, f"{path}: ticking every 37 ms gives the same frames, {wrong2} wrong")
+    // the first tick starts the show and changes nothing; frame 0 is on screen
+    uianim.anim_reset(&a)
+    check(!uianim.anim_tick(&a, 777) && uianim.anim_frame_index(&a) == 0, f"{path}: the first tick starts the clock")
+    check(uianim.anim_next_ms(&a, 777) == (*delays)[0], f"{path}: next change in {(*delays)[0]} ms")
+    check(!uianim.anim_tick(&a, 777 + (*delays)[0] - 1), f"{path}: one ms early: no change")
+    check(uianim.anim_tick(&a, 777 + (*delays)[0]) && uianim.anim_frame_index(&a) == 1, f"{path}: on time: frame 1")
+    // pause keeps the time the frame had left
+    let at: i64 = 777 + (*delays)[0]
+    uianim.anim_pause(&a, at + 10)
+    check(!uianim.anim_tick(&a, at + 100000) && uianim.anim_next_ms(&a, at + 100000) == 0 - 1, f"{path}: paused: no change, nothing to wait for")
+    uianim.anim_resume(&a, at + 100010)
+    check(uianim.anim_next_ms(&a, at + 100010) == (*delays)[1] - 10, f"{path}: resumed with the {(*delays)[1] - 10} ms the frame had left")
+    // a program stopped for ten minutes: one tick jumps to the right frame
+    uianim.anim_reset(&a)
+    uianim.anim_tick(&a, 0)
+    let late: i64 = 600000 + 13
+    uianim.anim_tick(&a, late)
+    var want: usize = expect_frame(delays, count, loops, late)
+    check(uianim.anim_frame_index(&a) == want, f"{path}: after ten minutes of no ticks: frame {want} (is {uianim.anim_frame_index(&a)})")
+    if loops != 0 as u32 {
+        check(uianim.anim_finished(&a) && uianim.anim_frame_index(&a) == count - 1, f"{path}: {loops} passes used up: stands on the last frame")
+        check(uianim.anim_next_ms(&a, late) == 0 - 1, f"{path}: finished: nothing to wait for")
+    } else {
+        check(!uianim.anim_finished(&a), f"{path}: loops forever")
+    }
+    uianim.anim_free(&a)
+    rt.buf_free(&data)
+}
+
+// -------------------------------------------------------------- the Markdown view
+
+fn on_image(ud: u64, url: u64, n: usize, info: *mut markdownview.ImgInfo) -> u32 {
+    let a: *mut uianim.Animation = ANIM_PTR as *mut uianim.Animation
+    (*info).w = uianim.anim_width(a)
+    (*info).h = uianim.anim_height(a)
+    (*info).anim = ANIM_PTR
+    return markdownview.IMG_READY
+}
+
+struct Page {
+    m: theme.Theme,
+    z: painter.Painter,
+    cv: canvas.Canvas,
+    c: render.Ctx,
+    w: usize,
+    h: usize,
+}
+
+fn page_new(w: usize, h: usize, font: u64) -> *mut Page {
+    let p: *mut Page = rt.heap_alloc(1 << 20) as *mut Page
+    (*p).m = theme.theme_new(false)
+    (*p).z = painter.painter_new()
+    (*p).cv = canvas.canvas_new()
+    (*p).w = w
+    (*p).h = h
+    if !canvas.canvas_init(&(*p).cv, w, h) || !painter.painter_init(&(*p).z, &(*p).cv, w, h) {
+        return 0 as u64 as *mut Page
+    }
+    painter.painter_set_font(&(*p).z, font)
+    (*p).c = render.ctx_new(&(*p).m, &(*p).z)
+    return p
+}
+
+// a hash of the canvas
+fn canvas_hash(p: *mut Page) -> u32 {
+    var h: u32 = 2166136261 as u32
+    var y: usize = 0
+    while y < (*p).h {
+        var x: usize = 0
+        while x < (*p).w {
+            h = (h ^ canvas.canvas_get(&(*p).cv, x, y)) *% 16777619 as u32
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return h
+}
+
+#[allow_escape]
+fn run_view(font: u64) {
+    var data: rt.Buf = rt.buf_new()
+    if !load("tests/data/gif/anim.gif", &data) {
+        check(false, f"anim.gif readable")
+        return
+    }
+    var a: uianim.Animation = uianim.anim_new()
+    uianim.anim_from_bytes(rt.buf_ptr(&data), rt.buf_len(&data), &a)
+    ANIM_PTR = (&a) as u64
+    let p: *mut Page = page_new(300, 200, font)
+    var v: markdownview.MdView = markdownview.mdv_new()
+    markdownview.mdv_set_markdown(&v, "# Picture\n\n![spinner](anim.gif)\n", doc.opts_default())
+    markdownview.mdv_set_image_cb(&v, 0, on_image)
+    markdownview.mdv_set_background(&v, style.TOK_BASE)
+    markdownview.mdv_set_rect(&v, 0.0, 0.0, 300.0, 200.0)
+    canvas.canvas_clear(&(*p).cv, 0xFFF4F4F6 as u32)
+    markdownview.mdv_paint(&v, &(*p).c)
+    let h0: u32 = canvas_hash(p)
+    check(markdownview.mdv_next_ms(&v, 0) == 0, f"the view says an animation wants its first tick")
+    markdownview.mdv_tick(&v, 5000)
+    check(markdownview.mdv_next_ms(&v, 5000) == 50, f"the view: next change in 50 ms (the first frame's delay)")
+    check(!markdownview.mdv_tick(&v, 5049), f"no change one ms early")
+    check(markdownview.mdv_tick(&v, 5050), f"the tick on time says: repaint")
+    canvas.canvas_clear(&(*p).cv, 0xFFF4F4F6 as u32)
+    markdownview.mdv_paint(&v, &(*p).c)
+    let h1: u32 = canvas_hash(p)
+    check(h0 != h1, f"frame 1 paints other pixels than frame 0")
+    // after a whole pass the picture is the first again
+    markdownview.mdv_tick(&v, 5050 + 100 + 70 + 20 + 100)
+    canvas.canvas_clear(&(*p).cv, 0xFFF4F4F6 as u32)
+    markdownview.mdv_paint(&v, &(*p).c)
+    check(canvas_hash(p) == h0, f"a whole pass later it is frame 0 again")
+    // a view without an animated picture has nothing to wait for
+    var v2: markdownview.MdView = markdownview.mdv_new()
+    markdownview.mdv_set_markdown(&v2, "# No picture\n", doc.opts_default())
+    check(markdownview.mdv_next_ms(&v2, 0) == 0 - 1, f"no animated image: nothing to wait for")
+    markdownview.mdv_free(&v2)
+    markdownview.mdv_free(&v)
+    uianim.anim_free(&a)
+    rt.buf_free(&data)
 }
 
 fn main(start: u64) -> i32 {
-    // ==================================================== 1. LINEAR
-    var lin: anim.Easing = anim.easing_linear()
-    var n1: [u8; 22] = "1 linear at 0.25 = 250"
-    report((&n1[0]) as u64, 22, milli(anim.ease_eval(&lin, 0.25)) == 250,
-        milli(anim.ease_eval(&lin, 0.25)), 250)
-
-    // ============================================== 2. THE CSS CURVES
-    //
-    // ease-in-out is point-symmetric about (0.5, 0.5): the value in the
-    // middle is EXACTLY 0.5. That is the sample point at which a wrongly
-    // solved Newton iteration is noticed at once.
-    var eio: anim.Easing = anim.easing_named(anim.EASE_IN_OUT)
-    var n2: [u8; 28] = "2 ease-in-out at 0.5 = 500  "
-    report((&n2[0]) as u64, 28, milli(anim.ease_eval(&eio, 0.5)) == 500,
-        milli(anim.ease_eval(&eio, 0.5)), 500)
-    // The ends are fixed.
-    var n3: [u8; 24] = "2 ease-in-out at 0 = 0  "
-    report((&n3[0]) as u64, 24, milli(anim.ease_eval(&eio, 0.0)) == 0,
-        milli(anim.ease_eval(&eio, 0.0)), 0)
-    var n4: [u8; 27] = "2 ease-in-out at 1 = 1000  "
-    report((&n4[0]) as u64, 27, milli(anim.ease_eval(&eio, 1.0)) == 1000,
-        milli(anim.ease_eval(&eio, 1.0)), 1000)
-
-    // ==================================================== 3. STEPS
-    //
-    // steps(4): at 0.5 the second jump has been taken, so 0.5.
-    var st: anim.Easing = anim.easing_steps(4)
-    var n5: [u8; 23] = "3 steps(4) at 0.6 = 500"
-    report((&n5[0]) as u64, 23, milli(anim.ease_eval(&st, 0.6)) == 500,
-        milli(anim.ease_eval(&st, 0.6)), 500)
-
-    // ==================================================== 4. THE SPRING
-    //
-    // At t = 0 it stands at the start, and after a long time it stands
-    // EXACTLY at 1 -- an Euler step drifts away here.
-    let f0: f64 = anim.spring_eval(1.0, 100.0, 10.0, 0.0)
-    var n6: [u8; 22] = "4 spring at t = 0 is 0"
-    report((&n6[0]) as u64, 22, milli(f0) == 0, milli(f0), 0)
-    let f9: f64 = anim.spring_eval(1.0, 100.0, 10.0, 8.0)
-    var n7: [u8; 29] = "4 spring settles at 1 (x1000)"
-    report((&n7[0]) as u64, 29, milli(f9) == 1000, milli(f9), 1000)
-
-    // ================================================== 5. THE CLOCK
-    var g: anim.Animator = anim.animator_new()
-    let i0: usize = anim.animator_add(&g,
-        anim.anim_new(0, 100, 0.0, 10.0, anim.easing_linear()))
-    var n8: [u8; 25] = "5 the register holds one "
-    report((&n8[0]) as u64, 25, anim.animator_count(&g) == 1,
-        anim.animator_count(&g) as i64, 1)
-    let ver: bool = anim.anim_tick(&g, 50)
-    var n9: [u8; 30] = "5 tick at 50 ms reports change"
-    report((&n9[0]) as u64, 30, ver, ver as i64, 1)
-    let v50: f64 = anim.anim_value(anim.animator_at(&g, i0), 50)
-    var n10: [u8; 26] = "5 halfway the value is 5.0"
-    report((&n10[0]) as u64, 26, milli(v50) == 5000, milli(v50), 5000)
-    // After the end the clock reports NOTHING any more -- otherwise the
-    // surface keeps painting forever.
-    anim.anim_tick(&g, 200)
-    let ruhe: bool = anim.anim_tick(&g, 300)
-    var n11: [u8; 31] = "5 after the end nothing changes"
-    report((&n11[0]) as u64, 31, !ruhe, ruhe as i64, 0)
-
-    // ================================================= 6. THE COLOURS
-    //
-    // Halfway between opaque red and opaque red stays red -- the
-    // probe that the premultiplication does not rub off.
-    let c: u32 = anim.mix_srgb(0xFFFF0000 as u32, 0xFFFF0000 as u32, 0.5)
-    var n12: [u8; 30] = "6 red mixed with red stays red"
-    report((&n12[0]) as u64, 30, c == 0xFFFF0000 as u32, (c & 16777215 as u32) as i64,
-        16711680)
-    // From fully transparent to opaque red: in the middle the
-    // COLOUR is already entirely red, only the alpha half. Whoever mixes straight
-    // gets here a dark red -- the grey intermediate tone.
-    let d: u32 = anim.mix_srgb(0x00FF0000 as u32, 0xFFFF0000 as u32, 0.5)
-    var n13: [u8; 33] = "6 fade-in keeps the hue (R = 255)"
-    report((&n13[0]) as u64, 33, ((d >> 16) & 255 as u32) == 255 as u32,
-        ((d >> 16) & 255 as u32) as i64, 255)
-    var n14: [u8; 27] = "6 and its alpha is half way"
-    report((&n14[0]) as u64, 27, ((d >> 24) & 255 as u32) == 128 as u32,
-        ((d >> 24) & 255 as u32) as i64, 128)
-
-    // ====================== 7. THE BEZIER CURVE WITH FREE POINTS
-    //
-    // Newton is only really checked if the t for the position x
-    // is known BY HAND. For cubic-bezier(0.5, 0, 0.5, 1) it is
-    //     x(t) = 1.5t - 1.5t^2 + t^3,   y(t) = 3(1-t)t^2 + t^3.
-    // At t = 1/4: x = 0.375 - 0.09375 + 0.015625 = 0.296875 and
-    //              y = 0.140625 + 0.015625 = 0.15625.
-    // So the curve at the position 0.296875 must deliver exactly 156 thousandths.
-    // An iteration that is sloppy with the inversion ends up visibly off
-    // here.
-    var bz: anim.Easing = anim.easing_bezier(0.5, 0.0, 0.5, 1.0)
-    var n15: [u8; 37] = "7 bezier(.5,0,.5,1) at 0.296875 = 156"
-    report((&n15[0]) as u64, 37,
-        milli(anim.ease_eval(&bz, 0.296875)) == 156,
-        milli(anim.ease_eval(&bz, 0.296875)), 156)
-    // And the inversion itself: t at the position 0.296875 is 0.25.
-    let tt: f64 = anim.bezier_t_for_x(0.5, 0.5, 0.296875)
-    var n16: [u8; 26] = "7 and its solved t is 0.25"
-    report((&n16[0]) as u64, 26, milli(tt) == 250, milli(tt), 250)
-    // A second curve with other points: cubic-bezier(.25,.75,.25,.25)
-    //     x(t) = 0.75t(1-t) + t^3  ->  x(0.5) = 0.1875 + 0.125 = 0.3125
-    //     y(t) = 2.25(1-t)^2 t + 0.75(1-t)t^2 + t^3
-    //          -> y(0.5) = 0.28125 + 0.09375 + 0.125 = 0.5
-    var bz2: anim.Easing = anim.easing_bezier(0.25, 0.75, 0.25, 0.25)
-    var n17: [u8; 41] = "7 bezier(.25,.75,.25,.25) at 0.3125 = 500"
-    report((&n17[0]) as u64, 41,
-        milli(anim.ease_eval(&bz2, 0.3125)) == 500,
-        milli(anim.ease_eval(&bz2, 0.3125)), 500)
-    // The two named CSS curves have so far been checked only at the ends and
-    // in the middle -- there the symmetry helps, and a crooked Newton is
-    // not noticed. So one INNER POINT each, whose
-    // t is determined by hand.
-    //
-    // ease-in = cubic-bezier(0.42, 0, 1, 1):
-    //     x(t) = 3(1-t)^2 t * 0.42 + 3(1-t)t^2 + t^3
-    //     y(t) = 3(1-t)t^2 + t^3 = 3t^2 - 2t^3
-    // At t = 1/4: 3(1-t)^2 t = 3 * 0.5625 * 0.25 = 0.421875, of which
-    // 0.42 is 0.17718750; 3(1-t)t^2 = 0.140625; t^3 = 0.015625.
-    //     x = 0.17718750 + 0.140625 + 0.015625 = 0.33343750
-    //     y = 0.1875 - 0.03125 = 0.15625
-    // A third of the way, a sixth of the distance: exactly that is
-    // the sluggish start that makes up ease-in.
-    var ein: anim.Easing = anim.easing_named(anim.EASE_IN)
-    var n17b: [u8; 29] = "7 ease-in at 0.33343750 = 156"
-    report((&n17b[0]) as u64, 29,
-        milli(anim.ease_eval(&ein, 0.33343750)) == 156,
-        milli(anim.ease_eval(&ein, 0.33343750)), 156)
-    // ease-out = cubic-bezier(0, 0, 0.58, 1), same y(t), different x:
-    //     x(t) = 3(1-t)t^2 * 0.58 + t^3
-    // At t = 3/4: 3(1-t)t^2 = 3 * 0.25 * 0.5625 = 0.421875, of which
-    // 0.58 is 0.24468750; t^3 = 0.421875.
-    //     x = 0.24468750 + 0.421875 = 0.66656250
-    //     y = 1.6875 - 0.84375 = 0.84375
-    // Two thirds of the way, five sixths of the distance: the run-out.
-    var eout: anim.Easing = anim.easing_named(anim.EASE_OUT)
-    var n17c: [u8; 30] = "7 ease-out at 0.66656250 = 844"
-    report((&n17c[0]) as u64, 30,
-        milli(anim.ease_eval(&eout, 0.66656250)) == 844,
-        milli(anim.ease_eval(&eout, 0.66656250)), 844)
-
-    // ================================ 8. STEPS AT THE JUMP POSITIONS
-    //
-    // steps(4, jump-end) holds the value 0 on [0, 0.25) and jumps AT
-    // 0.25 to 0.25. Exactly at the edge it is decided whether the
-    // section is open on the left or on the right.
-    var st4: anim.Easing = anim.easing_steps(4)
-    var n18: [u8; 31] = "8 steps(4) just below 0.25 is 0"
-    report((&n18[0]) as u64, 31, milli(anim.ease_eval(&st4, 0.2499)) == 0,
-        milli(anim.ease_eval(&st4, 0.2499)), 0)
-    var n19: [u8; 31] = "8 steps(4) at 0.25 jumps to 250"
-    report((&n19[0]) as u64, 31, milli(anim.ease_eval(&st4, 0.25)) == 250,
-        milli(anim.ease_eval(&st4, 0.25)), 250)
-    var n20: [u8; 36] = "8 steps(4) just below 1 is still 750"
-    report((&n20[0]) as u64, 36, milli(anim.ease_eval(&st4, 0.9999)) == 750,
-        milli(anim.ease_eval(&st4, 0.9999)), 750)
-    var n21: [u8; 28] = "8 steps(4) at 1 is exactly 1"
-    report((&n21[0]) as u64, 28, milli(anim.ease_eval(&st4, 1.0)) == 1000,
-        milli(anim.ease_eval(&st4, 1.0)), 1000)
-
-    // ============================ 9. THE SPRING IN ALL THREE CASES
-    //
-    // Every case has its own formula, and each is re-calculated
-    // by hand (m = 1, k = 100, so w0 = 10):
-    //
-    //   underdamped   c = 10 -> z = 0.5, wd = 5*sqrt(3) = 8.660254
-    //     x(0.2) = e^-1 (cos 1.7320508 + 0.57735 sin 1.7320508)
-    //            = 0.3678794 * 0.409313 = 0.150578  -> 849
-    //   critical      c = 20 -> z = 1
-    //     x(0.1) = e^-1 (1 + 1) = 0.7357589           -> 264
-    //   overdamped    c = 25 -> z = 1.25, r = 0.75, a = -5, b = -20
-    //     x(0.1) = (4/3) e^-0.5 - (1/3) e^-2
-    //            = 0.8087084 - 0.0451118 = 0.7635966  -> 236
-    let su: f64 = anim.spring_eval(1.0, 100.0, 10.0, 0.2)
-    var n22: [u8; 34] = "9 underdamped spring at 0.2 is 849"
-    report((&n22[0]) as u64, 34, milli(su) == 849, milli(su), 849)
-    let sk: f64 = anim.spring_eval(1.0, 100.0, 20.0, 0.1)
-    var n23: [u8; 33] = "9 critically damped at 0.1 is 264"
-    report((&n23[0]) as u64, 33, milli(sk) == 264, milli(sk), 264)
-    let so: f64 = anim.spring_eval(1.0, 100.0, 25.0, 0.1)
-    var n24: [u8; 26] = "9 overdamped at 0.1 is 236"
-    report((&n24[0]) as u64, 26, milli(so) == 236, milli(so), 236)
-    // And the proof that it really is a spring: the
-    // underdamped one shoots PAST the target.
-    //   x(0.5) = e^-2.5 (cos 4.330127 + 0.57735 sin 4.330127)
-    //          = 0.0820850 * (-0.908296) = -0.074562  -> 1075
-    let sh: f64 = anim.spring_eval(1.0, 100.0, 10.0, 0.5)
-    var n25: [u8; 33] = "9 and it overshoots past 1 (1075)"
-    report((&n25[0]) as u64, 33, milli(sh) == 1075, milli(sh), 1075)
-    // The overdamped case must NEVER overshoot -- it creeps.
-    var uebersch: bool = false
-    var q: i32 = 1
-    while q <= 100 {
-        if anim.spring_eval(1.0, 100.0, 25.0, (q as f64) * 0.02) > 1.0 {
-            uebersch = true
-        }
-        q = q + 1
+    let fs: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    if !sysfont.sysfont_load(fs) {
+        say("anim: no font (DejaVu Sans)\n")
+        return 9
     }
-    var n26: [u8; 37] = "9 the overdamped one never overshoots"
-    report((&n26[0]) as u64, 37, !uebersch, uebersch as i64, 0)
-
-    // ==================== 10. DELAY, REPETITION, ALTERNATE
-    //
-    // dur = 100 ms, from 0 to 10, linear. With 50 ms delay nothing
-    // has happened at 50 ms, at 100 ms half, at
-    // 150 ms everything.
-    var av: anim.Animation = anim.anim_new(0, 100, 0.0, 10.0,
-        anim.easing_linear())
-    anim.anim_set_delay(&av, 50)
-    var n27: [u8; 34] = "10 delayed run is still 0 at 50 ms"
-    report((&n27[0]) as u64, 34, milli(anim.anim_value(&av, 50)) == 0,
-        milli(anim.anim_value(&av, 50)), 0)
-    var n28: [u8; 31] = "10 halfway only at 100 ms (5.0)"
-    report((&n28[0]) as u64, 31, milli(anim.anim_value(&av, 100)) == 5000,
-        milli(anim.anim_value(&av, 100)), 5000)
-    var n29: [u8; 28] = "10 and done at 150 ms (10.0)"
-    report((&n29[0]) as u64, 28, milli(anim.anim_value(&av, 150)) == 10000,
-        milli(anim.anim_value(&av, 150)), 10000)
-    var n30: [u8; 35] = "10 done at 150 ms, not before (149)"
-    report((&n30[0]) as u64, 35,
-        !anim.anim_done(&av, 149) && anim.anim_done(&av, 150),
-        anim.anim_done(&av, 149) as i64, 0)
-
-    // Three iterations without delay: 250 ms lies in the middle of the
-    // THIRD, 320 ms is behind the end and stays at 10.
-    var aw: anim.Animation = anim.anim_new(0, 100, 0.0, 10.0,
-        anim.easing_linear())
-    anim.anim_set_repeat(&aw, 3)
-    var n31: [u8; 41] = "10 repeat(3): 250 ms is mid 3rd run (5.0)"
-    report((&n31[0]) as u64, 41, milli(anim.anim_value(&aw, 250)) == 5000,
-        milli(anim.anim_value(&aw, 250)), 5000)
-    var n32: [u8; 35] = "10 repeat(3): after 300 ms it rests"
-    report((&n32[0]) as u64, 35, milli(anim.anim_value(&aw, 320)) == 10000,
-        milli(anim.anim_value(&aw, 320)), 10000)
-
-    // Alternate: the second iteration runs BACKWARDS. At 120 ms
-    // it is 20 % along, so at 0.8 -> 8.0; at 150 ms exactly in the
-    // middle -> 5.0; at the end it stands at 0 again.
-    var ax: anim.Animation = anim.anim_new(0, 100, 0.0, 10.0,
-        anim.easing_linear())
-    anim.anim_set_repeat(&ax, 2)
-    anim.anim_set_direction(&ax, anim.DIR_ALTERNATE)
-    var n33: [u8; 36] = "10 alternate: 120 ms runs back (8.0)"
-    report((&n33[0]) as u64, 36, milli(anim.anim_value(&ax, 120)) == 8000,
-        milli(anim.anim_value(&ax, 120)), 8000)
-    var n34: [u8; 27] = "10 alternate: 150 ms is 5.0"
-    report((&n34[0]) as u64, 27, milli(anim.anim_value(&ax, 150)) == 5000,
-        milli(anim.anim_value(&ax, 150)), 5000)
-    var n35: [u8; 40] = "10 alternate: it ends where it began (0)"
-    report((&n35[0]) as u64, 40, milli(anim.anim_value(&ax, 200)) == 0,
-        milli(anim.anim_value(&ax, 200)), 0)
-    // Endless means endless: after ten and a half iterations it stands in
-    // the middle and is NOT finished.
-    var ay: anim.Animation = anim.anim_new(0, 100, 0.0, 10.0,
-        anim.easing_linear())
-    anim.anim_set_repeat(&ay, anim.REPEAT_FOREVER)
-    var n36: [u8; 40] = "10 forever: 1050 ms is mid run and alive"
-    report((&n36[0]) as u64, 40,
-        milli(anim.anim_value(&ay, 1050)) == 5000
-        && !anim.anim_done(&ay, 1050),
-        milli(anim.anim_value(&ay, 1050)), 5000)
-
-    // ================== 11. ALPHA AND COLOUR SPACE AGAINST THE GREY HOLE
-    //
-    // From transparent BLACK to opaque BLUE: whoever mixes straight
-    // gets in the middle a half-dark blue (B = 128) --
-    // premultiplied the hue stays full (B = 255).
-    let fb: u32 = anim.mix_srgb(0 as u32, 0xFF0000FF as u32, 0.5)
-    var n37: [u8; 35] = "11 fade from nothing keeps B at 255"
-    report((&n37[0]) as u64, 35, (fb & 255 as u32) == 255 as u32,
-        (fb & 255 as u32) as i64, 255)
-    // Blue -> yellow: in sRGB there lies in the middle a dead grey
-    // (0x808080, colourfulness max-min = 0). In OKLab the path stays colourful.
-    let mg: u32 = anim.mix_srgb(0xFF0000FF as u32, 0xFFFFFF00 as u32, 0.5)
-    let gr: i64 = bunt(mg)
-    var n38: [u8; 37] = "11 blue->yellow in sRGB goes grey (0)"
-    report((&n38[0]) as u64, 37, gr == 0, gr, 0)
-    let mo: u32 = anim.mix_oklab(0xFF0000FF as u32, 0xFFFFFF00 as u32, 0.5)
-    // By hand with the Ottosson matrices: the middle is 0x6CABC7,
-    // colourfulness 199 - 108 = 91.
-    var n39: [u8; 35] = "11 in OKLab it stays colourful (91)"
-    report((&n39[0]) as u64, 35, bunt(mo) == 91, bunt(mo), 91)
-    // And the point itself, channel by channel: 108 / 171 / 199. The
-    // cube root runs via math.powf, whose last places are not
-    // exact -- what is checked is therefore the largest channel distance with
-    // two permitted steps, not the bit pattern.
-    var n40: [u8; 36] = "11 the OKLab midpoint is 108/171/199"
-    report((&n40[0]) as u64, 36, abw(mo, 108, 171, 199) <= 2,
-        abw(mo, 108, 171, 199), 0)
-
-    // ================== 12. THE TRANSITION AT THE WIDGET (colour/radius/border)
-    //
-    // A button in the dark scheme. The target colours stand in theme.fi:
-    // rest 0x42414D, hovered 0x52525E, pressed 0x63636E. The radius
-    // comes from shape_osum (r_button = 8), the motion rule
-    // adds +2 to it on hover and -2 on pressing.
-    var cv: canvas.Canvas = canvas.canvas_new()
-    if !canvas.canvas_init(&cv, 64, 64) {
-        return 4
+    var c1: [u32; 8] = [127307801 as u32, 2909372847 as u32, 3034097713 as u32, 1689689223 as u32, 431876796 as u32, 0 as u32, 0 as u32, 0 as u32]
+    var d1: [i64; 8] = [50, 100, 70, 20, 100, 0, 0, 0]
+    run_file("tests/data/gif/anim.gif", 50, 40, 5, 0 as u32, &c1, &d1, 340)
+    var c2: [u32; 8] = [3993169432 as u32, 1246377520 as u32, 75956809 as u32, 818208761 as u32, 3142957108 as u32, 2036291222 as u32, 0 as u32, 0 as u32]
+    var d2: [i64; 8] = [40, 80, 120, 40, 40, 200, 0, 0]
+    run_file("tests/data/webp/anim_ll.webp", 48, 32, 6, 3 as u32, &c2, &d2, 520)
+    var c3: [u32; 8] = [873858455 as u32, 2012417856 as u32, 3877206944 as u32, 3092053462 as u32, 474199550 as u32, 1963128999 as u32, 0 as u32, 0 as u32]
+    var d3: [i64; 8] = [100, 100, 100, 100, 100, 100, 0, 0]
+    run_file("tests/data/webp/anim_lossy.webp", 48, 32, 6, 0 as u32, &c3, &d3, 600)
+    var c4: [u32; 8] = [2142182662 as u32, 71501888 as u32, 2955616923 as u32, 2960452949 as u32, 294095467 as u32, 2468994545 as u32, 0 as u32, 0 as u32]
+    var d4: [i64; 8] = [80, 80, 80, 80, 80, 80, 0, 0]
+    run_file("tests/data/gif/disp.gif", 48, 32, 6, 2 as u32, &c4, &d4, 480)
+    run_view(fs as u64)
+    say("checks: ")
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&nb, CHECKS as u64)
+    rt.write_everything(1, rt.buf_ptr(&nb), rt.buf_len(&nb))
+    rt.buf_free(&nb)
+    say("\n")
+    if BAD == 0 {
+        say("ANIM PASSED\n")
+        return 0
     }
-    var pz: painter.Painter = painter.painter_new()
-    if !painter.painter_init(&pz, &cv, 64, 64) {
-        return 5
-    }
-    var th: theme.Theme = theme.theme_new(true)
-    var cx: render.Ctx = render.ctx_new(&th, &pz)
-    var kn: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
-    widget.w_place(&kn, 8.0, 8.0, 48.0, 32.0)
-
-    let bg_n: u32 = anim.widget_target_bg(&cx, &kn, style.STATE_NORMAL)
-    var n41: [u8; 36] = "12 target colour at rest is 0x42414D"
-    report((&n41[0]) as u64, 36, bg_n == 0xFF42414D as u32,
-        (bg_n & 16777215 as u32) as i64, 4342093)
-    widget.w_set_hover(&kn, true)
-    let bg_h: u32 = anim.widget_target_bg(&cx, &kn, widget.w_state(&kn))
-    var n42: [u8; 30] = "12 hovered it aims at 0x52525E"
-    report((&n42[0]) as u64, 30, bg_h == 0xFF52525E as u32,
-        (bg_h & 16777215 as u32) as i64, 5395038)
-    var n43: [u8; 31] = "12 hovered radius is 8 + 2 = 10"
-    report((&n43[0]) as u64, 31,
-        milli(anim.widget_target_radius(&cx, &kn, style.STATE_HOVER)) == 10000,
-        milli(anim.widget_target_radius(&cx, &kn, style.STATE_HOVER)), 10000)
-    var n44: [u8; 30] = "12 pressed radius is 8 - 2 = 6"
-    report((&n44[0]) as u64, 30,
-        milli(anim.widget_target_radius(&cx, &kn, style.STATE_ACTIVE)) == 6000,
-        milli(anim.widget_target_radius(&cx, &kn, style.STATE_ACTIVE)), 6000)
-    // The border of a button is 0 -- in focus focus_w (2) is added,
-    // so that the ring does not pop up.
-    var n45: [u8; 30] = "12 focus grows the border to 2"
-    report((&n45[0]) as u64, 30,
-        milli(anim.widget_target_border(&cx, &kn, style.STATE_FOCUS)) == 2000,
-        milli(anim.widget_target_border(&cx, &kn, style.STATE_FOCUS)), 2000)
-
-    // The change itself: from rest to hovered, 100 ms, linear.
-    // At 50 ms everything stands EXACTLY in the middle:
-    //   colour R (0x42 + 0x52)/2 = 0x4A, G (0x41 + 0x52)/2 = 73.5 -> 74,
-    //          B (0x4D + 0x5E)/2 = 85.5 -> 86  =>  0x4A4A56
-    //   radius (8 + 10)/2 = 9,  shift (0 + -1)/2 = -0.5
-    var tr: anim.Transition = anim.trans_new(0xFF42414D as u32, 8.0, 0.0, 1.0)
-    anim.trans_set_duration(&tr, 100)
-    anim.trans_set_easing(&tr, anim.easing_linear())
-    let gewechselt: bool = anim.trans_from_widget(&tr, &cx, &kn, 0)
-    var n46: [u8; 39] = "12 the widget state starts a transition"
-    report((&n46[0]) as u64, 39, gewechselt, gewechselt as i64, 1)
-    anim.trans_tick(&tr, 50)
-    var n47: [u8; 34] = "12 at 50 ms the colour is 0x4A4A56"
-    report((&n47[0]) as u64, 34,
-        (anim.trans_color(&tr) & 16777215 as u32) == 0x4A4A56 as u32,
-        (anim.trans_color(&tr) & 16777215 as u32) as i64, 4868694)
-    var n48: [u8; 27] = "12 at 50 ms the radius is 9"
-    report((&n48[0]) as u64, 27, milli(anim.trans_radius(&tr)) == 9000,
-        milli(anim.trans_radius(&tr)), 9000)
-    // Upwards is negative; the MAGNITUDE is checked, because `milli`
-    // truncates towards zero and -0.5 would otherwise appear as -499.
-    var n49: [u8; 38] = "12 and it has risen half a point (500)"
-    report((&n49[0]) as u64, 38, milli(0.0 - anim.trans_dy(&tr)) == 500,
-        milli(0.0 - anim.trans_dy(&tr)), 500)
-    // At the end the target value stands, and a second call with an
-    // unchanged widget restarts NOTHING.
-    anim.trans_tick(&tr, 100)
-    var n50: [u8; 38] = "12 at 100 ms it has arrived (0x52525E)"
-    report((&n50[0]) as u64, 38,
-        (anim.trans_color(&tr) & 16777215 as u32) == 0x52525E as u32,
-        (anim.trans_color(&tr) & 16777215 as u32) as i64, 5395038)
-    var n51: [u8; 33] = "12 no state change starts nothing"
-    report((&n51[0]) as u64, 33, !anim.trans_from_widget(&tr, &cx, &kn, 100),
-        anim.trans_from_widget(&tr, &cx, &kn, 100) as i64, 0)
-
-    // The intermediate state really lands in the style of the widget --
-    // on that hangs that render paints it without special treatment.
-    anim.trans_tick(&tr, 50)
-    anim.trans_apply(&tr, &kn)
-    let sp: *mut style.Style = widget.w_style(&kn)
-    let painted: u32 = style.resolve_bg(widget.w_styleset(&kn),
-        widget.w_state(&kn), 0 as u32)
-    var n52: [u8; 45] = "12 trans_apply writes 0x4A4A56 into the style"
-    report((&n52[0]) as u64, 45,
-        style.color_value(painted) == 0x4A4A56 as u32,
-        style.color_value(painted) as i64, 4868694)
-    var n53: [u8; 22] = "12 and the radius as 9"
-    report((&n53[0]) as u64, 22,
-        style.resolve_num(widget.w_styleset(&kn), style.SF_RADIUS,
-            (*sp).radius as usize, 0) == 9,
-        style.resolve_num(widget.w_styleset(&kn), style.SF_RADIUS,
-            (*sp).radius as usize, 0) as i64, 9)
-
-    // Each state its own duration: pressed fast (60), back
-    // slow (240). At 30 ms after pressing half is
-    // done -- with the default duration it would be a quarter.
-    anim.trans_set_state_duration(&tr, style.STATE_ACTIVE, 60)
-    widget.w_set_active(&kn, true)
-    anim.trans_from_widget(&tr, &cx, &kn, 1000)
-    anim.trans_tick(&tr, 1030)
-    var n54: [u8; 42] = "12 pressed uses its own 60 ms (half at 30)"
-    report((&n54[0]) as u64, 42, milli(anim.trans_progress(&tr)) == 500,
-        milli(anim.trans_progress(&tr)), 500)
-    var n55: [u8; 37] = "12 and the duration in force is 60 ms"
-    report((&n55[0]) as u64, 37, anim.trans_duration(&tr) == 60,
-        anim.trans_duration(&tr), 60)
-    // OKLab can be switched from outside -- that was missing.
-    anim.trans_set_oklab(&tr, true)
-    var n56: [u8; 36] = "12 the OKLab path can be switched on"
-    report((&n56[0]) as u64, 36, anim.trans_oklab(&tr),
-        anim.trans_oklab(&tr) as i64, 1)
-
-    // ============ 12b. THE SAME TRANSITION, BUT FROM THE RENDER PATH
-    //
-    // Until round FEHLERBEHEBUNG everything calculated above stood NEXT TO
-    // the library: only whoever touched `anim.Transition` himself got
-    // a soft button, and exactly one program did that. Now
-    // `render` keeps the registry (`anim.transreg_bind`), and the change
-    // runs in the normal drawing path.
-    //
-    // THAT IS WHY IT IS READ FROM THE PICTURE here and not from the tween:
-    // the value that the check compares is the pixel in the
-    // middle of the button that `render.draw_button` painted.
-    // By hand: dark scheme, rest 0x42414D, hovered 0x52525E,
-    // 100 ms linear, so at half time
-    //   R (66+82)/2 = 74 = 0x4A, G (65+82)/2 = 73.5 -> 74 = 0x4A,
-    //   B (77+94)/2 = 85.5 -> 86 = 0x56.
-    var reg: anim.TransReg = anim.transreg_new()
-    anim.transreg_set_duration(&reg, 100)
-    anim.transreg_set_easing(&reg, anim.easing_linear())
-    var kr: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
-    widget.w_place(&kr, 8.0, 8.0, 48.0, 32.0)
-    anim.transreg_bind(&reg, &cx)
-    // Frame 1 at 0 ms: the button rests, the registry creates its
-    // entry on the TRUE values of the widget.
-    render.ctx_set_time(&cx, 0)
-    canvas.canvas_clear(&cv, (255 as u32 << 24) | 16777215 as u32)
-    render.draw_button(&cx, &kr)
-    var n65: [u8; 46] = "12b the render path knows one transition      "
-    report((&n65[0]) as u64, 45, anim.transreg_count(&reg) == 1,
-        anim.transreg_count(&reg) as i64, 1)
-    var n66: [u8; 46] = "12b at rest it paints 0x42414D                "
-    report((&n66[0]) as u64, 45, mid(&cv) == 4342093, mid(&cv), 4342093)
-    // The pointer arrives on it. Frame 2 at 50 ms starts the transition
-    // -- what is still painted is the rest colour, because the tween begins NOW.
-    widget.w_set_hover(&kr, true)
-    render.ctx_set_time(&cx, 50)
-    canvas.canvas_clear(&cv, (255 as u32 << 24) | 16777215 as u32)
-    render.draw_button(&cx, &kr)
-    var n67: [u8; 46] = "12b the frame that starts it still rests      "
-    report((&n67[0]) as u64, 45, mid(&cv) == 4342093, mid(&cv), 4342093)
-    // Frame 3 at 100 ms: half of the distance, 0x4A4A56.
-    render.ctx_set_time(&cx, 100)
-    canvas.canvas_clear(&cv, (255 as u32 << 24) | 16777215 as u32)
-    render.draw_button(&cx, &kr)
-    var n68: [u8; 46] = "12b halfway the render path paints 0x4A4A56   "
-    report((&n68[0]) as u64, 45, mid(&cv) == 4868694, mid(&cv), 4868694)
-    // And the same value comes from the cascade that render itself
-    // asks -- that is the value FROM the drawing path, without a canvas.
-    let rbg: u32 = render.anim_bg_of(&cx, &kr)
-    var n69: [u8; 46] = "12b and render.anim_bg_of says the same       "
-    report((&n69[0]) as u64, 45, (rbg & 16777215 as u32) == 4868694 as u32,
-        (rbg & 16777215 as u32) as i64, 4868694)
-    // Frame 4 at 150 ms: arrived. After that nothing is stale any more.
-    render.ctx_set_time(&cx, 150)
-    canvas.canvas_clear(&cv, (255 as u32 << 24) | 16777215 as u32)
-    render.draw_button(&cx, &kr)
-    var n70: [u8; 46] = "12b at the end it paints 0x52525E             "
-    report((&n70[0]) as u64, 45, mid(&cv) == 5395038, mid(&cv), 5395038)
-    render.ctx_set_time(&cx, 400)
-    var n71: [u8; 46] = "12b a settled button asks for no repaint      "
-    report((&n71[0]) as u64, 45, !render.anim_run(&cx, &kr),
-        render.anim_run(&cx, &kr) as i64, 0)
-    // THE COUNTER-CHECK: without a registry the same button jumps at once to
-    // the hover colour. Exactly that is the difference that the registry
-    // makes -- and it is measured, not claimed.
-    render.ctx_unbind_anim(&cx)
-    var ks: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
-    widget.w_place(&ks, 8.0, 8.0, 48.0, 32.0)
-    widget.w_set_hover(&ks, true)
-    render.ctx_set_time(&cx, 50)
-    canvas.canvas_clear(&cv, (255 as u32 << 24) | 16777215 as u32)
-    render.draw_button(&cx, &ks)
-    var n72: [u8; 46] = "12b without the register it jumps at once     "
-    report((&n72[0]) as u64, 45, mid(&cv) == 5395038, mid(&cv), 5395038)
-
-    // ====================== 13. THE NINE PHASES OF THE PROOF IMAGE
-    //
-    // Calculation is done with the formula from gallery5_main.fi. Required
-    // is: every two phases with different values lie at least
-    // MARKE_W + 6 = 20 points apart, so a mark width PLUS
-    // six points of visible background. With the spring even the weaker
-    // requirement "one mark width" was earlier violated --
-    // three marks lay on top of each other at the stop 1.12.
-    let d_fe: i64 = min_distance(anim.easing_spring(1.0, 30.0, 4.5))
-    var n57: [u8; 46] = "13 spring: 9 phases, min gap x100 >= 2000     "
-    report((&n57[0]) as u64, 45, d_fe >= GAP, d_fe, GAP)
-    let d_li: i64 = min_distance(anim.easing_linear())
-    var n58: [u8; 46] = "13 linear: the gap is exactly 12850 (x100)    "
-    report((&n58[0]) as u64, 45, d_li == 12850, d_li, 12850)
-    let d_ei: i64 = min_distance(anim.easing_named(anim.EASE_IN))
-    var n59: [u8; 46] = "13 ease-in: min gap x100 >= 2000              "
-    report((&n59[0]) as u64, 45, d_ei >= GAP, d_ei, GAP)
-    let d_eo: i64 = min_distance(anim.easing_named(anim.EASE_OUT))
-    var n60: [u8; 46] = "13 ease-out: min gap x100 >= 2000             "
-    report((&n60[0]) as u64, 45, d_eo >= GAP, d_eo, GAP)
-    let d_io: i64 = min_distance(anim.easing_named(anim.EASE_IN_OUT))
-    var n61: [u8; 46] = "13 ease-in-out: min gap x100 >= 2000          "
-    report((&n61[0]) as u64, 45, d_io >= GAP, d_io, GAP)
-    let d_st: i64 = min_distance(anim.easing_steps(5))
-    var n62: [u8; 46] = "13 steps(5): min gap x100 >= 2000             "
-    report((&n62[0]) as u64, 45, d_st >= GAP, d_st, GAP)
-    // And the staircase stands still at exactly three places, every other
-    // curve at none -- otherwise the exception above would be a free pass.
-    var n63: [u8; 46] = "13 steps(5) rests on three pairs              "
-    let g_st: i64 = same_pairs(anim.easing_steps(5))
-    report((&n63[0]) as u64, 45, g_st == 3, g_st, 3)
-    var n64: [u8; 46] = "13 the spring rests on none                   "
-    let g_fe: i64 = same_pairs(anim.easing_spring(1.0, 30.0, 4.5))
-    report((&n64[0]) as u64, 45, g_fe == 0, g_fe, 0)
-
-    // ============ 14. EVERY CURVE SAYS WHICH ONE IT IS
-    //
-    // `easing_named` built its three curves via `easing_bezier`, and
-    // that set WITHOUT EXCEPTION EASE_IN_OUT: ease-in, ease-out and
-    // ease-in-out could no longer be told apart by their kind.
-    // Whoever reads the kind to label a row or
-    // to merge equal curves got the same information three times
-    // for three different motions. Here for all six
-    // curves it is re-calculated that `kind` names the curve.
-    var k_li: anim.Easing = anim.easing_linear()
-    var n80: [u8; 46] = "14 linear      .kind == EASE_LINEAR (0)       "
-    report((&n80[0]) as u64, 45, k_li.kind == anim.EASE_LINEAR,
-        k_li.kind as i64, anim.EASE_LINEAR as i64)
-    var k_in: anim.Easing = anim.easing_named(anim.EASE_IN)
-    var n81: [u8; 46] = "14 ease-in     .kind == EASE_IN (1)           "
-    report((&n81[0]) as u64, 45, k_in.kind == anim.EASE_IN,
-        k_in.kind as i64, anim.EASE_IN as i64)
-    var k_ou: anim.Easing = anim.easing_named(anim.EASE_OUT)
-    var n82: [u8; 46] = "14 ease-out    .kind == EASE_OUT (2)          "
-    report((&n82[0]) as u64, 45, k_ou.kind == anim.EASE_OUT,
-        k_ou.kind as i64, anim.EASE_OUT as i64)
-    var k_io: anim.Easing = anim.easing_named(anim.EASE_IN_OUT)
-    var n83: [u8; 46] = "14 ease-in-out .kind == EASE_IN_OUT (3)       "
-    report((&n83[0]) as u64, 45, k_io.kind == anim.EASE_IN_OUT,
-        k_io.kind as i64, anim.EASE_IN_OUT as i64)
-    var k_st: anim.Easing = anim.easing_steps(4)
-    var n84: [u8; 46] = "14 steps(4)    .kind == EASE_STEPS (4)        "
-    report((&n84[0]) as u64, 45, k_st.kind == anim.EASE_STEPS,
-        k_st.kind as i64, anim.EASE_STEPS as i64)
-    var k_fe: anim.Easing = anim.easing_spring(1.0, 100.0, 10.0)
-    var n85: [u8; 46] = "14 spring      .kind == EASE_SPRING (5)       "
-    report((&n85[0]) as u64, 45, k_fe.kind == anim.EASE_SPRING,
-        k_fe.kind as i64, anim.EASE_SPRING as i64)
-    // The nameless curve keeps EASE_IN_OUT: a freely chosen
-    // cubic-bezier is in the general case neither purely accelerating
-    // nor purely braking.
-    var k_bz: anim.Easing = anim.easing_bezier(0.25, 0.75, 0.25, 0.25)
-    var n86: [u8; 46] = "14 cubic-bezier(..) keeps EASE_IN_OUT (3)     "
-    report((&n86[0]) as u64, 45, k_bz.kind == anim.EASE_IN_OUT,
-        k_bz.kind as i64, anim.EASE_IN_OUT as i64)
-    // AND THE MOTION STAYS THE SAME. The new kind must not change the
-    // value: `ease_eval` falls for EASE_IN as for
-    // EASE_IN_OUT into the Bezier branch. ease-in = cubic-bezier(0.42,0,
-    // 1,1) has at x = 0.5 the value 0.315357 (t = 0.374253 from the
-    // Newton inversion), rounded down to thousandths so 315.
-    var n87: [u8; 46] = "14 ease-in(0.5) x1000 unchanged at 315        "
-    let v_in: i64 = milli(anim.ease_eval(&k_in, 0.5))
-    report((&n87[0]) as u64, 45, v_in == 315, v_in, 315)
-    // ease-out is its mirror image: ease-out(0.5) = 1 - ease-in(0.5)
-    // = 0.684643, so 685 thousandths. The two values together make
-    // 1000 -- on that hangs the symmetry of the two curves.
-    var n88: [u8; 46] = "14 ease-out(0.5) x1000 is the mirror 685      "
-    let v_ou: i64 = milli(anim.ease_eval(&k_ou, 0.5))
-    report((&n88[0]) as u64, 45, v_ou == 685, v_ou, 685)
-    var n89: [u8; 46] = "14 both together are exactly 1000             "
-    report((&n89[0]) as u64, 45, v_in + v_ou == 1000, v_in + v_ou, 1000)
-
-    painter.painter_free(&pz)
-    canvas.canvas_free(&cv)
-
-    var t: rt.Buf = rt.buf_new()
-    rt.buf_push(&t, 10 as u8)
-    if G_ERRORS > 0 {
-        var f: [u8; 22] = "ANIM IS NOT IN ORDER.\n"
-        rt.buf_push_bytes(&t, (&f[0]) as u64, 22)
-        rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
-        rt.buf_free(&t)
-        return 1
-    }
-    var o: [u8; 13] = "ANIM PASSED.\n"
-    rt.buf_push_bytes(&t, (&o[0]) as u64, 13)
-    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
-    rt.buf_free(&t)
-    return 0
+    say("ANIM FAILED\n")
+    return 1
 }

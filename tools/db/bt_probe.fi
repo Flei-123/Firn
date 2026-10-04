@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/db/bt_probe.fi -- drives lib/db/pager + lib/db/btree on a table made by SQLite.
+//
+//     bt_probe ins <db> <root> <n> <maxlen> [start]   insert rows start .. start+n-1
+//     bt_probe del <db> <root> <n> <maxlen> [start]   delete the same rows
+//     bt_probe check <db> <root> <index?>              verify the tree, print counts
+//
+// The table is `t(id INTEGER PRIMARY KEY, b TEXT)`: the record is (NULL, text).
+// Row i has rowid (i * 2654435761) mod 2^32 + 1 and a text of (i*31+7) mod maxlen
+// letters. tools/db/check_bt.py makes the file and checks it with SQLite.
+import std.rt
+import std.io
+import std.fs
+import db.pager
+import db.btree
+import db.record
+import db.dberr
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: rt.ptr_of(p), n: rt.c_length(p) }
+}
+
+fn num(s: str) -> i64 {
+    var v: i64 = 0
+    var i: usize = 0
+    while i < s.length() {
+        v = v * 10 + ((s.chars(i) as i64) - 48)
+        i = i + 1
+    }
+    return v
+}
+
+fn die(e: DbError) -> bool {
+    io.eprint("ERROR ")
+    io.eprint_line(dberr.last_message())
+    return false
+}
+
+static mut seq_mode: bool = false
+
+fn rowid_of(i: i64) -> i64 {
+    if seq_mode {
+        return i + 1
+    }
+    return ((i * 2654435761) % 4294967296) + 1
+}
+
+fn make_text(i: i64, maxlen: i64, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    let n: i64 = (i * 31 + 7) % maxlen
+    var j: i64 = 0
+    while j < n {
+        rt.buf_push(out, (97 + (i + j) % 26) as u8)
+        j = j + 1
+    }
+}
+
+fn run(start: u64) -> DbError!bool {
+    var cmd: str = arg(start, 1)
+    // inss / dels: the same, with the rowids in sequence (appends to the right-most leaf)
+    if cmd.equal("inss") {
+        seq_mode = true
+        cmd = "ins"
+    } else if cmd.equal("dels") {
+        seq_mode = true
+        cmd = "del"
+    }
+    let path: str = arg(start, 2)
+    let root: u32 = num(arg(start, 3)) as u32
+    var pg: pager.Pager = pager.pager_new()
+    try pager.pager_open(&pg, path, false, false, 4096, 200)
+    pager.pager_set_busy(&pg, 1000)
+    var bt: btree.Bt = btree.bt_new(&pg)
+    if cmd.equal("check") {
+        try pager.pager_begin_read(&pg)
+        var st: btree.CheckStats = btree.CheckStats { pages: 0, cells: 0, leaf_depth: 0, problems: 0, bytes_free: 0 }
+        let index: bool = num(arg(start, 4)) != 0
+        let ok: bool = try btree.bt_check(&bt, root, index, &st)
+        io.fmt_print_line(io.fmt_number(io.fmt_text(io.fmt_number(io.fmt_text(io.fmt_number(io.fmt_text(io.fmt_new(), "pages=".p as u64, 6), st.pages as i64), " cells=".p as u64, 7), st.cells as i64), " depth=".p as u64, 7), st.leaf_depth))
+        if !ok {
+            io.print_line(dberr.last_message())
+        }
+        pager.pager_end_read(&pg)
+        pager.pager_close(&pg)
+        btree.bt_free(&bt)
+        return ok
+    }
+    var idxroot: u32 = 0
+    var ai: usize = 4
+    let with_index: bool = cmd.equal("insi") || cmd.equal("deli")
+    if with_index {
+        idxroot = num(arg(start, 4)) as u32
+        ai = 5
+    }
+    let n: i64 = num(arg(start, ai))
+    let maxlen: i64 = num(arg(start, ai + 1))
+    var first: i64 = 0
+    if rt.arg_count(start) > ai + 2 {
+        first = num(arg(start, ai + 2))
+    }
+    try pager.pager_begin_write(&pg)
+    var text: rt.Buf = rt.buf_new()
+    var rec: rt.Buf = rt.buf_new()
+    var i: i64 = first
+    while i < first + n {
+        if with_index {
+            make_text(i, maxlen, &text)
+            var iv: [record.Val; 2] = [record.val_text(rt.buf_ptr(&text), rt.buf_len(&text)), record.val_int(rowid_of(i))]
+            var ik: record.UKey = record.ukey_new((&iv[0]) as u64, 2, 0)
+            var irec: rt.Buf = rt.buf_new()
+            record.rec_encode(&iv[0], 2, &irec)
+            if cmd.equal("insi") {
+                var tv: [record.Val; 2] = [record.val_null(), iv[0]]
+                rt.buf_clear(&rec)
+                record.rec_encode(&tv[0], 2, &rec)
+                try btree.bt_table_insert(&bt, root, rowid_of(i), rt.buf_ptr(&rec), rt.buf_len(&rec))
+                let added: bool = try btree.bt_index_insert(&bt, idxroot, &ik, rt.buf_ptr(&irec), rt.buf_len(&irec))
+                if !added {
+                    io.eprint_line("index entry exists")
+                }
+            } else {
+                try btree.bt_table_delete(&bt, root, rowid_of(i))
+                let gone2: bool = try btree.bt_index_delete(&bt, idxroot, &ik)
+                if !gone2 {
+                    io.eprint_line("index entry not found")
+                }
+            }
+            rt.buf_free(&irec)
+        } else if cmd.equal("ins") {
+            make_text(i, maxlen, &text)
+            var vals: [record.Val; 2] = [record.val_null(), record.val_text(rt.buf_ptr(&text), rt.buf_len(&text))]
+            rt.buf_clear(&rec)
+            record.rec_encode(&vals[0], 2, &rec)
+            try btree.bt_table_insert(&bt, root, rowid_of(i), rt.buf_ptr(&rec), rt.buf_len(&rec))
+        } else {
+            let gone: bool = try btree.bt_table_delete(&bt, root, rowid_of(i))
+            if !gone {
+                io.eprint_line("row not found")
+            }
+        }
+        i = i + 1
+    }
+    try pager.pager_commit(&pg)
+    pager.pager_close(&pg)
+    btree.bt_free(&bt)
+    return true
+}
+
+fn main(start: u64) -> i32 {
+    let ok: bool = run(start) catch | e | (die(e))
+    if !ok {
+        return 1
+    }
+    return 0
+}

@@ -1,0 +1,300 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/download/dl_main.fi -- lib/net/download.fi as a program, for
+// tools/download/check.py (the manager against a Python server that
+// misbehaves on purpose).
+//
+// Commands, one per line on standard input:
+//   W <workers>                      a new manager
+//   O retries <n> | backoff <base> <max> | timeout <ms> | rate <n>
+//     | flags <n> | ua <text>
+//   A <url> <dest> <algo 0..4> <hex|-> <size> [flags]      add an item
+//   M <idx> <url>                    a mirror for item <idx>
+//   V <idx> <etag|-> <lastmod|->     validators ("~" stands for a space)
+//   K <bytes>                        cancel once that many octets are done
+//   X                                run on the pool, wait, report
+//   I                                run inline (no threads), report
+// The report (after X or I):
+//   ITEM <i> state=<n> err=<n> http=<n> net=<n> attempts=<n> done=<n> total=<n>
+//   STATS done=.. failed=.. skipped=.. bytes_done=.. bytes_total=.. wire=..
+//         retries=.. sockets=.. requests=.. reused=..
+//   EVENTS start=.. progress=.. retry=.. done=..
+//   RETRYDELAYS <ms> <ms> ...        in the order the callbacks saw them
+//   ETAG <i> <text>    LM <i> <text>
+//   MS <elapsed>
+//   .
+import std.rt
+import std.time
+import std.pool
+import std.hashfile
+import net.download
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == pool.WORKER_KIND {
+        return pool.worker_main(arg)
+    }
+    return 0
+}
+
+// counters of the callback (workers write: atomics)
+static mut EV_N: [u64; 5] = [0; 5]
+static mut DELAYS: [u64; 32] = [0; 32]
+static mut NDELAYS: u64 = 0
+static mut CANCEL_AT: u64 = 0
+static mut G_DL: u64 = 0
+
+fn on_event(ud: u64, ev: u32, idx: u64, a: u64, b: u64) {
+    __atomic_add((&EV_N[ev as usize]) as *mut u64, 1)
+    if ev == download.EV_RETRY {
+        let k: u64 = __atomic_add(&NDELAYS, 1)
+        if k < 32 {
+            DELAYS[k as usize] = b
+        }
+    }
+    if CANCEL_AT > 0 && G_DL != 0 {
+        var dd: download.Dl = download.Dl { p: G_DL }
+        if download.dl_bytes_done(&dd) >= CANCEL_AT {
+            download.dl_cancel(&dd)
+        }
+    }
+}
+
+fn word(p: u64, n: usize, from: usize, e: *mut usize) -> usize {
+    var i: usize = from
+    while i < n && rt.ld8(p, i) == 32 as u8 {
+        i = i + 1
+    }
+    var k: usize = i
+    while k < n && rt.ld8(p, k) != 32 as u8 {
+        k = k + 1
+    }
+    *e = k
+    return i
+}
+
+fn num(p: u64, s: usize, e: usize) -> u64 {
+    var v: u64 = 0
+    var i: usize = s
+    while i < e {
+        v = v * 10 + (rt.ld8(p, i) - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
+
+fn view(p: u64, s: usize, e: usize) -> str {
+    return str { p: rt.ptr_of(p + s as u64), n: e - s }
+}
+
+fn kv(out: *mut rt.Buf, k: str, v: u64) {
+    rt.buf_push_bytes(out, k.p as u64, k.length())
+    rt.buf_push_dec_u64(out, v)
+}
+
+fn lit(out: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(out, s.p as u64, s.length())
+}
+
+fn report(out: *mut rt.Buf, d: *mut download.Dl, ms: u64) {
+    let n: usize = download.dl_count(d)
+    var i: usize = 0
+    while i < n {
+        lit(out, "ITEM ")
+        rt.buf_push_dec_u64(out, i as u64)
+        kv(out, " state=", download.dl_item_state(d, i))
+        kv(out, " err=", download.dl_item_error(d, i) as u64)
+        kv(out, " http=", download.dl_item_http(d, i) as u64)
+        kv(out, " net=", download.dl_item_net_error(d, i) as u64)
+        kv(out, " attempts=", download.dl_item_attempts(d, i) as u64)
+        kv(out, " done=", download.dl_item_done(d, i))
+        kv(out, " total=", download.dl_item_total(d, i))
+        rt.buf_push(out, 10 as u8)
+        let et: str = download.dl_item_etag(d, i)
+        if et.length() > 0 {
+            lit(out, "ETAG ")
+            rt.buf_push_dec_u64(out, i as u64)
+            rt.buf_push(out, 32 as u8)
+            rt.buf_push_bytes(out, et.p as u64, et.length())
+            rt.buf_push(out, 10 as u8)
+        }
+        let lm: str = download.dl_item_last_modified(d, i)
+        if lm.length() > 0 {
+            lit(out, "LM ")
+            rt.buf_push_dec_u64(out, i as u64)
+            rt.buf_push(out, 32 as u8)
+            rt.buf_push_bytes(out, lm.p as u64, lm.length())
+            rt.buf_push(out, 10 as u8)
+        }
+        i = i + 1
+    }
+    lit(out, "STATS")
+    kv(out, " done=", download.dl_files_done(d))
+    kv(out, " failed=", download.dl_files_failed(d))
+    kv(out, " skipped=", download.dl_files_skipped(d))
+    kv(out, " bytes_done=", download.dl_bytes_done(d))
+    kv(out, " bytes_total=", download.dl_bytes_total(d))
+    kv(out, " wire=", download.dl_bytes_wire(d))
+    kv(out, " retries=", download.dl_retries_used(d))
+    kv(out, " sockets=", download.dl_sockets(d))
+    kv(out, " requests=", download.dl_requests(d))
+    kv(out, " reused=", download.dl_reused(d))
+    rt.buf_push(out, 10 as u8)
+    lit(out, "EVENTS")
+    kv(out, " start=", EV_N[1])
+    kv(out, " progress=", EV_N[2])
+    kv(out, " retry=", EV_N[3])
+    kv(out, " done=", EV_N[4])
+    rt.buf_push(out, 10 as u8)
+    lit(out, "RETRYDELAYS")
+    var k: u64 = 0
+    while k < NDELAYS && k < 32 {
+        rt.buf_push(out, 32 as u8)
+        rt.buf_push_dec_u64(out, DELAYS[k as usize])
+        k = k + 1
+    }
+    rt.buf_push(out, 10 as u8)
+    kv(out, "MS ", ms)
+    rt.buf_push(out, 10 as u8)
+    lit(out, ".\n")
+}
+
+fn main() -> i32 {
+    var inb: rt.Buf = rt.buf_new()
+    rt.read_stdin(&inb)
+    var out: rt.Buf = rt.buf_new()
+    var d: download.Dl = download.Dl { p: 0 }
+    let p: u64 = inb.ptr
+    let n: usize = inb.len
+    var i: usize = 0
+    while i < n {
+        var e: usize = i
+        while e < n && rt.ld8(p, e) != 10 as u8 {
+            e = e + 1
+        }
+        if e > i {
+            let cmd: u8 = rt.ld8(p, i)
+            var w1e: usize = 0
+            let w1: usize = word(p, e, i + 1, &w1e)
+            if cmd == 87 as u8 { // W
+                if d.p != 0 {
+                    download.dl_free(&d)
+                }
+                d = download.dl_new(num(p, w1, w1e))
+                G_DL = d.p
+                download.dl_set_progress(&d, on_event, 0)
+            } else if cmd == 79 as u8 { // O
+                var w2e: usize = 0
+                let w2: usize = word(p, e, w1e, &w2e)
+                var w3e: usize = 0
+                let w3: usize = word(p, e, w2e, &w3e)
+                let key: str = view(p, w1, w1e)
+                if key == "retries" {
+                    download.dl_set_retries(&d, num(p, w2, w2e) as u32)
+                } else if key == "backoff" {
+                    download.dl_set_backoff(&d, num(p, w2, w2e), num(p, w3, w3e))
+                } else if key == "timeout" {
+                    download.dl_set_timeout(&d, num(p, w2, w2e))
+                } else if key == "rate" {
+                    download.dl_set_rate(&d, num(p, w2, w2e))
+                } else if key == "flags" {
+                    download.dl_set_flags(&d, num(p, w2, w2e) as u32)
+                } else if key == "ua" {
+                    download.dl_set_user_agent(&d, view(p, w2, w2e))
+                }
+            } else if cmd == 65 as u8 { // A url dest algo hex size [flags]
+                var w2e: usize = 0
+                let w2: usize = word(p, e, w1e, &w2e)
+                var w3e: usize = 0
+                let w3: usize = word(p, e, w2e, &w3e)
+                var w4e: usize = 0
+                let w4: usize = word(p, e, w3e, &w4e)
+                var w5e: usize = 0
+                let w5: usize = word(p, e, w4e, &w5e)
+                var w6e: usize = 0
+                let w6: usize = word(p, e, w5e, &w6e)
+                var hex: str = view(p, w4, w4e)
+                if hex == "-" {
+                    hex = ""
+                }
+                let idx: i64 = download.dl_add(&d, view(p, w1, w1e), view(p, w2, w2e),
+                    num(p, w3, w3e) as u32, hex, num(p, w5, w5e))
+                if idx < 0 {
+                    lit(&out, "ADDFAIL\n")
+                } else if w6e > w6 {
+                    download.dl_set_item_flags(&d, idx, num(p, w6, w6e) as u32)
+                }
+            } else if cmd == 77 as u8 { // M idx url
+                var w2e: usize = 0
+                let w2: usize = word(p, e, w1e, &w2e)
+                if !download.dl_add_mirror(&d, num(p, w1, w1e) as i64, view(p, w2, w2e)) {
+                    lit(&out, "MIRRORFAIL\n")
+                }
+            } else if cmd == 86 as u8 { // V idx etag lm
+                var w2e: usize = 0
+                let w2: usize = word(p, e, w1e, &w2e)
+                var w3e: usize = 0
+                let w3: usize = word(p, e, w2e, &w3e)
+                // "~" stands for a space inside a value, "-" for nothing
+                var et: rt.Buf = rt.buf_new()
+                var lm: rt.Buf = rt.buf_new()
+                var q: usize = w2
+                while q < w2e {
+                    var ch: u8 = rt.ld8(p, q)
+                    if ch == 126 as u8 {
+                        ch = 32 as u8
+                    }
+                    rt.buf_push(&et, ch)
+                    q = q + 1
+                }
+                q = w3
+                while q < w3e {
+                    var ch: u8 = rt.ld8(p, q)
+                    if ch == 126 as u8 {
+                        ch = 32 as u8
+                    }
+                    rt.buf_push(&lm, ch)
+                    q = q + 1
+                }
+                var ets: str = str { p: rt.buf_data(&et), n: et.len }
+                var lms: str = str { p: rt.buf_data(&lm), n: lm.len }
+                if ets == "-" {
+                    ets = ""
+                }
+                if lms == "-" {
+                    lms = ""
+                }
+                if !download.dl_set_validators(&d, num(p, w1, w1e) as i64, ets, lms) {
+                    lit(&out, "VALFAIL\n")
+                }
+                rt.buf_free(&et)
+                rt.buf_free(&lm)
+            } else if cmd == 75 as u8 { // K bytes
+                CANCEL_AT = num(p, w1, w1e)
+            } else if cmd == 88 as u8 || cmd == 73 as u8 { // X / I
+                let t0: u64 = time.monotonic_ns()
+                var r: i64 = 0
+                if cmd == 88 as u8 {
+                    r = download.dl_run(&d)
+                } else {
+                    r = download.dl_run_inline(&d)
+                }
+                let ms: u64 = (time.monotonic_ns() - t0) / 1000000
+                if r < 0 {
+                    lit(&out, "RUNFAIL\n")
+                }
+                report(&out, &d, ms)
+                rt.write_everything(1, out.ptr, out.len)
+                rt.buf_clear(&out)
+            }
+        }
+        i = e + 1
+    }
+    if out.len > 0 {
+        rt.write_everything(1, out.ptr, out.len)
+    }
+    if d.p != 0 {
+        download.dl_free(&d)
+    }
+    rt.buf_free(&out)
+    rt.buf_free(&inb)
+    return 0
+}

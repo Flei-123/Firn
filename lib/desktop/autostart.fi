@@ -1,0 +1,315 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/desktop/autostart.fi -- desktop.autostart: start a program when the user logs in. Linux.
+//
+//     import desktop.autostart
+//
+//     autostart.autostart_set("org.example.app", "Example", "/opt/example/example", "--minimized\n--profile=a b")
+//     if autostart.autostart_is_enabled("org.example.app") { ... }
+//     autostart.autostart_remove("org.example.app")
+//
+// `args` are the program's arguments, ONE PER LINE (an argument cannot contain
+// a line break or another control character; blanks, quotes and every other
+// character are fine; the empty text means no arguments).
+// The same names exist in `autostart.windows.fi` (HKCU\\Software\\Microsoft\\Windows\\
+// CurrentVersion\\Run) and in the stubs `autostart_macos.fi` (a LaunchAgent plist),
+// `lib/@android/desktop/autostart.fi`, `autostart_osum.fi`;
+// `tools/desktop/platforms.py` checks the export lists.
+//
+// ON LINUX it is the freedesktop.org Desktop Application Autostart
+// Specification: a `<id>.desktop` file in `$XDG_CONFIG_HOME/autostart`
+// (`~/.config/autostart`), written atomically. Its `Exec=` line is quoted by the
+// Desktop Entry Specification's rules (a double quoted argument; inside it the
+// characters `"` `` ` `` `$` `\\` get a backslash; `%` is doubled so that it is not a field
+// code; then the whole value is escaped as a string: `\\` becomes `\\\\`), so the
+// desktop's launcher splits it back into exactly the arguments given.
+//
+// HONEST
+// S1  `app_id` becomes the file name: letters, digits, `.`, `_`, `-` only (anything
+//     else is refused); that is what makes `autostart_remove` safe.
+// S2  The entry works in desktops that implement the specification (GNOME, KDE,
+//     Xfce, Cinnamon, MATE, LXQt ...). A bare window manager starts only what
+//     its own configuration says.
+// S3  `autostart_set` replaces an existing entry of the same id. Entries made by
+//     other programs are never touched; `autostart_is_enabled` is false for an
+//     entry with `Hidden=true` or `X-GNOME-Autostart-enabled=false`.
+// S4  Tested by reading the file back with Python's own parser and the
+//     specification's unquoting rules (`tools/desktop/autostart_check.py`) and
+//     by `gio` (GLib's desktop file reader: `gio info`), not by logging in.
+import std.rt
+import std.str
+import std.fs
+import std.shell
+
+export {
+    autostart_set, autostart_set_in, autostart_remove, autostart_remove_in, autostart_is_enabled,
+    autostart_is_enabled_in, autostart_dir, autostart_command_in, exec_quote,
+}
+
+fn push_lit(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+fn id_ok(app_id: str) -> bool {
+    if app_id.length() == 0 || app_id.length() > 120 {
+        return false
+    }
+    var i: usize = 0
+    while i < app_id.length() {
+        let c: u8 = app_id.chars(i)
+        let ok: bool = (c >= 48 as u8 && c <= 57 as u8) || (c >= 65 as u8 && c <= 90 as u8)
+            || (c >= 97 as u8 && c <= 122 as u8) || c == 46 as u8 || c == 95 as u8 || c == 45 as u8
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return app_id.chars(0) != 46 as u8
+}
+
+// `~/.config/autostart` (or `$XDG_CONFIG_HOME/autostart`).
+fn autostart_dir(out: *mut rt.Buf) -> bool {
+    let c: str = shell.config_dir()
+    if c.length() == 0 {
+        return false
+    }
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, c.p as u64, c.length())
+    push_lit(out, "/autostart")
+    return true
+}
+
+fn no_ctl(s: str) -> bool {
+    var i: usize = 0
+    while i < s.length() {
+        let c: u8 = s.chars(i)
+        if c < 32 as u8 || c == 127 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Desktop Entry "string" value escaping: only the backslash needs it here
+// (control characters were refused before).
+fn push_value(out: *mut rt.Buf, s: str) {
+    var i: usize = 0
+    while i < s.length() {
+        let c: u8 = s.chars(i)
+        if c == 92 as u8 {
+            rt.buf_push(out, 92 as u8)
+        }
+        rt.buf_push(out, c)
+        i = i + 1
+    }
+}
+
+fn plain_arg(s: str) -> bool {
+    if s.length() == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < s.length() {
+        let c: u8 = s.chars(i)
+        let ok: bool = (c >= 48 as u8 && c <= 57 as u8) || (c >= 65 as u8 && c <= 90 as u8)
+            || (c >= 97 as u8 && c <= 122 as u8) || c == 45 as u8 || c == 46 as u8 || c == 95 as u8
+            || c == 47 as u8 || c == 58 as u8 || c == 61 as u8 || c == 44 as u8 || c == 43 as u8
+            || c == 64 as u8
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// One argument of an `Exec=` line, quoted (Desktop Entry Specification, "The Exec key"):
+// reserved characters or an empty argument -> in double quotes, with `"`, `` ` ``, `$`, `\`
+// preceded by a backslash. `%` is written `%%` (a field code otherwise).
+// NOT yet escaped as a string value: `push_value` does that for the whole line.
+fn exec_quote(out: *mut rt.Buf, s: str) {
+    if plain_arg(s) {
+        rt.buf_push_bytes(out, s.p as u64, s.length())
+        return
+    }
+    rt.buf_push(out, 34 as u8)
+    var i: usize = 0
+    while i < s.length() {
+        let c: u8 = s.chars(i)
+        if c == 34 as u8 || c == 96 as u8 || c == 36 as u8 || c == 92 as u8 {
+            rt.buf_push(out, 92 as u8)
+        }
+        if c == 37 as u8 {
+            rt.buf_push(out, 37 as u8)
+        }
+        rt.buf_push(out, c)
+        i = i + 1
+    }
+    rt.buf_push(out, 34 as u8)
+}
+
+fn entry_text(name: str, exe: str, args: str, out: *mut rt.Buf) -> bool {
+    if name.length() == 0 || exe.length() == 0 || !no_ctl(name) || !no_ctl(exe) {
+        return false
+    }
+    var line: rt.Buf = rt.buf_new()
+    exec_quote(&line, exe)
+    // `args` is split at every line break: "a\nb" = two arguments, "a\n" = "a" and an empty
+    // one; the empty text is NO argument (one single empty argument cannot be written).
+    var i: usize = 0
+    var more: bool = args.length() > 0
+    while more {
+        var j: usize = i
+        while j < args.length() && args.chars(j) != 10 as u8 {
+            j = j + 1
+        }
+        let a: str = args.part(i, j - i)
+        if !no_ctl(a) {
+            rt.buf_free(&line)
+            return false
+        }
+        rt.buf_push(&line, 32 as u8)
+        exec_quote(&line, a)
+        more = j < args.length()
+        i = j + 1
+    }
+    push_lit(out, "[Desktop Entry]\nType=Application\nVersion=1.0\nName=")
+    push_value(out, name)
+    push_lit(out, "\nExec=")
+    push_value(out, str { p: rt.buf_data(&line), n: rt.buf_len(&line) })
+    push_lit(out, "\nTerminal=false\nX-GNOME-Autostart-enabled=true\n")
+    rt.buf_free(&line)
+    return true
+}
+
+fn path_of(dir: str, app_id: str, out: *mut rt.Buf) {
+    rt.buf_push_bytes(out, dir.p as u64, dir.length())
+    rt.buf_push(out, 47 as u8)
+    rt.buf_push_bytes(out, app_id.p as u64, app_id.length())
+    push_lit(out, ".desktop")
+}
+
+// Makes (or replaces) the entry in `dir`.
+fn autostart_set_in(dir: str, app_id: str, name: str, exe: str, args: str) -> bool {
+    if !id_ok(app_id) {
+        return false
+    }
+    var text: rt.Buf = rt.buf_new()
+    if !entry_text(name, exe, args, &text) {
+        rt.buf_free(&text)
+        return false
+    }
+    fs.mkdir_all(dir) catch false
+    var p: rt.Buf = rt.buf_new()
+    path_of(dir, app_id, &p)
+    let ok: bool = fs.write_atomic(str { p: rt.buf_data(&p), n: rt.buf_len(&p) }, rt.buf_ptr(&text), rt.buf_len(&text)) catch false
+    rt.buf_free(&p)
+    rt.buf_free(&text)
+    return ok
+}
+
+fn autostart_set(app_id: str, name: str, exe: str, args: str) -> bool {
+    var d: rt.Buf = rt.buf_new()
+    if !autostart_dir(&d) {
+        rt.buf_free(&d)
+        return false
+    }
+    let ok: bool = autostart_set_in(str { p: rt.buf_data(&d), n: rt.buf_len(&d) }, app_id, name, exe, args)
+    rt.buf_free(&d)
+    return ok
+}
+
+// true = the entry is not there any more (it did not exist, or was removed).
+fn autostart_remove_in(dir: str, app_id: str) -> bool {
+    if !id_ok(app_id) {
+        return false
+    }
+    var p: rt.Buf = rt.buf_new()
+    path_of(dir, app_id, &p)
+    let path: str = str { p: rt.buf_data(&p), n: rt.buf_len(&p) }
+    var ok: bool = true
+    if fs.exists(path) {
+        ok = fs.remove(path) catch false
+    }
+    rt.buf_free(&p)
+    return ok
+}
+
+fn autostart_remove(app_id: str) -> bool {
+    var d: rt.Buf = rt.buf_new()
+    if !autostart_dir(&d) {
+        rt.buf_free(&d)
+        return false
+    }
+    let ok: bool = autostart_remove_in(str { p: rt.buf_data(&d), n: rt.buf_len(&d) }, app_id)
+    rt.buf_free(&d)
+    return ok
+}
+
+fn line_value(text: str, key: str) -> str {
+    var i: usize = 0
+    while i < text.length() {
+        var j: usize = i
+        while j < text.length() && text.chars(j) != 10 as u8 {
+            j = j + 1
+        }
+        let ln: str = text.part(i, j - i)
+        if ln.length() > key.length() && ln.part(0, key.length()) == key && ln.chars(key.length()) == 61 as u8 {
+            return ln.part(key.length() + 1, ln.length() - key.length() - 1)
+        }
+        i = j + 1
+    }
+    return ""
+}
+
+fn autostart_is_enabled_in(dir: str, app_id: str) -> bool {
+    if !id_ok(app_id) {
+        return false
+    }
+    var p: rt.Buf = rt.buf_new()
+    path_of(dir, app_id, &p)
+    var data: rt.Buf = rt.buf_new()
+    var ok: bool = false
+    let got: usize = fs.read_file(str { p: rt.buf_data(&p), n: rt.buf_len(&p) }, &data) catch 0
+    if got > 0 {
+        let text: str = str { p: rt.buf_data(&data), n: rt.buf_len(&data) }
+        ok = line_value(text, "Exec").length() > 0 && line_value(text, "Hidden") != "true"
+            && line_value(text, "X-GNOME-Autostart-enabled") != "false"
+    }
+    rt.buf_free(&data)
+    rt.buf_free(&p)
+    return ok
+}
+
+fn autostart_is_enabled(app_id: str) -> bool {
+    var d: rt.Buf = rt.buf_new()
+    if !autostart_dir(&d) {
+        rt.buf_free(&d)
+        return false
+    }
+    let ok: bool = autostart_is_enabled_in(str { p: rt.buf_data(&d), n: rt.buf_len(&d) }, app_id)
+    rt.buf_free(&d)
+    return ok
+}
+
+// The `Exec=` value of an entry as it stands in the file (still quoted), into `out`.
+fn autostart_command_in(dir: str, app_id: str, out: *mut rt.Buf) -> bool {
+    if !id_ok(app_id) {
+        return false
+    }
+    var p: rt.Buf = rt.buf_new()
+    path_of(dir, app_id, &p)
+    var data: rt.Buf = rt.buf_new()
+    var ok: bool = false
+    let got: usize = fs.read_file(str { p: rt.buf_data(&p), n: rt.buf_len(&p) }, &data) catch 0
+    if got > 0 {
+        let v: str = line_value(str { p: rt.buf_data(&data), n: rt.buf_len(&data) }, "Exec")
+        if v.length() > 0 {
+            rt.buf_push_bytes(out, v.p as u64, v.length())
+            ok = true
+        }
+    }
+    rt.buf_free(&data)
+    rt.buf_free(&p)
+    return ok
+}

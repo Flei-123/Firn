@@ -239,6 +239,12 @@ pub fn platform_dir() -> &'static str {
         "@web"
     } else if android() {
         "@android"
+    } else if windows() {
+        // Round PACK: a window program for Windows needs the Win32 back end
+        // and a font from C:\Windows\Fonts, not the X11 pair that "@linux"
+        // holds (lib/@windows/ has the two files that differ; everything
+        // else a program imports is found in the library directory itself).
+        "@windows"
     } else {
         "@linux"
     }
@@ -278,6 +284,8 @@ mod tests {
         assert_eq!(platform_dir(), "@android");
         flag_set("wasm32-browser").unwrap();
         assert_eq!(platform_dir(), "@web");
+        flag_set("x86_64-windows").unwrap();
+        assert_eq!(platform_dir(), "@windows");
         reset();
     }
 

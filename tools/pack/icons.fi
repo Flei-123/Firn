@@ -1,0 +1,503 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/pack/icons.fi -- one SVG or PNG in, every icon a package needs out.
+//
+//   icons <input.svg|input.png> <outdir> [--name NAME] [--bg RRGGBB]
+//
+// writes, below <outdir>:
+//
+//   png/NAME-<n>.png                 16 24 32 48 64 96 128 192 256 512 1024
+//   NAME.ico                         16 24 32 48 64 128 256  (PNG entries)
+//   NAME.icns                        16 32 64 128 256 512 1024 (+ @2x forms)
+//   hicolor/<n>x<n>/apps/NAME.png    the freedesktop icon theme sizes
+//   hicolor/scalable/apps/NAME.svg   when the input is an SVG
+//   android/res/mipmap-{m,h,xh,xxh,xxxh}dpi/ic_launcher.png  48 72 96 144 192
+//   android/res/mipmap-*/ic_launcher_round.png               (circle mask)
+//   android/res/mipmap-*/ic_launcher_foreground.png          108dp adaptive layer, 61 % centred
+//   android/res/mipmap-anydpi-v26/ic_launcher{,_round}.xml   the adaptive icon
+//   android/res/values/ic_launcher_background.xml            the colour (--bg, default FFFFFF)
+//   android/playstore-512.png
+//
+// An SVG is drawn once per size with lib/svg (sharp at every size); a PNG is
+// resampled (lib/pack/icons.fi) -- give one of at least 1024x1024 if the big
+// sizes should not be soft. A picture that is not square is centred on a
+// transparent square. No ImageMagick, no rsvg, no Python.
+//
+// Build:  firnc -o build/pack/icons tools/pack/icons.fi
+import std.rt
+import std.fs
+import std.io
+import appkit.util
+import paint.png
+import svg.image
+import pack.icons
+
+// size lists as text: no const arrays in stage 0
+const SIZES_PNG: str = "16,24,32,48,64,96,128,192,256,512,1024"
+const SIZES_HICOLOR: str = "16,24,32,48,64,128,256,512"
+const SIZES_ICO: str = "16,24,32,48,64,128,256"
+const SIZES_ICNS: str = "16,32,64,128,256,512,1024"
+
+// how many numbers a comma list holds
+fn list_n(l: str) -> usize {
+    var n: usize = 1
+    var i: usize = 0
+    while i < l.n {
+        if rt.ld8(l.p as u64, i) == 44 as u8 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// the i-th number of a comma list
+fn list_at(l: str, idx: usize) -> u32 {
+    var at: usize = 0
+    var v: u32 = 0 as u32
+    var i: usize = 0
+    while i < l.n {
+        let c: u8 = rt.ld8(l.p as u64, i)
+        if c == 44 as u8 {
+            if at == idx { return v }
+            at = at + 1
+            v = 0 as u32
+        } else {
+            v = v * 10 as u32 + (c - 48 as u8) as u32
+        }
+        i = i + 1
+    }
+    return v
+}
+
+fn list_has(l: str, v: u32) -> bool {
+    var i: usize = 0
+    while i < list_n(l) {
+        if list_at(l, i) == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+struct Source {
+    is_svg: bool,
+    svg: rt.Buf,           // the file, when SVG
+    rgba: rt.Buf,          // square straight RGBA, when PNG
+    side: usize,
+    wrote: usize,
+    failed: usize,
+}
+
+fn dec(v: usize) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&b, v as u64)
+    let s: str = util.buf_to_str_copy(&b)
+    rt.buf_free(&b)
+    return s
+}
+
+fn put(src: *mut Source, path: str, p: u64, n: usize) {
+    let w: usize = fs.write_file(path, p, n) catch 0
+    if w != n || n == 0 {
+        io.eprint_line("write failed: " + path)
+        (*src).failed = (*src).failed + 1
+        return
+    }
+    (*src).wrote = (*src).wrote + 1
+}
+
+fn dir_of(path: str) -> str {
+    var i: usize = path.n
+    while i > 0 {
+        if rt.ld8(path.p as u64, i - 1) == 47 as u8 {
+            var b: rt.Buf = rt.buf_new()
+            rt.buf_push_bytes(&b, path.p as u64, i - 1)
+            let s: str = util.buf_to_str_copy(&b)
+            rt.buf_free(&b)
+            return s
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn put_in(src: *mut Source, path: str, p: u64, n: usize) {
+    fs.mkdir_all(dir_of(path)) catch false
+    put(src, path, p, n)
+}
+
+fn is_png(p: u64, n: usize) -> bool {
+    return n > 8 && rt.ld8(p, 0) == 137 as u8 && rt.ld8(p, 1) == 80 as u8 && rt.ld8(p, 2) == 78 as u8 &&
+        rt.ld8(p, 3) == 71 as u8
+}
+
+// RGBA of `size` x `size`, straight, into `out`. False on failure.
+fn render(src: *mut Source, size: usize, out: *mut rt.Buf) -> bool {
+    if !(*src).is_svg {
+        return icons.resample(rt.buf_ptr(&(*src).rgba), (*src).side, (*src).side, out, size, size)
+    }
+    // the file's own size gives the aspect; the long edge becomes `size`
+    var im0: png.Image = png.image_new()
+    if !image.svg_to_image(rt.buf_ptr(&(*src).svg), rt.buf_len(&(*src).svg), &im0, 0 as u64) {
+        return false
+    }
+    let nw: usize = png.image_width(&im0)
+    let nh: usize = png.image_height(&im0)
+    png.image_free(&im0)
+    if nw == 0 || nh == 0 {
+        return false
+    }
+    var rw: usize = size
+    var rh: usize = size
+    if nw > nh {
+        rh = (size * nh + nw / 2) / nw
+    } else if nh > nw {
+        rw = (size * nw + nh / 2) / nh
+    }
+    if rw < 1 { rw = 1 }
+    if rh < 1 { rh = 1 }
+    var im: png.Image = png.image_new()
+    if !image.svg_too_image_big(rt.buf_ptr(&(*src).svg), rt.buf_len(&(*src).svg), &im, 0 as u64, rw, rh) {
+        return false
+    }
+    var flat: rt.Buf = rt.buf_new()
+    var y: usize = 0
+    while y < png.image_height(&im) {
+        var x: usize = 0
+        while x < png.image_width(&im) {
+            let v: u32 = png.image_pixel(&im, x, y)
+            rt.buf_push(&flat, ((v >> 16) & 255 as u32) as u8)
+            rt.buf_push(&flat, ((v >> 8) & 255 as u32) as u8)
+            rt.buf_push(&flat, (v & 255 as u32) as u8)
+            rt.buf_push(&flat, ((v >> 24) & 255 as u32) as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let fw: usize = png.image_width(&im)
+    let fh: usize = png.image_height(&im)
+    png.image_free(&im)
+    let ok: bool = square_to(rt.buf_ptr(&flat), fw, fh, size, out)
+    rt.buf_free(&flat)
+    return ok
+}
+
+// centre fw x fh on a transparent size x size
+fn square_to(p: u64, fw: usize, fh: usize, size: usize, out: *mut rt.Buf) -> bool {
+    rt.buf_clear(out)
+    rt.buf_reserve(out, size * size * 4)
+    let ox: usize = (size - fw) / 2
+    let oy: usize = (size - fh) / 2
+    var y: usize = 0
+    while y < size {
+        var x: usize = 0
+        while x < size {
+            if x >= ox && x < ox + fw && y >= oy && y < oy + fh {
+                let o: usize = ((y - oy) * fw + (x - ox)) * 4
+                rt.buf_push(out, rt.ld8(p, o))
+                rt.buf_push(out, rt.ld8(p, o + 1))
+                rt.buf_push(out, rt.ld8(p, o + 2))
+                rt.buf_push(out, rt.ld8(p, o + 3))
+            } else {
+                rt.buf_push_bytes(out, "\0\0\0\0".p as u64, 4)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return true
+}
+
+fn png_of(src: *mut Source, size: usize, png_out: *mut rt.Buf) -> bool {
+    var px: rt.Buf = rt.buf_new()
+    if !render(src, size, &px) {
+        rt.buf_free(&px)
+        return false
+    }
+    rt.buf_clear(png_out)
+    let ok: bool = icons.png_encode(rt.buf_ptr(&px), size, size, png_out)
+    rt.buf_free(&px)
+    return ok
+}
+
+fn hexv(c: u8) -> u32 {
+    if c >= 48 as u8 && c <= 57 as u8 { return (c - 48 as u8) as u32 }
+    if c >= 97 as u8 && c <= 102 as u8 { return (c - 87 as u8) as u32 }
+    if c >= 65 as u8 && c <= 70 as u8 { return (c - 55 as u8) as u32 }
+    return 0 as u32
+}
+
+// 'RRGGBB' -> 0xRRGGBB (anything else: white)
+fn parse_bg(s: str) -> u32 {
+    if s.n != 6 { return 16777215 as u32 }
+    var v: u32 = 0 as u32
+    var i: usize = 0
+    while i < 6 {
+        v = (v << 4) | hexv(rt.ld8(s.p as u64, i))
+        i = i + 1
+    }
+    return v
+}
+
+// the icon over a solid colour (legacy launcher icon), optionally cut to a circle
+fn compose(src: u64, size: usize, bg: u32, circle: bool, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    let br: f64 = ((bg >> 16) & 255 as u32) as f64
+    let bgc: f64 = ((bg >> 8) & 255 as u32) as f64
+    let bb: f64 = (bg & 255 as u32) as f64
+    let r: f64 = (size as f64) / 2.0
+    var y: usize = 0
+    while y < size {
+        var x: usize = 0
+        while x < size {
+            let o: usize = (y * size + x) * 4
+            let a: f64 = (rt.ld8(src, o + 3) as f64) / 255.0
+            var cov: f64 = 1.0
+            if circle {
+                let dx: f64 = (x as f64) + 0.5 - r
+                let dy: f64 = (y as f64) + 0.5 - r
+                // distance from the centre, via a few Newton steps for the root
+                var d: f64 = r
+                let q: f64 = dx * dx + dy * dy
+                var k: usize = 0
+                while k < 12 {
+                    if d > 0.0 { d = (d + q / d) / 2.0 }
+                    k = k + 1
+                }
+                if q == 0.0 { d = 0.0 }
+                cov = r - d + 0.5
+                if cov < 0.0 { cov = 0.0 }
+                if cov > 1.0 { cov = 1.0 }
+            }
+            let rr: f64 = (rt.ld8(src, o) as f64) * a + br * (1.0 - a)
+            let gg: f64 = (rt.ld8(src, o + 1) as f64) * a + bgc * (1.0 - a)
+            let bl: f64 = (rt.ld8(src, o + 2) as f64) * a + bb * (1.0 - a)
+            rt.buf_push(out, clamp8(rr))
+            rt.buf_push(out, clamp8(gg))
+            rt.buf_push(out, clamp8(bl))
+            rt.buf_push(out, clamp8(cov * 255.0))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn clamp8(v: f64) -> u8 {
+    if v <= 0.0 { return 0 as u8 }
+    if v >= 255.0 { return 255 as u8 }
+    return (v + 0.5) as u8
+}
+
+// the 108dp adaptive layer: the icon at 61 % (the 66dp safe zone) in the middle
+fn foreground(px: u64, size: usize, layer: usize, out: *mut rt.Buf) {
+    var small: usize = (layer * 61) / 100
+    if small < 1 { small = 1 }
+    var scaled: rt.Buf = rt.buf_new()
+    icons.resample(px, size, size, &scaled, small, small)
+    square_to(rt.buf_ptr(&scaled), small, small, layer, out)
+    rt.buf_free(&scaled)
+}
+
+fn android_sizes(src: *mut Source, outdir: str, bg: u32) {
+    var names: [str; 5] = ["mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"]
+    var launcher: [usize; 5] = [48, 72, 96, 144, 192]
+    var layer: [usize; 5] = [108, 162, 216, 324, 432]
+    var i: usize = 0
+    while i < 5 {
+        let d: str = outdir + "/android/res/mipmap-" + names[i]
+        var px: rt.Buf = rt.buf_new()
+        var png_b: rt.Buf = rt.buf_new()
+        // the 432 px square is the master of the density; rendering it once per size
+        // keeps every edge sharp
+        if render(src, launcher[i], &px) {
+            var flat: rt.Buf = rt.buf_new()
+            compose(rt.buf_ptr(&px), launcher[i], bg, false, &flat)
+            // legacy square icon keeps the full alpha of the colour: opaque
+            rt.buf_clear(&png_b)
+            if icons.png_encode(rt.buf_ptr(&flat), launcher[i], launcher[i], &png_b) {
+                put_in(src, d + "/ic_launcher.png", rt.buf_ptr(&png_b), rt.buf_len(&png_b))
+            }
+            var rnd: rt.Buf = rt.buf_new()
+            compose(rt.buf_ptr(&px), launcher[i], bg, true, &rnd)
+            rt.buf_clear(&png_b)
+            if icons.png_encode(rt.buf_ptr(&rnd), launcher[i], launcher[i], &png_b) {
+                put_in(src, d + "/ic_launcher_round.png", rt.buf_ptr(&png_b), rt.buf_len(&png_b))
+            }
+            rt.buf_free(&flat)
+            rt.buf_free(&rnd)
+        } else {
+            (*src).failed = (*src).failed + 1
+        }
+        rt.buf_free(&px)
+        // the adaptive foreground layer
+        var big: rt.Buf = rt.buf_new()
+        if render(src, layer[i], &big) {
+            var fg: rt.Buf = rt.buf_new()
+            foreground(rt.buf_ptr(&big), layer[i], layer[i], &fg)
+            rt.buf_clear(&png_b)
+            if icons.png_encode(rt.buf_ptr(&fg), layer[i], layer[i], &png_b) {
+                put_in(src, d + "/ic_launcher_foreground.png", rt.buf_ptr(&png_b), rt.buf_len(&png_b))
+            }
+            rt.buf_free(&fg)
+        } else {
+            (*src).failed = (*src).failed + 1
+        }
+        rt.buf_free(&big)
+        rt.buf_free(&png_b)
+        i = i + 1
+    }
+    let xml: str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<adaptive-icon xmlns:android=\"http://schemas.android.com/apk/res/android\">\n    <background android:drawable=\"@color/ic_launcher_background\"/>\n    <foreground android:drawable=\"@mipmap/ic_launcher_foreground\"/>\n</adaptive-icon>\n"
+    put_in(src, outdir + "/android/res/mipmap-anydpi-v26/ic_launcher.xml", xml.p as u64, xml.n)
+    put_in(src, outdir + "/android/res/mipmap-anydpi-v26/ic_launcher_round.xml", xml.p as u64, xml.n)
+    var hex: rt.Buf = rt.buf_new()
+    var rgb: [u8; 3] = [((bg >> 16) & 255 as u32) as u8, ((bg >> 8) & 255 as u32) as u8, (bg & 255 as u32) as u8]
+    util.hex_encode((&rgb[0]) as u64, 3, &hex)
+    let color: str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n    <color name=\"ic_launcher_background\">#" +
+        util.buf_to_str_copy(&hex) + "</color>\n</resources>\n"
+    rt.buf_free(&hex)
+    put_in(src, outdir + "/android/res/values/ic_launcher_background.xml", color.p as u64, color.n)
+    var store: rt.Buf = rt.buf_new()
+    if png_of(src, 512, &store) {
+        put_in(src, outdir + "/android/playstore-512.png", rt.buf_ptr(&store), rt.buf_len(&store))
+    }
+    rt.buf_free(&store)
+}
+
+fn arg_str(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    if p == 0 as u64 {
+        return ""
+    }
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn usage() -> i32 {
+    io.eprint_line("usage: icons <input.svg|input.png> <outdir> [--name NAME] [--bg RRGGBB]")
+    return 2
+}
+
+fn main(start: u64) -> i32 {
+    let argc: usize = rt.arg_count(start)
+    if argc < 3 {
+        return usage()
+    }
+    let input: str = arg_str(start, 1)
+    let outdir: str = arg_str(start, 2)
+    var name: str = "icon"
+    var bg: u32 = 16777215 as u32
+    var a: usize = 3
+    while a < argc {
+        let o: str = arg_str(start, a)
+        if o == "--name" && a + 1 < argc {
+            name = arg_str(start, a + 1)
+            a = a + 2
+        } else if o == "--bg" && a + 1 < argc {
+            bg = parse_bg(arg_str(start, a + 1))
+            a = a + 2
+        } else {
+            return usage()
+        }
+    }
+    var inb: rt.Buf = rt.buf_new()
+    let rn: usize = fs.read_file(input, &inb) catch 0
+    if rn == 0 {
+        io.eprint_line("cannot read " + input)
+        return 1
+    }
+    var src: Source = Source { is_svg: false, svg: rt.buf_new(), rgba: rt.buf_new(), side: 0,
+        wrote: 0, failed: 0 }
+    if is_png(rt.buf_ptr(&inb), rn) {
+        var im: png.Image = png.image_new()
+        if !png.decode_png(rt.buf_ptr(&inb), rn, &im) {
+            io.eprint_line("not a readable PNG: " + input)
+            return 1
+        }
+        let w: usize = png.image_width(&im)
+        let h: usize = png.image_height(&im)
+        var flat: rt.Buf = rt.buf_new()
+        var y: usize = 0
+        while y < h {
+            var x: usize = 0
+            while x < w {
+                let v: u32 = png.image_pixel(&im, x, y)
+                rt.buf_push(&flat, ((v >> 16) & 255 as u32) as u8)
+                rt.buf_push(&flat, ((v >> 8) & 255 as u32) as u8)
+                rt.buf_push(&flat, (v & 255 as u32) as u8)
+                rt.buf_push(&flat, ((v >> 24) & 255 as u32) as u8)
+                x = x + 1
+            }
+            y = y + 1
+        }
+        png.image_free(&im)
+        src.side = icons.fit_square(rt.buf_ptr(&flat), w, h, &src.rgba)
+        rt.buf_free(&flat)
+        if src.side < 512 {
+            io.eprint_line("note: the PNG is " + dec(src.side) + " px; the big sizes are enlarged (use 1024 px or an SVG)")
+        }
+    } else if image.ist_svg(rt.buf_ptr(&inb), rn) {
+        src.is_svg = true
+        rt.buf_push_bytes(&src.svg, rt.buf_ptr(&inb), rn)
+    } else {
+        io.eprint_line("neither PNG nor SVG: " + input)
+        return 1
+    }
+
+    // png/ and hicolor/
+    var set: icons.IconSet = icons.iconset_new()
+    var i: usize = 0
+    while i < list_n(SIZES_PNG) {
+        let s: usize = list_at(SIZES_PNG, i) as usize
+        var pb: rt.Buf = rt.buf_new()
+        if png_of(&src, s, &pb) {
+            put_in(&src, outdir + "/png/" + name + "-" + dec(s) + ".png", rt.buf_ptr(&pb), rt.buf_len(&pb))
+            let hc: u32 = list_at(SIZES_PNG, i)
+            if list_has(SIZES_HICOLOR, hc) {
+                put_in(&src, outdir + "/hicolor/" + dec(s) + "x" + dec(s) + "/apps/" + name + ".png",
+                    rt.buf_ptr(&pb), rt.buf_len(&pb))
+            }
+            icons.iconset_add(&set, hc, rt.buf_ptr(&pb), rt.buf_len(&pb))
+        } else {
+            io.eprint_line("could not draw size " + dec(s))
+            src.failed = src.failed + 1
+        }
+        rt.buf_free(&pb)
+        i = i + 1
+    }
+    // .ico: the sizes <= 256 that the set has; .icns: the sizes the table wants
+    var ico_set: icons.IconSet = icons.iconset_new()
+    var icns_set: icons.IconSet = icons.iconset_new()
+    var j: usize = 0
+    while j < icons.iconset_count(&set) {
+        let sz: u32 = icons.iconset_size(&set, j)
+        // re-add into the narrower sets by size
+        let in_ico: bool = list_has(SIZES_ICO, sz)
+        let in_icns: bool = list_has(SIZES_ICNS, sz)
+        var pb2: rt.Buf = rt.buf_new()
+        if in_ico || in_icns {
+            if png_of(&src, sz as usize, &pb2) {
+                if in_ico { icons.iconset_add(&ico_set, sz, rt.buf_ptr(&pb2), rt.buf_len(&pb2)) }
+                if in_icns { icons.iconset_add(&icns_set, sz, rt.buf_ptr(&pb2), rt.buf_len(&pb2)) }
+            }
+        }
+        rt.buf_free(&pb2)
+        j = j + 1
+    }
+    var ico: rt.Buf = rt.buf_new()
+    if icons.ico_build(&ico_set, &ico) {
+        put_in(&src, outdir + "/" + name + ".ico", rt.buf_ptr(&ico), rt.buf_len(&ico))
+    } else {
+        src.failed = src.failed + 1
+    }
+    var icns: rt.Buf = rt.buf_new()
+    if icons.icns_build(&icns_set, &icns) {
+        put_in(&src, outdir + "/" + name + ".icns", rt.buf_ptr(&icns), rt.buf_len(&icns))
+    } else {
+        src.failed = src.failed + 1
+    }
+    if src.is_svg {
+        put_in(&src, outdir + "/hicolor/scalable/apps/" + name + ".svg", rt.buf_ptr(&src.svg), rt.buf_len(&src.svg))
+    }
+    android_sizes(&src, outdir, bg)
+    io.print_line("icons: " + dec(src.wrote) + " files, " + dec(src.failed) + " failed")
+    if src.failed > 0 {
+        return 1
+    }
+    return 0
+}

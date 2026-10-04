@@ -158,8 +158,10 @@ measured**).
 * **Windows limits:** the seam's `poll` is `select`: at most 64 sockets per
   round, and the seam's descriptor table holds 256. The loop says so
   (`loop.socket_limit`) and the tests scale themselves down there.
-* **TLS 1.3 only**, as the rest of the library: `ws.postman-echo.com` offers
-  TLS 1.2 and cannot be reached (also not by `openssl s_client -tls1_3`).
+* **TLS 1.3 and (since round TLS12) TLS 1.2**: the 1.2 handshake is a state
+  machine of the same kind (`docs/TLS12.md`; checked with octets dribbled in
+  pieces of 1-7 by `tools/tls/tls12_check.py` part G). Hosts that offer only 1.2
+  such as `ws.postman-echo.com` complete the handshake now (an https GET gets its 404 over TLS 1.2; the WebSocket upgrade there was not re-run).
   The TLS handshake computes on the loop thread (a few ms each).
 * **Name lookup blocks** (`net.dns`, UDP with a timeout; cached by TTL).
   Numeric addresses and `localhost` never block. `bridge_call` can move a

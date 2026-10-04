@@ -33,6 +33,9 @@
 #      `call`, a call through a function value is exactly one `call rax`,
 #      a closure without captures allocates nothing -- in both compilers
 #      and with counter-checks (tools/fnval/run.sh).
+#  81. Compression (tools/compress/run.sh): lib/compress against libzstd, liblzma, libbrotli, libbz2,
+#      liblz4 and zlib in both directions, hostile inputs, dictionaries, net.http Content-Encoding,
+#      the AArch64 build under qemu and the Windows build under Wine (docs/COMPRESSION.md).
 #   9. HTML5 tokenizer (lib/html/, in Firn) against the official
 #      html5lib test suite: the exact quota out of 6,810 cases, the limit in
 #      tools/tokenizer/minquota.txt (tools/tokenizer/run.sh).
@@ -1621,6 +1624,120 @@ if [ "$ASRC" -eq 0 ]; then
 else
     bad "tools/async/run.sh failed (see .test-work/async.log)"
     grep -E 'FAIL' "$WORK/async.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 78. packaging: installers, packages, icons (tools/pack/, lib/pack/, docs/PACKAGING.md) =="
+# lib/pack's unit tests are in tests/2200-2203 (section 3): the shortcut writer, the icon formats, the
+# installer payload, a whole install / upgrade / uninstall without Windows. Here: tools/pack/test/run.sh
+# builds the Firn parts (icons tool, installer stub, self-extract stub) and runs checks.py -- every writer
+# (.deb, .rpm, tar.gz, SquashFS/AppImage, self-extracting .run, .opk, .app/.dmg, zip, NSIS script, PE icon
+# resource, manifest + Ed25519 signatures) against an independent reader: dpkg-deb, `dpkg -i` and `rpm -i` in
+# a container, unsquashfs, the AppImage runtime, OrientOS's opk.py byte for byte, the store's opkleser, makensis,
+# xorriso, a store tool in a throw-away repository. PACK_WINE=1 adds windows.sh: the Windows installer under
+# Wine (silent and window install, shortcuts read by an independent parser and started by Wine's shell,
+# the registry entry, upgrade, uninstall and its leftovers, cancel, NSIS, the portable zip; PACK_WINE_APP=1 also
+# the appkit template's window on the Win32 back end). Readers that are not installed SKIP.
+bash tools/pack/test/run.sh > "$WORK/pack.log" 2>&1 && PKRC=0 || PKRC=$?
+if [ "${PACK_WINE:-0}" = "1" ]; then
+    PACK_WINE=1 PACK_WINE_APP=${PACK_WINE_APP:-1} bash tools/pack/test/run.sh > "$WORK/pack_wine.log" 2>&1 || PKRC=1
+fi
+if [ "$PKRC" -eq 0 ]; then
+    ok
+    grep -E '^(pack checks:|windows.sh:|SKIP)' "$WORK"/pack*.log | sed 's/^/   /'
+else
+    bad "tools/pack/test failed (see .test-work/pack*.log)"
+    grep -E 'FAIL' "$WORK"/pack*.log | head -12 | sed 's/^/   /'
+fi
+
+echo "== 79. UI extras: QR codes against qrcodegen / python-qrcode / ZXing-C++, and the human texts against ICU (tools/qr/, tools/uiextras/) =="
+# The fUi parts of the same wave (rich text, selection and copy, highlighting, animated pictures,
+# the kit in the accessibility tree, touch, right to left, the QR widget) are section 18q of
+# tools/fui/run.sh; their library tests are tests/2240-2242 (section 3). Here the two that are
+# held against other implementations: lib/qr (the encoder's modules identical with Nayuki's
+# reference encoder for every version, level and mask; every code read back by ZXing-C++; the
+# decoder on pictures that get worse -- rotated, warped, blurred, damaged, cluttered -- with
+# ZXing-C++ as the yardstick) and lib/i18n/human.fi (relative times, byte sizes, date styles,
+# percent, lists, zones against ICU 72). SKIP (exit 0) without the Python packages.
+UXRC=0
+sh tools/qr/run.sh > "$WORK/qr_run.log" 2>&1 || UXRC=1
+sh tools/uiextras/run.sh > "$WORK/uiextras_run.log" 2>&1 || UXRC=1
+if [ "$UXRC" -eq 0 ]; then
+    ok
+    grep -E '^(cases|human:|total|QR PASSED|UIEXTRAS PASSED|  SKIP)' "$WORK/qr_run.log" "$WORK/uiextras_run.log" | sed 's/^/   /'
+else
+    bad "tools/qr or tools/uiextras failed (see .test-work/qr_run.log, uiextras_run.log)"
+    grep -E 'FAIL|DIFF|Traceback|Error' "$WORK/qr_run.log" "$WORK/uiextras_run.log" | head -12 | sed 's/^/   /'
+fi
+
+echo "== 80. downloads and sign-in: net.download, auth.jose/oauth/msa, appkit.fleitec_login (tools/download/, tools/oauth/) =="
+# tests/2140 (download manager against an in-process server), tests/2150-2153 (JWT against tokens signed
+# by Python's cryptography, OAuth units, the Microsoft chain's bodies, Sign in with Fleitec-ID against
+# an in-process ID server) are in section 3. Here: the Python-side servers that misbehave on purpose.
+#   tools/download/run.sh  net.download against fake_server.py (resume, retry, backoff, mirrors, ETag, cancel,
+#                          rate limit, keep-alive; the real Mojang CDN when there is a route); Wine
+#   tools/oauth/run.sh     auth.oauth against fake_idp.py (PKCE, loopback redirect under attack, device flow,
+#                          refresh rotation, id_token refusals, keyring) and auth.msa against fake_msa.py
+#                          (+ the real hosts with bogus credentials when there is a route); Wine
+bash tools/download/run.sh > "$WORK/download.log" 2>&1 && DLRC=0 || DLRC=$?
+bash tools/oauth/run.sh > "$WORK/oauth.log" 2>&1 && OARC=0 || OARC=$?
+grep -E 'passed|SKIP|windows' "$WORK/download.log" "$WORK/oauth.log" | sed 's/^[^:]*://; s/^/   /'
+if [ "$DLRC" -eq 0 ] && [ "$OARC" -eq 0 ]; then
+    ok
+else
+    bad "tools/download/run.sh or tools/oauth/run.sh failed (see .test-work/download.log, oauth.log)"
+    grep -E 'FAIL|Traceback' "$WORK/download.log" "$WORK/oauth.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 81. compression: zstd, xz/LZMA2, Brotli, bzip2, LZ4, gzip against libzstd, liblzma, libbrotli, libbz2, liblz4, zlib (tools/compress/run.sh) =="
+# lib/compress has its own positive tests (tests/2180..2189, in every build level above). This section holds it against
+# the reference implementations in BOTH directions -- a corpus compressed by them and decoded here (whole buffer and
+# streaming from a descriptor), what the encoders here write read back by them, zstd dictionaries trained by
+# `zstd --train`, every cut and 180 damaged copies per format, a 64 MiB bomb under limits -- in dev-fast, release-fast
+# and release-safe, then net.http's Content-Encoding br/zstd against python's http.server, then the AArch64 build under
+# qemu and the Windows build under Wine (docs/COMPRESSION.md).
+bash tools/compress/run.sh > "$WORK/compress.log" 2>&1 && CMPRC=0 || CMPRC=$?
+if [ "$CMPRC" -eq 0 ]; then
+    ok
+    grep -E '^(checks:|http checks:|   SKIP)' "$WORK/compress.log" | sed 's/^/   /'
+else
+    bad "tools/compress/run.sh failed (see .test-work/compress.log)"
+    grep -E 'FAIL|Traceback|Error' "$WORK/compress.log" | head -12 | sed 's/^/   /'
+fi
+
+echo "== 82. the embedded database against SQLite (tools/db/run.sh, lib/db, docs/DB.md) =="
+# tests/2160-2165 and examples/db_*.fi are in section 3. Here lib/db is held against Python's sqlite3, a real
+# SQLite: the parser, 25,000 constant expressions, trees edited by lib/db and read by SQLite, 106 SELECTs, DML/DDL and
+# 1,500 random statements, a process killed at every commit event, SQLite and lib/db processes on one file, 1,500
+# damaged files; then the same programs on x86_64-windows under Wine. tools/db/winkit.sh packs it for a real Windows PC.
+bash tools/db/run.sh > "$WORK/db.log" 2>&1 && DBRC=0 || DBRC=$?
+grep -E 'differences|ALL OK|damaged files|SKIP|crash points|kills' "$WORK/db.log" | sed 's/^/   /' | head -20
+if [ "$DBRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/db/run.sh failed (see .test-work/db.log)"
+    grep -E 'FAIL|FAILED|Traceback' "$WORK/db.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 83. the desktop libraries against programs nobody here wrote (tools/desktop/run.sh, round DESKTOP) =="
+# net.dbus (every D-Bus type both ways against libdbus), desktop.tray (a StatusNotifierWatcher and a dbusmenu
+# client in libdbus), desktop.notify (a notification server in libdbus), desktop.autostart (the Desktop Entry
+# spec's reading and GLib), audio (a real pulseaudio read back with parec/pactl, ffmpeg for the decoder),
+# files dropped on a window (XDND from GTK 3 and from python-xlib), the clipboard against GTK 3's, the
+# command line channel of appkit.single_instance (tests/2221) -- and the Windows builds under Wine (tray with
+# the icon read off the screen, balloons, the Run key read by MSVCRT, waveOut into ALSA's file plugin,
+# the Windows clipboard against GTK, WM_DROPFILES, ReadDirectoryChangesW, named pipes). Parts whose tools
+# are missing SKIP (exit 0 for them). Linux only: DESKTOP_WINDOWS=0 skips the Wine half.
+if [ "${DESKTOP_WINDOWS:-1}" = "1" ]; then
+    bash tools/desktop/run.sh > "$WORK/desktop.log" 2>&1 && DKRC=0 || DKRC=$?
+else
+    bash tools/desktop/run.sh linux > "$WORK/desktop.log" 2>&1 && DKRC=0 || DKRC=$?
+fi
+if [ "$DKRC" -eq 0 ]; then
+    ok
+    grep -E '^(  SKIP|desktop:)' "$WORK/desktop.log" | sed 's/^/   /'
+else
+    bad "tools/desktop/run.sh failed (see .test-work/desktop.log)"
+    grep -E 'FAIL' "$WORK/desktop.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

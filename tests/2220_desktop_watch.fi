@@ -1,0 +1,199 @@
+// expect_exit: 0
+// tests/2220_desktop_watch.fi -- desktop.watch (inotify; ReadDirectoryChangesW under Wine): creates,
+// writes, renames and removals in a watched tree, recursion into new folders, quiet, a missing
+// path, the root going away.
+import std.rt
+import std.str
+import std.fs
+import std.env
+import std.shell
+import std.time
+import desktop.watch
+
+fn sep(out: *mut rt.Buf) {
+    rt.buf_push(out, env.DIR_SEP)
+}
+
+// <root><sep><name> as an owned buffer
+fn under(root: str, name: str) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, root.p as u64, root.length())
+    sep(&b)
+    rt.buf_push_bytes(&b, name.p as u64, name.length())
+    return b
+}
+
+fn view(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+// "<kind>:<D|F>:<path>" as a buffer
+fn want(kind: str, dir: bool, path: str) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, kind.p as u64, kind.length())
+    rt.buf_push(&b, 58 as u8)
+    if dir {
+        rt.buf_push(&b, 68 as u8)
+    } else {
+        rt.buf_push(&b, 70 as u8)
+    }
+    rt.buf_push(&b, 58 as u8)
+    rt.buf_push_bytes(&b, path.p as u64, path.length())
+    return b
+}
+
+// Collects events until 400 ms of quiet; each as "<kind>:<D|F>:<path>\n".
+fn drain(w: *mut watch.Watcher, out: *mut rt.Buf) {
+    var ev: watch.WatchEvent = watch.watch_event_zero()
+    while watch.watch_poll(w, 400, &ev) {
+        rt.buf_push_dec_u64(out, ev.kind as u64)
+        rt.buf_push(out, 58 as u8)
+        if ev.is_dir {
+            rt.buf_push(out, 68 as u8)
+        } else {
+            rt.buf_push(out, 70 as u8)
+        }
+        rt.buf_push(out, 58 as u8)
+        let p: str = watch.watch_event_path(w)
+        rt.buf_push_bytes(out, p.p as u64, p.length())
+        rt.buf_push(out, 10 as u8)
+    }
+}
+
+fn has(b: *mut rt.Buf, s: *mut rt.Buf) -> bool {
+    let all: str = view(b)
+    return all.find(view(s)) != str.npos()
+}
+
+fn touch(path: str, text: str) -> bool {
+    let r: usize = fs.write_file(path, text.p as u64, text.length()) catch 99999
+    return r == text.length()
+}
+
+fn main(start: u64) -> i32 {
+    var rootb: rt.Buf = under(shell.temp_dir(), "firn-2220-")
+    rt.buf_push_dec_u64(&rootb, time.monotonic_ns() / 1000 as u64)
+    let root: str = view(&rootb)
+    fs.remove_tree(root) catch false
+    fs.mkdir_all(root) catch false
+
+    var w: watch.Watcher = watch.watch_new()
+    var missing: rt.Buf = under(root, "does-not-exist")
+    if watch.watch_add(&w, view(&missing), true) { return 2 }
+    if !watch.watch_add(&w, root, true) { return 3 }
+
+    var ev: watch.WatchEvent = watch.watch_event_zero()
+    if watch.watch_poll(&w, 50, &ev) { return 4 } // quiet
+
+    var a: rt.Buf = under(root, "a.txt")
+    let pa: str = view(&a)
+    if !touch(pa, "hello") { return 5 }
+    var log: rt.Buf = rt.buf_new()
+    drain(&w, &log)
+    var want1: rt.Buf = want("1", false, pa)
+    if !has(&log, &want1) { return 6 }
+    var want2: rt.Buf = want("2", false, pa)
+    if !has(&log, &want2) { return 7 }
+
+    // a folder, then a file in it: recursion
+    var sub: rt.Buf = under(root, "sub")
+    let ps: str = view(&sub)
+    fs.mkdir(ps) catch false
+    rt.buf_clear(&log)
+    drain(&w, &log)
+    var wd: rt.Buf = want("1", true, ps)
+    if !has(&log, &wd) { return 8 }
+    var b: rt.Buf = under(ps, "b.txt")
+    let pb: str = view(&b)
+    if !touch(pb, "x") { return 9 }
+    rt.buf_clear(&log)
+    drain(&w, &log)
+    var wb: rt.Buf = want("1", false, pb)
+    if !has(&log, &wb) { return 10 }
+
+    // a rename: two events with one cookie
+    var c: rt.Buf = under(root, "c.txt")
+    let pc: str = view(&c)
+    fs.rename(pa, pc) catch false
+    var ck_from: u32 = 0
+    var ck_to: u32 = 0
+    var got_from: bool = false
+    var got_to: bool = false
+    while watch.watch_poll(&w, 400, &ev) {
+        if ev.kind == watch.EV_RENAMED_FROM && watch.watch_event_path(&w) == pa {
+            got_from = true
+            ck_from = ev.cookie
+        }
+        if ev.kind == watch.EV_RENAMED_TO && watch.watch_event_path(&w) == pc {
+            got_to = true
+            ck_to = ev.cookie
+        }
+    }
+    if !got_from || !got_to { return 11 }
+    if ck_from != ck_to || ck_from == 0 as u32 { return 12 }
+
+    // a removal
+    fs.remove(pc) catch false
+    rt.buf_clear(&log)
+    drain(&w, &log)
+    var wr: rt.Buf = want("3", false, pc)
+    if !has(&log, &wr) { return 13 }
+
+    // a folder with content that appears by one move (the file inside must not be missed on Linux;
+    // Windows reports the folder itself, and the file inside through the subtree watch when it changes)
+    var stageb: rt.Buf = under(shell.temp_dir(), "firn-2220-stage-")
+    rt.buf_push_dec_u64(&stageb, time.monotonic_ns() / 1000 as u64)
+    let pst: str = view(&stageb)
+    fs.remove_tree(pst) catch false
+    fs.mkdir_all(pst) catch false
+    var inner: rt.Buf = under(pst, "inner.txt")
+    touch(view(&inner), "in")
+    var dest: rt.Buf = under(root, "moved")
+    let pd: str = view(&dest)
+    fs.rename(pst, pd) catch false
+    rt.buf_clear(&log)
+    drain(&w, &log)
+    var wmv: rt.Buf = want("5", true, pd)
+    if !has(&log, &wmv) {
+        var wmv2: rt.Buf = want("1", true, pd)
+        if !has(&log, &wmv2) { return 14 }
+    }
+    if env.DIR_SEP == 47 as u8 {
+        // inotify: the scan of the new folder reports the file that came with it
+        var wi: rt.Buf = want("1", false, view(&inner))
+        var innerm: rt.Buf = under(pd, "inner.txt")
+        var wi2: rt.Buf = want("1", false, view(&innerm))
+        if !has(&log, &wi2) { return 17 }
+    }
+    // a later change inside it is seen
+    var inner2: rt.Buf = under(pd, "inner.txt")
+    touch(view(&inner2), "changed")
+    rt.buf_clear(&log)
+    drain(&w, &log)
+    var wm: rt.Buf = want("2", false, view(&inner2))
+    // (Wine's implementation of the subtree watch does not follow a folder that was MOVED into the
+    // tree, only folders created in it; real Windows does. The check is for the Linux build and
+    // for Windows machines, so it runs wherever the folder separator is not Wine's... see docs.)
+    if !has(&log, &wm) && env.DIR_SEP == 47 as u8 { return 15 }
+
+    // the root goes away
+    fs.remove_tree(root) catch false
+    var gone: bool = false
+    while watch.watch_poll(&w, 500, &ev) {
+        if ev.kind == watch.EV_ROOT_GONE {
+            gone = true
+        }
+    }
+    if !gone {
+        // Windows: removing the folder is reported as the deletion of its last entries and the
+        // root's read ends with an error on the NEXT look; give it one more poll
+        if watch.watch_poll(&w, 1000, &ev) && ev.kind == watch.EV_ROOT_GONE {
+            gone = true
+        }
+    }
+    // Wine does not report a deleted watched folder (the folder stays "delete pending" while the
+    // watch holds it open); the Windows code handles the error return the documentation names.
+    if !gone && env.DIR_SEP == 47 as u8 { return 16 }
+    watch.watch_close(&w)
+    return 0
+}

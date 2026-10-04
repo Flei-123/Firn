@@ -16,6 +16,9 @@ of the rest of this repository.
 | `lib/markdown/entities.txt` | the HTML5 named character references that end in `;` (2,125), written out of Python's `html.entities.html5` | the WHATWG list is facts about names; no copyright text |
 | `lib/ton/mp3_tab.fi` (generated), structure of `lib/ton/mp3.fi` | **minimp3** by lieff, https://github.com/lieff/minimp3 | **CC0-1.0** (public domain dedication) |
 | `lib/webp/webp.fi` (the tables in it, structure of the VP8 part) | **RFC 6386** (VP8 Data Format and Decoding Guide, the reference decoder source in section 20) and the algorithms of **libwebp** (Google) | RFC 6386: the IETF Trust's licence for code in RFCs (BSD-style, attribution); libwebp: BSD-3-Clause |
+| `lib/compress/brotli_data.bin` (the dictionary, the context lookup tables and the word transforms inside it) | the **Brotli** reference implementation (Google, https://github.com/google/brotli): the static dictionary of RFC 7932 appendix A (122,784 octets, SHA-256 `20e42eb1b511c21806d4d227d07e5dd06877d8ce7b3a817f378f313653f35c70`), `kContextLookup` and the transform tables, lifted from an installed `libbrotlicommon` by `tools/compress/gen_brotli_data.py`, which checks the digest and the structure | **MIT** (Copyright 2013 Google Inc.) -- full text in `LICENSES/Brotli-MIT.txt` |
+| `lib/compress/bz2.fi` (the 512 entry `RNUMS` table of the obsolete "randomised" blocks) | **bzip2/libbz2** by Julian Seward (`randtable.c`) | the bzip2 licence (BSD-style, attribution) -- full text in `LICENSES/bzip2.txt` |
+| `tests/data/compress/*` | made by Python's lz4/lzma/bz2/brotli/zlib/gzip modules and the zstd and xz commands from `plain.bin` (an excerpt of `SPEC.md`, `lib/std/deflate.fi` and generated numbers), see `tools/compress/gen_fixtures.py` | the inputs are ours; the compressed forms are data, not code |
 | `tests/data/webp/logo-blue.webp`, `logo-green.webp` | FleiLauncher's own logos (Justin) | no rights of third parties |
 | `testdata/ton/*.mp3` | encoded here with ffmpeg from synthetic signals (sine, noise, impulses) | no rights of third parties |
 
@@ -40,3 +43,12 @@ libwebp, dwebp and Chromium show; `tools/libmvp/check_webp.py` holds it
 against libwebp octet for octet. The Firn code is MPL-2.0 (see
 `LICENSING.md`, 4 October 2026); the notices of the two sources travel with
 this page. VP8L (RFC 9649) was written from the specification.
+
+`lib/compress/` follows the specifications (RFC 8878 zstd, RFC 7932 Brotli, the
+xz file format and LZMA SDK documentation, the bzip2 format, the LZ4 block and
+frame format descriptions, RFC 1950-1952) and was written here; the only data
+taken over is the Brotli dictionary and tables above and bzip2's `randtable`.
+The algorithms of xxHash (BSD-2-Clause, Yann Collet) are re-written in
+`lib/compress/common.fi`. The xz BCJ filters follow the published behaviour of
+liblzma's simple filters (public domain, Lasse Collin). `docs/COMPRESSION.md`
+says what each part was held against.

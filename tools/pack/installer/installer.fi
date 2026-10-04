@@ -1,0 +1,267 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/pack/installer/installer.fi -- the Windows installer / uninstaller.
+//
+// ONE program for both jobs. `pack.py win-installer` appends a payload (a
+// zip) and a trailer to the compiled program; started like that it
+// installs. The same program without payload, saved as `uninstall.exe`,
+// uninstalls.
+//
+//   setup.exe                     the window (see ui.fi)
+//   setup.exe /S                  silent: install with the defaults
+//   setup.exe /S /D=C:\Apps\Foo   ... into this folder (NSIS style; /D= last)
+//   setup.exe --dir DIR           the same, long form
+//       --no-desktop --no-startmenu --no-launch --no-registry
+//       --log FILE                where to write the log (default %TEMP%\firn-setup.log)
+//   setup.exe --extract DIR       only unpack the payload (no shortcuts, no registry)
+//   setup.exe --info              print id/name/version of the payload and exit
+//   uninstall.exe /uninstall [/S] remove the program (a copy of this file in %TEMP% does the work)
+//
+// Exit code: 0 done, 1 usage, 2 no payload / damaged, 3 install failed,
+// 4 uninstall failed.
+//
+// Build: firnc --target=x86_64-windows --win-subsystem=windows -o setup-stub.exe installer.fi
+// (tools/pack/pack.sh builds it). The same source builds for Linux to run
+// the logic without Windows (tools/pack/test/installer_linux.sh): the
+// registry and shortcuts are then skipped.
+import std.rt
+import std.fs
+import std.io
+import std.osinfo
+import appkit.util
+import appkit.platform
+import pack.install
+import pack.payload
+import ui
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    if p == 0 as u64 {
+        return ""
+    }
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn lower_eq(a: str, b: str) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    var i: usize = 0
+    while i < a.n {
+        var x: u8 = rt.ld8(a.p as u64, i)
+        var y: u8 = rt.ld8(b.p as u64, i)
+        if x >= 65 as u8 && x <= 90 as u8 { x = x + 32 as u8 }
+        if y >= 65 as u8 && y <= 90 as u8 { y = y + 32 as u8 }
+        if x != y { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn env(name: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var r: str = ""
+    if platform.plat_env_get(name, &b) && rt.buf_len(&b) > 0 {
+        r = util.buf_to_str_copy(&b)
+    }
+    rt.buf_free(&b)
+    return r
+}
+
+fn default_log() -> str {
+    var t: str = env("TEMP")
+    if t.n == 0 { t = env("TMPDIR") }
+    if t.n == 0 { t = "/tmp" }
+    return install.fpath(t) + "/firn-setup.log"
+}
+
+// name and version of the install for the confirmation page, from its list
+#[allow_escape]
+fn uninstall_window(lg: *mut install.Logger, self_path: str, target: str) -> i32 {
+    var text: rt.Buf = rt.buf_new()
+    let got: usize = fs.read_file(target + "/.pack/install.txt", &text) catch 0
+    var name: str = "this program"
+    var version: str = ""
+    if got > 0 {
+        let n2: str = install.manifest_field(&text, "name")
+        let v2: str = install.manifest_field(&text, "version")
+        if n2.n > 0 { name = n2 }
+        version = v2
+    }
+    rt.buf_free(&text)
+    var unused: bool = false
+    var dummy: install.Installer = install.inst_new(lg)
+    return ui.run(ui.MODE_UNINSTALL, &dummy, lg, self_path, target, name, version, "", "", false, &unused)
+}
+
+// the window with only an error text (no payload: nothing to install)
+#[allow_escape]
+fn fail_window(lg: *mut install.Logger, msg: str, self_path: str) -> i32 {
+    var unused: bool = false
+    var dummy: install.Installer = install.inst_new(lg)
+    ui.run(ui.MODE_ERROR, &dummy, lg, self_path, "", "Setup", "", "", msg, false, &unused)
+    return 2
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    platform.plat_init(start)
+    let argc: usize = rt.arg_count(start)
+    var silent: bool = false
+    var dir: str = ""
+    var logpath: str = ""
+    var desktop: bool = true
+    var startmenu: bool = true
+    var launch: bool = true
+    var registry: bool = true
+    var uninst: bool = false
+    var stage2: bool = false
+    var info_only: bool = false
+    var extract_dir: str = ""
+    var a: usize = 1
+    while a < argc {
+        let o: str = arg(start, a)
+        if lower_eq(o, "/s") || o == "--silent" {
+            silent = true
+        } else if o == "--dir" && a + 1 < argc {
+            dir = arg(start, a + 1)
+            a = a + 1
+        } else if util.starts_with(o, "/D=") {
+            dir = str { p: (o.p as u64 + 3 as u64) as *mut u8, n: o.n - 3 }
+        } else if o == "--log" && a + 1 < argc {
+            logpath = arg(start, a + 1)
+            a = a + 1
+        } else if o == "--no-desktop" || lower_eq(o, "/nodesktop") {
+            desktop = false
+        } else if o == "--no-startmenu" {
+            startmenu = false
+        } else if o == "--no-launch" {
+            launch = false
+        } else if o == "--no-registry" {
+            registry = false
+        } else if lower_eq(o, "/uninstall") || o == "--uninstall" {
+            uninst = true
+        } else if lower_eq(o, "/uninstall-stage2") && a + 1 < argc {
+            stage2 = true
+            uninst = true
+            dir = arg(start, a + 1)
+            a = a + 1
+        } else if o == "--extract" && a + 1 < argc {
+            extract_dir = arg(start, a + 1)
+            a = a + 1
+        } else if o == "--info" {
+            info_only = true
+        } else {
+            io.eprint_line("unknown option " + o)
+            return 1
+        }
+        a = a + 1
+    }
+    if logpath.n == 0 {
+        logpath = default_log()
+    }
+    var lg: install.Logger = install.logger_new(logpath)
+
+    // where am I
+    var me: rt.Buf = rt.buf_new()
+    if !platform.plat_exe_path(&me) {
+        install.logline(&lg, "ERROR cannot find my own file")
+        return 2
+    }
+    let self_path: str = util.buf_to_str_copy(&me)
+    rt.buf_free(&me)
+
+    if uninst {
+        var target: str = install.fpath(dir)
+        if target.n == 0 {
+            // uninstall.exe sits in the install directory
+            let cut: usize = util.rfind_byte(self_path, 47 as u8)
+            target = str { p: self_path.p, n: cut }
+        }
+        if !silent && !stage2 {
+            return uninstall_window(&lg, self_path, target)
+        }
+        let rc: u32 = install.uninstall_run(self_path, target, stage2, silent, &lg)
+        if rc != 0 as u32 {
+            return 4
+        }
+        return 0
+    }
+
+    var exe: rt.Buf = rt.buf_new()
+    let exe_n: usize = fs.read_file(self_path, &exe) catch 0
+    if exe_n == 0 {
+        install.logline(&lg, "ERROR cannot read " + self_path)
+        return 2
+    }
+    var inst: install.Installer = install.inst_new(&lg)
+
+    if info_only {
+        var pl: payload.Payload = payload.Payload { off: 0, len: 0 }
+        var inf: payload.Info = payload.Info { id: "", name: "", version: "", vendor: "", exe: "",
+            icon: "", url: "", desktop: true, launch: true }
+        if !payload.payload_find(rt.buf_ptr(&exe), exe_n, &pl) ||
+            !payload.info_from_payload(rt.buf_ptr(&exe) + pl.off as u64, pl.len, &inf) {
+            io.eprint_line("no payload")
+            return 2
+        }
+        io.print_line("id=" + inf.id)
+        io.print_line("name=" + inf.name)
+        io.print_line("version=" + inf.version)
+        io.print_line("exe=" + inf.exe)
+        return 0
+    }
+
+    var extract_only: bool = false
+    var target_dir: str = dir
+    if extract_dir.n > 0 {
+        target_dir = extract_dir
+        desktop = false
+        startmenu = false
+        registry = false
+        launch = false
+        extract_only = true
+        silent = true
+    }
+    if !install.inst_open(&inst, rt.buf_ptr(&exe), exe_n, desktop, startmenu) {
+        io.eprint_line(install.inst_error(&inst))
+        if !silent {
+            return fail_window(&lg, install.inst_error(&inst), self_path)
+        }
+        return 2
+    }
+    inst.registry = registry
+    if !silent {
+        // the window: it asks for the folder and the two shortcuts, then drives inst_step itself
+        var def: str = target_dir
+        if def.n == 0 {
+            def = inst.dir
+        }
+        var launch_it: bool = false
+        let rc: i32 = ui.run(ui.MODE_INSTALL, &inst, &lg, self_path, "", inst.info.name, inst.info.version,
+            inst.info.vendor, def, launch && inst.info.launch, &launch_it)
+        if rc == 0 && launch_it {
+            install.inst_launch(&inst)
+        }
+        install.inst_free(&inst)
+        return rc
+    }
+    if !install.inst_begin(&inst, target_dir) {
+        io.eprint_line(install.inst_error(&inst))
+        return 3
+    }
+    while true {
+        let ph: u32 = install.inst_step(&inst)
+        if ph == install.PH_FAILED {
+            io.eprint_line(install.inst_error(&inst))
+            return 3
+        }
+        if ph == install.PH_DONE {
+            break
+        }
+    }
+    if launch && !extract_only {
+        // a silent install does not start the program unless --launch was meant: it does not
+    }
+    install.inst_free(&inst)
+    return 0
+}

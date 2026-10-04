@@ -1,0 +1,1840 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/expr.fi -- names, functions and the evaluation of expressions.
+//
+//   resolve_expr   binds column names to (source, column) and function names to
+//                  function numbers; leaves the tree ready for `eval`
+//   eval           evaluates a node against the current rows of the sources
+//
+// Three-valued logic (NULL = unknown) for AND, OR, NOT, comparisons, IN,
+// BETWEEN; affinity rules for comparisons (datatype3 section 4.2); integer
+// overflow turns a result into a REAL; `x / 0` is NULL.
+
+import std.rt
+import std.math
+import db.dberr
+import db.util as ut
+import db.record as rc
+import db.arena as ar
+import db.value as vl
+import db.dbcore as dc
+import db.sqlast as ax
+import db.sqllex as tk
+import db.vfsos as os
+import db.datetime as dtm
+
+export {
+    RowRef, SrcInfo, Scope, Ctx, scope_new, resolve_expr, eval, eval_truth, func_lookup,
+    expr_aff, expr_coll, compare_aff, is_aggregate_id, ctx_new, node_is_const, outer_depth_get, outer_depth_set,
+    F_COUNT, F_SUM, F_TOTAL, F_AVG, F_MIN_A, F_MAX_A, F_GROUP_CONCAT,
+    SUBQ_HOOK_NONE, MAX_ARGS, expr_text_name, call_scalar_for_test,
+}
+
+const MAX_ARGS: usize = 16
+const SUBQ_HOOK_NONE: i64 = 0
+
+// function numbers
+const F_ABS: u32 = 1
+const F_COALESCE: u32 = 2
+const F_IFNULL: u32 = 3
+const F_NULLIF: u32 = 4
+const F_LENGTH: u32 = 5
+const F_LOWER: u32 = 6
+const F_UPPER: u32 = 7
+const F_SUBSTR: u32 = 8
+const F_INSTR: u32 = 9
+const F_REPLACE: u32 = 10
+const F_TRIM: u32 = 11
+const F_LTRIM: u32 = 12
+const F_RTRIM: u32 = 13
+const F_TYPEOF: u32 = 14
+const F_HEX: u32 = 15
+const F_QUOTE: u32 = 16
+const F_RANDOM: u32 = 17
+const F_RANDOMBLOB: u32 = 18
+const F_ROUND: u32 = 19
+const F_MIN_S: u32 = 20
+const F_MAX_S: u32 = 21
+const F_IIF: u32 = 22
+const F_LIKE: u32 = 23
+const F_GLOB: u32 = 24
+const F_ZEROBLOB: u32 = 25
+const F_CHAR: u32 = 26
+const F_UNICODE: u32 = 27
+const F_LAST_INSERT_ROWID: u32 = 29
+const F_CHANGES: u32 = 30
+const F_TOTAL_CHANGES: u32 = 31
+const F_VERSION: u32 = 32
+const F_UNHEX: u32 = 33
+const F_PRINTF: u32 = 34
+const F_UNIXEPOCH: u32 = 35
+const F_DATE: u32 = 36
+const F_TIME: u32 = 37
+const F_DATETIME: u32 = 38
+const F_JULIANDAY: u32 = 39
+const F_STRFTIME: u32 = 40
+const F_COUNT: u32 = 100
+const F_SUM: u32 = 101
+const F_TOTAL: u32 = 102
+const F_AVG: u32 = 103
+const F_MIN_A: u32 = 104
+const F_MAX_A: u32 = 105
+const F_GROUP_CONCAT: u32 = 106
+
+fn is_aggregate_id(f: u32) -> bool {
+    return f >= 100
+}
+
+struct RowRef {
+    vals: u64,
+    ncols: usize,
+    rowid: i64,
+    valid: bool,
+}
+
+// what name resolution needs to know about one FROM item
+struct SrcInfo {
+    tbl: i32, // schema table, -1 for a sub-select
+    name_p: u64,
+    name_n: usize,
+    alias_p: u64,
+    alias_n: usize,
+    ncols: usize,
+    cols: u64, // Column array of the table
+    colnames: u64, // a sub-select: pairs (address, length) of the column names
+    rowid_col: i32,
+    hidden_rowid: bool, // the rowid can be named (tables, not sub-selects)
+    qual_only: bool, // only found when written with its name (`excluded`)
+}
+
+struct Scope {
+    n: usize,
+    src: [SrcInfo; 8],
+    parent: *mut Scope,
+}
+
+fn srcinfo_blank() -> SrcInfo {
+    return SrcInfo { tbl: -1, name_p: 0, name_n: 0, alias_p: 0, alias_n: 0, ncols: 0, cols: 0, colnames: 0,
+        rowid_col: -1, hidden_rowid: false, qual_only: false }
+}
+
+fn scope_new() -> Scope {
+    return Scope { n: 0, src: [srcinfo_blank(), srcinfo_blank(), srcinfo_blank(), srcinfo_blank(),
+        srcinfo_blank(), srcinfo_blank(), srcinfo_blank(), srcinfo_blank()], parent: 0 as *mut Scope }
+}
+
+// The evaluation context: where the current rows are.
+struct Ctx {
+    db: *mut dc.Db,
+    params: u64, // nparams Vals (the statement's bound values)
+    nparams: i32,
+    ast: *mut ax.Ast,
+    scope: *mut Scope,
+    rows: u64, // RowRef per source
+    arena: *mut ar.Arena,
+    agg: u64, // results of the aggregate calls of the current group (Vals) or 0
+    bare: u64, // values of the plain columns of the current group
+    parent: *mut Ctx,
+    subq: u64, // hook for sub-selects: address of the statement executor (select.fi)
+    stmt: u64, // the statement (address) the sub-select registry lives in
+    err_node: i32,
+}
+
+fn ctx_new(db: *mut dc.Db, ast: *mut ax.Ast, arena: *mut ar.Arena) -> Ctx {
+    return Ctx { db: db, params: 0, nparams: 0, ast: ast, scope: 0 as *mut Scope, rows: 0, arena: arena,
+        agg: 0, bare: 0, parent: 0 as *mut Ctx, subq: 0, stmt: 0, err_node: -1 }
+}
+
+// ------------------------------------------------------------- functions
+fn fname_is(p: u64, n: usize, w: str) -> bool {
+    return tk.lex_eq_ci(p, n, w)
+}
+
+// the number of a function, -1 unknown, -2 the argument count is wrong
+fn func_lookup(p: u64, n: usize, argc: i64, star: bool) -> i64 {
+    if star {
+        if fname_is(p, n, "count") {
+            return F_COUNT as i64
+        }
+        return -2
+    }
+    if fname_is(p, n, "abs") { if argc == 1 { return F_ABS as i64 } return -2 }
+    if fname_is(p, n, "coalesce") { if argc >= 2 { return F_COALESCE as i64 } return -2 }
+    if fname_is(p, n, "ifnull") { if argc == 2 { return F_IFNULL as i64 } return -2 }
+    if fname_is(p, n, "nullif") { if argc == 2 { return F_NULLIF as i64 } return -2 }
+    if fname_is(p, n, "length") { if argc == 1 { return F_LENGTH as i64 } return -2 }
+    if fname_is(p, n, "lower") { if argc == 1 { return F_LOWER as i64 } return -2 }
+    if fname_is(p, n, "upper") { if argc == 1 { return F_UPPER as i64 } return -2 }
+    if fname_is(p, n, "substr") || fname_is(p, n, "substring") {
+        if argc == 2 || argc == 3 { return F_SUBSTR as i64 }
+        return -2
+    }
+    if fname_is(p, n, "instr") { if argc == 2 { return F_INSTR as i64 } return -2 }
+    if fname_is(p, n, "replace") { if argc == 3 { return F_REPLACE as i64 } return -2 }
+    if fname_is(p, n, "trim") { if argc == 1 || argc == 2 { return F_TRIM as i64 } return -2 }
+    if fname_is(p, n, "ltrim") { if argc == 1 || argc == 2 { return F_LTRIM as i64 } return -2 }
+    if fname_is(p, n, "rtrim") { if argc == 1 || argc == 2 { return F_RTRIM as i64 } return -2 }
+    if fname_is(p, n, "typeof") { if argc == 1 { return F_TYPEOF as i64 } return -2 }
+    if fname_is(p, n, "hex") { if argc == 1 { return F_HEX as i64 } return -2 }
+    if fname_is(p, n, "unhex") { if argc == 1 { return F_UNHEX as i64 } return -2 }
+    if fname_is(p, n, "quote") { if argc == 1 { return F_QUOTE as i64 } return -2 }
+    if fname_is(p, n, "random") { if argc == 0 { return F_RANDOM as i64 } return -2 }
+    if fname_is(p, n, "randomblob") { if argc == 1 { return F_RANDOMBLOB as i64 } return -2 }
+    if fname_is(p, n, "zeroblob") { if argc == 1 { return F_ZEROBLOB as i64 } return -2 }
+    if fname_is(p, n, "round") { if argc == 1 || argc == 2 { return F_ROUND as i64 } return -2 }
+    if fname_is(p, n, "iif") { if argc == 3 { return F_IIF as i64 } return -2 }
+    if fname_is(p, n, "like") { if argc == 2 || argc == 3 { return F_LIKE as i64 } return -2 }
+    if fname_is(p, n, "glob") { if argc == 2 { return F_GLOB as i64 } return -2 }
+    if fname_is(p, n, "char") { return F_CHAR as i64 }
+    if fname_is(p, n, "unicode") { if argc == 1 { return F_UNICODE as i64 } return -2 }
+    if fname_is(p, n, "last_insert_rowid") { if argc == 0 { return F_LAST_INSERT_ROWID as i64 } return -2 }
+    if fname_is(p, n, "changes") { if argc == 0 { return F_CHANGES as i64 } return -2 }
+    if fname_is(p, n, "total_changes") { if argc == 0 { return F_TOTAL_CHANGES as i64 } return -2 }
+    if fname_is(p, n, "sqlite_version") { if argc == 0 { return F_VERSION as i64 } return -2 }
+    if fname_is(p, n, "printf") || fname_is(p, n, "format") { if argc >= 1 { return F_PRINTF as i64 } return -2 }
+    if fname_is(p, n, "unixepoch") { return F_UNIXEPOCH as i64 }
+    if fname_is(p, n, "date") { return F_DATE as i64 }
+    if fname_is(p, n, "time") { return F_TIME as i64 }
+    if fname_is(p, n, "datetime") { return F_DATETIME as i64 }
+    if fname_is(p, n, "julianday") { return F_JULIANDAY as i64 }
+    if fname_is(p, n, "strftime") { if argc >= 1 { return F_STRFTIME as i64 } return -2 }
+    if fname_is(p, n, "min") {
+        if argc == 1 { return F_MIN_A as i64 }
+        if argc >= 2 { return F_MIN_S as i64 }
+        return -2
+    }
+    if fname_is(p, n, "max") {
+        if argc == 1 { return F_MAX_A as i64 }
+        if argc >= 2 { return F_MAX_S as i64 }
+        return -2
+    }
+    if fname_is(p, n, "count") { if argc == 1 { return F_COUNT as i64 } return -2 }
+    if fname_is(p, n, "sum") { if argc == 1 { return F_SUM as i64 } return -2 }
+    if fname_is(p, n, "total") { if argc == 1 { return F_TOTAL as i64 } return -2 }
+    if fname_is(p, n, "avg") { if argc == 1 { return F_AVG as i64 } return -2 }
+    if fname_is(p, n, "group_concat") || fname_is(p, n, "string_agg") {
+        if argc == 1 || argc == 2 { return F_GROUP_CONCAT as i64 }
+        return -2
+    }
+    return -1
+}
+
+// ---------------------------------------------------------------- resolve
+fn msg2(a: str, p: u64, n: usize) -> str {
+    var b: rt.Buf = rt.buf_new()
+    ut.put_text(&b, a)
+    rt.buf_push_bytes(&b, p, n)
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn qual_msg(a: str, qp: u64, qn: usize, p: u64, n: usize) -> str {
+    var b: rt.Buf = rt.buf_new()
+    ut.put_text(&b, a)
+    if qn > 0 {
+        rt.buf_push_bytes(&b, qp, qn)
+        rt.buf_push(&b, 46 as u8)
+    }
+    rt.buf_push_bytes(&b, p, n)
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn src_col_count(si: *mut SrcInfo) -> usize {
+    return (*si).ncols
+}
+
+// finds the column of source i with that name: its number, -1 none, -2 rowid
+fn src_find_col(si: *mut SrcInfo, p: u64, n: usize) -> i64 {
+    if (*si).tbl >= 0 {
+        var i: usize = 0
+        while i < (*si).ncols {
+            let c: *mut dc.Column = ((*si).cols as *mut dc.Column) + i
+            if dc.name_eq((*c).name_p, (*c).name_n, p, n) {
+                return i as i64
+            }
+            i = i + 1
+        }
+        if (*si).hidden_rowid {
+            if dc.name_eq(p, n, "rowid".p as u64, 5) || dc.name_eq(p, n, "oid".p as u64, 3)
+                || dc.name_eq(p, n, "_rowid_".p as u64, 7) {
+                return -2
+            }
+        }
+        return -1
+    }
+    var i: usize = 0
+    while i < (*si).ncols {
+        let cp: u64 = rt.ld64((*si).colnames, 2 * i)
+        let cn: usize = rt.ld64((*si).colnames, 2 * i + 1) as usize
+        if dc.name_eq(cp, cn, p, n) {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// the deepest outer scope a name was found in since the last reset (correlation)
+static mut outer_depth_max: i32 = 0
+
+fn outer_depth_get() -> i32 {
+    return outer_depth_max
+}
+
+fn outer_depth_set(v: i32) {
+    outer_depth_max = v
+}
+
+fn resolve_col(sc: *mut Scope, ast: *mut ax.Ast, n: i32) -> DbError!bool {
+    let nd: *mut ax.Node = ax.ast_n(ast, n)
+    var depth: i32 = 0
+    var scope: *mut Scope = sc
+    while (scope as u64) != 0 {
+        var found_src: i64 = -1
+        var found_col: i64 = -1
+        var i: usize = 0
+        while i < (*scope).n {
+            let si: *mut SrcInfo = &(*scope).src[i]
+            if (*nd).sn2 > 0 {
+                if !(dc.name_eq((*si).alias_p, (*si).alias_n, (*nd).sp2, (*nd).sn2)) {
+                    i = i + 1
+                    continue
+                }
+            } else if (*si).qual_only {
+                i = i + 1
+                continue
+            }
+            let c: i64 = src_find_col(si, (*nd).sp, (*nd).sn)
+            if c != -1 {
+                if found_src >= 0 {
+                    return dberr.fail(DbError::Sql, qual_msg("ambiguous column name: ", (*nd).sp2, (*nd).sn2, (*nd).sp, (*nd).sn))
+                }
+                found_src = i as i64
+                found_col = c
+            }
+            i = i + 1
+        }
+        if found_src >= 0 {
+            (*nd).b = found_src as i32
+            if found_col == -2 {
+                (*nd).c = -1
+            } else {
+                (*nd).c = found_col as i32
+            }
+            (*nd).d = depth
+            if depth > outer_depth_max {
+                outer_depth_max = depth
+            }
+            return true
+        }
+        scope = (*scope).parent
+        depth = depth + 1
+    }
+    return dberr.fail(DbError::NoSuchColumn, qual_msg("no such column: ", (*nd).sp2, (*nd).sn2, (*nd).sp, (*nd).sn))
+}
+
+// Binds names in the tree of expression `n`. `agg_ok`: aggregate functions are
+// allowed here (select list, HAVING, ORDER BY of an aggregate query).
+fn resolve_expr(sc: *mut Scope, ast: *mut ax.Ast, n: i32, agg_ok: bool, in_agg: bool) -> DbError!bool {
+    if n < 0 {
+        return true
+    }
+    let nd: *mut ax.Node = ax.ast_n(ast, n)
+    let k: u32 = (*nd).kind
+    if k == ax.N_COL {
+        try resolve_col(sc, ast, n)
+        return true
+    }
+    if k == ax.N_INT || k == ax.N_REAL || k == ax.N_STR || k == ax.N_BLOB || k == ax.N_NULL {
+        return true
+    }
+    if k == ax.N_PARAM {
+        return true
+    }
+    if k == ax.N_FUNC {
+        let f: i64 = func_lookup((*nd).sp, (*nd).sn, (*nd).ival, ((*nd).flag & 2) != 0)
+        if f == -1 {
+            return dberr.fail(DbError::Sql, msg2("no such function: ", (*nd).sp, (*nd).sn))
+        }
+        if f == -2 {
+            return dberr.fail(DbError::Sql, msg2("wrong number of arguments to function ", (*nd).sp, (*nd).sn))
+        }
+        (*nd).op = f as u32
+        if is_aggregate_id(f as u32) {
+            if !agg_ok || in_agg {
+                return dberr.fail(DbError::Sql, msg2("misuse of aggregate function ", (*nd).sp, (*nd).sn))
+            }
+            var a: i32 = (*nd).a
+            while a >= 0 {
+                try resolve_expr(sc, ast, a, false, true)
+                a = (*ax.ast_n(ast, a)).next
+            }
+            return true
+        }
+        var a: i32 = (*nd).a
+        while a >= 0 {
+            try resolve_expr(sc, ast, a, agg_ok, in_agg)
+            a = (*ax.ast_n(ast, a)).next
+        }
+        return true
+    }
+    if k == ax.N_UNARY || k == ax.N_ISNULL || k == ax.N_CAST || k == ax.N_COLLATE {
+        try resolve_expr(sc, ast, (*nd).a, agg_ok, in_agg)
+        return true
+    }
+    if k == ax.N_BINARY || k == ax.N_IS {
+        try resolve_expr(sc, ast, (*nd).a, agg_ok, in_agg)
+        try resolve_expr(sc, ast, (*nd).b, agg_ok, in_agg)
+        return true
+    }
+    if k == ax.N_BETWEEN {
+        try resolve_expr(sc, ast, (*nd).a, agg_ok, in_agg)
+        try resolve_expr(sc, ast, (*nd).b, agg_ok, in_agg)
+        try resolve_expr(sc, ast, (*nd).c, agg_ok, in_agg)
+        return true
+    }
+    if k == ax.N_LIKE {
+        try resolve_expr(sc, ast, (*nd).a, agg_ok, in_agg)
+        try resolve_expr(sc, ast, (*nd).b, agg_ok, in_agg)
+        try resolve_expr(sc, ast, (*nd).c, agg_ok, in_agg)
+        return true
+    }
+    if k == ax.N_IN_LIST {
+        try resolve_expr(sc, ast, (*nd).a, agg_ok, in_agg)
+        var b: i32 = (*nd).b
+        while b >= 0 {
+            try resolve_expr(sc, ast, b, agg_ok, in_agg)
+            b = (*ax.ast_n(ast, b)).next
+        }
+        return true
+    }
+    if k == ax.N_CASE {
+        try resolve_expr(sc, ast, (*nd).a, agg_ok, in_agg)
+        var w: i32 = (*nd).b
+        while w >= 0 {
+            let wn: *mut ax.Node = ax.ast_n(ast, w)
+            try resolve_expr(sc, ast, (*wn).a, agg_ok, in_agg)
+            try resolve_expr(sc, ast, (*wn).b, agg_ok, in_agg)
+            w = (*wn).next
+        }
+        try resolve_expr(sc, ast, (*nd).c, agg_ok, in_agg)
+        return true
+    }
+    // sub-selects are resolved by exec.fi (they have their own scope); here they
+    // only need their left operand
+    if k == ax.N_IN_SELECT {
+        try resolve_expr(sc, ast, (*nd).a, agg_ok, in_agg)
+        return true
+    }
+    if k == ax.N_EXISTS || k == ax.N_SUBQ {
+        return true
+    }
+    return dberr.fail(DbError::Sql, "unsupported expression")
+}
+
+// is the expression free of column references, parameters and sub-selects?
+fn node_is_const(ast: *mut ax.Ast, n: i32) -> bool {
+    if n < 0 {
+        return true
+    }
+    let nd: *mut ax.Node = ax.ast_n(ast, n)
+    let k: u32 = (*nd).kind
+    if k == ax.N_COL || k == ax.N_EXISTS || k == ax.N_SUBQ || k == ax.N_IN_SELECT {
+        return false
+    }
+    if k == ax.N_FUNC {
+        if (*nd).op >= 100 || (*nd).op == F_RANDOM || (*nd).op == F_RANDOMBLOB || (*nd).op == F_LAST_INSERT_ROWID
+            || (*nd).op == F_CHANGES || (*nd).op == F_TOTAL_CHANGES || ((*nd).op >= F_UNIXEPOCH && (*nd).op <= F_STRFTIME) {
+            return false
+        }
+        var a: i32 = (*nd).a
+        while a >= 0 {
+            if !node_is_const(ast, a) {
+                return false
+            }
+            a = (*ax.ast_n(ast, a)).next
+        }
+        return true
+    }
+    if k == ax.N_IN_LIST {
+        var b: i32 = (*nd).b
+        while b >= 0 {
+            if !node_is_const(ast, b) {
+                return false
+            }
+            b = (*ax.ast_n(ast, b)).next
+        }
+        return node_is_const(ast, (*nd).a)
+    }
+    if k == ax.N_CASE {
+        var w: i32 = (*nd).b
+        while w >= 0 {
+            if !node_is_const(ast, (*ax.ast_n(ast, w)).a) || !node_is_const(ast, (*ax.ast_n(ast, w)).b) {
+                return false
+            }
+            w = (*ax.ast_n(ast, w)).next
+        }
+        return node_is_const(ast, (*nd).a) && node_is_const(ast, (*nd).c)
+    }
+    return node_is_const(ast, (*nd).a) && node_is_const(ast, (*nd).b) && node_is_const(ast, (*nd).c)
+}
+
+// the text of an expression as written (the name of a result column)
+fn expr_text_name(src: u64, srcn: usize, nd: *mut ax.Node, outp: *mut u64, outn: *mut usize) -> bool {
+    if (*nd).d >= 0 && (*nd).e >= (*nd).d && ((*nd).e as usize) <= srcn {
+        *outp = src + ((*nd).d as u64)
+        *outn = ((*nd).e - (*nd).d) as usize
+        return true
+    }
+    return false
+}
+
+// ----------------------------------------------------------- affinity/collation
+fn is_numeric_aff(a: i64) -> bool {
+    return a == 2 || a == 3 || a == 4
+}
+
+fn is_no_aff(a: i64) -> bool {
+    return a == -1 || a == 0
+}
+
+// the affinity of an expression: a column's, a CAST's, else NONE_AFF
+fn expr_aff(cx: *mut Ctx, n: i32) -> i64 {
+    if n < 0 {
+        return -1
+    }
+    let nd: *mut ax.Node = ax.ast_n((*cx).ast, n)
+    if (*nd).kind == ax.N_COL {
+        var scope: *mut Scope = (*cx).scope
+        var d: i32 = (*nd).d
+        while d > 0 && (scope as u64) != 0 {
+            scope = (*scope).parent
+            d = d - 1
+        }
+        if (scope as u64) == 0 {
+            return -1
+        }
+        let si: *mut SrcInfo = &(*scope).src[(*nd).b as usize]
+        if (*nd).c < 0 {
+            return 3
+        }
+        if (*si).tbl >= 0 {
+            let c: *mut dc.Column = ((*si).cols as *mut dc.Column) + ((*nd).c as usize)
+            return (*c).aff
+        }
+        return -1
+    }
+    if (*nd).kind == ax.N_CAST {
+        return (*nd).ival
+    }
+    if (*nd).kind == ax.N_COLLATE || (*nd).kind == ax.N_UNARY && (*nd).op == ax.OP_POS {
+        return expr_aff(cx, (*nd).a)
+    }
+    return -1
+}
+
+// the collation of an expression: explicit COLLATE, else a column's, else BINARY
+fn expr_coll(cx: *mut Ctx, n: i32) -> u32 {
+    if n < 0 {
+        return 0
+    }
+    let nd: *mut ax.Node = ax.ast_n((*cx).ast, n)
+    if (*nd).kind == ax.N_COLLATE {
+        let id: u32 = coll_id((*nd).sp, (*nd).sn)
+        return id
+    }
+    if (*nd).kind == ax.N_COL {
+        var scope: *mut Scope = (*cx).scope
+        var d: i32 = (*nd).d
+        while d > 0 && (scope as u64) != 0 {
+            scope = (*scope).parent
+            d = d - 1
+        }
+        if (scope as u64) == 0 || (*nd).c < 0 {
+            return 0
+        }
+        let si: *mut SrcInfo = &(*scope).src[(*nd).b as usize]
+        if (*si).tbl >= 0 {
+            let c: *mut dc.Column = ((*si).cols as *mut dc.Column) + ((*nd).c as usize)
+            return (*c).coll
+        }
+        return 0
+    }
+    if (*nd).kind == ax.N_UNARY && (*nd).op == ax.OP_POS {
+        return expr_coll(cx, (*nd).a)
+    }
+    return 0
+}
+
+fn coll_id(p: u64, n: usize) -> u32 {
+    if tk.lex_eq_ci(p, n, "NOCASE") {
+        return 1
+    }
+    if tk.lex_eq_ci(p, n, "RTRIM") {
+        return 2
+    }
+    return 0
+}
+
+// Compares two values under the affinity rules. false = one is NULL.
+fn compare_aff(cx: *mut Ctx, x: *mut rc.Val, ax_aff: i64, y: *mut rc.Val, ay_aff: i64, coll: u32,
+    out: *mut i64) -> bool {
+    if (*x).t == 0 || (*y).t == 0 {
+        return false
+    }
+    var a: rc.Val = *x
+    var b: rc.Val = *y
+    if is_numeric_aff(ax_aff) && !is_numeric_aff(ay_aff) {
+        if (*y).t == 3 {
+            vl.apply_affinity(&b, 2, (*cx).arena)
+        }
+    } else if is_numeric_aff(ay_aff) && !is_numeric_aff(ax_aff) {
+        if (*x).t == 3 {
+            vl.apply_affinity(&a, 2, (*cx).arena)
+        }
+    } else if ax_aff == 1 && is_no_aff(ay_aff) {
+        vl.apply_affinity(&b, 1, (*cx).arena)
+    } else if ay_aff == 1 && is_no_aff(ax_aff) {
+        vl.apply_affinity(&a, 1, (*cx).arena)
+    }
+    *out = vl.sql_compare(&a, &b, coll)
+    return true
+}
+
+// ------------------------------------------------------------- evaluation
+fn null_val() -> rc.Val {
+    return rc.val_null()
+}
+
+fn bool_val(b: bool) -> rc.Val {
+    if b {
+        return rc.val_int(1)
+    }
+    return rc.val_int(0)
+}
+
+fn tri_val(t: i64) -> rc.Val {
+    if t < 0 {
+        return rc.val_null()
+    }
+    return rc.val_int(t)
+}
+
+fn eval_truth(cx: *mut Ctx, n: i32) -> DbError!i64 {
+    let v: rc.Val = try eval(cx, n)
+    return vl.val_truth(&v)
+}
+
+fn param_val(cx: *mut Ctx, idx: i64) -> rc.Val {
+    if idx < 1 || idx > ((*cx).nparams as i64) {
+        return rc.val_null()
+    }
+    return *(((*cx).params as *mut rc.Val) + ((idx - 1) as usize))
+}
+
+fn eval_binary(cx: *mut Ctx, nd: *mut ax.Node) -> DbError!rc.Val {
+    let op: u32 = (*nd).op
+    let ast: *mut ax.Ast = (*cx).ast
+    if op == ax.OP_AND || op == ax.OP_OR {
+        let l: i64 = try eval_truth(cx, (*nd).a)
+        if op == ax.OP_AND {
+            if l == 0 {
+                return rc.val_int(0)
+            }
+            let r: i64 = try eval_truth(cx, (*nd).b)
+            if r == 0 {
+                return rc.val_int(0)
+            }
+            if l < 0 || r < 0 {
+                return rc.val_null()
+            }
+            return rc.val_int(1)
+        }
+        if l == 1 {
+            return rc.val_int(1)
+        }
+        let r2: i64 = try eval_truth(cx, (*nd).b)
+        if r2 == 1 {
+            return rc.val_int(1)
+        }
+        if l < 0 || r2 < 0 {
+            return rc.val_null()
+        }
+        return rc.val_int(0)
+    }
+    let x: rc.Val = try eval(cx, (*nd).a)
+    let y: rc.Val = try eval(cx, (*nd).b)
+    if op >= ax.OP_EQ && op <= ax.OP_GE {
+        var xx: rc.Val = x
+        var yy: rc.Val = y
+        var c: i64 = 0
+        var coll: u32 = expr_coll(cx, (*nd).a)
+        if coll == 0 {
+            coll = expr_coll(cx, (*nd).b)
+        }
+        if !compare_aff(cx, &xx, expr_aff(cx, (*nd).a), &yy, expr_aff(cx, (*nd).b), coll, &c) {
+            return rc.val_null()
+        }
+        if op == ax.OP_EQ { return bool_val(c == 0) }
+        if op == ax.OP_NE { return bool_val(c != 0) }
+        if op == ax.OP_LT { return bool_val(c < 0) }
+        if op == ax.OP_LE { return bool_val(c <= 0) }
+        if op == ax.OP_GT { return bool_val(c > 0) }
+        return bool_val(c >= 0)
+    }
+    var out: rc.Val = rc.val_null()
+    if x.t == 0 || y.t == 0 {
+        return rc.val_null()
+    }
+    var xx: rc.Val = x
+    var yy: rc.Val = y
+    if op >= ax.OP_ADD && op <= ax.OP_MOD {
+        if vl.arith(op, &xx, &yy, &out) {
+            return out
+        }
+        return rc.val_null()
+    }
+    if op == ax.OP_CONCAT {
+        if vl.concat_vals(&xx, &yy, (*cx).arena, &out) {
+            return out
+        }
+        return rc.val_null()
+    }
+    if vl.bitop(op, &xx, &yy, &out) {
+        return out
+    }
+    return rc.val_null()
+}
+
+fn eval_is(cx: *mut Ctx, nd: *mut ax.Node) -> DbError!rc.Val {
+    let x: rc.Val = try eval(cx, (*nd).a)
+    // x IS TRUE / x IS FALSE: the truth of x, NULL counts as neither
+    let rn: *mut ax.Node = ax.ast_n((*cx).ast, (*nd).b)
+    if (*rn).kind == ax.N_INT && (*rn).flag == 1 {
+        var xt: rc.Val = x
+        let tr: i64 = vl.val_truth(&xt)
+        var hit: bool = false
+        if (*rn).ival != 0 {
+            hit = tr == 1
+        } else {
+            hit = tr == 0
+        }
+        if (*nd).op == 1 {
+            return bool_val(!hit)
+        }
+        return bool_val(hit)
+    }
+    let y: rc.Val = try eval(cx, (*nd).b)
+    var same: bool = false
+    if x.t == 0 && y.t == 0 {
+        same = true
+    } else if x.t == 0 || y.t == 0 {
+        same = false
+    } else {
+        var xx: rc.Val = x
+        var yy: rc.Val = y
+        var c: i64 = 0
+        var coll: u32 = expr_coll(cx, (*nd).a)
+        if coll == 0 {
+            coll = expr_coll(cx, (*nd).b)
+        }
+        compare_aff(cx, &xx, expr_aff(cx, (*nd).a), &yy, expr_aff(cx, (*nd).b), coll, &c)
+        same = c == 0
+    }
+    if (*nd).op == 1 {
+        return bool_val(!same)
+    }
+    return bool_val(same)
+}
+
+fn text_of(v: *mut rc.Val, cx: *mut Ctx, p: *mut u64, n: *mut usize) {
+    var t: rc.Val = rc.val_null()
+    vl.val_to_text(v, (*cx).arena, &t)
+    *p = t.p
+    *n = t.n
+}
+
+fn eval_like(cx: *mut Ctx, nd: *mut ax.Node) -> DbError!rc.Val {
+    let x: rc.Val = try eval(cx, (*nd).a)
+    let pat: rc.Val = try eval(cx, (*nd).b)
+    var esc: i64 = -1
+    if (*nd).c >= 0 {
+        let e: rc.Val = try eval(cx, (*nd).c)
+        if e.t == 0 {
+            return rc.val_null()
+        }
+        var ep: u64 = 0
+        var en: usize = 0
+        var ee: rc.Val = e
+        text_of(&ee, cx, &ep, &en)
+        if en != 1 {
+            return dberr.fail(DbError::Sql, "ESCAPE expression must be a single character")
+        }
+        esc = rt.ld8(ep, 0) as i64
+    }
+    if x.t == 0 || pat.t == 0 {
+        return rc.val_null()
+    }
+    var xx: rc.Val = x
+    var pp: rc.Val = pat
+    var xp: u64 = 0
+    var xn: usize = 0
+    var pp_p: u64 = 0
+    var pp_n: usize = 0
+    text_of(&xx, cx, &xp, &xn)
+    text_of(&pp, cx, &pp_p, &pp_n)
+    var m: bool = false
+    if (*nd).op == 1 {
+        m = vl.glob_match(pp_p, pp_n, xp, xn)
+    } else {
+        m = vl.like_match(pp_p, pp_n, xp, xn, esc)
+    }
+    if (*nd).flag == 1 {
+        m = !m
+    }
+    return bool_val(m)
+}
+
+fn eval_in_list(cx: *mut Ctx, nd: *mut ax.Node) -> DbError!rc.Val {
+    let x: rc.Val = try eval(cx, (*nd).a)
+    if x.t == 0 {
+        // NULL IN (empty list) is false; otherwise NULL
+        if (*nd).b < 0 {
+            return bool_val((*nd).flag == 1)
+        }
+        return rc.val_null()
+    }
+    var saw_null: bool = false
+    let aff: i64 = expr_aff(cx, (*nd).a)
+    let coll: u32 = expr_coll(cx, (*nd).a)
+    var it: i32 = (*nd).b
+    while it >= 0 {
+        let y: rc.Val = try eval(cx, it)
+        if y.t == 0 {
+            saw_null = true
+        } else {
+            var xx: rc.Val = x
+            var yy: rc.Val = y
+            var c: i64 = 0
+            compare_aff(cx, &xx, aff, &yy, expr_aff(cx, it), coll, &c)
+            if c == 0 {
+                return bool_val((*nd).flag == 0)
+            }
+        }
+        it = (*ax.ast_n((*cx).ast, it)).next
+    }
+    if saw_null {
+        return rc.val_null()
+    }
+    return bool_val((*nd).flag == 1)
+}
+
+fn eval_case(cx: *mut Ctx, nd: *mut ax.Node) -> DbError!rc.Val {
+    var base: rc.Val = rc.val_null()
+    var has_base: bool = false
+    if (*nd).a >= 0 {
+        base = try eval(cx, (*nd).a)
+        has_base = true
+    }
+    var w: i32 = (*nd).b
+    while w >= 0 {
+        let wn: *mut ax.Node = ax.ast_n((*cx).ast, w)
+        if has_base {
+            let c: rc.Val = try eval(cx, (*wn).a)
+            if base.t != 0 && c.t != 0 {
+                var bb: rc.Val = base
+                var cc: rc.Val = c
+                var r: i64 = 0
+                compare_aff(cx, &bb, expr_aff(cx, (*nd).a), &cc, expr_aff(cx, (*wn).a), expr_coll(cx, (*nd).a), &r)
+                if r == 0 {
+                    return try eval(cx, (*wn).b)
+                }
+            }
+        } else {
+            let t: i64 = try eval_truth(cx, (*wn).a)
+            if t == 1 {
+                return try eval(cx, (*wn).b)
+            }
+        }
+        w = (*wn).next
+    }
+    if (*nd).c >= 0 {
+        return try eval(cx, (*nd).c)
+    }
+    return rc.val_null()
+}
+
+fn eval_col(cx: *mut Ctx, nd: *mut ax.Node) -> DbError!rc.Val {
+    var c: *mut Ctx = cx
+    var d: i32 = (*nd).d
+    while d > 0 && ((*c).parent as u64) != 0 {
+        c = (*c).parent
+        d = d - 1
+    }
+    // a plain column of an aggregate query: the first row of the group
+    if (*c).bare != 0 && (*nd).e >= 0 {
+        return *(((*c).bare as *mut rc.Val) + ((*nd).e as usize))
+    }
+    let r: *mut RowRef = ((*c).rows as *mut RowRef) + ((*nd).b as usize)
+    if !(*r).valid {
+        return rc.val_null()
+    }
+    if (*nd).c < 0 {
+        return rc.val_int((*r).rowid)
+    }
+    if ((*nd).c as usize) >= (*r).ncols {
+        return rc.val_null()
+    }
+    return *(((*r).vals as *mut rc.Val) + ((*nd).c as usize))
+}
+
+fn eval(cx: *mut Ctx, n: i32) -> DbError!rc.Val {
+    let nd: *mut ax.Node = ax.ast_n((*cx).ast, n)
+    let k: u32 = (*nd).kind
+    if k == ax.N_COL {
+        return try eval_col(cx, nd)
+    }
+    if k == ax.N_INT {
+        return rc.val_int((*nd).ival)
+    }
+    if k == ax.N_REAL {
+        return rc.val_real((*nd).fval)
+    }
+    if k == ax.N_STR {
+        return rc.val_text((*nd).sp, (*nd).sn)
+    }
+    if k == ax.N_BLOB {
+        return rc.val_blob((*nd).sp, (*nd).sn)
+    }
+    if k == ax.N_NULL {
+        return rc.val_null()
+    }
+    if k == ax.N_PARAM {
+        return param_val(cx, (*nd).ival)
+    }
+    if k == ax.N_BINARY {
+        return try eval_binary(cx, nd)
+    }
+    if k == ax.N_UNARY {
+        let op: u32 = (*nd).op
+        if op == ax.OP_NOT {
+            let t: i64 = try eval_truth(cx, (*nd).a)
+            if t < 0 {
+                return rc.val_null()
+            }
+            return rc.val_int(1 - t)
+        }
+        let x: rc.Val = try eval(cx, (*nd).a)
+        if op == ax.OP_POS {
+            return x
+        }
+        if x.t == 0 {
+            return rc.val_null()
+        }
+        var xx: rc.Val = x
+        var out: rc.Val = rc.val_null()
+        if op == ax.OP_NEG {
+            if vl.neg_value(&xx, &out) {
+                return out
+            }
+            return rc.val_null()
+        }
+        // ~x
+        return rc.val_int(~vl.val_to_int(&xx))
+    }
+    if k == ax.N_IS {
+        return try eval_is(cx, nd)
+    }
+    if k == ax.N_ISNULL {
+        let x: rc.Val = try eval(cx, (*nd).a)
+        if (*nd).op == 1 {
+            return bool_val(x.t != 0)
+        }
+        return bool_val(x.t == 0)
+    }
+    if k == ax.N_BETWEEN {
+        let x: rc.Val = try eval(cx, (*nd).a)
+        let lo: rc.Val = try eval(cx, (*nd).b)
+        let hi: rc.Val = try eval(cx, (*nd).c)
+        let aff: i64 = expr_aff(cx, (*nd).a)
+        let coll: u32 = expr_coll(cx, (*nd).a)
+        var xx: rc.Val = x
+        var l: rc.Val = lo
+        var h: rc.Val = hi
+        var c1: i64 = 0
+        var c2: i64 = 0
+        let ok1: bool = compare_aff(cx, &xx, aff, &l, expr_aff(cx, (*nd).b), coll, &c1)
+        let ok2: bool = compare_aff(cx, &xx, aff, &h, expr_aff(cx, (*nd).c), coll, &c2)
+        // x >= lo AND x <= hi with NULL logic
+        var r1: i64 = -1
+        var r2: i64 = -1
+        if ok1 {
+            if c1 >= 0 { r1 = 1 } else { r1 = 0 }
+        }
+        if ok2 {
+            if c2 <= 0 { r2 = 1 } else { r2 = 0 }
+        }
+        var res: i64 = -1
+        if r1 == 0 || r2 == 0 {
+            res = 0
+        } else if r1 < 0 || r2 < 0 {
+            res = -1
+        } else {
+            res = 1
+        }
+        if res >= 0 && (*nd).flag == 1 {
+            res = 1 - res
+        }
+        return tri_val(res)
+    }
+    if k == ax.N_LIKE {
+        return try eval_like(cx, nd)
+    }
+    if k == ax.N_IN_LIST {
+        return try eval_in_list(cx, nd)
+    }
+    if k == ax.N_CASE {
+        return try eval_case(cx, nd)
+    }
+    if k == ax.N_COLLATE {
+        return try eval(cx, (*nd).a)
+    }
+    if k == ax.N_CAST {
+        let x: rc.Val = try eval(cx, (*nd).a)
+        var xx: rc.Val = x
+        var out: rc.Val = rc.val_null()
+        vl.cast_value(&xx, (*nd).ival, (*nd).flag == 1, (*cx).arena, &out)
+        return out
+    }
+    if k == ax.N_FUNC {
+        return try eval_func(cx, nd)
+    }
+    if k == ax.N_IN_SELECT || k == ax.N_EXISTS || k == ax.N_SUBQ {
+        return try eval_subquery(cx, nd)
+    }
+    return dberr.fail(DbError::Sql, "unsupported expression")
+}
+
+// Sub-selects: filled in by exec.fi through a function address stored in
+// `Ctx.subq` (the SELECT executor lives in a module that imports this one).
+// The function takes (ctx, node, out Val) and answers 0 or an error number.
+fn eval_subquery(cx: *mut Ctx, nd: *mut ax.Node) -> DbError!rc.Val {
+    if (*cx).subq == 0 {
+        return dberr.fail(DbError::Unsupported, "sub-select in this position")
+    }
+    let f: fn(u64, u64, u64) -> i64 = (*cx).subq as fn(u64, u64, u64) -> i64
+    var out: rc.Val = rc.val_null()
+    let r: i64 = f(cx as u64, nd as u64, (&out) as u64)
+    if r != 0 {
+        return dberr.from_code(r)
+    }
+    return out
+}
+
+// -------------------------------------------------------------- scalar functions
+fn push_arena_text(cx: *mut Ctx, b: *mut rt.Buf) -> rc.Val {
+    let p: u64 = ar.arena_copy((*cx).arena, rt.buf_ptr(b), rt.buf_len(b))
+    return rc.val_text(p, rt.buf_len(b))
+}
+
+// number of characters of a UTF-8 text (up to the first NUL)
+fn utf8_len(p: u64, n: usize) -> usize {
+    var i: usize = 0
+    var cnt: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 0 as u8 {
+            break
+        }
+        if (c & 192 as u8) != 128 as u8 {
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// byte offset of the char with this index (chars counted from 0)
+fn utf8_off(p: u64, n: usize, ch: usize) -> usize {
+    var i: usize = 0
+    var cnt: usize = 0
+    while i < n {
+        if (rt.ld8(p, i) & 192 as u8) != 128 as u8 {
+            if cnt == ch {
+                return i
+            }
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn hex_digit(d: u64) -> u8 {
+    if d < 10 {
+        return (48 + d) as u8
+    }
+    return (55 + d) as u8
+}
+
+fn trim_func(cx: *mut Ctx, f: u32, args: *mut rc.Val, argc: usize) -> rc.Val {
+    if (*args).t == 0 {
+        return rc.val_null()
+    }
+    var t0: rc.Val = rc.val_null()
+    vl.val_to_text(args, (*cx).arena, &t0)
+    var cp: u64 = 0
+    var cn: usize = 0
+    var have_set: bool = false
+    var t1: rc.Val = rc.val_null()
+    if argc == 2 {
+        if (*(args + 1)).t == 0 {
+            return rc.val_null()
+        }
+        vl.val_to_text(args + 1, (*cx).arena, &t1)
+        cp = t1.p
+        cn = t1.n
+        have_set = true
+    }
+    var s: usize = 0
+    var e: usize = t0.n
+    if f == F_TRIM || f == F_LTRIM {
+        while s < e {
+            if trim_in_set(rt.ld8(t0.p, s), cp, cn, have_set) {
+                s = s + 1
+            } else {
+                break
+            }
+        }
+    }
+    if f == F_TRIM || f == F_RTRIM {
+        while e > s {
+            if trim_in_set(rt.ld8(t0.p, e - 1), cp, cn, have_set) {
+                e = e - 1
+            } else {
+                break
+            }
+        }
+    }
+    return rc.val_text(t0.p + (s as u64), e - s)
+}
+
+fn trim_in_set(c: u8, cp: u64, cn: usize, have: bool) -> bool {
+    if !have {
+        return c == 32 as u8
+    }
+    var i: usize = 0
+    while i < cn {
+        if rt.ld8(cp, i) == c {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn round_half_away(x: f64) -> f64 {
+    if x >= 0.0 {
+        return math.floor(x + 0.5)
+    }
+    return 0.0 - math.floor(0.0 - x + 0.5)
+}
+
+fn call_scalar_for_test() -> i32 {
+    return 0
+}
+
+fn eval_func(cx: *mut Ctx, nd: *mut ax.Node) -> DbError!rc.Val {
+    let f: u32 = (*nd).op
+    if is_aggregate_id(f) {
+        // the result of the aggregate in the current group
+        if (*cx).agg == 0 {
+            return dberr.fail(DbError::Sql, "misuse of aggregate function")
+        }
+        return *(((*cx).agg as *mut rc.Val) + ((*nd).d as usize))
+    }
+    // lazy functions
+    if f == F_COALESCE || f == F_IFNULL {
+        var a: i32 = (*nd).a
+        while a >= 0 {
+            let v: rc.Val = try eval(cx, a)
+            if v.t != 0 {
+                return v
+            }
+            a = (*ax.ast_n((*cx).ast, a)).next
+        }
+        return rc.val_null()
+    }
+    if f == F_IIF {
+        let a0: i32 = (*nd).a
+        let a1: i32 = (*ax.ast_n((*cx).ast, a0)).next
+        let a2: i32 = (*ax.ast_n((*cx).ast, a1)).next
+        let t: i64 = try eval_truth(cx, a0)
+        if t == 1 {
+            return try eval(cx, a1)
+        }
+        return try eval(cx, a2)
+    }
+    var args: [rc.Val; 16] = [rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(),
+        rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(),
+        rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null()]
+    var argc: usize = 0
+    var a: i32 = (*nd).a
+    while a >= 0 {
+        if argc >= MAX_ARGS {
+            return dberr.fail(DbError::TooBig, "too many arguments to a function")
+        }
+        args[argc] = try eval(cx, a)
+        argc = argc + 1
+        a = (*ax.ast_n((*cx).ast, a)).next
+    }
+    let ar0: *mut rc.Val = &args[0]
+    let cxa: *mut ar.Arena = (*cx).arena
+    if f == F_ABS {
+        if args[0].t == 0 {
+            return rc.val_null()
+        }
+        if args[0].t == 1 {
+            if args[0].i == vl.int_min() {
+                return dberr.fail(DbError::Sql, "integer overflow")
+            }
+            if args[0].i < 0 {
+                return rc.val_int(0 - args[0].i)
+            }
+            return args[0]
+        }
+        let x: f64 = vl.val_to_real(ar0)
+        if x < 0.0 {
+            return rc.val_real(0.0 - x)
+        }
+        return rc.val_real(x)
+    }
+    if f == F_NULLIF {
+        if args[0].t == 0 || args[1].t == 0 {
+            return args[0]
+        }
+        var c: i64 = 0
+        compare_aff(cx, &args[0], -1, &args[1], -1, 0, &c)
+        if c == 0 {
+            return rc.val_null()
+        }
+        return args[0]
+    }
+    if f == F_LENGTH {
+        if args[0].t == 0 {
+            return rc.val_null()
+        }
+        if args[0].t == 4 {
+            return rc.val_int(args[0].n as i64)
+        }
+        var t: rc.Val = rc.val_null()
+        vl.val_to_text(ar0, cxa, &t)
+        return rc.val_int(utf8_len(t.p, t.n) as i64)
+    }
+    if f == F_LOWER || f == F_UPPER {
+        if args[0].t == 0 {
+            return rc.val_null()
+        }
+        var t: rc.Val = rc.val_null()
+        vl.val_to_text(ar0, cxa, &t)
+        let d: u64 = ar.arena_alloc(cxa, t.n + 1)
+        var i: usize = 0
+        while i < t.n {
+            var c: u8 = rt.ld8(t.p, i)
+            if f == F_LOWER {
+                if c >= 65 as u8 && c <= 90 as u8 {
+                    c = c + 32 as u8
+                }
+            } else {
+                if c >= 97 as u8 && c <= 122 as u8 {
+                    c = c - 32 as u8
+                }
+            }
+            rt.st8(d, i, c)
+            i = i + 1
+        }
+        return rc.val_text(d, t.n)
+    }
+    if f == F_TYPEOF {
+        var s: str = "null"
+        if args[0].t == 1 {
+            s = "integer"
+        } else if args[0].t == 2 {
+            s = "real"
+        } else if args[0].t == 3 {
+            s = "text"
+        } else if args[0].t == 4 {
+            s = "blob"
+        }
+        return rc.val_text(s.p as u64, s.length())
+    }
+    if f == F_SUBSTR {
+        if args[0].t == 0 || args[1].t == 0 {
+            return rc.val_null()
+        }
+        var isblob: bool = args[0].t == 4
+        var t: rc.Val = args[0]
+        if !isblob {
+            vl.val_to_text(ar0, cxa, &t)
+        }
+        var p1: i64 = vl.val_to_int(&args[1])
+        var p2: i64 = 1000000000
+        var negp2: bool = false
+        if argc == 3 {
+            if args[2].t == 0 {
+                return rc.val_null()
+            }
+            p2 = vl.val_to_int(&args[2])
+            if p2 < 0 {
+                p2 = 0 - p2
+                negp2 = true
+            }
+        }
+        var len: i64 = 0
+        if isblob {
+            len = t.n as i64
+        } else {
+            len = utf8_len(t.p, t.n) as i64
+        }
+        if p1 < 0 {
+            p1 = p1 + len
+            if p1 < 0 {
+                p2 = p2 + p1
+                if p2 < 0 {
+                    p2 = 0
+                }
+                p1 = 0
+            }
+        } else if p1 > 0 {
+            p1 = p1 - 1
+        } else if p2 > 0 {
+            p2 = p2 - 1
+        }
+        if negp2 {
+            p1 = p1 - p2
+            if p1 < 0 {
+                p2 = p2 + p1
+                p1 = 0
+            }
+        }
+        if p1 + p2 > len || p1 + p2 < p1 {
+            p2 = len - p1
+            if p2 < 0 {
+                p2 = 0
+            }
+        }
+        if isblob {
+            return rc.val_blob(t.p + (p1 as u64), p2 as usize)
+        }
+        let so: usize = utf8_off(t.p, t.n, p1 as usize)
+        let eo: usize = utf8_off(t.p, t.n, (p1 + p2) as usize)
+        return rc.val_text(t.p + (so as u64), eo - so)
+    }
+    if f == F_INSTR {
+        if args[0].t == 0 || args[1].t == 0 {
+            return rc.val_null()
+        }
+        var hay: rc.Val = args[0]
+        var nee: rc.Val = args[1]
+        var blob: bool = hay.t == 4 && nee.t == 4
+        if !blob {
+            vl.val_to_text(&args[0], cxa, &hay)
+            vl.val_to_text(&args[1], cxa, &nee)
+        }
+        if nee.n == 0 {
+            return rc.val_int(1)
+        }
+        var i: usize = 0
+        while i + nee.n <= hay.n {
+            if ut.bytes_equal(hay.p + (i as u64), nee.p, nee.n) {
+                if blob {
+                    return rc.val_int((i + 1) as i64)
+                }
+                return rc.val_int((utf8_len(hay.p, i) + 1) as i64)
+            }
+            i = i + 1
+        }
+        return rc.val_int(0)
+    }
+    if f == F_REPLACE {
+        if args[0].t == 0 || args[1].t == 0 || args[2].t == 0 {
+            return rc.val_null()
+        }
+        var x: rc.Val = rc.val_null()
+        var y: rc.Val = rc.val_null()
+        var z: rc.Val = rc.val_null()
+        vl.val_to_text(&args[0], cxa, &x)
+        vl.val_to_text(&args[1], cxa, &y)
+        vl.val_to_text(&args[2], cxa, &z)
+        if y.n == 0 {
+            return x
+        }
+        var b: rt.Buf = rt.buf_new()
+        var i: usize = 0
+        while i < x.n {
+            if i + y.n <= x.n && ut.bytes_equal(x.p + (i as u64), y.p, y.n) {
+                rt.buf_push_bytes(&b, z.p, z.n)
+                i = i + y.n
+            } else {
+                rt.buf_push(&b, rt.ld8(x.p, i))
+                i = i + 1
+            }
+        }
+        let r: rc.Val = push_arena_text(cx, &b)
+        rt.buf_free(&b)
+        return r
+    }
+    if f == F_TRIM || f == F_LTRIM || f == F_RTRIM {
+        return trim_func(cx, f, ar0, argc)
+    }
+    if f == F_HEX {
+        if args[0].t == 0 {
+            return rc.val_text("".p as u64, 0)
+        }
+        var t: rc.Val = args[0]
+        if t.t != 4 {
+            vl.val_to_text(ar0, cxa, &t)
+        }
+        let d: u64 = ar.arena_alloc(cxa, t.n * 2 + 1)
+        var i: usize = 0
+        while i < t.n {
+            let b: u64 = rt.ld8(t.p, i) as u64
+            rt.st8(d, 2 * i, hex_digit(b >> 4))
+            rt.st8(d, 2 * i + 1, hex_digit(b & 15))
+            i = i + 1
+        }
+        return rc.val_text(d, t.n * 2)
+    }
+    if f == F_UNHEX {
+        if args[0].t == 0 {
+            return rc.val_null()
+        }
+        var t: rc.Val = rc.val_null()
+        vl.val_to_text(ar0, cxa, &t)
+        if t.n % 2 != 0 {
+            return rc.val_null()
+        }
+        let d: u64 = ar.arena_alloc(cxa, t.n / 2 + 1)
+        var i: usize = 0
+        while i < t.n {
+            let h: i64 = hexv(rt.ld8(t.p, i))
+            let l: i64 = hexv(rt.ld8(t.p, i + 1))
+            if h < 0 || l < 0 {
+                return rc.val_null()
+            }
+            rt.st8(d, i / 2, ((h << 4) | l) as u8)
+            i = i + 2
+        }
+        return rc.val_blob(d, t.n / 2)
+    }
+    if f == F_QUOTE {
+        var b: rt.Buf = rt.buf_new()
+        if args[0].t == 0 {
+            ut.put_text(&b, "NULL")
+        } else if args[0].t == 1 || args[0].t == 2 {
+            vl.val_text_into(ar0, &b)
+        } else if args[0].t == 3 {
+            rt.buf_push(&b, 39 as u8)
+            var i: usize = 0
+            while i < args[0].n {
+                let c: u8 = rt.ld8(args[0].p, i)
+                rt.buf_push(&b, c)
+                if c == 39 as u8 {
+                    rt.buf_push(&b, 39 as u8)
+                }
+                i = i + 1
+            }
+            rt.buf_push(&b, 39 as u8)
+        } else {
+            ut.put_text(&b, "X'")
+            var i: usize = 0
+            while i < args[0].n {
+                let c: u64 = rt.ld8(args[0].p, i) as u64
+                rt.buf_push(&b, hex_digit(c >> 4))
+                rt.buf_push(&b, hex_digit(c & 15))
+                i = i + 1
+            }
+            rt.buf_push(&b, 39 as u8)
+        }
+        let r: rc.Val = push_arena_text(cx, &b)
+        rt.buf_free(&b)
+        return r
+    }
+    if f == F_RANDOM {
+        var r: [u8; 8] = [0; 8]
+        os.os_random((&r[0]) as u64, 8)
+        return rc.val_int(ut.rd64((&r[0]) as u64, 0) as i64)
+    }
+    if f == F_RANDOMBLOB || f == F_ZEROBLOB {
+        if args[0].t == 0 {
+            return rc.val_null()
+        }
+        var n: i64 = vl.val_to_int(ar0)
+        if n < 1 {
+            n = 0
+        }
+        if n > 1000000000 {
+            return dberr.fail(DbError::TooBig, "string or blob too big")
+        }
+        let d: u64 = ar.arena_alloc(cxa, (n as usize) + 1)
+        if f == F_RANDOMBLOB {
+            os.os_random(d, n as usize)
+        } else {
+            ut.zero_bytes(d, n as usize)
+        }
+        return rc.val_blob(d, n as usize)
+    }
+    if f == F_ROUND {
+        if args[0].t == 0 {
+            return rc.val_null()
+        }
+        var digits: i64 = 0
+        if argc == 2 {
+            if args[1].t == 0 {
+                return rc.val_null()
+            }
+            digits = vl.val_to_int(&args[1])
+            if digits < 0 {
+                digits = 0
+            }
+            if digits > 30 {
+                digits = 30
+            }
+        }
+        let x: f64 = vl.val_to_real(ar0)
+        if digits == 0 {
+            return rc.val_real(round_half_away(x))
+        }
+        var m: f64 = 1.0
+        var rounder: f64 = 0.5
+        var i: i64 = 0
+        while i < digits {
+            m = m * 10.0
+            rounder = rounder * 0.1
+            i = i + 1
+        }
+        if x > 1.0e15 || x < -1.0e15 {
+            return rc.val_real(x)
+        }
+        return rc.val_real(vl.round_decimal(x, digits))
+    }
+    if f == F_MIN_S || f == F_MAX_S {
+        var best: rc.Val = args[0]
+        var i: usize = 0
+        while i < argc {
+            if args[i].t == 0 {
+                return rc.val_null()
+            }
+            if i > 0 {
+                let c: i64 = vl.sql_compare(&args[i], &best, 0)
+                if (f == F_MIN_S && c <= 0) || (f == F_MAX_S && c > 0) {
+                    best = args[i]
+                }
+            }
+            i = i + 1
+        }
+        return best
+    }
+    if f == F_LIKE || f == F_GLOB {
+        // like(pattern, text [, escape])
+        if args[0].t == 0 || args[1].t == 0 {
+            return rc.val_null()
+        }
+        var pt: rc.Val = rc.val_null()
+        var tx: rc.Val = rc.val_null()
+        vl.val_to_text(&args[0], cxa, &pt)
+        vl.val_to_text(&args[1], cxa, &tx)
+        var esc: i64 = -1
+        if argc == 3 && args[2].t != 0 {
+            var et: rc.Val = rc.val_null()
+            vl.val_to_text(&args[2], cxa, &et)
+            if et.n != 1 {
+                return dberr.fail(DbError::Sql, "ESCAPE expression must be a single character")
+            }
+            esc = rt.ld8(et.p, 0) as i64
+        }
+        if f == F_GLOB {
+            return bool_val(vl.glob_match(pt.p, pt.n, tx.p, tx.n))
+        }
+        return bool_val(vl.like_match(pt.p, pt.n, tx.p, tx.n, esc))
+    }
+    if f == F_CHAR {
+        var b: rt.Buf = rt.buf_new()
+        var i: usize = 0
+        while i < argc {
+            var cp: i64 = vl.val_to_int(&args[i])
+            if cp < 0 || cp > 1114111 {
+                cp = 65533
+            }
+            utf8_push(&b, cp as u64)
+            i = i + 1
+        }
+        let r: rc.Val = push_arena_text(cx, &b)
+        rt.buf_free(&b)
+        return r
+    }
+    if f == F_UNICODE {
+        if args[0].t == 0 {
+            return rc.val_null()
+        }
+        var t: rc.Val = rc.val_null()
+        vl.val_to_text(ar0, cxa, &t)
+        if t.n == 0 {
+            return rc.val_null()
+        }
+        return rc.val_int(utf8_decode(t.p, t.n) as i64)
+    }
+    if f == F_LAST_INSERT_ROWID {
+        return rc.val_int((*(*cx).db).last_rowid)
+    }
+    if f == F_CHANGES {
+        return rc.val_int((*(*cx).db).changes)
+    }
+    if f == F_TOTAL_CHANGES {
+        return rc.val_int((*(*cx).db).total_changes)
+    }
+    if f == F_VERSION {
+        return rc.val_text("3.45.0".p as u64, 6)
+    }
+    if f == F_PRINTF {
+        return try printf_func(cx, &args[0], argc)
+    }
+    if f >= F_UNIXEPOCH && f <= F_STRFTIME {
+        var kind: u32 = dtm.DT_UNIXEPOCH
+        if f == F_DATE {
+            kind = dtm.DT_DATE
+        } else if f == F_TIME {
+            kind = dtm.DT_TIME
+        } else if f == F_DATETIME {
+            kind = dtm.DT_DATETIME
+        } else if f == F_JULIANDAY {
+            kind = dtm.DT_JULIAN
+        } else if f == F_STRFTIME {
+            kind = dtm.DT_STRFTIME
+        }
+        var res: rc.Val = rc.val_null()
+        if dtm.date_func((*cx).db, kind, ar0, argc, cxa, &res) {
+            return res
+        }
+        return rc.val_null()
+    }
+    return dberr.fail(DbError::Sql, "unknown function")
+}
+
+fn hexv(c: u8) -> i64 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c as i64) - 48
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return (c as i64) - 87
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return (c as i64) - 55
+    }
+    return -1
+}
+
+fn utf8_push(b: *mut rt.Buf, cp: u64) {
+    if cp < 128 {
+        rt.buf_push(b, cp as u8)
+    } else if cp < 2048 {
+        rt.buf_push(b, (192 | (cp >> 6)) as u8)
+        rt.buf_push(b, (128 | (cp & 63)) as u8)
+    } else if cp < 65536 {
+        rt.buf_push(b, (224 | (cp >> 12)) as u8)
+        rt.buf_push(b, (128 | ((cp >> 6) & 63)) as u8)
+        rt.buf_push(b, (128 | (cp & 63)) as u8)
+    } else {
+        rt.buf_push(b, (240 | (cp >> 18)) as u8)
+        rt.buf_push(b, (128 | ((cp >> 12) & 63)) as u8)
+        rt.buf_push(b, (128 | ((cp >> 6) & 63)) as u8)
+        rt.buf_push(b, (128 | (cp & 63)) as u8)
+    }
+}
+
+fn utf8_decode(p: u64, n: usize) -> u64 {
+    let c: u64 = rt.ld8(p, 0) as u64
+    if c < 128 || n < 2 {
+        return c
+    }
+    if c >= 240 && n >= 4 {
+        return ((c & 7) << 18) | ((rt.ld8(p, 1) as u64 & 63) << 12) | ((rt.ld8(p, 2) as u64 & 63) << 6)
+            | (rt.ld8(p, 3) as u64 & 63)
+    }
+    if c >= 224 && n >= 3 {
+        return ((c & 15) << 12) | ((rt.ld8(p, 1) as u64 & 63) << 6) | (rt.ld8(p, 2) as u64 & 63)
+    }
+    return ((c & 31) << 6) | (rt.ld8(p, 1) as u64 & 63)
+}
+
+// printf("%d %s %f %x %c %%", ...) -- the common conversions, with width and precision
+fn printf_func(cx: *mut Ctx, args: *mut rc.Val, argc: usize) -> DbError!rc.Val {
+    var fmt: rc.Val = rc.val_null()
+    if (*args).t == 0 {
+        return rc.val_null()
+    }
+    vl.val_to_text(args, (*cx).arena, &fmt)
+    var b: rt.Buf = rt.buf_new()
+    var ai: usize = 1
+    var i: usize = 0
+    while i < fmt.n {
+        let c: u8 = rt.ld8(fmt.p, i)
+        if c != 37 as u8 {
+            rt.buf_push(&b, c)
+            i = i + 1
+            continue
+        }
+        i = i + 1
+        if i >= fmt.n {
+            break
+        }
+        // flags, width, precision
+        var left: bool = false
+        var zero: bool = false
+        var plus: bool = false
+        while i < fmt.n {
+            let fc: u8 = rt.ld8(fmt.p, i)
+            if fc == 45 as u8 {
+                left = true
+            } else if fc == 48 as u8 {
+                zero = true
+            } else if fc == 43 as u8 {
+                plus = true
+            } else if fc == 32 as u8 {
+            } else {
+                break
+            }
+            i = i + 1
+        }
+        var width: usize = 0
+        while i < fmt.n && rt.ld8(fmt.p, i) >= 48 as u8 && rt.ld8(fmt.p, i) <= 57 as u8 {
+            width = width * 10 + ((rt.ld8(fmt.p, i) as usize) - 48)
+            i = i + 1
+        }
+        var prec: i64 = -1
+        if i < fmt.n && rt.ld8(fmt.p, i) == 46 as u8 {
+            i = i + 1
+            prec = 0
+            while i < fmt.n && rt.ld8(fmt.p, i) >= 48 as u8 && rt.ld8(fmt.p, i) <= 57 as u8 {
+                prec = prec * 10 + ((rt.ld8(fmt.p, i) as i64) - 48)
+                i = i + 1
+            }
+        }
+        if i >= fmt.n {
+            break
+        }
+        let conv: u8 = rt.ld8(fmt.p, i)
+        i = i + 1
+        if conv == 37 as u8 {
+            rt.buf_push(&b, 37 as u8)
+            continue
+        }
+        var piece: rt.Buf = rt.buf_new()
+        var a: rc.Val = rc.val_null()
+        if ai < argc {
+            a = *(args + ai)
+        }
+        ai = ai + 1
+        if conv == 100 as u8 || conv == 105 as u8 {
+            let v: i64 = vl.val_to_int(&a)
+            if v >= 0 && plus {
+                rt.buf_push(&piece, 43 as u8)
+            }
+            rt.buf_push_dec_i64(&piece, v)
+        } else if conv == 115 as u8 {
+            var t: rc.Val = rc.val_null()
+            if a.t != 0 {
+                vl.val_to_text(&a, (*cx).arena, &t)
+            }
+            var n: usize = t.n
+            if prec >= 0 && (prec as usize) < n {
+                n = prec as usize
+            }
+            if t.t == 3 {
+                rt.buf_push_bytes(&piece, t.p, n)
+            }
+        } else if conv == 102 as u8 {
+            var p: i64 = prec
+            if p < 0 {
+                p = 6
+            }
+            fmt_fixed(&piece, vl.val_to_real(&a), p)
+        } else if conv == 120 as u8 || conv == 88 as u8 {
+            let v: u64 = vl.val_to_int(&a) as u64
+            rt.buf_push_hex_u64(&piece, v, 1)
+        } else if conv == 99 as u8 {
+            var t: rc.Val = rc.val_null()
+            vl.val_to_text(&a, (*cx).arena, &t)
+            if t.n > 0 {
+                rt.buf_push(&piece, rt.ld8(t.p, 0))
+            }
+        } else {
+            rt.buf_free(&piece)
+            rt.buf_free(&b)
+            return dberr.fail(DbError::Unsupported, "printf: this conversion is not supported")
+        }
+        let len: usize = rt.buf_len(&piece)
+        if len < width && !left {
+            var pad: usize = width - len
+            while pad > 0 {
+                if zero {
+                    rt.buf_push(&b, 48 as u8)
+                } else {
+                    rt.buf_push(&b, 32 as u8)
+                }
+                pad = pad - 1
+            }
+        }
+        rt.buf_push_bytes(&b, rt.buf_ptr(&piece), len)
+        if len < width && left {
+            var pad2: usize = width - len
+            while pad2 > 0 {
+                rt.buf_push(&b, 32 as u8)
+                pad2 = pad2 - 1
+            }
+        }
+        rt.buf_free(&piece)
+    }
+    let r: rc.Val = push_arena_text(cx, &b)
+    rt.buf_free(&b)
+    return r
+}
+
+// x with p digits after the point (round half away from zero on the decimal)
+fn fmt_fixed(b: *mut rt.Buf, x: f64, p: i64) {
+    var v: f64 = x
+    if v < 0.0 {
+        rt.buf_push(b, 45 as u8)
+        v = 0.0 - v
+    }
+    var m: f64 = 1.0
+    var i: i64 = 0
+    while i < p {
+        m = m * 10.0
+        i = i + 1
+    }
+    var scaled: f64 = round_half_away(v * m)
+    if scaled >= 9.0e18 {
+        vl.fmt_real(b, x)
+        return
+    }
+    let whole: u64 = scaled as u64
+    let mm: u64 = m as u64
+    rt.buf_push_dec_u64(b, whole / mm)
+    if p > 0 {
+        rt.buf_push(b, 46 as u8)
+        var frac: u64 = whole % mm
+        var digits: i64 = p
+        var div: u64 = mm / 10
+        while digits > 0 {
+            rt.buf_push(b, (48 + frac / div) as u8)
+            frac = frac % div
+            if div > 1 {
+                div = div / 10
+            }
+            digits = digits - 1
+        }
+    }
+}

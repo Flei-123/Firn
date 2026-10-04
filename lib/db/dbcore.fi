@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/dbcore.fi -- the shared structures of the SQL layer: the schema
+// (tables, columns, indexes as read from sqlite_master), the connection (`Db`)
+// and the prepared statement (`Stmt`).
+
+import std.rt
+import std.vec
+import db.dberr
+import db.util as ut
+import db.record as rc
+import db.arena as ar
+import db.pager as pgr
+import db.btree as bx
+import db.sqlast as ax
+
+export {
+    Column, Table, Index, Schema, Db, Stmt, schema_new, schema_free, schema_clear,
+    find_table, find_index, find_column, name_eq, db_new, sz_of_db, sz_of_stmt,
+    table_at, index_at, schema_table_count, schema_index_count,
+    sz_of_column, schema_add_table, schema_add_index, MAX_SRC, MAX_ICOLS, CF_PK, CF_NOTNULL, CF_UNIQUE, CF_AUTOINC, CF_DESC, CF_ROWID,
+    ST_FRESH, ST_RUNNING, ST_DONE,
+}
+
+const MAX_SRC: usize = 8
+const MAX_ICOLS: usize = 32
+
+const CF_PK: u32 = 1
+const CF_NOTNULL: u32 = 2
+const CF_UNIQUE: u32 = 4
+const CF_AUTOINC: u32 = 8
+const CF_DESC: u32 = 16
+const CF_ROWID: u32 = 32
+
+struct Column {
+    name_p: u64,
+    name_n: usize,
+    type_p: u64,
+    type_n: usize,
+    aff: i64,
+    flags: u32,
+    coll: u32,
+    dflt: i32, // node of the DEFAULT expression in the schema tree, or -1
+    checks: i32, // chain of CHECK expression nodes
+}
+
+struct Table {
+    name_p: u64,
+    name_n: usize,
+    root: u32,
+    ncols: usize,
+    cols: u64, // address of ncols Columns (schema arena)
+    rowid_col: i32, // the INTEGER PRIMARY KEY column, -1 if none
+    autoinc: bool,
+    bad: bool, // could not be understood (see msg)
+    msg_p: u64,
+    msg_n: usize,
+    sql_p: u64,
+    sql_n: usize,
+    tchecks: i32, // chain of table-level CHECK nodes
+    // the unique constraints in order: PRIMARY KEY (non-rowid) and UNIQUE, as column lists
+    nuniq: usize,
+    uniq_cols: [i32; 64], // 8 constraints x 8 columns, -1 terminated
+    ast_root: i32,
+    mrowid: i64, // the rowid of its row in sqlite_master
+}
+
+struct Index {
+    name_p: u64,
+    name_n: usize,
+    table: i32,
+    root: u32,
+    ncols: usize,
+    cols: [i32; 32], // column numbers of the table
+    desc: u64,
+    unique: bool,
+    auto: bool, // made for a UNIQUE / PRIMARY KEY constraint
+    bad: bool, // an index this library cannot maintain (collation, expression, partial)
+    msg_p: u64,
+    msg_n: usize,
+    mrowid: i64,
+    sql_p: u64,
+    sql_n: usize,
+}
+
+struct Schema {
+    tables: Vec[Table],
+    indexes: Vec[Index],
+    arena: ar.Arena,
+    ast: ax.Ast,
+    cookie: u32,
+    loaded: bool,
+    has_triggers: bool,
+    has_views: bool,
+}
+
+struct Db {
+    pg: pgr.Pager,
+    bt: bx.Bt,
+    schema: Schema,
+    is_open: bool,
+    readonly: bool,
+    in_txn: bool, // an explicit transaction (BEGIN) is open
+    txn_write: bool,
+    readers: i32, // statements that are in the middle of a SELECT
+    last_rowid: i64,
+    changes: i64,
+    total_changes: i64,
+    temp: ar.Arena, // statement scratch, reset by the statement
+    schema_gen: u64, // incremented whenever the schema was (re)read
+    max_sql: usize,
+    cookie_seen: u32,
+    now_ms: i64, // the clock at the start of the running statement (date functions)
+}
+
+const ST_FRESH: i32 = 0
+const ST_RUNNING: i32 = 1
+const ST_DONE: i32 = 2
+
+struct Stmt {
+    db: *mut Db,
+    sql: rt.Buf,
+    ast: ax.Ast,
+    root: i32,
+    kind: u32,
+    nparams: i32,
+    params: rt.Buf, // nparams Vals
+    parena: ar.Arena, // copies of bound text/blob
+    state: i32,
+    gen: u64, // schema generation the plan was made for
+    it: u64, // the running SELECT (address of its iterator), 0 if none
+    ncols: usize,
+    out: u64, // address of the current row's Vals
+    out_arena: ar.Arena,
+    changes: i64,
+    started_read: bool,
+    pos: usize, // offset of the next statement in the text (for exec)
+    subs: rt.Buf, // addresses of the sub-select iterators of this statement
+    sub_arena: ar.Arena, // values cached from uncorrelated sub-selects
+    plan: u64, // the compiled plan of a DML statement (address)
+}
+
+fn sz_of_db() -> usize {
+    return core_sz_of[Db]()
+}
+
+fn sz_of_stmt() -> usize {
+    return core_sz_of[Stmt]()
+}
+
+fn core_sz_of[T: Any]() -> usize {
+    return size_of[T]()
+}
+
+fn schema_new() -> Schema {
+    return Schema { tables: vec_new[Table](), indexes: vec_new[Index](), arena: ar.arena_new(),
+        ast: ax.ast_new(), cookie: 0, loaded: false, has_triggers: false, has_views: false }
+}
+
+// forgets all tables and indexes (the arena and the tree are reset)
+fn schema_clear(s: *mut Schema) {
+    vec_clear[Table](&(*s).tables)
+    vec_clear[Index](&(*s).indexes)
+    ar.arena_reset(&(*s).arena)
+    ax.ast_clear(&(*s).ast)
+    (*s).loaded = false
+    (*s).has_triggers = false
+    (*s).has_views = false
+}
+
+fn schema_free(s: *mut Schema) {
+    vec_free[Table](&(*s).tables)
+    vec_free[Index](&(*s).indexes)
+    ar.arena_free(&(*s).arena)
+    ax.ast_free(&(*s).ast)
+    (*s).loaded = false
+}
+
+fn schema_table_count(s: *mut Schema) -> usize {
+    return vec_len[Table](&(*s).tables)
+}
+
+fn schema_index_count(s: *mut Schema) -> usize {
+    return vec_len[Index](&(*s).indexes)
+}
+
+fn table_at(s: *mut Schema, i: usize) -> *mut Table {
+    return vec_elem_ptr[Table](&(*s).tables, i)
+}
+
+fn index_at(s: *mut Schema, i: usize) -> *mut Index {
+    return vec_elem_ptr[Index](&(*s).indexes, i)
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+// SQL names compare without regard to ASCII case
+fn name_eq(p1: u64, n1: usize, p2: u64, n2: usize) -> bool {
+    if n1 != n2 {
+        return false
+    }
+    var i: usize = 0
+    while i < n1 {
+        if lower(rt.ld8(p1, i)) != lower(rt.ld8(p2, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// index of the table or -1
+fn find_table(s: *mut Schema, p: u64, n: usize) -> i64 {
+    let cnt: usize = vec_len[Table](&(*s).tables)
+    var i: usize = 0
+    while i < cnt {
+        let t: *mut Table = vec_elem_ptr[Table](&(*s).tables, i)
+        if name_eq((*t).name_p, (*t).name_n, p, n) {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn find_index(s: *mut Schema, p: u64, n: usize) -> i64 {
+    let cnt: usize = vec_len[Index](&(*s).indexes)
+    var i: usize = 0
+    while i < cnt {
+        let x: *mut Index = vec_elem_ptr[Index](&(*s).indexes, i)
+        if name_eq((*x).name_p, (*x).name_n, p, n) {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// column number of a name in a table; -1 if none; -2 for rowid / oid / _rowid_
+fn find_column(t: *mut Table, p: u64, n: usize) -> i64 {
+    var i: usize = 0
+    while i < (*t).ncols {
+        let c: *mut Column = ((*t).cols as *mut Column) + i
+        if name_eq((*c).name_p, (*c).name_n, p, n) {
+            return i as i64
+        }
+        i = i + 1
+    }
+    if name_eq(p, n, "rowid".p as u64, 5) || name_eq(p, n, "oid".p as u64, 3) || name_eq(p, n, "_rowid_".p as u64, 7) {
+        return -2
+    }
+    return -1
+}
+
+fn db_new() -> Db {
+    return Db { pg: pgr.pager_new(), bt: bx.bt_new(0 as *mut pgr.Pager), schema: schema_new(), is_open: false,
+        readonly: false, in_txn: false, txn_write: false, readers: 0, last_rowid: 0, changes: 0,
+        total_changes: 0, temp: ar.arena_new(), schema_gen: 0, max_sql: 1000000, cookie_seen: 0, now_ms: 0 }
+}
+
+fn sz_of_column() -> usize {
+    return core_sz_of[Column]()
+}
+
+fn schema_add_table(s: *mut Schema, t: *mut Table) {
+    vec_push[Table](&(*s).tables, *t)
+}
+
+fn schema_add_index(s: *mut Schema, x: *mut Index) {
+    vec_push[Index](&(*s).indexes, *x)
+}

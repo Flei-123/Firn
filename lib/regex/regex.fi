@@ -57,6 +57,7 @@ export {
     regex_compile, regex_free, regex_find, regex_is_match, regex_replace_all,
     regex_group_count, regex_group_index, regex_error_offset,
     match_new, match_group, match_group_text,
+    Matcher, matcher_new, matcher_free, matcher_find,
 }
 
 error RegexError {
@@ -1092,38 +1093,85 @@ fn match_new() -> Match {
     return Match { start: -1, end: -1, caps: [-1 as i64; 64] }
 }
 
+// A MATCHER is the machine of one regex with its work areas allocated once, for
+// scanning a text with many `matcher_find` calls (a tokenizer, a find-all loop).
+// `regex_find` below builds one, asks once and frees it; the allocations of a
+// machine (nine vectors, mmap'd one by one in this runtime) cost far more than
+// the scan of a short stretch of text, which is what made a tokenizer slow
+// (0.4 ms per token). The marks keep their generation numbers from one find to
+// the next, so nothing has to be cleared between two finds. The regex must stay
+// where it is while the matcher lives.
+struct Matcher {
+    r: u64, // *mut Regex
+    vm: Vm,
+    la: Threads,
+    lb: Threads,
+}
+
+fn matcher_new(r: *mut Regex) -> Matcher {
+    let size: usize = vec_len[Inst](&(*r).prog)
+    let ncap: usize = (*r).ngroups as usize * 2
+    var mt: Matcher = Matcher { r: r as u64,
+        vm: Vm { r: r as u64, p: 0, n: 0, ncap: ncap, gen: 1, cur: vec_new[i64](), stack: vec_new[u64](),
+            saved: vec_new[i64]() },
+        la: threads_new(size), lb: threads_new(size) }
+    var k: usize = 0
+    while k < ncap {
+        vec_push[i64](&mt.vm.cur, -1)
+        k = k + 1
+    }
+    return mt
+}
+
+fn matcher_free(mt: *mut Matcher) {
+    threads_free(&(*mt).la)
+    threads_free(&(*mt).lb)
+    vec_free[i64](&(*mt).vm.cur)
+    vec_free[u64](&(*mt).vm.stack)
+    vec_free[i64](&(*mt).vm.saved)
+}
+
 // The leftmost-first match starting at octet `from` or later. true = found
 // (m.start, m.end and the groups set).
-fn regex_find(r: *mut Regex, s: str, from: usize, m: *mut Match) -> bool {
+fn matcher_find(mt: *mut Matcher, s: str, from: usize, m: *mut Match) -> bool {
     if from > s.n {
         return false
     }
-    let size: usize = vec_len[Inst](&(*r).prog)
+    let r: *mut Regex = (*mt).r as *mut Regex
     let ncap: usize = (*r).ngroups as usize * 2
-    var vm: Vm = Vm { r: r as u64, p: s.p as u64, n: s.n, ncap: ncap, gen: 0, cur: vec_new[i64](),
-        stack: vec_new[u64](), saved: vec_new[i64]() }
+    let vm: *mut Vm = &(*mt).vm
+    (*vm).p = s.p as u64
+    (*vm).n = s.n
     var k: usize = 0
-    while k < ncap {
-        vec_push[i64](&vm.cur, -1)
-        k = k + 1
+    if (*vm).gen > 3000000000 as u32 {
+        // the generation numbers are about to wrap: clear the marks
+        k = 0
+        while k < vec_len[u32](&(*mt).la.mark) {
+            vec_set[u32](&(*mt).la.mark, k, 0 as u32)
+            vec_set[u32](&(*mt).lb.mark, k, 0 as u32)
+            k = k + 1
+        }
+        (*vm).gen = 1
     }
-    var la: Threads = threads_new(size)
-    var lb: Threads = threads_new(size)
-    var clist: *mut Threads = &la
-    var nlist: *mut Threads = &lb
+    vec_clear[u32](&(*mt).la.pcs)
+    vec_clear[i64](&(*mt).la.caps)
+    vec_clear[u32](&(*mt).lb.pcs)
+    vec_clear[i64](&(*mt).lb.caps)
+    var clist: *mut Threads = &(*mt).la
+    var nlist: *mut Threads = &(*mt).lb
     var found: bool = false
     var pos: usize = from
-    vm.gen = 1
+    (*vm).gen = (*vm).gen + 1
     while true {
         // a new thread at this position, lowest priority -- as long as
         // nothing has matched yet
         if !found {
             k = 0
             while k < ncap {
-                *vec_elem_ptr[i64](&vm.cur, k) = -1
+                *vec_elem_ptr[i64](&(*vm).cur, k) = -1
                 k = k + 1
             }
-            add_thread(&vm, clist, 0 as u32, pos)
+            add_thread(vm, clist, 0 as u32, pos)
         }
         var c: u32 = 0
         var len: usize = 0
@@ -1137,10 +1185,10 @@ fn regex_find(r: *mut Regex, s: str, from: usize, m: *mut Match) -> bool {
                 break
             }
             pos = pos + len
-            vm.gen = vm.gen + 1 // the marks of this position are spent
+            (*vm).gen = (*vm).gen + 1 // the marks of this position are spent
             continue
         }
-        vm.gen = vm.gen + 1
+        (*vm).gen = (*vm).gen + 1
         vec_clear[u32](&(*nlist).pcs)
         vec_clear[i64](&(*nlist).caps)
         var t: usize = 0
@@ -1161,10 +1209,10 @@ fn regex_find(r: *mut Regex, s: str, from: usize, m: *mut Match) -> bool {
                 if pos < s.n && step_matches(r, ins, c) {
                     k = 0
                     while k < ncap {
-                        *vec_elem_ptr[i64](&vm.cur, k) = *vec_elem_ptr[i64](&(*clist).caps, t * ncap + k)
+                        *vec_elem_ptr[i64](&(*vm).cur, k) = *vec_elem_ptr[i64](&(*clist).caps, t * ncap + k)
                         k = k + 1
                     }
-                    add_thread(&vm, nlist, tpc + 1, pos + len)
+                    add_thread(vm, nlist, tpc + 1, pos + len)
                 }
                 t = t + 1
             }
@@ -1184,11 +1232,7 @@ fn regex_find(r: *mut Regex, s: str, from: usize, m: *mut Match) -> bool {
             break
         }
     }
-    threads_free(&la)
-    threads_free(&lb)
-    vec_free[i64](&vm.cur)
-    vec_free[u64](&vm.stack)
-    vec_free[i64](&vm.saved)
+    (*vm).gen = (*vm).gen + 1
     if found {
         (*m).start = (*m).caps[0]
         (*m).end = (*m).caps[1]
@@ -1198,6 +1242,16 @@ fn regex_find(r: *mut Regex, s: str, from: usize, m: *mut Match) -> bool {
             k = k + 1
         }
     }
+    return found
+}
+
+fn regex_find(r: *mut Regex, s: str, from: usize, m: *mut Match) -> bool {
+    if from > s.n {
+        return false
+    }
+    var mt: Matcher = matcher_new(r)
+    let found: bool = matcher_find(&mt, s, from, m)
+    matcher_free(&mt)
     return found
 }
 

@@ -1,0 +1,490 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/highlight/highlight.fi -- SYNTAX HIGHLIGHTING: a tokenizer interface and the
+// rules for JSON, TOML, INI, Firn, shell, Markdown (and YAML and a C-like family:
+// JavaScript, Java, C, Rust, ...), driven by lib/regex.
+//
+//     import highlight.highlight
+//     var h: highlight.Highlighter = highlight.hl_new()
+//     let lang: u32 = highlight.hl_language("json")            // HL_NONE if unknown
+//     var spans: Vec[highlight.HlSpan] = vec_new[highlight.HlSpan]()
+//     highlight.hl_tokenize(&h, lang, text.p as u64, text.n, &spans)
+//     // spans cover the text from octet 0 to n, one after the other, each with a kind
+//
+// THE INTERFACE. `hl_tokenize` returns SPANS that tile the text exactly: sorted,
+// non-overlapping, no gaps (what the rules do not claim is `TK_PLAIN`), adjacent
+// spans of one kind merged. A caller (the Markdown view) walks them line by line.
+// `hl_kind_at(spans, pos)` finds the kind of an octet by binary search.
+//
+// THE RULES are data: one line per rule, `<kind letter><i or -> <regex>`, every
+// rule its own regex. The scan keeps for each rule its NEXT match at or after the
+// current position (found with `regex_find`, re-found only when the position has
+// passed it) and takes the rule whose match starts first, the earlier rule on a
+// tie -- the same result as lib/regex's leftmost-first alternation `(r1)|(r2)|..`,
+// so a comment or string rule listed before the keywords wins at one position.
+// Why not the alternation: lib/regex sets up its machine per call in time
+// proportional to the program, and the alternation of 20 rules is 1,500
+// instructions -- 0.4 ms per token measured; per rule it is a few microseconds.
+// Linear in the text either way (the engine is a Pike VM, no backtracking: no
+// pattern and no text makes it slow). A rule marked `i` (inner) colours only its
+// first capture group, the rest of its match stays plain: `(#[^\n]*)` after
+// "start of line or blank" makes a shell comment without colouring the blank
+// before it. At most 31 rules per language.
+//
+// Not a parser: no nesting, no types of identifiers, no string interpolation
+// colouring. It is the level of a README: a keyword is a keyword wherever a regex
+// can see it, and a string that runs past the end of its line ends there (so one
+// quote in a comment cannot paint the rest of the file).
+//
+// HONEST NOTES
+//   * Block comments and fenced Markdown blocks are matched with `(?s)` and end
+//     at the end of the text if unterminated.
+//   * JSON keys are told from string values AFTER the scan (a string followed by
+//     a colon); TOML/INI/YAML keys by a rule.
+//   * The C-like family is one rule set with the union of the keywords of
+//     JavaScript/TypeScript, Java, C, C++, C#, Rust and Go: a word that is a
+//     keyword in one of them is coloured in all (`type` in Java code, say).
+//   * The compiled expressions are cached per language for the life of the
+//     `Highlighter`; call `hl_free` to release them.
+import std.rt
+import std.vec
+import regex.regex
+
+export {
+    Highlighter, HlSpan, hl_new, hl_free, hl_language, hl_tokenize, hl_kind_at, hl_language_name,
+    HL_NONE, HL_JSON, HL_TOML, HL_INI, HL_FIRN, HL_SHELL, HL_MARKDOWN, HL_YAML, HL_CLIKE, HL_COUNT,
+    TK_PLAIN, TK_KEYWORD, TK_STRING, TK_NUMBER, TK_COMMENT, TK_FUNCTION, TK_TYPE, TK_OPERATOR,
+    TK_PUNCT, TK_KEY, TK_ATTR, TK_CONSTANT, TK_VARIABLE, TK_HEADING, TK_EMPH, TK_LINK, TK_COUNT,
+}
+
+const HL_NONE: u32 = 0
+const HL_JSON: u32 = 1
+const HL_TOML: u32 = 2
+const HL_INI: u32 = 3
+const HL_FIRN: u32 = 4
+const HL_SHELL: u32 = 5
+const HL_MARKDOWN: u32 = 6
+const HL_YAML: u32 = 7
+const HL_CLIKE: u32 = 8
+const HL_COUNT: u32 = 9
+
+const TK_PLAIN: u32 = 0
+const TK_KEYWORD: u32 = 1
+const TK_STRING: u32 = 2
+const TK_NUMBER: u32 = 3
+const TK_COMMENT: u32 = 4
+const TK_FUNCTION: u32 = 5
+const TK_TYPE: u32 = 6
+const TK_OPERATOR: u32 = 7
+const TK_PUNCT: u32 = 8
+const TK_KEY: u32 = 9
+const TK_ATTR: u32 = 10
+const TK_CONSTANT: u32 = 11
+const TK_VARIABLE: u32 = 12
+const TK_HEADING: u32 = 13
+const TK_EMPH: u32 = 14
+const TK_LINK: u32 = 15
+const TK_COUNT: u32 = 16
+
+struct HlSpan {
+    start: usize,
+    len: usize,
+    kind: u32,
+}
+
+// the compiled languages: language l owns the regexes re[base[l] .. base[l] + nrules[l])
+struct Highlighter {
+    re: Vec[regex.Regex], // capacity reserved at the start: the matchers point into it
+    mt: Vec[regex.Matcher], // one machine per regex, parallel to `re`
+    base: [u32; 9],
+    have: [bool; 9],
+    kinds: [u32; 288], // per language (32 each) the kind of every rule
+    inner: [bool; 288], // per language: does the rule colour only its first capture group
+    nrules: [u32; 9],
+}
+
+fn hl_new() -> Highlighter {
+    var h: Highlighter = Highlighter { re: vec_new[regex.Regex](), mt: vec_new[regex.Matcher](),
+        base: [0 as u32; 9], have: [false; 9], kinds: [0 as u32; 288], inner: [false; 288], nrules: [0 as u32; 9] }
+    vec_reserve[regex.Regex](&h.re, 288)
+    vec_reserve[regex.Matcher](&h.mt, 288)
+    return h
+}
+
+fn hl_free(h: *mut Highlighter) {
+    var l: usize = 0
+    while l < vec_len[regex.Matcher](&(*h).mt) {
+        regex.matcher_free(vec_elem_ptr[regex.Matcher](&(*h).mt, l))
+        l = l + 1
+    }
+    vec_free[regex.Matcher](&(*h).mt)
+    l = 0
+    while l < vec_len[regex.Regex](&(*h).re) {
+        regex.regex_free(vec_elem_ptr[regex.Regex](&(*h).re, l))
+        l = l + 1
+    }
+    vec_free[regex.Regex](&(*h).re)
+    var k: usize = 0
+    while k < 9 {
+        (*h).have[k] = false
+        k = k + 1
+    }
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+fn name_is(s: str, w: str) -> bool {
+    if s.n != w.n {
+        return false
+    }
+    var i: usize = 0
+    while i < s.n {
+        if lower(rt.ld8(s.p as u64, i)) != rt.ld8(w.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The language of a fence info string / file extension: "json", "jsonc", "toml",
+// "ini", "cfg", "conf", "properties", "firn", "fi", "sh", "bash", "shell", "zsh",
+// "console", "md", "markdown", "yaml", "yml", "js", "javascript", "ts",
+// "typescript", "java", "c", "cpp", "c++", "cs", "csharp", "rust", "rs", "go",
+// "kotlin", "kt", "groovy", "gradle". Anything else: HL_NONE. Only the first word
+// of `info` counts ("java title=Foo.java").
+fn hl_language(info: str) -> u32 {
+    var n: usize = 0
+    while n < info.n {
+        let c: u8 = rt.ld8(info.p as u64, n)
+        if c == 32 as u8 || c == 9 as u8 || c == 123 as u8 || c == 44 as u8 {
+            break
+        }
+        n = n + 1
+    }
+    let w: str = str { p: info.p, n: n }
+    if name_is(w, "json") || name_is(w, "jsonc") || name_is(w, "json5") { return HL_JSON }
+    if name_is(w, "toml") { return HL_TOML }
+    if name_is(w, "ini") || name_is(w, "cfg") || name_is(w, "conf") || name_is(w, "properties")
+        || name_is(w, "env") || name_is(w, "desktop") { return HL_INI }
+    if name_is(w, "firn") || name_is(w, "fi") || name_is(w, "fir") { return HL_FIRN }
+    if name_is(w, "sh") || name_is(w, "bash") || name_is(w, "shell") || name_is(w, "zsh")
+        || name_is(w, "console") || name_is(w, "shell-session") || name_is(w, "terminal") { return HL_SHELL }
+    if name_is(w, "md") || name_is(w, "markdown") { return HL_MARKDOWN }
+    if name_is(w, "yaml") || name_is(w, "yml") { return HL_YAML }
+    if name_is(w, "js") || name_is(w, "javascript") || name_is(w, "ts") || name_is(w, "typescript")
+        || name_is(w, "java") || name_is(w, "c") || name_is(w, "cpp") || name_is(w, "c++")
+        || name_is(w, "h") || name_is(w, "hpp") || name_is(w, "cs") || name_is(w, "csharp")
+        || name_is(w, "rust") || name_is(w, "rs") || name_is(w, "go") || name_is(w, "kotlin")
+        || name_is(w, "kt") || name_is(w, "groovy") || name_is(w, "gradle") || name_is(w, "mcfunction") {
+        return HL_CLIKE
+    }
+    return HL_NONE
+}
+
+fn hl_language_name(l: u32) -> str {
+    if l == HL_JSON { return "json" }
+    if l == HL_TOML { return "toml" }
+    if l == HL_INI { return "ini" }
+    if l == HL_FIRN { return "firn" }
+    if l == HL_SHELL { return "shell" }
+    if l == HL_MARKDOWN { return "markdown" }
+    if l == HL_YAML { return "yaml" }
+    if l == HL_CLIKE { return "c-like" }
+    return "text"
+}
+
+// ----------------------------------------------------------------- the rules
+//
+// One rule per line: <kind letter><flag> <regex>
+//   kind: K keyword  S string  N number  C comment  F function  T type  O operator
+//         P punctuation  Y key  A attribute  X constant  V variable  H heading
+//         E emphasis  L link
+//   flag: i = colour only the first capture group, - = the whole match
+// The regexes are RE2 syntax with a doubled backslash (it is a Firn string).
+
+fn rules_json() -> str {
+    return "C- //[^\\n]*\nC- (?s:/\\*.*?(?:\\*/|\\z))\nS- \"(?:[^\"\\\\\\n]|\\\\.)*\"?\nX- \\b(?:true|false|null)\\b\nN- -?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\nP- [{}\\[\\],:]"
+}
+
+fn rules_toml() -> str {
+    return "C- #[^\\n]*\nS- (?s:\"\"\".*?(?:\"\"\"|\\z))\nS- (?s:'''.*?(?:'''|\\z))\nS- \"(?:[^\"\\\\\\n]|\\\\.)*\"?\nS- '[^'\\n]*'?\nT- (?m)^[ \\t]*\\[\\[?[^\\]\\n]*\\]\\]?\nYi (?m)^[ \\t]*([A-Za-z0-9_.\\-]+)[ \\t]*=\nX- \\b(?:true|false)\\b\nN- \\b(?:[+-]?(?:0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*(?:\\.[0-9_]+)?(?:[eE][+-]?[0-9_]+)?|inf|nan)|[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T ][0-9:.]+Z?)?)\\b\nP- [\\[\\]{},=]"
+}
+
+fn rules_ini() -> str {
+    return "C- (?m)^[ \\t]*[#;][^\\n]*\nS- \"(?:[^\"\\\\\\n]|\\\\.)*\"?\nT- (?m)^[ \\t]*\\[[^\\]\\n]*\\]\nYi (?m)^[ \\t]*([A-Za-z0-9_.\\-]+(?:[ \\t]+[A-Za-z0-9_.\\-]+)*)[ \\t]*[=:]\nX- \\b(?:true|false|yes|no|on|off)\\b\nN- \\b[+-]?[0-9]+(?:\\.[0-9]+)?\\b\nP- [=:]"
+}
+
+fn rules_firn() -> str {
+    return "C- //[^\\n]*\nC- (?s:/\\*.*?(?:\\*/|\\z))\nS- [bfu]?\"(?:[^\"\\\\\\n]|\\\\.)*\"?\nA- #\\[[^\\]\\n]*\\]\nK- \\b(?:fn|let|var|if|else|while|return|struct|const|static|profile|as|mut|syscall|extern|break|defer|errdefer|comptime|continue|for|in|import|export|enum|match|error|try|catch|gc|class|interface|impl|unsafe|throw|type|secret)\\b\nX- \\b(?:true|false|null)\\b\nT- \\b(?:i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|usize|isize|f32|f64|bool|str|string|Str|Str16|Bytes|v128|void)\\b\nN- \\b(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|[0-9][0-9_]*(?:\\.[0-9_]+)?(?:[eE][+-]?[0-9]+)?)(?:[iu](?:8|16|32|64|128|size)|f32|f64)?\\b\nT- \\b[A-Z][A-Za-z0-9_]*\\b\nFi ([A-Za-z_][A-Za-z0-9_]*)[ \\t]*\\(\nO- (?:->|=>|::|\\.\\.|<<=|>>=|[+\\-*/%&|^<>=!]=|<<|>>|&&|\\|\\||[+\\-*/%&|^~<>=!])"
+}
+
+fn rules_shell() -> str {
+    return "Ci (?:^|[ \\t;|&(])(#[^\\n]*)\nS- (?s:\"(?:[^\"\\\\]|\\\\.)*(?:\"|\\z))\nS- '[^']*'?\nS- `[^`]*`?\nV- \\$(?:\\{[^}\\n]*\\}?|[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])\nK- \\b(?:if|then|else|elif|fi|for|while|until|do|done|case|esac|in|function|select|time|return|exit|break|continue|local|export|readonly|declare|unset|shift|source|alias)\\b\nF- \\b(?:echo|cd|ls|cat|grep|sed|awk|printf|test|read|set|eval|exec|trap|kill|wait|pwd|mkdir|rm|cp|mv|chmod|chown|curl|wget|git|sudo|apt|apt-get|npm|pip|pip3|make|java|python|python3|docker|tar|unzip|ssh|scp|systemctl|journalctl|touch|find|xargs|head|tail|sort|uniq|wc|tee|env|which|ln|df|du|ps|top)\\b\nAi (?:^|[ \\t])(--?[A-Za-z][A-Za-z0-9_\\-]*)\nN- \\b[0-9]+\\b\nO- (?:&&|\\|\\||>>|<<|[|&;<>()])"
+}
+
+fn rules_markdown() -> str {
+    return "C- (?s:<!--.*?(?:-->|\\z))\nS- (?sm:^[ \\t]*(?:```|~~~).*?(?:^[ \\t]*(?:```|~~~)[^\\n]*|\\z))\nH- (?m)^#{1,6}[ \\t][^\\n]*\nC- (?m)^>[^\\n]*\nE- \\*\\*[^*\\n]+\\*\\*|__[^_\\n]+__\nE- \\*[^*\\n]+\\*|\\b_[^_\\n]+_\\b\nS- `[^`\\n]+`\nL- !?\\[[^\\]\\n]*\\]\\([^)\\n]*\\)\nL- https?://[^\\s)>\\]]+\nO- (?m)^[ \\t]*(?:[-*+]|[0-9]+[.)])[ \\t]\nO- (?m)^(?:-{3,}|\\*{3,}|_{3,})[ \\t]*$"
+}
+
+fn rules_yaml() -> str {
+    return "Ci (?:^|[ \\t])(#[^\\n]*)\nS- \"(?:[^\"\\\\\\n]|\\\\.)*\"?\nS- '[^'\\n]*'?\nYi (?m)^[ \\t]*(?:-[ \\t]+)?([A-Za-z0-9_.\\-/]+(?:[ \\t]+[A-Za-z0-9_.\\-/]+)*)[ \\t]*:(?:[ \\t]|$)\nV- [&*][A-Za-z0-9_\\-]+\nA- !!?[A-Za-z0-9_\\-]*\nX- \\b(?:true|false|null|yes|no|on|off)\\b\nN- \\b[+-]?[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\\b\nO- (?m)^(?:---|\\.\\.\\.)[ \\t]*$\nP- [\\[\\]{},|>]"
+}
+
+fn rules_clike() -> str {
+    return "C- //[^\\n]*\nC- (?s:/\\*.*?(?:\\*/|\\z))\nS- \"(?:[^\"\\\\\\n]|\\\\.)*\"?\nS- '(?:[^'\\\\\\n]|\\\\.)*'?\nS- (?s:`(?:[^`\\\\]|\\\\.)*(?:`|\\z))\nA- @[A-Za-z_][A-Za-z0-9_.]*\nK- \\b(?:abstract|as|async|await|break|case|catch|class|const|continue|default|defer|delete|do|else|enum|export|extends|extern|final|finally|fn|for|from|func|function|go|if|impl|implements|import|in|instanceof|interface|internal|let|match|mod|mut|namespace|new|of|override|package|private|protected|pub|public|return|sealed|select|static|struct|super|switch|synchronized|this|throw|throws|trait|try|type|typedef|typeof|union|unsafe|use|using|var|virtual|void|volatile|where|while|yield|val|fun|object|when|is|lateinit|data|inline|operator|companion|readonly|declare|ref|out|params|lock|checked|unchecked|goto|register|sizeof|signed|unsigned|auto|template|typename|friend|explicit|constexpr|noexcept|nullptr)\\b\nX- \\b(?:true|false|null|nil|None|undefined|NaN)\\b\nT- \\b(?:int|long|short|byte|char|float|double|boolean|bool|string|String|number|any|unknown|never|object|Object|i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|usize|isize|f32|f64|str|size_t|uint8_t|uint16_t|uint32_t|uint64_t|int8_t|int16_t|int32_t|int64_t|rune|uint|uintptr)\\b\nN- \\b(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|[0-9][0-9_]*(?:\\.[0-9_]+)?(?:[eE][+-]?[0-9]+)?)[uUlLfFdD]?[lL]?\\b\nT- \\b[A-Z][A-Za-z0-9_]*\\b\nFi ([A-Za-z_][A-Za-z0-9_]*)[ \\t]*\\(\nO- (?:->|=>|::|\\.\\.\\.?|\\+\\+|--|<<=|>>=|[+\\-*/%&|^<>=!]=|<<|>>|&&|\\|\\||[+\\-*/%&|^~<>=!?])"
+}
+
+fn rules_of(l: u32) -> str {
+    if l == HL_JSON { return rules_json() }
+    if l == HL_TOML { return rules_toml() }
+    if l == HL_INI { return rules_ini() }
+    if l == HL_FIRN { return rules_firn() }
+    if l == HL_SHELL { return rules_shell() }
+    if l == HL_MARKDOWN { return rules_markdown() }
+    if l == HL_YAML { return rules_yaml() }
+    if l == HL_CLIKE { return rules_clike() }
+    return ""
+}
+
+fn kind_of_letter(c: u8) -> u32 {
+    if c == 75 as u8 { return TK_KEYWORD }
+    if c == 83 as u8 { return TK_STRING }
+    if c == 78 as u8 { return TK_NUMBER }
+    if c == 67 as u8 { return TK_COMMENT }
+    if c == 70 as u8 { return TK_FUNCTION }
+    if c == 84 as u8 { return TK_TYPE }
+    if c == 79 as u8 { return TK_OPERATOR }
+    if c == 80 as u8 { return TK_PUNCT }
+    if c == 89 as u8 { return TK_KEY }
+    if c == 65 as u8 { return TK_ATTR }
+    if c == 88 as u8 { return TK_CONSTANT }
+    if c == 86 as u8 { return TK_VARIABLE }
+    if c == 72 as u8 { return TK_HEADING }
+    if c == 69 as u8 { return TK_EMPH }
+    if c == 76 as u8 { return TK_LINK }
+    return TK_PLAIN
+}
+
+// A rule table that does not compile is a bug in this file (the tests compile
+// every language), so the failure is recorded and a harmless empty regex stands
+// in; the caller then reports false and the text stays plain.
+fn hl_fail(b: *mut bool) -> regex.Regex {
+    *b = true
+    return regex.regex_compile("", 0 as u32) catch | f | (hl_never())
+}
+
+fn hl_never() -> regex.Regex {
+    rt.finish(99)
+    return hl_never()
+}
+
+// Compiles the rules of `l` into the cache; false if a rule does not compile.
+fn compile_lang(h: *mut Highlighter, l: u32) -> bool {
+    if (*h).have[l as usize] {
+        return true
+    }
+    let rules: str = rules_of(l)
+    (*h).base[l as usize] = vec_len[regex.Regex](&(*h).re) as u32
+    var nr: u32 = 0
+    var ok: bool = true
+    var i: usize = 0
+    while i < rules.n && nr < 31 {
+        var e: usize = i
+        while e < rules.n && rt.ld8(rules.p as u64, e) != 10 as u8 {
+            e = e + 1
+        }
+        if e - i >= 3 {
+            let k: usize = (l as usize) * 32 + (nr as usize)
+            (*h).kinds[k] = kind_of_letter(rt.ld8(rules.p as u64, i))
+            (*h).inner[k] = rt.ld8(rules.p as u64, i + 1) == 105 as u8
+            var failed: bool = false
+            let rg: regex.Regex = regex.regex_compile(str { p: rt.ptr_of(rules.p as u64 + (i + 3) as u64), n: e - i - 3 },
+                0 as u32) catch | x | (hl_fail(&failed))
+            if failed {
+                ok = false
+            }
+            vec_push[regex.Regex](&(*h).re, rg)
+            vec_push[regex.Matcher](&(*h).mt, regex.matcher_new(vec_elem_ptr[regex.Regex](&(*h).re, vec_len[regex.Regex](&(*h).re) - 1)))
+            nr = nr + 1
+        }
+        i = e + 1
+    }
+    (*h).nrules[l as usize] = nr
+    (*h).have[l as usize] = true
+    return ok
+}
+
+fn push_span(out: *mut Vec[HlSpan], start: usize, len: usize, kind: u32) {
+    if len == 0 {
+        return
+    }
+    let n: usize = vec_len[HlSpan](out)
+    if n > 0 {
+        let last: *mut HlSpan = vec_elem_ptr[HlSpan](out, n - 1)
+        if (*last).kind == kind && (*last).start + (*last).len == start {
+            (*last).len = (*last).len + len
+            return
+        }
+    }
+    vec_push[HlSpan](out, HlSpan { start: start, len: len, kind: kind })
+}
+
+fn cp_len(p: u64, n: usize, at: usize) -> usize {
+    let c: u8 = rt.ld8(p, at)
+    var k: usize = 1
+    if c >= 240 as u8 {
+        k = 4
+    } else if c >= 224 as u8 {
+        k = 3
+    } else if c >= 192 as u8 {
+        k = 2
+    }
+    if at + k > n {
+        k = n - at
+    }
+    return k
+}
+
+// The next non-empty match of one rule at or after `from`: its range and, for a
+// rule with an inner group, the group's range (else the same as the match).
+fn next_of(re: *mut regex.Matcher, text: str, from: usize, inner: bool, ms: *mut i64, me: *mut i64,
+        gs: *mut i64, ge: *mut i64) -> bool {
+    var m: regex.Match = regex.match_new()
+    var at: usize = from
+    while at <= text.n {
+        if !regex.matcher_find(re, text, at, &m) {
+            return false
+        }
+        if m.end > m.start {
+            *ms = m.start
+            *me = m.end
+            *gs = m.start
+            *ge = m.end
+            if inner {
+                var a: usize = 0
+                var b: usize = 0
+                if regex.match_group(&m, 1 as u32, &a, &b) && b > a {
+                    *gs = a as i64
+                    *ge = b as i64
+                } else {
+                    *gs = m.start
+                    *ge = m.start
+                }
+            }
+            return true
+        }
+        // an empty match: look again one character on
+        if (m.start as usize) >= text.n {
+            return false
+        }
+        at = (m.start as usize) + cp_len(text.p as u64, text.n, m.start as usize)
+    }
+    return false
+}
+
+// Tokenizes `n` octets at `p` (UTF-8) as language `l` into `out` (cleared
+// first). The spans tile [0, n). For HL_NONE (or an unknown language, or a rule
+// table that does not compile) the whole text is one TK_PLAIN span.
+fn hl_tokenize(h: *mut Highlighter, l: u32, p: u64, n: usize, out: *mut Vec[HlSpan]) -> bool {
+    vec_clear[HlSpan](out)
+    if n == 0 {
+        return true
+    }
+    if l == HL_NONE || l >= HL_COUNT || !compile_lang(h, l) {
+        push_span(out, 0, n, TK_PLAIN)
+        return l == HL_NONE
+    }
+    let text: str = str { p: rt.ptr_of(p), n: n }
+    let nr: usize = (*h).nrules[l as usize] as usize
+    let base: usize = (*h).base[l as usize] as usize
+    // per rule: the next match (start -1 = not searched yet, start = n + 1 = none left)
+    var ms: [i64; 32] = [0 - 1; 32]
+    var me: [i64; 32] = [0; 32]
+    var gs: [i64; 32] = [0; 32]
+    var ge: [i64; 32] = [0; 32]
+    var pos: usize = 0
+    while pos < n {
+        // refresh the rules whose match lies behind us, find the first start
+        var best: i64 = 0 - 1
+        var r: usize = 0
+        while r < nr {
+            if ms[r] < (pos as i64) || ms[r] < 0 {
+                let re: *mut regex.Matcher = vec_elem_ptr[regex.Matcher](&(*h).mt, base + r)
+                if !next_of(re, text, pos, (*h).inner[(l as usize) * 32 + r], &ms[r], &me[r], &gs[r], &ge[r]) {
+                    ms[r] = (n as i64) + 1
+                }
+            }
+            if ms[r] <= (n as i64) && (best < 0 || ms[r] < ms[best as usize]) {
+                best = r as i64
+            }
+            r = r + 1
+        }
+        if best < 0 {
+            break
+        }
+        let b: usize = best as usize
+        let start: usize = ms[b] as usize
+        let end: usize = me[b] as usize
+        push_span(out, pos, start - pos, TK_PLAIN)
+        let kind: usize = (l as usize) * 32 + b
+        if (*h).inner[kind] {
+            push_span(out, start, (gs[b] as usize) - start, TK_PLAIN)
+            push_span(out, gs[b] as usize, (ge[b] - gs[b]) as usize, (*h).kinds[kind])
+            push_span(out, ge[b] as usize, end - (ge[b] as usize), TK_PLAIN)
+        } else {
+            push_span(out, start, end - start, (*h).kinds[kind])
+        }
+        pos = end
+    }
+    if pos < n {
+        push_span(out, pos, n - pos, TK_PLAIN)
+    }
+    if l == HL_JSON {
+        json_keys(p, n, out)
+    }
+    return true
+}
+
+// a JSON string followed (after blanks and newlines) by a colon is a KEY
+fn json_keys(p: u64, n: usize, out: *mut Vec[HlSpan]) {
+    let cnt: usize = vec_len[HlSpan](out)
+    var i: usize = 0
+    while i < cnt {
+        let s: *mut HlSpan = vec_elem_ptr[HlSpan](out, i)
+        if (*s).kind == TK_STRING {
+            var q: usize = (*s).start + (*s).len
+            while q < n && (rt.ld8(p, q) == 32 as u8 || rt.ld8(p, q) == 9 as u8 || rt.ld8(p, q) == 10 as u8
+                || rt.ld8(p, q) == 13 as u8) {
+                q = q + 1
+            }
+            if q < n && rt.ld8(p, q) == 58 as u8 {
+                (*s).kind = TK_KEY
+            }
+        }
+        i = i + 1
+    }
+}
+
+// The kind of the octet at `pos` (binary search over spans from hl_tokenize);
+// TK_PLAIN outside.
+fn hl_kind_at(spans: *mut Vec[HlSpan], pos: usize) -> u32 {
+    var lo: usize = 0
+    var hi: usize = vec_len[HlSpan](spans)
+    while lo < hi {
+        let mid: usize = (lo + hi) / 2
+        let s: *mut HlSpan = vec_elem_ptr[HlSpan](spans, mid)
+        if pos < (*s).start {
+            hi = mid
+        } else if pos >= (*s).start + (*s).len {
+            lo = mid + 1
+        } else {
+            return (*s).kind
+        }
+    }
+    return TK_PLAIN
+}

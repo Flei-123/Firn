@@ -11,8 +11,8 @@ positive test in `tests/` and is held against programs nobody here wrote by
 
 | module | file | what it is |
 |---|---|---|
-| `std.tar` | `lib/std/tar.fi` | tar reader (ustar, V7, GNU long names, pax), tar writer, `tar_add_tree`, tar.gz, safe extraction |
-| `std.extract` | `lib/std/extract.fi` | `extract_archive(path, dest)`: `.zip`, `.tar.gz`/`.tgz`, `.tar`, found by content |
+| `std.tar` | `lib/std/tar.fi` | tar reader (ustar, V7, GNU long names, pax), tar writer, `tar_add_tree`, tar.gz, tar.zst, tar.xz, tar.bz2, tar.lz4 (via `lib/compress`, [COMPRESSION.md](COMPRESSION.md)), safe extraction |
+| `std.extract` | `lib/std/extract.fi` | `extract_archive(path, dest)`: `.zip`, `.tar.gz`/`.tgz`, `.tar.zst`, `.tar.xz`, `.tar.bz2`, `.tar.lz4`, `.tar`, found by content |
 | `std.safefs` | `lib/std/safefs.fi` | the rules and writers both extractors share (names, link targets, no write through a link) |
 | `std.hashfile` | `lib/std/hashfile.fi` | streaming file hashes (md5, sha1, sha256, sha512), hex, atomic download target |
 | `std.secret` | `lib/std/secret.fi`, `secret_os.fi`, `secret_os.windows.fi` | keyring: Credential Manager on Windows, encrypted file on Linux |

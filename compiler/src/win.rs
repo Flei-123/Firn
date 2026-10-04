@@ -110,6 +110,12 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("GetFileAttributesW", "KERNEL32.dll", 1),
     ("SetFilePointerEx", "KERNEL32.dll", 4),
     ("FlushFileBuffers", "KERNEL32.dll", 1),
+    // lib/db (the embedded database): shorten a file, ask its size, and lock the byte
+    // ranges SQLite's own Windows VFS locks (LockFileEx / UnlockFileEx).
+    ("SetEndOfFile", "KERNEL32.dll", 1),
+    ("GetFileSizeEx", "KERNEL32.dll", 2),
+    ("LockFileEx", "KERNEL32.dll", 6),
+    ("UnlockFileEx", "KERNEL32.dll", 5),
     ("VirtualAlloc", "KERNEL32.dll", 4),
     ("VirtualFree", "KERNEL32.dll", 3),
     ("VirtualProtect", "KERNEL32.dll", 4),
@@ -284,6 +290,23 @@ const KNOWN: &[(&str, &str, u32)] = &[
     // value `AppsUseLightTheme`. `RegGetValueW` does opening, reading and
     // closing in one call.
     ("RegGetValueW", "ADVAPI32.dll", 7),
+    // --- advapi32: WRITING the registry (lib/pack/winreg.fi) -----------
+    // Round PACK: an installer writes HKCU\Software\Microsoft\Windows\
+    // CurrentVersion\Uninstall\<id> (the "Apps & features" entry) and its
+    // uninstaller removes it again. Bound here because an indirect call
+    // through GetProcAddress is System V, not Win64 (see GetModuleFileNameW).
+    // RegCreateKeyExW(hkey, sub, 0, class, options, sam, sa, *result, *disp),
+    // RegSetValueExW(hkey, name, 0, type, data, bytes), RegCloseKey,
+    // RegDeleteTreeW(hkey, sub) (Vista and later; Wine has it),
+    // RegOpenKeyExW(hkey, sub, options, sam, *result).
+    ("RegCreateKeyExW", "ADVAPI32.dll", 9),
+    ("RegSetValueExW", "ADVAPI32.dll", 6),
+    ("RegCloseKey", "ADVAPI32.dll", 1),
+    ("RegDeleteTreeW", "ADVAPI32.dll", 2),
+    ("RegOpenKeyExW", "ADVAPI32.dll", 5),
+    // The shell is told that shortcuts / associations changed so that the
+    // new icons show without a restart of Explorer.
+    ("SHChangeNotify", "SHELL32.dll", 4),
     // --- advapi32: the Credential Manager (std.secret_os) --------------
     // The keyring of Windows: generic credentials, kept per user by the
     // system and protected with the user's logon secret (DPAPI). Round
@@ -308,6 +331,63 @@ const KNOWN: &[(&str, &str, u32)] = &[
     // The system buttons, dragging and Aero Snap remain
     // Windows' business. Four arguments: hwnd, attribute, pointer, length.
     ("DwmSetWindowAttribute", "dwmapi.dll", 4),
+    // --- the DESKTOP round (docs/DESKTOP.md): tray icon and menu, balloon
+    // notifications, the clipboard, files dropped on a window, waveOut audio,
+    // directory change notification, the Run key, a named pipe between two
+    // copies of a program. Every one of them is bound HERE because an indirect
+    // call through GetProcAddress is System V, not Win64 (see GetModuleFileNameW).
+    ("Shell_NotifyIconW", "SHELL32.dll", 2),
+    ("DragAcceptFiles", "SHELL32.dll", 2),
+    ("DragQueryFileW", "SHELL32.dll", 4),
+    ("DragFinish", "SHELL32.dll", 1),
+    ("CreatePopupMenu", "USER32.dll", 0),
+    ("AppendMenuW", "USER32.dll", 4),
+    ("TrackPopupMenu", "USER32.dll", 7),
+    ("DestroyMenu", "USER32.dll", 1),
+    ("SetForegroundWindow", "USER32.dll", 1),
+    ("PostMessageW", "USER32.dll", 4),
+    ("RegisterWindowMessageW", "USER32.dll", 1),
+    ("CreateIconIndirect", "USER32.dll", 1),
+    ("DestroyIcon", "USER32.dll", 1),
+    ("LoadIconW", "USER32.dll", 2),
+    ("OpenClipboard", "USER32.dll", 1),
+    ("CloseClipboard", "USER32.dll", 0),
+    ("EmptyClipboard", "USER32.dll", 0),
+    ("SetClipboardData", "USER32.dll", 2),
+    ("GetClipboardData", "USER32.dll", 1),
+    ("IsClipboardFormatAvailable", "USER32.dll", 1),
+    ("EnumClipboardFormats", "USER32.dll", 1),
+    ("RegisterClipboardFormatW", "USER32.dll", 1),
+    ("GetClipboardFormatNameW", "USER32.dll", 3),
+    ("CreateBitmap", "GDI32.dll", 5),
+    ("GlobalAlloc", "KERNEL32.dll", 2),
+    ("GlobalLock", "KERNEL32.dll", 1),
+    ("GlobalUnlock", "KERNEL32.dll", 1),
+    ("GlobalSize", "KERNEL32.dll", 1),
+    ("GlobalFree", "KERNEL32.dll", 1),
+    ("CreateEventW", "KERNEL32.dll", 4),
+    ("ResetEvent", "KERNEL32.dll", 1),
+    ("SetEvent", "KERNEL32.dll", 1),
+    ("GetOverlappedResult", "KERNEL32.dll", 4),
+    ("CancelIo", "KERNEL32.dll", 1),
+    ("ReadDirectoryChangesW", "KERNEL32.dll", 8),
+    ("CreateNamedPipeW", "KERNEL32.dll", 8),
+    ("ConnectNamedPipe", "KERNEL32.dll", 2),
+    ("DisconnectNamedPipe", "KERNEL32.dll", 1),
+    ("WaitNamedPipeW", "KERNEL32.dll", 2),
+    ("SetNamedPipeHandleState", "KERNEL32.dll", 4),
+    ("waveOutOpen", "WINMM.dll", 6),
+    ("waveOutClose", "WINMM.dll", 1),
+    ("waveOutPrepareHeader", "WINMM.dll", 3),
+    ("waveOutUnprepareHeader", "WINMM.dll", 3),
+    ("waveOutWrite", "WINMM.dll", 3),
+    ("waveOutReset", "WINMM.dll", 1),
+    ("waveOutPause", "WINMM.dll", 1),
+    ("waveOutRestart", "WINMM.dll", 1),
+    ("waveOutGetNumDevs", "WINMM.dll", 0),
+    ("waveOutGetPosition", "WINMM.dll", 3),
+    ("RegQueryValueExW", "ADVAPI32.dll", 6),
+    ("RegDeleteValueW", "ADVAPI32.dll", 2),
 ];
 
 /// DLL and arity of a known Win32 function.

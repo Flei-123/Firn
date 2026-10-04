@@ -178,6 +178,7 @@ const TABLE: &[(i64, A64)] = &[
     // std.secret takes an advisory lock on its vault (flock, 73 on x86-64).
     (73, A64::Direct(32)),           // flock
     (74, A64::Direct(82)), // fsync (Firn r64)
+    (77, A64::Direct(46)),           // ftruncate (lib/db: a database file shortened after a rollback)
     (79, A64::Direct(17)),           // getcwd
     (80, A64::Direct(49)),           // chdir     (std.process: the working directory of a child)
     // Round ABSCHLUSS (Certus): the same shape as `open` two lines up --

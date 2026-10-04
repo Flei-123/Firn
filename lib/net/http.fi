@@ -10,7 +10,9 @@
 //   * GET and POST, with a request body and a `Content-Type`
 //   * the header block, read case-insensitively, folded values refused
 //   * `Transfer-Encoding: chunked`, including chunk extensions and trailers
-//   * `Content-Encoding: gzip` and `deflate`, through lib/std/deflate.fi
+//   * `Content-Encoding: gzip` and `deflate`, through lib/std/deflate.fi, and `br`
+//     (Brotli) and `zstd` through lib/compress (bodies are refused above 256 MiB
+//     decoded, `HttpError::Encoding`)
 //   * redirects 301/302/303/307/308 with the METHOD RULES of RFC 9110 15.4
 //     (303 turns into GET and drops the body, 307/308 keep both), a hop
 //     limit and loop detection
@@ -24,12 +26,19 @@
 //
 // WHAT IS NOT, AND WHY IT IS SAID HERE RATHER THAN FOUND OUT LATER
 //
-//   TLS WITHOUT ROOTS. `https://` goes through lib/tls/tls.fi (TLS 1.3,
-//   certificate chain and host name checked against the system's roots,
-//   lib/tls/trust*.fi). Where the system has no usable roots the request
-//   is REFUSED with `HttpError::Tls` -- never downgraded to http:// and
-//   never sent unverified. There is no switch that turns the check off.
-//   TLS 1.2 servers are not reachable (tls.fi offers 1.3 only).
+//   TLS WITHOUT ROOTS. `https://` goes through lib/tls/tls.fi (TLS 1.3 and
+//   TLS 1.2, certificate chain and host name checked against the system's
+//   roots, lib/tls/trust*.fi). Where the system has no usable roots the
+//   request is REFUSED with `HttpError::Tls` -- never downgraded to http://
+//   and never sent unverified. There is no switch that turns the check off.
+//
+//   TLS VERSIONS. The ONE ClientHello offers 1.3 and 1.2; the server picks
+//   (`client_tls_version` says what it picked: 772 or 771). There is no
+//   second attempt with an older version after a failure -- that "fallback"
+//   is what downgrade attacks use -- and a server that picks 1.2 although it
+//   speaks 1.3 is refused (`Downgrade`, tls_err 16). TLS 1.0 and 1.1 servers
+//   are not reachable. `client_set_tls_max(c, 771)` offers 1.2 only, for the
+//   rare server that cannot cope with a ClientHello that mentions 1.3.
 //
 //   NAMES. A host that is not a numeric address is resolved by
 //   lib/net/dns.fi (resolv.conf / GetNetworkParams, hosts file, UDP with
@@ -49,6 +58,8 @@
 import std.rt
 import std.net
 import std.deflate
+import compress.brotli
+import compress.zstd
 import net.url
 import net.httpstate
 import net.dns
@@ -63,6 +74,7 @@ export {
     client_set_keepalive, client_set_max_redirects,
     client_resolver, client_add_trust_pem, client_set_system_trust,
     client_tls_error, client_tls_verify, client_tls_roots, client_is_tls,
+    client_tls_version, client_set_tls_max,
     client_jar, client_cache,
     client_sockets, client_reused, client_requests, client_redirects,
     resp_new, resp_init, resp_free, resp_reset,
@@ -77,6 +89,13 @@ export {
     build_request, parse_head, split_content_type, undo_encoding,
     harvest_cookies, status_is_redirect, addrs_of_host, client_now, err_of,
     ci_eq,
+    // round DOWNLOAD -- extra request headers, a user agent, a streaming
+    // sink for large bodies, and a way to drop the connection
+    client_set_headers, client_add_header, client_clear_headers,
+    client_set_user_agent, client_set_sink, client_clear_sink,
+    client_close, client_aborted, client_body_status, client_body_clen,
+    client_streamed, client_has_conn, client_conn_host, resp_streamed,
+    NO_LEN, http_get_num, http_post_num,
 }
 
 error HttpError {
@@ -96,6 +115,7 @@ error HttpError {
     RedirectLoop,
     TooLarge,
     OutOfMemory,
+    Aborted, // the sink refused more data (a cancel, a full disk)
 }
 
 const HDR_MAX: usize = 65536
@@ -103,6 +123,17 @@ const BODY_MAX: usize = 33554432
 const IDX_MAX: usize = 128
 const RD_ERR: usize = 18446744073709551615 as usize
 const NO_MAXAGE: u64 = 18446744073709551615 as u64
+// `client_body_clen` when the body has no announced length (chunked, or
+// read to the end of the connection)
+const NO_LEN: u64 = 18446744073709551615 as u64
+// hand on whatever has arrived, as soon as it has: a read that times out
+// or a connection that drops must not lose what was received before
+const SINK_FLUSH: usize = 1
+
+// The default sink: takes everything. Never called while no sink is set.
+fn sink_none(ud: u64, p: u64, n: usize) -> bool {
+    return true
+}
 
 struct Client {
     jar: httpstate.Jar,
@@ -133,7 +164,21 @@ struct Client {
     store_ready: bool, // the system roots have been loaded (or tried)
     sys_trust: bool, // load the system roots on the first https
     tls_err: u32, // tls_err_num of the last failed handshake, 0 = none
+    tls_ver: u32, // 772 / 771: what the last successful handshake negotiated
+    tls_max: u32, // 772 (default) or 771: the highest version offered
     tls_verify: u32, // x509 verdict of the last handshake
+    // --- round DOWNLOAD
+    extra: rt.Buf, // extra request header lines, each ending in CRLF
+    ua: [u8; 96], // the User-Agent, nua = 0: the default
+    nua: usize,
+    sink: fn(u64, u64, usize) -> bool, // (ud, octets, count); count 0 = begin
+    sink_ud: u64,
+    sink_set: bool,
+    streaming: bool, // the body being read goes to the sink
+    aborted: bool, // the sink said no
+    body_status: u32, // status of the response whose body goes to the sink
+    body_clen: u64, // its Content-Length, NO_LEN when unknown
+    streamed: u64, // octets given to the sink for this response
 }
 
 struct Response {
@@ -153,6 +198,7 @@ struct Response {
     wire: usize, // body octets as they arrived, before gunzip
     from_cache: bool,
     keep: bool, // may the connection stay open?
+    streamed: u64, // octets that went to the client's sink, not into `body`
 }
 
 // ---------------------------------------------------------------- Octets
@@ -201,6 +247,7 @@ fn resp_new() -> Response {
         body: rt.buf_new(), media: [0; 128], nmedia: 0,
         charset: [0; 64], ncharset: 0, final_url: [0; 768], nfinal: 0,
         hops: 0, chunks: 0, wire: 0, from_cache: false, keep: false,
+        streamed: 0,
     }
 }
 
@@ -221,6 +268,7 @@ fn resp_reset(r: *mut Response) {
     (*r).wire = 0
     (*r).from_cache = false
     (*r).keep = false
+    (*r).streamed = 0
 }
 
 fn resp_free(r: *mut Response) {
@@ -235,6 +283,7 @@ fn resp_body_len(r: *mut Response) -> usize { return (*r).body.len }
 fn resp_hops(r: *mut Response) -> u32 { return (*r).hops }
 fn resp_chunks(r: *mut Response) -> u32 { return (*r).chunks }
 fn resp_wire_len(r: *mut Response) -> usize { return (*r).wire }
+fn resp_streamed(r: *mut Response) -> u64 { return (*r).streamed }
 fn resp_from_cache(r: *mut Response) -> bool { return (*r).from_cache }
 fn resp_header_count(r: *mut Response) -> usize { return (*r).nh }
 fn resp_media_ptr(r: *mut Response) -> u64 { return (&(*r).media[0]) as u64 }
@@ -282,7 +331,10 @@ fn client_new() -> Client {
         res: dns.resolver_new(), res_ready: false,
         tc: tls.tls_new(), is_tls: false, ctls: false,
         store: x509.store_new(), store_ready: false, sys_trust: true,
-        tls_err: 0 as u32, tls_verify: 0 as u32,
+        tls_err: 0 as u32, tls_ver: 0 as u32, tls_max: 772 as u32, tls_verify: 0 as u32,
+        extra: rt.buf_new(), ua: [0; 96], nua: 0,
+        sink: sink_none, sink_ud: 0, sink_set: false, streaming: false,
+        aborted: false, body_status: 0 as u32, body_clen: NO_LEN, streamed: 0,
     }
 }
 
@@ -301,6 +353,7 @@ fn client_free(c: *mut Client) {
     httpstate.jar_free(&(*c).jar)
     httpstate.cache_free(&(*c).cache)
     rt.buf_free(&(*c).rbuf)
+    rt.buf_free(&(*c).extra)
     dns.resolver_free(&(*c).res)
     x509.store_free(&(*c).store)
 }
@@ -310,6 +363,120 @@ fn client_set_cache(c: *mut Client, on: bool) { (*c).use_cache = on }
 fn client_set_gzip(c: *mut Client, on: bool) { (*c).use_gzip = on }
 fn client_set_keepalive(c: *mut Client, on: bool) { (*c).keep_alive = on }
 fn client_set_max_redirects(c: *mut Client, n: u32) { (*c).max_redirects = n }
+
+// ---- round DOWNLOAD: what a download manager needs from the client
+
+// Extra request header lines, sent with EVERY request (and every redirect
+// hop) of this client until they are changed: `Range`, `If-Range`,
+// `If-None-Match`, `Authorization`. `p`/`n` is the block "Name: value\r\n..."
+// (it is copied; each line must end in CRLF and contain no other CR/LF).
+fn client_set_headers(c: *mut Client, p: u64, n: usize) {
+    rt.buf_clear(&(*c).extra)
+    rt.buf_push_bytes(&(*c).extra, p, n)
+}
+
+// One more line, "name: value" + CRLF. A name or value containing CR, LF or
+// NUL is refused (false): a header cannot be smuggled in through a value.
+fn client_add_header(c: *mut Client, name: u64, nn: usize, val: u64,
+    nv: usize) -> bool {
+    var i: usize = 0
+    while i < nn {
+        let ch: u8 = rt.ld8(name, i)
+        if ch == 13 as u8 || ch == 10 as u8 || ch == 0 as u8 || ch == 58 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < nv {
+        let ch: u8 = rt.ld8(val, i)
+        if ch == 13 as u8 || ch == 10 as u8 || ch == 0 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    if nn == 0 {
+        return false
+    }
+    header(&(*c).extra, name, nn, val, nv)
+    return true
+}
+
+fn client_clear_headers(c: *mut Client) { rt.buf_clear(&(*c).extra) }
+
+// The `User-Agent` (at most 96 octets; 0 octets = the default "Firn/B4").
+fn client_set_user_agent(c: *mut Client, p: u64, n: usize) {
+    var k: usize = n
+    if k > 96 {
+        k = 96
+    }
+    rt.mem_copy((&(*c).ua[0]) as u64, p, k)
+    (*c).nua = k
+}
+
+// A SINK for response bodies of status 200 and 206. Instead of collecting
+// the body in `Response.body` (32 MiB at most), the client hands it on in
+// pieces as they arrive (what one read returned, up to 16 KiB): `f(ud, p, n)`. The first call has
+// n == 0 and means "the head is known, the body is next" (ask
+// `client_body_status` / `client_body_clen`; the headers are in the
+// Response); the sink returns false to stop -- the transfer ends with
+// `HttpError::Aborted`, the connection is closed. Bodies of other statuses
+// (redirects, errors, 304) still go to memory, so error pages stay readable.
+// A body with a `Content-Encoding` is decoded in memory first and then given
+// in one piece (the limit of 32 MiB applies to that case only).
+// No sink size limit: a body of any length streams.
+fn client_set_sink(c: *mut Client, f: fn(u64, u64, usize) -> bool, ud: u64) {
+    (*c).sink = f
+    (*c).sink_ud = ud
+    (*c).sink_set = true
+}
+
+fn client_clear_sink(c: *mut Client) {
+    (*c).sink = sink_none
+    (*c).sink_ud = 0
+    (*c).sink_set = false
+}
+
+// Closes the connection (the next request opens a new one). A caller that
+// got an error back from a fetch should call this: the position in the
+// stream is unknown.
+fn client_close(c: *mut Client) { drop_conn(c) }
+fn client_aborted(c: *mut Client) -> bool { return (*c).aborted }
+fn client_body_status(c: *mut Client) -> u32 { return (*c).body_status }
+fn client_body_clen(c: *mut Client) -> u64 { return (*c).body_clen }
+// octets the sink received for the last response
+fn client_streamed(c: *mut Client) -> u64 { return (*c).streamed }
+fn client_has_conn(c: *mut Client) -> bool { return (*c).have_conn }
+// The host the open connection goes to (copied to `out`, at most 256 octets);
+// the answer is its length, 0 when there is none.
+fn client_conn_host(c: *mut Client, out: u64) -> usize {
+    if !(*c).have_conn {
+        return 0
+    }
+    rt.mem_copy(out, (&(*c).chost[0]) as u64, (*c).nchost)
+    return (*c).nchost
+}
+
+// hand the pending octets of `out` to the sink
+fn sink_flush(c: *mut Client, out: *mut rt.Buf) -> bool {
+    if (*out).len == 0 {
+        return true
+    }
+    let ok: bool = (*c).sink((*c).sink_ud, (*out).ptr, (*out).len)
+    (*c).streamed = (*c).streamed + (*out).len as u64
+    rt.buf_clear(out)
+    if !ok {
+        (*c).aborted = true
+    }
+    return ok
+}
+
+fn sink_room(c: *mut Client, out: *mut rt.Buf) -> bool {
+    if (*c).streaming && (*out).len >= SINK_FLUSH {
+        return sink_flush(c, out)
+    }
+    return true
+}
 fn client_jar(c: *mut Client) -> *mut httpstate.Jar { return &(*c).jar }
 fn client_cache(c: *mut Client) -> *mut httpstate.Cache { return &(*c).cache }
 fn client_sockets(c: *mut Client) -> u64 { return (*c).sockets }
@@ -340,13 +507,23 @@ fn client_set_system_trust(c: *mut Client, on: bool) { (*c).sys_trust = on }
 
 // Why the last TLS handshake failed: tls_err_num of its error (1 Io,
 // 2 Closed, 3 Protocol, 4 Version, 5 Group, 6 Suite, 7 Retry, 8 Alert,
-// 9 Certificate, 10 Signature, ...), 100 when there were no roots at all,
+// 9 Certificate, 10 Signature, ... 16 Downgrade), 100 when there were no roots at all,
 // 101 for a host name too long for SNI; 0 when it did not fail.
 fn client_tls_error(c: *mut Client) -> u32 { return (*c).tls_err }
 // The x509 verdict of the last handshake (x509.V_OK, V_NAME, V_EXPIRED, ...).
 fn client_tls_verify(c: *mut Client) -> u32 { return (*c).tls_verify }
 fn client_tls_roots(c: *mut Client) -> usize { return x509.store_count(&(*c).store) }
 fn client_is_tls(c: *mut Client) -> bool { return (*c).is_tls }
+// The TLS version of the last successful https handshake: 772 (1.3), 771 (1.2), 0 = none yet.
+fn client_tls_version(c: *mut Client) -> u32 { return (*c).tls_ver }
+// 771: offer TLS 1.2 only; anything else: 1.3 and 1.2 (the default).
+fn client_set_tls_max(c: *mut Client, v: u32) {
+    if v == 771 as u32 {
+        (*c).tls_max = 771 as u32
+    } else {
+        (*c).tls_max = 772 as u32
+    }
+}
 
 fn client_now(c: *mut Client) -> u64 {
     if (*c).now_fixed != 0 as u64 {
@@ -461,6 +638,7 @@ fn tls_open(c: *mut Client, hp: u64, hn: usize) -> bool {
         return false
     }
     (*c).tls_err = 0 as u32
+    tls.tls_set_max_version(&(*c).tc, (*c).tls_max)
     let ok: bool = tls.tls_handshake(&(*c).tc)
     catch | e | hs_fail(c, tls.tls_err_num(e))
     (*c).tls_verify = tls.tls_verify_reason(&(*c).tc)
@@ -470,6 +648,7 @@ fn tls_open(c: *mut Client, hp: u64, hn: usize) -> bool {
         return false
     }
     (*c).is_tls = true
+    (*c).tls_ver = tls.tls_version(&(*c).tc)
     return true
 }
 
@@ -592,6 +771,25 @@ fn header(b: *mut rt.Buf, name: u64, nn: usize, val: u64, nv: usize) {
     crlf(b)
 }
 
+// Does the caller's block of extra header lines contain a header called
+// `name` (any case)?
+fn extra_has(c: *mut Client, name: u64, nn: usize) -> bool {
+    let p: u64 = (*c).extra.ptr
+    let n: usize = (*c).extra.len
+    var i: usize = 0
+    while i < n {
+        // i is at the start of a line
+        if i + nn < n && ci_eq(p + i as u64, nn, name, nn) && rt.ld8(p, i + nn) == 58 as u8 {
+            return true
+        }
+        while i < n && rt.ld8(p, i) != 10 as u8 {
+            i = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
 fn build_request(c: *mut Client, u: *mut url.Url, method: u64, nm: usize,
     body: u64, nb: usize, ctype: u64, nct: usize,
     inm: u64, ninm: usize, ims: u64, nims: usize, out: *mut rt.Buf) {
@@ -614,14 +812,23 @@ fn build_request(c: *mut Client, u: *mut url.Url, method: u64, nm: usize,
     crlf(out)
     var h_ua: [u8; 10] = "User-Agent"
     var v_ua: [u8; 7] = "Firn/B4"
-    header(out, (&h_ua[0]) as u64, 10, (&v_ua[0]) as u64, 7)
+    if (*c).nua > 0 {
+        header(out, (&h_ua[0]) as u64, 10, (&(*c).ua[0]) as u64, (*c).nua)
+    } else if extra_has(c, (&h_ua[0]) as u64, 10) {
+        // the caller sends its own User-Agent line
+    } else {
+        header(out, (&h_ua[0]) as u64, 10, (&v_ua[0]) as u64, 7)
+    }
     var h_acc: [u8; 6] = "Accept"
     var v_acc: [u8; 3] = "*/*"
-    header(out, (&h_acc[0]) as u64, 6, (&v_acc[0]) as u64, 3)
+    // an `Accept` of the caller's (extra headers) replaces the default
+    if !extra_has(c, (&h_acc[0]) as u64, 6) {
+        header(out, (&h_acc[0]) as u64, 6, (&v_acc[0]) as u64, 3)
+    }
     if (*c).use_gzip {
         var h_ae: [u8; 15] = "Accept-Encoding"
-        var v_ae: [u8; 4] = "gzip"
-        header(out, (&h_ae[0]) as u64, 15, (&v_ae[0]) as u64, 4)
+        var v_ae: [u8; 14] = "gzip, br, zstd"
+        header(out, (&h_ae[0]) as u64, 15, (&v_ae[0]) as u64, 14)
     }
     if ninm > 0 {
         var h_inm: [u8; 13] = "If-None-Match"
@@ -653,6 +860,9 @@ fn build_request(c: *mut Client, u: *mut url.Url, method: u64, nm: usize,
             var h_ct: [u8; 12] = "Content-Type"
             header(out, (&h_ct[0]) as u64, 12, ctype, nct)
         }
+    }
+    if (*c).extra.len > 0 {
+        rt.buf_push_bytes(out, (*c).extra.ptr, (*c).extra.len)
     }
     var h_conn: [u8; 10] = "Connection"
     if (*c).keep_alive {
@@ -812,15 +1022,24 @@ fn take_from_buffer(c: *mut Client, want: usize, out: *mut rt.Buf) -> usize {
     if k > 0 {
         rt.buf_push_bytes(out, (*c).rbuf.ptr + (*c).rpos as u64, k)
         (*c).rpos = (*c).rpos + k
+        if (*c).rpos >= (*c).rbuf.len {
+            // everything read was taken: do not keep a second copy of a
+            // large body in the read buffer
+            rt.buf_clear(&(*c).rbuf)
+            (*c).rpos = 0
+        }
     }
     return k
 }
 
 fn read_exact_body(c: *mut Client, n: usize, out: *mut rt.Buf) -> HttpError!bool {
-    if n > BODY_MAX {
+    if n > BODY_MAX && !(*c).streaming {
         return HttpError::TooLarge
     }
     var done: usize = take_from_buffer(c, n, out)
+    if !sink_room(c, out) {
+        return HttpError::Aborted
+    }
     while done < n {
         var err: bool = false
         if !pump(c, &err) {
@@ -830,12 +1049,18 @@ fn read_exact_body(c: *mut Client, n: usize, out: *mut rt.Buf) -> HttpError!bool
             return HttpError::Body // shorter than announced
         }
         done = done + take_from_buffer(c, n - done, out)
+        if !sink_room(c, out) {
+            return HttpError::Aborted
+        }
     }
     return true
 }
 
 fn read_until_close(c: *mut Client, out: *mut rt.Buf) -> HttpError!bool {
     var done: usize = take_from_buffer(c, BODY_MAX, out)
+    if !sink_room(c, out) {
+        return HttpError::Aborted
+    }
     var more: bool = true
     while more {
         var err: bool = false
@@ -845,9 +1070,17 @@ fn read_until_close(c: *mut Client, out: *mut rt.Buf) -> HttpError!bool {
             }
             more = false
         } else {
-            done = done + take_from_buffer(c, BODY_MAX - done, out)
-            if done >= BODY_MAX {
-                return HttpError::TooLarge
+            if (*c).streaming {
+                // no limit when streaming: take what came, hand it on
+                done = done + take_from_buffer(c, (*c).rbuf.len - (*c).rpos, out)
+                if !sink_room(c, out) {
+                    return HttpError::Aborted
+                }
+            } else {
+                done = done + take_from_buffer(c, BODY_MAX - done, out)
+                if done >= BODY_MAX {
+                    return HttpError::TooLarge
+                }
             }
         }
     }
@@ -943,11 +1176,19 @@ fn read_chunked(c: *mut Client, r: *mut Response) -> HttpError!bool {
             (*r).chunks = (*r).chunks + 1 as u32
             let okb: bool = read_exact_body(c, size, &(*r).body)
             catch | e | chunk_fail(&line)
+            if (*c).aborted {
+                rt.buf_free(&line)
+                return HttpError::Aborted
+            }
             if !okb {
                 rt.buf_free(&line)
                 return HttpError::Body
             }
             total = total + size
+            if !sink_room(c, &(*r).body) {
+                rt.buf_free(&line)
+                return HttpError::Aborted
+            }
             // the CRLF behind the chunk
             let ok2: bool = try read_line(c, &line)
             if line.len != 0 {
@@ -982,6 +1223,8 @@ fn undo_encoding(r: *mut Response, enc: u64, ne: usize) -> HttpError!bool {
     var xgz: [u8; 6] = "x-gzip"
     var df: [u8; 7] = "deflate"
     var id: [u8; 8] = "identity"
+    var br: [u8; 2] = "br"
+    var zs: [u8; 4] = "zstd"
     if ne == 0 || ci_eq(enc, ne, (&id[0]) as u64, 8) {
         return true
     }
@@ -989,6 +1232,14 @@ fn undo_encoding(r: *mut Response, enc: u64, ne: usize) -> HttpError!bool {
     var ok: bool = false
     if ci_eq(enc, ne, (&gz[0]) as u64, 4) || ci_eq(enc, ne, (&xgz[0]) as u64, 6) {
         let n: usize = deflate.gzip_decompress((*r).body.ptr, (*r).body.len,
+            &out) catch 18446744073709551615 as usize
+        ok = n != 18446744073709551615 as usize
+    } else if ci_eq(enc, ne, (&br[0]) as u64, 2) {
+        let n: usize = brotli.brotli_decompress_limited((*r).body.ptr, (*r).body.len, 268435456,
+            &out) catch 18446744073709551615 as usize
+        ok = n != 18446744073709551615 as usize
+    } else if ci_eq(enc, ne, (&zs[0]) as u64, 4) {
+        let n: usize = zstd.zstd_decompress_limited((*r).body.ptr, (*r).body.len, 268435456,
             &out) catch 18446744073709551615 as usize
         ok = n != 18446744073709551615 as usize
     } else if ci_eq(enc, ne, (&df[0]) as u64, 7) {
@@ -1280,6 +1531,35 @@ fn exchange(c: *mut Client, u: *mut url.Url, method: u64, nm: usize,
             (*r).keep = false
         }
     }
+    // --- round DOWNLOAD: does this body go to the sink?
+    (*c).aborted = false
+    (*c).streaming = false
+    (*c).streamed = 0
+    (*c).body_status = (*r).status
+    (*c).body_clen = NO_LEN
+    if have_clen {
+        (*c).body_clen = clen as u64
+    }
+    var sinkable: bool = (*c).sink_set && !bodyless && !head_req &&
+    ((*r).status == 200 as u32 || (*r).status == 206 as u32)
+    var identity: bool = true
+    var atE0: u64 = 0
+    let nce0: usize = resp_header(r, (&h_ce[0]) as u64, 16, &atE0)
+    if nce0 > 0 {
+        var idn: [u8; 8] = "identity"
+        if !ci_eq(atE0, nce0, (&idn[0]) as u64, 8) {
+            identity = false
+        }
+    }
+    if sinkable && identity {
+        (*c).streaming = true
+        if !(*c).sink((*c).sink_ud, 0 as u64, 0) {
+            (*c).aborted = true
+            (*c).streaming = false
+            drop_conn(c)
+            return HttpError::Aborted
+        }
+    }
     if bodyless || head_req {
         (*r).wire = 0
     } else if chunked {
@@ -1294,6 +1574,13 @@ fn exchange(c: *mut Client, u: *mut url.Url, method: u64, nm: usize,
         (*r).wire = (*r).body.len
         (*r).keep = false
     }
+    if (*c).streaming {
+        (*c).streaming = false
+        if !sink_flush(c, &(*r).body) {
+            drop_conn(c)
+            return HttpError::Aborted
+        }
+    }
     if !(*c).keep_alive {
         (*r).keep = false
     }
@@ -1302,6 +1589,16 @@ fn exchange(c: *mut Client, u: *mut url.Url, method: u64, nm: usize,
     if nce > 0 && (*r).body.len > 0 {
         let oke: bool = try undo_encoding(r, atE, nce)
     }
+    if sinkable && !identity {
+        // decoded in memory, handed over in one piece
+        (*c).body_clen = (*r).body.len as u64
+        if !(*c).sink((*c).sink_ud, 0 as u64, 0) || !sink_flush(c, &(*r).body) {
+            (*c).aborted = true
+            drop_conn(c)
+            return HttpError::Aborted
+        }
+    }
+    (*r).streamed = (*c).streamed
     split_content_type(r)
     let ncook: usize = harvest_cookies(c, r, u)
     if !(*r).keep {
@@ -1463,7 +1760,8 @@ fn http_fetch(c: *mut Client, method: u64, nm: usize, urltext: u64,
             continue
         }
         // --- store it?
-        if is_get && (*c).use_cache && (*r).status == 200 as u32 {
+        if is_get && (*c).use_cache && (*r).status == 200 as u32 &&
+        (*r).streamed == 0 as u64 {
             var h_cc: [u8; 13] = "Cache-Control"
             var h_et: [u8; 4] = "ETag"
             var h_lm: [u8; 13] = "Last-Modified"
@@ -1543,6 +1841,7 @@ fn err_num(e: HttpError) -> u32 {
     if e == HttpError::TooManyRedirects { return 13 as u32 }
     if e == HttpError::RedirectLoop { return 14 as u32 }
     if e == HttpError::TooLarge { return 15 as u32 }
+    if e == HttpError::Aborted { return 17 as u32 }
     return 16 as u32
 }
 
@@ -1562,6 +1861,7 @@ fn err_of(n: u32) -> HttpError {
     if n == 13 as u32 { return HttpError::TooManyRedirects }
     if n == 14 as u32 { return HttpError::RedirectLoop }
     if n == 15 as u32 { return HttpError::TooLarge }
+    if n == 17 as u32 { return HttpError::Aborted }
     return HttpError::OutOfMemory
 }
 
@@ -1570,6 +1870,28 @@ fn http_get(c: *mut Client, u: u64, n: usize,
     var m: [u8; 3] = "GET"
     return http_fetch(c, (&m[0]) as u64, 3, u, n, 0 as u64, 0,
         0 as u64, 0, r)
+}
+
+// http_get with the error as a number (`err_num`, 0 = none): for callers
+// that cannot name the error type of this module in a `catch` handler.
+fn http_get_num(c: *mut Client, u: u64, n: usize, r: *mut Response) -> u32 {
+    var failed: u32 = 0
+    let ok: bool = http_get(c, u, n, r) catch | e | note(&failed, e)
+    if failed >= 10 as u32 {
+        return failed - 10 as u32
+    }
+    return 0 as u32
+}
+
+// http_post with the error as a number, see http_get_num.
+fn http_post_num(c: *mut Client, u: u64, n: usize, body: u64, nb: usize,
+    ctype: u64, nct: usize, r: *mut Response) -> u32 {
+    var failed: u32 = 0
+    let ok: bool = http_post(c, u, n, body, nb, ctype, nct, r) catch | e | note(&failed, e)
+    if failed >= 10 as u32 {
+        return failed - 10 as u32
+    }
+    return 0 as u32
 }
 
 fn http_post(c: *mut Client, u: u64, n: usize, body: u64, nb: usize,
@@ -1583,15 +1905,15 @@ fn http_post(c: *mut Client, u: u64, n: usize, body: u64, nb: usize,
 // outside it in stage 0 -- `http.HttpError::Tls` is not a form the parser
 // takes, and a number the caller has to decode again would be worse.
 fn err_name_of(e: HttpError, out: *mut rt.Buf) {
-    var t: [u8; 111] = "UrlSchemeTlsResolveConnectSendRecvClosedStatusHeaderBodyEncodingTooManyRedirectsRedirectLoopTooLargeOutOfMemory"
-    var offs: [usize; 17] = [0, 0, 3, 9, 12, 19, 26, 30, 34, 40, 46, 52, 56,
-        64, 80, 92, 100]
-    var lens: [usize; 17] = [0, 3, 6, 3, 7, 7, 4, 4, 6, 6, 6, 4, 8, 16, 12,
-        8, 11]
+    var t: [u8; 118] = "UrlSchemeTlsResolveConnectSendRecvClosedStatusHeaderBodyEncodingTooManyRedirectsRedirectLoopTooLargeOutOfMemoryAborted"
+    var offs: [usize; 18] = [0, 0, 3, 9, 12, 19, 26, 30, 34, 40, 46, 52, 56,
+        64, 80, 92, 100, 111]
+    var lens: [usize; 18] = [0, 3, 6, 3, 7, 7, 4, 4, 6, 6, 6, 4, 8, 16, 12,
+        8, 11, 7]
     let k: u32 = err_num(e)
     var i: usize = k as usize
-    if i > 16 {
-        i = 16
+    if i > 17 {
+        i = 17
     }
     rt.buf_push_bytes(out, (&t[0]) as u64 + offs[i] as u64, lens[i])
 }

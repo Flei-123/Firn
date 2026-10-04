@@ -1,0 +1,374 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/fleitec_login.fi -- "Sign in with Fleitec-ID": the client side of
+// docs/FLEITEC-ID.md section 7 for a program that has a login form (or a
+// saved login), on net.http and std.secret.
+//
+//     import appkit.fleitec_login as fid
+//     var f: fid.Fid = fid.fid_new()                    // https://jarvis.fleitec.com
+//     if fid.fid_load("myapp", "fleitec-id", &f) {      // a saved login
+//         if fid.fid_me(&f) == fid.FID_SIGNED_OUT { ... ask again ... }
+//     }
+//     let r: i64 = fid.fid_login(&f, "justin", password) // POST /api/login
+//     // r: FID_OK | FID_BAD_CREDENTIALS | FID_RATE_LIMITED (f.retry_after) |
+//     //    FID_FAILED | FID_UNREACHABLE        -- the five answers every SDK has
+//     fid.fid_save("myapp", "fleitec-id", &f)           // the token, in the keyring
+//     ... fid.fid_cookie_header(&f) for requests to other *.fleitec.com services
+//     fid.fid_logout(&f)
+//
+// WHAT IT IS, AND WHAT IT IS NOT
+//   * It speaks to the ID server (JARVIS): `POST /api/login`, `GET /api/me`,
+//     `POST /api/logout`. The password goes over https once and is never
+//     kept; the answer is a session token (a JWT, HS256, 30 days) that is
+//     saved in the keyring (std.secret) -- the Windows Credential Manager or
+//     the encrypted file.
+//   * The mapping of status codes is the one of docs/FLEITEC-ID.md section 7
+//     ("alle SDKs gleich"): login 200 with a token = ok, 401 = bad
+//     credentials, 429 = rate limited (Retry-After read), anything else
+//     (also 200 without a token) = failed, no answer = unreachable; me 200 =
+//     signed in, 401 = signed out, anything else = error. A name missing from
+//     the answer falls back to the typed one (trimmed).
+//   * IT DOES NOT CHECK THE TOKEN ITSELF. Checking needs the server's shared
+//     secret (lib/fleitec_id/jwt.fi, for servers); a program with a login
+//     form does not have it and must not. `fid_me` asks the server -- that is
+//     the authority (it also knows revocations, docs section 9 point 3).
+//     `fid_token_expiry` only READS the `exp` claim, for a "signed in for N
+//     more days" line.
+//   * It is NOT OAuth/OIDC: Fleitec-ID has no authorization endpoint, no
+//     consent page, no refresh token (docs section 12). When it gets one
+//     (the OIDC discovery is on the list there), auth.oauth is the client.
+//
+// HONEST
+//   F1  The server address is a parameter; https is required except for
+//       127.0.0.1/localhost (auth.oauth O1). The default is
+//       https://jarvis.fleitec.com -- the production host named in the spec;
+//       nothing here was run against it (a password cannot be tested without
+//       a real account). The tests use a stand-in server in the same process
+//       that checks the request bodies, the cookie and the status mapping.
+//   F2  The token is a `str` on the garbage collected heap (std.secret S3).
+//   F3  One Fid value is one connection: not thread safe.
+import std.rt
+import std.json
+import std.str
+import std.secret
+import net.http
+import fleitec_id.relay
+import fleitec_id.cookie
+import auth.jose
+import auth.oauth
+
+export {
+    Fid, fid_new, fid_init, fid_free, fid_set_server, fid_set_timeout,
+    fid_login, fid_me, fid_logout, fid_cookie_header, fid_token_expiry,
+    fid_signed_in, fid_save, fid_load, fid_delete, fid_to_json, fid_from_json,
+    FID_OK, FID_BAD_CREDENTIALS, FID_RATE_LIMITED, FID_FAILED, FID_UNREACHABLE,
+    FID_SIGNED_IN, FID_SIGNED_OUT, FID_ERROR, FID_SERVER,
+}
+
+const FID_SERVER: str = "https://jarvis.fleitec.com"
+
+// login
+const FID_OK: i64 = 0
+const FID_BAD_CREDENTIALS: i64 = 1
+const FID_RATE_LIMITED: i64 = 2
+const FID_FAILED: i64 = 3
+const FID_UNREACHABLE: i64 = 4
+// me
+const FID_SIGNED_IN: i64 = 10
+const FID_SIGNED_OUT: i64 = 11
+const FID_ERROR: i64 = 12
+
+struct Fid {
+    cl: http.Client,
+    server: str,
+    token: str, // the session JWT, "" when signed out
+    username: str,
+    device_token: str, // from /api/me, "" if none
+    admin: bool,
+    retry_after: i64, // seconds, from a 429
+    status: u32, // last HTTP status
+    body: rt.Buf,
+}
+
+fn fid_new() -> Fid {
+    return Fid { cl: http.client_new(), server: FID_SERVER, token: "", username: "",
+        device_token: "", admin: false, retry_after: 0, status: 0 as u32, body: rt.buf_new() }
+}
+
+fn fid_init(f: *mut Fid) -> bool {
+    if !http.client_init(&(*f).cl) {
+        return false
+    }
+    http.client_set_cache(&(*f).cl, false)
+    http.client_set_gzip(&(*f).cl, false)
+    http.client_set_timeout(&(*f).cl, 15000)
+    return true
+}
+
+fn fid_free(f: *mut Fid) {
+    http.client_free(&(*f).cl)
+    rt.buf_free(&(*f).body)
+}
+
+fn fid_set_server(f: *mut Fid, base: str) {
+    var n: usize = base.length()
+    while n > 0 && base.chars(n - 1) == 47 as u8 {
+        n = n - 1
+    }
+    (*f).server = base.part(0, n)
+}
+
+fn fid_set_timeout(f: *mut Fid, ms: u64) {
+    http.client_set_timeout(&(*f).cl, ms)
+}
+
+fn fid_signed_in(f: *mut Fid) -> bool {
+    return (*f).token.length() > 0
+}
+
+// "fleitec_session=<token, percent-encoded>" -- the Cookie header value for
+// requests to the other services of *.fleitec.com. "" when signed out.
+fn fid_cookie_header(f: *mut Fid) -> str {
+    if (*f).token.length() == 0 {
+        return ""
+    }
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, cookie.COOKIE_NAME.p as u64, cookie.COOKIE_NAME.length())
+    rt.buf_push(&b, 61 as u8)
+    relay.url_encode_token((*f).token.p as u64, (*f).token.length(), &b)
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+// One request. `body` may be empty (a GET). The answer's HTTP status in
+// Fid.status; false when nothing came back or the address is refused.
+fn call(f: *mut Fid, post: bool, what: str, body: *mut rt.Buf, with_cookie: bool) -> bool {
+    (*f).status = 0 as u32
+    rt.buf_clear(&(*f).body)
+    let target: str = (*f).server + what
+    if !oauth.oa_endpoint_ok(target) {
+        return false
+    }
+    var hdr: str = "Accept: application/json\r\n"
+    if with_cookie && (*f).token.length() > 0 {
+        hdr = hdr + "Cookie: " + fid_cookie_header(f) + "\r\n"
+    }
+    http.client_set_headers(&(*f).cl, hdr.p as u64, hdr.length())
+    var r: http.Response = http.resp_new()
+    var ne: u32 = 0 as u32
+    if post {
+        ne = http.http_post_num(&(*f).cl, target.p as u64, target.length(), (*body).ptr, (*body).len,
+            "application/json".p as u64, 16, &r)
+    } else {
+        ne = http.http_get_num(&(*f).cl, target.p as u64, target.length(), &r)
+    }
+    http.client_clear_headers(&(*f).cl)
+    if ne != 0 as u32 {
+        http.client_close(&(*f).cl)
+        http.resp_free(&r)
+        return false
+    }
+    (*f).status = http.resp_status(&r)
+    var ra: [u8; 11] = "Retry-After"
+    var at: u64 = 0
+    let nra: usize = http.resp_header(&r, (&ra[0]) as u64, 11, &at)
+    (*f).retry_after = 0
+    if nra > 0 {
+        var v: i64 = 0
+        var i: usize = 0
+        while i < nra && rt.ld8(at, i) >= 48 as u8 && rt.ld8(at, i) <= 57 as u8 && v < 1000000 {
+            v = v * 10 + (rt.ld8(at, i) - 48 as u8) as i64
+            i = i + 1
+        }
+        (*f).retry_after = v
+    }
+    rt.buf_push_bytes(&(*f).body, http.resp_body_ptr(&r), http.resp_body_len(&r))
+    http.resp_free(&r)
+    return true
+}
+
+fn trim(s: str) -> str {
+    var a: usize = 0
+    var b: usize = s.length()
+    while a < b && (s.chars(a) == 32 as u8 || s.chars(a) == 9 as u8) {
+        a = a + 1
+    }
+    while b > a && (s.chars(b - 1) == 32 as u8 || s.chars(b - 1) == 9 as u8) {
+        b = b - 1
+    }
+    return s.part(a, b - a)
+}
+
+// POST /api/login {username, password}.
+fn fid_login(f: *mut Fid, username: str, password: str) -> i64 {
+    var body: rt.Buf = rt.buf_new()
+    var w: json.JsonWriter = json.jw_new(&body, false)
+    json.jw_begin_object(&w)
+    json.jw_key(&w, "username".p as u64, 8)
+    json.jw_string(&w, username.p as u64, username.length())
+    json.jw_key(&w, "password".p as u64, 8)
+    json.jw_string(&w, password.p as u64, password.length())
+    json.jw_end(&w)
+    json.jw_free(&w)
+    let got: bool = call(f, true, "/api/login", &body, false)
+    rt.mem_set(body.ptr, 0 as u8, body.len) // the password does not stay in memory we own
+    rt.buf_free(&body)
+    if !got {
+        return FID_UNREACHABLE
+    }
+    if (*f).status == 401 as u32 {
+        return FID_BAD_CREDENTIALS
+    }
+    if (*f).status == 429 as u32 {
+        return FID_RATE_LIMITED
+    }
+    if (*f).status != 200 as u32 {
+        return FID_FAILED
+    }
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, (*f).body.ptr, (*f).body.len) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return FID_FAILED
+    }
+    let tok: str = oauth.oa_json_str(&d, json.json_root(&d), "token")
+    var name: str = oauth.oa_json_str(&d, json.json_root(&d), "username")
+    json.json_free(&d)
+    if tok.length() == 0 {
+        return FID_FAILED
+    }
+    if name.length() == 0 {
+        name = trim(username)
+    }
+    (*f).token = tok
+    (*f).username = name
+    return FID_OK
+}
+
+// GET /api/me with the session cookie: is the token still good?
+fn fid_me(f: *mut Fid) -> i64 {
+    if (*f).token.length() == 0 {
+        return FID_SIGNED_OUT
+    }
+    var none: rt.Buf = rt.buf_new()
+    let got: bool = call(f, false, "/api/me", &none, true)
+    rt.buf_free(&none)
+    if !got {
+        return FID_ERROR
+    }
+    if (*f).status == 401 as u32 {
+        return FID_SIGNED_OUT
+    }
+    if (*f).status != 200 as u32 {
+        return FID_ERROR
+    }
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, (*f).body.ptr, (*f).body.len) catch false
+    if ok && json.json_kind(&d, json.json_root(&d)) == json.JSON_OBJECT {
+        let root: u32 = json.json_root(&d)
+        let n: str = oauth.oa_json_str(&d, root, "username")
+        if n.length() > 0 {
+            (*f).username = n
+        }
+        (*f).device_token = oauth.oa_json_str(&d, root, "deviceToken")
+        let ad: u32 = json.json_get(&d, root, "admin".p as u64, 5)
+        (*f).admin = ad != json.JSON_NONE && json.json_kind(&d, ad) == json.JSON_TRUE
+    }
+    json.json_free(&d)
+    return FID_SIGNED_IN
+}
+
+// POST /api/logout (best effort), then forget the token in any case.
+fn fid_logout(f: *mut Fid) {
+    if (*f).token.length() > 0 {
+        var none: rt.Buf = rt.buf_new()
+        call(f, true, "/api/logout", &none, true)
+        rt.buf_free(&none)
+    }
+    (*f).token = ""
+    (*f).device_token = ""
+    (*f).admin = false
+}
+
+// The `exp` claim of the token (unix seconds), 0 when it has none. NOT a
+// check of the token (see the head).
+fn fid_token_expiry(f: *mut Fid) -> i64 {
+    if (*f).token.length() == 0 {
+        return 0
+    }
+    var j: jose.Jwt = jose.jwt_new()
+    var exp: i64 = 0
+    if jose.jwt_decode(&j, (*f).token) == jose.JWT_OK {
+        var found: bool = false
+        exp = jose.jwt_claim_int(&j, "exp", &found)
+        if !found {
+            exp = 0
+        }
+    }
+    jose.jwt_free(&j)
+    return exp
+}
+
+// {"server":..,"token":..,"username":..}
+fn fid_to_json(f: *mut Fid, out: *mut rt.Buf) {
+    var w: json.JsonWriter = json.jw_new(out, false)
+    json.jw_begin_object(&w)
+    json.jw_key(&w, "server".p as u64, 6)
+    json.jw_string(&w, (*f).server.p as u64, (*f).server.length())
+    json.jw_key(&w, "token".p as u64, 5)
+    json.jw_string(&w, (*f).token.p as u64, (*f).token.length())
+    json.jw_key(&w, "username".p as u64, 8)
+    json.jw_string(&w, (*f).username.p as u64, (*f).username.length())
+    json.jw_end(&w)
+    json.jw_free(&w)
+}
+
+fn fid_from_json(text: str, f: *mut Fid) -> bool {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, text.p as u64, text.length()) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return false
+    }
+    let root: u32 = json.json_root(&d)
+    let tok: str = oauth.oa_json_str(&d, root, "token")
+    let srv: str = oauth.oa_json_str(&d, root, "server")
+    let name: str = oauth.oa_json_str(&d, root, "username")
+    json.json_free(&d)
+    if tok.length() == 0 {
+        return false
+    }
+    (*f).token = tok
+    (*f).username = name
+    if srv.length() > 0 {
+        fid_set_server(f, srv)
+    }
+    return true
+}
+
+// The token goes to the keyring under (service, key).
+fn fid_save(service: str, key: str, f: *mut Fid) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    fid_to_json(f, &b)
+    let ok: bool = secret.secret_set_bytes(service, key, b.ptr, b.len) catch false
+    rt.mem_set(b.ptr, 0 as u8, b.len)
+    rt.buf_free(&b)
+    return ok
+}
+
+fn fid_load(service: str, key: str, f: *mut Fid) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = secret.secret_get_into(service, key, &b) catch 0
+    var ok: bool = false
+    if n > 0 {
+        ok = fid_from_json(str { p: rt.buf_data(&b), n: b.len }, f)
+    }
+    rt.mem_set(b.ptr, 0 as u8, b.cap)
+    rt.buf_free(&b)
+    return ok
+}
+
+fn fid_delete(service: str, key: str) -> bool {
+    let ok: bool = secret.secret_delete(service, key) catch false
+    return ok
+}

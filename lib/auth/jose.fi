@@ -1,0 +1,762 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/auth/jose.fi -- auth.jose: reading and CHECKING a JSON Web Token that an
+// identity provider signed (OpenID Connect id_tokens, access tokens that are
+// JWTs), with the provider's published keys (a JWKS).
+//
+// WHY ANOTHER JWT FILE. lib/fleitec_id/jwt.fi checks the HS256 session token
+// of the Fleitec-ID server against ONE shared secret and insists on a `uid`
+// claim; it cannot read an RS256/ES256 token and cannot look a key up by
+// `kid`. This file does what an OAuth client needs: it reads any token,
+// finds the key in a JWKS, checks the signature, and checks the claims the
+// RELYING PARTY is responsible for. It REUSES the other file where the work
+// is the same: the strict base64url decoder, the refusal codes and their
+// names (`JWT_OK` .. `JWT_NBF`); HS256 is checked here too, with a shared
+// secret, for any claim set (lib/fleitec_id/jwt.fi stays the one for the
+// Fleitec-ID session cookie, with its `uid` rules).
+//
+//     import auth.jose
+//     var keys: jose.Jwks = jose.jwks_new()
+//     jose.jwks_parse(&keys, json_text)                   // from the provider's jwks_uri
+//     var t: jose.Jwt = jose.jwt_new()
+//     if jose.jwt_decode(&t, token) == jose.JWT_OK {
+//         var pol: jose.Policy = jose.policy("https://issuer", "my-client-id")
+//         let why: i64 = jose.jwt_check(&t, &keys, &pol)  // 0 = valid
+//         let sub: str = jose.jwt_claim_str(&t, "sub")
+//     }
+//     jose.jwt_free(&t); jose.jwks_free(&keys)
+//
+// THE RULES (the same spirit as docs/FLEITEC-ID.md section 4):
+//   * three base64url parts, strictly decoded; any other count is malformed;
+//   * THE ALGORITHM IS DECIDED BY THE KEY, NOT BY THE TOKEN: the token's
+//     `alg` must be one of the allowed ones (`Policy.algs`), must fit the
+//     KIND of the key (RS* needs an RSA key, ES256 a P-256 key, ES384 a
+//     P-384 key, HS256 a shared secret) and, if the JWK names an `alg`, be
+//     equal to it. `none` is just not in the list. A key that came from a
+//     JWKS (`remote`) can NEVER be used as an HMAC secret: that is the
+//     classic RS256-to-HS256 confusion, and it is closed here by type;
+//   * the key is found by `kid`; a token without `kid` is checked against
+//     the only key of the set, else refused (no guessing);
+//   * `exp` is required and must lie strictly in the future (with `leeway`
+//     seconds of clock skew), `nbf` and `iat` may not lie in the future
+//     (leeway again); `iss` must equal the demanded one; the demanded `aud`
+//     must be the `aud` string or one entry of an `aud` array; a demanded
+//     `nonce` must match exactly (constant time);
+//   * the payload is read by PARSING it (std.json), never by searching.
+//
+// HONEST
+//   J1  ALGORITHMS: RS256, RS384, RS512 (PKCS#1 v1.5), ES256, ES384, HS256.
+//       Not: PS256 (RSA-PSS), ES512, EdDSA, HS384/HS512 -- `jwt_decode`
+//       accepts the token, `jwt_check` answers JWT_ALG. Microsoft, Google,
+//       GitHub and Keycloak sign with RS256; most others with RS256 or ES256.
+//   J2  RSA keys up to 4096 bits (std.crypto.big).
+//   J3  The check needs the key set; fetching it (and refetching once when a
+//       `kid` is unknown) is auth.oauth's job -- no network here.
+//   J4  A JWT is NOT encrypted (JWE is not supported): the claims are
+//       readable by anyone holding the token. Nothing secret belongs there.
+//   J5  Tokens are limited to 16 KiB (the id_tokens of the Microsoft
+//       identity platform are 1-3 KiB).
+import std.rt
+import std.str
+import std.json
+import std.time
+import std.base64
+import std.crypto.rsa
+import std.crypto.ecdsa
+import std.crypto.sha256
+import std.crypto.sha512
+import std.crypto.hmac
+import fleitec_id.jwt as fjwt
+
+export {
+    Jwt, Jwks, Policy,
+    jwt_new, jwt_free, jwt_decode, jwt_check, jwt_alg_name,
+    jwt_claim_str, jwt_claim_int, jwt_has_claim, jwt_aud_has, jwt_header_str,
+    jwt_kid, jwt_alg, jwt_payload,
+    jwks_new, jwks_free, jwks_parse, jwks_count, jwks_has_kid, jwks_add_secret,
+    policy, policy_algs, policy_nonce, policy_now, policy_leeway,
+    jwt_reason_name,
+    JWT_OK, JWT_MALFORMED, JWT_ALG, JWT_SIG, JWT_EXPIRED, JWT_CLAIMS,
+    JWT_ISS, JWT_AUD, JWT_NBF, JWT_NOKEY, JWT_NONCE,
+    ALG_NONE, ALG_HS256, ALG_RS256, ALG_RS384, ALG_RS512, ALG_ES256,
+    ALG_ES384, ALG_OTHER,
+    ALGS_DEFAULT, ALGS_ASYMMETRIC,
+    JWT_MAX,
+}
+
+// the refusals are the ones of lib/fleitec_id/jwt.fi, plus two
+const JWT_OK: i64 = 0
+const JWT_MALFORMED: i64 = 1
+const JWT_ALG: i64 = 2
+const JWT_SIG: i64 = 3
+const JWT_EXPIRED: i64 = 4
+const JWT_CLAIMS: i64 = 5
+const JWT_ISS: i64 = 7
+const JWT_AUD: i64 = 8
+const JWT_NBF: i64 = 9
+const JWT_NOKEY: i64 = 10 // no key in the set fits the token (kid / kind of key)
+const JWT_NONCE: i64 = 11
+
+const ALG_NONE: u32 = 0
+const ALG_HS256: u32 = 1
+const ALG_RS256: u32 = 2
+const ALG_RS384: u32 = 3
+const ALG_RS512: u32 = 4
+const ALG_ES256: u32 = 5
+const ALG_ES384: u32 = 6
+const ALG_OTHER: u32 = 99 // a name this file does not implement
+
+// Policy.algs is a bit mask of 1 << ALG_*
+const ALGS_ASYMMETRIC: u32 = 124 // RS256 RS384 RS512 ES256 ES384
+const ALGS_DEFAULT: u32 = 124
+
+const JWT_MAX: usize = 16384
+const KID_MAX: usize = 96
+const JWKS_MAX: usize = 16
+
+const K_RSA: u32 = 1
+const K_EC: u32 = 2
+const K_OCT: u32 = 3
+
+struct Jwt {
+    hdr: rt.Buf, // decoded header JSON
+    payload: rt.Buf, // decoded payload JSON
+    sig: rt.Buf, // decoded signature
+    input: rt.Buf, // "<header>.<payload>" as written, what was signed
+    token: rt.Buf, // the whole token as given (for the HS256 path)
+    alg: u32,
+    kid: [u8; 96],
+    nkid: usize,
+    ok: bool, // jwt_decode succeeded
+}
+
+struct Jwks {
+    arena: rt.Buf,
+    n: usize,
+    kind: [u32; 16],
+    curve: [u32; 16], // 1 = P-256, 2 = P-384
+    remote: [bool; 16],
+    kid_off: [u32; 16],
+    kid_len: [u32; 16],
+    alg_off: [u32; 16], // the JWK's own "alg", length 0 = none
+    alg_len: [u32; 16],
+    a_off: [u32; 16], // RSA n | EC x | oct k
+    a_len: [u32; 16],
+    b_off: [u32; 16], // RSA e | EC y
+    b_len: [u32; 16],
+}
+
+struct Policy {
+    iss: str, // "" = do not check (NOT recommended)
+    aud: str, // "" = do not check
+    nonce: str, // "" = do not check
+    now: i64, // 0 = the clock
+    leeway: i64, // seconds of clock skew allowed
+    algs: u32,
+    require_exp: bool,
+}
+
+// A policy that demands issuer and audience, 60 s of skew, the asymmetric
+// algorithms, and an `exp`.
+fn sp(s: str.Span) -> str {
+    return str { p: s.p, n: s.n }
+}
+
+fn policy(iss: str, aud: str) -> Policy {
+    return Policy { iss: iss, aud: aud, nonce: "", now: 0, leeway: 60,
+        algs: ALGS_DEFAULT, require_exp: true }
+}
+
+fn policy_algs(p: *mut Policy, mask: u32) { (*p).algs = mask }
+fn policy_nonce(p: *mut Policy, n: str) { (*p).nonce = n }
+fn policy_now(p: *mut Policy, t: i64) { (*p).now = t }
+fn policy_leeway(p: *mut Policy, s: i64) { (*p).leeway = s }
+
+fn jwt_new() -> Jwt {
+    return Jwt { hdr: rt.buf_new(), payload: rt.buf_new(), sig: rt.buf_new(),
+        input: rt.buf_new(), token: rt.buf_new(), alg: ALG_NONE, kid: [0; 96],
+        nkid: 0, ok: false }
+}
+
+fn jwt_free(j: *mut Jwt) {
+    rt.buf_free(&(*j).hdr)
+    rt.buf_free(&(*j).payload)
+    rt.buf_free(&(*j).sig)
+    rt.buf_free(&(*j).input)
+    rt.buf_free(&(*j).token)
+    (*j).ok = false
+}
+
+fn jwt_alg(j: *mut Jwt) -> u32 { return (*j).alg }
+
+fn jwt_kid(j: *mut Jwt) -> str {
+    return str { p: rt.ptr_of((&(*j).kid[0]) as u64), n: (*j).nkid }
+}
+
+// The decoded payload JSON (valid until jwt_free).
+fn jwt_payload(j: *mut Jwt) -> str {
+    return str { p: rt.buf_data(&(*j).payload), n: (*j).payload.len }
+}
+
+fn jwt_alg_name(a: u32) -> str {
+    if a == ALG_HS256 { return "HS256" }
+    if a == ALG_RS256 { return "RS256" }
+    if a == ALG_RS384 { return "RS384" }
+    if a == ALG_RS512 { return "RS512" }
+    if a == ALG_ES256 { return "ES256" }
+    if a == ALG_ES384 { return "ES384" }
+    if a == ALG_NONE { return "none" }
+    return "other"
+}
+
+fn jwt_reason_name(code: i64) -> str {
+    if code == JWT_OK { return "ok" }
+    if code == JWT_MALFORMED { return "malformed" }
+    if code == JWT_ALG { return "alg" }
+    if code == JWT_SIG { return "sig" }
+    if code == JWT_EXPIRED { return "expired" }
+    if code == JWT_CLAIMS { return "claims" }
+    if code == JWT_ISS { return "iss" }
+    if code == JWT_AUD { return "aud" }
+    if code == JWT_NBF { return "nbf" }
+    if code == JWT_NOKEY { return "nokey" }
+    if code == JWT_NONCE { return "nonce" }
+    return "unknown"
+}
+
+// ------------------------------------------------------------- decoding
+
+// Decodes base64url text (strictly) and appends it to `out`.
+fn b64_into(p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    rt.buf_reserve(out, (*out).len + n + 4)
+    if (*out).cap < (*out).len + n + 4 {
+        return false
+    }
+    let k: i64 = fjwt.b64url_decode(p, n, (*out).ptr + (*out).len as u64, (*out).cap - (*out).len)
+    if k < 0 {
+        return false
+    }
+    rt.buf_set_len(out, (*out).len + k as usize)
+    return true
+}
+
+fn alg_of(name: str) -> u32 {
+    if name == "HS256" { return ALG_HS256 }
+    if name == "RS256" { return ALG_RS256 }
+    if name == "RS384" { return ALG_RS384 }
+    if name == "RS512" { return ALG_RS512 }
+    if name == "ES256" { return ALG_ES256 }
+    if name == "ES384" { return ALG_ES384 }
+    if name == "none" || name == "None" || name == "NONE" || name.length() == 0 { return ALG_NONE }
+    return ALG_OTHER
+}
+
+// Splits and decodes `token`; checks nothing but the shape. JWT_OK or
+// JWT_MALFORMED. The header must be a JSON object with a string `alg`.
+fn jwt_decode(j: *mut Jwt, token: str) -> i64 {
+    jwt_free(j)
+    *j = jwt_new()
+    let n: usize = token.length()
+    if n < 8 || n > JWT_MAX {
+        return JWT_MALFORMED
+    }
+    let t: u64 = token.p as u64
+    var d1: usize = n
+    var d2: usize = n
+    var dots: usize = 0
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(t, i) == 46 as u8 {
+            dots = dots + 1
+            if dots == 1 {
+                d1 = i
+            } else if dots == 2 {
+                d2 = i
+            }
+        }
+        i = i + 1
+    }
+    if dots != 2 || d1 == 0 || d2 == d1 + 1 || d2 + 1 > n {
+        return JWT_MALFORMED
+    }
+    if !b64_into(t, d1, &(*j).hdr) || !b64_into(t + (d1 + 1) as u64, d2 - d1 - 1, &(*j).payload) ||
+    !b64_into(t + (d2 + 1) as u64, n - d2 - 1, &(*j).sig) {
+        return JWT_MALFORMED
+    }
+    rt.buf_push_bytes(&(*j).input, t, d2)
+    rt.buf_push_bytes(&(*j).token, t, n)
+    // the header
+    var h: json.Json = json.json_new()
+    let okh: bool = json.json_parse(&h, (*j).hdr.ptr, (*j).hdr.len) catch false
+    var rc: i64 = JWT_OK
+    if !okh || json.json_kind(&h, json.json_root(&h)) != json.JSON_OBJECT {
+        rc = JWT_MALFORMED
+    } else {
+        let an: u32 = claim_node(&h, "alg")
+        if an == json.JSON_NONE || json.json_kind(&h, an) != json.JSON_STRING {
+            rc = JWT_MALFORMED
+        } else {
+            let a: str.Span = json.json_string(&h, an)
+            (*j).alg = alg_of(sp(a))
+        }
+        let kn: u32 = claim_node(&h, "kid")
+        if kn != json.JSON_NONE && json.json_kind(&h, kn) == json.JSON_STRING {
+            let k: str.Span = json.json_string(&h, kn)
+            if k.n <= KID_MAX {
+                rt.mem_copy((&(*j).kid[0]) as u64, k.p as u64, k.n)
+                (*j).nkid = k.n
+            } else {
+                rc = JWT_MALFORMED
+            }
+        }
+    }
+    json.json_free(&h)
+    if rc == JWT_OK {
+        // the payload has to be a JSON object as well
+        var pl: json.Json = json.json_new()
+        let okp: bool = json.json_parse(&pl, (*j).payload.ptr, (*j).payload.len) catch false
+        if !okp || json.json_kind(&pl, json.json_root(&pl)) != json.JSON_OBJECT {
+            rc = JWT_MALFORMED
+        }
+        json.json_free(&pl)
+    }
+    (*j).ok = rc == JWT_OK
+    return rc
+}
+
+// ------------------------------------------------------------- claims
+
+// Reads one claim; `kind_ok` is the JSON kind wanted. Returns true when
+// found and of that kind, with the node in `d`.
+fn claim_node(d: *mut json.Json, name: str) -> u32 {
+    var key: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&key, name.p as u64, name.length())
+    let nd: u32 = json.json_get(d, json.json_root(d), key.ptr, key.len)
+    rt.buf_free(&key)
+    return nd
+}
+
+// A string claim, copied to the garbage collected heap; "" when it is
+// missing or not a string.
+fn jwt_claim_str(j: *mut Jwt, name: str) -> str {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, (*j).payload.ptr, (*j).payload.len) catch false
+    var out: str = ""
+    if ok {
+        let nd: u32 = claim_node(&d, name)
+        if nd != json.JSON_NONE && json.json_kind(&d, nd) == json.JSON_STRING {
+            let s: str.Span = json.json_string(&d, nd)
+            out = __str_copy(sp(s))
+        }
+    }
+    json.json_free(&d)
+    return out
+}
+
+// A string field of the HEADER.
+fn jwt_header_str(j: *mut Jwt, name: str) -> str {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, (*j).hdr.ptr, (*j).hdr.len) catch false
+    var out: str = ""
+    if ok {
+        let nd: u32 = claim_node(&d, name)
+        if nd != json.JSON_NONE && json.json_kind(&d, nd) == json.JSON_STRING {
+            let s: str.Span = json.json_string(&d, nd)
+            out = __str_copy(sp(s))
+        }
+    }
+    json.json_free(&d)
+    return out
+}
+
+fn jwt_has_claim(j: *mut Jwt, name: str) -> bool {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, (*j).payload.ptr, (*j).payload.len) catch false
+    var found: bool = false
+    if ok {
+        found = claim_node(&d, name) != json.JSON_NONE
+    }
+    json.json_free(&d)
+    return found
+}
+
+// An integer claim (NumericDate and the like). `found` says whether it was
+// there as a number; a fractional NumericDate is cut to whole seconds.
+fn jwt_claim_int(j: *mut Jwt, name: str, found: *mut bool) -> i64 {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, (*j).payload.ptr, (*j).payload.len) catch false
+    var v: i64 = 0
+    *found = false
+    if ok {
+        let nd: u32 = claim_node(&d, name)
+        if nd != json.JSON_NONE && json.json_kind(&d, nd) == json.JSON_NUMBER {
+            *found = true
+            if json.json_is_int(&d, nd) {
+                v = json.json_int(&d, nd)
+            } else {
+                v = json.json_number(&d, nd) as i64
+            }
+        }
+    }
+    json.json_free(&d)
+    return v
+}
+
+// Is `aud` the string `want`, or an entry of the array?
+fn jwt_aud_has(j: *mut Jwt, want: str) -> bool {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, (*j).payload.ptr, (*j).payload.len) catch false
+    var hit: bool = false
+    if ok {
+        let nd: u32 = claim_node(&d, "aud")
+        if nd != json.JSON_NONE {
+            let k: u8 = json.json_kind(&d, nd)
+            if k == json.JSON_STRING {
+                let s: str.Span = json.json_string(&d, nd)
+                hit = sp(s) == want
+            } else if k == json.JSON_ARRAY {
+                var c: u32 = json.json_child(&d, nd)
+                while c != json.JSON_NONE {
+                    if json.json_kind(&d, c) == json.JSON_STRING {
+                        let s2: str.Span = json.json_string(&d, c)
+                        if sp(s2) == want {
+                            hit = true
+                        }
+                    }
+                    c = json.json_next(&d, c)
+                }
+            }
+        }
+    }
+    json.json_free(&d)
+    return hit
+}
+
+// ------------------------------------------------------------- the keys
+
+fn jwks_new() -> Jwks {
+    return Jwks { arena: rt.buf_new(), n: 0, kind: [0; 16], curve: [0; 16],
+        remote: [false; 16], kid_off: [0; 16], kid_len: [0; 16], alg_off: [0; 16],
+        alg_len: [0; 16], a_off: [0; 16], a_len: [0; 16], b_off: [0; 16],
+        b_len: [0; 16] }
+}
+
+fn jwks_free(k: *mut Jwks) {
+    rt.buf_free(&(*k).arena)
+    (*k).n = 0
+}
+
+fn jwks_count(k: *mut Jwks) -> usize { return (*k).n }
+
+fn jwks_has_kid(k: *mut Jwks, kid: str) -> bool {
+    var i: usize = 0
+    while i < (*k).n {
+        if (*k).kid_len[i] as usize == kid.length() &&
+        rt.mem_eq((*k).arena.ptr + (*k).kid_off[i] as u64, kid.p as u64, kid.length()) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn arena_add(k: *mut Jwks, p: u64, n: usize) -> u32 {
+    let off: usize = (*k).arena.len
+    rt.buf_push_bytes(&(*k).arena, p, n)
+    return off as u32
+}
+
+// A shared secret for HS256 (a key that did NOT come from a JWKS). `kid`
+// may be "".
+fn jwks_add_secret(k: *mut Jwks, kid: str, secret: u64, n: usize) -> bool {
+    if (*k).n >= JWKS_MAX || n == 0 || kid.length() > KID_MAX {
+        return false
+    }
+    let i: usize = (*k).n
+    (*k).kind[i] = K_OCT
+    (*k).remote[i] = false
+    (*k).kid_off[i] = arena_add(k, kid.p as u64, kid.length())
+    (*k).kid_len[i] = kid.length() as u32
+    (*k).alg_len[i] = 0 as u32
+    (*k).a_off[i] = arena_add(k, secret, n)
+    (*k).a_len[i] = n as u32
+    (*k).n = i + 1
+    return true
+}
+
+// Reads a JWKS document ({"keys":[...]}). RSA ("n","e") and EC ("crv" P-256
+// or P-384, "x","y") keys that are for signatures (no `use` other than
+// "sig") are kept; others are skipped; a symmetric ("oct") key in a JWKS is
+// ignored on purpose (see the head). Returns the number of keys added, or
+// -1 when the text is not a JWKS.
+fn jwks_parse(k: *mut Jwks, text: str) -> i64 {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, text.p as u64, text.length()) catch false
+    if !ok {
+        json.json_free(&d)
+        return -1
+    }
+    let root: u32 = json.json_root(&d)
+    let keys: u32 = claim_node(&d, "keys")
+    if json.json_kind(&d, root) != json.JSON_OBJECT || keys == json.JSON_NONE ||
+    json.json_kind(&d, keys) != json.JSON_ARRAY {
+        json.json_free(&d)
+        return -1
+    }
+    var added: i64 = 0
+    var c: u32 = json.json_child(&d, keys)
+    while c != json.JSON_NONE {
+        if json.json_kind(&d, c) == json.JSON_OBJECT && (*k).n < JWKS_MAX {
+            add_jwk(k, &d, c)
+            added = added + 1
+        }
+        c = json.json_next(&d, c)
+    }
+    json.json_free(&d)
+    // `added` counted attempts; report what really is in the set
+    return (*k).n as i64
+}
+
+fn jstr(d: *mut json.Json, obj: u32, name: str) -> str.Span {
+    var key: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&key, name.p as u64, name.length())
+    let nd: u32 = json.json_get(d, obj, key.ptr, key.len)
+    rt.buf_free(&key)
+    if nd == json.JSON_NONE || json.json_kind(d, nd) != json.JSON_STRING {
+        return str.span_empty()
+    }
+    return json.json_string(d, nd)
+}
+
+// base64url member -> octets in the arena; false when it is not there / not valid
+fn jwk_b64(k: *mut Jwks, d: *mut json.Json, obj: u32, name: str, off: *mut u32, len: *mut u32) -> bool {
+    let s: str.Span = jstr(d, obj, name)
+    if s.n == 0 {
+        return false
+    }
+    var tmp: rt.Buf = rt.buf_new()
+    let good: bool = b64_into(s.p as u64, s.n, &tmp)
+    if good {
+        *off = arena_add(k, tmp.ptr, tmp.len)
+        *len = tmp.len as u32
+    }
+    rt.buf_free(&tmp)
+    return good && *len > 0 as u32
+}
+
+fn add_jwk(k: *mut Jwks, d: *mut json.Json, obj: u32) {
+    let kty: str.Span = jstr(d, obj, "kty")
+    let usev: str.Span = jstr(d, obj, "use")
+    if usev.n > 0 && !(sp(usev) == "sig") {
+        return
+    }
+    let kid: str.Span = jstr(d, obj, "kid")
+    if kid.n > KID_MAX {
+        return
+    }
+    let algs: str.Span = jstr(d, obj, "alg")
+    let i: usize = (*k).n
+    let mark: usize = (*k).arena.len
+    var ao: u32 = 0 as u32
+    var al: u32 = 0 as u32
+    var bo: u32 = 0 as u32
+    var bl: u32 = 0 as u32
+    var kind: u32 = 0 as u32
+    var curve: u32 = 0 as u32
+    if sp(kty) == "RSA" {
+        if !jwk_b64(k, d, obj, "n", &ao, &al) || !jwk_b64(k, d, obj, "e", &bo, &bl) {
+            rt.buf_set_len(&(*k).arena, mark)
+            return
+        }
+        // a leading zero octet in "n" is not allowed by RFC 7518 but seen;
+        // drop it so the length is the key length
+        if al > 1 as u32 && rt.ld8((*k).arena.ptr, ao as usize) == 0 as u8 {
+            ao = ao + 1 as u32
+            al = al - 1 as u32
+        }
+        if al < 128 as u32 || al > 512 as u32 {
+            rt.buf_set_len(&(*k).arena, mark)
+            return // below 1024 or above 4096 bits
+        }
+        kind = K_RSA
+    } else if sp(kty) == "EC" {
+        let crv: str.Span = jstr(d, obj, "crv")
+        var want: u32 = 0 as u32
+        if sp(crv) == "P-256" {
+            curve = 1 as u32
+            want = 32 as u32
+        } else if sp(crv) == "P-384" {
+            curve = 2 as u32
+            want = 48 as u32
+        } else {
+            return
+        }
+        if !jwk_b64(k, d, obj, "x", &ao, &al) || !jwk_b64(k, d, obj, "y", &bo, &bl) ||
+        al != want || bl != want {
+            rt.buf_set_len(&(*k).arena, mark)
+            return
+        }
+        kind = K_EC
+    } else {
+        return
+    }
+    (*k).kind[i] = kind
+    (*k).curve[i] = curve
+    (*k).remote[i] = true
+    (*k).kid_off[i] = arena_add(k, kid.p as u64, kid.n)
+    (*k).kid_len[i] = kid.n as u32
+    (*k).alg_off[i] = arena_add(k, algs.p as u64, algs.n)
+    (*k).alg_len[i] = algs.n as u32
+    (*k).a_off[i] = ao
+    (*k).a_len[i] = al
+    (*k).b_off[i] = bo
+    (*k).b_len[i] = bl
+    (*k).n = i + 1
+}
+
+// ----------------------------------------------------------- the check
+
+fn now_secs(pol: *mut Policy) -> i64 {
+    if (*pol).now != 0 {
+        return (*pol).now
+    }
+    return (time.now_unix_ms() / 1000) as i64
+}
+
+fn alg_fits(alg: u32, kind: u32, curve: u32) -> bool {
+    if alg == ALG_RS256 || alg == ALG_RS384 || alg == ALG_RS512 { return kind == K_RSA }
+    if alg == ALG_ES256 { return kind == K_EC && curve == 1 as u32 }
+    if alg == ALG_ES384 { return kind == K_EC && curve == 2 as u32 }
+    if alg == ALG_HS256 { return kind == K_OCT }
+    return false
+}
+
+// Which key? -1 none. A token with `kid` needs a key with that kid; one
+// without needs the set to hold exactly one key of a fitting kind.
+fn pick_key(j: *mut Jwt, k: *mut Jwks) -> i64 {
+    var found: i64 = -1
+    var fitting: i64 = 0
+    var i: usize = 0
+    while i < (*k).n {
+        if alg_fits((*j).alg, (*k).kind[i], (*k).curve[i]) {
+            if (*j).nkid > 0 {
+                if (*k).kid_len[i] as usize == (*j).nkid &&
+                rt.mem_eq((*k).arena.ptr + (*k).kid_off[i] as u64, (&(*j).kid[0]) as u64, (*j).nkid) {
+                    return i as i64
+                }
+            } else {
+                fitting = fitting + 1
+                found = i as i64
+            }
+        }
+        i = i + 1
+    }
+    if (*j).nkid == 0 && fitting == 1 {
+        return found
+    }
+    return -1
+}
+
+fn verify_sig(j: *mut Jwt, k: *mut Jwks, i: usize) -> bool {
+    let alg: u32 = (*j).alg
+    let a: u64 = (*k).arena.ptr + (*k).a_off[i] as u64
+    let al: usize = (*k).a_len[i] as usize
+    let b: u64 = (*k).arena.ptr + (*k).b_off[i] as u64
+    let bl: usize = (*k).b_len[i] as usize
+    let inp: u64 = (*j).input.ptr
+    let inl: usize = (*j).input.len
+    let sg: u64 = (*j).sig.ptr
+    let sl: usize = (*j).sig.len
+    var h: [u8; 64] = [0; 64]
+    if alg == ALG_HS256 {
+        var mac: [u8; 32] = [0; 32]
+        hmac.hmac_sha256(a, al, inp, inl, (&mac[0]) as u64)
+        return sl == 32 && hmac.hmac_equal((&mac[0]) as u64, sg, 32)
+    }
+    if alg == ALG_RS256 || alg == ALG_RS384 || alg == ALG_RS512 {
+        var ra: u32 = rsa.RSA_SHA256
+        if alg == ALG_RS384 { ra = rsa.RSA_SHA384 }
+        if alg == ALG_RS512 { ra = rsa.RSA_SHA512 }
+        if !rsa.hash_of(ra, inp, inl, (&h[0]) as u64) { return false }
+        return rsa.rsa_verify_pkcs1(a, al, b, bl, sg, sl, (&h[0]) as u64, ra)
+    }
+    if alg == ALG_ES256 {
+        if sl != 64 { return false }
+        sha256.sha256(inp, inl, (&h[0]) as u64)
+        return ecdsa.ecdsa_verify(a, b, sg, sg + 32, (&h[0]) as u64, 32)
+    }
+    if alg == ALG_ES384 {
+        if sl != 96 { return false }
+        sha512.sha384(inp, inl, (&h[0]) as u64)
+        return ecdsa.ecdsa_verify_p384(a, b, sg, sg + 48, (&h[0]) as u64, 48)
+    }
+    return false
+}
+
+// The whole check: algorithm and key, signature, then the claims. 0 (JWT_OK)
+// or the reason (jwt_reason_name).
+fn jwt_check(j: *mut Jwt, k: *mut Jwks, pol: *mut Policy) -> i64 {
+    if !(*j).ok {
+        return JWT_MALFORMED
+    }
+    let alg: u32 = (*j).alg
+    if alg == ALG_NONE || alg == ALG_OTHER || ((*pol).algs & (1 as u32 << alg)) == 0 as u32 {
+        return JWT_ALG
+    }
+    let ki: i64 = pick_key(j, k)
+    if ki < 0 {
+        return JWT_NOKEY
+    }
+    let i: usize = ki as usize
+    // a JWK that names an algorithm holds the token to it
+    if (*k).alg_len[i] > 0 as u32 {
+        let want: str = str { p: rt.ptr_of((*k).arena.ptr + (*k).alg_off[i] as u64),
+            n: (*k).alg_len[i] as usize }
+        if want != jwt_alg_name(alg) {
+            return JWT_ALG
+        }
+    }
+    // a key from the network is never an HMAC secret
+    if alg == ALG_HS256 && (*k).remote[i] {
+        return JWT_ALG
+    }
+    if !verify_sig(j, k, i) {
+        return JWT_SIG
+    }
+    // ---- claims
+    let now: i64 = now_secs(pol)
+    let lw: i64 = (*pol).leeway
+    var has: bool = false
+    let exp: i64 = jwt_claim_int(j, "exp", &has)
+    if !has {
+        if (*pol).require_exp {
+            return JWT_EXPIRED
+        }
+    } else if exp + lw <= now {
+        return JWT_EXPIRED
+    }
+    let nbf: i64 = jwt_claim_int(j, "nbf", &has)
+    if has && nbf - lw > now {
+        return JWT_NBF
+    }
+    let iat: i64 = jwt_claim_int(j, "iat", &has)
+    if has && iat - lw > now {
+        return JWT_NBF
+    }
+    if (*pol).iss.length() > 0 {
+        let iss: str = jwt_claim_str(j, "iss")
+        if iss != (*pol).iss {
+            return JWT_ISS
+        }
+    }
+    if (*pol).aud.length() > 0 && !jwt_aud_has(j, (*pol).aud) {
+        return JWT_AUD
+    }
+    if (*pol).nonce.length() > 0 {
+        let nc: str = jwt_claim_str(j, "nonce")
+        if nc.length() != (*pol).nonce.length() ||
+        !hmac.hmac_equal(nc.p as u64, (*pol).nonce.p as u64, nc.length()) {
+            return JWT_NONCE
+        }
+    }
+    return JWT_OK
+}

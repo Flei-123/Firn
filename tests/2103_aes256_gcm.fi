@@ -1,0 +1,165 @@
+// expect_exit: 0
+// tests/2103_aes256_gcm.fi -- AES-256 and AES-256-GCM (round TLS12), against
+// FIPS 197 and against Python's `cryptography` (AESGCM).
+//
+//  A  FIPS 197 C.3: the AES-256 block encryption of the standard's vector,
+//     on the hardware path AND on the scalar one (both must agree)
+//  B  GCM with 256 bit keys: eight cases (plaintext 0 to 333 octets, additional
+//     data 0 to 20 octets, one with a 128 bit key as the control) -- the
+//     sealed octets are exactly what `cryptography` produced from the same
+//     key, nonce, additional data and plaintext
+//  C  opening gives the plaintext back, and ONE flipped bit anywhere in the
+//     ciphertext, the tag or the additional data is refused
+//  D  a key that is neither 16 nor 32 octets long is refused
+//  E  `aes_decrypt_block` and CBC on an AES-256 object do nothing and say so
+//     instead of computing the wrong thing (aes.fi A1)
+import std.rt
+import std.str
+import std.crypto.aes
+import std.crypto.gcm
+
+fn hexval(c: u8) -> u8 {
+    if c >= 97 as u8 {
+        return c - 87 as u8
+    }
+    return c - 48 as u8
+}
+
+fn unhex(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i + 1 < s.length() {
+        rt.buf_push(out, (hexval(s.chars(i)) << 4 as u8) | hexval(s.chars(i + 1)))
+        i = i + 2
+    }
+}
+
+// the same byte pattern the generator used: (i * k + 3) % 251
+fn pat(n: usize, k: usize, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(out, ((i * k + 3) % 251) as u8)
+        i = i + 1
+    }
+}
+
+fn check(keylen: usize, pn: usize, an: usize, want_hex: str) -> bool {
+    var key: rt.Buf = rt.buf_new()
+    var nonce: rt.Buf = rt.buf_new()
+    var aad: rt.Buf = rt.buf_new()
+    var pt: rt.Buf = rt.buf_new()
+    var want: rt.Buf = rt.buf_new()
+    pat(keylen, 5, &key)
+    pat(12, 9, &nonce)
+    pat(an, 11, &aad)
+    pat(pn, 13, &pt)
+    unhex(want_hex, &want)
+    var ok: bool = rt.buf_len(&want) == pn + 16
+    var ct: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&ct, pn + 16)
+    rt.buf_set_len(&ct, pn + 16)
+    if ok {
+        ok = gcm.gcm_seal(rt.buf_ptr(&key), keylen, rt.buf_ptr(&nonce), rt.buf_ptr(&aad), an,
+            rt.buf_ptr(&pt), pn, rt.buf_ptr(&ct))
+    }
+    if ok && !rt.mem_eq(rt.buf_ptr(&ct), rt.buf_ptr(&want), pn + 16) {
+        ok = false
+    }
+    // C: open it again, then break it in three places
+    var back: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&back, pn + 16)
+    rt.buf_set_len(&back, pn + 16)
+    if ok {
+        ok = gcm.gcm_open(rt.buf_ptr(&key), keylen, rt.buf_ptr(&nonce), rt.buf_ptr(&aad), an,
+            rt.buf_ptr(&ct), pn + 16, rt.buf_ptr(&back))
+        if ok && pn > 0 && !rt.mem_eq(rt.buf_ptr(&back), rt.buf_ptr(&pt), pn) {
+            ok = false
+        }
+    }
+    if ok && pn > 0 {
+        rt.st8(rt.buf_ptr(&ct), pn / 2, rt.ld8(rt.buf_ptr(&ct), pn / 2) ^ 1 as u8)
+        if gcm.gcm_open(rt.buf_ptr(&key), keylen, rt.buf_ptr(&nonce), rt.buf_ptr(&aad), an,
+            rt.buf_ptr(&ct), pn + 16, rt.buf_ptr(&back)) {
+            ok = false
+        }
+        rt.st8(rt.buf_ptr(&ct), pn / 2, rt.ld8(rt.buf_ptr(&ct), pn / 2) ^ 1 as u8)
+    }
+    if ok {
+        rt.st8(rt.buf_ptr(&ct), pn + 15, rt.ld8(rt.buf_ptr(&ct), pn + 15) ^ 128 as u8)
+        if gcm.gcm_open(rt.buf_ptr(&key), keylen, rt.buf_ptr(&nonce), rt.buf_ptr(&aad), an,
+            rt.buf_ptr(&ct), pn + 16, rt.buf_ptr(&back)) {
+            ok = false
+        }
+        rt.st8(rt.buf_ptr(&ct), pn + 15, rt.ld8(rt.buf_ptr(&ct), pn + 15) ^ 128 as u8)
+    }
+    if ok && an > 0 {
+        rt.st8(rt.buf_ptr(&aad), 0, rt.ld8(rt.buf_ptr(&aad), 0) ^ 4 as u8)
+        if gcm.gcm_open(rt.buf_ptr(&key), keylen, rt.buf_ptr(&nonce), rt.buf_ptr(&aad), an,
+            rt.buf_ptr(&ct), pn + 16, rt.buf_ptr(&back)) {
+            ok = false
+        }
+    }
+    rt.buf_free(&key)
+    rt.buf_free(&nonce)
+    rt.buf_free(&aad)
+    rt.buf_free(&pt)
+    rt.buf_free(&want)
+    rt.buf_free(&ct)
+    rt.buf_free(&back)
+    return ok
+}
+
+fn main() -> i32 {
+    // ---- A. FIPS 197 C.3
+    var key: [u8; 32] = [0 as u8; 32]
+    var i: usize = 0
+    while i < 32 {
+        key[i] = i as u8
+        i = i + 1
+    }
+    var blk: [u8; 16] = [0 as u8; 16]
+    i = 0
+    while i < 16 {
+        blk[i] = (i * 17) as u8
+        i = i + 1
+    }
+    var want: rt.Buf = rt.buf_new()
+    unhex("8ea2b7ca516745bfeafc49904b496089", &want)
+    var hw: aes.Aes = aes.aes256_new((&key[0]) as u64)
+    var sw: aes.Aes = aes.aes256_new_soft((&key[0]) as u64)
+    var o1: [u8; 16] = [0 as u8; 16]
+    var o2: [u8; 16] = [0 as u8; 16]
+    aes.aes_encrypt_block(&hw, (&blk[0]) as u64, (&o1[0]) as u64)
+    aes.aes_encrypt_block(&sw, (&blk[0]) as u64, (&o2[0]) as u64)
+    if !rt.mem_eq((&o1[0]) as u64, rt.buf_ptr(&want), 16) { return 1 as i32 }
+    if !rt.mem_eq((&o2[0]) as u64, rt.buf_ptr(&want), 16) { return 2 as i32 }
+
+    // ---- B / C
+    if !check(32, 0, 0, "a4a7eebe0293b6a1687a54607ddaf9ff") { return 10 as i32 }
+    if !check(32, 1, 0, "cb37384c70c1c9dfe446a0d2ff9b97f62e") { return 11 as i32 }
+    if !check(32, 16, 13, "cbf28318b27e0603b9da27ebd2a81a834d40160a86a2991082f5dc91fd49a4c6") { return 12 as i32 }
+    if !check(32, 17, 5, "cbf28318b27e0603b9da27ebd2a81a8330b1aa401f6eba16398194bdce763907f9") { return 13 as i32 }
+    if !check(32, 60, 20, "cbf28318b27e0603b9da27ebd2a81a83306d1b91d18583423d85450b93a047c734b86cf80af68df29ce43008cfa8a4cc0d9dbda7a3121924d94a5775737f1b016e2e1048177fbd9222b5e082") { return 14 as i32 }
+    if !check(32, 100, 13, "cbf28318b27e0603b9da27ebd2a81a83306d1b91d18583423d85450b93a047c734b86cf80af68df29ce43008cfa8a4cc0d9dbda7a3121924d94a5775f11638a79533dd91615db40d8cd37dc252a9c35aa255222b7a9da87d0943aae1964026e0be6ab75b3ce290fc30c7aa51772ca79f6c1bbdda") { return 15 as i32 }
+    if !check(32, 333, 0, "cbf28318b27e0603b9da27ebd2a81a83306d1b91d18583423d85450b93a047c734b86cf80af68df29ce43008cfa8a4cc0d9dbda7a3121924d94a5775f11638a79533dd91615db40d8cd37dc252a9c35aa255222b7a9da87d0943aae1964026e0be6ab75bf32fa2057cbf5f9e10efa378e8dfa16852679f8b949688a312721a53209f4c4bae05d45078332ca43409e5ff2c3c743f518ad51110739d068eb790c3d1cd4eda54e562e7c226211cdc4386013f3b0935964a9464421dbc5ae7ac92307b77afeb66378dd74aae51a0b0b4240308affbef36db6fd8627df478c9182d76af5aaac512399ccde4491bc8527b1196be76c8e436f357472eef3a4d75a8fe5eb740664e7d86b24ebd9cdca3429155cbe962e187ee9b816fc18ca33df01904a1c709c30f4c5c3d454426c28c78887fdffdbc70d0c9bb63d3b99b0469b28801d13cb7da98950aee7c727ffd907361d240acd748b5a8ae598e043a14a106") { return 16 as i32 }
+    if !check(16, 50, 13, "1b50ea70f2b89c36c5eb1c1c7c4e329c2a06c2da9a0bb6692f19e7f9406f7de4fd12672b25b04d06757c60af385476abc4ff96b06a469243de9be0b10edce214174a") { return 17 as i32 }
+
+    // ---- D. a key length that does not exist
+    var nonce: [u8; 12] = [0 as u8; 12]
+    var out: [u8; 48] = [0 as u8; 48]
+    var plain: [u8; 16] = [0 as u8; 16]
+    if gcm.gcm_seal((&key[0]) as u64, 24, (&nonce[0]) as u64, (&plain[0]) as u64, 0,
+        (&plain[0]) as u64, 16, (&out[0]) as u64) { return 30 as i32 }
+    if gcm.gcm_seal((&key[0]) as u64, 0, (&nonce[0]) as u64, (&plain[0]) as u64, 0,
+        (&plain[0]) as u64, 16, (&out[0]) as u64) { return 31 as i32 }
+
+    // ---- E. what an AES-256 object does not do
+    var iv: [u8; 16] = [0 as u8; 16]
+    var big: [u8; 32] = [7 as u8; 32]
+    var res: [u8; 32] = [0 as u8; 32]
+    if aes.aes_cbc_encrypt(&hw, (&iv[0]) as u64, (&big[0]) as u64, 32, (&res[0]) as u64) { return 32 as i32 }
+    if aes.aes_cbc_decrypt(&hw, (&iv[0]) as u64, (&big[0]) as u64, 32, (&res[0]) as u64) { return 33 as i32 }
+    var untouched: [u8; 16] = [9 as u8; 16]
+    aes.aes_decrypt_block(&hw, (&blk[0]) as u64, (&untouched[0]) as u64)
+    if untouched[0] != 9 as u8 || untouched[15] != 9 as u8 { return 34 as i32 }
+    return 0
+}

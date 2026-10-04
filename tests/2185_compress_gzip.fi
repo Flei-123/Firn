@@ -1,0 +1,271 @@
+// expect_exit: 0
+// tests/2185_compress_gzip.fi -- lib/compress/gzip.fi, the streaming inflater
+// for gzip (several members, header fields, zero padding), zlib and raw DEFLATE:
+// streams made by Python's zlib and gzip (levels 0, 6, 9, fixed Huffman), read
+// octet for octet; streams written by std.deflate read by this decoder; refusals
+// (cut, flipped, CRC/ISIZE/Adler, bad stored length, a member that reaches into
+// the member before it, FDICT, limits); the reader from a descriptor.
+import compress.common
+import compress.gzip
+import std.deflate
+import std.rt
+import std.io
+import std.fs
+
+const PLAIN: str = __include_str("data/compress/plain.bin")
+const MIX: str = __include_str("data/compress/mix.bin")
+const F_GZ: str = __include_str("data/compress/plain.gz")
+const F_MULTI: str = __include_str("data/compress/plain_multi.gz")
+const F_STORED: str = __include_str("data/compress/plain_stored.gz")
+const F_ZLIB: str = __include_str("data/compress/plain.zlib")
+const F_DEFLATE: str = __include_str("data/compress/plain.deflate")
+const F_FIXED: str = __include_str("data/compress/plain_fixed.deflate")
+const F_CROSS: str = __include_str("data/compress/crossmember.gz")
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+static mut code: u32 = 0
+
+fn why(e: CompressError) -> usize {
+    if e == CompressError::Data { code = 1 }
+    if e == CompressError::Format { code = 2 }
+    if e == CompressError::Checksum { code = 3 }
+    if e == CompressError::Truncated { code = 4 }
+    if e == CompressError::TooLarge { code = 5 }
+    if e == CompressError::OutOfMemory { code = 6 }
+    if e == CompressError::Unsupported { code = 7 }
+    if e == CompressError::Dictionary { code = 8 }
+    if e == CompressError::Io { code = 9 }
+    return 0
+}
+
+fn is_plain(b: *mut rt.Buf, want: str) -> bool {
+    return rt.buf_len(b) == want.length() && rt.mem_eq(rt.buf_ptr(b), want.p as u64, want.length())
+}
+
+fn view(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn scratch(tag: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, "/tmp/firn_".p as u64, 10)
+    rt.buf_push_bytes(&b, tag.p as u64, tag.length())
+    rt.buf_push(&b, 95 as u8)
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+// deterministic pseudo random octets
+fn pseudo(n: usize, seed: u64) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    var x: u64 = seed
+    var i: usize = 0
+    while i < n {
+        x = x *% 6364136223846793005 +% 1442695040888963407
+        rt.buf_push(&b, ((x >> 33) & 255) as u8)
+        i = i + 1
+    }
+    return b
+}
+
+fn zeros(n: usize) -> rt.Buf {
+    var z: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&z, n)
+    rt.mem_set(rt.buf_ptr(&z), 0 as u8, n)
+    rt.buf_set_len(&z, n)
+    return z
+}
+
+fn finish(t: *mut Tally) -> i32 {
+    io.print("checks: ")
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&nb, (*t).total)
+    io.print_bytes(rt.buf_ptr(&nb), rt.buf_len(&nb))
+    io.print_line("")
+    if (*t).fails != 0 {
+        return 1 as i32
+    }
+    return 0
+}
+
+fn dec(kind: u32, z: str, max: usize, out: *mut rt.Buf) -> u32 {
+    code = 0
+    gzip.gz_decompress_limited(z.p as u64, z.length(), kind, max, out) catch | e | (why(e))
+    return code
+}
+
+fn decodes_to(t: *mut Tally, what: str, kind: u32, z: str, want: str) {
+    var out: rt.Buf = rt.buf_new()
+    let c: u32 = dec(kind, z, 0, &out)
+    check(t, what, c == 0 as u32 && is_plain(&out, want))
+    rt.buf_free(&out)
+}
+
+fn stream_dec(path: str, kind: u32, z: str, piece: usize, out: *mut rt.Buf) -> u32 {
+    code = 0
+    fs.write_file(path, z.p as u64, z.length()) catch 0
+    let fd: i64 = fs.open_read(path) catch -1
+    if fd < 0 {
+        return 99 as u32
+    }
+    var d: gzip.GzDec = gzip.gz_dec_open_fd(fd, kind)
+    let tmp: u64 = rt.heap_alloc(piece)
+    while true {
+        let k: usize = gzip.gz_dec_read(&d, tmp, piece) catch | e | (why(e))
+        if code != 0 as u32 || k == 0 {
+            break
+        }
+        rt.buf_push_bytes(out, tmp, k)
+    }
+    rt.heap_free(tmp, piece)
+    gzip.gz_dec_close(&d)
+    fs.close_fd(fd)
+    return code
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let path: str = scratch("gz2185")
+
+    decodes_to(&t, "gzip, level 6", gzip.GZ_GZIP, F_GZ, PLAIN)
+    decodes_to(&t, "gzip with auto detection", gzip.GZ_AUTO, F_GZ, PLAIN)
+    decodes_to(&t, "two members, a file name in the first, zero padding at the end", gzip.GZ_GZIP, F_MULTI, PLAIN)
+    decodes_to(&t, "gzip with stored blocks (level 0)", gzip.GZ_GZIP, F_STORED, PLAIN)
+    decodes_to(&t, "zlib", gzip.GZ_ZLIB, F_ZLIB, PLAIN)
+    decodes_to(&t, "zlib with auto detection", gzip.GZ_AUTO, F_ZLIB, PLAIN)
+    decodes_to(&t, "raw DEFLATE", gzip.GZ_RAW, F_DEFLATE, PLAIN)
+    decodes_to(&t, "raw DEFLATE, fixed Huffman", gzip.GZ_RAW, F_FIXED, str { p: PLAIN.p, n: 3000 })
+    // std.deflate's writer, every level, read by the streaming reader
+    var lv: usize = 1
+    var bad: usize = 0
+    while lv <= 9 {
+        var z: rt.Buf = rt.buf_new()
+        deflate.gzip_compress(PLAIN.p as u64, PLAIN.length(), lv, &z) catch 0
+        var back: rt.Buf = rt.buf_new()
+        if dec(gzip.GZ_GZIP, view(&z), 0, &back) != 0 as u32 || !is_plain(&back, PLAIN) {
+            bad = bad + 1
+        }
+        rt.buf_clear(&back)
+        rt.buf_clear(&z)
+        deflate.zlib_compress(MIX.p as u64, MIX.length(), lv, &z) catch 0
+        if dec(gzip.GZ_ZLIB, view(&z), 0, &back) != 0 as u32 || !is_plain(&back, MIX) {
+            bad = bad + 1
+        }
+        rt.buf_free(&back)
+        rt.buf_free(&z)
+        lv = lv + 1
+    }
+    check(&t, "std.deflate gzip/zlib output at levels 1..9 read back", bad == 0)
+    // refusals
+    var o: rt.Buf = rt.buf_new()
+    check(&t, "no gzip magic is Format", dec(gzip.GZ_GZIP, "this is not gzip data at all!", 0, &o) == 2 as u32)
+    rt.buf_clear(&o)
+    check(&t, "empty input is Truncated", dec(gzip.GZ_GZIP, "", 0, &o) == 4 as u32)
+    var cuts: usize = 0
+    var badc: usize = 0
+    var c: usize = 0
+    while c < F_GZ.length() {
+        rt.buf_clear(&o)
+        cuts = cuts + 1
+        if dec(gzip.GZ_GZIP, str { p: F_GZ.p, n: c }, 0, &o) == 0 as u32 {
+            badc = badc + 1
+        }
+        c = c + 43
+    }
+    check(&t, "every cut of a gzip file is refused", badc == 0 && cuts > 100)
+    var dmg: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&dmg, F_GZ.p as u64, F_GZ.length())
+    rt.st8(rt.buf_ptr(&dmg), F_GZ.length() - 8, rt.ld8(rt.buf_ptr(&dmg), F_GZ.length() - 8) ^ 1 as u8) // the CRC-32
+    rt.buf_clear(&o)
+    check(&t, "a wrong CRC-32 is Checksum", dec(gzip.GZ_GZIP, view(&dmg), 0, &o) == 3 as u32)
+    rt.buf_clear(&dmg)
+    rt.buf_push_bytes(&dmg, F_GZ.p as u64, F_GZ.length())
+    rt.st8(rt.buf_ptr(&dmg), F_GZ.length() - 1, rt.ld8(rt.buf_ptr(&dmg), F_GZ.length() - 1) ^ 1 as u8) // ISIZE
+    rt.buf_clear(&o)
+    check(&t, "a wrong ISIZE is Checksum", dec(gzip.GZ_GZIP, view(&dmg), 0, &o) == 3 as u32)
+    rt.buf_clear(&dmg)
+    rt.buf_push_bytes(&dmg, F_ZLIB.p as u64, F_ZLIB.length())
+    rt.st8(rt.buf_ptr(&dmg), F_ZLIB.length() - 1, rt.ld8(rt.buf_ptr(&dmg), F_ZLIB.length() - 1) ^ 1 as u8)
+    rt.buf_clear(&o)
+    check(&t, "a wrong Adler-32 is Checksum", dec(gzip.GZ_ZLIB, view(&dmg), 0, &o) == 3 as u32)
+    rt.buf_clear(&dmg)
+    rt.buf_push_bytes(&dmg, F_ZLIB.p as u64, F_ZLIB.length())
+    rt.st8(rt.buf_ptr(&dmg), 1, rt.ld8(rt.buf_ptr(&dmg), 1) | 32 as u8) // FDICT (and a broken header check)
+    rt.buf_clear(&o)
+    check(&t, "zlib with a damaged header is Format", dec(gzip.GZ_ZLIB, view(&dmg), 0, &o) == 2 as u32)
+    // stored block with a bad LEN/NLEN: the first block of the level-0 file
+    rt.buf_clear(&dmg)
+    rt.buf_push_bytes(&dmg, F_STORED.p as u64, F_STORED.length())
+    rt.st8(rt.buf_ptr(&dmg), 10 + 1 + 2, rt.ld8(rt.buf_ptr(&dmg), 10 + 1 + 2) ^ 1 as u8)
+    rt.buf_clear(&o)
+    check(&t, "a stored block whose NLEN is not ~LEN is Data", dec(gzip.GZ_GZIP, view(&dmg), 0, &o) == 1 as u32)
+    var wrong: usize = 0
+    var k: usize = 0
+    while k < 80 {
+        rt.buf_clear(&dmg)
+        rt.buf_push_bytes(&dmg, F_GZ.p as u64, F_GZ.length())
+        let at: usize = 10 + (k * 71) % (F_GZ.length() - 20)
+        rt.st8(rt.buf_ptr(&dmg), at, rt.ld8(rt.buf_ptr(&dmg), at) ^ ((1 + k % 7) as u8))
+        rt.buf_clear(&o)
+        if dec(gzip.GZ_GZIP, view(&dmg), 0, &o) == 0 as u32 && !is_plain(&o, PLAIN) {
+            wrong = wrong + 1
+        }
+        k = k + 1
+    }
+    check(&t, "damaged streams: never a wrong answer", wrong == 0)
+    rt.buf_free(&dmg)
+    rt.buf_clear(&o)
+    check(&t, "a member must not reach into the member before it", dec(gzip.GZ_GZIP, F_CROSS, 0, &o) == 1 as u32)
+    rt.buf_clear(&o)
+    check(&t, "limit == size passes", dec(gzip.GZ_GZIP, F_GZ, PLAIN.length(), &o) == 0 as u32 && is_plain(&o, PLAIN))
+    rt.buf_clear(&o)
+    check(&t, "limit == size - 1 is TooLarge, nothing past it written",
+        dec(gzip.GZ_GZIP, F_GZ, PLAIN.length() - 1, &o) == 5 as u32 && rt.buf_len(&o) <= PLAIN.length() - 1)
+    // a bomb: 4 MiB of zeros through std.deflate
+    var zero: rt.Buf = zeros(4194304)
+    var zz: rt.Buf = rt.buf_new()
+    deflate.gzip_compress(rt.buf_ptr(&zero), 4194304, 6, &zz) catch 0
+    rt.buf_clear(&o)
+    check(&t, "the bomb under a limit of 1 MiB is TooLarge", dec(gzip.GZ_GZIP, view(&zz), 1048576, &o) == 5 as u32 && rt.buf_len(&o) <= 1048576)
+    rt.buf_clear(&o)
+    check(&t, "the bomb at its size passes", dec(gzip.GZ_GZIP, view(&zz), 4194304, &o) == 0 as u32 && rt.buf_len(&o) == 4194304)
+    var s3: rt.Buf = rt.buf_new()
+    check(&t, "stream-decode of the bomb (a 32 KiB window)", stream_dec(path, gzip.GZ_GZIP, view(&zz), 70000, &s3) == 0 as u32
+        && rt.buf_len(&s3) == 4194304 && rt.mem_eq(rt.buf_ptr(&s3), rt.buf_ptr(&zero), 4194304))
+    rt.buf_free(&s3)
+    rt.buf_free(&zz)
+    rt.buf_free(&zero)
+    // streaming
+    var pieces: [usize; 4] = [1, 11, 4096, 100000]
+    var pi: usize = 0
+    while pi < 4 {
+        var s2: rt.Buf = rt.buf_new()
+        check(&t, "stream-decode gzip", stream_dec(path, gzip.GZ_GZIP, F_GZ, pieces[pi], &s2) == 0 as u32 && is_plain(&s2, PLAIN))
+        rt.buf_clear(&s2)
+        check(&t, "stream-decode two members + padding", stream_dec(path, gzip.GZ_AUTO, F_MULTI, pieces[pi], &s2) == 0 as u32 && is_plain(&s2, PLAIN))
+        rt.buf_clear(&s2)
+        check(&t, "stream-decode zlib", stream_dec(path, gzip.GZ_ZLIB, F_ZLIB, pieces[pi], &s2) == 0 as u32 && is_plain(&s2, PLAIN))
+        rt.buf_clear(&s2)
+        check(&t, "stream-decode raw deflate", stream_dec(path, gzip.GZ_RAW, F_DEFLATE, pieces[pi], &s2) == 0 as u32 && is_plain(&s2, PLAIN))
+        rt.buf_free(&s2)
+        pi = pi + 1
+    }
+    rt.buf_free(&o)
+    fs.remove(path) catch false
+    return finish(&t)
+}

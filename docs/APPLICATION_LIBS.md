@@ -39,7 +39,7 @@ any application that starts programs.
 | `std.env` (`lib/std/env.fi`) | read the environment, `find_executable` (`which`) | the kernel's `/proc/self/environ`, `sh` on PATH |
 | `std.pool` (`lib/std/pool.fi`) | fixed worker threads, bounded job queue, results; Linux and Windows (real `CreateThread` threads since round WIN-THREADS, [WINDOWS_THREADS.md](WINDOWS_THREADS.md)) | `tests/2065`: 5000 jobs once each, parallel speed-up, GC on workers |
 | `std.cmdline` (`lib/std/cmdline.fi`) | Windows command line quoting/splitting by the rules of the C runtime, UTF-8 <-> UTF-16 | the published examples + round trip (`tests/2060`) |
-| FLEILAUNCHER | `net.dns` (`lib/net/dns.fi`), `net.udp`, `net.dnsconf`, `tls.trust`; `net.http` now fetches `https://host/...` | DNS by name: A/AAAA, CNAME chains, UDP with retry and a doubling timeout, TCP fallback on TC, random transaction ID, answers accepted only from the server asked, TTL cache, hosts file, resolv.conf (Linux) / GetNetworkParams (Windows); `https://` through the TLS 1.3 client with the system's roots (PEM bundle on Linux, the certificate store on Windows) and the certificate checked against the NAME; secp256r1 added next to X25519 because Azure Front Door (`piston-meta.mojang.com`) refuses X25519-only. See [DNS.md](DNS.md) | a fake DNS server in Python (the server's log is counted), real answers of 1.1.1.1 decoded by an independent Python reader, `getaddrinfo`/`dig`/`curl` on the real network, a hermetic Python TLS server with a test CA (`tools/dns/run.sh`, also the Windows build under Wine) |
+| FLEILAUNCHER | `net.dns` (`lib/net/dns.fi`), `net.udp`, `net.dnsconf`, `tls.trust`; `net.http` now fetches `https://host/...` | DNS by name: A/AAAA, CNAME chains, UDP with retry and a doubling timeout, TCP fallback on TC, random transaction ID, answers accepted only from the server asked, TTL cache, hosts file, resolv.conf (Linux) / GetNetworkParams (Windows); `https://` through the TLS client (TLS 1.3 and, since round TLS12, TLS 1.2 -- [TLS12.md](TLS12.md)) with the system's roots (PEM bundle on Linux, the certificate store on Windows) and the certificate checked against the NAME; secp256r1 added next to X25519 because Azure Front Door (`piston-meta.mojang.com`) refuses X25519-only. See [DNS.md](DNS.md) | a fake DNS server in Python (the server's log is counted), real answers of 1.1.1.1 decoded by an independent Python reader, `getaddrinfo`/`dig`/`curl` on the real network, a hermetic Python TLS server with a test CA (`tools/dns/run.sh`, also the Windows build under Wine) |
 
 The compiler learned three more system calls for AArch64 on the way
 (`unlinkat`, `symlinkat`, `statx`; `compiler/src/syscalls.rs`), and
@@ -54,8 +54,8 @@ honest limits: [STD_ARCHIVES.md](STD_ARCHIVES.md).
 
 | module | what it does | held against |
 |---|---|---|
-| `std.tar` (`lib/std/tar.fi`) | tar reader (ustar, V7, GNU long names, pax), tar writer, `tar_add_tree`, tar.gz with a size limit on the inflated stream, safe extraction with mode bits | GNU tar 1.34 and Python `tarfile`, both directions; fourteen hostile archives |
-| `std.extract` (`lib/std/extract.fi`) | `extract_archive(path, dest)`: .zip, .tar.gz/.tgz, .tar found by content, `strip` for the Adoptium top directory, modes (0755 for `bin/java`) | Info-ZIP, `zipfile`, GNU tar |
+| `std.tar` (`lib/std/tar.fi`) | tar reader (ustar, V7, GNU long names, pax), tar writer, `tar_add_tree`, tar.gz and (round COMPRESS) tar.zst / tar.xz / tar.bz2 / tar.lz4 with a size limit on the inflated stream, safe extraction with mode bits | GNU tar 1.34 and Python `tarfile`, both directions; fourteen hostile archives |
+| `std.extract` (`lib/std/extract.fi`) | `extract_archive(path, dest)`: .zip, .tar.gz/.tgz, .tar.zst/.xz/.bz2/.lz4, .tar found by content, `strip` for the Adoptium top directory, modes (0755 for `bin/java`) | Info-ZIP, `zipfile`, GNU tar |
 | `std.safefs` (`lib/std/safefs.fi`) | the shared rules: names, link targets, nothing written through a link, Windows names | the hostile archives above |
 | `std.hashfile` (`lib/std/hashfile.fi`) | streaming md5/sha1/sha256/sha512 of a file, hex, `Download` (temporary file, verify, fsync, atomic rename) | Python `hashlib` |
 | `std.secret` (`lib/std/secret.fi`) | keyring `secret_set/get/delete(service, key)`: Credential Manager on Windows, ChaCha20-Poly1305 file on Linux (machine-bound or Argon2id password) | Python `cryptography` + PyNaCl; the real Credential Manager (Wine and a Windows 11 machine) |
@@ -111,3 +111,121 @@ honest gaps: [APPKIT.md](APPKIT.md).
 The store side (`store add-app`: `exe`, `bin`, `appimage`, `macos-app`
 packages, per-platform channel pointers, `mindestFassung`) is in the
 orientstore repository, `docs/KATALOG-FORMAT.md`.
+
+## The desktop libraries (round DESKTOP)
+
+A program that lives on somebody's desktop: tray icon and menu, notifications, files dropped on its window,
+the clipboard, sound, a watcher for folders, starting at login, a second copy that hands its command line to
+the first. One interface per module, a file per platform (Linux and Windows real and checked; macOS, Android,
+OrientOS stubs). The full map, how each piece is held against something nobody here wrote, and what is *not*
+verified (no real desktop, Windows only under Wine): [DESKTOP.md](DESKTOP.md).
+
+| module | what it does | held against |
+|---|---|---|
+| `net.dbus`, `net.unix` (`lib/net/`) | a D-Bus client **and service**: SASL EXTERNAL, every type with the alignment rules, calls/replies/errors/signals, the queue, `RequestName`, `AddMatch`; Unix sockets with exact address lengths | libdbus (dbus-python): 18 values both ways, 1 MiB, errors |
+| `desktop.tray` | notification-area icon + flat menu: StatusNotifierItem + dbusmenu (Linux), `Shell_NotifyIconW` (Windows); events by `tray_poll` | a StatusNotifierWatcher and dbusmenu client in libdbus (49 checks); Wine's shell, the icon read off the screen |
+| `desktop.notify` | notifications (`org.freedesktop.Notifications`; a balloon/toast on Windows) with actions, urgency, replace, close, the signals back | a notification server in libdbus; Wine's shell |
+| `window.drop_accept/drop_take`, `EV_DROP`, `desktop.filedrop` | files dropped on a window: XDND v5 (target side), `WM_DROPFILES` | GTK 3 as a real drag source driven with xdotool; a python-xlib source; a real `HDROP` |
+| `window.clipboard_*` on Windows | `CF_UNICODETEXT`, `CF_HDROP`, registered formats | GTK 3's clipboard through Wine's X bridge, both ways |
+| `audio.pcm`, `audio.pulse`, `audio.dev`, `audio.sink`, `audio.player` | PCM output: a PulseAudio native-protocol client, waveOut, file/null sinks, volume, `play_mp3` / `player_pump` on `ton.mp3` | the plain decoder byte for byte, zlib CRC-32, ffmpeg (SNR), a real pulseaudio read back by `parec`/`pactl`; waveOut into ALSA's file plugin |
+| `desktop.watch` | folder change events (inotify / `ReadDirectoryChangesW`), recursive | `tests/2220` on Linux and under Wine |
+| `desktop.autostart` | start at login (XDG autostart / the Run key) | GLib's `gio launch`, Python's reading of the spec; MSVCRT's argv parser |
+| `appkit.single_instance` (`single_listen`, `single_poll`, `single_send_args`) | the second copy hands its directory and arguments to the first (Unix socket / named pipe, same user) | `tests/2221`: two real processes, on Linux and under Wine |
+
+
+## Packaging (lib/pack, tools/pack)
+
+What turns a built program into the files people install it with, on every platform, without the platform's
+own packaging tools: [PACKAGING.md](PACKAGING.md). `bash package.sh` in a project from `tools/newapp.sh`
+(= `tools/pack/all.sh APP-DIR VERSION`) writes `dist/<version>/`: `.deb`, `.rpm`, `.tar.gz`, a real AppImage and a self-extracting
+`.run`, the Windows `setup.exe` (installer + uninstaller + Start Menu/Desktop shortcuts + "Apps & features" entry), the
+program with its icon, a portable zip and an NSIS script, `.app`/`.zip`/`.dmg` (structure only), an APK, an OrientOS `.opk`,
+all icon sizes, and `manifest.json` (SHA-256 + Ed25519 per file) with the `store add-app` commands.
+
+| module | what it does | held against |
+|---|---|---|
+| `pack.lnk` (`lib/pack/lnk.fi`) | Windows shortcuts (.lnk) written and read as plain octets (no COM): ID list, LinkInfo, Unicode strings | `tests/2200`; an independent reader (`tools/pack/test/lnkread.py`); Wine's shell starts the program through them |
+| `pack.icons` (`lib/pack/icons.fi`, `tools/pack/icons.fi`) | PNG encoder, resampler, `.ico` and `.icns` writers; one SVG/PNG -> every size, Android mipmaps, hicolor theme | `tests/2201`; read back by `lib/paint/png.fi`, PIL, `unsquashfs`-free parsers in `checks.py` |
+| `pack.payload`, `pack.install`, `pack.installed`, `pack.winreg` (+ `winreg.windows.fi`) | a zip appended to a program behind a hashed trailer; the installer state machine (extract, list, upgrade, shortcuts, `HKCU\...\Uninstall`, uninstaller that deletes itself); the registry writers (new `advapi32` imports in `compiler/src/win.rs`) | `tests/2202`, `tests/2203` (without Windows); `tools/pack/test/windows.sh` under Wine, window included |
+| `tools/pack/pack.py` (`packlib/`) | zip, deb, rpm, tar, SquashFS + AppImage, plist/.app/.dmg, OPKG, PE icon resource, NSIS script, manifest + signatures; Python standard library only | `tools/pack/test/checks.py`: ~170 checks against dpkg-deb, `dpkg -i` / `rpm -i` in a container, unsquashfs, the AppImage runtime, OrientOS's `opk.py`, makensis, xorriso |
+| `tools/pack/stub/selfx.fi` | the self-extracting Linux program (unpack once to the cache, `execve`, `$APPIMAGE` set so appkit updates the file itself) | `checks.py`: run, cached start, damaged file refused |
+
+## Round WIN-THREADS / TLS 1.2 (threads, process trees, TLS 1.2)
+
+| module | what it does | held against |
+|---|---|---|
+| Windows threads (`lib/gc/gc.fi` thread runtime on `CreateThread`, `compiler/src/thread.rs`, `win.rs`, `win_seam.rs`) | `thread_start/wait`, mutex, channel, `std.pool` on real threads on Windows; the seam is thread safe | `tests/834`, `860`-`862`, `1600`, `2065`, `2066`, `2091`, `2101` give the same output on Linux and under Wine; `tools/windows/threadkit.sh` writes a kit for a real Windows PC. See [WINDOWS_THREADS.md](WINDOWS_THREADS.md) |
+| process trees (`std.process`: `set_group`, `kill_tree`, `terminate_tree`, `set_kill_with_launcher`) | stop a child and everything it started: process group (Linux), job object (Windows) | `tests/2100`: a grandchild that holds the child's stdout pipe; end of file proves it died (Linux, Wine) |
+| `tls.tls` TLS 1.2 (`lib/tls/tls.fi`, `prf12.fi`; AES-256 in `aes.fi`/`gcm.fi`) | ECDHE-ECDSA/RSA with AES-128/256-GCM and ChaCha20-Poly1305, X25519 + secp256r1, extended master secret, downgrade protection, the same certificate and host name check; negotiated in the one ClientHello (no fallback retry) | `tests/2102`, `2103`; `tools/tls/tls12_check.py`: openssl s_server (suites x groups x signature schemes), Python `ssl` (512 KiB), man in the middle, fuzz, real hosts (`login.live.com`, `tls-v1-2.badssl.com`). See [TLS12.md](TLS12.md) |
+
+## UI extras (docs/UI_EXTRAS.md)
+
+The second wave of the launcher's UI: animated pictures, text selection and copy, the kit in the
+accessibility tree, touch gestures and right to left, rich text and syntax highlighting, QR
+codes, and localized times and sizes. Each has a test; the ones with a second implementation to
+compare with are held against it.
+
+| module | what it does | held against |
+|---|---|---|
+| `lib/qr` (`qr.fi`, `qrdec.fi`), `lib/fui/qrview.fi` | QR encoder (versions 1-40, L/M/Q/H, numeric/alphanumeric/byte, all masks, auto mask, level boost), decoder from a matrix or a picture (rotated, perspective, blurred, damaged), the widget | Nayuki's `qrcodegen`: module for module for every version/level/mask; python-qrcode (forced version and mask); ZXing-C++ reads every code and is the yardstick for the decoder (282/285, 349/355, 340/345 against its 284, 353, 340 on pictures that get worse) |
+| `lib/i18n/human.fi` | "5 minutes ago", "12,3 MB", date and time styles, percent, lists, wall clock of a TZif zone, in en de fr it es pl cs ru | ICU 72.1 (PyICU): 8,016 random cases, 0 differences; zones against Python `zoneinfo` |
+| `lib/highlight` (`highlight.fi`), `lib/fui/syntaxcolor.fi` | tokenizer interface and regex rules for JSON, TOML, INI, Firn, shell, Markdown, YAML, C-like; colours with 4.5:1 on the code ground | `tests/2242_highlight.fi` (every rule on sample text, the spans tile the text exactly on random input, linear time); the Markdown view's pixels |
+| `lib/regex` `Matcher` | the machine of a regex kept between finds (10x faster tokenizing) | tests/1914 and 6,000 random patterns against Python `re` unchanged |
+| `lib/fui/richtext.fi` | styled spans, wrapping, links, selection (drag, word, paragraph, Ctrl+A), copy, RTL paragraphs | `tools/fui/richtext_main.fi` (pixels) |
+| `lib/fui/uianim.fi` | GIF / animated WebP playback: delays, loops, pause, clock jumps | Pillow's frames (CRC) and delays for four files; `tools/fui/anim_main.fi` |
+| `lib/fui/kita11y.fi` | every kit part describes itself into the accessibility tree | `tools/fui/kita11y_main.fi`: the audit green, the dump compared |
+| `lib/fui/kittouch.fi` | tap, double tap, long press, pan with fling, pinch on `lib/window/pointers.fi`'s records | `tools/fui/touch_main.fi` (synthetic streams, the grid and the Markdown view) |
+| `kit.kit_set_rtl` | every kit part mirrored | `tools/fui/kitrtl_main.fi` (hit functions, decorations, keys) |
+
+
+## Libraries for FleiLauncher (downloads and sign-in)
+
+A launcher fetches thousands of files and signs the user in with a Microsoft
+account. Details, tests and the honest limits: [DOWNLOAD.md](DOWNLOAD.md),
+[OAUTH.md](OAUTH.md).
+
+| module | what it does | held against |
+|---|---|---|
+| `net.download` (`lib/net/download.fi`) | a download manager: N workers on `std.pool`, a keep-alive connection per worker and host, resume with `Range`/`If-Range`, ETag/Last-Modified (`If-None-Match`, 304), retry with exponential backoff and jitter, `Retry-After`, mirrors, a global rate limit, MD5/SHA-1/SHA-256/SHA-512 while the data arrives, atomic rename, per-file and total progress (polled or callback), cancel, skip of files that are already right | a Python server that cuts connections, answers 503, ignores `Range`, sends a wrong `Content-Range`, corrupts bytes, stalls (99 checks, three build stages, Wine); 3000 files at ~350 files/s; the real Mojang CDN (40 assets by SHA-1, `client.jar` resumed from 5 MB) |
+| `net.http` (additions) | extra request headers, user agent, a streaming body sink (no 32 MiB limit), `client_close`, errors as numbers | the download checks above |
+| `auth.jose` (`lib/auth/jose.fi`) | JWT / JWKS: RS256/384/512, ES256/384, HS256; `kid` lookup; exp/nbf/iat/iss/aud/nonce; alg none and RS256-to-HS256 refused | 54 tokens signed by Python `cryptography` (`tests/2150`) |
+| `auth.oauth` (`lib/auth/oauth.fi`) | OAuth 2.0 / OIDC client: discovery, device code flow, authorization code + PKCE with a loopback redirect server and the system browser, refresh, id_token check with the JWKS, userinfo, revocation, tokens in `std.secret` | a Python provider that checks PKCE, redirect URI, single-use codes, rotating refresh tokens and the polling interval (97 checks, three build stages, Wine); RFC 7636 appendix B |
+| `auth.msa` (`lib/auth/msa.fi`) | Microsoft account -> Xbox Live -> XSTS -> Minecraft services -> ownership -> profile, XSTS error texts, session in the keyring, `msa_ensure` | a Python stand-in that checks every header and body (64 checks); the real hosts with bogus credentials (TLS 1.3 path proven); **no real login** (no client id here) |
+| `appkit.fleitec_login` (`lib/appkit/fleitec_login.fi`) | "Sign in with Fleitec-ID": the five login answers and three `me` answers of docs/FLEITEC-ID.md, token in the keyring | `tests/2153` against an in-process ID server; not run against the real server |
+
+## Compression formats (round COMPRESS, [COMPRESSION.md](COMPRESSION.md))
+
+zstd, xz/LZMA2, Brotli, bzip2, LZ4 and a streaming gzip/zlib/DEFLATE inflater,
+with one door (`compress.auto`: magic-octet detection, whole buffer and
+streaming), and the two places that needed them: `.tar.zst`/`.tar.xz`/
+`.tar.bz2`/`.tar.lz4` in `std.tar`/`std.extract` (Adoptium, Modrinth packs and
+Linux packages) and `Content-Encoding: br`/`zstd` in `net.http`.
+
+| module | what it does | held against |
+|---|---|---|
+| `compress.zstd`, `zstd_enc` | RFC 8878 in full incl. dictionaries and streaming; encoder levels 1-19 with Huffman literals, FSE tables, repeat offsets, dictionaries | libzstd (`zstd` command): corpus x levels 1-22/--long/small windows/dictionaries, both directions, every cut and damaged copy, a 64 MiB bomb under limits |
+| `compress.lzma`, `lzma_enc` | LZMA2, `.xz` (CRC-32/64, SHA-256, filters delta/x86/PPC/IA-64/ARM/Thumb/SPARC/ARM64, several streams), `.lzma`; encoder presets 0-9 | liblzma (`xz`, Python `lzma`), both directions |
+| `compress.brotli` | RFC 7932 in full incl. the static dictionary and transforms | libbrotli (Python `brotli`): qualities 0-11, windows 10-24 |
+| `compress.bz2` | bzip2 (several streams, randomised blocks) | libbz2 (Python `bz2`) |
+| `compress.lz4` | LZ4 blocks and frames (linked, checksums, dictionaries, skippable, legacy) and an encoder | liblz4 (Python `lz4`), both directions |
+| `compress.gzip` | streaming gzip (several members)/zlib/DEFLATE | zlib/gzip |
+| `compress.auto` | detection by content and one decompress/compress API | all of the above |
+
+Every decoder takes a size limit and refuses with `TooLarge` before writing
+past it; every format has a streaming reader whose memory is "window + one
+unit". Linux, AArch64 (qemu) and Windows (Wine), all four build levels.
+
+## The embedded database (lib/db)
+
+Tables, indexes and transactions in one file, for a launcher's search cache and play history
+and for any Firn program. The file is a **SQLite 3 database**: SQLite reads what lib/db writes
+and the other way round, and a process killed in the middle of a commit leaves a journal that
+either one rolls back. The decision (SQLite format against an own key-value store), the SQL
+that is supported, the honest list of what is not (no WAL, UTF-8 only, no views/triggers/WITH/
+window functions, one connection per file per process on POSIX), the benchmark against C
+SQLite (35 to 60 times slower on bulk writes, 8 to 18 times on scans, close on commits and
+single lookups) and the Windows state (Wine only): [DB.md](DB.md).
+
+| module | what it does | held against |
+|---|---|---|
+| `db.sqlite` (`lib/db/sqlite.fi`) and 20 more files in `lib/db/` | `db_open/exec/prepare`, `stmt_step`, bound parameters of every type, column accessors, transactions with statement savepoints, `db_query_*`; SELECT with joins, aggregates, sub-selects, compound selects; INSERT/UPDATE/DELETE with upsert; CREATE/DROP/ALTER ADD COLUMN; PRAGMAs; ~45 functions incl. date and time; rollback journal, SQLite's own lock bytes (`flock`, `LockFileEx` on Windows) | Python `sqlite3` (SQLite 3.40.1): 70 statements parsed alike, 25,842 expressions bit for bit, 106 SELECTs, 1,500 random statements, files exchanged both ways with `integrity_check`; a kill at every commit event plus 25 random `kill -9`; SQLite and lib/db processes on one file; 1,500 damaged files without a crash, panic or hang; the Windows build under Wine (`tools/db/run.sh`, `tests/2160`-`2165`, `examples/db_modrinth_cache.fi`, `examples/db_game_history.fi`) |

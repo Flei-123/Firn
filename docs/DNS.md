@@ -61,7 +61,7 @@ on the curve (`ecdsa.point_valid`).
 
 * IPv4 transport only (D1); no DNSSEC/DoT/DoH/EDNS0, no 0x20 (D2); no search list (D3); no IDN, convert to
   punycode first (D4); the cache is per resolver and not thread-safe (D7, D8).
-* TLS 1.3 only: servers that still speak TLS 1.2 only are unreachable (`login.live.com`, `*.badssl.com`).
+* TLS 1.3 and 1.2 (round TLS12, [TLS12.md](TLS12.md)): `login.live.com` and `*.badssl.com` are reachable now; TLS 1.0/1.1-only servers are refused.
 * Windows: enumerating the certificate store is not what Windows' own chain building does; roots Windows adds on
   demand may be missing. Ship `cacert.pem` next to the program for those machines. Measured here only under Wine
   (the machine FLEI-ONE is not reachable from the server for a file transfer).

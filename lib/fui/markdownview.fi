@@ -48,12 +48,28 @@
 // redone (the scroll position stays). Without a hook every image is a
 // placeholder, which is also the right thing for an offline description.
 //
-// HONEST LIMITS: no text selection, no copy, no right-to-left paragraph
-// layout across a link boundary (lib/fui/painter.fi handles RTL inside one
-// word run), no nested tables inside table cells (the cell shows the inline
-// text only), code lines are wrapped rather than scrolled sideways, and
-// HTML blocks are only drawn when the parser kept raw HTML (HTML_RAW: as
-// code); in the default mode the parser has turned them into text.
+// SELECTION AND COPY. A press on text starts a selection, a drag extends it, a double click
+// selects the word, a third click the block; Ctrl+A selects everything and Ctrl+C
+// (`mdv_char`) hands the text to the clipboard hook (`mdv_set_clipboard`, the same
+// `fn(ptr, n) -> bool` as editor.fi's) -- headings and paragraphs as blocks, list items and
+// code lines as lines, table cells separated by tabs. A press on a link still follows the link.
+// A new width or text drops the selection. Touch: `mdv_touch_pan/_fling/_tap/_long`
+// (lib/fui/kittouch.fi's gestures; a long press selects the word).
+//
+// SYNTAX COLOURS. A fenced block whose info string names a language lib/highlight knows
+// (json, toml, ini, firn, sh, md, yaml, java/js/c/rust ...) is painted in the colours of
+// lib/fui/syntaxcolor.fi (4.5:1 on the code ground, light and dark); `mdv_set_highlight`.
+//
+// ANIMATED PICTURES. An image hook may fill `ImgInfo.anim` (an `uianim.Animation` of
+// lib/fui/uianim.fi: GIF, animated WebP); `mdv_tick` advances every such picture and says
+// when to repaint, `mdv_next_ms` when to wake up.
+//
+// HONEST LIMITS: no right-to-left paragraph layout across a link boundary
+// (lib/fui/painter.fi handles RTL inside one word run), a selection that crosses a
+// direction change is by logical order, no nested tables inside table cells (the cell shows
+// the inline text only), code lines are wrapped (at token boundaries when highlighted)
+// rather than scrolled sideways, and HTML blocks are only drawn when the parser kept raw HTML
+// (HTML_RAW: as code); in the default mode the parser has turned them into text.
 import std.rt
 import std.vec
 import markdown.doc
@@ -67,7 +83,11 @@ import fui.icons
 import fui.lucide
 import fui.icon
 import fui.uiimage
+import fui.uianim
 import fui.kitcolor
+import fui.syntaxcolor
+import fui.editor
+import highlight.highlight
 
 export {
     MdView, ImgInfo, mdv_new, mdv_free, mdv_set_markdown, mdv_set_base_size,
@@ -76,15 +96,31 @@ export {
     mdv_wheel, mdv_key, mdv_pointer_move, mdv_pointer_down, mdv_pointer_up,
     mdv_pointer_leave, mdv_link_count, mdv_link_url, mdv_hover_link,
     mdv_content_height, mdv_offset, mdv_set_offset, mdv_item_count,
-    mdv_link_rect, mdv_tick, mdv_doc,
+    mdv_link_rect, mdv_tick, mdv_doc, mdv_set_highlight,
+    mdv_select_all, mdv_clear_selection, mdv_has_selection, mdv_selection_text, mdv_copy,
+    mdv_set_clipboard, mdv_char, mdv_item_text, mdv_next_ms,
+    mdv_touch_pan, mdv_touch_fling, mdv_touch_tap, mdv_touch_long, mdv_double_click, mdv_set_time, mdv_selection_range,
+    BR_NONE, BR_PARA, BR_LINE, BR_CELL,
     IMG_PENDING, IMG_READY, IMG_FAILED,
 }
 
 const NIL: u32 = 4294967295
 
+// what separates a text item from the one before it, for copying: nothing/soft wrap (a blank
+// where there is a gap), a hard line break, a new block (blank line), a table cell (tab)
+const BR_NONE: u32 = 0
+const BR_LINE: u32 = 1
+const BR_PARA: u32 = 2
+const BR_CELL: u32 = 3
+const BR_SAME: u32 = 4 // (only as brk_cell) the block continues the line of the marker before it
+
 // A colour that is no theme token: the accent as TEXT on the page ground
 // (kitcolor.accent_text -- the launcher green is too light for a white page).
 const TOK_LINK: u32 = 1000
+
+// The colours of syntax highlighting: TOK_SYN + highlight.TK_* (a token that is not
+// a theme token either: the colour depends on the code ground, syntaxcolor.fi).
+const TOK_SYN: u32 = 1100
 
 const IMG_PENDING: u32 = 0
 const IMG_READY: u32 = 1
@@ -117,6 +153,10 @@ struct ImgInfo {
     w: usize,
     h: usize,
     stride: usize,
+    // an ANIMATED picture (lib/fui/uianim.fi): the address of an `uianim.Animation` the caller
+    // keeps alive, or 0. With one, `w` and `h` are still the size to lay out (the canvas), and the
+    // view paints the frame the animation shows now; `mdv_tick` advances it.
+    anim: u64,
 }
 
 // one drawn thing, in content coordinates
@@ -138,6 +178,7 @@ struct Item {
     tok2: u32,
     radius: f64,
     extra: i64,
+    brk: u32,
 }
 
 struct LinkRec {
@@ -168,9 +209,31 @@ struct MdView {
     img_cb: fn(u64, u64, usize, *mut ImgInfo) -> u32,
     has_img_cb: bool,
     drag_bar: bool,
+    // syntax highlighting of fenced code (lib/highlight): on by default
+    hl: highlight.Highlighter,
+    hl_on: bool,
+    hl_spans: Vec[highlight.HlSpan],
+    // the selection: positions are (item, octet offset in the item)
+    sel_on: bool,
+    sa_item: usize,
+    sa_off: usize,
+    sf_item: usize,
+    sf_off: usize,
+    sel_drag: bool,
+    now_ms: i64,
+    last_down_ms: i64,
+    last_x: f64,
+    last_y: f64,
+    clicks: u32,
+    clip_write: fn(u64, usize) -> bool,
+    has_clip: bool,
 }
 
 fn cb_link_none(ud: u64, p: u64, n: usize) {
+}
+
+fn clip_none(p: u64, n: usize) -> bool {
+    return false
 }
 
 fn cb_img_none(ud: u64, p: u64, n: usize, info: *mut ImgInfo) -> u32 {
@@ -186,6 +249,9 @@ fn mdv_new() -> MdView {
         total_h: 0.0, dirty: true, hover: NIL, press: NIL,
         link_ud: 0, link_cb: cb_link_none, has_link_cb: false,
         img_ud: 0, img_cb: cb_img_none, has_img_cb: false, drag_bar: false,
+        hl: highlight.hl_new(), hl_on: true, hl_spans: vec_new[highlight.HlSpan](),
+        sel_on: false, sa_item: 0, sa_off: 0, sf_item: 0, sf_off: 0, sel_drag: false, now_ms: 0,
+        last_down_ms: -100000, last_x: 0.0, last_y: 0.0, clicks: 0 as u32, clip_write: clip_none, has_clip: false,
     }
 }
 
@@ -194,7 +260,17 @@ fn mdv_free(v: *mut MdView) {
     vec_free[Item](&(*v).items)
     vec_free[LinkRec](&(*v).link_tab)
     rt.buf_free(&(*v).vpool)
+    highlight.hl_free(&(*v).hl)
+    vec_free[highlight.HlSpan](&(*v).hl_spans)
     (*v).has_doc = false
+}
+
+// Syntax highlighting of fenced code blocks whose info string names a language
+// lib/highlight knows (json, toml, ini, firn, sh, md, yaml, java/js/c/rust...).
+// On by default; `false` draws every code block in the plain code colour.
+fn mdv_set_highlight(v: *mut MdView, on: bool) {
+    (*v).hl_on = on
+    (*v).dirty = true
 }
 
 // Replace the text. The scroll position goes back to the top.
@@ -282,8 +358,56 @@ fn mdv_hover_link(v: *mut MdView) -> u32 {
     return (*v).hover
 }
 
+// The clock of the view: scrolling momentum and the ANIMATED pictures (every image that came
+// with an `ImgInfo.anim` advances to the frame `now_ms` says). True when the picture changed and
+// the program has to repaint.
 fn mdv_tick(v: *mut MdView, now_ms: i64) -> bool {
-    return viewport.viewport_tick(&(*v).vp, now_ms)
+    (*v).now_ms = now_ms
+    var changed: bool = viewport.viewport_tick(&(*v).vp, now_ms)
+    let n: usize = vec_len[Item](&(*v).items)
+    var i: usize = 0
+    while i < n {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+        if (*it).kind == IT_IMAGE && (*it).extra == 100 as i64 {
+            let q: u64 = rt.buf_ptr(&(*v).vpool) + ((*it).tok2 as u64)
+            let an: u64 = rt.ld64(q, 4)
+            if an != 0 {
+                if uianim.anim_tick(an as *mut uianim.Animation, now_ms) {
+                    changed = true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return changed
+}
+
+// Milliseconds until an animated picture of the view next changes (-1: none does) -- what the
+// host sleeps for instead of repainting every frame.
+fn mdv_next_ms(v: *mut MdView, now_ms: i64) -> i64 {
+    var best: i64 = 0 - 1
+    let n: usize = vec_len[Item](&(*v).items)
+    var i: usize = 0
+    while i < n {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+        if (*it).kind == IT_IMAGE && (*it).extra == 100 as i64 {
+            let q: u64 = rt.buf_ptr(&(*v).vpool) + ((*it).tok2 as u64)
+            let an: u64 = rt.ld64(q, 4)
+            if an != 0 {
+                let t: i64 = uianim.anim_next_ms(an as *mut uianim.Animation, now_ms)
+                if t >= 0 && (best < 0 || t < best) {
+                    best = t
+                }
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// The clock (ms) for telling a double click from two clicks; `mdv_tick` sets it too.
+fn mdv_set_time(v: *mut MdView, now_ms: i64) {
+    (*v).now_ms = now_ms
 }
 
 // ====================================================================
@@ -306,6 +430,9 @@ struct L {
     last: usize,
     at_start: bool,
     align: i64,
+    tok_over: u32, // NIL, or the token every word placed gets (syntax colours)
+    brk: u32, // the break the next text item carries (BR_*)
+    brk_cell: u32, // set by the table: the break the next block starts with
 }
 
 fn px(l: *mut L, pt: usize) -> f64 {
@@ -359,7 +486,7 @@ fn space_w(l: *mut L, flags: u32, size: f64) -> f64 {
 fn new_item(kind: u32) -> Item {
     return Item { kind: kind, flags: 0 as u32, x: 0.0, y: 0.0, w: 0.0, h: 0.0, asc: 0.0,
         desc: 0.0, lh: 0.0, size: 0.0, off: 0 as u32, n: 0 as u32, link: NIL,
-        tok: style.TOK_TEXT, tok2: NIL, radius: 0.0, extra: 0 }
+        tok: style.TOK_TEXT, tok2: NIL, radius: 0.0, extra: 0, brk: 0 as u32 }
 }
 
 fn push_item(l: *mut L, it: Item) -> usize {
@@ -530,6 +657,11 @@ fn place_word(l: *mut L, pool: u32, off: u32, n: usize, flags: u32, size: f64, l
         if link != NIL {
             it.tok = TOK_LINK
         }
+        if (*l).tok_over != NIL {
+            it.tok = (*l).tok_over
+        }
+        it.brk = (*l).brk
+        (*l).brk = 0 as u32
         (*l).last = push_item(l, it)
         (*l).x = (*l).x + tw
         (*l).at_start = false
@@ -611,7 +743,7 @@ fn collect_text(d: *mut doc.Doc, n: u32, out: *mut rt.Buf) {
 fn flow_image(l: *mut L, n: u32, flags: u32, size: f64, link: u32) {
     let v: *mut MdView = (*l).v
     let u: doc.Slice = doc.node_url(&(*v).d, n)
-    var info: ImgInfo = ImgInfo { px: 0, w: 0, h: 0, stride: 0 }
+    var info: ImgInfo = ImgInfo { px: 0, w: 0, h: 0, stride: 0, anim: 0 }
     var st: u32 = IMG_PENDING
     if (*v).has_img_cb && u.n > 0 {
         let f: fn(u64, u64, usize, *mut ImgInfo) -> u32 = (*v).img_cb
@@ -673,11 +805,11 @@ fn flow_image(l: *mut L, n: u32, flags: u32, size: f64, link: u32) {
     it.n = alt_n as u32
     it.extra = (st as i64)
     if ready {
-        // keep the pixel description in the view's pool: 4 words
+        // keep the pixel description in the view's pool: 5 words (the last: the animation)
         it.extra = 100
         it.tok2 = rt.buf_len(&(*v).vpool) as u32
-        var rec: [u64; 4] = [info.px, info.w as u64, info.h as u64, info.stride as u64]
-        rt.buf_push_bytes(&(*v).vpool, (&rec[0]) as u64, 32)
+        var rec: [u64; 5] = [info.px, info.w as u64, info.h as u64, info.stride as u64, info.anim]
+        rt.buf_push_bytes(&(*v).vpool, (&rec[0]) as u64, 40)
     }
     (*l).last = push_item(l, it)
     (*l).x = (*l).x + w
@@ -697,6 +829,7 @@ fn flow_inline(l: *mut L, parent: u32, flags: u32, size: f64, link: u32) {
             (*l).pend = true
         } else if k == doc.K_HARDBREAK {
             flush_line(l)
+            (*l).brk = BR_LINE
         } else if k == doc.K_CODE {
             let q: *mut doc.Node = doc.node_at(d, c)
             let pad: f64 = px(l, 3)
@@ -765,6 +898,15 @@ fn flow_inline(l: *mut L, parent: u32, flags: u32, size: f64, link: u32) {
 
 // A paragraph-like block: its inlines flowed into [x0, x0 + w].
 fn flow_block(l: *mut L, n: u32, x0: f64, w: f64, flags: u32, size: f64, align: i64) {
+    if (*l).brk_cell == BR_SAME {
+        (*l).brk = 0 as u32
+        (*l).brk_cell = 0 as u32
+    } else if (*l).brk_cell != 0 as u32 {
+        (*l).brk = (*l).brk_cell
+        (*l).brk_cell = 0 as u32
+    } else {
+        (*l).brk = BR_PARA
+    }
     (*l).left = x0
     (*l).right = x0 + w
     (*l).x = x0
@@ -910,6 +1052,22 @@ fn lay_block(l: *mut L, n: u32, x0: f64, w: f64, tight: bool, flags: u32) {
     }
 }
 
+// the first span that ends after octet `pos` (spans tile the text, sorted)
+fn hl_first_span(spans: *mut Vec[highlight.HlSpan], pos: usize) -> usize {
+    var lo: usize = 0
+    var hi: usize = vec_len[highlight.HlSpan](spans)
+    while lo < hi {
+        let mid: usize = (lo + hi) / 2
+        let sp: *mut highlight.HlSpan = vec_elem_ptr[highlight.HlSpan](spans, mid)
+        if (*sp).start + (*sp).len <= pos {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return lo
+}
+
 fn lay_code(l: *mut L, n: u32, x0: f64, w: f64) {
     let d: *mut doc.Doc = &(*(*l).v).d
     let base: f64 = (*l).base
@@ -920,6 +1078,19 @@ fn lay_code(l: *mut L, n: u32, x0: f64, w: f64) {
     let toff: u32 = (*q).txt
     let bg: usize = add_rect(l, IT_RECT, x0, (*l).y, w, 0.0, style.TOK_SURFACE, px(l, 6))
     let y0: f64 = (*l).y
+    // the language of a fenced block: its info string
+    var hl_lang: u32 = highlight.HL_NONE
+    if (*(*l).v).hl_on {
+        let info: doc.Slice = doc.node_url(d, n)
+        if info.n > 0 {
+            hl_lang = highlight.hl_language(str { p: rt.ptr_of(info.p), n: info.n })
+        }
+    }
+    if hl_lang != highlight.HL_NONE {
+        if !highlight.hl_tokenize(&(*(*l).v).hl, hl_lang, t.p, t.n, &(*(*l).v).hl_spans) {
+            hl_lang = highlight.HL_NONE
+        }
+    }
     (*l).y = (*l).y + pad
     // line by line; every line may wrap
     var i: usize = 0
@@ -936,12 +1107,39 @@ fn lay_code(l: *mut L, n: u32, x0: f64, w: f64) {
         (*l).right = x0 + w - pad
         (*l).x = (*l).left
         (*l).line_y = (*l).y
+        if i == 0 {
+            (*l).brk = BR_PARA
+        } else {
+            (*l).brk = BR_LINE
+        }
         (*l).line_start = vec_len[Item](&(*(*l).v).items)
         (*l).pend = false
         (*l).at_start = true
         (*l).last = (*l).line_start
         if e > i {
-            place_word(l, 0 as u32, toff + (i as u32), e - i, FL_CODE, size, NIL)
+            if hl_lang != highlight.HL_NONE {
+                // the line as pieces of one kind each (a piece never crosses a line end)
+                var si: usize = hl_first_span(&(*(*l).v).hl_spans, i)
+                var at: usize = i
+                while at < e && si < vec_len[highlight.HlSpan](&(*(*l).v).hl_spans) {
+                    let sp: *mut highlight.HlSpan = vec_elem_ptr[highlight.HlSpan](&(*(*l).v).hl_spans, si)
+                    var pe: usize = (*sp).start + (*sp).len
+                    if pe > e {
+                        pe = e
+                    }
+                    if pe > at {
+                        if (*sp).kind != highlight.TK_PLAIN {
+                            (*l).tok_over = TOK_SYN + (*sp).kind
+                        }
+                        place_word(l, 0 as u32, toff + (at as u32), pe - at, FL_CODE, size, NIL)
+                        (*l).tok_over = NIL
+                        at = pe
+                    }
+                    si = si + 1
+                }
+            } else {
+                place_word(l, 0 as u32, toff + (i as u32), e - i, FL_CODE, size, NIL)
+            }
         } else {
             // an empty line still takes a line
             var it: Item = new_item(IT_TEXT)
@@ -954,6 +1152,8 @@ fn lay_code(l: *mut L, n: u32, x0: f64, w: f64) {
             font_leave((*l).z, old)
             it.lh = line_h(l, size)
             it.n = 0 as u32
+            it.brk = (*l).brk
+            (*l).brk = 0 as u32
             let r: usize = push_item(l, it)
         }
         flush_line(l)
@@ -983,7 +1183,14 @@ fn lay_list(l: *mut L, n: u32, x0: f64, w: f64, flags: u32) {
     }
     let indent: f64 = px(l, 26)
     var item: u32 = doc.node_first(d, n)
+    var first_item: bool = true
     while item != doc.NIL {
+        // for copying: the first item starts a block, the others of a tight list a line
+        var ib: u32 = BR_PARA
+        if tight && !first_item {
+            ib = BR_LINE
+        }
+        first_item = false
         let y0: f64 = (*l).y
         let ts: i64 = doc.node_a(d, item)
         let lh: f64 = line_h(l, base)
@@ -1023,6 +1230,7 @@ fn lay_list(l: *mut L, n: u32, x0: f64, w: f64, flags: u32) {
             it.off = off
             it.n = nn as u32
             it.tok = style.TOK_TEXT_MUTED
+            it.brk = ib
             let r: usize = push_item(l, it)
         } else {
             let s: f64 = base * 0.34
@@ -1035,7 +1243,13 @@ fn lay_list(l: *mut L, n: u32, x0: f64, w: f64, flags: u32) {
             it.extra = (depth % 3) as i64
             let r: usize = push_item(l, it)
         }
+        if ordered && ts == 0 as i64 {
+            (*l).brk_cell = BR_SAME
+        } else {
+            (*l).brk_cell = ib
+        }
         lay_children(l, item, x0 + indent, w - indent, tight, flags)
+        (*l).brk_cell = 0 as u32
         // an item that holds nothing still takes a line
         if (*l).y <= y0 {
             (*l).y = y0 + lh
@@ -1150,6 +1364,11 @@ fn lay_table(l: *mut L, n: u32, x0: f64, w: f64, flags: u32) {
                 if header {
                     f = f | FL_BOLD
                 }
+                if ci > 0 {
+                    (*l).brk_cell = BR_CELL
+                } else if row != first {
+                    (*l).brk_cell = BR_LINE
+                }
                 flow_block(l, cell, cx + padx, cw[ci] - 2.0 * padx, f, base, doc.node_a(d, cell))
                 var hh: f64 = (*l).y - ry + pady
                 if hh > row_h {
@@ -1193,13 +1412,15 @@ fn mdv_layout(v: *mut MdView, c: *mut render.Ctx, width: f64) {
     vec_clear[LinkRec](&(*v).link_tab)
     rt.buf_clear(&(*v).vpool)
     (*v).hover = NIL
+    (*v).sel_on = false
+    (*v).sel_drag = false
     if !(*v).has_doc {
         (*v).total_h = 0.0
         return
     }
     var ly: L = L { c: c, z: render.ctx_painter(c), v: v, base: render.len_of(c, (*v).base_pt),
         y: 0.0, left: 0.0, right: 0.0, x: 0.0, line_y: 0.0, line_start: 0, pend: false,
-        last: 0, at_start: true, align: doc.ALIGN_NONE }
+        last: 0, at_start: true, align: doc.ALIGN_NONE, tok_over: NIL, brk: 0 as u32, brk_cell: 0 as u32 }
     let pad: f64 = render.len_of(c, (*v).pad_pt)
     ly.y = pad
     lay_children(&ly, 0 as u32, pad, width - 2.0 * pad, false, 0 as u32)
@@ -1215,6 +1436,12 @@ fn tokc(c: *mut render.Ctx, tok: u32) -> u32 {
         let m: *mut theme.Theme = render.ctx_theme(c)
         let f: *mut theme.Colors = theme.theme_colors(m)
         return theme.opaque(kitcolor.accent_text(m, (*f).base))
+    }
+    if tok >= TOK_SYN && tok < TOK_SYN + highlight.TK_COUNT {
+        // the ground of a code block is the surface token
+        let m: *mut theme.Theme = render.ctx_theme(c)
+        let ground: u32 = render.color_of(c, style.color_token(style.TOK_SURFACE)) & 16777215 as u32
+        return theme.opaque(syntaxcolor.syntax_color(m, tok - TOK_SYN, ground))
     }
     return render.color_of(c, style.color_token(tok))
 }
@@ -1315,6 +1542,10 @@ fn paint_image(v: *mut MdView, c: *mut render.Ctx, it: *mut Item, x: f64, y: f64
         let q: u64 = rt.buf_ptr(&(*v).vpool) + ((*it).tok2 as u64)
         var im: uiimage.Image = uiimage.image_wrap(rt.ld64(q, 0), rt.ld64(q, 1) as usize,
             rt.ld64(q, 2) as usize, rt.ld64(q, 3) as usize)
+        if rt.ld64(q, 4) != 0 {
+            // an animation: the frame it shows now
+            im = uianim.anim_frame_image(rt.ld64(q, 4) as *mut uianim.Animation)
+        }
         uiimage.image_draw_rect(z, &im, x, y, (*it).w, (*it).h, 0)
         return
     }
@@ -1372,6 +1603,9 @@ fn mdv_paint(v: *mut MdView, c: *mut render.Ctx) {
             }
             i = i + 1
         }
+        if mdv_has_selection(v) {
+            paint_selection(v, c, ox, oy, top, bot)
+        }
         i = 0
         while i < n {
             let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
@@ -1387,6 +1621,50 @@ fn mdv_paint(v: *mut MdView, c: *mut render.Ctx) {
         viewport.viewport_end(c, &(*v).vp)
     }
     viewport.viewport_draw_bars(c, &(*v).vp)
+}
+
+// The selection behind the text: the selected part of every word, and the blank between two
+// selected words of one line.
+fn paint_selection(v: *mut MdView, c: *mut render.Ctx, ox: f64, oy: f64, top: f64, bot: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let selcol: u32 = render.color_of(c, style.color_token(style.TOK_SELECTION))
+    var li: usize = 0
+    var lo: usize = 0
+    var hi: usize = 0
+    var ho: usize = 0
+    sel_range(v, &li, &lo, &hi, &ho)
+    let n: usize = vec_len[Item](&(*v).items)
+    var i: usize = li
+    while i <= hi && i < n {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+        if (*it).kind == IT_TEXT && (*it).n > 0 as u32 && (*it).y + (*it).asc + (*it).desc >= top && (*it).y <= bot {
+            var a: usize = 0
+            var b: usize = (*it).n as usize
+            if i == li {
+                a = lo
+            }
+            if i == hi && ho < b {
+                b = ho
+            }
+            if b > a {
+                var r: painter.TextRun = mk_run((*it).flags, (*it).size)
+                let old: u64 = font_enter(z, (*it).flags)
+                painter.run_sel_draw(z, &r, ox + (*it).x, oy + (*it).y, (*it).asc + (*it).desc, item_ptr(v, it),
+                    (*it).n as usize, a, b, selcol)
+                font_leave(z, old)
+                // the gap to the next word, if that is selected too
+                if b == (*it).n as usize && i < hi && i + 1 < n {
+                    let nx: *mut Item = vec_elem_ptr[Item](&(*v).items, i + 1)
+                    if (*nx).kind == IT_TEXT && (*nx).n > 0 as u32 && (*nx).brk == BR_NONE
+                        && (*nx).y > (*it).y - 1.0 && (*nx).y < (*it).y + 1.0 && (*nx).x > (*it).x + (*it).w {
+                        painter.surface(z, ox + (*it).x + (*it).w, oy + (*it).y, (*nx).x - ((*it).x + (*it).w),
+                            (*it).asc + (*it).desc, selcol)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
 }
 
 // Is this CODE item in the middle of an inline span (neither first nor
@@ -1472,10 +1750,394 @@ fn mdv_link_rect(v: *mut MdView, i: u32, x: *mut f64, y: *mut f64, w: *mut f64, 
     return false
 }
 
-// The pointer moved: the link under it is highlighted. True when the picture changed.
+// ====================================================================
+// SELECTION AND COPY
+// ====================================================================
+//
+// A position is (item, octet offset inside the item); the items are in reading order, so
+// positions compare as pairs. The items are the words of the layout: a layout redone for
+// a new width or scale or a new text clears the selection (the items it names are gone).
+
+fn item_ptr(v: *mut MdView, it: *mut Item) -> u64 {
+    var p: u64 = doc.pool_ptr(&(*v).d)
+    if (*it).flags & FL_VPOOL != 0 as u32 {
+        p = rt.buf_ptr(&(*v).vpool)
+    }
+    return p + ((*it).off as u64)
+}
+
+fn pos_lt(ai: usize, ao: usize, bi: usize, bo: usize) -> bool {
+    return ai < bi || (ai == bi && ao < bo)
+}
+
+// The selection normalised: (lo item, lo off, hi item, hi off).
+fn sel_range(v: *mut MdView, li: *mut usize, lo: *mut usize, hi: *mut usize, ho: *mut usize) {
+    if pos_lt((*v).sf_item, (*v).sf_off, (*v).sa_item, (*v).sa_off) {
+        *li = (*v).sf_item
+        *lo = (*v).sf_off
+        *hi = (*v).sa_item
+        *ho = (*v).sa_off
+    } else {
+        *li = (*v).sa_item
+        *lo = (*v).sa_off
+        *hi = (*v).sf_item
+        *ho = (*v).sf_off
+    }
+}
+
+fn mdv_has_selection(v: *mut MdView) -> bool {
+    return (*v).sel_on && ((*v).sa_item != (*v).sf_item || (*v).sa_off != (*v).sf_off)
+}
+
+fn mdv_clear_selection(v: *mut MdView) {
+    (*v).sel_on = false
+    (*v).sel_drag = false
+}
+
+// The selection as (item, offset) pairs, normalised; false if there is none.
+fn mdv_selection_range(v: *mut MdView, li: *mut usize, lo: *mut usize, hi: *mut usize, ho: *mut usize) -> bool {
+    if !mdv_has_selection(v) {
+        return false
+    }
+    sel_range(v, li, lo, hi, ho)
+    return true
+}
+
+fn mdv_set_clipboard(v: *mut MdView, write: fn(u64, usize) -> bool) {
+    (*v).clip_write = write
+    (*v).has_clip = true
+}
+
+fn is_text_item(it: *mut Item) -> bool {
+    return (*it).kind == IT_TEXT && ((*it).n > 0 as u32 || (*it).brk != 0 as u32)
+}
+
+// Everything: from the first text item to the end of the last.
+// The text item `i` (a word or a piece of code): its box in CONTENT coordinates and its octets.
+// False for items that are no text (rules, bullets, images). For tests, scroll-to and
+// accessibility.
+fn mdv_item_text(v: *mut MdView, i: usize, x: *mut f64, y: *mut f64, w: *mut f64, h: *mut f64,
+        p: *mut u64, n: *mut usize) -> bool {
+    if i >= vec_len[Item](&(*v).items) {
+        return false
+    }
+    let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+    if (*it).kind != IT_TEXT {
+        return false
+    }
+    *x = (*it).x
+    *y = (*it).y
+    *w = (*it).w
+    *h = (*it).asc + (*it).desc
+    *p = item_ptr(v, it)
+    *n = (*it).n as usize
+    return true
+}
+
+fn mdv_select_all(v: *mut MdView) {
+    let n: usize = vec_len[Item](&(*v).items)
+    var first: usize = n
+    var last: usize = n
+    var i: usize = 0
+    while i < n {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+        if (*it).kind == IT_TEXT && (*it).n > 0 as u32 {
+            if first == n {
+                first = i
+            }
+            last = i
+        }
+        i = i + 1
+    }
+    if first == n {
+        return
+    }
+    (*v).sel_on = true
+    (*v).sa_item = first
+    (*v).sa_off = 0
+    let li: *mut Item = vec_elem_ptr[Item](&(*v).items, last)
+    (*v).sf_item = last
+    (*v).sf_off = (*li).n as usize
+}
+
+// The octet offset in item `it` under content x (run_hit, bidi aware).
+fn off_in_item(v: *mut MdView, c: *mut render.Ctx, it: *mut Item, cx: f64) -> usize {
+    if cx <= (*it).x || (*it).n == 0 as u32 {
+        return 0
+    }
+    if cx >= (*it).x + (*it).w {
+        return (*it).n as usize
+    }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var r: painter.TextRun = mk_run((*it).flags, (*it).size)
+    let old: u64 = font_enter(z, (*it).flags)
+    let k: usize = painter.run_hit(z, &r, item_ptr(v, it), (*it).n as usize, cx - (*it).x)
+    font_leave(z, old)
+    return k
+}
+
+// The position under CONTENT coordinates (cx, cy): the item nearest to the point (vertically
+// first, then horizontally) and the offset in it. False if the view has no text.
+fn pos_at(v: *mut MdView, c: *mut render.Ctx, cx: f64, cy: f64, item: *mut usize, off: *mut usize) -> bool {
+    let n: usize = vec_len[Item](&(*v).items)
+    var best: usize = n
+    var bscore: f64 = 1000000000000.0
+    var i: usize = 0
+    while i < n {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+        if (*it).kind == IT_TEXT && (*it).n > 0 as u32 {
+            let h: f64 = (*it).asc + (*it).desc
+            var dy: f64 = 0.0
+            if cy < (*it).y {
+                dy = (*it).y - cy
+            } else if cy > (*it).y + h {
+                dy = cy - ((*it).y + h)
+            }
+            var dx: f64 = 0.0
+            if cx < (*it).x {
+                dx = (*it).x - cx
+            } else if cx > (*it).x + (*it).w {
+                dx = cx - ((*it).x + (*it).w)
+            }
+            let sc: f64 = dy * 1000.0 + dx
+            if sc < bscore {
+                bscore = sc
+                best = i
+            }
+        }
+        i = i + 1
+    }
+    if best == n {
+        return false
+    }
+    let it: *mut Item = vec_elem_ptr[Item](&(*v).items, best)
+    *item = best
+    *off = off_in_item(v, c, it, cx)
+    return true
+}
+
+// character classes for words: 0 blank, 1 letters/digits/_/non-ASCII, 2 other
+fn cclass(ch: u8) -> u32 {
+    if ch == 32 as u8 || ch == 9 as u8 || ch == 10 as u8 {
+        return 0 as u32
+    }
+    if (ch >= 48 as u8 && ch <= 57 as u8) || (ch >= 65 as u8 && ch <= 90 as u8) || (ch >= 97 as u8 && ch <= 122 as u8)
+        || ch == 95 as u8 || ch >= 128 as u8 {
+        return 1 as u32
+    }
+    return 2 as u32
+}
+
+// The word around (item, off): the run of the same class inside the item.
+fn word_in_item(v: *mut MdView, item: usize, off: usize, lo: *mut usize, hi: *mut usize) {
+    let it: *mut Item = vec_elem_ptr[Item](&(*v).items, item)
+    let p: u64 = item_ptr(v, it)
+    let n: usize = (*it).n as usize
+    var at: usize = off
+    if at >= n {
+        if n == 0 {
+            *lo = 0
+            *hi = 0
+            return
+        }
+        at = n - 1
+    }
+    let cl: u32 = cclass(rt.ld8(p, at))
+    var a: usize = at
+    while a > 0 && cclass(rt.ld8(p, a - 1)) == cl {
+        a = a - 1
+    }
+    var b: usize = at + 1
+    while b < n && cclass(rt.ld8(p, b)) == cl {
+        b = b + 1
+    }
+    *lo = a
+    *hi = b
+}
+
+// The block around an item: from the item that starts it (BR_PARA) to the one before the next.
+fn block_of(v: *mut MdView, item: usize, a: *mut usize, b: *mut usize) {
+    let n: usize = vec_len[Item](&(*v).items)
+    var s: usize = item
+    while s > 0 {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, s)
+        if (*it).kind == IT_TEXT && (*it).brk == BR_PARA {
+            break
+        }
+        s = s - 1
+    }
+    var e: usize = item + 1
+    while e < n {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, e)
+        if (*it).kind == IT_TEXT && (*it).brk == BR_PARA {
+            break
+        }
+        e = e + 1
+    }
+    // the last text item of the block
+    var last: usize = item
+    var k: usize = s
+    while k < e {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, k)
+        if (*it).kind == IT_TEXT && (*it).n > 0 as u32 {
+            last = k
+        }
+        k = k + 1
+    }
+    *a = s
+    *b = last
+}
+
+// Appends the selected text to `out`: the words as they stand, a blank between words, a line
+// break where the document has one (code lines, hard breaks), a blank line between blocks,
+// a tab between table cells. Returns the octets added.
+fn mdv_selection_text(v: *mut MdView, out: *mut rt.Buf) -> usize {
+    if !mdv_has_selection(v) {
+        return 0
+    }
+    var li: usize = 0
+    var lo: usize = 0
+    var hi: usize = 0
+    var ho: usize = 0
+    sel_range(v, &li, &lo, &hi, &ho)
+    let n: usize = vec_len[Item](&(*v).items)
+    let start_len: usize = rt.buf_len(out)
+    var prev: *mut Item = 0 as *mut Item
+    var emitted: bool = false
+    var i: usize = li
+    while i <= hi && i < n {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+        if is_text_item(it) {
+            var a: usize = 0
+            var b: usize = (*it).n as usize
+            if i == li {
+                a = lo
+            }
+            if i == hi {
+                b = ho
+            }
+            if b > (*it).n as usize {
+                b = (*it).n as usize
+            }
+            if (*it).n > 0 as u32 && b <= a {
+                i = i + 1
+                continue
+            }
+            if emitted {
+                if (*it).brk == BR_PARA {
+                    rt.buf_push(out, 10 as u8)
+                    rt.buf_push(out, 10 as u8)
+                } else if (*it).brk == BR_LINE {
+                    rt.buf_push(out, 10 as u8)
+                } else if (*it).brk == BR_CELL {
+                    rt.buf_push(out, 9 as u8)
+                } else if (*it).n > 0 as u32 {
+                    // a word after a word: a blank where there is a gap (or a soft line wrap)
+                    let same_line: bool = (*prev).y + 1.0 > (*it).y && (*prev).y - 1.0 < (*it).y
+                    if !same_line || (*it).x > (*prev).x + (*prev).w + 0.5 {
+                        rt.buf_push(out, 32 as u8)
+                    }
+                }
+            }
+            if (*it).n > 0 as u32 {
+                rt.buf_push_bytes(out, item_ptr(v, it) + a as u64, b - a)
+                emitted = true
+                prev = it
+            } else if emitted {
+                prev = it
+            }
+        }
+        i = i + 1
+    }
+    return rt.buf_len(out) - start_len
+}
+
+// Ctrl+C: the selection to the clipboard hook. False when nothing is selected or the platform refused.
+fn mdv_copy(v: *mut MdView) -> bool {
+    if !mdv_has_selection(v) || !(*v).has_clip {
+        return false
+    }
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = mdv_selection_text(v, &b)
+    var ok: bool = false
+    if n > 0 {
+        let f: fn(u64, usize) -> bool = (*v).clip_write
+        ok = f(rt.buf_ptr(&b), n)
+    }
+    rt.buf_free(&b)
+    return ok
+}
+
+// Ctrl+A and Ctrl+C: `cp` is the character or the control character 1 / 3, `mods` as editor.MOD_*.
+fn mdv_char(v: *mut MdView, cp: u32, mods: u32) -> bool {
+    var k: u32 = 0
+    if cp >= 1 as u32 && cp <= 26 as u32 {
+        k = cp + 96 as u32
+    } else if (mods & editor.MOD_CTRL) != 0 as u32 {
+        if cp >= 65 as u32 && cp <= 90 as u32 {
+            k = cp + 32 as u32
+        } else if cp >= 97 as u32 && cp <= 122 as u32 {
+            k = cp
+        }
+    }
+    if k == 97 as u32 {
+        mdv_select_all(v)
+        return true
+    }
+    if k == 99 as u32 {
+        let ok: bool = mdv_copy(v)
+        return true
+    }
+    return false
+}
+
+// content coordinates of a window point, not clamped (a drag past the edge keeps going)
+fn content_of(v: *mut MdView, x: f64, y: f64, cx: *mut f64, cy: *mut f64) {
+    *cx = x - viewport.viewport_content_x(&(*v).vp)
+    *cy = y - viewport.viewport_content_y(&(*v).vp)
+}
+
+// A double click at a window point (for hosts that count clicks themselves): selects the word.
+fn mdv_double_click(v: *mut MdView, c: *mut render.Ctx, x: f64, y: f64) {
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    content_of(v, x, y, &cx, &cy)
+    var item: usize = 0
+    var off: usize = 0
+    if !pos_at(v, c, cx, cy, &item, &off) {
+        return
+    }
+    var a: usize = 0
+    var b: usize = 0
+    word_in_item(v, item, off, &a, &b)
+    (*v).sel_on = true
+    (*v).sa_item = item
+    (*v).sa_off = a
+    (*v).sf_item = item
+    (*v).sf_off = b
+    (*v).sel_drag = false
+}
+
+// The pointer moved: the link under it is highlighted, or a selection drag goes on.
+// True when the picture changed.
 fn mdv_pointer_move(v: *mut MdView, c: *mut render.Ctx, x: f64, y: f64) -> bool {
     if (*v).drag_bar {
         return viewport.viewport_bar_drag(c, &(*v).vp, x, y)
+    }
+    if (*v).sel_drag {
+        var cx: f64 = 0.0
+        var cy: f64 = 0.0
+        content_of(v, x, y, &cx, &cy)
+        var item: usize = 0
+        var off: usize = 0
+        if pos_at(v, c, cx, cy, &item, &off) {
+            if item != (*v).sf_item || off != (*v).sf_off {
+                (*v).sf_item = item
+                (*v).sf_off = off
+                return true
+            }
+        }
+        return false
     }
     let h: u32 = link_at(v, x, y)
     if h != (*v).hover {
@@ -1493,25 +2155,123 @@ fn mdv_pointer_leave(v: *mut MdView) -> bool {
     return false
 }
 
-// A press. True when the view took it (a scrollbar, or a link that waits for
-// its release).
+fn near(a: f64, b: f64) -> bool {
+    var d: f64 = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < 6.0
+}
+
+// A press. True when the view took it: a scrollbar, a link that waits for its release, or the
+// start of a selection (the second click selects the word, the third the block).
 fn mdv_pointer_down(v: *mut MdView, c: *mut render.Ctx, x: f64, y: f64) -> bool {
     if viewport.viewport_bar_press(c, &(*v).vp, x, y) {
         (*v).drag_bar = viewport.viewport_bar_dragging(&(*v).vp) != viewport.VP_BAR_NONE
         return true
     }
     (*v).press = link_at(v, x, y)
-    return (*v).press != NIL
+    if (*v).press != NIL {
+        return true
+    }
+    // inside the view?
+    var gx: f64 = 0.0
+    var gy: f64 = 0.0
+    if !viewport.viewport_hit(&(*v).vp, x, y, &gx, &gy) {
+        return false
+    }
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    content_of(v, x, y, &cx, &cy)
+    var item: usize = 0
+    var off: usize = 0
+    if !pos_at(v, c, cx, cy, &item, &off) {
+        (*v).sel_on = false
+        return false
+    }
+    if (*v).now_ms - (*v).last_down_ms <= 450 && near(x, (*v).last_x) && near(y, (*v).last_y) {
+        (*v).clicks = (*v).clicks + 1
+    } else {
+        (*v).clicks = 1
+    }
+    (*v).last_down_ms = (*v).now_ms
+    (*v).last_x = x
+    (*v).last_y = y
+    (*v).sel_on = true
+    if (*v).clicks >= 3 {
+        var a: usize = 0
+        var b: usize = 0
+        block_of(v, item, &a, &b)
+        (*v).sa_item = a
+        (*v).sa_off = 0
+        let lb: *mut Item = vec_elem_ptr[Item](&(*v).items, b)
+        (*v).sf_item = b
+        (*v).sf_off = (*lb).n as usize
+        (*v).sel_drag = false
+        return true
+    }
+    if (*v).clicks == 2 {
+        var a: usize = 0
+        var b: usize = 0
+        word_in_item(v, item, off, &a, &b)
+        (*v).sa_item = item
+        (*v).sa_off = a
+        (*v).sf_item = item
+        (*v).sf_off = b
+        (*v).sel_drag = false
+        return true
+    }
+    (*v).sa_item = item
+    (*v).sa_off = off
+    (*v).sf_item = item
+    (*v).sf_off = off
+    (*v).sel_drag = true
+    return true
 }
 
-// A release. When it ends a click on a link, the link callback runs with the
-// target; true then.
+// ---- TOUCH. The plain calls the gestures of lib/fui/kittouch.fi become.
+
+// A pan: the content follows the finger by the step (dx, dy) it moved.
+fn mdv_touch_pan(v: *mut MdView, dx: f64, dy: f64) {
+    viewport.viewport_scroll_by(&(*v).vp, 0.0 - dx, 0.0 - dy)
+}
+
+// A fling: carry on with the finger's velocity (px per second); `mdv_tick` runs it.
+fn mdv_touch_fling(v: *mut MdView, vx_per_s: f64, vy_per_s: f64, now_ms: i64) {
+    viewport.viewport_fling(&(*v).vp, (0.0 - vx_per_s) / 1000.0, (0.0 - vy_per_s) / 1000.0, now_ms)
+}
+
+// A tap at a window point: a link under it is followed (the link callback runs); a tap
+// elsewhere clears the selection. True when a link was followed.
+fn mdv_touch_tap(v: *mut MdView, c: *mut render.Ctx, x: f64, y: f64) -> bool {
+    let l: u32 = link_at(v, x, y)
+    if l == NIL {
+        (*v).sel_on = false
+        return false
+    }
+    if (*v).has_link_cb {
+        let u: doc.Slice = mdv_link_url(v, l as usize)
+        let f: fn(u64, u64, usize) = (*v).link_cb
+        f((*v).link_ud, u.p, u.n)
+    }
+    return true
+}
+
+// A long press at a window point: selects the word under it (what a phone does), and the
+// program shows its copy bar. True when there was a word.
+fn mdv_touch_long(v: *mut MdView, c: *mut render.Ctx, x: f64, y: f64) -> bool {
+    mdv_double_click(v, c, x, y)
+    return mdv_has_selection(v)
+}
+
+// A release. When it ends a click on a link, the link callback runs with the target; true then.
 fn mdv_pointer_up(v: *mut MdView, c: *mut render.Ctx, x: f64, y: f64) -> bool {
     if (*v).drag_bar {
         viewport.viewport_bar_release(&(*v).vp)
         (*v).drag_bar = false
         return true
     }
+    (*v).sel_drag = false
     let p: u32 = (*v).press
     (*v).press = NIL
     if p == NIL {

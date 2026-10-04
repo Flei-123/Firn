@@ -1,0 +1,1410 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/dml.fi -- INSERT, UPDATE, DELETE.
+//
+// A row is written as a record into the table's B-tree and one entry into every
+// index of the table. Before that the row is checked in SQLite's order: column
+// affinity, NOT NULL, CHECK, then UNIQUE (the rowid, then each unique index).
+// A UNIQUE conflict follows the statement's conflict clause:
+//   ABORT (default), FAIL, ROLLBACK   the statement fails (and is undone)
+//   IGNORE                            the row is skipped
+//   REPLACE                           the old rows in the way are deleted first
+//   ON CONFLICT DO NOTHING / DO UPDATE (upsert, with the `excluded` row)
+//
+// UPDATE and DELETE FIRST collect the rowids to touch and only then change anything
+// (so a change cannot move the scan), DELETE without WHERE clears the trees at once.
+//
+// HONEST NOTES
+//   M1 A table with a trigger anywhere in the file answers Unsupported to every write
+//      (triggers would not fire); so does a table with an index this library cannot
+//      maintain (a collation other than BINARY, an expression, a partial index).
+//   M2 Foreign keys are parsed and ignored (SQLite's default is also "off").
+//   M3 The automatic rowid is max(rowid) + 1; with AUTOINCREMENT the larger of that and the
+//      value in sqlite_sequence plus one. A table whose largest rowid is 2^63-1 answers Full.
+//   M4 CHECK constraint failures say "CHECK constraint failed" without the expression.
+
+import std.rt
+import db.dberr
+import db.util as ut
+import db.record as rc
+import db.arena as ar
+import db.value as vl
+import db.dbcore as dc
+import db.pager as pgr
+import db.btree as bx
+import db.sqlast as ax
+import db.expr as ex
+import db.rowset as rs
+import db.plan as pl
+import db.select as sl
+
+export { exec_insert, exec_update, exec_delete, plan_free, master_rowid_next, tbl_index_list }
+
+struct Dml {
+    db: *mut dc.Db,
+    st: *mut dc.Stmt,
+    tidx: i32,
+    scope: ex.Scope,
+    cx: ex.Ctx, // statement expressions (VALUES, SET, WHERE)
+    cxc: ex.Ctx, // CHECK and DEFAULT expressions of the schema
+    rr: [ex.RowRef; 2],
+    arena: ar.Arena,
+    nidx: usize,
+    idx: [i32; 16],
+    vals: u64, // new row, ncols Vals (+ spare)
+    exc: u64, // the `excluded` row of an upsert
+    rec: rt.Buf,
+    keyrec: rt.Buf,
+    kv: u64, // key values
+    vals_n: usize, // bytes allocated for vals / exc
+    dsrc: pl.Source, // reads the rows that are deleted or replaced
+    mode: u32,
+    changes: i64,
+    hook: i32,
+}
+
+fn plan_free(st: *mut dc.Stmt) {
+}
+
+fn sz_of_dml() -> usize {
+    return dml_sz_of[Dml]()
+}
+
+fn dml_sz_of[T: Any]() -> usize {
+    return size_of[T]()
+}
+
+fn text_msg2(a: str, p: u64, n: usize, b: str, p2: u64, n2: usize) -> str {
+    var buf: rt.Buf = rt.buf_new()
+    ut.put_text(&buf, a)
+    rt.buf_push_bytes(&buf, p, n)
+    ut.put_text(&buf, b)
+    rt.buf_push_bytes(&buf, p2, n2)
+    let s: str = __str_copy(str { p: rt.buf_data(&buf), n: rt.buf_len(&buf) })
+    rt.buf_free(&buf)
+    return s
+}
+
+// the indexes of table `tidx` (schema index numbers); more than 16 is an error
+fn tbl_index_list(db: *mut dc.Db, tidx: i32, out: *mut i32, count: *mut usize) -> DbError!bool {
+    *count = 0
+    let sc: *mut dc.Schema = &(*db).schema
+    let n: usize = dc.schema_index_count(sc)
+    var i: usize = 0
+    while i < n {
+        let ix: *mut dc.Index = dc.index_at(sc, i)
+        if (*ix).table == tidx {
+            if (*ix).bad {
+                return dberr.fail(DbError::Unsupported, text_msg2("cannot maintain index ", (*ix).name_p, (*ix).name_n, ": ", (*ix).msg_p, (*ix).msg_n))
+            }
+            if *count >= 16 {
+                return dberr.fail(DbError::Unsupported, "more than 16 indexes on a table")
+            }
+            *(out + *count) = i as i32
+            *count = *count + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn dml_new(db: *mut dc.Db, st: *mut dc.Stmt) -> Dml {
+    var dv: Dml = Dml { db: db, st: st, tidx: -1, scope: ex.scope_new(), cx: ex.ctx_new(db, &(*st).ast, 0 as *mut ar.Arena),
+        cxc: ex.ctx_new(db, &(*db).schema.ast, 0 as *mut ar.Arena),
+        rr: [ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: true }, ex.RowRef { vals: 0, ncols: 0, rowid: 0, valid: true }],
+        arena: ar.arena_new(), nidx: 0, idx: [-1; 16], vals: 0, exc: 0, rec: rt.buf_new(), keyrec: rt.buf_new(),
+        kv: 0, vals_n: 0, dsrc: pl.source_new(), mode: ax.CF_ABORT, changes: 0, hook: 0 }
+    return dv
+}
+
+fn dml_free(e: *mut Dml) {
+    pl.src_free(&(*e).dsrc)
+    ar.arena_free(&(*e).arena)
+    rt.buf_free(&(*e).rec)
+    rt.buf_free(&(*e).keyrec)
+    if (*e).vals != 0 {
+        rt.heap_free((*e).vals, (*e).vals_n)
+    }
+    if (*e).exc != 0 {
+        rt.heap_free((*e).exc, (*e).vals_n)
+    }
+    if (*e).kv != 0 {
+        rt.heap_free((*e).kv, 40 * 40)
+    }
+}
+
+// Common start: the table, the scope, the contexts.
+fn dml_start(e: *mut Dml, name_p: u64, name_n: usize, with_excluded: bool) -> DbError!bool {
+    let db: *mut dc.Db = (*e).db
+    let st: *mut dc.Stmt = (*e).st
+    let sc: *mut dc.Schema = &(*db).schema
+    if (*sc).has_triggers {
+        return dberr.fail(DbError::Unsupported, "this database has triggers; writes are not supported (triggers would not fire)")
+    }
+    let ti: i64 = dc.find_table(sc, name_p, name_n)
+    if ti < 0 {
+        return dberr.fail(DbError::NoSuchTable, text_msg2("no such table: ", name_p, name_n, "", 0, 0))
+    }
+    let t: *mut dc.Table = dc.table_at(sc, ti as usize)
+    if (*t).bad {
+        return dberr.fail(DbError::Unsupported, text_msg2("table cannot be used: ", (*t).msg_p, (*t).msg_n, "", 0, 0))
+    }
+    if dc.name_eq((*t).name_p, (*t).name_n, "sqlite_master".p as u64, 13) || dc.name_eq((*t).name_p, (*t).name_n, "sqlite_schema".p as u64, 13) {
+        return dberr.fail(DbError::Sql, "table sqlite_master may not be modified")
+    }
+    (*e).tidx = ti as i32
+    try tbl_index_list(db, ti as i32, &(*e).idx[0], &(*e).nidx)
+    let info: *mut ex.SrcInfo = &(*e).scope.src[0]
+    (*info).tbl = ti as i32
+    (*info).name_p = (*t).name_p
+    (*info).name_n = (*t).name_n
+    (*info).alias_p = (*t).name_p
+    (*info).alias_n = (*t).name_n
+    (*info).ncols = (*t).ncols
+    (*info).cols = (*t).cols
+    (*info).rowid_col = (*t).rowid_col
+    (*info).hidden_rowid = true
+    (*e).scope.n = 1
+    if with_excluded {
+        let ix: *mut ex.SrcInfo = &(*e).scope.src[1]
+        (*ix).tbl = ti as i32
+        (*ix).name_p = "excluded".p as u64
+        (*ix).name_n = 8
+        (*ix).alias_p = "excluded".p as u64
+        (*ix).alias_n = 8
+        (*ix).ncols = (*t).ncols
+        (*ix).cols = (*t).cols
+        (*ix).rowid_col = (*t).rowid_col
+        (*ix).hidden_rowid = true
+        (*ix).qual_only = true
+        (*e).scope.n = 2
+    }
+    (*e).vals_n = ((*t).ncols + 4) * 40
+    (*e).vals = rt.heap_alloc((*e).vals_n)
+    if with_excluded {
+        (*e).exc = rt.heap_alloc(((*t).ncols + 4) * 40)
+    }
+    (*e).kv = rt.heap_alloc(40 * 40)
+    if (*e).vals == 0 || (*e).kv == 0 {
+        return dberr.fail(DbError::NoMemory, "out of memory")
+    }
+    (*e).rr[0] = ex.RowRef { vals: (*e).vals, ncols: (*t).ncols, rowid: 0, valid: true }
+    (*e).rr[1] = ex.RowRef { vals: (*e).exc, ncols: (*t).ncols, rowid: 0, valid: true }
+    (*e).cx.scope = &(*e).scope
+    (*e).cx.rows = ((&(*e).rr[0]) as u64)
+    (*e).cx.arena = &(*e).arena
+    (*e).cx.params = rt.buf_ptr(&(*st).params)
+    (*e).cx.nparams = (*st).nparams
+    (*e).cx.stmt = st as u64
+    (*e).cx.subq = sl.sub_hook_addr()
+    (*e).cxc.scope = &(*e).scope
+    (*e).cxc.rows = ((&(*e).rr[0]) as u64)
+    (*e).cxc.arena = &(*e).arena
+    (*e).cxc.params = rt.buf_ptr(&(*st).params)
+    (*e).cxc.nparams = (*st).nparams
+    return true
+}
+
+fn table_of(e: *mut Dml) -> *mut dc.Table {
+    return dc.table_at(&(*(*e).db).schema, (*e).tidx as usize)
+}
+
+// ----------------------------------------------------------- the checks
+fn qual_col_msg(a: str, t: *mut dc.Table, ci: usize) -> str {
+    let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + ci
+    var buf: rt.Buf = rt.buf_new()
+    ut.put_text(&buf, a)
+    rt.buf_push_bytes(&buf, (*t).name_p, (*t).name_n)
+    rt.buf_push(&buf, 46 as u8)
+    rt.buf_push_bytes(&buf, (*col).name_p, (*col).name_n)
+    let s: str = __str_copy(str { p: rt.buf_data(&buf), n: rt.buf_len(&buf) })
+    rt.buf_free(&buf)
+    return s
+}
+
+fn resolve_schema_expr(e: *mut Dml, n: i32) -> DbError!bool {
+    if n < 0 {
+        return true
+    }
+    // CHECK / DEFAULT expressions live in the schema tree; resolving is idempotent
+    try ex.resolve_expr(&(*e).scope, &(*(*e).db).schema.ast, n, false, false)
+    return true
+}
+
+// NOT NULL and CHECK for the row in e.vals
+fn validate_row(e: *mut Dml, rowid: i64) -> DbError!bool {
+    let t: *mut dc.Table = table_of(e)
+    let vals: *mut rc.Val = (*e).vals as *mut rc.Val
+    (*e).rr[0].rowid = rowid
+    var i: usize = 0
+    while i < (*t).ncols {
+        let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + i
+        if ((*col).flags & dc.CF_NOTNULL) != 0 && (*(vals + i)).t == 0 {
+            return dberr.fail(DbError::Constraint, qual_col_msg("NOT NULL constraint failed: ", t, i))
+        }
+        i = i + 1
+    }
+    // CHECK constraints of the columns and of the table
+    var c: usize = 0
+    while c < (*t).ncols {
+        let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + c
+        var ck: i32 = (*col).checks
+        while ck >= 0 {
+            try resolve_schema_expr(e, ck)
+            let tr: i64 = try ex.eval_truth(&(*e).cxc, ck)
+            if tr == 0 {
+                return dberr.fail(DbError::Constraint, "CHECK constraint failed")
+            }
+            ck = (*ax.ast_n(&(*(*e).db).schema.ast, ck)).next
+        }
+        c = c + 1
+    }
+    var tc: i32 = (*t).tchecks
+    while tc >= 0 {
+        let tn: *mut ax.Node = ax.ast_n(&(*(*e).db).schema.ast, tc)
+        if (*tn).op == 3 {
+            try resolve_schema_expr(e, (*tn).a)
+            let tr2: i64 = try ex.eval_truth(&(*e).cxc, (*tn).a)
+            if tr2 == 0 {
+                return dberr.fail(DbError::Constraint, "CHECK constraint failed")
+            }
+        }
+        tc = (*tn).next
+    }
+    return true
+}
+
+// ------------------------------------------------------------ index keys
+// the key record values of index `ixn` for a row: the index columns, then the rowid
+fn key_vals(e: *mut Dml, ix: *mut dc.Index, vals: *mut rc.Val, rowid: i64, out: *mut rc.Val) -> usize {
+    var i: usize = 0
+    while i < (*ix).ncols {
+        let c: i32 = (*ix).cols[i]
+        if c < 0 {
+            *(out + i) = rc.val_int(rowid)
+        } else {
+            *(out + i) = *(vals + (c as usize))
+        }
+        i = i + 1
+    }
+    *(out + (*ix).ncols) = rc.val_int(rowid)
+    return (*ix).ncols + 1
+}
+
+fn index_has_null(ix: *mut dc.Index, vals: *mut rc.Val) -> bool {
+    var i: usize = 0
+    while i < (*ix).ncols {
+        let c: i32 = (*ix).cols[i]
+        if c >= 0 && (*(vals + (c as usize))).t == 0 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn index_add(e: *mut Dml, ix: *mut dc.Index, vals: *mut rc.Val, rowid: i64) -> DbError!bool {
+    let db: *mut dc.Db = (*e).db
+    let kv: *mut rc.Val = (*e).kv as *mut rc.Val
+    let n: usize = key_vals(e, ix, vals, rowid, kv)
+    rt.buf_clear(&(*e).keyrec)
+    rc.rec_encode(kv, n, &(*e).keyrec)
+    var uk: rc.UKey = rc.ukey_new((*e).kv, n, (*ix).desc)
+    let added: bool = try bx.bt_index_insert(&(*db).bt, (*ix).root, &uk, rt.buf_ptr(&(*e).keyrec), rt.buf_len(&(*e).keyrec))
+    if !added {
+        return dberr.fail(DbError::Corrupt, "index entry exists already")
+    }
+    return true
+}
+
+fn index_remove(e: *mut Dml, ix: *mut dc.Index, vals: *mut rc.Val, rowid: i64) -> DbError!bool {
+    let db: *mut dc.Db = (*e).db
+    let kv: *mut rc.Val = (*e).kv as *mut rc.Val
+    let n: usize = key_vals(e, ix, vals, rowid, kv)
+    var uk: rc.UKey = rc.ukey_new((*e).kv, n, (*ix).desc)
+    let gone: bool = try bx.bt_index_delete(&(*db).bt, (*ix).root, &uk)
+    if !gone {
+        return dberr.fail(DbError::Corrupt, "index entry missing: the index does not match its table")
+    }
+    return true
+}
+
+// The rowid of an entry of a UNIQUE index equal to the row's key over the index
+// columns (not the rowid), or -1.
+fn find_conflict(e: *mut Dml, ix: *mut dc.Index, vals: *mut rc.Val) -> DbError!i64 {
+    if index_has_null(ix, vals) {
+        return -1
+    }
+    let db: *mut dc.Db = (*e).db
+    let kv: *mut rc.Val = (*e).kv as *mut rc.Val
+    var i: usize = 0
+    while i < (*ix).ncols {
+        let c: i32 = (*ix).cols[i]
+        if c < 0 {
+            return -1
+        }
+        *(kv + i) = *(vals + (c as usize))
+        i = i + 1
+    }
+    var uk: rc.UKey = rc.ukey_new((*e).kv, (*ix).ncols, (*ix).desc)
+    var cur: bx.Cursor = bx.cur_new((*ix).root, true)
+    let ok: bool = try bx.bt_index_seek(&(*db).bt, &cur, &uk, bx.SEEK_GE)
+    if !ok {
+        return -1
+    }
+    let pay: bx.Payload = try bx.bt_payload(&(*db).bt, &cur)
+    let c0: i64 = try rc.rec_compare_key(pay.p, pay.n, &uk)
+    if c0 != 0 {
+        return -1
+    }
+    let ncol: usize = rc.rec_column_count(pay.p, pay.n)
+    let rv: rc.Val = try rc.rec_column(pay.p, pay.n, ncol - 1)
+    return rv.i
+}
+
+fn unique_msg(e: *mut Dml, ix: *mut dc.Index) -> str {
+    let t: *mut dc.Table = table_of(e)
+    var buf: rt.Buf = rt.buf_new()
+    ut.put_text(&buf, "UNIQUE constraint failed: ")
+    var i: usize = 0
+    while i < (*ix).ncols {
+        if i > 0 {
+            ut.put_text(&buf, ", ")
+        }
+        rt.buf_push_bytes(&buf, (*t).name_p, (*t).name_n)
+        rt.buf_push(&buf, 46 as u8)
+        let c: i32 = (*ix).cols[i]
+        if c < 0 {
+            ut.put_text(&buf, "rowid")
+        } else {
+            let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + (c as usize)
+            rt.buf_push_bytes(&buf, (*col).name_p, (*col).name_n)
+        }
+        i = i + 1
+    }
+    let s: str = __str_copy(str { p: rt.buf_data(&buf), n: rt.buf_len(&buf) })
+    rt.buf_free(&buf)
+    return s
+}
+
+// Deletes the row `rowid` (and its index entries); the row's values are read from the table.
+fn delete_row_by_id(e: *mut Dml, rowid: i64) -> DbError!bool {
+    let db: *mut dc.Db = (*e).db
+    let t: *mut dc.Table = table_of(e)
+    let s: *mut pl.Source = &(*e).dsrc
+    (*s).tbl = (*e).tidx
+    (*s).ncols_table = (*t).ncols
+    pl.mark_all_used(s, (*t).ncols)
+    let found: bool = try pl.src_load_row(&(*e).cx, s, rowid)
+    if !found {
+        return false
+    }
+    let vals: *mut rc.Val = (*s).vals as *mut rc.Val
+    var i: usize = 0
+    while i < (*e).nidx {
+        let ix: *mut dc.Index = dc.index_at(&(*db).schema, (*e).idx[i] as usize)
+        try index_remove(e, ix, vals, rowid)
+        i = i + 1
+    }
+    try bx.bt_table_delete(&(*db).bt, (*t).root, rowid)
+    return true
+}
+
+// What to do with a conflict. 0: go on; 1: skip the row. `other` is the rowid in the way.
+fn on_conflict(e: *mut Dml, ix: *mut dc.Index, other: i64, mode: u32) -> DbError!i32 {
+    if mode == ax.CF_IGNORE {
+        return 1
+    }
+    if mode == ax.CF_REPLACE {
+        try delete_row_by_id(e, other)
+        return 0
+    }
+    if (ix as u64) == 0 {
+        let t: *mut dc.Table = table_of(e)
+        if (*t).rowid_col >= 0 {
+            return dberr.fail(DbError::Constraint, qual_col_msg("UNIQUE constraint failed: ", t, (*t).rowid_col as usize))
+        }
+        return dberr.fail(DbError::Constraint, text_msg2("UNIQUE constraint failed: ", (*t).name_p, (*t).name_n, ".rowid", 0, 0))
+    }
+    return dberr.fail(DbError::Constraint, unique_msg(e, ix))
+}
+
+// Checks the uniqueness of the new row (rowid and every unique index) and applies the
+// conflict mode. `own` is the rowid of the row being updated (-1 for an insert).
+// Returns 0 to go on, 1 to skip the row, 2 when an upsert already handled it.
+fn check_unique(e: *mut Dml, rowid: i64, own: i64, mode: u32, upsert: i32) -> DbError!i32 {
+    let db: *mut dc.Db = (*e).db
+    let t: *mut dc.Table = table_of(e)
+    let vals: *mut rc.Val = (*e).vals as *mut rc.Val
+    // the rowid
+    if rowid != own {
+        var pl2: bx.Payload = bx.Payload { p: 0, n: 0 }
+        let exists: bool = try bx.bt_table_find(&(*db).bt, (*t).root, rowid, &pl2)
+        if exists {
+            if upsert >= 0 {
+                let handled: i32 = try do_upsert(e, upsert, rowid, 0 as *mut dc.Index)
+                return handled
+            }
+            let r: i32 = try on_conflict(e, 0 as *mut dc.Index, rowid, mode)
+            if r == 1 {
+                return 1
+            }
+        }
+    }
+    var i: usize = 0
+    while i < (*e).nidx {
+        let ix: *mut dc.Index = dc.index_at(&(*db).schema, (*e).idx[i] as usize)
+        i = i + 1
+        if !(*ix).unique {
+            continue
+        }
+        let other: i64 = try find_conflict(e, ix, vals)
+        if other >= 0 && other != own {
+            if upsert >= 0 {
+                let handled: i32 = try do_upsert(e, upsert, other, ix)
+                return handled
+            }
+            let r: i32 = try on_conflict(e, ix, other, mode)
+            if r == 1 {
+                return 1
+            }
+        }
+    }
+    return 0
+}
+
+// ------------------------------------------------------------- the row write
+fn row_record(e: *mut Dml, vals: *mut rc.Val) {
+    let t: *mut dc.Table = table_of(e)
+    rt.buf_clear(&(*e).rec)
+    if (*t).rowid_col >= 0 {
+        let rcol: usize = (*t).rowid_col as usize
+        let keep: rc.Val = *(vals + rcol)
+        *(vals + rcol) = rc.val_null()
+        rc.rec_encode(vals, (*t).ncols, &(*e).rec)
+        *(vals + rcol) = keep
+    } else {
+        rc.rec_encode(vals, (*t).ncols, &(*e).rec)
+    }
+}
+
+fn write_row(e: *mut Dml, rowid: i64, with_indexes: bool) -> DbError!bool {
+    let db: *mut dc.Db = (*e).db
+    let t: *mut dc.Table = table_of(e)
+    let vals: *mut rc.Val = (*e).vals as *mut rc.Val
+    row_record(e, vals)
+    try bx.bt_table_insert(&(*db).bt, (*t).root, rowid, rt.buf_ptr(&(*e).rec), rt.buf_len(&(*e).rec))
+    if with_indexes {
+        var i: usize = 0
+        while i < (*e).nidx {
+            let ix: *mut dc.Index = dc.index_at(&(*db).schema, (*e).idx[i] as usize)
+            try index_add(e, ix, vals, rowid)
+            i = i + 1
+        }
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- sequences
+fn seq_find(db: *mut dc.Db, tp: u64, tn: usize, rowid: *mut i64, seq: *mut i64) -> DbError!bool {
+    let sc: *mut dc.Schema = &(*db).schema
+    let ti: i64 = dc.find_table(sc, "sqlite_sequence".p as u64, 15)
+    if ti < 0 {
+        return false
+    }
+    let st: *mut dc.Table = dc.table_at(sc, ti as usize)
+    var cur: bx.Cursor = bx.cur_new((*st).root, false)
+    var ok: bool = try bx.bt_first(&(*db).bt, &cur)
+    while ok {
+        let pay: bx.Payload = try bx.bt_payload(&(*db).bt, &cur)
+        var v: [rc.Val; 2] = [rc.val_null(), rc.val_null()]
+        try rc.rec_decode(pay.p, pay.n, &v[0], 2)
+        if v[0].t == 3 && dc.name_eq(v[0].p, v[0].n, tp, tn) {
+            *rowid = try bx.bt_rowid(&(*db).bt, &cur)
+            if v[1].t == 1 {
+                *seq = v[1].i
+            } else {
+                *seq = 0
+            }
+            return true
+        }
+        ok = try bx.bt_next(&(*db).bt, &cur)
+    }
+    return false
+}
+
+fn seq_store(db: *mut dc.Db, tp: u64, tn: usize, value: i64) -> DbError!bool {
+    let sc: *mut dc.Schema = &(*db).schema
+    let ti: i64 = dc.find_table(sc, "sqlite_sequence".p as u64, 15)
+    if ti < 0 {
+        return dberr.fail(DbError::Corrupt, "sqlite_sequence is missing")
+    }
+    let st: *mut dc.Table = dc.table_at(sc, ti as usize)
+    var rowid: i64 = 0
+    var old: i64 = 0
+    let found: bool = try seq_find(db, tp, tn, &rowid, &old)
+    var vals: [rc.Val; 2] = [rc.val_text(tp, tn), rc.val_int(value)]
+    var rec: rt.Buf = rt.buf_new()
+    rc.rec_encode(&vals[0], 2, &rec)
+    var rid: i64 = rowid
+    if !found {
+        rid = (try bx.bt_max_rowid(&(*db).bt, (*st).root)) + 1
+    }
+    let r: DbError!bool = bx.bt_table_insert(&(*db).bt, (*st).root, rid, rt.buf_ptr(&rec), rt.buf_len(&rec))
+    rt.buf_free(&rec)
+    try r
+    return true
+}
+
+// ------------------------------------------------------------------ INSERT
+
+// "table t has 3 columns but 2 values were supplied" / "2 values for 3 columns"
+fn count_msg(t: *mut dc.Table, explicit: bool, expected: usize, got: usize) -> str {
+    var b: rt.Buf = rt.buf_new()
+    if explicit {
+        rt.buf_push_dec_u64(&b, got as u64)
+        ut.put_text(&b, " values for ")
+        rt.buf_push_dec_u64(&b, expected as u64)
+        ut.put_text(&b, " columns")
+    } else {
+        ut.put_text(&b, "table ")
+        rt.buf_push_bytes(&b, (*t).name_p, (*t).name_n)
+        ut.put_text(&b, " has ")
+        rt.buf_push_dec_u64(&b, expected as u64)
+        ut.put_text(&b, " columns but ")
+        rt.buf_push_dec_u64(&b, got as u64)
+        ut.put_text(&b, " values were supplied")
+    }
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+fn column_map(e: *mut Dml, ins: *mut ax.Node, map: *mut i32, nmapped: *mut usize) -> DbError!bool {
+    let t: *mut dc.Table = table_of(e)
+    let ast: *mut ax.Ast = &(*(*e).st).ast
+    var i: usize = 0
+    while i < (*t).ncols {
+        *(map + i) = -1
+        i = i + 1
+    }
+    *nmapped = 0
+    if (*ins).a < 0 {
+        var k: usize = 0
+        while k < (*t).ncols {
+            *(map + k) = k as i32
+            k = k + 1
+        }
+        *nmapped = (*t).ncols
+        return true
+    }
+    var n: i32 = (*ins).a
+    var pos: i32 = 0
+    while n >= 0 {
+        let nn: *mut ax.Node = ax.ast_n(ast, n)
+        let ci: i64 = dc.find_column(t, (*nn).sp, (*nn).sn)
+        if ci == -2 {
+            if (*t).rowid_col < 0 {
+                // the hidden rowid: not a column we can map
+                return dberr.fail(DbError::Unsupported, "INSERT into the hidden rowid column is not supported")
+            }
+            *(map + ((*t).rowid_col as usize)) = pos
+        } else if ci < 0 {
+            return dberr.fail(DbError::NoSuchColumn, text_msg2("table ", (*t).name_p, (*t).name_n, " has no column named ", (*nn).sp, (*nn).sn))
+        } else {
+            *(map + (ci as usize)) = pos
+        }
+        pos = pos + 1
+        *nmapped = *nmapped + 1
+        n = (*nn).next
+    }
+    return true
+}
+
+// Fills e.vals from the source values `src` (positions per `map`), the defaults for the
+// rest; applies affinity; works out the rowid. Returns the rowid.
+fn build_new_row(e: *mut Dml, map: *mut i32, src: *mut rc.Val, nsrc: usize, explicit_rowid: *mut bool) -> DbError!i64 {
+    let db: *mut dc.Db = (*e).db
+    let t: *mut dc.Table = table_of(e)
+    let vals: *mut rc.Val = (*e).vals as *mut rc.Val
+    var i: usize = 0
+    while i < (*t).ncols {
+        let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + i
+        let m: i32 = *(map + i)
+        var v: rc.Val = rc.val_null()
+        if m >= 0 && (m as usize) < nsrc {
+            v = *(src + (m as usize))
+        } else if (*col).dflt >= 0 {
+            try resolve_schema_expr(e, (*col).dflt)
+            v = try ex.eval(&(*e).cxc, (*col).dflt)
+        }
+        if v.t == 3 || v.t == 4 {
+            // own the text: the source may be a transient value
+            v.p = ar.arena_copy(&(*e).arena, v.p, v.n)
+        }
+        vl.apply_affinity(&v, (*col).aff, &(*e).arena)
+        *(vals + i) = v
+        i = i + 1
+    }
+    *explicit_rowid = false
+    var rowid: i64 = 0
+    if (*t).rowid_col >= 0 {
+        let rcol: usize = (*t).rowid_col as usize
+        let rv: *mut rc.Val = vals + rcol
+        if (*rv).t == 0 {
+            // automatic
+            rowid = try next_rowid(e)
+            *rv = rc.val_int(rowid)
+        } else if (*rv).t == 1 {
+            rowid = (*rv).i
+            *explicit_rowid = true
+        } else {
+            return dberr.fail(DbError::Sql, "datatype mismatch")
+        }
+    } else {
+        rowid = try next_rowid(e)
+    }
+    return rowid
+}
+
+fn next_rowid(e: *mut Dml) -> DbError!i64 {
+    let db: *mut dc.Db = (*e).db
+    let t: *mut dc.Table = table_of(e)
+    var mx: i64 = try bx.bt_max_rowid(&(*db).bt, (*t).root)
+    if (*t).autoinc {
+        var rid: i64 = 0
+        var seq: i64 = 0
+        let found: bool = try seq_find(db, (*t).name_p, (*t).name_n, &rid, &seq)
+        if found && seq > mx {
+            mx = seq
+        }
+    }
+    if mx == 9223372036854775807 {
+        return dberr.fail(DbError::Full, "database or disk is full (rowid space exhausted)")
+    }
+    return mx + 1
+}
+
+#[allow_escape]
+fn exec_insert(st: *mut dc.Stmt) -> DbError!bool {
+    let db: *mut dc.Db = (*st).db
+    var e: Dml = dml_new(db, st)
+    let r: DbError!bool = insert_inner(&e, st)
+    dml_free(&e)
+    try r
+    return true
+}
+
+fn insert_inner(e: *mut Dml, st: *mut dc.Stmt) -> DbError!bool {
+    let db: *mut dc.Db = (*e).db
+    let ast: *mut ax.Ast = &(*st).ast
+    let ins: *mut ax.Node = ax.ast_n(ast, (*st).root)
+    let upsert: i32 = (*ins).d
+    try dml_start(e, (*ins).sp, (*ins).sn, upsert >= 0)
+    let t: *mut dc.Table = table_of(e)
+    (*e).mode = (*ins).op
+    var mapbuf: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&mapbuf, ((*t).ncols + 4) * 4)
+    var nmapped: usize = 0
+    let cm: DbError!bool = column_map(e, ins, (rt.buf_ptr(&mapbuf)) as *mut i32, &nmapped)
+    if dberr.failed_bool(cm) {
+        rt.buf_free(&mapbuf)
+        try cm
+    }
+    let ir: DbError!bool = insert_rows(e, st, ins, (rt.buf_ptr(&mapbuf)) as *mut i32, nmapped, upsert)
+    rt.buf_free(&mapbuf)
+    try ir
+    return true
+}
+
+#[allow_escape]
+fn insert_rows(e: *mut Dml, st: *mut dc.Stmt, ins: *mut ax.Node, map: *mut i32, nmapped: usize,
+    upsert: i32) -> DbError!bool {
+    let db: *mut dc.Db = (*e).db
+    let ast: *mut ax.Ast = &(*st).ast
+    let t: *mut dc.Table = table_of(e)
+    let mut_vals: *mut rc.Val = (*e).vals as *mut rc.Val
+    var es: ex.Scope = ex.scope_new()
+    var srcbuf: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&srcbuf, ((*t).ncols + 8) * 40)
+    let src: *mut rc.Val = (rt.buf_ptr(&srcbuf)) as *mut rc.Val
+    var changes: i64 = 0
+    var last: i64 = (*db).last_rowid
+    if upsert >= 0 {
+        try prepare_upsert(e, upsert)
+    }
+    if (*ins).flag == 1 {
+        // DEFAULT VALUES
+        var explicit: bool = false
+        let rowid: i64 = try build_new_row(e, map, src, 0, &explicit)
+        let done: bool = try store_new_row(e, rowid, upsert)
+        if done {
+            changes = changes + 1
+            last = rowid
+        }
+    } else if (*ins).b >= 0 {
+        var row: i32 = (*ins).b
+        while row >= 0 {
+            let rn: *mut ax.Node = ax.ast_n(ast, row)
+            // the expression list of the row
+            ar.arena_reset(&(*e).arena)
+            var cnt: usize = 0
+            var x: i32 = (*rn).a
+            while x >= 0 {
+                try sl.resolve_stmt(db, st, &es, x, false)
+                x = (*ax.ast_n(ast, x)).next
+            }
+            x = (*rn).a
+            while x >= 0 {
+                if cnt >= (*t).ncols + 8 {
+                    return dberr.fail(DbError::Sql, count_msg(t, (*ins).a >= 0, nmapped, cnt + 1))
+                }
+                // VALUES expressions see no row
+                (*e).rr[0].valid = false
+                *(src + cnt) = try ex.eval(&(*e).cx, x)
+                (*e).rr[0].valid = true
+                cnt = cnt + 1
+                x = (*ax.ast_n(ast, x)).next
+            }
+            if cnt != nmapped {
+                return dberr.fail(DbError::Sql, count_msg(t, (*ins).a >= 0, nmapped, cnt))
+            }
+            var explicit2: bool = false
+            let rowid: i64 = try build_new_row(e, map, src, cnt, &explicit2)
+            let done: bool = try store_new_row(e, rowid, upsert)
+            if done {
+                changes = changes + 1
+                last = rowid
+            }
+            row = (*rn).next
+        }
+    } else if (*ins).c >= 0 {
+        // INSERT .. SELECT: the rows are collected first
+        let child: *mut sl.SelIter = sl.sel_new(db, st, ast)
+        if (child as u64) == 0 {
+            return dberr.fail(DbError::NoMemory, "out of memory")
+        }
+        let sr: DbError!bool = sl.sel_setup(child, (*ins).c, 0 as *mut ex.Scope)
+        if dberr.failed_bool(sr) {
+            sl.sel_free(child)
+            try sr
+        }
+        var rows: rs.RowSet = rs.rs_new()
+        let dr: DbError!bool = drain_select(child, &rows)
+        let ncol: usize = sl.sel_ncols(child)
+        sl.sel_free(child)
+        if dberr.failed_bool(dr) {
+            rs.rs_free(&rows)
+            try dr
+        }
+        if ncol != nmapped {
+            rs.rs_free(&rows)
+            return dberr.fail(DbError::Sql, count_msg(t, (*ins).a >= 0, nmapped, ncol))
+        }
+        var i: usize = 0
+        while i < rs.rs_count(&rows) {
+            ar.arena_reset(&(*e).arena)
+            let got: DbError!usize = rs.rs_get(&rows, i, src, (*t).ncols + 8)
+            if dberr.failed_usize(got) {
+                rs.rs_free(&rows)
+                try got
+            }
+            let cnt: usize = got catch 0
+            var explicit3: bool = false
+            let rr: DbError!i64 = build_new_row(e, map, src, cnt, &explicit3)
+            if dberr.failed_i64(rr) {
+                rs.rs_free(&rows)
+                try rr
+            }
+            let rowid: i64 = rr catch 0
+            let sr2: DbError!bool = store_new_row(e, rowid, upsert)
+            if dberr.failed_bool(sr2) {
+                rs.rs_free(&rows)
+                try sr2
+            }
+            if sr2 catch false {
+                changes = changes + 1
+                last = rowid
+            }
+            i = i + 1
+        }
+        rs.rs_free(&rows)
+    } else {
+        return dberr.fail(DbError::Syntax, "INSERT without values")
+    }
+    (*db).changes = changes
+    (*db).total_changes = (*db).total_changes + changes
+    (*db).last_rowid = last
+    return true
+}
+
+fn drain_select(it: *mut sl.SelIter, r: *mut rs.RowSet) -> DbError!bool {
+    try sl.sel_start(it)
+    let n: usize = sl.sel_ncols(it)
+    while true {
+        let ok: bool = try sl.sel_next(it)
+        if !ok {
+            break
+        }
+        try rs.rs_add(r, (*it).out as *mut rc.Val, n)
+    }
+    return true
+}
+
+// Validates and writes e.vals as a new row. True if a row was stored (changes += 1).
+fn store_new_row(e: *mut Dml, rowid: i64, upsert: i32) -> DbError!bool {
+    try validate_row(e, rowid)
+    let u: i32 = try check_unique(e, rowid, -1, (*e).mode, upsert)
+    if u != 0 {
+        return false
+    }
+    try write_row(e, rowid, true)
+    // AUTOINCREMENT: the sequence follows the largest rowid used
+    let t: *mut dc.Table = table_of(e)
+    if (*t).autoinc {
+        var rid: i64 = 0
+        var seq: i64 = 0
+        let found: bool = try seq_find((*e).db, (*t).name_p, (*t).name_n, &rid, &seq)
+        if !found || rowid > seq {
+            try seq_store((*e).db, (*t).name_p, (*t).name_n, rowid)
+        }
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- upsert
+// ON CONFLICT DO UPDATE: the SET and WHERE expressions see the table row (source 0)
+// and the row that was to be inserted (source 1, "excluded").
+fn prepare_upsert(e: *mut Dml, upsert: i32) -> DbError!bool {
+    let st: *mut dc.Stmt = (*e).st
+    let ast: *mut ax.Ast = &(*st).ast
+    let un: *mut ax.Node = ax.ast_n(ast, upsert)
+    var s: i32 = (*un).b
+    while s >= 0 {
+        let sn: *mut ax.Node = ax.ast_n(ast, s)
+        try sl.resolve_stmt((*e).db, st, &(*e).scope, (*sn).a, false)
+        s = (*sn).next
+    }
+    try sl.resolve_stmt((*e).db, st, &(*e).scope, (*un).c, false)
+    return true
+}
+
+fn do_upsert(e: *mut Dml, upsert: i32, other: i64, ix: *mut dc.Index) -> DbError!i32 {
+    let db: *mut dc.Db = (*e).db
+    let st: *mut dc.Stmt = (*e).st
+    let ast: *mut ax.Ast = &(*st).ast
+    let un: *mut ax.Node = ax.ast_n(ast, upsert)
+    let t: *mut dc.Table = table_of(e)
+    // the conflict target must match the constraint that failed (if one is named)
+    if (*un).a >= 0 {
+        var ok: bool = false
+        var n: i32 = (*un).a
+        var tcols: [i32; 8] = [-1; 8]
+        var nt: usize = 0
+        while n >= 0 && nt < 8 {
+            let nn: *mut ax.Node = ax.ast_n(ast, n)
+            let ci: i64 = dc.find_column(t, (*nn).sp, (*nn).sn)
+            if ci == -2 {
+                tcols[nt] = -1
+            } else {
+                tcols[nt] = ci as i32
+            }
+            nt = nt + 1
+            n = (*nn).next
+        }
+        if (ix as u64) == 0 {
+            // the rowid / primary key alias
+            ok = nt == 1 && (tcols[0] == (*t).rowid_col || tcols[0] == -1)
+        } else {
+            ok = nt == (*ix).ncols
+            var k: usize = 0
+            while ok && k < nt {
+                if tcols[k] != (*ix).cols[k] {
+                    ok = false
+                }
+                k = k + 1
+            }
+        }
+        if !ok {
+            // another constraint: this is an ordinary conflict
+            return try on_conflict(e, ix, other, ax.CF_ABORT)
+        }
+    }
+    if (*un).flag == 1 {
+        return 1
+    }
+    // the old row, the new row
+    let vals: *mut rc.Val = (*e).vals as *mut rc.Val
+    let exc: *mut rc.Val = (*e).exc as *mut rc.Val
+    var i: usize = 0
+    while i < (*t).ncols {
+        *(exc + i) = *(vals + i)
+        i = i + 1
+    }
+    (*e).rr[1].rowid = (*e).rr[0].rowid
+    // load the existing row
+    var s: pl.Source = pl.source_new()
+    s.tbl = (*e).tidx
+    s.ncols_table = (*t).ncols
+    pl.mark_all_used(&s, (*t).ncols)
+    let found: bool = try pl.src_load_row(&(*e).cx, &s, other)
+    if !found {
+        pl.src_free(&s)
+        return dberr.fail(DbError::Corrupt, "conflicting row vanished")
+    }
+    // new values start from the old row
+    var old: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&old, ((*t).ncols + 2) * 40)
+    let ov: *mut rc.Val = (rt.buf_ptr(&old)) as *mut rc.Val
+    var j: usize = 0
+    while j < (*t).ncols {
+        var v: rc.Val = *((s.vals as *mut rc.Val) + j)
+        if v.t == 3 || v.t == 4 {
+            v.p = ar.arena_copy(&(*e).arena, v.p, v.n)
+        }
+        *(ov + j) = v
+        *(vals + j) = v
+        j = j + 1
+    }
+    pl.src_free(&s)
+    (*e).rr[0].vals = rt.buf_ptr(&old)
+    (*e).rr[0].rowid = other
+    (*e).rr[0].valid = true
+    (*e).rr[1].valid = true
+    // WHERE of the upsert
+    if (*un).c >= 0 {
+        let tr: DbError!i64 = ex.eval_truth(&(*e).cx, (*un).c)
+        if dberr.failed_i64(tr) {
+            (*e).rr[0].vals = (*e).vals
+            rt.buf_free(&old)
+            try tr
+        }
+        if (tr catch 0) != 1 {
+            (*e).rr[0].vals = (*e).vals
+            rt.buf_free(&old)
+            return 1
+        }
+    }
+    // SET
+    var sets: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&sets, ((*t).ncols + 2) * 40)
+    let nv: *mut rc.Val = (rt.buf_ptr(&sets)) as *mut rc.Val
+    j = 0
+    while j < (*t).ncols {
+        *(nv + j) = *(ov + j)
+        j = j + 1
+    }
+    var sn: i32 = (*un).b
+    var failed: bool = false
+    var err_r: DbError!bool = true
+    while sn >= 0 && !failed {
+        let sno: *mut ax.Node = ax.ast_n(ast, sn)
+        let ci: i64 = dc.find_column(t, (*sno).sp, (*sno).sn)
+        if ci < 0 {
+            (*e).rr[0].vals = (*e).vals
+            rt.buf_free(&old)
+            rt.buf_free(&sets)
+            return dberr.fail(DbError::NoSuchColumn, text_msg2("no such column: ", (*sno).sp, (*sno).sn, "", 0, 0))
+        }
+        let ev: DbError!rc.Val = ex.eval(&(*e).cx, (*sno).a)
+        if failed_val(ev) {
+            (*e).rr[0].vals = (*e).vals
+            rt.buf_free(&old)
+            rt.buf_free(&sets)
+            let vv: rc.Val = try ev
+            return 1
+        }
+        var nvv: rc.Val = ev catch rc.val_null()
+        if nvv.t == 3 || nvv.t == 4 {
+            nvv.p = ar.arena_copy(&(*e).arena, nvv.p, nvv.n)
+        }
+        let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + (ci as usize)
+        vl.apply_affinity(&nvv, (*col).aff, &(*e).arena)
+        *(nv + (ci as usize)) = nvv
+        sn = (*sno).next
+    }
+    // write: the new values become the row
+    let own: i64 = other
+    var new_rowid: i64 = own
+    if (*t).rowid_col >= 0 {
+        let rv: rc.Val = *(nv + ((*t).rowid_col as usize))
+        if rv.t != 1 {
+            (*e).rr[0].vals = (*e).vals
+            rt.buf_free(&old)
+            rt.buf_free(&sets)
+            return dberr.fail(DbError::Sql, "datatype mismatch")
+        }
+        new_rowid = rv.i
+    }
+    (*e).rr[0].vals = (*e).vals
+    let r: DbError!bool = update_existing(e, other, ov, nv, new_rowid)
+    rt.buf_free(&old)
+    rt.buf_free(&sets)
+    try r
+    return 1
+}
+
+fn mark_val(f: *mut bool) -> rc.Val {
+    *f = true
+    return rc.val_null()
+}
+
+fn failed_val(r: DbError!rc.Val) -> bool {
+    var f: bool = false
+    let v: rc.Val = r catch | e | (mark_val(&f))
+    return f
+}
+
+// Replaces the row `own` (old values `ov`) by the values `nv` (rowid `new_rowid`):
+// validation, uniqueness against the other rows, the indexes, the table row.
+fn update_existing(e: *mut Dml, own: i64, ov: *mut rc.Val, nv: *mut rc.Val, new_rowid: i64) -> DbError!bool {
+    let db: *mut dc.Db = (*e).db
+    let t: *mut dc.Table = table_of(e)
+    let vals: *mut rc.Val = (*e).vals as *mut rc.Val
+    var j: usize = 0
+    while j < (*t).ncols {
+        *(vals + j) = *(nv + j)
+        j = j + 1
+    }
+    if (*t).rowid_col >= 0 {
+        *(vals + ((*t).rowid_col as usize)) = rc.val_int(new_rowid)
+    }
+    try validate_row(e, new_rowid)
+    let u: i32 = try check_unique(e, new_rowid, own, (*e).mode, -1)
+    if u != 0 {
+        return false
+    }
+    // index entries: remove the old, add the new where they differ
+    var i: usize = 0
+    while i < (*e).nidx {
+        let ix: *mut dc.Index = dc.index_at(&(*db).schema, (*e).idx[i] as usize)
+        i = i + 1
+        var same: bool = new_rowid == own
+        var c: usize = 0
+        while same && c < (*ix).ncols {
+            let col: i32 = (*ix).cols[c]
+            if col >= 0 {
+                var a: rc.Val = *(ov + (col as usize))
+                var b: rc.Val = *(nv + (col as usize))
+                if rc.val_compare(&a, &b) != 0 {
+                    same = false
+                }
+            }
+            c = c + 1
+        }
+        if !same {
+            try index_remove(e, ix, ov, own)
+            try index_add(e, ix, vals, new_rowid)
+        }
+    }
+    if new_rowid != own {
+        try bx.bt_table_delete(&(*db).bt, (*t).root, own)
+    }
+    try write_row(e, new_rowid, false)
+    return true
+}
+
+// ------------------------------------------------------------------ UPDATE
+#[allow_escape]
+fn exec_update(st: *mut dc.Stmt) -> DbError!bool {
+    let db: *mut dc.Db = (*st).db
+    var e: Dml = dml_new(db, st)
+    let r: DbError!bool = update_inner(&e, st)
+    dml_free(&e)
+    try r
+    return true
+}
+
+fn run_filters(cx: *mut ex.Ctx, list: *mut i32, n: usize) -> DbError!bool {
+    var i: usize = 0
+    while i < n {
+        let t: i64 = try ex.eval_truth(cx, *(list + i))
+        if t != 1 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Collects the rowids of the rows that match `where_n`.
+#[allow_escape]
+fn collect_rowids(e: *mut Dml, where_n: i32, out: *mut rt.Buf) -> DbError!bool {
+    let st: *mut dc.Stmt = (*e).st
+    let ast: *mut ax.Ast = &(*st).ast
+    let t: *mut dc.Table = table_of(e)
+    var s: pl.Source = pl.source_new()
+    s.tbl = (*e).tidx
+    s.ncols_table = (*t).ncols
+    s.rowid_col = (*t).rowid_col
+    pl.mark_all_used(&s, (*t).ncols)
+    var conj: [i32; 32] = [-1; 32]
+    var nconj: usize = 0
+    pl.split_and(ast, where_n, &conj[0], &nconj, 32)
+    var k: usize = 0
+    while k < nconj && k < 24 {
+        s.filt[k] = conj[k]
+        k = k + 1
+    }
+    s.nfilt = k
+    (*e).cx.scope = &(*e).scope
+    let pr: DbError!bool = pl.plan_level(&(*e).cx, &s, 0, &conj[0], nconj)
+    if dberr.failed_bool(pr) {
+        pl.src_free(&s)
+        try pr
+    }
+    let or: DbError!bool = pl.src_open(&(*e).cx, &s)
+    if dberr.failed_bool(or) {
+        pl.src_free(&s)
+        try or
+    }
+    while true {
+        ar.arena_reset(&(*e).arena)
+        let ar2: DbError!bool = pl.src_advance(&(*e).cx, &s)
+        if dberr.failed_bool(ar2) {
+            pl.src_free(&s)
+            try ar2
+        }
+        if !(ar2 catch false) {
+            break
+        }
+        (*e).rr[0].vals = s.vals
+        (*e).rr[0].rowid = s.rowid
+        (*e).rr[0].valid = true
+        let fr: DbError!bool = run_filters(&(*e).cx, &s.filt[0], s.nfilt)
+        if dberr.failed_bool(fr) {
+            pl.src_free(&s)
+            try fr
+        }
+        if !(fr catch false) {
+            continue
+        }
+        let at: usize = rt.buf_len(out)
+        rt.buf_reserve(out, at + 8)
+        rt.st64(rt.buf_ptr(out) + (at as u64), 0, s.rowid as u64)
+        rt.buf_set_len(out, at + 8)
+    }
+    (*e).rr[0].vals = (*e).vals
+    pl.src_free(&s)
+    return true
+}
+
+fn update_inner(e: *mut Dml, st: *mut dc.Stmt) -> DbError!bool {
+    let db: *mut dc.Db = (*e).db
+    let ast: *mut ax.Ast = &(*st).ast
+    let un: *mut ax.Node = ax.ast_n(ast, (*st).root)
+    try dml_start(e, (*un).sp, (*un).sn, false)
+    let t: *mut dc.Table = table_of(e)
+    (*e).mode = (*un).op
+    // resolve SET targets and expressions, and WHERE
+    var targets: [i32; 64] = [-1; 64]
+    var nt: usize = 0
+    var s: i32 = (*un).a
+    while s >= 0 {
+        let sn: *mut ax.Node = ax.ast_n(ast, s)
+        let ci: i64 = dc.find_column(t, (*sn).sp, (*sn).sn)
+        if ci == -1 {
+            return dberr.fail(DbError::NoSuchColumn, text_msg2("no such column: ", (*sn).sp, (*sn).sn, "", 0, 0))
+        }
+        var ct: i32 = ci as i32
+        if ci == -2 {
+            if (*t).rowid_col < 0 {
+                return dberr.fail(DbError::Unsupported, "UPDATE of the hidden rowid is not supported")
+            }
+            ct = (*t).rowid_col
+        }
+        if nt >= 64 {
+            return dberr.fail(DbError::TooBig, "too many columns in SET")
+        }
+        targets[nt] = ct
+        nt = nt + 1
+        try sl.resolve_stmt(db, st, &(*e).scope, (*sn).a, false)
+        s = (*sn).next
+    }
+    try sl.resolve_stmt(db, st, &(*e).scope, (*un).b, false)
+    var ids: rt.Buf = rt.buf_new()
+    let cr: DbError!bool = collect_rowids(e, (*un).b, &ids)
+    if dberr.failed_bool(cr) {
+        rt.buf_free(&ids)
+        try cr
+    }
+    let nrows: usize = rt.buf_len(&ids) / 8
+    var sctx: pl.Source = pl.source_new()
+    sctx.tbl = (*e).tidx
+    sctx.ncols_table = (*t).ncols
+    pl.mark_all_used(&sctx, (*t).ncols)
+    var oldbuf: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&oldbuf, ((*t).ncols + 2) * 40)
+    var newbuf: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&newbuf, ((*t).ncols + 2) * 40)
+    let ov: *mut rc.Val = (rt.buf_ptr(&oldbuf)) as *mut rc.Val
+    let nv: *mut rc.Val = (rt.buf_ptr(&newbuf)) as *mut rc.Val
+    var changes: i64 = 0
+    var r: DbError!bool = true
+    var i: usize = 0
+    var failed: bool = false
+    while i < nrows && !failed {
+        let rowid: i64 = rt.ld64(rt.buf_ptr(&ids), i) as i64
+        i = i + 1
+        ar.arena_reset(&(*e).arena)
+        let lr: DbError!bool = pl.src_load_row(&(*e).cx, &sctx, rowid)
+        if dberr.failed_bool(lr) {
+            r = lr
+            failed = true
+            break
+        }
+        if !(lr catch false) {
+            continue
+        }
+        // old values (text copied: the source arena changes when the next row loads)
+        var j: usize = 0
+        while j < (*t).ncols {
+            var v: rc.Val = *((sctx.vals as *mut rc.Val) + j)
+            if v.t == 3 || v.t == 4 {
+                v.p = ar.arena_copy(&(*e).arena, v.p, v.n)
+            }
+            *(ov + j) = v
+            *(nv + j) = v
+            j = j + 1
+        }
+        (*e).rr[0].vals = rt.buf_ptr(&oldbuf)
+        (*e).rr[0].rowid = rowid
+        (*e).rr[0].valid = true
+        // the new values, computed against the OLD row
+        var sn: i32 = (*un).a
+        var k: usize = 0
+        var new_rowid: i64 = rowid
+        while sn >= 0 {
+            let sno: *mut ax.Node = ax.ast_n(ast, sn)
+            let ev: DbError!rc.Val = ex.eval(&(*e).cx, (*sno).a)
+            if failed_val(ev) {
+                var tmp: rc.Val = rc.val_null()
+                let vv0: rc.Val = ev catch | er | (dml_note_err(er))
+                r = dml_err_result()
+                failed = true
+                break
+            }
+            var vv: rc.Val = ev catch rc.val_null()
+            if vv.t == 3 || vv.t == 4 {
+                vv.p = ar.arena_copy(&(*e).arena, vv.p, vv.n)
+            }
+            let ci: usize = targets[k] as usize
+            let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + ci
+            vl.apply_affinity(&vv, (*col).aff, &(*e).arena)
+            *(nv + ci) = vv
+            k = k + 1
+            sn = (*sno).next
+        }
+        if failed {
+            break
+        }
+        if (*t).rowid_col >= 0 {
+            let rv: rc.Val = *(nv + ((*t).rowid_col as usize))
+            if rv.t == 0 {
+                // setting the rowid alias to NULL gives the row a new automatic rowid
+                r = dberr.fail(DbError::Constraint, qual_col_msg("NOT NULL constraint failed: ", t, (*t).rowid_col as usize))
+                failed = true
+                break
+            }
+            if rv.t != 1 {
+                r = dberr.fail(DbError::Sql, "datatype mismatch")
+                failed = true
+                break
+            }
+            new_rowid = rv.i
+        }
+        (*e).rr[0].vals = (*e).vals
+        let ur: DbError!bool = update_existing(e, rowid, ov, nv, new_rowid)
+        if dberr.failed_bool(ur) {
+            r = ur
+            failed = true
+            break
+        }
+        if ur catch false {
+            changes = changes + 1
+        }
+    }
+    pl.src_free(&sctx)
+    rt.buf_free(&oldbuf)
+    rt.buf_free(&newbuf)
+    rt.buf_free(&ids)
+    if failed {
+        try r
+    }
+    (*db).changes = changes
+    (*db).total_changes = (*db).total_changes + changes
+    return true
+}
+
+// ------------------------------------------------------------------ DELETE
+#[allow_escape]
+fn exec_delete(st: *mut dc.Stmt) -> DbError!bool {
+    let db: *mut dc.Db = (*st).db
+    var e: Dml = dml_new(db, st)
+    let r: DbError!bool = delete_inner(&e, st)
+    dml_free(&e)
+    try r
+    return true
+}
+
+fn delete_inner(e: *mut Dml, st: *mut dc.Stmt) -> DbError!bool {
+    let db: *mut dc.Db = (*e).db
+    let ast: *mut ax.Ast = &(*st).ast
+    let dn: *mut ax.Node = ax.ast_n(ast, (*st).root)
+    try dml_start(e, (*dn).sp, (*dn).sn, false)
+    let t: *mut dc.Table = table_of(e)
+    if (*dn).a < 0 {
+        // no WHERE: clear every tree
+        let n: i64 = try bx.bt_count(&(*db).bt, (*t).root, false)
+        try bx.bt_clear(&(*db).bt, (*t).root)
+        var i: usize = 0
+        while i < (*e).nidx {
+            let ix: *mut dc.Index = dc.index_at(&(*db).schema, (*e).idx[i] as usize)
+            try bx.bt_clear(&(*db).bt, (*ix).root)
+            i = i + 1
+        }
+        (*db).changes = n
+        (*db).total_changes = (*db).total_changes + n
+        return true
+    }
+    try sl.resolve_stmt(db, st, &(*e).scope, (*dn).a, false)
+    var ids: rt.Buf = rt.buf_new()
+    let cr: DbError!bool = collect_rowids(e, (*dn).a, &ids)
+    if dberr.failed_bool(cr) {
+        rt.buf_free(&ids)
+        try cr
+    }
+    let nrows: usize = rt.buf_len(&ids) / 8
+    var changes: i64 = 0
+    var i2: usize = 0
+    while i2 < nrows {
+        let rowid: i64 = rt.ld64(rt.buf_ptr(&ids), i2) as i64
+        i2 = i2 + 1
+        ar.arena_reset(&(*e).arena)
+        let dr: DbError!bool = delete_row_by_id(e, rowid)
+        if dberr.failed_bool(dr) {
+            rt.buf_free(&ids)
+            try dr
+        }
+        if dr catch false {
+            changes = changes + 1
+        }
+    }
+    rt.buf_free(&ids)
+    (*db).changes = changes
+    (*db).total_changes = (*db).total_changes + changes
+    return true
+}
+
+fn master_rowid_next(db: *mut dc.Db) -> DbError!i64 {
+    return (try bx.bt_max_rowid(&(*db).bt, 1)) + 1
+}
+
+static mut dml_last_err: i64 = 18
+
+fn dml_note_err(er: DbError) -> rc.Val {
+    dml_last_err = dberr.to_code(er)
+    return rc.val_null()
+}
+
+fn dml_err_result() -> DbError!bool {
+    return dberr.from_code(dml_last_err)
+}

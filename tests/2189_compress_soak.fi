@@ -1,0 +1,249 @@
+// expect_exit: 0
+// tests/2189_compress_soak.fi -- no leaks. Every decoder and encoder of
+// lib/compress runs a few hundred times on small inputs (whole buffer, streaming,
+// the error paths too) and the resident memory of the process must not grow:
+// the decoders allocate tables, windows and scratch with heap_alloc and a missing
+// free shows up here as megabytes. File descriptors are counted as well.
+import compress.common
+import compress.auto
+import compress.lz4
+import compress.zstd
+import compress.zstd_enc
+import compress.lzma
+import compress.lzma_enc
+import compress.bz2
+import compress.brotli
+import compress.gzip
+import std.rt
+import std.io
+import std.fs
+
+const PLAIN: str = __include_str("data/compress/plain.bin")
+const F_LZ4: str = __include_str("data/compress/plain_cchk.lz4")
+const F_ZST: str = __include_str("data/compress/plain.zst")
+const F_XZ: str = __include_str("data/compress/plain.xz")
+const F_BZ2: str = __include_str("data/compress/plain.bz2")
+const F_BR: str = __include_str("data/compress/plain_q5.br")
+const F_GZ: str = __include_str("data/compress/plain.gz")
+const F_DICT: str = __include_str("data/compress/dict.zdict")
+const F_REC: str = __include_str("data/compress/record_dict.zst")
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+static mut code: u32 = 0
+
+fn why(e: CompressError) -> usize {
+    if e == CompressError::Data { code = 1 }
+    if e == CompressError::Format { code = 2 }
+    if e == CompressError::Checksum { code = 3 }
+    if e == CompressError::Truncated { code = 4 }
+    if e == CompressError::TooLarge { code = 5 }
+    if e == CompressError::OutOfMemory { code = 6 }
+    if e == CompressError::Unsupported { code = 7 }
+    if e == CompressError::Dictionary { code = 8 }
+    if e == CompressError::Io { code = 9 }
+    return 0
+}
+
+fn is_plain(b: *mut rt.Buf, want: str) -> bool {
+    return rt.buf_len(b) == want.length() && rt.mem_eq(rt.buf_ptr(b), want.p as u64, want.length())
+}
+
+fn view(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn scratch(tag: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, "/tmp/firn_".p as u64, 10)
+    rt.buf_push_bytes(&b, tag.p as u64, tag.length())
+    rt.buf_push(&b, 95 as u8)
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+// deterministic pseudo random octets
+fn pseudo(n: usize, seed: u64) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    var x: u64 = seed
+    var i: usize = 0
+    while i < n {
+        x = x *% 6364136223846793005 +% 1442695040888963407
+        rt.buf_push(&b, ((x >> 33) & 255) as u8)
+        i = i + 1
+    }
+    return b
+}
+
+fn zeros(n: usize) -> rt.Buf {
+    var z: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&z, n)
+    rt.mem_set(rt.buf_ptr(&z), 0 as u8, n)
+    rt.buf_set_len(&z, n)
+    return z
+}
+
+fn finish(t: *mut Tally) -> i32 {
+    io.print("checks: ")
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&nb, (*t).total)
+    io.print_bytes(rt.buf_ptr(&nb), rt.buf_len(&nb))
+    io.print_line("")
+    if (*t).fails != 0 {
+        return 1 as i32
+    }
+    return 0
+}
+
+// resident pages of this process (/proc/self/statm, second field)
+fn resident_pages() -> u64 {
+    var b: rt.Buf = rt.buf_new()
+    fs.read_file("/proc/self/statm", &b) catch 0
+    let p: u64 = rt.buf_ptr(&b)
+    let n: usize = rt.buf_len(&b)
+    var i: usize = 0
+    while i < n && rt.ld8(p, i) != 32 as u8 {
+        i = i + 1
+    }
+    i = i + 1
+    var v: u64 = 0
+    while i < n && rt.ld8(p, i) >= 48 as u8 && rt.ld8(p, i) <= 57 as u8 {
+        v = v * 10 + ((rt.ld8(p, i) - 48 as u8) as u64)
+        i = i + 1
+    }
+    rt.buf_free(&b)
+    return v
+}
+
+fn open_fds() -> usize {
+    var n: usize = 0
+    var fd: i64 = 3
+    while fd < 64 {
+        // F_GETFD = 1: -1 for a closed descriptor
+        if syscall(72, fd, 1, 0, 0, 0, 0) >= 0 {
+            n = n + 1
+        }
+        fd = fd + 1
+    }
+    return n
+}
+
+fn dummy(e: CompressError) -> auto.AutoDec {
+    return auto.AutoDec { kind: 0, h: 0, hsize: 0, max: 0 }
+}
+
+// one round of everything; the results are checked, not just discarded
+fn round(path: str, wrong: *mut usize) {
+    var o: rt.Buf = rt.buf_new()
+    lz4.lz4_frame_decompress(F_LZ4.p as u64, F_LZ4.length(), &o) catch 0
+    if !is_plain(&o, PLAIN) { *wrong = *wrong + 1 }
+    rt.buf_clear(&o)
+    zstd.zstd_decompress(F_ZST.p as u64, F_ZST.length(), &o) catch 0
+    if !is_plain(&o, PLAIN) { *wrong = *wrong + 1 }
+    rt.buf_clear(&o)
+    lzma.xz_decompress(F_XZ.p as u64, F_XZ.length(), &o) catch 0
+    if !is_plain(&o, PLAIN) { *wrong = *wrong + 1 }
+    rt.buf_clear(&o)
+    bz2.bz2_decompress(F_BZ2.p as u64, F_BZ2.length(), &o) catch 0
+    if !is_plain(&o, PLAIN) { *wrong = *wrong + 1 }
+    rt.buf_clear(&o)
+    brotli.brotli_decompress(F_BR.p as u64, F_BR.length(), &o) catch 0
+    if !is_plain(&o, PLAIN) { *wrong = *wrong + 1 }
+    rt.buf_clear(&o)
+    gzip.gz_decompress(F_GZ.p as u64, F_GZ.length(), gzip.GZ_GZIP, &o) catch 0
+    if !is_plain(&o, PLAIN) { *wrong = *wrong + 1 }
+    rt.buf_clear(&o)
+    // dictionary
+    zstd.zstd_decompress_dict(F_REC.p as u64, F_REC.length(), 0, F_DICT.p as u64, F_DICT.length(), &o) catch 0
+    rt.buf_clear(&o)
+    // error paths: cut and damaged inputs
+    zstd.zstd_decompress(F_ZST.p as u64, F_ZST.length() - 7, &o) catch 0
+    lzma.xz_decompress(F_XZ.p as u64, F_XZ.length() / 2, &o) catch 0
+    bz2.bz2_decompress(F_BZ2.p as u64, F_BZ2.length() - 3, &o) catch 0
+    brotli.brotli_decompress(F_BR.p as u64, F_BR.length() / 3, &o) catch 0
+    gzip.gz_decompress(F_GZ.p as u64, F_GZ.length() - 5, gzip.GZ_GZIP, &o) catch 0
+    lz4.lz4_frame_decompress(F_LZ4.p as u64, F_LZ4.length() - 2, &o) catch 0
+    zstd.zstd_decompress_limited(F_ZST.p as u64, F_ZST.length(), 100, &o) catch 0
+    lzma.xz_decompress_limited(F_XZ.p as u64, F_XZ.length(), 100, &o) catch 0
+    bz2.bz2_decompress_limited(F_BZ2.p as u64, F_BZ2.length(), 100, &o) catch 0
+    rt.buf_clear(&o)
+    // the encoders
+    var z: rt.Buf = rt.buf_new()
+    lz4.lz4_frame_compress(PLAIN.p as u64, PLAIN.length(), &z) catch 0
+    rt.buf_clear(&z)
+    zstd_enc.zstd_compress(PLAIN.p as u64, PLAIN.length(), 3, &z) catch 0
+    rt.buf_clear(&z)
+    zstd_enc.zstd_compress_dict(PLAIN.p as u64, PLAIN.length(), 5, F_DICT.p as u64, F_DICT.length(), &z) catch 0
+    rt.buf_clear(&z)
+    lzma_enc.xz_compress(PLAIN.p as u64, PLAIN.length(), 4, &z) catch 0
+    rt.buf_clear(&z)
+    lzma_enc.lzma_alone_compress(PLAIN.p as u64, PLAIN.length(), 2, &z) catch 0
+    rt.buf_clear(&z)
+    var e: zstd_enc.ZstdEnc = zstd_enc.zstd_enc_new(3, true)
+    zstd_enc.zstd_enc_write(&e, PLAIN.p as u64, 5000, &z)
+    zstd_enc.zstd_enc_finish(&e, &z)
+    zstd_enc.zstd_enc_free(&e)
+    rt.buf_clear(&z)
+    var x: lzma_enc.XzEnc = lzma_enc.xz_enc_new(3, 4)
+    lzma_enc.xz_enc_write(&x, PLAIN.p as u64, 5000, &z)
+    lzma_enc.xz_enc_finish(&x, &z)
+    lzma_enc.xz_enc_free(&x)
+    rt.buf_free(&z)
+    rt.buf_free(&o)
+    // streaming readers from a descriptor, closed half way
+    fs.write_file(path, F_ZST.p as u64, F_ZST.length()) catch 0
+    let fd: i64 = fs.open_read(path) catch -1
+    var d: zstd.ZstdDec = zstd.zstd_dec_open_fd(fd)
+    let tmp: u64 = rt.heap_alloc(1000)
+    zstd.zstd_dec_read(&d, tmp, 1000) catch 0
+    zstd.zstd_dec_close(&d)
+    rt.heap_free(tmp, 1000)
+    fs.close_fd(fd)
+    // the facade's heap-allocated decoder
+    fs.write_file(path, F_XZ.p as u64, F_XZ.length()) catch 0
+    let fd2: i64 = fs.open_read(path) catch -1
+    var ad: auto.AutoDec = auto.auto_dec_open_fd(fd2) catch | e | (dummy(e))
+    auto.auto_dec_close(&ad)
+    fs.close_fd(fd2)
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let path: str = scratch("soak2189")
+    var wrong: usize = 0
+    // warm up: the allocator, the page cache, lazily built tables
+    var w: usize = 0
+    while w < 6 {
+        round(path, &wrong)
+        w = w + 1
+    }
+    let before: u64 = resident_pages()
+    let fds0: usize = open_fds()
+    var i: usize = 0
+    while i < 150 {
+        round(path, &wrong)
+        i = i + 1
+    }
+    let after: u64 = resident_pages()
+    let fds1: usize = open_fds()
+    check(&t, "every result was right", wrong == 0)
+    // 150 rounds; a leak of even 20 KiB per round would be 3 MB (750 pages)
+    check(&t, "resident memory did not grow (less than 1 MiB over 150 rounds)", after < before + 256)
+    check(&t, "no descriptor was left open", fds1 == fds0)
+    fs.remove(path) catch false
+    return finish(&t)
+}

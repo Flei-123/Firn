@@ -1,0 +1,409 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/rowset.fi -- rows kept in memory as SQLite records, with a stable sort.
+//
+// The place where ORDER BY, GROUP BY, DISTINCT, compound selects and sub-selects
+// park their rows. A row is a record (db.record): text and blob values are copied
+// in, so nothing here points into a page cache.
+
+import std.rt
+import db.dberr
+import db.util as ut
+import db.record as rc
+import db.value as vl
+
+export {
+    RowSet, SortKey, rs_new, rs_free, rs_clear, rs_add, rs_get, rs_count, rs_sort, rs_dedupe,
+    rs_row_bytes, rs_find, rs_column, rs_remove_rows_not_in,
+}
+
+struct RowSet {
+    data: rt.Buf,
+    offs: rt.Buf, // per row: offset u64, length u64
+    n: usize,
+}
+
+struct SortKey {
+    col: usize,
+    desc: bool,
+    nulls: i32, // 0 default (NULL first when ascending), 1 NULLS FIRST, 2 NULLS LAST
+    coll: u32,
+}
+
+fn rs_new() -> RowSet {
+    return RowSet { data: rt.buf_new(), offs: rt.buf_new(), n: 0 }
+}
+
+fn rs_free(r: *mut RowSet) {
+    rt.buf_free(&(*r).data)
+    rt.buf_free(&(*r).offs)
+    (*r).n = 0
+}
+
+fn rs_clear(r: *mut RowSet) {
+    rt.buf_clear(&(*r).data)
+    rt.buf_clear(&(*r).offs)
+    (*r).n = 0
+}
+
+fn rs_count(r: *mut RowSet) -> usize {
+    return (*r).n
+}
+
+fn rs_add(r: *mut RowSet, vals: *mut rc.Val, n: usize) -> DbError!bool {
+    let off: usize = rt.buf_len(&(*r).data)
+    rc.rec_encode(vals, n, &(*r).data)
+    let len: usize = rt.buf_len(&(*r).data) - off
+    let at: usize = rt.buf_len(&(*r).offs)
+    rt.buf_reserve(&(*r).offs, at + 16)
+    let m: u64 = rt.buf_ptr(&(*r).offs) + (at as u64)
+    rt.st64(m, 0, off as u64)
+    rt.st64(m, 1, len as u64)
+    rt.buf_set_len(&(*r).offs, at + 16)
+    (*r).n = (*r).n + 1
+    return true
+}
+
+fn rs_row_bytes(r: *mut RowSet, i: usize, p: *mut u64, len: *mut usize) {
+    let m: u64 = rt.buf_ptr(&(*r).offs) + ((i * 16) as u64)
+    *p = rt.buf_ptr(&(*r).data) + rt.ld64(m, 0)
+    *len = rt.ld64(m, 1) as usize
+}
+
+// Decodes row i into `out` (up to maxn columns); text points into the rowset.
+fn rs_get(r: *mut RowSet, i: usize, out: *mut rc.Val, maxn: usize) -> DbError!usize {
+    var p: u64 = 0
+    var len: usize = 0
+    rs_row_bytes(r, i, &p, &len)
+    return rc.rec_decode(p, len, out, maxn)
+}
+
+fn rs_column(r: *mut RowSet, i: usize, col: usize) -> DbError!rc.Val {
+    var p: u64 = 0
+    var len: usize = 0
+    rs_row_bytes(r, i, &p, &len)
+    return rc.rec_column(p, len, col)
+}
+
+fn key_compare(r: *mut RowSet, a: usize, b: usize, keys: *mut SortKey, nkeys: usize) -> DbError!i64 {
+    var ap: u64 = 0
+    var al: usize = 0
+    var bp: u64 = 0
+    var bl: usize = 0
+    rs_row_bytes(r, a, &ap, &al)
+    rs_row_bytes(r, b, &bp, &bl)
+    var k: usize = 0
+    while k < nkeys {
+        let key: *mut SortKey = keys + k
+        let x: rc.Val = try rc.rec_column(ap, al, (*key).col)
+        let y: rc.Val = try rc.rec_column(bp, bl, (*key).col)
+        if x.t == 0 || y.t == 0 {
+            if x.t == 0 && y.t == 0 {
+                k = k + 1
+                continue
+            }
+            var ord: i64 = 1
+            if x.t == 0 {
+                ord = -1
+            }
+            if (*key).nulls == 1 {
+                return ord
+            }
+            if (*key).nulls == 2 {
+                return 0 - ord
+            }
+            if (*key).desc {
+                return 0 - ord
+            }
+            return ord
+        }
+        var xx: rc.Val = x
+        var yy: rc.Val = y
+        var c: i64 = vl.sql_compare(&xx, &yy, (*key).coll)
+        if c != 0 {
+            if (*key).desc {
+                return 0 - c
+            }
+            return c
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+// Stable merge sort of the rows by the keys.
+fn rs_sort(r: *mut RowSet, keys: *mut SortKey, nkeys: usize) -> DbError!bool {
+    let n: usize = (*r).n
+    if n < 2 || nkeys == 0 {
+        return true
+    }
+    // sort an index array, then rebuild the offsets
+    var idx: rt.Buf = rt.buf_new()
+    var tmp: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&idx, n * 4 + 8)
+    rt.buf_reserve(&tmp, n * 4 + 8)
+    let ip: u64 = rt.buf_ptr(&idx)
+    let tp: u64 = rt.buf_ptr(&tmp)
+    var i: usize = 0
+    while i < n {
+        rt.st32(ip, i, i as u32)
+        i = i + 1
+    }
+    var width: usize = 1
+    var src: u64 = ip
+    var dst: u64 = tp
+    while width < n {
+        var lo: usize = 0
+        while lo < n {
+            var mid: usize = lo + width
+            if mid > n {
+                mid = n
+            }
+            var hi: usize = lo + 2 * width
+            if hi > n {
+                hi = n
+            }
+            var a: usize = lo
+            var b: usize = mid
+            var o: usize = lo
+            while a < mid && b < hi {
+                let ra: usize = rt.ld32(src, a) as usize
+                let rb: usize = rt.ld32(src, b) as usize
+                let c: i64 = try key_compare(r, ra, rb, keys, nkeys)
+                if c <= 0 {
+                    rt.st32(dst, o, ra as u32)
+                    a = a + 1
+                } else {
+                    rt.st32(dst, o, rb as u32)
+                    b = b + 1
+                }
+                o = o + 1
+            }
+            while a < mid {
+                rt.st32(dst, o, rt.ld32(src, a))
+                a = a + 1
+                o = o + 1
+            }
+            while b < hi {
+                rt.st32(dst, o, rt.ld32(src, b))
+                b = b + 1
+                o = o + 1
+            }
+            lo = lo + 2 * width
+        }
+        let sw: u64 = src
+        src = dst
+        dst = sw
+        width = width * 2
+    }
+    // src holds the order
+    var no: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&no, n * 16 + 8)
+    let np: u64 = rt.buf_ptr(&no)
+    let op: u64 = rt.buf_ptr(&(*r).offs)
+    var k: usize = 0
+    while k < n {
+        let from: usize = rt.ld32(src, k) as usize
+        rt.st64(np + ((k * 16) as u64), 0, rt.ld64(op + ((from * 16) as u64), 0))
+        rt.st64(np + ((k * 16) as u64), 1, rt.ld64(op + ((from * 16) as u64), 1))
+        k = k + 1
+    }
+    ut.move_bytes(op, np, n * 16)
+    rt.buf_free(&no)
+    rt.buf_free(&idx)
+    rt.buf_free(&tmp)
+    return true
+}
+
+fn rows_equal(r: *mut RowSet, a: usize, b: usize, ncols: usize) -> DbError!bool {
+    var ap: u64 = 0
+    var al: usize = 0
+    var bp: u64 = 0
+    var bl: usize = 0
+    rs_row_bytes(r, a, &ap, &al)
+    rs_row_bytes(r, b, &bp, &bl)
+    var k: usize = 0
+    while k < ncols {
+        let x: rc.Val = try rc.rec_column(ap, al, k)
+        let y: rc.Val = try rc.rec_column(bp, bl, k)
+        var xx: rc.Val = x
+        var yy: rc.Val = y
+        if rc.val_compare(&xx, &yy) != 0 {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// Removes rows equal (over the first ncols columns) to an earlier row; the
+// order of the survivors is kept.
+fn rs_dedupe(r: *mut RowSet, ncols: usize) -> DbError!bool {
+    let n: usize = (*r).n
+    if n < 2 {
+        return true
+    }
+    // sort a copy of the order by all columns, then mark later duplicates
+    var keys: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&keys, ncols * 24 + 8)
+    let kp: u64 = rt.buf_ptr(&keys)
+    var c: usize = 0
+    while c < ncols {
+        let sk: *mut SortKey = ((kp) as *mut SortKey) + c
+        *sk = SortKey { col: c, desc: false, nulls: 0, coll: 0 }
+        c = c + 1
+    }
+    // remember each row's original position as a trailing column by sorting a
+    // parallel (offs) copy
+    var saved: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&saved, n * 16 + 8)
+    ut.move_bytes(rt.buf_ptr(&saved), rt.buf_ptr(&(*r).offs), n * 16)
+    try rs_sort(r, kp as *mut SortKey, ncols)
+    // after the sort: for every sorted row find its original index by offset
+    var drop: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&drop, n + 8)
+    ut.zero_bytes(rt.buf_ptr(&drop), n)
+    // original index of a row: its offset (rows were appended, so offsets rise with the index)
+    var i: usize = 1
+    while i < n {
+        let same: bool = try rows_equal(r, i - 1, i, ncols)
+        if same {
+            // the later original position is dropped
+            let oa: u64 = rt.ld64(rt.buf_ptr(&(*r).offs) + (((i - 1) * 16) as u64), 0)
+            let ob: u64 = rt.ld64(rt.buf_ptr(&(*r).offs) + ((i * 16) as u64), 0)
+            // find original indices by binary search in `saved` (sorted by offset)
+            let ia: usize = find_orig(rt.buf_ptr(&saved), n, oa)
+            let ib: usize = find_orig(rt.buf_ptr(&saved), n, ob)
+            if ia < ib {
+                rt.st8(rt.buf_ptr(&drop), ib, 1 as u8)
+                // keep the earlier one as the representative for the next comparison
+                ut.move_bytes(rt.buf_ptr(&(*r).offs) + ((i * 16) as u64), rt.buf_ptr(&(*r).offs) + (((i - 1) * 16) as u64), 16)
+            } else {
+                rt.st8(rt.buf_ptr(&drop), ia, 1 as u8)
+            }
+        }
+        i = i + 1
+    }
+    // rebuild in original order, without the dropped
+    var out: rt.Buf = rt.buf_new()
+    var kept: usize = 0
+    var o: usize = 0
+    while o < n {
+        if rt.ld8(rt.buf_ptr(&drop), o) == 0 as u8 {
+            rt.buf_push_bytes(&out, rt.buf_ptr(&saved) + ((o * 16) as u64), 16)
+            kept = kept + 1
+        }
+        o = o + 1
+    }
+    rt.buf_clear(&(*r).offs)
+    rt.buf_push_bytes(&(*r).offs, rt.buf_ptr(&out), rt.buf_len(&out))
+    (*r).n = kept
+    rt.buf_free(&out)
+    rt.buf_free(&drop)
+    rt.buf_free(&saved)
+    rt.buf_free(&keys)
+    return true
+}
+
+// the index whose offset (first u64 of the pair) equals `off`; offsets rise
+fn find_orig(base: u64, n: usize, off: u64) -> usize {
+    var lo: usize = 0
+    var hi: usize = n
+    while lo < hi {
+        let mid: usize = (lo + hi) / 2
+        let v: u64 = rt.ld64(base + ((mid * 16) as u64), 0)
+        if v < off {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return lo
+}
+
+// Position of the first row equal to the given values over `n` columns (linear), or -1.
+fn rs_find(r: *mut RowSet, vals: *mut rc.Val, n: usize) -> DbError!i64 {
+    var i: usize = 0
+    var tmp: [rc.Val; 32] = [rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(),
+        rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(),
+        rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(),
+        rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(),
+        rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null()]
+    while i < (*r).n {
+        let k: usize = try rs_get(r, i, &tmp[0], n)
+        var ok: bool = k >= n
+        var c: usize = 0
+        while ok && c < n {
+            if rc.val_compare(&tmp[c], vals + c) != 0 {
+                ok = false
+            }
+            c = c + 1
+        }
+        if ok {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// For set operations: keeps only the rows of `a` (keep_if_found = true) that appear in `b`,
+// or only those that do not (false). Compares all `ncols` columns.
+fn rs_remove_rows_not_in(a: *mut RowSet, b: *mut RowSet, ncols: usize, keep_if_found: bool) -> DbError!bool {
+    // sort b once (by all columns) and binary-search it
+    var keys: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&keys, ncols * 24 + 8)
+    let kp: u64 = rt.buf_ptr(&keys)
+    var c: usize = 0
+    while c < ncols {
+        let sk: *mut SortKey = ((kp) as *mut SortKey) + c
+        *sk = SortKey { col: c, desc: false, nulls: 0, coll: 0 }
+        c = c + 1
+    }
+    try rs_sort(b, kp as *mut SortKey, ncols)
+    var out: rt.Buf = rt.buf_new()
+    var kept: usize = 0
+    var i: usize = 0
+    var av: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&av, ncols * 40 + 8)
+    var bv: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&bv, ncols * 40 + 8)
+    while i < (*a).n {
+        let ka: usize = try rs_get(a, i, (rt.buf_ptr(&av)) as *mut rc.Val, ncols)
+        var lo: usize = 0
+        var hi: usize = (*b).n
+        var found: bool = false
+        while lo < hi && !found {
+            let mid: usize = (lo + hi) / 2
+            let kb: usize = try rs_get(b, mid, (rt.buf_ptr(&bv)) as *mut rc.Val, ncols)
+            var cmp: i64 = 0
+            var q: usize = 0
+            while q < ncols && cmp == 0 {
+                cmp = rc.val_compare(((rt.buf_ptr(&av)) as *mut rc.Val) + q, ((rt.buf_ptr(&bv)) as *mut rc.Val) + q)
+                q = q + 1
+            }
+            if cmp == 0 {
+                found = true
+            } else if cmp < 0 {
+                hi = mid
+            } else {
+                lo = mid + 1
+            }
+        }
+        if found == keep_if_found {
+            var p: u64 = 0
+            var l: usize = 0
+            rs_row_bytes(a, i, &p, &l)
+            rt.buf_push_bytes(&out, rt.buf_ptr(&(*a).offs) + ((i * 16) as u64), 16)
+            kept = kept + 1
+        }
+        i = i + 1
+    }
+    rt.buf_clear(&(*a).offs)
+    rt.buf_push_bytes(&(*a).offs, rt.buf_ptr(&out), rt.buf_len(&out))
+    (*a).n = kept
+    rt.buf_free(&out)
+    rt.buf_free(&keys)
+    rt.buf_free(&av)
+    rt.buf_free(&bv)
+    return true
+}

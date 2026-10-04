@@ -1,0 +1,1098 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/compress/lzma_enc.fi -- an LZMA2 / .xz / .lzma encoder, readable by
+// liblzma, xz, Python's lzma and every other decoder. The decoder is in
+// lib/compress/lzma.fi.
+//
+//     import compress.lzma_enc
+//     lzma_enc.xz_compress(p, n, 6, &out) catch |e| ...             // preset 0..9
+//     lzma_enc.xz_compress_check(p, n, 6, lzma_enc.CHECK_SHA256, &out) catch |e| ...
+//     lzma_enc.lzma_alone_compress(p, n, 6, &out) catch |e| ...     // legacy .lzma
+//
+//     var e: lzma_enc.XzEnc = lzma_enc.xz_enc_new(6, lzma_enc.CHECK_CRC64)  // streaming
+//     lzma_enc.xz_enc_write(&e, p, n, &out)      // output may be drained and cleared
+//     lzma_enc.xz_enc_finish(&e, &out)
+//     lzma_enc.xz_enc_free(&e)
+//
+// WHAT IT IS. A real LZMA encoder: a range coder with the complete LZMA model
+// (literal contexts with the "matched literal" mode after a match, the 12
+// states, the four repeat distances with short reps, length and distance
+// coders), a hash-chain match finder (3 and 4 octet hashes) and the fast
+// parser of liblzma (the longest match against the four repeat distances,
+// one position of look-ahead). LZMA2 framing cuts the stream into chunks of
+// at most 2 MiB / 64 KiB and stores a chunk raw when it does not shrink; the
+// state is reset after such a chunk. Presets 0..9 choose the dictionary
+// (256 KiB .. 64 MiB, never more than the input needs), search depth and
+// "nice length". lc = 3, lp = 0, pb = 2.
+//
+// HONEST
+//   X1 No binary-tree match finder and no optimal parsing: output is
+//      typically 4-8 % larger than `xz -6`. Speed in docs/COMPRESSION.md.
+//   X2 One block per stream (no multithreaded block splitting).
+//   X3 Streaming: the window (dictionary size + a few MiB) stays in memory;
+//      the input is not held as a whole.
+import std.rt
+import std.crypto.sha256
+import compress.common
+import compress.lzma
+
+export {
+    XzEnc, xz_enc_new, xz_enc_write, xz_enc_finish, xz_enc_free,
+    xz_compress, xz_compress_check, lzma_alone_compress,
+    CHECK_NONE, CHECK_CRC32, CHECK_CRC64, CHECK_SHA256,
+}
+
+const CHECK_NONE: u32 = 0
+const CHECK_CRC32: u32 = 1
+const CHECK_CRC64: u32 = 4
+const CHECK_SHA256: u32 = 10
+
+const MAXLEN: usize = 273
+const CHUNK_UMAX: usize = 2097152 - 300
+const CHUNK_CMAX: usize = 65536 - 40
+
+// ====================================================================
+// THE RANGE ENCODER
+// ====================================================================
+
+struct RcEnc {
+    low: u64,
+    range: u32,
+    cache: u32,
+    csize: u64,
+    out: rt.Buf,
+}
+
+fn re_init(r: *mut RcEnc) {
+    (*r).low = 0
+    (*r).range = 0xFFFFFFFF
+    (*r).cache = 0
+    (*r).csize = 1
+    rt.buf_clear(&(*r).out)
+}
+
+fn re_shift(r: *mut RcEnc) {
+    if ((*r).low & 0xFFFFFFFF) < 0xFF000000 || ((*r).low >> 32) != 0 {
+        var temp: u32 = (*r).cache
+        let carry: u32 = ((*r).low >> 32) as u32
+        while true {
+            rt.buf_push(&(*r).out, ((temp + carry) & 0xFF) as u8)
+            temp = 0xFF
+            (*r).csize = (*r).csize - 1
+            if (*r).csize == 0 {
+                break
+            }
+        }
+        (*r).cache = (((*r).low >> 24) & 0xFF) as u32
+    }
+    (*r).csize = (*r).csize + 1
+    (*r).low = ((*r).low & 0x00FFFFFF) << 8
+}
+
+fn re_flush(r: *mut RcEnc) {
+    var i: usize = 0
+    while i < 5 {
+        re_shift(r)
+        i = i + 1
+    }
+}
+
+// Octets that would be written if the coder were flushed now.
+fn re_pending(r: *mut RcEnc) -> usize {
+    return (*r).out.len + ((*r).csize as usize) + 5
+}
+
+fn re_bit(r: *mut RcEnc, probs: u64, idx: usize, bit: u32) {
+    let p: u32 = rt.ld16(probs, idx) as u32
+    let bound: u32 = ((*r).range >> 11) * p
+    if bit == 0 {
+        (*r).range = bound
+        rt.st16(probs, idx, (p + ((2048 - p) >> 5)) as u16)
+    } else {
+        (*r).low = (*r).low + (bound as u64)
+        (*r).range = (*r).range - bound
+        rt.st16(probs, idx, (p - (p >> 5)) as u16)
+    }
+    while (*r).range < 0x1000000 {
+        (*r).range = (*r).range << 8
+        re_shift(r)
+    }
+}
+
+fn re_direct(r: *mut RcEnc, v: u32, nbits: u32) {
+    var i: u32 = nbits
+    while i > 0 {
+        i = i - 1
+        (*r).range = (*r).range >> 1
+        if ((v >> i) & 1) != 0 {
+            (*r).low = (*r).low + ((*r).range as u64)
+        }
+        while (*r).range < 0x1000000 {
+            (*r).range = (*r).range << 8
+            re_shift(r)
+        }
+    }
+}
+
+fn re_tree(r: *mut RcEnc, probs: u64, base: usize, nbits: u32, sym: u32) {
+    var m: u32 = 1
+    var i: u32 = nbits
+    while i > 0 {
+        i = i - 1
+        let b: u32 = (sym >> i) & 1
+        re_bit(r, probs, base + (m as usize), b)
+        m = (m << 1) | b
+    }
+}
+
+fn re_tree_rev(r: *mut RcEnc, probs: u64, base: usize, nbits: u32, sym: u32) {
+    var m: u32 = 1
+    var s: u32 = sym
+    var i: u32 = 0
+    while i < nbits {
+        let b: u32 = s & 1
+        s = s >> 1
+        re_bit(r, probs, base + (m as usize), b)
+        m = (m << 1) | b
+        i = i + 1
+    }
+}
+
+// ====================================================================
+// THE LZMA MODEL (encoder side)
+// ====================================================================
+
+struct XzEnc {
+    preset: u32,
+    check: u32,
+    alone: bool, // the legacy .lzma stream: one run, no LZMA2 framing
+    // the window
+    win: rt.Buf,
+    owned: bool,
+    pos: usize, // next position to encode
+    abs0: u64, // stream position of win[0]
+    dict_size: usize,
+    wsize: usize, // power of two >= dict_size (the chain size)
+    // match finder
+    ht3: u64,
+    ht4: u64,
+    hlog: u32,
+    chain: u64,
+    ins: usize, // positions below this are in the tables
+    depth: u32,
+    nice: usize,
+    // the model
+    probs: u64,
+    nprobs: usize,
+    state: u32,
+    reps: [u32; 4],
+    rc: RcEnc,
+    // LZMA2 chunk bookkeeping
+    dict_reset: bool,
+    props_pending: bool,
+    state_reset: bool,
+    comp_total: u64, // LZMA2 data octets written so far (the block's compressed size)
+    total_in: u64,
+    started: bool,
+    finished: bool,
+    ready: bool,
+    failed: bool,
+    // checks
+    ctab: common.Crc32,
+    crc32: u32,
+    crc64: common.Crc64,
+    sha: sha256.Sha256,
+}
+
+fn dict_for_preset(p: u32) -> usize {
+    if p == 0 {
+        return 262144
+    }
+    if p == 1 {
+        return 1048576
+    }
+    if p == 2 {
+        return 2097152
+    }
+    if p <= 4 {
+        return 4194304
+    }
+    if p <= 6 {
+        return 8388608
+    }
+    if p == 7 {
+        return 16777216
+    }
+    if p == 8 {
+        return 33554432
+    }
+    return 67108864
+}
+
+fn xz_enc_new(preset: u32, check: u32) -> XzEnc {
+    var pr: u32 = preset
+    if pr > 9 {
+        pr = 9
+    }
+    var ck: u32 = check
+    if ck != 0 && ck != 1 && ck != 4 && ck != 10 {
+        ck = 4
+    }
+    var e: XzEnc = XzEnc { preset: pr, check: ck, alone: false, win: rt.buf_new(), owned: true, pos: 0, abs0: 0,
+        dict_size: dict_for_preset(pr), wsize: 0, ht3: 0, ht4: 0, hlog: 17, chain: 0, ins: 0, depth: 8, nice: 32,
+        probs: 0, nprobs: 0, state: 0, reps: [0; 4],
+        rc: RcEnc { low: 0, range: 0, cache: 0, csize: 0, out: rt.buf_new() },
+        dict_reset: true, props_pending: true, state_reset: false, comp_total: 0, total_in: 0,
+        started: false, finished: false, ready: false, failed: false,
+        ctab: common.crc32_new(), crc32: 0, crc64: common.crc64_new(), sha: sha256.sha256_new() }
+    if pr == 0 {
+        e.depth = 4
+        e.nice = 32
+    } else if pr == 1 {
+        e.depth = 8
+        e.nice = 32
+    } else if pr == 2 {
+        e.depth = 12
+        e.nice = 48
+    } else if pr == 3 {
+        e.depth = 24
+        e.nice = 64
+    } else if pr <= 5 {
+        e.depth = 32
+        e.nice = 64
+    } else if pr == 6 {
+        e.depth = 64
+        e.nice = 96
+    } else {
+        e.depth = 128
+        e.nice = 192
+        if pr == 9 {
+            e.depth = 256
+            e.nice = 273
+        }
+    }
+    e.hlog = 16
+    if pr >= 3 {
+        e.hlog = 18
+    }
+    if pr >= 6 {
+        e.hlog = 20
+    }
+    return e
+}
+
+fn xz_enc_free(e: *mut XzEnc) {
+    if (*e).owned {
+        rt.buf_free(&(*e).win)
+    }
+    rt.buf_free(&(*e).rc.out)
+    if (*e).ht3 != 0 {
+        rt.heap_free((*e).ht3, 65536 * 4)
+        (*e).ht3 = 0
+    }
+    if (*e).ht4 != 0 {
+        rt.heap_free((*e).ht4, ((1 as usize) << ((*e).hlog as usize)) * 4)
+        (*e).ht4 = 0
+    }
+    if (*e).chain != 0 {
+        rt.heap_free((*e).chain, (*e).wsize * 4)
+        (*e).chain = 0
+    }
+    if (*e).probs != 0 {
+        rt.heap_free((*e).probs, (*e).nprobs * 2)
+        (*e).probs = 0
+    }
+    (*e).ready = false
+}
+
+// lc = 3, lp = 0, pb = 2
+const LC: u32 = 3
+const LP: u32 = 0
+const PB: u32 = 2
+
+fn enc_prepare(e: *mut XzEnc) -> bool {
+    if (*e).ready {
+        return true
+    }
+    var ws: usize = 4096
+    while ws < (*e).dict_size {
+        ws = ws * 2
+    }
+    (*e).wsize = ws
+    (*e).ht3 = rt.heap_alloc(65536 * 4)
+    (*e).ht4 = rt.heap_alloc(((1 as usize) << ((*e).hlog as usize)) * 4)
+    (*e).chain = rt.heap_alloc(ws * 4)
+    (*e).nprobs = lzma.P_LIT + ((0x300 as usize) << ((LC + LP) as usize))
+    (*e).probs = rt.heap_alloc((*e).nprobs * 2)
+    if (*e).ht3 == 0 || (*e).ht4 == 0 || (*e).chain == 0 || (*e).probs == 0 {
+        (*e).failed = true
+        return false
+    }
+    (*e).ready = true
+    return true
+}
+
+fn model_reset(e: *mut XzEnc) {
+    var i: usize = 0
+    while i < (*e).nprobs {
+        rt.st16((*e).probs, i, lzma.PROB_INIT)
+        i = i + 1
+    }
+    (*e).state = 0
+    (*e).reps[0] = 0
+    (*e).reps[1] = 0
+    (*e).reps[2] = 0
+    (*e).reps[3] = 0
+}
+
+fn enc_len(e: *mut XzEnc, base: usize, len: u32, pos_state: usize) {
+    let l: u32 = len - 2
+    let pr: u64 = (*e).probs
+    if l < 8 {
+        re_bit(&(*e).rc, pr, base, 0)
+        re_tree(&(*e).rc, pr, base + 2 + pos_state * 8, 3, l)
+    } else if l < 16 {
+        re_bit(&(*e).rc, pr, base, 1)
+        re_bit(&(*e).rc, pr, base + 1, 0)
+        re_tree(&(*e).rc, pr, base + 130 + pos_state * 8, 3, l - 8)
+    } else {
+        re_bit(&(*e).rc, pr, base, 1)
+        re_bit(&(*e).rc, pr, base + 1, 1)
+        re_tree(&(*e).rc, pr, base + 258, 8, l - 16)
+    }
+}
+
+fn pos_slot_of(dist: u32) -> u32 {
+    if dist < 4 {
+        return dist
+    }
+    var n: u32 = 31
+    while ((dist >> n) & 1) == 0 {
+        n = n - 1
+    }
+    return 2 * n + ((dist >> (n - 1)) & 1)
+}
+
+fn enc_dist(e: *mut XzEnc, dist: u32, len: u32) {
+    let pr: u64 = (*e).probs
+    var ls: u32 = len - 2
+    if ls > 3 {
+        ls = 3
+    }
+    let slot: u32 = pos_slot_of(dist)
+    re_tree(&(*e).rc, pr, lzma.P_POSSLOT + (ls as usize) * 64, 6, slot)
+    if slot >= 4 {
+        let nd: u32 = (slot >> 1) - 1
+        let base: u32 = (2 | (slot & 1)) << nd
+        let red: u32 = dist - base
+        if slot < 14 {
+            re_tree_rev(&(*e).rc, pr, lzma.P_SPECPOS + (base as usize) - (slot as usize) - 1, nd, red)
+        } else {
+            re_direct(&(*e).rc, red >> 4, nd - 4)
+            re_tree_rev(&(*e).rc, pr, lzma.P_ALIGN, 4, red & 15)
+        }
+    }
+}
+
+// position since the last dictionary reset of window index `p`
+fn since_of(e: *mut XzEnc, p: usize) -> u64 {
+    return (*e).abs0 + (p as u64)
+}
+
+fn enc_literal(e: *mut XzEnc, p: usize) {
+    let pr: u64 = (*e).probs
+    let win: u64 = (*e).win.ptr
+    let since: u64 = since_of(e, p)
+    var prev: u32 = 0
+    if since > 0 {
+        prev = rt.ld8(win, p - 1) as u32
+    }
+    let pos_state: usize = (since as usize) & 3
+    let r: *mut RcEnc = &(*e).rc
+    let st: usize = (*e).state as usize
+    re_bit(r, pr, lzma.P_ISMATCH + st * 16 + pos_state, 0)
+    let lit_state: usize = (((since as usize) & 0) << (LC as usize)) + ((prev >> (8 - LC)) as usize)
+    let base: usize = lzma.P_LIT + 0x300 * lit_state
+    let sym: u32 = (rt.ld8(win, p) as u32) | 0x100
+    if (*e).state >= 7 {
+        var mb: u32 = rt.ld8(win, p - ((*e).reps[0] as usize) - 1) as u32
+        var offs: u32 = 0x100
+        var s: u32 = 1
+        var i: u32 = 8
+        while i > 0 {
+            i = i - 1
+            mb = mb << 1
+            let mbit: u32 = mb & offs
+            let bit: u32 = (sym >> i) & 1
+            re_bit(r, pr, base + ((offs + mbit + s) as usize), bit)
+            s = (s << 1) | bit
+            if bit == 0 {
+                offs = offs & (0xFFFFFFFF ^ mbit)
+            } else {
+                offs = offs & mbit
+            }
+        }
+    } else {
+        var s: u32 = 1
+        var i: u32 = 8
+        while i > 0 {
+            i = i - 1
+            let bit: u32 = (sym >> i) & 1
+            re_bit(r, pr, base + (s as usize), bit)
+            s = (s << 1) | bit
+        }
+    }
+    if (*e).state < 4 {
+        (*e).state = 0
+    } else if (*e).state < 10 {
+        (*e).state = (*e).state - 3
+    } else {
+        (*e).state = (*e).state - 6
+    }
+}
+
+// A match with a new distance.
+fn enc_match(e: *mut XzEnc, p: usize, dist: u32, len: u32) {
+    let pr: u64 = (*e).probs
+    let pos_state: usize = (since_of(e, p) as usize) & 3
+    let st: usize = (*e).state as usize
+    re_bit(&(*e).rc, pr, lzma.P_ISMATCH + st * 16 + pos_state, 1)
+    re_bit(&(*e).rc, pr, lzma.P_ISREP + st, 0)
+    enc_len(e, lzma.P_MATCHLEN, len, pos_state)
+    enc_dist(e, dist, len)
+    (*e).reps[3] = (*e).reps[2]
+    (*e).reps[2] = (*e).reps[1]
+    (*e).reps[1] = (*e).reps[0]
+    (*e).reps[0] = dist
+    if (*e).state < 7 {
+        (*e).state = 7
+    } else {
+        (*e).state = 10
+    }
+}
+
+// A match at one of the four recent distances (len 1 with idx 0 = "short rep").
+fn enc_rep(e: *mut XzEnc, p: usize, idx: usize, len: u32) {
+    let pr: u64 = (*e).probs
+    let pos_state: usize = (since_of(e, p) as usize) & 3
+    let st: usize = (*e).state as usize
+    let r: *mut RcEnc = &(*e).rc
+    re_bit(r, pr, lzma.P_ISMATCH + st * 16 + pos_state, 1)
+    re_bit(r, pr, lzma.P_ISREP + st, 1)
+    if idx == 0 {
+        re_bit(r, pr, lzma.P_ISREP0 + st, 0)
+        if len == 1 {
+            re_bit(r, pr, lzma.P_REP0LONG + st * 16 + pos_state, 0)
+            if (*e).state < 7 {
+                (*e).state = 9
+            } else {
+                (*e).state = 11
+            }
+            return
+        }
+        re_bit(r, pr, lzma.P_REP0LONG + st * 16 + pos_state, 1)
+    } else {
+        re_bit(r, pr, lzma.P_ISREP0 + st, 1)
+        let dist: u32 = (*e).reps[idx]
+        if idx == 1 {
+            re_bit(r, pr, lzma.P_ISREP1 + st, 0)
+        } else {
+            re_bit(r, pr, lzma.P_ISREP1 + st, 1)
+            re_bit(r, pr, lzma.P_ISREP2 + st, (idx - 2) as u32)
+            if idx == 3 {
+                (*e).reps[3] = (*e).reps[2]
+            }
+            (*e).reps[2] = (*e).reps[1]
+        }
+        (*e).reps[1] = (*e).reps[0]
+        (*e).reps[0] = dist
+    }
+    enc_len(e, lzma.P_REPLEN, len, pos_state)
+    if (*e).state < 7 {
+        (*e).state = 8
+    } else {
+        (*e).state = 11
+    }
+}
+
+// ====================================================================
+// THE MATCH FINDER
+// ====================================================================
+
+fn h3_of(v: u32) -> usize {
+    return (((v & 0xFFFFFF) *% 2654435761) >> 16) as usize
+}
+
+fn h4_of(v: u32, bits: u32) -> usize {
+    return ((v *% 2246822519) >> (32 - bits)) as usize
+}
+
+fn ld3(win: u64, p: usize, wl: usize) -> u32 {
+    // the 4 octets at p, zero padded past the end of the window
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        if p + i < wl {
+            v = v | ((rt.ld8(win, p + i) as u32) << ((i * 8) as u32))
+        }
+        i = i + 1
+    }
+    return v
+}
+
+fn mf_insert(e: *mut XzEnc, p: usize) {
+    let wl: usize = (*e).win.len
+    if p + 3 > wl {
+        return
+    }
+    let win: u64 = (*e).win.ptr
+    if p + 4 <= wl {
+        let v: u32 = common.ld32le(win, p)
+        rt.st32((*e).ht3, h3_of(v), (p + 1) as u32)
+        let hh: usize = h4_of(v, (*e).hlog)
+        rt.st32((*e).chain, p & ((*e).wsize - 1), rt.ld32((*e).ht4, hh))
+        rt.st32((*e).ht4, hh, (p + 1) as u32)
+    } else {
+        let v: u32 = ld3(win, p, wl)
+        rt.st32((*e).ht3, h3_of(v), (p + 1) as u32)
+    }
+}
+
+fn mf_insert_upto(e: *mut XzEnc, q: usize) {
+    while (*e).ins < q {
+        mf_insert(e, (*e).ins)
+        (*e).ins = (*e).ins + 1
+    }
+}
+
+fn match_len(win: u64, a: usize, b: usize, limit: usize) -> usize {
+    var n: usize = 0
+    while n + 8 <= limit && common.ld64le(win, a + n) == common.ld64le(win, b + n) {
+        n = n + 8
+    }
+    while n < limit && rt.ld8(win, a + n) == rt.ld8(win, b + n) {
+        n = n + 1
+    }
+    return n
+}
+
+// The longest match at p (length >= 3, else 0); its distance in `dist`.
+fn mf_search(e: *mut XzEnc, p: usize, avail: usize, dist: *mut usize) -> usize {
+    if avail < 3 {
+        return 0
+    }
+    let win: u64 = (*e).win.ptr
+    let wl: usize = (*e).win.len
+    let v: u32 = ld3(win, p, wl)
+    var best: usize = 2
+    var bdist: usize = 0
+    let c3: usize = rt.ld32((*e).ht3, h3_of(v)) as usize
+    if c3 != 0 {
+        let c: usize = c3 - 1
+        if c < p && p - c <= (*e).dict_size {
+            let l: usize = match_len(win, p, c, avail)
+            if l > best {
+                best = l
+                bdist = p - c
+            }
+        }
+    }
+    if avail >= 4 {
+        var cand: usize = rt.ld32((*e).ht4, h4_of(v, (*e).hlog)) as usize
+        var left: u32 = (*e).depth
+        let mask: usize = (*e).wsize - 1
+        while cand != 0 && left > 0 {
+            let c: usize = cand - 1
+            if c >= p || p - c > (*e).dict_size {
+                break
+            }
+            if best < avail && rt.ld8(win, c + best) == rt.ld8(win, p + best) {
+                let l: usize = match_len(win, p, c, avail)
+                if l > best {
+                    best = l
+                    bdist = p - c
+                    if l >= (*e).nice || l >= avail {
+                        break
+                    }
+                }
+            }
+            let nx: usize = rt.ld32((*e).chain, c & mask) as usize
+            if nx >= cand {
+                break
+            }
+            cand = nx
+            left = left - 1
+        }
+    }
+    if best < 3 {
+        return 0
+    }
+    if best == 3 && bdist > 4096 {
+        return 0 // a far 3 octet match costs more than it saves
+    }
+    *dist = bdist
+    return best
+}
+
+fn change_pair(small: usize, big: usize) -> bool {
+    return (big >> 7) > small
+}
+
+// May the distance `d` be used at window index `p`?
+fn dist_ok(e: *mut XzEnc, p: usize, d: usize) -> bool {
+    return d <= p && (d as u64) <= since_of(e, p) && d <= (*e).dict_size
+}
+
+// ====================================================================
+// THE PARSER: one symbol at e.pos; returns the octets it covers
+// ====================================================================
+
+fn parse_one(e: *mut XzEnc) -> usize {
+    let p: usize = (*e).pos
+    let win: u64 = (*e).win.ptr
+    let wl: usize = (*e).win.len
+    var avail: usize = wl - p
+    if avail > MAXLEN {
+        avail = MAXLEN
+    }
+    mf_insert_upto(e, p)
+    var rep_len: usize = 0
+    var rep_idx: usize = 0
+    var i: usize = 0
+    while i < 4 {
+        let d: usize = ((*e).reps[i] as usize) + 1
+        if avail >= 2 && dist_ok(e, p, d) {
+            let l: usize = match_len(win, p, p - d, avail)
+            if l >= 2 {
+                if l >= (*e).nice {
+                    enc_rep(e, p, i, l as u32)
+                    return l
+                }
+                if l > rep_len {
+                    rep_len = l
+                    rep_idx = i
+                }
+            }
+        }
+        i = i + 1
+    }
+    var mdist: usize = 0
+    let mlen: usize = mf_search(e, p, avail, &mdist)
+    if mlen >= (*e).nice && mlen > 0 {
+        enc_match(e, p, (mdist - 1) as u32, mlen as u32)
+        return mlen
+    }
+    if rep_len >= 2 {
+        if rep_len + 1 >= mlen || (rep_len + 2 >= mlen && mdist >= 512) || (rep_len + 3 >= mlen && mdist >= 32768) {
+            enc_rep(e, p, rep_idx, rep_len as u32)
+            return rep_len
+        }
+    }
+    if mlen < 3 || avail <= 2 {
+        // a literal, or a one octet "short rep" when the octet at rep0 matches
+        let d0: usize = ((*e).reps[0] as usize) + 1
+        if dist_ok(e, p, d0) && rt.ld8(win, p) == rt.ld8(win, p - d0) && (*e).state >= 7 {
+            enc_rep(e, p, 0, 1)
+            return 1
+        }
+        enc_literal(e, p)
+        return 1
+    }
+    // lazy: is a better match one position on?
+    mf_insert_upto(e, p + 1)
+    var navail: usize = wl - (p + 1)
+    if navail > MAXLEN {
+        navail = MAXLEN
+    }
+    var ndist: usize = 0
+    let nl: usize = mf_search(e, p + 1, navail, &ndist)
+    if nl >= 3 {
+        if (nl >= mlen && ndist < mdist) || (nl == mlen + 1 && !change_pair(mdist, ndist)) || nl > mlen + 1
+            || (nl + 1 >= mlen && mlen >= 3 && change_pair(ndist, mdist)) {
+            enc_literal(e, p)
+            return 1
+        }
+    }
+    var j: usize = 0
+    while j < 4 {
+        let d: usize = ((*e).reps[j] as usize) + 1
+        if navail >= 2 && dist_ok(e, p + 1, d) {
+            let l: usize = match_len(win, p + 1, p + 1 - d, navail)
+            if l >= 2 && l + 1 >= mlen {
+                enc_literal(e, p)
+                return 1
+            }
+        }
+        j = j + 1
+    }
+    enc_match(e, p, (mdist - 1) as u32, mlen as u32)
+    return mlen
+}
+
+// ====================================================================
+// LZMA2 CHUNKS AND THE .XZ WRAPPING
+// ====================================================================
+
+fn put32le(out: *mut rt.Buf, v: u32) {
+    rt.buf_push(out, (v & 0xFF) as u8)
+    rt.buf_push(out, ((v >> 8) & 0xFF) as u8)
+    rt.buf_push(out, ((v >> 16) & 0xFF) as u8)
+    rt.buf_push(out, ((v >> 24) & 0xFF) as u8)
+}
+
+fn put_vli(out: *mut rt.Buf, v: u64) {
+    var x: u64 = v
+    while x >= 0x80 {
+        rt.buf_push(out, ((x & 0x7F) | 0x80) as u8)
+        x = x >> 7
+    }
+    rt.buf_push(out, x as u8)
+}
+
+fn dict_prop_byte(size: usize) -> u32 {
+    // the smallest 2^k or 3 * 2^(k-1) that holds `size`
+    var b: u32 = 0
+    while b < 40 && (lzma.dict_size_of(b) as usize) < size {
+        b = b + 1
+    }
+    return b
+}
+
+// Encodes symbols from e.pos until a chunk limit and appends one LZMA2 chunk
+// (or raw chunks) to `out`.
+fn enc_chunk(e: *mut XzEnc, out: *mut rt.Buf, fin: bool) {
+    let start: usize = (*e).pos
+    var mode: u32 = 0
+    if (*e).dict_reset {
+        mode = 3
+    } else if (*e).props_pending {
+        mode = 2
+    } else if (*e).state_reset {
+        mode = 1
+    }
+    if mode > 0 {
+        model_reset(e)
+    }
+    re_init(&(*e).rc)
+    let wl: usize = (*e).win.len
+    while (*e).pos < wl {
+        if !fin && wl - (*e).pos < MAXLEN + 2 {
+            break
+        }
+        if (*e).pos - start >= CHUNK_UMAX || re_pending(&(*e).rc) >= CHUNK_CMAX {
+            break
+        }
+        let n: usize = parse_one(e)
+        (*e).pos = (*e).pos + n
+    }
+    let usz: usize = (*e).pos - start
+    if usz == 0 {
+        return
+    }
+    re_flush(&(*e).rc)
+    let csz: usize = (*e).rc.out.len
+    common.buf_ensure(out, (*out).len + csz + usz + 16)
+    if csz >= usz {
+        // does not shrink: stored chunks of at most 64 KiB
+        var at: usize = 0
+        while at < usz {
+            var k: usize = usz - at
+            if k > 65536 {
+                k = 65536
+            }
+            var ctl: u32 = 2
+            if (*e).dict_reset {
+                ctl = 1
+                (*e).dict_reset = false
+                (*e).props_pending = true
+            }
+            rt.buf_push(out, ctl as u8)
+            rt.buf_push(out, (((k - 1) >> 8) & 0xFF) as u8)
+            rt.buf_push(out, ((k - 1) & 0xFF) as u8)
+            common.buf_append_bytes(out, (*e).win.ptr + (start + at) as u64, k)
+            (*e).comp_total = (*e).comp_total + 3 + (k as u64)
+            at = at + k
+        }
+        (*e).state_reset = true
+    } else {
+        var hl: usize = 5
+        if mode >= 2 {
+            hl = 6
+        }
+        let ctl: u32 = 0x80 | (mode << 5) | ((((usz - 1) >> 16) & 0x1F) as u32)
+        rt.buf_push(out, ctl as u8)
+        rt.buf_push(out, (((usz - 1) >> 8) & 0xFF) as u8)
+        rt.buf_push(out, ((usz - 1) & 0xFF) as u8)
+        rt.buf_push(out, (((csz - 1) >> 8) & 0xFF) as u8)
+        rt.buf_push(out, ((csz - 1) & 0xFF) as u8)
+        if mode >= 2 {
+            rt.buf_push(out, (((PB * 5 + LP) * 9 + LC) & 0xFF) as u8)
+        }
+        common.buf_append_bytes(out, (*e).rc.out.ptr, csz)
+        (*e).comp_total = (*e).comp_total + (hl as u64) + (csz as u64)
+        if mode == 3 {
+            (*e).dict_reset = false
+        }
+        if mode >= 2 {
+            (*e).props_pending = false
+        }
+        (*e).state_reset = false
+    }
+}
+
+// Drops history the dictionary cannot reach any more and rebases the tables.
+fn enc_compact(e: *mut XzEnc) {
+    if !(*e).owned || (*e).pos < 2 * (*e).wsize {
+        return
+    }
+    let cut: usize = (*e).wsize * (((*e).pos - (*e).wsize) / (*e).wsize)
+    if cut == 0 {
+        return
+    }
+    let rest: usize = (*e).win.len - cut
+    rt.mem_copy((*e).win.ptr, (*e).win.ptr + cut as u64, rest)
+    (*e).win.len = rest
+    (*e).pos = (*e).pos - cut
+    (*e).ins = (*e).ins - cut
+    (*e).abs0 = (*e).abs0 + (cut as u64)
+    rebase_table((*e).ht3, 65536, cut)
+    rebase_table((*e).ht4, (1 as usize) << ((*e).hlog as usize), cut)
+    rebase_table((*e).chain, (*e).wsize, cut)
+}
+
+fn rebase_table(t: u64, n: usize, cut: usize) {
+    var i: usize = 0
+    while i < n {
+        let v: u32 = rt.ld32(t, i)
+        if v != 0 {
+            if (v as usize) <= cut {
+                rt.st32(t, i, 0)
+            } else {
+                rt.st32(t, i, v - (cut as u32))
+            }
+        }
+        i = i + 1
+    }
+}
+
+const TRIGGER: usize = 1048576
+
+fn enc_run(e: *mut XzEnc, out: *mut rt.Buf, fin: bool) {
+    while (*e).pos < (*e).win.len {
+        if !fin && (*e).win.len - (*e).pos < TRIGGER {
+            break
+        }
+        let before: usize = (*e).pos
+        enc_chunk(e, out, fin)
+        if (*e).pos == before {
+            break
+        }
+        enc_compact(e)
+    }
+}
+
+fn check_update(e: *mut XzEnc, p: u64, n: usize) {
+    if (*e).check == 1 {
+        (*e).crc32 = common.crc32_update_of(&(*e).ctab, (*e).crc32, p, n)
+    } else if (*e).check == 4 {
+        common.crc64_update(&(*e).crc64, p, n)
+    } else if (*e).check == 10 {
+        sha256.sha256_update(&(*e).sha, p, n)
+    }
+}
+
+fn write_headers(e: *mut XzEnc, out: *mut rt.Buf) {
+    common.buf_ensure(out, (*out).len + 64)
+    // stream header
+    let at: usize = (*out).len
+    rt.buf_push(out, 0xFD as u8)
+    rt.buf_push(out, 0x37 as u8)
+    rt.buf_push(out, 0x7A as u8)
+    rt.buf_push(out, 0x58 as u8)
+    rt.buf_push(out, 0x5A as u8)
+    rt.buf_push(out, 0 as u8)
+    rt.buf_push(out, 0 as u8)
+    rt.buf_push(out, (*e).check as u8)
+    put32le(out, common.crc32_of((*out).ptr + (at + 6) as u64, 2))
+}
+
+fn write_block_header(e: *mut XzEnc, out: *mut rt.Buf) {
+    let at: usize = (*out).len
+    rt.buf_push(out, 2 as u8) // size: (2 + 1) * 4 = 12
+    rt.buf_push(out, 0 as u8) // one filter, no sizes
+    rt.buf_push(out, 0x21 as u8) // LZMA2
+    rt.buf_push(out, 1 as u8)
+    rt.buf_push(out, dict_prop_byte((*e).dict_size) as u8)
+    rt.buf_push(out, 0 as u8)
+    rt.buf_push(out, 0 as u8)
+    rt.buf_push(out, 0 as u8)
+    put32le(out, common.crc32_of((*out).ptr + at as u64, 8))
+}
+
+// Appends input; completed chunks go to `out`.
+fn xz_enc_write(e: *mut XzEnc, p: u64, n: usize, out: *mut rt.Buf) {
+    if n == 0 || (*e).finished {
+        return
+    }
+    if !enc_prepare(e) {
+        return
+    }
+    if !(*e).started {
+        write_headers(e, out)
+        write_block_header(e, out)
+        (*e).started = true
+    }
+    check_update(e, p, n)
+    (*e).total_in = (*e).total_in + (n as u64)
+    var at: usize = 0
+    while at < n {
+        var k: usize = n - at
+        if k > TRIGGER {
+            k = TRIGGER
+        }
+        common.buf_append_bytes(&(*e).win, p + at as u64, k)
+        at = at + k
+        enc_run(e, out, false)
+    }
+}
+
+// Flushes the last chunk, writes padding, check, index and footer.
+fn xz_enc_finish(e: *mut XzEnc, out: *mut rt.Buf) {
+    if (*e).finished {
+        return
+    }
+    (*e).finished = true
+    var unpadded: u64 = 0
+    if !(*e).started {
+        write_headers(e, out)
+    } else {
+        enc_run(e, out, true)
+        rt.buf_push(out, 0 as u8) // end of the LZMA2 data
+        (*e).comp_total = (*e).comp_total + 1
+        var pad: u64 = (4 - ((*e).comp_total % 4)) % 4
+        while pad > 0 {
+            rt.buf_push(out, 0 as u8)
+            pad = pad - 1
+        }
+        var csz: usize = 0
+        if (*e).check == 1 {
+            put32le(out, (*e).crc32)
+            csz = 4
+        } else if (*e).check == 4 {
+            let c: u64 = common.crc64_final(&(*e).crc64)
+            put32le(out, (c & 0xFFFFFFFF) as u32)
+            put32le(out, (c >> 32) as u32)
+            csz = 8
+        } else if (*e).check == 10 {
+            var dg: [u8; 32] = [0; 32]
+            sha256.sha256_final(&(*e).sha, (&dg[0]) as u64)
+            common.buf_append_bytes(out, (&dg[0]) as u64, 32)
+            csz = 32
+        }
+        unpadded = 12 + (*e).comp_total + (csz as u64)
+    }
+    // the index
+    let ix: usize = (*out).len
+    rt.buf_push(out, 0 as u8)
+    if (*e).started {
+        put_vli(out, 1)
+        put_vli(out, unpadded)
+        put_vli(out, (*e).total_in)
+    } else {
+        put_vli(out, 0)
+    }
+    while ((*out).len - ix) % 4 != 0 {
+        rt.buf_push(out, 0 as u8)
+    }
+    put32le(out, common.crc32_of((*out).ptr + ix as u64, (*out).len - ix))
+    let isz: usize = (*out).len - ix
+    // the footer
+    let fx: usize = (*out).len
+    put32le(out, 0) // CRC, patched below
+    put32le(out, ((isz / 4) - 1) as u32)
+    rt.buf_push(out, 0 as u8)
+    rt.buf_push(out, (*e).check as u8)
+    common.st32le((*out).ptr, fx, common.crc32_of((*out).ptr + (fx + 4) as u64, 6))
+    rt.buf_push(out, 0x59 as u8)
+    rt.buf_push(out, 0x5A as u8)
+}
+
+fn xz_compress(src: u64, n: usize, preset: u32, out: *mut rt.Buf) -> CompressError!usize {
+    return try xz_compress_check(src, n, preset, CHECK_CRC64, out)
+}
+
+fn pow2_at_least(n: usize) -> usize {
+    var v: usize = 4096
+    while v < n {
+        v = v * 2
+    }
+    return v
+}
+
+fn xz_compress_check(src: u64, n: usize, preset: u32, check: u32, out: *mut rt.Buf) -> CompressError!usize {
+    let before: usize = (*out).len
+    var e: XzEnc = xz_enc_new(preset, check)
+    defer xz_enc_free(&e)
+    if n >= 2147483648 {
+        // too big for 32 bit positions: through the (compacting) window
+        xz_enc_write(&e, src, n, out)
+        xz_enc_finish(&e, out)
+        if e.failed {
+            return CompressError::OutOfMemory
+        }
+        return (*out).len - before
+    }
+    // the dictionary never needs to exceed the input
+    if e.dict_size > pow2_at_least(n) {
+        e.dict_size = pow2_at_least(n)
+    }
+    if n == 0 {
+        xz_enc_finish(&e, out)
+        return (*out).len - before
+    }
+    if !enc_prepare(&e) {
+        return CompressError::OutOfMemory
+    }
+    e.owned = false
+    e.win = rt.Buf { ptr: src, len: n, cap: 0 }
+    write_headers(&e, out)
+    write_block_header(&e, out)
+    e.started = true
+    check_update(&e, src, n)
+    e.total_in = n as u64
+    common.buf_ensure(out, (*out).len + n + (n >> 3) + 256)
+    enc_run(&e, out, true)
+    xz_enc_finish(&e, out)
+    if e.failed {
+        return CompressError::OutOfMemory
+    }
+    return (*out).len - before
+}
+
+// The legacy .lzma format: 13 octet header, one LZMA run.
+fn lzma_alone_compress(src: u64, n: usize, preset: u32, out: *mut rt.Buf) -> CompressError!usize {
+    let before: usize = (*out).len
+    var e: XzEnc = xz_enc_new(preset, 0)
+    defer xz_enc_free(&e)
+    e.alone = true
+    if e.dict_size > pow2_at_least(n) {
+        e.dict_size = pow2_at_least(n)
+    }
+    if !enc_prepare(&e) {
+        return CompressError::OutOfMemory
+    }
+    e.owned = false
+    e.win = rt.Buf { ptr: src, len: n, cap: 0 }
+    rt.buf_push(out, (((PB * 5 + LP) * 9 + LC) & 0xFF) as u8)
+    put32le(out, e.dict_size as u32)
+    put32le(out, (n & 0xFFFFFFFF) as u32)
+    put32le(out, ((n as u64) >> 32) as u32)
+    model_reset(&e)
+    re_init(&e.rc)
+    while e.pos < n {
+        let k: usize = parse_one(&e)
+        e.pos = e.pos + k
+    }
+    re_flush(&e.rc)
+    common.buf_append_bytes(out, e.rc.out.ptr, e.rc.out.len)
+    return (*out).len - before
+}

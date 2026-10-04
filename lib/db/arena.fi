@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/arena.fi -- a bump allocator that never moves what it handed out.
+//
+// Blocks of 64 KiB (or bigger, for one big request) come from the operating
+// system; `arena_alloc` cuts pieces off the current block. `arena_reset`
+// keeps the first block and gives the others back; `arena_free` gives all
+// back. Memory is NOT zeroed after a reset (a fresh block is zero).
+
+import std.rt
+
+export { Arena, arena_new, arena_alloc, arena_reset, arena_free, arena_copy, arena_bytes }
+
+const ARENA_BLOCK: usize = 65536
+
+struct Arena {
+    cur: u64,
+    end: u64,
+    blocks: rt.Buf, // pairs: address u64, size u64
+    nblocks: usize,
+    total: usize,
+}
+
+fn arena_new() -> Arena {
+    return Arena { cur: 0, end: 0, blocks: rt.buf_new(), nblocks: 0, total: 0 }
+}
+
+fn add_block(a: *mut Arena, size: usize) -> bool {
+    let p: u64 = rt.heap_alloc(size)
+    if p == 0 {
+        return false
+    }
+    let at: usize = rt.buf_len(&(*a).blocks)
+    rt.buf_reserve(&(*a).blocks, at + 16)
+    let b: u64 = rt.buf_ptr(&(*a).blocks) + (at as u64)
+    rt.st64(b, 0, p)
+    rt.st64(b, 1, size as u64)
+    rt.buf_set_len(&(*a).blocks, at + 16)
+    (*a).nblocks = (*a).nblocks + 1
+    (*a).total = (*a).total + size
+    return true
+}
+
+// n octets (8-aligned) or 0 if the system has no memory.
+fn arena_alloc(a: *mut Arena, n0: usize) -> u64 {
+    var n: usize = ((n0 + 7) / 8) * 8
+    if n == 0 {
+        n = 8
+    }
+    if (*a).cur + (n as u64) > (*a).end || (*a).cur == 0 {
+        if n > ARENA_BLOCK / 2 {
+            // a block of its own; the current block stays current
+            let saved_cur: u64 = (*a).cur
+            let saved_end: u64 = (*a).end
+            if !add_block(a, n) {
+                return 0
+            }
+            let at: usize = rt.buf_len(&(*a).blocks) - 16
+            let p: u64 = rt.ld64(rt.buf_ptr(&(*a).blocks) + (at as u64), 0)
+            (*a).cur = saved_cur
+            (*a).end = saved_end
+            return p
+        }
+        if !add_block(a, ARENA_BLOCK) {
+            return 0
+        }
+        let at2: usize = rt.buf_len(&(*a).blocks) - 16
+        let p2: u64 = rt.ld64(rt.buf_ptr(&(*a).blocks) + (at2 as u64), 0)
+        (*a).cur = p2
+        (*a).end = p2 + (ARENA_BLOCK as u64)
+    }
+    let r: u64 = (*a).cur
+    (*a).cur = r + (n as u64)
+    return r
+}
+
+fn arena_copy(a: *mut Arena, p: u64, n: usize) -> u64 {
+    let d: u64 = arena_alloc(a, n + 1)
+    if d == 0 {
+        return 0
+    }
+    var i: usize = 0
+    while i + 8 <= n {
+        rt.st64(d + (i as u64), 0, rt.ld64(p + (i as u64), 0))
+        i = i + 8
+    }
+    while i < n {
+        rt.st8(d, i, rt.ld8(p, i))
+        i = i + 1
+    }
+    rt.st8(d, n, 0 as u8)
+    return d
+}
+
+fn arena_bytes(a: *mut Arena) -> usize {
+    return (*a).total
+}
+
+// Keeps the first block; every other block is returned to the system.
+fn arena_reset(a: *mut Arena) {
+    let n: usize = (*a).nblocks
+    if n == 0 {
+        return
+    }
+    let base: u64 = rt.buf_ptr(&(*a).blocks)
+    var i: usize = 1
+    while i < n {
+        rt.heap_free(rt.ld64(base + ((i * 16) as u64), 0), rt.ld64(base + ((i * 16) as u64), 1) as usize)
+        i = i + 1
+    }
+    // the first block: only if it is the standard block, else free it too
+    let first: u64 = rt.ld64(base, 0)
+    let fsize: usize = rt.ld64(base, 1) as usize
+    if fsize == ARENA_BLOCK {
+        rt.buf_set_len(&(*a).blocks, 16)
+        (*a).nblocks = 1
+        (*a).total = ARENA_BLOCK
+        (*a).cur = first
+        (*a).end = first + (ARENA_BLOCK as u64)
+    } else {
+        rt.heap_free(first, fsize)
+        rt.buf_clear(&(*a).blocks)
+        (*a).nblocks = 0
+        (*a).total = 0
+        (*a).cur = 0
+        (*a).end = 0
+    }
+}
+
+fn arena_free(a: *mut Arena) {
+    let n: usize = (*a).nblocks
+    let base: u64 = rt.buf_ptr(&(*a).blocks)
+    var i: usize = 0
+    while i < n {
+        rt.heap_free(rt.ld64(base + ((i * 16) as u64), 0), rt.ld64(base + ((i * 16) as u64), 1) as usize)
+        i = i + 1
+    }
+    rt.buf_free(&(*a).blocks)
+    (*a).nblocks = 0
+    (*a).total = 0
+    (*a).cur = 0
+    (*a).end = 0
+}

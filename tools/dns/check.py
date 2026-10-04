@@ -363,11 +363,12 @@ def part_d():
               'a content-addressed Mojang file has exactly the length curl got (%d)' % len(r.stdout), repr(g))
     else:
         skip('Mojang package file not available for comparison')
-    # The refusals, from badssl.com. Those hosts speak TLS 1.2 only, so the
-    # handshake ends in an alert before any certificate is seen: what is
-    # checked is that nothing is FETCHED from them (Tls, no body). The
-    # certificate verdicts themselves (EXPIRED, NAME, UNKNOWN_ISSUER) are
-    # held by part C and by tools/tls/cert_check.py.
+    # The refusals, from badssl.com. Those hosts speak TLS 1.2 (the client
+    # offers it since round TLS12), so the handshake gets as far as the
+    # certificate and is refused THERE: what is checked is that nothing is
+    # FETCHED from them (Tls, no body). The exact verdicts (EXPIRED, NAME,
+    # UNKNOWN_ISSUER) are held by part C, tools/tls/cert_check.py and
+    # tools/tls/tls12_check.py.
     probe = sh('curl -s -o /dev/null -w "%{http_code}" --max-time 15 https://badssl.com/')
     if probe.stdout.strip() != '200':
         skip('badssl.com is not reachable')
