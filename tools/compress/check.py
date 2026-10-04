@@ -21,7 +21,7 @@ Prints one line per group and a total; exit code 1 on any failure.
 import os, sys, subprocess, random, tempfile, shutil, time, struct, zlib
 
 PROBE = os.path.abspath(sys.argv[1])
-FMTS = sys.argv[2:] or ["lz4", "zstd", "xz", "lzma", "bz2", "br"]
+FMTS = sys.argv[2:] or ["lz4", "zstd", "xz", "lzma", "bz2", "br", "gz", "zlib", "deflate", "auto"]
 PARTS = os.environ.get("CHECK_PARTS", "decode,encode,hostile").split(",")
 W = tempfile.mkdtemp(prefix="compress-check-")
 import atexit
@@ -187,6 +187,46 @@ def ref_compressors(fmt):
         out.append(("xz-lc0lp2pb0", lambda d: lzma.compress(d, format=lzma.FORMAT_XZ,
                                                            filters=[{"id": lzma.FILTER_LZMA2, "preset": 2, "lc": 0,
                                                                      "lp": 2, "pb": 0}])))
+    elif fmt == "gz":
+        import gzip, io
+        out.append(("gzip-1", lambda d: gzip.compress(d, 1, mtime=0)))
+        out.append(("gzip-6", lambda d: gzip.compress(d, 6, mtime=123456)))
+        out.append(("gzip-9", lambda d: gzip.compress(d, 9)))
+        out.append(("gzip-0-stored", lambda d: gzip.compress(d, 0)))
+        def named(d):
+            b = io.BytesIO()
+            with gzip.GzipFile(filename="some/name.txt", mode="wb", fileobj=b, mtime=1) as f:
+                f.write(d)
+            return b.getvalue()
+        out.append(("gzip-fname", named))
+        out.append(("gzip-multimember", lambda d: gzip.compress(d[: len(d) // 3]) + gzip.compress(d[len(d) // 3:]) ))
+        out.append(("gzip-zeropad", lambda d: gzip.compress(d) + bytes(16)))
+        def header_crc(d):
+            # a header with FHCRC and FEXTRA set, made by hand
+            body = zlib.compressobj(6, zlib.DEFLATED, -15)
+            raw = body.compress(d) + body.flush()
+            hdr = bytes([0x1f, 0x8b, 8, 2 | 4, 0, 0, 0, 0, 0, 3]) + struct.pack("<H", 5) + b"extra"
+            h = hdr + struct.pack("<H", zlib.crc32(hdr) & 0xFFFF)
+            return h + raw + struct.pack("<II", zlib.crc32(d) & 0xFFFFFFFF, len(d) & 0xFFFFFFFF)
+        out.append(("gzip-fhcrc-fextra", header_crc))
+    elif fmt == "zlib":
+        out.append(("zlib-1", lambda d: zlib.compress(d, 1)))
+        out.append(("zlib-9", lambda d: zlib.compress(d, 9)))
+        out.append(("zlib-0", lambda d: zlib.compress(d, 0)))
+    elif fmt == "deflate":
+        def raw(level, strategy=zlib.Z_DEFAULT_STRATEGY):
+            def f(d):
+                c = zlib.compressobj(level, zlib.DEFLATED, -15, 9, strategy)
+                return c.compress(d) + c.flush()
+            return f
+        out.append(("deflate-6", raw(6)))
+        out.append(("deflate-9", raw(9)))
+        out.append(("deflate-fixed", raw(6, zlib.Z_FIXED)))
+        out.append(("deflate-huffman-only", raw(6, zlib.Z_HUFFMAN_ONLY)))
+        out.append(("deflate-rle", raw(6, zlib.Z_RLE)))
+    elif fmt == "auto":
+        for f in ("gz", "zstd", "xz", "bz2", "lz4"):
+            out.append(("auto-" + f, ref_compressors(f)[1][1] if f != "gz" else ref_compressors(f)[0][1]))
     elif fmt == "lzma":
         import lzma
         out.append(("lzma-alone-4", lambda d: lzma.compress(d, format=lzma.FORMAT_ALONE, preset=4)))
@@ -218,6 +258,11 @@ def ref_decompress(fmt, data):
         if r.returncode != 0:
             raise ValueError("zstd: " + r.stderr.decode(errors="replace"))
         return r.stdout
+    if fmt == "gz" or fmt == "auto":
+        import gzip
+        return gzip.decompress(data)
+    if fmt == "zlib":
+        return zlib.decompress(data)
     if fmt == "xz" or fmt == "lzma":
         import lzma
         return lzma.decompress(data)
@@ -231,9 +276,9 @@ def ref_decompress(fmt, data):
 
 
 # the encoder knobs the probe offers per format (level argument for op c)
-ENC_LEVELS = {"lz4": [None], "zstd": [None, 1, 3, 6], "xz": [None, 1, 3, 6, 9], "lzma": [None, 1, 9], "bz2": [None, 1, 9], "br": [None]}
+ENC_LEVELS = {"lz4": [None], "zstd": [None, 1, 3, 6], "xz": [None, 1, 3, 6, 9], "lzma": [None, 1, 9], "bz2": [None, 1, 9], "br": [None], "gz": [None], "zlib": [None], "deflate": [None], "auto": [None]}
 
-ENC_ENABLED = {"lz4": True, "zstd": True, "xz": True, "lzma": True, "bz2": False, "br": False}
+ENC_ENABLED = {"lz4": True, "zstd": True, "xz": True, "lzma": True, "bz2": False, "br": False, "gz": False, "zlib": False, "deflate": False, "auto": False}
 
 
 def group(fmt):

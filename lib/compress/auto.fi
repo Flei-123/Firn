@@ -1,0 +1,421 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/compress/auto.fi -- one door for every compression format of
+// lib/compress: the format is found by its magic octets and the matching
+// decoder does the work, whole-buffer or streaming.
+//
+//     import compress.auto
+//     let k: u32 = auto.detect(p, n)                              // auto.KIND_ZSTD ...
+//     auto.decompress_limited(p, n, 1 << 30, &out) catch |e| ...  // whole buffer, any format
+//
+//     var d: auto.AutoDec = auto.auto_dec_open_fd(fd) catch |e| ...   // streaming, any format
+//     let n: usize = auto.auto_dec_read(&d, buf, 65536) catch |e| ... // 0 = end
+//     auto.auto_dec_close(&d)
+//
+//     auto.compress(auto.KIND_ZSTD, p, n, 3, &out) catch |e| ...      // gzip, zstd, xz, lz4
+//
+// WHAT IS RECOGNISED (by content, never by file name):
+//   gzip   1f 8b 08            zstd  28 b5 2f fd (and skippable frames 184d2a5x
+//   xz     fd 37 7a 58 5a 00         that are followed by a zstd frame or nothing)
+//   bzip2  "BZh" '1'..'9' and the block or end magic that must follow
+//   lz4    04 22 4d 18 (and the legacy 02 21 4c 18, skippable frames before an lz4 frame)
+//   zip    "PK" 03 04 / 05 06 -- recognised, but a ZIP is an archive, not a stream:
+//          decompress() answers `Unsupported`; use lib/zip or std.extract.
+// NOT recognised: Brotli and legacy .lzma (they have no magic), zlib streams
+// (two octets are no proof). Ask for them by name with `decompress_as`
+// (KIND_BROTLI, KIND_LZMA, KIND_ZLIB, KIND_DEFLATE).
+//
+// HONEST
+//   A1 Streaming reads from a descriptor: the first octets are looked at in
+//      the 64 KiB read buffer (not consumed), then the decoder of the format
+//      takes over the same buffer -- nothing is read twice, nothing is held
+//      whole. Legacy .lzma has no streaming decoder (it is whole-buffer).
+//   A2 compress() knows gzip (std.deflate), zstd, xz and lz4. bzip2 and Brotli
+//      have no encoder here: `Unsupported`.
+import std.rt
+import std.deflate
+import compress.common
+import compress.gzip
+import compress.zstd
+import compress.zstd_enc
+import compress.lzma
+import compress.lzma_enc
+import compress.bz2
+import compress.lz4
+import compress.brotli
+
+export {
+    AutoDec, auto_dec_open_mem, auto_dec_open_fd, auto_dec_read, auto_dec_close, auto_dec_kind, auto_dec_set_limit,
+    detect, kind_name, kind_extension,
+    decompress, decompress_limited, decompress_as,
+    compress,
+    KIND_UNKNOWN, KIND_GZIP, KIND_ZSTD, KIND_XZ, KIND_BZIP2, KIND_LZ4, KIND_ZIP,
+    KIND_BROTLI, KIND_LZMA, KIND_ZLIB, KIND_DEFLATE,
+}
+
+const KIND_UNKNOWN: u32 = 0
+const KIND_GZIP: u32 = 1
+const KIND_ZSTD: u32 = 2
+const KIND_XZ: u32 = 3
+const KIND_BZIP2: u32 = 4
+const KIND_LZ4: u32 = 5
+const KIND_ZIP: u32 = 6
+const KIND_BROTLI: u32 = 7
+const KIND_LZMA: u32 = 8
+const KIND_ZLIB: u32 = 9
+const KIND_DEFLATE: u32 = 10
+
+fn kind_name(k: u32) -> str {
+    if k == KIND_GZIP {
+        return "gzip"
+    }
+    if k == KIND_ZSTD {
+        return "zstd"
+    }
+    if k == KIND_XZ {
+        return "xz"
+    }
+    if k == KIND_BZIP2 {
+        return "bzip2"
+    }
+    if k == KIND_LZ4 {
+        return "lz4"
+    }
+    if k == KIND_ZIP {
+        return "zip"
+    }
+    if k == KIND_BROTLI {
+        return "brotli"
+    }
+    if k == KIND_LZMA {
+        return "lzma"
+    }
+    if k == KIND_ZLIB {
+        return "zlib"
+    }
+    if k == KIND_DEFLATE {
+        return "deflate"
+    }
+    return "unknown"
+}
+
+// The usual file name extension of a format (without the dot).
+fn kind_extension(k: u32) -> str {
+    if k == KIND_GZIP {
+        return "gz"
+    }
+    if k == KIND_ZSTD {
+        return "zst"
+    }
+    if k == KIND_XZ {
+        return "xz"
+    }
+    if k == KIND_BZIP2 {
+        return "bz2"
+    }
+    if k == KIND_LZ4 {
+        return "lz4"
+    }
+    if k == KIND_ZIP {
+        return "zip"
+    }
+    if k == KIND_BROTLI {
+        return "br"
+    }
+    if k == KIND_LZMA {
+        return "lzma"
+    }
+    return ""
+}
+
+// Which format do these octets begin with? (KIND_UNKNOWN when none.)
+fn detect(p: u64, n: usize) -> u32 {
+    if n >= 3 && rt.ld8(p, 0) == 0x1F as u8 && rt.ld8(p, 1) == 0x8B as u8 && rt.ld8(p, 2) == 8 as u8 {
+        return KIND_GZIP
+    }
+    if n >= 6 && lzma.xz_is_xz(p, n) {
+        return KIND_XZ
+    }
+    if n >= 4 {
+        let m: u32 = common.ld32le(p, 0)
+        if m == 0xFD2FB528 {
+            return KIND_ZSTD
+        }
+        if m == 0x184D2204 || m == 0x184C2102 {
+            return KIND_LZ4
+        }
+        if m >= 0x184D2A50 && m <= 0x184D2A5F {
+            // zstd and lz4 share the skippable magic: look past the frame
+            if n >= 8 {
+                let sz: u64 = common.ld32le(p, 4) as u64
+                if 8 + sz + 4 <= (n as u64) {
+                    let m2: u32 = common.ld32le(p, 8 + (sz as usize))
+                    if m2 == 0x184D2204 || m2 == 0x184C2102 {
+                        return KIND_LZ4
+                    }
+                }
+            }
+            return KIND_ZSTD
+        }
+    }
+    if n >= 4 && rt.ld8(p, 0) == 0x42 as u8 && rt.ld8(p, 1) == 0x5A as u8 && rt.ld8(p, 2) == 0x68 as u8
+        && rt.ld8(p, 3) >= 0x31 as u8 && rt.ld8(p, 3) <= 0x39 as u8 {
+        if n >= 10 {
+            // the block magic (pi) or the end magic (sqrt(pi)) must follow
+            let a: u8 = rt.ld8(p, 4)
+            if !(a == 0x31 as u8 && rt.ld8(p, 5) == 0x41 as u8) && !(a == 0x17 as u8 && rt.ld8(p, 5) == 0x72 as u8) {
+                return KIND_UNKNOWN
+            }
+        }
+        return KIND_BZIP2
+    }
+    if n >= 4 && rt.ld8(p, 0) == 0x50 as u8 && rt.ld8(p, 1) == 0x4B as u8 {
+        let c: u8 = rt.ld8(p, 2)
+        let d: u8 = rt.ld8(p, 3)
+        if (c == 3 as u8 && d == 4 as u8) || (c == 5 as u8 && d == 6 as u8) {
+            return KIND_ZIP
+        }
+    }
+    return KIND_UNKNOWN
+}
+
+// ====================================================================
+// WHOLE BUFFER
+// ====================================================================
+
+fn decompress(src: u64, n: usize, out: *mut rt.Buf) -> CompressError!usize {
+    return try decompress_as(detect(src, n), src, n, 0, out)
+}
+
+fn decompress_limited(src: u64, n: usize, max: usize, out: *mut rt.Buf) -> CompressError!usize {
+    return try decompress_as(detect(src, n), src, n, max, out)
+}
+
+// `max` = 0: no limit. KIND_UNKNOWN is `Format`; KIND_ZIP is `Unsupported`.
+fn decompress_as(kind: u32, src: u64, n: usize, max: usize, out: *mut rt.Buf) -> CompressError!usize {
+    if kind == KIND_GZIP {
+        return try gzip.gz_decompress_limited(src, n, gzip.GZ_GZIP, max, out)
+    }
+    if kind == KIND_ZLIB {
+        return try gzip.gz_decompress_limited(src, n, gzip.GZ_ZLIB, max, out)
+    }
+    if kind == KIND_DEFLATE {
+        return try gzip.gz_decompress_limited(src, n, gzip.GZ_RAW, max, out)
+    }
+    if kind == KIND_ZSTD {
+        return try zstd.zstd_decompress_limited(src, n, max, out)
+    }
+    if kind == KIND_XZ {
+        return try lzma.xz_decompress_limited(src, n, max, out)
+    }
+    if kind == KIND_LZMA {
+        return try lzma.lzma_alone_decompress_limited(src, n, max, out)
+    }
+    if kind == KIND_BZIP2 {
+        return try bz2.bz2_decompress_limited(src, n, max, out)
+    }
+    if kind == KIND_LZ4 {
+        return try lz4.lz4_frame_decompress_limited(src, n, max, out)
+    }
+    if kind == KIND_BROTLI {
+        return try brotli.brotli_decompress_limited(src, n, max, out)
+    }
+    if kind == KIND_ZIP {
+        return CompressError::Unsupported
+    }
+    return CompressError::Format
+}
+
+// Compresses with the named format. `level`: 0 = the format's default,
+// otherwise gzip 1..9, zstd 1..19, xz 1..9, lz4 ignored.
+fn compress(kind: u32, src: u64, n: usize, level: u32, out: *mut rt.Buf) -> CompressError!usize {
+    if kind == KIND_GZIP {
+        var lv: usize = level as usize
+        if lv == 0 {
+            lv = 6
+        }
+        let r: usize = deflate.gzip_compress(src, n, lv, out) catch 0 - 1
+        if r == 0xFFFFFFFFFFFFFFFF {
+            return CompressError::OutOfMemory
+        }
+        return r
+    }
+    if kind == KIND_ZSTD {
+        return try zstd_enc.zstd_compress(src, n, level, out)
+    }
+    if kind == KIND_XZ {
+        var lv: u32 = level
+        if lv == 0 {
+            lv = 6
+        }
+        return try lzma_enc.xz_compress(src, n, lv, out)
+    }
+    if kind == KIND_LZ4 {
+        return try lz4.lz4_frame_compress(src, n, out)
+    }
+    return CompressError::Unsupported
+}
+
+// ====================================================================
+// STREAMING
+// ====================================================================
+
+struct AutoDec {
+    kind: u32,
+    h: u64, // the decoder of the format, on the heap
+    hsize: usize,
+    max: usize,
+}
+
+fn auto_dec_kind(d: *mut AutoDec) -> u32 {
+    return (*d).kind
+}
+
+fn auto_dec_open_mem(p: u64, n: usize) -> CompressError!AutoDec {
+    return try open_source(common.src_mem(p, n), 0)
+}
+
+fn auto_dec_open_fd(fd: i64) -> CompressError!AutoDec {
+    return try open_source(common.src_fd(fd), 0)
+}
+
+// KIND_UNKNOWN as `forced` = look at the content.
+fn open_source(s: common.Source, forced: u32) -> CompressError!AutoDec {
+    var src: common.Source = s
+    var kind: u32 = forced
+    if kind == KIND_UNKNOWN {
+        var got: usize = 0
+        let head: u64 = common.src_peek(&src, 16, &got)
+        if common.src_failed(&src) {
+            common.src_free(&src)
+            return CompressError::Io
+        }
+        kind = detect(head, got)
+        if kind == KIND_UNKNOWN {
+            common.src_free(&src)
+            if got == 0 {
+                return CompressError::Truncated
+            }
+            return CompressError::Format
+        }
+    }
+    var d: AutoDec = AutoDec { kind: kind, h: 0, hsize: 0, max: 0 }
+    if kind == KIND_GZIP || kind == KIND_ZLIB || kind == KIND_DEFLATE {
+        d.hsize = gzip.gz_dec_size()
+        d.h = rt.heap_alloc(d.hsize)
+        if d.h != 0 {
+            var gk: u32 = gzip.GZ_GZIP
+            if kind == KIND_ZLIB {
+                gk = gzip.GZ_ZLIB
+            } else if kind == KIND_DEFLATE {
+                gk = gzip.GZ_RAW
+            }
+            *(d.h as *mut gzip.GzDec) = gzip.gz_dec_open_source(src, gk)
+        }
+    } else if kind == KIND_ZSTD {
+        d.hsize = zstd.zstd_dec_size()
+        d.h = rt.heap_alloc(d.hsize)
+        if d.h != 0 {
+            *(d.h as *mut zstd.ZstdDec) = zstd.zstd_dec_open_source(src)
+        }
+    } else if kind == KIND_XZ {
+        d.hsize = lzma.xz_dec_size()
+        d.h = rt.heap_alloc(d.hsize)
+        if d.h != 0 {
+            *(d.h as *mut lzma.XzDec) = lzma.xz_dec_open_source(src)
+        }
+    } else if kind == KIND_BZIP2 {
+        d.hsize = bz2.bz2_dec_size()
+        d.h = rt.heap_alloc(d.hsize)
+        if d.h != 0 {
+            *(d.h as *mut bz2.Bz2Dec) = bz2.bz2_dec_open_source(src)
+        }
+    } else if kind == KIND_LZ4 {
+        d.hsize = lz4.lz4_dec_size()
+        d.h = rt.heap_alloc(d.hsize)
+        if d.h != 0 {
+            *(d.h as *mut lz4.Lz4Dec) = lz4.lz4_dec_open_source(src)
+        }
+    } else if kind == KIND_BROTLI {
+        d.hsize = brotli.brotli_dec_size()
+        d.h = rt.heap_alloc(d.hsize)
+        if d.h != 0 {
+            *(d.h as *mut brotli.BrDec) = brotli.brotli_dec_open_source(src)
+        }
+    } else {
+        common.src_free(&src)
+        if kind == KIND_ZIP {
+            return CompressError::Unsupported
+        }
+        return CompressError::Format
+    }
+    if d.h == 0 {
+        common.src_free(&src)
+        return CompressError::OutOfMemory
+    }
+    return d
+}
+
+// Limits the total output of the stream (0 = none).
+fn auto_dec_set_limit(d: *mut AutoDec, max: usize) {
+    (*d).max = max
+    let k: u32 = (*d).kind
+    if k == KIND_GZIP || k == KIND_ZLIB || k == KIND_DEFLATE {
+        gzip.gz_dec_set_limit((*d).h as *mut gzip.GzDec, max)
+    } else if k == KIND_ZSTD {
+        (*((*d).h as *mut zstd.ZstdDec)).max = max
+    } else if k == KIND_XZ {
+        (*((*d).h as *mut lzma.XzDec)).max = max
+    } else if k == KIND_BZIP2 {
+        (*((*d).h as *mut bz2.Bz2Dec)).max = max
+    } else if k == KIND_LZ4 {
+        (*((*d).h as *mut lz4.Lz4Dec)).limit = max
+    } else if k == KIND_BROTLI {
+        (*((*d).h as *mut brotli.BrDec)).max = max
+    }
+}
+
+fn auto_dec_close(d: *mut AutoDec) {
+    if (*d).h == 0 {
+        return
+    }
+    let k: u32 = (*d).kind
+    if k == KIND_GZIP || k == KIND_ZLIB || k == KIND_DEFLATE {
+        gzip.gz_dec_close((*d).h as *mut gzip.GzDec)
+    } else if k == KIND_ZSTD {
+        zstd.zstd_dec_close((*d).h as *mut zstd.ZstdDec)
+    } else if k == KIND_XZ {
+        lzma.xz_dec_close((*d).h as *mut lzma.XzDec)
+    } else if k == KIND_BZIP2 {
+        bz2.bz2_dec_close((*d).h as *mut bz2.Bz2Dec)
+    } else if k == KIND_LZ4 {
+        lz4.lz4_dec_close((*d).h as *mut lz4.Lz4Dec)
+    } else if k == KIND_BROTLI {
+        brotli.brotli_dec_close((*d).h as *mut brotli.BrDec)
+    }
+    rt.heap_free((*d).h, (*d).hsize)
+    (*d).h = 0
+}
+
+// Up to `n` decoded octets into `dst`; 0 = the end of the stream.
+fn auto_dec_read(d: *mut AutoDec, dst: u64, n: usize) -> CompressError!usize {
+    let k: u32 = (*d).kind
+    if k == KIND_GZIP || k == KIND_ZLIB || k == KIND_DEFLATE {
+        return try gzip.gz_dec_read((*d).h as *mut gzip.GzDec, dst, n)
+    }
+    if k == KIND_ZSTD {
+        return try zstd.zstd_dec_read((*d).h as *mut zstd.ZstdDec, dst, n)
+    }
+    if k == KIND_XZ {
+        return try lzma.xz_dec_read((*d).h as *mut lzma.XzDec, dst, n)
+    }
+    if k == KIND_BZIP2 {
+        return try bz2.bz2_dec_read((*d).h as *mut bz2.Bz2Dec, dst, n)
+    }
+    if k == KIND_LZ4 {
+        return try lz4.lz4_dec_read((*d).h as *mut lz4.Lz4Dec, dst, n)
+    }
+    if k == KIND_BROTLI {
+        return try brotli.brotli_dec_read((*d).h as *mut brotli.BrDec, dst, n)
+    }
+    return CompressError::Format
+}

@@ -42,9 +42,10 @@
 //      this change); `Content-Encoding: br` is for receiving.
 import std.rt
 import compress.common
+import compress.bitio
 
 export {
-    BrDec, brotli_dec_open_mem, brotli_dec_open_fd, brotli_dec_read, brotli_dec_close,
+    BrDec, brotli_dec_open_source, brotli_dec_size, brotli_dec_open_mem, brotli_dec_open_fd, brotli_dec_read, brotli_dec_close,
     brotli_decompress, brotli_decompress_limited,
 }
 
@@ -74,124 +75,13 @@ static CL_LEN: [u8; 16] = [2, 2, 2, 3, 2, 2, 2, 4, 2, 2, 2, 3, 2, 2, 2, 4]
 static CL_VAL: [u8; 16] = [0, 4, 3, 2, 0, 4, 3, 1, 0, 4, 3, 2, 0, 4, 3, 5]
 
 // ====================================================================
-// PREFIX CODES: a tree is [cnt: 16 x u16][fast: 256 x u16][sym: alpha x u16]
-// ====================================================================
-
-const T_CNT: usize = 0
-const T_FAST: usize = 16
-const T_SYM: usize = 272
-
-fn tree_size(alpha: usize) -> usize {
-    return (T_SYM + alpha) * 2
-}
-
-// Builds a tree from code lengths (one per symbol). Returns false when the
-// lengths do not form a complete code (except the one-symbol case).
-fn build_tree(t: u64, lens: u64, alpha: usize) -> bool {
-    var cnt: [u32; 16] = [0; 16]
-    var nz: usize = 0
-    var last: usize = 0
-    var s: usize = 0
-    while s < alpha {
-        let l: usize = rt.ld8(lens, s) as usize
-        if l > 0 {
-            cnt[l] = cnt[l] + 1
-            nz = nz + 1
-            last = s
-        }
-        s = s + 1
-    }
-    var i: usize = 0
-    while i < 16 {
-        rt.st16(t, T_CNT + i, 0 as u16)
-        i = i + 1
-    }
-    i = 0
-    while i < 256 {
-        rt.st16(t, T_FAST + i, 0 as u16)
-        i = i + 1
-    }
-    if nz == 0 {
-        return false
-    }
-    if nz == 1 {
-        rt.st16(t, T_CNT, 1 as u16)
-        rt.st16(t, T_SYM, last as u16)
-        return true
-    }
-    // complete?
-    var left: i32 = 1
-    var l: usize = 1
-    while l < 16 {
-        left = left * 2 - (cnt[l] as i32)
-        if left < 0 {
-            return false
-        }
-        l = l + 1
-    }
-    if left != 0 {
-        return false
-    }
-    var offs: [u32; 17] = [0; 17]
-    l = 1
-    while l < 16 {
-        offs[l + 1] = offs[l] + cnt[l]
-        rt.st16(t, T_CNT + l, cnt[l] as u16)
-        l = l + 1
-    }
-    // symbols in (length, value) order, and the canonical codes for the fast table
-    var next: [u32; 17] = [0; 17]
-    var code: u32 = 0
-    l = 1
-    while l < 16 {
-        code = (code + cnt[l - 1]) << 1
-        if l == 1 {
-            code = 0
-        }
-        next[l] = code
-        l = l + 1
-    }
-    s = 0
-    while s < alpha {
-        let sl: usize = rt.ld8(lens, s) as usize
-        if sl > 0 {
-            let pos: u32 = offs[sl]
-            offs[sl] = pos + 1
-            rt.st16(t, T_SYM + (pos as usize), s as u16)
-            let c: u32 = next[sl]
-            next[sl] = c + 1
-            if sl <= 8 {
-                // the stream is read LSB first: reverse the code
-                var r: u32 = 0
-                var k: usize = 0
-                while k < sl {
-                    r = (r << 1) | ((c >> (k as u32)) & 1)
-                    k = k + 1
-                }
-                var idx: u32 = r
-                let e: u16 = (((sl as u32) << 10) | (s as u32)) as u16
-                while idx < 256 {
-                    rt.st16(t, T_FAST + (idx as usize), e)
-                    idx = idx + ((1 as u32) << (sl as u32))
-                }
-            }
-        }
-        s = s + 1
-    }
-    return true
-}
-
-// ====================================================================
 // THE DECODER STATE AND THE BIT READER (LSB first)
 // ====================================================================
 
 struct BrDec {
-    src: common.Source,
+    b: bitio.Bits,
     out: rt.Buf,
     drained: usize,
-    bitbuf: u64,
-    bitcnt: usize,
-    padbits: usize,
     state: u32, // 0 stream header, 1 meta-block header, 2 commands of a compressed meta-block, 9 finished
     wbits: u32,
     window: usize,
@@ -227,7 +117,7 @@ struct BrDec {
 }
 
 fn dec_new(s: common.Source) -> BrDec {
-    var d: BrDec = BrDec { src: s, out: rt.buf_new(), drained: 0, bitbuf: 0, bitcnt: 0, padbits: 0, state: 0,
+    var d: BrDec = BrDec { b: bitio.bits_new(s), out: rt.buf_new(), drained: 0, state: 0,
         wbits: 0, window: 0, total: 0, max: 0, produced: 0, mlen: 0, is_last: false, nbt: [1; 3], bt: [0; 3],
         btlast: [0; 3], btprev: [1; 3], bl: [0; 3], tt: [0; 1590], tc: [0; 894], npostfix: 0, ndirect: 0,
         ctx_mode: [0; 256], cmap_l: [0; 16384], cmap_d: [0; 1024], ntrees_l: 0, ntrees_d: 0,
@@ -269,129 +159,45 @@ fn free_forests(d: *mut BrDec) {
 }
 
 fn brotli_dec_close(d: *mut BrDec) {
-    common.src_free(&(*d).src)
+    bitio.bits_free(&(*d).b)
     rt.buf_free(&(*d).out)
     free_forests(d)
 }
 
-// Refills to at least 57 bits; past the end of the input appends zero bits
-// (counted in `padbits`).
 fn fill(d: *mut BrDec) {
-    while (*d).bitcnt <= 56 {
-        let b: i32 = common.src_byte(&(*d).src)
-        if b < 0 {
-            (*d).padbits = (*d).padbits + 8
-        } else {
-            (*d).bitbuf = (*d).bitbuf | ((b as u64) << ((*d).bitcnt as u64))
-        }
-        (*d).bitcnt = (*d).bitcnt + 8
-    }
+    bitio.b_fill(&(*d).b)
 }
 
 // Were bits consumed that the input never had?
 fn exhausted(d: *mut BrDec) -> bool {
-    return (*d).bitcnt < (*d).padbits
+    return bitio.b_exhausted(&(*d).b)
 }
 
 // 0..32 bits.
 fn bits(d: *mut BrDec, n: usize) -> u32 {
-    if n == 0 {
-        return 0
-    }
-    if (*d).bitcnt < n {
-        fill(d)
-    }
-    let v: u64 = (*d).bitbuf & (((1 as u64) << (n as u64)) - 1)
-    (*d).bitbuf = (*d).bitbuf >> (n as u64)
-    (*d).bitcnt = (*d).bitcnt - n
-    return v as u32
+    return bitio.b_bits(&(*d).b, n)
 }
 
 fn bit(d: *mut BrDec) -> bool {
-    return bits(d, 1) != 0
+    return bitio.b_bits(&(*d).b, 1) != 0
 }
 
 // Discards the bits up to the next octet boundary; false if they were not zero.
 fn align(d: *mut BrDec) -> bool {
-    let r: usize = (*d).bitcnt % 8
-    if r == 0 {
-        return true
-    }
-    return bits(d, r) == 0
+    return bitio.b_align(&(*d).b)
 }
 
-// `n` whole octets (after `align`): first from the bit buffer, then the input.
 fn read_bytes(d: *mut BrDec, dst: u64, n: usize) -> bool {
-    var at: usize = 0
-    while at < n && (*d).bitcnt >= 8 {
-        rt.st8(dst, at, ((*d).bitbuf & 0xFF) as u8)
-        (*d).bitbuf = (*d).bitbuf >> 8
-        (*d).bitcnt = (*d).bitcnt - 8
-        at = at + 1
-    }
-    if exhausted(d) {
-        return false
-    }
-    if at < n {
-        // the padding the bit buffer may still hold is not data
-        (*d).padbits = 0
-        return common.src_read(&(*d).src, dst + at as u64, n - at) == n - at
-    }
-    return true
+    return bitio.b_read_bytes(&(*d).b, dst, n)
 }
 
 fn skip_bytes(d: *mut BrDec, n: usize) -> bool {
-    var left: usize = n
-    while left > 0 && (*d).bitcnt >= 8 {
-        (*d).bitbuf = (*d).bitbuf >> 8
-        (*d).bitcnt = (*d).bitcnt - 8
-        left = left - 1
-    }
-    if exhausted(d) {
-        return false
-    }
-    if left > 0 {
-        (*d).padbits = 0
-        return common.src_skip(&(*d).src, left) == left
-    }
-    return true
+    return bitio.b_skip_bytes(&(*d).b, n)
 }
 
-// One symbol of the tree at `t` (see build_tree); 0xFFFFFFFF on a bad code.
+// One symbol of the tree at `t`; 0xFFFFFFFF on a bad code.
 fn rd_sym(d: *mut BrDec, t: u64) -> u32 {
-    if (*d).bitcnt < 16 {
-        fill(d)
-    }
-    if rt.ld16(t, T_CNT) != 0 as u16 {
-        return rt.ld16(t, T_SYM) as u32
-    }
-    let e: u32 = rt.ld16(t, T_FAST + (((*d).bitbuf & 0xFF) as usize)) as u32
-    if e != 0 {
-        let l: u32 = e >> 10
-        (*d).bitbuf = (*d).bitbuf >> (l as u64)
-        (*d).bitcnt = (*d).bitcnt - (l as usize)
-        return e & 1023
-    }
-    var code: i32 = 0
-    var first: i32 = 0
-    var index: i32 = 0
-    var len: usize = 1
-    var b: u64 = (*d).bitbuf
-    while len < 16 {
-        code = code | ((b & 1) as i32)
-        b = b >> 1
-        let c: i32 = rt.ld16(t, T_CNT + len) as i32
-        if code - c < first {
-            (*d).bitbuf = (*d).bitbuf >> (len as u64)
-            (*d).bitcnt = (*d).bitcnt - len
-            return rt.ld16(t, T_SYM + ((index + (code - first)) as usize)) as u32
-        }
-        index = index + c
-        first = (first + c) << 1
-        code = code << 1
-        len = len + 1
-    }
-    return 0xFFFFFFFF
+    return bitio.tree_sym(&(*d).b, t)
 }
 
 // ====================================================================
@@ -399,7 +205,7 @@ fn rd_sym(d: *mut BrDec, t: u64) -> u32 {
 // ====================================================================
 
 // Reads the description of a code over `alpha` symbols and builds its tree
-// at `dst` (which has room for tree_size(alpha) octets).
+// at `dst` (which has room for bitio.tree_size(alpha) octets).
 #[allow_escape]
 fn read_code(d: *mut BrDec, alpha: usize, dst: u64) -> CompressError!bool {
     var lens: [u8; 704] = [0; 704]
@@ -458,7 +264,7 @@ fn read_code(d: *mut BrDec, alpha: usize, dst: u64) -> CompressError!bool {
         if exhausted(d) {
             return CompressError::Truncated
         }
-        if !build_tree(dst, (&lens[0]) as u64, alpha) {
+        if !bitio.build_tree(dst, (&lens[0]) as u64, alpha) {
             return CompressError::Data
         }
         return true
@@ -469,14 +275,10 @@ fn read_code(d: *mut BrDec, alpha: usize, dst: u64) -> CompressError!bool {
     var ncodes: usize = 0
     var i: usize = hskip
     while i < 18 {
-        if (*d).bitcnt < 8 {
-            fill(d)
-        }
-        let v4: usize = ((*d).bitbuf & 15) as usize
+        let v4: usize = bitio.b_peek(&(*d).b, 4) as usize
         let n: usize = CL_LEN[v4] as usize
         let val: u8 = CL_VAL[v4]
-        (*d).bitbuf = (*d).bitbuf >> (n as u64)
-        (*d).bitcnt = (*d).bitcnt - n
+        bitio.b_drop(&(*d).b, n)
         clen[CL_ORDER[i] as usize] = val
         if val != 0 as u8 {
             space = space - (32 >> (val as i32))
@@ -494,7 +296,7 @@ fn read_code(d: *mut BrDec, alpha: usize, dst: u64) -> CompressError!bool {
         return CompressError::Data
     }
     var ctree: [u16; 290] = [0; 290]
-    if !build_tree((&ctree[0]) as u64, (&clen[0]) as u64, 18) {
+    if !bitio.build_tree((&ctree[0]) as u64, (&clen[0]) as u64, 18) {
         return CompressError::Data
     }
     // the code lengths of the alphabet
@@ -549,7 +351,7 @@ fn read_code(d: *mut BrDec, alpha: usize, dst: u64) -> CompressError!bool {
     if sp != 0 {
         return CompressError::Data
     }
-    if !build_tree(dst, (&lens[0]) as u64, alpha) {
+    if !bitio.build_tree(dst, (&lens[0]) as u64, alpha) {
         return CompressError::Data
     }
     return true
@@ -785,9 +587,9 @@ fn read_compressed_header(d: *mut BrDec) -> CompressError!bool {
     }
     // the prefix codes
     (*d).dist_alpha = 16 + (*d).ndirect + (48 << (*d).npostfix)
-    (*d).fl_size = (*d).ntrees_l * tree_size(256)
-    (*d).fi_size = (*d).nbt[1] * tree_size(704)
-    (*d).fd_size = (*d).ntrees_d * tree_size((*d).dist_alpha)
+    (*d).fl_size = (*d).ntrees_l * bitio.tree_size(256)
+    (*d).fi_size = (*d).nbt[1] * bitio.tree_size(704)
+    (*d).fd_size = (*d).ntrees_d * bitio.tree_size((*d).dist_alpha)
     (*d).forest_l = rt.heap_alloc((*d).fl_size)
     (*d).forest_i = rt.heap_alloc((*d).fi_size)
     (*d).forest_d = rt.heap_alloc((*d).fd_size)
@@ -796,21 +598,21 @@ fn read_compressed_header(d: *mut BrDec) -> CompressError!bool {
     }
     i = 0
     while i < (*d).ntrees_l {
-        if !(try read_code(d, 256, (*d).forest_l + (i * tree_size(256)) as u64)) {
+        if !(try read_code(d, 256, (*d).forest_l + (i * bitio.tree_size(256)) as u64)) {
             return CompressError::Data
         }
         i = i + 1
     }
     i = 0
     while i < (*d).nbt[1] {
-        if !(try read_code(d, 704, (*d).forest_i + (i * tree_size(704)) as u64)) {
+        if !(try read_code(d, 704, (*d).forest_i + (i * bitio.tree_size(704)) as u64)) {
             return CompressError::Data
         }
         i = i + 1
     }
     i = 0
     while i < (*d).ntrees_d {
-        if !(try read_code(d, (*d).dist_alpha, (*d).forest_d + (i * tree_size((*d).dist_alpha)) as u64)) {
+        if !(try read_code(d, (*d).dist_alpha, (*d).forest_d + (i * bitio.tree_size((*d).dist_alpha)) as u64)) {
             return CompressError::Data
         }
         i = i + 1
@@ -871,7 +673,7 @@ fn run_commands(d: *mut BrDec, out: *mut rt.Buf) -> CompressError!bool {
             try block_switch(d, 1)
         }
         (*d).bl[1] = (*d).bl[1] - 1
-        let cmd: u32 = rd_sym(d, (*d).forest_i + ((*d).bt[1] * tree_size(704)) as u64)
+        let cmd: u32 = rd_sym(d, (*d).forest_i + ((*d).bt[1] * bitio.tree_size(704)) as u64)
         if cmd == 0xFFFFFFFF {
             return CompressError::Data
         }
@@ -909,7 +711,7 @@ fn run_commands(d: *mut BrDec, out: *mut rt.Buf) -> CompressError!bool {
             let cb: u64 = ctxbase + (mode * 512) as u64
             let cid: usize = (rt.ld8(cb, p1 as usize) as usize) | (rt.ld8(cb + 256, p2 as usize) as usize)
             let tree: usize = (*d).cmap_l[((*d).bt[0] << 6) + cid] as usize
-            let lit: u32 = rd_sym(d, (*d).forest_l + (tree * tree_size(256)) as u64)
+            let lit: u32 = rd_sym(d, (*d).forest_l + (tree * bitio.tree_size(256)) as u64)
             if lit == 0xFFFFFFFF {
                 return CompressError::Data
             }
@@ -945,7 +747,7 @@ fn run_commands(d: *mut BrDec, out: *mut rt.Buf) -> CompressError!bool {
                 dctx = cpy - 2
             }
             let tree: usize = (*d).cmap_d[((*d).bt[2] << 2) + dctx] as usize
-            let dc: u32 = rd_sym(d, (*d).forest_d + (tree * tree_size((*d).dist_alpha)) as u64)
+            let dc: u32 = rd_sym(d, (*d).forest_d + (tree * bitio.tree_size((*d).dist_alpha)) as u64)
             if dc == 0xFFFFFFFF {
                 return CompressError::Data
             }
@@ -1056,7 +858,7 @@ fn run_commands(d: *mut BrDec, out: *mut rt.Buf) -> CompressError!bool {
 }
 
 fn bad_input(d: *mut BrDec) -> CompressError {
-    if common.src_failed(&(*d).src) {
+    if common.src_failed(&(*d).b.src) {
         return CompressError::Io
     }
     return CompressError::Truncated
@@ -1239,4 +1041,22 @@ fn brotli_dec_read(d: *mut BrDec, dst: u64, n: usize) -> CompressError!usize {
         (*d).drained = (*d).drained + k
     }
     return k
+}
+
+fn brotli_dec_open_source(s: common.Source) -> BrDec {
+    return dec_new(s)
+}
+
+struct BrDecPair {
+    a: BrDec,
+    b: BrDec,
+}
+
+// The size of a decoder in octets (the step between two of them in a pair).
+fn brotli_dec_size() -> usize {
+    var p: BrDecPair = BrDecPair { a: dec_new(common.src_mem(0, 0)), b: dec_new(common.src_mem(0, 0)) }
+    let sz: usize = ((&p.b) as usize) - ((&p.a) as usize)
+    brotli_dec_close(&p.a)
+    brotli_dec_close(&p.b)
+    return sz
 }

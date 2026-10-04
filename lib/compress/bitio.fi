@@ -1,0 +1,267 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/compress/bitio.fi -- a bit reader (least significant bit first, the
+// order of DEFLATE and Brotli) over a `common.Source`, and canonical prefix
+// code trees with a one octet lookup table, shared by compress.brotli and
+// compress.gzip.
+//
+// THE READER keeps up to 64 bits; past the end of the input it supplies zero
+// bits and counts them (`padbits`), so a decoder checks `b_exhausted` at
+// convenient points instead of threading an error through every bit. THE TREE
+// of a code with `alpha` symbols is stored in tree_size(alpha) octets at an
+// address the caller owns: 16 u16 counts per code length, 256 u16 lookup
+// entries for codes up to 8 bits ((length << 10) | symbol; 0 = longer), and the
+// symbols in (length, value) order for the bit-by-bit fall-back. A code with a
+// single symbol has count[0] = 1 and costs no bits.
+import std.rt
+import compress.common
+
+export {
+    Bits, bits_new, bits_free, b_fill, b_exhausted, b_bits, b_peek, b_drop, b_align, b_read_bytes, b_skip_bytes,
+    tree_size, build_tree, tree_sym,
+    T_CNT, T_FAST, T_SYM,
+}
+
+struct Bits {
+    src: common.Source,
+    bitbuf: u64,
+    bitcnt: usize,
+    padbits: usize,
+}
+
+fn bits_new(s: common.Source) -> Bits {
+    return Bits { src: s, bitbuf: 0, bitcnt: 0, padbits: 0 }
+}
+
+fn bits_free(b: *mut Bits) {
+    common.src_free(&(*b).src)
+}
+
+// Refills to at least 57 bits.
+fn b_fill(b: *mut Bits) {
+    while (*b).bitcnt <= 56 {
+        let v: i32 = common.src_byte(&(*b).src)
+        if v < 0 {
+            (*b).padbits = (*b).padbits + 8
+        } else {
+            (*b).bitbuf = (*b).bitbuf | ((v as u64) << ((*b).bitcnt as u64))
+        }
+        (*b).bitcnt = (*b).bitcnt + 8
+    }
+}
+
+// Were bits consumed that the input never had?
+fn b_exhausted(b: *mut Bits) -> bool {
+    return (*b).bitcnt < (*b).padbits
+}
+
+// 0..32 bits.
+fn b_bits(b: *mut Bits, n: usize) -> u32 {
+    if n == 0 {
+        return 0
+    }
+    if (*b).bitcnt < n {
+        b_fill(b)
+    }
+    let v: u64 = (*b).bitbuf & (((1 as u64) << (n as u64)) - 1)
+    (*b).bitbuf = (*b).bitbuf >> (n as u64)
+    (*b).bitcnt = (*b).bitcnt - n
+    return v as u32
+}
+
+// The next `n` (<= 32) bits without consuming them.
+fn b_peek(b: *mut Bits, n: usize) -> u32 {
+    if (*b).bitcnt < n {
+        b_fill(b)
+    }
+    return ((*b).bitbuf & (((1 as u64) << (n as u64)) - 1)) as u32
+}
+
+fn b_drop(b: *mut Bits, n: usize) {
+    (*b).bitbuf = (*b).bitbuf >> (n as u64)
+    (*b).bitcnt = (*b).bitcnt - n
+}
+
+// Discards the bits up to the next octet boundary; false if they were not zero.
+fn b_align(b: *mut Bits) -> bool {
+    let r: usize = (*b).bitcnt % 8
+    if r == 0 {
+        return true
+    }
+    return b_bits(b, r) == 0
+}
+
+// `n` whole octets (after `b_align`): first from the bit buffer, then the input.
+fn b_read_bytes(b: *mut Bits, dst: u64, n: usize) -> bool {
+    var at: usize = 0
+    while at < n && (*b).bitcnt >= 8 {
+        rt.st8(dst, at, ((*b).bitbuf & 0xFF) as u8)
+        (*b).bitbuf = (*b).bitbuf >> 8
+        (*b).bitcnt = (*b).bitcnt - 8
+        at = at + 1
+    }
+    if b_exhausted(b) {
+        return false
+    }
+    if at < n {
+        return common.src_read(&(*b).src, dst + at as u64, n - at) == n - at
+    }
+    return true
+}
+
+fn b_skip_bytes(b: *mut Bits, n: usize) -> bool {
+    var left: usize = n
+    while left > 0 && (*b).bitcnt >= 8 {
+        (*b).bitbuf = (*b).bitbuf >> 8
+        (*b).bitcnt = (*b).bitcnt - 8
+        left = left - 1
+    }
+    if b_exhausted(b) {
+        return false
+    }
+    if left > 0 {
+        return common.src_skip(&(*b).src, left) == left
+    }
+    return true
+}
+
+const T_CNT: usize = 0
+const T_FAST: usize = 16
+const T_SYM: usize = 272
+
+fn tree_size(alpha: usize) -> usize {
+    return (T_SYM + alpha) * 2
+}
+
+// Builds a tree from code lengths (one per symbol). Returns false when the
+// lengths do not form a complete code (except the one-symbol case).
+fn build_tree(t: u64, lens: u64, alpha: usize) -> bool {
+    var cnt: [u32; 16] = [0; 16]
+    var nz: usize = 0
+    var last: usize = 0
+    var s: usize = 0
+    while s < alpha {
+        let l: usize = rt.ld8(lens, s) as usize
+        if l > 0 {
+            cnt[l] = cnt[l] + 1
+            nz = nz + 1
+            last = s
+        }
+        s = s + 1
+    }
+    var i: usize = 0
+    while i < 16 {
+        rt.st16(t, T_CNT + i, 0 as u16)
+        i = i + 1
+    }
+    i = 0
+    while i < 256 {
+        rt.st16(t, T_FAST + i, 0 as u16)
+        i = i + 1
+    }
+    if nz == 0 {
+        return false
+    }
+    if nz == 1 {
+        rt.st16(t, T_CNT, 1 as u16)
+        rt.st16(t, T_SYM, last as u16)
+        return true
+    }
+    // complete?
+    var left: i32 = 1
+    var l: usize = 1
+    while l < 16 {
+        left = left * 2 - (cnt[l] as i32)
+        if left < 0 {
+            return false
+        }
+        l = l + 1
+    }
+    if left != 0 {
+        return false
+    }
+    var offs: [u32; 17] = [0; 17]
+    l = 1
+    while l < 16 {
+        offs[l + 1] = offs[l] + cnt[l]
+        rt.st16(t, T_CNT + l, cnt[l] as u16)
+        l = l + 1
+    }
+    // symbols in (length, value) order, and the canonical codes for the fast table
+    var next: [u32; 17] = [0; 17]
+    var code: u32 = 0
+    l = 1
+    while l < 16 {
+        code = (code + cnt[l - 1]) << 1
+        if l == 1 {
+            code = 0
+        }
+        next[l] = code
+        l = l + 1
+    }
+    s = 0
+    while s < alpha {
+        let sl: usize = rt.ld8(lens, s) as usize
+        if sl > 0 {
+            let pos: u32 = offs[sl]
+            offs[sl] = pos + 1
+            rt.st16(t, T_SYM + (pos as usize), s as u16)
+            let c: u32 = next[sl]
+            next[sl] = c + 1
+            if sl <= 8 {
+                // the stream is read LSB first: reverse the code
+                var r: u32 = 0
+                var k: usize = 0
+                while k < sl {
+                    r = (r << 1) | ((c >> (k as u32)) & 1)
+                    k = k + 1
+                }
+                var idx: u32 = r
+                let e: u16 = (((sl as u32) << 10) | (s as u32)) as u16
+                while idx < 256 {
+                    rt.st16(t, T_FAST + (idx as usize), e)
+                    idx = idx + ((1 as u32) << (sl as u32))
+                }
+            }
+        }
+        s = s + 1
+    }
+    return true
+}
+
+
+// One symbol of the tree at `t`; 0xFFFFFFFF on a bad code.
+fn tree_sym(b: *mut Bits, t: u64) -> u32 {
+    if (*b).bitcnt < 16 {
+        b_fill(b)
+    }
+    if rt.ld16(t, T_CNT) != 0 as u16 {
+        return rt.ld16(t, T_SYM) as u32
+    }
+    let e: u32 = rt.ld16(t, T_FAST + (((*b).bitbuf & 0xFF) as usize)) as u32
+    if e != 0 {
+        let l: u32 = e >> 10
+        (*b).bitbuf = (*b).bitbuf >> (l as u64)
+        (*b).bitcnt = (*b).bitcnt - (l as usize)
+        return e & 1023
+    }
+    var code: i32 = 0
+    var first: i32 = 0
+    var index: i32 = 0
+    var len: usize = 1
+    var v: u64 = (*b).bitbuf
+    while len < 16 {
+        code = code | ((v & 1) as i32)
+        v = v >> 1
+        let c: i32 = rt.ld16(t, T_CNT + len) as i32
+        if code - c < first {
+            (*b).bitbuf = (*b).bitbuf >> (len as u64)
+            (*b).bitcnt = (*b).bitcnt - len
+            return rt.ld16(t, T_SYM + ((index + (code - first)) as usize)) as u32
+        }
+        index = index + c
+        first = (first + c) << 1
+        code = code << 1
+        len = len + 1
+    }
+    return 0xFFFFFFFF
+}
