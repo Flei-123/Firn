@@ -1621,7 +1621,7 @@ if [ "$ASRC" -eq 0 ]; then
 else
     bad "tools/async/run.sh failed (see .test-work/async.log)"
     grep -E 'FAIL' "$WORK/async.log" | head -12 | sed 's/^/   /'
-echo "== 77. packaging: installers, packages, icons (tools/pack/, lib/pack/, docs/PACKAGING.md) =="
+echo "== 78. packaging: installers, packages, icons (tools/pack/, lib/pack/, docs/PACKAGING.md) =="
 # lib/pack's unit tests are in tests/2200-2203 (section 3): the shortcut writer, the icon formats, the
 # installer payload, a whole install / upgrade / uninstall without Windows. Here: tools/pack/test/run.sh
 # builds the Firn parts (icons tool, installer stub, self-extract stub) and runs checks.py -- every writer

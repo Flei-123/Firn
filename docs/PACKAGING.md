@@ -210,7 +210,7 @@ This is a second layer next to the catalog signature `store add-app` makes -- it
 | `tools/pack/test/android.sh` | a project from `newapp.sh` -> signed APK: package id, version code, adaptive launcher icon, mipmaps, v3 signature, both ABIs (SDK/NDK needed) |
 | `tools/pack/test/windows.sh` | under Wine (65 checks): installer, shortcuts (own reader **and** Wine's shell), registry, upgrade, `sync_version`, uninstall (+ leftovers), the windows (xdotool, screenshots), cancel, the error window, NSIS setup, portable zip, the template window |
 
-`test.sh` section 77 runs the unit tests (via the normal list) and `tools/pack/test/run.sh`; `PACK_WINE=1` adds the Wine run.
+`test.sh` section 78 runs the unit tests (via the normal list) and `tools/pack/test/run.sh`; `PACK_WINE=1` adds the Wine run.
 
 ## 10. Honest list of what is not done / not seen
 
