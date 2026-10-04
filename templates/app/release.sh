@@ -89,8 +89,8 @@ add_apk() {   # an APK is read by `store add` itself (package name, version code
 IFS=, read -ra LIST <<<"$PLATFORMS"
 for p in "${LIST[@]}"; do
     case "$p" in
-        linux)   bash build.sh;          add bin build/@ID@ linux-x86_64 ;;
-        windows) bash build-windows.sh;  add exe build/@ID@.exe windows-x86_64 ;;
+        linux)   bash build.sh;          add bin linux-x86_64 build/@ID@ ;;
+        windows) bash build-windows.sh;  add exe windows-x86_64 build/@ID@.exe ;;
         android) bash build-android.sh;  add_apk build/@ID@.apk ;;
         *) echo "unknown platform $p (linux, windows, android)" >&2; exit 2 ;;
     esac
