@@ -1608,6 +1608,21 @@ else
     grep -E 'FAIL' "$WORK"/appkit_*.log | head -12 | sed 's/^/   /'
 fi
 
+echo "== 77. async IO: a thousand connections, a window and the loop, real wss (tools/async/run.sh) =="
+# tests/2120-2125 (section 3) are the in-process half: the loop (epoll and poll), streams, TLS,
+# the HTTP client, the WebSocket client, posting from threads. Here: 1000 connections held
+# against Python asyncio in both directions, the window + loop probe on an Xvfb, the WebSocket
+# client against real wss:// echo services (skipped without a route), and the Windows build
+# under Wine (skipped without Wine/mingw).
+bash tools/async/run.sh > "$WORK/async.log" 2>&1 && ASRC=0 || ASRC=$?
+if [ "$ASRC" -eq 0 ]; then
+    ok
+    grep -E '^(conn:|ui:|ASYNC)|^  (ok|skip)   .*(wss|connections)' "$WORK/async.log" | sed 's/^/   /' | head -12
+else
+    bad "tools/async/run.sh failed (see .test-work/async.log)"
+    grep -E 'FAIL' "$WORK/async.log" | head -12 | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

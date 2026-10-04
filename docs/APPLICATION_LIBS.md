@@ -71,6 +71,28 @@ general. Each has a positive test in `tests/` or a check in `tools/fui/run.sh`.
 | `lib/fui/markdownview.fi` | a scrolling Markdown view: wrapped text, headings, lists, quotes, code, tables, task boxes, links with a click callback, images through an async hook (placeholder, ready, failed) | `tools/fui/mdview_main.fi`: pixels in light and dark, wide and narrow, WCAG 2 contrast |
 | `lib/fui/kit.fi`, `lib/fui/kitcolor.fi` (`docs/fui-kit.md`) | button, toasts, modal with focus trap, tab bar and sidebar with symbols, tile grid with avatars, search field with clear button, progress bar with a label that reads on fill and track; the launcher accent as readable text on any ground | `tools/fui/kit_main.fi` (pixels, hit functions, focus ring, icon-free variants, every colour pair), `tools/fui/kitlive.py` (the example in a real window on Xvfb) |
 
+## Async IO (round ASYNC)
+
+One thread for many connections: an event loop with timers, non-blocking TCP
+and TLS streams, an HTTP client and a WebSocket client that run on it, a way to
+hand results from other threads to the UI thread, and a wait that serves a
+window and the loop together. Design, API, what was proved against what, and
+the honest list of gaps: [ASYNC.md](ASYNC.md).
+
+| module | what it does | held against |
+|---|---|---|
+| `async.loop` (`lib/async/loop.fi`) | descriptors (epoll on Linux x86-64/AArch64, `poll` everywhere, `select` through the Windows seam), timers in a heap, deferred calls, `wake` from threads, hooks, a descriptor to embed in another wait (`loop_fd`) | the kernel; 4 build levels, AArch64 (qemu), Windows (Wine) (`tests/2120`) |
+| `async.stream` | non-blocking TCP and TLS-client streams with one callback, input kept until consumed, output queue and back pressure, one lazy timeout per stream, an acceptor | echo with 120 clients, refused connect, idle timeout, 4 MiB through a closed window (`tests/2121`); **1000 connections open at once against Python asyncio**, both directions (`tools/async/check_conn.py`) |
+| `tls.tls` (additions) | the client handshake as a state machine (`tls_handshake_step`, `WouldBlock`), buffered output; the blocking `tls_handshake` runs the same code in a loop | an in-process TLS server that dribbles 1-7 octets per ms, wrong name and unknown CA (`tests/2122`); the blocking suites (`tools/tls/run.sh`) unchanged |
+| `async.ahttp` | HTTP/1.1 client on the loop over `net.http`'s request/head/cookie/gzip code: Content-Length, chunked, until-close, redirects, timeouts, https | 100 requests at once, dribbled chunked, redirect loop, gzip, cookies (`tests/2123`) |
+| `async.wsc` (+ `ws.ws` additions) | WebSocket client: ws/wss, ping/pong, keep-alive, fragmentation both ways, closing handshake with timeout, reconnect with backoff | an in-process server (and `tls_server.fi`) with every violation the codec knows (`tests/2124`); **real wss:// echo services** (`tools/async/wss_main.fi`) |
+| `async.post` | `post` from any thread to the loop thread, a bridge that runs blocking work on `std.pool` and answers on the loop thread | 4 threads x 500 posts in order, GC on workers while the loop sleeps, 25 stress runs (`tests/2125`) |
+| `std.net` (additions) | `set_nonblocking`, `read_nb`/`write_nb`/`accept_nb`, `connect_nb` + `connect_finish`, `sock_error` | all of the above |
+| `window.wait_any_fd`, `fuiwin.window_wait_many_fd` | wait for window events and a descriptor (the loop's) at once; a window with an event wins | a window + loop on an Xvfb: results arrive with no window event, an idle second costs no CPU (`tools/async/check_ui.py`) |
+
+`bash tools/async/run.sh` runs the outside checks (test.sh section 77);
+`bash tools/async/winkit.sh` builds the kit for a real Windows machine.
+
 ## The application kit (appkit)
 
 A new Firn program should get updates from the own signed store, settings, a
