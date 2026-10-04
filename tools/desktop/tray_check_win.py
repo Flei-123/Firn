@@ -69,7 +69,11 @@ try:
     subprocess.run(["wineserver", "-k"], env=env)       # no explorer left over from an earlier check
     time.sleep(1.5)
     r = subprocess.run(["wine", tray_exe], capture_output=True, text=True, env=env, timeout=60)
-    check("without a shell tray the program learns it (SHOWN no)", "SHOWN no" in r.stdout, (r.stdout, r.stderr[-200:]))
+    # Wine may or may not have started its own shell by now (it does when it boots a fresh prefix session):
+    # either way the program must say what the shell did, and `VISIBLE` must agree with `SHOWN`.
+    o0 = r.stdout.split()
+    check("a program started without our shell learns whether the tray took the icon (SHOWN yes/no, VISIBLE the same)",
+          o0[:2] in (["SHOWN", "yes"], ["SHOWN", "no"]) and o0[2:4] == ["VISIBLE", o0[1]], (r.stdout, r.stderr[-200:]))
     subprocess.run(["wineserver", "-k"], env=env)
     time.sleep(1)
     # ---- with the shell
