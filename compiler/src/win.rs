@@ -380,12 +380,8 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("waveOutRestart", "WINMM.dll", 1),
     ("waveOutGetNumDevs", "WINMM.dll", 0),
     ("waveOutGetPosition", "WINMM.dll", 3),
-    ("RegCreateKeyExW", "ADVAPI32.dll", 9),
-    ("RegOpenKeyExW", "ADVAPI32.dll", 5),
-    ("RegSetValueExW", "ADVAPI32.dll", 6),
     ("RegQueryValueExW", "ADVAPI32.dll", 6),
     ("RegDeleteValueW", "ADVAPI32.dll", 2),
-    ("RegCloseKey", "ADVAPI32.dll", 1),
 ];
 
 /// DLL and arity of a known Win32 function.
