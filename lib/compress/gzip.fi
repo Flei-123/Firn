@@ -1,0 +1,766 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/compress/gzip.fi -- a STREAMING inflater: raw DEFLATE (RFC 1951), zlib
+// (RFC 1950) and gzip (RFC 1952, several members in a row), with the same
+// interface and bounded memory as the other decoders of lib/compress. (The
+// whole-buffer inflater and the deflate/gzip ENCODER stay in std.deflate; this
+// file exists so that `compress.auto` can read every format from a file
+// descriptor or a socket without holding it, and so that .tar.gz can be
+// unpacked in a stream.)
+//
+//     import compress.gzip
+//     var d: gzip.GzDec = gzip.gz_dec_open_fd(fd, gzip.GZ_AUTO)
+//     let k: usize = gzip.gz_dec_read(&d, buf, 65536) catch |e| ...   // 0 = end
+//     gzip.gz_dec_close(&d)
+//     gzip.gz_decompress_limited(p, n, gzip.GZ_GZIP, 1 << 30, &out) catch |e| ...
+//
+// The decoder produces output one slice (~64 KiB) at a time and keeps only the
+// 32 KiB window. A bad stored-block length, an over- or under-subscribed code
+// where DEFLATE does not allow one, a distance in front of the output, a
+// wrong CRC-32/ISIZE/Adler-32 are `Data`/`Checksum`; a cut stream is
+// `Truncated`; output past `max` is `TooLarge` and is never written.
+//
+// HONEST
+//   G1 Bytes after the last gzip member that are neither zero padding nor
+//      another member are `Format` (gzip(1) warns and carries on).
+//   G2 zlib streams with a preset dictionary (FDICT) are refused as `Format`.
+//   G3 Raw DEFLATE ends at its final block; whatever follows is not looked at.
+import std.rt
+import std.deflate
+import compress.common
+import compress.bitio
+
+export {
+    GzDec, gz_dec_open_source, gz_dec_size, gz_dec_open_mem, gz_dec_open_fd, gz_dec_read, gz_dec_close, gz_dec_set_limit,
+    gz_decompress, gz_decompress_limited,
+    GZ_AUTO, GZ_GZIP, GZ_ZLIB, GZ_RAW,
+}
+
+const GZ_AUTO: u32 = 0
+const GZ_GZIP: u32 = 1
+const GZ_ZLIB: u32 = 2
+const GZ_RAW: u32 = 3
+const SLICE: usize = 65536
+const WIN: usize = 32768
+
+static LBASE: [u16; 29] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99,
+    115, 131, 163, 195, 227, 258]
+static LEXT: [u8; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+static DBASE: [u16; 30] = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025,
+    1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+static DEXT: [u8; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
+    13, 13]
+static CLORDER: [u8; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+struct GzDec {
+    b: bitio.Bits,
+    out: rt.Buf,
+    drained: usize,
+    kind: u32, // GZ_*
+    state: u32, // 0 member header, 1 block header, 2 stored, 3 huffman, 4 trailer, 9 finished
+    members: u32,
+    last: bool, // the current block is the final one
+    left: usize, // octets left in a stored block
+    nodist: bool, // the block's distance code is empty
+    lt: [u16; 1120], // literal/length tree (alphabet 288)
+    dt: [u16; 640], // distance tree (alphabet 32)
+    crc: u32, // running CRC-32 of the member's output (not inverted)
+    ctab: common.Crc32,
+    adler: u32,
+    mlen: u64, // member output size
+    max: usize,
+    produced: usize,
+    total: u64,
+}
+
+fn dec_new(s: common.Source, kind: u32) -> GzDec {
+    return GzDec { b: bitio.bits_new(s), out: rt.buf_new(), drained: 0, kind: kind, state: 0, members: 0,
+        last: false, left: 0, nodist: false, lt: [0; 1120], dt: [0; 640], crc: 0, ctab: common.crc32_new(),
+        adler: 1, mlen: 0, max: 0, produced: 0, total: 0 }
+}
+
+fn gz_dec_open_mem(p: u64, n: usize, kind: u32) -> GzDec {
+    return dec_new(common.src_mem(p, n), kind)
+}
+
+fn gz_dec_open_fd(fd: i64, kind: u32) -> GzDec {
+    return dec_new(common.src_fd(fd), kind)
+}
+
+fn gz_dec_set_limit(d: *mut GzDec, max: usize) {
+    (*d).max = max
+}
+
+fn gz_dec_close(d: *mut GzDec) {
+    bitio.bits_free(&(*d).b)
+    rt.buf_free(&(*d).out)
+}
+
+fn bad_input(d: *mut GzDec) -> CompressError {
+    if common.src_failed(&(*d).b.src) {
+        return CompressError::Io
+    }
+    return CompressError::Truncated
+}
+
+// A whole octet from the bit reader (the header and trailer are octet
+// oriented; the reader must be on an octet boundary).
+fn rd8(d: *mut GzDec) -> i32 {
+    let v: u32 = bitio.b_bits(&(*d).b, 8)
+    if bitio.b_exhausted(&(*d).b) {
+        return -1
+    }
+    return v as i32
+}
+
+// ---------------------------------------------------------------- headers
+
+// The gzip member header; verifies the optional header CRC. false = EOF.
+fn read_gzip_header(d: *mut GzDec, first: u32) -> CompressError!bool {
+    var hdr: [u8; 10] = [0; 10]
+    hdr[0] = first as u8
+    var i: usize = 1
+    while i < 10 {
+        let v: i32 = rd8(d)
+        if v < 0 {
+            return bad_input(d)
+        }
+        hdr[i] = v as u8
+        i = i + 1
+    }
+    if hdr[0] != 0x1F as u8 || hdr[1] != 0x8B as u8 {
+        return CompressError::Format
+    }
+    if hdr[2] != 8 as u8 {
+        return CompressError::Format
+    }
+    let flg: u32 = hdr[3] as u32
+    if (flg & 0xE0) != 0 {
+        return CompressError::Format
+    }
+    var tab: deflate.CrcTable = deflate.crc_table()
+    var crc: u32 = deflate.crc32_more(&tab, 0, (&hdr[0]) as u64, 10)
+    if (flg & 4) != 0 {
+        let a: i32 = rd8(d)
+        let b: i32 = rd8(d)
+        if a < 0 || b < 0 {
+            return bad_input(d)
+        }
+        var two: [u8; 2] = [a as u8, b as u8]
+        crc = deflate.crc32_more(&tab, crc, (&two[0]) as u64, 2)
+        var n: usize = (a as usize) + ((b as usize) << 8)
+        while n > 0 {
+            let v: i32 = rd8(d)
+            if v < 0 {
+                return bad_input(d)
+            }
+            var one: [u8; 1] = [v as u8]
+            crc = deflate.crc32_more(&tab, crc, (&one[0]) as u64, 1)
+            n = n - 1
+        }
+    }
+    var f: u32 = 8
+    while f <= 16 {
+        if (flg & f) != 0 {
+            while true {
+                let v: i32 = rd8(d)
+                if v < 0 {
+                    return bad_input(d)
+                }
+                var one: [u8; 1] = [v as u8]
+                crc = deflate.crc32_more(&tab, crc, (&one[0]) as u64, 1)
+                if v == 0 {
+                    break
+                }
+            }
+        }
+        f = f * 2
+    }
+    if (flg & 2) != 0 {
+        let a: i32 = rd8(d)
+        let b: i32 = rd8(d)
+        if a < 0 || b < 0 {
+            return bad_input(d)
+        }
+        if ((a as u32) | ((b as u32) << 8)) != (crc & 0xFFFF) {
+            return CompressError::Checksum
+        }
+    }
+    return true
+}
+
+fn read_zlib_header(d: *mut GzDec, first: u32) -> CompressError!bool {
+    let flg: i32 = rd8(d)
+    if flg < 0 {
+        return bad_input(d)
+    }
+    if (first & 15) != 8 || (first >> 4) > 7 {
+        return CompressError::Format
+    }
+    if (first * 256 + (flg as u32)) % 31 != 0 {
+        return CompressError::Format
+    }
+    if ((flg as u32) & 32) != 0 {
+        return CompressError::Format // FDICT
+    }
+    return true
+}
+
+// ----------------------------------------------------------- the DEFLATE blocks
+
+// A code with exactly one symbol, of length 1, gets a second symbol (the last
+// of the alphabet, never a valid one) so that it is complete.
+fn fix_single(lens: u64, alpha: usize) {
+    var nz: usize = 0
+    var one: bool = false
+    var i: usize = 0
+    while i < alpha {
+        let l: u8 = rt.ld8(lens, i)
+        if l != 0 as u8 {
+            nz = nz + 1
+            one = l == 1 as u8
+        }
+        i = i + 1
+    }
+    if nz == 1 && one {
+        rt.st8(lens, alpha - 1, 1 as u8)
+    }
+}
+
+// Reads the code lengths of a dynamic block and builds both trees.
+#[allow_escape]
+fn read_dynamic(d: *mut GzDec) -> CompressError!bool {
+    let hlit: usize = (bitio.b_bits(&(*d).b, 5) as usize) + 257
+    let hdist: usize = (bitio.b_bits(&(*d).b, 5) as usize) + 1
+    let hclen: usize = (bitio.b_bits(&(*d).b, 4) as usize) + 4
+    if bitio.b_exhausted(&(*d).b) {
+        return bad_input(d)
+    }
+    if hlit > 286 || hdist > 30 {
+        return CompressError::Data
+    }
+    var cl: [u8; 19] = [0; 19]
+    var i: usize = 0
+    while i < hclen {
+        cl[CLORDER[i] as usize] = bitio.b_bits(&(*d).b, 3) as u8
+        i = i + 1
+    }
+    var ct: [u16; 300] = [0; 300]
+    var cnz: usize = 0
+    i = 0
+    while i < 19 {
+        if cl[i] != 0 as u8 {
+            cnz = cnz + 1
+        }
+        i = i + 1
+    }
+    if cnz < 2 || !bitio.build_tree((&ct[0]) as u64, (&cl[0]) as u64, 19) {
+        return CompressError::Data
+    }
+    var lens: [u8; 320] = [0; 320]
+    var n: usize = 0
+    while n < hlit + hdist {
+        let s: u32 = bitio.tree_sym(&(*d).b, (&ct[0]) as u64)
+        if s == 0xFFFFFFFF {
+            return CompressError::Data
+        }
+        if bitio.b_exhausted(&(*d).b) {
+            return bad_input(d)
+        }
+        if s < 16 {
+            lens[n] = s as u8
+            n = n + 1
+        } else {
+            var rep: usize = 0
+            var val: u8 = 0
+            if s == 16 {
+                if n == 0 {
+                    return CompressError::Data
+                }
+                val = lens[n - 1]
+                rep = 3 + (bitio.b_bits(&(*d).b, 2) as usize)
+            } else if s == 17 {
+                rep = 3 + (bitio.b_bits(&(*d).b, 3) as usize)
+            } else {
+                rep = 11 + (bitio.b_bits(&(*d).b, 7) as usize)
+            }
+            if n + rep > hlit + hdist {
+                return CompressError::Data
+            }
+            var k: usize = 0
+            while k < rep {
+                lens[n + k] = val
+                k = k + 1
+            }
+            n = n + rep
+        }
+    }
+    if lens[256] == 0 as u8 {
+        return CompressError::Data
+    }
+    // DEFLATE allows an incomplete code only when it is a single code of length 1;
+    // give it a partner that is no valid symbol (a stream that uses it is refused)
+    var ll: [u8; 288] = [0; 288]
+    i = 0
+    while i < hlit {
+        ll[i] = lens[i]
+        i = i + 1
+    }
+    fix_single((&ll[0]) as u64, 288)
+    if !bitio.build_tree((&(*d).lt[0]) as u64, (&ll[0]) as u64, 288) {
+        return CompressError::Data
+    }
+    // the distance code may be empty (a block of literals only)
+    (*d).nodist = false
+    var any: bool = false
+    i = 0
+    while i < hdist {
+        if lens[hlit + i] != 0 as u8 {
+            any = true
+        }
+        i = i + 1
+    }
+    if any {
+        var dl: [u8; 32] = [0; 32]
+        i = 0
+        while i < hdist {
+            dl[i] = lens[hlit + i]
+            i = i + 1
+        }
+        fix_single((&dl[0]) as u64, 32)
+        if !bitio.build_tree((&(*d).dt[0]) as u64, (&dl[0]) as u64, 32) {
+            return CompressError::Data
+        }
+    } else {
+        (*d).nodist = true
+    }
+    return true
+}
+
+fn fixed_trees(d: *mut GzDec) -> bool {
+    var lens: [u8; 288] = [0; 288]
+    var i: usize = 0
+    while i < 288 {
+        if i < 144 {
+            lens[i] = 8
+        } else if i < 256 {
+            lens[i] = 9
+        } else if i < 280 {
+            lens[i] = 7
+        } else {
+            lens[i] = 8
+        }
+        i = i + 1
+    }
+    if !bitio.build_tree((&(*d).lt[0]) as u64, (&lens[0]) as u64, 288) {
+        return false
+    }
+    var dl: [u8; 32] = [5; 32] // 30 and 31 are never valid, but they own codes
+    (*d).nodist = false
+    return bitio.build_tree((&(*d).dt[0]) as u64, (&dl[0]) as u64, 32)
+}
+
+// Decodes symbols of the current Huffman block until ~SLICE octets were
+// produced or the block ends. true = the block is complete.
+//
+// The hot loop keeps the bit buffer in locals and refills it eight octets at a
+// time straight from the input chunk (`bits` above `bc` are the NEXT octets of the
+// stream, so refilling again ORs in the same bits); the generic reader is only
+// called near the end of the input and for codes longer than 8 bits. One
+// iteration needs at most 15 + 5 + 15 + 13 = 48 bits, so refilling to 48 once at
+// the top is enough.
+fn run_huffman(d: *mut GzDec, out: *mut rt.Buf, room: usize, limited: bool) -> CompressError!bool {
+    let start: usize = (*out).len
+    if !common.buf_ensure(out, start + SLICE + 600) {
+        return CompressError::OutOfMemory
+    }
+    let dst: u64 = (*out).ptr
+    var op: usize = start
+    var bb: u64 = (*d).b.bitbuf
+    var bc: usize = (*d).b.bitcnt
+    let lt: u64 = (&(*d).lt[0]) as u64
+    let dt: u64 = (&(*d).dt[0]) as u64
+    let sp: *mut common.Source = &(*d).b.src
+    let mlen0: u64 = (*d).mlen
+    var left: usize = 0xFFFFFFFFFFFFFFFF
+    if (*d).max > 0 {
+        left = (*d).max - (*d).produced
+    }
+    var err: u32 = 0 // 1 Data, 2 TooLarge
+    var fin: bool = false
+    while op - start < SLICE {
+        if bc < 48 {
+            if (*sp).n - (*sp).pos >= 8 {
+                let w: u64 = common.ld64le((*sp).p, (*sp).pos)
+                bb = bb | (w << (bc as u64))
+                let take: usize = (63 - bc) >> 3
+                (*sp).pos = (*sp).pos + take
+                bc = bc + take * 8
+            } else {
+                (*d).b.bitbuf = bb
+                (*d).b.bitcnt = bc
+                bitio.b_fill(&(*d).b)
+                bb = (*d).b.bitbuf
+                bc = (*d).b.bitcnt
+            }
+        }
+        var sym: u32 = rt.ld16(lt, bitio.T_FAST + ((bb & 255) as usize)) as u32
+        if sym != 0 {
+            let l: u32 = sym >> 10
+            bb = bb >> (l as u64)
+            bc = bc - (l as usize)
+            sym = sym & 1023
+        } else {
+            (*d).b.bitbuf = bb
+            (*d).b.bitcnt = bc
+            sym = bitio.tree_sym(&(*d).b, lt)
+            bb = (*d).b.bitbuf
+            bc = (*d).b.bitcnt
+            if sym == 0xFFFFFFFF {
+                err = 1
+                break
+            }
+        }
+        if sym < 256 {
+            if op - start + 1 > left {
+                err = 2
+                break
+            }
+            rt.st8(dst, op, sym as u8)
+            op = op + 1
+            continue
+        }
+        if sym == 256 {
+            fin = true
+            break
+        }
+        let li: usize = (sym as usize) - 257
+        if li >= 29 || (*d).nodist {
+            err = 1
+            break
+        }
+        let eb: usize = LEXT[li] as usize
+        let len: usize = (LBASE[li] as usize) + ((bb & (((1 as u64) << (eb as u64)) - 1)) as usize)
+        bb = bb >> (eb as u64)
+        bc = bc - eb
+        var ds: u32 = rt.ld16(dt, bitio.T_FAST + ((bb & 255) as usize)) as u32
+        if ds != 0 {
+            let l: u32 = ds >> 10
+            bb = bb >> (l as u64)
+            bc = bc - (l as usize)
+            ds = ds & 1023
+        } else {
+            (*d).b.bitbuf = bb
+            (*d).b.bitcnt = bc
+            ds = bitio.tree_sym(&(*d).b, dt)
+            bb = (*d).b.bitbuf
+            bc = (*d).b.bitcnt
+        }
+        if ds >= 30 {
+            err = 1
+            break
+        }
+        let deb: usize = DEXT[ds as usize] as usize
+        let dist: usize = (DBASE[ds as usize] as usize) + ((bb & (((1 as u64) << (deb as u64)) - 1)) as usize)
+        bb = bb >> (deb as u64)
+        bc = bc - deb
+        // the distance may reach back at most to the start of this member's output we hold
+        if (dist as u64) > mlen0 + ((op - start) as u64) || dist > op {
+            err = 1
+            break
+        }
+        if op - start + len > left {
+            err = 2
+            break
+        }
+        if dist >= 8 {
+            var k: usize = 0
+            while k < len {
+                common.st64le(dst, op + k, common.ld64le(dst, op - dist + k))
+                k = k + 8
+            }
+        } else {
+            var k: usize = 0
+            while k < len {
+                rt.st8(dst, op + k, rt.ld8(dst, op + k - dist))
+                k = k + 1
+            }
+        }
+        op = op + len
+    }
+    (*d).b.bitbuf = bb
+    (*d).b.bitcnt = bc
+    (*out).len = op
+    if err == 1 {
+        return CompressError::Data
+    }
+    if err == 2 {
+        return CompressError::TooLarge
+    }
+    if bitio.b_exhausted(&(*d).b) {
+        return bad_input(d)
+    }
+    return fin
+}
+
+fn finish_slice(d: *mut GzDec, out: *mut rt.Buf, start: usize) {
+    let got: usize = (*out).len - start
+    if got == 0 {
+        return
+    }
+    (*d).produced = (*d).produced + got
+    (*d).total = (*d).total + (got as u64)
+    (*d).mlen = (*d).mlen + (got as u64)
+    if (*d).kind == GZ_GZIP {
+        (*d).crc = common.crc32_more(&(*d).ctab, (*d).crc, (*out).ptr + start as u64, got)
+    } else if (*d).kind == GZ_ZLIB {
+        (*d).adler = deflate.adler32_more((*d).adler, (*out).ptr + start as u64, got)
+    }
+}
+
+// One step: false = the end of the input.
+fn gz_step(d: *mut GzDec, out: *mut rt.Buf) -> CompressError!bool {
+    let st: u32 = (*d).state
+    if st == 9 {
+        return false
+    }
+    if st == 0 {
+        // a member / stream header
+        if (*d).members > 0 {
+            // more input?
+            if (*d).b.bitcnt <= (*d).b.padbits && common.src_at_end(&(*d).b.src) {
+                (*d).state = 9
+                return false
+            }
+        }
+        if (*d).kind == GZ_AUTO {
+            let c0: u32 = bitio.b_peek(&(*d).b, 8)
+            if bitio.b_exhausted(&(*d).b) {
+                return bad_input(d)
+            }
+            if c0 == 0x1F {
+                (*d).kind = GZ_GZIP
+            } else {
+                (*d).kind = GZ_ZLIB
+            }
+        }
+        if (*d).kind != GZ_RAW {
+            let v: i32 = rd8(d)
+            if v < 0 {
+                return bad_input(d)
+            }
+            if (*d).kind == GZ_GZIP {
+                // zero padding after a member is allowed
+                if (*d).members > 0 && v == 0 {
+                    var z: i32 = 0
+                    while z == 0 {
+                        if (*d).b.bitcnt <= (*d).b.padbits && common.src_at_end(&(*d).b.src) {
+                            (*d).state = 9
+                            return false
+                        }
+                        z = rd8(d)
+                        if z < 0 {
+                            return bad_input(d)
+                        }
+                    }
+                    return CompressError::Format
+                }
+                try read_gzip_header(d, v as u32)
+            } else {
+                try read_zlib_header(d, v as u32)
+            }
+        }
+        (*d).members = (*d).members + 1
+        (*d).crc = 0
+        (*d).adler = 1
+        (*d).mlen = 0
+        (*d).state = 1
+        return true
+    }
+    if st == 1 {
+        (*d).last = bitio.b_bits(&(*d).b, 1) != 0
+        let typ: u32 = bitio.b_bits(&(*d).b, 2)
+        if bitio.b_exhausted(&(*d).b) {
+            return bad_input(d)
+        }
+        if typ == 0 {
+            if !bitio.b_align(&(*d).b) {
+                // padding bits are not required to be zero in DEFLATE: ignore them
+            }
+            let l: u32 = bitio.b_bits(&(*d).b, 16)
+            let nl: u32 = bitio.b_bits(&(*d).b, 16)
+            if bitio.b_exhausted(&(*d).b) {
+                return bad_input(d)
+            }
+            if l != (nl ^ 0xFFFF) {
+                return CompressError::Data
+            }
+            (*d).left = l as usize
+            (*d).state = 2
+        } else if typ == 3 {
+            return CompressError::Data
+        } else {
+            if typ == 1 {
+                if !fixed_trees(d) {
+                    return CompressError::Data
+                }
+            } else {
+                try read_dynamic(d)
+            }
+            (*d).state = 3
+        }
+        return true
+    }
+    if st == 2 {
+        // a stored block: up to SLICE octets at a time
+        var k: usize = (*d).left
+        if k > SLICE {
+            k = SLICE
+        }
+        if (*d).max > 0 && (*d).produced + k > (*d).max {
+            return CompressError::TooLarge
+        }
+        if !common.buf_ensure(out, (*out).len + k) {
+            return CompressError::OutOfMemory
+        }
+        let start: usize = (*out).len
+        if !bitio.b_align(&(*d).b) {
+            // DEFLATE ignores the bits before a stored block's length
+        }
+        if k > 0 {
+            if !bitio.b_read_bytes(&(*d).b, (*out).ptr + start as u64, k) {
+                return bad_input(d)
+            }
+            (*out).len = start + k
+        }
+        finish_slice(d, out, start)
+        (*d).left = (*d).left - k
+        if (*d).left == 0 {
+            if (*d).last {
+                (*d).state = 4
+            } else {
+                (*d).state = 1
+            }
+        }
+        return true
+    }
+    if st == 3 {
+        let start: usize = (*out).len
+        let done: bool = try run_huffman(d, out, 0, false)
+        finish_slice(d, out, start)
+        if done {
+            if (*d).last {
+                (*d).state = 4
+            } else {
+                (*d).state = 1
+            }
+        }
+        return true
+    }
+    // state 4: the trailer
+    if (*d).kind == GZ_RAW {
+        (*d).state = 9
+        return false
+    }
+    // the trailer is octet aligned
+    if !bitio.b_align(&(*d).b) {
+        // padding after the last block: ignored
+    }
+    if (*d).kind == GZ_GZIP {
+        var t: [u8; 8] = [0; 8]
+        var i: usize = 0
+        while i < 8 {
+            let v: i32 = rd8(d)
+            if v < 0 {
+                return bad_input(d)
+            }
+            t[i] = v as u8
+            i = i + 1
+        }
+        if common.ld32le((&t[0]) as u64, 0) != (*d).crc {
+            return CompressError::Checksum
+        }
+        if common.ld32le((&t[0]) as u64, 4) != (((*d).mlen & 0xFFFFFFFF) as u32) {
+            return CompressError::Checksum
+        }
+        (*d).state = 0
+        return true
+    }
+    var t: [u8; 4] = [0; 4]
+    var i: usize = 0
+    while i < 4 {
+        let v: i32 = rd8(d)
+        if v < 0 {
+            return bad_input(d)
+        }
+        t[i] = v as u8
+        i = i + 1
+    }
+    let want: u32 = ((t[0] as u32) << 24) | ((t[1] as u32) << 16) | ((t[2] as u32) << 8) | (t[3] as u32)
+    if want != (*d).adler {
+        return CompressError::Checksum
+    }
+    (*d).state = 9
+    return false
+}
+
+// ---------------------------------------------------------- whole buffer
+
+fn gz_decompress(src: u64, n: usize, kind: u32, out: *mut rt.Buf) -> CompressError!usize {
+    return try gz_decompress_limited(src, n, kind, 0, out)
+}
+
+fn gz_decompress_limited(src: u64, n: usize, kind: u32, max: usize, out: *mut rt.Buf) -> CompressError!usize {
+    var d: GzDec = gz_dec_open_mem(src, n, kind)
+    defer gz_dec_close(&d)
+    d.max = max
+    d.total = 0
+    let before: usize = (*out).len
+    while true {
+        let more: bool = try gz_step(&d, out)
+        if !more {
+            break
+        }
+    }
+    return (*out).len - before
+}
+
+// ---------------------------------------------------------------- streaming
+
+fn gz_dec_read(d: *mut GzDec, dst: u64, n: usize) -> CompressError!usize {
+    while (*d).drained >= (*d).out.len && (*d).state != 9 {
+        // the window is what a distance can still reach (not past the member start: total counts all)
+        let cut: usize = common.buf_compact(&(*d).out, (*d).drained, WIN)
+        (*d).drained = (*d).drained - cut
+        let more: bool = try gz_step(d, &(*d).out)
+        if !more {
+            break
+        }
+    }
+    var k: usize = (*d).out.len - (*d).drained
+    if k > n {
+        k = n
+    }
+    if k > 0 {
+        rt.mem_copy(dst, (*d).out.ptr + (*d).drained as u64, k)
+        (*d).drained = (*d).drained + k
+    }
+    return k
+}
+
+fn gz_dec_open_source(s: common.Source, kind: u32) -> GzDec {
+    return dec_new(s, kind)
+}
+
+struct GzDecPair {
+    a: GzDec,
+    b: GzDec,
+}
+
+// The size of a decoder in octets (the step between two of them in a pair).
+fn gz_dec_size() -> usize {
+    var p: GzDecPair = GzDecPair { a: dec_new(common.src_mem(0, 0), 0), b: dec_new(common.src_mem(0, 0), 0) }
+    let sz: usize = ((&p.b) as usize) - ((&p.a) as usize)
+    gz_dec_close(&p.a)
+    gz_dec_close(&p.b)
+    return sz
+}

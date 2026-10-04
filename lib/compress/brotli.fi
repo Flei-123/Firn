@@ -1,0 +1,1062 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/compress/brotli.fi -- a Brotli decoder (RFC 7932): the whole format --
+// window sizes 2^10..2^24, uncompressed and metadata meta-blocks, block
+// switching for literals, insert&copy commands and distances, context maps
+// with the four literal context modes, simple and complex prefix codes, the
+// distance ring buffer with its 16 short codes, NPOSTFIX/NDIRECT, and the 122,784
+// octet static dictionary with its 121 word transforms.
+//
+//     import compress.brotli
+//     brotli.brotli_decompress_limited(p, n, 1 << 30, &out) catch |e| ...
+//
+//     var d: brotli.BrDec = brotli.brotli_dec_open_fd(fd)              // streaming
+//     let k: usize = brotli.brotli_dec_read(&d, buf, 65536) catch |e| ...  // 0 = end
+//     brotli.brotli_dec_close(&d)
+//
+// Brotli has no magic number; `compress.auto` therefore cannot detect it (it
+// is what `Content-Encoding: br` and `.br` say it is).
+//
+// THE STATIC DICTIONARY AND THE TABLES. lib/compress/brotli_data.bin holds
+// the dictionary (RFC 7932 appendix A, 122,784 octets, SHA-256 20e42eb1...),
+// the context lookup tables and the transform table of the reference
+// implementation; tools/compress/gen_brotli_data.py builds it from an
+// installed libbrotlicommon and checks digest and structure. That data is
+// Copyright the Brotli Authors (Google), MIT license: see THIRD_PARTY.md.
+//
+// MEMORY. The streaming reader keeps `window + one command's output` (a
+// window of up to 16 MiB - 16; a single command can insert at most 2^24 + 22594
+// literals). Whole-buffer decoding keeps the output (it is the output).
+//
+// ERRORS. A prefix code that is not complete, a context map or block type out
+// of range, a distance beyond the window that is no valid dictionary word,
+// a copy past the meta-block length, nonzero padding, an invalid metadata or
+// uncompressed header are `Data`; a cut stream `Truncated`; more output than
+// the caller's `max` is `TooLarge`, written never.
+//
+// HONEST
+//   R1 Bytes after the last meta-block are ignored (Python's brotli does the
+//      same; Chromium treats them as an error).
+//   R2 The "large window" extension (WBITS = 1 000 001, up to 2^30) is
+//      refused as `Unsupported`.
+//   R3 No encoder in this library (lib/compress/brotli_enc.fi is not part of
+//      this change); `Content-Encoding: br` is for receiving.
+import std.rt
+import compress.common
+import compress.bitio
+
+export {
+    BrDec, brotli_dec_open_source, brotli_dec_size, brotli_dec_open_mem, brotli_dec_open_fd, brotli_dec_read, brotli_dec_close,
+    brotli_decompress, brotli_decompress_limited,
+}
+
+const BR_DATA: str = __include_str("brotli_data.bin")
+const OFF_CTX: usize = 0
+const OFF_PS: usize = 2048
+const OFF_TR: usize = 2265
+const OFF_DICT: usize = 2628
+const SLICE: usize = 262144
+
+// the size bits of the dictionary by word length 4..24 (index = length)
+static NDBITS: [u8; 25] = [0, 0, 0, 0, 10, 10, 11, 11, 10, 10, 10, 10, 10, 9, 9, 8, 7, 7, 8, 7, 7, 6, 6, 5, 5]
+
+static BL_BASE: [u32; 26] = [1, 5, 9, 13, 17, 25, 33, 41, 49, 65, 81, 97, 113, 145, 177, 209, 241, 305, 369, 497,
+    753, 1265, 2289, 4337, 8433, 16625]
+static BL_BITS: [u8; 26] = [2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 8, 9, 10, 11, 12, 13, 24]
+static INS_BASE: [u32; 24] = [0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98, 130, 194, 322, 578, 1090, 2114,
+    6210, 22594]
+static INS_BITS: [u8; 24] = [0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 12, 14, 24]
+static CPY_BASE: [u32; 24] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 18, 22, 30, 38, 54, 70, 102, 134, 198, 326, 582,
+    1094, 2118]
+static CPY_BITS: [u8; 24] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 24]
+static CELL_INS: [u8; 11] = [0, 0, 0, 0, 8, 8, 0, 16, 8, 16, 16]
+static CELL_CPY: [u8; 11] = [0, 8, 0, 8, 0, 8, 16, 0, 16, 8, 16]
+static CL_ORDER: [u8; 18] = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+static CL_LEN: [u8; 16] = [2, 2, 2, 3, 2, 2, 2, 4, 2, 2, 2, 3, 2, 2, 2, 4]
+static CL_VAL: [u8; 16] = [0, 4, 3, 2, 0, 4, 3, 1, 0, 4, 3, 2, 0, 4, 3, 5]
+
+// ====================================================================
+// THE DECODER STATE AND THE BIT READER (LSB first)
+// ====================================================================
+
+struct BrDec {
+    b: bitio.Bits,
+    out: rt.Buf,
+    drained: usize,
+    state: u32, // 0 stream header, 1 meta-block header, 2 commands of a compressed meta-block, 9 finished
+    wbits: u32,
+    window: usize,
+    total: u64, // octets produced by the stream so far
+    max: usize, // 0 = no limit
+    produced: usize,
+    // the meta-block
+    mlen: usize,
+    is_last: bool,
+    nbt: [usize; 3], // block type counts: 0 = literals, 1 = insert&copy, 2 = distances
+    bt: [usize; 3],
+    btlast: [usize; 3],
+    btprev: [usize; 3],
+    bl: [usize; 3],
+    tt: [u16; 1590], // three block type trees (alphabet <= 258)
+    tc: [u16; 894], // three block count trees (alphabet 26)
+    npostfix: usize,
+    ndirect: usize,
+    ctx_mode: [u8; 256],
+    cmap_l: [u8; 16384],
+    cmap_d: [u8; 1024],
+    ntrees_l: usize,
+    ntrees_d: usize,
+    forest_l: u64,
+    forest_i: u64,
+    forest_d: u64,
+    fl_size: usize,
+    fi_size: usize,
+    fd_size: usize,
+    dist_alpha: usize,
+    rb: [i64; 4],
+    ps_off: [u16; 50],
+}
+
+fn dec_new(s: common.Source) -> BrDec {
+    var d: BrDec = BrDec { b: bitio.bits_new(s), out: rt.buf_new(), drained: 0, state: 0,
+        wbits: 0, window: 0, total: 0, max: 0, produced: 0, mlen: 0, is_last: false, nbt: [1; 3], bt: [0; 3],
+        btlast: [0; 3], btprev: [1; 3], bl: [0; 3], tt: [0; 1590], tc: [0; 894], npostfix: 0, ndirect: 0,
+        ctx_mode: [0; 256], cmap_l: [0; 16384], cmap_d: [0; 1024], ntrees_l: 0, ntrees_d: 0,
+        forest_l: 0, forest_i: 0, forest_d: 0, fl_size: 0, fi_size: 0, fd_size: 0, dist_alpha: 0,
+        rb: [4, 11, 15, 16], ps_off: [0; 50] }
+    // offsets of the 50 prefix/suffix strings
+    let blob: u64 = (BR_DATA.p as u64) + OFF_PS as u64
+    var p: usize = 0
+    var i: usize = 0
+    while i < 50 && p < 217 {
+        d.ps_off[i] = p as u16
+        p = p + 1 + (rt.ld8(blob, p) as usize)
+        i = i + 1
+    }
+    return d
+}
+
+fn brotli_dec_open_mem(p: u64, n: usize) -> BrDec {
+    return dec_new(common.src_mem(p, n))
+}
+
+fn brotli_dec_open_fd(fd: i64) -> BrDec {
+    return dec_new(common.src_fd(fd))
+}
+
+fn free_forests(d: *mut BrDec) {
+    if (*d).forest_l != 0 {
+        rt.heap_free((*d).forest_l, (*d).fl_size)
+        (*d).forest_l = 0
+    }
+    if (*d).forest_i != 0 {
+        rt.heap_free((*d).forest_i, (*d).fi_size)
+        (*d).forest_i = 0
+    }
+    if (*d).forest_d != 0 {
+        rt.heap_free((*d).forest_d, (*d).fd_size)
+        (*d).forest_d = 0
+    }
+}
+
+fn brotli_dec_close(d: *mut BrDec) {
+    bitio.bits_free(&(*d).b)
+    rt.buf_free(&(*d).out)
+    free_forests(d)
+}
+
+fn fill(d: *mut BrDec) {
+    bitio.b_fill(&(*d).b)
+}
+
+// Were bits consumed that the input never had?
+fn exhausted(d: *mut BrDec) -> bool {
+    return bitio.b_exhausted(&(*d).b)
+}
+
+// 0..32 bits.
+fn bits(d: *mut BrDec, n: usize) -> u32 {
+    return bitio.b_bits(&(*d).b, n)
+}
+
+fn bit(d: *mut BrDec) -> bool {
+    return bitio.b_bits(&(*d).b, 1) != 0
+}
+
+// Discards the bits up to the next octet boundary; false if they were not zero.
+fn align(d: *mut BrDec) -> bool {
+    return bitio.b_align(&(*d).b)
+}
+
+fn read_bytes(d: *mut BrDec, dst: u64, n: usize) -> bool {
+    return bitio.b_read_bytes(&(*d).b, dst, n)
+}
+
+fn skip_bytes(d: *mut BrDec, n: usize) -> bool {
+    return bitio.b_skip_bytes(&(*d).b, n)
+}
+
+// One symbol of the tree at `t`; 0xFFFFFFFF on a bad code.
+fn rd_sym(d: *mut BrDec, t: u64) -> u32 {
+    return bitio.tree_sym(&(*d).b, t)
+}
+
+// ====================================================================
+// READING A PREFIX CODE (RFC 7932 3.4, 3.5)
+// ====================================================================
+
+// Reads the description of a code over `alpha` symbols and builds its tree
+// at `dst` (which has room for bitio.tree_size(alpha) octets).
+#[allow_escape]
+fn read_code(d: *mut BrDec, alpha: usize, dst: u64) -> CompressError!bool {
+    var lens: [u8; 704] = [0; 704]
+    let hskip: usize = bits(d, 2) as usize
+    if hskip == 1 {
+        // a simple code: up to four symbols
+        let nsym: usize = (bits(d, 2) as usize) + 1
+        var maxbits: usize = 0
+        var v: usize = alpha - 1
+        while v > 0 {
+            maxbits = maxbits + 1
+            v = v >> 1
+        }
+        var sy: [usize; 4] = [0; 4]
+        var i: usize = 0
+        while i < nsym {
+            sy[i] = bits(d, maxbits) as usize
+            if sy[i] >= alpha {
+                return CompressError::Data
+            }
+            i = i + 1
+        }
+        var a: usize = 0
+        while a < nsym {
+            var b: usize = a + 1
+            while b < nsym {
+                if sy[a] == sy[b] {
+                    return CompressError::Data
+                }
+                b = b + 1
+            }
+            a = a + 1
+        }
+        if nsym == 1 {
+            lens[sy[0]] = 1
+        } else if nsym == 2 {
+            lens[sy[0]] = 1
+            lens[sy[1]] = 1
+        } else if nsym == 3 {
+            lens[sy[0]] = 1
+            lens[sy[1]] = 2
+            lens[sy[2]] = 2
+        } else {
+            if bit(d) {
+                lens[sy[0]] = 1
+                lens[sy[1]] = 2
+                lens[sy[2]] = 3
+                lens[sy[3]] = 3
+            } else {
+                lens[sy[0]] = 2
+                lens[sy[1]] = 2
+                lens[sy[2]] = 2
+                lens[sy[3]] = 2
+            }
+        }
+        if exhausted(d) {
+            return CompressError::Truncated
+        }
+        if !bitio.build_tree(dst, (&lens[0]) as u64, alpha) {
+            return CompressError::Data
+        }
+        return true
+    }
+    // a complex code: the code length code first
+    var clen: [u8; 18] = [0; 18]
+    var space: i32 = 32
+    var ncodes: usize = 0
+    var i: usize = hskip
+    while i < 18 {
+        let v4: usize = bitio.b_peek(&(*d).b, 4) as usize
+        let n: usize = CL_LEN[v4] as usize
+        let val: u8 = CL_VAL[v4]
+        bitio.b_drop(&(*d).b, n)
+        clen[CL_ORDER[i] as usize] = val
+        if val != 0 as u8 {
+            space = space - (32 >> (val as i32))
+            ncodes = ncodes + 1
+            if space <= 0 {
+                break
+            }
+        }
+        i = i + 1
+    }
+    if exhausted(d) {
+        return CompressError::Truncated
+    }
+    if ncodes != 1 && space != 0 {
+        return CompressError::Data
+    }
+    var ctree: [u16; 290] = [0; 290]
+    if !bitio.build_tree((&ctree[0]) as u64, (&clen[0]) as u64, 18) {
+        return CompressError::Data
+    }
+    // the code lengths of the alphabet
+    var sym: usize = 0
+    var prev_len: u32 = 8
+    var repeat: u32 = 0
+    var repeat_len: u32 = 0
+    var sp: i32 = 32768
+    while sym < alpha && sp > 0 {
+        let cl: u32 = rd_sym(d, (&ctree[0]) as u64)
+        if cl == 0xFFFFFFFF {
+            return CompressError::Data
+        }
+        if exhausted(d) {
+            return CompressError::Truncated
+        }
+        if cl < 16 {
+            repeat = 0
+            lens[sym] = cl as u8
+            sym = sym + 1
+            if cl != 0 {
+                prev_len = cl
+                sp = sp - (32768 >> (cl as i32))
+            }
+        } else {
+            let extra: usize = if cl == 16 { 2 } else { 3 }
+            let new_len: u32 = if cl == 16 { prev_len } else { 0 }
+            if repeat_len != new_len {
+                repeat = 0
+                repeat_len = new_len
+            }
+            let old: u32 = repeat
+            if repeat > 0 {
+                repeat = (repeat - 2) << (extra as u32)
+            }
+            repeat = repeat + bits(d, extra) + 3
+            let delta: u32 = repeat - old
+            if sym + (delta as usize) > alpha {
+                return CompressError::Data
+            }
+            var k: u32 = 0
+            while k < delta {
+                lens[sym] = repeat_len as u8
+                sym = sym + 1
+                k = k + 1
+            }
+            if repeat_len != 0 {
+                sp = sp - ((delta as i32) << (15 - (repeat_len as i32)))
+            }
+        }
+    }
+    if sp != 0 {
+        return CompressError::Data
+    }
+    if !bitio.build_tree(dst, (&lens[0]) as u64, alpha) {
+        return CompressError::Data
+    }
+    return true
+}
+
+// A number 1..256 (block type counts, number of trees).
+fn read_256(d: *mut BrDec) -> usize {
+    if !bit(d) {
+        return 1
+    }
+    let n: usize = bits(d, 3) as usize
+    if n == 0 {
+        return 2
+    }
+    return (bits(d, n) as usize) + ((1 as usize) << n) + 1
+}
+
+// A context map of `size` entries over `ntrees` trees.
+fn read_context_map(d: *mut BrDec, ntrees: usize, size: usize, map: u64) -> CompressError!bool {
+    if ntrees < 2 {
+        var i: usize = 0
+        while i < size {
+            rt.st8(map, i, 0 as u8)
+            i = i + 1
+        }
+        return true
+    }
+    var rlemax: usize = 0
+    if bit(d) {
+        rlemax = (bits(d, 4) as usize) + 1
+    }
+    let alpha: usize = ntrees + rlemax
+    var tree: [u16; 800] = [0; 800]
+    // the code for the map symbols: alphabet <= 256 + 16
+    if !(try read_code(d, alpha, (&tree[0]) as u64)) {
+        return CompressError::Data
+    }
+    var i: usize = 0
+    while i < size {
+        let s: u32 = rd_sym(d, (&tree[0]) as u64)
+        if s == 0xFFFFFFFF {
+            return CompressError::Data
+        }
+        if exhausted(d) {
+            return CompressError::Truncated
+        }
+        if (s as usize) == 0 {
+            rt.st8(map, i, 0 as u8)
+            i = i + 1
+        } else if (s as usize) <= rlemax {
+            let run: usize = ((1 as usize) << (s as usize)) + (bits(d, s as usize) as usize)
+            if i + run > size {
+                return CompressError::Data
+            }
+            var k: usize = 0
+            while k < run {
+                rt.st8(map, i + k, 0 as u8)
+                k = k + 1
+            }
+            i = i + run
+        } else {
+            rt.st8(map, i, ((s as usize) - rlemax) as u8)
+            i = i + 1
+        }
+    }
+    if bit(d) {
+        // inverse move-to-front
+        var mtf: [u8; 256] = [0; 256]
+        var k: usize = 0
+        while k < 256 {
+            mtf[k] = k as u8
+            k = k + 1
+        }
+        i = 0
+        while i < size {
+            let idx: usize = rt.ld8(map, i) as usize
+            let v: u8 = mtf[idx]
+            rt.st8(map, i, v)
+            var j: usize = idx
+            while j > 0 {
+                mtf[j] = mtf[j - 1]
+                j = j - 1
+            }
+            mtf[0] = v
+            i = i + 1
+        }
+    }
+    return true
+}
+
+// ====================================================================
+// THE STATIC DICTIONARY AND ITS TRANSFORMS (RFC 7932 8)
+// ====================================================================
+
+fn dict_offset(len: usize) -> usize {
+    var off: usize = 0
+    var l: usize = 4
+    while l < len {
+        off = off + l * ((1 as usize) << (NDBITS[l] as usize))
+        l = l + 1
+    }
+    return off
+}
+
+fn upper_case(p: u64, n: usize) -> usize {
+    // an overly simple model of UTF-8 upper casing, as the RFC prescribes
+    let c: u8 = rt.ld8(p, 0)
+    if c < 0xC0 as u8 {
+        if c >= 0x61 as u8 && c <= 0x7A as u8 {
+            rt.st8(p, 0, c ^ 32 as u8)
+        }
+        return 1
+    }
+    if c < 0xE0 as u8 {
+        if n >= 2 {
+            rt.st8(p, 1, rt.ld8(p, 1) ^ 32 as u8)
+        }
+        return 2
+    }
+    if n >= 3 {
+        rt.st8(p, 2, rt.ld8(p, 2) ^ 5 as u8)
+    }
+    return 3
+}
+
+// Writes prefix + transformed word + suffix to `dst`; returns the length.
+fn transform_word(d: *mut BrDec, dst: u64, word: u64, wlen: usize, tid: usize) -> usize {
+    let tr: u64 = (BR_DATA.p as u64) + (OFF_TR + tid * 3) as u64
+    let ps: u64 = (BR_DATA.p as u64) + OFF_PS as u64
+    let pid: usize = rt.ld8(tr, 0) as usize
+    let typ: usize = rt.ld8(tr, 1) as usize
+    let sid: usize = rt.ld8(tr, 2) as usize
+    var n: usize = 0
+    // the prefix
+    var po: usize = (*d).ps_off[pid] as usize
+    let pl: usize = rt.ld8(ps, po) as usize
+    rt.mem_copy(dst, ps + (po + 1) as u64, pl)
+    n = pl
+    // the word
+    var w: u64 = word
+    var l: usize = wlen
+    if typ >= 1 && typ <= 9 {
+        if typ >= l {
+            l = 0
+        } else {
+            l = l - typ
+        }
+    } else if typ >= 12 && typ <= 20 {
+        var skip: usize = typ - 11
+        if skip > l {
+            skip = l
+        }
+        w = w + skip as u64
+        l = l - skip
+    }
+    rt.mem_copy(dst + n as u64, w, l)
+    if typ == 10 {
+        if l > 0 {
+            upper_case(dst + n as u64, l)
+        }
+    } else if typ == 11 {
+        var rest: usize = l
+        var q: u64 = dst + n as u64
+        while rest > 0 {
+            let step: usize = upper_case(q, rest)
+            if step > rest {
+                break
+            }
+            q = q + step as u64
+            rest = rest - step
+        }
+    }
+    n = n + l
+    // the suffix
+    po = (*d).ps_off[sid] as usize
+    let sl: usize = rt.ld8(ps, po) as usize
+    rt.mem_copy(dst + n as u64, ps + (po + 1) as u64, sl)
+    return n + sl
+}
+
+// ====================================================================
+// THE META-BLOCK HEADER (RFC 7932 9.2)
+// ====================================================================
+
+// Reads the rest of a compressed meta-block header: block types, distance
+// parameters, context maps and the prefix codes.
+fn read_compressed_header(d: *mut BrDec) -> CompressError!bool {
+    free_forests(d)
+    var cat: usize = 0
+    while cat < 3 {
+        let n: usize = read_256(d)
+        (*d).nbt[cat] = n
+        (*d).bt[cat] = 0
+        (*d).btlast[cat] = 0
+        (*d).btprev[cat] = 1
+        (*d).bl[cat] = 16777216
+        if n >= 2 {
+            let ts: usize = 530
+            let cs: usize = 298
+            if !(try read_code(d, n + 2, ((&(*d).tt[0]) as u64) + (cat * ts * 2) as u64)) {
+                return CompressError::Data
+            }
+            if !(try read_code(d, 26, ((&(*d).tc[0]) as u64) + (cat * cs * 2) as u64)) {
+                return CompressError::Data
+            }
+            let s: u32 = rd_sym(d, ((&(*d).tc[0]) as u64) + (cat * cs * 2) as u64)
+            if s == 0xFFFFFFFF || s >= 26 {
+                return CompressError::Data
+            }
+            (*d).bl[cat] = (BL_BASE[s as usize] as usize) + (bits(d, BL_BITS[s as usize] as usize) as usize)
+        }
+        cat = cat + 1
+    }
+    (*d).npostfix = bits(d, 2) as usize
+    (*d).ndirect = (bits(d, 4) as usize) << (*d).npostfix
+    // context modes of the literal block types
+    var i: usize = 0
+    while i < (*d).nbt[0] {
+        (*d).ctx_mode[i] = bits(d, 2) as u8
+        i = i + 1
+    }
+    if exhausted(d) {
+        return CompressError::Truncated
+    }
+    // literal context map
+    (*d).ntrees_l = read_256(d)
+    if !(try read_context_map(d, (*d).ntrees_l, (*d).nbt[0] * 64, (&(*d).cmap_l[0]) as u64)) {
+        return CompressError::Data
+    }
+    (*d).ntrees_d = read_256(d)
+    if !(try read_context_map(d, (*d).ntrees_d, (*d).nbt[2] * 4, (&(*d).cmap_d[0]) as u64)) {
+        return CompressError::Data
+    }
+    // the prefix codes
+    (*d).dist_alpha = 16 + (*d).ndirect + (48 << (*d).npostfix)
+    (*d).fl_size = (*d).ntrees_l * bitio.tree_size(256)
+    (*d).fi_size = (*d).nbt[1] * bitio.tree_size(704)
+    (*d).fd_size = (*d).ntrees_d * bitio.tree_size((*d).dist_alpha)
+    (*d).forest_l = rt.heap_alloc((*d).fl_size)
+    (*d).forest_i = rt.heap_alloc((*d).fi_size)
+    (*d).forest_d = rt.heap_alloc((*d).fd_size)
+    if (*d).forest_l == 0 || (*d).forest_i == 0 || (*d).forest_d == 0 {
+        return CompressError::OutOfMemory
+    }
+    i = 0
+    while i < (*d).ntrees_l {
+        if !(try read_code(d, 256, (*d).forest_l + (i * bitio.tree_size(256)) as u64)) {
+            return CompressError::Data
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < (*d).nbt[1] {
+        if !(try read_code(d, 704, (*d).forest_i + (i * bitio.tree_size(704)) as u64)) {
+            return CompressError::Data
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < (*d).ntrees_d {
+        if !(try read_code(d, (*d).dist_alpha, (*d).forest_d + (i * bitio.tree_size((*d).dist_alpha)) as u64)) {
+            return CompressError::Data
+        }
+        i = i + 1
+    }
+    if exhausted(d) {
+        return CompressError::Truncated
+    }
+    // (the ring of last distances lives on from meta-block to meta-block)
+    return true
+}
+
+// A block switch for category `cat` (0 literals, 1 insert&copy, 2 distances).
+fn block_switch(d: *mut BrDec, cat: usize) -> CompressError!bool {
+    let ts: usize = 530
+    let cs: usize = 298
+    let s: u32 = rd_sym(d, ((&(*d).tt[0]) as u64) + (cat * ts * 2) as u64)
+    if s == 0xFFFFFFFF {
+        return CompressError::Data
+    }
+    var t: usize = 0
+    if s == 0 {
+        t = (*d).btprev[cat]
+    } else if s == 1 {
+        t = (*d).btlast[cat] + 1
+        if t >= (*d).nbt[cat] {
+            t = t - (*d).nbt[cat]
+        }
+    } else {
+        t = (s as usize) - 2
+    }
+    if t >= (*d).nbt[cat] {
+        return CompressError::Data
+    }
+    (*d).btprev[cat] = (*d).btlast[cat]
+    (*d).btlast[cat] = t
+    (*d).bt[cat] = t
+    let c: u32 = rd_sym(d, ((&(*d).tc[0]) as u64) + (cat * cs * 2) as u64)
+    if c == 0xFFFFFFFF || c >= 26 {
+        return CompressError::Data
+    }
+    (*d).bl[cat] = (BL_BASE[c as usize] as usize) + (bits(d, BL_BITS[c as usize] as usize) as usize)
+    return true
+}
+
+fn too_big(d: *mut BrDec, extra: usize) -> bool {
+    return (*d).max > 0 && (*d).produced + extra > (*d).max
+}
+
+// Decodes commands until ~SLICE octets were produced or the meta-block ends.
+// true = the meta-block is complete.
+fn run_commands(d: *mut BrDec, out: *mut rt.Buf) -> CompressError!bool {
+    let start: usize = (*out).len
+    let ctxbase: u64 = (BR_DATA.p as u64) + OFF_CTX as u64
+    let dict: u64 = (BR_DATA.p as u64) + OFF_DICT as u64
+    var scratch: [u8; 160] = [0; 160]
+    while (*d).mlen > 0 && (*out).len - start < SLICE {
+        if (*d).bl[1] == 0 {
+            try block_switch(d, 1)
+        }
+        (*d).bl[1] = (*d).bl[1] - 1
+        let cmd: u32 = rd_sym(d, (*d).forest_i + ((*d).bt[1] * bitio.tree_size(704)) as u64)
+        if cmd == 0xFFFFFFFF {
+            return CompressError::Data
+        }
+        let cell: usize = (cmd >> 6) as usize
+        let ic: usize = (CELL_INS[cell] as usize) + (((cmd >> 3) & 7) as usize)
+        let cc: usize = (CELL_CPY[cell] as usize) + ((cmd & 7) as usize)
+        let ins: usize = (INS_BASE[ic] as usize) + (bits(d, INS_BITS[ic] as usize) as usize)
+        let cpy: usize = (CPY_BASE[cc] as usize) + (bits(d, CPY_BITS[cc] as usize) as usize)
+        if ins > (*d).mlen {
+            return CompressError::Data
+        }
+        if too_big(d, ins) {
+            return CompressError::TooLarge
+        }
+        if !common.buf_ensure(out, (*out).len + ins + 64) {
+            return CompressError::OutOfMemory
+        }
+        // the literals
+        var p1: u32 = 0
+        var p2: u32 = 0
+        var op: usize = (*out).len
+        if (*d).total > 0 {
+            p1 = rt.ld8((*out).ptr, op - 1) as u32
+        }
+        if (*d).total > 1 {
+            p2 = rt.ld8((*out).ptr, op - 2) as u32
+        }
+        var k: usize = 0
+        while k < ins {
+            if (*d).bl[0] == 0 {
+                try block_switch(d, 0)
+            }
+            (*d).bl[0] = (*d).bl[0] - 1
+            let mode: usize = (*d).ctx_mode[(*d).bt[0]] as usize
+            let cb: u64 = ctxbase + (mode * 512) as u64
+            let cid: usize = (rt.ld8(cb, p1 as usize) as usize) | (rt.ld8(cb + 256, p2 as usize) as usize)
+            let tree: usize = (*d).cmap_l[((*d).bt[0] << 6) + cid] as usize
+            let lit: u32 = rd_sym(d, (*d).forest_l + (tree * bitio.tree_size(256)) as u64)
+            if lit == 0xFFFFFFFF {
+                return CompressError::Data
+            }
+            rt.st8((*out).ptr, op, lit as u8)
+            op = op + 1
+            p2 = p1
+            p1 = lit
+            k = k + 1
+        }
+        if exhausted(d) {
+            return CompressError::Truncated
+        }
+        (*out).len = op
+        (*d).total = (*d).total + (ins as u64)
+        (*d).produced = (*d).produced + ins
+        (*d).mlen = (*d).mlen - ins
+        if (*d).mlen == 0 {
+            break
+        }
+        // the distance
+        var dist: i64 = 0
+        var push: bool = true
+        if cell < 2 {
+            dist = (*d).rb[0]
+            push = false
+        } else {
+            if (*d).bl[2] == 0 {
+                try block_switch(d, 2)
+            }
+            (*d).bl[2] = (*d).bl[2] - 1
+            var dctx: usize = 3
+            if cpy <= 4 {
+                dctx = cpy - 2
+            }
+            let tree: usize = (*d).cmap_d[((*d).bt[2] << 2) + dctx] as usize
+            let dc: u32 = rd_sym(d, (*d).forest_d + (tree * bitio.tree_size((*d).dist_alpha)) as u64)
+            if dc == 0xFFFFFFFF {
+                return CompressError::Data
+            }
+            let dcode: usize = dc as usize
+            if dcode < 16 {
+                if dcode == 0 {
+                    dist = (*d).rb[0]
+                    push = false
+                } else if dcode < 4 {
+                    dist = (*d).rb[dcode]
+                } else {
+                    var base: i64 = (*d).rb[0]
+                    var idx: usize = dcode - 4
+                    if dcode >= 10 {
+                        base = (*d).rb[1]
+                        idx = dcode - 10
+                    }
+                    // offsets -1, +1, -2, +2, -3, +3
+                    var delta: i64 = ((idx / 2) as i64) + 1
+                    if idx % 2 == 0 {
+                        delta = 0 - delta
+                    }
+                    dist = base + delta
+                }
+                if dist <= 0 {
+                    return CompressError::Data
+                }
+            } else if dcode < 16 + (*d).ndirect {
+                dist = ((dcode - 15) as i64)
+            } else {
+                let np: usize = (*d).npostfix
+                let x: usize = dcode - (*d).ndirect - 16
+                let nbits: usize = 1 + (x >> (np + 1))
+                let hcode: usize = x >> np
+                let lcode: usize = x & (((1 as usize) << np) - 1)
+                let off: usize = (((2 + (hcode & 1)) << nbits)) - 4
+                let extra: usize = bits(d, nbits) as usize
+                dist = ((((off + extra) << np) + lcode + (*d).ndirect + 1) as i64)
+            }
+            if exhausted(d) {
+                return CompressError::Truncated
+            }
+        }
+        // the copy: from the window, or a word of the static dictionary
+        var maxd: i64 = (*d).window as i64
+        if ((*d).total as i64) < maxd {
+            maxd = (*d).total as i64
+        }
+        if dist <= maxd {
+            if cpy > (*d).mlen {
+                return CompressError::Data
+            }
+            if too_big(d, cpy) {
+                return CompressError::TooLarge
+            }
+            if !common.buf_ensure(out, (*out).len + cpy + 64) {
+                return CompressError::OutOfMemory
+            }
+            if push {
+                (*d).rb[3] = (*d).rb[2]
+                (*d).rb[2] = (*d).rb[1]
+                (*d).rb[1] = (*d).rb[0]
+                (*d).rb[0] = dist
+            }
+            let o: usize = (*out).len
+            let dd: usize = dist as usize
+            if dd >= 8 {
+                rt.mem_copy((*out).ptr + o as u64, (*out).ptr + (o - dd) as u64, cpy)
+            } else {
+                var j: usize = 0
+                while j < cpy {
+                    rt.st8((*out).ptr, o + j, rt.ld8((*out).ptr, o + j - dd))
+                    j = j + 1
+                }
+            }
+            (*out).len = o + cpy
+            (*d).total = (*d).total + (cpy as u64)
+            (*d).produced = (*d).produced + cpy
+            (*d).mlen = (*d).mlen - cpy
+        } else {
+            if cpy < 4 || cpy > 24 {
+                return CompressError::Data
+            }
+            let wid: usize = (dist - maxd - 1) as usize
+            let nb: usize = NDBITS[cpy] as usize
+            let widx: usize = wid & (((1 as usize) << nb) - 1)
+            let tid: usize = wid >> nb
+            if tid >= 121 {
+                return CompressError::Data
+            }
+            let n: usize = transform_word(d, (&scratch[0]) as u64, dict + (dict_offset(cpy) + widx * cpy) as u64,
+                cpy, tid)
+            if n > (*d).mlen {
+                return CompressError::Data
+            }
+            if too_big(d, n) {
+                return CompressError::TooLarge
+            }
+            if !common.buf_append_bytes(out, (&scratch[0]) as u64, n) {
+                return CompressError::OutOfMemory
+            }
+            (*d).total = (*d).total + (n as u64)
+            (*d).produced = (*d).produced + n
+            (*d).mlen = (*d).mlen - n
+        }
+    }
+    return (*d).mlen == 0
+}
+
+fn bad_input(d: *mut BrDec) -> CompressError {
+    if common.src_failed(&(*d).b.src) {
+        return CompressError::Io
+    }
+    return CompressError::Truncated
+}
+
+// One step: the stream header, a meta-block header (stored and metadata
+// blocks are finished in it), or one slice of commands. false = the end.
+fn brotli_step(d: *mut BrDec, out: *mut rt.Buf) -> CompressError!bool {
+    let st: u32 = (*d).state
+    if st == 9 {
+        return false
+    }
+    if st == 0 {
+        // WBITS
+        var w: u32 = 16
+        if bit(d) {
+            let n: u32 = bits(d, 3)
+            if n != 0 {
+                w = 17 + n
+            } else {
+                let m: u32 = bits(d, 3)
+                if m == 1 {
+                    return CompressError::Unsupported // the large window extension
+                }
+                if m != 0 {
+                    w = 8 + m
+                } else {
+                    w = 17
+                }
+            }
+        }
+        if exhausted(d) {
+            return bad_input(d)
+        }
+        (*d).wbits = w
+        (*d).window = ((1 as usize) << (w as usize)) - 16
+        (*d).state = 1
+        return true
+    }
+    if st == 2 {
+        let done: bool = try run_commands(d, out)
+        if done {
+            if (*d).is_last {
+                (*d).state = 9
+                return false
+            }
+            (*d).state = 1
+        }
+        return true
+    }
+    // a meta-block header
+    (*d).is_last = bit(d)
+    if (*d).is_last {
+        if bit(d) {
+            if exhausted(d) {
+                return bad_input(d)
+            }
+            (*d).state = 9
+            return false
+        }
+    }
+    let mn: u32 = bits(d, 2)
+    if mn == 3 {
+        // metadata: skipped
+        if bit(d) {
+            return CompressError::Data // reserved
+        }
+        let sb: usize = bits(d, 2) as usize
+        var skip: usize = 0
+        if sb > 0 {
+            var v: usize = 0
+            var i: usize = 0
+            while i < sb {
+                v = v | ((bits(d, 8) as usize) << (8 * i))
+                i = i + 1
+            }
+            if sb > 1 && (v >> (8 * (sb - 1))) == 0 {
+                return CompressError::Data
+            }
+            skip = v + 1
+        }
+        if exhausted(d) {
+            return bad_input(d)
+        }
+        if !align(d) {
+            return CompressError::Data
+        }
+        if !skip_bytes(d, skip) {
+            return bad_input(d)
+        }
+        if (*d).is_last {
+            return CompressError::Data
+        }
+        return true
+    }
+    let nn: usize = (mn as usize) + 4
+    var ml: usize = 0
+    var i: usize = 0
+    while i < nn {
+        ml = ml | ((bits(d, 4) as usize) << (4 * i))
+        i = i + 1
+    }
+    if nn > 4 && (ml >> (4 * (nn - 1))) == 0 {
+        return CompressError::Data
+    }
+    ml = ml + 1
+    if exhausted(d) {
+        return bad_input(d)
+    }
+    (*d).mlen = ml
+    var uncompressed: bool = false
+    if !(*d).is_last {
+        uncompressed = bit(d)
+    }
+    if uncompressed {
+        if !align(d) {
+            return CompressError::Data
+        }
+        if too_big(d, ml) {
+            return CompressError::TooLarge
+        }
+        if !common.buf_ensure(out, (*out).len + ml) {
+            return CompressError::OutOfMemory
+        }
+        if !read_bytes(d, (*out).ptr + (*out).len as u64, ml) {
+            return bad_input(d)
+        }
+        (*out).len = (*out).len + ml
+        (*d).total = (*d).total + (ml as u64)
+        (*d).produced = (*d).produced + ml
+        (*d).mlen = 0
+        return true
+    }
+    try read_compressed_header(d)
+    (*d).state = 2
+    return true
+}
+
+// ---------------------------------------------------------- whole buffer
+
+fn brotli_decompress(src: u64, n: usize, out: *mut rt.Buf) -> CompressError!usize {
+    return try brotli_decompress_limited(src, n, 0, out)
+}
+
+fn brotli_decompress_limited(src: u64, n: usize, max: usize, out: *mut rt.Buf) -> CompressError!usize {
+    var d: BrDec = brotli_dec_open_mem(src, n)
+    defer brotli_dec_close(&d)
+    d.max = max
+    let before: usize = (*out).len
+    while true {
+        let more: bool = try brotli_step(&d, out)
+        if !more {
+            break
+        }
+    }
+    return (*out).len - before
+}
+
+// ---------------------------------------------------------------- streaming
+
+fn brotli_dec_read(d: *mut BrDec, dst: u64, n: usize) -> CompressError!usize {
+    while (*d).drained >= (*d).out.len && (*d).state != 9 {
+        var keep: usize = 0
+        if (*d).state != 0 {
+            keep = (*d).window
+        }
+        let cut: usize = common.buf_compact(&(*d).out, (*d).drained, keep)
+        (*d).drained = (*d).drained - cut
+        let more: bool = try brotli_step(d, &(*d).out)
+        if !more {
+            break
+        }
+    }
+    var k: usize = (*d).out.len - (*d).drained
+    if k > n {
+        k = n
+    }
+    if k > 0 {
+        rt.mem_copy(dst, (*d).out.ptr + (*d).drained as u64, k)
+        (*d).drained = (*d).drained + k
+    }
+    return k
+}
+
+fn brotli_dec_open_source(s: common.Source) -> BrDec {
+    return dec_new(s)
+}
+
+struct BrDecPair {
+    a: BrDec,
+    b: BrDec,
+}
+
+// The size of a decoder in octets (the step between two of them in a pair).
+fn brotli_dec_size() -> usize {
+    var p: BrDecPair = BrDecPair { a: dec_new(common.src_mem(0, 0)), b: dec_new(common.src_mem(0, 0)) }
+    let sz: usize = ((&p.b) as usize) - ((&p.a) as usize)
+    brotli_dec_close(&p.a)
+    brotli_dec_close(&p.b)
+    return sz
+}

@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/db/bench.fi -- the benchmarks of lib/db (tools/db/bench.py runs the same work in
+// SQLite and prints both):
+//
+//     bench <dir> [rows]       (default 100000 rows for the insert tests, 1000000 for the scan)
+//
+// Prints "<name> <milliseconds>" lines.
+import std.rt
+import std.io
+import db.dberr
+import db.dbcore as dc
+import db.sqlite as sq
+
+fn now_ms() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, ((&ts[0]) as u64) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000 + ts[1] / 1000000
+}
+
+fn report(name: str, t0: i64) {
+    let dt: i64 = now_ms() - t0
+    io.print(name)
+    io.print(" ")
+    io.fmt_print_line(io.fmt_number(io.fmt_new(), dt))
+}
+
+fn die(e: DbError) -> bool {
+    io.eprint("ERROR ")
+    io.eprint_line(sq.last_error_message())
+    return false
+}
+
+fn path_in(dir: str, name: str) -> str {
+    return dir + "/" + name
+}
+
+fn exec(d: *mut dc.Db, sql: str) {
+    let ok: bool = sq.db_exec(d, sql) catch | e | (die(e))
+    if !ok {
+        io.eprint_line(sql)
+    }
+}
+
+fn scalar(d: *mut dc.Db, sql: str) -> i64 {
+    return sq.db_query_int(d, sql, -1) catch | e | (die_i(e))
+}
+
+fn die_i(e: DbError) -> i64 {
+    io.eprint("ERROR ")
+    io.eprint_line(sq.last_error_message())
+    return -2
+}
+
+fn num(s: str) -> i64 {
+    var v: i64 = 0
+    var i: usize = 0
+    while i < s.length() {
+        v = v * 10 + ((s.chars(i) as i64) - 48)
+        i = i + 1
+    }
+    return v
+}
+
+fn main(start: u64) -> i32 {
+    let a1: u64 = rt.arg_ptr(start, 1)
+    let dir: str = str { p: rt.ptr_of(a1), n: rt.c_length(a1) }
+    var n: i64 = 100000
+    var big: i64 = 1000000
+    if rt.arg_count(start) > 2 {
+        let a2: u64 = rt.arg_ptr(start, 2)
+        n = num(str { p: rt.ptr_of(a2), n: rt.c_length(a2) })
+        big = n * 10
+    }
+    let path: str = path_in(dir, "bench.db")
+    let d: *mut dc.Db = sq.db_open(path, sq.OPEN_CREATE) catch | e | (0 as *mut dc.Db)
+    if (d as u64) == 0 {
+        io.eprint_line("cannot open")
+        return 1
+    }
+    // ---- 1. n inserts, one transaction, prepared statement with bound parameters
+    exec(d, "CREATE TABLE b(id INTEGER PRIMARY KEY, a INTEGER, name TEXT, v REAL)")
+    exec(d, "CREATE INDEX b_a ON b(a)")
+    var t0: i64 = now_ms()
+    exec(d, "BEGIN")
+    let ins: *mut dc.Stmt = sq.db_prepare(d, "INSERT INTO b(a, name, v) VALUES (?, ?, ?)") catch | e | (0 as *mut dc.Stmt)
+    var i: i64 = 0
+    while i < n {
+        sq.stmt_bind_int(ins, 1, (i * 7919) % 10007) catch false
+        sq.stmt_bind_text(ins, 2, "name number") catch false
+        sq.stmt_bind_real(ins, 3, (i as f64) * 0.5) catch false
+        sq.stmt_step(ins) catch false
+        sq.stmt_reset(ins)
+        i = i + 1
+    }
+    sq.stmt_finalize(ins)
+    exec(d, "COMMIT")
+    report("insert_100k_one_txn", t0)
+    if rt.arg_count(start) > 3 {
+        // a third argument: only the first test (for the profiler)
+        sq.db_close(d)
+        return 0
+    }
+    // ---- 2. the same with every insert its own transaction and no fsync (the cost of a commit)
+    exec(d, "PRAGMA synchronous = OFF")
+    exec(d, "CREATE TABLE c(id INTEGER PRIMARY KEY, a INTEGER)")
+    t0 = now_ms()
+    let ins2: *mut dc.Stmt = sq.db_prepare(d, "INSERT INTO c(a) VALUES (?)") catch | e | (0 as *mut dc.Stmt)
+    var k: i64 = 0
+    while k < n / 10 {
+        sq.stmt_bind_int(ins2, 1, k) catch false
+        sq.stmt_step(ins2) catch false
+        sq.stmt_reset(ins2)
+        k = k + 1
+    }
+    sq.stmt_finalize(ins2)
+    report("insert_10k_own_txn_nosync", t0)
+    exec(d, "PRAGMA synchronous = FULL")
+    // ---- 3. the same with fsync, fewer
+    t0 = now_ms()
+    let ins3: *mut dc.Stmt = sq.db_prepare(d, "INSERT INTO c(a) VALUES (?)") catch | e | (0 as *mut dc.Stmt)
+    k = 0
+    while k < 200 {
+        sq.stmt_bind_int(ins3, 1, k) catch false
+        sq.stmt_step(ins3) catch false
+        sq.stmt_reset(ins3)
+        k = k + 1
+    }
+    sq.stmt_finalize(ins3)
+    report("insert_200_own_txn_fsync", t0)
+    // ---- 4. a big table for scans: `big` rows in one statement
+    exec(d, "CREATE TABLE s(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, t TEXT)")
+    t0 = now_ms()
+    exec(d, "BEGIN")
+    let ins4: *mut dc.Stmt = sq.db_prepare(d, "INSERT INTO s(a, b, t) VALUES (?, ?, ?)") catch | e | (0 as *mut dc.Stmt)
+    var j: i64 = 0
+    while j < big {
+        sq.stmt_bind_int(ins4, 1, j % 1000) catch false
+        sq.stmt_bind_int(ins4, 2, (j * 31) % 977) catch false
+        sq.stmt_bind_text(ins4, 3, "row") catch false
+        sq.stmt_step(ins4) catch false
+        sq.stmt_reset(ins4)
+        j = j + 1
+    }
+    sq.stmt_finalize(ins4)
+    exec(d, "COMMIT")
+    report("insert_1M_one_txn", t0)
+    // ---- 5. scans
+    t0 = now_ms()
+    let c1: i64 = scalar(d, "SELECT count(*) FROM s WHERE a = 7 AND b > 100")
+    report("scan_1M_count_where", t0)
+    t0 = now_ms()
+    let c2: i64 = scalar(d, "SELECT sum(a * b) FROM s")
+    report("scan_1M_sum_expr", t0)
+    t0 = now_ms()
+    let c3: i64 = scalar(d, "SELECT count(*) FROM s WHERE t = 'row' AND id % 3 = 0")
+    report("scan_1M_text_filter", t0)
+    // rows through the API
+    t0 = now_ms()
+    let sel: *mut dc.Stmt = sq.db_prepare(d, "SELECT id, a, b FROM s WHERE a < 500") catch | e | (0 as *mut dc.Stmt)
+    var acc: i64 = 0
+    while true {
+        let more: bool = sq.stmt_step(sel) catch false
+        if !more {
+            break
+        }
+        acc = acc + sq.stmt_column_int(sel, 1)
+    }
+    sq.stmt_finalize(sel)
+    report("scan_1M_rows_through_api", t0)
+    // ---- 6. lookups
+    exec(d, "CREATE INDEX s_a ON s(a)")
+    t0 = now_ms()
+    exec(d, "CREATE INDEX s_b ON s(b)")
+    report("create_index_1M", t0)
+    t0 = now_ms()
+    let look: *mut dc.Stmt = sq.db_prepare(d, "SELECT b FROM s WHERE id = ?") catch | e | (0 as *mut dc.Stmt)
+    var q: i64 = 0
+    var sum: i64 = 0
+    while q < n {
+        sq.stmt_bind_int(look, 1, 1 + (q * 7919) % big) catch false
+        let m: bool = sq.stmt_step(look) catch false
+        if m {
+            sum = sum + sq.stmt_column_int(look, 0)
+        }
+        sq.stmt_reset(look)
+        q = q + 1
+    }
+    sq.stmt_finalize(look)
+    report("lookup_100k_by_rowid", t0)
+    t0 = now_ms()
+    let look2: *mut dc.Stmt = sq.db_prepare(d, "SELECT count(*) FROM s WHERE a = ?") catch | e | (0 as *mut dc.Stmt)
+    q = 0
+    while q < 2000 {
+        sq.stmt_bind_int(look2, 1, q % 1000) catch false
+        let m2: bool = sq.stmt_step(look2) catch false
+        if m2 {
+            sum = sum + sq.stmt_column_int(look2, 0)
+        }
+        sq.stmt_reset(look2)
+        q = q + 1
+    }
+    sq.stmt_finalize(look2)
+    report("lookup_2k_by_index_1000_rows_each", t0)
+    // ---- 7. sort and group
+    t0 = now_ms()
+    let c4: i64 = scalar(d, "SELECT count(*) FROM (SELECT b, id FROM s ORDER BY b, id LIMIT 100000)")
+    report("order_by_100k_of_1M", t0)
+    t0 = now_ms()
+    let c5: i64 = scalar(d, "SELECT count(*) FROM (SELECT a, count(*), avg(b) FROM s GROUP BY a)")
+    report("group_by_1M", t0)
+    // ---- 8. update and delete in a transaction
+    t0 = now_ms()
+    exec(d, "UPDATE b SET v = v + 1, a = a + 1 WHERE id % 2 = 0")
+    report("update_50k_with_index", t0)
+    t0 = now_ms()
+    exec(d, "DELETE FROM b WHERE id % 3 = 0")
+    report("delete_33k_with_index", t0)
+    // ---- 9. file size
+    let pages: i64 = scalar(d, "PRAGMA page_count")
+    io.print("pages ")
+    io.fmt_print_line(io.fmt_number(io.fmt_new(), pages))
+    io.print("check ")
+    io.fmt_print_line(io.fmt_number(io.fmt_number(io.fmt_number(io.fmt_number(io.fmt_number(io.fmt_new(), c1), c2), c3), c4), c5))
+    sq.db_close(d)
+    return 0
+}

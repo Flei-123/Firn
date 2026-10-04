@@ -1,0 +1,484 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/schema.fi -- reading the schema of a database: sqlite_master -> tables,
+// columns, indexes.
+//
+// Every `CREATE TABLE` / `CREATE INDEX` text in sqlite_master is parsed with the
+// same parser the statements use. What this library cannot work with does NOT stop
+// the database from opening: a table or index it does not understand is marked
+// `bad` (with the reason) and answers `Unsupported` only when it is used.
+//
+// The INTEGER PRIMARY KEY column is the rowid (an alias): its record slot holds NULL
+// and the value comes from the rowid. Auto-indexes of UNIQUE / PRIMARY KEY
+// constraints have no SQL text; they are matched to the constraints of the table in
+// order (`sqlite_autoindex_<table>_<n>`), the way SQLite creates them.
+//
+// HONEST NOTES
+//   D1 Views are not supported (a SELECT from one answers "no such table"); triggers make
+//      every write answer Unsupported (they would not fire).
+//   D2 Indexes on expressions, partial indexes and indexes with a collation other than
+//      BINARY are `bad`: reads work (they are not used), writes to the table do not.
+//   D3 The text encoding must be UTF-8 (checked by the pager).
+
+import std.rt
+import db.dberr
+import db.util as ut
+import db.record as rc
+import db.arena as ar
+import db.dbcore as dc
+import db.pager as pgr
+import db.btree as bx
+import db.sqlast as ax
+import db.sqlparse as sp
+
+export { schema_load, ensure_schema, header_cookie, schema_text_copy, MASTER_SQL }
+
+const MASTER_SQL: str = "CREATE TABLE sqlite_master(type text,name text,tbl_name text,rootpage integer,sql text)"
+
+fn header_cookie(db: *mut dc.Db) -> DbError!u32 {
+    if pgr.pager_page_count(&(*db).pg) == 0 {
+        return 0
+    }
+    let d: u64 = try pgr.pager_get(&(*db).pg, 1)
+    return ut.rd32(d, 40) as u32
+}
+
+fn schema_text_copy(db: *mut dc.Db, p: u64, n: usize) -> u64 {
+    return ar.arena_copy(&(*db).schema.arena, p, n)
+}
+
+fn ieq(p: u64, n: usize, w: str) -> bool {
+    return dc.name_eq(p, n, w.p as u64, w.length())
+}
+
+// is the declared type exactly the word INTEGER?
+fn is_integer_type(p: u64, n: usize) -> bool {
+    return ieq(p, n, "integer")
+}
+
+fn table_blank() -> dc.Table {
+    return dc.Table { name_p: 0, name_n: 0, root: 0, ncols: 0, cols: 0, rowid_col: -1, autoinc: false, bad: false,
+        msg_p: 0, msg_n: 0, sql_p: 0, sql_n: 0, tchecks: -1, nuniq: 0, uniq_cols: [-1; 64], ast_root: -1, mrowid: 0 }
+}
+
+fn index_blank() -> dc.Index {
+    return dc.Index { name_p: 0, name_n: 0, table: -1, root: 0, ncols: 0, cols: [-1; 32], desc: 0, unique: false,
+        auto: false, bad: false, msg_p: 0, msg_n: 0, mrowid: 0, sql_p: 0, sql_n: 0 }
+}
+
+fn add_uniq(t: *mut dc.Table, cols: *mut i32, n: usize) -> bool {
+    if n == 0 || n > 8 || (*t).nuniq >= 8 {
+        return false
+    }
+    // an identical constraint is not repeated
+    var c: usize = 0
+    while c < (*t).nuniq {
+        var same: bool = true
+        var k: usize = 0
+        while k < 8 {
+            var want: i32 = -1
+            if k < n {
+                want = *(cols + k)
+            }
+            if (*t).uniq_cols[c * 8 + k] != want {
+                same = false
+            }
+            k = k + 1
+        }
+        if same {
+            return true
+        }
+        c = c + 1
+    }
+    var k2: usize = 0
+    while k2 < 8 {
+        if k2 < n {
+            (*t).uniq_cols[(*t).nuniq * 8 + k2] = *(cols + k2)
+        } else {
+            (*t).uniq_cols[(*t).nuniq * 8 + k2] = -1
+        }
+        k2 = k2 + 1
+    }
+    (*t).nuniq = (*t).nuniq + 1
+    return true
+}
+
+// Builds a Table from the parsed CREATE TABLE. `bad` is set on trouble.
+fn build_table(db: *mut dc.Db, t: *mut dc.Table, node: i32) -> DbError!bool {
+    let sc: *mut dc.Schema = &(*db).schema
+    let ast: *mut ax.Ast = &(*sc).ast
+    let ct: *mut ax.Node = ax.ast_n(ast, node)
+    // columns
+    var ncols: usize = 0
+    var c: i32 = (*ct).a
+    while c >= 0 {
+        ncols = ncols + 1
+        c = (*ax.ast_n(ast, c)).next
+    }
+    if ncols == 0 || ncols > 2000 {
+        return dberr.fail(DbError::Unsupported, "a table needs 1 to 2000 columns")
+    }
+    let arr: u64 = ar.arena_alloc(&(*sc).arena, ncols * dc.sz_of_column() + 8)
+    (*t).cols = arr
+    (*t).ncols = ncols
+    var i: usize = 0
+    c = (*ct).a
+    var pk_count: usize = 0
+    var pk_col: i32 = -1
+    while c >= 0 {
+        let cn: *mut ax.Node = ax.ast_n(ast, c)
+        let col: *mut dc.Column = (arr as *mut dc.Column) + i
+        (*col).name_p = (*cn).sp
+        (*col).name_n = (*cn).sn
+        (*col).type_p = (*cn).sp2
+        (*col).type_n = (*cn).sn2
+        (*col).aff = (*cn).ival
+        (*col).flags = (*cn).flag
+        (*col).coll = (*cn).op
+        (*col).dflt = (*cn).a
+        (*col).checks = (*cn).b
+        if ((*cn).flag & 1) != 0 {
+            pk_count = pk_count + 1
+            pk_col = i as i32
+        }
+        if ((*cn).flag & 8) != 0 {
+            (*t).autoinc = true
+        }
+        i = i + 1
+        c = (*cn).next
+    }
+    // table constraints: PRIMARY KEY (cols), UNIQUE (cols), CHECK
+    var tc: i32 = (*ct).b
+    (*t).tchecks = tc
+    var tpk: [i32; 8] = [-1; 8]
+    var ntpk: usize = 0
+    var has_tpk: bool = false
+    while tc >= 0 {
+        let tn: *mut ax.Node = ax.ast_n(ast, tc)
+        if (*tn).op == 1 {
+            has_tpk = true
+            var ic: i32 = (*tn).a
+            while ic >= 0 {
+                let icn: *mut ax.Node = ax.ast_n(ast, ic)
+                let ci: i64 = dc.find_column(t, (*icn).sp, (*icn).sn)
+                if ci < 0 {
+                    return dberr.fail(DbError::Unsupported, "PRIMARY KEY names an unknown column")
+                }
+                if ntpk < 8 {
+                    tpk[ntpk] = ci as i32
+                    ntpk = ntpk + 1
+                }
+                ic = (*icn).next
+            }
+        }
+        tc = (*tn).next
+    }
+    // the rowid alias: one PRIMARY KEY column declared exactly INTEGER (not DESC)
+    var alias: i32 = -1
+    if pk_count == 1 && !has_tpk {
+        let col: *mut dc.Column = (arr as *mut dc.Column) + (pk_col as usize)
+        if is_integer_type((*col).type_p, (*col).type_n) && ((*col).flags & 16) == 0 {
+            alias = pk_col
+        }
+    } else if pk_count == 0 && has_tpk && ntpk == 1 {
+        let col: *mut dc.Column = (arr as *mut dc.Column) + (tpk[0] as usize)
+        if is_integer_type((*col).type_p, (*col).type_n) {
+            alias = tpk[0]
+        }
+    }
+    if alias >= 0 {
+        (*t).rowid_col = alias
+        let col: *mut dc.Column = (arr as *mut dc.Column) + (alias as usize)
+        (*col).flags = (*col).flags | dc.CF_ROWID
+    }
+    // the unique constraints in textual order (columns first, then table constraints)
+    var j: usize = 0
+    while j < ncols {
+        let col: *mut dc.Column = (arr as *mut dc.Column) + j
+        var one: [i32; 1] = [j as i32]
+        if ((*col).flags & dc.CF_PK) != 0 && (j as i32) != alias {
+            if !add_uniq(t, &one[0], 1) {
+                return dberr.fail(DbError::Unsupported, "too many UNIQUE constraints")
+            }
+        }
+        if ((*col).flags & dc.CF_UNIQUE) != 0 {
+            if !add_uniq(t, &one[0], 1) {
+                return dberr.fail(DbError::Unsupported, "too many UNIQUE constraints")
+            }
+        }
+        j = j + 1
+    }
+    tc = (*ct).b
+    while tc >= 0 {
+        let tn: *mut ax.Node = ax.ast_n(ast, tc)
+        if (*tn).op == 1 || (*tn).op == 2 {
+            var cols: [i32; 8] = [-1; 8]
+            var nc: usize = 0
+            var ic: i32 = (*tn).a
+            while ic >= 0 {
+                let icn: *mut ax.Node = ax.ast_n(ast, ic)
+                let ci: i64 = dc.find_column(t, (*icn).sp, (*icn).sn)
+                if ci < 0 {
+                    return dberr.fail(DbError::Unsupported, "UNIQUE names an unknown column")
+                }
+                if nc < 8 {
+                    cols[nc] = ci as i32
+                    nc = nc + 1
+                }
+                ic = (*icn).next
+            }
+            let is_alias_pk: bool = (*tn).op == 1 && alias >= 0
+            if !is_alias_pk {
+                if !add_uniq(t, &cols[0], nc) {
+                    return dberr.fail(DbError::Unsupported, "too many or too wide UNIQUE constraints")
+                }
+            }
+        }
+        tc = (*tn).next
+    }
+    return true
+}
+
+fn copy_val_text(db: *mut dc.Db, v: *mut rc.Val, outp: *mut u64, outn: *mut usize) {
+    if (*v).t == 3 || (*v).t == 4 {
+        *outp = ar.arena_copy(&(*db).schema.arena, (*v).p, (*v).n)
+        *outn = (*v).n
+    } else {
+        *outp = 0
+        *outn = 0
+    }
+}
+
+fn set_msg(db: *mut dc.Db, p: *mut u64, n: *mut usize) {
+    let m: str = dberr.last_message()
+    *p = ar.arena_copy(&(*db).schema.arena, m.p as u64, m.length())
+    *n = m.length()
+}
+
+fn load_table_row(db: *mut dc.Db, rowid: i64, name: *mut rc.Val, root: i64, sql: *mut rc.Val) -> DbError!bool {
+    let sc: *mut dc.Schema = &(*db).schema
+    var t: dc.Table = table_blank()
+    copy_val_text(db, name, &t.name_p, &t.name_n)
+    t.root = root as u32
+    t.mrowid = rowid
+    if (*sql).t != 3 {
+        t.bad = true
+        t.msg_p = "no SQL for this table".p as u64
+        t.msg_n = 21
+        vec_push_table(sc, &t)
+        return true
+    }
+    copy_val_text(db, sql, &t.sql_p, &t.sql_n)
+    // parse the copy (its text must live as long as the schema)
+    let ast: *mut ax.Ast = &(*sc).ast
+    var ps: sp.Parser = sp.parser_new(ast, t.sql_p, t.sql_n)
+    let r: DbError!i32 = sp.parse_stmt(&ps)
+    var node: i32 = r catch -1
+    if node < 0 {
+        t.bad = true
+        set_msg(db, &t.msg_p, &t.msg_n)
+        vec_push_table(sc, &t)
+        return true
+    }
+    let nd: *mut ax.Node = ax.ast_n(ast, node)
+    if (*nd).kind != ax.N_CREATE_TABLE {
+        t.bad = true
+        t.msg_p = "not a CREATE TABLE".p as u64
+        t.msg_n = 18
+        vec_push_table(sc, &t)
+        return true
+    }
+    t.ast_root = node
+    let b: DbError!bool = build_table(db, &t, node)
+    let ok: bool = b catch false
+    if !ok {
+        t.bad = true
+        set_msg(db, &t.msg_p, &t.msg_n)
+        if t.cols == 0 {
+            // a table without columns cannot even be listed
+            t.ncols = 0
+        }
+    }
+    vec_push_table(sc, &t)
+    return true
+}
+
+fn vec_push_table(sc: *mut dc.Schema, t: *mut dc.Table) {
+    dc.schema_add_table(sc, t)
+}
+
+fn load_index_row(db: *mut dc.Db, rowid: i64, name: *mut rc.Val, tbl: *mut rc.Val, root: i64, sql: *mut rc.Val) -> DbError!bool {
+    let sc: *mut dc.Schema = &(*db).schema
+    var ix: dc.Index = index_blank()
+    copy_val_text(db, name, &ix.name_p, &ix.name_n)
+    var tp: u64 = 0
+    var tn: usize = 0
+    copy_val_text(db, tbl, &tp, &tn)
+    let ti: i64 = dc.find_table(sc, tp, tn)
+    if ti < 0 {
+        return true
+    }
+    ix.table = ti as i32
+    ix.root = root as u32
+    ix.mrowid = rowid
+    let t: *mut dc.Table = dc.table_at(sc, ti as usize)
+    if (*sql).t == 3 {
+        copy_val_text(db, sql, &ix.sql_p, &ix.sql_n)
+        let ast: *mut ax.Ast = &(*sc).ast
+        var ps: sp.Parser = sp.parser_new(ast, ix.sql_p, ix.sql_n)
+        let r: DbError!i32 = sp.parse_stmt(&ps)
+        let node: i32 = r catch -1
+        if node < 0 {
+            ix.bad = true
+            set_msg(db, &ix.msg_p, &ix.msg_n)
+            dc.schema_add_index(sc, &ix)
+            return true
+        }
+        let nd: *mut ax.Node = ax.ast_n(ast, node)
+        if (*nd).kind != ax.N_CREATE_INDEX {
+            ix.bad = true
+            dc.schema_add_index(sc, &ix)
+            return true
+        }
+        ix.unique = ((*nd).flag & 1) != 0
+        var c: i32 = (*nd).a
+        var k: usize = 0
+        while c >= 0 {
+            let cn: *mut ax.Node = ax.ast_n(ast, c)
+            let ci: i64 = dc.find_column(t, (*cn).sp, (*cn).sn)
+            if ci == -1 || k >= 32 {
+                ix.bad = true
+                dberr.set_message("index column is unknown or the index is too wide")
+                set_msg(db, &ix.msg_p, &ix.msg_n)
+                break
+            }
+            if ci == -2 {
+                ix.cols[k] = -1
+            } else {
+                ix.cols[k] = ci as i32
+                let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + (ci as usize)
+                if (*col).coll != 0 || (*cn).op != 0 {
+                    ix.bad = true
+                    dberr.set_message("index with a collation other than BINARY")
+                    set_msg(db, &ix.msg_p, &ix.msg_n)
+                }
+            }
+            if (*cn).flag == 1 {
+                ix.desc = ix.desc | (1 << (k as u64))
+            }
+            k = k + 1
+            c = (*cn).next
+        }
+        ix.ncols = k
+        dc.schema_add_index(sc, &ix)
+        return true
+    }
+    // an auto-index: the n-th constraint of the table
+    ix.auto = true
+    ix.unique = true
+    var n: usize = 0
+    var pos: usize = ix.name_n
+    // the number after the last '_'
+    var digits: usize = 0
+    while pos > 0 && rt.ld8(ix.name_p, pos - 1) >= 48 as u8 && rt.ld8(ix.name_p, pos - 1) <= 57 as u8 {
+        pos = pos - 1
+        digits = digits + 1
+    }
+    var q: usize = pos
+    while q < ix.name_n {
+        n = n * 10 + ((rt.ld8(ix.name_p, q) as usize) - 48)
+        q = q + 1
+    }
+    if digits == 0 || n == 0 || n > (*t).nuniq {
+        ix.bad = true
+        dberr.set_message("unknown auto-index")
+        set_msg(db, &ix.msg_p, &ix.msg_n)
+        dc.schema_add_index(sc, &ix)
+        return true
+    }
+    var k2: usize = 0
+    while k2 < 8 {
+        let cidx: i32 = (*t).uniq_cols[(n - 1) * 8 + k2]
+        if cidx < 0 {
+            break
+        }
+        ix.cols[k2] = cidx
+        let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + (cidx as usize)
+        if (*col).coll != 0 {
+            ix.bad = true
+            dberr.set_message("index with a collation other than BINARY")
+            set_msg(db, &ix.msg_p, &ix.msg_n)
+        }
+        if ((*col).flags & dc.CF_DESC) != 0 {
+            // a DESC primary key column: the auto-index is descending
+            ix.desc = ix.desc | (1 << (k2 as u64))
+        }
+        k2 = k2 + 1
+    }
+    ix.ncols = k2
+    dc.schema_add_index(sc, &ix)
+    return true
+}
+
+// Reads sqlite_master into the schema.
+fn schema_load(db: *mut dc.Db) -> DbError!bool {
+    let sc: *mut dc.Schema = &(*db).schema
+    dc.schema_clear(sc)
+    (*db).schema_gen = (*db).schema_gen + 1
+    // the master table itself
+    var nm: rc.Val = rc.val_text("sqlite_master".p as u64, 13)
+    var sq: rc.Val = rc.val_text(MASTER_SQL.p as u64, MASTER_SQL.length())
+    try load_table_row(db, 0, &nm, 1, &sq)
+    var nm2: rc.Val = rc.val_text("sqlite_schema".p as u64, 13)
+    try load_table_row(db, 0, &nm2, 1, &sq)
+    (*sc).cookie = try header_cookie(db)
+    if pgr.pager_page_count(&(*db).pg) == 0 {
+        (*sc).loaded = true
+        return true
+    }
+    let bt: *mut bx.Bt = &(*db).bt
+    var pass: usize = 0
+    while pass < 2 {
+        var cur: bx.Cursor = bx.cur_new(1, false)
+        var ok: bool = try bx.bt_first(bt, &cur)
+        while ok {
+            let rowid: i64 = try bx.bt_rowid(bt, &cur)
+            let pl: bx.Payload = try bx.bt_payload(bt, &cur)
+            var v: [rc.Val; 5] = [rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null(), rc.val_null()]
+            let n: usize = try rc.rec_decode(pl.p, pl.n, &v[0], 5)
+            if n >= 4 && v[0].t == 3 {
+                let tp: u64 = v[0].p
+                let tn: usize = v[0].n
+                var rootpage: i64 = 0
+                if v[3].t == 1 {
+                    rootpage = v[3].i
+                }
+                if pass == 0 {
+                    if ieq(tp, tn, "table") {
+                        try load_table_row(db, rowid, &v[1], rootpage, &v[4])
+                    } else if ieq(tp, tn, "trigger") {
+                        (*sc).has_triggers = true
+                    } else if ieq(tp, tn, "view") {
+                        (*sc).has_views = true
+                    }
+                } else {
+                    if ieq(tp, tn, "index") {
+                        try load_index_row(db, rowid, &v[1], &v[2], rootpage, &v[4])
+                    }
+                }
+            }
+            ok = try bx.bt_next(bt, &cur)
+        }
+        pass = pass + 1
+    }
+    (*sc).loaded = true
+    return true
+}
+
+// Makes sure the schema in memory is the one in the file (needs a read transaction).
+fn ensure_schema(db: *mut dc.Db) -> DbError!bool {
+    let ck: u32 = try header_cookie(db)
+    if !(*db).schema.loaded || (*db).schema.cookie != ck {
+        try schema_load(db)
+    }
+    return true
+}

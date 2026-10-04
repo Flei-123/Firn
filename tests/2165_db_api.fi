@@ -1,0 +1,227 @@
+// expect_exit: 0
+// tests/2165_db_api.fi -- the programming interface of lib/db/sqlite.fi: prepared statements, the
+// bound values of every type (and their numbers), reuse after a reset, the column accessors
+// and names, last_insert_rowid / changes, transactions, the kind of an error, a prepared
+// statement surviving a schema change, two statements alive at once, big values, a read-only
+// connection, the data being there after a reopen.
+import std.rt
+import std.io
+import std.fs
+import db.dberr
+import db.dbcore as dc
+import db.sqlite as sq
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+fn check_text(t: *mut Tally, what: str, got: str, want: str) {
+    (*t).total = (*t).total + 1
+    if !got.equal(want) {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print(what)
+        io.print(": got [")
+        io.print(got)
+        io.print("] want [")
+        io.print(want)
+        io.print_line("]")
+    }
+}
+
+fn scratch_path() -> str {
+    var b: rt.Buf = rt.buf_new()
+    let head: str = "/tmp/firn_db_2165_"
+    rt.buf_push_bytes(&b, head.p as u64, head.length())
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn kind_of(e: DbError) -> i64 {
+    if e == DbError::Constraint { return 1 }
+    if e == DbError::Range { return 2 }
+    if e == DbError::NoSuchTable { return 3 }
+    if e == DbError::Syntax { return 4 }
+    if e == DbError::ReadOnly { return 5 }
+    if e == DbError::Misuse { return 6 }
+    return 99
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let path: str = scratch_path()
+    let d: *mut dc.Db = sq.db_open(path, sq.OPEN_CREATE) catch | e | (0 as *mut dc.Db)
+    if (d as u64) == 0 {
+        io.print_line("FAIL cannot create the database")
+        return 2
+    }
+    check(&t, "exec several statements", sq.db_exec(d, "CREATE TABLE v(id INTEGER PRIMARY KEY, i INTEGER, r REAL, s TEXT, b BLOB, n); CREATE TABLE log(k INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT);") catch false)
+    // ---- every type bound and read back
+    let ins: *mut dc.Stmt = sq.db_prepare(d, "INSERT INTO v(i, r, s, b, n) VALUES (?1, ?2, ?3, ?4, ?5)") catch | e | (0 as *mut dc.Stmt)
+    check(&t, "five parameters", sq.stmt_param_count(ins) == 5)
+    var blob: [u8; 6] = [1, 0, 255, 3, 0, 9]
+    check(&t, "bind int", sq.stmt_bind_int(ins, 1, -9223372036854775807) catch false)
+    check(&t, "bind real", sq.stmt_bind_real(ins, 2, 2.5) catch false)
+    check(&t, "bind text", sq.stmt_bind_text(ins, 3, "héllo wörld") catch false)
+    check(&t, "bind blob", sq.stmt_bind_blob(ins, 4, (&blob[0]) as u64, 6) catch false)
+    check(&t, "bind null", sq.stmt_bind_null(ins, 5) catch false)
+    check(&t, "step insert", !(sq.stmt_step(ins) catch true))
+    check(&t, "last_insert_rowid", sq.db_last_insert_rowid(d) == 1)
+    check(&t, "changes", sq.db_changes(d) == 1)
+    // reuse: reset, new values, the old ones are still bound where not replaced
+    sq.stmt_reset(ins)
+    sq.stmt_bind_int(ins, 1, 7) catch false
+    sq.stmt_bind_text(ins, 3, "again") catch false
+    check(&t, "second step", !(sq.stmt_step(ins) catch true))
+    check(&t, "rowid 2", sq.db_last_insert_rowid(d) == 2)
+    sq.stmt_reset(ins)
+    sq.stmt_clear_bindings(ins)
+    check(&t, "third step, all NULL", !(sq.stmt_step(ins) catch true))
+    check(&t, "total_changes", sq.db_total_changes(d) == 3)
+    let bad: bool = sq.stmt_bind_int(ins, 6, 1) catch | e | (kind_of(e) == 2)
+    check(&t, "a parameter out of range is Range", bad)
+    sq.stmt_finalize(ins)
+    // ---- read it back
+    let sel: *mut dc.Stmt = sq.db_prepare(d, "SELECT id, i, r, s, b, n, i + 1 AS next, 'x' || id FROM v ORDER BY id") catch | e | (0 as *mut dc.Stmt)
+    check(&t, "eight columns", (sq.stmt_step(sel) catch false) && sq.stmt_column_count(sel) == 8)
+    check_text(&t, "name 0", sq.stmt_column_name(sel, 0), "id")
+    check_text(&t, "name of an alias", sq.stmt_column_name(sel, 6), "next")
+    check_text(&t, "name of an expression", sq.stmt_column_name(sel, 7), "'x' || id")
+    check(&t, "types of row 1", sq.stmt_column_type(sel, 1) == sq.COL_INT && sq.stmt_column_type(sel, 2) == sq.COL_REAL
+        && sq.stmt_column_type(sel, 3) == sq.COL_TEXT && sq.stmt_column_type(sel, 4) == sq.COL_BLOB && sq.stmt_column_type(sel, 5) == sq.COL_NULL)
+    check(&t, "int", sq.stmt_column_int(sel, 1) == -9223372036854775807)
+    check(&t, "real", sq.stmt_column_real(sel, 2) == 2.5)
+    check_text(&t, "text", sq.stmt_column_text(sel, 3), "héllo wörld")
+    var bp: u64 = 0
+    var bn: usize = 0
+    sq.stmt_column_blob(sel, 4, &bp, &bn)
+    check(&t, "blob", bn == 6 && rt.ld8(bp, 0) == 1 as u8 && rt.ld8(bp, 2) == 255 as u8 && rt.ld8(bp, 5) == 9 as u8)
+    check(&t, "NULL", sq.stmt_column_is_null(sel, 5))
+    check_text(&t, "an int as text", sq.stmt_column_text(sel, 0), "1")
+    check_text(&t, "a real as text", sq.stmt_column_text(sel, 2), "2.5")
+    check(&t, "row 2", (sq.stmt_step(sel) catch false) && sq.stmt_column_int(sel, 1) == 7)
+    check_text(&t, "row 2 text", sq.stmt_column_text(sel, 3), "again")
+    check(&t, "row 3 all NULL", (sq.stmt_step(sel) catch false) && sq.stmt_column_is_null(sel, 1) && sq.stmt_column_is_null(sel, 3))
+    check(&t, "no row 4", !(sq.stmt_step(sel) catch true))
+    sq.stmt_finalize(sel)
+    // ---- named parameters
+    let named: *mut dc.Stmt = sq.db_prepare(d, "SELECT :a + :b + :a, @c") catch | e | (0 as *mut dc.Stmt)
+    check(&t, "named parameters count 3", sq.stmt_param_count(named) == 3)
+    sq.stmt_bind_int(named, 1, 10) catch false
+    sq.stmt_bind_int(named, 2, 5) catch false
+    sq.stmt_bind_text(named, 3, "z") catch false
+    check(&t, "named sum", (sq.stmt_step(named) catch false) && sq.stmt_column_int(named, 0) == 25)
+    check_text(&t, "named text", sq.stmt_column_text(named, 1), "z")
+    sq.stmt_finalize(named)
+    // ---- transactions
+    check(&t, "not in a transaction", !sq.db_in_transaction(d))
+    check(&t, "begin", sq.db_begin(d) catch false)
+    check(&t, "in a transaction", sq.db_in_transaction(d))
+    sq.db_exec(d, "INSERT INTO log(msg) VALUES ('a'), ('b')") catch false
+    check(&t, "rollback", sq.db_rollback(d) catch false)
+    check(&t, "rolled back", (sq.db_query_int(d, "SELECT count(*) FROM log", -1) catch -2) == 0)
+    sq.db_begin(d) catch false
+    sq.db_exec(d, "INSERT INTO log(msg) VALUES ('c')") catch false
+    check(&t, "commit", sq.db_commit(d) catch false)
+    check(&t, "committed", (sq.db_query_int(d, "SELECT count(*) FROM log", -1) catch -2) == 1)
+    let twice: bool = sq.db_commit(d) catch | e | (kind_of(e) == 6)
+    check(&t, "commit without begin is Misuse", twice)
+    // ---- kinds of errors, and the message
+    let c1: bool = sq.db_exec(d, "INSERT INTO v(id) VALUES (1)") catch | e | (kind_of(e) == 1)
+    check(&t, "duplicate rowid is Constraint", c1)
+    check_text(&t, "its message", sq.last_error_message(), "UNIQUE constraint failed: v.id")
+    let c2: bool = sq.db_exec(d, "SELECT * FROM nothere") catch | e | (kind_of(e) == 3)
+    check(&t, "no such table", c2)
+    let c3: bool = sq.db_exec(d, "SELEKT 1") catch | e | (kind_of(e) == 4)
+    check(&t, "syntax error", c3)
+    // ---- a prepared statement survives a schema change
+    let keep: *mut dc.Stmt = sq.db_prepare(d, "SELECT * FROM log") catch | e | (0 as *mut dc.Stmt)
+    check(&t, "one column before", (sq.stmt_step(keep) catch false) && sq.stmt_column_count(keep) == 2)
+    sq.stmt_reset(keep)
+    sq.db_exec(d, "ALTER TABLE log ADD COLUMN extra INTEGER DEFAULT 77") catch false
+    check(&t, "three columns after", (sq.stmt_step(keep) catch false) && sq.stmt_column_count(keep) == 3 && sq.stmt_column_int(keep, 2) == 77)
+    sq.stmt_finalize(keep)
+    // ---- two statements alive at once: a SELECT is open while another statement writes
+    sq.db_exec(d, "INSERT INTO log(msg) VALUES ('d'), ('e'), ('f')") catch false
+    let outer: *mut dc.Stmt = sq.db_prepare(d, "SELECT msg FROM log ORDER BY k") catch | e | (0 as *mut dc.Stmt)
+    let inner: *mut dc.Stmt = sq.db_prepare(d, "INSERT INTO v(s) VALUES (?)") catch | e | (0 as *mut dc.Stmt)
+    var rows: i64 = 0
+    var wrote: i64 = 0
+    while sq.stmt_step(outer) catch false {
+        rows = rows + 1
+        sq.stmt_bind_text(inner, 1, sq.stmt_column_text(outer, 0)) catch false
+        sq.stmt_step(inner) catch false
+        sq.stmt_reset(inner)
+        wrote = wrote + 1
+    }
+    check(&t, "the select saw its rows", rows == 4)
+    check(&t, "the inserts happened", (sq.db_query_int(d, "SELECT count(*) FROM v", -1) catch -2) == 3 + wrote)
+    sq.stmt_finalize(outer)
+    sq.stmt_finalize(inner)
+    // ---- big values
+    let big: *mut dc.Stmt = sq.db_prepare(d, "INSERT INTO v(b, s) VALUES (?, ?)") catch | e | (0 as *mut dc.Stmt)
+    var bigbuf: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 300000 {
+        rt.buf_push(&bigbuf, ((i * 7) % 251) as u8)
+        i = i + 1
+    }
+    sq.stmt_bind_blob(big, 1, rt.buf_ptr(&bigbuf), rt.buf_len(&bigbuf)) catch false
+    sq.stmt_bind_text(big, 2, "big") catch false
+    check(&t, "insert 300 KB blob", !(sq.stmt_step(big) catch true))
+    sq.stmt_finalize(big)
+    let rb: *mut dc.Stmt = sq.db_prepare(d, "SELECT b, length(b) FROM v WHERE s = 'big'") catch | e | (0 as *mut dc.Stmt)
+    check(&t, "read it", sq.stmt_step(rb) catch false)
+    var rp: u64 = 0
+    var rn: usize = 0
+    sq.stmt_column_blob(rb, 0, &rp, &rn)
+    var same: bool = rn == 300000
+    var j: usize = 0
+    while same && j < rn {
+        if rt.ld8(rp, j) != rt.ld8(rt.buf_ptr(&bigbuf), j) {
+            same = false
+        }
+        j = j + 1
+    }
+    check(&t, "the same octets", same)
+    check(&t, "its length in SQL", sq.stmt_column_int(rb, 1) == 300000)
+    sq.stmt_finalize(rb)
+    check_text(&t, "integrity", sq.db_query_all(d, "PRAGMA integrity_check") catch "?", "ok")
+    // ---- reopen: the data is there; a read-only connection cannot write
+    sq.db_close(d)
+    let d2: *mut dc.Db = sq.db_open(path, sq.OPEN_READONLY) catch | e | (0 as *mut dc.Db)
+    check(&t, "reopen read-only", (d2 as u64) != 0)
+    check(&t, "data after reopen", (sq.db_query_int(d2, "SELECT count(*) FROM log", -1) catch -2) == 4)
+    let ro: bool = sq.db_exec(d2, "INSERT INTO log(msg) VALUES ('no')") catch | e | (kind_of(e) == 5)
+    check(&t, "write on a read-only connection is ReadOnly", ro)
+    check(&t, "reads still work", (sq.db_query_int(d2, "SELECT count(*) FROM v", -1) catch -2) == 3 + wrote + 1)
+    sq.db_close(d2)
+    // a file that is no database
+    var junk: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < 5000 {
+        rt.buf_push(&junk, ((k * 13) % 256) as u8)
+        k = k + 1
+    }
+    fs.write_file(path, rt.buf_ptr(&junk), rt.buf_len(&junk)) catch 0
+    let nd: bool = (sq.db_open(path, sq.OPEN_CREATE) catch | e | (0 as *mut dc.Db)) as u64 == 0
+    check(&t, "a file that is not a database is refused", nd)
+    fs.remove(path) catch false
+    io.fmt_print_line(io.fmt_number(io.fmt_text(io.fmt_number(io.fmt_text(io.fmt_new(), "checks ".p as u64, 7), t.total), " failed ".p as u64, 8), t.fails))
+    if t.fails != 0 {
+        return 1
+    }
+    return 0
+}

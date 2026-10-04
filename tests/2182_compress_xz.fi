@@ -1,0 +1,361 @@
+// expect_exit: 0
+// tests/2182_compress_xz.fi -- lib/compress/lzma.fi (decoder: LZMA, LZMA2, the
+// .xz container, filters, checks) and lzma_enc.fi (encoder): streams made by
+// Python's lzma (xz 5.4): presets, CRC-32/CRC-64/SHA-256/no check, delta and the
+// branch converters x86, PowerPC, IA-64, ARM, ARM-Thumb, SPARC and ARM64 (the
+// last made by the xz command line), several streams with stream padding, the
+// legacy .lzma format; refusals (cut, flipped, bad checks, header/index damage,
+// limits, a dictionary above the cap); the encoder at every preset and check,
+// stored chunks for incompressible data, chunks of 2 MiB, streaming; the
+// reader from a descriptor. tools/compress/check.py holds both directions
+// against liblzma over a much larger corpus.
+import compress.common
+import compress.lzma
+import compress.lzma_enc
+import std.rt
+import std.io
+import std.fs
+
+const PLAIN: str = __include_str("data/compress/plain.bin")
+const MIX: str = __include_str("data/compress/mix.bin")
+const F_XZ: str = __include_str("data/compress/plain.xz")
+const F_CRC32: str = __include_str("data/compress/plain_crc32.xz")
+const F_SHA: str = __include_str("data/compress/plain_sha256.xz")
+const F_NOCHECK: str = __include_str("data/compress/plain_nocheck.xz")
+const F_DELTA: str = __include_str("data/compress/plain_delta.xz")
+const F_X86TXT: str = __include_str("data/compress/plain_x86.xz")
+const F_MULTI: str = __include_str("data/compress/plain_multi.xz")
+const F_BLOCKS: str = __include_str("data/compress/plain_blocks.xz")
+const F_EMPTY: str = __include_str("data/compress/empty.xz")
+const F_ALONE: str = __include_str("data/compress/plain.lzma")
+const F_ZEROS: str = __include_str("data/compress/zeros.xz")
+const M_X86: str = __include_str("data/compress/mix_x86.xz")
+const M_PPC: str = __include_str("data/compress/mix_ppc.xz")
+const M_IA64: str = __include_str("data/compress/mix_ia64.xz")
+const M_ARM: str = __include_str("data/compress/mix_arm.xz")
+const M_THUMB: str = __include_str("data/compress/mix_armthumb.xz")
+const M_SPARC: str = __include_str("data/compress/mix_sparc.xz")
+const M_ARM64: str = __include_str("data/compress/mix_arm64.xz")
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+static mut code: u32 = 0
+
+fn why(e: CompressError) -> usize {
+    if e == CompressError::Data { code = 1 }
+    if e == CompressError::Format { code = 2 }
+    if e == CompressError::Checksum { code = 3 }
+    if e == CompressError::Truncated { code = 4 }
+    if e == CompressError::TooLarge { code = 5 }
+    if e == CompressError::OutOfMemory { code = 6 }
+    if e == CompressError::Unsupported { code = 7 }
+    if e == CompressError::Dictionary { code = 8 }
+    if e == CompressError::Io { code = 9 }
+    return 0
+}
+
+fn is_plain(b: *mut rt.Buf, want: str) -> bool {
+    return rt.buf_len(b) == want.length() && rt.mem_eq(rt.buf_ptr(b), want.p as u64, want.length())
+}
+
+fn view(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn scratch(tag: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, "/tmp/firn_".p as u64, 10)
+    rt.buf_push_bytes(&b, tag.p as u64, tag.length())
+    rt.buf_push(&b, 95 as u8)
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+// deterministic pseudo random octets
+fn pseudo(n: usize, seed: u64) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    var x: u64 = seed
+    var i: usize = 0
+    while i < n {
+        x = x *% 6364136223846793005 +% 1442695040888963407
+        rt.buf_push(&b, ((x >> 33) & 255) as u8)
+        i = i + 1
+    }
+    return b
+}
+
+fn zeros(n: usize) -> rt.Buf {
+    var z: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&z, n)
+    rt.mem_set(rt.buf_ptr(&z), 0 as u8, n)
+    rt.buf_set_len(&z, n)
+    return z
+}
+
+fn finish(t: *mut Tally) -> i32 {
+    io.print("checks: ")
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&nb, (*t).total)
+    io.print_bytes(rt.buf_ptr(&nb), rt.buf_len(&nb))
+    io.print_line("")
+    if (*t).fails != 0 {
+        return 1 as i32
+    }
+    return 0
+}
+
+fn dec(z: str, max: usize, out: *mut rt.Buf) -> u32 {
+    code = 0
+    lzma.xz_decompress_limited(z.p as u64, z.length(), max, out) catch | e | (why(e))
+    return code
+}
+
+fn decodes_to(t: *mut Tally, what: str, z: str, want: str) {
+    var out: rt.Buf = rt.buf_new()
+    let c: u32 = dec(z, 0, &out)
+    check(t, what, c == 0 as u32 && is_plain(&out, want))
+    rt.buf_free(&out)
+}
+
+fn stream_dec(path: str, z: str, piece: usize, dmax: u64, out: *mut rt.Buf) -> u32 {
+    code = 0
+    fs.write_file(path, z.p as u64, z.length()) catch 0
+    let fd: i64 = fs.open_read(path) catch -1
+    if fd < 0 {
+        return 99 as u32
+    }
+    var d: lzma.XzDec = lzma.xz_dec_open_fd(fd)
+    if dmax > 0 {
+        lzma.xz_dec_set_dict_max(&d, dmax)
+    }
+    let tmp: u64 = rt.heap_alloc(piece)
+    while true {
+        let k: usize = lzma.xz_dec_read(&d, tmp, piece) catch | e | (why(e))
+        if code != 0 as u32 || k == 0 {
+            break
+        }
+        rt.buf_push_bytes(out, tmp, k)
+    }
+    rt.heap_free(tmp, piece)
+    lzma.xz_dec_close(&d)
+    fs.close_fd(fd)
+    return code
+}
+
+fn roundtrip(src: u64, n: usize, preset: u32, check: u32, zlen: *mut usize) -> bool {
+    var z: rt.Buf = rt.buf_new()
+    lzma_enc.xz_compress_check(src, n, preset, check, &z) catch | e | (why(e))
+    *zlen = rt.buf_len(&z)
+    var back: rt.Buf = rt.buf_new()
+    let c: u32 = dec(view(&z), 0, &back)
+    let ok: bool = c == 0 as u32 && rt.buf_len(&back) == n && rt.mem_eq(rt.buf_ptr(&back), src, n)
+    rt.buf_free(&back)
+    rt.buf_free(&z)
+    return ok
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let path: str = scratch("xz2182")
+
+    // A. liblzma's streams
+    decodes_to(&t, "preset 6, CRC-64", F_XZ, PLAIN)
+    decodes_to(&t, "CRC-32", F_CRC32, PLAIN)
+    decodes_to(&t, "SHA-256", F_SHA, PLAIN)
+    decodes_to(&t, "no check", F_NOCHECK, PLAIN)
+    decodes_to(&t, "delta + LZMA2", F_DELTA, PLAIN)
+    decodes_to(&t, "x86 + LZMA2 on text", F_X86TXT, PLAIN)
+    decodes_to(&t, "two streams with stream padding", F_MULTI, PLAIN)
+    decodes_to(&t, "an empty stream (no block)", F_EMPTY, "")
+    decodes_to(&t, "four blocks with their sizes in the headers (xz -T2, SHA-256)", F_BLOCKS, PLAIN)
+    decodes_to(&t, "BCJ x86 on code-like data", M_X86, MIX)
+    decodes_to(&t, "BCJ PowerPC", M_PPC, MIX)
+    decodes_to(&t, "BCJ IA-64", M_IA64, MIX)
+    decodes_to(&t, "BCJ ARM", M_ARM, MIX)
+    decodes_to(&t, "BCJ ARM-Thumb", M_THUMB, MIX)
+    decodes_to(&t, "BCJ SPARC", M_SPARC, MIX)
+    decodes_to(&t, "BCJ ARM64 (xz command line)", M_ARM64, MIX)
+    var o: rt.Buf = rt.buf_new()
+    code = 0
+    lzma.lzma_alone_decompress(F_ALONE.p as u64, F_ALONE.length(), &o) catch | e | (why(e))
+    check(&t, "legacy .lzma", code == 0 as u32 && is_plain(&o, PLAIN))
+    rt.buf_clear(&o)
+    check(&t, "is_xz", lzma.xz_is_xz(F_XZ.p as u64, F_XZ.length()) && !lzma.xz_is_xz(F_ALONE.p as u64, F_ALONE.length()))
+    // B. refusals
+    check(&t, "bad magic is Format", dec("this is not an xz file at all, really", 0, &o) == 2 as u32)
+    rt.buf_clear(&o)
+    check(&t, "empty input is Truncated", dec("", 0, &o) == 4 as u32)
+    var cuts: usize = 0
+    var bad: usize = 0
+    var c: usize = 0
+    while c < F_XZ.length() {
+        rt.buf_clear(&o)
+        cuts = cuts + 1
+        if dec(str { p: F_XZ.p, n: c }, 0, &o) == 0 as u32 {
+            bad = bad + 1
+        }
+        c = c + 47
+    }
+    check(&t, "every cut of a stream is refused", bad == 0 && cuts > 100)
+    var dmg: rt.Buf = rt.buf_new()
+    // flipping a check octet
+    rt.buf_push_bytes(&dmg, F_XZ.p as u64, F_XZ.length())
+    let chk_at: usize = F_XZ.length() - 12 - 12 - 8 // CRC-64 sits before the index (12) and the footer (12) -- see below
+    rt.st8(rt.buf_ptr(&dmg), chk_at, rt.ld8(rt.buf_ptr(&dmg), chk_at) ^ 1 as u8)
+    rt.buf_clear(&o)
+    let r1: u32 = dec(view(&dmg), 0, &o)
+    check(&t, "damage in the block's check area is refused", r1 == 3 as u32 || r1 == 1 as u32)
+    // the header CRC (octets 12 + 8 .. 12 + 12 hold the block header's CRC-32)
+    rt.buf_clear(&dmg)
+    rt.buf_push_bytes(&dmg, F_XZ.p as u64, F_XZ.length())
+    rt.st8(rt.buf_ptr(&dmg), 12 + 9, rt.ld8(rt.buf_ptr(&dmg), 12 + 9) ^ 1 as u8)
+    rt.buf_clear(&o)
+    check(&t, "a damaged block header is Checksum", dec(view(&dmg), 0, &o) == 3 as u32)
+    // the footer
+    rt.buf_clear(&dmg)
+    rt.buf_push_bytes(&dmg, F_XZ.p as u64, F_XZ.length())
+    rt.st8(rt.buf_ptr(&dmg), F_XZ.length() - 1, 0 as u8)
+    rt.buf_clear(&o)
+    let r3: u32 = dec(view(&dmg), 0, &o)
+    check(&t, "a damaged footer is refused", r3 != 0 as u32)
+    // damage inside the compressed data: an error or (stored chunk) a CRC mismatch, never a wrong answer
+    var wrong: usize = 0
+    var k: usize = 0
+    while k < 60 {
+        rt.buf_clear(&dmg)
+        rt.buf_push_bytes(&dmg, F_XZ.p as u64, F_XZ.length())
+        let at: usize = 24 + (k * 131) % (F_XZ.length() - 48)
+        rt.st8(rt.buf_ptr(&dmg), at, rt.ld8(rt.buf_ptr(&dmg), at) ^ ((1 + k % 7) as u8))
+        rt.buf_clear(&o)
+        if dec(view(&dmg), 0, &o) == 0 as u32 && !is_plain(&o, PLAIN) {
+            wrong = wrong + 1
+        }
+        k = k + 1
+    }
+    check(&t, "damaged streams: never a wrong answer", wrong == 0)
+    rt.buf_free(&dmg)
+    rt.buf_clear(&o)
+    check(&t, "limit == size passes", dec(F_XZ, PLAIN.length(), &o) == 0 as u32 && is_plain(&o, PLAIN))
+    rt.buf_clear(&o)
+    check(&t, "limit == size - 1 is TooLarge, nothing past it written",
+        dec(F_XZ, PLAIN.length() - 1, &o) == 5 as u32 && rt.buf_len(&o) <= PLAIN.length() - 1)
+    rt.buf_clear(&o)
+    check(&t, "the zeros bomb (1.5 MB in ~1 KB) under a 100000 limit", dec(F_ZEROS, 100000, &o) == 5 as u32 && rt.buf_len(&o) <= 100000)
+    rt.buf_clear(&o)
+    check(&t, "...and at its exact size", dec(F_ZEROS, 1500000, &o) == 0 as u32 && rt.buf_len(&o) == 1500000)
+    var so: rt.Buf = rt.buf_new()
+    check(&t, "a dictionary above the streaming cap is Unsupported", stream_dec(path, F_XZ, 4096, 1024, &so) == 7 as u32)
+    rt.buf_free(&so)
+    // C. the streaming reader
+    var pieces: [usize; 4] = [1, 17, 4096, 100000]
+    var pi: usize = 0
+    while pi < 4 {
+        var s2: rt.Buf = rt.buf_new()
+        check(&t, "stream-decode CRC-64", stream_dec(path, F_XZ, pieces[pi], 0, &s2) == 0 as u32 && is_plain(&s2, PLAIN))
+        rt.buf_clear(&s2)
+        check(&t, "stream-decode delta + LZMA2", stream_dec(path, F_DELTA, pieces[pi], 0, &s2) == 0 as u32 && is_plain(&s2, PLAIN))
+        rt.buf_clear(&s2)
+        check(&t, "stream-decode two streams", stream_dec(path, F_MULTI, pieces[pi], 0, &s2) == 0 as u32 && is_plain(&s2, PLAIN))
+        rt.buf_clear(&s2)
+        check(&t, "stream-decode BCJ x86", stream_dec(path, M_X86, pieces[pi], 0, &s2) == 0 as u32 && is_plain(&s2, MIX))
+        rt.buf_free(&s2)
+        pi = pi + 1
+    }
+    // D. the encoder
+    var zlen: usize = 0
+    var presets: [u32; 5] = [0, 1, 3, 6, 9]
+    var sz: [usize; 5] = [0, 0, 0, 0, 0]
+    var pr: usize = 0
+    while pr < 5 {
+        check(&t, "own stream, preset", roundtrip(PLAIN.p as u64, PLAIN.length(), presets[pr], 4, &zlen))
+        sz[pr] = zlen
+        check(&t, "own stream, preset, code-like data", roundtrip(MIX.p as u64, MIX.length(), presets[pr], 4, &zlen))
+        pr = pr + 1
+    }
+    check(&t, "the ratio is sane: preset 6 below 70 % of the text", sz[3] * 10 < PLAIN.length() * 7)
+    check(&t, "own streams with no check / CRC-32 / CRC-64 / SHA-256",
+        roundtrip(PLAIN.p as u64, PLAIN.length(), 4, 0, &zlen) && roundtrip(PLAIN.p as u64, PLAIN.length(), 4, 1, &zlen)
+        && roundtrip(PLAIN.p as u64, PLAIN.length(), 4, 4, &zlen) && roundtrip(PLAIN.p as u64, PLAIN.length(), 4, 10, &zlen))
+    var n: usize = 0
+    var bad2: usize = 0
+    while n < 80 {
+        var src: rt.Buf = pseudo(n, 21 + n as u64)
+        var j: usize = 0
+        while j < n {
+            rt.st8(rt.buf_ptr(&src), j, rt.ld8(rt.buf_ptr(&src), j) % 4 as u8)
+            j = j + 1
+        }
+        if !roundtrip(rt.buf_ptr(&src), n, 4, 4, &zlen) {
+            bad2 = bad2 + 1
+        }
+        rt.buf_free(&src)
+        n = n + 1
+    }
+    check(&t, "own streams for every size 0..79", bad2 == 0)
+    var rnd: rt.Buf = pseudo(150000, 3)
+    check(&t, "incompressible 150000 octets (stored chunks, state resets)", roundtrip(rt.buf_ptr(&rnd), 150000, 4, 4, &zlen) && zlen < 150000 + 200)
+    rt.buf_free(&rnd)
+    var big: rt.Buf = zeros(2600000)
+    check(&t, "2.6 MB of zeros: chunks of 2 MiB, 512 octets like liblzma", roundtrip(rt.buf_ptr(&big), 2600000, 3, 4, &zlen) && zlen < 700)
+    rt.buf_free(&big)
+    // a stream that mixes compressible and random parts: chunk kinds alternate
+    var mixd: rt.Buf = pseudo(70000, 31)
+    var q: usize = 0
+    while q < 70000 {
+        if (q / 5000) % 2 == 0 {
+            rt.st8(rt.buf_ptr(&mixd), q, 97 as u8 + (rt.ld8(rt.buf_ptr(&mixd), q) % 3 as u8))
+        }
+        q = q + 1
+    }
+    check(&t, "alternating compressible / random stretches", roundtrip(rt.buf_ptr(&mixd), 70000, 6, 4, &zlen))
+    rt.buf_free(&mixd)
+    // legacy .lzma
+    var za: rt.Buf = rt.buf_new()
+    lzma_enc.lzma_alone_compress(PLAIN.p as u64, PLAIN.length(), 5, &za) catch | e | (why(e))
+    var ba: rt.Buf = rt.buf_new()
+    code = 0
+    lzma.lzma_alone_decompress(rt.buf_ptr(&za), rt.buf_len(&za), &ba) catch | e | (why(e))
+    check(&t, "own .lzma stream", code == 0 as u32 && is_plain(&ba, PLAIN) && rt.buf_len(&za) * 10 < PLAIN.length() * 7)
+    rt.buf_free(&ba)
+    rt.buf_free(&za)
+    // streaming encoder in pieces
+    var cs: [usize; 3] = [1, 999, 100000]
+    var ci: usize = 0
+    while ci < 3 {
+        var e: lzma_enc.XzEnc = lzma_enc.xz_enc_new(4, 4)
+        var z: rt.Buf = rt.buf_new()
+        var p: usize = 0
+        while p < PLAIN.length() {
+            var kk: usize = PLAIN.length() - p
+            if kk > cs[ci] {
+                kk = cs[ci]
+            }
+            lzma_enc.xz_enc_write(&e, (PLAIN.p as u64) + p as u64, kk, &z)
+            p = p + kk
+        }
+        lzma_enc.xz_enc_finish(&e, &z)
+        lzma_enc.xz_enc_free(&e)
+        var back: rt.Buf = rt.buf_new()
+        check(&t, "stream-encode in pieces", dec(view(&z), 0, &back) == 0 as u32 && is_plain(&back, PLAIN))
+        rt.buf_free(&back)
+        rt.buf_free(&z)
+        ci = ci + 1
+    }
+    rt.buf_free(&o)
+    fs.remove(path) catch false
+    return finish(&t)
+}

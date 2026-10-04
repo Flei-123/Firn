@@ -1,0 +1,1566 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/compress/lzma.fi -- LZMA, LZMA2 and the .xz container: the decoder in
+// full (every LZMA2 chunk type, the filters delta, x86, PowerPC, IA-64, ARM,
+// ARM-Thumb, SPARC and ARM64, CRC-32, CRC-64 and SHA-256 checks, several
+// blocks and streams, stream padding, index and footer cross-checked, the
+// legacy `.lzma` format) and an encoder (LZMA2 in an .xz stream).
+//
+//     import compress.lzma
+//     lzma.xz_decompress_limited(p, n, 1 << 30, &out) catch |e| ...
+//     lzma.xz_compress(p, n, 6, &out) catch |e| ...                // preset 0..9
+//
+//     var d: lzma.XzDec = lzma.xz_dec_open_fd(fd)                  // streaming
+//     let k: usize = lzma.xz_dec_read(&d, buf, 65536) catch |e| ...// 0 = end
+//     lzma.xz_dec_close(&d)
+//
+// THE FORMAT. LZMA is LZ77 with a range coder: every decision (literal or
+// match, which of the four recent distances, how long, how far) is one or
+// more binary events coded with adaptive 11 bit probabilities, in a context
+// made of a 12 state machine, the position and the previous byte. LZMA2 cuts
+// the data into chunks (<= 2 MiB uncompressed, <= 64 KiB compressed), each
+// stored raw or LZMA coded, with explicit resets of the dictionary, the state
+// or the properties. The .xz container wraps a chain of filters (LZMA2 last),
+// a check, an index and a footer.
+//
+// DECODER LIMITS. A dictionary above `xz_dec_set_dict_max` (default 256 MiB)
+// is `Unsupported` for the STREAMING reader (it must hold a window); the
+// whole-buffer call keeps its output anyway and has no such limit. Distances
+// beyond the bytes produced since the last dictionary reset or beyond the
+// dictionary size, a chunk whose range coder does not end at zero, sizes in
+// the headers that do not add up, a wrong CRC-32/CRC-64/SHA-256, index
+// records that disagree with the blocks are `Data`/`Checksum`; a cut stream
+// is `Truncated`; output past `max` is `TooLarge` and is never written.
+//
+// ENCODER (lib/compress/lzma_enc.fi): a hash-chain match finder (3 and 4
+// octet hashes), the "fast" parser of liblzma (longest match against the four
+// repeat distances, a one position look-ahead), real range coding with all
+// LZMA contexts, LZMA2 chunking with fall-back to stored chunks for data that
+// does not compress. Output is read by liblzma / xz / Python.
+//
+// HONEST
+//   X1 Encoder: no binary-tree match finder, no optimal parsing (xz -6 is
+//      typically 4-8 % smaller). Presets 0..9 set dictionary size and search
+//      depth; there is no multithreading (one block per stream).
+//   X2 Unsupported check ids (2, 3, 5..9, 11..15) are skipped, not verified,
+//      like xz does with a warning.
+//   X3 RISC-V BCJ (xz 5.6) and LZMA SDK's other filters are `Unsupported`.
+//   X4 The legacy .lzma header is accepted with a known size or the end
+//      marker; a dictionary size field of 0 or above 2^32-1 is refused.
+import std.rt
+import compress.common
+import std.crypto.sha256
+
+export {
+    XzDec, xz_dec_open_source, xz_dec_size, xz_dec_open_mem, xz_dec_open_fd, xz_dec_set_dict_max, xz_dec_read, xz_dec_close,
+    xz_decompress, xz_decompress_limited,
+    lzma_alone_decompress, lzma_alone_decompress_limited,
+    xz_is_xz,
+    // shared with lzma_enc.fi
+    dict_size_of, PROB_INIT, P_ISMATCH, P_ISREP, P_ISREP0, P_ISREP1, P_ISREP2, P_REP0LONG, P_POSSLOT,
+    P_SPECPOS, P_ALIGN, P_MATCHLEN, P_REPLEN, P_LIT,
+}
+
+// ====================================================================
+// THE RANGE DECODER AND THE LZMA MODEL
+// ====================================================================
+
+const P_ISMATCH: usize = 0 // [12][16]
+const P_ISREP: usize = 192
+const P_ISREP0: usize = 204
+const P_ISREP1: usize = 216
+const P_ISREP2: usize = 228
+const P_REP0LONG: usize = 240 // [12][16]
+const P_POSSLOT: usize = 432 // [4][64]
+const P_SPECPOS: usize = 688 // 128 (114 used)
+const P_ALIGN: usize = 816 // 16
+const P_MATCHLEN: usize = 832 // 514: choice, choice2, low[16][8], mid[16][8], high[256]
+const P_REPLEN: usize = 1346 // 514
+const P_LIT: usize = 1860 // 0x300 << (lc + lp)
+const PROB_INIT: u16 = 1024
+
+struct Rc {
+    range: u32,
+    code: u32,
+    ip: u64,
+    ie: u64,
+    over: bool, // more input was needed than the chunk has
+}
+
+struct Lzma {
+    probs: u64, // u16[nprobs]
+    nprobs: usize,
+    lc: u32,
+    lp: u32,
+    pb: u32,
+    state: u32,
+    rep0: u32,
+    rep1: u32,
+    rep2: u32,
+    rep3: u32,
+    pend: usize, // octets of a match still to copy (legacy .lzma only: a match may cross a call boundary)
+    alone: bool,
+    rc: Rc,
+}
+
+fn lzma_new() -> Lzma {
+    return Lzma { probs: 0, nprobs: 0, lc: 0, lp: 0, pb: 0, state: 0, rep0: 0, rep1: 0, rep2: 0, rep3: 0, pend: 0, alone: false,
+        rc: Rc { range: 0, code: 0, ip: 0, ie: 0, over: false } }
+}
+
+fn lzma_free(s: *mut Lzma) {
+    if (*s).probs != 0 {
+        rt.heap_free((*s).probs, (*s).nprobs * 2)
+        (*s).probs = 0
+    }
+}
+
+// Sets lc/lp/pb (false if out of range) and (re)allocates the models.
+fn lzma_set_props(s: *mut Lzma, lc: u32, lp: u32, pb: u32) -> bool {
+    if lc > 8 || lp > 4 || pb > 4 {
+        return false
+    }
+    (*s).lc = lc
+    (*s).lp = lp
+    (*s).pb = pb
+    let need: usize = P_LIT + ((0x300 as usize) << ((lc + lp) as usize))
+    if (*s).nprobs < need {
+        if (*s).probs != 0 {
+            rt.heap_free((*s).probs, (*s).nprobs * 2)
+        }
+        (*s).probs = rt.heap_alloc(need * 2)
+        (*s).nprobs = need
+        if (*s).probs == 0 {
+            (*s).nprobs = 0
+            return false
+        }
+    }
+    return true
+}
+
+// The props byte (lc + 9 * (lp + 5 * pb)).
+fn lzma_set_props_byte(s: *mut Lzma, b: u32) -> bool {
+    if b >= 225 {
+        return false
+    }
+    let lc: u32 = b % 9
+    let r: u32 = b / 9
+    return lzma_set_props(s, lc, r % 5, r / 5)
+}
+
+// Probabilities back to 1/2, state and distances to the start.
+fn lzma_reset_state(s: *mut Lzma) {
+    let n: usize = P_LIT + ((0x300 as usize) << (((*s).lc + (*s).lp) as usize))
+    var i: usize = 0
+    while i < n {
+        rt.st16((*s).probs, i, PROB_INIT)
+        i = i + 1
+    }
+    (*s).state = 0
+    (*s).rep0 = 0
+    (*s).rep1 = 0
+    (*s).rep2 = 0
+    (*s).rep3 = 0
+    (*s).pend = 0
+}
+
+fn rc_init(rc: *mut Rc, p: u64, n: usize) -> bool {
+    (*rc).ip = p
+    (*rc).ie = p + n as u64
+    (*rc).over = false
+    (*rc).range = 0xFFFFFFFF
+    (*rc).code = 0
+    if n < 5 {
+        return false
+    }
+    if rt.ld8(p, 0) != 0 as u8 {
+        return false
+    }
+    (*rc).code = ((rt.ld8(p, 1) as u32) << 24) | ((rt.ld8(p, 2) as u32) << 16) | ((rt.ld8(p, 3) as u32) << 8)
+        | (rt.ld8(p, 4) as u32)
+    (*rc).ip = p + 5
+    return true
+}
+
+#[inline]
+fn rc_norm(rc: *mut Rc) {
+    if (*rc).range < 0x1000000 {
+        (*rc).range = (*rc).range << 8
+        if (*rc).ip < (*rc).ie {
+            (*rc).code = ((*rc).code << 8) | (rt.ld8((*rc).ip, 0) as u32)
+            (*rc).ip = (*rc).ip + 1
+        } else {
+            (*rc).code = (*rc).code << 8
+            (*rc).over = true
+        }
+    }
+}
+
+// One adaptive bit. The range is normalised BEFORE the bit (as in the LZMA
+// SDK), so the decoder never asks for an octet it does not need yet; at the
+// end of an LZMA2 chunk the caller normalises once more and expects the input
+// to be used up exactly.
+#[inline]
+fn rc_bit(rc: *mut Rc, probs: u64, idx: usize) -> u32 {
+    rc_norm(rc)
+    let p: u32 = rt.ld16(probs, idx) as u32
+    let bound: u32 = ((*rc).range >> 11) * p
+    if (*rc).code < bound {
+        (*rc).range = bound
+        rt.st16(probs, idx, (p + ((2048 - p) >> 5)) as u16)
+        return 0
+    }
+    (*rc).range = (*rc).range - bound
+    (*rc).code = (*rc).code - bound
+    rt.st16(probs, idx, (p - (p >> 5)) as u16)
+    return 1
+}
+
+// `nbits` equiprobable bits, most significant first.
+#[inline]
+fn rc_direct(rc: *mut Rc, nbits: u32) -> u32 {
+    var res: u32 = 0
+    var i: u32 = 0
+    while i < nbits {
+        rc_norm(rc)
+        (*rc).range = (*rc).range >> 1
+        var b: u32 = 0
+        if (*rc).code >= (*rc).range {
+            (*rc).code = (*rc).code - (*rc).range
+            b = 1
+        }
+        res = (res << 1) | b
+        i = i + 1
+    }
+    return res
+}
+
+fn rc_tree(rc: *mut Rc, probs: u64, base: usize, nbits: u32) -> u32 {
+    var m: u32 = 1
+    var i: u32 = 0
+    while i < nbits {
+        m = (m << 1) | rc_bit(rc, probs, base + (m as usize))
+        i = i + 1
+    }
+    return m - ((1 as u32) << nbits)
+}
+
+fn rc_tree_rev(rc: *mut Rc, probs: u64, base: usize, nbits: u32) -> u32 {
+    var m: u32 = 1
+    var sym: u32 = 0
+    var i: u32 = 0
+    while i < nbits {
+        let b: u32 = rc_bit(rc, probs, base + (m as usize))
+        m = (m << 1) | b
+        sym = sym | (b << i)
+        i = i + 1
+    }
+    return sym
+}
+
+// A length: 0..271 (the real length is that + 2).
+fn rc_len(rc: *mut Rc, probs: u64, base: usize, pos_state: usize) -> u32 {
+    if rc_bit(rc, probs, base) == 0 {
+        return rc_tree(rc, probs, base + 2 + pos_state * 8, 3)
+    }
+    if rc_bit(rc, probs, base + 1) == 0 {
+        return 8 + rc_tree(rc, probs, base + 130 + pos_state * 8, 3)
+    }
+    return 16 + rc_tree(rc, probs, base + 258, 8)
+}
+
+// ====================================================================
+// DECODING ONE LZMA RUN INTO THE OUTPUT BUFFER
+// ====================================================================
+
+// Decodes symbols until `want` octets have been appended to `out` (or, with
+// `allow_end`, the end marker is met). `since` is the number of octets
+// produced since the last dictionary reset (before this call), `dict_size`
+// the largest distance allowed. Returns the number of octets produced;
+// `*ended` is set when the end marker was read. A match may run past `want`
+// only in the legacy .lzma format (`alone`): the rest is carried in `pend`.
+fn lzma_run(s: *mut Lzma, out: *mut rt.Buf, want: usize, since: u64, dict_size: u64, allow_end: bool,
+    ended: *mut bool) -> CompressError!usize {
+    *ended = false
+    let probs: u64 = (*s).probs
+    if !common.buf_ensure(out, (*out).len + want + 8) {
+        return CompressError::OutOfMemory
+    }
+    let dst: u64 = (*out).ptr
+    let start: usize = (*out).len
+    var op: usize = start
+    let stop: usize = start + want
+    let rc: *mut Rc = &(*s).rc
+    let pb_mask: usize = (((1 as usize) << ((*s).pb as usize)) - 1)
+    let lp_mask: usize = (((1 as usize) << ((*s).lp as usize)) - 1)
+    let lc: u32 = (*s).lc
+    var state: u32 = (*s).state
+    var rep0: u32 = (*s).rep0
+    var rep1: u32 = (*s).rep1
+    var rep2: u32 = (*s).rep2
+    var rep3: u32 = (*s).rep3
+    var err: u32 = 0
+    if (*s).pend > 0 {
+        // the rest of a match that crossed the end of the previous call
+        var k: usize = (*s).pend
+        if k > stop - op {
+            k = stop - op
+        }
+        let dist: usize = (rep0 as usize) + 1
+        var j: usize = 0
+        while j < k {
+            rt.st8(dst, op + j, rt.ld8(dst, op + j - dist))
+            j = j + 1
+        }
+        op = op + k
+        (*s).pend = (*s).pend - k
+    }
+    while op < stop {
+        let produced: u64 = since + ((op - start) as u64)
+        let pos_state: usize = (produced as usize) & pb_mask
+        if rc_bit(rc, probs, P_ISMATCH + (state as usize) * 16 + pos_state) == 0 {
+            // a literal
+            var prev: u32 = 0
+            if produced > 0 {
+                prev = rt.ld8(dst, op - 1) as u32
+            }
+            let lit_state: usize = ((((produced as usize) & lp_mask) << (lc as usize)) + ((prev >> (8 - lc)) as usize))
+            let base: usize = P_LIT + 0x300 * lit_state
+            var sym: u32 = 1
+            if state >= 7 {
+                // after a match: the byte at rep0 steers the contexts
+                var mb: u32 = rt.ld8(dst, op - (rep0 as usize) - 1) as u32
+                var off: u32 = 0x100
+                while sym < 0x100 {
+                    mb = mb << 1
+                    let mbit: u32 = mb & off
+                    let b: u32 = rc_bit(rc, probs, base + ((off + mbit + sym) as usize))
+                    sym = (sym << 1) | b
+                    if b == 0 {
+                        off = off & (0xFFFFFFFF ^ mbit)
+                    } else {
+                        off = off & mbit
+                    }
+                }
+            } else {
+                while sym < 0x100 {
+                    sym = (sym << 1) | rc_bit(rc, probs, base + (sym as usize))
+                }
+            }
+            rt.st8(dst, op, (sym & 0xFF) as u8)
+            op = op + 1
+            if state < 4 {
+                state = 0
+            } else if state < 10 {
+                state = state - 3
+            } else {
+                state = state - 6
+            }
+        } else {
+            var len: u32 = 0
+            if rc_bit(rc, probs, P_ISREP + (state as usize)) == 0 {
+                // a simple match: distance follows
+                rep3 = rep2
+                rep2 = rep1
+                rep1 = rep0
+                len = rc_len(rc, probs, P_MATCHLEN, pos_state)
+                if state < 7 {
+                    state = 7
+                } else {
+                    state = 10
+                }
+                var ls: u32 = len
+                if ls > 3 {
+                    ls = 3
+                }
+                let slot: u32 = rc_tree(rc, probs, P_POSSLOT + (ls as usize) * 64, 6)
+                if slot < 4 {
+                    rep0 = slot
+                } else {
+                    let nd: u32 = (slot >> 1) - 1
+                    var d: u32 = (2 | (slot & 1)) << nd
+                    if slot < 14 {
+                        d = d + rc_tree_rev(rc, probs, P_SPECPOS + (d as usize) - (slot as usize) - 1, nd)
+                    } else {
+                        d = d + (rc_direct(rc, nd - 4) << 4)
+                        d = d + rc_tree_rev(rc, probs, P_ALIGN, 4)
+                    }
+                    rep0 = d
+                    if rep0 == 0xFFFFFFFF {
+                        // the end marker
+                        if !allow_end || (*rc).over {
+                            err = 1
+                        } else {
+                            *ended = true
+                        }
+                        break
+                    }
+                }
+            } else {
+                if produced == 0 {
+                    err = 1
+                    break
+                }
+                if rc_bit(rc, probs, P_ISREP0 + (state as usize)) == 0 {
+                    if rc_bit(rc, probs, P_REP0LONG + (state as usize) * 16 + pos_state) == 0 {
+                        // a "short rep": one octet from rep0
+                        if (rep0 as u64) >= produced || (rep0 as u64) >= dict_size {
+                            err = 1
+                            break
+                        }
+                        if state < 7 {
+                            state = 9
+                        } else {
+                            state = 11
+                        }
+                        rt.st8(dst, op, rt.ld8(dst, op - (rep0 as usize) - 1))
+                        op = op + 1
+                        continue
+                    }
+                } else {
+                    var dist: u32 = 0
+                    if rc_bit(rc, probs, P_ISREP1 + (state as usize)) == 0 {
+                        dist = rep1
+                    } else {
+                        if rc_bit(rc, probs, P_ISREP2 + (state as usize)) == 0 {
+                            dist = rep2
+                        } else {
+                            dist = rep3
+                            rep3 = rep2
+                        }
+                        rep2 = rep1
+                    }
+                    rep1 = rep0
+                    rep0 = dist
+                }
+                len = rc_len(rc, probs, P_REPLEN, pos_state)
+                if state < 7 {
+                    state = 8
+                } else {
+                    state = 11
+                }
+            }
+            // copy the match
+            var mlen: usize = (len as usize) + 2
+            if (rep0 as u64) >= produced || (rep0 as u64) >= dict_size {
+                err = 1
+                break
+            }
+            if mlen > stop - op {
+                if !(*s).alone {
+                    err = 2 // the match runs past the chunk
+                    break
+                }
+                (*s).pend = mlen - (stop - op)
+                mlen = stop - op
+            }
+            let dist: usize = (rep0 as usize) + 1
+            if dist >= 8 {
+                rt.mem_copy(dst + op as u64, dst + (op - dist) as u64, mlen)
+            } else {
+                var k: usize = 0
+                while k < mlen {
+                    rt.st8(dst, op + k, rt.ld8(dst, op + k - dist))
+                    k = k + 1
+                }
+            }
+            op = op + mlen
+        }
+        if (*rc).over {
+            err = 3
+            break
+        }
+    }
+    (*s).state = state
+    (*s).rep0 = rep0
+    (*s).rep1 = rep1
+    (*s).rep2 = rep2
+    (*s).rep3 = rep3
+    (*out).len = op
+    if err != 0 {
+        return CompressError::Data
+    }
+    if (*rc).over {
+        return CompressError::Data
+    }
+    return op - start
+}
+
+// ====================================================================
+// THE BCJ AND DELTA FILTERS (decoding direction)
+// ====================================================================
+
+struct XzFilter {
+    id: u32,
+    dist: u32, // delta distance
+    done: usize, // buffer index up to which this stage's output is final
+    ip: u32, // stream position of buffer index `done`
+    prev_mask: u32, // x86
+    prev_pos: u32, // x86
+    dring: [u8; 256],
+    dpos: u32,
+}
+
+fn flt_new() -> XzFilter {
+    return XzFilter { id: 0, dist: 0, done: 0, ip: 0, prev_mask: 0, prev_pos: 0xFFFFFFFB, dring: [0; 256], dpos: 0 }
+}
+
+fn test86(b: u8) -> bool {
+    return b == 0 as u8 || b == 0xFF as u8
+}
+
+// One in-place conversion pass over buf[start..end); returns the number of
+// octets that are final (the rest needs more data to be judged).
+fn filter_pass(f: *mut XzFilter, buf: u64, start: usize, end: usize) -> usize {
+    let size: usize = end - start
+    let p: u64 = buf + start as u64
+    let now: u32 = (*f).ip
+    let id: u32 = (*f).id
+    if id == 0x03 {
+        // delta
+        var i: usize = 0
+        let dist: u32 = (*f).dist
+        while i < size {
+            let prev: u8 = (*f).dring[(((*f).dpos -% dist) & 0xFF) as usize]
+            let v: u8 = ((rt.ld8(p, i) as u32 + prev as u32) & 0xFF) as u8
+            rt.st8(p, i, v)
+            (*f).dring[((*f).dpos & 0xFF) as usize] = v
+            (*f).dpos = (*f).dpos +% 1
+            i = i + 1
+        }
+        (*f).ip = (*f).ip +% (size as u32)
+        return size
+    }
+    var i: usize = 0
+    if id == 0x04 {
+        // x86
+        if size < 5 {
+            return 0
+        }
+        var prev_mask: u32 = (*f).prev_mask
+        var prev_pos: u32 = (*f).prev_pos
+        if now -% prev_pos > 5 {
+            prev_pos = now -% 5
+        }
+        let limit: usize = size - 5
+        while i <= limit {
+            var b: u8 = rt.ld8(p, i)
+            if b != 0xE8 as u8 && b != 0xE9 as u8 {
+                i = i + 1
+                continue
+            }
+            let offset: u32 = now +% (i as u32) -% prev_pos
+            prev_pos = now +% (i as u32)
+            if offset > 5 {
+                prev_mask = 0
+            } else {
+                var k: u32 = 0
+                while k < offset {
+                    prev_mask = prev_mask & 0x77
+                    prev_mask = prev_mask << 1
+                    k = k + 1
+                }
+            }
+            b = rt.ld8(p, i + 4)
+            var allowed: bool = false
+            let pm: u32 = (prev_mask >> 1) & 7
+            if pm == 0 || pm == 1 || pm == 2 || pm == 4 {
+                allowed = true
+            }
+            if test86(b) && allowed && (prev_mask >> 1) < 0x10 {
+                var src: u32 = ((b as u32) << 24) | ((rt.ld8(p, i + 3) as u32) << 16)
+                    | ((rt.ld8(p, i + 2) as u32) << 8) | (rt.ld8(p, i + 1) as u32)
+                var dest: u32 = 0
+                while true {
+                    dest = src -% (now +% (i as u32) +% 5)
+                    if prev_mask == 0 {
+                        break
+                    }
+                    let bn: u32 = x86_bitnum((prev_mask >> 1) & 7)
+                    b = ((dest >> (24 - bn * 8)) & 0xFF) as u8
+                    if !test86(b) {
+                        break
+                    }
+                    src = dest ^ (((1 as u32) << (32 - bn * 8)) -% 1)
+                }
+                let top: u32 = (dest >> 24) & 1
+                if top == 1 {
+                    rt.st8(p, i + 4, 0xFF as u8)
+                } else {
+                    rt.st8(p, i + 4, 0 as u8)
+                }
+                rt.st8(p, i + 3, ((dest >> 16) & 0xFF) as u8)
+                rt.st8(p, i + 2, ((dest >> 8) & 0xFF) as u8)
+                rt.st8(p, i + 1, (dest & 0xFF) as u8)
+                i = i + 5
+                prev_mask = 0
+            } else {
+                i = i + 1
+                prev_mask = prev_mask | 1
+                if test86(b) {
+                    prev_mask = prev_mask | 0x10
+                }
+            }
+        }
+        (*f).prev_mask = prev_mask
+        (*f).prev_pos = prev_pos
+        (*f).ip = (*f).ip +% (i as u32)
+        return i
+    }
+    if id == 0x07 {
+        // ARM
+        while i + 4 <= size {
+            if rt.ld8(p, i + 3) == 0xEB as u8 {
+                var src: u32 = ((rt.ld8(p, i + 2) as u32) << 16) | ((rt.ld8(p, i + 1) as u32) << 8)
+                    | (rt.ld8(p, i) as u32)
+                src = src << 2
+                var dest: u32 = src -% (now +% (i as u32) +% 8)
+                dest = dest >> 2
+                rt.st8(p, i + 2, ((dest >> 16) & 0xFF) as u8)
+                rt.st8(p, i + 1, ((dest >> 8) & 0xFF) as u8)
+                rt.st8(p, i, (dest & 0xFF) as u8)
+            }
+            i = i + 4
+        }
+    } else if id == 0x08 {
+        // ARM Thumb
+        while i + 4 <= size {
+            if (rt.ld8(p, i + 1) & 0xF8 as u8) == 0xF0 as u8 && (rt.ld8(p, i + 3) & 0xF8 as u8) == 0xF8 as u8 {
+                var src: u32 = (((rt.ld8(p, i + 1) as u32) & 7) << 19) | ((rt.ld8(p, i) as u32) << 11)
+                    | (((rt.ld8(p, i + 3) as u32) & 7) << 8) | (rt.ld8(p, i + 2) as u32)
+                src = src << 1
+                var dest: u32 = src -% (now +% (i as u32) +% 4)
+                dest = dest >> 1
+                rt.st8(p, i + 1, (0xF0 | ((dest >> 19) & 7)) as u8)
+                rt.st8(p, i, ((dest >> 11) & 0xFF) as u8)
+                rt.st8(p, i + 3, (0xF8 | ((dest >> 8) & 7)) as u8)
+                rt.st8(p, i + 2, (dest & 0xFF) as u8)
+                i = i + 2
+            }
+            i = i + 2
+        }
+    } else if id == 0x05 {
+        // PowerPC
+        while i + 4 <= size {
+            if (rt.ld8(p, i) >> 2) == 0x12 as u8 && (rt.ld8(p, i + 3) & 3 as u8) == 1 as u8 {
+                let src: u32 = (((rt.ld8(p, i) as u32) & 3) << 24) | ((rt.ld8(p, i + 1) as u32) << 16)
+                    | ((rt.ld8(p, i + 2) as u32) << 8) | ((rt.ld8(p, i + 3) as u32) & 0xFC)
+                let dest: u32 = src -% (now +% (i as u32))
+                rt.st8(p, i, (0x48 | ((dest >> 24) & 3)) as u8)
+                rt.st8(p, i + 1, ((dest >> 16) & 0xFF) as u8)
+                rt.st8(p, i + 2, ((dest >> 8) & 0xFF) as u8)
+                rt.st8(p, i + 3, (((rt.ld8(p, i + 3) as u32) & 3) | (dest & 0xFC)) as u8)
+            }
+            i = i + 4
+        }
+    } else if id == 0x09 {
+        // SPARC
+        while i + 4 <= size {
+            let b0: u8 = rt.ld8(p, i)
+            let b1: u8 = rt.ld8(p, i + 1)
+            if (b0 == 0x40 as u8 && (b1 & 0xC0 as u8) == 0 as u8) || (b0 == 0x7F as u8 && (b1 & 0xC0 as u8) == 0xC0 as u8) {
+                var src: u32 = ((b0 as u32) << 24) | ((b1 as u32) << 16) | ((rt.ld8(p, i + 2) as u32) << 8)
+                    | (rt.ld8(p, i + 3) as u32)
+                src = src << 2
+                var dest: u32 = src -% (now +% (i as u32))
+                dest = dest >> 2
+                let sign: u32 = (dest >> 22) & 1
+                dest = ((((0 as u32) -% sign) << 22) & 0x3FFFFFFF) | (dest & 0x3FFFFF) | 0x40000000
+                rt.st8(p, i, ((dest >> 24) & 0xFF) as u8)
+                rt.st8(p, i + 1, ((dest >> 16) & 0xFF) as u8)
+                rt.st8(p, i + 2, ((dest >> 8) & 0xFF) as u8)
+                rt.st8(p, i + 3, (dest & 0xFF) as u8)
+            }
+            i = i + 4
+        }
+    } else if id == 0x06 {
+        // IA-64
+        while i + 16 <= size {
+            let tmpl: usize = (rt.ld8(p, i) & 0x1F as u8) as usize
+            let mask: u32 = ia64_mask(tmpl)
+            var bit_pos: u32 = 5
+            var slot: u32 = 0
+            while slot < 3 {
+                if ((mask >> slot) & 1) != 0 {
+                    let byte_pos: usize = (bit_pos >> 3) as usize
+                    let bit_res: u32 = bit_pos & 7
+                    var instr: u64 = 0
+                    var j: usize = 0
+                    while j < 6 {
+                        instr = instr + ((rt.ld8(p, i + j + byte_pos) as u64) << ((8 * j) as u64))
+                        j = j + 1
+                    }
+                    var norm: u64 = instr >> (bit_res as u64)
+                    if ((norm >> 37) & 0xF) == 5 && ((norm >> 9) & 7) == 0 {
+                        var src: u32 = ((norm >> 13) & 0xFFFFF) as u32
+                        src = src | ((((norm >> 36) & 1) as u32) << 20)
+                        src = src << 4
+                        var dest: u32 = src -% (now +% (i as u32))
+                        dest = dest >> 4
+                        norm = norm & (0xFFFFFFFFFFFFFFFF ^ ((0x8FFFFF as u64) << 13))
+                        norm = norm | (((dest & 0xFFFFF) as u64) << 13)
+                        norm = norm | (((dest & 0x100000) as u64) << 16)
+                        instr = instr & (((1 as u64) << (bit_res as u64)) - 1)
+                        instr = instr | (norm << (bit_res as u64))
+                        j = 0
+                        while j < 6 {
+                            rt.st8(p, i + j + byte_pos, ((instr >> ((8 * j) as u64)) & 0xFF) as u8)
+                            j = j + 1
+                        }
+                    }
+                }
+                slot = slot + 1
+                bit_pos = bit_pos + 41
+            }
+            i = i + 16
+        }
+    } else if id == 0x0A {
+        // ARM64
+        while i + 4 <= size {
+            let pc: u32 = now +% (i as u32)
+            var instr: u32 = common.ld32le(p, i)
+            if (instr >> 26) == 0x25 {
+                let src: u32 = instr
+                instr = 0x94000000
+                let pcw: u32 = (0 as u32) -% (pc >> 2)
+                instr = instr | ((src +% pcw) & 0x03FFFFFF)
+                common.st32le(p, i, instr)
+            } else if (instr & 0x9F000000) == 0x90000000 {
+                let src: u32 = ((instr >> 29) & 3) | ((instr >> 3) & 0x001FFFFC)
+                if ((src +% 0x00020000) & 0x001C0000) == 0 {
+                    instr = instr & 0x9000001F
+                    let pcw: u32 = (0 as u32) -% (pc >> 12)
+                    let dest: u32 = src +% pcw
+                    instr = instr | ((dest & 3) << 29)
+                    instr = instr | ((dest & 0x0003FFFC) << 3)
+                    instr = instr | (((0 as u32) -% (dest & 0x00020000)) & 0x00E00000)
+                    common.st32le(p, i, instr)
+                }
+            }
+            i = i + 4
+        }
+    }
+    (*f).ip = (*f).ip +% (i as u32)
+    return i
+}
+
+fn x86_bitnum(m: u32) -> u32 {
+    // MASK_TO_BIT_NUMBER = {0, 1, 2, 2, 3, 3, 3, 3}
+    if m == 0 {
+        return 0
+    }
+    if m == 1 {
+        return 1
+    }
+    if m <= 3 {
+        return 2
+    }
+    return 3
+}
+
+fn ia64_mask(t: usize) -> u32 {
+    // BRANCH_TABLE = {0 x16, 4,4,6,6,0,0,7,7, 4,4,0,0,4,4,0,0}
+    if t < 16 {
+        return 0
+    }
+    var v: u32 = 0
+    let k: usize = t - 16
+    if k == 0 || k == 1 || k == 8 || k == 9 || k == 12 || k == 13 {
+        v = 4
+    } else if k == 2 || k == 3 {
+        v = 6
+    } else if k == 6 || k == 7 {
+        v = 7
+    }
+    return v
+}
+
+// ====================================================================
+// THE .XZ CONTAINER
+// ====================================================================
+
+struct XzDec {
+    src: common.Source,
+    out: rt.Buf,
+    dict: rt.Buf, // the LZMA dictionary when filters are in the chain (it must hold the UNFILTERED data)
+    drained: usize,
+    ready: usize, // octets of `out` that are final (filters may hold the tail back)
+    chk_done: usize,
+    state: u32, // 0 stream header, 1 block header / index, 2 LZMA2 chunks, 6 stream end padding, 9 done
+    nstreams: u32,
+    check: u32,
+    check_size: usize,
+    stream_flags: u32,
+    recs: rt.Buf, // (unpadded size, uncompressed size) of every block of the stream, u64 pairs
+    // the block
+    bhdr: usize,
+    has_csize: bool,
+    csize: u64,
+    has_usize: bool,
+    usize_: u64,
+    blk_in0: u64,
+    blk_out0: u64,
+    nflt: usize,
+    flt: [XzFilter; 4],
+    lz: Lzma,
+    dict_size: u64,
+    since: u64,
+    need_dict_reset: bool,
+    need_props: bool,
+    // checks
+    ctab: common.Crc32,
+    crc32: u32,
+    crc64: common.Crc64,
+    sha: sha256.Sha256,
+    // totals and options
+    total: u64,
+    max: usize,
+    dict_max: u64,
+    legacy: bool,
+    pend: i32, // an octet read ahead (-2 = none)
+}
+
+fn xz_new(s: common.Source) -> XzDec {
+    return XzDec { src: s, out: rt.buf_new(), dict: rt.buf_new(), drained: 0, ready: 0, chk_done: 0, state: 0, nstreams: 0,
+        check: 0, check_size: 0, stream_flags: 0, recs: rt.buf_new(), bhdr: 0, has_csize: false, csize: 0,
+        has_usize: false, usize_: 0, blk_in0: 0, blk_out0: 0, nflt: 0,
+        flt: [flt_new(), flt_new(), flt_new(), flt_new()], lz: lzma_new(), dict_size: 0, since: 0,
+        need_dict_reset: true, need_props: true, ctab: common.crc32_new(), crc32: 0,
+        crc64: common.crc64_new(), sha: sha256.sha256_new(), total: 0, max: 0, dict_max: 268435456,
+        legacy: false, pend: 0 - 2 }
+}
+
+fn xz_dec_open_mem(p: u64, n: usize) -> XzDec {
+    return xz_new(common.src_mem(p, n))
+}
+
+fn xz_dec_open_fd(fd: i64) -> XzDec {
+    return xz_new(common.src_fd(fd))
+}
+
+// The largest LZMA2 dictionary the STREAMING reader accepts (octets).
+fn xz_dec_set_dict_max(d: *mut XzDec, n: u64) {
+    (*d).dict_max = n
+}
+
+fn xz_dec_close(d: *mut XzDec) {
+    common.src_free(&(*d).src)
+    rt.buf_free(&(*d).out)
+    rt.buf_free(&(*d).dict)
+    rt.buf_free(&(*d).recs)
+    lzma_free(&(*d).lz)
+}
+
+fn xz_is_xz(p: u64, n: usize) -> bool {
+    return n >= 6 && rt.ld8(p, 0) == 0xFD as u8 && rt.ld8(p, 1) == 0x37 as u8 && rt.ld8(p, 2) == 0x7A as u8
+        && rt.ld8(p, 3) == 0x58 as u8 && rt.ld8(p, 4) == 0x5A as u8 && rt.ld8(p, 5) == 0 as u8
+}
+
+fn check_size_of(id: u32) -> usize {
+    if id == 0 {
+        return 0
+    }
+    if id <= 3 {
+        return 4
+    }
+    if id <= 6 {
+        return 8
+    }
+    if id <= 9 {
+        return 16
+    }
+    if id <= 12 {
+        return 32
+    }
+    return 64
+}
+
+fn chk_start(d: *mut XzDec) {
+    (*d).crc32 = 0
+    (*d).crc64 = common.crc64_new()
+    (*d).sha = sha256.sha256_new()
+}
+
+fn chk_update(d: *mut XzDec, p: u64, n: usize) {
+    if n == 0 {
+        return
+    }
+    if (*d).check == 1 {
+        (*d).crc32 = common.crc32_update_of(&(*d).ctab, (*d).crc32, p, n)
+    } else if (*d).check == 4 {
+        common.crc64_update(&(*d).crc64, p, n)
+    } else if (*d).check == 10 {
+        sha256.sha256_update(&(*d).sha, p, n)
+    }
+}
+
+fn bad_input(d: *mut XzDec) -> CompressError {
+    if common.src_failed(&(*d).src) {
+        return CompressError::Io
+    }
+    return CompressError::Truncated
+}
+
+// The next input octet, honouring a byte read ahead.
+fn next_byte(d: *mut XzDec) -> i32 {
+    if (*d).pend != 0 - 2 {
+        let v: i32 = (*d).pend
+        (*d).pend = 0 - 2
+        return v
+    }
+    return common.src_byte(&(*d).src)
+}
+
+// `n` octets into `dst` (a pending octet comes first); false if short.
+fn rd_bytes(d: *mut XzDec, dst: u64, n: usize) -> bool {
+    var at: usize = 0
+    if n > 0 && (*d).pend != 0 - 2 {
+        rt.st8(dst, 0, (*d).pend as u8)
+        (*d).pend = 0 - 2
+        at = 1
+    }
+    return common.src_read(&(*d).src, dst + at as u64, n - at) == n - at
+}
+
+// A variable length integer out of memory: false if malformed or short.
+fn vli_get(p: u64, n: usize, pos: *mut usize, out: *mut u64) -> bool {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < 9 {
+        if *pos >= n {
+            return false
+        }
+        let b: u8 = rt.ld8(p, *pos)
+        *pos = *pos + 1
+        v = v | (((b & 0x7F as u8) as u64) << ((7 * i) as u64))
+        if (b & 0x80 as u8) == 0 as u8 {
+            if b == 0 as u8 && i > 0 {
+                return false // not the shortest form
+            }
+            *out = v
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// A VLI out of the input, feeding the octets into a running CRC-32.
+fn vli_read(d: *mut XzDec, crc: *mut u32, cnt: *mut usize, out: *mut u64) -> CompressError!bool {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < 9 {
+        let b: i32 = common.src_byte(&(*d).src)
+        if b < 0 {
+            return bad_input(d)
+        }
+        var one: [u8; 1] = [b as u8]
+        *crc = common.crc32_update_of(&(*d).ctab, *crc, (&one[0]) as u64, 1)
+        *cnt = *cnt + 1
+        v = v | (((b & 0x7F) as u64) << ((7 * i) as u64))
+        if (b & 0x80) == 0 {
+            if b == 0 && i > 0 {
+                return CompressError::Data
+            }
+            *out = v
+            return true
+        }
+        i = i + 1
+    }
+    return CompressError::Data
+}
+
+fn dict_size_of(b: u32) -> u64 {
+    if b == 40 {
+        return 0xFFFFFFFF
+    }
+    return ((2 | (b & 1)) as u64) << ((b / 2 + 11) as u64)
+}
+
+// Reads the block header whose first octet (the size) is `first`.
+fn read_block_header(d: *mut XzDec, first: u32) -> CompressError!bool {
+    let hs: usize = ((first as usize) + 1) * 4
+    var h: [u8; 1024] = [0; 1024]
+    h[0] = first as u8
+    if !rd_bytes(d, (&h[1]) as u64, hs - 1) {
+        return bad_input(d)
+    }
+    let want: u32 = common.ld32le((&h[0]) as u64, hs - 4)
+    if common.crc32_of((&h[0]) as u64, hs - 4) != want {
+        return CompressError::Checksum
+    }
+    let flags: u32 = h[1] as u32
+    if (flags & 0x3C) != 0 {
+        return CompressError::Unsupported
+    }
+    let nf: usize = ((flags & 3) as usize) + 1
+    var pos: usize = 2
+    (*d).has_csize = (flags & 0x40) != 0
+    (*d).has_usize = (flags & 0x80) != 0
+    if (*d).has_csize {
+        if !vli_get((&h[0]) as u64, hs - 4, &pos, &(*d).csize) {
+            return CompressError::Data
+        }
+        if (*d).csize == 0 {
+            return CompressError::Data
+        }
+    }
+    if (*d).has_usize {
+        if !vli_get((&h[0]) as u64, hs - 4, &pos, &(*d).usize_) {
+            return CompressError::Data
+        }
+    }
+    (*d).nflt = 0
+    var k: usize = 0
+    var have_lzma2: bool = false
+    while k < nf {
+        var id: u64 = 0
+        var psz: u64 = 0
+        if !vli_get((&h[0]) as u64, hs - 4, &pos, &id) || !vli_get((&h[0]) as u64, hs - 4, &pos, &psz) {
+            return CompressError::Data
+        }
+        if pos + (psz as usize) > hs - 4 {
+            return CompressError::Data
+        }
+        if id == 0x21 {
+            if k != nf - 1 || psz != 1 {
+                return CompressError::Data // LZMA2 must be last
+            }
+            let db: u32 = h[pos] as u32
+            if db > 40 {
+                return CompressError::Data
+            }
+            (*d).dict_size = dict_size_of(db)
+            have_lzma2 = true
+        } else {
+            if k == nf - 1 {
+                return CompressError::Data
+            }
+            var f: XzFilter = flt_new()
+            f.id = id as u32
+            if id == 0x03 {
+                if psz != 1 {
+                    return CompressError::Data
+                }
+                f.dist = (h[pos] as u32) + 1
+            } else if id == 0x04 || id == 0x05 || id == 0x06 || id == 0x07 || id == 0x08 || id == 0x09
+                || id == 0x0A {
+                if psz != 0 {
+                    // a start offset: not supported
+                    return CompressError::Unsupported
+                }
+            } else {
+                return CompressError::Unsupported
+            }
+            if (*d).nflt >= 3 {
+                return CompressError::Data
+            }
+            (*d).flt[(*d).nflt] = f
+            (*d).nflt = (*d).nflt + 1
+        }
+        pos = pos + (psz as usize)
+        k = k + 1
+    }
+    if !have_lzma2 {
+        return CompressError::Data
+    }
+    // the rest is padding
+    while pos < hs - 4 {
+        if h[pos] != 0 as u8 {
+            return CompressError::Data
+        }
+        pos = pos + 1
+    }
+    if (*d).state == 1 && (*d).dict_max < (*d).dict_size {
+        return CompressError::Unsupported
+    }
+    (*d).bhdr = hs
+    return true
+}
+
+// Runs the filter chain over what the last chunk appended; `fin` at the end
+// of a block (the tail that needs lookahead passes through unchanged).
+fn run_filters(d: *mut XzDec, out: *mut rt.Buf, fin: bool) {
+    let buf: u64 = (*out).ptr
+    var end: usize = (*out).len
+    if (*d).nflt == 0 {
+        (*d).ready = end
+        return
+    }
+    var k: usize = (*d).nflt
+    while k > 0 {
+        k = k - 1
+        let start: usize = (*d).flt[k].done
+        if end > start {
+            let n: usize = filter_pass(&(*d).flt[k], buf, start, end)
+            (*d).flt[k].done = start + n
+        }
+        if fin {
+            // the unconvertible tail is final as it is
+            (*d).flt[k].ip = (*d).flt[k].ip +% ((end - (*d).flt[k].done) as u32)
+            (*d).flt[k].done = end
+        }
+        end = (*d).flt[k].done
+    }
+    (*d).ready = (*d).flt[0].done
+}
+
+fn finish_check(d: *mut XzDec, out: *mut rt.Buf) {
+    if (*d).ready > (*d).chk_done {
+        chk_update(d, (*out).ptr + (*d).chk_done as u64, (*d).ready - (*d).chk_done)
+        (*d).chk_done = (*d).ready
+    }
+}
+
+// The index and the footer of a stream.
+fn read_index_footer(d: *mut XzDec) -> CompressError!bool {
+    var crc: u32 = common.crc32_of(0, 0)
+    var cnt: usize = 1
+    var zero: [u8; 1] = [0]
+    crc = common.crc32_update_of(&(*d).ctab, crc, (&zero[0]) as u64, 1)
+    var nrec: u64 = 0
+    try vli_read(d, &crc, &cnt, &nrec)
+    if nrec != ((*d).recs.len / 16) as u64 {
+        return CompressError::Data
+    }
+    var i: u64 = 0
+    while i < nrec {
+        var up: u64 = 0
+        var us: u64 = 0
+        try vli_read(d, &crc, &cnt, &up)
+        try vli_read(d, &crc, &cnt, &us)
+        if up != common.ld64le((*d).recs.ptr, (i as usize) * 16) || us != common.ld64le((*d).recs.ptr, (i as usize) * 16 + 8) {
+            return CompressError::Data
+        }
+        i = i + 1
+    }
+    while cnt % 4 != 0 {
+        let b: i32 = common.src_byte(&(*d).src)
+        if b < 0 {
+            return bad_input(d)
+        }
+        if b != 0 {
+            return CompressError::Data
+        }
+        var one: [u8; 1] = [0]
+        crc = common.crc32_update_of(&(*d).ctab, crc, (&one[0]) as u64, 1)
+        cnt = cnt + 1
+    }
+    var w: [u8; 4] = [0; 4]
+    if !rd_bytes(d, (&w[0]) as u64, 4) {
+        return bad_input(d)
+    }
+    if common.ld32le((&w[0]) as u64, 0) != crc {
+        return CompressError::Checksum
+    }
+    cnt = cnt + 4
+    // the footer: CRC-32, backward size, flags, "YZ"
+    var f: [u8; 12] = [0; 12]
+    if !rd_bytes(d, (&f[0]) as u64, 12) {
+        return bad_input(d)
+    }
+    if common.crc32_of((&f[4]) as u64, 6) != common.ld32le((&f[0]) as u64, 0) {
+        return CompressError::Checksum
+    }
+    if f[10] != 0x59 as u8 || f[11] != 0x5A as u8 {
+        return CompressError::Data
+    }
+    let back: u64 = ((common.ld32le((&f[0]) as u64, 4)) as u64 + 1) * 4
+    if back != (cnt as u64) {
+        return CompressError::Data
+    }
+    if (f[8] as u32) != 0 || (f[9] as u32) != (*d).stream_flags {
+        return CompressError::Data
+    }
+    return true
+}
+
+// One step: false = everything is decoded.
+fn xz_step(d: *mut XzDec, out: *mut rt.Buf) -> CompressError!bool {
+    let st: u32 = (*d).state
+    if st == 9 {
+        return false
+    }
+    if st == 0 {
+        var h: [u8; 12] = [0; 12]
+        let first: i32 = next_byte(d)
+        if first < 0 {
+            if common.src_failed(&(*d).src) {
+                return CompressError::Io
+            }
+            return CompressError::Truncated
+        }
+        h[0] = first as u8
+        if !rd_bytes(d, (&h[1]) as u64, 11) {
+            return bad_input(d)
+        }
+        if !xz_is_xz((&h[0]) as u64, 12) {
+            return CompressError::Format
+        }
+        if common.crc32_of((&h[6]) as u64, 2) != common.ld32le((&h[0]) as u64, 8) {
+            return CompressError::Checksum
+        }
+        if h[6] != 0 as u8 || (h[7] & 0xF0 as u8) != 0 as u8 {
+            return CompressError::Unsupported
+        }
+        (*d).check = (h[7] & 0x0F as u8) as u32
+        (*d).check_size = check_size_of((*d).check)
+        (*d).stream_flags = h[7] as u32
+        rt.buf_clear(&(*d).recs)
+        (*d).state = 1
+        return true
+    }
+    if st == 1 {
+        let b: i32 = common.src_byte(&(*d).src)
+        if b < 0 {
+            return bad_input(d)
+        }
+        if b == 0 {
+            try read_index_footer(d)
+            (*d).nstreams = (*d).nstreams + 1
+            (*d).state = 6
+            return true
+        }
+        try read_block_header(d, b as u32)
+        (*d).blk_in0 = common.src_consumed(&(*d).src)
+        (*d).blk_out0 = (*d).total
+        (*d).since = 0
+        (*d).need_dict_reset = true
+        (*d).need_props = true
+        chk_start(d)
+        (*d).ready = (*out).len
+        (*d).chk_done = (*out).len
+        var k: usize = 0
+        while k < (*d).nflt {
+            (*d).flt[k].done = (*out).len
+            k = k + 1
+        }
+        (*d).state = 2
+        return true
+    }
+    if st == 6 {
+        // stream padding (zeros, four at a time), then the next stream or the end
+        while true {
+            let b: i32 = common.src_byte(&(*d).src)
+            if b < 0 {
+                if common.src_failed(&(*d).src) {
+                    return CompressError::Io
+                }
+                (*d).state = 9
+                return false
+            }
+            if b == 0 {
+                var z: [u8; 3] = [0; 3]
+                if !rd_bytes(d, (&z[0]) as u64, 3) {
+                    return CompressError::Data
+                }
+                if z[0] != 0 as u8 || z[1] != 0 as u8 || z[2] != 0 as u8 {
+                    return CompressError::Data
+                }
+                continue
+            }
+            (*d).pend = b
+            (*d).state = 0
+            return true
+        }
+    }
+    // state 2: one LZMA2 chunk
+    let cb: i32 = common.src_byte(&(*d).src)
+    if cb < 0 {
+        return bad_input(d)
+    }
+    let ctl: u32 = cb as u32
+    if ctl == 0 {
+        // end of the block's data
+        let csz: u64 = common.src_consumed(&(*d).src) - (*d).blk_in0
+        let usz: u64 = (*d).total - (*d).blk_out0
+        if (*d).has_csize && (*d).csize != csz {
+            return CompressError::Data
+        }
+        if (*d).has_usize && (*d).usize_ != usz {
+            return CompressError::Data
+        }
+        run_filters(d, out, true)
+        finish_check(d, out)
+        var pad: u64 = (4 - (csz % 4)) % 4
+        while pad > 0 {
+            let b: i32 = common.src_byte(&(*d).src)
+            if b < 0 {
+                return bad_input(d)
+            }
+            if b != 0 {
+                return CompressError::Data
+            }
+            pad = pad - 1
+        }
+        if (*d).check_size > 0 {
+            var c: [u8; 64] = [0; 64]
+            if !rd_bytes(d, (&c[0]) as u64, (*d).check_size) {
+                return bad_input(d)
+            }
+            if (*d).check == 1 {
+                if common.ld32le((&c[0]) as u64, 0) != (*d).crc32 {
+                    return CompressError::Checksum
+                }
+            } else if (*d).check == 4 {
+                if common.ld64le((&c[0]) as u64, 0) != common.crc64_final(&(*d).crc64) {
+                    return CompressError::Checksum
+                }
+            } else if (*d).check == 10 {
+                var dg: [u8; 32] = [0; 32]
+                sha256.sha256_final(&(*d).sha, (&dg[0]) as u64)
+                if !rt.mem_eq((&c[0]) as u64, (&dg[0]) as u64, 32) {
+                    return CompressError::Checksum
+                }
+            }
+        }
+        common.buf_ensure(&(*d).recs, (*d).recs.len + 16)
+        common.st64le((*d).recs.ptr, (*d).recs.len, ((*d).bhdr as u64) + csz + ((*d).check_size as u64))
+        common.st64le((*d).recs.ptr, (*d).recs.len + 8, usz)
+        (*d).recs.len = (*d).recs.len + 16
+        (*d).state = 1
+        return true
+    }
+    if ctl == 1 || ctl >= 0xE0 {
+        (*d).need_props = true
+        (*d).need_dict_reset = false
+        (*d).since = 0
+    } else if (*d).need_dict_reset {
+        return CompressError::Data
+    }
+    var usz: usize = 0
+    var csz: usize = 0
+    if ctl >= 0x80 {
+        var hb: [u8; 5] = [0; 5]
+        var hl: usize = 4
+        if ctl >= 0xC0 {
+            hl = 5
+        }
+        if !rd_bytes(d, (&hb[0]) as u64, hl) {
+            return bad_input(d)
+        }
+        usz = (((ctl & 0x1F) as usize) << 16) + ((hb[0] as usize) << 8) + (hb[1] as usize) + 1
+        csz = ((hb[2] as usize) << 8) + (hb[3] as usize) + 1
+        if ctl >= 0xC0 {
+            (*d).need_props = false
+            let pb: u32 = hb[4] as u32
+            if pb >= 225 {
+                return CompressError::Data
+            }
+            let lc: u32 = pb % 9
+            let r: u32 = pb / 9
+            if lc + (r % 5) > 4 {
+                return CompressError::Data // LZMA2 allows lc + lp <= 4
+            }
+            if !lzma_set_props(&(*d).lz, lc, r % 5, r / 5) {
+                return CompressError::OutOfMemory
+            }
+            lzma_reset_state(&(*d).lz)
+        } else if (*d).need_props {
+            return CompressError::Data
+        } else if ctl >= 0xA0 {
+            lzma_reset_state(&(*d).lz)
+        }
+    } else {
+        if ctl > 2 {
+            return CompressError::Data
+        }
+        var hb: [u8; 2] = [0; 2]
+        if !rd_bytes(d, (&hb[0]) as u64, 2) {
+            return bad_input(d)
+        }
+        usz = ((hb[0] as usize) << 8) + (hb[1] as usize) + 1
+        csz = usz
+    }
+    if (*d).max > 0 && (*d).total + (usz as u64) > ((*d).max as u64) {
+        return CompressError::TooLarge
+    }
+    let cp: u64 = common.src_take(&(*d).src, csz)
+    if cp == 0 {
+        return bad_input(d)
+    }
+    // without filters the output buffer is the dictionary; with filters the
+    // dictionary is a buffer of its own (matches must see the unfiltered data)
+    var tgt: *mut rt.Buf = out
+    if (*d).nflt > 0 {
+        tgt = &(*d).dict
+    }
+    let tstart: usize = (*tgt).len
+    if ctl < 0x80 {
+        if !common.buf_append_bytes(tgt, cp, usz) {
+            return CompressError::OutOfMemory
+        }
+    } else {
+        if !rc_init(&(*d).lz.rc, cp, csz) {
+            return CompressError::Data
+        }
+        var ended: bool = false
+        let got: usize = try lzma_run(&(*d).lz, tgt, usz, (*d).since, (*d).dict_size, false, &ended)
+        rc_norm(&(*d).lz.rc)
+        if (*d).lz.rc.over || got != usz || (*d).lz.rc.ip != (*d).lz.rc.ie || (*d).lz.rc.code != 0 {
+            return CompressError::Data
+        }
+    }
+    if (*d).nflt > 0 {
+        if !common.buf_append_bytes(out, (*tgt).ptr + tstart as u64, usz) {
+            return CompressError::OutOfMemory
+        }
+        // forget history the dictionary can no longer reach
+        let keep: usize = (*d).dict_size as usize
+        if (*tgt).len > keep + 4194304 {
+            common.buf_compact(tgt, (*tgt).len, keep)
+        }
+    }
+    (*d).since = (*d).since + (usz as u64)
+    (*d).total = (*d).total + (usz as u64)
+    run_filters(d, out, false)
+    finish_check(d, out)
+    return true
+}
+
+// ---------------------------------------------------------- whole buffer
+
+fn xz_decompress(src: u64, n: usize, out: *mut rt.Buf) -> CompressError!usize {
+    return try xz_decompress_limited(src, n, 0, out)
+}
+
+fn xz_decompress_limited(src: u64, n: usize, max: usize, out: *mut rt.Buf) -> CompressError!usize {
+    var d: XzDec = xz_dec_open_mem(src, n)
+    defer xz_dec_close(&d)
+    d.max = max
+    d.dict_max = 0xFFFFFFFFFFFFFFFF
+    let before: usize = (*out).len
+    while true {
+        let more: bool = try xz_step(&d, out)
+        if !more {
+            break
+        }
+    }
+    return (*out).len - before
+}
+
+// ---------------------------------------------------------------- streaming
+
+fn xz_dec_read(d: *mut XzDec, dst: u64, n: usize) -> CompressError!usize {
+    while (*d).drained >= (*d).ready && (*d).state != 9 {
+        var keep: usize = 0
+        if (*d).state == 2 {
+            keep = (*d).dict_size as usize
+        }
+        let cut: usize = common.buf_compact(&(*d).out, (*d).drained, keep)
+        if cut > 0 {
+            (*d).drained = (*d).drained - cut
+            (*d).ready = (*d).ready - cut
+            (*d).chk_done = (*d).chk_done - cut
+            var k: usize = 0
+            while k < (*d).nflt {
+                (*d).flt[k].done = (*d).flt[k].done - cut
+                k = k + 1
+            }
+        }
+        let more: bool = try xz_step(d, &(*d).out)
+        if !more {
+            break
+        }
+    }
+    var k: usize = (*d).ready - (*d).drained
+    if k > n {
+        k = n
+    }
+    if k > 0 {
+        rt.mem_copy(dst, (*d).out.ptr + (*d).drained as u64, k)
+        (*d).drained = (*d).drained + k
+    }
+    return k
+}
+
+// ====================================================================
+// THE LEGACY .lzma FORMAT (whole buffer only)
+// ====================================================================
+
+fn lzma_alone_decompress(src: u64, n: usize, out: *mut rt.Buf) -> CompressError!usize {
+    return try lzma_alone_decompress_limited(src, n, 0, out)
+}
+
+fn lzma_alone_decompress_limited(src: u64, n: usize, max: usize, out: *mut rt.Buf) -> CompressError!usize {
+    if n < 13 {
+        return CompressError::Truncated
+    }
+    var s: Lzma = lzma_new()
+    defer lzma_free(&s)
+    s.alone = true
+    if !lzma_set_props_byte(&s, rt.ld8(src, 0) as u32) {
+        return CompressError::Format
+    }
+    let dsz: u64 = common.ld32le(src, 1) as u64
+    if dsz == 0 {
+        return CompressError::Format
+    }
+    let usz: u64 = common.ld64le(src, 5)
+    let known: bool = usz != 0xFFFFFFFFFFFFFFFF
+    if known && usz > 0x7FFFFFFFFFFFFFFF {
+        return CompressError::Format
+    }
+    if known && max > 0 && usz > (max as u64) {
+        return CompressError::TooLarge
+    }
+    lzma_reset_state(&s)
+    if !rc_init(&s.rc, src + 13, n - 13) {
+        return CompressError::Data
+    }
+    let before: usize = (*out).len
+    var produced: u64 = 0
+    var ended: bool = false
+    while !ended {
+        var want: usize = 65536
+        if known {
+            if produced >= usz {
+                break
+            }
+            if usz - produced < (want as u64) {
+                want = (usz - produced) as usize
+            }
+        }
+        if max > 0 {
+            let left: usize = max - (produced as usize)
+            if want > left {
+                want = left
+                if want == 0 {
+                    // at the limit: only the end marker may follow
+                    if known {
+                        break
+                    }
+                    let keep: usize = (*out).len
+                    let got1: usize = try lzma_run(&s, out, 1, produced, dsz, true, &ended)
+                    (*out).len = keep
+                    if !ended || got1 != 0 {
+                        return CompressError::TooLarge
+                    }
+                    break
+                }
+            }
+        }
+        // distances are checked against everything produced (dictionary
+        // size is the stated one, but never above the size of the stream)
+        let got: usize = try lzma_run(&s, out, want, produced, dsz, !known, &ended)
+        produced = produced + (got as u64)
+    }
+    return (*out).len - before
+}
+
+fn xz_dec_open_source(s: common.Source) -> XzDec {
+    return xz_new(s)
+}
+
+struct XzDecPair {
+    a: XzDec,
+    b: XzDec,
+}
+
+// The size of a decoder in octets (the step between two of them in a pair).
+fn xz_dec_size() -> usize {
+    var p: XzDecPair = XzDecPair { a: xz_new(common.src_mem(0, 0)), b: xz_new(common.src_mem(0, 0)) }
+    let sz: usize = ((&p.b) as usize) - ((&p.a) as usize)
+    xz_dec_close(&p.a)
+    xz_dec_close(&p.b)
+    return sz
+}

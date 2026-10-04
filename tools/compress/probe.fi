@@ -1,0 +1,419 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/compress/probe.fi -- lib/compress against the reference tools.
+//
+//     probe <op> <fmt> <in> <out> [arg]
+//
+//   op d    whole-buffer decode            arg = output limit (0/absent = none)
+//   op ds   streaming decode (the input is read from a descriptor, the output
+//           drained in pieces of `arg` octets, default 4093)
+//   op c    whole-buffer encode            arg = level (absent = default)
+//   op cs   streaming encode               arg = chunk size fed to the encoder
+//   fmt     lz4 | zstd | xz | bz2 | br | auto
+//
+// Prints "OK <octets>" or "ERROR <kind>" on standard output and writes the
+// result to <out>. tools/compress/check.py runs it against python/zstd/xz.
+import compress.common
+import compress.lz4
+import compress.bz2
+import compress.zstd
+import compress.zstd_enc
+import compress.lzma
+import compress.lzma_enc
+import compress.brotli
+import compress.auto
+import compress.gzip
+import std.fs
+import std.io
+import std.rt
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: rt.ptr_of(p), n: rt.c_length(p) }
+}
+
+fn num(s: str) -> usize {
+    var v: usize = 0
+    var i: usize = 0
+    while i < s.length() {
+        let c: u8 = rt.ld8(s.p as u64, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            break
+        }
+        v = v * 10 + ((c - 48 as u8) as usize)
+        i = i + 1
+    }
+    return v
+}
+
+fn kind(e: CompressError) -> bool {
+    if e == CompressError::Data { io.print_line("ERROR Data") }
+    if e == CompressError::Format { io.print_line("ERROR Format") }
+    if e == CompressError::Checksum { io.print_line("ERROR Checksum") }
+    if e == CompressError::Truncated { io.print_line("ERROR Truncated") }
+    if e == CompressError::TooLarge { io.print_line("ERROR TooLarge") }
+    if e == CompressError::OutOfMemory { io.print_line("ERROR OutOfMemory") }
+    if e == CompressError::Unsupported { io.print_line("ERROR Unsupported") }
+    if e == CompressError::Dictionary { io.print_line("ERROR Dictionary") }
+    if e == CompressError::Io { io.print_line("ERROR Io") }
+    return false
+}
+
+fn same(a: str, b: str) -> bool {
+    if a.length() != b.length() {
+        return false
+    }
+    return rt.mem_eq(a.p as u64, b.p as u64, a.length())
+}
+
+// ---------------------------------------------------------------- formats
+
+fn whole_decode(fmt: str, p: u64, n: usize, limit: usize, dict: u64, dictlen: usize, out: *mut rt.Buf) -> CompressError!usize {
+    if same(fmt, "lz4") {
+        return try lz4.lz4_frame_decompress_limited(p, n, limit, out)
+    }
+    if same(fmt, "bz2") {
+        return try bz2.bz2_decompress_limited(p, n, limit, out)
+    }
+    if same(fmt, "zstd") {
+        return try zstd.zstd_decompress_dict(p, n, limit, dict, dictlen, out)
+    }
+    if same(fmt, "xz") {
+        return try lzma.xz_decompress_limited(p, n, limit, out)
+    }
+    if same(fmt, "br") {
+        return try brotli.brotli_decompress_limited(p, n, limit, out)
+    }
+    if same(fmt, "auto") {
+        return try auto.decompress_limited(p, n, limit, out)
+    }
+    if same(fmt, "gz") {
+        return try gzip.gz_decompress_limited(p, n, gzip.GZ_GZIP, limit, out)
+    }
+    if same(fmt, "zlib") {
+        return try gzip.gz_decompress_limited(p, n, gzip.GZ_ZLIB, limit, out)
+    }
+    if same(fmt, "deflate") {
+        return try gzip.gz_decompress_limited(p, n, gzip.GZ_RAW, limit, out)
+    }
+    if same(fmt, "lzma") {
+        return try lzma.lzma_alone_decompress_limited(p, n, limit, out)
+    }
+    return CompressError::Unsupported
+}
+
+fn whole_encode(fmt: str, p: u64, n: usize, level: usize, dict: u64, dictlen: usize, out: *mut rt.Buf) -> CompressError!usize {
+    if same(fmt, "lz4") {
+        return try lz4.lz4_frame_compress(p, n, out)
+    }
+    if same(fmt, "xz") {
+        var lv: usize = level
+        if lv == 0 {
+            lv = 6
+        }
+        return try lzma_enc.xz_compress_check(p, n, lv as u32, lzma_enc.CHECK_CRC64, out)
+    }
+    if same(fmt, "lzma") {
+        var lv: usize = level
+        if lv == 0 {
+            lv = 6
+        }
+        return try lzma_enc.lzma_alone_compress(p, n, lv as u32, out)
+    }
+    if same(fmt, "zstd") {
+        var lv: usize = level
+        if lv == 0 {
+            lv = 3
+        }
+        return try zstd_enc.zstd_compress_dict(p, n, lv as u32, dict, dictlen, out)
+    }
+    return CompressError::Unsupported
+}
+
+// streaming decode from a descriptor into `out`, `piece` octets at a time
+fn stream_decode(fmt: str, fd: i64, piece: usize, dict: u64, dictlen: usize, out: *mut rt.Buf) -> CompressError!usize {
+    let tmp: u64 = rt.heap_alloc(piece)
+    if tmp == 0 {
+        return CompressError::OutOfMemory
+    }
+    var total: usize = 0
+    if same(fmt, "lz4") {
+        var d: lz4.Lz4Dec = lz4.lz4_dec_open_fd(fd)
+        while true {
+            let k: usize = lz4.lz4_dec_read(&d, tmp, piece) catch |e| (stream_fail(e, &d))
+            if k == 0 {
+                break
+            }
+            rt.buf_push_bytes(out, tmp, k)
+            total = total + k
+        }
+        lz4.lz4_dec_close(&d)
+        rt.heap_free(tmp, piece)
+        return total
+    }
+    if same(fmt, "gz") || same(fmt, "zlib") || same(fmt, "deflate") {
+        var gk: u32 = gzip.GZ_GZIP
+        if same(fmt, "zlib") {
+            gk = gzip.GZ_ZLIB
+        } else if same(fmt, "deflate") {
+            gk = gzip.GZ_RAW
+        }
+        var d: gzip.GzDec = gzip.gz_dec_open_fd(fd, gk)
+        while true {
+            let k: usize = gzip.gz_dec_read(&d, tmp, piece) catch |e| (stream_fail_gz(e, &d))
+            if k == 0 {
+                break
+            }
+            rt.buf_push_bytes(out, tmp, k)
+            total = total + k
+        }
+        gzip.gz_dec_close(&d)
+        rt.heap_free(tmp, piece)
+        return total
+    }
+    if same(fmt, "auto") {
+        var d: auto.AutoDec = auto.auto_dec_open_fd(fd) catch |e| (open_fail(e))
+        while true {
+            let k: usize = auto.auto_dec_read(&d, tmp, piece) catch |e| (stream_fail_auto(e, &d))
+            if k == 0 {
+                break
+            }
+            rt.buf_push_bytes(out, tmp, k)
+            total = total + k
+        }
+        auto.auto_dec_close(&d)
+        rt.heap_free(tmp, piece)
+        return total
+    }
+    if same(fmt, "br") {
+        var d: brotli.BrDec = brotli.brotli_dec_open_fd(fd)
+        while true {
+            let k: usize = brotli.brotli_dec_read(&d, tmp, piece) catch |e| (stream_fail_br(e, &d))
+            if k == 0 {
+                break
+            }
+            rt.buf_push_bytes(out, tmp, k)
+            total = total + k
+        }
+        brotli.brotli_dec_close(&d)
+        rt.heap_free(tmp, piece)
+        return total
+    }
+    if same(fmt, "xz") {
+        var d: lzma.XzDec = lzma.xz_dec_open_fd(fd)
+        while true {
+            let k: usize = lzma.xz_dec_read(&d, tmp, piece) catch |e| (stream_fail_xz(e, &d))
+            if k == 0 {
+                break
+            }
+            rt.buf_push_bytes(out, tmp, k)
+            total = total + k
+        }
+        lzma.xz_dec_close(&d)
+        rt.heap_free(tmp, piece)
+        return total
+    }
+    if same(fmt, "zstd") {
+        var d: zstd.ZstdDec = zstd.zstd_dec_open_fd(fd)
+        if dictlen > 0 {
+            zstd.zstd_dec_set_dict(&d, dict, dictlen)
+        }
+        while true {
+            let k: usize = zstd.zstd_dec_read(&d, tmp, piece) catch |e| (stream_fail_zstd(e, &d))
+            if k == 0 {
+                break
+            }
+            rt.buf_push_bytes(out, tmp, k)
+            total = total + k
+        }
+        zstd.zstd_dec_close(&d)
+        rt.heap_free(tmp, piece)
+        return total
+    }
+    if same(fmt, "bz2") {
+        var d: bz2.Bz2Dec = bz2.bz2_dec_open_fd(fd)
+        while true {
+            let k: usize = bz2.bz2_dec_read(&d, tmp, piece) catch |e| (stream_fail_bz2(e, &d))
+            if k == 0 {
+                break
+            }
+            rt.buf_push_bytes(out, tmp, k)
+            total = total + k
+        }
+        bz2.bz2_dec_close(&d)
+        rt.heap_free(tmp, piece)
+        return total
+    }
+    rt.heap_free(tmp, piece)
+    return CompressError::Unsupported
+}
+
+fn stream_fail_zstd(e: CompressError, d: *mut zstd.ZstdDec) -> usize {
+    kind(e)
+    zstd.zstd_dec_close(d)
+    rt.finish(0)
+    return 0
+}
+
+fn stream_fail_xz(e: CompressError, d: *mut lzma.XzDec) -> usize {
+    kind(e)
+    lzma.xz_dec_close(d)
+    rt.finish(0)
+    return 0
+}
+
+fn stream_fail_br(e: CompressError, d: *mut brotli.BrDec) -> usize {
+    kind(e)
+    brotli.brotli_dec_close(d)
+    rt.finish(0)
+    return 0
+}
+
+fn stream_fail_auto(e: CompressError, d: *mut auto.AutoDec) -> usize {
+    kind(e)
+    auto.auto_dec_close(d)
+    rt.finish(0)
+    return 0
+}
+
+fn stream_fail_gz(e: CompressError, d: *mut gzip.GzDec) -> usize {
+    kind(e)
+    gzip.gz_dec_close(d)
+    rt.finish(0)
+    return 0
+}
+
+fn open_fail(e: CompressError) -> auto.AutoDec {
+    kind(e)
+    rt.finish(0)
+    return auto.AutoDec { kind: 0, h: 0, hsize: 0, max: 0 }
+}
+
+fn stream_fail(e: CompressError, d: *mut lz4.Lz4Dec) -> usize {
+    kind(e)
+    lz4.lz4_dec_close(d)
+    rt.finish(0)
+    return 0
+}
+
+fn stream_fail_bz2(e: CompressError, d: *mut bz2.Bz2Dec) -> usize {
+    kind(e)
+    bz2.bz2_dec_close(d)
+    rt.finish(0)
+    return 0
+}
+
+fn stream_encode(fmt: str, p: u64, n: usize, chunk: usize, dict: u64, dictlen: usize, out: *mut rt.Buf) -> CompressError!usize {
+    if same(fmt, "lz4") {
+        var e: lz4.Lz4Enc = lz4.lz4_enc_new(5, true, true, 0)
+        var at: usize = 0
+        while at < n {
+            var k: usize = n - at
+            if k > chunk {
+                k = chunk
+            }
+            lz4.lz4_enc_write(&e, p + at as u64, k, out)
+            at = at + k
+        }
+        lz4.lz4_enc_finish(&e, out)
+        lz4.lz4_enc_free(&e)
+        return rt.buf_len(out)
+    }
+    if same(fmt, "xz") {
+        var e: lzma_enc.XzEnc = lzma_enc.xz_enc_new(6, lzma_enc.CHECK_CRC32)
+        var at: usize = 0
+        while at < n {
+            var k: usize = n - at
+            if k > chunk {
+                k = chunk
+            }
+            lzma_enc.xz_enc_write(&e, p + at as u64, k, out)
+            at = at + k
+        }
+        lzma_enc.xz_enc_finish(&e, out)
+        lzma_enc.xz_enc_free(&e)
+        return rt.buf_len(out)
+    }
+    if same(fmt, "zstd") {
+        var e: zstd_enc.ZstdEnc = zstd_enc.zstd_enc_new_dict(3, true, dict, dictlen)
+        var at: usize = 0
+        while at < n {
+            var k: usize = n - at
+            if k > chunk {
+                k = chunk
+            }
+            zstd_enc.zstd_enc_write(&e, p + at as u64, k, out)
+            at = at + k
+        }
+        zstd_enc.zstd_enc_finish(&e, out)
+        zstd_enc.zstd_enc_free(&e)
+        return rt.buf_len(out)
+    }
+    return CompressError::Unsupported
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 5 {
+        io.print_line("usage: probe <d|ds|c|cs> <fmt> <in> <out> [arg]")
+        return 2
+    }
+    let op: str = arg(start, 1)
+    let fmt: str = arg(start, 2)
+    var a: usize = 0
+    var have_arg: bool = false
+    if rt.arg_count(start) > 5 {
+        a = num(arg(start, 5))
+        have_arg = true
+    }
+    var dictb: rt.Buf = rt.buf_new()
+    if rt.arg_count(start) > 6 {
+        fs.read_file(arg(start, 6), &dictb) catch 0
+    }
+    var out: rt.Buf = rt.buf_new()
+    var ok: bool = true
+    var n: usize = 0
+    if same(op, "ds") {
+        let fd: i64 = fs.open_read(arg(start, 3)) catch -1
+        if fd < 0 {
+            io.print_line("ERROR open")
+            return 1
+        }
+        var piece: usize = 4093
+        if have_arg && a > 0 {
+            piece = a
+        }
+        n = stream_decode(fmt, fd, piece, rt.buf_ptr(&dictb), rt.buf_len(&dictb), &out) catch |e| (fail(e, &ok))
+        fs.close_fd(fd)
+    } else {
+        var data: rt.Buf = rt.buf_new()
+        fs.read_file(arg(start, 3), &data) catch 0
+        if same(op, "d") {
+            n = whole_decode(fmt, rt.buf_ptr(&data), rt.buf_len(&data), a, rt.buf_ptr(&dictb), rt.buf_len(&dictb), &out) catch |e| (fail(e, &ok))
+        } else if same(op, "c") {
+            n = whole_encode(fmt, rt.buf_ptr(&data), rt.buf_len(&data), a, rt.buf_ptr(&dictb), rt.buf_len(&dictb), &out) catch |e| (fail(e, &ok))
+        } else if same(op, "cs") {
+            var chunk: usize = 4097
+            if have_arg && a > 0 {
+                chunk = a
+            }
+            n = stream_encode(fmt, rt.buf_ptr(&data), rt.buf_len(&data), chunk, rt.buf_ptr(&dictb), rt.buf_len(&dictb), &out) catch |e| (fail(e, &ok))
+        } else {
+            io.print_line("ERROR op")
+            return 2
+        }
+    }
+    if !ok {
+        return 0
+    }
+    fs.write_file(arg(start, 4), rt.buf_ptr(&out), rt.buf_len(&out)) catch 0
+    var msg: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&msg, "OK ".p as u64, 3)
+    rt.buf_push_dec_u64(&msg, n as u64)
+    io.print_line_bytes(rt.buf_ptr(&msg), rt.buf_len(&msg))
+    return 0
+}
+
+fn fail(e: CompressError, ok: *mut bool) -> usize {
+    kind(e)
+    *ok = false
+    return 0
+}

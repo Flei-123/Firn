@@ -1,0 +1,140 @@
+// expect_exit: 0
+// tests/2161_db_sql.fi -- SQL through lib/db, answers compared with what SQLite answered to the
+// same statements (tools/db/gen_test.py wrote the expectations from SQLite 3.40): DDL, constraints,
+// conflict clauses, joins, sub-selects, compound selects, aggregates, transactions, ALTER, upsert,
+// the text of the common errors, and the PRAGMAs. A fresh database in the temp directory.
+import std.rt
+import std.io
+import std.fs
+import db.dberr
+import db.dbcore as dc
+import db.sqlite as sq
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, got: str, want: str) {
+    (*t).total = (*t).total + 1
+    if !got.equal(want) {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print(what)
+        io.print(": got [")
+        io.print(got)
+        io.print("] want [")
+        io.print(want)
+        io.print_line("]")
+    }
+}
+
+// the rows as text, or "E:" and the message
+fn q(d: *mut dc.Db, sql: str) -> str {
+    let s: str = sq.db_query_all(d, sql) catch | e | ("E:" + sq.last_error_message())
+    return s
+}
+
+fn scratch_path() -> str {
+    var b: rt.Buf = rt.buf_new()
+    let head: str = "/tmp/firn_db_2161_"
+    rt.buf_push_bytes(&b, head.p as u64, head.length())
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let path: str = scratch_path()
+    let d: *mut dc.Db = sq.db_open(path, sq.OPEN_CREATE) catch | e | (0 as *mut dc.Db)
+    if (d as u64) == 0 {
+        io.print_line("FAIL cannot create the database")
+        return 2
+    }
+    check(&t, "step 0", q(d, "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER NOT NULL DEFAULT 5, b TEXT UNIQUE, c REAL, d BLOB, e TEXT DEFAULT 'x')"), "")
+    check(&t, "step 1", q(d, "CREATE INDEX t_a ON t(a)"), "")
+    check(&t, "step 2", q(d, "CREATE UNIQUE INDEX t_ce ON t(c, e)"), "")
+    check(&t, "step 3", q(d, "INSERT INTO t(a, b, c) VALUES (1, 'one', 1.5), (2, 'two', 2.5), (3, 'three', 3.5)"), "")
+    check(&t, "step 4", q(d, "INSERT INTO t(b) VALUES ('five')"), "")
+    check(&t, "step 5", q(d, "INSERT INTO t(a, b) VALUES (NULL, 'bad')"), "E:NOT NULL constraint failed: t.a")
+    check(&t, "step 6", q(d, "INSERT INTO t(a, b) VALUES (9, 'one')"), "E:UNIQUE constraint failed: t.b")
+    check(&t, "step 7", q(d, "INSERT INTO t(id, b) VALUES (1, 'dupid')"), "E:UNIQUE constraint failed: t.id")
+    check(&t, "step 8", q(d, "INSERT OR IGNORE INTO t(a, b) VALUES (9, 'one')"), "")
+    check(&t, "step 9", q(d, "INSERT OR REPLACE INTO t(a, b, c) VALUES (7, 'one', 7.5)"), "")
+    check(&t, "step 10", q(d, "INSERT INTO t(a, b, c) VALUES (4, 'four', 1.5)"), "")
+    check(&t, "step 11", q(d, "SELECT id, a, b, c, e FROM t ORDER BY id"), "2|2|two|2.5|x;3|3|three|3.5|x;4|5|five|NULL|x;5|7|one|7.5|x;6|4|four|1.5|x")
+    check(&t, "step 12", q(d, "SELECT typeof(a), typeof(b), typeof(c), typeof(d) FROM t WHERE b = 'two'"), "integer|text|real|null")
+    check(&t, "step 13", q(d, "UPDATE t SET a = a * 10 WHERE a < 4"), "")
+    check(&t, "step 14", q(d, "UPDATE t SET b = 'two' WHERE id = 1"), "")
+    check(&t, "step 15", q(d, "SELECT id, a FROM t ORDER BY a DESC, id"), "3|30;2|20;5|7;4|5;6|4")
+    check(&t, "step 16", q(d, "DELETE FROM t WHERE b LIKE 't%'"), "")
+    check(&t, "step 17", q(d, "SELECT count(*), sum(a), min(b), max(b), avg(a) FROM t"), "3|16|five|one|5.33333333333333")
+    check(&t, "step 18", q(d, "SELECT id FROM t WHERE a BETWEEN 5 AND 8 ORDER BY id"), "4;5")
+    check(&t, "step 19", q(d, "SELECT 1 + 1, 7 / 2, 7 % 3, -7 / 2, 2.5 * 2, 'a' || 'b' || 1, 5 > 3, NULL IS NULL, 1 = NULL"), "2|3|1|-3|5.0|ab1|1|1|NULL")
+    check(&t, "step 20", q(d, "SELECT abs(-3), round(2.675, 2), length('日本語'), upper('abc'), substr('hello', 2, 3), coalesce(NULL, 'z'), typeof(1.0), hex('A')"), "3|2.68|3|ABC|ell|z|real|41")
+    check(&t, "step 21", q(d, "SELECT CAST('12abc' AS INTEGER), CAST(3.9 AS INTEGER), CAST(7 AS TEXT), CAST('x' AS BLOB), typeof(CAST(1 AS REAL))"), "12|3|7|x'78'|real")
+    check(&t, "step 22", q(d, "SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END, CASE 3 WHEN 1 THEN 'x' WHEN 3 THEN 'y' END"), "b|y")
+    check(&t, "step 23", q(d, "SELECT 9223372036854775807 + 1, 4611686018427387904 * 2, 1 / 0, 5 % 0"), "9.22337203685478e+18|9.22337203685478e+18|NULL|NULL")
+    check(&t, "step 24", q(d, "SELECT 'abc' LIKE 'A%', 'abc' GLOB 'A*', 'a_c' LIKE 'a\\_c' ESCAPE '\\', 3 IN (1, 2, 3), 3 NOT IN (1, 2), 'b' BETWEEN 'a' AND 'c'"), "1|0|1|1|1|1")
+    check(&t, "step 25", q(d, "CREATE TABLE p(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, boss INTEGER REFERENCES p(id))"), "")
+    check(&t, "step 26", q(d, "INSERT INTO p(name, boss) VALUES ('ann', NULL), ('bob', 1), ('cy', 1), ('di', 2)"), "")
+    check(&t, "step 27", q(d, "DELETE FROM p WHERE id = 4"), "")
+    check(&t, "step 28", q(d, "INSERT INTO p(name, boss) VALUES ('ed', 3)"), "")
+    check(&t, "step 29", q(d, "SELECT * FROM p ORDER BY id"), "1|ann|NULL;2|bob|1;3|cy|1;5|ed|3")
+    check(&t, "step 30", q(d, "SELECT name, seq FROM sqlite_sequence"), "p|5")
+    check(&t, "step 31", q(d, "SELECT e.name, b.name FROM p e LEFT JOIN p b ON b.id = e.boss ORDER BY e.id"), "ann|NULL;bob|ann;cy|ann;ed|cy")
+    check(&t, "step 32", q(d, "SELECT b.name, count(*) FROM p e JOIN p b ON b.id = e.boss GROUP BY b.id ORDER BY b.name"), "ann|2;cy|1")
+    check(&t, "step 33", q(d, "SELECT name FROM p WHERE boss IN (SELECT id FROM p WHERE boss IS NULL) ORDER BY name"), "bob;cy")
+    check(&t, "step 34", q(d, "SELECT name, (SELECT count(*) FROM p x WHERE x.boss = p.id) FROM p ORDER BY id"), "ann|2;bob|0;cy|1;ed|0")
+    check(&t, "step 35", q(d, "SELECT name FROM p WHERE EXISTS (SELECT 1 FROM p x WHERE x.boss = p.id) ORDER BY name"), "ann;cy")
+    check(&t, "step 36", q(d, "SELECT name FROM p WHERE boss = 1 UNION SELECT name FROM p WHERE id = 1 ORDER BY 1"), "ann;bob;cy")
+    check(&t, "step 37", q(d, "SELECT boss FROM p WHERE boss IS NOT NULL EXCEPT SELECT id FROM p WHERE id = 1"), "3")
+    check(&t, "step 38", q(d, "SELECT name FROM (SELECT name, id FROM p WHERE id > 1) WHERE id < 5 ORDER BY id"), "bob;cy")
+    check(&t, "step 39", q(d, "SELECT group_concat(name, '+') FROM (SELECT name FROM p ORDER BY id)"), "ann+bob+cy+ed")
+    check(&t, "step 40", q(d, "BEGIN"), "")
+    check(&t, "step 41", q(d, "INSERT INTO p(name) VALUES ('tx1')"), "")
+    check(&t, "step 42", q(d, "SELECT count(*) FROM p"), "5")
+    check(&t, "step 43", q(d, "ROLLBACK"), "")
+    check(&t, "step 44", q(d, "SELECT count(*) FROM p"), "4")
+    check(&t, "step 45", q(d, "BEGIN"), "")
+    check(&t, "step 46", q(d, "INSERT INTO p(name) VALUES ('tx2')"), "")
+    check(&t, "step 47", q(d, "INSERT INTO p(name) VALUES (NULL)"), "E:NOT NULL constraint failed: p.name")
+    check(&t, "step 48", q(d, "COMMIT"), "")
+    check(&t, "step 49", q(d, "SELECT count(*) FROM p"), "5")
+    check(&t, "step 50", q(d, "COMMIT"), "E:cannot commit - no transaction is active")
+    check(&t, "step 51", q(d, "ALTER TABLE p ADD COLUMN age INTEGER DEFAULT 18"), "")
+    check(&t, "step 52", q(d, "SELECT name, age FROM p ORDER BY id LIMIT 2"), "ann|18;bob|18")
+    check(&t, "step 53", q(d, "UPDATE p SET age = 30 WHERE id = 2"), "")
+    check(&t, "step 54", q(d, "SELECT name, age FROM p ORDER BY id LIMIT 3"), "ann|18;bob|30;cy|18")
+    check(&t, "step 55", q(d, "CREATE TABLE u(k TEXT PRIMARY KEY, n INTEGER)"), "")
+    check(&t, "step 56", q(d, "INSERT INTO u VALUES ('a', 1)"), "")
+    check(&t, "step 57", q(d, "INSERT INTO u VALUES ('a', 5) ON CONFLICT(k) DO UPDATE SET n = n + excluded.n"), "")
+    check(&t, "step 58", q(d, "INSERT INTO u VALUES ('a', 5) ON CONFLICT(k) DO NOTHING"), "")
+    check(&t, "step 59", q(d, "SELECT * FROM u"), "a|6")
+    check(&t, "step 60", q(d, "SELECT * FROM nosuch"), "E:no such table: nosuch")
+    check(&t, "step 61", q(d, "SELECT nosuch FROM t"), "E:no such column: nosuch")
+    check(&t, "step 62", q(d, "SELCT 1"), "E:near \"SELCT\": syntax error")
+    check(&t, "step 63", q(d, "INSERT INTO t(nosuch) VALUES (1)"), "E:table t has no column named nosuch")
+    check(&t, "step 64", q(d, "INSERT INTO t VALUES (1, 2)"), "E:table t has 6 columns but 2 values were supplied")
+    check(&t, "step 65", q(d, "CREATE TABLE t(x)"), "E:table t already exists")
+    check(&t, "step 66", q(d, "DROP TABLE nosuch"), "E:no such table: nosuch")
+    check(&t, "step 67", q(d, "DROP TABLE IF EXISTS nosuch"), "")
+    check(&t, "step 68", q(d, "SELECT * FROM t WHERE"), "E:incomplete input")
+    check(&t, "step 69", q(d, "SELECT a, b FROM t GROUP BY a HAVING count(*) > 5"), "")
+    check(&t, "step 70", q(d, "SELECT sqlite_version() > '3'"), "1")
+    check(&t, "step 71", q(d, "DROP INDEX t_a"), "")
+    check(&t, "step 72", q(d, "DROP TABLE u"), "")
+    check(&t, "step 73", q(d, "SELECT type, name FROM sqlite_master ORDER BY name"), "table|p;index|sqlite_autoindex_t_1;table|sqlite_sequence;table|t;index|t_ce")
+    check(&t, "step 74", q(d, "PRAGMA table_info(p)"), "0|id|INTEGER|0|NULL|1;1|name|TEXT|1|NULL|0;2|boss|INTEGER|0|NULL|0;3|age|INTEGER|0|18|0")
+    check(&t, "step 75", q(d, "PRAGMA index_list(t)"), "0|t_ce|1|c|0;1|sqlite_autoindex_t_1|1|u|0")
+    check(&t, "step 76", q(d, "PRAGMA integrity_check"), "ok")
+    sq.db_close(d)
+    fs.remove(path) catch false
+    io.fmt_print_line(io.fmt_number(io.fmt_text(io.fmt_number(io.fmt_text(io.fmt_new(), "checks ".p as u64, 7), t.total), " failed ".p as u64, 8), t.fails))
+    if t.fails != 0 {
+        return 1
+    }
+    return 0
+}

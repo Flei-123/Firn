@@ -1,0 +1,1183 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/value.fi -- how SQL values convert, compare and calculate (SQLite's rules).
+//
+//   * text to number: leading/trailing white space, sign, digits, '.', exponent;
+//     "looks like a number" means the WHOLE text does (column affinity,
+//     comparisons); a number PREFIX is enough for arithmetic and CAST
+//   * REAL to text is SQLite's "%!.15g": 15 significant digits, a ".0" is kept
+//     ("100.0", "1.0e+20", "0.1")
+//   * affinity (datatype3.html): INTEGER/NUMERIC convert numeric-looking text and
+//     whole-number reals to INTEGER; REAL converts to a float; TEXT converts
+//     numbers to text; BLOB (none) leaves everything
+//   * integer overflow turns the result of + - * into a REAL; x / 0 and x % 0 are NULL
+//   * collations: BINARY (octets), NOCASE (ASCII case folded), RTRIM (trailing
+//     spaces ignored)
+//   * LIKE is case-insensitive for ASCII (SQLite's default), GLOB is not
+
+import std.rt
+import std.num
+import db.dberr
+import db.util as ut
+import db.record as rc
+import db.arena as ar
+
+export {
+    fmt_g16, round_decimal, text_int_prefix, parse_num, fmt_real, fmt_int, val_text_into, val_to_text, val_truth, val_to_real, val_to_int,
+    apply_affinity, cast_value, sql_compare, arith, concat_vals, like_match, glob_match,
+    real_to_int_exact, int_min, val_is_numeric_text, coll_compare, bitop, neg_value, NONE_AFF,
+    ws_alloc,
+}
+
+const NONE_AFF: i64 = -1
+
+fn int_min() -> i64 {
+    return 0 - 9223372036854775807 - 1
+}
+
+fn is_ws(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8 || c == 10 as u8 || c == 12 as u8 || c == 13 as u8
+}
+
+fn is_dig(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+// scratch memory for the decimal conversion routines (allocated once)
+static mut dtoa_ws: u64 = 0
+
+fn ws_alloc() -> u64 {
+    if dtoa_ws == 0 {
+        dtoa_ws = rt.heap_alloc(num.dtoa_work_bytes() + 64)
+    }
+    return dtoa_ws
+}
+
+// Reads a number from the start of the text. Answer: 0 = no number there,
+// 1 = INTEGER, 2 = REAL (in `out`). `full` is set when nothing but white
+// space follows the number.
+fn parse_num(p: u64, n: usize, out: *mut rc.Val, full: *mut bool) -> i64 {
+    var i: usize = 0
+    *full = false
+    while i < n && is_ws(rt.ld8(p, i)) {
+        i = i + 1
+    }
+    let start: usize = i
+    var neg: bool = false
+    if i < n && (rt.ld8(p, i) == 43 as u8 || rt.ld8(p, i) == 45 as u8) {
+        neg = rt.ld8(p, i) == 45 as u8
+        i = i + 1
+    }
+    let d0: usize = i
+    while i < n && is_dig(rt.ld8(p, i)) {
+        i = i + 1
+    }
+    let nint: usize = i - d0
+    var is_real: bool = false
+    var fd: usize = i
+    var nfrac: usize = 0
+    if i < n && rt.ld8(p, i) == 46 as u8 {
+        var j: usize = i + 1
+        fd = j
+        while j < n && is_dig(rt.ld8(p, j)) {
+            j = j + 1
+        }
+        nfrac = j - fd
+        if nint > 0 || nfrac > 0 {
+            is_real = true
+            i = j
+        }
+    }
+    if nint == 0 && nfrac == 0 {
+        return 0
+    }
+    var estart: usize = 0
+    var eend: usize = 0
+    if i < n && (rt.ld8(p, i) == 101 as u8 || rt.ld8(p, i) == 69 as u8) {
+        var j: usize = i + 1
+        if j < n && (rt.ld8(p, j) == 43 as u8 || rt.ld8(p, j) == 45 as u8) {
+            j = j + 1
+        }
+        if j < n && is_dig(rt.ld8(p, j)) {
+            estart = i + 1
+            while j < n && is_dig(rt.ld8(p, j)) {
+                j = j + 1
+            }
+            eend = j
+            is_real = true
+            i = j
+        }
+    }
+    var k: usize = i
+    while k < n && is_ws(rt.ld8(p, k)) {
+        k = k + 1
+    }
+    *full = k == n
+    if !is_real {
+        // an integer, unless it does not fit
+        var v: u64 = 0
+        var over: bool = false
+        var q: usize = d0
+        while q < d0 + nint {
+            let dg: u64 = (rt.ld8(p, q) as u64) - 48
+            if v > 922337203685477580 || (v == 922337203685477580 && dg > 8) {
+                over = true
+                break
+            }
+            v = v * 10 + dg
+            q = q + 1
+        }
+        if !over && (neg || v <= 9223372036854775807) {
+            if neg {
+                if v == 9223372036854775808 {
+                    *out = rc.val_int(int_min())
+                } else {
+                    *out = rc.val_int(0 - (v as i64))
+                }
+            } else {
+                *out = rc.val_int(v as i64)
+            }
+            return 1
+        }
+    }
+    // a real: normalised text for the exact converter
+    var b: rt.Buf = rt.buf_new()
+    if neg {
+        rt.buf_push(&b, 45 as u8)
+    }
+    if nint == 0 {
+        rt.buf_push(&b, 48 as u8)
+    } else {
+        rt.buf_push_bytes(&b, p + (d0 as u64), nint)
+    }
+    rt.buf_push(&b, 46 as u8)
+    if nfrac == 0 {
+        rt.buf_push(&b, 48 as u8)
+    } else {
+        rt.buf_push_bytes(&b, p + (fd as u64), nfrac)
+    }
+    if estart != 0 {
+        rt.buf_push(&b, 101 as u8)
+        rt.buf_push_bytes(&b, p + (estart as u64), eend - estart)
+    }
+    var f: f64 = 0.0
+    num.text_to_f64(rt.buf_data(&b), rt.buf_len(&b), &f)
+    rt.buf_free(&b)
+    *out = rc.val_real(f)
+    return 2
+}
+
+// does the whole text look like a number? (affinity and comparisons)
+fn val_is_numeric_text(p: u64, n: usize, out: *mut rc.Val) -> bool {
+    var full: bool = false
+    let k: i64 = parse_num(p, n, out, &full)
+    return k != 0 && full
+}
+
+// -------------------------------------------------------------- text of numbers
+fn fmt_int(out: *mut rt.Buf, v: i64) {
+    rt.buf_push_dec_i64(out, v)
+}
+
+// SQLite's "%!.15g"
+fn fmt_real(out: *mut rt.Buf, f: f64) {
+    if f != f {
+        ut.put_text(out, "NaN")
+        return
+    }
+    let bits: u64 = rc.bits_of_f64(f)
+    let neg: bool = (bits >> 63) != 0
+    if f > 1.7976931348623157e308 {
+        ut.put_text(out, "Inf")
+        return
+    }
+    if f < -1.7976931348623157e308 {
+        ut.put_text(out, "-Inf")
+        return
+    }
+    if (bits & 9223372036854775807) == 0 {
+        ut.put_text(out, "0.0")
+        return
+    }
+    if neg {
+        rt.buf_push(out, 45 as u8)
+    }
+    var digits: [u8; 32] = [0; 32]
+    var n10: i64 = 0
+    var k: usize = num.dtoa_digits(bits, (&digits[0]) as *mut u8, &n10, ws_alloc() as *mut u8)
+    var e10: i64 = n10 - 1
+    // round to 15 significant digits
+    if k > 15 {
+        var carry: bool = digits[15] >= 53 as u8
+        var q: usize = 15
+        while carry && q > 0 {
+            q = q - 1
+            if digits[q] == 57 as u8 {
+                digits[q] = 48 as u8
+            } else {
+                digits[q] = digits[q] + 1 as u8
+                carry = false
+            }
+        }
+        if carry {
+            digits[0] = 49 as u8
+            var z: usize = 1
+            while z < 15 {
+                digits[z] = 48 as u8
+                z = z + 1
+            }
+            e10 = e10 + 1
+        }
+        k = 15
+    }
+    while k > 1 && digits[k - 1] == 48 as u8 {
+        k = k - 1
+    }
+    if e10 < -4 || e10 >= 15 {
+        rt.buf_push(out, digits[0])
+        rt.buf_push(out, 46 as u8)
+        if k > 1 {
+            var q: usize = 1
+            while q < k {
+                rt.buf_push(out, digits[q])
+                q = q + 1
+            }
+        } else {
+            rt.buf_push(out, 48 as u8)
+        }
+        rt.buf_push(out, 101 as u8)
+        var ee: i64 = e10
+        if ee < 0 {
+            rt.buf_push(out, 45 as u8)
+            ee = 0 - ee
+        } else {
+            rt.buf_push(out, 43 as u8)
+        }
+        if ee < 10 {
+            rt.buf_push(out, 48 as u8)
+        }
+        rt.buf_push_dec_i64(out, ee)
+        return
+    }
+    if e10 >= 0 {
+        var q: usize = 0
+        var i: i64 = 0
+        while i <= e10 {
+            if q < k {
+                rt.buf_push(out, digits[q])
+                q = q + 1
+            } else {
+                rt.buf_push(out, 48 as u8)
+            }
+            i = i + 1
+        }
+        rt.buf_push(out, 46 as u8)
+        if q < k {
+            while q < k {
+                rt.buf_push(out, digits[q])
+                q = q + 1
+            }
+        } else {
+            rt.buf_push(out, 48 as u8)
+        }
+        return
+    }
+    ut.put_text(out, "0.")
+    var z: i64 = 0
+    while z < (0 - e10) - 1 {
+        rt.buf_push(out, 48 as u8)
+        z = z + 1
+    }
+    var q: usize = 0
+    while q < k {
+        rt.buf_push(out, digits[q])
+        q = q + 1
+    }
+}
+
+// Appends the text form of a value (NULL appends nothing). TEXT and BLOB
+// append their octets.
+fn val_text_into(v: *mut rc.Val, out: *mut rt.Buf) {
+    let t: i64 = (*v).t
+    if t == 1 {
+        fmt_int(out, (*v).i)
+    } else if t == 2 {
+        fmt_real(out, (*v).f)
+    } else if t == 3 || t == 4 {
+        rt.buf_push_bytes(out, (*v).p, (*v).n)
+    }
+}
+
+// The value as a TEXT value (numbers are formatted into the arena).
+fn val_to_text(v: *mut rc.Val, a: *mut ar.Arena, out: *mut rc.Val) {
+    let t: i64 = (*v).t
+    if t == 3 {
+        *out = *v
+        return
+    }
+    if t == 0 {
+        *out = rc.val_null()
+        return
+    }
+    var b: rt.Buf = rt.buf_new()
+    val_text_into(v, &b)
+    let p: u64 = ar.arena_copy(a, rt.buf_ptr(&b), rt.buf_len(&b))
+    *out = rc.val_text(p, rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+// ------------------------------------------------------------ to numbers
+fn real_to_int_exact(f: f64, out: *mut i64) -> bool {
+    if f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
+        let i: i64 = f as i64
+        if (i as f64) == f {
+            *out = i
+            return true
+        }
+    }
+    return false
+}
+
+// the numeric value of a value for arithmetic: NULL stays NULL (answer false);
+// text uses its number prefix (no number = 0)
+fn to_number(v: *mut rc.Val, out: *mut rc.Val) -> bool {
+    let t: i64 = (*v).t
+    if t == 0 {
+        return false
+    }
+    if t == 1 || t == 2 {
+        *out = *v
+        return true
+    }
+    var full: bool = false
+    let k: i64 = parse_num((*v).p, (*v).n, out, &full)
+    if k == 0 {
+        *out = rc.val_int(0)
+    }
+    return true
+}
+
+fn val_to_real(v: *mut rc.Val) -> f64 {
+    var x: rc.Val = rc.val_null()
+    if !to_number(v, &x) {
+        return 0.0
+    }
+    if x.t == 1 {
+        return x.i as f64
+    }
+    return x.f
+}
+
+// the integer prefix of a text (sign and digits, saturating): "12abc" is 12, "1e2" is 1
+fn text_int_prefix(p: u64, n: usize) -> i64 {
+    var i: usize = 0
+    while i < n && is_ws(rt.ld8(p, i)) {
+        i = i + 1
+    }
+    var neg: bool = false
+    if i < n && (rt.ld8(p, i) == 43 as u8 || rt.ld8(p, i) == 45 as u8) {
+        neg = rt.ld8(p, i) == 45 as u8
+        i = i + 1
+    }
+    var v: u64 = 0
+    var over: bool = false
+    while i < n && is_dig(rt.ld8(p, i)) {
+        let dg: u64 = (rt.ld8(p, i) as u64) - 48
+        if v > 922337203685477580 || (v == 922337203685477580 && dg > 7) {
+            over = true
+        } else if !over {
+            v = v * 10 + dg
+        }
+        i = i + 1
+    }
+    if over {
+        if neg {
+            return int_min()
+        }
+        return 9223372036854775807
+    }
+    if neg {
+        return 0 - (v as i64)
+    }
+    return v as i64
+}
+
+// CAST(.. AS INTEGER): reals are cut towards zero (saturating), text uses its integer prefix
+fn val_to_int(v: *mut rc.Val) -> i64 {
+    if (*v).t == 3 || (*v).t == 4 {
+        return text_int_prefix((*v).p, (*v).n)
+    }
+    var x: rc.Val = rc.val_null()
+    if !to_number(v, &x) {
+        return 0
+    }
+    if x.t == 1 {
+        return x.i
+    }
+    let f: f64 = x.f
+    if f != f {
+        return 0
+    }
+    if f >= 9223372036854775807.0 {
+        return 9223372036854775807
+    }
+    if f <= -9223372036854775808.0 {
+        return int_min()
+    }
+    return f as i64
+}
+
+// -1 NULL (unknown), 0 false, 1 true
+fn val_truth(v: *mut rc.Val) -> i64 {
+    let t: i64 = (*v).t
+    if t == 0 {
+        return -1
+    }
+    if t == 1 {
+        if (*v).i != 0 {
+            return 1
+        }
+        return 0
+    }
+    if t == 2 {
+        if (*v).f != 0.0 {
+            return 1
+        }
+        return 0
+    }
+    var x: rc.Val = rc.val_null()
+    var full: bool = false
+    let k: i64 = parse_num((*v).p, (*v).n, &x, &full)
+    if k == 1 {
+        if x.i != 0 {
+            return 1
+        }
+        return 0
+    }
+    if k == 2 {
+        if x.f != 0.0 {
+            return 1
+        }
+        return 0
+    }
+    return 0
+}
+
+// ----------------------------------------------------------- affinity
+// Applies the column affinity to a value in place (storage rules).
+fn apply_affinity(v: *mut rc.Val, aff: i64, a: *mut ar.Arena) {
+    let t: i64 = (*v).t
+    if t == 0 || aff == 0 {
+        return
+    }
+    if aff == 1 {
+        // TEXT
+        if t == 1 || t == 2 {
+            var out: rc.Val = rc.val_null()
+            val_to_text(v, a, &out)
+            *v = out
+        }
+        return
+    }
+    if aff == 4 {
+        // REAL
+        if t == 1 {
+            *v = rc.val_real((*v).i as f64)
+            return
+        }
+        if t == 3 {
+            var x: rc.Val = rc.val_null()
+            if val_is_numeric_text((*v).p, (*v).n, &x) {
+                if x.t == 1 {
+                    *v = rc.val_real(x.i as f64)
+                } else {
+                    *v = x
+                }
+            }
+        }
+        return
+    }
+    // NUMERIC (2) and INTEGER (3)
+    if t == 3 {
+        var x: rc.Val = rc.val_null()
+        if val_is_numeric_text((*v).p, (*v).n, &x) {
+            *v = x
+        } else {
+            return
+        }
+    }
+    if (*v).t == 2 {
+        var i: i64 = 0
+        if real_to_int_exact((*v).f, &i) {
+            *v = rc.val_int(i)
+        }
+    }
+}
+
+fn cast_value(v: *mut rc.Val, aff: i64, blob: bool, a: *mut ar.Arena, out: *mut rc.Val) {
+    if (*v).t == 0 {
+        *out = rc.val_null()
+        return
+    }
+    if blob {
+        // CAST(x AS BLOB): the octets of the text form
+        if (*v).t == 4 {
+            *out = *v
+            return
+        }
+        var b: rt.Buf = rt.buf_new()
+        val_text_into(v, &b)
+        let p: u64 = ar.arena_copy(a, rt.buf_ptr(&b), rt.buf_len(&b))
+        *out = rc.val_blob(p, rt.buf_len(&b))
+        rt.buf_free(&b)
+        return
+    }
+    if aff == 1 {
+        if (*v).t == 4 {
+            *out = rc.val_text((*v).p, (*v).n)
+            return
+        }
+        val_to_text(v, a, out)
+        return
+    }
+    if aff == 3 {
+        *out = rc.val_int(val_to_int(v))
+        return
+    }
+    if aff == 4 {
+        *out = rc.val_real(val_to_real(v))
+        return
+    }
+    if aff == 2 {
+        // NUMERIC: the number prefix, an integer if it is one
+        var x: rc.Val = rc.val_null()
+        if !to_number(v, &x) {
+            *out = rc.val_null()
+            return
+        }
+        if x.t == 2 && (*v).t == 3 {
+            var i: i64 = 0
+            if real_to_int_exact(x.f, &i) {
+                x = rc.val_int(i)
+            }
+        }
+        *out = x
+        return
+    }
+    // BLOB affinity: CAST(x AS) without type or "NONE": unchanged
+    *out = *v
+}
+
+// -------------------------------------------------------------- compare
+fn fold(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+// text order under a collation: 0 BINARY, 1 NOCASE, 2 RTRIM
+fn coll_compare(pa: u64, na: usize, pb: u64, nb: usize, coll: u32) -> i64 {
+    if coll == 0 {
+        return ut.bytes_compare(pa, na, pb, nb)
+    }
+    if coll == 2 {
+        var x: usize = na
+        var y: usize = nb
+        while x > 0 && rt.ld8(pa, x - 1) == 32 as u8 {
+            x = x - 1
+        }
+        while y > 0 && rt.ld8(pb, y - 1) == 32 as u8 {
+            y = y - 1
+        }
+        return ut.bytes_compare(pa, x, pb, y)
+    }
+    var n: usize = na
+    if nb < n {
+        n = nb
+    }
+    var i: usize = 0
+    while i < n {
+        let c: u8 = fold(rt.ld8(pa, i))
+        let d: u8 = fold(rt.ld8(pb, i))
+        if c != d {
+            if c < d {
+                return -1
+            }
+            return 1
+        }
+        i = i + 1
+    }
+    if na < nb {
+        return -1
+    }
+    if na > nb {
+        return 1
+    }
+    return 0
+}
+
+// Order of two non-NULL values under a collation (storage class order:
+// numbers < text < blob). Affinity conversions are the caller's job.
+fn sql_compare(x: *mut rc.Val, y: *mut rc.Val, coll: u32) -> i64 {
+    if (*x).t == 3 && (*y).t == 3 && coll != 0 {
+        return coll_compare((*x).p, (*x).n, (*y).p, (*y).n, coll)
+    }
+    return rc.val_compare(x, y)
+}
+
+// ---------------------------------------------------------------- arithmetic
+fn add_over(a: i64, b: i64) -> bool {
+    let s: i64 = a +% b
+    return ((a ^ s) & (b ^ s)) < 0
+}
+
+fn sub_over(a: i64, b: i64) -> bool {
+    let s: i64 = a -% b
+    return ((a ^ b) & (a ^ s)) < 0
+}
+
+fn mul_over(a: i64, b: i64) -> bool {
+    if a == 0 || b == 0 {
+        return false
+    }
+    if (a == -1 && b == int_min()) || (b == -1 && a == int_min()) {
+        return true
+    }
+    let p: i64 = a *% b
+    return p / b != a
+}
+
+// + - * / % on two non-NULL values. op: ax.OP_ADD(1) SUB(2) MUL(3) DIV(4) MOD(5).
+// Answer false = the result is NULL.
+fn arith(op: u32, x: *mut rc.Val, y: *mut rc.Val, out: *mut rc.Val) -> bool {
+    var a: rc.Val = rc.val_null()
+    var b: rc.Val = rc.val_null()
+    to_number(x, &a)
+    to_number(y, &b)
+    if op == 5 {
+        // remainder on integers; real operands are cut to integers first
+        var ia: i64 = 0
+        var ib: i64 = 0
+        var real: bool = false
+        if a.t != 1 {
+            real = true
+        }
+        if b.t != 1 {
+            real = true
+        }
+        ia = val_to_int(x)
+        ib = val_to_int(y)
+        if ib == 0 {
+            return false
+        }
+        var r: i64 = 0
+        if ib != -1 {
+            r = ia % ib
+        }
+        if real {
+            *out = rc.val_real(r as f64)
+        } else {
+            *out = rc.val_int(r)
+        }
+        return true
+    }
+    if a.t == 1 && b.t == 1 {
+        let i: i64 = a.i
+        let j: i64 = b.i
+        if op == 1 {
+            if !add_over(i, j) {
+                *out = rc.val_int(i +% j)
+                return true
+            }
+        } else if op == 2 {
+            if !sub_over(i, j) {
+                *out = rc.val_int(i -% j)
+                return true
+            }
+        } else if op == 3 {
+            if !mul_over(i, j) {
+                *out = rc.val_int(i *% j)
+                return true
+            }
+        } else {
+            if j == 0 {
+                return false
+            }
+            if !(j == -1 && i == int_min()) {
+                *out = rc.val_int(i / j)
+                return true
+            }
+        }
+    }
+    var fa: f64 = 0.0
+    var fb: f64 = 0.0
+    if a.t == 1 {
+        fa = a.i as f64
+    } else {
+        fa = a.f
+    }
+    if b.t == 1 {
+        fb = b.i as f64
+    } else {
+        fb = b.f
+    }
+    var r: f64 = 0.0
+    if op == 1 {
+        r = fa + fb
+    } else if op == 2 {
+        r = fa - fb
+    } else if op == 3 {
+        r = fa * fb
+    } else {
+        if fb == 0.0 {
+            return false
+        }
+        r = fa / fb
+    }
+    if r != r {
+        return false
+    }
+    *out = rc.val_real(r)
+    return true
+}
+
+fn neg_value(x: *mut rc.Val, out: *mut rc.Val) -> bool {
+    var a: rc.Val = rc.val_null()
+    if !to_number(x, &a) {
+        return false
+    }
+    if a.t == 1 {
+        if a.i == int_min() {
+            *out = rc.val_real(9223372036854775808.0)
+        } else {
+            *out = rc.val_int(0 - a.i)
+        }
+        return true
+    }
+    *out = rc.val_real(-a.f)
+    return true
+}
+
+// & | << >> on integers. op: 15 BITAND, 16 BITOR, 17 LSHIFT, 18 RSHIFT
+fn bitop(op: u32, x: *mut rc.Val, y: *mut rc.Val, out: *mut rc.Val) -> bool {
+    if (*x).t == 0 || (*y).t == 0 {
+        return false
+    }
+    let a: i64 = val_to_int(x)
+    let b: i64 = val_to_int(y)
+    if op == 15 {
+        *out = rc.val_int(a & b)
+        return true
+    }
+    if op == 16 {
+        *out = rc.val_int(a | b)
+        return true
+    }
+    var sh: i64 = b
+    var left: bool = op == 17
+    if sh < 0 {
+        left = !left
+        if sh == int_min() {
+            sh = 9223372036854775807
+        } else {
+            sh = 0 - sh
+        }
+    }
+    if sh >= 64 {
+        if left || a >= 0 {
+            *out = rc.val_int(0)
+        } else {
+            *out = rc.val_int(-1)
+        }
+        return true
+    }
+    if left {
+        *out = rc.val_int(((a as u64) << (sh as u64)) as i64)
+    } else {
+        *out = rc.val_int(a >> (sh as u64))
+    }
+    return true
+}
+
+// a || b: both to text; false when either is NULL
+fn concat_vals(x: *mut rc.Val, y: *mut rc.Val, a: *mut ar.Arena, out: *mut rc.Val) -> bool {
+    if (*x).t == 0 || (*y).t == 0 {
+        return false
+    }
+    var b: rt.Buf = rt.buf_new()
+    val_text_into(x, &b)
+    val_text_into(y, &b)
+    let p: u64 = ar.arena_copy(a, rt.buf_ptr(&b), rt.buf_len(&b))
+    *out = rc.val_text(p, rt.buf_len(&b))
+    rt.buf_free(&b)
+    return true
+}
+
+// ------------------------------------------------------------- LIKE, GLOB
+fn char_len(c: u8) -> usize {
+    if c < 128 as u8 {
+        return 1
+    }
+    if c >= 240 as u8 {
+        return 4
+    }
+    if c >= 224 as u8 {
+        return 3
+    }
+    if c >= 192 as u8 {
+        return 2
+    }
+    return 1
+}
+
+// `esc` < 0: no escape character
+fn like_match(p: u64, pn: usize, t: u64, tn: usize, esc: i64) -> bool {
+    var pi: usize = 0
+    var ti: usize = 0
+    var star_pi: i64 = -1
+    var star_ti: usize = 0
+    while ti < tn {
+        var matched: bool = false
+        if pi < pn {
+            let c: u8 = rt.ld8(p, pi)
+            if esc >= 0 && (c as i64) == esc && pi + 1 < pn {
+                let d: u8 = rt.ld8(p, pi + 1)
+                if fold(d) == fold(rt.ld8(t, ti)) {
+                    pi = pi + 2
+                    ti = ti + 1
+                    matched = true
+                }
+            } else if c == 37 as u8 {
+                star_pi = pi as i64
+                star_ti = ti
+                pi = pi + 1
+                continue
+            } else if c == 95 as u8 {
+                var cl: usize = char_len(rt.ld8(t, ti))
+                if ti + cl > tn {
+                    cl = tn - ti
+                }
+                ti = ti + cl
+                pi = pi + 1
+                matched = true
+            } else if fold(c) == fold(rt.ld8(t, ti)) {
+                pi = pi + 1
+                ti = ti + 1
+                matched = true
+            }
+        }
+        if matched {
+            continue
+        }
+        if star_pi >= 0 {
+            var cl: usize = char_len(rt.ld8(t, star_ti))
+            if star_ti + cl > tn {
+                cl = tn - star_ti
+            }
+            star_ti = star_ti + cl
+            ti = star_ti
+            pi = (star_pi as usize) + 1
+            continue
+        }
+        return false
+    }
+    while pi < pn && rt.ld8(p, pi) == 37 as u8 {
+        pi = pi + 1
+    }
+    return pi == pn
+}
+
+// one GLOB character class at p[pi] (after '['); answers whether `c` is in it
+// and sets `next` to the index after ']'; false if the class is not closed
+fn glob_class(p: u64, pn: usize, pi: usize, c: u8, next: *mut usize, hit: *mut bool) -> bool {
+    var i: usize = pi
+    var neg: bool = false
+    if i < pn && rt.ld8(p, i) == 94 as u8 {
+        neg = true
+        i = i + 1
+    }
+    var found: bool = false
+    var first: bool = true
+    while i < pn {
+        let d: u8 = rt.ld8(p, i)
+        if d == 93 as u8 && !first {
+            *next = i + 1
+            *hit = found != neg
+            return true
+        }
+        first = false
+        if i + 2 < pn && rt.ld8(p, i + 1) == 45 as u8 && rt.ld8(p, i + 2) != 93 as u8 {
+            let hi: u8 = rt.ld8(p, i + 2)
+            if c >= d && c <= hi {
+                found = true
+            }
+            i = i + 3
+        } else {
+            if c == d {
+                found = true
+            }
+            i = i + 1
+        }
+    }
+    return false
+}
+
+fn glob_match(p: u64, pn: usize, t: u64, tn: usize) -> bool {
+    var pi: usize = 0
+    var ti: usize = 0
+    var star_pi: i64 = -1
+    var star_ti: usize = 0
+    while ti < tn {
+        var matched: bool = false
+        if pi < pn {
+            let c: u8 = rt.ld8(p, pi)
+            if c == 42 as u8 {
+                star_pi = pi as i64
+                star_ti = ti
+                pi = pi + 1
+                continue
+            } else if c == 63 as u8 {
+                var cl: usize = char_len(rt.ld8(t, ti))
+                if ti + cl > tn {
+                    cl = tn - ti
+                }
+                ti = ti + cl
+                pi = pi + 1
+                matched = true
+            } else if c == 91 as u8 {
+                var nx: usize = 0
+                var hit: bool = false
+                if glob_class(p, pn, pi + 1, rt.ld8(t, ti), &nx, &hit) {
+                    if hit {
+                        pi = nx
+                        ti = ti + 1
+                        matched = true
+                    }
+                } else if rt.ld8(t, ti) == c {
+                    pi = pi + 1
+                    ti = ti + 1
+                    matched = true
+                }
+            } else if c == rt.ld8(t, ti) {
+                pi = pi + 1
+                ti = ti + 1
+                matched = true
+            }
+        }
+        if matched {
+            continue
+        }
+        if star_pi >= 0 {
+            var cl: usize = char_len(rt.ld8(t, star_ti))
+            if star_ti + cl > tn {
+                cl = tn - star_ti
+            }
+            star_ti = star_ti + cl
+            ti = star_ti
+            pi = (star_pi as usize) + 1
+            continue
+        }
+        return false
+    }
+    while pi < pn && rt.ld8(p, pi) == 42 as u8 {
+        pi = pi + 1
+    }
+    return pi == pn
+}
+
+// x rounded to d decimals the way SQLite's printf does: half away from zero on the
+// decimal digits of the number (15 significant digits), then back to a double
+fn round_decimal(x: f64, d: i64) -> f64 {
+    if x == 0.0 || x != x {
+        return x
+    }
+    var ax: f64 = x
+    var neg: bool = false
+    if x < 0.0 {
+        ax = 0.0 - x
+        neg = true
+    }
+    let bits: u64 = rc.bits_of_f64(ax)
+    var digits: [u8; 40] = [0; 40]
+    var n10: i64 = 0
+    var k: usize = num.dtoa_digits(bits, (&digits[0]) as *mut u8, &n10, ws_alloc() as *mut u8)
+    if k > 15 {
+        var carry: bool = digits[15] >= 53 as u8
+        var q: usize = 15
+        while carry && q > 0 {
+            q = q - 1
+            if digits[q] == 57 as u8 {
+                digits[q] = 48 as u8
+            } else {
+                digits[q] = digits[q] + 1 as u8
+                carry = false
+            }
+        }
+        if carry {
+            digits[0] = 49 as u8
+            var z: usize = 1
+            while z < 15 {
+                digits[z] = 48 as u8
+                z = z + 1
+            }
+            n10 = n10 + 1
+        }
+        k = 15
+    }
+    let keep: i64 = n10 + d
+    if keep >= (k as i64) {
+        return x
+    }
+    var res: f64 = 0.0
+    if keep < 0 {
+        res = 0.0
+    } else {
+        var carry2: bool = digits[keep as usize] >= 53 as u8
+        var kk: usize = keep as usize
+        var q2: usize = kk
+        while carry2 && q2 > 0 {
+            q2 = q2 - 1
+            if digits[q2] == 57 as u8 {
+                digits[q2] = 48 as u8
+            } else {
+                digits[q2] = digits[q2] + 1 as u8
+                carry2 = false
+            }
+        }
+        if carry2 {
+            // all nines rolled over: 0.999.. -> 1.0 at one more digit
+            var z2: usize = kk
+            while z2 > 0 {
+                digits[z2] = digits[z2 - 1]
+                z2 = z2 - 1
+            }
+            digits[0] = 49 as u8
+            n10 = n10 + 1
+            kk = kk + 1
+        }
+        // text "<digits>e<exponent>"
+        var b: rt.Buf = rt.buf_new()
+        if kk == 0 {
+            rt.buf_free(&b)
+            res = 0.0
+        } else {
+            var i: usize = 0
+            while i < kk {
+                rt.buf_push(&b, digits[i])
+                i = i + 1
+            }
+            rt.buf_push(&b, 101 as u8)
+            rt.buf_push_dec_i64(&b, n10 - (kk as i64))
+            var f: f64 = 0.0
+            num.text_to_f64(rt.buf_data(&b), rt.buf_len(&b), &f)
+            rt.buf_free(&b)
+            res = f
+        }
+    }
+    if neg {
+        return -res
+    }
+    return res
+}
+
+// C's "%.16g" (what strftime's %J prints): 16 significant digits, no forced ".0"
+fn fmt_g16(out: *mut rt.Buf, f: f64) {
+    if f != f || f > 1.7976931348623157e308 || f < -1.7976931348623157e308 {
+        fmt_real(out, f)
+        return
+    }
+    let bits: u64 = rc.bits_of_f64(f)
+    if (bits & 9223372036854775807) == 0 {
+        rt.buf_push(out, 48 as u8)
+        return
+    }
+    if (bits >> 63) != 0 {
+        rt.buf_push(out, 45 as u8)
+    }
+    var digits: [u8; 40] = [0; 40]
+    var n10: i64 = 0
+    var k: usize = num.dtoa_digits(bits, (&digits[0]) as *mut u8, &n10, ws_alloc() as *mut u8)
+    var e10: i64 = n10 - 1
+    if k > 16 {
+        var carry: bool = digits[16] >= 53 as u8
+        var q: usize = 16
+        while carry && q > 0 {
+            q = q - 1
+            if digits[q] == 57 as u8 {
+                digits[q] = 48 as u8
+            } else {
+                digits[q] = digits[q] + 1 as u8
+                carry = false
+            }
+        }
+        if carry {
+            digits[0] = 49 as u8
+            var z: usize = 1
+            while z < 16 {
+                digits[z] = 48 as u8
+                z = z + 1
+            }
+            e10 = e10 + 1
+        }
+        k = 16
+    }
+    while k > 1 && digits[k - 1] == 48 as u8 {
+        k = k - 1
+    }
+    if e10 < -4 || e10 >= 16 {
+        rt.buf_push(out, digits[0])
+        if k > 1 {
+            rt.buf_push(out, 46 as u8)
+            var q: usize = 1
+            while q < k {
+                rt.buf_push(out, digits[q])
+                q = q + 1
+            }
+        }
+        rt.buf_push(out, 101 as u8)
+        var ee: i64 = e10
+        if ee < 0 {
+            rt.buf_push(out, 45 as u8)
+            ee = 0 - ee
+        } else {
+            rt.buf_push(out, 43 as u8)
+        }
+        if ee < 10 {
+            rt.buf_push(out, 48 as u8)
+        }
+        rt.buf_push_dec_i64(out, ee)
+        return
+    }
+    if e10 >= 0 {
+        var q: usize = 0
+        var i: i64 = 0
+        while i <= e10 {
+            if q < k {
+                rt.buf_push(out, digits[q])
+                q = q + 1
+            } else {
+                rt.buf_push(out, 48 as u8)
+            }
+            i = i + 1
+        }
+        if q < k {
+            rt.buf_push(out, 46 as u8)
+            while q < k {
+                rt.buf_push(out, digits[q])
+                q = q + 1
+            }
+        }
+        return
+    }
+    ut.put_text(out, "0.")
+    var z: i64 = 0
+    while z < (0 - e10) - 1 {
+        rt.buf_push(out, 48 as u8)
+        z = z + 1
+    }
+    var q: usize = 0
+    while q < k {
+        rt.buf_push(out, digits[q])
+        q = q + 1
+    }
+}

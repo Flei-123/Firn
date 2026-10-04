@@ -1,0 +1,1601 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/pager.fi -- the pager: page cache, locks, transactions and the
+// rollback journal of a SQLite 3 database file.
+//
+// WHAT IT DOES
+//   * reads and writes the pages of a database file (page size 512..65536,
+//     any "reserved" tail, UTF-8 text) through a clock-replacement cache;
+//   * takes the SAME byte-range locks as SQLite's unix VFS (SHARED / RESERVED /
+//     PENDING / EXCLUSIVE at 0x40000000), so SQLite and this library can use
+//     one file from two processes and exclude each other;
+//   * keeps a rollback journal in SQLite's own format (`<file>-journal`:
+//     magic d9d505f920a163d7, per-page checksums with a nonce): a process that
+//     dies mid-commit leaves a "hot journal" that THIS library AND SQLite roll
+//     back on the next open;
+//   * hands out and takes back pages through the freelist (trunk and leaf
+//     pages of the file format) and extends the file;
+//   * statement savepoints in memory: one failed statement of a bigger
+//     transaction can be undone without ending the transaction.
+//
+// THE COMMIT, in the order that makes it crash safe (journal_mode = DELETE,
+// synchronous = FULL):
+//   1. before a page is first changed, its old content goes to the journal
+//   2. journal records are synced, then the record count in the journal header
+//      is written and synced
+//   3. EXCLUSIVE lock; the changed pages are written into the database file; sync
+//   4. the journal file is deleted (THIS is the moment of the commit); the
+//      directory is synced
+// A dead process after 3 leaves a complete journal -> rolled back. A dead
+// process after 4 leaves nothing to undo.
+//
+// A page that does not fit into the cache any more is written out early
+// ("spill"): the journal is synced first, so every spilled page can still be
+// undone.
+//
+// HONEST NOTES
+//   P1 NO WAL. A file in WAL mode (format version 2 in the header) answers
+//      `Unsupported`. A rollback journal is what this file offers.
+//   P2 NO AUTO-VACUUM WRITES. A file with auto-vacuum (pointer-map pages) is read
+//      but every write answers `Unsupported`.
+//   P3 ONE CONNECTION PER FILE PER PROCESS (vfsos.fi V1).
+//   P4 TEXT ENCODING: UTF-8 only; a file with UTF-16 text answers `Unsupported`.
+//   P5 `crash` is a test hook (see `pager_set_crash`): after N events the
+//      process kills itself with SIGKILL, in the middle of a page write if
+//      the event is a write -- this is how the crash tests stop the commit.
+//   P6 Journal files made by other tools in "persist", "truncate", "memory" or
+//      "off" mode are read like any other journal; this library itself
+//      writes only the DELETE form.
+
+import std.rt
+import std.vec
+import db.dberr
+import db.util
+import db.vfsos
+
+export {
+    Pager, pager_new, pager_open, pager_close, pager_begin_read, pager_end_read,
+    pager_begin_write, pager_commit, pager_rollback, pager_get, pager_write,
+    pager_alloc_page, pager_free_page, pager_next_op, pager_set_crash,
+    pager_set_busy, pager_set_sync, pager_stmt_begin, pager_stmt_end,
+    pager_stmt_rollback, pager_in_write, pager_page_count, pager_usable,
+    pager_page_size, pager_init_new, pager_set_max_pages, pager_freelist_count,
+    pager_purge_cache, pager_is_open, pager_header_valid, pager_set_cache_size,
+    PAGER_PENDING_BYTE, PAGER_MAX_PAGE_SIZE,
+}
+
+const PAGER_PENDING_BYTE: u64 = 1073741824
+const RESERVED_BYTE: u64 = 1073741825
+const SHARED_FIRST: u64 = 1073741826
+const SHARED_SIZE: u64 = 510
+const PAGER_MAX_PAGE_SIZE: usize = 65536
+
+const LOCK_NONE: i64 = 0
+const LOCK_SHARED: i64 = 1
+const LOCK_RESERVED: i64 = 2
+const LOCK_PENDING: i64 = 3
+const LOCK_EXCLUSIVE: i64 = 4
+
+#[inline]
+fn g8(p: u64, off: usize) -> u64 {
+    return (*((p + off as u64) as *mut u8)) as u64
+}
+
+#[inline]
+fn g16(p: u64, off: usize) -> u64 {
+    return ((*((p + off as u64) as *mut u8)) as u64) << 8 | ((*((p + (off + 1) as u64) as *mut u8)) as u64)
+}
+
+#[inline]
+fn g32(p: u64, off: usize) -> u64 {
+    return ((*((p + off as u64) as *mut u8)) as u64) << 24 | ((*((p + (off + 1) as u64) as *mut u8)) as u64) << 16
+        | ((*((p + (off + 2) as u64) as *mut u8)) as u64) << 8 | ((*((p + (off + 3) as u64) as *mut u8)) as u64)
+}
+
+#[inline]
+fn p8(p: u64, off: usize, v: u64) {
+    *((p + off as u64) as *mut u8) = (v & 255) as u8
+}
+
+#[inline]
+fn p16(p: u64, off: usize, v: u64) {
+    *((p + off as u64) as *mut u8) = ((v >> 8) & 255) as u8
+    *((p + (off + 1) as u64) as *mut u8) = (v & 255) as u8
+}
+
+#[inline]
+fn p32(p: u64, off: usize, v: u64) {
+    *((p + off as u64) as *mut u8) = ((v >> 24) & 255) as u8
+    *((p + (off + 1) as u64) as *mut u8) = ((v >> 16) & 255) as u8
+    *((p + (off + 2) as u64) as *mut u8) = ((v >> 8) & 255) as u8
+    *((p + (off + 3) as u64) as *mut u8) = (v & 255) as u8
+}
+
+// native-endian frame fields (frame i of a table at `base`: unit = 4 octets)
+#[inline]
+fn f32g(base: u64, i: usize) -> u32 {
+    return *((base + (i * 4) as u64) as *mut u32)
+}
+
+#[inline]
+fn f32s(base: u64, i: usize, v: u32) {
+    *((base + (i * 4) as u64) as *mut u32) = v
+}
+
+#[inline]
+fn f64g(base: u64, i: usize) -> u64 {
+    return *((base + (i * 8) as u64) as *mut u64)
+}
+
+#[inline]
+fn f64s(base: u64, i: usize, v: u64) {
+    *((base + (i * 8) as u64) as *mut u64) = v
+}
+
+const FR_DIRTY: u32 = 1
+const FR_REF: u32 = 2
+
+const SECTOR: usize = 512
+const JOURNAL_HDR: usize = 28
+
+struct Pager {
+    fd: i64,
+    path: rt.Buf, // the database file name (octets, no zero)
+    jpath: rt.Buf, // path + "-journal"
+    readonly: bool,
+    nowrite: bool, // an auto-vacuum file: readable only
+    is_open: bool,
+    page_size: usize,
+    usable: usize,
+    db_pages: u32,
+    orig_pages: u32,
+    max_pages: u32,
+    lock: i64,
+    counter: u32, // the file change counter last seen or written
+    have_header: bool,
+    nframes: usize,
+    nused: usize,
+    hand: usize,
+    frames: u64, // nframes records of 32 octets
+    buckets: u64, // nbuckets u32: frame index + 1
+    nbuckets: usize,
+    cache_mem: u64,
+    cache_req: usize,
+    dirty: usize,
+    epoch: u64,
+    state: i32, // 0 nothing, 1 reading (SHARED), 2 writing (RESERVED or more)
+    jfd: i64,
+    jopen: bool,
+    jcount: u32,
+    jsynced: u32,
+    jnonce: u32,
+    jdir_synced: bool,
+    jbuf: u64,
+    jset: rt.Buf, // bit per page: already in the journal
+    db_touched: bool,
+    sj_on: bool,
+    sj_pages: u32,
+    sj_data: rt.Buf,
+    sj_set: rt.Buf,
+    busy_ms: i64,
+    sync_mode: i32, // 2 = sync (default), 0 = no fsync at all
+    crash: i64,
+    n_reads: u64,
+    n_writes: u64,
+    n_syncs: u64,
+    hold_read: i32, // readers of this connection are active: keep the read lock after a write ends
+}
+
+// ---------------------------------------------------------------- frames
+// frame i is at frames + i*32: pgno u32 @0, flags u32 @4, next u32 @8,
+// last op u64 @16, (data is cache_mem + i * page_size)
+
+#[inline]
+fn fr_addr(pg: *mut Pager, i: usize) -> u64 {
+    return (*pg).frames + (i as u64) * 32
+}
+
+#[inline]
+fn fr_data(pg: *mut Pager, i: usize) -> u64 {
+    return (*pg).cache_mem + (i as u64) * ((*pg).page_size as u64)
+}
+
+#[inline]
+fn frame_find(pg: *mut Pager, pgno: u32) -> i64 {
+    let b: usize = (pgno as usize) & ((*pg).nbuckets - 1)
+    var idx: u32 = f32g((*pg).buckets, b)
+    while idx != 0 {
+        let fa: u64 = fr_addr(pg, (idx - 1) as usize)
+        if f32g(fa, 0) == pgno {
+            return (idx - 1) as i64
+        }
+        idx = f32g(fa, 2)
+    }
+    return -1
+}
+
+fn frame_unlink(pg: *mut Pager, i: usize) {
+    let fa: u64 = fr_addr(pg, i)
+    let pgno: u32 = f32g(fa, 0)
+    if pgno == 0 {
+        return
+    }
+    let b: usize = (pgno as usize) & ((*pg).nbuckets - 1)
+    var idx: u32 = f32g((*pg).buckets, b)
+    if idx == (i + 1) as u32 {
+        f32s((*pg).buckets, b, f32g(fa, 2))
+    } else {
+        while idx != 0 {
+            let ca: u64 = fr_addr(pg, (idx - 1) as usize)
+            let nx: u32 = f32g(ca, 2)
+            if nx == (i + 1) as u32 {
+                f32s(ca, 2, f32g(fa, 2))
+                break
+            }
+            idx = nx
+        }
+    }
+    f32s(fa, 0, 0)
+    f32s(fa, 2, 0)
+}
+
+fn frame_link(pg: *mut Pager, i: usize, pgno: u32) {
+    let fa: u64 = fr_addr(pg, i)
+    let b: usize = (pgno as usize) & ((*pg).nbuckets - 1)
+    f32s(fa, 0, pgno)
+    f32s(fa, 2, f32g((*pg).buckets, b))
+    f32s((*pg).buckets, b, (i + 1) as u32)
+}
+
+fn cache_free(pg: *mut Pager) {
+    if (*pg).cache_mem != 0 {
+        rt.heap_free((*pg).cache_mem, (*pg).nframes * (*pg).page_size)
+        rt.heap_free((*pg).frames, (*pg).nframes * 32)
+        rt.heap_free((*pg).buckets, (*pg).nbuckets * 4)
+    }
+    (*pg).cache_mem = 0
+    (*pg).frames = 0
+    (*pg).buckets = 0
+    (*pg).nused = 0
+    (*pg).hand = 0
+}
+
+fn cache_alloc(pg: *mut Pager) -> DbError!bool {
+    if (*pg).cache_mem != 0 {
+        return true
+    }
+    var n: usize = (*pg).cache_req
+    if n < 64 {
+        n = 64
+    }
+    var nb: usize = 128
+    while nb < n * 2 {
+        nb = nb * 2
+    }
+    let mem: u64 = rt.heap_alloc(n * (*pg).page_size)
+    let fr: u64 = rt.heap_alloc(n * 32)
+    let bu: u64 = rt.heap_alloc(nb * 4)
+    if mem == 0 || fr == 0 || bu == 0 {
+        rt.heap_free(mem, n * (*pg).page_size)
+        rt.heap_free(fr, n * 32)
+        rt.heap_free(bu, nb * 4)
+        return dberr.fail(DbError::NoMemory, "cannot allocate the page cache")
+    }
+    (*pg).cache_mem = mem
+    (*pg).frames = fr
+    (*pg).buckets = bu
+    (*pg).nframes = n
+    (*pg).nbuckets = nb
+    (*pg).nused = 0
+    (*pg).hand = 0
+    return true
+}
+
+// Forgets every cached page. Only valid while nothing is dirty.
+fn pager_purge_cache(pg: *mut Pager) {
+    if (*pg).cache_mem == 0 {
+        return
+    }
+    util.zero_bytes((*pg).buckets, (*pg).nbuckets * 4)
+    var i: usize = 0
+    while i < (*pg).nused {
+        let fa: u64 = fr_addr(pg, i)
+        f32s(fa, 0, 0)
+        f32s(fa, 1, 0)
+        f32s(fa, 2, 0)
+        i = i + 1
+    }
+    (*pg).nused = 0
+    (*pg).hand = 0
+    (*pg).dirty = 0
+}
+
+// Every public operation of the B-tree starts a new "op": the pages it
+// touched are not thrown out of the cache until the next one.
+#[inline]
+fn pager_next_op(pg: *mut Pager) {
+    (*pg).epoch = (*pg).epoch + 1
+}
+
+// ----------------------------------------------------------------- crash
+// Test hook: `pager_set_crash(pg, n)` makes the process kill itself at the
+// n-th event (journal record write, journal sync, header write, database page
+// write, database sync, journal delete). A write event writes half a block first.
+fn pager_set_crash(pg: *mut Pager, n: i64) {
+    (*pg).crash = n
+}
+
+fn crash_hit(pg: *mut Pager) -> bool {
+    if (*pg).crash <= 0 {
+        return false
+    }
+    (*pg).crash = (*pg).crash - 1
+    return (*pg).crash == 0
+}
+
+fn pager_set_busy(pg: *mut Pager, ms: i64) {
+    (*pg).busy_ms = ms
+}
+
+// 2 = fsync at every commit step (the default); 0 = never (faster, NOT
+// crash safe against a power cut; a killed process is still safe).
+fn pager_set_sync(pg: *mut Pager, mode: i32) {
+    (*pg).sync_mode = mode
+}
+
+fn pager_set_max_pages(pg: *mut Pager, n: u32) {
+    (*pg).max_pages = n
+}
+
+#[inline]
+fn pager_in_write(pg: *mut Pager) -> bool {
+    return (*pg).state == 2
+}
+
+fn pager_is_open(pg: *mut Pager) -> bool {
+    return (*pg).is_open
+}
+
+#[inline]
+fn pager_page_count(pg: *mut Pager) -> u32 {
+    return (*pg).db_pages
+}
+
+#[inline]
+fn pager_usable(pg: *mut Pager) -> usize {
+    return (*pg).usable
+}
+
+#[inline]
+fn pager_page_size(pg: *mut Pager) -> usize {
+    return (*pg).page_size
+}
+
+fn os_fail(r: i64, what: str) -> DbError {
+    if r == vfsos.OS_BUSY {
+        return dberr.fail(DbError::Busy, "database is locked")
+    }
+    if r == vfsos.OS_LOCKED {
+        return dberr.fail(DbError::Locked, "this process has the file open already")
+    }
+    if r == -28 || r == -122 {
+        return dberr.fail(DbError::Full, "no space left on the device")
+    }
+    if r == -30 {
+        return dberr.fail(DbError::ReadOnly, "attempt to write a readonly database")
+    }
+    return dberr.fail(DbError::Io, what)
+}
+
+// ----------------------------------------------------------------- locks
+fn lock_try_shared(pg: *mut Pager) -> i64 {
+    let fd: i64 = (*pg).fd
+    var r: i64 = vfsos.os_lock(fd, vfsos.OS_LOCK_SHARED, PAGER_PENDING_BYTE, 1)
+    if r != 0 {
+        return r
+    }
+    r = vfsos.os_lock(fd, vfsos.OS_LOCK_SHARED, SHARED_FIRST, SHARED_SIZE)
+    vfsos.os_unlock(fd, PAGER_PENDING_BYTE, 1)
+    return r
+}
+
+fn lock_try_reserved(pg: *mut Pager) -> i64 {
+    return vfsos.os_lock((*pg).fd, vfsos.OS_LOCK_EXCLUSIVE, RESERVED_BYTE, 1)
+}
+
+// PENDING first (new readers stay out), then the whole shared range
+fn lock_try_exclusive(pg: *mut Pager) -> i64 {
+    let fd: i64 = (*pg).fd
+    if (*pg).lock < LOCK_PENDING {
+        let r: i64 = vfsos.os_lock(fd, vfsos.OS_LOCK_EXCLUSIVE, PAGER_PENDING_BYTE, 1)
+        if r != 0 {
+            return r
+        }
+        (*pg).lock = LOCK_PENDING
+    }
+    return vfsos.os_lock(fd, vfsos.OS_LOCK_EXCLUSIVE, SHARED_FIRST, SHARED_SIZE)
+}
+
+fn unlock_all(pg: *mut Pager) {
+    if (*pg).lock > LOCK_NONE {
+        vfsos.os_unlock((*pg).fd, PAGER_PENDING_BYTE, 512)
+    }
+    (*pg).lock = LOCK_NONE
+}
+
+// back to a SHARED lock (after recovery)
+fn unlock_to_shared(pg: *mut Pager) {
+    if (*pg).lock > LOCK_SHARED {
+        let fd: i64 = (*pg).fd
+        if (*pg).lock == LOCK_EXCLUSIVE {
+            vfsos.os_lock(fd, vfsos.OS_LOCK_SHARED, SHARED_FIRST, SHARED_SIZE)
+        }
+        vfsos.os_unlock(fd, PAGER_PENDING_BYTE, 1)
+        vfsos.os_unlock(fd, RESERVED_BYTE, 1)
+        (*pg).lock = LOCK_SHARED
+    }
+}
+
+// level: 1 shared, 2 reserved, 4 exclusive. Waits up to busy_ms.
+fn lock_wait(pg: *mut Pager, level: i64) -> DbError!bool {
+    var waited: i64 = 0
+    var step: i64 = 1
+    while true {
+        var r: i64 = 0
+        if level == LOCK_SHARED {
+            r = lock_try_shared(pg)
+        } else if level == LOCK_RESERVED {
+            r = lock_try_reserved(pg)
+        } else {
+            r = lock_try_exclusive(pg)
+        }
+        if r == 0 {
+            if level == LOCK_SHARED && (*pg).lock < LOCK_SHARED {
+                (*pg).lock = LOCK_SHARED
+            } else if level == LOCK_RESERVED {
+                (*pg).lock = LOCK_RESERVED
+            } else if level == LOCK_EXCLUSIVE {
+                (*pg).lock = LOCK_EXCLUSIVE
+            }
+            return true
+        }
+        if r != vfsos.OS_BUSY {
+            return os_fail(r, "cannot lock the database file")
+        }
+        if waited >= (*pg).busy_ms {
+            return dberr.fail(DbError::Busy, "database is locked")
+        }
+        vfsos.os_sleep_ms(step)
+        waited = waited + step
+        if step < 50 {
+            step = step * 2
+        }
+    }
+    return true
+}
+
+// ------------------------------------------------------------------ open
+fn is_pow2(n: usize) -> bool {
+    return n != 0 && (n & (n - 1)) == 0
+}
+
+fn pager_new() -> Pager {
+    return Pager {
+        fd: -1, path: rt.buf_new(), jpath: rt.buf_new(), readonly: false, nowrite: false,
+        is_open: false, page_size: 4096, usable: 4096, db_pages: 0, orig_pages: 0,
+        max_pages: 1073741823, lock: 0, counter: 0, have_header: false, nframes: 0,
+        nused: 0, hand: 0, frames: 0, buckets: 0, nbuckets: 0, cache_mem: 0,
+        cache_req: 1000, dirty: 0, epoch: 1, state: 0, jfd: -1, jopen: false,
+        jcount: 0, jsynced: 0, jnonce: 0, jdir_synced: false, jbuf: 0,
+        jset: rt.buf_new(), db_touched: false, sj_on: false, sj_pages: 0,
+        sj_data: rt.buf_new(), sj_set: rt.buf_new(), busy_ms: 0, sync_mode: 2,
+        crash: 0, n_reads: 0, n_writes: 0, n_syncs: 0, hold_read: 0,
+    }
+}
+
+// Opens the file. `page_size` is used only for a NEW (empty) file; an
+// existing file brings its own. `cache_pages` is the cache size in pages.
+fn pager_open(pg: *mut Pager, path: str, create: bool, readonly: bool,
+    page_size: usize, cache_pages: usize) -> DbError!bool {
+    *pg = pager_new()
+    if page_size < 512 || page_size > PAGER_MAX_PAGE_SIZE || !is_pow2(page_size) {
+        return dberr.fail(DbError::Misuse, "page size must be a power of two from 512 to 65536")
+    }
+    (*pg).page_size = page_size
+    (*pg).usable = page_size
+    (*pg).cache_req = cache_pages
+    (*pg).readonly = readonly
+    let fd: i64 = vfsos.os_open(path, create && !readonly, readonly)
+    if fd < 0 {
+        if fd == vfsos.OS_LOCKED {
+            return os_fail(fd, "")
+        }
+        if fd == -2 {
+            return dberr.fail(DbError::Io, "unable to open database file: no such file")
+        }
+        return dberr.fail(DbError::Io, "unable to open database file")
+    }
+    (*pg).fd = fd
+    util.put_text(&(*pg).path, path)
+    util.put_text(&(*pg).jpath, path)
+    util.put_text(&(*pg).jpath, "-journal")
+    (*pg).is_open = true
+    return true
+}
+
+fn path_str(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn pager_close(pg: *mut Pager) {
+    if !(*pg).is_open {
+        return
+    }
+    if (*pg).state == 2 {
+        pager_rollback(pg) catch false
+    }
+    unlock_all(pg)
+    vfsos.os_close((*pg).fd)
+    (*pg).fd = -1
+    cache_free(pg)
+    if (*pg).jbuf != 0 {
+        rt.heap_free((*pg).jbuf, (*pg).page_size + 8)
+        (*pg).jbuf = 0
+    }
+    rt.buf_free(&(*pg).path)
+    rt.buf_free(&(*pg).jpath)
+    rt.buf_free(&(*pg).jset)
+    rt.buf_free(&(*pg).sj_data)
+    rt.buf_free(&(*pg).sj_set)
+    (*pg).is_open = false
+    (*pg).state = 0
+}
+
+// ---------------------------------------------------------- header check
+const HEADER_MAGIC: str = "SQLite format 3"
+
+// Is the 100 octet header at `h` one this library can work with? Fills page
+// size, usable size and the page count. `file_size` is the size of the file.
+fn pager_header_valid(pg: *mut Pager, h: u64, file_size: u64) -> DbError!bool {
+    var i: usize = 0
+    let m: str = "SQLite format 3"
+    while i < 15 {
+        if rt.ld8(h, i) != m.chars(i) {
+            return dberr.fail(DbError::NotADb, "file is not a database")
+        }
+        i = i + 1
+    }
+    if rt.ld8(h, 15) != 0 as u8 {
+        return dberr.fail(DbError::NotADb, "file is not a database")
+    }
+    var ps: usize = g16(h, 16) as usize
+    if ps == 1 {
+        ps = 65536
+    }
+    if ps < 512 || !is_pow2(ps) {
+        return dberr.fail(DbError::Corrupt, "invalid page size in the database header")
+    }
+    let wv: u64 = g8(h, 18)
+    let rv: u64 = g8(h, 19)
+    if wv == 2 || rv == 2 {
+        return dberr.fail(DbError::Unsupported, "the database is in WAL mode (not supported)")
+    }
+    if wv > 2 || rv > 2 {
+        return dberr.fail(DbError::Unsupported, "unknown file format version")
+    }
+    if g8(h, 21) != 64 || g8(h, 22) != 32 || g8(h, 23) != 32 {
+        return dberr.fail(DbError::Corrupt, "invalid payload fractions in the database header")
+    }
+    let reserved: usize = g8(h, 20) as usize
+    if ps - reserved < 480 {
+        return dberr.fail(DbError::Corrupt, "invalid reserved space in the database header")
+    }
+    let enc: u64 = g32(h, 56)
+    if enc != 1 && enc != 0 {
+        return dberr.fail(DbError::Unsupported, "text encoding is not UTF-8 (not supported)")
+    }
+    (*pg).nowrite = g32(h, 52) != 0
+    var np: u64 = g32(h, 28)
+    let counter: u64 = g32(h, 24)
+    let valid_for: u64 = g32(h, 92)
+    if np == 0 || counter != valid_for {
+        np = file_size / (ps as u64)
+    }
+    if np > (*pg).max_pages as u64 {
+        return dberr.fail(DbError::Corrupt, "page count in the database header is too large")
+    }
+    if (*pg).page_size != ps {
+        if (*pg).cache_mem != 0 {
+            cache_free(pg)
+        }
+        if (*pg).jbuf != 0 {
+            rt.heap_free((*pg).jbuf, (*pg).page_size + 8)
+            (*pg).jbuf = 0
+        }
+    }
+    (*pg).page_size = ps
+    (*pg).usable = ps - reserved
+    (*pg).db_pages = np as u32
+    (*pg).counter = counter as u32
+    return true
+}
+
+// A brand new file: page 1 with the SQLite header and an empty table
+// B-tree page for sqlite_master. Called inside a write transaction.
+fn pager_init_new(pg: *mut Pager) -> DbError!bool {
+    if (*pg).db_pages != 0 {
+        return true
+    }
+    let p1: u32 = try pager_alloc_page(pg)
+    let d: u64 = try pager_write(pg, p1)
+    util.zero_bytes(d, (*pg).page_size)
+    let m: str = "SQLite format 3"
+    var i: usize = 0
+    while i < 15 {
+        rt.st8(d, i, m.chars(i))
+        i = i + 1
+    }
+    var ps: u64 = (*pg).page_size as u64
+    if ps == 65536 {
+        ps = 1
+    }
+    p16(d, 16, ps)
+    p8(d, 18, 1)
+    p8(d, 19, 1)
+    p8(d, 20, 0)
+    p8(d, 21, 64)
+    p8(d, 22, 32)
+    p8(d, 23, 32)
+    p32(d, 44, 4)
+    p32(d, 56, 1)
+    p32(d, 96, 3045000)
+    // the empty sqlite_master leaf at offset 100
+    p8(d, 100, 13)
+    p16(d, 105, (*pg).page_size as u64)
+    (*pg).usable = (*pg).page_size
+    return true
+}
+
+// -------------------------------------------------------------- journal
+fn cksum_page(nonce: u32, data: u64, ps: usize) -> u32 {
+    var c: u64 = nonce as u64
+    var i: usize = ps - 200
+    while i > 0 {
+        c = c + (rt.ld8(data, i) as u64)
+        if i < 200 {
+            break
+        }
+        i = i - 200
+    }
+    return (c & 4294967295) as u32
+}
+
+fn dir_sync_of(pg: *mut Pager) {
+    // the directory of the journal: everything before the last '/'
+    let jp: str = path_str(&(*pg).jpath)
+    var n: usize = jp.length()
+    var cut: usize = 0
+    var found: bool = false
+    var i: usize = 0
+    while i < n {
+        let c: u8 = jp.chars(i)
+        if c == 47 as u8 || c == 92 as u8 {
+            cut = i
+            found = true
+        }
+        i = i + 1
+    }
+    if !found {
+        vfsos.os_sync_dir(".")
+        return
+    }
+    if cut == 0 {
+        vfsos.os_sync_dir("/")
+        return
+    }
+    let d: str = __str_copy(str { p: jp.p, n: cut })
+    vfsos.os_sync_dir(d)
+}
+
+fn journal_open(pg: *mut Pager) -> DbError!bool {
+    if (*pg).jopen {
+        return true
+    }
+    if (*pg).jbuf == 0 {
+        (*pg).jbuf = rt.heap_alloc((*pg).page_size + 8)
+        if (*pg).jbuf == 0 {
+            return dberr.fail(DbError::NoMemory, "cannot allocate the journal buffer")
+        }
+    }
+    let jf: i64 = vfsos.os_open(path_str(&(*pg).jpath), true, false)
+    if jf < 0 {
+        return os_fail(jf, "cannot create the journal file")
+    }
+    vfsos.os_truncate(jf, 0)
+    var nonce: [u8; 4] = [0; 4]
+    if !vfsos.os_random((&nonce[0]) as u64, 4) {
+        nonce[0] = ((*pg).epoch & 255) as u8
+        nonce[1] = 77 as u8
+        nonce[2] = 19 as u8
+        nonce[3] = 5 as u8
+    }
+    (*pg).jnonce = g32((&nonce[0]) as u64, 0) as u32
+    let h: u64 = (*pg).jbuf
+    util.zero_bytes(h, SECTOR)
+    var mg: [u8; 8] = [217, 213, 5, 249, 32, 161, 99, 215]
+    var i: usize = 0
+    while i < 8 {
+        rt.st8(h, i, mg[i])
+        i = i + 1
+    }
+    p32(h, 8, 0)
+    p32(h, 12, (*pg).jnonce as u64)
+    p32(h, 16, (*pg).orig_pages as u64)
+    p32(h, 20, SECTOR as u64)
+    p32(h, 24, (*pg).page_size as u64)
+    let r: i64 = vfsos.os_write(jf, 0, h, SECTOR)
+    if r < 0 {
+        vfsos.os_close(jf)
+        return os_fail(r, "cannot write the journal header")
+    }
+    (*pg).jfd = jf
+    (*pg).jopen = true
+    (*pg).jcount = 0
+    (*pg).jsynced = 0
+    (*pg).jdir_synced = false
+    return true
+}
+
+fn journal_record(pg: *mut Pager, pgno: u32, data: u64) -> DbError!bool {
+    try journal_open(pg)
+    let ps: usize = (*pg).page_size
+    let b: u64 = (*pg).jbuf
+    p32(b, 0, pgno as u64)
+    util.move_bytes(b + 4, data, ps)
+    p32(b, 4 + ps, cksum_page((*pg).jnonce, data, ps) as u64)
+    let off: u64 = (SECTOR as u64) + ((*pg).jcount as u64) * ((ps + 8) as u64)
+    var n: usize = ps + 8
+    var dying: bool = false
+    if crash_hit(pg) {
+        n = (ps + 8) / 2
+        dying = true
+    }
+    let r: i64 = vfsos.os_write((*pg).jfd, off, b, n)
+    if dying {
+        vfsos.os_kill_self()
+    }
+    if r < 0 {
+        return os_fail(r, "cannot write the journal")
+    }
+    (*pg).jcount = (*pg).jcount + 1
+    return true
+}
+
+fn journal_sync(pg: *mut Pager) -> DbError!bool {
+    if !(*pg).jopen || (*pg).jcount == (*pg).jsynced {
+        return true
+    }
+    if (*pg).sync_mode == 2 {
+        if crash_hit(pg) {
+            vfsos.os_kill_self()
+        }
+        let r: i64 = vfsos.os_sync((*pg).jfd)
+        (*pg).n_syncs = (*pg).n_syncs + 1
+        if r < 0 {
+            return os_fail(r, "cannot sync the journal")
+        }
+        if !(*pg).jdir_synced {
+            dir_sync_of(pg)
+            (*pg).jdir_synced = true
+        }
+    }
+    var cnt: [u8; 4] = [0; 4]
+    p32((&cnt[0]) as u64, 0, (*pg).jcount as u64)
+    if crash_hit(pg) {
+        // half of the count: two of its four octets
+        vfsos.os_write((*pg).jfd, 8, (&cnt[0]) as u64, 2)
+        vfsos.os_kill_self()
+    }
+    let w: i64 = vfsos.os_write((*pg).jfd, 8, (&cnt[0]) as u64, 4)
+    if w < 0 {
+        return os_fail(w, "cannot write the journal header")
+    }
+    if (*pg).sync_mode == 2 {
+        let r2: i64 = vfsos.os_sync((*pg).jfd)
+        (*pg).n_syncs = (*pg).n_syncs + 1
+        if r2 < 0 {
+            return os_fail(r2, "cannot sync the journal")
+        }
+    }
+    (*pg).jsynced = (*pg).jcount
+    return true
+}
+
+fn jset_has(pg: *mut Pager, pgno: u32) -> bool {
+    let byte: usize = (pgno as usize) / 8
+    if byte >= rt.buf_len(&(*pg).jset) {
+        return false
+    }
+    return (rt.buf_at(&(*pg).jset, byte) as u32 >> (pgno % 8)) & 1 == 1
+}
+
+fn jset_add(pg: *mut Pager, pgno: u32) {
+    let byte: usize = (pgno as usize) / 8
+    let need: usize = byte + 1
+    if need > rt.buf_len(&(*pg).jset) {
+        rt.buf_reserve(&(*pg).jset, need + 64)
+        let old: usize = rt.buf_len(&(*pg).jset)
+        util.zero_bytes(rt.buf_ptr(&(*pg).jset) + old as u64, rt.buf_len(&(*pg).jset) + 0)
+        // the reserved memory is zero (fresh mmap) except what a copy brought; clear the new tail explicitly
+        util.zero_bytes(rt.buf_ptr(&(*pg).jset) + old as u64, need + 64 - old)
+        rt.buf_set_len(&(*pg).jset, need + 64)
+    }
+    let p: u64 = rt.buf_ptr(&(*pg).jset)
+    rt.st8(p, byte, (rt.ld8(p, byte) as u32 | (1 << (pgno % 8))) as u8)
+}
+
+// ------------------------------------------------------ the dirty pages
+// Writes every dirty page into the database file (the journal must be
+// synced already, or the transaction must not need one).
+fn write_dirty(pg: *mut Pager) -> DbError!bool {
+    let ps: usize = (*pg).page_size
+    var i: usize = 0
+    while i < (*pg).nused {
+        let fa: u64 = fr_addr(pg, i)
+        let fl: u32 = f32g(fa, 1)
+        if (fl & FR_DIRTY) != 0 {
+            let pgno: u32 = f32g(fa, 0)
+            var n: usize = ps
+            var dying: bool = false
+            if crash_hit(pg) {
+                n = ps / 2
+                dying = true
+            }
+            let r: i64 = vfsos.os_write((*pg).fd, ((pgno - 1) as u64) * (ps as u64), fr_data(pg, i), n)
+            if dying {
+                vfsos.os_kill_self()
+            }
+            if r < 0 {
+                return os_fail(r, "cannot write the database file")
+            }
+            (*pg).n_writes = (*pg).n_writes + 1
+            f32s(fa, 1, fl & (4294967295 - FR_DIRTY))
+            (*pg).dirty = (*pg).dirty - 1
+            (*pg).db_touched = true
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// A transaction too big for the cache: journal first, then the pages
+fn spill(pg: *mut Pager) -> DbError!bool {
+    try journal_sync(pg)
+    try lock_wait(pg, LOCK_EXCLUSIVE)
+    try write_dirty(pg)
+    return true
+}
+
+// ------------------------------------------------------------ frame take
+fn take_frame(pg: *mut Pager) -> DbError!usize {
+    if (*pg).nused < (*pg).nframes {
+        let i: usize = (*pg).nused
+        (*pg).nused = i + 1
+        return i
+    }
+    var attempt: usize = 0
+    while attempt < 2 {
+        var scanned: usize = 0
+        let limit: usize = 2 * (*pg).nframes
+        while scanned < limit {
+            let i: usize = (*pg).hand
+            (*pg).hand = (i + 1) % (*pg).nframes
+            scanned = scanned + 1
+            let fa: u64 = fr_addr(pg, i)
+            let fl: u32 = f32g(fa, 1)
+            if (fl & FR_DIRTY) != 0 {
+                continue
+            }
+            if f64g(fa, 2) == (*pg).epoch {
+                continue
+            }
+            if (fl & FR_REF) != 0 {
+                f32s(fa, 1, fl & (4294967295 - FR_REF))
+                continue
+            }
+            frame_unlink(pg, i)
+            return i
+        }
+        if attempt == 0 && (*pg).state == 2 && (*pg).dirty > 0 {
+            try spill(pg)
+        }
+        attempt = attempt + 1
+    }
+    return dberr.fail(DbError::Full, "the page cache is full of pages in use")
+}
+
+// The frame of page `pgno`, read from the file unless `load` is false.
+fn pager_frame(pg: *mut Pager, pgno: u32, load: bool) -> DbError!usize {
+    let f: i64 = frame_find(pg, pgno)
+    if f >= 0 {
+        let fa: u64 = fr_addr(pg, f as usize)
+        f32s(fa, 1, f32g(fa, 1) | FR_REF)
+        f64s(fa, 2, (*pg).epoch)
+        return f as usize
+    }
+    let i: usize = try take_frame(pg)
+    let fa: u64 = fr_addr(pg, i)
+    f32s(fa, 1, FR_REF)
+    f64s(fa, 2, (*pg).epoch)
+    frame_link(pg, i, pgno)
+    let data: u64 = fr_data(pg, i)
+    if load {
+        let ps: usize = (*pg).page_size
+        let n: i64 = vfsos.os_read((*pg).fd, ((pgno - 1) as u64) * (ps as u64), data, ps)
+        if n < 0 {
+            frame_unlink(pg, i)
+            f32s(fa, 1, 0)
+            return os_fail(n, "cannot read the database file")
+        }
+        (*pg).n_reads = (*pg).n_reads + 1
+        if (n as usize) < ps {
+            util.zero_bytes(data + (n as u64), ps - (n as usize))
+        }
+    } else {
+        util.zero_bytes(data, (*pg).page_size)
+    }
+    return i
+}
+
+// The content of page `pgno` (1-based): an address valid until the next op.
+fn pager_get(pg: *mut Pager, pgno: u32) -> DbError!u64 {
+    if (*pg).state == 0 {
+        return dberr.fail(DbError::Misuse, "page read outside a transaction")
+    }
+    if pgno == 0 || pgno > (*pg).db_pages {
+        return dberr.fail(DbError::Corrupt, "page number out of range")
+    }
+    let i: usize = try pager_frame(pg, pgno, true)
+    return fr_data(pg, i)
+}
+
+// ---------------------------------------------------------- stmt journal
+fn sj_has(pg: *mut Pager, pgno: u32) -> bool {
+    let byte: usize = (pgno as usize) / 8
+    if byte >= rt.buf_len(&(*pg).sj_set) {
+        return false
+    }
+    return (rt.buf_at(&(*pg).sj_set, byte) as u32 >> (pgno % 8)) & 1 == 1
+}
+
+fn sj_add(pg: *mut Pager, pgno: u32) {
+    let byte: usize = (pgno as usize) / 8
+    let need: usize = byte + 1
+    if need > rt.buf_len(&(*pg).sj_set) {
+        rt.buf_reserve(&(*pg).sj_set, need + 64)
+        let old: usize = rt.buf_len(&(*pg).sj_set)
+        util.zero_bytes(rt.buf_ptr(&(*pg).sj_set) + old as u64, need + 64 - old)
+        rt.buf_set_len(&(*pg).sj_set, need + 64)
+    }
+    let p: u64 = rt.buf_ptr(&(*pg).sj_set)
+    rt.st8(p, byte, (rt.ld8(p, byte) as u32 | (1 << (pgno % 8))) as u8)
+}
+
+fn sj_clear_set(pg: *mut Pager) {
+    let rec: usize = (*pg).page_size + 4
+    var off: usize = 0
+    let total: usize = rt.buf_len(&(*pg).sj_data)
+    let base: u64 = rt.buf_ptr(&(*pg).sj_data)
+    while off + rec <= total {
+        let pgno: u32 = g32(base, off) as u32
+        let byte: usize = (pgno as usize) / 8
+        if byte < rt.buf_len(&(*pg).sj_set) {
+            let p: u64 = rt.buf_ptr(&(*pg).sj_set)
+            rt.st8(p, byte, (rt.ld8(p, byte) as u32 & (255 - (1 << (pgno % 8)))) as u8)
+        }
+        off = off + rec
+    }
+    rt.buf_clear(&(*pg).sj_data)
+}
+
+// Starts a statement savepoint (inside a write transaction).
+fn pager_stmt_begin(pg: *mut Pager) {
+    if (*pg).state != 2 {
+        return
+    }
+    sj_clear_set(pg)
+    (*pg).sj_on = true
+    (*pg).sj_pages = (*pg).db_pages
+}
+
+fn pager_stmt_end(pg: *mut Pager) {
+    if (*pg).sj_on {
+        sj_clear_set(pg)
+    }
+    (*pg).sj_on = false
+}
+
+// Undoes everything since pager_stmt_begin.
+fn pager_stmt_rollback(pg: *mut Pager) -> DbError!bool {
+    if !(*pg).sj_on {
+        return true
+    }
+    (*pg).sj_on = false
+    pager_next_op(pg)
+    let rec: usize = (*pg).page_size + 4
+    let total: usize = rt.buf_len(&(*pg).sj_data)
+    let base: u64 = rt.buf_ptr(&(*pg).sj_data)
+    var off: usize = 0
+    // drop the pages that did not exist at the start
+    (*pg).db_pages = (*pg).sj_pages
+    var k: usize = 0
+    while k < (*pg).nused {
+        let fa: u64 = fr_addr(pg, k)
+        let pn: u32 = f32g(fa, 0)
+        if pn > (*pg).sj_pages {
+            if (f32g(fa, 1) & FR_DIRTY) != 0 {
+                (*pg).dirty = (*pg).dirty - 1
+            }
+            frame_unlink(pg, k)
+            f32s(fa, 1, 0)
+        }
+        k = k + 1
+    }
+    while off + rec <= total {
+        let pgno: u32 = g32(base, off) as u32
+        if pgno != 0 && pgno <= (*pg).sj_pages {
+            pager_next_op(pg)
+            let i: usize = try pager_frame(pg, pgno, false)
+            let fa: u64 = fr_addr(pg, i)
+            util.move_bytes(fr_data(pg, i), base + (off + 4) as u64, (*pg).page_size)
+            let fl: u32 = f32g(fa, 1)
+            if (fl & FR_DIRTY) == 0 {
+                f32s(fa, 1, fl | FR_DIRTY)
+                (*pg).dirty = (*pg).dirty + 1
+            }
+        }
+        off = off + rec
+    }
+    sj_clear_set(pg)
+    return true
+}
+
+// Marks page `pgno` as about to change and returns its address. The old
+// content goes to the journal (and the statement journal) first.
+fn pager_write(pg: *mut Pager, pgno: u32) -> DbError!u64 {
+    if (*pg).state != 2 {
+        return dberr.fail(DbError::Misuse, "write outside a write transaction")
+    }
+    if pgno == 0 || pgno > (*pg).db_pages {
+        return dberr.fail(DbError::Corrupt, "page number out of range")
+    }
+    let i: usize = try pager_frame(pg, pgno, true)
+    let data: u64 = fr_data(pg, i)
+    if pgno <= (*pg).orig_pages && !jset_has(pg, pgno) {
+        try journal_record(pg, pgno, data)
+        jset_add(pg, pgno)
+    }
+    if (*pg).sj_on && pgno <= (*pg).sj_pages && !sj_has(pg, pgno) {
+        let rec: usize = (*pg).page_size + 4
+        let at: usize = rt.buf_len(&(*pg).sj_data)
+        rt.buf_reserve(&(*pg).sj_data, at + rec)
+        let base: u64 = rt.buf_ptr(&(*pg).sj_data)
+        p32(base, at, pgno as u64)
+        util.move_bytes(base + (at + 4) as u64, data, (*pg).page_size)
+        rt.buf_set_len(&(*pg).sj_data, at + rec)
+        sj_add(pg, pgno)
+    }
+    let fa: u64 = fr_addr(pg, i)
+    let fl: u32 = f32g(fa, 1)
+    if (fl & FR_DIRTY) == 0 {
+        f32s(fa, 1, fl | FR_DIRTY)
+        (*pg).dirty = (*pg).dirty + 1
+    }
+    return data
+}
+
+// ------------------------------------------------------------ the freelist
+// Page 1 header: first trunk page @32, number of free pages @36.
+fn pager_freelist_count(pg: *mut Pager) -> DbError!u32 {
+    let p1: u64 = try pager_get(pg, 1)
+    return g32(p1, 36) as u32
+}
+
+fn pager_alloc_page(pg: *mut Pager) -> DbError!u32 {
+    if (*pg).state != 2 {
+        return dberr.fail(DbError::Misuse, "allocation outside a write transaction")
+    }
+    if (*pg).nowrite {
+        return dberr.fail(DbError::Unsupported, "auto-vacuum databases are read only here")
+    }
+    try journal_open(pg)
+    if (*pg).db_pages > 0 {
+        let count0: u64 = g32(try pager_get(pg, 1), 36)
+        if count0 > 0 {
+            let p1: u64 = try pager_write(pg, 1)
+            let count: u64 = g32(p1, 36)
+            let trunk: u32 = g32(p1, 32) as u32
+            if trunk < 2 || trunk > (*pg).db_pages {
+                return dberr.fail(DbError::Corrupt, "freelist trunk page out of range")
+            }
+            let td: u64 = try pager_write(pg, trunk)
+            let n: u64 = g32(td, 4)
+            if n > 0 {
+                if n > ((*pg).usable as u64) / 4 - 2 {
+                    return dberr.fail(DbError::Corrupt, "freelist trunk page has too many entries")
+                }
+                let leaf: u32 = g32(td, 8 + ((n - 1) as usize) * 4) as u32
+                if leaf < 2 || leaf > (*pg).db_pages {
+                    return dberr.fail(DbError::Corrupt, "freelist leaf page out of range")
+                }
+                p32(td, 4, n - 1)
+                p32(p1, 36, count - 1)
+                let ld: u64 = try pager_write(pg, leaf)
+                util.zero_bytes(ld, (*pg).page_size)
+                return leaf
+            }
+            // an empty trunk: the trunk itself is the page
+            p32(p1, 32, g32(td, 0))
+            p32(p1, 36, count - 1)
+            util.zero_bytes(td, (*pg).page_size)
+            return trunk
+        }
+    }
+    var npg: u32 = (*pg).db_pages + 1
+    if (npg as u64) == (PAGER_PENDING_BYTE / ((*pg).page_size as u64)) + 1 {
+        npg = npg + 1
+    }
+    if npg > (*pg).max_pages {
+        return dberr.fail(DbError::Full, "database or disk is full (page limit)")
+    }
+    (*pg).db_pages = npg
+    let i: usize = try pager_frame(pg, npg, false)
+    let fa: u64 = fr_addr(pg, i)
+    let fl: u32 = f32g(fa, 1)
+    if (fl & FR_DIRTY) == 0 {
+        f32s(fa, 1, fl | FR_DIRTY)
+        (*pg).dirty = (*pg).dirty + 1
+    }
+    return npg
+}
+
+fn pager_free_page(pg: *mut Pager, pgno: u32) -> DbError!bool {
+    if pgno < 2 || pgno > (*pg).db_pages {
+        return dberr.fail(DbError::Corrupt, "free of a page out of range")
+    }
+    let p1: u64 = try pager_write(pg, 1)
+    let count: u64 = g32(p1, 36)
+    let trunk: u32 = g32(p1, 32) as u32
+    if trunk != 0 {
+        if trunk < 2 || trunk > (*pg).db_pages {
+            return dberr.fail(DbError::Corrupt, "freelist trunk page out of range")
+        }
+        let td: u64 = try pager_write(pg, trunk)
+        let n: u64 = g32(td, 4)
+        let room: u64 = ((*pg).usable as u64) / 4 - 8
+        if n < room {
+            p32(td, 8 + (n as usize) * 4, pgno as u64)
+            p32(td, 4, n + 1)
+            p32(p1, 36, count + 1)
+            return true
+        }
+    }
+    let nd: u64 = try pager_write(pg, pgno)
+    util.zero_bytes(nd, (*pg).page_size)
+    p32(nd, 0, trunk as u64)
+    p32(nd, 4, 0)
+    p32(p1, 32, pgno as u64)
+    p32(p1, 36, count + 1)
+    return true
+}
+
+// -------------------------------------------------------- playback / hot
+// Rolls the journal back into the database file. `jf` is an open journal.
+fn playback(pg: *mut Pager, jf: i64) -> DbError!bool {
+    let size: i64 = vfsos.os_size(jf)
+    if size < (JOURNAL_HDR as i64) {
+        return true
+    }
+    var hb: [u8; 32] = [0; 32]
+    let h: u64 = (&hb[0]) as u64
+    var mg: [u8; 8] = [217, 213, 5, 249, 32, 161, 99, 215]
+    var off: u64 = 0
+    var first: bool = true
+    var db_size: u64 = 0
+    var did_something: bool = false
+    var psz: usize = (*pg).page_size
+    let rbuf0: u64 = rt.heap_alloc(PAGER_MAX_PAGE_SIZE + 8)
+    if rbuf0 == 0 {
+        return dberr.fail(DbError::NoMemory, "cannot allocate the playback buffer")
+    }
+    while off + (JOURNAL_HDR as u64) <= (size as u64) {
+        let n: i64 = vfsos.os_read(jf, off, h, JOURNAL_HDR)
+        if n < (JOURNAL_HDR as i64) {
+            break
+        }
+        var ok: bool = true
+        var i: usize = 0
+        while i < 8 {
+            if rt.ld8(h, i) != mg[i] {
+                ok = false
+            }
+            i = i + 1
+        }
+        if !ok {
+            break
+        }
+        var nrec: u64 = g32(h, 8)
+        let nonce: u32 = g32(h, 12) as u32
+        let dbs: u64 = g32(h, 16)
+        let sector: usize = g32(h, 20) as usize
+        let jps: usize = g32(h, 24) as usize
+        if first {
+            if jps < 512 || jps > PAGER_MAX_PAGE_SIZE || !is_pow2(jps) || sector < 32 || sector > 65536
+                || !is_pow2(sector) {
+                rt.heap_free(rbuf0, PAGER_MAX_PAGE_SIZE + 8)
+                return dberr.fail(DbError::Corrupt, "the journal header is damaged")
+            }
+            psz = jps
+            db_size = dbs
+        } else if jps != psz {
+            break
+        }
+        let rec_off: u64 = off + (sector as u64)
+        if nrec == 4294967295 {
+            nrec = ((size as u64) - rec_off) / ((psz + 8) as u64)
+        }
+        var r: u64 = 0
+        while r < nrec {
+            let ro: u64 = rec_off + r * ((psz + 8) as u64)
+            if ro + ((psz + 8) as u64) > (size as u64) {
+                break
+            }
+            let got: i64 = vfsos.os_read(jf, ro, rbuf0, psz + 8)
+            if got < ((psz + 8) as i64) {
+                break
+            }
+            let pgno: u64 = g32(rbuf0, 0)
+            if pgno == 0 || pgno > 2147483647 {
+                break
+            }
+            let ck: u32 = g32(rbuf0, 4 + psz) as u32
+            if cksum_page(nonce, rbuf0 + 4, psz) != ck {
+                break
+            }
+            let w: i64 = vfsos.os_write((*pg).fd, (pgno - 1) * (psz as u64), rbuf0 + 4, psz)
+            if w < 0 {
+                rt.heap_free(rbuf0, PAGER_MAX_PAGE_SIZE + 8)
+                return os_fail(w, "cannot write the database file during recovery")
+            }
+            did_something = true
+            r = r + 1
+        }
+        if first {
+            vfsos.os_truncate((*pg).fd, db_size * (psz as u64))
+            did_something = true
+        }
+        first = false
+        var next: u64 = rec_off + nrec * ((psz + 8) as u64)
+        let sec: u64 = sector as u64
+        next = (next + sec - 1) / sec * sec
+        if next <= off {
+            break
+        }
+        off = next
+    }
+    rt.heap_free(rbuf0, PAGER_MAX_PAGE_SIZE + 8)
+    if did_something && (*pg).sync_mode == 2 {
+        vfsos.os_sync((*pg).fd)
+    }
+    return true
+}
+
+fn journal_is_hot(pg: *mut Pager) -> bool {
+    let jp: str = path_str(&(*pg).jpath)
+    if !vfsos.os_exists(jp) {
+        return false
+    }
+    // a writer that holds RESERVED owns the journal: not hot
+    if vfsos.os_check_lock((*pg).fd, RESERVED_BYTE, 1) {
+        return false
+    }
+    return true
+}
+
+// Holding SHARED: if a hot journal is there, roll it back.
+fn hot_recover(pg: *mut Pager) -> DbError!bool {
+    if !journal_is_hot(pg) {
+        return true
+    }
+    let jf: i64 = vfsos.os_open(path_str(&(*pg).jpath), false, false)
+    if jf < 0 {
+        return true
+    }
+    var hb: [u8; 16] = [0; 16]
+    let n: i64 = vfsos.os_read(jf, 0, (&hb[0]) as u64, 8)
+    var mg: [u8; 8] = [217, 213, 5, 249, 32, 161, 99, 215]
+    var magic: bool = n == 8
+    var i: usize = 0
+    while i < 8 && magic {
+        if hb[i] != mg[i] {
+            magic = false
+        }
+        i = i + 1
+    }
+    if !magic {
+        vfsos.os_close(jf)
+        return true
+    }
+    // this process needs EXCLUSIVE to change the file
+    let had: i64 = (*pg).lock
+    let r: DbError!bool = lock_wait(pg, LOCK_EXCLUSIVE)
+    let locked: bool = r catch false
+    if !locked {
+        vfsos.os_close(jf)
+        unlock_to_shared(pg)
+        return dberr.fail(DbError::Busy, "database is locked (a hot journal needs recovery)")
+    }
+    if !vfsos.os_exists(path_str(&(*pg).jpath)) {
+        vfsos.os_close(jf)
+        unlock_to_shared(pg)
+        return true
+    }
+    let rc: DbError!bool = playback(pg, jf)
+    let rc_ok: bool = rc catch false
+    vfsos.os_close(jf)
+    if !rc_ok {
+        unlock_to_shared(pg)
+        return rc
+    }
+    vfsos.os_delete(path_str(&(*pg).jpath))
+    dir_sync_of(pg)
+    unlock_to_shared(pg)
+    pager_purge_cache(pg)
+    (*pg).have_header = false
+    return true
+}
+
+// ---------------------------------------------------------- transactions
+// Takes the SHARED lock, recovers a hot journal, reads and checks the header.
+fn pager_begin_read(pg: *mut Pager) -> DbError!bool {
+    if (*pg).state >= 1 {
+        return true
+    }
+    try lock_wait(pg, LOCK_SHARED)
+    let hr: DbError!bool = hot_recover(pg)
+    let hr_ok: bool = hr catch false
+    if !hr_ok {
+        unlock_all(pg)
+        return hr
+    }
+    let size: i64 = vfsos.os_size((*pg).fd)
+    if size < 0 {
+        unlock_all(pg)
+        return os_fail(size, "cannot get the size of the database file")
+    }
+    var hdr: [u8; 100] = [0; 100]
+    if size == 0 {
+        // a new, empty database
+        if (*pg).db_pages != 0 {
+            pager_purge_cache(pg)
+        }
+        (*pg).db_pages = 0
+        (*pg).counter = 0
+        (*pg).have_header = false
+    } else {
+        if size < 100 {
+            unlock_all(pg)
+            return dberr.fail(DbError::NotADb, "file is not a database")
+        }
+        let n: i64 = vfsos.os_read((*pg).fd, 0, (&hdr[0]) as u64, 100)
+        if n < 100 {
+            unlock_all(pg)
+            return os_fail(n, "cannot read the database header")
+        }
+        let old_counter: u32 = (*pg).counter
+        let had_header: bool = (*pg).have_header
+        let vh: DbError!bool = pager_header_valid(pg, (&hdr[0]) as u64, size as u64)
+        let vh_ok: bool = vh catch false
+        if !vh_ok {
+            unlock_all(pg)
+            return vh
+        }
+        if !had_header || old_counter != (*pg).counter {
+            pager_purge_cache(pg)
+        }
+        (*pg).have_header = true
+    }
+    let ca: DbError!bool = cache_alloc(pg)
+    let ca_ok: bool = ca catch false
+    if !ca_ok {
+        unlock_all(pg)
+        return ca
+    }
+    (*pg).state = 1
+    pager_next_op(pg)
+    return true
+}
+
+fn pager_end_read(pg: *mut Pager) {
+    if (*pg).state == 1 {
+        unlock_all(pg)
+        (*pg).state = 0
+    }
+}
+
+// Takes the RESERVED lock (starting the read transaction if there is none): from now on
+// nobody else can write; readers still can, until the commit.
+//
+// DEADLOCK RULE (SQLite's too): a connection that holds a SHARED lock and waits for
+// RESERVED would keep the writer that holds RESERVED from getting EXCLUSIVE. So when the
+// transaction starts from nothing, a busy RESERVED lock means: give the SHARED lock back,
+// wait, start again. When a read transaction is open already the answer is Busy at once.
+fn pager_begin_write(pg: *mut Pager) -> DbError!bool {
+    if (*pg).state == 2 {
+        return true
+    }
+    if (*pg).readonly {
+        return dberr.fail(DbError::ReadOnly, "attempt to write a readonly database")
+    }
+    if (*pg).nowrite {
+        return dberr.fail(DbError::Unsupported, "auto-vacuum databases are read only here")
+    }
+    var waited: i64 = 0
+    var step: i64 = 1
+    var fresh: bool = (*pg).state == 0
+    while true {
+        if (*pg).state == 0 {
+            try pager_begin_read(pg)
+        }
+        let r: i64 = lock_try_reserved(pg)
+        if r == 0 {
+            (*pg).lock = LOCK_RESERVED
+            break
+        }
+        if r != vfsos.OS_BUSY {
+            if fresh {
+                pager_end_read(pg)
+            }
+            return os_fail(r, "cannot lock the database file")
+        }
+        if !fresh || waited >= (*pg).busy_ms {
+            if fresh {
+                pager_end_read(pg)
+            }
+            return dberr.fail(DbError::Busy, "database is locked")
+        }
+        pager_end_read(pg)
+        vfsos.os_sleep_ms(step)
+        waited = waited + step
+        if step < 50 {
+            step = step * 2
+        }
+    }
+    (*pg).state = 2
+    (*pg).orig_pages = (*pg).db_pages
+    rt.buf_clear(&(*pg).jset)
+    (*pg).db_touched = false
+    (*pg).jcount = 0
+    (*pg).jsynced = 0
+    (*pg).sj_on = false
+    return true
+}
+
+fn end_write_state(pg: *mut Pager) {
+    if (*pg).jopen {
+        vfsos.os_close((*pg).jfd)
+        (*pg).jopen = false
+        (*pg).jfd = -1
+    }
+    (*pg).sj_on = false
+    rt.buf_clear(&(*pg).sj_data)
+    rt.buf_clear(&(*pg).sj_set)
+    rt.buf_clear(&(*pg).jset)
+    (*pg).db_touched = false
+    (*pg).jcount = 0
+    (*pg).jsynced = 0
+    if (*pg).hold_read > 0 {
+        unlock_to_shared(pg)
+        (*pg).state = 1
+    } else {
+        unlock_all(pg)
+        (*pg).state = 0
+    }
+}
+
+fn pager_commit(pg: *mut Pager) -> DbError!bool {
+    if (*pg).state != 2 {
+        if (*pg).state == 1 {
+            pager_end_read(pg)
+        }
+        return true
+    }
+    pager_next_op(pg)
+    if (*pg).dirty == 0 && (*pg).db_pages == (*pg).orig_pages && !(*pg).db_touched {
+        end_write_state(pg)
+        return true
+    }
+    // the header of page 1: change counter, size in pages
+    let h: u64 = try pager_write(pg, 1)
+    var c: u64 = ((*pg).counter as u64) + 1
+    c = c & 4294967295
+    p32(h, 24, c)
+    p32(h, 28, (*pg).db_pages as u64)
+    p32(h, 92, c)
+    p32(h, 96, 3045000)
+    try journal_sync(pg)
+    try lock_wait(pg, LOCK_EXCLUSIVE)
+    try write_dirty(pg)
+    let want: u64 = ((*pg).db_pages as u64) * ((*pg).page_size as u64)
+    if (vfsos.os_size((*pg).fd) as u64) > want {
+        vfsos.os_truncate((*pg).fd, want)
+    }
+    if (*pg).sync_mode == 2 {
+        if crash_hit(pg) {
+            vfsos.os_kill_self()
+        }
+        let r: i64 = vfsos.os_sync((*pg).fd)
+        (*pg).n_syncs = (*pg).n_syncs + 1
+        if r < 0 {
+            return os_fail(r, "cannot sync the database file")
+        }
+    }
+    (*pg).counter = c as u32
+    if (*pg).jopen {
+        vfsos.os_close((*pg).jfd)
+        (*pg).jopen = false
+        if crash_hit(pg) {
+            vfsos.os_kill_self()
+        }
+        let d: i64 = vfsos.os_delete(path_str(&(*pg).jpath))
+        if d < 0 && d != -2 {
+            return os_fail(d, "cannot delete the journal")
+        }
+        if (*pg).sync_mode == 2 {
+            dir_sync_of(pg)
+        }
+    }
+    end_write_state(pg)
+    return true
+}
+
+fn pager_rollback(pg: *mut Pager) -> DbError!bool {
+    if (*pg).state == 1 {
+        pager_end_read(pg)
+        return true
+    }
+    if (*pg).state != 2 {
+        return true
+    }
+    // every cached page may be newer than the file: forget them all
+    (*pg).dirty = 0
+    pager_purge_cache(pg)
+    var res: bool = true
+    if (*pg).jopen {
+        if (*pg).db_touched {
+            let rc: DbError!bool = playback(pg, (*pg).jfd)
+            res = rc catch false
+        }
+        vfsos.os_close((*pg).jfd)
+        (*pg).jopen = false
+        vfsos.os_delete(path_str(&(*pg).jpath))
+    } else if (*pg).db_touched {
+        let want: u64 = ((*pg).orig_pages as u64) * ((*pg).page_size as u64)
+        vfsos.os_truncate((*pg).fd, want)
+    }
+    (*pg).db_pages = (*pg).orig_pages
+    end_write_state(pg)
+    if !res {
+        return dberr.fail(DbError::Io, "rollback failed: the journal could not be replayed")
+    }
+    return true
+}
+
+// A new cache size in pages. While no transaction is open the cache is dropped and
+// made again at the next one; during one the new size is used from then on.
+fn pager_set_cache_size(pg: *mut Pager, n: usize) {
+    (*pg).cache_req = n
+    if (*pg).state == 0 && (*pg).cache_mem != 0 {
+        cache_free(pg)
+        (*pg).have_header = false
+    }
+}

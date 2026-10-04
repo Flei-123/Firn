@@ -1,0 +1,176 @@
+// expect_exit: 0
+// examples/db_game_history.fi -- the play history of a game launcher: which instance was played
+// when, for how long, and how it ended. One file, no server.
+//
+//   instance   a game setup (name, version, loader)
+//   session    one run: start, end (NULL while it runs), exit code
+//   event      what happened in a session (a line of log worth keeping)
+//
+// Shows: foreign-key-like joins, GROUP BY with SUM/COUNT/MAX, the date functions (strftime on
+// unix seconds), a session recorded inside one transaction, rolling a whole session back,
+// a run that never ended (the process was killed: end is NULL), pruning old events.
+import std.rt
+import std.io
+import std.fs
+import db.dberr
+import db.dbcore as dc
+import db.sqlite as sq
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn expect(t: *mut Tally, what: str, got: str, want: str) {
+    (*t).total = (*t).total + 1
+    if !got.equal(want) {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print(what)
+        io.print(": got [")
+        io.print(got)
+        io.print("] want [")
+        io.print(want)
+        io.print_line("]")
+    } else {
+        io.print("ok   ")
+        io.print_line(what)
+    }
+}
+
+fn query(d: *mut dc.Db, sql: str) -> str {
+    return sq.db_query_all(d, sql) catch "<error>"
+}
+
+fn run(d: *mut dc.Db, sql: str) -> bool {
+    return sq.db_exec(d, sql) catch false
+}
+
+fn scratch_path() -> str {
+    var b: rt.Buf = rt.buf_new()
+    let head: str = "/tmp/firn_game_history_"
+    rt.buf_push_bytes(&b, head.p as u64, head.length())
+    rt.buf_push_dec_i64(&b, syscall(39, 0, 0, 0, 0, 0, 0))
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn add_instance(d: *mut dc.Db, name: str, version: str, loader: str) -> i64 {
+    let st: *mut dc.Stmt = sq.db_prepare(d, "INSERT INTO instance(name, version, loader) VALUES (?1, ?2, ?3)") catch | e | (0 as *mut dc.Stmt)
+    sq.stmt_bind_text(st, 1, name) catch false
+    sq.stmt_bind_text(st, 2, version) catch false
+    sq.stmt_bind_text(st, 3, loader) catch false
+    sq.stmt_step(st) catch false
+    sq.stmt_finalize(st)
+    return sq.db_last_insert_rowid(d)
+}
+
+// One finished session and its events, all or nothing.
+fn record_session(d: *mut dc.Db, instance: i64, start: i64, end: i64, code: i64, crashed: bool) -> i64 {
+    sq.db_begin(d) catch false
+    let st: *mut dc.Stmt = sq.db_prepare(d, "INSERT INTO session(instance, started, ended, exit_code) VALUES (?1, ?2, ?3, ?4)") catch | e | (0 as *mut dc.Stmt)
+    sq.stmt_bind_int(st, 1, instance) catch false
+    sq.stmt_bind_int(st, 2, start) catch false
+    sq.stmt_bind_int(st, 3, end) catch false
+    sq.stmt_bind_int(st, 4, code) catch false
+    sq.stmt_step(st) catch false
+    sq.stmt_finalize(st)
+    let sid: i64 = sq.db_last_insert_rowid(d)
+    let ev: *mut dc.Stmt = sq.db_prepare(d, "INSERT INTO event(session, at, kind, text) VALUES (?1, ?2, ?3, ?4)") catch | e | (0 as *mut dc.Stmt)
+    sq.stmt_bind_int(ev, 1, sid) catch false
+    sq.stmt_bind_int(ev, 2, start) catch false
+    sq.stmt_bind_text(ev, 3, "start") catch false
+    sq.stmt_bind_text(ev, 4, "game started") catch false
+    sq.stmt_step(ev) catch false
+    sq.stmt_reset(ev)
+    sq.stmt_bind_int(ev, 2, end) catch false
+    if crashed {
+        sq.stmt_bind_text(ev, 3, "crash") catch false
+        sq.stmt_bind_text(ev, 4, "the game exited with an error") catch false
+    } else {
+        sq.stmt_bind_text(ev, 3, "stop") catch false
+        sq.stmt_bind_text(ev, 4, "game closed") catch false
+    }
+    sq.stmt_step(ev) catch false
+    sq.stmt_finalize(ev)
+    sq.db_commit(d) catch false
+    return sid
+}
+
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+    let path: str = scratch_path()
+    let d: *mut dc.Db = sq.db_open(path, sq.OPEN_CREATE) catch | e | (0 as *mut dc.Db)
+    if (d as u64) == 0 {
+        io.print_line("FAIL cannot create the database")
+        return 2
+    }
+    sq.db_set_synchronous(d, 0)
+    run(d, "CREATE TABLE instance(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL, loader TEXT NOT NULL DEFAULT 'vanilla')")
+    run(d, "CREATE TABLE session(id INTEGER PRIMARY KEY, instance INTEGER NOT NULL REFERENCES instance(id), started INTEGER NOT NULL, ended INTEGER, exit_code INTEGER)")
+    run(d, "CREATE TABLE event(id INTEGER PRIMARY KEY, session INTEGER NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT)")
+    run(d, "CREATE INDEX session_instance ON session(instance, started)")
+    run(d, "CREATE INDEX event_session ON event(session)")
+
+    let survival: i64 = add_instance(d, "Survival", "1.21.1", "fabric")
+    let creative: i64 = add_instance(d, "Creative", "1.20.4", "vanilla")
+    let modpack: i64 = add_instance(d, "Modpack", "1.20.1", "forge")
+    expect(&t, "ids in order", query(d, "SELECT id, name FROM instance ORDER BY id"), "1|Survival;2|Creative;3|Modpack")
+    // a unique name is enforced
+    let dup: i64 = add_instance(d, "Survival", "1.21.1", "fabric")
+    expect(&t, "a name twice is refused", query(d, "SELECT count(*) FROM instance"), "3")
+
+    // 2026-09-01 00:00:00 UTC is 1788220800
+    let day: i64 = 1788220800
+    record_session(d, survival, day + 3600, day + 3600 + 5400, 0, false)           // 90 min
+    record_session(d, survival, day + 86400 + 7200, day + 86400 + 7200 + 1800, 0, false) // 30 min, next day
+    record_session(d, creative, day + 86400 + 40000, day + 86400 + 40000 + 600, 1, true)   // 10 min, crashed
+    record_session(d, modpack, day + 2 * 86400, day + 2 * 86400 + 7200, 0, false)  // 120 min
+    record_session(d, survival, day + 2 * 86400 + 50000, day + 2 * 86400 + 50000 + 3600, 0, false) // 60 min
+
+    expect(&t, "play time per instance (minutes), longest first", query(d, "SELECT i.name, sum(s.ended - s.started) / 60 AS minutes FROM instance i JOIN session s ON s.instance = i.id GROUP BY i.id ORDER BY minutes DESC, i.name"), "Survival|180;Modpack|120;Creative|10")
+    expect(&t, "sessions and the longest one", query(d, "SELECT i.name, count(*), max(s.ended - s.started) / 60 FROM instance i JOIN session s ON s.instance = i.id GROUP BY i.id ORDER BY i.id"), "Survival|3|90;Creative|1|10;Modpack|1|120")
+    expect(&t, "last played", query(d, "SELECT i.name, strftime('%Y-%m-%d %H:%M', max(s.started), 'unixepoch') FROM instance i JOIN session s ON s.instance = i.id GROUP BY i.id ORDER BY max(s.started) DESC"), "Survival|2026-09-03 13:53;Modpack|2026-09-03 00:00;Creative|2026-09-02 11:06")
+    expect(&t, "play time per day", query(d, "SELECT date(started, 'unixepoch') AS d, sum(ended - started) / 60 FROM session GROUP BY d ORDER BY d"), "2026-09-01|90;2026-09-02|40;2026-09-03|180")
+    expect(&t, "crashes per instance", query(d, "SELECT i.name, count(*) FROM event e JOIN session s ON s.id = e.session JOIN instance i ON i.id = s.instance WHERE e.kind = 'crash' GROUP BY i.id"), "Creative|1")
+    expect(&t, "instances never played or crashed", query(d, "SELECT name FROM instance WHERE id NOT IN (SELECT instance FROM session WHERE exit_code <> 0) ORDER BY name"), "Modpack;Survival")
+    expect(&t, "events of the crashed session", query(d, "SELECT kind, text FROM event WHERE session = 3 ORDER BY at"), "start|game started;crash|the game exited with an error")
+
+    // a session whose recording fails half-way leaves nothing behind
+    sq.db_begin(d) catch false
+    run(d, "INSERT INTO session(instance, started) VALUES (1, 1788999999)")
+    run(d, "INSERT INTO event(session, at, kind) VALUES (6, 1788999999, 'start')")
+    sq.db_rollback(d) catch false
+    expect(&t, "a rolled-back session is gone", query(d, "SELECT count(*) FROM session"), "5")
+    expect(&t, "and its events", query(d, "SELECT count(*) FROM event"), "10")
+
+    // a run that never ended: the launcher was killed, `ended` stays NULL
+    run(d, "INSERT INTO session(instance, started) VALUES (1, 1789000000)")
+    expect(&t, "an open session", query(d, "SELECT id, ended IS NULL FROM session WHERE ended IS NULL"), "6|1")
+    run(d, "UPDATE session SET ended = started, exit_code = -1 WHERE ended IS NULL")
+    expect(&t, "closed with exit code -1 on the next start", query(d, "SELECT exit_code, ended - started FROM session WHERE id = 6"), "-1|0")
+
+    // events older than a day before the last session are pruned
+    run(d, "DELETE FROM event WHERE at < 1788220800 + 86400 AND kind = 'start'")
+    expect(&t, "old events pruned", query(d, "SELECT count(*) FROM event"), "9")
+    expect(&t, "sessions untouched", query(d, "SELECT count(*) FROM session"), "6")
+
+    sq.db_close(d)
+    // reopen: all there, and the file is a valid SQLite file
+    let d2: *mut dc.Db = sq.db_open(path, 0) catch | e | (0 as *mut dc.Db)
+    expect(&t, "after a reopen", query(d2, "SELECT count(*) FROM session"), "6")
+    expect(&t, "integrity", query(d2, "PRAGMA integrity_check"), "ok")
+    sq.db_close(d2)
+    fs.remove(path) catch false
+    var f: io.Fmt = io.fmt_new()
+    f = io.fmt_text(f, "checks ".p as u64, 7)
+    f = io.fmt_number(f, t.total)
+    f = io.fmt_text(f, ", failed ".p as u64, 9)
+    f = io.fmt_number(f, t.fails)
+    io.fmt_print_line(f)
+    if t.fails != 0 {
+        return 1
+    }
+    return 0
+}
