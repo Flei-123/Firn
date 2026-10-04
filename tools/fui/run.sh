@@ -595,6 +595,23 @@ else
 fi
 
 echo
+echo "== 18q. UI EXTRAS (docs/UI_EXTRAS.md): rich text, selection + copy, highlighting, animated pictures,"
+echo "         the kit in the accessibility tree, touch gestures, right-to-left, the QR widget =="
+# Each program paints into a canvas (or feeds synthetic pointer streams) and checks the result;
+# the last line of each is XXX PASSED or the run stops (set -e).
+#   richtext   spans, wrapping, links, selection (drag, word, paragraph, Ctrl+A), Ctrl+C, RTL
+#   mdextras   syntax-coloured code blocks, select all / drag / word / block, copy text format
+#   anim       animated GIF + WebP against Pillow's frames and delays, loops, pause, big gaps
+#   kita11y    every kit part described into the a11y tree, the audit green, the dump
+#   touch      tap / double tap / long press / pan / fling / pinch, the grid and the Markdown view
+#   kitrtl     every kit part mirrored: hit functions, decorations, keys; the default untouched
+#   qrview     the QR widget's pixels and that the painted picture reads back
+for t in richtext mdextras anim kita11y touch kitrtl qrview; do
+    build $t
+    "$W/$t" | tail -n 3
+done
+
+echo
 echo "== 18p2. THE ACCESSIBILITY AUDIT OF EVERY fUi PROGRAM (r98) =="
 # tools/fui/audit_main.fi shows that lib/fui/audit.fi has teeth (an unnamed
 # button, a duplicate key, a secret in the export are each found);

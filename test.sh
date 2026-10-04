@@ -1642,6 +1642,24 @@ if [ "$PKRC" -eq 0 ]; then
 else
     bad "tools/pack/test failed (see .test-work/pack*.log)"
     grep -E 'FAIL' "$WORK"/pack*.log | head -12 | sed 's/^/   /'
+echo "== 77. UI extras: QR codes against qrcodegen / python-qrcode / ZXing-C++, and the human texts against ICU (tools/qr/, tools/uiextras/) =="
+# The fUi parts of the same wave (rich text, selection and copy, highlighting, animated pictures,
+# the kit in the accessibility tree, touch, right to left, the QR widget) are section 18q of
+# tools/fui/run.sh; their library tests are tests/2240-2242 (section 3). Here the two that are
+# held against other implementations: lib/qr (the encoder's modules identical with Nayuki's
+# reference encoder for every version, level and mask; every code read back by ZXing-C++; the
+# decoder on pictures that get worse -- rotated, warped, blurred, damaged, cluttered -- with
+# ZXing-C++ as the yardstick) and lib/i18n/human.fi (relative times, byte sizes, date styles,
+# percent, lists, zones against ICU 72). SKIP (exit 0) without the Python packages.
+UXRC=0
+sh tools/qr/run.sh > "$WORK/qr_run.log" 2>&1 || UXRC=1
+sh tools/uiextras/run.sh > "$WORK/uiextras_run.log" 2>&1 || UXRC=1
+if [ "$UXRC" -eq 0 ]; then
+    ok
+    grep -E '^(cases|human:|total|QR PASSED|UIEXTRAS PASSED|  SKIP)' "$WORK/qr_run.log" "$WORK/uiextras_run.log" | sed 's/^/   /'
+else
+    bad "tools/qr or tools/uiextras failed (see .test-work/qr_run.log, uiextras_run.log)"
+    grep -E 'FAIL|DIFF|Traceback|Error' "$WORK/qr_run.log" "$WORK/uiextras_run.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
