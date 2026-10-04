@@ -1,0 +1,280 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/async/post.fi -- hand work to the loop thread from other threads, and
+// run blocking work on worker threads with the result coming back to it.
+//
+// THE UI-THREAD RULE. The loop (async.loop) and everything on it -- streams,
+// the HTTP client, the WebSocket client -- belong to ONE thread. A fUi
+// program has one thread for the window anyway; a result that a worker
+// thread produced (a file read, a database query, a name lookup, an
+// `net.http` fetch that blocks) must be handed to THAT thread, because
+// widgets, and Firn's collector-owned objects the UI keeps, may only be
+// touched there. `post` is that hand-over:
+//
+//     fn arrived(l: *mut loop.Loop, arg: u64) { /* runs on the loop thread */ }
+//
+//     var po: post.Poster = post.poster_new(&l)          // once, on the loop thread
+//     loop.set_keep_alive(&l, true)                      // the loop waits for posts
+//     ... any thread:  post.post(&po, arrived, 42)       // returns at once
+//
+// `post` may be called from ANY thread (also from the loop thread itself,
+// also from many at once). Calls run in the order they were posted, on the
+// loop thread, in a later step of the loop, never inside `post`. A post wakes
+// a loop that sleeps in epoll/poll (eventfd, see loop.fi WAKE).
+//
+// THE BRIDGE builds on std.pool: `bridge_call(f, arg, done, ud)` runs
+// `f(arg)` on a worker thread (so `f` may block as long as it likes) and then
+// calls `done(loop, ud, result)` on the loop thread.
+//
+//     fn work(arg: u64) -> u64 { ... blocking ... return result }
+//     fn done(l: *mut loop.Loop, ud: u64, result: u64) { ... }
+//     fn __thread_work(kind: u64, arg: u64) -> u64 {      // the pool's ONE line
+//         if kind == pool.WORKER_KIND { return pool.worker_main(arg) }
+//         return 0
+//     }
+//     var br: post.Bridge = post.bridge_new(&l, 4, 64)
+//     post.bridge_call(&br, work, 7, done, 0)
+//
+// ==================================================================== HONEST
+//
+// P1  THREADS: Linux x86-64 only (the thread runtime, round 49). On AArch64
+//     the compiler refuses programs that use threads; on Windows there are no
+//     threads yet (std.pool runs a job at once, inside `bridge_call`): the
+//     API works, the work is just not concurrent.
+// P2  THE ARGUMENT IS A NUMBER (std.pool Q1): what `arg` points to must stay
+//     alive and must not be moved by the collector until the callback has
+//     run. Hand over indices, malloc-style memory (`rt.heap_alloc`) or
+//     objects the program keeps referenced.
+// P3  `post` takes a lock that is held only for the few instructions of a
+//     push; a flood of posts from many threads queues up without a limit
+//     (memory), there is no back pressure.
+// P4  The callbacks of one drain run back to back: a slow one delays the
+//     descriptors and timers of the loop (loop.fi A4).
+// P5  `bridge_call` does NOT block when the pool's queue is full -- it
+//     returns false (std.pool Q2 would deadlock a loop thread that waits).
+import std.rt
+import std.pool
+import async.loop
+
+export {
+    Poster, Bridge,
+    poster_new, poster_free, post, post_pending, post_total,
+    bridge_new, bridge_free, bridge_call, bridge_pending,
+}
+
+// block, in 64 bit words
+const B_LOCK: usize = 0
+const B_COUNT: usize = 1
+const B_CAP: usize = 2
+const B_ARR: usize = 3
+const B_POSTED: usize = 4
+const B_DELIVERED: usize = 5
+const B_REFS: usize = 6
+const B_WORDS: usize = 8
+
+struct Poster {
+    l: *mut loop.Loop,
+    blk: u64,
+}
+
+// One queue per LOOP: a second `poster_new` on the same loop (a bridge makes
+// one of its own) shares the queue of the first -- the loop has a single
+// wake hook.
+fn poster_new(l: *mut loop.Loop) -> Poster {
+    if loop.wake_hook_fn(l) == drain as u64 {
+        let have: u64 = loop.wake_hook_ud(l)
+        rt.st64(have, B_REFS, rt.ld64(have, B_REFS) + 1)
+        return Poster { l: l, blk: have }
+    }
+    let blk: u64 = rt.heap_alloc(B_WORDS * 8)
+    if blk != 0 {
+        rt.mem_set(blk, 0 as u8, B_WORDS * 8)
+        rt.st64(blk, B_REFS, 1)
+        loop.set_wake_hook(l, drain, blk)
+        // the loop's sleep must not hold up a collection run on another thread
+        loop.set_block_hooks(l, sleep_before, sleep_after)
+    }
+    return Poster { l: l, blk: blk }
+}
+
+// The loop must not be running a drain when this is called. The queue goes
+// with the last poster of the loop.
+fn poster_free(p: *mut Poster) {
+    if (*p).blk == 0 {
+        return
+    }
+    let refs: u64 = rt.ld64((*p).blk, B_REFS)
+    if refs > 1 {
+        rt.st64((*p).blk, B_REFS, refs - 1)
+        (*p).blk = 0
+        return
+    }
+    loop.set_wake_hook((*p).l, drain_none, 0)
+    loop.set_block_hooks((*p).l, no_hook, no_hook)
+    let arr: u64 = rt.ld64((*p).blk, B_ARR)
+    let cap: usize = rt.ld64((*p).blk, B_CAP) as usize
+    if arr != 0 {
+        rt.heap_free(arr, cap * 16)
+    }
+    rt.heap_free((*p).blk, B_WORDS * 8)
+    (*p).blk = 0
+}
+
+fn sleep_before() { thread_blocking_an() }
+fn sleep_after() { thread_blocking_out() }
+
+fn drain_none(l: *mut loop.Loop, ud: u64) { }
+fn no_hook() { }
+
+// Queues `f(loop, arg)` for the loop thread. Any thread. false: out of
+// memory (the call is dropped).
+fn post(p: *mut Poster, f: fn(*mut loop.Loop, u64), arg: u64) -> bool {
+    let blk: u64 = (*p).blk
+    if blk == 0 {
+        return false
+    }
+    let lock: *mut u64 = (blk + (B_LOCK * 8) as u64) as *mut u64
+    thread_lock(lock)
+    var n: usize = rt.ld64(blk, B_COUNT) as usize
+    var cap: usize = rt.ld64(blk, B_CAP) as usize
+    if n == cap {
+        var ncap: usize = cap * 2
+        if ncap == 0 {
+            ncap = 64
+        }
+        let na: u64 = rt.heap_alloc(ncap * 16)
+        if na == 0 {
+            thread_unlock(lock)
+            return false
+        }
+        let old: u64 = rt.ld64(blk, B_ARR)
+        if old != 0 {
+            rt.mem_copy(na, old, n * 16)
+            rt.heap_free(old, cap * 16)
+        }
+        rt.st64(blk, B_ARR, na)
+        rt.st64(blk, B_CAP, ncap as u64)
+        cap = ncap
+    }
+    let arr: u64 = rt.ld64(blk, B_ARR)
+    rt.st64(arr, n * 2, f as u64)
+    rt.st64(arr, n * 2 + 1, arg)
+    rt.st64(blk, B_COUNT, (n + 1) as u64)
+    rt.st64(blk, B_POSTED, rt.ld64(blk, B_POSTED) + 1)
+    thread_unlock(lock)
+    // A wake-up is only needed for the first entry: the drain takes all.
+    if n == 0 {
+        loop.wake((*p).l)
+    }
+    return true
+}
+
+// Entries waiting (a snapshot; other threads may be posting).
+fn post_pending(p: *mut Poster) -> usize {
+    return rt.ld64((*p).blk, B_COUNT) as usize
+}
+
+// Posts accepted / calls delivered since the start.
+fn post_total(p: *mut Poster) -> u64 {
+    return rt.ld64((*p).blk, B_POSTED)
+}
+
+// The wake hook: takes everything that has been posted and runs it, in
+// order, on the loop thread.
+fn drain(l: *mut loop.Loop, blk: u64) {
+    while true {
+        let lock: *mut u64 = (blk + (B_LOCK * 8) as u64) as *mut u64
+        thread_lock(lock)
+        let n: usize = rt.ld64(blk, B_COUNT) as usize
+        if n == 0 {
+            thread_unlock(lock)
+            return
+        }
+        let arr: u64 = rt.ld64(blk, B_ARR)
+        let cap: usize = rt.ld64(blk, B_CAP) as usize
+        rt.st64(blk, B_ARR, 0)
+        rt.st64(blk, B_CAP, 0)
+        rt.st64(blk, B_COUNT, 0)
+        thread_unlock(lock)
+        var i: usize = 0
+        while i < n {
+            let f: fn(*mut loop.Loop, u64) = rt.ld64(arr, i * 2) as fn(*mut loop.Loop, u64)
+            f(l, rt.ld64(arr, i * 2 + 1))
+            i = i + 1
+        }
+        rt.st64(blk, B_DELIVERED, rt.ld64(blk, B_DELIVERED) + n as u64)
+        rt.heap_free(arr, cap * 16)
+    }
+}
+
+// ---------------------------------------------------------------- Bridge
+
+struct Bridge {
+    po: Poster,
+    workers: pool.Pool,
+    qcap: usize,
+}
+
+// ctx block, in words
+const C_FN: usize = 0
+const C_ARG: usize = 1
+const C_DONE: usize = 2
+const C_UD: usize = 3
+const C_RES: usize = 4
+const C_POSTER: usize = 5
+const C_WORDS: usize = 6
+
+fn bridge_new(l: *mut loop.Loop, workers: usize, queue: usize) -> Bridge {
+    return Bridge { po: poster_new(l), workers: pool.pool_new(workers as u64, queue as u64), qcap: queue }
+}
+
+// Waits for the jobs that are queued (std.pool shutdown) and frees all. Call
+// it after the loop has finished with the results.
+fn bridge_free(b: *mut Bridge) {
+    pool.shutdown(&(*b).workers)
+    poster_free(&(*b).po)
+}
+
+fn bridge_pending(b: *mut Bridge) -> u64 {
+    return pool.pending(&(*b).workers)
+}
+
+fn bridge_job(ctx: u64) -> u64 {
+    let f: fn(u64) -> u64 = rt.ld64(ctx, C_FN) as fn(u64) -> u64
+    let r: u64 = f(rt.ld64(ctx, C_ARG))
+    rt.st64(ctx, C_RES, r)
+    let po: *mut Poster = rt.ld64(ctx, C_POSTER) as *mut Poster
+    post(po, bridge_deliver, ctx)
+    return 0
+}
+
+fn bridge_deliver(l: *mut loop.Loop, ctx: u64) {
+    let done: fn(*mut loop.Loop, u64, u64) = rt.ld64(ctx, C_DONE) as fn(*mut loop.Loop, u64, u64)
+    let ud: u64 = rt.ld64(ctx, C_UD)
+    let r: u64 = rt.ld64(ctx, C_RES)
+    rt.heap_free(ctx, C_WORDS * 8)
+    done(l, ud, r)
+}
+
+// Runs `f(arg)` on a worker, then `done(loop, ud, result)` on the loop
+// thread. false: the queue is full (P5) or there is no memory.
+fn bridge_call(b: *mut Bridge, f: fn(u64) -> u64, arg: u64,
+    done: fn(*mut loop.Loop, u64, u64), ud: u64) -> bool {
+    if pool.pending(&(*b).workers) >= (*b).qcap as u64 {
+        return false
+    }
+    let ctx: u64 = rt.heap_alloc(C_WORDS * 8)
+    if ctx == 0 {
+        return false
+    }
+    rt.st64(ctx, C_FN, f as u64)
+    rt.st64(ctx, C_ARG, arg)
+    rt.st64(ctx, C_DONE, done as u64)
+    rt.st64(ctx, C_UD, ud)
+    rt.st64(ctx, C_RES, 0)
+    rt.st64(ctx, C_POSTER, (&(*b).po) as u64)
+    if pool.submit(&(*b).workers, bridge_job, ctx) == 0 {
+        rt.heap_free(ctx, C_WORDS * 8)
+        return false
+    }
+    return true
+}

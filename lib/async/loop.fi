@@ -87,7 +87,7 @@ export {
     loop_new, loop_init, loop_init_poll, loop_free,
     watch_add, watch_mod, watch_del, watch_count,
     timer_after, timer_every, timer_cancel, timer_count, timer_next_ms,
-    defer_call, wake, loop_fd,
+    defer_call, wake, loop_fd, set_wake_hook, wake_hook_fn, wake_hook_ud, set_block_hooks,
     run_once, run, stop, set_keep_alive,
     mono_ms, now_cached,
     is_epoll, backend_name, wake_kind, socket_limit,
@@ -164,6 +164,10 @@ struct Loop {
     evbuf: rt.Buf, // epoll_event records
     pfds: rt.Buf, // pollfd records of the poll backend
     pmap: rt.Buf, // ... and the handle each one belongs to
+    whook: u64, // called on the loop thread after a wake-up (post.fi)
+    wud: u64,
+    bin: u64, // called before / after the loop sleeps in the kernel (post.fi)
+    bout: u64,
     stopped: bool,
     keep: bool,
     now: i64, // the clock as of the start of this round
@@ -182,7 +186,7 @@ fn loop_new() -> Loop {
         heap: rt.buf_new(), nheap: 0, tseq: 0,
         defers: rt.buf_new(), ndefer: 0,
         evbuf: rt.buf_new(), pfds: rt.buf_new(), pmap: rt.buf_new(),
-        stopped: false, keep: false, now: 0,
+        whook: 0, wud: 0, bin: 0, bout: 0, stopped: false, keep: false, now: 0,
         rounds: 0, events: 0, fired: 0, deferred_run: 0, wakes: 0 }
 }
 
@@ -351,6 +355,46 @@ fn wake_drain(l: *mut Loop) {
     }
     syscall(SYS_READ, (*l).wr as i64, (&sink[0]) as i64, n, 0, 0, 0)
     (*l).wakes = (*l).wakes + 1
+    if (*l).whook != 0 {
+        let h: fn(*mut Loop, u64) = (*l).whook as fn(*mut Loop, u64)
+        h(l, (*l).wud)
+    }
+}
+
+// `h(loop, ud)` runs on the loop thread every time the loop was woken by
+// `wake`, while the wake-up event is handled. One hook per loop
+// (lib/async/post.fi takes it).
+fn wake_hook_fn(l: *mut Loop) -> u64 { return (*l).whook }
+fn wake_hook_ud(l: *mut Loop) -> u64 { return (*l).wud }
+
+fn set_wake_hook(l: *mut Loop, h: fn(*mut Loop, u64), ud: u64) {
+    (*l).whook = h as u64
+    (*l).wud = ud
+}
+
+// In a program with several threads the collector must be able to run while
+// this thread sleeps in epoll_wait/poll: the thread runtime wants the sleep
+// announced (`thread_blocking_an` / `thread_blocking_out`, round 49). Those
+// are thread builtins, which a single-threaded program -- and the AArch64
+// and Windows targets -- must not be forced to carry, so the loop only calls
+// two hooks and lib/async/post.fi, the thread-aware part, sets them.
+fn set_block_hooks(l: *mut Loop, before: fn(), after: fn()) {
+    (*l).bin = before as u64
+    (*l).bout = after as u64
+}
+
+fn sleep_in(l: *mut Loop, wait: i64) {
+    if (*l).bin != 0 && wait != 0 {
+        let h: fn() = (*l).bin as fn()
+        h()
+    }
+}
+
+fn sleep_out(l: *mut Loop, wait: i64) {
+    if (*l).bout != 0 && wait != 0 {
+        let h: fn() = (*l).bout as fn()
+        h()
+    }
 }
 
 // ------------------------------------------------------------ Life cycle
@@ -787,8 +831,10 @@ fn wait_epoll(l: *mut Loop, wait: i64) -> u64 {
     if tmo > 2000000000 {
         tmo = 2000000000
     }
+    sleep_in(l, tmo)
     let r: i64 = syscall(SYS_EPOLL_PWAIT, (*l).ep as i64, (*l).evbuf.ptr as i64,
         MAX_EVENTS as i64, tmo, 0, 8)
+    sleep_out(l, tmo)
     if r <= 0 {
         return 0 // timeout, or EINTR: a signal is not an event
     }
@@ -836,12 +882,14 @@ fn wait_poll(l: *mut Loop, wait: i64) -> u64 {
         slot = slot + 1
     }
     var r: i64 = 0
+    sleep_in(l, wait)
     if wait < 0 {
         // a constant: the AArch64 translation of poll() needs to SEE -1
         r = syscall(SYS_POLL, (*l).pfds.ptr as i64, n as i64, -1, 0, 0, 0)
     } else {
         r = syscall(SYS_POLL, (*l).pfds.ptr as i64, n as i64, wait, 0, 0, 0)
     }
+    sleep_out(l, wait)
     if r <= 0 {
         return 0
     }

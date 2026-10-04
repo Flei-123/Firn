@@ -1,0 +1,276 @@
+// expect_exit: 0
+// tests/2125_async_post.fi -- async.post: results from other threads reach
+// the loop thread; the bridge runs blocking work on std.pool workers.
+//
+// A  4 producer threads post 500 callbacks each: all 2000 arrive on the loop
+//    thread (checked by thread id), in order per producer
+// B  a loop that sleeps (nothing to do) is woken by a post from a thread
+//    100 ms later -- it does not spin meanwhile
+// C  the bridge: 16 jobs of 50 ms on 8 workers finish in far less than 16 x 50 ms,
+//    results are right, every `done` runs on the loop thread
+// D  posting from the loop thread itself; a callback that posts again
+// E  the queue-full refusal of bridge_call
+// F  a collection runs on a worker while the loop thread sleeps in the kernel
+//    (the sleep is announced to the collector)
+import std.rt
+import std.str
+import std.pool
+import async.loop
+import async.post
+
+const KIND_PRODUCER: u64 = 4242
+
+static mut fails: u32 = 0
+
+fn check(ok: bool, code: u32) {
+    if !ok {
+        fails = fails + 1
+        let m: [u8; 5] = "FAIL "
+        syscall(1, 2, (&m[0]) as i64, 5, 0, 0, 0)
+        var d: [u8; 4] = [48, 48, 48, 10]
+        d[0] = (48 + (code / 100) % 10) as u8
+        d[1] = (48 + (code / 10) % 10) as u8
+        d[2] = (48 + code % 10) as u8
+        syscall(1, 2, (&d[0]) as i64, 4, 0, 0, 0)
+    }
+}
+
+fn tid() -> i64 {
+    return syscall(186, 0, 0, 0, 0, 0, 0)
+}
+
+fn nap_ms(ms: i64) {
+    var ts: [i64; 2] = [0, 0]
+    ts[0] = ms / 1000
+    ts[1] = (ms % 1000) * 1000000
+    syscall(35, (&ts[0]) as i64, 0, 0, 0, 0, 0)
+}
+
+// ---- shared with the producers (the producer threads get these addresses)
+static mut poster_addr: u64 = 0
+static mut loop_tid: i64 = 0
+static mut received: u64 = 0
+static mut wrong_thread: u64 = 0
+static mut out_of_order: u64 = 0
+static mut last_seq: [u64; 8] = [0; 8]
+static mut total_expected: u64 = 0
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == pool.WORKER_KIND {
+        return pool.worker_main(arg)
+    }
+    if kind == KIND_PRODUCER {
+        // arg = producer number; posts 500 callbacks
+        let po: *mut post.Poster = poster_addr as *mut post.Poster
+        var i: u64 = 1
+        while i <= 500 {
+            post.post(po, on_arrival, (arg << 32) | i)
+            i = i + 1
+        }
+        return 0
+    }
+    return 0
+}
+
+fn on_arrival(l: *mut loop.Loop, arg: u64) {
+    received = received + 1
+    if tid() != loop_tid {
+        wrong_thread = wrong_thread + 1
+    }
+    let who: usize = (arg >> 32) as usize
+    let seq: u64 = arg & 4294967295
+    if seq != last_seq[who] + 1 {
+        out_of_order = out_of_order + 1
+    }
+    last_seq[who] = seq
+    if received == total_expected {
+        loop.stop(l)
+    }
+}
+
+// ---- B
+static mut b_arrived: i64 = 0
+static mut b_rounds_before: u64 = 0
+
+fn b_late(arg: u64) -> u64 {
+    nap_ms(100)
+    post.post(poster_addr as *mut post.Poster, b_arrive, 7)
+    return 0
+}
+
+fn b_arrive(l: *mut loop.Loop, arg: u64) {
+    b_arrived = loop.mono_ms()
+    loop.stop(l)
+}
+
+// ---- C
+static mut c_done: u32 = 0
+static mut c_sum: u64 = 0
+static mut c_wrong_thread: u32 = 0
+
+fn c_work(arg: u64) -> u64 {
+    nap_ms(50)
+    return arg * 2
+}
+
+fn c_finished(l: *mut loop.Loop, ud: u64, result: u64) {
+    c_done = c_done + 1
+    c_sum = c_sum + result
+    if tid() != loop_tid {
+        c_wrong_thread = c_wrong_thread + 1
+    }
+    if ud != result / 2 {
+        c_wrong_thread = c_wrong_thread + 100
+    }
+    if c_done == 16 {
+        loop.stop(l)
+    }
+}
+
+// ---- D
+static mut d_order: [u64; 4] = [0; 4]
+static mut d_n: usize = 0
+
+fn d_third(l: *mut loop.Loop, arg: u64) { d_order[d_n] = arg; d_n = d_n + 1 }
+fn d_second(l: *mut loop.Loop, arg: u64) {
+    d_order[d_n] = arg
+    d_n = d_n + 1
+    post.post(poster_addr as *mut post.Poster, d_third, 3)
+}
+fn d_first(l: *mut loop.Loop, arg: u64) {
+    d_order[d_n] = arg
+    d_n = d_n + 1
+    // posted from the loop thread, while it is draining
+    post.post(poster_addr as *mut post.Poster, d_second, 2)
+}
+
+// ---- F: a worker allocates in the collected heap while the loop sleeps
+fn f_garbage(arg: u64) -> u64 {
+    var total: u64 = 0
+    var k: u64 = 0
+    while k < 200 {
+        var s: str = "garbage"
+        var j: u64 = 0
+        while j < 100 {
+            s = s + "xxxxxxxxxxxxxxxx"
+            j = j + 1
+        }
+        total = total + s.length() as u64
+        k = k + 1
+    }
+    return total
+}
+
+static mut f_done: u32 = 0
+static mut f_total: u64 = 0
+
+fn f_finished(l: *mut loop.Loop, ud: u64, result: u64) {
+    f_done = f_done + 1
+    f_total = f_total + result
+    if f_done == 4 {
+        loop.stop(l)
+    }
+}
+
+fn t_stop(l: *mut loop.Loop, ud: u64) { loop.stop(l) }
+
+#[allow_escape]
+fn main() -> i32 {
+    var l: loop.Loop = loop.loop_new()
+    check(loop.loop_init(&l), 1)
+    loop_tid = tid()
+    var po: post.Poster = post.poster_new(&l)
+    poster_addr = (&po) as u64
+    loop.set_keep_alive(&l, true)
+    let guard: u64 = loop.timer_after(&l, 20000, t_stop, 0) // never hangs
+
+    // ---- A
+    total_expected = 2000
+    var h: [u64; 4] = [0; 4]
+    var i: u64 = 0
+    while i < 4 {
+        h[i as usize] = thread_start(KIND_PRODUCER, i)
+        check(h[i as usize] != 0, 10)
+        i = i + 1
+    }
+    loop.run(&l)
+    check(received == 2000, 11)
+    check(wrong_thread == 0, 12)
+    check(out_of_order == 0, 13)
+    check(post.post_total(&po) == 2000, 14)
+
+    // ---- B: sleeping loop, woken by a thread
+    let r0: u64 = loop.stat_rounds(&l)
+    let t0: i64 = loop.mono_ms()
+    // a pool job plays the thread that answers late
+    var bp: pool.Pool = pool.pool_new(1, 4)
+    pool.submit(&bp, b_late, 0)
+    loop.run(&l)
+    let waited: i64 = b_arrived - t0
+    check(waited >= 90 && waited < 1000, 20)
+    check(loop.stat_rounds(&l) - r0 < 12, 21) // it slept, it did not spin
+    pool.shutdown(&bp)
+
+    // ---- C: the bridge
+    var br: post.Bridge = post.bridge_new(&l, 8, 32)
+    let t1: i64 = loop.mono_ms()
+    var j: u64 = 0
+    while j < 16 {
+        check(post.bridge_call(&br, c_work, j + 1, c_finished, j + 1), 30)
+        j = j + 1
+    }
+    loop.run(&l)
+    let took: i64 = loop.mono_ms() - t1
+    check(c_done == 16, 31)
+    check(c_sum == 2 * (16 * 17 / 2), 32)
+    check(c_wrong_thread == 0, 33)
+    check(took < 600, 34) // 8 at a time: about 100 ms, not 800
+
+    // ---- D: order, and posting from the loop thread
+    d_n = 0
+    post.post(&po, d_first, 1)
+    loop.timer_after(&l, 100, t_stop, 0)
+    loop.run(&l)
+    check(d_n == 3 && d_order[0] == 1 && d_order[1] == 2 && d_order[2] == 3, 40)
+
+    // ---- E: queue full
+    var small: post.Bridge = post.bridge_new(&l, 1, 2)
+    var accepted: u32 = 0
+    var refused: u32 = 0
+    j = 0
+    while j < 10 {
+        if post.bridge_call(&small, c_work, j, c_finished, 0) {
+            accepted = accepted + 1
+        } else {
+            refused = refused + 1
+        }
+        j = j + 1
+    }
+    check(accepted >= 2 && refused >= 1, 50)
+    c_done = 100 // never reaches 16 again; just drain
+    let t3: i64 = loop.mono_ms()
+    while post.bridge_pending(&small) > 0 && loop.mono_ms() - t3 < 3000 {
+        loop.run_once(&l, 20)
+    }
+    loop.run_once(&l, 20)
+    post.bridge_free(&small)
+
+    // ---- F: garbage collection on the workers while the loop sleeps
+    f_done = 0
+    j = 0
+    while j < 4 {
+        post.bridge_call(&br, f_garbage, j, f_finished, 0)
+        j = j + 1
+    }
+    loop.run(&l)
+    check(f_done == 4 && f_total == 4 * 200 * (7 + 1600), 60)
+
+    loop.timer_cancel(&l, guard)
+    post.bridge_free(&br)
+    post.poster_free(&po)
+    loop.loop_free(&l)
+    if fails != 0 {
+        return 1
+    }
+    return 0
+}
