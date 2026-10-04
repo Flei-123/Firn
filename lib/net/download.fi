@@ -1,0 +1,1730 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/download.fi -- net.download: a download manager on net.http,
+// std.pool and std.hashfile.
+//
+// WHY. A Minecraft launcher fetches 3000 small asset files, a few hundred
+// libraries and a 400 MB Java runtime, over flaky connections, and wants a
+// progress bar, a cancel button and files that are either right or absent.
+// `net.http` fetches ONE thing into memory; `std.hashfile` writes one file
+// atomically; `std.pool` runs jobs. This file is the glue plus everything
+// a long list of downloads needs on top.
+//
+//     import net.download
+//
+//     fn __thread_work(kind: u64, arg: u64) -> u64 {        // the pool's line
+//         if kind == pool.WORKER_KIND { return pool.worker_main(arg) }
+//         return 0
+//     }
+//
+//     var d: download.Dl = download.dl_new(8)                // 8 workers
+//     download.dl_set_progress(&d, on_event, 0)              // optional
+//     download.dl_add(&d, "https://host/a.bin", "/data/a.bin",
+//         hashfile.HASH_SHA1, "<hex>", 1234)                  // size 0 = unknown
+//     download.dl_add_mirror(&d, 0, "https://mirror/a.bin")   // fallback URL
+//     download.dl_start(&d)                                   // returns at once
+//     ... poll download.dl_bytes_done(&d), dl_files_done(&d) ...
+//     download.dl_wait(&d)                                    // or dl_run(&d)
+//     download.dl_free(&d)
+//
+// WHAT IT DOES
+//   * N workers (std.pool), one HTTP client per worker slot; a slot keeps
+//     its connection OPEN (keep-alive) and a job prefers the slot whose
+//     connection already goes to its host, so 3000 files from one host
+//     cost a handful of handshakes, not 3000.
+//   * Items are taken in the order they were added.
+//   * RESUME. The data goes to `<dest>.part`; a later attempt (or run)
+//     asks `Range: bytes=<n>-` and appends. The octets already on disk are
+//     hashed again first, so the digest covers the whole file. A server
+//     that answers 200 instead of 206 makes the file start over; a 206
+//     whose Content-Range does not start where asked is refused.
+//     Without a digest the part is only resumed when a VALIDATOR (ETag or
+//     Last-Modified, sent as `If-Range`) is known -- from a sidecar file
+//     (`DL_META`) or from `dl_set_validators`; a blind splice of two
+//     versions of a file is not offered.
+//   * ALREADY THERE. A dest that matches the digest (or, with `DL_TRUST_SIZE`
+//     or when no digest is given, the declared size) is `DL_SKIPPED` without
+//     a request. With neither and a known validator the server is asked
+//     with `If-None-Match`/`If-Modified-Since`: 304 is `DL_NOT_MODIFIED`.
+//   * RETRY with exponential backoff (base, doubling, cap, +-25 % jitter);
+//     transient failures: connection errors, timeouts, 408, 429, 5xx,
+//     a wrong digest or size. `Retry-After` (seconds) is honoured up to the
+//     cap. A 4xx (other than 408/429) retires THAT mirror. Mirrors are
+//     tried in turn; going to the next mirror costs no delay, a full
+//     round does.
+//   * RATE LIMIT in octets per second for ALL workers together.
+//   * PROGRESS. Polled: totals (`dl_bytes_done` ...) and per item
+//     (`dl_item_done` ...), or pushed: a callback with events START,
+//     PROGRESS (at most every 100 ms per file), RETRY, DONE. The callback
+//     runs ON A WORKER THREAD, one at a time (a lock serialises them).
+//   * VERIFY. SHA-1/SHA-256/SHA-512/MD5 while the data arrives; a wrong
+//     digest deletes the part and counts as a failed attempt.
+//   * ATOMIC. The dest appears by rename after fsync, with the verified
+//     content; on any failure it is the old file or absent, never half.
+//   * CANCEL. `dl_cancel` stops after the next chunk (a stalled read ends at
+//     the timeout); the `.part` file stays, so a later run resumes.
+//
+// HONEST
+//   D1  THE THREAD LINE. Like std.pool, the program has to contain the
+//       `__thread_work` dispatcher shown above. Without it use `dl_run_inline`
+//       (one item after the other on the calling thread).
+//   D2  WINDOWS has no threads in this runtime yet (std.pool Q6): `dl_start`
+//       then downloads everything before it returns, one file at a time.
+//       Results and API are the same; the progress is only visible through
+//       the callback.
+//   D3  NO PROXY, NO HTTP/2, NO IPv6 (net.http). The cookie jar and the
+//       response cache of net.http are not used.
+//   D4  THE CALLBACK AND THE POLL VALUES ARE NOT A SNAPSHOT: they are read
+//       while workers write; every single value is a whole 64-bit word,
+//       the set of values can be a few octets apart.
+//   D5  DIGEST OF A RESUMED FILE: the octets already on disk are trusted
+//       only through the final digest. A `.part` that someone edited is
+//       caught by the digest, or -- without a digest -- not at all.
+//   D6  ONE MANAGER PER DESTINATION. Two managers (or processes) that write
+//       the same `<dest>.part` at the same time corrupt each other; there is
+//       no lock file.
+//   D7  A RENAME ONTO A FILE THAT IS OPEN (Windows, a running .exe) fails;
+//       the rename is tried again for ~2 s, then the item fails with
+//       `DE_DISK` and the verified `.part` stays.
+//   D8  `Content-Encoding` other than identity is never asked for. If a
+//       server sends one anyway the body is decoded in memory first (32 MiB
+//       limit) and the resume offset then means DECODED octets -- do not
+//       point this at servers that compress files on the fly.
+//   D9  Memory: one `net.http` client per worker, each with TLS buffers; a
+//       few hundred KiB each. Strings are copied into the manager.
+//   D10 The directory of the dest is created (`mkdir -p`); nothing else
+//       outside `<dest>.part`/`<dest>.dlmeta` is ever written or removed.
+import std.rt
+import std.fs
+import std.time
+import std.pool
+import std.hashfile
+import net.url
+import net.http
+
+export {
+    Dl,
+    dl_new, dl_free, dl_add, dl_add_mirror, dl_set_validators,
+    dl_set_item_flags, dl_set_item_mode,
+    dl_set_retries, dl_set_backoff, dl_set_timeout, dl_set_rate,
+    dl_set_flags, dl_set_progress, dl_set_user_agent,
+    dl_start, dl_wait, dl_run, dl_run_inline, dl_cancel, dl_finished,
+    dl_count, dl_files_total, dl_files_done, dl_files_failed,
+    dl_files_skipped, dl_bytes_done, dl_bytes_total, dl_bytes_wire,
+    dl_retries_used, dl_sockets, dl_requests, dl_reused,
+    dl_item_state, dl_item_error, dl_item_http, dl_item_net_error,
+    dl_item_attempts, dl_item_done, dl_item_total, dl_item_url,
+    dl_item_etag, dl_item_last_modified,
+    dl_backoff_ms,
+    DL_PENDING, DL_RUNNING, DL_OK, DL_SKIPPED, DL_NOT_MODIFIED, DL_FAILED,
+    DL_CANCELLED,
+    DE_NONE, DE_URL, DE_HTTP, DE_NET, DE_HASH, DE_SIZE, DE_DISK, DE_CANCEL,
+    DE_RANGE, DE_NOMEM,
+    DL_NORESUME, DL_META, DL_TRUST_SIZE, DL_FORCE, DL_NOSYNC,
+    EV_START, EV_PROGRESS, EV_RETRY, EV_DONE,
+    DL_MAX_URLS,
+}
+
+// ---------------------------------------------------------------- Public
+
+const DL_PENDING: u64 = 0
+const DL_RUNNING: u64 = 1
+const DL_OK: u64 = 2
+const DL_SKIPPED: u64 = 3 // the file was there and right; no request
+const DL_NOT_MODIFIED: u64 = 4 // the server said 304
+const DL_FAILED: u64 = 5
+const DL_CANCELLED: u64 = 6
+
+// error classes of a failed item (`dl_item_error`)
+const DE_NONE: u32 = 0
+const DE_URL: u32 = 1 // not an http(s) URL
+const DE_HTTP: u32 = 2 // a status that is no use: `dl_item_http`
+const DE_NET: u32 = 3 // connection/TLS/DNS/timeout: `dl_item_net_error`
+const DE_HASH: u32 = 4 // the digest differs
+const DE_SIZE: u32 = 5 // the size differs from the declared one
+const DE_DISK: u32 = 6 // cannot create/write/rename
+const DE_CANCEL: u32 = 7
+const DE_RANGE: u32 = 8 // a 206 that does not match the request
+const DE_NOMEM: u32 = 9
+
+// flags (per manager default, per item override with dl_set_item_flags)
+const DL_NORESUME: u32 = 1 // never resume: every attempt starts at zero
+const DL_META: u32 = 2 // keep `<dest>.dlmeta` (ETag, Last-Modified)
+const DL_TRUST_SIZE: u32 = 4 // an existing file of the right size is right
+const DL_FORCE: u32 = 8 // ignore an existing dest and a part
+const DL_NOSYNC: u32 = 16 // no fsync before the rename (faster, less durable)
+
+// callback events: f(ud, event, item, a, b)
+const EV_START: u32 = 1 // a = declared size (0 unknown), b = octets resumed
+const EV_PROGRESS: u32 = 2 // a = octets of this file, b = its total (0 unknown)
+const EV_RETRY: u32 = 3 // a = attempt just failed (1-based), b = delay in ms
+const EV_DONE: u32 = 4 // a = state (DL_*), b = error class (DE_*)
+
+const DL_MAX_URLS: usize = 4
+
+// ------------------------------------------------------------- Internals
+
+const ZERO: u64 = 0
+const ONE: u64 = 1
+const NO_LEN: u64 = 18446744073709551615
+
+// failures raised by the sink (Ctx.fail)
+const F_NONE: u32 = 0
+const F_CANCEL: u32 = 1
+const F_DISK: u32 = 2
+const F_SIZE: u32 = 3
+const F_RANGE: u32 = 4
+
+// results of one attempt
+const RC_OK: u32 = 0
+const RC_RETRY: u32 = 1 // try again (after the backoff)
+const RC_RETRY_NOW: u32 = 2 // try again without a delay
+const RC_DEAD: u32 = 3 // this mirror is no use: next one
+const RC_DISK: u32 = 4 // nothing to retry
+const RC_CANCEL: u32 = 5
+const RC_NOTMOD: u32 = 6
+
+// the numbers of http.err_num (the variants cannot be named from here)
+const NE_URL: u32 = 1
+const NE_SCHEME: u32 = 2
+const NE_ABORTED: u32 = 17
+
+const PROGRESS_NS: u64 = 100000000
+const IO_CHUNK: usize = 65536
+const ETAG_MAX: usize = 160
+const LM_MAX: usize = 48
+
+struct Item {
+    mgr: u64,
+    idx: u64,
+    nurls: u32,
+    dead: u32, // bit k: URL k is retired
+    url_off: [u32; 4],
+    url_len: [u32; 4],
+    dest_off: u32,
+    dest_len: u32,
+    algo: u32,
+    hexlen: u32,
+    want: [u8; 128],
+    size: u64,
+    flags: u32,
+    mode: u32,
+    etag: [u8; 160],
+    netag: usize,
+    lm: [u8; 48],
+    nlm: usize,
+    state: u64,
+    err: u32,
+    http_status: u32,
+    net_err: u32,
+    attempts: u32,
+    done: u64,
+    total: u64,
+    counted: u64, // what this item has put into the manager's bytes_done
+    size_counted: u64, // ... into bytes_total
+    last_report: u64,
+    retry_after_ms: u64,
+}
+
+struct Slot {
+    lock: u64,
+    client: u64, // *mut http.Client, 0 until first use
+    host_h: u64, // hash of the origin its connection goes to
+}
+
+struct Mgr {
+    workers: u64,
+    retries: u32,
+    flags: u32,
+    backoff_base: u64,
+    backoff_max: u64,
+    timeout_ms: u64,
+    rate: u64,
+    ua: [u8; 96],
+    nua: usize,
+    items: u64, // array of Item
+    n: usize,
+    cap: usize,
+    arena: rt.Buf,
+    slots: u64, // array of Slot
+    nslots: usize,
+    pool: pool.Pool,
+    started: bool,
+    inline_run: bool,
+    cb: fn(u64, u32, u64, u64, u64),
+    cb_ud: u64,
+    cb_lock: u64,
+    rl_lock: u64,
+    rl_t: u64,
+    cancel: u64,
+    files_done: u64,
+    files_failed: u64,
+    files_skipped: u64,
+    files_final: u64,
+    bytes_done: u64,
+    bytes_total: u64,
+    bytes_wire: u64,
+    retries_used: u64,
+}
+
+struct Dl {
+    p: u64, // *mut Mgr; 0 = could not be created
+}
+
+struct Ctx {
+    m: *mut Mgr,
+    it: *mut Item,
+    cl: *mut http.Client,
+    resp: *mut http.Response,
+    part: rt.Buf,
+    fd: i64,
+    hasher: hashfile.Hasher,
+    have: u64, // octets of the part at the start of this attempt
+    written: u64, // length of the part now
+    total: u64, // length of the whole file when known, else 0
+    began: bool,
+    fail: u32,
+    status: u32,
+}
+
+fn dl_size_of[T: Any]() -> usize {
+    return size_of[T]()
+}
+
+fn progress_none(ud: u64, ev: u32, idx: u64, a: u64, b: u64) {
+}
+
+fn lock_take(p: *mut u64) {
+    while __atomic_swap(p, ZERO, ONE) != ZERO {
+        time.sleep_ms(1)
+    }
+}
+
+fn lock_drop(p: *mut u64) {
+    __atomic_swap(p, ONE, ZERO)
+}
+
+fn sub_u64(p: *mut u64, v: u64) {
+    __atomic_add(p, ZERO -% v)
+}
+
+fn item_at(m: *mut Mgr, i: usize) -> *mut Item {
+    return ((*m).items + (i * dl_size_of[Item]()) as u64) as *mut Item
+}
+
+fn arena_ptr(m: *mut Mgr, off: u32) -> u64 {
+    return (*m).arena.ptr + off as u64
+}
+
+// ------------------------------------------------------------- Lifecycle
+
+fn dl_new(workers: u64) -> Dl {
+    let sz: usize = dl_size_of[Mgr]()
+    let blk: u64 = rt.heap_alloc(sz)
+    if blk == 0 {
+        return Dl { p: 0 }
+    }
+    rt.mem_set(blk, 0 as u8, sz)
+    let m: *mut Mgr = blk as *mut Mgr
+    var w: u64 = workers
+    if w < 1 {
+        w = 1
+    }
+    if w > 32 {
+        w = 32
+    }
+    (*m).workers = w
+    (*m).retries = 4 as u32
+    (*m).flags = 0 as u32
+    (*m).backoff_base = 500
+    (*m).backoff_max = 30000
+    (*m).timeout_ms = 15000
+    (*m).rate = 0
+    (*m).arena = rt.buf_new()
+    (*m).pool = pool.Pool { blk: 0 }
+    (*m).cb = progress_none
+    (*m).items = 0
+    (*m).n = 0
+    (*m).cap = 0
+    // the slots: one per worker, each with its own HTTP client (made on use)
+    let ssz: usize = dl_size_of[Slot]()
+    (*m).slots = rt.heap_alloc(ssz * w as usize)
+    if (*m).slots == 0 {
+        rt.heap_free(blk, sz)
+        return Dl { p: 0 }
+    }
+    rt.mem_set((*m).slots, 0 as u8, ssz * w as usize)
+    (*m).nslots = w as usize
+    return Dl { p: blk }
+}
+
+// Waits for the work, then frees every client, the pool and all memory.
+fn dl_free(d: *mut Dl) {
+    if (*d).p == 0 {
+        return
+    }
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    if (*m).started {
+        dl_wait(d)
+        if (*m).pool.blk != 0 {
+            pool.shutdown(&(*m).pool)
+        }
+    }
+    var i: usize = 0
+    let ssz: usize = dl_size_of[Slot]()
+    while i < (*m).nslots {
+        let sl: *mut Slot = ((*m).slots + (i * ssz) as u64) as *mut Slot
+        if (*sl).client != 0 {
+            let c: *mut http.Client = (*sl).client as *mut http.Client
+            http.client_free(c)
+            rt.heap_free((*sl).client, dl_size_of[http.Client]())
+        }
+        i = i + 1
+    }
+    rt.heap_free((*m).slots, ssz * (*m).nslots)
+    if (*m).items != 0 {
+        rt.heap_free((*m).items, (*m).cap * dl_size_of[Item]())
+    }
+    rt.buf_free(&(*m).arena)
+    rt.heap_free((*d).p, dl_size_of[Mgr]())
+    (*d).p = 0
+}
+
+// ------------------------------------------------------------ Settings
+
+fn dl_set_retries(d: *mut Dl, attempts_per_url: u32) {
+    var n: u32 = attempts_per_url
+    if n < 1 as u32 {
+        n = 1 as u32
+    }
+    (*((*d).p as *mut Mgr)).retries = n
+}
+
+fn dl_set_backoff(d: *mut Dl, base_ms: u64, max_ms: u64) {
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    (*m).backoff_base = base_ms
+    (*m).backoff_max = max_ms
+}
+
+fn dl_set_timeout(d: *mut Dl, ms: u64) {
+    (*((*d).p as *mut Mgr)).timeout_ms = ms
+}
+
+// Octets per second for all workers together; 0 = unlimited.
+fn dl_set_rate(d: *mut Dl, bytes_per_s: u64) {
+    (*((*d).p as *mut Mgr)).rate = bytes_per_s
+}
+
+fn dl_set_flags(d: *mut Dl, flags: u32) {
+    (*((*d).p as *mut Mgr)).flags = flags
+}
+
+fn dl_set_progress(d: *mut Dl, f: fn(u64, u32, u64, u64, u64), ud: u64) {
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    (*m).cb = f
+    (*m).cb_ud = ud
+}
+
+fn dl_set_user_agent(d: *mut Dl, ua: str) {
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    var k: usize = ua.length()
+    if k > 96 {
+        k = 96
+    }
+    rt.mem_copy((&(*m).ua[0]) as u64, ua.p as u64, k)
+    (*m).nua = k
+}
+
+// ---------------------------------------------------------------- Items
+
+fn arena_put(m: *mut Mgr, s: str) -> i64 {
+    let off: usize = (*m).arena.len
+    rt.buf_push_bytes(&(*m).arena, s.p as u64, s.length())
+    if (*m).arena.len != off + s.length() {
+        return -1
+    }
+    return off as i64
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+// Adds a download; returns its index, or -1 (not started yet is required,
+// the URL/dest is empty, the digest is not hex of the right length, no memory).
+// `algo` is hashfile.HASH_NONE/MD5/SHA1/SHA256/SHA512, `want_hex` the digest
+// (either case) or "" with HASH_NONE; `size` the declared length, 0 = unknown.
+fn dl_add(d: *mut Dl, link: str, dest: str, algo: u32, want_hex: str,
+    size: u64) -> i64 {
+    if (*d).p == 0 {
+        return -1
+    }
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    if (*m).started || link.length() == 0 || dest.length() == 0 {
+        return -1
+    }
+    var hl: usize = 0
+    if algo != hashfile.HASH_NONE {
+        hl = hashfile.hash_len(algo)
+        if hl == 0 || want_hex.length() != hl * 2 {
+            return -1
+        }
+        var k: usize = 0
+        while k < want_hex.length() {
+            let c: u8 = want_hex.chars(k)
+            let ok: bool = (c >= 48 as u8 && c <= 57 as u8) ||
+            (c >= 97 as u8 && c <= 102 as u8) || (c >= 65 as u8 && c <= 70 as u8)
+            if !ok {
+                return -1
+            }
+            k = k + 1
+        }
+    }
+    if (*m).n == (*m).cap {
+        var nc: usize = (*m).cap * 2
+        if nc < 64 {
+            nc = 64
+        }
+        let isz: usize = dl_size_of[Item]()
+        let nb: u64 = rt.heap_alloc(nc * isz)
+        if nb == 0 {
+            return -1
+        }
+        if (*m).items != 0 {
+            rt.mem_copy(nb, (*m).items, (*m).n * isz)
+            rt.heap_free((*m).items, (*m).cap * isz)
+        }
+        (*m).items = nb
+        (*m).cap = nc
+    }
+    let uo: i64 = arena_put(m, link)
+    let dn: i64 = arena_put(m, dest)
+    if uo < 0 || dn < 0 {
+        return -1
+    }
+    let idx: usize = (*m).n
+    let it: *mut Item = item_at(m, idx)
+    rt.mem_set(it as u64, 0 as u8, dl_size_of[Item]())
+    (*it).mgr = (*d).p
+    (*it).idx = idx as u64
+    (*it).nurls = 1 as u32
+    (*it).url_off[0] = uo as u32
+    (*it).url_len[0] = link.length() as u32
+    (*it).dest_off = dn as u32
+    (*it).dest_len = dest.length() as u32
+    (*it).algo = algo
+    (*it).hexlen = hl as u32 * 2 as u32
+    var k2: usize = 0
+    while k2 < hl * 2 {
+        (*it).want[k2] = lower(want_hex.chars(k2))
+        k2 = k2 + 1
+    }
+    (*it).size = size
+    (*it).flags = (*m).flags
+    (*it).mode = 0 as u32
+    (*m).n = idx + 1
+    return idx as i64
+}
+
+// A fallback URL for item `idx` (at most DL_MAX_URLS in all).
+fn dl_add_mirror(d: *mut Dl, idx: i64, link: str) -> bool {
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    if (*d).p == 0 || (*m).started || idx < 0 || idx as usize >= (*m).n ||
+    link.length() == 0 {
+        return false
+    }
+    let it: *mut Item = item_at(m, idx as usize)
+    if (*it).nurls as usize >= DL_MAX_URLS {
+        return false
+    }
+    let uo: i64 = arena_put(m, link)
+    if uo < 0 {
+        return false
+    }
+    let k: usize = (*it).nurls as usize
+    (*it).url_off[k] = uo as u32
+    (*it).url_len[k] = link.length() as u32
+    (*it).nurls = (*it).nurls + 1 as u32
+    return true
+}
+
+// Validators the caller knows from an earlier run (ETag as sent, with its
+// quotes; Last-Modified as an HTTP date). "" = none.
+fn dl_set_validators(d: *mut Dl, idx: i64, etag: str, last_modified: str) -> bool {
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    if (*d).p == 0 || (*m).started || idx < 0 || idx as usize >= (*m).n {
+        return false
+    }
+    let it: *mut Item = item_at(m, idx as usize)
+    if etag.length() > ETAG_MAX || last_modified.length() > LM_MAX {
+        return false
+    }
+    if !header_value_ok(etag.p as u64, etag.length()) ||
+    !header_value_ok(last_modified.p as u64, last_modified.length()) {
+        return false
+    }
+    rt.mem_copy((&(*it).etag[0]) as u64, etag.p as u64, etag.length())
+    (*it).netag = etag.length()
+    rt.mem_copy((&(*it).lm[0]) as u64, last_modified.p as u64, last_modified.length())
+    (*it).nlm = last_modified.length()
+    return true
+}
+
+fn dl_set_item_flags(d: *mut Dl, idx: i64, flags: u32) -> bool {
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    if (*d).p == 0 || (*m).started || idx < 0 || idx as usize >= (*m).n {
+        return false
+    }
+    (*item_at(m, idx as usize)).flags = flags
+    return true
+}
+
+// Permission bits for the finished file (Linux; 0 = leave the default).
+fn dl_set_item_mode(d: *mut Dl, idx: i64, mode: u32) -> bool {
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    if (*d).p == 0 || (*m).started || idx < 0 || idx as usize >= (*m).n {
+        return false
+    }
+    (*item_at(m, idx as usize)).mode = mode
+    return true
+}
+
+// No CR, LF or NUL: a value that goes into a request header.
+fn header_value_ok(p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 13 as u8 || c == 10 as u8 || c == 0 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// --------------------------------------------------------------- Running
+
+// Starts the workers and queues every item; returns at once (on Windows
+// after everything is done, see D2). False when nothing could be started.
+fn dl_start(d: *mut Dl) -> bool {
+    if (*d).p == 0 {
+        return false
+    }
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    if (*m).started {
+        return false
+    }
+    (*m).started = true
+    let n: u64 = (*m).n as u64
+    for_totals(m)
+    (*m).pool = pool.pool_new((*m).workers, n + 1)
+    if (*m).pool.blk == 0 {
+        (*m).started = false
+        return false
+    }
+    var i: usize = 0
+    while i < (*m).n {
+        let j: u64 = pool.submit(&(*m).pool, dl_job, item_at(m, i) as u64)
+        if j == 0 {
+            (*item_at(m, i)).state = DL_FAILED
+            (*item_at(m, i)).err = DE_NOMEM
+            __atomic_add(&(*m).files_failed, ONE)
+            __atomic_add(&(*m).files_final, ONE)
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The declared sizes are the first guess of the total.
+fn for_totals(m: *mut Mgr) {
+    var i: usize = 0
+    while i < (*m).n {
+        let it: *mut Item = item_at(m, i)
+        if (*it).size > 0 {
+            (*it).size_counted = (*it).size
+            (*m).bytes_total = (*m).bytes_total + (*it).size
+        }
+        i = i + 1
+    }
+}
+
+// Waits until every item is final.
+fn dl_wait(d: *mut Dl) {
+    if (*d).p == 0 {
+        return
+    }
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    if !(*m).started || (*m).inline_run {
+        return
+    }
+    pool.wait_idle(&(*m).pool)
+}
+
+// start + wait; the answer is the number of items that did not end in
+// DL_OK/DL_SKIPPED/DL_NOT_MODIFIED. -1 when it could not start.
+fn dl_run(d: *mut Dl) -> i64 {
+    if !dl_start(d) {
+        return -1
+    }
+    dl_wait(d)
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    return ((*m).n as u64 - (*m).files_done) as i64
+}
+
+// One item after the other on THIS thread, no pool and no
+// `__thread_work` needed. Same answer as `dl_run`.
+fn dl_run_inline(d: *mut Dl) -> i64 {
+    if (*d).p == 0 {
+        return -1
+    }
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    if (*m).started {
+        return -1
+    }
+    (*m).started = true
+    (*m).inline_run = true
+    for_totals(m)
+    var i: usize = 0
+    while i < (*m).n {
+        dl_job(item_at(m, i) as u64)
+        i = i + 1
+    }
+    return ((*m).n as u64 - (*m).files_done) as i64
+}
+
+// Stops: queued items end as DL_CANCELLED without a request, running ones
+// after the next chunk. Parts stay on disk.
+fn dl_cancel(d: *mut Dl) {
+    if (*d).p == 0 {
+        return
+    }
+    (*((*d).p as *mut Mgr)).cancel = 1
+}
+
+fn dl_finished(d: *mut Dl) -> bool {
+    if (*d).p == 0 {
+        return true
+    }
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    return (*m).started && (*m).files_final >= (*m).n as u64
+}
+
+// ------------------------------------------------------------- Statistics
+
+fn dl_count(d: *mut Dl) -> usize { return (*((*d).p as *mut Mgr)).n }
+fn dl_files_total(d: *mut Dl) -> u64 { return (*((*d).p as *mut Mgr)).n as u64 }
+// ok + skipped + not modified
+fn dl_files_done(d: *mut Dl) -> u64 { return (*((*d).p as *mut Mgr)).files_done }
+fn dl_files_failed(d: *mut Dl) -> u64 { return (*((*d).p as *mut Mgr)).files_failed }
+fn dl_files_skipped(d: *mut Dl) -> u64 { return (*((*d).p as *mut Mgr)).files_skipped }
+// octets that count towards completion: written to a part (resumed octets
+// included) plus the size of files that were already there
+fn dl_bytes_done(d: *mut Dl) -> u64 { return (*((*d).p as *mut Mgr)).bytes_done }
+// declared sizes, plus lengths the servers announced for items declared 0
+fn dl_bytes_total(d: *mut Dl) -> u64 { return (*((*d).p as *mut Mgr)).bytes_total }
+// octets that really came over the network in this run
+fn dl_bytes_wire(d: *mut Dl) -> u64 { return (*((*d).p as *mut Mgr)).bytes_wire }
+fn dl_retries_used(d: *mut Dl) -> u64 { return (*((*d).p as *mut Mgr)).retries_used }
+
+// sockets opened / requests sent / requests that found a connection open,
+// over all workers (read after dl_wait)
+fn dl_sockets(d: *mut Dl) -> u64 { return sum_clients(d, 0) }
+fn dl_requests(d: *mut Dl) -> u64 { return sum_clients(d, 1) }
+fn dl_reused(d: *mut Dl) -> u64 { return sum_clients(d, 2) }
+
+fn sum_clients(d: *mut Dl, what: u32) -> u64 {
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    var tot: u64 = 0
+    var i: usize = 0
+    let ssz: usize = dl_size_of[Slot]()
+    while i < (*m).nslots {
+        let sl: *mut Slot = ((*m).slots + (i * ssz) as u64) as *mut Slot
+        if (*sl).client != 0 {
+            let c: *mut http.Client = (*sl).client as *mut http.Client
+            if what == 0 as u32 {
+                tot = tot + http.client_sockets(c)
+            } else if what == 1 as u32 {
+                tot = tot + http.client_requests(c)
+            } else {
+                tot = tot + http.client_reused(c)
+            }
+        }
+        i = i + 1
+    }
+    return tot
+}
+
+fn dl_item_state(d: *mut Dl, i: usize) -> u64 { return (*item_at((*d).p as *mut Mgr, i)).state }
+fn dl_item_error(d: *mut Dl, i: usize) -> u32 { return (*item_at((*d).p as *mut Mgr, i)).err }
+fn dl_item_http(d: *mut Dl, i: usize) -> u32 { return (*item_at((*d).p as *mut Mgr, i)).http_status }
+// the net.http error number (http.err_num) of the last network failure
+fn dl_item_net_error(d: *mut Dl, i: usize) -> u32 { return (*item_at((*d).p as *mut Mgr, i)).net_err }
+fn dl_item_attempts(d: *mut Dl, i: usize) -> u32 { return (*item_at((*d).p as *mut Mgr, i)).attempts }
+fn dl_item_done(d: *mut Dl, i: usize) -> u64 { return (*item_at((*d).p as *mut Mgr, i)).done }
+fn dl_item_total(d: *mut Dl, i: usize) -> u64 { return (*item_at((*d).p as *mut Mgr, i)).total }
+
+// The URL of item `i`, `k`-th (0 = primary), as a str view into the manager
+// (valid until dl_free).
+fn dl_item_url(d: *mut Dl, i: usize, k: usize) -> str {
+    let m: *mut Mgr = (*d).p as *mut Mgr
+    let it: *mut Item = item_at(m, i)
+    if k >= (*it).nurls as usize {
+        return ""
+    }
+    return str { p: rt.ptr_of(arena_ptr(m, (*it).url_off[k])),
+        n: (*it).url_len[k] as usize }
+}
+
+// The validators the server gave for the file last downloaded (or the ones
+// set by the caller), for the next run's `dl_set_validators`.
+fn dl_item_etag(d: *mut Dl, i: usize) -> str {
+    let it: *mut Item = item_at((*d).p as *mut Mgr, i)
+    return str { p: rt.ptr_of((&(*it).etag[0]) as u64), n: (*it).netag }
+}
+
+fn dl_item_last_modified(d: *mut Dl, i: usize) -> str {
+    let it: *mut Item = item_at((*d).p as *mut Mgr, i)
+    return str { p: rt.ptr_of((&(*it).lm[0]) as u64), n: (*it).nlm }
+}
+
+// ------------------------------------------------------------- Backoff
+
+// The delay before retry number `round` (1 = the first retry), in ms:
+// base * 2^(round-1), capped, then jittered by -25 % .. +25 % with `seed`.
+fn dl_backoff_ms(base: u64, cap: u64, round: u32, seed: u64) -> u64 {
+    if round == 0 as u32 || base == 0 {
+        return 0
+    }
+    var d: u64 = base
+    var k: u32 = 1 as u32
+    while k < round && d < cap {
+        d = d * 2
+        k = k + 1 as u32
+    }
+    if d > cap {
+        d = cap
+    }
+    // jitter in quarters: seed mixed by an LCG step
+    let x: u64 = seed *% 6364136223846793005 as u64 +% 1442695040888963407 as u64
+    let r: u64 = (x >> 33) % 501 // 0..500
+    // d * (750 + r) / 1000  =  0.75 d .. 1.25 d
+    var j: u64 = d / 1000 * (750 + r) + (d % 1000) * (750 + r) / 1000
+    if j > cap {
+        j = cap
+    }
+    return j
+}
+
+// --------------------------------------------------------------- Helpers
+
+fn hash_origin(host: u64, nh: usize, port: u16, secure: bool) -> u64 {
+    var h: u64 = 14695981039346656037 as u64
+    var i: usize = 0
+    while i < nh {
+        h = (h ^ lower(rt.ld8(host, i)) as u64) *% 1099511628211 as u64
+        i = i + 1
+    }
+    h = (h ^ port as u64) *% 1099511628211 as u64
+    if secure {
+        h = (h ^ 1 as u64) *% 1099511628211 as u64
+    }
+    return h
+}
+
+fn emit(m: *mut Mgr, ev: u32, idx: u64, a: u64, b: u64) {
+    lock_take(&(*m).cb_lock)
+    (*m).cb((*m).cb_ud, ev, idx, a, b)
+    lock_drop(&(*m).cb_lock)
+}
+
+// Sleeps `ms` in slices of 25 ms; false when the manager was cancelled.
+fn nap(m: *mut Mgr, ms: u64) -> bool {
+    var left: u64 = ms
+    while left > 0 {
+        if (*m).cancel != 0 {
+            return false
+        }
+        var s: u64 = 25
+        if left < s {
+            s = left
+        }
+        time.sleep_ms(s)
+        left = left - s
+    }
+    return (*m).cancel == 0
+}
+
+// The shared token bucket: `n` octets were just received; waits so that
+// the average over all workers stays under `rate`.
+fn throttle(m: *mut Mgr, n: usize) {
+    let rate: u64 = (*m).rate
+    if rate == 0 {
+        return
+    }
+    let cost: u64 = (n as u64) * 1000000000 / rate
+    let now: u64 = time.monotonic_ns()
+    lock_take(&(*m).rl_lock)
+    var t: u64 = (*m).rl_t
+    // at most 100 ms of credit may pile up while nobody downloads
+    if t + 100000000 < now {
+        t = now - 100000000
+    }
+    t = t + cost
+    (*m).rl_t = t
+    lock_drop(&(*m).rl_lock)
+    if t > now {
+        nap(m, (t - now) / 1000000)
+    }
+}
+
+fn parse_u64(p: u64, n: usize, ok: *mut bool) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    *ok = false
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            break
+        }
+        let nv: u64 = v * 10 + (c - 48 as u8) as u64
+        if nv < v || v > 1844674407370955160 as u64 {
+            *ok = false
+            return 0
+        }
+        v = nv
+        *ok = true
+        i = i + 1
+    }
+    return v
+}
+
+fn push_lit(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+fn path_str(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn dest_str(m: *mut Mgr, it: *mut Item) -> str {
+    return str { p: rt.ptr_of(arena_ptr(m, (*it).dest_off)), n: (*it).dest_len as usize }
+}
+
+// `<dest><suffix>` into `b`
+fn path_with(m: *mut Mgr, it: *mut Item, suffix: str, b: *mut rt.Buf) {
+    rt.buf_clear(b)
+    rt.buf_push_bytes(b, arena_ptr(m, (*it).dest_off), (*it).dest_len as usize)
+    rt.buf_push_bytes(b, suffix.p as u64, suffix.length())
+}
+
+fn stat_fail(out: *mut i64) -> fs.FileInfo {
+    *out = -1
+    return fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0 as u64, mtime_ns: 0 }
+}
+
+// size of a regular file, -1 when absent or not a file
+fn file_size(path: str) -> i64 {
+    var out: i64 = 0
+    let info: fs.FileInfo = fs.stat(path) catch | e | stat_fail(&out)
+    if out < 0 {
+        return -1
+    }
+    if info.kind != fs.KIND_FILE {
+        return -1
+    }
+    return info.size as i64
+}
+
+fn remove_quiet(path: str) {
+    let ok: bool = fs.remove(path) catch false
+}
+
+// ----------------------------------------------------------- The sidecar
+//
+// `<dest>.dlmeta`: three lines -- ETag, Last-Modified, total length.
+
+fn meta_write(m: *mut Mgr, it: *mut Item) {
+    var pb: rt.Buf = rt.buf_new()
+    path_with(m, it, ".dlmeta", &pb)
+    var body: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&body, (&(*it).etag[0]) as u64, (*it).netag)
+    rt.buf_push(&body, 10 as u8)
+    rt.buf_push_bytes(&body, (&(*it).lm[0]) as u64, (*it).nlm)
+    rt.buf_push(&body, 10 as u8)
+    rt.buf_push_dec_u64(&body, (*it).total)
+    rt.buf_push(&body, 10 as u8)
+    let ok: bool = fs.write_atomic(path_str(&pb), body.ptr, body.len) catch false
+    rt.buf_free(&body)
+    rt.buf_free(&pb)
+}
+
+// Fills the validators of `it` from the sidecar unless the caller set them.
+fn meta_read(m: *mut Mgr, it: *mut Item) {
+    if (*it).netag > 0 || (*it).nlm > 0 {
+        return
+    }
+    var pb: rt.Buf = rt.buf_new()
+    path_with(m, it, ".dlmeta", &pb)
+    var body: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(path_str(&pb), &body) catch 0
+    rt.buf_free(&pb)
+    if n > 0 && n < 1024 {
+        // line 1 and line 2
+        var l1: usize = 0
+        while l1 < n && rt.ld8(body.ptr, l1) != 10 as u8 {
+            l1 = l1 + 1
+        }
+        var l2: usize = l1 + 1
+        while l2 < n && rt.ld8(body.ptr, l2) != 10 as u8 {
+            l2 = l2 + 1
+        }
+        if l1 < n && l2 < n && l1 <= ETAG_MAX && l2 - l1 - 1 <= LM_MAX &&
+        header_value_ok(body.ptr, l1) {
+            rt.mem_copy((&(*it).etag[0]) as u64, body.ptr, l1)
+            (*it).netag = l1
+            rt.mem_copy((&(*it).lm[0]) as u64, body.ptr + (l1 + 1) as u64, l2 - l1 - 1)
+            (*it).nlm = l2 - l1 - 1
+        }
+    }
+    rt.buf_free(&body)
+}
+
+// ----------------------------------------------------------- The sink
+
+fn count_done(m: *mut Mgr, it: *mut Item, newdone: u64) {
+    // keep the manager's total equal to the sum of what the items contribute
+    if newdone >= (*it).counted {
+        __atomic_add(&(*m).bytes_done, newdone - (*it).counted)
+    } else {
+        sub_u64(&(*m).bytes_done, (*it).counted - newdone)
+    }
+    (*it).counted = newdone
+    (*it).done = newdone
+}
+
+fn set_total(m: *mut Mgr, it: *mut Item, total: u64) {
+    (*it).total = total
+    if (*it).size == 0 && total > (*it).size_counted {
+        __atomic_add(&(*m).bytes_total, total - (*it).size_counted)
+        (*it).size_counted = total
+    }
+}
+
+// The Content-Range "bytes S-E/T": S in `start`, T in `total` (0 = "*").
+fn parse_content_range(r: *mut http.Response, start: *mut u64, total: *mut u64) -> bool {
+    var name: [u8; 13] = "Content-Range"
+    var at: u64 = 0
+    let n: usize = http.resp_header(r, (&name[0]) as u64, 13, &at)
+    if n < 8 {
+        return false
+    }
+    // "bytes "
+    var i: usize = 0
+    while i < n && rt.ld8(at, i) != 32 as u8 {
+        i = i + 1
+    }
+    i = i + 1
+    var ok: bool = false
+    let s: u64 = parse_u64(at + i as u64, n - i, &ok)
+    if !ok {
+        return false
+    }
+    *start = s
+    while i < n && rt.ld8(at, i) != 47 as u8 {
+        i = i + 1
+    }
+    i = i + 1
+    var ok2: bool = false
+    let t: u64 = parse_u64(at + i as u64, n - i, &ok2)
+    if ok2 {
+        *total = t
+    } else {
+        *total = 0
+    }
+    return true
+}
+
+fn keep_header(r: *mut http.Response, name: str, dst: u64, max: usize, out_n: *mut usize) {
+    var at: u64 = 0
+    let n: usize = http.resp_header(r, name.p as u64, name.length(), &at)
+    if n > 0 && n <= max && header_value_ok(at, n) {
+        rt.mem_copy(dst, at, n)
+        *out_n = n
+    }
+}
+
+fn ctx_close_fd(cx: *mut Ctx) {
+    if (*cx).fd >= 0 {
+        fs.close_fd((*cx).fd)
+        (*cx).fd = -1
+    }
+}
+
+// The head of a 200/206 is known: decide where the data goes.
+fn sink_begin(cx: *mut Ctx) -> bool {
+    let m: *mut Mgr = (*cx).m
+    let it: *mut Item = (*cx).it
+    let status: u32 = http.client_body_status((*cx).cl)
+    let clen: u64 = http.client_body_clen((*cx).cl)
+    (*cx).status = status
+    var total: u64 = 0
+    var resume_at: u64 = 0
+    if status == 206 as u32 {
+        var s: u64 = 0
+        var t: u64 = 0
+        if (*cx).have == 0 || !parse_content_range((*cx).resp, &s, &t) || s != (*cx).have {
+            (*cx).fail = F_RANGE
+            return false
+        }
+        resume_at = s
+        total = t
+        if total == 0 && clen != NO_LEN {
+            total = resume_at + clen
+        }
+    } else {
+        // a whole body: whatever the part held is void
+        if clen != NO_LEN {
+            total = clen
+        }
+        if (*cx).have > 0 {
+            (*cx).hasher = hashfile.hasher_new((*it).algo)
+            (*cx).have = 0
+        }
+    }
+    if (*it).size > 0 && total > 0 && total != (*it).size {
+        (*cx).fail = F_SIZE
+        return false
+    }
+    (*cx).total = total
+    if total > 0 {
+        set_total(m, it, total)
+    }
+    // validators for the next run, and for If-Range after a break
+    if status != 206 as u32 {
+        (*it).netag = 0
+        (*it).nlm = 0
+    }
+    keep_header((*cx).resp, "ETag", (&(*it).etag[0]) as u64, ETAG_MAX, &(*it).netag)
+    keep_header((*cx).resp, "Last-Modified", (&(*it).lm[0]) as u64, LM_MAX, &(*it).nlm)
+    // open the part
+    if status == 206 as u32 {
+        (*cx).fd = fs.open_append(path_str(&(*cx).part)) catch -1
+    } else {
+        (*cx).fd = fs.open_truncate(path_str(&(*cx).part)) catch -1
+    }
+    if (*cx).fd < 0 {
+        (*cx).fail = F_DISK
+        return false
+    }
+    (*cx).written = (*cx).have
+    count_done(m, it, (*cx).written)
+    if ((*it).flags & DL_META) != 0 as u32 {
+        (*it).total = total
+        meta_write(m, it)
+    }
+    (*cx).began = true
+    return true
+}
+
+fn dl_sink(ud: u64, p: u64, n: usize) -> bool {
+    let cx: *mut Ctx = ud as *mut Ctx
+    if n == 0 {
+        return sink_begin(cx)
+    }
+    let m: *mut Mgr = (*cx).m
+    let it: *mut Item = (*cx).it
+    if (*m).cancel != 0 {
+        (*cx).fail = F_CANCEL
+        return false
+    }
+    let ok: bool = fs.write_fd_all((*cx).fd, p, n) catch false
+    if !ok {
+        (*cx).fail = F_DISK
+        return false
+    }
+    hashfile.hasher_update(&(*cx).hasher, p, n)
+    (*cx).written = (*cx).written + n as u64
+    if (*it).size > 0 && (*cx).written > (*it).size {
+        (*cx).fail = F_SIZE
+        return false
+    }
+    __atomic_add(&(*m).bytes_wire, n as u64)
+    count_done(m, it, (*cx).written)
+    let now: u64 = time.monotonic_ns()
+    if now - (*it).last_report >= PROGRESS_NS {
+        (*it).last_report = now
+        emit(m, EV_PROGRESS, (*it).idx, (*cx).written, (*cx).total)
+    }
+    throttle(m, n)
+    return true
+}
+
+// -------------------------------------------------- The client of a slot
+
+fn grab_slot(m: *mut Mgr, hh: u64) -> *mut Slot {
+    let ssz: usize = dl_size_of[Slot]()
+    while true {
+        // first choice: a free slot whose connection already goes there
+        var i: usize = 0
+        while i < (*m).nslots {
+            let sl: *mut Slot = ((*m).slots + (i * ssz) as u64) as *mut Slot
+            if (*sl).lock == ZERO && (*sl).client != 0 && (*sl).host_h == hh {
+                if __atomic_swap(&(*sl).lock, ZERO, ONE) == ZERO {
+                    return sl
+                }
+            }
+            i = i + 1
+        }
+        // second: any free slot
+        i = 0
+        while i < (*m).nslots {
+            let sl: *mut Slot = ((*m).slots + (i * ssz) as u64) as *mut Slot
+            if (*sl).lock == ZERO {
+                if __atomic_swap(&(*sl).lock, ZERO, ONE) == ZERO {
+                    return sl
+                }
+            }
+            i = i + 1
+        }
+        time.sleep_ms(1)
+    }
+    return 0 as *mut Slot
+}
+
+fn slot_client(m: *mut Mgr, sl: *mut Slot) -> *mut http.Client {
+    if (*sl).client == 0 {
+        let sz: usize = dl_size_of[http.Client]()
+        let blk: u64 = rt.heap_alloc(sz)
+        if blk == 0 {
+            return 0 as *mut http.Client
+        }
+        *(blk as *mut http.Client) = http.client_new()
+        let c: *mut http.Client = blk as *mut http.Client
+        if !http.client_init(c) {
+            http.client_free(c)
+            rt.heap_free(blk, sz)
+            return 0 as *mut http.Client
+        }
+        http.client_set_gzip(c, false)
+        http.client_set_cache(c, false)
+        http.client_set_keepalive(c, true)
+        http.client_set_max_redirects(c, 10 as u32)
+        (*sl).client = blk
+    }
+    let c: *mut http.Client = (*sl).client as *mut http.Client
+    http.client_set_timeout(c, (*m).timeout_ms)
+    if (*m).nua > 0 {
+        http.client_set_user_agent(c, (&(*m).ua[0]) as u64, (*m).nua)
+    }
+    return c
+}
+
+fn release_slot(sl: *mut Slot, hh: u64) {
+    (*sl).host_h = hh
+    __atomic_swap(&(*sl).lock, ONE, ZERO)
+}
+
+// ------------------------------------------------------ Existing files
+
+// 1 = the file at dest is right (skip), 0 = no use
+fn existing_ok(m: *mut Mgr, it: *mut Item) -> bool {
+    if ((*it).flags & DL_FORCE) != 0 as u32 {
+        return false
+    }
+    let dest: str = dest_str(m, it)
+    let sz: i64 = file_size(dest)
+    if sz < 0 {
+        return false
+    }
+    if (*it).hexlen > 0 as u32 {
+        if ((*it).flags & DL_TRUST_SIZE) != 0 as u32 && (*it).size > 0 &&
+        sz as u64 == (*it).size {
+            return true
+        }
+        if (*it).size > 0 && sz as u64 != (*it).size {
+            return false
+        }
+        let want: str = str { p: rt.ptr_of((&(*it).want[0]) as u64), n: (*it).hexlen as usize }
+        let ok: bool = hashfile.verify_file_hex(dest, (*it).algo, want) catch false
+        return ok
+    }
+    if (*it).size > 0 {
+        return sz as u64 == (*it).size
+    }
+    return false
+}
+
+// Feeds the first `n` octets of the part into the hasher.
+fn hash_prefix(cx: *mut Ctx, n: u64) -> bool {
+    let fd: i64 = fs.open_read(path_str(&(*cx).part)) catch -1
+    if fd < 0 {
+        return false
+    }
+    let buf: u64 = rt.heap_alloc(IO_CHUNK)
+    if buf == 0 {
+        fs.close_fd(fd)
+        return false
+    }
+    var left: u64 = n
+    var ok: bool = true
+    while left > 0 && ok {
+        var want: usize = IO_CHUNK
+        if (want as u64) > left {
+            want = left as usize
+        }
+        let k: usize = fs.read_fd(fd, buf, want) catch 0
+        if k == 0 {
+            ok = false
+        } else {
+            hashfile.hasher_update(&(*cx).hasher, buf, k)
+            left = left - k as u64
+        }
+    }
+    rt.heap_free(buf, IO_CHUNK)
+    fs.close_fd(fd)
+    return ok
+}
+
+// Digest of the part compared with the wanted hex.
+fn digest_ok(cx: *mut Ctx) -> bool {
+    let it: *mut Item = (*cx).it
+    if (*it).hexlen == 0 as u32 {
+        return true
+    }
+    var dg: [u8; 64] = [0; 64]
+    hashfile.hasher_final(&(*cx).hasher, (&dg[0]) as u64)
+    var hex: rt.Buf = rt.buf_new()
+    hashfile.hex_encode((&dg[0]) as u64, hashfile.hash_len((*it).algo), &hex)
+    var same: bool = hex.len == (*it).hexlen as usize &&
+    rt.mem_eq(hex.ptr, (&(*it).want[0]) as u64, hex.len)
+    rt.buf_free(&hex)
+    return same
+}
+
+// fsync, rename over dest, chmod. false = disk trouble (the part stays).
+fn publish(cx: *mut Ctx) -> bool {
+    let m: *mut Mgr = (*cx).m
+    let it: *mut Item = (*cx).it
+    if (*cx).fd >= 0 {
+        if ((*it).flags & DL_NOSYNC) == 0 as u32 {
+            let s: bool = fs.sync_fd((*cx).fd) catch false
+            if !s {
+                ctx_close_fd(cx)
+                return false
+            }
+        }
+        ctx_close_fd(cx)
+    }
+    let dest: str = dest_str(m, it)
+    var tries: u32 = 0 as u32
+    var done: bool = false
+    while !done && tries < 20 as u32 {
+        done = fs.rename(path_str(&(*cx).part), dest) catch false
+        if !done {
+            tries = tries + 1 as u32
+            time.sleep_ms(100)
+        }
+    }
+    if !done {
+        return false
+    }
+    if (*it).mode != 0 as u32 {
+        let c: bool = fs.chmod(dest, (*it).mode) catch false
+    }
+    if ((*it).flags & DL_META) != 0 as u32 {
+        (*it).total = (*cx).written
+        meta_write(m, it)
+    }
+    return true
+}
+
+// ------------------------------------------------------------ One attempt
+
+// Builds the request headers into `hb`.
+fn build_headers(it: *mut Item, have: u64, hb: *mut rt.Buf) {
+    rt.buf_clear(hb)
+    if have > 0 {
+        // Range (+ If-Range with a strong validator)
+        push_lit(hb, "Range: bytes=")
+        rt.buf_push_dec_u64(hb, have)
+        push_lit(hb, "-\r\n")
+        let strong: bool = (*it).netag > 0 && !((*it).netag >= 2 &&
+        rt.ld8((&(*it).etag[0]) as u64, 0) == 87 as u8 &&
+        rt.ld8((&(*it).etag[0]) as u64, 1) == 47 as u8)
+        if strong {
+            push_lit(hb, "If-Range: ")
+            rt.buf_push_bytes(hb, (&(*it).etag[0]) as u64, (*it).netag)
+            push_lit(hb, "\r\n")
+        } else if (*it).nlm > 0 {
+            push_lit(hb, "If-Range: ")
+            rt.buf_push_bytes(hb, (&(*it).lm[0]) as u64, (*it).nlm)
+            push_lit(hb, "\r\n")
+        }
+    }
+}
+
+fn conditional_headers(it: *mut Item, hb: *mut rt.Buf) {
+    rt.buf_clear(hb)
+    if (*it).netag > 0 {
+        push_lit(hb, "If-None-Match: ")
+        rt.buf_push_bytes(hb, (&(*it).etag[0]) as u64, (*it).netag)
+        push_lit(hb, "\r\n")
+    }
+    if (*it).nlm > 0 {
+        push_lit(hb, "If-Modified-Since: ")
+        rt.buf_push_bytes(hb, (&(*it).lm[0]) as u64, (*it).nlm)
+        push_lit(hb, "\r\n")
+    }
+}
+
+// Retry-After in seconds -> ms (0 when absent or a date).
+fn retry_after(r: *mut http.Response) -> u64 {
+    var name: [u8; 11] = "Retry-After"
+    var at: u64 = 0
+    let n: usize = http.resp_header(r, (&name[0]) as u64, 11, &at)
+    if n == 0 {
+        return 0
+    }
+    var ok: bool = false
+    let s: u64 = parse_u64(at, n, &ok)
+    if !ok || s > 100000 {
+        return 0
+    }
+    return s * 1000
+}
+
+#[allow_escape]
+fn attempt(m: *mut Mgr, it: *mut Item, ui: usize, revalidate: bool) -> u32 {
+    (*it).retry_after_ms = 0
+    let upos: u64 = arena_ptr(m, (*it).url_off[ui])
+    let ulen: usize = (*it).url_len[ui] as usize
+    var u: url.Url = url.url_new()
+    if !url.url_parse(upos, ulen, &u) || !(url.url_is_http(&u) || url.url_is_https(&u)) {
+        (*it).err = DE_URL
+        return RC_DEAD
+    }
+    let hh: u64 = hash_origin(url.url_host_ptr(&u), url.url_host_len(&u),
+        url.url_port(&u), url.url_is_https(&u))
+    var rsp: http.Response = http.resp_new()
+    var cx: Ctx = Ctx {
+        m: m, it: it, cl: 0 as *mut http.Client, resp: &rsp,
+        part: rt.buf_new(), fd: -1, hasher: hashfile.hasher_new((*it).algo),
+        have: 0, written: 0, total: 0, began: false, fail: F_NONE, status: 0 as u32,
+    }
+    path_with(m, it, ".part", &cx.part)
+
+    // ---- what is on disk
+    let flags: u32 = (*it).flags
+    if (flags & DL_FORCE) != 0 as u32 {
+        remove_quiet(path_str(&cx.part))
+    }
+    var have: u64 = 0
+    let psz: i64 = file_size(path_str(&cx.part))
+    if psz > 0 && (flags & DL_NORESUME) == 0 as u32 {
+        meta_read(m, it)
+        let validator: bool = (*it).hexlen > 0 as u32 || (*it).nlm > 0 ||
+        ((*it).netag > 0 && !((*it).netag >= 2 &&
+        rt.ld8((&(*it).etag[0]) as u64, 0) == 87 as u8))
+        if validator && !((*it).size > 0 && psz as u64 > (*it).size) {
+            have = psz as u64
+        } else {
+            remove_quiet(path_str(&cx.part))
+        }
+    } else if psz >= 0 {
+        remove_quiet(path_str(&cx.part))
+    }
+    (*it).done = 0
+    if have > 0 {
+        if !hash_prefix(&cx, have) {
+            remove_quiet(path_str(&cx.part))
+            have = 0
+            cx.hasher = hashfile.hasher_new((*it).algo)
+        }
+    }
+    cx.have = have
+    count_done(m, it, have)
+    // a complete part that was never renamed: no request needed
+    if have > 0 && (*it).size > 0 && have == (*it).size {
+        cx.written = have
+        cx.total = have
+        var rc0: u32 = RC_OK
+        if !digest_ok(&cx) {
+            remove_quiet(path_str(&cx.part))
+            count_done(m, it, 0)
+            (*it).err = DE_HASH
+            rc0 = RC_RETRY
+        } else if !publish(&cx) {
+            (*it).err = DE_DISK
+            rc0 = RC_DISK
+        }
+        rt.buf_free(&cx.part)
+        http.resp_free(&rsp)
+        return rc0
+    }
+
+    // ---- the request
+    let sl: *mut Slot = grab_slot(m, hh)
+    let cl: *mut http.Client = slot_client(m, sl)
+    if cl == 0 as *mut http.Client {
+        release_slot(sl, 0)
+        (*it).err = DE_NOMEM
+        rt.buf_free(&cx.part)
+        http.resp_free(&rsp)
+        return RC_DISK
+    }
+    cx.cl = cl
+    var hb: rt.Buf = rt.buf_new()
+    if revalidate && have == 0 {
+        conditional_headers(it, &hb)
+    } else {
+        build_headers(it, have, &hb)
+    }
+    http.client_set_headers(cl, hb.ptr, hb.len)
+    rt.buf_free(&hb)
+    http.client_set_sink(cl, dl_sink, (&cx) as u64)
+
+    let nerr: u32 = http.http_get_num(cl, upos, ulen, &rsp)
+    let got: bool = nerr == 0 as u32
+    http.client_clear_sink(cl)
+    http.client_clear_headers(cl)
+    var rc: u32 = RC_OK
+    let status: u32 = http.resp_status(&rsp)
+    if !got {
+        // the connection's state is unknown after any failure
+        http.client_close(cl)
+        ctx_close_fd(&cx)
+        if cx.fail == F_CANCEL || (*m).cancel != 0 {
+            (*it).err = DE_CANCEL
+            rc = RC_CANCEL
+        } else if cx.fail == F_DISK {
+            (*it).err = DE_DISK
+            rc = RC_DISK
+        } else if cx.fail == F_SIZE {
+            remove_quiet(path_str(&cx.part))
+            count_done(m, it, 0)
+            (*it).err = DE_SIZE
+            rc = RC_RETRY
+        } else if cx.fail == F_RANGE {
+            remove_quiet(path_str(&cx.part))
+            count_done(m, it, 0)
+            (*it).err = DE_RANGE
+            rc = RC_RETRY_NOW
+        } else {
+            (*it).err = DE_NET
+            (*it).net_err = nerr
+            rc = RC_RETRY
+            if nerr == NE_URL || nerr == NE_SCHEME {
+                rc = RC_DEAD
+            }
+        }
+    } else if cx.began {
+        // 200/206 streamed into the part
+        if (*it).size > 0 && cx.written != (*it).size {
+            ctx_close_fd(&cx)
+            remove_quiet(path_str(&cx.part))
+            count_done(m, it, 0)
+            (*it).err = DE_SIZE
+            rc = RC_RETRY
+        } else if !digest_ok(&cx) {
+            ctx_close_fd(&cx)
+            remove_quiet(path_str(&cx.part))
+            count_done(m, it, 0)
+            (*it).err = DE_HASH
+            rc = RC_RETRY
+        } else if !publish(&cx) {
+            ctx_close_fd(&cx)
+            (*it).err = DE_DISK
+            rc = RC_DISK
+        } else {
+            count_done(m, it, cx.written)
+            (*it).total = cx.written
+        }
+    } else if status == 304 as u32 {
+        rc = RC_NOTMOD
+    } else if status == 416 as u32 {
+        // the range does not fit: the part is useless (or already whole)
+        remove_quiet(path_str(&cx.part))
+        count_done(m, it, 0)
+        (*it).http_status = status
+        (*it).err = DE_HTTP
+        rc = RC_RETRY_NOW
+    } else {
+        (*it).http_status = status
+        (*it).err = DE_HTTP
+        if status == 408 as u32 || status == 429 as u32 || status >= 500 as u32 {
+            (*it).retry_after_ms = retry_after(&rsp)
+            rc = RC_RETRY
+        } else {
+            rc = RC_DEAD
+        }
+    }
+    // a response whose body was not read to its end poisons the connection
+    if rc != RC_OK && rc != RC_NOTMOD {
+        http.client_close(cl)
+    }
+    release_slot(sl, hh)
+    rt.buf_free(&cx.part)
+    http.resp_free(&rsp)
+    return rc
+}
+
+// ---------------------------------------------------------------- The job
+
+fn finish(m: *mut Mgr, it: *mut Item, state: u64) {
+    (*it).state = state
+    if state == DL_OK || state == DL_SKIPPED || state == DL_NOT_MODIFIED {
+        (*it).err = DE_NONE
+        __atomic_add(&(*m).files_done, ONE)
+        if state != DL_OK {
+            __atomic_add(&(*m).files_skipped, ONE)
+        }
+    } else {
+        __atomic_add(&(*m).files_failed, ONE)
+    }
+    emit(m, EV_DONE, (*it).idx, state, (*it).err as u64)
+    __atomic_add(&(*m).files_final, ONE)
+}
+
+// The next mirror at or after `from` that is not retired; -1 if none.
+fn next_alive(it: *mut Item, from: usize) -> i64 {
+    var k: usize = 0
+    let n: usize = (*it).nurls as usize
+    while k < n {
+        let u: usize = (from + k) % n
+        if ((*it).dead & (1 as u32 << u as u32)) == 0 as u32 {
+            return u as i64
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+fn dl_job(arg: u64) -> u64 {
+    let it: *mut Item = arg as *mut Item
+    let m: *mut Mgr = (*it).mgr as *mut Mgr
+    if (*m).cancel != 0 {
+        (*it).err = DE_CANCEL
+        finish(m, it, DL_CANCELLED)
+        return 0
+    }
+    (*it).state = DL_RUNNING
+    emit(m, EV_START, (*it).idx, (*it).size, 0)
+
+    // the directory
+    let dest: str = dest_str(m, it)
+    let parent: str = fs.path_parent(dest)
+    if parent.length() > 0 {
+        let okd: bool = fs.mkdir_all(parent) catch false
+        if !okd && !fs.is_dir(parent) {
+            (*it).err = DE_DISK
+            finish(m, it, DL_FAILED)
+            return 0
+        }
+    }
+    // already there?
+    if existing_ok(m, it) {
+        let sz: i64 = file_size(dest)
+        count_done(m, it, sz as u64)
+        if (*it).size == 0 {
+            set_total(m, it, sz as u64)
+        }
+        (*it).total = sz as u64
+        finish(m, it, DL_SKIPPED)
+        return 0
+    }
+    // no digest, no size, a known validator and a file: ask if it changed
+    var revalidate: bool = false
+    if (*it).hexlen == 0 as u32 && (*it).size == 0 && ((*it).flags & DL_FORCE) == 0 as u32 &&
+    file_size(dest) >= 0 {
+        meta_read(m, it)
+        if (*it).netag > 0 || (*it).nlm > 0 {
+            revalidate = true
+        }
+    }
+
+    let per: u32 = (*m).retries
+    let total_attempts: u32 = per * (*it).nurls
+    var a: u32 = 0 as u32
+    var ui: usize = 0
+    var final_state: u64 = DL_FAILED
+    var running: bool = true
+    while running && a < total_attempts {
+        if (*m).cancel != 0 {
+            (*it).err = DE_CANCEL
+            final_state = DL_CANCELLED
+            break
+        }
+        let alive: i64 = next_alive(it, a as usize % (*it).nurls as usize)
+        if alive < 0 {
+            break // every mirror is retired; (*it).err says why
+        }
+        ui = alive as usize
+        if a > 0 as u32 {
+            // back at the first mirror (or the only one): the backoff;
+            // the next mirror of a round costs nothing
+            var delay: u64 = 0
+            if a % (*it).nurls == 0 as u32 {
+                delay = dl_backoff_ms((*m).backoff_base, (*m).backoff_max,
+                    a / (*it).nurls, time.monotonic_ns() ^ ((*it).idx * 2654435761 as u64))
+            }
+            if (*it).retry_after_ms > delay {
+                delay = (*it).retry_after_ms
+                if delay > (*m).backoff_max {
+                    delay = (*m).backoff_max
+                }
+            }
+            emit(m, EV_RETRY, (*it).idx, a as u64, delay)
+            if delay > 0 && !nap(m, delay) {
+                (*it).err = DE_CANCEL
+                final_state = DL_CANCELLED
+                break
+            }
+        }
+        let rc: u32 = attempt(m, it, ui, revalidate)
+        (*it).attempts = (*it).attempts + 1 as u32
+        if rc == RC_OK {
+            final_state = DL_OK
+            break
+        }
+        if rc == RC_NOTMOD {
+            final_state = DL_NOT_MODIFIED
+            break
+        }
+        if rc == RC_CANCEL {
+            final_state = DL_CANCELLED
+            break
+        }
+        if rc == RC_DISK {
+            break
+        }
+        __atomic_add(&(*m).retries_used, ONE)
+        if rc == RC_DEAD {
+            (*it).dead = (*it).dead | (1 as u32 << ui as u32)
+            if next_alive(it, 0) < 0 {
+                break
+            }
+        }
+        if rc == RC_RETRY_NOW {
+            (*it).retry_after_ms = 0
+        }
+        a = a + 1 as u32
+    }
+    if final_state == DL_OK || final_state == DL_NOT_MODIFIED {
+        if final_state == DL_NOT_MODIFIED {
+            let sz2: i64 = file_size(dest)
+            if sz2 >= 0 {
+                count_done(m, it, sz2 as u64)
+                (*it).total = sz2 as u64
+            }
+        }
+        finish(m, it, final_state)
+    } else if final_state == DL_CANCELLED {
+        finish(m, it, DL_CANCELLED)
+    } else {
+        finish(m, it, DL_FAILED)
+    }
+    return 0
+}
