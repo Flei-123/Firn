@@ -1,0 +1,270 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/sqlast.fi -- the syntax tree of a SQL statement.
+//
+// One flat kind of node (`Node`), kept in chunks so that a pointer to a node
+// stays valid while more nodes are added. Children are node INDEXES (-1 = none);
+// lists are chains through `next`. Text (names, string literals) is a span
+// (`sp`, `sn`) into the SQL text or into the tree's own arena.
+//
+// FIELDS BY KIND ("a".."h" are child indexes unless said otherwise)
+//   N_INT     ival              N_REAL  fval           N_NULL
+//   N_STR     sp,sn (unescaped) N_BLOB  sp,sn (the octets)
+//   N_PARAM   ival = number (1..), sp,sn = name or empty
+//   N_COL     sp,sn = column, sp2,sn2 = table qualifier or empty;
+//             resolved: b = source index, c = column index (-1 = the rowid)
+//   N_UNARY   op OP_NEG/OP_POS/OP_NOT/OP_BITNOT, a
+//   N_BINARY  op OP_*, a, b
+//   N_IS      op 0 IS / 1 IS NOT, a, b
+//   N_ISNULL  op 0 ISNULL / 1 NOTNULL, a
+//   N_BETWEEN flag 1 = NOT, a, b, c
+//   N_IN_LIST flag 1 = NOT, a = value, b = list head;  N_IN_SELECT: b = N_SELECT
+//   N_LIKE    op 0 LIKE / 1 GLOB, flag 1 = NOT, a = value, b = pattern, c = escape
+//   N_FUNC    sp,sn = name, a = argument list head, ival = argument count,
+//             flag 1 = DISTINCT, flag 2 = star argument; resolved: op = function id
+//   N_CAST    a, ival = affinity code of the target type
+//   N_CASE    a = operand or -1, b = list of N_WHEN (a = condition, b = result), c = else
+//   N_EXISTS  a = N_SELECT      N_SUBQ  a = N_SELECT
+//   N_COLLATE a, sp,sn = collation name
+//   N_SELECT  a = result column list (N_RESCOL), b = source list (N_SOURCE), c = WHERE,
+//             d = GROUP BY list, e = HAVING, f = ORDER BY list (N_ORDERTERM),
+//             g = LIMIT, h = OFFSET, flag 1 = DISTINCT, op = compound operator
+//             (0 none, CO_UNION, CO_UNION_ALL, CO_INTERSECT, CO_EXCEPT), ival = next select
+//             of the compound chain
+//   N_RESCOL  a = expression (-1 for a star), flag 1 = star, sp2,sn2 = table of `t.*`,
+//             sp,sn = alias or empty
+//   N_SOURCE  sp,sn = table name, sp2,sn2 = alias, op = join kind (JOIN_*) joining this
+//             source to the ones before, a = ON expression or -1, b = USING list head
+//             (N_NAME), c = a sub-select
+//   N_ORDERTERM a = expression, flag 1 = DESC, op = nulls (0 default, 1 first, 2 last)
+//   N_INSERT  sp,sn = table, a = column name list (N_NAME) or -1, b = rows (chain of
+//             N_VALUES_ROW) or -1, c = N_SELECT or -1, op = conflict mode (CF_*),
+//             flag 1 = DEFAULT VALUES
+//   N_VALUES_ROW a = expression list head
+//   N_UPDATE  sp,sn = table, a = SET list (N_SET), b = WHERE, op = conflict mode
+//   N_SET     sp,sn = column, a = expression
+//   N_DELETE  sp,sn = table, a = WHERE
+//   N_CREATE_TABLE sp,sn = name, a = column list (N_COLDEF), b = table constraints
+//             (N_TBLCONS), flag 1 = IF NOT EXISTS, c = AS SELECT (unsupported)
+//   N_COLDEF  sp,sn = name, sp2,sn2 = declared type text, ival = affinity code,
+//             flag bits 1 PRIMARY KEY, 2 NOT NULL, 4 UNIQUE, 8 AUTOINCREMENT,
+//             16 DESC primary key; a = DEFAULT expression or -1, b = CHECK list head,
+//             op = collation id
+//   N_TBLCONS op 1 PRIMARY KEY / 2 UNIQUE / 3 CHECK, a = column list (N_IDXCOL) or
+//             check expression
+//   N_CREATE_INDEX sp,sn = index name, sp2,sn2 = table, a = column list (N_IDXCOL),
+//             flag 1 = UNIQUE, flag 2 = IF NOT EXISTS, b = WHERE (unsupported)
+//   N_IDXCOL  sp,sn = column name, flag 1 = DESC, a = expression (unsupported) or -1
+//   N_DROP    op 1 TABLE / 2 INDEX, sp,sn = name, flag 1 = IF EXISTS
+//   N_BEGIN   op 0 DEFERRED / 1 IMMEDIATE / 2 EXCLUSIVE;  N_COMMIT;  N_ROLLBACK
+//   N_PRAGMA  sp,sn = name, a = value expression or -1
+//   N_ALTER   op 1 ADD COLUMN, 2 RENAME TO, 3 RENAME COLUMN; sp,sn = table, a = N_COLDEF,
+//             sp2,sn2 = new name
+//   N_NAME    sp,sn = name
+
+import std.rt
+import std.vec
+import db.arena as ar
+
+export {
+    Node, Ast, ast_new, ast_free, ast_add, ast_n, ast_copy_text, ast_clear,
+    N_NONE, N_INT, N_REAL, N_STR, N_BLOB, N_NULL, N_PARAM, N_COL, N_UNARY, N_BINARY, N_IS,
+    N_ISNULL, N_BETWEEN, N_IN_LIST, N_IN_SELECT, N_LIKE, N_FUNC, N_CAST, N_CASE, N_WHEN,
+    N_EXISTS, N_SUBQ, N_COLLATE, N_SELECT, N_RESCOL, N_SOURCE, N_ORDERTERM, N_INSERT,
+    N_UPDATE, N_DELETE, N_SET, N_CREATE_TABLE, N_COLDEF, N_TBLCONS, N_CREATE_INDEX,
+    N_IDXCOL, N_DROP, N_BEGIN, N_COMMIT, N_ROLLBACK, N_PRAGMA, N_ALTER, N_VALUES_ROW,
+    N_NAME, N_VACUUM, N_ANALYZE,
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_CONCAT, OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT,
+    OP_GE, OP_AND, OP_OR, OP_BITAND, OP_BITOR, OP_LSHIFT, OP_RSHIFT,
+    OP_NEG, OP_POS, OP_NOT, OP_BITNOT,
+    CO_NONE, CO_UNION, CO_UNION_ALL, CO_INTERSECT, CO_EXCEPT,
+    JOIN_FIRST, JOIN_INNER, JOIN_LEFT, JOIN_CROSS,
+    CF_ABORT, CF_IGNORE, CF_REPLACE, CF_FAIL, CF_ROLLBACK,
+    AFF_BLOB, AFF_TEXT, AFF_NUMERIC, AFF_INTEGER, AFF_REAL,
+}
+
+const N_NONE: u32 = 0
+const N_INT: u32 = 1
+const N_REAL: u32 = 2
+const N_STR: u32 = 3
+const N_BLOB: u32 = 4
+const N_NULL: u32 = 5
+const N_PARAM: u32 = 6
+const N_COL: u32 = 7
+const N_UNARY: u32 = 8
+const N_BINARY: u32 = 9
+const N_IS: u32 = 10
+const N_ISNULL: u32 = 11
+const N_BETWEEN: u32 = 12
+const N_IN_LIST: u32 = 13
+const N_IN_SELECT: u32 = 14
+const N_LIKE: u32 = 15
+const N_FUNC: u32 = 16
+const N_CAST: u32 = 17
+const N_CASE: u32 = 18
+const N_WHEN: u32 = 19
+const N_EXISTS: u32 = 20
+const N_SUBQ: u32 = 21
+const N_COLLATE: u32 = 22
+const N_SELECT: u32 = 30
+const N_RESCOL: u32 = 31
+const N_SOURCE: u32 = 32
+const N_ORDERTERM: u32 = 33
+const N_INSERT: u32 = 34
+const N_UPDATE: u32 = 35
+const N_DELETE: u32 = 36
+const N_SET: u32 = 37
+const N_CREATE_TABLE: u32 = 38
+const N_COLDEF: u32 = 39
+const N_TBLCONS: u32 = 40
+const N_CREATE_INDEX: u32 = 41
+const N_IDXCOL: u32 = 42
+const N_DROP: u32 = 43
+const N_BEGIN: u32 = 44
+const N_COMMIT: u32 = 45
+const N_ROLLBACK: u32 = 46
+const N_PRAGMA: u32 = 47
+const N_ALTER: u32 = 48
+const N_VALUES_ROW: u32 = 49
+const N_NAME: u32 = 50
+const N_VACUUM: u32 = 51
+const N_ANALYZE: u32 = 52
+
+const OP_ADD: u32 = 1
+const OP_SUB: u32 = 2
+const OP_MUL: u32 = 3
+const OP_DIV: u32 = 4
+const OP_MOD: u32 = 5
+const OP_CONCAT: u32 = 6
+const OP_EQ: u32 = 7
+const OP_NE: u32 = 8
+const OP_LT: u32 = 9
+const OP_LE: u32 = 10
+const OP_GT: u32 = 11
+const OP_GE: u32 = 12
+const OP_AND: u32 = 13
+const OP_OR: u32 = 14
+const OP_BITAND: u32 = 15
+const OP_BITOR: u32 = 16
+const OP_LSHIFT: u32 = 17
+const OP_RSHIFT: u32 = 18
+const OP_NEG: u32 = 1
+const OP_POS: u32 = 2
+const OP_NOT: u32 = 3
+const OP_BITNOT: u32 = 4
+
+const CO_NONE: u32 = 0
+const CO_UNION: u32 = 1
+const CO_UNION_ALL: u32 = 2
+const CO_INTERSECT: u32 = 3
+const CO_EXCEPT: u32 = 4
+
+const JOIN_FIRST: u32 = 0
+const JOIN_INNER: u32 = 1
+const JOIN_LEFT: u32 = 2
+const JOIN_CROSS: u32 = 3
+
+const CF_ABORT: u32 = 0
+const CF_IGNORE: u32 = 1
+const CF_REPLACE: u32 = 2
+const CF_FAIL: u32 = 3
+const CF_ROLLBACK: u32 = 4
+
+// column affinity codes: the letters SQLite uses ('A'..'E') as numbers
+const AFF_BLOB: i64 = 0
+const AFF_TEXT: i64 = 1
+const AFF_NUMERIC: i64 = 2
+const AFF_INTEGER: i64 = 3
+const AFF_REAL: i64 = 4
+
+struct Node {
+    kind: u32,
+    op: u32,
+    flag: u32,
+    a: i32,
+    b: i32,
+    c: i32,
+    d: i32,
+    e: i32,
+    f: i32,
+    g: i32,
+    h: i32,
+    next: i32,
+    ival: i64,
+    fval: f64,
+    sp: u64,
+    sn: usize,
+    sp2: u64,
+    sn2: usize,
+}
+
+struct Ast {
+    chunks: Vec[u64],
+    count: i32,
+    arena: ar.Arena,
+    nparams: i32,
+    root: i32,
+}
+
+const CHUNK_NODES: i32 = 256
+
+// size_of[T]() written inside a module cannot name the module's own types; a generic helper can
+fn sz_of[T: Any]() -> usize {
+    return size_of[T]()
+}
+
+fn ast_new() -> Ast {
+    return Ast { chunks: vec_new[u64](), count: 0, arena: ar.arena_new(), nparams: 0, root: -1 }
+}
+
+fn ast_free(t: *mut Ast) {
+    var i: usize = 0
+    let n: usize = vec_len[u64](&(*t).chunks)
+    while i < n {
+        rt.heap_free(vec_at[u64](&(*t).chunks, i), (CHUNK_NODES as usize) * sz_of[Node]())
+        i = i + 1
+    }
+    vec_free[u64](&(*t).chunks)
+    ar.arena_free(&(*t).arena)
+    (*t).count = 0
+}
+
+// forgets every node (keeps the chunks)
+fn ast_clear(t: *mut Ast) {
+    (*t).count = 0
+    (*t).nparams = 0
+    (*t).root = -1
+    ar.arena_reset(&(*t).arena)
+}
+
+fn node_blank() -> Node {
+    return Node { kind: 0, op: 0, flag: 0, a: -1, b: -1, c: -1, d: -1, e: -1, f: -1, g: -1, h: -1,
+        next: -1, ival: 0, fval: 0.0, sp: 0, sn: 0, sp2: 0, sn2: 0 }
+}
+
+// pointer to node i (stable while the tree lives)
+fn ast_n(t: *mut Ast, i: i32) -> *mut Node {
+    let chunk: u64 = vec_at[u64](&(*t).chunks, (i / CHUNK_NODES) as usize)
+    return ((chunk as *mut Node) + ((i % CHUNK_NODES) as usize))
+}
+
+// A new node of `kind`; the answer is its index (-1: out of memory)
+fn ast_add(t: *mut Ast, kind: u32) -> i32 {
+    let i: i32 = (*t).count
+    if i % CHUNK_NODES == 0 && ((i / CHUNK_NODES) as usize) >= vec_len[u64](&(*t).chunks) {
+        let c: u64 = rt.heap_alloc((CHUNK_NODES as usize) * sz_of[Node]())
+        if c == 0 {
+            return -1
+        }
+        vec_push[u64](&(*t).chunks, c)
+    }
+    (*t).count = i + 1
+    let n: *mut Node = ast_n(t, i)
+    *n = node_blank()
+    (*n).kind = kind
+    return i
+}
+
+// A copy of text in the tree's arena (so it outlives the SQL text)
+fn ast_copy_text(t: *mut Ast, p: u64, n: usize) -> u64 {
+    return ar.arena_copy(&(*t).arena, p, n)
+}

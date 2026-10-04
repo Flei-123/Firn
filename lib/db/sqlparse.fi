@@ -1,0 +1,2098 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/sqlparse.fi -- the parser: SQL text to a tree (db.sqlast).
+//
+// THE DIALECT (what parses; everything else is `Syntax` or `Unsupported`)
+//   SELECT [DISTINCT|ALL] columns [FROM sources] [WHERE e] [GROUP BY e,..] [HAVING e]
+//          [ORDER BY e [ASC|DESC] [NULLS FIRST|LAST],..] [LIMIT e [OFFSET e | , e]]
+//          with UNION [ALL] / INTERSECT / EXCEPT between cores;
+//          sources: table [AS] alias, (SELECT ..) alias, chained with , / [INNER|CROSS|LEFT [OUTER]] JOIN
+//          .. ON e / USING (..)
+//   INSERT [OR ABORT|FAIL|IGNORE|REPLACE|ROLLBACK] INTO t [(cols)] VALUES (..),(..) | SELECT .. | DEFAULT VALUES
+//          [ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET .. [WHERE e]]     REPLACE INTO ..
+//   UPDATE [OR ..] t SET c = e,.. [WHERE e]        DELETE FROM t [WHERE e]
+//   CREATE [TEMP] TABLE [IF NOT EXISTS] t (column definitions, table constraints)
+//   CREATE [UNIQUE] INDEX [IF NOT EXISTS] i ON t (c [ASC|DESC],..)
+//   DROP TABLE|INDEX [IF EXISTS] n        ALTER TABLE t ADD [COLUMN] def | RENAME TO n
+//   BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION]   COMMIT | END   ROLLBACK
+//   PRAGMA name [= v | (v)]        VACUUM        ANALYZE
+//   Expressions: literals, parameters (? ?N :n @n $n), columns, operators in SQLite's
+//   precedence, IS [NOT] [DISTINCT FROM], [NOT] IN (list | select), [NOT] BETWEEN,
+//   [NOT] LIKE/GLOB [ESCAPE], ISNULL/NOTNULL/NOT NULL, CASE, CAST, COLLATE,
+//   functions, EXISTS (select), (select).
+//
+// NOT parsed (answers `Unsupported` with the word): RIGHT/FULL/NATURAL JOIN,
+// WITH, window functions, RETURNING, generated columns, WITHOUT ROWID, CREATE
+// VIEW/TRIGGER/VIRTUAL TABLE, partial and expression indexes, ATTACH.
+
+import std.rt
+import std.vec
+import db.dberr
+import db.util
+import db.arena
+import db.sqlast as ax
+import db.sqllex as tk
+
+export { Parser, parser_new, parse_stmt, affinity_of_type, parser_pos }
+
+struct Parser {
+    lx: tk.Lexer,
+    tok: tk.Token,
+    ast: *mut ax.Ast,
+    src: u64,
+    n: usize,
+    next_param: i64,
+    pnames: rt.Buf, // triples: span address, length, number
+    depth: i32,
+    last_end: usize, // end of the token before the current one
+}
+
+fn parser_new(ast: *mut ax.Ast, p: u64, n: usize) -> Parser {
+    var ps: Parser = Parser { lx: tk.lex_new(p, n), tok: tk.Token { kind: 0, code: 0, p: 0, n: 0, start: 0, end: 0,
+        ival: 0, fval: 0.0, esc: false, quoted: false }, ast: ast, src: p, n: n, next_param: 0,
+        pnames: rt.buf_new(), depth: 0, last_end: 0 }
+    tk.lex_next(&ps.lx, &ps.tok)
+    return ps
+}
+
+// offset of the current token in the text
+fn parser_pos(ps: *mut Parser) -> usize {
+    return (*ps).tok.start
+}
+
+fn advance(ps: *mut Parser) {
+    (*ps).last_end = (*ps).tok.end
+    tk.lex_next(&(*ps).lx, &(*ps).tok)
+}
+
+fn syntax(ps: *mut Parser) -> DbError {
+    var b: rt.Buf = rt.buf_new()
+    if (*ps).tok.kind == tk.TK_EOF {
+        util.put_text(&b, "incomplete input")
+    } else if (*ps).tok.kind == tk.TK_ERR {
+        util.put_text(&b, "unrecognized token: \"")
+        let a: usize = (*ps).tok.start
+        var e: usize = (*ps).tok.end
+        if e > (*ps).n {
+            e = (*ps).n
+        }
+        if e - a > 40 {
+            e = a + 40
+        }
+        rt.buf_push_bytes(&b, (*ps).src + (a as u64), e - a)
+        util.put_text(&b, "\"")
+    } else {
+        util.put_text(&b, "near \"")
+        let a: usize = (*ps).tok.start
+        var e: usize = (*ps).tok.end
+        if e - a > 40 {
+            e = a + 40
+        }
+        rt.buf_push_bytes(&b, (*ps).src + (a as u64), e - a)
+        util.put_text(&b, "\": syntax error")
+    }
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return dberr.fail(DbError::Syntax, s)
+}
+
+fn unsupported(what: str) -> DbError {
+    return dberr.fail(DbError::Unsupported, what)
+}
+
+fn is_kw(ps: *mut Parser, k: u32) -> bool {
+    return (*ps).tok.kind == tk.TK_ID && !(*ps).tok.quoted && (*ps).tok.code == k
+}
+
+fn accept_kw(ps: *mut Parser, k: u32) -> bool {
+    if is_kw(ps, k) {
+        advance(ps)
+        return true
+    }
+    return false
+}
+
+fn expect_kw(ps: *mut Parser, k: u32) -> DbError!bool {
+    if is_kw(ps, k) {
+        advance(ps)
+        return true
+    }
+    return syntax(ps)
+}
+
+fn is_op(ps: *mut Parser, code: u32) -> bool {
+    return (*ps).tok.kind == tk.TK_OP && (*ps).tok.code == code
+}
+
+fn accept_op(ps: *mut Parser, code: u32) -> bool {
+    if is_op(ps, code) {
+        advance(ps)
+        return true
+    }
+    return false
+}
+
+fn expect_op(ps: *mut Parser, code: u32) -> DbError!bool {
+    if is_op(ps, code) {
+        advance(ps)
+        return true
+    }
+    return syntax(ps)
+}
+
+fn mk(ps: *mut Parser, kind: u32) -> DbError!i32 {
+    let i: i32 = ax.ast_add((*ps).ast, kind)
+    if i < 0 {
+        return dberr.fail(DbError::NoMemory, "out of memory building the statement")
+    }
+    return i
+}
+
+// keywords that can not be used as a plain name
+fn hard_reserved(k: u32) -> bool {
+    return k == tk.K_SELECT || k == tk.K_FROM || k == tk.K_WHERE || k == tk.K_GROUP || k == tk.K_BY || k == tk.K_HAVING
+        || k == tk.K_ORDER || k == tk.K_LIMIT || k == tk.K_UNION || k == tk.K_INTERSECT || k == tk.K_EXCEPT
+        || k == tk.K_JOIN || k == tk.K_INNER || k == tk.K_LEFT || k == tk.K_RIGHT || k == tk.K_FULL || k == tk.K_CROSS
+        || k == tk.K_NATURAL || k == tk.K_OUTER || k == tk.K_ON || k == tk.K_USING || k == tk.K_AND || k == tk.K_OR
+        || k == tk.K_NOT || k == tk.K_IN || k == tk.K_IS || k == tk.K_NULL || k == tk.K_LIKE || k == tk.K_GLOB
+        || k == tk.K_BETWEEN || k == tk.K_CASE || k == tk.K_WHEN || k == tk.K_THEN || k == tk.K_ELSE || k == tk.K_END
+        || k == tk.K_EXISTS || k == tk.K_AS || k == tk.K_INSERT || k == tk.K_INTO || k == tk.K_VALUES || k == tk.K_UPDATE
+        || k == tk.K_SET || k == tk.K_DELETE || k == tk.K_CREATE || k == tk.K_TABLE || k == tk.K_INDEX || k == tk.K_DROP
+        || k == tk.K_ALTER || k == tk.K_DISTINCT || k == tk.K_ALL || k == tk.K_DEFAULT || k == tk.K_PRIMARY
+        || k == tk.K_UNIQUE || k == tk.K_CHECK || k == tk.K_REFERENCES || k == tk.K_FOREIGN || k == tk.K_CONSTRAINT
+        || k == tk.K_COLLATE || k == tk.K_CAST || k == tk.K_ESCAPE || k == tk.K_TO || k == tk.K_ISNULL
+        || k == tk.K_NOTNULL || k == tk.K_TRUE || k == tk.K_FALSE
+}
+
+// can the current token be a name?
+fn at_name(ps: *mut Parser) -> bool {
+    let t: *mut tk.Token = &(*ps).tok
+    if (*t).kind != tk.TK_ID {
+        return false
+    }
+    if (*t).quoted || (*t).code == 0 {
+        return true
+    }
+    return !hard_reserved((*t).code)
+}
+
+// copy of a quoted name/string without its doubled quotes
+fn unescaped(ps: *mut Parser, p: u64, n: usize, q: u8, outn: *mut usize) -> u64 {
+    var buf: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        rt.buf_push(&buf, c)
+        if c == q && i + 1 < n && rt.ld8(p, i + 1) == q {
+            i = i + 1
+        }
+        i = i + 1
+    }
+    let r: u64 = ax.ast_copy_text((*ps).ast, rt.buf_ptr(&buf), rt.buf_len(&buf))
+    *outn = rt.buf_len(&buf)
+    rt.buf_free(&buf)
+    return r
+}
+
+// the name at the current token (advances); sp/sn of the answer through out params
+fn parse_name(ps: *mut Parser, outp: *mut u64, outn: *mut usize) -> DbError!bool {
+    let t: *mut tk.Token = &(*ps).tok
+    if (*t).kind == tk.TK_ID && ((*t).quoted || (*t).code == 0 || !hard_reserved((*t).code)) {
+        if (*t).esc {
+            var q: u8 = 34 as u8
+            if rt.ld8((*ps).src, (*t).start) == 96 as u8 {
+                q = 96 as u8
+            }
+            *outp = unescaped(ps, (*t).p, (*t).n, q, outn)
+        } else {
+            *outp = (*t).p
+            *outn = (*t).n
+        }
+        advance(ps)
+        return true
+    }
+    if (*t).kind == tk.TK_STR {
+        // a string used as a name (SQLite allows it for aliases and columns)
+        if (*t).esc {
+            *outp = unescaped(ps, (*t).p, (*t).n, 39 as u8, outn)
+        } else {
+            *outp = (*t).p
+            *outn = (*t).n
+        }
+        advance(ps)
+        return true
+    }
+    return syntax(ps)
+}
+
+// ------------------------------------------------------------ affinity
+// SQLite's rules for the affinity of a declared type (section 3.1 of
+// datatype3): INT -> INTEGER; CHAR/CLOB/TEXT -> TEXT; BLOB or nothing -> none;
+// REAL/FLOA/DOUB -> REAL; else NUMERIC.
+fn contains_ci(p: u64, n: usize, word: str) -> bool {
+    let w: usize = word.length()
+    if w > n {
+        return false
+    }
+    var i: usize = 0
+    while i + w <= n {
+        var j: usize = 0
+        var ok: bool = true
+        while j < w {
+            var c: u8 = rt.ld8(p, i + j)
+            if c >= 65 as u8 && c <= 90 as u8 {
+                c = c + 32 as u8
+            }
+            if c != word.chars(j) {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if ok {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn affinity_of_type(p: u64, n: usize) -> i64 {
+    if n == 0 {
+        return ax.AFF_BLOB
+    }
+    if contains_ci(p, n, "int") {
+        return ax.AFF_INTEGER
+    }
+    if contains_ci(p, n, "char") || contains_ci(p, n, "clob") || contains_ci(p, n, "text") {
+        return ax.AFF_TEXT
+    }
+    if contains_ci(p, n, "blob") {
+        return ax.AFF_BLOB
+    }
+    if contains_ci(p, n, "real") || contains_ci(p, n, "floa") || contains_ci(p, n, "doub") {
+        return ax.AFF_REAL
+    }
+    return ax.AFF_NUMERIC
+}
+
+// -------------------------------------------------------------- expressions
+fn mk_binary(ps: *mut Parser, op: u32, a: i32, b: i32) -> DbError!i32 {
+    let n: i32 = try mk(ps, ax.N_BINARY)
+    let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+    (*nn).op = op
+    (*nn).a = a
+    (*nn).b = b
+    return n
+}
+
+fn param_number(ps: *mut Parser, p: u64, n: usize) -> i64 {
+    // the same name twice is the same parameter
+    let cnt: usize = rt.buf_len(&(*ps).pnames) / 24
+    var i: usize = 0
+    let base: u64 = rt.buf_ptr(&(*ps).pnames)
+    while i < cnt {
+        let ap: u64 = rt.ld64(base + ((i * 24) as u64), 0)
+        let an: usize = rt.ld64(base + ((i * 24) as u64), 1) as usize
+        if an == n && util.bytes_equal(ap, p, n) {
+            return rt.ld64(base + ((i * 24) as u64), 2) as i64
+        }
+        i = i + 1
+    }
+    (*ps).next_param = (*ps).next_param + 1
+    let num: i64 = (*ps).next_param
+    let at: usize = rt.buf_len(&(*ps).pnames)
+    rt.buf_reserve(&(*ps).pnames, at + 24)
+    let b: u64 = rt.buf_ptr(&(*ps).pnames) + (at as u64)
+    rt.st64(b, 0, p)
+    rt.st64(b, 1, n as u64)
+    rt.st64(b, 2, num as u64)
+    rt.buf_set_len(&(*ps).pnames, at + 24)
+    return num
+}
+
+fn parse_expr_list_until_rparen(ps: *mut Parser, head: *mut i32, count: *mut i64) -> DbError!bool {
+    var last: i32 = -1
+    *head = -1
+    *count = 0
+    if is_op(ps, tk.P_RPAREN) {
+        return true
+    }
+    while true {
+        let e: i32 = try parse_expr(ps, 1)
+        if last < 0 {
+            *head = e
+        } else {
+            (*ax.ast_n((*ps).ast, last)).next = e
+        }
+        last = e
+        *count = *count + 1
+        if !accept_op(ps, tk.P_COMMA) {
+            break
+        }
+    }
+    return true
+}
+
+fn parse_type_name(ps: *mut Parser, outstart: *mut usize, outend: *mut usize) -> DbError!bool {
+    // words (and a parenthesised size) up to a constraint keyword, ',' or ')'
+    *outstart = (*ps).tok.start
+    *outend = (*ps).tok.start
+    var any: bool = false
+    while (*ps).tok.kind == tk.TK_ID || (*ps).tok.kind == tk.TK_STR {
+        if (*ps).tok.kind == tk.TK_ID && !(*ps).tok.quoted {
+            let k: u32 = (*ps).tok.code
+            if k == tk.K_CONSTRAINT || k == tk.K_PRIMARY || k == tk.K_NOT || k == tk.K_NULL || k == tk.K_UNIQUE
+                || k == tk.K_CHECK || k == tk.K_DEFAULT || k == tk.K_COLLATE || k == tk.K_REFERENCES
+                || k == tk.K_GENERATED || k == tk.K_AS || k == tk.K_ON || k == tk.K_ASC || k == tk.K_DESC
+                || k == tk.K_AUTOINCREMENT {
+                break
+            }
+        }
+        if !any {
+            *outstart = (*ps).tok.start
+        }
+        any = true
+        *outend = (*ps).tok.end
+        advance(ps)
+    }
+    if any && is_op(ps, tk.P_LPAREN) {
+        advance(ps)
+        // (n) or (n, m), signed numbers
+        while !is_op(ps, tk.P_RPAREN) {
+            if (*ps).tok.kind == tk.TK_EOF {
+                return syntax(ps)
+            }
+            advance(ps)
+        }
+        *outend = (*ps).tok.end
+        advance(ps)
+    }
+    return any
+}
+
+fn parse_case(ps: *mut Parser) -> DbError!i32 {
+    let c: i32 = try mk(ps, ax.N_CASE)
+    if !is_kw(ps, tk.K_WHEN) {
+        let op: i32 = try parse_expr(ps, 1)
+        (*ax.ast_n((*ps).ast, c)).a = op
+    }
+    var last: i32 = -1
+    while accept_kw(ps, tk.K_WHEN) {
+        let w: i32 = try mk(ps, ax.N_WHEN)
+        let cond: i32 = try parse_expr(ps, 1)
+        try expect_kw(ps, tk.K_THEN)
+        let res: i32 = try parse_expr(ps, 1)
+        let wn: *mut ax.Node = ax.ast_n((*ps).ast, w)
+        (*wn).a = cond
+        (*wn).b = res
+        if last < 0 {
+            (*ax.ast_n((*ps).ast, c)).b = w
+        } else {
+            (*ax.ast_n((*ps).ast, last)).next = w
+        }
+        last = w
+    }
+    if last < 0 {
+        return syntax(ps)
+    }
+    if accept_kw(ps, tk.K_ELSE) {
+        let e: i32 = try parse_expr(ps, 1)
+        (*ax.ast_n((*ps).ast, c)).c = e
+    }
+    try expect_kw(ps, tk.K_END)
+    return c
+}
+
+fn parse_primary(ps: *mut Parser) -> DbError!i32 {
+    let t: *mut tk.Token = &(*ps).tok
+    let k: u32 = (*t).kind
+    if k == tk.TK_INT {
+        let n: i32 = try mk(ps, ax.N_INT)
+        (*ax.ast_n((*ps).ast, n)).ival = (*t).ival
+        advance(ps)
+        return n
+    }
+    if k == tk.TK_FLOAT {
+        let n: i32 = try mk(ps, ax.N_REAL)
+        (*ax.ast_n((*ps).ast, n)).fval = (*t).fval
+        advance(ps)
+        return n
+    }
+    if k == tk.TK_STR {
+        let n: i32 = try mk(ps, ax.N_STR)
+        let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+        if (*t).esc {
+            var ln: usize = 0
+            (*nn).sp = unescaped(ps, (*t).p, (*t).n, 39 as u8, &ln)
+            (*nn).sn = ln
+        } else {
+            (*nn).sp = ax.ast_copy_text((*ps).ast, (*t).p, (*t).n)
+            (*nn).sn = (*t).n
+        }
+        advance(ps)
+        return n
+    }
+    if k == tk.TK_BLOB {
+        // hex digits to octets
+        if (*t).n % 2 != 0 {
+            return dberr.fail(DbError::Syntax, "unrecognized token: odd number of hex digits in a blob literal")
+        }
+        let n: i32 = try mk(ps, ax.N_BLOB)
+        var buf: rt.Buf = rt.buf_new()
+        var i: usize = 0
+        while i < (*t).n {
+            let a: u8 = rt.ld8((*t).p, i)
+            let b: u8 = rt.ld8((*t).p, i + 1)
+            if !is_hex_digit(a) || !is_hex_digit(b) {
+                rt.buf_free(&buf)
+                return dberr.fail(DbError::Syntax, "unrecognized token: bad hex digit in a blob literal")
+            }
+            rt.buf_push(&buf, ((hex_val(a) << 4) | hex_val(b)) as u8)
+            i = i + 2
+        }
+        let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+        (*nn).sp = ax.ast_copy_text((*ps).ast, rt.buf_ptr(&buf), rt.buf_len(&buf))
+        (*nn).sn = rt.buf_len(&buf)
+        rt.buf_free(&buf)
+        advance(ps)
+        return n
+    }
+    if k == tk.TK_PARAM {
+        let n: i32 = try mk(ps, ax.N_PARAM)
+        var num: i64 = 0
+        if (*t).ival > 0 {
+            num = (*t).ival
+            if num > (*ps).next_param {
+                (*ps).next_param = num
+            }
+        } else if (*t).ival == 0 {
+            (*ps).next_param = (*ps).next_param + 1
+            num = (*ps).next_param
+        } else {
+            num = param_number(ps, (*t).p, (*t).n)
+        }
+        let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+        (*nn).ival = num
+        if (*t).ival < 0 {
+            (*nn).sp = (*t).p
+            (*nn).sn = (*t).n
+        }
+        if num > ((*(*ps).ast).nparams as i64) {
+            (*(*ps).ast).nparams = num as i32
+        }
+        advance(ps)
+        return n
+    }
+    if k == tk.TK_OP {
+        if (*t).code == tk.P_LPAREN {
+            advance(ps)
+            if is_kw(ps, tk.K_SELECT) {
+                let s: i32 = try parse_select(ps)
+                try expect_op(ps, tk.P_RPAREN)
+                let n: i32 = try mk(ps, ax.N_SUBQ)
+                (*ax.ast_n((*ps).ast, n)).a = s
+                return n
+            }
+            let e: i32 = try parse_expr(ps, 1)
+            if is_op(ps, tk.P_COMMA) {
+                return unsupported("row values")
+            }
+            try expect_op(ps, tk.P_RPAREN)
+            return e
+        }
+        return syntax(ps)
+    }
+    if k == tk.TK_ID {
+        let code: u32 = (*t).code
+        if !(*t).quoted {
+            if code == tk.K_NULL {
+                advance(ps)
+                return try mk(ps, ax.N_NULL)
+            }
+            if code == tk.K_TRUE || code == tk.K_FALSE {
+                let n: i32 = try mk(ps, ax.N_INT)
+                if code == tk.K_TRUE {
+                    (*ax.ast_n((*ps).ast, n)).ival = 1
+                }
+                advance(ps)
+                return n
+            }
+            if code == tk.K_CASE {
+                advance(ps)
+                return try parse_case(ps)
+            }
+            if code == tk.K_EXISTS {
+                advance(ps)
+                try expect_op(ps, tk.P_LPAREN)
+                let s: i32 = try parse_select(ps)
+                try expect_op(ps, tk.P_RPAREN)
+                let n: i32 = try mk(ps, ax.N_EXISTS)
+                (*ax.ast_n((*ps).ast, n)).a = s
+                return n
+            }
+            if code == tk.K_CAST {
+                advance(ps)
+                try expect_op(ps, tk.P_LPAREN)
+                let e: i32 = try parse_expr(ps, 1)
+                try expect_kw(ps, tk.K_AS)
+                var ts: usize = 0
+                var te: usize = 0
+                let any: bool = try parse_type_name(ps, &ts, &te)
+                try expect_op(ps, tk.P_RPAREN)
+                let n: i32 = try mk(ps, ax.N_CAST)
+                let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+                (*nn).a = e
+                var aff: i64 = ax.AFF_BLOB
+                if any {
+                    aff = affinity_of_type((*ps).src + (ts as u64), te - ts)
+                    // CAST(x AS NUMERIC) keeps NUMERIC; "BLOB" is ax.AFF_BLOB; flag the BLOB cast
+                    if contains_ci((*ps).src + (ts as u64), te - ts, "blob") {
+                        (*nn).flag = 1
+                    }
+                }
+                (*nn).ival = aff
+                return n
+            }
+            if code == tk.K_CURRENT_TIME || code == tk.K_CURRENT_DATE || code == tk.K_CURRENT_TIMESTAMP {
+                return unsupported("CURRENT_TIME / CURRENT_DATE / CURRENT_TIMESTAMP")
+            }
+            if code != 0 && hard_reserved(code) {
+                return syntax(ps)
+            }
+        }
+        // a name: column, table.column or a function call
+        var p1: u64 = 0
+        var n1: usize = 0
+        try parse_name(ps, &p1, &n1)
+        if is_op(ps, tk.P_LPAREN) {
+            advance(ps)
+            let f: i32 = try mk(ps, ax.N_FUNC)
+            let fnn: *mut ax.Node = ax.ast_n((*ps).ast, f)
+            (*fnn).sp = p1
+            (*fnn).sn = n1
+            if is_op(ps, tk.P_STAR) {
+                advance(ps)
+                (*ax.ast_n((*ps).ast, f)).flag = 2
+            } else {
+                if accept_kw(ps, tk.K_DISTINCT) {
+                    (*ax.ast_n((*ps).ast, f)).flag = 1
+                } else {
+                    accept_kw(ps, tk.K_ALL)
+                }
+                var head: i32 = -1
+                var cnt: i64 = 0
+                try parse_expr_list_until_rparen(ps, &head, &cnt)
+                let f2: *mut ax.Node = ax.ast_n((*ps).ast, f)
+                (*f2).a = head
+                (*f2).ival = cnt
+            }
+            try expect_op(ps, tk.P_RPAREN)
+            if is_kw(ps, tk.K_OVER) {
+                return unsupported("window functions")
+            }
+            return f
+        }
+        let c: i32 = try mk(ps, ax.N_COL)
+        let cn: *mut ax.Node = ax.ast_n((*ps).ast, c)
+        if is_op(ps, tk.P_DOT) {
+            advance(ps)
+            var p2: u64 = 0
+            var n2: usize = 0
+            if is_op(ps, tk.P_STAR) {
+                return syntax(ps)
+            }
+            try parse_name(ps, &p2, &n2)
+            if is_op(ps, tk.P_DOT) {
+                // schema.table.column: the schema is ignored
+                advance(ps)
+                var p3: u64 = 0
+                var n3: usize = 0
+                try parse_name(ps, &p3, &n3)
+                let cn3: *mut ax.Node = ax.ast_n((*ps).ast, c)
+                (*cn3).sp2 = p2
+                (*cn3).sn2 = n2
+                (*cn3).sp = p3
+                (*cn3).sn = n3
+                return c
+            }
+            (*cn).sp2 = p1
+            (*cn).sn2 = n1
+            (*cn).sp = p2
+            (*cn).sn = n2
+            return c
+        }
+        (*cn).sp = p1
+        (*cn).sn = n1
+        return c
+    }
+    return syntax(ps)
+}
+
+fn is_hex_digit(c: u8) -> bool {
+    return (c >= 48 as u8 && c <= 57 as u8) || (c >= 97 as u8 && c <= 102 as u8) || (c >= 65 as u8 && c <= 70 as u8)
+}
+
+fn hex_val(c: u8) -> u32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c as u32) - 48
+    }
+    if c >= 97 as u8 {
+        return (c as u32) - 97 + 10
+    }
+    return (c as u32) - 65 + 10
+}
+
+fn parse_unary(ps: *mut Parser) -> DbError!i32 {
+    (*ps).depth = (*ps).depth + 1
+    if (*ps).depth > 200 {
+        return dberr.fail(DbError::TooBig, "expression tree is too deep")
+    }
+    var r: i32 = -1
+    if is_op(ps, tk.P_MINUS) || is_op(ps, tk.P_PLUS) || is_op(ps, tk.P_TILDE) {
+        let c: u32 = (*ps).tok.code
+        advance(ps)
+        let e: i32 = try parse_unary(ps)
+        // -literal folds into the literal
+        let en: *mut ax.Node = ax.ast_n((*ps).ast, e)
+        if c == tk.P_MINUS && (*en).kind == ax.N_INT && (*en).ival != 0 - 9223372036854775807 - 1 {
+            (*en).ival = 0 - (*en).ival
+            r = e
+        } else if c == tk.P_MINUS && (*en).kind == ax.N_REAL {
+            (*en).fval = 0.0 - (*en).fval
+            r = e
+        } else {
+            let n: i32 = try mk(ps, ax.N_UNARY)
+            let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+            if c == tk.P_MINUS {
+                (*nn).op = ax.OP_NEG
+            } else if c == tk.P_PLUS {
+                (*nn).op = ax.OP_POS
+            } else {
+                (*nn).op = ax.OP_BITNOT
+            }
+            (*nn).a = e
+            r = n
+        }
+    } else {
+        let p: i32 = try parse_primary(ps)
+        r = p
+    }
+    // postfix COLLATE
+    while is_kw(ps, tk.K_COLLATE) {
+        advance(ps)
+        var cp: u64 = 0
+        var cn: usize = 0
+        try parse_name(ps, &cp, &cn)
+        let n: i32 = try mk(ps, ax.N_COLLATE)
+        let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+        (*nn).a = r
+        (*nn).sp = cp
+        (*nn).sn = cn
+        r = n
+    }
+    (*ps).depth = (*ps).depth - 1
+    return r
+}
+
+// precedence of the binary operator at the current token, 0 if none
+fn binary_prec(ps: *mut Parser) -> u32 {
+    let t: *mut tk.Token = &(*ps).tok
+    if (*t).kind == tk.TK_OP {
+        let c: u32 = (*t).code
+        if c == tk.P_STAR || c == tk.P_SLASH || c == tk.P_PERCENT {
+            return 8
+        }
+        if c == tk.P_PLUS || c == tk.P_MINUS {
+            return 7
+        }
+        if c == tk.P_CONCAT {
+            return 9
+        }
+        if c == tk.P_BITAND || c == tk.P_BITOR || c == tk.P_LSHIFT || c == tk.P_RSHIFT {
+            return 6
+        }
+        if c == tk.P_LT || c == tk.P_LE || c == tk.P_GT || c == tk.P_GE {
+            return 5
+        }
+        if c == tk.P_EQ || c == tk.P_NE {
+            return 4
+        }
+        return 0
+    }
+    if (*t).kind == tk.TK_ID && !(*t).quoted {
+        let k: u32 = (*t).code
+        if k == tk.K_OR {
+            return 1
+        }
+        if k == tk.K_AND {
+            return 2
+        }
+        if k == tk.K_IS || k == tk.K_IN || k == tk.K_LIKE || k == tk.K_GLOB || k == tk.K_BETWEEN || k == tk.K_MATCH
+            || k == tk.K_REGEXP || k == tk.K_ISNULL || k == tk.K_NOTNULL || k == tk.K_NOT {
+            return 4
+        }
+    }
+    return 0
+}
+
+fn op_of_token(c: u32) -> u32 {
+    if c == tk.P_STAR { return ax.OP_MUL }
+    if c == tk.P_SLASH { return ax.OP_DIV }
+    if c == tk.P_PERCENT { return ax.OP_MOD }
+    if c == tk.P_PLUS { return ax.OP_ADD }
+    if c == tk.P_MINUS { return ax.OP_SUB }
+    if c == tk.P_CONCAT { return ax.OP_CONCAT }
+    if c == tk.P_BITAND { return ax.OP_BITAND }
+    if c == tk.P_BITOR { return ax.OP_BITOR }
+    if c == tk.P_LSHIFT { return ax.OP_LSHIFT }
+    if c == tk.P_RSHIFT { return ax.OP_RSHIFT }
+    if c == tk.P_LT { return ax.OP_LT }
+    if c == tk.P_LE { return ax.OP_LE }
+    if c == tk.P_GT { return ax.OP_GT }
+    if c == tk.P_GE { return ax.OP_GE }
+    if c == tk.P_EQ { return ax.OP_EQ }
+    return ax.OP_NE
+}
+
+// the part after `NOT`: IN, BETWEEN, LIKE, GLOB, NULL (postfix)
+fn parse_not_suffix(ps: *mut Parser, left: i32, negate: bool) -> DbError!i32 {
+    if accept_kw(ps, tk.K_IN) {
+        try expect_op(ps, tk.P_LPAREN)
+        if is_kw(ps, tk.K_SELECT) {
+            let s: i32 = try parse_select(ps)
+            try expect_op(ps, tk.P_RPAREN)
+            let n: i32 = try mk(ps, ax.N_IN_SELECT)
+            let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+            (*nn).a = left
+            (*nn).b = s
+            if negate {
+                (*nn).flag = 1
+            }
+            return n
+        }
+        var head: i32 = -1
+        var cnt: i64 = 0
+        try parse_expr_list_until_rparen(ps, &head, &cnt)
+        try expect_op(ps, tk.P_RPAREN)
+        let n: i32 = try mk(ps, ax.N_IN_LIST)
+        let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+        (*nn).a = left
+        (*nn).b = head
+        (*nn).ival = cnt
+        if negate {
+            (*nn).flag = 1
+        }
+        return n
+    }
+    if accept_kw(ps, tk.K_BETWEEN) {
+        let lo: i32 = try parse_expr(ps, 5)
+        try expect_kw(ps, tk.K_AND)
+        let hi: i32 = try parse_expr(ps, 5)
+        let n: i32 = try mk(ps, ax.N_BETWEEN)
+        let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+        (*nn).a = left
+        (*nn).b = lo
+        (*nn).c = hi
+        if negate {
+            (*nn).flag = 1
+        }
+        return n
+    }
+    if is_kw(ps, tk.K_LIKE) || is_kw(ps, tk.K_GLOB) {
+        var op: u32 = 0
+        if is_kw(ps, tk.K_GLOB) {
+            op = 1
+        }
+        advance(ps)
+        let pat: i32 = try parse_expr(ps, 5)
+        var esc: i32 = -1
+        if accept_kw(ps, tk.K_ESCAPE) {
+            let e: i32 = try parse_expr(ps, 5)
+            esc = e
+        }
+        let n: i32 = try mk(ps, ax.N_LIKE)
+        let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+        (*nn).op = op
+        (*nn).a = left
+        (*nn).b = pat
+        (*nn).c = esc
+        if negate {
+            (*nn).flag = 1
+        }
+        return n
+    }
+    if is_kw(ps, tk.K_MATCH) || is_kw(ps, tk.K_REGEXP) {
+        return unsupported("MATCH / REGEXP")
+    }
+    if is_kw(ps, tk.K_NULL) {
+        advance(ps)
+        let n: i32 = try mk(ps, ax.N_ISNULL)
+        let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+        (*nn).a = left
+        (*nn).op = 1
+        return n
+    }
+    return syntax(ps)
+}
+
+fn parse_expr(ps: *mut Parser, minp: u32) -> DbError!i32 {
+    var left: i32 = 0
+    if is_kw(ps, tk.K_NOT) && minp <= 3 {
+        advance(ps)
+        let e: i32 = try parse_expr(ps, 4)
+        let n: i32 = try mk(ps, ax.N_UNARY)
+        let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+        (*nn).op = ax.OP_NOT
+        (*nn).a = e
+        left = n
+    } else if is_kw(ps, tk.K_NOT) {
+        // NOT inside a tighter operand: still a prefix NOT of a comparison
+        advance(ps)
+        let e: i32 = try parse_expr(ps, 4)
+        let n: i32 = try mk(ps, ax.N_UNARY)
+        let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+        (*nn).op = ax.OP_NOT
+        (*nn).a = e
+        left = n
+    } else {
+        let u: i32 = try parse_unary(ps)
+        left = u
+    }
+    while true {
+        let prec: u32 = binary_prec(ps)
+        if prec == 0 || prec < minp {
+            break
+        }
+        let t: *mut tk.Token = &(*ps).tok
+        if (*t).kind == tk.TK_OP {
+            let c: u32 = (*t).code
+            advance(ps)
+            let rhs: i32 = try parse_expr(ps, prec + 1)
+            left = try mk_binary(ps, op_of_token(c), left, rhs)
+            continue
+        }
+        let k: u32 = (*t).code
+        if k == tk.K_OR {
+            advance(ps)
+            let rhs: i32 = try parse_expr(ps, 2)
+            left = try mk_binary(ps, ax.OP_OR, left, rhs)
+        } else if k == tk.K_AND {
+            advance(ps)
+            let rhs: i32 = try parse_expr(ps, 3)
+            left = try mk_binary(ps, ax.OP_AND, left, rhs)
+        } else if k == tk.K_IS {
+            advance(ps)
+            var neg: u32 = 0
+            if accept_kw(ps, tk.K_NOT) {
+                neg = 1
+            }
+            if accept_kw(ps, tk.K_DISTINCT) {
+                try expect_kw(ps, tk.K_FROM)
+                // IS DISTINCT FROM == IS NOT; IS NOT DISTINCT FROM == IS
+                neg = 1 - neg
+            }
+            let rhs: i32 = try parse_expr(ps, 5)
+            let n: i32 = try mk(ps, ax.N_IS)
+            let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+            (*nn).op = neg
+            (*nn).a = left
+            (*nn).b = rhs
+            left = n
+        } else if k == tk.K_ISNULL || k == tk.K_NOTNULL {
+            advance(ps)
+            let n: i32 = try mk(ps, ax.N_ISNULL)
+            let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+            (*nn).a = left
+            if k == tk.K_NOTNULL {
+                (*nn).op = 1
+            }
+            left = n
+        } else if k == tk.K_NOT {
+            advance(ps)
+            left = try parse_not_suffix(ps, left, true)
+        } else {
+            // IN, LIKE, GLOB, BETWEEN, MATCH, REGEXP
+            left = try parse_not_suffix(ps, left, false)
+        }
+    }
+    return left
+}
+
+// ------------------------------------------------------------------ select
+fn parse_result_columns(ps: *mut Parser) -> DbError!i32 {
+    var head: i32 = -1
+    var last: i32 = -1
+    while true {
+        let c: i32 = try mk(ps, ax.N_RESCOL)
+        if is_op(ps, tk.P_STAR) {
+            advance(ps)
+            (*ax.ast_n((*ps).ast, c)).flag = 1
+        } else {
+            // table.* ?
+            var done: bool = false
+            if (*ps).tok.kind == tk.TK_ID {
+                // look ahead without consuming: save the lexer state
+                let sl: tk.Lexer = (*ps).lx
+                let st: tk.Token = (*ps).tok
+                var p1: u64 = 0
+                var n1: usize = 0
+                if at_name(ps) {
+                    try parse_name(ps, &p1, &n1)
+                    if is_op(ps, tk.P_DOT) {
+                        advance(ps)
+                        if is_op(ps, tk.P_STAR) {
+                            advance(ps)
+                            let cn: *mut ax.Node = ax.ast_n((*ps).ast, c)
+                            (*cn).flag = 1
+                            (*cn).sp2 = p1
+                            (*cn).sn2 = n1
+                            done = true
+                        }
+                    }
+                }
+                if !done {
+                    (*ps).lx = sl
+                    (*ps).tok = st
+                }
+            }
+            if !done {
+                let e: i32 = try parse_expr(ps, 1)
+                (*ax.ast_n((*ps).ast, c)).a = e
+                if accept_kw(ps, tk.K_AS) {
+                    var ap: u64 = 0
+                    var an: usize = 0
+                    try parse_name(ps, &ap, &an)
+                    let cn: *mut ax.Node = ax.ast_n((*ps).ast, c)
+                    (*cn).sp = ap
+                    (*cn).sn = an
+                } else if at_name(ps) || (*ps).tok.kind == tk.TK_STR {
+                    var ap: u64 = 0
+                    var an: usize = 0
+                    try parse_name(ps, &ap, &an)
+                    let cn: *mut ax.Node = ax.ast_n((*ps).ast, c)
+                    (*cn).sp = ap
+                    (*cn).sn = an
+                }
+            }
+        }
+        if last < 0 {
+            head = c
+        } else {
+            (*ax.ast_n((*ps).ast, last)).next = c
+        }
+        last = c
+        if !accept_op(ps, tk.P_COMMA) {
+            break
+        }
+    }
+    return head
+}
+
+fn parse_source(ps: *mut Parser, joinkind: u32) -> DbError!i32 {
+    let s: i32 = try mk(ps, ax.N_SOURCE)
+    (*ax.ast_n((*ps).ast, s)).op = joinkind
+    if is_op(ps, tk.P_LPAREN) {
+        advance(ps)
+        if !is_kw(ps, tk.K_SELECT) {
+            return unsupported("parenthesized joins")
+        }
+        let sub: i32 = try parse_select(ps)
+        try expect_op(ps, tk.P_RPAREN)
+        (*ax.ast_n((*ps).ast, s)).c = sub
+    } else {
+        var p1: u64 = 0
+        var n1: usize = 0
+        try parse_name(ps, &p1, &n1)
+        if is_op(ps, tk.P_DOT) {
+            // schema.table: the schema must be main
+            advance(ps)
+            var p2: u64 = 0
+            var n2: usize = 0
+            try parse_name(ps, &p2, &n2)
+            p1 = p2
+            n1 = n2
+        }
+        let sn: *mut ax.Node = ax.ast_n((*ps).ast, s)
+        (*sn).sp = p1
+        (*sn).sn = n1
+    }
+    var ap: u64 = 0
+    var an: usize = 0
+    var has_alias: bool = false
+    if accept_kw(ps, tk.K_AS) {
+        try parse_name(ps, &ap, &an)
+        has_alias = true
+    } else if at_name(ps) {
+        try parse_name(ps, &ap, &an)
+        has_alias = true
+    }
+    if has_alias {
+        let sn: *mut ax.Node = ax.ast_n((*ps).ast, s)
+        (*sn).sp2 = ap
+        (*sn).sn2 = an
+    }
+    return s
+}
+
+fn parse_from(ps: *mut Parser) -> DbError!i32 {
+    let first: i32 = try parse_source(ps, ax.JOIN_FIRST)
+    var last: i32 = first
+    while true {
+        var jk: u32 = 0
+        if accept_op(ps, tk.P_COMMA) {
+            jk = ax.JOIN_INNER
+        } else {
+            if is_kw(ps, tk.K_NATURAL) || is_kw(ps, tk.K_RIGHT) || is_kw(ps, tk.K_FULL) {
+                return unsupported("NATURAL / RIGHT / FULL JOIN")
+            }
+            var seen: bool = false
+            if accept_kw(ps, tk.K_LEFT) {
+                accept_kw(ps, tk.K_OUTER)
+                jk = ax.JOIN_LEFT
+                seen = true
+            } else if accept_kw(ps, tk.K_INNER) {
+                jk = ax.JOIN_INNER
+                seen = true
+            } else if accept_kw(ps, tk.K_CROSS) {
+                jk = ax.JOIN_CROSS
+                seen = true
+            }
+            if is_kw(ps, tk.K_JOIN) {
+                advance(ps)
+                if !seen {
+                    jk = ax.JOIN_INNER
+                }
+            } else if seen {
+                return syntax(ps)
+            } else {
+                break
+            }
+        }
+        let s: i32 = try parse_source(ps, jk)
+        (*ax.ast_n((*ps).ast, last)).next = s
+        last = s
+        if accept_kw(ps, tk.K_ON) {
+            let e: i32 = try parse_expr(ps, 1)
+            (*ax.ast_n((*ps).ast, s)).a = e
+        } else if accept_kw(ps, tk.K_USING) {
+            try expect_op(ps, tk.P_LPAREN)
+            var lastn: i32 = -1
+            while true {
+                var p1: u64 = 0
+                var n1: usize = 0
+                try parse_name(ps, &p1, &n1)
+                let nm: i32 = try mk(ps, ax.N_NAME)
+                let nn: *mut ax.Node = ax.ast_n((*ps).ast, nm)
+                (*nn).sp = p1
+                (*nn).sn = n1
+                if lastn < 0 {
+                    (*ax.ast_n((*ps).ast, s)).b = nm
+                } else {
+                    (*ax.ast_n((*ps).ast, lastn)).next = nm
+                }
+                lastn = nm
+                if !accept_op(ps, tk.P_COMMA) {
+                    break
+                }
+            }
+            try expect_op(ps, tk.P_RPAREN)
+        }
+    }
+    return first
+}
+
+fn parse_expr_chain(ps: *mut Parser) -> DbError!i32 {
+    var head: i32 = -1
+    var last: i32 = -1
+    while true {
+        let e: i32 = try parse_expr(ps, 1)
+        if last < 0 {
+            head = e
+        } else {
+            (*ax.ast_n((*ps).ast, last)).next = e
+        }
+        last = e
+        if !accept_op(ps, tk.P_COMMA) {
+            break
+        }
+    }
+    return head
+}
+
+fn parse_select_core(ps: *mut Parser) -> DbError!i32 {
+    try expect_kw(ps, tk.K_SELECT)
+    let s: i32 = try mk(ps, ax.N_SELECT)
+    if accept_kw(ps, tk.K_DISTINCT) {
+        (*ax.ast_n((*ps).ast, s)).flag = 1
+    } else {
+        accept_kw(ps, tk.K_ALL)
+    }
+    let cols: i32 = try parse_result_columns(ps)
+    (*ax.ast_n((*ps).ast, s)).a = cols
+    if accept_kw(ps, tk.K_FROM) {
+        let f: i32 = try parse_from(ps)
+        (*ax.ast_n((*ps).ast, s)).b = f
+    }
+    if accept_kw(ps, tk.K_WHERE) {
+        let w: i32 = try parse_expr(ps, 1)
+        (*ax.ast_n((*ps).ast, s)).c = w
+    }
+    if is_kw(ps, tk.K_GROUP) {
+        advance(ps)
+        try expect_kw(ps, tk.K_BY)
+        let g: i32 = try parse_expr_chain(ps)
+        (*ax.ast_n((*ps).ast, s)).d = g
+        if accept_kw(ps, tk.K_HAVING) {
+            let h: i32 = try parse_expr(ps, 1)
+            (*ax.ast_n((*ps).ast, s)).e = h
+        }
+    } else if is_kw(ps, tk.K_HAVING) {
+        advance(ps)
+        let h: i32 = try parse_expr(ps, 1)
+        (*ax.ast_n((*ps).ast, s)).e = h
+    }
+    return s
+}
+
+fn parse_select(ps: *mut Parser) -> DbError!i32 {
+    if is_kw(ps, tk.K_WITH) {
+        return unsupported("WITH")
+    }
+    if is_kw(ps, tk.K_VALUES) {
+        return unsupported("VALUES as a select")
+    }
+    let head: i32 = try parse_select_core(ps)
+    var last: i32 = head
+    while is_kw(ps, tk.K_UNION) || is_kw(ps, tk.K_INTERSECT) || is_kw(ps, tk.K_EXCEPT) {
+        var op: u32 = ax.CO_UNION
+        if is_kw(ps, tk.K_INTERSECT) {
+            op = ax.CO_INTERSECT
+        } else if is_kw(ps, tk.K_EXCEPT) {
+            op = ax.CO_EXCEPT
+        }
+        advance(ps)
+        if op == ax.CO_UNION && accept_kw(ps, tk.K_ALL) {
+            op = ax.CO_UNION_ALL
+        }
+        let nx: i32 = try parse_select_core(ps)
+        (*ax.ast_n((*ps).ast, nx)).op = op
+        (*ax.ast_n((*ps).ast, last)).ival = nx as i64
+        last = nx
+    }
+    // ORDER BY and LIMIT belong to the whole compound (kept on the head)
+    if is_kw(ps, tk.K_ORDER) {
+        advance(ps)
+        try expect_kw(ps, tk.K_BY)
+        var first: i32 = -1
+        var lastt: i32 = -1
+        while true {
+            let e: i32 = try parse_expr(ps, 1)
+            let t: i32 = try mk(ps, ax.N_ORDERTERM)
+            (*ax.ast_n((*ps).ast, t)).a = e
+            if accept_kw(ps, tk.K_DESC) {
+                (*ax.ast_n((*ps).ast, t)).flag = 1
+            } else {
+                accept_kw(ps, tk.K_ASC)
+            }
+            if accept_kw(ps, tk.K_NULLS) {
+                if accept_kw(ps, tk.K_FIRST) {
+                    (*ax.ast_n((*ps).ast, t)).op = 1
+                } else if accept_kw(ps, tk.K_LAST) {
+                    (*ax.ast_n((*ps).ast, t)).op = 2
+                } else {
+                    return syntax(ps)
+                }
+            }
+            if lastt < 0 {
+                first = t
+            } else {
+                (*ax.ast_n((*ps).ast, lastt)).next = t
+            }
+            lastt = t
+            if !accept_op(ps, tk.P_COMMA) {
+                break
+            }
+        }
+        (*ax.ast_n((*ps).ast, head)).f = first
+    }
+    if accept_kw(ps, tk.K_LIMIT) {
+        let l: i32 = try parse_expr(ps, 1)
+        (*ax.ast_n((*ps).ast, head)).g = l
+        if accept_kw(ps, tk.K_OFFSET) {
+            let o: i32 = try parse_expr(ps, 1)
+            (*ax.ast_n((*ps).ast, head)).h = o
+        } else if accept_op(ps, tk.P_COMMA) {
+            // LIMIT offset, count
+            let c: i32 = try parse_expr(ps, 1)
+            (*ax.ast_n((*ps).ast, head)).h = l
+            (*ax.ast_n((*ps).ast, head)).g = c
+        }
+    }
+    return head
+}
+
+// ------------------------------------------------------------- statements
+fn conflict_mode(ps: *mut Parser) -> DbError!u32 {
+    // after OR
+    if accept_kw(ps, tk.K_ABORT) {
+        return ax.CF_ABORT
+    }
+    if accept_kw(ps, tk.K_IGNORE) {
+        return ax.CF_IGNORE
+    }
+    if accept_kw(ps, tk.K_REPLACE) {
+        return ax.CF_REPLACE
+    }
+    if accept_kw(ps, tk.K_FAIL) {
+        return ax.CF_FAIL
+    }
+    if accept_kw(ps, tk.K_ROLLBACK) {
+        return ax.CF_ROLLBACK
+    }
+    return syntax(ps)
+}
+
+fn parse_name_list(ps: *mut Parser) -> DbError!i32 {
+    var head: i32 = -1
+    var last: i32 = -1
+    while true {
+        var p1: u64 = 0
+        var n1: usize = 0
+        try parse_name(ps, &p1, &n1)
+        let nm: i32 = try mk(ps, ax.N_NAME)
+        let nn: *mut ax.Node = ax.ast_n((*ps).ast, nm)
+        (*nn).sp = p1
+        (*nn).sn = n1
+        if last < 0 {
+            head = nm
+        } else {
+            (*ax.ast_n((*ps).ast, last)).next = nm
+        }
+        last = nm
+        if !accept_op(ps, tk.P_COMMA) {
+            break
+        }
+    }
+    return head
+}
+
+fn parse_insert(ps: *mut Parser, replace: bool) -> DbError!i32 {
+    let s: i32 = try mk(ps, ax.N_INSERT)
+    if replace {
+        (*ax.ast_n((*ps).ast, s)).op = ax.CF_REPLACE
+    } else if accept_kw(ps, tk.K_OR) {
+        let cm: u32 = try conflict_mode(ps)
+        (*ax.ast_n((*ps).ast, s)).op = cm
+    }
+    try expect_kw(ps, tk.K_INTO)
+    var p1: u64 = 0
+    var n1: usize = 0
+    try parse_name(ps, &p1, &n1)
+    if is_op(ps, tk.P_DOT) {
+        advance(ps)
+        var p2: u64 = 0
+        var n2: usize = 0
+        try parse_name(ps, &p2, &n2)
+        p1 = p2
+        n1 = n2
+    }
+    let sn: *mut ax.Node = ax.ast_n((*ps).ast, s)
+    (*sn).sp = p1
+    (*sn).sn = n1
+    if is_op(ps, tk.P_LPAREN) {
+        advance(ps)
+        let cols: i32 = try parse_name_list(ps)
+        try expect_op(ps, tk.P_RPAREN)
+        (*ax.ast_n((*ps).ast, s)).a = cols
+    }
+    if accept_kw(ps, tk.K_DEFAULT) {
+        try expect_kw(ps, tk.K_VALUES)
+        (*ax.ast_n((*ps).ast, s)).flag = 1
+    } else if accept_kw(ps, tk.K_VALUES) {
+        var lastr: i32 = -1
+        while true {
+            try expect_op(ps, tk.P_LPAREN)
+            let row: i32 = try mk(ps, ax.N_VALUES_ROW)
+            var head: i32 = -1
+            var cnt: i64 = 0
+            try parse_expr_list_until_rparen(ps, &head, &cnt)
+            try expect_op(ps, tk.P_RPAREN)
+            let rn: *mut ax.Node = ax.ast_n((*ps).ast, row)
+            (*rn).a = head
+            (*rn).ival = cnt
+            if lastr < 0 {
+                (*ax.ast_n((*ps).ast, s)).b = row
+            } else {
+                (*ax.ast_n((*ps).ast, lastr)).next = row
+            }
+            lastr = row
+            if !accept_op(ps, tk.P_COMMA) {
+                break
+            }
+        }
+    } else if is_kw(ps, tk.K_SELECT) {
+        let sel: i32 = try parse_select(ps)
+        (*ax.ast_n((*ps).ast, s)).c = sel
+    } else {
+        return syntax(ps)
+    }
+    if is_kw(ps, tk.K_ON) {
+        // ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET c = e,.. [WHERE e]
+        advance(ps)
+        try expect_kw(ps, tk.K_CONFLICT)
+        let u: i32 = try mk(ps, ax.N_SET)
+        // the upsert clause: kind ax.N_SET reused: a = target column list, b = SET list or -1,
+        // c = WHERE, flag 1 = DO NOTHING
+        if is_op(ps, tk.P_LPAREN) {
+            advance(ps)
+            let cl: i32 = try parse_name_list(ps)
+            try expect_op(ps, tk.P_RPAREN)
+            (*ax.ast_n((*ps).ast, u)).a = cl
+            if accept_kw(ps, tk.K_WHERE) {
+                return unsupported("partial index conflict target")
+            }
+        }
+        try expect_kw(ps, tk.K_DO)
+        if accept_kw(ps, tk.K_NOTHING) {
+            (*ax.ast_n((*ps).ast, u)).flag = 1
+        } else {
+            try expect_kw(ps, tk.K_UPDATE)
+            try expect_kw(ps, tk.K_SET)
+            let sets: i32 = try parse_set_list(ps)
+            (*ax.ast_n((*ps).ast, u)).b = sets
+            if accept_kw(ps, tk.K_WHERE) {
+                let w: i32 = try parse_expr(ps, 1)
+                (*ax.ast_n((*ps).ast, u)).c = w
+            }
+        }
+        (*ax.ast_n((*ps).ast, s)).d = u
+    }
+    if is_kw(ps, tk.K_RETURNING) {
+        return unsupported("RETURNING")
+    }
+    return s
+}
+
+fn parse_set_list(ps: *mut Parser) -> DbError!i32 {
+    var head: i32 = -1
+    var last: i32 = -1
+    while true {
+        var p1: u64 = 0
+        var n1: usize = 0
+        try parse_name(ps, &p1, &n1)
+        if is_op(ps, tk.P_DOT) {
+            advance(ps)
+            var p2: u64 = 0
+            var n2: usize = 0
+            try parse_name(ps, &p2, &n2)
+            p1 = p2
+            n1 = n2
+        }
+        try expect_op(ps, tk.P_EQ)
+        let e: i32 = try parse_expr(ps, 1)
+        let st: i32 = try mk(ps, ax.N_SET)
+        let sn: *mut ax.Node = ax.ast_n((*ps).ast, st)
+        (*sn).sp = p1
+        (*sn).sn = n1
+        (*sn).a = e
+        if last < 0 {
+            head = st
+        } else {
+            (*ax.ast_n((*ps).ast, last)).next = st
+        }
+        last = st
+        if !accept_op(ps, tk.P_COMMA) {
+            break
+        }
+    }
+    return head
+}
+
+fn parse_update(ps: *mut Parser) -> DbError!i32 {
+    let s: i32 = try mk(ps, ax.N_UPDATE)
+    if accept_kw(ps, tk.K_OR) {
+        let cm: u32 = try conflict_mode(ps)
+        (*ax.ast_n((*ps).ast, s)).op = cm
+    }
+    var p1: u64 = 0
+    var n1: usize = 0
+    try parse_name(ps, &p1, &n1)
+    if is_op(ps, tk.P_DOT) {
+        advance(ps)
+        var p2: u64 = 0
+        var n2: usize = 0
+        try parse_name(ps, &p2, &n2)
+        p1 = p2
+        n1 = n2
+    }
+    let sn: *mut ax.Node = ax.ast_n((*ps).ast, s)
+    (*sn).sp = p1
+    (*sn).sn = n1
+    try expect_kw(ps, tk.K_SET)
+    let sets: i32 = try parse_set_list(ps)
+    (*ax.ast_n((*ps).ast, s)).a = sets
+    if is_kw(ps, tk.K_FROM) {
+        return unsupported("UPDATE ... FROM")
+    }
+    if accept_kw(ps, tk.K_WHERE) {
+        let w: i32 = try parse_expr(ps, 1)
+        (*ax.ast_n((*ps).ast, s)).b = w
+    }
+    if is_kw(ps, tk.K_RETURNING) || is_kw(ps, tk.K_ORDER) || is_kw(ps, tk.K_LIMIT) {
+        return unsupported("UPDATE with RETURNING / ORDER BY / LIMIT")
+    }
+    return s
+}
+
+fn parse_delete(ps: *mut Parser) -> DbError!i32 {
+    try expect_kw(ps, tk.K_FROM)
+    let s: i32 = try mk(ps, ax.N_DELETE)
+    var p1: u64 = 0
+    var n1: usize = 0
+    try parse_name(ps, &p1, &n1)
+    if is_op(ps, tk.P_DOT) {
+        advance(ps)
+        var p2: u64 = 0
+        var n2: usize = 0
+        try parse_name(ps, &p2, &n2)
+        p1 = p2
+        n1 = n2
+    }
+    let sn: *mut ax.Node = ax.ast_n((*ps).ast, s)
+    (*sn).sp = p1
+    (*sn).sn = n1
+    if accept_kw(ps, tk.K_WHERE) {
+        let w: i32 = try parse_expr(ps, 1)
+        (*ax.ast_n((*ps).ast, s)).a = w
+    }
+    if is_kw(ps, tk.K_RETURNING) || is_kw(ps, tk.K_ORDER) || is_kw(ps, tk.K_LIMIT) {
+        return unsupported("DELETE with RETURNING / ORDER BY / LIMIT")
+    }
+    return s
+}
+
+// skips a REFERENCES clause (foreign keys are parsed and ignored)
+fn skip_references(ps: *mut Parser) -> DbError!bool {
+    // REFERENCES tbl [(cols)] [ON DELETE|UPDATE action] [MATCH name] [[NOT] DEFERRABLE ...]
+    var p1: u64 = 0
+    var n1: usize = 0
+    try parse_name(ps, &p1, &n1)
+    if is_op(ps, tk.P_LPAREN) {
+        while !is_op(ps, tk.P_RPAREN) {
+            if (*ps).tok.kind == tk.TK_EOF {
+                return syntax(ps)
+            }
+            advance(ps)
+        }
+        advance(ps)
+    }
+    while true {
+        if is_kw(ps, tk.K_ON) {
+            advance(ps)
+            if !(accept_kw(ps, tk.K_DELETE) || accept_kw(ps, tk.K_UPDATE)) {
+                return syntax(ps)
+            }
+            // SET NULL | SET DEFAULT | CASCADE | RESTRICT | NO ACTION
+            var guard: i32 = 0
+            while guard < 3 {
+                if is_kw(ps, tk.K_SET) || is_kw(ps, tk.K_NULL) || is_kw(ps, tk.K_DEFAULT) || (*ps).tok.kind == tk.TK_ID {
+                    if is_kw(ps, tk.K_ON) || is_kw(ps, tk.K_NOT) || is_kw(ps, tk.K_DEFERRABLE) || is_kw(ps, tk.K_MATCH) {
+                        break
+                    }
+                    if (*ps).tok.kind == tk.TK_ID && is_idword_end(ps) {
+                        break
+                    }
+                    advance(ps)
+                } else {
+                    break
+                }
+                guard = guard + 1
+            }
+        } else if is_kw(ps, tk.K_MATCH) {
+            advance(ps)
+            advance(ps)
+        } else if is_kw(ps, tk.K_DEFERRABLE) {
+            advance(ps)
+            if accept_kw(ps, tk.K_INITIALLY) {
+                advance(ps)
+            }
+        } else if is_kw(ps, tk.K_NOT) {
+            // NOT DEFERRABLE (but NOT NULL belongs to the column)
+            let sl: tk.Lexer = (*ps).lx
+            let st: tk.Token = (*ps).tok
+            advance(ps)
+            if is_kw(ps, tk.K_DEFERRABLE) {
+                advance(ps)
+                if accept_kw(ps, tk.K_INITIALLY) {
+                    advance(ps)
+                }
+            } else {
+                (*ps).lx = sl
+                (*ps).tok = st
+                break
+            }
+        } else {
+            break
+        }
+    }
+    return true
+}
+
+// a keyword-less word that ends the action words (CASCADE, RESTRICT, ACTION, NO)
+fn is_idword_end(ps: *mut Parser) -> bool {
+    let t: *mut tk.Token = &(*ps).tok
+    if (*t).kind != tk.TK_ID || (*t).quoted {
+        return true
+    }
+    if tk.lex_eq_ci((*t).p, (*t).n, "CASCADE") || tk.lex_eq_ci((*t).p, (*t).n, "RESTRICT")
+        || tk.lex_eq_ci((*t).p, (*t).n, "ACTION") || tk.lex_eq_ci((*t).p, (*t).n, "NO") {
+        return false
+    }
+    return true
+}
+
+fn parse_default_value(ps: *mut Parser) -> DbError!i32 {
+    if is_op(ps, tk.P_LPAREN) {
+        advance(ps)
+        let e: i32 = try parse_expr(ps, 1)
+        try expect_op(ps, tk.P_RPAREN)
+        return e
+    }
+    if is_op(ps, tk.P_PLUS) || is_op(ps, tk.P_MINUS) {
+        let u: i32 = try parse_unary(ps)
+        return u
+    }
+    if (*ps).tok.kind == tk.TK_INT || (*ps).tok.kind == tk.TK_FLOAT || (*ps).tok.kind == tk.TK_STR
+        || (*ps).tok.kind == tk.TK_BLOB || is_kw(ps, tk.K_NULL) || is_kw(ps, tk.K_TRUE) || is_kw(ps, tk.K_FALSE) {
+        let p: i32 = try parse_primary(ps)
+        return p
+    }
+    if is_kw(ps, tk.K_CURRENT_TIME) || is_kw(ps, tk.K_CURRENT_DATE) || is_kw(ps, tk.K_CURRENT_TIMESTAMP) {
+        return unsupported("DEFAULT CURRENT_TIMESTAMP")
+    }
+    // a bare word is a string ("DEFAULT abc")
+    if (*ps).tok.kind == tk.TK_ID {
+        let n: i32 = try mk(ps, ax.N_STR)
+        let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+        (*nn).sp = ax.ast_copy_text((*ps).ast, (*ps).tok.p, (*ps).tok.n)
+        (*nn).sn = (*ps).tok.n
+        advance(ps)
+        return n
+    }
+    return syntax(ps)
+}
+
+fn collation_id(p: u64, n: usize) -> u32 {
+    if tk.lex_eq_ci(p, n, "BINARY") {
+        return 0
+    }
+    if tk.lex_eq_ci(p, n, "NOCASE") {
+        return 1
+    }
+    if tk.lex_eq_ci(p, n, "RTRIM") {
+        return 2
+    }
+    return 99
+}
+
+fn parse_coldef(ps: *mut Parser) -> DbError!i32 {
+    let c: i32 = try mk(ps, ax.N_COLDEF)
+    var p1: u64 = 0
+    var n1: usize = 0
+    try parse_name(ps, &p1, &n1)
+    let cn0: *mut ax.Node = ax.ast_n((*ps).ast, c)
+    (*cn0).sp = p1
+    (*cn0).sn = n1
+    var ts: usize = 0
+    var te: usize = 0
+    let any: bool = try parse_type_name(ps, &ts, &te)
+    if any {
+        let cn: *mut ax.Node = ax.ast_n((*ps).ast, c)
+        (*cn).sp2 = (*ps).src + (ts as u64)
+        (*cn).sn2 = te - ts
+        (*cn).ival = affinity_of_type((*ps).src + (ts as u64), te - ts)
+    }
+    var lastchk: i32 = -1
+    while true {
+        if accept_kw(ps, tk.K_CONSTRAINT) {
+            var qp: u64 = 0
+            var qn: usize = 0
+            try parse_name(ps, &qp, &qn)
+        }
+        if accept_kw(ps, tk.K_PRIMARY) {
+            try expect_kw(ps, tk.K_KEY)
+            let cn: *mut ax.Node = ax.ast_n((*ps).ast, c)
+            (*cn).flag = (*cn).flag | 1
+            if accept_kw(ps, tk.K_DESC) {
+                (*ax.ast_n((*ps).ast, c)).flag = (*ax.ast_n((*ps).ast, c)).flag | 16
+            } else {
+                accept_kw(ps, tk.K_ASC)
+            }
+            if accept_kw(ps, tk.K_ON) {
+                try expect_kw(ps, tk.K_CONFLICT)
+                try conflict_mode(ps)
+            }
+            if accept_kw(ps, tk.K_AUTOINCREMENT) {
+                (*ax.ast_n((*ps).ast, c)).flag = (*ax.ast_n((*ps).ast, c)).flag | 8
+            }
+        } else if accept_kw(ps, tk.K_NOT) {
+            try expect_kw(ps, tk.K_NULL)
+            (*ax.ast_n((*ps).ast, c)).flag = (*ax.ast_n((*ps).ast, c)).flag | 2
+            if accept_kw(ps, tk.K_ON) {
+                try expect_kw(ps, tk.K_CONFLICT)
+                try conflict_mode(ps)
+            }
+        } else if accept_kw(ps, tk.K_NULL) {
+            // NULL constraint: nothing
+        } else if accept_kw(ps, tk.K_UNIQUE) {
+            (*ax.ast_n((*ps).ast, c)).flag = (*ax.ast_n((*ps).ast, c)).flag | 4
+            if accept_kw(ps, tk.K_ON) {
+                try expect_kw(ps, tk.K_CONFLICT)
+                try conflict_mode(ps)
+            }
+        } else if accept_kw(ps, tk.K_CHECK) {
+            try expect_op(ps, tk.P_LPAREN)
+            let e: i32 = try parse_expr(ps, 1)
+            try expect_op(ps, tk.P_RPAREN)
+            if lastchk < 0 {
+                (*ax.ast_n((*ps).ast, c)).b = e
+            } else {
+                (*ax.ast_n((*ps).ast, lastchk)).next = e
+            }
+            lastchk = e
+        } else if accept_kw(ps, tk.K_DEFAULT) {
+            let e: i32 = try parse_default_value(ps)
+            (*ax.ast_n((*ps).ast, c)).a = e
+        } else if accept_kw(ps, tk.K_COLLATE) {
+            var cp: u64 = 0
+            var cn: usize = 0
+            try parse_name(ps, &cp, &cn)
+            let id: u32 = collation_id(cp, cn)
+            if id == 99 {
+                return unsupported("unknown collation (BINARY, NOCASE and RTRIM exist)")
+            }
+            (*ax.ast_n((*ps).ast, c)).op = id
+        } else if accept_kw(ps, tk.K_REFERENCES) {
+            try skip_references(ps)
+        } else if is_kw(ps, tk.K_GENERATED) || is_kw(ps, tk.K_AS) {
+            return unsupported("generated columns")
+        } else {
+            break
+        }
+    }
+    return c
+}
+
+fn parse_idxcols(ps: *mut Parser) -> DbError!i32 {
+    var head: i32 = -1
+    var last: i32 = -1
+    while true {
+        let c: i32 = try mk(ps, ax.N_IDXCOL)
+        var p1: u64 = 0
+        var n1: usize = 0
+        if at_name(ps) || (*ps).tok.kind == tk.TK_STR {
+            let sl: tk.Lexer = (*ps).lx
+            let st: tk.Token = (*ps).tok
+            try parse_name(ps, &p1, &n1)
+            if !(is_op(ps, tk.P_COMMA) || is_op(ps, tk.P_RPAREN) || is_kw(ps, tk.K_ASC) || is_kw(ps, tk.K_DESC) || is_kw(ps, tk.K_COLLATE)) {
+                (*ps).lx = sl
+                (*ps).tok = st
+                return unsupported("indexes on expressions")
+            }
+        } else {
+            return unsupported("indexes on expressions")
+        }
+        let cn: *mut ax.Node = ax.ast_n((*ps).ast, c)
+        (*cn).sp = p1
+        (*cn).sn = n1
+        if accept_kw(ps, tk.K_COLLATE) {
+            var cp: u64 = 0
+            var cnn: usize = 0
+            try parse_name(ps, &cp, &cnn)
+            let id: u32 = collation_id(cp, cnn)
+            if id == 99 {
+                return unsupported("unknown collation (BINARY, NOCASE and RTRIM exist)")
+            }
+            (*ax.ast_n((*ps).ast, c)).op = id
+        }
+        if accept_kw(ps, tk.K_DESC) {
+            (*ax.ast_n((*ps).ast, c)).flag = 1
+        } else {
+            accept_kw(ps, tk.K_ASC)
+        }
+        if last < 0 {
+            head = c
+        } else {
+            (*ax.ast_n((*ps).ast, last)).next = c
+        }
+        last = c
+        if !accept_op(ps, tk.P_COMMA) {
+            break
+        }
+    }
+    return head
+}
+
+fn parse_create_table(ps: *mut Parser, start: usize) -> DbError!i32 {
+    let s: i32 = try mk(ps, ax.N_CREATE_TABLE)
+    if accept_kw(ps, tk.K_IF) {
+        try expect_kw(ps, tk.K_NOT)
+        try expect_kw(ps, tk.K_EXISTS)
+        (*ax.ast_n((*ps).ast, s)).flag = 1
+    }
+    var p1: u64 = 0
+    var n1: usize = 0
+    try parse_name(ps, &p1, &n1)
+    if is_op(ps, tk.P_DOT) {
+        advance(ps)
+        var p2: u64 = 0
+        var n2: usize = 0
+        try parse_name(ps, &p2, &n2)
+        p1 = p2
+        n1 = n2
+    }
+    let sn0: *mut ax.Node = ax.ast_n((*ps).ast, s)
+    (*sn0).sp = p1
+    (*sn0).sn = n1
+    if is_kw(ps, tk.K_AS) {
+        return unsupported("CREATE TABLE ... AS SELECT")
+    }
+    try expect_op(ps, tk.P_LPAREN)
+    var lastc: i32 = -1
+    var lastk: i32 = -1
+    while true {
+        // table constraint or column
+        var is_cons: bool = false
+        if is_kw(ps, tk.K_CONSTRAINT) {
+            advance(ps)
+            var qp: u64 = 0
+            var qn: usize = 0
+            try parse_name(ps, &qp, &qn)
+            is_cons = true
+        }
+        if is_kw(ps, tk.K_PRIMARY) || is_kw(ps, tk.K_UNIQUE) || is_kw(ps, tk.K_CHECK) || is_kw(ps, tk.K_FOREIGN) {
+            is_cons = true
+        }
+        if is_cons {
+            let k: i32 = try mk(ps, ax.N_TBLCONS)
+            if accept_kw(ps, tk.K_PRIMARY) {
+                try expect_kw(ps, tk.K_KEY)
+                try expect_op(ps, tk.P_LPAREN)
+                let cl: i32 = try parse_idxcols(ps)
+                try expect_op(ps, tk.P_RPAREN)
+                let kn: *mut ax.Node = ax.ast_n((*ps).ast, k)
+                (*kn).op = 1
+                (*kn).a = cl
+                if accept_kw(ps, tk.K_ON) {
+                    try expect_kw(ps, tk.K_CONFLICT)
+                    try conflict_mode(ps)
+                }
+            } else if accept_kw(ps, tk.K_UNIQUE) {
+                try expect_op(ps, tk.P_LPAREN)
+                let cl: i32 = try parse_idxcols(ps)
+                try expect_op(ps, tk.P_RPAREN)
+                let kn: *mut ax.Node = ax.ast_n((*ps).ast, k)
+                (*kn).op = 2
+                (*kn).a = cl
+                if accept_kw(ps, tk.K_ON) {
+                    try expect_kw(ps, tk.K_CONFLICT)
+                    try conflict_mode(ps)
+                }
+            } else if accept_kw(ps, tk.K_CHECK) {
+                try expect_op(ps, tk.P_LPAREN)
+                let e: i32 = try parse_expr(ps, 1)
+                try expect_op(ps, tk.P_RPAREN)
+                let kn: *mut ax.Node = ax.ast_n((*ps).ast, k)
+                (*kn).op = 3
+                (*kn).a = e
+            } else if accept_kw(ps, tk.K_FOREIGN) {
+                try expect_kw(ps, tk.K_KEY)
+                try expect_op(ps, tk.P_LPAREN)
+                let cl: i32 = try parse_name_list(ps)
+                try expect_op(ps, tk.P_RPAREN)
+                try expect_kw(ps, tk.K_REFERENCES)
+                try skip_references(ps)
+                (*ax.ast_n((*ps).ast, k)).op = 4
+            } else {
+                return syntax(ps)
+            }
+            if lastk < 0 {
+                (*ax.ast_n((*ps).ast, s)).b = k
+            } else {
+                (*ax.ast_n((*ps).ast, lastk)).next = k
+            }
+            lastk = k
+        } else {
+            let c: i32 = try parse_coldef(ps)
+            if lastc < 0 {
+                (*ax.ast_n((*ps).ast, s)).a = c
+            } else {
+                (*ax.ast_n((*ps).ast, lastc)).next = c
+            }
+            lastc = c
+        }
+        if !accept_op(ps, tk.P_COMMA) {
+            break
+        }
+    }
+    if lastc < 0 {
+        return syntax(ps)
+    }
+    try expect_op(ps, tk.P_RPAREN)
+    if is_kw(ps, tk.K_WITHOUT) {
+        return unsupported("WITHOUT ROWID tables")
+    }
+    // text of the statement for sqlite_master
+    let sn1: *mut ax.Node = ax.ast_n((*ps).ast, s)
+    (*sn1).d = start as i32
+    (*sn1).e = (*ps).last_end as i32
+    return s
+}
+
+fn parse_create_index(ps: *mut Parser, start: usize, unique: bool) -> DbError!i32 {
+    let s: i32 = try mk(ps, ax.N_CREATE_INDEX)
+    if unique {
+        (*ax.ast_n((*ps).ast, s)).flag = 1
+    }
+    if accept_kw(ps, tk.K_IF) {
+        try expect_kw(ps, tk.K_NOT)
+        try expect_kw(ps, tk.K_EXISTS)
+        (*ax.ast_n((*ps).ast, s)).flag = (*ax.ast_n((*ps).ast, s)).flag | 2
+    }
+    var p1: u64 = 0
+    var n1: usize = 0
+    try parse_name(ps, &p1, &n1)
+    if is_op(ps, tk.P_DOT) {
+        advance(ps)
+        var p2: u64 = 0
+        var n2: usize = 0
+        try parse_name(ps, &p2, &n2)
+        p1 = p2
+        n1 = n2
+    }
+    try expect_kw(ps, tk.K_ON)
+    var t1: u64 = 0
+    var tn: usize = 0
+    try parse_name(ps, &t1, &tn)
+    try expect_op(ps, tk.P_LPAREN)
+    let cols: i32 = try parse_idxcols(ps)
+    try expect_op(ps, tk.P_RPAREN)
+    if is_kw(ps, tk.K_WHERE) {
+        return unsupported("partial indexes")
+    }
+    let sn: *mut ax.Node = ax.ast_n((*ps).ast, s)
+    (*sn).sp = p1
+    (*sn).sn = n1
+    (*sn).sp2 = t1
+    (*sn).sn2 = tn
+    (*sn).a = cols
+    (*sn).d = start as i32
+    (*sn).e = (*ps).last_end as i32
+    return s
+}
+
+fn parse_stmt_inner(ps: *mut Parser) -> DbError!i32 {
+    let start: usize = (*ps).tok.start
+    if is_kw(ps, tk.K_SELECT) {
+        return try parse_select(ps)
+    }
+    if is_kw(ps, tk.K_VALUES) || is_kw(ps, tk.K_WITH) {
+        return unsupported("WITH / VALUES statements")
+    }
+    if accept_kw(ps, tk.K_INSERT) {
+        return try parse_insert(ps, false)
+    }
+    if accept_kw(ps, tk.K_REPLACE) {
+        return try parse_insert(ps, true)
+    }
+    if accept_kw(ps, tk.K_UPDATE) {
+        return try parse_update(ps)
+    }
+    if accept_kw(ps, tk.K_DELETE) {
+        return try parse_delete(ps)
+    }
+    if accept_kw(ps, tk.K_CREATE) {
+        accept_kw(ps, tk.K_TEMP)
+        accept_kw(ps, tk.K_TEMPORARY)
+        if accept_kw(ps, tk.K_TABLE) {
+            return try parse_create_table(ps, start)
+        }
+        var unique: bool = false
+        if accept_kw(ps, tk.K_UNIQUE) {
+            unique = true
+        }
+        if accept_kw(ps, tk.K_INDEX) {
+            return try parse_create_index(ps, start, unique)
+        }
+        if is_kw(ps, tk.K_VIEW) || is_kw(ps, tk.K_TRIGGER) || is_kw(ps, tk.K_VIRTUAL) {
+            return unsupported("CREATE VIEW / TRIGGER / VIRTUAL TABLE")
+        }
+        return syntax(ps)
+    }
+    if accept_kw(ps, tk.K_DROP) {
+        let s: i32 = try mk(ps, ax.N_DROP)
+        if accept_kw(ps, tk.K_TABLE) {
+            (*ax.ast_n((*ps).ast, s)).op = 1
+        } else if accept_kw(ps, tk.K_INDEX) {
+            (*ax.ast_n((*ps).ast, s)).op = 2
+        } else if is_kw(ps, tk.K_VIEW) || is_kw(ps, tk.K_TRIGGER) {
+            return unsupported("DROP VIEW / TRIGGER")
+        } else {
+            return syntax(ps)
+        }
+        if accept_kw(ps, tk.K_IF) {
+            try expect_kw(ps, tk.K_EXISTS)
+            (*ax.ast_n((*ps).ast, s)).flag = 1
+        }
+        var p1: u64 = 0
+        var n1: usize = 0
+        try parse_name(ps, &p1, &n1)
+        if is_op(ps, tk.P_DOT) {
+            advance(ps)
+            var p2: u64 = 0
+            var n2: usize = 0
+            try parse_name(ps, &p2, &n2)
+            p1 = p2
+            n1 = n2
+        }
+        let sn: *mut ax.Node = ax.ast_n((*ps).ast, s)
+        (*sn).sp = p1
+        (*sn).sn = n1
+        return s
+    }
+    if accept_kw(ps, tk.K_ALTER) {
+        try expect_kw(ps, tk.K_TABLE)
+        let s: i32 = try mk(ps, ax.N_ALTER)
+        var p1: u64 = 0
+        var n1: usize = 0
+        try parse_name(ps, &p1, &n1)
+        let sna: *mut ax.Node = ax.ast_n((*ps).ast, s)
+        (*sna).sp = p1
+        (*sna).sn = n1
+        if accept_kw(ps, tk.K_ADD) {
+            accept_kw(ps, tk.K_COLUMN)
+            let c: i32 = try parse_coldef(ps)
+            let snb: *mut ax.Node = ax.ast_n((*ps).ast, s)
+            (*snb).op = 1
+            (*snb).a = c
+            (*snb).d = (*ps).last_end as i32
+            return s
+        }
+        if accept_kw(ps, tk.K_RENAME) {
+            if accept_kw(ps, tk.K_TO) {
+                var p2: u64 = 0
+                var n2: usize = 0
+                try parse_name(ps, &p2, &n2)
+                let sn: *mut ax.Node = ax.ast_n((*ps).ast, s)
+                (*sn).op = 2
+                (*sn).sp2 = p2
+                (*sn).sn2 = n2
+                return s
+            }
+            accept_kw(ps, tk.K_COLUMN)
+            return unsupported("ALTER TABLE ... RENAME COLUMN")
+        }
+        return syntax(ps)
+    }
+    if accept_kw(ps, tk.K_BEGIN) {
+        let s: i32 = try mk(ps, ax.N_BEGIN)
+        if accept_kw(ps, tk.K_DEFERRED) {
+            (*ax.ast_n((*ps).ast, s)).op = 0
+        } else if accept_kw(ps, tk.K_IMMEDIATE) {
+            (*ax.ast_n((*ps).ast, s)).op = 1
+        } else if accept_kw(ps, tk.K_EXCLUSIVE) {
+            (*ax.ast_n((*ps).ast, s)).op = 2
+        }
+        accept_kw(ps, tk.K_TRANSACTION)
+        return s
+    }
+    if accept_kw(ps, tk.K_COMMIT) || accept_kw(ps, tk.K_END) {
+        accept_kw(ps, tk.K_TRANSACTION)
+        return try mk(ps, ax.N_COMMIT)
+    }
+    if accept_kw(ps, tk.K_ROLLBACK) {
+        accept_kw(ps, tk.K_TRANSACTION)
+        if is_kw(ps, tk.K_TO) {
+            return unsupported("ROLLBACK TO (savepoints)")
+        }
+        return try mk(ps, ax.N_ROLLBACK)
+    }
+    if is_kw(ps, tk.K_SAVEPOINT) || is_kw(ps, tk.K_RELEASE) {
+        return unsupported("savepoints")
+    }
+    if accept_kw(ps, tk.K_PRAGMA) {
+        let s: i32 = try mk(ps, ax.N_PRAGMA)
+        var p1: u64 = 0
+        var n1: usize = 0
+        try parse_name(ps, &p1, &n1)
+        if is_op(ps, tk.P_DOT) {
+            advance(ps)
+            var p2: u64 = 0
+            var n2: usize = 0
+            try parse_name(ps, &p2, &n2)
+            p1 = p2
+            n1 = n2
+        }
+        let snp: *mut ax.Node = ax.ast_n((*ps).ast, s)
+        (*snp).sp = p1
+        (*snp).sn = n1
+        if accept_op(ps, tk.P_EQ) || is_op(ps, tk.P_LPAREN) {
+            var paren: bool = false
+            if is_op(ps, tk.P_LPAREN) {
+                advance(ps)
+                paren = true
+            }
+            // a signed number, a string or a bare word
+            if (*ps).tok.kind == tk.TK_ID && !(*ps).tok.quoted {
+                let n: i32 = try mk(ps, ax.N_STR)
+                let nn: *mut ax.Node = ax.ast_n((*ps).ast, n)
+                (*nn).sp = ax.ast_copy_text((*ps).ast, (*ps).tok.p, (*ps).tok.n)
+                (*nn).sn = (*ps).tok.n
+                advance(ps)
+                (*ax.ast_n((*ps).ast, s)).a = n
+            } else {
+                let e: i32 = try parse_unary(ps)
+                (*ax.ast_n((*ps).ast, s)).a = e
+            }
+            if paren {
+                try expect_op(ps, tk.P_RPAREN)
+            }
+        }
+        return s
+    }
+    if accept_kw(ps, tk.K_VACUUM) {
+        return try mk(ps, ax.N_VACUUM)
+    }
+    if accept_kw(ps, tk.K_ANALYZE) {
+        // ANALYZE [name]
+        if (*ps).tok.kind == tk.TK_ID {
+            advance(ps)
+        }
+        return try mk(ps, ax.N_ANALYZE)
+    }
+    if is_kw(ps, tk.K_EXPLAIN) {
+        return unsupported("EXPLAIN")
+    }
+    return syntax(ps)
+}
+
+// Parses the next statement of the text. The answer is the root node, or
+// -1 when only ';' and white space are left.
+fn parse_stmt(ps: *mut Parser) -> DbError!i32 {
+    while is_op(ps, tk.P_SEMI) {
+        advance(ps)
+    }
+    if (*ps).tok.kind == tk.TK_EOF {
+        return -1
+    }
+    (*ps).depth = 0
+    let r: i32 = try parse_stmt_inner(ps)
+    // a statement ends at ';' or the end of the text
+    if is_op(ps, tk.P_SEMI) {
+        advance(ps)
+    } else if (*ps).tok.kind != tk.TK_EOF {
+        return syntax(ps)
+    }
+    (*(*ps).ast).root = r
+    return r
+}

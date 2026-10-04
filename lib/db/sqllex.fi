@@ -1,0 +1,992 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/sqllex.fi -- the tokenizer of the SQL dialect (SQLite's).
+//
+// Tokens: identifiers and keywords (`TK_ID`, the keyword number in `code`
+// when it is one and was not quoted), quoted identifiers ("x", `x`, [x]),
+// strings ('it''s', raw span, `esc` set when it holds '' pairs), integer and
+// real numbers (decimal, 0x hex, exponent), blobs (X'4142'), parameters
+// (?, ?NNN, :name, @name, $name) and operators. Comments (-- and /* */) and
+// white space are skipped. Text is UTF-8 and is never validated here.
+
+import std.rt
+import std.num
+import db.util
+
+export {
+    Lexer, Token, lex_new, lex_next, kw_code, tok_is_op, lex_eq_ci, tok_text,
+    TK_EOF, TK_ID, TK_STR, TK_INT, TK_FLOAT, TK_BLOB, TK_PARAM, TK_OP, TK_ERR,
+    P_PLUS, P_MINUS, P_STAR, P_SLASH, P_PERCENT, P_LPAREN, P_RPAREN, P_COMMA, P_SEMI, P_DOT,
+    P_EQ, P_NE, P_LT, P_LE, P_GT, P_GE, P_CONCAT, P_BITAND, P_BITOR, P_LSHIFT, P_RSHIFT,
+    P_TILDE,
+    K_SELECT, K_FROM, K_WHERE, K_GROUP, K_BY, K_HAVING, K_ORDER, K_LIMIT, K_OFFSET, K_DISTINCT, K_ALL, K_AS, K_JOIN, K_INNER, K_LEFT, K_RIGHT, K_FULL, K_OUTER, K_CROSS, K_NATURAL, K_ON, K_USING, K_UNION, K_INTERSECT, K_EXCEPT, K_AND, K_OR, K_NOT, K_IN, K_IS, K_NULL, K_LIKE, K_GLOB, K_BETWEEN, K_ESCAPE, K_CASE, K_WHEN, K_THEN, K_ELSE, K_END, K_EXISTS, K_CAST, K_COLLATE, K_ASC, K_DESC, K_NULLS, K_FIRST, K_LAST, K_INSERT, K_INTO, K_VALUES, K_DEFAULT, K_UPDATE, K_SET, K_DELETE, K_REPLACE, K_CREATE, K_TABLE, K_INDEX, K_UNIQUE, K_PRIMARY, K_KEY, K_AUTOINCREMENT, K_CHECK, K_REFERENCES, K_FOREIGN, K_CONSTRAINT, K_IF, K_DROP, K_ALTER, K_ADD, K_COLUMN, K_RENAME, K_TO, K_BEGIN, K_COMMIT, K_ROLLBACK, K_TRANSACTION, K_DEFERRED, K_IMMEDIATE, K_EXCLUSIVE, K_PRAGMA, K_VACUUM, K_ANALYZE, K_TEMP, K_TEMPORARY, K_ISNULL, K_NOTNULL, K_MATCH, K_REGEXP, K_IGNORE, K_ABORT, K_FAIL, K_WITHOUT, K_ROWID, K_TRUE, K_FALSE, K_VIEW, K_TRIGGER, K_EXPLAIN, K_SAVEPOINT, K_RELEASE, K_DEFERRABLE, K_INITIALLY, K_WITH, K_RECURSIVE, K_CURRENT_TIME, K_CURRENT_DATE, K_CURRENT_TIMESTAMP, K_CONFLICT, K_DO, K_NOTHING, K_RETURNING, K_OVER, K_WINDOW, K_PARTITION, K_GENERATED, K_ALWAYS, K_STORED, K_VIRTUAL, K_DATABASE, K_ATTACH, K_DETACH, K_REINDEX
+}
+
+const TK_EOF: u32 = 0
+const TK_ID: u32 = 1
+const TK_STR: u32 = 2
+const TK_INT: u32 = 3
+const TK_FLOAT: u32 = 4
+const TK_BLOB: u32 = 5
+const TK_PARAM: u32 = 6
+const TK_OP: u32 = 7
+const TK_ERR: u32 = 8
+
+const P_PLUS: u32 = 1
+const P_MINUS: u32 = 2
+const P_STAR: u32 = 3
+const P_SLASH: u32 = 4
+const P_PERCENT: u32 = 5
+const P_LPAREN: u32 = 6
+const P_RPAREN: u32 = 7
+const P_COMMA: u32 = 8
+const P_SEMI: u32 = 9
+const P_DOT: u32 = 10
+const P_EQ: u32 = 11
+const P_NE: u32 = 12
+const P_LT: u32 = 13
+const P_LE: u32 = 14
+const P_GT: u32 = 15
+const P_GE: u32 = 16
+const P_CONCAT: u32 = 17
+const P_BITAND: u32 = 18
+const P_BITOR: u32 = 19
+const P_LSHIFT: u32 = 20
+const P_RSHIFT: u32 = 21
+const P_TILDE: u32 = 22
+
+const K_SELECT: u32 = 1
+const K_FROM: u32 = 2
+const K_WHERE: u32 = 3
+const K_GROUP: u32 = 4
+const K_BY: u32 = 5
+const K_HAVING: u32 = 6
+const K_ORDER: u32 = 7
+const K_LIMIT: u32 = 8
+const K_OFFSET: u32 = 9
+const K_DISTINCT: u32 = 10
+const K_ALL: u32 = 11
+const K_AS: u32 = 12
+const K_JOIN: u32 = 13
+const K_INNER: u32 = 14
+const K_LEFT: u32 = 15
+const K_RIGHT: u32 = 16
+const K_FULL: u32 = 17
+const K_OUTER: u32 = 18
+const K_CROSS: u32 = 19
+const K_NATURAL: u32 = 20
+const K_ON: u32 = 21
+const K_USING: u32 = 22
+const K_UNION: u32 = 23
+const K_INTERSECT: u32 = 24
+const K_EXCEPT: u32 = 25
+const K_AND: u32 = 26
+const K_OR: u32 = 27
+const K_NOT: u32 = 28
+const K_IN: u32 = 29
+const K_IS: u32 = 30
+const K_NULL: u32 = 31
+const K_LIKE: u32 = 32
+const K_GLOB: u32 = 33
+const K_BETWEEN: u32 = 34
+const K_ESCAPE: u32 = 35
+const K_CASE: u32 = 36
+const K_WHEN: u32 = 37
+const K_THEN: u32 = 38
+const K_ELSE: u32 = 39
+const K_END: u32 = 40
+const K_EXISTS: u32 = 41
+const K_CAST: u32 = 42
+const K_COLLATE: u32 = 43
+const K_ASC: u32 = 44
+const K_DESC: u32 = 45
+const K_NULLS: u32 = 46
+const K_FIRST: u32 = 47
+const K_LAST: u32 = 48
+const K_INSERT: u32 = 49
+const K_INTO: u32 = 50
+const K_VALUES: u32 = 51
+const K_DEFAULT: u32 = 52
+const K_UPDATE: u32 = 53
+const K_SET: u32 = 54
+const K_DELETE: u32 = 55
+const K_REPLACE: u32 = 56
+const K_CREATE: u32 = 57
+const K_TABLE: u32 = 58
+const K_INDEX: u32 = 59
+const K_UNIQUE: u32 = 60
+const K_PRIMARY: u32 = 61
+const K_KEY: u32 = 62
+const K_AUTOINCREMENT: u32 = 63
+const K_CHECK: u32 = 64
+const K_REFERENCES: u32 = 65
+const K_FOREIGN: u32 = 66
+const K_CONSTRAINT: u32 = 67
+const K_IF: u32 = 68
+const K_DROP: u32 = 69
+const K_ALTER: u32 = 70
+const K_ADD: u32 = 71
+const K_COLUMN: u32 = 72
+const K_RENAME: u32 = 73
+const K_TO: u32 = 74
+const K_BEGIN: u32 = 75
+const K_COMMIT: u32 = 76
+const K_ROLLBACK: u32 = 77
+const K_TRANSACTION: u32 = 78
+const K_DEFERRED: u32 = 79
+const K_IMMEDIATE: u32 = 80
+const K_EXCLUSIVE: u32 = 81
+const K_PRAGMA: u32 = 82
+const K_VACUUM: u32 = 83
+const K_ANALYZE: u32 = 84
+const K_TEMP: u32 = 85
+const K_TEMPORARY: u32 = 86
+const K_ISNULL: u32 = 87
+const K_NOTNULL: u32 = 88
+const K_MATCH: u32 = 89
+const K_REGEXP: u32 = 90
+const K_IGNORE: u32 = 91
+const K_ABORT: u32 = 92
+const K_FAIL: u32 = 93
+const K_WITHOUT: u32 = 94
+const K_ROWID: u32 = 95
+const K_TRUE: u32 = 96
+const K_FALSE: u32 = 97
+const K_VIEW: u32 = 98
+const K_TRIGGER: u32 = 99
+const K_EXPLAIN: u32 = 100
+const K_SAVEPOINT: u32 = 101
+const K_RELEASE: u32 = 102
+const K_DEFERRABLE: u32 = 103
+const K_INITIALLY: u32 = 104
+const K_WITH: u32 = 105
+const K_RECURSIVE: u32 = 106
+const K_CURRENT_TIME: u32 = 107
+const K_CURRENT_DATE: u32 = 108
+const K_CURRENT_TIMESTAMP: u32 = 109
+const K_CONFLICT: u32 = 110
+const K_DO: u32 = 111
+const K_NOTHING: u32 = 112
+const K_RETURNING: u32 = 113
+const K_OVER: u32 = 114
+const K_WINDOW: u32 = 115
+const K_PARTITION: u32 = 116
+const K_GENERATED: u32 = 117
+const K_ALWAYS: u32 = 118
+const K_STORED: u32 = 119
+const K_VIRTUAL: u32 = 120
+const K_DATABASE: u32 = 121
+const K_ATTACH: u32 = 122
+const K_DETACH: u32 = 123
+const K_REINDEX: u32 = 124
+
+struct Lexer {
+    p: u64,
+    n: usize,
+    pos: usize,
+}
+
+struct Token {
+    kind: u32,
+    code: u32, // keyword number (TK_ID) or operator number (TK_OP)
+    p: u64, // the text (inside the quotes for a quoted name or string)
+    n: usize,
+    start: usize, // offset of the first octet of the token (with quotes)
+    end: usize, // offset after the token
+    ival: i64,
+    fval: f64,
+    esc: bool, // the text holds doubled quotes
+    quoted: bool,
+}
+
+fn lex_new(p: u64, n: usize) -> Lexer {
+    return Lexer { p: p, n: n, pos: 0 }
+}
+
+fn tok_blank() -> Token {
+    return Token { kind: 0, code: 0, p: 0, n: 0, start: 0, end: 0, ival: 0, fval: 0.0, esc: false,
+        quoted: false }
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+// text of p[0..n] equals the (upper case) word, ignoring case
+fn eq_ci_at(p: u64, word: str) -> bool {
+    let n: usize = word.length()
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        let w: u8 = word.chars(i)
+        if c != w && c != w + 32 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn eq_ci(p: u64, word: str) -> bool {
+    return eq_ci_at(p, word)
+}
+
+fn lex_eq_ci(p: u64, n: usize, word: str) -> bool {
+    if n != word.length() {
+        return false
+    }
+    return eq_ci_at(p, word)
+}
+
+fn tok_text(t: *mut Token) -> str {
+    return str { p: (*t).p as *mut u8, n: (*t).n }
+}
+
+fn tok_is_op(t: *mut Token, code: u32) -> bool {
+    return (*t).kind == TK_OP && (*t).code == code
+}
+
+// the keyword number of the word at p (n octets), 0 if it is none
+fn kw_code(p: u64, n: usize) -> u32 {
+    if n < 2 || n > 17 {
+        return 0
+    }
+    if n == 6 && eq_ci(p, "SELECT") {
+        return K_SELECT
+    }
+    if n == 4 && eq_ci(p, "FROM") {
+        return K_FROM
+    }
+    if n == 5 && eq_ci(p, "WHERE") {
+        return K_WHERE
+    }
+    if n == 5 && eq_ci(p, "GROUP") {
+        return K_GROUP
+    }
+    if n == 2 && eq_ci(p, "BY") {
+        return K_BY
+    }
+    if n == 6 && eq_ci(p, "HAVING") {
+        return K_HAVING
+    }
+    if n == 5 && eq_ci(p, "ORDER") {
+        return K_ORDER
+    }
+    if n == 5 && eq_ci(p, "LIMIT") {
+        return K_LIMIT
+    }
+    if n == 6 && eq_ci(p, "OFFSET") {
+        return K_OFFSET
+    }
+    if n == 8 && eq_ci(p, "DISTINCT") {
+        return K_DISTINCT
+    }
+    if n == 3 && eq_ci(p, "ALL") {
+        return K_ALL
+    }
+    if n == 2 && eq_ci(p, "AS") {
+        return K_AS
+    }
+    if n == 4 && eq_ci(p, "JOIN") {
+        return K_JOIN
+    }
+    if n == 5 && eq_ci(p, "INNER") {
+        return K_INNER
+    }
+    if n == 4 && eq_ci(p, "LEFT") {
+        return K_LEFT
+    }
+    if n == 5 && eq_ci(p, "RIGHT") {
+        return K_RIGHT
+    }
+    if n == 4 && eq_ci(p, "FULL") {
+        return K_FULL
+    }
+    if n == 5 && eq_ci(p, "OUTER") {
+        return K_OUTER
+    }
+    if n == 5 && eq_ci(p, "CROSS") {
+        return K_CROSS
+    }
+    if n == 7 && eq_ci(p, "NATURAL") {
+        return K_NATURAL
+    }
+    if n == 2 && eq_ci(p, "ON") {
+        return K_ON
+    }
+    if n == 5 && eq_ci(p, "USING") {
+        return K_USING
+    }
+    if n == 5 && eq_ci(p, "UNION") {
+        return K_UNION
+    }
+    if n == 9 && eq_ci(p, "INTERSECT") {
+        return K_INTERSECT
+    }
+    if n == 6 && eq_ci(p, "EXCEPT") {
+        return K_EXCEPT
+    }
+    if n == 3 && eq_ci(p, "AND") {
+        return K_AND
+    }
+    if n == 2 && eq_ci(p, "OR") {
+        return K_OR
+    }
+    if n == 3 && eq_ci(p, "NOT") {
+        return K_NOT
+    }
+    if n == 2 && eq_ci(p, "IN") {
+        return K_IN
+    }
+    if n == 2 && eq_ci(p, "IS") {
+        return K_IS
+    }
+    if n == 4 && eq_ci(p, "NULL") {
+        return K_NULL
+    }
+    if n == 4 && eq_ci(p, "LIKE") {
+        return K_LIKE
+    }
+    if n == 4 && eq_ci(p, "GLOB") {
+        return K_GLOB
+    }
+    if n == 7 && eq_ci(p, "BETWEEN") {
+        return K_BETWEEN
+    }
+    if n == 6 && eq_ci(p, "ESCAPE") {
+        return K_ESCAPE
+    }
+    if n == 4 && eq_ci(p, "CASE") {
+        return K_CASE
+    }
+    if n == 4 && eq_ci(p, "WHEN") {
+        return K_WHEN
+    }
+    if n == 4 && eq_ci(p, "THEN") {
+        return K_THEN
+    }
+    if n == 4 && eq_ci(p, "ELSE") {
+        return K_ELSE
+    }
+    if n == 3 && eq_ci(p, "END") {
+        return K_END
+    }
+    if n == 6 && eq_ci(p, "EXISTS") {
+        return K_EXISTS
+    }
+    if n == 4 && eq_ci(p, "CAST") {
+        return K_CAST
+    }
+    if n == 7 && eq_ci(p, "COLLATE") {
+        return K_COLLATE
+    }
+    if n == 3 && eq_ci(p, "ASC") {
+        return K_ASC
+    }
+    if n == 4 && eq_ci(p, "DESC") {
+        return K_DESC
+    }
+    if n == 5 && eq_ci(p, "NULLS") {
+        return K_NULLS
+    }
+    if n == 5 && eq_ci(p, "FIRST") {
+        return K_FIRST
+    }
+    if n == 4 && eq_ci(p, "LAST") {
+        return K_LAST
+    }
+    if n == 6 && eq_ci(p, "INSERT") {
+        return K_INSERT
+    }
+    if n == 4 && eq_ci(p, "INTO") {
+        return K_INTO
+    }
+    if n == 6 && eq_ci(p, "VALUES") {
+        return K_VALUES
+    }
+    if n == 7 && eq_ci(p, "DEFAULT") {
+        return K_DEFAULT
+    }
+    if n == 6 && eq_ci(p, "UPDATE") {
+        return K_UPDATE
+    }
+    if n == 3 && eq_ci(p, "SET") {
+        return K_SET
+    }
+    if n == 6 && eq_ci(p, "DELETE") {
+        return K_DELETE
+    }
+    if n == 7 && eq_ci(p, "REPLACE") {
+        return K_REPLACE
+    }
+    if n == 6 && eq_ci(p, "CREATE") {
+        return K_CREATE
+    }
+    if n == 5 && eq_ci(p, "TABLE") {
+        return K_TABLE
+    }
+    if n == 5 && eq_ci(p, "INDEX") {
+        return K_INDEX
+    }
+    if n == 6 && eq_ci(p, "UNIQUE") {
+        return K_UNIQUE
+    }
+    if n == 7 && eq_ci(p, "PRIMARY") {
+        return K_PRIMARY
+    }
+    if n == 3 && eq_ci(p, "KEY") {
+        return K_KEY
+    }
+    if n == 13 && eq_ci(p, "AUTOINCREMENT") {
+        return K_AUTOINCREMENT
+    }
+    if n == 5 && eq_ci(p, "CHECK") {
+        return K_CHECK
+    }
+    if n == 10 && eq_ci(p, "REFERENCES") {
+        return K_REFERENCES
+    }
+    if n == 7 && eq_ci(p, "FOREIGN") {
+        return K_FOREIGN
+    }
+    if n == 10 && eq_ci(p, "CONSTRAINT") {
+        return K_CONSTRAINT
+    }
+    if n == 2 && eq_ci(p, "IF") {
+        return K_IF
+    }
+    if n == 4 && eq_ci(p, "DROP") {
+        return K_DROP
+    }
+    if n == 5 && eq_ci(p, "ALTER") {
+        return K_ALTER
+    }
+    if n == 3 && eq_ci(p, "ADD") {
+        return K_ADD
+    }
+    if n == 6 && eq_ci(p, "COLUMN") {
+        return K_COLUMN
+    }
+    if n == 6 && eq_ci(p, "RENAME") {
+        return K_RENAME
+    }
+    if n == 2 && eq_ci(p, "TO") {
+        return K_TO
+    }
+    if n == 5 && eq_ci(p, "BEGIN") {
+        return K_BEGIN
+    }
+    if n == 6 && eq_ci(p, "COMMIT") {
+        return K_COMMIT
+    }
+    if n == 8 && eq_ci(p, "ROLLBACK") {
+        return K_ROLLBACK
+    }
+    if n == 11 && eq_ci(p, "TRANSACTION") {
+        return K_TRANSACTION
+    }
+    if n == 8 && eq_ci(p, "DEFERRED") {
+        return K_DEFERRED
+    }
+    if n == 9 && eq_ci(p, "IMMEDIATE") {
+        return K_IMMEDIATE
+    }
+    if n == 9 && eq_ci(p, "EXCLUSIVE") {
+        return K_EXCLUSIVE
+    }
+    if n == 6 && eq_ci(p, "PRAGMA") {
+        return K_PRAGMA
+    }
+    if n == 6 && eq_ci(p, "VACUUM") {
+        return K_VACUUM
+    }
+    if n == 7 && eq_ci(p, "ANALYZE") {
+        return K_ANALYZE
+    }
+    if n == 4 && eq_ci(p, "TEMP") {
+        return K_TEMP
+    }
+    if n == 9 && eq_ci(p, "TEMPORARY") {
+        return K_TEMPORARY
+    }
+    if n == 6 && eq_ci(p, "ISNULL") {
+        return K_ISNULL
+    }
+    if n == 7 && eq_ci(p, "NOTNULL") {
+        return K_NOTNULL
+    }
+    if n == 5 && eq_ci(p, "MATCH") {
+        return K_MATCH
+    }
+    if n == 6 && eq_ci(p, "REGEXP") {
+        return K_REGEXP
+    }
+    if n == 6 && eq_ci(p, "IGNORE") {
+        return K_IGNORE
+    }
+    if n == 5 && eq_ci(p, "ABORT") {
+        return K_ABORT
+    }
+    if n == 4 && eq_ci(p, "FAIL") {
+        return K_FAIL
+    }
+    if n == 7 && eq_ci(p, "WITHOUT") {
+        return K_WITHOUT
+    }
+    if n == 5 && eq_ci(p, "ROWID") {
+        return K_ROWID
+    }
+    if n == 4 && eq_ci(p, "TRUE") {
+        return K_TRUE
+    }
+    if n == 5 && eq_ci(p, "FALSE") {
+        return K_FALSE
+    }
+    if n == 4 && eq_ci(p, "VIEW") {
+        return K_VIEW
+    }
+    if n == 7 && eq_ci(p, "TRIGGER") {
+        return K_TRIGGER
+    }
+    if n == 7 && eq_ci(p, "EXPLAIN") {
+        return K_EXPLAIN
+    }
+    if n == 9 && eq_ci(p, "SAVEPOINT") {
+        return K_SAVEPOINT
+    }
+    if n == 7 && eq_ci(p, "RELEASE") {
+        return K_RELEASE
+    }
+    if n == 10 && eq_ci(p, "DEFERRABLE") {
+        return K_DEFERRABLE
+    }
+    if n == 9 && eq_ci(p, "INITIALLY") {
+        return K_INITIALLY
+    }
+    if n == 4 && eq_ci(p, "WITH") {
+        return K_WITH
+    }
+    if n == 9 && eq_ci(p, "RECURSIVE") {
+        return K_RECURSIVE
+    }
+    if n == 12 && eq_ci(p, "CURRENT_TIME") {
+        return K_CURRENT_TIME
+    }
+    if n == 12 && eq_ci(p, "CURRENT_DATE") {
+        return K_CURRENT_DATE
+    }
+    if n == 17 && eq_ci(p, "CURRENT_TIMESTAMP") {
+        return K_CURRENT_TIMESTAMP
+    }
+    if n == 8 && eq_ci(p, "CONFLICT") {
+        return K_CONFLICT
+    }
+    if n == 2 && eq_ci(p, "DO") {
+        return K_DO
+    }
+    if n == 7 && eq_ci(p, "NOTHING") {
+        return K_NOTHING
+    }
+    if n == 9 && eq_ci(p, "RETURNING") {
+        return K_RETURNING
+    }
+    if n == 4 && eq_ci(p, "OVER") {
+        return K_OVER
+    }
+    if n == 6 && eq_ci(p, "WINDOW") {
+        return K_WINDOW
+    }
+    if n == 9 && eq_ci(p, "PARTITION") {
+        return K_PARTITION
+    }
+    if n == 9 && eq_ci(p, "GENERATED") {
+        return K_GENERATED
+    }
+    if n == 6 && eq_ci(p, "ALWAYS") {
+        return K_ALWAYS
+    }
+    if n == 6 && eq_ci(p, "STORED") {
+        return K_STORED
+    }
+    if n == 7 && eq_ci(p, "VIRTUAL") {
+        return K_VIRTUAL
+    }
+    if n == 8 && eq_ci(p, "DATABASE") {
+        return K_DATABASE
+    }
+    if n == 6 && eq_ci(p, "ATTACH") {
+        return K_ATTACH
+    }
+    if n == 6 && eq_ci(p, "DETACH") {
+        return K_DETACH
+    }
+    if n == 7 && eq_ci(p, "REINDEX") {
+        return K_REINDEX
+    }
+    return 0
+}
+
+fn is_idstart(c: u8) -> bool {
+    return (c >= 97 as u8 && c <= 122 as u8) || (c >= 65 as u8 && c <= 90 as u8) || c == 95 as u8
+        || c >= 128 as u8
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+fn is_idchar(c: u8) -> bool {
+    return is_idstart(c) || is_digit(c) || c == 36 as u8
+}
+
+fn is_hex(c: u8) -> bool {
+    return is_digit(c) || (c >= 97 as u8 && c <= 102 as u8) || (c >= 65 as u8 && c <= 70 as u8)
+}
+
+fn hexval(c: u8) -> i64 {
+    if is_digit(c) {
+        return (c as i64) - 48
+    }
+    return ((lower(c) as i64) - 97) + 10
+}
+
+// Reads the next token into `t`. At the end t.kind is TK_EOF.
+fn lex_next(lx: *mut Lexer, t: *mut Token) {
+    let p: u64 = (*lx).p
+    let n: usize = (*lx).n
+    var i: usize = (*lx).pos
+    *t = tok_blank()
+    // white space and comments
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 32 as u8 || c == 9 as u8 || c == 10 as u8 || c == 13 as u8 || c == 12 as u8 {
+            i = i + 1
+        } else if c == 45 as u8 && i + 1 < n && rt.ld8(p, i + 1) == 45 as u8 {
+            while i < n && rt.ld8(p, i) != 10 as u8 {
+                i = i + 1
+            }
+        } else if c == 47 as u8 && i + 1 < n && rt.ld8(p, i + 1) == 42 as u8 {
+            i = i + 2
+            while i < n && !(rt.ld8(p, i) == 42 as u8 && i + 1 < n && rt.ld8(p, i + 1) == 47 as u8) {
+                i = i + 1
+            }
+            if i < n {
+                i = i + 2
+            } else {
+                i = n
+            }
+        } else {
+            break
+        }
+    }
+    (*t).start = i
+    if i >= n {
+        (*t).kind = TK_EOF
+        (*t).end = i
+        (*lx).pos = i
+        return
+    }
+    let c: u8 = rt.ld8(p, i)
+    // identifiers and keywords
+    if is_idstart(c) {
+        let s: usize = i
+        while i < n && is_idchar(rt.ld8(p, i)) {
+            i = i + 1
+        }
+        // X'..' blob literal
+        if (c == 120 as u8 || c == 88 as u8) && i == s + 1 && i < n && rt.ld8(p, i) == 39 as u8 {
+            var j: usize = i + 1
+            while j < n && rt.ld8(p, j) != 39 as u8 {
+                j = j + 1
+            }
+            if j >= n {
+                (*t).kind = TK_ERR
+                (*t).end = n
+                (*lx).pos = n
+                return
+            }
+            (*t).kind = TK_BLOB
+            (*t).p = p + ((i + 1) as u64)
+            (*t).n = j - i - 1
+            (*t).end = j + 1
+            (*lx).pos = j + 1
+            return
+        }
+        (*t).kind = TK_ID
+        (*t).p = p + (s as u64)
+        (*t).n = i - s
+        (*t).code = kw_code((*t).p, (*t).n)
+        (*t).end = i
+        (*lx).pos = i
+        return
+    }
+    // quoted identifiers
+    if c == 34 as u8 || c == 96 as u8 || c == 91 as u8 {
+        var close: u8 = c
+        if c == 91 as u8 {
+            close = 93 as u8
+        }
+        var j: usize = i + 1
+        var esc: bool = false
+        while j < n {
+            let d: u8 = rt.ld8(p, j)
+            if d == close {
+                if close != 93 as u8 && j + 1 < n && rt.ld8(p, j + 1) == close {
+                    esc = true
+                    j = j + 2
+                    continue
+                }
+                break
+            }
+            j = j + 1
+        }
+        if j >= n {
+            (*t).kind = TK_ERR
+            (*t).end = n
+            (*lx).pos = n
+            return
+        }
+        (*t).kind = TK_ID
+        (*t).p = p + ((i + 1) as u64)
+        (*t).n = j - i - 1
+        (*t).esc = esc
+        (*t).quoted = true
+        (*t).end = j + 1
+        (*lx).pos = j + 1
+        return
+    }
+    // strings
+    if c == 39 as u8 {
+        var j: usize = i + 1
+        var esc: bool = false
+        while j < n {
+            if rt.ld8(p, j) == 39 as u8 {
+                if j + 1 < n && rt.ld8(p, j + 1) == 39 as u8 {
+                    esc = true
+                    j = j + 2
+                    continue
+                }
+                break
+            }
+            j = j + 1
+        }
+        if j >= n {
+            (*t).kind = TK_ERR
+            (*t).end = n
+            (*lx).pos = n
+            return
+        }
+        (*t).kind = TK_STR
+        (*t).p = p + ((i + 1) as u64)
+        (*t).n = j - i - 1
+        (*t).esc = esc
+        (*t).end = j + 1
+        (*lx).pos = j + 1
+        return
+    }
+    // numbers
+    if is_digit(c) || (c == 46 as u8 && i + 1 < n && is_digit(rt.ld8(p, i + 1))) {
+        let s: usize = i
+        // hex integer
+        if c == 48 as u8 && i + 2 < n && (rt.ld8(p, i + 1) == 120 as u8 || rt.ld8(p, i + 1) == 88 as u8)
+            && is_hex(rt.ld8(p, i + 2)) {
+            i = i + 2
+            var v: u64 = 0
+            var digits: usize = 0
+            while i < n && is_hex(rt.ld8(p, i)) {
+                v = (v << 4) | (hexval(rt.ld8(p, i)) as u64)
+                digits = digits + 1
+                i = i + 1
+            }
+            if digits > 16 {
+                (*t).kind = TK_ERR
+            } else {
+                (*t).kind = TK_INT
+                (*t).ival = v as i64
+            }
+            (*t).p = p + (s as u64)
+            (*t).n = i - s
+            (*t).end = i
+            (*lx).pos = i
+            return
+        }
+        var is_real: bool = false
+        while i < n && is_digit(rt.ld8(p, i)) {
+            i = i + 1
+        }
+        if i < n && rt.ld8(p, i) == 46 as u8 {
+            is_real = true
+            i = i + 1
+            while i < n && is_digit(rt.ld8(p, i)) {
+                i = i + 1
+            }
+        }
+        if i < n && (rt.ld8(p, i) == 101 as u8 || rt.ld8(p, i) == 69 as u8) {
+            var j: usize = i + 1
+            if j < n && (rt.ld8(p, j) == 43 as u8 || rt.ld8(p, j) == 45 as u8) {
+                j = j + 1
+            }
+            if j < n && is_digit(rt.ld8(p, j)) {
+                while j < n && is_digit(rt.ld8(p, j)) {
+                    j = j + 1
+                }
+                is_real = true
+                i = j
+            }
+        }
+        (*t).p = p + (s as u64)
+        (*t).n = i - s
+        (*t).end = i
+        (*lx).pos = i
+        // an identifier glued to a number is an error ("123abc")
+        if i < n && is_idstart(rt.ld8(p, i)) {
+            (*t).kind = TK_ERR
+            return
+        }
+        if !is_real {
+            // integer if it fits an i64, else a real
+            var v: u64 = 0
+            var over: bool = false
+            var k: usize = s
+            while k < i {
+                let d: u64 = (rt.ld8(p, k) as u64) - 48
+                if v > 922337203685477580 || (v == 922337203685477580 && d > 7) {
+                    over = true
+                    break
+                }
+                v = v * 10 + d
+                k = k + 1
+            }
+            if !over {
+                (*t).kind = TK_INT
+                (*t).ival = v as i64
+                return
+            }
+        }
+        var f: f64 = 0.0
+        num.text_to_f64((*t).p as *mut u8, (*t).n, &f)
+        (*t).kind = TK_FLOAT
+        (*t).fval = f
+        return
+    }
+    // parameters
+    if c == 63 as u8 {
+        var j: usize = i + 1
+        var v: i64 = 0
+        while j < n && is_digit(rt.ld8(p, j)) {
+            v = v * 10 + ((rt.ld8(p, j) as i64) - 48)
+            if v > 100000 {
+                (*t).kind = TK_ERR
+                (*t).end = j
+                (*lx).pos = j
+                return
+            }
+            j = j + 1
+        }
+        (*t).kind = TK_PARAM
+        (*t).ival = v
+        (*t).p = p + (i as u64)
+        (*t).n = j - i
+        (*t).end = j
+        (*lx).pos = j
+        return
+    }
+    if c == 58 as u8 || c == 64 as u8 || c == 36 as u8 {
+        var j: usize = i + 1
+        while j < n && is_idchar(rt.ld8(p, j)) {
+            j = j + 1
+        }
+        if j == i + 1 {
+            (*t).kind = TK_ERR
+            (*t).end = j
+            (*lx).pos = j
+            return
+        }
+        (*t).kind = TK_PARAM
+        (*t).ival = 0 - 1
+        (*t).p = p + (i as u64)
+        (*t).n = j - i
+        (*t).end = j
+        (*lx).pos = j
+        return
+    }
+    // operators
+    (*t).kind = TK_OP
+    (*t).p = p + (i as u64)
+    (*t).n = 1
+    var code: u32 = 0
+    var len: usize = 1
+    let d: u8 = if i + 1 < n { rt.ld8(p, i + 1) } else { 0 as u8 }
+    if c == 43 as u8 {
+        code = P_PLUS
+    } else if c == 45 as u8 {
+        code = P_MINUS
+    } else if c == 42 as u8 {
+        code = P_STAR
+    } else if c == 47 as u8 {
+        code = P_SLASH
+    } else if c == 37 as u8 {
+        code = P_PERCENT
+    } else if c == 40 as u8 {
+        code = P_LPAREN
+    } else if c == 41 as u8 {
+        code = P_RPAREN
+    } else if c == 44 as u8 {
+        code = P_COMMA
+    } else if c == 59 as u8 {
+        code = P_SEMI
+    } else if c == 46 as u8 {
+        code = P_DOT
+    } else if c == 126 as u8 {
+        code = P_TILDE
+    } else if c == 38 as u8 {
+        code = P_BITAND
+    } else if c == 61 as u8 {
+        code = P_EQ
+        if d == 61 as u8 {
+            len = 2
+        }
+    } else if c == 33 as u8 {
+        if d == 61 as u8 {
+            code = P_NE
+            len = 2
+        }
+    } else if c == 60 as u8 {
+        code = P_LT
+        if d == 61 as u8 {
+            code = P_LE
+            len = 2
+        } else if d == 62 as u8 {
+            code = P_NE
+            len = 2
+        } else if d == 60 as u8 {
+            code = P_LSHIFT
+            len = 2
+        }
+    } else if c == 62 as u8 {
+        code = P_GT
+        if d == 61 as u8 {
+            code = P_GE
+            len = 2
+        } else if d == 62 as u8 {
+            code = P_RSHIFT
+            len = 2
+        }
+    } else if c == 124 as u8 {
+        code = P_BITOR
+        if d == 124 as u8 {
+            code = P_CONCAT
+            len = 2
+        }
+    }
+    if code == 0 {
+        (*t).kind = TK_ERR
+        len = 1
+    }
+    (*t).code = code
+    (*t).n = len
+    (*t).end = i + len
+    (*lx).pos = i + len
+}
