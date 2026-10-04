@@ -1,0 +1,1978 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/qr/qrdec.fi -- a QR code DECODER: from a module matrix (`qrdec_modules`)
+// or from a picture (`qrdec_gray`, `qrdec_rgba`) to the octets that were encoded.
+//
+//     import qr.qrdec
+//     var r: qrdec.QrResult = qrdec.qrdec_result_new()
+//     qrdec.qrdec_rgba(px, w, h, &r) catch |e| ...
+//     // r.payload (rt.Buf), r.version, r.ecc, r.mask, r.corrected, r.eci
+//     qrdec.qrdec_result_free(&r)
+//
+// THE PICTURE PATH: gray conversion, binarisation (a global Otsu threshold
+// first; a local-mean threshold with two window sizes and the inverted picture
+// as fallbacks), finder patterns by the 1:1:3:1:1 run ratio on rows, checked
+// down the column and back along the row, the best of the finder triples by
+// right angle and side ratio, orientation by the sign of the cross product
+// (rotated by any angle), the size from the module pitch, the fourth corner
+// from the alignment pattern (found by template matching around the place the
+// three finders predict) for versions 2 and up, a perspective transform by the
+// four points, five votes per module.
+//
+// THE MATRIX PATH: format information read from both copies and corrected
+// (BCH, up to 3 flipped bits), the data modules unmasked, the codewords taken
+// out in the standard order, de-interleaved, each block corrected by
+// Reed-Solomon (Berlekamp-Massey, Chien search, Forney) up to ecc/2 octets,
+// the segments read: numeric, alphanumeric, byte, Kanji (as Shift JIS octets),
+// ECI (the designator is kept), structured-append headers skipped, FNC1 marks
+// ignored.
+//
+// HELD AGAINST: codes of Python `qrcode`, `segno` and `zxingcpp`'s writer drawn
+// as pictures -- clean, rotated, perspective-warped, blurred, noisy -- and
+// the codes of the Firn encoder; tools/qr/run.sh. ZXing-C++ is the yardstick for
+// how many damaged pictures it still reads and we do not (reported).
+//
+// HONEST NOTES
+//   * Not read: mirrored codes, Micro QR, rMQR, codes on a strongly curved
+//     surface, several codes in one picture (the best triple wins), pictures
+//     where a module is smaller than 2 pixels.
+//   * The version is taken from the sampled size; for versions 7 and up the
+//     version information is not used to correct a wrong size estimate (the
+//     neighbouring sizes are tried instead).
+//   * Segments are returned as the raw octets; mixed encodings are not
+//     re-coded, the ECI designator of the LAST ECI header is in `eci` (-1 =
+//     none; 26 = UTF-8).
+//   * Pictures over 4 Mpixel are first averaged down by an integer factor.
+
+import std.rt
+import std.math
+import qr.qr
+
+export {
+    QrResult, QrDecError, qrdec_result_new, qrdec_result_free,
+    qrdec_modules, qrdec_gray, qrdec_rgba, qrdec_rs_correct,
+}
+
+error QrDecError {
+    NotFound, // no QR code located in the picture
+    Format, // the format information is unreadable
+    Uncorrectable, // more damaged codewords than the error correction can repair
+    BadData, // the bit stream contradicts itself
+    OutOfMemory,
+}
+
+struct QrResult {
+    payload: rt.Buf, // the octets, segments joined
+    version: u32,
+    ecc: u32, // qr.QR_ECC_*
+    mask: u32,
+    corrected: u32, // codewords the Reed-Solomon step repaired
+    eci: i32, // last ECI designator, -1 = none
+}
+
+fn qrdec_result_new() -> QrResult {
+    return QrResult { payload: rt.buf_new(), version: 0 as u32, ecc: 0 as u32, mask: 0 as u32,
+        corrected: 0 as u32, eci: 0 - 1 }
+}
+
+fn qrdec_result_free(r: *mut QrResult) {
+    rt.buf_free(&(*r).payload)
+}
+
+// ------------------------------------------------------------------ GF(256)
+
+static mut GFE: [u8; 512] = [0 as u8; 512]
+static mut GFL: [u8; 256] = [0 as u8; 256]
+static mut GF_READY: bool = false
+
+fn gf_init() {
+    if GF_READY {
+        return
+    }
+    var x: u32 = 1 as u32
+    var i: usize = 0
+    while i < 255 {
+        GFE[i] = x as u8
+        GFL[x as usize] = i as u8
+        x = x << 1
+        if (x & 256 as u32) != 0 as u32 {
+            x = x ^ 285 as u32
+        }
+        i++
+    }
+    i = 255
+    while i < 512 {
+        GFE[i] = GFE[i - 255]
+        i++
+    }
+    GF_READY = true
+}
+
+fn gmul(a: i64, b: i64) -> i64 {
+    if a == 0 || b == 0 {
+        return 0
+    }
+    return GFE[(GFL[a as usize] as usize) + (GFL[b as usize] as usize)] as i64
+}
+
+fn gdiv(a: i64, b: i64) -> i64 {
+    if a == 0 || b == 0 {
+        return 0
+    }
+    return GFE[(GFL[a as usize] as usize) + 255 - (GFL[b as usize] as usize)] as i64
+}
+
+// alpha^e for any integer e
+fn galpha(e: i64) -> i64 {
+    var k: i64 = e % 255
+    if k < 0 {
+        k = k + 255
+    }
+    return GFE[k as usize] as i64
+}
+
+// ------------------------------------------------------------ Reed-Solomon
+
+fn syndromes(p: u64, n: i64, nsym: i64, syn: *mut [i64; 40]) -> bool {
+    var any: bool = false
+    var j: i64 = 0
+    while j < nsym {
+        var s: i64 = 0
+        let a: i64 = galpha(j)
+        var i: i64 = 0
+        while i < n {
+            s = gmul(s, a) ^ (rt.ld8(p, i as usize) as i64)
+            i = i + 1
+        }
+        (*syn)[j as usize] = s
+        if s != 0 {
+            any = true
+        }
+        j = j + 1
+    }
+    return any
+}
+
+// Corrects the block at `p` (n octets, the last `nsym` are the error
+// correction) in place. Returns the number of corrected octets, or -1 if the
+// damage is beyond repair.
+fn qrdec_rs_correct(p: u64, n: i64, nsym: i64) -> i64 {
+    gf_init()
+    if nsym < 1 || nsym > 32 || n <= nsym || n > 255 {
+        return 0 - 1
+    }
+    var syn: [i64; 40] = [0; 40]
+    if !syndromes(p, n, nsym, &syn) {
+        return 0
+    }
+    // Berlekamp-Massey
+    var cc: [i64; 40] = [0; 40]
+    var bb: [i64; 40] = [0; 40]
+    var tt: [i64; 40] = [0; 40]
+    cc[0] = 1
+    bb[0] = 1
+    var l: i64 = 0
+    var m: i64 = 1
+    var b: i64 = 1
+    var step: i64 = 0
+    while step < nsym {
+        var d: i64 = syn[step as usize]
+        var i: i64 = 1
+        while i <= l {
+            d = d ^ gmul(cc[i as usize], syn[(step - i) as usize])
+            i = i + 1
+        }
+        if d == 0 {
+            m = m + 1
+        } else {
+            let coef: i64 = gdiv(d, b)
+            i = 0
+            while i < 40 {
+                tt[i as usize] = cc[i as usize]
+                i = i + 1
+            }
+            i = 0
+            while i + m < 40 {
+                cc[(i + m) as usize] = cc[(i + m) as usize] ^ gmul(coef, bb[i as usize])
+                i = i + 1
+            }
+            if 2 * l <= step {
+                l = step + 1 - l
+                i = 0
+                while i < 40 {
+                    bb[i as usize] = tt[i as usize]
+                    i = i + 1
+                }
+                b = d
+                m = 1
+            } else {
+                m = m + 1
+            }
+        }
+        step = step + 1
+    }
+    if l > nsym / 2 || l == 0 {
+        return 0 - 1
+    }
+    // Chien search: position i (degree j = n - 1 - i) is in error if
+    // Lambda(alpha^-j) = 0
+    var pos: [i64; 40] = [0; 40]
+    var cnt: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        let j: i64 = n - 1 - i
+        var s: i64 = 0
+        var k: i64 = 0
+        while k <= l {
+            s = s ^ gmul(cc[k as usize], galpha(0 - j * k))
+            k = k + 1
+        }
+        if s == 0 {
+            if cnt >= 32 {
+                return 0 - 1
+            }
+            pos[cnt as usize] = i
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    if cnt != l {
+        return 0 - 1
+    }
+    // Omega(x) = S(x) Lambda(x) mod x^nsym
+    var om: [i64; 40] = [0; 40]
+    i = 0
+    while i < nsym {
+        var s: i64 = 0
+        var k: i64 = 0
+        while k <= i && k <= l {
+            s = s ^ gmul(cc[k as usize], syn[(i - k) as usize])
+            k = k + 1
+        }
+        om[i as usize] = s
+        i = i + 1
+    }
+    // Forney
+    var e: i64 = 0
+    while e < cnt {
+        let j: i64 = n - 1 - pos[e as usize]
+        let xinv: i64 = galpha(0 - j)
+        let x: i64 = galpha(j)
+        var num: i64 = 0
+        var k: i64 = 0
+        while k < nsym {
+            num = num ^ gmul(om[k as usize], galpha(0 - j * k))
+            k = k + 1
+        }
+        var den: i64 = 0
+        k = 1
+        while k <= l {
+            if k % 2 == 1 {
+                den = den ^ gmul(cc[k as usize], galpha(0 - j * (k - 1)))
+            }
+            k = k + 1
+        }
+        if den == 0 {
+            return 0 - 1
+        }
+        let mag: i64 = gmul(x, gdiv(num, den))
+        let at: usize = pos[e as usize] as usize
+        rt.st8(p, at, (rt.ld8(p, at) as i64 ^ mag) as u8)
+        e = e + 1
+    }
+    if syndromes(p, n, nsym, &syn) {
+        return 0 - 1
+    }
+    return cnt
+}
+
+// ---------------------------------------------------------- the matrix path
+
+fn popcount(v: u32) -> i64 {
+    var c: i64 = 0
+    var x: u32 = v
+    while x != 0 as u32 {
+        c = c + (x & 1 as u32) as i64
+        x = x >> 1
+    }
+    return c
+}
+
+fn dark_at(q: *mut qr.QrCode, x: i64, y: i64) -> u32 {
+    if qr.qr_dark(q, x, y) {
+        return 1 as u32
+    }
+    return 0 as u32
+}
+
+fn read_format_copy(q: *mut qr.QrCode, copy: i64) -> u32 {
+    let n: i64 = (*q).size as i64
+    var v: u32 = 0 as u32
+    if copy == 0 {
+        var i: i64 = 0
+        while i <= 5 {
+            v = v | (dark_at(q, 8, i) << (i as u32))
+            i = i + 1
+        }
+        v = v | (dark_at(q, 8, 7) << 6)
+        v = v | (dark_at(q, 8, 8) << 7)
+        v = v | (dark_at(q, 7, 8) << 8)
+        i = 9
+        while i < 15 {
+            v = v | (dark_at(q, 14 - i, 8) << (i as u32))
+            i = i + 1
+        }
+    } else {
+        var i: i64 = 0
+        while i < 8 {
+            v = v | (dark_at(q, n - 1 - i, 8) << (i as u32))
+            i = i + 1
+        }
+        i = 8
+        while i < 15 {
+            v = v | (dark_at(q, 8, n - 15 + i) << (i as u32))
+            i = i + 1
+        }
+    }
+    return v
+}
+
+// Out: level and mask. False if no format word is within 3 bit errors.
+fn read_format(q: *mut qr.QrCode, ecc_out: *mut u32, mask_out: *mut u32) -> bool {
+    let f1: u32 = read_format_copy(q, 0)
+    let f2: u32 = read_format_copy(q, 1)
+    var best: i64 = 100
+    var be: u32 = 0 as u32
+    var bm: u32 = 0 as u32
+    var e: u32 = 0 as u32
+    while e < 4 as u32 {
+        var m: u32 = 0 as u32
+        while m < 8 as u32 {
+            let f: u32 = qr.qr_format_bits(e, m)
+            var d: i64 = popcount(f ^ f1)
+            let d2: i64 = popcount(f ^ f2)
+            if d2 < d {
+                d = d2
+            }
+            if d < best {
+                best = d
+                be = e
+                bm = m
+            }
+            m = m + 1 as u32
+        }
+        e = e + 1 as u32
+    }
+    if best > 3 {
+        return false
+    }
+    *ecc_out = be
+    *mask_out = bm
+    return true
+}
+
+// Takes the codewords out of the symbol (unmasked) into `out`.
+fn read_codewords(q: *mut qr.QrCode, tmpl: u64, mask: u32, out: u64, nbytes: i64) {
+    let n: i64 = (*q).size as i64
+    var z: i64 = 0
+    while z < nbytes {
+        rt.st8(out, z as usize, 0 as u8)
+        z = z + 1
+    }
+    var i: i64 = 0
+    var right: i64 = n - 1
+    while right >= 1 {
+        if right == 6 {
+            right = 5
+        }
+        var vert: i64 = 0
+        while vert < n {
+            var j: i64 = 0
+            while j < 2 {
+                let x: i64 = right - j
+                let upward: bool = ((right + 1) & 2) == 0
+                var y: i64 = vert
+                if upward {
+                    y = n - 1 - vert
+                }
+                if (rt.ld8(tmpl, (y * n + x) as usize) & 2 as u8) == 0 as u8 && i < nbytes * 8 {
+                    var b: u32 = dark_at(q, x, y)
+                    if qr.qr_mask_invert(mask, x, y) {
+                        b = b ^ 1 as u32
+                    }
+                    if b != 0 as u32 {
+                        let at: usize = (i >> 3) as usize
+                        rt.st8(out, at, rt.ld8(out, at) | ((128 >> (i & 7)) as u8))
+                    }
+                    i = i + 1
+                }
+                j = j + 1
+            }
+            vert = vert + 1
+        }
+        right = right - 2
+    }
+}
+
+// De-interleaves, corrects every block, writes the data octets to `data`.
+// Returns the corrected total or -1.
+fn fix_blocks(raw: u64, version: u32, ecc: u32, data: u64) -> i64 {
+    let nblocks: i64 = qr.qr_num_blocks(version, ecc) as i64
+    let ecc_len: i64 = qr.qr_ecc_codewords_per_block(version, ecc) as i64
+    let total: i64 = (qr.qr_raw_modules(version) / 8 as u32) as i64
+    let nshort: i64 = nblocks - total % nblocks
+    let short_len: i64 = total / nblocks
+    let blk: u64 = rt.heap_alloc((nblocks * 256) as usize)
+    if blk == 0 {
+        return 0 - 2
+    }
+    var idx: i64 = 0
+    var col: i64 = 0
+    while col < short_len - ecc_len + 1 {
+        var b: i64 = 0
+        while b < nblocks {
+            var dl: i64 = short_len - ecc_len
+            if b >= nshort {
+                dl = dl + 1
+            }
+            if col < dl {
+                rt.st8(blk, (b * 256 + col) as usize, rt.ld8(raw, idx as usize))
+                idx = idx + 1
+            }
+            b = b + 1
+        }
+        col = col + 1
+    }
+    col = 0
+    while col < ecc_len {
+        var b: i64 = 0
+        while b < nblocks {
+            var dl: i64 = short_len - ecc_len
+            if b >= nshort {
+                dl = dl + 1
+            }
+            rt.st8(blk, (b * 256 + dl + col) as usize, rt.ld8(raw, idx as usize))
+            idx = idx + 1
+            b = b + 1
+        }
+        col = col + 1
+    }
+    var fixed: i64 = 0
+    var out: i64 = 0
+    var b: i64 = 0
+    while b < nblocks {
+        var dl: i64 = short_len - ecc_len
+        if b >= nshort {
+            dl = dl + 1
+        }
+        let r: i64 = qrdec_rs_correct(blk + (b * 256) as u64, dl + ecc_len, ecc_len)
+        if r < 0 {
+            rt.heap_free(blk, (nblocks * 256) as usize)
+            return 0 - 1
+        }
+        fixed = fixed + r
+        var k: i64 = 0
+        while k < dl {
+            rt.st8(data, out as usize, rt.ld8(blk, (b * 256 + k) as usize))
+            out = out + 1
+            k = k + 1
+        }
+        b = b + 1
+    }
+    rt.heap_free(blk, (nblocks * 256) as usize)
+    return fixed
+}
+
+struct BitReader {
+    p: u64,
+    nbits: i64,
+    pos: i64,
+}
+
+fn br_left(r: *mut BitReader) -> i64 {
+    return (*r).nbits - (*r).pos
+}
+
+fn br_read(r: *mut BitReader, count: i64) -> i64 {
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < count {
+        let b: i64 = ((rt.ld8((*r).p, ((*r).pos >> 3) as usize) >> ((7 - ((*r).pos & 7)) as u8)) & 1 as u8) as i64
+        v = (v << 1) | b
+        (*r).pos = (*r).pos + 1
+        i = i + 1
+    }
+    return v
+}
+
+static mut ALNUM_CHARS: [u8; 45] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+
+// The segments of the data stream into `res.payload`. False if the stream is
+// inconsistent.
+fn parse_segments(data: u64, ndata: i64, version: u32, res: *mut QrResult) -> bool {
+    var r: BitReader = BitReader { p: data, nbits: ndata * 8, pos: 0 }
+    while br_left(&r) >= 4 {
+        let mode: i64 = br_read(&r, 4)
+        if mode == 0 {
+            return true
+        }
+        if mode == 7 {
+            // ECI designator: 1 to 3 octets
+            if br_left(&r) < 8 {
+                return false
+            }
+            var d: i64 = br_read(&r, 8)
+            if (d & 128) == 0 {
+                (*res).eci = d as i32
+            } else {
+                if (d & 192) == 128 {
+                    if br_left(&r) < 8 {
+                        return false
+                    }
+                    d = ((d & 63) << 8) | br_read(&r, 8)
+                    (*res).eci = d as i32
+                } else {
+                    if br_left(&r) < 16 {
+                        return false
+                    }
+                    d = ((d & 31) << 16) | br_read(&r, 16)
+                    (*res).eci = d as i32
+                }
+            }
+            continue
+        }
+        if mode == 3 {
+            // structured append: 4 bit position, 4 bit total, 8 bit parity
+            if br_left(&r) < 16 {
+                return false
+            }
+            br_read(&r, 16)
+            continue
+        }
+        if mode == 5 {
+            continue
+        }
+        if mode == 9 {
+            if br_left(&r) < 8 {
+                return false
+            }
+            br_read(&r, 8)
+            continue
+        }
+        if mode == 1 {
+            let cb: i64 = qr.qr_char_count_bits(qr.QR_MODE_NUMERIC, version)
+            if br_left(&r) < cb {
+                return false
+            }
+            var cnt: i64 = br_read(&r, cb)
+            while cnt >= 3 {
+                if br_left(&r) < 10 {
+                    return false
+                }
+                let v: i64 = br_read(&r, 10)
+                if v >= 1000 {
+                    return false
+                }
+                rt.buf_push(&(*res).payload, (48 + v / 100) as u8)
+                rt.buf_push(&(*res).payload, (48 + (v / 10) % 10) as u8)
+                rt.buf_push(&(*res).payload, (48 + v % 10) as u8)
+                cnt = cnt - 3
+            }
+            if cnt == 2 {
+                if br_left(&r) < 7 {
+                    return false
+                }
+                let v: i64 = br_read(&r, 7)
+                if v >= 100 {
+                    return false
+                }
+                rt.buf_push(&(*res).payload, (48 + v / 10) as u8)
+                rt.buf_push(&(*res).payload, (48 + v % 10) as u8)
+            }
+            if cnt == 1 {
+                if br_left(&r) < 4 {
+                    return false
+                }
+                let v: i64 = br_read(&r, 4)
+                if v >= 10 {
+                    return false
+                }
+                rt.buf_push(&(*res).payload, (48 + v) as u8)
+            }
+            continue
+        }
+        if mode == 2 {
+            let cb: i64 = qr.qr_char_count_bits(qr.QR_MODE_ALNUM, version)
+            if br_left(&r) < cb {
+                return false
+            }
+            var cnt: i64 = br_read(&r, cb)
+            while cnt >= 2 {
+                if br_left(&r) < 11 {
+                    return false
+                }
+                let v: i64 = br_read(&r, 11)
+                if v >= 45 * 45 {
+                    return false
+                }
+                rt.buf_push(&(*res).payload, ALNUM_CHARS[(v / 45) as usize])
+                rt.buf_push(&(*res).payload, ALNUM_CHARS[(v % 45) as usize])
+                cnt = cnt - 2
+            }
+            if cnt == 1 {
+                if br_left(&r) < 6 {
+                    return false
+                }
+                let v: i64 = br_read(&r, 6)
+                if v >= 45 {
+                    return false
+                }
+                rt.buf_push(&(*res).payload, ALNUM_CHARS[v as usize])
+            }
+            continue
+        }
+        if mode == 4 {
+            let cb: i64 = qr.qr_char_count_bits(qr.QR_MODE_BYTE, version)
+            if br_left(&r) < cb {
+                return false
+            }
+            let cnt: i64 = br_read(&r, cb)
+            if br_left(&r) < cnt * 8 {
+                return false
+            }
+            var i: i64 = 0
+            while i < cnt {
+                rt.buf_push(&(*res).payload, br_read(&r, 8) as u8)
+                i = i + 1
+            }
+            continue
+        }
+        if mode == 8 {
+            var cb: i64 = 8
+            if version >= 10 as u32 {
+                cb = 10
+            }
+            if version >= 27 as u32 {
+                cb = 12
+            }
+            if br_left(&r) < cb {
+                return false
+            }
+            let cnt: i64 = br_read(&r, cb)
+            if br_left(&r) < cnt * 13 {
+                return false
+            }
+            var i: i64 = 0
+            while i < cnt {
+                let v: i64 = br_read(&r, 13)
+                var a: i64 = (v / 192) * 256 + v % 192
+                if a < 7936 {
+                    a = a + 33088
+                } else {
+                    a = a + 49472
+                }
+                rt.buf_push(&(*res).payload, (a >> 8) as u8)
+                rt.buf_push(&(*res).payload, (a & 255) as u8)
+                i = i + 1
+            }
+            (*res).eci = 20
+            continue
+        }
+        return false
+    }
+    return true
+}
+
+// Decodes a module matrix (a `qr.QrCode` whose `modules` hold the symbol: bit 0
+// of every octet = dark; `size` = 17 + 4 * version).
+fn qrdec_modules(q: *mut qr.QrCode, res: *mut QrResult) -> QrDecError!bool {
+    let n: i64 = (*q).size as i64
+    if n < 21 || n > 177 || (n - 17) % 4 != 0 {
+        return QrDecError::NotFound
+    }
+    if rt.buf_len(&(*q).modules) < (n * n) as usize {
+        return QrDecError::NotFound
+    }
+    let version: u32 = ((n - 17) / 4) as u32
+    var ecc: u32 = 0 as u32
+    var mask: u32 = 0 as u32
+    if !read_format(q, &ecc, &mask) {
+        return QrDecError::Format
+    }
+    var tmpl: rt.Buf = rt.buf_new()
+    if !qr.qr_function_template(version, &tmpl) {
+        return QrDecError::OutOfMemory
+    }
+    let total: i64 = (qr.qr_raw_modules(version) / 8 as u32) as i64
+    let ndata: i64 = qr.qr_data_codewords(version, ecc) as i64
+    let raw: u64 = rt.heap_alloc((total + 1) as usize)
+    let data: u64 = rt.heap_alloc((ndata + 1) as usize)
+    if raw == 0 || data == 0 {
+        rt.heap_free(raw, (total + 1) as usize)
+        rt.heap_free(data, (ndata + 1) as usize)
+        rt.buf_free(&tmpl)
+        return QrDecError::OutOfMemory
+    }
+    read_codewords(q, rt.buf_ptr(&tmpl), mask, raw, total)
+    rt.buf_free(&tmpl)
+    let fixed: i64 = fix_blocks(raw, version, ecc, data)
+    rt.heap_free(raw, (total + 1) as usize)
+    if fixed < 0 {
+        rt.heap_free(data, (ndata + 1) as usize)
+        if fixed == 0 - 2 {
+            return QrDecError::OutOfMemory
+        }
+        return QrDecError::Uncorrectable
+    }
+    rt.buf_clear(&(*res).payload)
+    (*res).eci = 0 - 1
+    let ok: bool = parse_segments(data, ndata, version, res)
+    rt.heap_free(data, (ndata + 1) as usize)
+    if !ok {
+        return QrDecError::BadData
+    }
+    (*res).version = version
+    (*res).ecc = ecc
+    (*res).mask = mask
+    (*res).corrected = fixed as u32
+    return true
+}
+
+// ------------------------------------------------------------ the image path
+
+fn fabs(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+fn ffloor(v: f64) -> i64 {
+    let t: i64 = v as i64
+    if (t as f64) > v {
+        return t - 1
+    }
+    return t
+}
+
+fn fround(v: f64) -> i64 {
+    return ffloor(v + 0.5)
+}
+
+// gray (w*h octets) -> bin (1 = dark) by a global Otsu threshold
+fn binarize_otsu(gray: u64, n: usize, bin: u64, invert: bool) {
+    var hist: [i64; 256] = [0; 256]
+    var i: usize = 0
+    while i < n {
+        hist[rt.ld8(gray, i) as usize] = hist[rt.ld8(gray, i) as usize] + 1
+        i++
+    }
+    var sum: i64 = 0
+    var t: i64 = 0
+    while t < 256 {
+        sum = sum + t * hist[t as usize]
+        t = t + 1
+    }
+    var wb: i64 = 0
+    var sb: i64 = 0
+    var best: f64 = 0.0 - 1.0
+    var thr: i64 = 127
+    t = 0
+    while t < 256 {
+        wb = wb + hist[t as usize]
+        if wb != 0 {
+            let wf: i64 = (n as i64) - wb
+            if wf == 0 {
+                break
+            }
+            sb = sb + t * hist[t as usize]
+            let mb: f64 = (sb as f64) / (wb as f64)
+            let mf: f64 = ((sum - sb) as f64) / (wf as f64)
+            let between: f64 = (wb as f64) * (wf as f64) * (mb - mf) * (mb - mf)
+            if between > best {
+                best = between
+                thr = t
+            }
+        }
+        t = t + 1
+    }
+    i = 0
+    while i < n {
+        var d: bool = (rt.ld8(gray, i) as i64) <= thr
+        if invert {
+            d = !d
+        }
+        if d {
+            rt.st8(bin, i, 1 as u8)
+        } else {
+            rt.st8(bin, i, 0 as u8)
+        }
+        i++
+    }
+}
+
+// local mean threshold: dark if pixel < mean(window of radius r) - c
+fn binarize_local(gray: u64, w: usize, h: usize, r: i64, c: i64, bin: u64) -> bool {
+    let iw: usize = w + 1
+    let integ: u64 = rt.heap_alloc((iw * (h + 1)) * 4)
+    if integ == 0 {
+        return false
+    }
+    var y: usize = 0
+    while y <= h {
+        rt.st32(integ, y * iw, 0 as u32)
+        y++
+    }
+    var x: usize = 0
+    while x <= w {
+        rt.st32(integ, x, 0 as u32)
+        x++
+    }
+    y = 1
+    while y <= h {
+        var row: u32 = 0 as u32
+        x = 1
+        while x <= w {
+            row = row + (rt.ld8(gray, (y - 1) * w + x - 1) as u32)
+            rt.st32(integ, y * iw + x, rt.ld32(integ, (y - 1) * iw + x) + row)
+            x++
+        }
+        y++
+    }
+    y = 0
+    while y < h {
+        var y0: i64 = (y as i64) - r
+        var y1: i64 = (y as i64) + r + 1
+        if y0 < 0 { y0 = 0 }
+        if y1 > h as i64 { y1 = h as i64 }
+        x = 0
+        while x < w {
+            var x0: i64 = (x as i64) - r
+            var x1: i64 = (x as i64) + r + 1
+            if x0 < 0 { x0 = 0 }
+            if x1 > w as i64 { x1 = w as i64 }
+            let s: i64 = (rt.ld32(integ, (y1 as usize) * iw + (x1 as usize)) as i64)
+                - (rt.ld32(integ, (y0 as usize) * iw + (x1 as usize)) as i64)
+                - (rt.ld32(integ, (y1 as usize) * iw + (x0 as usize)) as i64)
+                + (rt.ld32(integ, (y0 as usize) * iw + (x0 as usize)) as i64)
+            let cnt: i64 = (y1 - y0) * (x1 - x0)
+            let mean: i64 = s / cnt
+            if (rt.ld8(gray, y * w + x) as i64) < mean - c {
+                rt.st8(bin, y * w + x, 1 as u8)
+            } else {
+                rt.st8(bin, y * w + x, 0 as u8)
+            }
+            x++
+        }
+        y++
+    }
+    rt.heap_free(integ, (iw * (h + 1)) * 4)
+    return true
+}
+
+fn bin_at(bin: u64, w: i64, h: i64, x: i64, y: i64) -> i64 {
+    if x < 0 || y < 0 || x >= w || y >= h {
+        return 0
+    }
+    return rt.ld8(bin, (y * w + x) as usize) as i64
+}
+
+// the 1:1:3:1:1 test on five run lengths
+fn ratio_ok(a: i64, b: i64, c: i64, d: i64, e: i64) -> bool {
+    let total: i64 = a + b + c + d + e
+    if total < 7 || a < 1 || b < 1 || c < 1 || d < 1 || e < 1 {
+        return false
+    }
+    let ms: f64 = (total as f64) / 7.0
+    let tol: f64 = ms * 0.65
+    if fabs((a as f64) - ms) > tol { return false }
+    if fabs((b as f64) - ms) > tol { return false }
+    if fabs((d as f64) - ms) > tol { return false }
+    if fabs((e as f64) - ms) > tol { return false }
+    if fabs((c as f64) - 3.0 * ms) > 3.0 * tol { return false }
+    return true
+}
+
+// consecutive pixels of `color` from (x, y) in the direction (dx, dy)
+fn run_len(bin: u64, w: i64, h: i64, x: i64, y: i64, dx: i64, dy: i64, color: i64) -> i64 {
+    var n: i64 = 0
+    var cx: i64 = x
+    var cy: i64 = y
+    while cx >= 0 && cy >= 0 && cx < w && cy < h && (rt.ld8(bin, (cy * w + cx) as usize) as i64) == color {
+        n = n + 1
+        cx = cx + dx
+        cy = cy + dy
+    }
+    return n
+}
+
+// Checks the five runs through (x, y) along (dx, dy). On success: the centre
+// of the middle run along that axis (as a coordinate on the axis) and the
+// total length of the five runs.
+fn cross_check(bin: u64, w: i64, h: i64, x: i64, y: i64, dx: i64, dy: i64,
+        centre: *mut f64, total: *mut i64) -> bool {
+    // back from the start pixel (inclusive)
+    let c_back: i64 = run_len(bin, w, h, x, y, 0 - dx, 0 - dy, 1)
+    if c_back == 0 {
+        return false
+    }
+    let l_back: i64 = run_len(bin, w, h, x - dx * c_back, y - dy * c_back, 0 - dx, 0 - dy, 0)
+    if l_back == 0 {
+        return false
+    }
+    let d_back: i64 = run_len(bin, w, h, x - dx * (c_back + l_back), y - dy * (c_back + l_back),
+        0 - dx, 0 - dy, 1)
+    if d_back == 0 {
+        return false
+    }
+    let c_fwd: i64 = run_len(bin, w, h, x + dx, y + dy, dx, dy, 1)
+    let l_fwd: i64 = run_len(bin, w, h, x + dx * (c_fwd + 1), y + dy * (c_fwd + 1), dx, dy, 0)
+    if l_fwd == 0 {
+        return false
+    }
+    let d_fwd: i64 = run_len(bin, w, h, x + dx * (c_fwd + l_fwd + 1), y + dy * (c_fwd + l_fwd + 1),
+        dx, dy, 1)
+    if d_fwd == 0 {
+        return false
+    }
+    if !ratio_ok(d_back, l_back, c_back + c_fwd, l_fwd, d_fwd) {
+        return false
+    }
+    // start of the middle run on the axis = pos - (c_back - 1)
+    var pos: i64 = x
+    if dx == 0 {
+        pos = y
+    }
+    let start: f64 = (pos - (c_back - 1)) as f64
+    *centre = start + ((c_back + c_fwd) as f64) / 2.0
+    *total = d_back + l_back + c_back + c_fwd + l_fwd + d_fwd
+    return true
+}
+
+struct Finders {
+    n: i64,
+    x: [f64; 512],
+    y: [f64; 512],
+    ms: [f64; 512],
+    cnt: [i64; 512],
+}
+
+fn add_finder(f: *mut Finders, x: f64, y: f64, ms: f64) {
+    var i: i64 = 0
+    while i < (*f).n {
+        let dx: f64 = (*f).x[i as usize] - x
+        let dy: f64 = (*f).y[i as usize] - y
+        let lim: f64 = ms * 2.0
+        if dx * dx + dy * dy < lim * lim {
+            let c: f64 = (*f).cnt[i as usize] as f64
+            (*f).x[i as usize] = ((*f).x[i as usize] * c + x) / (c + 1.0)
+            (*f).y[i as usize] = ((*f).y[i as usize] * c + y) / (c + 1.0)
+            (*f).ms[i as usize] = ((*f).ms[i as usize] * c + ms) / (c + 1.0)
+            (*f).cnt[i as usize] = (*f).cnt[i as usize] + 1
+            return
+        }
+        i = i + 1
+    }
+    if (*f).n < 512 {
+        (*f).x[(*f).n as usize] = x
+        (*f).y[(*f).n as usize] = y
+        (*f).ms[(*f).n as usize] = ms
+        (*f).cnt[(*f).n as usize] = 1
+        (*f).n = (*f).n + 1
+    }
+}
+
+fn scan_finders(bin: u64, w: i64, h: i64, f: *mut Finders) {
+    (*f).n = 0
+    var y: i64 = 0
+    while y < h {
+        var runs: [i64; 5] = [0; 5]
+        var nruns: i64 = 0
+        var color: i64 = rt.ld8(bin, (y * w) as usize) as i64
+        var len: i64 = 0
+        var x: i64 = 0
+        while x <= w {
+            var cur: i64 = 1 - color
+            if x < w {
+                cur = rt.ld8(bin, (y * w + x) as usize) as i64
+            }
+            if x < w && cur == color {
+                len = len + 1
+                x = x + 1
+                continue
+            }
+            // a run of `color` and `len` ended at x
+            runs[0] = runs[1]
+            runs[1] = runs[2]
+            runs[2] = runs[3]
+            runs[3] = runs[4]
+            runs[4] = len
+            nruns = nruns + 1
+            if color == 1 && nruns >= 5 && ratio_ok(runs[0], runs[1], runs[2], runs[3], runs[4]) {
+                let xc: i64 = x - runs[4] - runs[3] - runs[2] / 2 - 1
+                var yc: f64 = 0.0
+                var tv: i64 = 0
+                if cross_check(bin, w, h, xc, y, 0, 1, &yc, &tv) {
+                    var xc2: f64 = 0.0
+                    var th: i64 = 0
+                    let yi: i64 = ffloor(yc)
+                    if cross_check(bin, w, h, xc, yi, 1, 0, &xc2, &th) {
+                        let t1: f64 = (tv as f64)
+                        let t2: f64 = (th as f64)
+                        if fabs(t1 - t2) < 0.5 * (t1 + t2) / 2.0 {
+                            add_finder(f, xc2, yc, (t1 + t2) / 14.0)
+                        }
+                    }
+                }
+            }
+            color = cur
+            len = 1
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// ---- the transform
+
+// A perspective map from module coordinates to picture coordinates, fitted in
+// normalised coordinates (both sides centred and scaled) so that the normal
+// equations stay well conditioned.
+struct Homog {
+    h: [f64; 9],
+    uc: f64, // module side: centre and scale
+    us: f64,
+    xc: f64, // picture side: centre and scale
+    yc: f64,
+    ps: f64,
+}
+
+fn solve8(m: *mut [f64; 72], out: *mut [f64; 8]) -> bool {
+    // m: 8 rows of 9 (augmented)
+    var col: i64 = 0
+    while col < 8 {
+        var piv: i64 = col
+        var best: f64 = fabs((*m)[(col * 9 + col) as usize])
+        var r: i64 = col + 1
+        while r < 8 {
+            let v: f64 = fabs((*m)[(r * 9 + col) as usize])
+            if v > best {
+                best = v
+                piv = r
+            }
+            r = r + 1
+        }
+        if best < 0.000000000001 {
+            return false
+        }
+        if piv != col {
+            var k: i64 = 0
+            while k < 9 {
+                let t: f64 = (*m)[(col * 9 + k) as usize]
+                (*m)[(col * 9 + k) as usize] = (*m)[(piv * 9 + k) as usize]
+                (*m)[(piv * 9 + k) as usize] = t
+                k = k + 1
+            }
+        }
+        r = 0
+        while r < 8 {
+            if r != col {
+                let fct: f64 = (*m)[(r * 9 + col) as usize] / (*m)[(col * 9 + col) as usize]
+                var k: i64 = col
+                while k < 9 {
+                    (*m)[(r * 9 + k) as usize] = (*m)[(r * 9 + k) as usize] - fct * (*m)[(col * 9 + k) as usize]
+                    k = k + 1
+                }
+            }
+            r = r + 1
+        }
+        col = col + 1
+    }
+    var i: i64 = 0
+    while i < 8 {
+        (*out)[i as usize] = (*m)[(i * 9 + 8) as usize] / (*m)[(i * 9 + i) as usize]
+        i = i + 1
+    }
+    return true
+}
+
+// Least-squares fit of the map through n >= 4 points (u, v) -> (x, y), each with
+// a weight. `dim` centres the module side.
+fn fit_h(u: *mut [f64; 16], v: *mut [f64; 16], px: *mut [f64; 16], py: *mut [f64; 16],
+        wt: *mut [f64; 16], n: i64, dim: i64, out: *mut Homog) -> bool {
+    var mx: f64 = 0.0
+    var my: f64 = 0.0
+    var i: i64 = 0
+    while i < n {
+        mx = mx + (*px)[i as usize]
+        my = my + (*py)[i as usize]
+        i = i + 1
+    }
+    mx = mx / (n as f64)
+    my = my / (n as f64)
+    var spread: f64 = 0.0
+    i = 0
+    while i < n {
+        spread = spread + fabs((*px)[i as usize] - mx) + fabs((*py)[i as usize] - my)
+        i = i + 1
+    }
+    spread = spread / (n as f64) / 2.0
+    if spread < 1.0 {
+        return false
+    }
+    (*out).uc = (dim as f64) / 2.0
+    (*out).us = (dim as f64) / 2.0
+    (*out).xc = mx
+    (*out).yc = my
+    (*out).ps = spread
+    var m: [f64; 72] = [0.0; 72]
+    i = 0
+    while i < n {
+        let uu: f64 = ((*u)[i as usize] - (*out).uc) / (*out).us
+        let vv: f64 = ((*v)[i as usize] - (*out).uc) / (*out).us
+        let x: f64 = ((*px)[i as usize] - mx) / spread
+        let y: f64 = ((*py)[i as usize] - my) / spread
+        let w: f64 = (*wt)[i as usize]
+        // the two rows of this point, accumulated into A^T A and A^T b
+        var r0: [f64; 9] = [uu, vv, 1.0, 0.0, 0.0, 0.0, 0.0 - uu * x, 0.0 - vv * x, x]
+        var r1: [f64; 9] = [0.0, 0.0, 0.0, uu, vv, 1.0, 0.0 - uu * y, 0.0 - vv * y, y]
+        var a: i64 = 0
+        while a < 8 {
+            var b: i64 = 0
+            while b < 9 {
+                m[(a * 9 + b) as usize] = m[(a * 9 + b) as usize]
+                    + w * (r0[a as usize] * r0[b as usize] + r1[a as usize] * r1[b as usize])
+                b = b + 1
+            }
+            a = a + 1
+        }
+        i = i + 1
+    }
+    var s: [f64; 8] = [0.0; 8]
+    if !solve8(&m, &s) {
+        return false
+    }
+    i = 0
+    while i < 8 {
+        (*out).h[i as usize] = s[i as usize]
+        i = i + 1
+    }
+    (*out).h[8] = 1.0
+    return true
+}
+
+fn hmap(t: *mut Homog, u: f64, v: f64, ox: *mut f64, oy: *mut f64) {
+    let uu: f64 = (u - (*t).uc) / (*t).us
+    let vv: f64 = (v - (*t).uc) / (*t).us
+    let d: f64 = (*t).h[6] * uu + (*t).h[7] * vv + 1.0
+    *ox = ((*t).h[0] * uu + (*t).h[1] * vv + (*t).h[2]) / d * (*t).ps + (*t).xc
+    *oy = ((*t).h[3] * uu + (*t).h[4] * vv + (*t).h[5]) / d * (*t).ps + (*t).yc
+}
+
+// the five-vote sample of one module
+fn sample_module(bin: u64, w: i64, h: i64, t: *mut Homog, mx: i64, my: i64) -> bool {
+    var votes: i64 = 0
+    var k: i64 = 0
+    while k < 5 {
+        var du: f64 = 0.0
+        var dv: f64 = 0.0
+        if k == 1 { du = 0.25 }
+        if k == 2 { du = 0.0 - 0.25 }
+        if k == 3 { dv = 0.25 }
+        if k == 4 { dv = 0.0 - 0.25 }
+        var x: f64 = 0.0
+        var y: f64 = 0.0
+        hmap(t, (mx as f64) + 0.5 + du, (my as f64) + 0.5 + dv, &x, &y)
+        votes = votes + bin_at(bin, w, h, ffloor(x), ffloor(y))
+        k = k + 1
+    }
+    return votes >= 3
+}
+
+// score of an alignment pattern template (25 modules) at picture point (px, py)
+// with the module axes (ux, uy) and (vx, vy)
+fn align_score(bin: u64, w: i64, h: i64, px: f64, py: f64, ux: f64, uy: f64, vx: f64, vy: f64) -> i64 {
+    var s: i64 = 0
+    var dy: i64 = 0 - 2
+    while dy <= 2 {
+        var dx: i64 = 0 - 2
+        while dx <= 2 {
+            let ring: i64 = imax_abs(dx, dy)
+            var want: i64 = 1
+            if ring == 1 {
+                want = 0
+            }
+            let x: f64 = px + (dx as f64) * ux + (dy as f64) * vx
+            let y: f64 = py + (dx as f64) * uy + (dy as f64) * vy
+            if bin_at(bin, w, h, ffloor(x), ffloor(y)) == want {
+                s = s + 1
+            }
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+    return s
+}
+
+fn imax_abs(a: i64, b: i64) -> i64 {
+    var x: i64 = a
+    var y: i64 = b
+    if x < 0 { x = 0 - x }
+    if y < 0 { y = 0 - y }
+    if x > y {
+        return x
+    }
+    return y
+}
+
+// The four outer corners of a finder pattern at (cx, cy): the extremes, along
+// the four diagonals of the code's own axes (unit vectors (dx, dy) along the
+// top edge and (nx, ny) towards the lower left), of the dark ring that
+// surrounds the finder. `cor` receives x0,y0 .. x3,y3 in the order
+// (-d-n), (+d-n), (-d+n), (+d+n) = module corners (0,0), (7,0), (0,7), (7,7).
+fn finder_corners(bin: u64, w: i64, h: i64, cx: f64, cy: f64, ms: f64,
+        dx: f64, dy: f64, nx: f64, ny: f64, cor: *mut [f64; 8]) -> bool {
+    var rad: i64 = ffloor(ms * 5.5) + 2
+    if rad < 6 {
+        rad = 6
+    }
+    let side: i64 = 2 * rad + 1
+    let vis: u64 = rt.heap_alloc((side * side) as usize)
+    let stk: u64 = rt.heap_alloc((side * side * 4) as usize)
+    if vis == 0 || stk == 0 {
+        rt.heap_free(vis, (side * side) as usize)
+        rt.heap_free(stk, (side * side * 4) as usize)
+        return false
+    }
+    let ox: i64 = ffloor(cx) - rad
+    let oy: i64 = ffloor(cy) - rad
+    var z: i64 = 0
+    while z < side * side {
+        rt.st8(vis, z as usize, 0 as u8)
+        z = z + 1
+    }
+    // a seed on the dark ring: 3 modules from the centre, along either axis
+    var sx: i64 = 0 - 1
+    var sy: i64 = 0 - 1
+    var k: i64 = 0
+    while k < 4 && sx < 0 {
+        var vx: f64 = dx
+        var vy: f64 = dy
+        if k == 1 { vx = 0.0 - dx
+                    vy = 0.0 - dy }
+        if k == 2 { vx = nx
+                    vy = ny }
+        if k == 3 { vx = 0.0 - nx
+                    vy = 0.0 - ny }
+        let tx: i64 = ffloor(cx + vx * 3.0 * ms)
+        let ty: i64 = ffloor(cy + vy * 3.0 * ms)
+        if bin_at(bin, w, h, tx, ty) == 1 {
+            sx = tx
+            sy = ty
+        }
+        k = k + 1
+    }
+    if sx < 0 {
+        rt.heap_free(vis, (side * side) as usize)
+        rt.heap_free(stk, (side * side * 4) as usize)
+        return false
+    }
+    var best: [f64; 4] = [0.0 - 1000000000.0, 0.0 - 1000000000.0, 0.0 - 1000000000.0, 0.0 - 1000000000.0]
+    var bx: [f64; 4] = [0.0; 4]
+    var by: [f64; 4] = [0.0; 4]
+    var sp: i64 = 0
+    rt.st32(stk, 0, ((sy - oy) * side + (sx - ox)) as u32)
+    sp = 1
+    rt.st8(vis, ((sy - oy) * side + (sx - ox)) as usize, 1 as u8)
+    var count: i64 = 0
+    while sp > 0 {
+        sp = sp - 1
+        let code: i64 = rt.ld32(stk, sp as usize) as i64
+        let py: i64 = code / side + oy
+        let px: i64 = code % side + ox
+        count = count + 1
+        // the pixel's four corners count (pixel centre + 0.5 offsets), so the
+        // extreme is the outer edge of the pixel
+        var c: i64 = 0
+        while c < 4 {
+            var ex: f64 = 0.0
+            var ey: f64 = 0.0
+            if c == 0 { ex = 0.0 - dx - nx
+                        ey = 0.0 - dy - ny }
+            if c == 1 { ex = dx - nx
+                        ey = dy - ny }
+            if c == 2 { ex = 0.0 - dx + nx
+                        ey = 0.0 - dy + ny }
+            if c == 3 { ex = dx + nx
+                        ey = dy + ny }
+            let sc: f64 = ((px as f64) + 0.5) * ex + ((py as f64) + 0.5) * ey
+            if sc > best[c as usize] {
+                best[c as usize] = sc
+                bx[c as usize] = (px as f64) + 0.5
+                by[c as usize] = (py as f64) + 0.5
+            }
+            c = c + 1
+        }
+        var d: i64 = 0
+        while d < 4 {
+            var qx: i64 = px
+            var qy: i64 = py
+            if d == 0 { qx = px + 1 }
+            if d == 1 { qx = px - 1 }
+            if d == 2 { qy = py + 1 }
+            if d == 3 { qy = py - 1 }
+            if qx >= ox && qy >= oy && qx < ox + side && qy < oy + side {
+                let li: i64 = (qy - oy) * side + (qx - ox)
+                if rt.ld8(vis, li as usize) == 0 as u8 && bin_at(bin, w, h, qx, qy) == 1 {
+                    rt.st8(vis, li as usize, 1 as u8)
+                    if sp < side * side {
+                        rt.st32(stk, sp as usize, li as u32)
+                        sp = sp + 1
+                    }
+                }
+            }
+            d = d + 1
+        }
+    }
+    rt.heap_free(vis, (side * side) as usize)
+    rt.heap_free(stk, (side * side * 4) as usize)
+    // the component must be about the size of a finder's outer ring (24 modules
+    // of ms * ms pixels, give or take) and must not have filled the window
+    let area: f64 = 24.0 * ms * ms
+    if (count as f64) < area * 0.5 || (count as f64) > area * 1.8 {
+        return false
+    }
+    var c: i64 = 0
+    while c < 4 {
+        (*cor)[(c * 2) as usize] = bx[c as usize]
+        (*cor)[(c * 2 + 1) as usize] = by[c as usize]
+        c = c + 1
+    }
+    return true
+}
+
+// Tries to read the code whose finders are (ax,ay) top left, (bx,by) top right,
+// (cx,cy) bottom left (picture coordinates of their centres, `ms` the module
+// pitch measured), for version `ver`. `variant`: bit 0 = fit through the finders'
+// outer corners (else through their centres), bit 1 = use the alignment pattern.
+fn try_version(bin: u64, w: i64, h: i64, ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64,
+        ms: f64, ver: i64, res: *mut QrResult, variant: i64) -> bool {
+    let dim: i64 = 17 + 4 * ver
+    let df: f64 = dim as f64
+    if (variant & 2) != 0 && ver < 2 {
+        return false
+    }
+    var u: [f64; 16] = [0.0; 16]
+    var v: [f64; 16] = [0.0; 16]
+    var px: [f64; 16] = [0.0; 16]
+    var py: [f64; 16] = [0.0; 16]
+    var wt: [f64; 16] = [0.0; 16]
+    var np: i64 = 0
+    // unit vectors of the code's axes (approximate, from the finder centres)
+    let tdx: f64 = bx - ax
+    let tdy: f64 = by - ay
+    let tl: f64 = math.sqrt(tdx * tdx + tdy * tdy)
+    let ldx: f64 = cx - ax
+    let ldy: f64 = cy - ay
+    let ll: f64 = math.sqrt(ldx * ldx + ldy * ldy)
+    if tl < 1.0 || ll < 1.0 {
+        return false
+    }
+    if (variant & 1) != 0 {
+        var cor: [f64; 8] = [0.0; 8]
+        var fi: i64 = 0
+        while fi < 3 {
+            var fx: f64 = ax
+            var fy: f64 = ay
+            var u0: f64 = 0.0
+            var v0: f64 = 0.0
+            if fi == 1 {
+                fx = bx
+                fy = by
+                u0 = df - 7.0
+            }
+            if fi == 2 {
+                fx = cx
+                fy = cy
+                v0 = df - 7.0
+            }
+            if !finder_corners(bin, w, h, fx, fy, ms, tdx / tl, tdy / tl, ldx / ll, ldy / ll, &cor) {
+                return false
+            }
+            var c: i64 = 0
+            while c < 4 {
+                var cu: f64 = u0
+                var cv: f64 = v0
+                if c == 1 || c == 3 {
+                    cu = cu + 7.0
+                }
+                if c == 2 || c == 3 {
+                    cv = cv + 7.0
+                }
+                u[np as usize] = cu
+                v[np as usize] = cv
+                px[np as usize] = cor[(c * 2) as usize]
+                py[np as usize] = cor[(c * 2 + 1) as usize]
+                wt[np as usize] = 1.0
+                np = np + 1
+                c = c + 1
+            }
+            fi = fi + 1
+        }
+    } else {
+        u[0] = 3.5
+        v[0] = 3.5
+        px[0] = ax
+        py[0] = ay
+        u[1] = df - 3.5
+        v[1] = 3.5
+        px[1] = bx
+        py[1] = by
+        u[2] = 3.5
+        v[2] = df - 3.5
+        px[2] = cx
+        py[2] = cy
+        wt[0] = 1.0
+        wt[1] = 1.0
+        wt[2] = 1.0
+        np = 3
+        if (variant & 2) == 0 {
+            u[3] = df - 3.5
+            v[3] = df - 3.5
+            px[3] = bx + cx - ax
+            py[3] = by + cy - ay
+            wt[3] = 1.0
+            np = 4
+        }
+    }
+    var t: Homog = Homog { h: [0.0; 9], uc: 0.0, us: 1.0, xc: 0.0, yc: 0.0, ps: 1.0 }
+    if (variant & 2) != 0 {
+        // a provisional map without the alignment pattern predicts where it is
+        var np0: i64 = np
+        if (variant & 1) == 0 {
+            u[3] = df - 3.5
+            v[3] = df - 3.5
+            px[3] = bx + cx - ax
+            py[3] = by + cy - ay
+            wt[3] = 1.0
+            np0 = 4
+        }
+        if !fit_h(&u, &v, &px, &py, &wt, np0, dim, &t) {
+            return false
+        }
+        let au: f64 = df - 6.5
+        var ex: f64 = 0.0
+        var ey: f64 = 0.0
+        hmap(&t, au, au, &ex, &ey)
+        var e1x: f64 = 0.0
+        var e1y: f64 = 0.0
+        hmap(&t, au + 1.0, au, &e1x, &e1y)
+        var e2x: f64 = 0.0
+        var e2y: f64 = 0.0
+        hmap(&t, au, au + 1.0, &e2x, &e2y)
+        let ux: f64 = e1x - ex
+        let uy: f64 = e1y - ey
+        let vx: f64 = e2x - ex
+        let vy: f64 = e2y - ey
+        let pitch: f64 = math.sqrt(ux * ux + uy * uy)
+        var rad: i64 = ffloor(pitch * 3.0) + 1
+        if rad < 3 {
+            rad = 3
+        }
+        var best: i64 = 0 - 1
+        var bxx: f64 = ex
+        var byy: f64 = ey
+        var step: i64 = ffloor(pitch / 3.0)
+        if step < 1 {
+            step = 1
+        }
+        var oy: i64 = 0 - rad
+        while oy <= rad {
+            var ox: i64 = 0 - rad
+            while ox <= rad {
+                let sx: f64 = ex + (ox as f64)
+                let sy: f64 = ey + (oy as f64)
+                let sc: i64 = align_score(bin, w, h, sx, sy, ux, uy, vx, vy)
+                if sc > best {
+                    best = sc
+                    bxx = sx
+                    byy = sy
+                }
+                ox = ox + step
+            }
+            oy = oy + step
+        }
+        var fy: i64 = 0 - step
+        while fy <= step {
+            var fx: i64 = 0 - step
+            while fx <= step {
+                let sx: f64 = bxx + (fx as f64)
+                let sy: f64 = byy + (fy as f64)
+                let sc: i64 = align_score(bin, w, h, sx, sy, ux, uy, vx, vy)
+                if sc > best {
+                    best = sc
+                    bxx = sx
+                    byy = sy
+                }
+                fx = fx + 1
+            }
+            fy = fy + 1
+        }
+        if best < 22 {
+            return false
+        }
+        // the alignment centre replaces the guessed fourth point
+        np = np0
+        if (variant & 1) == 0 {
+            np = 3
+        }
+        u[np as usize] = au
+        v[np as usize] = au
+        px[np as usize] = bxx
+        py[np as usize] = byy
+        wt[np as usize] = 4.0
+        np = np + 1
+    }
+    if !fit_h(&u, &v, &px, &py, &wt, np, dim, &t) {
+        return false
+    }
+    var q: qr.QrCode = qr.qr_new()
+    rt.buf_reserve(&q.modules, (dim * dim) as usize)
+    if rt.buf_ptr(&q.modules) == 0 {
+        return false
+    }
+    rt.buf_set_len(&q.modules, (dim * dim) as usize)
+    var my: i64 = 0
+    while my < dim {
+        var mx: i64 = 0
+        while mx < dim {
+            var d: u8 = 0 as u8
+            if sample_module(bin, w, h, &t, mx, my) {
+                d = 1 as u8
+            }
+            rt.st8(rt.buf_ptr(&q.modules), (my * dim + mx) as usize, d)
+            mx = mx + 1
+        }
+        my = my + 1
+    }
+    q.size = dim as u32
+    q.version = ver as u32
+    var ok: bool = true
+    qrdec_modules(&q, res) catch | e | (set_false(&ok))
+    qr.qr_free(&q)
+    return ok
+}
+
+fn set_false(b: *mut bool) -> bool {
+    *b = false
+    return false
+}
+
+// One attempt on one binarisation: finders, triples, versions.
+fn attempt(bin: u64, w: i64, h: i64, res: *mut QrResult) -> bool {
+    var f: Finders = Finders { n: 0, x: [0.0; 512], y: [0.0; 512], ms: [0.0; 512], cnt: [0; 512] }
+    scan_finders(bin, w, h, &f)
+    // the strongest candidates
+    var idx: [i64; 12] = [0; 12]
+    var m: i64 = 0
+    var used: [bool; 512] = [false; 512]
+    while m < 12 {
+        var bi: i64 = 0 - 1
+        var i: i64 = 0
+        while i < f.n {
+            if !used[i as usize] && f.cnt[i as usize] >= 2 && (bi < 0 || f.cnt[i as usize] > f.cnt[bi as usize]) {
+                bi = i
+            }
+            i = i + 1
+        }
+        if bi < 0 {
+            break
+        }
+        used[bi as usize] = true
+        idx[m as usize] = bi
+        m = m + 1
+    }
+    if m < 3 {
+        return false
+    }
+    // score every triple
+    var tries: i64 = 0
+    var done_score: f64 = 0.0
+    while tries < 6 {
+        var best: f64 = 1000000.0
+        var ba: i64 = 0 - 1
+        var bb: i64 = 0
+        var bc: i64 = 0
+        var i: i64 = 0
+        while i < m {
+            var j: i64 = i + 1
+            while j < m {
+                var k: i64 = j + 1
+                while k < m {
+                    let a: i64 = idx[i as usize]
+                    let b: i64 = idx[j as usize]
+                    let c: i64 = idx[k as usize]
+                    let sc: f64 = triple_score(&f, a, b, c)
+                    if sc > done_score && sc < best {
+                        best = sc
+                        ba = a
+                        bb = b
+                        bc = c
+                    }
+                    k = k + 1
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        if ba < 0 || best > 0.9 {
+            return false
+        }
+        done_score = best
+        if try_triple(bin, w, h, &f, ba, bb, bc, res) {
+            return true
+        }
+        tries = tries + 1
+    }
+    return false
+}
+
+// 0 = a perfect right isosceles triangle with equal module pitch; larger = worse
+fn triple_score(f: *mut Finders, a: i64, b: i64, c: i64) -> f64 {
+    let ms1: f64 = (*f).ms[a as usize]
+    let ms2: f64 = (*f).ms[b as usize]
+    let ms3: f64 = (*f).ms[c as usize]
+    var lo: f64 = ms1
+    var hi: f64 = ms1
+    if ms2 < lo { lo = ms2 }
+    if ms3 < lo { lo = ms3 }
+    if ms2 > hi { hi = ms2 }
+    if ms3 > hi { hi = ms3 }
+    if hi > lo * 1.8 {
+        return 1000.0
+    }
+    let dab: f64 = dist(f, a, b)
+    let dac: f64 = dist(f, a, c)
+    let dbc: f64 = dist(f, b, c)
+    // the right angle sits opposite the longest side
+    var corner: i64 = a
+    var s1: f64 = dab
+    var s2: f64 = dac
+    var lng: f64 = dbc
+    if dab >= dac && dab >= dbc {
+        corner = c
+        s1 = dac
+        s2 = dbc
+        lng = dab
+    } else {
+        if dac >= dab && dac >= dbc {
+            corner = b
+            s1 = dab
+            s2 = dbc
+            lng = dac
+        }
+    }
+    if corner < 0 || s1 < 1.0 || s2 < 1.0 {
+        return 1000.0
+    }
+    let diff: f64 = fabs(s1 - s2) / (s1 + s2)
+    let hyp: f64 = fabs(lng - 1.41421356 * (s1 + s2) / 2.0) / lng
+    // the code must be big enough: finders are 7 modules; at least 14 apart
+    var msm: f64 = (ms1 + ms2 + ms3) / 3.0
+    if s1 < 10.0 * msm {
+        return 1000.0
+    }
+    return diff + hyp
+}
+
+fn dist(f: *mut Finders, a: i64, b: i64) -> f64 {
+    let dx: f64 = (*f).x[a as usize] - (*f).x[b as usize]
+    let dy: f64 = (*f).y[a as usize] - (*f).y[b as usize]
+    return math.sqrt(dx * dx + dy * dy)
+}
+
+fn add_cand(c: *mut [i64; 12], n: i64, v: i64) -> i64 {
+    if v < 1 || v > 40 || n >= 12 {
+        return n
+    }
+    var i: i64 = 0
+    while i < n {
+        if (*c)[i as usize] == v {
+            return n
+        }
+        i = i + 1
+    }
+    (*c)[n as usize] = v
+    return n + 1
+}
+
+// Counts the dark/light changes along the timing row (module row 6) between the
+// two upper finders, on three parallel lines, and returns the symbol size
+// they imply (transitions + 13), or 0 if the lines disagree wildly.
+fn timing_dim(bin: u64, w: i64, h: i64, ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64,
+        ms: f64) -> i64 {
+    let tdx: f64 = bx - ax
+    let tdy: f64 = by - ay
+    let tlen: f64 = math.sqrt(tdx * tdx + tdy * tdy)
+    let ldx: f64 = cx - ax
+    let ldy: f64 = cy - ay
+    let llen: f64 = math.sqrt(ldx * ldx + ldy * ldy)
+    if tlen < 1.0 || llen < 1.0 || ms < 1.0 {
+        return 0
+    }
+    // unit vectors along the top edge and towards the lower left finder
+    let ex: f64 = tdx / tlen
+    let ey: f64 = tdy / tlen
+    let nx: f64 = ldx / llen
+    let ny: f64 = ldy / llen
+    // the pitch along the row (not corrected for rotation)
+    var res: [i64; 3] = [0; 3]
+    var li: i64 = 0
+    while li < 3 {
+        var off: f64 = 3.0
+        if li == 0 { off = 2.75 }
+        if li == 2 { off = 3.25 }
+        let sx: f64 = ax + nx * off * ms
+        let sy: f64 = ay + ny * off * ms
+        let step: f64 = ms * 0.2
+        let count: i64 = ffloor(tlen / step)
+        var cur: i64 = 1
+        var pending: i64 = 0
+        var trans: i64 = 0
+        var i: i64 = 0
+        while i <= count {
+            let x: f64 = sx + ex * step * (i as f64)
+            let y: f64 = sy + ey * step * (i as f64)
+            let v: i64 = bin_at(bin, w, h, ffloor(x), ffloor(y))
+            if v != cur {
+                pending = pending + 1
+                if pending >= 2 {
+                    trans = trans + 1
+                    cur = v
+                    pending = 0
+                }
+            } else {
+                pending = 0
+            }
+            i = i + 1
+        }
+        res[li as usize] = trans + 13
+        li = li + 1
+    }
+    // the median of three
+    var a: i64 = res[0]
+    var b: i64 = res[1]
+    var c: i64 = res[2]
+    if a > b {
+        let t: i64 = a
+        a = b
+        b = t
+    }
+    if b > c {
+        let t: i64 = b
+        b = c
+        c = t
+    }
+    if a > b {
+        b = a
+    }
+    return b
+}
+
+fn try_triple(bin: u64, w: i64, h: i64, f: *mut Finders, a: i64, b: i64, c: i64, res: *mut QrResult) -> bool {
+    let dab: f64 = dist(f, a, b)
+    let dac: f64 = dist(f, a, c)
+    let dbc: f64 = dist(f, b, c)
+    // corner = top left
+    var tl: i64 = a
+    var p1: i64 = b
+    var p2: i64 = c
+    if dab >= dac && dab >= dbc {
+        tl = c
+        p1 = a
+        p2 = b
+    } else {
+        if dac >= dab && dac >= dbc {
+            tl = b
+            p1 = a
+            p2 = c
+        }
+    }
+    // orientation: with y down, the cross product of (tl->p1) x (tl->p2) > 0
+    // means p1 is "right" of tl and p2 "below"
+    let x1: f64 = (*f).x[p1 as usize] - (*f).x[tl as usize]
+    let y1: f64 = (*f).y[p1 as usize] - (*f).y[tl as usize]
+    let x2: f64 = (*f).x[p2 as usize] - (*f).x[tl as usize]
+    let y2: f64 = (*f).y[p2 as usize] - (*f).y[tl as usize]
+    var tr: i64 = p1
+    var bl: i64 = p2
+    if x1 * y2 - y1 * x2 < 0.0 {
+        tr = p2
+        bl = p1
+    }
+    let ax: f64 = (*f).x[tl as usize]
+    let ay: f64 = (*f).y[tl as usize]
+    let bx: f64 = (*f).x[tr as usize]
+    let by: f64 = (*f).y[tr as usize]
+    let cx: f64 = (*f).x[bl as usize]
+    let cy: f64 = (*f).y[bl as usize]
+    // The run lengths the finder scan measured are chords of a rotated square:
+    // a code turned by phi (folded into -45..45 degrees) shows every module
+    // 1 / cos(phi) wider along a row or a column.
+    let tdx: f64 = bx - ax
+    let tdy: f64 = by - ay
+    let tlen: f64 = math.sqrt(tdx * tdx + tdy * tdy)
+    var big: f64 = fabs(tdx)
+    if fabs(tdy) > big {
+        big = fabs(tdy)
+    }
+    let ms: f64 = ((*f).ms[tl as usize] + (*f).ms[tr as usize] + (*f).ms[bl as usize]) / 3.0 * big / tlen
+    let d_top: f64 = dist(f, tl, tr)
+    let d_left: f64 = dist(f, tl, bl)
+    let dim_g: f64 = (d_top + d_left) / 2.0 / ms + 7.0
+    // the timing pattern between the finders counts the modules directly
+    let dim_t: i64 = timing_dim(bin, w, h, ax, ay, bx, by, cx, cy, ms)
+    var cands: [i64; 12] = [0; 12]
+    var nc: i64 = 0
+    var vt: i64 = 0
+    if dim_t >= 21 {
+        vt = fround((((dim_t as f64) - 17.0) / 4.0))
+        nc = add_cand(&cands, nc, vt)
+    }
+    let vg: i64 = fround((dim_g - 17.0) / 4.0)
+    nc = add_cand(&cands, nc, vg)
+    if vt > 0 {
+        nc = add_cand(&cands, nc, vt - 1)
+        nc = add_cand(&cands, nc, vt + 1)
+    }
+    nc = add_cand(&cands, nc, vg - 1)
+    nc = add_cand(&cands, nc, vg + 1)
+    nc = add_cand(&cands, nc, vg - 2)
+    nc = add_cand(&cands, nc, vg + 2)
+    var k: i64 = 0
+    while k < nc {
+        let cand: i64 = cands[k as usize]
+        var vr: i64 = 3
+        while vr >= 0 {
+            if try_version(bin, w, h, ax, ay, bx, by, cx, cy, ms, cand, res, vr) {
+                return true
+            }
+            vr = vr - 1
+        }
+        k = k + 1
+    }
+    return false
+}
+
+// A picture of gray octets (w * h, row 0 on top; 0 = black).
+fn qrdec_gray(p: u64, w: usize, h: usize, res: *mut QrResult) -> QrDecError!bool {
+    if w < 21 || h < 21 || w > 65536 || h > 65536 {
+        return QrDecError::NotFound
+    }
+    // average down by an integer factor if the picture is huge
+    var f: usize = 1
+    while (w / f) * (h / f) > 4194304 {
+        f = f + 1
+    }
+    var gw: usize = w
+    var gh: usize = h
+    var gray: u64 = p
+    var own: bool = false
+    if f > 1 {
+        gw = w / f
+        gh = h / f
+        gray = rt.heap_alloc(gw * gh)
+        if gray == 0 {
+            return QrDecError::OutOfMemory
+        }
+        own = true
+        var y: usize = 0
+        while y < gh {
+            var x: usize = 0
+            while x < gw {
+                var s: u32 = 0 as u32
+                var yy: usize = 0
+                while yy < f {
+                    var xx: usize = 0
+                    while xx < f {
+                        s = s + (rt.ld8(p, (y * f + yy) * w + x * f + xx) as u32)
+                        xx++
+                    }
+                    yy++
+                }
+                rt.st8(gray, y * gw + x, (s / ((f * f) as u32)) as u8)
+                x++
+            }
+            y++
+        }
+    }
+    let bin: u64 = rt.heap_alloc(gw * gh)
+    if bin == 0 {
+        if own {
+            rt.heap_free(gray, gw * gh)
+        }
+        return QrDecError::OutOfMemory
+    }
+    var found: bool = false
+    var att: i64 = 0
+    var base: i64 = (gw as i64)
+    if (gh as i64) < base {
+        base = gh as i64
+    }
+    while att < 4 && !found {
+        var ok: bool = true
+        if att == 0 {
+            binarize_otsu(gray, gw * gh, bin, false)
+        }
+        if att == 1 {
+            var r: i64 = base / 8
+            if r < 8 {
+                r = 8
+            }
+            ok = binarize_local(gray, gw, gh, r, 7, bin)
+        }
+        if att == 2 {
+            var r: i64 = base / 4
+            if r < 12 {
+                r = 12
+            }
+            ok = binarize_local(gray, gw, gh, r, 4, bin)
+        }
+        if att == 3 {
+            binarize_otsu(gray, gw * gh, bin, true)
+        }
+        if ok {
+            found = attempt(bin, gw as i64, gh as i64, res)
+        }
+        att = att + 1
+    }
+    rt.heap_free(bin, gw * gh)
+    if own {
+        rt.heap_free(gray, gw * gh)
+    }
+    if !found {
+        return QrDecError::NotFound
+    }
+    return true
+}
+
+// RGBA octets (alpha composited over white).
+fn qrdec_rgba(p: u64, w: usize, h: usize, res: *mut QrResult) -> QrDecError!bool {
+    let g: u64 = rt.heap_alloc(w * h + 1)
+    if g == 0 {
+        return QrDecError::OutOfMemory
+    }
+    var i: usize = 0
+    while i < w * h {
+        let r: i64 = rt.ld8(p, i * 4) as i64
+        let gg: i64 = rt.ld8(p, i * 4 + 1) as i64
+        let b: i64 = rt.ld8(p, i * 4 + 2) as i64
+        let a: i64 = rt.ld8(p, i * 4 + 3) as i64
+        var y: i64 = (r * 299 + gg * 587 + b * 114) / 1000
+        y = (y * a + 255 * (255 - a)) / 255
+        rt.st8(g, i, y as u8)
+        i++
+    }
+    let r: QrDecError!bool = qrdec_gray(g, w, h, res)
+    rt.heap_free(g, w * h + 1)
+    return try r
+}

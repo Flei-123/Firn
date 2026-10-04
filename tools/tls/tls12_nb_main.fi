@@ -1,0 +1,183 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/tls/tls12_nb_main.fi -- the TLS client in NON-BLOCKING mode, driven by
+// a loop of its own (round TLS12; the state machine itself is round ASYNC).
+//
+//     tls12_nb_main <ip> <port> <hostname> <trust-store> [12]
+//
+// Connects, switches the socket and the TLS object to non-blocking, runs
+// `tls_handshake_step` until it is done (a `poll(2)` on the socket every time
+// it answers `WouldBlock`), sends a GET and reads the page with `tls_read`
+// (the same wait on `WouldBlock`). Prints `VERSION`, `SUITE`, `STATUS`,
+// `BYTES`, `WOULDBLOCK` (how often a step or a read had to wait): a proxy that
+// hands the server's octets over a few at a time makes that number large, and
+// the answer must still be the same page. `tools/tls/tls12_check.py` part G.
+import std.rt
+import std.net
+import tls.tls
+import tls.x509
+
+const RD_ERR: usize = 18446744073709551615
+
+fn put(out: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(out, p, n)
+}
+
+fn say_num(out: *mut rt.Buf, key: str, v: u64) {
+    put(out, key.p as u64, key.n)
+    rt.buf_push(out, 32 as u8)
+    rt.buf_push_dec_u64(out, v)
+    rt.buf_push(out, 10 as u8)
+}
+
+fn parse_u32(p: u64) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while true {
+        let ch: u8 = rt.ld8(p, i)
+        if ch < 48 as u8 || ch > 57 as u8 {
+            break
+        }
+        v = v * 10 as u32 + (ch - 48 as u8) as u32
+        i = i + 1
+    }
+    return v
+}
+
+// waits until the socket is readable (or `ms` have passed)
+fn wait_readable(fd: i32, ms: i64) {
+    var pfd: [i32; 2] = [fd, 1] // fd, events = POLLIN (low 16 bits), revents = 0
+    syscall(7, (&pfd[0]) as i64, 1, ms, 0, 0, 0)
+}
+
+fn now_seconds() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 0, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] as u64
+}
+
+fn main(start: u64) -> i32 {
+    var out: rt.Buf = rt.buf_new()
+    if rt.arg_count(start) < 5 {
+        return 2
+    }
+    // a.b.c.d
+    let ipp: u64 = rt.arg_ptr(start, 1)
+    var parts: [u32; 4] = [0; 4]
+    var k: usize = 0
+    var v: u32 = 0
+    var i: usize = 0
+    while true {
+        let ch: u8 = rt.ld8(ipp, i)
+        if ch == 0 as u8 {
+            break
+        }
+        if ch == 46 as u8 {
+            parts[k] = v
+            k = k + 1
+            v = 0
+        } else {
+            v = v * 10 as u32 + (ch - 48 as u8) as u32
+        }
+        i = i + 1
+    }
+    parts[k] = v
+    let addr: u32 = net.ipv4(parts[0] as u8, parts[1] as u8, parts[2] as u8, parts[3] as u8)
+    let port: u32 = parse_u32(rt.arg_ptr(start, 2))
+    let hostp: u64 = rt.arg_ptr(start, 3)
+    let hostn: usize = rt.c_length(hostp)
+    var storebuf: rt.Buf = rt.buf_new()
+    var store: x509.Store = x509.store_new()
+    if rt.read_file(rt.arg_ptr(start, 4), &storebuf) {
+        let taken: usize = x509.store_load_pem(&store, storebuf.ptr, storebuf.len)
+    }
+    var bad: bool = false
+    var c: net.Conn = net.connect_tcp(addr, port as u16) catch | e | fail_conn(&bad)
+    if bad {
+        return 1
+    }
+    let nbok: bool = net.set_nonblocking(&c, true) catch false
+    var t: tls.Tls = tls.tls_new()
+    let oki: bool = tls.tls_init(&t, &c, &store, hostp, hostn, now_seconds())
+    tls.tls_set_nonblocking(&t, true)
+    if rt.arg_count(start) > 5 {
+        tls.tls_set_max_version(&t, 771 as u32)
+    }
+    let fd: i32 = net.conn_fd(&c)
+    var waits: u64 = 0
+    var errslot: u32 = 0
+    var tries: u32 = 0
+    var done: bool = false
+    while !done && tries < 200000 {
+        tries = tries + 1
+        done = tls.tls_handshake_step(&t) catch | e | tls.tls_note_error(&errslot, e)
+        if !done {
+            if errslot != 0 as u32 {
+                say_num(&out, "ERR", errslot as u64)
+                rt.write_everything(1, out.ptr, out.len)
+                return 1
+            }
+            waits = waits + 1
+            wait_readable(fd, 5000)
+        }
+    }
+    if !done {
+        say_num(&out, "ERR", 99)
+        rt.write_everything(1, out.ptr, out.len)
+        return 1
+    }
+    say_num(&out, "VERSION", tls.tls_version(&t) as u64)
+    say_num(&out, "SUITE", tls.tls_suite(&t) as u64)
+    // a request
+    var req: rt.Buf = rt.buf_new()
+    var g: [u8; 22] = "GET / HTTP/1.1\r\nHost: "
+    put(&req, (&g[0]) as u64, 22)
+    put(&req, hostp, hostn)
+    var tail: [u8; 23] = "\r\nConnection: close\r\n\r\n"
+    put(&req, (&tail[0]) as u64, 23)
+    let okw: bool = tls.tls_write(&t, req.ptr, req.len) catch false
+    var guard: u32 = 0
+    while tls.tls_out_pending(&t) > 0 && guard < 100000 {
+        guard = guard + 1
+        let fl: bool = tls.tls_flush(&t)
+        wait_readable(fd, 1)
+    }
+    var body: rt.Buf = rt.buf_new()
+    var chunk: [u8; 4096] = [0; 4096]
+    var finished: bool = false
+    var spins: u32 = 0
+    while !finished && spins < 200000 {
+        spins = spins + 1
+        let n: usize = tls.tls_read(&t, (&chunk[0]) as u64, 4096) catch RD_ERR
+        if n == RD_ERR {
+            if tls.tls_closed(&t) {
+                finished = true // an error ended the connection
+            } else {
+                waits = waits + 1 // WouldBlock
+                wait_readable(fd, 5000)
+            }
+        } else if n == 0 {
+            finished = true
+        } else {
+            put(&body, (&chunk[0]) as u64, n)
+        }
+    }
+    say_num(&out, "BYTES", body.len as u64)
+    var e: usize = 0
+    while e < body.len && rt.ld8(body.ptr, e) != 13 as u8 {
+        e = e + 1
+    }
+    put(&out, "STATUS ".p as u64, 7)
+    put(&out, body.ptr, e)
+    rt.buf_push(&out, 10 as u8)
+    say_num(&out, "WOULDBLOCK", waits)
+    tls.tls_close(&t)
+    tls.tls_free(&t)
+    net.close(&c)
+    rt.write_everything(1, out.ptr, out.len)
+    return 0
+}
+
+fn fail_conn(bad: *mut bool) -> net.Conn {
+    *bad = true
+    return net.Conn { fd: -1, err: 0, peer: 0 as u32, peer_port: 0 as u16 }
+}

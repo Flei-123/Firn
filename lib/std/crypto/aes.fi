@@ -46,10 +46,16 @@
 //
 // ==================================================================== HONEST
 //
-// A1 128 BIT KEYS ONLY. The key schedule for 192 and 256 differs in more
-//    than a loop bound (the extra SubWord at Nk 8), and an untested key
-//    length is worse than a missing one. The NIST vectors in
-//    `testdata/crypto/` are the 128 bit sets.
+// A1 128 BIT KEYS, and 256 BIT KEYS FOR ENCRYPTION ONLY. The key schedule
+//    for 192 and 256 differs in more than a loop bound (the extra SubWord at
+//    Nk 8), and an untested key length is worse than a missing one. The NIST
+//    vectors in `testdata/crypto/` are the 128 bit sets. AES-256 (round
+//    TLS12: `aes256_new`) is there for ONE job, the block ENCRYPTION GCM is
+//    built on (TLS_..._AES_256_GCM_SHA384); it is checked against FIPS 197
+//    C.3 and against Python's `cryptography` (`tests/2103`). Its inverse
+//    cipher, CBC and CFB8 are NOT offered for it: `aes_decrypt_block`,
+//    `aes_cbc_*` and `aes_cfb8_*` on an AES-256 object answer false / do
+//    nothing instead of computing the wrong thing. 192 bit keys do not exist.
 // A2 NO PADDING. `aes_cbc_encrypt` demands a multiple of 16 and says so by
 //    returning false. PKCS#7 is a protocol decision, not a cipher one --
 //    and a padding oracle is one of the classic ways to lose a key.
@@ -83,7 +89,7 @@
 import std.rt
 import std.crypto.accel
 
-export { Aes, aes128_new, aes128_new_soft,
+export { Aes, aes128_new, aes128_new_soft, aes256_new, aes256_new_soft,
     aes_encrypt_block, aes_decrypt_block, aes_encrypt_block_soft,
     aes_cbc_encrypt, aes_cbc_decrypt, aes_cfb8_encrypt, aes_cfb8_decrypt,
     aes_cbc_encrypt_soft, aes_cbc_decrypt_soft,
@@ -93,7 +99,8 @@ export { Aes, aes128_new, aes128_new_soft,
 const AES_BLOCK: usize = 16
 
 struct Aes {
-    rk: [u8; 176], // 11 round keys of 16 octets
+    rk: [u8; 240], // 11 round keys of 16 octets (AES-128) or 15 (AES-256)
+    nr: usize, // the number of rounds: 10 or 14
     sbox: [u8; 256],
     isbox: [u8; 256],
     // The multiplication tables of MixColumns/InvMixColumns. MEASURED, not
@@ -165,7 +172,7 @@ fn gmul(a0: u8, b0: u8) -> u8 {
 // The key schedule of FIPS 197 5.2: 44 words, every fourth one goes
 // through RotWord, SubWord and the round constant.
 fn aes128_new(key: u64) -> Aes {
-    var a: Aes = Aes { rk: [0; 176], sbox: sbox_table(), isbox: [0; 256],
+    var a: Aes = Aes { rk: [0; 240], nr: 10, sbox: sbox_table(), isbox: [0; 256],
         m2: [0; 256], m3: [0; 256], m9: [0; 256], m11: [0; 256],
         m13: [0; 256], m14: [0; 256], ni: accel.accel_aes() }
     var i: usize = 0
@@ -213,6 +220,49 @@ fn aes128_new(key: u64) -> Aes {
     return a
 }
 
+// AES-256, the key schedule of FIPS 197 5.2 with Nk = 8 (60 words): every
+// eighth word goes through RotWord, SubWord and the round constant, and every
+// fourth one in between through SubWord alone -- the step AES-128 does not have.
+fn aes256_new(key: u64) -> Aes {
+    var a: Aes = aes128_new(key) // the tables, and the first 16 octets
+    a.nr = 14
+    var i: usize = 0
+    while i < 32 {
+        a.rk[i] = rt.ld8(key, i)
+        i = i + 1
+    }
+    var rcon: u8 = 1 as u8
+    var w: usize = 8
+    while w < 60 {
+        var t: [u8; 4] = [0; 4]
+        var j: usize = 0
+        while j < 4 {
+            t[j] = a.rk[(w - 1) * 4 + j]
+            j = j + 1
+        }
+        if w % 8 == 0 {
+            let tmp: u8 = t[0]
+            t[0] = a.sbox[t[1] as usize] ^ rcon
+            t[1] = a.sbox[t[2] as usize]
+            t[2] = a.sbox[t[3] as usize]
+            t[3] = a.sbox[tmp as usize]
+            rcon = gmul(rcon, 2 as u8)
+        } else if w % 8 == 4 {
+            t[0] = a.sbox[t[0] as usize]
+            t[1] = a.sbox[t[1] as usize]
+            t[2] = a.sbox[t[2] as usize]
+            t[3] = a.sbox[t[3] as usize]
+        }
+        j = 0
+        while j < 4 {
+            a.rk[w * 4 + j] = a.rk[(w - 8) * 4 + j] ^ t[j]
+            j = j + 1
+        }
+        w = w + 1
+    }
+    return a
+}
+
 fn add_round_key(st: *mut [u8; 16], a: *mut Aes, round: usize) {
     var i: usize = 0
     while i < 16 {
@@ -229,8 +279,9 @@ fn aes_encrypt_block_soft(a: *mut Aes, inp: u64, out: u64) {
         i = i + 1
     }
     add_round_key(&st, a, 0)
+    let nr: usize = (*a).nr
     var round: usize = 1
-    while round <= 10 {
+    while round <= nr {
         // SubBytes
         i = 0
         while i < 16 {
@@ -253,7 +304,7 @@ fn aes_encrypt_block_soft(a: *mut Aes, inp: u64, out: u64) {
             }
             r = r + 1
         }
-        if round < 10 {
+        if round < nr {
             // MixColumns
             var c: usize = 0
             while c < 4 {
@@ -279,6 +330,9 @@ fn aes_encrypt_block_soft(a: *mut Aes, inp: u64, out: u64) {
 }
 
 fn aes_decrypt_block(a: *mut Aes, inp: u64, out: u64) {
+    if (*a).nr != 10 {
+        return // A1: no inverse cipher for AES-256
+    }
     var st: [u8; 16] = [0; 16]
     var i: usize = 0
     while i < 16 {
@@ -450,16 +504,26 @@ fn aes128_new_soft(key: u64) -> Aes {
     return a
 }
 
+fn aes256_new_soft(key: u64) -> Aes {
+    var a: Aes = aes256_new(key)
+    a.ni = false
+    return a
+}
+
 fn aes_encrypt_block(a: *mut Aes, inp: u64, out: u64) {
     if (*a).ni {
-        accel.aes128_ni_encrypt_block((&(*a).rk[0]) as u64, inp, out)
+        if (*a).nr == 14 {
+            accel.aes256_ni_encrypt_block((&(*a).rk[0]) as u64, inp, out)
+        } else {
+            accel.aes128_ni_encrypt_block((&(*a).rk[0]) as u64, inp, out)
+        }
         return
     }
     aes_encrypt_block_soft(a, inp, out)
 }
 
 fn aes_cbc_encrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) -> bool {
-    if n % 16 != 0 {
+    if n % 16 != 0 || (*a).nr != 10 {
         return false
     }
     if (*a).ni {
@@ -470,7 +534,7 @@ fn aes_cbc_encrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) -> bool {
 }
 
 fn aes_cbc_decrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) -> bool {
-    if n % 16 != 0 {
+    if n % 16 != 0 || (*a).nr != 10 {
         return false
     }
     if (*a).ni {
@@ -481,6 +545,9 @@ fn aes_cbc_decrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) -> bool {
 }
 
 fn aes_cfb8_encrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) {
+    if (*a).nr != 10 {
+        return
+    }
     if (*a).ni {
         accel.aes128_ni_cfb8_encrypt((&(*a).rk[0]) as u64, iv, p, n, out)
         return
@@ -489,6 +556,9 @@ fn aes_cfb8_encrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) {
 }
 
 fn aes_cfb8_decrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) {
+    if (*a).nr != 10 {
+        return
+    }
     if (*a).ni {
         accel.aes128_ni_cfb8_decrypt((&(*a).rk[0]) as u64, iv, p, n, out)
         return

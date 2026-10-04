@@ -34,12 +34,12 @@ any application that starts programs.
 
 | module | what it does | held against |
 |---|---|---|
-| `std.process` (`lib/std/process.fi`, `process.windows.fi`) | start a program with arguments, working directory, changed environment; stdin/stdout/stderr inherited, piped or discarded; blocking and non-blocking reads; wait (with timeout), try_wait, exit code, kill/terminate, detach, `no_window`; `run_capture`/`run_io` collect both outputs while feeding input without deadlock; every failure is a `ProcError` | 3 MiB both ways through a child, 300 KB on stdout+stderr, 300 starts without a leak (`tests/2062`-`2064`, Linux, AArch64, Wine) |
+| `std.process` (`lib/std/process.fi`, `process.windows.fi`) | start a program with arguments, working directory, changed environment; stdin/stdout/stderr inherited, piped or discarded; blocking and non-blocking reads; wait (with timeout), try_wait, exit code, kill/terminate, whole process trees (`set_group`, `kill_tree`, `terminate_tree`: a process group on Linux, a job object on Windows; `set_kill_with_launcher` on Windows), detach, `no_window`; `run_capture`/`run_io` collect both outputs while feeding input without deadlock; every failure is a `ProcError` | 3 MiB both ways through a child, 300 KB on stdout+stderr, 300 starts without a leak (`tests/2062`-`2064`, Linux, AArch64, Wine); the tree kill by a grandchild that holds the pipe open (`tests/2100`, Linux and Wine; see [WINDOWS_THREADS.md](WINDOWS_THREADS.md)) |
 | `std.shell` (`lib/std/shell.fi`) | `open_url`, `open_path`, `reveal_in_file_manager`, `find_in_path`, home/config/data/cache/temp/Minecraft directories, `find_java`/`java_candidates`/`java_major_version` | a fake `xdg-open` and fake `java` scripts (`tests/2061`) |
 | `std.env` (`lib/std/env.fi`) | read the environment, `find_executable` (`which`) | the kernel's `/proc/self/environ`, `sh` on PATH |
-| `std.pool` (`lib/std/pool.fi`) | fixed worker threads, bounded job queue, results; Linux only (Windows runs jobs inline) | `tests/2065`: 5000 jobs once each, parallel speed-up, GC on workers |
+| `std.pool` (`lib/std/pool.fi`) | fixed worker threads, bounded job queue, results; Linux and Windows (real `CreateThread` threads since round WIN-THREADS, [WINDOWS_THREADS.md](WINDOWS_THREADS.md)) | `tests/2065`: 5000 jobs once each, parallel speed-up, GC on workers |
 | `std.cmdline` (`lib/std/cmdline.fi`) | Windows command line quoting/splitting by the rules of the C runtime, UTF-8 <-> UTF-16 | the published examples + round trip (`tests/2060`) |
-| FLEILAUNCHER | `net.dns` (`lib/net/dns.fi`), `net.udp`, `net.dnsconf`, `tls.trust`; `net.http` now fetches `https://host/...` | DNS by name: A/AAAA, CNAME chains, UDP with retry and a doubling timeout, TCP fallback on TC, random transaction ID, answers accepted only from the server asked, TTL cache, hosts file, resolv.conf (Linux) / GetNetworkParams (Windows); `https://` through the TLS 1.3 client with the system's roots (PEM bundle on Linux, the certificate store on Windows) and the certificate checked against the NAME; secp256r1 added next to X25519 because Azure Front Door (`piston-meta.mojang.com`) refuses X25519-only. See [DNS.md](DNS.md) | a fake DNS server in Python (the server's log is counted), real answers of 1.1.1.1 decoded by an independent Python reader, `getaddrinfo`/`dig`/`curl` on the real network, a hermetic Python TLS server with a test CA (`tools/dns/run.sh`, also the Windows build under Wine) |
+| FLEILAUNCHER | `net.dns` (`lib/net/dns.fi`), `net.udp`, `net.dnsconf`, `tls.trust`; `net.http` now fetches `https://host/...` | DNS by name: A/AAAA, CNAME chains, UDP with retry and a doubling timeout, TCP fallback on TC, random transaction ID, answers accepted only from the server asked, TTL cache, hosts file, resolv.conf (Linux) / GetNetworkParams (Windows); `https://` through the TLS client (TLS 1.3 and, since round TLS12, TLS 1.2 -- [TLS12.md](TLS12.md)) with the system's roots (PEM bundle on Linux, the certificate store on Windows) and the certificate checked against the NAME; secp256r1 added next to X25519 because Azure Front Door (`piston-meta.mojang.com`) refuses X25519-only. See [DNS.md](DNS.md) | a fake DNS server in Python (the server's log is counted), real answers of 1.1.1.1 decoded by an independent Python reader, `getaddrinfo`/`dig`/`curl` on the real network, a hermetic Python TLS server with a test CA (`tools/dns/run.sh`, also the Windows build under Wine) |
 
 The compiler learned three more system calls for AArch64 on the way
 (`unlinkat`, `symlinkat`, `statx`; `compiler/src/syscalls.rs`), and
@@ -70,6 +70,28 @@ general. Each has a positive test in `tests/` or a check in `tools/fui/run.sh`.
 | `lib/markdown` (`md.fi`, `doc.fi`, `block.fi`, `inline.fi`, `html.fi`; `docs/MARKDOWN.md`) | CommonMark 0.31 plus GFM tables, strikethrough, task items and bare URLs, into an arena tree; raw HTML ignored, escaped or kept (default: ignored, `<br>`/`<img>`/`<a>` kept in sense); HTML writer with a safe mode | the CommonMark spec: **all 652 examples** byte for byte, and 37 GFM cases from markdown-it-py (`tests/2090_markdown.fi`); pathological input bounded |
 | `lib/fui/markdownview.fi` | a scrolling Markdown view: wrapped text, headings, lists, quotes, code, tables, task boxes, links with a click callback, images through an async hook (placeholder, ready, failed) | `tools/fui/mdview_main.fi`: pixels in light and dark, wide and narrow, WCAG 2 contrast |
 | `lib/fui/kit.fi`, `lib/fui/kitcolor.fi` (`docs/fui-kit.md`) | button, toasts, modal with focus trap, tab bar and sidebar with symbols, tile grid with avatars, search field with clear button, progress bar with a label that reads on fill and track; the launcher accent as readable text on any ground | `tools/fui/kit_main.fi` (pixels, hit functions, focus ring, icon-free variants, every colour pair), `tools/fui/kitlive.py` (the example in a real window on Xvfb) |
+
+## Async IO (round ASYNC)
+
+One thread for many connections: an event loop with timers, non-blocking TCP
+and TLS streams, an HTTP client and a WebSocket client that run on it, a way to
+hand results from other threads to the UI thread, and a wait that serves a
+window and the loop together. Design, API, what was proved against what, and
+the honest list of gaps: [ASYNC.md](ASYNC.md).
+
+| module | what it does | held against |
+|---|---|---|
+| `async.loop` (`lib/async/loop.fi`) | descriptors (epoll on Linux x86-64/AArch64, `poll` everywhere, `select` through the Windows seam), timers in a heap, deferred calls, `wake` from threads, hooks, a descriptor to embed in another wait (`loop_fd`) | the kernel; 4 build levels, AArch64 (qemu), Windows (Wine) (`tests/2120`) |
+| `async.stream` | non-blocking TCP and TLS-client streams with one callback, input kept until consumed, output queue and back pressure, one lazy timeout per stream, an acceptor | echo with 120 clients, refused connect, idle timeout, 4 MiB through a closed window (`tests/2121`); **1000 connections open at once against Python asyncio**, both directions (`tools/async/check_conn.py`) |
+| `tls.tls` (additions) | the client handshake as a state machine (`tls_handshake_step`, `WouldBlock`), buffered output; the blocking `tls_handshake` runs the same code in a loop | an in-process TLS server that dribbles 1-7 octets per ms, wrong name and unknown CA (`tests/2122`); the blocking suites (`tools/tls/run.sh`) unchanged |
+| `async.ahttp` | HTTP/1.1 client on the loop over `net.http`'s request/head/cookie/gzip code: Content-Length, chunked, until-close, redirects, timeouts, https | 100 requests at once, dribbled chunked, redirect loop, gzip, cookies (`tests/2123`) |
+| `async.wsc` (+ `ws.ws` additions) | WebSocket client: ws/wss, ping/pong, keep-alive, fragmentation both ways, closing handshake with timeout, reconnect with backoff | an in-process server (and `tls_server.fi`) with every violation the codec knows (`tests/2124`); **real wss:// echo services** (`tools/async/wss_main.fi`) |
+| `async.post` | `post` from any thread to the loop thread, a bridge that runs blocking work on `std.pool` and answers on the loop thread | 4 threads x 500 posts in order, GC on workers while the loop sleeps, 25 stress runs (`tests/2125`) |
+| `std.net` (additions) | `set_nonblocking`, `read_nb`/`write_nb`/`accept_nb`, `connect_nb` + `connect_finish`, `sock_error` | all of the above |
+| `window.wait_any_fd`, `fuiwin.window_wait_many_fd` | wait for window events and a descriptor (the loop's) at once; a window with an event wins | a window + loop on an Xvfb: results arrive with no window event, an idle second costs no CPU (`tools/async/check_ui.py`) |
+
+`bash tools/async/run.sh` runs the outside checks (test.sh section 77);
+`bash tools/async/winkit.sh` builds the kit for a real Windows machine.
 
 ## The application kit (appkit)
 
@@ -110,3 +132,63 @@ verified (no real desktop, Windows only under Wine): [DESKTOP.md](DESKTOP.md).
 | `desktop.autostart` | start at login (XDG autostart / the Run key) | GLib's `gio launch`, Python's reading of the spec; MSVCRT's argv parser |
 | `appkit.single_instance` (`single_listen`, `single_poll`, `single_send_args`) | the second copy hands its directory and arguments to the first (Unix socket / named pipe, same user) | `tests/2221`: two real processes, on Linux and under Wine |
 
+
+## Packaging (lib/pack, tools/pack)
+
+What turns a built program into the files people install it with, on every platform, without the platform's
+own packaging tools: [PACKAGING.md](PACKAGING.md). `bash package.sh` in a project from `tools/newapp.sh`
+(= `tools/pack/all.sh APP-DIR VERSION`) writes `dist/<version>/`: `.deb`, `.rpm`, `.tar.gz`, a real AppImage and a self-extracting
+`.run`, the Windows `setup.exe` (installer + uninstaller + Start Menu/Desktop shortcuts + "Apps & features" entry), the
+program with its icon, a portable zip and an NSIS script, `.app`/`.zip`/`.dmg` (structure only), an APK, an OrientOS `.opk`,
+all icon sizes, and `manifest.json` (SHA-256 + Ed25519 per file) with the `store add-app` commands.
+
+| module | what it does | held against |
+|---|---|---|
+| `pack.lnk` (`lib/pack/lnk.fi`) | Windows shortcuts (.lnk) written and read as plain octets (no COM): ID list, LinkInfo, Unicode strings | `tests/2200`; an independent reader (`tools/pack/test/lnkread.py`); Wine's shell starts the program through them |
+| `pack.icons` (`lib/pack/icons.fi`, `tools/pack/icons.fi`) | PNG encoder, resampler, `.ico` and `.icns` writers; one SVG/PNG -> every size, Android mipmaps, hicolor theme | `tests/2201`; read back by `lib/paint/png.fi`, PIL, `unsquashfs`-free parsers in `checks.py` |
+| `pack.payload`, `pack.install`, `pack.installed`, `pack.winreg` (+ `winreg.windows.fi`) | a zip appended to a program behind a hashed trailer; the installer state machine (extract, list, upgrade, shortcuts, `HKCU\...\Uninstall`, uninstaller that deletes itself); the registry writers (new `advapi32` imports in `compiler/src/win.rs`) | `tests/2202`, `tests/2203` (without Windows); `tools/pack/test/windows.sh` under Wine, window included |
+| `tools/pack/pack.py` (`packlib/`) | zip, deb, rpm, tar, SquashFS + AppImage, plist/.app/.dmg, OPKG, PE icon resource, NSIS script, manifest + signatures; Python standard library only | `tools/pack/test/checks.py`: ~170 checks against dpkg-deb, `dpkg -i` / `rpm -i` in a container, unsquashfs, the AppImage runtime, OrientOS's `opk.py`, makensis, xorriso |
+| `tools/pack/stub/selfx.fi` | the self-extracting Linux program (unpack once to the cache, `execve`, `$APPIMAGE` set so appkit updates the file itself) | `checks.py`: run, cached start, damaged file refused |
+
+## Round WIN-THREADS / TLS 1.2 (threads, process trees, TLS 1.2)
+
+| module | what it does | held against |
+|---|---|---|
+| Windows threads (`lib/gc/gc.fi` thread runtime on `CreateThread`, `compiler/src/thread.rs`, `win.rs`, `win_seam.rs`) | `thread_start/wait`, mutex, channel, `std.pool` on real threads on Windows; the seam is thread safe | `tests/834`, `860`-`862`, `1600`, `2065`, `2066`, `2091`, `2101` give the same output on Linux and under Wine; `tools/windows/threadkit.sh` writes a kit for a real Windows PC. See [WINDOWS_THREADS.md](WINDOWS_THREADS.md) |
+| process trees (`std.process`: `set_group`, `kill_tree`, `terminate_tree`, `set_kill_with_launcher`) | stop a child and everything it started: process group (Linux), job object (Windows) | `tests/2100`: a grandchild that holds the child's stdout pipe; end of file proves it died (Linux, Wine) |
+| `tls.tls` TLS 1.2 (`lib/tls/tls.fi`, `prf12.fi`; AES-256 in `aes.fi`/`gcm.fi`) | ECDHE-ECDSA/RSA with AES-128/256-GCM and ChaCha20-Poly1305, X25519 + secp256r1, extended master secret, downgrade protection, the same certificate and host name check; negotiated in the one ClientHello (no fallback retry) | `tests/2102`, `2103`; `tools/tls/tls12_check.py`: openssl s_server (suites x groups x signature schemes), Python `ssl` (512 KiB), man in the middle, fuzz, real hosts (`login.live.com`, `tls-v1-2.badssl.com`). See [TLS12.md](TLS12.md) |
+
+## UI extras (docs/UI_EXTRAS.md)
+
+The second wave of the launcher's UI: animated pictures, text selection and copy, the kit in the
+accessibility tree, touch gestures and right to left, rich text and syntax highlighting, QR
+codes, and localized times and sizes. Each has a test; the ones with a second implementation to
+compare with are held against it.
+
+| module | what it does | held against |
+|---|---|---|
+| `lib/qr` (`qr.fi`, `qrdec.fi`), `lib/fui/qrview.fi` | QR encoder (versions 1-40, L/M/Q/H, numeric/alphanumeric/byte, all masks, auto mask, level boost), decoder from a matrix or a picture (rotated, perspective, blurred, damaged), the widget | Nayuki's `qrcodegen`: module for module for every version/level/mask; python-qrcode (forced version and mask); ZXing-C++ reads every code and is the yardstick for the decoder (282/285, 349/355, 340/345 against its 284, 353, 340 on pictures that get worse) |
+| `lib/i18n/human.fi` | "5 minutes ago", "12,3 MB", date and time styles, percent, lists, wall clock of a TZif zone, in en de fr it es pl cs ru | ICU 72.1 (PyICU): 8,016 random cases, 0 differences; zones against Python `zoneinfo` |
+| `lib/highlight` (`highlight.fi`), `lib/fui/syntaxcolor.fi` | tokenizer interface and regex rules for JSON, TOML, INI, Firn, shell, Markdown, YAML, C-like; colours with 4.5:1 on the code ground | `tests/2242_highlight.fi` (every rule on sample text, the spans tile the text exactly on random input, linear time); the Markdown view's pixels |
+| `lib/regex` `Matcher` | the machine of a regex kept between finds (10x faster tokenizing) | tests/1914 and 6,000 random patterns against Python `re` unchanged |
+| `lib/fui/richtext.fi` | styled spans, wrapping, links, selection (drag, word, paragraph, Ctrl+A), copy, RTL paragraphs | `tools/fui/richtext_main.fi` (pixels) |
+| `lib/fui/uianim.fi` | GIF / animated WebP playback: delays, loops, pause, clock jumps | Pillow's frames (CRC) and delays for four files; `tools/fui/anim_main.fi` |
+| `lib/fui/kita11y.fi` | every kit part describes itself into the accessibility tree | `tools/fui/kita11y_main.fi`: the audit green, the dump compared |
+| `lib/fui/kittouch.fi` | tap, double tap, long press, pan with fling, pinch on `lib/window/pointers.fi`'s records | `tools/fui/touch_main.fi` (synthetic streams, the grid and the Markdown view) |
+| `kit.kit_set_rtl` | every kit part mirrored | `tools/fui/kitrtl_main.fi` (hit functions, decorations, keys) |
+
+
+## Libraries for FleiLauncher (downloads and sign-in)
+
+A launcher fetches thousands of files and signs the user in with a Microsoft
+account. Details, tests and the honest limits: [DOWNLOAD.md](DOWNLOAD.md),
+[OAUTH.md](OAUTH.md).
+
+| module | what it does | held against |
+|---|---|---|
+| `net.download` (`lib/net/download.fi`) | a download manager: N workers on `std.pool`, a keep-alive connection per worker and host, resume with `Range`/`If-Range`, ETag/Last-Modified (`If-None-Match`, 304), retry with exponential backoff and jitter, `Retry-After`, mirrors, a global rate limit, MD5/SHA-1/SHA-256/SHA-512 while the data arrives, atomic rename, per-file and total progress (polled or callback), cancel, skip of files that are already right | a Python server that cuts connections, answers 503, ignores `Range`, sends a wrong `Content-Range`, corrupts bytes, stalls (99 checks, three build stages, Wine); 3000 files at ~350 files/s; the real Mojang CDN (40 assets by SHA-1, `client.jar` resumed from 5 MB) |
+| `net.http` (additions) | extra request headers, user agent, a streaming body sink (no 32 MiB limit), `client_close`, errors as numbers | the download checks above |
+| `auth.jose` (`lib/auth/jose.fi`) | JWT / JWKS: RS256/384/512, ES256/384, HS256; `kid` lookup; exp/nbf/iat/iss/aud/nonce; alg none and RS256-to-HS256 refused | 54 tokens signed by Python `cryptography` (`tests/2150`) |
+| `auth.oauth` (`lib/auth/oauth.fi`) | OAuth 2.0 / OIDC client: discovery, device code flow, authorization code + PKCE with a loopback redirect server and the system browser, refresh, id_token check with the JWKS, userinfo, revocation, tokens in `std.secret` | a Python provider that checks PKCE, redirect URI, single-use codes, rotating refresh tokens and the polling interval (97 checks, three build stages, Wine); RFC 7636 appendix B |
+| `auth.msa` (`lib/auth/msa.fi`) | Microsoft account -> Xbox Live -> XSTS -> Minecraft services -> ownership -> profile, XSTS error texts, session in the keyring, `msa_ensure` | a Python stand-in that checks every header and body (64 checks); the real hosts with bogus credentials (TLS 1.3 path proven); **no real login** (no client id here) |
+| `appkit.fleitec_login` (`lib/appkit/fleitec_login.fi`) | "Sign in with Fleitec-ID": the five login answers and three `me` answers of docs/FLEITEC-ID.md, token in the keyring | `tests/2153` against an in-process ID server; not run against the real server |

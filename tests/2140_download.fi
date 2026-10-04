@@ -1,0 +1,466 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+// tests/2140_download.fi -- lib/net/download.fi against a server IN THIS
+// PROCESS (lib/http/server.fi on 127.0.0.1, its own thread). The nasty
+// cases (cut connections, flaky servers, the real Mojang CDN) are in
+// tools/download/check.py; this test is the part that runs in every build
+// level and on AArch64.
+//
+// A  dl_backoff_ms: zero for round 0, doubling, the cap, +-25 % jitter
+// B  dl_add refuses a digest of the wrong length / not hex, an empty URL,
+//    a fifth URL; nothing can be added after the start
+// C  40 files with SHA-1 and size on 4 workers: right octets, right counts,
+//    the server saw 40 requests on few connections (keep-alive)
+// D  a part left on disk is continued with `Range: bytes=N-` (the server
+//    records the header), the whole file is right
+// E  a 404 on the first URL and the mirror's answer; a 404 alone is FAILED
+//    with the status
+// F  the second run finds everything in place and sends no request; a file
+//    with the right size and the wrong octets is replaced
+// G  If-None-Match: an unchanged file is NOT_MODIFIED with the sidecar
+// H  the same through dl_run_inline (no threads)
+import std.rt
+import std.net
+import std.fs
+import std.time
+import std.pool
+import std.hashfile
+import http.server as http
+import net.download
+
+const KIND_SERVER: u64 = 7771
+// shared block
+const S_PORT: u64 = 0
+const S_QUIT: u64 = 8
+const S_REQS: u64 = 16
+const S_READY: u64 = 24
+const S_RANGE_N: u64 = 32 // length of the last Range header
+const S_RANGE: u64 = 40 // up to 64 octets of it
+const S_INM: u64 = 112 // 1 when the last request had If-None-Match
+const S_GONE: u64 = 120 // requests for /gone
+const S_SIZE: usize = 256
+
+static mut SHARED: u64 = 0
+
+fn ld(a: u64, o: u64) -> u64 { return *((a + o) as *mut u64) }
+fn st(a: u64, o: u64, v: u64) { *((a + o) as *mut u64) = v }
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == pool.WORKER_KIND {
+        return pool.worker_main(arg)
+    }
+    if kind == KIND_SERVER {
+        return serve_thread(arg)
+    }
+    return 0
+}
+
+fn byte_at(i: u64, seed: u64) -> u8 {
+    return ((((i *% 131) +% (seed *% 17)) ^ (i >> 8)) & 255) as u8
+}
+
+fn make(size: usize, seed: u64, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    rt.buf_reserve(out, size + 1)
+    var i: u64 = 0
+    while i < size as u64 {
+        rt.buf_push(out, byte_at(i, seed))
+        i = i + 1
+    }
+}
+
+fn qnum(r: *mut http.Req, name: str) -> u64 {
+    let v: str = http.query_param(r, name)
+    var x: u64 = 0
+    var i: usize = 0
+    while i < v.n {
+        x = x * 10 + (v.chars(i) - 48 as u8) as u64
+        i = i + 1
+    }
+    return x
+}
+
+fn push_s(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn on_file(r: *mut http.Req) {
+    let sh: u64 = SHARED
+    __atomic_add((sh + S_REQS) as *mut u64, 1)
+    let size: u64 = qnum(r, "size")
+    let seed: u64 = qnum(r, "seed")
+    var data: rt.Buf = rt.buf_new()
+    make(size as usize, seed, &data)
+    let rg: str = http.header(r, "range")
+    let inm: str = http.header(r, "if-none-match")
+    st(sh, S_RANGE_N, rg.n as u64)
+    var k: usize = 0
+    while k < rg.n && k < 64 {
+        *((sh + S_RANGE + k as u64) as *mut u8) = rg.chars(k)
+        k = k + 1
+    }
+    st(sh, S_INM, 0)
+    var etag: rt.Buf = rt.buf_new()
+    push_s(&etag, "\"e")
+    rt.buf_push_dec_u64(&etag, seed)
+    push_s(&etag, "\"")
+    let ets: str = str { p: rt.buf_data(&etag), n: etag.len }
+    if inm.n > 0 {
+        st(sh, S_INM, 1)
+        if inm == ets {
+            var ex: rt.Buf = rt.buf_new()
+            push_s(&ex, "ETag: ")
+            push_s(&ex, ets)
+            push_s(&ex, "\r\n")
+            http.reply_ex(r, 304, "", str { p: rt.buf_data(&ex), n: ex.len }, "")
+            rt.buf_free(&ex)
+            rt.buf_free(&etag)
+            rt.buf_free(&data)
+            return
+        }
+    }
+    var ex2: rt.Buf = rt.buf_new()
+    push_s(&ex2, "ETag: ")
+    push_s(&ex2, ets)
+    push_s(&ex2, "\r\nAccept-Ranges: bytes\r\n")
+    var start: u64 = 0
+    var code: u32 = 200
+    if rg.n > 6 && rg.starts_with("bytes=") {
+        var v: u64 = 0
+        var i: usize = 6
+        while i < rg.n && rg.chars(i) != 45 as u8 {
+            v = v * 10 + (rg.chars(i) - 48 as u8) as u64
+            i = i + 1
+        }
+        start = v
+        code = 206
+        push_s(&ex2, "Content-Range: bytes ")
+        rt.buf_push_dec_u64(&ex2, start)
+        push_s(&ex2, "-")
+        rt.buf_push_dec_u64(&ex2, size - 1)
+        push_s(&ex2, "/")
+        rt.buf_push_dec_u64(&ex2, size)
+        push_s(&ex2, "\r\n")
+    }
+    http.reply_ex(r, code, "application/octet-stream",
+        str { p: rt.buf_data(&ex2), n: ex2.len },
+        str { p: rt.ptr_of(data.ptr + start), n: (size - start) as usize })
+    rt.buf_free(&ex2)
+    rt.buf_free(&etag)
+    rt.buf_free(&data)
+}
+
+fn on_gone(r: *mut http.Req) {
+    __atomic_add((SHARED + S_GONE) as *mut u64, 1)
+    http.reply(r, 404, "text/plain", "gone\n")
+}
+
+#[allow_escape]
+fn serve_thread(sh: u64) -> u64 {
+    var port: u64 = 31000 + (rt.ld64(sh, 0) % 2000)
+    var tries: u32 = 0 as u32
+    while tries < 200 as u32 {
+        var app: http.App = http.app(port as u16)
+        app.addr = net.ADDR_LOCAL
+        http.set_quiet(&app, true)
+        http.route(&app, "/f", on_file)
+        http.route(&app, "/gone", on_gone)
+        if http.step(&app, 0) {
+            st(sh, S_PORT, port)
+            st(sh, S_READY, 1)
+            while ld(sh, S_QUIT) == 0 {
+                http.step(&app, 20)
+            }
+            return 0
+        }
+        port = port + 1
+        tries = tries + 1 as u32
+    }
+    st(sh, S_READY, 2)
+    return 0
+}
+
+fn url_of(buf: *mut rt.Buf, path: str, size: u64, seed: u64) -> str {
+    rt.buf_clear(buf)
+    push_s(buf, "http://127.0.0.1:")
+    rt.buf_push_dec_u64(buf, ld(SHARED, S_PORT))
+    push_s(buf, path)
+    push_s(buf, "?size=")
+    rt.buf_push_dec_u64(buf, size)
+    push_s(buf, "&seed=")
+    rt.buf_push_dec_u64(buf, seed)
+    return str { p: rt.buf_data(buf), n: (*buf).len }
+}
+
+fn dest_of(buf: *mut rt.Buf, dir: str, name: str) -> str {
+    rt.buf_clear(buf)
+    push_s(buf, dir)
+    push_s(buf, "/")
+    push_s(buf, name)
+    return str { p: rt.buf_data(buf), n: (*buf).len }
+}
+
+fn name_of(buf: *mut rt.Buf, prefix: str, i: u64) -> str {
+    rt.buf_clear(buf)
+    push_s(buf, prefix)
+    rt.buf_push_dec_u64(buf, i)
+    return str { p: rt.buf_data(buf), n: (*buf).len }
+}
+
+fn digest(size: usize, seed: u64) -> str {
+    var d: rt.Buf = rt.buf_new()
+    make(size, seed, &d)
+    let h: str = hashfile.hash_bytes_hex(hashfile.HASH_SHA1, d.ptr, d.len)
+    rt.buf_free(&d)
+    return h
+}
+
+fn same_file(path: str, size: usize, seed: u64) -> bool {
+    var got: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(path, &got) catch 0
+    var want: rt.Buf = rt.buf_new()
+    make(size, seed, &want)
+    var ok: bool = n == size && got.len == want.len && rt.mem_eq(got.ptr, want.ptr, size)
+    rt.buf_free(&got)
+    rt.buf_free(&want)
+    return ok
+}
+
+fn main() -> i32 {
+    // ---- A. the backoff
+    if download.dl_backoff_ms(500, 30000, 0 as u32, 1) != 0 { return 1 as i32 }
+    var seed: u64 = 12345
+    var r: u32 = 1 as u32
+    var expect: u64 = 500
+    while r <= 12 as u32 {
+        var k: u64 = 0
+        while k < 50 {
+            let v: u64 = download.dl_backoff_ms(500, 30000, r, seed + k * 7919)
+            var base: u64 = expect
+            if base > 30000 { base = 30000 }
+            if v < base * 3 / 4 - 1 || (v > base * 5 / 4 + 1 && v != 30000) { return 2 as i32 }
+            if v > 30000 { return 3 as i32 }
+            k = k + 1
+        }
+        expect = expect * 2
+        r = r + 1 as u32
+    }
+    // the jitter is not constant
+    var distinct: u64 = 0
+    var last: u64 = 0
+    var q: u64 = 0
+    while q < 20 {
+        let v2: u64 = download.dl_backoff_ms(1000, 100000, 3 as u32, q * 104729 + 3)
+        if v2 != last { distinct = distinct + 1 }
+        last = v2
+        q = q + 1
+    }
+    if distinct < 10 { return 4 as i32 }
+
+    // ---- the server
+    SHARED = rt.heap_alloc(S_SIZE)
+    rt.mem_set(SHARED, 0 as u8, S_SIZE)
+    st(SHARED, 0, time.monotonic_ns() % 1000003)
+    let th: u64 = thread_start(KIND_SERVER, SHARED)
+    var waited: u32 = 0 as u32
+    while ld(SHARED, S_READY) == 0 && waited < 500 as u32 {
+        time.sleep_ms(10)
+        waited = waited + 1 as u32
+    }
+    if ld(SHARED, S_READY) != 1 { return 5 as i32 }
+
+    var dirb: rt.Buf = rt.buf_new()
+    push_s(&dirb, "/tmp/firn-dl2140-")
+    rt.buf_push_dec_u64(&dirb, time.monotonic_ns())
+    let dir: str = str { p: rt.buf_data(&dirb), n: dirb.len }
+    let okm: bool = fs.mkdir_all(dir) catch false
+    if !okm { return 6 as i32 }
+
+    var ub: rt.Buf = rt.buf_new()
+    var db: rt.Buf = rt.buf_new()
+    var nb: rt.Buf = rt.buf_new()
+    var rc: i32 = 0
+
+    // ---- B. dl_add validation
+    var d0: download.Dl = download.dl_new(2)
+    if d0.p == 0 { return 7 as i32 }
+    if download.dl_add(&d0, "http://127.0.0.1:1/x", "/tmp/x", hashfile.HASH_SHA1, "abc", 0) >= 0 { rc = 8 }
+    if download.dl_add(&d0, "http://127.0.0.1:1/x", "/tmp/x", hashfile.HASH_SHA1,
+        "zz00000000000000000000000000000000000000", 0) >= 0 { rc = 9 }
+    if download.dl_add(&d0, "", "/tmp/x", 0 as u32, "", 0) >= 0 { rc = 10 }
+    if download.dl_add(&d0, "http://127.0.0.1:1/x", "", 0 as u32, "", 0) >= 0 { rc = 11 }
+    let i0: i64 = download.dl_add(&d0, "http://127.0.0.1:1/x", "/tmp/x", hashfile.HASH_SHA1,
+        "AABBCCDDEEFF00112233445566778899AABBCCDD", 5)
+    if i0 != 0 { rc = 12 }
+    if !download.dl_add_mirror(&d0, 0, "http://a/1") { rc = 13 }
+    if !download.dl_add_mirror(&d0, 0, "http://a/2") { rc = 14 }
+    if !download.dl_add_mirror(&d0, 0, "http://a/3") { rc = 15 }
+    if download.dl_add_mirror(&d0, 0, "http://a/4") { rc = 16 }
+    if download.dl_add_mirror(&d0, 7, "http://a/4") { rc = 17 }
+    if download.dl_set_validators(&d0, 0, "bad\r\netag", "") { rc = 18 }
+    if !download.dl_set_validators(&d0, 0, "\"x\"", "") { rc = 19 }
+    if download.dl_count(&d0) != 1 { rc = 20 }
+    if download.dl_item_url(&d0, 0, 2) != "http://a/2" { rc = 21 }
+    download.dl_free(&d0)
+    if rc != 0 { return rc }
+
+    // ---- C. 40 files on 4 workers
+    var d1: download.Dl = download.dl_new(4)
+    var i: u64 = 0
+    var total: u64 = 0
+    while i < 40 {
+        let size: u64 = 500 + i * 313
+        total = total + size
+        let u: str = url_of(&ub, "/f", size, 100 + i)
+        let nm: str = name_of(&nb, "c", i)
+        let dst: str = dest_of(&db, dir, nm)
+        if download.dl_add(&d1, u, dst, hashfile.HASH_SHA1, digest(size as usize, 100 + i), size) != i as i64 {
+            return 30 as i32
+        }
+        i = i + 1
+    }
+    if download.dl_run(&d1) != 0 { return 31 as i32 }
+    i = 0
+    while i < 40 {
+        let size: u64 = 500 + i * 313
+        let nm: str = name_of(&nb, "c", i)
+        if download.dl_item_state(&d1, i as usize) != download.DL_OK { return 32 as i32 }
+        if !same_file(dest_of(&db, dir, nm), size as usize, 100 + i) { return 33 as i32 }
+        i = i + 1
+    }
+    if download.dl_files_done(&d1) != 40 || download.dl_bytes_done(&d1) != total { return 34 as i32 }
+    if download.dl_bytes_total(&d1) != total || download.dl_bytes_wire(&d1) != total { return 35 as i32 }
+    if ld(SHARED, S_REQS) != 40 { return 36 as i32 }
+    if download.dl_sockets(&d1) > 8 || download.dl_reused(&d1) < 30 { return 37 as i32 }
+    if !download.dl_finished(&d1) { return 38 as i32 }
+    download.dl_free(&d1)
+
+    // ---- D. a part on disk is continued
+    st(SHARED, S_REQS, 0)
+    let sizeD: u64 = 200000
+    {
+        var part: rt.Buf = rt.buf_new()
+        make(77777, 900, &part)
+        let pp: str = dest_of(&db, dir, "d0.part")
+        let w: usize = fs.write_file(pp, part.ptr, part.len) catch 0
+        rt.buf_free(&part)
+        if w != 77777 { return 40 as i32 }
+    }
+    var d2: download.Dl = download.dl_new(2)
+    download.dl_add(&d2, url_of(&ub, "/f", sizeD, 900), dest_of(&db, dir, "d0"),
+        hashfile.HASH_SHA1, digest(sizeD as usize, 900), sizeD)
+    if download.dl_run(&d2) != 0 { return 41 as i32 }
+    if download.dl_item_state(&d2, 0) != download.DL_OK { return 42 as i32 }
+    if !same_file(dest_of(&db, dir, "d0"), sizeD as usize, 900) { return 43 as i32 }
+    if download.dl_bytes_wire(&d2) != sizeD - 77777 { return 44 as i32 }
+    if ld(SHARED, S_RANGE_N) != 12 { return 45 as i32 }   // "bytes=77777-"
+    if *((SHARED + S_RANGE + 6) as *mut u8) != 55 as u8 { return 46 as i32 } // '7'
+    if fs.exists(dest_of(&db, dir, "d0.part")) { return 47 as i32 }
+    download.dl_free(&d2)
+
+    // ---- E. 404 + mirror; a 404 alone
+    st(SHARED, S_GONE, 0)
+    var d3: download.Dl = download.dl_new(2)
+    download.dl_set_backoff(&d3, 5, 20)
+    let sizeE: u64 = 3000
+    var gone: rt.Buf = rt.buf_new()
+    push_s(&gone, "http://127.0.0.1:")
+    rt.buf_push_dec_u64(&gone, ld(SHARED, S_PORT))
+    push_s(&gone, "/gone")
+    let gs: str = str { p: rt.buf_data(&gone), n: gone.len }
+    let e0: i64 = download.dl_add(&d3, gs, dest_of(&db, dir, "e0"),
+        hashfile.HASH_SHA1, digest(sizeE as usize, 5), sizeE)
+    if !download.dl_add_mirror(&d3, e0, url_of(&ub, "/f", sizeE, 5)) { return 50 as i32 }
+    let e1: i64 = download.dl_add(&d3, gs, dest_of(&db, dir, "e1"), 0 as u32, "", 0)
+    if download.dl_run(&d3) != 1 { return 51 as i32 }
+    if download.dl_item_state(&d3, 0) != download.DL_OK { return 52 as i32 }
+    if download.dl_item_attempts(&d3, 0) != 2 as u32 { return 53 as i32 }
+    if !same_file(dest_of(&db, dir, "e0"), sizeE as usize, 5) { return 54 as i32 }
+    if download.dl_item_state(&d3, 1) != download.DL_FAILED { return 55 as i32 }
+    if download.dl_item_error(&d3, 1) != download.DE_HTTP || download.dl_item_http(&d3, 1) != 404 as u32 { return 56 as i32 }
+    if download.dl_item_attempts(&d3, 1) != 1 as u32 { return 57 as i32 }
+    if fs.exists(dest_of(&db, dir, "e1")) { return 58 as i32 }
+    if download.dl_files_failed(&d3) != 1 || download.dl_files_done(&d3) != 1 { return 59 as i32 }
+    download.dl_free(&d3)
+    rt.buf_free(&gone)
+
+    // ---- F. a second run sends nothing; a wrong file of the right size is replaced
+    st(SHARED, S_REQS, 0)
+    {
+        var junk: rt.Buf = rt.buf_new()
+        let n7: usize = 500 + 7 * 313
+        var z: usize = 0
+        while z < n7 {
+            rt.buf_push(&junk, 120 as u8)
+            z = z + 1
+        }
+        let w: usize = fs.write_file(dest_of(&db, dir, "c7"), junk.ptr, junk.len) catch 0
+        rt.buf_free(&junk)
+        if w != n7 { return 60 as i32 }
+    }
+    var d4: download.Dl = download.dl_new(4)
+    i = 0
+    while i < 40 {
+        let size: u64 = 500 + i * 313
+        let nm: str = name_of(&nb, "c", i)
+        download.dl_add(&d4, url_of(&ub, "/f", size, 100 + i), dest_of(&db, dir, nm),
+            hashfile.HASH_SHA1, digest(size as usize, 100 + i), size)
+        i = i + 1
+    }
+    if download.dl_run(&d4) != 0 { return 61 as i32 }
+    if download.dl_files_skipped(&d4) != 39 { return 62 as i32 }
+    if ld(SHARED, S_REQS) != 1 { return 63 as i32 }
+    if download.dl_item_state(&d4, 7) != download.DL_OK { return 64 as i32 }
+    if !same_file(dest_of(&db, dir, "c7"), 500 + 7 * 313, 107) { return 65 as i32 }
+    download.dl_free(&d4)
+
+    // ---- G. If-None-Match with the sidecar
+    st(SHARED, S_REQS, 0)
+    let sizeG: u64 = 4096
+    var d5: download.Dl = download.dl_new(1)
+    let g0: i64 = download.dl_add(&d5, url_of(&ub, "/f", sizeG, 77), dest_of(&db, dir, "g0"), 0 as u32, "", 0)
+    download.dl_set_item_flags(&d5, g0, download.DL_META)
+    if download.dl_run(&d5) != 0 { return 70 as i32 }
+    if download.dl_item_state(&d5, 0) != download.DL_OK { return 71 as i32 }
+    if download.dl_item_etag(&d5, 0) != "\"e77\"" { return 72 as i32 }
+    if !fs.exists(dest_of(&db, dir, "g0.dlmeta")) { return 73 as i32 }
+    download.dl_free(&d5)
+    var d6: download.Dl = download.dl_new(1)
+    let g1: i64 = download.dl_add(&d6, url_of(&ub, "/f", sizeG, 77), dest_of(&db, dir, "g0"), 0 as u32, "", 0)
+    download.dl_set_item_flags(&d6, g1, download.DL_META)
+    if download.dl_run(&d6) != 0 { return 74 as i32 }
+    if download.dl_item_state(&d6, 0) != download.DL_NOT_MODIFIED { return 75 as i32 }
+    if ld(SHARED, S_INM) != 1 { return 76 as i32 }
+    if download.dl_bytes_wire(&d6) != 0 { return 77 as i32 }
+    if !same_file(dest_of(&db, dir, "g0"), sizeG as usize, 77) { return 78 as i32 }
+    download.dl_free(&d6)
+
+    // ---- H. inline, no threads
+    var d7: download.Dl = download.dl_new(3)
+    i = 0
+    while i < 5 {
+        let nm: str = name_of(&nb, "h", i)
+        let size: u64 = 1000 + i
+        download.dl_add(&d7, url_of(&ub, "/f", size, 300 + i), dest_of(&db, dir, nm),
+            hashfile.HASH_SHA1, digest(size as usize, 300 + i), size)
+        i = i + 1
+    }
+    if download.dl_run_inline(&d7) != 0 { return 80 as i32 }
+    i = 0
+    while i < 5 {
+        let nm: str = name_of(&nb, "h", i)
+        if !same_file(dest_of(&db, dir, nm), 1000 + i as usize, 300 + i) { return 81 as i32 }
+        i = i + 1
+    }
+    download.dl_free(&d7)
+
+    // ---- the end
+    st(SHARED, S_QUIT, 1)
+    thread_wait(th)
+    let rm: bool = fs.remove_tree(dir) catch false
+    rt.buf_free(&ub)
+    rt.buf_free(&db)
+    rt.buf_free(&nb)
+    rt.buf_free(&dirb)
+    return 0 as i32
+}

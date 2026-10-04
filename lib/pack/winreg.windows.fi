@@ -1,0 +1,181 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/pack/winreg.windows.fi -- the Windows registry (HKEY_CURRENT_USER),
+// the part an installer needs. The twin of winreg.fi (read its header).
+//
+// advapi32 imports bound in compiler/src/win.rs: RegCreateKeyExW,
+// RegSetValueExW, RegCloseKey, RegDeleteTreeW, RegOpenKeyExW and the
+// RegGetValueW that std/appkit already used. Everything is HKCU, so no
+// administrator is needed -- an installer that writes HKLM would need one,
+// and `Programs` in the user profile does not.
+import std.rt
+import appkit.util
+
+export {
+    reg_available, reg_set_string, reg_set_expand, reg_set_dword,
+    reg_get_string, reg_get_dword, reg_delete_tree, reg_key_exists, shell_changed,
+}
+
+extern fn RegCreateKeyExW(hkey: i64, sub: u64, reserved: i64, cls: u64, opts: i64, sam: i64,
+    sa: u64, result: u64, disp: u64) -> i32;
+extern fn RegSetValueExW(hkey: i64, name: u64, reserved: i64, typ: i64, data: u64, cb: i64) -> i32;
+extern fn RegCloseKey(hkey: i64) -> i32;
+extern fn RegDeleteTreeW(hkey: i64, sub: u64) -> i32;
+extern fn RegOpenKeyExW(hkey: i64, sub: u64, opts: i64, sam: i64, result: u64) -> i32;
+extern fn SHChangeNotify(event: i64, flags: i64, a: u64, b: u64);
+extern fn RegGetValueW(key: i64, sub: u64, name: u64, flags: i64, typ: u64,
+    data: u64, cb: u64) -> i32;
+
+const HKCU: i64 = 2147483649       // 0x80000001
+const KEY_ALL_ACCESS: i64 = 983103 // 0xF003F
+const KEY_READ: i64 = 131097       // 0x20019
+const REG_SZ: i64 = 1
+const REG_EXPAND_SZ: i64 = 2
+const REG_DWORD: i64 = 4
+const RRF_RT_REG_SZ: i64 = 2
+const RRF_RT_REG_DWORD: i64 = 16
+
+fn reg_available() -> bool {
+    return true
+}
+
+// UTF-8 -> UTF-16 with the zero unit, backslashes for slashes (key paths)
+fn wide(s: str, out: *mut rt.Buf, keypath: bool) {
+    rt.buf_clear(out)
+    util.utf8_to_utf16(s.p as u64, s.n, out)
+    if keypath {
+        var i: usize = 0
+        while i + 1 < rt.buf_len(out) {
+            if rt.ld8(rt.buf_ptr(out), i) == 47 as u8 && rt.ld8(rt.buf_ptr(out), i + 1) == 0 as u8 {
+                rt.st8(rt.buf_ptr(out), i, 92 as u8)
+            }
+            i = i + 2
+        }
+    }
+    rt.buf_push(out, 0 as u8)
+    rt.buf_push(out, 0 as u8)
+}
+
+// open (creating) the key; the handle or 0
+fn create_key(key: str) -> i64 {
+    var wk: rt.Buf = rt.buf_new()
+    wide(key, &wk, true)
+    var h: i64 = 0
+    var disp: i32 = 0
+    let r: i32 = RegCreateKeyExW(HKCU, rt.buf_ptr(&wk), 0, 0 as u64, 0, KEY_ALL_ACCESS, 0 as u64,
+        (&h) as u64, (&disp) as u64)
+    rt.buf_free(&wk)
+    if r != 0 {
+        return 0
+    }
+    return h
+}
+
+fn set_value(key: str, name: str, typ: i64, data: u64, cb: usize) -> bool {
+    let h: i64 = create_key(key)
+    if h == 0 {
+        return false
+    }
+    var wn: rt.Buf = rt.buf_new()
+    wide(name, &wn, false)
+    let r: i32 = RegSetValueExW(h, rt.buf_ptr(&wn), 0, typ, data, cb as i64)
+    rt.buf_free(&wn)
+    RegCloseKey(h)
+    return r == 0
+}
+
+fn set_text(key: str, name: str, value: str, typ: i64) -> bool {
+    var wv: rt.Buf = rt.buf_new()
+    wide(value, &wv, false)
+    let ok: bool = set_value(key, name, typ, rt.buf_ptr(&wv), rt.buf_len(&wv))
+    rt.buf_free(&wv)
+    return ok
+}
+
+fn reg_set_string(key: str, name: str, value: str) -> bool {
+    return set_text(key, name, value, REG_SZ)
+}
+
+fn reg_set_expand(key: str, name: str, value: str) -> bool {
+    return set_text(key, name, value, REG_EXPAND_SZ)
+}
+
+fn reg_set_dword(key: str, name: str, value: u32) -> bool {
+    var v: u32 = value
+    return set_value(key, name, REG_DWORD, (&v) as u64, 4)
+}
+
+fn reg_get_string(key: str, name: str, out: *mut rt.Buf) -> bool {
+    var wk: rt.Buf = rt.buf_new()
+    var wn: rt.Buf = rt.buf_new()
+    wide(key, &wk, true)
+    wide(name, &wn, false)
+    var data: rt.Buf = rt.buf_new()
+    if !util.buf_room(&data, 65536) {
+        rt.buf_free(&wk)
+        rt.buf_free(&wn)
+        rt.buf_free(&data)
+        return false
+    }
+    var cb: i32 = 65534
+    let r: i32 = RegGetValueW(HKCU, rt.buf_ptr(&wk), rt.buf_ptr(&wn), RRF_RT_REG_SZ, 0 as u64,
+        rt.buf_ptr(&data), (&cb) as u64)
+    rt.buf_free(&wk)
+    rt.buf_free(&wn)
+    if r != 0 {
+        rt.buf_free(&data)
+        return false
+    }
+    // cb counts octets including the terminator
+    var units: usize = (cb as usize) / 2
+    if units > 0 {
+        units = units - 1
+    }
+    util.utf16_to_utf8(rt.buf_ptr(&data), units, true, out)
+    rt.buf_free(&data)
+    return true
+}
+
+fn reg_get_dword(key: str, name: str, out: *mut u32) -> bool {
+    var wk: rt.Buf = rt.buf_new()
+    var wn: rt.Buf = rt.buf_new()
+    wide(key, &wk, true)
+    wide(name, &wn, false)
+    var v: u32 = 0 as u32
+    var cb: i32 = 4
+    let r: i32 = RegGetValueW(HKCU, rt.buf_ptr(&wk), rt.buf_ptr(&wn), RRF_RT_REG_DWORD, 0 as u64,
+        (&v) as u64, (&cb) as u64)
+    rt.buf_free(&wk)
+    rt.buf_free(&wn)
+    if r != 0 {
+        return false
+    }
+    *out = v
+    return true
+}
+
+fn reg_key_exists(key: str) -> bool {
+    var wk: rt.Buf = rt.buf_new()
+    wide(key, &wk, true)
+    var h: i64 = 0
+    let r: i32 = RegOpenKeyExW(HKCU, rt.buf_ptr(&wk), 0, KEY_READ, (&h) as u64)
+    rt.buf_free(&wk)
+    if r != 0 {
+        return false
+    }
+    RegCloseKey(h)
+    return true
+}
+
+fn reg_delete_tree(key: str) -> bool {
+    var wk: rt.Buf = rt.buf_new()
+    wide(key, &wk, true)
+    let r: i32 = RegDeleteTreeW(HKCU, rt.buf_ptr(&wk))
+    rt.buf_free(&wk)
+    // 0 = deleted, 2 = ERROR_FILE_NOT_FOUND: it is gone either way
+    return r == 0 || r == 2
+}
+
+// SHCNE_ASSOCCHANGED (0x08000000): shortcuts and icons changed, redraw
+fn shell_changed() {
+    SHChangeNotify(134217728, 0, 0 as u64, 0 as u64)
+}

@@ -1,0 +1,316 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/uianim.fi -- ANIMATED PICTURES in fUi: a GIF or animated WebP that plays.
+//
+//     var a: uianim.Animation = uianim.anim_new()
+//     if uianim.anim_from_bytes(p, n, &a) {                  // GIF, animated or still WebP, or any
+//         ...                                                // picture lib/fui/uiimagedec takes (one frame)
+//         // every frame of the program:
+//         let changed: bool = uianim.anim_tick(&a, now_ms)   // advance by the delays
+//         uianim.anim_draw(z, &a, x, y, w, h, uiimage.FIT_CONTAIN)
+//         // and when to wake up: uianim.anim_next_ms(&a, now_ms)  (-1 = nothing changes any more)
+//     }
+//     uianim.anim_free(&a)
+//
+// WHAT IT DOES. The decoders (lib/gif, lib/webp) hand over every frame as a full canvas with its
+// delay; this keeps them, remembers which frame is on screen and since when, and moves on when
+// the clock says so -- looping as the file asks (GIF's NETSCAPE2.0 count, WebP's loop count; 0 =
+// forever), or standing on the last frame when the count is used up. A program that was stopped
+// for a while (a hidden tab, a suspended phone) does not play the missed frames in a burst: it
+// jumps to the frame the clock now says.
+//
+// THE CLOCK is the caller's (milliseconds, any origin, monotonic): `anim_tick(now)`; the first
+// tick starts the show. `anim_next_ms` is the time until the picture next changes, so the host
+// can sleep exactly that long (the window host's frame request) instead of repainting 60 times
+// a second for a picture that changes every 100 ms -- and so a still picture costs nothing.
+//
+// DELAYS. A GIF delay under 20 ms is played as 100 ms (what every browser does, because
+// authors of the 90s wrote 0 for "as fast as possible" and meant "normal"); a WebP delay of 0 is
+// played as 10 ms (so a zero cannot make a busy loop). Other delays are as the file says.
+//
+// HONEST NOTES
+//   * Memory: every frame is a full canvas (w * h * 4 octets); the decoders' limits apply
+//     (GIF 256 MiB, WebP 256 MiB for all frames) and `anim_from_bytes_limited` takes a smaller one.
+//   * Animated PNG (APNG) is not read: lib/paint/png.fi shows its first frame as a still.
+//   * A still picture (JPEG, PNG, one-frame GIF/WebP) is an animation of one frame: `anim_tick`
+//     never reports a change, `anim_next_ms` is -1.
+import std.rt
+import gif.gif
+import webp.webp
+import fui.uiimage
+import fui.uiimagedec
+import fui.painter
+
+export {
+    Animation, anim_new, anim_free, anim_from_bytes, anim_from_bytes_limited, anim_count,
+    anim_width, anim_height, anim_frame_index, anim_frame_image, anim_tick, anim_next_ms,
+    anim_draw, anim_reset, anim_pause, anim_resume, anim_paused, anim_finished,
+    anim_delay_ms, anim_total_ms, anim_loops, anim_set_frame,
+    ANIM_MAX_BYTES,
+}
+
+const ANIM_MAX_BYTES: u64 = 268435456
+
+struct Animation {
+    fmt: u32, // uiimage.IMG_FMT_*
+    w: usize,
+    h: usize,
+    count: usize,
+    loops: u32, // 0 = forever
+    gif: gif.GifAnim,
+    webp: webp.WebpAnim,
+    still: uiimagedec.Decoded, // a picture of one frame from another decoder
+    still_view: uiimage.Image,
+    // playback
+    frame: usize,
+    t0: i64, // when the current frame went on screen
+    started: bool,
+    paused: bool,
+    paused_at: i64,
+    played: u32, // finished passes
+    done: bool,
+}
+
+fn anim_new() -> Animation {
+    return Animation { fmt: 0 as u32, w: 0, h: 0, count: 0, loops: 0 as u32, gif: gif.gif_anim_new(),
+        webp: webp.webp_anim_new(), still: uiimagedec.decoded_new(), still_view: uiimage.image_new(),
+        frame: 0, t0: 0, started: false, paused: false, paused_at: 0, played: 0 as u32, done: false }
+}
+
+fn anim_free(a: *mut Animation) {
+    gif.gif_anim_free(&(*a).gif)
+    webp.webp_anim_free(&(*a).webp)
+    uiimagedec.decoded_free(&(*a).still)
+    (*a).count = 0
+    (*a).w = 0
+    (*a).h = 0
+    (*a).fmt = 0 as u32
+}
+
+fn anim_from_bytes(src: u64, n: usize, a: *mut Animation) -> bool {
+    return anim_from_bytes_limited(src, n, uiimagedec.IMAGE_MAX_PIXELS, ANIM_MAX_BYTES, a)
+}
+
+// Decodes every frame. `max_pixels` bounds one canvas, `max_bytes` all frames together.
+fn anim_from_bytes_limited(src: u64, n: usize, max_pixels: u64, max_bytes: u64, a: *mut Animation) -> bool {
+    anim_free(a)
+    (*a).frame = 0
+    (*a).started = false
+    (*a).paused = false
+    (*a).played = 0 as u32
+    (*a).done = false
+    let fmt: u32 = uiimage.image_format(src, n)
+    if fmt == uiimage.IMG_FMT_GIF {
+        let maxf: u32 = 4096 as u32
+        let ok: bool = gif.gif_decode_anim_limited(src, n, max_pixels, maxf, &(*a).gif) catch false
+        if !ok || (*a).gif.count == 0 as u32 {
+            anim_free(a)
+            return false
+        }
+        if (*a).gif.w as u64 * (*a).gif.h as u64 * (*a).gif.count as u64 * 4 > max_bytes {
+            anim_free(a)
+            return false
+        }
+        (*a).fmt = fmt
+        (*a).w = (*a).gif.w as usize
+        (*a).h = (*a).gif.h as usize
+        (*a).count = (*a).gif.count as usize
+        (*a).loops = (*a).gif.loops
+        return true
+    }
+    if fmt == uiimage.IMG_FMT_WEBP {
+        let ok: bool = webp.webp_decode_anim_limited(src, n, max_pixels, 4096 as u32, &(*a).webp) catch false
+        if !ok || (*a).webp.count == 0 as u32 {
+            anim_free(a)
+            return false
+        }
+        if (*a).webp.w as u64 * (*a).webp.h as u64 * (*a).webp.count as u64 * 4 > max_bytes {
+            anim_free(a)
+            return false
+        }
+        (*a).fmt = fmt
+        (*a).w = (*a).webp.w as usize
+        (*a).h = (*a).webp.h as usize
+        (*a).count = (*a).webp.count as usize
+        (*a).loops = (*a).webp.loops
+        return true
+    }
+    // anything else: one frame
+    if uiimagedec.image_from_bytes_limited(src, n, max_pixels, &(*a).still, &(*a).still_view) {
+        (*a).fmt = fmt
+        (*a).w = (*a).still_view.w
+        (*a).h = (*a).still_view.h
+        (*a).count = 1
+        (*a).loops = 1 as u32
+        return true
+    }
+    return false
+}
+
+fn anim_count(a: *mut Animation) -> usize { return (*a).count }
+fn anim_width(a: *mut Animation) -> usize { return (*a).w }
+fn anim_height(a: *mut Animation) -> usize { return (*a).h }
+fn anim_loops(a: *mut Animation) -> u32 { return (*a).loops }
+fn anim_frame_index(a: *mut Animation) -> usize { return (*a).frame }
+fn anim_paused(a: *mut Animation) -> bool { return (*a).paused }
+
+// The pass count is used up and the last frame stays.
+fn anim_finished(a: *mut Animation) -> bool { return (*a).done }
+
+// The delay of frame `i` as it is PLAYED (see the header), in milliseconds.
+fn anim_delay_ms(a: *mut Animation, i: usize) -> i64 {
+    if i >= (*a).count {
+        return 0
+    }
+    if (*a).fmt == uiimage.IMG_FMT_GIF {
+        let d: u32 = gif.gif_anim_delay(&(*a).gif, i as u32)
+        if d < 20 as u32 {
+            return 100
+        }
+        return d as i64
+    }
+    if (*a).fmt == uiimage.IMG_FMT_WEBP {
+        let d: u32 = webp.webp_anim_delay(&(*a).webp, i as u32)
+        if d == 0 as u32 {
+            return 10
+        }
+        return d as i64
+    }
+    return 0
+}
+
+// The length of one pass over all frames, in milliseconds.
+fn anim_total_ms(a: *mut Animation) -> i64 {
+    var t: i64 = 0
+    var i: usize = 0
+    while i < (*a).count {
+        t = t + anim_delay_ms(a, i)
+        i = i + 1
+    }
+    return t
+}
+
+// The picture of frame `i` (the whole canvas, straight RGBA) pointing into the animation.
+fn frame_image(a: *mut Animation, i: usize) -> uiimage.Image {
+    if (*a).count == 0 || i >= (*a).count {
+        return uiimage.image_new()
+    }
+    if (*a).fmt == uiimage.IMG_FMT_GIF {
+        return uiimage.image_wrap(rt.buf_ptr(&(*a).gif.px) + (i * (*a).w * (*a).h * 4) as u64, (*a).w, (*a).h, 0)
+    }
+    if (*a).fmt == uiimage.IMG_FMT_WEBP {
+        return uiimage.image_wrap(rt.buf_ptr(&(*a).webp.px) + (i * (*a).w * (*a).h * 4) as u64, (*a).w, (*a).h, 0)
+    }
+    return (*a).still_view
+}
+
+// The frame on screen now.
+fn anim_frame_image(a: *mut Animation) -> uiimage.Image {
+    return frame_image(a, (*a).frame)
+}
+
+// Back to the first frame and the first pass; the next tick starts the clock again.
+fn anim_reset(a: *mut Animation) {
+    (*a).frame = 0
+    (*a).started = false
+    (*a).played = 0 as u32
+    (*a).done = false
+}
+
+// Show frame `i` and restart its time at the next tick (a seek, or a thumbnail).
+fn anim_set_frame(a: *mut Animation, i: usize) {
+    if i < (*a).count {
+        (*a).frame = i
+        (*a).started = false
+        (*a).done = false
+    }
+}
+
+fn anim_pause(a: *mut Animation, now_ms: i64) {
+    if !(*a).paused {
+        (*a).paused = true
+        (*a).paused_at = now_ms
+    }
+}
+
+// Continue where it stopped: the frame on screen gets the time it had left.
+fn anim_resume(a: *mut Animation, now_ms: i64) {
+    if (*a).paused {
+        (*a).paused = false
+        if (*a).started {
+            (*a).t0 = (*a).t0 + (now_ms - (*a).paused_at)
+        }
+    }
+}
+
+// Advances to the frame the clock `now_ms` says. True when the frame on screen changed (the
+// program has to repaint).
+fn anim_tick(a: *mut Animation, now_ms: i64) -> bool {
+    if (*a).count <= 1 || (*a).paused || (*a).done {
+        if !(*a).started {
+            (*a).started = true
+            (*a).t0 = now_ms
+        }
+        return false
+    }
+    if !(*a).started {
+        (*a).started = true
+        (*a).t0 = now_ms
+        return false
+    }
+    let before: usize = (*a).frame
+    var guard: usize = 0
+    while now_ms - (*a).t0 >= anim_delay_ms(a, (*a).frame) && !(*a).done {
+        (*a).t0 = (*a).t0 + anim_delay_ms(a, (*a).frame)
+        if (*a).frame + 1 < (*a).count {
+            (*a).frame = (*a).frame + 1
+        } else {
+            (*a).played = (*a).played + 1 as u32
+            if (*a).loops != 0 as u32 && (*a).played >= (*a).loops {
+                (*a).done = true
+            } else {
+                (*a).frame = 0
+            }
+        }
+        guard = guard + 1
+        if guard >= (*a).count * 2 {
+            // far behind (the program was stopped): jump over whole passes, then play on
+            let total: i64 = anim_total_ms(a)
+            if total > 0 && now_ms - (*a).t0 > total {
+                let passes: i64 = (now_ms - (*a).t0) / total
+                if (*a).loops != 0 as u32 && ((*a).played as i64) + passes >= ((*a).loops as i64) {
+                    (*a).done = true
+                    (*a).frame = (*a).count - 1
+                } else {
+                    (*a).played = (*a).played + passes as u32
+                    (*a).t0 = (*a).t0 + passes * total
+                }
+            }
+            guard = 0
+        }
+    }
+    return (*a).frame != before
+}
+
+// Milliseconds until the picture next changes; -1 if it never does (still, finished, paused).
+fn anim_next_ms(a: *mut Animation, now_ms: i64) -> i64 {
+    if (*a).count <= 1 || (*a).paused || (*a).done {
+        return 0 - 1
+    }
+    if !(*a).started {
+        return 0
+    }
+    var left: i64 = (*a).t0 + anim_delay_ms(a, (*a).frame) - now_ms
+    if left < 0 {
+        left = 0
+    }
+    return left
+}
+
+// Draws the frame on screen into the rectangle (x, y, w, h) with `fit` (uiimage.FIT_*).
+fn anim_draw(z: *mut painter.Painter, a: *mut Animation, x: f64, y: f64, w: f64, h: f64, fit: u32) {
+    var im: uiimage.Image = anim_frame_image(a)
+    if im.px == 0 {
+        return
+    }
+    uiimage.image_draw(z, &im, x, y, w, h, fit, 0 as u32)
+}

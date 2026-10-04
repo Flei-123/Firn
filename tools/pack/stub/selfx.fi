@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/pack/stub/selfx.fi -- the start of a self-extracting Linux program
+// (the AppImage-compatible fallback of tools/pack: ELF stub + zip payload).
+//
+//   [ this program ][ payload.zip: an AppDir ][ trailer, 64 octets ]
+//
+// The trailer is the one of the Windows installer (lib/pack/payload.fi): the
+// payload is found again, its SHA-256 checked, and `.pack/info` says which
+// file inside is the program (`exe=usr/bin/myapp`).
+//
+// WHAT HAPPENS WHEN IT RUNS
+//   1. the payload is extracted ONCE to
+//        $XDG_CACHE_HOME/firn-run/<id>-<12 hex of the payload hash>/
+//      (else ~/.cache/...), into a temp name that is renamed into place --
+//      two starts at the same time do not see a half-written folder
+//   2. the program inside is started with execve (this process becomes it):
+//        APPDIR=<the folder>   APPIMAGE=<this file>   ARGV0=<how it was called>
+//      so appkit's updater replaces THIS file (lib/appkit/platform.fi reads
+//      $APPIMAGE) and the next start finds the new payload under a new folder
+//
+// WHY NOT THE REAL APPIMAGE FORMAT: a type 2 AppImage is a squashfs image
+// that a runtime mounts with FUSE. `pack.py appimage` writes exactly that
+// when it is given a runtime; this stub is for where there is none (or no
+// FUSE on the target): it needs nothing but the kernel. Old extracted
+// folders are not removed here (`~/.cache` is the user's to clean);
+// `--appimage-extract-clean` removes all but the current one.
+//
+// OPTIONS the stub itself answers (everything else goes to the program):
+//   --appimage-extract [DIR]   unpack into DIR (default ./squashfs-root) and exit
+//   --appimage-info            print id, version and the cache folder
+import std.rt
+import std.fs
+import std.io
+import std.dir
+import std.safefs
+import std.tar
+import std.extract
+import appkit.util
+import pack.payload
+
+fn env_of(start: u64, name: str) -> str {
+    let argc: usize = rt.arg_count(start)
+    var i: usize = argc + 2
+    while true {
+        let p: u64 = rt.ld64(start, i)
+        if p == 0 as u64 {
+            return ""
+        }
+        let n: usize = rt.c_length(p)
+        let e: str = str { p: p as *mut u8, n: n }
+        if n > name.n && rt.ld8(p, name.n) == 61 as u8 && rt.mem_eq(p, name.p as u64, name.n) {
+            return str { p: (p + (name.n + 1) as u64) as *mut u8, n: n - name.n - 1 }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn arg_of(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    if p == 0 as u64 {
+        return ""
+    }
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn die(msg: str, code: i32) -> i32 {
+    io.eprint_line("selfx: " + msg)
+    return code
+}
+
+fn hex12(p: u64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    util.hex_encode(p, 6, &b)
+    let s: str = util.buf_to_str_copy(&b)
+    rt.buf_free(&b)
+    return s
+}
+
+fn getpid() -> i64 {
+    return syscall(39, 0, 0, 0, 0, 0, 0)
+}
+
+fn dec(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, v)
+    let s: str = util.buf_to_str_copy(&b)
+    rt.buf_free(&b)
+    return s
+}
+
+// a C string copy in `blob`; returns its offset
+fn cstr(blob: *mut rt.Buf, s: str) -> usize {
+    let off: usize = rt.buf_len(blob)
+    rt.buf_push_bytes(blob, s.p as u64, s.n)
+    rt.buf_push(blob, 0 as u8)
+    return off
+}
+
+fn put64(b: *mut rt.Buf, v: u64) {
+    var i: usize = 0
+    while i < 8 {
+        rt.buf_push(b, ((v >> (8 * i as u64)) & 255 as u64) as u8)
+        i = i + 1
+    }
+}
+
+fn starts(s: str, pre: str) -> bool {
+    return util.starts_with(s, pre)
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    // ---- this file
+    var selfp: str = ""
+    selfp = fs.readlink("/proc/self/exe") catch ""
+    if selfp.n == 0 {
+        return die("cannot find myself (/proc/self/exe)", 2)
+    }
+    if util.ends_with(selfp, " (deleted)") {
+        selfp = str { p: selfp.p, n: selfp.n - 10 }
+    }
+    var whole: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(selfp, &whole) catch 0
+    if n == 0 {
+        return die("cannot read " + selfp, 2)
+    }
+    var pl: payload.Payload = payload.Payload { off: 0, len: 0 }
+    if !payload.payload_find(rt.buf_ptr(&whole), n, &pl) {
+        return die("no intact payload in " + selfp + " (truncated or damaged download?)", 2)
+    }
+    let zp: u64 = rt.buf_ptr(&whole) + pl.off as u64
+    var inf: payload.Info = payload.Info { id: "", name: "", version: "", vendor: "", exe: "", icon: "",
+        url: "", desktop: true, launch: true }
+    if !payload.info_from_payload(zp, pl.len, &inf) {
+        return die("the payload has no valid .pack/info", 2)
+    }
+
+    // ---- the cache folder
+    var base: str = env_of(start, "XDG_CACHE_HOME")
+    if base.n == 0 {
+        let home: str = env_of(start, "HOME")
+        if home.n == 0 {
+            return die("no HOME and no XDG_CACHE_HOME", 2)
+        }
+        base = home + "/.cache"
+    }
+    let sha: u64 = rt.buf_ptr(&whole) + (n - payload.TRAILER_SIZE + 24) as u64
+    let dir: str = base + "/firn-run/" + inf.id + "-" + hex12(sha)
+
+    // ---- the options of the stub
+    let a1: str = arg_of(start, 1)
+    if a1 == "--appimage-info" {
+        io.print_line("id=" + inf.id)
+        io.print_line("version=" + inf.version)
+        io.print_line("folder=" + dir)
+        return 0
+    }
+    var target: str = dir
+    var extract_only: bool = false
+    if a1 == "--appimage-extract" {
+        extract_only = true
+        target = "squashfs-root"
+        if rt.arg_count(start) > 2 {
+            target = arg_of(start, 2)
+        }
+    }
+    if extract_only || !fs.is_file(dir + "/.pack/ready") {
+        let tmp: str = target + ".tmp" + dec(getpid())
+        if !extract_only {
+            fs.mkdir_all(base + "/firn-run") catch false
+        }
+        var opts: safefs.ExtractOptions = safefs.extract_options_default()
+        opts.overwrite = true
+        var failed: bool = false
+        extract.extract_memory(zp, pl.len, "", tmp, opts, tar.tar_limits_default()) catch | e | (note_fail(&failed))
+        if failed {
+            fs.remove_tree(tmp) catch false
+            return die("cannot unpack into " + tmp + " (disk full?)", 3)
+        }
+        fs.mkdir_all(tmp + "/.pack") catch false
+        let ok: str = "ok\n"
+        fs.write_file(tmp + "/.pack/ready", ok.p as u64, ok.n) catch 0
+        if extract_only {
+            fs.remove_tree(target) catch false
+        }
+        let moved: bool = fs.rename(tmp, target) catch false
+        if !moved {
+            // somebody else was faster: use theirs
+            fs.remove_tree(tmp) catch false
+            if !fs.is_file(dir + "/.pack/ready") && !extract_only {
+                return die("cannot move the unpacked folder into place", 3)
+            }
+        }
+        if extract_only {
+            return 0
+        }
+    }
+
+    // ---- exec the program
+    let prog: str = dir + "/" + inf.exe
+    if !fs.is_file(prog) {
+        return die("the payload has no " + inf.exe, 3)
+    }
+    let argc: usize = rt.arg_count(start)
+    var blob: rt.Buf = rt.buf_new()
+    var offs: rt.Buf = rt.buf_new()       // offsets of every string, in order: argv then envp
+    let o_prog: usize = cstr(&blob, prog)
+    var i: usize = 1
+    var argv_offs: rt.Buf = rt.buf_new()
+    put64(&argv_offs, o_prog as u64)
+    while i < argc {
+        put64(&argv_offs, cstr(&blob, arg_of(start, i)) as u64)
+        i = i + 1
+    }
+    // the environment: the old one without APPIMAGE/APPDIR/ARGV0, plus ours
+    var env_offs: rt.Buf = rt.buf_new()
+    var k: usize = argc + 2
+    while true {
+        let p: u64 = rt.ld64(start, k)
+        if p == 0 as u64 {
+            break
+        }
+        let e: str = str { p: p as *mut u8, n: rt.c_length(p) }
+        if !starts(e, "APPIMAGE=") && !starts(e, "APPDIR=") && !starts(e, "ARGV0=") {
+            put64(&env_offs, cstr(&blob, e) as u64)
+        }
+        k = k + 1
+    }
+    put64(&env_offs, cstr(&blob, "APPIMAGE=" + selfp) as u64)
+    put64(&env_offs, cstr(&blob, "APPDIR=" + dir) as u64)
+    put64(&env_offs, cstr(&blob, "ARGV0=" + arg_of(start, 0)) as u64)
+    // pointer arrays (the blob no longer grows)
+    let bp: u64 = rt.buf_ptr(&blob)
+    var argv: rt.Buf = rt.buf_new()
+    var j: usize = 0
+    while j < rt.buf_len(&argv_offs) / 8 {
+        put64(&argv, bp + rt.ld64(rt.buf_ptr(&argv_offs), j))
+        j = j + 1
+    }
+    put64(&argv, 0 as u64)
+    var envp: rt.Buf = rt.buf_new()
+    j = 0
+    while j < rt.buf_len(&env_offs) / 8 {
+        put64(&envp, bp + rt.ld64(rt.buf_ptr(&env_offs), j))
+        j = j + 1
+    }
+    put64(&envp, 0 as u64)
+    let r: i64 = syscall(59, bp as i64, rt.buf_ptr(&argv) as i64, rt.buf_ptr(&envp) as i64, 0, 0, 0)
+    return die("cannot start " + prog + " (execve failed, errno " + dec(0 - r) + ")", 4)
+}
+
+fn note_fail(failed: *mut bool) -> safefs.ExtractStats {
+    *failed = true
+    return safefs.ExtractStats { files: 0, dirs: 0, links: 0, bytes: 0 }
+}

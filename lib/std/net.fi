@@ -66,10 +66,14 @@
 //
 // ------------------------------------------------------------------ HONEST
 //
-// N1  BLOCKING ONLY. There is no `O_NONBLOCK`, no `epoll`, no `poll`. The
-//     concurrency model of this round is one thread per connection
-//     (`thread_start`, round 49) -- which is exactly what the socket API
-//     was designed for and what `demos/mcserver` does.
+// N1  BLOCKING BY DEFAULT. The calls above block; the concurrency model of
+//     round 76 is one thread per connection (`thread_start`, round 49) --
+//     which is exactly what the socket API was designed for and what
+//     `demos/mcserver` does. Round ASYNC added the other half at the END of
+//     this file: `set_nonblocking`, `read_nb`/`write_nb`/`accept_nb`
+//     (`NetError::WouldBlock` instead of a failure), `connect_nb` +
+//     `connect_finish` and `sock_error`. The event loop that waits for many
+//     of them at once is `lib/async/loop.fi`.
 // N2  IPv4 ONLY. `AF_INET`, not `AF_INET6`. A `sockaddr_in6` is 28 bytes
 //     and needs a scope id; nothing in this round wants it.
 // N3  NO NAME RESOLUTION HERE. `connect_tcp` takes a numeric address. Names
@@ -104,6 +108,10 @@ export {
     peer_addr, peer_port,
     errno_of,
     local_ipv4, ipv4_text,
+    // round ASYNC -- non-blocking sockets
+    set_nonblocking, set_nonblocking_fd, listener_set_nonblocking,
+    read_nb, write_nb, accept_nb, connect_nb, connect_finish, sock_error,
+    conn_from_fd_peer, listener_new_nb,
 }
 
 // ------------------------------------------------------------ System calls
@@ -153,6 +161,7 @@ error NetError {
     Address, // getsockname/getpeername failed
     Broken, // read/write failed with an errno
     Closed, // the peer closed while more octets were expected
+    WouldBlock, // non-blocking call: nothing to do right now (EAGAIN)
 }
 
 // --------------------------------------------------------------- Structures
@@ -707,4 +716,224 @@ fn ipv4_text(a: u32, out: *mut rt.Buf) {
         }
         i = i + 1
     }
+}
+
+// ============================================ NON-BLOCKING SOCKETS (ASYNC)
+//
+// Everything above blocks. The event loop (`lib/async/loop.fi`) needs the
+// other half: a socket that answers "not now" instead of waiting.
+//
+//   * `O_NONBLOCK` is set with fcntl(2) F_SETFL. The Windows seam
+//     (`compiler/src/win_seam.rs`, call 72) turns it into ioctlsocket
+//     FIONBIO, so the same code runs on both.
+//   * "not now" is EAGAIN (11) on Linux. A non-blocking connect(2) answers
+//     EINPROGRESS (115); the seam maps WSAEWOULDBLOCK (10035) to EAGAIN and
+//     WSAEINPROGRESS to EINPROGRESS, so BOTH numbers mean "pending" here.
+//   * `*_nb` functions return `NetError::WouldBlock` for EAGAIN and set
+//     `Conn.err` to -11 (so that a driver which has lost the error value in
+//     a `catch` can still tell "not now" from a failure: set `err` to 0
+//     first, look at it after); every other failure is `Broken` with the
+//     errno in `Conn.err`, exactly as in the blocking calls.
+//   * the result of a non-blocking connect is read with getsockopt(2)
+//     SO_ERROR once the socket is writable (`connect_finish`).
+
+const SYS_FCNTL: i64 = 72
+const SYS_GETSOCKOPT: i64 = 55
+const F_GETFL: i64 = 3
+const F_SETFL: i64 = 4
+const O_NONBLOCK: i64 = 2048
+const SOCK_NONBLOCK: i64 = 2048
+const SOCK_CLOEXEC: i64 = 524288
+const SO_ERROR: i64 = 4
+const EAGAIN: i64 = 0 - 11
+const EINPROGRESS: i64 = 0 - 115
+
+fn set_nonblocking_fd(fd: i32, on: bool) -> bool {
+    if fd < 0 {
+        return false
+    }
+    let fl: i64 = syscall(SYS_FCNTL, fd as i64, F_GETFL, 0, 0, 0, 0)
+    if failed(fl) {
+        return false
+    }
+    var nf: i64 = fl & (0 - 1 - O_NONBLOCK)
+    if on {
+        nf = fl | O_NONBLOCK
+    }
+    if nf == fl {
+        return true
+    }
+    let r: i64 = syscall(SYS_FCNTL, fd as i64, F_SETFL, nf, 0, 0, 0)
+    return !failed(r)
+}
+
+fn set_nonblocking(c: *mut Conn, on: bool) -> NetError!bool {
+    if !set_nonblocking_fd((*c).fd, on) {
+        return NetError::Options
+    }
+    return true
+}
+
+fn listener_set_nonblocking(l: *mut Listener, on: bool) -> NetError!bool {
+    if !set_nonblocking_fd((*l).fd, on) {
+        return NetError::Options
+    }
+    return true
+}
+
+// A listener that is non-blocking from the start (backlog as given).
+fn listener_new_nb(addr: u32, port: u16, backlog: i32) -> NetError!Listener {
+    var l: Listener = try listen_tcp_err(addr, port, backlog, 0 as *mut i64)
+    if !set_nonblocking_fd(l.fd, true) {
+        close_listener(&l)
+        return NetError::Options
+    }
+    return l
+}
+
+// accept4 with SOCK_NONBLOCK: the new connection is non-blocking already.
+// `NetError::WouldBlock` when no connection is waiting.
+fn accept_nb(l: *mut Listener) -> NetError!Conn {
+    var sa: SockAddrIn = SockAddrIn { family: 0 as u16, port: 0 as u16, addr: 0 as u32, zero: [0; 8] }
+    var len: i32 = 16
+    var r: i64 = 0
+    var again: bool = true
+    while again {
+        r = syscall(SYS_ACCEPT4, (*l).fd as i64, (&sa) as i64, (&len) as i64,
+            SOCK_NONBLOCK | SOCK_CLOEXEC, 0, 0)
+        if r != EINTR {
+            again = false
+        }
+    }
+    if r == EAGAIN {
+        return NetError::WouldBlock
+    }
+    if failed(r) {
+        (*l).err = r as i32
+        return NetError::Accept
+    }
+    return Conn {
+        fd: r as i32,
+        err: 0,
+        peer: host_to_net_32(sa.addr),
+        peer_port: host_to_net_16(sa.port),
+    }
+}
+
+// recv without waiting. 0 = the peer closed in an orderly way.
+fn read_nb(c: *mut Conn, buf: u64, n: usize) -> NetError!usize {
+    if n == 0 {
+        return 0 as usize
+    }
+    var r: i64 = 0
+    var again: bool = true
+    while again {
+        r = syscall(SYS_RECVFROM, (*c).fd as i64, buf as i64, n as i64, 0, 0, 0)
+        if r != EINTR {
+            again = false
+        }
+    }
+    if r == EAGAIN {
+        (*c).err = r as i32 // -11: how a driver tells WouldBlock from a failure after `catch`
+        return NetError::WouldBlock
+    }
+    if failed(r) {
+        (*c).err = r as i32
+        return NetError::Broken
+    }
+    return r as usize
+}
+
+// send without waiting. A SHORT count is normal; WouldBlock = the kernel's
+// send buffer is full.
+fn write_nb(c: *mut Conn, buf: u64, n: usize) -> NetError!usize {
+    if n == 0 {
+        return 0 as usize
+    }
+    var r: i64 = 0
+    var again: bool = true
+    while again {
+        r = syscall(SYS_SENDTO, (*c).fd as i64, buf as i64, n as i64,
+            MSG_NOSIGNAL, 0, 0)
+        if r != EINTR {
+            again = false
+        }
+    }
+    if r == EAGAIN {
+        (*c).err = r as i32 // -11: how a driver tells WouldBlock from a failure after `catch`
+        return NetError::WouldBlock
+    }
+    if failed(r) {
+        (*c).err = r as i32
+        return NetError::Broken
+    }
+    return r as usize
+}
+
+// Starts a connect and returns AT ONCE. `*pending` is true when the
+// handshake is still running: wait until the socket is writable, then call
+// `connect_finish`. false = connected already (loopback often is).
+fn connect_nb(addr: u32, port: u16, pending: *mut bool, err: *mut i64) -> NetError!Conn {
+    *pending = false
+    if err as u64 != 0 as u64 {
+        *err = 0
+    }
+    let fd: i64 = syscall(SYS_SOCKET, AF_INET as i64, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, 0, 0, 0)
+    if failed(fd) {
+        if err as u64 != 0 as u64 {
+            *err = 0 - fd
+        }
+        return NetError::Socket
+    }
+    var sa: SockAddrIn = SockAddrIn { family: 0 as u16, port: 0 as u16, addr: 0 as u32, zero: [0; 8] }
+    addr_init(&sa, addr, port)
+    var r: i64 = 0
+    var again: bool = true
+    while again {
+        r = syscall(SYS_CONNECT, fd, (&sa) as i64, 16, 0, 0, 0)
+        if r != EINTR {
+            again = false
+        }
+    }
+    if r == EINPROGRESS || r == EAGAIN {
+        *pending = true
+    } else if failed(r) {
+        if err as u64 != 0 as u64 {
+            *err = 0 - r
+        }
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        return NetError::Connect
+    }
+    return Conn { fd: fd as i32, err: 0, peer: addr, peer_port: port }
+}
+
+// SO_ERROR: the pending error of the socket as a POSITIVE errno, 0 = none.
+// Reading it CLEARS it. -1 when getsockopt itself failed.
+fn sock_error(fd: i32) -> i64 {
+    var v: i32 = 0
+    var len: i32 = 4
+    let r: i64 = syscall(SYS_GETSOCKOPT, fd as i64, SOL_SOCKET, SO_ERROR,
+        (&v) as i64, (&len) as i64, 0)
+    if failed(r) {
+        return 0 - 1
+    }
+    return v as i64
+}
+
+// After the socket became writable: did the connect work?
+fn connect_finish(c: *mut Conn, err: *mut i64) -> NetError!bool {
+    let e: i64 = sock_error((*c).fd)
+    if err as u64 != 0 as u64 {
+        *err = e
+    }
+    if e != 0 {
+        (*c).err = (0 - e) as i32
+        return NetError::Connect
+    }
+    return true
+}
+
+// A Conn around a descriptor that also knows the peer (accepted elsewhere).
+fn conn_from_fd_peer(fd: i32, peer: u32, port: u16) -> Conn {
+    return Conn { fd: fd, err: 0, peer: peer, peer_port: port }
 }

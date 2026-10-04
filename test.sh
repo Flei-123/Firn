@@ -1628,6 +1628,81 @@ if [ "$DKRC" -eq 0 ]; then
 else
     bad "tools/desktop/run.sh failed (see .test-work/desktop.log)"
     grep -E 'FAIL' "$WORK/desktop.log" | head -12 | sed 's/^/   /'
+echo "== 77. async IO: a thousand connections, a window and the loop, real wss (tools/async/run.sh) =="
+# tests/2120-2125 (section 3) are the in-process half: the loop (epoll and poll), streams, TLS,
+# the HTTP client, the WebSocket client, posting from threads. Here: 1000 connections held
+# against Python asyncio in both directions, the window + loop probe on an Xvfb, the WebSocket
+# client against real wss:// echo services (skipped without a route), and the Windows build
+# under Wine (skipped without Wine/mingw).
+bash tools/async/run.sh > "$WORK/async.log" 2>&1 && ASRC=0 || ASRC=$?
+if [ "$ASRC" -eq 0 ]; then
+    ok
+    grep -E '^(conn:|ui:|ASYNC)|^  (ok|skip)   .*(wss|connections)' "$WORK/async.log" | sed 's/^/   /' | head -12
+else
+    bad "tools/async/run.sh failed (see .test-work/async.log)"
+    grep -E 'FAIL' "$WORK/async.log" | head -12 | sed 's/^/   /'
+fi
+
+echo "== 78. packaging: installers, packages, icons (tools/pack/, lib/pack/, docs/PACKAGING.md) =="
+# lib/pack's unit tests are in tests/2200-2203 (section 3): the shortcut writer, the icon formats, the
+# installer payload, a whole install / upgrade / uninstall without Windows. Here: tools/pack/test/run.sh
+# builds the Firn parts (icons tool, installer stub, self-extract stub) and runs checks.py -- every writer
+# (.deb, .rpm, tar.gz, SquashFS/AppImage, self-extracting .run, .opk, .app/.dmg, zip, NSIS script, PE icon
+# resource, manifest + Ed25519 signatures) against an independent reader: dpkg-deb, `dpkg -i` and `rpm -i` in
+# a container, unsquashfs, the AppImage runtime, OrientOS's opk.py byte for byte, the store's opkleser, makensis,
+# xorriso, a store tool in a throw-away repository. PACK_WINE=1 adds windows.sh: the Windows installer under
+# Wine (silent and window install, shortcuts read by an independent parser and started by Wine's shell,
+# the registry entry, upgrade, uninstall and its leftovers, cancel, NSIS, the portable zip; PACK_WINE_APP=1 also
+# the appkit template's window on the Win32 back end). Readers that are not installed SKIP.
+bash tools/pack/test/run.sh > "$WORK/pack.log" 2>&1 && PKRC=0 || PKRC=$?
+if [ "${PACK_WINE:-0}" = "1" ]; then
+    PACK_WINE=1 PACK_WINE_APP=${PACK_WINE_APP:-1} bash tools/pack/test/run.sh > "$WORK/pack_wine.log" 2>&1 || PKRC=1
+fi
+if [ "$PKRC" -eq 0 ]; then
+    ok
+    grep -E '^(pack checks:|windows.sh:|SKIP)' "$WORK"/pack*.log | sed 's/^/   /'
+else
+    bad "tools/pack/test failed (see .test-work/pack*.log)"
+    grep -E 'FAIL' "$WORK"/pack*.log | head -12 | sed 's/^/   /'
+fi
+
+echo "== 79. UI extras: QR codes against qrcodegen / python-qrcode / ZXing-C++, and the human texts against ICU (tools/qr/, tools/uiextras/) =="
+# The fUi parts of the same wave (rich text, selection and copy, highlighting, animated pictures,
+# the kit in the accessibility tree, touch, right to left, the QR widget) are section 18q of
+# tools/fui/run.sh; their library tests are tests/2240-2242 (section 3). Here the two that are
+# held against other implementations: lib/qr (the encoder's modules identical with Nayuki's
+# reference encoder for every version, level and mask; every code read back by ZXing-C++; the
+# decoder on pictures that get worse -- rotated, warped, blurred, damaged, cluttered -- with
+# ZXing-C++ as the yardstick) and lib/i18n/human.fi (relative times, byte sizes, date styles,
+# percent, lists, zones against ICU 72). SKIP (exit 0) without the Python packages.
+UXRC=0
+sh tools/qr/run.sh > "$WORK/qr_run.log" 2>&1 || UXRC=1
+sh tools/uiextras/run.sh > "$WORK/uiextras_run.log" 2>&1 || UXRC=1
+if [ "$UXRC" -eq 0 ]; then
+    ok
+    grep -E '^(cases|human:|total|QR PASSED|UIEXTRAS PASSED|  SKIP)' "$WORK/qr_run.log" "$WORK/uiextras_run.log" | sed 's/^/   /'
+else
+    bad "tools/qr or tools/uiextras failed (see .test-work/qr_run.log, uiextras_run.log)"
+    grep -E 'FAIL|DIFF|Traceback|Error' "$WORK/qr_run.log" "$WORK/uiextras_run.log" | head -12 | sed 's/^/   /'
+fi
+
+echo "== 80. downloads and sign-in: net.download, auth.jose/oauth/msa, appkit.fleitec_login (tools/download/, tools/oauth/) =="
+# tests/2140 (download manager against an in-process server), tests/2150-2153 (JWT against tokens signed
+# by Python's cryptography, OAuth units, the Microsoft chain's bodies, Sign in with Fleitec-ID against
+# an in-process ID server) are in section 3. Here: the Python-side servers that misbehave on purpose.
+#   tools/download/run.sh  net.download against fake_server.py (resume, retry, backoff, mirrors, ETag, cancel,
+#                          rate limit, keep-alive; the real Mojang CDN when there is a route); Wine
+#   tools/oauth/run.sh     auth.oauth against fake_idp.py (PKCE, loopback redirect under attack, device flow,
+#                          refresh rotation, id_token refusals, keyring) and auth.msa against fake_msa.py
+#                          (+ the real hosts with bogus credentials when there is a route); Wine
+bash tools/download/run.sh > "$WORK/download.log" 2>&1 && DLRC=0 || DLRC=$?
+bash tools/oauth/run.sh > "$WORK/oauth.log" 2>&1 && OARC=0 || OARC=$?
+grep -E 'passed|SKIP|windows' "$WORK/download.log" "$WORK/oauth.log" | sed 's/^[^:]*://; s/^/   /'
+if [ "$DLRC" -eq 0 ] && [ "$OARC" -eq 0 ]; then
+    ok
+else
+    bad "tools/download/run.sh or tools/oauth/run.sh failed (see .test-work/download.log, oauth.log)"
+    grep -E 'FAIL|Traceback' "$WORK/download.log" "$WORK/oauth.log" | head -12 | sed 's/^/   /' || true
 fi
 
 TOTAL=$((PASS + FAIL))

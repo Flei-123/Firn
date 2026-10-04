@@ -76,12 +76,20 @@ frame that returns.
   (Xvfb), operated with xdotool, checked with `xwd` pixels and the CPU it used
   while idle.
 
+## Since the UI-extras wave (docs/UI_EXTRAS.md)
+
+* **Right to left.** `kit.kit_set_rtl(true)` mirrors every part; `tools/fui/kitrtl_main.fi`
+  proves the hit functions, the decorations and the keys against the left-to-right picture.
+* **Touch.** `lib/fui/kittouch.fi` (tap, double tap, long press, pan, fling, pinch) and the
+  `grid_touch_*` / `mdv_touch_*` calls; `tools/fui/touch_main.fi` feeds synthetic pointer streams.
+* **Accessibility.** `lib/fui/kita11y.fi` describes every part into the a11y tree from the very
+  state the frame paints; `examples/fui/launcher_kit.fi` audits through it
+  (`tools/fui/kita11y_main.fi` compares the dump).
+
 ## Honest limits
 
-No right-to-left mirroring; no touch gestures (wheel, bars and keys scroll;
-a program wanting fling feeds `viewport_fling`); one line of text per toast and
-per tile line (cut with "..."); hover does not animate; and **the parts are
-not announced to a screen reader** -- immediate mode has no node tree for
-`audit.fi` to read. The example's audit therefore builds a name for every
-operable part it offers and audits those; wiring the kit into the a11y tree is
-the open step.
+One line of text per toast and per tile line (cut with "..."); hover does not animate; in RTL the
+grid's scrollbar stays at the right and pointing symbols are not flipped; the a11y tree has no
+geometry and is not connected to AT-SPI / UIA yet (a screen reader still cannot read the
+window -- the tree is what it will read); touch is tested with synthetic pointer streams, not on a
+phone in this wave.

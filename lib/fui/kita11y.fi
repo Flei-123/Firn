@@ -1,0 +1,375 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/kita11y.fi -- THE KIT IN THE ACCESSIBILITY TREE.
+//
+// The parts of lib/fui/kit.fi are immediate mode: painted every frame from the state the
+// program keeps, no node behind them -- and a screen reader (or lib/fui/audit.fi) cannot
+// read what is only painted. This file lets every part DESCRIBE ITSELF into a scene
+// tree (lib/fui/scene.fi + lib/fui/a11y.fi), from the very state and strings the frame
+// paints, so that nothing is written down twice:
+//
+//     var kx: kita11y.KitAx = kita11y.kax_new(&scene, &ax)
+//     let root: usize = kita11y.kax_root(&kx, "Launcher")
+//     kita11y.kax_nav(&kx, root, items, n, active, collapsed)
+//     kita11y.kax_tabbar(&kx, root, tabs, nt, sel)
+//     kita11y.kax_search(&kx, root, &search, "Search mods")
+//     kita11y.kax_grid(&kx, root, tiles, nt, selected)
+//     kita11y.kax_button(&kx, root, "Play", kit.ST_FOCUS)
+//     kita11y.kax_toasts(&kx, root, &toasts)
+//     kita11y.kax_modal(&kx, root, &modal)       // and then its own buttons as children
+//     let report: audit.Audit = audit.audit_tree_ax(&scene, &ax)
+//
+// WHAT EACH PART BECOMES (the role, the name, the state a screen reader announces):
+//
+//   button       button, the label; disabled / focused from the part's state bits
+//   tab bar      toolbar of tabs: "Installed, 3" (label, then the badge), the selected one
+//                selected, "tab 2 of 3" from the position among its siblings
+//   sidebar      a menu of menu items (the headers are headings): "Settings", the active
+//                one selected; a collapsed sidebar names its items the same (they are
+//                only symbols on screen: the name is what a reader needs most)
+//   tile grid    a list of tiles: "title, subtitle, badge"; the selected tile pressed
+//   search       a text box named by its hint, holding the text; a "Clear" button while
+//                there is text (a secret is never exported: this field is not one)
+//   progress     a progress bar with its label, 0..1000 as the widget's value; an
+//                indeterminate one says "working"
+//   toasts       a live status node per message (`kit.TK_ERROR` = "Error: ..."), with the
+//                action and a "Dismiss" button as children -- announced when it appears
+//   modal        a group named by its title with a "Close" button; while open the
+//                caller should add only its own controls under it (the focus trap)
+//   avatar       an image named by the person
+//
+// The names are put in an arena of this object (`names`, 8 KiB): the a11y tree keeps
+// pointers, not copies, and the strings are made here (a label plus its badge, a
+// tile's three lines). `kax_reset` forgets the tree and the arena for the next frame; a
+// program may also describe once after each change instead of each frame.
+//
+// HONEST NOTES
+//   * The tree has no geometry: it says WHAT is there, not WHERE. Wiring it to AT-SPI /
+//     UIA (so that a real screen reader reads it) is the platform step that is still
+//     open; `a11y.a11y_dump` is the text a test compares.
+//   * A part the program draws that is not described here is not in the tree. The
+//     describe functions take the same arguments as the draw functions so that
+//     adding one is the same line as drawing one.
+import std.rt
+import fui.scene
+import fui.widget
+import fui.a11y
+import fui.kit
+import fui.flex
+
+export {
+    KitAx, kax_new, kax_free, kax_reset, kax_root, kax_button, kax_label, kax_tabbar, kax_nav, kax_grid,
+    kax_search, kax_progress, kax_toasts, kax_modal, kax_avatar, kax_heading,
+}
+
+const ARENA_CAP: usize = 8192
+
+struct KitAx {
+    sc: *mut scene.Scene,
+    ax: *mut a11y.A11y,
+    names: rt.Buf, // the composed names; never grown after kax_new (the tree points into it)
+}
+
+fn kax_new(sc: *mut scene.Scene, ax: *mut a11y.A11y) -> KitAx {
+    var kx: KitAx = KitAx { sc: sc, ax: ax, names: rt.buf_new() }
+    rt.buf_reserve(&kx.names, ARENA_CAP)
+    return kx
+}
+
+fn kax_free(kx: *mut KitAx) {
+    rt.buf_free(&(*kx).names)
+}
+
+// Forget the tree and the names: the next frame describes anew.
+fn kax_reset(kx: *mut KitAx) {
+    scene.scene_reset((*kx).sc)
+    a11y.a11y_reset((*kx).ax)
+    rt.buf_clear(&(*kx).names)
+}
+
+// Copies `s` into the arena; the arena view, or `s` itself if the arena is full.
+fn keep(kx: *mut KitAx, s: str) -> str {
+    let len: usize = rt.buf_len(&(*kx).names)
+    if len + s.n + 1 > ARENA_CAP || s.n == 0 {
+        return s
+    }
+    rt.buf_push_bytes(&(*kx).names, s.p as u64, s.n)
+    return str { p: rt.ptr_of(rt.buf_ptr(&(*kx).names) + len as u64), n: s.n }
+}
+
+// a, then ", " and b (if b is not empty), then ", " and c
+fn join3(kx: *mut KitAx, a: str, b: str, c: str) -> str {
+    let len: usize = rt.buf_len(&(*kx).names)
+    let need: usize = a.n + b.n + c.n + 4
+    if len + need > ARENA_CAP {
+        return a
+    }
+    rt.buf_push_bytes(&(*kx).names, a.p as u64, a.n)
+    if b.n > 0 {
+        rt.buf_push(&(*kx).names, 44 as u8)
+        rt.buf_push(&(*kx).names, 32 as u8)
+        rt.buf_push_bytes(&(*kx).names, b.p as u64, b.n)
+    }
+    if c.n > 0 {
+        rt.buf_push(&(*kx).names, 44 as u8)
+        rt.buf_push(&(*kx).names, 32 as u8)
+        rt.buf_push_bytes(&(*kx).names, c.p as u64, c.n)
+    }
+    return str { p: rt.ptr_of(rt.buf_ptr(&(*kx).names) + len as u64), n: rt.buf_len(&(*kx).names) - len }
+}
+
+// (the digits are copied into the arena before the frame ends)
+#[allow_escape]
+fn dec(kx: *mut KitAx, v: usize) -> str {
+    var tmp: [u8; 24] = [0 as u8; 24]
+    let n: usize = kit.fmt_uint(v as u64, &tmp)
+    return keep(kx, str { p: rt.ptr_of((&tmp[0]) as u64), n: n })
+}
+
+fn node(kx: *mut KitAx, parent: usize, kind: u32, name: str) -> usize {
+    let n: usize = scene.scene_widget((*kx).sc, parent, kind, name.p as u64, name.n)
+    if n != scene.SCENE_NONE {
+        a11y.a11y_set_name((*kx).ax, n, name.p as u64, name.n)
+    }
+    return n
+}
+
+// The root of the described window: a column box named by the window title.
+fn kax_root(kx: *mut KitAx, title: str) -> usize {
+    let r: usize = scene.scene_box((*kx).sc, scene.SCENE_NONE, 0 as u32, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_START)
+    if r != scene.SCENE_NONE {
+        let t: str = keep(kx, title)
+        a11y.a11y_set_name((*kx).ax, r, t.p as u64, t.n)
+        a11y.a11y_set_role((*kx).ax, r, a11y.ROLE_GROUP)
+    }
+    return r
+}
+
+// A heading (a section title).
+fn kax_heading(kx: *mut KitAx, parent: usize, text: str) -> usize {
+    let t: str = keep(kx, text)
+    let n: usize = scene.scene_add((*kx).sc, parent, scene.N_TEXT)
+    if n != scene.SCENE_NONE {
+        scene.node_set_text((*kx).sc, n, t.p as u64, t.n)
+        a11y.a11y_set_role((*kx).ax, n, a11y.ROLE_HEADING)
+    }
+    return n
+}
+
+// A plain text.
+fn kax_label(kx: *mut KitAx, parent: usize, text: str) -> usize {
+    let t: str = keep(kx, text)
+    let n: usize = scene.scene_add((*kx).sc, parent, scene.N_TEXT)
+    if n != scene.SCENE_NONE {
+        scene.node_set_text((*kx).sc, n, t.p as u64, t.n)
+    }
+    return n
+}
+
+fn apply_state(kx: *mut KitAx, n: usize, st: u32) {
+    if n == scene.SCENE_NONE {
+        return
+    }
+    let e: *mut widget.Widget = scene.node_widget((*kx).sc, n)
+    if (st & kit.ST_DISABLED) != 0 as u32 {
+        widget.w_set_disabled(e, true)
+    }
+    if (st & kit.ST_FOCUS) != 0 as u32 {
+        widget.w_set_focus(e, true)
+    }
+}
+
+// A button with the label the frame paints and the state bits (`kit.ST_*`) it is drawn with.
+fn kax_button(kx: *mut KitAx, parent: usize, label: str, st: u32) -> usize {
+    let n: usize = node(kx, parent, widget.KIND_BUTTON, keep(kx, label))
+    apply_state(kx, n, st)
+    return n
+}
+
+// The tab bar: a toolbar of tabs "label, badge"; `sel` is the selected index (kit.NONE: none).
+fn kax_tabbar(kx: *mut KitAx, parent: usize, tabs: *mut kit.Tab, n: usize, sel: usize) -> usize {
+    let bar: usize = scene.scene_add((*kx).sc, parent, scene.N_WIDGET)
+    if bar == scene.SCENE_NONE {
+        return bar
+    }
+    scene.node_set_widget_kind((*kx).sc, bar, widget.KIND_TOOLBAR)
+    var i: usize = 0
+    while i < n {
+        let t: *mut kit.Tab = kit.tab_at(tabs, i)
+        var badge: str = ""
+        if (*t).badge > 0 {
+            badge = dec(kx, (*t).badge)
+        }
+        let tn: usize = node(kx, bar, widget.KIND_TAB, join3(kx, (*t).label, badge, ""))
+        if tn != scene.SCENE_NONE && i == sel {
+            widget.w_set_selected(scene.node_widget((*kx).sc, tn), true)
+        }
+        i = i + 1
+    }
+    return bar
+}
+
+// The sidebar: a menu; headers are headings, the other entries menu items, `active` selected.
+fn kax_nav(kx: *mut KitAx, parent: usize, items: *mut kit.NavItem, n: usize, active: usize, collapsed: bool) -> usize {
+    let menu: usize = scene.scene_add((*kx).sc, parent, scene.N_WIDGET)
+    if menu == scene.SCENE_NONE {
+        return menu
+    }
+    scene.node_set_widget_kind((*kx).sc, menu, widget.KIND_MENU)
+    var i: usize = 0
+    while i < n {
+        let it: *mut kit.NavItem = kit.nav_at(items, i)
+        if (*it).header {
+            kax_heading(kx, menu, (*it).label)
+        } else {
+            var badge: str = ""
+            if (*it).badge > 0 {
+                badge = dec(kx, (*it).badge)
+            }
+            let nn: usize = node(kx, menu, widget.KIND_BUTTON, join3(kx, (*it).label, badge, ""))
+            if nn != scene.SCENE_NONE {
+                a11y.a11y_set_role((*kx).ax, nn, a11y.ROLE_MENUITEM)
+                if i == active {
+                    widget.w_set_selected(scene.node_widget((*kx).sc, nn), true)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return menu
+}
+
+// The tile grid: a list of tiles named "title, subtitle, badge"; the selected one is pressed.
+fn kax_grid(kx: *mut KitAx, parent: usize, tiles: *mut kit.Tile, n: usize, selected: usize) -> usize {
+    let list: usize = scene.scene_add((*kx).sc, parent, scene.N_WIDGET)
+    if list == scene.SCENE_NONE {
+        return list
+    }
+    scene.node_set_widget_kind((*kx).sc, list, widget.KIND_LIST)
+    var i: usize = 0
+    while i < n {
+        let t: *mut kit.Tile = kit.tile_at(tiles, i)
+        let tn: usize = node(kx, list, widget.KIND_TILE, join3(kx, (*t).title, (*t).sub, (*t).badge))
+        if tn != scene.SCENE_NONE && i == selected {
+            a11y.a11y_set_toggle((*kx).ax, tn, true)
+            widget.w_set_value(scene.node_widget((*kx).sc, tn), 1)
+        }
+        i = i + 1
+    }
+    return list
+}
+
+// The search field: a text box named by `hint`, holding the text; a Clear button while there is text.
+fn kax_search(kx: *mut KitAx, parent: usize, s: *mut kit.Search, hint: str) -> usize {
+    let tb: usize = node(kx, parent, widget.KIND_TEXTBOX, keep(kx, hint))
+    if tb == scene.SCENE_NONE {
+        return tb
+    }
+    let n: usize = kit.search_text_len(s)
+    if n > 0 {
+        let txt: str = keep(kx, str { p: rt.ptr_of(kit.search_text_ptr(s)), n: n })
+        scene.node_set_text((*kx).sc, tb, txt.p as u64, txt.n)
+        node(kx, parent, widget.KIND_BUTTON, "Clear")
+    }
+    if kit.search_has_focus(s) {
+        widget.w_set_focus(scene.node_widget((*kx).sc, tb), true)
+    }
+    return tb
+}
+
+// A progress bar: `permille` 0..1000 (< 0 = indeterminate), `label` the text it shows (empty: "Progress").
+fn kax_progress(kx: *mut KitAx, parent: usize, permille: i64, label: str) -> usize {
+    var name: str = label
+    if name.n == 0 {
+        name = "Progress"
+    }
+    if permille < 0 as i64 {
+        name = join3(kx, name, "working", "")
+    }
+    let n: usize = node(kx, parent, widget.KIND_PROGRESS, keep(kx, name))
+    if n != scene.SCENE_NONE {
+        var v: i64 = permille
+        if v < 0 {
+            v = 0
+        }
+        if v > 1000 {
+            v = 1000
+        }
+        widget.w_set_value(scene.node_widget((*kx).sc, n), v)
+    }
+    return n
+}
+
+fn toast_kind_word(k: u32) -> str {
+    if k == kit.TK_SUCCESS { return "Success" }
+    if k == kit.TK_WARNING { return "Warning" }
+    if k == kit.TK_ERROR { return "Error" }
+    return "Information"
+}
+
+// The messages on screen: a live status node each ("Error: text"), the action and a Dismiss
+// button as its children. A message that is already fading out is not described.
+fn kax_toasts(kx: *mut KitAx, parent: usize, q: *mut kit.Toasts) -> usize {
+    var first: usize = scene.SCENE_NONE
+    var i: usize = 0
+    while i < 4 {
+        let t: *mut kit.Toast = &(*q).t[i]
+        if (*t).alive && (*t).closing == 0 {
+            let text: str = str { p: rt.ptr_of((&(*t).text[0]) as u64), n: (*t).n }
+            let n: usize = scene.scene_add((*kx).sc, parent, scene.N_WIDGET)
+            if n != scene.SCENE_NONE {
+                scene.node_set_widget_kind((*kx).sc, n, widget.KIND_BADGE)
+                let name: str = join3(kx, toast_kind_word((*t).kind), "", "")
+                var full: str = keep(kx, text)
+                // "Error: text": the kind word, a colon, the text
+                let len: usize = rt.buf_len(&(*kx).names)
+                if len + name.n + full.n + 3 <= ARENA_CAP {
+                    rt.buf_push_bytes(&(*kx).names, name.p as u64, name.n)
+                    rt.buf_push(&(*kx).names, 58 as u8)
+                    rt.buf_push(&(*kx).names, 32 as u8)
+                    rt.buf_push_bytes(&(*kx).names, full.p as u64, full.n)
+                    full = str { p: rt.ptr_of(rt.buf_ptr(&(*kx).names) + len as u64), n: rt.buf_len(&(*kx).names) - len }
+                }
+                scene.node_set_text((*kx).sc, n, full.p as u64, full.n)
+                a11y.a11y_set_name((*kx).ax, n, full.p as u64, full.n)
+                scene.node_set_live((*kx).sc, n, true)
+                if (*t).an > 0 {
+                    node(kx, n, widget.KIND_BUTTON, keep(kx, str { p: rt.ptr_of((&(*t).action[0]) as u64), n: (*t).an }))
+                }
+                node(kx, n, widget.KIND_BUTTON, "Dismiss")
+                if first == scene.SCENE_NONE {
+                    first = n
+                }
+            }
+        }
+        i = i + 1
+    }
+    return first
+}
+
+// The open dialog: a group named by its title, with a Close button. SCENE_NONE while closed.
+// The program describes its own controls under the returned node (the focus trap).
+fn kax_modal(kx: *mut KitAx, parent: usize, m: *mut kit.Modal) -> usize {
+    if !kit.modal_blocks(m) {
+        return scene.SCENE_NONE
+    }
+    let title: str = keep(kx, str { p: rt.ptr_of((&(*m).title[0]) as u64), n: (*m).tn })
+    let g: usize = scene.scene_add((*kx).sc, parent, scene.N_WIDGET)
+    if g == scene.SCENE_NONE {
+        return g
+    }
+    scene.node_set_widget_kind((*kx).sc, g, widget.KIND_GROUPBOX)
+    a11y.a11y_set_name((*kx).ax, g, title.p as u64, title.n)
+    node(kx, g, widget.KIND_BUTTON, "Close")
+    return g
+}
+
+// A person's picture (an avatar): an image named by the person.
+fn kax_avatar(kx: *mut KitAx, parent: usize, name: str) -> usize {
+    let n: usize = scene.scene_add((*kx).sc, parent, scene.N_BOX)
+    if n != scene.SCENE_NONE {
+        let t: str = keep(kx, name)
+        a11y.a11y_set_name((*kx).ax, n, t.p as u64, t.n)
+        a11y.a11y_set_role((*kx).ax, n, a11y.ROLE_IMAGE)
+    }
+    return n
+}

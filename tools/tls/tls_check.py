@@ -18,7 +18,7 @@ THE COUNTER-CHECKS ARE THE POINT. A client that ignores certificates
 connects to everything and looks perfect in a table of successes. So the
 list below contains servers that this client MUST refuse -- an expired
 certificate, a name that does not match, an issuer nobody signed for, a
-server that will only speak TLS 1.2, a server that offers only a cipher
+server that offers only a cipher
 suite this client does not have -- and a man in the middle that flips one
 bit of one record, which must come back as a decryption failure and not as
 a page.
@@ -301,16 +301,15 @@ def main():
         ("an empty trust store trusts nothing", "rsa.crt", "rsa.key", [],
          "localhost", empty,
          {"ERRCertificate": "", "VERIFY": "UNKNOWN_ISSUER"}, True),
-        # A TLS 1.2-only OpenSSL does not answer with a TLS 1.2
-        # ServerHello -- it reads `supported_versions` with only 0x0304 in
-        # it and sends `protocol_version` (alert 70). That refusal is the
-        # right outcome and the alert number is what is checked, so that
-        # this case cannot be passed by failing for some other reason.
-        ("the server will only speak TLS 1.2", "rsa.crt", "rsa.key",
-         ["-tls1_2"], "localhost", ca,
-         {"ERRAlert": "", "ALERT": "70"}, True),
-        ("the server offers only a suite we do not have", "rsa.crt",
-         "rsa.key", ["-ciphersuites", "TLS_AES_256_GCM_SHA384"],
+        # A TLS 1.2-only OpenSSL used to be REFUSED here (alert 70,
+        # protocol_version): the client offered 1.3 only. Since round TLS12
+        # the one ClientHello offers 1.2 as well and the handshake succeeds;
+        # tools/tls/tls12_check.py holds the 1.2 half in detail.
+        ("the server will only speak TLS 1.2 (reachable since round TLS12)",
+         "rsa.crt", "rsa.key", ["-tls1_2"], "localhost", ca,
+         {"SUITE": "49199", "VERIFY": "OK"}, False),
+        ("the server offers only a TLS 1.3 suite we do not have", "rsa.crt",
+         "rsa.key", ["-no_tls1_2", "-ciphersuites", "TLS_AES_256_GCM_SHA384"],
          "localhost", ca, {"ERRAlert": ""}, True),
     ]
     port = PORT

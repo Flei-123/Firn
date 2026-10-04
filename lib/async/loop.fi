@@ -1,0 +1,991 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/async/loop.fi -- an event loop: sockets, timers, wake-up, callbacks.
+//
+// One thread waits for MANY descriptors at once and calls a function when
+// one of them can be read or written; the same thread fires timers. That is
+// the whole idea, and it is what turns "one thread per connection" (std.net,
+// round 76) into "one thread per program": a launcher that downloads 3000
+// files, a chat that keeps a WebSocket open and draws at 60 frames a second.
+//
+//     import async.loop
+//
+//     fn on_tick(l: *mut loop.Loop, ud: u64) { ... }
+//     fn on_readable(l: *mut loop.Loop, ud: u64, ev: u32) { ... }
+//
+//     var l: loop.Loop = loop.loop_new()
+//     loop.loop_init(&l)
+//     loop.timer_every(&l, 1000, on_tick, 0)
+//     let w: u64 = loop.watch_add(&l, fd, loop.EV_READ, on_readable, 0)
+//     loop.run(&l)                       // until loop.stop(&l) or nothing is left
+//
+// ============================================================== THE PIECES
+//
+//   WATCH  `watch_add(fd, events, cb, ud)` -> handle. `cb(loop, ud, revents)`
+//          is called while the descriptor is readable (EV_READ) / writable
+//          (EV_WRITE); EV_ERR and EV_HUP are always reported. LEVEL
+//          triggered: a callback that does not read everything is called
+//          again. `watch_mod` changes the interest, `watch_del` removes.
+//          A handle carries a generation: a callback that deletes ANOTHER
+//          watch in the same round does not get a stale event for it.
+//   TIMER  `timer_after(ms, cb, ud)`, `timer_every(ms, cb, ud)`, `timer_cancel`.
+//          A heap ordered by (due time, creation order): timers set for the
+//          same moment fire in the order they were set. A timer set by a
+//          callback fires in the NEXT round at the earliest.
+//   DEFER  `defer_call(cb, ud)`: run `cb` at the start of the next round
+//          ("call soon"). It never runs inside the caller.
+//   WAKE   `wake(&l)`: the ONE function that may be called from another
+//          thread (or a signal handler). It makes a sleeping loop return from
+//          its wait. eventfd(2) on Linux, a loopback socket pair where there
+//          is no eventfd (Windows). `lib/async/post.fi` builds a queue of
+//          closures on top of it.
+//   EMBED  `loop_fd(&l)` is a descriptor that is READABLE while the loop has
+//          something to do (the epoll descriptor itself). A program that
+//          already waits on something else -- a GUI main loop with
+//          `window.wait_any` -- puts this one into its own poll and calls
+//          `run_once(&l, 0)` when it fires. -1 where there is none.
+//
+// ============================================================== THE BACKENDS
+//
+//   epoll   Linux x86-64 and AArch64. O(1) per ready descriptor, so a
+//           thousand idle connections cost nothing. The `epoll_event`
+//           record is PACKED (12 octets) on x86-64 and 16 octets on AArch64;
+//           the loop asks uname(2) which one it is on.
+//   poll    everywhere: the same call the window layer uses (`poll(2)`;
+//           ppoll on AArch64; the Windows seam answers it with select, which
+//           caps a round at 64 sockets -- see A5). The array is rebuilt in
+//           every round, O(n).
+//
+// `loop_init` takes epoll when the kernel has it and poll otherwise;
+// `loop_init_poll` forces poll (the tests run both).
+//
+// ==================================================================== HONEST
+//
+// A1  ONE THREAD. Every function except `wake` must be called from the
+//     thread that runs the loop. Nothing here is locked.
+// A2  CALLBACKS ARE FUNCTION VALUES WITH A `u64` ARGUMENT. The loop keeps
+//     them as plain addresses in memory the collector does not scan: pass
+//     functions WITHOUT captured variables, and keep what `ud` points to
+//     alive yourself (the same rule as std.pool, Q1).
+// A3  LEVEL TRIGGERED, no edge triggering, no EPOLLONESHOT: simple to get
+//     right; a callback that cannot make progress should `watch_mod` the
+//     interest away instead of ignoring the event, or the loop spins.
+// A4  TIME IS MILLISECONDS from CLOCK_MONOTONIC. A timer fires at the first
+//     round after its time; there is no promise tighter than that, and a
+//     callback that runs for 50 ms delays every timer behind it by 50 ms.
+// A5  WINDOWS: the seam's poll is select(): at most 64 sockets per round and
+//     at most 256 descriptors in the whole process (the seam's table).
+//     Threads do not exist there yet (std.pool Q6), so `wake` has no thread to
+//     be called from; it still works (the pair), it is just never needed.
+// A6  NO EPOLLRDHUP, no priority data. A half-closed peer shows up as a read
+//     that returns 0.
+import std.rt
+import std.net
+
+export {
+    Loop,
+    EV_READ, EV_WRITE, EV_ERR, EV_HUP,
+    loop_new, loop_init, loop_init_poll, loop_free,
+    watch_add, watch_mod, watch_del, watch_count,
+    timer_after, timer_every, timer_cancel, timer_count, timer_next_ms,
+    defer_call, wake, loop_fd, embed_wait_ms, set_wake_hook, wake_hook_fn, wake_hook_ud, set_block_hooks,
+    run_once, run, stop, set_keep_alive,
+    mono_ms, now_cached,
+    is_epoll, backend_name, wake_kind, socket_limit,
+    stat_rounds, stat_events, stat_timers, stat_defers, stat_wakes,
+}
+
+// poll(2) and epoll(7) agree on these four bits, which is why one set of
+// constants serves both backends.
+const EV_READ: u32 = 1
+const EV_WRITE: u32 = 4
+const EV_ERR: u32 = 8
+const EV_HUP: u32 = 16
+
+const SYS_READ: i64 = 0
+const SYS_WRITE: i64 = 1
+const SYS_CLOSE: i64 = 3
+const SYS_POLL: i64 = 7
+const SYS_UNAME: i64 = 63
+const SYS_CLOCK: i64 = 228
+const SYS_EPOLL_CTL: i64 = 233
+const SYS_EPOLL_PWAIT: i64 = 281
+const SYS_EVENTFD2: i64 = 290
+const SYS_EPOLL_CREATE1: i64 = 291
+
+const EPOLL_CTL_ADD: i64 = 1
+const EPOLL_CTL_DEL: i64 = 2
+const EPOLL_CTL_MOD: i64 = 3
+const EFD_NONBLOCK: i64 = 2048
+const O_CLOEXEC: i64 = 524288
+
+const MAX_EVENTS: usize = 256
+
+const WATCH_WORDS: usize = 6
+const W_FD: usize = 0
+const W_EV: usize = 1
+const W_CB: usize = 2
+const W_UD: usize = 3
+const W_GEN: usize = 4
+const W_LINK: usize = 5 // bit 0: in use; bits 8..: next free slot + 1
+
+const TIMER_WORDS: usize = 8
+const T_DUE: usize = 0
+const T_IVL: usize = 1
+const T_CB: usize = 2
+const T_UD: usize = 3
+const T_GEN: usize = 4
+const T_LINK: usize = 5
+const T_POS: usize = 6
+const T_SEQ: usize = 7
+
+const MASK32: u64 = 4294967295
+
+struct Loop {
+    ep: i32, // epoll descriptor, -1 = poll backend
+    use_ep: bool,
+    seam: bool, // uname failed: not a Linux kernel (the Windows seam)
+    stride: usize, // size of an epoll_event on this machine
+    doff: usize, // offset of its data member
+    wr: i32, // wake-up: the side that is read
+    ww: i32, // ... and the side that is written (the same for an eventfd)
+    wkind: u32, // 0 none, 1 eventfd, 2 loopback pair
+    watches: rt.Buf,
+    nslots: usize,
+    wfree: usize, // first free slot + 1, 0 = none
+    nwatch: usize,
+    timers: rt.Buf,
+    ntslots: usize,
+    tfree: usize,
+    heap: rt.Buf, // slots of the timers, a binary min-heap
+    nheap: usize,
+    tseq: u64,
+    defers: rt.Buf, // (callback, argument) pairs
+    ndefer: usize,
+    evbuf: rt.Buf, // epoll_event records
+    pfds: rt.Buf, // pollfd records of the poll backend
+    pmap: rt.Buf, // ... and the handle each one belongs to
+    whook: u64, // called on the loop thread after a wake-up (post.fi)
+    wud: u64,
+    bin: u64, // called before / after the loop sleeps in the kernel (post.fi)
+    bout: u64,
+    stopped: bool,
+    keep: bool,
+    now: i64, // the clock as of the start of this round
+    rounds: u64,
+    events: u64,
+    fired: u64,
+    deferred_run: u64,
+    wakes: u64,
+}
+
+fn loop_new() -> Loop {
+    return Loop { ep: 0 - 1, use_ep: false, seam: false, stride: 12, doff: 4,
+        wr: 0 - 1, ww: 0 - 1, wkind: 0,
+        watches: rt.buf_new(), nslots: 0, wfree: 0, nwatch: 0,
+        timers: rt.buf_new(), ntslots: 0, tfree: 0,
+        heap: rt.buf_new(), nheap: 0, tseq: 0,
+        defers: rt.buf_new(), ndefer: 0,
+        evbuf: rt.buf_new(), pfds: rt.buf_new(), pmap: rt.buf_new(),
+        whook: 0, wud: 0, bin: 0, bout: 0, stopped: false, keep: false, now: 0,
+        rounds: 0, events: 0, fired: 0, deferred_run: 0, wakes: 0 }
+}
+
+// ------------------------------------------------------------------ Clock
+
+fn mono_ms() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(SYS_CLOCK, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000 + ts[1] / 1000000
+}
+
+// The clock as of the start of the current round (cheap; a callback that
+// wants the exact time calls `mono_ms`).
+fn now_cached(l: *mut Loop) -> i64 { return (*l).now }
+
+// ---------------------------------------------------------------- Records
+
+fn wget(l: *mut Loop, slot: usize, k: usize) -> u64 {
+    return rt.ld64((*l).watches.ptr, slot * WATCH_WORDS + k)
+}
+
+fn wput(l: *mut Loop, slot: usize, k: usize, v: u64) {
+    rt.st64((*l).watches.ptr, slot * WATCH_WORDS + k, v)
+}
+
+fn tget(l: *mut Loop, slot: usize, k: usize) -> u64 {
+    return rt.ld64((*l).timers.ptr, slot * TIMER_WORDS + k)
+}
+
+fn tput(l: *mut Loop, slot: usize, k: usize, v: u64) {
+    rt.st64((*l).timers.ptr, slot * TIMER_WORDS + k, v)
+}
+
+fn make_handle(gen: u64, slot: usize) -> u64 {
+    return ((gen & MASK32) << 32) | (slot as u64 + 1)
+}
+
+// The slot a watch handle names, or -1 when it is stale / not a handle.
+fn watch_slot(l: *mut Loop, h: u64) -> i64 {
+    let lo: u64 = h & MASK32
+    if lo == 0 || lo as usize > (*l).nslots {
+        return 0 - 1
+    }
+    let slot: usize = (lo - 1) as usize
+    if (wget(l, slot, W_LINK) & 1) == 0 {
+        return 0 - 1
+    }
+    if (wget(l, slot, W_GEN) & MASK32) != (h >> 32) {
+        return 0 - 1
+    }
+    return slot as i64
+}
+
+fn timer_slot(l: *mut Loop, h: u64) -> i64 {
+    let lo: u64 = h & MASK32
+    if lo == 0 || lo as usize > (*l).ntslots {
+        return 0 - 1
+    }
+    let slot: usize = (lo - 1) as usize
+    if (tget(l, slot, T_LINK) & 1) == 0 {
+        return 0 - 1
+    }
+    if (tget(l, slot, T_GEN) & MASK32) != (h >> 32) {
+        return 0 - 1
+    }
+    return slot as i64
+}
+
+// ------------------------------------------------------------- epoll glue
+
+fn failed(r: i64) -> bool {
+    return r < 0 && r > 0 - 4096
+}
+
+// events u32 at 0, the 64-bit data at `doff`
+fn ep_event(l: *mut Loop, buf: u64, ev: u32, data: u64) {
+    rt.st64(buf, 0, 0)
+    rt.st64(buf, 1, 0)
+    rt.st32(buf, 0, ev)
+    rt.st64(buf + (*l).doff as u64, 0, data)
+}
+
+fn ep_ctl(l: *mut Loop, op: i64, fd: i32, ev: u32, data: u64) -> bool {
+    var rec: [u64; 2] = [0; 2]
+    ep_event(l, (&rec[0]) as u64, ev, data)
+    let r: i64 = syscall(SYS_EPOLL_CTL, (*l).ep as i64, op, fd as i64,
+        (&rec[0]) as i64, 0, 0)
+    return !failed(r)
+}
+
+// x86-64 packs the record (12 octets); everything else keeps the natural
+// layout (16). A failed uname means "not Linux": the packed default is never
+// used then, because epoll_create1 fails first.
+fn detect_layout(l: *mut Loop) {
+    var u: [u8; 390] = [0; 390]
+    let r: i64 = syscall(SYS_UNAME, (&u[0]) as i64, 0, 0, 0, 0, 0)
+    (*l).stride = 12
+    (*l).doff = 4
+    (*l).seam = r != 0
+    if r == 0 {
+        // utsname.machine is the fifth field of 65 octets
+        let isx86: bool = u[260] == 120 as u8 && u[261] == 56 as u8 && u[262] == 54 as u8
+        if !isx86 {
+            (*l).stride = 16
+            (*l).doff = 8
+        }
+    }
+}
+
+// --------------------------------------------------------------- Wake-up
+
+fn wake_setup(l: *mut Loop) -> bool {
+    let fd: i64 = syscall(SYS_EVENTFD2, 0, EFD_NONBLOCK | O_CLOEXEC, 0, 0, 0, 0)
+    if !failed(fd) {
+        (*l).wr = fd as i32
+        (*l).ww = fd as i32
+        (*l).wkind = 1
+        return true
+    }
+    // No eventfd (Windows, an old kernel): a connected pair of loopback
+    // sockets. The listener lives only as long as this function.
+    var lst: net.Listener = net.listen_tcp(net.ADDR_LOCAL, 0 as u16) catch net.listener_from_fd(0 - 1)
+    if !net.listener_is_open(&lst) {
+        return false
+    }
+    var a: net.Conn = net.connect_tcp(net.ADDR_LOCAL, net.listener_port(&lst)) catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&a) {
+        net.close_listener(&lst)
+        return false
+    }
+    var b: net.Conn = net.accept(&lst) catch net.conn_from_fd(0 - 1)
+    net.close_listener(&lst)
+    if !net.conn_is_open(&b) {
+        net.close(&a)
+        return false
+    }
+    net.set_no_delay(&a, true) catch false
+    net.set_nonblocking_fd(a.fd, true)
+    net.set_nonblocking_fd(b.fd, true)
+    (*l).wr = b.fd
+    (*l).ww = a.fd
+    (*l).wkind = 2
+    return true
+}
+
+// Callable from ANY thread. The write of one octet (a counter for an
+// eventfd) is atomic in the kernel; nothing of the loop is touched but two
+// descriptors that never change after `loop_init`.
+fn wake(l: *mut Loop) {
+    if (*l).ww < 0 {
+        return
+    }
+    var one: [u64; 1] = [1; 1]
+    var n: i64 = 8
+    if (*l).wkind == 2 {
+        n = 1
+    }
+    syscall(SYS_WRITE, (*l).ww as i64, (&one[0]) as i64, n, 0, 0, 0)
+}
+
+fn wake_drain(l: *mut Loop) {
+    var sink: [u64; 32] = [0; 32]
+    var n: i64 = 8
+    if (*l).wkind == 2 {
+        n = 256
+    }
+    syscall(SYS_READ, (*l).wr as i64, (&sink[0]) as i64, n, 0, 0, 0)
+    (*l).wakes = (*l).wakes + 1
+    if (*l).whook != 0 {
+        let h: fn(*mut Loop, u64) = (*l).whook as fn(*mut Loop, u64)
+        h(l, (*l).wud)
+    }
+}
+
+// `h(loop, ud)` runs on the loop thread every time the loop was woken by
+// `wake`, while the wake-up event is handled. One hook per loop
+// (lib/async/post.fi takes it).
+fn wake_hook_fn(l: *mut Loop) -> u64 { return (*l).whook }
+fn wake_hook_ud(l: *mut Loop) -> u64 { return (*l).wud }
+
+fn set_wake_hook(l: *mut Loop, h: fn(*mut Loop, u64), ud: u64) {
+    (*l).whook = h as u64
+    (*l).wud = ud
+}
+
+// In a program with several threads the collector must be able to run while
+// this thread sleeps in epoll_wait/poll: the thread runtime wants the sleep
+// announced (`thread_blocking_an` / `thread_blocking_out`, round 49). Those
+// are thread builtins, which a single-threaded program -- and the AArch64
+// and Windows targets -- must not be forced to carry, so the loop only calls
+// two hooks and lib/async/post.fi, the thread-aware part, sets them.
+fn set_block_hooks(l: *mut Loop, before: fn(), after: fn()) {
+    (*l).bin = before as u64
+    (*l).bout = after as u64
+}
+
+fn sleep_in(l: *mut Loop, wait: i64) {
+    if (*l).bin != 0 && wait != 0 {
+        let h: fn() = (*l).bin as fn()
+        h()
+    }
+}
+
+fn sleep_out(l: *mut Loop, wait: i64) {
+    if (*l).bout != 0 && wait != 0 {
+        let h: fn() = (*l).bout as fn()
+        h()
+    }
+}
+
+// ------------------------------------------------------------ Life cycle
+
+fn init_common(l: *mut Loop, force_poll: bool) -> bool {
+    detect_layout(l)
+    rt.buf_reserve(&(*l).evbuf, MAX_EVENTS * 16)
+    if (*l).evbuf.cap < MAX_EVENTS * 16 {
+        return false
+    }
+    if !wake_setup(l) {
+        return false
+    }
+    (*l).ep = 0 - 1
+    (*l).use_ep = false
+    if !force_poll {
+        let e: i64 = syscall(SYS_EPOLL_CREATE1, O_CLOEXEC, 0, 0, 0, 0, 0)
+        if !failed(e) {
+            (*l).ep = e as i32
+            (*l).use_ep = true
+            if !ep_ctl(l, EPOLL_CTL_ADD, (*l).wr, EV_READ, 0) {
+                syscall(SYS_CLOSE, e, 0, 0, 0, 0, 0)
+                (*l).ep = 0 - 1
+                (*l).use_ep = false
+            }
+        }
+    }
+    (*l).now = mono_ms()
+    return true
+}
+
+fn loop_init(l: *mut Loop) -> bool {
+    return init_common(l, false)
+}
+
+// The poll backend even where epoll exists.
+fn loop_init_poll(l: *mut Loop) -> bool {
+    return init_common(l, true)
+}
+
+fn loop_free(l: *mut Loop) {
+    if (*l).ep >= 0 {
+        syscall(SYS_CLOSE, (*l).ep as i64, 0, 0, 0, 0, 0)
+    }
+    if (*l).wr >= 0 {
+        syscall(SYS_CLOSE, (*l).wr as i64, 0, 0, 0, 0, 0)
+    }
+    if (*l).ww >= 0 && (*l).ww != (*l).wr {
+        syscall(SYS_CLOSE, (*l).ww as i64, 0, 0, 0, 0, 0)
+    }
+    (*l).ep = 0 - 1
+    (*l).wr = 0 - 1
+    (*l).ww = 0 - 1
+    rt.buf_free(&(*l).watches)
+    rt.buf_free(&(*l).timers)
+    rt.buf_free(&(*l).heap)
+    rt.buf_free(&(*l).defers)
+    rt.buf_free(&(*l).evbuf)
+    rt.buf_free(&(*l).pfds)
+    rt.buf_free(&(*l).pmap)
+    (*l).nslots = 0
+    (*l).wfree = 0
+    (*l).nwatch = 0
+    (*l).ntslots = 0
+    (*l).tfree = 0
+    (*l).nheap = 0
+    (*l).ndefer = 0
+}
+
+fn is_epoll(l: *mut Loop) -> bool { return (*l).use_ep }
+fn wake_kind(l: *mut Loop) -> u32 { return (*l).wkind }
+
+// How many sockets one loop can watch: 0 = no practical limit (Linux),
+// otherwise the number (Windows: the seam's poll is select(), A5).
+fn socket_limit(l: *mut Loop) -> usize {
+    if (*l).seam {
+        return 60
+    }
+    return 0
+}
+
+fn backend_name(l: *mut Loop, out: *mut rt.Buf) {
+    if (*l).use_ep {
+        rt.buf_push_bytes(out, "epoll".p as u64, 5)
+    } else {
+        rt.buf_push_bytes(out, "poll".p as u64, 4)
+    }
+}
+
+// The descriptor to put into somebody else's poll (see EMBED above).
+fn loop_fd(l: *mut Loop) -> i32 {
+    if (*l).use_ep {
+        return (*l).ep
+    }
+    return 0 - 1
+}
+
+// How long a program that waits on ITS OWN things (a window) and on
+// `loop_fd` may sleep at most: 0 when a deferred call is waiting, the time
+// to the next timer, `cap_ms` otherwise -- and at most 10 ms when the loop
+// has no pollable descriptor (`loop_fd` = -1), so that it is stepped often
+// enough. Timers are not descriptors: without this limit a due timer would
+// wait for the next window event.
+fn embed_wait_ms(l: *mut Loop, cap_ms: i64) -> i64 {
+    if (*l).ndefer > 0 {
+        return 0
+    }
+    var ms: i64 = cap_ms
+    if !(*l).use_ep && (ms < 0 || ms > 10) {
+        ms = 10
+    }
+    if (*l).nheap > 0 {
+        let tw: i64 = timer_next_ms(l)
+        if ms < 0 || tw < ms {
+            ms = tw
+        }
+    }
+    return ms
+}
+
+fn stat_rounds(l: *mut Loop) -> u64 { return (*l).rounds }
+fn stat_events(l: *mut Loop) -> u64 { return (*l).events }
+fn stat_timers(l: *mut Loop) -> u64 { return (*l).fired }
+fn stat_defers(l: *mut Loop) -> u64 { return (*l).deferred_run }
+fn stat_wakes(l: *mut Loop) -> u64 { return (*l).wakes }
+
+// ---------------------------------------------------------------- Watches
+
+// Registers `fd`. 0 = failed (out of memory, or the kernel refused the
+// descriptor: a regular file cannot be watched with epoll).
+fn watch_add(l: *mut Loop, fd: i32, events: u32,
+    cb: fn(*mut Loop, u64, u32), ud: u64) -> u64 {
+    if fd < 0 {
+        return 0
+    }
+    var slot: usize = 0
+    if (*l).wfree != 0 {
+        slot = (*l).wfree - 1
+        (*l).wfree = (wget(l, slot, W_LINK) >> 8) as usize
+    } else {
+        slot = (*l).nslots
+        let need: usize = (slot + 1) * WATCH_WORDS * 8
+        rt.buf_reserve(&(*l).watches, need)
+        if (*l).watches.cap < need {
+            return 0
+        }
+        rt.buf_set_len(&(*l).watches, need)
+        (*l).nslots = slot + 1
+        wput(l, slot, W_GEN, 0)
+    }
+    let gen: u64 = (wget(l, slot, W_GEN) + 1) & MASK32
+    wput(l, slot, W_GEN, gen)
+    wput(l, slot, W_FD, fd as u64)
+    wput(l, slot, W_EV, events as u64)
+    wput(l, slot, W_CB, cb as u64)
+    wput(l, slot, W_UD, ud)
+    wput(l, slot, W_LINK, 1)
+    let h: u64 = make_handle(gen, slot)
+    if (*l).use_ep {
+        if !ep_ctl(l, EPOLL_CTL_ADD, fd, events, h) {
+            wput(l, slot, W_LINK, ((*l).wfree as u64) << 8)
+            (*l).wfree = slot + 1
+            return 0
+        }
+    }
+    (*l).nwatch = (*l).nwatch + 1
+    return h
+}
+
+fn watch_mod(l: *mut Loop, h: u64, events: u32) -> bool {
+    let s: i64 = watch_slot(l, h)
+    if s < 0 {
+        return false
+    }
+    let slot: usize = s as usize
+    if wget(l, slot, W_EV) == events as u64 {
+        return true
+    }
+    if (*l).use_ep {
+        if !ep_ctl(l, EPOLL_CTL_MOD, wget(l, slot, W_FD) as i32, events, h) {
+            return false
+        }
+    }
+    wput(l, slot, W_EV, events as u64)
+    return true
+}
+
+// Idempotent: a stale or zero handle is ignored. The descriptor is NOT
+// closed -- the caller owns it.
+fn watch_del(l: *mut Loop, h: u64) {
+    let s: i64 = watch_slot(l, h)
+    if s < 0 {
+        return
+    }
+    let slot: usize = s as usize
+    if (*l).use_ep {
+        ep_ctl(l, EPOLL_CTL_DEL, wget(l, slot, W_FD) as i32, 0, 0)
+    }
+    wput(l, slot, W_LINK, ((*l).wfree as u64) << 8)
+    (*l).wfree = slot + 1
+    (*l).nwatch = (*l).nwatch - 1
+}
+
+fn watch_count(l: *mut Loop) -> usize { return (*l).nwatch }
+
+// ----------------------------------------------------------------- Timers
+
+fn heap_slot(l: *mut Loop, i: usize) -> usize {
+    return rt.ld64((*l).heap.ptr, i) as usize
+}
+
+fn heap_put(l: *mut Loop, i: usize, slot: usize) {
+    rt.st64((*l).heap.ptr, i, slot as u64)
+    tput(l, slot, T_POS, i as u64)
+}
+
+// is the timer in slot a before the one in slot b?
+fn t_before(l: *mut Loop, a: usize, b: usize) -> bool {
+    let da: i64 = tget(l, a, T_DUE) as i64
+    let db: i64 = tget(l, b, T_DUE) as i64
+    if da != db {
+        return da < db
+    }
+    return tget(l, a, T_SEQ) < tget(l, b, T_SEQ)
+}
+
+fn sift_up(l: *mut Loop, start: usize) {
+    var i: usize = start
+    let s: usize = heap_slot(l, i)
+    while i > 0 {
+        let p: usize = (i - 1) / 2
+        let ps: usize = heap_slot(l, p)
+        if !t_before(l, s, ps) {
+            break
+        }
+        heap_put(l, i, ps)
+        i = p
+    }
+    heap_put(l, i, s)
+}
+
+fn sift_down(l: *mut Loop, start: usize) {
+    var i: usize = start
+    let s: usize = heap_slot(l, i)
+    while true {
+        var c: usize = 2 * i + 1
+        if c >= (*l).nheap {
+            break
+        }
+        if c + 1 < (*l).nheap && t_before(l, heap_slot(l, c + 1), heap_slot(l, c)) {
+            c = c + 1
+        }
+        let cs: usize = heap_slot(l, c)
+        if !t_before(l, cs, s) {
+            break
+        }
+        heap_put(l, i, cs)
+        i = c
+    }
+    heap_put(l, i, s)
+}
+
+// Takes the timer at heap position `pos` out of the heap (the slot is NOT
+// freed here).
+fn heap_remove(l: *mut Loop, pos: usize) {
+    let last: usize = (*l).nheap - 1
+    (*l).nheap = last
+    if pos == last {
+        return
+    }
+    heap_put(l, pos, heap_slot(l, last))
+    sift_down(l, pos)
+    sift_up(l, pos)
+}
+
+fn timer_free_slot(l: *mut Loop, slot: usize) {
+    tput(l, slot, T_LINK, ((*l).tfree as u64) << 8)
+    (*l).tfree = slot + 1
+}
+
+fn timer_new(l: *mut Loop, ms: i64, ivl: i64, cb: fn(*mut Loop, u64), ud: u64) -> u64 {
+    var slot: usize = 0
+    if (*l).tfree != 0 {
+        slot = (*l).tfree - 1
+        (*l).tfree = (tget(l, slot, T_LINK) >> 8) as usize
+    } else {
+        slot = (*l).ntslots
+        let need: usize = (slot + 1) * TIMER_WORDS * 8
+        rt.buf_reserve(&(*l).timers, need)
+        if (*l).timers.cap < need {
+            return 0
+        }
+        rt.buf_set_len(&(*l).timers, need)
+        (*l).ntslots = slot + 1
+        tput(l, slot, T_GEN, 0)
+    }
+    let hneed: usize = ((*l).nheap + 1) * 8
+    rt.buf_reserve(&(*l).heap, hneed)
+    if (*l).heap.cap < hneed {
+        timer_free_slot(l, slot)
+        return 0
+    }
+    rt.buf_set_len(&(*l).heap, hneed)
+    var wait: i64 = ms
+    if wait < 0 {
+        wait = 0
+    }
+    let gen: u64 = (tget(l, slot, T_GEN) + 1) & MASK32
+    tput(l, slot, T_GEN, gen)
+    tput(l, slot, T_DUE, (mono_ms() + wait) as u64)
+    tput(l, slot, T_IVL, ivl as u64)
+    tput(l, slot, T_CB, cb as u64)
+    tput(l, slot, T_UD, ud)
+    tput(l, slot, T_LINK, 1)
+    (*l).tseq = (*l).tseq + 1
+    tput(l, slot, T_SEQ, (*l).tseq)
+    heap_put(l, (*l).nheap, slot)
+    (*l).nheap = (*l).nheap + 1
+    sift_up(l, (*l).nheap - 1)
+    return make_handle(gen, slot)
+}
+
+// `cb(loop, ud)` once, `ms` from now. 0 = out of memory.
+fn timer_after(l: *mut Loop, ms: i64, cb: fn(*mut Loop, u64), ud: u64) -> u64 {
+    return timer_new(l, ms, 0, cb, ud)
+}
+
+// ... and again every `ms` (at least 1) until cancelled.
+fn timer_every(l: *mut Loop, ms: i64, cb: fn(*mut Loop, u64), ud: u64) -> u64 {
+    var p: i64 = ms
+    if p < 1 {
+        p = 1
+    }
+    return timer_new(l, p, p, cb, ud)
+}
+
+// True when the timer was still pending. A fired one-shot, a cancelled
+// one or 0 give false -- so cancelling twice is harmless.
+fn timer_cancel(l: *mut Loop, h: u64) -> bool {
+    let s: i64 = timer_slot(l, h)
+    if s < 0 {
+        return false
+    }
+    let slot: usize = s as usize
+    heap_remove(l, tget(l, slot, T_POS) as usize)
+    timer_free_slot(l, slot)
+    return true
+}
+
+fn timer_count(l: *mut Loop) -> usize { return (*l).nheap }
+
+// Milliseconds until the first timer is due (0 = overdue), -1 = no timer.
+fn timer_next_ms(l: *mut Loop) -> i64 {
+    if (*l).nheap == 0 {
+        return 0 - 1
+    }
+    let due: i64 = tget(l, heap_slot(l, 0), T_DUE) as i64
+    let w: i64 = due - mono_ms()
+    if w < 0 {
+        return 0
+    }
+    return w
+}
+
+fn fire_timers(l: *mut Loop) -> u64 {
+    // Only timers that existed when the round began: a callback that sets a
+    // timer of 0 ms gets it in the NEXT round (otherwise two such timers
+    // could keep each other, and the loop, busy forever).
+    let limit: u64 = (*l).tseq
+    var n: u64 = 0
+    while (*l).nheap > 0 {
+        let slot: usize = heap_slot(l, 0)
+        if (tget(l, slot, T_DUE) as i64) > (*l).now || tget(l, slot, T_SEQ) > limit {
+            break
+        }
+        let cb: fn(*mut Loop, u64) = tget(l, slot, T_CB) as fn(*mut Loop, u64)
+        let ud: u64 = tget(l, slot, T_UD)
+        let ivl: i64 = tget(l, slot, T_IVL) as i64
+        if ivl > 0 {
+            // re-arm first, so that the callback can cancel itself
+            var due: i64 = (tget(l, slot, T_DUE) as i64) + ivl
+            if due <= (*l).now {
+                due = (*l).now + ivl
+            }
+            tput(l, slot, T_DUE, due as u64)
+            (*l).tseq = (*l).tseq + 1
+            tput(l, slot, T_SEQ, (*l).tseq)
+            sift_down(l, 0)
+        } else {
+            heap_remove(l, 0)
+            timer_free_slot(l, slot)
+        }
+        n = n + 1
+        (*l).fired = (*l).fired + 1
+        cb(l, ud)
+    }
+    return n
+}
+
+// ------------------------------------------------------------------ Defer
+
+fn defer_call(l: *mut Loop, cb: fn(*mut Loop, u64), ud: u64) -> bool {
+    let need: usize = ((*l).ndefer + 1) * 16
+    rt.buf_reserve(&(*l).defers, need)
+    if (*l).defers.cap < need {
+        return false
+    }
+    rt.buf_set_len(&(*l).defers, need)
+    rt.st64((*l).defers.ptr, (*l).ndefer * 2, cb as u64)
+    rt.st64((*l).defers.ptr, (*l).ndefer * 2 + 1, ud)
+    (*l).ndefer = (*l).ndefer + 1
+    return true
+}
+
+fn run_defers(l: *mut Loop) -> u64 {
+    let n: usize = (*l).ndefer
+    if n == 0 {
+        return 0
+    }
+    var i: usize = 0
+    while i < n {
+        let cb: fn(*mut Loop, u64) = rt.ld64((*l).defers.ptr, i * 2) as fn(*mut Loop, u64)
+        let ud: u64 = rt.ld64((*l).defers.ptr, i * 2 + 1)
+        cb(l, ud)
+        i = i + 1
+    }
+    // drop the n that ran; calls queued meanwhile move to the front
+    let rest: usize = (*l).ndefer - n
+    var k: usize = 0
+    while k < rest * 2 {
+        rt.st64((*l).defers.ptr, k, rt.ld64((*l).defers.ptr, n * 2 + k))
+        k = k + 1
+    }
+    (*l).ndefer = rest
+    rt.buf_set_len(&(*l).defers, rest * 16)
+    (*l).deferred_run = (*l).deferred_run + n as u64
+    return n as u64
+}
+
+// ------------------------------------------------------- Waiting (epoll)
+
+fn dispatch_one(l: *mut Loop, h: u64, rev: u32) -> u64 {
+    let s: i64 = watch_slot(l, h)
+    if s < 0 {
+        return 0 // removed by an earlier callback of this round
+    }
+    let slot: usize = s as usize
+    let cb: fn(*mut Loop, u64, u32) = wget(l, slot, W_CB) as fn(*mut Loop, u64, u32)
+    let ud: u64 = wget(l, slot, W_UD)
+    (*l).events = (*l).events + 1
+    cb(l, ud, rev)
+    return 1
+}
+
+fn wait_epoll(l: *mut Loop, wait: i64) -> u64 {
+    var tmo: i64 = wait
+    if tmo > 2000000000 {
+        tmo = 2000000000
+    }
+    sleep_in(l, tmo)
+    let r: i64 = syscall(SYS_EPOLL_PWAIT, (*l).ep as i64, (*l).evbuf.ptr as i64,
+        MAX_EVENTS as i64, tmo, 0, 8)
+    sleep_out(l, tmo)
+    if r <= 0 {
+        return 0 // timeout, or EINTR: a signal is not an event
+    }
+    var n: u64 = 0
+    var i: usize = 0
+    while i < r as usize {
+        let rec: u64 = (*l).evbuf.ptr + (i * (*l).stride) as u64
+        let ev: u32 = rt.ld32(rec, 0)
+        let data: u64 = rt.ld64(rec + (*l).doff as u64, 0)
+        i = i + 1
+        if data == 0 {
+            wake_drain(l)
+            continue
+        }
+        n = n + dispatch_one(l, data, ev)
+    }
+    return n
+}
+
+// ------------------------------------------------------- Waiting (poll)
+
+fn wait_poll(l: *mut Loop, wait: i64) -> u64 {
+    // slot 0: the wake-up; then one entry per live watch
+    let cap: usize = ((*l).nwatch + 1) * 8
+    rt.buf_reserve(&(*l).pfds, cap)
+    rt.buf_reserve(&(*l).pmap, cap)
+    if (*l).pfds.cap < cap || (*l).pmap.cap < cap {
+        return 0
+    }
+    var n: usize = 0
+    rt.st32((*l).pfds.ptr, 0, (*l).wr as u32)
+    rt.st16((*l).pfds.ptr, 2, EV_READ as u16)
+    rt.st16((*l).pfds.ptr, 3, 0 as u16)
+    rt.st64((*l).pmap.ptr, 0, 0)
+    n = 1
+    var slot: usize = 0
+    while slot < (*l).nslots {
+        if (wget(l, slot, W_LINK) & 1) != 0 {
+            rt.st32((*l).pfds.ptr, n * 2, wget(l, slot, W_FD) as u32)
+            rt.st16((*l).pfds.ptr, n * 4 + 2, wget(l, slot, W_EV) as u16)
+            rt.st16((*l).pfds.ptr, n * 4 + 3, 0 as u16)
+            rt.st64((*l).pmap.ptr, n, make_handle(wget(l, slot, W_GEN), slot))
+            n = n + 1
+        }
+        slot = slot + 1
+    }
+    var r: i64 = 0
+    sleep_in(l, wait)
+    if wait < 0 {
+        // a constant: the AArch64 translation of poll() needs to SEE -1
+        r = syscall(SYS_POLL, (*l).pfds.ptr as i64, n as i64, -1, 0, 0, 0)
+    } else {
+        r = syscall(SYS_POLL, (*l).pfds.ptr as i64, n as i64, wait, 0, 0, 0)
+    }
+    sleep_out(l, wait)
+    if r <= 0 {
+        return 0
+    }
+    var cnt: u64 = 0
+    var i: usize = 0
+    while i < n {
+        let rev: u32 = rt.ld16((*l).pfds.ptr, i * 4 + 3) as u32
+        if rev != 0 {
+            let h: u64 = rt.ld64((*l).pmap.ptr, i)
+            if h == 0 {
+                wake_drain(l)
+            } else {
+                cnt = cnt + dispatch_one(l, h, rev)
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// ------------------------------------------------------------------ Rounds
+
+fn has_work(l: *mut Loop) -> bool {
+    return (*l).nwatch > 0 || (*l).nheap > 0 || (*l).ndefer > 0 || (*l).keep
+}
+
+// One round: deferred calls, then the descriptors that are ready (waiting
+// at most `max_wait` ms, -1 = until something happens, 0 = just look), then
+// the timers that are due. Returns how many callbacks ran. A round never
+// waits longer than the next timer.
+fn run_once(l: *mut Loop, max_wait: i64) -> u64 {
+    (*l).rounds = (*l).rounds + 1
+    var did: u64 = run_defers(l)
+    var wait: i64 = max_wait
+    if (*l).ndefer > 0 {
+        wait = 0
+    }
+    if did > 0 {
+        wait = 0 // something ran: look, do not sleep
+    }
+    if (*l).nheap > 0 {
+        let tw: i64 = timer_next_ms(l)
+        if wait < 0 || tw < wait {
+            wait = tw
+        }
+    }
+    if (*l).use_ep {
+        did = did + wait_epoll(l, wait)
+    } else {
+        did = did + wait_poll(l, wait)
+    }
+    (*l).now = mono_ms()
+    did = did + fire_timers(l)
+    return did
+}
+
+// Until `stop`, or until nothing is left to wait for.
+fn run(l: *mut Loop) {
+    (*l).stopped = false
+    while !(*l).stopped && has_work(l) {
+        run_once(l, 0 - 1)
+    }
+    (*l).stopped = false
+}
+
+// From a callback (or after `wake`, from another thread -- set nothing
+// here from another thread, post a callback that calls it).
+fn stop(l: *mut Loop) {
+    (*l).stopped = true
+}
+
+// true: `run` does not return just because nothing is registered (a server
+// thread that waits for posted work). false is the default.
+fn set_keep_alive(l: *mut Loop, on: bool) {
+    (*l).keep = on
+}

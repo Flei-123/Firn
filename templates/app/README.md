@@ -22,6 +22,17 @@ One file: `VERSION`. Bump it, build, release. The update client compares
 semantic versions (`0.5.6`, `0.6.0-beta.1`); a pre-release sorts before the
 release.
 
+## Packages
+
+    bash package.sh                                  # dist/<version>/: .deb, .tar.gz, AppImage/.run,
+                                                     # Windows setup.exe + portable zip + NSIS script,
+                                                     # manifest.json (SHA-256 + signatures), store-add.sh
+    bash package.sh --platforms linux,windows,android --sign-key ~/keys/pack.key
+
+`pack.ini` says what the packages call the program (name, category, icon, Debian
+dependencies); `assets/icon.svg` becomes every icon size (.ico, .icns, PNG set,
+Android mipmaps). See `docs/PACKAGING.md` of the Firn checkout.
+
 ## Release
 
     bash release.sh                                  # dry run into a throw-away store

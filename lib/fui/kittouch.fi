@@ -1,0 +1,526 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/kittouch.fi -- TOUCH GESTURES FOR THE IMMEDIATE-MODE KIT: tap, double tap, long
+// press, pan with a fling, pinch.
+//
+// The kit (lib/fui/kit.fi, the Markdown view) has no scene tree, so the gesture arena of
+// lib/fui/event.fi -- which routes to NODES -- cannot serve it. This is the same arena
+// reduced to what a program of immediate-mode parts needs: ONE recogniser fed with the
+// pointer records of lib/window/pointers.fi, giving gestures at screen points; the program
+// decides what is under them with the kit's own `*_hit` functions.
+//
+//     var g: kittouch.Touch = kittouch.tg_new()
+//     // every pointer record the window delivers (window.next_pointer):
+//     kittouch.tg_feed(&g, &p)
+//     // every frame, for the long-press timer:
+//     kittouch.tg_tick(&g, now_ms)
+//     var e: kittouch.Gesture = kittouch.gesture_blank()
+//     while kittouch.tg_next(&g, &e) {
+//         if e.kind == kittouch.TG_TAP { ... e.x, e.y ... }
+//         if e.kind == kittouch.TG_PAN_MOVE { grid_touch_pan(&grid, e.dy) }
+//         if e.kind == kittouch.TG_PAN_END && e.fling { grid_touch_fling(&grid, e.vy, now) }
+//     }
+//
+// THE GESTURES (the numbers are lib/fui/event.fi's: TOUCH_SLOP 16 px, LONG_MS 500,
+// DOUBLE_MS 300, DOUBLE_DIST 100 px, FLING_MIN 50 px/s, FLING_MAX 8000 px/s):
+//   TAP         the last finger lifts within the slop (a mouse: a click without a drag),
+//   DOUBLE_TAP  a second tap within DOUBLE_MS and DOUBLE_DIST of the first -- after its TAP,
+//               as the DOM sends click, click, dblclick,
+//   LONG_PRESS  a finger rests within the slop for LONG_MS (`tg_tick`; at the lift if the
+//               host never ticked); no TAP follows it,
+//   PAN_START / PAN_MOVE / PAN_END   one finger leaves the slop; MOVE carries the step
+//               since the last event (dx, dy) and the total; END carries the velocity of
+//               the last 100 ms and `fling` if it is at least FLING_MIN (clamped to FLING_MAX),
+//   PINCH_START / PINCH_MOVE / PINCH_END   a second finger comes down: `scale` is the
+//               distance of the two against the start, `angle` their turn in degrees
+//               (-180..180), (x, y) the midpoint; it wins over a running pan, which ends
+//               without a fling.
+// Pen counts as touch. Mouse pointers give only TAP and DOUBLE_TAP (they have hover, drag
+// and the wheel already -- the same split as `touch-action` in CSS).
+//
+// Nothing here allocates; the whole machine is tested with synthetic streams in
+// tools/fui/touch_main.fi, and the kit's parts take the gestures as the plain calls
+// `grid_touch_*`, `mdv_touch_*`.
+import window.pointers
+
+export {
+    Touch, Gesture, tg_new, tg_feed, tg_tick, tg_next, tg_reset, gesture_blank, tg_pending, tg_active_fingers,
+    TG_NONE, TG_TAP, TG_DOUBLE_TAP, TG_LONG_PRESS, TG_PAN_START, TG_PAN_MOVE, TG_PAN_END,
+    TG_PINCH_START, TG_PINCH_MOVE, TG_PINCH_END,
+    TG_SLOP, TG_LONG_MS, TG_DOUBLE_MS, TG_DOUBLE_DIST, TG_FLING_MIN, TG_FLING_MAX,
+}
+
+const TG_NONE: u32 = 0
+const TG_TAP: u32 = 1
+const TG_DOUBLE_TAP: u32 = 2
+const TG_LONG_PRESS: u32 = 3
+const TG_PAN_START: u32 = 4
+const TG_PAN_MOVE: u32 = 5
+const TG_PAN_END: u32 = 6
+const TG_PINCH_START: u32 = 7
+const TG_PINCH_MOVE: u32 = 8
+const TG_PINCH_END: u32 = 9
+
+// the numbers of lib/fui/event.fi (TOUCH_SLOP ...); tools/fui/touch_main.fi checks they agree
+const TG_SLOP: f64 = 16.0
+const TG_LONG_MS: i64 = 500
+const TG_DOUBLE_MS: i64 = 300
+const TG_DOUBLE_DIST: f64 = 100.0
+const TG_FLING_MIN: f64 = 50.0
+const TG_FLING_MAX: f64 = 8000.0
+
+const M_IDLE: u32 = 0
+const M_DOWN: u32 = 1 // one finger down, nothing decided
+const M_PAN: u32 = 2
+const M_PINCH: u32 = 3
+const M_LONG: u32 = 4 // a long press fired: the lift does nothing
+const M_DEAD: u32 = 5 // a pinch ended with a finger still down: wait for all to lift
+
+const SAMPLES: usize = 8
+const QUEUE: usize = 16
+
+struct Gesture {
+    kind: u32,
+    x: f64,
+    y: f64,
+    dx: f64, // pan: the step since the last event
+    dy: f64,
+    tx: f64, // pan: the total since the start
+    ty: f64,
+    vx: f64, // pan end: px per second
+    vy: f64,
+    fling: bool,
+    scale: f64,
+    angle: f64,
+    t: i64,
+    mouse: bool,
+}
+
+fn gesture_blank() -> Gesture {
+    return Gesture { kind: TG_NONE, x: 0.0, y: 0.0, dx: 0.0, dy: 0.0, tx: 0.0, ty: 0.0, vx: 0.0, vy: 0.0,
+        fling: false, scale: 1.0, angle: 0.0, t: 0, mouse: false }
+}
+
+struct Finger {
+    used: bool,
+    id: u32,
+    ptype: u32,
+    x0: f64,
+    y0: f64,
+    t0: i64,
+    x: f64,
+    y: f64,
+    t: i64,
+}
+
+fn finger_blank() -> Finger {
+    return Finger { used: false, id: 0 as u32, ptype: 0 as u32, x0: 0.0, y0: 0.0, t0: 0, x: 0.0, y: 0.0, t: 0 }
+}
+
+struct Sample {
+    t: i64,
+    x: f64,
+    y: f64,
+}
+
+struct Touch {
+    mode: u32,
+    f: [Finger; 2],
+    nf: usize,
+    // the pan
+    lx: f64, // the last point a PAN_MOVE reported
+    ly: f64,
+    sx: f64, // where the pan started
+    sy: f64,
+    samples: [Sample; 8],
+    ns: usize, // samples written (ring)
+    // the pinch
+    pd0: f64, // start distance
+    pa0: f64, // start angle
+    // double tap
+    last_tap_t: i64,
+    last_tap_x: f64,
+    last_tap_y: f64,
+    have_tap: bool,
+    // the queue of events
+    q: [Gesture; 16],
+    qh: usize,
+    qt: usize,
+    now: i64,
+}
+
+fn tg_new() -> Touch {
+    return Touch { mode: M_IDLE, f: [finger_blank(); 2], nf: 0, lx: 0.0, ly: 0.0, sx: 0.0, sy: 0.0,
+        samples: [Sample { t: 0, x: 0.0, y: 0.0 }; 8], ns: 0, pd0: 1.0, pa0: 0.0, last_tap_t: 0,
+        last_tap_x: 0.0, last_tap_y: 0.0, have_tap: false, q: [gesture_blank(); 16], qh: 0, qt: 0, now: 0 }
+}
+
+// Forget everything in flight (a lost window focus, a cancel).
+fn tg_reset(t: *mut Touch) {
+    (*t).mode = M_IDLE
+    (*t).nf = 0
+    (*t).f[0].used = false
+    (*t).f[1].used = false
+    (*t).ns = 0
+    (*t).qh = 0
+    (*t).qt = 0
+}
+
+fn tg_active_fingers(t: *mut Touch) -> usize {
+    return (*t).nf
+}
+
+fn tg_pending(t: *mut Touch) -> usize {
+    return (*t).qt - (*t).qh
+}
+
+fn push(t: *mut Touch, e: Gesture) {
+    // consecutive moves are coalesced: a frame that gets twenty pointer records still
+    // hands the program ONE PAN_MOVE (the sum of the steps) -- the queue cannot overflow
+    // on a fast finger
+    if (*t).qt > (*t).qh && (e.kind == TG_PAN_MOVE || e.kind == TG_PINCH_MOVE) {
+        let k: usize = ((*t).qt - 1) % QUEUE
+        if (*t).q[k].kind == e.kind {
+            if e.kind == TG_PAN_MOVE {
+                let ndx: f64 = (*t).q[k].dx + e.dx
+                let ndy: f64 = (*t).q[k].dy + e.dy
+                (*t).q[k] = e
+                (*t).q[k].dx = ndx
+                (*t).q[k].dy = ndy
+            } else {
+                (*t).q[k] = e
+            }
+            return
+        }
+    }
+    if (*t).qt - (*t).qh >= QUEUE {
+        (*t).qh = (*t).qh + 1 // the oldest is dropped
+    }
+    (*t).q[(*t).qt % QUEUE] = e
+    (*t).qt = (*t).qt + 1
+}
+
+// The next gesture; false when there is none.
+fn tg_next(t: *mut Touch, out: *mut Gesture) -> bool {
+    if (*t).qh >= (*t).qt {
+        return false
+    }
+    *out = (*t).q[(*t).qh % QUEUE]
+    (*t).qh = (*t).qh + 1
+    return true
+}
+
+fn mk(kind: u32, x: f64, y: f64, tm: i64, mouse: bool) -> Gesture {
+    var e: Gesture = gesture_blank()
+    e.kind = kind
+    e.x = x
+    e.y = y
+    e.t = tm
+    e.mouse = mouse
+    return e
+}
+
+fn dist(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    let dx: f64 = bx - ax
+    let dy: f64 = by - ay
+    // sqrt without std.math: Newton, 6 steps, enough for a gesture
+    let s: f64 = dx * dx + dy * dy
+    if s <= 0.0 {
+        return 0.0
+    }
+    var r: f64 = s
+    if r > 1.0 {
+        r = s / 2.0
+    }
+    var i: usize = 0
+    while i < 30 {
+        r = (r + s / r) / 2.0
+        i = i + 1
+    }
+    return r
+}
+
+// the angle of b - a in degrees (-180..180), by atan2 from a series (no std.math in a gesture)
+fn angle_of(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    let dx: f64 = bx - ax
+    let dy: f64 = by - ay
+    if dx == 0.0 && dy == 0.0 {
+        return 0.0
+    }
+    var ax2: f64 = dx
+    var ay2: f64 = dy
+    if ax2 < 0.0 {
+        ax2 = 0.0 - ax2
+    }
+    if ay2 < 0.0 {
+        ay2 = 0.0 - ay2
+    }
+    // an angle in 0..90 from the ratio, by a polynomial with an error under 0.3 degrees
+    var a: f64 = 0.0
+    if ax2 >= ay2 {
+        let r: f64 = ay2 / ax2
+        a = r * (45.0 - (r - 1.0) * (14.0 + 3.8 * r))
+    } else {
+        let r: f64 = ax2 / ay2
+        a = 90.0 - r * (45.0 - (r - 1.0) * (14.0 + 3.8 * r))
+    }
+    if dx < 0.0 && dy >= 0.0 {
+        a = 180.0 - a
+    } else if dx < 0.0 && dy < 0.0 {
+        a = a - 180.0
+    } else if dx >= 0.0 && dy < 0.0 {
+        a = 0.0 - a
+    }
+    return a
+}
+
+fn turn(a: f64) -> f64 {
+    var r: f64 = a
+    while r > 180.0 {
+        r = r - 360.0
+    }
+    while r < 0.0 - 180.0 {
+        r = r + 360.0
+    }
+    return r
+}
+
+fn slot_of(t: *mut Touch, id: u32) -> usize {
+    var i: usize = 0
+    while i < 2 {
+        if (*t).f[i].used && (*t).f[i].id == id {
+            return i
+        }
+        i = i + 1
+    }
+    return 2
+}
+
+fn add_sample(t: *mut Touch, tm: i64, x: f64, y: f64) {
+    let k: usize = (*t).ns % SAMPLES
+    (*t).samples[k] = Sample { t: tm, x: x, y: y }
+    (*t).ns = (*t).ns + 1
+}
+
+// The velocity of the last 100 ms (px per second).
+fn velocity(t: *mut Touch, now: i64, vx: *mut f64, vy: *mut f64) {
+    *vx = 0.0
+    *vy = 0.0
+    var n: usize = (*t).ns
+    if n < 2 {
+        return
+    }
+    var cnt: usize = n
+    if cnt > SAMPLES {
+        cnt = SAMPLES
+    }
+    let last: Sample = (*t).samples[(n - 1) % SAMPLES]
+    // the oldest sample within 100 ms of the last one
+    var first: Sample = last
+    var k: usize = 1
+    while k < cnt {
+        let s: Sample = (*t).samples[(n - 1 - k) % SAMPLES]
+        if last.t - s.t <= 100 {
+            first = s
+        }
+        k = k + 1
+    }
+    let dt: i64 = last.t - first.t
+    if dt <= 0 {
+        return
+    }
+    *vx = (last.x - first.x) * 1000.0 / (dt as f64)
+    *vy = (last.y - first.y) * 1000.0 / (dt as f64)
+}
+
+fn is_touch(ptype: u32) -> bool {
+    return ptype != pointers.PTR_MOUSE
+}
+
+fn start_pan(t: *mut Touch, tm: i64) {
+    (*t).mode = M_PAN
+    (*t).sx = (*t).f[0].x0
+    (*t).sy = (*t).f[0].y0
+    (*t).lx = (*t).f[0].x0
+    (*t).ly = (*t).f[0].y0
+    var e: Gesture = mk(TG_PAN_START, (*t).f[0].x0, (*t).f[0].y0, tm, false)
+    push(t, e)
+}
+
+fn end_pan(t: *mut Touch, tm: i64, fling_ok: bool) {
+    var e: Gesture = mk(TG_PAN_END, (*t).f[0].x, (*t).f[0].y, tm, false)
+    var vx: f64 = 0.0
+    var vy: f64 = 0.0
+    velocity(t, tm, &vx, &vy)
+    e.tx = (*t).f[0].x - (*t).sx
+    e.ty = (*t).f[0].y - (*t).sy
+    if fling_ok {
+        var sp: f64 = dist(0.0, 0.0, vx, vy)
+        if sp >= TG_FLING_MIN {
+            if sp > TG_FLING_MAX {
+                vx = vx * TG_FLING_MAX / sp
+                vy = vy * TG_FLING_MAX / sp
+            }
+            e.vx = vx
+            e.vy = vy
+            e.fling = true
+        }
+    }
+    push(t, e)
+}
+
+// One pointer record (window.next_pointer / pointers.pointers_next).
+fn tg_feed(t: *mut Touch, p: *mut pointers.Pointer) {
+    (*t).now = (*p).t
+    let touch: bool = is_touch((*p).ptype)
+    let kind: u32 = (*p).kind
+    if kind == pointers.PK_DOWN {
+        var s: usize = slot_of(t, (*p).id)
+        if s == 2 {
+            if (*t).f[0].used == false {
+                s = 0
+            } else if (*t).f[1].used == false {
+                s = 1
+            } else {
+                return // a third finger: ignored
+            }
+        }
+        (*t).f[s] = Finger { used: true, id: (*p).id, ptype: (*p).ptype, x0: (*p).x, y0: (*p).y, t0: (*p).t,
+            x: (*p).x, y: (*p).y, t: (*p).t }
+        (*t).nf = (*t).nf + 1
+        if (*t).nf == 1 {
+            (*t).mode = M_DOWN
+            (*t).ns = 0
+            add_sample(t, (*p).t, (*p).x, (*p).y)
+        } else if (*t).nf == 2 && touch && is_touch((*t).f[0].ptype) {
+            if (*t).mode == M_PAN {
+                end_pan(t, (*p).t, false)
+            }
+            (*t).mode = M_PINCH
+            (*t).pd0 = dist((*t).f[0].x, (*t).f[0].y, (*t).f[1].x, (*t).f[1].y)
+            if (*t).pd0 < 1.0 {
+                (*t).pd0 = 1.0
+            }
+            (*t).pa0 = angle_of((*t).f[0].x, (*t).f[0].y, (*t).f[1].x, (*t).f[1].y)
+            let mx: f64 = ((*t).f[0].x + (*t).f[1].x) / 2.0
+            let my: f64 = ((*t).f[0].y + (*t).f[1].y) / 2.0
+            push(t, mk(TG_PINCH_START, mx, my, (*p).t, false))
+        }
+        return
+    }
+    let s: usize = slot_of(t, (*p).id)
+    if s == 2 {
+        return
+    }
+    if kind == pointers.PK_MOVE {
+        (*t).f[s].x = (*p).x
+        (*t).f[s].y = (*p).y
+        (*t).f[s].t = (*p).t
+        if (*t).mode == M_DOWN && s == 0 && touch {
+            if dist((*t).f[0].x0, (*t).f[0].y0, (*p).x, (*p).y) > TG_SLOP {
+                start_pan(t, (*p).t)
+                add_sample(t, (*p).t, (*p).x, (*p).y)
+                var e: Gesture = mk(TG_PAN_MOVE, (*p).x, (*p).y, (*p).t, false)
+                e.dx = (*p).x - (*t).lx
+                e.dy = (*p).y - (*t).ly
+                e.tx = (*p).x - (*t).sx
+                e.ty = (*p).y - (*t).sy
+                (*t).lx = (*p).x
+                (*t).ly = (*p).y
+                push(t, e)
+            }
+        } else if (*t).mode == M_DOWN && s == 0 && !touch {
+            // a mouse that moves is a drag: no tap on the release
+            if dist((*t).f[0].x0, (*t).f[0].y0, (*p).x, (*p).y) > TG_SLOP {
+                (*t).mode = M_DEAD
+            }
+        } else if (*t).mode == M_PAN && s == 0 {
+            add_sample(t, (*p).t, (*p).x, (*p).y)
+            var e: Gesture = mk(TG_PAN_MOVE, (*p).x, (*p).y, (*p).t, false)
+            e.dx = (*p).x - (*t).lx
+            e.dy = (*p).y - (*t).ly
+            e.tx = (*p).x - (*t).sx
+            e.ty = (*p).y - (*t).sy
+            (*t).lx = (*p).x
+            (*t).ly = (*p).y
+            push(t, e)
+        } else if (*t).mode == M_PINCH {
+            let d: f64 = dist((*t).f[0].x, (*t).f[0].y, (*t).f[1].x, (*t).f[1].y)
+            let a: f64 = angle_of((*t).f[0].x, (*t).f[0].y, (*t).f[1].x, (*t).f[1].y)
+            var e: Gesture = mk(TG_PINCH_MOVE, ((*t).f[0].x + (*t).f[1].x) / 2.0, ((*t).f[0].y + (*t).f[1].y) / 2.0, (*p).t, false)
+            e.scale = d / (*t).pd0
+            e.angle = turn(a - (*t).pa0)
+            push(t, e)
+        }
+        return
+    }
+    if kind == pointers.PK_UP || kind == pointers.PK_CANCEL {
+        (*t).f[s].x = (*p).x
+        (*t).f[s].y = (*p).y
+        let cancel: bool = kind == pointers.PK_CANCEL
+        let mode: u32 = (*t).mode
+        if mode == M_PINCH {
+            let d: f64 = dist((*t).f[0].x, (*t).f[0].y, (*t).f[1].x, (*t).f[1].y)
+            var e: Gesture = mk(TG_PINCH_END, ((*t).f[0].x + (*t).f[1].x) / 2.0, ((*t).f[0].y + (*t).f[1].y) / 2.0, (*p).t, false)
+            e.scale = d / (*t).pd0
+            push(t, e)
+            (*t).mode = M_DEAD
+        } else if mode == M_PAN && s == 0 {
+            end_pan(t, (*p).t, !cancel)
+            (*t).mode = M_IDLE
+        } else if mode == M_DOWN && s == 0 && !cancel {
+            // the last finger lifts inside the slop: a tap (a mouse: a click) -- or, if it rested
+            // for LONG_MS and the host never ticked, the long press
+            if touch && (*p).t - (*t).f[0].t0 >= TG_LONG_MS {
+                push(t, mk(TG_LONG_PRESS, (*p).x, (*p).y, (*p).t, false))
+                (*t).have_tap = false
+                (*t).mode = M_IDLE
+                (*t).f[s].used = false
+                if (*t).nf > 0 {
+                    (*t).nf = (*t).nf - 1
+                }
+                return
+            }
+            var e: Gesture = mk(TG_TAP, (*p).x, (*p).y, (*p).t, !touch)
+            push(t, e)
+            if (*t).have_tap && (*p).t - (*t).last_tap_t <= TG_DOUBLE_MS
+                && dist((*t).last_tap_x, (*t).last_tap_y, (*p).x, (*p).y) <= TG_DOUBLE_DIST {
+                push(t, mk(TG_DOUBLE_TAP, (*p).x, (*p).y, (*p).t, !touch))
+                (*t).have_tap = false
+            } else {
+                (*t).have_tap = true
+                (*t).last_tap_t = (*p).t
+                (*t).last_tap_x = (*p).x
+                (*t).last_tap_y = (*p).y
+            }
+            (*t).mode = M_IDLE
+        } else if mode == M_LONG {
+            (*t).mode = M_IDLE
+        }
+        if mode == M_DOWN && s == 0 && cancel {
+            (*t).mode = M_IDLE
+        }
+        (*t).f[s].used = false
+        if (*t).nf > 0 {
+            (*t).nf = (*t).nf - 1
+        }
+        if (*t).nf == 0 {
+            (*t).mode = M_IDLE
+        }
+        return
+    }
+}
+
+// The clock: a finger that has rested within the slop for LONG_MS gives LONG_PRESS (once).
+// True when a gesture was queued.
+fn tg_tick(t: *mut Touch, now_ms: i64) -> bool {
+    (*t).now = now_ms
+    if (*t).mode == M_DOWN && (*t).nf == 1 && is_touch((*t).f[0].ptype) {
+        if now_ms - (*t).f[0].t0 >= TG_LONG_MS {
+            (*t).mode = M_LONG
+            (*t).have_tap = false
+            push(t, mk(TG_LONG_PRESS, (*t).f[0].x, (*t).f[0].y, now_ms, false))
+            return true
+        }
+    }
+    return false
+}

@@ -1,0 +1,1198 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/async/wsc.fi -- a WebSocket CLIENT (RFC 6455) on the event loop:
+// ws:// and wss://, ping/pong, keep-alive, fragmentation, the closing
+// handshake and reconnecting with backoff.
+//
+//     import async.loop
+//     import async.wsc
+//
+//     fn on_ws(c: *mut wsc.WsClient, ud: u64, kind: u32, arg: u32) {
+//         if kind == wsc.WE_OPEN {
+//             wsc.wsc_send_str(c, "hello")
+//         } else if kind == wsc.WE_MESSAGE {
+//             // wsc.wsc_msg_ptr(c) .. wsc_msg_len(c); `arg` is OP_TEXT or OP_BINARY
+//         } else if kind == wsc.WE_CLOSE {
+//             // arg = the close code (1006 = the connection died)
+//         }
+//     }
+//     let c: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 0)
+//     wsc.wsc_use_system_trust(c)                       // wss:// needs roots
+//     wsc.wsc_set_auto_reconnect(c, true, 500, 30000, 0)
+//     wsc.wsc_set_keepalive(c, 20000, 10000)
+//     wsc.wsc_connect_str(c, "wss://echo.example.org/socket")
+//     loop.run(&l)
+//
+// EVENTS (one callback, `kind`)
+//   WE_OPEN       the upgrade is accepted; sending is allowed from now on
+//   WE_MESSAGE    a whole message (fragments joined, text checked for UTF-8)
+//                 stands in `wsc_msg_ptr/len`, valid during the call only
+//   WE_PONG       a pong arrived (its payload is in `wsc_msg_ptr/len`)
+//   WE_CLOSE      a connection that WAS open has ended; `arg` is the close
+//                 code (the peer's, or ours, or 1006 when it just died)
+//   WE_ERROR      something went wrong; `arg` is a WSE_* code (see
+//                 `wsc_error`, `wsc_status`, `wsc_tls_error`). An error
+//                 before the upgrade is reported WITHOUT a WE_CLOSE (there
+//                 was nothing open to close)
+//   WE_RECONNECT  a new attempt is scheduled; `arg` = attempt number,
+//                 `wsc_next_delay_ms` = when
+//
+// WHAT THE CLIENT DOES FOR YOU
+//   * answers every ping with a pong carrying the same payload
+//   * keep-alive (`wsc_set_keepalive(interval, timeout)`): when nothing has
+//     arrived for `interval` ms it sends a ping; if nothing arrives within
+//     `timeout` ms after that, the connection is declared dead (WSE_TIMEOUT)
+//     and, with auto-reconnect, replaced
+//   * CLOSING HANDSHAKE: `wsc_close(code)` sends a close frame and waits for
+//     the peer's (at most `wsc_set_close_timeout`, default 3000 ms), then
+//     shuts the TCP connection; a close frame from the peer is answered with
+//     the same code
+//   * RECONNECT (`wsc_set_auto_reconnect`): after a connection that was not
+//     closed by the program dies, or an attempt fails, the next attempt
+//     comes after base * 2^n ms (capped, spread by +-20 %, `ws.backoff_ms`);
+//     the counter returns to 0 when an upgrade succeeds. `max_attempts` 0 =
+//     for ever
+//   * FRAGMENTATION: messages longer than `wsc_set_fragment_size` leave as
+//     several frames; incoming fragments are reassembled up to
+//     `wsc_set_max_message` (default 16 MiB; above that: close 1009)
+//   * the protocol checks of lib/ws/ws.fi (reserved bits, unknown opcodes,
+//     masked server frames, bad UTF-8, ...) end the connection with the
+//     right close code
+//
+// ==================================================================== HONEST
+//
+// W1  Sending is refused (false) unless the state is OPEN: there is NO queue
+//     for messages written while connecting or between reconnects. A program
+//     that must not lose messages keeps its own queue and flushes it on
+//     WE_OPEN.
+// W2  Names are resolved BLOCKING, as in async.ahttp (H2); only the first
+//     address of an answer is tried, then the next ones on failure.
+// W3  No permessage-deflate and no other extension; `Sec-WebSocket-Extensions`
+//     is never offered. A server that answers with one is refused.
+// W4  TLS 1.3 only, and the TLS handshake computes on the loop thread
+//     (stream.fi S2).
+// W5  Redirects (3xx) to the upgrade request are not followed.
+import std.rt
+import std.str
+import std.net
+import std.base64
+import std.crypto.random
+import net.url
+import net.dns
+import tls.x509
+import tls.trust
+import ws.ws
+import async.loop
+import async.stream
+
+export {
+    WsClient,
+    WE_OPEN, WE_MESSAGE, WE_PONG, WE_CLOSE, WE_ERROR, WE_RECONNECT,
+    WSE_URL, WSE_RESOLVE, WSE_CONNECT, WSE_TLS, WSE_HANDSHAKE, WSE_PROTOCOL,
+    WSE_TIMEOUT, WSE_IO, WSE_TOO_LARGE, WSE_NO_ROOTS,
+    WS_IDLE, WS_CONNECTING, WS_HANDSHAKE, WS_OPEN, WS_CLOSING, WS_WAITING,
+    wsc_new, wsc_free, wsc_connect, wsc_connect_str, wsc_close, wsc_abort,
+    wsc_send_text, wsc_send_str, wsc_send_binary, wsc_ping,
+    wsc_set_auto_reconnect, wsc_set_keepalive, wsc_set_max_message,
+    wsc_set_fragment_size, wsc_set_connect_timeout, wsc_set_close_timeout,
+    wsc_add_trust_pem, wsc_use_system_trust, wsc_set_header, wsc_set_protocols,
+    wsc_msg_ptr, wsc_msg_len, wsc_is_open, wsc_state, wsc_close_code, wsc_error,
+    wsc_status, wsc_tls_error, wsc_attempt, wsc_next_delay_ms,
+    wsc_protocol_ptr, wsc_protocol_len, wsc_peer_reason_ptr, wsc_peer_reason_len,
+    wsc_messages_in, wsc_messages_out, wsc_pings_sent, wsc_reconnects,
+    wsc_opens, wsc_bytes_in,
+}
+
+const WE_OPEN: u32 = 1
+const WE_MESSAGE: u32 = 2
+const WE_PONG: u32 = 3
+const WE_CLOSE: u32 = 4
+const WE_ERROR: u32 = 5
+const WE_RECONNECT: u32 = 6
+
+const WSE_URL: u32 = 1
+const WSE_RESOLVE: u32 = 2
+const WSE_CONNECT: u32 = 3
+const WSE_TLS: u32 = 4
+const WSE_HANDSHAKE: u32 = 5
+const WSE_PROTOCOL: u32 = 6
+const WSE_TIMEOUT: u32 = 7
+const WSE_IO: u32 = 8
+const WSE_TOO_LARGE: u32 = 9
+const WSE_NO_ROOTS: u32 = 10
+
+const WS_IDLE: u32 = 0 // nothing started / ended for good
+const WS_CONNECTING: u32 = 1 // TCP (and TLS)
+const WS_HANDSHAKE: u32 = 2 // the HTTP upgrade
+const WS_OPEN: u32 = 3
+const WS_CLOSING: u32 = 4 // our close frame is out, the peer's is awaited
+const WS_WAITING: u32 = 5 // between reconnect attempts
+
+struct WsClient {
+    l: *mut loop.Loop,
+    cb: fn(*mut WsClient, u64, u32, u32),
+    ud: u64,
+    state: u32,
+    s: *mut stream.Stream,
+    u: url.Url,
+    secure: bool,
+    have_url: bool,
+    addrs: [u32; 8],
+    naddr: usize,
+    iaddr: usize,
+    res: dns.Resolver,
+    res_ready: bool,
+    store: x509.Store,
+    store_ready: bool,
+    sys_trust: bool,
+    key: [u8; 32],
+    nkey: usize,
+    extra: rt.Buf, // extra request header lines, CRLF terminated
+    protos: rt.Buf, // Sec-WebSocket-Protocol offer
+    proto: [u8; 64], // the protocol the server chose
+    nproto: usize,
+    msg: rt.Buf,
+    in_msg: bool,
+    mop: u32,
+    utf: ws.Utf8,
+    max_msg: usize,
+    frag: usize,
+    peer_reason: [u8; 125],
+    npeer_reason: usize,
+    // keep-alive
+    ka_interval: i64,
+    ka_timeout: i64,
+    ka_timer: u64,
+    last_rx: i64,
+    ping_out: bool,
+    ping_at: i64,
+    // closing
+    user_closed: bool, // the program asked to close: no reconnect
+    close_sent: bool,
+    close_got: bool,
+    close_code: u32,
+    close_timeout_ms: i64,
+    close_timer: u64,
+    ever_open: bool, // the CURRENT connection reached OPEN
+    emitted_close: bool,
+    // reconnect
+    auto: bool,
+    base_ms: i64,
+    cap_ms: i64,
+    max_attempts: u32,
+    attempt: u32,
+    delay_ms: i64,
+    rtimer: u64,
+    connect_ms: i64,
+    // results
+    err: u32,
+    status: u32,
+    tlserr: u32,
+    epoch: u32,
+    busy: u32,
+    dead: bool, // wsc_free was called
+    // counters
+    n_in: u64,
+    n_out: u64,
+    n_ping: u64,
+    n_reco: u64,
+    n_open: u64,
+    b_in: u64,
+}
+
+fn ws_obj_alloc[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+fn ws_obj_free[T](p: u64) {
+    rt.heap_free(p, size_of[T]())
+}
+
+// ------------------------------------------------------------ Life cycle
+
+fn wsc_new(l: *mut loop.Loop, cb: fn(*mut WsClient, u64, u32, u32), ud: u64) -> *mut WsClient {
+    let p: u64 = ws_obj_alloc[WsClient]()
+    if p == 0 {
+        return 0 as *mut WsClient
+    }
+    let c: *mut WsClient = p as *mut WsClient
+    *c = WsClient { l: l, cb: cb, ud: ud, state: WS_IDLE, s: 0 as *mut stream.Stream,
+        u: url.url_new(), secure: false, have_url: false, addrs: [0; 8], naddr: 0,
+        iaddr: 0, res: dns.resolver_new(), res_ready: false, store: x509.store_new(),
+        store_ready: false, sys_trust: false, key: [0; 32], nkey: 0,
+        extra: rt.buf_new(), protos: rt.buf_new(), proto: [0; 64], nproto: 0,
+        msg: rt.buf_new(), in_msg: false, mop: 0, utf: ws.utf8_new(),
+        max_msg: 16777216, frag: 0, peer_reason: [0; 125], npeer_reason: 0,
+        ka_interval: 0, ka_timeout: 0, ka_timer: 0, last_rx: 0, ping_out: false,
+        ping_at: 0, user_closed: false, close_sent: false, close_got: false,
+        close_code: 1006, close_timeout_ms: 3000, close_timer: 0, ever_open: false,
+        emitted_close: false, auto: false, base_ms: 500, cap_ms: 30000,
+        max_attempts: 0, attempt: 0, delay_ms: 0, rtimer: 0, connect_ms: 10000,
+        err: 0, status: 0, tlserr: 0, epoch: 0, busy: 0, dead: false,
+        n_in: 0, n_out: 0, n_ping: 0, n_reco: 0, n_open: 0, b_in: 0 }
+    return c
+}
+
+fn release(c: *mut WsClient) {
+    rt.buf_free(&(*c).extra)
+    rt.buf_free(&(*c).protos)
+    rt.buf_free(&(*c).msg)
+    x509.store_free(&(*c).store)
+    dns.resolver_free(&(*c).res)
+    ws_obj_free[WsClient](c as u64)
+}
+
+// Ends everything without a callback and frees the client. Safe inside a
+// callback of this client (the memory goes when the callback returns).
+fn wsc_free(c: *mut WsClient) {
+    if (*c).dead {
+        return
+    }
+    (*c).dead = true
+    (*c).user_closed = true
+    cancel_timers(c)
+    let s: *mut stream.Stream = (*c).s
+    (*c).s = 0 as *mut stream.Stream
+    (*c).state = WS_IDLE
+    if s as u64 != 0 {
+        stream.stream_abort(s)
+    }
+    if (*c).busy == 0 {
+        release(c)
+    }
+}
+
+fn cancel_timers(c: *mut WsClient) {
+    if (*c).ka_timer != 0 {
+        loop.timer_cancel((*c).l, (*c).ka_timer)
+        (*c).ka_timer = 0
+    }
+    if (*c).close_timer != 0 {
+        loop.timer_cancel((*c).l, (*c).close_timer)
+        (*c).close_timer = 0
+    }
+    if (*c).rtimer != 0 {
+        loop.timer_cancel((*c).l, (*c).rtimer)
+        (*c).rtimer = 0
+    }
+}
+
+// Calls the program. While it runs, `busy` keeps the memory alive.
+fn emit(c: *mut WsClient, kind: u32, arg: u32) {
+    if (*c).dead {
+        return
+    }
+    (*c).busy = (*c).busy + 1
+    let cb: fn(*mut WsClient, u64, u32, u32) = (*c).cb
+    cb(c, (*c).ud, kind, arg)
+    (*c).busy = (*c).busy - 1
+    if (*c).busy == 0 && (*c).dead {
+        release(c)
+    }
+}
+
+// ----------------------------------------------------------- Configuration
+
+fn wsc_set_auto_reconnect(c: *mut WsClient, on: bool, base_ms: i64, cap_ms: i64, max_attempts: u32) {
+    (*c).auto = on
+    if base_ms > 0 { (*c).base_ms = base_ms }
+    if cap_ms > 0 { (*c).cap_ms = cap_ms }
+    (*c).max_attempts = max_attempts
+}
+
+// 0 switches the keep-alive off.
+fn wsc_set_keepalive(c: *mut WsClient, interval_ms: i64, timeout_ms: i64) {
+    (*c).ka_interval = interval_ms
+    (*c).ka_timeout = timeout_ms
+    if (*c).state == WS_OPEN {
+        arm_keepalive(c)
+    }
+}
+
+fn wsc_set_max_message(c: *mut WsClient, n: usize) { (*c).max_msg = n }
+fn wsc_set_fragment_size(c: *mut WsClient, n: usize) { (*c).frag = n }
+fn wsc_set_connect_timeout(c: *mut WsClient, ms: i64) { (*c).connect_ms = ms }
+fn wsc_set_close_timeout(c: *mut WsClient, ms: i64) { (*c).close_timeout_ms = ms }
+
+// PEM roots for wss:// (any number of calls).
+fn wsc_add_trust_pem(c: *mut WsClient, p: u64, n: usize) -> usize {
+    return x509.store_load_pem(&(*c).store, p, n)
+}
+
+// The roots of the system (PEM bundle on Linux, the certificate store on
+// Windows), loaded on the first wss:// connection.
+fn wsc_use_system_trust(c: *mut WsClient) { (*c).sys_trust = true }
+
+// One more request header line: name, value (no CR/LF; they are refused).
+fn wsc_set_header(c: *mut WsClient, name: str, value: str) -> bool {
+    var i: usize = 0
+    while i < name.n {
+        let ch: u8 = *(name.p + i)
+        if ch == 13 as u8 || ch == 10 as u8 || ch == 58 as u8 { return false }
+        i = i + 1
+    }
+    i = 0
+    while i < value.n {
+        let ch2: u8 = *(value.p + i)
+        if ch2 == 13 as u8 || ch2 == 10 as u8 { return false }
+        i = i + 1
+    }
+    rt.buf_push_bytes(&(*c).extra, name.p as u64, name.n)
+    rt.buf_push_bytes(&(*c).extra, ": ".p as u64, 2)
+    rt.buf_push_bytes(&(*c).extra, value.p as u64, value.n)
+    rt.buf_push_bytes(&(*c).extra, "\r\n".p as u64, 2)
+    return true
+}
+
+// "chat, superchat": the Sec-WebSocket-Protocol offer; the one the server
+// picks is `wsc_protocol_ptr/len`.
+fn wsc_set_protocols(c: *mut WsClient, list: str) {
+    rt.buf_clear(&(*c).protos)
+    rt.buf_push_bytes(&(*c).protos, list.p as u64, list.n)
+}
+
+// ---------------------------------------------------------------- Accessors
+
+fn wsc_msg_ptr(c: *mut WsClient) -> u64 { return (*c).msg.ptr }
+fn wsc_msg_len(c: *mut WsClient) -> usize { return (*c).msg.len }
+fn wsc_is_open(c: *mut WsClient) -> bool { return (*c).state == WS_OPEN }
+fn wsc_state(c: *mut WsClient) -> u32 { return (*c).state }
+fn wsc_close_code(c: *mut WsClient) -> u32 { return (*c).close_code }
+fn wsc_error(c: *mut WsClient) -> u32 { return (*c).err }
+fn wsc_status(c: *mut WsClient) -> u32 { return (*c).status }
+fn wsc_tls_error(c: *mut WsClient) -> u32 { return (*c).tlserr }
+fn wsc_attempt(c: *mut WsClient) -> u32 { return (*c).attempt }
+fn wsc_next_delay_ms(c: *mut WsClient) -> i64 { return (*c).delay_ms }
+fn wsc_protocol_ptr(c: *mut WsClient) -> u64 { return (&(*c).proto[0]) as u64 }
+fn wsc_protocol_len(c: *mut WsClient) -> usize { return (*c).nproto }
+fn wsc_peer_reason_ptr(c: *mut WsClient) -> u64 { return (&(*c).peer_reason[0]) as u64 }
+fn wsc_peer_reason_len(c: *mut WsClient) -> usize { return (*c).npeer_reason }
+fn wsc_messages_in(c: *mut WsClient) -> u64 { return (*c).n_in }
+fn wsc_messages_out(c: *mut WsClient) -> u64 { return (*c).n_out }
+fn wsc_pings_sent(c: *mut WsClient) -> u64 { return (*c).n_ping }
+fn wsc_reconnects(c: *mut WsClient) -> u64 { return (*c).n_reco }
+fn wsc_opens(c: *mut WsClient) -> u64 { return (*c).n_open }
+fn wsc_bytes_in(c: *mut WsClient) -> u64 { return (*c).b_in }
+
+// ------------------------------------------------------------- Connecting
+
+fn parse_ip4(p: u64, n: usize, out: *mut u32) -> bool {
+    var parts: [u32; 4] = [0; 4]
+    var k: usize = 0
+    var v: u32 = 0
+    var digits: usize = 0
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        if ch == 46 as u8 {
+            if digits == 0 || k >= 3 { return false }
+            parts[k] = v
+            k = k + 1
+            v = 0
+            digits = 0
+        } else if ch >= 48 as u8 && ch <= 57 as u8 {
+            v = v * 10 as u32 + (ch - 48 as u8) as u32
+            digits = digits + 1
+            if v > 255 as u32 || digits > 3 { return false }
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    if k != 3 || digits == 0 { return false }
+    parts[3] = v
+    *out = net.ipv4(parts[0] as u8, parts[1] as u8, parts[2] as u8, parts[3] as u8)
+    return true
+}
+
+fn resolve(c: *mut WsClient) -> bool {
+    let hp: u64 = url.url_host_ptr(&(*c).u)
+    let hn: usize = url.url_host_len(&(*c).u)
+    var one: u32 = 0
+    if parse_ip4(hp, hn, &one) {
+        (*c).addrs[0] = one
+        (*c).naddr = 1
+        return true
+    }
+    if hn == 9 && rt.mem_eq(hp, "localhost".p as u64, 9) {
+        (*c).addrs[0] = net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8)
+        (*c).naddr = 1
+        return true
+    }
+    if !(*c).res_ready {
+        if !dns.resolver_init(&(*c).res) {
+            return false
+        }
+        (*c).res_ready = true
+    }
+    var o: dns.Resolved = dns.resolved_new()
+    let ok: bool = dns.dns_resolve_a(&(*c).res, hp, hn, &o) catch false
+    if !ok || o.n == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < o.n && i < 8 {
+        (*c).addrs[i] = o.addr[i]
+        i = i + 1
+    }
+    (*c).naddr = i
+    return true
+}
+
+fn wall_seconds() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 0, (&ts[0]) as i64, 0, 0, 0)
+    return ts[0] as u64
+}
+
+fn wsc_connect_str(c: *mut WsClient, u: str) -> bool {
+    return wsc_connect(c, u.p as u64, u.n)
+}
+
+// ws://host[:port]/path?query or wss://... Starts at once and returns; the
+// result comes as WE_OPEN or WE_ERROR. false: the URL is no ws/wss URL (no
+// event follows then) or a connection is already running.
+fn wsc_connect(c: *mut WsClient, u: u64, n: usize) -> bool {
+    if (*c).state != WS_IDLE || (*c).dead {
+        return false
+    }
+    // ws:// is http:// and wss:// is https:// as far as the address goes
+    var t: rt.Buf = rt.buf_new()
+    var secure: bool = false
+    if n >= 6 && ws_ci_prefix(u, n, "wss://") {
+        secure = true
+        rt.buf_push_bytes(&t, "https://".p as u64, 8)
+        rt.buf_push_bytes(&t, u + 6 as u64, n - 6)
+    } else if n >= 5 && ws_ci_prefix(u, n, "ws://") {
+        rt.buf_push_bytes(&t, "http://".p as u64, 7)
+        rt.buf_push_bytes(&t, u + 5 as u64, n - 5)
+    } else {
+        rt.buf_free(&t)
+        return false
+    }
+    let ok: bool = url.url_parse(t.ptr, t.len, &(*c).u)
+    rt.buf_free(&t)
+    if !ok {
+        return false
+    }
+    (*c).secure = secure
+    (*c).have_url = true
+    (*c).user_closed = false
+    (*c).attempt = 0
+    start_attempt(c)
+    return true
+}
+
+fn ws_ci_prefix(p: u64, n: usize, lit: str) -> bool {
+    if n < lit.n { return false }
+    var i: usize = 0
+    while i < lit.n {
+        var a: u8 = rt.ld8(p, i)
+        if a >= 65 as u8 && a <= 90 as u8 { a = a + 32 as u8 }
+        if a != *(lit.p + i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// One attempt: resolve, open the stream. Failure is reported through
+// `attempt_failed`, never as a return value to the caller of connect.
+fn start_attempt(c: *mut WsClient) {
+    (*c).epoch = (*c).epoch + 1
+    (*c).err = 0
+    (*c).status = 0
+    (*c).tlserr = 0
+    (*c).ever_open = false
+    (*c).emitted_close = false
+    (*c).close_sent = false
+    (*c).close_got = false
+    (*c).close_code = 1006
+    (*c).in_msg = false
+    (*c).ping_out = false
+    (*c).nproto = 0
+    rt.buf_clear(&(*c).msg)
+    (*c).state = WS_CONNECTING
+    if !resolve(c) {
+        // reported from the loop, not from inside wsc_connect
+        (*c).err = WSE_RESOLVE
+        loop.defer_call((*c).l, deferred_failed, c as u64)
+        return
+    }
+    (*c).iaddr = 0
+    if !open_stream(c) {
+        loop.defer_call((*c).l, deferred_failed, c as u64)
+    }
+}
+
+fn deferred_failed(l: *mut loop.Loop, ud: u64) {
+    let c: *mut WsClient = ud as *mut WsClient
+    if (*c).dead {
+        if (*c).busy == 0 {
+            release(c)
+        }
+        return
+    }
+    if (*c).state != WS_CONNECTING {
+        return
+    }
+    attempt_failed(c)
+}
+
+fn open_stream(c: *mut WsClient) -> bool {
+    let addr: u32 = (*c).addrs[(*c).iaddr]
+    var port: u16 = url.url_port(&(*c).u)
+    var s: *mut stream.Stream = 0 as *mut stream.Stream
+    if (*c).secure {
+        if !(*c).store_ready {
+            if (*c).sys_trust {
+                trust.trust_load_system(&(*c).store)
+            }
+            (*c).store_ready = true
+        }
+        if x509.store_count(&(*c).store) == 0 {
+            (*c).err = WSE_NO_ROOTS
+            return false
+        }
+        let hs: str = str { p: url.url_host_ptr(&(*c).u) as *mut u8, n: url.url_host_len(&(*c).u) }
+        s = stream.stream_open_tls((*c).l, addr, port, hs, &(*c).store, wall_seconds(),
+            (*c).connect_ms, on_stream, c as u64)
+    } else {
+        s = stream.stream_open((*c).l, addr, port, (*c).connect_ms, on_stream, c as u64)
+    }
+    if s as u64 == 0 {
+        (*c).err = WSE_CONNECT
+        return false
+    }
+    (*c).s = s
+    return true
+}
+
+// -------------------------------------------------------------- The stream
+
+fn on_stream(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    let c: *mut WsClient = ud as *mut WsClient
+    if (*c).dead || s != (*c).s {
+        return // an old stream
+    }
+    (*c).busy = (*c).busy + 1
+    stream_event(c, s, kind, arg)
+    (*c).busy = (*c).busy - 1
+    if (*c).busy == 0 && (*c).dead {
+        release(c)
+    }
+}
+
+fn stream_event(c: *mut WsClient, s: *mut stream.Stream, kind: u32, arg: i64) {
+    if kind == stream.SE_CONNECTED {
+        send_upgrade(c, s)
+    } else if kind == stream.SE_DATA {
+        if (*c).state == WS_HANDSHAKE {
+            read_upgrade(c, s)
+        } else if (*c).state == WS_OPEN || (*c).state == WS_CLOSING {
+            read_frames(c, s)
+        }
+    } else if kind == stream.SE_CLOSED {
+        (*c).s = 0 as *mut stream.Stream
+        on_stream_closed(c, s, arg)
+    }
+}
+
+fn push_str(b: *mut rt.Buf, t: str) {
+    rt.buf_push_bytes(b, t.p as u64, t.n)
+}
+
+fn send_upgrade(c: *mut WsClient, s: *mut stream.Stream) {
+    var nonce: [u8; 16] = [0; 16]
+    if !random.random_bytes((&nonce[0]) as u64, 16) {
+        (*c).err = WSE_IO
+        stream.stream_abort(s)
+        return
+    }
+    var key: rt.Buf = rt.buf_new()
+    base64.encode((&nonce[0]) as u64, 16, &key)
+    (*c).nkey = key.len
+    var i: usize = 0
+    while i < key.len && i < 32 {
+        (*c).key[i] = rt.ld8(key.ptr, i)
+        i = i + 1
+    }
+    var req: rt.Buf = rt.buf_new()
+    push_str(&req, "GET ")
+    rt.buf_push_bytes(&req, url.url_path_ptr(&(*c).u), url.url_path_len(&(*c).u))
+    push_str(&req, " HTTP/1.1\r\nHost: ")
+    rt.buf_push_bytes(&req, url.url_host_ptr(&(*c).u), url.url_host_len(&(*c).u))
+    if url.url_port(&(*c).u) != url.url_default_port(&(*c).u) {
+        rt.buf_push(&req, 58 as u8)
+        rt.buf_push_dec_u64(&req, url.url_port(&(*c).u) as u64)
+    }
+    push_str(&req, "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ")
+    rt.buf_push_bytes(&req, key.ptr, key.len)
+    push_str(&req, "\r\n")
+    if (*c).protos.len > 0 {
+        push_str(&req, "Sec-WebSocket-Protocol: ")
+        rt.buf_push_bytes(&req, (*c).protos.ptr, (*c).protos.len)
+        push_str(&req, "\r\n")
+    }
+    rt.buf_push_bytes(&req, (*c).extra.ptr, (*c).extra.len)
+    push_str(&req, "\r\n")
+    rt.buf_free(&key)
+    stream.stream_write(s, req.ptr, req.len)
+    rt.buf_free(&req)
+    (*c).state = WS_HANDSHAKE
+}
+
+fn hdr_ci_eq(p: u64, n: usize, lit: str) -> bool {
+    if n != lit.n { return false }
+    return ws_ci_prefix(p, n, lit)
+}
+
+// The 101 answer. Leftover octets are frames and stay in the stream.
+fn read_upgrade(c: *mut WsClient, s: *mut stream.Stream) {
+    let have: usize = stream.stream_in_len(s)
+    let p: u64 = stream.stream_in_ptr(s)
+    var end: usize = 0
+    var i: usize = 0
+    while i + 4 <= have {
+        if rt.ld8(p, i) == 13 as u8 && rt.ld8(p, i + 1) == 10 as u8 &&
+        rt.ld8(p, i + 2) == 13 as u8 && rt.ld8(p, i + 3) == 10 as u8 {
+            end = i + 4
+            break
+        }
+        i = i + 1
+    }
+    if end == 0 {
+        if have > 16384 {
+            (*c).err = WSE_HANDSHAKE
+            stream.stream_abort(s)
+        }
+        return
+    }
+    // status line
+    var status: u32 = 0
+    if end >= 12 && ws_ci_prefix(p, end, "http/1.1 ") {
+        var q: usize = 9
+        var d: usize = 0
+        while q < end && d < 3 && rt.ld8(p, q) >= 48 as u8 && rt.ld8(p, q) <= 57 as u8 {
+            status = status * 10 as u32 + (rt.ld8(p, q) - 48 as u8) as u32
+            q = q + 1
+            d = d + 1
+        }
+    }
+    (*c).status = status
+    var accept_ok: bool = false
+    var upgrade_ok: bool = false
+    var conn_ok: bool = false
+    var ext_seen: bool = false
+    (*c).nproto = 0
+    var want: rt.Buf = rt.buf_new()
+    ws.accept_key(str { p: (&(*c).key[0]) as *mut u8, n: (*c).nkey }, &want)
+    // header lines
+    var ls: usize = 0
+    while ls < end {
+        var le: usize = ls
+        while le < end && rt.ld8(p, le) != 10 as u8 { le = le + 1 }
+        var ll: usize = le - ls
+        if ll > 0 && rt.ld8(p, ls + ll - 1) == 13 as u8 { ll = ll - 1 }
+        var colon: usize = 0
+        var k: usize = 0
+        while k < ll {
+            if rt.ld8(p, ls + k) == 58 as u8 { colon = k; break }
+            k = k + 1
+        }
+        if colon > 0 {
+            var vs: usize = colon + 1
+            while vs < ll && (rt.ld8(p, ls + vs) == 32 as u8 || rt.ld8(p, ls + vs) == 9 as u8) { vs = vs + 1 }
+            var ve: usize = ll
+            while ve > vs && (rt.ld8(p, ls + ve - 1) == 32 as u8 || rt.ld8(p, ls + ve - 1) == 9 as u8) { ve = ve - 1 }
+            let np: u64 = p + ls as u64
+            let vp: u64 = p + (ls + vs) as u64
+            let vn: usize = ve - vs
+            if hdr_ci_eq(np, colon, "sec-websocket-accept") {
+                accept_ok = vn == want.len && rt.mem_eq(vp, want.ptr, want.len)
+            } else if hdr_ci_eq(np, colon, "upgrade") {
+                upgrade_ok = hdr_ci_eq(vp, vn, "websocket")
+            } else if hdr_ci_eq(np, colon, "connection") {
+                // a list: look for "upgrade"
+                var z: usize = 0
+                while z + 7 <= vn {
+                    if ws_ci_prefix(vp + z as u64, vn - z, "upgrade") { conn_ok = true }
+                    z = z + 1
+                }
+            } else if hdr_ci_eq(np, colon, "sec-websocket-extensions") {
+                ext_seen = true
+            } else if hdr_ci_eq(np, colon, "sec-websocket-protocol") {
+                var m: usize = vn
+                if m > 64 { m = 64 }
+                rt.mem_copy((&(*c).proto[0]) as u64, vp, m)
+                (*c).nproto = m
+            }
+        }
+        ls = le + 1
+    }
+    rt.buf_free(&want)
+    stream.stream_consume(s, end)
+    if status != 101 || !accept_ok || !upgrade_ok || !conn_ok || ext_seen {
+        (*c).err = WSE_HANDSHAKE
+        stream.stream_abort(s)
+        return
+    }
+    // a protocol the client never offered is a violation (RFC 6455 4.1)
+    if (*c).nproto > 0 && (*c).protos.len == 0 {
+        (*c).err = WSE_HANDSHAKE
+        stream.stream_abort(s)
+        return
+    }
+    (*c).state = WS_OPEN
+    (*c).ever_open = true
+    (*c).attempt = 0
+    (*c).n_open = (*c).n_open + 1
+    (*c).last_rx = loop.mono_ms()
+    stream.stream_set_timeout(s, 0) // from now on the keep-alive decides
+    stream.stream_set_max_in(s, (*c).max_msg + 16384)
+    arm_keepalive(c)
+    emit(c, WE_OPEN, 0)
+    // frames that came with the upgrade
+    if (*c).s == s && ((*c).state == WS_OPEN || (*c).state == WS_CLOSING) && stream.stream_in_len(s) > 0 {
+        read_frames(c, s)
+    }
+}
+
+// --------------------------------------------------------------- Keep-alive
+
+fn arm_keepalive(c: *mut WsClient) {
+    if (*c).ka_timer != 0 {
+        loop.timer_cancel((*c).l, (*c).ka_timer)
+        (*c).ka_timer = 0
+    }
+    if (*c).ka_interval <= 0 {
+        return
+    }
+    var tick: i64 = (*c).ka_interval
+    if (*c).ka_timeout > 0 && (*c).ka_timeout < tick {
+        tick = (*c).ka_timeout
+    }
+    tick = tick / 4
+    if tick < 5 { tick = 5 }
+    (*c).ka_timer = loop.timer_every((*c).l, tick, ka_tick, c as u64)
+}
+
+fn ka_tick(l: *mut loop.Loop, ud: u64) {
+    let c: *mut WsClient = ud as *mut WsClient
+    if (*c).dead || (*c).state != WS_OPEN || (*c).s as u64 == 0 {
+        return
+    }
+    let now: i64 = loop.mono_ms()
+    if (*c).ping_out {
+        if now - (*c).ping_at >= (*c).ka_timeout {
+            // dead: nothing came back (and nothing else arrived either)
+            fail(c, WSE_TIMEOUT)
+        }
+        return
+    }
+    if now - (*c).last_rx >= (*c).ka_interval {
+        send_control(c, ws.OP_PING, 0 as u64, 0)
+        (*c).ping_out = true
+        (*c).ping_at = now
+        (*c).n_ping = (*c).n_ping + 1
+    }
+}
+
+// -------------------------------------------------------------- Sending
+
+// One frame (op, payload) from the client: always masked.
+fn send_control(c: *mut WsClient, op: u32, p: u64, n: usize) -> bool {
+    if (*c).s as u64 == 0 {
+        return false
+    }
+    var mask: [u8; 4] = [0; 4]
+    if !random.random_bytes((&mask[0]) as u64, 4) {
+        return false
+    }
+    var out: rt.Buf = rt.buf_new()
+    ws.write_frame(&out, op, true, p, n, (&mask[0]) as u64)
+    let ok: bool = stream.stream_write((*c).s, out.ptr, out.len)
+    rt.buf_free(&out)
+    return ok
+}
+
+fn send_message(c: *mut WsClient, op: u32, p: u64, n: usize) -> bool {
+    if (*c).state != WS_OPEN || (*c).s as u64 == 0 {
+        return false // W1
+    }
+    var out: rt.Buf = rt.buf_new()
+    var at: usize = 0
+    var first: bool = true
+    var fsz: usize = (*c).frag
+    if fsz == 0 || n <= fsz { fsz = n }
+    if n == 0 {
+        // an empty message is one empty frame
+        var mask0: [u8; 4] = [0; 4]
+        if !random.random_bytes((&mask0[0]) as u64, 4) {
+            rt.buf_free(&out)
+            return false
+        }
+        ws.write_frame(&out, op, true, p, 0, (&mask0[0]) as u64)
+    }
+    while at < n {
+        var k: usize = n - at
+        if k > fsz { k = fsz }
+        var mask: [u8; 4] = [0; 4]
+        if !random.random_bytes((&mask[0]) as u64, 4) {
+            rt.buf_free(&out)
+            return false
+        }
+        var fop: u32 = ws.OP_CONT
+        if first { fop = op }
+        ws.write_frame(&out, fop, at + k == n, p + at as u64, k, (&mask[0]) as u64)
+        first = false
+        at = at + k
+    }
+    let ok: bool = stream.stream_write((*c).s, out.ptr, out.len)
+    rt.buf_free(&out)
+    if ok { (*c).n_out = (*c).n_out + 1 }
+    return ok
+}
+
+fn wsc_send_text(c: *mut WsClient, p: u64, n: usize) -> bool {
+    return send_message(c, ws.OP_TEXT, p, n)
+}
+
+fn wsc_send_str(c: *mut WsClient, t: str) -> bool {
+    return send_message(c, ws.OP_TEXT, t.p as u64, t.n)
+}
+
+fn wsc_send_binary(c: *mut WsClient, p: u64, n: usize) -> bool {
+    return send_message(c, ws.OP_BINARY, p, n)
+}
+
+// A ping with up to 125 octets of payload; the pong arrives as WE_PONG.
+fn wsc_ping(c: *mut WsClient, p: u64, n: usize) -> bool {
+    if (*c).state != WS_OPEN || n > 125 {
+        return false
+    }
+    (*c).n_ping = (*c).n_ping + 1
+    return send_control(c, ws.OP_PING, p, n)
+}
+
+// ------------------------------------------------------------------ Receiving
+
+fn read_frames(c: *mut WsClient, s: *mut stream.Stream) {
+    let epoch: u32 = (*c).epoch
+    while !(*c).dead && (*c).s == s && (*c).epoch == epoch &&
+    ((*c).state == WS_OPEN || (*c).state == WS_CLOSING) {
+        let have: usize = stream.stream_in_len(s)
+        let base: u64 = stream.stream_in_ptr(s)
+        var f: ws.Frame = ws.frame_new()
+        let r: i32 = ws.parse_frame(base, have, &f)
+        if r == ws.PARSE_ERROR {
+            protocol_error(c, f.err)
+            return
+        }
+        if r == ws.PARSE_MORE || (have as u64) < (f.hlen as u64) + f.plen {
+            if f.plen > (*c).max_msg as u64 + 1024 && r != ws.PARSE_MORE {
+                protocol_error(c, 1009)
+            }
+            return
+        }
+        if f.masked {
+            protocol_error(c, 1002) // a server never masks
+            return
+        }
+        let pl: usize = f.plen as usize
+        let pp: u64 = base + f.hlen as u64
+        (*c).last_rx = loop.mono_ms()
+        (*c).ping_out = false
+        (*c).b_in = (*c).b_in + (f.hlen + pl) as u64
+        if f.op == ws.OP_PING {
+            if (*c).state == WS_OPEN {
+                send_control(c, ws.OP_PONG, pp, pl)
+            }
+        } else if f.op == ws.OP_PONG {
+            rt.buf_clear(&(*c).msg)
+            rt.buf_push_bytes(&(*c).msg, pp, pl)
+            emit(c, WE_PONG, 0)
+        } else if f.op == ws.OP_CLOSE {
+            peer_close(c, s, pp, pl)
+            return
+        } else {
+            if f.op == ws.OP_CONT {
+                if !(*c).in_msg {
+                    protocol_error(c, 1002)
+                    return
+                }
+            } else {
+                if (*c).in_msg {
+                    protocol_error(c, 1002)
+                    return
+                }
+                (*c).in_msg = true
+                (*c).mop = f.op
+                (*c).utf = ws.utf8_new()
+                rt.buf_clear(&(*c).msg)
+            }
+            if (*c).msg.len + pl > (*c).max_msg {
+                protocol_error(c, 1009)
+                return
+            }
+            if (*c).mop == ws.OP_TEXT && !ws.utf8_feed(&(*c).utf, pp, pl) {
+                protocol_error(c, 1007)
+                return
+            }
+            rt.buf_push_bytes(&(*c).msg, pp, pl)
+            if f.fin {
+                if (*c).mop == ws.OP_TEXT && !ws.utf8_complete(&(*c).utf) {
+                    protocol_error(c, 1007)
+                    return
+                }
+                (*c).in_msg = false
+                (*c).n_in = (*c).n_in + 1
+                let mop: u32 = (*c).mop
+                if (*c).state == WS_OPEN {
+                    stream.stream_consume(s, f.hlen + pl)
+                    emit(c, WE_MESSAGE, mop)
+                    continue
+                }
+            }
+        }
+        stream.stream_consume(s, f.hlen + pl)
+    }
+}
+
+// The peer's close frame (`pp`/`pl` is its payload).
+fn peer_close(c: *mut WsClient, s: *mut stream.Stream, pp: u64, pl: usize) {
+    var code: u32 = 1005
+    (*c).npeer_reason = 0
+    if pl == 1 {
+        protocol_error(c, 1002)
+        return
+    }
+    if pl >= 2 {
+        code = ((rt.ld8(pp, 0) as u32) << 8) | (rt.ld8(pp, 1) as u32)
+        if !ws.close_code_ok(code) {
+            protocol_error(c, 1002)
+            return
+        }
+        if pl > 2 {
+            var u: ws.Utf8 = ws.utf8_new()
+            if !ws.utf8_feed(&u, pp + 2 as u64, pl - 2) || !ws.utf8_complete(&u) {
+                protocol_error(c, 1007)
+                return
+            }
+            var m: usize = pl - 2
+            if m > 123 { m = 123 }
+            rt.mem_copy((&(*c).peer_reason[0]) as u64, pp + 2 as u64, m)
+            (*c).npeer_reason = m
+        }
+    }
+    (*c).close_got = true
+    (*c).close_code = code
+    if !(*c).close_sent {
+        // answer with the same code (RFC 6455 5.5.1)
+        var b: [u8; 2] = [0, 0]
+        var rc: u32 = code
+        if code == 1005 { rc = 1000 }
+        b[0] = ((rc >> 8) & 255) as u8
+        b[1] = (rc & 255) as u8
+        send_control(c, ws.OP_CLOSE, (&b[0]) as u64, 2)
+        (*c).close_sent = true
+    }
+    (*c).state = WS_CLOSING
+    stream.stream_consume(s, stream.stream_in_len(s))
+    stream.stream_close(s) // the close frame goes out first, then the socket
+}
+
+// Sends our close frame with `code` (1002, 1007, 1009 ...) and ends.
+fn protocol_error(c: *mut WsClient, code: u32) {
+    (*c).err = WSE_PROTOCOL
+    if code == 1009 { (*c).err = WSE_TOO_LARGE }
+    (*c).close_code = code
+    if !(*c).close_sent {
+        var b: [u8; 2] = [0, 0]
+        b[0] = ((code >> 8) & 255) as u8
+        b[1] = (code & 255) as u8
+        send_control(c, ws.OP_CLOSE, (&b[0]) as u64, 2)
+        (*c).close_sent = true
+    }
+    (*c).state = WS_CLOSING
+    (*c).close_got = true // nothing more is read: end after the frame is out
+    let s: *mut stream.Stream = (*c).s
+    if s as u64 != 0 {
+        stream.stream_consume(s, stream.stream_in_len(s))
+        stream.stream_close(s)
+    }
+}
+
+// The connection is bad: drop it NOW (no closing handshake).
+fn fail(c: *mut WsClient, code: u32) {
+    (*c).err = code
+    let s: *mut stream.Stream = (*c).s
+    if s as u64 != 0 {
+        stream.stream_abort(s)
+    }
+}
+
+// ------------------------------------------------------------------ Closing
+
+// Starts the closing handshake. `code` 1000 = normal; 0 = no code. The
+// connection stays until the peer answers or `wsc_set_close_timeout` passes
+// (then it is dropped). No reconnect follows. Before the upgrade: stops
+// trying.
+fn wsc_close(c: *mut WsClient, code: u32) {
+    (*c).user_closed = true
+    if (*c).state == WS_WAITING {
+        cancel_timers(c)
+        (*c).state = WS_IDLE
+        return
+    }
+    if (*c).state == WS_CONNECTING || (*c).state == WS_HANDSHAKE {
+        wsc_abort(c)
+        return
+    }
+    if (*c).state != WS_OPEN {
+        return
+    }
+    if !(*c).close_sent {
+        if code == 0 {
+            send_control(c, ws.OP_CLOSE, 0 as u64, 0)
+        } else {
+            var b: [u8; 2] = [0, 0]
+            b[0] = ((code >> 8) & 255) as u8
+            b[1] = (code & 255) as u8
+            send_control(c, ws.OP_CLOSE, (&b[0]) as u64, 2)
+        }
+        (*c).close_sent = true
+    }
+    if code != 0 { (*c).close_code = code } else { (*c).close_code = 1005 }
+    (*c).state = WS_CLOSING
+    if (*c).ka_timer != 0 {
+        loop.timer_cancel((*c).l, (*c).ka_timer)
+        (*c).ka_timer = 0
+    }
+    if (*c).close_timeout_ms > 0 && (*c).close_timer == 0 {
+        (*c).close_timer = loop.timer_after((*c).l, (*c).close_timeout_ms, on_close_timeout, c as u64)
+    }
+}
+
+fn on_close_timeout(l: *mut loop.Loop, ud: u64) {
+    let c: *mut WsClient = ud as *mut WsClient
+    (*c).close_timer = 0
+    if (*c).dead || (*c).state != WS_CLOSING {
+        return
+    }
+    // the peer never answered: drop the connection
+    (*c).close_code = 1006
+    let s: *mut stream.Stream = (*c).s
+    if s as u64 != 0 {
+        stream.stream_abort(s)
+    }
+}
+
+// Hard stop: no handshake, no reconnect, WE_CLOSE (1006) if it was open.
+fn wsc_abort(c: *mut WsClient) {
+    (*c).user_closed = true
+    if (*c).state == WS_WAITING {
+        cancel_timers(c)
+        (*c).state = WS_IDLE
+        return
+    }
+    let s: *mut stream.Stream = (*c).s
+    if s as u64 != 0 {
+        (*c).close_code = 1006
+        stream.stream_abort(s)
+    }
+}
+
+// The stream is gone (closed, failed or aborted).
+fn on_stream_closed(c: *mut WsClient, s: *mut stream.Stream, reason: i64) {
+    if (*c).ka_timer != 0 {
+        loop.timer_cancel((*c).l, (*c).ka_timer)
+        (*c).ka_timer = 0
+    }
+    if (*c).close_timer != 0 {
+        loop.timer_cancel((*c).l, (*c).close_timer)
+        (*c).close_timer = 0
+    }
+    let was_open: bool = (*c).ever_open
+    if !was_open {
+        // an attempt that never got to OPEN
+        if (*c).err == 0 {
+            if reason == stream.CL_TLS {
+                (*c).err = WSE_TLS
+                (*c).tlserr = stream.stream_tls_error(s)
+            } else if reason == stream.CL_TIMEOUT {
+                (*c).err = WSE_TIMEOUT
+            } else if reason == stream.CL_CONNECT {
+                (*c).err = WSE_CONNECT
+            } else {
+                (*c).err = WSE_IO
+            }
+        }
+        // the next address of the answer, if there is one
+        if (*c).err == WSE_CONNECT && (*c).iaddr + 1 < (*c).naddr && !(*c).user_closed {
+            (*c).iaddr = (*c).iaddr + 1
+            (*c).err = 0
+            if open_stream(c) {
+                return
+            }
+        }
+        attempt_failed(c)
+        return
+    }
+    // a connection that WAS open
+    if (*c).err == 0 && reason == stream.CL_TLS {
+        (*c).err = WSE_TLS
+        (*c).tlserr = stream.stream_tls_error(s)
+    } else if (*c).err == 0 && reason == stream.CL_ERROR {
+        (*c).err = WSE_IO
+    }
+    if !(*c).close_got && !(*c).close_sent {
+        (*c).close_code = 1006
+    } else if !(*c).close_got && (*c).close_sent && (*c).close_code != 1006 && !(*c).user_closed {
+        (*c).close_code = 1006
+    }
+    (*c).state = WS_IDLE
+    (*c).in_msg = false
+    if (*c).err != 0 {
+        emit(c, WE_ERROR, (*c).err)
+    }
+    if (*c).dead { return }
+    (*c).emitted_close = true
+    emit(c, WE_CLOSE, (*c).close_code)
+    if (*c).dead { return }
+    maybe_reconnect(c)
+}
+
+// An attempt that did not reach OPEN: tell, then retry or give up.
+fn attempt_failed(c: *mut WsClient) {
+    (*c).state = WS_IDLE
+    (*c).s = 0 as *mut stream.Stream
+    emit(c, WE_ERROR, (*c).err)
+    if (*c).dead { return }
+    maybe_reconnect(c)
+}
+
+fn maybe_reconnect(c: *mut WsClient) {
+    if (*c).user_closed || !(*c).auto || (*c).dead || !(*c).have_url {
+        return
+    }
+    if (*c).max_attempts != 0 && (*c).attempt >= (*c).max_attempts {
+        return
+    }
+    var rnd: [u8; 4] = [0; 4]
+    random.random_bytes((&rnd[0]) as u64, 4)
+    let r: u32 = (rnd[0] as u32) | ((rnd[1] as u32) << 8) | ((rnd[2] as u32) << 16)
+    (*c).delay_ms = ws.backoff_ms((*c).attempt, (*c).base_ms, (*c).cap_ms, r)
+    (*c).attempt = (*c).attempt + 1
+    (*c).state = WS_WAITING
+    (*c).rtimer = loop.timer_after((*c).l, (*c).delay_ms, on_retry, c as u64)
+    emit(c, WE_RECONNECT, (*c).attempt)
+}
+
+fn on_retry(l: *mut loop.Loop, ud: u64) {
+    let c: *mut WsClient = ud as *mut WsClient
+    (*c).rtimer = 0
+    if (*c).dead || (*c).state != WS_WAITING || (*c).user_closed {
+        return
+    }
+    (*c).n_reco = (*c).n_reco + 1
+    start_attempt(c)
+}

@@ -47,6 +47,10 @@
 #                         from the gallery or the camera): the manifest gets
 #                         the invisible org.firn.FirnPick activity (same
 #                         classes.dex as --push)
+#   --icon-res <dir>      launcher icon resources (tools/pack/icons.fi makes them:
+#                         <outdir>/android/res with mipmap-*dpi, mipmap-anydpi-v26
+#                         and values/ic_launcher_background.xml): compiled with
+#                         aapt2 into the APK, the manifest gets android:icon
 #   --out <file.apk>      (default: build/android/<name>/<name>.apk)
 #
 # Environment: FIRNC, FIRNLIB (default: this tree), NDK, SDK, API (29),
@@ -65,7 +69,7 @@ SRCDIR=$(dirname "$ENTRY_ABS")
 NAME=$(basename "$SRCDIR"); PKG=""; LIB=firnapp; ABI=both
 VCODE=1; VNAME=0.1; OPT=release-safe; ASSETS=""; PERMS=(); EXTRA=""; DEX=""
 PUSH=0; PICK=0; ARGSFILE=""
-OUT=""
+OUT=""; ICONRES=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --name) NAME=$2; shift 2 ;;
@@ -82,6 +86,7 @@ while [ $# -gt 0 ]; do
         --push) PUSH=1; shift ;;
         --pick) PICK=1; shift ;;
         --args-file) ARGSFILE=$2; shift 2 ;;
+        --icon-res) ICONRES=$2; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
         *) echo "unknown option $1" >&2; usage ;;
     esac
@@ -184,8 +189,10 @@ EOF
     for p in ${PERMS[@]+"${PERMS[@]}"}; do
         echo "    <uses-permission android:name=\"$p\" />"
     done
+    ICONATTR=""
+    [ -n "$ICONRES" ] && ICONATTR='android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round"'
     cat <<EOF
-    <application android:label="$NAME" android:hasCode="$HASCODE"
+    <application android:label="$NAME" android:hasCode="$HASCODE" $ICONATTR
         android:extractNativeLibs="true">
         <activity android:name="android.app.NativeActivity"
             android:label="$NAME" android:exported="true"
@@ -204,9 +211,14 @@ EOF
     echo "</manifest>"
 } > "$MAN"
 
+RESARGS=()
+if [ -n "$ICONRES" ]; then
+    "$BT/aapt2" compile --dir "$ICONRES" -o "$BUILD/res.zip"
+    RESARGS=("$BUILD/res.zip")
+fi
 "$BT/aapt2" link -I "$SDK/platforms/android-35/android.jar" \
     --manifest "$MAN" --min-sdk-version "$API" --target-sdk-version 34 \
-    -o "$BUILD/raw.apk"
+    ${RESARGS[@]+"${RESARGS[@]}"} -o "$BUILD/raw.apk"
 
 PACK=$BUILD/pack
 mkdir -p "$PACK/lib"

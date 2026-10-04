@@ -42,6 +42,26 @@
 //     library creates its own parent-side ends non-inheritable; a handle
 //     the program made inheritable itself goes along.
 // W9  `fork` has no equivalent and nothing here needs it.
+// W10 PROCESS TREES are JOB OBJECTS. `set_group(c, true)` starts the child
+//     suspended, puts it into a new job (`CreateJobObjectW`,
+//     `AssignProcessToJobObject`) and only then resumes it, so it cannot
+//     start a grandchild outside the job; children of a member join the job
+//     automatically. `kill_tree` and `terminate_tree` are
+//     `TerminateJobObject` (exit code 137 resp. 143, like W1: Windows has no
+//     "ask nicely" for a tree). `set_kill_with_launcher(c, true)` adds
+//     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: the job handle belongs to the
+//     launcher, and when the launcher ends (normally, crashed, killed) the
+//     system closes it and kills every process in the job. `close` does NOT
+//     close the job handle (that would kill the tree of a launcher that only
+//     wanted to release the pipes): one handle per grouped child stays until
+//     the launcher ends. If the job cannot be created or assigned
+//     (Windows 7 and a launcher that is itself in a job; nested jobs work
+//     from Windows 8) `spawn` fails with Resource and the child is killed:
+//     a launcher that asked for the guarantee does not get a child without it.
+//     Where it is kept: `Child.h` holds the process handle in its low 32 bits
+//     and the job handle in the high 32 (Windows handles are 32 bit values by
+//     design); never read it directly. A process that is allowed to break
+//     away from jobs (CREATE_BREAKAWAY_FROM_JOB) escapes.
 
 import rt
 import str
@@ -55,11 +75,11 @@ export {
     STDIO_INHERIT, STDIO_PIPE, STDIO_NULL,
     command, command_free, add_arg, set_cwd, set_env, unset_env, clear_env,
     set_stdin, set_stdout, set_stderr, merge_stderr,
-    set_no_window, set_detach,
+    set_no_window, set_detach, set_group, set_kill_with_launcher, kill_with_launcher_supported,
     spawn, run, run_capture, run_io, communicate,
     write_in, close_in, read_out, read_err, read_out_nb, read_err_nb,
     wait, wait_timeout, try_wait, is_running, exit_code, term_signal, pid_of,
-    kill, terminate, close,
+    kill, terminate, kill_tree, terminate_tree, is_grouped, close,
     last_errno,
 }
 
@@ -90,12 +110,14 @@ struct Command {
     err_mode: u8,
     no_window: bool,
     detach: bool,
+    group: bool,
+    kill_close: bool,
     bad: bool,
 }
 
 struct Child {
     pid: i64,
-    h: u64, // the process handle
+    h: u64, // low 32 bits: the process handle; high 32 bits: the job handle (W10)
     in_fd: i64, // HANDLE values, -1 = none
     out_fd: i64,
     err_fd: i64,
@@ -121,6 +143,11 @@ extern fn WriteFile(h: i64, buf: u64, n: i64, put: u64, ov: u64) -> i32;
 extern fn CreateFileW(name: u64, access: i64, share: i64, sa: u64, disp: i64, flags: i64,
     tmpl: i64) -> i64;
 extern fn GetStdHandle(which: i64) -> i64;
+extern fn CreateJobObjectW(sa: u64, name: u64) -> u64;
+extern fn AssignProcessToJobObject(job: u64, proc: u64) -> i32;
+extern fn SetInformationJobObject(job: u64, class: i64, info: u64, len: i64) -> i32;
+extern fn TerminateJobObject(job: u64, code: i64) -> i32;
+extern fn ResumeThread(h: u64) -> i32;
 extern fn GetLastError() -> i32;
 extern fn Sleep(ms: i64);
 
@@ -130,6 +157,10 @@ const STARTF_USESTDHANDLES: u32 = 256
 const CREATE_UNICODE_ENVIRONMENT: i64 = 1024
 const CREATE_NO_WINDOW: i64 = 134217728 // 0x08000000
 const DETACHED_PROCESS: i64 = 8
+const CREATE_SUSPENDED: i64 = 4
+const JOB_EXTENDED_LIMIT_INFORMATION: i64 = 9
+const JOB_LIMIT_KILL_ON_JOB_CLOSE: u32 = 8192 // 0x2000
+const JOB_EXTENDED_LIMIT_SIZE: i64 = 144 // JOBOBJECT_EXTENDED_LIMIT_INFORMATION on x64
 const CREATE_NEW_PROCESS_GROUP: i64 = 512
 const INFINITE: i64 = 4294967295
 const WAIT_OBJECT_0: i32 = 0
@@ -166,7 +197,8 @@ fn command(program: str) -> Command {
     var c: Command = Command {
         program: rt.buf_new(), args: rt.buf_new(), nargs: 0, cwd: rt.buf_new(),
         envs: rt.buf_new(), env_clear: false, in_mode: 0 as u8, out_mode: 0 as u8,
-        err_mode: 0 as u8, no_window: false, detach: false, bad: false,
+        err_mode: 0 as u8, no_window: false, detach: false, group: false,
+        kill_close: false, bad: false,
     }
     if program.length() == 0 || !push_cstr(&c.program, program) {
         c.bad = true
@@ -299,6 +331,26 @@ fn set_no_window(c: *mut Command, on: bool) {
 
 fn set_detach(c: *mut Command, on: bool) {
     (*c).detach = on
+}
+
+// The child leads a job object of its own, so that `kill_tree` /
+// `terminate_tree` reach it and everything it starts (W10).
+fn set_group(c: *mut Command, on: bool) {
+    (*c).group = on
+}
+
+// The child and its tree are killed when the launcher ends (W10); implies
+// `set_group`.
+fn set_kill_with_launcher(c: *mut Command, on: bool) {
+    (*c).kill_close = on
+    if on {
+        (*c).group = true
+    }
+}
+
+// true on Windows: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+fn kill_with_launcher_supported() -> bool {
+    return true
 }
 
 // ---------------------------------------------------------- The helpers
@@ -545,6 +597,7 @@ fn spawn(c: *mut Command) -> ProcError!Child {
     var result_ok: bool = false
     var pid: i64 = 0
     var hproc: u64 = 0
+    var hjob: u64 = 0
     var fail_code: i64 = 0
     if ok && cin != -1 && cout != -1 && cerr != -1 {
         // STARTUPINFOW (104 octets): cb at 0, dwFlags at 60, the handles at 80/88/96
@@ -557,6 +610,10 @@ fn spawn(c: *mut Command) -> ProcError!Child {
         rt.st64(sip, 12, cerr as u64)
         var pi: [u64; 3] = [0; 3] // hProcess, hThread, dwProcessId, dwThreadId
         var flags: i64 = CREATE_UNICODE_ENVIRONMENT
+        if (*c).group {
+            // suspended until it is inside the job (W10)
+            flags = flags | CREATE_SUSPENDED
+        }
         if (*c).detach {
             flags = flags | CREATE_NEW_PROCESS_GROUP
             if (*c).no_window {
@@ -579,9 +636,29 @@ fn spawn(c: *mut Command) -> ProcError!Child {
             env_ptr, dir_ptr, sip, (&pi[0]) as u64)
         if r != 0 {
             result_ok = true
-            hproc = pi[0]
-            CloseHandle(pi[1] as i64)
+            hproc = pi[0] & 4294967295
             pid = (pi[2] & 4294967295) as i64
+            if (*c).group {
+                hjob = job_new((*c).kill_close)
+                if hjob == 0 || AssignProcessToJobObject(hjob, hproc) == 0 {
+                    // no job, no child: a guarantee that was asked for is not faked
+                    fail_code = GetLastError() as i64
+                    if fail_code == 0 {
+                        fail_code = 6
+                    }
+                    result_ok = false
+                    TerminateProcess(hproc, 1)
+                    CloseHandle(hproc as i64)
+                    if hjob != 0 {
+                        CloseHandle(hjob as i64)
+                        hjob = 0
+                    }
+                    fail_code = 6
+                } else {
+                    ResumeThread(pi[1])
+                }
+            }
+            CloseHandle(pi[1] as i64)
         } else {
             fail_code = GetLastError() as i64
         }
@@ -610,7 +687,7 @@ fn spawn(c: *mut Command) -> ProcError!Child {
         return error_of(fail_code)
     }
     return Child {
-        pid: pid, h: hproc, in_fd: pin_w, out_fd: pout_r, err_fd: perr_r,
+        pid: pid, h: hproc | (hjob << 32), in_fd: pin_w, out_fd: pout_r, err_fd: perr_r,
         done: false, code: 0, sig: 0, own: true,
     }
 }
@@ -699,24 +776,55 @@ fn read_err_nb(ch: *mut Child, p: u64, cap: usize) -> i64 {
 
 // --------------------------------------------------------------- Waiting
 
+// The two handles packed into `Child.h` (W10).
+fn proc_h(ch: *mut Child) -> u64 {
+    return (*ch).h & 4294967295
+}
+
+fn job_h(ch: *mut Child) -> u64 {
+    return (*ch).h >> 32
+}
+
+// A new job object; with `kill_close` its limit says "kill everything when the
+// last handle is closed". 0 = it could not be made.
+fn job_new(kill_close: bool) -> u64 {
+    var job: u64 = CreateJobObjectW(0, 0)
+    if job == 0 {
+        return 0
+    }
+    job = job & 4294967295
+    if kill_close {
+        var info: [u64; 18] = [0; 18]
+        let ip: u64 = (&info[0]) as u64
+        rt.st32(ip, 4, JOB_LIMIT_KILL_ON_JOB_CLOSE) // BasicLimitInformation.LimitFlags at 16
+        if SetInformationJobObject(job, JOB_EXTENDED_LIMIT_INFORMATION, ip,
+            JOB_EXTENDED_LIMIT_SIZE) == 0 {
+            CloseHandle(job as i64)
+            return 0
+        }
+    }
+    return job
+}
+
 // Waits `ms` (INFINITE = forever); true = the child has ended, the code is read.
 fn wait_h(ch: *mut Child, ms: i64) -> bool {
     if (*ch).done {
         return true
     }
-    if (*ch).h == 0 {
+    let ph: u64 = proc_h(ch)
+    if ph == 0 {
         return true
     }
-    let r: i32 = WaitForSingleObject((*ch).h, ms)
+    let r: i32 = WaitForSingleObject(ph, ms)
     if r != WAIT_OBJECT_0 {
         return false
     }
     var code: [u32; 2] = [0; 2]
-    GetExitCodeProcess((*ch).h, (&code[0]) as u64)
+    GetExitCodeProcess(ph, (&code[0]) as u64)
     (*ch).code = code[0] as i32
     (*ch).done = true
-    CloseHandle((*ch).h as i64)
-    (*ch).h = 0
+    CloseHandle(ph as i64)
+    (*ch).h = (*ch).h & 18446744069414584320 // keep the job handle (high half)
     return true
 }
 
@@ -754,15 +862,39 @@ fn pid_of(ch: *mut Child) -> i64 {
 }
 
 fn kill(ch: *mut Child) {
-    if !(*ch).done && (*ch).h != 0 {
-        TerminateProcess((*ch).h, 137)
+    if !(*ch).done && proc_h(ch) != 0 {
+        TerminateProcess(proc_h(ch), 137)
     }
 }
 
 fn terminate(ch: *mut Child) {
-    if !(*ch).done && (*ch).h != 0 {
-        TerminateProcess((*ch).h, 143)
+    if !(*ch).done && proc_h(ch) != 0 {
+        TerminateProcess(proc_h(ch), 143)
     }
+}
+
+fn is_grouped(ch: *mut Child) -> bool {
+    return job_h(ch) != 0
+}
+
+// Terminates every process of the child's job (W10) -- the child, its
+// children, theirs. true = it went out. A child without a job gets a plain
+// `kill` and the answer is false.
+fn kill_tree(ch: *mut Child) -> bool {
+    if job_h(ch) != 0 {
+        return TerminateJobObject(job_h(ch), 137) != 0
+    }
+    kill(ch)
+    return false
+}
+
+// The same, exit code 143 (there is no gentler way to stop a tree here).
+fn terminate_tree(ch: *mut Child) -> bool {
+    if job_h(ch) != 0 {
+        return TerminateJobObject(job_h(ch), 143) != 0
+    }
+    terminate(ch)
+    return false
 }
 
 // Closes the caller's ends of the pipes, and the process handle once the

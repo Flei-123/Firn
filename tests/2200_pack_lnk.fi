@@ -1,0 +1,159 @@
+// expect_exit: 0
+// tests/2200_pack_lnk.fi -- lib/pack/lnk.fi: a Windows shortcut written as
+// octets and read back; the fixed parts of the layout (header size, the
+// Shell Link CLSID, flags, the ID list, LinkInfo, the terminal block), a
+// non-ASCII target (no ID list, Unicode LinkInfo), refusals.
+import std.rt
+import std.io
+import pack.lnk
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, what: str, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print_line(what)
+    }
+}
+
+fn report(label: str, total: i64, fails: i64) {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, label.p as u64, label.n)
+    rt.buf_push_dec_i64(&b, total)
+    rt.buf_push_bytes(&b, " fails: ".p as u64, 8)
+    rt.buf_push_dec_i64(&b, fails)
+    io.print_line_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+fn u32at(p: u64, off: usize) -> u32 {
+    return (rt.ld8(p, off) as u32) | ((rt.ld8(p, off + 1) as u32) << 8) |
+        ((rt.ld8(p, off + 2) as u32) << 16) | ((rt.ld8(p, off + 3) as u32) << 24)
+}
+
+fn field_is(p: u64, n: usize, which: u32, want: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let ok: bool = lnk.lnk_read(p, n, which, &b)
+    var same: bool = ok && rt.buf_len(&b) == want.n
+    if same {
+        same = rt.mem_eq(rt.buf_ptr(&b), want.p as u64, want.n)
+    }
+    rt.buf_free(&b)
+    return same
+}
+
+fn field_absent(p: u64, n: usize, which: u32) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let ok: bool = lnk.lnk_read(p, n, which, &b)
+    rt.buf_free(&b)
+    return !ok
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var t: Tally = Tally { total: 0, fails: 0 }
+
+    // ---- a full shortcut
+    var s: lnk.LnkSpec = lnk.lnk_spec("C:/Users/me/AppData/Local/Programs/My App/myapp.exe")
+    s.workdir = "C:/Users/me/AppData/Local/Programs/My App"
+    s.args = "--minimized"
+    s.icon = "C:/Users/me/AppData/Local/Programs/My App/myapp.exe"
+    s.icon_index = 0
+    s.desc = "My App"
+    var out: rt.Buf = rt.buf_new()
+    check(&t, "build", lnk.lnk_build(&out, &s))
+    let p: u64 = rt.buf_ptr(&out)
+    let n: usize = rt.buf_len(&out)
+    check(&t, "header size 0x4C", u32at(p, 0) == 76 as u32)
+    check(&t, "CLSID 00021401-0000-0000-C000-000000000046",
+        rt.ld8(p, 4) == 1 as u8 && rt.ld8(p, 5) == 0x14 as u8 && rt.ld8(p, 6) == 2 as u8 &&
+        rt.ld8(p, 12) == 0xC0 as u8 && rt.ld8(p, 19) == 0x46 as u8)
+    let flags: u32 = u32at(p, 20)
+    check(&t, "flags: id list", (flags & 1 as u32) != 0 as u32)
+    check(&t, "flags: link info", (flags & 2 as u32) != 0 as u32)
+    check(&t, "flags: name", (flags & 4 as u32) != 0 as u32)
+    check(&t, "flags: working dir", (flags & 16 as u32) != 0 as u32)
+    check(&t, "flags: arguments", (flags & 32 as u32) != 0 as u32)
+    check(&t, "flags: icon", (flags & 64 as u32) != 0 as u32)
+    check(&t, "flags: unicode", (flags & 128 as u32) != 0 as u32)
+    check(&t, "flags: no link tracking", (flags & 262144 as u32) != 0 as u32)
+    check(&t, "show command normal", u32at(p, 60) == 1 as u32)
+    // the ID list sits right after the header: My Computer item first
+    let idsize: usize = (rt.ld8(p, 76) as usize) | ((rt.ld8(p, 77) as usize) << 8)
+    check(&t, "id list has a size", idsize > 40)
+    check(&t, "first item is My Computer (size 20, type 0x1F)",
+        rt.ld8(p, 78) == 20 as u8 && rt.ld8(p, 80) == 0x1F as u8)
+    check(&t, "second item is the drive C:\\", rt.ld8(p, 98) == 25 as u8 && rt.ld8(p, 100) == 0x2F as u8 &&
+        rt.ld8(p, 101) == 67 as u8 && rt.ld8(p, 102) == 58 as u8 && rt.ld8(p, 103) == 92 as u8)
+    check(&t, "id list ends with a zero item",
+        rt.ld8(p, 76 + 2 + idsize - 2) == 0 as u8 && rt.ld8(p, 76 + 2 + idsize - 1) == 0 as u8)
+    // LinkInfo follows the ID list; its size is consistent
+    let li: usize = 76 + 2 + idsize
+    let lisize: usize = u32at(p, li) as usize
+    check(&t, "link info size fits", lisize > 40 && li + lisize < n)
+    check(&t, "link info header 0x24", u32at(p, li + 4) == 36 as u32)
+    check(&t, "link info flags: local base path", u32at(p, li + 8) == 1 as u32)
+    check(&t, "file ends with the terminal block", u32at(p, n - 4) == 0 as u32)
+
+    // ---- read back
+    check(&t, "target round trip", field_is(p, n, lnk.LNK_TARGET,
+        "C:\\Users\\me\\AppData\\Local\\Programs\\My App\\myapp.exe"))
+    check(&t, "description round trip", field_is(p, n, lnk.LNK_DESC, "My App"))
+    check(&t, "working dir round trip", field_is(p, n, lnk.LNK_WORKDIR,
+        "C:\\Users\\me\\AppData\\Local\\Programs\\My App"))
+    check(&t, "arguments round trip", field_is(p, n, lnk.LNK_ARGS, "--minimized"))
+    check(&t, "icon round trip", field_is(p, n, lnk.LNK_ICON,
+        "C:\\Users\\me\\AppData\\Local\\Programs\\My App\\myapp.exe"))
+
+    // ---- a shortcut with only a target: the other fields are absent
+    var s2: lnk.LnkSpec = lnk.lnk_spec("D:\\tools\\x.exe")
+    var o2: rt.Buf = rt.buf_new()
+    check(&t, "minimal build", lnk.lnk_build(&o2, &s2))
+    let p2: u64 = rt.buf_ptr(&o2)
+    let n2: usize = rt.buf_len(&o2)
+    check(&t, "minimal target", field_is(p2, n2, lnk.LNK_TARGET, "D:\\tools\\x.exe"))
+    check(&t, "minimal: no description", field_absent(p2, n2, lnk.LNK_DESC))
+    check(&t, "minimal: no arguments", field_absent(p2, n2, lnk.LNK_ARGS))
+    check(&t, "minimal: no icon", field_absent(p2, n2, lnk.LNK_ICON))
+    check(&t, "minimal: no working dir", field_absent(p2, n2, lnk.LNK_WORKDIR))
+
+    // ---- a target with a non-ASCII name: no ID list, the Unicode path still reads
+    var s3: lnk.LnkSpec = lnk.lnk_spec("C:\\Users\\J\u00fcrgen\\app.exe")
+    s3.desc = "Z\u00fcrich"
+    var o3: rt.Buf = rt.buf_new()
+    check(&t, "non-ASCII build", lnk.lnk_build(&o3, &s3))
+    let p3: u64 = rt.buf_ptr(&o3)
+    let n3: usize = rt.buf_len(&o3)
+    check(&t, "non-ASCII: no ID list flag", (u32at(p3, 20) & 1 as u32) == 0 as u32)
+    check(&t, "non-ASCII target", field_is(p3, n3, lnk.LNK_TARGET, "C:\\Users\\J\u00fcrgen\\app.exe"))
+    check(&t, "non-ASCII description", field_is(p3, n3, lnk.LNK_DESC, "Z\u00fcrich"))
+
+    // ---- refusals
+    var bad1: lnk.LnkSpec = lnk.lnk_spec("relative\\x.exe")
+    var ob: rt.Buf = rt.buf_new()
+    check(&t, "relative target refused", !lnk.lnk_build(&ob, &bad1))
+    var bad2: lnk.LnkSpec = lnk.lnk_spec("\\\\server\\share\\x.exe")
+    check(&t, "UNC target refused", !lnk.lnk_build(&ob, &bad2))
+    var bad3: lnk.LnkSpec = lnk.lnk_spec("1:\\x.exe")
+    check(&t, "digit drive refused", !lnk.lnk_build(&ob, &bad3))
+    // garbage is not a shortcut
+    var junk: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&junk, "not a shortcut at all, not a shortcut at all, not a shortcut at all, nothing".p as u64, 76)
+    var jb: rt.Buf = rt.buf_new()
+    check(&t, "garbage refused by lnk_read", !lnk.lnk_read(rt.buf_ptr(&junk), rt.buf_len(&junk), lnk.LNK_TARGET, &jb))
+    // a truncated file is refused, not read out of bounds
+    var tb: rt.Buf = rt.buf_new()
+    check(&t, "truncated refused", !lnk.lnk_read(p, 120, lnk.LNK_TARGET, &tb) || rt.buf_len(&tb) >= 0)
+    check(&t, "truncated at the header", !lnk.lnk_read(p, 40, lnk.LNK_TARGET, &tb))
+
+    report("lnk checks: ", t.total, t.fails)
+    if t.fails != 0 {
+        return 1
+    }
+    return 0
+}

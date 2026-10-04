@@ -1,0 +1,239 @@
+// expect_exit: 0
+// tests/2100_std_process_tree.fi -- std.process: stopping a whole process TREE
+// (process group on Linux, job object on Windows). The SAME program on both.
+//
+// The test starts ITSELF (`--child <mode>`), like tests/2064. The child
+// `tree` starts a grandchild that inherits the child's stdout pipe. A pipe
+// only reports end of file when EVERY holder of its write end is gone, so
+// "the caller sees end of file" is a portable proof that the grandchild is
+// dead as well -- no pid probing, no /proc.
+//
+// A  set_group + kill_tree: child and grandchild die, exit code 137
+// B  set_group + terminate_tree: the same, exit code 143
+// C  CONTROL, no group: kill (and kill_tree, which answers false) leave the
+//    grandchild alive -- without this A and B would prove nothing
+// D  kill_tree on a child that has ended long ago does not hurt
+// E  set_kill_with_launcher: the launcher ends, its tree dies with it
+//    (Windows; Linux says `kill_with_launcher_supported() == false` and the
+//    case is skipped)
+import std.rt
+import std.str
+import std.process
+
+fn now_ms() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] * 1000 + ts[1] / 1000000) as u64
+}
+
+fn nap(ms: u64) {
+    var ts: [i64; 2] = [(ms / 1000) as i64, ((ms % 1000) * 1000000) as i64]
+    syscall(35, (&ts[0]) as i64, 0, 0, 0, 0, 0)
+}
+
+fn say(fd: i64, s: str) {
+    syscall(1, fd, s.p as i64, s.length() as i64, 0, 0, 0)
+}
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn num(s: str) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < s.length() {
+        v = v * 10 + (s.chars(i) - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
+
+fn terr(e: ProcError) -> i32 {
+    if e == ProcError::NotFound { return 1001 }
+    if e == ProcError::Permission { return 1002 }
+    if e == ProcError::Invalid { return 1003 }
+    if e == ProcError::Resource { return 1004 }
+    if e == ProcError::Exec { return 1005 }
+    return 1007
+}
+
+fn dummy(code: i32) -> process.Child {
+    return process.Child { pid: 0 - code as i64, h: 0, in_fd: -1, out_fd: -1, err_fd: -1,
+        done: false, code: 0, sig: 0, own: true }
+}
+
+fn start(c: *mut process.Command) -> process.Child {
+    return process.spawn(c) catch | e | dummy(terr(e))
+}
+
+fn me(self_path: str, mode: str) -> process.Command {
+    var c: process.Command = process.command(self_path)
+    process.add_arg(&c, "--child")
+    process.add_arg(&c, mode)
+    return c
+}
+
+fn child_main(start: u64) -> i32 {
+    let mode: str = arg(start, 2)
+    let self_path: str = arg(start, 0)
+    if mode == "sleep" {
+        nap(num(arg(start, 3)))
+        return 0
+    }
+    if mode == "tree" || mode == "launcher" {
+        // the grandchild: stdout is INHERITED (the pipe of whoever started us)
+        var g: process.Command = me(self_path, "sleep")
+        process.add_arg(&g, arg(start, 3))
+        process.set_stdin(&g, process.STDIO_NULL)
+        process.set_stderr(&g, process.STDIO_NULL)
+        if mode == "launcher" {
+            process.set_kill_with_launcher(&g, true)
+        }
+        var gc: process.Child = start_child(&g)
+        if gc.pid <= 0 {
+            return 50
+        }
+        say(1, "ready\n")
+        if mode == "launcher" {
+            return 0
+        }
+        nap(60000)
+        return 0
+    }
+    return 99
+}
+
+fn start_child(c: *mut process.Command) -> process.Child {
+    return start(c)
+}
+
+// Reads from the child's stdout until `want` octets arrived (true) or `ms` passed.
+fn read_ready(ch: *mut process.Child, want: usize, ms: u64) -> bool {
+    var buf: [u8; 64] = [0 as u8; 64]
+    let b: u64 = (&buf[0]) as u64
+    var got: usize = 0
+    let deadline: u64 = now_ms() + ms
+    while got < want {
+        let n: i64 = process.read_out_nb(ch, b + got as u64, 64 - got)
+        if n > 0 {
+            got = got + n as usize
+        } else if n == -11 {
+            if now_ms() >= deadline {
+                return false
+            }
+            nap(5)
+        } else {
+            return false
+        }
+    }
+    return true
+}
+
+// 1 = end of file arrived within `ms` (every holder of the pipe is gone),
+// 0 = the pipe is still open after `ms`, 2 = a read error.
+fn drain(ch: *mut process.Child, ms: u64) -> i32 {
+    var buf: [u8; 256] = [0 as u8; 256]
+    let b: u64 = (&buf[0]) as u64
+    let deadline: u64 = now_ms() + ms
+    while true {
+        let n: i64 = process.read_out_nb(ch, b, 256)
+        if n == 0 {
+            return 1
+        }
+        if n == -11 {
+            if now_ms() >= deadline {
+                return 0
+            }
+            nap(10)
+        } else if n < 0 {
+            return 2
+        }
+    }
+    return 0
+}
+
+// the child `tree` with a grandchild that sleeps `gms` milliseconds
+fn tree_cmd(self_path: str, mode: str, gms: str) -> process.Command {
+    var c: process.Command = me(self_path, mode)
+    process.add_arg(&c, gms)
+    process.set_stdin(&c, process.STDIO_NULL)
+    process.set_stdout(&c, process.STDIO_PIPE)
+    process.set_stderr(&c, process.STDIO_NULL)
+    return c
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) >= 3 && arg(start, 1) == "--child" {
+        return child_main(start)
+    }
+    let self_path: str = arg(start, 0)
+
+    // --- A. group + kill_tree
+    var c: process.Command = tree_cmd(self_path, "tree", "60000")
+    process.set_group(&c, true)
+    var ch: process.Child = start(&c)
+    if ch.pid <= 0 { return 1 as i32 }
+    if !process.is_grouped(&ch) { return 2 as i32 }
+    if !read_ready(&ch, 6, 15000) { return 3 as i32 }
+    if drain(&ch, 300) != 0 { return 4 as i32 }
+    let t0: u64 = now_ms()
+    if !process.kill_tree(&ch) { return 5 as i32 }
+    if process.wait(&ch) != 137 { return 6 as i32 }
+    if drain(&ch, 10000) != 1 { return 7 as i32 }
+    if now_ms() - t0 > 8000 { return 8 as i32 }
+    process.close(&ch)
+    process.command_free(&c)
+
+    // --- B. group + terminate_tree
+    c = tree_cmd(self_path, "tree", "60000")
+    process.set_group(&c, true)
+    ch = start(&c)
+    if ch.pid <= 0 { return 9 as i32 }
+    if !read_ready(&ch, 6, 15000) { return 10 as i32 }
+    if !process.terminate_tree(&ch) { return 11 as i32 }
+    if process.wait(&ch) != 143 { return 12 as i32 }
+    if drain(&ch, 10000) != 1 { return 13 as i32 }
+    process.close(&ch)
+    process.command_free(&c)
+
+    // --- C. control: no group. The grandchild sleeps 2.5 s and OUTLIVES the kill.
+    c = tree_cmd(self_path, "tree", "2500")
+    ch = start(&c)
+    if ch.pid <= 0 { return 14 as i32 }
+    if process.is_grouped(&ch) { return 15 as i32 }
+    if !read_ready(&ch, 6, 15000) { return 16 as i32 }
+    if process.kill_tree(&ch) { return 17 as i32 } // no group: false, but it killed the child
+    if process.wait(&ch) != 137 { return 18 as i32 }
+    if drain(&ch, 700) != 0 { return 19 as i32 } // the grandchild still holds the pipe
+    if drain(&ch, 12000) != 1 { return 20 as i32 } // and lets go when its sleep is over
+    process.close(&ch)
+    process.command_free(&c)
+
+    // --- D. a grouped child that ended long ago
+    c = me(self_path, "sleep")
+    process.add_arg(&c, "0")
+    process.set_group(&c, true)
+    process.set_stdin(&c, process.STDIO_NULL)
+    ch = start(&c)
+    if ch.pid <= 0 { return 21 as i32 }
+    if process.wait(&ch) != 0 { return 22 as i32 }
+    process.kill_tree(&ch)
+    process.terminate_tree(&ch)
+    process.close(&ch)
+    process.command_free(&c)
+
+    // --- E. the tree dies with the launcher
+    if process.kill_with_launcher_supported() {
+        c = tree_cmd(self_path, "launcher", "30000")
+        ch = start(&c)
+        if ch.pid <= 0 { return 23 as i32 }
+        if !read_ready(&ch, 6, 15000) { return 24 as i32 }
+        if process.wait(&ch) != 0 { return 25 as i32 } // the launcher has ended ...
+        if drain(&ch, 8000) != 1 { return 26 as i32 } // ... and its grandchild went with it
+        process.close(&ch)
+        process.command_free(&c)
+    }
+    return 0
+}

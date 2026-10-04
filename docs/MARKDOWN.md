@@ -79,9 +79,12 @@ file is `spec.json` of https://spec.commonmark.org/0.31.2/ unchanged.
 * `HTML_IGNORE` is a policy for display, not a sanitiser for output: use
   `html.render(..., safe = true)` (empty targets for `javascript:`,
   `vbscript:`, `file:`, `data:`) if you write HTML.
-* The view: no text selection or copy, code lines wrap instead of scrolling
-  sideways, a table cell shows inline content only (no nested blocks), HTML
-  blocks are drawn as code only with `HTML_RAW`.
+* The view: code lines wrap (at token boundaries when highlighted) instead of
+  scrolling sideways, a table cell shows inline content only (no nested
+  blocks), HTML blocks are drawn as code only with `HTML_RAW`, a selection
+  across a direction change is by logical order, and a new width drops the
+  selection. Selection, copy, syntax colours, animated pictures and touch are
+  in [UI_EXTRAS.md](UI_EXTRAS.md).
 
 ## The view
 
