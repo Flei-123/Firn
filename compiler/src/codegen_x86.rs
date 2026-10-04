@@ -545,7 +545,17 @@ pub fn emit(m: &Module) -> Result<String, String> {
 /// `FIRN_KEEP_ALL=1` switches it off.
 pub fn prune_enabled() -> bool {
     !dwarf::with_variables()
+        && !OBJECT_ONLY.load(std::sync::atomic::Ordering::Relaxed)
         && std::env::var("FIRN_KEEP_ALL").map(|v| v != "1").unwrap_or(true)
+}
+
+/// `-c` / `--object`: the object is linked into somebody else's program (a C
+/// host calls its functions by name, `tools/abi`), so no function is
+/// unreachable -- the pruning has to leave all of them in.
+static OBJECT_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_object_only(on: bool) {
+    OBJECT_ONLY.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn asm_symbols(text: &str, mut each: impl FnMut(&str)) {

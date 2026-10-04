@@ -1050,7 +1050,10 @@ fn run(opts: &Options) -> i32 {
         return emit_wasm(opts, &module, path, target_out_manifest, &mut tm);
     }
     let emitted = match target::active() {
-        target::Target::X86_64 => codegen_x86::emit(&module),
+        target::Target::X86_64 => {
+            codegen_x86::set_object_only(opts.only_object);
+            codegen_x86::emit(&module)
+        }
         target::Target::Aarch64 => codegen_a64::emit(&module),
         target::Target::Wasm32Browser => unreachable!("handled above"),
     };
