@@ -280,7 +280,7 @@ run_case() {          # $1 = file, $2 = "opt" | "noopt" | "devfast" | "safe"
 
     if ! "$FIRNC" $flags -o "$bin" "$file" >"$WORK/$base.$mode.cerr" 2>&1; then
         bad "$file [$mode]: compilation failed"
-        sed 's/^/        /' "$WORK/$base.$mode.cerr" | head -8
+        sed 's/^/        /' "$WORK/$base.$mode.cerr" | head -8 || true
         return
     fi
     hdr=$(head -1 "$file")
@@ -355,13 +355,13 @@ for f in tests/neg/*.fi; do
     if ! grep -qF ":$pos" "$WORK/neg.out"; then
         echo
         bad "$f: position '$pos' is missing from the message"
-        sed 's/^/        /' "$WORK/neg.out" | head -6
+        sed 's/^/        /' "$WORK/neg.out" | head -6 || true
         continue
     fi
     if ! grep -qF "$msg" "$WORK/neg.out"; then
         echo
         bad "$f: text '$msg' is missing from the message"
-        sed 's/^/        /' "$WORK/neg.out" | head -6
+        sed 's/^/        /' "$WORK/neg.out" | head -6 || true
         continue
     fi
     # The source line and the marker have to be there
@@ -390,50 +390,50 @@ echo "== 5. proof of the optimiser =="
 bash test_opt.sh > "$WORK/opt.log" 2>&1 && OPTRC=0 || OPTRC=$?
 if [ "$OPTRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/opt.log" | sed 's/^/   /'
+    tail -1 "$WORK/opt.log" | sed 's/^/   /' || true
 else
     bad "test_opt.sh failed (see .test-work/opt.log)"
-    tail -20 "$WORK/opt.log" | sed 's/^/   /'
+    tail -20 "$WORK/opt.log" | sed 's/^/   /' || true
 fi
 
 echo "== 6. proof of the result-location guarantee (SPEC.md 13.1) =="
 bash tools/result_location/run.sh > "$WORK/result_location.log" 2>&1 && EORC=0 || EORC=$?
 if [ "$EORC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/result_location.log" | sed 's/^/   /'
+    tail -1 "$WORK/result_location.log" | sed 's/^/   /' || true
 else
     bad "tools/result_location/run.sh failed (see .test-work/result_location.log)"
-    tail -20 "$WORK/result_location.log" | sed 's/^/   /'
+    tail -20 "$WORK/result_location.log" | sed 's/^/   /' || true
 fi
 
 echo "== 7. architecture: field access <-> memory location separated =="
 bash tools/layers/run.sh > "$WORK/layers.log" 2>&1 && SCRC=0 || SCRC=$?
 if [ "$SCRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/layers.log" | sed 's/^/   /'
+    tail -1 "$WORK/layers.log" | sed 's/^/   /' || true
 else
     bad "tools/layers/run.sh failed (see .test-work/layers.log)"
-    tail -20 "$WORK/layers.log" | sed 's/^/   /'
+    tail -20 "$WORK/layers.log" | sed 's/^/   /' || true
 fi
 
 echo "== 8. symbol naming scheme (DESIGN_GOALS 4) =="
 bash tools/symbole/run.sh > "$WORK/symbols.log" 2>&1 && SYRC=0 || SYRC=$?
 if [ "$SYRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/symbols.log" | sed 's/^/   /'
+    tail -1 "$WORK/symbols.log" | sed 's/^/   /' || true
 else
     bad "tools/symbole/run.sh failed (see .test-work/symbols.log)"
-    tail -20 "$WORK/symbols.log" | sed 's/^/   /'
+    tail -20 "$WORK/symbols.log" | sed 's/^/   /' || true
 fi
 
 echo "== 8b. atomic primitive: 'lock xadd' (tools/atomic/run.sh, ROUND 47) =="
 bash tools/atomic/run.sh > "$WORK/atomic.log" 2>&1 && ATRC=0 || ATRC=$?
 if [ "$ATRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/atomic.log" | sed 's/^/   /'
+    tail -1 "$WORK/atomic.log" | sed 's/^/   /' || true
 else
     bad "tools/atomic/run.sh failed (see .test-work/atomic.log)"
-    tail -20 "$WORK/atomic.log" | sed 's/^/   /'
+    tail -20 "$WORK/atomic.log" | sed 's/^/   /' || true
 fi
 
 echo "== 8b2. build time environment variables (tools/env/run.sh, ROUND FIRN-ENV) =="
@@ -443,10 +443,10 @@ echo "== 8b2. build time environment variables (tools/env/run.sh, ROUND FIRN-ENV
 bash tools/env/run.sh > "$WORK/env.log" 2>&1 && EVRC=0 || EVRC=$?
 if [ "$EVRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/env.log" | sed 's/^/   /'
+    tail -1 "$WORK/env.log" | sed 's/^/   /' || true
 else
     bad "tools/env/run.sh failed (see .test-work/env.log)"
-    tail -30 "$WORK/env.log" | sed 's/^/   /'
+    tail -30 "$WORK/env.log" | sed 's/^/   /' || true
 fi
 
 echo "== 8c. bounds: static dispatch without an indirect call (ROUND 50) =="
@@ -455,20 +455,20 @@ echo "== 8c. bounds: static dispatch without an indirect call (ROUND 50) =="
 BOUNDS_MEASURE=${BOUNDS_MEASURE:-0} bash tools/bounds/run.sh > "$WORK/bounds.log" 2>&1 && SKRC=0 || SKRC=$?
 if [ "$SKRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/bounds.log" | sed 's/^/   /'
+    tail -1 "$WORK/bounds.log" | sed 's/^/   /' || true
 else
     bad "tools/bounds/run.sh failed (see .test-work/bounds.log)"
-    tail -20 "$WORK/bounds.log" | sed 's/^/   /'
+    tail -20 "$WORK/bounds.log" | sed 's/^/   /' || true
 fi
 
 echo "== 9. HTML5 tokenizer against html5lib (tools/tokenizer/run.sh) =="
 bash tools/tokenizer/run.sh --fast > "$WORK/tokenizer.log" 2>&1 && TKRC=0 || TKRC=$?
 if [ "$TKRC" -eq 0 ]; then
     ok
-    grep -E '^TOTAL' "$WORK/tokenizer.log" | sed 's/^/   /'
+    grep -E '^TOTAL' "$WORK/tokenizer.log" | sed 's/^/   /' || true
 else
     bad "tools/tokenizer/run.sh failed (see .test-work/tokenizer.log)"
-    tail -20 "$WORK/tokenizer.log" | sed 's/^/   /'
+    tail -20 "$WORK/tokenizer.log" | sed 's/^/   /' || true
 fi
 
 echo "== 9b. HTML tree construction + DOM core (tools/html/run.sh) =="
@@ -479,10 +479,10 @@ echo "== 9b. HTML tree construction + DOM core (tools/html/run.sh) =="
 bash tools/html/run.sh --fast > "$WORK/tree.log" 2>&1 && BMRC=0 || BMRC=$?
 if [ "$BMRC" -eq 0 ]; then
     ok
-    grep -E '^TOTAL|^OK:' "$WORK/tree.log" | sed 's/^/   /'
+    grep -E '^TOTAL|^OK:' "$WORK/tree.log" | sed 's/^/   /' || true
 else
     bad "tools/html/run.sh failed (see .test-work/tree.log)"
-    tail -20 "$WORK/tree.log" | sed 's/^/   /'
+    tail -20 "$WORK/tree.log" | sed 's/^/   /' || true
 fi
 
 echo "== 9c. CSS: syntax, selectors, cascade (tools/css/run.sh) =="
@@ -493,10 +493,10 @@ echo "== 9c. CSS: syntax, selectors, cascade (tools/css/run.sh) =="
 CSS_SOAK_MS=${CSS_SOAK_MS:-6000} bash tools/css/run.sh --fast > "$WORK/css.log" 2>&1 && CSRC=0 || CSRC=$?
 if [ "$CSRC" -eq 0 ]; then
     ok
-    grep -E '^TOTAL|^OK:|^match comparisons' "$WORK/css.log" | sed 's/^/   /'
+    grep -E '^TOTAL|^OK:|^match comparisons' "$WORK/css.log" | sed 's/^/   /' || true
 else
     bad "tools/css/run.sh failed (see .test-work/css.log)"
-    tail -20 "$WORK/css.log" | sed 's/^/   /'
+    tail -20 "$WORK/css.log" | sed 's/^/   /' || true
 fi
 
 echo "== 10. DOM soak run: cycles without a leak (tools/dom_soak/run.sh) =="
@@ -507,10 +507,10 @@ SOAK_SEC=${SOAK_SEC:-12} SOAK_CYCLES=${SOAK_CYCLES:-400000} \
   bash tools/dom_soak/run.sh > "$WORK/dom_soak.log" 2>&1 && DSRC=0 || DSRC=$?
 if [ "$DSRC" -eq 0 ]; then
     ok
-    grep -E 'PASSED|counter-check strikes' "$WORK/dom_soak.log" | sed 's/^/   /'
+    grep -E 'PASSED|counter-check strikes' "$WORK/dom_soak.log" | sed 's/^/   /' || true
 else
     bad "tools/dom_soak/run.sh failed (see .test-work/dom_soak.log)"
-    tail -20 "$WORK/dom_soak.log" | sed 's/^/   /'
+    tail -20 "$WORK/dom_soak.log" | sed 's/^/   /' || true
 fi
 
 echo "== 11. lexer in Firn against the lexer in Rust (tools/lex_compare.sh) =="
@@ -519,10 +519,10 @@ echo "== 11. lexer in Firn against the lexer in Rust (tools/lex_compare.sh) =="
 bash tools/lex_compare.sh > "$WORK/lex_compare.log" 2>&1 && LXRC=0 || LXRC=$?
 if [ "$LXRC" -eq 0 ]; then
     ok
-    grep -E '^(SAME|DIFFERENT|TOKENS|FLOATING)' "$WORK/lex_compare.log" | sed 's/^/   /'
+    grep -E '^(SAME|DIFFERENT|TOKENS|FLOATING)' "$WORK/lex_compare.log" | sed 's/^/   /' || true
 else
     bad "tools/lex_compare.sh failed (see .test-work/lex_compare.log)"
-    tail -20 "$WORK/lex_compare.log" | sed 's/^/   /'
+    tail -20 "$WORK/lex_compare.log" | sed 's/^/   /' || true
 fi
 
 echo "== 28. the number reader: four readers, one bit pattern (tools/lexnum/run.sh, ROUND 65/71) =="
@@ -539,10 +539,10 @@ echo "== 28. the number reader: four readers, one bit pattern (tools/lexnum/run.
 bash tools/lexnum/run.sh > "$WORK/lexnum.log" 2>&1 && LNRC=0 || LNRC=$?
 if [ "$LNRC" -eq 0 ]; then
     ok
-    grep -E '^   (float literals|integer literals|firnc0 vs|refused literals)|^OK:' "$WORK/lexnum.log" | sed 's/^/   /'
+    grep -E '^   (float literals|integer literals|firnc0 vs|refused literals)|^OK:' "$WORK/lexnum.log" | sed 's/^/   /' || true
 else
     bad "tools/lexnum/run.sh failed (see .test-work/lexnum.log)"
-    tail -20 "$WORK/lexnum.log" | sed 's/^/   /'
+    tail -20 "$WORK/lexnum.log" | sed 's/^/   /' || true
 fi
 
 echo "== 31. str does not leak: endurance run with a counter-check (tools/strsoak/run.sh, ROUND 70) =="
@@ -554,70 +554,70 @@ echo "== 31. str does not leak: endurance run with a counter-check (tools/strsoa
 bash tools/strsoak/run.sh > "$WORK/strsoak.log" 2>&1 && SSRC=0 || SSRC=$?
 if [ "$SSRC" -eq 0 ]; then
     ok
-    grep -E '^  (firnc0|firnc1)|^STRSOAK' "$WORK/strsoak.log" | sed 's/^/   /'
+    grep -E '^  (firnc0|firnc1)|^STRSOAK' "$WORK/strsoak.log" | sed 's/^/   /' || true
 else
     bad "tools/strsoak/run.sh failed (see .test-work/strsoak.log)"
-    tail -20 "$WORK/strsoak.log" | sed 's/^/   /'
+    tail -20 "$WORK/strsoak.log" | sed 's/^/   /' || true
 fi
 
 echo "== 12. parser in Firn against the parser in Rust (tools/parser_compare.sh) =="
 bash tools/parser_compare.sh > "$WORK/parser_compare.log" 2>&1 && PVRC=0 || PVRC=$?
 if [ "$PVRC" -eq 0 ]; then
     ok
-    grep -E '^(SAME|DIFFERENT|NOT CORE)' "$WORK/parser_compare.log" | sed 's/^/   /'
+    grep -E '^(SAME|DIFFERENT|NOT CORE)' "$WORK/parser_compare.log" | sed 's/^/   /' || true
 else
     bad "tools/parser_compare.sh failed (see .test-work/parser_compare.log)"
-    tail -20 "$WORK/parser_compare.log" | sed 's/^/   /'
+    tail -20 "$WORK/parser_compare.log" | sed 's/^/   /' || true
 fi
 
 echo "== 13. layout and ABI in Firn against Rust (tools/types_compare.sh) =="
 bash tools/types_compare.sh > "$WORK/types_compare.log" 2>&1 && TVRC=0 || TVRC=$?
 if [ "$TVRC" -eq 0 ]; then
     ok
-    grep -E '^(SAME|DIFFERENT|WITH STRUCTS)' "$WORK/types_compare.log" | sed 's/^/   /'
+    grep -E '^(SAME|DIFFERENT|WITH STRUCTS)' "$WORK/types_compare.log" | sed 's/^/   /' || true
 else
     bad "tools/types_compare.sh failed (see .test-work/types_compare.log)"
-    tail -20 "$WORK/types_compare.log" | sed 's/^/   /'
+    tail -20 "$WORK/types_compare.log" | sed 's/^/   /' || true
 fi
 
 echo "== 14. type checker in Firn against Rust (tools/sema_compare.sh) =="
 bash tools/sema_compare.sh > "$WORK/sema_compare.log" 2>&1 && SVRC=0 || SVRC=$?
 if [ "$SVRC" -eq 0 ]; then
     ok
-    grep -E '^(SAME|DIFFERENT|EXPRESSIONS|NOT CORE)' "$WORK/sema_compare.log" | sed 's/^/   /'
+    grep -E '^(SAME|DIFFERENT|EXPRESSIONS|NOT CORE)' "$WORK/sema_compare.log" | sed 's/^/   /' || true
 else
     bad "tools/sema_compare.sh failed (see .test-work/sema_compare.log)"
-    tail -20 "$WORK/sema_compare.log" | sed 's/^/   /'
+    tail -20 "$WORK/sema_compare.log" | sed 's/^/   /' || true
 fi
 
 echo "== 15. lowering in Firn against Rust (tools/fir_compare.sh) =="
 bash tools/fir_compare.sh > "$WORK/fir_compare.log" 2>&1 && FVRC=0 || FVRC=$?
 if [ "$FVRC" -eq 0 ]; then
     ok
-    grep -E '^(SAME|DIFFERENT|INSTRUCTIONS|DEFER)' "$WORK/fir_compare.log" | sed 's/^/   /'
+    grep -E '^(SAME|DIFFERENT|INSTRUCTIONS|DEFER)' "$WORK/fir_compare.log" | sed 's/^/   /' || true
 else
     bad "tools/fir_compare.sh failed (see .test-work/fir_compare.log)"
-    tail -20 "$WORK/fir_compare.log" | sed 's/^/   /'
+    tail -20 "$WORK/fir_compare.log" | sed 's/^/   /' || true
 fi
 
 echo "== 16. the compiler in Firn compiles, the result runs (tools/self_compare.sh) =="
 bash tools/self_compare.sh > "$WORK/self_compare.log" 2>&1 && SBRC=0 || SBRC=$?
 if [ "$SBRC" -eq 0 ]; then
     ok
-    grep -E '^(SAME|DIFFERING|FAULTY|CODEGEN)' "$WORK/self_compare.log" | sed 's/^/   /'
+    grep -E '^(SAME|DIFFERING|FAULTY|CODEGEN)' "$WORK/self_compare.log" | sed 's/^/   /' || true
 else
     bad "tools/self_compare.sh failed (see .test-work/self_compare.log)"
-    tail -20 "$WORK/self_compare.log" | sed 's/^/   /'
+    tail -20 "$WORK/self_compare.log" | sed 's/^/   /' || true
 fi
 
 echo "== 17. the fixpoint: Firn compiles itself (tools/fixpoint.sh) =="
 bash tools/fixpoint.sh > "$WORK/fixpoint.log" 2>&1 && FPRC=0 || FPRC=$?
 if [ "$FPRC" -eq 0 ]; then
     ok
-    grep -E '^(STAGE|FIXPOINT|CORPUS)' "$WORK/fixpoint.log" | sed 's/^/   /'
+    grep -E '^(STAGE|FIXPOINT|CORPUS)' "$WORK/fixpoint.log" | sed 's/^/   /' || true
 else
     bad "tools/fixpoint.sh failed (see .test-work/fixpoint.log)"
-    tail -20 "$WORK/fixpoint.log" | sed 's/^/   /'
+    tail -20 "$WORK/fixpoint.log" | sed 's/^/   /' || true
 fi
 
 echo "== 20. concurrency: threads, mutex, atomic primitives (tools/thread/run.sh) =="
@@ -628,10 +628,10 @@ echo "== 20. concurrency: threads, mutex, atomic primitives (tools/thread/run.sh
 bash tools/thread/run.sh > "$WORK/thread.log" 2>&1 && FDRC=0 || FDRC=$?
 if [ "$FDRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/thread.log" | sed 's/^/   /'
+    tail -1 "$WORK/thread.log" | sed 's/^/   /' || true
 else
     bad "tools/thread/run.sh failed (see .test-work/thread.log)"
-    grep FAIL "$WORK/thread.log" | head -10 | sed 's/^/   /'
+    grep FAIL "$WORK/thread.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 19. freestanding: profile kernel, inline asm, MMIO, iretq (tools/freestanding/run.sh) =="
@@ -641,10 +641,10 @@ echo "== 19. freestanding: profile kernel, inline asm, MMIO, iretq (tools/freest
 bash tools/freestanding/run.sh > "$WORK/freestanding.log" 2>&1 && FSRC=0 || FSRC=$?
 if [ "$FSRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/freestanding.log" | sed 's/^/   /'
+    tail -1 "$WORK/freestanding.log" | sed 's/^/   /' || true
 else
     bad "tools/freestanding/run.sh failed (see .test-work/freestanding.log)"
-    grep FAIL "$WORK/freestanding.log" | head -10 | sed 's/^/   /'
+    grep FAIL "$WORK/freestanding.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 9d. JavaScript: lexer, parser, interpreter (tools/js/run.sh) =="
@@ -654,10 +654,10 @@ echo "== 9d. JavaScript: lexer, parser, interpreter (tools/js/run.sh) =="
 JS_SOAK_ROUNDS=${JS_SOAK_ROUNDS:-20000} bash tools/js/run.sh --fast > "$WORK/js.log" 2>&1 && JSRC=0 || JSRC=$?
 if [ "$JSRC" -eq 0 ]; then
     ok
-    grep -E '^TOTAL|^OK:|^cross check' "$WORK/js.log" | sed 's/^/   /'
+    grep -E '^TOTAL|^OK:|^cross check' "$WORK/js.log" | sed 's/^/   /' || true
 else
     bad "tools/js/run.sh failed (see .test-work/js.log)"
-    tail -20 "$WORK/js.log" | sed 's/^/   /'
+    tail -20 "$WORK/js.log" | sed 's/^/   /' || true
 fi
 
 echo "== 18. package and project system (tools/packages/run.sh) =="
@@ -667,10 +667,10 @@ echo "== 18. package and project system (tools/packages/run.sh) =="
 bash tools/packages/run.sh > "$WORK/packages.log" 2>&1 && PKRC=0 || PKRC=$?
 if [ "$PKRC" -eq 0 ]; then
     ok
-    grep -E '^PACKAGES' "$WORK/packages.log" | sed 's/^/   /'
+    grep -E '^PACKAGES' "$WORK/packages.log" | sed 's/^/   /' || true
 else
     bad "tools/packages/run.sh failed (see .test-work/packages.log)"
-    tail -20 "$WORK/packages.log" | sed 's/^/   /'
+    tail -20 "$WORK/packages.log" | sed 's/^/   /' || true
 fi
 
 echo "== 8d. functions as values: direct stays direct (tools/fnval/run.sh) =="
@@ -680,10 +680,10 @@ echo "== 8d. functions as values: direct stays direct (tools/fnval/run.sh) =="
 bash tools/fnval/run.sh > "$WORK/fnval.log" 2>&1 && FVRC=0 || FVRC=$?
 if [ "$FVRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/fnval.log" | sed 's/^/   /'
+    tail -1 "$WORK/fnval.log" | sed 's/^/   /' || true
 else
     bad "tools/fnval/run.sh failed (see .test-work/fnval.log)"
-    grep FAIL "$WORK/fnval.log" | head -10 | sed 's/^/   /'
+    grep FAIL "$WORK/fnval.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 27. function values in a struct field (tools/fnfield/run.sh, ROUND 68) =="
@@ -694,10 +694,10 @@ echo "== 27. function values in a struct field (tools/fnfield/run.sh, ROUND 68) 
 bash tools/fnfield/run.sh > "$WORK/fnfield.log" 2>&1 && FFRC=0 || FFRC=$?
 if [ "$FFRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/fnfield.log" | sed 's/^/   /'
+    tail -1 "$WORK/fnfield.log" | sed 's/^/   /' || true
 else
     bad "tools/fnfield/run.sh failed (see .test-work/fnfield.log)"
-    grep FAIL "$WORK/fnfield.log" | head -10 | sed 's/^/   /'
+    grep FAIL "$WORK/fnfield.log" | head -10 | sed 's/^/   /' || true
 fi
 echo "== 23. layout: from the computed style to the box with coordinates (tools/layout/run.sh) =="
 # Rounds 61 and 67. The box model with margin collapsing, the block flow,
@@ -718,11 +718,11 @@ echo "== 23. layout: from the computed style to the box with coordinates (tools/
 bash tools/layout/run.sh --fast > "$WORK/layout.log" 2>&1 && LYRC=0 || LYRC=$?
 if [ "$LYRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/layout.log" | sed 's/^/   /'
+    tail -1 "$WORK/layout.log" | sed 's/^/   /' || true
 else
     bad "tools/layout/run.sh failed (see .test-work/layout.log)"
-    grep -E 'FAILED|ERROR' "$WORK/layout.log" | head -10 | sed 's/^/   /'
-    tail -5 "$WORK/layout.log" | sed 's/^/   /'
+    grep -E 'FAILED|ERROR' "$WORK/layout.log" | head -10 | sed 's/^/   /' || true
+    tail -5 "$WORK/layout.log" | sed 's/^/   /' || true
 fi
 
 echo "== 21. english migration: no German identifiers left (tools/english/check.sh) =="
@@ -732,10 +732,10 @@ echo "== 21. english migration: no German identifiers left (tools/english/check.
 bash tools/english/check.sh > "$WORK/english.log" 2>&1 && ENRC=0 || ENRC=$?
 if [ "$ENRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/english.log" | sed 's/^/   /'
+    tail -1 "$WORK/english.log" | sed 's/^/   /' || true
 else
     bad "tools/english/check.sh reports German identifiers (see .test-work/english.log)"
-    tail -20 "$WORK/english.log" | sed 's/^/   /'
+    tail -20 "$WORK/english.log" | sed 's/^/   /' || true
 fi
 
 echo "== 24. the formatter: canonical shape (tools/fmt/run.sh, ROUND 64) =="
@@ -747,10 +747,10 @@ echo "== 24. the formatter: canonical shape (tools/fmt/run.sh, ROUND 64) =="
 bash tools/fmt/run.sh --fast > "$WORK/fmt.log" 2>&1 && FMRC=0 || FMRC=$?
 if [ "$FMRC" -eq 0 ]; then
     ok
-    grep -E '^   (files formatted|token stream|syntax tree|second run)' "$WORK/fmt.log" | sed 's/^/   /'
+    grep -E '^   (files formatted|token stream|syntax tree|second run)' "$WORK/fmt.log" | sed 's/^/   /' || true
 else
     bad "tools/fmt/run.sh failed (see .test-work/fmt.log)"
-    grep FAIL "$WORK/fmt.log" | head -10 | sed 's/^/   /'
+    grep FAIL "$WORK/fmt.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 25. debug information: gdb in a Firn program (tools/dwarf/run.sh, ROUND 64) =="
@@ -762,10 +762,10 @@ echo "== 25. debug information: gdb in a Firn program (tools/dwarf/run.sh, ROUND
 bash tools/dwarf/run.sh > "$WORK/dwarf.log" 2>&1 && DWRC=0 || DWRC=$?
 if [ "$DWRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/dwarf.log" | sed 's/^/   /'
+    tail -1 "$WORK/dwarf.log" | sed 's/^/   /' || true
 else
     bad "tools/dwarf/run.sh failed (see .test-work/dwarf.log)"
-    grep FAIL "$WORK/dwarf.log" | head -10 | sed 's/^/   /'
+    grep FAIL "$WORK/dwarf.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 26. the language server: firnc --lsp (tools/lsp/run.sh, ROUND 64) =="
@@ -777,10 +777,10 @@ echo "== 26. the language server: firnc --lsp (tools/lsp/run.sh, ROUND 64) =="
 bash tools/lsp/run.sh > "$WORK/lsp.log" 2>&1 && LSRC=0 || LSRC=$?
 if [ "$LSRC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/lsp.log" | sed 's/^/   /'
+    tail -1 "$WORK/lsp.log" | sed 's/^/   /' || true
 else
     bad "tools/lsp/run.sh failed (see .test-work/lsp.log)"
-    grep FAIL "$WORK/lsp.log" | head -10 | sed 's/^/   /'
+    grep FAIL "$WORK/lsp.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 29. the comfort layer: demo + input soak (tools/strlib/comfort/run.sh, ROUND 69) =="
@@ -795,10 +795,10 @@ COMFORT_LINES=${COMFORT_LINES:-60000} COMFORT_LEAK_LINES=${COMFORT_LEAK_LINES:-2
   bash tools/strlib/comfort/run.sh > "$WORK/comfort.log" 2>&1 && CFRC=0 || CFRC=$?
 if [ "$CFRC" -eq 0 ]; then
     ok
-    grep -E '^   (demo|soak|counter-check)' "$WORK/comfort.log" | sed 's/^/   /'
+    grep -E '^   (demo|soak|counter-check)' "$WORK/comfort.log" | sed 's/^/   /' || true
 else
     bad "tools/strlib/comfort/run.sh failed (see .test-work/comfort.log)"
-    grep FAIL "$WORK/comfort.log" | head -10 | sed 's/^/   /'
+    grep FAIL "$WORK/comfort.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 30. std.core in a kernel: the library without an allocator (tools/core/run.sh, ROUND 73) =="
@@ -818,11 +818,11 @@ CORE_ROUNDS=${CORE_ROUNDS:-40000} CORE_LEAK_ROUNDS=${CORE_LEAK_ROUNDS:-20000} \
   bash tools/core/run.sh > "$WORK/core.log" 2>&1 && CORERC=0 || CORERC=$?
 if [ "$CORERC" -eq 0 ]; then
     ok
-    tail -1 "$WORK/core.log" | sed 's/^/   /'
-    grep -E '^  OK    (soak|counter-check|firnc0: .core\.ok)' "$WORK/core.log" | sed 's/^/   /'
+    tail -1 "$WORK/core.log" | sed 's/^/   /' || true
+    grep -E '^  OK    (soak|counter-check|firnc0: .core\.ok)' "$WORK/core.log" | sed 's/^/   /' || true
 else
     bad "tools/core/run.sh failed (see .test-work/core.log)"
-    grep FAIL "$WORK/core.log" | head -10 | sed 's/^/   /'
+    grep FAIL "$WORK/core.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 32. the calling convention against GCC (tools/abi/run.sh, ROUND 71) =="
@@ -838,10 +838,10 @@ echo "== 32. the calling convention against GCC (tools/abi/run.sh, ROUND 71) =="
 bash tools/abi/run.sh > "$WORK/abi.log" 2>&1 && ABIRC=0 || ABIRC=$?
 if [ "$ABIRC" -eq 0 ]; then
     ok
-    grep -E '^abi:|^RESULT' "$WORK/abi.log" | sed 's/^/   /'
+    grep -E '^abi:|^RESULT' "$WORK/abi.log" | sed 's/^/   /' || true
 else
     bad "tools/abi/run.sh failed (see .test-work/abi.log)"
-    grep -E 'ERROR|FAIL' "$WORK/abi.log" | head -10 | sed 's/^/   /'
+    grep -E 'ERROR|FAIL' "$WORK/abi.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 33. f32 against real data: WAV and glTF (tools/f32data/run.sh, ROUND 71) =="
@@ -853,10 +853,10 @@ echo "== 33. f32 against real data: WAV and glTF (tools/f32data/run.sh, ROUND 71
 bash tools/f32data/run.sh > "$WORK/f32data.log" 2>&1 && F32RC=0 || F32RC=$?
 if [ "$F32RC" -eq 0 ]; then
     ok
-    grep -E 'identical|^OK' "$WORK/f32data.log" | sed 's/^/   /'
+    grep -E 'identical|^OK' "$WORK/f32data.log" | sed 's/^/   /' || true
 else
     bad "tools/f32data/run.sh failed (see .test-work/f32data.log)"
-    grep -E 'DIFFERENT|FAIL' "$WORK/f32data.log" | head -10 | sed 's/^/   /'
+    grep -E 'DIFFERENT|FAIL' "$WORK/f32data.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 34. the features of round 66: generators, async, classes (tools/js/round66.sh) =="
@@ -868,10 +868,10 @@ echo "== 34. the features of round 66: generators, async, classes (tools/js/roun
 bash tools/js/round66.sh --fast > "$WORK/round66.log" 2>&1 && R66RC=0 || R66RC=$?
 if [ "$R66RC" -eq 0 ]; then
     ok
-    grep -E '^   (generators|async|classes|gen |genleak|jobs )' "$WORK/round66.log" | sed 's/^/   /'
+    grep -E '^   (generators|async|classes|gen |genleak|jobs )' "$WORK/round66.log" | sed 's/^/   /' || true
 else
     bad "tools/js/round66.sh failed (see .test-work/round66.log)"
-    grep -E 'FAILED|BELOW' "$WORK/round66.log" | head -10 | sed 's/^/   /'
+    grep -E 'FAILED|BELOW' "$WORK/round66.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 35. the features of round 74: built ins, regular expressions, dates (tools/js/round74.sh) =="
@@ -886,10 +886,10 @@ echo "== 35. the features of round 74: built ins, regular expressions, dates (to
 bash tools/js/round74.sh --fast > "$WORK/round74.log" 2>&1 && R74RC=0 || R74RC=$?
 if [ "$R74RC" -eq 0 ]; then
     ok
-    grep -E '^   (builtins|text|re_0|clean |leak )' "$WORK/round74.log" | sed 's/^/   /'
+    grep -E '^   (builtins|text|re_0|clean |leak )' "$WORK/round74.log" | sed 's/^/   /' || true
 else
     bad "tools/js/round74.sh failed (see .test-work/round74.log)"
-    grep -E 'FAILED|BELOW|DIFFERENT' "$WORK/round74.log" | head -10 | sed 's/^/   /'
+    grep -E 'FAILED|BELOW|DIFFERENT' "$WORK/round74.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 36. sockets against the outside: nc, curl, sixteen at once (tools/net/run.sh, ROUND 76) =="
@@ -904,10 +904,10 @@ echo "== 36. sockets against the outside: nc, curl, sixteen at once (tools/net/r
 NET_MB=${NET_MB:-1} bash tools/net/run.sh > "$WORK/net.log" 2>&1 && NETRC=0 || NETRC=$?
 if [ "$NETRC" -eq 0 ]; then
     ok
-    grep -E '^  (release-fast|no-opt|dev-fast):' "$WORK/net.log" | sed 's/^/ /'
+    grep -E '^  (release-fast|no-opt|dev-fast):' "$WORK/net.log" | sed 's/^/ /' || true
 else
     bad "tools/net/run.sh failed (see .test-work/net.log)"
-    grep -E 'FAIL|RESULT' "$WORK/net.log" | head -10 | sed 's/^/   /'
+    grep -E 'FAIL|RESULT' "$WORK/net.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 37. NBT against Notch's reference file (tools/nbt/run.sh, ROUND 76) =="
@@ -921,10 +921,10 @@ echo "== 37. NBT against Notch's reference file (tools/nbt/run.sh, ROUND 76) =="
 bash tools/nbt/run.sh > "$WORK/nbt.log" 2>&1 && NBTRC=0 || NBTRC=$?
 if [ "$NBTRC" -eq 0 ]; then
     ok
-    grep -E '^  (reference|release-fast|no-opt|dev-fast)' "$WORK/nbt.log" | sed 's/^/ /'
+    grep -E '^  (reference|release-fast|no-opt|dev-fast)' "$WORK/nbt.log" | sed 's/^/ /' || true
 else
     bad "tools/nbt/run.sh failed (see .test-work/nbt.log)"
-    grep -E 'FAIL|RESULT' "$WORK/nbt.log" | head -10 | sed 's/^/   /'
+    grep -E 'FAIL|RESULT' "$WORK/nbt.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 38. a Minecraft client gets into the world (tools/mcserver/run.sh, ROUND 76) =="
@@ -944,7 +944,7 @@ if [ "$MCRC" -eq 0 ]; then
         "$WORK/mcserver.log" | sed 's/^/ /'
 else
     bad "tools/mcserver/run.sh failed (see .test-work/mcserver.log)"
-    grep -E 'FAIL|RESULT' "$WORK/mcserver.log" | head -10 | sed 's/^/   /'
+    grep -E 'FAIL|RESULT' "$WORK/mcserver.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 39. foreign functions in both directions (tools/extfn/run.sh, ROUND 75) =="
@@ -958,10 +958,10 @@ echo "== 39. foreign functions in both directions (tools/extfn/run.sh, ROUND 75)
 bash tools/extfn/run.sh > "$WORK/extfn.log" 2>&1 && EXTRC=0 || EXTRC=$?
 if [ "$EXTRC" -eq 0 ]; then
     ok
-    grep -E '^(PASS|FAIL):? ' "$WORK/extfn.log" | sed 's/^/   /'
+    grep -E '^(PASS|FAIL):? ' "$WORK/extfn.log" | sed 's/^/   /' || true
 else
     bad "tools/extfn/run.sh failed (see .test-work/extfn.log)"
-    grep -E 'FAIL' "$WORK/extfn.log" | head -10 | sed 's/^/   /'
+    grep -E 'FAIL' "$WORK/extfn.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 40. a pointer into a local cannot leave its frame (tools/escape/run.sh, ROUND 79) =="
@@ -977,10 +977,10 @@ echo "== 40. a pointer into a local cannot leave its frame (tools/escape/run.sh,
 bash tools/escape/run.sh > "$WORK/escape.log" 2>&1 && ESCRC=0 || ESCRC=$?
 if [ "$ESCRC" -eq 0 ]; then
     ok
-    grep -E '^  (cases|messages identical):|^PASS:' "$WORK/escape.log" | sed 's/^/ /'
+    grep -E '^  (cases|messages identical):|^PASS:' "$WORK/escape.log" | sed 's/^/ /' || true
 else
     bad "tools/escape/run.sh failed (see .test-work/escape.log)"
-    grep -E '^FAIL' "$WORK/escape.log" | head -10 | sed 's/^/   /'
+    grep -E '^FAIL' "$WORK/escape.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 41. the standard library of round 81 (tools/stdlib81/run.sh) =="
@@ -1007,11 +1007,11 @@ if [ "$STDRC" -eq 0 ]; then
     ok
     grep -E '^  (FNV-1a|hash vectors|release-fast [0-9]|probe chain|soak |counter-check |level [0-9]|y_ |n_ |i_ |json.tool|json.load|error position|python/openssl|getrandom|testdata/|sha1 |sha256 |aes |cfb8 )' \
         "$WORK/stdlib81.log" | sed 's/^/ /'
-    grep -E '^NIST TOTAL' "$WORK/stdlib81.log" | head -1 | sed 's/^/   /'
-    grep -E '^  RESULT ok \(' "$WORK/stdlib81.log" | head -1 | sed 's/^/   deflate /'
+    grep -E '^NIST TOTAL' "$WORK/stdlib81.log" | head -1 | sed 's/^/   /' || true
+    grep -E '^  RESULT ok \(' "$WORK/stdlib81.log" | head -1 | sed 's/^/   deflate /' || true
 else
     bad "tools/stdlib81/run.sh failed (see .test-work/stdlib81.log)"
-    grep -E 'FAIL|RESULT' "$WORK/stdlib81.log" | head -12 | sed 's/^/   /'
+    grep -E 'FAIL|RESULT' "$WORK/stdlib81.log" | head -12 | sed 's/^/   /' || true
 fi
 
 echo "== 42. the speed of round 82 (tools/bench82/run.sh) =="
@@ -1043,7 +1043,7 @@ if [ "$B82RC" -eq 0 ]; then
         "$WORK/bench82.log" | sed 's/^/ /'
 else
     bad "tools/bench82/run.sh failed (see .test-work/bench82.log)"
-    grep -E 'FAIL|MISMATCH|BELOW|ABOVE|RESULT' "$WORK/bench82.log" | head -12 | sed 's/^/   /'
+    grep -E 'FAIL|MISMATCH|BELOW|ABOVE|RESULT' "$WORK/bench82.log" | head -12 | sed 's/^/   /' || true
 fi
 echo
 echo "== 43. the second machine: aarch64 (tools/aarch64/, ROUND 80) =="
@@ -1069,10 +1069,10 @@ echo "== 43. the second machine: aarch64 (tools/aarch64/, ROUND 80) =="
 bash tools/aarch64/machine.sh > "$WORK/a64_machine.log" 2>&1 && A64MRC=0 || A64MRC=$?
 if [ "$A64MRC" -eq 0 ]; then
     ok
-    grep -E '^(  ok |  aapcs64|SKIP)' "$WORK/a64_machine.log" | sed 's/^/ /'
+    grep -E '^(  ok |  aapcs64|SKIP)' "$WORK/a64_machine.log" | sed 's/^/ /' || true
 else
     bad "tools/aarch64/machine.sh failed (see .test-work/a64_machine.log)"
-    grep -E '^  FAIL' "$WORK/a64_machine.log" | head -10 | sed 's/^/   /'
+    grep -E '^  FAIL' "$WORK/a64_machine.log" | head -10 | sed 's/^/   /' || true
 fi
 
 A64_RC=0
@@ -1087,7 +1087,7 @@ for stage in "" "--no-opt"; do
     else
         A64_RC=1
         bad "tools/aarch64/run.sh $stage failed (see .test-work/a64_run.$tag.log)"
-        grep -E '^  DIFF |^FAIL' "$WORK/a64_run.$tag.log" | head -10 | sed 's/^/   /'
+        grep -E '^  DIFF |^FAIL' "$WORK/a64_run.$tag.log" | head -10 | sed 's/^/   /' || true
     fi
 done
 
@@ -1107,10 +1107,10 @@ echo "== 44. checked integer arithmetic (tools/checked/run.sh, ROUND 72) =="
 bash tools/checked/run.sh > "$WORK/checked.log" 2>&1 && CHKRC=0 || CHKRC=$?
 if [ "$CHKRC" -eq 0 ]; then
     ok
-    grep -E '^(CHECKS|  compiler)' "$WORK/checked.log" | sed 's/^/   /'
+    grep -E '^(CHECKS|  compiler)' "$WORK/checked.log" | sed 's/^/   /' || true
 else
     bad "tools/checked/run.sh failed (see .test-work/checked.log)"
-    grep -E '  FAIL|CHECKS' "$WORK/checked.log" | head -12 | sed 's/^/   /'
+    grep -E '  FAIL|CHECKS' "$WORK/checked.log" | head -12 | sed 's/^/   /' || true
 fi
 
 echo "== 45. the first five minutes with the language (tools/firstrun/run.sh, ROUND 88) =="
@@ -1123,10 +1123,10 @@ echo "== 45. the first five minutes with the language (tools/firstrun/run.sh, RO
 bash tools/firstrun/run.sh > "$WORK/firstrun.log" 2>&1 && FRRC=0 || FRRC=$?
 if [ "$FRRC" -eq 0 ]; then
     ok
-    grep -E '^(PASS|  SKIP)' "$WORK/firstrun.log" | sed 's/^/   /'
+    grep -E '^(PASS|  SKIP)' "$WORK/firstrun.log" | sed 's/^/   /' || true
 else
     bad "tools/firstrun/run.sh failed (see .test-work/firstrun.log)"
-    grep -E '^  FAIL|^FAIL' "$WORK/firstrun.log" | head -10 | sed 's/^/   /'
+    grep -E '^  FAIL|^FAIL' "$WORK/firstrun.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 46. global variables: 'static' and 'static mut' (tools/state/run.sh, ROUND 89) =="
@@ -1140,10 +1140,10 @@ echo "== 46. global variables: 'static' and 'static mut' (tools/state/run.sh, RO
 bash tools/state/run.sh > "$WORK/state.log" 2>&1 && STRC=0 || STRC=$?
 if [ "$STRC" -eq 0 ]; then
     ok
-    grep -E '^state:|^   SKIPPED' "$WORK/state.log" | sed 's/^/   /'
+    grep -E '^state:|^   SKIPPED' "$WORK/state.log" | sed 's/^/   /' || true
 else
     bad "tools/state/run.sh failed (see .test-work/state.log)"
-    grep -E '^  FAIL|^state:' "$WORK/state.log" | head -12 | sed 's/^/   /'
+    grep -E '^  FAIL|^state:' "$WORK/state.log" | head -12 | sed 's/^/   /' || true
 fi
 
 echo "== 47. the checked index, the checked division, the panic handler (tools/checkidx/run.sh, ROUND 89) =="
@@ -1156,10 +1156,10 @@ echo "== 47. the checked index, the checked division, the panic handler (tools/c
 bash tools/checkidx/run.sh > "$WORK/checkidx.log" 2>&1 && CIRC=0 || CIRC=$?
 if [ "$CIRC" -eq 0 ]; then
     ok
-    grep -E '^checkidx:' "$WORK/checkidx.log" | sed 's/^/   /'
+    grep -E '^checkidx:' "$WORK/checkidx.log" | sed 's/^/   /' || true
 else
     bad "tools/checkidx/run.sh failed (see .test-work/checkidx.log)"
-    grep -E '^  FAIL|^checkidx:' "$WORK/checkidx.log" | head -12 | sed 's/^/   /'
+    grep -E '^  FAIL|^checkidx:' "$WORK/checkidx.log" | head -12 | sed 's/^/   /' || true
 fi
 
 echo "== 48. the four build levels agree (tools/optlevels/run.sh, ROUND 90) =="
@@ -1169,7 +1169,7 @@ if [ "$OLRC" -eq 0 ]; then
     ok
 else
     bad "tools/optlevels/run.sh failed (see .test-work/optlevels.log)"
-    sed 's/^/        /' "$WORK/optlevels.log" | grep FAIL | head -12
+    sed 's/^/        /' "$WORK/optlevels.log" | grep FAIL | head -12 || true
 fi
 echo "== 51. the same package on two machines (tools/repro/two_machines.sh, ROUND 93) =="
 # ACCEPTANCE item 5. Not "two directories" like `tools/repro/run.sh` of round
@@ -1185,7 +1185,7 @@ if [ "$TMRC" -eq 0 ]; then
     ok
 else
     bad "tools/repro/two_machines.sh failed (see .test-work/twomachines.log)"
-    grep -E 'DIFFERENT|FAILED|MISSING|failed' "$WORK/twomachines.log" | head -12 | sed 's/^/   /'
+    grep -E 'DIFFERENT|FAILED|MISSING|failed' "$WORK/twomachines.log" | head -12 | sed 's/^/   /' || true
 fi
 
 echo "== 52. phi nodes: the loop counter leaves the frame (tools/phi/run.sh, ROUND 92) =="
@@ -1195,7 +1195,7 @@ if [ "$PHRC" -eq 0 ]; then
     ok
 else
     bad "tools/phi/run.sh failed (see .test-work/phi.log)"
-    grep -E '^  FAIL|^phi:' "$WORK/phi.log" | head -12 | sed 's/^/   /'
+    grep -E '^  FAIL|^phi:' "$WORK/phi.log" | head -12 | sed 's/^/   /' || true
 fi
 
 echo "== 53. the test runner and the line table (ROUND 94) =="
@@ -1211,11 +1211,11 @@ echo "== 53. the test runner and the line table (ROUND 94) =="
 bash tools/testrunner/run.sh > "$WORK/testrunner.log" 2>&1 && TRRC=0 || TRRC=$?
 if [ "$TRRC" -eq 0 ]; then
     ok
-    grep -E '^   (case |total|the case after|firnc1|tools/testrunner)' "$WORK/testrunner.log" | head -8 | sed 's/^/   /'
-    tail -1 "$WORK/testrunner.log" | sed 's/^/   /'
+    grep -E '^   (case |total|the case after|firnc1|tools/testrunner)' "$WORK/testrunner.log" | head -8 | sed 's/^/   /' || true
+    tail -1 "$WORK/testrunner.log" | sed 's/^/   /' || true
 else
     bad "tools/testrunner/run.sh failed (see .test-work/testrunner.log)"
-    grep FAIL "$WORK/testrunner.log" | head -10 | sed 's/^/   /'
+    grep FAIL "$WORK/testrunner.log" | head -10 | sed 's/^/   /' || true
 fi
 
 # ROUND K3. Sections 53 and 54 belong to the rounds running in parallel;
@@ -1228,7 +1228,7 @@ if [ "$K3RC" -eq 0 ]; then
     ok
 else
     bad "tools/k3net/run.sh failed (see .test-work/k3net.log)"
-    grep -E '^  FAIL' "$WORK/k3net.log" | head -12 | sed 's/^/   /'
+    grep -E '^  FAIL' "$WORK/k3net.log" | head -12 | sed 's/^/   /' || true
 fi
 
 echo "== 54. the Unicode table out of the UCD and the endurance run of the collector (ROUND 95) =="
@@ -1256,7 +1256,7 @@ if [ "$UCDRC" -eq 0 ]; then
         && "$WORK/probe_tables" > "$WORK/ucd_answers.txt" \
         && python3 tools/ucd/verify_tables.py "$WORK/ucd_answers.txt" > "$WORK/ucd_verify.log" 2>&1 \
         || UCDRC=9
-    grep -E 'IDENTICAL|DIFFERENT|compared' "$WORK/ucd_verify.log" | cut -c1-110 | sed 's/^/ /'
+    grep -E 'IDENTICAL|DIFFERENT|compared' "$WORK/ucd_verify.log" | cut -c1-110 | sed 's/^/ /' || true
 fi
 SOAKRC=0
 SOAK_SEC=${TEST_SOAK_SEC:-90} SOAK_LEAK_SEC=${TEST_SOAK_LEAK_SEC:-30} \
@@ -1268,7 +1268,7 @@ if [ "$UCDRC" -eq 0 ] && [ "$SOAKRC" -eq 0 ]; then
     ok
 else
     bad "round 95 failed (ucd $UCDRC, soak $SOAKRC -- see .test-work/ucd_build.log, .test-work/gc_soak.log)"
-    grep -E 'FAILED|ERROR|error' "$WORK/ucd_build.log" "$WORK/ucd_verify.log" "$WORK/gc_soak.log" 2>/dev/null | head -10 | sed 's/^/   /'
+    grep -E 'FAILED|ERROR|error' "$WORK/ucd_build.log" "$WORK/ucd_verify.log" "$WORK/gc_soak.log" 2>/dev/null | head -10 | sed 's/^/   /' || true
 fi
 echo "== 59. the official html5lib tests, the DOM and the style tree (tools/domb1/run.sh, ROUND B1) =="
 # The number 59 is fixed for this round; 53 to 58 belong to the rounds that
@@ -1279,7 +1279,7 @@ if [ "$B1RC" -eq 0 ]; then
     ok
 else
     bad "tools/domb1/run.sh failed (see .test-work/domb1.log)"
-    grep -E '^   (ERROR|FAILED)|^ *>>' "$WORK/domb1.log" | head -12 | sed 's/^/   /'
+    grep -E '^   (ERROR|FAILED)|^ *>>' "$WORK/domb1.log" | head -12 | sed 's/^/   /' || true
 fi
 echo "== 61. LAYOUT against the official Web Platform Tests (tools/layoutb2/run.sh, ROUND B2) =="
 # The number 61 is fixed for this round; 60 belongs to round R96, which was
@@ -1310,8 +1310,8 @@ if [ "$B2RC" -eq 0 ]; then
     ok
 else
     bad "tools/layoutb2/run.sh failed (see .test-work/layoutb2.log)"
-    grep -E 'FAILED|Traceback|Error' "$WORK/layoutb2.log" | head -12 | sed 's/^/   /'
-    tail -5 "$WORK/layoutb2.log" | sed 's/^/   /'
+    grep -E 'FAILED|Traceback|Error' "$WORK/layoutb2.log" | head -12 | sed 's/^/   /' || true
+    tail -5 "$WORK/layoutb2.log" | sed 's/^/   /' || true
 fi
 
 echo "== 62. PAINTING against the official reference tests (tools/paintb3/run.sh, ROUND B3) =="
@@ -1349,8 +1349,8 @@ if [ "$B3RC" -eq 0 ]; then
     ok
 else
     bad "tools/paintb3/run.sh failed (see .test-work/paintb3.log)"
-    grep -E 'FAILED|Traceback|Error' "$WORK/paintb3.log" | head -12 | sed 's/^/   /'
-    tail -5 "$WORK/paintb3.log" | sed 's/^/   /'
+    grep -E 'FAILED|Traceback|Error' "$WORK/paintb3.log" | head -12 | sed 's/^/   /' || true
+    tail -5 "$WORK/paintb3.log" | sed 's/^/   /' || true
 fi
 
 echo "== 63. THE PAGE COMES ALIVE: scripts, invalidation and HTTP (ROUND B4) =="
@@ -1395,8 +1395,8 @@ if [ "$B4RC" -eq 0 ]; then
     ok
 else
     bad "tools/liveb4/run.sh failed (see .test-work/liveb4.log)"
-    grep -E 'FAIL|Traceback|Error' "$WORK/liveb4.log" | head -12 | sed 's/^/   /'
-    tail -5 "$WORK/liveb4.log" | sed 's/^/   /'
+    grep -E 'FAIL|Traceback|Error' "$WORK/liveb4.log" | head -12 | sed 's/^/   /' || true
+    tail -5 "$WORK/liveb4.log" | sed 's/^/   /' || true
 fi
 
 echo "== 64. the promotion pass under stress (tools/promote/run.sh, round OPT-GENERAL) =="
@@ -1510,10 +1510,10 @@ echo "== 71. the move checker and drop in BOTH compilers (tools/moves/run.sh, ro
 bash tools/moves/run.sh > "$WORK/moves.log" 2>&1 && MVRC=0 || MVRC=$?
 if [ "$MVRC" -eq 0 ]; then
     ok
-    grep -E '^  (cases|messages identical)' "$WORK/moves.log" | sed 's/^/ /'
+    grep -E '^  (cases|messages identical)' "$WORK/moves.log" | sed 's/^/ /' || true
 else
     bad "tools/moves/run.sh failed (see .test-work/moves.log)"
-    grep -E '^FAIL' "$WORK/moves.log" | head -10 | sed 's/^/   /'
+    grep -E '^FAIL' "$WORK/moves.log" | head -10 | sed 's/^/   /' || true
 fi
 
 echo "== 72. the MP3 decoder in Firn: bit-exact against recorded checksums (tools/ton_build.sh, round TON) =="
@@ -1523,10 +1523,10 @@ echo "== 72. the MP3 decoder in Firn: bit-exact against recorded checksums (tool
 bash tools/ton_build.sh > "$WORK/ton.log" 2>&1 && TNRC=0 || TNRC=$?
 if [ "$TNRC" -eq 0 ]; then
     ok
-    grep -E 'PASS' "$WORK/ton.log" | sed 's/^/   /'
+    grep -E 'PASS' "$WORK/ton.log" | sed 's/^/   /' || true
 else
     bad "tools/ton_build.sh failed (see .test-work/ton.log)"
-    tail -n 8 "$WORK/ton.log" | sed 's/^/   /'
+    tail -n 8 "$WORK/ton.log" | sed 's/^/   /' || true
 fi
 
 echo "== 73. manifest-lint: the ACTIONS manifests of the Fleitec family (tools/manifest-lint/run.sh, audit item 6) =="
@@ -1536,10 +1536,10 @@ echo "== 73. manifest-lint: the ACTIONS manifests of the Fleitec family (tools/m
 bash tools/manifest-lint/run.sh > "$WORK/manifest-lint.log" 2>&1 && MLRC=0 || MLRC=$?
 if [ "$MLRC" -eq 0 ]; then
     ok
-    tail -n 2 "$WORK/manifest-lint.log" | sed 's/^/   /'
+    tail -n 2 "$WORK/manifest-lint.log" | sed 's/^/   /' || true
 else
     bad "tools/manifest-lint/run.sh failed (see .test-work/manifest-lint.log)"
-    tail -n 8 "$WORK/manifest-lint.log" | sed 's/^/   /'
+    tail -n 8 "$WORK/manifest-lint.log" | sed 's/^/   /' || true
 fi
 
 echo "== 74. archives, file hashes and the keyring against other implementations (tools/stdarchive/run.sh) =="
@@ -1550,10 +1550,10 @@ echo "== 74. archives, file hashes and the keyring against other implementations
 bash tools/stdarchive/run.sh > "$WORK/stdarchive.log" 2>&1 && SARC=0 || SARC=$?
 if [ "$SARC" -eq 0 ]; then
     ok
-    tail -n 1 "$WORK/stdarchive.log" | sed 's/^/   /'
+    tail -n 1 "$WORK/stdarchive.log" | sed 's/^/   /' || true
 else
     bad "tools/stdarchive/run.sh failed (see .test-work/stdarchive.log)"
-    grep -E 'FAIL|Traceback|Error' "$WORK/stdarchive.log" | head -12 | sed 's/^/   /'
+    grep -E 'FAIL|Traceback|Error' "$WORK/stdarchive.log" | head -12 | sed 's/^/   /' || true
 fi
 
 echo "== 75. DNS resolver and https by name (tools/dns/run.sh, round DNS) =="
@@ -1601,11 +1601,11 @@ if [ "${APPKIT_E2E_ANDROID:-0}" = "1" ]; then
 fi
 if [ "$AKRC" -eq 0 ]; then
     ok
-    tail -n 1 "$WORK/appkit_platforms.log" | sed 's/^/   /'
-    grep -E '^(appkit e2e:|newapp:|appkit kit:|SKIP)' "$WORK/appkit_e2e.log" "$WORK/appkit_newapp.log" "$WORK/appkit_kit.log" | sed 's/^/   /'
+    tail -n 1 "$WORK/appkit_platforms.log" | sed 's/^/   /' || true
+    grep -E '^(appkit e2e:|newapp:|appkit kit:|SKIP)' "$WORK/appkit_e2e.log" "$WORK/appkit_newapp.log" "$WORK/appkit_kit.log" | sed 's/^/   /' || true
 else
     bad "tools/appkit failed (see .test-work/appkit_*.log)"
-    grep -E 'FAIL' "$WORK"/appkit_*.log | head -12 | sed 's/^/   /'
+    grep -E 'FAIL' "$WORK"/appkit_*.log | head -12 | sed 's/^/   /' || true
 fi
 
 echo "== 77. async IO: a thousand connections, a window and the loop, real wss (tools/async/run.sh) =="
@@ -1617,10 +1617,10 @@ echo "== 77. async IO: a thousand connections, a window and the loop, real wss (
 bash tools/async/run.sh > "$WORK/async.log" 2>&1 && ASRC=0 || ASRC=$?
 if [ "$ASRC" -eq 0 ]; then
     ok
-    grep -E '^(conn:|ui:|ASYNC)|^  (ok|skip)   .*(wss|connections)' "$WORK/async.log" | sed 's/^/   /' | head -12
+    grep -E '^(conn:|ui:|ASYNC)|^  (ok|skip)   .*(wss|connections)' "$WORK/async.log" | sed 's/^/   /' | head -12 || true
 else
     bad "tools/async/run.sh failed (see .test-work/async.log)"
-    grep -E 'FAIL' "$WORK/async.log" | head -12 | sed 's/^/   /'
+    grep -E 'FAIL' "$WORK/async.log" | head -12 | sed 's/^/   /' || true
 fi
 
 TOTAL=$((PASS + FAIL))
