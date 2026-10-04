@@ -1,0 +1,1530 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/markdownview.fi -- A SCROLLING MARKDOWN VIEW (fUi).
+//
+// ========================================================= WHAT IT IS
+//
+// Hand it Markdown text (the README of a mod, the description of a project
+// on Modrinth or GitHub) and a rectangle; it lays the document out at the
+// rectangle's width, paints it with the theme's colours, scrolls it (wheel,
+// keys, scrollbar, touch fling through lib/fui/viewport.fi) and tells you
+// when a link was clicked. The text is parsed by lib/markdown (CommonMark +
+// GFM tables, strikethrough, task items, bare URLs).
+//
+//     var v: markdownview.MdView = markdownview.mdv_new()
+//     markdownview.mdv_set_markdown(&v, text, doc.opts_default())
+//     markdownview.mdv_set_link_cb(&v, 0, on_link)        // fn(ud, url_ptr, url_len)
+//     markdownview.mdv_set_image_cb(&v, 0, on_image)      // optional, see below
+//     ... every frame: mdv_set_rect(&v, x, y, w, h); mdv_paint(&v, ctx)
+//     ... input: mdv_wheel / mdv_key / mdv_pointer_move / _down / _up
+//
+// ========================================================= WHAT IT DRAWS
+//
+//   * paragraphs with **bold**, *italic*, ~~strike~~, `code`, links (accent
+//     colour, underlined under the pointer), soft and hard line breaks,
+//   * headings 1-6 (h1 and h2 get a rule under them), thematic breaks,
+//   * block quotes (a bar on the left), bullet / numbered / task lists, any
+//     depth, loose and tight,
+//   * code blocks (monospace face if the program put one in font slot 1,
+//     else the main face), long lines wrap,
+//   * GFM tables with alignment, a header row and cell borders; column
+//     widths come from the content (min = longest word, max = one line),
+//   * images -- see below.
+//
+// Colours are theme tokens only (style.TOK_*), so light and dark are right
+// for free; the 15 point base size and every spacing are design points that
+// go through render.len_of, so the display scale works.
+//
+// ========================================================= IMAGES
+//
+// The view does not load pictures. For every image it meets it calls the
+// hook (`mdv_set_image_cb`) with the URL; the hook answers
+//   IMG_PENDING  not here yet -- a placeholder (frame, picture symbol, alt
+//                text) is drawn,
+//   IMG_READY    the pixels are in the ImgInfo (RGBA bytes, straight alpha;
+//                the caller keeps them alive) -- drawn scaled down to the
+//                width of the view, never scaled up,
+//   IMG_FAILED   a placeholder with a "broken" mark.
+// When a picture arrives later, call `mdv_invalidate` and the layout is
+// redone (the scroll position stays). Without a hook every image is a
+// placeholder, which is also the right thing for an offline description.
+//
+// HONEST LIMITS: no text selection, no copy, no right-to-left paragraph
+// layout across a link boundary (lib/fui/painter.fi handles RTL inside one
+// word run), no nested tables inside table cells (the cell shows the inline
+// text only), code lines are wrapped rather than scrolled sideways, and
+// HTML blocks are only drawn when the parser kept raw HTML (HTML_RAW: as
+// code); in the default mode the parser has turned them into text.
+import std.rt
+import std.vec
+import markdown.doc
+import markdown.md
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.viewport
+import fui.icons
+import fui.lucide
+import fui.icon
+import fui.uiimage
+import fui.kitcolor
+import paint.canvas
+
+export {
+    MdView, ImgInfo, mdv_new, mdv_free, mdv_set_markdown, mdv_set_base_size,
+    mdv_set_link_cb, mdv_set_image_cb, mdv_set_rect, mdv_set_pad,
+    mdv_set_background, mdv_invalidate, mdv_paint, mdv_layout,
+    mdv_wheel, mdv_key, mdv_pointer_move, mdv_pointer_down, mdv_pointer_up,
+    mdv_pointer_leave, mdv_link_count, mdv_link_url, mdv_hover_link,
+    mdv_content_height, mdv_offset, mdv_set_offset, mdv_item_count,
+    mdv_link_rect, mdv_tick, mdv_doc,
+    IMG_PENDING, IMG_READY, IMG_FAILED,
+}
+
+const NIL: u32 = 4294967295
+
+// A colour that is no theme token: the accent as TEXT on the page ground
+// (kitcolor.accent_text -- the launcher green is too light for a white page).
+const TOK_LINK: u32 = 1000
+
+const IMG_PENDING: u32 = 0
+const IMG_READY: u32 = 1
+const IMG_FAILED: u32 = 2
+
+// item kinds
+const IT_TEXT: u32 = 1
+const IT_RECT: u32 = 2
+const IT_RING: u32 = 3
+const IT_BULLET: u32 = 4
+const IT_CHECK: u32 = 5
+const IT_IMAGE: u32 = 6
+const IT_CHECKED: u32 = 7
+
+// text flags
+const FL_BOLD: u32 = 1
+const FL_ITALIC: u32 = 2
+const FL_STRIKE: u32 = 4
+const FL_CODE: u32 = 8
+const FL_MUTED: u32 = 16
+const FL_VPOOL: u32 = 32
+const FL_CODE_FIRST: u32 = 64
+const FL_CODE_LAST: u32 = 128
+
+// What the image hook fills in. The pixels are RGBA BYTES in memory (red
+// first, alpha last -- the order lib/paint/png.fi decodes to, see
+// lib/fui/uiimage.fi), straight alpha; the caller keeps them alive.
+struct ImgInfo {
+    px: u64,
+    w: usize,
+    h: usize,
+    stride: usize,
+}
+
+// one drawn thing, in content coordinates
+struct Item {
+    kind: u32,
+    flags: u32,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    asc: f64,
+    desc: f64,
+    lh: f64,
+    size: f64,
+    off: u32,
+    n: u32,
+    link: u32,
+    tok: u32,
+    tok2: u32,
+    radius: f64,
+    extra: i64,
+}
+
+struct LinkRec {
+    off: u32,
+    n: u32,
+}
+
+struct MdView {
+    d: doc.Doc,
+    has_doc: bool,
+    items: Vec[Item],
+    links: Vec[LinkRec],
+    vpool: rt.Buf,
+    vp: viewport.Viewport,
+    base_pt: usize,
+    pad_pt: usize,
+    bg_tok: u32,
+    lay_w: f64,
+    lay_scale: usize,
+    total_h: f64,
+    dirty: bool,
+    hover: u32,
+    press: u32,
+    link_ud: u64,
+    link_cb: fn(u64, u64, usize),
+    has_link_cb: bool,
+    img_ud: u64,
+    img_cb: fn(u64, u64, usize, *mut ImgInfo) -> u32,
+    has_img_cb: bool,
+    drag_bar: bool,
+}
+
+fn cb_link_none(ud: u64, p: u64, n: usize) {
+}
+
+fn cb_img_none(ud: u64, p: u64, n: usize, info: *mut ImgInfo) -> u32 {
+    return IMG_PENDING
+}
+
+fn mdv_new() -> MdView {
+    return MdView {
+        d: doc.doc_new(doc.opts_default()), has_doc: false,
+        items: vec_new[Item](), links: vec_new[LinkRec](), vpool: rt.buf_new(),
+        vp: viewport.viewport_new(0.0, 0.0, 100.0, 100.0, 100.0, 100.0),
+        base_pt: 15, pad_pt: 12, bg_tok: NIL, lay_w: 0.0, lay_scale: 0,
+        total_h: 0.0, dirty: true, hover: NIL, press: NIL,
+        link_ud: 0, link_cb: cb_link_none, has_link_cb: false,
+        img_ud: 0, img_cb: cb_img_none, has_img_cb: false, drag_bar: false,
+    }
+}
+
+fn mdv_free(v: *mut MdView) {
+    doc.doc_free(&(*v).d)
+    vec_free[Item](&(*v).items)
+    vec_free[LinkRec](&(*v).links)
+    rt.buf_free(&(*v).vpool)
+    (*v).has_doc = false
+}
+
+// Replace the text. The scroll position goes back to the top.
+fn mdv_set_markdown(v: *mut MdView, src: str, o: doc.Opts) {
+    doc.doc_free(&(*v).d)
+    (*v).d = md.parse(src, o)
+    (*v).has_doc = true
+    (*v).dirty = true
+    (*v).hover = NIL
+    (*v).press = NIL
+    viewport.viewport_set_offset(&(*v).vp, 0.0, 0.0)
+}
+
+// The base text size in design points (default 15).
+fn mdv_set_base_size(v: *mut MdView, pt: usize) {
+    (*v).base_pt = pt
+    (*v).dirty = true
+}
+
+fn mdv_set_pad(v: *mut MdView, pt: usize) {
+    (*v).pad_pt = pt
+    (*v).dirty = true
+}
+
+// A theme token to fill the view's rectangle with before painting
+// (style.TOK_BASE ...); NIL (the default) paints no ground.
+fn mdv_set_background(v: *mut MdView, tok: u32) {
+    (*v).bg_tok = tok
+}
+
+fn mdv_set_link_cb(v: *mut MdView, ud: u64, f: fn(u64, u64, usize)) {
+    (*v).link_ud = ud
+    (*v).link_cb = f
+    (*v).has_link_cb = true
+}
+
+fn mdv_set_image_cb(v: *mut MdView, ud: u64, f: fn(u64, u64, usize, *mut ImgInfo) -> u32) {
+    (*v).img_ud = ud
+    (*v).img_cb = f
+    (*v).has_img_cb = true
+    (*v).dirty = true
+}
+
+// Pictures arrived (or went away): lay out again, keep the scroll position.
+fn mdv_invalidate(v: *mut MdView) {
+    (*v).dirty = true
+}
+
+fn mdv_set_rect(v: *mut MdView, x: f64, y: f64, w: f64, h: f64) {
+    viewport.viewport_set_rect(&(*v).vp, x, y, w, h)
+}
+
+fn mdv_content_height(v: *mut MdView) -> f64 {
+    return (*v).total_h
+}
+
+fn mdv_offset(v: *mut MdView) -> f64 {
+    return viewport.viewport_off_y(&(*v).vp)
+}
+
+fn mdv_set_offset(v: *mut MdView, y: f64) {
+    viewport.viewport_set_offset(&(*v).vp, 0.0, y)
+}
+
+fn mdv_item_count(v: *mut MdView) -> usize {
+    return vec_len[Item](&(*v).items)
+}
+
+fn mdv_doc(v: *mut MdView) -> *mut doc.Doc {
+    return &(*v).d
+}
+
+fn mdv_link_count(v: *mut MdView) -> usize {
+    return vec_len[LinkRec](&(*v).links)
+}
+
+// The target of link `i` (the text stands in the document's pool: valid
+// until the next mdv_set_markdown).
+fn mdv_link_url(v: *mut MdView, i: usize) -> doc.Slice {
+    let r: *mut LinkRec = vec_elem_ptr[LinkRec](&(*v).links, i)
+    return doc.Slice { p: doc.pool_ptr(&(*v).d) + ((*r).off as u64), n: (*r).n as usize }
+}
+
+fn mdv_hover_link(v: *mut MdView) -> u32 {
+    return (*v).hover
+}
+
+fn mdv_tick(v: *mut MdView, now_ms: i64) -> bool {
+    return viewport.viewport_tick(&(*v).vp, now_ms)
+}
+
+// ====================================================================
+// LAYOUT
+// ====================================================================
+
+struct L {
+    c: *mut render.Ctx,
+    z: *mut painter.Painter,
+    v: *mut MdView,
+    base: f64,
+    y: f64,
+    // the line being filled
+    left: f64,
+    right: f64,
+    x: f64,
+    line_y: f64,
+    line_start: usize,
+    pend: bool,
+    last: usize,
+    at_start: bool,
+    align: i64,
+}
+
+fn px(l: *mut L, pt: usize) -> f64 {
+    return render.len_of((*l).c, pt)
+}
+
+fn mk_run(flags: u32, size: f64) -> painter.TextRun {
+    var r: painter.TextRun = painter.run_new(size)
+    if flags & FL_BOLD != 0 as u32 {
+        r = painter.run_set_weight(r, 700)
+    }
+    if flags & FL_ITALIC != 0 as u32 {
+        r = painter.run_set_slant(r, 1)
+    }
+    return r
+}
+
+// The monospace face for code, when the program supplied one in slot 1.
+fn font_enter(z: *mut painter.Painter, flags: u32) -> u64 {
+    if flags & FL_CODE != 0 as u32 {
+        let f: u64 = painter.painter_font_slot(z, 1)
+        if f != 0 {
+            let old: u64 = painter.painter_font(z)
+            painter.painter_set_font(z, f)
+            return old
+        }
+    }
+    return 0
+}
+
+fn font_leave(z: *mut painter.Painter, old: u64) {
+    if old != 0 {
+        painter.painter_set_font(z, old)
+    }
+}
+
+// The width of the text (p, n) in a style.
+fn measure(l: *mut L, flags: u32, size: f64, p: u64, n: usize) -> f64 {
+    var r: painter.TextRun = mk_run(flags, size)
+    let old: u64 = font_enter((*l).z, flags)
+    let w: f64 = painter.run_width((*l).z, &r, p, n)
+    font_leave((*l).z, old)
+    return w
+}
+
+fn space_w(l: *mut L, flags: u32, size: f64) -> f64 {
+    var sp: [u8; 1] = [32 as u8]
+    return measure(l, flags, size, (&sp[0]) as u64, 1)
+}
+
+fn new_item(kind: u32) -> Item {
+    return Item { kind: kind, flags: 0 as u32, x: 0.0, y: 0.0, w: 0.0, h: 0.0, asc: 0.0,
+        desc: 0.0, lh: 0.0, size: 0.0, off: 0 as u32, n: 0 as u32, link: NIL,
+        tok: style.TOK_TEXT, tok2: NIL, radius: 0.0, extra: 0 }
+}
+
+fn push_item(l: *mut L, it: Item) -> usize {
+    let i: usize = vec_len[Item](&(*(*l).v).items)
+    vec_push[Item](&(*(*l).v).items, it)
+    return i
+}
+
+fn item_at(l: *mut L, i: usize) -> *mut Item {
+    return vec_elem_ptr[Item](&(*(*l).v).items, i)
+}
+
+// A filled or ringed rectangle.
+fn add_rect(l: *mut L, kind: u32, x: f64, y: f64, w: f64, h: f64, tok: u32, radius: f64) -> usize {
+    var it: Item = new_item(kind)
+    it.x = x
+    it.y = y
+    it.w = w
+    it.h = h
+    it.tok = tok
+    it.radius = radius
+    return push_item(l, it)
+}
+
+// Line metrics of a text size.
+fn line_h(l: *mut L, size: f64) -> f64 {
+    return size * 1.5
+}
+
+// ---------------------------------------------------------------- the flow
+
+// Finish the current line: stack the items vertically, shift for the
+// alignment, and move the pen down.
+fn flush_line(l: *mut L) {
+    let n: usize = vec_len[Item](&(*(*l).v).items)
+    if n <= (*l).line_start {
+        (*l).x = (*l).left
+        (*l).at_start = true
+        (*l).pend = false
+        (*l).last = n
+        return
+    }
+    var up: f64 = 0.0
+    var down: f64 = 0.0
+    var minx: f64 = 1000000000.0
+    var maxx: f64 = 0.0
+    var k: usize = (*l).line_start
+    while k < n {
+        let it: *mut Item = item_at(l, k)
+        if (*it).kind == IT_TEXT || (*it).kind == IT_IMAGE {
+            let lead: f64 = ((*it).lh - (*it).asc - (*it).desc) / 2.0
+            var a: f64 = (*it).asc + lead
+            var b: f64 = (*it).desc + lead
+            if lead < 0.0 {
+                a = (*it).asc
+                b = (*it).desc
+            }
+            if a > up {
+                up = a
+            }
+            if b > down {
+                down = b
+            }
+            if (*it).x < minx {
+                minx = (*it).x
+            }
+            if (*it).x + (*it).w > maxx {
+                maxx = (*it).x + (*it).w
+            }
+        }
+        k = k + 1
+    }
+    var shift: f64 = 0.0
+    if (*l).align == doc.ALIGN_CENTER {
+        shift = ((*l).right - (*l).left - (maxx - minx)) / 2.0
+    } else if (*l).align == doc.ALIGN_RIGHT {
+        shift = (*l).right - (*l).left - (maxx - minx)
+    }
+    if shift < 0.0 {
+        shift = 0.0
+    }
+    k = (*l).line_start
+    while k < n {
+        let it: *mut Item = item_at(l, k)
+        if (*it).kind == IT_TEXT || (*it).kind == IT_IMAGE {
+            (*it).y = (*l).line_y + up - (*it).asc
+            (*it).x = (*it).x + shift
+        }
+        k = k + 1
+    }
+    (*l).y = (*l).line_y + up + down
+    (*l).line_y = (*l).y
+    (*l).line_start = n
+    (*l).x = (*l).left
+    (*l).at_start = true
+    (*l).pend = false
+    (*l).last = n
+}
+
+fn same_style(a: *mut Item, flags: u32, link: u32) -> bool {
+    let m: u32 = FL_BOLD | FL_ITALIC | FL_STRIKE | FL_CODE | FL_MUTED
+    return (*a).kind == IT_TEXT && ((*a).flags & m) == (flags & m) && (*a).link == link
+        && (flags & (FL_STRIKE | FL_CODE) != 0 as u32 || link != NIL)
+}
+
+// Put one word on the line (breaking the line before it, or inside it if it
+// is wider than a line).
+fn place_word(l: *mut L, pool: u32, off: u32, n: usize, flags: u32, size: f64, link: u32) {
+    var p: u64 = doc.pool_ptr(&(*(*l).v).d)
+    if pool == 1 as u32 {
+        p = rt.buf_ptr(&(*(*l).v).vpool)
+    }
+    p = p + (off as u64)
+    var done: usize = 0
+    while done < n {
+        let rest: usize = n - done
+        let w: f64 = measure(l, flags, size, p + (done as u64), rest)
+        var gap: f64 = 0.0
+        if (*l).pend && !(*l).at_start {
+            gap = space_w(l, flags, size)
+        }
+        let room: f64 = (*l).right - (*l).x - gap
+        if w > room && !(*l).at_start {
+            flush_line(l)
+            continue
+        }
+        var take: usize = rest
+        var tw: f64 = w
+        if w > (*l).right - (*l).left && (*l).at_start {
+            // a word wider than the line: cut it where the line is full
+            var r: painter.TextRun = mk_run(flags, size)
+            let old: u64 = font_enter((*l).z, flags)
+            take = painter.run_fits_upto((*l).z, &r, p + (done as u64), rest, (*l).right - (*l).left)
+            if take == 0 {
+                // not even one letter: take one anyway (no endless loop)
+                take = scan_cp_len(p + (done as u64), rest)
+            }
+            tw = painter.run_width((*l).z, &r, p + (done as u64), take)
+            font_leave((*l).z, old)
+        }
+        // the gap joins the neighbour when both have the same decoration
+        if gap > 0.0 {
+            if (*l).last < vec_len[Item](&(*(*l).v).items) {
+                let prev: *mut Item = item_at(l, (*l).last)
+                if same_style(prev, flags, link) {
+                    (*prev).w = (*prev).w + gap
+                }
+            }
+            (*l).x = (*l).x + gap
+        }
+        var it: Item = new_item(IT_TEXT)
+        it.flags = flags | (if pool == 1 as u32 { FL_VPOOL } else { 0 as u32 })
+        it.x = (*l).x
+        it.w = tw
+        it.size = size
+        var rr: painter.TextRun = mk_run(flags, size)
+        let old2: u64 = font_enter((*l).z, flags)
+        it.asc = painter.font_ascent((*l).z, size)
+        it.desc = painter.font_descent((*l).z, size)
+        font_leave((*l).z, old2)
+        it.lh = line_h(l, size)
+        it.off = off + (done as u32)
+        it.n = take as u32
+        it.link = link
+        if flags & FL_MUTED != 0 as u32 {
+            it.tok = style.TOK_TEXT_MUTED
+        }
+        if link != NIL {
+            it.tok = TOK_LINK
+        }
+        (*l).last = push_item(l, it)
+        (*l).x = (*l).x + tw
+        (*l).at_start = false
+        (*l).pend = false
+        done = done + take
+        if done < n {
+            flush_line(l)
+        }
+    }
+}
+
+fn scan_cp_len(p: u64, n: usize) -> usize {
+    let c: u8 = rt.ld8(p, 0)
+    var l: usize = 1
+    if c >= 240 as u8 {
+        l = 4
+    } else if c >= 224 as u8 {
+        l = 3
+    } else if c >= 192 as u8 {
+        l = 2
+    }
+    if l > n {
+        l = n
+    }
+    return l
+}
+
+fn is_sp(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8 || c == 10 as u8
+}
+
+// A TEXT of the document: words and gaps.
+fn flow_text(l: *mut L, off: u32, n: usize, flags: u32, size: f64, link: u32) {
+    let p: u64 = doc.pool_ptr(&(*(*l).v).d) + (off as u64)
+    var i: usize = 0
+    while i < n {
+        if is_sp(rt.ld8(p, i)) {
+            (*l).pend = true
+            while i < n && is_sp(rt.ld8(p, i)) {
+                i = i + 1
+            }
+        } else {
+            let s: usize = i
+            while i < n && !is_sp(rt.ld8(p, i)) {
+                i = i + 1
+            }
+            place_word(l, 0 as u32, off + (s as u32), i - s, flags, size, link)
+        }
+    }
+}
+
+// The link table: the target of node `n` as a link record, its index.
+fn add_link(l: *mut L, n: u32) -> u32 {
+    let u: doc.Slice = doc.node_url(&(*(*l).v).d, n)
+    let q: *mut doc.Node = doc.node_at(&(*(*l).v).d, n)
+    let i: usize = vec_len[LinkRec](&(*(*l).v).links)
+    vec_push[LinkRec](&(*(*l).v).links, LinkRec { off: (*q).url, n: (*q).url_n })
+    return i as u32
+}
+
+// The text of a subtree as one string in the view's pool (alt text).
+fn collect_text(d: *mut doc.Doc, n: u32, out: *mut rt.Buf) {
+    var c: u32 = doc.node_first(d, n)
+    while c != doc.NIL {
+        let k: u32 = doc.node_kind(d, c)
+        if k == doc.K_TEXT || k == doc.K_CODE {
+            let t: doc.Slice = doc.node_text(d, c)
+            rt.buf_push_bytes(out, t.p, t.n)
+        } else if k == doc.K_SOFTBREAK || k == doc.K_HARDBREAK {
+            rt.buf_push(out, 32 as u8)
+        } else if doc.node_first(d, c) != doc.NIL {
+            collect_text(d, c, out)
+        }
+        c = doc.node_next(d, c)
+    }
+}
+
+// An image in the line: an atom of its own size.
+fn flow_image(l: *mut L, n: u32, flags: u32, size: f64, link: u32) {
+    let v: *mut MdView = (*l).v
+    let u: doc.Slice = doc.node_url(&(*v).d, n)
+    var info: ImgInfo = ImgInfo { px: 0, w: 0, h: 0, stride: 0 }
+    var st: u32 = IMG_PENDING
+    if (*v).has_img_cb && u.n > 0 {
+        let f: fn(u64, u64, usize, *mut ImgInfo) -> u32 = (*v).img_cb
+        st = f((*v).img_ud, u.p, u.n, &info)
+    }
+    // alt text into the view's pool
+    var alt: rt.Buf = rt.buf_new()
+    collect_text(&(*v).d, n, &alt)
+    let alt_off: u32 = rt.buf_len(&(*v).vpool) as u32
+    rt.buf_push_bytes(&(*v).vpool, rt.buf_ptr(&alt), rt.buf_len(&alt))
+    let alt_n: usize = rt.buf_len(&alt)
+    rt.buf_free(&alt)
+    let unit: f64 = px(l, 100) / 100.0
+    var w: f64 = 0.0
+    var h: f64 = 0.0
+    var ready: bool = false
+    if st == IMG_READY && info.w > 0 && info.h > 0 {
+        ready = true
+        w = (info.w as f64) * unit
+        h = (info.h as f64) * unit
+        let avail: f64 = (*l).right - (*l).left
+        if w > avail {
+            h = h * avail / w
+            w = avail
+        }
+    } else {
+        // the placeholder: a frame as wide as its alt text and a symbol
+        let sym: f64 = size * 1.2
+        var tw: f64 = 0.0
+        if alt_n > 0 {
+            tw = measure(l, 0 as u32, size * 0.9, rt.buf_ptr(&(*v).vpool) + (alt_off as u64), alt_n)
+        }
+        w = sym + tw + px(l, 20)
+        h = size * 1.9
+        let avail: f64 = (*l).right - (*l).left
+        if w > avail {
+            w = avail
+        }
+    }
+    var gap: f64 = 0.0
+    if (*l).pend && !(*l).at_start {
+        gap = space_w(l, flags, size)
+    }
+    if !(*l).at_start && (*l).x + gap + w > (*l).right {
+        flush_line(l)
+        gap = 0.0
+    }
+    (*l).x = (*l).x + gap
+    var it: Item = new_item(IT_IMAGE)
+    it.x = (*l).x
+    it.w = w
+    it.h = h
+    it.asc = h
+    it.desc = 0.0
+    it.lh = h
+    it.size = size
+    it.link = link
+    it.off = alt_off
+    it.n = alt_n as u32
+    it.extra = (st as i64)
+    if ready {
+        // keep the pixel description in the view's pool: 4 words
+        it.extra = 100
+        it.tok2 = rt.buf_len(&(*v).vpool) as u32
+        var rec: [u64; 4] = [info.px, info.w as u64, info.h as u64, info.stride as u64]
+        rt.buf_push_bytes(&(*v).vpool, (&rec[0]) as u64, 32)
+    }
+    (*l).last = push_item(l, it)
+    (*l).x = (*l).x + w
+    (*l).at_start = false
+    (*l).pend = false
+}
+
+fn flow_inline(l: *mut L, parent: u32, flags: u32, size: f64, link: u32) {
+    let d: *mut doc.Doc = &(*(*l).v).d
+    var c: u32 = doc.node_first(d, parent)
+    while c != doc.NIL {
+        let k: u32 = doc.node_kind(d, c)
+        if k == doc.K_TEXT {
+            let q: *mut doc.Node = doc.node_at(d, c)
+            flow_text(l, (*q).txt, (*q).txt_n as usize, flags, size, link)
+        } else if k == doc.K_SOFTBREAK {
+            (*l).pend = true
+        } else if k == doc.K_HARDBREAK {
+            flush_line(l)
+        } else if k == doc.K_CODE {
+            let q: *mut doc.Node = doc.node_at(d, c)
+            let pad: f64 = px(l, 3)
+            // the words of the span; the first and the last carry the padding
+            var off: u32 = (*q).txt
+            let n: usize = (*q).txt_n as usize
+            let p: u64 = doc.pool_ptr(d) + (off as u64)
+            var i: usize = 0
+            var first: bool = true
+            while i < n {
+                if is_sp(rt.ld8(p, i)) {
+                    (*l).pend = true
+                    while i < n && is_sp(rt.ld8(p, i)) {
+                        i = i + 1
+                    }
+                } else {
+                    let s: usize = i
+                    while i < n && !is_sp(rt.ld8(p, i)) {
+                        i = i + 1
+                    }
+                    var f: u32 = flags | FL_CODE
+                    if first {
+                        f = f | FL_CODE_FIRST
+                        first = false
+                        // a leading gap before a code span stays plain text
+                        let had: bool = (*l).pend
+                        (*l).pend = false
+                        if had && !(*l).at_start {
+                            (*l).x = (*l).x + space_w(l, flags, size)
+                        }
+                        (*l).x = (*l).x + pad
+                    }
+                    var rest: usize = n
+                    while rest > i && is_sp(rt.ld8(p, rest - 1)) {
+                        rest = rest - 1
+                    }
+                    if i >= rest {
+                        f = f | FL_CODE_LAST
+                    }
+                    place_word(l, 0 as u32, off + (s as u32), i - s, f, size * 0.92, link)
+                    if i >= rest {
+                        (*l).x = (*l).x + pad
+                    }
+                }
+            }
+            if first {
+                // an empty span: nothing to show
+            }
+        } else if k == doc.K_EMPH {
+            flow_inline(l, c, flags | FL_ITALIC, size, link)
+        } else if k == doc.K_STRONG {
+            flow_inline(l, c, flags | FL_BOLD, size, link)
+        } else if k == doc.K_STRIKE {
+            flow_inline(l, c, flags | FL_STRIKE, size, link)
+        } else if k == doc.K_LINK {
+            let li: u32 = add_link(l, c)
+            flow_inline(l, c, flags, size, li)
+        } else if k == doc.K_IMAGE {
+            flow_image(l, c, flags, size, link)
+        } else if k == doc.K_HTML_INLINE {
+            // raw HTML (only with HTML_RAW) is not drawn
+        }
+        c = doc.node_next(d, c)
+    }
+}
+
+// A paragraph-like block: its inlines flowed into [x0, x0 + w].
+fn flow_block(l: *mut L, n: u32, x0: f64, w: f64, flags: u32, size: f64, align: i64) {
+    (*l).left = x0
+    (*l).right = x0 + w
+    (*l).x = x0
+    (*l).line_y = (*l).y
+    (*l).line_start = vec_len[Item](&(*(*l).v).items)
+    (*l).pend = false
+    (*l).at_start = true
+    (*l).last = (*l).line_start
+    (*l).align = align
+    flow_inline(l, n, flags, size, NIL)
+    flush_line(l)
+    (*l).align = doc.ALIGN_NONE
+}
+
+// ------------------------------------------------------- measuring (tables)
+
+// The narrowest (longest word) and the widest (all on one line) a block's
+// inline content gets.
+fn extents(l: *mut L, parent: u32, flags: u32, size: f64, minw: *mut f64, maxw: *mut f64, run: *mut f64) {
+    let d: *mut doc.Doc = &(*(*l).v).d
+    var c: u32 = doc.node_first(d, parent)
+    while c != doc.NIL {
+        let k: u32 = doc.node_kind(d, c)
+        if k == doc.K_TEXT || k == doc.K_CODE {
+            let q: *mut doc.Node = doc.node_at(d, c)
+            var f: u32 = flags
+            var sz: f64 = size
+            if k == doc.K_CODE {
+                f = f | FL_CODE
+                sz = size * 0.92
+            }
+            let p: u64 = doc.pool_ptr(d) + ((*q).txt as u64)
+            let n: usize = (*q).txt_n as usize
+            var i: usize = 0
+            while i < n {
+                if is_sp(rt.ld8(p, i)) {
+                    *run = *run + space_w(l, f, sz)
+                    while i < n && is_sp(rt.ld8(p, i)) {
+                        i = i + 1
+                    }
+                } else {
+                    let s: usize = i
+                    while i < n && !is_sp(rt.ld8(p, i)) {
+                        i = i + 1
+                    }
+                    let w: f64 = measure(l, f, sz, p + (s as u64), i - s)
+                    *run = *run + w
+                    if w > *minw {
+                        *minw = w
+                    }
+                }
+            }
+        } else if k == doc.K_SOFTBREAK {
+            *run = *run + space_w(l, flags, size)
+        } else if k == doc.K_HARDBREAK {
+            if *run > *maxw {
+                *maxw = *run
+            }
+            *run = 0.0
+        } else if k == doc.K_IMAGE {
+            let w: f64 = size * 8.0
+            if w > *minw {
+                *minw = w
+            }
+            *run = *run + w
+        } else {
+            var f: u32 = flags
+            if k == doc.K_STRONG {
+                f = f | FL_BOLD
+            } else if k == doc.K_EMPH {
+                f = f | FL_ITALIC
+            }
+            extents(l, c, f, size, minw, maxw, run)
+        }
+        c = doc.node_next(d, c)
+    }
+}
+
+// ------------------------------------------------------------- the blocks
+
+fn heading_scale(level: i64) -> f64 {
+    if level == 1 as i64 { return 2.0 }
+    if level == 2 as i64 { return 1.5 }
+    if level == 3 as i64 { return 1.25 }
+    if level == 4 as i64 { return 1.1 }
+    if level == 5 as i64 { return 1.0 }
+    return 0.9
+}
+
+fn lay_children(l: *mut L, parent: u32, x0: f64, w: f64, tight: bool, flags: u32) {
+    let d: *mut doc.Doc = &(*(*l).v).d
+    var c: u32 = doc.node_first(d, parent)
+    while c != doc.NIL {
+        lay_block(l, c, x0, w, tight, flags)
+        c = doc.node_next(d, c)
+    }
+}
+
+fn lay_block(l: *mut L, n: u32, x0: f64, w: f64, tight: bool, flags: u32) {
+    let d: *mut doc.Doc = &(*(*l).v).d
+    let k: u32 = doc.node_kind(d, n)
+    let base: f64 = (*l).base
+    if k == doc.K_PARA {
+        flow_block(l, n, x0, w, flags, base, doc.ALIGN_NONE)
+        if tight {
+            (*l).y = (*l).y + px(l, 3)
+        } else {
+            (*l).y = (*l).y + base * 0.8
+        }
+    } else if k == doc.K_HEADING {
+        let lv: i64 = doc.node_a(d, n)
+        let sz: f64 = base * heading_scale(lv)
+        if (*l).y > 0.0 {
+            (*l).y = (*l).y + sz * 0.45
+        }
+        flow_block(l, n, x0, w, flags | FL_BOLD, sz, doc.ALIGN_NONE)
+        if lv <= 2 as i64 {
+            (*l).y = (*l).y + px(l, 4)
+            let r: usize = add_rect(l, IT_RECT, x0, (*l).y, w, px(l, 1), style.TOK_SEPARATOR, 0.0)
+            (*l).y = (*l).y + px(l, 1)
+        }
+        (*l).y = (*l).y + base * 0.6
+    } else if k == doc.K_THEMATIC {
+        (*l).y = (*l).y + base * 0.5
+        let r: usize = add_rect(l, IT_RECT, x0, (*l).y, w, px(l, 2), style.TOK_SEPARATOR, 0.0)
+        (*l).y = (*l).y + px(l, 2) + base * 0.9
+    } else if k == doc.K_CODE_BLOCK || k == doc.K_HTML_BLOCK {
+        lay_code(l, n, x0, w)
+    } else if k == doc.K_QUOTE {
+        let bar: usize = add_rect(l, IT_RECT, x0, (*l).y, px(l, 4), 0.0, style.TOK_BORDER, 2.0)
+        let y0: f64 = (*l).y
+        lay_children(l, n, x0 + px(l, 16), w - px(l, 16), tight, flags | FL_MUTED)
+        let it: *mut Item = item_at(l, bar)
+        var hh: f64 = (*l).y - y0 - base * 0.6
+        if hh < 0.0 {
+            hh = (*l).y - y0
+        }
+        (*it).h = hh
+    } else if k == doc.K_LIST {
+        lay_list(l, n, x0, w, flags)
+    } else if k == doc.K_TABLE {
+        lay_table(l, n, x0, w, flags)
+    }
+}
+
+fn lay_code(l: *mut L, n: u32, x0: f64, w: f64) {
+    let d: *mut doc.Doc = &(*(*l).v).d
+    let base: f64 = (*l).base
+    let pad: f64 = px(l, 10)
+    let size: f64 = base * 0.92
+    let t: doc.Slice = doc.node_text(d, n)
+    let q: *mut doc.Node = doc.node_at(d, n)
+    let toff: u32 = (*q).txt
+    let bg: usize = add_rect(l, IT_RECT, x0, (*l).y, w, 0.0, style.TOK_SURFACE, px(l, 6))
+    let y0: f64 = (*l).y
+    (*l).y = (*l).y + pad
+    // line by line; every line may wrap
+    var i: usize = 0
+    while i <= t.n {
+        var e: usize = i
+        while e < t.n && rt.ld8(t.p, e) != 10 as u8 {
+            e = e + 1
+        }
+        if i == t.n {
+            break
+        }
+        // a line of code is ONE word that wraps by cutting (spaces count)
+        (*l).left = x0 + pad
+        (*l).right = x0 + w - pad
+        (*l).x = (*l).left
+        (*l).line_y = (*l).y
+        (*l).line_start = vec_len[Item](&(*(*l).v).items)
+        (*l).pend = false
+        (*l).at_start = true
+        (*l).last = (*l).line_start
+        if e > i {
+            place_word(l, 0 as u32, toff + (i as u32), e - i, FL_CODE, size, NIL)
+        } else {
+            // an empty line still takes a line
+            var it: Item = new_item(IT_TEXT)
+            it.flags = FL_CODE
+            it.size = size
+            it.x = (*l).left
+            let old: u64 = font_enter((*l).z, FL_CODE)
+            it.asc = painter.font_ascent((*l).z, size)
+            it.desc = painter.font_descent((*l).z, size)
+            font_leave((*l).z, old)
+            it.lh = line_h(l, size)
+            it.n = 0 as u32
+            let r: usize = push_item(l, it)
+        }
+        flush_line(l)
+        i = e + 1
+    }
+    (*l).y = (*l).y + pad
+    let it: *mut Item = item_at(l, bg)
+    (*it).h = (*l).y - y0
+    let ring: usize = add_rect(l, IT_RING, x0, y0, w, (*l).y - y0, style.TOK_BORDER, px(l, 6))
+    (*l).y = (*l).y + base * 0.8
+}
+
+fn lay_list(l: *mut L, n: u32, x0: f64, w: f64, flags: u32) {
+    let d: *mut doc.Doc = &(*(*l).v).d
+    let base: f64 = (*l).base
+    let tight: bool = doc.node_c(d, n) == 1 as i64
+    let ordered: bool = doc.node_b(d, n) == 1 as i64
+    var num: i64 = doc.node_a(d, n)
+    // depth decides the bullet shape: 0 = disc, 1 = ring, 2+ = square-ish disc
+    var depth: usize = 0
+    var a: u32 = doc.node_parent(d, n)
+    while a != doc.NIL {
+        if doc.node_kind(d, a) == doc.K_LIST {
+            depth = depth + 1
+        }
+        a = doc.node_parent(d, a)
+    }
+    let indent: f64 = px(l, 26)
+    var item: u32 = doc.node_first(d, n)
+    while item != doc.NIL {
+        let y0: f64 = (*l).y
+        let ts: i64 = doc.node_a(d, item)
+        let lh: f64 = line_h(l, base)
+        // the marker, centred on the first line
+        if ts != 0 as i64 {
+            let s: f64 = base * 0.95
+            var it: Item = new_item(IT_CHECK)
+            if ts == 2 as i64 {
+                it.kind = IT_CHECKED
+            }
+            it.x = x0 + indent - s - px(l, 10)
+            it.y = y0 + (lh - s) / 2.0
+            it.w = s
+            it.h = s
+            it.tok = style.TOK_TEXT_MUTED
+            it.radius = px(l, 3)
+            let r: usize = push_item(l, it)
+        } else if ordered {
+            // "12." right-aligned against the content
+            var nb: rt.Buf = rt.buf_new()
+            rt.buf_push_dec_i64(&nb, num)
+            rt.buf_push(&nb, 46 as u8)
+            let off: u32 = rt.buf_len(&(*(*l).v).vpool) as u32
+            rt.buf_push_bytes(&(*(*l).v).vpool, rt.buf_ptr(&nb), rt.buf_len(&nb))
+            let nn: usize = rt.buf_len(&nb)
+            rt.buf_free(&nb)
+            let tw: f64 = measure(l, 0 as u32, base, rt.buf_ptr(&(*(*l).v).vpool) + (off as u64), nn)
+            var it: Item = new_item(IT_TEXT)
+            it.flags = FL_VPOOL
+            it.size = base
+            it.asc = painter.font_ascent((*l).z, base)
+            it.desc = painter.font_descent((*l).z, base)
+            it.lh = lh
+            it.w = tw
+            it.x = x0 + indent - tw - px(l, 6)
+            it.y = y0 + (lh - it.asc - it.desc) / 2.0
+            it.off = off
+            it.n = nn as u32
+            it.tok = style.TOK_TEXT_MUTED
+            let r: usize = push_item(l, it)
+        } else {
+            let s: f64 = base * 0.34
+            var it: Item = new_item(IT_BULLET)
+            it.x = x0 + indent - s - px(l, 10)
+            it.y = y0 + (lh - s) / 2.0
+            it.w = s
+            it.h = s
+            it.tok = style.TOK_TEXT_MUTED
+            it.extra = (depth % 3) as i64
+            let r: usize = push_item(l, it)
+        }
+        lay_children(l, item, x0 + indent, w - indent, tight, flags)
+        // an item that holds nothing still takes a line
+        if (*l).y <= y0 {
+            (*l).y = y0 + lh
+        }
+        item = doc.node_next(d, item)
+        num = num + 1
+    }
+    if tight {
+        (*l).y = (*l).y + base * 0.5
+    } else {
+        (*l).y = (*l).y + base * 0.2
+    }
+}
+
+fn lay_table(l: *mut L, n: u32, x0: f64, w: f64, flags: u32) {
+    let d: *mut doc.Doc = &(*(*l).v).d
+    let base: f64 = (*l).base
+    let padx: f64 = px(l, 10)
+    let pady: f64 = px(l, 6)
+    // the first row tells the column count
+    let first: u32 = doc.node_first(d, n)
+    if first == doc.NIL {
+        return
+    }
+    let ncols: usize = doc.node_child_count(d, first)
+    if ncols == 0 || ncols > 32 {
+        return
+    }
+    var minw: [f64; 32] = [0.0; 32]
+    var maxw: [f64; 32] = [0.0; 32]
+    var row: u32 = first
+    while row != doc.NIL {
+        var cell: u32 = doc.node_first(d, row)
+        var ci: usize = 0
+        while cell != doc.NIL && ci < ncols {
+            var f: u32 = flags
+            if doc.node_b(d, row) == 1 as i64 {
+                f = f | FL_BOLD
+            }
+            var mn: f64 = 0.0
+            var mx: f64 = 0.0
+            var run: f64 = 0.0
+            extents(l, cell, f, base, &mn, &mx, &run)
+            if run > mx {
+                mx = run
+            }
+            if mn > minw[ci] {
+                minw[ci] = mn
+            }
+            if mx > maxw[ci] {
+                maxw[ci] = mx
+            }
+            cell = doc.node_next(d, cell)
+            ci = ci + 1
+        }
+        row = doc.node_next(d, row)
+    }
+    // column widths: all at their widest if that fits, else from the
+    // narrowest, the rest shared by how much each column wants
+    var cw: [f64; 32] = [0.0; 32]
+    var sum_max: f64 = 0.0
+    var sum_min: f64 = 0.0
+    var ci: usize = 0
+    while ci < ncols {
+        sum_max = sum_max + maxw[ci] + 2.0 * padx
+        sum_min = sum_min + minw[ci] + 2.0 * padx
+        ci = ci + 1
+    }
+    ci = 0
+    if sum_max <= w {
+        while ci < ncols {
+            cw[ci] = maxw[ci] + 2.0 * padx
+            ci = ci + 1
+        }
+    } else if sum_min >= w {
+        // not even the narrowest fit: share the width evenly
+        while ci < ncols {
+            cw[ci] = w / (ncols as f64)
+            ci = ci + 1
+        }
+    } else {
+        let extra: f64 = w - sum_min
+        let want: f64 = sum_max - sum_min
+        while ci < ncols {
+            cw[ci] = minw[ci] + 2.0 * padx + extra * (maxw[ci] - minw[ci]) / want
+            ci = ci + 1
+        }
+    }
+    var tw: f64 = 0.0
+    ci = 0
+    while ci < ncols {
+        tw = tw + cw[ci]
+        ci = ci + 1
+    }
+    let y_start: f64 = (*l).y
+    row = first
+    while row != doc.NIL {
+        let header: bool = doc.node_b(d, row) == 1 as i64
+        var bg: usize = NIL as usize
+        if header {
+            bg = add_rect(l, IT_RECT, x0, (*l).y, tw, 0.0, style.TOK_SURFACE, 0.0)
+        }
+        var cell: u32 = doc.node_first(d, row)
+        var cx: f64 = x0
+        var row_h: f64 = 0.0
+        ci = 0
+        let ry: f64 = (*l).y
+        while ci < ncols {
+            if cell != doc.NIL {
+                (*l).y = ry + pady
+                var f: u32 = flags
+                if header {
+                    f = f | FL_BOLD
+                }
+                flow_block(l, cell, cx + padx, cw[ci] - 2.0 * padx, f, base, doc.node_a(d, cell))
+                var hh: f64 = (*l).y - ry + pady
+                if hh > row_h {
+                    row_h = hh
+                }
+                cell = doc.node_next(d, cell)
+            }
+            cx = cx + cw[ci]
+            ci = ci + 1
+        }
+        if row_h < line_h(l, base) + 2.0 * pady {
+            row_h = line_h(l, base) + 2.0 * pady
+        }
+        if bg != (NIL as usize) {
+            let it: *mut Item = item_at(l, bg)
+            (*it).h = row_h
+        }
+        // the line under the row
+        let r: usize = add_rect(l, IT_RECT, x0, ry + row_h - px(l, 1), tw, px(l, 1), style.TOK_BORDER, 0.0)
+        (*l).y = ry + row_h
+        row = doc.node_next(d, row)
+    }
+    // the outer frame and the column lines
+    let th: f64 = (*l).y - y_start
+    let r1: usize = add_rect(l, IT_RECT, x0, y_start, tw, px(l, 1), style.TOK_BORDER, 0.0)
+    var vx: f64 = x0
+    ci = 0
+    while ci <= ncols {
+        let r2: usize = add_rect(l, IT_RECT, vx, y_start, px(l, 1), th, style.TOK_BORDER, 0.0)
+        if ci < ncols {
+            vx = vx + cw[ci]
+        }
+        ci = ci + 1
+    }
+    (*l).y = (*l).y + base * 0.9
+}
+
+// Lay the document out at `width` (device points, the width of the content).
+fn mdv_layout(v: *mut MdView, c: *mut render.Ctx, width: f64) {
+    vec_clear[Item](&(*v).items)
+    vec_clear[LinkRec](&(*v).links)
+    rt.buf_clear(&(*v).vpool)
+    (*v).hover = NIL
+    if !(*v).has_doc {
+        (*v).total_h = 0.0
+        return
+    }
+    var ly: L = L { c: c, z: render.ctx_painter(c), v: v, base: render.len_of(c, (*v).base_pt),
+        y: 0.0, left: 0.0, right: 0.0, x: 0.0, line_y: 0.0, line_start: 0, pend: false,
+        last: 0, at_start: true, align: doc.ALIGN_NONE }
+    let pad: f64 = render.len_of(c, (*v).pad_pt)
+    ly.y = pad
+    lay_children(&ly, 0 as u32, pad, width - 2.0 * pad, false, 0 as u32)
+    (*v).total_h = ly.y + pad
+}
+
+// ====================================================================
+// PAINTING
+// ====================================================================
+
+fn tokc(c: *mut render.Ctx, tok: u32) -> u32 {
+    if tok == TOK_LINK {
+        let m: *mut theme.Theme = render.ctx_theme(c)
+        let f: *mut theme.Colors = theme.theme_colors(m)
+        return theme.opaque(kitcolor.accent_text(m, (*f).base))
+    }
+    return render.color_of(c, style.color_token(tok))
+}
+
+// (Re)do the layout if the width, the scale or the content changed.
+fn ensure_layout(v: *mut MdView, c: *mut render.Ctx) {
+    let sc: usize = theme.theme_scale(render.ctx_theme(c))
+    var w: f64 = viewport.viewport_w(&(*v).vp)
+    if (*v).dirty || w != (*v).lay_w || sc != (*v).lay_scale {
+        // first with the full width; if a bar appears, once more without it
+        mdv_layout(v, c, w)
+        viewport.viewport_set_content(&(*v).vp, w, (*v).total_h)
+        var iw: f64 = viewport.viewport_inner_w(&(*v).vp)
+        if iw != w {
+            mdv_layout(v, c, iw)
+            viewport.viewport_set_content(&(*v).vp, iw, (*v).total_h)
+        }
+        (*v).lay_w = w
+        (*v).lay_scale = sc
+        (*v).dirty = false
+    }
+}
+
+fn paint_item(v: *mut MdView, c: *mut render.Ctx, it: *mut Item, ox: f64, oy: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let k: u32 = (*it).kind
+    let x: f64 = ox + (*it).x
+    let y: f64 = oy + (*it).y
+    if k == IT_RECT {
+        painter.round_rect(z, x, y, (*it).w, (*it).h, (*it).radius, tokc(c, (*it).tok))
+    } else if k == IT_RING {
+        painter.round_ring(z, x, y, (*it).w, (*it).h, (*it).radius, render.len_of(c, 1), tokc(c, (*it).tok))
+    } else if k == IT_BULLET {
+        let col: u32 = tokc(c, (*it).tok)
+        if (*it).extra == 1 as i64 {
+            painter.round_ring(z, x, y, (*it).w, (*it).h, (*it).w / 2.0, render.len_of(c, 1), col)
+        } else {
+            painter.round_rect(z, x, y, (*it).w, (*it).h, (*it).w / 2.0, col)
+        }
+    } else if k == IT_CHECK || k == IT_CHECKED {
+        let col: u32 = tokc(c, (*it).tok)
+        if k == IT_CHECKED {
+            painter.round_rect(z, x, y, (*it).w, (*it).h, (*it).radius, tokc(c, style.TOK_ACCENT))
+            icon.check(z, x + (*it).w * 0.12, y + (*it).h * 0.12, (*it).w * 0.76, render.len_of(c, 2),
+                tokc(c, style.TOK_TEXT_ON_ACCENT))
+        } else {
+            painter.round_ring(z, x, y, (*it).w, (*it).h, (*it).radius, render.len_of(c, 1), col)
+        }
+    } else if k == IT_TEXT {
+        if (*it).n == 0 as u32 {
+            return
+        }
+        let fl: u32 = (*it).flags
+        var p: u64 = doc.pool_ptr(&(*v).d)
+        if fl & FL_VPOOL != 0 as u32 {
+            p = rt.buf_ptr(&(*v).vpool)
+        }
+        p = p + ((*it).off as u64)
+        var col: u32 = tokc(c, (*it).tok)
+        var r: painter.TextRun = mk_run(fl, (*it).size)
+        let old: u64 = font_enter(z, fl)
+        let base_y: f64 = y + (*it).asc
+        painter.run_draw(z, &r, x, base_y, (*it).w + 2.0, col, p, (*it).n as usize, painter.TEXT_L)
+        font_leave(z, old)
+        if fl & FL_STRIKE != 0 as u32 {
+            painter.surface(z, x, y + (*it).asc * 0.62, (*it).w, render.len_of(c, 1), col)
+        }
+        if (*it).link != NIL && (*it).link == (*v).hover {
+            painter.surface(z, x, base_y + render.len_of(c, 2), (*it).w, render.len_of(c, 1), col)
+        }
+    } else if k == IT_IMAGE {
+        paint_image(v, c, it, x, y)
+    }
+}
+
+// The inline-code ground goes BEHIND the text: a first pass paints it.
+fn paint_code_ground(v: *mut MdView, c: *mut render.Ctx, it: *mut Item, ox: f64, oy: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let pad: f64 = render.len_of(c, 3)
+    var x: f64 = ox + (*it).x
+    var w: f64 = (*it).w
+    if (*it).flags & FL_CODE_FIRST != 0 as u32 {
+        x = x - pad
+        w = w + pad
+    }
+    if (*it).flags & FL_CODE_LAST != 0 as u32 {
+        w = w + pad
+    }
+    let vm: f64 = render.len_of(c, 1)
+    painter.round_rect(z, x, oy + (*it).y - vm, w, (*it).asc + (*it).desc + 2.0 * vm,
+        render.len_of(c, 4), tokc(c, style.TOK_BUTTON))
+}
+
+fn paint_image(v: *mut MdView, c: *mut render.Ctx, it: *mut Item, x: f64, y: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    if (*it).extra == 100 as i64 {
+        // the picture itself
+        let q: u64 = rt.buf_ptr(&(*v).vpool) + ((*it).tok2 as u64)
+        var im: uiimage.Image = uiimage.image_wrap(rt.ld64(q, 0), rt.ld64(q, 1) as usize,
+            rt.ld64(q, 2) as usize, rt.ld64(q, 3) as usize)
+        uiimage.image_draw_rect(z, &im, x, y, (*it).w, (*it).h, 0)
+        return
+    }
+    // the placeholder: frame, symbol, alt text
+    painter.round_rect(z, x, y, (*it).w, (*it).h, render.len_of(c, 6), tokc(c, style.TOK_SURFACE))
+    painter.round_ring(z, x, y, (*it).w, (*it).h, render.len_of(c, 6), render.len_of(c, 1),
+        tokc(c, style.TOK_BORDER))
+    let sym: f64 = (*it).size * 1.0
+    var id: i64 = lucide.IMAGE
+    if (*it).extra == 2 as i64 {
+        id = lucide.CIRCLE_ALERT
+    }
+    icons.icon_stroke(z, id, x + render.len_of(c, 8), y + ((*it).h - sym) / 2.0, sym,
+        tokc(c, style.TOK_TEXT_MUTED), icons.STROKE_DEFAULT)
+    if (*it).n > 0 as u32 {
+        let p: u64 = rt.buf_ptr(&(*v).vpool) + ((*it).off as u64)
+        var r: painter.TextRun = painter.run_new((*it).size * 0.9)
+        let tx: f64 = x + render.len_of(c, 8) + sym + render.len_of(c, 6)
+        let room: f64 = x + (*it).w - tx - render.len_of(c, 6)
+        if room > 4.0 {
+            let base_y: f64 = painter.text_baseline_mid(z, y, (*it).h, (*it).size * 0.9)
+            let fit: usize = painter.run_fits_upto(z, &r, p, (*it).n as usize, room)
+            painter.run_draw(z, &r, tx, base_y, room + 2.0, tokc(c, style.TOK_TEXT_MUTED), p, fit, painter.TEXT_L)
+        }
+    }
+}
+
+// Paint the view into its rectangle (mdv_set_rect). Lays out first if needed.
+fn mdv_paint(v: *mut MdView, c: *mut render.Ctx) {
+    ensure_layout(v, c)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    if (*v).bg_tok != NIL {
+        painter.surface(z, viewport.viewport_x(&(*v).vp), viewport.viewport_y(&(*v).vp),
+            viewport.viewport_w(&(*v).vp), viewport.viewport_h(&(*v).vp), tokc(c, (*v).bg_tok))
+    }
+    let ox: f64 = viewport.viewport_content_x(&(*v).vp)
+    let oy: f64 = viewport.viewport_content_y(&(*v).vp)
+    let top: f64 = viewport.viewport_off_y(&(*v).vp)
+    let bot: f64 = top + viewport.viewport_inner_h(&(*v).vp)
+    if viewport.viewport_begin(c, &(*v).vp) {
+        let n: usize = vec_len[Item](&(*v).items)
+        // pass 1: the grounds of inline code (behind the text)
+        var i: usize = 0
+        while i < n {
+            let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+            if (*it).y + (*it).h + (*it).lh >= top && (*it).y <= bot {
+                if (*it).kind == IT_TEXT && ((*it).flags & FL_CODE) != 0 as u32 {
+                    // a code BLOCK has the rectangle of its block; inline code
+                    // is told apart by the padding flags (or sits in the middle
+                    // of a span)
+                    if ((*it).flags & (FL_CODE_FIRST | FL_CODE_LAST)) != 0 as u32 || is_inline_code(v, i) {
+                        paint_code_ground(v, c, it, ox, oy)
+                    }
+                }
+            }
+            i = i + 1
+        }
+        i = 0
+        while i < n {
+            let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+            var ih: f64 = (*it).h
+            if (*it).kind == IT_TEXT {
+                ih = (*it).asc + (*it).desc
+            }
+            if (*it).y + ih + 2.0 >= top && (*it).y <= bot {
+                paint_item(v, c, it, ox, oy)
+            }
+            i = i + 1
+        }
+        viewport.viewport_end(c, &(*v).vp)
+    }
+    viewport.viewport_draw_bars(c, &(*v).vp)
+}
+
+// Is this CODE item in the middle of an inline span (neither first nor
+// last word)? Then its ground continues the span. The neighbours decide.
+fn is_inline_code(v: *mut MdView, i: usize) -> bool {
+    if i == 0 {
+        return false
+    }
+    // an inline span's middle words sit between a CODE_FIRST and a CODE_LAST
+    var k: usize = i
+    while k > 0 {
+        k = k - 1
+        let p: *mut Item = vec_elem_ptr[Item](&(*v).items, k)
+        if (*p).kind != IT_TEXT || ((*p).flags & FL_CODE) == 0 as u32 {
+            return false
+        }
+        if ((*p).flags & FL_CODE_LAST) != 0 as u32 {
+            return false
+        }
+        if ((*p).flags & FL_CODE_FIRST) != 0 as u32 {
+            return true
+        }
+    }
+    return false
+}
+
+// ====================================================================
+// INPUT
+// ====================================================================
+
+fn mdv_wheel(v: *mut MdView, dy: f64) {
+    viewport.viewport_wheel(&(*v).vp, 0.0, dy)
+}
+
+fn mdv_key(v: *mut MdView, key: u32) -> bool {
+    return viewport.viewport_key(&(*v).vp, key)
+}
+
+// The link under a window point, NIL if none.
+fn link_at(v: *mut MdView, x: f64, y: f64) -> u32 {
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    if !viewport.viewport_hit(&(*v).vp, x, y, &cx, &cy) {
+        return NIL
+    }
+    let n: usize = vec_len[Item](&(*v).items)
+    var i: usize = 0
+    while i < n {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+        if (*it).link != NIL && ((*it).kind == IT_TEXT || (*it).kind == IT_IMAGE) {
+            var h: f64 = (*it).h
+            if (*it).kind == IT_TEXT {
+                h = (*it).asc + (*it).desc
+            }
+            if cx >= (*it).x && cx < (*it).x + (*it).w && cy >= (*it).y && cy < (*it).y + h {
+                return (*it).link
+            }
+        }
+        i = i + 1
+    }
+    return NIL
+}
+
+// The rectangle (content coordinates) of the first item of link `i`;
+// false if there is none. (For tests and for scrolling to a link.)
+fn mdv_link_rect(v: *mut MdView, i: u32, x: *mut f64, y: *mut f64, w: *mut f64, h: *mut f64) -> bool {
+    let n: usize = vec_len[Item](&(*v).items)
+    var k: usize = 0
+    while k < n {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, k)
+        if (*it).link == i && ((*it).kind == IT_TEXT || (*it).kind == IT_IMAGE) {
+            *x = (*it).x
+            *y = (*it).y
+            *w = (*it).w
+            *h = (*it).h
+            if (*it).kind == IT_TEXT {
+                *h = (*it).asc + (*it).desc
+            }
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+// The pointer moved: the link under it is highlighted. True when the picture changed.
+fn mdv_pointer_move(v: *mut MdView, c: *mut render.Ctx, x: f64, y: f64) -> bool {
+    if (*v).drag_bar {
+        return viewport.viewport_bar_drag(c, &(*v).vp, x, y)
+    }
+    let h: u32 = link_at(v, x, y)
+    if h != (*v).hover {
+        (*v).hover = h
+        return true
+    }
+    return false
+}
+
+fn mdv_pointer_leave(v: *mut MdView) -> bool {
+    if (*v).hover != NIL {
+        (*v).hover = NIL
+        return true
+    }
+    return false
+}
+
+// A press. True when the view took it (a scrollbar, or a link that waits for
+// its release).
+fn mdv_pointer_down(v: *mut MdView, c: *mut render.Ctx, x: f64, y: f64) -> bool {
+    if viewport.viewport_bar_press(c, &(*v).vp, x, y) {
+        (*v).drag_bar = viewport.viewport_bar_dragging(&(*v).vp) != viewport.VP_BAR_NONE
+        return true
+    }
+    (*v).press = link_at(v, x, y)
+    return (*v).press != NIL
+}
+
+// A release. When it ends a click on a link, the link callback runs with the
+// target; true then.
+fn mdv_pointer_up(v: *mut MdView, c: *mut render.Ctx, x: f64, y: f64) -> bool {
+    if (*v).drag_bar {
+        viewport.viewport_bar_release(&(*v).vp)
+        (*v).drag_bar = false
+        return true
+    }
+    let p: u32 = (*v).press
+    (*v).press = NIL
+    if p == NIL {
+        return false
+    }
+    if link_at(v, x, y) != p {
+        return false
+    }
+    if (*v).has_link_cb {
+        let u: doc.Slice = mdv_link_url(v, p as usize)
+        let f: fn(u64, u64, usize) = (*v).link_cb
+        f((*v).link_ud, u.p, u.n)
+    }
+    return true
+}
