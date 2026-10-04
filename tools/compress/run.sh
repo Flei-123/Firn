@@ -62,7 +62,7 @@ else
     echo "   SKIP: qemu-aarch64 is missing"
 fi
 
-echo "-- Windows under Wine (tiny corpus)"
+echo "-- Windows under Wine (smoke test: decode and encode of a few small inputs)"
 WINE=${WINE:-}
 if [ -z "$WINE" ]; then
     for c in wine wine64 /usr/lib/wine/wine64; do
@@ -73,8 +73,9 @@ if [ -n "$WINE" ] && command -v x86_64-w64-mingw32-ld >/dev/null 2>&1; then
     export WINEPREFIX=${WINEPREFIX:-${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.wine-firn}
     export WINEDEBUG=${WINEDEBUG:--all}
     if "$FIRNC" --target=x86_64-windows --opt-level=dev-fast -o "$W/probe_win.exe" tools/compress/probe.fi > "$W/probe_win.log" 2>&1; then
-        # CHECK_QUICK=2: a tiny corpus -- every probe run is a Wine process start
-        CHECK_QUICK=2 RUNNER="$WINE" python3 tools/compress/check.py "$W/probe_win.exe" || rc=1
+        # CHECK_QUICK=3 and decode+encode only: a smoke test of the platform seam (files, descriptors,
+        # the clock-free code paths) -- every probe run is a Wine process start
+        CHECK_QUICK=3 CHECK_PARTS=decode,encode RUNNER="$WINE" python3 tools/compress/check.py "$W/probe_win.exe" || rc=1
     else
         echo "  FAIL the probe does not build for Windows"; grep -v RWX "$W/probe_win.log" | head -5; rc=1
     fi

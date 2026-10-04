@@ -24,7 +24,7 @@ PROBE = os.path.abspath(sys.argv[1])
 # RUNNER: a program that runs the probe (qemu-aarch64 for an AArch64 build, wine for a
 # Windows build); CHECK_QUICK=1: a small corpus and fewer hostile cases (for the slow runners)
 RUNNER = os.environ.get("RUNNER", "").split()
-QUICK = int(os.environ.get("CHECK_QUICK") or 0)   # 1: reduced corpus; 2: tiny (for Wine)
+QUICK = int(os.environ.get("CHECK_QUICK") or 0)   # 1: reduced corpus; 2: tiny; 3: a smoke test (for Wine)
 FMTS = sys.argv[2:] or ["lz4", "zstd", "xz", "lzma", "bz2", "br", "gz", "zlib", "deflate", "auto"]
 PARTS = os.environ.get("CHECK_PARTS", "decode,encode,hostile").split(",")
 W = tempfile.mkdtemp(prefix="compress-check-")
@@ -86,6 +86,9 @@ def corpus():
     items = corpus_full()
     if not QUICK:
         return items
+    if QUICK >= 3:
+        keep = {"empty": None, "a1": None, "text600k": 8000, "runs": 5000, "bcjmix": 4000}
+        return [(n, d if keep[n] is None else d[: keep[n]]) for n, d in items if n in keep]
     if QUICK >= 2:
         keep = {"empty": None, "rand1": None, "a1": None, "abab": 6000, "text600k": 30000, "runs": 20000, "bcjmix": 12000,
                 "dna": 10000, "sparse": 10000}
@@ -348,7 +351,9 @@ def group(fmt):
     n0 = len(FAILS)
     # ---- decode: reference compressors -> ours
     refs = ref_compressors(fmt) if "decode" in PARTS else []
-    if QUICK >= 2:
+    if QUICK >= 3:
+        refs = refs[:2]
+    elif QUICK >= 2:
         refs = refs[:: max(1, len(refs) // 3)][:3]
     for label, comp in refs:
         for name, data in items:
@@ -370,7 +375,7 @@ def group(fmt):
     n1 = len(FAILS)
     # ---- encode: ours -> reference
     if ENC_ENABLED.get(fmt) and "encode" in PARTS:
-        for lv in (ENC_LEVELS[fmt][:2] if QUICK >= 2 else ENC_LEVELS[fmt]):
+        for lv in (ENC_LEVELS[fmt][:1] if QUICK >= 3 else ENC_LEVELS[fmt][:2] if QUICK >= 2 else ENC_LEVELS[fmt]):
             for name, data in items:
                 st, z = run_probe("c", fmt, data, lv)
                 if not st.startswith("OK"):
@@ -440,6 +445,8 @@ def group(fmt):
 
 def zstd_dict_group():
     """dictionaries: trained (zstd --train), raw content, wrong/missing id"""
+    if QUICK >= 3:
+        return
     t0 = time.time()
     n0 = len(FAILS)
     rnd = random.Random(99)
