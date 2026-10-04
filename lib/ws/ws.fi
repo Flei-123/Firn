@@ -22,7 +22,12 @@
 //   1007  text (or a close reason) that is not UTF-8 -- checked as the
 //         octets arrive, so a broken sequence fails at once
 //   1009  a message longer than the limit the receiver set
+//
+// The NON-BLOCKING client (reconnect with backoff, keep-alive pings, the
+// closing handshake with a timeout, fragmentation, wss:// on the event loop)
+// is lib/async/wsc.fi; it uses this codec. `backoff_ms` below is shared.
 import std.rt
+import std.str
 import std.net
 import std.base64
 import std.crypto.sha1
@@ -36,6 +41,8 @@ export {
     utf8_new, utf8_feed, utf8_complete,
     client_new, connect, connect_tls, send_text, send_binary, send_ping, recv,
     close, close_code, is_open, client_free,
+    // round ASYNC
+    send_fragmented, backoff_ms, close_timeout, send_close_frame,
     OP_CONT, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG,
     PARSE_MORE, PARSE_OK, PARSE_ERROR,
 }
@@ -512,4 +519,76 @@ fn recv(c: *mut Client, out: *mut rt.Buf) -> WsError!u32 {
         }
     }
     return WsError::Protocol
+}
+
+// ------------------------------------------------------------ Round ASYNC
+
+// One message in fragments of at most `frag` octets (a TEXT or BINARY frame
+// without FIN, then CONTINUATION frames, the last with FIN). A message that
+// fits in one fragment is a single frame. Control frames (pings) may be
+// sent between calls; they must not be sent between fragments of ONE call
+// and cannot be -- the fragments leave in one write.
+fn send_fragmented(c: *mut Client, op: u32, p: u64, n: usize, frag: usize) -> bool {
+    if !(*c).open { return false }
+    if op != OP_TEXT && op != OP_BINARY { return false }
+    if frag == 0 || n <= frag {
+        return send_frame(c, op, p, n)
+    }
+    var out: rt.Buf = rt.buf_new()
+    var at: usize = 0
+    var first: bool = true
+    while at < n {
+        var k: usize = n - at
+        if k > frag { k = frag }
+        var mask: [u8; 4] = [0; 4]
+        if !random.random_bytes((&mask[0]) as u64, 4) {
+            rt.buf_free(&out)
+            return false
+        }
+        var fop: u32 = OP_CONT
+        if first { fop = op }
+        write_frame(&out, fop, at + k == n, p + at as u64, k, (&mask[0]) as u64)
+        first = false
+        at = at + k
+    }
+    let ok: bool = raw_write(c, out.ptr, out.len)
+    rt.buf_free(&out)
+    return ok
+}
+
+// A close frame (code, no reason) without waiting for the answer.
+fn send_close_frame(c: *mut Client, code: u32) -> bool {
+    var b: [u8; 2] = [0, 0]
+    b[0] = ((code >> 8) & 255) as u8
+    b[1] = (code & 255) as u8
+    return send_frame(c, OP_CLOSE, (&b[0]) as u64, 2)
+}
+
+// `close`, but the peer gets at most `ms` milliseconds to answer (the plain
+// `close` waits for as long as the socket lets it). The socket timeout is
+// set on the connection, so this holds for plain and TLS connections alike.
+fn close_timeout(c: *mut Client, code: u32, ms: u64) {
+    if net.conn_is_open(&(*c).conn) {
+        net.set_timeout(&(*c).conn, ms) catch false
+    }
+    close(c, code)
+}
+
+// Delay before reconnect attempt number `attempt` (0 = the first retry):
+// base * 2^attempt, capped, then spread by +-20 % with `rnd` (any u32;
+// callers pass random bytes) so that a thousand clients that lost the same
+// server do not return in the same millisecond.
+fn backoff_ms(attempt: u32, base: i64, cap: i64, rnd: u32) -> i64 {
+    var d: i64 = base
+    var i: u32 = 0
+    while i < attempt && d < cap {
+        d = d * 2
+        i = i + 1
+    }
+    if d > cap { d = cap }
+    // factor 0.8 .. 1.2 in steps of 1/1000
+    let f: i64 = 800 + (rnd % 401) as i64
+    d = d * f / 1000
+    if d < 1 { d = 1 }
+    return d
 }
