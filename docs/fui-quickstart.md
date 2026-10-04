@@ -170,6 +170,16 @@ its handler. The full API (also for scene-tree programs) is in
 `docs/fui-list-rows.md`.
 
 
+## Beyond `fui.app`: a launcher-style window
+
+`fui.app` builds a window out of labels, buttons and fields. For a program whose
+whole window is custom -- a sidebar, tabs, a grid of cards, toasts, a dialog
+with a focus trap, a Markdown page -- there is the immediate-mode kit
+(`lib/fui/kit.fi`, `docs/fui-kit.md`) and the Markdown view
+(`lib/fui/markdownview.fi`, `docs/MARKDOWN.md`); `examples/fui/launcher_kit.fi`
+is a complete window using all of it, on the same `fui.apphost` (native and
+browser).
+
 ## The API
 
 | Call | What it does |
