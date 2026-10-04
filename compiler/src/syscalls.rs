@@ -206,7 +206,9 @@ const TABLE: &[(i64, A64)] = &[
     (107, A64::Direct(175)),         // geteuid
     // ROUND C-059: stood until now between 13 and 14 and thereby broke
     // the sorting of the table (a test of its own). Only moved.
+    (109, A64::Direct(154)),         // setpgid   (std.process: set_group)
     (112, A64::Direct(157)),         // setsid    (std.process: detach)
+    (121, A64::Direct(155)),         // getpgid   (std.process: the group is verified)
     (128, A64::Direct(137)),         // rt_sigtimedwait (std.process: swallow a SIGPIPE)
     (131, A64::Direct(132)),         // sigaltstack -- eigener Signalstapel
     (158, A64::SetThreadPointer),    // arch_prctl(ARCH_SET_FS) -> msr tpidr_el0
@@ -220,6 +222,7 @@ const TABLE: &[(i64, A64)] = &[
     (217, A64::Direct(61)),          // getdents64
     (228, A64::Direct(113)),         // clock_gettime
     (231, A64::Direct(94)),          // exit_group
+    (233, A64::Direct(21)),          // epoll_ctl     (lib/async)
     (257, A64::Direct(56)),          // openat
     (262, A64::Direct(79)),          // newfstatat
     // OPENPLAN LIB-001 (std.fs): rmdir has no generic form -- std.fs calls
@@ -228,7 +231,10 @@ const TABLE: &[(i64, A64)] = &[
     (263, A64::Direct(35)),          // unlinkat
     (266, A64::Direct(36)),          // symlinkat (std.fs.symlink)
     (267, A64::Direct(78)),          // readlinkat (std.fs.readlink)
+    (281, A64::Direct(22)),          // epoll_pwait   (lib/async; epoll_wait has no generic form)
     (288, A64::Direct(242)),         // accept4
+    (290, A64::Direct(19)),          // eventfd2      (lib/async: wake-up from threads)
+    (291, A64::Direct(20)),          // epoll_create1 (lib/async)
     (293, A64::Direct(59)),          // pipe2     (std.process)
     (318, A64::Direct(278)),         // getrandom
     (332, A64::Direct(291)),         // statx
@@ -357,7 +363,9 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (97, "getrlimit", Wasm::Missing("a browser page has no resource limits")),
     (102, "getuid", Wasm::Missing("a browser page has no users")),
     (107, "geteuid", Wasm::Missing("a browser page has no users")),
+    (109, "setpgid", Wasm::Missing(NO_PROCESSES)),
     (112, "setsid", Wasm::Missing(NO_PROCESSES)),
+    (121, "getpgid", Wasm::Missing(NO_PROCESSES)),
     (128, "rt_sigtimedwait", Wasm::Missing(NO_SIGNALS)),
     (131, "sigaltstack", Wasm::Missing(NO_SIGNALS)),
     (158, "arch_prctl", Wasm::Missing(NO_THREADS)),
@@ -369,12 +377,16 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (217, "getdents64", Wasm::Missing(NO_FILES)),
     (228, "clock_gettime", Wasm::ClockGettime),
     (231, "exit_group", Wasm::Exit),
+    (233, "epoll_ctl", Wasm::Missing(NO_FILES)),
     (257, "openat", Wasm::Missing(NO_FILES)),
     (262, "newfstatat", Wasm::Missing(NO_FILES)),
     (263, "unlinkat", Wasm::Missing(NO_FILES)),
     (266, "symlinkat", Wasm::Missing(NO_FILES)),
     (267, "readlinkat", Wasm::Missing(NO_FILES)),
+    (281, "epoll_pwait", Wasm::Missing(NO_FILES)),
     (288, "accept4", Wasm::Missing(NO_SOCKETS)),
+    (290, "eventfd2", Wasm::Missing(NO_FILES)),
+    (291, "epoll_create1", Wasm::Missing(NO_FILES)),
     (293, "pipe2", Wasm::Missing(NO_FILES)),
     (318, "getrandom", Wasm::Getrandom),
     (332, "statx", Wasm::Missing(NO_FILES)),

@@ -1726,14 +1726,15 @@ fn emit_inst(
             store_dst(e, fr, d, "rax");
         }
         Op::ThreadSpawn { arg, stack, ctid } => {
-            // ROUND WINDOWS: clone(2) has no counterpart behind the seam; the
-            // spawn yields ENOSYS (-38), which `thread_spawn` reports as a
-            // failure instead of refusing every program that links lib/gc.
+            // ROUND WIN-THREADS: CreateThread instead of clone(2).
             if crate::target::windows() {
-                crate::thread::spawn_unsupported(e);
-                if let Some(d) = i.dst {
-                    store_dst(e, fr, d, "rax");
-                }
+                crate::simd::xflush(e, fr);
+                let d = i.dst.ok_or("internal error: spawn without target")?;
+                load_full(e, fr, "rdi", *arg);
+                load_full(e, fr, "rsi", *stack);
+                load_full(e, fr, "rdx", *ctid);
+                crate::thread::spawn_sequence_windows(e);
+                store_dst(e, fr, d, "rax");
                 return Ok(());
             }
             crate::simd::xflush(e, fr);
@@ -1746,7 +1747,11 @@ fn emit_inst(
         }
         Op::ThreadSelf => {
             let d = i.dst.ok_or("internal error: threadself without target")?;
-            crate::thread::self_sequence(e);
+            if crate::target::windows() {
+                crate::thread::self_sequence_windows(e);
+            } else {
+                crate::thread::self_sequence(e);
+            }
             store_dst(e, fr, d, "rax");
         }
         Op::CopyMem { dst, src, size } => {

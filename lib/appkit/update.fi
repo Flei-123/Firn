@@ -1,0 +1,1788 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/update.fi -- THE UPDATER: check the store, download, verify,
+// replace the running program, and take it back if the new one does not
+// come up.
+//
+// THE FLOW (docs/APPKIT.md has the pictures)
+//
+//   check     entry.json + signature  ->  catalog  ->  the build the channel
+//             points at for this platform  ->  newer than me?
+//   fetch     download next to the executable, SHA-256 + size from the
+//             SIGNED catalog, file magic  ->  `<exe>.new`, READY
+//   apply     back up the old file, rename the new one in place, start it
+//   confirm   the new program calls update_mark_healthy() once it is up
+//   rollback  no confirmation within `update.healthy_s` seconds (or the new
+//             process died): the old file goes back and is started again
+//
+// NOTHING BLOCKS THE UI. check and fetch run in a BACKGROUND WORKER:
+//   * a thread (`thread_start`) where the platform has them (Linux x86-64),
+//   * else a worker PROCESS: the program starts itself with
+//     `--appkit-worker check|fetch`, the worker writes its progress to a
+//     small status file and the UI reads it (Windows has no threads in Firn
+//     today; AArch64 neither),
+//   * or, for tools and tests, the blocking calls themselves.
+// The UI side is the same in every case: `update_start`, then `update_poll`
+// each frame, then read `status()`.
+//
+// WHAT IT TRUSTS: the Ed25519 key compiled into the program (appinfo).
+// Everything else -- the server, the connection, a mirror -- is checked:
+// the entry's signature, its freshness, the catalog's hash, the download's
+// hash and size. A file whose SHA-256 differs from the signed catalog is
+// deleted and never run.
+//
+// STATE lives in two small JSON files (appkit.config): `settings`
+// (update.auto, update.channel, update.interval_h, update.follow_rollback,
+// update.healthy_s, update.store) and `state` (the last catalog revision
+// and timestamp seen, the pending update, builds that failed).
+//
+// THREAD NOTE. A program that wants thread mode defines
+//     fn __thread_work(kind: u64, arg: u64) -> u64 {
+//         return update.thread_dispatch(kind, arg)
+//     }
+// (the language wants this dispatcher in the program itself). Without it
+// `update_start` falls back to the process worker.
+import std.rt
+import std.fs
+import std.time
+import std.json
+import std.crypto.sha256
+import appkit.util
+import appkit.version
+import appkit.catalog
+import appkit.fetch
+import appkit.appinfo
+import appkit.platform
+import appkit.config
+import appkit.log
+
+export {
+    Status, Updater, update_new, update_init, update_global,
+    update_boot, update_start, update_poll, update_cancel, update_busy,
+    update_status, update_apply, update_supervise, update_mark_healthy,
+    update_check_blocking, update_fetch_blocking, update_auto_due,
+    update_set_channel, update_channel, update_settings, update_state,
+    update_save_settings, update_staged_path, update_forget_staged,
+    update_set_resolver, update_set_verify_tls, update_pending_text,
+    update_was_rolled_back, update_clear_rolled_back, thread_dispatch,
+    update_user_arg, update_user_argc, update_started_after_update,
+    update_started_after_rollback,
+    status_text, err_text, status_notes, status_version, status_error,
+    PH_IDLE, PH_CHECKING, PH_UPTODATE, PH_AVAILABLE, PH_DOWNLOADING,
+    PH_VERIFYING, PH_READY, PH_APPLYING, PH_ERROR, PH_UNSUPPORTED,
+    PH_DONE_INSTALLER,
+    UE_NONE, UE_NETWORK, UE_SIGNATURE, UE_ENTRY, UE_CATALOG, UE_NOT_FOUND,
+    UE_PLATFORM, UE_HASH, UE_SIZE, UE_DISK, UE_WRITABLE, UE_APPLY,
+    UE_WORKER, UE_CANCELLED, UE_CONFIG, UE_UNSUPPORTED, UE_VERSION,
+    UE_FLOOR, UE_MAGIC, UE_STATE,
+    OP_CHECK, OP_FETCH, RUN_AUTO, RUN_THREAD, RUN_PROCESS, RUN_BLOCKING,
+    UPDATE_THREAD_KIND,
+}
+
+// ---- phases (what the UI shows)
+const PH_IDLE: u64 = 0
+const PH_CHECKING: u64 = 1
+const PH_UPTODATE: u64 = 2
+const PH_AVAILABLE: u64 = 3
+const PH_DOWNLOADING: u64 = 4
+const PH_VERIFYING: u64 = 5
+const PH_READY: u64 = 6
+const PH_APPLYING: u64 = 7
+const PH_ERROR: u64 = 8
+const PH_UNSUPPORTED: u64 = 9
+const PH_DONE_INSTALLER: u64 = 10 // handed to the system installer
+
+// ---- errors
+const UE_NONE: u64 = 0
+const UE_NETWORK: u64 = 1
+const UE_SIGNATURE: u64 = 2
+const UE_ENTRY: u64 = 3
+const UE_CATALOG: u64 = 4
+const UE_NOT_FOUND: u64 = 5
+const UE_PLATFORM: u64 = 6
+const UE_HASH: u64 = 7
+const UE_SIZE: u64 = 8
+const UE_DISK: u64 = 9
+const UE_WRITABLE: u64 = 10
+const UE_APPLY: u64 = 11
+const UE_WORKER: u64 = 12
+const UE_CANCELLED: u64 = 13
+const UE_CONFIG: u64 = 14
+const UE_UNSUPPORTED: u64 = 15
+const UE_VERSION: u64 = 16
+const UE_FLOOR: u64 = 17
+const UE_MAGIC: u64 = 18
+const UE_STATE: u64 = 19
+
+// ---- what a worker does
+const OP_CHECK: u32 = 1
+const OP_FETCH: u32 = 2 // check, and download when something newer exists
+
+// ---- how it runs
+const RUN_AUTO: u32 = 0
+const RUN_THREAD: u32 = 1
+const RUN_PROCESS: u32 = 2
+const RUN_BLOCKING: u32 = 3
+
+const UPDATE_THREAD_KIND: u64 = 7771
+
+const DEFAULT_HEALTHY_S: i64 = 45
+const DEFAULT_INTERVAL_H: i64 = 24
+const CATALOG_MAX: u64 = 8388608
+const ENTRY_MAX: u64 = 65536
+const BEAT_DEAD_MS: u64 = 30000
+
+// What the UI reads. Plain aligned words: a worker thread writes them and
+// the UI thread reads them without a lock (a torn read of a text can show
+// a half-updated line for one frame, never a crash; `seq` changes after
+// every complete update).
+struct Status {
+    phase: u64,
+    err: u64,
+    seq: u64,
+    beat: u64,
+    done: u64,
+    total: u64,
+    http: u64,
+    pid: u64,
+    size: u64,
+    rollback: u64, // the offered build is a rollback by the publisher
+    running: u64, // a background worker (thread or process) is still at work
+    ver: [u8; 64],
+    nver: u64,
+    notes: [u8; 1536],
+    nnotes: u64,
+    errtext: [u8; 192],
+    nerr: u64,
+    sha: [u8; 64], // the offered build's SHA-256: all that apply needs from a worker
+    nsha: u64,
+}
+
+struct Updater {
+    ok: bool,
+    st: Status,
+    settings: config.Config,
+    state: config.Config,
+    build: catalog.Build,
+    cancel: u64,
+    mode: u32,
+    worker_op: u32,
+    thread_h: u64,
+    publish_file: bool,
+    status_path: [u8; 512],
+    nstatus_path: usize,
+    state_dir: [u8; 512],
+    nstate_dir: usize,
+    supervise: bool,
+    last_publish_ms: u64,
+    last_poll_ms: u64,
+    last_beat_seen: u64,
+    last_beat_ms: u64,
+    seen_seq: u64,
+    own_sha: [u8; 64],
+    have_own_sha: bool,
+    verify_tls: bool,
+    resolver: fn(u64, usize, *mut u32) -> bool,
+    started_ms: u64,
+    last_cancel_check_ms: u64,
+    new_token: i64, // the program update_apply started (platform.plat_spawned_alive)
+}
+
+static mut G_UPDATER: u64 = 0
+static mut G_RESTARTED: bool = false
+static mut G_ROLLEDBACK_START: bool = false
+
+// ------------------------------------------------------------ the object
+
+// `size_of[T]()` written inside a module cannot name the module's own
+// struct (the compiler qualifies the type later than it reads the call);
+// through a generic wrapper it can.
+fn upd_size_of[T: Any]() -> usize {
+    return size_of[T]()
+}
+
+fn update_new() -> *mut Updater {
+    let n: usize = upd_size_of[Updater]()
+    let p: u64 = rt.heap_alloc(n)
+    if p == 0 as u64 {
+        return 0 as *mut Updater
+    }
+    rt.mem_set(p, 0 as u8, n)
+    let u: *mut Updater = p as *mut Updater
+    (*u).settings = config.config_new()
+    (*u).state = config.config_new()
+    (*u).build = catalog.build_new()
+    (*u).verify_tls = true
+    (*u).resolver = fetch.resolve_system
+    (*u).mode = RUN_AUTO
+    (*u).new_token = -1
+    (*u).ok = false
+    G_UPDATER = p
+    return u
+}
+
+// The one updater of the program (the one update_new made last).
+fn update_global() -> *mut Updater {
+    return G_UPDATER as *mut Updater
+}
+
+fn update_set_resolver(u: *mut Updater, r: fn(u64, usize, *mut u32) -> bool) {
+    (*u).resolver = r
+}
+
+fn update_set_verify_tls(u: *mut Updater, on: bool) {
+    (*u).verify_tls = on
+}
+
+fn update_settings(u: *mut Updater) -> *mut config.Config {
+    return &(*u).settings
+}
+
+fn update_state(u: *mut Updater) -> *mut config.Config {
+    return &(*u).state
+}
+
+fn update_status(u: *mut Updater) -> *mut Status {
+    return &(*u).st
+}
+
+fn state_dir_str(u: *mut Updater) -> str {
+    return str { p: (&(*u).state_dir[0]) as *mut u8, n: (*u).nstate_dir }
+}
+
+fn status_path_str(u: *mut Updater) -> str {
+    return str { p: (&(*u).status_path[0]) as *mut u8, n: (*u).nstatus_path }
+}
+
+// ---------------------------------------------------------------- status
+
+fn now_ms() -> u64 {
+    return time.monotonic_ns() / 1000000 as u64
+}
+
+fn put_text(dst: u64, cap: usize, s: str) -> u64 {
+    var n: usize = s.n
+    if n > cap {
+        n = cap
+    }
+    rt.mem_copy(dst, s.p as u64, n)
+    return n as u64
+}
+
+fn status_version(s: *mut Status) -> str {
+    return str { p: (&(*s).ver[0]) as *mut u8, n: (*s).nver as usize }
+}
+
+fn status_notes(s: *mut Status) -> str {
+    return str { p: (&(*s).notes[0]) as *mut u8, n: (*s).nnotes as usize }
+}
+
+fn status_error(s: *mut Status) -> str {
+    return str { p: (&(*s).errtext[0]) as *mut u8, n: (*s).nerr as usize }
+}
+
+fn err_text(e: u64) -> str {
+    if e == UE_NONE { return "" }
+    if e == UE_NETWORK { return "Cannot reach the update server." }
+    if e == UE_SIGNATURE { return "The update information is not signed by the publisher. Nothing was installed." }
+    if e == UE_ENTRY { return "The update information is out of date or not valid." }
+    if e == UE_CATALOG { return "The update catalog is damaged." }
+    if e == UE_NOT_FOUND { return "This program is not in the update catalog (or the channel has no build)." }
+    if e == UE_PLATFORM { return "There is no build for this system." }
+    if e == UE_HASH { return "The downloaded file does not match its checksum. It was deleted." }
+    if e == UE_SIZE { return "The downloaded file has the wrong size. It was deleted." }
+    if e == UE_DISK { return "Cannot write the downloaded file." }
+    if e == UE_WRITABLE { return "The program folder is read-only for you; the update cannot be put next to the program." }
+    if e == UE_APPLY { return "Replacing the program failed." }
+    if e == UE_WORKER { return "The update worker stopped without an answer." }
+    if e == UE_CANCELLED { return "Cancelled." }
+    if e == UE_CONFIG { return "The update settings of this program are incomplete." }
+    if e == UE_UNSUPPORTED { return "This system cannot update the program by itself." }
+    if e == UE_VERSION { return "The version in the catalog is not a version number." }
+    if e == UE_FLOOR { return "The offered build is older than the lowest allowed one." }
+    if e == UE_MAGIC { return "The downloaded file is not a program for this system." }
+    return "Update state error."
+}
+
+fn status_text(phase: u64) -> str {
+    if phase == PH_IDLE { return "idle" }
+    if phase == PH_CHECKING { return "checking" }
+    if phase == PH_UPTODATE { return "up to date" }
+    if phase == PH_AVAILABLE { return "update available" }
+    if phase == PH_DOWNLOADING { return "downloading" }
+    if phase == PH_VERIFYING { return "verifying" }
+    if phase == PH_READY { return "ready to install" }
+    if phase == PH_APPLYING { return "installing" }
+    if phase == PH_ERROR { return "error" }
+    if phase == PH_UNSUPPORTED { return "not supported here" }
+    return "handed to the system installer"
+}
+
+// escape \n and \\ so a text fits on one status-file line
+fn push_esc(out: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 10 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 110 as u8)
+        } else if c == 92 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 92 as u8)
+        } else if c == 13 as u8 {
+            // dropped
+        } else {
+            rt.buf_push(out, c)
+        }
+        i = i + 1
+    }
+}
+
+fn kv_num(out: *mut rt.Buf, key: str, v: u64) {
+    util.buf_push_str(out, key)
+    rt.buf_push(out, 61 as u8)
+    rt.buf_push_dec_u64(out, v)
+    rt.buf_push(out, 10 as u8)
+}
+
+fn kv_txt(out: *mut rt.Buf, key: str, p: u64, n: usize) {
+    util.buf_push_str(out, key)
+    rt.buf_push(out, 61 as u8)
+    push_esc(out, p, n)
+    rt.buf_push(out, 10 as u8)
+}
+
+// the worker process publishes its status as a file (atomic rename)
+fn publish(u: *mut Updater, force: bool) {
+    if !(*u).publish_file || (*u).nstatus_path == 0 {
+        return
+    }
+    let now: u64 = now_ms()
+    if !force && now - (*u).last_publish_ms < 150 as u64 {
+        return
+    }
+    (*u).last_publish_ms = now
+    var b: rt.Buf = rt.buf_new()
+    let s: *mut Status = &(*u).st
+    kv_num(&b, "phase", (*s).phase)
+    kv_num(&b, "err", (*s).err)
+    kv_num(&b, "seq", (*s).seq)
+    kv_num(&b, "beat", (*s).beat)
+    kv_num(&b, "done", (*s).done)
+    kv_num(&b, "total", (*s).total)
+    kv_num(&b, "http", (*s).http)
+    kv_num(&b, "pid", (*s).pid)
+    kv_num(&b, "size", (*s).size)
+    kv_num(&b, "rollback", (*s).rollback)
+    kv_num(&b, "running", (*s).running)
+    kv_txt(&b, "ver", (&(*s).ver[0]) as u64, (*s).nver as usize)
+    kv_txt(&b, "notes", (&(*s).notes[0]) as u64, (*s).nnotes as usize)
+    kv_txt(&b, "errtext", (&(*s).errtext[0]) as u64, (*s).nerr as usize)
+    kv_txt(&b, "sha", (&(*s).sha[0]) as u64, (*s).nsha as usize)
+    let ok: bool = fs.write_atomic(status_path_str(u), rt.buf_ptr(&b), rt.buf_len(&b)) catch false
+    rt.buf_free(&b)
+}
+
+fn st_phase(u: *mut Updater, phase: u64) {
+    (*u).st.phase = phase
+    (*u).st.beat = (*u).st.beat + 1
+    (*u).st.seq = (*u).st.seq + 1
+    publish(u, true)
+}
+
+fn st_fail(u: *mut Updater, err: u64, detail: str) {
+    (*u).st.err = err
+    var t: str = err_text(err)
+    (*u).st.nerr = put_text((&(*u).st.errtext[0]) as u64, 192, t)
+    if detail.n > 0 {
+        // "<text> (<detail>)" when it fits
+        var b: rt.Buf = rt.buf_new()
+        util.buf_push_str(&b, t)
+        util.buf_push_str(&b, " (")
+        util.buf_push_str(&b, detail)
+        rt.buf_push(&b, 41 as u8)
+        (*u).st.nerr = put_text((&(*u).st.errtext[0]) as u64, 192, str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+        rt.buf_free(&b)
+    }
+    log.log_error("update", str { p: (&(*u).st.errtext[0]) as *mut u8, n: (*u).st.nerr as usize })
+    st_phase(u, PH_ERROR)
+}
+
+fn fetch_progress(ud: u64, done: u64, total: u64) {
+    let u: *mut Updater = ud as *mut Updater
+    // a worker PROCESS has no other thread to tell it about a cancel: the UI
+    // writes a file, and every progress call looks for it (twice a second)
+    if (*u).publish_file {
+        let now: u64 = now_ms()
+        if now - (*u).last_cancel_check_ms >= 500 as u64 {
+            (*u).last_cancel_check_ms = now
+            var cp: rt.Buf = rt.buf_new()
+            state_file(u, "update-cancel", &cp)
+            if fs.exists(util.buf_to_str_copy(&cp)) {
+                (*u).cancel = 1
+            }
+            rt.buf_free(&cp)
+        }
+    }
+    (*u).st.done = done
+    (*u).st.total = total
+    (*u).st.beat = (*u).st.beat + 1
+    (*u).st.seq = (*u).st.seq + 1
+    publish(u, false)
+}
+
+fn is_cancelled(u: *mut Updater) -> bool {
+    return (*u).cancel != 0 as u64
+}
+
+// ---------------------------------------------------------------- paths
+
+fn update_staged_path(u: *mut Updater, out: *mut rt.Buf) -> bool {
+    var exe: rt.Buf = rt.buf_new()
+    var ok: bool = true
+    if platform.plat_swap_kind() == platform.SWAP_FILES {
+        if !platform.plat_exe_path(&exe) {
+            ok = false
+        }
+    }
+    if ok {
+        ok = platform.plat_stage_path(util.buf_to_str_copy(&exe), out)
+    }
+    rt.buf_free(&exe)
+    return ok
+}
+
+fn state_file(u: *mut Updater, name: str, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    util.buf_push_str(out, state_dir_str(u))
+    rt.buf_push(out, 47 as u8)
+    util.buf_push_str(out, name)
+}
+
+// ---------------------------------------------------------------- init
+
+// Reads settings and state, opens the log. Call after appinfo_init and
+// platform.plat_init. Returns false when appinfo is not set.
+fn update_init(u: *mut Updater) -> bool {
+    (*u).ok = false
+    if !appinfo.appinfo_ready() {
+        return false
+    }
+    var cd: rt.Buf = rt.buf_new()
+    var sd: rt.Buf = rt.buf_new()
+    let have_c: bool = platform.plat_dir(platform.DIR_CONFIG, appinfo.app_id(), appinfo.app_vendor(), &cd)
+    let have_s: bool = platform.plat_dir(platform.DIR_STATE, appinfo.app_id(), appinfo.app_vendor(), &sd)
+    if !have_c || !have_s || rt.buf_len(&sd) > 480 {
+        rt.buf_free(&cd)
+        rt.buf_free(&sd)
+        return false
+    }
+    rt.mem_copy((&(*u).state_dir[0]) as u64, rt.buf_ptr(&sd), rt.buf_len(&sd))
+    (*u).nstate_dir = rt.buf_len(&sd)
+    let sdir: str = util.buf_to_str_copy(&sd)
+    let cdir: str = util.buf_to_str_copy(&cd)
+    rt.buf_free(&cd)
+    rt.buf_free(&sd)
+    let made: bool = fs.mkdir_all(sdir) catch false
+    config.config_path_set(&(*u).settings, cdir + "/settings.json")
+    config.config_load(&(*u).settings)
+    config.config_path_set(&(*u).state, sdir + "/appkit-state.json")
+    config.config_load(&(*u).state)
+    // the user's channel / store override
+    var b: rt.Buf = rt.buf_new()
+    if config.get_str(&(*u).settings, "update.channel", "", &b) && rt.buf_len(&b) > 0 {
+        appinfo.app_set_channel(util.buf_to_str_copy(&b))
+    }
+    if config.get_str(&(*u).settings, "update.store", "", &b) && rt.buf_len(&b) > 0 {
+        appinfo.app_set_store(util.buf_to_str_copy(&b))
+    }
+    rt.buf_free(&b)
+    let sp: str = sdir + "/update-status.txt"
+    if sp.n < 512 {
+        rt.mem_copy((&(*u).status_path[0]) as u64, sp.p as u64, sp.n)
+        (*u).nstatus_path = sp.n
+    }
+    (*u).ok = true
+    return true
+}
+
+fn update_channel(u: *mut Updater, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    util.buf_push_str(out, appinfo.app_channel())
+}
+
+// the user picked a channel: remember it and use it from now on
+fn update_set_channel(u: *mut Updater, c: str) -> bool {
+    if !appinfo.app_set_channel(c) {
+        return false
+    }
+    config.set_str(&(*u).settings, "update.channel", c)
+    return config.config_save(&(*u).settings)
+}
+
+fn update_save_settings(u: *mut Updater) -> bool {
+    return config.config_save(&(*u).settings)
+}
+
+// is an automatic check due? (settings: update.auto, update.interval_h)
+fn update_auto_due(u: *mut Updater) -> bool {
+    if !config.get_bool(&(*u).settings, "update.auto", true) {
+        return false
+    }
+    let every: i64 = config.get_int(&(*u).settings, "update.interval_h", DEFAULT_INTERVAL_H)
+    let last: i64 = config.get_int(&(*u).state, "check.last", 0)
+    let now: i64 = time.now_unix_ms() / 1000
+    return last == 0 || now - last >= every * 3600 || now < last
+}
+
+// ------------------------------------------------------- hashing a file
+
+// SHA-256 (64 hex digits into `hex`) and size of a file, streamed.
+fn hash_file(path: str, hex: u64, size_out: *mut u64) -> bool {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    let fd: i64 = syscall(2, rt.buf_ptr(&c) as i64, 524288, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return false
+    }
+    var chunk: rt.Buf = rt.buf_new()
+    if !util.buf_room(&chunk, 262144) {
+        syscall(3, fd, 0, 0, 0, 0, 0)
+        rt.buf_free(&chunk)
+        return false
+    }
+    var s: sha256.Sha256 = sha256.sha256_new()
+    var total: u64 = 0
+    var ok: bool = true
+    while true {
+        let n: i64 = syscall(0, fd, rt.buf_ptr(&chunk) as i64, 262144, 0, 0, 0)
+        if n < 0 {
+            if n == -4 {
+                continue
+            }
+            ok = false
+            break
+        }
+        if n == 0 {
+            break
+        }
+        sha256.sha256_update(&s, rt.buf_ptr(&chunk), n as usize)
+        total = total + n as u64
+    }
+    syscall(3, fd, 0, 0, 0, 0, 0)
+    rt.buf_free(&chunk)
+    if !ok {
+        return false
+    }
+    var d: [u8; 32] = [0; 32]
+    sha256.sha256_final(&s, (&d[0]) as u64)
+    var h: rt.Buf = rt.buf_new()
+    util.hex_encode((&d[0]) as u64, 32, &h)
+    rt.mem_copy(hex, rt.buf_ptr(&h), 64)
+    rt.buf_free(&h)
+    *size_out = total
+    return true
+}
+
+// the hash of the running program (once per process)
+fn own_hash(u: *mut Updater) -> bool {
+    if (*u).have_own_sha {
+        return true
+    }
+    if platform.plat_swap_kind() != platform.SWAP_FILES {
+        return false
+    }
+    var exe: rt.Buf = rt.buf_new()
+    if !platform.plat_exe_path(&exe) {
+        rt.buf_free(&exe)
+        return false
+    }
+    var sz: u64 = 0
+    let ok: bool = hash_file(util.buf_to_str_copy(&exe), (&(*u).own_sha[0]) as u64, &sz)
+    rt.buf_free(&exe)
+    (*u).have_own_sha = ok
+    return ok
+}
+
+// --------------------------------------------------------------- the check
+
+// the package key of this program in the catalog
+fn package_key(out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    let art: str = platform.plat_art()
+    if art == "apk" {
+        util.buf_push_str(out, appinfo.app_android_id())
+        return
+    }
+    util.buf_push_str(out, art)
+    rt.buf_push(out, 58 as u8)
+    util.buf_push_str(out, appinfo.app_id())
+}
+
+// fetch `path` (relative to the store) into memory
+fn get_mem(u: *mut Updater, rel: str, max: u64, out: *mut rt.Buf, http: *mut u32) -> u32 {
+    var f: fetch.Fetch = fetch.fetch_new()
+    var url: rt.Buf = rt.buf_new()
+    util.buf_push_str(&url, appinfo.app_store_url())
+    util.buf_push_str(&url, rel)
+    fetch.fetch_set_url(&f, util.buf_to_str_copy(&url))
+    rt.buf_free(&url)
+    f.max_body = max
+    f.timeout_ms = 15000
+    f.deadline_ms = 120000
+    f.verify_tls = (*u).verify_tls
+    f.cancel = (&(*u).cancel) as u64
+    fetch.fetch_set_resolver(&f, (*u).resolver)
+    f.progress = fetch_progress
+    f.progress_ud = u as u64
+    let r: u32 = fetch.fetch_run(&f)
+    *http = f.status
+    rt.buf_clear(out)
+    if r == fetch.FE_OK {
+        rt.buf_push_bytes(out, rt.buf_ptr(&f.body), rt.buf_len(&f.body))
+    }
+    fetch.fetch_free(&f)
+    return r
+}
+
+fn net_fail(u: *mut Updater, r: u32, http: u32) {
+    if r == fetch.FE_CANCELLED {
+        st_fail(u, UE_CANCELLED, "")
+        return
+    }
+    var d: rt.Buf = rt.buf_new()
+    util.buf_push_str(&d, fetch.fetch_err_text(r))
+    if http != 0 as u32 {
+        util.buf_push_str(&d, ", HTTP ")
+        rt.buf_push_dec_u64(&d, http as u64)
+    }
+    (*u).st.http = http as u64
+    st_fail(u, UE_NETWORK, util.buf_to_str_copy(&d))
+    rt.buf_free(&d)
+}
+
+fn ec_text(ec: u32) -> str {
+    if ec == catalog.EC_FORMAT { return "unknown format" }
+    if ec == catalog.EC_ROLLBACK { return "older than one seen before" }
+    if ec == catalog.EC_EXPIRED { return "expired" }
+    if ec == catalog.EC_REVISION { return "revision went backwards" }
+    if ec == catalog.EC_HASH { return "catalog hash differs" }
+    if ec == catalog.EC_SIZE { return "catalog size differs" }
+    if ec == catalog.EC_MISMATCH { return "entry and catalog disagree" }
+    if ec == catalog.EC_PARSE { return "cannot read it" }
+    return "not valid"
+}
+
+// Runs the whole check and leaves the answer in the status. The chosen
+// build is copied into (*u).build. Returns the final phase.
+fn update_check_blocking(u: *mut Updater) -> u64 {
+    (*u).cancel = 0
+    (*u).st.err = UE_NONE
+    (*u).st.nerr = 0
+    (*u).st.done = 0
+    (*u).st.total = 0
+    (*u).st.rollback = 0
+    (*u).st.http = 0
+    st_phase(u, PH_CHECKING)
+    if !(*u).ok || !appinfo.appinfo_ready() {
+        st_fail(u, UE_CONFIG, "")
+        return PH_ERROR
+    }
+    log.log_info("update", "checking " + (appinfo.app_store_url()) + " channel " + appinfo.app_channel())
+    var entry_raw: rt.Buf = rt.buf_new()
+    var sig: rt.Buf = rt.buf_new()
+    var cat_raw: rt.Buf = rt.buf_new()
+    var http: u32 = 0
+    let now: i64 = time.now_unix_ms() / 1000
+    var last_rev: i64 = config.get_int(&(*u).state, "seen.revision", -1)
+    if last_rev < appinfo.app_min_revision() {
+        last_rev = appinfo.app_min_revision()
+    }
+    var last_ts: rt.Buf = rt.buf_new()
+    config.get_str(&(*u).state, "seen.timestamp", "", &last_ts)
+    let entry_seen: bool = config.get_bool(&(*u).state, "entry.seen", false)
+    var revision: i64 = -1
+    var ts_text: rt.Buf = rt.buf_new()
+    var phase: u64 = PH_ERROR
+
+    // ---- 1. the signed entry (TUF-light), or the old direct way
+    var r: u32 = get_mem(u, "entry.json", ENTRY_MAX, &entry_raw, &http)
+    var legacy: bool = false
+    if r == fetch.FE_STATUS && http == 404 as u32 {
+        if entry_seen {
+            net_fail(u, r, http)
+            phase = PH_ERROR
+            rt.buf_free(&entry_raw)
+            rt.buf_free(&sig)
+            rt.buf_free(&cat_raw)
+            rt.buf_free(&last_ts)
+            rt.buf_free(&ts_text)
+            return PH_ERROR
+        }
+        legacy = true
+    } else if r != fetch.FE_OK {
+        net_fail(u, r, http)
+        rt.buf_free(&entry_raw)
+        rt.buf_free(&sig)
+        rt.buf_free(&cat_raw)
+        rt.buf_free(&last_ts)
+        rt.buf_free(&ts_text)
+        return PH_ERROR
+    }
+    var ent: catalog.Entry = catalog.entry_new()
+    var good: bool = true
+    if !legacy {
+        r = get_mem(u, "entry.json.sig", 128, &sig, &http)
+        if r != fetch.FE_OK {
+            net_fail(u, r, http)
+            good = false
+        }
+        if good && !catalog.verify_signature(appinfo.app_key_ptr(), rt.buf_ptr(&entry_raw),
+            rt.buf_len(&entry_raw), rt.buf_ptr(&sig), rt.buf_len(&sig)) {
+            st_fail(u, UE_SIGNATURE, "entry.json")
+            good = false
+        }
+        if good && !catalog.entry_parse(rt.buf_ptr(&entry_raw), rt.buf_len(&entry_raw), &ent) {
+            st_fail(u, UE_ENTRY, "cannot read entry.json")
+            good = false
+        }
+        if good {
+            let ec: u32 = catalog.entry_check(&ent, now, last_rev, str { p: rt.buf_data(&last_ts), n: rt.buf_len(&last_ts) })
+            if ec != catalog.EC_OK {
+                st_fail(u, UE_ENTRY, ec_text(ec))
+                good = false
+            }
+        }
+        if good {
+            let rel: str = str { p: (&ent.cat_url[0]) as *mut u8, n: ent.ncat_url }
+            if !catalog.build_url_ok(rel.p as u64, rel.n) {
+                st_fail(u, UE_ENTRY, "unsafe catalog address")
+                good = false
+            } else {
+                r = get_mem(u, rel, CATALOG_MAX, &cat_raw, &http)
+                if r != fetch.FE_OK {
+                    net_fail(u, r, http)
+                    good = false
+                }
+            }
+        }
+        if good {
+            let ec2: u32 = catalog.catalog_check(&ent, rt.buf_ptr(&cat_raw), rt.buf_len(&cat_raw))
+            if ec2 != catalog.EC_OK {
+                st_fail(u, UE_CATALOG, ec_text(ec2))
+                good = false
+            }
+        }
+        revision = ent.revision
+        rt.buf_push_bytes(&ts_text, (&ent.ts[0]) as u64, ent.nts)
+    } else {
+        // the old way: index.json + index.json.sig, no freshness protection
+        r = get_mem(u, "index.json", CATALOG_MAX, &cat_raw, &http)
+        if r != fetch.FE_OK {
+            net_fail(u, r, http)
+            good = false
+        }
+        if good {
+            r = get_mem(u, "index.json.sig", 128, &sig, &http)
+            if r != fetch.FE_OK {
+                net_fail(u, r, http)
+                good = false
+            }
+        }
+        if good && !catalog.verify_signature(appinfo.app_key_ptr(), rt.buf_ptr(&cat_raw),
+            rt.buf_len(&cat_raw), rt.buf_ptr(&sig), rt.buf_len(&sig)) {
+            st_fail(u, UE_SIGNATURE, "index.json")
+            good = false
+        }
+    }
+    rt.buf_free(&entry_raw)
+    rt.buf_free(&sig)
+    if !good {
+        rt.buf_free(&cat_raw)
+        rt.buf_free(&last_ts)
+        rt.buf_free(&ts_text)
+        return PH_ERROR
+    }
+
+    // ---- 2. the catalog
+    var d: json.Json = json.json_new()
+    let parsed: bool = json.json_parse(&d, rt.buf_ptr(&cat_raw), rt.buf_len(&cat_raw)) catch false
+    rt.buf_free(&cat_raw)
+    if !parsed {
+        json.json_free(&d)
+        st_fail(u, UE_CATALOG, "not JSON")
+        rt.buf_free(&last_ts)
+        rt.buf_free(&ts_text)
+        return PH_ERROR
+    }
+    let root: u32 = json.json_root(&d)
+    if root == json.JSON_NONE ||
+        catalog.catalog_format(&d) != 1 {
+        json.json_free(&d)
+        st_fail(u, UE_CATALOG, "unknown catalog format")
+        rt.buf_free(&last_ts)
+        rt.buf_free(&ts_text)
+        return PH_ERROR
+    }
+    let cat_rev: i64 = catalog.catalog_revision(&d)
+    if !legacy && cat_rev != revision {
+        json.json_free(&d)
+        st_fail(u, UE_CATALOG, ec_text(catalog.EC_MISMATCH))
+        rt.buf_free(&last_ts)
+        rt.buf_free(&ts_text)
+        return PH_ERROR
+    }
+    if legacy {
+        revision = cat_rev
+        if last_rev >= 0 && revision < last_rev {
+            json.json_free(&d)
+            st_fail(u, UE_ENTRY, ec_text(catalog.EC_REVISION))
+            rt.buf_free(&last_ts)
+            rt.buf_free(&ts_text)
+            return PH_ERROR
+        }
+    }
+    // everything held: remember what was seen
+    config.set_int(&(*u).state, "seen.revision", revision)
+    if rt.buf_len(&ts_text) > 0 {
+        config.set_str(&(*u).state, "seen.timestamp", util.buf_to_str_copy(&ts_text))
+    }
+    if !legacy {
+        config.set_bool(&(*u).state, "entry.seen", true)
+    }
+    config.set_int(&(*u).state, "check.last", now)
+    config.config_save(&(*u).state)
+    rt.buf_free(&last_ts)
+    rt.buf_free(&ts_text)
+
+    // ---- 3. my package, my channel, my platform
+    var pk: rt.Buf = rt.buf_new()
+    package_key(&pk)
+    let pkgkey: str = util.buf_to_str_copy(&pk)
+    rt.buf_free(&pk)
+    var b: catalog.Build = catalog.build_new()
+    let sel: u32 = catalog.catalog_select(&d, pkgkey, appinfo.app_channel(), platform.plat_id(), platform.plat_art(), &b)
+    if sel != catalog.SEL_OK {
+        json.json_free(&d)
+        if sel == catalog.SEL_PLATFORM || sel == catalog.SEL_ART {
+            st_fail(u, UE_PLATFORM, pkgkey)
+        } else if sel == catalog.SEL_INCOMPLETE {
+            st_fail(u, UE_CATALOG, "the build entry is incomplete")
+        } else {
+            st_fail(u, UE_NOT_FOUND, pkgkey + ", channel " + appinfo.app_channel())
+        }
+        return PH_ERROR
+    }
+    // ---- 4. who am I, and is the offer newer?
+    // `build` 0 is "not known" (store build ids start at 1); decide() wants -1.
+    // An Android program cannot hash its own file (the system owns the APK):
+    // it is decided by the version alone.
+    var inst_build: i64 = appinfo.app_build()
+    if inst_build <= 0 {
+        inst_build = 0 - 1
+    }
+    var same_file: bool = false
+    if own_hash(u) {
+        if rt.mem_eq((&(*u).own_sha[0]) as u64, (&b.sha256[0]) as u64, 64) {
+            same_file = true
+        }
+        let known: i64 = catalog.catalog_build_by_sha(&d, pkgkey, (&(*u).own_sha[0]) as u64)
+        if known >= 0 {
+            inst_build = known
+        }
+    }
+    json.json_free(&d)
+    let decision: u32 = catalog.decide(appinfo.app_version(), inst_build, same_file, &b)
+    (*u).build = b
+    (*u).st.size = (*u).build.size
+    rt.mem_copy((&(*u).st.sha[0]) as u64, (&(*u).build.sha256[0]) as u64, 64)
+    (*u).st.nsha = 64
+    (*u).st.nver = put_text((&(*u).st.ver[0]) as u64, 64, str { p: (&(*u).build.version[0]) as *mut u8, n: (*u).build.nversion })
+    (*u).st.nnotes = put_text((&(*u).st.notes[0]) as u64, 1536, str { p: (&(*u).build.notes[0]) as *mut u8, n: (*u).build.nnotes })
+    if decision == catalog.D_BROKEN {
+        st_fail(u, UE_VERSION, "")
+        return PH_ERROR
+    }
+    if decision == catalog.D_BELOW_FLOOR {
+        st_fail(u, UE_FLOOR, "")
+        return PH_ERROR
+    }
+    if decision == catalog.D_UPTODATE {
+        log.log_info("update", "up to date")
+        st_phase(u, PH_UPTODATE)
+        return PH_UPTODATE
+    }
+    // a build that failed here before is not offered again by itself
+    if is_bad_build(u, (&b.sha256[0]) as u64) {
+        log.log_warn("update", "the offered build failed on this machine before; skipped")
+        st_phase(u, PH_UPTODATE)
+        return PH_UPTODATE
+    }
+    if decision == catalog.D_ROLLBACK {
+        if !config.get_bool(&(*u).settings, "update.follow_rollback", false) {
+            log.log_info("update", "the publisher moved the channel back; not followed")
+            st_phase(u, PH_UPTODATE)
+            return PH_UPTODATE
+        }
+        (*u).st.rollback = 1
+    }
+    log.log_info("update", "available: " + status_version(&(*u).st))
+    st_phase(u, PH_AVAILABLE)
+    return PH_AVAILABLE
+}
+
+// ------------------------------------------------------------ bad builds
+
+fn is_bad_build(u: *mut Updater, sha: u64) -> bool {
+    var i: usize = 0
+    while i < 4 {
+        var key: rt.Buf = rt.buf_new()
+        util.buf_push_str(&key, "bad.")
+        rt.buf_push_dec_u64(&key, i as u64)
+        var v: rt.Buf = rt.buf_new()
+        let have: bool = config.get_str(&(*u).state, util.buf_to_str_copy(&key), "", &v)
+        let same: bool = have && rt.buf_len(&v) == 64 && rt.mem_eq(rt.buf_ptr(&v), sha, 64)
+        rt.buf_free(&key)
+        rt.buf_free(&v)
+        if same {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn remember_bad_build(u: *mut Updater, sha: str) {
+    // shift 0..2 up, newest at 0
+    var i: usize = 3
+    while i > 0 {
+        var from: rt.Buf = rt.buf_new()
+        util.buf_push_str(&from, "bad.")
+        rt.buf_push_dec_u64(&from, (i - 1) as u64)
+        var to: rt.Buf = rt.buf_new()
+        util.buf_push_str(&to, "bad.")
+        rt.buf_push_dec_u64(&to, i as u64)
+        var v: rt.Buf = rt.buf_new()
+        if config.get_str(&(*u).state, util.buf_to_str_copy(&from), "", &v) {
+            config.set_str(&(*u).state, util.buf_to_str_copy(&to), util.buf_to_str_copy(&v))
+        }
+        rt.buf_free(&from)
+        rt.buf_free(&to)
+        rt.buf_free(&v)
+        i = i - 1
+    }
+    config.set_str(&(*u).state, "bad.0", sha)
+}
+
+// ------------------------------------------------------------ the download
+
+fn magic_ok(path: str, art: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    let fd: i64 = syscall(2, rt.buf_ptr(&c) as i64, 524288, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        rt.buf_free(&b)
+        return false
+    }
+    var head: [u8; 4] = [0; 4]
+    let n: i64 = syscall(0, fd, (&head[0]) as i64, 4, 0, 0, 0)
+    syscall(3, fd, 0, 0, 0, 0, 0)
+    rt.buf_free(&b)
+    if n < 4 {
+        return false
+    }
+    if art == "exe" {
+        return head[0] == 77 as u8 && head[1] == 90 as u8 // "MZ"
+    }
+    if art == "bin" || art == "appimage" {
+        return head[0] == 127 as u8 && head[1] == 69 as u8 && head[2] == 76 as u8 && head[3] == 70 as u8 // 7f "ELF"
+    }
+    if art == "apk" || art == "macos-app" {
+        return head[0] == 80 as u8 && head[1] == 75 as u8 // "PK"
+    }
+    return true
+}
+
+// Downloads the chosen build (status must be AVAILABLE) next to the
+// executable and verifies it. Returns the final phase.
+fn update_fetch_blocking(u: *mut Updater) -> u64 {
+    if (*u).st.phase != PH_AVAILABLE || !(*u).build.found {
+        st_fail(u, UE_STATE, "no update to download")
+        return PH_ERROR
+    }
+    if !platform.plat_can_self_update() {
+        st_fail(u, UE_UNSUPPORTED, "")
+        return PH_ERROR
+    }
+    (*u).cancel = 0
+    var staged: rt.Buf = rt.buf_new()
+    if !update_staged_path(u, &staged) {
+        rt.buf_free(&staged)
+        st_fail(u, UE_APPLY, "cannot find the program file")
+        return PH_ERROR
+    }
+    let sp: str = util.buf_to_str_copy(&staged)
+    rt.buf_free(&staged)
+    if platform.plat_swap_kind() == platform.SWAP_FILES {
+        var exe: rt.Buf = rt.buf_new()
+        platform.plat_exe_path(&exe)
+        if !platform.plat_can_write_beside(util.buf_to_str_copy(&exe)) {
+            rt.buf_free(&exe)
+            st_fail(u, UE_WRITABLE, platform.plat_install_hint())
+            return PH_ERROR
+        }
+        rt.buf_free(&exe)
+    }
+    let b: *mut catalog.Build = &(*u).build
+    (*u).st.done = 0
+    (*u).st.total = (*b).size
+    st_phase(u, PH_DOWNLOADING)
+    // the sink: a file next to the program
+    var cp: rt.Buf = rt.buf_new()
+    util.buf_push_str(&cp, sp)
+    rt.buf_push(&cp, 0 as u8)
+    let fd: i64 = syscall(2, rt.buf_ptr(&cp) as i64, 577 | 524288, 493, 0, 0, 0)
+    rt.buf_free(&cp)
+    if fd < 0 {
+        st_fail(u, UE_DISK, sp)
+        return PH_ERROR
+    }
+    var f: fetch.Fetch = fetch.fetch_new()
+    var url: rt.Buf = rt.buf_new()
+    util.buf_push_str(&url, appinfo.app_store_url())
+    rt.buf_push_bytes(&url, (&(*b).file[0]) as u64, (*b).nfile)
+    fetch.fetch_set_url(&f, util.buf_to_str_copy(&url))
+    rt.buf_free(&url)
+    f.max_body = (*b).size
+    f.timeout_ms = 20000
+    f.deadline_ms = 3600000
+    f.verify_tls = (*u).verify_tls
+    f.sink_fd = fd
+    f.want_hash = true
+    f.cancel = (&(*u).cancel) as u64
+    f.progress = fetch_progress
+    f.progress_ud = u as u64
+    fetch.fetch_set_resolver(&f, (*u).resolver)
+    let r: u32 = fetch.fetch_run(&f)
+    syscall(74, fd, 0, 0, 0, 0, 0)
+    syscall(3, fd, 0, 0, 0, 0, 0)
+    if r != fetch.FE_OK {
+        fs.remove(sp) catch false
+        let st: u32 = f.status
+        fetch.fetch_free(&f)
+        net_fail(u, r, st)
+        return PH_ERROR
+    }
+    st_phase(u, PH_VERIFYING)
+    // size, then hash, then magic: each refusal deletes the file
+    if f.got != (*b).size {
+        fs.remove(sp) catch false
+        fetch.fetch_free(&f)
+        st_fail(u, UE_SIZE, "")
+        return PH_ERROR
+    }
+    var hex: rt.Buf = rt.buf_new()
+    util.hex_encode((&f.digest[0]) as u64, 32, &hex)
+    let same: bool = rt.buf_len(&hex) == 64 && rt.mem_eq(rt.buf_ptr(&hex), (&(*b).sha256[0]) as u64, 64)
+    rt.buf_free(&hex)
+    fetch.fetch_free(&f)
+    if !same {
+        fs.remove(sp) catch false
+        log.log_error("update", "download hash mismatch; file deleted")
+        st_fail(u, UE_HASH, "")
+        return PH_ERROR
+    }
+    if !magic_ok(sp, str { p: (&(*b).art[0]) as *mut u8, n: (*b).nart }) {
+        fs.remove(sp) catch false
+        st_fail(u, UE_MAGIC, "")
+        return PH_ERROR
+    }
+    log.log_info("update", "downloaded and verified")
+    st_phase(u, PH_READY)
+    return PH_READY
+}
+
+fn update_forget_staged(u: *mut Updater) {
+    var staged: rt.Buf = rt.buf_new()
+    if update_staged_path(u, &staged) {
+        fs.remove(util.buf_to_str_copy(&staged)) catch false
+    }
+    rt.buf_free(&staged)
+}
+
+// --------------------------------------------------------------- the worker
+
+// what a worker does, blocking, to the end
+fn worker_run(u: *mut Updater, op: u32) {
+    (*u).st.pid = platform.plat_self_pid() as u64
+    (*u).st.running = 1
+    let ph: u64 = update_check_blocking(u)
+    if op == OP_FETCH && ph == PH_AVAILABLE {
+        update_fetch_blocking(u)
+    }
+    (*u).st.running = 0
+    (*u).st.seq = (*u).st.seq + 1
+    publish(u, true)
+}
+
+// the thread entry (the program's __thread_work forwards here)
+fn thread_dispatch(kind: u64, arg: u64) -> u64 {
+    if kind != UPDATE_THREAD_KIND {
+        return 0
+    }
+    let u: *mut Updater = arg as *mut Updater
+    worker_run(u, (*u).worker_op)
+    (*u).thread_h = 0
+    return 1
+}
+
+fn update_busy(u: *mut Updater) -> bool {
+    if (*u).st.running != 0 as u64 {
+        return true
+    }
+    let p: u64 = (*u).st.phase
+    return p == PH_CHECKING || p == PH_DOWNLOADING || p == PH_VERIFYING || p == PH_APPLYING
+}
+
+// What this platform can do: a thread of our own (Linux), else the program
+// started again as a worker process (Windows), else -- Android, where a
+// program can do neither -- the work runs right here (RUN_BLOCKING; the
+// progress callback is called from there, so a program can keep its window
+// alive).
+fn pick_mode(mode: u32) -> u32 {
+    var m: u32 = mode
+    if m == RUN_AUTO {
+        if platform.plat_threads() {
+            m = RUN_THREAD
+        } else if platform.plat_worker_process() {
+            m = RUN_PROCESS
+        } else {
+            m = RUN_BLOCKING
+        }
+    }
+    // asked for what is not there: the next best
+    if m == RUN_THREAD && !platform.plat_threads() {
+        m = RUN_PROCESS
+    }
+    if m == RUN_PROCESS && !platform.plat_worker_process() {
+        m = RUN_BLOCKING
+    }
+    return m
+}
+
+// Starts a check (OP_CHECK) or a check-and-download (OP_FETCH) in the
+// background. Returns false if one is already running or none could be
+// started. RUN_BLOCKING runs it here and returns when it is done.
+fn update_start(u: *mut Updater, op: u32, mode: u32) -> bool {
+    if !(*u).ok || update_busy(u) {
+        return false
+    }
+    let m: u32 = pick_mode(mode)
+    (*u).worker_op = op
+    (*u).cancel = 0
+    (*u).st.err = UE_NONE
+    (*u).st.nerr = 0
+    (*u).st.nsha = 0
+    (*u).st.nver = 0
+    if m == RUN_BLOCKING {
+        (*u).publish_file = false
+        worker_run(u, op)
+        return true
+    }
+    if m == RUN_THREAD {
+        (*u).publish_file = false
+        (*u).st.phase = PH_CHECKING
+        (*u).st.running = 1
+        (*u).st.seq = (*u).st.seq + 1
+        let h: u64 = thread_start(UPDATE_THREAD_KIND, u as u64)
+        if h == 0 as u64 {
+            (*u).st.phase = PH_IDLE
+            (*u).st.running = 0
+            return false
+        }
+        (*u).thread_h = h
+        (*u).mode = m
+        return true
+    }
+    // a worker process: this program again, `--appkit-worker check|fetch`
+    var exe: rt.Buf = rt.buf_new()
+    if !platform.plat_exe_path(&exe) {
+        rt.buf_free(&exe)
+        return false
+    }
+    var args: util.Args = util.args_new()
+    util.args_push(&args, "--appkit-worker")
+    if op == OP_FETCH {
+        util.args_push(&args, "fetch")
+    } else {
+        util.args_push(&args, "check")
+    }
+    // remove a stale status file so the UI never reads an old answer
+    fs.remove(status_path_str(u)) catch false
+    (*u).publish_file = false
+    let tok: i64 = platform.plat_spawn_detached(util.buf_to_str_copy(&exe), &args)
+    util.args_free(&args)
+    rt.buf_free(&exe)
+    if tok < 0 {
+        return false
+    }
+    (*u).mode = RUN_PROCESS
+    (*u).st.phase = PH_CHECKING
+    (*u).st.running = 1
+    (*u).st.seq = (*u).st.seq + 1
+    (*u).last_beat_seen = 0
+    (*u).last_beat_ms = now_ms()
+    (*u).started_ms = now_ms()
+    return true
+}
+
+fn update_cancel(u: *mut Updater) {
+    (*u).cancel = 1
+    // a worker process is told by a cancel file it polls between reads
+    if (*u).mode == RUN_PROCESS && (*u).nstate_dir > 0 {
+        var p: rt.Buf = rt.buf_new()
+        state_file(u, "update-cancel", &p)
+        fs.write_file(util.buf_to_str_copy(&p), "1".p as u64, 1) catch 0
+        rt.buf_free(&p)
+    }
+}
+
+fn unesc_into(dst: u64, cap: usize, p: u64, n: usize) -> u64 {
+    var i: usize = 0
+    var k: usize = 0
+    while i < n && k < cap {
+        let c: u8 = rt.ld8(p, i)
+        if c == 92 as u8 && i + 1 < n {
+            let d: u8 = rt.ld8(p, i + 1)
+            if d == 110 as u8 {
+                rt.st8(dst, k, 10 as u8)
+            } else {
+                rt.st8(dst, k, d)
+            }
+            i = i + 2
+        } else {
+            rt.st8(dst, k, c)
+            i = i + 1
+        }
+        k = k + 1
+    }
+    return k as u64
+}
+
+fn num_at(p: u64, n: usize) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            break
+        }
+        v = v * 10 as u64 + (c - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
+
+// Reads the worker's status file into the Status (process mode).
+fn read_status_file(u: *mut Updater) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(status_path_str(u), &b) catch 4294967295
+    if n == 4294967295 || n == 0 {
+        rt.buf_free(&b)
+        return false
+    }
+    let base: u64 = rt.buf_ptr(&b)
+    var i: usize = 0
+    var phase: u64 = 99
+    while i < n {
+        var e: usize = i
+        while e < n && rt.ld8(base, e) != 10 as u8 {
+            e = e + 1
+        }
+        var eq: usize = i
+        while eq < e && rt.ld8(base, eq) != 61 as u8 {
+            eq = eq + 1
+        }
+        if eq < e {
+            let key: str = str { p: (base + i as u64) as *mut u8, n: eq - i }
+            let vp: u64 = base + (eq + 1) as u64
+            let vn: usize = e - eq - 1
+            let s: *mut Status = &(*u).st
+            if key == "phase" { phase = num_at(vp, vn) }
+            else if key == "err" { (*s).err = num_at(vp, vn) }
+            else if key == "beat" { (*s).beat = num_at(vp, vn) }
+            else if key == "done" { (*s).done = num_at(vp, vn) }
+            else if key == "total" { (*s).total = num_at(vp, vn) }
+            else if key == "http" { (*s).http = num_at(vp, vn) }
+            else if key == "pid" { (*s).pid = num_at(vp, vn) }
+            else if key == "size" { (*s).size = num_at(vp, vn) }
+            else if key == "rollback" { (*s).rollback = num_at(vp, vn) }
+            else if key == "running" { (*s).running = num_at(vp, vn) }
+            else if key == "ver" { (*s).nver = unesc_into((&(*s).ver[0]) as u64, 64, vp, vn) }
+            else if key == "notes" { (*s).nnotes = unesc_into((&(*s).notes[0]) as u64, 1536, vp, vn) }
+            else if key == "errtext" { (*s).nerr = unesc_into((&(*s).errtext[0]) as u64, 192, vp, vn) }
+            else if key == "sha" { (*s).nsha = unesc_into((&(*s).sha[0]) as u64, 64, vp, vn) }
+        }
+        i = e + 1
+    }
+    rt.buf_free(&b)
+    if phase == 99 {
+        return false
+    }
+    (*u).st.phase = phase
+    return true
+}
+
+// Call once per UI frame (cheap). Returns true when the status changed
+// since the last call. In process mode it reads the worker's status file
+// (at most every 100 ms) and notices a worker that died.
+fn update_poll(u: *mut Updater) -> bool {
+    if (*u).mode == RUN_PROCESS && update_busy(u) {
+        let now: u64 = now_ms()
+        if now - (*u).last_poll_ms >= 100 as u64 {
+            (*u).last_poll_ms = now
+            let before: u64 = (*u).st.beat
+            if read_status_file(u) {
+                (*u).st.seq = (*u).st.seq + 1
+                if (*u).st.beat != (*u).last_beat_seen {
+                    (*u).last_beat_seen = (*u).st.beat
+                    (*u).last_beat_ms = now
+                }
+            }
+            // no sign of life for BEAT_DEAD_MS while busy: the worker died
+            if update_busy(u) && now - (*u).last_beat_ms > BEAT_DEAD_MS {
+                (*u).st.running = 0
+                st_fail(u, UE_WORKER, "")
+            }
+        }
+    }
+    if (*u).seen_seq != (*u).st.seq {
+        (*u).seen_seq = (*u).st.seq
+        return true
+    }
+    return false
+}
+
+// --------------------------------------------------------- apply / restart
+
+fn exe_and_backup(exe: *mut rt.Buf, backup: *mut rt.Buf) -> bool {
+    if !platform.plat_exe_path(exe) {
+        return false
+    }
+    rt.buf_clear(backup)
+    rt.buf_push_bytes(backup, rt.buf_ptr(exe), rt.buf_len(exe))
+    util.buf_push_str(backup, ".old")
+    return true
+}
+
+// Puts the downloaded program in place and starts it. The caller then
+// closes its window and calls update_supervise (which returns when the new
+// program has confirmed -- or after the old one is back).
+// Returns platform.AP_OK, AP_STAGED (the system installs it) or an error.
+fn update_apply(u: *mut Updater, restart_args: *mut util.Args) -> u32 {
+    if (*u).st.phase != PH_READY || (*u).st.nsha != 64 as u64 {
+        st_fail(u, UE_STATE, "nothing is ready")
+        return platform.AP_NO_NEW
+    }
+    var staged: rt.Buf = rt.buf_new()
+    if !update_staged_path(u, &staged) {
+        rt.buf_free(&staged)
+        st_fail(u, UE_APPLY, "no program file")
+        return platform.AP_NO_NEW
+    }
+    let sp: str = util.buf_to_str_copy(&staged)
+    rt.buf_free(&staged)
+    // the file may have been touched since the download: hash it again (a
+    // virus scanner can hold a fresh file for a moment: a file that exists
+    // but cannot be opened yet is tried again for a few seconds)
+    var hex: [u8; 64] = [0; 64]
+    var sz: u64 = 0
+    var hashed: bool = hash_file(sp, (&hex[0]) as u64, &sz)
+    var tries: u32 = 0
+    while !hashed && tries < 15 && fs.is_file(sp) {
+        time.sleep_ms(200)
+        hashed = hash_file(sp, (&hex[0]) as u64, &sz)
+        tries = tries + 1
+    }
+    if !hashed ||
+        !rt.mem_eq((&hex[0]) as u64, (&(*u).st.sha[0]) as u64, 64) {
+        fs.remove(sp) catch false
+        st_fail(u, UE_HASH, "")
+        return platform.AP_NO_NEW
+    }
+    st_phase(u, PH_APPLYING)
+    if platform.plat_swap_kind() == platform.SWAP_INSTALLER {
+        let rc: u32 = platform.plat_apply(sp, "", "")
+        if rc == platform.AP_OK || rc == platform.AP_STAGED {
+            st_phase(u, PH_DONE_INSTALLER)
+            return rc
+        }
+        st_fail(u, UE_APPLY, "the system installer refused")
+        return rc
+    }
+    var exe: rt.Buf = rt.buf_new()
+    var backup: rt.Buf = rt.buf_new()
+    if !exe_and_backup(&exe, &backup) {
+        st_fail(u, UE_APPLY, "no program file")
+        rt.buf_free(&exe)
+        rt.buf_free(&backup)
+        return platform.AP_NO_NEW
+    }
+    let exe_s: str = util.buf_to_str_copy(&exe)
+    let bak_s: str = util.buf_to_str_copy(&backup)
+    rt.buf_free(&exe)
+    rt.buf_free(&backup)
+    // remember what is about to happen BEFORE it happens
+    config.set_str(&(*u).state, "pending.state", "applied")
+    config.set_str(&(*u).state, "pending.from", appinfo.app_version())
+    config.set_str(&(*u).state, "pending.to", status_version(&(*u).st))
+    config.set_str(&(*u).state, "pending.sha", str { p: (&(*u).st.sha[0]) as *mut u8, n: 64 })
+    config.set_int(&(*u).state, "pending.started", time.now_unix_ms() / 1000)
+    config.set_int(&(*u).state, "pending.tries", 0)
+    config.config_save(&(*u).state)
+    var hp: rt.Buf = rt.buf_new()
+    state_file(u, "healthy", &hp)
+    fs.remove(util.buf_to_str_copy(&hp)) catch false
+    rt.buf_free(&hp)
+    let rc: u32 = platform.plat_apply(sp, exe_s, bak_s)
+    if rc != platform.AP_OK {
+        config.remove_key(&(*u).state, "pending.state")
+        config.config_save(&(*u).state)
+        if rc == platform.AP_PERM {
+            st_fail(u, UE_WRITABLE, platform.plat_install_hint())
+        } else {
+            st_fail(u, UE_APPLY, "")
+        }
+        return rc
+    }
+    log.log_info("update", "replaced the program; starting the new version")
+    var empty: util.Args = util.args_new()
+    var use: *mut util.Args = restart_args
+    if restart_args as u64 == 0 as u64 {
+        use = &empty
+    }
+    // the new program is told it is the restarted one
+    var a: util.Args = util.args_new()
+    util.args_push(&a, "--appkit-restarted")
+    var k: usize = 0
+    var at: u64 = rt.buf_ptr(&(*use).buf)
+    while k < util.args_count(use) {
+        util.args_push(&a, str { p: at as *mut u8, n: rt.c_length(at) })
+        at = at + rt.c_length(at) as u64 + 1 as u64
+        k = k + 1
+    }
+    let started_tok: i64 = platform.plat_spawn_detached(exe_s, &a)
+    util.args_free(&a)
+    util.args_free(&empty)
+    (*u).new_token = started_tok
+    if started_tok < 0 {
+        log.log_error("update", "could not start the new version; rolling back")
+        platform.plat_rollback(exe_s, bak_s)
+        config.remove_key(&(*u).state, "pending.state")
+        config.config_save(&(*u).state)
+        st_fail(u, UE_APPLY, "the new version did not start")
+        return platform.AP_RENAME
+    }
+    (*u).supervise = true
+    return platform.AP_OK
+}
+
+// After update_apply: wait (headless) until the new program confirms. If it
+// does not within `update.healthy_s` seconds, or its process died, put the
+// old program back and start it. Returns true when the new one is healthy,
+// false when it was rolled back.
+fn update_supervise(u: *mut Updater) -> bool {
+    if !(*u).supervise {
+        return true
+    }
+    (*u).supervise = false
+    let limit: i64 = config.get_int(&(*u).settings, "update.healthy_s", DEFAULT_HEALTHY_S)
+    let t0: u64 = now_ms()
+    var hp: rt.Buf = rt.buf_new()
+    state_file(u, "healthy", &hp)
+    let healthy_path: str = util.buf_to_str_copy(&hp)
+    rt.buf_free(&hp)
+    var healthy: bool = false
+    var reason: str = "no confirmation in time"
+    // The new process was started by this process (platform token): once it
+    // is gone without having confirmed, there is no point in waiting out the
+    // rest of the time. (A little grace first: a program that confirms and
+    // then ends at once -- a test, a tool -- leaves its marker before the
+    // process disappears, and the marker is looked at first.)
+    while true {
+        if fs.exists(healthy_path) {
+            healthy = true
+            break
+        }
+        if (*u).new_token >= 0 && !platform.plat_spawned_alive((*u).new_token) {
+            platform.plat_sleep_ms(150)
+            if fs.exists(healthy_path) {
+                healthy = true
+            } else {
+                reason = "the new version exited"
+            }
+            break
+        }
+        if (now_ms() - t0) / 1000 as u64 >= limit as u64 {
+            break
+        }
+        platform.plat_sleep_ms(100)
+    }
+    if healthy {
+        log.log_info("update", "the new version confirmed")
+        return true
+    }
+    log.log_error("update", "rolling back: " + reason)
+    if (*u).new_token >= 0 {
+        // a version that hangs is ended; one that already exited is not
+        // a problem
+        platform.plat_kill_spawned((*u).new_token)
+        platform.plat_sleep_ms(300)
+    }
+    var exe: rt.Buf = rt.buf_new()
+    var backup: rt.Buf = rt.buf_new()
+    if exe_and_backup(&exe, &backup) {
+        let exe_s: str = util.buf_to_str_copy(&exe)
+        let bak_s: str = util.buf_to_str_copy(&backup)
+        let rc: u32 = platform.plat_rollback(exe_s, bak_s)
+        remember_bad_build(u, str { p: (&(*u).st.sha[0]) as *mut u8, n: 64 })
+        config.set_str(&(*u).state, "pending.state", "rolledback")
+        config.set_str(&(*u).state, "rollback.reason", reason)
+        config.set_str(&(*u).state, "rollback.version", status_version(&(*u).st))
+        config.config_save(&(*u).state)
+        if rc == platform.AP_OK {
+            var a: util.Args = util.args_new()
+            util.args_push(&a, "--appkit-rolledback")
+            platform.plat_spawn_detached(exe_s, &a)
+            util.args_free(&a)
+        }
+    }
+    rt.buf_free(&exe)
+    rt.buf_free(&backup)
+    return false
+}
+
+// ----------------------------------------------------------- the new side
+
+// Call early in main of EVERY start, after appinfo_init and plat_init:
+// handles `--appkit-worker` (never returns then), and the bookkeeping of a
+// freshly updated or rolled back start. `args` of the start block are read
+// through platform.plat_arg.
+// Returns 0 normally; a worker process exits by itself.
+fn update_boot(u: *mut Updater) -> u32 {
+    let argc: usize = platform.plat_argc()
+    var worker: bool = false
+    var op: u32 = OP_CHECK
+    var restarted: bool = false
+    var rolledback: bool = false
+    var i: usize = 1
+    while i < argc {
+        let a: str = platform.plat_arg(i)
+        if a == "--appkit-worker" {
+            worker = true
+            if i + 1 < argc && platform.plat_arg(i + 1) == "fetch" {
+                op = OP_FETCH
+            }
+        } else if a == "--appkit-restarted" {
+            restarted = true
+        } else if a == "--appkit-rolledback" {
+            rolledback = true
+        }
+        i = i + 1
+    }
+    G_RESTARTED = restarted
+    G_ROLLEDBACK_START = rolledback
+    if !(*u).ok {
+        if !update_init(u) {
+            return 0
+        }
+    }
+    if worker {
+        (*u).publish_file = true
+        // a cancel file left over from an earlier run must not stop this one
+        var cp: rt.Buf = rt.buf_new()
+        state_file(u, "update-cancel", &cp)
+        fs.remove(util.buf_to_str_copy(&cp)) catch false
+        rt.buf_free(&cp)
+        worker_run(u, op)
+        platform.plat_exit(0)
+    }
+    var ps: rt.Buf = rt.buf_new()
+    config.get_str(&(*u).state, "pending.state", "", &ps)
+    if util.buf_eq_str(&ps, "applied") && !restarted {
+        // The state says an update was applied and never confirmed, and this
+        // is not the start the update made: a previous start of the new
+        // version died before it was healthy. Count the attempt.
+        let tries: i64 = config.get_int(&(*u).state, "pending.tries", 0) + 1
+        config.set_int(&(*u).state, "pending.tries", tries)
+        config.config_save(&(*u).state)
+        if tries >= 2 {
+            self_rollback(u)
+        }
+    }
+    rt.buf_free(&ps)
+    if rolledback {
+        log.log_warn("update", "started after a rollback")
+    }
+    cleanup_after_boot(u)
+    return 0
+}
+
+// the new version itself cannot confirm (it keeps dying): put the old one
+// back and start it
+fn self_rollback(u: *mut Updater) {
+    var exe: rt.Buf = rt.buf_new()
+    var backup: rt.Buf = rt.buf_new()
+    if exe_and_backup(&exe, &backup) {
+        let exe_s: str = util.buf_to_str_copy(&exe)
+        let bak_s: str = util.buf_to_str_copy(&backup)
+        if fs.is_file(bak_s) {
+            // this process is the bad version: its file is replaced by the
+            // backup, the old version is started, this one ends
+            var sha: rt.Buf = rt.buf_new()
+            config.get_str(&(*u).state, "pending.sha", "", &sha)
+            if rt.buf_len(&sha) == 64 {
+                remember_bad_build(u, util.buf_to_str_copy(&sha))
+            }
+            rt.buf_free(&sha)
+            let rc: u32 = platform.plat_rollback(exe_s, bak_s)
+            config.set_str(&(*u).state, "pending.state", "rolledback")
+            config.set_str(&(*u).state, "rollback.reason", "the new version did not stay up")
+            config.config_save(&(*u).state)
+            if rc == platform.AP_OK {
+                var a: util.Args = util.args_new()
+                util.args_push(&a, "--appkit-rolledback")
+                platform.plat_spawn_detached(exe_s, &a)
+                util.args_free(&a)
+                platform.plat_exit(0)
+            }
+        }
+    }
+    rt.buf_free(&exe)
+    rt.buf_free(&backup)
+}
+
+// stale files of earlier updates: a leftover download, the cancel flag, and
+// the backup once the new version has been confirmed
+fn cleanup_after_boot(u: *mut Updater) {
+    var ps: rt.Buf = rt.buf_new()
+    config.get_str(&(*u).state, "pending.state", "", &ps)
+    let confirmed: bool = util.buf_eq_str(&ps, "confirmed")
+    rt.buf_free(&ps)
+    var exe: rt.Buf = rt.buf_new()
+    var backup: rt.Buf = rt.buf_new()
+    if exe_and_backup(&exe, &backup) {
+        if confirmed {
+            let bak_s: str = util.buf_to_str_copy(&backup)
+            if fs.exists(bak_s) {
+                fs.remove(bak_s) catch false
+            }
+        }
+    }
+    rt.buf_free(&exe)
+    rt.buf_free(&backup)
+}
+
+// The new program calls this when it is up and usable (the template does it
+// a few seconds after the first frame). It lets the old program's
+// supervisor stand down and marks the update confirmed.
+fn update_mark_healthy(u: *mut Updater) {
+    var hp: rt.Buf = rt.buf_new()
+    state_file(u, "healthy", &hp)
+    fs.write_file(util.buf_to_str_copy(&hp), "1".p as u64, 1) catch 0
+    rt.buf_free(&hp)
+    var ps: rt.Buf = rt.buf_new()
+    config.get_str(&(*u).state, "pending.state", "", &ps)
+    if util.buf_eq_str(&ps, "applied") {
+        config.set_str(&(*u).state, "pending.state", "confirmed")
+        config.config_save(&(*u).state)
+        log.log_info("update", "update confirmed")
+    }
+    rt.buf_free(&ps)
+}
+
+// "rolled back from X: reason" for the UI, empty when nothing happened
+fn update_pending_text(u: *mut Updater, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    var ps: rt.Buf = rt.buf_new()
+    config.get_str(&(*u).state, "pending.state", "", &ps)
+    if util.buf_eq_str(&ps, "rolledback") {
+        util.buf_push_str(out, "The update to ")
+        var v: rt.Buf = rt.buf_new()
+        config.get_str(&(*u).state, "rollback.version", "?", &v)
+        rt.buf_push_bytes(out, rt.buf_ptr(&v), rt.buf_len(&v))
+        util.buf_push_str(out, " did not work and was undone: ")
+        config.get_str(&(*u).state, "rollback.reason", "", &v)
+        rt.buf_push_bytes(out, rt.buf_ptr(&v), rt.buf_len(&v))
+        rt.buf_free(&v)
+    }
+    rt.buf_free(&ps)
+}
+
+fn update_was_rolled_back(u: *mut Updater) -> bool {
+    var ps: rt.Buf = rt.buf_new()
+    config.get_str(&(*u).state, "pending.state", "", &ps)
+    let r: bool = util.buf_eq_str(&ps, "rolledback")
+    rt.buf_free(&ps)
+    return r
+}
+
+fn update_clear_rolled_back(u: *mut Updater) {
+    if update_was_rolled_back(u) {
+        config.remove_key(&(*u).state, "pending.state")
+        config.config_save(&(*u).state)
+    }
+}
+
+// ---------------------------------------------------- the program's own args
+
+// true when this process was started by an update (--appkit-restarted)
+fn update_started_after_update() -> bool {
+    return G_RESTARTED
+}
+
+// true when this process was started after a rollback
+fn update_started_after_rollback() -> bool {
+    return G_ROLLEDBACK_START
+}
+
+fn is_appkit_flag(a: str) -> bool {
+    return a == "--appkit-restarted" || a == "--appkit-rolledback"
+}
+
+// The program's own command line without the flags appkit adds: the n-th
+// (1 = first after the program name) argument that is not
+// `--appkit-restarted`, `--appkit-rolledback` or `--appkit-worker <mode>`.
+// "" when there is none.
+fn update_user_arg(n: usize) -> str {
+    let argc: usize = platform.plat_argc()
+    var seen: usize = 0
+    var i: usize = 1
+    while i < argc {
+        let a: str = platform.plat_arg(i)
+        if a == "--appkit-worker" {
+            i = i + 2
+            continue
+        }
+        if !is_appkit_flag(a) {
+            seen = seen + 1
+            if seen == n {
+                return a
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn update_user_argc() -> usize {
+    var n: usize = 0
+    while update_user_arg(n + 1).n > 0 {
+        n = n + 1
+    }
+    return n
+}

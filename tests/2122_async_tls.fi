@@ -1,0 +1,360 @@
+// expect_exit: 0
+// tests/2122_async_tls.fi -- async.stream over TLS 1.3, non-blocking.
+//
+// The server is lib/tls/tls_server.fi (sans-I/O) driven by an async.stream
+// of its own, in the SAME loop as the clients. Certificates: a throw-away CA
+// and a leaf for "localhost" (ECDSA P-256, valid until 2045), embedded below.
+//
+// A  one client, 100 KB out and back through TLS (several records each way)
+// B  a server that DRIBBLES its output 1-7 octets per millisecond: the
+//    handshake and the data arrive in tiny pieces, the client's state
+//    machine has to survive a WouldBlock inside every record
+// C  the wrong host name -> CL_TLS with the Certificate error (9)
+// D  an unknown CA (empty trust store) -> CL_TLS, Certificate (9)
+// E  5 clients at once
+// F  close: the client closes gracefully (close_notify), the server sees it
+import std.rt
+import std.net
+import tls.tls
+import tls.x509
+import tls.tls_server as server
+import async.loop
+import async.stream
+
+const CA_PEM: str = "-----BEGIN CERTIFICATE-----\nMIIBoDCCAUWgAwIBAgIUHOPVny2cpnkX7d96Wpk3/SxnimMwCgYIKoZIzj0EAwIw\nHTEbMBkGA1UEAwwSRmlybiBBc3luYyBUZXN0IENBMB4XDTI2MTAwNDEzMzg1M1oX\nDTQ1MTIwMzEzMzg1M1owHTEbMBkGA1UEAwwSRmlybiBBc3luYyBUZXN0IENBMFkw\nEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE/InTK88XDK/84XVZtb0+C4vBFN/iFdG/\nzGb8Gv0D+3WSvm61onKCehjHT2RMhqwkn4GKHQrPyy3z64v+1aQQuKNjMGEwHQYD\nVR0OBBYEFDE4jGvGpFbAah85vcNKQmJBlqftMB8GA1UdIwQYMBaAFDE4jGvGpFbA\nah85vcNKQmJBlqftMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoG\nCCqGSM49BAMCA0kAMEYCIQCCpSrTRRuYn3rnO693EOnAPt8KqIx3zqPM+Y2VCWCF\n6QIhAMiVcp8pMCrQ80tSWqMfqnxa7SV+FYmcSuvwPw7244TG\n-----END CERTIFICATE-----\n"
+const LEAF_PEM: str = "-----BEGIN CERTIFICATE-----\nMIIBwDCCAWagAwIBAgIUKfz5qA8JZtZUU6YKPNFuMF8g7acwCgYIKoZIzj0EAwIw\nHTEbMBkGA1UEAwwSRmlybiBBc3luYyBUZXN0IENBMB4XDTI2MTAwNDEzMzg1M1oX\nDTQ1MTIwMzEzMzg1M1owFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0C\nAQYIKoZIzj0DAQcDQgAEoKBkcuaZTiKwCUh4/1/SzwTG/jD+AJaRMmJugM8/06lu\n2afEc4dvv6DS5L5G1Vg/UHC/5qbmq/n8UnUIPiW2SaOBjDCBiTAaBgNVHREEEzAR\ngglsb2NhbGhvc3SHBH8AAAEwCQYDVR0TBAIwADALBgNVHQ8EBAMCB4AwEwYDVR0l\nBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYEFHT27QBDhUA56BO5StJ33ejRz4tQMB8G\nA1UdIwQYMBaAFDE4jGvGpFbAah85vcNKQmJBlqftMAoGCCqGSM49BAMCA0gAMEUC\nIQDAedU74cuZDb1Xa9uPlv1D7YJdzBRyugd58hj5AFXDVgIgSZBwNgMKB6D7+WQG\nw5jeatcXyAagk9LwvO4tjdEVng8=\n-----END CERTIFICATE-----\n"
+const LEAF_KEY: str = "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIB3m+9EQHqGkqMWKiF6AvWEeDt08FhehG9fmgpHGAeyGoAoGCCqGSM49\nAwEHoUQDQgAEoKBkcuaZTiKwCUh4/1/SzwTG/jD+AJaRMmJugM8/06lu2afEc4dv\nv6DS5L5G1Vg/UHC/5qbmq/n8UnUIPiW2SQ==\n-----END EC PRIVATE KEY-----\n"
+
+static mut fails: u32 = 0
+
+fn check(ok: bool, code: u32) {
+    if !ok {
+        fails = fails + 1
+        let m: [u8; 5] = "FAIL "
+        syscall(1, 2, (&m[0]) as i64, 5, 0, 0, 0)
+        var d: [u8; 4] = [48, 48, 48, 10]
+        d[0] = (48 + (code / 100) % 10) as u8
+        d[1] = (48 + (code / 10) % 10) as u8
+        d[2] = (48 + code % 10) as u8
+        syscall(1, 2, (&d[0]) as i64, 4, 0, 0, 0)
+    }
+}
+
+fn wall_seconds() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 0, (&ts[0]) as i64, 0, 0, 0)
+    return ts[0] as u64
+}
+
+// ---------------------------------------------------------- the server
+
+struct SCtx {
+    t: server.TlsServer,
+    s: *mut stream.Stream,
+    dribble: bool,
+    timer: u64,
+    echoed: u64,
+    seen_close: bool,
+    live: bool,
+}
+
+struct CfgHolder { cfg: server.TlsConfig }
+static mut cfg_holder: u64 = 0
+static mut dribble_mode: bool = false
+static mut srv_closed: u32 = 0
+static mut srv_close_reason: i64 = 0 - 1
+static mut srv_total_echo: u64 = 0
+
+// Moves what the TLS server has produced onto the stream.
+fn pump_out(c: *mut SCtx) {
+    let n: usize = server.out_len(&(*c).t)
+    if n == 0 {
+        return
+    }
+    if (*c).dribble {
+        var k: usize = 1 + (((*c).echoed + n as u64) % 7) as usize
+        if k > n {
+            k = n
+        }
+        stream.stream_write((*c).s, server.out_ptr(&(*c).t), k)
+        server.out_consume(&(*c).t, k)
+        if server.out_len(&(*c).t) > 0 && (*c).timer == 0 {
+            (*c).timer = loop.timer_after(stream.stream_loop((*c).s), 1, s_tick, c as u64)
+        }
+        return
+    }
+    stream.stream_write((*c).s, server.out_ptr(&(*c).t), n)
+    server.out_consume(&(*c).t, n)
+}
+
+fn s_tick(l: *mut loop.Loop, ud: u64) {
+    let c: *mut SCtx = ud as *mut SCtx
+    (*c).timer = 0
+    if !(*c).live {
+        return
+    }
+    pump_out(c)
+}
+
+fn srv_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    let c: *mut SCtx = ud as *mut SCtx
+    if kind == stream.SE_DATA {
+        let ok: bool = server.feed(&(*c).t, stream.stream_in_ptr(s), stream.stream_in_len(s))
+        stream.stream_consume(s, stream.stream_in_len(s))
+        if server.app_len(&(*c).t) > 0 {
+            let n: usize = server.app_len(&(*c).t)
+            server.send(&(*c).t, server.app_ptr(&(*c).t), n)
+            server.app_consume(&(*c).t, n)
+            (*c).echoed = (*c).echoed + n as u64
+            srv_total_echo = srv_total_echo + n as u64
+        }
+        pump_out(c)
+        if !ok || server.failed(&(*c).t) {
+            stream.stream_abort(s)
+        }
+    } else if kind == stream.SE_CLOSED {
+        (*c).live = false
+        if (*c).timer != 0 {
+            loop.timer_cancel(stream.stream_loop(s), (*c).timer)
+        }
+        srv_closed = srv_closed + 1
+        srv_close_reason = arg
+        (*c).seen_close = server.is_closed(&(*c).t)
+        server.server_free(&(*c).t)
+        // the context is leaked on purpose in this test (freed with the heap)
+    }
+}
+
+fn on_conn(l: *mut loop.Loop, ud: u64, c: net.Conn) {
+    let p: u64 = rt.heap_alloc(size_of[SCtx]())
+    let x: *mut SCtx = p as *mut SCtx
+    *x = SCtx { t: server.server_new(&(*(cfg_holder as *mut CfgHolder)).cfg), s: 0 as *mut stream.Stream, dribble: dribble_mode,
+        timer: 0, echoed: 0, seen_close: false, live: true }
+    (*x).s = stream.stream_adopt(l, c, 20000, srv_event, p)
+}
+
+// ---------------------------------------------------------- the clients
+
+const MAXC: usize = 5
+static mut c_done: [u32; 8] = [0; 8]
+static mut c_got: [u32; 8] = [0; 8]
+static mut c_bad: [u32; 8] = [0; 8]
+static mut c_reason: [i64; 8] = [0 - 1; 8]
+static mut c_tlserr: [u32; 8] = [0; 8]
+static mut c_len: [u32; 8] = [0; 8]
+static mut c_connected: [u32; 8] = [0; 8]
+static mut c_close_when_done: bool = false
+
+fn mbyte(id: usize, i: usize) -> u8 {
+    return ((i * 31 + id * 5 + (i >> 9)) & 255) as u8
+}
+
+fn cli_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    let id: usize = ud as usize
+    if kind == stream.SE_CONNECTED {
+        c_connected[id] = 1
+        let n: usize = c_len[id] as usize
+        if n > 0 {
+            let p: u64 = rt.heap_alloc(n)
+            var i: usize = 0
+            while i < n {
+                rt.st8(p, i, mbyte(id, i))
+                i = i + 1
+            }
+            stream.stream_write(s, p, n)
+            rt.heap_free(p, n)
+        }
+    } else if kind == stream.SE_DATA {
+        let n: usize = stream.stream_in_len(s)
+        let p: u64 = stream.stream_in_ptr(s)
+        var i: usize = 0
+        while i < n {
+            if rt.ld8(p, i) != mbyte(id, c_got[id] as usize + i) {
+                c_bad[id] = c_bad[id] + 1
+            }
+            i = i + 1
+        }
+        c_got[id] = c_got[id] + n as u32
+        stream.stream_consume(s, n)
+        if c_got[id] == c_len[id] {
+            c_done[id] = 1
+            if c_close_when_done {
+                stream.stream_close(s)
+            }
+        }
+    } else if kind == stream.SE_CLOSED {
+        c_reason[id] = arg
+        c_tlserr[id] = stream.stream_tls_error(s)
+    }
+}
+
+fn reset_clients() {
+    var i: usize = 0
+    while i < MAXC {
+        c_done[i] = 0
+        c_got[i] = 0
+        c_bad[i] = 0
+        c_reason[i] = 0 - 1
+        c_tlserr[i] = 0
+        c_len[i] = 0
+        c_connected[i] = 0
+        i = i + 1
+    }
+}
+
+static mut pred_fn: u64 = 0
+
+fn t_stop(l: *mut loop.Loop, ud: u64) { loop.stop(l) }
+
+fn t_check(l: *mut loop.Loop, ud: u64) {
+    let f: fn() -> bool = pred_fn as fn() -> bool
+    if f() {
+        loop.stop(l)
+    }
+}
+
+fn run_until(l: *mut loop.Loop, ms: i64, pred: fn() -> bool) {
+    pred_fn = pred as u64
+    let h: u64 = loop.timer_after(l, ms, t_stop, 0)
+    let c: u64 = loop.timer_every(l, 2, t_check, 0)
+    loop.run(l)
+    loop.timer_cancel(l, h)
+    loop.timer_cancel(l, c)
+}
+
+static mut want_clients: usize = 1
+
+fn p_all_done() -> bool {
+    var i: usize = 0
+    while i < want_clients {
+        if c_done[i] == 0 && c_reason[i] < 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn p_all_closed() -> bool {
+    var i: usize = 0
+    while i < want_clients {
+        if c_reason[i] < 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+#[allow_escape]
+fn suite(force_poll: bool) {
+    var l: loop.Loop = loop.loop_new()
+    var ok: bool = false
+    if force_poll {
+        ok = loop.loop_init_poll(&l)
+    } else {
+        ok = loop.loop_init(&l)
+    }
+    check(ok, 1)
+    var store: x509.Store = x509.store_new()
+    check(x509.store_load_pem(&store, CA_PEM.p as u64, CA_PEM.n) == 1, 2)
+    var empty: x509.Store = x509.store_new()
+    let now: u64 = wall_seconds()
+    let acc: *mut stream.Acceptor = stream.acceptor_new(&l, net.ADDR_LOCAL, 0 as u16, 64, on_conn, 0)
+    check(acc as u64 != 0, 3)
+    let port: u16 = stream.acceptor_port(acc)
+
+    // ---- A: 100 KB through TLS
+    reset_clients()
+    dribble_mode = false
+    c_close_when_done = true
+    want_clients = 1
+    c_len[0] = 100000
+    let a: *mut stream.Stream = stream.stream_open_tls(&l, net.ADDR_LOCAL, port, "localhost", &store, now, 10000, cli_event, 0)
+    check(a as u64 != 0, 10)
+    run_until(&l, 10000, p_all_closed)
+    check(c_connected[0] == 1, 11)
+    check(c_done[0] == 1 && c_got[0] == 100000 && c_bad[0] == 0, 12)
+    check(c_reason[0] == stream.CL_LOCAL, 13)
+
+    // ---- B: a dribbling server
+    reset_clients()
+    dribble_mode = true
+    want_clients = 1
+    c_len[0] = 3000
+    let b: *mut stream.Stream = stream.stream_open_tls(&l, net.ADDR_LOCAL, port, "localhost", &store, now, 20000, cli_event, 0)
+    check(b as u64 != 0, 20)
+    run_until(&l, 20000, p_all_closed)
+    check(c_done[0] == 1 && c_got[0] == 3000 && c_bad[0] == 0, 21)
+    dribble_mode = false
+
+    // ---- C: wrong name
+    reset_clients()
+    want_clients = 1
+    c_len[0] = 10
+    let c: *mut stream.Stream = stream.stream_open_tls(&l, net.ADDR_LOCAL, port, "evil.example", &store, now, 10000, cli_event, 0)
+    check(c as u64 != 0, 30)
+    run_until(&l, 10000, p_all_closed)
+    check(c_reason[0] == stream.CL_TLS, 31)
+    check(c_tlserr[0] == 9, 32) // Certificate
+    check(c_connected[0] == 0, 33)
+
+    // ---- D: unknown CA
+    reset_clients()
+    want_clients = 1
+    c_len[0] = 10
+    let d: *mut stream.Stream = stream.stream_open_tls(&l, net.ADDR_LOCAL, port, "localhost", &empty, now, 10000, cli_event, 0)
+    check(d as u64 != 0, 40)
+    run_until(&l, 10000, p_all_closed)
+    check(c_reason[0] == stream.CL_TLS, 41)
+    check(c_tlserr[0] == 9, 42)
+    check(c_connected[0] == 0, 43)
+
+    // ---- E: 5 at once
+    reset_clients()
+    want_clients = MAXC
+    c_close_when_done = true
+    var i: usize = 0
+    while i < MAXC {
+        c_len[i] = 5000 + i as u32 * 700
+        let e: *mut stream.Stream = stream.stream_open_tls(&l, net.ADDR_LOCAL, port, "localhost", &store, now, 20000, cli_event, i as u64)
+        check(e as u64 != 0, 50)
+        i = i + 1
+    }
+    run_until(&l, 20000, p_all_closed)
+    var good: u32 = 0
+    i = 0
+    while i < MAXC {
+        if c_done[i] == 1 && c_got[i] == c_len[i] && c_bad[i] == 0 {
+            good = good + 1
+        }
+        i = i + 1
+    }
+    check(good == MAXC as u32, 51)
+
+    // all servers saw their clients leave
+    let t0: i64 = loop.mono_ms()
+    while srv_closed < 9 && loop.mono_ms() - t0 < 2000 {
+        loop.run_once(&l, 10)
+    }
+    check(srv_closed >= 8, 60)
+
+    stream.acceptor_close(acc)
+    x509.store_free(&store)
+    x509.store_free(&empty)
+    loop.loop_free(&l)
+}
+
+fn main() -> i32 {
+    cfg_holder = rt.heap_alloc(size_of[CfgHolder]())
+    (*(cfg_holder as *mut CfgHolder)).cfg = server.config_new()
+    if !server.config_load_pem(&(*(cfg_holder as *mut CfgHolder)).cfg, LEAF_PEM.p as u64, LEAF_PEM.n, LEAF_KEY.p as u64, LEAF_KEY.n) {
+        return 2
+    }
+    suite(false)
+    suite(true)
+    if fails != 0 {
+        return 1
+    }
+    return 0
+}

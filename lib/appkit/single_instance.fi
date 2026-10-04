@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/single_instance.fi -- ONE copy of the program per user.
+//
+//     match single.single_acquire(5000) { ... }
+//     let r: u32 = single.single_acquire(0)      // do not wait
+//     if r == single.SI_HELD { ... "already running": tell the user / exit }
+//
+// HOW. The lock is a file in the program's state directory
+// (`<state>/instance.lock`) that the first copy holds open with an
+// exclusive lock for as long as it lives: a POSIX record lock on Linux, a
+// file opened with share mode 0 on Windows (appkit.platform, plat_lock).
+// The kernel drops it when the process ends, however it ends -- a crash
+// leaves no stale lock, which a pid file cannot promise.
+//
+// WAITING. A program that has just updated itself is started while the old
+// copy is still closing its window. `single_acquire(wait_ms)` retries every
+// 100 ms for that long; the updater's restart passes a few seconds.
+import std.rt
+import std.fs
+import appkit.util
+import appkit.appinfo
+import appkit.platform
+
+export { single_acquire, single_release, single_held, SI_OK, SI_HELD, SI_ERROR }
+
+const SI_OK: u32 = 0
+const SI_HELD: u32 = 1 // another copy is running
+const SI_ERROR: u32 = 2 // the lock file could not be used
+
+static mut G_HANDLE: i64 = -1
+
+fn lock_path(out: *mut rt.Buf) -> bool {
+    if !platform.plat_dir(platform.DIR_STATE, appinfo.app_id(), appinfo.app_vendor(), out) {
+        return false
+    }
+    let made: bool = fs.mkdir_all(util.buf_to_str_copy(out)) catch false
+    util.buf_push_str(out, "/instance.lock")
+    return true
+}
+
+// Takes the lock. SI_OK = this is the only copy (keep running);
+// SI_HELD = another copy holds it (after waiting `wait_ms`).
+fn single_acquire(wait_ms: u64) -> u32 {
+    if G_HANDLE >= 0 {
+        return SI_OK
+    }
+    var p: rt.Buf = rt.buf_new()
+    if !lock_path(&p) {
+        rt.buf_free(&p)
+        return SI_ERROR
+    }
+    let path: str = util.buf_to_str_copy(&p)
+    rt.buf_free(&p)
+    var waited: u64 = 0
+    while true {
+        let h: i64 = platform.plat_lock(path)
+        if h >= 0 {
+            G_HANDLE = h
+            return SI_OK
+        }
+        if h == -2 {
+            return SI_ERROR
+        }
+        if waited >= wait_ms {
+            return SI_HELD
+        }
+        platform.plat_sleep_ms(100)
+        waited = waited + 100
+    }
+    return SI_ERROR
+}
+
+fn single_release() {
+    if G_HANDLE >= 0 {
+        platform.plat_unlock(G_HANDLE)
+        G_HANDLE = -1
+    }
+}
+
+fn single_held() -> bool {
+    return G_HANDLE >= 0
+}

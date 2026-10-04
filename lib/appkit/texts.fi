@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/texts.fi -- TEXTS IN THE USER'S LANGUAGE, on top of lib/i18n.
+// (the module is called `texts`, not `i18n`: it imports lib/i18n, whose
+// module name is `i18n`, and two modules of one name cannot meet.)
+//
+//     // once, at start (the template does this):
+//     texts.tr_register("en", EN_TEXT)        // your own catalogs,
+//     texts.tr_register("de", DE_TEXT)        // .opmsg files embedded
+//     texts.tr_select("")                     // "" = the system language
+//
+//     texts.tr("update.check")                // "Nach Updates suchen"
+//     texts.tr1("update.available", "version", "1.2.0")
+//     texts.trn("files", "count", 3.0)        // plural variants
+//
+// appkit's OWN pages (updates, settings, about, the crash notice) come with
+// English and German texts (lib/appkit/locale/*.opmsg); they are registered
+// by tr_select, a program adds its own on top. Lookup order: the selected
+// language -> English -> the key itself (a missing text shows its id on
+// screen instead of an empty label, lib/i18n's rule).
+//
+// THE SYSTEM LANGUAGE comes from the platform layer (plat_locale: LANG on
+// Linux, the registry on Windows, Locale on Android); a language without a
+// catalog falls back to English. The user's own choice -- a settings entry
+// `ui.language` -- is passed to tr_select by the program.
+//
+// OWNERSHIP. The catalogs are parsed from the texts you register; the texts
+// must stay valid (use `const` strings or __include_str). tr_select can be
+// called again (a language switch in the settings) and rebuilds the bundle.
+import std.rt
+import i18n.i18n
+import appkit.util
+import appkit.platform
+
+export { tr_register, tr_select, tr_lang, tr, tr1, trn, tr_system_lang }
+
+const EN_BUILTIN: str = __include_str("locale/en.opmsg")
+const DE_BUILTIN: str = __include_str("locale/de.opmsg")
+
+const MAX_CAT: usize = 8
+
+static mut G_NREG: usize = 0
+static mut G_LANG: [u8; 64] = [0; 64]
+static mut G_NLANG: [u8; 8] = [0; 8]
+static mut G_TEXT: [u64; 8] = [0; 8]
+static mut G_TEXTN: [u64; 8] = [0; 8]
+static mut G_BUNDLE: u64 = 0
+static mut G_SELECTED: [u8; 8] = [0; 8]
+static mut G_NSELECTED: usize = 0
+static mut G_BUILTIN_DONE: bool = false
+
+// Bundle lives on the heap: it holds Vecs, which a static cannot initialise.
+fn texts_size_of[T: Any]() -> usize {
+    return size_of[T]()
+}
+
+fn bundle_ptr() -> *mut i18n.Bundle {
+    return G_BUNDLE as *mut i18n.Bundle
+}
+
+// Adds a catalog for `lang` (a short code: "de", "en"). A second text for
+// the same language is ADDED after the first (the program's own keys next
+// to appkit's). `text` must outlive the program (a const or an embedded
+// file). false when the table is full or the code is not 2-7 letters.
+fn tr_register(lang: str, text: str) -> bool {
+    if G_NREG >= MAX_CAT || lang.n < 2 || lang.n > 7 {
+        return false
+    }
+    rt.mem_copy((&G_LANG[0]) as u64 + (G_NREG * 8) as u64, lang.p as u64, lang.n)
+    G_NLANG[G_NREG] = lang.n as u8
+    G_TEXT[G_NREG] = text.p as u64
+    G_TEXTN[G_NREG] = text.n as u64
+    G_NREG = G_NREG + 1
+    return true
+}
+
+fn reg_lang(i: usize) -> str {
+    return str { p: ((&G_LANG[0]) as u64 + (i * 8) as u64) as *mut u8, n: G_NLANG[i] as usize }
+}
+
+// the user's system language, two letters ("en" when unknown)
+fn tr_system_lang(out: *mut rt.Buf) {
+    platform.plat_locale(out)
+}
+
+fn add_catalogs(b: *mut i18n.Bundle, lang: str) {
+    var i: usize = 0
+    while i < G_NREG {
+        if reg_lang(i) == lang {
+            let t: str = str { p: G_TEXT[i] as *mut u8, n: G_TEXTN[i] as usize }
+            let c: i18n.Catalog = i18n.catalog_load(t.p as u64, t.n, lang) catch | e | empty_catalog(lang)
+            i18n.bundle_add(b, c)
+        }
+        i = i + 1
+    }
+}
+
+fn empty_catalog(lang: str) -> i18n.Catalog {
+    let nothing: str = "@lang en"
+    return i18n.catalog_load(nothing.p as u64, nothing.n, "en") catch | e | empty_catalog(lang)
+}
+
+// Chooses the language and (re)builds the lookup: the chosen language
+// first, English behind it. `lang` "" means the system language. Registers
+// appkit's own texts the first time. Returns false only if the bundle could
+// not be made.
+fn tr_select(lang: str) -> bool {
+    if !G_BUILTIN_DONE {
+        tr_register("en", EN_BUILTIN)
+        tr_register("de", DE_BUILTIN)
+        G_BUILTIN_DONE = true
+    }
+    var want: rt.Buf = rt.buf_new()
+    if lang.n == 0 {
+        platform.plat_locale(&want)
+    } else {
+        util.buf_push_str(&want, lang)
+    }
+    // two letters are enough: "de-AT" -> "de"
+    var w: str = str { p: rt.buf_data(&want), n: rt.buf_len(&want) }
+    if w.n > 2 {
+        w = str { p: w.p, n: 2 }
+    }
+    // is there a catalog for it? else English
+    var have: bool = false
+    var i: usize = 0
+    while i < G_NREG {
+        if reg_lang(i) == w {
+            have = true
+        }
+        i = i + 1
+    }
+    if !have {
+        w = "en"
+    }
+    rt.mem_copy((&G_SELECTED[0]) as u64, w.p as u64, w.n)
+    G_NSELECTED = w.n
+    rt.buf_free(&want)
+    if G_BUNDLE == 0 as u64 {
+        let n: usize = texts_size_of[i18n.Bundle]()
+        G_BUNDLE = rt.heap_alloc(n)
+        if G_BUNDLE == 0 as u64 {
+            return false
+        }
+    } else {
+        i18n.bundle_free(bundle_ptr())
+    }
+    *bundle_ptr() = i18n.bundle_new()
+    let sel: str = str { p: (&G_SELECTED[0]) as *mut u8, n: G_NSELECTED }
+    add_catalogs(bundle_ptr(), sel)
+    if sel != "en" {
+        add_catalogs(bundle_ptr(), "en")
+    }
+    return true
+}
+
+fn tr_lang() -> str {
+    return str { p: (&G_SELECTED[0]) as *mut u8, n: G_NSELECTED }
+}
+
+// the text for `key`; the key itself when nothing has it
+fn tr(key: str) -> str {
+    if G_BUNDLE == 0 as u64 {
+        tr_select("")
+    }
+    var a: i18n.Args = i18n.args_new()
+    let s: str = i18n.msg(bundle_ptr(), key, &a)
+    i18n.args_free(&a)
+    return s
+}
+
+// one text argument: {name}
+fn tr1(key: str, name: str, value: str) -> str {
+    if G_BUNDLE == 0 as u64 {
+        tr_select("")
+    }
+    var a: i18n.Args = i18n.args_new()
+    i18n.args_str(&a, name, value)
+    let s: str = i18n.msg(bundle_ptr(), key, &a)
+    i18n.args_free(&a)
+    return s
+}
+
+// one number argument: {name:number}, plural variants chosen by it
+fn trn(key: str, name: str, n: f64) -> str {
+    if G_BUNDLE == 0 as u64 {
+        tr_select("")
+    }
+    var a: i18n.Args = i18n.args_new()
+    i18n.args_num(&a, name, n)
+    let s: str = i18n.msg(bundle_ptr(), key, &a)
+    i18n.args_free(&a)
+    return s
+}

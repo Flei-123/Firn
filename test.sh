@@ -1554,6 +1554,8 @@ if [ "$SARC" -eq 0 ]; then
 else
     bad "tools/stdarchive/run.sh failed (see .test-work/stdarchive.log)"
     grep -E 'FAIL|Traceback|Error' "$WORK/stdarchive.log" | head -12 | sed 's/^/   /'
+fi
+
 echo "== 75. DNS resolver and https by name (tools/dns/run.sh, round DNS) =="
 # lib/net/dns.fi against a fake DNS server in Python (what the server saw is
 # counted from its log), against the real network when there is one, https by
@@ -1567,6 +1569,58 @@ if [ "$DNRC" -eq 0 ]; then
 else
     bad "tools/dns/run.sh failed (see .test-work/dns.log)"
     grep -E 'FAIL' "$WORK/dns.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 76. appkit: the platform files agree, and the update runs end to end against a local store (tools/appkit/, lib/appkit) =="
+# lib/appkit's unit tests are in tests/2050-2056 (section 3). Here: (1) the five platform files
+# (Linux, Windows, Android, macOS, OrientOS) export the same names with the same signatures and
+# type-check; (2) tools/appkit/e2e.sh -- the real orientstore tool publishes into a temp directory,
+# a local server serves it, a program built on lib/appkit updates itself: check in all three
+# modes, hash / signature / catalog / key / expiry / rollback attacks refused, channels, the floor,
+# chunked / redirected / dropped / slow downloads, a cancelled download, the real replacement of
+# the running program, and the rollback when the new version crashes or hangs; and tools/appkit/
+# newapp_test.sh -- tools/newapp.sh makes a project that builds, starts on Xvfb and releases (needs
+# lib/fui/kit.fi; it builds the Android APK too when the Android build tools are there). The Windows
+# build under Wine runs the same script with APPKIT_E2E_WINDOWS=1 (about ten minutes); the Android
+# update on the emulator (tools/appkit/android_check.sh: PackageInstaller, the system's question, a
+# foreign key refused) with APPKIT_E2E_ANDROID=1 (it starts the AVD "firn" when no device is up).
+# SKIPs (exit 0) without the orientstore tool or python3 cryptography.
+python3 tools/appkit/platforms.py > "$WORK/appkit_platforms.log" 2>&1 && AKRC=0 || AKRC=$?
+bash tools/appkit/e2e.sh > "$WORK/appkit_e2e.log" 2>&1 || AKRC=1
+bash tools/appkit/newapp_test.sh > "$WORK/appkit_newapp.log" 2>&1 || AKRC=1
+# the kit for another machine (tools/appkit/winkit.sh): built for Linux and run here
+( kitdir=$(mktemp -d "${TMPDIR:-/tmp}/appkit-kit.XXXXXX") && trap 'rm -rf "$kitdir"' EXIT \
+  && bash tools/appkit/winkit.sh linux "$kitdir/kit.zip" \
+  && python3 -c "import sys,zipfile;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$kitdir/kit.zip" "$kitdir" \
+  && python3 "$kitdir/appkit-kit/run.py" ) > "$WORK/appkit_kit.log" 2>&1 || AKRC=1
+if [ "${APPKIT_E2E_WINDOWS:-0}" = "1" ]; then
+    E2E_TARGET=windows bash tools/appkit/e2e.sh > "$WORK/appkit_e2e_win.log" 2>&1 || AKRC=1
+fi
+if [ "${APPKIT_E2E_ANDROID:-0}" = "1" ]; then
+    bash tools/appkit/android_check.sh > "$WORK/appkit_android.log" 2>&1 || AKRC=1
+fi
+if [ "$AKRC" -eq 0 ]; then
+    ok
+    tail -n 1 "$WORK/appkit_platforms.log" | sed 's/^/   /'
+    grep -E '^(appkit e2e:|newapp:|appkit kit:|SKIP)' "$WORK/appkit_e2e.log" "$WORK/appkit_newapp.log" "$WORK/appkit_kit.log" | sed 's/^/   /'
+else
+    bad "tools/appkit failed (see .test-work/appkit_*.log)"
+    grep -E 'FAIL' "$WORK"/appkit_*.log | head -12 | sed 's/^/   /'
+fi
+
+echo "== 77. async IO: a thousand connections, a window and the loop, real wss (tools/async/run.sh) =="
+# tests/2120-2125 (section 3) are the in-process half: the loop (epoll and poll), streams, TLS,
+# the HTTP client, the WebSocket client, posting from threads. Here: 1000 connections held
+# against Python asyncio in both directions, the window + loop probe on an Xvfb, the WebSocket
+# client against real wss:// echo services (skipped without a route), and the Windows build
+# under Wine (skipped without Wine/mingw).
+bash tools/async/run.sh > "$WORK/async.log" 2>&1 && ASRC=0 || ASRC=$?
+if [ "$ASRC" -eq 0 ]; then
+    ok
+    grep -E '^(conn:|ui:|ASYNC)|^  (ok|skip)   .*(wss|connections)' "$WORK/async.log" | sed 's/^/   /' | head -12
+else
+    bad "tools/async/run.sh failed (see .test-work/async.log)"
+    grep -E 'FAIL' "$WORK/async.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

@@ -1,0 +1,579 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/platform.windows.fi -- THE PLATFORM LAYER, Windows.
+//
+// The compiler picks this file instead of platform.fi for
+// `--target=x86_64-windows` (the module twin rule, compiler/src/modules.rs).
+// It exports exactly the names platform.fi documents. Read that file's
+// header for the contract.
+//
+// WINDOWS NOTES
+//   * PATHS inside appkit use forward slashes everywhere (std.fs does, and
+//     Win32 accepts them); the OS gets what it wants: CreateProcessW is
+//     handed backslashes. `plat_exe_path` converts the other way.
+//   * THE RUNNING EXE CAN BE RENAMED BUT NOT OVERWRITTEN. So an update is
+//     two renames: exe -> exe.old, exe.new -> exe. `plat_apply` does both
+//     and puts the first one back if the second fails. The backup IS the
+//     old program (renamed), not a copy.
+//   * NO THREADS. The Firn Windows target has no thread support today
+//     (compiler/src/win.rs imports no CreateThread), so plat_threads() is
+//     false and the updater runs its worker as a second process
+//     (this program with --appkit-worker). That is also how Certus' updater
+//     worked.
+//   * SINGLE INSTANCE LOCK: a file opened with share mode 0
+//     (CreateFileW). No other process can open it while the handle lives; the
+//     kernel closes it when the process dies, so a crash leaves no lock.
+//     `plat_lock_held` asks the same question from outside.
+//   * SPAWNING is std.process (CreateProcessW with DETACHED_PROCESS); it
+//     keeps the process handle, so a new version that HANGS can be ended
+//     (TerminateProcess) by the supervisor that started it.
+//   * ENVIRONMENT: GetEnvironmentStringsW (the start block's envp is empty
+//     on Windows).
+import std.rt
+import std.fs
+import std.time
+import std.process
+import appkit.util
+
+export {
+    plat_init, plat_os, plat_arch, plat_id, plat_art, plat_argc, plat_arg,
+    plat_env_get, plat_dir, plat_exe_path, plat_self_pid, plat_spawned_alive,
+    plat_kill_spawned, plat_spawn_detached, plat_lock, plat_unlock, plat_lock_held,
+    plat_apply, plat_rollback, plat_can_write_beside, plat_threads,
+    plat_worker_process,
+    plat_can_self_update, plat_install_hint, plat_exit, plat_sleep_ms,
+    plat_file_copy, plat_chmod_exec, plat_path_sep, plat_stage_path, plat_locale,
+    plat_swap_kind, SWAP_FILES, SWAP_INSTALLER,
+    DIR_CONFIG, DIR_DATA, DIR_STATE, DIR_CACHE, DIR_LOG,
+    AP_OK, AP_NO_NEW, AP_BACKUP, AP_RENAME, AP_PERM, AP_UNSUPPORTED,
+    AP_STAGED,
+}
+
+const DIR_CONFIG: u32 = 0
+const DIR_DATA: u32 = 1
+const DIR_STATE: u32 = 2
+const DIR_CACHE: u32 = 3
+const DIR_LOG: u32 = 4
+
+const AP_OK: u32 = 0
+const AP_NO_NEW: u32 = 1
+const AP_BACKUP: u32 = 2
+const AP_RENAME: u32 = 3
+const AP_PERM: u32 = 4
+const AP_UNSUPPORTED: u32 = 5
+const AP_STAGED: u32 = 6
+
+const SWAP_FILES: u32 = 0
+const SWAP_INSTALLER: u32 = 1
+
+extern fn GetModuleFileNameW(h: i64, buf: u64, n: i64) -> i32;
+extern fn CloseHandle(h: i64) -> i32;
+extern fn CreateFileW(name: u64, access: i64, share: i64, sa: u64, disp: i64,
+    flags: i64, tmpl: i64) -> i64;
+extern fn WriteFile(h: i64, buf: u64, n: i64, written: u64, ov: u64) -> i32;
+extern fn GetLastError() -> i32;
+extern fn GetEnvironmentStringsW() -> u64;
+extern fn FreeEnvironmentStringsW(p: u64) -> i32;
+extern fn GetCurrentProcessId() -> i32;
+extern fn RegGetValueW(key: i64, sub: u64, name: u64, flags: i64, typ: u64,
+    data: u64, cb: u64) -> i32;
+
+static mut G_START: u64 = 0
+
+fn plat_init(start: u64) {
+    G_START = start
+}
+
+fn plat_os() -> str {
+    return "windows"
+}
+
+fn plat_arch() -> str {
+    return "x86_64"
+}
+
+fn plat_id() -> str {
+    return "windows-x86_64"
+}
+
+fn plat_art() -> str {
+    return "exe"
+}
+
+fn plat_path_sep() -> str {
+    return "/"
+}
+
+fn plat_argc() -> usize {
+    return rt.arg_count(G_START)
+}
+
+fn plat_arg(i: usize) -> str {
+    let p: u64 = rt.arg_ptr(G_START, i)
+    if p == 0 as u64 {
+        return ""
+    }
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+// text -> UTF-16 with a terminating zero unit, into a fresh buffer
+fn to_wide(s: str, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    util.utf8_to_utf16(s.p as u64, s.n, out)
+    rt.buf_push(out, 0 as u8)
+    rt.buf_push(out, 0 as u8)
+}
+
+// ------------------------------------------------------------ environment
+
+fn lower16(u: u32) -> u32 {
+    if u >= 65 as u32 && u <= 90 as u32 {
+        return u + 32 as u32
+    }
+    return u
+}
+
+fn plat_env_get(name: str, out: *mut rt.Buf) -> bool {
+    let block: u64 = GetEnvironmentStringsW()
+    if block == 0 as u64 {
+        return false
+    }
+    var found: bool = false
+    var at: usize = 0
+    // entries "NAME=VALUE\0", the block ends with an empty entry
+    while at < 65536 {
+        let first: u32 = rt.ld16(block, at) as u32
+        if first == 0 as u32 {
+            break
+        }
+        var e: usize = at
+        while e < at + 32768 && rt.ld16(block, e) != 0 as u16 {
+            e = e + 1
+        }
+        let n: usize = e - at
+        if n > name.n && rt.ld16(block, at + name.n) == 61 as u16 {
+            var same: bool = true
+            var k: usize = 0
+            while k < name.n {
+                if lower16(rt.ld16(block, at + k) as u32) != lower16(rt.ld8(name.p as u64, k) as u32) {
+                    same = false
+                    break
+                }
+                k = k + 1
+            }
+            if same {
+                rt.buf_clear(out)
+                util.utf16_to_utf8(block + ((at + name.n + 1) * 2) as u64, n - name.n - 1, false, out)
+                found = true
+                break
+            }
+        }
+        at = e + 1
+    }
+    FreeEnvironmentStringsW(block)
+    return found
+}
+
+fn slashes(b: *mut rt.Buf) {
+    var i: usize = 0
+    while i < rt.buf_len(b) {
+        if rt.ld8(rt.buf_ptr(b), i) == 92 as u8 {
+            rt.st8(rt.buf_ptr(b), i, 47 as u8)
+        }
+        i = i + 1
+    }
+}
+
+fn plat_dir(kind: u32, app: str, vendor: str, out: *mut rt.Buf) -> bool {
+    // APPKIT_HOME relocates every directory (tests, portable installs):
+    // $APPKIT_HOME/{config,data,state,cache,logs}/<app>. Wine and some
+    // shells reset APPDATA/LOCALAPPDATA; this one is left alone.
+    var ov: rt.Buf = rt.buf_new()
+    if plat_env_get("APPKIT_HOME", &ov) && rt.buf_len(&ov) > 0 {
+        slashes(&ov)
+        rt.buf_clear(out)
+        rt.buf_push_bytes(out, rt.buf_ptr(&ov), rt.buf_len(&ov))
+        rt.buf_free(&ov)
+        rt.buf_push(out, 47 as u8)
+        if kind == DIR_CONFIG { util.buf_push_str(out, "config") }
+        else if kind == DIR_DATA { util.buf_push_str(out, "data") }
+        else if kind == DIR_STATE { util.buf_push_str(out, "state") }
+        else if kind == DIR_CACHE { util.buf_push_str(out, "cache") }
+        else { util.buf_push_str(out, "logs") }
+        rt.buf_push(out, 47 as u8)
+        util.buf_push_str(out, app)
+        return true
+    }
+    rt.buf_free(&ov)
+    var base: rt.Buf = rt.buf_new()
+    var ok: bool = false
+    if kind == DIR_CONFIG {
+        ok = plat_env_get("APPDATA", &base)
+    } else {
+        ok = plat_env_get("LOCALAPPDATA", &base)
+    }
+    if !ok || rt.buf_len(&base) == 0 {
+        ok = plat_env_get("USERPROFILE", &base)
+        if ok {
+            util.buf_push_str(&base, "/AppData/Local")
+        }
+    }
+    if ok && rt.buf_len(&base) > 0 {
+        slashes(&base)
+        rt.buf_clear(out)
+        rt.buf_push_bytes(out, rt.buf_ptr(&base), rt.buf_len(&base))
+        rt.buf_push(out, 47 as u8)
+        util.buf_push_str(out, vendor)
+        rt.buf_push(out, 47 as u8)
+        util.buf_push_str(out, app)
+        if kind == DIR_STATE {
+            util.buf_push_str(out, "/state")
+        } else if kind == DIR_CACHE {
+            util.buf_push_str(out, "/cache")
+        } else if kind == DIR_LOG {
+            util.buf_push_str(out, "/logs")
+        }
+        ok = true
+    } else {
+        ok = false
+    }
+    rt.buf_free(&base)
+    return ok
+}
+
+// ----------------------------------------------------------- the program
+
+fn plat_exe_path(out: *mut rt.Buf) -> bool {
+    var w: rt.Buf = rt.buf_new()
+    if !util.buf_room(&w, 65536) {
+        rt.buf_free(&w)
+        return false
+    }
+    let n: i32 = GetModuleFileNameW(0, rt.buf_ptr(&w), 32768)
+    if n <= 0 || n >= 32768 {
+        rt.buf_free(&w)
+        return false
+    }
+    rt.buf_clear(out)
+    util.utf16_to_utf8(rt.buf_ptr(&w), n as usize, false, out)
+    rt.buf_free(&w)
+    slashes(out)
+    return true
+}
+
+fn plat_self_pid() -> i64 {
+    return GetCurrentProcessId() as i64
+}
+
+fn plat_sleep_ms(ms: u64) {
+    time.sleep_ms(ms)
+}
+
+fn plat_exit(code: i64) {
+    rt.finish(code)
+}
+
+// the path with backslashes, as Windows wants it for a program name
+fn backslashes(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < s.n {
+        var c: u8 = rt.ld8(s.p as u64, i)
+        if c == 47 as u8 {
+            c = 92 as u8
+        }
+        rt.buf_push(out, c)
+        i = i + 1
+    }
+}
+
+// ---- spawned programs: std.process does the double fork (Linux) or
+// CreateProcessW with DETACHED_PROCESS (Windows) and keeps the pid / the
+// process handle, so the updater's supervisor can ask whether the new
+// version is still alive and end it if it hangs. A token (0..3) names one.
+const SPAWN_SLOTS: usize = 4
+static mut G_CHILDREN: u64 = 0
+static mut G_NEXT_SLOT: usize = 0
+
+// `size_of[T]()` written inside a module cannot name the module's own types;
+// through a generic wrapper it can (see update.fi).
+fn plat_size_of[T: Any]() -> usize {
+    return size_of[T]()
+}
+
+fn child_slot(i: usize) -> *mut process.Child {
+    let sz: usize = plat_size_of[process.Child]()
+    if G_CHILDREN == 0 as u64 {
+        G_CHILDREN = rt.heap_alloc(sz * SPAWN_SLOTS)
+    }
+    return (G_CHILDREN + (i * sz) as u64) as *mut process.Child
+}
+
+fn dummy_child(failed: *mut bool) -> process.Child {
+    *failed = true
+    return process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1,
+        done: true, code: 0, sig: 0, own: false }
+}
+
+// Starts `path` with `args` (the arguments AFTER the program name), detached:
+// the caller never waits for it and it outlives the caller. Returns a token
+// (>= 0) for plat_spawned_alive / plat_kill_spawned, or -1 when it did not
+// start.
+fn plat_spawn_detached(path: str, args: *mut util.Args) -> i64 {
+    var c: process.Command = process.command(path)
+    var at: u64 = rt.buf_ptr(&(*args).buf)
+    var k: usize = 0
+    while k < util.args_count(args) {
+        let n: usize = rt.c_length(at)
+        process.add_arg(&c, str { p: at as *mut u8, n: n })
+        at = at + n as u64 + 1 as u64
+        k = k + 1
+    }
+    process.set_detach(&c, true)
+    process.set_no_window(&c, true)
+    var failed: bool = false
+    let ch: process.Child = process.spawn(&c) catch | e | dummy_child(&failed)
+    process.command_free(&c)
+    if failed {
+        return -1
+    }
+    let i: usize = G_NEXT_SLOT
+    G_NEXT_SLOT = (G_NEXT_SLOT + 1) % SPAWN_SLOTS
+    *child_slot(i) = ch
+    return i as i64
+}
+
+fn plat_spawned_alive(token: i64) -> bool {
+    if token < 0 || token >= SPAWN_SLOTS as i64 {
+        return false
+    }
+    return process.is_running(child_slot(token as usize))
+}
+
+fn plat_kill_spawned(token: i64) -> bool {
+    if token < 0 || token >= SPAWN_SLOTS as i64 {
+        return false
+    }
+    process.kill(child_slot(token as usize))
+    return true
+}
+
+// ------------------------------------------------------------ the lock
+
+// CreateFileW(path, GENERIC_READ|GENERIC_WRITE, share 0, OPEN_ALWAYS): a
+// second open of the same file by anybody fails with a sharing violation
+// while the handle lives. Returns the handle (> 0), -1 = held by someone
+// else, -2 = another error. The holder's pid is written into the file.
+fn plat_lock(path: str) -> i64 {
+    var bs: rt.Buf = rt.buf_new()
+    backslashes(path, &bs)
+    var w: rt.Buf = rt.buf_new()
+    to_wide(str { p: rt.buf_data(&bs), n: rt.buf_len(&bs) }, &w)
+    // GENERIC_READ 0x80000000 | GENERIC_WRITE 0x40000000, OPEN_ALWAYS 4,
+    // FILE_ATTRIBUTE_NORMAL 0x80
+    let h: i64 = CreateFileW(rt.buf_ptr(&w), 3221225472, 0, 0 as u64, 4, 128, 0)
+    rt.buf_free(&bs)
+    rt.buf_free(&w)
+    if h == -1 {
+        let e: i32 = GetLastError()
+        if e == 32 || e == 33 {
+            return -1
+        }
+        return -2
+    }
+    var t: rt.Buf = rt.buf_new()
+    util.push_dec_pad(&t, plat_self_pid() as u64, 10)
+    rt.buf_push(&t, 10 as u8)
+    var written: [u8; 8] = [0; 8]
+    WriteFile(h, rt.buf_ptr(&t), rt.buf_len(&t) as i64, (&written[0]) as u64, 0 as u64)
+    rt.buf_free(&t)
+    return h
+}
+
+fn plat_unlock(h: i64) {
+    if h > 0 {
+        CloseHandle(h)
+    }
+}
+
+// Is `path` locked by a live process? Opens it with share mode 0 and
+// closes it again at once; a sharing violation means yes.
+fn plat_lock_held(path: str) -> bool {
+    var bs: rt.Buf = rt.buf_new()
+    backslashes(path, &bs)
+    var w: rt.Buf = rt.buf_new()
+    to_wide(str { p: rt.buf_data(&bs), n: rt.buf_len(&bs) }, &w)
+    // OPEN_EXISTING 3: a lock file that is not there is not held
+    let h: i64 = CreateFileW(rt.buf_ptr(&w), 3221225472, 0, 0 as u64, 3, 128, 0)
+    rt.buf_free(&bs)
+    rt.buf_free(&w)
+    if h == -1 {
+        let e: i32 = GetLastError()
+        return e == 32 || e == 33
+    }
+    CloseHandle(h)
+    return false
+}
+
+// --------------------------------------------------------- files for update
+
+fn plat_chmod_exec(path: str) -> bool {
+    return true
+}
+
+fn plat_file_copy(src: str, dst: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(src, &b) catch 4294967295
+    if n == 4294967295 {
+        rt.buf_free(&b)
+        return false
+    }
+    let w: usize = fs.write_file(dst, rt.buf_ptr(&b), rt.buf_len(&b)) catch 4294967295
+    let ok: bool = w == rt.buf_len(&b)
+    rt.buf_free(&b)
+    return ok
+}
+
+fn plat_can_write_beside(exe: str) -> bool {
+    let probe: str = exe + ".appkit-probe"
+    let wrote: usize = fs.write_file(probe, "x".p as u64, 1) catch 0
+    let ok: bool = wrote == 1
+    if ok {
+        let rm: bool = fs.remove(probe) catch false
+    }
+    return ok
+}
+
+// A file that was just written can be held for a moment by a virus scanner
+// (Microsoft Defender reads every new program), and a rename then fails with
+// a sharing violation. An updater that gave up at once would throw away a
+// perfectly good update: try for a few seconds. A file that is not there is
+// not waited for.
+fn rename_retry(from: str, to: str) -> bool {
+    var i: u32 = 0
+    while i < 25 {
+        let ok: bool = fs.rename(from, to) catch | e | false
+        if ok {
+            return true
+        }
+        if fs.last_errno() == 2 {
+            return false
+        }
+        time.sleep_ms(200)
+        i = i + 1
+    }
+    return false
+}
+
+fn plat_apply(newf: str, exe: str, backup: str) -> u32 {
+    if !fs.is_file(newf) {
+        return AP_NO_NEW
+    }
+    // an old backup from an earlier update is replaced
+    if fs.exists(backup) {
+        let rm: bool = fs.remove(backup) catch false
+    }
+    // 1. the running program is renamed out of the way (allowed on Windows)
+    if !rename_retry(exe, backup) {
+        if fs.last_errno() == 13 || fs.last_errno() == 1 {
+            return AP_PERM
+        }
+        return AP_BACKUP
+    }
+    // 2. the new file takes the name
+    if !rename_retry(newf, exe) {
+        // put the old one back
+        let back: bool = rename_retry(backup, exe)
+        return AP_RENAME
+    }
+    return AP_OK
+}
+
+// the program file of the NEW version is moved aside (it may still be
+// running -- a rename is allowed), the backup takes the name back
+fn plat_rollback(exe: str, backup: str) -> u32 {
+    if !fs.is_file(backup) {
+        return AP_NO_NEW
+    }
+    let bad: str = exe + ".bad"
+    if fs.exists(bad) {
+        let rm: bool = fs.remove(bad) catch false
+    }
+    if fs.exists(exe) {
+        if !rename_retry(exe, bad) {
+            return AP_RENAME
+        }
+    }
+    if !rename_retry(backup, exe) {
+        return AP_RENAME
+    }
+    // a leftover of the bad version goes if it can (it may be running)
+    if fs.exists(bad) {
+        let rm2: bool = fs.remove(bad) catch false
+    }
+    return AP_OK
+}
+
+// The user's language: HKCU\Control Panel\International, LocaleName
+// ("de-DE"); the first two letters, lower case. "en" when it cannot be read.
+fn plat_locale(out: *mut rt.Buf) -> bool {
+    var wsub: rt.Buf = rt.buf_new()
+    var wname: rt.Buf = rt.buf_new()
+    to_wide("Control Panel\\International", &wsub)
+    to_wide("LocaleName", &wname)
+    var data: [u8; 256] = [0; 256]
+    var cb: [u8; 8] = [0; 8]
+    rt.st32((&cb[0]) as u64, 0, 256 as u32)
+    // HKEY_CURRENT_USER 0x80000001, RRF_RT_REG_SZ 2
+    let rc: i32 = RegGetValueW(2147483649, rt.buf_ptr(&wsub), rt.buf_ptr(&wname), 2,
+        0 as u64, (&data[0]) as u64, (&cb[0]) as u64)
+    rt.buf_free(&wsub)
+    rt.buf_free(&wname)
+    var got: bool = false
+    if rc == 0 {
+        let a: u32 = rt.ld16((&data[0]) as u64, 0) as u32
+        let b: u32 = rt.ld16((&data[0]) as u64, 1) as u32
+        let la: u32 = lower16(a)
+        let lb: u32 = lower16(b)
+        if la >= 97 as u32 && la <= 122 as u32 && lb >= 97 as u32 && lb <= 122 as u32 {
+            rt.buf_clear(out)
+            rt.buf_push(out, la as u8)
+            rt.buf_push(out, lb as u8)
+            got = true
+        }
+    }
+    if !got {
+        rt.buf_clear(out)
+        util.buf_push_str(out, "en")
+    }
+    return got
+}
+
+fn plat_swap_kind() -> u32 {
+    return SWAP_FILES
+}
+
+fn plat_stage_path(exe: str, out: *mut rt.Buf) -> bool {
+    if exe.n == 0 {
+        return false
+    }
+    rt.buf_clear(out)
+    util.buf_push_str(out, exe)
+    util.buf_push_str(out, ".new")
+    return true
+}
+
+fn plat_threads() -> bool {
+    return false
+}
+
+// Can this program start ITSELF as a worker process (`--appkit-worker`)?
+fn plat_worker_process() -> bool {
+    return true
+}
+
+fn plat_can_self_update() -> bool {
+    return true
+}
+
+fn plat_install_hint() -> str {
+    return "The program is in a folder you may not change (for example Program Files). Move it to a folder of your own, such as your Documents or AppData, to let it update itself."
+}

@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/async/conn_main.fi -- a thousand connections on one loop.
+//
+//   conn_main server [port]      echo server; prints "PORT <p>", runs until it
+//                                has been idle for 1.5 s after the last client left
+//   conn_main client <port> <n>  n connections to 127.0.0.1:port, ALL OPEN AT
+//                                THE SAME TIME (the messages go out only after
+//                                the n-th connect), each sends 64 octets and
+//                                checks the echo; prints "OK ..." or "FAIL ..."
+//   conn_main inproc <n> [poll]  both in one process and one loop (2n sockets);
+//                                "poll" forces the poll backend
+//
+// tools/async/run.sh runs all three, with an independent counterpart (a
+// Python asyncio server / client) for the first two.
+import std.rt
+import std.io
+import std.net
+import async.loop
+import async.stream
+
+fn say(tag: str, a: i64, b: i64, c: i64) {
+    var buf: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&buf, tag.p as u64, tag.n)
+    rt.buf_push(&buf, 32 as u8)
+    rt.buf_push_dec_i64(&buf, a)
+    rt.buf_push(&buf, 32 as u8)
+    rt.buf_push_dec_i64(&buf, b)
+    rt.buf_push(&buf, 32 as u8)
+    rt.buf_push_dec_i64(&buf, c)
+    rt.buf_push(&buf, 10 as u8)
+    rt.write_everything(1, buf.ptr, buf.len)
+    rt.buf_free(&buf)
+}
+
+fn num_arg(start: u64, i: usize) -> i64 {
+    if rt.arg_count(start) <= i { return 0 }
+    let p: u64 = rt.arg_ptr(start, i)
+    var v: i64 = 0
+    var k: usize = 0
+    while k < rt.c_length(p) {
+        v = v * 10 + (rt.ld8(p, k) - 48 as u8) as i64
+        k = k + 1
+    }
+    return v
+}
+
+fn is_word(start: u64, i: usize, w: str) -> bool {
+    if rt.arg_count(start) <= i { return false }
+    let p: u64 = rt.arg_ptr(start, i)
+    return rt.c_length(p) == w.n && rt.mem_eq(p, w.p as u64, w.n)
+}
+
+// ------------------------------------------------------------ the server
+
+static mut srv_live: i64 = 0
+static mut srv_max: i64 = 0
+static mut srv_total: i64 = 0
+static mut srv_idle_since: i64 = 0
+static mut srv_bytes: i64 = 0
+
+fn srv_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    if kind == stream.SE_DATA {
+        let n: usize = stream.stream_in_len(s)
+        srv_bytes = srv_bytes + n as i64
+        stream.stream_write(s, stream.stream_in_ptr(s), n)
+        stream.stream_consume(s, n)
+    } else if kind == stream.SE_CLOSED {
+        srv_live = srv_live - 1
+        srv_idle_since = loop.mono_ms()
+    }
+}
+
+fn on_conn(l: *mut loop.Loop, ud: u64, c: net.Conn) {
+    srv_live = srv_live + 1
+    srv_total = srv_total + 1
+    if srv_live > srv_max { srv_max = srv_live }
+    srv_idle_since = 0
+    stream.stream_adopt(l, c, 60000, srv_event, 0)
+}
+
+fn idle_check(l: *mut loop.Loop, ud: u64) {
+    if srv_total > 0 && srv_live == 0 && loop.mono_ms() - srv_idle_since > 1500 {
+        loop.stop(l)
+    }
+}
+
+// ------------------------------------------------------------ the clients
+
+static mut N: i64 = 0
+static mut cli_connected: i64 = 0
+static mut cli_peak: i64 = 0
+static mut cli_live: i64 = 0
+static mut cli_ok: i64 = 0
+static mut cli_bad: i64 = 0
+static mut cli_failed_connect: i64 = 0
+static mut streams: u64 = 0 // N stream pointers
+static mut cli_t0: i64 = 0
+static mut cli_t_all: i64 = 0
+
+fn pat(id: usize, i: usize) -> u8 {
+    return ((id * 11 + i) & 255) as u8
+}
+
+fn send_all_now() {
+    var id: usize = 0
+    while id < N as usize {
+        let s: *mut stream.Stream = rt.ld64(streams, id) as *mut stream.Stream
+        if s as u64 != 0 {
+            var msg: [u8; 64] = [0; 64]
+            var i: usize = 0
+            while i < 64 {
+                msg[i] = pat(id, i)
+                i = i + 1
+            }
+            stream.stream_write(s, (&msg[0]) as u64, 64)
+        }
+        id = id + 1
+    }
+}
+
+fn cli_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    let id: usize = ud as usize
+    if kind == stream.SE_CONNECTED {
+        cli_connected = cli_connected + 1
+        cli_live = cli_live + 1
+        if cli_live > cli_peak { cli_peak = cli_live }
+        if cli_connected == N {
+            cli_t_all = loop.mono_ms() - cli_t0
+            send_all_now() // the barrier: n connections are open NOW
+        }
+    } else if kind == stream.SE_DATA {
+        if stream.stream_in_len(s) >= 64 {
+            let p: u64 = stream.stream_in_ptr(s)
+            var good: bool = true
+            var i: usize = 0
+            while i < 64 {
+                if rt.ld8(p, i) != pat(id, i) { good = false }
+                i = i + 1
+            }
+            if good { cli_ok = cli_ok + 1 } else { cli_bad = cli_bad + 1 }
+            stream.stream_consume(s, 64)
+            // all echoes in: leave
+            if cli_ok + cli_bad == N {
+                close_all()
+            }
+        }
+    } else if kind == stream.SE_CLOSED {
+        if arg == stream.CL_CONNECT || arg == stream.CL_TIMEOUT {
+            cli_failed_connect = cli_failed_connect + 1
+        }
+        cli_live = cli_live - 1
+        rt.st64(streams, id, 0)
+    }
+}
+
+fn close_all() {
+    var id: usize = 0
+    while id < N as usize {
+        let s: *mut stream.Stream = rt.ld64(streams, id) as *mut stream.Stream
+        if s as u64 != 0 {
+            stream.stream_close(s)
+        }
+        id = id + 1
+    }
+}
+
+fn cli_check(l: *mut loop.Loop, ud: u64) {
+    if cli_ok + cli_bad == N && cli_live == 0 {
+        loop.stop(l)
+    }
+}
+
+fn give_up(l: *mut loop.Loop, ud: u64) {
+    loop.stop(l)
+}
+
+fn start_clients(l: *mut loop.Loop, port: u16) {
+    streams = rt.heap_alloc(N as usize * 8)
+    rt.mem_set(streams, 0 as u8, N as usize * 8)
+    cli_t0 = loop.mono_ms()
+    var id: usize = 0
+    while id < N as usize {
+        let s: *mut stream.Stream = stream.stream_open(l, net.ADDR_LOCAL, port, 30000, cli_event, id as u64)
+        rt.st64(streams, id, s as u64)
+        if s as u64 == 0 {
+            cli_failed_connect = cli_failed_connect + 1
+        }
+        id = id + 1
+    }
+    loop.timer_every(l, 20, cli_check, 0)
+    loop.timer_after(l, 60000, give_up, 0)
+}
+
+fn report_client(l: *mut loop.Loop) -> i32 {
+    let ms: i64 = loop.mono_ms() - cli_t0
+    if cli_ok == N && cli_bad == 0 && cli_peak == N && cli_failed_connect == 0 {
+        say("OK", N, cli_peak, ms)
+        say("RAMP_MS", cli_t_all, 0, 0)
+        return 0
+    }
+    say("FAIL", cli_ok, cli_peak, cli_failed_connect)
+    return 1
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var l: loop.Loop = loop.loop_new()
+    var force_poll: bool = false
+    if is_word(start, 1, "server") {
+        if !loop.loop_init(&l) { return 2 }
+        let acc: *mut stream.Acceptor = stream.acceptor_new(&l, net.ADDR_LOCAL, num_arg(start, 2) as u16, 4096, on_conn, 0)
+        if acc as u64 == 0 { return 3 }
+        say("PORT", stream.acceptor_port(acc) as i64, 0, 0)
+        loop.timer_every(&l, 100, idle_check, 0)
+        loop.timer_after(&l, 120000, give_up, 0)
+        loop.run(&l)
+        say("SERVED", srv_total, srv_max, srv_bytes)
+        return 0
+    }
+    if is_word(start, 1, "client") {
+        N = num_arg(start, 3)
+        if !loop.loop_init(&l) { return 2 }
+        start_clients(&l, num_arg(start, 2) as u16)
+        loop.run(&l)
+        return report_client(&l)
+    }
+    if is_word(start, 1, "inproc") {
+        N = num_arg(start, 2)
+        force_poll = is_word(start, 3, "poll")
+        var ok: bool = false
+        if force_poll { ok = loop.loop_init_poll(&l) } else { ok = loop.loop_init(&l) }
+        if !ok { return 2 }
+        let acc: *mut stream.Acceptor = stream.acceptor_new(&l, net.ADDR_LOCAL, 0 as u16, 4096, on_conn, 0)
+        if acc as u64 == 0 { return 3 }
+        start_clients(&l, stream.acceptor_port(acc))
+        loop.run(&l)
+        var nm: rt.Buf = rt.buf_new()
+        loop.backend_name(&l, &nm)
+        rt.write_everything(1, nm.ptr, nm.len)
+        rt.write_everything(1, " ".p as u64, 1)
+        rt.buf_free(&nm)
+        let rc: i32 = report_client(&l)
+        say("SERVED", srv_total, srv_max, srv_bytes)
+        return rc
+    }
+    return 4
+}

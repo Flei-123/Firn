@@ -1,0 +1,366 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/config.fi -- the program's settings in ONE small JSON file.
+//
+//     {
+//       "ui.dark": true,
+//       "update.auto": true,
+//       "update.channel": "stabil",
+//       "window.width": 1280
+//     }
+//
+// A flat object of string, integer and boolean values; the keys are
+// dotted names the program chooses. The file lives where the platform keeps
+// settings (appkit.platform: %APPDATA%\<vendor>\<app> on Windows,
+// ~/.config/<app> on Linux, ~/Library/Application Support/<app> on macOS,
+// the files directory on Android) and is human-editable.
+//
+//     var c: config.Config = config.config_new()
+//     config.config_load(&c)                       // missing file = empty
+//     let dark: bool = config.get_bool(&c, "ui.dark", true)
+//     config.set_str(&c, "update.channel", "beta")
+//     config.config_save(&c)                       // atomic: temp + rename
+//
+// LIMITS (deliberate, so a Config is a plain value without a heap): 64
+// entries, keys up to 47 octets, string values up to 191 octets. A file with
+// more or with nested values keeps what fits and ignores the rest; saving
+// writes only what the program knows -- a hand-added nested block is not
+// preserved, and the file says so in a comment key ("_note") that the
+// loader ignores.
+//
+// ATOMIC SAVE. The new text goes to `<file>.tmp`, is flushed, and renamed
+// over the old file: a crash leaves the old or the new file, never half of
+// one (std.fs.write_atomic).
+import std.rt
+import std.fs
+import std.json
+import std.str
+import appkit.util
+import appkit.platform
+
+export {
+    Config, config_new, config_path_set, config_load, config_save,
+    config_dir_for, get_str, get_int, get_bool, has, set_str, set_int,
+    set_bool, remove_key, config_dirty, config_count, config_key_at,
+    CONFIG_MAX,
+}
+
+const CONFIG_MAX: usize = 64
+const KEY_MAX: usize = 47
+const VAL_MAX: usize = 191
+
+const K_NONE: u8 = 0
+const K_STR: u8 = 1
+const K_INT: u8 = 2
+const K_BOOL: u8 = 3
+
+struct Config {
+    n: usize,
+    kind: [u8; 64],
+    klen: [u8; 64],
+    vlen: [u8; 64],
+    keys: [u8; 3072],
+    vals: [u8; 12288],
+    ints: [i64; 64],
+    path: [u8; 512],
+    npath: usize,
+    dirty: bool,
+}
+
+fn config_new() -> Config {
+    return Config { n: 0, kind: [0; 64], klen: [0; 64], vlen: [0; 64],
+        keys: [0; 3072], vals: [0; 12288], ints: [0; 64], path: [0; 512],
+        npath: 0, dirty: false }
+}
+
+fn config_dirty(c: *mut Config) -> bool {
+    return (*c).dirty
+}
+
+fn config_count(c: *mut Config) -> usize {
+    return (*c).n
+}
+
+// the key of entry i (a view into the Config)
+fn config_key_at(c: *mut Config, i: usize) -> str {
+    if i >= (*c).n {
+        return ""
+    }
+    return str { p: (&(*c).keys[i * 48]) as *mut u8, n: (*c).klen[i] as usize }
+}
+
+fn find(c: *mut Config, key: str) -> i64 {
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).klen[i] as usize == key.n &&
+            rt.mem_eq((&(*c).keys[i * 48]) as u64, key.p as u64, key.n) {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn has(c: *mut Config, key: str) -> bool {
+    return find(c, key) >= 0
+}
+
+fn slot_for(c: *mut Config, key: str) -> i64 {
+    if key.n == 0 || key.n > KEY_MAX {
+        return -1
+    }
+    let at: i64 = find(c, key)
+    if at >= 0 {
+        return at
+    }
+    if (*c).n >= CONFIG_MAX {
+        return -1
+    }
+    let i: usize = (*c).n
+    rt.mem_copy((&(*c).keys[i * 48]) as u64, key.p as u64, key.n)
+    (*c).klen[i] = key.n as u8
+    (*c).kind[i] = K_NONE
+    (*c).n = i + 1
+    return i as i64
+}
+
+fn set_str(c: *mut Config, key: str, v: str) -> bool {
+    if v.n > VAL_MAX {
+        return false
+    }
+    let i: i64 = slot_for(c, key)
+    if i < 0 {
+        return false
+    }
+    let u: usize = i as usize
+    rt.mem_copy((&(*c).vals[u * 192]) as u64, v.p as u64, v.n)
+    (*c).vlen[u] = v.n as u8
+    (*c).kind[u] = K_STR
+    (*c).dirty = true
+    return true
+}
+
+fn set_int(c: *mut Config, key: str, v: i64) -> bool {
+    let i: i64 = slot_for(c, key)
+    if i < 0 {
+        return false
+    }
+    (*c).ints[i as usize] = v
+    (*c).kind[i as usize] = K_INT
+    (*c).dirty = true
+    return true
+}
+
+fn set_bool(c: *mut Config, key: str, v: bool) -> bool {
+    let i: i64 = slot_for(c, key)
+    if i < 0 {
+        return false
+    }
+    var n: i64 = 0
+    if v {
+        n = 1
+    }
+    (*c).ints[i as usize] = n
+    (*c).kind[i as usize] = K_BOOL
+    (*c).dirty = true
+    return true
+}
+
+fn remove_key(c: *mut Config, key: str) -> bool {
+    let i: i64 = find(c, key)
+    if i < 0 {
+        return false
+    }
+    var k: usize = i as usize
+    while k + 1 < (*c).n {
+        rt.mem_copy((&(*c).keys[k * 48]) as u64, (&(*c).keys[(k + 1) * 48]) as u64, 48)
+        rt.mem_copy((&(*c).vals[k * 192]) as u64, (&(*c).vals[(k + 1) * 192]) as u64, 192)
+        (*c).klen[k] = (*c).klen[k + 1]
+        (*c).vlen[k] = (*c).vlen[k + 1]
+        (*c).kind[k] = (*c).kind[k + 1]
+        (*c).ints[k] = (*c).ints[k + 1]
+        k = k + 1
+    }
+    (*c).n = (*c).n - 1
+    (*c).dirty = true
+    return true
+}
+
+// The string value of `key` copied into `out` (cleared first); false and
+// `dflt` when the key is missing or not a string.
+fn get_str(c: *mut Config, key: str, dflt: str, out: *mut rt.Buf) -> bool {
+    rt.buf_clear(out)
+    let i: i64 = find(c, key)
+    if i >= 0 && (*c).kind[i as usize] == K_STR {
+        let u: usize = i as usize
+        rt.buf_push_bytes(out, (&(*c).vals[u * 192]) as u64, (*c).vlen[u] as usize)
+        return true
+    }
+    rt.buf_push_bytes(out, dflt.p as u64, dflt.n)
+    return false
+}
+
+fn get_int(c: *mut Config, key: str, dflt: i64) -> i64 {
+    let i: i64 = find(c, key)
+    if i >= 0 && ((*c).kind[i as usize] == K_INT || (*c).kind[i as usize] == K_BOOL) {
+        return (*c).ints[i as usize]
+    }
+    return dflt
+}
+
+fn get_bool(c: *mut Config, key: str, dflt: bool) -> bool {
+    let i: i64 = find(c, key)
+    if i >= 0 && ((*c).kind[i as usize] == K_BOOL || (*c).kind[i as usize] == K_INT) {
+        return (*c).ints[i as usize] != 0
+    }
+    return dflt
+}
+
+// ------------------------------------------------------------- the file
+
+// Where the settings of (app, vendor) live: <config dir>/config.json
+fn config_dir_for(app: str, vendor: str, out: *mut rt.Buf) -> bool {
+    return platform.plat_dir(platform.DIR_CONFIG, app, vendor, out)
+}
+
+fn config_path_set(c: *mut Config, path: str) -> bool {
+    if path.n == 0 || path.n > 511 {
+        return false
+    }
+    rt.mem_copy((&(*c).path[0]) as u64, path.p as u64, path.n)
+    (*c).npath = path.n
+    return true
+}
+
+fn path_of(c: *mut Config) -> str {
+    return str { p: (&(*c).path[0]) as *mut u8, n: (*c).npath }
+}
+
+// Reads the file named by config_path_set. A missing file is an empty
+// config and `true`; a file that is not valid JSON is `false` and the config
+// stays empty (the caller decides whether to tell the user; the next save
+// replaces it).
+fn config_load(c: *mut Config) -> bool {
+    (*c).n = 0
+    (*c).dirty = false
+    if (*c).npath == 0 {
+        return false
+    }
+    var raw: rt.Buf = rt.buf_new()
+    let r: usize = fs.read_file(path_of(c), &raw) catch 4294967295
+    if r == 4294967295 {
+        rt.buf_free(&raw)
+        // not there: fine. Anything else (a directory?) is an error.
+        return !fs.exists(path_of(c))
+    }
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, rt.buf_ptr(&raw), rt.buf_len(&raw)) catch false
+    rt.buf_free(&raw)
+    if !ok {
+        json.json_free(&d)
+        return false
+    }
+    let root: u32 = json.json_root(&d)
+    if root == json.JSON_NONE || json.json_kind(&d, root) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return false
+    }
+    var ch: u32 = json.json_child(&d, root)
+    while ch != json.JSON_NONE {
+        let k: str.Span = json.json_key(&d, ch)
+        let kind: u8 = json.json_kind(&d, ch)
+        let key: str = str { p: k.p, n: k.n }
+        // keys that start with an underscore are comments ("_note")
+        if k.n > 0 && k.n <= KEY_MAX && rt.ld8(k.p as u64, 0) != 95 as u8 {
+            if kind == json.JSON_STRING {
+                let v: str.Span = json.json_string(&d, ch)
+                set_str(c, key, str { p: v.p, n: v.n })
+            } else if kind == json.JSON_NUMBER && json.json_is_int(&d, ch) {
+                set_int(c, key, json.json_int(&d, ch))
+            } else if kind == json.JSON_TRUE {
+                set_bool(c, key, true)
+            } else if kind == json.JSON_FALSE {
+                set_bool(c, key, false)
+            }
+        }
+        ch = json.json_next(&d, ch)
+    }
+    json.json_free(&d)
+    (*c).dirty = false
+    return true
+}
+
+// "text" with the JSON escapes
+fn push_json_str(out: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push(out, 34 as u8)
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        if ch == 34 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 34 as u8)
+        } else if ch == 92 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 92 as u8)
+        } else if ch == 10 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 110 as u8)
+        } else if ch == 13 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 114 as u8)
+        } else if ch == 9 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 116 as u8)
+        } else if ch < 32 as u8 {
+            util.buf_push_str(out, "\\u00")
+            rt.buf_push(out, util.hex_digit(ch >> 4 as u8))
+            rt.buf_push(out, util.hex_digit(ch & 15 as u8))
+        } else {
+            rt.buf_push(out, ch)
+        }
+        i = i + 1
+    }
+    rt.buf_push(out, 34 as u8)
+}
+
+// Writes the file (creating its directory). Atomic.
+fn config_save(c: *mut Config) -> bool {
+    if (*c).npath == 0 {
+        return false
+    }
+    var b: rt.Buf = rt.buf_new()
+    util.buf_push_str(&b, "{\n")
+    var i: usize = 0
+    while i < (*c).n {
+        util.buf_push_str(&b, "  ")
+        push_json_str(&b, (&(*c).keys[i * 48]) as u64, (*c).klen[i] as usize)
+        util.buf_push_str(&b, ": ")
+        let kd: u8 = (*c).kind[i]
+        if kd == K_STR {
+            push_json_str(&b, (&(*c).vals[i * 192]) as u64, (*c).vlen[i] as usize)
+        } else if kd == K_BOOL {
+            if (*c).ints[i] != 0 {
+                util.buf_push_str(&b, "true")
+            } else {
+                util.buf_push_str(&b, "false")
+            }
+        } else {
+            rt.buf_push_dec_i64(&b, (*c).ints[i])
+        }
+        if i + 1 < (*c).n {
+            rt.buf_push(&b, 44 as u8)
+        }
+        rt.buf_push(&b, 10 as u8)
+        i = i + 1
+    }
+    util.buf_push_str(&b, "}\n")
+    let dir: str = fs.path_parent(path_of(c))
+    if dir.n > 0 {
+        let made: bool = fs.mkdir_all(dir) catch false
+    }
+    let ok: bool = fs.write_atomic(path_of(c), rt.buf_ptr(&b), rt.buf_len(&b)) catch false
+    rt.buf_free(&b)
+    if ok {
+        (*c).dirty = false
+    }
+    return ok
+}

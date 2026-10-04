@@ -1,0 +1,958 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/fetch.fi -- ONE HTTP(S) GET, streamed, hashed, cancellable.
+//
+// WHY THIS IS NOT lib/net/http.fi. net.http reads the whole body into
+// memory (32 MiB limit), has no progress and no cancel, and refuses https.
+// An updater needs the opposite: a 10 MB executable goes to a FILE while it
+// arrives, its SHA-256 is computed on the way, the caller sees progress and
+// can stop it, and the catalog (a few hundred KiB) goes to memory. And it
+// must speak TLS, because store.fleitec.com is https only. So this file is
+// the small client the updater needs, built from the same parts the
+// library already has: lib/net/url.fi (URL), lib/std/net.fi (TCP),
+// lib/tls (TLS 1.3, certificate chain), lib/std/crypto/sha256.fi.
+//
+// WHAT IT DOES
+//   * GET only. HTTP/1.1, `Connection: close`, no keep-alive, no cache, no
+//     cookies -- one request, one connection.
+//   * http:// and https://. TLS verifies the chain against PEM roots: the
+//     caller's; else the system's (lib/tls/trust.fi: the PEM bundle on
+//     Linux, the Windows certificate store through the Windows twin) AND
+//     always the roots embedded in lib/appkit/roots.pem (the Let's Encrypt
+//     chain of store.fleitec.com), so an image without a bundle still works.
+//     `verify_tls = false` switches the check off (a local test server);
+//     it does NOT change what the updater trusts: the catalog is signed
+//     with Ed25519 and every file is checked against its SHA-256 from the
+//     signed catalog, TLS is the second line, not the first.
+//   * Redirects 301/302/303/307/308, at most 5, https -> http refused.
+//   * `Content-Length` and `Transfer-Encoding: chunked`, or read to the end
+//     of the connection. A body shorter than announced is an error
+//     (FE_SHORT), never a silently truncated file.
+//   * The body goes to memory (`body`) or to an open file (`sink_fd`),
+//     optionally through SHA-256 (`want_hash`), with a progress call every
+//     64 KiB / 100 ms and a cancel flag (the ADDRESS of a u64 the caller
+//     sets to non-zero from another thread) checked between reads.
+//
+// WHAT IT DOES NOT: resume (Range), HTTP/2, compression (it asks for
+// `identity`), proxies, IPv6. Names are resolved by a hook the caller can
+// replace (`resolve`): the default (`resolve_system`) knows dotted IPv4,
+// "localhost", and everything else through lib/net/dns.fi (the hosts file,
+// resolv.conf / the Windows adapters, UDP with a TCP fallback, a small cache).
+//
+// TIMEOUTS. `timeout_ms` bounds every connect and every read; `deadline_ms`
+// bounds the whole call (0 = none). Under TLS a read timeout ends the call
+// (lib/tls closes the session on a failed read); on a plain socket a read
+// that timed out is retried until the deadline or the cancel flag.
+import std.rt
+import std.net
+import std.time
+import std.crypto.sha256
+import tls.tls
+import tls.x509
+import net.url
+import net.dns
+import tls.trust
+
+export {
+    Fetch, fetch_new, fetch_free, fetch_set_url, fetch_set_resolver,
+    fetch_run, fetch_get_mem, fetch_err_text, fetch_header_find, resolve_basic,
+    resolve_system,
+    FE_OK, FE_URL, FE_SCHEME, FE_RESOLVE, FE_CONNECT, FE_TLS, FE_SEND,
+    FE_RECV, FE_HEADER, FE_STATUS, FE_REDIRECT, FE_TOOLARGE, FE_SHORT,
+    FE_CANCELLED, FE_TIMEOUT, FE_SINK, FE_BODY, FE_MEMORY,
+}
+
+const FE_OK: u32 = 0
+const FE_URL: u32 = 1
+const FE_SCHEME: u32 = 2
+const FE_RESOLVE: u32 = 3
+const FE_CONNECT: u32 = 4
+const FE_TLS: u32 = 5
+const FE_SEND: u32 = 6
+const FE_RECV: u32 = 7
+const FE_HEADER: u32 = 8
+const FE_STATUS: u32 = 9
+const FE_REDIRECT: u32 = 10
+const FE_TOOLARGE: u32 = 11
+const FE_SHORT: u32 = 12
+const FE_CANCELLED: u32 = 13
+const FE_TIMEOUT: u32 = 14
+const FE_SINK: u32 = 15
+const FE_BODY: u32 = 16
+const FE_MEMORY: u32 = 17
+
+const HEAD_MAX: usize = 16384
+const MAX_HOPS: u32 = 5
+const CHUNK: usize = 16384
+const RETRY_AGAIN: i64 = -11
+
+const ROOTS_EMBEDDED: str = __include_str("roots.pem")
+
+struct Fetch {
+    // ---- the request, set by the caller
+    url: [u8; 1024],
+    nurl: usize,
+    timeout_ms: u64,
+    deadline_ms: u64,
+    max_body: u64,
+    verify_tls: bool,
+    roots: rt.Buf,
+    sink_fd: i64,
+    want_hash: bool,
+    cancel: u64,
+    progress: fn(u64, u64, u64),
+    progress_ud: u64,
+    resolve: fn(u64, usize, *mut u32) -> bool,
+    user_agent: [u8; 64],
+    nagent: usize,
+    // ---- the answer
+    status: u32,
+    total: u64,
+    got: u64,
+    body: rt.Buf,
+    sha: sha256.Sha256,
+    digest: [u8; 32],
+    tls_reason: u32,
+    final_url: [u8; 1024],
+    nfinal: usize,
+    // ---- inside
+    loc: [u8; 1024],
+    nloc: usize,
+    t0: u64,
+    last_report: u64,
+    last_reported_bytes: u64,
+    hdr: rt.Buf,
+}
+
+fn progress_none(ud: u64, done: u64, total: u64) {
+}
+
+// The default resolver: a dotted IPv4 address or "localhost".
+fn resolve_basic(host: u64, n: usize, out: *mut u32) -> bool {
+    var lh: [u8; 9] = "localhost"
+    if url.ci_equal(host, n, (&lh[0]) as u64, 9) {
+        *out = net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8)
+        return true
+    }
+    if !url.host_is_ip4(host, n) {
+        return false
+    }
+    var parts: [u32; 4] = [0; 4]
+    var k: usize = 0
+    var v: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(host, i)
+        if ch == 46 as u8 {
+            if k >= 3 {
+                return false
+            }
+            parts[k] = v
+            k = k + 1
+            v = 0
+        } else {
+            v = v * 10 as u32 + (ch - 48 as u8) as u32
+            if v > 255 as u32 {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    if k != 3 {
+        return false
+    }
+    parts[3] = v
+    *out = net.ipv4(parts[0] as u8, parts[1] as u8, parts[2] as u8,
+        parts[3] as u8)
+    return true
+}
+
+// `size_of[T]()` written inside a module cannot name the module's own types;
+// through a generic wrapper it can. (Generic function names are program-wide,
+// so each appkit module has its own.)
+fn fetch_size_of[T: Any]() -> usize {
+    return size_of[T]()
+}
+
+static mut G_RESOLVER: u64 = 0
+
+// The default resolver: the numeric and local cases of `resolve_basic`, then
+// the system's way (lib/net/dns.fi). One resolver per process, made on the
+// first name.
+fn resolve_system(host: u64, n: usize, out: *mut u32) -> bool {
+    if resolve_basic(host, n, out) {
+        return true
+    }
+    if G_RESOLVER == 0 as u64 {
+        let sz: usize = fetch_size_of[dns.Resolver]()
+        G_RESOLVER = rt.heap_alloc(sz)
+        if G_RESOLVER == 0 as u64 {
+            return false
+        }
+        *(G_RESOLVER as *mut dns.Resolver) = dns.resolver_new()
+        if !dns.resolver_init(G_RESOLVER as *mut dns.Resolver) {
+            return false
+        }
+    }
+    let a: u32 = dns.dns_lookup_a(G_RESOLVER as *mut dns.Resolver, host, n) catch 0 as u32
+    if a == 0 as u32 {
+        return false
+    }
+    *out = a
+    return true
+}
+
+fn fetch_new() -> Fetch {
+    return Fetch {
+        url: [0; 1024], nurl: 0, timeout_ms: 15000, deadline_ms: 0,
+        max_body: 0, verify_tls: true, roots: rt.buf_new(), sink_fd: -1,
+        want_hash: false, cancel: 0, progress: progress_none,
+        progress_ud: 0, resolve: resolve_system, user_agent: [0; 64],
+        nagent: 0, status: 0, total: 0, got: 0, body: rt.buf_new(),
+        sha: sha256.sha256_new(), digest: [0; 32], tls_reason: 0,
+        final_url: [0; 1024], nfinal: 0, loc: [0; 1024], nloc: 0, t0: 0,
+        last_report: 0, last_reported_bytes: 0, hdr: rt.buf_new(),
+    }
+}
+
+fn fetch_free(f: *mut Fetch) {
+    rt.buf_free(&(*f).roots)
+    rt.buf_free(&(*f).body)
+    rt.buf_free(&(*f).hdr)
+}
+
+fn fetch_set_url(f: *mut Fetch, u: str) -> bool {
+    if u.n == 0 || u.n > 1023 {
+        return false
+    }
+    var i: usize = 0
+    while i < u.n {
+        (*f).url[i] = rt.ld8(u.p as u64, i)
+        i = i + 1
+    }
+    (*f).nurl = u.n
+    return true
+}
+
+fn fetch_set_resolver(f: *mut Fetch, r: fn(u64, usize, *mut u32) -> bool) {
+    (*f).resolve = r
+}
+
+fn fetch_err_text(e: u32) -> str {
+    if e == FE_OK { return "ok" }
+    if e == FE_URL { return "the address cannot be read" }
+    if e == FE_SCHEME { return "only http and https are supported" }
+    if e == FE_RESOLVE { return "the host name cannot be resolved" }
+    if e == FE_CONNECT { return "cannot connect" }
+    if e == FE_TLS { return "the TLS connection failed" }
+    if e == FE_SEND { return "sending the request failed" }
+    if e == FE_RECV { return "receiving failed" }
+    if e == FE_HEADER { return "the answer is not HTTP" }
+    if e == FE_STATUS { return "the server answered with an error status" }
+    if e == FE_REDIRECT { return "too many or forbidden redirects" }
+    if e == FE_TOOLARGE { return "the answer is larger than allowed" }
+    if e == FE_SHORT { return "the answer ended before all data arrived" }
+    if e == FE_CANCELLED { return "cancelled" }
+    if e == FE_TIMEOUT { return "timed out" }
+    if e == FE_SINK { return "cannot write the downloaded data" }
+    if e == FE_BODY { return "the answer body is malformed" }
+    return "out of memory"
+}
+
+// ---------------------------------------------------------------- time
+
+fn now_ms() -> u64 {
+    return time.monotonic_ns() / 1000000 as u64
+}
+
+fn cancelled(f: *mut Fetch) -> bool {
+    if (*f).cancel == 0 as u64 {
+        return false
+    }
+    return rt.ld64((*f).cancel, 0) != 0 as u64
+}
+
+fn past_deadline(f: *mut Fetch) -> bool {
+    if (*f).deadline_ms == 0 as u64 {
+        return false
+    }
+    return now_ms() - (*f).t0 > (*f).deadline_ms
+}
+
+// --------------------------------------------------------- the channel
+
+struct Chan {
+    conn: net.Conn,
+    t: tls.Tls,
+    store: x509.Store,
+    secure: bool,
+    open: bool,
+    inb: rt.Buf,
+    pos: usize,
+}
+
+fn chan_new() -> Chan {
+    return Chan { conn: net.conn_from_fd(0 - 1), t: tls.tls_new(),
+        store: x509.store_new(), secure: false, open: false,
+        inb: rt.buf_new(), pos: 0 }
+}
+
+fn chan_close(c: *mut Chan) {
+    if (*c).secure {
+        tls.tls_close(&(*c).t)
+        tls.tls_free(&(*c).t)
+        (*c).secure = false
+    }
+    if net.conn_is_open(&(*c).conn) {
+        net.close(&(*c).conn)
+    }
+    x509.store_free(&(*c).store)
+    rt.buf_free(&(*c).inb)
+    (*c).open = false
+}
+
+fn chan_write(c: *mut Chan, p: u64, n: usize) -> bool {
+    if (*c).secure {
+        let ok: bool = tls.tls_write(&(*c).t, p, n) catch false
+        return ok
+    }
+    let k: usize = net.write_all(&(*c).conn, p, n) catch 0
+    return k == n
+}
+
+// More octets into `inb`. Returns the count (> 0), 0 at the end of the
+// stream, a negative number on an error (-1) or when cancelled/timed out
+// (-2 / -3).
+fn chan_fill(c: *mut Chan, f: *mut Fetch) -> i64 {
+    if (*c).pos > 0 && (*c).pos == (*c).inb.len {
+        rt.buf_clear(&(*c).inb)
+        (*c).pos = 0
+    }
+    let have: usize = (*c).inb.len
+    rt.buf_reserve(&(*c).inb, have + CHUNK)
+    if (*c).inb.cap < have + CHUNK {
+        return -1
+    }
+    while true {
+        if cancelled(f) {
+            return -2
+        }
+        if past_deadline(f) {
+            return -3
+        }
+        if (*c).secure {
+            var err: bool = false
+            let k: usize = tls.tls_read(&(*c).t, (*c).inb.ptr + have as u64, CHUNK) catch 4294967295
+            if k == 4294967295 {
+                return -1
+            }
+            if k == 0 {
+                return 0
+            }
+            rt.buf_set_len(&(*c).inb, have + k)
+            return k as i64
+        }
+        let k: usize = net.read(&(*c).conn, (*c).inb.ptr + have as u64, CHUNK) catch 4294967295
+        if k == 4294967295 {
+            if net.conn_error(&(*c).conn) as i64 == RETRY_AGAIN {
+                continue
+            }
+            return -1
+        }
+        if k == 0 {
+            return 0
+        }
+        rt.buf_set_len(&(*c).inb, have + k)
+        return k as i64
+    }
+    return -1
+}
+
+fn avail(c: *mut Chan) -> usize {
+    return (*c).inb.len - (*c).pos
+}
+
+// -------------------------------------------------------------- TLS roots
+
+fn load_roots(f: *mut Fetch, s: *mut x509.Store) {
+    var taken: usize = 0
+    if rt.buf_len(&(*f).roots) > 0 {
+        taken = x509.store_load_pem(s, rt.buf_ptr(&(*f).roots),
+            rt.buf_len(&(*f).roots))
+        if taken > 0 {
+            return
+        }
+    }
+    // the system's roots (a PEM bundle on Linux, the certificate store on Windows)
+    trust.trust_load_system(s)
+    // ... and ALWAYS the embedded chain on top: a store whose chain the
+    // system bundle lacks (an old image) must still be reachable.
+    x509.store_load_pem(s, ROOTS_EMBEDDED.p as u64, ROOTS_EMBEDDED.n)
+}
+
+// ----------------------------------------------------------- the request
+
+fn push_lit(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn build_request(f: *mut Fetch, u: *mut url.Url, out: *mut rt.Buf) {
+    push_lit(out, "GET ")
+    rt.buf_push_bytes(out, url.url_path_ptr(u), url.url_path_len(u))
+    push_lit(out, " HTTP/1.1\r\nHost: ")
+    rt.buf_push_bytes(out, url.url_host_ptr(u), url.url_host_len(u))
+    if url.url_port(u) != url.url_default_port(u) {
+        rt.buf_push(out, 58 as u8)
+        rt.buf_push_dec_u64(out, url.url_port(u) as u64)
+    }
+    push_lit(out, "\r\nUser-Agent: ")
+    if (*f).nagent > 0 {
+        rt.buf_push_bytes(out, (&(*f).user_agent[0]) as u64, (*f).nagent)
+    } else {
+        push_lit(out, "firn-appkit/1")
+    }
+    push_lit(out, "\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n")
+}
+
+// ---------------------------------------------------------------- headers
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+// The value of header `name` (lower case, without the colon) in the header
+// block `h`[0, n): its offset and length. The first line (status) is
+// skipped.
+fn fetch_header_find(h: u64, n: usize, name: str, off: *mut usize,
+    len: *mut usize) -> bool {
+    var i: usize = 0
+    // skip the status line
+    while i < n && rt.ld8(h, i) != 10 as u8 {
+        i = i + 1
+    }
+    i = i + 1
+    while i < n {
+        var e: usize = i
+        while e < n && rt.ld8(h, e) != 10 as u8 {
+            e = e + 1
+        }
+        // line [i, e) (may end in \r)
+        var le: usize = e
+        if le > i && rt.ld8(h, le - 1) == 13 as u8 {
+            le = le - 1
+        }
+        if le > i + name.n && rt.ld8(h, i + name.n) == 58 as u8 {
+            var same: bool = true
+            var k: usize = 0
+            while k < name.n {
+                if lower(rt.ld8(h, i + k)) != rt.ld8(name.p as u64, k) {
+                    same = false
+                    break
+                }
+                k = k + 1
+            }
+            if same {
+                var vs: usize = i + name.n + 1
+                while vs < le && (rt.ld8(h, vs) == 32 as u8 || rt.ld8(h, vs) == 9 as u8) {
+                    vs = vs + 1
+                }
+                // trailing white space is not part of the value
+                var ve: usize = le
+                while ve > vs && (rt.ld8(h, ve - 1) == 32 as u8 || rt.ld8(h, ve - 1) == 9 as u8) {
+                    ve = ve - 1
+                }
+                *off = vs
+                *len = ve - vs
+                return true
+            }
+        }
+        i = e + 1
+    }
+    return false
+}
+
+fn parse_u64(p: u64, n: usize, out: *mut u64) -> bool {
+    if n == 0 || n > 18 {
+        return false
+    }
+    var v: u64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return false
+        }
+        v = v * 10 as u64 + (c - 48 as u8) as u64
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+fn ci_has(p: u64, n: usize, word: str) -> bool {
+    if n < word.n {
+        return false
+    }
+    var at: usize = 0
+    while at + word.n <= n {
+        var same: bool = true
+        var k: usize = 0
+        while k < word.n {
+            if lower(rt.ld8(p, at + k)) != rt.ld8(word.p as u64, k) {
+                same = false
+                break
+            }
+            k = k + 1
+        }
+        if same {
+            return true
+        }
+        at = at + 1
+    }
+    return false
+}
+
+// ------------------------------------------------------------------ sink
+
+fn report(f: *mut Fetch, force: bool) {
+    let now: u64 = now_ms()
+    if force || (*f).got - (*f).last_reported_bytes >= 65536 as u64 ||
+        now - (*f).last_report >= 100 as u64 {
+        (*f).last_report = now
+        (*f).last_reported_bytes = (*f).got
+        (*f).progress((*f).progress_ud, (*f).got, (*f).total)
+    }
+}
+
+// One piece of the body into the sink. false = the call must end;
+// `fail` receives why.
+fn sink_write(f: *mut Fetch, p: u64, n: usize, fail: *mut u32) -> bool {
+    if n == 0 {
+        return true
+    }
+    if (*f).max_body != 0 as u64 && (*f).got + n as u64 > (*f).max_body {
+        *fail = FE_TOOLARGE
+        return false
+    }
+    if (*f).sink_fd >= 0 {
+        var done: usize = 0
+        while done < n {
+            let w: i64 = syscall(1, (*f).sink_fd, (p + done as u64) as i64, (n - done) as i64, 0, 0, 0)
+            if w <= 0 {
+                if w == -4 {
+                    continue
+                }
+                *fail = FE_SINK
+                return false
+            }
+            done = done + w as usize
+        }
+    } else {
+        rt.buf_push_bytes(&(*f).body, p, n)
+        if rt.buf_len(&(*f).body) < (*f).got as usize + n {
+            *fail = FE_MEMORY
+            return false
+        }
+    }
+    if (*f).want_hash {
+        sha256.sha256_update(&(*f).sha, p, n)
+    }
+    (*f).got = (*f).got + n as u64
+    report(f, false)
+    return true
+}
+
+// ------------------------------------------------------------------ body
+
+// States of the chunked decoder.
+const CK_SIZE: u32 = 0
+const CK_DATA: u32 = 1
+const CK_CR: u32 = 2
+const CK_TRAILER: u32 = 3
+const CK_DONE: u32 = 4
+
+fn hexv(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 { return (c - 48 as u8) as i32 }
+    if c >= 97 as u8 && c <= 102 as u8 { return (c - 87 as u8) as i32 }
+    if c >= 65 as u8 && c <= 70 as u8 { return (c - 55 as u8) as i32 }
+    return -1
+}
+
+fn read_body(f: *mut Fetch, c: *mut Chan, chunked: bool, clen: u64,
+    have_len: bool) -> u32 {
+    var fail: u32 = FE_OK
+    if !chunked {
+        var left: u64 = clen
+        while true {
+            let a: usize = avail(c)
+            if a > 0 {
+                var take: usize = a
+                if have_len && take as u64 > left {
+                    take = left as usize
+                }
+                if !sink_write(f, (*c).inb.ptr + (*c).pos as u64, take, &fail) {
+                    return fail
+                }
+                (*c).pos = (*c).pos + take
+                if have_len {
+                    left = left - take as u64
+                    if left == 0 as u64 {
+                        return FE_OK
+                    }
+                }
+                continue
+            }
+            let k: i64 = chan_fill(c, f)
+            if k == -2 { return FE_CANCELLED }
+            if k == -3 { return FE_TIMEOUT }
+            if k < 0 { return FE_RECV }
+            if k == 0 {
+                if have_len {
+                    return FE_SHORT
+                }
+                return FE_OK
+            }
+        }
+    }
+    // chunked: "<hex>[;ext]\r\n<data>\r\n" ... "0\r\n<trailer>\r\n\r\n"
+    var st: u32 = CK_SIZE
+    var csize: u64 = 0
+    var digits: u32 = 0
+    var ext: bool = false
+    var line_len: usize = 0
+    while st != CK_DONE {
+        if avail(c) == 0 {
+            let k: i64 = chan_fill(c, f)
+            if k == -2 { return FE_CANCELLED }
+            if k == -3 { return FE_TIMEOUT }
+            if k < 0 { return FE_RECV }
+            if k == 0 { return FE_SHORT }
+            continue
+        }
+        if st == CK_DATA {
+            var take: usize = avail(c)
+            if take as u64 > csize {
+                take = csize as usize
+            }
+            if !sink_write(f, (*c).inb.ptr + (*c).pos as u64, take, &fail) {
+                return fail
+            }
+            (*c).pos = (*c).pos + take
+            csize = csize - take as u64
+            if csize == 0 as u64 {
+                st = CK_CR
+            }
+            continue
+        }
+        let ch: u8 = rt.ld8((*c).inb.ptr, (*c).pos)
+        (*c).pos = (*c).pos + 1
+        if st == CK_SIZE {
+            if ch == 10 as u8 {
+                if digits == 0 as u32 {
+                    return FE_BODY
+                }
+                digits = 0
+                ext = false
+                if csize == 0 as u64 {
+                    st = CK_TRAILER
+                    line_len = 0
+                } else {
+                    st = CK_DATA
+                }
+                continue
+            }
+            if ext {
+                continue
+            }
+            let hv: i32 = hexv(ch)
+            if hv < 0 {
+                // ';' or '\r': the rest of the line is ignored
+                ext = true
+                continue
+            }
+            if digits >= 15 as u32 {
+                return FE_BODY
+            }
+            csize = csize * 16 as u64 + hv as u64
+            digits = digits + 1
+            continue
+        }
+        if st == CK_CR {
+            // the CRLF after the data of a chunk
+            if ch == 10 as u8 {
+                st = CK_SIZE
+                csize = 0
+                digits = 0
+                ext = false
+            } else if ch != 13 as u8 {
+                return FE_BODY
+            }
+            continue
+        }
+        // CK_TRAILER: lines until an empty one
+        if ch == 10 as u8 {
+            if line_len == 0 {
+                st = CK_DONE
+            }
+            line_len = 0
+        } else if ch != 13 as u8 {
+            line_len = line_len + 1
+        }
+    }
+    return FE_OK
+}
+
+// ------------------------------------------------------------- one request
+
+const OUT_DONE: u32 = 0
+const OUT_REDIRECT: u32 = 1
+
+// One request to `u`. FE_OK with `redirect` set means: follow
+// `(*f).loc`.
+fn fetch_once(f: *mut Fetch, u: *mut url.Url, redirect: *mut bool) -> u32 {
+    *redirect = false
+    var https: bool = false
+    if url.url_is_https(u) {
+        https = true
+    } else if !url.url_is_http(u) {
+        return FE_SCHEME
+    }
+    var addr: u32 = 0
+    if !(*f).resolve(url.url_host_ptr(u), url.url_host_len(u), &addr) {
+        return FE_RESOLVE
+    }
+    var c: Chan = chan_new()
+    var conn_err: bool = false
+    let cn: net.Conn = net.connect_tcp_timeout(addr, url.url_port(u), (*f).timeout_ms) catch | e | net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&cn) {
+        chan_close(&c)
+        return FE_CONNECT
+    }
+    c.conn = cn
+    c.open = true
+    let st: bool = net.set_timeout(&c.conn, (*f).timeout_ms) catch false
+    let nd: bool = net.set_no_delay(&c.conn, true) catch false
+    if https {
+        if (*f).verify_tls {
+            load_roots(f, &c.store)
+        }
+        let now_s: u64 = time.now_unix_ms() as u64 / 1000 as u64
+        if !tls.tls_init(&c.t, &c.conn, &c.store, url.url_host_ptr(u),
+            url.url_host_len(u), now_s) {
+            chan_close(&c)
+            return FE_TLS
+        }
+        c.secure = true
+        let hs: bool = tls.tls_handshake(&c.t) catch false
+        (*f).tls_reason = tls.tls_verify_reason(&c.t)
+        if !hs {
+            chan_close(&c)
+            return FE_TLS
+        }
+        if (*f).verify_tls && (*f).tls_reason != x509.V_OK {
+            chan_close(&c)
+            return FE_TLS
+        }
+    }
+    var req: rt.Buf = rt.buf_new()
+    build_request(f, u, &req)
+    let sent: bool = chan_write(&c, rt.buf_ptr(&req), rt.buf_len(&req))
+    rt.buf_free(&req)
+    if !sent {
+        chan_close(&c)
+        return FE_SEND
+    }
+    // ---- the header block
+    var head_end: usize = 0
+    var scanned: usize = 0
+    while true {
+        let have: usize = avail(&c)
+        var i: usize = c.pos + scanned
+        var found: bool = false
+        while i + 4 <= c.pos + have {
+            if rt.ld8(c.inb.ptr, i) == 13 as u8 && rt.ld8(c.inb.ptr, i + 1) == 10 as u8 &&
+                rt.ld8(c.inb.ptr, i + 2) == 13 as u8 && rt.ld8(c.inb.ptr, i + 3) == 10 as u8 {
+                head_end = i + 4
+                found = true
+                break
+            }
+            i = i + 1
+        }
+        if found {
+            break
+        }
+        if have > 3 {
+            scanned = have - 3
+        }
+        if have > HEAD_MAX {
+            chan_close(&c)
+            return FE_HEADER
+        }
+        let k: i64 = chan_fill(&c, f)
+        if k == -2 { chan_close(&c); return FE_CANCELLED }
+        if k == -3 { chan_close(&c); return FE_TIMEOUT }
+        if k < 0 { chan_close(&c); return FE_RECV }
+        if k == 0 { chan_close(&c); return FE_HEADER }
+    }
+    let hp: u64 = c.inb.ptr + c.pos as u64
+    let hn: usize = head_end - c.pos
+    // "HTTP/1.x NNN"
+    if hn < 12 || rt.ld8(hp, 0) != 72 as u8 || rt.ld8(hp, 1) != 84 as u8 ||
+        rt.ld8(hp, 2) != 84 as u8 || rt.ld8(hp, 3) != 80 as u8 || rt.ld8(hp, 4) != 47 as u8 {
+        chan_close(&c)
+        return FE_HEADER
+    }
+    var code: u32 = 0
+    var di: usize = 9
+    while di < 12 {
+        let ch: u8 = rt.ld8(hp, di)
+        if ch < 48 as u8 || ch > 57 as u8 {
+            chan_close(&c)
+            return FE_HEADER
+        }
+        code = code * 10 as u32 + (ch - 48 as u8) as u32
+        di = di + 1
+    }
+    (*f).status = code
+    // keep the header block for the caller (fetch_header_find)
+    rt.buf_clear(&(*f).hdr)
+    rt.buf_push_bytes(&(*f).hdr, hp, hn)
+    var off: usize = 0
+    var len: usize = 0
+    if code == 301 as u32 || code == 302 as u32 || code == 303 as u32 ||
+        code == 307 as u32 || code == 308 as u32 {
+        if !fetch_header_find(hp, hn, "location", &off, &len) || len == 0 || len > 1023 {
+            chan_close(&c)
+            return FE_REDIRECT
+        }
+        var i: usize = 0
+        while i < len {
+            (*f).loc[i] = rt.ld8(hp, off + i)
+            i = i + 1
+        }
+        (*f).nloc = len
+        *redirect = true
+        chan_close(&c)
+        return FE_OK
+    }
+    if code != 200 as u32 {
+        chan_close(&c)
+        return FE_STATUS
+    }
+    var chunked: bool = false
+    if fetch_header_find(hp, hn, "transfer-encoding", &off, &len) {
+        if ci_has(hp + off as u64, len, "chunked") {
+            chunked = true
+        }
+    }
+    var clen: u64 = 0
+    var have_len: bool = false
+    if !chunked && fetch_header_find(hp, hn, "content-length", &off, &len) {
+        if !parse_u64(hp + off as u64, len, &clen) {
+            chan_close(&c)
+            return FE_HEADER
+        }
+        have_len = true
+    }
+    if have_len {
+        (*f).total = clen
+        if (*f).max_body != 0 as u64 && clen > (*f).max_body {
+            chan_close(&c)
+            return FE_TOOLARGE
+        }
+    }
+    c.pos = head_end
+    let r: u32 = read_body(f, &c, chunked, clen, have_len)
+    chan_close(&c)
+    if r != FE_OK {
+        return r
+    }
+    report(f, true)
+    return FE_OK
+}
+
+// The whole call: follows redirects. FE_OK means the final answer was a 200
+// and the body went to the sink; FE_STATUS leaves the status in `f.status`.
+fn fetch_run(f: *mut Fetch) -> u32 {
+    (*f).t0 = now_ms()
+    (*f).last_report = 0
+    (*f).last_reported_bytes = 0
+    (*f).got = 0
+    (*f).total = 0
+    (*f).status = 0
+    rt.buf_clear(&(*f).body)
+    if (*f).want_hash {
+        (*f).sha = sha256.sha256_new()
+    }
+    var cur: url.Url = url.url_new()
+    if !url.url_parse((&(*f).url[0]) as u64, (*f).nurl, &cur) {
+        return FE_URL
+    }
+    var hops: u32 = 0
+    while true {
+        var redirect: bool = false
+        let r: u32 = fetch_once(f, &cur, &redirect)
+        if r != FE_OK {
+            return r
+        }
+        if !redirect {
+            // remember where we ended up
+            var b: rt.Buf = rt.buf_new()
+            url.url_write(&cur, &b)
+            var n: usize = rt.buf_len(&b)
+            if n > 1023 {
+                n = 1023
+            }
+            var i: usize = 0
+            while i < n {
+                (*f).final_url[i] = rt.ld8(rt.buf_ptr(&b), i)
+                i = i + 1
+            }
+            (*f).nfinal = n
+            rt.buf_free(&b)
+            if (*f).want_hash {
+                sha256.sha256_final(&(*f).sha, (&(*f).digest[0]) as u64)
+            }
+            return FE_OK
+        }
+        hops = hops + 1
+        if hops > MAX_HOPS {
+            return FE_REDIRECT
+        }
+        var next: url.Url = url.url_new()
+        if !url.url_parse_rel(&cur, (&(*f).loc[0]) as u64, (*f).nloc, &next) {
+            return FE_REDIRECT
+        }
+        // never from https down to http
+        if url.url_is_https(&cur) && !url.url_is_https(&next) {
+            return FE_REDIRECT
+        }
+        cur = next
+    }
+    return FE_URL
+}
+
+// Convenience: GET `u` into memory (`out` is cleared first). `max` bounds
+// the body. Returns FE_OK or the failure; on FE_STATUS the HTTP status is
+// in `status`.
+fn fetch_get_mem(u: str, max: u64, timeout_ms: u64, verify_tls: bool,
+    out: *mut rt.Buf, status: *mut u32) -> u32 {
+    var f: Fetch = fetch_new()
+    if !fetch_set_url(&f, u) {
+        fetch_free(&f)
+        return FE_URL
+    }
+    f.max_body = max
+    f.timeout_ms = timeout_ms
+    f.verify_tls = verify_tls
+    let r: u32 = fetch_run(&f)
+    *status = f.status
+    rt.buf_clear(out)
+    if r == FE_OK {
+        rt.buf_push_bytes(out, rt.buf_ptr(&f.body), rt.buf_len(&f.body))
+    }
+    fetch_free(&f)
+    return r
+}

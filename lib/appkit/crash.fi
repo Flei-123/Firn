@@ -1,0 +1,340 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/crash.fi -- a CRASH REPORT in a file, written by the NEXT start.
+//
+//     crash.crash_begin()            // early in main (after appkit boot)
+//     ...
+//     crash.crash_end()              // at a clean exit
+//
+//     // somewhere in the UI, after start:
+//     if crash.crash_pending(&path) { ... "the program ended unexpectedly
+//                                       last time; the report is at <path>" }
+//
+// WHY LIKE THIS. Firn has no portable way to run code while the process is
+// dying (a segmentation fault, a panic, a kill, a power cut). So the report
+// is made by the NEXT start from what the dead one left:
+//
+//   * a RUN MARKER, `<state>/run.marker`, written at start and held under an
+//     exclusive lock for as long as the process lives (the same lock the
+//     single instance uses -- the kernel drops it when the process ends);
+//     it is emptied by `crash_end`. A marker that is not empty and not
+//     locked belongs to a process that did not exit cleanly.
+//   * the tail of the log file (appkit.log), the last words of the dead run.
+//   * on POSIX, the standard error stream of the run, which `crash_begin`
+//     redirects into `<state>/stderr.txt`: a Firn panic prints its message
+//     there ("panic: index out of range ..."), so the report says WHY.
+//
+// The report is a text file `<state>/crash/crash-<unix time>.txt`; the five
+// newest are kept. Nothing is ever sent anywhere: the program decides what
+// to do with the path (show it, offer to send it, ignore it).
+//
+// A program that catches its own fatal error calls `crash_report(text)`
+// directly.
+import std.rt
+import std.fs
+import std.dir
+import std.time
+import appkit.util
+import appkit.appinfo
+import appkit.platform
+import appkit.log
+
+export {
+    crash_begin, crash_end, crash_report, crash_pending, crash_clear,
+    crash_release_for_test, CRASH_KEEP,
+}
+
+const CRASH_KEEP: usize = 5
+const TAIL_BYTES: usize = 6144
+
+static mut G_HANDLE: i64 = -1
+static mut G_SEQ: u64 = 0
+static mut G_DIR: [u8; 512] = [0; 512]
+static mut G_NDIR: usize = 0
+
+fn state_dir() -> str {
+    return str { p: (&G_DIR[0]) as *mut u8, n: G_NDIR }
+}
+
+fn file_in(name: str, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    util.buf_push_str(out, state_dir())
+    rt.buf_push(out, 47 as u8)
+    util.buf_push_str(out, name)
+}
+
+fn nonempty_file(path: str, out: *mut rt.Buf) -> bool {
+    let n: usize = fs.read_file(path, out) catch 0
+    return n > 0
+}
+
+fn line(b: *mut rt.Buf, key: str, val: str) {
+    util.buf_push_str(b, key)
+    util.buf_push_str(b, ": ")
+    util.buf_push_str(b, val)
+    rt.buf_push(b, 10 as u8)
+}
+
+fn when_text(b: *mut rt.Buf, ms: i64) {
+    let t: time.DateTime = time.civil_from_unix(ms)
+    util.push_dec_pad(b, t.year as u64, 4)
+    rt.buf_push(b, 45 as u8)
+    util.push_dec_pad(b, t.month as u64, 2)
+    rt.buf_push(b, 45 as u8)
+    util.push_dec_pad(b, t.day as u64, 2)
+    rt.buf_push(b, 84 as u8)
+    util.push_dec_pad(b, t.hour as u64, 2)
+    rt.buf_push(b, 58 as u8)
+    util.push_dec_pad(b, t.minute as u64, 2)
+    rt.buf_push(b, 58 as u8)
+    util.push_dec_pad(b, t.second as u64, 2)
+    rt.buf_push(b, 90 as u8)
+}
+
+// the names "crash-<12 digits>.txt" (22 octets) found in `d`, one after the
+// other with a zero octet behind each (stride 23); returns how many
+const NAME_LEN: usize = 22
+const STRIDE: usize = 23
+
+fn list_reports(d: str, out: *mut rt.Buf) -> usize {
+    rt.buf_clear(out)
+    var dd: dir.Dir = dir.open(d)
+    if !dir.is_open(&dd) {
+        return 0
+    }
+    var n: usize = 0
+    while dir.next(&dd) {
+        if dd.name.n == NAME_LEN && util.starts_with(dd.name, "crash-") {
+            rt.buf_push_bytes(out, dd.name.p as u64, NAME_LEN)
+            rt.buf_push(out, 0 as u8)
+            n = n + 1
+        }
+    }
+    dir.close(&dd)
+    return n
+}
+
+// the index of the lexicographically smallest (oldest) / largest name
+fn pick(list: *mut rt.Buf, n: usize, newest: bool) -> usize {
+    var best: usize = 0
+    var i: usize = 1
+    while i < n {
+        let a: u64 = rt.buf_ptr(list) + (i * STRIDE) as u64
+        let b: u64 = rt.buf_ptr(list) + (best * STRIDE) as u64
+        var k: usize = 0
+        var cmp: i32 = 0
+        while k < NAME_LEN && cmp == 0 {
+            let x: u8 = rt.ld8(a, k)
+            let y: u8 = rt.ld8(b, k)
+            if x < y { cmp = -1 }
+            if x > y { cmp = 1 }
+            k = k + 1
+        }
+        if (newest && cmp > 0) || (!newest && cmp < 0) {
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// keep the newest CRASH_KEEP reports, delete the rest
+fn prune(d: str) {
+    var list: rt.Buf = rt.buf_new()
+    var n: usize = list_reports(d, &list)
+    while n > CRASH_KEEP {
+        let at: usize = pick(&list, n, false)
+        let victim: str = str { p: (rt.buf_ptr(&list) + (at * STRIDE) as u64) as *mut u8, n: NAME_LEN }
+        fs.remove(d + "/" + __str_copy(victim)) catch false
+        // move the last entry into the hole
+        if at != n - 1 {
+            rt.mem_copy(rt.buf_ptr(&list) + (at * STRIDE) as u64,
+                rt.buf_ptr(&list) + ((n - 1) * STRIDE) as u64, STRIDE)
+        }
+        n = n - 1
+    }
+    rt.buf_free(&list)
+}
+
+// Writes a report now. `why` is free text (the caller's description or the
+// stderr tail). Returns the path.
+fn write_report(why: str, prev_marker: str) -> bool {
+    var dp: rt.Buf = rt.buf_new()
+    util.buf_push_str(&dp, state_dir())
+    util.buf_push_str(&dp, "/crash")
+    let d: str = util.buf_to_str_copy(&dp)
+    rt.buf_free(&dp)
+    let made: bool = fs.mkdir_all(d) catch false
+    let now: i64 = time.now_unix_ms()
+    var name: rt.Buf = rt.buf_new()
+    util.buf_push_str(&name, d)
+    util.buf_push_str(&name, "/crash-")
+    // seconds * 100 + a counter: two reports in one second keep apart
+    G_SEQ = G_SEQ + 1
+    util.push_dec_pad(&name, (now / 1000) as u64 * 100 as u64 + G_SEQ % 100 as u64, 12)
+    util.buf_push_str(&name, ".txt")
+    var b: rt.Buf = rt.buf_new()
+    util.buf_push_str(&b, "CRASH REPORT\n")
+    line(&b, "program", appinfo.app_name())
+    line(&b, "version", appinfo.app_version())
+    line(&b, "platform", platform.plat_id())
+    var w: rt.Buf = rt.buf_new()
+    when_text(&w, now)
+    line(&b, "reported", util.buf_to_str_copy(&w))
+    rt.buf_free(&w)
+    if prev_marker.n > 0 {
+        util.buf_push_str(&b, "previous run: ")
+        util.buf_push_str(&b, prev_marker)
+        rt.buf_push(&b, 10 as u8)
+    }
+    util.buf_push_str(&b, "\n--- what the program said last ---\n")
+    util.buf_push_str(&b, why)
+    util.buf_push_str(&b, "\n\n--- the end of the log ---\n")
+    log.log_tail(TAIL_BYTES, &b)
+    let n: usize = fs.write_file(util.buf_to_str_copy(&name), rt.buf_ptr(&b), rt.buf_len(&b)) catch 0
+    let ok: bool = n == rt.buf_len(&b)
+    rt.buf_free(&b)
+    rt.buf_free(&name)
+    prune(d)
+    return ok
+}
+
+// A caught fatal error: write the report now.
+fn crash_report(text: str) -> bool {
+    if G_NDIR == 0 {
+        return false
+    }
+    log.log_error("crash", text)
+    return write_report(text, "")
+}
+
+// Call once, early. Judges the PREVIOUS run (writes its report if it died),
+// then marks this run. Returns true when a report was written for the
+// previous run.
+fn crash_begin() -> bool {
+    var sd: rt.Buf = rt.buf_new()
+    if !platform.plat_dir(platform.DIR_STATE, appinfo.app_id(), appinfo.app_vendor(), &sd) ||
+        rt.buf_len(&sd) > 480 {
+        rt.buf_free(&sd)
+        return false
+    }
+    rt.mem_copy((&G_DIR[0]) as u64, rt.buf_ptr(&sd), rt.buf_len(&sd))
+    G_NDIR = rt.buf_len(&sd)
+    rt.buf_free(&sd)
+    let made: bool = fs.mkdir_all(state_dir()) catch false
+    var mp: rt.Buf = rt.buf_new()
+    file_in("run.marker", &mp)
+    let marker: str = util.buf_to_str_copy(&mp)
+    rt.buf_free(&mp)
+    // what the last run left
+    var prev: rt.Buf = rt.buf_new()
+    let had: bool = nonempty_file(marker, &prev)
+    var wrote: bool = false
+    let h: i64 = platform.plat_lock(marker)
+    if h == -1 {
+        // another live copy holds the marker: it is not ours to judge
+        rt.buf_free(&prev)
+        return false
+    }
+    if h >= 0 {
+        G_HANDLE = h
+    }
+    if had {
+        // the previous run did not end cleanly
+        var err: rt.Buf = rt.buf_new()
+        var ep: rt.Buf = rt.buf_new()
+        file_in("stderr.txt", &ep)
+        let es: str = util.buf_to_str_copy(&ep)
+        rt.buf_free(&ep)
+        var why: str = "(nothing on standard error)"
+        if nonempty_file(es, &err) {
+            var from: usize = 0
+            if rt.buf_len(&err) > 4096 {
+                from = rt.buf_len(&err) - 4096
+            }
+            why = __str_copy(str { p: (rt.buf_data(&err) + from as u64) as *mut u8, n: rt.buf_len(&err) - from })
+        }
+        rt.buf_free(&err)
+        wrote = write_report(why, util.buf_to_str_copy(&prev))
+        log.log_warn("crash", "the previous run did not end cleanly; report written")
+    }
+    rt.buf_free(&prev)
+    // this run: version and start time in the marker (the lock stays)
+    var info: rt.Buf = rt.buf_new()
+    util.buf_push_str(&info, appinfo.app_version())
+    util.buf_push_str(&info, " started ")
+    when_text(&info, time.now_unix_ms())
+    util.buf_push_str(&info, " pid ")
+    rt.buf_push_dec_u64(&info, platform.plat_self_pid() as u64)
+    rt.buf_push(&info, 10 as u8)
+    // the lock file already holds the pid; the marker text is a second file
+    var mi: rt.Buf = rt.buf_new()
+    file_in("run.info", &mi)
+    fs.write_file(util.buf_to_str_copy(&mi), rt.buf_ptr(&info), rt.buf_len(&info)) catch 0
+    rt.buf_free(&mi)
+    rt.buf_free(&info)
+    return wrote
+}
+
+// A clean exit: empty the info and release the marker.
+fn crash_end() {
+    if G_NDIR == 0 {
+        return
+    }
+    var mi: rt.Buf = rt.buf_new()
+    file_in("run.info", &mi)
+    fs.remove(util.buf_to_str_copy(&mi)) catch false
+    rt.buf_free(&mi)
+    var mp: rt.Buf = rt.buf_new()
+    file_in("run.marker", &mp)
+    if G_HANDLE >= 0 {
+        platform.plat_unlock(G_HANDLE)
+        G_HANDLE = -1
+    }
+    // a lock file with a pid in it would look like a dead run: empty it
+    fs.write_file(util.buf_to_str_copy(&mp), "".p as u64, 0) catch 0
+    rt.buf_free(&mp)
+}
+
+// The newest report that has not been cleared: its path in `out`.
+fn crash_pending(out: *mut rt.Buf) -> bool {
+    if G_NDIR == 0 {
+        return false
+    }
+    var dp: rt.Buf = rt.buf_new()
+    util.buf_push_str(&dp, state_dir())
+    util.buf_push_str(&dp, "/crash")
+    let d: str = util.buf_to_str_copy(&dp)
+    rt.buf_free(&dp)
+    var list: rt.Buf = rt.buf_new()
+    let n: usize = list_reports(d, &list)
+    if n == 0 {
+        rt.buf_free(&list)
+        return false
+    }
+    let at: usize = pick(&list, n, true)
+    rt.buf_clear(out)
+    util.buf_push_str(out, d)
+    rt.buf_push(out, 47 as u8)
+    rt.buf_push_bytes(out, rt.buf_ptr(&list) + (at * STRIDE) as u64, NAME_LEN)
+    rt.buf_free(&list)
+    return true
+}
+
+// forget the reports (the user saw or sent them)
+fn crash_clear() {
+    var p: rt.Buf = rt.buf_new()
+    while crash_pending(&p) {
+        fs.remove(util.buf_to_str_copy(&p)) catch false
+    }
+    rt.buf_free(&p)
+}
+
+// FOR TESTS: let go of the run marker's lock WITHOUT saying the run ended
+// cleanly -- what the death of the process does. (One process cannot die and
+// then start again, so a test stands in for it.)
+fn crash_release_for_test() {
+    if G_HANDLE >= 0 {
+        platform.plat_unlock(G_HANDLE)
+        G_HANDLE = -1
+    }
+}

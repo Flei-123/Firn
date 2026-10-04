@@ -1,0 +1,642 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/catalog.fi -- the signed store catalog: verify, parse, choose.
+//
+// THE FORMAT is the one store.fleitec.com serves (orientstore/docs/
+// KATALOG-FORMAT.md, format 1): `entry.json` (a small, often re-signed
+// document: revision, timestamp, expiry, and the SHA-256 of the catalog)
+// and `index.json` (the catalog: packages, builds, channels). Both are
+// signed with Ed25519 (RFC 8032) over their exact octets, the signature is
+// 64 raw octets in `<name>.sig`, the public key is 32 octets and is
+// COMPILED INTO the application (lib/appkit/appinfo.fi) -- the file
+// `oeffentlich.key` on the server is only a convenience.
+//
+// THE ORDER OF CHECKS is the whole security (KATALOG-FORMAT.md section 7):
+//   1. the entry's Ed25519 signature -- nothing in it is believed before
+//   2. its timestamp is not older than the last one seen (rollback)
+//   3. `laeuft_ab` lies in the future (freeze: a mirror that just stops
+//      serving fresh files cannot hold a security update back forever)
+//   4. its revision is not lower than the last one seen
+//   5. the catalog's SHA-256 equals the one in the entry, its size too
+//   6. only then the catalog is parsed
+// A server without an entry (`entry.json` -> 404) is the OLD way: the
+// catalog is verified directly with `index.json.sig`. That fallback is
+// allowed only while this device never saw an entry (the caller keeps that
+// flag) -- otherwise deleting the file would switch the freeze protection
+// off.
+//
+// WHAT THIS FILE DOES NOT DO: the network (appkit/fetch.fi), the files and
+// the state (appkit/update.fi). Everything here is a function of bytes.
+import std.rt
+import std.json
+import std.str
+import std.time
+import std.crypto.sha256
+import std.crypto.ed25519
+import appkit.version
+
+export {
+    Entry, Build, entry_new, build_new,
+    verify_signature, sha256_hex, hex_decode32,
+    entry_parse, entry_check, catalog_check,
+    catalog_select, catalog_build_by_sha, build_url_ok,
+    catalog_format, catalog_revision,
+    decide,
+    EC_OK, EC_BAD_SIGNATURE, EC_PARSE, EC_FORMAT, EC_ROLLBACK, EC_EXPIRED,
+    EC_REVISION, EC_HASH, EC_SIZE, EC_MISMATCH, EC_CLOCK,
+    SEL_OK, SEL_NO_PACKAGE, SEL_NO_CHANNEL, SEL_NO_BUILD, SEL_PLATFORM,
+    SEL_INCOMPLETE, SEL_ART,
+    D_UPTODATE, D_UPDATE, D_ROLLBACK, D_BROKEN, D_BELOW_FLOOR,
+    BUILD_PKG_MAX, BUILD_FILE_MAX, BUILD_NOTES_MAX,
+}
+
+// ---- results of the checks on entry and catalog
+const EC_OK: u32 = 0
+const EC_BAD_SIGNATURE: u32 = 1
+const EC_PARSE: u32 = 2
+const EC_FORMAT: u32 = 3 // a format number this client does not know
+const EC_ROLLBACK: u32 = 4 // older than something seen before
+const EC_EXPIRED: u32 = 5 // `laeuft_ab` has passed
+const EC_REVISION: u32 = 6
+const EC_HASH: u32 = 7
+const EC_SIZE: u32 = 8
+const EC_MISMATCH: u32 = 9 // entry and catalog disagree about the revision
+const EC_CLOCK: u32 = 10
+
+// ---- results of choosing a build
+const SEL_OK: u32 = 0
+const SEL_NO_PACKAGE: u32 = 1
+const SEL_NO_CHANNEL: u32 = 2
+const SEL_NO_BUILD: u32 = 3
+const SEL_PLATFORM: u32 = 4
+const SEL_INCOMPLETE: u32 = 5
+const SEL_ART: u32 = 6
+
+// ---- decisions
+const D_UPTODATE: u32 = 0
+const D_UPDATE: u32 = 1
+const D_ROLLBACK: u32 = 2 // the publisher moved the channel back
+const D_BROKEN: u32 = 3 // the catalog's version text is not a version
+const D_BELOW_FLOOR: u32 = 4 // the offered build is older than the floor
+
+const BUILD_PKG_MAX: usize = 96
+const BUILD_FILE_MAX: usize = 400
+const BUILD_NOTES_MAX: usize = 1536
+
+struct Entry {
+    ok: bool,
+    eingang: i64,
+    revision: i64,
+    ts: [u8; 32],
+    nts: usize,
+    expires: [u8; 32],
+    nexpires: usize,
+    cat_url: [u8; 256],
+    ncat_url: usize,
+    cat_sha: [u8; 64],
+    ncat_sha: usize,
+    cat_size: u64,
+}
+
+fn entry_new() -> Entry {
+    return Entry { ok: false, eingang: 0, revision: 0, ts: [0; 32], nts: 0,
+        expires: [0; 32], nexpires: 0, cat_url: [0; 256], ncat_url: 0,
+        cat_sha: [0; 64], ncat_sha: 0, cat_size: 0 }
+}
+
+// The one build an update would install.
+struct Build {
+    found: bool,
+    pkg: [u8; 96],
+    npkg: usize,
+    art: [u8; 24],
+    nart: usize,
+    build_id: i64,
+    version: [u8; 64],
+    nversion: usize,
+    version_code: i64,
+    file: [u8; 400],
+    nfile: usize,
+    sha256: [u8; 64],
+    size: u64,
+    notes: [u8; 1536],
+    nnotes: usize,
+    created: [u8; 32],
+    ncreated: usize,
+    floor: [u8; 64],
+    nfloor: usize,
+    channel: [u8; 32],
+    nchannel: usize,
+}
+
+fn build_new() -> Build {
+    return Build { found: false, pkg: [0; 96], npkg: 0, art: [0; 24], nart: 0,
+        build_id: 0, version: [0; 64], nversion: 0, version_code: 0,
+        file: [0; 400], nfile: 0, sha256: [0; 64], size: 0,
+        notes: [0; 1536], nnotes: 0, created: [0; 32], ncreated: 0,
+        floor: [0; 64], nfloor: 0, channel: [0; 32], nchannel: 0 }
+}
+
+// ------------------------------------------------------------ primitives
+
+// Ed25519 over `msg`[0, n) with the 32 octet key `pubkey` and the 64 octet
+// signature `sig`. false = do not use it.
+fn verify_signature(pubkey: u64, msg: u64, n: usize, sig: u64,
+    nsig: usize) -> bool {
+    if nsig != 64 {
+        return false
+    }
+    var c: ed25519.Ctx = ed25519.ctx_new()
+    if !ed25519.ctx_init(&c) {
+        return false
+    }
+    return ed25519.ed25519_verify(&c, pubkey, msg, n, sig)
+}
+
+// 64 lower case hex digits of SHA-256(p[0, n)).
+fn sha256_hex(p: u64, n: usize, out: u64) {
+    var d: [u8; 32] = [0; 32]
+    sha256.sha256(p, n, (&d[0]) as u64)
+    var digits: [u8; _] = "0123456789abcdef"
+    var i: usize = 0
+    while i < 32 {
+        rt.st8(out, i * 2, digits[(d[i] >> 4 as u8) as usize])
+        rt.st8(out, i * 2 + 1, digits[(d[i] & 15 as u8) as usize])
+        i = i + 1
+    }
+}
+
+fn nib(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 { return (c - 48 as u8) as i32 }
+    if c >= 97 as u8 && c <= 102 as u8 { return (c - 87 as u8) as i32 }
+    if c >= 65 as u8 && c <= 70 as u8 { return (c - 55 as u8) as i32 }
+    return -1
+}
+
+// 64 hex digits -> 32 octets. false = not exactly that.
+fn hex_decode32(s: str, out: u64) -> bool {
+    if s.n != 64 {
+        return false
+    }
+    var i: usize = 0
+    while i < 32 {
+        let hi: i32 = nib(rt.ld8(s.p as u64, i * 2))
+        let lo: i32 = nib(rt.ld8(s.p as u64, i * 2 + 1))
+        if hi < 0 || lo < 0 {
+            return false
+        }
+        rt.st8(out, i, ((hi << 4) | lo) as u8)
+        i = i + 1
+    }
+    return true
+}
+
+fn span_copy(dst: u64, cap: usize, s: str.Span, outn: *mut usize) -> bool {
+    if s.n > cap {
+        return false
+    }
+    rt.mem_copy(dst, s.p as u64, s.n)
+    *outn = s.n
+    return true
+}
+
+fn jget(d: *mut json.Json, obj: u32, key: str) -> u32 {
+    if obj == json.JSON_NONE {
+        return json.JSON_NONE
+    }
+    return json.json_get(d, obj, key.p as u64, key.n)
+}
+
+// the string at obj.key, or an empty span
+fn jstr(d: *mut json.Json, obj: u32, key: str) -> str.Span {
+    let n: u32 = jget(d, obj, key)
+    if n == json.JSON_NONE || json.json_kind(d, n) != json.JSON_STRING {
+        return str.Span { p: 0 as *mut u8, n: 0 }
+    }
+    return json.json_string(d, n)
+}
+
+fn jint(d: *mut json.Json, obj: u32, key: str, dflt: i64) -> i64 {
+    let n: u32 = jget(d, obj, key)
+    if n == json.JSON_NONE || json.json_kind(d, n) != json.JSON_NUMBER {
+        return dflt
+    }
+    return json.json_int(d, n)
+}
+
+fn span_eq_str(s: str.Span, t: str) -> bool {
+    if s.n != t.n {
+        return false
+    }
+    return rt.mem_eq(s.p as u64, t.p as u64, s.n)
+}
+
+// ------------------------------------------------------------------ entry
+
+// Reads entry.json. Does NOT judge it (see entry_check).
+fn entry_parse(p: u64, n: usize, e: *mut Entry) -> bool {
+    *e = entry_new()
+    var d: json.Json = json.json_new()
+    let okp: bool = json.json_parse(&d, p, n) catch false
+    if !okp {
+        json.json_free(&d)
+        return false
+    }
+    let root: u32 = json.json_root(&d)
+    if root == json.JSON_NONE || json.json_kind(&d, root) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return false
+    }
+    (*e).eingang = jint(&d, root, "eingang", 0)
+    (*e).revision = jint(&d, root, "revision", -1)
+    let cat: u32 = jget(&d, root, "katalog")
+    var good: bool = cat != json.JSON_NONE
+    if good {
+        good = span_copy((&(*e).cat_url[0]) as u64, 256, jstr(&d, cat, "url"), &(*e).ncat_url)
+    }
+    if good {
+        good = span_copy((&(*e).cat_sha[0]) as u64, 64, jstr(&d, cat, "sha256"), &(*e).ncat_sha)
+    }
+    if good {
+        (*e).cat_size = jint(&d, cat, "groesse", 0) as u64
+    }
+    if good {
+        good = span_copy((&(*e).ts[0]) as u64, 32, jstr(&d, root, "zeitstempel"), &(*e).nts)
+    }
+    if good {
+        good = span_copy((&(*e).expires[0]) as u64, 32, jstr(&d, root, "laeuft_ab"), &(*e).nexpires)
+    }
+    json.json_free(&d)
+    if !good || (*e).ncat_sha != 64 || (*e).ncat_url == 0 || (*e).revision < 0 ||
+        (*e).nts == 0 || (*e).nexpires == 0 {
+        return false
+    }
+    (*e).ok = true
+    return true
+}
+
+fn unix_of(p: u64, n: usize, out: *mut i64) -> bool {
+    let t: time.DateTime = time.parse_iso8601(str { p: p as *mut u8, n: n }) catch | e | time.DateTime { year: 0, month: 0 as u32, day: 0 as u32, hour: 0 as u32, minute: 0 as u32, second: 0 as u32, ms: 0 as u32, offset_min: 0 as i32 }
+    if t.year == 0 {
+        return false
+    }
+    *out = time.unix_from_civil(t) / 1000
+    return true
+}
+
+// The policy: format number, rollback, freeze, revision. `now` is unix
+// seconds; `last_rev` / `last_ts` are what this device saw before (-1 /
+// empty = nothing yet). Returns EC_OK or the first rule broken.
+fn entry_check(e: *mut Entry, now: i64, last_rev: i64, last_ts: str) -> u32 {
+    if !(*e).ok || (*e).eingang != 1 {
+        return EC_FORMAT
+    }
+    var exp: i64 = 0
+    if !unix_of((&(*e).expires[0]) as u64, (*e).nexpires, &exp) {
+        return EC_PARSE
+    }
+    var ts: i64 = 0
+    if !unix_of((&(*e).ts[0]) as u64, (*e).nts, &ts) {
+        return EC_PARSE
+    }
+    // an older timestamp than the one seen: somebody serves an old copy
+    if last_ts.n > 0 {
+        var last: i64 = 0
+        if unix_of(last_ts.p as u64, last_ts.n, &last) && ts < last {
+            return EC_ROLLBACK
+        }
+    }
+    if last_rev >= 0 && (*e).revision < last_rev {
+        return EC_REVISION
+    }
+    // A clock before the entry was made cannot be right either; that is
+    // not a reason to refuse (a device with a dead battery clock still has
+    // to be able to update), only the expiry is judged against it -- and
+    // only when the clock is plausible (after the entry's own timestamp).
+    if now >= ts && now > exp {
+        return EC_EXPIRED
+    }
+    return EC_OK
+}
+
+// The catalog bytes against the entry: hash, size, and (once parsed by the
+// caller) the revision. EC_OK when hash and size agree.
+fn catalog_check(e: *mut Entry, p: u64, n: usize) -> u32 {
+    if (*e).cat_size != 0 as u64 && (*e).cat_size != n as u64 {
+        return EC_SIZE
+    }
+    var hex: [u8; 64] = [0; 64]
+    sha256_hex(p, n, (&hex[0]) as u64)
+    if !rt.mem_eq((&hex[0]) as u64, (&(*e).cat_sha[0]) as u64, 64) {
+        return EC_HASH
+    }
+    return EC_OK
+}
+
+// the catalog's own format number and revision
+fn catalog_format(d: *mut json.Json) -> i64 {
+    return jint(d, json.json_root(d), "katalog", 0 - 1)
+}
+
+fn catalog_revision(d: *mut json.Json) -> i64 {
+    return jint(d, json.json_root(d), "revision", 0 - 1)
+}
+
+// ---------------------------------------------------------------- choosing
+
+// A file path from the catalog must stay inside the store: relative, no
+// "..", no scheme, no backslash, not empty.
+fn build_url_ok(p: u64, n: usize) -> bool {
+    if n == 0 || n > 399 {
+        return false
+    }
+    if rt.ld8(p, 0) == 47 as u8 {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 92 as u8 || c == 58 as u8 || c < 32 as u8 {
+            return false
+        }
+        if c == 46 as u8 && i + 1 < n && rt.ld8(p, i + 1) == 46 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn is_hex64(p: u64, n: usize) -> bool {
+    if n != 64 {
+        return false
+    }
+    var i: usize = 0
+    while i < 64 {
+        let c: u8 = rt.ld8(p, i)
+        let ok: bool = (c >= 48 as u8 && c <= 57 as u8) || (c >= 97 as u8 && c <= 102 as u8)
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// does the array at `arr` contain the string `want`?
+fn array_has(d: *mut json.Json, arr: u32, want: str) -> bool {
+    if arr == json.JSON_NONE || json.json_kind(d, arr) != json.JSON_ARRAY {
+        return false
+    }
+    var c: u32 = json.json_child(d, arr)
+    while c != json.JSON_NONE {
+        if json.json_kind(d, c) == json.JSON_STRING &&
+            span_eq_str(json.json_string(d, c), want) {
+            return true
+        }
+        c = json.json_next(d, c)
+    }
+    return false
+}
+
+fn array_len(d: *mut json.Json, arr: u32) -> usize {
+    if arr == json.JSON_NONE || json.json_kind(d, arr) != json.JSON_ARRAY {
+        return 0
+    }
+    return json.json_count(d, arr)
+}
+
+// Does the build / package say it runs on `platform`? A build with its own
+// `plattformen` decides alone; otherwise the package's `ziele` do; a package
+// that names neither is taken as "everywhere".
+fn platform_ok(d: *mut json.Json, pkg: u32, build: u32, platform: str) -> bool {
+    let pl: u32 = jget(d, build, "plattformen")
+    if array_len(d, pl) > 0 {
+        return array_has(d, pl, platform)
+    }
+    let zl: u32 = jget(d, pkg, "ziele")
+    if array_len(d, zl) > 0 {
+        var c: u32 = json.json_child(d, zl)
+        while c != json.JSON_NONE {
+            if span_eq_str(jstr(d, c, "plattform"), platform) {
+                return true
+            }
+            c = json.json_next(d, c)
+        }
+        return false
+    }
+    return true
+}
+
+fn fill_build(d: *mut json.Json, pkg: u32, b: u32, out: *mut Build) -> bool {
+    (*out).build_id = jint(d, b, "build_id", 0 - 1)
+    var v: str.Span = jstr(d, b, "fassung")
+    if v.n == 0 {
+        v = jstr(d, b, "versionName")
+    }
+    if !span_copy((&(*out).version[0]) as u64, 64, v, &(*out).nversion) || (*out).nversion == 0 {
+        return false
+    }
+    (*out).version_code = jint(d, b, "versionCode", 0)
+    if !span_copy((&(*out).file[0]) as u64, 400, jstr(d, b, "datei"), &(*out).nfile) {
+        return false
+    }
+    if !build_url_ok((&(*out).file[0]) as u64, (*out).nfile) {
+        return false
+    }
+    let sha: str.Span = jstr(d, b, "sha256")
+    if !is_hex64(sha.p as u64, sha.n) {
+        return false
+    }
+    rt.mem_copy((&(*out).sha256[0]) as u64, sha.p as u64, 64)
+    (*out).size = jint(d, b, "groesse", 0) as u64
+    if (*out).size == 0 as u64 {
+        return false
+    }
+    let notes: str.Span = jstr(d, b, "aenderungen")
+    if notes.n > BUILD_NOTES_MAX {
+        // cut a long text at the limit rather than refuse the update
+        (*out).nnotes = BUILD_NOTES_MAX
+        rt.mem_copy((&(*out).notes[0]) as u64, notes.p as u64, BUILD_NOTES_MAX)
+    } else {
+        (*out).nnotes = notes.n
+        rt.mem_copy((&(*out).notes[0]) as u64, notes.p as u64, notes.n)
+    }
+    let cr: str.Span = jstr(d, b, "erstellt")
+    if cr.n <= 32 {
+        (*out).ncreated = cr.n
+        rt.mem_copy((&(*out).created[0]) as u64, cr.p as u64, cr.n)
+    }
+    let fl: str.Span = jstr(d, pkg, "mindestFassung")
+    if fl.n > 0 && fl.n <= 64 {
+        (*out).nfloor = fl.n
+        rt.mem_copy((&(*out).floor[0]) as u64, fl.p as u64, fl.n)
+    }
+    return true
+}
+
+// Chooses the build of package `pkgkey` that `channel` points at for
+// `platform`. `want_art` is the package kind this platform installs
+// ("exe", "bin", "appimage", "macos-app", "opk", "apk").
+//
+// A channel pointer is looked up as `<channel>@<platform>` first and as
+// `<channel>` second, so ONE package can serve two machines of the same
+// kind (linux-x86_64 and linux-aarch64) with a pointer each.
+fn catalog_select(d: *mut json.Json, pkgkey: str, channel: str, platform: str,
+    want_art: str, out: *mut Build) -> u32 {
+    *out = build_new()
+    let root: u32 = json.json_root(d)
+    let pakete: u32 = jget(d, root, "pakete")
+    let pkg: u32 = jget(d, pakete, pkgkey)
+    if pkg == json.JSON_NONE || json.json_kind(d, pkg) != json.JSON_OBJECT {
+        return SEL_NO_PACKAGE
+    }
+    let art: str.Span = jstr(d, pkg, "art")
+    if !span_eq_str(art, want_art) {
+        return SEL_ART
+    }
+    if pkgkey.n > BUILD_PKG_MAX || art.n > 24 || channel.n > 32 {
+        return SEL_INCOMPLETE
+    }
+    // the channel pointer
+    var key: [u8; 80] = [0; 80]
+    var chosen: u32 = json.JSON_NONE
+    var found_key: bool = false
+    let kan: u32 = jget(d, pkg, "kanaele")
+    if kan != json.JSON_NONE {
+        if channel.n + 1 + platform.n <= 80 {
+            rt.mem_copy((&key[0]) as u64, channel.p as u64, channel.n)
+            key[channel.n] = 64 as u8
+            rt.mem_copy((&key[0]) as u64 + channel.n as u64 + 1, platform.p as u64, platform.n)
+            let n1: u32 = json.json_get(d, kan, (&key[0]) as u64, channel.n + 1 + platform.n)
+            if n1 != json.JSON_NONE && json.json_kind(d, n1) == json.JSON_NUMBER {
+                chosen = n1
+            }
+        }
+        if chosen == json.JSON_NONE {
+            let n2: u32 = jget(d, kan, channel)
+            if n2 != json.JSON_NONE && json.json_kind(d, n2) == json.JSON_NUMBER {
+                chosen = n2
+            }
+        }
+        if chosen == json.JSON_NONE {
+            return SEL_NO_CHANNEL
+        }
+    }
+    let builds: u32 = jget(d, pkg, "builds")
+    var bnode: u32 = json.JSON_NONE
+    if chosen != json.JSON_NONE && array_len(d, builds) > 0 {
+        let want_id: i64 = json.json_int(d, chosen)
+        var c: u32 = json.json_child(d, builds)
+        while c != json.JSON_NONE {
+            if jint(d, c, "build_id", 0 - 1) == want_id {
+                bnode = c
+                break
+            }
+            c = json.json_next(d, c)
+        }
+        if bnode == json.JSON_NONE {
+            return SEL_NO_BUILD
+        }
+    } else {
+        // an old style package: the newest entry of `fassungen`
+        let fas: u32 = jget(d, pkg, "fassungen")
+        if array_len(d, fas) == 0 {
+            return SEL_NO_BUILD
+        }
+        bnode = json.json_child(d, fas)
+    }
+    if !platform_ok(d, pkg, bnode, platform) {
+        return SEL_PLATFORM
+    }
+    if !fill_build(d, pkg, bnode, out) {
+        *out = build_new()
+        return SEL_INCOMPLETE
+    }
+    rt.mem_copy((&(*out).pkg[0]) as u64, pkgkey.p as u64, pkgkey.n)
+    (*out).npkg = pkgkey.n
+    rt.mem_copy((&(*out).art[0]) as u64, art.p as u64, art.n)
+    (*out).nart = art.n
+    rt.mem_copy((&(*out).channel[0]) as u64, channel.p as u64, channel.n)
+    (*out).nchannel = channel.n
+    (*out).found = true
+    return SEL_OK
+}
+
+// The build id of the build whose file has this SHA-256 (hex), or -1. This
+// is how an installed program finds out WHICH build it is without carrying
+// the number: it hashes its own executable.
+fn catalog_build_by_sha(d: *mut json.Json, pkgkey: str, sha_hex: u64) -> i64 {
+    let root: u32 = json.json_root(d)
+    let pkg: u32 = jget(d, jget(d, root, "pakete"), pkgkey)
+    if pkg == json.JSON_NONE {
+        return 0 - 1
+    }
+    let builds: u32 = jget(d, pkg, "builds")
+    if array_len(d, builds) == 0 {
+        return 0 - 1
+    }
+    var c: u32 = json.json_child(d, builds)
+    while c != json.JSON_NONE {
+        let s: str.Span = jstr(d, c, "sha256")
+        if s.n == 64 && rt.mem_eq(s.p as u64, sha_hex, 64) {
+            return jint(d, c, "build_id", 0 - 1)
+        }
+        c = json.json_next(d, c)
+    }
+    return 0 - 1
+}
+
+// ---------------------------------------------------------------- deciding
+
+// What to do about `b` (the channel's build), given the installed version
+// text `inst` and, when the running executable is a build the store knows,
+// its build id (`inst_build`, -1 = unknown) and whether its file hash
+// equals the offered one (`same_file`).
+//
+//   same file                         -> up to date
+//   offered version > installed       -> update
+//   offered version == installed      -> update only if the installed build
+//                                        is a KNOWN, OLDER build (a rebuild
+//                                        under the same number); a build the
+//                                        store does not know (a developer's
+//                                        own) is never overwritten
+//   offered version < installed       -> a rollback by the publisher, only
+//                                        when the store really moved the
+//                                        channel back (installed build known
+//                                        and newer than the offered one)
+//   offered version below the floor   -> D_BELOW_FLOOR (never installed)
+fn decide(inst: str, inst_build: i64, same_file: bool, b: *mut Build) -> u32 {
+    if !(*b).found {
+        return D_BROKEN
+    }
+    if same_file {
+        return D_UPTODATE
+    }
+    var ok: bool = false
+    let off: str = str { p: (&(*b).version[0]) as *mut u8, n: (*b).nversion }
+    let c: i32 = version.version_cmp_text(off, inst, &ok)
+    if !ok {
+        return D_BROKEN
+    }
+    if (*b).nfloor > 0 {
+        let fl: str = str { p: (&(*b).floor[0]) as *mut u8, n: (*b).nfloor }
+        var ok2: bool = false
+        let cf: i32 = version.version_cmp_text(off, fl, &ok2)
+        if ok2 && cf < 0 {
+            return D_BELOW_FLOOR
+        }
+    }
+    if c > 0 {
+        return D_UPDATE
+    }
+    if c == 0 {
+        if inst_build >= 0 && inst_build < (*b).build_id {
+            return D_UPDATE
+        }
+        return D_UPTODATE
+    }
+    if inst_build >= 0 && inst_build > (*b).build_id {
+        return D_ROLLBACK
+    }
+    return D_UPTODATE
+}

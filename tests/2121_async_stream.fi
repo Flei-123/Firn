@@ -1,0 +1,401 @@
+// expect_exit: 0
+// tests/2121_async_stream.fi -- async.stream: TCP streams on the event loop.
+// Both backends (epoll, poll). Server and clients share ONE loop.
+//
+// A  120 clients each send 3000 octets through an echo server and check
+//    every octet of the answer
+// B  a refused connect ends with CL_CONNECT and errno 111 (ECONNREFUSED)
+// C  a silent server: the idle timeout closes the client with CL_TIMEOUT
+//    after about the time that was asked for
+// D  4 MiB written at once, through a server that stops reading for a while
+//    (the window closes, SE_DRAINED comes later, nothing is lost)
+// E  the server closes: data first, then CL_EOF
+// F  stream_close is graceful: 1 MiB queued, then close -- the peer gets all
+import std.rt
+import std.net
+import async.loop
+import async.stream
+
+static mut fails: u32 = 0
+
+fn check(ok: bool, code: u32) {
+    if !ok {
+        fails = fails + 1
+        let m: [u8; 5] = "FAIL "
+        syscall(1, 2, (&m[0]) as i64, 5, 0, 0, 0)
+        var d: [u8; 4] = [48, 48, 48, 10]
+        d[0] = (48 + (code / 100) % 10) as u8
+        d[1] = (48 + (code / 10) % 10) as u8
+        d[2] = (48 + code % 10) as u8
+        syscall(1, 2, (&d[0]) as i64, 4, 0, 0, 0)
+    }
+}
+
+// ------------------------------------------------------------ A: echo
+
+static mut NCLI: usize = 120 // (a static, set per backend below)
+const MSG: usize = 3000
+
+static mut got: [u32; 128] = [0; 128]
+static mut cli_bad: [u32; 128] = [0; 128]
+static mut cli_done: [u32; 128] = [0; 128]
+static mut cli_closed: [i64; 128] = [0; 128]
+static mut ndone: u32 = 0
+static mut srv_conns: u32 = 0
+static mut srv_closed: u32 = 0
+
+fn pat(id: usize, i: usize) -> u8 {
+    return ((id * 7 + i) & 255) as u8
+}
+
+fn echo_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    if kind == stream.SE_DATA {
+        stream.stream_write(s, stream.stream_in_ptr(s), stream.stream_in_len(s))
+        stream.stream_consume(s, stream.stream_in_len(s))
+    } else if kind == stream.SE_CLOSED {
+        srv_closed = srv_closed + 1
+    }
+}
+
+fn on_conn(l: *mut loop.Loop, ud: u64, c: net.Conn) {
+    srv_conns = srv_conns + 1
+    stream.stream_adopt(l, c, 10000, echo_event, 0)
+}
+
+fn cli_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    let id: usize = ud as usize
+    if kind == stream.SE_CONNECTED {
+        var buf: [u8; 3000] = [0; 3000]
+        var i: usize = 0
+        while i < MSG {
+            buf[i] = pat(id, i)
+            i = i + 1
+        }
+        stream.stream_write(s, (&buf[0]) as u64, MSG)
+    } else if kind == stream.SE_DATA {
+        let n: usize = stream.stream_in_len(s)
+        let p: u64 = stream.stream_in_ptr(s)
+        var i: usize = 0
+        while i < n {
+            if rt.ld8(p, i) != pat(id, got[id] as usize + i) {
+                cli_bad[id] = cli_bad[id] + 1
+            }
+            i = i + 1
+        }
+        got[id] = got[id] + n as u32
+        stream.stream_consume(s, n)
+        if got[id] as usize == MSG {
+            cli_done[id] = 1
+            ndone = ndone + 1
+            stream.stream_close(s)
+        }
+    } else if kind == stream.SE_CLOSED {
+        cli_closed[id] = arg
+    }
+}
+
+// ----------------------------------------------- B: refused
+
+static mut b_reason: i64 = 0 - 1
+static mut b_errno: i64 = 0
+
+fn b_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    if kind == stream.SE_CLOSED {
+        b_reason = arg
+        b_errno = stream.stream_errno(s)
+    }
+}
+
+// ----------------------------------------------- C: silent server
+
+static mut c_reason: i64 = 0 - 1
+static mut c_t0: i64 = 0
+static mut c_el: i64 = 0
+
+fn silent_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    // accepts and says nothing; closed when the client goes
+}
+
+fn c_conn(l: *mut loop.Loop, ud: u64, c: net.Conn) {
+    stream.stream_adopt(l, c, 0, silent_event, 0)
+}
+
+fn c_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    if kind == stream.SE_CLOSED {
+        c_reason = arg
+        c_el = loop.mono_ms() - c_t0
+    }
+}
+
+// ----------------------------------------------- D: backpressure
+
+const BIG: usize = 4194304
+static mut d_srv_got: u64 = 0
+static mut d_srv_hash: u64 = 0
+static mut d_drained: u32 = 0
+static mut d_cli_closed: i64 = 0 - 1
+static mut d_resume_h: u64 = 0
+static mut d_srv_stream: u64 = 0
+static mut d_paused_seen: bool = false
+
+fn d_resume(l: *mut loop.Loop, ud: u64) {
+    stream.stream_pause_read(ud as *mut stream.Stream, false)
+}
+
+fn d_srv_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    if kind == stream.SE_DATA {
+        let n: usize = stream.stream_in_len(s)
+        let p: u64 = stream.stream_in_ptr(s)
+        var i: usize = 0
+        while i < n {
+            d_srv_hash = (d_srv_hash * 31 + rt.ld8(p, i) as u64) % 1000000007
+            i = i + 1
+        }
+        d_srv_got = d_srv_got + n as u64
+        stream.stream_consume(s, n)
+    } else if kind == stream.SE_CLOSED {
+        d_srv_stream = 0
+    }
+}
+
+fn d_conn(l: *mut loop.Loop, ud: u64, c: net.Conn) {
+    let s: *mut stream.Stream = stream.stream_adopt(l, c, 10000, d_srv_event, 0)
+    d_srv_stream = s as u64
+    // do not read for 150 ms: the client's 4 MiB cannot go anywhere
+    stream.stream_pause_read(s, true)
+    loop.timer_after(l, 150, d_resume, s as u64)
+}
+
+fn d_cli_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    if kind == stream.SE_CONNECTED {
+        let p: u64 = rt.heap_alloc(BIG)
+        var i: usize = 0
+        var h: u64 = 0
+        while i < BIG {
+            let b: u8 = ((i * 13 + (i >> 8)) & 255) as u8
+            rt.st8(p, i, b)
+            h = (h * 31 + b as u64) % 1000000007
+            i = i + 1
+        }
+        d_expect_hash = h
+        stream.stream_write(s, p, BIG)
+        d_pending_after_write = stream.stream_out_pending(s)
+        rt.heap_free(p, BIG)
+    } else if kind == stream.SE_DRAINED {
+        d_drained = d_drained + 1
+        stream.stream_close(s)
+    } else if kind == stream.SE_CLOSED {
+        d_cli_closed = arg
+    }
+}
+
+static mut d_expect_hash: u64 = 0
+static mut d_pending_after_write: usize = 0
+
+// ----------------------------------------------- E: server closes
+
+static mut e_got: usize = 0
+static mut e_reason: i64 = 0 - 1
+
+fn e_conn(l: *mut loop.Loop, ud: u64, c: net.Conn) {
+    let s: *mut stream.Stream = stream.stream_adopt(l, c, 0, silent_event, 0)
+    stream.stream_write_str(s, "bye bye")
+    stream.stream_close(s)
+}
+
+fn e_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    if kind == stream.SE_DATA {
+        e_got = e_got + stream.stream_in_len(s)
+        stream.stream_consume(s, stream.stream_in_len(s))
+    } else if kind == stream.SE_CLOSED {
+        e_reason = arg
+    }
+}
+
+// ----------------------------------------------- F: graceful close
+
+const ONEMB: usize = 1048576
+static mut f_srv_got: u64 = 0
+static mut f_srv_reason: i64 = 0 - 1
+
+fn f_srv_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    if kind == stream.SE_DATA {
+        f_srv_got = f_srv_got + stream.stream_in_len(s) as u64
+        stream.stream_consume(s, stream.stream_in_len(s))
+    } else if kind == stream.SE_CLOSED {
+        f_srv_reason = arg
+    }
+}
+
+fn f_conn(l: *mut loop.Loop, ud: u64, c: net.Conn) {
+    stream.stream_adopt(l, c, 10000, f_srv_event, 0)
+}
+
+fn f_cli_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    if kind == stream.SE_CONNECTED {
+        let p: u64 = rt.heap_alloc(ONEMB)
+        rt.mem_set(p, 7 as u8, ONEMB)
+        stream.stream_write(s, p, ONEMB)
+        rt.heap_free(p, ONEMB)
+        stream.stream_close(s) // graceful: the megabyte goes first
+    }
+}
+
+fn t_stop(l: *mut loop.Loop, ud: u64) { loop.stop(l) }
+
+static mut pred_fn: u64 = 0
+
+fn t_check(l: *mut loop.Loop, ud: u64) {
+    let f: fn() -> bool = pred_fn as fn() -> bool
+    if f() {
+        loop.stop(l)
+    }
+}
+
+// Runs until `pred()` is true (checked every 2 ms) or `ms` passed.
+fn run_until(l: *mut loop.Loop, ms: i64, pred: fn() -> bool) {
+    pred_fn = pred as u64
+    let h: u64 = loop.timer_after(l, ms, t_stop, 0)
+    let c: u64 = loop.timer_every(l, 2, t_check, 0)
+    loop.run(l)
+    loop.timer_cancel(l, h)
+    loop.timer_cancel(l, c)
+}
+
+fn p_a() -> bool { return ndone == NCLI as u32 && srv_closed == NCLI as u32 }
+fn p_b() -> bool { return b_reason >= 0 }
+fn p_c() -> bool { return c_reason >= 0 }
+fn p_d() -> bool { return d_cli_closed >= 0 && d_srv_got == BIG as u64 }
+fn p_e() -> bool { return e_reason >= 0 }
+fn p_f() -> bool { return f_srv_reason >= 0 }
+fn p_none() -> bool { return false }
+
+#[allow_escape]
+fn suite(force_poll: bool) {
+    var l: loop.Loop = loop.loop_new()
+    var ok: bool = false
+    if force_poll {
+        ok = loop.loop_init_poll(&l)
+    } else {
+        ok = loop.loop_init(&l)
+    }
+    check(ok, 1)
+
+    // ---- A
+    // (on Windows the seam's poll is select(): 64 sockets at most, A5)
+    NCLI = 120
+    if loop.socket_limit(&l) != 0 {
+        NCLI = 20
+    }
+    var i: usize = 0
+    while i < 128 {
+        got[i] = 0
+        cli_bad[i] = 0
+        cli_done[i] = 0
+        cli_closed[i] = 0 - 1
+        i = i + 1
+    }
+    ndone = 0
+    srv_conns = 0
+    srv_closed = 0
+    let acc: *mut stream.Acceptor = stream.acceptor_new(&l, net.ADDR_LOCAL, 0 as u16, 256, on_conn, 0)
+    check(acc as u64 != 0, 10)
+    let port: u16 = stream.acceptor_port(acc)
+    i = 0
+    while i < NCLI {
+        let s: *mut stream.Stream = stream.stream_open(&l, net.ADDR_LOCAL, port, 10000, cli_event, i as u64)
+        check(s as u64 != 0, 11)
+        i = i + 1
+    }
+    run_until(&l, 8000, p_a)
+    check(ndone == NCLI as u32, 12)
+    var bad: u32 = 0
+    var closed_ok: u32 = 0
+    i = 0
+    while i < NCLI {
+        bad = bad + cli_bad[i]
+        if cli_closed[i] == stream.CL_LOCAL {
+            closed_ok = closed_ok + 1
+        }
+        i = i + 1
+    }
+    check(bad == 0, 13)
+    check(closed_ok == NCLI as u32, 14)
+    check(srv_conns == NCLI as u32, 15)
+    check(stream.acceptor_count(acc) == NCLI as u64, 16)
+    // every server side saw the client leave
+    check(srv_closed == NCLI as u32, 17)
+    stream.acceptor_close(acc)
+    check(loop.watch_count(&l) == 0, 18)
+
+    // ---- B: refused (the port of a listener that was closed)
+    var lst: net.Listener = net.listen_tcp(net.ADDR_LOCAL, 0 as u16) catch net.listener_from_fd(0 - 1)
+    let dead_port: u16 = net.listener_port(&lst)
+    net.close_listener(&lst)
+    let sb: *mut stream.Stream = stream.stream_open(&l, net.ADDR_LOCAL, dead_port, 3000, b_event, 0)
+    check(sb as u64 != 0, 20)
+    run_until(&l, 3000, p_b)
+    check(b_reason == stream.CL_CONNECT, 21)
+    check(b_errno == 111, 22)
+
+    // ---- C: idle timeout
+    let acc_c: *mut stream.Acceptor = stream.acceptor_new(&l, net.ADDR_LOCAL, 0 as u16, 8, c_conn, 0)
+    c_t0 = loop.mono_ms()
+    let sc: *mut stream.Stream = stream.stream_open(&l, net.ADDR_LOCAL, stream.acceptor_port(acc_c), 150, c_event, 0)
+    check(sc as u64 != 0, 30)
+    run_until(&l, 3000, p_c)
+    check(c_reason == stream.CL_TIMEOUT, 31)
+    check(c_el >= 140 && c_el < 3000, 32)
+    stream.acceptor_close(acc_c)
+
+    // ---- D: backpressure
+    d_srv_got = 0
+    d_srv_hash = 0
+    d_drained = 0
+    d_cli_closed = 0 - 1
+    let acc_d: *mut stream.Acceptor = stream.acceptor_new(&l, net.ADDR_LOCAL, 0 as u16, 8, d_conn, 0)
+    let sd: *mut stream.Stream = stream.stream_open(&l, net.ADDR_LOCAL, stream.acceptor_port(acc_d), 10000, d_cli_event, 0)
+    check(sd as u64 != 0, 40)
+    run_until(&l, 8000, p_d)
+    check(d_srv_got == BIG as u64, 41)
+    check(d_srv_hash == d_expect_hash, 42)
+    check(d_drained == 1, 43)
+    check(d_pending_after_write > 0, 44) // the socket could not take 4 MiB at once
+    check(d_cli_closed == stream.CL_LOCAL, 45)
+    stream.acceptor_close(acc_d)
+
+    // ---- E: the server closes after its data
+    e_got = 0
+    e_reason = 0 - 1
+    let acc_e: *mut stream.Acceptor = stream.acceptor_new(&l, net.ADDR_LOCAL, 0 as u16, 8, e_conn, 0)
+    let se: *mut stream.Stream = stream.stream_open(&l, net.ADDR_LOCAL, stream.acceptor_port(acc_e), 5000, e_event, 0)
+    check(se as u64 != 0, 50)
+    run_until(&l, 3000, p_e)
+    check(e_got == 7, 51)
+    check(e_reason == stream.CL_EOF, 52)
+    stream.acceptor_close(acc_e)
+
+    // ---- F: graceful close
+    f_srv_got = 0
+    f_srv_reason = 0 - 1
+    let acc_f: *mut stream.Acceptor = stream.acceptor_new(&l, net.ADDR_LOCAL, 0 as u16, 8, f_conn, 0)
+    let sf: *mut stream.Stream = stream.stream_open(&l, net.ADDR_LOCAL, stream.acceptor_port(acc_f), 5000, f_cli_event, 0)
+    check(sf as u64 != 0, 60)
+    run_until(&l, 5000, p_f)
+    check(f_srv_got == ONEMB as u64, 61)
+    check(f_srv_reason == stream.CL_EOF, 62)
+    stream.acceptor_close(acc_f)
+
+    check(loop.watch_count(&l) == 0, 70)
+    check(loop.timer_count(&l) == 0, 71)
+    loop.loop_free(&l)
+}
+
+fn main() -> i32 {
+    suite(false)
+    suite(true)
+    if fails != 0 {
+        return 1
+    }
+    return 0
+}

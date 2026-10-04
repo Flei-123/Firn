@@ -7076,10 +7076,12 @@ fn emit_inst(
         Op::ThreadSpawn { arg, stack, ctid } => {
             // ROUND WINDOWS: see codegen_x86.rs -- ENOSYS instead of clone(2).
             if crate::target::windows() {
-                crate::thread::spawn_unsupported(e);
-                if let Some(d) = i.dst {
-                    ra.store_dst(e, d, "rax");
-                }
+                let d = i.dst.ok_or("internal error: spawn without target")?;
+                ra.load_full(e, "rdi", *arg);
+                ra.load_full(e, "rsi", *stack);
+                ra.load_full(e, "rdx", *ctid);
+                crate::thread::spawn_sequence_windows(e);
+                ra.store_dst(e, d, "rax");
                 return Ok(());
             }
             let d = i.dst.ok_or("internal error: spawn without target")?;
@@ -7091,7 +7093,11 @@ fn emit_inst(
         }
         Op::ThreadSelf => {
             let d = i.dst.ok_or("internal error: threadself without target")?;
-            crate::thread::self_sequence(e);
+            if crate::target::windows() {
+                crate::thread::self_sequence_windows(e);
+            } else {
+                crate::thread::self_sequence(e);
+            }
             ra.store_dst(e, d, "rax");
         }
         Op::AtomicAdd { addr, val } => {

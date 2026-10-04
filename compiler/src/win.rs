@@ -83,6 +83,24 @@ pub const PAGE: u64 = 4096;
 const KNOWN: &[(&str, &str, u32)] = &[
     // --- kernel32: process, memory, files, time -----------------------
     ("ExitProcess", "KERNEL32.dll", 1),
+    // --- kernel32: THREADS (round WIN-THREADS) -------------------------
+    // `CreateThread` for `Op::ThreadSpawn`; `TlsAlloc`/`TlsSetValue` keep the
+    // thread block pointer (the Windows twin of `fs:0`, see
+    // `thread::self_sequence_windows`); `WaitOnAddress`/`WakeByAddress*` are
+    // the futex of the thread runtime (Windows 8 and later, the same floor
+    // as `GetCurrentThreadStackLimits` below).
+    ("CreateThread", "KERNEL32.dll", 6),
+    ("TlsAlloc", "KERNEL32.dll", 0),
+    ("TlsSetValue", "KERNEL32.dll", 2),
+    ("WaitOnAddress", "API-MS-WIN-CORE-SYNCH-L1-2-0.dll", 4),
+    ("WakeByAddressSingle", "API-MS-WIN-CORE-SYNCH-L1-2-0.dll", 1),
+    ("WakeByAddressAll", "API-MS-WIN-CORE-SYNCH-L1-2-0.dll", 1),
+    // --- kernel32: JOB OBJECTS (round WIN-THREADS, std.process.kill_tree)
+    ("CreateJobObjectW", "KERNEL32.dll", 2),
+    ("AssignProcessToJobObject", "KERNEL32.dll", 2),
+    ("SetInformationJobObject", "KERNEL32.dll", 4),
+    ("TerminateJobObject", "KERNEL32.dll", 2),
+    ("ResumeThread", "KERNEL32.dll", 1),
     ("GetStdHandle", "KERNEL32.dll", 1),
     ("WriteFile", "KERNEL32.dll", 5),
     ("ReadFile", "KERNEL32.dll", 5),
@@ -124,6 +142,7 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("listen", "WS2_32.dll", 2),
     ("accept", "WS2_32.dll", 3),
     ("setsockopt", "WS2_32.dll", 5),
+    ("getsockopt", "WS2_32.dll", 5),
     ("getsockname", "WS2_32.dll", 3),
     ("ioctlsocket", "WS2_32.dll", 3),
     // --- ws2_32: what round CERTUS-WINDOWS had to add ------------------
@@ -313,6 +332,8 @@ thread_local! {
     static PROBED: RefCell<bool> = const { RefCell::new(false) };
     /// Did the hand written runtime need the system call stub?
     static SYSSTUB_USED: RefCell<bool> = const { RefCell::new(false) };
+    /// Did a thread start (`Op::ThreadSpawn`) need the thread entry thunk?
+    static THREADMAIN_USED: RefCell<bool> = const { RefCell::new(false) };
 }
 
 /// The PE subsystem this image declares (`console` or `windows`).
@@ -340,6 +361,7 @@ pub fn reset() {
     CBUSED.with(|u| u.borrow_mut().clear());
     PROBED.with(|p| *p.borrow_mut() = false);
     SYSSTUB_USED.with(|p| *p.borrow_mut() = false);
+    THREADMAIN_USED.with(|p| *p.borrow_mut() = false);
 }
 
 /// Registers `name` as an import and yields the symbol a System V caller
@@ -392,6 +414,22 @@ fn imp(name: &str) -> String {
 /// Records that a stack probe was emitted.
 pub fn note_probe() {
     PROBED.with(|p| *p.borrow_mut() = true);
+}
+
+/// The symbol of the thread entry thunk (Win64 -> Firn) that `CreateThread`
+/// jumps to; see `thread_main_asm`.
+pub const THREAD_MAIN: &str = "_Fwin.thread_main";
+
+/// Records that `Op::ThreadSpawn` needs the thread entry thunk (and the
+/// import it ends with).
+pub fn note_thread_main() {
+    THREADMAIN_USED.with(|p| *p.borrow_mut() = true);
+    let _ = note("WakeByAddressAll");
+}
+
+/// Is the thread entry thunk needed?
+pub fn thread_main_used() -> bool {
+    THREADMAIN_USED.with(|p| *p.borrow())
 }
 
 /// Records that the hand written runtime needs the system call stub.
@@ -584,6 +622,52 @@ fn cb_thunk_asm(sym: &str, argc: u32) -> String {
     s
 }
 
+/// **The entry of a Firn thread on Windows.**
+///
+/// `CreateThread` jumps here with the Win64 convention: `rcx` = the thread
+/// block (the `arg` of `Op::ThreadSpawn`, see `thread::spawn_sequence_windows`).
+/// What the Linux `clone` sequence does in its child -- fetch the argument,
+/// call `__thread_entry` -- is written out here, wrapped in the same
+/// callee-saved bookkeeping every `#[win_callback]` thunk has (`rsi`, `rdi`
+/// and `xmm6`-`xmm15` are callee-saved in Win64 and scratch in Firn).
+///
+/// Three things on top of a plain callback:
+///   1. the stack bottom the collector scans up to is the TEB's `StackBase`
+///      (`gs:[8]`) -- the thread runs on the stack Windows gave it, not on
+///      the block the creator mapped (that one stays unused, see
+///      docs/WINDOWS_THREADS.md);
+///   2. after `__thread_entry` returns, the thread id word is zeroed and
+///      woken -- exactly what the kernel does for `CLONE_CHILD_CLEARTID` on
+///      Linux, and what `thread_wait` sleeps on;
+///   3. the thread simply returns, which is `ExitThread`.
+fn thread_main_asm() -> String {
+    let mut s = String::new();
+    s.push_str(&format!("\n.globl {}\n{}:\n", THREAD_MAIN, THREAD_MAIN));
+    s.push_str("    # Win64 thread start -> __thread_entry(tcb)\n");
+    s.push_str("    push rbp\n    mov rbp, rsp\n");
+    s.push_str("    push rbx\n    push rsi\n    push rdi\n");
+    s.push_str("    sub rsp, 168\n");
+    for k in 0..10u32 {
+        s.push_str(&format!("    movaps [rsp+{}], xmm{}\n", k * 16, k + 6));
+    }
+    s.push_str("    mov rbx, rcx\n");
+    s.push_str("    mov rax, qword ptr gs:[8]\n");
+    s.push_str(&format!("    mov qword ptr [rbx+{}], rax\n", crate::thread::WIN_TCB_BOTTOM));
+    s.push_str("    mov rdi, rbx\n");
+    s.push_str(&format!("    call {}\n", crate::codegen_x86::label(crate::thread::ENTRY)));
+    s.push_str(&format!("    mov dword ptr [rbx+{}], 0\n", crate::thread::WIN_TCB_TID));
+    s.push_str(&format!("    lea rdi, [rbx+{}]\n", crate::thread::WIN_TCB_TID));
+    s.push_str(&format!("    call {}\n", thunk("WakeByAddressAll")));
+    for k in 0..10u32 {
+        s.push_str(&format!("    movaps xmm{}, [rsp+{}]\n", k + 6, k * 16));
+    }
+    s.push_str("    xor eax, eax\n");
+    s.push_str("    add rsp, 168\n");
+    s.push_str("    pop rdi\n    pop rsi\n    pop rbx\n");
+    s.push_str("    leave\n    ret\n");
+    s
+}
+
 /// **The stack probe.**
 ///
 /// A Windows thread stack is reserved but not committed. At its lower end
@@ -735,7 +819,7 @@ pub fn runtime_asm() -> String {
     let used: Vec<String> = USED.with(|u| u.borrow().iter().cloned().collect());
     let mut s = String::new();
     let any_cb = CBUSED.with(|c| !c.borrow().is_empty());
-    if used.is_empty() && !probed() && !sysstub_used() && !any_cb {
+    if used.is_empty() && !probed() && !sysstub_used() && !any_cb && !thread_main_used() {
         return s;
     }
     s.push_str("\n# ==== round WINDOWS: the boundary to Win32 ====\n");
@@ -751,6 +835,9 @@ pub fn runtime_asm() -> String {
     }
     if probed() {
         s.push_str(&chkstk_asm());
+    }
+    if thread_main_used() {
+        s.push_str(&thread_main_asm());
     }
     if sysstub_used() {
         s.push_str(&sysstub_asm());
@@ -833,5 +920,39 @@ mod tests {
         assert!(a.contains("mov byte ptr [rcx], 0"), "{}", a);
         // and touches the remainder as well
         assert!(a.contains("sub rcx, rax"), "{}", a);
+    }
+
+    /// The thread entry thunk: Win64 in, `__thread_entry` called with the
+    /// thread block, the stack bottom taken from the TEB, the TID word zeroed
+    /// and woken at the end, and the callee-saved registers kept.
+    #[test]
+    fn the_thread_entry_thunk_does_what_clone_did_for_the_child() {
+        reset();
+        let a = thread_main_asm();
+        assert!(a.contains("mov rbx, rcx"), "{}", a);
+        assert!(a.contains("mov rax, qword ptr gs:[8]"), "{}", a);
+        assert!(a.contains("mov qword ptr [rbx+40], rax"), "{}", a);
+        assert!(a.contains("mov rdi, rbx"), "{}", a);
+        let call = a.find("__thread_entry").expect("calls the entry");
+        let zero = a.find("mov dword ptr [rbx+16], 0").expect("zeroes the TID word");
+        let wake = a.find("WakeByAddressAll").expect("wakes it");
+        assert!(call < zero && zero < wake, "{}", a);
+        // rsi/rdi/xmm6-15 are callee-saved in Win64 and scratch in Firn.
+        assert!(a.contains("push rsi") && a.contains("pop rdi"), "{}", a);
+        assert!(a.contains("movaps [rsp+144], xmm15"), "{}", a);
+        // entered with rsp = 8 mod 16: 1 + 3 pushes and 168 octets leave it 16-aligned
+        assert!(a.contains("sub rsp, 168"), "{}", a);
+    }
+
+    #[test]
+    fn the_thread_imports_are_known() {
+        for n in ["CreateThread", "TlsAlloc", "TlsSetValue", "WaitOnAddress",
+            "WakeByAddressSingle", "WakeByAddressAll", "CreateJobObjectW",
+            "AssignProcessToJobObject", "SetInformationJobObject", "TerminateJobObject",
+            "ResumeThread"] {
+            assert!(known(n).is_some(), "{} is not in the import table", n);
+        }
+        assert_eq!(known("CreateThread"), Some(("KERNEL32.dll", 6)));
+        assert_eq!(known("WaitOnAddress").map(|k| k.1), Some(4));
     }
 }

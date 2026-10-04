@@ -1,0 +1,802 @@
+// expect_exit: 0
+// tests/2124_async_ws.fi -- async.wsc: the WebSocket client on the event loop.
+// The server is in the same loop (async.stream + the frame codec of
+// lib/ws/ws.fi); for wss:// lib/tls/tls_server.fi sits in front of it.
+//
+// A  echo, text and binary, 70000 octets in fragments of 16384 (ws://)
+// B  the same over wss:// (non-blocking TLS), plus ping/pong and a clean close
+// C  a message the SERVER fragments, with a ping between the fragments
+// D  ping/pong both ways (the pong carries the payload back)
+// E  closing handshake started by the client (code 1000, the server sees it)
+//    and by the server (1001 and a reason)
+// F  protocol violations by the server: bad UTF-8 -> we close 1007; a masked
+//    frame -> 1002; a message over the limit -> 1009 (the SERVER sees the code)
+// G  keep-alive: a server that never answers pings -> WSE_TIMEOUT + 1006
+// H  reconnect: delays double up to the cap, max_attempts is honoured, and a
+//    server that appears later is found; a dropped connection comes back
+// I  an answer that is not 101 -> WSE_HANDSHAKE, status 200, no WE_CLOSE
+// J  Sec-WebSocket-Protocol negotiation
+// K  wss:// with the wrong name / an unknown CA -> WSE_TLS, Certificate (9)
+import std.rt
+import std.str
+import std.net
+import std.base64
+import std.crypto.sha1
+import tls.tls
+import tls.x509
+import tls.tls_server as server
+import ws.ws
+import async.loop
+import async.stream
+import async.wsc
+
+const CA_PEM: str = "-----BEGIN CERTIFICATE-----\nMIIBoDCCAUWgAwIBAgIUHOPVny2cpnkX7d96Wpk3/SxnimMwCgYIKoZIzj0EAwIw\nHTEbMBkGA1UEAwwSRmlybiBBc3luYyBUZXN0IENBMB4XDTI2MTAwNDEzMzg1M1oX\nDTQ1MTIwMzEzMzg1M1owHTEbMBkGA1UEAwwSRmlybiBBc3luYyBUZXN0IENBMFkw\nEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE/InTK88XDK/84XVZtb0+C4vBFN/iFdG/\nzGb8Gv0D+3WSvm61onKCehjHT2RMhqwkn4GKHQrPyy3z64v+1aQQuKNjMGEwHQYD\nVR0OBBYEFDE4jGvGpFbAah85vcNKQmJBlqftMB8GA1UdIwQYMBaAFDE4jGvGpFbA\nah85vcNKQmJBlqftMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoG\nCCqGSM49BAMCA0kAMEYCIQCCpSrTRRuYn3rnO693EOnAPt8KqIx3zqPM+Y2VCWCF\n6QIhAMiVcp8pMCrQ80tSWqMfqnxa7SV+FYmcSuvwPw7244TG\n-----END CERTIFICATE-----\n"
+const LEAF_PEM: str = "-----BEGIN CERTIFICATE-----\nMIIBwDCCAWagAwIBAgIUKfz5qA8JZtZUU6YKPNFuMF8g7acwCgYIKoZIzj0EAwIw\nHTEbMBkGA1UEAwwSRmlybiBBc3luYyBUZXN0IENBMB4XDTI2MTAwNDEzMzg1M1oX\nDTQ1MTIwMzEzMzg1M1owFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0C\nAQYIKoZIzj0DAQcDQgAEoKBkcuaZTiKwCUh4/1/SzwTG/jD+AJaRMmJugM8/06lu\n2afEc4dvv6DS5L5G1Vg/UHC/5qbmq/n8UnUIPiW2SaOBjDCBiTAaBgNVHREEEzAR\ngglsb2NhbGhvc3SHBH8AAAEwCQYDVR0TBAIwADALBgNVHQ8EBAMCB4AwEwYDVR0l\nBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYEFHT27QBDhUA56BO5StJ33ejRz4tQMB8G\nA1UdIwQYMBaAFDE4jGvGpFbAah85vcNKQmJBlqftMAoGCCqGSM49BAMCA0gAMEUC\nIQDAedU74cuZDb1Xa9uPlv1D7YJdzBRyugd58hj5AFXDVgIgSZBwNgMKB6D7+WQG\nw5jeatcXyAagk9LwvO4tjdEVng8=\n-----END CERTIFICATE-----\n"
+const LEAF_KEY: str = "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIB3m+9EQHqGkqMWKiF6AvWEeDt08FhehG9fmgpHGAeyGoAoGCCqGSM49\nAwEHoUQDQgAEoKBkcuaZTiKwCUh4/1/SzwTG/jD+AJaRMmJugM8/06lu2afEc4dv\nv6DS5L5G1Vg/UHC/5qbmq/n8UnUIPiW2SQ==\n-----END EC PRIVATE KEY-----\n"
+static mut fails: u32 = 0
+
+fn check(ok: bool, code: u32) {
+    if !ok {
+        fails = fails + 1
+        let m: [u8; 5] = "FAIL "
+        syscall(1, 2, (&m[0]) as i64, 5, 0, 0, 0)
+        var d: [u8; 4] = [48, 48, 48, 10]
+        d[0] = (48 + (code / 100) % 10) as u8
+        d[1] = (48 + (code / 10) % 10) as u8
+        d[2] = (48 + code % 10) as u8
+        syscall(1, 2, (&d[0]) as i64, 4, 0, 0, 0)
+    }
+}
+
+fn wall_seconds() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 0, (&ts[0]) as i64, 0, 0, 0)
+    return ts[0] as u64
+}
+
+fn pat(i: usize) -> u8 {
+    return ((i * 37 + (i >> 7)) & 255) as u8
+}
+
+fn push(b: *mut rt.Buf, t: str) {
+    rt.buf_push_bytes(b, t.p as u64, t.n)
+}
+
+// ================================================================= server
+
+const M_ECHO: u32 = 1
+const M_FRAG: u32 = 2
+const M_BADUTF: u32 = 3
+const M_MASKED: u32 = 4
+const M_BIG: u32 = 5
+const M_SRVCLOSE: u32 = 6
+const M_SILENT: u32 = 7
+const M_DROP: u32 = 8
+const M_NO101: u32 = 9
+const M_PROTO: u32 = 10
+
+struct WCtx {
+    s: *mut stream.Stream,
+    t: server.TlsServer,
+    secure: bool,
+    phase: u32,
+    mode: u32,
+    inb: rt.Buf,
+    msg: rt.Buf,
+    mop: u32,
+    in_msg: bool,
+    live: bool,
+    timer: u64,
+}
+
+struct CfgHolder { cfg: server.TlsConfig }
+static mut cfg_holder: u64 = 0
+
+static mut srv_conns: u32 = 0
+static mut srv_close_code: u32 = 0
+static mut srv_close_seen: u32 = 0
+static mut srv_pongs: u32 = 0
+static mut srv_pong_mid: u32 = 0
+static mut srv_pong_test: u32 = 0
+static mut srv_msgs: u32 = 0
+static mut srv_secure_conns: u32 = 0
+
+fn out_raw(c: *mut WCtx, p: u64, n: usize) {
+    if !(*c).live {
+        return
+    }
+    if (*c).secure {
+        server.send(&(*c).t, p, n)
+        let k: usize = server.out_len(&(*c).t)
+        if k > 0 {
+            stream.stream_write((*c).s, server.out_ptr(&(*c).t), k)
+            server.out_consume(&(*c).t, k)
+        }
+        return
+    }
+    stream.stream_write((*c).s, p, n)
+}
+
+fn send_frame(c: *mut WCtx, op: u32, fin: bool, p: u64, n: usize, masked: bool) {
+    var out: rt.Buf = rt.buf_new()
+    var mk: [u8; 4] = [1, 2, 3, 4]
+    var mp: u64 = 0
+    if masked {
+        mp = (&mk[0]) as u64
+    }
+    ws.write_frame(&out, op, fin, p, n, mp)
+    out_raw(c, out.ptr, out.len)
+    rt.buf_free(&out)
+}
+
+fn s_timer(l: *mut loop.Loop, ud: u64) {
+    let c: *mut WCtx = ud as *mut WCtx
+    (*c).timer = 0
+    if !(*c).live {
+        return
+    }
+    if (*c).mode == M_SRVCLOSE {
+        var b: [u8; 12] = [3, 233, 103, 111, 105, 110, 103, 32, 97, 119, 97, 121]
+        send_frame(c, ws.OP_CLOSE, true, (&b[0]) as u64, 12, false)
+    } else if (*c).mode == M_DROP {
+        stream.stream_abort((*c).s)
+    }
+}
+
+fn start_actions(c: *mut WCtx) {
+    let m: u32 = (*c).mode
+    if m == M_SRVCLOSE {
+        send_frame(c, ws.OP_TEXT, true, "hello".p as u64, 5, false)
+        (*c).timer = loop.timer_after(stream.stream_loop((*c).s), 20, s_timer, c as u64)
+    } else if m == M_BADUTF {
+        var b: [u8; 3] = [102, 195, 40]
+        send_frame(c, ws.OP_TEXT, true, (&b[0]) as u64, 3, false)
+    } else if m == M_MASKED {
+        send_frame(c, ws.OP_TEXT, true, "x".p as u64, 1, true)
+    } else if m == M_BIG {
+        var big: [u8; 5000] = [65; 5000]
+        send_frame(c, ws.OP_BINARY, true, (&big[0]) as u64, 5000, false)
+    } else if m == M_DROP {
+        (*c).timer = loop.timer_after(stream.stream_loop((*c).s), 40, s_timer, c as u64)
+    }
+}
+
+fn find(p: u64, n: usize, from: usize, lit: str) -> usize {
+    var i: usize = from
+    while i + lit.n <= n {
+        if rt.mem_eq(p + i as u64, lit.p as u64, lit.n) {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn handle_upgrade(c: *mut WCtx, he: usize) {
+    let p: u64 = (*c).inb.ptr
+    // route
+    var mode: u32 = M_ECHO
+    if find(p, he, 0, "GET /frag ") < he { mode = M_FRAG }
+    else if find(p, he, 0, "GET /badutf ") < he { mode = M_BADUTF }
+    else if find(p, he, 0, "GET /masked ") < he { mode = M_MASKED }
+    else if find(p, he, 0, "GET /big ") < he { mode = M_BIG }
+    else if find(p, he, 0, "GET /srvclose ") < he { mode = M_SRVCLOSE }
+    else if find(p, he, 0, "GET /silent ") < he { mode = M_SILENT }
+    else if find(p, he, 0, "GET /drop ") < he { mode = M_DROP }
+    else if find(p, he, 0, "GET /no101 ") < he { mode = M_NO101 }
+    else if find(p, he, 0, "GET /proto ") < he { mode = M_PROTO }
+    (*c).mode = mode
+    if mode == M_NO101 {
+        var r0: rt.Buf = rt.buf_new()
+        push(&r0, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nno")
+        out_raw(c, r0.ptr, r0.len)
+        rt.buf_free(&r0)
+        return
+    }
+    let k0: usize = find(p, he, 0, "Sec-WebSocket-Key: ")
+    var key: rt.Buf = rt.buf_new()
+    if k0 < he {
+        var q: usize = k0 + 19
+        while q < he && rt.ld8(p, q) != 13 as u8 {
+            rt.buf_push(&key, rt.ld8(p, q))
+            q = q + 1
+        }
+    }
+    var acc: rt.Buf = rt.buf_new()
+    ws.accept_key(str { p: key.ptr as *mut u8, n: key.len }, &acc)
+    var r: rt.Buf = rt.buf_new()
+    push(&r, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
+    rt.buf_push_bytes(&r, acc.ptr, acc.len)
+    push(&r, "\r\n")
+    if mode == M_PROTO && find(p, he, 0, "Sec-WebSocket-Protocol: ") < he {
+        push(&r, "Sec-WebSocket-Protocol: chat\r\n")
+    }
+    push(&r, "\r\n")
+    out_raw(c, r.ptr, r.len)
+    rt.buf_free(&r)
+    rt.buf_free(&acc)
+    rt.buf_free(&key)
+    (*c).phase = 1
+    start_actions(c)
+}
+
+fn drop_front(c: *mut WCtx, n: usize) {
+    let rest: usize = (*c).inb.len - n
+    if rest > 0 {
+        rt.mem_copy((*c).inb.ptr, (*c).inb.ptr + n as u64, rest)
+    }
+    rt.buf_set_len(&(*c).inb, rest)
+}
+
+fn on_message(c: *mut WCtx) {
+    srv_msgs = srv_msgs + 1
+    if (*c).mode == M_ECHO || (*c).mode == M_PROTO || (*c).mode == M_SILENT {
+        send_frame(c, (*c).mop, true, (*c).msg.ptr, (*c).msg.len, false)
+    } else if (*c).mode == M_FRAG {
+        // "Hello, w" + ping + "\xc3\xb6rld" + "!"  (the o-umlaut split by nothing: whole)
+        send_frame(c, ws.OP_TEXT, false, "Hello, w".p as u64, 8, false)
+        send_frame(c, ws.OP_PING, true, "mid".p as u64, 3, false)
+        var u: [u8; 5] = [195, 182, 114, 108, 100]
+        send_frame(c, ws.OP_CONT, false, (&u[0]) as u64, 5, false)
+        send_frame(c, ws.OP_CONT, true, "!".p as u64, 1, false)
+    }
+}
+
+fn frames_in(c: *mut WCtx) {
+    while (*c).live && (*c).phase == 1 {
+        var f: ws.Frame = ws.frame_new()
+        let r: i32 = ws.parse_frame((*c).inb.ptr, (*c).inb.len, &f)
+        if r != ws.PARSE_OK || (*c).inb.len < f.hlen + f.plen as usize {
+            return
+        }
+        let pl: usize = f.plen as usize
+        let pp: u64 = (*c).inb.ptr + f.hlen as u64
+        if f.masked {
+            ws.unmask(pp, pl, (&f.mask[0]) as u64, 0)
+        }
+        if f.op == ws.OP_PING {
+            if (*c).mode != M_SILENT {
+                send_frame(c, ws.OP_PONG, true, pp, pl, false)
+            }
+        } else if f.op == ws.OP_PONG {
+            srv_pongs = srv_pongs + 1
+            if pl == 3 && rt.mem_eq(pp, "mid".p as u64, 3) { srv_pong_mid = srv_pong_mid + 1 }
+            if pl == 9 && rt.mem_eq(pp, "pong-test".p as u64, 9) { srv_pong_test = srv_pong_test + 1 }
+        } else if f.op == ws.OP_CLOSE {
+            var code: u32 = 1005
+            if pl >= 2 {
+                code = ((rt.ld8(pp, 0) as u32) << 8) | (rt.ld8(pp, 1) as u32)
+            }
+            srv_close_code = code
+            srv_close_seen = srv_close_seen + 1
+            if pl >= 2 {
+                send_frame(c, ws.OP_CLOSE, true, pp, 2, false)
+            } else {
+                send_frame(c, ws.OP_CLOSE, true, pp, 0, false)
+            }
+            drop_front(c, f.hlen + pl)
+            stream.stream_close((*c).s)
+            return
+        } else {
+            if f.op != ws.OP_CONT {
+                (*c).mop = f.op
+                rt.buf_clear(&(*c).msg)
+            }
+            rt.buf_push_bytes(&(*c).msg, pp, pl)
+            if f.fin {
+                on_message(c)
+            }
+        }
+        drop_front(c, f.hlen + pl)
+    }
+}
+
+fn app_in(c: *mut WCtx, p: u64, n: usize) {
+    rt.buf_push_bytes(&(*c).inb, p, n)
+    if (*c).phase == 0 {
+        let he: usize = find((*c).inb.ptr, (*c).inb.len, 0, "\r\n\r\n")
+        if he >= (*c).inb.len {
+            return
+        }
+        handle_upgrade(c, he)
+        drop_front(c, he + 4)
+        if (*c).mode == M_NO101 {
+            stream.stream_close((*c).s)
+            return
+        }
+    }
+    frames_in(c)
+}
+
+fn srv_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    let c: *mut WCtx = ud as *mut WCtx
+    if kind == stream.SE_DATA {
+        if (*c).secure {
+            let ok: bool = server.feed(&(*c).t, stream.stream_in_ptr(s), stream.stream_in_len(s))
+            stream.stream_consume(s, stream.stream_in_len(s))
+            let k: usize = server.out_len(&(*c).t)
+            if k > 0 {
+                stream.stream_write(s, server.out_ptr(&(*c).t), k)
+                server.out_consume(&(*c).t, k)
+            }
+            let n: usize = server.app_len(&(*c).t)
+            if n > 0 {
+                app_in(c, server.app_ptr(&(*c).t), n)
+                server.app_consume(&(*c).t, n)
+            }
+            if !ok || server.failed(&(*c).t) {
+                stream.stream_abort(s)
+            }
+        } else {
+            let n2: usize = stream.stream_in_len(s)
+            app_in(c, stream.stream_in_ptr(s), n2)
+            stream.stream_consume(s, n2)
+        }
+    } else if kind == stream.SE_CLOSED {
+        (*c).live = false
+        if (*c).timer != 0 {
+            loop.timer_cancel(stream.stream_loop(s), (*c).timer)
+        }
+        rt.buf_free(&(*c).inb)
+        rt.buf_free(&(*c).msg)
+        if (*c).secure {
+            server.server_free(&(*c).t)
+        }
+    }
+}
+
+fn mk_ctx(l: *mut loop.Loop, cn: net.Conn, secure: bool) {
+    let q: u64 = rt.heap_alloc(size_of[WCtx]())
+    let c: *mut WCtx = q as *mut WCtx
+    var t: server.TlsServer = server.server_new(&(*(cfg_holder as *mut CfgHolder)).cfg)
+    *c = WCtx { s: 0 as *mut stream.Stream, t: t, secure: secure, phase: 0, mode: 0,
+        inb: rt.buf_new(), msg: rt.buf_new(), mop: 0, in_msg: false, live: true, timer: 0 }
+    srv_conns = srv_conns + 1
+    if secure { srv_secure_conns = srv_secure_conns + 1 }
+    (*c).s = stream.stream_adopt(l, cn, 20000, srv_event, q)
+}
+
+fn on_conn_plain(l: *mut loop.Loop, ud: u64, cn: net.Conn) { mk_ctx(l, cn, false) }
+fn on_conn_tls(l: *mut loop.Loop, ud: u64, cn: net.Conn) { mk_ctx(l, cn, true) }
+
+// ================================================================= clients
+
+const NC: usize = 16
+static mut opens: [u32; 16] = [0; 16]
+static mut msgs: [u32; 16] = [0; 16]
+static mut msg_ok: [u32; 16] = [0; 16]
+static mut closes: [u32; 16] = [0; 16]
+static mut close_code: [u32; 16] = [0; 16]
+static mut errors: [u32; 16] = [0; 16]
+static mut last_err: [u32; 16] = [0; 16]
+static mut recos: [u32; 16] = [0; 16]
+static mut pongs: [u32; 16] = [0; 16]
+static mut pong_ok: [u32; 16] = [0; 16]
+static mut delay0: [i64; 16] = [0; 16]
+static mut delay1: [i64; 16] = [0; 16]
+static mut delay2: [i64; 16] = [0; 16]
+static mut delay3: [i64; 16] = [0; 16]
+static mut t_open: [i64; 16] = [0; 16]
+static mut t_close: [i64; 16] = [0; 16]
+static mut status_seen: [u32; 16] = [0; 16]
+static mut tls_err: [u32; 16] = [0; 16]
+static mut peer_reason_ok: [u32; 16] = [0; 16]
+static mut proto_ok: [u32; 16] = [0; 16]
+static mut flow: [u32; 16] = [0; 16] // per-test progress counter
+
+fn reset_clients() {
+    var i: usize = 0
+    while i < NC {
+        opens[i] = 0
+        msgs[i] = 0
+        msg_ok[i] = 0
+        closes[i] = 0
+        close_code[i] = 0
+        errors[i] = 0
+        last_err[i] = 0
+        recos[i] = 0
+        pongs[i] = 0
+        pong_ok[i] = 0
+        delay0[i] = 0
+        delay1[i] = 0
+        delay2[i] = 0
+        delay3[i] = 0
+        t_open[i] = 0
+        t_close[i] = 0
+        status_seen[i] = 0
+        tls_err[i] = 0
+        peer_reason_ok[i] = 0
+        proto_ok[i] = 0
+        flow[i] = 0
+        i = i + 1
+    }
+}
+
+const BIGN: usize = 70000
+
+fn send_big(c: *mut wsc.WsClient) {
+    let p: u64 = rt.heap_alloc(BIGN)
+    var i: usize = 0
+    while i < BIGN {
+        rt.st8(p, i, pat(i))
+        i = i + 1
+    }
+    wsc.wsc_send_binary(c, p, BIGN)
+    rt.heap_free(p, BIGN)
+}
+
+fn on_ws(c: *mut wsc.WsClient, ud: u64, kind: u32, arg: u32) {
+    let id: usize = ud as usize
+    if kind == wsc.WE_OPEN {
+        opens[id] = opens[id] + 1
+        t_open[id] = loop.mono_ms()
+        if wsc.wsc_protocol_len(c) == 4 && rt.mem_eq(wsc.wsc_protocol_ptr(c), "chat".p as u64, 4) {
+            proto_ok[id] = 1
+        }
+        if id == 0 || id == 1 {
+            send_big(c)
+        } else if id == 2 {
+            wsc.wsc_send_str(c, "go")
+        } else if id == 3 || id == 4 || id == 5 || id == 6 {
+            // the server speaks first
+        } else if id == 9 {
+            wsc.wsc_send_str(c, "ping me")
+        }
+    } else if kind == wsc.WE_MESSAGE {
+        msgs[id] = msgs[id] + 1
+        let n: usize = wsc.wsc_msg_len(c)
+        let p: u64 = wsc.wsc_msg_ptr(c)
+        if id == 0 || id == 1 {
+            if flow[id] == 0 {
+                // the 70000 octet echo
+                var ok: bool = n == BIGN && arg == ws.OP_BINARY
+                var i: usize = 0
+                while ok && i < n {
+                    if rt.ld8(p, i) != pat(i) { ok = false }
+                    i = i + 1
+                }
+                if ok { msg_ok[id] = msg_ok[id] + 1 }
+                flow[id] = 1
+                wsc.wsc_send_str(c, "héllo ünïcode")
+            } else if flow[id] == 1 {
+                if n == 16 && arg == ws.OP_TEXT && rt.mem_eq(p, "héllo ünïcode".p as u64, 16) {
+                    msg_ok[id] = msg_ok[id] + 1
+                }
+                flow[id] = 2
+                if id == 1 {
+                    wsc.wsc_ping(c, "pong-test".p as u64, 9)
+                } else {
+                    wsc.wsc_close(c, 1000)
+                }
+            }
+        } else if id == 2 {
+            // "Hello, wörld!" = 8 + 5 + 1 octets
+            if n == 14 && arg == ws.OP_TEXT && rt.mem_eq(p, "Hello, wörld!".p as u64, 14) {
+                msg_ok[id] = msg_ok[id] + 1
+            }
+            wsc.wsc_close(c, 1000)
+        } else if id == 3 {
+            if n == 5 && rt.mem_eq(p, "hello".p as u64, 5) {
+                msg_ok[id] = msg_ok[id] + 1
+            }
+        } else if id == 9 {
+            if n == 7 && rt.mem_eq(p, "ping me".p as u64, 7) {
+                msg_ok[id] = msg_ok[id] + 1
+            }
+            wsc.wsc_close(c, 1000)
+        }
+    } else if kind == wsc.WE_PONG {
+        pongs[id] = pongs[id] + 1
+        if wsc.wsc_msg_len(c) == 9 && rt.mem_eq(wsc.wsc_msg_ptr(c), "pong-test".p as u64, 9) {
+            pong_ok[id] = pong_ok[id] + 1
+            if id == 1 {
+                wsc.wsc_close(c, 1000)
+            }
+        }
+    } else if kind == wsc.WE_CLOSE {
+        closes[id] = closes[id] + 1
+        close_code[id] = arg
+        t_close[id] = loop.mono_ms()
+        if wsc.wsc_peer_reason_len(c) == 10 && rt.mem_eq(wsc.wsc_peer_reason_ptr(c), "going away".p as u64, 10) {
+            peer_reason_ok[id] = 1
+        }
+        if id == 8 && closes[id] == 1 {
+            // dropped by the server: the client reconnects by itself
+        }
+    } else if kind == wsc.WE_ERROR {
+        errors[id] = errors[id] + 1
+        last_err[id] = arg
+        status_seen[id] = wsc.wsc_status(c)
+        tls_err[id] = wsc.wsc_tls_error(c)
+    } else if kind == wsc.WE_RECONNECT {
+        recos[id] = recos[id] + 1
+        let d: i64 = wsc.wsc_next_delay_ms(c)
+        if recos[id] == 1 { delay0[id] = d }
+        else if recos[id] == 2 { delay1[id] = d }
+        else if recos[id] == 3 { delay2[id] = d }
+        else if recos[id] == 4 { delay3[id] = d }
+    }
+}
+
+// ---- running
+
+static mut pred_fn: u64 = 0
+
+fn t_stop(l: *mut loop.Loop, ud: u64) { loop.stop(l) }
+
+fn t_check(l: *mut loop.Loop, ud: u64) {
+    let f: fn() -> bool = pred_fn as fn() -> bool
+    if f() {
+        loop.stop(l)
+    }
+}
+
+fn run_until(l: *mut loop.Loop, ms: i64, pred: fn() -> bool) {
+    pred_fn = pred as u64
+    let h: u64 = loop.timer_after(l, ms, t_stop, 0)
+    let c: u64 = loop.timer_every(l, 2, t_check, 0)
+    loop.run(l)
+    loop.timer_cancel(l, h)
+    loop.timer_cancel(l, c)
+}
+
+fn p_c0() -> bool { return closes[0] > 0 }
+fn p_c1() -> bool { return closes[1] > 0 }
+fn p_c2() -> bool { return closes[2] > 0 }
+fn p_c3() -> bool { return closes[3] > 0 }
+fn p_c4() -> bool { return closes[4] > 0 }
+fn p_c5() -> bool { return closes[5] > 0 }
+fn p_c6() -> bool { return closes[6] > 0 }
+fn p_c7() -> bool { return closes[7] > 0 }
+fn p_e10() -> bool { return errors[10] > 0 }
+fn p_e11() -> bool { return errors[11] > 0 }
+fn p_e12() -> bool { return errors[12] > 0 }
+fn p_c9() -> bool { return closes[9] > 0 }
+fn p_recos() -> bool { return recos[13] >= 4 && errors[13] >= 5 }
+fn p_open14() -> bool { return opens[14] > 0 }
+fn p_open8() -> bool { return opens[8] >= 2 }
+
+fn url_for(port: u16, scheme: str, host: str, path: str, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    push(out, scheme)
+    push(out, host)
+    push(out, ":")
+    rt.buf_push_dec_u64(out, port as u64)
+    push(out, path)
+}
+
+static mut late_port: u16 = 0
+static mut late_acc: u64 = 0
+static mut late_loop: u64 = 0
+
+fn late_start(l: *mut loop.Loop, ud: u64) {
+    late_acc = stream.acceptor_new(l, net.ADDR_LOCAL, late_port, 16, on_conn_plain, 0) as u64
+}
+
+fn stop_client8(l: *mut loop.Loop, ud: u64) {
+    wsc.wsc_close(ud as *mut wsc.WsClient, 1000)
+}
+
+#[allow_escape]
+fn suite(force_poll: bool) {
+    var l: loop.Loop = loop.loop_new()
+    var ok: bool = false
+    if force_poll {
+        ok = loop.loop_init_poll(&l)
+    } else {
+        ok = loop.loop_init(&l)
+    }
+    check(ok, 1)
+    let acc: *mut stream.Acceptor = stream.acceptor_new(&l, net.ADDR_LOCAL, 0 as u16, 64, on_conn_plain, 0)
+    let acc_tls: *mut stream.Acceptor = stream.acceptor_new(&l, net.ADDR_ANY, 0 as u16, 64, on_conn_tls, 0)
+    check(acc as u64 != 0 && acc_tls as u64 != 0, 2)
+    let port: u16 = stream.acceptor_port(acc)
+    let tport: u16 = stream.acceptor_port(acc_tls)
+    var u: rt.Buf = rt.buf_new()
+    reset_clients()
+
+    // ---- A: ws:// echo in fragments of 16384, then close(1000)
+    srv_close_code = 0
+    srv_close_seen = 0
+    let c0: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 0)
+    wsc.wsc_set_fragment_size(c0, 16384)
+    url_for(port, "ws://", "127.0.0.1", "/echo", &u)
+    check(wsc.wsc_connect(c0, u.ptr, u.len), 10)
+    run_until(&l, 10000, p_c0)
+    check(opens[0] == 1 && msg_ok[0] == 2 && msgs[0] == 2, 11)
+    check(closes[0] == 1 && close_code[0] == 1000, 12)
+    check(srv_close_code == 1000 && srv_close_seen == 1, 13)
+    check(wsc.wsc_state(c0) == wsc.WS_IDLE, 14)
+    check(wsc.wsc_messages_out(c0) == 2, 15)
+    wsc.wsc_free(c0)
+
+    // ---- B: wss:// echo + ping + close
+    let c1: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 1)
+    var store_pem_ok: usize = wsc.wsc_add_trust_pem(c1, CA_PEM.p as u64, CA_PEM.n)
+    check(store_pem_ok == 1, 20)
+    wsc.wsc_set_fragment_size(c1, 20000)
+    url_for(tport, "wss://", "localhost", "/echo", &u)
+    srv_pong_test = 0
+    check(wsc.wsc_connect(c1, u.ptr, u.len), 21)
+    run_until(&l, 20000, p_c1)
+    check(opens[1] == 1 && msg_ok[1] == 2, 22)
+    check(pongs[1] == 1 && pong_ok[1] == 1, 23)
+    check(closes[1] == 1 && close_code[1] == 1000, 24)
+    check(srv_secure_conns >= 1, 25)
+    wsc.wsc_free(c1)
+
+    // ---- C: a message the server fragments (with a ping in between)
+    srv_pong_mid = 0
+    let c2: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 2)
+    url_for(port, "ws://", "127.0.0.1", "/frag", &u)
+    wsc.wsc_connect(c2, u.ptr, u.len)
+    run_until(&l, 10000, p_c2)
+    check(msg_ok[2] == 1 && msgs[2] == 1, 30)
+    check(srv_pong_mid == 1, 31) // the ping between the fragments was answered
+    check(closes[2] == 1 && close_code[2] == 1000, 32)
+    wsc.wsc_free(c2)
+
+    // ---- E: the SERVER closes (1001 + reason)
+    srv_close_code = 0
+    let c3: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 3)
+    url_for(port, "ws://", "127.0.0.1", "/srvclose", &u)
+    wsc.wsc_connect(c3, u.ptr, u.len)
+    run_until(&l, 10000, p_c3)
+    check(msg_ok[3] == 1, 40)
+    check(closes[3] == 1 && close_code[3] == 1001 && peer_reason_ok[3] == 1, 41)
+    let t_a: i64 = loop.mono_ms()
+    while srv_close_code == 0 && loop.mono_ms() - t_a < 1000 { loop.run_once(&l, 10) }
+    check(srv_close_code == 1001, 42) // our answer carried the same code
+    wsc.wsc_free(c3)
+
+    // ---- F: violations
+    srv_close_code = 0
+    let c4: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 4)
+    url_for(port, "ws://", "127.0.0.1", "/badutf", &u)
+    wsc.wsc_connect(c4, u.ptr, u.len)
+    run_until(&l, 10000, p_c4)
+    check(closes[4] == 1 && close_code[4] == 1007 && errors[4] == 1 && last_err[4] == wsc.WSE_PROTOCOL, 50)
+    let t_b: i64 = loop.mono_ms()
+    while srv_close_code == 0 && loop.mono_ms() - t_b < 1000 { loop.run_once(&l, 10) }
+    check(srv_close_code == 1007, 51)
+    wsc.wsc_free(c4)
+    srv_close_code = 0
+    let c5: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 5)
+    url_for(port, "ws://", "127.0.0.1", "/masked", &u)
+    wsc.wsc_connect(c5, u.ptr, u.len)
+    run_until(&l, 10000, p_c5)
+    check(closes[5] == 1 && close_code[5] == 1002, 52)
+    let t_c: i64 = loop.mono_ms()
+    while srv_close_code == 0 && loop.mono_ms() - t_c < 1000 { loop.run_once(&l, 10) }
+    check(srv_close_code == 1002, 53)
+    wsc.wsc_free(c5)
+    srv_close_code = 0
+    let c6: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 6)
+    wsc.wsc_set_max_message(c6, 1000)
+    url_for(port, "ws://", "127.0.0.1", "/big", &u)
+    wsc.wsc_connect(c6, u.ptr, u.len)
+    run_until(&l, 10000, p_c6)
+    check(closes[6] == 1 && close_code[6] == 1009 && last_err[6] == wsc.WSE_TOO_LARGE, 54)
+    let t_d: i64 = loop.mono_ms()
+    while srv_close_code == 0 && loop.mono_ms() - t_d < 1000 { loop.run_once(&l, 10) }
+    check(srv_close_code == 1009, 55)
+    wsc.wsc_free(c6)
+
+    // ---- G: keep-alive against a server that never answers
+    let c7: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 7)
+    wsc.wsc_set_keepalive(c7, 60, 60)
+    url_for(port, "ws://", "127.0.0.1", "/silent", &u)
+    wsc.wsc_connect(c7, u.ptr, u.len)
+    run_until(&l, 5000, p_c7)
+    check(closes[7] == 1 && close_code[7] == 1006 && errors[7] == 1 && last_err[7] == wsc.WSE_TIMEOUT, 60)
+    check(t_close[7] - t_open[7] >= 100 && t_close[7] - t_open[7] < 4000, 61)
+    check(wsc.wsc_pings_sent(c7) >= 1, 62)
+    wsc.wsc_free(c7)
+
+    // ---- I: not a 101
+    let c10: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 10)
+    url_for(port, "ws://", "127.0.0.1", "/no101", &u)
+    wsc.wsc_connect(c10, u.ptr, u.len)
+    run_until(&l, 5000, p_e10)
+    check(errors[10] == 1 && last_err[10] == wsc.WSE_HANDSHAKE && status_seen[10] == 200, 70)
+    check(closes[10] == 0 && opens[10] == 0, 71)
+    wsc.wsc_free(c10)
+
+    // ---- J: sub-protocol
+    let c9: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 9)
+    wsc.wsc_set_protocols(c9, "superchat, chat")
+    url_for(port, "ws://", "127.0.0.1", "/proto", &u)
+    wsc.wsc_connect(c9, u.ptr, u.len)
+    run_until(&l, 5000, p_c9)
+    check(proto_ok[9] == 1 && msg_ok[9] == 1 && closes[9] == 1, 75)
+    wsc.wsc_free(c9)
+
+    // ---- K: wss with the wrong name (127.0.0.2 is not in the certificate)
+    let c11: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 11)
+    wsc.wsc_add_trust_pem(c11, CA_PEM.p as u64, CA_PEM.n)
+    url_for(tport, "wss://", "127.0.0.2", "/echo", &u)
+    wsc.wsc_connect(c11, u.ptr, u.len)
+    run_until(&l, 10000, p_e11)
+    check(errors[11] == 1 && last_err[11] == wsc.WSE_TLS && tls_err[11] == 9, 80)
+    check(opens[11] == 0 && closes[11] == 0, 81)
+    wsc.wsc_free(c11)
+    // an unknown CA: the system roots do not know the test CA
+    let c12: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 12)
+    wsc.wsc_use_system_trust(c12)
+    url_for(tport, "wss://", "localhost", "/echo", &u)
+    wsc.wsc_connect(c12, u.ptr, u.len)
+    run_until(&l, 10000, p_e12)
+    check(errors[12] == 1, 82)
+    check((last_err[12] == wsc.WSE_TLS && tls_err[12] == 9) || last_err[12] == wsc.WSE_NO_ROOTS, 83)
+    wsc.wsc_free(c12)
+
+    // ---- H: reconnect with backoff against a dead port, max 4 attempts
+    var lst: net.Listener = net.listen_tcp(net.ADDR_LOCAL, 0 as u16) catch net.listener_from_fd(0 - 1)
+    let dead: u16 = net.listener_port(&lst)
+    net.close_listener(&lst)
+    let c13: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 13)
+    wsc.wsc_set_auto_reconnect(c13, true, 20, 80, 4)
+    url_for(dead, "ws://", "127.0.0.1", "/echo", &u)
+    wsc.wsc_connect(c13, u.ptr, u.len)
+    run_until(&l, 10000, p_recos)
+    // let the last attempt fail and make sure nothing more is scheduled
+    let t_e: i64 = loop.mono_ms()
+    while loop.mono_ms() - t_e < 400 { loop.run_once(&l, 20) }
+    check(recos[13] == 4 && errors[13] == 5, 90)
+    check(delay0[13] >= 16 && delay0[13] <= 24, 91)
+    check(delay1[13] >= 32 && delay1[13] <= 48, 92)
+    check(delay2[13] >= 64 && delay2[13] <= 96, 93)
+    check(delay3[13] >= 64 && delay3[13] <= 96, 94) // the cap (80) holds
+    check(wsc.wsc_state(c13) == wsc.WS_IDLE && wsc.wsc_reconnects(c13) == 4, 95)
+    wsc.wsc_free(c13)
+
+    // ... a server that appears LATER is found
+    var lst2: net.Listener = net.listen_tcp(net.ADDR_LOCAL, 0 as u16) catch net.listener_from_fd(0 - 1)
+    late_port = net.listener_port(&lst2)
+    net.close_listener(&lst2)
+    let c14: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 14)
+    wsc.wsc_set_auto_reconnect(c14, true, 20, 50, 0)
+    url_for(late_port, "ws://", "127.0.0.1", "/echo", &u)
+    wsc.wsc_connect(c14, u.ptr, u.len)
+    loop.timer_after(&l, 150, late_start, 0)
+    run_until(&l, 10000, p_open14)
+    check(opens[14] == 1 && recos[14] >= 2, 96)
+    wsc.wsc_close(c14, 1000)
+    let t_f: i64 = loop.mono_ms()
+    while closes[14] == 0 && loop.mono_ms() - t_f < 2000 { loop.run_once(&l, 10) }
+    check(closes[14] == 1 && close_code[14] == 1000, 97)
+    wsc.wsc_free(c14)
+    stream.acceptor_close(late_acc as *mut stream.Acceptor)
+
+    // ... a connection the server drops comes back by itself
+    let c8: *mut wsc.WsClient = wsc.wsc_new(&l, on_ws, 8)
+    wsc.wsc_set_auto_reconnect(c8, true, 10, 40, 0)
+    url_for(port, "ws://", "127.0.0.1", "/drop", &u)
+    wsc.wsc_connect(c8, u.ptr, u.len)
+    run_until(&l, 10000, p_open8)
+    check(opens[8] >= 2 && closes[8] >= 1 && close_code[8] == 1006, 98)
+    check(wsc.wsc_attempt(c8) == 0 || wsc.wsc_attempt(c8) == 1, 99)
+    wsc.wsc_abort(c8)
+    wsc.wsc_free(c8)
+
+    rt.buf_free(&u)
+    stream.acceptor_close(acc)
+    stream.acceptor_close(acc_tls)
+    let t_g: i64 = loop.mono_ms()
+    while loop.watch_count(&l) > 0 && loop.mono_ms() - t_g < 1500 { loop.run_once(&l, 10) }
+    loop.loop_free(&l)
+}
+
+fn main() -> i32 {
+    cfg_holder = rt.heap_alloc(size_of[CfgHolder]())
+    (*(cfg_holder as *mut CfgHolder)).cfg = server.config_new()
+    if !server.config_load_pem(&(*(cfg_holder as *mut CfgHolder)).cfg, LEAF_PEM.p as u64, LEAF_PEM.n, LEAF_KEY.p as u64, LEAF_KEY.n) {
+        return 2
+    }
+    suite(false)
+    suite(true)
+    if fails != 0 {
+        return 1
+    }
+    return 0
+}

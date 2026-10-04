@@ -1,0 +1,558 @@
+// expect_exit: 0
+// tests/2123_async_http.fi -- async.ahttp: the HTTP client on the event loop.
+// A small HTTP/1.1 server (async.stream) lives in the same loop.
+//
+// A  Content-Length body (5000 octets, every octet checked)
+// B  chunked body (extensions, a trailer) DRIBBLED 9 octets per millisecond
+// C  no framing at all: the body ends when the server closes
+// D  302 -> 301 -> 200 (hops, final URL); 307 keeps the POST body
+// E  POST with a body and a Content-Type, echoed
+// F  a redirect loop is refused (error 14), too many hops (13)
+// G  gzip body decoded
+// H  a cookie set on one request is sent on the next
+// I  a silent server: the total time (60 ms) ends it with AE_TIMEOUT
+// J  refused connect (5), unsupported scheme (2), bad URL (1)
+// K  3 MiB through Content-Length
+// L  100 requests at once
+import std.rt
+import std.net
+import net.http
+import async.loop
+import async.stream
+import async.ahttp
+
+static mut fails: u32 = 0
+
+fn check(ok: bool, code: u32) {
+    if !ok {
+        fails = fails + 1
+        let m: [u8; 5] = "FAIL "
+        syscall(1, 2, (&m[0]) as i64, 5, 0, 0, 0)
+        var d: [u8; 4] = [48, 48, 48, 10]
+        d[0] = (48 + (code / 100) % 10) as u8
+        d[1] = (48 + (code / 10) % 10) as u8
+        d[2] = (48 + code % 10) as u8
+        syscall(1, 2, (&d[0]) as i64, 4, 0, 0, 0)
+    }
+}
+
+// ---------------------------------------------------------------- server
+
+struct SConn {
+    out: rt.Buf,
+    pos: usize,
+    dribble: usize, // octets per millisecond, 0 = all at once
+    timer: u64,
+    s: *mut stream.Stream,
+    live: bool,
+    close_after: bool,
+}
+
+static mut srv_requests: u32 = 0
+static mut saw_cookie: u32 = 0
+static mut saw_post_body: u32 = 0
+static mut gz_blob: [u8; 37] = [31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 203, 72, 205, 201, 201, 87, 72, 175, 202, 44, 80, 84, 200, 24, 101, 15, 59, 54, 0, 117, 14, 220, 42, 224, 1, 0, 0]
+
+fn push(b: *mut rt.Buf, t: str) {
+    rt.buf_push_bytes(b, t.p as u64, t.n)
+}
+
+fn bbyte(i: usize) -> u8 {
+    return ((i * 7 + (i >> 8)) & 255) as u8
+}
+
+const NOLEN: usize = 18446744073709551615
+
+fn head(b: *mut rt.Buf, status: str, extra: str, clen: usize, chunked: bool) {
+    push(b, "HTTP/1.1 ")
+    push(b, status)
+    push(b, "\r\n")
+    push(b, extra)
+    if chunked {
+        push(b, "Transfer-Encoding: chunked\r\n")
+    } else if clen != NOLEN {
+        push(b, "Content-Length: ")
+        rt.buf_push_dec_u64(b, clen as u64)
+        push(b, "\r\n")
+    }
+    push(b, "\r\n")
+}
+
+fn find(p: u64, n: usize, lit: str) -> usize {
+    var i: usize = 0
+    while i + lit.n <= n {
+        if rt.mem_eq(p + i as u64, lit.p as u64, lit.n) {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn starts(p: u64, n: usize, lit: str) -> bool {
+    return n >= lit.n && rt.mem_eq(p, lit.p as u64, lit.n)
+}
+
+fn pump(l: *mut loop.Loop, ud: u64) {
+    let c: *mut SConn = ud as *mut SConn
+    (*c).timer = 0
+    if !(*c).live {
+        return
+    }
+    var k: usize = (*c).out.len - (*c).pos
+    if (*c).dribble != 0 && k > (*c).dribble {
+        k = (*c).dribble
+    }
+    if k > 0 {
+        stream.stream_write((*c).s, (*c).out.ptr + (*c).pos as u64, k)
+        (*c).pos = (*c).pos + k
+    }
+    if (*c).pos < (*c).out.len {
+        (*c).timer = loop.timer_after(l, 1, pump, ud)
+    } else if (*c).close_after {
+        stream.stream_close((*c).s)
+    }
+}
+
+fn srv_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    let c: *mut SConn = ud as *mut SConn
+    if kind == stream.SE_DATA {
+        if (*c).out.len != 0 {
+            stream.stream_consume(s, stream.stream_in_len(s))
+            return
+        }
+        let p: u64 = stream.stream_in_ptr(s)
+        let n: usize = stream.stream_in_len(s)
+        let he: usize = find(p, n, "\r\n\r\n")
+        if he >= n {
+            return
+        }
+        // Content-Length of the request
+        var clen: usize = 0
+        let ci: usize = find(p, he, "Content-Length: ")
+        if ci < he {
+            var q: usize = ci + 16
+            while q < he && rt.ld8(p, q) >= 48 as u8 && rt.ld8(p, q) <= 57 as u8 {
+                clen = clen * 10 + (rt.ld8(p, q) - 48 as u8) as usize
+                q = q + 1
+            }
+        }
+        if n < he + 4 + clen {
+            return
+        }
+        srv_requests = srv_requests + 1
+        respond(s, c, p, he, p + (he + 4) as u64, clen)
+        stream.stream_consume(s, n)
+        pump(stream.stream_loop(s), c as u64)
+    } else if kind == stream.SE_CLOSED {
+        (*c).live = false
+        if (*c).timer != 0 {
+            loop.timer_cancel(stream.stream_loop(s), (*c).timer)
+        }
+        rt.buf_free(&(*c).out)
+    }
+}
+
+fn respond(s: *mut stream.Stream, c: *mut SConn, p: u64, he: usize, body: u64, clen: usize) {
+    let o: *mut rt.Buf = &(*c).out
+    (*c).close_after = true
+    if starts(p, he, "GET /len ") {
+        head(o, "200 OK", "Content-Type: text/plain; charset=utf-8\r\n", 5000, false)
+        var i: usize = 0
+        while i < 5000 {
+            rt.buf_push(o, bbyte(i))
+            i = i + 1
+        }
+    } else if starts(p, he, "GET /big ") {
+        head(o, "200 OK", "", 3145728, false)
+        var i2: usize = 0
+        while i2 < 3145728 {
+            rt.buf_push(o, bbyte(i2))
+            i2 = i2 + 1
+        }
+    } else if starts(p, he, "GET /chunked ") {
+        (*c).dribble = 9
+        head(o, "200 OK", "Content-Type: application/octet-stream\r\n", 0, true)
+        // chunks of 1000, 1, 2500 octets; an extension; a trailer
+        var base: usize = 0
+        push(o, "3e8;ext=1\r\n")
+        var j: usize = 0
+        while j < 1000 {
+            rt.buf_push(o, bbyte(base + j))
+            j = j + 1
+        }
+        base = base + 1000
+        push(o, "\r\n1\r\n")
+        rt.buf_push(o, bbyte(base))
+        base = base + 1
+        push(o, "\r\n9C4\r\n")
+        j = 0
+        while j < 2500 {
+            rt.buf_push(o, bbyte(base + j))
+            j = j + 1
+        }
+        push(o, "\r\n0\r\nX-Trailer: yes\r\n\r\n")
+    } else if starts(p, he, "GET /close ") {
+        push(o, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+        var i3: usize = 0
+        while i3 < 777 {
+            rt.buf_push(o, bbyte(i3))
+            i3 = i3 + 1
+        }
+    } else if starts(p, he, "GET /r1 ") {
+        head(o, "302 Found", "Location: /r2\r\n", 0, false)
+    } else if starts(p, he, "GET /r2 ") {
+        head(o, "301 Moved", "Location: http://127.0.0.1/len\r\n", 0, false)
+        // the absolute form carries no port: the client must not guess ours
+        (*o).len = 0
+        head(o, "301 Moved", "Location: /len\r\n", 0, false)
+    } else if starts(p, he, "POST /p307 ") {
+        head(o, "307 Temporary Redirect", "Location: /echo\r\n", 0, false)
+    } else if starts(p, he, "POST /p303 ") {
+        head(o, "303 See Other", "Location: /len\r\n", 0, false)
+    } else if starts(p, he, "POST /echo ") {
+        saw_post_body = saw_post_body + 1
+        var ct_ok: bool = find(p, he, "Content-Type: text/x-test") < he
+        if ct_ok {
+            head(o, "200 OK", "Content-Type: text/x-echo\r\n", clen, false)
+        } else {
+            head(o, "415 Unsupported", "", clen, false)
+        }
+        rt.buf_push_bytes(o, body, clen)
+    } else if starts(p, he, "GET /loop ") {
+        head(o, "302 Found", "Location: /loop\r\n", 0, false)
+    } else if starts(p, he, "GET /ping ") {
+        head(o, "302 Found", "Location: /pong\r\n", 0, false)
+    } else if starts(p, he, "GET /pong ") {
+        head(o, "302 Found", "Location: /ping\r\n", 0, false)
+    } else if starts(p, he, "GET /gzip ") {
+        head(o, "200 OK", "Content-Encoding: gzip\r\n", 37, false)
+        rt.buf_push_bytes(o, (&gz_blob[0]) as u64, 37)
+    } else if starts(p, he, "GET /cookie ") {
+        head(o, "200 OK", "Set-Cookie: sid=abc123; Path=/\r\n", 2, false)
+        push(o, "ok")
+    } else if starts(p, he, "GET /needcookie ") {
+        if find(p, he, "Cookie: sid=abc123") < he {
+            saw_cookie = saw_cookie + 1
+            head(o, "200 OK", "", 3, false)
+            push(o, "yes")
+        } else {
+            head(o, "403 Forbidden", "", 2, false)
+            push(o, "no")
+        }
+    } else if starts(p, he, "GET /silent ") {
+        (*c).close_after = false
+        // no answer at all
+    } else {
+        head(o, "404 Not Found", "", 0, false)
+    }
+}
+
+fn on_conn(l: *mut loop.Loop, ud: u64, cn: net.Conn) {
+    let q: u64 = rt.heap_alloc(size_of[SConn]())
+    let c: *mut SConn = q as *mut SConn
+    *c = SConn { out: rt.buf_new(), pos: 0, dribble: 0, timer: 0,
+        s: 0 as *mut stream.Stream, live: true, close_after: true }
+    (*c).s = stream.stream_adopt(l, cn, 20000, srv_event, q)
+}
+
+// ---------------------------------------------------------------- clients
+
+struct Res {
+    done: bool,
+    err: u32,
+    tlserr: u32,
+    status: u32,
+    n: usize,
+    ok_body: bool,
+    hops: u32,
+    elapsed: i64,
+    ctype_ok: bool,
+    final_ok: bool,
+    echo_ok: bool,
+    text_yes: bool,
+}
+
+static mut res: [Res; 128] = [Res { done: false, err: 0, tlserr: 0, status: 0, n: 0, ok_body: false, hops: 0,
+    elapsed: 0, ctype_ok: false, final_ok: false, echo_ok: false, text_yes: false }; 128]
+
+fn on_done(r: *mut ahttp.Request, ud: u64) {
+    let i: usize = ud as usize
+    res[i].done = true
+    res[i].err = ahttp.areq_error(r)
+    res[i].tlserr = ahttp.areq_tls_error(r)
+    res[i].status = ahttp.areq_status(r)
+    res[i].n = ahttp.areq_body_len(r)
+    res[i].hops = ahttp.areq_hops(r)
+    res[i].elapsed = ahttp.areq_elapsed_ms(r)
+    // the body: bbyte pattern
+    var ok: bool = true
+    let p: u64 = ahttp.areq_body_ptr(r)
+    var k: usize = 0
+    while k < res[i].n {
+        if rt.ld8(p, k) != bbyte(k) {
+            ok = false
+            break
+        }
+        k = k + 1
+    }
+    res[i].ok_body = ok
+    var at: u64 = 0
+    let nct: usize = ahttp.areq_header(r, "Content-Type".p as u64, 12, &at)
+    res[i].ctype_ok = nct == 25 && rt.mem_eq(at, "text/plain; charset=utf-8".p as u64, 25)
+    let fp: u64 = ahttp.areq_final_url_ptr(r)
+    let fn_: usize = ahttp.areq_final_url_len(r)
+    res[i].final_ok = fn_ > 4 && rt.mem_eq(fp + (fn_ - 4) as u64, "/len".p as u64, 4)
+    res[i].echo_ok = res[i].n == 11 && rt.mem_eq(p, "hello world".p as u64, 11)
+    res[i].text_yes = res[i].n == 3 && rt.mem_eq(p, "yes".p as u64, 3)
+}
+
+fn clear_res() {
+    var i: usize = 0
+    while i < 128 {
+        res[i].done = false
+        res[i].err = 0
+        res[i].tlserr = 0
+        res[i].status = 0
+        res[i].n = 0
+        res[i].ok_body = false
+        res[i].hops = 0
+        res[i].elapsed = 0
+        res[i].ctype_ok = false
+        res[i].final_ok = false
+        res[i].echo_ok = false
+        res[i].text_yes = false
+        i = i + 1
+    }
+}
+
+static mut want: usize = 1
+static mut pred_fn: u64 = 0
+
+fn t_stop(l: *mut loop.Loop, ud: u64) { loop.stop(l) }
+
+fn t_check(l: *mut loop.Loop, ud: u64) {
+    var i: usize = 0
+    while i < want {
+        if !res[i].done {
+            return
+        }
+        i = i + 1
+    }
+    loop.stop(l)
+}
+
+fn run_all(l: *mut loop.Loop, ms: i64) {
+    let h: u64 = loop.timer_after(l, ms, t_stop, 0)
+    let c: u64 = loop.timer_every(l, 2, t_check, 0)
+    loop.run(l)
+    loop.timer_cancel(l, h)
+    loop.timer_cancel(l, c)
+}
+
+fn url_to(port: u16, path: str, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    push(out, "http://127.0.0.1:")
+    rt.buf_push_dec_u64(out, port as u64)
+    push(out, path)
+}
+
+#[allow_escape]
+fn suite(force_poll: bool) {
+    var l: loop.Loop = loop.loop_new()
+    var ok: bool = false
+    if force_poll {
+        ok = loop.loop_init_poll(&l)
+    } else {
+        ok = loop.loop_init(&l)
+    }
+    check(ok, 1)
+    var a: ahttp.AClient = ahttp.aclient_new()
+    check(ahttp.aclient_init(&a, &l), 2)
+    http.client_set_max_redirects(ahttp.aclient_http(&a), 5)
+    let acc: *mut stream.Acceptor = stream.acceptor_new(&l, net.ADDR_LOCAL, 0 as u16, 256, on_conn, 0)
+    check(acc as u64 != 0, 3)
+    let port: u16 = stream.acceptor_port(acc)
+    var u: rt.Buf = rt.buf_new()
+
+    // ---- A
+    clear_res()
+    want = 1
+    url_to(port, "/len", &u)
+    ahttp.aclient_get(&a, u.ptr, u.len, 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].done && res[0].err == 0 && res[0].status == 200, 10)
+    check(res[0].n == 5000 && res[0].ok_body, 11)
+    check(res[0].ctype_ok, 12)
+
+    // ---- B: chunked, dribbled
+    clear_res()
+    url_to(port, "/chunked", &u)
+    ahttp.aclient_get(&a, u.ptr, u.len, 10000, on_done, 0)
+    run_all(&l, 10000)
+    check(res[0].done && res[0].err == 0 && res[0].status == 200, 20)
+    check(res[0].n == 3501 && res[0].ok_body, 21)
+
+    // ---- C: until close
+    clear_res()
+    url_to(port, "/close", &u)
+    ahttp.aclient_get(&a, u.ptr, u.len, 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].done && res[0].err == 0 && res[0].status == 200, 30)
+    check(res[0].n == 777 && res[0].ok_body, 31)
+
+    // ---- D: redirects
+    clear_res()
+    url_to(port, "/r1", &u)
+    ahttp.aclient_get(&a, u.ptr, u.len, 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].done && res[0].err == 0 && res[0].status == 200, 40)
+    check(res[0].hops == 2 && res[0].final_ok && res[0].n == 5000, 41)
+    // 307 keeps the POST and its body
+    clear_res()
+    saw_post_body = 0
+    url_to(port, "/p307", &u)
+    ahttp.aclient_post(&a, u.ptr, u.len, "hello world".p as u64, 11, "text/x-test".p as u64, 11, 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].done && res[0].err == 0 && res[0].status == 200 && res[0].echo_ok, 42)
+    check(res[0].hops == 1 && saw_post_body == 1, 43)
+    // 303 turns the POST into a GET
+    clear_res()
+    url_to(port, "/p303", &u)
+    ahttp.aclient_post(&a, u.ptr, u.len, "hello world".p as u64, 11, "text/x-test".p as u64, 11, 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].done && res[0].err == 0 && res[0].status == 200 && res[0].n == 5000, 44)
+
+    // ---- E: POST
+    clear_res()
+    url_to(port, "/echo", &u)
+    ahttp.aclient_post(&a, u.ptr, u.len, "hello world".p as u64, 11, "text/x-test".p as u64, 11, 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].done && res[0].err == 0 && res[0].status == 200 && res[0].echo_ok, 50)
+
+    // ---- F: loops
+    clear_res()
+    url_to(port, "/loop", &u)
+    ahttp.aclient_get(&a, u.ptr, u.len, 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].done && res[0].err == 14, 60)
+    clear_res()
+    url_to(port, "/ping", &u)
+    ahttp.aclient_get(&a, u.ptr, u.len, 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].done && res[0].err == 14, 61)
+
+    // ---- G: gzip
+    clear_res()
+    url_to(port, "/gzip", &u)
+    ahttp.aclient_get(&a, u.ptr, u.len, 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].done && res[0].err == 0 && res[0].status == 200 && res[0].n == 480, 70)
+
+    // ---- H: cookies
+    clear_res()
+    saw_cookie = 0
+    url_to(port, "/needcookie", &u)
+    ahttp.aclient_get(&a, u.ptr, u.len, 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].status == 403, 80) // no cookie yet
+    clear_res()
+    url_to(port, "/cookie", &u)
+    ahttp.aclient_get(&a, u.ptr, u.len, 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].status == 200, 81)
+    clear_res()
+    url_to(port, "/needcookie", &u)
+    ahttp.aclient_get(&a, u.ptr, u.len, 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].status == 200 && res[0].text_yes && saw_cookie == 1, 82)
+
+    // ---- I: silent server, total time
+    clear_res()
+    url_to(port, "/silent", &u)
+    let t0: i64 = loop.mono_ms()
+    ahttp.aclient_get(&a, u.ptr, u.len, 60, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].done && res[0].err == ahttp.AE_TIMEOUT, 90)
+    check(loop.mono_ms() - t0 >= 55 && loop.mono_ms() - t0 < 4000, 91)
+
+    // ---- J: refused, scheme, url
+    var lst: net.Listener = net.listen_tcp(net.ADDR_LOCAL, 0 as u16) catch net.listener_from_fd(0 - 1)
+    let dead: u16 = net.listener_port(&lst)
+    net.close_listener(&lst)
+    clear_res()
+    url_to(dead, "/len", &u)
+    ahttp.aclient_get(&a, u.ptr, u.len, 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].done && res[0].err == 5, 100)
+    clear_res()
+    ahttp.aclient_get_str(&a, "ftp://127.0.0.1/x", 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].done && res[0].err == 2, 101)
+    clear_res()
+    ahttp.aclient_get_str(&a, "not a url", 5000, on_done, 0)
+    run_all(&l, 5000)
+    check(res[0].done && res[0].err == 1, 102)
+
+    // ---- K: 3 MiB
+    clear_res()
+    url_to(port, "/big", &u)
+    ahttp.aclient_get(&a, u.ptr, u.len, 20000, on_done, 0)
+    run_all(&l, 20000)
+    check(res[0].done && res[0].err == 0 && res[0].n == 3145728 && res[0].ok_body, 110)
+
+    // ---- L: 100 at once
+    clear_res()
+    var npar: usize = 100
+    if loop.socket_limit(&l) != 0 {
+        npar = 12 // the Windows seam's poll is select(): 64 sockets (loop.fi A5)
+    }
+    want = npar
+    srv_requests = 0
+    url_to(port, "/len", &u)
+    var i: usize = 0
+    while i < npar {
+        ahttp.aclient_get(&a, u.ptr, u.len, 20000, on_done, i as u64)
+        i = i + 1
+    }
+    check(ahttp.aclient_active(&a) == npar, 120)
+    run_all(&l, 20000)
+    var good: u32 = 0
+    i = 0
+    while i < npar {
+        if res[i].done && res[i].err == 0 && res[i].status == 200 && res[i].n == 5000 && res[i].ok_body {
+            good = good + 1
+        }
+        i = i + 1
+    }
+    check(good == npar as u32, 121)
+    check(srv_requests == npar as u32, 122)
+    check(ahttp.aclient_active(&a) == 0, 123)
+
+    // names of errors
+    var nm: rt.Buf = rt.buf_new()
+    ahttp.areq_error_name(ahttp.AE_TIMEOUT, &nm)
+    check(nm.len == 7, 130)
+    rt.buf_clear(&nm)
+    ahttp.areq_error_name(14, &nm)
+    check(nm.len == 12, 131) // RedirectLoop
+    rt.buf_free(&nm)
+
+    rt.buf_free(&u)
+    stream.acceptor_close(acc)
+    let t1: i64 = loop.mono_ms()
+    while loop.watch_count(&l) > 0 && loop.mono_ms() - t1 < 1000 {
+        loop.run_once(&l, 10)
+    }
+    ahttp.aclient_free(&a)
+    loop.loop_free(&l)
+}
+
+fn main() -> i32 {
+    suite(false)
+    suite(true)
+    if fails != 0 {
+        return 1
+    }
+    return 0
+}

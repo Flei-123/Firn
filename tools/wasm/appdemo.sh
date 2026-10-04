@@ -19,7 +19,11 @@ cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 export FIRNLIB="$ROOT/lib"
 FIRNC=${FIRNC:-compiler/target/release/firnc}
-W=${W:-/tmp/firn-appdemo}
+# an own work directory per run (parallel workers shared the fixed /tmp name); removed at the end unless W= is given
+if [ -z "${W:-}" ]; then
+    W=$(mktemp -d "${TMPDIR:-/tmp}/firn-appdemo.XXXXXX")
+    trap 'rm -rf "$W"' EXIT
+fi
 mkdir -p "$W/ref"
 fail=0
 

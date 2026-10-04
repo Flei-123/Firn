@@ -73,6 +73,23 @@
 //    content plus the one type octet. Padding would hide the length of a
 //    request from a passive observer; not padding is what every browser
 //    does today and what this round measures.
+// N1 NON-BLOCKING MODE (round ASYNC, `tls_set_nonblocking`). The handshake
+//    is a state machine (`tls_handshake_step`): every call does as much as
+//    the octets that have arrived allow and answers `TlsError::WouldBlock`
+//    when it needs more -- nothing is lost, the next call goes on where this
+//    one stopped. `tls_handshake` is the same machine run in a loop, so
+//    both modes execute the SAME code. The socket must be non-blocking
+//    (std.net `set_nonblocking`); the caller waits for it to become readable
+//    (or writable, when `tls_out_pending` > 0) and calls again.
+// N2 OUTPUT IS BUFFERED in non-blocking mode: `tls_write` encrypts into an
+//    internal buffer and tries to send it at once; what the kernel does not
+//    take stays there until `tls_flush`. A caller that writes a lot should
+//    look at `tls_out_pending` and stop feeding while it is large.
+// N3 ONE RECORD AT A TIME: a record that has arrived only in part waits in
+//    the read buffer (`read_record` consumes nothing before the whole record
+//    stands there), so a `WouldBlock` in the middle of a record loses nothing.
+// N4 `tls_read` answers `WouldBlock` for "nothing more right now" and 0 for
+//    "the peer is done", exactly as read(2) does on a non-blocking socket.
 // T6 A CLOSE WITHOUT `close_notify` is reported as a clean end of stream
 //    for the body, because a large part of the web does exactly that and
 //    treating it as an error means failing on pages that work everywhere
@@ -101,6 +118,9 @@ export {
     tls_alert_desc, tls_chain_depth, tls_err_num, tls_err_name,
     tls_fail_into, tls_fail_len,
     SUITE_AES128GCM, SUITE_CHACHA20,
+    // round ASYNC -- non-blocking mode (see N1..N4 below)
+    tls_set_nonblocking, tls_handshake_step, tls_flush, tls_out_pending,
+    tls_is_nonblocking, tls_closed, tls_note_error,
 }
 
 error TlsError {
@@ -119,6 +139,7 @@ error TlsError {
     Unsupported, // an algorithm this round does not have
     TooLarge,
     Random, // the kernel would not give randomness
+    WouldBlock, // non-blocking mode: no more octets right now, call again
 }
 
 const SUITE_AES128GCM: u32 = 4865 // 0x1301
@@ -195,6 +216,16 @@ struct Tls {
     records_in: usize,
     records_out: usize,
     hs_bytes: usize,
+    // round ASYNC: non-blocking mode and the state of the handshake machine
+    nb: bool,
+    blocked: bool, // the last `fill` found no octets (EAGAIN)
+    wbuf: rt.Buf, // octets that still have to go to the socket (N2)
+    wpos: usize,
+    hs_step: u32, // 0 start, 1 ServerHello, 2 server flight, 3 done
+    hs_have_cert: bool,
+    hs_verified: bool,
+    hs_fin: bool,
+    certs: [x509.Cert; 10],
 }
 
 fn tls_new() -> Tls {
@@ -210,7 +241,10 @@ fn tls_new() -> Tls {
         p256_priv: [0; 32], p256_pub: [0; 65], group: 0 as u32,
         established: false, truncated: false, closed: false,
         verify: x509.V_PARSE, chain_depth: 0, ncerts: 0, alert_desc: 0,
-        now: 0, records_in: 0, records_out: 0, hs_bytes: 0 }
+        now: 0, records_in: 0, records_out: 0, hs_bytes: 0,
+        nb: false, blocked: false, wbuf: rt.buf_new(), wpos: 0, hs_step: 0 as u32,
+        hs_have_cert: false, hs_verified: false, hs_fin: false,
+        certs: [x509.cert_new(); 10] }
 }
 
 fn tls_init(t: *mut Tls, conn: *mut net.Conn, store: *mut x509.Store,
@@ -237,6 +271,7 @@ fn tls_free(t: *mut Tls) {
     rt.buf_free(&(*t).certbuf)
     rt.buf_free(&(*t).tr)
     rt.buf_free(&(*t).app)
+    rt.buf_free(&(*t).wbuf)
 }
 
 fn tls_established(t: *mut Tls) -> bool {
@@ -295,6 +330,7 @@ const RD_ERR: usize = 18446744073709551615
 // stream; `err` tells a failure apart from an end.
 fn fill(t: *mut Tls, need: usize, err: *mut bool) -> bool {
     *err = false
+    (*t).blocked = false
     while (*t).rbuf.len - (*t).rpos < need {
         // compact, so that a long connection does not grow the buffer
         if (*t).rpos > 0 && (*t).rpos == (*t).rbuf.len {
@@ -307,8 +343,20 @@ fn fill(t: *mut Tls, need: usize, err: *mut bool) -> bool {
             *err = true
             return false
         }
-        let k: usize = net.read((*t).conn, (*t).rbuf.ptr + have as u64,
-            MAX_RECORD) catch RD_ERR
+        var k: usize = 0
+        if (*t).nb {
+            (*(*t).conn).err = 0
+            k = net.read_nb((*t).conn, (*t).rbuf.ptr + have as u64,
+                MAX_RECORD) catch RD_ERR
+            if k == RD_ERR && net.conn_error((*t).conn) == 0 - 11 {
+                // EAGAIN (N1): not an error, not the end -- come back later
+                (*t).blocked = true
+                return false
+            }
+        } else {
+            k = net.read((*t).conn, (*t).rbuf.ptr + have as u64,
+                MAX_RECORD) catch RD_ERR
+        }
         if k == RD_ERR {
             *err = true
             return false
@@ -321,9 +369,63 @@ fn fill(t: *mut Tls, need: usize, err: *mut bool) -> bool {
     return true
 }
 
+// Sends what is in `wbuf`; false only on a real error. EAGAIN leaves the
+// rest there for the next call (N2).
+fn flush_nb(t: *mut Tls) -> bool {
+    while (*t).wpos < (*t).wbuf.len {
+        (*(*t).conn).err = 0
+        let k: usize = net.write_nb((*t).conn, (*t).wbuf.ptr + (*t).wpos as u64,
+            (*t).wbuf.len - (*t).wpos) catch RD_ERR
+        if k == RD_ERR {
+            if net.conn_error((*t).conn) == 0 - 11 {
+                return true
+            }
+            return false
+        }
+        if k == 0 {
+            return false
+        }
+        (*t).wpos = (*t).wpos + k
+    }
+    rt.buf_clear(&(*t).wbuf)
+    (*t).wpos = 0
+    return true
+}
+
 fn send_raw(t: *mut Tls, p: u64, n: usize) -> bool {
+    if (*t).nb {
+        rt.buf_push_bytes(&(*t).wbuf, p, n)
+        return flush_nb(t)
+    }
     let k: usize = net.write_all((*t).conn, p, n) catch RD_ERR
     return k == n
+}
+
+// Non-blocking mode (N1): the socket must be non-blocking already.
+fn tls_set_nonblocking(t: *mut Tls, on: bool) {
+    (*t).nb = on
+}
+
+fn tls_is_nonblocking(t: *mut Tls) -> bool {
+    return (*t).nb
+}
+
+fn tls_closed(t: *mut Tls) -> bool {
+    return (*t).closed
+}
+
+// Octets encrypted and waiting for the socket (N2).
+fn tls_out_pending(t: *mut Tls) -> usize {
+    return (*t).wbuf.len - (*t).wpos
+}
+
+// Tries to send them. true = no error (octets may remain: see
+// `tls_out_pending`); false = the socket failed.
+fn tls_flush(t: *mut Tls) -> bool {
+    if !(*t).nb {
+        return true
+    }
+    return flush_nb(t)
 }
 
 // -------------------------------------------------------- The record layer
@@ -394,6 +496,9 @@ fn aead_seal_suite(t: *mut Tls, nonce: u64, aad: u64, na: usize,
 fn read_record(t: *mut Tls, kind: *mut u32) -> TlsError!bool {
     var err: bool = false
     if !fill(t, 5, &err) {
+        if (*t).blocked {
+            return TlsError::WouldBlock
+        }
         if err {
             return TlsError::Io
         }
@@ -406,6 +511,9 @@ fn read_record(t: *mut Tls, kind: *mut u32) -> TlsError!bool {
         return TlsError::TooLarge
     }
     if !fill(t, 5 + len, &err) {
+        if (*t).blocked {
+            return TlsError::WouldBlock // N3: nothing was consumed
+        }
         if err {
             return TlsError::Io
         }
@@ -966,130 +1074,157 @@ fn ecdsa_from_der(leaf: *mut x509.Cert, digest: u64, hlen: usize,
 
 // ------------------------------------------------------------ The handshake
 
+// The blocking handshake: the machine below, run until it is done. On a
+// blocking socket `WouldBlock` cannot happen; if the socket is non-blocking
+// after all, the caller gets the error and may call `tls_handshake_step`
+// itself.
 fn tls_handshake(t: *mut Tls) -> TlsError!bool {
-    if !random.random_bytes((&(*t).priv[0]) as u64, 32) {
-        return TlsError::Random
+    while true {
+        let done: bool = try tls_handshake_step(t)
+        if done {
+            return true
+        }
     }
-    if !x25519.x25519_base((&(*t).priv[0]) as u64,
-        (&(*t).pub_key[0]) as u64) {
-        return TlsError::Random
+    return true
+}
+
+// ONE STEP of the handshake (N1). true = established. The error
+// `WouldBlock` means: more octets are needed, call again when the socket is
+// readable; every other error is final. The state lives in the struct
+// (`hs_step` and the flags), the transcript and the buffers are as they
+// were, so a step that stops early loses nothing.
+fn tls_handshake_step(t: *mut Tls) -> TlsError!bool {
+    if (*t).established {
+        return true
     }
-    // the secp256r1 share: a scalar in 1 .. n-1 (a draw outside is
-    // astronomically rare, but it is checked, not assumed)
-    var drawn: bool = false
-    var tries: usize = 0
-    while !drawn && tries < 8 {
-        if !random.random_bytes((&(*t).p256_priv[0]) as u64, 32) {
+    if (*t).hs_step == 0 as u32 {
+        if !random.random_bytes((&(*t).priv[0]) as u64, 32) {
             return TlsError::Random
         }
-        if p256.p256_scalar_valid((&(*t).p256_priv[0]) as u64) {
-            drawn = true
+        if !x25519.x25519_base((&(*t).priv[0]) as u64,
+            (&(*t).pub_key[0]) as u64) {
+            return TlsError::Random
         }
-        tries = tries + 1
-    }
-    if !drawn || !p256.p256_public((&(*t).p256_priv[0]) as u64,
-        (&(*t).p256_pub[0]) as u64) {
-        return TlsError::Random
-    }
-    var ch: rt.Buf = rt.buf_new()
-    if !build_client_hello(t, &ch) {
+        // the secp256r1 share: a scalar in 1 .. n-1 (a draw outside is
+        // astronomically rare, but it is checked, not assumed)
+        var drawn: bool = false
+        var tries: usize = 0
+        while !drawn && tries < 8 {
+            if !random.random_bytes((&(*t).p256_priv[0]) as u64, 32) {
+                return TlsError::Random
+            }
+            if p256.p256_scalar_valid((&(*t).p256_priv[0]) as u64) {
+                drawn = true
+            }
+            tries = tries + 1
+        }
+        if !drawn || !p256.p256_public((&(*t).p256_priv[0]) as u64,
+            (&(*t).p256_pub[0]) as u64) {
+            return TlsError::Random
+        }
+        var ch: rt.Buf = rt.buf_new()
+        if !build_client_hello(t, &ch) {
+            rt.buf_free(&ch)
+            return TlsError::Random
+        }
+        rt.buf_push_bytes(&(*t).tr, ch.ptr, ch.len)
+        (*t).hs_bytes = (*t).hs_bytes + ch.len
+        let sent: bool = write_record(t, REC_HANDSHAKE, ch.ptr, ch.len)
         rt.buf_free(&ch)
-        return TlsError::Random
-    }
-    rt.buf_push_bytes(&(*t).tr, ch.ptr, ch.len)
-    (*t).hs_bytes = (*t).hs_bytes + ch.len
-    let sent: bool = write_record(t, REC_HANDSHAKE, ch.ptr, ch.len)
-    rt.buf_free(&ch)
-    if !sent {
-        return TlsError::Io
-    }
-    // the middlebox compatibility record (RFC 8446 D.4)
-    var ccs: [u8; 1] = [1; 1]
-    let ok_ccs: bool = write_record(t, REC_CHANGE_CIPHER,
-        (&ccs[0]) as u64, 1)
-
-    var htype: u32 = 0
-    var hoff: usize = 0
-    var hlen: usize = 0
-    let got: bool = try next_handshake(t, &htype, &hoff, &hlen)
-    if htype != HS_SERVER_HELLO {
-        return TlsError::Protocol
-    }
-    var share: usize = 0
-    let okh: bool = try parse_server_hello(t, (*t).hsin.ptr, hoff, hlen,
-        &share)
-    if !install_handshake_keys(t, (*t).hsin.ptr + share as u64) {
-        return TlsError::Protocol
-    }
-
-    var certs: [x509.Cert; 10] = [x509.cert_new(); 10]
-    var ncerts: usize = 0
-    var have_cert: bool = false
-    var verified: bool = false
-    var saw_finished: bool = false
-    while !saw_finished {
-        var ht: u32 = 0
-        var ho: usize = 0
-        var hl: usize = 0
-        // The transcript up to but NOT including this message -- the
-        // CertificateVerify and the Finished are each computed over
-        // everything BEFORE themselves.
-        let before: usize = (*t).tr.len
-        let g2: bool = try next_handshake(t, &ht, &ho, &hl)
-        if ht == HS_ENCRYPTED_EXT {
-            parse_encrypted_extensions(t, (*t).hsin.ptr, ho, hl)
-        } else if ht == HS_CERT_REQUEST {
-            // T3: noted, and answered with an empty Certificate below.
-            have_cert = have_cert
-        } else if ht == HS_CERTIFICATE {
-            rt.buf_clear(&(*t).certbuf)
-            rt.buf_push_bytes(&(*t).certbuf, (*t).hsin.ptr + ho as u64, hl)
-            let g3: bool = try parse_certificate(t, (*t).certbuf.ptr, 0, hl,
-                &certs, &ncerts)
-            (*t).ncerts = ncerts
-            var res: x509.VerifyResult = x509.VerifyResult { reason: 0,
-                depth: 0, anchor: 0 }
-            (*t).verify = x509.verify_chain((*t).store, &certs, ncerts,
-                (&(*t).host[0]) as u64, (*t).hostlen, (*t).now, &res)
-            (*t).chain_depth = res.depth
-            if (*t).verify != x509.V_OK {
-                send_alert(t, 2 as u32, 48 as u32) // unknown_ca
-                return TlsError::Certificate
-            }
-            have_cert = true
-        } else if ht == HS_CERT_VERIFY {
-            if !have_cert || hl < 4 {
-                return TlsError::Protocol
-            }
-            let alg: u32 = be16((*t).hsin.ptr, ho)
-            let slen: usize = be16((*t).hsin.ptr, ho + 2) as usize
-            if 4 + slen > hl {
-                return TlsError::Protocol
-            }
-            let g4: bool = try verify_certverify(t, &certs[0], alg,
-                (*t).hsin.ptr + (ho + 4) as u64, slen, before)
-            verified = true
-        } else if ht == HS_FINISHED {
-            if !verified {
-                return TlsError::Signature
-            }
-            var fkey: [u8; 32] = [0; 32]
-            if !keys.finished_key((&(*t).s_hs_secret[0]) as u64,
-                (&fkey[0]) as u64) {
-                return TlsError::Protocol
-            }
-            var want: [u8; 32] = [0; 32]
-            keys.finished_mac((&fkey[0]) as u64, (*t).tr.ptr, before,
-                (&want[0]) as u64)
-            if hl != 32 || !chacha.tag_equal((&want[0]) as u64,
-                (*t).hsin.ptr + ho as u64, 32) {
-                return TlsError::Finished
-            }
-            saw_finished = true
-        } else if ht == HS_KEY_UPDATE {
-            send_alert(t, 2 as u32, 40 as u32) // handshake_failure -- T2
-            return TlsError::Unsupported
+        if !sent {
+            return TlsError::Io
         }
+        // the middlebox compatibility record (RFC 8446 D.4)
+        var ccs: [u8; 1] = [1; 1]
+        let ok_ccs: bool = write_record(t, REC_CHANGE_CIPHER,
+            (&ccs[0]) as u64, 1)
+        (*t).hs_step = 1 as u32
+    }
+
+    if (*t).hs_step == 1 as u32 {
+        var htype: u32 = 0
+        var hoff: usize = 0
+        var hlen: usize = 0
+        let got: bool = try next_handshake(t, &htype, &hoff, &hlen)
+        if htype != HS_SERVER_HELLO {
+            return TlsError::Protocol
+        }
+        var share: usize = 0
+        let okh: bool = try parse_server_hello(t, (*t).hsin.ptr, hoff, hlen,
+            &share)
+        if !install_handshake_keys(t, (*t).hsin.ptr + share as u64) {
+            return TlsError::Protocol
+        }
+        (*t).hs_step = 2 as u32
+    }
+
+    if (*t).hs_step == 2 as u32 {
+        while !(*t).hs_fin {
+            var ht: u32 = 0
+            var ho: usize = 0
+            var hl: usize = 0
+            // The transcript up to but NOT including this message -- the
+            // CertificateVerify and the Finished are each computed over
+            // everything BEFORE themselves.
+            let before: usize = (*t).tr.len
+            let g2: bool = try next_handshake(t, &ht, &ho, &hl)
+            if ht == HS_ENCRYPTED_EXT {
+                parse_encrypted_extensions(t, (*t).hsin.ptr, ho, hl)
+            } else if ht == HS_CERT_REQUEST {
+                // T3: noted, and answered with an empty Certificate below.
+                (*t).hs_have_cert = (*t).hs_have_cert
+            } else if ht == HS_CERTIFICATE {
+                rt.buf_clear(&(*t).certbuf)
+                rt.buf_push_bytes(&(*t).certbuf, (*t).hsin.ptr + ho as u64, hl)
+                (*t).ncerts = 0
+                let g3: bool = try parse_certificate(t, (*t).certbuf.ptr, 0, hl,
+                    &(*t).certs, &(*t).ncerts)
+                var res: x509.VerifyResult = x509.VerifyResult { reason: 0,
+                    depth: 0, anchor: 0 }
+                (*t).verify = x509.verify_chain((*t).store, &(*t).certs,
+                    (*t).ncerts, (&(*t).host[0]) as u64, (*t).hostlen,
+                    (*t).now, &res)
+                (*t).chain_depth = res.depth
+                if (*t).verify != x509.V_OK {
+                    send_alert(t, 2 as u32, 48 as u32) // unknown_ca
+                    return TlsError::Certificate
+                }
+                (*t).hs_have_cert = true
+            } else if ht == HS_CERT_VERIFY {
+                if !(*t).hs_have_cert || hl < 4 {
+                    return TlsError::Protocol
+                }
+                let alg: u32 = be16((*t).hsin.ptr, ho)
+                let slen: usize = be16((*t).hsin.ptr, ho + 2) as usize
+                if 4 + slen > hl {
+                    return TlsError::Protocol
+                }
+                let g4: bool = try verify_certverify(t, &(*t).certs[0], alg,
+                    (*t).hsin.ptr + (ho + 4) as u64, slen, before)
+                (*t).hs_verified = true
+            } else if ht == HS_FINISHED {
+                if !(*t).hs_verified {
+                    return TlsError::Signature
+                }
+                var fkey: [u8; 32] = [0; 32]
+                if !keys.finished_key((&(*t).s_hs_secret[0]) as u64,
+                    (&fkey[0]) as u64) {
+                    return TlsError::Protocol
+                }
+                var want: [u8; 32] = [0; 32]
+                keys.finished_mac((&fkey[0]) as u64, (*t).tr.ptr, before,
+                    (&want[0]) as u64)
+                if hl != 32 || !chacha.tag_equal((&want[0]) as u64,
+                    (*t).hsin.ptr + ho as u64, 32) {
+                    return TlsError::Finished
+                }
+                (*t).hs_fin = true
+            } else if ht == HS_KEY_UPDATE {
+                send_alert(t, 2 as u32, 40 as u32) // handshake_failure -- T2
+                return TlsError::Unsupported
+            }
+        }
+        (*t).hs_step = 3 as u32
     }
 
     // the client's own Finished, over the transcript INCLUDING the
@@ -1115,6 +1250,7 @@ fn tls_handshake(t: *mut Tls) -> TlsError!bool {
         return TlsError::Protocol
     }
     (*t).established = true
+    (*t).hs_step = 4 as u32
     return true
 }
 
@@ -1190,6 +1326,9 @@ fn tls_read(t: *mut Tls, out: u64, max: usize) -> TlsError!usize {
         var err: bool = false
         // A clean end of stream without close_notify -- see T6.
         if !fill(t, 5, &err) {
+            if (*t).blocked {
+                return TlsError::WouldBlock // N4
+            }
             (*t).closed = true
             if err {
                 return TlsError::Io
@@ -1253,19 +1392,20 @@ fn tls_err_num(e: TlsError) -> u32 {
     if e == TlsError::Decrypt { return 12 as u32 }
     if e == TlsError::Unsupported { return 13 as u32 }
     if e == TlsError::TooLarge { return 14 as u32 }
+    if e == TlsError::WouldBlock { return 16 as u32 }
     return 15 as u32
 }
 
 fn tls_err_name(e: TlsError, out: *mut rt.Buf) {
-    var t: [u8; 103] = "IoClosedProtocolVersionGroupSuiteRetryAlertCertificateSignatureFinishedDecryptUnsupportedTooLargeRandom"
-    var offs: [usize; 16] = [0, 0, 2, 8, 16, 23, 28, 33, 38, 43, 54, 63,
-        71, 78, 89, 97]
-    var lens: [usize; 16] = [0, 2, 6, 8, 7, 5, 5, 5, 5, 11, 9, 8, 7, 11,
-        8, 6]
+    var t: [u8; 113] = "IoClosedProtocolVersionGroupSuiteRetryAlertCertificateSignatureFinishedDecryptUnsupportedTooLargeRandomWouldBlock"
+    var offs: [usize; 17] = [0, 0, 2, 8, 16, 23, 28, 33, 38, 43, 54, 63,
+        71, 78, 89, 97, 103]
+    var lens: [usize; 17] = [0, 2, 6, 8, 7, 5, 5, 5, 5, 11, 9, 8, 7, 11,
+        8, 6, 10]
     let k: u32 = tls_err_num(e)
     var i: usize = k as usize
-    if i > 15 {
-        i = 15
+    if i > 16 {
+        i = 16
     }
     rt.buf_push_bytes(out, (&t[0]) as u64 + offs[i] as u64, lens[i])
 }
@@ -1284,4 +1424,16 @@ fn tls_fail_into(out: *mut rt.Buf, e: TlsError, failed: *mut bool) -> bool {
 fn tls_fail_len(out: *mut rt.Buf, e: TlsError, failed: *mut bool) -> usize {
     let ok: bool = tls_fail_into(out, e, failed)
     return 0
+}
+
+// `catch |e| tls.tls_note_error(&slot, e)`: stores `tls_err_num(e)` in
+// `*slot` unless the error is WouldBlock (then 0), and answers false. For a
+// non-blocking driver (lib/async/stream.fi) that must tell "call again"
+// from "failed" without naming the error type.
+fn tls_note_error(slot: *mut u32, e: TlsError) -> bool {
+    *slot = 0 as u32
+    if e != TlsError::WouldBlock {
+        *slot = tls_err_num(e)
+    }
+    return false
 }

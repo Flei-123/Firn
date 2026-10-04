@@ -41,7 +41,12 @@ cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 export FIRNLIB="$ROOT/lib"
 export FIRNC=${FIRNC:-$ROOT/compiler/target/release/firnc}
-export W=${W:-/tmp/firn-wasm-run}
+# an own work directory per run (parallel workers shared the fixed /tmp name); removed at the end unless W= is given
+if [ -z "${W:-}" ]; then
+    W=$(mktemp -d "${TMPDIR:-/tmp}/firn-wasm-run.XXXXXX")
+    trap 'rm -rf "$W"' EXIT
+fi
+export W
 LEVELS=${LEVELS:-"release-fast dev dev-fast release-safe"}
 JOBS=${JOBS:-8}
 export LEVELS ROOT

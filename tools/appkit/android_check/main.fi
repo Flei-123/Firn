@@ -1,0 +1,176 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/appkit/android_check/main.fi -- THE TEST APP of tools/appkit/android_check.sh.
+//
+// The smallest Android program built on lib/appkit: a window (its colour is
+// derived from the version, so a screenshot tells the versions apart) and
+// the update flow, driven by the first line of args.txt:
+//
+//   (empty)    just run: boot bookkeeping, confirm, show the window
+//   update     check the store, download, hand the APK to the PackageInstaller
+//   check      check the store only
+//
+// Every answer is one line "KEY value ..." on stdout; the Android host
+// writes stdout to <files>/stdout.txt, so `adb shell cat` reads it.
+//
+// Build: tools/appkit/android_check.sh (it sets FIRN_E2E_*; the store is the
+// host's loopback as the emulator sees it: http://10.0.2.2:<port>/).
+import std.rt
+import std.io
+import std.time
+import window.window
+import appkit.appinfo
+import appkit.platform
+import appkit.update
+import appkit.log
+import appkit.util
+
+const VERSION: str = __env_or("FIRN_E2E_VERSION", "0.1.0")
+const STORE_URL: str = __env_or("FIRN_E2E_STORE", "http://10.0.2.2:8099/")
+const STORE_KEY: str = __env_or("FIRN_E2E_KEY", "0000000000000000000000000000000000000000000000000000000000000000")
+const CHANNEL: str = __env_or("FIRN_E2E_CHANNEL", "stabil")
+
+// a thread worker is never used on Android (plat_threads is false), but the
+// runtime wants the dispatcher in every program that links appkit.update
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    return update.thread_dispatch(kind, arg)
+}
+
+fn say(label: str, v: str) {
+    io.print(label)
+    io.print(" ")
+    io.print_line(v)
+}
+
+fn say_num(label: str, v: u64) {
+    var b: rt.Buf = rt.buf_new()
+    util.buf_push_str(&b, label)
+    rt.buf_push(&b, 32 as u8)
+    rt.buf_push_dec_u64(&b, v)
+    rt.buf_push(&b, 10 as u8)
+    io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+fn report(u: *mut update.Updater) {
+    let s: *mut update.Status = update.update_status(u)
+    var b: rt.Buf = rt.buf_new()
+    util.buf_push_str(&b, "RESULT ")
+    util.buf_push_str(&b, update.status_text((*s).phase))
+    util.buf_push_str(&b, " err=")
+    rt.buf_push_dec_u64(&b, (*s).err)
+    util.buf_push_str(&b, " ver=")
+    util.buf_push_str(&b, update.status_version(s))
+    util.buf_push_str(&b, " size=")
+    rt.buf_push_dec_u64(&b, (*s).size)
+    rt.buf_push(&b, 10 as u8)
+    io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    if (*s).nerr > 0 {
+        say("ERRTEXT", update.status_error(s))
+    }
+}
+
+// a colour from the version text, so every version looks different
+fn color_of(s: str) -> u32 {
+    // FNV-1a in 64 bits, cut to 32 (a u32 multiplication would panic on overflow)
+    var h: u64 = 2166136261
+    var i: usize = 0
+    while i < s.n {
+        h = ((h ^ (rt.ld8(s.p as u64, i) as u64)) * 16777619) & 4294967295
+        i = i + 1
+    }
+    return ((h & 16777215) | 4278190080) as u32
+}
+
+fn paint(f: *mut window.Window, color: u32) {
+    let ok: bool = window.fill(f, color, 0, 0, window.width(f), window.height(f))
+    let ok2: bool = window.present(f)
+}
+
+fn main(start: u64) -> i32 {
+    platform.plat_init(start)
+    var spec: appinfo.AppSpec = appinfo.AppSpec { id: "appkitcheck", name: "Appkit Check",
+        vendor: "FirnE2E", version: VERSION, build: 0, channel: CHANNEL,
+        store_url: STORE_URL, store_key: STORE_KEY, android_id: "org.firn.appkitcheck" }
+    if !appinfo.appinfo_init(spec) {
+        say("FATAL", "appinfo_init failed")
+        return 2
+    }
+    let u: *mut update.Updater = update.update_new()
+    if !update.update_init(u) {
+        say("FATAL", "update_init failed")
+        return 2
+    }
+    update.update_set_verify_tls(u, false)
+    var logdir: rt.Buf = rt.buf_new()
+    platform.plat_dir(platform.DIR_LOG, appinfo.app_id(), appinfo.app_vendor(), &logdir)
+    log.log_open(util.buf_to_str_copy(&logdir), "check", log.LOG_DEBUG, 262144, 2)
+    rt.buf_free(&logdir)
+    update.update_boot(u)
+    say("RUNNING", VERSION)
+    say("PLATFORM", platform.plat_id())
+    say("ART", platform.plat_art())
+    var loc: rt.Buf = rt.buf_new()
+    platform.plat_locale(&loc)
+    say("LOCALE", util.buf_to_str_copy(&loc))
+    rt.buf_free(&loc)
+    if update.update_started_after_update() { say("STARTED", "after-update") }
+
+    var f: window.Window = window.window_new()
+    if !window.open_window(&f, 0) {
+        say("FATAL", "no window")
+        return 1
+    }
+    if !window.make(&f, 360, 640) {
+        say("FATAL", "no surface")
+        return 1
+    }
+    let shown: bool = window.show_window(&f)
+    let color: u32 = color_of(VERSION)
+    paint(&f, color)
+    update.update_mark_healthy(u)
+    say("HEALTHY", VERSION)
+
+    let cmd: str = update.update_user_arg(1)
+    if cmd == "check" || cmd == "update" {
+        var op: u32 = update.OP_CHECK
+        if cmd == "update" { op = update.OP_FETCH }
+        // no threads, no second process on Android: this runs right here
+        if !update.update_start(u, op, update.RUN_AUTO) {
+            say("FATAL", "update_start failed")
+        } else {
+            report(u)
+            let s: *mut update.Status = update.update_status(u)
+            if cmd == "update" && (*s).phase == update.PH_READY {
+                var args: util.Args = util.args_new()
+                let rc: u32 = update.update_apply(u, &args)
+                util.args_free(&args)
+                say_num("APPLY", rc as u64)
+                report(u)
+            }
+        }
+        paint(&f, color)
+    }
+    var runs: bool = true
+    var ticks: u64 = 0
+    while runs {
+        let w: bool = window.wait_event(&f, 1000)
+        var k: u32 = window.next_event(&f)
+        while k != window.EV_NONE {
+            if k == window.EV_CLOSED {
+                runs = false
+            } else if k == window.EV_KEY && window.ev_a(&f) == window.K_ESCAPE {
+                runs = false
+            } else if k == window.EV_EXPOSE || k == window.EV_CONFIGURE {
+                paint(&f, color)
+            }
+            k = window.next_event(&f)
+        }
+        ticks = ticks + 1
+        if ticks % 10 == 0 {
+            say_num("ALIVE", ticks)
+        }
+    }
+    window.close_window(&f)
+    return 0
+}

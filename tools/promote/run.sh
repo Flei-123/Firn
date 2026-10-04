@@ -13,7 +13,11 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 export FIRNLIB="$PWD/lib"
 FIRNC=${FIRNC:-compiler/target/release/firnc}
-W=${W:-/tmp/firn-promote-run}
+# an own work directory per run (parallel workers shared the fixed /tmp name); removed at the end unless W= is given
+if [ -z "${W:-}" ]; then
+    W=$(mktemp -d "${TMPDIR:-/tmp}/firn-promote-run.XXXXXX")
+    trap 'rm -rf "$W"' EXIT
+fi
 mkdir -p "$W"
 PROGS="tests/1720_promote_regions.fi tests/1722_fp_args_cache.fi tests/1721_wasm_tree_phi.fi tests/1000_js_lex.fi tests/1002_js_interp.fi tests/1501_js_regexp.fi tests/1503_js_r74_gc.fi tests/065_deep_nesting.fi examples/bubblesort.fi examples/fib.fi"
 pass=0; fail=0

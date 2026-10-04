@@ -34,10 +34,10 @@ any application that starts programs.
 
 | module | what it does | held against |
 |---|---|---|
-| `std.process` (`lib/std/process.fi`, `process.windows.fi`) | start a program with arguments, working directory, changed environment; stdin/stdout/stderr inherited, piped or discarded; blocking and non-blocking reads; wait (with timeout), try_wait, exit code, kill/terminate, detach, `no_window`; `run_capture`/`run_io` collect both outputs while feeding input without deadlock; every failure is a `ProcError` | 3 MiB both ways through a child, 300 KB on stdout+stderr, 300 starts without a leak (`tests/2062`-`2064`, Linux, AArch64, Wine) |
+| `std.process` (`lib/std/process.fi`, `process.windows.fi`) | start a program with arguments, working directory, changed environment; stdin/stdout/stderr inherited, piped or discarded; blocking and non-blocking reads; wait (with timeout), try_wait, exit code, kill/terminate, whole process trees (`set_group`, `kill_tree`, `terminate_tree`: a process group on Linux, a job object on Windows; `set_kill_with_launcher` on Windows), detach, `no_window`; `run_capture`/`run_io` collect both outputs while feeding input without deadlock; every failure is a `ProcError` | 3 MiB both ways through a child, 300 KB on stdout+stderr, 300 starts without a leak (`tests/2062`-`2064`, Linux, AArch64, Wine); the tree kill by a grandchild that holds the pipe open (`tests/2100`, Linux and Wine; see [WINDOWS_THREADS.md](WINDOWS_THREADS.md)) |
 | `std.shell` (`lib/std/shell.fi`) | `open_url`, `open_path`, `reveal_in_file_manager`, `find_in_path`, home/config/data/cache/temp/Minecraft directories, `find_java`/`java_candidates`/`java_major_version` | a fake `xdg-open` and fake `java` scripts (`tests/2061`) |
 | `std.env` (`lib/std/env.fi`) | read the environment, `find_executable` (`which`) | the kernel's `/proc/self/environ`, `sh` on PATH |
-| `std.pool` (`lib/std/pool.fi`) | fixed worker threads, bounded job queue, results; Linux only (Windows runs jobs inline) | `tests/2065`: 5000 jobs once each, parallel speed-up, GC on workers |
+| `std.pool` (`lib/std/pool.fi`) | fixed worker threads, bounded job queue, results; Linux and Windows (real `CreateThread` threads since round WIN-THREADS, [WINDOWS_THREADS.md](WINDOWS_THREADS.md)) | `tests/2065`: 5000 jobs once each, parallel speed-up, GC on workers |
 | `std.cmdline` (`lib/std/cmdline.fi`) | Windows command line quoting/splitting by the rules of the C runtime, UTF-8 <-> UTF-16 | the published examples + round trip (`tests/2060`) |
 | FLEILAUNCHER | `net.dns` (`lib/net/dns.fi`), `net.udp`, `net.dnsconf`, `tls.trust`; `net.http` now fetches `https://host/...` | DNS by name: A/AAAA, CNAME chains, UDP with retry and a doubling timeout, TCP fallback on TC, random transaction ID, answers accepted only from the server asked, TTL cache, hosts file, resolv.conf (Linux) / GetNetworkParams (Windows); `https://` through the TLS 1.3 client with the system's roots (PEM bundle on Linux, the certificate store on Windows) and the certificate checked against the NAME; secp256r1 added next to X25519 because Azure Front Door (`piston-meta.mojang.com`) refuses X25519-only. See [DNS.md](DNS.md) | a fake DNS server in Python (the server's log is counted), real answers of 1.1.1.1 decoded by an independent Python reader, `getaddrinfo`/`dig`/`curl` on the real network, a hermetic Python TLS server with a test CA (`tools/dns/run.sh`, also the Windows build under Wine) |
 
@@ -71,3 +71,43 @@ general. Each has a positive test in `tests/` or a check in `tools/fui/run.sh`.
 | `lib/fui/markdownview.fi` | a scrolling Markdown view: wrapped text, headings, lists, quotes, code, tables, task boxes, links with a click callback, images through an async hook (placeholder, ready, failed) | `tools/fui/mdview_main.fi`: pixels in light and dark, wide and narrow, WCAG 2 contrast |
 | `lib/fui/kit.fi`, `lib/fui/kitcolor.fi` (`docs/fui-kit.md`) | button, toasts, modal with focus trap, tab bar and sidebar with symbols, tile grid with avatars, search field with clear button, progress bar with a label that reads on fill and track; the launcher accent as readable text on any ground | `tools/fui/kit_main.fi` (pixels, hit functions, focus ring, icon-free variants, every colour pair), `tools/fui/kitlive.py` (the example in a real window on Xvfb) |
 
+## Async IO (round ASYNC)
+
+One thread for many connections: an event loop with timers, non-blocking TCP
+and TLS streams, an HTTP client and a WebSocket client that run on it, a way to
+hand results from other threads to the UI thread, and a wait that serves a
+window and the loop together. Design, API, what was proved against what, and
+the honest list of gaps: [ASYNC.md](ASYNC.md).
+
+| module | what it does | held against |
+|---|---|---|
+| `async.loop` (`lib/async/loop.fi`) | descriptors (epoll on Linux x86-64/AArch64, `poll` everywhere, `select` through the Windows seam), timers in a heap, deferred calls, `wake` from threads, hooks, a descriptor to embed in another wait (`loop_fd`) | the kernel; 4 build levels, AArch64 (qemu), Windows (Wine) (`tests/2120`) |
+| `async.stream` | non-blocking TCP and TLS-client streams with one callback, input kept until consumed, output queue and back pressure, one lazy timeout per stream, an acceptor | echo with 120 clients, refused connect, idle timeout, 4 MiB through a closed window (`tests/2121`); **1000 connections open at once against Python asyncio**, both directions (`tools/async/check_conn.py`) |
+| `tls.tls` (additions) | the client handshake as a state machine (`tls_handshake_step`, `WouldBlock`), buffered output; the blocking `tls_handshake` runs the same code in a loop | an in-process TLS server that dribbles 1-7 octets per ms, wrong name and unknown CA (`tests/2122`); the blocking suites (`tools/tls/run.sh`) unchanged |
+| `async.ahttp` | HTTP/1.1 client on the loop over `net.http`'s request/head/cookie/gzip code: Content-Length, chunked, until-close, redirects, timeouts, https | 100 requests at once, dribbled chunked, redirect loop, gzip, cookies (`tests/2123`) |
+| `async.wsc` (+ `ws.ws` additions) | WebSocket client: ws/wss, ping/pong, keep-alive, fragmentation both ways, closing handshake with timeout, reconnect with backoff | an in-process server (and `tls_server.fi`) with every violation the codec knows (`tests/2124`); **real wss:// echo services** (`tools/async/wss_main.fi`) |
+| `async.post` | `post` from any thread to the loop thread, a bridge that runs blocking work on `std.pool` and answers on the loop thread | 4 threads x 500 posts in order, GC on workers while the loop sleeps, 25 stress runs (`tests/2125`) |
+| `std.net` (additions) | `set_nonblocking`, `read_nb`/`write_nb`/`accept_nb`, `connect_nb` + `connect_finish`, `sock_error` | all of the above |
+| `window.wait_any_fd`, `fuiwin.window_wait_many_fd` | wait for window events and a descriptor (the loop's) at once; a window with an event wins | a window + loop on an Xvfb: results arrive with no window event, an idle second costs no CPU (`tools/async/check_ui.py`) |
+
+`bash tools/async/run.sh` runs the outside checks (test.sh section 77);
+`bash tools/async/winkit.sh` builds the kit for a real Windows machine.
+
+## The application kit (appkit)
+
+A new Firn program should get updates from the own signed store, settings, a
+log with rotation, crash reports, a single-instance lock and translated texts
+without writing them again (FleiLauncher is the first user). The map, the
+store format it reads and extends, the update flow, the platform layer and its
+honest gaps: [APPKIT.md](APPKIT.md).
+
+| module | what it does | held against |
+|---|---|---|
+| `appkit.update`, `appkit.catalog`, `appkit.fetch`, `appkit.version`, `std.crypto.ed25519` (`lib/appkit/`, `lib/std/crypto/ed25519.fi`) | the update client for the real store (`entry.json` + `index.json`, Ed25519 signatures, freshness and rollback protection, channels per platform, semver + build id): check, streamed download with SHA-256 and progress, atomic replacement of the running program, a confirmation by the new program and **rollback** when it crashes or hangs; a background thread, a worker process or a blocking call; on Android the system's PackageInstaller | `tools/appkit/e2e.sh`: 60 checks against a local store (a changed byte, a wrong signature, a wrong key, an expired or older catalog, redirects, cut-off and slow answers, a real replacement, rollback after a crash and a hang), Linux and Windows (Wine); `tools/appkit/android_check.sh` on the emulator; the RFC 8032 vectors and a real store entry (`tests/2050`); the live store read-only |
+| `appkit.platform*` (`platform.fi`, `platform.windows.fi`, `lib/@android/appkit/platform.fi`, `platform_macos.fi`, `platform_osum.fi`) | one interface, one file per platform: directories, lock, spawn, language, replacing the program | `tools/appkit/platforms.py` (same names, same signatures, each type-checks); macOS and OrientOS are **untested stubs** |
+| `appkit.config`, `appkit.log`, `appkit.crash`, `appkit.single_instance`, `appkit.texts`, `appkit.appinfo` | settings in one JSON file (atomic), a log with rotation, crash reports made by the next start, one copy per user, `.opmsg` texts (English and German built in), who the program is | `tests/2051`-`2056` in every build mode and under Wine |
+| `templates/app` + `tools/newapp.sh` | `newapp.sh <Name> <app-id>` writes a runnable fUi program (sidebar, Settings, Updates, About, update banner, dark with a green accent) with build scripts for Linux, Windows and Android and a `release.sh` that publishes into the store | `tools/appkit/newapp_test.sh` (generate, build, start under Xvfb with a self-test, dry-run release) |
+
+The store side (`store add-app`: `exe`, `bin`, `appimage`, `macos-app`
+packages, per-platform channel pointers, `mindestFassung`) is in the
+orientstore repository, `docs/KATALOG-FORMAT.md`.
