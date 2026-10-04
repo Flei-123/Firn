@@ -1034,6 +1034,7 @@ mod tests {
                     name: p.to_string(),
                     ty: TypeExpr::Named("i64".to_string(), sp(1, 1)),
                     span: sp(1, 10),
+                    refk: 0,
                 })
                 .collect(),
             ret: None,

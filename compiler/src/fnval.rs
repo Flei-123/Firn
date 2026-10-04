@@ -365,6 +365,7 @@ pub(crate) fn closure_params(d: &LambdaDecl) -> Vec<Param> {
             span: d.span,
         },
         span: d.span,
+        refk: 0,
     });
     ps
 }

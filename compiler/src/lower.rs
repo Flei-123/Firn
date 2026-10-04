@@ -1721,6 +1721,13 @@ impl<'a> Lower<'a> {
                     let name = format!("{}__drop", prefix);
                     self.push_void(FTy::Void, Op::Call { name, args: vec![addr] });
                 }
+                // r200: an enum keeps its variants' payloads on top of one
+                // another -- only the payload of the variant that is
+                // stored may be destroyed, chosen by the tag at run time.
+                if let Some(def) = crate::sema_match::enum_by_struct(*i) {
+                    self.emit_enum_drop(addr, &def);
+                    return;
+                }
                 for (a, ft) in self.drop_field_addrs(addr, *i) {
                     self.emit_drop(a, &ft);
                 }
@@ -1740,6 +1747,38 @@ impl<'a> Lower<'a> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// r200: destroys the payload of the stored variant of the enum at
+    /// `addr` (nothing for a variant without a `drop` in its payload).
+    fn emit_enum_drop(&mut self, addr: Val, def: &crate::sema_match::EnumDef) {
+        let mut tag: Option<Val> = None;
+        for v in &def.variants {
+            if !v.fields.iter().any(|t| self.needs_drop(t)) {
+                continue;
+            }
+            let t = match tag {
+                Some(t) => t,
+                None => {
+                    let t = self.load(FTy::U32, addr);
+                    tag = Some(t);
+                    t
+                }
+            };
+            let k = self.constant(FTy::U32, v.tag);
+            let hit = self.push(FTy::Bool, Op::Cmp { op: CmpOp::Eq, ty: FTy::U32, a: t, b: k });
+            let body = self.new_block();
+            let next = self.new_block();
+            self.set_term(Term::BrCond { cond: hit, then_bb: body, else_bb: next });
+            self.cur = body;
+            // the addresses of ALL the payload fields that own something are
+            // computed first (layout.rs), then each one is destroyed
+            for (a, ty) in self.variant_drop_addrs(addr, v) {
+                self.emit_drop(a, &ty);
+            }
+            self.set_term(Term::Br(next));
+            self.cur = next;
         }
     }
 
@@ -2616,8 +2655,8 @@ mod tests {
         let f = ast::FnDecl {
             name: "f".into(),
             params: vec![
-                ast::Param { name: "p".into(), ty: ast::TypeExpr::Named("bool".into(), Span::none()), span: Span::none() },
-                ast::Param { name: "q".into(), ty: ast::TypeExpr::Named("bool".into(), Span::none()), span: Span::none() },
+                ast::Param { name: "p".into(), ty: ast::TypeExpr::Named("bool".into(), Span::none()), span: Span::none(), refk: 0 },
+                ast::Param { name: "q".into(), ty: ast::TypeExpr::Named("bool".into(), Span::none()), span: Span::none(), refk: 0 },
             ],
             ret: None,
             body: blk(vec![
@@ -2680,6 +2719,7 @@ mod tests {
                 name: "n".into(),
                 ty: ast::TypeExpr::Named("i32".into(), Span::none()),
                 span: Span::none(),
+                refk: 0,
             }],
             ret: Some(ast::TypeExpr::Named("i32".into(), Span::none())),
             body: blk(vec![

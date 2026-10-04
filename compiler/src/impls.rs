@@ -321,6 +321,7 @@ fn self_param(p: &mut Parser, ty: &str, tsp: Span) -> Option<Param> {
             name: "self".to_string(),
             ty: TypeExpr::Named(tname, tsp),
             span: sp,
+            refk: 0,
         });
     }
     if p.at(&TokKind::Star) {
@@ -334,6 +335,7 @@ fn self_param(p: &mut Parser, ty: &str, tsp: Span) -> Option<Param> {
                     span: Parser::join(star, sp),
                 },
                 span: sp,
+                refk: 0,
             });
         }
     }
@@ -361,6 +363,7 @@ fn self_param(p: &mut Parser, ty: &str, tsp: Span) -> Option<Param> {
                 span: Parser::join(start, sp),
             },
             span: sp,
+            refk: if io { 2 } else { 1 },
         });
     }
     p.error_here(

@@ -215,6 +215,8 @@ impl<'a> Checker<'a> {
         // HOOK moves: the move checker for values with a `drop` (moves.rs,
         // round OWN-1, SPEC 3.3). Silent unless the program declares a `drop`.
         crate::moves::hook_check(self, prog);
+        // HOOK refcalls: what a reference parameter may be handed to (refparam.rs, r198/r199).
+        crate::refparam::hook_calls(self, prog);
         // HOOK kern: `#[interrupt]` — check the form and forbid calls
         // (core.rs, round 52).
         crate::core::check_interrupts(self, prog);
@@ -4222,8 +4224,8 @@ mod tests {
         let f = FnDecl {
             name: "f".to_string(),
             params: vec![
-                Param { name: "a".to_string(), ty: named("i32"), span: sp() },
-                Param { name: "b".to_string(), ty: named("i32"), span: sp() },
+                Param { name: "a".to_string(), ty: named("i32"), span: sp(), refk: 0 },
+                Param { name: "b".to_string(), ty: named("i32"), span: sp(), refk: 0 },
             ],
             ret: Some(named("i32")),
             body: blk(vec![Stmt::Return { value: Some(fret), span: sp() }]),
@@ -4440,6 +4442,7 @@ mod tests {
                 name: "a".to_string(),
                 ty: TypeExpr::Array { elem: Box::new(named("i32")), len: 4, span: sp() },
                 span: sp(),
+                refk: 0,
             }],
             ret: None,
             body: blk(Vec::new()),
