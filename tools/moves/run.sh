@@ -7,11 +7,8 @@
 #   1. THE REFUSED ONES (tests/neg/move_*.fi, tests/neg/drop_*.fi): every one
 #      has to be refused by firnc0 AND by the self-hosted firnc1, and the two
 #      messages have to be the same -- the headline, the position, the source
-#      line, `= note:`. ONE DIFFERENCE IS ALLOWED, and it is named: the width
-#      of the marker `^^^` under the source line. The Firn tree remembers where
-#      a node starts, not where it ends, so firnc1 draws `^` (an identifier,
-#      `if` and `fn` get their real width). The marker line is therefore
-#      compared with its width cut to one character.
+#      line, `= note:`. Marker width included (r196: the parser keeps the width of
+#      every operand's first line, ast.expr_len, as Parser::join does in firnc0).
 #
 #   2. THE ACCEPTED ONES (tests/2004..2007): programs with `drop` and moves
 #      that have to build in both compilers, run, and give the same output and
@@ -53,8 +50,8 @@ fail=0
 same=0
 note() { echo "FAIL  $1"; fail=$((fail + 1)); }
 
-# the marker line (`  |    ^^^ here`) with its width cut to one character
-norm() { sed -E 's/\^+ here/^ here/' "$1"; }
+# the two renderings are compared as they are, marker width included
+norm() { cat "$1"; }
 
 # ---------------------------------------------------------------- refused
 for f in tests/neg/move_*.fi tests/neg/drop_*.fi; do
@@ -92,7 +89,7 @@ refused=$pass
 # --------------------------------------------------------------- accepted
 accepted=0
 for f in tests/2004_move_ok.fi tests/2005_drop_order.fi tests/2006_drop_methods.fi \
-         tests/2007_drop_error_path.fi tests/2010_*.fi tests/2011_*.fi tests/2012_*.fi; do
+         tests/2007_drop_error_path.fi tests/2010_*.fi tests/2011_*.fi tests/2012_drop_*.fi; do
     [ -f "$f" ] || continue
     name=$(basename "$f" .fi)
     "$FIRNC" "$f" -o "$WORK/$name.bin" > "$WORK/$name.c0" 2>&1 || { note "$name: firnc0 refused it"; continue; }
@@ -109,6 +106,6 @@ for f in tests/2004_move_ok.fi tests/2005_drop_order.fi tests/2006_drop_methods.
 done
 
 echo "  cases: refused $refused, accepted $accepted"
-echo "  messages identical (marker width aside): $same"
+echo "  messages identical (marker width included): $same"
 echo "PASS: $pass  FAIL: $fail"
 [ "$fail" -eq 0 ]
