@@ -136,3 +136,23 @@ all icon sizes, and `manifest.json` (SHA-256 + Ed25519 per file) with the `store
 | Windows threads (`lib/gc/gc.fi` thread runtime on `CreateThread`, `compiler/src/thread.rs`, `win.rs`, `win_seam.rs`) | `thread_start/wait`, mutex, channel, `std.pool` on real threads on Windows; the seam is thread safe | `tests/834`, `860`-`862`, `1600`, `2065`, `2066`, `2091`, `2101` give the same output on Linux and under Wine; `tools/windows/threadkit.sh` writes a kit for a real Windows PC. See [WINDOWS_THREADS.md](WINDOWS_THREADS.md) |
 | process trees (`std.process`: `set_group`, `kill_tree`, `terminate_tree`, `set_kill_with_launcher`) | stop a child and everything it started: process group (Linux), job object (Windows) | `tests/2100`: a grandchild that holds the child's stdout pipe; end of file proves it died (Linux, Wine) |
 | `tls.tls` TLS 1.2 (`lib/tls/tls.fi`, `prf12.fi`; AES-256 in `aes.fi`/`gcm.fi`) | ECDHE-ECDSA/RSA with AES-128/256-GCM and ChaCha20-Poly1305, X25519 + secp256r1, extended master secret, downgrade protection, the same certificate and host name check; negotiated in the one ClientHello (no fallback retry) | `tests/2102`, `2103`; `tools/tls/tls12_check.py`: openssl s_server (suites x groups x signature schemes), Python `ssl` (512 KiB), man in the middle, fuzz, real hosts (`login.live.com`, `tls-v1-2.badssl.com`). See [TLS12.md](TLS12.md) |
+
+## UI extras (docs/UI_EXTRAS.md)
+
+The second wave of the launcher's UI: animated pictures, text selection and copy, the kit in the
+accessibility tree, touch gestures and right to left, rich text and syntax highlighting, QR
+codes, and localized times and sizes. Each has a test; the ones with a second implementation to
+compare with are held against it.
+
+| module | what it does | held against |
+|---|---|---|
+| `lib/qr` (`qr.fi`, `qrdec.fi`), `lib/fui/qrview.fi` | QR encoder (versions 1-40, L/M/Q/H, numeric/alphanumeric/byte, all masks, auto mask, level boost), decoder from a matrix or a picture (rotated, perspective, blurred, damaged), the widget | Nayuki's `qrcodegen`: module for module for every version/level/mask; python-qrcode (forced version and mask); ZXing-C++ reads every code and is the yardstick for the decoder (282/285, 349/355, 340/345 against its 284, 353, 340 on pictures that get worse) |
+| `lib/i18n/human.fi` | "5 minutes ago", "12,3 MB", date and time styles, percent, lists, wall clock of a TZif zone, in en de fr it es pl cs ru | ICU 72.1 (PyICU): 8,016 random cases, 0 differences; zones against Python `zoneinfo` |
+| `lib/highlight` (`highlight.fi`), `lib/fui/syntaxcolor.fi` | tokenizer interface and regex rules for JSON, TOML, INI, Firn, shell, Markdown, YAML, C-like; colours with 4.5:1 on the code ground | `tests/2242_highlight.fi` (every rule on sample text, the spans tile the text exactly on random input, linear time); the Markdown view's pixels |
+| `lib/regex` `Matcher` | the machine of a regex kept between finds (10x faster tokenizing) | tests/1914 and 6,000 random patterns against Python `re` unchanged |
+| `lib/fui/richtext.fi` | styled spans, wrapping, links, selection (drag, word, paragraph, Ctrl+A), copy, RTL paragraphs | `tools/fui/richtext_main.fi` (pixels) |
+| `lib/fui/uianim.fi` | GIF / animated WebP playback: delays, loops, pause, clock jumps | Pillow's frames (CRC) and delays for four files; `tools/fui/anim_main.fi` |
+| `lib/fui/kita11y.fi` | every kit part describes itself into the accessibility tree | `tools/fui/kita11y_main.fi`: the audit green, the dump compared |
+| `lib/fui/kittouch.fi` | tap, double tap, long press, pan with fling, pinch on `lib/window/pointers.fi`'s records | `tools/fui/touch_main.fi` (synthetic streams, the grid and the Markdown view) |
+| `kit.kit_set_rtl` | every kit part mirrored | `tools/fui/kitrtl_main.fi` (hit functions, decorations, keys) |
+
