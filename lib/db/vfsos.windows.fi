@@ -1,0 +1,295 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/db/vfsos.windows.fi -- the Windows twin of lib/db/vfsos.fi (selected by the
+// compiler on --target=x86_64-windows). The same functions, over kernel32:
+// CreateFileW, ReadFile/WriteFile at a file position, FlushFileBuffers, SetEndOfFile and
+// LockFileEx/UnlockFileEx on SQLite's own lock bytes (0x40000000 and the 510 after the
+// first two), the way SQLite's Windows VFS takes them -- so SQLite for Windows and this
+// library exclude each other on one file.
+//
+// DIFFERENCES FROM THE POSIX FILE (all hidden behind the same names):
+//   * LockFileEx locks belong to the HANDLE, so two opens of one file in one process
+//     exclude each other properly; no table of open files is needed.
+//   * A lock cannot be converted: to go from a shared to an exclusive lock on the range, or
+//     back, the range is unlocked first and locked again (SQLite does the same); if the
+//     exclusive lock is refused the shared one is taken again.
+//   * UnlockFileEx needs the EXACT range that was locked, so `os_unlock` of the whole lock
+//     area (what the pager asks for) unlocks the three ranges one by one.
+//   * A directory cannot be flushed: `os_sync_dir` does nothing (NTFS journals the metadata).
+//
+// HONEST (W1) Under Wine the byte-range locks are Wine's own (a wineserver), they exclude
+// between Wine processes; real Windows has not been reachable from here, so the lock and
+// rename paths have only run under Wine. The test kit for a real machine is in docs/DB.md.
+
+import std.rt
+import std.cmdline
+
+export {
+    os_open, os_close, os_read, os_write, os_sync, os_truncate, os_size,
+    os_lock, os_unlock, os_check_lock, os_delete, os_exists, os_sync_dir,
+    os_sleep_ms, os_random, os_kill_self,
+    OS_BUSY, OS_LOCKED, OS_LOCK_SHARED, OS_LOCK_EXCLUSIVE,
+}
+
+const OS_BUSY: i64 = 1
+const OS_LOCKED: i64 = -200
+const OS_LOCK_SHARED: i64 = 0
+const OS_LOCK_EXCLUSIVE: i64 = 1
+
+extern fn CreateFileW(name: u64, access: i64, share: i64, sa: u64, disp: i64, flags: i64, tmpl: i64) -> i64;
+extern fn ReadFile(h: i64, buf: u64, n: i64, got: u64, ov: u64) -> i32;
+extern fn WriteFile(h: i64, buf: u64, n: i64, put: u64, ov: u64) -> i32;
+extern fn CloseHandle(h: i64) -> i32;
+extern fn SetFilePointerEx(h: i64, dist: i64, newpos: u64, how: i64) -> i32;
+extern fn FlushFileBuffers(h: i64) -> i32;
+extern fn SetEndOfFile(h: i64) -> i32;
+extern fn GetFileSizeEx(h: i64, size: u64) -> i32;
+extern fn LockFileEx(h: i64, flags: i64, reserved: i64, lo: i64, hi: i64, ov: u64) -> i32;
+extern fn UnlockFileEx(h: i64, reserved: i64, lo: i64, hi: i64, ov: u64) -> i32;
+extern fn DeleteFileW(name: u64) -> i32;
+extern fn GetFileAttributesW(name: u64) -> i32;
+extern fn GetLastError() -> i32;
+extern fn Sleep(ms: i64);
+extern fn SystemFunction036(buf: u64, n: i64) -> i32;
+extern fn GetCurrentProcess() -> i64;
+extern fn TerminateProcess(h: i64, code: i64) -> i32;
+
+const GENERIC_READ: i64 = 2147483648
+const GENERIC_WRITE: i64 = 1073741824
+const SHARE_ALL: i64 = 7
+const OPEN_EXISTING: i64 = 3
+const OPEN_ALWAYS: i64 = 4
+const FILE_ATTRIBUTE_NORMAL: i64 = 128
+const LOCKFILE_FAIL_IMMEDIATELY: i64 = 1
+const LOCKFILE_EXCLUSIVE_LOCK: i64 = 2
+
+const PENDING_BYTE: u64 = 1073741824
+const RESERVED_BYTE: u64 = 1073741825
+const SHARED_FIRST: u64 = 1073741826
+const SHARED_SIZE: u64 = 510
+
+fn errno_of(e: i32) -> i64 {
+    // the Win32 codes that matter, as the negative errno numbers lib/db checks
+    if e == 2 || e == 3 {
+        return -2
+    }
+    if e == 5 {
+        return -13
+    }
+    if e == 33 || e == 32 || e == 997 {
+        return 1
+    }
+    if e == 112 || e == 39 {
+        return -28
+    }
+    return -5
+}
+
+// a wide, zero-terminated copy of the path in `out`
+fn wide_path(path: str, out: *mut rt.Buf) -> bool {
+    let n: usize = path.length()
+    if n == 0 {
+        return false
+    }
+    cmdline.utf8_to_utf16_path(path.p as u64, n, out)
+    rt.buf_push(out, 0 as u8)
+    rt.buf_push(out, 0 as u8)
+    return true
+}
+
+fn os_open(path: str, create: bool, readonly: bool) -> i64 {
+    var w: rt.Buf = rt.buf_new()
+    if !wide_path(path, &w) {
+        rt.buf_free(&w)
+        return -22
+    }
+    var access: i64 = GENERIC_READ | GENERIC_WRITE
+    if readonly {
+        access = GENERIC_READ
+    }
+    var disp: i64 = OPEN_EXISTING
+    if create && !readonly {
+        disp = OPEN_ALWAYS
+    }
+    let h: i64 = CreateFileW(rt.buf_ptr(&w), access, SHARE_ALL, 0, disp, FILE_ATTRIBUTE_NORMAL, 0)
+    rt.buf_free(&w)
+    if h == -1 || h == 0 {
+        return errno_of(GetLastError())
+    }
+    return h
+}
+
+fn os_close(h: i64) {
+    CloseHandle(h)
+}
+
+fn seek_to(h: i64, off: u64) -> bool {
+    return SetFilePointerEx(h, off as i64, 0, 0) != 0
+}
+
+fn os_read(h: i64, off: u64, p: u64, n: usize) -> i64 {
+    if !seek_to(h, off) {
+        return errno_of(GetLastError())
+    }
+    var done: usize = 0
+    while done < n {
+        var got: [u32; 2] = [0; 2]
+        let ok: i32 = ReadFile(h, p + (done as u64), (n - done) as i64, (&got[0]) as u64, 0)
+        if ok == 0 {
+            return errno_of(GetLastError())
+        }
+        if got[0] == 0 {
+            break
+        }
+        done = done + (got[0] as usize)
+    }
+    return done as i64
+}
+
+fn os_write(h: i64, off: u64, p: u64, n: usize) -> i64 {
+    if !seek_to(h, off) {
+        return errno_of(GetLastError())
+    }
+    var done: usize = 0
+    while done < n {
+        var put: [u32; 2] = [0; 2]
+        let ok: i32 = WriteFile(h, p + (done as u64), (n - done) as i64, (&put[0]) as u64, 0)
+        if ok == 0 {
+            return errno_of(GetLastError())
+        }
+        if put[0] == 0 {
+            return -28
+        }
+        done = done + (put[0] as usize)
+    }
+    return 0
+}
+
+fn os_sync(h: i64) -> i64 {
+    if FlushFileBuffers(h) == 0 {
+        return errno_of(GetLastError())
+    }
+    return 0
+}
+
+fn os_truncate(h: i64, size: u64) -> i64 {
+    if !seek_to(h, size) {
+        return errno_of(GetLastError())
+    }
+    if SetEndOfFile(h) == 0 {
+        return errno_of(GetLastError())
+    }
+    return 0
+}
+
+fn os_size(h: i64) -> i64 {
+    var sz: [i64; 2] = [0; 2]
+    if GetFileSizeEx(h, (&sz[0]) as u64) == 0 {
+        return errno_of(GetLastError())
+    }
+    return sz[0]
+}
+
+// An OVERLAPPED record (32 octets) with the byte offset; LockFileEx wants one.
+fn lock_call(h: i64, flags: i64, start: u64, len: u64) -> i32 {
+    var ov: [u64; 4] = [0; 4]
+    ov[2] = start
+    return LockFileEx(h, flags, 0, len as i64, 0, (&ov[0]) as u64)
+}
+
+fn unlock_call(h: i64, start: u64, len: u64) -> i32 {
+    var ov: [u64; 4] = [0; 4]
+    ov[2] = start
+    return UnlockFileEx(h, 0, len as i64, 0, (&ov[0]) as u64)
+}
+
+// A byte-range lock without waiting. Locks are not converted in place: the range is
+// unlocked first, and if the new lock is refused the old kind is taken again.
+fn os_lock(h: i64, kind: i64, start: u64, len: u64) -> i64 {
+    var flags: i64 = LOCKFILE_FAIL_IMMEDIATELY
+    if kind == OS_LOCK_EXCLUSIVE {
+        flags = flags | LOCKFILE_EXCLUSIVE_LOCK
+    }
+    var held_shared: bool = false
+    if len == SHARED_SIZE {
+        // the shared range: it may be held shared (to go exclusive) or exclusive (to go shared)
+        if kind == OS_LOCK_EXCLUSIVE {
+            held_shared = unlock_call(h, start, len) != 0
+        } else {
+            unlock_call(h, start, len)
+        }
+    }
+    if lock_call(h, flags, start, len) != 0 {
+        return 0
+    }
+    let e: i32 = GetLastError()
+    if held_shared {
+        lock_call(h, LOCKFILE_FAIL_IMMEDIATELY, start, len)
+    }
+    return errno_of(e)
+}
+
+// Unlocks a range. The whole lock area (PENDING, RESERVED and the shared range) is
+// unlocked piece by piece, whatever of it is held.
+fn os_unlock(h: i64, start: u64, len: u64) -> i64 {
+    if start == PENDING_BYTE && len == 512 {
+        unlock_call(h, PENDING_BYTE, 1)
+        unlock_call(h, RESERVED_BYTE, 1)
+        unlock_call(h, SHARED_FIRST, SHARED_SIZE)
+        return 0
+    }
+    if unlock_call(h, start, len) == 0 {
+        return -1
+    }
+    return 0
+}
+
+// Does another process hold a lock on the byte? Asked by trying to take it.
+fn os_check_lock(h: i64, start: u64, len: u64) -> bool {
+    if lock_call(h, LOCKFILE_FAIL_IMMEDIATELY | LOCKFILE_EXCLUSIVE_LOCK, start, len) != 0 {
+        unlock_call(h, start, len)
+        return false
+    }
+    return true
+}
+
+fn os_delete(path: str) -> i64 {
+    var w: rt.Buf = rt.buf_new()
+    if !wide_path(path, &w) {
+        rt.buf_free(&w)
+        return -22
+    }
+    let ok: i32 = DeleteFileW(rt.buf_ptr(&w))
+    rt.buf_free(&w)
+    if ok == 0 {
+        return errno_of(GetLastError())
+    }
+    return 0
+}
+
+fn os_exists(path: str) -> bool {
+    var w: rt.Buf = rt.buf_new()
+    if !wide_path(path, &w) {
+        rt.buf_free(&w)
+        return false
+    }
+    let a: i32 = GetFileAttributesW(rt.buf_ptr(&w))
+    rt.buf_free(&w)
+    return a != -1
+}
+
+fn os_sync_dir(path: str) -> i64 {
+    return 0
+}
+
+fn os_sleep_ms(ms: i64) {
+    Sleep(ms)
+}
+
+fn os_random(p: u64, n: usize) -> bool {
+    return SystemFunction036(p, n as i64) != 0
+}
+
+// What a power cut does to a process (tests).
+fn os_kill_self() {
+    TerminateProcess(GetCurrentProcess(), 9)
+}

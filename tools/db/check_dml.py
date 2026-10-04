@@ -7,6 +7,7 @@
 import os, random, shutil, sqlite3, struct, subprocess, sys, tempfile
 
 probe = sys.argv[1]
+RUNNER = os.environ.get("RUNNER", "").split()
 SEED = int(sys.argv[2]) if len(sys.argv) > 2 else 20261004
 random.seed(SEED)
 
@@ -27,7 +28,7 @@ def run_mine(db, stmts, crash=None):
     with open(script, "w", encoding="utf-8") as f:
         for s in stmts:
             f.write(s + "\n")
-    args = [probe, db, script]
+    args = RUNNER + [probe, db, script]
     r = subprocess.run(args, capture_output=True)
     shutil.rmtree(d)
     lines = r.stdout.decode("utf-8", "replace").split("\n")

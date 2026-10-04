@@ -8,6 +8,7 @@
 import os, random, shutil, sqlite3, struct, subprocess, sys, tempfile
 
 probe = sys.argv[1]
+RUNNER = os.environ.get("RUNNER", "").split()
 random.seed(20261004)
 
 def enc(v):
@@ -173,7 +174,7 @@ with tempfile.TemporaryDirectory() as d:
             f.write("\n")
     work = os.path.join(d, "work.db")
     shutil.copy(path, work)
-    r = subprocess.run([probe, work, script], capture_output=True)
+    r = subprocess.run(RUNNER + [probe, work, script], capture_output=True)
     lines = r.stdout.decode("utf-8", "replace").split("\n")
     if r.returncode != 0:
         print("probe exit", r.returncode, r.stderr.decode()[:300])

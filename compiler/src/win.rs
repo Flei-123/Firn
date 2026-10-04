@@ -110,6 +110,12 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("GetFileAttributesW", "KERNEL32.dll", 1),
     ("SetFilePointerEx", "KERNEL32.dll", 4),
     ("FlushFileBuffers", "KERNEL32.dll", 1),
+    // lib/db (the embedded database): shorten a file, ask its size, and lock the byte
+    // ranges SQLite's own Windows VFS locks (LockFileEx / UnlockFileEx).
+    ("SetEndOfFile", "KERNEL32.dll", 1),
+    ("GetFileSizeEx", "KERNEL32.dll", 2),
+    ("LockFileEx", "KERNEL32.dll", 6),
+    ("UnlockFileEx", "KERNEL32.dll", 5),
     ("VirtualAlloc", "KERNEL32.dll", 4),
     ("VirtualFree", "KERNEL32.dll", 3),
     ("VirtualProtect", "KERNEL32.dll", 4),

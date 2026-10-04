@@ -11,6 +11,7 @@
 import os, random, shutil, signal, sqlite3, subprocess, sys, tempfile, time
 
 probe = sys.argv[1]
+RUNNER = os.environ.get("RUNNER", "").split()
 random.seed(7)
 fails = 0
 
@@ -19,7 +20,7 @@ def mine(db, script_lines, crash=None, timeout=120):
     sc = os.path.join(d, "s.sql")
     with open(sc, "w") as f:
         f.write("\n".join(script_lines) + "\n")
-    args = [probe, db, sc] + ([str(crash)] if crash else [])
+    args = RUNNER + [probe, db, sc] + ([str(crash)] if crash else [])
     r = subprocess.run(args, capture_output=True, timeout=timeout)
     shutil.rmtree(d)
     return r
@@ -110,7 +111,7 @@ with tempfile.TemporaryDirectory() as d:
         big = (n % 3 != 0)
         script = txn(100 + n, big)
         r = mine(work, script, crash=n)
-        killed = r.returncode == -9
+        killed = r.returncode in (-9, 9)
         # recovery by SQLite on one copy, by lib/db on another
         w1 = os.path.join(d, "w1.db"); w2 = os.path.join(d, "w2.db")
         for ext in ("", "-journal"):
@@ -160,7 +161,7 @@ with tempfile.TemporaryDirectory() as d:
                 os.unlink(work + ext)
         shutil.copy(base, work)
         r = mine(work, big_txn, crash=n)
-        killed = r.returncode == -9
+        killed = r.returncode in (-9, 9)
         w1 = os.path.join(d, "b1.db"); w2 = os.path.join(d, "b2.db")
         for ext in ("", "-journal"):
             for w in (w1, w2):
@@ -178,6 +179,10 @@ with tempfile.TemporaryDirectory() as d:
     print(f"  {spilled_back} kills inside the big commit, every one rolled back cleanly")
     # killed from outside at random moments
     print("random kill -9 during a stream of transactions:")
+    if RUNNER:
+        print("  (skipped under a runner: killing the launcher is not killing the program)")
+        print("FAILED" if fails else "ALL OK", fails)
+        sys.exit(1 if fails else 0)
     work = os.path.join(d, "ext.db")
     shutil.copy(base, work)
     kills = 0
@@ -190,7 +195,7 @@ with tempfile.TemporaryDirectory() as d:
         dd = tempfile.mkdtemp()
         sc = os.path.join(dd, "s.sql")
         open(sc, "w").write("\n".join(script) + "\n")
-        p = subprocess.Popen([probe, work, sc], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p = subprocess.Popen(RUNNER + [probe, work, sc], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(random.uniform(0.02, 0.35))
         if p.poll() is None:
             p.send_signal(signal.SIGKILL)
