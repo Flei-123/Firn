@@ -1,0 +1,572 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+// tests/2061_dns_loopback.fi -- lib/net/dns.fi against a DNS SERVER IN THIS
+// PROCESS: real UDP and TCP datagrams over 127.0.0.1, no network needed.
+//
+// The server (two threads: UDP and TCP, same port number) answers by the
+// first label of the name asked:
+//
+//   plain   one A record                       cname   a chain of two CNAMEs
+//   split   a CNAME and NO address; `target`   big     TC over UDP, the full
+//           has the address                            answer over TCP
+//   nx      NXDOMAIN                           fail    SERVFAIL
+//   slow    drops the first question           dead    never answers
+//   spoof   first forged answers (wrong ID; right ID from ANOTHER port),
+//           then the real one
+//   short   an A record with TTL 1             v6      an AAAA record
+//
+// WHAT IS CHECKED, and why it is worth a test
+//   A  the ordinary answer; the second question is served from the CACHE
+//      and the server does not see it (counted on the server's side, not
+//      assumed from the client's)
+//   B  CNAME chains inside one answer and across two answers
+//   C  TCP fallback after TC
+//   D  NXDOMAIN is an answer and is cached; SERVFAIL ends the search with
+//      ONE question, not a retry storm
+//   E  retry: the dropped question is asked again, and a dead server costs
+//      exactly `retries` datagrams and ends in Timeout
+//   F  a forged answer -- wrong transaction ID, or the right ID from the
+//      wrong port -- is ignored, the real one is taken
+//   G  numeric addresses, localhost and the hosts table never touch the
+//      server; an invalid name never leaves the machine
+//   H  a dead first server and a live second one
+//   I  a TTL of 1 second expires (monotonic clock), the flush empties the
+//      cache, AAAA is parsed
+//   J  the transaction IDs are not constant
+import std.rt
+import std.net
+import std.time
+import net.dns
+import net.udp
+
+const P_UDP_FD: u64 = 0
+const P_LISTEN_FD: u64 = 8
+const P_COUNT: u64 = 16 // questions the server has SEEN (UDP and TCP)
+const P_QUIT: u64 = 24
+const P_SLOW_SEEN: u64 = 32
+const P_IDS: u64 = 40 // eight u64 slots: transaction IDs seen
+const P_NIDS: u64 = 104
+const P_SPOOF_SENT: u64 = 112
+const P_TCP_COUNT: u64 = 120
+const P_SIZE: usize = 256
+
+fn ld(a: u64, o: u64) -> u64 { return *((a + o) as *mut u64) }
+fn st(a: u64, o: u64, v: u64) { *((a + o) as *mut u64) = v }
+
+fn put16(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, (v & 255 as u32) as u8)
+}
+
+fn put32(b: *mut rt.Buf, v: u32) {
+    put16(b, v >> 16)
+    put16(b, v & 65535 as u32)
+}
+
+// A name as labels: "mid.test" -> 3 m i d 4 t e s t 0.
+fn put_name(b: *mut rt.Buf, p: u64, n: usize) {
+    var start: usize = 0
+    var i: usize = 0
+    while i <= n {
+        if i == n || rt.ld8(p, i) == 46 as u8 {
+            rt.buf_push(b, (i - start) as u8)
+            rt.buf_push_bytes(b, p + start as u64, i - start)
+            start = i + 1
+        }
+        i = i + 1
+    }
+    rt.buf_push(b, 0 as u8)
+}
+
+// The record header: owner (a pointer to the question name, or `name`),
+// type, class IN, TTL, RDLENGTH.
+fn rr_head(b: *mut rt.Buf, own: u64, ownn: usize, typ: u32, ttl: u32, rdlen: u32) {
+    if own == 0 {
+        rt.buf_push(b, 192 as u8)
+        rt.buf_push(b, 12 as u8)
+    } else {
+        put_name(b, own, ownn)
+    }
+    put16(b, typ)
+    put16(b, 1 as u32)
+    put32(b, ttl)
+    put16(b, rdlen)
+}
+
+fn rr_a(b: *mut rt.Buf, own: u64, ownn: usize, ttl: u32, a: u32) {
+    rr_head(b, own, ownn, 1 as u32, ttl, 4 as u32)
+    put32(b, a)
+}
+
+// A CNAME whose target is written out in full: 2 + the name's wire length.
+fn rr_cname(b: *mut rt.Buf, own: u64, ownn: usize, ttl: u32, tgt: u64, tn: usize) {
+    rr_head(b, own, ownn, 5 as u32, ttl, (tn + 2) as u32)
+    put_name(b, tgt, tn)
+}
+
+fn lab_is(req: u64, lit: u64, n: usize) -> bool {
+    if rt.ld8(req, 12) as usize != n {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(req, 13 + i) != rt.ld8(lit, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The end of the question section of a request: the name, QTYPE, QCLASS.
+fn question_end(req: u64, n: usize) -> usize {
+    var pos: usize = 12
+    while pos < n && rt.ld8(req, pos) != 0 as u8 {
+        pos = pos + 1 + rt.ld8(req, pos) as usize
+    }
+    return pos + 1 + 4
+}
+
+// The answer for one question, in `out`. Returns false when the server stays
+// silent. `tcp` is true for the stream. `first` is true the first time this
+// label is seen (for `slow`).
+fn build_reply(page: u64, req: u64, n: usize, out: *mut rt.Buf, tcp: bool,
+    forged: u32) -> bool {
+    let qe: usize = question_end(req, n)
+    let qtype: u32 = ((rt.ld8(req, qe - 4) as u32) << 8) | (rt.ld8(req, qe - 3) as u32)
+    var flags: u32 = 33152 as u32 // QR RD RA
+    var an: u32 = 0 as u32
+    var body: rt.Buf = rt.buf_new()
+    var a_slow: [u8; 4] = "slow"
+    var a_dead: [u8; 4] = "dead"
+    var a_plain: [u8; 5] = "plain"
+    var a_cname: [u8; 5] = "cname"
+    var a_split: [u8; 5] = "split"
+    var a_target: [u8; 6] = "target"
+    var a_big: [u8; 3] = "big"
+    var a_nx: [u8; 2] = "nx"
+    var a_fail: [u8; 4] = "fail"
+    var a_spoof: [u8; 5] = "spoof"
+    var a_short: [u8; 5] = "short"
+    var a_v6: [u8; 2] = "v6"
+    var mid: [u8; 8] = "mid.test"
+    var end: [u8; 8] = "end.test"
+    var tgt: [u8; 11] = "target.test"
+    if lab_is(req, (&a_dead[0]) as u64, 4) {
+        rt.buf_free(&body)
+        return false
+    }
+    if lab_is(req, (&a_slow[0]) as u64, 4) {
+        if ld(page, P_SLOW_SEEN) == 0 {
+            st(page, P_SLOW_SEEN, 1)
+            rt.buf_free(&body)
+            return false
+        }
+        rr_a(&body, 0 as u64, 0, 60 as u32, net.ipv4(192 as u8, 0 as u8, 2 as u8, 8 as u8))
+        an = 1 as u32
+    } else if lab_is(req, (&a_plain[0]) as u64, 5) {
+        rr_a(&body, 0 as u64, 0, 60 as u32, net.ipv4(192 as u8, 0 as u8, 2 as u8, 1 as u8))
+        an = 1 as u32
+    } else if lab_is(req, (&a_cname[0]) as u64, 5) {
+        rr_cname(&body, 0 as u64, 0, 300 as u32, (&mid[0]) as u64, 8)
+        rr_cname(&body, (&mid[0]) as u64, 8, 200 as u32, (&end[0]) as u64, 8)
+        rr_a(&body, (&end[0]) as u64, 8, 120 as u32, net.ipv4(192 as u8, 0 as u8, 2 as u8, 2 as u8))
+        an = 3 as u32
+    } else if lab_is(req, (&a_split[0]) as u64, 5) {
+        rr_cname(&body, 0 as u64, 0, 90 as u32, (&tgt[0]) as u64, 11)
+        an = 1 as u32
+    } else if lab_is(req, (&a_target[0]) as u64, 6) {
+        rr_a(&body, 0 as u64, 0, 45 as u32, net.ipv4(192 as u8, 0 as u8, 2 as u8, 3 as u8))
+        an = 1 as u32
+    } else if lab_is(req, (&a_big[0]) as u64, 3) {
+        if !tcp {
+            flags = 33152 as u32 | 512 as u32 // TC
+        } else {
+            rr_a(&body, 0 as u64, 0, 30 as u32, net.ipv4(192 as u8, 0 as u8, 2 as u8, 4 as u8))
+            rr_a(&body, 0 as u64, 0, 30 as u32, net.ipv4(192 as u8, 0 as u8, 2 as u8, 5 as u8))
+            rr_a(&body, 0 as u64, 0, 30 as u32, net.ipv4(192 as u8, 0 as u8, 2 as u8, 6 as u8))
+            an = 3 as u32
+        }
+    } else if lab_is(req, (&a_nx[0]) as u64, 2) {
+        flags = 33152 as u32 | 3 as u32
+    } else if lab_is(req, (&a_fail[0]) as u64, 4) {
+        flags = 33152 as u32 | 2 as u32
+    } else if lab_is(req, (&a_spoof[0]) as u64, 5) {
+        if forged == 1 as u32 {
+            rr_a(&body, 0 as u64, 0, 60 as u32, net.ipv4(6 as u8, 6 as u8, 6 as u8, 6 as u8))
+        } else {
+            rr_a(&body, 0 as u64, 0, 60 as u32, net.ipv4(192 as u8, 0 as u8, 2 as u8, 9 as u8))
+        }
+        an = 1 as u32
+    } else if lab_is(req, (&a_short[0]) as u64, 5) {
+        rr_a(&body, 0 as u64, 0, 1 as u32, net.ipv4(192 as u8, 0 as u8, 2 as u8, 7 as u8))
+        an = 1 as u32
+    } else if lab_is(req, (&a_v6[0]) as u64, 2) {
+        rr_head(&body, 0 as u64, 0, 28 as u32, 77 as u32, 16 as u32)
+        var k: usize = 0
+        while k < 16 {
+            rt.buf_push(&body, (32 + k) as u8)
+            k = k + 1
+        }
+        an = 1 as u32
+    } else {
+        flags = 33152 as u32 | 3 as u32
+    }
+    // the header with the request's ID (or a wrong one for the forgery)
+    var id: u32 = ((rt.ld8(req, 0) as u32) << 8) | (rt.ld8(req, 1) as u32)
+    if forged == 1 as u32 {
+        id = id ^ 4660 as u32
+    }
+    put16(out, id)
+    put16(out, flags)
+    put16(out, 1 as u32)
+    put16(out, an)
+    put16(out, 0 as u32)
+    put16(out, 0 as u32)
+    rt.buf_push_bytes(out, req + 12 as u64, qe - 12)
+    rt.buf_push_bytes(out, body.ptr, body.len)
+    rt.buf_free(&body)
+    // keep the transaction IDs for check J
+    let nid: u64 = ld(page, P_NIDS)
+    if forged == 0 as u32 && nid < 8 as u64 && !tcp {
+        st(page, P_IDS + nid * 8 as u64, ((rt.ld8(req, 0) as u64) << 8) | (rt.ld8(req, 1) as u64))
+        st(page, P_NIDS, nid + 1 as u64)
+    }
+    return qtype != 99 as u32
+}
+
+fn serve_udp(page: u64) {
+    let fd: i64 = ld(page, P_UDP_FD) as i64
+    let fd2: i64 = udp.udp_open() // another source port, for the forgeries
+    let buf: u64 = rt.heap_alloc(2048)
+    var a_spoof: [u8; 5] = "spoof"
+    var go: bool = true
+    while go {
+        var fa: u32 = 0
+        var fp: u16 = 0 as u16
+        thread_blocking_an()
+        let k: i64 = udp.udp_recvfrom(fd, buf, 2048, &fa, &fp)
+        thread_blocking_out()
+        if k < 0 {
+            go = false
+        } else if k == 4 && rt.ld8(buf, 0) == 81 as u8 {
+            go = false // "QUIT"
+        } else if ld(page, P_QUIT) != 0 {
+            go = false
+        } else {
+            st(page, P_COUNT, ld(page, P_COUNT) + 1)
+            if lab_is(buf, (&a_spoof[0]) as u64, 5) && ld(page, P_SPOOF_SENT) == 0 {
+                st(page, P_SPOOF_SENT, 1)
+                // 1: right source, wrong ID
+                var f1: rt.Buf = rt.buf_new()
+                if build_reply(page, buf, k as usize, &f1, false, 1 as u32) {
+                    udp.udp_sendto(fd, f1.ptr, f1.len, fa, fp)
+                }
+                rt.buf_free(&f1)
+                // 2: right ID, wrong source port: an evil address that would
+                // be accepted by a resolver that only looks at the ID
+                var f2: rt.Buf = rt.buf_new()
+                if build_reply(page, buf, k as usize, &f2, false, 2 as u32) {
+                    // the forged one carries the evil address: patch the last four octets
+                    rt.st8(f2.ptr, f2.len - 4, 6 as u8)
+                    rt.st8(f2.ptr, f2.len - 3, 6 as u8)
+                    rt.st8(f2.ptr, f2.len - 2, 6 as u8)
+                    rt.st8(f2.ptr, f2.len - 1, 6 as u8)
+                    udp.udp_sendto(fd2, f2.ptr, f2.len, fa, fp)
+                }
+                rt.buf_free(&f2)
+            }
+            var out: rt.Buf = rt.buf_new()
+            if build_reply(page, buf, k as usize, &out, false, 0 as u32) {
+                udp.udp_sendto(fd, out.ptr, out.len, fa, fp)
+            }
+            rt.buf_free(&out)
+        }
+    }
+    udp.udp_close(fd2)
+    rt.heap_free(buf, 2048)
+}
+
+fn serve_tcp(page: u64) {
+    var l: net.Listener = net.listener_from_fd(ld(page, P_LISTEN_FD) as i32)
+    let buf: u64 = rt.heap_alloc(2048)
+    var go: bool = true
+    while go {
+        thread_blocking_an()
+        var c: net.Conn = net.accept(&l) catch net.conn_from_fd(0 - 1)
+        thread_blocking_out()
+        if !net.conn_is_open(&c) {
+            go = false
+        } else {
+            let h: usize = net.read_full(&c, buf, 2) catch 0 as usize
+            if h == 2 {
+                let len: usize = ((rt.ld8(buf, 0) as usize) << 8) | (rt.ld8(buf, 1) as usize)
+                if len > 2000 {
+                    go = false
+                } else {
+                    let g: usize = net.read_full(&c, buf + 2 as u64, len) catch 0 as usize
+                    if g == len {
+                        if len == 4 && rt.ld8(buf, 2) == 81 as u8 {
+                            go = false // "QUIT"
+                        } else {
+                            st(page, P_COUNT, ld(page, P_COUNT) + 1)
+                            st(page, P_TCP_COUNT, ld(page, P_TCP_COUNT) + 1)
+                            var out: rt.Buf = rt.buf_new()
+                            put16(&out, 0 as u32) // the length, patched below
+                            if build_reply(page, buf + 2 as u64, len, &out, true, 0 as u32) {
+                                let body: usize = out.len - 2
+                                rt.st8(out.ptr, 0, ((body >> 8) & 255) as u8)
+                                rt.st8(out.ptr, 1, (body & 255) as u8)
+                                let w: usize = net.write_all(&c, out.ptr, out.len) catch 0 as usize
+                            }
+                            rt.buf_free(&out)
+                        }
+                    }
+                }
+            }
+            net.close(&c)
+        }
+    }
+    rt.heap_free(buf, 2048)
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == 1 {
+        serve_udp(arg)
+    } else {
+        serve_tcp(arg)
+    }
+    return 0
+}
+
+// ----------------------------------------------------------------- the client
+
+fn go(res: *mut dns.Resolver, name: u64, n: usize, out: *mut dns.Resolved) -> bool {
+    return dns.dns_resolve_a(res, name, n, out) catch false
+}
+
+fn a4(a: u8, b: u8, c: u8, d: u8) -> u32 { return net.ipv4(a, b, c, d) }
+
+fn scenario(page: u64, port: u16) -> i32 {
+    var res: dns.Resolver = dns.resolver_new()
+    dns.resolver_clear_servers(&res)
+    dns.resolver_add_server(&res, net.ADDR_LOCAL)
+    dns.resolver_set_port(&res, port)
+    dns.resolver_set_timeout(&res, 250 as u64)
+    dns.resolver_set_retries(&res, 3 as u32)
+    var hosts: [u8; 38] = "10.1.2.3 nas.lan NAS\n127.0.0.1 me.lan\n"
+    dns.resolver_load_hosts_text(&res, (&hosts[0]) as u64, 38)
+
+    var out: dns.Resolved = dns.resolved_new()
+    var n_plain: [u8; 10] = "plain.test"
+    var n_cname: [u8; 10] = "cname.test"
+    var n_split: [u8; 10] = "split.test"
+    var n_big: [u8; 8] = "big.test"
+    var n_nx: [u8; 7] = "nx.test"
+    var n_fail: [u8; 9] = "fail.test"
+    var n_slow: [u8; 9] = "slow.test"
+    var n_dead: [u8; 9] = "dead.test"
+    var n_spoof: [u8; 10] = "spoof.test"
+    var n_short: [u8; 10] = "short.test"
+    var n_v6: [u8; 7] = "v6.test"
+
+    // --- A: the ordinary answer, then the cache --------------------------
+    if !go(&res, (&n_plain[0]) as u64, 10, &out) { return 10 }
+    if out.n != 1 || out.addr[0] != a4(192 as u8, 0 as u8, 2 as u8, 1 as u8) { return 11 }
+    if out.via != dns.VIA_UDP { return 12 }
+    if out.ttl != 60 as u32 { return 13 }
+    if out.server != net.ADDR_LOCAL { return 14 }
+    if ld(page, P_COUNT) != 1 { return 15 }
+    if !go(&res, (&n_plain[0]) as u64, 10, &out) { return 16 }
+    if out.via != dns.VIA_CACHE || out.addr[0] != a4(192 as u8, 0 as u8, 2 as u8, 1 as u8) { return 17 }
+    if out.ttl > 60 as u32 || out.ttl == 0 as u32 { return 18 }
+    if ld(page, P_COUNT) != 1 { return 19 } // the SERVER did not see it
+    if dns.resolver_cache_hits(&res) != 1 as u64 { return 20 }
+    // the same name in other case and with a trailing dot is the same entry
+    var n_plain2: [u8; 11] = "PLAIN.test."
+    if !go(&res, (&n_plain2[0]) as u64, 11, &out) { return 21 }
+    if out.via != dns.VIA_CACHE { return 22 }
+    // the flush empties it
+    dns.resolver_flush(&res)
+    if !go(&res, (&n_plain[0]) as u64, 10, &out) { return 23 }
+    if out.via != dns.VIA_UDP || ld(page, P_COUNT) != 2 { return 24 }
+
+    // --- B: CNAME chains --------------------------------------------------
+    if !go(&res, (&n_cname[0]) as u64, 10, &out) { return 30 }
+    if out.n != 1 || out.addr[0] != a4(192 as u8, 0 as u8, 2 as u8, 2 as u8) { return 31 }
+    if out.cnames != 2 as u32 { return 32 }
+    if out.ttl != 120 as u32 { return 33 } // the smallest TTL on the chain
+    if ld(page, P_COUNT) != 3 { return 34 }
+    if !go(&res, (&n_split[0]) as u64, 10, &out) { return 35 }
+    if out.n != 1 || out.addr[0] != a4(192 as u8, 0 as u8, 2 as u8, 3 as u8) { return 36 }
+    if out.cnames != 1 as u32 { return 37 }
+    if ld(page, P_COUNT) != 5 { return 38 } // split, then target: two questions
+
+    // --- C: TC, then TCP --------------------------------------------------
+    if !go(&res, (&n_big[0]) as u64, 8, &out) { return 40 }
+    if out.n != 3 || out.addr[2] != a4(192 as u8, 0 as u8, 2 as u8, 6 as u8) { return 41 }
+    if out.via != dns.VIA_TCP { return 42 }
+    if dns.resolver_tcp_used(&res) != 1 as u64 { return 43 }
+    if ld(page, P_TCP_COUNT) != 1 { return 44 }
+
+    // --- D: NXDOMAIN, SERVFAIL ---------------------------------------------
+    let before_nx: u64 = ld(page, P_COUNT)
+    if go(&res, (&n_nx[0]) as u64, 7, &out) { return 50 }
+    if dns.resolver_last_error(&res) != 7 as u32 { return 51 }
+    if ld(page, P_COUNT) != before_nx + 1 { return 52 }
+    if go(&res, (&n_nx[0]) as u64, 7, &out) { return 53 }
+    if dns.resolver_last_error(&res) != 7 as u32 { return 54 }
+    if ld(page, P_COUNT) != before_nx + 1 { return 55 } // negative cache
+    let before_fail: u64 = ld(page, P_COUNT)
+    if go(&res, (&n_fail[0]) as u64, 9, &out) { return 56 }
+    if dns.resolver_last_error(&res) != 6 as u32 { return 57 }
+    if ld(page, P_COUNT) != before_fail + 1 { return 58 } // ONE question
+
+    // --- E: retry, and a dead server ---------------------------------------
+    let udp0: u64 = dns.resolver_udp_sent(&res)
+    if !go(&res, (&n_slow[0]) as u64, 9, &out) { return 60 }
+    if out.addr[0] != a4(192 as u8, 0 as u8, 2 as u8, 8 as u8) { return 61 }
+    if dns.resolver_udp_sent(&res) != udp0 + 2 as u64 { return 62 }
+    let udp1: u64 = dns.resolver_udp_sent(&res)
+    let t0: u64 = time.monotonic_ns()
+    if go(&res, (&n_dead[0]) as u64, 9, &out) { return 63 }
+    let waited: u64 = (time.monotonic_ns() - t0) / 1000000 as u64
+    if dns.resolver_last_error(&res) != 3 as u32 { return 64 }
+    if dns.resolver_udp_sent(&res) != udp1 + 3 as u64 { return 65 }
+    // 250 + 500 + 1000 ms
+    if waited < 1700 as u64 || waited > 6000 as u64 { return 66 }
+
+    // --- F: forged answers ---------------------------------------------------
+    if !go(&res, (&n_spoof[0]) as u64, 10, &out) { return 70 }
+    if out.addr[0] != a4(192 as u8, 0 as u8, 2 as u8, 9 as u8) { return 71 }
+    if ld(page, P_SPOOF_SENT) != 1 { return 72 } // the forgeries really went out
+
+    // --- G: no question leaves the machine ------------------------------------
+    let before_local: u64 = ld(page, P_COUNT)
+    var n_ip: [u8; 10] = "192.0.2.50"
+    if !go(&res, (&n_ip[0]) as u64, 10, &out) { return 80 }
+    if out.addr[0] != a4(192 as u8, 0 as u8, 2 as u8, 50 as u8) || out.via != dns.VIA_NUMERIC { return 81 }
+    var n_lh: [u8; 9] = "localhost"
+    if !go(&res, (&n_lh[0]) as u64, 9, &out) { return 82 }
+    if out.addr[0] != net.ADDR_LOCAL || out.via != dns.VIA_LOCALHOST { return 83 }
+    var n_lh2: [u8; 13] = "web.localhost"
+    if !go(&res, (&n_lh2[0]) as u64, 13, &out) { return 84 }
+    if out.addr[0] != net.ADDR_LOCAL || out.via != dns.VIA_LOCALHOST { return 85 }
+    var n_nas: [u8; 7] = "nas.lan"
+    if !go(&res, (&n_nas[0]) as u64, 7, &out) { return 86 }
+    if out.addr[0] != a4(10 as u8, 1 as u8, 2 as u8, 3 as u8) || out.via != dns.VIA_HOSTS { return 87 }
+    var n_bad: [u8; 4] = "a..b"
+    if go(&res, (&n_bad[0]) as u64, 4, &out) { return 88 }
+    if dns.resolver_last_error(&res) != 1 as u32 { return 89 }
+    if ld(page, P_COUNT) != before_local { return 90 }
+
+    // --- H: a dead first server, a live second one -----------------------------
+    var res2: dns.Resolver = dns.resolver_new()
+    dns.resolver_clear_servers(&res2)
+    dns.resolver_add_server(&res2, a4(127 as u8, 0 as u8, 0 as u8, 2 as u8))
+    dns.resolver_add_server(&res2, net.ADDR_LOCAL)
+    dns.resolver_set_port(&res2, port)
+    dns.resolver_set_timeout(&res2, 200 as u64)
+    dns.resolver_set_retries(&res2, 2 as u32)
+    if !go(&res2, (&n_plain[0]) as u64, 10, &out) { return 100 }
+    if out.addr[0] != a4(192 as u8, 0 as u8, 2 as u8, 1 as u8) { return 101 }
+    if out.server != net.ADDR_LOCAL { return 102 }
+    // one datagram into the void, one to the live server
+    if dns.resolver_udp_sent(&res2) != 2 as u64 { return 103 }
+
+    // --- I: expiry, AAAA ------------------------------------------------------------
+    if !go(&res, (&n_short[0]) as u64, 10, &out) { return 110 }
+    if out.ttl != 1 as u32 { return 111 }
+    let c1: u64 = ld(page, P_COUNT)
+    if !go(&res, (&n_short[0]) as u64, 10, &out) { return 112 }
+    if out.via != dns.VIA_CACHE || ld(page, P_COUNT) != c1 { return 113 }
+    time.sleep_ms(1200 as u64)
+    if !go(&res, (&n_short[0]) as u64, 10, &out) { return 114 }
+    if out.via != dns.VIA_UDP || ld(page, P_COUNT) != c1 + 1 { return 115 }
+    var o6: dns.Resolved = dns.resolved_new()
+    let ok6: bool = dns.dns_resolve(&res, (&n_v6[0]) as u64, 7, dns.T_AAAA, &o6) catch false
+    if !ok6 { return 116 }
+    if o6.n6 != 1 || o6.addr6[0] != 32 as u8 || o6.addr6[15] != 47 as u8 { return 117 }
+    if o6.ttl != 77 as u32 { return 118 }
+
+    // --- J: the transaction IDs are not constant ----------------------------------
+    let nids: u64 = ld(page, P_NIDS)
+    if nids < 6 as u64 { return 120 }
+    var distinct: usize = 0
+    var i: usize = 0
+    while i < nids as usize {
+        var seen: bool = false
+        var k: usize = 0
+        while k < i {
+            if ld(page, P_IDS + (k * 8) as u64) == ld(page, P_IDS + (i * 8) as u64) {
+                seen = true
+            }
+            k = k + 1
+        }
+        if !seen {
+            distinct = distinct + 1
+        }
+        i = i + 1
+    }
+    if distinct < 5 { return 121 }
+    dns.resolver_free(&res)
+    dns.resolver_free(&res2)
+    return 0
+}
+
+fn main() -> i32 {
+    if !thread_init() { return 1 }
+
+    // A TCP listener and a UDP socket on the SAME port number.
+    var l: net.Listener = net.listener_from_fd(0 - 1)
+    var ufd: i64 = 0 - 1
+    var port: u16 = 0 as u16
+    var tries: usize = 0
+    while ufd < 0 && tries < 50 {
+        l = net.listen_tcp(net.ADDR_LOCAL, 0 as u16) catch net.listener_from_fd(0 - 1)
+        if net.listener_is_open(&l) {
+            port = net.listener_port(&l)
+            let fd: i64 = udp.udp_open()
+            if fd >= 0 {
+                if udp.udp_bind(fd, net.ADDR_LOCAL, port) >= 0 {
+                    ufd = fd
+                } else {
+                    udp.udp_close(fd)
+                    net.close_listener(&l)
+                }
+            }
+        }
+        tries = tries + 1
+    }
+    if ufd < 0 { return 2 }
+    let page: u64 = rt.heap_alloc(P_SIZE)
+    if page == 0 { return 3 }
+    var z: usize = 0
+    while z < P_SIZE / 8 {
+        st(page, (z * 8) as u64, 0)
+        z = z + 1
+    }
+    st(page, P_UDP_FD, ufd as u64)
+    st(page, P_LISTEN_FD, net.listener_fd(&l) as u64)
+    let hu: u64 = thread_start(1, page)
+    let ht: u64 = thread_start(2, page)
+    if hu == 0 || ht == 0 { return 4 }
+    let rc: i32 = scenario(page, port)
+    // --- shut the server threads down -------------------------------------------------
+    st(page, P_QUIT, 1)
+    var quit: [u8; 4] = "QUIT"
+    let qfd: i64 = udp.udp_open()
+    udp.udp_sendto(qfd, (&quit[0]) as u64, 4, net.ADDR_LOCAL, port)
+    udp.udp_close(qfd)
+    var qc: net.Conn = net.connect_tcp(net.ADDR_LOCAL, port) catch net.conn_from_fd(0 - 1)
+    if net.conn_is_open(&qc) {
+        var qm: [u8; 6] = [0, 4, 81, 85, 73, 84]
+        let qw: usize = net.write_all(&qc, (&qm[0]) as u64, 6) catch 0 as usize
+        net.close(&qc)
+    }
+    thread_wait(hu)
+    thread_wait(ht)
+    udp.udp_close(ufd)
+    net.close_listener(&l)
+    return rc
+}

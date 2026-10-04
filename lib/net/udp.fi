@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/udp.fi -- UDP datagram sockets, IPv4 (round DNS).
+//
+// `lib/std/net.fi` is TCP only: `connect_tcp`, `listen_tcp`, a `Conn` that
+// is a byte stream. A DNS question is one datagram out and one datagram
+// back, so it needs `sendto(2)` WITH an address and `recvfrom(2)` that
+// reports who answered -- the two forms that `std.net` leaves at flags 0
+// and a null address. The Windows seam (compiler/src/win_seam.rs, calls 44
+// and 45) has translated both since round CERTUS-WINDOWS; this file is the
+// library that finally uses them.
+//
+// SAME SYSTEM CALLS ON BOTH SYSTEMS. Nothing here is Linux specific: the
+// numbers are the Linux ones and the seam turns them into ws2_32 on the
+// Windows target (SOCK_DGRAM stays 2, AF_INET stays 2, SO_RCVTIMEO is
+// translated from a timeval into a DWORD of milliseconds).
+//
+// ERRORS ARE THE KERNEL'S. Every function returns an `i64`: >= 0 is the
+// result, < 0 is the negated errno -- the convention of the raw system
+// calls and of `net.errno_of`. No error union: the one caller that matters
+// (lib/net/dns.fi) has to tell a timeout from a refusal, and an error union
+// cannot carry the errno in stage 0.
+//
+// HONEST
+//   U1 BLOCKING ONLY, with an optional receive timeout (`udp_set_timeout`).
+//      No poll/select, no non-blocking mode, no multiplexing of several
+//      sockets in one thread.
+//   U2 IPv4 ONLY, like std.net (N2).
+//   U3 ADDRESSES ARE IN HOST ORDER, the way one reads them
+//      (`net.ipv4(127, 0, 0, 1)`); the swap into network order happens
+//      here, once, on the way into the sockaddr and back out of it.
+//   U4 A DATAGRAM LONGER THAN THE BUFFER IS CUT, silently -- that is what
+//      recvfrom(2) does for UDP. The caller sizes the buffer for the
+//      largest datagram it expects.
+
+export {
+    udp_open, udp_bind, udp_close, udp_set_timeout, udp_sendto,
+    udp_recvfrom, udp_local_port, udp_is_timeout,
+    EAGAIN_NEG, ETIMEDOUT_NEG,
+}
+
+const SYS_CLOSE: i64 = 3
+const SYS_SOCKET: i64 = 41
+const SYS_SENDTO: i64 = 44
+const SYS_RECVFROM: i64 = 45
+const SYS_BIND: i64 = 49
+const SYS_GETSOCKNAME: i64 = 51
+const SYS_SETSOCKOPT: i64 = 54
+
+const AF_INET: i64 = 2
+const SOCK_DGRAM: i64 = 2
+const SOL_SOCKET: i64 = 1
+const SO_RCVTIMEO: i64 = 20
+const SO_SNDTIMEO: i64 = 21
+const MSG_NOSIGNAL: i64 = 16384
+
+// The two codes a receive timeout shows up as: EAGAIN from Linux (a
+// SO_RCVTIMEO that ran out), ETIMEDOUT from the Windows seam.
+const EAGAIN_NEG: i64 = 0 - 11
+const ETIMEDOUT_NEG: i64 = 0 - 110
+const EINTR_NEG: i64 = 0 - 4
+
+fn failed(r: i64) -> bool {
+    return r < 0 && r > 0 - 4096
+}
+
+// A fresh UDP socket: the descriptor, or a negative errno.
+fn udp_open() -> i64 {
+    return syscall(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0, 0, 0, 0)
+}
+
+fn udp_close(fd: i64) {
+    if fd < 0 {
+        return
+    }
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+}
+
+// The 16 octets of `struct sockaddr_in`: family (host order), port and
+// address in NETWORK order, eight octets of zero.
+fn fill_sockaddr(sa: *mut [u8; 16], addr: u32, port: u16) {
+    var i: usize = 0
+    while i < 16 {
+        (*sa)[i] = 0 as u8
+        i = i + 1
+    }
+    (*sa)[0] = AF_INET as u8
+    (*sa)[2] = ((port >> 8) & 255 as u16) as u8
+    (*sa)[3] = (port & 255 as u16) as u8
+    (*sa)[4] = ((addr >> 24) & 255 as u32) as u8
+    (*sa)[5] = ((addr >> 16) & 255 as u32) as u8
+    (*sa)[6] = ((addr >> 8) & 255 as u32) as u8
+    (*sa)[7] = (addr & 255 as u32) as u8
+}
+
+// Binds to `addr`:`port` (port 0 = let the kernel pick; ask
+// `udp_local_port` which one it was). 0 or a negative errno.
+fn udp_bind(fd: i64, addr: u32, port: u16) -> i64 {
+    var sa: [u8; 16] = [0; 16]
+    fill_sockaddr(&sa, addr, port)
+    return syscall(SYS_BIND, fd, (&sa[0]) as i64, 16, 0, 0, 0)
+}
+
+// The port the socket really has (host order), or a negative errno.
+fn udp_local_port(fd: i64) -> i64 {
+    var sa: [u8; 16] = [0; 16]
+    var len: [u32; 1] = [16]
+    let r: i64 = syscall(SYS_GETSOCKNAME, fd, (&sa[0]) as i64,
+        (&len[0]) as i64, 0, 0, 0)
+    if failed(r) {
+        return r
+    }
+    return ((sa[2] as i64) << 8) | (sa[3] as i64)
+}
+
+// SO_RCVTIMEO and SO_SNDTIMEO. `struct timeval` is two 64 bit words; 0 ms
+// means "no timeout". Returns 0 or a negative errno.
+fn udp_set_timeout(fd: i64, ms: u64) -> i64 {
+    var tv: [i64; 2] = [0; 2]
+    tv[0] = (ms / 1000 as u64) as i64
+    tv[1] = (ms % 1000 as u64) as i64 * 1000
+    let a: i64 = syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_RCVTIMEO,
+        (&tv[0]) as i64, 16, 0)
+    if failed(a) {
+        return a
+    }
+    let b: i64 = syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_SNDTIMEO,
+        (&tv[0]) as i64, 16, 0)
+    if failed(b) {
+        return b
+    }
+    return 0
+}
+
+// One datagram of `n` octets to `addr`:`port`. The number of octets sent
+// or a negative errno.
+fn udp_sendto(fd: i64, buf: u64, n: usize, addr: u32, port: u16) -> i64 {
+    var sa: [u8; 16] = [0; 16]
+    fill_sockaddr(&sa, addr, port)
+    var r: i64 = 0
+    var tries: usize = 0
+    while tries < 8 {
+        r = syscall(SYS_SENDTO, fd, buf as i64, n as i64, MSG_NOSIGNAL,
+            (&sa[0]) as i64, 16)
+        if r != EINTR_NEG {
+            break
+        }
+        tries = tries + 1
+    }
+    return r
+}
+
+// One datagram into `buf` (at most `cap` octets, see U4). The sender is
+// written to `*from_addr` / `*from_port` (host order) -- a resolver that
+// does not look at it accepts an answer from anybody. The number of octets
+// or a negative errno; `udp_is_timeout` tells a timeout from the rest.
+fn udp_recvfrom(fd: i64, buf: u64, cap: usize, from_addr: *mut u32,
+    from_port: *mut u16) -> i64 {
+    var sa: [u8; 16] = [0; 16]
+    var len: [u32; 1] = [16]
+    var r: i64 = 0
+    var tries: usize = 0
+    while tries < 8 {
+        len[0] = 16 as u32
+        r = syscall(SYS_RECVFROM, fd, buf as i64, cap as i64, 0,
+            (&sa[0]) as i64, (&len[0]) as i64)
+        if r != EINTR_NEG {
+            break
+        }
+        tries = tries + 1
+    }
+    if failed(r) {
+        return r
+    }
+    *from_addr = ((sa[4] as u32) << 24) | ((sa[5] as u32) << 16)
+        | ((sa[6] as u32) << 8) | (sa[7] as u32)
+    *from_port = (((sa[2] as u16) << 8) | (sa[3] as u16))
+    return r
+}
+
+fn udp_is_timeout(r: i64) -> bool {
+    return r == EAGAIN_NEG || r == ETIMEDOUT_NEG
+}

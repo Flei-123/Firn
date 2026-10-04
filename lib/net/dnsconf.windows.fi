@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/dnsconf.windows.fi -- the Windows twin of dnsconf.fi (round DNS).
+//
+// Windows has no /etc/resolv.conf. The name servers are a property of the
+// network adapters; `GetNetworkParams` (iphlpapi, bound in
+// compiler/src/win.rs) is the older and simpler way for IPv4: a
+// `FIXED_INFO` block that holds a linked list of `IP_ADDR_STRING`, each one
+// with the server as DOTTED TEXT. This file walks that list and writes
+// `nameserver <text>` lines, so that the same parser as on Linux reads
+// them.
+//
+// LAYOUT, x64, from iptypes.h (and measured against the documented sizes):
+//
+//   FIXED_INFO
+//     0    HostName[132]
+//     132  DomainName[132]
+//     264  PIP_ADDR_STRING CurrentDnsServer
+//     272  IP_ADDR_STRING DnsServerList        <- the first list element
+//   IP_ADDR_STRING (48 octets)
+//     0    Next              (pointer, 8)
+//     8    IpAddress.String  (char[16])
+//     24   IpMask.String     (char[16])
+//     40   Context           (DWORD) + padding
+//
+// The elements after the first are separate allocations INSIDE the buffer
+// the call filled; following `Next` stays inside it.
+//
+// HONEST
+//   W1 `GetNetworkParams` lists the servers of the machine, not of one
+//      adapter, and it knows only IPv4 servers. A machine whose only DNS
+//      is an IPv6 address gets the public fallback of dns.fi.
+//   W2 The hosts file is read from C:\Windows\System32\drivers\etc\hosts.
+//      A system installed on another drive letter gets no hosts table
+//      (the file simply is not found); the %SystemRoot% expansion is not
+//      done here.
+import std.rt
+
+export { conf_resolv, conf_hosts }
+
+extern fn GetNetworkParams(info: u64, len: u64) -> i32;
+
+const BUF_LEN: usize = 4096
+const OFF_LIST: usize = 272
+
+fn conf_resolv(out: *mut rt.Buf) -> bool {
+    var info: [u8; 4096] = [0; 4096]
+    var len: [u32; 1] = [4096]
+    let rc: i32 = GetNetworkParams((&info[0]) as u64, (&len[0]) as u64)
+    if rc != 0 {
+        return false
+    }
+    var word: [u8; 11] = "nameserver "
+    let base: u64 = (&info[0]) as u64
+    var node: u64 = base + OFF_LIST as u64
+    var written: usize = 0
+    var hops: usize = 0
+    while node != 0 as u64 && hops < 16 {
+        // The element has to lie inside the buffer, or `Next` is garbage.
+        if node < base || node + 48 as u64 > base + BUF_LEN as u64 {
+            break
+        }
+        let text: u64 = node + 8 as u64
+        var n: usize = 0
+        while n < 16 && rt.ld8(text, n) != 0 as u8 {
+            n = n + 1
+        }
+        if n > 0 {
+            rt.buf_push_bytes(out, (&word[0]) as u64, 11)
+            rt.buf_push_bytes(out, text, n)
+            rt.buf_push(out, 10 as u8)
+            written = written + 1
+        }
+        node = rt.ld64(node, 0)
+        hops = hops + 1
+    }
+    return written > 0
+}
+
+fn conf_hosts(out: *mut rt.Buf) -> bool {
+    var path: [u8; 38] = "C:/Windows/System32/drivers/etc/hosts\0"
+    return rt.read_file((&path[0]) as u64, out)
+}

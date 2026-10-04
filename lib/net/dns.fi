@@ -1,0 +1,1295 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/dns.fi -- A DNS RESOLVER in Firn (round DNS).
+//
+// Until now `net.http` could fetch from `http://127.0.0.1:8080/` and from
+// nothing that has a NAME: `HttpError::Resolve` was the answer to every
+// hostname (std.net N3 said "a round of its own"). This is that round.
+//
+// WHAT IS IN HERE
+//   * the wire format of RFC 1035 -- header, question, resource records,
+//     NAME COMPRESSION (pointers) with a hop limit -- as pure functions
+//     over octets (`dns_build_query`, `dns_parse_reply`) that are unit
+//     tested against fixtures;
+//   * A and AAAA records; CNAME CHAINS are followed, inside one answer
+//     (in any record order) and across answers (a CNAME with no address
+//     behind it starts a new question), up to 8 hops, and a cycle is
+//     `CnameLoop`, not a hang;
+//   * the resolver: UDP with a per-attempt timeout that DOUBLES, retries,
+//     every configured server in order, a random 16 bit transaction ID
+//     from the kernel (std.crypto.random), the answer accepted only from
+//     the server asked, on port 53, with the same ID and the same
+//     question; TCP FALLBACK (2 octet length prefix, RFC 1035 4.2.2) when
+//     the UDP answer has TC set;
+//   * the sources, in the order a C library asks them: a numeric IPv4
+//     address, `localhost`, the hosts file, the cache, the network;
+//   * a small TTL cache (32 names, positive and negative);
+//   * the name servers from /etc/resolv.conf (Linux) or from
+//     GetNetworkParams (Windows) -- lib/net/dnsconf*.fi -- and, when there
+//     are none, 1.1.1.1 and 8.8.8.8.
+//
+// SAME CODE ON BOTH SYSTEMS. The sockets go through `syscall` and the
+// Windows seam turns them into ws2_32 (lib/net/udp.fi); only the config
+// source differs (dnsconf.windows.fi).
+//
+// ----------------------------------------------------------------- USE
+//
+//     var res: dns.Resolver = dns.resolver_new()
+//     dns.resolver_init(&res)
+//     var out: dns.Resolved = dns.resolved_new()
+//     let ok: bool = dns.dns_resolve_a(&res, host_ptr, host_len, &out)
+//         catch false
+//     // out.addr[0] is the first address, in host order (net.ipv4 form)
+//
+// `net.http` does exactly this for any host that is not a numeric address.
+//
+// ---------------------------------------------------------------- HONEST
+//
+// D1  IPv4 TRANSPORT ONLY. AAAA records are PARSED and handed back
+//     (`Resolved.addr6`, `dns_resolve(.., T_AAAA, ..)`), but the queries
+//     travel over IPv4 and std.net cannot dial an IPv6 address anyway.
+// D2  NO DNSSEC, NO DoT/DoH, NO EDNS0. Without EDNS the classic limit of
+//     512 octets applies and a bigger answer arrives with TC, which the
+//     TCP fallback then fetches -- slower, not wrong. What protects
+//     against a forged answer is the 16 bit ID, the random source port the
+//     kernel picks, the sender and question check -- not cryptography. 0x20
+//     case randomisation is not done.
+// D3  NO SEARCH LIST, NO `ndots`. `intranet` is asked for as `intranet`.
+//     resolv.conf `search`/`domain`/`options` lines are ignored; so is
+//     the DomainName of Windows.
+// D4  NO INTERNATIONAL NAMES. A name with an octet >= 128 is `Name`; the
+//     caller converts to punycode first (xn--...). Nothing here does.
+// D5  NO ITERATIVE RESOLUTION. The servers are RECURSIVE resolvers; their
+//     answers are taken as they come, except that records which do not
+//     belong to the CNAME chain of the question are dropped (so a
+//     resolver that stuffs unrelated records into an answer is not
+//     believed).
+// D6  THE FALLBACK SERVERS ARE PUBLIC and used only when nothing is
+//     configured -- never ADDED to a configured list, because a company
+//     network that blocks 1.1.1.1 should not wait for it on every miss.
+// D7  THE CACHE IS PER RESOLVER, not per process, not shared between
+//     threads; the clock is the monotonic one, so a changed wall clock
+//     cannot expire or revive an entry. TTLs are clamped to 1 .. 3600 s;
+//     a negative answer lives 30 s (the SOA minimum is not read). Names
+//     longer than 95 octets are simply not cached.
+// D8  BLOCKING, one question at a time, in the calling thread.
+import std.rt
+import std.net
+import std.crypto.random
+import net.udp
+import net.dnsconf
+
+export {
+    DnsError, Resolver, Resolved, Reply,
+    resolver_new, resolver_init, resolver_free, resolver_clear_servers,
+    resolver_add_server, resolver_set_port, resolver_set_timeout,
+    resolver_set_retries, resolver_use_cache, resolver_use_hosts,
+    resolver_server_count, resolver_flush, resolver_last_error,
+    resolver_queries, resolver_cache_hits, resolver_udp_sent,
+    resolver_tcp_used, resolver_load_hosts_text,
+    resolved_new,
+    dns_resolve, dns_resolve_a, dns_lookup_a, dns_err_num, dns_err_name,
+    dns_build_query, dns_parse_reply, reply_new, dns_name_valid,
+    dns_parse_ipv4, dns_parse_resolv_conf, dns_hosts_lookup,
+    T_A, T_CNAME, T_AAAA,
+    VIA_NUMERIC, VIA_LOCALHOST, VIA_HOSTS, VIA_CACHE, VIA_UDP, VIA_TCP,
+}
+
+error DnsError {
+    Name, // not a valid host name (empty, bad octet, label > 63, > 253)
+    NoServers, // nothing to ask
+    Timeout, // every attempt of every server ran out
+    Network, // the socket failed (no route, no permission)
+    Format, // the answers were not DNS
+    ServerFail, // every server said SERVFAIL/REFUSED/...
+    NxDomain, // the name does not exist
+    NoData, // the name exists, but has no record of this type
+    CnameLoop, // a chain of more than 8 CNAMEs, or a cycle
+    Random, // the kernel would not give randomness for the ID
+}
+
+const T_A: u32 = 1
+const T_CNAME: u32 = 5
+const T_AAAA: u32 = 28
+const CLASS_IN: u32 = 1
+
+const VIA_NUMERIC: u32 = 1
+const VIA_LOCALHOST: u32 = 2
+const VIA_HOSTS: u32 = 3
+const VIA_CACHE: u32 = 4
+const VIA_UDP: u32 = 5
+const VIA_TCP: u32 = 6
+
+const BAD: usize = 18446744073709551615 as usize
+const MAX_ADDRS: usize = 8
+const MAX_ADDRS6: usize = 4
+const MAX_SERVERS: usize = 4
+const MAX_CNAME: u32 = 8
+const CACHE_N: usize = 32
+const CACHE_NAME: usize = 96
+const TTL_NONE: u32 = 4294967295 as u32
+const NEG_TTL_S: u64 = 30
+const TTL_MAX_S: u32 = 3600
+
+// Outcomes of one exchange with one server.
+const X_OK: i32 = 0
+const X_TIMEOUT: i32 = 1
+const X_NET: i32 = 2
+const X_FORMAT: i32 = 3
+const X_SERVFAIL: i32 = 4
+const X_RANDOM: i32 = 5
+
+// ------------------------------------------------------------ Octet helpers
+
+fn low(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+fn be16(p: u64, off: usize) -> u32 {
+    return ((rt.ld8(p, off) as u32) << 8) | (rt.ld8(p, off + 1) as u32)
+}
+
+fn be32(p: u64, off: usize) -> u32 {
+    return ((rt.ld8(p, off) as u32) << 24) | ((rt.ld8(p, off + 1) as u32) << 16)
+    | ((rt.ld8(p, off + 2) as u32) << 8) | (rt.ld8(p, off + 3) as u32)
+}
+
+fn push16(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, (v & 255 as u32) as u8)
+}
+
+// Two names, ASCII case-insensitive.
+fn name_eq(a: u64, an: usize, b: u64, bn: usize) -> bool {
+    if an != bn {
+        return false
+    }
+    var i: usize = 0
+    while i < an {
+        if low(rt.ld8(a, i)) != low(rt.ld8(b, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn copy_lower(dst: u64, src: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.st8(dst, i, low(rt.ld8(src, i)))
+        i = i + 1
+    }
+}
+
+// A monotonic clock in milliseconds -- TTLs must not follow a wall clock
+// that somebody sets (D7). clock_gettime(CLOCK_MONOTONIC); the Windows seam
+// translates call 228.
+fn now_ms() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] * 1000 + ts[1] / 1000000) as u64
+}
+
+// --------------------------------------------------------------- Addresses
+
+// A strict dotted quad: four decimal parts, 0..255, no sign, no leading
+// zeros ("010" is octal to inet_aton and decimal to everybody else -- the
+// ambiguity is refused, not guessed), no spaces. The address comes out in
+// HOST order, the `net.ipv4` form.
+fn dns_parse_ipv4(p: u64, n: usize, out: *mut u32) -> bool {
+    if n < 7 || n > 15 {
+        return false
+    }
+    var parts: u32 = 0
+    var v: u32 = 0
+    var digits: usize = 0
+    var acc: u32 = 0
+    var i: usize = 0
+    while i <= n {
+        var ch: u8 = 46 as u8
+        if i < n {
+            ch = rt.ld8(p, i)
+        }
+        if ch == 46 as u8 {
+            if digits == 0 {
+                return false
+            }
+            if parts >= 4 as u32 {
+                return false
+            }
+            acc = (acc << 8) | v
+            parts = parts + 1 as u32
+            v = 0
+            digits = 0
+        } else if ch >= 48 as u8 && ch <= 57 as u8 {
+            if digits > 0 && v == 0 {
+                return false // a leading zero
+            }
+            v = v * 10 as u32 + (ch - 48 as u8) as u32
+            digits = digits + 1
+            if digits > 3 || v > 255 as u32 {
+                return false
+            }
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    if parts != 4 as u32 {
+        return false
+    }
+    *out = acc
+    return true
+}
+
+// `localhost` and `*.localhost` are loopback by RFC 6761.
+fn is_localhost(p: u64, n: usize) -> bool {
+    var lh: [u8; 9] = "localhost"
+    if name_eq(p, n, (&lh[0]) as u64, 9) {
+        return true
+    }
+    if n > 10 {
+        var dl: [u8; 10] = ".localhost"
+        return name_eq(p + (n - 10) as u64, 10, (&dl[0]) as u64, 10)
+    }
+    return false
+}
+
+// ------------------------------------------------------------ Name checks
+
+// A host name as the resolver sends it: no trailing dot (the caller strips
+// one), labels of 1..63 octets of letters, digits, '-' and '_', in all at
+// most 253 octets. Octets >= 128 are refused (D4).
+fn dns_name_valid(p: u64, n: usize) -> bool {
+    if n == 0 || n > 253 {
+        return false
+    }
+    var label: usize = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 46 as u8 {
+            if label == 0 {
+                return false
+            }
+            label = 0
+        } else {
+            let ok: bool = (c >= 48 as u8 && c <= 57 as u8)
+            || (c >= 65 as u8 && c <= 90 as u8)
+            || (c >= 97 as u8 && c <= 122 as u8)
+            || c == 45 as u8 || c == 95 as u8
+            if !ok {
+                return false
+            }
+            label = label + 1
+            if label > 63 {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return label > 0
+}
+
+// ---------------------------------------------------------------- The query
+
+// One question, recursion desired, no EDNS (D2). `name` may end in one
+// dot. False when the name is not valid.
+fn dns_build_query(out: *mut rt.Buf, id: u32, name: u64, n: usize,
+    qtype: u32) -> bool {
+    var nl: usize = n
+    if nl > 0 && rt.ld8(name, nl - 1) == 46 as u8 {
+        nl = nl - 1
+    }
+    if !dns_name_valid(name, nl) {
+        return false
+    }
+    push16(out, id)
+    push16(out, 256 as u32) // RD
+    push16(out, 1 as u32) // QDCOUNT
+    push16(out, 0 as u32)
+    push16(out, 0 as u32)
+    push16(out, 0 as u32)
+    var start: usize = 0
+    var i: usize = 0
+    while i <= nl {
+        if i == nl || rt.ld8(name, i) == 46 as u8 {
+            let len: usize = i - start
+            rt.buf_push(out, len as u8)
+            rt.buf_push_bytes(out, name + start as u64, len)
+            start = i + 1
+        }
+        i = i + 1
+    }
+    rt.buf_push(out, 0 as u8)
+    push16(out, qtype)
+    push16(out, CLASS_IN)
+    return true
+}
+
+// ---------------------------------------------------------------- The reply
+
+struct Reply {
+    id: u32,
+    rcode: u32,
+    truncated: bool,
+    naddr: usize,
+    addr: [u32; 8], // host order
+    naddr6: usize,
+    addr6: [u8; 64], // four 16 octet addresses
+    ttl: u32, // the smallest TTL of the records that were used
+    ncname: u32, // CNAMEs followed inside this answer
+    cur: [u8; 256], // the name at the end of the chain, lower case
+    ncur: usize,
+    looped: bool, // the chain was longer than MAX_CNAME or a cycle
+}
+
+fn reply_new() -> Reply {
+    return Reply { id: 0 as u32, rcode: 0 as u32, truncated: false,
+        naddr: 0, addr: [0; 8], naddr6: 0, addr6: [0; 64],
+        ttl: TTL_NONE, ncname: 0 as u32, cur: [0; 256], ncur: 0,
+        looped: false }
+}
+
+fn reply_reset(r: *mut Reply) {
+    (*r).id = 0 as u32
+    (*r).rcode = 0 as u32
+    (*r).truncated = false
+    (*r).naddr = 0
+    (*r).naddr6 = 0
+    (*r).ttl = TTL_NONE
+    (*r).ncname = 0 as u32
+    (*r).ncur = 0
+    (*r).looped = false
+}
+
+// Reads a name at `off` -- plain labels or a compression pointer, or a
+// run of labels ending in one -- as lower case dotted text into `out`
+// (256 octets). Returns the length (0 for the root) or BAD. `*next` is
+// the offset just past the name AS IT STANDS at `off` (a pointer is two
+// octets, however long the name behind it is).
+//
+// THE DEFENCES. A pointer must lie inside the message; at most 16 pointers
+// are followed (a loop `c0 0c` pointing at itself would otherwise spin
+// forever); a label type other than 00 and 11 is refused (01 and 10 are
+// the extended types nobody ever deployed); the text is capped at 253.
+fn name_read(msg: u64, n: usize, off: usize, out: u64, next: *mut usize) -> usize {
+    var pos: usize = off
+    var o: usize = 0
+    var jumped: bool = false
+    var hops: usize = 0
+    var nxt: usize = 0
+    while true {
+        if pos >= n {
+            return BAD
+        }
+        let b: usize = rt.ld8(msg, pos) as usize
+        if b == 0 {
+            if !jumped {
+                nxt = pos + 1
+            }
+            break
+        }
+        if (b & 192) == 192 {
+            if pos + 1 >= n {
+                return BAD
+            }
+            let ptr: usize = ((b & 63) << 8) | (rt.ld8(msg, pos + 1) as usize)
+            if !jumped {
+                nxt = pos + 2
+                jumped = true
+            }
+            hops = hops + 1
+            if hops > 16 || ptr >= n {
+                return BAD
+            }
+            pos = ptr
+        } else if (b & 192) != 0 {
+            return BAD
+        } else {
+            if pos + 1 + b > n {
+                return BAD
+            }
+            var need: usize = o + b
+            if o > 0 {
+                need = need + 1
+            }
+            if need > 253 {
+                return BAD
+            }
+            if o > 0 {
+                rt.st8(out, o, 46 as u8)
+                o = o + 1
+            }
+            var k: usize = 0
+            while k < b {
+                rt.st8(out, o + k, low(rt.ld8(msg, pos + 1 + k)))
+                k = k + 1
+            }
+            o = o + b
+            pos = pos + 1 + b
+        }
+    }
+    *next = nxt
+    return o
+}
+
+struct Rr {
+    name: [u8; 256],
+    nname: usize,
+    typ: u32,
+    class: u32,
+    ttl: u32,
+    rdoff: usize,
+    rdlen: usize,
+    next: usize,
+}
+
+fn rr_new() -> Rr {
+    return Rr { name: [0; 256], nname: 0, typ: 0 as u32, class: 0 as u32,
+        ttl: 0 as u32, rdoff: 0, rdlen: 0, next: 0 }
+}
+
+fn rr_read(msg: u64, n: usize, off: usize, rr: *mut Rr) -> bool {
+    var nx: usize = 0
+    let ln: usize = name_read(msg, n, off, (&(*rr).name[0]) as u64, &nx)
+    if ln == BAD {
+        return false
+    }
+    (*rr).nname = ln
+    if nx + 10 > n {
+        return false
+    }
+    (*rr).typ = be16(msg, nx)
+    (*rr).class = be16(msg, nx + 2)
+    (*rr).ttl = be32(msg, nx + 4)
+    (*rr).rdlen = be16(msg, nx + 8) as usize
+    (*rr).rdoff = nx + 10
+    if (*rr).rdoff + (*rr).rdlen > n {
+        return false
+    }
+    (*rr).next = (*rr).rdoff + (*rr).rdlen
+    return true
+}
+
+fn ttl_note(r: *mut Reply, t: u32) {
+    if t < (*r).ttl {
+        (*r).ttl = t
+    }
+}
+
+// Parses an answer to the question (`qname`, `qtype`, class IN).
+//
+// FALSE means "this is not an answer to what was asked": too short, QR not
+// set, an opcode other than 0, no or other than one question, a question
+// that is not the one sent, a record that runs past the end. The resolver
+// ignores such a datagram and keeps waiting -- a forged or stray packet
+// must cost a moment, never decide the outcome.
+//
+// TRUE fills `r`: the header (id, rcode, TC), and, when RCODE is 0 and the
+// message is not truncated, the addresses at the END OF THE CNAME CHAIN
+// that starts at the question name. Only records owned by a name on that
+// chain are used (D5), whatever else the answer section holds.
+fn dns_parse_reply(msg: u64, n: usize, qname: u64, qlen: usize, qtype: u32,
+    r: *mut Reply) -> bool {
+    reply_reset(r)
+    if n < 12 {
+        return false
+    }
+    let flags: u32 = be16(msg, 2)
+    if (flags & 32768 as u32) == 0 as u32 {
+        return false
+    }
+    if ((flags >> 11) & 15 as u32) != 0 as u32 {
+        return false
+    }
+    (*r).id = be16(msg, 0)
+    (*r).rcode = flags & 15 as u32
+    (*r).truncated = (flags & 512 as u32) != 0 as u32
+    if be16(msg, 4) != 1 as u32 {
+        return false
+    }
+    let an: usize = be16(msg, 6) as usize
+
+    // the question must be the one we sent
+    var tmp: [u8; 256] = [0; 256]
+    var nx: usize = 0
+    let ln: usize = name_read(msg, n, 12, (&tmp[0]) as u64, &nx)
+    if ln == BAD || nx + 4 > n {
+        return false
+    }
+    if be16(msg, nx) != qtype || be16(msg, nx + 2) != CLASS_IN {
+        return false
+    }
+    var ql: usize = qlen
+    if ql > 0 && rt.ld8(qname, ql - 1) == 46 as u8 {
+        ql = ql - 1
+    }
+    if !name_eq((&tmp[0]) as u64, ln, qname, ql) {
+        return false
+    }
+    let ans: usize = nx + 4
+    copy_lower((&(*r).cur[0]) as u64, qname, ql)
+    (*r).ncur = ql
+    if (*r).truncated || (*r).rcode != 0 as u32 {
+        return true
+    }
+
+    // Phase 1: the CNAME chain, starting at the question name. A CNAME
+    // found restarts the scan, because answers do not have to be in chain
+    // order.
+    var rr: Rr = rr_new()
+    var changed: bool = true
+    while changed {
+        changed = false
+        var off: usize = ans
+        var i: usize = 0
+        while i < an && !changed {
+            if !rr_read(msg, n, off, &rr) {
+                return false
+            }
+            if rr.class == CLASS_IN && rr.typ == T_CNAME
+            && name_eq((&rr.name[0]) as u64, rr.nname,
+                (&(*r).cur[0]) as u64, (*r).ncur) {
+                var nx2: usize = 0
+                let tl: usize = name_read(msg, n, rr.rdoff,
+                    (&tmp[0]) as u64, &nx2)
+                if tl == BAD {
+                    return false
+                }
+                if (*r).ncname >= MAX_CNAME {
+                    (*r).looped = true
+                    return true
+                }
+                ttl_note(r, rr.ttl)
+                copy_lower((&(*r).cur[0]) as u64, (&tmp[0]) as u64, tl)
+                (*r).ncur = tl
+                (*r).ncname = (*r).ncname + 1 as u32
+                changed = true
+            }
+            off = rr.next
+            i = i + 1
+        }
+    }
+
+    // Phase 2: the addresses owned by the last name of the chain.
+    var off2: usize = ans
+    var j: usize = 0
+    while j < an {
+        if !rr_read(msg, n, off2, &rr) {
+            return false
+        }
+        if rr.class == CLASS_IN && name_eq((&rr.name[0]) as u64, rr.nname,
+            (&(*r).cur[0]) as u64, (*r).ncur) {
+            if rr.typ == T_A && rr.rdlen == 4 && (*r).naddr < MAX_ADDRS {
+                (*r).addr[(*r).naddr] = be32(msg, rr.rdoff)
+                (*r).naddr = (*r).naddr + 1
+                ttl_note(r, rr.ttl)
+            } else if rr.typ == T_AAAA && rr.rdlen == 16
+            && (*r).naddr6 < MAX_ADDRS6 {
+                var k: usize = 0
+                while k < 16 {
+                    (*r).addr6[(*r).naddr6 * 16 + k] = rt.ld8(msg, rr.rdoff + k)
+                    k = k + 1
+                }
+                (*r).naddr6 = (*r).naddr6 + 1
+                ttl_note(r, rr.ttl)
+            }
+        }
+        off2 = rr.next
+        j = j + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------- resolv.conf, hosts
+
+fn is_blank(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8 || c == 13 as u8
+}
+
+// The next whitespace separated token in [pos, end): its start, the end in
+// `*tend`. A start equal to `end` means there is none.
+fn next_token(p: u64, pos: usize, end: usize, tend: *mut usize) -> usize {
+    var i: usize = pos
+    while i < end && is_blank(rt.ld8(p, i)) {
+        i = i + 1
+    }
+    var k: usize = i
+    while k < end && !is_blank(rt.ld8(p, k)) {
+        k = k + 1
+    }
+    *tend = k
+    return i
+}
+
+// The end of the useful part of a line: a `#` or `;` starts a comment.
+fn line_end(p: u64, from: usize, end: usize) -> usize {
+    var i: usize = from
+    while i < end {
+        let c: u8 = rt.ld8(p, i)
+        if c == 35 as u8 || c == 59 as u8 {
+            return i
+        }
+        i = i + 1
+    }
+    return end
+}
+
+// `nameserver <IPv4>` lines, in order, without duplicates, at most 4 (the
+// glibc limit is 3). IPv6 servers and every other keyword are skipped
+// (D1, D3). Returns the number found.
+fn dns_parse_resolv_conf(p: u64, n: usize, out: *mut [u32; 4]) -> usize {
+    var found: usize = 0
+    var i: usize = 0
+    var kw: [u8; 10] = "nameserver"
+    while i < n && found < MAX_SERVERS {
+        var e: usize = i
+        while e < n && rt.ld8(p, e) != 10 as u8 {
+            e = e + 1
+        }
+        let le: usize = line_end(p, i, e)
+        var t1e: usize = 0
+        let t1: usize = next_token(p, i, le, &t1e)
+        if t1e - t1 == 10 && name_eq(p + t1 as u64, 10, (&kw[0]) as u64, 10) {
+            var t2e: usize = 0
+            let t2: usize = next_token(p, t1e, le, &t2e)
+            var ip: u32 = 0
+            if t2e > t2 && dns_parse_ipv4(p + t2 as u64, t2e - t2, &ip) {
+                var dup: bool = false
+                var k: usize = 0
+                while k < found {
+                    if (*out)[k] == ip {
+                        dup = true
+                    }
+                    k = k + 1
+                }
+                if !dup {
+                    (*out)[found] = ip
+                    found = found + 1
+                }
+            }
+        }
+        i = e + 1
+    }
+    return found
+}
+
+// The first hosts line that lists `name` (case-insensitive) after an IPv4
+// address. Lines whose address is not IPv4 (`::1 localhost`) are skipped.
+fn dns_hosts_lookup(p: u64, n: usize, name: u64, nlen: usize,
+    out: *mut u32) -> bool {
+    var i: usize = 0
+    while i < n {
+        var e: usize = i
+        while e < n && rt.ld8(p, e) != 10 as u8 {
+            e = e + 1
+        }
+        let le: usize = line_end(p, i, e)
+        var ae: usize = 0
+        let a: usize = next_token(p, i, le, &ae)
+        var ip: u32 = 0
+        if ae > a && dns_parse_ipv4(p + a as u64, ae - a, &ip) {
+            var pos: usize = ae
+            var go: bool = true
+            while go {
+                var te: usize = 0
+                let t: usize = next_token(p, pos, le, &te)
+                if te == t {
+                    go = false
+                } else {
+                    if name_eq(p + t as u64, te - t, name, nlen) {
+                        *out = ip
+                        return true
+                    }
+                    pos = te
+                }
+            }
+        }
+        i = e + 1
+    }
+    return false
+}
+
+// ----------------------------------------------------------------- Resolver
+
+struct Resolved {
+    addr: [u32; 8], // host order; addr[0] is the one to dial
+    n: usize,
+    addr6: [u8; 64],
+    n6: usize,
+    ttl: u32,
+    via: u32, // VIA_*
+    cnames: u32, // CNAMEs followed on the way
+    server: u32, // the server that answered (0 when none was asked)
+}
+
+fn resolved_new() -> Resolved {
+    return Resolved { addr: [0; 8], n: 0, addr6: [0; 64], n6: 0,
+        ttl: 0 as u32, via: 0 as u32, cnames: 0 as u32, server: 0 as u32 }
+}
+
+fn resolved_reset(o: *mut Resolved) {
+    (*o).n = 0
+    (*o).n6 = 0
+    (*o).ttl = 0 as u32
+    (*o).via = 0 as u32
+    (*o).cnames = 0 as u32
+    (*o).server = 0 as u32
+}
+
+struct Resolver {
+    servers: [u32; 4],
+    nservers: usize,
+    port: u16,
+    timeout_ms: u64,
+    retries: u32,
+    use_cache: bool,
+    use_hosts: bool,
+    hosts: rt.Buf,
+    have_hosts: bool,
+    // the cache, as parallel arrays (names are lower case)
+    c_name: [u8; 3072], // CACHE_N * CACHE_NAME
+    c_nlen: [usize; 32],
+    c_addr: [u32; 256], // CACHE_N * MAX_ADDRS
+    c_n: [usize; 32],
+    c_exp: [u64; 32], // monotonic milliseconds
+    c_kind: [u32; 32], // 0 free, 1 positive, 2 NXDOMAIN, 3 NODATA
+    c_next: usize,
+    n_queries: u64,
+    n_hits: u64,
+    n_udp: u64,
+    n_tcp: u64,
+    last_err: u32,
+}
+
+fn resolver_new() -> Resolver {
+    return Resolver { servers: [0; 4], nservers: 0, port: 53 as u16,
+        timeout_ms: 2000 as u64, retries: 2 as u32, use_cache: true,
+        use_hosts: true, hosts: rt.buf_new(), have_hosts: false,
+        c_name: [0; 3072], c_nlen: [0; 32], c_addr: [0; 256], c_n: [0; 32],
+        c_exp: [0; 32], c_kind: [0; 32], c_next: 0,
+        n_queries: 0 as u64, n_hits: 0 as u64, n_udp: 0 as u64,
+        n_tcp: 0 as u64, last_err: 0 as u32 }
+}
+
+fn resolver_free(r: *mut Resolver) {
+    rt.buf_free(&(*r).hosts)
+    (*r).have_hosts = false
+    (*r).nservers = 0
+}
+
+// Reads the system configuration: name servers (resolv.conf /
+// GetNetworkParams) and the hosts table; falls back to 1.1.1.1 and 8.8.8.8
+// when there are no servers (D6). Returns false only when out of memory.
+fn resolver_init(r: *mut Resolver) -> bool {
+    var conf: rt.Buf = rt.buf_new()
+    var found: usize = 0
+    if conf_resolv_text(&conf) {
+        found = dns_parse_resolv_conf(conf.ptr, conf.len, &(*r).servers)
+    }
+    rt.buf_free(&conf)
+    (*r).nservers = found
+    if found == 0 {
+        (*r).servers[0] = net.ipv4(1 as u8, 1 as u8, 1 as u8, 1 as u8)
+        (*r).servers[1] = net.ipv4(8 as u8, 8 as u8, 8 as u8, 8 as u8)
+        (*r).nservers = 2
+    }
+    rt.buf_clear(&(*r).hosts)
+    (*r).have_hosts = dnsconf.conf_hosts(&(*r).hosts)
+    return true
+}
+
+fn conf_resolv_text(out: *mut rt.Buf) -> bool {
+    return dnsconf.conf_resolv(out)
+}
+
+// A hosts table from memory (tests; a program with its own overrides).
+fn resolver_load_hosts_text(r: *mut Resolver, p: u64, n: usize) {
+    rt.buf_clear(&(*r).hosts)
+    rt.buf_push_bytes(&(*r).hosts, p, n)
+    (*r).have_hosts = true
+}
+
+fn resolver_clear_servers(r: *mut Resolver) { (*r).nservers = 0 }
+
+fn resolver_add_server(r: *mut Resolver, addr: u32) -> bool {
+    if (*r).nservers >= MAX_SERVERS {
+        return false
+    }
+    (*r).servers[(*r).nservers] = addr
+    (*r).nservers = (*r).nservers + 1
+    return true
+}
+
+fn resolver_set_port(r: *mut Resolver, port: u16) { (*r).port = port }
+fn resolver_set_timeout(r: *mut Resolver, ms: u64) { (*r).timeout_ms = ms }
+fn resolver_set_retries(r: *mut Resolver, n: u32) { (*r).retries = n }
+fn resolver_use_cache(r: *mut Resolver, on: bool) { (*r).use_cache = on }
+fn resolver_use_hosts(r: *mut Resolver, on: bool) { (*r).use_hosts = on }
+fn resolver_server_count(r: *mut Resolver) -> usize { return (*r).nservers }
+fn resolver_last_error(r: *mut Resolver) -> u32 { return (*r).last_err }
+fn resolver_queries(r: *mut Resolver) -> u64 { return (*r).n_queries }
+fn resolver_cache_hits(r: *mut Resolver) -> u64 { return (*r).n_hits }
+fn resolver_udp_sent(r: *mut Resolver) -> u64 { return (*r).n_udp }
+fn resolver_tcp_used(r: *mut Resolver) -> u64 { return (*r).n_tcp }
+
+fn resolver_flush(r: *mut Resolver) {
+    var i: usize = 0
+    while i < CACHE_N {
+        (*r).c_kind[i] = 0 as u32
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------------- Cache
+
+// The slot holding `name` and still fresh, or BAD. Expired entries are
+// freed on the way.
+fn cache_find(r: *mut Resolver, name: u64, n: usize, now: u64) -> usize {
+    if n > CACHE_NAME - 1 {
+        return BAD
+    }
+    var i: usize = 0
+    while i < CACHE_N {
+        if (*r).c_kind[i] != 0 as u32 && (*r).c_nlen[i] == n {
+            if name_eq((&(*r).c_name[0]) as u64 + (i * CACHE_NAME) as u64, n,
+                name, n) {
+                if (*r).c_exp[i] <= now {
+                    (*r).c_kind[i] = 0 as u32
+                    return BAD
+                }
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return BAD
+}
+
+fn cache_put(r: *mut Resolver, name: u64, n: usize, kind: u32,
+    addrs: *mut [u32; 8], na: usize, ttl_s: u64, now: u64) {
+    if !(*r).use_cache || n > CACHE_NAME - 1 || ttl_s == 0 as u64 {
+        return
+    }
+    var slot: usize = cache_find(r, name, n, now)
+    if slot == BAD {
+        // a free slot, else round robin
+        var i: usize = 0
+        while i < CACHE_N && slot == BAD {
+            if (*r).c_kind[i] == 0 as u32 || (*r).c_exp[i] <= now {
+                slot = i
+            }
+            i = i + 1
+        }
+        if slot == BAD {
+            slot = (*r).c_next % CACHE_N
+            (*r).c_next = (*r).c_next + 1
+        }
+    }
+    copy_lower((&(*r).c_name[0]) as u64 + (slot * CACHE_NAME) as u64, name, n)
+    (*r).c_nlen[slot] = n
+    (*r).c_kind[slot] = kind
+    (*r).c_n[slot] = na
+    var k: usize = 0
+    while k < na && k < MAX_ADDRS {
+        (*r).c_addr[slot * MAX_ADDRS + k] = (*addrs)[k]
+        k = k + 1
+    }
+    (*r).c_exp[slot] = now + ttl_s * 1000 as u64
+}
+
+// ----------------------------------------------------------------- Exchange
+
+// One UDP question to `server`; waits for an answer that is really one:
+// from that server and port, a well formed reply with our ID and our
+// question. Everything else is ignored (at most 16 stray datagrams, and
+// never past the deadline). The reply lands in `rep`.
+fn exchange_udp(r: *mut Resolver, server: u32, q: *mut rt.Buf, id: u32,
+    name: u64, nlen: usize, qtype: u32, ms: u64, rep: *mut Reply) -> i32 {
+    let fd: i64 = udp.udp_open()
+    if fd < 0 {
+        return X_NET
+    }
+    if udp.udp_set_timeout(fd, ms) < 0 {
+        udp.udp_close(fd)
+        return X_NET
+    }
+    let t0: u64 = now_ms()
+    let sent: i64 = udp.udp_sendto(fd, (*q).ptr, (*q).len, server, (*r).port)
+    (*r).n_udp = (*r).n_udp + 1 as u64
+    if sent < 0 {
+        udp.udp_close(fd)
+        return X_NET
+    }
+    var buf: [u8; 4096] = [0; 4096]
+    var status: i32 = X_TIMEOUT
+    var stray: usize = 0
+    var go: bool = true
+    while go {
+        var fa: u32 = 0
+        var fp: u16 = 0 as u16
+        let k: i64 = udp.udp_recvfrom(fd, (&buf[0]) as u64, 4096, &fa, &fp)
+        if k < 0 {
+            if !udp.udp_is_timeout(k) {
+                status = X_NET
+            }
+            go = false
+        } else {
+            var mine: bool = fa == server && fp == (*r).port
+            if mine {
+                mine = dns_parse_reply((&buf[0]) as u64, k as usize, name,
+                    nlen, qtype, rep)
+            }
+            if mine && (*rep).id == id {
+                status = X_OK
+                go = false
+            } else {
+                stray = stray + 1
+                if stray >= 16 || now_ms() - t0 >= ms {
+                    go = false
+                }
+            }
+        }
+    }
+    udp.udp_close(fd)
+    return status
+}
+
+// The same question over TCP (RFC 1035 4.2.2): a two octet length, then
+// the message; the answer comes the same way. Used when UDP said TC.
+fn exchange_tcp(r: *mut Resolver, server: u32, q: *mut rt.Buf, id: u32,
+    name: u64, nlen: usize, qtype: u32, ms: u64, rep: *mut Reply) -> i32 {
+    var c: net.Conn = net.connect_tcp_timeout(server, (*r).port, ms)
+    catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&c) {
+        return X_NET
+    }
+    (*r).n_tcp = (*r).n_tcp + 1 as u64
+    let okt: bool = net.set_timeout(&c, ms) catch false
+    var out: rt.Buf = rt.buf_new()
+    push16(&out, (*q).len as u32)
+    rt.buf_push_bytes(&out, (*q).ptr, (*q).len)
+    let w: usize = net.write_all(&c, out.ptr, out.len) catch BAD
+    rt.buf_free(&out)
+    if w == BAD {
+        net.close(&c)
+        return X_NET
+    }
+    var hdr: [u8; 2] = [0; 2]
+    let h: usize = net.read_full(&c, (&hdr[0]) as u64, 2) catch BAD
+    if h == BAD {
+        net.close(&c)
+        return X_TIMEOUT
+    }
+    let len: usize = ((hdr[0] as usize) << 8) | (hdr[1] as usize)
+    if len < 12 {
+        net.close(&c)
+        return X_FORMAT
+    }
+    var body: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&body, len)
+    if body.cap < len {
+        rt.buf_free(&body)
+        net.close(&c)
+        return X_NET
+    }
+    let g: usize = net.read_full(&c, body.ptr, len) catch BAD
+    net.close(&c)
+    var status: i32 = X_TIMEOUT
+    if g != BAD {
+        status = X_FORMAT
+        if dns_parse_reply(body.ptr, len, name, nlen, qtype, rep) && (*rep).id == id {
+            status = X_OK
+        }
+    }
+    rt.buf_free(&body)
+    return status
+}
+
+// Asks the servers in order, `retries` rounds, the timeout doubling every
+// round (capped at 8 s). A server that answers with SERVFAIL, REFUSED and
+// the like is skipped for the next; NXDOMAIN and NOERROR end the search.
+// `out.via` says UDP or TCP. Returns an X_* code.
+fn ask(r: *mut Resolver, name: u64, nlen: usize, qtype: u32,
+    rep: *mut Reply, out: *mut Resolved) -> i32 {
+    var last: i32 = X_TIMEOUT
+    var attempt: u32 = 0
+    var stop: bool = false
+    while attempt < (*r).retries && !stop {
+        var ms: u64 = (*r).timeout_ms << (attempt as u64)
+        if ms > 8000 as u64 {
+            ms = 8000 as u64
+        }
+        var s: usize = 0
+        while s < (*r).nservers && !stop {
+            let server: u32 = (*r).servers[s]
+            var idb: [u8; 2] = [0; 2]
+            if !random.random_bytes((&idb[0]) as u64, 2) {
+                return X_RANDOM
+            }
+            let id: u32 = ((idb[0] as u32) << 8) | (idb[1] as u32)
+            var q: rt.Buf = rt.buf_new()
+            if !dns_build_query(&q, id, name, nlen, qtype) {
+                rt.buf_free(&q)
+                return X_FORMAT
+            }
+            var st: i32 = exchange_udp(r, server, &q, id, name, nlen, qtype,
+                ms, rep)
+            (*out).via = VIA_UDP
+            if st == X_OK && (*rep).truncated {
+                st = exchange_tcp(r, server, &q, id, name, nlen, qtype, ms, rep)
+                (*out).via = VIA_TCP
+            }
+            rt.buf_free(&q)
+            if st == X_OK {
+                if (*rep).rcode == 0 as u32 || (*rep).rcode == 3 as u32 {
+                    (*out).server = server
+                    return X_OK
+                }
+                last = X_SERVFAIL
+            } else {
+                last = st
+            }
+            s = s + 1
+        }
+        if last == X_SERVFAIL {
+            stop = true // a definite "no" from every server: asking again will not change it
+        }
+        attempt = attempt + 1
+    }
+    return last
+}
+
+fn fail_of(r: *mut Resolver, st: i32) -> u32 {
+    var code: u32 = 10 as u32
+    if st == X_TIMEOUT {
+        code = 3 as u32
+    }
+    if st == X_NET {
+        code = 4 as u32
+    }
+    if st == X_FORMAT {
+        code = 5 as u32
+    }
+    if st == X_SERVFAIL {
+        code = 6 as u32
+    }
+    (*r).last_err = code
+    return code
+}
+
+// ------------------------------------------------------------------ Resolve
+
+// Resolves `name` (A or AAAA) into `out`.
+//
+//   numeric IPv4 -> localhost -> hosts table -> cache -> the servers
+//
+// The numeric, localhost, hosts and cache steps apply to A only; an AAAA
+// question always goes to the servers (D1). `out.via` says where the
+// answer came from. Errors say why not -- NxDomain and NoData are answers
+// (and are cached for 30 s), the others are failures of the lookup.
+fn dns_resolve(r: *mut Resolver, name: u64, nlen: usize, qtype: u32,
+    out: *mut Resolved) -> DnsError!bool {
+    resolved_reset(out)
+    (*r).last_err = 0 as u32
+    var nl: usize = nlen
+    if nl > 0 && rt.ld8(name, nl - 1) == 46 as u8 {
+        nl = nl - 1
+    }
+    if !dns_name_valid(name, nl) {
+        (*r).last_err = 1 as u32
+        return DnsError::Name
+    }
+    (*r).n_queries = (*r).n_queries + 1 as u64
+    var qn: [u8; 256] = [0; 256]
+    copy_lower((&qn[0]) as u64, name, nl)
+    let q: u64 = (&qn[0]) as u64
+    let now: u64 = now_ms()
+
+    if qtype == T_A {
+        var ip: u32 = 0
+        if dns_parse_ipv4(q, nl, &ip) {
+            (*out).addr[0] = ip
+            (*out).n = 1
+            (*out).via = VIA_NUMERIC
+            return true
+        }
+        if is_localhost(q, nl) {
+            (*out).addr[0] = net.ADDR_LOCAL
+            (*out).n = 1
+            (*out).via = VIA_LOCALHOST
+            return true
+        }
+        if (*r).use_hosts && (*r).have_hosts
+        && dns_hosts_lookup((*r).hosts.ptr, (*r).hosts.len, q, nl, &ip) {
+            (*out).addr[0] = ip
+            (*out).n = 1
+            (*out).via = VIA_HOSTS
+            return true
+        }
+        let slot: usize = cache_find(r, q, nl, now)
+        if slot != BAD {
+            (*r).n_hits = (*r).n_hits + 1 as u64
+            let kind: u32 = (*r).c_kind[slot]
+            if kind == 2 as u32 {
+                (*r).last_err = 7 as u32
+                return DnsError::NxDomain
+            }
+            if kind == 3 as u32 {
+                (*r).last_err = 8 as u32
+                return DnsError::NoData
+            }
+            var k: usize = 0
+            while k < (*r).c_n[slot] && k < MAX_ADDRS {
+                (*out).addr[k] = (*r).c_addr[slot * MAX_ADDRS + k]
+                k = k + 1
+            }
+            (*out).n = (*r).c_n[slot]
+            (*out).via = VIA_CACHE
+            let left: u64 = ((*r).c_exp[slot] - now) / 1000 as u64
+            (*out).ttl = left as u32
+            return true
+        }
+    }
+    if (*r).nservers == 0 {
+        (*r).last_err = 2 as u32
+        return DnsError::NoServers
+    }
+
+    var cur: [u8; 256] = [0; 256]
+    copy_lower((&cur[0]) as u64, q, nl)
+    var ncur: usize = nl
+    var hops: u32 = 0
+    var cnames: u32 = 0
+    var rep: Reply = reply_new()
+    var done: bool = false
+    var result: u32 = 0 as u32 // 0 address, 7 NXDOMAIN, 8 NODATA, 9 loop
+    while !done {
+        let st: i32 = ask(r, (&cur[0]) as u64, ncur, qtype, &rep, out)
+        if st != X_OK {
+            let code: u32 = fail_of(r, st)
+            if code == 3 as u32 {
+                return DnsError::Timeout
+            }
+            if code == 4 as u32 {
+                return DnsError::Network
+            }
+            if code == 5 as u32 {
+                return DnsError::Format
+            }
+            if code == 6 as u32 {
+                return DnsError::ServerFail
+            }
+            return DnsError::Random
+        }
+        if rep.rcode == 3 as u32 {
+            result = 7 as u32
+            done = true
+        } else if rep.looped {
+            result = 9 as u32
+            done = true
+        } else if (qtype == T_A && rep.naddr > 0)
+        || (qtype == T_AAAA && rep.naddr6 > 0) {
+            cnames = cnames + rep.ncname
+            done = true
+        } else if rep.ncname > 0 as u32 && !name_eq((&rep.cur[0]) as u64,
+            rep.ncur, (&cur[0]) as u64, ncur) {
+            // the chain ended in a name with no address: ask for that one
+            hops = hops + rep.ncname
+            cnames = cnames + rep.ncname
+            if hops > MAX_CNAME {
+                result = 9 as u32
+                done = true
+            } else {
+                copy_lower((&cur[0]) as u64, (&rep.cur[0]) as u64, rep.ncur)
+                ncur = rep.ncur
+            }
+        } else {
+            result = 8 as u32
+            done = true
+        }
+    }
+    (*r).last_err = result
+    if result == 7 as u32 {
+        cache_put(r, q, nl, 2 as u32, &(*out).addr, 0, NEG_TTL_S, now)
+        return DnsError::NxDomain
+    }
+    if result == 8 as u32 {
+        if qtype == T_A {
+            cache_put(r, q, nl, 3 as u32, &(*out).addr, 0, NEG_TTL_S, now)
+        }
+        return DnsError::NoData
+    }
+    if result == 9 as u32 {
+        return DnsError::CnameLoop
+    }
+    (*out).cnames = cnames
+    var ttl: u32 = rep.ttl
+    if ttl == TTL_NONE {
+        ttl = 0 as u32
+    }
+    if ttl > TTL_MAX_S {
+        ttl = TTL_MAX_S
+    }
+    (*out).ttl = ttl
+    var k2: usize = 0
+    while k2 < rep.naddr {
+        (*out).addr[k2] = rep.addr[k2]
+        k2 = k2 + 1
+    }
+    (*out).n = rep.naddr
+    var k3: usize = 0
+    while k3 < rep.naddr6 * 16 {
+        (*out).addr6[k3] = rep.addr6[k3]
+        k3 = k3 + 1
+    }
+    (*out).n6 = rep.naddr6
+    if qtype == T_A {
+        cache_put(r, q, nl, 1 as u32, &(*out).addr, rep.naddr, ttl as u64, now)
+    }
+    return true
+}
+
+fn dns_resolve_a(r: *mut Resolver, name: u64, nlen: usize,
+    out: *mut Resolved) -> DnsError!bool {
+    let ok: bool = try dns_resolve(r, name, nlen, T_A, out)
+    return ok
+}
+
+// The first IPv4 address of a name, in host order.
+fn dns_lookup_a(r: *mut Resolver, name: u64, nlen: usize) -> DnsError!u32 {
+    var out: Resolved = resolved_new()
+    let ok: bool = try dns_resolve(r, name, nlen, T_A, &out)
+    return out.addr[0]
+}
+
+// ------------------------------------------------------------ Error numbers
+
+fn dns_err_num(e: DnsError) -> u32 {
+    if e == DnsError::Name { return 1 as u32 }
+    if e == DnsError::NoServers { return 2 as u32 }
+    if e == DnsError::Timeout { return 3 as u32 }
+    if e == DnsError::Network { return 4 as u32 }
+    if e == DnsError::Format { return 5 as u32 }
+    if e == DnsError::ServerFail { return 6 as u32 }
+    if e == DnsError::NxDomain { return 7 as u32 }
+    if e == DnsError::NoData { return 8 as u32 }
+    if e == DnsError::CnameLoop { return 9 as u32 }
+    return 10 as u32
+}
+
+// The variant name for the number `resolver_last_error` / `dns_err_num`
+// gives, appended to `out`.
+fn dns_err_name(code: u32, out: *mut rt.Buf) {
+    var t: [u8; 74] = "OkNameNoServersTimeoutNetworkFormatServerFailNxDomainNoDataCnameLoopRandom"
+    var off: [usize; 12] = [0, 2, 6, 15, 22, 29, 35, 45, 53, 59, 68, 74]
+    var c: usize = code as usize
+    if c > 10 {
+        c = 10
+    }
+    rt.buf_push_bytes(out, (&t[0]) as u64 + off[c] as u64, off[c + 1] - off[c])
+}
