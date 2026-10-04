@@ -1,0 +1,342 @@
+// expect_exit: 0
+// tests/2012_fleitec_id.fi -- lib/fleitec_id (the Firn client of the Fleitec-ID
+// protocol) against the SHARED vectors.
+//
+// tests/data/fleitec-id-vectors.json is a copy of JARVIS
+// docs/fleitec-id/vectors.json (made by gen_vectors.py with Python's hmac,
+// hashlib and base64 -- nothing of the five implementations). The same file
+// is run by the TypeScript SDK, JARVIS, Cockpit, LogicLab, FreeViewer and
+// FirnChat; this test is the Firn library's turn. It is embedded at build
+// time (__include_str), so the test cannot miss its input.
+//
+// What is checked here: session token (25 cases, strict rules), device
+// tokens fkz1/fkm1 and their stored hash, API tokens ckt_, pair codes,
+// the Set-Cookie strings and the Cookie header, the relay URLs and the
+// token escaping. NOT here (not part of the Firn library): the HTTP client
+// status mapping, the address-book merge, scrypt.
+import std.io
+import std.rt
+import std.json
+import std.str
+import fleitec_id.jwt
+import fleitec_id.token
+import fleitec_id.cookie
+import fleitec_id.relay
+
+const VECTORS: str = __include_str("data/fleitec-id-vectors.json")
+
+struct Tally {
+    total: i64,
+    fails: i64,
+}
+
+fn check(t: *mut Tally, group: str, id: str.Span, ok: bool) {
+    (*t).total = (*t).total + 1
+    if !ok {
+        (*t).fails = (*t).fails + 1
+        io.print("FAIL ")
+        io.print(group)
+        io.print(" ")
+        io.print_line_bytes(id.p as u64, id.n)
+    }
+}
+
+fn get(d: *mut json.Json, o: u32, key: str) -> u32 {
+    return json.json_get(d, o, key.p as u64, key.n)
+}
+
+fn sget(d: *mut json.Json, o: u32, key: str) -> str.Span {
+    return json.json_string(d, get(d, o, key))
+}
+
+fn span_is(p: u64, n: usize, s: str) -> bool {
+    if n != s.n {
+        return false
+    }
+    return rt.mem_eq(p, s.p as u64, n)
+}
+
+fn span_eq(a: str.Span, b: str.Span) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    return rt.mem_eq(a.p as u64, b.p as u64, a.n)
+}
+
+// does the buffer hold exactly this span?
+fn buf_is(b: *mut rt.Buf, s: str.Span) -> bool {
+    if rt.buf_len(b) != s.n {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(b), s.p as u64, s.n)
+}
+
+fn code_of(p: u64, n: usize) -> i64 {
+    if span_is(p, n, "ok") {
+        return jwt.JWT_OK
+    }
+    if span_is(p, n, "malformed") {
+        return jwt.JWT_MALFORMED
+    }
+    if span_is(p, n, "alg") {
+        return jwt.JWT_ALG
+    }
+    if span_is(p, n, "sig") {
+        return jwt.JWT_SIG
+    }
+    if span_is(p, n, "expired") {
+        return jwt.JWT_EXPIRED
+    }
+    if span_is(p, n, "claims") {
+        return jwt.JWT_CLAIMS
+    }
+    if span_is(p, n, "iss") {
+        return jwt.JWT_ISS
+    }
+    if span_is(p, n, "aud") {
+        return jwt.JWT_AUD
+    }
+    if span_is(p, n, "nbf") {
+        return jwt.JWT_NBF
+    }
+    return -1
+}
+
+fn run_jwt(t: *mut Tally, d: *mut json.Json, root: u32) {
+    let jw: u32 = get(d, root, "jwt")
+    let sec: str.Span = sget(d, jw, "secret")
+    let now: i64 = json.json_int(d, get(d, jw, "now"))
+    var it: u32 = json.json_child(d, get(d, jw, "cases"))
+    while it != json.JSON_NONE {
+        let id: str.Span = sget(d, it, "id")
+        let tok: str.Span = sget(d, it, "token")
+        let ex: str.Span = sget(d, it, "expect")
+        let want: i64 = code_of(ex.p as u64, ex.n)
+        var issp: u64 = 0
+        var issn: usize = 0
+        var audp: u64 = 0
+        var audn: usize = 0
+        let dm: u32 = get(d, it, "demand")
+        if dm != json.JSON_NONE {
+            let s1: str.Span = sget(d, dm, "iss")
+            issp = s1.p as u64
+            issn = s1.n
+            let s2: str.Span = sget(d, dm, "aud")
+            audp = s2.p as u64
+            audn = s2.n
+        }
+        var c: jwt.Claims = jwt.claims_zero()
+        let got: i64 = jwt.jwt_verify_full(tok.p as u64, tok.n, sec.p as u64,
+            sec.n, now, issp, issn, audp, audn, &c)
+        var good: bool = got == want && want >= 0
+        if good && want == jwt.JWT_OK {
+            let uid: str.Span = sget(d, it, "uid")
+            let nm: str.Span = sget(d, it, "name")
+            if jwt.claims_uid_len(&c) != uid.n
+                || !rt.mem_eq(jwt.claims_uid_ptr(&c), uid.p as u64, uid.n) {
+                good = false
+            }
+            if jwt.claims_name_len(&c) != nm.n
+                || !rt.mem_eq(jwt.claims_name_ptr(&c), nm.p as u64, nm.n) {
+                good = false
+            }
+        }
+        check(t, "jwt", id, good)
+        it = json.json_next(d, it)
+    }
+}
+
+fn run_device(t: *mut Tally, d: *mut json.Json, root: u32) {
+    let dt0: u32 = get(d, root, "device_token")
+    var it: u32 = json.json_child(d, get(d, dt0, "cases"))
+    var hex: [u8; 64] = [0; 64]
+    while it != json.JSON_NONE {
+        let id: str.Span = sget(d, it, "id")
+        let tk: str.Span = sget(d, it, "token")
+        let prefix: str.Span = sget(d, it, "prefix")
+        let want_ok: bool = json.json_bool(d, get(d, it, "ok"))
+        var pfx: [u8; 4] = [0; 4]
+        var k: usize = 0
+        while k < 4 && k < prefix.n {
+            pfx[k] = rt.ld8(prefix.p as u64, k)
+            k = k + 1
+        }
+        var lit: str = str { p: (&pfx[0]) as *mut u8, n: prefix.n }
+        let r: token.DeviceToken = token.device_token_parse(tk.p as u64, tk.n,
+            lit)
+        var good: bool = r.ok == want_ok
+        if good && want_ok {
+            let uid: str.Span = sget(d, it, "uid")
+            let secret: str.Span = sget(d, it, "secret")
+            let hash: str.Span = sget(d, it, "hash")
+            if r.uid_len != uid.n
+                || !rt.mem_eq(tk.p as u64 + r.uid_at as u64, uid.p as u64, uid.n) {
+                good = false
+            }
+            if tk.n - r.secret_at != 64
+                || !rt.mem_eq(tk.p as u64 + r.secret_at as u64, secret.p as u64, 64) {
+                good = false
+            }
+            token.sha256_hex(tk.p as u64 + r.secret_at as u64, 64,
+                (&hex[0]) as u64)
+            if hash.n != 64 || !rt.mem_eq((&hex[0]) as u64, hash.p as u64, 64) {
+                good = false
+            }
+        }
+        check(t, "device", id, good)
+        it = json.json_next(d, it)
+    }
+}
+
+fn run_api(t: *mut Tally, d: *mut json.Json, root: u32) {
+    let a0: u32 = get(d, root, "api_token")
+    var it: u32 = json.json_child(d, get(d, a0, "cases"))
+    var hex: [u8; 64] = [0; 64]
+    while it != json.JSON_NONE {
+        let id: str.Span = sget(d, it, "id")
+        let tk: str.Span = sget(d, it, "token")
+        let want_ok: bool = json.json_bool(d, get(d, it, "ok"))
+        let r: token.ApiToken = token.api_token_parse(tk.p as u64, tk.n)
+        var good: bool = r.ok == want_ok
+        if good && want_ok {
+            let tid: str.Span = sget(d, it, "tokenId")
+            let secret: str.Span = sget(d, it, "secret")
+            let hash: str.Span = sget(d, it, "hash")
+            if tid.n != 10 || !rt.mem_eq(tk.p as u64 + r.id_at as u64, tid.p as u64, 10) {
+                good = false
+            }
+            if secret.n != 43
+                || !rt.mem_eq(tk.p as u64 + r.secret_at as u64, secret.p as u64, 43) {
+                good = false
+            }
+            token.sha256_hex(secret.p as u64, secret.n, (&hex[0]) as u64)
+            if hash.n != 64 || !rt.mem_eq((&hex[0]) as u64, hash.p as u64, 64) {
+                good = false
+            }
+        }
+        check(t, "api", id, good)
+        it = json.json_next(d, it)
+    }
+}
+
+fn run_pair(t: *mut Tally, d: *mut json.Json, root: u32) {
+    let p0: u32 = get(d, root, "pair_code")
+    var out: [u8; 64] = [0; 64]
+    var it: u32 = json.json_child(d, get(d, p0, "normalize"))
+    while it != json.JSON_NONE {
+        let inp: str.Span = sget(d, it, "input")
+        let ex: str.Span = sget(d, it, "expect")
+        let n: usize = token.pair_normalize(inp.p as u64, inp.n, (&out[0]) as u64, 64)
+        check(t, "pair.normalize", inp, n == ex.n
+            && rt.mem_eq((&out[0]) as u64, ex.p as u64, n))
+        it = json.json_next(d, it)
+    }
+    var it2: u32 = json.json_child(d, get(d, p0, "format"))
+    while it2 != json.JSON_NONE {
+        let raw: str.Span = sget(d, it2, "raw")
+        let ex2: str.Span = sget(d, it2, "expect")
+        let n2: usize = token.pair_format(raw.p as u64, raw.n, (&out[0]) as u64)
+        check(t, "pair.format", raw, n2 == ex2.n
+            && rt.mem_eq((&out[0]) as u64, ex2.p as u64, n2))
+        it2 = json.json_next(d, it2)
+    }
+}
+
+fn run_cookie(t: *mut Tally, d: *mut json.Json, root: u32) {
+    let c0: u32 = get(d, root, "cookie")
+    var out: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&out)
+    let dom: str.Span = sget(d, c0, "domain")
+    var domain: str = str { p: dom.p, n: dom.n }
+
+    let sc: u32 = get(d, c0, "set_cookie")
+    let sct: str.Span = sget(d, sc, "token")
+    cookie.session_cookie(sct.p as u64, sct.n, domain,
+        json.json_int(d, get(d, sc, "maxAge")), &out)
+    check(t, "cookie", sget(d, sc, "expect"), buf_is(&out, sget(d, sc, "expect")))
+
+    rt.buf_clear(&out)
+    let se: u32 = get(d, c0, "set_cookie_encoded")
+    let set_: str.Span = sget(d, se, "token")
+    cookie.session_cookie(set_.p as u64, set_.n, domain,
+        json.json_int(d, get(d, se, "maxAge")), &out)
+    check(t, "cookie.encoded", sget(d, se, "expect"),
+        buf_is(&out, sget(d, se, "expect")))
+
+    rt.buf_clear(&out)
+    let cc: u32 = get(d, c0, "clear_cookie")
+    cookie.clear_cookie(domain, &out)
+    check(t, "cookie.clear", sget(d, cc, "expect"), buf_is(&out, sget(d, cc, "expect")))
+
+    // the Cookie header: the value of fleitec_session (empty when absent/broken)
+    var val: [u8; 256] = [0; 256]
+    var it: u32 = json.json_child(d, get(d, c0, "parse"))
+    while it != json.JSON_NONE {
+        let hdr: str.Span = sget(d, it, "header")
+        let ex: str.Span = sget(d, get(d, it, "expect"), "fleitec_session")
+        let n: usize = cookie.cookie_find(hdr.p as u64, hdr.n, cookie.COOKIE_NAME,
+            (&val[0]) as u64, 256)
+        check(t, "cookie.parse", hdr, n == ex.n
+            && rt.mem_eq((&val[0]) as u64, ex.p as u64, n))
+        it = json.json_next(d, it)
+    }
+}
+
+fn run_relay(t: *mut Tally, d: *mut json.Json, root: u32) {
+    let r0: u32 = get(d, root, "relay_urls")
+    var out: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&out)
+    var it: u32 = json.json_child(d, get(d, r0, "account_url"))
+    while it != json.JSON_NONE {
+        rt.buf_clear(&out)
+        let rl: str.Span = sget(d, it, "relay")
+        let wh: str.Span = sget(d, it, "what")
+        relay.account_url(rl.p as u64, rl.n, wh.p as u64, wh.n, &out)
+        check(t, "relay.account", rl, buf_is(&out, sget(d, it, "expect")))
+        it = json.json_next(d, it)
+    }
+    var it2: u32 = json.json_child(d, get(d, r0, "plain_url"))
+    while it2 != json.JSON_NONE {
+        rt.buf_clear(&out)
+        let rl2: str.Span = sget(d, it2, "relay")
+        let wh2: str.Span = sget(d, it2, "what")
+        relay.plain_url(rl2.p as u64, rl2.n, wh2.p as u64, wh2.n, &out)
+        check(t, "relay.plain", rl2, buf_is(&out, sget(d, it2, "expect")))
+        it2 = json.json_next(d, it2)
+    }
+    var it3: u32 = json.json_child(d, get(d, r0, "urlenc"))
+    while it3 != json.JSON_NONE {
+        rt.buf_clear(&out)
+        let inp: str.Span = sget(d, it3, "input")
+        relay.url_encode_token(inp.p as u64, inp.n, &out)
+        check(t, "relay.urlenc", inp, buf_is(&out, sget(d, it3, "expect")))
+        it3 = json.json_next(d, it3)
+    }
+}
+
+fn main() -> i32 {
+    var d: json.Json = json.json_new()
+    defer json.json_free(&d)
+    let parsed: bool = json.json_parse(&d, VECTORS.p as u64, VECTORS.n) catch false
+    if !parsed {
+        io.print_line("FAIL the vectors are not JSON")
+        return 1
+    }
+    let root: u32 = json.json_root(&d)
+    var t: Tally = Tally { total: 0, fails: 0 }
+    run_jwt(&t, &d, root)
+    run_device(&t, &d, root)
+    run_api(&t, &d, root)
+    run_pair(&t, &d, root)
+    run_cookie(&t, &d, root)
+    run_relay(&t, &d, root)
+    if t.total < 70 {
+        io.fmt_print_line(f"FAIL only {t.total} cases ran")
+        return 2
+    }
+    if t.fails > 0 {
+        io.fmt_print_line(f"FAIL {t.fails} of {t.total}")
+        return 3
+    }
+    return 0
+}

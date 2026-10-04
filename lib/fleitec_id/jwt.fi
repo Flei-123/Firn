@@ -1,0 +1,827 @@
+// SPDX-License-Identifier: MPL-2.0
+// Origin: FirnChat src/web/jwt.fi (same author), lifted into the Firn library
+// as the Firn client of the Fleitec-ID protocol (docs/FLEITEC-ID.md in the
+// JARVIS tree). The file is a copy on purpose: FirnChat is NOT switched over
+// yet; tests/1700_fleitec_id.fi runs both against the same vectors.
+// lib/fleitec_id/jwt.fi
+// src/web/jwt.fi -- CHECKING A JSON WEB TOKEN. Nothing else.
+//
+// The JARVIS server at fleitec.com already signs its browser sessions:
+// a cookie `fleitec_session` for *.fleitec.com holding a JWT with HS256,
+// the secret 64 hex characters in /root/.fleitec/secret (mode 0600), the
+// payload {"uid":"u_DiS4in7esMF1","name":"Justin","iat":...,"exp":...}.
+// FIRNCHAT does not talk to that server: it checks the signature itself.
+//
+// THE RULES, and they are the whole point of this file:
+//   * three base64url parts separated by '.', no padding;
+//   * HMAC-SHA256 over "<head>.<payload>" with the secret, compared in
+//     CONSTANT TIME (hmac.hmac_equal) -- never with an early exit;
+//   * the algorithm is decided by US, not by the token: the head must say
+//     "HS256". "alg":"none" is not a special case here, it is simply not
+//     HS256, and it is refused like every other value;
+//   * exp must lie in the future, and a `nbf` that lies in the future
+//     means the token is not valid YET -- it is refused just as hard as
+//     an expired one;
+//   * an issuer (`iss`) and an audience (`aud`) can be DEMANDED by the
+//     operator (anbieter.conf: `iss = ...`, `aud = ...`). Then the claim
+//     has to be there and to match octet for octet. Without those keys
+//     nothing changes -- jwt_verify is jwt_verify_full with no demand.
+// No network call, no external package, no crypto of our own -- only
+// lib/std/crypto/{hmac,sha256}.fi.
+
+import std.io
+import std.rt
+import std.crypto.hmac
+import std.crypto.sha256
+
+export { Claims, claims_zero, claims_uid_ptr, claims_uid_len, claims_name_ptr,
+    claims_name_len, claims_exp, claims_iat,
+    jwt_verify, jwt_verify_full, jwt_reason, jwt_secret_load,
+    jwt_secret_load_form, b64url_decode,
+    JWT_OK, JWT_MALFORMED, JWT_ALG, JWT_SIG, JWT_EXPIRED, JWT_CLAIMS,
+    JWT_COOKIE_BIG, JWT_ISS, JWT_AUD, JWT_NBF }
+
+const UID_MAX: usize = 96
+const JNAME_MAX: usize = 64
+const TOKEN_MAX: usize = 2048
+const SECRET_HEX: usize = 64
+
+// Why a token was refused. 0 is the only good answer.
+const JWT_OK: i64 = 0
+const JWT_MALFORMED: i64 = 1 // not three base64url parts / not JSON
+const JWT_ALG: i64 = 2 // the head does not say HS256 ("none" lands here)
+const JWT_SIG: i64 = 3 // signature does not match the secret
+const JWT_EXPIRED: i64 = 4 // exp is in the past (or missing)
+const JWT_CLAIMS: i64 = 5 // no uid
+// The Cookie header of the request did not fit into the buffer it was
+// read into, so the token could not even be looked for. That is not a
+// bad token -- it is a request nobody could judge, and it gets its own
+// code so the refusal does not blame the signature.
+const JWT_COOKIE_BIG: i64 = 6
+// The three refusals of the demanded claims. They are their OWN codes:
+// a token of a foreign issuer is not a broken signature, and a token
+// that is not valid yet is not an expired one -- the log line and the
+// browser get the truth.
+const JWT_ISS: i64 = 7 // no `iss`, or another one than demanded
+const JWT_AUD: i64 = 8 // no `aud`, or another one than demanded
+const JWT_NBF: i64 = 9 // `nbf` lies in the future: not valid yet
+
+struct Claims {
+    uid: [u8; 96],
+    uidn: usize,
+    name: [u8; 64],
+    name_len: usize,
+    iat: i64,
+    exp: i64,
+    ok: bool,
+}
+
+fn claims_zero() -> Claims {
+    return Claims { uid: [0; 96], uidn: 0, name: [0; 64], name_len: 0,
+        iat: 0, exp: 0, ok: false }
+}
+
+fn claims_uid_ptr(c: *mut Claims) -> u64 {
+    return (&(*c).uid[0]) as u64
+}
+
+fn claims_uid_len(c: *mut Claims) -> usize {
+    return (*c).uidn
+}
+
+fn claims_name_ptr(c: *mut Claims) -> u64 {
+    return (&(*c).name[0]) as u64
+}
+
+fn claims_name_len(c: *mut Claims) -> usize {
+    return (*c).name_len
+}
+
+fn claims_exp(c: *mut Claims) -> i64 {
+    return (*c).exp
+}
+
+fn claims_iat(c: *mut Claims) -> i64 {
+    return (*c).iat
+}
+
+// ---------------------------------------------------------- the API
+
+// The value of one base64url character, -1 when it is not one. '+' and
+// '/' of plain base64 are NOT in this alphabet, and neither is the '='
+// of the padding -- a JWT is written without it.
+fn b64url_value(c: u8) -> i32 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return (c - 65 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 122 as u8 {
+        return ((c - 97 as u8) as i32) + 26
+    }
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return ((c - 48 as u8) as i32) + 52
+    }
+    if c == 45 as u8 {
+        return 62
+    }
+    if c == 95 as u8 {
+        return 63
+    }
+    return -1
+}
+
+// base64url (RFC 4648 §5, no padding, no '+' and no '/') into `out`.
+// Returns the number of octets written, or -1 when a character does not
+// belong to the alphabet or the result does not fit.
+fn b64url_decode(src: u64, n: usize, out: u64, cap: usize) -> i64 {
+    if n == 0 {
+        return 0
+    }
+    // A group of four characters carries three octets. A remainder of one
+    // character carries nothing at all and can only be a broken token.
+    if (n % 4) == 1 {
+        return -1
+    }
+    var acc: u32 = 0
+    var bits: usize = 0
+    var w: usize = 0
+    var i: usize = 0
+    while i < n {
+        let v: i32 = b64url_value(rt.ld8(src, i))
+        if v < 0 {
+            return -1
+        }
+        acc = (acc << 6 as u32) | (v as u32)
+        bits = bits + 6
+        if bits >= 8 {
+            bits = bits - 8
+            if w >= cap {
+                return -1
+            }
+            rt.st8(out, w, ((acc >> (bits as u32)) & 255 as u32) as u8)
+            w = w + 1
+        }
+        i = i + 1
+    }
+    // The leftover bits of the last group must be zero -- everything else
+    // is a second spelling of the same octets, and a token has exactly one.
+    if bits > 0 {
+        let mask: u32 = ((1 as u32) << (bits as u32)) - 1 as u32
+        if (acc & mask) != 0 as u32 {
+            return -1
+        }
+    }
+    return w as i64
+}
+
+// The value of one hex digit, -1 when it is not one.
+fn hex_value_of(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return ((c - 97 as u8) as i32) + 10
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return ((c - 65 as u8) as i32) + 10
+    }
+    return -1
+}
+
+// Reads the shared secret out of a file. The file holds 64 hex characters
+// (trailing whitespace and a newline are allowed and nothing else).
+// Returns the number of octets of the RAW key (32), 0 when the file is
+// unusable. `out` needs 32 octets.
+// THE KEY FILE, AS IT IS WRITTEN. `hex` says how to read it:
+//   false (the default, `geheimnis-form = text`): the octets of the file
+//         ARE the key. That is what node's createHmac('sha256', text)
+//         does, and it is what the JARVIS server does with
+//         /root/.fleitec/secret -- the 64 hex characters there are the
+//         key as TEXT, not 32 decoded octets. Getting this wrong costs a
+//         signature that never matches.
+//   true  (`geheimnis-form = hex`): the file holds hex and the decoded
+//         octets are the key.
+// Trailing newline/blanks are cut off either way; under 16 octets is
+// refused -- that is a word, not a secret.
+fn jwt_secret_load_form(path: u64, out: u64, cap: usize, hex: bool) -> usize {
+    if cap < 32 {
+        return 0
+    }
+    var b: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&b)
+    if !io.read_file(path, &b) {
+        return 0
+    }
+    let p: u64 = rt.buf_ptr(&b)
+    var n: usize = rt.buf_len(&b)
+    while n > 0 {
+        let ch: u8 = rt.ld8(p, n - 1)
+        if ch == 10 as u8 || ch == 13 as u8 || ch == 32 as u8
+            || ch == 9 as u8 {
+            n = n - 1
+        } else {
+            break
+        }
+    }
+    if n == 0 {
+        return 0
+    }
+    if hex {
+        if n != SECRET_HEX {
+            return 0
+        }
+        var i: usize = 0
+        while i < 32 {
+            let hi: i32 = hex_value_of(rt.ld8(p, i * 2))
+            let lo: i32 = hex_value_of(rt.ld8(p, i * 2 + 1))
+            if hi < 0 || lo < 0 {
+                return 0
+            }
+            rt.st8(out, i, ((hi * 16) + lo) as u8)
+            i = i + 1
+        }
+        return 32
+    }
+    if n < 16 || n > cap {
+        return 0
+    }
+    var k: usize = 0
+    while k < n {
+        rt.st8(out, k, rt.ld8(p, k))
+        k = k + 1
+    }
+    return n
+}
+
+// The old name, kept for callers that do not care: text form.
+fn jwt_secret_load(path: u64, out: u64, cap: usize) -> usize {
+    return jwt_secret_load_form(path, out, cap, false)
+}
+
+// ------------------------------------------------------- a flat JSON object
+//
+// Enough JSON for a JWT payload and nothing more: an object of string and
+// number fields, read by WALKING it (key, colon, value, comma) instead of
+// searching for the key anywhere in the text. That difference matters --
+// a payload {"uid":"x","name":"\"exp\":9999999999"} must not be able to
+// smuggle a field in through a value.
+
+fn json_skip_ws(p: u64, n: usize, i: usize) -> usize {
+    var k: usize = i
+    while k < n {
+        let c: u8 = rt.ld8(p, k)
+        if c == 32 as u8 || c == 9 as u8 || c == 10 as u8 || c == 13 as u8 {
+            k = k + 1
+        } else {
+            return k
+        }
+    }
+    return k
+}
+
+// `i` points at the opening quote. Returns the index just after the
+// closing one, 0 when the string never ends.
+fn json_skip_string(p: u64, n: usize, i: usize) -> usize {
+    var k: usize = i + 1
+    while k < n {
+        let c: u8 = rt.ld8(p, k)
+        if c == 92 as u8 {
+            k = k + 2
+        } else {
+            if c == 34 as u8 {
+                return k + 1
+            }
+            k = k + 1
+        }
+    }
+    return 0
+}
+
+// Steps over one value (string, number, object, array, literal) and gives
+// back the index behind it.
+fn json_skip_value(p: u64, n: usize, i: usize) -> usize {
+    if i >= n {
+        return n
+    }
+    let c: u8 = rt.ld8(p, i)
+    if c == 34 as u8 {
+        let e: usize = json_skip_string(p, n, i)
+        if e == 0 {
+            return n
+        }
+        return e
+    }
+    if c == 123 as u8 || c == 91 as u8 {
+        var depth: i64 = 0
+        var k: usize = i
+        while k < n {
+            let d: u8 = rt.ld8(p, k)
+            if d == 34 as u8 {
+                let e2: usize = json_skip_string(p, n, k)
+                if e2 == 0 {
+                    return n
+                }
+                k = e2
+            } else {
+                if d == 123 as u8 || d == 91 as u8 {
+                    depth = depth + 1
+                }
+                if d == 125 as u8 || d == 93 as u8 {
+                    depth = depth - 1
+                }
+                k = k + 1
+                if depth == 0 {
+                    return k
+                }
+            }
+        }
+        return n
+    }
+    var k2: usize = i
+    while k2 < n {
+        let d2: u8 = rt.ld8(p, k2)
+        if d2 == 44 as u8 || d2 == 125 as u8 || d2 == 93 as u8 {
+            return k2
+        }
+        k2 = k2 + 1
+    }
+    return n
+}
+
+// Index of the VALUE that belongs to `key`, -1 when the object does not
+// carry it.
+fn json_find_value(body: u64, n: usize, key: u64, keyn: usize) -> i64 {
+    var i: usize = json_skip_ws(body, n, 0)
+    if i < n && rt.ld8(body, i) == 123 as u8 {
+        i = i + 1
+    }
+    var guard: usize = 0
+    while guard < 256 {
+        guard = guard + 1
+        i = json_skip_ws(body, n, i)
+        if i >= n || rt.ld8(body, i) != 34 as u8 {
+            return -1
+        }
+        let ks: usize = i + 1
+        let after: usize = json_skip_string(body, n, i)
+        if after == 0 {
+            return -1
+        }
+        let ke: usize = after - 1
+        i = json_skip_ws(body, n, after)
+        if i >= n || rt.ld8(body, i) != 58 as u8 {
+            return -1
+        }
+        i = json_skip_ws(body, n, i + 1)
+        if i >= n {
+            return -1
+        }
+        if (ke - ks) == keyn && keyn > 0
+            && rt.mem_eq(body + ks as u64, key, keyn) {
+            return i as i64
+        }
+        i = json_skip_ws(body, n, json_skip_value(body, n, i))
+        if i < n && rt.ld8(body, i) == 44 as u8 {
+            i = i + 1
+        } else {
+            return -1
+        }
+    }
+    return -1
+}
+
+// Writes one code point as UTF-8. Returns the number of octets, 0 when it
+// does not fit.
+fn utf8_put(out: u64, w: usize, cap: usize, cp: i32) -> usize {
+    if cp < 128 {
+        if w + 1 > cap {
+            return 0
+        }
+        rt.st8(out, w, cp as u8)
+        return 1
+    }
+    if cp < 2048 {
+        if w + 2 > cap {
+            return 0
+        }
+        rt.st8(out, w, (192 + (cp / 64)) as u8)
+        rt.st8(out, w + 1, (128 + (cp % 64)) as u8)
+        return 2
+    }
+    if cp < 65536 {
+        if w + 3 > cap {
+            return 0
+        }
+        rt.st8(out, w, (224 + (cp / 4096)) as u8)
+        rt.st8(out, w + 1, (128 + ((cp / 64) % 64)) as u8)
+        rt.st8(out, w + 2, (128 + (cp % 64)) as u8)
+        return 3
+    }
+    if w + 4 > cap {
+        return 0
+    }
+    rt.st8(out, w, (240 + (cp / 262144)) as u8)
+    rt.st8(out, w + 1, (128 + ((cp / 4096) % 64)) as u8)
+    rt.st8(out, w + 2, (128 + ((cp / 64) % 64)) as u8)
+    rt.st8(out, w + 3, (128 + (cp % 64)) as u8)
+    return 4
+}
+
+// The four hex digits of a \uXXXX, -1 when they are not four hex digits.
+fn json_hex4(body: u64, n: usize, i: usize) -> i32 {
+    if i + 4 > n {
+        return -1
+    }
+    var cp: i32 = 0
+    var k: usize = 0
+    while k < 4 {
+        let h: i32 = hex_value_of(rt.ld8(body, i + k))
+        if h < 0 {
+            return -1
+        }
+        cp = cp * 16 + h
+        k = k + 1
+    }
+    return cp
+}
+
+// One string field out of a flat JSON object: "key":"value". Returns the
+// length, 0 when it is not there. Handles \" \\ \/ \n \t and \uXXXX.
+fn json_string_field(body: u64, n: usize, key: u64, keyn: usize, out: u64,
+    cap: usize) -> usize {
+    let at: i64 = json_find_value(body, n, key, keyn)
+    if at < 0 {
+        return 0
+    }
+    var i: usize = at as usize
+    if rt.ld8(body, i) != 34 as u8 {
+        return 0
+    }
+    i = i + 1
+    var w: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(body, i)
+        if c == 34 as u8 {
+            return w
+        }
+        if c != 92 as u8 {
+            if w >= cap {
+                return 0
+            }
+            rt.st8(out, w, c)
+            w = w + 1
+            i = i + 1
+        } else {
+            if i + 1 >= n {
+                return 0
+            }
+            let e: u8 = rt.ld8(body, i + 1)
+            i = i + 2
+            if e == 117 as u8 {
+                var cp: i32 = json_hex4(body, n, i)
+                if cp < 0 {
+                    return 0
+                }
+                i = i + 4
+                // A surrogate pair is one code point written as two
+                // escapes; a lone half becomes U+FFFD, it is not worth
+                // refusing a display name over.
+                if cp >= 55296 && cp <= 56319 {
+                    var lo: i32 = -1
+                    if i + 6 <= n && rt.ld8(body, i) == 92 as u8
+                        && rt.ld8(body, i + 1) == 117 as u8 {
+                        lo = json_hex4(body, n, i + 2)
+                    }
+                    if lo >= 56320 && lo <= 57343 {
+                        cp = 65536 + ((cp - 55296) * 1024) + (lo - 56320)
+                        i = i + 6
+                    } else {
+                        cp = 65533
+                    }
+                } else {
+                    if cp >= 56320 && cp <= 57343 {
+                        cp = 65533
+                    }
+                }
+                let wrote: usize = utf8_put(out, w, cap, cp)
+                if wrote == 0 {
+                    return 0
+                }
+                w = w + wrote
+            } else {
+                var put: u8 = 0 as u8
+                if e == 34 as u8 || e == 92 as u8 || e == 47 as u8 {
+                    put = e
+                } else {
+                    if e == 110 as u8 {
+                        put = 10 as u8
+                    } else {
+                        if e == 116 as u8 {
+                            put = 9 as u8
+                        } else {
+                            if e == 114 as u8 {
+                                put = 13 as u8
+                            } else {
+                                if e == 98 as u8 {
+                                    put = 8 as u8
+                                } else {
+                                    if e == 102 as u8 {
+                                        put = 12 as u8
+                                    } else {
+                                        return 0
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if w >= cap {
+                    return 0
+                }
+                rt.st8(out, w, put)
+                w = w + 1
+            }
+        }
+    }
+    return 0
+}
+
+// One number field: "key":123. `found` says whether it was there at all,
+// which is not the same as the value being 0.
+fn json_number_field(body: u64, n: usize, key: u64, keyn: usize,
+    found: *mut bool) -> i64 {
+    *found = false
+    let at: i64 = json_find_value(body, n, key, keyn)
+    if at < 0 {
+        return 0
+    }
+    var i: usize = at as usize
+    var neg: bool = false
+    if rt.ld8(body, i) == 45 as u8 {
+        neg = true
+        i = i + 1
+    }
+    var v: i64 = 0
+    var digits: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(body, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            break
+        }
+        if v > 922337203685477580 {
+            return 0
+        }
+        v = v * 10 + ((c - 48 as u8) as i64)
+        digits = digits + 1
+        i = i + 1
+    }
+    if digits == 0 {
+        return 0
+    }
+    *found = true
+    if neg {
+        return 0 - v
+    }
+    return v
+}
+
+// ------------------------------------------------------------- the check
+
+// THE CHECK. `tok` is the raw token out of the cookie, `secret` the 32
+// RAW octets out of jwt_secret_load, `now` unix seconds. Returns one of
+// the JWT_* constants; `out` is only filled on JWT_OK.
+fn jwt_verify(tok: u64, tokn: usize, secret: u64, secn: usize, now: i64,
+    out: *mut Claims) -> i64 {
+    return jwt_verify_full(tok, tokn, secret, secn, now, 0, 0, 0, 0, out)
+}
+
+// THE SAME CHECK WITH THE OPERATOR'S DEMANDS. `iss`/`issn` and
+// `aud`/`audn` are the values out of anbieter.conf; a length of 0 means
+// "not demanded", and then this is exactly jwt_verify. When a value IS
+// demanded, the claim has to stand in the payload as a STRING and to be
+// equal octet for octet -- a missing claim is a refusal, not a pass.
+// (An `aud` written as a JSON ARRAY is not read here: what this file
+// does not understand, it does not wave through.)
+fn jwt_verify_full(tok: u64, tokn: usize, secret: u64, secn: usize,
+    now: i64, iss: u64, issn: usize, aud: u64, audn: usize,
+    out: *mut Claims) -> i64 {
+    *out = claims_zero()
+    if tokn < 8 || tokn > TOKEN_MAX || secn == 0 {
+        return JWT_MALFORMED
+    }
+    // Exactly three parts. A fourth dot is not "extra data to ignore",
+    // it is a different token.
+    var d1: usize = 0
+    var d2: usize = 0
+    var dots: usize = 0
+    var i: usize = 0
+    while i < tokn {
+        if rt.ld8(tok, i) == 46 as u8 {
+            dots = dots + 1
+            if dots == 1 {
+                d1 = i
+            }
+            if dots == 2 {
+                d2 = i
+            }
+            if dots > 2 {
+                return JWT_MALFORMED
+            }
+        }
+        i = i + 1
+    }
+    if dots != 2 {
+        return JWT_MALFORMED
+    }
+    let headn: usize = d1
+    let bodyn: usize = d2 - d1 - 1
+    let signn: usize = tokn - d2 - 1
+    if headn == 0 || bodyn == 0 {
+        return JWT_MALFORMED
+    }
+
+    // The head, and the algorithm WE insist on. "none" is not a special
+    // case, it simply is not HS256.
+    var head: [u8; 512] = [0; 512]
+    let hn: i64 = b64url_decode(tok, headn, (&head[0]) as u64, 512)
+    if hn <= 0 {
+        return JWT_MALFORMED
+    }
+    var kalg: [u8; 3] = "alg"
+    var algv: [u8; 32] = [0; 32]
+    let an: usize = json_string_field((&head[0]) as u64, hn as usize,
+        (&kalg[0]) as u64, 3, (&algv[0]) as u64, 32)
+    var want: [u8; 5] = "HS256"
+    if an != 5 || !rt.mem_eq((&algv[0]) as u64, (&want[0]) as u64, 5) {
+        return JWT_ALG
+    }
+
+    // The signature over "<head>.<payload>", compared in constant time.
+    var sig: [u8; 64] = [0; 64]
+    let sn: i64 = b64url_decode(tok + (d2 + 1) as u64, signn,
+        (&sig[0]) as u64, 64)
+    if sn != 32 {
+        return JWT_SIG
+    }
+    var mac: [u8; 32] = [0; 32]
+    hmac.hmac_sha256(secret, secn, tok, d2, (&mac[0]) as u64)
+    if !hmac.hmac_equal((&mac[0]) as u64, (&sig[0]) as u64, 32) {
+        return JWT_SIG
+    }
+
+    // Only now is the payload worth reading.
+    var body: [u8; 1024] = [0; 1024]
+    let bn: i64 = b64url_decode(tok + (d1 + 1) as u64, bodyn,
+        (&body[0]) as u64, 1024)
+    if bn <= 0 {
+        return JWT_MALFORMED
+    }
+    let bp: u64 = (&body[0]) as u64
+    let bl: usize = bn as usize
+
+    var kexp: [u8; 3] = "exp"
+    var have: bool = false
+    let exp: i64 = json_number_field(bp, bl, (&kexp[0]) as u64, 3, &have)
+    if !have || exp <= now {
+        return JWT_EXPIRED
+    }
+
+    // NOT VALID YET. `nbf` is optional -- but when it stands there, it
+    // is binding: a token minted for tomorrow is no token for today.
+    var knbf: [u8; 3] = "nbf"
+    var havenbf: bool = false
+    let nbf: i64 = json_number_field(bp, bl, (&knbf[0]) as u64, 3, &havenbf)
+    if havenbf && now < nbf {
+        return JWT_NBF
+    }
+
+    // THE ISSUER, when the operator demands one.
+    if issn > 0 {
+        var kiss: [u8; 3] = "iss"
+        var issv: [u8; 160] = [0; 160]
+        let isn: usize = json_string_field(bp, bl, (&kiss[0]) as u64, 3,
+            (&issv[0]) as u64, 160)
+        if isn == 0 || isn != issn
+            || !rt.mem_eq((&issv[0]) as u64, iss, isn) {
+            return JWT_ISS
+        }
+    }
+
+    // THE AUDIENCE, when the operator demands one.
+    if audn > 0 {
+        var kaud: [u8; 3] = "aud"
+        var audv: [u8; 160] = [0; 160]
+        let adn: usize = json_string_field(bp, bl, (&kaud[0]) as u64, 3,
+            (&audv[0]) as u64, 160)
+        if adn == 0 || adn != audn
+            || !rt.mem_eq((&audv[0]) as u64, aud, adn) {
+            return JWT_AUD
+        }
+    }
+
+    // WHO THE TOKEN IS ABOUT. JARVIS writes `uid`; the rest of the world
+    // writes `sub` (RFC 7519). Both are read, `uid` first -- so a token of
+    // a foreign issuer can be plugged in through anbieter.conf without a
+    // line of code here, which is the whole point of this module.
+    var kuid: [u8; 3] = "uid"
+    var uidb: [u8; 96] = [0; 96]
+    var un: usize = json_string_field(bp, bl, (&kuid[0]) as u64, 3,
+        (&uidb[0]) as u64, UID_MAX)
+    if un == 0 {
+        var ksub: [u8; 3] = "sub"
+        un = json_string_field(bp, bl, (&ksub[0]) as u64, 3,
+            (&uidb[0]) as u64, UID_MAX)
+    }
+    if un == 0 {
+        return JWT_CLAIMS
+    }
+
+    var kname: [u8; 4] = "name"
+    var nameb: [u8; 64] = [0; 64]
+    var nn: usize = json_string_field(bp, bl, (&kname[0]) as u64, 4,
+        (&nameb[0]) as u64, JNAME_MAX)
+    if nn == 0 {
+        // the spelling OpenID Connect uses
+        var kpu: [u8; 18] = "preferred_username"
+        nn = json_string_field(bp, bl, (&kpu[0]) as u64, 18,
+            (&nameb[0]) as u64, JNAME_MAX)
+    }
+
+    var kiat: [u8; 3] = "iat"
+    var have2: bool = false
+    let iat: i64 = json_number_field(bp, bl, (&kiat[0]) as u64, 3, &have2)
+
+    var k: usize = 0
+    while k < un {
+        (*out).uid[k] = uidb[k]
+        k = k + 1
+    }
+    (*out).uidn = un
+    k = 0
+    while k < nn {
+        (*out).name[k] = nameb[k]
+        k = k + 1
+    }
+    (*out).name_len = nn
+    (*out).exp = exp
+    if have2 {
+        (*out).iat = iat
+    }
+    (*out).ok = true
+    return JWT_OK
+}
+
+// The name of the refusal, for the log line and for the test. Returns its
+// length; `out` needs 32 octets.
+fn jwt_reason(code: i64, out: u64) -> usize {
+    if code == JWT_OK {
+        var s0: [u8; 2] = "ok"
+        return reason_put(out, (&s0[0]) as u64, 2)
+    }
+    if code == JWT_MALFORMED {
+        var s1: [u8; 9] = "malformed"
+        return reason_put(out, (&s1[0]) as u64, 9)
+    }
+    if code == JWT_ALG {
+        var s2: [u8; 13] = "bad algorithm"
+        return reason_put(out, (&s2[0]) as u64, 13)
+    }
+    if code == JWT_SIG {
+        var s3: [u8; 13] = "bad signature"
+        return reason_put(out, (&s3[0]) as u64, 13)
+    }
+    if code == JWT_EXPIRED {
+        var s4: [u8; 7] = "expired"
+        return reason_put(out, (&s4[0]) as u64, 7)
+    }
+    if code == JWT_CLAIMS {
+        var s5: [u8; 6] = "no uid"
+        return reason_put(out, (&s5[0]) as u64, 6)
+    }
+    if code == JWT_ISS {
+        var s8: [u8; 10] = "bad issuer"
+        return reason_put(out, (&s8[0]) as u64, 10)
+    }
+    if code == JWT_AUD {
+        var s9: [u8; 12] = "bad audience"
+        return reason_put(out, (&s9[0]) as u64, 12)
+    }
+    if code == JWT_NBF {
+        var sa: [u8; 13] = "not valid yet"
+        return reason_put(out, (&sa[0]) as u64, 13)
+    }
+    if code == JWT_COOKIE_BIG {
+        var s7: [u8; 24] = "cookie header too large\0"
+        return reason_put(out, (&s7[0]) as u64, 23)
+    }
+    var s6: [u8; 7] = "unknown"
+    return reason_put(out, (&s6[0]) as u64, 7)
+}
+
+fn reason_put(out: u64, src: u64, n: usize) -> usize {
+    var i: usize = 0
+    while i < n {
+        rt.st8(out, i, rt.ld8(src, i))
+        i = i + 1
+    }
+    return n
+}
