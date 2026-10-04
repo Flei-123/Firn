@@ -168,6 +168,19 @@ def ref_compressors(fmt):
         out.append(("lz4-256k-linked", lambda d: lf.compress(d, block_size=lf.BLOCKSIZE_MAX256KB, block_linked=True)))
         out.append(("lz4-1m-nochk", lambda d: lf.compress(d, block_size=lf.BLOCKSIZE_MAX1MB, content_checksum=False)))
         out.append(("lz4-4m", lambda d: lf.compress(d, block_size=lf.BLOCKSIZE_MAX4MB, store_size=True)))
+        import lz4.block as lb
+
+        def legacy(d):
+            # the legacy frame (lz4 -l): magic, then [u32 size][block] ..., blocks of up to 8 MiB
+            o = struct.pack("<I", 0x184C2102)
+            step = 1 << 20
+            for i in range(0, max(len(d), 1), step):
+                blk = lb.compress(d[i:i + step], mode="high_compression", compression=5, store_size=False)
+                o += struct.pack("<I", len(blk)) + blk
+                if i + step >= len(d):
+                    break
+            return o
+        out.append(("lz4-legacy", legacy))
     elif fmt == "zstd":
         def z(level, *extra):
             def f(d):
@@ -188,6 +201,8 @@ def ref_compressors(fmt):
         out.append(("xz-9e", lambda d: lzma.compress(d, preset=9 | lzma.PRESET_EXTREME)))
         out.append(("xz-crc32", lambda d: lzma.compress(d, check=lzma.CHECK_CRC32)))
         out.append(("xz-crc64", lambda d: lzma.compress(d, check=lzma.CHECK_CRC64)))
+        out.append(("xz-mt-blocks", lambda d: subprocess.run(["xz", "-c", "-T4", "--block-size=65536", "-3"], input=d,
+                                                            capture_output=True).stdout))
         out.append(("xz-sha256", lambda d: lzma.compress(d, check=lzma.CHECK_SHA256)))
         out.append(("xz-none", lambda d: lzma.compress(d, check=lzma.CHECK_NONE)))
         out.append(("xz-delta+lzma2", lambda d: lzma.compress(d, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC32,

@@ -52,6 +52,13 @@ w("plain_nosize_64k.lz4", lf.compress(plain, block_size=lf.BLOCKSIZE_MAX64KB, bl
                                       content_checksum=False))
 w("plain_multi.lz4", lf.compress(plain[:7000]) + b"\x50\x2a\x4d\x18\x05\x00\x00\x00skip!" + lf.compress(plain[7000:]))
 w("empty.lz4", lf.compress(b""))
+# the legacy frame (lz4 -l): magic, then [u32 size][block] ... (here two blocks)
+import lz4.block as lb0
+leg = struct.pack("<I", 0x184C2102)
+for part in (plain[:7000], plain[7000:]):
+    blk = lb0.compress(part, mode="high_compression", compression=5, store_size=False)
+    leg += struct.pack("<I", len(blk)) + blk
+w("legacy.lz4", leg)
 import lz4.block as lb
 w("record2_dict.lz4block", lb.compress(recs[8], mode="high_compression", compression=9, dict=recs[7], store_size=False))
 
@@ -100,6 +107,8 @@ w("plain_x86.xz", lzma.compress(plain, format=lzma.FORMAT_XZ, filters=[
     {"id": lzma.FILTER_X86}, {"id": lzma.FILTER_LZMA2, "preset": 4}]))
 w("plain_multi.xz", lzma.compress(plain[:5000]) + bytes(8) + lzma.compress(plain[5000:], check=lzma.CHECK_CRC32))
 w("empty.xz", lzma.compress(b""))
+# several blocks, with their sizes in the headers (xz -T2 --block-size)
+w("plain_blocks.xz", subprocess.run(["xz", "-c", "-T2", "--block-size=4000", "-3", "--check=sha256"], input=plain, capture_output=True, check=True).stdout)
 w("plain.lzma", lzma.compress(plain, format=lzma.FORMAT_ALONE, preset=4))
 w("zeros.xz", lzma.compress(bytes(1500000), preset=1))
 # code-like data for the branch converters: random with call/branch patterns
