@@ -1,0 +1,854 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gif/gif.fi -- a GIF decoder: GIF87a and GIF89a to RGBA, with LZW,
+// transparency, interlacing, and animation (delays, disposal, loop count).
+//
+//     import gif.gif
+//     var im: gif.GifImage = gif.gif_image_new()
+//     gif.gif_decode(p, n, &im) catch |e| ...        // im.w, im.h, im.px (RGBA)
+//     gif.gif_image_free(&im)
+//
+//     var an: gif.GifAnim = gif.gif_anim_new()       // every frame
+//     gif.gif_decode_anim(p, n, &an) catch |e| ...   // an.px, gif.gif_anim_delay
+//
+// Output is the same as lib/jpeg and lib/webp: STRAIGHT RGBA octets, row 0
+// on top, `w * h * 4` octets in `px`.
+//
+// WHAT IT READS: the logical screen, the global and local colour tables
+// (2 to 256 entries), the graphic control extension (transparent index,
+// delay, disposal method), the NETSCAPE2.0 loop count, interlaced images
+// (the four passes of the spec), LZW with 1 to 8 bit minimum code size
+// including the deferred-clear and the full-table behaviour browsers rely
+// on. Comment, plain-text and unknown application extensions are skipped.
+//
+// COMPOSITION (what a browser draws): the canvas is the logical screen,
+// transparent at the start; every frame is drawn at its offset, pixels with
+// the transparent index leave the canvas as it is; then the disposal
+// method of that frame is applied for the NEXT one: 2 = the frame's
+// rectangle becomes transparent, 3 = back to what it was before the frame,
+// 0/1 = left as it is. `gif_decode` returns the first frame on the canvas;
+// `gif_decode_anim` every frame as a full canvas, with its delay.
+//
+// DELAYS are reported as the file says, in milliseconds (the file counts
+// hundredths of a second): 0 stays 0. Browsers draw a delay under 20 ms as
+// 100 ms -- that is a policy of the player, not of the decoder.
+//
+// HELD AGAINST AN IMPLEMENTATION NOBODY HERE WROTE: tools/libmvp/check_gif.py
+// decodes a generated corpus (every palette size, interlaced, transparent,
+// partial frames, offsets, all disposal methods, local palettes) and the
+// GIFs of Modrinth with this file and with Pillow and compares every
+// octet.
+//
+// HONEST NOTES
+//   * A pixel whose index is outside the colour table is drawn black and
+//     opaque.
+//   * Transparent pixels of the FIRST frame carry the colour table colour
+//     with alpha 0, like Pillow's RGBA conversion; in later frames the
+//     colour of an alpha-0 pixel is not defined (the check compares those
+//     as "transparent" only).
+//   * A frame whose pixel data is cut or shorter than its rectangle is
+//     damaged: `GifError::Corrupt` for the first frame; in an animation the
+//     frames before it are kept and the rest is dropped. A missing trailer
+//     (0x3B) is not an error.
+//   * Frames that reach beyond the logical screen are clipped.
+//
+// LIMITS: at most `GIF_MAX_PIXELS` (16,777,216) per canvas or frame unless
+// `gif_decode_limited` is given another bound; an animation holds
+// `frames * canvas * 4` octets and at most `GIF_MAX_ANIM_BYTES` (256 MiB).
+
+import std.rt
+
+export {
+    GifImage, GifAnim, GifError,
+    gif_image_new, gif_image_free, gif_anim_new, gif_anim_free, gif_anim_delay,
+    gif_decode, gif_decode_limited, gif_decode_anim, gif_decode_anim_limited,
+    gif_info, gif_sniff,
+    GIF_MAX_PIXELS, GIF_MAX_ANIM_BYTES,
+}
+
+error GifError {
+    NotGif, // no GIF87a/GIF89a signature
+    Corrupt, // a block or the pixel data contradicts itself, or the data is cut
+    Unsupported,
+    TooLarge, // over the pixel limit
+    OutOfMemory,
+}
+
+const GIF_MAX_PIXELS: u64 = 16777216
+const GIF_MAX_ANIM_BYTES: u64 = 268435456
+
+struct GifImage {
+    w: u32,
+    h: u32,
+    px: rt.Buf, // w * h * 4 octets, RGBA, row 0 at the top
+    has_alpha: bool, // some pixel of the first frame is transparent
+    animated: bool, // the file has more than one frame
+}
+
+struct GifAnim {
+    w: u32, // canvas = logical screen
+    h: u32,
+    loops: u32, // times to play, 0 = forever (NETSCAPE2.0); 1 without the extension
+    count: u32,
+    px: rt.Buf, // count canvases of w * h * 4 octets, one after the other
+    delays: rt.Buf, // count u32 (little endian): milliseconds
+    has_alpha: bool,
+}
+
+fn gif_image_new() -> GifImage {
+    return GifImage { w: 0, h: 0, px: rt.buf_new(), has_alpha: false, animated: false }
+}
+
+fn gif_image_free(im: *mut GifImage) {
+    rt.buf_free(&(*im).px)
+    (*im).w = 0
+    (*im).h = 0
+}
+
+fn gif_anim_new() -> GifAnim {
+    return GifAnim { w: 0, h: 0, loops: 1, count: 0, px: rt.buf_new(),
+        delays: rt.buf_new(), has_alpha: false }
+}
+
+fn gif_anim_free(an: *mut GifAnim) {
+    rt.buf_free(&(*an).px)
+    rt.buf_free(&(*an).delays)
+    (*an).w = 0
+    (*an).h = 0
+    (*an).count = 0
+}
+
+// The delay of frame `i` in milliseconds (0 outside the animation).
+fn gif_anim_delay(an: *mut GifAnim, i: u32) -> u32 {
+    if i >= (*an).count {
+        return 0
+    }
+    return rt.ld32(rt.buf_ptr(&(*an).delays), i as usize)
+}
+
+const GR_OK: u32 = 0
+const GR_NOT_GIF: u32 = 1
+const GR_CORRUPT: u32 = 2
+const GR_SIZE: u32 = 3
+const GR_MEMORY: u32 = 4
+
+fn gif_sniff(p: u64, n: usize) -> bool {
+    if n < 13 {
+        return false
+    }
+    // "GIF87a" / "GIF89a"
+    return rt.ld8(p, 0) == 71 as u8 && rt.ld8(p, 1) == 73 as u8 && rt.ld8(p, 2) == 70 as u8
+        && rt.ld8(p, 3) == 56 as u8 && (rt.ld8(p, 4) == 55 as u8 || rt.ld8(p, 4) == 57 as u8)
+        && rt.ld8(p, 5) == 97 as u8
+}
+
+#[no_gc]
+fn b8(p: u64, i: usize) -> i64 {
+    return (*((p + i as u64) as *mut u8)) as i64
+}
+
+#[no_gc]
+fn le16(p: u64, i: usize) -> i64 {
+    return b8(p, i) | (b8(p, i + 1) << 8)
+}
+
+#[no_gc]
+fn put8(p: u64, i: usize, v: i64) {
+    *((p + i as u64) as *mut u8) = (v & 255) as u8
+}
+
+fn zero(p: u64, n: usize) {
+    var i: usize = 0
+    while i + 8 <= n {
+        *((p + i as u64) as *mut u64) = 0
+        i = i + 8
+    }
+    while i < n {
+        *((p + i as u64) as *mut u8) = 0 as u8
+        i = i + 1
+    }
+}
+
+fn copy_bytes(dst: u64, src: u64, n: usize) {
+    var i: usize = 0
+    while i + 8 <= n {
+        *((dst + i as u64) as *mut u64) = *((src + i as u64) as *mut u64)
+        i = i + 8
+    }
+    while i < n {
+        *((dst + i as u64) as *mut u8) = *((src + i as u64) as *mut u8)
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------------ LZW
+
+struct Lzw {
+    p: u64,
+    n: usize,
+    pos: usize, // next octet of the block stream
+    left: usize, // octets left in the current sub-block
+    done: bool, // the block terminator was read
+    cut: bool, // the data ended inside a block
+    bits: u32,
+    nbits: u32,
+    prefix: [u16; 4096],
+    suffix: [u8; 4096],
+    stack: [u8; 4097],
+}
+
+fn lzw_byte(l: *mut Lzw) -> i32 {
+    if (*l).left == 0 {
+        if (*l).done {
+            return 0 - 1
+        }
+        if (*l).pos >= (*l).n {
+            (*l).cut = true
+            return 0 - 1
+        }
+        let len: usize = b8((*l).p, (*l).pos) as usize
+        (*l).pos = (*l).pos + 1
+        if len == 0 {
+            (*l).done = true
+            return 0 - 1
+        }
+        (*l).left = len
+    }
+    if (*l).pos >= (*l).n {
+        (*l).cut = true
+        return 0 - 1
+    }
+    let v: i32 = b8((*l).p, (*l).pos) as i32
+    (*l).pos = (*l).pos + 1
+    (*l).left = (*l).left - 1
+    return v
+}
+
+fn lzw_code(l: *mut Lzw, size: u32) -> i32 {
+    while (*l).nbits < size {
+        let b: i32 = lzw_byte(l)
+        if b < 0 {
+            return 0 - 1
+        }
+        (*l).bits = (*l).bits | ((b as u32) << (*l).nbits)
+        (*l).nbits = (*l).nbits + 8
+    }
+    let c: u32 = (*l).bits & ((1 << size) - 1)
+    (*l).bits = (*l).bits >> size
+    (*l).nbits = (*l).nbits - size
+    return c as i32
+}
+
+// Decodes the LZW stream into `total` index octets at `dst`. Returns the
+// number of octets written (less than `total` = the data is damaged or
+// short). Afterwards the block stream is read up to its terminator.
+fn lzw_decode(l: *mut Lzw, minbits: u32, dst: u64, total: usize) -> usize {
+    let clear: i32 = (1 << minbits) as i32
+    let eoi: i32 = clear + 1
+    var next: i32 = eoi + 1
+    var size: u32 = minbits + 1
+    var prev: i32 = 0 - 1
+    var first: i32 = 0
+    var out: usize = 0
+    var bad: bool = false
+    while out < total && !bad {
+        let code: i32 = lzw_code(l, size)
+        if code < 0 {
+            break
+        }
+        if code == clear {
+            next = eoi + 1
+            size = minbits + 1
+            prev = 0 - 1
+            continue
+        }
+        if code == eoi {
+            break
+        }
+        if prev < 0 {
+            // the first code after a clear must be a literal
+            if code >= clear {
+                bad = true
+                break
+            }
+            put8(dst, out, code as i64)
+            out = out + 1
+            prev = code
+            first = code
+            continue
+        }
+        // the string of `code` (or of `prev` + its first octet if code is
+        // the one not yet in the table)
+        var sp: usize = 0
+        var cur: i32 = code
+        if code > next || (code == next && next >= 4096) {
+            bad = true
+            break
+        }
+        if code == next {
+            (*l).stack[sp] = first as u8
+            sp = sp + 1
+            cur = prev
+        }
+        while cur >= clear {
+            if sp >= 4096 || cur >= 4096 {
+                bad = true
+                break
+            }
+            (*l).stack[sp] = (*l).suffix[cur as usize]
+            sp = sp + 1
+            cur = (*l).prefix[cur as usize] as i32
+        }
+        if bad {
+            break
+        }
+        (*l).stack[sp] = cur as u8
+        sp = sp + 1
+        first = cur
+        // emit in reverse; a string running over the end is cut
+        while sp > 0 && out < total {
+            sp = sp - 1
+            put8(dst, out, (*l).stack[sp] as i64)
+            out = out + 1
+        }
+        if next < 4096 {
+            (*l).prefix[next as usize] = prev as u16
+            (*l).suffix[next as usize] = first as u8
+            next = next + 1
+            if next == (1 << size) as i32 && size < 12 {
+                size = size + 1
+            }
+        }
+        prev = code
+    }
+    // read on to the terminator of the block stream
+    if !(*l).done && !(*l).cut {
+        while (*l).pos < (*l).n && !(*l).done {
+            if (*l).left > 0 {
+                let skip: usize = (*l).left
+                if (*l).pos + skip > (*l).n {
+                    (*l).cut = true
+                    (*l).pos = (*l).n
+                } else {
+                    (*l).pos = (*l).pos + skip
+                    (*l).left = 0
+                }
+            } else {
+                let len: usize = b8((*l).p, (*l).pos) as usize
+                (*l).pos = (*l).pos + 1
+                if len == 0 {
+                    (*l).done = true
+                } else {
+                    (*l).left = len
+                }
+            }
+        }
+        if !(*l).done {
+            (*l).cut = true
+        }
+    }
+    if bad {
+        return 0
+    }
+    return out
+}
+
+// ---------------------------------------------------------------- frames
+
+struct Gce {
+    have: bool,
+    disposal: i64,
+    delay: i64, // ms
+    transp: i64, // index, -1 = none
+}
+
+// skip the sub-blocks starting at `pos`; returns the position after the
+// terminator, or n + 1 when the data is cut
+fn skip_blocks(p: u64, n: usize, pos0: usize) -> usize {
+    var pos: usize = pos0
+    while pos < n {
+        let len: usize = b8(p, pos) as usize
+        pos = pos + 1
+        if len == 0 {
+            return pos
+        }
+        pos = pos + len
+    }
+    return n + 1
+}
+
+// is there another image descriptor after `pos0`?
+fn more_frames(p: u64, n: usize, pos0: usize) -> bool {
+    var pos: usize = pos0
+    while pos < n {
+        let t: i64 = b8(p, pos)
+        if t == 44 {
+            return true
+        }
+        if t != 33 {
+            return false
+        }
+        pos = skip_blocks(p, n, pos + 2)
+    }
+    return false
+}
+
+fn put_rgba(px: u64, r: i64, g: i64, b: i64, a: i64) {
+    put8(px, 0, r)
+    put8(px, 1, g)
+    put8(px, 2, b)
+    put8(px, 3, a)
+}
+
+fn pal_color(pal: *mut [u8; 768], ncol: i64, idx: i64, px: u64) {
+    if idx < ncol {
+        put_rgba(px, (*pal)[(idx * 3) as usize] as i64, (*pal)[(idx * 3 + 1) as usize] as i64,
+            (*pal)[(idx * 3 + 2) as usize] as i64, 255)
+    } else {
+        put_rgba(px, 0, 0, 0, 255)
+    }
+}
+
+// the interlaced row `k` (in coded order) of an image of `h` rows
+fn interlace_row(k: i64, h: i64) -> i64 {
+    // pass 1: rows 0, 8, 16..; pass 2: 4, 12..; pass 3: 2, 6..; pass 4: 1, 3..
+    var n1: i64 = (h + 7) / 8
+    var n2: i64 = (h + 3) / 8
+    var n3: i64 = (h + 1) / 4
+    if k < n1 {
+        return k * 8
+    }
+    var j: i64 = k - n1
+    if j < n2 {
+        return 4 + j * 8
+    }
+    j = j - n2
+    if j < n3 {
+        return 2 + j * 4
+    }
+    j = j - n3
+    return 1 + j * 2
+}
+
+fn gif_fail(r: u32) -> GifError!bool {
+    if r == GR_NOT_GIF { return GifError::NotGif }
+    if r == GR_SIZE { return GifError::TooLarge }
+    if r == GR_MEMORY { return GifError::OutOfMemory }
+    return GifError::Corrupt
+}
+
+// Reads the header and the logical screen. Returns the position after the
+// global colour table.
+fn read_screen(p: u64, n: usize, w: *mut i64, h: *mut i64, pal: *mut [u8; 768],
+    ncol: *mut i64, bg: *mut i64, pos: *mut usize) -> u32 {
+    if !gif_sniff(p, n) {
+        return GR_NOT_GIF
+    }
+    *w = le16(p, 6)
+    *h = le16(p, 8)
+    let packed: i64 = b8(p, 10)
+    *bg = b8(p, 11)
+    var at: usize = 13
+    *ncol = 0
+    if (packed & 128) != 0 {
+        let c: i64 = 1 << ((packed & 7) + 1)
+        if at + (c * 3) as usize > n {
+            return GR_CORRUPT
+        }
+        var i: usize = 0
+        while i < (c * 3) as usize {
+            (*pal)[i] = b8(p, at + i) as u8
+            i = i + 1
+        }
+        *ncol = c
+        at = at + (c * 3) as usize
+    }
+    *pos = at
+    return GR_OK
+}
+
+fn gif_info(p: u64, n: usize, w: *mut u32, h: *mut u32) -> bool {
+    var pal: [u8; 768] = [0; 768]
+    var sw: i64 = 0
+    var sh: i64 = 0
+    var nc: i64 = 0
+    var bg: i64 = 0
+    var pos: usize = 0
+    if read_screen(p, n, &sw, &sh, &pal, &nc, &bg, &pos) != GR_OK {
+        return false
+    }
+    if sw == 0 || sh == 0 {
+        // a zero screen: the first image descriptor says how big it is
+        while pos < n {
+            let b: i64 = b8(p, pos)
+            if b == 33 {
+                pos = skip_blocks(p, n, pos + 2)
+            } else if b == 44 && pos + 10 <= n {
+                sw = le16(p, pos + 1) + le16(p, pos + 5)
+                sh = le16(p, pos + 3) + le16(p, pos + 7)
+                break
+            } else {
+                return false
+            }
+        }
+    }
+    if sw == 0 || sh == 0 {
+        return false
+    }
+    *w = sw as u32
+    *h = sh as u32
+    return true
+}
+
+fn gif_core(p: u64, n: usize, maxpx: i64, maxframes: u32, out: *mut rt.Buf,
+    dl: *mut rt.Buf, count: *mut u32, cw: *mut i64, ch: *mut i64, loops: *mut u32,
+    alpha: *mut bool, animated: *mut bool) -> u32 {
+    var gpal: [u8; 768] = [0; 768]
+    var gcount: i64 = 0
+    var bgi: i64 = 0
+    var pos: usize = 0
+    var sw: i64 = 0
+    var sh: i64 = 0
+    let sr: u32 = read_screen(p, n, &sw, &sh, &gpal, &gcount, &bgi, &pos)
+    if sr != GR_OK {
+        return sr
+    }
+    *loops = 1
+    *animated = false
+    *alpha = false
+    rt.buf_clear(out)
+    rt.buf_clear(dl)
+    var want: u32 = maxframes
+    if want == 0 {
+        want = 1
+    }
+    var W: i64 = sw
+    var H: i64 = sh
+    var gce: Gce = Gce { have: false, disposal: 0, delay: 0, transp: 0 - 1 }
+    var fcount: u32 = 0
+    var rc: u32 = GR_OK
+    var prev: u64 = 0
+    var cbytes: usize = 0
+    var pdisp: i64 = 0
+    var running: bool = true
+    var lz: Lzw = Lzw { p: p, n: n, pos: 0, left: 0, done: false, cut: false, bits: 0, nbits: 0,
+        prefix: [0; 4096], suffix: [0; 4096], stack: [0; 4097] }
+    while running && rc == GR_OK && pos < n {
+        let tag: i64 = b8(p, pos)
+        if tag == 59 { // trailer
+            break
+        } else if tag == 33 { // extension
+            if pos + 2 > n {
+                break
+            }
+            let label: i64 = b8(p, pos + 1)
+            if label == 249 && pos + 7 <= n && b8(p, pos + 2) >= 4 { // graphic control
+                let pk: i64 = b8(p, pos + 3)
+                gce.have = true
+                gce.disposal = (pk >> 2) & 7
+                gce.delay = le16(p, pos + 4) * 10
+                gce.transp = 0 - 1
+                if (pk & 1) != 0 {
+                    gce.transp = b8(p, pos + 6)
+                }
+            } else if label == 255 && pos + 14 <= n && b8(p, pos + 2) == 11 {
+                // NETSCAPE2.0: sub-block id 1 holds the loop count
+                if b8(p, pos + 3) == 78 && b8(p, pos + 4) == 69 && b8(p, pos + 5) == 84
+                    && pos + 19 <= n && b8(p, pos + 14) == 3 && b8(p, pos + 15) == 1 {
+                    *loops = le16(p, pos + 16) as u32
+                }
+            }
+            let np: usize = skip_blocks(p, n, pos + 2)
+            if np > n {
+                break
+            }
+            pos = np
+        } else if tag == 44 { // image
+            if pos + 10 > n {
+                rc = GR_CORRUPT
+                break
+            }
+            let fx: i64 = le16(p, pos + 1)
+            let fy: i64 = le16(p, pos + 3)
+            let fw: i64 = le16(p, pos + 5)
+            let fh: i64 = le16(p, pos + 7)
+            let pk: i64 = b8(p, pos + 9)
+            pos = pos + 10
+            // the canvas: the logical screen (or the first frame, if the
+            // screen is empty)
+            if fcount == 0 {
+                if W == 0 || H == 0 {
+                    W = fx + fw
+                    H = fy + fh
+                }
+                if W == 0 || H == 0 || W * H > maxpx {
+                    rc = GR_SIZE
+                    if W == 0 || H == 0 {
+                        rc = GR_CORRUPT
+                    }
+                    break
+                }
+                cbytes = (W * H * 4) as usize
+                if (cbytes as u64) > GIF_MAX_ANIM_BYTES {
+                    rc = GR_SIZE
+                    break
+                }
+                if (cbytes as u64) * (want as u64) > GIF_MAX_ANIM_BYTES {
+                    want = (GIF_MAX_ANIM_BYTES / (cbytes as u64)) as u32
+                }
+                prev = rt.heap_alloc(cbytes)
+                if prev == 0 {
+                    rc = GR_MEMORY
+                    break
+                }
+            }
+            if fw == 0 || fh == 0 || fw * fh > maxpx {
+                rc = GR_SIZE
+                if fw == 0 || fh == 0 {
+                    rc = GR_CORRUPT
+                }
+                break
+            }
+            // the colour table of the frame
+            var lpal: [u8; 768] = [0; 768]
+            var lcount: i64 = 0
+            var pal: *mut [u8; 768] = &gpal
+            var ncol: i64 = gcount
+            if (pk & 128) != 0 {
+                let c: i64 = 1 << ((pk & 7) + 1)
+                if pos + (c * 3) as usize > n {
+                    rc = GR_CORRUPT
+                    break
+                }
+                var i: usize = 0
+                while i < (c * 3) as usize {
+                    lpal[i] = b8(p, pos + i) as u8
+                    i = i + 1
+                }
+                lcount = c
+                pos = pos + (c * 3) as usize
+                pal = &lpal
+                ncol = lcount
+            }
+            if pos >= n {
+                rc = GR_CORRUPT
+                break
+            }
+            let minbits: i64 = b8(p, pos)
+            pos = pos + 1
+            if minbits < 1 || minbits > 8 {
+                rc = GR_CORRUPT
+                break
+            }
+            // decode the indices
+            let total: usize = (fw * fh) as usize
+            let idx: u64 = rt.heap_alloc(total)
+            if idx == 0 {
+                rc = GR_MEMORY
+                break
+            }
+            lz.pos = pos
+            lz.left = 0
+            lz.done = false
+            lz.cut = false
+            lz.bits = 0
+            lz.nbits = 0
+            let got: usize = lzw_decode(&lz, minbits as u32, idx, total)
+            pos = lz.pos
+            if got < total {
+                rt.heap_free(idx, total)
+                rc = GR_CORRUPT
+                break
+            }
+            // the canvas for this frame
+            let need: usize = cbytes * (fcount as usize + 1)
+            rt.buf_reserve(out, need)
+            if (*out).cap < need {
+                rt.heap_free(idx, total)
+                rc = GR_MEMORY
+                break
+            }
+            rt.buf_set_len(out, need)
+            let cur: u64 = rt.buf_ptr(out) + (cbytes * fcount as usize) as u64
+            let tr: i64 = gce.transp
+            if fcount == 0 {
+                // transparent at the start; the colour of the transparent
+                // index is kept (alpha 0), like Pillow's RGBA conversion
+                zero(cur, cbytes)
+                if tr >= 0 && tr < ncol {
+                    var q: usize = 0
+                    while q < cbytes {
+                        put_rgba(cur + q as u64, (*pal)[(tr * 3) as usize] as i64,
+                            (*pal)[(tr * 3 + 1) as usize] as i64, (*pal)[(tr * 3 + 2) as usize] as i64, 0)
+                        q = q + 4
+                    }
+                }
+            } else {
+                copy_bytes(cur, prev, cbytes)
+            }
+            // draw
+            var k: i64 = 0
+            var sawt: bool = false
+            while k < fh {
+                var row: i64 = k
+                if (pk & 64) != 0 {
+                    row = interlace_row(k, fh)
+                }
+                let y: i64 = fy + row
+                if y >= 0 && y < H {
+                    var x: i64 = 0
+                    while x < fw {
+                        let cx: i64 = fx + x
+                        if cx < W {
+                            let v: i64 = b8(idx, (k * fw + x) as usize)
+                            let o: u64 = cur + ((y * W + cx) * 4) as u64
+                            if v == tr {
+                                sawt = true
+                                if fcount == 0 {
+                                    pal_color(pal, ncol, v, o)
+                                    put8(o, 3, 0)
+                                }
+                            } else {
+                                pal_color(pal, ncol, v, o)
+                            }
+                        }
+                        x = x + 1
+                    }
+                }
+                k = k + 1
+            }
+            rt.heap_free(idx, total)
+            if fcount == 0 {
+                *alpha = sawt
+            }
+            // disposal for the next frame
+            var disp: i64 = gce.disposal
+            if disp > 3 {
+                disp = 0
+            }
+            if disp != 3 {
+                copy_bytes(prev, cur, cbytes)
+                if disp == 2 {
+                    var y2: i64 = fy
+                    while y2 < fy + fh && y2 < H {
+                        if y2 >= 0 {
+                            var cw2: i64 = fw
+                            if fx + cw2 > W {
+                                cw2 = W - fx
+                            }
+                            if cw2 > 0 {
+                                zero(prev + ((y2 * W + fx) * 4) as u64, (cw2 * 4) as usize)
+                            }
+                        }
+                        y2 = y2 + 1
+                    }
+                }
+            }
+            pdisp = disp
+            var z: u32 = 0
+            while z < 4 {
+                rt.buf_push(dl, ((gce.delay >> (8 * z as i64)) & 255) as u8)
+                z = z + 1
+            }
+            fcount = fcount + 1
+            gce.have = false
+            gce.disposal = 0
+            gce.delay = 0
+            gce.transp = 0 - 1
+            if fcount >= want {
+                *animated = more_frames(p, n, pos)
+                running = false
+            }
+        } else {
+            // garbage between blocks
+            if fcount == 0 {
+                rc = GR_CORRUPT
+            }
+            break
+        }
+    }
+    if prev != 0 {
+        rt.heap_free(prev, cbytes)
+    }
+    if rc != GR_OK && fcount > 0 && rc != GR_MEMORY && rc != GR_SIZE {
+        // a damaged later frame: keep the good ones
+        rc = GR_OK
+    }
+    if rc == GR_OK && fcount == 0 {
+        rc = GR_CORRUPT
+    }
+    if rc != GR_OK {
+        rt.buf_clear(out)
+        rt.buf_clear(dl)
+        return rc
+    }
+    *count = fcount
+    *cw = W
+    *ch = H
+    return GR_OK
+}
+
+fn gif_decode(p: u64, n: usize, im: *mut GifImage) -> GifError!bool {
+    return try gif_decode_limited(p, n, GIF_MAX_PIXELS, im)
+}
+
+// Decodes the first frame (on the logical screen) to RGBA in `im` (its
+// buffer is reused). At most `max_pixels`.
+fn gif_decode_limited(p: u64, n: usize, max_pixels: u64, im: *mut GifImage) -> GifError!bool {
+    var dl: rt.Buf = rt.buf_new()
+    var count: u32 = 0
+    var cw: i64 = 0
+    var ch: i64 = 0
+    var loops: u32 = 0
+    var alpha: bool = false
+    var anim: bool = false
+    var mp: i64 = max_pixels as i64
+    if max_pixels > 4294967296 {
+        mp = 4294967296
+    }
+    let r: u32 = gif_core(p, n, mp, 1 as u32, &(*im).px, &dl, &count, &cw, &ch, &loops,
+        &alpha, &anim)
+    rt.buf_free(&dl)
+    if r != GR_OK {
+        (*im).w = 0
+        (*im).h = 0
+        return try gif_fail(r)
+    }
+    (*im).w = cw as u32
+    (*im).h = ch as u32
+    (*im).has_alpha = alpha
+    (*im).animated = anim
+    return true
+}
+
+fn gif_decode_anim(p: u64, n: usize, an: *mut GifAnim) -> GifError!bool {
+    return try gif_decode_anim_limited(p, n, GIF_MAX_PIXELS, 4096 as u32, an)
+}
+
+// Every frame (at most `max_frames`) as a full canvas with its delay.
+fn gif_decode_anim_limited(p: u64, n: usize, max_pixels: u64, max_frames: u32,
+    an: *mut GifAnim) -> GifError!bool {
+    var count: u32 = 0
+    var cw: i64 = 0
+    var ch: i64 = 0
+    var loops: u32 = 0
+    var alpha: bool = false
+    var anim: bool = false
+    var mp: i64 = max_pixels as i64
+    if max_pixels > 4294967296 {
+        mp = 4294967296
+    }
+    let r: u32 = gif_core(p, n, mp, max_frames, &(*an).px, &(*an).delays, &count,
+        &cw, &ch, &loops, &alpha, &anim)
+    if r != GR_OK {
+        (*an).w = 0
+        (*an).h = 0
+        (*an).count = 0
+        return try gif_fail(r)
+    }
+    (*an).w = cw as u32
+    (*an).h = ch as u32
+    (*an).count = count
+    (*an).loops = loops
+    (*an).has_alpha = alpha
+    return true
+}

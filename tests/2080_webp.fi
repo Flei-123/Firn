@@ -1,0 +1,221 @@
+// expect_exit: 42
+// tests/2080_webp.fi -- lib/webp: every picture in tests/data/webp decodes
+// to exactly the pixels Pillow (libwebp) gives -- compared by the CRC-32 of
+// the RGBA octets -- plus the animation composer, the refusals and a
+// hostile-input sweep (every cut, thousands of damaged files: no crash).
+// The whole corpus, 838 Modrinth icons and the cwebp-knob variants:
+// tools/libmvp/check_webp.py.
+import webp.webp
+import std.fs
+import std.rt
+import std.deflate
+
+static mut code: i32 = 0
+
+fn why(e: WebpError) -> bool {
+    if e == WebpError::NotWebp { code = 1 }
+    if e == WebpError::Corrupt { code = 2 }
+    if e == WebpError::Unsupported { code = 3 }
+    if e == WebpError::TooLarge { code = 4 }
+    if e == WebpError::OutOfMemory { code = 5 }
+    return false
+}
+
+// 0 = decoded, else the error code of `why`
+fn refusal(p: u64, n: usize, limit: u64) -> i32 {
+    code = 0
+    var im: webp.WebpImage = webp.webp_image_new()
+    webp.webp_decode_limited(p, n, limit, &im) catch | e | (why(e))
+    webp.webp_image_free(&im)
+    return code
+}
+
+fn crc_of(path: str, w: u32, h: u32) -> u32 {
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(path, &data) catch 0
+    if n == 0 {
+        return 1 as u32
+    }
+    var im: webp.WebpImage = webp.webp_image_new()
+    let ok: bool = webp.webp_decode(rt.buf_ptr(&data), n, &im) catch false
+    if !ok || im.w != w || im.h != h {
+        return 2 as u32
+    }
+    let c: u32 = deflate.crc32(rt.buf_ptr(&im.px), rt.buf_len(&im.px))
+    webp.webp_image_free(&im)
+    rt.buf_free(&data)
+    return c
+}
+
+// all frames: the XOR of the CRC-32 of every canvas; the frame count and
+// the delays are checked on the way (delay of frame i = d[i])
+fn anim_crc(path: str, w: u32, h: u32, frames: u32, d0: u32, d2: u32, loops: u32) -> u32 {
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(path, &data) catch 0
+    if n == 0 {
+        return 1 as u32
+    }
+    var an: webp.WebpAnim = webp.webp_anim_new()
+    let ok: bool = webp.webp_decode_anim(rt.buf_ptr(&data), n, &an) catch false
+    if !ok || an.w != w || an.h != h || an.count != frames || an.loops != loops {
+        return 2 as u32
+    }
+    if webp.webp_anim_delay(&an, 0) != d0 || webp.webp_anim_delay(&an, 2) != d2 {
+        return 3 as u32
+    }
+    var x: u32 = 0
+    var i: u32 = 0
+    let sz: usize = w as usize * h as usize * 4
+    while i < frames {
+        x = x ^ deflate.crc32(rt.buf_ptr(&an.px) + (sz * i as usize) as u64, sz)
+        i = i + 1
+    }
+    webp.webp_anim_free(&an)
+    rt.buf_free(&data)
+    return x
+}
+
+// a cheap deterministic generator for the damage
+static mut seed: u64 = 12345
+
+fn rnd() -> u32 {
+    seed = (seed * 1103515245 + 12345) & 2147483647
+    return ((seed >> 8) & 16777215) as u32
+}
+
+// decode `n` damaged copies of the file; the only thing demanded is that
+// the program lives (a refusal or a picture, both fine)
+fn damage(path: str, copies: u32) -> bool {
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(path, &data) catch 0
+    if n == 0 {
+        return false
+    }
+    var work: rt.Buf = rt.buf_new()
+    var k: u32 = 0
+    while k < copies {
+        rt.buf_clear(&work)
+        rt.buf_push_bytes(&work, rt.buf_ptr(&data), n)
+        let hits: u32 = 1 + rnd() % 4
+        var j: u32 = 0
+        while j < hits {
+            let at: usize = (rnd() as usize) % n
+            let m: u32 = rnd() % 3
+            if m == 0 {
+                rt.st8(rt.buf_ptr(&work), at, 255 as u8)
+            } else if m == 1 {
+                rt.st8(rt.buf_ptr(&work), at, 0 as u8)
+            } else {
+                rt.st8(rt.buf_ptr(&work), at, (rnd() % 256) as u8)
+            }
+            j = j + 1
+        }
+        refusal(rt.buf_ptr(&work), n, 1000000)
+        var an: webp.WebpAnim = webp.webp_anim_new()
+        webp.webp_decode_anim_limited(rt.buf_ptr(&work), n, 1000000, 8 as u32, &an) catch false
+        webp.webp_anim_free(&an)
+        k = k + 1
+    }
+    rt.buf_free(&work)
+    rt.buf_free(&data)
+    return true
+}
+
+// every prefix of the file: never a crash, and (`strict`) anything cut by
+// more than the one padding octet is refused. An animation is not strict:
+// a prefix that holds the first frame whole shows that frame.
+fn cuts(path: str, strict: bool) -> i32 {
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(path, &data) catch 0
+    if n == 0 {
+        return 1
+    }
+    let p: u64 = rt.buf_ptr(&data)
+    var c: usize = 0
+    while c + 1 < n {
+        if refusal(p, c, 1000000) == 0 && strict {
+            return 2
+        }
+        c = c + 1
+    }
+    rt.buf_free(&data)
+    return 0
+}
+
+fn main() -> i32 {
+    // lossless
+    if crc_of("tests/data/webp/ll_rgb.webp", 61 as u32, 47 as u32) != 970121498 as u32 { return 1 as i32 }
+    if crc_of("tests/data/webp/ll_rgba.webp", 61 as u32, 47 as u32) != 1185970656 as u32 { return 2 as i32 }
+    if crc_of("tests/data/webp/ll_pal.webp", 61 as u32, 47 as u32) != 4292838439 as u32 { return 3 as i32 }
+    // lossy, alpha plane, tiny, quality 5
+    if crc_of("tests/data/webp/lossy_q75.webp", 61 as u32, 47 as u32) != 567735987 as u32 { return 4 as i32 }
+    if crc_of("tests/data/webp/lossy_q5.webp", 61 as u32, 47 as u32) != 1804633447 as u32 { return 5 as i32 }
+    if crc_of("tests/data/webp/lossy_alpha.webp", 61 as u32, 47 as u32) != 4226166147 as u32 { return 6 as i32 }
+    if crc_of("tests/data/webp/lossy_alpha_exact.webp", 61 as u32, 47 as u32) != 3404985213 as u32 { return 7 as i32 }
+    if crc_of("tests/data/webp/lossy_1x1.webp", 1 as u32, 1 as u32) != 205926545 as u32 { return 8 as i32 }
+    if crc_of("tests/data/webp/lossy_33x2.webp", 33 as u32, 2 as u32) != 972065774 as u32 { return 9 as i32 }
+    // FleiLauncher's own logos
+    if crc_of("tests/data/webp/logo-blue.webp", 128 as u32, 128 as u32) != 3315418914 as u32 { return 10 as i32 }
+    if crc_of("tests/data/webp/logo-green.webp", 128 as u32, 128 as u32) != 1281464983 as u32 { return 11 as i32 }
+    // an animation: its first frame as a still, then every frame
+    if crc_of("tests/data/webp/anim_ll.webp", 48 as u32, 32 as u32) != 3993169432 as u32 { return 12 as i32 }
+    if crc_of("tests/data/webp/anim_lossy.webp", 48 as u32, 32 as u32) != 873858455 as u32 { return 13 as i32 }
+    if anim_crc("tests/data/webp/anim_ll.webp", 48 as u32, 32 as u32, 6 as u32, 40 as u32, 120 as u32, 3 as u32) != 1375857466 as u32 { return 14 as i32 }
+    if anim_crc("tests/data/webp/anim_lossy.webp", 48 as u32, 32 as u32, 6 as u32, 100 as u32, 100 as u32, 0 as u32) != 1978778104 as u32 { return 15 as i32 }
+
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file("tests/data/webp/lossy_alpha.webp", &data) catch 0
+    let p: u64 = rt.buf_ptr(&data)
+    var w: u32 = 0
+    var h: u32 = 0
+    if !webp.webp_info(p, n, &w, &h) || w != 61 || h != 47 { return 20 as i32 }
+    if !webp.webp_sniff(p, n) { return 21 as i32 }
+    // the pixel limit: 61 * 47 = 2867
+    if refusal(p, n, 2866) != 4 { return 22 as i32 }
+    if refusal(p, n, 2867) != 0 { return 23 as i32 }
+    // not a WebP
+    if refusal(p + 1, n - 1, 1000000) != 1 { return 24 as i32 }
+    if refusal(p, 11, 1000000) != 1 { return 25 as i32 }
+    // a RIFF that is not WEBP
+    var riff: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&riff, p, n)
+    rt.st8(rt.buf_ptr(&riff), 8, 87 as u8)
+    rt.st8(rt.buf_ptr(&riff), 9, 65 as u8)
+    rt.st8(rt.buf_ptr(&riff), 10, 86 as u8)
+    rt.st8(rt.buf_ptr(&riff), 11, 69 as u8)
+    if refusal(rt.buf_ptr(&riff), n, 1000000) != 1 { return 26 as i32 }
+    // the VP8 key frame start code damaged
+    var sc: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&sc, p, n)
+    var i: usize = 12
+    while i + 3 < n {
+        if rt.ld8(p, i) == 157 as u8 && rt.ld8(p, i + 1) == 1 as u8 && rt.ld8(p, i + 2) == 42 as u8 {
+            rt.st8(rt.buf_ptr(&sc), i, 0 as u8)
+            i = n
+        }
+        i = i + 1
+    }
+    if refusal(rt.buf_ptr(&sc), n, 1000000) != 2 { return 27 as i32 }
+    // a huge VP8L header (16384 x 16384) is refused before any memory is asked for
+    var big: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&big, rt.buf_ptr(&data), 12)
+    var hdr: [u8; 18] = [86, 80, 56, 76, 10, 0, 0, 0, 47, 255, 255, 255, 15, 0, 0, 0, 0, 0]
+    i = 0
+    while i < 18 {
+        rt.buf_push(&big, hdr[i])
+        i = i + 1
+    }
+    if refusal(rt.buf_ptr(&big), rt.buf_len(&big), 16777216) != 4 { return 28 as i32 }
+
+    // every cut of three files
+    if cuts("tests/data/webp/lossy_33x2.webp", true) != 0 { return 29 as i32 }
+    if cuts("tests/data/webp/ll_rgba.webp", true) != 0 { return 30 as i32 }
+    if cuts("tests/data/webp/lossy_alpha.webp", true) != 0 { return 31 as i32 }
+    if cuts("tests/data/webp/anim_ll.webp", false) != 0 { return 32 as i32 }
+    // damaged files
+    if !damage("tests/data/webp/ll_rgba.webp", 150 as u32) { return 33 as i32 }
+    if !damage("tests/data/webp/lossy_alpha.webp", 150 as u32) { return 34 as i32 }
+    if !damage("tests/data/webp/anim_ll.webp", 100 as u32) { return 35 as i32 }
+    if !damage("tests/data/webp/anim_lossy.webp", 100 as u32) { return 36 as i32 }
+    return 42
+}

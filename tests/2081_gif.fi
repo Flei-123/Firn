@@ -1,0 +1,216 @@
+// expect_exit: 42
+// tests/2081_gif.fi -- lib/gif: every picture in tests/data/gif decodes to
+// exactly the pixels Pillow gives (CRC-32 of the RGBA octets), the
+// animation composer (delays, loop count, disposal 1/2/3, transparency),
+// the refusals, and a hostile-input sweep (every cut, thousands of damaged
+// files: no crash). More files and pixel-by-pixel comparison, including
+// the GIFs of Modrinth: tools/libmvp/check_gif.py.
+import gif.gif
+import std.fs
+import std.rt
+import std.deflate
+
+static mut code: i32 = 0
+
+fn why(e: GifError) -> bool {
+    if e == GifError::NotGif { code = 1 }
+    if e == GifError::Corrupt { code = 2 }
+    if e == GifError::Unsupported { code = 3 }
+    if e == GifError::TooLarge { code = 4 }
+    if e == GifError::OutOfMemory { code = 5 }
+    return false
+}
+
+// 0 = decoded, else the error code of `why`
+fn refusal(p: u64, n: usize, limit: u64) -> i32 {
+    code = 0
+    var im: gif.GifImage = gif.gif_image_new()
+    gif.gif_decode_limited(p, n, limit, &im) catch | e | (why(e))
+    gif.gif_image_free(&im)
+    return code
+}
+
+fn crc_of(path: str, w: u32, h: u32) -> u32 {
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(path, &data) catch 0
+    if n == 0 {
+        return 1 as u32
+    }
+    var im: gif.GifImage = gif.gif_image_new()
+    let ok: bool = gif.gif_decode(rt.buf_ptr(&data), n, &im) catch false
+    if !ok || im.w != w || im.h != h {
+        return 2 as u32
+    }
+    let c: u32 = deflate.crc32(rt.buf_ptr(&im.px), rt.buf_len(&im.px))
+    gif.gif_image_free(&im)
+    rt.buf_free(&data)
+    return c
+}
+
+// a pixel that is fully transparent has no colour worth comparing
+fn norm_crc(p: u64, sz: usize) -> u32 {
+    var tmp: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&tmp, p, sz)
+    let q: u64 = rt.buf_ptr(&tmp)
+    var i: usize = 0
+    while i < sz {
+        if rt.ld8(q, i + 3) == 0 as u8 {
+            rt.st8(q, i, 0 as u8)
+            rt.st8(q, i + 1, 0 as u8)
+            rt.st8(q, i + 2, 0 as u8)
+        }
+        i = i + 4
+    }
+    let c: u32 = deflate.crc32(q, sz)
+    rt.buf_free(&tmp)
+    return c
+}
+
+// all frames: the XOR of the CRC-32 of every canvas (frame 0 as it is, the
+// others with transparent pixels normalised), the frame count, two delays
+// and the loop count
+fn anim_crc(path: str, w: u32, h: u32, frames: u32, d0: u32, d2: u32, loops: u32) -> u32 {
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(path, &data) catch 0
+    if n == 0 {
+        return 1 as u32
+    }
+    var an: gif.GifAnim = gif.gif_anim_new()
+    let ok: bool = gif.gif_decode_anim(rt.buf_ptr(&data), n, &an) catch false
+    if !ok || an.w != w || an.h != h || an.count != frames || an.loops != loops {
+        return 2 as u32
+    }
+    if gif.gif_anim_delay(&an, 0) != d0 || gif.gif_anim_delay(&an, 2) != d2 {
+        return 3 as u32
+    }
+    var x: u32 = 0
+    var i: u32 = 0
+    let sz: usize = w as usize * h as usize * 4
+    while i < frames {
+        let fp: u64 = rt.buf_ptr(&an.px) + (sz * i as usize) as u64
+        if i == 0 {
+            x = x ^ deflate.crc32(fp, sz)
+        } else {
+            x = x ^ norm_crc(fp, sz)
+        }
+        i = i + 1
+    }
+    gif.gif_anim_free(&an)
+    rt.buf_free(&data)
+    return x
+}
+
+static mut seed: u64 = 777
+
+fn rnd() -> u32 {
+    seed = (seed * 1103515245 + 12345) & 2147483647
+    return ((seed >> 8) & 16777215) as u32
+}
+
+fn damage(path: str, copies: u32) -> bool {
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(path, &data) catch 0
+    if n == 0 {
+        return false
+    }
+    var work: rt.Buf = rt.buf_new()
+    var k: u32 = 0
+    while k < copies {
+        rt.buf_clear(&work)
+        rt.buf_push_bytes(&work, rt.buf_ptr(&data), n)
+        let hits: u32 = 1 + rnd() % 4
+        var j: u32 = 0
+        while j < hits {
+            let at: usize = (rnd() as usize) % n
+            let m: u32 = rnd() % 3
+            if m == 0 {
+                rt.st8(rt.buf_ptr(&work), at, 255 as u8)
+            } else if m == 1 {
+                rt.st8(rt.buf_ptr(&work), at, 0 as u8)
+            } else {
+                rt.st8(rt.buf_ptr(&work), at, (rnd() % 256) as u8)
+            }
+            j = j + 1
+        }
+        refusal(rt.buf_ptr(&work), n, 1000000)
+        var an: gif.GifAnim = gif.gif_anim_new()
+        gif.gif_decode_anim_limited(rt.buf_ptr(&work), n, 1000000, 8 as u32, &an) catch false
+        gif.gif_anim_free(&an)
+        k = k + 1
+    }
+    rt.buf_free(&work)
+    rt.buf_free(&data)
+    return true
+}
+
+// every prefix of the file: never a crash; a prefix that ends inside the
+// FIRST frame's data is refused
+fn cuts(path: str, strict_to: usize) -> i32 {
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(path, &data) catch 0
+    if n == 0 {
+        return 1
+    }
+    let p: u64 = rt.buf_ptr(&data)
+    var c: usize = 0
+    while c + 1 < n {
+        if refusal(p, c, 1000000) == 0 && c < strict_to {
+            return 2
+        }
+        c = c + 1
+    }
+    rt.buf_free(&data)
+    return 0
+}
+
+fn main() -> i32 {
+    // palettes of 2, 4, 16 and 256 colours, interlaced, transparent, 1 x 1,
+    // a picture that cannot be compressed (the code table fills up)
+    if crc_of("tests/data/gif/pal2.gif", 61 as u32, 47 as u32) != 741168659 as u32 { return 1 as i32 }
+    if crc_of("tests/data/gif/pal4.gif", 61 as u32, 47 as u32) != 2210061435 as u32 { return 2 as i32 }
+    if crc_of("tests/data/gif/pal16.gif", 61 as u32, 47 as u32) != 2404311184 as u32 { return 3 as i32 }
+    if crc_of("tests/data/gif/pal256.gif", 61 as u32, 47 as u32) != 2790937811 as u32 { return 4 as i32 }
+    if crc_of("tests/data/gif/inter.gif", 61 as u32, 47 as u32) != 2404311184 as u32 { return 5 as i32 } // = pal16
+    if crc_of("tests/data/gif/transp.gif", 61 as u32, 47 as u32) != 1286317406 as u32 { return 6 as i32 }
+    if crc_of("tests/data/gif/s1x1.gif", 1 as u32, 1 as u32) != 205926545 as u32 { return 7 as i32 }
+    if crc_of("tests/data/gif/noise.gif", 120 as u32, 90 as u32) != 2497212039 as u32 { return 8 as i32 }
+    // animations: the first frame as a still, then every frame
+    if crc_of("tests/data/gif/anim.gif", 50 as u32, 40 as u32) != 127307801 as u32 { return 9 as i32 }
+    if crc_of("tests/data/gif/disp.gif", 48 as u32, 32 as u32) != 2142182662 as u32 { return 10 as i32 }
+    if anim_crc("tests/data/gif/anim.gif", 50 as u32, 40 as u32, 5 as u32, 50 as u32, 70 as u32, 0 as u32) != 1663881148 as u32 { return 11 as i32 }
+    if anim_crc("tests/data/gif/disp.gif", 48 as u32, 32 as u32, 6 as u32, 80 as u32, 80 as u32, 2 as u32) != 4179463442 as u32 { return 12 as i32 }
+
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file("tests/data/gif/pal16.gif", &data) catch 0
+    let p: u64 = rt.buf_ptr(&data)
+    var w: u32 = 0
+    var h: u32 = 0
+    if !gif.gif_info(p, n, &w, &h) || w != 61 || h != 47 { return 20 as i32 }
+    if !gif.gif_sniff(p, n) { return 21 as i32 }
+    // the pixel limit: 61 * 47 = 2867
+    if refusal(p, n, 2866) != 4 { return 22 as i32 }
+    if refusal(p, n, 2867) != 0 { return 23 as i32 }
+    // not a GIF
+    if refusal(p + 1, n - 1, 1000000) != 1 { return 24 as i32 }
+    if refusal(p, 5, 1000000) != 1 { return 25 as i32 }
+    // a missing trailer is fine, a missing octet of pixel data is not
+    if refusal(p, n - 1, 1000000) != 0 { return 26 as i32 }
+    if refusal(p, n - 4, 1000000) != 2 { return 27 as i32 }
+    // a screen of 65535 x 65535 is refused before any memory is asked for
+    var big: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&big, p, n)
+    rt.st8(rt.buf_ptr(&big), 6, 255 as u8)
+    rt.st8(rt.buf_ptr(&big), 7, 255 as u8)
+    rt.st8(rt.buf_ptr(&big), 8, 255 as u8)
+    rt.st8(rt.buf_ptr(&big), 9, 255 as u8)
+    if refusal(rt.buf_ptr(&big), n, 16777216) != 4 { return 28 as i32 }
+
+    if cuts("tests/data/gif/inter.gif", 600) != 0 { return 30 as i32 }
+    if cuts("tests/data/gif/s1x1.gif", 30) != 0 { return 31 as i32 }
+    if cuts("tests/data/gif/disp.gif", 100) != 0 { return 32 as i32 }
+    if !damage("tests/data/gif/transp.gif", 200 as u32) { return 33 as i32 }
+    if !damage("tests/data/gif/noise.gif", 100 as u32) { return 34 as i32 }
+    if !damage("tests/data/gif/anim.gif", 150 as u32) { return 35 as i32 }
+    if !damage("tests/data/gif/disp.gif", 200 as u32) { return 36 as i32 }
+    return 42
+}

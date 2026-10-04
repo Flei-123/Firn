@@ -69,6 +69,17 @@ any more.
   no other author. As sole author Justin released them for Firn under
   MPL-2.0 -- the same step as above. Only the SPDX line changed.
 
+* 4 October 2026: the WebP decoder `lib/webp/webp.fi` came over from Certus
+  (`lib/paint/webp.fi`, Certus branch `alltag`, last commit `c0d9d2aa`),
+  where it was GPL-2.0-only. `git log -- lib/paint/webp.fi` in Certus shows 8
+  commits, all by Justin, and no other author. As sole author Justin released
+  the file for Firn under MPL-2.0 -- the same step as for `lib/window/`,
+  `lib/svg/` and `lib/tls/`. The interface was reworked (WebpImage /
+  WebpError, size limits, VP8X canvas checks, animation composer); the
+  decoding code is the Certus code. It translates the reference decoder of
+  RFC 6386 and follows libwebp (BSD-3-Clause), see `THIRD_PARTY.md`. The GIF
+  decoder `lib/gif/` and `lib/fui/uiimagedec.fi` were written here.
+
 ## Why MPL-2.0
 
 A language is only useful if programs written in it may be closed. The MPL

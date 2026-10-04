@@ -19,6 +19,13 @@ positive test in `tests/` (run in every build level and on AArch64 by
 | LIB-008 | `lib/regex` (`regex.fi`) | RE2-style regular expressions in linear time (Pike VM): classes, groups, named groups, lazy quantifiers, anchors, flags, replacement with `$1`/`${name}`; refuses backreferences and lookaround | Python `re` on 20,000 random patterns |
 | LIB-009 | `lib/print` (`print.fi`) | IPP client over `net.http`: CUPS-Get-Printers/-Default, Get-Printer-Attributes, Print-Job, Get-Job-Attributes, Cancel-Job | CUPS' `ippeveprinter` (a real IPP Everywhere printer) and a stand-in for the CUPS scheduler |
 | LIB-010 | `lib/jpeg` (`jpeg.fi`) | baseline and progressive JPEG to RGBA, any subsampling, restart markers, grey/YCbCr/RGB/CMYK, EXIF orientation; libjpeg's islow IDCT, fancy upsampling and colour tables | Pillow (libjpeg-turbo): the same RGBA octets for 46 files |
+| FL-001 | `lib/webp` (`webp.fi`) | WebP to RGBA: lossless (VP8L, all four transforms, colour cache), lossy (VP8 key frames with loop filter, libwebp's fancy upsampling), ALPH alpha plane (raw or compressed, all filters), VP8X canvas, animations (first frame as a still; `webp_decode_anim` composes every frame like WebPAnimDecoder, with delays and loop count); size limit 16 Mpixel by default, hostile input gives `WebpError`, never a crash | Pillow (libwebp): the same RGBA octets for 991 files (generated corpus, 40 hand-muxed animations with every offset/blend/dispose combination, 838 Modrinth icons), lossless AND lossy, no tolerance |
+| FL-002 | `lib/gif` (`gif.fi`) | GIF87a/89a to RGBA: LZW (1-8 bit, deferred clear, full table), global/local palettes, transparency, interlace, graphic control (delay, disposal 0-3), NETSCAPE loop count; `gif_decode` = first frame on the screen, `gif_decode_anim` = every frame as a canvas | Pillow: the same RGBA octets for 76 files incl. hand-written LZW streams (no clear, no EOI, 1-octet sub-blocks, KwKwK) and the Modrinth GIFs; known divergences listed in `check_gif.py` |
+| FL-003 | `fui.uiimagedec` (`lib/fui/uiimagedec.fi`) | `image_from_bytes`: PNG, JPEG, WebP or GIF by magic octets (`uiimage.image_format`) to an fUi picture; size read before any pixel memory is asked for | `tests/2082_image_from_bytes.fi`: one picture as PNG/WebP/GIF decodes identically |
+
+FL-001 .. FL-003 are the image decoders the FleiLauncher (Minecraft launcher
+in Firn/fUi) needs for mod icons and screenshots. Details and the hostile-input
+rules: `docs/IMAGE_DECODERS.md`.
 
 The compiler learned three more system calls for AArch64 on the way
 (`unlinkat`, `symlinkat`, `statx`; `compiler/src/syscalls.rs`), and

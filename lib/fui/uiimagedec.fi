@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/uiimagedec.fi -- ANY PICTURE BECOMES AN fUi PICTURE.
+//
+//     import fui.uiimagedec
+//     var d: uiimagedec.Decoded = uiimagedec.decoded_new()
+//     var view: uiimage.Image = uiimage.image_new()
+//     if uiimagedec.image_from_bytes(p, n, &d, &view) {
+//         // draw `view` ... as long as `d` lives
+//     }
+//     uiimagedec.decoded_free(&d)
+//
+// `image_from_bytes` looks at the first octets (uiimage.image_format) and
+// hands the bytes to the right decoder: PNG (lib/paint/png.fi), JPEG
+// (lib/jpeg), WebP (lib/webp) or GIF (lib/gif; the first frame on the
+// logical screen, animated WebP likewise). The result is the same for all
+// four: straight RGBA, which is what `uiimage.image_wrap` wants -- no
+// conversion, no copy.
+//
+// OWNERSHIP: like `uiimagepng.image_from_png`, the `view` only POINTS at
+// the pixels and `Decoded` owns them. Keep the `Decoded` alive as long as
+// the widget shows the picture, free it afterwards. One `Decoded` can be
+// reused for the next picture (the previous pixels are released first).
+//
+// HOSTILE INPUT: the size is read from the header BEFORE any pixel memory
+// is asked for and refused over `IMAGE_MAX_PIXELS` (16,777,216 = 4096 x
+// 4096) or the bound given to `image_from_bytes_limited`. Cut or damaged
+// files give `false` and an empty `view`, never a crash and never half a
+// picture (JPEG is the one exception by its nature: a cut baseline file
+// decodes as far as it goes, the rest grey, as libjpeg does).
+//
+// HONEST NOTE: PNG is whatever lib/paint/png.fi takes -- grey, RGB, grey
+// + alpha and RGBA at 8 bits, no interlace. Palette, 16-bit and Adam7 PNGs
+// are refused (`false`); Modrinth mod icons are often palette PNGs.
+import std.rt
+import paint.png
+import jpeg.jpeg
+import webp.webp
+import gif.gif
+import fui.uiimage
+
+export {
+    Decoded, decoded_new, decoded_free, image_from_bytes, image_from_bytes_limited,
+    IMAGE_MAX_PIXELS,
+}
+
+const IMAGE_MAX_PIXELS: u64 = 16777216
+
+// What was decoded, and who owns the pixels. Only the member of `fmt` is
+// in use.
+struct Decoded {
+    fmt: u32, // uiimage.IMG_FMT_*
+    png: png.Image,
+    jpeg: jpeg.JpegImage,
+    webp: webp.WebpImage,
+    gif: gif.GifImage,
+}
+
+fn decoded_new() -> Decoded {
+    return Decoded { fmt: 0, png: png.image_new(), jpeg: jpeg.jpeg_image_new(),
+        webp: webp.webp_image_new(), gif: gif.gif_image_new() }
+}
+
+// Releases the pixels of whatever was decoded.
+fn decoded_free(d: *mut Decoded) {
+    if (*d).fmt == uiimage.IMG_FMT_PNG {
+        png.image_free(&(*d).png)
+    }
+    jpeg.jpeg_image_free(&(*d).jpeg)
+    webp.webp_image_free(&(*d).webp)
+    gif.gif_image_free(&(*d).gif)
+    (*d).png = png.image_new()
+    (*d).fmt = 0
+}
+
+fn be32(p: u64, i: usize) -> u64 {
+    return ((rt.ld8(p, i) as u64) << 24) | ((rt.ld8(p, i + 1) as u64) << 16)
+        | ((rt.ld8(p, i + 2) as u64) << 8) | (rt.ld8(p, i + 3) as u64)
+}
+
+fn image_from_bytes(src: u64, n: usize, dst: *mut Decoded, view: *mut uiimage.Image) -> bool {
+    return image_from_bytes_limited(src, n, IMAGE_MAX_PIXELS, dst, view)
+}
+
+// Decodes the picture in `src[0..n]` into `dst` and points `view` at its
+// pixels; false (and an empty `view`) when the bytes are no picture this
+// library takes, are damaged, or hold more than `max_pixels` pixels.
+fn image_from_bytes_limited(src: u64, n: usize, max_pixels: u64, dst: *mut Decoded,
+    view: *mut uiimage.Image) -> bool {
+    decoded_free(dst)
+    *view = uiimage.image_new()
+    let fmt: u32 = uiimage.image_format(src, n)
+    if fmt == uiimage.IMG_FMT_PNG {
+        // the size from IHDR first: png.decode_png asks for w * h * 4 octets
+        if n < 33 {
+            return false
+        }
+        let w: u64 = be32(src, 16)
+        let h: u64 = be32(src, 20)
+        if w == 0 || h == 0 || w > 65535 || h > 65535 || w * h > max_pixels {
+            return false
+        }
+        (*dst).fmt = fmt
+        if !png.decode_png(src, n, &(*dst).png) {
+            decoded_free(dst)
+            return false
+        }
+        *view = uiimagepng_view(&(*dst).png)
+        return true
+    }
+    if fmt == uiimage.IMG_FMT_JPEG {
+        let ok: bool = jpeg.jpeg_decode_limited(src, n, max_pixels, &(*dst).jpeg) catch false
+        if !ok {
+            decoded_free(dst)
+            return false
+        }
+        (*dst).fmt = fmt
+        *view = uiimage.image_wrap(rt.buf_ptr(&(*dst).jpeg.px), (*dst).jpeg.w as usize,
+            (*dst).jpeg.h as usize, 0)
+        return true
+    }
+    if fmt == uiimage.IMG_FMT_WEBP {
+        let ok: bool = webp.webp_decode_limited(src, n, max_pixels, &(*dst).webp) catch false
+        if !ok {
+            decoded_free(dst)
+            return false
+        }
+        (*dst).fmt = fmt
+        *view = uiimage.image_wrap(rt.buf_ptr(&(*dst).webp.px), (*dst).webp.w as usize,
+            (*dst).webp.h as usize, 0)
+        return true
+    }
+    if fmt == uiimage.IMG_FMT_GIF {
+        let ok: bool = gif.gif_decode_limited(src, n, max_pixels, &(*dst).gif) catch false
+        if !ok {
+            decoded_free(dst)
+            return false
+        }
+        (*dst).fmt = fmt
+        *view = uiimage.image_wrap(rt.buf_ptr(&(*dst).gif.px), (*dst).gif.w as usize,
+            (*dst).gif.h as usize, 0)
+        return true
+    }
+    return false
+}
+
+fn uiimagepng_view(im: *mut png.Image) -> uiimage.Image {
+    if !png.image_ok(im) {
+        return uiimage.image_new()
+    }
+    return uiimage.image_wrap((*im).px as u64, png.image_width(im), png.image_height(im), 0)
+}

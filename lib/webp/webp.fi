@@ -1,0 +1,3995 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/webp/webp.fi -- a WebP decoder: lossy (VP8), lossless (VP8L), alpha
+// (ALPH), the extended container (VP8X) and animations (ANIM/ANMF).
+//
+//     import webp.webp
+//     var im: webp.WebpImage = webp.webp_image_new()
+//     webp.webp_decode(p, n, &im) catch |e| ...   // im.w, im.h, im.px (RGBA)
+//     webp.webp_image_free(&im)
+//
+//     var an: webp.WebpAnim = webp.webp_anim_new()   // every frame
+//     webp.webp_decode_anim(p, n, &an) catch |e| ... // an.px, an.delays
+//
+// Output is the same as lib/jpeg: STRAIGHT (not premultiplied) RGBA octets,
+// row 0 on top, `w * h * 4` octets in `px`.
+//
+// WHAT IT READS
+//   * simple lossy ("VP8 "), simple lossless ("VP8L"), and the extended
+//     form (VP8X) with ALPH (the alpha plane of a lossy picture: raw or
+//     VP8L-compressed, with the four prediction filters), ICC/EXIF/XMP
+//     chunks (skipped);
+//   * animations: `webp_decode` returns the FIRST frame the way libwebp's
+//     WebPAnimDecoder shows it (canvas size, frame placed at its offset,
+//     blended on transparent); `webp_decode_anim` returns every frame as a
+//     full canvas with its duration, composed exactly like WebPAnimDecoder
+//     (dispose-to-background, alpha blending of non-premultiplied pixels
+//     with libwebp's integer arithmetic).
+//
+// VP8L (RFC 9649): an ARGB image, LZ77 + prefix codes + colour cache, then
+// up to four inverse transforms (predictor, cross-colour, subtract-green,
+// colour indexing). VP8 (RFC 6386): a key frame, translated from the
+// reference decoder in the RFC (dixie: bool decoder, modes, tokens, intra
+// prediction, IDCT, loop filter); the tables were generated from that
+// source (tools/webp/gen_tables.py). YUV -> RGB uses libwebp's "fancy"
+// chroma upsampling and its fixed-point colour conversion, and the hot
+// parts follow libwebp's own decoder, so the pictures are the ones dwebp
+// and Chromium show.
+//
+// HELD AGAINST AN IMPLEMENTATION NOBODY HERE WROTE: tools/libmvp/check_webp.py
+// decodes a corpus (lossless and lossy, palette, alpha raw/compressed/
+// filtered, 1x1 .. 333x211, every cwebp knob, animations, the Modrinth mod
+// icons and FleiLauncher's own images) with this file and with Pillow
+// (libwebp) and compares every octet: lossless AND lossy are identical,
+// there is no tolerance.
+//
+// ORIGIN, HONEST: this file is the WebP decoder of the Certus browser
+// (lib/paint/webp.fi in the Certus tree, 27.09.2026, same authors),
+// brought over with a new interface (`WebpImage`/`WebpError`, size limits
+// as parameters, no process-wide error code), the VP8X canvas checks and
+// the animation composer. The Certus copy is GPL-2.0-only; the copyright
+// holders of this tree are the same and release it here as MPL-2.0. It
+// translates the BSD-licensed decoder code of RFC 6386 and follows the
+// algorithms of libwebp (BSD-3-Clause); see THIRD_PARTY.md.
+//
+// LIMITS: at most `WEBP_MAX_PIXELS` (16,777,216 = 4096 x 4096) per picture
+// or canvas unless `webp_decode_limited` is given another bound; an
+// animation holds `frames * canvas * 4` octets and at most
+// `WEBP_MAX_ANIM_BYTES` (256 MiB). Damaged and cut files give
+// `WebpError::Corrupt` -- never a crash, never a partial picture.
+//
+// HONEST NOTES
+//   * The first call builds process-wide lookup tables (loop filter, YUV);
+//     the writes are idempotent, so two threads racing on the very first
+//     call do no harm, but call `webp_init()` once before starting
+//     threads if you want that to be certain.
+//   * The colour profile (ICC) is ignored, like dwebp does by default.
+//   * Lossy pictures are decoded as libwebp does with default options:
+//     "fancy" upsampling, no dithering.
+import std.rt
+
+export {
+    WebpImage, WebpAnim, WebpError,
+    webp_image_new, webp_image_free, webp_anim_new, webp_anim_free,
+    webp_decode, webp_decode_limited, webp_decode_anim, webp_decode_anim_limited,
+    webp_info, webp_sniff, webp_init, webp_anim_delay,
+    WEBP_MAX_PIXELS, WEBP_MAX_ANIM_BYTES,
+}
+
+error WebpError {
+    NotWebp, // no RIFF/WEBP header
+    Corrupt, // a chunk or a bitstream contradicts itself, or the data is cut
+    Unsupported, // a feature this decoder does not take
+    TooLarge, // over the pixel limit
+    OutOfMemory,
+}
+
+const WEBP_MAX_PIXELS: u64 = 16777216
+const WEBP_MAX_ANIM_BYTES: u64 = 268435456
+
+struct WebpImage {
+    w: u32,
+    h: u32,
+    px: rt.Buf, // w * h * 4 octets, RGBA, row 0 at the top
+    has_alpha: bool, // the file says the picture has an alpha channel
+    animated: bool, // the file is an animation (px is its first frame)
+}
+
+struct WebpAnim {
+    w: u32, // canvas
+    h: u32,
+    loops: u32, // 0 = forever
+    count: u32,
+    px: rt.Buf, // count canvases of w * h * 4 octets, one after the other
+    delays: rt.Buf, // count u32 (little endian): milliseconds
+    has_alpha: bool,
+}
+
+fn webp_image_new() -> WebpImage {
+    return WebpImage { w: 0, h: 0, px: rt.buf_new(), has_alpha: false, animated: false }
+}
+
+fn webp_image_free(im: *mut WebpImage) {
+    rt.buf_free(&(*im).px)
+    (*im).w = 0
+    (*im).h = 0
+}
+
+fn webp_anim_new() -> WebpAnim {
+    return WebpAnim { w: 0, h: 0, loops: 0, count: 0, px: rt.buf_new(),
+        delays: rt.buf_new(), has_alpha: false }
+}
+
+fn webp_anim_free(an: *mut WebpAnim) {
+    rt.buf_free(&(*an).px)
+    rt.buf_free(&(*an).delays)
+    (*an).w = 0
+    (*an).h = 0
+    (*an).count = 0
+}
+
+// The delay of frame `i` in milliseconds (0 outside the animation).
+fn webp_anim_delay(an: *mut WebpAnim, i: u32) -> u32 {
+    if i >= (*an).count {
+        return 0
+    }
+    return rt.ld32(rt.buf_ptr(&(*an).delays), i as usize)
+}
+
+// Builds the lookup tables once (see HONEST NOTES).
+fn webp_init() {
+    lf_init()
+    yuv_init()
+}
+
+const WR_OK: u32 = 0
+const WR_NOT_WEBP: u32 = 1
+const WR_TRUNCATED: u32 = 2
+const WR_VP8L: u32 = 3
+const WR_VP8: u32 = 4
+const WR_MEMORY: u32 = 5
+const WR_ALPHA: u32 = 6
+const WR_SIZE: u32 = 7
+const WR_UNSUPPORTED: u32 = 8
+
+// ------------------------------------------------------------ raw memory
+
+#[no_gc]
+fn ld8(p: u64, i: usize) -> i64 {
+    return (*((p + i as u64) as *mut u8)) as i64
+}
+
+#[no_gc]
+fn st8(p: u64, i: usize, v: i64) {
+    *((p + i as u64) as *mut u8) = (v & 255) as u8
+}
+
+#[no_gc]
+fn ld8o(p: u64, off: i64) -> i64 {
+    let a: u64 = ((p as i64) + off) as u64
+    return (*(a as *mut u8)) as i64
+}
+
+#[no_gc]
+fn st8o(p: u64, off: i64, v: i64) {
+    let a: u64 = ((p as i64) + off) as u64
+    *(a as *mut u8) = (v & 255) as u8
+}
+
+#[no_gc]
+fn ld32(p: u64, i: usize) -> i64 {
+    return (*((p + (i * 4) as u64) as *mut u32)) as i64
+}
+
+#[no_gc]
+fn st32(p: u64, i: usize, v: i64) {
+    *((p + (i * 4) as u64) as *mut u32) = (v & 4294967295) as u32
+}
+
+// signed 32 bit cells (coefficients, mode info, contexts)
+#[no_gc]
+fn ldi(p: u64, i: usize) -> i64 {
+    return (*((p + (i * 4) as u64) as *mut i32)) as i64
+}
+
+#[no_gc]
+fn sti(p: u64, i: usize, v: i64) {
+    *((p + (i * 4) as u64) as *mut i32) = v as i32
+}
+
+// zeroed memory (mmap), 0 on failure
+fn alloc(n: usize) -> u64 {
+    return rt.heap_alloc(n) as u64
+}
+
+fn free(p: u64, n: usize) {
+    if p != 0 {
+        rt.heap_free(p, n)
+    }
+}
+
+fn zero(p: u64, n: usize) {
+    var i: usize = 0
+    while i + 8 <= n {
+        *((p + i as u64) as *mut u64) = 0
+        i = i + 8
+    }
+    while i < n {
+        *((p + i as u64) as *mut u8) = 0 as u8
+        i = i + 1
+    }
+}
+
+fn le32(p: u64, i: usize) -> i64 {
+    return ld8(p, i) | (ld8(p, i + 1) << 8) | (ld8(p, i + 2) << 16)
+        | (ld8(p, i + 3) << 24)
+}
+
+fn le24(p: u64, i: usize) -> i64 {
+    return ld8(p, i) | (ld8(p, i + 1) << 8) | (ld8(p, i + 2) << 16)
+}
+
+fn tag_is(p: u64, i: usize, a: i64, b: i64, c: i64, d: i64) -> bool {
+    return ld8(p, i) == a && ld8(p, i + 1) == b && ld8(p, i + 2) == c
+        && ld8(p, i + 3) == d
+}
+
+fn clamp255(v: i64) -> i64 {
+    if v < 0 {
+        return 0
+    }
+    if v > 255 {
+        return 255
+    }
+    return v
+}
+
+fn iabs(v: i64) -> i64 {
+    if v < 0 {
+        return 0 - v
+    }
+    return v
+}
+
+// "RIFF" .... "WEBP"
+fn webp_sniff(p: u64, n: usize) -> bool {
+    if n < 16 {
+        return false
+    }
+    return tag_is(p, 0, 82, 73, 70, 70) && tag_is(p, 8, 87, 69, 66, 80)
+}
+
+// ================================================================= VP8L
+
+struct LBits {
+    src: u64,
+    n: usize,
+    pos: usize,
+    val: u64,
+    nb: i64,
+    eos: bool,
+}
+
+fn lb_new(src: u64, n: usize) -> LBits {
+    return LBits { src: src, n: n, pos: 0, val: 0, nb: 0, eos: false }
+}
+
+// k <= 32 bits, least significant first (RFC 9649, 3.1)
+fn lb_read(b: *mut LBits, k: i64) -> i64 {
+    if k <= 0 {
+        return 0
+    }
+    while (*b).nb < k {
+        if (*b).pos < (*b).n {
+            (*b).val = (*b).val | ((ld8((*b).src, (*b).pos) as u64)
+                << ((*b).nb as u64))
+            (*b).pos = (*b).pos + 1
+        } else {
+            (*b).eos = true
+        }
+        (*b).nb = (*b).nb + 8
+    }
+    let one: u64 = 1
+    let r: u64 = (*b).val & ((one << (k as u64)) - one)
+    (*b).val = (*b).val >> (k as u64)
+    (*b).nb = (*b).nb - k
+    return r as i64
+}
+
+fn lb_bit(b: *mut LBits) -> i64 {
+    if (*b).nb == 0 {
+        if (*b).pos < (*b).n {
+            (*b).val = ld8((*b).src, (*b).pos) as u64
+            (*b).pos = (*b).pos + 1
+        } else {
+            (*b).val = 0
+            (*b).eos = true
+        }
+        (*b).nb = 8
+    }
+    let r: i64 = ((*b).val & 1) as i64
+    (*b).val = (*b).val >> 1
+    (*b).nb = (*b).nb - 1
+    return r
+}
+
+fn divup(a: i64, b: i64) -> i64 {
+    return (a + b - 1) / b
+}
+
+// ---- prefix codes
+//
+// A code lives in 17 + alphabet i32 cells: [0] the one symbol of a code
+// that has only one (it takes no bits), else -1; [1..15] the number of
+// codes of each length; [17..] the symbols ordered by (length, value) --
+// the canonical order of RFC 9649 3.7.2.1.1 (the one DEFLATE uses). A
+// symbol is read bit by bit, first bit = most significant bit of the code
+// (puff.c's decoder).
+fn huff_build(h: u64, lens: u64, alpha: usize) -> bool {
+    var i: usize = 0
+    while i < 17 {
+        sti(h, i, 0)
+        i = i + 1
+    }
+    var nz: i64 = 0
+    var last: i64 = 0
+    i = 0
+    while i < alpha {
+        let l: i64 = ldi(lens, i)
+        if l > 0 {
+            if l > 15 {
+                return false
+            }
+            sti(h, l as usize, ldi(h, l as usize) + 1)
+            nz = nz + 1
+            last = i as i64
+        }
+        i = i + 1
+    }
+    if nz == 0 {
+        return false
+    }
+    if nz == 1 {
+        sti(h, 0, last)
+        return true
+    }
+    sti(h, 0, 0 - 1)
+    var offs: [i64; 17] = [0; 17]
+    var l2: usize = 1
+    while l2 < 15 {
+        offs[l2 + 1] = offs[l2] + ldi(h, l2)
+        l2 = l2 + 1
+    }
+    i = 0
+    while i < alpha {
+        let l: i64 = ldi(lens, i)
+        if l > 0 {
+            sti(h, 17 + offs[l as usize] as usize, i as i64)
+            offs[l as usize] = offs[l as usize] + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn huff_sym(b: *mut LBits, h: u64) -> i64 {
+    let s0: i64 = ldi(h, 0)
+    if s0 >= 0 {
+        return s0
+    }
+    var code: i64 = 0
+    var first: i64 = 0
+    var index: i64 = 0
+    var len: usize = 1
+    while len <= 15 {
+        code = code | lb_bit(b)
+        let count: i64 = ldi(h, len)
+        if code - count < first {
+            return ldi(h, 17 + (index + code - first) as usize)
+        }
+        index = index + count
+        first = first + count
+        first = first << 1
+        code = code << 1
+        len = len + 1
+    }
+    return 0 - 1
+}
+
+fn cl_order(i: usize) -> usize {
+    var o: [u8; 19] = [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12,
+        13, 14, 15]
+    return o[i] as usize
+}
+
+// RFC 9649 3.7.2.1: a simple code (one or two symbols) or a normal one
+// whose code lengths are themselves prefix coded.
+fn read_code(b: *mut LBits, alpha: usize, h: u64, lens: u64) -> bool {
+    zero(lens, alpha * 4)
+    if lb_read(b, 1) == 1 {
+        let num: i64 = lb_read(b, 1) + 1
+        let first8: i64 = lb_read(b, 1)
+        let s0: i64 = lb_read(b, 1 + 7 * first8)
+        if s0 >= alpha as i64 {
+            return false
+        }
+        sti(lens, s0 as usize, 1)
+        if num == 2 {
+            let s1: i64 = lb_read(b, 8)
+            if s1 >= alpha as i64 {
+                return false
+            }
+            sti(lens, s1 as usize, 1)
+        }
+        return huff_build(h, lens, alpha)
+    }
+    var clc: [i32; 19] = [0; 19]
+    let ncl: i64 = lb_read(b, 4) + 4
+    if ncl > 19 {
+        return false
+    }
+    var i: i64 = 0
+    while i < ncl {
+        clc[cl_order(i as usize)] = lb_read(b, 3) as i32
+        i = i + 1
+    }
+    var h2: [i32; 40] = [0; 40]
+    let h2p: u64 = (&h2[0]) as u64
+    if !huff_build(h2p, (&clc[0]) as u64, 19) {
+        return false
+    }
+    var max_symbol: i64 = alpha as i64
+    if lb_read(b, 1) == 1 {
+        let lnb: i64 = 2 + 2 * lb_read(b, 3)
+        max_symbol = 2 + lb_read(b, lnb)
+        if max_symbol > alpha as i64 {
+            return false
+        }
+    }
+    var prev: i64 = 8
+    var sym: i64 = 0
+    while sym < alpha as i64 {
+        if max_symbol == 0 {
+            break
+        }
+        max_symbol = max_symbol - 1
+        let cl: i64 = huff_sym(b, h2p)
+        if cl < 0 || (*b).eos {
+            return false
+        }
+        if cl < 16 {
+            sti(lens, sym as usize, cl)
+            sym = sym + 1
+            if cl != 0 {
+                prev = cl
+            }
+        } else {
+            var extra: i64 = 2
+            var off: i64 = 3
+            if cl == 17 {
+                extra = 3
+            }
+            if cl == 18 {
+                extra = 7
+                off = 11
+            }
+            let rep: i64 = lb_read(b, extra) + off
+            if sym + rep > alpha as i64 {
+                return false
+            }
+            var v: i64 = 0
+            if cl == 16 {
+                v = prev
+            }
+            var k: i64 = 0
+            while k < rep {
+                sti(lens, (sym + k) as usize, v)
+                k = k + 1
+            }
+            sym = sym + rep
+        }
+    }
+    return huff_build(h, lens, alpha)
+}
+
+fn prefix_value(b: *mut LBits, p: i64) -> i64 {
+    if p < 4 {
+        return p + 1
+    }
+    let extra: i64 = (p - 2) >> 1
+    let off: i64 = (2 + (p & 1)) << extra
+    return off + lb_read(b, extra) + 1
+}
+
+fn plane_code(i: usize) -> i64 {
+    var t: [u8; 120] = b"\x18\x07\x17\x19\x28\x06\x27\x29\x16\x1a\x26\x2a\x38\x05\x37\x39\x15\x1b\x36\x3a\x25\x2b\x48\x04\x47\x49\x14\x1c\x35\x3b\x46\x4a\x24\x2c\x58\x45\x4b\x34\x3c\x03\x57\x59\x13\x1d\x56\x5a\x23\x2d\x44\x4c\x55\x5b\x33\x3d\x68\x02\x67\x69\x12\x1e\x66\x6a\x22\x2e\x54\x5c\x43\x4d\x65\x6b\x32\x3e\x78\x01\x77\x79\x53\x5d\x11\x1f\x64\x6c\x42\x4e\x76\x7a\x21\x2f\x75\x7b\x31\x3f\x63\x6d\x52\x5e\x00\x74\x7c\x41\x4f\x10\x20\x62\x6e\x30\x73\x7d\x51\x5f\x40\x72\x7e\x61\x6f\x50\x71\x7f\x60\x70"
+    return t[i] as i64
+}
+
+fn plane_to_dist(xs: i64, code: i64) -> i64 {
+    if code > 120 {
+        return code - 120
+    }
+    let dc: i64 = plane_code((code - 1) as usize)
+    let yoff: i64 = dc >> 4
+    let xoff: i64 = 8 - (dc & 15)
+    let d: i64 = yoff * xs + xoff
+    if d >= 1 {
+        return d
+    }
+    return 1
+}
+
+fn cache_key(argb: i64, bits: i64) -> usize {
+    let m: u64 = ((argb as u64) * (506832829 as u64)) & (4294967295 as u64)
+    return (m >> ((32 - bits) as u64)) as usize
+}
+
+// The entropy-coded image (RFC 9649 5): with meta prefix codes and the
+// colour cache for the main image, without meta codes for the transform
+// data and the entropy image. Returns a heap block of xs*ys ARGB words.
+fn vp8l_coded(b: *mut LBits, xs: i64, ys: i64, level0: bool) -> u64 {
+    var cache_bits: i64 = 0
+    if lb_read(b, 1) == 1 {
+        cache_bits = lb_read(b, 4)
+        if cache_bits < 1 || cache_bits > 11 {
+            return 0
+        }
+    }
+    var mbits: i64 = 0
+    var meta: u64 = 0
+    var mw: i64 = 0
+    var mcount: usize = 0
+    var ngroups: i64 = 1
+    if level0 && lb_read(b, 1) == 1 {
+        mbits = lb_read(b, 3) + 2
+        mw = divup(xs, 1 << mbits)
+        let mh: i64 = divup(ys, 1 << mbits)
+        meta = vp8l_coded(b, mw, mh, false)
+        if meta == 0 {
+            return 0
+        }
+        mcount = (mw * mh) as usize
+        var i: usize = 0
+        while i < mcount {
+            let g: i64 = (ld32(meta, i) >> 8) & 65535
+            if g + 1 > ngroups {
+                ngroups = g + 1
+            }
+            i = i + 1
+        }
+    }
+    var csize: i64 = 0
+    if cache_bits > 0 {
+        csize = 1 << cache_bits
+    }
+    let a0: i64 = 256 + 24 + csize
+    let gcells: i64 = 5 * 17 + a0 + 256 * 3 + 40
+    let gbytes: usize = (ngroups * gcells * 4) as usize
+    let groups: u64 = alloc(gbytes)
+    let lens: u64 = alloc(((a0 + 8) * 4) as usize)
+    var ok: bool = groups != 0 && lens != 0
+    var g: i64 = 0
+    while ok && g < ngroups {
+        let base: u64 = groups + (g * gcells * 4) as u64
+        ok = read_code(b, a0 as usize, base, lens)
+        let o1: u64 = base + ((17 + a0) * 4) as u64
+        ok = ok && read_code(b, 256, o1, lens)
+        let o2: u64 = o1 + ((17 + 256) * 4) as u64
+        ok = ok && read_code(b, 256, o2, lens)
+        let o3: u64 = o2 + ((17 + 256) * 4) as u64
+        ok = ok && read_code(b, 256, o3, lens)
+        let o4: u64 = o3 + ((17 + 256) * 4) as u64
+        ok = ok && read_code(b, 40, o4, lens)
+        g = g + 1
+    }
+    free(lens, ((a0 + 8) * 4) as usize)
+    let total: i64 = xs * ys
+    var cache: u64 = 0
+    if ok && csize > 0 {
+        cache = alloc((csize * 4) as usize)
+        ok = cache != 0
+    }
+    var out: u64 = 0
+    if ok {
+        out = alloc((total * 4) as usize)
+        ok = out != 0
+    }
+    var pos: i64 = 0
+    var x: i64 = 0
+    var y: i64 = 0
+    while ok && pos < total {
+        var gi: i64 = 0
+        if meta != 0 {
+            gi = (ld32(meta, ((y >> mbits) * mw + (x >> mbits)) as usize)
+                >> 8) & 65535
+        }
+        let hg: u64 = groups + (gi * gcells * 4) as u64
+        let s: i64 = huff_sym(b, hg)
+        if s < 0 || (*b).eos {
+            ok = false
+            break
+        }
+        if s < 256 {
+            let hr: u64 = hg + ((17 + a0) * 4) as u64
+            let hb: u64 = hr + ((17 + 256) * 4) as u64
+            let ha: u64 = hb + ((17 + 256) * 4) as u64
+            let r: i64 = huff_sym(b, hr)
+            let bl: i64 = huff_sym(b, hb)
+            let a: i64 = huff_sym(b, ha)
+            if r < 0 || bl < 0 || a < 0 {
+                ok = false
+                break
+            }
+            let argb: i64 = (a << 24) | (r << 16) | (s << 8) | bl
+            st32(out, pos as usize, argb)
+            if csize > 0 {
+                st32(cache, cache_key(argb, cache_bits), argb)
+            }
+            pos = pos + 1
+            if meta != 0 {
+                x = x + 1
+                if x == xs {
+                    x = 0
+                    y = y + 1
+                }
+            }
+        } else if s < 280 {
+            let len: i64 = prefix_value(b, s - 256)
+            let hd: u64 = hg + ((17 + a0) * 4 + (17 + 256) * 12) as u64
+            let ds: i64 = huff_sym(b, hd)
+            if ds < 0 {
+                ok = false
+                break
+            }
+            let dist: i64 = plane_to_dist(xs, prefix_value(b, ds))
+            if dist > pos || pos + len > total {
+                ok = false
+                break
+            }
+            // ROUND WEBP-TEMPO: the copy walks two pointers; the
+            // position in the picture is only needed for the meta codes
+            var sp: u64 = out + ((pos - dist) * 4) as u64
+            var dp: u64 = out + (pos * 4) as u64
+            let de: u64 = dp + (len * 4) as u64
+            if csize > 0 {
+                while dp < de {
+                    let v: u32 = *(sp as *mut u32)
+                    *(dp as *mut u32) = v
+                    st32(cache, cache_key(v as i64, cache_bits), v as i64)
+                    sp = sp + 4
+                    dp = dp + 4
+                }
+            } else {
+                while dp < de {
+                    *(dp as *mut u32) = *(sp as *mut u32)
+                    sp = sp + 4
+                    dp = dp + 4
+                }
+            }
+            pos = pos + len
+            if meta != 0 {
+                x = x + len
+                while x >= xs {
+                    x = x - xs
+                    y = y + 1
+                }
+            }
+        } else {
+            let ci: i64 = s - 280
+            if ci >= csize {
+                ok = false
+                break
+            }
+            let v: i64 = ld32(cache, ci as usize)
+            st32(out, pos as usize, v)
+            pos = pos + 1
+            if meta != 0 {
+                x = x + 1
+                if x == xs {
+                    x = 0
+                    y = y + 1
+                }
+            }
+        }
+    }
+    free(groups, gbytes)
+    if cache != 0 {
+        free(cache, (csize * 4) as usize)
+    }
+    if meta != 0 {
+        free(meta, mcount * 4)
+    }
+    if !ok {
+        if out != 0 {
+            free(out, (total * 4) as usize)
+        }
+        return 0
+    }
+    return out
+}
+
+// ---- per-channel pixel arithmetic
+fn px_add(a: i64, b: i64) -> i64 {
+    let ag: i64 = ((a & 4278255360) + (b & 4278255360)) & 4278255360
+    let rb: i64 = ((a & 16711935) + (b & 16711935)) & 16711935
+    return ag | rb
+}
+
+fn px_avg(a: i64, b: i64) -> i64 {
+    return (((a ^ b) & 4278124286) >> 1) + (a & b)
+}
+
+fn chan(p: i64, sh: i64) -> i64 {
+    return (p >> sh) & 255
+}
+
+fn px_select(l: i64, t: i64, tl: i64) -> i64 {
+    // distance of the estimate (L + T - TL) to L is |T - TL|, to T |L - TL|
+    var pl: i64 = 0
+    var pt: i64 = 0
+    var sh: i64 = 0
+    while sh < 32 {
+        pl = pl + iabs(chan(t, sh) - chan(tl, sh))
+        pt = pt + iabs(chan(l, sh) - chan(tl, sh))
+        sh = sh + 8
+    }
+    if pl < pt {
+        return l
+    }
+    return t
+}
+
+fn px_clamp_full(a: i64, b: i64, c: i64) -> i64 {
+    var r: i64 = 0
+    var sh: i64 = 0
+    while sh < 32 {
+        r = r | (clamp255(chan(a, sh) + chan(b, sh) - chan(c, sh)) << sh)
+        sh = sh + 8
+    }
+    return r
+}
+
+fn px_clamp_half(a: i64, b: i64) -> i64 {
+    var r: i64 = 0
+    var sh: i64 = 0
+    while sh < 32 {
+        let ac: i64 = chan(a, sh)
+        r = r | (clamp255(ac + (ac - chan(b, sh)) / 2) << sh)
+        sh = sh + 8
+    }
+    return r
+}
+
+fn predict(mode: i64, l: i64, t: i64, tr: i64, tl: i64) -> i64 {
+    if mode == 1 { return l }
+    if mode == 2 { return t }
+    if mode == 3 { return tr }
+    if mode == 4 { return tl }
+    if mode == 5 { return px_avg(px_avg(l, tr), t) }
+    if mode == 6 { return px_avg(l, tl) }
+    if mode == 7 { return px_avg(l, t) }
+    if mode == 8 { return px_avg(tl, t) }
+    if mode == 9 { return px_avg(t, tr) }
+    if mode == 10 { return px_avg(px_avg(l, tl), px_avg(t, tr)) }
+    if mode == 11 { return px_select(l, t, tl) }
+    if mode == 12 { return px_clamp_full(l, t, tl) }
+    if mode == 13 { return px_clamp_half(px_avg(l, t), tl) }
+    return 4278190080
+}
+
+fn inv_predictor(px: u64, w: i64, h: i64, bits: i64, data: u64) {
+    let bw: i64 = divup(w, 1 << bits)
+    var y: i64 = 0
+    while y < h {
+        var x: i64 = 0
+        while x < w {
+            let i: i64 = y * w + x
+            var pred: i64 = 0
+            if y == 0 {
+                if x == 0 {
+                    pred = 4278190080
+                } else {
+                    pred = ld32(px, (i - 1) as usize)
+                }
+            } else if x == 0 {
+                pred = ld32(px, (i - w) as usize)
+            } else {
+                let mode: i64 = (ld32(data, ((y >> bits) * bw + (x >> bits))
+                    as usize) >> 8) & 15
+                pred = predict(mode, ld32(px, (i - 1) as usize),
+                    ld32(px, (i - w) as usize), ld32(px, (i - w + 1) as usize),
+                    ld32(px, (i - w - 1) as usize))
+            }
+            st32(px, i as usize, px_add(ld32(px, i as usize), pred))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn s8(v: i64) -> i64 {
+    let b: i64 = v & 255
+    if b >= 128 {
+        return b - 256
+    }
+    return b
+}
+
+fn inv_cross_color(px: u64, w: i64, h: i64, bits: i64, data: u64) {
+    let bw: i64 = divup(w, 1 << bits)
+    var y: i64 = 0
+    while y < h {
+        var x: i64 = 0
+        while x < w {
+            let m: i64 = ld32(data, ((y >> bits) * bw + (x >> bits)) as usize)
+            let g2r: i64 = s8(m)
+            let g2b: i64 = s8(m >> 8)
+            let r2b: i64 = s8(m >> 16)
+            let i: usize = (y * w + x) as usize
+            let argb: i64 = ld32(px, i)
+            let gs: i64 = s8(argb >> 8)
+            var r: i64 = (argb >> 16) & 255
+            var bl: i64 = argb & 255
+            r = (r + ((g2r * gs) >> 5)) & 255
+            bl = bl + ((g2b * gs) >> 5)
+            bl = (bl + ((r2b * s8(r)) >> 5)) & 255
+            st32(px, i, (argb & 4278255360) | (r << 16) | bl)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn inv_subtract_green(px: u64, n: i64) {
+    var i: i64 = 0
+    while i < n {
+        let argb: i64 = ld32(px, i as usize)
+        let g: i64 = (argb >> 8) & 255
+        let r: i64 = (((argb >> 16) & 255) + g) & 255
+        let bl: i64 = ((argb & 255) + g) & 255
+        st32(px, i as usize, (argb & 4278255360) | (r << 16) | bl)
+        i = i + 1
+    }
+}
+
+// ROUND WEBP-TEMPO: the palette is copied into 256 entries (zeros past
+// its size, as libwebp does), so an index needs no bounds check, and a
+// packed word is unpacked once for all the pixels it holds. Before: the
+// word was fetched and shifted again for every pixel, with the index
+// check -- about 50 instructions a pixel of a paletted alpha plane.
+fn inv_color_index(src: u64, dst: u64, w: i64, h: i64, bits: i64,
+    table: u64, size: i64) {
+    var pal: [u32; 256] = [0 as u32; 256]
+    var i: i64 = 0
+    while i < size && i < 256 {
+        pal[i as usize] = ld32(table, i as usize) as u32
+        i = i + 1
+    }
+    let pt: u64 = (&pal[0]) as u64
+    let sw: i64 = divup(w, 1 << bits)
+    let bpp: i64 = 8 >> bits
+    let mask: u64 = ((1 << bpp) - 1) as u64
+    let per: i64 = 1 << bits
+    var sp: u64 = src
+    var dp: u64 = dst
+    var y: i64 = 0
+    while y < h {
+        if bits == 0 {
+            let e: u64 = dp + (w * 4) as u64
+            while dp < e {
+                let idx: u64 = ((*(sp as *mut u32)) as u64 >> 8) & 255
+                *(dp as *mut u32) = *((pt + idx * 4) as *mut u32)
+                sp = sp + 4
+                dp = dp + 4
+            }
+        } else {
+            // whole words first: `per` pixels each, unrolled by kind
+            let full: u64 = sp + ((w >> bits) * 4) as u64
+            if bits == 1 {
+                while sp < full {
+                    let v: u64 = (*(sp as *mut u32)) as u64 >> 8
+                    *(dp as *mut u32) = *((pt + (v & 15) * 4) as *mut u32)
+                    *((dp + 4) as *mut u32) = *((pt + ((v >> 4) & 15) * 4) as *mut u32)
+                    sp = sp + 4
+                    dp = dp + 8
+                }
+            } else if bits == 2 {
+                while sp < full {
+                    let v: u64 = (*(sp as *mut u32)) as u64 >> 8
+                    *(dp as *mut u32) = *((pt + (v & 3) * 4) as *mut u32)
+                    *((dp + 4) as *mut u32) = *((pt + ((v >> 2) & 3) * 4) as *mut u32)
+                    *((dp + 8) as *mut u32) = *((pt + ((v >> 4) & 3) * 4) as *mut u32)
+                    *((dp + 12) as *mut u32) = *((pt + ((v >> 6) & 3) * 4) as *mut u32)
+                    sp = sp + 4
+                    dp = dp + 16
+                }
+            } else {
+                while sp < full {
+                    var v: u64 = (*(sp as *mut u32)) as u64 >> 8
+                    let e: u64 = dp + 32
+                    while dp < e {
+                        *(dp as *mut u32) = *((pt + (v & 1) * 4) as *mut u32)
+                        v = v >> 1
+                        dp = dp + 4
+                    }
+                    sp = sp + 4
+                }
+            }
+            // the rest of the row: part of one word
+            let rest: i64 = w & (per - 1)
+            if rest > 0 {
+                var v: u64 = ((*(sp as *mut u32)) as u64 >> 8) & 255
+                var k: i64 = 0
+                while k < rest {
+                    *(dp as *mut u32) = *((pt + (v & mask) * 4) as *mut u32)
+                    v = v >> (bpp as u64)
+                    dp = dp + 4
+                    k = k + 1
+                }
+                sp = sp + 4
+            }
+        }
+        y = y + 1
+    }
+}
+
+// The whole VP8L image stream after the 5 header bytes (also the body of
+// a lossless ALPH chunk): transforms, the coded image, the inverse
+// transforms in reverse order. Returns xs*ys ARGB words or 0.
+fn vp8l_stream(b: *mut LBits, xs: i64, ys: i64) -> u64 {
+    var ttype: [i64; 4] = [0; 4]
+    var tbits: [i64; 4] = [0; 4]
+    var tdata: [u64; 4] = [0; 4]
+    var tdn: [usize; 4] = [0; 4]
+    var txs: [i64; 4] = [0; 4]
+    var tsize: [i64; 4] = [0; 4]
+    var nt: usize = 0
+    var cur: i64 = xs
+    var ok: bool = true
+    var seen: i64 = 0
+    while ok && lb_read(b, 1) == 1 {
+        if nt >= 4 {
+            ok = false
+            break
+        }
+        let t: i64 = lb_read(b, 2)
+        if (seen & (1 << t)) != 0 {
+            ok = false
+            break
+        }
+        seen = seen | (1 << t)
+        ttype[nt] = t
+        txs[nt] = cur
+        if t == 0 || t == 1 {
+            let bits: i64 = lb_read(b, 3) + 2
+            let bw: i64 = divup(cur, 1 << bits)
+            let bh: i64 = divup(ys, 1 << bits)
+            tbits[nt] = bits
+            tdata[nt] = vp8l_coded(b, bw, bh, false)
+            tdn[nt] = (bw * bh * 4) as usize
+            ok = tdata[nt] != 0
+        } else if t == 3 {
+            let size: i64 = lb_read(b, 8) + 1
+            let tab: u64 = vp8l_coded(b, size, 1, false)
+            ok = tab != 0
+            if ok {
+                var i: i64 = 1
+                while i < size {
+                    st32(tab, i as usize, px_add(ld32(tab, i as usize),
+                        ld32(tab, (i - 1) as usize)))
+                    i = i + 1
+                }
+            }
+            var bits: i64 = 0
+            if size <= 2 {
+                bits = 3
+            } else if size <= 4 {
+                bits = 2
+            } else if size <= 16 {
+                bits = 1
+            }
+            tbits[nt] = bits
+            tdata[nt] = tab
+            tdn[nt] = (size * 4) as usize
+            tsize[nt] = size
+            cur = divup(cur, 1 << bits)
+        }
+        nt = nt + 1
+    }
+    var px: u64 = 0
+    var pxn: usize = 0
+    if ok {
+        px = vp8l_coded(b, cur, ys, true)
+        pxn = (cur * ys * 4) as usize
+        ok = px != 0
+    }
+    var j: i64 = (nt as i64) - 1
+    while ok && j >= 0 {
+        let k: usize = j as usize
+        let w: i64 = txs[k]
+        if ttype[k] == 0 {
+            inv_predictor(px, w, ys, tbits[k], tdata[k])
+        } else if ttype[k] == 1 {
+            inv_cross_color(px, w, ys, tbits[k], tdata[k])
+        } else if ttype[k] == 2 {
+            inv_subtract_green(px, w * ys)
+        } else {
+            let nn: usize = (w * ys * 4) as usize
+            let dst: u64 = alloc(nn)
+            if dst == 0 {
+                ok = false
+            } else {
+                inv_color_index(px, dst, w, ys, tbits[k], tdata[k], tsize[k])
+                free(px, pxn)
+                px = dst
+                pxn = nn
+            }
+        }
+        j = j - 1
+    }
+    var q: usize = 0
+    while q < nt {
+        if tdata[q] != 0 {
+            free(tdata[q], tdn[q])
+        }
+        q = q + 1
+    }
+    if !ok {
+        if px != 0 {
+            free(px, pxn)
+        }
+        return 0
+    }
+    return px
+}
+
+// ARGB words -> RGBA octets at `dst` (n pixels)
+fn argb_to_rgba(px: u64, n: usize, dst: u64) {
+    var i: usize = 0
+    while i < n {
+        let v: i64 = ld32(px, i)
+        st8(dst, i * 4, v >> 16)
+        st8(dst, i * 4 + 1, v >> 8)
+        st8(dst, i * 4 + 2, v)
+        st8(dst, i * 4 + 3, v >> 24)
+        i = i + 1
+    }
+}
+
+// the 5 octets of a VP8L header: size and the alpha hint
+fn vp8l_head(src: u64, n: usize, w: *mut i64, h: *mut i64, alpha: *mut bool) -> u32 {
+    if n < 5 || ld8(src, 0) != 47 {
+        return WR_VP8L
+    }
+    var b: LBits = lb_new(src + 1, n - 1)
+    *w = lb_read(&b, 14) + 1
+    *h = lb_read(&b, 14) + 1
+    *alpha = lb_read(&b, 1) == 1
+    let ver: i64 = lb_read(&b, 3)
+    if ver != 0 {
+        return WR_VP8L
+    }
+    return WR_OK
+}
+
+// Decodes a VP8L stream into `dst` (w * h * 4 octets, the size the header
+// gives and the caller has checked).
+fn decode_vp8l(src: u64, n: usize, dst: u64) -> u32 {
+    var w: i64 = 0
+    var h: i64 = 0
+    var alpha: bool = false
+    let r: u32 = vp8l_head(src, n, &w, &h, &alpha)
+    if r != WR_OK {
+        return r
+    }
+    var b: LBits = lb_new(src + 1, n - 1)
+    lb_read(&b, 32)
+    let px: u64 = vp8l_stream(&b, w, h)
+    if px == 0 {
+        return WR_VP8L
+    }
+    argb_to_rgba(px, (w * h) as usize, dst)
+    free(px, (w * h * 4) as usize)
+    return WR_OK
+}
+
+// ================================================================== VP8
+//
+// A key frame, translated from the reference decoder of RFC 6386
+// (section 20, "dixie"). Names in the comments point at the C original.
+
+// ROUND WEBP-TEMPO: the bool decoder the way libwebp keeps it
+// (bit_reader_utils / VP8GetBit): `value` holds up to 64 bits of the
+// partition, the current 8-bit window is value >> bits, `range` is kept
+// minus one (127 .. 254 when normalized), and the normalization is ONE
+// shift from a table instead of a loop over single bits with a byte load
+// every eighth step. The same decisions as the reference's bool_get.
+struct BD {
+    value: u64,
+    range: i64,
+    bits: i64,
+    pos: u64,
+    end: u64,
+}
+
+fn bd_new() -> BD {
+    return BD { value: 0, range: 254, bits: 0 - 8, pos: 0, end: 0 }
+}
+
+// 7 - floor(log2(r)): the shift that brings a range r (1 .. 255) back to
+// 128 .. 255
+static LOG2SH: [u8; 256] = [
+    0, 7, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+// init_bool_decoder
+fn bd_init(d: *mut BD, p: u64, sz: usize) {
+    (*d).value = 0
+    (*d).range = 254
+    (*d).bits = 0 - 8
+    (*d).pos = p
+    (*d).end = p + sz as u64
+    bd_fill(d)
+}
+
+// VP8LoadNewBytes / VP8LoadFinalBytes: seven octets at once while they
+// last, then one at a time, then zeros -- the reference decoder reads
+// zeros past the end of a partition (libwebp calls that an error; a
+// valid stream never gets there)
+fn bd_fill(d: *mut BD) {
+    let p: u64 = (*d).pos
+    if p + 7 <= (*d).end {
+        let v: u64 = ((ld8(p, 0) as u64) << 48) | ((ld8(p, 1) as u64) << 40)
+            | ((ld8(p, 2) as u64) << 32) | ((ld8(p, 3) as u64) << 24)
+            | ((ld8(p, 4) as u64) << 16) | ((ld8(p, 5) as u64) << 8)
+            | (ld8(p, 6) as u64)
+        (*d).value = ((*d).value << 56) | v
+        (*d).pos = p + 7
+        (*d).bits = (*d).bits + 56
+    } else if p < (*d).end {
+        (*d).value = ((*d).value << 8) | (ld8(p, 0) as u64)
+        (*d).pos = p + 1
+        (*d).bits = (*d).bits + 8
+    } else {
+        (*d).value = (*d).value << 8
+        (*d).bits = (*d).bits + 8
+    }
+}
+
+// bool_get
+fn bd_get(d: *mut BD, prob: i64) -> i64 {
+    if (*d).bits < 0 {
+        bd_fill(d)
+    }
+    let pos: i64 = (*d).bits
+    let range: i64 = (*d).range
+    let split: i64 = (range * prob) >> 8
+    let value: u64 = (*d).value
+    // (value >> pos) > split  <=>  value >= (split + 1) << pos
+    let big: u64 = ((split + 1) as u64) << (pos as u64)
+    var r: i64 = 0
+    var nr: i64 = split + 1
+    if value >= big {
+        nr = range - split
+        (*d).value = value - big
+        r = 1
+    }
+    let sh: i64 = LOG2SH[nr as usize] as i64
+    (*d).range = (nr << sh) - 1
+    (*d).bits = pos - sh
+    return r
+}
+
+fn bd_bit(d: *mut BD) -> i64 {
+    return bd_get(d, 128)
+}
+
+fn bd_uint(d: *mut BD, n: i64) -> i64 {
+    var z: i64 = 0
+    var bit: i64 = n - 1
+    while bit >= 0 {
+        z = z | (bd_bit(d) << bit)
+        bit = bit - 1
+    }
+    return z
+}
+
+fn bd_int(d: *mut BD, n: i64) -> i64 {
+    let z: i64 = bd_uint(d, n)
+    if bd_bit(d) == 1 {
+        return 0 - z
+    }
+    return z
+}
+
+fn bd_maybe_int(d: *mut BD, n: i64) -> i64 {
+    if bd_bit(d) == 1 {
+        return bd_int(d, n)
+    }
+    return 0
+}
+
+// ---- modes (modemv.c, key frame)
+const M_DC: i64 = 0
+const M_V: i64 = 1
+const M_H: i64 = 2
+const M_TM: i64 = 3
+const M_B: i64 = 4
+
+// kf_y_mode_tree with kf_y_mode_probs {145, 156, 163, 128}
+fn read_kf_ymode(d: *mut BD) -> i64 {
+    if bd_get(d, 145) == 0 {
+        return M_B
+    }
+    if bd_get(d, 156) == 0 {
+        if bd_get(d, 163) == 0 {
+            return M_DC
+        }
+        return M_V
+    }
+    if bd_get(d, 128) == 0 {
+        return M_H
+    }
+    return M_TM
+}
+
+// uv_mode_tree with kf_uv_mode_probs {142, 114, 183}
+fn read_uvmode(d: *mut BD) -> i64 {
+    if bd_get(d, 142) == 0 {
+        return M_DC
+    }
+    if bd_get(d, 114) == 0 {
+        return M_V
+    }
+    if bd_get(d, 183) == 0 {
+        return M_H
+    }
+    return M_TM
+}
+
+// b_mode_tree, values stored +16 (B_DC_PRED 0 ... B_HU_PRED 9)
+static BMODE_TREE: [u8; 18] = [16, 18, 15, 20, 14, 22, 24, 28, 13, 26, 11, 10,
+    12, 30, 9, 32, 8, 7]
+
+fn read_bmode(d: *mut BD, probs: u64) -> i64 {
+    var i: i64 = 0
+    while true {
+        let bit: i64 = bd_get(d, ld8(probs, (i >> 1) as usize))
+        i = (BMODE_TREE[(i + bit) as usize] as i64) - 16
+        if i <= 0 {
+            break
+        }
+    }
+    return 0 - i
+}
+
+// the 4x4 mode a 16x16 mode stands for as a neighbour context
+fn implied_bmode(ymode: i64) -> i64 {
+    if ymode == M_V {
+        return 2
+    }
+    if ymode == M_H {
+        return 3
+    }
+    if ymode == M_TM {
+        return 1
+    }
+    return 0
+}
+
+// ---- tokens (tokens.c; the loop as libwebp's GetCoeffs writes it)
+static ZIGZAG: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15]
+static BANDS: [u8; 17] = [0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 0]
+// which of the 9 left/above context cells a block (0..24) uses
+static LCTX: [u8; 25] = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4,
+    5, 5, 6, 6, 7, 7, 8]
+static ACTX: [u8; 25] = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5,
+    4, 5, 6, 7, 6, 7, 8]
+static CAT6: [u8; 11] = [254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129]
+
+// the size of a token beyond ONE (GetLargeValue): p = the 11
+// probabilities of this position
+fn read_large(d: *mut BD, p: u64) -> i64 {
+    var v: i64 = 0
+    if bd_get(d, ld8(p, 3)) == 0 {
+        if bd_get(d, ld8(p, 4)) == 0 {
+            v = 2
+        } else {
+            v = 3 + bd_get(d, ld8(p, 5))
+        }
+    } else if bd_get(d, ld8(p, 6)) == 0 {
+        if bd_get(d, ld8(p, 7)) == 0 {
+            v = 5 + bd_get(d, 159)
+        } else {
+            v = 7 + 2 * bd_get(d, 165)
+            v = v + bd_get(d, 145)
+        }
+    } else if bd_get(d, ld8(p, 8)) == 0 {
+        if bd_get(d, ld8(p, 9)) == 0 {
+            v = 11 + 4 * bd_get(d, 173)
+            v = v + 2 * bd_get(d, 148)
+            v = v + bd_get(d, 140)
+        } else {
+            v = 19 + 8 * bd_get(d, 176)
+            v = v + 4 * bd_get(d, 155)
+            v = v + 2 * bd_get(d, 140)
+            v = v + bd_get(d, 135)
+        }
+    } else if bd_get(d, ld8(p, 10)) == 0 {
+        v = 35 + 16 * bd_get(d, 180)
+        v = v + 8 * bd_get(d, 157)
+        v = v + 4 * bd_get(d, 141)
+        v = v + 2 * bd_get(d, 134)
+        v = v + bd_get(d, 130)
+    } else {
+        v = 67
+        var k: i64 = 0
+        while k < 11 {
+            v = v + (bd_get(d, CAT6[k as usize] as i64) << (10 - k))
+            k = k + 1
+        }
+    }
+    return v
+}
+
+// One 4x4 block of tokens (decode_mb_tokens / GetCoeffs). `bp` = 17
+// pointers, the probabilities of each position's band for this block
+// type (ROUND WEBP-TEMPO: computed once per frame instead of
+// ((type * 8 + band(c)) * 3 + ctx) * 11 per token through calls that
+// built the band and zigzag tables on the stack). Writes the dequantised
+// coefficients in raster order into `out`, returns where it stopped:
+// after the last token, or 16 (== first: nothing).
+fn read_block(d: *mut BD, bp: u64, ctx0: i64, out: u64, dq: u64,
+    first: i64) -> i64 {
+    var n: i64 = first
+    var p: u64 = *((bp + (n * 8) as u64) as *mut u64) + (ctx0 * 11) as u64
+    while n < 16 {
+        if bd_get(d, ld8(p, 0)) == 0 {
+            return n
+        }
+        while bd_get(d, ld8(p, 1)) == 0 {
+            n = n + 1
+            if n == 16 {
+                return 16
+            }
+            p = *((bp + (n * 8) as u64) as *mut u64)
+        }
+        let pn: u64 = *((bp + ((n + 1) * 8) as u64) as *mut u64)
+        var v: i64 = 1
+        if bd_get(d, ld8(p, 2)) == 0 {
+            p = pn + 11
+        } else {
+            v = read_large(d, p)
+            p = pn + 22
+        }
+        if bd_get(d, 128) == 1 {
+            v = 0 - v
+        }
+        if n > 0 {
+            v = v * *((dq + 8) as *mut i64)
+        } else {
+            v = v * *(dq as *mut i64)
+        }
+        sti(out, ZIGZAG[n as usize] as usize, s16(v))
+        n = n + 1
+    }
+    return 16
+}
+
+// ---- transforms (idct_add.c)
+// vp8_dixie_walsh: the 16 Y2 coefficients at `y2` (contiguous) become the
+// DC of the 16 Y blocks (every 16th cell from `co`). Values are shorts in
+// the original, so every stored result wraps to 16 bits.
+fn walsh(y2: u64, co: u64) {
+    var t: [i64; 16] = [0; 16]
+    var i: usize = 0
+    while i < 4 {
+        let a1: i64 = ldi(y2, i) + ldi(y2, 12 + i)
+        let b1: i64 = ldi(y2, 4 + i) + ldi(y2, 8 + i)
+        let c1: i64 = ldi(y2, 4 + i) - ldi(y2, 8 + i)
+        let d1: i64 = ldi(y2, i) - ldi(y2, 12 + i)
+        t[i] = s16(a1 + b1)
+        t[4 + i] = s16(c1 + d1)
+        t[8 + i] = s16(a1 - b1)
+        t[12 + i] = s16(d1 - c1)
+        i = i + 1
+    }
+    i = 0
+    while i < 4 {
+        let a1: i64 = t[4 * i] + t[4 * i + 3]
+        let b1: i64 = t[4 * i + 1] + t[4 * i + 2]
+        let c1: i64 = t[4 * i + 1] - t[4 * i + 2]
+        let d1: i64 = t[4 * i] - t[4 * i + 3]
+        let a2: i64 = a1 + b1
+        let b2: i64 = c1 + d1
+        let c2: i64 = a1 - b1
+        let d2: i64 = d1 - c1
+        sti(co, (4 * i) * 16, s16((a2 + 3) >> 3))
+        sti(co, (4 * i + 1) * 16, s16((b2 + 3) >> 3))
+        sti(co, (4 * i + 2) * 16, s16((c2 + 3) >> 3))
+        sti(co, (4 * i + 3) * 16, s16((d2 + 3) >> 3))
+        i = i + 1
+    }
+}
+
+fn mul35468(v: i64) -> i64 {
+    return (v * 35468) >> 16
+}
+
+fn mul20091(v: i64) -> i64 {
+    return v + ((v * 20091) >> 16)
+}
+
+// the low 16 bits, sign-extended (a C `short`)
+fn s16(v: i64) -> i64 {
+    return (v << 48) >> 48
+}
+
+// ---- the inverse DCT of one 4x4 block: the reference's
+// vp8_dixie_idct_add (= libwebp dec.c TransformOne_C for every stream that
+// is not broken), the results of the first pass wrapped to 16 bits.
+//
+// ROUND WEBP-TEMPO: a block is transformed only when it has something to
+// add. libwebp keeps two bits per block for that (NzCodeBits); here the
+// token reader's end position says it: past index 1 -> the full
+// transform, else only the DC (every pixel gets (dc + 4) >> 3), else
+// nothing. Before, every block ran the full transform through calls to
+// ldi/mul/s16/clamp255 (1 049 instructions a block, 99 per pixel).
+fn addpx(r: u64, i: usize, dv: i64) {
+    var v: i64 = ld8(r, i) + dv
+    if (v & (0 - 256)) != 0 {
+        // below 0 -> 0, above 255 -> 255, without a second branch
+        v = ((0 - 1 - v) >> 63) & 255
+    }
+    st8(r, i, v)
+}
+
+fn idct_full(px: u64, st: i64, co: u64) {
+    // vertical pass, one column at a time: tRC = row R, column C. The
+    // results are shorts as in the reference (and in libwebp's SIMD
+    // versions, which work in 16-bit lanes): a damaged stream can carry
+    // coefficients that overflow here, and then only the wrap gives the
+    // picture Chromium shows.
+    let a0: i64 = ldi(co, 0) + ldi(co, 8)
+    let b0: i64 = ldi(co, 0) - ldi(co, 8)
+    let c0: i64 = mul35468(ldi(co, 4)) - mul20091(ldi(co, 12))
+    let d0: i64 = mul20091(ldi(co, 4)) + mul35468(ldi(co, 12))
+    let a1: i64 = ldi(co, 1) + ldi(co, 9)
+    let b1: i64 = ldi(co, 1) - ldi(co, 9)
+    let c1: i64 = mul35468(ldi(co, 5)) - mul20091(ldi(co, 13))
+    let d1: i64 = mul20091(ldi(co, 5)) + mul35468(ldi(co, 13))
+    let a2: i64 = ldi(co, 2) + ldi(co, 10)
+    let b2: i64 = ldi(co, 2) - ldi(co, 10)
+    let c2: i64 = mul35468(ldi(co, 6)) - mul20091(ldi(co, 14))
+    let d2: i64 = mul20091(ldi(co, 6)) + mul35468(ldi(co, 14))
+    let a3: i64 = ldi(co, 3) + ldi(co, 11)
+    let b3: i64 = ldi(co, 3) - ldi(co, 11)
+    let c3: i64 = mul35468(ldi(co, 7)) - mul20091(ldi(co, 15))
+    let d3: i64 = mul20091(ldi(co, 7)) + mul35468(ldi(co, 15))
+    // horizontal pass, one row at a time (the +4 rounds the >> 3)
+    var r: u64 = px
+    var x0: i64 = s16(a0 + d0)
+    var x1: i64 = s16(a1 + d1)
+    var x2: i64 = s16(a2 + d2)
+    var x3: i64 = s16(a3 + d3)
+    var ra: i64 = x0 + x2 + 4
+    var rb: i64 = x0 - x2 + 4
+    var rc: i64 = mul35468(x1) - mul20091(x3)
+    var rd: i64 = mul20091(x1) + mul35468(x3)
+    addpx(r, 0, (ra + rd) >> 3)
+    addpx(r, 1, (rb + rc) >> 3)
+    addpx(r, 2, (rb - rc) >> 3)
+    addpx(r, 3, (ra - rd) >> 3)
+    r = ((r as i64) + st) as u64
+    x0 = s16(b0 + c0)
+    x1 = s16(b1 + c1)
+    x2 = s16(b2 + c2)
+    x3 = s16(b3 + c3)
+    ra = x0 + x2 + 4
+    rb = x0 - x2 + 4
+    rc = mul35468(x1) - mul20091(x3)
+    rd = mul20091(x1) + mul35468(x3)
+    addpx(r, 0, (ra + rd) >> 3)
+    addpx(r, 1, (rb + rc) >> 3)
+    addpx(r, 2, (rb - rc) >> 3)
+    addpx(r, 3, (ra - rd) >> 3)
+    r = ((r as i64) + st) as u64
+    x0 = s16(b0 - c0)
+    x1 = s16(b1 - c1)
+    x2 = s16(b2 - c2)
+    x3 = s16(b3 - c3)
+    ra = x0 + x2 + 4
+    rb = x0 - x2 + 4
+    rc = mul35468(x1) - mul20091(x3)
+    rd = mul20091(x1) + mul35468(x3)
+    addpx(r, 0, (ra + rd) >> 3)
+    addpx(r, 1, (rb + rc) >> 3)
+    addpx(r, 2, (rb - rc) >> 3)
+    addpx(r, 3, (ra - rd) >> 3)
+    r = ((r as i64) + st) as u64
+    x0 = s16(a0 - d0)
+    x1 = s16(a1 - d1)
+    x2 = s16(a2 - d2)
+    x3 = s16(a3 - d3)
+    ra = x0 + x2 + 4
+    rb = x0 - x2 + 4
+    rc = mul35468(x1) - mul20091(x3)
+    rd = mul20091(x1) + mul35468(x3)
+    addpx(r, 0, (ra + rd) >> 3)
+    addpx(r, 1, (rb + rc) >> 3)
+    addpx(r, 2, (rb - rc) >> 3)
+    addpx(r, 3, (ra - rd) >> 3)
+}
+
+fn idct_dc(px: u64, st: i64, dc: i64) {
+    let d: i64 = (dc + 4) >> 3
+    var r: u64 = px
+    var y: i64 = 0
+    while y < 4 {
+        addpx(r, 0, d)
+        addpx(r, 1, d)
+        addpx(r, 2, d)
+        addpx(r, 3, d)
+        r = ((r as i64) + st) as u64
+        y = y + 1
+    }
+}
+
+// One block into the picture, then its coefficients back to zero (the
+// buffer is zero between blocks, so a macroblock no longer clears all
+// 400 cells up front). `c` = where the token reader stopped.
+fn recon_block(px: u64, st: i64, co: u64, c: i64) {
+    if c > 1 {
+        idct_full(px, st, co)
+        var k: u64 = 0
+        while k < 64 {
+            *((co + k) as *mut u64) = 0
+            k = k + 8
+        }
+    } else {
+        let dc: i64 = ldi(co, 0)
+        if dc != 0 {
+            idct_dc(px, st, dc)
+            sti(co, 0, 0)
+        }
+    }
+}
+
+// ---- intra prediction (predict.c). `p` is the top-left pixel of the
+// block, `st` the row stride; the row above and the column to the left
+// are always readable (frame border).
+fn at(p: u64, st: i64, x: i64, y: i64) -> i64 {
+    return ld8o(p, y * st + x)
+}
+
+fn put(p: u64, st: i64, x: i64, y: i64, v: i64) {
+    st8o(p, y * st + x, v)
+}
+
+// ROUND WEBP-TEMPO: the 16x16, 8x8 and 4x4 fills write whole rows
+// (two 64-bit words, one, or one 32-bit word) instead of single octets
+// through at()/put(); the DC sums the row above as 64-bit words.
+fn fill_row(r: u64, n: i64, v8: u64) {
+    if n == 16 {
+        *(r as *mut u64) = v8
+        *((r + 8) as *mut u64) = v8
+    } else if n == 8 {
+        *(r as *mut u64) = v8
+    } else {
+        *(r as *mut u32) = (v8 & 4294967295) as u32
+    }
+}
+
+// the sum of the eight octets of x
+fn hsum8(x: u64) -> i64 {
+    let t: u64 = (x & 71777214294589695) + ((x >> 8) & 71777214294589695)
+    // four 16-bit lanes (each <= 510) folded by shifts; a multiply by
+    // 0x0001000100010001 would wrap, and release-safe builds trap on that
+    let u: u64 = t + (t >> 32)
+    return ((u + (u >> 16)) & 65535) as i64
+}
+
+fn pred_h(p: u64, st: i64, n: i64) {
+    var r: i64 = p as i64
+    var i: i64 = 0
+    while i < n {
+        let l: u64 = (*((r - 1) as u64 as *mut u8)) as u64
+        fill_row(r as u64, n, l * 72340172838076673)
+        r = r + st
+        i = i + 1
+    }
+}
+
+fn pred_v(p: u64, st: i64, n: i64) {
+    let top: i64 = (p as i64) - st
+    let a: u64 = *(top as u64 as *mut u64)
+    var b: u64 = 0
+    if n == 16 {
+        b = *((top + 8) as u64 as *mut u64)
+    }
+    var r: i64 = p as i64
+    var i: i64 = 0
+    while i < n {
+        if n == 16 {
+            *(r as u64 as *mut u64) = a
+            *((r + 8) as u64 as *mut u64) = b
+        } else if n == 8 {
+            *(r as u64 as *mut u64) = a
+        } else {
+            *(r as u64 as *mut u32) = a as u32
+        }
+        r = r + st
+        i = i + 1
+    }
+}
+
+// TrueMotion: clip(above[x] + left[y] - corner), the clip from the loop
+// filter's table (the sum lies in -255 .. 510)
+fn pred_tm(p: u64, st: i64, n: i64) {
+    let t: i64 = (&G_LF[0]) as u64 as i64
+    let top: i64 = (p as i64) - st
+    let tl: i64 = lpx(top - 1)
+    var r: i64 = p as i64
+    var i: i64 = 0
+    while i < n {
+        let d: i64 = lpx(r - 1) - tl
+        var j: i64 = 0
+        while j < n {
+            lset(r + j, tcl1(t, lpx(top + j) + d))
+            j = j + 1
+        }
+        r = r + st
+        i = i + 1
+    }
+}
+
+fn pred_dc(p: u64, st: i64, n: i64) {
+    let top: i64 = (p as i64) - st
+    var dc: i64 = 0
+    if n == 4 {
+        dc = hsum8((*(top as u64 as *mut u32)) as u64)
+    } else {
+        dc = hsum8(*(top as u64 as *mut u64))
+        if n == 16 {
+            dc = dc + hsum8(*((top + 8) as u64 as *mut u64))
+        }
+    }
+    var r: i64 = (p as i64) - 1
+    var i: i64 = 0
+    while i < n {
+        dc = dc + lpx(r)
+        r = r + st
+        i = i + 1
+    }
+    var sh: i64 = 3
+    if n == 16 {
+        sh = 5
+    } else if n == 8 {
+        sh = 4
+    }
+    dc = (dc + (1 << (sh - 1))) >> sh
+    let v8: u64 = (dc as u64) * 72340172838076673
+    r = p as i64
+    i = 0
+    while i < n {
+        fill_row(r as u64, n, v8)
+        r = r + st
+        i = i + 1
+    }
+}
+
+fn avg3(a: i64, b: i64, c: i64) -> i64 {
+    return (a + 2 * b + c + 2) >> 2
+}
+
+fn avg2(a: i64, b: i64) -> i64 {
+    return (a + b + 1) >> 1
+}
+
+// the ten 4x4 modes; A[i] = above row (A[-1] = corner), L[i] = left column
+fn pred_b(p: u64, st: i64, mode: i64) {
+    if mode == 0 {
+        pred_dc(p, st, 4)
+        return
+    }
+    if mode == 1 {
+        pred_tm(p, st, 4)
+        return
+    }
+    var a: [i64; 9] = [0; 9]
+    var l: [i64; 4] = [0; 4]
+    var k: i64 = 0
+    while k < 9 {
+        a[k as usize] = at(p, st, k - 1, 0 - 1)
+        k = k + 1
+    }
+    k = 0
+    while k < 4 {
+        l[k as usize] = at(p, st, 0 - 1, k)
+        k = k + 1
+    }
+    // a[0] = corner, a[1..8] = above[0..7]
+    var o: [i64; 16] = [0; 16]
+    if mode == 2 {
+        // VE
+        var j: usize = 0
+        while j < 4 {
+            let v: i64 = avg3(a[j], a[j + 1], a[j + 2])
+            o[j] = v
+            o[4 + j] = v
+            o[8 + j] = v
+            o[12 + j] = v
+            j = j + 1
+        }
+    } else if mode == 3 {
+        // HE
+        let r0: i64 = avg3(a[0], l[0], l[1])
+        let r1: i64 = avg3(l[0], l[1], l[2])
+        let r2: i64 = avg3(l[1], l[2], l[3])
+        let r3: i64 = avg3(l[2], l[3], l[3])
+        var j: usize = 0
+        while j < 4 {
+            o[j] = r0
+            o[4 + j] = r1
+            o[8 + j] = r2
+            o[12 + j] = r3
+            j = j + 1
+        }
+    } else if mode == 4 {
+        // LD: above[0..7] = a[1..8]
+        let p0: i64 = avg3(a[1], a[2], a[3])
+        let p1: i64 = avg3(a[2], a[3], a[4])
+        let p2: i64 = avg3(a[3], a[4], a[5])
+        let p3: i64 = avg3(a[4], a[5], a[6])
+        let p4: i64 = avg3(a[5], a[6], a[7])
+        let p5: i64 = avg3(a[6], a[7], a[8])
+        let p6: i64 = avg3(a[7], a[8], a[8])
+        o[0] = p0
+        o[1] = p1
+        o[2] = p2
+        o[3] = p3
+        o[4] = p1
+        o[5] = p2
+        o[6] = p3
+        o[7] = p4
+        o[8] = p2
+        o[9] = p3
+        o[10] = p4
+        o[11] = p5
+        o[12] = p3
+        o[13] = p4
+        o[14] = p5
+        o[15] = p6
+    } else if mode == 5 {
+        // RD
+        let p0: i64 = avg3(l[0], a[0], a[1])
+        let p1: i64 = avg3(a[0], a[1], a[2])
+        let p2: i64 = avg3(a[1], a[2], a[3])
+        let p3: i64 = avg3(a[2], a[3], a[4])
+        let p4: i64 = avg3(l[1], l[0], a[0])
+        let p5: i64 = avg3(l[2], l[1], l[0])
+        let p6: i64 = avg3(l[3], l[2], l[1])
+        o[0] = p0
+        o[1] = p1
+        o[2] = p2
+        o[3] = p3
+        o[4] = p4
+        o[5] = p0
+        o[6] = p1
+        o[7] = p2
+        o[8] = p5
+        o[9] = p4
+        o[10] = p0
+        o[11] = p1
+        o[12] = p6
+        o[13] = p5
+        o[14] = p4
+        o[15] = p0
+    } else if mode == 6 {
+        // VR
+        let p0: i64 = avg2(a[0], a[1])
+        let p1: i64 = avg2(a[1], a[2])
+        let p2: i64 = avg2(a[2], a[3])
+        let p3: i64 = avg2(a[3], a[4])
+        let p4: i64 = avg3(l[0], a[0], a[1])
+        let p5: i64 = avg3(a[0], a[1], a[2])
+        let p6: i64 = avg3(a[1], a[2], a[3])
+        let p7: i64 = avg3(a[2], a[3], a[4])
+        let p8: i64 = avg3(l[1], l[0], a[0])
+        let p9: i64 = avg3(l[2], l[1], l[0])
+        o[0] = p0
+        o[1] = p1
+        o[2] = p2
+        o[3] = p3
+        o[4] = p4
+        o[5] = p5
+        o[6] = p6
+        o[7] = p7
+        o[8] = p8
+        o[9] = p0
+        o[10] = p1
+        o[11] = p2
+        o[12] = p9
+        o[13] = p4
+        o[14] = p5
+        o[15] = p6
+    } else if mode == 7 {
+        // VL
+        let p0: i64 = avg2(a[1], a[2])
+        let p1: i64 = avg2(a[2], a[3])
+        let p2: i64 = avg2(a[3], a[4])
+        let p3: i64 = avg2(a[4], a[5])
+        let p4: i64 = avg3(a[1], a[2], a[3])
+        let p5: i64 = avg3(a[2], a[3], a[4])
+        let p6: i64 = avg3(a[3], a[4], a[5])
+        let p7: i64 = avg3(a[4], a[5], a[6])
+        let p8: i64 = avg3(a[5], a[6], a[7])
+        let p9: i64 = avg3(a[6], a[7], a[8])
+        o[0] = p0
+        o[1] = p1
+        o[2] = p2
+        o[3] = p3
+        o[4] = p4
+        o[5] = p5
+        o[6] = p6
+        o[7] = p7
+        o[8] = p1
+        o[9] = p2
+        o[10] = p3
+        o[11] = p8
+        o[12] = p5
+        o[13] = p6
+        o[14] = p7
+        o[15] = p9
+    } else if mode == 8 {
+        // HD
+        let p0: i64 = avg2(l[0], a[0])
+        let p1: i64 = avg3(l[0], a[0], a[1])
+        let p2: i64 = avg3(a[0], a[1], a[2])
+        let p3: i64 = avg3(a[1], a[2], a[3])
+        let p4: i64 = avg2(l[1], l[0])
+        let p5: i64 = avg3(l[1], l[0], a[0])
+        let p6: i64 = avg2(l[2], l[1])
+        let p7: i64 = avg3(l[2], l[1], l[0])
+        let p8: i64 = avg2(l[3], l[2])
+        let p9: i64 = avg3(l[3], l[2], l[1])
+        o[0] = p0
+        o[1] = p1
+        o[2] = p2
+        o[3] = p3
+        o[4] = p4
+        o[5] = p5
+        o[6] = p0
+        o[7] = p1
+        o[8] = p6
+        o[9] = p7
+        o[10] = p4
+        o[11] = p5
+        o[12] = p8
+        o[13] = p9
+        o[14] = p6
+        o[15] = p7
+    } else {
+        // HU
+        let p0: i64 = avg2(l[0], l[1])
+        let p1: i64 = avg3(l[0], l[1], l[2])
+        let p2: i64 = avg2(l[1], l[2])
+        let p3: i64 = avg3(l[1], l[2], l[3])
+        let p4: i64 = avg2(l[2], l[3])
+        let p5: i64 = avg3(l[2], l[3], l[3])
+        let p6: i64 = l[3]
+        o[0] = p0
+        o[1] = p1
+        o[2] = p2
+        o[3] = p3
+        o[4] = p2
+        o[5] = p3
+        o[6] = p4
+        o[7] = p5
+        o[8] = p4
+        o[9] = p5
+        o[10] = p6
+        o[11] = p6
+        o[12] = p6
+        o[13] = p6
+        o[14] = p6
+        o[15] = p6
+    }
+    var r: i64 = p as i64
+    var y: usize = 0
+    while y < 16 {
+        *(r as u64 as *mut u32) = (o[y] | (o[y + 1] << 8) | (o[y + 2] << 16)
+            | (o[y + 3] << 24)) as u32
+        r = r + st
+        y = y + 4
+    }
+}
+
+// ---- loop filter, libwebp's C version (dsp/dec.c FilterLoop26/24,
+// DoFilter2/4/6, NeedsFilter2, Hev) with its clip tables
+// (dec_clip_tables.c): the same decisions and values as the reference's
+// dixie_loopfilter.c, which this file followed before.
+//
+// ROUND WEBP-TEMPO: one function per kind of edge walks all 16 (or 8)
+// positions itself; before, every position went through three to four
+// calls (lf_normal_thr -> lf_simple_thr, lf_hev, lf_common/lf_mb_edge)
+// with branchy clamps -- 87 instructions a pixel. `q` is the first pixel
+// after the edge, `hs` the step across the edge (1 for a vertical edge,
+// the stride for a horizontal one), `vs` the step along it.
+//
+// G_LF in bytes: abs0 at 0 (index 255 + d, d in -255 .. 255), sclip1 at
+// 512 (1532 + d, -1020 .. 1020 -> -128 .. 127), sclip2 at 2560 (2672 + d,
+// -112 .. 112 -> -16 .. 15), clip1 at 2816 (3071 + d, -255 .. 510 ->
+// 0 .. 255).
+static mut G_LF_OK: bool = false
+static mut G_LF: [u8; 3584] = [0 as u8; 3584]
+
+fn lf_init() {
+    if G_LF_OK {
+        return
+    }
+    var d: i64 = 0 - 1020
+    while d <= 1020 {
+        if d >= 0 - 255 && d <= 255 {
+            G_LF[(255 + d) as usize] = iabs(d) as u8
+        }
+        var c1: i64 = d
+        if c1 < 0 - 128 {
+            c1 = 0 - 128
+        }
+        if c1 > 127 {
+            c1 = 127
+        }
+        G_LF[(1532 + d) as usize] = (c1 & 255) as u8
+        if d >= 0 - 112 && d <= 112 {
+            var c2: i64 = d
+            if c2 < 0 - 16 {
+                c2 = 0 - 16
+            }
+            if c2 > 15 {
+                c2 = 15
+            }
+            G_LF[(2672 + d) as usize] = (c2 & 255) as u8
+        }
+        if d >= 0 - 255 && d <= 510 {
+            G_LF[(3071 + d) as usize] = clamp255(d) as u8
+        }
+        d = d + 1
+    }
+    G_LF_OK = true
+}
+
+fn lpx(a: i64) -> i64 {
+    return (*(a as u64 as *mut u8)) as i64
+}
+
+fn lset(a: i64, v: i64) {
+    *(a as u64 as *mut u8) = (v & 255) as u8
+}
+
+fn tabs(t: i64, d: i64) -> i64 {
+    return (*((t + 255 + d) as u64 as *mut u8)) as i64
+}
+
+fn tsc1(t: i64, d: i64) -> i64 {
+    return (*((t + 1532 + d) as u64 as *mut i8)) as i64
+}
+
+fn tsc2(t: i64, d: i64) -> i64 {
+    return (*((t + 2672 + d) as u64 as *mut i8)) as i64
+}
+
+fn tcl1(t: i64, d: i64) -> i64 {
+    return (*((t + 3071 + d) as u64 as *mut u8)) as i64
+}
+
+// ROUND WEBP-TEMPO: a flat stretch changes nothing. When the pixels on
+// both sides of the edge are all equal, every filter above computes
+// a = 0 (DoFilter2/4/6 alike, and the thresholds pass), i.e. writes the
+// same values back. Illustrations and screenshots are full of such
+// stretches, so they are recognised first -- across a horizontal edge by
+// comparing the rows as 64-bit words (all positions of the edge at
+// once), across a vertical edge by the eight octets of one position as
+// one 64-bit word.
+fn lf_flat8(q: i64) -> bool {
+    let x: u64 = *((q - 4) as u64 as *mut u64)
+    return x == (x & 255) * 72340172838076673
+}
+
+fn lf_flat4(q: i64) -> bool {
+    let x: u64 = (*((q - 2) as u64 as *mut u32)) as u64
+    return x == (x & 255) * 16843009
+}
+
+// DoFilter2: the simple filter and the high edge variance case
+fn lf_do2(t: i64, q: i64, hs: i64) {
+    let p1: i64 = lpx(q - 2 * hs)
+    let p0: i64 = lpx(q - hs)
+    let q0: i64 = lpx(q)
+    let q1: i64 = lpx(q + hs)
+    let a: i64 = 3 * (q0 - p0) + tsc1(t, p1 - q1)
+    let a1: i64 = tsc2(t, (a + 4) >> 3)
+    let a2: i64 = tsc2(t, (a + 3) >> 3)
+    lset(q - hs, tcl1(t, p0 + a2))
+    lset(q, tcl1(t, q0 - a1))
+}
+
+// the simple filter over 16 positions
+fn lf_simple(p: u64, hs: i64, vs: i64, thresh: i64) {
+    if hs != 1 && lf_rows_diff(p, hs, 2, 0) == 0 && lf_rows_diff(p, hs, 2, 8) == 0 {
+        return
+    }
+    let t: i64 = (&G_LF[0]) as u64 as i64
+    let t2: i64 = 2 * thresh + 1
+    var q: i64 = p as i64
+    var k: i64 = 0
+    while k < 16 {
+        if hs == 1 && lf_flat4(q) {
+            q = q + vs
+            k = k + 1
+            continue
+        }
+        let p1: i64 = lpx(q - 2 * hs)
+        let p0: i64 = lpx(q - hs)
+        let q0: i64 = lpx(q)
+        let q1: i64 = lpx(q + hs)
+        if 4 * tabs(t, p0 - q0) + tabs(t, p1 - q1) <= t2 {
+            lf_do2(t, q, hs)
+        }
+        q = q + vs
+        k = k + 1
+    }
+}
+
+// the OR of the XORs of neighbouring rows -k .. k-1 over the eight
+// positions at p + off: octet j is zero when position j is flat
+fn lf_rows_diff(p: u64, st: i64, k: i64, off: i64) -> u64 {
+    var q: i64 = (p as i64) - k * st + off
+    var prev: u64 = *(q as u64 as *mut u64)
+    var acc: u64 = 0
+    var j: i64 = 1
+    while j < 2 * k {
+        q = q + st
+        let cur: u64 = *(q as u64 as *mut u64)
+        acc = acc | (prev ^ cur)
+        prev = cur
+        j = j + 1
+    }
+    return acc
+}
+
+// FilterLoop26 (macroblock edge), a vertical edge: n positions down
+fn lf_mb_v(p: u64, vs: i64, n: i64, thresh: i64, it: i64, hev: i64) {
+    let hs: i64 = 1
+    let t: i64 = (&G_LF[0]) as u64 as i64
+    let t2: i64 = 2 * thresh + 1
+    var q: i64 = p as i64
+    var k: i64 = 0
+    while k < n {
+        if lf_flat8(q) {
+            q = q + vs
+            k = k + 1
+            continue
+        }
+        let p1: i64 = lpx(q - 2 * hs)
+        let p0: i64 = lpx(q - hs)
+        let q0: i64 = lpx(q)
+        let q1: i64 = lpx(q + hs)
+        if 4 * tabs(t, p0 - q0) + tabs(t, p1 - q1) <= t2 {
+            let p3: i64 = lpx(q - 4 * hs)
+            let p2: i64 = lpx(q - 3 * hs)
+            let q2: i64 = lpx(q + 2 * hs)
+            let q3: i64 = lpx(q + 3 * hs)
+            let h1: i64 = tabs(t, p1 - p0)
+            let h2: i64 = tabs(t, q1 - q0)
+            if tabs(t, p3 - p2) <= it && tabs(t, p2 - p1) <= it && h1 <= it
+                && tabs(t, q3 - q2) <= it && tabs(t, q2 - q1) <= it && h2 <= it {
+                if h1 > hev || h2 > hev {
+                    lf_do2(t, q, hs)
+                } else {
+                    // DoFilter6
+                    let w: i64 = tsc1(t, 3 * (q0 - p0) + tsc1(t, p1 - q1))
+                    let a1: i64 = (27 * w + 63) >> 7
+                    let a2: i64 = (18 * w + 63) >> 7
+                    let a3: i64 = (9 * w + 63) >> 7
+                    lset(q - 3 * hs, tcl1(t, p2 + a3))
+                    lset(q - 2 * hs, tcl1(t, p1 + a2))
+                    lset(q - hs, tcl1(t, p0 + a1))
+                    lset(q, tcl1(t, q0 - a1))
+                    lset(q + hs, tcl1(t, q1 - a2))
+                    lset(q + 2 * hs, tcl1(t, q2 - a3))
+                }
+            }
+        }
+        q = q + vs
+        k = k + 1
+    }
+}
+
+// FilterLoop26, a horizontal edge: n positions to the right
+fn lf_mb_h(p: u64, hs: i64, n: i64, thresh: i64, it: i64, hev: i64) {
+    // the rows p3 .. q3 compared as 64-bit words: a zero octet in the
+    // mask = a flat position
+    let m0: u64 = lf_rows_diff(p, hs, 4, 0)
+    var m1: u64 = 0
+    if n == 16 {
+        m1 = lf_rows_diff(p, hs, 4, 8)
+    }
+    if m0 == 0 && m1 == 0 {
+        return
+    }
+    let t: i64 = (&G_LF[0]) as u64 as i64
+    let t2: i64 = 2 * thresh + 1
+    var q: i64 = p as i64
+    var k: i64 = 0
+    while k < n {
+        var m: u64 = m0
+        if k >= 8 {
+            m = m1
+        }
+        if ((m >> (((k & 7) * 8) as u64)) & 255) == 0 {
+            q = q + 1
+            k = k + 1
+            continue
+        }
+        let p1: i64 = lpx(q - 2 * hs)
+        let p0: i64 = lpx(q - hs)
+        let q0: i64 = lpx(q)
+        let q1: i64 = lpx(q + hs)
+        if 4 * tabs(t, p0 - q0) + tabs(t, p1 - q1) <= t2 {
+            let p3: i64 = lpx(q - 4 * hs)
+            let p2: i64 = lpx(q - 3 * hs)
+            let q2: i64 = lpx(q + 2 * hs)
+            let q3: i64 = lpx(q + 3 * hs)
+            let h1: i64 = tabs(t, p1 - p0)
+            let h2: i64 = tabs(t, q1 - q0)
+            if tabs(t, p3 - p2) <= it && tabs(t, p2 - p1) <= it && h1 <= it
+                && tabs(t, q3 - q2) <= it && tabs(t, q2 - q1) <= it && h2 <= it {
+                if h1 > hev || h2 > hev {
+                    lf_do2(t, q, hs)
+                } else {
+                    // DoFilter6
+                    let w: i64 = tsc1(t, 3 * (q0 - p0) + tsc1(t, p1 - q1))
+                    let a1: i64 = (27 * w + 63) >> 7
+                    let a2: i64 = (18 * w + 63) >> 7
+                    let a3: i64 = (9 * w + 63) >> 7
+                    lset(q - 3 * hs, tcl1(t, p2 + a3))
+                    lset(q - 2 * hs, tcl1(t, p1 + a2))
+                    lset(q - hs, tcl1(t, p0 + a1))
+                    lset(q, tcl1(t, q0 - a1))
+                    lset(q + hs, tcl1(t, q1 - a2))
+                    lset(q + 2 * hs, tcl1(t, q2 - a3))
+                }
+            }
+        }
+        q = q + 1
+        k = k + 1
+    }
+}
+
+// FilterLoop24 (inner edge), a vertical edge
+fn lf_inner_v(p: u64, vs: i64, n: i64, thresh: i64, it: i64, hev: i64) {
+    let hs: i64 = 1
+    let t: i64 = (&G_LF[0]) as u64 as i64
+    let t2: i64 = 2 * thresh + 1
+    var q: i64 = p as i64
+    var k: i64 = 0
+    while k < n {
+        if lf_flat8(q) {
+            q = q + vs
+            k = k + 1
+            continue
+        }
+        let p1: i64 = lpx(q - 2 * hs)
+        let p0: i64 = lpx(q - hs)
+        let q0: i64 = lpx(q)
+        let q1: i64 = lpx(q + hs)
+        if 4 * tabs(t, p0 - q0) + tabs(t, p1 - q1) <= t2 {
+            let p3: i64 = lpx(q - 4 * hs)
+            let p2: i64 = lpx(q - 3 * hs)
+            let q2: i64 = lpx(q + 2 * hs)
+            let q3: i64 = lpx(q + 3 * hs)
+            let h1: i64 = tabs(t, p1 - p0)
+            let h2: i64 = tabs(t, q1 - q0)
+            if tabs(t, p3 - p2) <= it && tabs(t, p2 - p1) <= it && h1 <= it
+                && tabs(t, q3 - q2) <= it && tabs(t, q2 - q1) <= it && h2 <= it {
+                if h1 > hev || h2 > hev {
+                    lf_do2(t, q, hs)
+                } else {
+                    // DoFilter4
+                    let a: i64 = 3 * (q0 - p0)
+                    let a1: i64 = tsc2(t, (a + 4) >> 3)
+                    let a2: i64 = tsc2(t, (a + 3) >> 3)
+                    let a3: i64 = (a1 + 1) >> 1
+                    lset(q - 2 * hs, tcl1(t, p1 + a3))
+                    lset(q - hs, tcl1(t, p0 + a2))
+                    lset(q, tcl1(t, q0 - a1))
+                    lset(q + hs, tcl1(t, q1 - a3))
+                }
+            }
+        }
+        q = q + vs
+        k = k + 1
+    }
+}
+
+// FilterLoop24, a horizontal edge
+fn lf_inner_h(p: u64, hs: i64, n: i64, thresh: i64, it: i64, hev: i64) {
+    // the rows p3 .. q3 compared as 64-bit words: a zero octet in the
+    // mask = a flat position
+    let m0: u64 = lf_rows_diff(p, hs, 4, 0)
+    var m1: u64 = 0
+    if n == 16 {
+        m1 = lf_rows_diff(p, hs, 4, 8)
+    }
+    if m0 == 0 && m1 == 0 {
+        return
+    }
+    let t: i64 = (&G_LF[0]) as u64 as i64
+    let t2: i64 = 2 * thresh + 1
+    var q: i64 = p as i64
+    var k: i64 = 0
+    while k < n {
+        var m: u64 = m0
+        if k >= 8 {
+            m = m1
+        }
+        if ((m >> (((k & 7) * 8) as u64)) & 255) == 0 {
+            q = q + 1
+            k = k + 1
+            continue
+        }
+        let p1: i64 = lpx(q - 2 * hs)
+        let p0: i64 = lpx(q - hs)
+        let q0: i64 = lpx(q)
+        let q1: i64 = lpx(q + hs)
+        if 4 * tabs(t, p0 - q0) + tabs(t, p1 - q1) <= t2 {
+            let p3: i64 = lpx(q - 4 * hs)
+            let p2: i64 = lpx(q - 3 * hs)
+            let q2: i64 = lpx(q + 2 * hs)
+            let q3: i64 = lpx(q + 3 * hs)
+            let h1: i64 = tabs(t, p1 - p0)
+            let h2: i64 = tabs(t, q1 - q0)
+            if tabs(t, p3 - p2) <= it && tabs(t, p2 - p1) <= it && h1 <= it
+                && tabs(t, q3 - q2) <= it && tabs(t, q2 - q1) <= it && h2 <= it {
+                if h1 > hev || h2 > hev {
+                    lf_do2(t, q, hs)
+                } else {
+                    // DoFilter4
+                    let a: i64 = 3 * (q0 - p0)
+                    let a1: i64 = tsc2(t, (a + 4) >> 3)
+                    let a2: i64 = tsc2(t, (a + 3) >> 3)
+                    let a3: i64 = (a1 + 1) >> 1
+                    lset(q - 2 * hs, tcl1(t, p1 + a3))
+                    lset(q - hs, tcl1(t, p0 + a2))
+                    lset(q, tcl1(t, q0 - a1))
+                    lset(q + hs, tcl1(t, q1 - a3))
+                }
+            }
+        }
+        q = q + 1
+        k = k + 1
+    }
+}
+
+// ---- the frame
+struct Vp8 {
+    w: i64,
+    h: i64,
+    mbw: i64,
+    mbh: i64,
+    // planes with a border; y/u/v point at pixel (0, 0)
+    ybuf: u64,
+    ybytes: usize,
+    y: u64,
+    ys: i64,
+    ubuf: u64,
+    vbuf: u64,
+    uvbytes: usize,
+    u: u64,
+    v: u64,
+    uvs: i64,
+    // headers
+    seg_on: i64,
+    seg_map: i64,
+    seg_abs: i64,
+    seg_q: [i64; 4],
+    seg_lf: [i64; 4],
+    seg_p: [i64; 3],
+    lf_simple: i64,
+    lf_level: i64,
+    lf_sharp: i64,
+    lf_delta: i64,
+    ref_delta: [i64; 4],
+    mode_delta: [i64; 4],
+    skip_on: i64,
+    skip_p: i64,
+    // dequant factors per segment: y1dc y1ac y2dc y2ac uvdc uvac
+    dq: [i64; 24],
+    probs: u64,
+    tables: u64,
+    mbi: u64,
+    mbin: usize,
+}
+
+const MBI_CELLS: usize = 24
+const BORDER: i64 = 32
+
+fn dcq(t: u64, q: i64) -> i64 {
+    var k: i64 = q
+    if k < 0 {
+        k = 0
+    }
+    if k > 127 {
+        k = 127
+    }
+    return ld8(t, T_DCQ + (k * 2) as usize) | (ld8(t, T_DCQ + (k * 2 + 1) as usize) << 8)
+}
+
+fn acq(t: u64, q: i64) -> i64 {
+    var k: i64 = q
+    if k < 0 {
+        k = 0
+    }
+    if k > 127 {
+        k = 127
+    }
+    return ld8(t, T_ACQ + (k * 2) as usize) | (ld8(t, T_ACQ + (k * 2 + 1) as usize) << 8)
+}
+
+fn mbi_at(f: *mut Vp8, row: i64, col: i64) -> u64 {
+    return (*f).mbi + (((row + 1) * ((*f).mbw + 1) + (col + 1)) as usize
+        * MBI_CELLS * 4) as u64
+}
+
+// fixup_left: the column left of the frame is 129, except for DC_PRED
+// below row 0, where it copies the row above (DC then averages the top)
+fn fixup_left(p: u64, st: i64, n: i64, row: i64, mode: i64) {
+    if mode == M_DC && row > 0 {
+        var i: i64 = 0
+        while i < n {
+            put(p, st, 0 - 1, i, at(p, st, i, 0 - 1))
+            i = i + 1
+        }
+    } else {
+        var i: i64 = 0 - 1
+        while i < n {
+            put(p, st, 0 - 1, i, 129)
+            i = i + 1
+        }
+    }
+}
+
+// fixup_above: the row above the frame is 127, except for DC_PRED right
+// of column 0, where it copies the left column
+fn fixup_above(p: u64, st: i64, n: i64, col: i64, mode: i64) {
+    if mode == M_DC && col > 0 {
+        var i: i64 = 0
+        while i < n {
+            put(p, st, i, 0 - 1, at(p, st, 0 - 1, i))
+            i = i + 1
+        }
+    } else {
+        var i: i64 = 0 - 1
+        while i < n {
+            put(p, st, i, 0 - 1, 127)
+            i = i + 1
+        }
+    }
+    var k: i64 = 0
+    while k < 4 {
+        put(p, st, n + k, 0 - 1, 127)
+        k = k + 1
+    }
+}
+
+fn vp8_free(f: *mut Vp8) {
+    free((*f).ybuf, (*f).ybytes)
+    free((*f).ubuf, (*f).uvbytes)
+    free((*f).vbuf, (*f).uvbytes)
+    free((*f).probs, 1056)
+    free((*f).tables, T_LEN)
+    free((*f).mbi, (*f).mbin)
+}
+
+fn decode_vp8_frame(src: u64, n: usize, f: *mut Vp8) -> bool {
+    if n < 10 {
+        return false
+    }
+    let tag: i64 = le24(src, 0)
+    if (tag & 1) != 0 {
+        return false
+    }
+    let part0: i64 = (tag >> 5) & 524287
+    if ld8(src, 3) != 157 || ld8(src, 4) != 1 || ld8(src, 5) != 42 {
+        return false
+    }
+    (*f).w = (ld8(src, 6) | (ld8(src, 7) << 8)) & 16383
+    (*f).h = (ld8(src, 8) | (ld8(src, 9) << 8)) & 16383
+    if (*f).w == 0 || (*f).h == 0 {
+        return false
+    }
+    if 10 + part0 > n as i64 {
+        return false
+    }
+    (*f).mbw = ((*f).w + 15) / 16
+    (*f).mbh = ((*f).h + 15) / 16
+    let mbw: i64 = (*f).mbw
+    let mbh: i64 = (*f).mbh
+    // planes
+    (*f).ys = mbw * 16 + 2 * BORDER
+    (*f).ybytes = ((*f).ys * (mbh * 16 + 2 * BORDER)) as usize
+    (*f).ybuf = alloc((*f).ybytes)
+    (*f).uvs = mbw * 8 + 2 * BORDER
+    (*f).uvbytes = ((*f).uvs * (mbh * 8 + 2 * BORDER)) as usize
+    (*f).ubuf = alloc((*f).uvbytes)
+    (*f).vbuf = alloc((*f).uvbytes)
+    (*f).probs = alloc(1056)
+    (*f).tables = alloc(T_LEN)
+    (*f).mbin = ((mbw + 1) * (mbh + 1)) as usize * MBI_CELLS * 4
+    (*f).mbi = alloc((*f).mbin)
+    if (*f).ybuf == 0 || (*f).ubuf == 0 || (*f).vbuf == 0 || (*f).probs == 0
+    || (*f).tables == 0 || (*f).mbi == 0 {
+        return false
+    }
+    (*f).y = (*f).ybuf + (BORDER * (*f).ys + BORDER) as u64
+    (*f).u = (*f).ubuf + (BORDER * (*f).uvs + BORDER) as u64
+    (*f).v = (*f).vbuf + (BORDER * (*f).uvs + BORDER) as u64
+    tables_fill((*f).tables)
+    lf_init()
+    let tb: u64 = (*f).tables
+    var i: usize = 0
+    while i < 1056 {
+        st8((*f).probs, i, ld8(tb, T_DEF + i))
+        i = i + 1
+    }
+    // ---- the first partition: frame header (decode_frame)
+    var d0: BD = bd_new()
+    bd_init(&d0, src + 10, part0 as usize)
+    let d: *mut BD = &d0
+    let cs: i64 = bd_uint(d, 2)
+    if cs < 0 {
+        return false
+    }
+    // segmentation
+    (*f).seg_on = bd_bit(d)
+    (*f).seg_map = 0
+    (*f).seg_abs = 0
+    var k: usize = 0
+    while k < 4 {
+        (*f).seg_q[k] = 0
+        (*f).seg_lf[k] = 0
+        k = k + 1
+    }
+    (*f).seg_p[0] = 255
+    (*f).seg_p[1] = 255
+    (*f).seg_p[2] = 255
+    if (*f).seg_on == 1 {
+        (*f).seg_map = bd_bit(d)
+        let upd_data: i64 = bd_bit(d)
+        if upd_data == 1 {
+            (*f).seg_abs = bd_bit(d)
+            k = 0
+            while k < 4 {
+                (*f).seg_q[k] = bd_maybe_int(d, 7)
+                k = k + 1
+            }
+            k = 0
+            while k < 4 {
+                (*f).seg_lf[k] = bd_maybe_int(d, 6)
+                k = k + 1
+            }
+        }
+        if (*f).seg_map == 1 {
+            k = 0
+            while k < 3 {
+                if bd_bit(d) == 1 {
+                    (*f).seg_p[k] = bd_uint(d, 8)
+                } else {
+                    (*f).seg_p[k] = 255
+                }
+                k = k + 1
+            }
+        }
+    }
+    // loop filter
+    (*f).lf_simple = bd_bit(d)
+    (*f).lf_level = bd_uint(d, 6)
+    (*f).lf_sharp = bd_uint(d, 3)
+    (*f).lf_delta = bd_bit(d)
+    k = 0
+    while k < 4 {
+        (*f).ref_delta[k] = 0
+        (*f).mode_delta[k] = 0
+        k = k + 1
+    }
+    if (*f).lf_delta == 1 && bd_bit(d) == 1 {
+        k = 0
+        while k < 4 {
+            (*f).ref_delta[k] = bd_maybe_int(d, 6)
+            k = k + 1
+        }
+        k = 0
+        while k < 4 {
+            (*f).mode_delta[k] = bd_maybe_int(d, 6)
+            k = k + 1
+        }
+    }
+    // token partitions
+    let np: i64 = 1 << bd_uint(d, 2)
+    var pstart: i64 = 10 + part0
+    let rest: i64 = (n as i64) - pstart
+    if rest < 3 * (np - 1) {
+        return false
+    }
+    var pdata: i64 = pstart + 3 * (np - 1)
+    var left: i64 = (n as i64) - pdata
+    var parts: [BD; 8] = [bd_new(); 8]
+    var pi: i64 = 0
+    while pi < np {
+        var psz: i64 = left
+        if pi < np - 1 {
+            psz = le24(src, (pstart + 3 * pi) as usize)
+        }
+        if psz > left {
+            return false
+        }
+        bd_init(&parts[pi as usize], src + pdata as u64, psz as usize)
+        pdata = pdata + psz
+        left = left - psz
+        pi = pi + 1
+    }
+    // quantizer
+    let qi: i64 = bd_uint(d, 7)
+    let y1dc: i64 = bd_maybe_int(d, 4)
+    let y2dc: i64 = bd_maybe_int(d, 4)
+    let y2ac: i64 = bd_maybe_int(d, 4)
+    let uvdc: i64 = bd_maybe_int(d, 4)
+    let uvac: i64 = bd_maybe_int(d, 4)
+    // reference header of a key frame: only refresh_entropy_probs
+    let refresh: i64 = bd_bit(d)
+    if refresh < 0 {
+        return false
+    }
+    // coefficient probability updates
+    i = 0
+    while i < 1056 {
+        if bd_get(d, ld8(tb, T_UPD + i)) == 1 {
+            st8((*f).probs, i, bd_uint(d, 8))
+        }
+        i = i + 1
+    }
+    (*f).skip_on = bd_bit(d)
+    (*f).skip_p = 0
+    if (*f).skip_on == 1 {
+        (*f).skip_p = bd_uint(d, 8)
+    }
+    // dequant_init
+    var sgi: i64 = 0
+    while sgi < 4 {
+        var q: i64 = qi
+        if (*f).seg_on == 1 {
+            if (*f).seg_abs == 1 {
+                q = (*f).seg_q[sgi as usize]
+            } else {
+                q = q + (*f).seg_q[sgi as usize]
+            }
+        }
+        let o: usize = (sgi * 6) as usize
+        (*f).dq[o] = dcq(tb, q + y1dc)
+        (*f).dq[o + 1] = acq(tb, q)
+        (*f).dq[o + 2] = dcq(tb, q + y2dc) * 2
+        var y2a: i64 = acq(tb, q + y2ac) * 155 / 100
+        if y2a < 8 {
+            y2a = 8
+        }
+        (*f).dq[o + 3] = y2a
+        var uvd: i64 = dcq(tb, q + uvdc)
+        if uvd > 132 {
+            uvd = 132
+        }
+        (*f).dq[o + 4] = uvd
+        (*f).dq[o + 5] = acq(tb, q + uvac)
+        sgi = sgi + 1
+    }
+    // ---- the macroblocks
+    let coeffs: u64 = alloc(25 * 16 * 4)
+    let above_nz: u64 = alloc((mbw * 9 * 4) as usize)
+    var left_nz: [i32; 9] = [0; 9]
+    let lnz: u64 = (&left_nz[0]) as u64
+    var nzc: [i64; 25] = [0; 25]
+    // per block type the probabilities of each position's band (the 17th
+    // entry is only looked at after the last position)
+    var bandp: [u64; 68] = [0 as u64; 68]
+    var ti: i64 = 0
+    while ti < 4 {
+        var ni: i64 = 0
+        while ni < 17 {
+            bandp[(ti * 17 + ni) as usize] = (*f).probs
+                + ((ti * 8 + (BANDS[ni as usize] as i64)) * 33) as u64
+            ni = ni + 1
+        }
+        ti = ti + 1
+    }
+    let bpb: u64 = (&bandp[0]) as u64
+    let dqb: u64 = (&(*f).dq[0]) as u64
+    if coeffs == 0 || above_nz == 0 {
+        return false
+    }
+    let ys: i64 = (*f).ys
+    let uvs: i64 = (*f).uvs
+    var row: i64 = 0
+    while row < mbh {
+        let pd: *mut BD = &parts[(row & (np - 1)) as usize]
+        k = 0
+        while k < 9 {
+            left_nz[k] = 0
+            k = k + 1
+        }
+        // the mode cells of this row, of the row above, one macroblock apart
+        let mrow: u64 = mbi_at(f, row, 0)
+        let mstep: u64 = (MBI_CELLS * 4) as u64
+        let mup: u64 = (((*f).mbw + 1) * (MBI_CELLS * 4) as i64) as u64
+        var col: i64 = 0
+        while col < mbw {
+            let mb: u64 = mrow + (col as u64) * mstep
+            let mba: u64 = mb - mup
+            let mbl: u64 = mb - mstep
+            // modes (vp8_dixie_modemv_process_row, key frame)
+            var seg: i64 = 0
+            if (*f).seg_map == 1 {
+                if bd_get(d, (*f).seg_p[0]) == 1 {
+                    seg = 2 + bd_get(d, (*f).seg_p[2])
+                } else {
+                    seg = bd_get(d, (*f).seg_p[1])
+                }
+            }
+            var skip: i64 = 0
+            if (*f).skip_on == 1 {
+                skip = bd_get(d, (*f).skip_p)
+            }
+            let ym: i64 = read_kf_ymode(d)
+            if ym == M_B {
+                var b: i64 = 0
+                while b < 16 {
+                    var am: i64 = 0
+                    if b < 4 {
+                        am = ldi(mba, (5 + b + 12) as usize)
+                    } else {
+                        am = ldi(mb, (5 + b - 4) as usize)
+                    }
+                    var lm: i64 = 0
+                    if (b & 3) == 0 {
+                        lm = ldi(mbl, (5 + b + 3) as usize)
+                    } else {
+                        lm = ldi(mb, (5 + b - 1) as usize)
+                    }
+                    let pr: u64 = tb + (T_KFB + ((am * 10 + lm) * 9) as usize) as u64
+                    sti(mb, (5 + b) as usize, read_bmode(d, pr))
+                    b = b + 1
+                }
+            } else {
+                // neighbours only ever read the bottom row (cells 17..20)
+                // and the right column (cells 8, 12, 16, 20) of the
+                // implied 4x4 modes
+                let im: i64 = implied_bmode(ym)
+                sti(mb, 8, im)
+                sti(mb, 12, im)
+                sti(mb, 16, im)
+                sti(mb, 17, im)
+                sti(mb, 18, im)
+                sti(mb, 19, im)
+                sti(mb, 20, im)
+            }
+            let uvm: i64 = read_uvmode(d)
+            sti(mb, 0, ym)
+            sti(mb, 1, uvm)
+            sti(mb, 2, seg)
+            sti(mb, 3, skip)
+            // tokens (vp8_dixie_tokens_process_row). ROUND WEBP-TEMPO:
+            // the left/above context cells of a block follow from its row
+            // and column (no lookup tables); the left one travels along
+            // the row in a local. nzc[b] = where the reader stopped.
+            let an: u64 = above_nz + (col * 9 * 4) as u64
+            var nz: i64 = 0
+            if skip == 1 {
+                k = 0
+                while k < 8 {
+                    sti(lnz, k, 0)
+                    sti(an, k, 0)
+                    k = k + 1
+                }
+                if ym != M_B {
+                    sti(lnz, 8, 0)
+                    sti(an, 8, 0)
+                }
+            } else {
+                // y1dc y1ac y2dc y2ac uvdc uvac of this segment
+                let dqp: u64 = dqb + (seg * 48) as u64
+                var first: i64 = 0
+                var ytype: i64 = 3
+                if ym != M_B {
+                    // the Y2 block (i = 24, type 1)
+                    let ctx: i64 = ldi(lnz, 8) + ldi(an, 8)
+                    let c: i64 = read_block(pd, bpb + 136, ctx, coeffs + 1536,
+                        dqp + 16, 0)
+                    nzc[24] = c
+                    var t: i64 = 0
+                    if c != 0 {
+                        t = 1
+                    }
+                    sti(lnz, 8, t)
+                    sti(an, 8, t)
+                    nz = t
+                    first = 1
+                    ytype = 0
+                }
+                let bpy: u64 = bpb + (ytype * 136) as u64
+                var by: i64 = 0
+                while by < 4 {
+                    var l: i64 = ldi(lnz, by as usize)
+                    var bx: i64 = 0
+                    while bx < 4 {
+                        let bi: i64 = by * 4 + bx
+                        let c: i64 = read_block(pd, bpy, l + ldi(an, bx as usize),
+                            coeffs + (bi * 64) as u64, dqp, first)
+                        nzc[bi as usize] = c
+                        l = 0
+                        if c > first {
+                            l = 1
+                        }
+                        sti(an, bx as usize, l)
+                        nz = nz | l
+                        bx = bx + 1
+                    }
+                    sti(lnz, by as usize, l)
+                    by = by + 1
+                }
+                // U: context cells 4-5, V: 6-7, 2x2 blocks each
+                var pl: i64 = 4
+                while pl < 8 {
+                    var by2: i64 = 0
+                    while by2 < 2 {
+                        var l: i64 = ldi(lnz, (pl + by2) as usize)
+                        var bx2: i64 = 0
+                        while bx2 < 2 {
+                            let bi: i64 = 16 + (pl - 4) * 2 + by2 * 2 + bx2
+                            let c: i64 = read_block(pd, bpb + 272,
+                                l + ldi(an, (pl + bx2) as usize),
+                                coeffs + (bi * 64) as u64, dqp + 32, 0)
+                            nzc[bi as usize] = c
+                            l = 0
+                            if c > 0 {
+                                l = 1
+                            }
+                            sti(an, (pl + bx2) as usize, l)
+                            nz = nz | l
+                            bx2 = bx2 + 1
+                        }
+                        sti(lnz, (pl + by2) as usize, l)
+                        by2 = by2 + 1
+                    }
+                    pl = pl + 2
+                }
+            }
+            sti(mb, 4, nz)
+            // prediction + reconstruction (vp8_dixie_predict_process_row);
+            // a macroblock without tokens (skip) is prediction only
+            let yp: u64 = ((*f).y as i64 + row * 16 * ys + col * 16) as u64
+            let up: u64 = ((*f).u as i64 + row * 8 * uvs + col * 8) as u64
+            let vp: u64 = ((*f).v as i64 + row * 8 * uvs + col * 8) as u64
+            if col == 0 {
+                fixup_left(yp, ys, 16, row, ym)
+                fixup_left(up, uvs, 8, row, uvm)
+                fixup_left(vp, uvs, 8, row, uvm)
+                if row == 0 {
+                    put(yp, ys, 0 - 1, 0 - 1, 127)
+                }
+            }
+            if row == 0 {
+                fixup_above(yp, ys, 16, col, ym)
+                fixup_above(up, uvs, 8, col, uvm)
+                fixup_above(vp, uvs, 8, col, uvm)
+            }
+            if ym == M_B {
+                // copy_down: the 4 pixels above-right of the macroblock
+                // serve subblocks 7, 11 and 15 as well
+                let ar: u32 = *(((yp as i64) - ys + 16) as u64 as *mut u32)
+                *(((yp as i64) + 3 * ys + 16) as u64 as *mut u32) = ar
+                *(((yp as i64) + 7 * ys + 16) as u64 as *mut u32) = ar
+                *(((yp as i64) + 11 * ys + 16) as u64 as *mut u32) = ar
+                var b: i64 = 0
+                while b < 16 {
+                    let bp: u64 = ((yp as i64) + (b >> 2) * 4 * ys + (b & 3) * 4) as u64
+                    pred_b(bp, ys, ldi(mb, (5 + b) as usize))
+                    if skip == 0 {
+                        let co: u64 = coeffs + (b * 64) as u64
+                        if nzc[b as usize] > 1 || ldi(co, 0) != 0 {
+                            recon_block(bp, ys, co, nzc[b as usize])
+                        }
+                    }
+                    b = b + 1
+                }
+            } else {
+                if ym == M_DC {
+                    pred_dc(yp, ys, 16)
+                } else if ym == M_V {
+                    pred_v(yp, ys, 16)
+                } else if ym == M_H {
+                    pred_h(yp, ys, 16)
+                } else {
+                    pred_tm(yp, ys, 16)
+                }
+                if skip == 0 {
+                    // the Y2 block gives every Y block its DC; with only
+                    // its own DC set, all sixteen get (dc + 3) >> 3 (libwebp)
+                    let y2: u64 = coeffs + 1536
+                    if nzc[24] > 1 {
+                        walsh(y2, coeffs)
+                        var k2: u64 = 0
+                        while k2 < 64 {
+                            *((y2 + k2) as *mut u64) = 0
+                            k2 = k2 + 8
+                        }
+                    } else if nzc[24] == 1 {
+                        let dc0: i64 = s16((ldi(y2, 0) + 3) >> 3)
+                        var k2: usize = 0
+                        while k2 < 16 {
+                            sti(coeffs, k2 * 16, dc0)
+                            k2 = k2 + 1
+                        }
+                        sti(y2, 0, 0)
+                    }
+                    var b: i64 = 0
+                    while b < 16 {
+                        let co: u64 = coeffs + (b * 64) as u64
+                        if nzc[b as usize] > 1 || ldi(co, 0) != 0 {
+                            let bp: u64 = ((yp as i64) + (b >> 2) * 4 * ys + (b & 3) * 4) as u64
+                            recon_block(bp, ys, co, nzc[b as usize])
+                        }
+                        b = b + 1
+                    }
+                }
+            }
+            if uvm == M_DC {
+                pred_dc(up, uvs, 8)
+                pred_dc(vp, uvs, 8)
+            } else if uvm == M_V {
+                pred_v(up, uvs, 8)
+                pred_v(vp, uvs, 8)
+            } else if uvm == M_H {
+                pred_h(up, uvs, 8)
+                pred_h(vp, uvs, 8)
+            } else {
+                pred_tm(up, uvs, 8)
+                pred_tm(vp, uvs, 8)
+            }
+            if skip == 0 {
+                var cb: i64 = 0
+                while cb < 8 {
+                    let co: u64 = coeffs + ((16 + cb) * 64) as u64
+                    if nzc[(16 + cb) as usize] > 1 || ldi(co, 0) != 0 {
+                        var pb: i64 = up as i64
+                        if cb >= 4 {
+                            pb = vp as i64
+                        }
+                        let q: i64 = cb & 3
+                        let o: i64 = (q >> 1) * 4 * uvs + (q & 1) * 4
+                        recon_block((pb + o) as u64, uvs, co, nzc[(16 + cb) as usize])
+                    }
+                    cb = cb + 1
+                }
+            }
+            col = col + 1
+        }
+        // extend the last row of the macroblock row by four pixels to the
+        // right (the above-right of the next row's last macroblock)
+        let ep: u64 = ((*f).y as i64 + row * 16 * ys) as u64
+        let lastv: i64 = at(ep, ys, mbw * 16 - 1, 15)
+        var e: i64 = 0
+        while e < 4 {
+            put(ep, ys, mbw * 16 + e, 15, lastv)
+            e = e + 1
+        }
+        row = row + 1
+    }
+    free(coeffs, 25 * 16 * 4)
+    free(above_nz, (mbw * 9 * 4) as usize)
+    // ---- loop filter over the whole frame (prediction used the
+    // unfiltered pixels, exactly as the reference's one-row delay)
+    if (*f).lf_level > 0 {
+        lf_init()
+        row = 0
+        while row < mbh {
+            var col: i64 = 0
+            while col < mbw {
+                let mb: u64 = mbi_at(f, row, col)
+                let ym: i64 = ldi(mb, 0)
+                var lvl: i64 = (*f).lf_level
+                if (*f).seg_on == 1 {
+                    let sg: usize = ldi(mb, 2) as usize
+                    if (*f).seg_abs == 1 {
+                        lvl = (*f).seg_lf[sg]
+                    } else {
+                        lvl = lvl + (*f).seg_lf[sg]
+                    }
+                }
+                if lvl > 63 {
+                    lvl = 63
+                } else if lvl < 0 {
+                    lvl = 0
+                }
+                if (*f).lf_delta == 1 {
+                    lvl = lvl + (*f).ref_delta[0]
+                    if ym == M_B {
+                        lvl = lvl + (*f).mode_delta[0]
+                    }
+                }
+                if lvl > 63 {
+                    lvl = 63
+                } else if lvl < 0 {
+                    lvl = 0
+                }
+                var ilim: i64 = lvl
+                if (*f).lf_sharp > 0 {
+                    if (*f).lf_sharp > 4 {
+                        ilim = ilim >> 2
+                    } else {
+                        ilim = ilim >> 1
+                    }
+                    if ilim > 9 - (*f).lf_sharp {
+                        ilim = 9 - (*f).lf_sharp
+                    }
+                }
+                if ilim < 1 {
+                    ilim = 1
+                }
+                var hev: i64 = 0
+                if lvl >= 15 {
+                    hev = 1
+                }
+                if lvl >= 40 {
+                    hev = hev + 1
+                }
+                if lvl > 0 {
+                    let inner: bool = ldi(mb, 4) != 0 || ym == M_B
+                    let yp: u64 = ((*f).y as i64 + row * 16 * ys + col * 16) as u64
+                    let up: u64 = ((*f).u as i64 + row * 8 * uvs + col * 8) as u64
+                    let vp: u64 = ((*f).v as i64 + row * 8 * uvs + col * 8) as u64
+                    if (*f).lf_simple == 1 {
+                        let mbl: i64 = (lvl + 2) * 2 + ilim
+                        let bl: i64 = lvl * 2 + ilim
+                        if col > 0 {
+                            lf_simple(yp, 1, ys, mbl)
+                        }
+                        if inner {
+                            lf_simple(yp + 4, 1, ys, bl)
+                            lf_simple(yp + 8, 1, ys, bl)
+                            lf_simple(yp + 12, 1, ys, bl)
+                        }
+                        if row > 0 {
+                            lf_simple(yp, ys, 1, mbl)
+                        }
+                        if inner {
+                            lf_simple(yp + (4 * ys) as u64, ys, 1, bl)
+                            lf_simple(yp + (8 * ys) as u64, ys, 1, bl)
+                            lf_simple(yp + (12 * ys) as u64, ys, 1, bl)
+                        }
+                    } else {
+                        let mbl: i64 = (lvl + 2) * 2 + ilim
+                        let bl: i64 = lvl * 2 + ilim
+                        if col > 0 {
+                            lf_mb_v(yp, ys, 16, mbl, ilim, hev)
+                            lf_mb_v(up, uvs, 8, mbl, ilim, hev)
+                            lf_mb_v(vp, uvs, 8, mbl, ilim, hev)
+                        }
+                        if inner {
+                            lf_inner_v(yp + 4, ys, 16, bl, ilim, hev)
+                            lf_inner_v(yp + 8, ys, 16, bl, ilim, hev)
+                            lf_inner_v(yp + 12, ys, 16, bl, ilim, hev)
+                            lf_inner_v(up + 4, uvs, 8, bl, ilim, hev)
+                            lf_inner_v(vp + 4, uvs, 8, bl, ilim, hev)
+                        }
+                        if row > 0 {
+                            lf_mb_h(yp, ys, 16, mbl, ilim, hev)
+                            lf_mb_h(up, uvs, 8, mbl, ilim, hev)
+                            lf_mb_h(vp, uvs, 8, mbl, ilim, hev)
+                        }
+                        if inner {
+                            lf_inner_h(yp + (4 * ys) as u64, ys, 16, bl, ilim, hev)
+                            lf_inner_h(yp + (8 * ys) as u64, ys, 16, bl, ilim, hev)
+                            lf_inner_h(yp + (12 * ys) as u64, ys, 16, bl, ilim, hev)
+                            lf_inner_h(up + (4 * uvs) as u64, uvs, 8, bl, ilim, hev)
+                            lf_inner_h(vp + (4 * uvs) as u64, uvs, 8, bl, ilim, hev)
+                        }
+                    }
+                }
+                col = col + 1
+            }
+            row = row + 1
+        }
+    }
+    return true
+}
+
+// ---- YUV -> RGB, libwebp's fixed point (yuv.h) and "fancy" upsampling
+// (upsampling.c UPSAMPLE_FUNC), so the result matches Chromium/dwebp.
+//
+// ROUND WEBP-TEMPO: all three channel sums of yuv.h in ONE 64-bit word.
+// R, G and B each get a 21-bit lane (bits 0, 21, 42). Every lane carries
+// a bias of 32768 = 512 << 6 plus 16 times the byte offset of its clip
+// table (R 8192, G 16384, B 24576); the table words are built so that
+// each of their lane parts is never negative -- then the three words of
+// a pixel (for y, u, v) add without a borrow or carry crossing a lane,
+// and a lane shifted right by 4 and masked is directly the byte offset of
+// its entry: (x >> 6) * 4 + offset for the sum x of VP8Clip8. The clip
+// table of each channel holds the channel already in place (alpha 255
+// rides on red). ONE table base for everything.
+//
+// Layout of G_T in bytes: [0, 2048) y words, [2048, 4096) u words,
+// [4096, 6144) v words, clip tables at 8192 (R), 16384 (G), 24576 (B),
+// each indexed by lane >> 6 in 235 .. 1046.
+//
+// The upsampling ("fancy", u and v packed as u | v << 16 exactly like
+// libwebp: the halves never carry into each other, the low half only
+// collects bits of v below bit 8, which the mask drops) works on packed
+// chroma rows (each chroma row packed once, it serves two row pairs) and
+// four chroma columns at a time in 32-bit lanes: only adds, logical
+// right shifts and masks, SSE2 on x86-64 and NEON on aarch64. It writes,
+// for every pixel of an output row pair, the byte offsets of its u and v
+// words in G_T (u * 8 + 2048 | (v * 8 + 4096) << 16) into two scratch
+// rows; the conversion to RGBA is a second, short loop (one loop for both
+// needed more registers than the code generator has and spilled on every
+// pixel).
+//
+// Before: put_rgb as a call per pixel with three branchy clips and four
+// octet stores, u and v interpolated separately (120 instructions a
+// pixel, a quarter of the decoder).
+static mut G_YUV_OK: bool = false
+static mut G_T: [u64; 4096] = [0 as u64; 4096]
+
+fn yuv_init() {
+    if G_YUV_OK {
+        return
+    }
+    let t: u64 = (&G_T[0]) as u64
+    var i: i64 = 0
+    while i < 256 {
+        let yy: u64 = ((i * 19077) >> 8) as u64
+        let o: u64 = (i * 8) as u64
+        // the y word carries the table offsets (times 16) of all three
+        // lanes; the 32768 of the clip rides on the u and v parts below
+        *((t + o) as *mut u64) = (yy + 131072) | ((yy + 262144) << 21)
+            | ((yy + 393216) << 42)
+        // u: G gets 16384 - MultHi(u, 6419), B MultHi(u, 33050) - 17685 + 32768
+        let ug: u64 = (16384 - ((i * 6419) >> 8)) as u64
+        let ub: u64 = (((i * 33050) >> 8) - 17685 + 32768) as u64
+        *((t + 2048 + o) as *mut u64) = (ug << 21) | (ub << 42)
+        // v: R gets MultHi(v, 26149) - 14234 + 32768, G 16384 - MultHi(v, 13320) + 8708
+        let vr: u64 = (((i * 26149) >> 8) - 14234 + 32768) as u64
+        let vg: u64 = (16384 - ((i * 13320) >> 8) + 8708) as u64
+        *((t + 4096 + o) as *mut u64) = vr | (vg << 21)
+        i = i + 1
+    }
+    i = 0
+    while i < 1048 {
+        var c: i64 = i - 512
+        if c < 0 {
+            c = 0
+        }
+        if c > 255 {
+            c = 255
+        }
+        let o: u64 = (i * 4) as u64
+        *((t + 8192 + o) as *mut u32) = (c | 4278190080) as u32
+        *((t + 16384 + o) as *mut u32) = (c << 8) as u32
+        *((t + 24576 + o) as *mut u32) = (c << 16) as u32
+        i = i + 1
+    }
+    G_YUV_OK = true
+}
+
+// n pixels: luma octets at yp, u/v offset words at uvp, RGBA words to dp
+fn yuv_row(yp: u64, uvp: u64, dp: u64, n: i64) {
+    let t: u64 = (&G_T[0]) as u64
+    var y8: u64 = yp
+    var uv4: u64 = uvp
+    var d4: u64 = dp
+    let e: u64 = dp + (n * 4) as u64
+    // the pixel before, as key y | uv << 8 and its RGBA word: flat
+    // stretches repeat it
+    var lk: u64 = 0
+    var lw: u32 = 0
+    while d4 < e {
+        let uv: u64 = (*(uv4 as *mut u32)) as u64
+        let key: u64 = ((*(y8 as *mut u8)) as u64) | (uv << 8)
+        if key != lk {
+            let s: u64 = *((t + ((key & 255) << 3)) as *mut u64)
+                + *((t + (uv & 65535)) as *mut u64) + *((t + (uv >> 16)) as *mut u64)
+            lw = *((t + ((s >> 4) & 32764)) as *mut u32)
+                | *((t + ((s >> 25) & 32764)) as *mut u32)
+                | *((t + ((s >> 46) & 32764)) as *mut u32)
+            lk = key
+        }
+        *(d4 as *mut u32) = lw
+        y8 = y8 + 1
+        uv4 = uv4 + 4
+        d4 = d4 + 4
+    }
+}
+
+// one chroma row packed: u | v << 16 per column
+fn pack_uv(u: u64, v: u64, dst: u64, n: i64) {
+    var i: u64 = 0
+    let e: u64 = n as u64
+    while i < e {
+        let uu: u32 = (*((u + i) as *mut u8)) as u32
+        let vv: u32 = (*((v + i) as *mut u8)) as u32
+        *((dst + i * 4) as *mut u32) = uu | (vv << 16)
+        i = i + 1
+    }
+}
+
+// packed chroma -> the u/v byte offsets of yuv_row
+fn uv_off(uv: i64) -> i64 {
+    return ((uv << 3) & 133695480) | 268437504
+}
+
+// The packed chroma of an output row pair: `tp` = the chroma row above,
+// `cp` = this one (both packed, four spare words behind them), results
+// into `uvt` (upper row) and `uvb` (lower row), w words each plus up to
+// seven spare ones: the vector loop runs in steps of four columns and may
+// go past the last one; those lanes land behind the row or on pixel
+// w - 1, which the tail writes again.
+fn up_rows(tp: u64, cp: u64, uvt: u64, uvb: u64, w: i64) {
+    let last: i64 = (w - 1) >> 1
+    let t0: i64 = ld32(tp, 0)
+    let c0: i64 = ld32(cp, 0)
+    st32(uvt, 0, uv_off((3 * t0 + c0 + 131074) >> 2))
+    st32(uvb, 0, uv_off((3 * c0 + t0 + 131074) >> 2))
+    let k8: v128 = __v128_from_u64(2251834173947912 as u64, 2251834173947912 as u64)
+    // 0x07F807F8 and 0x10000800 in every lane
+    let msk: v128 = __v128_from_u64(574217714356717560 as u64, 574217714356717560 as u64)
+    let off: v128 = __v128_from_u64(1152930300968306688 as u64, 1152930300968306688 as u64)
+    // pointers walk in steps of four columns: a function with vectors
+    // keeps every scalar in the stack frame, so the loop carries as few
+    // of them as possible
+    var po: u64 = tp
+    var qo: u64 = cp
+    var ot: u64 = uvt + 4
+    var ob: u64 = uvb + 4
+    var cnt: i64 = (last + 3) >> 2
+    while cnt > 0 {
+        let tl: v128 = __v128_load(po as *u8)
+        let t: v128 = __v128_load((po + 4) as *u8)
+        let l: v128 = __v128_load(qo as *u8)
+        let c: v128 = __v128_load((qo + 4) as *u8)
+        let avg: v128 = __v128_add32(__v128_add32(__v128_add32(tl, t), __v128_add32(l, c)), k8)
+        let tpl: v128 = __v128_add32(t, l)
+        let tlc: v128 = __v128_add32(tl, c)
+        let d12: v128 = __v128_shr32(__v128_add32(avg, __v128_add32(tpl, tpl)), 3)
+        let d03: v128 = __v128_shr32(__v128_add32(avg, __v128_add32(tlc, tlc)), 3)
+        let a: v128 = __v128_shr32(__v128_add32(d12, tl), 1)
+        let b: v128 = __v128_shr32(__v128_add32(d03, t), 1)
+        let e: v128 = __v128_shr32(__v128_add32(d03, l), 1)
+        let g: v128 = __v128_shr32(__v128_add32(d12, c), 1)
+        // to byte offsets in G_T: ((uv << 3) & (2040 | 2040 << 16)) | (2048 | 4096 << 16)
+        let a2: v128 = __v128_or(__v128_and(__v128_shl32(a, 3), msk), off)
+        let b2: v128 = __v128_or(__v128_and(__v128_shl32(b, 3), msk), off)
+        let e2: v128 = __v128_or(__v128_and(__v128_shl32(e, 3), msk), off)
+        let g2: v128 = __v128_or(__v128_and(__v128_shl32(g, 3), msk), off)
+        __v128_store(ot as *mut u8, __v128_unpacklo32(a2, b2))
+        __v128_store((ot + 16) as *mut u8, __v128_unpackhi32(a2, b2))
+        __v128_store(ob as *mut u8, __v128_unpacklo32(e2, g2))
+        __v128_store((ob + 16) as *mut u8, __v128_unpackhi32(e2, g2))
+        po = po + 16
+        qo = qo + 16
+        ot = ot + 32
+        ob = ob + 32
+        cnt = cnt - 1
+    }
+    if (w & 1) == 0 {
+        let tl2: i64 = ld32(tp, last as usize)
+        let l2: i64 = ld32(cp, last as usize)
+        st32(uvt, (w - 1) as usize, uv_off((3 * tl2 + l2 + 131074) >> 2))
+        st32(uvb, (w - 1) as usize, uv_off((3 * l2 + tl2 + 131074) >> 2))
+    }
+}
+
+fn vp8_to_rgba(f: *mut Vp8, dst: u64) {
+    yuv_init()
+    let w: i64 = (*f).w
+    let h: i64 = (*f).h
+    let cw: i64 = (w + 1) >> 1
+    let pn: usize = ((cw + 4) * 4) as usize
+    let rn: usize = ((w + 8) * 4) as usize
+    var pa: u64 = alloc(pn)
+    var pb: u64 = alloc(pn)
+    let uvt: u64 = alloc(rn)
+    let uvb: u64 = alloc(rn)
+    if pa != 0 && pb != 0 && uvt != 0 && uvb != 0 {
+        let yb: u64 = (*f).y
+        let ys: i64 = (*f).ys
+        let uvs: i64 = (*f).uvs
+        pack_uv((*f).u, (*f).v, pa, cw)
+        up_rows(pa, pa, uvt, uvb, w)
+        yuv_row(yb, uvt, dst, w)
+        var k: i64 = 1
+        while 2 * k - 1 < h {
+            if 2 * k < h {
+                pack_uv(((*f).u as i64 + k * uvs) as u64,
+                    ((*f).v as i64 + k * uvs) as u64, pb, cw)
+                up_rows(pa, pb, uvt, uvb, w)
+                yuv_row((yb as i64 + (2 * k - 1) * ys) as u64, uvt,
+                    dst + ((2 * k - 1) * w * 4) as u64, w)
+                yuv_row((yb as i64 + 2 * k * ys) as u64, uvb,
+                    dst + (2 * k * w * 4) as u64, w)
+                let sw: u64 = pa
+                pa = pb
+                pb = sw
+            } else {
+                up_rows(pa, pa, uvt, uvb, w)
+                yuv_row((yb as i64 + (2 * k - 1) * ys) as u64, uvt,
+                    dst + ((2 * k - 1) * w * 4) as u64, w)
+            }
+            k = k + 1
+        }
+    }
+    free(pa, pn)
+    free(pb, pn)
+    free(uvt, rn)
+    free(uvb, rn)
+}
+
+fn vp8_new() -> Vp8 {
+    return Vp8 { w: 0, h: 0, mbw: 0, mbh: 0, ybuf: 0, ybytes: 0, y: 0,
+        ys: 0, ubuf: 0, vbuf: 0, uvbytes: 0, u: 0, v: 0, uvs: 0,
+        seg_on: 0, seg_map: 0, seg_abs: 0, seg_q: [0; 4], seg_lf: [0; 4],
+        seg_p: [255; 3], lf_simple: 0, lf_level: 0, lf_sharp: 0,
+        lf_delta: 0, ref_delta: [0; 4], mode_delta: [0; 4], skip_on: 0,
+        skip_p: 0, dq: [0; 24], probs: 0, tables: 0, mbi: 0, mbin: 0 }
+}
+
+// ---- ALPH (the alpha plane of a lossy image)
+//
+// ROUND WEBP-TEMPO: written straight into the alpha octets of the RGBA
+// picture (stride 4) and unfiltered there; before, the plane was decoded
+// into a buffer of its own, unfiltered there and copied over in a third
+// pass. `rgba` holds w * h pixels whose alpha octets are replaced.
+fn decode_alpha(src: u64, n: usize, w: i64, h: i64, rgba: u64) -> bool {
+    if n < 1 {
+        return false
+    }
+    let hdr: i64 = ld8(src, 0)
+    let method: i64 = hdr & 3
+    let filter: i64 = (hdr >> 2) & 3
+    let total: i64 = w * h
+    let end: u64 = rgba + (total * 4) as u64
+    var dp: u64 = rgba + 3
+    if method == 0 {
+        if (n as i64) - 1 < total {
+            return false
+        }
+        var sp: u64 = src + 1
+        while dp < end {
+            *(dp as *mut u8) = *(sp as *mut u8)
+            sp = sp + 1
+            dp = dp + 4
+        }
+    } else if method == 1 {
+        var b: LBits = lb_new(src + 1, n - 1)
+        let px: u64 = vp8l_stream(&b, w, h)
+        if px == 0 {
+            return false
+        }
+        // the green octet of each ARGB word
+        var sp: u64 = px + 1
+        while dp < end {
+            *(dp as *mut u8) = *(sp as *mut u8)
+            sp = sp + 4
+            dp = dp + 4
+        }
+        free(px, (total * 4) as usize)
+    } else {
+        return false
+    }
+    // unfilter (libwebp filters.c: Horizontal/Vertical/GradientUnfilter)
+    if filter == 0 {
+        return true
+    }
+    let rs: i64 = w * 4
+    var y: i64 = 0
+    while y < h {
+        let r: u64 = rgba + (y * rs + 3) as u64
+        let e: u64 = r + (w * 4) as u64
+        if y == 0 || filter == 1 {
+            var pred: i64 = 0
+            if y > 0 {
+                pred = ld8(r - rs as u64, 0)
+            }
+            var q: u64 = r
+            while q < e {
+                let v: i64 = (ld8(q, 0) + pred) & 255
+                st8(q, 0, v)
+                pred = v
+                q = q + 4
+            }
+        } else if filter == 2 {
+            var q: u64 = r
+            while q < e {
+                st8(q, 0, ld8(q, 0) + ld8(q - rs as u64, 0))
+                q = q + 4
+            }
+        } else {
+            var top: i64 = ld8(r - rs as u64, 0)
+            var tl: i64 = top
+            var left: i64 = top
+            var q: u64 = r
+            while q < e {
+                top = ld8(q - rs as u64, 0)
+                left = (ld8(q, 0) + clamp255(left + top - tl)) & 255
+                tl = top
+                st8(q, 0, left)
+                q = q + 4
+            }
+        }
+        y = y + 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- container
+//
+// One still picture inside a run of chunks (the whole file body, or the
+// payload of an ANMF frame): an optional ALPH, then VP8 or VP8L.
+struct Still {
+    kind: u32, // 0 none, 1 VP8 (lossy), 2 VP8L (lossless)
+    body: u64,
+    bn: usize,
+    alph: u64,
+    alph_n: usize,
+    w: i64,
+    h: i64,
+    has_alpha: bool,
+}
+
+fn still_new() -> Still {
+    return Still { kind: 0, body: 0, bn: 0, alph: 0, alph_n: 0, w: 0, h: 0,
+        has_alpha: false }
+}
+
+// the 10 octets of a VP8 key frame header: size
+fn vp8_head(src: u64, n: usize, w: *mut i64, h: *mut i64) -> u32 {
+    if n < 10 {
+        return WR_VP8
+    }
+    let tag: i64 = le24(src, 0)
+    if (tag & 1) != 0 {
+        return WR_VP8
+    }
+    if ld8(src, 3) != 157 || ld8(src, 4) != 1 || ld8(src, 5) != 42 {
+        return WR_VP8
+    }
+    *w = (ld8(src, 6) | (ld8(src, 7) << 8)) & 16383
+    *h = (ld8(src, 8) | (ld8(src, 9) << 8)) & 16383
+    if *w == 0 || *h == 0 {
+        return WR_VP8
+    }
+    return WR_OK
+}
+
+// Walk the chunks from `at0` to `end` until the picture is found.
+fn still_find(p: u64, at0: usize, end: usize, st: *mut Still) -> u32 {
+    var at: usize = at0
+    while at + 8 <= end {
+        let sz: usize = le32(p, at + 4) as usize
+        let body: usize = at + 8
+        if body + sz > end {
+            return WR_TRUNCATED
+        }
+        if tag_is(p, at, 65, 76, 80, 72) { // ALPH
+            if (*st).alph == 0 {
+                (*st).alph = p + body as u64
+                (*st).alph_n = sz
+            }
+        } else if tag_is(p, at, 86, 80, 56, 32) { // "VP8 "
+            (*st).kind = 1
+            (*st).body = p + body as u64
+            (*st).bn = sz
+            let r: u32 = vp8_head((*st).body, sz, &(*st).w, &(*st).h)
+            (*st).has_alpha = (*st).alph != 0
+            return r
+        } else if tag_is(p, at, 86, 80, 56, 76) { // VP8L
+            (*st).kind = 2
+            (*st).body = p + body as u64
+            (*st).bn = sz
+            // the alpha plane of a VP8L picture is in the stream itself
+            (*st).alph = 0
+            return vp8l_head((*st).body, sz, &(*st).w, &(*st).h, &(*st).has_alpha)
+        }
+        at = body + sz + (sz & 1)
+    }
+    return WR_NOT_WEBP
+}
+
+// Decodes the picture `st` describes into `dst` (st.w * st.h * 4 octets).
+fn still_decode(st: *mut Still, dst: u64) -> u32 {
+    if (*st).kind == 2 {
+        return decode_vp8l((*st).body, (*st).bn, dst)
+    }
+    var f: Vp8 = vp8_new()
+    if !decode_vp8_frame((*st).body, (*st).bn, &f) {
+        vp8_free(&f)
+        return WR_VP8
+    }
+    if f.w != (*st).w || f.h != (*st).h {
+        vp8_free(&f)
+        return WR_VP8
+    }
+    vp8_to_rgba(&f, dst)
+    vp8_free(&f)
+    if (*st).alph != 0 {
+        // a broken alpha plane leaves the picture opaque, like libwebp
+        // does (decoding may have filled part of it: back to 255)
+        if !decode_alpha((*st).alph, (*st).alph_n, (*st).w, (*st).h, dst) {
+            var q: u64 = dst + 3
+            let e: u64 = dst + ((*st).w * (*st).h * 4) as u64
+            while q < e {
+                *(q as *mut u8) = 255 as u8
+                q = q + 4
+            }
+        }
+    }
+    return WR_OK
+}
+
+// What the top of the file says.
+struct Top {
+    end: usize, // end of the RIFF body
+    at: usize, // first chunk after the (optional) VP8X
+    vp8x: bool,
+    flags: i64,
+    cw: i64, // canvas (VP8X only)
+    ch: i64,
+    loops: i64,
+    anmf: usize, // offset of the first ANMF chunk, 0 = none
+}
+
+fn top_parse(p: u64, n: usize, t: *mut Top) -> u32 {
+    if !webp_sniff(p, n) {
+        return WR_NOT_WEBP
+    }
+    var end: usize = (le32(p, 4) + 8) as usize
+    if end > n {
+        end = n
+    }
+    (*t).end = end
+    (*t).at = 12
+    (*t).vp8x = false
+    (*t).flags = 0
+    (*t).cw = 0
+    (*t).ch = 0
+    (*t).loops = 0
+    (*t).anmf = 0
+    if end < 20 {
+        return WR_TRUNCATED
+    }
+    if tag_is(p, 12, 86, 80, 56, 88) { // VP8X
+        let sz: usize = le32(p, 16) as usize
+        if sz < 10 || 20 + sz > end {
+            return WR_TRUNCATED
+        }
+        (*t).vp8x = true
+        (*t).flags = ld8(p, 20)
+        (*t).cw = le24(p, 24) + 1
+        (*t).ch = le24(p, 27) + 1
+        (*t).at = 20 + sz + (sz & 1)
+        // look for ANIM and the first ANMF
+        var at: usize = (*t).at
+        while at + 8 <= end {
+            let csz: usize = le32(p, at + 4) as usize
+            let body: usize = at + 8
+            if body + csz > end {
+                return WR_TRUNCATED
+            }
+            if tag_is(p, at, 65, 78, 73, 77) && csz >= 6 { // ANIM
+                (*t).loops = ld8(p, body + 4) | (ld8(p, body + 5) << 8)
+            } else if tag_is(p, at, 65, 78, 77, 70) { // ANMF
+                if (*t).anmf == 0 {
+                    (*t).anmf = at
+                }
+            } else if tag_is(p, at, 86, 80, 56, 32) || tag_is(p, at, 86, 80, 56, 76) {
+                break
+            }
+            at = body + csz + (csz & 1)
+        }
+    }
+    return WR_OK
+}
+
+fn webp_info(p: u64, n: usize, w: *mut u32, h: *mut u32) -> bool {
+    var t: Top = Top { end: 0, at: 0, vp8x: false, flags: 0, cw: 0, ch: 0, loops: 0, anmf: 0 }
+    if top_parse(p, n, &t) != WR_OK {
+        return false
+    }
+    if t.vp8x {
+        *w = t.cw as u32
+        *h = t.ch as u32
+        return true
+    }
+    var st: Still = still_new()
+    if still_find(p, t.at, t.end, &st) != WR_OK {
+        return false
+    }
+    *w = st.w as u32
+    *h = st.h as u32
+    return true
+}
+
+// Prepares `b` to hold `n` octets, zero filled. false = out of memory.
+fn buf_zeroed(b: *mut rt.Buf, n: usize) -> bool {
+    rt.buf_clear(b)
+    rt.buf_reserve(b, n)
+    if (*b).cap < n {
+        return false
+    }
+    rt.buf_set_len(b, n)
+    zero(rt.buf_ptr(b), n)
+    return true
+}
+
+// ---------------------------------------------------------------- animation
+//
+// The composition follows libwebp's WebPAnimDecoder (anim_decode.c):
+//   * the canvas starts transparent, the background colour of ANIM is NOT
+//     used (libwebp ignores it by default);
+//   * a "key frame" (the first; a full-size frame without blending or
+//     alpha; a frame after a full-size or key frame disposed to background)
+//     starts from a transparent canvas, every other frame from the
+//     previous canvas after ITS disposal;
+//   * the decoded frame replaces the pixels of its rectangle, and then,
+//     unless it is a key frame or has the no-blend flag, is blended over
+//     the previous canvas with BlendPixelNonPremult (integer arithmetic).
+
+fn blend_channel(src: i64, sa: i64, dst: i64, da: i64, scale: i64) -> i64 {
+    return ((src * sa + dst * da) * scale) >> 24
+}
+
+// libwebp's BlendPixelNonPremult on one RGBA pixel: `s` (the decoded frame)
+// over `d` (the previous canvas); the result is written to `s`.
+fn blend_px(s: u64, d: u64) {
+    let sa: i64 = ld8(s, 3)
+    if sa == 255 {
+        return // opaque: libwebp's BlendPixelRowNonPremult leaves the pixel alone
+    }
+    if sa == 0 {
+        st8(s, 0, ld8(d, 0))
+        st8(s, 1, ld8(d, 1))
+        st8(s, 2, ld8(d, 2))
+        st8(s, 3, ld8(d, 3))
+        return
+    }
+    let da: i64 = ld8(d, 3)
+    let dfa: i64 = (da * (256 - sa)) >> 8
+    let ba: i64 = sa + dfa
+    let scale: i64 = (1 << 24) / ba
+    st8(s, 0, blend_channel(ld8(s, 0), sa, ld8(d, 0), dfa, scale))
+    st8(s, 1, blend_channel(ld8(s, 1), sa, ld8(d, 1), dfa, scale))
+    st8(s, 2, blend_channel(ld8(s, 2), sa, ld8(d, 2), dfa, scale))
+    st8(s, 3, ba)
+}
+
+fn copy_bytes(dst: u64, src: u64, n: usize) {
+    var i: usize = 0
+    while i + 8 <= n {
+        *((dst + i as u64) as *mut u64) = *((src + i as u64) as *mut u64)
+        i = i + 8
+    }
+    while i < n {
+        *((dst + i as u64) as *mut u8) = *((src + i as u64) as *mut u8)
+        i = i + 1
+    }
+}
+
+// Decodes the file into `out` (`frames` canvases, one after the other) and
+// the delays into `dl` (u32 each). At most `maxframes` frames are taken.
+// Returns a reason; on success `*count`, `*cw`, `*ch` are set.
+fn decode_core(p: u64, n: usize, maxpx: i64, maxframes: u32, out: *mut rt.Buf,
+    dl: *mut rt.Buf, count: *mut u32, cw: *mut i64, ch: *mut i64, loops: *mut u32,
+    alpha: *mut bool, animated: *mut bool) -> u32 {
+    var t: Top = Top { end: 0, at: 0, vp8x: false, flags: 0, cw: 0, ch: 0, loops: 0, anmf: 0 }
+    let tr: u32 = top_parse(p, n, &t)
+    if tr != WR_OK {
+        return tr
+    }
+    *loops = t.loops as u32
+    *animated = false
+    if t.vp8x {
+        if t.cw * t.ch > maxpx {
+            return WR_SIZE
+        }
+        *alpha = (t.flags & 16) != 0
+    }
+    if t.anmf == 0 {
+        // ---- a still picture
+        var st: Still = still_new()
+        let r: u32 = still_find(p, t.at, t.end, &st)
+        if r != WR_OK {
+            if r == WR_NOT_WEBP {
+                return WR_TRUNCATED
+            }
+            return r
+        }
+        if t.vp8x && (st.w != t.cw || st.h != t.ch) {
+            return WR_VP8 // the canvas and the picture disagree
+        }
+        if st.w * st.h > maxpx {
+            return WR_SIZE
+        }
+        let bytes: usize = (st.w * st.h * 4) as usize
+        rt.buf_clear(out)
+        rt.buf_reserve(out, bytes)
+        if (*out).cap < bytes {
+            return WR_MEMORY
+        }
+        rt.buf_set_len(out, bytes)
+        let r2: u32 = still_decode(&st, rt.buf_ptr(out))
+        if r2 != WR_OK {
+            rt.buf_clear(out)
+            return r2
+        }
+        rt.buf_clear(dl)
+        var z: u32 = 0
+        while z < 4 {
+            rt.buf_push(dl, 0 as u8)
+            z = z + 1
+        }
+        *count = 1
+        *cw = st.w
+        *ch = st.h
+        if !t.vp8x {
+            *alpha = st.has_alpha
+        }
+        return WR_OK
+    }
+    // ---- an animation: ANMF frames on the VP8X canvas
+    *animated = true
+    let W: i64 = t.cw
+    let H: i64 = t.ch
+    let cbytes: usize = (W * H * 4) as usize
+    var want: u32 = maxframes
+    if want == 0 {
+        want = 1
+    }
+    if (cbytes as u64) * (want as u64) > WEBP_MAX_ANIM_BYTES {
+        // fewer frames than asked, but at least one canvas must fit
+        if (cbytes as u64) > WEBP_MAX_ANIM_BYTES {
+            return WR_SIZE
+        }
+        want = (WEBP_MAX_ANIM_BYTES / (cbytes as u64)) as u32
+    }
+    rt.buf_clear(out)
+    rt.buf_clear(dl)
+    let prev: u64 = alloc(cbytes)
+    if prev == 0 {
+        return WR_MEMORY
+    }
+    var fcount: u32 = 0
+    var rc: u32 = WR_OK
+    // the previous frame's rectangle and dispose method
+    var px0: i64 = 0
+    var py0: i64 = 0
+    var pw0: i64 = 0
+    var ph0: i64 = 0
+    var pdisp: i64 = 0
+    var pkey: bool = false
+    var at: usize = t.anmf
+    while at + 8 <= t.end && fcount < want && rc == WR_OK {
+        let csz: usize = le32(p, at + 4) as usize
+        let body: usize = at + 8
+        if body + csz > t.end {
+            rc = WR_TRUNCATED
+            break
+        }
+        if tag_is(p, at, 65, 78, 77, 70) {
+            if csz < 16 {
+                rc = WR_TRUNCATED
+                break
+            }
+            let fx: i64 = le24(p, body) * 2
+            let fy: i64 = le24(p, body + 3) * 2
+            let fw: i64 = le24(p, body + 6) + 1
+            let fh: i64 = le24(p, body + 9) + 1
+            let dur: i64 = le24(p, body + 12)
+            let fl: i64 = ld8(p, body + 15)
+            let noblend: bool = (fl & 2) != 0
+            let disp: i64 = fl & 1
+            if fx + fw > W || fy + fh > H {
+                rc = WR_VP8
+                break
+            }
+            var st: Still = still_new()
+            let r: u32 = still_find(p, body + 16, body + csz, &st)
+            if r != WR_OK {
+                rc = r
+                if r == WR_NOT_WEBP {
+                    rc = WR_VP8
+                }
+                break
+            }
+            if st.w != fw || st.h != fh {
+                rc = WR_VP8
+                break
+            }
+            // decode the frame into a scratch buffer
+            let fbytes: usize = (fw * fh * 4) as usize
+            let fb: u64 = alloc(fbytes)
+            if fb == 0 {
+                rc = WR_MEMORY
+                break
+            }
+            let dr: u32 = still_decode(&st, fb)
+            if dr != WR_OK {
+                free(fb, fbytes)
+                rc = dr
+                break
+            }
+            // the output canvas of this frame
+            let need: usize = cbytes * (fcount as usize + 1)
+            rt.buf_reserve(out, need)
+            if (*out).cap < need {
+                free(fb, fbytes)
+                rc = WR_MEMORY
+                break
+            }
+            rt.buf_set_len(out, need)
+            let cur: u64 = rt.buf_ptr(out) + (cbytes * fcount as usize) as u64
+            // key frame?
+            let full: bool = fw == W && fh == H
+            var key: bool = false
+            if fcount == 0 {
+                key = true
+            } else if (!st.has_alpha || noblend) && full {
+                key = true
+            } else if pdisp == 1 && ((pw0 == W && ph0 == H) || pkey) {
+                key = true
+            }
+            if key {
+                zero(cur, cbytes)
+            } else {
+                copy_bytes(cur, prev, cbytes)
+            }
+            // the frame replaces its rectangle
+            var y: i64 = 0
+            while y < fh {
+                copy_bytes(cur + (((fy + y) * W + fx) * 4) as u64,
+                    fb + (y * fw * 4) as u64, (fw * 4) as usize)
+                y = y + 1
+            }
+            free(fb, fbytes)
+            // blend over the previous canvas
+            if fcount > 0 && !noblend && !key {
+                y = 0
+                while y < fh {
+                    var x: i64 = 0
+                    while x < fw {
+                        var skip: bool = false
+                        if pdisp == 1 {
+                            // inside the previous rectangle (disposed to
+                            // transparent) the decoded pixel stays as is
+                            let ax: i64 = fx + x
+                            let ay: i64 = fy + y
+                            if ax >= px0 && ax < px0 + pw0 && ay >= py0 && ay < py0 + ph0 {
+                                skip = true
+                            }
+                        }
+                        if !skip {
+                            let o: u64 = (((fy + y) * W + fx + x) * 4) as u64
+                            blend_px(cur + o, prev + o)
+                        }
+                        x = x + 1
+                    }
+                    y = y + 1
+                }
+            }
+            // the canvas after disposal is the next frame's start
+            copy_bytes(prev, cur, cbytes)
+            if disp == 1 {
+                y = 0
+                while y < fh {
+                    zero(prev + (((fy + y) * W + fx) * 4) as u64, (fw * 4) as usize)
+                    y = y + 1
+                }
+            }
+            px0 = fx
+            py0 = fy
+            pw0 = fw
+            ph0 = fh
+            pdisp = disp
+            pkey = key
+            // the delay
+            var z: u32 = 0
+            while z < 4 {
+                rt.buf_push(dl, ((dur >> (8 * z as i64)) & 255) as u8)
+                z = z + 1
+            }
+            fcount = fcount + 1
+        }
+        at = body + csz + (csz & 1)
+    }
+    free(prev, cbytes)
+    if rc == WR_OK && fcount == 0 {
+        rc = WR_TRUNCATED
+    }
+    if rc != WR_OK {
+        rt.buf_clear(out)
+        rt.buf_clear(dl)
+        return rc
+    }
+    *count = fcount
+    *cw = W
+    *ch = H
+    return WR_OK
+}
+
+fn reason_err(r: u32) -> u32 {
+    // 0 not webp, 1 corrupt, 2 unsupported, 3 too large, 4 out of memory
+    if r == WR_NOT_WEBP {
+        return 0
+    }
+    if r == WR_SIZE {
+        return 3
+    }
+    if r == WR_MEMORY {
+        return 4
+    }
+    if r == WR_UNSUPPORTED {
+        return 2
+    }
+    return 1
+}
+
+fn webp_fail(r: u32) -> WebpError!bool {
+    let k: u32 = reason_err(r)
+    if k == 0 { return WebpError::NotWebp }
+    if k == 3 { return WebpError::TooLarge }
+    if k == 4 { return WebpError::OutOfMemory }
+    if k == 2 { return WebpError::Unsupported }
+    return WebpError::Corrupt
+}
+
+fn webp_decode(p: u64, n: usize, im: *mut WebpImage) -> WebpError!bool {
+    return try webp_decode_limited(p, n, WEBP_MAX_PIXELS, im)
+}
+
+// Decodes the picture (the first frame of an animation, on its canvas) to
+// RGBA in `im` (its buffer is reused). At most `max_pixels`.
+fn webp_decode_limited(p: u64, n: usize, max_pixels: u64, im: *mut WebpImage) -> WebpError!bool {
+    var dl: rt.Buf = rt.buf_new()
+    var count: u32 = 0
+    var cw: i64 = 0
+    var ch: i64 = 0
+    var loops: u32 = 0
+    var alpha: bool = false
+    var anim: bool = false
+    var mp: i64 = max_pixels as i64
+    if max_pixels > 4294967296 {
+        mp = 4294967296
+    }
+    let r: u32 = decode_core(p, n, mp, 1 as u32, &(*im).px, &dl, &count, &cw, &ch,
+        &loops, &alpha, &anim)
+    rt.buf_free(&dl)
+    if r != WR_OK {
+        (*im).w = 0
+        (*im).h = 0
+        return try webp_fail(r)
+    }
+    (*im).w = cw as u32
+    (*im).h = ch as u32
+    (*im).has_alpha = alpha
+    (*im).animated = anim
+    return true
+}
+
+fn webp_decode_anim(p: u64, n: usize, an: *mut WebpAnim) -> WebpError!bool {
+    return try webp_decode_anim_limited(p, n, WEBP_MAX_PIXELS, 4096 as u32, an)
+}
+
+// Every frame (at most `max_frames`) as a full canvas. A still picture is
+// an animation of one frame with delay 0.
+fn webp_decode_anim_limited(p: u64, n: usize, max_pixels: u64, max_frames: u32,
+    an: *mut WebpAnim) -> WebpError!bool {
+    var count: u32 = 0
+    var cw: i64 = 0
+    var ch: i64 = 0
+    var loops: u32 = 0
+    var alpha: bool = false
+    var anim: bool = false
+    var mp: i64 = max_pixels as i64
+    if max_pixels > 4294967296 {
+        mp = 4294967296
+    }
+    let r: u32 = decode_core(p, n, mp, max_frames, &(*an).px, &(*an).delays, &count,
+        &cw, &ch, &loops, &alpha, &anim)
+    if r != WR_OK {
+        (*an).w = 0
+        (*an).h = 0
+        (*an).count = 0
+        return try webp_fail(r)
+    }
+    (*an).w = cw as u32
+    (*an).h = ch as u32
+    (*an).count = count
+    (*an).loops = loops
+    (*an).has_alpha = alpha
+    return true
+}
+
+const T_UPD: usize = 0
+const T_DEF: usize = 1056
+const T_KFB: usize = 2112
+const T_DCQ: usize = 3012
+const T_ACQ: usize = 3268
+const T_LEN: usize = 3524
+
+fn tables_fill(p: u64) {
+    tables_part0(p, 0)
+    tables_part1(p, 1024)
+    tables_part2(p, 2048)
+    tables_part3(p, 3072)
+}
+
+#[no_gc]
+fn tables_part0(p: u64, at: usize) {
+    var t: [u8; 1024] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xb0\xf6\xff\xff\xff\xff\xff\xff\xff\xff\xff\xdf\xf1\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xf9\xfd\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf4\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xea\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf6\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xef\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf8\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfb\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfb\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xfd\xff\xfe\xff\xff\xff\xff\xff\xff\xfa\xff\xfe\xff\xfe\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xd9\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xe1\xfc\xf1\xfd\xff\xff\xfe\xff\xff\xff\xff\xea\xfa\xf1\xfa\xfd\xff\xfd\xfe\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xdf\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xee\xfd\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xf8\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xf9\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf7\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xfa\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xba\xfb\xfa\xff\xff\xff\xff\xff\xff\xff\xff\xea\xfb\xf4\xfe\xff\xff\xff\xff\xff\xff\xff\xfb\xfb\xf3\xfd\xfe\xff\xfe\xff\xff\xff\xff\xff\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xec\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfb\xfd\xfd\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf8\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfa\xfe\xfc\xfe\xff\xff\xff\xff\xff\xff\xff\xf8\xfe\xf9\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xf6\xfd\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xfc\xfe\xfb\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xfe\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xf8\xfe\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xff\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfb\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xf5\xfb\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfb\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xfc\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf9\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xfa\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+    var i: usize = 0
+    while i < 1024 {
+        *((p + (at + i) as u64) as *mut u8) = t[i]
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn tables_part1(p: u64, at: usize) {
+    var t: [u8; 1024] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\xfd\x88\xfe\xff\xe4\xdb\x80\x80\x80\x80\x80\xbd\x81\xf2\xff\xe3\xd5\xff\xdb\x80\x80\x80\x6a\x7e\xe3\xfc\xd6\xd1\xff\xff\x80\x80\x80\x01\x62\xf8\xff\xec\xe2\xff\xff\x80\x80\x80\xb5\x85\xee\xfe\xdd\xea\xff\x9a\x80\x80\x80\x4e\x86\xca\xf7\xc6\xb4\xff\xdb\x80\x80\x80\x01\xb9\xf9\xff\xf3\xff\x80\x80\x80\x80\x80\xb8\x96\xf7\xff\xec\xe0\x80\x80\x80\x80\x80\x4d\x6e\xd8\xff\xec\xe6\x80\x80\x80\x80\x80\x01\x65\xfb\xff\xf1\xff\x80\x80\x80\x80\x80\xaa\x8b\xf1\xfc\xec\xd1\xff\xff\x80\x80\x80\x25\x74\xc4\xf3\xe4\xff\xff\xff\x80\x80\x80\x01\xcc\xfe\xff\xf5\xff\x80\x80\x80\x80\x80\xcf\xa0\xfa\xff\xee\x80\x80\x80\x80\x80\x80\x66\x67\xe7\xff\xd3\xab\x80\x80\x80\x80\x80\x01\x98\xfc\xff\xf0\xff\x80\x80\x80\x80\x80\xb1\x87\xf3\xff\xea\xe1\x80\x80\x80\x80\x80\x50\x81\xd3\xff\xc2\xe0\x80\x80\x80\x80\x80\x01\x01\xff\x80\x80\x80\x80\x80\x80\x80\x80\xf6\x01\xff\x80\x80\x80\x80\x80\x80\x80\x80\xff\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\xc6\x23\xed\xdf\xc1\xbb\xa2\xa0\x91\x9b\x3e\x83\x2d\xc6\xdd\xac\xb0\xdc\x9d\xfc\xdd\x01\x44\x2f\x92\xd0\x95\xa7\xdd\xa2\xff\xdf\x80\x01\x95\xf1\xff\xdd\xe0\xff\xff\x80\x80\x80\xb8\x8d\xea\xfd\xde\xdc\xff\xc7\x80\x80\x80\x51\x63\xb5\xf2\xb0\xbe\xf9\xca\xff\xff\x80\x01\x81\xe8\xfd\xd6\xc5\xf2\xc4\xff\xff\x80\x63\x79\xd2\xfa\xc9\xc6\xff\xca\x80\x80\x80\x17\x5b\xa3\xf2\xaa\xbb\xf7\xd2\xff\xff\x80\x01\xc8\xf6\xff\xea\xff\x80\x80\x80\x80\x80\x6d\xb2\xf1\xff\xe7\xf5\xff\xff\x80\x80\x80\x2c\x82\xc9\xfd\xcd\xc0\xff\xff\x80\x80\x80\x01\x84\xef\xfb\xdb\xd1\xff\xa5\x80\x80\x80\x5e\x88\xe1\xfb\xda\xbe\xff\xff\x80\x80\x80\x16\x64\xae\xf5\xba\xa1\xff\xc7\x80\x80\x80\x01\xb6\xf9\xff\xe8\xeb\x80\x80\x80\x80\x80\x7c\x8f\xf1\xff\xe3\xea\x80\x80\x80\x80\x80\x23\x4d\xb5\xfb\xc1\xd3\xff\xcd\x80\x80\x80\x01\x9d\xf7\xff\xec\xe7\xff\xff\x80\x80\x80\x79\x8d\xeb\xff\xe1\xe3\xff\xff\x80\x80\x80\x2d\x63\xbc\xfb\xc3\xd9\xff\xe0\x80\x80\x80\x01\x01\xfb\xff\xd5\xff\x80\x80\x80\x80\x80\xcb\x01\xf8\xff\xff\x80\x80\x80\x80\x80\x80\x89\x01\xb1\xff\xe0\xff\x80\x80\x80\x80\x80\xfd\x09\xf8\xfb\xcf\xd0\xff\xc0\x80\x80\x80\xaf\x0d\xe0\xf3\xc1\xb9\xf9\xc6\xff\xff\x80\x49\x11\xab\xdd\xa1\xb3\xec\xa7\xff\xea\x80\x01\x5f\xf7\xfd\xd4\xb7\xff\xff\x80\x80\x80\xef\x5a\xf4\xfa\xd3\xd1\xff\xff\x80\x80\x80\x9b\x4d\xc3\xf8\xbc\xc3\xff\xff\x80\x80\x80\x01\x18\xef\xfb\xda\xdb\xff\xcd\x80\x80\x80\xc9\x33\xdb\xff\xc4\xba\x80\x80\x80\x80\x80\x45\x2e\xbe\xef\xc9\xda\xff\xe4\x80\x80\x80\x01\xbf\xfb\xff\xff\x80\x80\x80\x80\x80\x80\xdf\xa5\xf9\xff\xd5\xff\x80\x80\x80\x80\x80\x8d\x7c\xf8\xff\xff\x80\x80\x80\x80\x80\x80\x01\x10\xf8\xff\xff\x80\x80\x80\x80\x80\x80\xbe\x24\xe6\xff\xec\xff\x80\x80\x80\x80\x80\x95\x01\xff\x80\x80\x80\x80\x80\x80\x80\x80\x01\xe2\xff\x80\x80\x80\x80\x80\x80\x80\x80\xf7\xc0\xff\x80\x80\x80\x80\x80\x80\x80\x80\xf0\x80\xff\x80\x80\x80\x80\x80\x80\x80\x80\x01\x86\xfc\xff\xff\x80\x80\x80\x80\x80\x80\xd5\x3e\xfa\xff\xff\x80\x80\x80\x80\x80\x80\x37\x5d\xff\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\xca\x18\xd5\xeb\xba\xbf\xdc\xa0\xf0\xaf\xff\x7e\x26\xb6\xe8\xa9\xb8\xe4\xae\xff\xbb\x80\x3d\x2e\x8a\xdb\x97\xb2\xf0\xaa\xff\xd8\x80\x01\x70\xe6\xfa\xc7\xbf\xf7\x9f\xff\xff\x80\xa6\x6d\xe4\xfc\xd3\xd7\xff\xae\x80\x80\x80\x27\x4d\xa2\xe8\xac\xb4\xf5\xb2\xff\xff\x80\x01\x34\xdc\xf6\xc6\xc7\xf9\xdc\xff\xff\x80\x7c\x4a\xbf\xf3\xb7\xc1\xfa\xdd\xff\xff\x80\x18\x47\x82\xdb\x9a\xaa\xf3\xb6\xff\xff\x80\x01\xb6\xe1\xf9\xdb\xf0\xff\xe0\x80\x80\x80\x95\x96\xe2\xfc\xd8\xcd\xff\xab\x80\x80\x80\x1c\x6c\xaa\xf2\xb7\xc2\xfe\xdf\xff\xff\x80\x01\x51\xe6\xfc\xcc\xcb\xff\xc0\x80\x80\x80\x7b\x66\xd1\xf7\xbc\xc4\xff\xe9\x80\x80\x80\x14\x5f\x99\xf3\xa4\xad\xff\xcb\x80\x80\x80\x01\xde\xf8\xff\xd8\xd5\x80\x80\x80\x80\x80\xa8\xaf\xf6\xfc\xeb\xcd\xff\xff\x80\x80\x80\x2f\x74\xd7\xff\xd3\xd4\xff\xff\x80\x80\x80\x01\x79"
+    var i: usize = 0
+    while i < 1024 {
+        *((p + (at + i) as u64) as *mut u8) = t[i]
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn tables_part2(p: u64, at: usize) {
+    var t: [u8; 1024] = b"\xec\xfd\xd4\xd6\xff\xff\x80\x80\x80\x8d\x54\xd5\xfc\xc9\xca\xff\xdb\x80\x80\x80\x2a\x50\xa0\xf0\xa2\xb9\xff\xcd\x80\x80\x80\x01\x01\xff\x80\x80\x80\x80\x80\x80\x80\x80\xf4\x01\xff\x80\x80\x80\x80\x80\x80\x80\x80\xee\x01\xff\x80\x80\x80\x80\x80\x80\x80\x80\xe7\x78\x30\x59\x73\x71\x78\x98\x70\x98\xb3\x40\x7e\xaa\x76\x2e\x46\x5f\xaf\x45\x8f\x50\x55\x52\x48\x9b\x67\x38\x3a\x0a\xab\xda\xbd\x11\x0d\x98\x90\x47\x0a\x26\xab\xd5\x90\x22\x1a\x72\x1a\x11\xa3\x2c\xc3\x15\x0a\xad\x79\x18\x50\xc3\x1a\x3e\x2c\x40\x55\xaa\x2e\x37\x13\x88\xa0\x21\xce\x47\x3f\x14\x08\x72\x72\xd0\x0c\x09\xe2\x51\x28\x0b\x60\xb6\x54\x1d\x10\x24\x86\xb7\x59\x89\x62\x65\x6a\xa5\x94\x48\xbb\x64\x82\x9d\x6f\x20\x4b\x50\x42\x66\xa7\x63\x4a\x3e\x28\xea\x80\x29\x35\x09\xb2\xf1\x8d\x1a\x08\x6b\x68\x4f\x0c\x1b\xd9\xff\x57\x11\x07\x4a\x2b\x1a\x92\x49\xa6\x31\x17\x9d\x41\x26\x69\xa0\x33\x34\x1f\x73\x80\x57\x44\x47\x2c\x72\x33\x0f\xba\x17\x2f\x29\x0e\x6e\xb6\xb7\x15\x11\xc2\x42\x2d\x19\x66\xc5\xbd\x17\x12\x16\x58\x58\x93\x96\x2a\x2e\x2d\xc4\xcd\x2b\x61\xb7\x75\x55\x26\x23\xb3\x3d\x27\x35\xc8\x57\x1a\x15\x2b\xe8\xab\x38\x22\x33\x68\x72\x66\x1d\x5d\x4d\x6b\x36\x20\x1a\x33\x01\x51\x2b\x1f\x27\x1c\x55\xab\x3a\xa5\x5a\x62\x40\x22\x16\x74\xce\x17\x22\x2b\xa6\x49\x44\x19\x6a\x16\x40\xab\x24\xe1\x72\x22\x13\x15\x66\x84\xbc\x10\x4c\x7c\x3e\x12\x4e\x5f\x55\x39\x32\x30\x33\xc1\x65\x23\x9f\xd7\x6f\x59\x2e\x6f\x3c\x94\x1f\xac\xdb\xe4\x15\x12\x6f\x70\x71\x4d\x55\xb3\xff\x26\x78\x72\x28\x2a\x01\xc4\xf5\xd1\x0a\x19\x6d\x64\x50\x08\x2b\x9a\x01\x33\x1a\x47\x58\x2b\x1d\x8c\xa6\xd5\x25\x2b\x9a\x3d\x3f\x1e\x9b\x43\x2d\x44\x01\xd1\x8e\x4e\x4e\x10\xff\x80\x22\xc5\xab\x29\x28\x05\x66\xd3\xb7\x04\x01\xdd\x33\x32\x11\xa8\xd1\xc0\x17\x19\x52\x7d\x62\x2a\x58\x68\x55\x75\xaf\x52\x5f\x54\x35\x59\x80\x64\x71\x65\x2d\x4b\x4f\x7b\x2f\x33\x80\x51\xab\x01\x39\x11\x05\x47\x66\x39\x35\x29\x31\x73\x15\x02\x0a\x66\xff\xa6\x17\x06\x26\x21\x0d\x79\x39\x49\x1a\x01\x55\x29\x0a\x43\x8a\x4d\x6e\x5a\x2f\x72\x65\x1d\x10\x0a\x55\x80\x65\xc4\x1a\x39\x12\x0a\x66\x66\xd5\x22\x14\x2b\x75\x14\x0f\x24\xa3\x80\x44\x01\x1a\x8a\x1f\x24\xab\x1b\xa6\x26\x2c\xe5\x43\x57\x3a\xa9\x52\x73\x1a\x3b\xb3\x3f\x3b\x5a\xb4\x3b\xa6\x5d\x49\x9a\x28\x28\x15\x74\x8f\xd1\x22\x27\xaf\x39\x2e\x16\x18\x80\x01\x36\x11\x25\x2f\x0f\x10\xb7\x22\xdf\x31\x2d\xb7\x2e\x11\x21\xb7\x06\x62\x0f\x20\xb7\x41\x20\x49\x73\x1c\x80\x17\x80\xcd\x28\x03\x09\x73\x33\xc0\x12\x06\xdf\x57\x25\x09\x73\x3b\x4d\x40\x15\x2f\x68\x37\x2c\xda\x09\x36\x35\x82\xe2\x40\x5a\x46\xcd\x28\x29\x17\x1a\x39\x36\x39\x70\xb8\x05\x29\x26\xa6\xd5\x1e\x22\x1a\x85\x98\x74\x0a\x20\x86\x4b\x20\x0c\x33\xc0\xff\xa0\x2b\x33\x27\x13\x35\xdd\x1a\x72\x20\x49\xff\x1f\x09\x41\xea\x02\x0f\x01\x76\x49\x58\x1f\x23\x43\x66\x55\x37\xba\x55\x38\x15\x17\x6f\x3b\xcd\x2d\x25\xc0\x37\x26\x46\x7c\x49\x66\x01\x22\x62\x66\x3d\x47\x25\x22\x35\x1f\xf3\xc0\x45\x3c\x47\x26\x49\x77\x1c\xde\x25\x44\x2d\x80\x22\x01\x2f\x0b\xf5\xab\x3e\x11\x13\x46\x92\x55\x37\x3e\x46\x4b\x0f\x09\x09\x40\xff\xb8\x77\x10\x25\x2b\x25\x9a\x64\xa3\x55\xa0\x01\x3f\x09\x5c\x88\x1c\x40\x20\xc9\x55\x56\x06\x1c\x05\x40\xff\x19\xf8\x01\x38\x08\x11\x84\x89\xff\x37\x74\x80\x3a\x0f\x14\x52\x87\x39\x1a\x79\x28\xa4\x32\x1f\x89\x9a\x85\x19\x23\xda\x33\x67\x2c\x83\x83\x7b\x1f\x06\x9e\x56\x28\x40\x87\x94\xe0\x2d\xb7\x80\x16\x1a\x11\x83\xf0\x9a\x0e\x01\xd1\x53\x0c\x0d\x36\xc0\xff\x44\x2f\x1c\x2d\x10\x15\x5b\x40\xde\x07\x01\xc5\x38\x15\x27\x9b\x3c\x8a\x17\x66\xd5\x55\x1a\x55\x55\x80\x80\x20\x92\xab\x12\x0b\x07\x3f\x90\xab\x04\x04\xf6\x23\x1b\x0a\x92\xae\xab\x0c\x1a\x80\xbe\x50\x23\x63\xb4\x50\x7e\x36\x2d\x55\x7e\x2f\x57\xb0\x33\x29\x14\x20\x65\x4b\x80\x8b\x76\x92\x74\x80\x55\x38\x29\x0f\xb0\xec\x55\x25\x09\x3e\x92\x24\x13\x1e\xab\xff\x61\x1b\x14\x47\x1e\x11\x77\x76\xff\x11\x12\x8a\x65\x26\x3c\x8a\x37\x46\x2b\x1a\x8e\x8a\x2d\x3d\x3e\xdb\x01\x51\xbc\x40\x20\x29\x14\x75\x97\x8e\x14\x15\xa3\x70\x13\x0c\x3d\xc3\x80\x30\x04\x18\x04\x00\x05\x00\x06\x00\x07\x00\x08\x00\x09\x00\x0a\x00\x0a\x00\x0b\x00\x0c\x00\x0d\x00\x0e\x00\x0f\x00\x10\x00\x11\x00\x11\x00\x12\x00\x13\x00\x14\x00\x14\x00\x15\x00\x15\x00\x16\x00\x16\x00\x17\x00\x17\x00\x18\x00\x19\x00\x19\x00\x1a\x00"
+    var i: usize = 0
+    while i < 1024 {
+        *((p + (at + i) as u64) as *mut u8) = t[i]
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn tables_part3(p: u64, at: usize) {
+    var t: [u8; 452] = b"\x1b\x00\x1c\x00\x1d\x00\x1e\x00\x1f\x00\x20\x00\x21\x00\x22\x00\x23\x00\x24\x00\x25\x00\x25\x00\x26\x00\x27\x00\x28\x00\x29\x00\x2a\x00\x2b\x00\x2c\x00\x2d\x00\x2e\x00\x2e\x00\x2f\x00\x30\x00\x31\x00\x32\x00\x33\x00\x34\x00\x35\x00\x36\x00\x37\x00\x38\x00\x39\x00\x3a\x00\x3b\x00\x3c\x00\x3d\x00\x3e\x00\x3f\x00\x40\x00\x41\x00\x42\x00\x43\x00\x44\x00\x45\x00\x46\x00\x47\x00\x48\x00\x49\x00\x4a\x00\x4b\x00\x4c\x00\x4c\x00\x4d\x00\x4e\x00\x4f\x00\x50\x00\x51\x00\x52\x00\x53\x00\x54\x00\x55\x00\x56\x00\x57\x00\x58\x00\x59\x00\x5b\x00\x5d\x00\x5f\x00\x60\x00\x62\x00\x64\x00\x65\x00\x66\x00\x68\x00\x6a\x00\x6c\x00\x6e\x00\x70\x00\x72\x00\x74\x00\x76\x00\x7a\x00\x7c\x00\x7e\x00\x80\x00\x82\x00\x84\x00\x86\x00\x88\x00\x8a\x00\x8c\x00\x8f\x00\x91\x00\x94\x00\x97\x00\x9a\x00\x9d\x00\x04\x00\x05\x00\x06\x00\x07\x00\x08\x00\x09\x00\x0a\x00\x0b\x00\x0c\x00\x0d\x00\x0e\x00\x0f\x00\x10\x00\x11\x00\x12\x00\x13\x00\x14\x00\x15\x00\x16\x00\x17\x00\x18\x00\x19\x00\x1a\x00\x1b\x00\x1c\x00\x1d\x00\x1e\x00\x1f\x00\x20\x00\x21\x00\x22\x00\x23\x00\x24\x00\x25\x00\x26\x00\x27\x00\x28\x00\x29\x00\x2a\x00\x2b\x00\x2c\x00\x2d\x00\x2e\x00\x2f\x00\x30\x00\x31\x00\x32\x00\x33\x00\x34\x00\x35\x00\x36\x00\x37\x00\x38\x00\x39\x00\x3a\x00\x3c\x00\x3e\x00\x40\x00\x42\x00\x44\x00\x46\x00\x48\x00\x4a\x00\x4c\x00\x4e\x00\x50\x00\x52\x00\x54\x00\x56\x00\x58\x00\x5a\x00\x5c\x00\x5e\x00\x60\x00\x62\x00\x64\x00\x66\x00\x68\x00\x6a\x00\x6c\x00\x6e\x00\x70\x00\x72\x00\x74\x00\x77\x00\x7a\x00\x7d\x00\x80\x00\x83\x00\x86\x00\x89\x00\x8c\x00\x8f\x00\x92\x00\x95\x00\x98\x00\x9b\x00\x9e\x00\xa1\x00\xa4\x00\xa7\x00\xaa\x00\xad\x00\xb1\x00\xb5\x00\xb9\x00\xbd\x00\xc1\x00\xc5\x00\xc9\x00\xcd\x00\xd1\x00\xd5\x00\xd9\x00\xdd\x00\xe1\x00\xe5\x00\xea\x00\xef\x00\xf5\x00\xf9\x00\xfe\x00\x03\x01\x08\x01\x0d\x01\x12\x01\x17\x01\x1c\x01"
+    var i: usize = 0
+    while i < 452 {
+        *((p + (at + i) as u64) as *mut u8) = t[i]
+        i = i + 1
+    }
+}

@@ -1,0 +1,131 @@
+// expect_exit: 42
+// tests/2082_image_from_bytes.fi -- lib/fui/uiimagedec: ONE call decodes
+// PNG, JPEG, WebP or GIF by their first octets. The same opaque picture as
+// PNG, lossless WebP and GIF gives the same pixels (CRC-32 as Pillow's),
+// the colours come out in R, G, B, A order, an unknown or cut file gives
+// false and an empty picture, the pixel limit holds, and a Decoded can be
+// used again.
+import fui.uiimage
+import fui.uiimagedec
+import std.fs
+import std.rt
+import std.deflate
+
+fn load(path: str, buf: *mut rt.Buf) -> usize {
+    rt.buf_clear(buf)
+    return fs.read_file(path, buf) catch 0
+}
+
+// decodes `path`; returns the CRC-32 of the RGBA octets, or a small number
+// (1 = unreadable, 2 = refused, 3 = wrong size)
+fn crc_of(path: str, w: usize, h: usize, fmt: u32) -> u32 {
+    var data: rt.Buf = rt.buf_new()
+    let n: usize = load(path, &data)
+    if n == 0 {
+        return 1 as u32
+    }
+    if uiimage.image_format(rt.buf_ptr(&data), n) != fmt {
+        return 4 as u32
+    }
+    var d: uiimagedec.Decoded = uiimagedec.decoded_new()
+    var v: uiimage.Image = uiimage.image_new()
+    if !uiimagedec.image_from_bytes(rt.buf_ptr(&data), n, &d, &v) {
+        return 2 as u32
+    }
+    if v.w != w || v.h != h || !uiimage.image_ok(&v) {
+        return 3 as u32
+    }
+    let c: u32 = deflate.crc32(v.px, w * h * 4)
+    uiimagedec.decoded_free(&d)
+    rt.buf_free(&data)
+    return c
+}
+
+fn refused(p: u64, n: usize, limit: u64) -> bool {
+    var d: uiimagedec.Decoded = uiimagedec.decoded_new()
+    var v: uiimage.Image = uiimage.image_new()
+    let ok: bool = uiimagedec.image_from_bytes_limited(p, n, limit, &d, &v)
+    var empty: bool = !uiimage.image_ok(&v)
+    uiimagedec.decoded_free(&d)
+    return !ok && empty
+}
+
+fn main() -> i32 {
+    // one picture, three containers: all three give Pillow's pixels
+    if crc_of("tests/data/img/same.png", 61, 47, uiimage.IMG_FMT_PNG) != 2404311184 as u32 { return 1 as i32 }
+    if crc_of("tests/data/img/same.webp", 61, 47, uiimage.IMG_FMT_WEBP) != 2404311184 as u32 { return 2 as i32 }
+    if crc_of("tests/data/img/same.gif", 61, 47, uiimage.IMG_FMT_GIF) != 2404311184 as u32 { return 3 as i32 }
+    // JPEG (the CRC of tests/1916_jpeg.fi)
+    if crc_of("tests/data/jpeg/base420.jpg", 123, 77, uiimage.IMG_FMT_JPEG) != 2716695594 as u32 { return 4 as i32 }
+    // RGBA PNG, an animated WebP and GIF (the first frame)
+    if crc_of("tests/data/img/rgba.png", 24, 16, uiimage.IMG_FMT_PNG) != 3536439009 as u32 { return 5 as i32 }
+    if crc_of("tests/data/webp/anim_ll.webp", 48, 32, uiimage.IMG_FMT_WEBP) != 3993169432 as u32 { return 6 as i32 }
+    if crc_of("tests/data/gif/anim.gif", 50, 40, uiimage.IMG_FMT_GIF) != 127307801 as u32 { return 7 as i32 }
+    if crc_of("tests/data/webp/logo-blue.webp", 128, 128, uiimage.IMG_FMT_WEBP) != 3315418914 as u32 { return 8 as i32 }
+
+    // the channels read back as numbers: a lossless 1 x 1 and a 1 x 1 GIF
+    // agree, and the alpha octet is the fourth (fUi reads R at +0, A at +3)
+    var data: rt.Buf = rt.buf_new()
+    var n: usize = load("tests/data/img/rgba.png", &data)
+    var d: uiimagedec.Decoded = uiimagedec.decoded_new()
+    var v: uiimage.Image = uiimage.image_new()
+    if !uiimagedec.image_from_bytes(rt.buf_ptr(&data), n, &d, &v) { return 10 as i32 }
+    let px: u32 = uiimage.image_pixel_at(&v, 3, 2)
+    let o: usize = 2 * 24 * 4 + 3 * 4
+    let want: u32 = ((rt.ld8(v.px, o + 3) as u32) << 24) | ((rt.ld8(v.px, o) as u32) << 16)
+        | ((rt.ld8(v.px, o + 1) as u32) << 8) | (rt.ld8(v.px, o + 2) as u32)
+    if px != want { return 11 as i32 }
+
+    // the same Decoded again, with another format: the old pixels go first
+    n = load("tests/data/img/same.gif", &data)
+    if !uiimagedec.image_from_bytes(rt.buf_ptr(&data), n, &d, &v) { return 12 as i32 }
+    if v.w != 61 || v.h != 47 || d.fmt != uiimage.IMG_FMT_GIF { return 13 as i32 }
+    uiimagedec.decoded_free(&d)
+
+    // refusals: unknown bytes, a palette PNG (not taken by lib/paint/png.fi),
+    // empty input, the pixel limit
+    n = load("tests/data/img/palette.png", &data)
+    if !refused(rt.buf_ptr(&data), n, 1000000) { return 20 as i32 }
+    var junk: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 200 {
+        rt.buf_push(&junk, (i * 13 % 251) as u8)
+        i = i + 1
+    }
+    if !refused(rt.buf_ptr(&junk), rt.buf_len(&junk), 1000000) { return 21 as i32 }
+    if !refused(rt.buf_ptr(&junk), 0, 1000000) { return 22 as i32 }
+    n = load("tests/data/img/same.webp", &data)
+    if !refused(rt.buf_ptr(&data), n, 2866) { return 23 as i32 }
+    n = load("tests/data/img/same.gif", &data)
+    if !refused(rt.buf_ptr(&data), n, 2866) { return 24 as i32 }
+    n = load("tests/data/img/same.png", &data)
+    if !refused(rt.buf_ptr(&data), n, 2866) { return 25 as i32 }
+    n = load("tests/data/jpeg/base420.jpg", &data)
+    if !refused(rt.buf_ptr(&data), n, 9000) { return 26 as i32 }
+
+    // every cut of one file per format: no crash (a refusal, or the picture
+    // for the JPEG, which libjpeg-style decodes what is there)
+    var k: u32 = 0
+    while k < 5 {
+        if k == 0 { n = load("tests/data/img/same.png", &data) }
+        if k == 1 { n = load("tests/data/img/same.webp", &data) }
+        if k == 2 { n = load("tests/data/img/same.gif", &data) }
+        if k == 3 { n = load("tests/data/webp/lossy_alpha.webp", &data) }
+        if k == 4 { n = load("tests/data/img/rgba.png", &data) }
+        var c: usize = 0
+        while c < n {
+            var d2: uiimagedec.Decoded = uiimagedec.decoded_new()
+            var v2: uiimage.Image = uiimage.image_new()
+            let ok: bool = uiimagedec.image_from_bytes(rt.buf_ptr(&data), c, &d2, &v2)
+            // WebP: anything cut by more than the padding octet is refused;
+            // GIF: a cut inside the pixel data is (a missing trailer is not)
+            if ok && (k == 1 || k == 3) && c + 1 < n { return 30 as i32 + k as i32 }
+            if ok && k == 2 && c < n / 2 { return 30 as i32 + k as i32 }
+            if !ok && uiimage.image_ok(&v2) { return 40 as i32 }
+            uiimagedec.decoded_free(&d2)
+            c = c + 7
+        }
+        k = k + 1
+    }
+    return 42
+}
