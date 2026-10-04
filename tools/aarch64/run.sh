@@ -92,6 +92,19 @@ if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
 fi
 export MMAP_REUSE
 
+# Can a guest start another guest program? (execve of an aarch64 file needs
+# binfmt_misc on the host.) Decides the entries of environment.txt that name
+# the probe `foreign-exec`: the cases that start THEMSELVES as a child process.
+FOREIGN_EXEC=unknown
+if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+    if aarch64-linux-gnu-gcc -static -O0 -o "$WORK/probe_exec" tools/aarch64/qemu_exec_probe.c 2>/dev/null; then
+        PROBE_OUT=$("$QEMU" "$WORK/probe_exec" 2>&1)
+        if [ $? -eq 0 ]; then FOREIGN_EXEC=yes; else FOREIGN_EXEC=no; fi
+        echo "  probe: $PROBE_OUT"
+    fi
+fi
+export FOREIGN_EXEC
+
 # ---------------------------------------------------------------- one case
 # Writes exactly ONE result line to standard output:
 #   SAME <file> | DIFF <file> :: <why> | NOTSUP <file> :: <why>
@@ -107,6 +120,10 @@ differs() {   # $1 = file, $2 = why
         probe=$(echo "$line" | awk '{print $2}')
         reason=$(echo "$line" | cut -d' ' -f3-)
         if [ "$probe" = "mmap-address-reuse" ] && [ "${MMAP_REUSE:-unknown}" = "no" ]; then
+            echo "ENVIRON $1 :: $reason"
+            return
+        fi
+        if [ "$probe" = "foreign-exec" ] && [ "${FOREIGN_EXEC:-unknown}" = "no" ]; then
             echo "ENVIRON $1 :: $reason"
             return
         fi
@@ -194,7 +211,7 @@ one_case() {
     echo "SAME $file"
 }
 export -f one_case
-export FIRNC QEMU WORK FLAGS ROOT FIRNLIB
+export FIRNC QEMU WORK FLAGS ROOT FIRNLIB FOREIGN_EXEC MMAP_REUSE
 
 LIST="$WORK/list.txt"
 ls tests/*.fi > "$LIST"

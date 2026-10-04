@@ -1,0 +1,1144 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/process.fi -- std.process: start a program and talk to it (Linux).
+//
+// What a launcher needs: start `java` with an argument list, in a working
+// directory, with a changed environment; catch what it prints without
+// deadlocking on a full pipe; wait for it (with a limit); kill it; or let it
+// go and keep running after the launcher is gone.
+//
+//     import std.process
+//
+//     var c: process.Command = process.command("java")
+//     process.add_arg(&c, "-Xmx2G")
+//     process.add_arg(&c, "-jar")
+//     process.add_arg(&c, "game.jar")
+//     process.set_cwd(&c, "/home/me/.minecraft")
+//     process.set_env(&c, "LANG", "C")
+//
+//     // (a) run it, collect both outputs, at most 10 seconds
+//     var out: rt.Buf = rt.buf_new()
+//     var err: rt.Buf = rt.buf_new()
+//     let code: i32 = process.run_capture(&c, &out, &err, 10000) catch | e | ...
+//
+//     // (b) start it, read its output as it comes
+//     var ch: process.Child = process.spawn(&c) catch | e | ...
+//     while true {
+//         let n: i64 = process.read_out(&ch, buf, 4096)
+//         if n <= 0 { break }
+//     }
+//     process.wait(&ch)
+//
+//     // (c) let it run on its own
+//     process.set_detach(&c, true)
+//     process.spawn(&c)
+//
+// The same names and the same behaviour exist on Windows
+// (`process.windows.fi`, chosen by `--target=x86_64-windows`); the
+// differences are listed under HONEST.
+//
+// HOW IT IS DONE. `fork`, `execve`, `pipe2`, `dup2`, `wait4`, `kill`, `poll`
+// through the `syscall` intrinsic, no libc. Everything the child needs
+// (argument vector, environment, strings) is built BEFORE the fork, so the
+// child between `fork` and `execve` only makes system calls -- it allocates
+// nothing and touches no lock, which matters in a program with threads and a
+// garbage collector. Whether `execve` worked is reported through a pipe
+// that closes by itself on a successful exec: the parent reads either end of
+// file (success) or four octets with the errno (failure). That is how
+// `process.spawn("no-such-program")` fails in the CALLER instead of
+// producing a child that exits with 127.
+//
+// All pipe ends the library keeps are close-on-exec, so a second child
+// started later does not inherit the first child's stdin and hold it open
+// (the reason a child waiting for end of file otherwise waits forever).
+//
+// WRITING TO A CHILD THAT IS GONE raises SIGPIPE, whose default action kills
+// the writer. `write_in` blocks the signal for the call and swallows it, so
+// the answer is the error `-32` (EPIPE) and not the death of the launcher.
+//
+// DEADLOCK. A child that writes more than a pipe holds (64 KiB on Linux)
+// stops until somebody reads. A parent that reads stdout to the end FIRST
+// and stderr afterwards stops too, if the child fills stderr first. Both are
+// avoided by `communicate`/`run_capture`/`run_io`, which `poll` all pipes and
+// write the input in small pieces while reading (tests/2062 pushes 3 MiB
+// through `cat` in both directions at once).
+//
+// HONEST
+// P1  `detach` is a double fork with `setsid`: the program is no longer a
+//     child of the caller, the caller never has to `wait` for it, and
+//     closing the terminal does not take it along. The `Child` has the pid
+//     and no pipes, and `wait`/`kill` still work on it for as long as the pid
+//     is not reused (`wait` cannot, because it is not our child any more:
+//     it polls the pid with `kill(pid, 0)`; the exit code is then unknown, -1).
+// P2  Searching `PATH` is done by the library (std.env.find_executable).
+//     A name with a `/` is used as it is; relative to the working
+//     directory of the CALLER (not of the child) -- `set_cwd` does not
+//     change what `command("./run.sh")` means.
+// P3  `terminate` is SIGTERM, `kill` is SIGKILL. Only the child receives it;
+//     grandchildren (a launcher script's `java`) survive a `kill`. A process
+//     group kill is not offered.
+// P4  The exit code of a child killed by a signal is 128 + signal number
+//     (`term_signal` tells the signal itself).
+// P5  `no_window` has no meaning on Linux and is accepted.
+// P6  The environment is rebuilt from `/proc/self/environ`, i.e. the one
+//     the launcher started with.
+// P7  `fork` of a process with a big heap copies page tables; for a
+//     launcher this is a few milliseconds. `vfork`/`posix_spawn` would be
+//     cheaper and are not used because the sequence between fork and exec
+//     (chdir, dup2) is the whole point.
+// P8  wait with timeout polls `wait4(WNOHANG)` every 1..10 ms. There is no
+//     SIGCHLD handler and no pidfd.
+
+import rt
+import str
+import env
+import envblock
+import fs
+
+export {
+    ProcError, Command, Child,
+    STDIO_INHERIT, STDIO_PIPE, STDIO_NULL,
+    command, command_free, add_arg, set_cwd, set_env, unset_env, clear_env,
+    set_stdin, set_stdout, set_stderr, merge_stderr,
+    set_no_window, set_detach,
+    spawn, run, run_capture, run_io, communicate,
+    write_in, close_in, read_out, read_err, read_out_nb, read_err_nb,
+    wait, wait_timeout, try_wait, is_running, exit_code, term_signal, pid_of,
+    kill, terminate, close,
+    last_errno,
+}
+
+error ProcError {
+    NotFound, // the program does not exist (or is not on PATH)
+    Permission, // it exists but cannot be executed / the directory cannot be entered
+    Invalid, // an empty program name, a NUL octet in an argument, a bad mode
+    Resource, // fork / pipe failed (out of processes, out of descriptors)
+    Exec, // execve failed for another reason (bad format, ...)
+    Timeout, // run_capture ran out of time (the child was killed)
+    Io, // a pipe broke while collecting output
+}
+
+const STDIO_INHERIT: u8 = 0 // the child shares the caller's descriptor
+const STDIO_PIPE: u8 = 1 // a pipe; the caller reads/writes the other end
+const STDIO_NULL: u8 = 2 // /dev/null (reads give end of file, writes vanish)
+const STDIO_MERGE: u8 = 3 // stderr only: the same destination as stdout
+
+// What a program is started with. Everything is copied into memory of the
+// command's own (not the garbage collected heap), so the strings given to
+// the builders need not stay alive.
+struct Command {
+    program: rt.Buf, // the name as given, NUL terminated
+    args: rt.Buf, // NUL terminated strings, one after the other
+    nargs: usize,
+    cwd: rt.Buf, // empty = inherit
+    envs: rt.Buf, // "K=V\0" sets, "K\0" removes
+    env_clear: bool,
+    in_mode: u8,
+    out_mode: u8,
+    err_mode: u8,
+    no_window: bool,
+    detach: bool,
+    bad: bool, // a NUL octet or an empty program name was given
+}
+
+// A started child. The descriptors are -1 when not piped.
+struct Child {
+    pid: i64,
+    h: u64, // the process handle (Windows); 0 here
+    in_fd: i64,
+    out_fd: i64,
+    err_fd: i64,
+    done: bool,
+    code: i32,
+    sig: i32,
+    own: bool, // false for a detached child (not our child: wait4 cannot see it)
+}
+
+const SYS_READ: i64 = 0
+const SYS_WRITE: i64 = 1
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const SYS_POLL: i64 = 7
+const SYS_RT_SIGPROCMASK: i64 = 14
+const SYS_DUP2: i64 = 33
+const SYS_NANOSLEEP: i64 = 35
+const SYS_FORK: i64 = 57
+const SYS_EXECVE: i64 = 59
+const SYS_WAIT4: i64 = 61
+const SYS_KILL: i64 = 62
+const SYS_FCNTL: i64 = 72
+const SYS_CHDIR: i64 = 80
+const SYS_SETSID: i64 = 112
+const SYS_RT_SIGTIMEDWAIT: i64 = 128
+const SYS_CLOCK_GETTIME: i64 = 228
+const SYS_PIPE2: i64 = 293
+
+const O_RDWR: i64 = 2
+const O_CLOEXEC: i64 = 524288 // 0x80000
+const O_NONBLOCK: i64 = 2048
+const F_SETFD: i64 = 2
+const F_SETFL: i64 = 4
+const WNOHANG: i64 = 1
+const POLLIN: i64 = 1
+const POLLOUT: i64 = 4
+const POLLERR: i64 = 8
+const POLLHUP: i64 = 16
+const SIGKILL: i64 = 9
+const SIGTERM: i64 = 15
+const SIGPIPE_BIT: u64 = 4096 // 1 << (13 - 1)
+const SIG_BLOCK: i64 = 0
+const SIG_SETMASK: i64 = 2
+const EINTR: i64 = -4
+const EAGAIN: i64 = -11
+const EPIPE: i64 = -32
+
+static mut proc_errno: i64 = 0
+
+// The errno of the last failure inside this module (0 = none yet).
+fn last_errno() -> i64 {
+    return proc_errno
+}
+
+// ------------------------------------------------------------ The command
+
+fn push_cstr(b: *mut rt.Buf, s: str) -> bool {
+    let n: usize = s.length()
+    var i: usize = 0
+    while i < n {
+        if s.chars(i) == 0 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    rt.buf_push_bytes(b, s.p as u64, n)
+    rt.buf_push(b, 0 as u8)
+    return true
+}
+
+// A command for the program `program`: a name that is looked up in PATH, or
+// a path. The name is also what the child sees as argument 0.
+fn command(program: str) -> Command {
+    var c: Command = Command {
+        program: rt.buf_new(), args: rt.buf_new(), nargs: 0, cwd: rt.buf_new(),
+        envs: rt.buf_new(), env_clear: false, in_mode: 0 as u8, out_mode: 0 as u8,
+        err_mode: 0 as u8, no_window: false, detach: false, bad: false,
+    }
+    if program.length() == 0 || !push_cstr(&c.program, program) {
+        c.bad = true
+    }
+    return c
+}
+
+// Gives the memory of the command back. Call it when the command is no longer needed.
+fn command_free(c: *mut Command) {
+    rt.buf_free(&(*c).program)
+    rt.buf_free(&(*c).args)
+    rt.buf_free(&(*c).cwd)
+    rt.buf_free(&(*c).envs)
+    (*c).nargs = 0
+}
+
+fn add_arg(c: *mut Command, a: str) {
+    if !push_cstr(&(*c).args, a) {
+        (*c).bad = true
+        return
+    }
+    (*c).nargs = (*c).nargs + 1
+}
+
+// The working directory of the child. Empty = the caller's.
+fn set_cwd(c: *mut Command, dir: str) {
+    rt.buf_clear(&(*c).cwd)
+    if dir.length() == 0 {
+        return
+    }
+    if !push_cstr(&(*c).cwd, dir) {
+        (*c).bad = true
+    }
+}
+
+// Does the entry `e` (a slice of `envs`, "K=V" or "K") have the key `key`?
+fn key_is(blob: *mut rt.Buf, at: usize, end: usize, key: str) -> bool {
+    let n: usize = key.length()
+    var k: usize = 0
+    while at + k < end && rt.buf_at(blob, at + k) != 61 as u8 {
+        k = k + 1
+    }
+    if k != n {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if rt.buf_at(blob, at + i) != key.chars(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Removes every entry with the key `key` from the list of changes.
+fn envs_drop(c: *mut Command, key: str) {
+    var out: rt.Buf = rt.buf_new()
+    let total: usize = rt.buf_len(&(*c).envs)
+    var at: usize = 0
+    while at < total {
+        var e: usize = at
+        while e < total && rt.buf_at(&(*c).envs, e) != 0 as u8 {
+            e = e + 1
+        }
+        if !key_is(&(*c).envs, at, e, key) {
+            rt.buf_push_bytes(&out, rt.buf_ptr(&(*c).envs) + at as u64, e - at + 1)
+        }
+        at = e + 1
+    }
+    rt.buf_free(&(*c).envs)
+    (*c).envs = out
+}
+
+fn env_key_ok(key: str) -> bool {
+    if key.length() == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < key.length() {
+        if key.chars(i) == 61 as u8 || key.chars(i) == 0 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The child gets `key=value` (replacing an inherited one).
+fn set_env(c: *mut Command, key: str, value: str) {
+    if !env_key_ok(key) {
+        (*c).bad = true
+        return
+    }
+    envs_drop(c, key)
+    rt.buf_push_bytes(&(*c).envs, key.p as u64, key.length())
+    rt.buf_push(&(*c).envs, 61 as u8)
+    if !push_cstr(&(*c).envs, value) {
+        (*c).bad = true
+    }
+}
+
+// The child does not get the variable `key`, even if the caller has it.
+fn unset_env(c: *mut Command, key: str) {
+    if !env_key_ok(key) {
+        (*c).bad = true
+        return
+    }
+    envs_drop(c, key)
+    push_cstr(&(*c).envs, key)
+}
+
+// The child starts with an EMPTY environment (plus the `set_env` ones).
+fn clear_env(c: *mut Command) {
+    (*c).env_clear = true
+}
+
+fn mode_ok(m: u8) -> bool {
+    return m == STDIO_INHERIT || m == STDIO_PIPE || m == STDIO_NULL
+}
+
+fn set_stdin(c: *mut Command, mode: u8) {
+    if !mode_ok(mode) {
+        (*c).bad = true
+        return
+    }
+    (*c).in_mode = mode
+}
+
+fn set_stdout(c: *mut Command, mode: u8) {
+    if !mode_ok(mode) {
+        (*c).bad = true
+        return
+    }
+    (*c).out_mode = mode
+}
+
+fn set_stderr(c: *mut Command, mode: u8) {
+    if !mode_ok(mode) {
+        (*c).bad = true
+        return
+    }
+    (*c).err_mode = mode
+}
+
+// stderr goes where stdout goes (`2>&1`): one pipe, the lines in the order
+// the child wrote them.
+fn merge_stderr(c: *mut Command) {
+    (*c).err_mode = STDIO_MERGE
+}
+
+// Windows: no console window for the child (CREATE_NO_WINDOW). Linux: no effect.
+fn set_no_window(c: *mut Command, on: bool) {
+    (*c).no_window = on
+}
+
+// The child runs on after the caller, is not its child, and survives it.
+// With `detach` the three standard descriptors can be PIPE only for the
+// child's own use: the caller gets none of them. Use STDIO_NULL or
+// STDIO_INHERIT.
+fn set_detach(c: *mut Command, on: bool) {
+    (*c).detach = on
+}
+
+// ---------------------------------------------------------- The helpers
+
+fn now_ms() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(SYS_CLOCK_GETTIME, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] * 1000 + ts[1] / 1000000) as u64
+}
+
+fn sleep_ms_raw(ms: u64) {
+    var ts: [i64; 2] = [(ms / 1000) as i64, ((ms % 1000) * 1000000) as i64]
+    var rem: [i64; 2] = [0; 2]
+    var r: i64 = syscall(SYS_NANOSLEEP, (&ts[0]) as i64, (&rem[0]) as i64, 0, 0, 0, 0)
+    while r == EINTR {
+        ts[0] = rem[0]
+        ts[1] = rem[1]
+        r = syscall(SYS_NANOSLEEP, (&ts[0]) as i64, (&rem[0]) as i64, 0, 0, 0, 0)
+    }
+}
+
+fn close_fd(fd: i64) {
+    if fd >= 0 {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    }
+}
+
+// An array of `count` pointers into the NUL separated strings of `blob`,
+// closed by a zero pointer. Memory from the page allocator; give it back
+// with `ptr_array_free`.
+fn ptr_array(blob: *mut rt.Buf, count: usize) -> u64 {
+    let a: u64 = rt.heap_alloc((count + 1) * 8)
+    if a == 0 {
+        return 0
+    }
+    var at: usize = 0
+    var k: usize = 0
+    let base: u64 = rt.buf_ptr(blob)
+    while k < count {
+        rt.st64(a, k, base + at as u64)
+        while rt.buf_at(blob, at) != 0 as u8 {
+            at = at + 1
+        }
+        at = at + 1
+        k = k + 1
+    }
+    rt.st64(a, count, 0)
+    return a
+}
+
+fn ptr_array_free(a: u64, count: usize) {
+    if a != 0 {
+        rt.heap_free(a, (count + 1) * 8)
+    }
+}
+
+// The environment of the child: the inherited one (unless cleared), minus
+// the keys the command removes or sets, plus the sets. Result in `out`
+// ("K=V\0" ...), the number of entries returned.
+fn build_env(c: *mut Command, out: *mut rt.Buf) -> usize {
+    var base: rt.Buf = rt.buf_new()
+    if !(*c).env_clear {
+        env.list_into(&base)
+    }
+    let n: usize = envblock.merge_env(&base, &(*c).envs, false, out)
+    rt.buf_free(&base)
+    return n
+}
+
+fn error_of(errno: i64) -> ProcError {
+    proc_errno = errno
+    if errno == 2 || errno == 20 {
+        return ProcError::NotFound
+    }
+    if errno == 13 || errno == 1 {
+        return ProcError::Permission
+    }
+    if errno == 12 || errno == 11 || errno == 24 || errno == 23 {
+        return ProcError::Resource
+    }
+    return ProcError::Exec
+}
+
+// ------------------------------------------------------- The child side
+//
+// Runs in the forked child. ONLY system calls and arithmetic: no
+// allocation, no function that could take a lock. Never returns.
+
+fn child_fail(errpipe: i64, errno: i64) {
+    var e: [i32; 1] = [errno as i32]
+    syscall(SYS_WRITE, errpipe, (&e[0]) as i64, 4, 0, 0, 0)
+    rt.finish(127)
+}
+
+// Puts `from` on the descriptor `to` (and clears close-on-exec on it).
+fn child_dup(errpipe: i64, from: i64, to: i64) {
+    if from == to {
+        syscall(SYS_FCNTL, to, F_SETFD, 0, 0, 0, 0)
+        return
+    }
+    let r: i64 = syscall(SYS_DUP2, from, to, 0, 0, 0, 0)
+    if r < 0 {
+        child_fail(errpipe, 0 - r)
+    }
+}
+
+fn child_null(errpipe: i64, to: i64, devnull: u64) {
+    let fd: i64 = syscall(SYS_OPEN, devnull as i64, O_RDWR, 0, 0, 0, 0)
+    if fd < 0 {
+        child_fail(errpipe, 0 - fd)
+    }
+    child_dup(errpipe, fd, to)
+    if fd != to {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    }
+}
+
+// in_c/out_c/err_c: the child's end of each pipe (or -1).
+fn child_run(c: *mut Command, exe: u64, argv: u64, envp: u64, in_c: i64, out_c: i64,
+    err_c: i64, errpipe: i64, pidpipe: i64, devnull: u64) {
+    if (*c).detach {
+        syscall(SYS_SETSID, 0, 0, 0, 0, 0, 0)
+        let g: i64 = syscall(SYS_FORK, 0, 0, 0, 0, 0, 0)
+        if g < 0 {
+            child_fail(errpipe, 0 - g)
+        }
+        if g > 0 {
+            // the middle process: hand the pid to the caller and vanish
+            var gp: [i32; 1] = [g as i32]
+            syscall(SYS_WRITE, pidpipe, (&gp[0]) as i64, 4, 0, 0, 0)
+            rt.finish(0)
+        }
+    }
+    if rt.buf_len(&(*c).cwd) > 0 {
+        let r: i64 = syscall(SYS_CHDIR, rt.buf_ptr(&(*c).cwd) as i64, 0, 0, 0, 0, 0)
+        if r < 0 {
+            child_fail(errpipe, 0 - r)
+        }
+    }
+    if (*c).in_mode == STDIO_PIPE {
+        child_dup(errpipe, in_c, 0)
+    } else if (*c).in_mode == STDIO_NULL {
+        child_null(errpipe, 0, devnull)
+    }
+    if (*c).out_mode == STDIO_PIPE {
+        child_dup(errpipe, out_c, 1)
+    } else if (*c).out_mode == STDIO_NULL {
+        child_null(errpipe, 1, devnull)
+    }
+    if (*c).err_mode == STDIO_PIPE {
+        child_dup(errpipe, err_c, 2)
+    } else if (*c).err_mode == STDIO_NULL {
+        child_null(errpipe, 2, devnull)
+    } else if (*c).err_mode == STDIO_MERGE {
+        child_dup(errpipe, 1, 2)
+    }
+    let r: i64 = syscall(SYS_EXECVE, exe as i64, argv as i64, envp as i64, 0, 0, 0)
+    // only reached when execve failed; the errno is the negated result
+    child_fail(errpipe, 0 - r)
+}
+
+// ------------------------------------------------------------- Spawning
+
+const SYS_GETCWD: i64 = 79
+
+// `exe` is a path; a relative one is made absolute against the CALLER's
+// working directory NOW, because the child changes its own before `execve`
+// (`set_cwd`) and would otherwise look for the program in the wrong place.
+fn absolutize(exe: *mut rt.Buf) {
+    if rt.buf_len(exe) == 0 || rt.buf_at(exe, 0) == 47 as u8 {
+        return
+    }
+    var cwd: [u8; 4096] = [0 as u8; 4096]
+    let r: i64 = syscall(SYS_GETCWD, (&cwd[0]) as i64, 4096, 0, 0, 0, 0)
+    if r <= 0 {
+        return
+    }
+    var joined: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&joined, (&cwd[0]) as u64, rt.c_length((&cwd[0]) as u64))
+    if rt.buf_at(&joined, rt.buf_len(&joined) - 1) != 47 as u8 {
+        rt.buf_push(&joined, 47 as u8)
+    }
+    // "./x" -> "x"
+    var skip: usize = 0
+    while rt.buf_len(exe) >= skip + 2 && rt.buf_at(exe, skip) == 46 as u8 && rt.buf_at(exe, skip + 1) == 47 as u8 {
+        skip = skip + 2
+    }
+    rt.buf_push_bytes(&joined, rt.buf_ptr(exe) + skip as u64, rt.buf_len(exe) - skip)
+    rt.buf_free(exe)
+    *exe = joined
+}
+
+fn make_pipe(fds: *mut i32) -> bool {
+    return syscall(SYS_PIPE2, fds as i64, O_CLOEXEC, 0, 0, 0, 0) >= 0
+}
+
+// Starts the program. The command stays usable (it can be started again).
+fn spawn(c: *mut Command) -> ProcError!Child {
+    if (*c).bad || rt.buf_len(&(*c).program) <= 1 {
+        return ProcError::Invalid
+    }
+    if (*c).detach && ((*c).in_mode == STDIO_PIPE || (*c).out_mode == STDIO_PIPE
+        || (*c).err_mode == STDIO_PIPE || (*c).err_mode == STDIO_MERGE) {
+        return ProcError::Invalid
+    }
+    if (*c).err_mode == STDIO_MERGE && (*c).out_mode == STDIO_NULL {
+        // 2>&1 onto /dev/null: the same as NULL for stderr
+        (*c).err_mode = STDIO_NULL
+    }
+    let pname: str = str { p: rt.buf_data(&(*c).program), n: rt.buf_len(&(*c).program) - 1 }
+
+    // --- the program
+    var exe: rt.Buf = rt.buf_new()
+    if !env.find_executable(pname, &exe) {
+        rt.buf_free(&exe)
+        // a path that exists but cannot be executed is another error than a missing one
+        var sl: bool = false
+        var i: usize = 0
+        while i < pname.length() {
+            if pname.chars(i) == 47 as u8 {
+                sl = true
+            }
+            i = i + 1
+        }
+        if sl && fs.exists(pname) {
+            proc_errno = 13
+            return ProcError::Permission
+        }
+        proc_errno = 2
+        return ProcError::NotFound
+    }
+    absolutize(&exe)
+    rt.buf_push(&exe, 0 as u8)
+
+    // --- argument vector: argv[0] = the name as given
+    var argblob: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&argblob, rt.buf_ptr(&(*c).program), rt.buf_len(&(*c).program))
+    rt.buf_push_bytes(&argblob, rt.buf_ptr(&(*c).args), rt.buf_len(&(*c).args))
+    let argc: usize = (*c).nargs + 1
+    let argv: u64 = ptr_array(&argblob, argc)
+
+    // --- environment
+    var envblob: rt.Buf = rt.buf_new()
+    let envc: usize = build_env(c, &envblob)
+    let envp: u64 = ptr_array(&envblob, envc)
+    var devnull: [u8; 10] = "/dev/null\0"
+
+    // --- pipes
+    var pin: [i32; 2] = [-1; 2]
+    var pout: [i32; 2] = [-1; 2]
+    var perr: [i32; 2] = [-1; 2]
+    var perrno: [i32; 2] = [-1; 2]
+    var ppid: [i32; 2] = [-1; 2]
+    var ok: bool = argv != 0 && envp != 0 && make_pipe((&perrno[0]) as *mut i32)
+    if ok && (*c).detach {
+        ok = make_pipe((&ppid[0]) as *mut i32)
+    }
+    if ok && (*c).in_mode == STDIO_PIPE {
+        ok = make_pipe((&pin[0]) as *mut i32)
+    }
+    if ok && (*c).out_mode == STDIO_PIPE {
+        ok = make_pipe((&pout[0]) as *mut i32)
+    }
+    if ok && (*c).err_mode == STDIO_PIPE {
+        ok = make_pipe((&perr[0]) as *mut i32)
+    }
+    if !ok {
+        close_fd(pin[0] as i64)
+        close_fd(pin[1] as i64)
+        close_fd(pout[0] as i64)
+        close_fd(pout[1] as i64)
+        close_fd(perr[0] as i64)
+        close_fd(perr[1] as i64)
+        close_fd(perrno[0] as i64)
+        close_fd(perrno[1] as i64)
+        close_fd(ppid[0] as i64)
+        close_fd(ppid[1] as i64)
+        ptr_array_free(argv, argc)
+        ptr_array_free(envp, envc)
+        rt.buf_free(&exe)
+        rt.buf_free(&argblob)
+        rt.buf_free(&envblob)
+        proc_errno = 24
+        return ProcError::Resource
+    }
+
+    let kid: i64 = syscall(SYS_FORK, 0, 0, 0, 0, 0, 0)
+    if kid == 0 {
+        child_run(c, rt.buf_ptr(&exe), argv, envp, pin[0] as i64, pout[1] as i64,
+            perr[1] as i64, perrno[1] as i64, ppid[1] as i64, (&devnull[0]) as u64)
+    }
+    // --- parent
+    close_fd(pin[0] as i64)
+    close_fd(pout[1] as i64)
+    close_fd(perr[1] as i64)
+    close_fd(perrno[1] as i64)
+    close_fd(ppid[1] as i64)
+    ptr_array_free(argv, argc)
+    ptr_array_free(envp, envc)
+    rt.buf_free(&exe)
+    rt.buf_free(&argblob)
+    rt.buf_free(&envblob)
+    if kid < 0 {
+        close_fd(pin[1] as i64)
+        close_fd(pout[0] as i64)
+        close_fd(perr[0] as i64)
+        close_fd(perrno[0] as i64)
+        close_fd(ppid[0] as i64)
+        proc_errno = 0 - kid
+        return ProcError::Resource
+    }
+
+    var child_pid: i64 = kid
+    var own: bool = true
+    if (*c).detach {
+        // the middle process writes the grandchild's pid and exits
+        var gp: [i32; 1] = [0]
+        var got: i64 = syscall(SYS_READ, ppid[0] as i64, (&gp[0]) as i64, 4, 0, 0, 0)
+        while got == EINTR {
+            got = syscall(SYS_READ, ppid[0] as i64, (&gp[0]) as i64, 4, 0, 0, 0)
+        }
+        var st: i32 = 0
+        syscall(SYS_WAIT4, kid, (&st) as i64, 0, 0, 0, 0)
+        close_fd(ppid[0] as i64)
+        if got == 4 {
+            child_pid = gp[0] as i64
+            own = false
+        } else {
+            // the middle process failed before the second fork: errpipe has the reason
+            child_pid = 0 - 1
+        }
+    }
+
+    // --- did execve work? (end of file = yes, 4 octets = the errno)
+    var ee: [i32; 1] = [0]
+    var n: i64 = syscall(SYS_READ, perrno[0] as i64, (&ee[0]) as i64, 4, 0, 0, 0)
+    while n == EINTR {
+        n = syscall(SYS_READ, perrno[0] as i64, (&ee[0]) as i64, 4, 0, 0, 0)
+    }
+    close_fd(perrno[0] as i64)
+    if n == 4 || child_pid < 0 {
+        var st2: i32 = 0
+        if own {
+            syscall(SYS_WAIT4, kid, (&st2) as i64, 0, 0, 0, 0)
+        }
+        close_fd(pin[1] as i64)
+        close_fd(pout[0] as i64)
+        close_fd(perr[0] as i64)
+        if n == 4 {
+            return error_of(ee[0] as i64)
+        }
+        proc_errno = 5
+        return ProcError::Exec
+    }
+    // a pipe that the caller keeps must never block it by accident
+    return Child {
+        pid: child_pid, h: 0, in_fd: pin[1] as i64, out_fd: pout[0] as i64,
+        err_fd: perr[0] as i64, done: false, code: 0, sig: 0, own: own,
+    }
+}
+
+// ----------------------------------------------------------- The pipes
+
+// Writes all `n` octets to the child's stdin. The result is `n`, or a
+// negated errno (-32 = the child closed its stdin or is gone).
+fn write_in(ch: *mut Child, p: u64, n: usize) -> i64 {
+    if (*ch).in_fd < 0 {
+        return -9
+    }
+    // SIGPIPE: block it for this thread while we write
+    var set: [u64; 1] = [SIGPIPE_BIT]
+    var old: [u64; 1] = [0]
+    syscall(SYS_RT_SIGPROCMASK, SIG_BLOCK, (&set[0]) as i64, (&old[0]) as i64, 8, 0, 0)
+    var done: usize = 0
+    var result: i64 = n as i64
+    while done < n {
+        let r: i64 = syscall(SYS_WRITE, (*ch).in_fd, (p + done as u64) as i64, (n - done) as i64, 0, 0, 0)
+        if r == EINTR {
+            continue
+        }
+        if r == EAGAIN {
+            // a non blocking pipe (after communicate): wait until it can take more
+            var pfd: [i32; 2] = [(*ch).in_fd as i32, POLLOUT as i32]
+            syscall(SYS_POLL, (&pfd[0]) as i64, 1, -1, 0, 0, 0)
+            continue
+        }
+        if r < 0 {
+            result = r
+            break
+        }
+        done = done + r as usize
+    }
+    if result == EPIPE {
+        // swallow the SIGPIPE this write made pending
+        var zero: [i64; 2] = [0; 2]
+        syscall(SYS_RT_SIGTIMEDWAIT, (&set[0]) as i64, 0, (&zero[0]) as i64, 8, 0, 0)
+    }
+    syscall(SYS_RT_SIGPROCMASK, SIG_SETMASK, (&old[0]) as i64, 0, 8, 0, 0)
+    return result
+}
+
+// Closes the child's stdin: the child reads end of file.
+fn close_in(ch: *mut Child) {
+    close_fd((*ch).in_fd)
+    (*ch).in_fd = -1
+}
+
+fn read_fd_blocking(fd: i64, p: u64, cap: usize) -> i64 {
+    if fd < 0 {
+        return 0
+    }
+    var r: i64 = syscall(SYS_READ, fd, p as i64, cap as i64, 0, 0, 0)
+    while r == EINTR {
+        r = syscall(SYS_READ, fd, p as i64, cap as i64, 0, 0, 0)
+    }
+    return r
+}
+
+// Is there something to read (or end of file) on `fd` right now?
+fn readable(fd: i64) -> bool {
+    var pfd: [i32; 2] = [fd as i32, POLLIN as i32]
+    var r: i64 = syscall(SYS_POLL, (&pfd[0]) as i64, 1, 0, 0, 0, 0)
+    while r == EINTR {
+        r = syscall(SYS_POLL, (&pfd[0]) as i64, 1, 0, 0, 0, 0)
+    }
+    return r > 0
+}
+
+fn read_fd_nb(fd: i64, p: u64, cap: usize) -> i64 {
+    if fd < 0 {
+        return 0
+    }
+    if !readable(fd) {
+        return EAGAIN
+    }
+    return read_fd_blocking(fd, p, cap)
+}
+
+// Reads from the child's stdout, BLOCKING until there is something: the
+// result is the number of octets (at most `cap`), 0 at end of file (the
+// child closed its stdout, normally by exiting), or a negated errno. A
+// short read is normal; it is not an end of file.
+fn read_out(ch: *mut Child, p: u64, cap: usize) -> i64 {
+    return read_fd_blocking((*ch).out_fd, p, cap)
+}
+
+fn read_err(ch: *mut Child, p: u64, cap: usize) -> i64 {
+    return read_fd_blocking((*ch).err_fd, p, cap)
+}
+
+// The same without blocking: -11 (EAGAIN) means "nothing yet, still open".
+fn read_out_nb(ch: *mut Child, p: u64, cap: usize) -> i64 {
+    return read_fd_nb((*ch).out_fd, p, cap)
+}
+
+fn read_err_nb(ch: *mut Child, p: u64, cap: usize) -> i64 {
+    return read_fd_nb((*ch).err_fd, p, cap)
+}
+
+// --------------------------------------------------------------- Waiting
+
+// Looks at the child. `flags` = WNOHANG (do not block) or 0. true = it has
+// ended (code/sig are set).
+fn reap(ch: *mut Child, flags: i64) -> bool {
+    if (*ch).done {
+        return true
+    }
+    if !(*ch).own {
+        // not our child: all that can be asked is "does the pid still exist?"
+        var alive: bool = true
+        if flags == 0 {
+            while alive {
+                alive = syscall(SYS_KILL, (*ch).pid, 0, 0, 0, 0, 0) == 0
+                if alive {
+                    sleep_ms_raw(20)
+                }
+            }
+        } else {
+            alive = syscall(SYS_KILL, (*ch).pid, 0, 0, 0, 0, 0) == 0
+        }
+        if !alive {
+            (*ch).done = true
+            (*ch).code = -1
+        }
+        return (*ch).done
+    }
+    var status: i32 = 0
+    var r: i64 = syscall(SYS_WAIT4, (*ch).pid, (&status) as i64, flags, 0, 0, 0)
+    while r == EINTR {
+        r = syscall(SYS_WAIT4, (*ch).pid, (&status) as i64, flags, 0, 0, 0)
+    }
+    if r == 0 {
+        return false
+    }
+    (*ch).done = true
+    if r < 0 {
+        // somebody else collected it (SIGCHLD ignored, another wait): gone, code unknown
+        (*ch).code = -1
+        return true
+    }
+    if (status & 127) == 0 {
+        (*ch).code = (status >> 8) & 255
+    } else {
+        (*ch).sig = status & 127
+        (*ch).code = 128 + (status & 127)
+    }
+    return true
+}
+
+// Waits until the child has ended and returns its exit code (128 + signal
+// when a signal ended it, -1 when unknown).
+fn wait(ch: *mut Child) -> i32 {
+    reap(ch, 0)
+    return (*ch).code
+}
+
+// Waits at most `ms` milliseconds. true = the child has ended.
+fn wait_timeout(ch: *mut Child, ms: u64) -> bool {
+    if reap(ch, WNOHANG) {
+        return true
+    }
+    let deadline: u64 = now_ms() + ms
+    var nap: u64 = 1
+    while true {
+        let now: u64 = now_ms()
+        if now >= deadline {
+            return false
+        }
+        var left: u64 = deadline - now
+        if nap < left {
+            left = nap
+        }
+        sleep_ms_raw(left)
+        if reap(ch, WNOHANG) {
+            return true
+        }
+        if nap < 10 {
+            nap = nap * 2
+        }
+    }
+    return false
+}
+
+// Has the child ended? Never blocks.
+fn try_wait(ch: *mut Child) -> bool {
+    return reap(ch, WNOHANG)
+}
+
+fn is_running(ch: *mut Child) -> bool {
+    return !reap(ch, WNOHANG)
+}
+
+// The exit code once the child has ended (before that: 0).
+fn exit_code(ch: *mut Child) -> i32 {
+    return (*ch).code
+}
+
+// The signal that ended the child, 0 if it exited normally.
+fn term_signal(ch: *mut Child) -> i32 {
+    return (*ch).sig
+}
+
+fn pid_of(ch: *mut Child) -> i64 {
+    return (*ch).pid
+}
+
+// SIGKILL: the child cannot refuse. Does nothing to one that has ended.
+fn kill(ch: *mut Child) {
+    if !(*ch).done && (*ch).pid > 0 {
+        syscall(SYS_KILL, (*ch).pid, SIGKILL, 0, 0, 0, 0)
+    }
+}
+
+// SIGTERM: asks the child to end; it may clean up or ignore it.
+fn terminate(ch: *mut Child) {
+    if !(*ch).done && (*ch).pid > 0 {
+        syscall(SYS_KILL, (*ch).pid, SIGTERM, 0, 0, 0, 0)
+    }
+}
+
+// Closes the caller's ends of the pipes. The child is NOT stopped and NOT
+// waited for; a child that is not waited for stays a zombie until the
+// caller ends -- `wait` it, or start it with `set_detach`.
+fn close(ch: *mut Child) {
+    close_fd((*ch).in_fd)
+    close_fd((*ch).out_fd)
+    close_fd((*ch).err_fd)
+    (*ch).in_fd = -1
+    (*ch).out_fd = -1
+    (*ch).err_fd = -1
+}
+
+// ----------------------------------------------- Collecting without deadlock
+
+const PIECE: usize = 4096
+
+fn set_nonblocking(fd: i64) {
+    if fd >= 0 {
+        syscall(SYS_FCNTL, fd, F_SETFL, O_NONBLOCK, 0, 0, 0)
+    }
+}
+
+// Feeds `in_n` octets to the child's stdin while collecting its stdout and
+// stderr, all at once, until both outputs have ended, the child has ended
+// and there is nothing more to read, or `timeout_ms` (0 = no limit) is up.
+// Stdin is closed when all input is written. The pipes that were not
+// created (mode not PIPE) are skipped; `out`/`err` may be null pointers for
+// the ones not wanted -- but then do not pipe them, an unread pipe fills up.
+//
+// The result is false when the time ran out (the child is still running and
+// the caller decides: `kill` it).
+fn communicate(ch: *mut Child, in_p: u64, in_n: usize, out: *mut rt.Buf, err: *mut rt.Buf,
+    timeout_ms: u64) -> bool {
+    var written: usize = 0
+    set_nonblocking((*ch).in_fd)
+    if (*ch).in_fd >= 0 && in_n == 0 {
+        close_in(ch)
+    }
+    let deadline: u64 = now_ms() + timeout_ms
+    var tmp: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&tmp, PIECE)
+    var open_out: bool = (*ch).out_fd >= 0
+    var open_err: bool = (*ch).err_fd >= 0
+    var exited_polls: u32 = 0
+    while open_out || open_err || (*ch).in_fd >= 0 {
+        var pfds: [i32; 6] = [-1, 0, -1, 0, -1, 0]
+        if (*ch).in_fd >= 0 {
+            pfds[0] = (*ch).in_fd as i32
+            pfds[1] = POLLOUT as i32
+        }
+        if open_out {
+            pfds[2] = (*ch).out_fd as i32
+            pfds[3] = POLLIN as i32
+        }
+        if open_err {
+            pfds[4] = (*ch).err_fd as i32
+            pfds[5] = POLLIN as i32
+        }
+        var wait_ms: i64 = 50
+        if timeout_ms > 0 {
+            let now: u64 = now_ms()
+            if now >= deadline {
+                rt.buf_free(&tmp)
+                return false
+            }
+            if deadline - now < 50 {
+                wait_ms = (deadline - now) as i64
+            }
+        }
+        var r: i64 = syscall(SYS_POLL, (&pfds[0]) as i64, 3, wait_ms, 0, 0, 0)
+        if r == EINTR {
+            continue
+        }
+        if r == 0 {
+            // quiet: has the child ended while somebody else (a grandchild) holds the pipes?
+            if (*ch).own && reap(ch, WNOHANG) {
+                exited_polls = exited_polls + 1
+                if exited_polls >= 2 {
+                    break
+                }
+            }
+            continue
+        }
+        if r < 0 {
+            break
+        }
+        // revents sit in the upper 16 bits of the second word of each pollfd
+        let ev_in: i64 = ((pfds[1] as u32) >> 16) as i64
+        let ev_out: i64 = ((pfds[3] as u32) >> 16) as i64
+        let ev_err: i64 = ((pfds[5] as u32) >> 16) as i64
+        if (*ch).in_fd >= 0 && ev_in != 0 {
+            if (ev_in & (POLLERR | POLLHUP)) != 0 {
+                close_in(ch)
+            } else if written < in_n {
+                var m: usize = in_n - written
+                if m > PIECE {
+                    m = PIECE
+                }
+                let w: i64 = write_in(ch, in_p + written as u64, m)
+                if w < 0 && w != EAGAIN {
+                    close_in(ch)
+                } else if w > 0 {
+                    written = written + w as usize
+                }
+                if written >= in_n && (*ch).in_fd >= 0 {
+                    close_in(ch)
+                }
+            }
+        }
+        if open_out && ev_out != 0 {
+            let n: i64 = read_fd_blocking((*ch).out_fd, rt.buf_ptr(&tmp), PIECE)
+            if n > 0 {
+                rt.buf_push_bytes(out, rt.buf_ptr(&tmp), n as usize)
+            } else {
+                open_out = false
+            }
+        }
+        if open_err && ev_err != 0 {
+            let n: i64 = read_fd_blocking((*ch).err_fd, rt.buf_ptr(&tmp), PIECE)
+            if n > 0 {
+                rt.buf_push_bytes(err, rt.buf_ptr(&tmp), n as usize)
+            } else {
+                open_err = false
+            }
+        }
+    }
+    rt.buf_free(&tmp)
+    return true
+}
+
+// ------------------------------------------------------------ Conveniences
+
+// Starts the command with the standard descriptors it has, waits for it and
+// returns its exit code. Nothing is captured.
+fn run(c: *mut Command) -> ProcError!i32 {
+    var ch: Child = try spawn(c)
+    close(&ch)
+    return wait(&ch)
+}
+
+// Starts the command with the given input, collects stdout into `out` and
+// stderr into `err` (separately; `merge_stderr` on the command mixes them
+// into `out` and `err` stays empty), waits and returns the exit code. The
+// pipes are drained while the input is written, so neither side can stall
+// the other. `timeout_ms` = 0 means no limit; when the time is up the child
+// is killed and the error is `ProcError::Timeout`. The modes of the command are set
+// by this function: stdin = pipe, stdout = pipe, stderr = pipe unless merged.
+fn run_io(c: *mut Command, in_p: u64, in_n: usize, out: *mut rt.Buf, err: *mut rt.Buf,
+    timeout_ms: u64) -> ProcError!i32 {
+    (*c).in_mode = STDIO_PIPE
+    (*c).out_mode = STDIO_PIPE
+    if (*c).err_mode != STDIO_MERGE {
+        (*c).err_mode = STDIO_PIPE
+    }
+    var ch: Child = try spawn(c)
+    let finished: bool = communicate(&ch, in_p, in_n, out, err, timeout_ms)
+    if !finished {
+        kill(&ch)
+        wait(&ch)
+        close(&ch)
+        return ProcError::Timeout
+    }
+    close(&ch)
+    if timeout_ms == 0 {
+        return wait(&ch)
+    }
+    // the pipes ended; the child may need a moment to be reaped
+    if !wait_timeout(&ch, 2000) {
+        kill(&ch)
+        wait(&ch)
+        return ProcError::Timeout
+    }
+    return ch.code
+}
+
+// `run_io` without input.
+fn run_capture(c: *mut Command, out: *mut rt.Buf, err: *mut rt.Buf, timeout_ms: u64) -> ProcError!i32 {
+    return run_io(c, 0, 0, out, err, timeout_ms)
+}

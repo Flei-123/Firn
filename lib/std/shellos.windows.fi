@@ -1,0 +1,244 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/shellos.windows.fi -- the operating system half of std.shell on
+// Windows (picked instead of lib/std/shellos.fi by `--target=x86_64-windows`).
+// Use `std.shell`, not this file.
+//
+// `ShellExecuteW` (shell32) is what Explorer itself calls when you double
+// click something: it asks the registry for the association. It is bound in
+// the compiler's import table (compiler/src/win.rs).
+//
+// Only `http`, `https` and `mailto` URLs are opened (`file:`, `ms-*:`,
+// `search-ms:`, `javascript:` and the like can run things), and `open_path`
+// refuses names with a program or script extension: opening `x.exe` would
+// RUN it, which a call named "open a document" must not do by accident.
+
+import rt
+import str
+import env
+import cmdline
+
+export {
+    os_open_url, os_open_path, os_reveal, os_refuses_path, os_dir, os_java_exe,
+    os_java_bases, os_exe_suffix,
+    DIR_HOME, DIR_CONFIG, DIR_DATA, DIR_CACHE, DIR_TEMP, DIR_MINECRAFT,
+    LAUNCH_OK, LAUNCH_MISSING, LAUNCH_FAILED,
+}
+
+const LAUNCH_OK: i32 = 0
+const LAUNCH_MISSING: i32 = 1
+const LAUNCH_FAILED: i32 = 2
+
+const DIR_HOME: i32 = 0
+const DIR_CONFIG: i32 = 1
+const DIR_DATA: i32 = 2
+const DIR_CACHE: i32 = 3
+const DIR_TEMP: i32 = 4
+const DIR_MINECRAFT: i32 = 5
+
+extern fn ShellExecuteW(hwnd: i64, verb: u64, file: u64, params: u64, dir: u64, show: i64) -> i64;
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+fn starts_with_ci(s: str, prefix: str) -> bool {
+    if s.length() < prefix.length() {
+        return false
+    }
+    var i: usize = 0
+    while i < prefix.length() {
+        if lower(s.chars(i)) != lower(prefix.chars(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn wide(s: str, path: bool, out: *mut rt.Buf) {
+    if path {
+        cmdline.utf8_to_utf16_path(s.p as u64, s.length(), out)
+    } else {
+        cmdline.utf8_to_utf16(s.p as u64, s.length(), out)
+    }
+    cmdline.push_u16(out, 0 as u16)
+}
+
+// ShellExecuteW "open" on `file` (and `params`); mapped to LAUNCH_*.
+fn execute(file: str, file_is_path: bool, params: str) -> i32 {
+    var verb: [u16; 5] = u"open\0"
+    var f: rt.Buf = rt.buf_new()
+    wide(file, file_is_path, &f)
+    var p: rt.Buf = rt.buf_new()
+    var pp: u64 = 0
+    if params.length() > 0 {
+        wide(params, false, &p)
+        pp = rt.buf_ptr(&p)
+    }
+    let r: i64 = ShellExecuteW(0, (&verb[0]) as u64, rt.buf_ptr(&f), pp, 0, 1)
+    rt.buf_free(&f)
+    rt.buf_free(&p)
+    if r > 32 {
+        return LAUNCH_OK
+    }
+    // 2 file not found, 3 path not found, 31 no association
+    if r == 2 || r == 3 || r == 31 {
+        return LAUNCH_MISSING
+    }
+    return LAUNCH_FAILED
+}
+
+fn os_open_url(url: str) -> i32 {
+    if !starts_with_ci(url, "http://") && !starts_with_ci(url, "https://")
+        && !starts_with_ci(url, "mailto:") {
+        return LAUNCH_FAILED
+    }
+    return execute(url, false, "")
+}
+
+fn os_open_path(path: str) -> i32 {
+    return execute(path, true, "")
+}
+
+// Programs and scripts: "opening" them would run them.
+fn os_refuses_path(path: str) -> bool {
+    var dot: usize = path.length()
+    var i: usize = path.length()
+    while i > 0 {
+        i = i - 1
+        let c: u8 = path.chars(i)
+        if c == 46 as u8 {
+            dot = i
+            break
+        }
+        if c == 47 as u8 || c == 92 as u8 {
+            break
+        }
+    }
+    if dot >= path.length() {
+        return false
+    }
+    var ext: rt.Buf = rt.buf_new()
+    var k: usize = dot + 1
+    while k < path.length() {
+        rt.buf_push(&ext, lower(path.chars(k)))
+        k = k + 1
+    }
+    let e: str = str { p: rt.buf_data(&ext), n: rt.buf_len(&ext) }
+    var bad: bool = false
+    if e == "exe" || e == "com" || e == "bat" || e == "cmd" || e == "scr" || e == "pif"
+        || e == "msi" || e == "msp" || e == "ps1" || e == "vbs" || e == "vbe" || e == "js"
+        || e == "jse" || e == "wsf" || e == "wsh" || e == "lnk" || e == "hta" || e == "cpl"
+        || e == "reg" || e == "jar" {
+        bad = true
+    }
+    rt.buf_free(&ext)
+    return bad
+}
+
+// Explorer with the item selected; a folder is simply opened.
+fn os_reveal(path: str, parent: str, is_dir: bool) -> i32 {
+    if is_dir {
+        return execute(path, true, "")
+    }
+    var w: rt.Buf = rt.buf_new()
+    cmdline.utf8_to_utf16_path(path.p as u64, path.length(), &w)
+    var back: rt.Buf = rt.buf_new()
+    cmdline.utf16_to_utf8(rt.buf_ptr(&w), rt.buf_len(&w) / 2, &back)
+    let params: str = "/select,\"" + str { p: rt.buf_data(&back), n: rt.buf_len(&back) } + "\""
+    rt.buf_free(&w)
+    rt.buf_free(&back)
+    return execute("explorer.exe", false, params)
+}
+
+fn push_var(name: str, out: *mut rt.Buf) -> bool {
+    var v: rt.Buf = rt.buf_new()
+    if env.get_into(name, &v) && rt.buf_len(&v) > 0 {
+        rt.buf_push_bytes(out, rt.buf_ptr(&v), rt.buf_len(&v))
+        rt.buf_free(&v)
+        return true
+    }
+    rt.buf_free(&v)
+    return false
+}
+
+fn os_dir(which: i32, out: *mut rt.Buf) -> bool {
+    if which == DIR_HOME {
+        return push_var("USERPROFILE", out)
+    }
+    if which == DIR_CONFIG {
+        return push_var("APPDATA", out)
+    }
+    if which == DIR_DATA || which == DIR_CACHE {
+        return push_var("LOCALAPPDATA", out)
+    }
+    if which == DIR_TEMP {
+        if push_var("TEMP", out) {
+            return true
+        }
+        return push_var("TMP", out)
+    }
+    if which == DIR_MINECRAFT {
+        if !push_var("APPDATA", out) {
+            return false
+        }
+        let m: str = "\\.minecraft"
+        rt.buf_push_bytes(out, m.p as u64, m.length())
+        return true
+    }
+    return false
+}
+
+fn os_java_exe(gui: bool) -> str {
+    if gui {
+        return "javaw.exe"
+    }
+    return "java.exe"
+}
+
+fn os_exe_suffix() -> str {
+    return ".exe"
+}
+
+fn add_base(var_name: str, tail: str, out: *mut rt.Buf) -> usize {
+    var v: rt.Buf = rt.buf_new()
+    if env.get_into(var_name, &v) && rt.buf_len(&v) > 0 {
+        rt.buf_push_bytes(out, rt.buf_ptr(&v), rt.buf_len(&v))
+        rt.buf_push_bytes(out, tail.p as u64, tail.length())
+        rt.buf_push(out, 0 as u8)
+        rt.buf_free(&v)
+        return 1
+    }
+    rt.buf_free(&v)
+    return 0
+}
+
+fn os_java_bases(out: *mut rt.Buf) -> usize {
+    var n: usize = 0
+    var k: usize = 0
+    while k < 3 {
+        var pf: str = "ProgramFiles"
+        if k == 1 {
+            pf = "ProgramW6432"
+        }
+        if k == 2 {
+            pf = "ProgramFiles(x86)"
+        }
+        n = n + add_base(pf, "\\Java", out)
+        n = n + add_base(pf, "\\Eclipse Adoptium", out)
+        n = n + add_base(pf, "\\Eclipse Foundation", out)
+        n = n + add_base(pf, "\\Microsoft", out)
+        n = n + add_base(pf, "\\Zulu", out)
+        n = n + add_base(pf, "\\Amazon Corretto", out)
+        n = n + add_base(pf, "\\BellSoft", out)
+        n = n + add_base(pf, "\\Semeru", out)
+        n = n + add_base(pf, "\\AdoptOpenJDK", out)
+        k = k + 1
+    }
+    n = n + add_base("USERPROFILE", "\\.jdks", out)
+    n = n + add_base("LOCALAPPDATA", "\\Programs\\Eclipse Adoptium", out)
+    return n
+}

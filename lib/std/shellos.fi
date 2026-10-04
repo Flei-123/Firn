@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/shellos.fi -- the operating system half of std.shell (Linux).
+//
+// `std.shell` is one file for every system; what differs per system lives
+// here, and `shellos.windows.fi` is picked instead of this file by
+// `--target=x86_64-windows`. Nothing in here is meant to be called
+// directly -- use `std.shell`.
+
+import rt
+import str
+import env
+import process
+
+export {
+    os_open_url, os_open_path, os_reveal, os_refuses_path, os_dir, os_java_exe, os_java_bases, os_exe_suffix,
+    DIR_HOME, DIR_CONFIG, DIR_DATA, DIR_CACHE, DIR_TEMP, DIR_MINECRAFT,
+    LAUNCH_OK, LAUNCH_MISSING, LAUNCH_FAILED,
+}
+
+const LAUNCH_OK: i32 = 0
+const LAUNCH_MISSING: i32 = 1 // the program that opens things is not installed
+const LAUNCH_FAILED: i32 = 2
+
+const DIR_HOME: i32 = 0
+const DIR_CONFIG: i32 = 1
+const DIR_DATA: i32 = 2
+const DIR_CACHE: i32 = 3
+const DIR_TEMP: i32 = 4
+const DIR_MINECRAFT: i32 = 5
+
+fn dummy(code: i32) -> process.Child {
+    return process.Child { pid: 0 - code as i64, h: 0, in_fd: -1, out_fd: -1, err_fd: -1,
+        done: false, code: 0, sig: 0, own: true }
+}
+
+fn miss(e: ProcError) -> i32 {
+    if e == ProcError::NotFound {
+        return 1
+    }
+    return 2
+}
+
+// Starts `prog a1 a2` and lets it go (detached, no standard streams).
+fn launch(prog: str, a1: str, a2: str, a3: str) -> i32 {
+    var c: process.Command = process.command(prog)
+    if a1.length() > 0 {
+        process.add_arg(&c, a1)
+    }
+    if a2.length() > 0 {
+        process.add_arg(&c, a2)
+    }
+    if a3.length() > 0 {
+        process.add_arg(&c, a3)
+    }
+    process.set_detach(&c, true)
+    process.set_stdin(&c, process.STDIO_NULL)
+    process.set_stdout(&c, process.STDIO_NULL)
+    process.set_stderr(&c, process.STDIO_NULL)
+    var ch: process.Child = process.spawn(&c) catch | e | dummy(miss(e))
+    process.command_free(&c)
+    if ch.pid > 0 {
+        process.close(&ch)
+        return LAUNCH_OK
+    }
+    return (0 - ch.pid) as i32
+}
+
+fn os_open_url(url: str) -> i32 {
+    return os_open(url)
+}
+
+fn os_open_path(path: str) -> i32 {
+    return os_open(path)
+}
+
+// Opens a URL or a path with the program the desktop has chosen for it.
+fn os_open(target: str) -> i32 {
+    let r: i32 = launch("xdg-open", target, "", "")
+    if r != LAUNCH_MISSING {
+        return r
+    }
+    return launch("gio", "open", target, "")
+}
+
+fn hex_digit(v: u32) -> u8 {
+    if v < 10 {
+        return (48 + v) as u8
+    }
+    return (55 + v) as u8
+}
+
+// "file://" + percent-encoded absolute path.
+fn file_uri(path: str, out: *mut rt.Buf) {
+    let head: str = "file://"
+    rt.buf_push_bytes(out, head.p as u64, head.length())
+    var i: usize = 0
+    while i < path.length() {
+        let c: u8 = path.chars(i)
+        let plain: bool = (c >= 48 as u8 && c <= 57 as u8) || (c >= 65 as u8 && c <= 90 as u8)
+            || (c >= 97 as u8 && c <= 122 as u8) || c == 45 as u8 || c == 46 as u8
+            || c == 95 as u8 || c == 126 as u8 || c == 47 as u8
+        if plain {
+            rt.buf_push(out, c)
+        } else {
+            rt.buf_push(out, 37 as u8)
+            rt.buf_push(out, hex_digit((c as u32) >> 4))
+            rt.buf_push(out, hex_digit((c as u32) & 15))
+        }
+        i = i + 1
+    }
+}
+
+// Shows the file in the file manager with the item selected (the
+// FileManager1 D-Bus interface that Nautilus, Dolphin, Nemo, Thunar and
+// PCManFM-Qt implement); a directory, or a desktop without that interface,
+// gets the folder opened instead.
+fn os_reveal(path: str, parent: str, is_dir: bool) -> i32 {
+    if is_dir {
+        return os_open(path)
+    }
+    var uri: rt.Buf = rt.buf_new()
+    file_uri(path, &uri)
+    let arr: str = "array:string:" + str { p: rt.buf_data(&uri), n: rt.buf_len(&uri) }
+    rt.buf_free(&uri)
+    var c: process.Command = process.command("dbus-send")
+    process.add_arg(&c, "--session")
+    process.add_arg(&c, "--dest=org.freedesktop.FileManager1")
+    process.add_arg(&c, "--type=method_call")
+    process.add_arg(&c, "/org/freedesktop/FileManager1")
+    process.add_arg(&c, "org.freedesktop.FileManager1.ShowItems")
+    process.add_arg(&c, arr)
+    process.add_arg(&c, "string:")
+    var out: rt.Buf = rt.buf_new()
+    var err: rt.Buf = rt.buf_new()
+    let code: i32 = process.run_capture(&c, &out, &err, 4000) catch | e | 1000
+    process.command_free(&c)
+    rt.buf_free(&out)
+    rt.buf_free(&err)
+    if code == 0 {
+        return LAUNCH_OK
+    }
+    return os_open(parent)
+}
+
+fn dir_from(var_name: str, tail: str, out: *mut rt.Buf) -> bool {
+    var v: rt.Buf = rt.buf_new()
+    if env.get_into(var_name, &v) && rt.buf_len(&v) > 0 && rt.buf_at(&v, 0) == 47 as u8 {
+        rt.buf_push_bytes(out, rt.buf_ptr(&v), rt.buf_len(&v))
+        rt.buf_free(&v)
+        return true
+    }
+    rt.buf_free(&v)
+    if env.get_into("HOME", &v) && rt.buf_len(&v) > 0 {
+        rt.buf_push_bytes(out, rt.buf_ptr(&v), rt.buf_len(&v))
+        rt.buf_free(&v)
+        rt.buf_push_bytes(out, tail.p as u64, tail.length())
+        return true
+    }
+    rt.buf_free(&v)
+    return false
+}
+
+// A well known directory of the user, appended to `out` (no terminator).
+// false = it cannot be determined (no HOME).
+fn os_dir(which: i32, out: *mut rt.Buf) -> bool {
+    if which == DIR_HOME {
+        return env.get_into("HOME", out) && rt.buf_len(out) > 0
+    }
+    if which == DIR_CONFIG {
+        return dir_from("XDG_CONFIG_HOME", "/.config", out)
+    }
+    if which == DIR_DATA {
+        return dir_from("XDG_DATA_HOME", "/.local/share", out)
+    }
+    if which == DIR_CACHE {
+        return dir_from("XDG_CACHE_HOME", "/.cache", out)
+    }
+    if which == DIR_TEMP {
+        var v: rt.Buf = rt.buf_new()
+        if env.get_into("TMPDIR", &v) && rt.buf_len(&v) > 0 {
+            rt.buf_push_bytes(out, rt.buf_ptr(&v), rt.buf_len(&v))
+            rt.buf_free(&v)
+            return true
+        }
+        rt.buf_free(&v)
+        let t: str = "/tmp"
+        rt.buf_push_bytes(out, t.p as u64, 4)
+        return true
+    }
+    if which == DIR_MINECRAFT {
+        var h: rt.Buf = rt.buf_new()
+        if !(env.get_into("HOME", &h) && rt.buf_len(&h) > 0) {
+            rt.buf_free(&h)
+            return false
+        }
+        rt.buf_push_bytes(out, rt.buf_ptr(&h), rt.buf_len(&h))
+        rt.buf_free(&h)
+        let m: str = "/.minecraft"
+        rt.buf_push_bytes(out, m.p as u64, m.length())
+        return true
+    }
+    return false
+}
+
+// The name of the Java launcher in a `bin` directory: `java` (the console
+// one), or `javaw` (Windows: no console window; the same as `java` here).
+fn os_java_exe(gui: bool) -> str {
+    return "java"
+}
+
+fn os_exe_suffix() -> str {
+    return ""
+}
+
+// Linux opens whatever the desktop makes of it; nothing is refused here.
+fn os_refuses_path(path: str) -> bool {
+    return false
+}
+
+// Directories whose CHILDREN are Java installations (`<base>/<name>/bin/java`),
+// NUL separated, appended to `out`; the number of bases returned.
+fn os_java_bases(out: *mut rt.Buf) -> usize {
+    var n: usize = 0
+    let fixed: str = "/usr/lib/jvm"
+    rt.buf_push_bytes(out, fixed.p as u64, fixed.length())
+    rt.buf_push(out, 0 as u8)
+    let f2: str = "/usr/java"
+    rt.buf_push_bytes(out, f2.p as u64, f2.length())
+    rt.buf_push(out, 0 as u8)
+    let f3: str = "/opt/java"
+    rt.buf_push_bytes(out, f3.p as u64, f3.length())
+    rt.buf_push(out, 0 as u8)
+    n = 3
+    var h: rt.Buf = rt.buf_new()
+    if env.get_into("HOME", &h) && rt.buf_len(&h) > 0 {
+        let hl: usize = rt.buf_len(&h)
+        let s1: str = "/.sdkman/candidates/java"
+        rt.buf_push_bytes(out, rt.buf_ptr(&h), hl)
+        rt.buf_push_bytes(out, s1.p as u64, s1.length())
+        rt.buf_push(out, 0 as u8)
+        let s2: str = "/.jdks"
+        rt.buf_push_bytes(out, rt.buf_ptr(&h), hl)
+        rt.buf_push_bytes(out, s2.p as u64, s2.length())
+        rt.buf_push(out, 0 as u8)
+        n = n + 2
+    }
+    rt.buf_free(&h)
+    return n
+}

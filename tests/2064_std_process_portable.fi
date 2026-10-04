@@ -1,0 +1,420 @@
+// expect_exit: 0
+// tests/2064_std_process_portable.fi -- std.process, the SAME program on
+// Linux and on Windows (wine / a real machine).
+//
+// The test starts ITSELF as the child (`argv[0] --child <mode> ...`), so
+// nothing but the compiler's own output is needed: no `sh`, no `cat`, no
+// `cmd.exe`. The child modes are at the top of `main`.
+//
+// A  arguments arrive exactly (spaces, quotes, empty, trailing backslash)
+// B  exit codes
+// C  stdout and stderr separate, and merged
+// D  3 MiB through a child that echoes stdin to stdout (no deadlock)
+// E  300000 octets on stdout AND stderr (no deadlock)
+// F  working directory, environment (set, replace, unset, clear)
+// G  timeout kills; wait_timeout / is_running / kill
+// H  non blocking read: nothing, then data, then end of file
+// I  a dead reader: write_in answers an error, the program lives
+// J  detach: the program runs on alone
+// K  a program that does not exist
+// L  60 starts in a row
+import std.rt
+import std.str
+import std.process
+import std.fs
+import std.env
+
+fn now_ms() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] * 1000 + ts[1] / 1000000) as u64
+}
+
+fn nap(ms: u64) {
+    var ts: [i64; 2] = [(ms / 1000) as i64, ((ms % 1000) * 1000000) as i64]
+    syscall(35, (&ts[0]) as i64, 0, 0, 0, 0, 0)
+}
+
+fn say(fd: i64, s: str) {
+    syscall(1, fd, s.p as i64, s.length() as i64, 0, 0, 0)
+}
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn num(s: str) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < s.length() {
+        v = v * 10 + (s.chars(i) - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
+
+fn eq(b: *mut rt.Buf, s: str) -> bool {
+    if rt.buf_len(b) != s.length() {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(b), s.p as u64, s.length())
+}
+
+fn terr(e: ProcError) -> i32 {
+    if e == ProcError::NotFound { return 1001 }
+    if e == ProcError::Permission { return 1002 }
+    if e == ProcError::Invalid { return 1003 }
+    if e == ProcError::Resource { return 1004 }
+    if e == ProcError::Exec { return 1005 }
+    if e == ProcError::Io { return 1006 }
+    return 1007
+}
+
+fn dummy(code: i32) -> process.Child {
+    return process.Child { pid: 0 - code as i64, h: 0, in_fd: -1, out_fd: -1, err_fd: -1,
+        done: false, code: 0, sig: 0, own: true }
+}
+
+fn start(c: *mut process.Command) -> process.Child {
+    return process.spawn(c) catch | e | dummy(terr(e))
+}
+
+// the command that starts this program as a child in `mode`
+fn me(self_path: str, mode: str) -> process.Command {
+    var c: process.Command = process.command(self_path)
+    process.add_arg(&c, "--child")
+    process.add_arg(&c, mode)
+    return c
+}
+
+fn child_main(start: u64) -> i32 {
+    let mode: str = arg(start, 2)
+    if mode == "args" {
+        var i: usize = 3
+        while i < rt.arg_count(start) {
+            say(1, "<")
+            say(1, arg(start, i))
+            say(1, ">")
+            i = i + 1
+        }
+        return 0
+    }
+    if mode == "exit" {
+        return num(arg(start, 3)) as i32
+    }
+    if mode == "errout" {
+        say(1, "out\n")
+        say(2, "err\n")
+        return 0
+    }
+    if mode == "cat" {
+        var buf: [u8; 4096] = [0 as u8; 4096]
+        while true {
+            let n: i64 = syscall(0, 0, (&buf[0]) as i64, 4096, 0, 0, 0)
+            if n <= 0 {
+                break
+            }
+            var done: i64 = 0
+            while done < n {
+                let w: i64 = syscall(1, 1, ((&buf[0]) as i64) + done, n - done, 0, 0, 0)
+                if w <= 0 {
+                    return 3
+                }
+                done = done + w
+            }
+        }
+        return 0
+    }
+    if mode == "both" {
+        let n: usize = num(arg(start, 3)) as usize
+        var chunk: [u8; 1000] = [66 as u8; 1000]
+        var left: usize = n
+        while left > 0 {
+            var m: usize = left
+            if m > 1000 { m = 1000 }
+            syscall(1, 2, (&chunk[0]) as i64, m as i64, 0, 0, 0)
+            left = left - m
+        }
+        left = n
+        while left > 0 {
+            var m: usize = left
+            if m > 1000 { m = 1000 }
+            syscall(1, 1, (&chunk[0]) as i64, m as i64, 0, 0, 0)
+            left = left - m
+        }
+        return 0
+    }
+    if mode == "sleep" {
+        nap(num(arg(start, 3)))
+        return 0
+    }
+    if mode == "late" {
+        nap(num(arg(start, 3)))
+        say(1, "late\n")
+        return 0
+    }
+    if mode == "env" {
+        var v: rt.Buf = rt.buf_new()
+        if env.get_into(arg(start, 3), &v) {
+            say(1, "[")
+            syscall(1, 1, rt.buf_ptr(&v) as i64, rt.buf_len(&v) as i64, 0, 0, 0)
+            say(1, "]")
+        } else {
+            say(1, "<unset>")
+        }
+        return 0
+    }
+    if mode == "cwd" {
+        var b: [u8; 512] = [0 as u8; 512]
+        let n: i64 = syscall(79, (&b[0]) as i64, 512, 0, 0, 0, 0)
+        if n > 0 {
+            syscall(1, 1, (&b[0]) as i64, rt.c_length((&b[0]) as u64) as i64, 0, 0, 0)
+        }
+        return 0
+    }
+    if mode == "marker" {
+        nap(num(arg(start, 3)))
+        let path: str = arg(start, 4)
+        var mk: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&mk, "done".p as u64, 4)
+        fs.write_file(path, rt.buf_ptr(&mk), 4) catch 0
+        return 0
+    }
+    return 99
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) >= 3 && arg(start, 1) == "--child" {
+        return child_main(start)
+    }
+    let self_path: str = arg(start, 0)
+    var out: rt.Buf = rt.buf_new()
+    var err: rt.Buf = rt.buf_new()
+    var c: process.Command = me(self_path, "exit")
+    var code: i32 = 0
+
+    // --- B. exit codes (also proves the child really started)
+    process.add_arg(&c, "7")
+    code = process.run_capture(&c, &out, &err, 20000) catch | e | terr(e)
+    if code != 7 { return 1 as i32 }
+    process.command_free(&c)
+
+    // --- A. arguments arrive exactly
+    c = me(self_path, "args")
+    process.add_arg(&c, "plain")
+    process.add_arg(&c, "a b")
+    process.add_arg(&c, "")
+    process.add_arg(&c, "q\"uote")
+    process.add_arg(&c, "back\\")
+    process.add_arg(&c, "C:\\Program Files\\x\\")
+    process.add_arg(&c, "-Dk=\"v w\"")
+    process.add_arg(&c, "{\"a\":[1, 2]}")
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 20000) catch | e | terr(e)
+    if code != 0 { return 2 as i32 }
+    if !eq(&out, "<plain><a b><><q\"uote><back\\><C:\\Program Files\\x\\><-Dk=\"v w\"><{\"a\":[1, 2]}>") { return 3 as i32 }
+    process.command_free(&c)
+
+    // --- C. stdout / stderr
+    c = me(self_path, "errout")
+    rt.buf_clear(&out)
+    rt.buf_clear(&err)
+    code = process.run_capture(&c, &out, &err, 20000) catch | e | terr(e)
+    if !eq(&out, "out\n") { return 4 as i32 }
+    if !eq(&err, "err\n") { return 5 as i32 }
+    process.merge_stderr(&c)
+    rt.buf_clear(&out)
+    rt.buf_clear(&err)
+    code = process.run_capture(&c, &out, &err, 20000) catch | e | terr(e)
+    // both lines in stdout; their ORDER is the child's write order
+    if rt.buf_len(&out) != 8 || rt.buf_len(&err) != 0 { return 6 as i32 }
+    process.command_free(&c)
+
+    // --- D. 3 MiB in, 3 MiB out
+    let big: usize = 3 * 1024 * 1024
+    var data: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < big {
+        rt.buf_push(&data, ((i * 7 + i / 251) % 256) as u8)
+        i = i + 1
+    }
+    c = me(self_path, "cat")
+    rt.buf_clear(&out)
+    rt.buf_clear(&err)
+    code = process.run_io(&c, rt.buf_ptr(&data), big, &out, &err, 60000) catch | e | terr(e)
+    if code != 0 { return 7 as i32 }
+    if rt.buf_len(&out) != big { return 8 as i32 }
+    if !rt.mem_eq(rt.buf_ptr(&out), rt.buf_ptr(&data), big) { return 9 as i32 }
+    process.command_free(&c)
+    rt.buf_free(&data)
+
+    // --- E. 300000 on both
+    c = me(self_path, "both")
+    process.add_arg(&c, "300000")
+    rt.buf_clear(&out)
+    rt.buf_clear(&err)
+    code = process.run_capture(&c, &out, &err, 60000) catch | e | terr(e)
+    if code != 0 { return 10 as i32 }
+    if rt.buf_len(&out) != 300000 || rt.buf_len(&err) != 300000 { return 11 as i32 }
+    process.command_free(&c)
+
+    // --- F. cwd, environment
+    c = me(self_path, "cwd")
+    process.set_cwd(&c, fs.temp_dir())
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 20000) catch | e | terr(e)
+    if rt.buf_len(&out) == 0 { return 12 as i32 }
+    process.command_free(&c)
+    c = me(self_path, "env")
+    process.add_arg(&c, "FIRN_2064")
+    process.set_env(&c, "FIRN_2064", "bar baz")
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 20000) catch | e | terr(e)
+    if !eq(&out, "[bar baz]") { return 13 as i32 }
+    process.set_env(&c, "FIRN_2064", "second")
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 20000) catch | e | terr(e)
+    if !eq(&out, "[second]") { return 14 as i32 }
+    process.unset_env(&c, "FIRN_2064")
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 20000) catch | e | terr(e)
+    if !eq(&out, "<unset>") { return 15 as i32 }
+    process.command_free(&c)
+    c = me(self_path, "env")
+    process.add_arg(&c, "ONLY")
+    process.clear_env(&c)
+    process.set_env(&c, "ONLY", "1")
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 20000) catch | e | terr(e)
+    if !eq(&out, "[1]") { return 16 as i32 }
+    process.command_free(&c)
+    // a cleared environment has no PATH (wine adds its own WINE* variables to every
+    // process, so "exactly one variable" cannot be asked here)
+    c = me(self_path, "env")
+    process.add_arg(&c, "PATH")
+    process.clear_env(&c)
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 20000) catch | e | terr(e)
+    if !eq(&out, "<unset>") { return 40 as i32 }
+    process.command_free(&c)
+    // and without clearing the child has the caller's PATH
+    c = me(self_path, "env")
+    process.add_arg(&c, "PATH")
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 20000) catch | e | terr(e)
+    if rt.buf_len(&out) < 4 || rt.buf_at(&out, 0) != 91 as u8 { return 41 as i32 }
+    process.command_free(&c)
+
+    // --- G. timeout / wait_timeout / kill
+    c = me(self_path, "sleep")
+    process.add_arg(&c, "30000")
+    rt.buf_clear(&out)
+    let t0: u64 = now_ms()
+    let timed: i32 = process.run_capture(&c, &out, &err, 400) catch | e | terr(e)
+    if now_ms() - t0 > 8000 { return 17 as i32 }
+    if timed != 1007 { return 18 as i32 }
+    var ch: process.Child = start(&c)
+    if ch.pid <= 0 { return 19 as i32 }
+    if !process.is_running(&ch) { return 20 as i32 }
+    if process.wait_timeout(&ch, 150) { return 21 as i32 }
+    process.kill(&ch)
+    let kc: i32 = process.wait(&ch)
+    if kc != 137 { return 22 as i32 }
+    if process.is_running(&ch) { return 23 as i32 }
+    process.close(&ch)
+    process.command_free(&c)
+
+    // --- H. non blocking read
+    c = me(self_path, "late")
+    process.add_arg(&c, "400")
+    process.set_stdout(&c, process.STDIO_PIPE)
+    ch = start(&c)
+    if ch.pid <= 0 { return 24 as i32 }
+    var buf: [u8; 64] = [0 as u8; 64]
+    let b: u64 = (&buf[0]) as u64
+    if process.read_out_nb(&ch, b, 64) != -11 { return 25 as i32 }
+    var got: usize = 0
+    var spins: u32 = 0
+    while got < 5 && spins < 2000 {
+        let n: i64 = process.read_out_nb(&ch, b + got as u64, 64 - got)
+        if n > 0 {
+            got = got + n as usize
+        } else if n == -11 {
+            nap(5)
+        } else {
+            break
+        }
+        spins = spins + 1
+    }
+    if got != 5 { return 26 as i32 }
+    if buf[0] != 108 as u8 || buf[4] != 10 as u8 { return 27 as i32 }
+    if process.read_out(&ch, b, 64) != 0 { return 28 as i32 }
+    if process.wait(&ch) != 0 { return 29 as i32 }
+    process.close(&ch)
+    process.command_free(&c)
+
+    // --- I. a dead reader
+    c = me(self_path, "exit")
+    process.add_arg(&c, "0")
+    process.set_stdin(&c, process.STDIO_PIPE)
+    ch = start(&c)
+    if ch.pid <= 0 { return 30 as i32 }
+    process.wait(&ch)
+    var junk: [u8; 4096] = [65 as u8; 4096]
+    let w: i64 = process.write_in(&ch, (&junk[0]) as u64, 4096)
+    if w >= 0 { return 31 as i32 }
+    let w2: i64 = process.write_in(&ch, (&junk[0]) as u64, 4096)
+    if w2 >= 0 { return 32 as i32 }
+    process.close(&ch)
+    process.command_free(&c)
+
+    // --- J. detach
+    let marker: str = fs.path_join(fs.temp_dir(), "firn_2064_marker")
+    fs.remove(marker) catch false
+    c = me(self_path, "marker")
+    process.add_arg(&c, "400")
+    process.add_arg(&c, marker)
+    process.set_detach(&c, true)
+    process.set_stdin(&c, process.STDIO_NULL)
+    process.set_stdout(&c, process.STDIO_NULL)
+    process.set_stderr(&c, process.STDIO_NULL)
+    let t1: u64 = now_ms()
+    ch = start(&c)
+    if ch.pid <= 0 { return 33 as i32 }
+    if now_ms() - t1 > 300 { return 34 as i32 }
+    if fs.exists(marker) { return 35 as i32 }
+    var waited: u32 = 0
+    while !fs.exists(marker) && waited < 400 {
+        nap(25)
+        waited = waited + 1
+    }
+    if !fs.exists(marker) { return 36 as i32 }
+    process.wait_timeout(&ch, 3000)
+    process.close(&ch)
+    fs.remove(marker) catch false
+    process.command_free(&c)
+
+    // --- K. a program that does not exist
+    c = process.command("no_such_program_2064")
+    ch = start(&c)
+    if ch.pid != -1001 { return 37 as i32 }
+    process.command_free(&c)
+
+    // --- L. 60 starts in a row
+    var k: u32 = 0
+    while k < 60 {
+        c = me(self_path, "exit")
+        process.add_arg(&c, "3")
+        process.set_stdin(&c, process.STDIO_PIPE)
+        process.set_stdout(&c, process.STDIO_PIPE)
+        process.set_stderr(&c, process.STDIO_PIPE)
+        ch = start(&c)
+        if ch.pid <= 0 { return 38 as i32 }
+        if process.wait(&ch) != 3 { return 39 as i32 }
+        process.close(&ch)
+        process.command_free(&c)
+        k = k + 1
+    }
+    return 0
+}

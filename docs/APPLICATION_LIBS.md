@@ -27,6 +27,19 @@ FL-001 .. FL-003 are the image decoders the FleiLauncher (Minecraft launcher
 in Firn/fUi) needs for mod icons and screenshots. Details and the hostile-input
 rules: `docs/IMAGE_DECODERS.md`.
 
+## Launcher libraries (round PROCESS, `docs/ROUND-PROCESS.md`)
+
+Asked for by a Minecraft launcher in Firn + fUi (FleiLauncher); useful for
+any application that starts programs.
+
+| module | what it does | held against |
+|---|---|---|
+| `std.process` (`lib/std/process.fi`, `process.windows.fi`) | start a program with arguments, working directory, changed environment; stdin/stdout/stderr inherited, piped or discarded; blocking and non-blocking reads; wait (with timeout), try_wait, exit code, kill/terminate, detach, `no_window`; `run_capture`/`run_io` collect both outputs while feeding input without deadlock; every failure is a `ProcError` | 3 MiB both ways through a child, 300 KB on stdout+stderr, 300 starts without a leak (`tests/2062`-`2064`, Linux, AArch64, Wine) |
+| `std.shell` (`lib/std/shell.fi`) | `open_url`, `open_path`, `reveal_in_file_manager`, `find_in_path`, home/config/data/cache/temp/Minecraft directories, `find_java`/`java_candidates`/`java_major_version` | a fake `xdg-open` and fake `java` scripts (`tests/2061`) |
+| `std.env` (`lib/std/env.fi`) | read the environment, `find_executable` (`which`) | the kernel's `/proc/self/environ`, `sh` on PATH |
+| `std.pool` (`lib/std/pool.fi`) | fixed worker threads, bounded job queue, results; Linux only (Windows runs jobs inline) | `tests/2065`: 5000 jobs once each, parallel speed-up, GC on workers |
+| `std.cmdline` (`lib/std/cmdline.fi`) | Windows command line quoting/splitting by the rules of the C runtime, UTF-8 <-> UTF-16 | the published examples + round trip (`tests/2060`) |
+
 The compiler learned three more system calls for AArch64 on the way
 (`unlinkat`, `symlinkat`, `statx`; `compiler/src/syscalls.rs`), and
 `lib/svg/` became MPL-2.0 (LICENSING.md), which OpenPlan (GPL-3.0) needed

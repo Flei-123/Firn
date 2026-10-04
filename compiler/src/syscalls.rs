@@ -174,8 +174,10 @@ const TABLE: &[(i64, A64)] = &[
     (61, A64::Direct(260)),          // wait4
     (62, A64::Direct(129)),          // kill
     (63, A64::Direct(160)),          // uname
+    (72, A64::Direct(25)),           // fcntl     (std.process: close-on-exec, non-blocking)
     (74, A64::Direct(82)), // fsync (Firn r64)
     (79, A64::Direct(17)),           // getcwd
+    (80, A64::Direct(49)),           // chdir     (std.process: the working directory of a child)
     // Round ABSCHLUSS (Certus): the same shape as `open` two lines up --
     // the generic table has no `mkdir`, only `mkdirat`, and AT_FDCWD in
     // front of the path makes it mean the same. Without this line every
@@ -202,6 +204,8 @@ const TABLE: &[(i64, A64)] = &[
     (107, A64::Direct(175)),         // geteuid
     // ROUND C-059: stood until now between 13 and 14 and thereby broke
     // the sorting of the table (a test of its own). Only moved.
+    (112, A64::Direct(157)),         // setsid    (std.process: detach)
+    (128, A64::Direct(137)),         // rt_sigtimedwait (std.process: swallow a SIGPIPE)
     (131, A64::Direct(132)),         // sigaltstack -- eigener Signalstapel
     (158, A64::SetThreadPointer),    // arch_prctl(ARCH_SET_FS) -> msr tpidr_el0
     // ROUND C-059 (Certus): lib/js/interp.fi sets the stack of the
@@ -222,6 +226,7 @@ const TABLE: &[(i64, A64)] = &[
     (263, A64::Direct(35)),          // unlinkat
     (266, A64::Direct(36)),          // symlinkat (std.fs.symlink)
     (288, A64::Direct(242)),         // accept4
+    (293, A64::Direct(59)),          // pipe2     (std.process)
     (318, A64::Direct(278)),         // getrandom
     (332, A64::Direct(291)),         // statx
 ];
@@ -339,6 +344,7 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (72, "fcntl", Wasm::Missing(NO_FILES)),
     (74, "fsync", Wasm::Missing(NO_FILES)),
     (79, "getcwd", Wasm::Missing(NO_FILES)),
+    (80, "chdir", Wasm::Missing(NO_FILES)),
     (82, "rename", Wasm::Missing(NO_FILES)),
     (83, "mkdir", Wasm::Missing(NO_FILES)),
     (87, "unlink", Wasm::Missing(NO_FILES)),
@@ -347,6 +353,8 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (97, "getrlimit", Wasm::Missing("a browser page has no resource limits")),
     (102, "getuid", Wasm::Missing("a browser page has no users")),
     (107, "geteuid", Wasm::Missing("a browser page has no users")),
+    (112, "setsid", Wasm::Missing(NO_PROCESSES)),
+    (128, "rt_sigtimedwait", Wasm::Missing(NO_SIGNALS)),
     (131, "sigaltstack", Wasm::Missing(NO_SIGNALS)),
     (158, "arch_prctl", Wasm::Missing(NO_THREADS)),
     (160, "setrlimit", Wasm::Missing("a browser page has no resource limits")),
@@ -362,6 +370,7 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (263, "unlinkat", Wasm::Missing(NO_FILES)),
     (266, "symlinkat", Wasm::Missing(NO_FILES)),
     (288, "accept4", Wasm::Missing(NO_SOCKETS)),
+    (293, "pipe2", Wasm::Missing(NO_FILES)),
     (318, "getrandom", Wasm::Getrandom),
     (332, "statx", Wasm::Missing(NO_FILES)),
 ];

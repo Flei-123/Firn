@@ -1,0 +1,338 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/cmdline.fi -- std.cmdline: the Windows command line, both ways.
+//
+// A Windows process gets ONE string, not an argument vector. The program
+// that starts it has to glue the arguments into that string, and the
+// program that is started cuts it apart again (`CommandLineToArgvW`, or the
+// startup code of the C runtime). If the two do not agree, an argument with
+// a space or a quote in it arrives as something else -- and that is the
+// classic way a launcher breaks a Java command line (`-Dname="a b"`, a JSON
+// argument, a path with a trailing backslash).
+//
+// This file is the glue and the knife, and it is PURE: no system call, no
+// Windows function. That is why it lives in its own module, why the Linux
+// build can test it against the published rules, and why `std.process` on
+// Windows only has to call it.
+//
+// THE RULES (the ones the C runtime of Visual C++ 2008 and later and
+// CommandLineToArgvW use for every argument after the first):
+//
+//   * arguments are separated by spaces and tabs outside of quotes
+//   * a `"` toggles quoting and is not part of the argument
+//   * 2n backslashes followed by `"`  -> n backslashes, the quote toggles
+//   * 2n+1 backslashes followed by `"` -> n backslashes and a literal `"`
+//   * backslashes NOT followed by a quote are literal
+//   * inside quotes, `""` is one literal `"` (the post-2008 rule)
+//
+// The first token (the program name) is special: no backslash processing,
+// it ends at the first space outside of quotes, or at the closing quote.
+//
+// `win_quote_arg` produces, for any octet string, the shortest text that
+// these rules read back as exactly that string: an argument without space,
+// tab, newline, vertical tab or quote is written unchanged; an empty one
+// becomes `""`; every other one is wrapped in quotes with the backslashes in
+// front of a quote (and in front of the closing quote) doubled.
+//
+// HONEST
+// C1  This is the rule of the C runtime. A program that parses its own
+//     command line differently (cmd.exe and every `.bat` file, some
+//     installers) reads it differently, and no quoting can fix that for
+//     all of them. Do not start `.bat`/`.cmd` files with untrusted arguments.
+// C2  The text is UTF-8 here; `utf8_to_utf16` makes the UTF-16 that
+//     `CreateProcessW` wants. A lone surrogate or an invalid octet becomes
+//     U+FFFD (a path that is not valid UTF-8 cannot be addressed through the
+//     wide API anyway).
+// C3  A NUL octet cannot be part of an argument on either system; callers
+//     refuse it before they get here.
+
+import rt
+import str
+
+export {
+    push_u16, utf8_to_utf16, utf8_to_utf16_path, utf16_to_utf8, push_utf8,
+    win_quote_arg, win_command_line, win_split_command_line,
+}
+
+fn is_cont(b: u8) -> bool {
+    return (b & 192) == 128
+}
+
+// One little-endian UTF-16 code unit as two octets.
+fn push_u16(out: *mut rt.Buf, v: u16) {
+    rt.buf_push(out, (v & 255) as u8)
+    rt.buf_push(out, (v >> 8) as u8)
+}
+
+// UTF-8 (`p`, `n` octets) -> UTF-16 little endian code units appended to
+// `out` (two octets each), NO terminating zero.
+fn utf8_to_utf16(p: u64, n: usize, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < n {
+        let c: u32 = rt.ld8(p, i) as u32
+        var cp: u32 = 65533
+        var len: usize = 1
+        if c < 128 {
+            cp = c
+        } else if c >= 194 && c < 224 {
+            if i + 1 < n && is_cont(rt.ld8(p, i + 1)) {
+                cp = ((c & 31) << 6) | ((rt.ld8(p, i + 1) as u32) & 63)
+                len = 2
+            }
+        } else if c >= 224 && c < 240 {
+            if i + 2 < n && is_cont(rt.ld8(p, i + 1)) && is_cont(rt.ld8(p, i + 2)) {
+                let v: u32 = ((c & 15) << 12) | (((rt.ld8(p, i + 1) as u32) & 63) << 6)
+                    | ((rt.ld8(p, i + 2) as u32) & 63)
+                // overlong forms and surrogates are not UTF-8
+                if v >= 2048 && (v < 55296 || v > 57343) {
+                    cp = v
+                    len = 3
+                }
+            }
+        } else if c >= 240 && c < 245 {
+            if i + 3 < n && is_cont(rt.ld8(p, i + 1)) && is_cont(rt.ld8(p, i + 2))
+                && is_cont(rt.ld8(p, i + 3)) {
+                let v: u32 = ((c & 7) << 18) | (((rt.ld8(p, i + 1) as u32) & 63) << 12)
+                    | (((rt.ld8(p, i + 2) as u32) & 63) << 6)
+                    | ((rt.ld8(p, i + 3) as u32) & 63)
+                if v >= 65536 && v <= 1114111 {
+                    cp = v
+                    len = 4
+                }
+            }
+        }
+        if cp >= 65536 {
+            let w: u32 = cp - 65536
+            push_u16(out, (55296 + (w >> 10)) as u16)
+            push_u16(out, (56320 + (w & 1023)) as u16)
+        } else {
+            push_u16(out, cp as u16)
+        }
+        i = i + len
+    }
+}
+
+// The same for a path: `/` becomes `\`, which is what the wide Win32 calls
+// want (they accept `/` in most places, but not in `\\?\` paths and not in
+// the working directory of CreateProcess in every version).
+fn utf8_to_utf16_path(p: u64, n: usize, out: *mut rt.Buf) {
+    let start: usize = rt.buf_len(out)
+    utf8_to_utf16(p, n, out)
+    var i: usize = start
+    while i + 1 < rt.buf_len(out) {
+        if rt.buf_at(out, i) == 47 as u8 && rt.buf_at(out, i + 1) == 0 as u8 {
+            rt.st8(rt.buf_ptr(out), i, 92 as u8)
+        }
+        i = i + 2
+    }
+}
+
+// One code point as UTF-8.
+fn push_utf8(out: *mut rt.Buf, cp: u32) {
+    if cp < 128 {
+        rt.buf_push(out, cp as u8)
+    } else if cp < 2048 {
+        rt.buf_push(out, (192 | (cp >> 6)) as u8)
+        rt.buf_push(out, (128 | (cp & 63)) as u8)
+    } else if cp < 65536 {
+        rt.buf_push(out, (224 | (cp >> 12)) as u8)
+        rt.buf_push(out, (128 | ((cp >> 6) & 63)) as u8)
+        rt.buf_push(out, (128 | (cp & 63)) as u8)
+    } else {
+        rt.buf_push(out, (240 | (cp >> 18)) as u8)
+        rt.buf_push(out, (128 | ((cp >> 12) & 63)) as u8)
+        rt.buf_push(out, (128 | ((cp >> 6) & 63)) as u8)
+        rt.buf_push(out, (128 | (cp & 63)) as u8)
+    }
+}
+
+// UTF-16 little endian (`units` code units at `p`) -> UTF-8 appended to
+// `out`. A lone surrogate becomes U+FFFD.
+fn utf16_to_utf8(p: u64, units: usize, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < units {
+        let u: u32 = rt.ld16(p, i) as u32
+        if u >= 55296 && u < 56320 && i + 1 < units {
+            let l: u32 = rt.ld16(p, i + 1) as u32
+            if l >= 56320 && l < 57344 {
+                push_utf8(out, 65536 + ((u - 55296) << 10) + (l - 56320))
+                i = i + 2
+                continue
+            }
+        }
+        if u >= 55296 && u < 57344 {
+            push_utf8(out, 65533)
+        } else {
+            push_utf8(out, u)
+        }
+        i = i + 1
+    }
+}
+
+fn push_backslashes(out: *mut rt.Buf, n: usize) {
+    var k: usize = 0
+    while k < n {
+        rt.buf_push(out, 92 as u8)
+        k = k + 1
+    }
+}
+
+// Appends the argument `s`, quoted so that the rules above read it back
+// as `s`.
+fn win_quote_arg(s: str, out: *mut rt.Buf) {
+    let n: usize = s.length()
+    var needs: bool = n == 0
+    var i: usize = 0
+    while i < n && !needs {
+        let c: u8 = s.chars(i)
+        if c == 32 as u8 || c == 9 as u8 || c == 10 as u8 || c == 11 as u8 || c == 34 as u8 {
+            needs = true
+        }
+        i = i + 1
+    }
+    if !needs {
+        rt.buf_push_bytes(out, s.p as u64, n)
+        return
+    }
+    rt.buf_push(out, 34 as u8)
+    var bs: usize = 0
+    i = 0
+    while i < n {
+        let c: u8 = s.chars(i)
+        if c == 92 as u8 {
+            bs = bs + 1
+        } else if c == 34 as u8 {
+            push_backslashes(out, bs * 2 + 1)
+            rt.buf_push(out, 34 as u8)
+            bs = 0
+        } else {
+            push_backslashes(out, bs)
+            bs = 0
+            rt.buf_push(out, c)
+        }
+        i = i + 1
+    }
+    push_backslashes(out, bs * 2)
+    rt.buf_push(out, 34 as u8)
+}
+
+// The whole command line: the program name (quoted like an argument -- a
+// path with a space needs it), then every argument. `args` is a block of
+// NUL terminated strings, `nargs` of them (the form `std.process` keeps).
+// `out` receives UTF-8; no terminating zero.
+fn win_command_line(program: str, args: *mut rt.Buf, nargs: usize, out: *mut rt.Buf) {
+    // The program name: if it needs quotes, plain wrapping -- the parser
+    // does no backslash processing on the first token, so a trailing
+    // backslash must NOT be doubled there.
+    var needs: bool = program.length() == 0
+    var i: usize = 0
+    while i < program.length() {
+        let c: u8 = program.chars(i)
+        if c == 32 as u8 || c == 9 as u8 {
+            needs = true
+        }
+        i = i + 1
+    }
+    if needs {
+        rt.buf_push(out, 34 as u8)
+        rt.buf_push_bytes(out, program.p as u64, program.length())
+        rt.buf_push(out, 34 as u8)
+    } else {
+        rt.buf_push_bytes(out, program.p as u64, program.length())
+    }
+    var at: usize = 0
+    var k: usize = 0
+    while k < nargs {
+        let start: usize = at
+        while at < rt.buf_len(args) && rt.buf_at(args, at) != 0 as u8 {
+            at = at + 1
+        }
+        rt.buf_push(out, 32 as u8)
+        win_quote_arg(str { p: (rt.buf_ptr(args) + start as u64) as *mut u8, n: at - start }, out)
+        at = at + 1
+        k = k + 1
+    }
+}
+
+// The knife: cuts `line` into arguments by the rules above. Every argument
+// is appended to `out` followed by a zero octet; the result is the number of
+// arguments.
+fn win_split_command_line(line: str, out: *mut rt.Buf) -> usize {
+    let n: usize = line.length()
+    var i: usize = 0
+    var count: usize = 0
+    // --- the program name
+    while i < n && (line.chars(i) == 32 as u8 || line.chars(i) == 9 as u8) {
+        i = i + 1
+    }
+    if i >= n {
+        return 0
+    }
+    var inq: bool = false
+    while i < n {
+        let c: u8 = line.chars(i)
+        if c == 34 as u8 {
+            inq = !inq
+        } else if !inq && (c == 32 as u8 || c == 9 as u8) {
+            break
+        } else {
+            rt.buf_push(out, c)
+        }
+        i = i + 1
+    }
+    rt.buf_push(out, 0 as u8)
+    count = 1
+    // --- the rest
+    while true {
+        while i < n && (line.chars(i) == 32 as u8 || line.chars(i) == 9 as u8) {
+            i = i + 1
+        }
+        if i >= n {
+            break
+        }
+        inq = false
+        while i < n {
+            let c: u8 = line.chars(i)
+            if c == 92 as u8 {
+                var bs: usize = 0
+                while i < n && line.chars(i) == 92 as u8 {
+                    bs = bs + 1
+                    i = i + 1
+                }
+                if i < n && line.chars(i) == 34 as u8 {
+                    var h: usize = 0
+                    while h < bs / 2 {
+                        rt.buf_push(out, 92 as u8)
+                        h = h + 1
+                    }
+                    if bs % 2 == 1 {
+                        rt.buf_push(out, 34 as u8)
+                        i = i + 1
+                    }
+                    // an even count: the quote is seen again by the loop
+                } else {
+                    var h: usize = 0
+                    while h < bs {
+                        rt.buf_push(out, 92 as u8)
+                        h = h + 1
+                    }
+                }
+            } else if c == 34 as u8 {
+                if inq && i + 1 < n && line.chars(i + 1) == 34 as u8 {
+                    rt.buf_push(out, 34 as u8)
+                    i = i + 2
+                } else {
+                    inq = !inq
+                    i = i + 1
+                }
+            } else if !inq && (c == 32 as u8 || c == 9 as u8) {
+                break
+            } else {
+                rt.buf_push(out, c)
+                i = i + 1
+            }
+        }
+        rt.buf_push(out, 0 as u8)
+        count = count + 1
+    }
+    return count
+}

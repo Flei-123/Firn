@@ -1,0 +1,197 @@
+// expect_exit: 0
+// tests/2062_std_process.fi -- std.process on Linux: start programs, pipes
+// that cannot deadlock, exit codes, kill, timeouts, detach.
+import std.rt
+import std.str
+import std.process
+import std.fs
+
+fn eq(b: *mut rt.Buf, s: str) -> bool {
+    if rt.buf_len(b) != s.length() {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(b), s.p as u64, s.length())
+}
+
+fn now_ms() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] * 1000 + ts[1] / 1000000) as u64
+}
+
+// the class of an error as a number
+fn terr(e: ProcError) -> i32 {
+    if e == ProcError::NotFound { return 1001 }
+    if e == ProcError::Permission { return 1002 }
+    if e == ProcError::Invalid { return 1003 }
+    if e == ProcError::Resource { return 1004 }
+    if e == ProcError::Exec { return 1005 }
+    if e == ProcError::Io { return 1006 }
+    return 1007
+}
+
+fn dummy(code: i32) -> process.Child {
+    return process.Child { pid: 0 - code as i64, h: 0, in_fd: -1, out_fd: -1, err_fd: -1,
+        done: false, code: 0, sig: 0, own: true }
+}
+
+// the error number of a failing spawn; 0 if it worked (the child is waited for)
+fn spawn_error(c: *mut process.Command) -> i32 {
+    var ch: process.Child = process.spawn(c) catch | e | dummy(terr(e))
+    if ch.pid > 0 {
+        process.kill(&ch)
+        process.wait(&ch)
+        process.close(&ch)
+        return 0
+    }
+    return (0 - ch.pid) as i32
+}
+
+fn sh(script: str) -> process.Command {
+    var c: process.Command = process.command("sh")
+    process.add_arg(&c, "-c")
+    process.add_arg(&c, script)
+    return c
+}
+
+fn main() -> i32 {
+    // --- A. echo, both outputs separated
+    var c: process.Command = process.command("echo")
+    process.add_arg(&c, "hello")
+    process.add_arg(&c, "world")
+    var out: rt.Buf = rt.buf_new()
+    var err: rt.Buf = rt.buf_new()
+    var code: i32 = process.run_capture(&c, &out, &err, 10000) catch 99
+    if code != 0 { return 1 as i32 }
+    if !eq(&out, "hello world\n") { return 2 as i32 }
+    if rt.buf_len(&err) != 0 { return 3 as i32 }
+    process.command_free(&c)
+
+    // --- B. exit codes, and a signal
+    c = sh("exit 7")
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 10000) catch 99
+    if code != 7 { return 4 as i32 }
+    process.command_free(&c)
+    c = sh("kill -9 $$")
+    code = process.run_capture(&c, &out, &err, 10000) catch 99
+    if code != 137 { return 5 as i32 }
+    process.command_free(&c)
+
+    // --- C. stderr is separate; merged it is in order in stdout
+    c = sh("echo out; echo err 1>&2")
+    rt.buf_clear(&out)
+    rt.buf_clear(&err)
+    code = process.run_capture(&c, &out, &err, 10000) catch 99
+    if code != 0 { return 6 as i32 }
+    if !eq(&out, "out\n") { return 7 as i32 }
+    if !eq(&err, "err\n") { return 8 as i32 }
+    process.merge_stderr(&c)
+    rt.buf_clear(&out)
+    rt.buf_clear(&err)
+    code = process.run_capture(&c, &out, &err, 10000) catch 99
+    if !eq(&out, "out\nerr\n") { return 9 as i32 }
+    if rt.buf_len(&err) != 0 { return 10 as i32 }
+    process.command_free(&c)
+
+    // --- D. 3 MiB through `cat` in both directions at once (input > pipe size
+    // and output > pipe size: writing first or reading first would deadlock)
+    let big: usize = 3 * 1024 * 1024
+    var data: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < big {
+        rt.buf_push(&data, ((i * 7 + i / 251) % 256) as u8)
+        i = i + 1
+    }
+    c = process.command("cat")
+    rt.buf_clear(&out)
+    rt.buf_clear(&err)
+    code = process.run_io(&c, rt.buf_ptr(&data), big, &out, &err, 30000) catch 99
+    if code != 0 { return 11 as i32 }
+    if rt.buf_len(&out) != big { return 12 as i32 }
+    if !rt.mem_eq(rt.buf_ptr(&out), rt.buf_ptr(&data), big) { return 13 as i32 }
+    process.command_free(&c)
+    rt.buf_free(&data)
+
+    // --- E. 300000 octets on stdout AND on stderr (reading one to the end
+    // first would deadlock)
+    c = sh("head -c 300000 /dev/zero 1>&2; head -c 300000 /dev/zero")
+    rt.buf_clear(&out)
+    rt.buf_clear(&err)
+    code = process.run_capture(&c, &out, &err, 30000) catch 99
+    if code != 0 { return 14 as i32 }
+    if rt.buf_len(&out) != 300000 { return 15 as i32 }
+    if rt.buf_len(&err) != 300000 { return 16 as i32 }
+    process.command_free(&c)
+
+    // --- F. errors
+    c = process.command("no_such_program_xyz_2062")
+    if spawn_error(&c) != 1001 { return 17 as i32 }
+    process.command_free(&c)
+    c = process.command("/etc/passwd")
+    if spawn_error(&c) != 1002 { return 18 as i32 }
+    process.command_free(&c)
+    c = process.command("")
+    if spawn_error(&c) != 1003 { return 19 as i32 }
+    process.command_free(&c)
+    c = process.command("sh")
+    process.set_cwd(&c, "/no/such/dir/2062")
+    if spawn_error(&c) != 1001 { return 28 as i32 }
+    process.command_free(&c)
+
+    // --- G. working directory, environment, arguments
+    c = sh("pwd")
+    process.set_cwd(&c, "/tmp")
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 10000) catch 99
+    if !eq(&out, "/tmp\n") { return 20 as i32 }
+    process.command_free(&c)
+    c = sh("echo $FOO_2062")
+    process.set_env(&c, "FOO_2062", "bar baz")
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 10000) catch 99
+    if !eq(&out, "bar baz\n") { return 21 as i32 }
+    process.set_env(&c, "FOO_2062", "second")
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 10000) catch 99
+    if !eq(&out, "second\n") { return 22 as i32 }
+    process.command_free(&c)
+    c = sh("echo ${USER_OR_HOME_2062-unset}${HOME-unset}")
+    process.unset_env(&c, "HOME")
+    rt.buf_clear(&out)
+    // HOME is gone from the CHILD only
+    code = process.run_capture(&c, &out, &err, 10000) catch 99
+    if !eq(&out, "unsetunset\n") { return 23 as i32 }
+    process.command_free(&c)
+    c = process.command("/usr/bin/env")
+    process.clear_env(&c)
+    process.set_env(&c, "ONLY", "1")
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 10000) catch 99
+    if !eq(&out, "ONLY=1\n") { return 24 as i32 }
+    process.command_free(&c)
+    c = process.command("sh")
+    process.add_arg(&c, "-c")
+    process.add_arg(&c, "printf '%s|' \"$@\"")
+    process.add_arg(&c, "sh")
+    process.add_arg(&c, "a b")
+    process.add_arg(&c, "")
+    process.add_arg(&c, "c\"d")
+    process.add_arg(&c, "-n")
+    rt.buf_clear(&out)
+    code = process.run_capture(&c, &out, &err, 10000) catch 99
+    if !eq(&out, "a b||c\"d|-n|") { return 25 as i32 }
+    process.command_free(&c)
+
+    // --- H. timeout kills the child
+    c = process.command("sleep")
+    process.add_arg(&c, "30")
+    rt.buf_clear(&out)
+    let t0: u64 = now_ms()
+    let timed: i32 = process.run_capture(&c, &out, &err, 300) catch | e | terr(e)
+    process.command_free(&c)
+    if now_ms() - t0 > 5000 { return 26 as i32 }
+    if timed != 1007 { return 27 as i32 }
+
+    return 0
+}

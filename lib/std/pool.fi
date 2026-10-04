@@ -1,0 +1,363 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/pool.fi -- std.pool: a fixed set of worker threads and a job queue.
+//
+// For the work that waits for the network: 3000 files to download, 50 at a
+// time. A job is a function value `fn(u64) -> u64` and one argument; the
+// result (a number) is collected afterwards.
+//
+//     import std.pool
+//
+//     fn fetch(i: u64) -> u64 { ... return 1 }          // runs on a worker
+//
+//     fn __thread_work(kind: u64, arg: u64) -> u64 {    // ONE line to wire it
+//         if kind == pool.WORKER_KIND { return pool.worker_main(arg) }
+//         return 0
+//     }
+//
+//     fn main() -> i32 {
+//         var p: pool.Pool = pool.pool_new(8, 256)
+//         var i: u64 = 0
+//         while i < 3000 {
+//             pool.submit(&p, fetch, i)                  // blocks when 256 are waiting
+//             i = i + 1
+//         }
+//         pool.wait_idle(&p)                             // all 3000 are done
+//         let n: u64 = pool.completed(&p)
+//         pool.shutdown(&p)
+//         return 0
+//     }
+//
+// or, with the results:
+//
+//     let j: u64 = pool.submit(&p, f, arg)               // a handle, 0 = failed
+//     ...
+//     pool.wait_idle(&p)
+//     let r: u64 = pool.job_result(j)
+//     pool.job_free(j)
+//
+// WHY THE `__thread_work` LINE. The thread runtime (round 49) starts a thread
+// with a KIND and one argument and calls the program's own dispatcher
+// `fn __thread_work(kind, arg)`; a library cannot define it, because there can
+// be only one per program. `pool.worker_main` is what the dispatcher has to
+// call for `pool.WORKER_KIND`. A program with its own threads gives them kinds
+// of its own.
+//
+// HOW IT WORKS. The queue is a thread channel (`thread_channel_*`): bounded,
+// blocking, FIFO. `submit` puts the address of a job record in it; a worker
+// takes it out, calls the function, stores the result in the record and
+// counts. The record lives in memory of the pool's own (not in the garbage
+// collected heap) and is recycled by `job_free`.
+//
+// HONEST
+// Q1  THE ARGUMENT IS A NUMBER. If it is the address of something, that
+//     something must stay alive and must not be moved or collected while the
+//     job is waiting or running: the collector does not look into the queue.
+//     Hand over indices (into an array the caller owns), addresses of
+//     memory from `rt.heap_alloc`, or objects the caller keeps referenced
+//     elsewhere. The same holds for what a function value closes over -- use
+//     functions without captured variables.
+// Q2  `submit` BLOCKS while the queue is full. Do not call it from inside a
+//     job of the same pool unless the queue is larger than all jobs that can
+//     be waiting: if every worker is blocked in `submit`, nobody takes jobs
+//     out and the pool deadlocks.
+// Q3  `wait_idle` polls (every millisecond); `shutdown` waits for the jobs
+//     that are queued, then ends the workers. A job that never returns
+//     blocks `shutdown` forever; there is no cancellation.
+// Q4  Up to 64 threads exist in a program (the thread table), and the pool
+//     uses `workers` of them; `pool_new` asks for at most 32.
+// Q5  A worker that computes without allocating and without blocking does
+//     not stop for the collector (docs/ROUND49.md 7): a job that runs for
+//     seconds in a pure loop delays every collection. Network and file jobs
+//     block constantly and are fine.
+// Q6  Linux only. On Windows this file's twin runs every job at once in
+//     `submit` on the calling thread (no threads there yet): the program
+//     works, one job at a time, with the same API and the same results.
+// Q7  Each worker has a stack of 1 MiB (`thread_stack_set` before `pool_new`
+//     changes it for all threads started afterwards).
+
+import rt
+
+export {
+    Pool, WORKER_KIND,
+    pool_new, submit, wait_idle, shutdown, worker_main,
+    pending, completed, worker_count,
+    job_done, job_result, job_free,
+    run_all,
+}
+
+// The thread kind of a pool worker ("pool" in ASCII).
+const WORKER_KIND: u64 = 1886351212
+
+const SYS_NANOSLEEP: i64 = 35
+
+// pool block, in 64 bit words
+const P_CHAN: usize = 0
+const P_WORKERS: usize = 1
+const P_PENDING: usize = 2
+const P_COMPLETED: usize = 3
+const P_LOCK: usize = 4
+const P_FREE: usize = 5 // free list of job records
+const P_SLABS: usize = 6 // number of slabs
+const P_STOPPED: usize = 7
+const P_HANDLES: usize = 8 // 32 thread handles
+const P_SLAB_LIST: usize = 40 // up to 4096 slab addresses (see SLAB_MAX)
+const P_WORDS: usize = 4136
+
+// job record, 4 words
+const J_FN: usize = 0
+const J_ARG: usize = 1
+const J_RES: usize = 2
+const J_NEXT_STATE: usize = 3 // low 8 bits: 0 free/queued, 1 running, 2 done; the rest: next in the free list
+const JOB_WORDS: usize = 4
+const SLAB_JOBS: usize = 128
+const SLAB_MAX: usize = 4096
+
+const MINUS1: u64 = 18446744073709551615
+
+struct Pool {
+    blk: u64, // 0 = the pool could not be created
+}
+
+fn nap_ms(ms: u64) {
+    var ts: [i64; 2] = [(ms / 1000) as i64, ((ms % 1000) * 1000000) as i64]
+    syscall(SYS_NANOSLEEP, (&ts[0]) as i64, 0, 0, 0, 0, 0)
+}
+
+// Starts `workers` threads (1 to 32) and a queue that holds `queue` jobs
+// (at least 1). `Pool.blk == 0` when it did not work (no memory, the thread
+// table is full).
+fn pool_new(workers: u64, queue: u64) -> Pool {
+    var w: u64 = workers
+    if w < 1 {
+        w = 1
+    }
+    if w > 32 {
+        w = 32
+    }
+    var q: u64 = queue
+    if q < 1 {
+        q = 1
+    }
+    let blk: u64 = rt.heap_alloc(P_WORDS * 8)
+    if blk == 0 {
+        return Pool { blk: 0 }
+    }
+    rt.mem_set(blk, 0 as u8, P_WORDS * 8)
+    let ch: u64 = thread_channel_new(q)
+    if ch == 0 {
+        rt.heap_free(blk, P_WORDS * 8)
+        return Pool { blk: 0 }
+    }
+    rt.st64(blk, P_CHAN, ch)
+    var started: u64 = 0
+    while started < w {
+        let h: u64 = thread_start(WORKER_KIND, blk)
+        if h == 0 {
+            break
+        }
+        rt.st64(blk, P_HANDLES + started as usize, h)
+        started = started + 1
+    }
+    rt.st64(blk, P_WORKERS, started)
+    if started == 0 {
+        thread_channel_free(ch)
+        rt.heap_free(blk, P_WORDS * 8)
+        return Pool { blk: 0 }
+    }
+    return Pool { blk: blk }
+}
+
+fn worker_count(p: *mut Pool) -> u64 {
+    if (*p).blk == 0 {
+        return 0
+    }
+    return rt.ld64((*p).blk, P_WORKERS)
+}
+
+// Takes a job record from the free list or from a new slab.
+fn job_alloc(blk: u64) -> u64 {
+    let lock: *mut u64 = (blk + (P_LOCK * 8) as u64) as *mut u64
+    thread_lock(lock)
+    var j: u64 = rt.ld64(blk, P_FREE)
+    if j != 0 {
+        rt.st64(blk, P_FREE, rt.ld64(j, J_NEXT_STATE) >> 8)
+    } else {
+        let n: u64 = rt.ld64(blk, P_SLABS)
+        if n < SLAB_MAX as u64 {
+            let slab: u64 = rt.heap_alloc(SLAB_JOBS * JOB_WORDS * 8)
+            if slab != 0 {
+                rt.mem_set(slab, 0 as u8, SLAB_JOBS * JOB_WORDS * 8)
+                rt.st64(blk, P_SLAB_LIST + n as usize, slab)
+                rt.st64(blk, P_SLABS, n + 1)
+                // record 0 is returned, 1.. go onto the free list
+                var k: usize = SLAB_JOBS - 1
+                while k >= 1 {
+                    let rec: u64 = slab + (k * JOB_WORDS * 8) as u64
+                    rt.st64(rec, J_NEXT_STATE, rt.ld64(blk, P_FREE) << 8)
+                    rt.st64(blk, P_FREE, rec)
+                    k = k - 1
+                }
+                j = slab
+            }
+        }
+    }
+    thread_unlock(lock)
+    return j
+}
+
+// Queues `f(arg)`. The result is the job handle (for `job_done`,
+// `job_result`, `job_free`), or 0 when the pool is stopped or out of memory.
+// Blocks while the queue is full (Q2).
+fn submit(p: *mut Pool, f: fn(u64) -> u64, arg: u64) -> u64 {
+    let blk: u64 = (*p).blk
+    if blk == 0 || rt.ld64(blk, P_STOPPED) != 0 {
+        return 0
+    }
+    let j: u64 = job_alloc(blk)
+    if j == 0 {
+        return 0
+    }
+    rt.st64(j, J_FN, f as u64)
+    rt.st64(j, J_ARG, arg)
+    rt.st64(j, J_RES, 0)
+    rt.st64(j, J_NEXT_STATE, 0)
+    __atomic_add((blk + (P_PENDING * 8) as u64) as *mut u64, 1)
+    thread_channel_send(rt.ld64(blk, P_CHAN), j)
+    return j
+}
+
+fn job_done(j: u64) -> bool {
+    return (rt.ld64(j, J_NEXT_STATE) & 255) == 2
+}
+
+// The result of a finished job (0 while it is not finished).
+fn job_result(j: u64) -> u64 {
+    if !job_done(j) {
+        return 0
+    }
+    return rt.ld64(j, J_RES)
+}
+
+// Gives the record back for reuse. The handle is invalid afterwards.
+fn job_free(p: *mut Pool, j: u64) {
+    let blk: u64 = (*p).blk
+    if blk == 0 || j == 0 {
+        return
+    }
+    let lock: *mut u64 = (blk + (P_LOCK * 8) as u64) as *mut u64
+    thread_lock(lock)
+    rt.st64(j, J_NEXT_STATE, rt.ld64(blk, P_FREE) << 8)
+    rt.st64(blk, P_FREE, j)
+    thread_unlock(lock)
+}
+
+fn pending(p: *mut Pool) -> u64 {
+    if (*p).blk == 0 {
+        return 0
+    }
+    return rt.ld64((*p).blk, P_PENDING)
+}
+
+fn completed(p: *mut Pool) -> u64 {
+    if (*p).blk == 0 {
+        return 0
+    }
+    return rt.ld64((*p).blk, P_COMPLETED)
+}
+
+// Returns when every job submitted so far has finished.
+fn wait_idle(p: *mut Pool) {
+    if (*p).blk == 0 {
+        return
+    }
+    while rt.ld64((*p).blk, P_PENDING) != 0 {
+        nap_ms(1)
+    }
+}
+
+// What the dispatcher calls for WORKER_KIND (see the head of this file).
+fn worker_main(blk: u64) -> u64 {
+    let ch: u64 = rt.ld64(blk, P_CHAN)
+    while true {
+        let j: u64 = thread_channel_receive(ch)
+        if j == 0 {
+            break
+        }
+        rt.st64(j, J_NEXT_STATE, 1)
+        let f: fn(u64) -> u64 = rt.ld64(j, J_FN) as fn(u64) -> u64
+        let r: u64 = f(rt.ld64(j, J_ARG))
+        rt.st64(j, J_RES, r)
+        // the counter is a locked instruction: it orders the result before the state
+        __atomic_add((blk + (P_COMPLETED * 8) as u64) as *mut u64, 1)
+        rt.st64(j, J_NEXT_STATE, 2)
+        __atomic_add((blk + (P_PENDING * 8) as u64) as *mut u64, MINUS1)
+    }
+    return 0
+}
+
+// Waits for the queued jobs, ends the workers and frees everything. The
+// pool and every job handle are invalid afterwards.
+fn shutdown(p: *mut Pool) {
+    let blk: u64 = (*p).blk
+    if blk == 0 {
+        return
+    }
+    rt.st64(blk, P_STOPPED, 1)
+    wait_idle(p)
+    let ch: u64 = rt.ld64(blk, P_CHAN)
+    let n: u64 = rt.ld64(blk, P_WORKERS)
+    var i: u64 = 0
+    while i < n {
+        thread_channel_send(ch, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        thread_wait(rt.ld64(blk, P_HANDLES + i as usize))
+        i = i + 1
+    }
+    thread_channel_free(ch)
+    var s: u64 = 0
+    let slabs: u64 = rt.ld64(blk, P_SLABS)
+    while s < slabs {
+        rt.heap_free(rt.ld64(blk, P_SLAB_LIST + s as usize), SLAB_JOBS * JOB_WORDS * 8)
+        s = s + 1
+    }
+    rt.heap_free(blk, P_WORDS * 8)
+    (*p).blk = 0
+}
+
+// `f(args[0])` .. `f(args[n-1])` on the pool; the results land in
+// `results[0..n]` (both are arrays of u64 in memory the caller owns). Returns
+// when all are done. The result is false if a job could not be queued
+// (the others still ran).
+fn run_all(p: *mut Pool, f: fn(u64) -> u64, args: u64, n: usize, results: u64) -> bool {
+    let jobs: u64 = rt.heap_alloc(n * 8 + 8)
+    if jobs == 0 {
+        return false
+    }
+    var ok: bool = true
+    var i: usize = 0
+    while i < n {
+        let j: u64 = submit(p, f, rt.ld64(args, i))
+        rt.st64(jobs, i, j)
+        if j == 0 {
+            ok = false
+        }
+        i = i + 1
+    }
+    wait_idle(p)
+    i = 0
+    while i < n {
+        let j: u64 = rt.ld64(jobs, i)
+        if j != 0 {
+            rt.st64(results, i, job_result(j))
+            job_free(p, j)
+        } else {
+            rt.st64(results, i, 0)
+        }
+        i = i + 1
+    }
+    rt.heap_free(jobs, n * 8 + 8)
+    return ok
+}

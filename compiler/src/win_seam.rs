@@ -538,42 +538,85 @@ fn __win_argv() -> u64 {
     // octets.
     let text: u64 = blk + 4096
     let n: i64 = __win_u16_to_u8(cmd, 0 - 1, text, 32768)
-    // Split the command line the way Windows does for the simple cases:
-    // quotes group, spaces separate. A backslash before a quote is NOT
-    // special here -- that rule only exists inside quoted stretches in
-    // Microsoft's own parser and would silently corrupt paths.
+    // Split the command line by the rules of the C runtime (the same ones
+    // CommandLineToArgvW uses for everything after the program name):
+    //   * spaces and tabs separate, quotes group and are dropped
+    //   * 2n backslashes + `"` -> n backslashes, the quote groups
+    //   * 2n+1 backslashes + `"` -> n backslashes and a literal `"`
+    //   * backslashes NOT followed by a quote are literal (paths are safe)
+    //   * inside quotes `""` is one literal `"`
+    // The program name (the first word) gets no backslash processing.
+    // The result is never longer than the input, so the words are cut
+    // in place: `w` (write) stays behind or at `i` (read).
     var argc: i64 = 0
     var i: i64 = 0
     while i < n {
-        while i < n && __win_ld8(text, i) == 32 {
+        while i < n && (__win_ld8(text, i) == 32 || __win_ld8(text, i) == 9) {
             i = i + 1
         }
         if i >= n {
             break
         }
-        var q: i64 = 0
-        if __win_ld8(text, i) == 34 {
-            q = 1
-            i = i + 1
-        }
+        var w: i64 = i
         let start: i64 = i
-        while i < n {
+        var q: i64 = 0
+        var done: i64 = 0
+        while i < n && done == 0 {
             let c: i64 = __win_ld8(text, i)
-            if q == 1 && c == 34 {
-                break
+            if c == 92 && argc > 0 {
+                var bs: i64 = 0
+                while i < n && __win_ld8(text, i) == 92 {
+                    bs = bs + 1
+                    i = i + 1
+                }
+                if i < n && __win_ld8(text, i) == 34 {
+                    var h: i64 = 0
+                    while h < bs / 2 {
+                        __win_st8(text, w, 92)
+                        w = w + 1
+                        h = h + 1
+                    }
+                    if bs % 2 == 1 {
+                        __win_st8(text, w, 34)
+                        w = w + 1
+                        i = i + 1
+                    }
+                } else {
+                    var h2: i64 = 0
+                    while h2 < bs {
+                        __win_st8(text, w, 92)
+                        w = w + 1
+                        h2 = h2 + 1
+                    }
+                }
+            } else {
+                if c == 34 {
+                    if q == 1 && argc > 0 && i + 1 < n && __win_ld8(text, i + 1) == 34 {
+                        __win_st8(text, w, 34)
+                        w = w + 1
+                        i = i + 2
+                    } else {
+                        q = 1 - q
+                        i = i + 1
+                    }
+                } else {
+                    if q == 0 && (c == 32 || c == 9) {
+                        done = 1
+                    } else {
+                        __win_st8(text, w, c)
+                        w = w + 1
+                        i = i + 1
+                    }
+                }
             }
-            if q == 0 && c == 32 {
-                break
-            }
-            i = i + 1
         }
         if argc < 500 {
             __win_st64(blk, 1 + argc, (text as i64) + start)
             argc = argc + 1
         }
         // Terminate the word in place; the next one starts behind it.
+        __win_st8(text, w, 0)
         if i < n {
-            __win_st8(text, i, 0)
             i = i + 1
         }
     }

@@ -1,0 +1,468 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/shell.fi -- std.shell: what a program asks of the desktop.
+//
+//     import std.shell
+//
+//     shell.open_url("https://example.org/") catch | e | ...
+//     shell.open_path("/home/me/Downloads/readme.pdf") catch | e | ...
+//     shell.reveal_in_file_manager("/home/me/.minecraft/saves") catch | e | ...
+//
+//     let java: str = shell.find_java(false)            // "" = none found
+//     let major: i32 = shell.java_major_version(java)   // 8, 17, 21, ... or -1
+//     let where: str = shell.find_in_path("git")        // "" = not on PATH
+//
+//     let data: str = shell.data_dir()                  // ~/.local/share | %LOCALAPPDATA%
+//     let mc: str = shell.minecraft_dir()               // ~/.minecraft | %APPDATA%\.minecraft
+//
+// One source file for Linux and Windows. What differs lives in `shellos.fi`
+// (Linux: xdg-open, D-Bus, XDG directories) and `shellos.windows.fi`
+// (ShellExecuteW, explorer, the known folders); the compiler picks the right
+// one for the target.
+//
+// WHAT "OPEN" MEANS. `open_url` hands the URL to the system's choice of
+// browser, `open_path` hands a file to the program the system associates with
+// it (a folder opens in the file manager). Neither waits: on Linux the helper
+// is started detached, on Windows ShellExecute returns when the request has
+// been handed over. Success means "the request was made", not "a window is
+// open now" -- there is no way to know that.
+//
+// WHAT IS REFUSED. `open_url` accepts only `scheme://...` with a scheme of
+// letters, digits, `+`, `-`, `.` and `mailto:`; no control characters or
+// blanks in it. A string such as `--help` or `-c cmd` is never handed to an
+// opener, and `open_path` makes a relative path that begins with `-`
+// unmistakably a path (`./-x`). On Windows `open_url` additionally refuses
+// every scheme that is not `http`, `https` or `mailto`: `file:`, `ms-...`
+// and `javascript:` run things.
+//
+// HONEST
+// S1  `reveal_in_file_manager` selects the item on Linux only when the
+//     desktop has the FileManager1 D-Bus interface (GNOME, KDE, Cinnamon,
+//     XFCE with Thunar, LXQt); otherwise it opens the containing folder.
+//     Windows always selects (explorer /select).
+// S2  Directory functions read the environment the program was started with.
+//     They answer "" when nothing can be determined (no HOME).
+// S3  `java_candidates` knows the usual places (JAVA_HOME, PATH, system
+//     JVM folders, SDKMAN, IntelliJ's .jdks, the Minecraft launcher's
+//     runtime folder; on Windows Program Files\Java, Adoptium, Microsoft,
+//     Zulu, Corretto, BellSoft, Semeru). A Java installed anywhere else is
+//     not found -- the caller must let the user choose one.
+// S4  `java_major_version` RUNS `java -version` (a fraction of a second,
+//     limited to 10 s) and reads "1.8.0_x" as 8, "17.0.2" as 17, "21" as 21.
+
+import rt
+import str
+import env
+import fs
+import dir
+import process
+import shellos
+
+export {
+    ShellError,
+    open_url, open_path, reveal_in_file_manager,
+    find_in_path,
+    home_dir, config_dir, data_dir, cache_dir, temp_dir, minecraft_dir,
+    java_candidates, find_java, java_major_version,
+}
+
+error ShellError {
+    Invalid, // a URL or path that is not acceptable (see above)
+    NotFound, // the path does not exist / no program to open it with
+    Failed, // the system refused the request
+}
+
+fn launch_error(r: i32) -> ShellError {
+    if r == shellos.LAUNCH_MISSING {
+        return ShellError::NotFound
+    }
+    return ShellError::Failed
+}
+
+fn scheme_ok(url: str) -> bool {
+    let n: usize = url.length()
+    if n == 0 || n > 8192 {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        let c: u8 = url.chars(i)
+        if c <= 32 as u8 || c == 127 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    // scheme ":" ...
+    var s: usize = 0
+    while s < n && url.chars(s) != 58 as u8 {
+        let c: u8 = url.chars(s)
+        let ok: bool = (c >= 48 as u8 && c <= 57 as u8) || (c >= 65 as u8 && c <= 90 as u8)
+            || (c >= 97 as u8 && c <= 122 as u8) || c == 43 as u8 || c == 45 as u8 || c == 46 as u8
+        if !ok {
+            return false
+        }
+        s = s + 1
+    }
+    if s == 0 || s >= n {
+        return false
+    }
+    // the first character of a scheme is a letter
+    let f: u8 = url.chars(0)
+    if !((f >= 65 as u8 && f <= 90 as u8) || (f >= 97 as u8 && f <= 122 as u8)) {
+        return false
+    }
+    let rest: str = url.part(s + 1, n - s - 1)
+    if rest.length() >= 2 && rest.chars(0) == 47 as u8 && rest.chars(1) == 47 as u8 {
+        return true
+    }
+    // mailto:person@example.org
+    return s == 6 && url.part(0, 6) == "mailto" && rest.length() > 0
+}
+
+// Opens the URL in the default browser (or the mail program for `mailto:`).
+fn open_url(url: str) -> ShellError!bool {
+    if !scheme_ok(url) {
+        return ShellError::Invalid
+    }
+    let r: i32 = shellos.os_open_url(url)
+    if r != shellos.LAUNCH_OK {
+        return launch_error(r)
+    }
+    return true
+}
+
+// Opens a file with its associated program, or a folder in the file manager.
+fn open_path(path: str) -> ShellError!bool {
+    if path.length() == 0 {
+        return ShellError::Invalid
+    }
+    var i: usize = 0
+    while i < path.length() {
+        if path.chars(i) == 0 as u8 {
+            return ShellError::Invalid
+        }
+        i = i + 1
+    }
+    if !fs.exists(path) {
+        return ShellError::NotFound
+    }
+    var p: str = path
+    if path.chars(0) == 45 as u8 {
+        p = "./" + path
+    }
+    if shellos.os_refuses_path(p) {
+        return ShellError::Invalid
+    }
+    let r: i32 = shellos.os_open_path(p)
+    if r != shellos.LAUNCH_OK {
+        return launch_error(r)
+    }
+    return true
+}
+
+// Shows the file or folder in the file manager, selected if the system
+// can do that (see S1).
+fn reveal_in_file_manager(path: str) -> ShellError!bool {
+    if path.length() == 0 {
+        return ShellError::Invalid
+    }
+    if !fs.exists(path) {
+        return ShellError::NotFound
+    }
+    var p: str = path
+    if path.chars(0) == 45 as u8 {
+        p = "./" + path
+    }
+    var parent: str = fs.path_parent(p)
+    if parent.length() == 0 {
+        parent = "."
+    }
+    let r: i32 = shellos.os_reveal(p, parent, fs.is_dir(p))
+    if r != shellos.LAUNCH_OK {
+        return launch_error(r)
+    }
+    return true
+}
+
+// The full path of the program `name` on the search path, "" if there is none.
+fn find_in_path(name: str) -> str {
+    var out: rt.Buf = rt.buf_new()
+    if !env.find_executable(name, &out) {
+        rt.buf_free(&out)
+        return ""
+    }
+    let s: str = __str_copy(str { p: rt.buf_data(&out), n: rt.buf_len(&out) })
+    rt.buf_free(&out)
+    return s
+}
+
+fn dir_str(which: i32) -> str {
+    var b: rt.Buf = rt.buf_new()
+    if !shellos.os_dir(which, &b) || rt.buf_len(&b) == 0 {
+        rt.buf_free(&b)
+        return ""
+    }
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+// The user's home directory.
+fn home_dir() -> str {
+    return dir_str(shellos.DIR_HOME)
+}
+
+// Where a program keeps settings: $XDG_CONFIG_HOME or ~/.config; %APPDATA%.
+fn config_dir() -> str {
+    return dir_str(shellos.DIR_CONFIG)
+}
+
+// Where a program keeps its data: $XDG_DATA_HOME or ~/.local/share; %LOCALAPPDATA%.
+fn data_dir() -> str {
+    return dir_str(shellos.DIR_DATA)
+}
+
+// Where a program keeps what it can rebuild: $XDG_CACHE_HOME or ~/.cache; %LOCALAPPDATA%.
+fn cache_dir() -> str {
+    return dir_str(shellos.DIR_CACHE)
+}
+
+// The temporary directory: $TMPDIR or /tmp; %TEMP%.
+fn temp_dir() -> str {
+    return dir_str(shellos.DIR_TEMP)
+}
+
+// The folder of the Minecraft launcher: ~/.minecraft; %APPDATA%\.minecraft.
+fn minecraft_dir() -> str {
+    return dir_str(shellos.DIR_MINECRAFT)
+}
+
+// ---------------------------------------------------------------- Java
+
+// Adds `<dir>/bin/<java>` (and `<dir>/jre/bin/<java>`) when it is an
+// executable file and not yet in the list.
+fn add_java(root: str, exe: str, out: *mut rt.Buf, count: *mut usize) {
+    var k: usize = 0
+    while k < 2 {
+        var cand: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&cand, root.p as u64, root.length())
+        if k == 1 {
+            let j: str = "/jre"
+            rt.buf_push_bytes(&cand, j.p as u64, j.length())
+        }
+        let b: str = "/bin/"
+        rt.buf_push_bytes(&cand, b.p as u64, b.length())
+        rt.buf_push_bytes(&cand, exe.p as u64, exe.length())
+        var found: rt.Buf = rt.buf_new()
+        let cs: str = str { p: rt.buf_data(&cand), n: rt.buf_len(&cand) }
+        if env.find_executable(cs, &found) {
+            add_unique(out, count, &found)
+        }
+        rt.buf_free(&found)
+        rt.buf_free(&cand)
+        k = k + 1
+    }
+}
+
+fn add_unique(out: *mut rt.Buf, count: *mut usize, path: *mut rt.Buf) {
+    // already there?
+    let total: usize = rt.buf_len(out)
+    var at: usize = 0
+    while at < total {
+        var e: usize = at
+        while e < total && rt.buf_at(out, e) != 0 as u8 {
+            e = e + 1
+        }
+        if e - at == rt.buf_len(path)
+            && rt.mem_eq(rt.buf_ptr(out) + at as u64, rt.buf_ptr(path), e - at) {
+            return
+        }
+        at = e + 1
+    }
+    rt.buf_push_bytes(out, rt.buf_ptr(path), rt.buf_len(path))
+    rt.buf_push(out, 0 as u8)
+    *count = *count + 1
+}
+
+// Every child directory of `base` as a Java home.
+fn scan_base(base: str, exe: str, out: *mut rt.Buf, count: *mut usize) {
+    var d: dir.Dir = dir.open(base)
+    if !dir.is_open(&d) {
+        return
+    }
+    // collect the names first: add_java runs processes and files
+    var names: rt.Buf = rt.buf_new()
+    while dir.next(&d) {
+        rt.buf_push_bytes(&names, d.name.p as u64, d.name.length())
+        rt.buf_push(&names, 0 as u8)
+    }
+    dir.close(&d)
+    let total: usize = rt.buf_len(&names)
+    var at: usize = 0
+    while at < total {
+        var e: usize = at
+        while e < total && rt.buf_at(&names, e) != 0 as u8 {
+            e = e + 1
+        }
+        let child: str = base + "/" + str { p: (rt.buf_ptr(&names) + at as u64) as *mut u8, n: e - at }
+        add_java(child, exe, out, count)
+        at = e + 1
+    }
+    rt.buf_free(&names)
+}
+
+// The names (one level) in `d` as NUL separated list.
+fn names_of(path: str, out: *mut rt.Buf) {
+    var d: dir.Dir = dir.open(path)
+    if !dir.is_open(&d) {
+        return
+    }
+    while dir.next(&d) {
+        rt.buf_push_bytes(out, d.name.p as u64, d.name.length())
+        rt.buf_push(out, 0 as u8)
+    }
+    dir.close(&d)
+}
+
+// Finds Java installations: JAVA_HOME, the search path, the usual JVM
+// folders, and the runtimes of the Minecraft launcher
+// (`<.minecraft>/runtime/<name>/<platform>/<name>/bin/java`). The paths go
+// into `out`, each followed by a zero octet, without duplicates, in this
+// order (JAVA_HOME first); the result is how many there are. `gui` asks for
+// `javaw` on Windows (no console window), it changes nothing on Linux.
+fn java_candidates(gui: bool, out: *mut rt.Buf) -> usize {
+    var count: usize = 0
+    let exe: str = shellos.os_java_exe(gui)
+    // JAVA_HOME
+    var jh: rt.Buf = rt.buf_new()
+    if env.get_into("JAVA_HOME", &jh) && rt.buf_len(&jh) > 0 {
+        add_java(str { p: rt.buf_data(&jh), n: rt.buf_len(&jh) }, exe, out, &count)
+    }
+    rt.buf_free(&jh)
+    // PATH
+    var on_path: rt.Buf = rt.buf_new()
+    if env.find_executable(exe, &on_path) {
+        add_unique(out, &count, &on_path)
+    }
+    rt.buf_free(&on_path)
+    // the JVM folders
+    var bases: rt.Buf = rt.buf_new()
+    shellos.os_java_bases(&bases)
+    let bt: usize = rt.buf_len(&bases)
+    var at: usize = 0
+    while at < bt {
+        var e: usize = at
+        while e < bt && rt.buf_at(&bases, e) != 0 as u8 {
+            e = e + 1
+        }
+        scan_base(str { p: (rt.buf_ptr(&bases) + at as u64) as *mut u8, n: e - at }, exe, out, &count)
+        at = e + 1
+    }
+    rt.buf_free(&bases)
+    // the Minecraft launcher's own runtimes
+    let mc: str = minecraft_dir()
+    if mc.length() > 0 {
+        let rt_dir: str = mc + "/runtime"
+        var l1: rt.Buf = rt.buf_new()
+        names_of(rt_dir, &l1)
+        var a1: usize = 0
+        while a1 < rt.buf_len(&l1) {
+            var e1: usize = a1
+            while rt.buf_at(&l1, e1) != 0 as u8 {
+                e1 = e1 + 1
+            }
+            let p1: str = rt_dir + "/" + str { p: (rt.buf_ptr(&l1) + a1 as u64) as *mut u8, n: e1 - a1 }
+            var l2: rt.Buf = rt.buf_new()
+            names_of(p1, &l2)
+            var a2: usize = 0
+            while a2 < rt.buf_len(&l2) {
+                var e2: usize = a2
+                while rt.buf_at(&l2, e2) != 0 as u8 {
+                    e2 = e2 + 1
+                }
+                let p2: str = p1 + "/" + str { p: (rt.buf_ptr(&l2) + a2 as u64) as *mut u8, n: e2 - a2 }
+                scan_base(p2, exe, out, &count)
+                a2 = e2 + 1
+            }
+            rt.buf_free(&l2)
+            a1 = e1 + 1
+        }
+        rt.buf_free(&l1)
+    }
+    return count
+}
+
+// The first Java found (see `java_candidates`), "" if there is none.
+fn find_java(gui: bool) -> str {
+    var all: rt.Buf = rt.buf_new()
+    if java_candidates(gui, &all) == 0 {
+        rt.buf_free(&all)
+        return ""
+    }
+    var e: usize = 0
+    while rt.buf_at(&all, e) != 0 as u8 {
+        e = e + 1
+    }
+    let s: str = __str_copy(str { p: rt.buf_data(&all), n: e })
+    rt.buf_free(&all)
+    return s
+}
+
+// The major version of the Java at `path` (8, 11, 17, 21, ...), -1 if it
+// cannot be told. Runs `<path> -version` (see S4).
+fn java_major_version(path: str) -> i32 {
+    if path.length() == 0 {
+        return -1
+    }
+    var c: process.Command = process.command(path)
+    process.add_arg(&c, "-version")
+    var out: rt.Buf = rt.buf_new()
+    var err: rt.Buf = rt.buf_new()
+    let code: i32 = process.run_capture(&c, &out, &err, 10000) catch | e | -1
+    process.command_free(&c)
+    // `java -version` writes to stderr (a few JVMs to stdout)
+    var v: i32 = -1
+    if code == 0 {
+        v = major_from(&err)
+        if v < 0 {
+            v = major_from(&out)
+        }
+    }
+    rt.buf_free(&out)
+    rt.buf_free(&err)
+    return v
+}
+
+// ... version "1.8.0_292" ... / version "17.0.2" ... / version "21" ...
+fn major_from(b: *mut rt.Buf) -> i32 {
+    let n: usize = rt.buf_len(b)
+    var i: usize = 0
+    while i < n && rt.buf_at(b, i) != 34 as u8 {
+        i = i + 1
+    }
+    i = i + 1
+    var first: i32 = 0
+    var digits: u32 = 0
+    while i < n && rt.buf_at(b, i) >= 48 as u8 && rt.buf_at(b, i) <= 57 as u8 {
+        first = first * 10 + (rt.buf_at(b, i) - 48 as u8) as i32
+        digits = digits + 1
+        i = i + 1
+    }
+    if digits == 0 {
+        return -1
+    }
+    if first == 1 && i + 1 < n && rt.buf_at(b, i) == 46 as u8 {
+        // 1.8.0_292 -> 8
+        var second: i32 = 0
+        var d2: u32 = 0
+        var j: usize = i + 1
+        while j < n && rt.buf_at(b, j) >= 48 as u8 && rt.buf_at(b, j) <= 57 as u8 {
+            second = second * 10 + (rt.buf_at(b, j) - 48 as u8) as i32
+            d2 = d2 + 1
+            j = j + 1
+        }
+        if d2 > 0 {
+            return second
+        }
+    }
+    return first
+}

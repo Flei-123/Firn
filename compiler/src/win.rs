@@ -158,6 +158,18 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("GetModuleFileNameW", "KERNEL32.dll", 3),
     ("CreateProcessW", "KERNEL32.dll", 10),
     ("GetExitCodeProcess", "KERNEL32.dll", 2),
+    // --- kernel32 + shell32: std.process / std.shell / std.env --------
+    // A Firn function value is called System V, so `GetProcAddress` + `fn`
+    // cannot reach these (the comment above, measured). Bound here they
+    // get the thunk like every import. Pipes with a handle that is NOT
+    // inherited, waiting with a timeout, killing, peeking into a pipe so a
+    // read never blocks, and ShellExecute for "open this".
+    ("CreatePipe", "KERNEL32.dll", 4),
+    ("SetHandleInformation", "KERNEL32.dll", 3),
+    ("WaitForSingleObject", "KERNEL32.dll", 2),
+    ("TerminateProcess", "KERNEL32.dll", 2),
+    ("PeekNamedPipe", "KERNEL32.dll", 6),
+    ("ShellExecuteW", "SHELL32.dll", 6),
     // --- user32: the window ------------------------------------------
     // Round MERGE-WIN 5.2 says "any GUI" is not bound and therefore not
     // reachable. This is where that stops being true. Everything here is

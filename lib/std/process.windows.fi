@@ -1,0 +1,895 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/process.windows.fi -- std.process on Windows (picked by
+// `--target=x86_64-windows` in place of lib/std/process.fi; same API and the
+// same names, see there for the description and the examples).
+//
+// HOW IT IS DONE. `CreateProcessW` with the command line built by
+// `std.cmdline` (the quoting rules of the C runtime), `CreatePipe` for the
+// pipes with the parent's end made non-inheritable (`SetHandleInformation`),
+// `ReadFile`/`WriteFile`, `PeekNamedPipe` so that a read never blocks when
+// the caller does not want it to, `WaitForSingleObject` for waiting with a
+// timeout, `TerminateProcess` for kill. All of them are bound in the
+// compiler's import table (compiler/src/win.rs): a Firn function value is
+// called System V, so `GetProcAddress` + a function pointer cannot reach
+// them.
+//
+// HONEST (the differences from Linux)
+// W1  `terminate` and `kill` are both `TerminateProcess`: the child cannot
+//     clean up. The exit code it reports is 143 resp. 137, so the numbers
+//     match the Linux ones; `term_signal` is always 0.
+// W2  The exit code is the 32 bit value of `GetExitCodeProcess` as an
+//     `i32`: a crash is a negative number (0xC0000005 = -1073741819).
+// W3  `no_window` is `CREATE_NO_WINDOW`: a console program gets no console
+//     window. A GUI program (javaw.exe) never had one.
+// W4  `detach` is `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`: no
+//     console is shared with the caller, Ctrl+C in the caller's console does
+//     not reach it, and it keeps running after the caller exits. The caller
+//     still gets a handle (so `wait`, `kill` work on a detached child, better
+//     than on Linux); `close` releases it. Unlike Linux, pipes ARE allowed
+//     with detach (the caller gets its ends).
+// W5  Pipes hold 1 MiB. Writing more input than the child has read and
+//     the pipe holds blocks `write_in` -- `communicate` writes in pieces of
+//     4096 and drains the outputs between the pieces, which cannot deadlock
+//     unless the child reads nothing AND fills its output at the same time.
+// W6  The program is found by `env.find_executable` (PATH, PATHEXT), never in
+//     the current directory. `.bat`/`.cmd` start through cmd.exe, whose
+//     own argument rules differ from the ones used here (std.cmdline C1).
+// W7  The environment block is UTF-16 in the order of the inherited
+//     variables, then the changes; it is not sorted (Windows does not
+//     need it for lookups).
+// W8  A child inherits ALL inheritable handles of the caller
+//     (bInheritHandles = TRUE is the only way to give it the pipes). The
+//     library creates its own parent-side ends non-inheritable; a handle
+//     the program made inheritable itself goes along.
+// W9  `fork` has no equivalent and nothing here needs it.
+
+import rt
+import str
+import env
+import envblock
+import cmdline
+import fs
+
+export {
+    ProcError, Command, Child,
+    STDIO_INHERIT, STDIO_PIPE, STDIO_NULL,
+    command, command_free, add_arg, set_cwd, set_env, unset_env, clear_env,
+    set_stdin, set_stdout, set_stderr, merge_stderr,
+    set_no_window, set_detach,
+    spawn, run, run_capture, run_io, communicate,
+    write_in, close_in, read_out, read_err, read_out_nb, read_err_nb,
+    wait, wait_timeout, try_wait, is_running, exit_code, term_signal, pid_of,
+    kill, terminate, close,
+    last_errno,
+}
+
+error ProcError {
+    NotFound,
+    Permission,
+    Invalid,
+    Resource,
+    Exec,
+    Timeout,
+    Io,
+}
+
+const STDIO_INHERIT: u8 = 0
+const STDIO_PIPE: u8 = 1
+const STDIO_NULL: u8 = 2
+const STDIO_MERGE: u8 = 3
+
+struct Command {
+    program: rt.Buf,
+    args: rt.Buf,
+    nargs: usize,
+    cwd: rt.Buf,
+    envs: rt.Buf,
+    env_clear: bool,
+    in_mode: u8,
+    out_mode: u8,
+    err_mode: u8,
+    no_window: bool,
+    detach: bool,
+    bad: bool,
+}
+
+struct Child {
+    pid: i64,
+    h: u64, // the process handle
+    in_fd: i64, // HANDLE values, -1 = none
+    out_fd: i64,
+    err_fd: i64,
+    done: bool,
+    code: i32,
+    sig: i32,
+    own: bool,
+}
+
+// ------------------------------------------------------------ Win32
+
+extern fn CreateProcessW(app: u64, line: u64, pa: i64, ta: i64, inherit: i32, flags: i64,
+    envp: u64, dir: u64, si: u64, pi: u64) -> i32;
+extern fn GetExitCodeProcess(h: u64, code: u64) -> i32;
+extern fn CloseHandle(h: i64) -> i32;
+extern fn CreatePipe(rd: u64, wr: u64, sa: u64, size: i64) -> i32;
+extern fn SetHandleInformation(h: i64, mask: i64, flags: i64) -> i32;
+extern fn WaitForSingleObject(h: u64, ms: i64) -> i32;
+extern fn TerminateProcess(h: u64, code: i64) -> i32;
+extern fn PeekNamedPipe(h: i64, buf: u64, cap: i64, read: u64, avail: u64, left: u64) -> i32;
+extern fn ReadFile(h: i64, buf: u64, n: i64, got: u64, ov: u64) -> i32;
+extern fn WriteFile(h: i64, buf: u64, n: i64, put: u64, ov: u64) -> i32;
+extern fn CreateFileW(name: u64, access: i64, share: i64, sa: u64, disp: i64, flags: i64,
+    tmpl: i64) -> i64;
+extern fn GetStdHandle(which: i64) -> i64;
+extern fn GetLastError() -> i32;
+extern fn Sleep(ms: i64);
+
+const PIPE_SIZE: i64 = 1048576
+const HANDLE_FLAG_INHERIT: i64 = 1
+const STARTF_USESTDHANDLES: u32 = 256
+const CREATE_UNICODE_ENVIRONMENT: i64 = 1024
+const CREATE_NO_WINDOW: i64 = 134217728 // 0x08000000
+const DETACHED_PROCESS: i64 = 8
+const CREATE_NEW_PROCESS_GROUP: i64 = 512
+const INFINITE: i64 = 4294967295
+const WAIT_OBJECT_0: i32 = 0
+const WAIT_TIMEOUT: i32 = 258
+const ERROR_BROKEN_PIPE: i32 = 109
+const ERROR_NO_DATA: i32 = 232
+const GENERIC_RW: i64 = 3221225472 // 0xC0000000
+const OPEN_EXISTING: i64 = 3
+
+static mut proc_errno: i64 = 0
+
+// The Windows error code of the last failure inside this module.
+fn last_errno() -> i64 {
+    return proc_errno
+}
+
+// ------------------------------------------------------------ The command
+
+fn push_cstr(b: *mut rt.Buf, s: str) -> bool {
+    let n: usize = s.length()
+    var i: usize = 0
+    while i < n {
+        if s.chars(i) == 0 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    rt.buf_push_bytes(b, s.p as u64, n)
+    rt.buf_push(b, 0 as u8)
+    return true
+}
+
+fn command(program: str) -> Command {
+    var c: Command = Command {
+        program: rt.buf_new(), args: rt.buf_new(), nargs: 0, cwd: rt.buf_new(),
+        envs: rt.buf_new(), env_clear: false, in_mode: 0 as u8, out_mode: 0 as u8,
+        err_mode: 0 as u8, no_window: false, detach: false, bad: false,
+    }
+    if program.length() == 0 || !push_cstr(&c.program, program) {
+        c.bad = true
+    }
+    return c
+}
+
+fn command_free(c: *mut Command) {
+    rt.buf_free(&(*c).program)
+    rt.buf_free(&(*c).args)
+    rt.buf_free(&(*c).cwd)
+    rt.buf_free(&(*c).envs)
+    (*c).nargs = 0
+}
+
+fn add_arg(c: *mut Command, a: str) {
+    if !push_cstr(&(*c).args, a) {
+        (*c).bad = true
+        return
+    }
+    (*c).nargs = (*c).nargs + 1
+}
+
+fn set_cwd(c: *mut Command, dir: str) {
+    rt.buf_clear(&(*c).cwd)
+    if dir.length() == 0 {
+        return
+    }
+    if !push_cstr(&(*c).cwd, dir) {
+        (*c).bad = true
+    }
+}
+
+fn envs_drop(c: *mut Command, key: str) {
+    var probe: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&probe, key.p as u64, key.length())
+    var out: rt.Buf = rt.buf_new()
+    let total: usize = rt.buf_len(&(*c).envs)
+    var at: usize = 0
+    while at < total {
+        var e: usize = at
+        while e < total && rt.buf_at(&(*c).envs, e) != 0 as u8 {
+            e = e + 1
+        }
+        if !envblock.entry_key_eq(&(*c).envs, at, e, &probe, 0, rt.buf_len(&probe), true) {
+            rt.buf_push_bytes(&out, rt.buf_ptr(&(*c).envs) + at as u64, e - at + 1)
+        }
+        at = e + 1
+    }
+    rt.buf_free(&probe)
+    rt.buf_free(&(*c).envs)
+    (*c).envs = out
+}
+
+fn env_key_ok(key: str) -> bool {
+    if key.length() == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < key.length() {
+        if key.chars(i) == 61 as u8 || key.chars(i) == 0 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn set_env(c: *mut Command, key: str, value: str) {
+    if !env_key_ok(key) {
+        (*c).bad = true
+        return
+    }
+    envs_drop(c, key)
+    rt.buf_push_bytes(&(*c).envs, key.p as u64, key.length())
+    rt.buf_push(&(*c).envs, 61 as u8)
+    if !push_cstr(&(*c).envs, value) {
+        (*c).bad = true
+    }
+}
+
+fn unset_env(c: *mut Command, key: str) {
+    if !env_key_ok(key) {
+        (*c).bad = true
+        return
+    }
+    envs_drop(c, key)
+    push_cstr(&(*c).envs, key)
+}
+
+fn clear_env(c: *mut Command) {
+    (*c).env_clear = true
+}
+
+fn mode_ok(m: u8) -> bool {
+    return m == STDIO_INHERIT || m == STDIO_PIPE || m == STDIO_NULL
+}
+
+fn set_stdin(c: *mut Command, mode: u8) {
+    if !mode_ok(mode) {
+        (*c).bad = true
+        return
+    }
+    (*c).in_mode = mode
+}
+
+fn set_stdout(c: *mut Command, mode: u8) {
+    if !mode_ok(mode) {
+        (*c).bad = true
+        return
+    }
+    (*c).out_mode = mode
+}
+
+fn set_stderr(c: *mut Command, mode: u8) {
+    if !mode_ok(mode) {
+        (*c).bad = true
+        return
+    }
+    (*c).err_mode = mode
+}
+
+fn merge_stderr(c: *mut Command) {
+    (*c).err_mode = STDIO_MERGE
+}
+
+fn set_no_window(c: *mut Command, on: bool) {
+    (*c).no_window = on
+}
+
+fn set_detach(c: *mut Command, on: bool) {
+    (*c).detach = on
+}
+
+// ---------------------------------------------------------- The helpers
+
+fn now_ms() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] * 1000 + ts[1] / 1000000) as u64
+}
+
+fn close_h(h: i64) {
+    if h >= 0 {
+        CloseHandle(h)
+    }
+}
+
+fn build_env(c: *mut Command, out: *mut rt.Buf) -> usize {
+    var base: rt.Buf = rt.buf_new()
+    if !(*c).env_clear {
+        env.list_into(&base)
+    }
+    let n: usize = envblock.merge_env(&base, &(*c).envs, true, out)
+    rt.buf_free(&base)
+    return n
+}
+
+// UTF-8 "K=V\0" entries -> the UTF-16 block CreateProcessW wants (every
+// entry ends in a zero unit, the block in one more).
+fn env_block_wide(blob: *mut rt.Buf, out: *mut rt.Buf) {
+    let total: usize = rt.buf_len(blob)
+    var at: usize = 0
+    while at < total {
+        var e: usize = at
+        while e < total && rt.buf_at(blob, e) != 0 as u8 {
+            e = e + 1
+        }
+        cmdline.utf8_to_utf16(rt.buf_ptr(blob) + at as u64, e - at, out)
+        cmdline.push_u16(out, 0 as u16)
+        at = e + 1
+    }
+    if total == 0 {
+        // an empty block is two zero units
+        cmdline.push_u16(out, 0 as u16)
+    }
+    cmdline.push_u16(out, 0 as u16)
+}
+
+fn error_of(code: i64) -> ProcError {
+    proc_errno = code
+    if code == 2 || code == 3 || code == 267 {
+        return ProcError::NotFound
+    }
+    if code == 5 {
+        return ProcError::Permission
+    }
+    if code == 4 || code == 8 || code == 14 || code == 1450 || code == 1455 {
+        return ProcError::Resource
+    }
+    return ProcError::Exec
+}
+
+// A SECURITY_ATTRIBUTES record (24 octets) that makes the handle inheritable:
+// nLength at 0, lpSecurityDescriptor at 8 (null), bInheritHandle at 16.
+fn sa_init(sa: u64) {
+    rt.mem_set(sa, 0 as u8, 24)
+    rt.st32(sa, 0, 24 as u32)
+    rt.st32(sa, 4, 1 as u32)
+}
+
+// A pipe whose two ends are both inheritable; the caller makes its own end
+// private. rd/wr receive the HANDLE values.
+fn make_pipe(rd: *mut i64, wr: *mut i64) -> bool {
+    var sa: [u64; 3] = [0; 3]
+    sa_init((&sa[0]) as u64)
+    if CreatePipe(rd as u64, wr as u64, (&sa[0]) as u64, PIPE_SIZE) == 0 {
+        proc_errno = GetLastError() as i64
+        return false
+    }
+    return true
+}
+
+// The NUL device, inheritable, for reading and writing.
+fn open_nul() -> i64 {
+    var sa: [u64; 3] = [0; 3]
+    sa_init((&sa[0]) as u64)
+    var name: [u16; 4] = u"NUL\0"
+    return CreateFileW((&name[0]) as u64, GENERIC_RW, 3, (&sa[0]) as u64, OPEN_EXISTING, 0, 0)
+}
+
+fn valid_h(h: i64) -> bool {
+    return h != 0 && h != -1
+}
+
+// ------------------------------------------------------------- Spawning
+
+// `exe` is a path; a relative one is made absolute against the CALLER's
+// working directory (the seam answers `getcwd` from GetCurrentDirectoryW) so
+// that `set_cwd` cannot change which program is meant.
+fn absolutize(exe: *mut rt.Buf) {
+    let n: usize = rt.buf_len(exe)
+    if n == 0 {
+        return
+    }
+    let c0: u8 = rt.buf_at(exe, 0)
+    if c0 == 47 as u8 || c0 == 92 as u8 {
+        return
+    }
+    if n >= 2 && rt.buf_at(exe, 1) == 58 as u8 {
+        return
+    }
+    var cwd: [u8; 1024] = [0 as u8; 1024]
+    let r: i64 = syscall(79, (&cwd[0]) as i64, 1024, 0, 0, 0, 0)
+    if r <= 0 {
+        return
+    }
+    var joined: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&joined, (&cwd[0]) as u64, rt.c_length((&cwd[0]) as u64))
+    let last: u8 = rt.buf_at(&joined, rt.buf_len(&joined) - 1)
+    if last != 47 as u8 && last != 92 as u8 {
+        rt.buf_push(&joined, 92 as u8)
+    }
+    var skip: usize = 0
+    while n >= skip + 2 && rt.buf_at(exe, skip) == 46 as u8
+        && (rt.buf_at(exe, skip + 1) == 47 as u8 || rt.buf_at(exe, skip + 1) == 92 as u8) {
+        skip = skip + 2
+    }
+    rt.buf_push_bytes(&joined, rt.buf_ptr(exe) + skip as u64, n - skip)
+    rt.buf_free(exe)
+    *exe = joined
+}
+
+fn spawn(c: *mut Command) -> ProcError!Child {
+    if (*c).bad || rt.buf_len(&(*c).program) <= 1 {
+        return ProcError::Invalid
+    }
+    if (*c).err_mode == STDIO_MERGE && (*c).out_mode == STDIO_NULL {
+        (*c).err_mode = STDIO_NULL
+    }
+    let pname: str = str { p: rt.buf_data(&(*c).program), n: rt.buf_len(&(*c).program) - 1 }
+
+    // --- the program (CreateProcess would search the current directory first;
+    // we resolve it ourselves, see W6)
+    var exe: rt.Buf = rt.buf_new()
+    if !env.find_executable(pname, &exe) {
+        rt.buf_free(&exe)
+        proc_errno = 2
+        return ProcError::NotFound
+    }
+    absolutize(&exe)
+    var exe_w: rt.Buf = rt.buf_new()
+    cmdline.utf8_to_utf16_path(rt.buf_ptr(&exe), rt.buf_len(&exe), &exe_w)
+    cmdline.push_u16(&exe_w, 0 as u16)
+    rt.buf_free(&exe)
+
+    // --- command line
+    var line: rt.Buf = rt.buf_new()
+    cmdline.win_command_line(pname, &(*c).args, (*c).nargs, &line)
+    var line_w: rt.Buf = rt.buf_new()
+    cmdline.utf8_to_utf16(rt.buf_ptr(&line), rt.buf_len(&line), &line_w)
+    cmdline.push_u16(&line_w, 0 as u16)
+    rt.buf_free(&line)
+
+    // --- environment (only when the command changes it)
+    var env_w: rt.Buf = rt.buf_new()
+    var use_env: bool = false
+    if (*c).env_clear || rt.buf_len(&(*c).envs) > 0 {
+        var merged: rt.Buf = rt.buf_new()
+        build_env(c, &merged)
+        env_block_wide(&merged, &env_w)
+        rt.buf_free(&merged)
+        use_env = true
+    }
+
+    // --- working directory
+    var cwd_w: rt.Buf = rt.buf_new()
+    if rt.buf_len(&(*c).cwd) > 1 {
+        cmdline.utf8_to_utf16_path(rt.buf_ptr(&(*c).cwd), rt.buf_len(&(*c).cwd) - 1, &cwd_w)
+        cmdline.push_u16(&cwd_w, 0 as u16)
+    }
+
+    // --- the three standard handles: what the child gets (cin/cout/cerr)
+    // and what the caller keeps (pin_w/pout_r/perr_r)
+    var cin: i64 = -1
+    var cout: i64 = -1
+    var cerr: i64 = -1
+    var pin_w: i64 = -1
+    var pout_r: i64 = -1
+    var perr_r: i64 = -1
+    var own_in: bool = false
+    var own_out: bool = false
+    var own_err: bool = false
+    var ok: bool = true
+    if (*c).in_mode == STDIO_PIPE {
+        ok = make_pipe(&cin, &pin_w)
+        own_in = ok
+        if ok {
+            SetHandleInformation(pin_w, HANDLE_FLAG_INHERIT, 0)
+        }
+    } else if (*c).in_mode == STDIO_NULL {
+        cin = open_nul()
+        own_in = true
+    } else {
+        cin = GetStdHandle(-10)
+        if !valid_h(cin) {
+            cin = open_nul()
+            own_in = true
+        }
+    }
+    if ok && (*c).out_mode == STDIO_PIPE {
+        ok = make_pipe(&pout_r, &cout)
+        own_out = ok
+        if ok {
+            SetHandleInformation(pout_r, HANDLE_FLAG_INHERIT, 0)
+        }
+    } else if ok && (*c).out_mode == STDIO_NULL {
+        cout = open_nul()
+        own_out = true
+    } else if ok {
+        cout = GetStdHandle(-11)
+        if !valid_h(cout) {
+            cout = open_nul()
+            own_out = true
+        }
+    }
+    if ok && (*c).err_mode == STDIO_PIPE {
+        ok = make_pipe(&perr_r, &cerr)
+        own_err = ok
+        if ok {
+            SetHandleInformation(perr_r, HANDLE_FLAG_INHERIT, 0)
+        }
+    } else if ok && (*c).err_mode == STDIO_NULL {
+        cerr = open_nul()
+        own_err = true
+    } else if ok && (*c).err_mode == STDIO_MERGE {
+        cerr = cout
+    } else if ok {
+        cerr = GetStdHandle(-12)
+        if !valid_h(cerr) {
+            cerr = open_nul()
+            own_err = true
+        }
+    }
+
+    var result_ok: bool = false
+    var pid: i64 = 0
+    var hproc: u64 = 0
+    var fail_code: i64 = 0
+    if ok && cin != -1 && cout != -1 && cerr != -1 {
+        // STARTUPINFOW (104 octets): cb at 0, dwFlags at 60, the handles at 80/88/96
+        var si: [u64; 13] = [0; 13]
+        let sip: u64 = (&si[0]) as u64
+        rt.st32(sip, 0, 104 as u32)
+        rt.st32(sip, 15, STARTF_USESTDHANDLES)
+        rt.st64(sip, 10, cin as u64)
+        rt.st64(sip, 11, cout as u64)
+        rt.st64(sip, 12, cerr as u64)
+        var pi: [u64; 3] = [0; 3] // hProcess, hThread, dwProcessId, dwThreadId
+        var flags: i64 = CREATE_UNICODE_ENVIRONMENT
+        if (*c).detach {
+            flags = flags | CREATE_NEW_PROCESS_GROUP
+            if (*c).no_window {
+                flags = flags | CREATE_NO_WINDOW
+            } else {
+                flags = flags | DETACHED_PROCESS
+            }
+        } else if (*c).no_window {
+            flags = flags | CREATE_NO_WINDOW
+        }
+        var env_ptr: u64 = 0
+        if use_env {
+            env_ptr = rt.buf_ptr(&env_w)
+        }
+        var dir_ptr: u64 = 0
+        if rt.buf_len(&cwd_w) > 0 {
+            dir_ptr = rt.buf_ptr(&cwd_w)
+        }
+        let r: i32 = CreateProcessW(rt.buf_ptr(&exe_w), rt.buf_ptr(&line_w), 0, 0, 1, flags,
+            env_ptr, dir_ptr, sip, (&pi[0]) as u64)
+        if r != 0 {
+            result_ok = true
+            hproc = pi[0]
+            CloseHandle(pi[1] as i64)
+            pid = (pi[2] & 4294967295) as i64
+        } else {
+            fail_code = GetLastError() as i64
+        }
+    } else if ok {
+        fail_code = 6
+    } else {
+        fail_code = proc_errno
+    }
+
+    // the child's ends (and handles we opened for it) are not ours any more
+    if own_in { close_h(cin) }
+    if own_out { close_h(cout) }
+    if own_err { close_h(cerr) }
+    rt.buf_free(&exe_w)
+    rt.buf_free(&line_w)
+    rt.buf_free(&env_w)
+    rt.buf_free(&cwd_w)
+    if !result_ok {
+        close_h(pin_w)
+        close_h(pout_r)
+        close_h(perr_r)
+        if fail_code == 6 {
+            proc_errno = 6
+            return ProcError::Resource
+        }
+        return error_of(fail_code)
+    }
+    return Child {
+        pid: pid, h: hproc, in_fd: pin_w, out_fd: pout_r, err_fd: perr_r,
+        done: false, code: 0, sig: 0, own: true,
+    }
+}
+
+// ----------------------------------------------------------- The pipes
+
+// Writes all `n` octets to the child's stdin: `n`, or a negated errno
+// (-32 = the child closed its stdin or is gone).
+fn write_in(ch: *mut Child, p: u64, n: usize) -> i64 {
+    if (*ch).in_fd < 0 {
+        return -9
+    }
+    var done: usize = 0
+    while done < n {
+        var put: [u32; 2] = [0; 2]
+        let r: i32 = WriteFile((*ch).in_fd, p + done as u64, (n - done) as i64, (&put[0]) as u64, 0)
+        if r == 0 {
+            let e: i32 = GetLastError()
+            if e == ERROR_BROKEN_PIPE || e == ERROR_NO_DATA {
+                return -32
+            }
+            return -5
+        }
+        done = done + put[0] as usize
+    }
+    return n as i64
+}
+
+fn close_in(ch: *mut Child) {
+    close_h((*ch).in_fd)
+    (*ch).in_fd = -1
+}
+
+// 0 = end of file; -5 = other error.
+fn read_h(h: i64, p: u64, cap: usize) -> i64 {
+    if h < 0 {
+        return 0
+    }
+    var got: [u32; 2] = [0; 2]
+    let r: i32 = ReadFile(h, p, cap as i64, (&got[0]) as u64, 0)
+    if r == 0 {
+        if GetLastError() == ERROR_BROKEN_PIPE {
+            return 0
+        }
+        return -5
+    }
+    return got[0] as i64
+}
+
+fn read_h_nb(h: i64, p: u64, cap: usize) -> i64 {
+    if h < 0 {
+        return 0
+    }
+    var avail: [u32; 2] = [0; 2]
+    if PeekNamedPipe(h, 0, 0, 0, (&avail[0]) as u64, 0) == 0 {
+        if GetLastError() == ERROR_BROKEN_PIPE {
+            return 0
+        }
+        return -5
+    }
+    if avail[0] == 0 as u32 {
+        return -11
+    }
+    var m: usize = avail[0] as usize
+    if m > cap {
+        m = cap
+    }
+    return read_h(h, p, m)
+}
+
+fn read_out(ch: *mut Child, p: u64, cap: usize) -> i64 {
+    return read_h((*ch).out_fd, p, cap)
+}
+
+fn read_err(ch: *mut Child, p: u64, cap: usize) -> i64 {
+    return read_h((*ch).err_fd, p, cap)
+}
+
+fn read_out_nb(ch: *mut Child, p: u64, cap: usize) -> i64 {
+    return read_h_nb((*ch).out_fd, p, cap)
+}
+
+fn read_err_nb(ch: *mut Child, p: u64, cap: usize) -> i64 {
+    return read_h_nb((*ch).err_fd, p, cap)
+}
+
+// --------------------------------------------------------------- Waiting
+
+// Waits `ms` (INFINITE = forever); true = the child has ended, the code is read.
+fn wait_h(ch: *mut Child, ms: i64) -> bool {
+    if (*ch).done {
+        return true
+    }
+    if (*ch).h == 0 {
+        return true
+    }
+    let r: i32 = WaitForSingleObject((*ch).h, ms)
+    if r != WAIT_OBJECT_0 {
+        return false
+    }
+    var code: [u32; 2] = [0; 2]
+    GetExitCodeProcess((*ch).h, (&code[0]) as u64)
+    (*ch).code = code[0] as i32
+    (*ch).done = true
+    CloseHandle((*ch).h as i64)
+    (*ch).h = 0
+    return true
+}
+
+fn wait(ch: *mut Child) -> i32 {
+    wait_h(ch, INFINITE)
+    return (*ch).code
+}
+
+fn wait_timeout(ch: *mut Child, ms: u64) -> bool {
+    var m: i64 = ms as i64
+    if ms > 4294967294 {
+        m = 4294967294
+    }
+    return wait_h(ch, m)
+}
+
+fn try_wait(ch: *mut Child) -> bool {
+    return wait_h(ch, 0)
+}
+
+fn is_running(ch: *mut Child) -> bool {
+    return !wait_h(ch, 0)
+}
+
+fn exit_code(ch: *mut Child) -> i32 {
+    return (*ch).code
+}
+
+fn term_signal(ch: *mut Child) -> i32 {
+    return (*ch).sig
+}
+
+fn pid_of(ch: *mut Child) -> i64 {
+    return (*ch).pid
+}
+
+fn kill(ch: *mut Child) {
+    if !(*ch).done && (*ch).h != 0 {
+        TerminateProcess((*ch).h, 137)
+    }
+}
+
+fn terminate(ch: *mut Child) {
+    if !(*ch).done && (*ch).h != 0 {
+        TerminateProcess((*ch).h, 143)
+    }
+}
+
+// Closes the caller's ends of the pipes, and the process handle once the
+// child has ended. A child that still runs keeps its handle until `wait`
+// (or the caller ends) -- without it the exit code could not be read.
+fn close(ch: *mut Child) {
+    close_h((*ch).in_fd)
+    close_h((*ch).out_fd)
+    close_h((*ch).err_fd)
+    (*ch).in_fd = -1
+    (*ch).out_fd = -1
+    (*ch).err_fd = -1
+}
+
+// ----------------------------------------------- Collecting without deadlock
+
+const PIECE: usize = 4096
+
+// See the Linux version for the contract. Here: a loop of PeekNamedPipe /
+// ReadFile on both outputs, the input in pieces between them, a look at the
+// process, and a millisecond nap when nothing happened.
+fn communicate(ch: *mut Child, in_p: u64, in_n: usize, out: *mut rt.Buf, err: *mut rt.Buf,
+    timeout_ms: u64) -> bool {
+    var written: usize = 0
+    if (*ch).in_fd >= 0 && in_n == 0 {
+        close_in(ch)
+    }
+    let deadline: u64 = now_ms() + timeout_ms
+    var tmp: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&tmp, 65536)
+    var open_out: bool = (*ch).out_fd >= 0
+    var open_err: bool = (*ch).err_fd >= 0
+    var quiet_after_exit: u32 = 0
+    while open_out || open_err || (*ch).in_fd >= 0 {
+        var busy: bool = false
+        if open_out {
+            let n: i64 = read_h_nb((*ch).out_fd, rt.buf_ptr(&tmp), 65536)
+            if n > 0 {
+                rt.buf_push_bytes(out, rt.buf_ptr(&tmp), n as usize)
+                busy = true
+            } else if n == 0 || n == -5 {
+                open_out = false
+            }
+        }
+        if open_err {
+            let n: i64 = read_h_nb((*ch).err_fd, rt.buf_ptr(&tmp), 65536)
+            if n > 0 {
+                rt.buf_push_bytes(err, rt.buf_ptr(&tmp), n as usize)
+                busy = true
+            } else if n == 0 || n == -5 {
+                open_err = false
+            }
+        }
+        if (*ch).in_fd >= 0 {
+            if written < in_n {
+                var m: usize = in_n - written
+                if m > PIECE {
+                    m = PIECE
+                }
+                let w: i64 = write_in(ch, in_p + written as u64, m)
+                if w < 0 {
+                    close_in(ch)
+                } else {
+                    written = written + w as usize
+                    busy = true
+                    if written >= in_n {
+                        close_in(ch)
+                    }
+                }
+            } else {
+                close_in(ch)
+            }
+        }
+        if timeout_ms > 0 && now_ms() >= deadline {
+            rt.buf_free(&tmp)
+            return false
+        }
+        if !busy {
+            // quiet: has the child ended while a grandchild holds the pipes?
+            if wait_h(ch, 0) {
+                quiet_after_exit = quiet_after_exit + 1
+                if quiet_after_exit >= 3 {
+                    break
+                }
+            }
+            Sleep(1)
+        }
+    }
+    rt.buf_free(&tmp)
+    return true
+}
+
+// ------------------------------------------------------------ Conveniences
+
+fn run(c: *mut Command) -> ProcError!i32 {
+    var ch: Child = try spawn(c)
+    close(&ch)
+    return wait(&ch)
+}
+
+fn run_io(c: *mut Command, in_p: u64, in_n: usize, out: *mut rt.Buf, err: *mut rt.Buf,
+    timeout_ms: u64) -> ProcError!i32 {
+    (*c).in_mode = STDIO_PIPE
+    (*c).out_mode = STDIO_PIPE
+    if (*c).err_mode != STDIO_MERGE {
+        (*c).err_mode = STDIO_PIPE
+    }
+    var ch: Child = try spawn(c)
+    let finished: bool = communicate(&ch, in_p, in_n, out, err, timeout_ms)
+    if !finished {
+        kill(&ch)
+        wait(&ch)
+        close(&ch)
+        return ProcError::Timeout
+    }
+    close(&ch)
+    if timeout_ms == 0 {
+        return wait(&ch)
+    }
+    if !wait_timeout(&ch, 2000) {
+        kill(&ch)
+        wait(&ch)
+        return ProcError::Timeout
+    }
+    return ch.code
+}
+
+fn run_capture(c: *mut Command, out: *mut rt.Buf, err: *mut rt.Buf, timeout_ms: u64) -> ProcError!i32 {
+    return run_io(c, 0, 0, out, err, timeout_ms)
+}

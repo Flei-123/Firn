@@ -1,0 +1,194 @@
+// expect_exit: 0
+// tests/2063_std_process_live.fi -- std.process on Linux: a child that is
+// alive while we talk to it. wait with timeout, kill, non-blocking reads,
+// stdin and end of file, a dead reader (EPIPE must not kill us), descriptors
+// that do not leak into a second child, detach, and no descriptor leak over
+// 300 starts.
+import std.rt
+import std.str
+import std.process
+import std.fs
+import std.dir
+
+fn now_ms() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] * 1000 + ts[1] / 1000000) as u64
+}
+
+fn terr(e: ProcError) -> i32 {
+    return 1000
+}
+
+fn dummy() -> process.Child {
+    return process.Child { pid: 0 - 1, h: 0, in_fd: -1, out_fd: -1, err_fd: -1,
+        done: false, code: 0, sig: 0, own: true }
+}
+
+fn start(c: *mut process.Command) -> process.Child {
+    return process.spawn(c) catch | e | dummy()
+}
+
+fn eq(b: *mut rt.Buf, s: str) -> bool {
+    if rt.buf_len(b) != s.length() {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(b), s.p as u64, s.length())
+}
+
+// number of open descriptors of this process
+fn fd_count() -> usize {
+    var d: dir.Dir = dir.open("/proc/self/fd")
+    var n: usize = 0
+    while dir.next(&d) {
+        n = n + 1
+    }
+    dir.close(&d)
+    return n
+}
+
+fn main() -> i32 {
+    // --- A. wait_timeout / is_running / kill
+    var c: process.Command = process.command("sleep")
+    process.add_arg(&c, "30")
+    var ch: process.Child = start(&c)
+    if ch.pid <= 0 { return 1 as i32 }
+    if !process.is_running(&ch) { return 2 as i32 }
+    let t0: u64 = now_ms()
+    if process.wait_timeout(&ch, 200) { return 3 as i32 }
+    let dt: u64 = now_ms() - t0
+    if dt < 190 || dt > 1500 { return 4 as i32 }
+    process.terminate(&ch)
+    if process.wait(&ch) != 143 { return 5 as i32 }
+    if process.term_signal(&ch) != 15 { return 6 as i32 }
+    if process.is_running(&ch) { return 7 as i32 }
+    // a second kill of an ended child does nothing (no pid reuse accident)
+    process.kill(&ch)
+    process.close(&ch)
+    ch = start(&c)
+    process.kill(&ch)
+    if process.wait(&ch) != 137 { return 8 as i32 }
+    process.command_free(&c)
+
+    // --- B. non blocking read: nothing yet, then the line, then end of file
+    c = process.command("sh")
+    process.add_arg(&c, "-c")
+    process.add_arg(&c, "sleep 0.3; echo late")
+    process.set_stdout(&c, process.STDIO_PIPE)
+    ch = start(&c)
+    if ch.pid <= 0 { return 9 as i32 }
+    var buf: [u8; 64] = [0 as u8; 64]
+    let b: u64 = (&buf[0]) as u64
+    if process.read_out_nb(&ch, b, 64) != -11 { return 10 as i32 }
+    var got: usize = 0
+    var spins: u32 = 0
+    while got < 5 && spins < 400 {
+        let n: i64 = process.read_out_nb(&ch, b + got as u64, 64 - got)
+        if n > 0 {
+            got = got + n as usize
+        } else if n == -11 {
+            var ts: [i64; 2] = [0, 5000000]
+            syscall(35, (&ts[0]) as i64, 0, 0, 0, 0, 0)
+        } else {
+            break
+        }
+        spins = spins + 1
+    }
+    if got != 5 { return 11 as i32 }
+    if buf[0] != 108 as u8 || buf[4] != 10 as u8 { return 12 as i32 }
+    // now: end of file (blocking read returns 0)
+    if process.read_out(&ch, b, 64) != 0 { return 13 as i32 }
+    if process.wait(&ch) != 0 { return 14 as i32 }
+    process.close(&ch)
+    process.command_free(&c)
+
+    // --- C. stdin: write, close, the child sees the end
+    c = process.command("cat")
+    process.set_stdin(&c, process.STDIO_PIPE)
+    process.set_stdout(&c, process.STDIO_PIPE)
+    ch = start(&c)
+    var msg: [u8; 4] = [97 as u8, 98 as u8, 99 as u8, 10 as u8]
+    if process.write_in(&ch, (&msg[0]) as u64, 4) != 4 { return 15 as i32 }
+    // a second child that holds nothing of the first one's descriptors:
+    var c2: process.Command = process.command("sleep")
+    process.add_arg(&c2, "30")
+    var other: process.Child = start(&c2)
+    process.close_in(&ch)
+    // if `other` had inherited the write end, cat would never see the end of file
+    var all: rt.Buf = rt.buf_new()
+    var n3: i64 = process.read_out(&ch, b, 64)
+    while n3 > 0 {
+        rt.buf_push_bytes(&all, b, n3 as usize)
+        n3 = process.read_out(&ch, b, 64)
+    }
+    if !eq(&all, "abc\n") { return 16 as i32 }
+    if process.wait(&ch) != 0 { return 17 as i32 }
+    process.kill(&other)
+    process.wait(&other)
+    process.close(&other)
+    process.close(&ch)
+    process.command_free(&c)
+    process.command_free(&c2)
+
+    // --- D. writing to a child that has gone away: -32, and we live
+    c = process.command("true")
+    process.set_stdin(&c, process.STDIO_PIPE)
+    ch = start(&c)
+    process.wait(&ch)
+    var junk: [u8; 4096] = [65 as u8; 4096]
+    let w: i64 = process.write_in(&ch, (&junk[0]) as u64, 4096)
+    if w != -32 { return 18 as i32 }
+    // and once more: the signal of the first write must not have stayed pending
+    let w2: i64 = process.write_in(&ch, (&junk[0]) as u64, 4096)
+    if w2 != -32 { return 19 as i32 }
+    process.close(&ch)
+    process.command_free(&c)
+
+    // --- E. detach: start returns at once, the program runs on alone
+    var marker: str = "/tmp/firn_2063_marker"
+    fs.remove(marker) catch false
+    c = process.command("sh")
+    process.add_arg(&c, "-c")
+    process.add_arg(&c, "sleep 0.3; echo done > /tmp/firn_2063_marker")
+    process.set_detach(&c, true)
+    process.set_stdout(&c, process.STDIO_NULL)
+    let t1: u64 = now_ms()
+    ch = start(&c)
+    if ch.pid <= 0 { return 20 as i32 }
+    if now_ms() - t1 > 250 { return 21 as i32 }
+    if fs.exists(marker) { return 22 as i32 }
+    // not our child: wait follows the pid
+    if !process.wait_timeout(&ch, 5000) { return 23 as i32 }
+    if !fs.exists(marker) { return 24 as i32 }
+    fs.remove(marker) catch false
+    process.command_free(&c)
+
+    // --- F. no descriptor leak over 300 starts (pipes, error pipe, children)
+    let before: usize = fd_count()
+    var k: u32 = 0
+    while k < 300 {
+        c = process.command("true")
+        process.set_stdin(&c, process.STDIO_PIPE)
+        process.set_stdout(&c, process.STDIO_PIPE)
+        process.set_stderr(&c, process.STDIO_PIPE)
+        ch = start(&c)
+        if ch.pid <= 0 { return 30 as i32 }
+        process.wait(&ch)
+        process.close(&ch)
+        process.command_free(&c)
+        k = k + 1
+    }
+    // and 50 failing ones
+    k = 0
+    while k < 50 {
+        c = process.command("no_such_program_2063")
+        process.set_stdout(&c, process.STDIO_PIPE)
+        ch = start(&c)
+        if ch.pid > 0 { return 31 as i32 }
+        process.command_free(&c)
+        k = k + 1
+    }
+    if fd_count() != before { return 32 as i32 }
+
+    return 0
+}
