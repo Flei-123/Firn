@@ -103,6 +103,18 @@ cannot be tested without a real account); `tests/2153` runs it against a
 stand-in that follows the spec. When Fleitec-ID gets OIDC discovery, `auth.oauth`
 is the client and this file shrinks to a configuration.
 
+## Platforms
+
+| platform | status |
+|---|---|
+| Linux x86-64 | **tested**: tests/2150-2153 in every build level; `tools/oauth/run.sh` (97 + 64 checks, three build stages) |
+| Linux aarch64 | tests/2150-2153 compile and **pass under qemu-aarch64** (2153 and 2140 include threads and sockets) |
+| Windows x86-64 | **tested under Wine**: both drivers, all hermetic sections except the keyring ones (the Credential Manager is not a file; `std.secret` has its own Wine/Windows 11 proof, `tests/2073`), including the loopback server and the cancel flag; not on a real Windows machine |
+| macOS, OrientOS, Android | not built or run. Needs `std.shell.open_url` (the browser), `std.secret`, a socket for the loopback server; the device flow needs no browser and no server and is the way where those are missing |
+
+Redirect host: the default is `127.0.0.1`; with `oauth_set_redirect_host(&o, "localhost")` (Microsoft wants it) a
+browser may try `::1` first and falls back to `127.0.0.1` -- the server is IPv4 only.
+
 ## Tests
 
 | test | what |
