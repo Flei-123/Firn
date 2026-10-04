@@ -75,7 +75,7 @@ if [ -n "$WINE" ] && command -v x86_64-w64-mingw32-ld >/dev/null 2>&1; then
     if "$FIRNC" --target=x86_64-windows --opt-level=dev-fast -o "$W/probe_win.exe" tools/compress/probe.fi > "$W/probe_win.log" 2>&1; then
         # CHECK_QUICK=3 and decode+encode only: a smoke test of the platform seam (files, descriptors,
         # the clock-free code paths) -- every probe run is a Wine process start
-        CHECK_QUICK=3 CHECK_PARTS=decode,encode RUNNER="$WINE" python3 tools/compress/check.py "$W/probe_win.exe" || rc=1
+        CHECK_QUICK=3 CHECK_PARTS=decode,encode RUNNER="$WINE" python3 tools/compress/check.py "$W/probe_win.exe" lz4 zstd xz lzma bz2 br gz auto || rc=1
     else
         echo "  FAIL the probe does not build for Windows"; grep -v RWX "$W/probe_win.log" | head -5; rc=1
     fi
