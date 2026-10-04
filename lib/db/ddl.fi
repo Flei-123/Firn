@@ -1,7 +1,1081 @@
 // SPDX-License-Identifier: MPL-2.0
-// lib/db/ddl.fi -- CREATE, DROP, ALTER, PRAGMA (stub)
+// lib/db/ddl.fi -- CREATE / DROP / ALTER and PRAGMA.
+//
+// A schema change writes sqlite_master (page 1 is its table tree), builds or frees the
+// trees, and adds one to the schema cookie (header offset 40) so that other
+// connections, SQLite included, re-read the schema.
+//
+//   CREATE TABLE   a tree for the table, one for each UNIQUE / PRIMARY KEY constraint
+//                  (`sqlite_autoindex_<table>_<n>`), `sqlite_sequence` for AUTOINCREMENT
+//   CREATE INDEX   a tree, filled from the table (a UNIQUE index fails on a duplicate)
+//   DROP TABLE/INDEX  the trees go back to the freelist
+//   ALTER TABLE .. ADD COLUMN   the SQL text in sqlite_master gets the column; old rows read
+//                  the new column's DEFAULT
+//   PRAGMA         user_version, schema_version, application_id, page_size, page_count,
+//                  freelist_count, table_info, index_list, index_info, integrity_check,
+//                  journal_mode, synchronous, busy_timeout, foreign_keys, encoding ...
+//
+// HONEST NOTES
+//   L1 ALTER TABLE .. RENAME and DROP COLUMN, VACUUM, CREATE VIEW/TRIGGER: Unsupported.
+//   L2 The SQL text stored for a table is the statement without IF NOT EXISTS (as SQLite does);
+//      `CREATE TABLE ... AS SELECT` is Unsupported.
+//   L3 An index (or UNIQUE/PRIMARY KEY) with a collation other than BINARY: Unsupported.
+
 import std.rt
+import db.dberr
+import db.util as ut
+import db.record as rc
+import db.arena as ar
+import db.value as vl
 import db.dbcore as dc
-export { ddl_stub }
-fn ddl_stub(st: *mut dc.Stmt) {
+import db.pager as pgr
+import db.btree as bx
+import db.sqlast as ax
+import db.expr as ex
+import db.rowset as rs
+import db.schema as sch
+import db.select as sl
+import db.dml as dm
+
+export { exec_ddl, exec_pragma_set, pragma_query, pragma_set_nowrite, pragma_is_write, bump_cookie }
+
+fn msg3(a: str, p: u64, n: usize, b: str) -> str {
+    var buf: rt.Buf = rt.buf_new()
+    ut.put_text(&buf, a)
+    rt.buf_push_bytes(&buf, p, n)
+    ut.put_text(&buf, b)
+    let s: str = __str_copy(str { p: rt.buf_data(&buf), n: rt.buf_len(&buf) })
+    rt.buf_free(&buf)
+    return s
+}
+
+fn starts_with_ci(p: u64, n: usize, w: str) -> bool {
+    if n < w.length() {
+        return false
+    }
+    return dc.name_eq(p, w.length(), w.p as u64, w.length())
+}
+
+// adds one to the schema cookie of the file header
+fn bump_cookie(db: *mut dc.Db) -> DbError!bool {
+    let d: u64 = try pgr.pager_write(&(*db).pg, 1)
+    let c: u64 = (ut.rd32(d, 40) + 1) & 4294967295
+    ut.wr32(d, 40, c)
+    return true
+}
+
+// A row of sqlite_master. `sql_p == 0` stores NULL.
+fn master_add(db: *mut dc.Db, kind: str, np: u64, nn: usize, tp: u64, tn: usize, root: u32, sp: u64, sn: usize) -> DbError!i64 {
+    var v: [rc.Val; 5] = [rc.val_text(kind.p as u64, kind.length()), rc.val_text(np, nn), rc.val_text(tp, tn),
+        rc.val_int(root as i64), rc.val_null()]
+    if sp != 0 {
+        v[4] = rc.val_text(sp, sn)
+    }
+    var rec: rt.Buf = rt.buf_new()
+    rc.rec_encode(&v[0], 5, &rec)
+    let rowid: i64 = try dm.master_rowid_next(db)
+    let r: DbError!bool = bx.bt_table_insert(&(*db).bt, 1, rowid, rt.buf_ptr(&rec), rt.buf_len(&rec))
+    rt.buf_free(&rec)
+    try r
+    return rowid
+}
+
+fn master_delete(db: *mut dc.Db, rowid: i64) -> DbError!bool {
+    try bx.bt_table_delete(&(*db).bt, 1, rowid)
+    return true
+}
+
+fn stmt_text(st: *mut dc.Stmt, from: i32, to: i32) -> str {
+    return str { p: (rt.buf_ptr(&(*st).sql) + (from as u64)) as *mut u8, n: (to - from) as usize }
+}
+
+fn reload(db: *mut dc.Db) -> DbError!bool {
+    try sch.schema_load(db)
+    return true
+}
+
+// ----------------------------------------------------------------- CREATE TABLE
+fn create_sequence_table(db: *mut dc.Db) -> DbError!bool {
+    if dc.find_table(&(*db).schema, "sqlite_sequence".p as u64, 15) >= 0 {
+        return true
+    }
+    let root: u32 = try bx.bt_create(&(*db).bt, false)
+    let sql: str = "CREATE TABLE sqlite_sequence(name,seq)"
+    try master_add(db, "table", "sqlite_sequence".p as u64, 15, "sqlite_sequence".p as u64, 15, root, sql.p as u64, sql.length())
+    return true
+}
+
+// CREATE TABLE name AS SELECT ...: the columns are the result columns (typed by affinity)
+fn exec_create_table_as(st: *mut dc.Stmt) -> DbError!bool {
+    let db: *mut dc.Db = (*st).db
+    let ast: *mut ax.Ast = &(*st).ast
+    let nd: *mut ax.Node = ax.ast_n(ast, (*st).root)
+    let np: u64 = (*nd).sp
+    let nn: usize = (*nd).sn
+    if starts_with_ci(np, nn, "sqlite_") {
+        return dberr.fail(DbError::Sql, msg3("object name reserved for internal use: ", np, nn, ""))
+    }
+    let it: *mut sl.SelIter = sl.sel_new(db, st, ast)
+    if (it as u64) == 0 {
+        return dberr.fail(DbError::NoMemory, "out of memory")
+    }
+    let sr: DbError!bool = sl.sel_setup(it, (*nd).c, 0 as *mut ex.Scope)
+    if dberr.failed_bool(sr) {
+        sl.sel_free(it)
+        try sr
+    }
+    let ncols: usize = sl.sel_ncols(it)
+    var sqlb: rt.Buf = rt.buf_new()
+    ut.put_text(&sqlb, "CREATE TABLE ")
+    rt.buf_push_bytes(&sqlb, np, nn)
+    rt.buf_push(&sqlb, 40 as u8)
+    var affs: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < ncols {
+        if i > 0 {
+            rt.buf_push(&sqlb, 44 as u8)
+        }
+        var cp: u64 = 0
+        var cn: usize = 0
+        sl.sel_name(it, i, &cp, &cn)
+        var simple: bool = cn > 0
+        var k: usize = 0
+        while k < cn {
+            let c: u8 = rt.ld8(cp, k)
+            let letter: bool = (c >= 65 as u8 && c <= 90 as u8) || (c >= 97 as u8 && c <= 122 as u8) || c == 95 as u8
+            let digit: bool = c >= 48 as u8 && c <= 57 as u8
+            if !(letter || (digit && k > 0)) {
+                simple = false
+            }
+            k = k + 1
+        }
+        if simple {
+            rt.buf_push_bytes(&sqlb, cp, cn)
+        } else {
+            rt.buf_push(&sqlb, 34 as u8)
+            k = 0
+            while k < cn {
+                let c: u8 = rt.ld8(cp, k)
+                rt.buf_push(&sqlb, c)
+                if c == 34 as u8 {
+                    rt.buf_push(&sqlb, 34 as u8)
+                }
+                k = k + 1
+            }
+            rt.buf_push(&sqlb, 34 as u8)
+        }
+        let aff: i64 = sl.sel_col_aff(it, i)
+        if aff == 3 {
+            ut.put_text(&sqlb, " INT")
+        } else if aff == 1 {
+            ut.put_text(&sqlb, " TEXT")
+        } else if aff == 2 {
+            ut.put_text(&sqlb, " NUM")
+        } else if aff == 4 {
+            ut.put_text(&sqlb, " REAL")
+        }
+        var afb: i64 = aff
+        if afb < 0 {
+            afb = 0
+        }
+        rt.buf_push(&affs, afb as u8)
+        i = i + 1
+    }
+    rt.buf_push(&sqlb, 41 as u8)
+    let sqlp: u64 = ar.arena_copy(&(*db).temp, rt.buf_ptr(&sqlb), rt.buf_len(&sqlb))
+    let sqln: usize = rt.buf_len(&sqlb)
+    rt.buf_free(&sqlb)
+    let root: u32 = try bx.bt_create(&(*db).bt, false)
+    try master_add(db, "table", np, nn, np, nn, root, sqlp, sqln)
+    // the rows
+    let r: DbError!bool = ctas_rows(db, it, root, ncols, &affs)
+    rt.buf_free(&affs)
+    sl.sel_free(it)
+    try r
+    try bump_cookie(db)
+    (*db).schema.loaded = false
+    return true
+}
+
+fn ctas_rows(db: *mut dc.Db, it: *mut sl.SelIter, root: u32, ncols: usize, affs: *mut rt.Buf) -> DbError!bool {
+    try sl.sel_start(it)
+    var rowid: i64 = 0
+    var rec: rt.Buf = rt.buf_new()
+    var vbuf: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&vbuf, (ncols + 1) * 40)
+    let vals: *mut rc.Val = (rt.buf_ptr(&vbuf)) as *mut rc.Val
+    var arena: ar.Arena = ar.arena_new()
+    while true {
+        let more: DbError!bool = sl.sel_next(it)
+        if dberr.failed_bool(more) {
+            rt.buf_free(&rec)
+            rt.buf_free(&vbuf)
+            ar.arena_free(&arena)
+            try more
+        }
+        if !(more catch false) {
+            break
+        }
+        var i: usize = 0
+        while i < ncols {
+            var v: rc.Val = *(((*it).out as *mut rc.Val) + i)
+            vl.apply_affinity(&v, rt.ld8(rt.buf_ptr(affs), i) as i64, &arena)
+            *(vals + i) = v
+            i = i + 1
+        }
+        rt.buf_clear(&rec)
+        rc.rec_encode(vals, ncols, &rec)
+        rowid = rowid + 1
+        let ir: DbError!bool = bx.bt_table_insert(&(*db).bt, root, rowid, rt.buf_ptr(&rec), rt.buf_len(&rec))
+        if dberr.failed_bool(ir) {
+            rt.buf_free(&rec)
+            rt.buf_free(&vbuf)
+            ar.arena_free(&arena)
+            try ir
+        }
+        ar.arena_reset(&arena)
+    }
+    rt.buf_free(&rec)
+    rt.buf_free(&vbuf)
+    ar.arena_free(&arena)
+    return true
+}
+
+fn exec_create_table(st: *mut dc.Stmt) -> DbError!bool {
+    let db: *mut dc.Db = (*st).db
+    let ast: *mut ax.Ast = &(*st).ast
+    let nd: *mut ax.Node = ax.ast_n(ast, (*st).root)
+    let np: u64 = (*nd).sp
+    let nn: usize = (*nd).sn
+    if dc.find_table(&(*db).schema, np, nn) >= 0 || dc.find_index(&(*db).schema, np, nn) >= 0 {
+        if ((*nd).flag & 1) != 0 {
+            return true
+        }
+        return dberr.fail(DbError::Exists, msg3("table ", np, nn, " already exists"))
+    }
+    if starts_with_ci(np, nn, "sqlite_") {
+        return dberr.fail(DbError::Sql, msg3("object name reserved for internal use: ", np, nn, ""))
+    }
+    if (*nd).c >= 0 {
+        return try exec_create_table_as(st)
+    }
+    // columns: no duplicates, AUTOINCREMENT only on an INTEGER PRIMARY KEY
+    var c: i32 = (*nd).a
+    var ncols: usize = 0
+    while c >= 0 {
+        let cn: *mut ax.Node = ax.ast_n(ast, c)
+        var c2: i32 = (*cn).next
+        while c2 >= 0 {
+            let cn2: *mut ax.Node = ax.ast_n(ast, c2)
+            if dc.name_eq((*cn).sp, (*cn).sn, (*cn2).sp, (*cn2).sn) {
+                return dberr.fail(DbError::Sql, msg3("duplicate column name: ", (*cn).sp, (*cn).sn, ""))
+            }
+            c2 = (*cn2).next
+        }
+        if ((*cn).flag & 8) != 0 {
+            if ((*cn).flag & 1) == 0 || !dc.name_eq((*cn).sp2, (*cn).sn2, "integer".p as u64, 7) {
+                return dberr.fail(DbError::Sql, "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")
+            }
+        }
+        if (*cn).op != 0 && ((*cn).flag & 5) != 0 {
+            return dberr.fail(DbError::Unsupported, "PRIMARY KEY / UNIQUE on a column with a collation other than BINARY")
+        }
+        ncols = ncols + 1
+        c = (*cn).next
+    }
+    if ncols > 2000 {
+        return dberr.fail(DbError::TooBig, "too many columns (at most 2000)")
+    }
+    let root: u32 = try bx.bt_create(&(*db).bt, false)
+    // the text of the statement without IF NOT EXISTS: "CREATE TABLE " + name .. end
+    var sqlb: rt.Buf = rt.buf_new()
+    ut.put_text(&sqlb, "CREATE TABLE ")
+    let tail: str = stmt_text(st, (*nd).g, (*nd).e)
+    rt.buf_push_bytes(&sqlb, tail.p as u64, tail.length())
+    let sqlp: u64 = ar.arena_copy(&(*db).temp, rt.buf_ptr(&sqlb), rt.buf_len(&sqlb))
+    let sqln: usize = rt.buf_len(&sqlb)
+    rt.buf_free(&sqlb)
+    let tr: DbError!i64 = master_add(db, "table", np, nn, np, nn, root, sqlp, sqln)
+    if dberr.failed_i64(tr) {
+        try tr
+    }
+    // AUTOINCREMENT needs sqlite_sequence
+    var autoinc: bool = false
+    c = (*nd).a
+    while c >= 0 {
+        if ((*ax.ast_n(ast, c)).flag & 8) != 0 {
+            autoinc = true
+        }
+        c = (*ax.ast_n(ast, c)).next
+    }
+    if autoinc {
+        try create_sequence_table(db)
+    }
+    // the indexes of the constraints: read the table back to count them
+    try bump_cookie(db)
+    try reload(db)
+    let ti: i64 = dc.find_table(&(*db).schema, np, nn)
+    if ti < 0 {
+        return dberr.fail(DbError::Corrupt, "the new table was not found")
+    }
+    let t: *mut dc.Table = dc.table_at(&(*db).schema, ti as usize)
+    if (*t).bad {
+        return dberr.fail(DbError::Unsupported, msg3("table cannot be created: ", (*t).msg_p, (*t).msg_n, ""))
+    }
+    let nuniq: usize = (*t).nuniq
+    var u: usize = 1
+    while u <= nuniq {
+        var nb: rt.Buf = rt.buf_new()
+        ut.put_text(&nb, "sqlite_autoindex_")
+        rt.buf_push_bytes(&nb, np, nn)
+        rt.buf_push(&nb, 95 as u8)
+        rt.buf_push_dec_u64(&nb, u as u64)
+        let iroot: u32 = try bx.bt_create(&(*db).bt, true)
+        let ir: DbError!i64 = master_add(db, "index", rt.buf_ptr(&nb), rt.buf_len(&nb), np, nn, iroot, 0, 0)
+        rt.buf_free(&nb)
+        if dberr.failed_i64(ir) {
+            try ir
+        }
+        u = u + 1
+    }
+    (*db).schema.loaded = false
+    return true
+}
+
+// --------------------------------------------------------------- CREATE INDEX
+fn exec_create_index(st: *mut dc.Stmt) -> DbError!bool {
+    let db: *mut dc.Db = (*st).db
+    let ast: *mut ax.Ast = &(*st).ast
+    let nd: *mut ax.Node = ax.ast_n(ast, (*st).root)
+    let sc: *mut dc.Schema = &(*db).schema
+    if dc.find_index(sc, (*nd).sp, (*nd).sn) >= 0 || dc.find_table(sc, (*nd).sp, (*nd).sn) >= 0 {
+        if ((*nd).flag & 2) != 0 {
+            return true
+        }
+        return dberr.fail(DbError::Exists, msg3("index ", (*nd).sp, (*nd).sn, " already exists"))
+    }
+    if starts_with_ci((*nd).sp, (*nd).sn, "sqlite_") {
+        return dberr.fail(DbError::Sql, "object name reserved for internal use")
+    }
+    let ti: i64 = dc.find_table(sc, (*nd).sp2, (*nd).sn2)
+    if ti < 0 {
+        return dberr.fail(DbError::NoSuchTable, msg3("no such table: ", (*nd).sp2, (*nd).sn2, ""))
+    }
+    let t: *mut dc.Table = dc.table_at(sc, ti as usize)
+    if (*t).bad {
+        return dberr.fail(DbError::Unsupported, msg3("table cannot be used: ", (*t).msg_p, (*t).msg_n, ""))
+    }
+    if starts_with_ci((*t).name_p, (*t).name_n, "sqlite_") {
+        return dberr.fail(DbError::Sql, "table may not be indexed")
+    }
+    var cols: [i32; 32] = [-1; 32]
+    var nc: usize = 0
+    var desc: u64 = 0
+    var c: i32 = (*nd).a
+    while c >= 0 {
+        let cn: *mut ax.Node = ax.ast_n(ast, c)
+        if nc >= 32 {
+            return dberr.fail(DbError::Unsupported, "an index on more than 32 columns")
+        }
+        let ci: i64 = dc.find_column(t, (*cn).sp, (*cn).sn)
+        if ci == -1 {
+            return dberr.fail(DbError::NoSuchColumn, msg3("table ", (*t).name_p, (*t).name_n, " has no column named ") )
+        }
+        if (*cn).op != 0 {
+            return dberr.fail(DbError::Unsupported, "an index with a collation other than BINARY")
+        }
+        if ci == -2 {
+            cols[nc] = -1
+        } else {
+            cols[nc] = ci as i32
+            let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + (ci as usize)
+            if (*col).coll != 0 {
+                return dberr.fail(DbError::Unsupported, "an index on a column with a collation other than BINARY")
+            }
+        }
+        if (*cn).flag == 1 {
+            desc = desc | (1 << (nc as u64))
+        }
+        nc = nc + 1
+        c = (*cn).next
+    }
+    let unique: bool = ((*nd).flag & 1) != 0
+    let root: u32 = try bx.bt_create(&(*db).bt, true)
+    // fill it from the table
+    var cur: bx.Cursor = bx.cur_new((*t).root, false)
+    var ok: bool = try bx.bt_first(&(*db).bt, &cur)
+    var vbuf: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&vbuf, ((*t).ncols + 2) * 40)
+    var kbuf: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&kbuf, 40 * 40)
+    var rec: rt.Buf = rt.buf_new()
+    var failed: bool = false
+    var ferr: DbError = DbError::Misuse
+    var fmsg: str = ""
+    let vals: *mut rc.Val = (rt.buf_ptr(&vbuf)) as *mut rc.Val
+    let kv: *mut rc.Val = (rt.buf_ptr(&kbuf)) as *mut rc.Val
+    while ok && !failed {
+        let rowid: i64 = try bx.bt_rowid(&(*db).bt, &cur)
+        let pl: bx.Payload = try bx.bt_payload(&(*db).bt, &cur)
+        var i: usize = 0
+        while i < (*t).ncols {
+            *(vals + i) = rc.val_null()
+            i = i + 1
+        }
+        let got: usize = try rc.rec_decode(pl.p, pl.n, vals, (*t).ncols)
+        // the default of columns the record does not have
+        var j: usize = got
+        while j < (*t).ncols {
+            let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + j
+            if (*col).dflt >= 0 {
+                var es: ex.Scope = ex.scope_new()
+                var cx0: ex.Ctx = ex.ctx_new(db, &(*db).schema.ast, &(*db).temp)
+                cx0.scope = &es
+                let dv: DbError!rc.Val = ex.eval(&cx0, (*col).dflt)
+                *(vals + j) = dv catch rc.val_null()
+            }
+            j = j + 1
+        }
+        if (*t).rowid_col >= 0 {
+            *(vals + ((*t).rowid_col as usize)) = rc.val_int(rowid)
+        }
+        var k: usize = 0
+        var has_null: bool = false
+        while k < nc {
+            if cols[k] < 0 {
+                *(kv + k) = rc.val_int(rowid)
+            } else {
+                *(kv + k) = *(vals + (cols[k] as usize))
+                if (*(kv + k)).t == 0 {
+                    has_null = true
+                }
+            }
+            k = k + 1
+        }
+        *(kv + nc) = rc.val_int(rowid)
+        rt.buf_clear(&rec)
+        rc.rec_encode(kv, nc + 1, &rec)
+        // the key now lives in `rec`: decode it for the comparisons (nothing points into pages)
+        var dv2: rt.Buf = rt.buf_new()
+        rt.buf_reserve(&dv2, 40 * 40)
+        let dvp: *mut rc.Val = (rt.buf_ptr(&dv2)) as *mut rc.Val
+        let dn: usize = try rc.rec_decode(rt.buf_ptr(&rec), rt.buf_len(&rec), dvp, nc + 1)
+        if unique && !has_null {
+            var uk0: rc.UKey = rc.ukey_new(rt.buf_ptr(&dv2), nc, desc)
+            var icur: bx.Cursor = bx.cur_new(root, true)
+            let found: bool = try bx.bt_index_seek(&(*db).bt, &icur, &uk0, bx.SEEK_GE)
+            if found {
+                let ipl: bx.Payload = try bx.bt_payload(&(*db).bt, &icur)
+                let c0: i64 = try rc.rec_compare_key(ipl.p, ipl.n, &uk0)
+                if c0 == 0 {
+                    failed = true
+                    var mb: rt.Buf = rt.buf_new()
+                    ut.put_text(&mb, "UNIQUE constraint failed: ")
+                    var q: usize = 0
+                    while q < nc {
+                        if q > 0 {
+                            ut.put_text(&mb, ", ")
+                        }
+                        rt.buf_push_bytes(&mb, (*t).name_p, (*t).name_n)
+                        rt.buf_push(&mb, 46 as u8)
+                        if cols[q] < 0 {
+                            ut.put_text(&mb, "rowid")
+                        } else {
+                            let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + (cols[q] as usize)
+                            rt.buf_push_bytes(&mb, (*col).name_p, (*col).name_n)
+                        }
+                        q = q + 1
+                    }
+                    fmsg = __str_copy(str { p: rt.buf_data(&mb), n: rt.buf_len(&mb) })
+                    rt.buf_free(&mb)
+                    ferr = DbError::Constraint
+                }
+            }
+        }
+        if !failed {
+            var uk: rc.UKey = rc.ukey_new(rt.buf_ptr(&dv2), nc + 1, desc)
+            let added: DbError!bool = bx.bt_index_insert(&(*db).bt, root, &uk, rt.buf_ptr(&rec), rt.buf_len(&rec))
+            if dberr.failed_bool(added) {
+                rt.buf_free(&dv2)
+                rt.buf_free(&vbuf)
+                rt.buf_free(&kbuf)
+                rt.buf_free(&rec)
+                try added
+            }
+        }
+        rt.buf_free(&dv2)
+        if !failed {
+            ok = try bx.bt_next(&(*db).bt, &cur)
+        }
+    }
+    rt.buf_free(&vbuf)
+    rt.buf_free(&kbuf)
+    rt.buf_free(&rec)
+    if failed {
+        return dberr.fail(ferr, fmsg)
+    }
+    var sqlb: rt.Buf = rt.buf_new()
+    if unique {
+        ut.put_text(&sqlb, "CREATE UNIQUE INDEX ")
+    } else {
+        ut.put_text(&sqlb, "CREATE INDEX ")
+    }
+    let tail: str = stmt_text(st, (*nd).g, (*nd).e)
+    rt.buf_push_bytes(&sqlb, tail.p as u64, tail.length())
+    let sqlp: u64 = ar.arena_copy(&(*db).temp, rt.buf_ptr(&sqlb), rt.buf_len(&sqlb))
+    let sqln: usize = rt.buf_len(&sqlb)
+    rt.buf_free(&sqlb)
+    try master_add(db, "index", (*nd).sp, (*nd).sn, (*t).name_p, (*t).name_n, root, sqlp, sqln)
+    try bump_cookie(db)
+    (*db).schema.loaded = false
+    return true
+}
+
+// ---------------------------------------------------------------------- DROP
+fn exec_drop(st: *mut dc.Stmt) -> DbError!bool {
+    let db: *mut dc.Db = (*st).db
+    let ast: *mut ax.Ast = &(*st).ast
+    let nd: *mut ax.Node = ax.ast_n(ast, (*st).root)
+    let sc: *mut dc.Schema = &(*db).schema
+    if (*nd).op == 1 {
+        let ti: i64 = dc.find_table(sc, (*nd).sp, (*nd).sn)
+        if ti < 0 {
+            if ((*nd).flag & 1) != 0 {
+                return true
+            }
+            return dberr.fail(DbError::NoSuchTable, msg3("no such table: ", (*nd).sp, (*nd).sn, ""))
+        }
+        let t: *mut dc.Table = dc.table_at(sc, ti as usize)
+        if starts_with_ci((*t).name_p, (*t).name_n, "sqlite_") {
+            return dberr.fail(DbError::Sql, msg3("table ", (*t).name_p, (*t).name_n, " may not be dropped"))
+        }
+        // its indexes first
+        var i: usize = 0
+        let n: usize = dc.schema_index_count(sc)
+        while i < n {
+            let ix: *mut dc.Index = dc.index_at(sc, i)
+            if (*ix).table == (ti as i32) {
+                try bx.bt_drop(&(*db).bt, (*ix).root)
+                try master_delete(db, (*ix).mrowid)
+            }
+            i = i + 1
+        }
+        let autoinc: bool = (*t).autoinc
+        let tname_p: u64 = (*t).name_p
+        let tname_n: usize = (*t).name_n
+        try bx.bt_drop(&(*db).bt, (*t).root)
+        try master_delete(db, (*t).mrowid)
+        if autoinc {
+            // its row in sqlite_sequence
+            let si: i64 = dc.find_table(sc, "sqlite_sequence".p as u64, 15)
+            if si >= 0 {
+                let stab: *mut dc.Table = dc.table_at(sc, si as usize)
+                var cur: bx.Cursor = bx.cur_new((*stab).root, false)
+                var ok: bool = try bx.bt_first(&(*db).bt, &cur)
+                var victim: i64 = -1
+                while ok && victim < 0 {
+                    let pl: bx.Payload = try bx.bt_payload(&(*db).bt, &cur)
+                    var v: [rc.Val; 1] = [rc.val_null()]
+                    try rc.rec_decode(pl.p, pl.n, &v[0], 1)
+                    if v[0].t == 3 && dc.name_eq(v[0].p, v[0].n, tname_p, tname_n) {
+                        victim = try bx.bt_rowid(&(*db).bt, &cur)
+                    } else {
+                        ok = try bx.bt_next(&(*db).bt, &cur)
+                    }
+                }
+                if victim >= 0 {
+                    try bx.bt_table_delete(&(*db).bt, (*stab).root, victim)
+                }
+            }
+        }
+        try bump_cookie(db)
+        (*db).schema.loaded = false
+        return true
+    }
+    // DROP INDEX
+    let xi: i64 = dc.find_index(sc, (*nd).sp, (*nd).sn)
+    if xi < 0 {
+        if ((*nd).flag & 1) != 0 {
+            return true
+        }
+        return dberr.fail(DbError::NoSuchTable, msg3("no such index: ", (*nd).sp, (*nd).sn, ""))
+    }
+    let ix: *mut dc.Index = dc.index_at(sc, xi as usize)
+    if (*ix).auto {
+        return dberr.fail(DbError::Sql, msg3("index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped: ", (*ix).name_p, (*ix).name_n, ""))
+    }
+    try bx.bt_drop(&(*db).bt, (*ix).root)
+    try master_delete(db, (*ix).mrowid)
+    try bump_cookie(db)
+    (*db).schema.loaded = false
+    return true
+}
+
+// --------------------------------------------------------------------- ALTER
+fn exec_alter(st: *mut dc.Stmt) -> DbError!bool {
+    let db: *mut dc.Db = (*st).db
+    let ast: *mut ax.Ast = &(*st).ast
+    let nd: *mut ax.Node = ax.ast_n(ast, (*st).root)
+    let sc: *mut dc.Schema = &(*db).schema
+    if (*nd).op != 1 {
+        return dberr.fail(DbError::Unsupported, "ALTER TABLE: only ADD COLUMN is supported")
+    }
+    let ti: i64 = dc.find_table(sc, (*nd).sp, (*nd).sn)
+    if ti < 0 {
+        return dberr.fail(DbError::NoSuchTable, msg3("no such table: ", (*nd).sp, (*nd).sn, ""))
+    }
+    let t: *mut dc.Table = dc.table_at(sc, ti as usize)
+    if (*t).bad || (*t).mrowid == 0 {
+        return dberr.fail(DbError::Unsupported, "this table cannot be altered")
+    }
+    let cd: *mut ax.Node = ax.ast_n(ast, (*nd).a)
+    if ((*cd).flag & 1) != 0 {
+        return dberr.fail(DbError::Sql, "Cannot add a PRIMARY KEY column")
+    }
+    if ((*cd).flag & 4) != 0 {
+        return dberr.fail(DbError::Sql, "Cannot add a UNIQUE column")
+    }
+    if dc.find_column(t, (*cd).sp, (*cd).sn) != -1 {
+        return dberr.fail(DbError::Sql, msg3("duplicate column name: ", (*cd).sp, (*cd).sn, ""))
+    }
+    if (*cd).a >= 0 {
+        var es: ex.Scope = ex.scope_new()
+        try ex.resolve_expr(&es, ast, (*cd).a, false, false)
+        if !ex.node_is_const(ast, (*cd).a) {
+            return dberr.fail(DbError::Sql, "Cannot add a column with non-constant default")
+        }
+    }
+    if ((*cd).flag & 2) != 0 {
+        var null_default: bool = (*cd).a < 0
+        if (*cd).a >= 0 && (*ax.ast_n(ast, (*cd).a)).kind == ax.N_NULL {
+            null_default = true
+        }
+        if null_default {
+            return dberr.fail(DbError::Sql, "Cannot add a NOT NULL column with default value NULL")
+        }
+    }
+    // the new text: the old one with ", <column>" before its last ')'
+    var pos: usize = (*t).sql_n
+    while pos > 0 && rt.ld8((*t).sql_p, pos - 1) != 41 as u8 {
+        pos = pos - 1
+    }
+    if pos == 0 {
+        return dberr.fail(DbError::Corrupt, "the CREATE TABLE text has no closing parenthesis")
+    }
+    pos = pos - 1
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&nb, (*t).sql_p, pos)
+    ut.put_text(&nb, ", ")
+    let coldef: str = stmt_text(st, (*nd).e, (*nd).d)
+    rt.buf_push_bytes(&nb, coldef.p as u64, coldef.length())
+    rt.buf_push_bytes(&nb, (*t).sql_p + (pos as u64), (*t).sql_n - pos)
+    // the master row again, with the new text
+    var v: [rc.Val; 5] = [rc.val_text("table".p as u64, 5), rc.val_text((*t).name_p, (*t).name_n),
+        rc.val_text((*t).name_p, (*t).name_n), rc.val_int((*t).root as i64), rc.val_text(rt.buf_ptr(&nb), rt.buf_len(&nb))]
+    var rec: rt.Buf = rt.buf_new()
+    rc.rec_encode(&v[0], 5, &rec)
+    let r: DbError!bool = bx.bt_table_insert(&(*db).bt, 1, (*t).mrowid, rt.buf_ptr(&rec), rt.buf_len(&rec))
+    rt.buf_free(&rec)
+    rt.buf_free(&nb)
+    try r
+    try bump_cookie(db)
+    (*db).schema.loaded = false
+    return true
+}
+
+fn exec_ddl(st: *mut dc.Stmt) -> DbError!bool {
+    let k: u32 = (*st).kind
+    if k == ax.N_CREATE_TABLE {
+        return try exec_create_table(st)
+    }
+    if k == ax.N_CREATE_INDEX {
+        return try exec_create_index(st)
+    }
+    if k == ax.N_DROP {
+        return try exec_drop(st)
+    }
+    if k == ax.N_ALTER {
+        return try exec_alter(st)
+    }
+    return dberr.fail(DbError::Unsupported, "statement is not available")
+}
+
+// -------------------------------------------------------------------- PRAGMA
+fn pname_is(nd: *mut ax.Node, w: str) -> bool {
+    return dc.name_eq((*nd).sp, (*nd).sn, w.p as u64, w.length())
+}
+
+// does this PRAGMA write to the file? (user_version = N, application_id = N)
+fn pragma_is_write(st: *mut dc.Stmt) -> bool {
+    let nd: *mut ax.Node = ax.ast_n(&(*st).ast, (*st).root)
+    if (*nd).a < 0 {
+        return false
+    }
+    return pname_is(nd, "user_version") || pname_is(nd, "application_id")
+}
+
+fn pragma_value_int(st: *mut dc.Stmt, nd: *mut ax.Node) -> i64 {
+    if (*nd).a < 0 {
+        return 0
+    }
+    let vn: *mut ax.Node = ax.ast_n(&(*st).ast, (*nd).a)
+    if (*vn).kind == ax.N_INT {
+        return (*vn).ival
+    }
+    if (*vn).kind == ax.N_STR {
+        var x: rc.Val = rc.val_text((*vn).sp, (*vn).sn)
+        // on / off / true / false
+        if dc.name_eq((*vn).sp, (*vn).sn, "on".p as u64, 2) || dc.name_eq((*vn).sp, (*vn).sn, "true".p as u64, 4)
+            || dc.name_eq((*vn).sp, (*vn).sn, "yes".p as u64, 3) || dc.name_eq((*vn).sp, (*vn).sn, "full".p as u64, 4) {
+            return 1
+        }
+        if dc.name_eq((*vn).sp, (*vn).sn, "extra".p as u64, 5) {
+            return 3
+        }
+        return vl.val_to_int(&x)
+    }
+    if (*vn).kind == ax.N_REAL {
+        return (*vn).fval as i64
+    }
+    return 0
+}
+
+// PRAGMAs that set connection state and write nothing. Answers true if it was one.
+fn pragma_set_nowrite(st: *mut dc.Stmt) -> DbError!bool {
+    let db: *mut dc.Db = (*st).db
+    let nd: *mut ax.Node = ax.ast_n(&(*st).ast, (*st).root)
+    if (*nd).a < 0 {
+        return false
+    }
+    if pname_is(nd, "synchronous") {
+        let v: i64 = pragma_value_int(st, nd)
+        var m: i32 = 2
+        if v == 0 {
+            m = 0
+        }
+        pgr.pager_set_sync(&(*db).pg, m)
+        return true
+    }
+    if pname_is(nd, "busy_timeout") {
+        pgr.pager_set_busy(&(*db).pg, pragma_value_int(st, nd))
+        return true
+    }
+    if pname_is(nd, "cache_size") {
+        var n: i64 = pragma_value_int(st, nd)
+        if n < 0 {
+            // negative: kibibytes
+            n = (0 - n) * 1024 / (pgr.pager_page_size(&(*db).pg) as i64)
+        }
+        if n < 64 {
+            n = 64
+        }
+        (*db).pg.cache_req = n as usize
+        return true
+    }
+    if pname_is(nd, "foreign_keys") || pname_is(nd, "journal_mode") || pname_is(nd, "locking_mode")
+        || pname_is(nd, "temp_store") || pname_is(nd, "recursive_triggers") || pname_is(nd, "case_sensitive_like")
+        || pname_is(nd, "auto_vacuum") || pname_is(nd, "page_size") || pname_is(nd, "encoding")
+        || pname_is(nd, "mmap_size") || pname_is(nd, "secure_delete") || pname_is(nd, "wal_autocheckpoint") {
+        return true
+    }
+    return false
+}
+
+// PRAGMA user_version = N / application_id = N (inside a write transaction)
+fn exec_pragma_set(st: *mut dc.Stmt) -> DbError!bool {
+    let db: *mut dc.Db = (*st).db
+    let nd: *mut ax.Node = ax.ast_n(&(*st).ast, (*st).root)
+    let v: i64 = pragma_value_int(st, nd)
+    let d: u64 = try pgr.pager_write(&(*db).pg, 1)
+    if pname_is(nd, "user_version") {
+        ut.wr32(d, 60, (v as u64) & 4294967295)
+    } else {
+        ut.wr32(d, 68, (v as u64) & 4294967295)
+    }
+    return true
+}
+
+fn pragma_row_int(it: *mut sl.SelIter, v: i64) -> DbError!bool {
+    var row: [rc.Val; 1] = [rc.val_int(v)]
+    return sl.sel_fixed_row(it, &row[0])
+}
+
+fn pragma_row_text(it: *mut sl.SelIter, s: str) -> DbError!bool {
+    var row: [rc.Val; 1] = [rc.val_text(s.p as u64, s.length())]
+    return sl.sel_fixed_row(it, &row[0])
+}
+
+fn table_by_arg(db: *mut dc.Db, st: *mut dc.Stmt, nd: *mut ax.Node) -> DbError!*mut dc.Table {
+    if (*nd).a < 0 {
+        return dberr.fail(DbError::Sql, "this PRAGMA needs a table name")
+    }
+    let vn: *mut ax.Node = ax.ast_n(&(*st).ast, (*nd).a)
+    var p: u64 = 0
+    var n: usize = 0
+    if (*vn).kind == ax.N_STR {
+        p = (*vn).sp
+        n = (*vn).sn
+    } else if (*vn).kind == ax.N_COL {
+        p = (*vn).sp
+        n = (*vn).sn
+    } else {
+        return dberr.fail(DbError::Sql, "this PRAGMA needs a table name")
+    }
+    let ti: i64 = dc.find_table(&(*db).schema, p, n)
+    if ti < 0 {
+        return dberr.fail(DbError::NoSuchTable, msg3("no such table: ", p, n, ""))
+    }
+    return dc.table_at(&(*db).schema, ti as usize)
+}
+
+// the text of a literal DEFAULT as PRAGMA table_info shows it
+fn default_text(db: *mut dc.Db, n: i32, out: *mut rt.Buf) -> bool {
+    if n < 0 {
+        return false
+    }
+    let nd: *mut ax.Node = ax.ast_n(&(*db).schema.ast, n)
+    if (*nd).kind == ax.N_INT {
+        rt.buf_push_dec_i64(out, (*nd).ival)
+        return true
+    }
+    if (*nd).kind == ax.N_REAL {
+        vl.fmt_real(out, (*nd).fval)
+        return true
+    }
+    if (*nd).kind == ax.N_STR {
+        rt.buf_push(out, 39 as u8)
+        var i: usize = 0
+        while i < (*nd).sn {
+            let c: u8 = rt.ld8((*nd).sp, i)
+            rt.buf_push(out, c)
+            if c == 39 as u8 {
+                rt.buf_push(out, 39 as u8)
+            }
+            i = i + 1
+        }
+        rt.buf_push(out, 39 as u8)
+        return true
+    }
+    if (*nd).kind == ax.N_NULL {
+        ut.put_text(out, "NULL")
+        return true
+    }
+    return false
+}
+
+// Builds the rows of a PRAGMA that answers rows. A new iterator, or 0 if the pragma has none.
+fn pragma_query(st: *mut dc.Stmt) -> DbError!u64 {
+    let db: *mut dc.Db = (*st).db
+    let nd: *mut ax.Node = ax.ast_n(&(*st).ast, (*st).root)
+    var it: *mut sl.SelIter = 0 as *mut sl.SelIter
+    if pname_is(nd, "user_version") || pname_is(nd, "application_id") || pname_is(nd, "schema_version") {
+        it = sl.sel_fixed_new(db, st, 1)
+        sl.sel_fixed_add_name(it, "user_version")
+        var v: i64 = 0
+        if pgr.pager_page_count(&(*db).pg) > 0 {
+            let d: u64 = try pgr.pager_get(&(*db).pg, 1)
+            if pname_is(nd, "user_version") {
+                v = (ut.rd32(d, 60) as% i32) as i64
+            } else if pname_is(nd, "application_id") {
+                v = (ut.rd32(d, 68) as% i32) as i64
+            } else {
+                v = ut.rd32(d, 40) as i64
+            }
+        }
+        try pragma_row_int(it, v)
+        return it as u64
+    }
+    if pname_is(nd, "page_count") || pname_is(nd, "page_size") || pname_is(nd, "freelist_count") {
+        it = sl.sel_fixed_new(db, st, 1)
+        sl.sel_fixed_add_name(it, "page_count")
+        var v2: i64 = 0
+        if pname_is(nd, "page_count") {
+            v2 = pgr.pager_page_count(&(*db).pg) as i64
+        } else if pname_is(nd, "page_size") {
+            v2 = pgr.pager_page_size(&(*db).pg) as i64
+        } else if pgr.pager_page_count(&(*db).pg) > 0 {
+            let fc: u32 = try pgr.pager_freelist_count(&(*db).pg)
+            v2 = fc as i64
+        }
+        try pragma_row_int(it, v2)
+        return it as u64
+    }
+    if pname_is(nd, "journal_mode") {
+        it = sl.sel_fixed_new(db, st, 1)
+        sl.sel_fixed_add_name(it, "journal_mode")
+        try pragma_row_text(it, "delete")
+        return it as u64
+    }
+    if pname_is(nd, "synchronous") {
+        it = sl.sel_fixed_new(db, st, 1)
+        sl.sel_fixed_add_name(it, "synchronous")
+        var m: i64 = 2
+        if (*db).pg.sync_mode == 0 {
+            m = 0
+        }
+        try pragma_row_int(it, m)
+        return it as u64
+    }
+    if pname_is(nd, "encoding") {
+        it = sl.sel_fixed_new(db, st, 1)
+        sl.sel_fixed_add_name(it, "encoding")
+        try pragma_row_text(it, "UTF-8")
+        return it as u64
+    }
+    if pname_is(nd, "foreign_keys") || pname_is(nd, "auto_vacuum") || pname_is(nd, "recursive_triggers") {
+        it = sl.sel_fixed_new(db, st, 1)
+        sl.sel_fixed_add_name(it, "foreign_keys")
+        try pragma_row_int(it, 0)
+        return it as u64
+    }
+    if pname_is(nd, "table_info") {
+        let t: *mut dc.Table = try table_by_arg(db, st, nd)
+        it = sl.sel_fixed_new(db, st, 6)
+        sl.sel_fixed_add_name(it, "cid")
+        sl.sel_fixed_add_name(it, "name")
+        sl.sel_fixed_add_name(it, "type")
+        sl.sel_fixed_add_name(it, "notnull")
+        sl.sel_fixed_add_name(it, "dflt_value")
+        sl.sel_fixed_add_name(it, "pk")
+        // primary key positions: the column-level flag, else table-level order
+        var i: usize = 0
+        while i < (*t).ncols {
+            let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + i
+            var row: [rc.Val; 6] = [rc.val_int(i as i64), rc.val_text((*col).name_p, (*col).name_n),
+                rc.val_text((*col).type_p, (*col).type_n), rc.val_int(0), rc.val_null(), rc.val_int(0)]
+            if ((*col).flags & dc.CF_NOTNULL) != 0 {
+                row[3] = rc.val_int(1)
+            }
+            var dt: rt.Buf = rt.buf_new()
+            if default_text(db, (*col).dflt, &dt) {
+                row[4] = rc.val_text(rt.buf_ptr(&dt), rt.buf_len(&dt))
+            }
+            if ((*col).flags & dc.CF_PK) != 0 {
+                row[5] = rc.val_int(1)
+            }
+            if (*col).type_n == 0 {
+                row[2] = rc.val_text("".p as u64, 0)
+            }
+            let r: DbError!bool = sl.sel_fixed_row(it, &row[0])
+            rt.buf_free(&dt)
+            try r
+            i = i + 1
+        }
+        return it as u64
+    }
+    if pname_is(nd, "index_list") {
+        let t: *mut dc.Table = try table_by_arg(db, st, nd)
+        it = sl.sel_fixed_new(db, st, 5)
+        sl.sel_fixed_add_name(it, "seq")
+        sl.sel_fixed_add_name(it, "name")
+        sl.sel_fixed_add_name(it, "unique")
+        sl.sel_fixed_add_name(it, "origin")
+        sl.sel_fixed_add_name(it, "partial")
+        let ti: i64 = dc.find_table(&(*db).schema, (*t).name_p, (*t).name_n)
+        var seq: i64 = 0
+        var i2: usize = dc.schema_index_count(&(*db).schema)
+        // newest first, like SQLite
+        while i2 > 0 {
+            i2 = i2 - 1
+            let ix: *mut dc.Index = dc.index_at(&(*db).schema, i2)
+            if (*ix).table == (ti as i32) {
+                var origin: str = "c"
+                if (*ix).auto {
+                    origin = "u"
+                }
+                var u: i64 = 0
+                if (*ix).unique {
+                    u = 1
+                }
+                var row: [rc.Val; 5] = [rc.val_int(seq), rc.val_text((*ix).name_p, (*ix).name_n), rc.val_int(u),
+                    rc.val_text(origin.p as u64, 1), rc.val_int(0)]
+                try sl.sel_fixed_row(it, &row[0])
+                seq = seq + 1
+            }
+        }
+        return it as u64
+    }
+    if pname_is(nd, "index_info") {
+        if (*nd).a < 0 {
+            return dberr.fail(DbError::Sql, "this PRAGMA needs an index name")
+        }
+        let vn: *mut ax.Node = ax.ast_n(&(*st).ast, (*nd).a)
+        let xi: i64 = dc.find_index(&(*db).schema, (*vn).sp, (*vn).sn)
+        if xi < 0 {
+            return dberr.fail(DbError::NoSuchTable, "no such index")
+        }
+        let ix: *mut dc.Index = dc.index_at(&(*db).schema, xi as usize)
+        let t: *mut dc.Table = dc.table_at(&(*db).schema, (*ix).table as usize)
+        it = sl.sel_fixed_new(db, st, 3)
+        sl.sel_fixed_add_name(it, "seqno")
+        sl.sel_fixed_add_name(it, "cid")
+        sl.sel_fixed_add_name(it, "name")
+        var k: usize = 0
+        while k < (*ix).ncols {
+            var row: [rc.Val; 3] = [rc.val_int(k as i64), rc.val_int((*ix).cols[k] as i64), rc.val_null()]
+            if (*ix).cols[k] >= 0 {
+                let col: *mut dc.Column = ((*t).cols as *mut dc.Column) + ((*ix).cols[k] as usize)
+                row[2] = rc.val_text((*col).name_p, (*col).name_n)
+            }
+            try sl.sel_fixed_row(it, &row[0])
+            k = k + 1
+        }
+        return it as u64
+    }
+    if pname_is(nd, "integrity_check") || pname_is(nd, "quick_check") {
+        it = sl.sel_fixed_new(db, st, 1)
+        sl.sel_fixed_add_name(it, "integrity_check")
+        var problems: i64 = 0
+        let sc: *mut dc.Schema = &(*db).schema
+        // every tree, then the entry counts of the indexes against the tables
+        var chk: bx.CheckStats = bx.CheckStats { pages: 0, cells: 0, leaf_depth: 0, problems: 0, bytes_free: 0 }
+        var cnt: i64 = 0
+        let ok0: DbError!bool = bx.bt_check(&(*db).bt, 1, false, &chk)
+        if dberr.failed_bool(ok0) || !(ok0 catch false) {
+            problems = problems + 1
+            try pragma_row_text(it, "*** in database main *** sqlite_master tree is damaged")
+        }
+        var ti: usize = 0
+        let nt: usize = dc.schema_table_count(sc)
+        while ti < nt {
+            let t: *mut dc.Table = dc.table_at(sc, ti)
+            ti = ti + 1
+            if (*t).mrowid == 0 || (*t).bad {
+                continue
+            }
+            let okt: DbError!bool = bx.bt_check(&(*db).bt, (*t).root, false, &chk)
+            if dberr.failed_bool(okt) || !(okt catch false) {
+                problems = problems + 1
+                try pragma_row_text(it, msg3("*** in table ", (*t).name_p, (*t).name_n, " the tree is damaged"))
+                continue
+            }
+            let nrows: i64 = try bx.bt_count(&(*db).bt, (*t).root, false)
+            var xi2: usize = 0
+            let nx: usize = dc.schema_index_count(sc)
+            while xi2 < nx {
+                let ix: *mut dc.Index = dc.index_at(sc, xi2)
+                xi2 = xi2 + 1
+                if (*ix).table != ((ti - 1) as i32) || (*ix).bad {
+                    continue
+                }
+                let oki: DbError!bool = bx.bt_check(&(*db).bt, (*ix).root, true, &chk)
+                if dberr.failed_bool(oki) || !(oki catch false) {
+                    problems = problems + 1
+                    try pragma_row_text(it, msg3("*** in index ", (*ix).name_p, (*ix).name_n, " the tree is damaged"))
+                    continue
+                }
+                let nent: i64 = try bx.bt_count(&(*db).bt, (*ix).root, true)
+                if nent != nrows {
+                    problems = problems + 1
+                    try pragma_row_text(it, msg3("wrong # of entries in index ", (*ix).name_p, (*ix).name_n, ""))
+                }
+            }
+        }
+        if problems == 0 {
+            try pragma_row_text(it, "ok")
+        }
+        return it as u64
+    }
+    // anything else: no rows
+    return 0
 }
