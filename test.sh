@@ -1529,6 +1529,19 @@ else
     tail -n 8 "$WORK/ton.log" | sed 's/^/   /'
 fi
 
+echo "== 73. manifest-lint: the ACTIONS manifests of the Fleitec family (tools/manifest-lint/run.sh, audit item 6) =="
+# One format (`manifest 1`) read by OpenPlan, LogicLab, the OrientOS action bus and now FirnChat, FreeViewer, Daidalos.
+# The linter takes the intersection of the three parsers; its tests break every rule once, and the fixtures are
+# copies of the real manifests, which must pass. The projects run manifest_lint.py on their own ACTIONS in their CI.
+bash tools/manifest-lint/run.sh > "$WORK/manifest-lint.log" 2>&1 && MLRC=0 || MLRC=$?
+if [ "$MLRC" -eq 0 ]; then
+    ok
+    tail -n 2 "$WORK/manifest-lint.log" | sed 's/^/   /'
+else
+    bad "tools/manifest-lint/run.sh failed (see .test-work/manifest-lint.log)"
+    tail -n 8 "$WORK/manifest-lint.log" | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
