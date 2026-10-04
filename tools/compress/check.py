@@ -205,9 +205,9 @@ def ref_decompress(fmt, data):
 
 
 # the encoder knobs the probe offers per format (level argument for op c)
-ENC_LEVELS = {"lz4": [None], "zstd": [None, 1, 3, 6], "xz": [None, 0, 3, 6], "lzma": [None], "bz2": [None, 1, 9], "br": [None]}
+ENC_LEVELS = {"lz4": [None], "zstd": [None, 1, 3, 6], "xz": [None, 1, 3, 6, 9], "lzma": [None, 1, 9], "bz2": [None, 1, 9], "br": [None]}
 
-ENC_ENABLED = {"lz4": True, "zstd": True, "xz": False, "lzma": False, "bz2": False, "br": False}
+ENC_ENABLED = {"lz4": True, "zstd": True, "xz": True, "lzma": True, "bz2": False, "br": False}
 
 
 def group(fmt):
@@ -247,7 +247,7 @@ def group(fmt):
                     fail("encode(%s) %s: reference rejects our stream: %s" % (lv, name, e))
                     continue
                 check("encode(%s) %s" % (lv, name), back == data, "reference reads back %d vs %d octets" % (len(back), len(data)))
-                if lv is None or lv == ENC_LEVELS[fmt][-1]:
+                if fmt != "lzma" and (lv is None or lv == ENC_LEVELS[fmt][-1]):
                     for chunk in (1, 4097, 1 << 20):
                         if chunk == 1 and len(data) > 3000:
                             continue
