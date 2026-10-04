@@ -132,7 +132,7 @@ Reading it honestly:
 | `tests/2164_db_readsqlite.fi` | `tests/data/db/sample.db` (made by SQLite: page size 512, overflow, indexes, `user_version` 42) read by lib/db | same |
 | `tests/2165_db_api.fi` | the programming interface: binding of every type, reset and reuse, errors, read-only, reopen | same |
 | `examples/db_modrinth_cache.fi`, `examples/db_game_history.fi` | the two applications, 20 and 17 self-checks | same |
-| `tools/db/run.sh` (section 77 of `test.sh`) | held against Python's `sqlite3` (SQLite 3.40.1): `check_parse.py` (parser accepts and refuses like SQLite), `check_expr.py` (constant expressions bit for bit, including dates), `check_bt.py`, `check_idx.py` (trees edited by lib/db are read by SQLite), `check_select.py` (106 queries), `check_dml.py` (statements, 1,500 random statements, files read both ways), `check_crash.py`, `check_lock.py`, `check_hostile.py`; then the same programs built for `x86_64-windows` and run under Wine | see `docs/APPLICATION_LIBS.md` and the log of the last run |
+| `tools/db/run.sh` (section 82 of `test.sh`) | held against Python's `sqlite3` (SQLite 3.40.1): `check_parse.py` (parser accepts and refuses like SQLite), `check_expr.py` (constant expressions bit for bit, including dates), `check_bt.py`, `check_idx.py` (trees edited by lib/db are read by SQLite), `check_select.py` (106 queries), `check_dml.py` (statements, 1,525 in the random workload, files read both ways), `check_crash.py`, `check_lock.py`, `check_hostile.py`; then the same programs built for `x86_64-windows` and run under Wine | parser 70 statements, expressions 25,842, SELECT 106: **0 differences**; DML 0 differences; crashes: 14 deterministic points, 22 kills inside a commit larger than the cache, 25 random `kill -9`, every file consistent afterwards; locks: no update lost (360 = 180 + 180); damaged files: 1,500, **0 crashes/panics/hangs** (1,025 answered an error); Wine: SELECT, DML, crash points, 150 damaged files, all clean |
 
 Reproduce: `bash tools/db/run.sh` (`quick` for fewer hostile files and no Windows build); the
 benchmark: `firnc --opt-level=release-fast -o bench tools/db/bench.fi && ./bench <dir>` and
@@ -146,7 +146,7 @@ benchmark: `firnc --opt-level=release-fast -o bench tools/db/bench.fi && ./bench
 **Real Windows has not run it** (the development machine cannot reach one). Things Wine cannot
 show: the behaviour of a virus scanner holding a fresh file, `LockFileEx` semantics between two
 real processes of different users, the effect of `FlushFileBuffers` on a real disk. A test kit
-(`tools/db/winkit.sh`) packs the probe programs and the checks for a real machine.
+(`bash tools/db/winkit.sh windows out.zip`) packs the probe program and the checks (Python 3 is the only need on the PC); the Linux build of the kit was run and passes, the Windows one is waiting for a PC.
 
 ## Where things are
 

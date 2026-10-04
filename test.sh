@@ -1704,6 +1704,20 @@ else
     grep -E 'FAIL|Traceback|Error' "$WORK/compress.log" | head -12 | sed 's/^/   /'
 fi
 
+echo "== 82. the embedded database against SQLite (tools/db/run.sh, lib/db, docs/DB.md) =="
+# tests/2160-2165 and examples/db_*.fi are in section 3. Here lib/db is held against Python's sqlite3, a real
+# SQLite: the parser, 25,000 constant expressions, trees edited by lib/db and read by SQLite, 106 SELECTs, DML/DDL and
+# 1,500 random statements, a process killed at every commit event, SQLite and lib/db processes on one file, 1,500
+# damaged files; then the same programs on x86_64-windows under Wine. tools/db/winkit.sh packs it for a real Windows PC.
+bash tools/db/run.sh > "$WORK/db.log" 2>&1 && DBRC=0 || DBRC=$?
+grep -E 'differences|ALL OK|damaged files|SKIP|crash points|kills' "$WORK/db.log" | sed 's/^/   /' | head -20
+if [ "$DBRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/db/run.sh failed (see .test-work/db.log)"
+    grep -E 'FAIL|FAILED|Traceback' "$WORK/db.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

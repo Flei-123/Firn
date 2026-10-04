@@ -193,3 +193,18 @@ Linux packages) and `Content-Encoding: br`/`zstd` in `net.http`.
 Every decoder takes a size limit and refuses with `TooLarge` before writing
 past it; every format has a streaming reader whose memory is "window + one
 unit". Linux, AArch64 (qemu) and Windows (Wine), all four build levels.
+
+## The embedded database (lib/db)
+
+Tables, indexes and transactions in one file, for a launcher's search cache and play history
+and for any Firn program. The file is a **SQLite 3 database**: SQLite reads what lib/db writes
+and the other way round, and a process killed in the middle of a commit leaves a journal that
+either one rolls back. The decision (SQLite format against an own key-value store), the SQL
+that is supported, the honest list of what is not (no WAL, UTF-8 only, no views/triggers/WITH/
+window functions, one connection per file per process on POSIX), the benchmark against C
+SQLite (35 to 60 times slower on bulk writes, 8 to 18 times on scans, close on commits and
+single lookups) and the Windows state (Wine only): [DB.md](DB.md).
+
+| module | what it does | held against |
+|---|---|---|
+| `db.sqlite` (`lib/db/sqlite.fi`) and 20 more files in `lib/db/` | `db_open/exec/prepare`, `stmt_step`, bound parameters of every type, column accessors, transactions with statement savepoints, `db_query_*`; SELECT with joins, aggregates, sub-selects, compound selects; INSERT/UPDATE/DELETE with upsert; CREATE/DROP/ALTER ADD COLUMN; PRAGMAs; ~45 functions incl. date and time; rollback journal, SQLite's own lock bytes (`flock`, `LockFileEx` on Windows) | Python `sqlite3` (SQLite 3.40.1): 70 statements parsed alike, 25,842 expressions bit for bit, 106 SELECTs, 1,500 random statements, files exchanged both ways with `integrity_check`; a kill at every commit event plus 25 random `kill -9`; SQLite and lib/db processes on one file; 1,500 damaged files without a crash, panic or hang; the Windows build under Wine (`tools/db/run.sh`, `tests/2160`-`2165`, `examples/db_modrinth_cache.fi`, `examples/db_game_history.fi`) |
