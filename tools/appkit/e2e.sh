@@ -356,6 +356,11 @@ out=$(run "$APP" state)
 expect "state: the update is confirmed" "$out" "STATE pending.state=confirmed"
 out=$(run "$APP" check $THREADMODE)
 expect "after the update: up to date (same file as the store's)" "$out" "RESULT up to date"
+# a developer's own build of the very same version (another file the store
+# does not know) must not be overwritten by the published one
+build 1.1.0 dev "$W/art/app-1.1.0-dev$EXT"
+out=$(run "$W/art/app-1.1.0-dev$EXT" check $THREADMODE)
+expect "a developer's own build of the same version is left alone" "$out" "RESULT up to date"
 if [ ! -e "$APP.old" ]; then ok "the backup is cleaned up after the confirmation"; else bad "the backup file was left"; fi
 
 echo "== 13. a new version that CRASHES: rolled back"
