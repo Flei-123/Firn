@@ -45,7 +45,10 @@ build_stubs() {
         if newer "$OUT/setup-stub.exe" "$HERE/installer" "$ROOT/lib/pack" "$ROOT/lib/fui" "$ROOT/lib/window" "$ROOT/lib/@windows" "$ROOT/compiler/target/release/firnc"; then
             ( cd "$HERE/installer" && "$FIRNC" --target=x86_64-windows --win-subsystem=windows \
                 --opt-level=release-fast -o "$OUT/setup-stub.exe" installer.fi ) >/dev/null 2>"$OUT/setup.log" \
-                || { cat "$OUT/setup.log" >&2; echo "pack: the installer stub did not build" >&2; exit 1; }
+                || { cat "$OUT/setup.log" >&2
+                     grep -q 'undefined reference to `Reg\|SHChangeNotify' "$OUT/setup.log" \
+                         && echo "pack: the compiler is older than compiler/src/win.rs (registry imports): cargo build --release in compiler/" >&2
+                     echo "pack: the installer stub did not build" >&2; exit 1; }
         fi
     else
         echo "pack: no mingw binutils: the Windows installer stub is not built" >&2
