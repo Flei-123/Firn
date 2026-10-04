@@ -71,3 +71,21 @@ general. Each has a positive test in `tests/` or a check in `tools/fui/run.sh`.
 | `lib/fui/markdownview.fi` | a scrolling Markdown view: wrapped text, headings, lists, quotes, code, tables, task boxes, links with a click callback, images through an async hook (placeholder, ready, failed) | `tools/fui/mdview_main.fi`: pixels in light and dark, wide and narrow, WCAG 2 contrast |
 | `lib/fui/kit.fi`, `lib/fui/kitcolor.fi` (`docs/fui-kit.md`) | button, toasts, modal with focus trap, tab bar and sidebar with symbols, tile grid with avatars, search field with clear button, progress bar with a label that reads on fill and track; the launcher accent as readable text on any ground | `tools/fui/kit_main.fi` (pixels, hit functions, focus ring, icon-free variants, every colour pair), `tools/fui/kitlive.py` (the example in a real window on Xvfb) |
 
+## The application kit (appkit)
+
+A new Firn program should get updates from the own signed store, settings, a
+log with rotation, crash reports, a single-instance lock and translated texts
+without writing them again (FleiLauncher is the first user). The map, the
+store format it reads and extends, the update flow, the platform layer and its
+honest gaps: [APPKIT.md](APPKIT.md).
+
+| module | what it does | held against |
+|---|---|---|
+| `appkit.update`, `appkit.catalog`, `appkit.fetch`, `appkit.version`, `std.crypto.ed25519` (`lib/appkit/`, `lib/std/crypto/ed25519.fi`) | the update client for the real store (`entry.json` + `index.json`, Ed25519 signatures, freshness and rollback protection, channels per platform, semver + build id): check, streamed download with SHA-256 and progress, atomic replacement of the running program, a confirmation by the new program and **rollback** when it crashes or hangs; a background thread, a worker process or a blocking call; on Android the system's PackageInstaller | `tools/appkit/e2e.sh`: 60 checks against a local store (a changed byte, a wrong signature, a wrong key, an expired or older catalog, redirects, cut-off and slow answers, a real replacement, rollback after a crash and a hang), Linux and Windows (Wine); `tools/appkit/android_check.sh` on the emulator; the RFC 8032 vectors and a real store entry (`tests/2050`); the live store read-only |
+| `appkit.platform*` (`platform.fi`, `platform.windows.fi`, `lib/@android/appkit/platform.fi`, `platform_macos.fi`, `platform_osum.fi`) | one interface, one file per platform: directories, lock, spawn, language, replacing the program | `tools/appkit/platforms.py` (same names, same signatures, each type-checks); macOS and OrientOS are **untested stubs** |
+| `appkit.config`, `appkit.log`, `appkit.crash`, `appkit.single_instance`, `appkit.texts`, `appkit.appinfo` | settings in one JSON file (atomic), a log with rotation, crash reports made by the next start, one copy per user, `.opmsg` texts (English and German built in), who the program is | `tests/2051`-`2056` in every build mode and under Wine |
+| `templates/app` + `tools/newapp.sh` | `newapp.sh <Name> <app-id>` writes a runnable fUi program (sidebar, Settings, Updates, About, update banner, dark with a green accent) with build scripts for Linux, Windows and Android and a `release.sh` that publishes into the store | `tools/appkit/newapp_test.sh` (generate, build, start under Xvfb with a self-test, dry-run release) |
+
+The store side (`store add-app`: `exe`, `bin`, `appimage`, `macos-app`
+packages, per-platform channel pointers, `mindestFassung`) is in the
+orientstore repository, `docs/KATALOG-FORMAT.md`.

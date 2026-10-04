@@ -1554,6 +1554,8 @@ if [ "$SARC" -eq 0 ]; then
 else
     bad "tools/stdarchive/run.sh failed (see .test-work/stdarchive.log)"
     grep -E 'FAIL|Traceback|Error' "$WORK/stdarchive.log" | head -12 | sed 's/^/   /'
+fi
+
 echo "== 75. DNS resolver and https by name (tools/dns/run.sh, round DNS) =="
 # lib/net/dns.fi against a fake DNS server in Python (what the server saw is
 # counted from its log), against the real network when there is one, https by
@@ -1569,7 +1571,7 @@ else
     grep -E 'FAIL' "$WORK/dns.log" | head -12 | sed 's/^/   /' || true
 fi
 
-echo "== 75. appkit: the platform files agree, and the update runs end to end against a local store (tools/appkit/, lib/appkit) =="
+echo "== 76. appkit: the platform files agree, and the update runs end to end against a local store (tools/appkit/, lib/appkit) =="
 # lib/appkit's unit tests are in tests/2050-2056 (section 3). Here: (1) the five platform files
 # (Linux, Windows, Android, macOS, OrientOS) export the same names with the same signatures and
 # type-check; (2) tools/appkit/e2e.sh -- the real orientstore tool publishes into a temp directory,
