@@ -1,0 +1,355 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/platform_osum.fi -- THE PLATFORM LAYER, OrientOS (osum).
+//
+// ##########################  UNTESTED  ##########################
+// Written against the OrientOS tree (/root/osum*, kernel/user/ulib.fi,
+// kernel/user/opk.fi, docs/OTA.md) WITHOUT running anything on it: the
+// OrientOS build pins its own copy of the Firn library (vendor/firn), which
+// does not have lib/appkit yet, and the checks need a QEMU run per case.
+// What tools/appkit/platforms.sh verifies is that this file exports the
+// same names as the other platform files and type-checks.
+//
+// WHAT IT ASSUMES (each point is something to confirm on a running system)
+//   * a `profile app` program gets its start block at ARGS_BASE with the
+//     same layout as on Linux ([argc][argv..][0][envp..]) -- ulib.fi says
+//     so (T_USTACK = proc.ARGS_BASE), so plat_arg/plat_env_get are the
+//     Linux ones. OrientOS has no environment worth reading; plat_env_get
+//     finds what the start block holds.
+//   * Linux numbers exist for open 2, read 0, write 1, close 3, lseek 8,
+//     getpid 39, wait4 61, exit 60, rename 82, mkdir 83, unlink 87
+//     (kernel/user/ulib.fi: "one name per call ... Linux' number where
+//     there is one"); the OrientOS ones are SYS_EXEC 1001 (spawn: path,
+//     argv, argc -> pid) and SYS_KILL 1004.
+//   * UPDATES ARE PACKAGES. An OrientOS application is an `opk` package
+//     (`opk:<name>` in the store, art "opk"); the system installs it with
+//     `/bin/opk installieren <file>` and switches the generation
+//     atomically (docs/OTA.md). So the swap kind is SWAP_INSTALLER:
+//     plat_apply runs opk on the downloaded file and answers AP_STAGED --
+//     the new generation is live at the next start, there is nothing to
+//     rename and nothing to roll back by hand (the kernel's boot counter
+//     does that, kernel/ab.fi).
+//   * DIRECTORIES: /data/<app>/{config,data,state,cache,logs}.
+//   * NO THREADS in the sense of thread_start; the worker is a process.
+//   * THE SINGLE INSTANCE LOCK is an O_EXCL file removed at unlock; a crash
+//     leaves it behind (there is no record locking to lean on).
+import std.rt
+import std.fs
+import std.time
+import appkit.util
+
+export {
+    plat_init, plat_os, plat_arch, plat_id, plat_art, plat_argc, plat_arg,
+    plat_env_get, plat_dir, plat_exe_path, plat_self_pid, plat_pid_alive,
+    plat_kill, plat_spawn_detached, plat_lock, plat_unlock, plat_lock_held,
+    plat_apply, plat_rollback, plat_can_write_beside, plat_threads,
+    plat_can_self_update, plat_install_hint, plat_exit, plat_sleep_ms,
+    plat_file_copy, plat_chmod_exec, plat_path_sep, plat_stage_path,
+    plat_locale, plat_swap_kind, SWAP_FILES, SWAP_INSTALLER,
+    DIR_CONFIG, DIR_DATA, DIR_STATE, DIR_CACHE, DIR_LOG,
+    AP_OK, AP_NO_NEW, AP_BACKUP, AP_RENAME, AP_PERM, AP_UNSUPPORTED,
+    AP_STAGED,
+}
+
+const DIR_CONFIG: u32 = 0
+const DIR_DATA: u32 = 1
+const DIR_STATE: u32 = 2
+const DIR_CACHE: u32 = 3
+const DIR_LOG: u32 = 4
+
+const AP_OK: u32 = 0
+const AP_NO_NEW: u32 = 1
+const AP_BACKUP: u32 = 2
+const AP_RENAME: u32 = 3
+const AP_PERM: u32 = 4
+const AP_UNSUPPORTED: u32 = 5
+const AP_STAGED: u32 = 6
+
+const SWAP_FILES: u32 = 0
+const SWAP_INSTALLER: u32 = 1
+
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const SYS_WRITE: i64 = 1
+const SYS_GETPID: i64 = 39
+const SYS_WAIT4: i64 = 61
+const SYS_UNLINK: i64 = 87
+const SYS_EXEC: i64 = 1001
+const SYS_KILL: i64 = 1004
+const O_EXCL_CREATE: i64 = 193 // O_WRONLY | O_CREAT | O_EXCL
+
+static mut G_START: u64 = 0
+
+fn plat_init(start: u64) {
+    G_START = start
+}
+
+fn plat_os() -> str {
+    return "osum"
+}
+
+fn plat_arch() -> str {
+    return "x86_64"
+}
+
+fn plat_id() -> str {
+    return "osum-x86_64"
+}
+
+// an OrientOS program is an opk package
+fn plat_art() -> str {
+    return "opk"
+}
+
+fn plat_path_sep() -> str {
+    return "/"
+}
+
+fn plat_argc() -> usize {
+    return rt.arg_count(G_START)
+}
+
+fn plat_arg(i: usize) -> str {
+    let p: u64 = rt.arg_ptr(G_START, i)
+    if p == 0 as u64 {
+        return ""
+    }
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn plat_env_get(name: str, out: *mut rt.Buf) -> bool {
+    if G_START == 0 as u64 {
+        return false
+    }
+    var i: usize = rt.arg_count(G_START) + 2
+    while true {
+        let p: u64 = rt.ld64(G_START, i)
+        if p == 0 as u64 {
+            return false
+        }
+        let n: usize = rt.c_length(p)
+        if n > name.n && rt.ld8(p, name.n) == 61 as u8 && rt.mem_eq(p, name.p as u64, name.n) {
+            rt.buf_clear(out)
+            rt.buf_push_bytes(out, p + name.n as u64 + 1 as u64, n - name.n - 1)
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn plat_dir(kind: u32, app: str, vendor: str, out: *mut rt.Buf) -> bool {
+    rt.buf_clear(out)
+    util.buf_push_str(out, "/data/")
+    util.buf_push_str(out, app)
+    if kind == DIR_CONFIG { util.buf_push_str(out, "/config") }
+    else if kind == DIR_DATA { util.buf_push_str(out, "/data") }
+    else if kind == DIR_STATE { util.buf_push_str(out, "/state") }
+    else if kind == DIR_CACHE { util.buf_push_str(out, "/cache") }
+    else { util.buf_push_str(out, "/logs") }
+    return true
+}
+
+// the program's own path as the loader got it (argv[0]); there is no
+// /proc/self/exe to ask
+fn plat_exe_path(out: *mut rt.Buf) -> bool {
+    let a: str = plat_arg(0)
+    if a.n == 0 {
+        return false
+    }
+    rt.buf_clear(out)
+    util.buf_push_str(out, a)
+    return true
+}
+
+fn plat_self_pid() -> i64 {
+    return syscall(SYS_GETPID, 0, 0, 0, 0, 0, 0)
+}
+
+fn plat_pid_alive(pid: i64) -> bool {
+    return pid > 0
+}
+
+fn plat_kill(pid: i64) -> bool {
+    if pid <= 1 {
+        return false
+    }
+    return syscall(SYS_KILL, pid, 9, 0, 0, 0, 0) >= 0
+}
+
+fn plat_sleep_ms(ms: u64) {
+    time.sleep_ms(ms)
+}
+
+fn plat_exit(code: i64) {
+    rt.finish(code)
+}
+
+// SYS_EXEC starts a process and returns its pid; the child is not waited for
+fn plat_spawn_detached(path: str, args: *mut util.Args) -> bool {
+    var cpath: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&cpath, path.p as u64, path.n)
+    rt.buf_push(&cpath, 0 as u8)
+    let na: usize = util.args_count(args)
+    var argv: rt.Buf = rt.buf_new()
+    var ok: bool = util.buf_room(&argv, (na + 2) * 8)
+    if ok {
+        rt.buf_set_len(&argv, (na + 2) * 8)
+        let base: u64 = rt.buf_ptr(&argv)
+        rt.st64(base, 0, rt.buf_ptr(&cpath))
+        var at: u64 = rt.buf_ptr(&(*args).buf)
+        var k: usize = 0
+        while k < na {
+            rt.st64(base, k + 1, at)
+            at = at + rt.c_length(at) as u64 + 1 as u64
+            k = k + 1
+        }
+        rt.st64(base, na + 1, 0 as u64)
+        // kernel/proc.fi gives an exec MAX_ARGS = 8 arguments
+        let r: i64 = syscall(SYS_EXEC, rt.buf_ptr(&cpath) as i64, base as i64, (na + 1) as i64, 0, 0, 0)
+        ok = r > 0
+    }
+    rt.buf_free(&argv)
+    rt.buf_free(&cpath)
+    return ok
+}
+
+// O_EXCL file; held until plat_unlock removes it
+static mut G_LOCK_PATH: [u8; 512] = [0; 512]
+static mut G_NLOCK: usize = 0
+
+fn plat_lock(path: str) -> i64 {
+    if path.n == 0 || path.n > 500 {
+        return -2
+    }
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    let fd: i64 = syscall(SYS_OPEN, rt.buf_ptr(&c) as i64, O_EXCL_CREATE, 420, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        if fd == -17 {
+            return -1
+        }
+        return -2
+    }
+    var t: rt.Buf = rt.buf_new()
+    util.push_dec_pad(&t, plat_self_pid() as u64, 10)
+    rt.buf_push(&t, 10 as u8)
+    syscall(SYS_WRITE, fd, rt.buf_ptr(&t) as i64, rt.buf_len(&t) as i64, 0, 0, 0)
+    rt.buf_free(&t)
+    rt.mem_copy((&G_LOCK_PATH[0]) as u64, path.p as u64, path.n)
+    G_NLOCK = path.n
+    return fd
+}
+
+fn plat_unlock(h: i64) {
+    if h >= 0 {
+        syscall(SYS_CLOSE, h, 0, 0, 0, 0, 0)
+        if G_NLOCK > 0 {
+            fs.remove(str { p: (&G_LOCK_PATH[0]) as *mut u8, n: G_NLOCK }) catch false
+            G_NLOCK = 0
+        }
+    }
+}
+
+// no record locks: the file's existence is all there is
+fn plat_lock_held(path: str) -> bool {
+    return fs.exists(path)
+}
+
+fn plat_chmod_exec(path: str) -> bool {
+    return true
+}
+
+fn plat_file_copy(src: str, dst: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(src, &b) catch 4294967295
+    if n == 4294967295 {
+        rt.buf_free(&b)
+        return false
+    }
+    let w: usize = fs.write_file(dst, rt.buf_ptr(&b), rt.buf_len(&b)) catch 4294967295
+    let ok: bool = w == rt.buf_len(&b)
+    rt.buf_free(&b)
+    return ok
+}
+
+fn plat_can_write_beside(exe: str) -> bool {
+    return true
+}
+
+fn plat_swap_kind() -> u32 {
+    return SWAP_INSTALLER
+}
+
+// the .opk waits in the cache directory of the program
+fn plat_stage_path(exe: str, out: *mut rt.Buf) -> bool {
+    rt.buf_clear(out)
+    util.buf_push_str(out, "/tmp/appkit-update.opk")
+    return true
+}
+
+// `opk installieren <file>` (kernel/user/opk.fi): checks the package's
+// signature and content hash itself, writes the new generation, switches
+// /system/AKTUELL. The new version runs from the next start.
+fn plat_apply(newf: str, exe: str, backup: str) -> u32 {
+    if !fs.is_file(newf) {
+        return AP_NO_NEW
+    }
+    var a: util.Args = util.args_new()
+    util.args_push(&a, "installieren")
+    util.args_push(&a, newf)
+    var opk: str = "/bin/opk"
+    var cpath: rt.Buf = rt.buf_new()
+    util.buf_push_str(&cpath, opk)
+    rt.buf_push(&cpath, 0 as u8)
+    var argv: rt.Buf = rt.buf_new()
+    var ok: bool = util.buf_room(&argv, 4 * 8)
+    var rc: u32 = AP_RENAME
+    if ok {
+        rt.buf_set_len(&argv, 4 * 8)
+        let base: u64 = rt.buf_ptr(&argv)
+        rt.st64(base, 0, rt.buf_ptr(&cpath))
+        var at: u64 = rt.buf_ptr(&a.buf)
+        rt.st64(base, 1, at)
+        at = at + rt.c_length(at) as u64 + 1 as u64
+        rt.st64(base, 2, at)
+        rt.st64(base, 3, 0 as u64)
+        let pid: i64 = syscall(SYS_EXEC, rt.buf_ptr(&cpath) as i64, base as i64, 3, 0, 0, 0)
+        if pid > 0 {
+            var status: [u64; 1] = [0 as u64; 1]
+            let w: i64 = syscall(SYS_WAIT4, pid, (&status[0]) as i64, 0, 0, 0, 0)
+            if w >= 0 && ((status[0] >> 8) & 255 as u64) == 0 as u64 {
+                rc = AP_STAGED
+            }
+        }
+    }
+    rt.buf_free(&argv)
+    rt.buf_free(&cpath)
+    util.args_free(&a)
+    return rc
+}
+
+// the system keeps the previous generation; the kernel's boot counter
+// returns to it by itself (kernel/ab.fi) -- there is nothing to do here
+fn plat_rollback(exe: str, backup: str) -> u32 {
+    return AP_UNSUPPORTED
+}
+
+fn plat_threads() -> bool {
+    return false
+}
+
+fn plat_can_self_update() -> bool {
+    return true
+}
+
+fn plat_install_hint() -> str {
+    return "Updates of OrientOS programs are installed by the system (opk)."
+}
+
+fn plat_locale(out: *mut rt.Buf) -> bool {
+    rt.buf_clear(out)
+    util.buf_push_str(out, "en")
+    return false
+}

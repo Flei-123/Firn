@@ -1569,6 +1569,30 @@ else
     grep -E 'FAIL' "$WORK/dns.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 75. appkit: the platform files agree, and the update runs end to end against a local store (tools/appkit/, lib/appkit) =="
+# lib/appkit's unit tests are in tests/2050-2056 (section 3). Here: (1) the five platform files
+# (Linux, Windows, Android, macOS, OrientOS) export the same names with the same signatures and
+# type-check; (2) tools/appkit/e2e.sh -- the real orientstore tool publishes into a temp directory,
+# a local server serves it, a program built on lib/appkit updates itself: check in all three
+# modes, hash / signature / catalog / key / expiry / rollback attacks refused, channels, the floor,
+# chunked / redirected / dropped / slow downloads, a cancelled download, the real replacement of
+# the running program, and the rollback when the new version crashes or hangs. The Windows build
+# under Wine runs the same script with APPKIT_E2E_WINDOWS=1 (about ten minutes). SKIPs (exit 0)
+# without the orientstore tool or python3 cryptography.
+python3 tools/appkit/platforms.py > "$WORK/appkit_platforms.log" 2>&1 && AKRC=0 || AKRC=$?
+bash tools/appkit/e2e.sh > "$WORK/appkit_e2e.log" 2>&1 || AKRC=1
+if [ "${APPKIT_E2E_WINDOWS:-0}" = "1" ]; then
+    E2E_TARGET=windows bash tools/appkit/e2e.sh > "$WORK/appkit_e2e_win.log" 2>&1 || AKRC=1
+fi
+if [ "$AKRC" -eq 0 ]; then
+    ok
+    tail -n 1 "$WORK/appkit_platforms.log" | sed 's/^/   /'
+    grep -E '^(appkit e2e:|SKIP)' "$WORK/appkit_e2e.log" | sed 's/^/   /'
+else
+    bad "tools/appkit failed (see .test-work/appkit_*.log)"
+    grep -E 'FAIL' "$WORK"/appkit_*.log | head -12 | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

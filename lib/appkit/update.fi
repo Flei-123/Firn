@@ -153,6 +153,8 @@ struct Status {
     nnotes: u64,
     errtext: [u8; 192],
     nerr: u64,
+    sha: [u8; 64], // the offered build's SHA-256: all that apply needs from a worker
+    nsha: u64,
 }
 
 struct Updater {
@@ -186,6 +188,7 @@ struct Updater {
 
 static mut G_UPDATER: u64 = 0
 static mut G_RESTARTED: bool = false
+static mut G_RUN_LOCK: i64 = -1
 static mut G_ROLLEDBACK_START: bool = false
 
 // ------------------------------------------------------------ the object
@@ -373,6 +376,7 @@ fn publish(u: *mut Updater, force: bool) {
     kv_txt(&b, "ver", (&(*s).ver[0]) as u64, (*s).nver as usize)
     kv_txt(&b, "notes", (&(*s).notes[0]) as u64, (*s).nnotes as usize)
     kv_txt(&b, "errtext", (&(*s).errtext[0]) as u64, (*s).nerr as usize)
+    kv_txt(&b, "sha", (&(*s).sha[0]) as u64, (*s).nsha as usize)
     let ok: bool = fs.write_atomic(status_path_str(u), rt.buf_ptr(&b), rt.buf_len(&b)) catch false
     rt.buf_free(&b)
 }
@@ -885,6 +889,8 @@ fn update_check_blocking(u: *mut Updater) -> u64 {
     let decision: u32 = catalog.decide(appinfo.app_version(), inst_build, same_file, &b)
     (*u).build = b
     (*u).st.size = (*u).build.size
+    rt.mem_copy((&(*u).st.sha[0]) as u64, (&(*u).build.sha256[0]) as u64, 64)
+    (*u).st.nsha = 64
     (*u).st.nver = put_text((&(*u).st.ver[0]) as u64, 64, str { p: (&(*u).build.version[0]) as *mut u8, n: (*u).build.nversion })
     (*u).st.nnotes = put_text((&(*u).st.notes[0]) as u64, 1536, str { p: (&(*u).build.notes[0]) as *mut u8, n: (*u).build.nnotes })
     if decision == catalog.D_BROKEN {
@@ -1136,6 +1142,10 @@ fn update_busy(u: *mut Updater) -> bool {
 }
 
 fn pick_mode(mode: u32) -> u32 {
+    // threads asked for where there are none: the process worker instead
+    if mode == RUN_THREAD && !platform.plat_threads() {
+        return RUN_PROCESS
+    }
     if mode != RUN_AUTO {
         return mode
     }
@@ -1157,6 +1167,8 @@ fn update_start(u: *mut Updater, op: u32, mode: u32) -> bool {
     (*u).cancel = 0
     (*u).st.err = UE_NONE
     (*u).st.nerr = 0
+    (*u).st.nsha = 0
+    (*u).st.nver = 0
     if m == RUN_BLOCKING {
         (*u).publish_file = false
         worker_run(u, op)
@@ -1294,6 +1306,7 @@ fn read_status_file(u: *mut Updater) -> bool {
             else if key == "ver" { (*s).nver = unesc_into((&(*s).ver[0]) as u64, 64, vp, vn) }
             else if key == "notes" { (*s).nnotes = unesc_into((&(*s).notes[0]) as u64, 1536, vp, vn) }
             else if key == "errtext" { (*s).nerr = unesc_into((&(*s).errtext[0]) as u64, 192, vp, vn) }
+            else if key == "sha" { (*s).nsha = unesc_into((&(*s).sha[0]) as u64, 64, vp, vn) }
         }
         i = e + 1
     }
@@ -1352,7 +1365,7 @@ fn exe_and_backup(exe: *mut rt.Buf, backup: *mut rt.Buf) -> bool {
 // program has confirmed -- or after the old one is back).
 // Returns platform.AP_OK, AP_STAGED (the system installs it) or an error.
 fn update_apply(u: *mut Updater, restart_args: *mut util.Args) -> u32 {
-    if (*u).st.phase != PH_READY || !(*u).build.found {
+    if (*u).st.phase != PH_READY || (*u).st.nsha != 64 as u64 {
         st_fail(u, UE_STATE, "nothing is ready")
         return platform.AP_NO_NEW
     }
@@ -1368,7 +1381,7 @@ fn update_apply(u: *mut Updater, restart_args: *mut util.Args) -> u32 {
     var hex: [u8; 64] = [0; 64]
     var sz: u64 = 0
     if !hash_file(sp, (&hex[0]) as u64, &sz) ||
-        !rt.mem_eq((&hex[0]) as u64, (&(*u).build.sha256[0]) as u64, 64) {
+        !rt.mem_eq((&hex[0]) as u64, (&(*u).st.sha[0]) as u64, 64) {
         fs.remove(sp) catch false
         st_fail(u, UE_HASH, "")
         return platform.AP_NO_NEW
@@ -1399,7 +1412,7 @@ fn update_apply(u: *mut Updater, restart_args: *mut util.Args) -> u32 {
     config.set_str(&(*u).state, "pending.state", "applied")
     config.set_str(&(*u).state, "pending.from", appinfo.app_version())
     config.set_str(&(*u).state, "pending.to", status_version(&(*u).st))
-    config.set_str(&(*u).state, "pending.sha", str { p: (&(*u).build.sha256[0]) as *mut u8, n: 64 })
+    config.set_str(&(*u).state, "pending.sha", str { p: (&(*u).st.sha[0]) as *mut u8, n: 64 })
     config.set_int(&(*u).state, "pending.started", time.now_unix_ms() / 1000)
     config.set_int(&(*u).state, "pending.tries", 0)
     config.config_save(&(*u).state)
@@ -1470,28 +1483,38 @@ fn update_supervise(u: *mut Updater) -> bool {
     rt.buf_free(&pp)
     var healthy: bool = false
     var new_pid: i64 = 0
+    var seen_held: bool = false
     var reason: str = "no confirmation in time"
+    var lp: rt.Buf = rt.buf_new()
+    state_file(u, "running.lock", &lp)
+    let lock_path: str = util.buf_to_str_copy(&lp)
+    rt.buf_free(&lp)
     while true {
         if fs.exists(healthy_path) {
             healthy = true
             break
         }
-        // the new process announces its pid at boot; if it is gone before
-        // it confirmed, there is no point waiting any longer
+        // The new process takes `running.lock` in update_boot and holds it
+        // for as long as it lives. Once it has been seen holding it and the
+        // lock is free again without a confirmation, it died: no point in
+        // waiting out the rest of the time.
+        let held: bool = platform.plat_lock_held(lock_path)
+        if held {
+            seen_held = true
+        } else if seen_held && !fs.exists(healthy_path) {
+            reason = "the new version exited"
+            break
+        }
         var pb: rt.Buf = rt.buf_new()
         let n: usize = fs.read_file(pid_path, &pb) catch 0
         if n > 0 {
             new_pid = num_at(rt.buf_ptr(&pb), n) as i64
         }
         rt.buf_free(&pb)
-        if new_pid > 0 && !platform.plat_pid_alive(new_pid) && !fs.exists(healthy_path) {
-            reason = "the new version exited"
-            break
-        }
         if (now_ms() - t0) / 1000 as u64 >= limit as u64 {
             break
         }
-        platform.plat_sleep_ms(200)
+        platform.plat_sleep_ms(100)
     }
     if healthy {
         log.log_info("update", "the new version confirmed")
@@ -1508,7 +1531,7 @@ fn update_supervise(u: *mut Updater) -> bool {
         let exe_s: str = util.buf_to_str_copy(&exe)
         let bak_s: str = util.buf_to_str_copy(&backup)
         let rc: u32 = platform.plat_rollback(exe_s, bak_s)
-        remember_bad_build(u, str { p: (&(*u).build.sha256[0]) as *mut u8, n: 64 })
+        remember_bad_build(u, str { p: (&(*u).st.sha[0]) as *mut u8, n: 64 })
         config.set_str(&(*u).state, "pending.state", "rolledback")
         config.set_str(&(*u).state, "rollback.reason", reason)
         config.set_str(&(*u).state, "rollback.version", status_version(&(*u).st))
@@ -1570,6 +1593,21 @@ fn update_boot(u: *mut Updater) -> u32 {
         worker_run(u, op)
         platform.plat_exit(0)
     }
+    // every normal start holds running.lock for as long as it lives: that is
+    // how an old version supervising an update sees the new one die
+    var rl: rt.Buf = rt.buf_new()
+    state_file(u, "running.lock", &rl)
+    var tries_l: u32 = 0
+    while tries_l < 4 && G_RUN_LOCK < 0 {
+        G_RUN_LOCK = platform.plat_lock(util.buf_to_str_copy(&rl))
+        if G_RUN_LOCK == -1 {
+            platform.plat_sleep_ms(60)
+        } else if G_RUN_LOCK == -2 {
+            break
+        }
+        tries_l = tries_l + 1
+    }
+    rt.buf_free(&rl)
     // a process that was started by an update announces itself
     var pp: rt.Buf = rt.buf_new()
     state_file(u, "running.pid", &pp)

@@ -1,0 +1,502 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/platform_macos.fi -- THE PLATFORM LAYER, macOS.
+//
+// ##########################  UNTESTED  ##########################
+// Firn has NO macOS target today: no Mach-O writer, no libSystem binding,
+// no window backend (lib/window has x11, win32, android, osum). This file is
+// the macOS side of the appkit contract (lib/appkit/platform.fi) written
+// against the macOS API as documented, so that the day a Mach-O target
+// exists the platform is a matter of making this file compile and running
+// tools/appkit/e2e.sh. Nothing in it has run. What `tools/appkit/
+// platforms.sh` checks is only that it exports the same names as the other
+// platform files and that it type-checks (`firnc --emit=asm`).
+//
+// WHAT IT ASSUMES
+//   * `extern fn` names resolve to libSystem symbols (System V calling
+//     convention on x86_64; AAPCS64 on arm64 -- the same as Linux's).
+//   * the program is either a bare Mach-O file (updated like a Linux
+//     binary: rename over it) or lives in an application bundle
+//     `Name.app/Contents/MacOS/name`, in which case the UNIT OF UPDATE is the
+//     bundle: the store's `macos-app` build is a ZIP with one top-level
+//     `Name.app`, extracted next to the old bundle and renamed into place.
+//   * downloaded by the program itself, a file carries no quarantine
+//     attribute; an unsigned bundle will still be refused by Gatekeeper on
+//     the user's machine unless it is signed (the release script's job).
+//   * no threads (no Mach-O target to say otherwise): the updater runs its
+//     worker as a second process.
+//
+// DIRECTORIES (Apple's guidelines)
+//   config  ~/Library/Application Support/<app>
+//   data    ~/Library/Application Support/<app>
+//   state   ~/Library/Application Support/<app>/state
+//   cache   ~/Library/Caches/<app>
+//   log     ~/Library/Logs/<app>
+import std.rt
+import std.fs
+import std.time
+import appkit.util
+
+export {
+    plat_init, plat_os, plat_arch, plat_id, plat_art, plat_argc, plat_arg,
+    plat_env_get, plat_dir, plat_exe_path, plat_self_pid, plat_pid_alive,
+    plat_kill, plat_spawn_detached, plat_lock, plat_unlock, plat_lock_held,
+    plat_apply, plat_rollback, plat_can_write_beside, plat_threads,
+    plat_can_self_update, plat_install_hint, plat_exit, plat_sleep_ms,
+    plat_file_copy, plat_chmod_exec, plat_path_sep, plat_stage_path,
+    plat_locale, plat_swap_kind, SWAP_FILES, SWAP_INSTALLER,
+    DIR_CONFIG, DIR_DATA, DIR_STATE, DIR_CACHE, DIR_LOG,
+    AP_OK, AP_NO_NEW, AP_BACKUP, AP_RENAME, AP_PERM, AP_UNSUPPORTED,
+    AP_STAGED,
+}
+
+const DIR_CONFIG: u32 = 0
+const DIR_DATA: u32 = 1
+const DIR_STATE: u32 = 2
+const DIR_CACHE: u32 = 3
+const DIR_LOG: u32 = 4
+
+const AP_OK: u32 = 0
+const AP_NO_NEW: u32 = 1
+const AP_BACKUP: u32 = 2
+const AP_RENAME: u32 = 3
+const AP_PERM: u32 = 4
+const AP_UNSUPPORTED: u32 = 5
+const AP_STAGED: u32 = 6
+
+const SWAP_FILES: u32 = 0
+const SWAP_INSTALLER: u32 = 1
+
+// libSystem
+extern fn _NSGetExecutablePath(buf: u64, size: u64) -> i32;
+extern fn uname(buf: u64) -> i32;
+extern fn getpid() -> i32;
+extern fn kill(pid: i32, sig: i32) -> i32;
+extern fn fork() -> i32;
+extern fn execve(path: u64, argv: u64, envp: u64) -> i32;
+extern fn waitpid(pid: i32, status: u64, options: i32) -> i32;
+extern fn setsid() -> i32;
+extern fn _exit(code: i32);
+extern fn open(path: u64, flags: i32, mode: i32) -> i32;
+extern fn close(fd: i32) -> i32;
+extern fn read(fd: i32, buf: u64, n: usize) -> i64;
+extern fn write(fd: i32, buf: u64, n: usize) -> i64;
+extern fn flock(fd: i32, op: i32) -> i32;
+extern fn chmod(path: u64, mode: i32) -> i32;
+extern fn rename(from: u64, to: u64) -> i32;
+
+// macOS values (not Linux's): O_CREAT 0x200, O_TRUNC 0x400, O_WRONLY 1,
+// O_RDWR 2, O_NONBLOCK 4; LOCK_EX 2, LOCK_NB 4, LOCK_UN 8
+const O_RDONLY: i32 = 0
+const O_RDWR_CREAT: i32 = 514
+const O_WRITE_NEW: i32 = 1537
+const LOCK_EX_NB: i32 = 6
+
+static mut G_START: u64 = 0
+static mut G_ARCH: [u8; 16] = [0; 16]
+static mut G_NARCH: usize = 0
+static mut G_ID: [u8; 32] = [0; 32]
+static mut G_NID: usize = 0
+
+fn plat_init(start: u64) {
+    G_START = start
+}
+
+fn plat_os() -> str {
+    return "macos"
+}
+
+fn plat_path_sep() -> str {
+    return "/"
+}
+
+fn plat_argc() -> usize {
+    return rt.arg_count(G_START)
+}
+
+fn plat_arg(i: usize) -> str {
+    let p: u64 = rt.arg_ptr(G_START, i)
+    if p == 0 as u64 {
+        return ""
+    }
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+// struct utsname on macOS: five fields of 256 octets; machine is the fifth
+fn plat_arch() -> str {
+    if G_NARCH == 0 {
+        var u: [u8; 1280] = [0; 1280]
+        var out: str = "x86_64"
+        if uname((&u[0]) as u64) == 0 {
+            var n: usize = 0
+            while n < 255 && u[1024 + n] != 0 as u8 {
+                n = n + 1
+            }
+            let m: str = str { p: (&u[1024]) as *mut u8, n: n }
+            if m == "arm64" || m == "aarch64" {
+                out = "aarch64"
+            }
+        }
+        rt.mem_copy((&G_ARCH[0]) as u64, out.p as u64, out.n)
+        G_NARCH = out.n
+    }
+    return str { p: (&G_ARCH[0]) as *mut u8, n: G_NARCH }
+}
+
+fn plat_id() -> str {
+    if G_NID == 0 {
+        let a: str = plat_arch()
+        rt.mem_copy((&G_ID[0]) as u64, "macos-".p as u64, 6)
+        rt.mem_copy((&G_ID[0]) as u64 + 6 as u64, a.p as u64, a.n)
+        G_NID = 6 + a.n
+    }
+    return str { p: (&G_ID[0]) as *mut u8, n: G_NID }
+}
+
+// a bundle is updated as a bundle, a bare binary as a file
+fn plat_art() -> str {
+    var p: rt.Buf = rt.buf_new()
+    var bundle: bool = false
+    if plat_exe_path(&p) {
+        bundle = bundle_of(str { p: rt.buf_data(&p), n: rt.buf_len(&p) }) > 0
+    }
+    rt.buf_free(&p)
+    if bundle {
+        return "macos-app"
+    }
+    return "bin"
+}
+
+// length of the path up to and including ".app" when `exe` is inside one
+// (".../Name.app/Contents/MacOS/name"), else 0
+fn bundle_of(exe: str) -> usize {
+    var i: usize = 0
+    while i + 5 <= exe.n {
+        if rt.mem_eq(exe.p as u64 + i as u64, ".app/".p as u64, 5) {
+            return i + 4
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn plat_env_get(name: str, out: *mut rt.Buf) -> bool {
+    if G_START == 0 as u64 {
+        return false
+    }
+    let argc: usize = rt.arg_count(G_START)
+    var i: usize = argc + 2
+    while true {
+        let p: u64 = rt.ld64(G_START, i)
+        if p == 0 as u64 {
+            return false
+        }
+        let n: usize = rt.c_length(p)
+        if n > name.n && rt.ld8(p, name.n) == 61 as u8 && rt.mem_eq(p, name.p as u64, name.n) {
+            rt.buf_clear(out)
+            rt.buf_push_bytes(out, p + name.n as u64 + 1 as u64, n - name.n - 1)
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn plat_dir(kind: u32, app: str, vendor: str, out: *mut rt.Buf) -> bool {
+    var ov: rt.Buf = rt.buf_new()
+    if plat_env_get("APPKIT_HOME", &ov) && rt.buf_len(&ov) > 0 {
+        rt.buf_clear(out)
+        rt.buf_push_bytes(out, rt.buf_ptr(&ov), rt.buf_len(&ov))
+        rt.buf_free(&ov)
+        rt.buf_push(out, 47 as u8)
+        if kind == DIR_CONFIG { util.buf_push_str(out, "config") }
+        else if kind == DIR_DATA { util.buf_push_str(out, "data") }
+        else if kind == DIR_STATE { util.buf_push_str(out, "state") }
+        else if kind == DIR_CACHE { util.buf_push_str(out, "cache") }
+        else { util.buf_push_str(out, "logs") }
+        rt.buf_push(out, 47 as u8)
+        util.buf_push_str(out, app)
+        return true
+    }
+    rt.buf_free(&ov)
+    var home: rt.Buf = rt.buf_new()
+    if !plat_env_get("HOME", &home) || rt.buf_len(&home) == 0 {
+        rt.buf_free(&home)
+        return false
+    }
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, rt.buf_ptr(&home), rt.buf_len(&home))
+    rt.buf_free(&home)
+    if kind == DIR_CACHE {
+        util.buf_push_str(out, "/Library/Caches/")
+        util.buf_push_str(out, app)
+    } else if kind == DIR_LOG {
+        util.buf_push_str(out, "/Library/Logs/")
+        util.buf_push_str(out, app)
+    } else {
+        util.buf_push_str(out, "/Library/Application Support/")
+        util.buf_push_str(out, app)
+        if kind == DIR_STATE {
+            util.buf_push_str(out, "/state")
+        }
+    }
+    return true
+}
+
+// the executable; for a bundle the update unit is the .app, see apply
+fn plat_exe_path(out: *mut rt.Buf) -> bool {
+    var buf: [u8; 4096] = [0; 4096]
+    var size: [u32; 2] = [4096 as u32, 0 as u32]
+    if _NSGetExecutablePath((&buf[0]) as u64, (&size[0]) as u64) != 0 {
+        return false
+    }
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, (&buf[0]) as u64, rt.c_length((&buf[0]) as u64))
+    return true
+}
+
+fn plat_self_pid() -> i64 {
+    return getpid() as i64
+}
+
+fn plat_pid_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false
+    }
+    let r: i32 = kill(pid as i32, 0)
+    return r == 0
+}
+
+fn plat_kill(pid: i64) -> bool {
+    if pid <= 1 {
+        return false
+    }
+    return kill(pid as i32, 9) == 0
+}
+
+fn plat_sleep_ms(ms: u64) {
+    time.sleep_ms(ms)
+}
+
+fn plat_exit(code: i64) {
+    _exit(code as i32)
+}
+
+fn plat_spawn_detached(path: str, args: *mut util.Args) -> bool {
+    var cpath: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&cpath, path.p as u64, path.n)
+    rt.buf_push(&cpath, 0 as u8)
+    let na: usize = util.args_count(args)
+    var argv: rt.Buf = rt.buf_new()
+    var ok: bool = util.buf_room(&argv, (na + 2) * 8)
+    var envp: u64 = 0
+    if G_START != 0 as u64 {
+        envp = G_START + ((rt.arg_count(G_START) + 2) * 8) as u64
+    }
+    if ok {
+        rt.buf_set_len(&argv, (na + 2) * 8)
+        let base: u64 = rt.buf_ptr(&argv)
+        rt.st64(base, 0, rt.buf_ptr(&cpath))
+        var at: u64 = rt.buf_ptr(&(*args).buf)
+        var k: usize = 0
+        while k < na {
+            rt.st64(base, k + 1, at)
+            at = at + rt.c_length(at) as u64 + 1 as u64
+            k = k + 1
+        }
+        rt.st64(base, na + 1, 0 as u64)
+        let pid: i32 = fork()
+        if pid < 0 {
+            ok = false
+        } else if pid == 0 {
+            setsid()
+            let pid2: i32 = fork()
+            if pid2 == 0 {
+                execve(rt.buf_ptr(&cpath), base, envp)
+                _exit(127)
+            }
+            _exit(0)
+        } else {
+            var status: [i32; 2] = [0; 2]
+            waitpid(pid, (&status[0]) as u64, 0)
+        }
+    }
+    rt.buf_free(&argv)
+    rt.buf_free(&cpath)
+    return ok
+}
+
+fn plat_lock(path: str) -> i64 {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    let fd: i32 = open(rt.buf_ptr(&c), O_RDWR_CREAT, 420)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return -2
+    }
+    if flock(fd, LOCK_EX_NB) != 0 {
+        close(fd)
+        return -1
+    }
+    var t: rt.Buf = rt.buf_new()
+    util.push_dec_pad(&t, getpid() as u64, 10)
+    rt.buf_push(&t, 10 as u8)
+    write(fd, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+    return fd as i64
+}
+
+fn plat_unlock(h: i64) {
+    if h >= 0 {
+        close(h as i32)
+    }
+}
+
+// flock locks belong to the open file description: a second open + flock in
+// this process conflicts with the first, so the probe works from inside as
+// well as from outside
+fn plat_lock_held(path: str) -> bool {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    let fd: i32 = open(rt.buf_ptr(&c), O_RDONLY, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return false
+    }
+    let r: i32 = flock(fd, LOCK_EX_NB)
+    close(fd)
+    return r != 0
+}
+
+fn plat_chmod_exec(path: str) -> bool {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    let r: i32 = chmod(rt.buf_ptr(&c), 493)
+    rt.buf_free(&c)
+    return r == 0
+}
+
+fn plat_file_copy(src: str, dst: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(src, &b) catch 4294967295
+    if n == 4294967295 {
+        rt.buf_free(&b)
+        return false
+    }
+    let w: usize = fs.write_file(dst, rt.buf_ptr(&b), rt.buf_len(&b)) catch 4294967295
+    let ok: bool = w == rt.buf_len(&b)
+    rt.buf_free(&b)
+    return ok && plat_chmod_exec(dst)
+}
+
+fn plat_can_write_beside(exe: str) -> bool {
+    var target: str = exe
+    let bn: usize = bundle_of(exe)
+    if bn > 0 {
+        target = str { p: exe.p, n: bn }
+    }
+    let probe: str = target + ".appkit-probe"
+    let wrote: usize = fs.write_file(probe, "x".p as u64, 1) catch 0
+    let ok: bool = wrote == 1
+    if ok {
+        let rm: bool = fs.remove(probe) catch false
+    }
+    return ok
+}
+
+fn plat_swap_kind() -> u32 {
+    return SWAP_FILES
+}
+
+// a bare binary: <exe>.new; a bundle: <Name.app>.update.zip next to it
+fn plat_stage_path(exe: str, out: *mut rt.Buf) -> bool {
+    if exe.n == 0 {
+        return false
+    }
+    rt.buf_clear(out)
+    let bn: usize = bundle_of(exe)
+    if bn > 0 {
+        rt.buf_push_bytes(out, exe.p as u64, bn)
+        util.buf_push_str(out, ".update.zip")
+    } else {
+        util.buf_push_str(out, exe)
+        util.buf_push_str(out, ".new")
+    }
+    return true
+}
+
+// A bare binary: copy aside, rename over (as on Linux). A bundle: the staged
+// ZIP must be extracted first -- NOT WRITTEN YET: it needs lib/zip's reader
+// to keep the executable bit of every entry, which it does not expose.
+// Reported as AP_UNSUPPORTED rather than guessed.
+fn plat_apply(newf: str, exe: str, backup: str) -> u32 {
+    if bundle_of(exe) > 0 {
+        return AP_UNSUPPORTED
+    }
+    if !fs.is_file(newf) {
+        return AP_NO_NEW
+    }
+    if !plat_file_copy(exe, backup) {
+        return AP_BACKUP
+    }
+    if !plat_chmod_exec(newf) {
+        return AP_PERM
+    }
+    let ok: bool = fs.rename(newf, exe) catch | e | false
+    if !ok {
+        return AP_RENAME
+    }
+    return AP_OK
+}
+
+fn plat_rollback(exe: str, backup: str) -> u32 {
+    if !fs.is_file(backup) {
+        return AP_NO_NEW
+    }
+    let ok: bool = fs.rename(backup, exe) catch | e | false
+    if !ok {
+        return AP_RENAME
+    }
+    return AP_OK
+}
+
+fn plat_threads() -> bool {
+    return false
+}
+
+fn plat_can_self_update() -> bool {
+    return true
+}
+
+fn plat_install_hint() -> str {
+    return "The program is in a folder you may not change. Drag it into your own Applications folder (~/Applications) to let it update itself."
+}
+
+// the user's language: LANG / LC_ALL of the environment, else English
+fn plat_locale(out: *mut rt.Buf) -> bool {
+    var v: rt.Buf = rt.buf_new()
+    var got: bool = false
+    var names: [str; 3] = ["LC_ALL", "LC_MESSAGES", "LANG"]
+    var i: usize = 0
+    while i < 3 && !got {
+        if plat_env_get(names[i], &v) && rt.buf_len(&v) >= 2 {
+            let a: u8 = rt.ld8(rt.buf_ptr(&v), 0)
+            let b: u8 = rt.ld8(rt.buf_ptr(&v), 1)
+            if a >= 97 as u8 && a <= 122 as u8 && b >= 97 as u8 && b <= 122 as u8 {
+                rt.buf_clear(out)
+                rt.buf_push(out, a)
+                rt.buf_push(out, b)
+                got = true
+            }
+        }
+        i = i + 1
+    }
+    rt.buf_free(&v)
+    if !got {
+        rt.buf_clear(out)
+        util.buf_push_str(out, "en")
+    }
+    return got
+}

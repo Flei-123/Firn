@@ -31,6 +31,7 @@
 //   plat_self_pid() / plat_pid_alive(pid) / plat_kill(pid)
 //   plat_spawn_detached(path, args)   start a program, do not wait
 //   plat_lock(path) / plat_unlock(h)  the single instance lock
+//   plat_lock_held(path)              is that lock held by a LIVE process?
 //   plat_apply(newf, exe, backup)     put `newf` in place of `exe`, keeping
 //        the old one as `backup` (an atomic rename where the OS has one)
 //   plat_rollback(exe, backup)        put the backup back
@@ -39,6 +40,7 @@
 //   plat_stage_path(exe, out)         where the downloaded file is kept until
 //        it is applied (next to the executable, so the rename stays on one
 //        volume; Android/OrientOS: a cache file)
+//   plat_locale(out)                  the user's language, 2 letters: "de"
 //   plat_threads()                    does thread_start work here?
 //   plat_can_self_update()            may this program replace itself?
 //   plat_install_hint()               a sentence for the user when it may not
@@ -64,10 +66,11 @@ import appkit.util
 export {
     plat_init, plat_os, plat_arch, plat_id, plat_art, plat_argc, plat_arg,
     plat_env_get, plat_dir, plat_exe_path, plat_self_pid, plat_pid_alive,
-    plat_kill, plat_spawn_detached, plat_lock, plat_unlock, plat_apply,
+    plat_kill, plat_spawn_detached, plat_lock, plat_unlock, plat_lock_held,
+    plat_apply,
     plat_rollback, plat_can_write_beside, plat_threads,
     plat_can_self_update, plat_install_hint, plat_exit, plat_sleep_ms,
-    plat_file_copy, plat_chmod_exec, plat_path_sep, plat_stage_path,
+    plat_file_copy, plat_chmod_exec, plat_path_sep, plat_stage_path, plat_locale,
     plat_swap_kind, SWAP_FILES, SWAP_INSTALLER,
     DIR_CONFIG, DIR_DATA, DIR_STATE, DIR_CACHE, DIR_LOG,
     AP_OK, AP_NO_NEW, AP_BACKUP, AP_RENAME, AP_PERM, AP_UNSUPPORTED,
@@ -241,7 +244,26 @@ fn env_or(name: str, dflt: str, out: *mut rt.Buf) {
 //   cache   $XDG_CACHE_HOME  or ~/.cache           /<app>
 //   log     <state>/logs
 // `app` is the directory name; `vendor` is not used on Linux.
+// $APPKIT_HOME, when set, replaces all of it (see below).
 fn plat_dir(kind: u32, app: str, vendor: str, out: *mut rt.Buf) -> bool {
+    // APPKIT_HOME relocates every directory (tests, portable installs):
+    // $APPKIT_HOME/{config,data,state,cache,logs}/<app>
+    var ov: rt.Buf = rt.buf_new()
+    if plat_env_get("APPKIT_HOME", &ov) && rt.buf_len(&ov) > 0 {
+        rt.buf_clear(out)
+        rt.buf_push_bytes(out, rt.buf_ptr(&ov), rt.buf_len(&ov))
+        rt.buf_free(&ov)
+        rt.buf_push(out, 47 as u8)
+        if kind == DIR_CONFIG { util.buf_push_str(out, "config") }
+        else if kind == DIR_DATA { util.buf_push_str(out, "data") }
+        else if kind == DIR_STATE { util.buf_push_str(out, "state") }
+        else if kind == DIR_CACHE { util.buf_push_str(out, "cache") }
+        else { util.buf_push_str(out, "logs") }
+        rt.buf_push(out, 47 as u8)
+        util.buf_push_str(out, app)
+        return true
+    }
+    rt.buf_free(&ov)
     var home: rt.Buf = rt.buf_new()
     env_or("HOME", "", &home)
     var base: rt.Buf = rt.buf_new()
@@ -438,6 +460,28 @@ fn plat_lock(path: str) -> i64 {
     return fd
 }
 
+// Is `path` locked by a process other than this one? (POSIX F_GETLK.) A
+// file that is not there is not held.
+fn plat_lock_held(path: str) -> bool {
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, path.p as u64, path.n)
+    rt.buf_push(&c, 0 as u8)
+    let fd: i64 = syscall(SYS_OPEN, rt.buf_ptr(&c) as i64, O_RDONLY | 524288, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    if fd < 0 {
+        return false
+    }
+    var l: FlockRec = FlockRec { l_type: 1 as i16, l_whence: 0 as i16, pad: 0 as i32,
+        l_start: 0, l_len: 0, l_pid: 0 as i32, pad2: 0 as i32 }
+    let r: i64 = syscall(SYS_FCNTL, fd, 5, (&l) as i64, 0, 0, 0)
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    if r < 0 {
+        return false
+    }
+    // F_UNLCK (2): nothing would stop us, so nobody holds it
+    return l.l_type != 2 as i16
+}
+
 fn plat_unlock(h: i64) {
     if h >= 0 {
         syscall(SYS_CLOSE, h, 0, 0, 0, 0, 0)
@@ -555,6 +599,36 @@ fn plat_rollback(exe: str, backup: str) -> u32 {
         return AP_RENAME
     }
     return AP_OK
+}
+
+// the user's language as two lower case letters ("de"), "en" when unknown.
+// LC_ALL, then LC_MESSAGES, then LANG ("de_DE.UTF-8" -> "de").
+fn plat_locale(out: *mut rt.Buf) -> bool {
+    var v: rt.Buf = rt.buf_new()
+    var got: bool = false
+    var names: [str; 3] = ["LC_ALL", "LC_MESSAGES", "LANG"]
+    var i: usize = 0
+    while i < 3 && !got {
+        if plat_env_get(names[i], &v) && rt.buf_len(&v) >= 2 {
+            let p: u64 = rt.buf_ptr(&v)
+            let a: u8 = rt.ld8(p, 0)
+            let b: u8 = rt.ld8(p, 1)
+            let alpha: bool = a >= 97 as u8 && a <= 122 as u8 && b >= 97 as u8 && b <= 122 as u8
+            if alpha {
+                rt.buf_clear(out)
+                rt.buf_push(out, a)
+                rt.buf_push(out, b)
+                got = true
+            }
+        }
+        i = i + 1
+    }
+    rt.buf_free(&v)
+    if !got {
+        rt.buf_clear(out)
+        util.buf_push_str(out, "en")
+    }
+    return got
 }
 
 fn plat_swap_kind() -> u32 {

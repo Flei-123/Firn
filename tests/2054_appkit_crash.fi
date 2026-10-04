@@ -1,0 +1,122 @@
+// expect_exit: 0
+// tests/2054_appkit_crash.fi -- lib/appkit/crash.fi + single_instance.fi: the
+// run marker, the report of a run that did not end cleanly, the newest-five
+// rule, a clean exit leaves nothing, the instance lock.
+//
+// One process plays both runs: "run 1" begins and is never ended (the marker
+// stays full, the lock is let go by hand to stand for the death of the
+// process); "run 2" begins and must find a report.
+import std.rt
+import std.fs
+import appkit.crash
+import appkit.log
+import appkit.appinfo
+import appkit.platform
+import appkit.single_instance
+import std.dir
+import appkit.util
+
+fn exists_report(p: *mut rt.Buf) -> bool {
+    return crash.crash_pending(p)
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    platform.plat_init(start)
+    var home: rt.Buf = rt.buf_new()
+    util.buf_push_str(&home, "/tmp/firn_appkit_crash_2054_")
+    rt.buf_push_dec_i64(&home, syscall(39, 0, 0, 0, 0, 0, 0))
+    let h: str = util.buf_to_str_copy(&home)
+    fs.remove_tree(h) catch false
+    fs.mkdir_all(h + "/state") catch false
+    // the state directory comes from XDG_STATE_HOME, which the start block
+    // of this test does not have: make the platform layer see one through a
+    // fake start block (argv0, no args, envp with one entry)
+    var env: rt.Buf = rt.buf_new()
+    util.buf_push_str(&env, "XDG_STATE_HOME=")
+    util.buf_push_str(&env, h + "/state")
+    rt.buf_push(&env, 0 as u8)
+    var a0: [u8; 2] = "t\0"
+    var block: [u64; 8] = [0; 8]
+    block[0] = 1
+    block[1] = (&a0[0]) as u64
+    block[2] = 0
+    block[3] = rt.buf_ptr(&env)
+    block[4] = 0
+    platform.plat_init((&block[0]) as u64)
+
+    var spec: appinfo.AppSpec = appinfo.AppSpec { id: "crashtest", name: "Crash Test",
+        vendor: "V", version: "1.2.3", build: 0, channel: "stabil",
+        store_url: "http://127.0.0.1/", store_key: "0000000000000000000000000000000000000000000000000000000000000000",
+        android_id: "" }
+    if !appinfo.appinfo_ready() && !appinfo.appinfo_init(spec) { return 1 }
+    var sd: rt.Buf = rt.buf_new()
+    if !platform.plat_dir(platform.DIR_STATE, "crashtest", "V", &sd) { return 2 }
+    if !util.buf_eq_str(&sd, h + "/state/crashtest") { return 3 }
+    log.log_open(util.buf_to_str_copy(&sd) + "/logs", "app", log.LOG_INFO, 65536, 2)
+    log.log_info("test", "run one starts")
+
+    // ---- run 1: begins, never ends
+    let wrote1: bool = crash.crash_begin()
+    if wrote1 { return 10 }                      // nothing to judge yet
+    var p: rt.Buf = rt.buf_new()
+    if exists_report(&p) { return 11 }
+    // standard error of that run, as crash_begin would have redirected it
+    fs.write_file(util.buf_to_str_copy(&sd) + "/stderr.txt", "panic: index out of range\n".p as u64, 26) catch 0
+    log.log_error("test", "something went wrong in run one")
+    // the process "dies": its lock goes (the file content stays)
+    crash.crash_release_for_test()
+
+    // ---- run 2
+    let wrote2: bool = crash.crash_begin()
+    if !wrote2 { return 12 }
+    if !exists_report(&p) { return 13 }
+    var rep: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(util.buf_to_str_copy(&p), &rep) catch 0
+    if n == 0 { return 14 }
+    var has_ver: bool = false
+    var has_panic: bool = false
+    var has_log: bool = false
+    var i: usize = 0
+    while i + 5 <= n {
+        if rt.mem_eq(rt.buf_ptr(&rep) + i as u64, "1.2.3".p as u64, 5) { has_ver = true }
+        i = i + 1
+    }
+    i = 0
+    while i + 24 <= n {
+        if rt.mem_eq(rt.buf_ptr(&rep) + i as u64, "panic: index out of range".p as u64, 24) { has_panic = true }
+        if rt.mem_eq(rt.buf_ptr(&rep) + i as u64, "something went wrong".p as u64, 20) { has_log = true }
+        i = i + 1
+    }
+    if !has_ver || !has_panic || !has_log { return 16 }
+
+    // ---- run 2 ends cleanly: the next begin writes nothing
+    crash.crash_end()
+    let wrote3: bool = crash.crash_begin()
+    if wrote3 { return 20 }
+    crash.crash_end()
+
+    // ---- the newest five are kept
+    var k: usize = 0
+    while k < 8 {
+        crash.crash_report("explicit report")
+        k = k + 1
+    }
+    var count: usize = 0
+    var dd: dir.Dir = dir.open(util.buf_to_str_copy(&sd) + "/crash")
+    while dir.next(&dd) {
+        if util.starts_with(dd.name, "crash-") { count = count + 1 }
+    }
+    dir.close(&dd)
+    if count != crash.CRASH_KEEP { return 30 }
+    crash.crash_clear()
+    if crash.crash_pending(&p) { return 31 }
+
+    // ---- the instance lock
+    if single_instance.single_acquire(0) != single_instance.SI_OK { return 40 }
+    if !single_instance.single_held() { return 41 }
+    single_instance.single_release()
+    if single_instance.single_held() { return 42 }
+    fs.remove_tree(h) catch false
+    return 0
+}
