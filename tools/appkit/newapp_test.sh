@@ -8,6 +8,7 @@
 #   3. the program starts on an X server (Xvfb) with --selftest: 30 frames, clean exit, a log line
 #   4. release.sh (dry run): builds, publishes into a throw-away store with `store add-app`,
 #      verifies it -- and the catalog it made names bin:probe-app with the right version
+#   4b. build-android.sh: the APK with both ABIs and the receiver class (when the Android build tools are there)
 #   5. the same for a project generated with another id/vendor (substitutions are not hard coded)
 #
 # Needs fui.kit (lib/fui/kit.fi) and an X server (Xvfb) for step 3; without them
@@ -36,7 +37,7 @@ if [ ! -f "$ROOT/lib/fui/kit.fi" ]; then echo "SKIP: lib/fui/kit.fi is not in th
 echo "== 1. generate"
 out=$(bash tools/newapp.sh "Probe App" probe-app --dir "$W/p1" --store-key $KEY --vendor ProbeCo --android-id org.probe.app 2>&1) \
     && ok "newapp.sh ran" || bad "newapp.sh" "$out"
-for f in VERSION build.sh build-windows.sh build-android.sh release.sh src/main.fi src/ui.fi src/appspec.fi locale/en.opmsg locale/de.opmsg README.md .gitignore; do
+for f in VERSION build.sh build-windows.sh build-android.sh release.sh src/main.fi src/ui.fi src/appspec.fi src/locale/en.opmsg src/locale/de.opmsg README.md .gitignore; do
     [ -f "$W/p1/$f" ] && ok "file $f" || bad "file $f is missing"
 done
 if grep -rq '@[A-Z_]*@' "$W/p1" --include='*' 2>/dev/null; then bad "an unfilled placeholder is left" "$(grep -rn '@[A-Z_]*@' "$W/p1" | head -3)"; else ok "every placeholder is filled"; fi
@@ -74,6 +75,32 @@ if [ -n "$TOOL" ] && python3 -c 'import cryptography' 2>/dev/null; then
     [ ! -d "$W/real/speicher" ] && ok "a real store needs the typed YES (nothing was written)" || bad "a store was written without a yes"
 else
     echo "  --    no store tool / python3 cryptography: the release is not tested"
+fi
+
+echo "== 4b. the Android build (APK, arm64 + x86_64, with the receiver class)"
+SDKDIR=${SDK:-/root/android-sdk}
+AAPT2=$(ls "$SDKDIR"/build-tools/*/aapt2 2>/dev/null | tail -1)
+if [ -d "${NDK:-/root/android-ndk-min}" ] && [ -n "$AAPT2" ] && command -v keytool >/dev/null 2>&1; then
+    if (cd "$W/p1" && FIRN_ROOT=$ROOT FIRNC=$FIRNC KEYSTORE=$W/test.jks bash build-android.sh >"$W/android.log" 2>&1); then
+        ok "build-android.sh builds the APK"
+    else
+        bad "build-android.sh" "$(tail -6 "$W/android.log")"
+    fi
+    APK=$W/p1/build/probe-app.apk
+    if [ -s "$APK" ]; then
+        badging=$("$AAPT2" dump badging "$APK" 2>/dev/null)
+        echo "$badging" | grep -q "package: name='org.probe.app'" && ok "the package is the android id of the generator" || bad "package name" "$(echo "$badging" | head -2)"
+        echo "$badging" | grep -q 'UPDATE_PACKAGES_WITHOUT_USER_ACTION' && ok "the manifest asks for the installer permissions" || bad "installer permissions missing"
+        python3 - "$APK" <<'PY' && ok "the APK has classes.dex and both native libraries" || bad "APK contents"
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+names = set(z.namelist())
+need = {"classes.dex", "lib/arm64-v8a/libfirnapp.so", "lib/x86_64/libfirnapp.so"}
+sys.exit(0 if need <= names and b"org/firn/FirnInstall" in z.read("classes.dex") else 1)
+PY
+    fi
+else
+    echo "  --    no Android NDK / SDK build tools / keytool: the APK is not built"
 fi
 
 echo "== 5. another project, same generator"

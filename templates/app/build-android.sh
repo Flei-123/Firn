@@ -31,6 +31,7 @@ bash "$FIRN_ROOT/tools/android/build.sh" src/main.fi --name "@NAME@" --package "
     --version-code "$VCODE" --version-name "$VERSION" \
     --permission android.permission.INTERNET \
     --permission android.permission.REQUEST_INSTALL_PACKAGES \
+    --permission android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION \
     --dex build/classes.dex --manifest-extra build/receiver.xml \
     --out "$PWD/build/@ID@.apk"
 echo "built build/@ID@.apk $VERSION (versionCode $VCODE)"

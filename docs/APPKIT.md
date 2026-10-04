@@ -234,8 +234,8 @@ channels of the store format are not implemented in the client.
 |---|---|
 | `src/main.fi` | the start sequence of section 2 |
 | `src/appspec.fi` | name, id, vendor, store address and key (the key from `--store-key`, `$FIRN_STORE_KEY`, `/srv/store/oeffentlich.key`, or -- trust on first use, shown with its fingerprint -- the store's `oeffentlich.key`) |
-| `src/ui.fi` | a window on `fui.kit`: sidebar with Home, Settings, Updates and About, dark with a green accent, a banner and a toast when an update is ready, the "restart and install" button |
-| `locale/en.opmsg`, `de.opmsg` | the program's own texts |
+| `src/ui.fi` | a window on `fui.kit`: sidebar with Home, Settings, Updates and About, dark with a green accent, a banner and a toast when an update is ready, the "restart and install" button; a window narrower than 560 logical pixels (a phone upright) folds the sidebar to its icons and gives the banner two rows |
+| `src/locale/en.opmsg`, `de.opmsg` | the program's own texts |
 | `build.sh`, `build-windows.sh`, `build-android.sh` | the three builds; `VERSION` is the only place the version lives; `CHANNEL=` and `STORE=` pick the channel and store |
 | `release.sh` | build -> `store add-app` / `store add` -> verify; `--platforms linux,windows,android`, `--channel`, `--notes`, `--min-version`, `--store-repo`, `--publish-to` |
 
@@ -296,6 +296,10 @@ the same signatures and that each type-checks.
   with another key is refused by Android (`status=5
   INSTALL_FAILED_UPDATE_INCOMPATIBLE`): **keep the signing key**
   (`~/.firn/android.keystore`, see `tools/android/build.sh`).
+* **After the install** the system replaces the app and ends the process; it
+  does not start it again, the user opens the app. (The receiver of a
+  successful install usually runs in a fresh process without a window, so
+  it writes no status file; the new version knows it is new by its version.)
 * **No rollback.** The system owns the replacement; there is no backup file
   (`plat_rollback` answers "unsupported").
 * **No threads.** `thread_start` re-seats the thread pointer (`arch_prctl` /

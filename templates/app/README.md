@@ -55,7 +55,7 @@ channel in its settings (`update.channel`) or the one it was built with
 | `src/main.fi` | start: appinfo, update boot, log, crash marker, single instance, texts, the window, shutdown |
 | `src/appspec.fi` | name, id, vendor, store address and key |
 | `src/ui.fi` | the window: sidebar, Home, Settings, Updates, About, the update banner |
-| `locale/*.opmsg` | your own texts (appkit brings its own) |
+| `src/locale/*.opmsg` | your own texts (appkit brings its own) |
 | `build*.sh`, `release.sh` | build and publish |
 
 Documentation: `docs/APPKIT.md` in the Firn repository.

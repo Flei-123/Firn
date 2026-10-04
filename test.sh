@@ -1580,14 +1580,19 @@ echo "== 76. appkit: the platform files agree, and the update runs end to end ag
 # chunked / redirected / dropped / slow downloads, a cancelled download, the real replacement of
 # the running program, and the rollback when the new version crashes or hangs; and tools/appkit/
 # newapp_test.sh -- tools/newapp.sh makes a project that builds, starts on Xvfb and releases (needs
-# lib/fui/kit.fi). The Windows build
-# under Wine runs the same script with APPKIT_E2E_WINDOWS=1 (about ten minutes). SKIPs (exit 0)
-# without the orientstore tool or python3 cryptography.
+# lib/fui/kit.fi; it builds the Android APK too when the Android build tools are there). The Windows
+# build under Wine runs the same script with APPKIT_E2E_WINDOWS=1 (about ten minutes); the Android
+# update on the emulator (tools/appkit/android_check.sh: PackageInstaller, the system's question, a
+# foreign key refused) with APPKIT_E2E_ANDROID=1 (it starts the AVD "firn" when no device is up).
+# SKIPs (exit 0) without the orientstore tool or python3 cryptography.
 python3 tools/appkit/platforms.py > "$WORK/appkit_platforms.log" 2>&1 && AKRC=0 || AKRC=$?
 bash tools/appkit/e2e.sh > "$WORK/appkit_e2e.log" 2>&1 || AKRC=1
 bash tools/appkit/newapp_test.sh > "$WORK/appkit_newapp.log" 2>&1 || AKRC=1
 if [ "${APPKIT_E2E_WINDOWS:-0}" = "1" ]; then
     E2E_TARGET=windows bash tools/appkit/e2e.sh > "$WORK/appkit_e2e_win.log" 2>&1 || AKRC=1
+fi
+if [ "${APPKIT_E2E_ANDROID:-0}" = "1" ]; then
+    bash tools/appkit/android_check.sh > "$WORK/appkit_android.log" 2>&1 || AKRC=1
 fi
 if [ "$AKRC" -eq 0 ]; then
     ok
