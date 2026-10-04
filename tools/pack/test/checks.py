@@ -342,8 +342,12 @@ def body(tmp):
            "the runtime itself extracts it (no FUSE needed): " + r.stdout.decode()[-150:])
         r = run(j("squashfs-root", "AppRun"), j("ai-ran.txt"))
         ok(r.returncode == 0 and os.path.isfile(j("ai-ran.txt")), "AppRun starts the program")
-        r = run(j("hello.AppImage"), j("ai-ran2.txt"), env=dict(os.environ, APPIMAGE_EXTRACT_AND_RUN="1"))
+        before = set(n for n in os.listdir("/tmp") if n.startswith("appimage_extracted_"))
+        r = run(j("hello.AppImage"), j("ai-ran2.txt"), env=dict(os.environ, APPIMAGE_EXTRACT_AND_RUN="1", TMPDIR=tmp))
         ok(r.returncode == 0 and os.path.isfile(j("ai-ran2.txt")), "APPIMAGE_EXTRACT_AND_RUN=1 runs it")
+        for n in set(os.listdir("/tmp")) - before:                 # the runtime unpacks next to /tmp, not always TMPDIR
+            if n.startswith("appimage_extracted_"):
+                shutil.rmtree(os.path.join("/tmp", n), ignore_errors=True)
         r = run(j("squashfs-root", "usr", "bin", "hello"), j("ai-ran3.txt"))
         shutil.rmtree(j("squashfs-root"), ignore_errors=True)
 

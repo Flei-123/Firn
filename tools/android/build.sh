@@ -214,7 +214,7 @@ EOF
 RESARGS=()
 if [ -n "$ICONRES" ]; then
     "$BT/aapt2" compile --dir "$ICONRES" -o "$BUILD/res.zip"
-    RESARGS=(-R "$BUILD/res.zip")
+    RESARGS=("$BUILD/res.zip")
 fi
 "$BT/aapt2" link -I "$SDK/platforms/android-35/android.jar" \
     --manifest "$MAN" --min-sdk-version "$API" --target-sdk-version 34 \

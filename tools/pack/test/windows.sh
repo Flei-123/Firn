@@ -278,6 +278,19 @@ else
     bad "the window for the Cancel test did not open"
 fi
 
+# a setup.exe without a payload (a damaged download, or the bare stub) says so in a window
+rm -f "$T/gui4.log"
+( wine "$(winp "$T/stub-i.exe")" --log "$(winp "$T/gui4.log")" >/dev/null 2>&1 & )
+EID=""
+for i in $(seq 1 30); do EID=$(xwininfo -root -tree 2>/dev/null | grep -E 'Setup"' | head -1 | awk '{print $1}'); [ -n "$EID" ] && break; sleep 1; done
+check "a setup without payload opens a window with the error" "[ -n \"$EID\" ] && grep -q 'no intact payload' $T/gui4.log"
+if [ -n "$EID" ]; then
+    EX=$(xwininfo -id $EID | sed -n 's/.*Absolute upper-left X: *//p'); EY=$(xwininfo -id $EID | sed -n 's/.*Absolute upper-left Y: *//p')
+    xdotool mousemove $((EX + 540 - 65)) $((EY + 380 - 47)) click 1                  # Close
+    sleep 2
+    check "...and Close ends it" "! xwininfo -id $EID >/dev/null 2>&1"
+fi
+
 if command -v makensis >/dev/null 2>&1; then
     echo "-- the NSIS variant"
     mkdir -p "$T/nsis"
