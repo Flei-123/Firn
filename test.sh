@@ -1660,6 +1660,23 @@ if [ "$UXRC" -eq 0 ]; then
 else
     bad "tools/qr or tools/uiextras failed (see .test-work/qr_run.log, uiextras_run.log)"
     grep -E 'FAIL|DIFF|Traceback|Error' "$WORK/qr_run.log" "$WORK/uiextras_run.log" | head -12 | sed 's/^/   /'
+echo "== 77. downloads and sign-in: net.download, auth.jose/oauth/msa, appkit.fleitec_login (tools/download/, tools/oauth/) =="
+# tests/2140 (download manager against an in-process server), tests/2150-2153 (JWT against tokens signed
+# by Python's cryptography, OAuth units, the Microsoft chain's bodies, Sign in with Fleitec-ID against
+# an in-process ID server) are in section 3. Here: the Python-side servers that misbehave on purpose.
+#   tools/download/run.sh  net.download against fake_server.py (resume, retry, backoff, mirrors, ETag, cancel,
+#                          rate limit, keep-alive; the real Mojang CDN when there is a route); Wine
+#   tools/oauth/run.sh     auth.oauth against fake_idp.py (PKCE, loopback redirect under attack, device flow,
+#                          refresh rotation, id_token refusals, keyring) and auth.msa against fake_msa.py
+#                          (+ the real hosts with bogus credentials when there is a route); Wine
+bash tools/download/run.sh > "$WORK/download.log" 2>&1 && DLRC=0 || DLRC=$?
+bash tools/oauth/run.sh > "$WORK/oauth.log" 2>&1 && OARC=0 || OARC=$?
+grep -E 'passed|SKIP|windows' "$WORK/download.log" "$WORK/oauth.log" | sed 's/^[^:]*://; s/^/   /'
+if [ "$DLRC" -eq 0 ] && [ "$OARC" -eq 0 ]; then
+    ok
+else
+    bad "tools/download/run.sh or tools/oauth/run.sh failed (see .test-work/download.log, oauth.log)"
+    grep -E 'FAIL|Traceback' "$WORK/download.log" "$WORK/oauth.log" | head -12 | sed 's/^/   /' || true
 fi
 
 TOTAL=$((PASS + FAIL))

@@ -32,6 +32,7 @@ Details per platform and the list of what is missing: [section 7](#7-platform-la
 | `update` | the updater: check, download, verify, replace, confirm, roll back; background worker; the status the UI reads |
 | `catalog` | the store's `entry.json` and catalog: signature, freshness, hashes, choosing the build of this platform, comparing versions |
 | `fetch` | one streamed HTTP(S) GET with SHA-256 on the way, progress and cancel (names through `net.dns`, https through `tls.trust`) |
+| `fleitec_login` | "Sign in with Fleitec-ID": login / me / logout against the ID server, token in the keyring (see [OAUTH.md](OAUTH.md)) |
 | `version` | semantic versions (`1.2.3`, `1.2.3-beta.1`) and their order |
 | `config` | settings in one small JSON file, atomic save |
 | `log` | a log file with levels and rotation |

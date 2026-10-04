@@ -156,3 +156,18 @@ compare with are held against it.
 | `lib/fui/kittouch.fi` | tap, double tap, long press, pan with fling, pinch on `lib/window/pointers.fi`'s records | `tools/fui/touch_main.fi` (synthetic streams, the grid and the Markdown view) |
 | `kit.kit_set_rtl` | every kit part mirrored | `tools/fui/kitrtl_main.fi` (hit functions, decorations, keys) |
 
+
+## Libraries for FleiLauncher (downloads and sign-in)
+
+A launcher fetches thousands of files and signs the user in with a Microsoft
+account. Details, tests and the honest limits: [DOWNLOAD.md](DOWNLOAD.md),
+[OAUTH.md](OAUTH.md).
+
+| module | what it does | held against |
+|---|---|---|
+| `net.download` (`lib/net/download.fi`) | a download manager: N workers on `std.pool`, a keep-alive connection per worker and host, resume with `Range`/`If-Range`, ETag/Last-Modified (`If-None-Match`, 304), retry with exponential backoff and jitter, `Retry-After`, mirrors, a global rate limit, MD5/SHA-1/SHA-256/SHA-512 while the data arrives, atomic rename, per-file and total progress (polled or callback), cancel, skip of files that are already right | a Python server that cuts connections, answers 503, ignores `Range`, sends a wrong `Content-Range`, corrupts bytes, stalls (99 checks, three build stages, Wine); 3000 files at ~350 files/s; the real Mojang CDN (40 assets by SHA-1, `client.jar` resumed from 5 MB) |
+| `net.http` (additions) | extra request headers, user agent, a streaming body sink (no 32 MiB limit), `client_close`, errors as numbers | the download checks above |
+| `auth.jose` (`lib/auth/jose.fi`) | JWT / JWKS: RS256/384/512, ES256/384, HS256; `kid` lookup; exp/nbf/iat/iss/aud/nonce; alg none and RS256-to-HS256 refused | 54 tokens signed by Python `cryptography` (`tests/2150`) |
+| `auth.oauth` (`lib/auth/oauth.fi`) | OAuth 2.0 / OIDC client: discovery, device code flow, authorization code + PKCE with a loopback redirect server and the system browser, refresh, id_token check with the JWKS, userinfo, revocation, tokens in `std.secret` | a Python provider that checks PKCE, redirect URI, single-use codes, rotating refresh tokens and the polling interval (97 checks, three build stages, Wine); RFC 7636 appendix B |
+| `auth.msa` (`lib/auth/msa.fi`) | Microsoft account -> Xbox Live -> XSTS -> Minecraft services -> ownership -> profile, XSTS error texts, session in the keyring, `msa_ensure` | a Python stand-in that checks every header and body (64 checks); the real hosts with bogus credentials (TLS 1.3 path proven); **no real login** (no client id here) |
+| `appkit.fleitec_login` (`lib/appkit/fleitec_login.fi`) | "Sign in with Fleitec-ID": the five login answers and three `me` answers of docs/FLEITEC-ID.md, token in the keyring | `tests/2153` against an in-process ID server; not run against the real server |
