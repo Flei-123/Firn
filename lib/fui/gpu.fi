@@ -76,7 +76,7 @@ export {
     gpu_veil, gpu_glow, gpu_round, gpu_frost,
     gpu_sw_begin, gpu_sw_end, gpu_upload_band, gpu_stray,
     Target, target_new, gpu_target_make, gpu_target_free, gpu_target_ok, gpu_copy,
-    gpu_draw_target, gpu_draw_pixels, gpu_draw_image, gpu_main, gpu_clear_rows, gpu_tmp,
+    gpu_draw_target, gpu_draw_pixels, gpu_draw_image, gpu_draw_photo, gpu_main, gpu_clear_rows, gpu_tmp,
     AKey, akey_new, gpu_atlas_find, gpu_atlas_put, gpu_atlas_draw,
     gpu_stats, GPU_VERSION,
 }
@@ -100,6 +100,7 @@ const K_BOXV: f64 = 12.0
 const K_BOX2H: f64 = 13.0
 const K_BOX2V: f64 = 14.0
 const K_TINT: f64 = 15.0
+const K_PHOTO: f64 = 16.0
 
 // One quad: 32 floats (f32), see VS/FS below.
 const INST_F: usize = 32
@@ -207,6 +208,12 @@ struct Gpu {
     up: u32,
     up_w: i32,
     up_h: i32,
+    // ONE PHOTO KEPT ON THE GPU (gpu_draw_photo): its own texture, uploaded
+    // once and drawn at any place and scale until another photo's key comes
+    img: u32,
+    img_w: i32,
+    img_h: i32,
+    img_key: u64,
     // scratch targets: two small ones (the glass), one of the canvas size
     s1: Target,
     s2: Target,
@@ -234,6 +241,7 @@ fn gpu_new() -> Gpu {
         ad_x0: 0, ad_y0: 0, ad_x1: 0, ad_y1: 0, table: 0, tcount: 0,
         stream: 0 as u32, smem: 0, ss_x: 0, ss_y: 0, ss_h: 0, sd_y0: 0,
         sd_y1: 0, up: 0 as u32, up_w: 0, up_h: 0,
+        img: 0 as u32, img_w: 0, img_h: 0, img_key: 0,
         s1: target_new(), s2: target_new(), tmp: target_new(),
         draws: 0, quads: 0, uploads: 0, readbacks: 0, stray: 0, frames: 0,
     }
@@ -343,6 +351,10 @@ fn gpu_open(g: *mut Gpu, api: *mut gl.GlApi) -> bool {
     (*g).up = 0 as u32
     (*g).up_w = 0
     (*g).up_h = 0
+    (*g).img = 0 as u32
+    (*g).img_w = 0
+    (*g).img_h = 0
+    (*g).img_key = 0
     (*g).main = target_new()
     (*g).s1 = target_new()
     (*g).s2 = target_new()
@@ -1197,6 +1209,57 @@ fn gpu_draw_image(g: *mut Gpu, px: u64, stride: usize, iw: i32, ih: i32,
     col4(p, 4, 4278190080 as u32)
     v4(p, 20, 0.0, 0.0, dx as f64, dy as f64)
     gpu_flush(g)
+}
+
+// A PHOTO from memory (premultiplied RGBA, iw x ih, `stride` octets a row)
+// laid over the canvas at any place and scale, src-over, cut by the clip:
+// the part (sx0, sy0)-(sx1, sy1) of it (texels, rows from the top, may be
+// fractional) fills the rectangle (x0, y0)-(x1, y1) of the canvas (device
+// pixels, fractional too), mixed bilinear, `al` (0..255) the strength.
+// THE PHOTO STAYS ON THE GPU: `key` names these pixels (a photo and its
+// size); the pixels go up once, when the key is not the one of the last
+// call -- a zoom or a pan of the same photo draws one quad and uploads
+// nothing. A key of 0 is "never kept": every call uploads.
+fn gpu_draw_photo(g: *mut Gpu, key: u64, px: u64, stride: usize, iw: i32,
+    ih: i32, x0: f64, y0: f64, x1: f64, y1: f64, sx0: f64, sy0: f64,
+    sx1: f64, sy1: f64, al: u32) {
+    if iw <= 0 || ih <= 0 || x1 <= x0 || y1 <= y0 {
+        return
+    }
+    var b: [f64; 4] = [x0, y0, x1, y1]
+    // the box is whole pixels: the quad covers every pixel the rectangle touches
+    b[0] = flo(x0)
+    b[1] = flo(y0)
+    b[2] = cei(x1)
+    b[3] = cei(y1)
+    if !band(g, &b[0]) {
+        return
+    }
+    let api: *mut gl.GlApi = a(g)
+    if (*g).img == 0 as u32 || (*g).img_w != iw || (*g).img_h != ih ||
+        key == 0 || (*g).img_key != key {
+        gpu_flush(g)
+        if (*g).img == 0 as u32 || (*g).img_w != iw || (*g).img_h != ih {
+            if (*g).img != 0 as u32 {
+                x_delete_obj(api, gl.GLK_TEXTURE, (*g).img)
+            }
+            (*g).img = make_texture(g, gl.GL_RGBA8, iw, ih, gl.GL_RGBA)
+            (*g).img_w = iw
+            (*g).img_h = ih
+        }
+        x_active_texture(api, gl.GL_TEXTURE0)
+        x_bind_texture(api, gl.GL_TEXTURE_2D, (*g).img)
+        x_tex_sub_image_2d(api, gl.GL_TEXTURE_2D, 0, 0, 0, iw, ih, gl.GL_RGBA,
+            gl.GL_UNSIGNED_BYTE, px, ((ih - 1) as usize) * stride + (iw as usize) * 4,
+            (stride / 4) as i32)
+        (*g).uploads = (*g).uploads + 1
+        (*g).img_key = key
+    }
+    want(g, &(*g).main, true, (*g).img, iw, ih)
+    let p: u64 = quad(g, K_PHOTO, b[0], b[1], b[2], b[3], b[0], b[1], b[2], b[3])
+    col4(p, 4, al << 24)
+    v4(p, 12, x0, y0, x1, y1)
+    v4(p, 20, sx0, sy0, sx1, sy1)
 }
 
 // Rows [y0, y1) of a target made transparent (a layer cleared).

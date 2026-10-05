@@ -287,5 +287,33 @@ void main() {
         o = unoct((x + (x >> 8)) >> 8);
         return;
     }
+    if (kind == 16) {
+        // a PHOTO at any place and any scale (gpu_draw_photo): v_g = where it lies on
+        // the canvas (x0, y0, x1, y1, fractional), v_t = the part of the texture that
+        // is shown (sx0, sy0, sx1, sy1, in texels, rows from the top), v_c0.a = strength.
+        // Bilinear, the four texels fetched and mixed here (the texture itself stays
+        // NEAREST like every other); the picture's own edges are antialiased.
+        vec2 dd = v_g.zw - v_g.xy;
+        if (dd.x <= 0.0 || dd.y <= 0.0) discard;
+        float cov = ovl(i.x, i.x + 1.0, v_g.x, v_g.z) * ovl(i.y, i.y + 1.0, v_g.y, v_g.w) * clipf;
+        if (cov <= 0.0) discard;
+        vec2 uv = clamp((vec2(i.x + 0.5, i.y + 0.5) - v_g.xy) / dd, 0.0, 1.0);
+        vec2 sp = mix(v_t.xy, v_t.zw, uv) - 0.5;
+        vec2 fl = floor(sp);
+        vec2 fr = sp - fl;
+        ivec2 lo = ivec2(0);
+        ivec2 hi = ivec2(int(u_srcsize.x) - 1, int(u_srcsize.y) - 1);
+        ivec2 p0 = clamp(ivec2(fl), lo, hi);
+        ivec2 p1 = clamp(ivec2(fl) + ivec2(1, 1), lo, hi);
+        vec4 t00 = texelFetch(u_src, ivec2(p0.x, p0.y), 0);
+        vec4 t10 = texelFetch(u_src, ivec2(p1.x, p0.y), 0);
+        vec4 t01 = texelFetch(u_src, ivec2(p0.x, p1.y), 0);
+        vec4 t11 = texelFetch(u_src, ivec2(p1.x, p1.y), 0);
+        vec4 s = mix(mix(t00, t10, fr.x), mix(t01, t11, fr.x), fr.y);
+        float a = v_c0.a / 255.0 * min(cov, 1.0);
+        o = s * a;
+        if (o.a <= 0.0 && o.r <= 0.0 && o.g <= 0.0 && o.b <= 0.0) discard;
+        return;
+    }
     discard;
 }

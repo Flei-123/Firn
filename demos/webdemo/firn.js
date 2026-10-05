@@ -211,7 +211,7 @@ const firnTag = document.currentScript;
         firn_web_tz(lo, hi) { return -new Date(((hi >>> 0) * 4294967296 + (lo >>> 0)) * 1000).getTimezoneOffset() | 0; },
         firn_web_store_get(kp, kn, p, cap) { try { return put(localStorage.getItem(str(kp, kn)), p, cap); } catch (e) { return 0; } },
         firn_web_store_set(kp, kn, p, n) { try { localStorage.setItem(str(kp, kn), str(p, n)); } catch (e) { /* private mode */ } },
-        firn_web_cursor(k) { canvas.style.cursor = ['default', 'pointer', 'text'][k] || 'default'; },
+        firn_web_cursor(k) { canvas.style.cursor = ['default', 'pointer', 'text', 'grab', 'grabbing', 'zoom-in'][k] || 'default'; },
         // THE FIELD THE KEYBOARD REALLY EDITS (lib/plat/web.fi web_edit_mode):
         // the text field holds the page's whole line and lies over its field
         firn_web_edit_mode(on, font, line, left, top, right) { editMode(on, font, line, left, top, right); },
@@ -471,8 +471,12 @@ const firnTag = document.currentScript;
     canvas.addEventListener('pointerup', (e) => ev(ptr(2, e)));
     canvas.addEventListener('pointercancel', (e) => ev(ptr(4, e)));
     canvas.addEventListener('pointerleave', (e) => ev(ptr(3, e)));
-    canvas.addEventListener('wheel', (e) => { e.preventDefault(); ev(x.firn_web_wheel(e.deltaX, e.deltaY, e.deltaMode)); }, { passive: false });
     const mods = (e) => (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0);
+    // the wheel with the modifier keys (Ctrl is how a trackpad's pinch comes in)
+    canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        ev(x.firn_web_wheel_ex ? x.firn_web_wheel_ex(e.deltaX, e.deltaY, e.deltaMode, mods(e)) : x.firn_web_wheel(e.deltaX, e.deltaY, e.deltaMode));
+    }, { passive: false });
     const key = (down) => (e) => {
         if (e.isComposing || e.key === 'Process' || e.key === 'Unidentified') return;
         // The mirrored field edits itself (Backspace, the arrows, Home/End,
