@@ -144,6 +144,10 @@ const TABLE: &[(i64, A64)] = &[
     (21, A64::AtFdcwd(48)),          // access    -> faccessat (Firn r64)
     (24, A64::Direct(124)),          // sched_yield
     (28, A64::Direct(233)),          // madvise
+    // OPENPLAN r23 (lib/window/x11.fi): the System V shared memory of MIT-SHM
+    (29, A64::Direct(194)),          // shmget
+    (30, A64::Direct(196)),          // shmat
+    (31, A64::Direct(195)),          // shmctl
     (32, A64::Direct(23)),           // dup
     (33, A64::Dup3(24)),             // dup2      -> dup3
     (35, A64::Direct(101)),          // nanosleep
@@ -174,6 +178,7 @@ const TABLE: &[(i64, A64)] = &[
     (61, A64::Direct(260)),          // wait4
     (62, A64::Direct(129)),          // kill
     (63, A64::Direct(160)),          // uname
+    (67, A64::Direct(197)),          // shmdt
     (72, A64::Direct(25)),           // fcntl     (std.process: close-on-exec, non-blocking)
     // std.secret takes an advisory lock on its vault (flock, 73 on x86-64).
     (73, A64::Direct(32)),           // flock
@@ -406,7 +411,7 @@ mod tests {
     #[test]
     fn the_calls_the_library_makes_are_all_in_the_table() {
         // Exactly the numbers that appear in lib/std/*.fi and tests/*.fi.
-        for n in [0i64, 1, 2, 3, 7, 9, 11, 41, 42, 44, 45, 48, 49, 50, 51, 52, 54, 59, 60, 61, 231, 288]
+        for n in [0i64, 1, 2, 3, 7, 9, 11, 29, 30, 31, 41, 42, 44, 45, 48, 49, 50, 51, 52, 54, 59, 60, 61, 67, 231, 288]
         {
             assert!(aarch64(n).is_some(), "syscall {} missing from the table", n);
         }
