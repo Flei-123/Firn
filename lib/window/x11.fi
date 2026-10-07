@@ -47,9 +47,10 @@
 //    with a reason and not a black window.
 // U2 THE WHOLE CANVAS GOES OVER ON EVERY FRAME (3.8 MB at 1200x800).
 //    A damage rectangle would be the next step.
-// U3 NO SHARED MEMORY (MIT-SHM), NO BACK BUFFER: `fill` and `text` go
-//    to the server one by one. Whoever wants to be flicker free paints
-//    into an own buffer and sends ONE `image`.
+// U3 NO BACK BUFFER: `fill` and `text` go to the server one by one.
+//    Whoever wants to be flicker free paints into an own buffer and sends
+//    ONE `image`. (Shared memory, MIT-SHM, has been there since 07.10.2026
+//    for images of 64 KiB and more -- see S1 below.)
 // U4 `r_ppm` DOES NOT EXIST HERE (false). The client holds no canvas.
 //    The capture comes during acceptance with `xwd` FROM THE SERVER --
 //    the stronger measurement: a program that claims to have painted
@@ -77,10 +78,31 @@
 //    them octet by octet against hand-derived values and against real
 //    captures of an Xvfb (testdata/x11/).
 //
+// ======================================= WHAT OPENPLAN ADDED (07.10.2026)
+//
+// S1 MIT-SHM (r23). A picture of 64 KiB and more no longer goes over the
+//    socket (a PutImage in bands of 64 KiB: 8.3 MB of a full-window frame
+//    through 130 `write`s and the server reading every one of them) but is
+//    copied ONCE into a System V segment that the server has attached too,
+//    and one ShmPutImage of 40 octets says where it is. The first big image
+//    asks the server for the extension and makes the segment (it grows when
+//    a bigger image comes, never shrinks; up to 128 MiB); the segment is
+//    marked for removal as soon as the server has attached it, so a crash
+//    leaves nothing behind. THE SERVER MUST HAVE FINISHED READING before
+//    the next frame is copied over it: every ShmPutImage is followed by a
+//    GetInputFocus, and the next `r_image` waits for ITS reply (the server
+//    works through the requests in order) -- a frame later that reply is
+//    long there and the wait costs nothing. WHEN IT DOES NOT WORK (the
+//    extension is absent, the server cannot attach the segment because it
+//    lives in another IPC namespace -- the attach is checked with a round
+//    trip and an error reply -- or `shmget` says no), every image goes the
+//    old way, with the PutImage bands. FIRN_X11_NOSHM=1 in the environment
+//    switches it off (to measure it).
+//
 // WHAT DOES NOT WORK (still): dead keys and compose (a dead key gives no
 // character), the old Latin-2..9/Cyrillic keysym tables (only Latin-1
 // and the Unicode keysyms become characters), TCP displays
-// (`host:0`), MIT-SHM, and more than the first screen.
+// (`host:0`), and more than the first screen.
 import std.rt
 import std.str
 import std.net
@@ -132,7 +154,7 @@ export {
     req_setup, req_intern_atom, req_create_window, req_create_gc,
     req_change_property, req_map_window, req_get_property,
     req_get_keyboard_mapping, req_get_modifier_mapping,
-    req_put_image_head,
+    req_put_image_head, req_shm_attach, req_shm_detach, req_shm_put_image,
     Keymap, keymap_new, keymap_ok, keymap_from_reply,
     keymap_mods_from_reply, keymap_col, keymap_sym, ks_key, ks_char,
     decode_event, auth_pick,
@@ -253,6 +275,19 @@ struct Platte {
     dnd_ok: bool,
     drop: rt.Buf,
     drop_n: usize,
+    // MIT-SHM (S1): 0 = not asked yet, 1 = in use, 2 = no (refused or
+    // failed -- the PutImage bands). `shm_op` the major opcode of the
+    // extension, `shm_seg` the id the server knows the segment by (0 =
+    // none), `shm_id` the System V id, `shm_ptr` our mapping, `shm_cap` its
+    // size, `shm_fence` the sequence number of the GetInputFocus after the
+    // last ShmPutImage (0 = nothing to wait for).
+    shm_state: u32,
+    shm_op: u32,
+    shm_seg: u32,
+    shm_id: i64,
+    shm_ptr: u64,
+    shm_cap: usize,
+    shm_fence: u32,
 }
 
 fn surface_new() -> Platte {
@@ -268,6 +303,8 @@ fn surface_new() -> Platte {
         a_xaware: 0, a_xenter: 0, a_xpos: 0, a_xstatus: 0, a_xleave: 0, a_xdrop: 0, a_xfin: 0, a_xsel: 0,
         a_xtypes: 0, a_xcopy: 0, a_urilist: 0, a_xprop: 0, dnd_on: false, dnd_src: 0, dnd_ver: 0, dnd_ok: false,
         drop: rt.buf_new(), drop_n: 0,
+        shm_state: 0 as u32, shm_op: 0 as u32, shm_seg: 0 as u32, shm_id: 0, shm_ptr: 0 as u64, shm_cap: 0,
+        shm_fence: 0 as u32,
         a_protocols: 0, a_delete: 0, dpi: 96, dark: false,
         dark_known: false, dark_us: 0, inj: 0, gift: 0, fail: 0,
         spos: 0, ein_n: 0, ein_hook: in_nothing, ein_ud: 0,
@@ -865,6 +902,61 @@ fn req_put_image_head(b: *mut rt.Buf, win: u32, gc: u32, w: usize,
     rt.buf_push(b, depth as u8)
     rt.buf_push(b, 0 as u8)
     rt.buf_push(b, 0 as u8)
+}
+
+// MIT-SHM (S1). `op` is the major opcode QueryExtension gave for "MIT-SHM".
+// ShmAttach (minor 1): the server maps the System V segment `shmid` and
+// calls it `seg`.
+fn req_shm_attach(b: *mut rt.Buf, op: u32, seg: u32, shmid: u32,
+    read_only: bool) {
+    rt.buf_push(b, op as u8)
+    rt.buf_push(b, 1 as u8)
+    put16(b, 4 as u32)
+    put32(b, seg)
+    put32(b, shmid)
+    if read_only {
+        rt.buf_push(b, 1 as u8)
+    } else {
+        rt.buf_push(b, 0 as u8)
+    }
+    rt.buf_push(b, 0 as u8)
+    rt.buf_push(b, 0 as u8)
+    rt.buf_push(b, 0 as u8)
+}
+
+// ShmDetach (minor 2).
+fn req_shm_detach(b: *mut rt.Buf, op: u32, seg: u32) {
+    rt.buf_push(b, op as u8)
+    rt.buf_push(b, 2 as u8)
+    put16(b, 2 as u32)
+    put32(b, seg)
+}
+
+// ShmPutImage (minor 3), ZPixmap, no completion event: the picture of
+// `tw` x `th` pixels lies in the segment at octet `offset`; the part
+// (`sx`, `sy`, `sw` x `sh`) of it goes to (`dx`, `dy`) of the drawable.
+fn req_shm_put_image(b: *mut rt.Buf, op: u32, win: u32, gc: u32, tw: usize,
+    th: usize, sx: usize, sy: usize, sw: usize, sh: usize, dx: usize,
+    dy: usize, depth: u32, seg: u32, offset: u32) {
+    rt.buf_push(b, op as u8)
+    rt.buf_push(b, 3 as u8)
+    put16(b, 10 as u32)
+    put32(b, win)
+    put32(b, gc)
+    put16(b, tw as u32)
+    put16(b, th as u32)
+    put16(b, sx as u32)
+    put16(b, sy as u32)
+    put16(b, sw as u32)
+    put16(b, sh as u32)
+    put16(b, dx as u32)
+    put16(b, dy as u32)
+    rt.buf_push(b, depth as u8)
+    rt.buf_push(b, 2 as u8) // ZPixmap
+    rt.buf_push(b, 0 as u8) // send_event: no ShmCompletion, the fence is a round trip
+    rt.buf_push(b, 0 as u8)
+    put32(b, seg)
+    put32(b, offset)
 }
 
 // ------------------------------------------------- the reply to the setup
@@ -2117,6 +2209,10 @@ fn r_image(x: *mut Platte, px: u64, w: usize, h: usize, dx: usize,
     if per_row == 0 {
         return true
     }
+    // S1: a big picture goes through shared memory
+    if per_row * h >= SHM_MIN_BYTES && w < 65536 && h < 65536 && shm_ready(x, per_row * h) {
+        return shm_put(x, px, w, h, dx, dy)
+    }
     var rows: usize = 65536 / per_row
     if rows == 0 {
         rows = 1
@@ -2141,6 +2237,180 @@ fn r_image(x: *mut Platte, px: u64, w: usize, h: usize, dx: usize,
     }
     rt.buf_free(&r)
     return true
+}
+
+// ------------------------------------------------------------- MIT-SHM (S1)
+
+const SYS_SHMGET: i64 = 29
+const SYS_SHMAT: i64 = 30
+const SYS_SHMCTL: i64 = 31
+const SYS_SHMDT: i64 = 67
+const SHM_CREATE_0600: i64 = 896 // IPC_CREAT (01000) | 0600
+const SHM_MIN_BYTES: usize = 65536
+const SHM_FIRST_BYTES: usize = 1048576
+const SHM_MAX_BYTES: usize = 134217728
+
+// A GetInputFocus right behind the request: its reply says the server has
+// worked through everything before it.
+fn req_fence(b: *mut rt.Buf) {
+    rt.buf_push(b, 43 as u8)
+    rt.buf_push(b, 0 as u8)
+    put16(b, 1 as u32)
+}
+
+// Waits for the reply (or error) to the request with this sequence number;
+// the record is out of the buffer afterwards. `got` tells whether it was there.
+fn shm_reply(x: *mut Platte, seq: u32, ms: i64, got: *mut bool) {
+    var rep: rt.Buf = rt.buf_new()
+    let r: bool = wait_record(x, 1 as u32, seq, ms, &rep)
+    *got = rt.buf_len(&rep) > 0
+    rt.buf_free(&rep)
+}
+
+// Does the server speak MIT-SHM, and may we? (FIRN_X11_NOSHM=1: no.)
+fn shm_probe(x: *mut Platte) -> bool {
+    var e_n: [u8; 14] = "FIRN_X11_NOSHM"
+    var ev: rt.Buf = rt.buf_new()
+    let off: bool = env_get((&e_n[0]) as u64, 14, &ev)
+    rt.buf_free(&ev)
+    if off {
+        return false
+    }
+    var nm: [u8; 7] = "MIT-SHM"
+    var r: rt.Buf = rt.buf_new()
+    req_query_extension(&r, (&nm[0]) as u64, 7)
+    let sent: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    if !sent {
+        return false
+    }
+    var rep: rt.Buf = rt.buf_new()
+    let ok: bool = wait_record(x, 1 as u32, (*x).seq, 2000, &rep)
+    var present: bool = false
+    if ok && rt.buf_len(&rep) >= 32 && rt.ld8(rt.buf_ptr(&rep), 8) != 0 as u8 {
+        (*x).shm_op = rt.ld8(rt.buf_ptr(&rep), 9) as u32
+        present = (*x).shm_op != 0 as u32
+    }
+    rt.buf_free(&rep)
+    return present
+}
+
+// The segment (ours and the server's) is given up. What the server is still
+// reading stays valid for it: the segment is already marked for removal.
+fn shm_drop(x: *mut Platte) {
+    if (*x).shm_seg != 0 as u32 && (*x).open {
+        var r: rt.Buf = rt.buf_new()
+        req_shm_detach(&r, (*x).shm_op, (*x).shm_seg)
+        let sent: bool = send(x, r.ptr, r.len)
+        rt.buf_free(&r)
+    }
+    if (*x).shm_ptr != 0 as u64 {
+        syscall(SYS_SHMDT, (*x).shm_ptr as i64, 0, 0, 0, 0, 0)
+    }
+    (*x).shm_seg = 0 as u32
+    (*x).shm_ptr = 0 as u64
+    (*x).shm_cap = 0
+    (*x).shm_id = 0
+}
+
+// A segment of at least `bytes` octets, attached by the server too.
+// False: nothing came of it (and the old segment, if there was one, is kept).
+fn shm_grow(x: *mut Platte, bytes: usize) -> bool {
+    var cap: usize = SHM_FIRST_BYTES
+    if bytes > cap {
+        cap = (bytes + 4095) / 4096 * 4096
+    }
+    if cap > SHM_MAX_BYTES {
+        return false
+    }
+    let id: i64 = syscall(SYS_SHMGET, 0, cap as i64, SHM_CREATE_0600, 0, 0, 0)
+    if id < 0 {
+        return false
+    }
+    let at: i64 = syscall(SYS_SHMAT, id, 0, 0, 0, 0, 0)
+    if at < 0 && at > 0 - 4096 {
+        syscall(SYS_SHMCTL, id, 0, 0, 0, 0, 0)
+        return false
+    }
+    let seg: u32 = new_id(x)
+    var r: rt.Buf = rt.buf_new()
+    req_shm_attach(&r, (*x).shm_op, seg, id as u32, false)
+    let seq_attach: u32 = ((*x).seq + 1) & 65535
+    req_fence(&r)
+    let sent: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    var fenced: bool = false
+    if sent {
+        shm_reply(x, (*x).seq, 2000, &fenced)
+    }
+    var refused: bool = false
+    if fenced {
+        // an error for the attach comes BEFORE the reply to the fence
+        shm_reply(x, seq_attach, 0, &refused)
+    }
+    // marked for removal: it goes away when the last of us lets go (or dies)
+    syscall(SYS_SHMCTL, id, 0, 0, 0, 0, 0)
+    if !fenced || refused {
+        syscall(SYS_SHMDT, at, 0, 0, 0, 0, 0)
+        return false
+    }
+    shm_drop(x)
+    (*x).shm_seg = seg
+    (*x).shm_id = id
+    (*x).shm_ptr = at as u64
+    (*x).shm_cap = cap
+    return true
+}
+
+// Is there a segment of at least `bytes` octets to send through? (The
+// first call asks the server.)
+fn shm_ready(x: *mut Platte, bytes: usize) -> bool {
+    if (*x).shm_state == 2 as u32 {
+        return false
+    }
+    if (*x).shm_state == 0 as u32 {
+        if !shm_probe(x) {
+            (*x).shm_state = 2 as u32
+            return false
+        }
+        (*x).shm_state = 1 as u32
+    }
+    if (*x).shm_seg != 0 as u32 && bytes <= (*x).shm_cap {
+        return true
+    }
+    if !shm_grow(x, bytes) {
+        if (*x).shm_seg == 0 as u32 {
+            (*x).shm_state = 2 as u32 // never worked: stay with PutImage
+        }
+        return false
+    }
+    return true
+}
+
+// The picture through the segment: wait until the server has read the last
+// one, copy this one in, ShmPutImage, and the fence behind it.
+fn shm_put(x: *mut Platte, px: u64, w: usize, h: usize, dx: usize,
+    dy: usize) -> bool {
+    if (*x).shm_fence != 0 as u32 {
+        var got: bool = false
+        shm_reply(x, (*x).shm_fence, 2000, &got)
+        (*x).shm_fence = 0 as u32
+        if !got {
+            // the server does not answer: do not write over what it may be reading
+            return false
+        }
+    }
+    rt.mem_copy((*x).shm_ptr, px, w * h * 4)
+    var r: rt.Buf = rt.buf_new()
+    req_shm_put_image(&r, (*x).shm_op, (*x).win, (*x).gc, w, h, 0, 0, w, h, dx,
+        dy, (*x).depth, (*x).shm_seg, 0 as u32)
+    req_fence(&r)
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    if ok {
+        (*x).shm_fence = (*x).seq
+    }
+    return ok
 }
 
 // The font of the server for labels. Every X server has had "fixed"
@@ -2678,6 +2948,7 @@ fn key_ascii(code: u32, shift: bool) -> u32 {
 }
 
 fn r_close(x: *mut Platte) {
+    shm_drop(x)
     if (*x).open {
         net.close(&(*x).c)
         (*x).open = false
