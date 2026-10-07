@@ -741,6 +741,17 @@ else
     tail -20 "$WORK/english.log" | sed 's/^/   /' || true
 fi
 
+echo "== 21b. english guard, shared (tools/english/no_german.py): German in code only goes down =="
+# One guard for every repo (audit 07.10.2026): paths, identifiers, comments and string literals of all code files,
+# frozen counts in no-german.baseline.json, allow list in no-german.json. The check above stays as the sharper one for Firn's own libs.
+if { bash tools/english/no_german_selftest.sh && bash tools/english/no_german_ci.sh .; } > "$WORK/no_german.log" 2>&1; then
+    ok
+    tail -1 "$WORK/no_german.log" | sed 's/^/   /' || true
+else
+    bad "tools/english/no_german.py: more German than no-german.baseline.json allows (see .test-work/no_german.log)"
+    tail -20 "$WORK/no_german.log" | sed 's/^/   /' || true
+fi
+
 echo "== 24. the formatter: canonical shape (tools/fmt/run.sh, ROUND 64) =="
 # firnfmt, written in Firn. Proven is: the token stream and the syntax tree
 # stay unchanged over the WHOLE tree, a second run changes nothing, the
