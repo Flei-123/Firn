@@ -1740,6 +1740,20 @@ else
     grep -E 'FAIL' "$WORK/desktop.log" | head -12 | sed 's/^/   /'
 fi
 
+echo "== 100. the block cache of rt.heap_alloc, counted at the kernel's door (tools/rtcache/run.sh, OpenPlan r66) =="
+# `heap_alloc` used to be one mmap per block and `heap_free` one munmap. Freed blocks of up to 16 pages are now
+# kept (zeroed again on the way out); 200,000 rounds of alloc/free reach the kernel 70 times instead of ~400,000,
+# with the counter-check (a program that never frees must still cost one mmap per block). The behaviour of the
+# blocks (zero, reuse, limit, four threads) is tests/2244_rt_block_cache.fi.
+bash tools/rtcache/run.sh > "$WORK/rtcache.log" 2>&1 && RCRC=0 || RCRC=$?
+if [ "$RCRC" -eq 0 ]; then
+    ok
+    grep -E '^   ' "$WORK/rtcache.log" | sed 's/^/ /'
+else
+    bad "tools/rtcache/run.sh failed (see .test-work/rtcache.log)"
+    grep -E 'FAIL|error' "$WORK/rtcache.log" | head -8 | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

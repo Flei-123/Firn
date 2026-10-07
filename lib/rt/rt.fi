@@ -83,6 +83,70 @@ fn pages_on(n: usize) -> usize {
     return (n + PAGE - 1) / PAGE * PAGE
 }
 
+// THE BLOCK CACHE (OpenPlan r66).
+//
+// `heap_alloc` used to go to the kernel for EVERY block -- an `mmap` for a
+// vector of eight slots -- and `heap_free` gave it straight back with a
+// `munmap`. A program that builds and drops small buffers all the time
+// (`op pdf` on a 1,000-page project: 228,000 pairs, 95 % of them one 4 KiB
+// page) spent more time in the kernel than in its own code: the mapping,
+// the page fault of the first touch, the unmapping. Now a freed block of up
+// to `CACHE_PAGES` pages is kept on a list of its size (in pages) and handed
+// out again; only a block that no list holds comes from the kernel, and a
+// list that is full gives its block back.
+//
+// WHAT STAYS AS IT WAS. A block is page aligned and zero initialized over
+// its WHOLE rounded size: a block that comes out of the cache is wiped
+// again (a word per step) -- the kernel's zero page was free, this is not,
+// but it costs a fraction of the mapping and the fault it saves. `heap_free`
+// has to get the size it was given at `heap_alloc` (it always had to: the
+// kernel's `munmap` needs it).
+//
+// THE LIMIT. At most `CACHE_CLASS_BYTES` per size are held, so at most
+// `CACHE_PAGES * CACHE_CLASS_BYTES` (4 MiB) in all; the rest goes back to the
+// kernel as before.
+//
+// THREADS. The lists are the first global state of the runtime (`static
+// mut`, round 89) and several threads allocate (round 49). The lock is a
+// TRY-lock built from the one atomic Firn has (`__atomic_add`): whoever does
+// not get it does not wait -- an allocation goes to the kernel, a release
+// goes to the kernel -- so no thread ever stands still for another and
+// nothing here can dead-lock. A list is touched only while the lock is held.
+//
+// A block on a list holds the address of the next one in its first word.
+const CACHE_PAGES: usize = 16
+const CACHE_CLASS_BYTES: usize = 262144
+const MINUS_ONE: u64 = 18446744073709551615
+
+static mut cache_head: [u64; 17] = [0; 17]
+static mut cache_count: [u64; 17] = [0; 17]
+static mut cache_lock: u64 = 0
+
+#[no_gc]
+fn cache_try() -> bool {
+    let before: u64 = __atomic_add((&cache_lock) as *mut u64, 1)
+    if before == 0 {
+        return true
+    }
+    __atomic_add((&cache_lock) as *mut u64, MINUS_ONE)
+    return false
+}
+
+#[no_gc]
+fn cache_release() {
+    __atomic_add((&cache_lock) as *mut u64, MINUS_ONE)
+}
+
+// the block wiped: every octet of it zero (`len` is a multiple of a page)
+#[no_gc]
+fn wipe(p: u64, len: usize) {
+    var i: usize = 0
+    while i < len / 8 {
+        *((p + i as u64 * 8) as *mut u64) = 0
+        i = i + 1
+    }
+}
+
 // n bytes from the operating system, zero initialized. 0 = failed.
 //
 // WITHOUT a fixed address, without MAP_FIXED -- an allocator that picks its
@@ -93,6 +157,18 @@ fn heap_alloc(n: usize) -> u64 {
         return 0
     }
     let len: usize = pages_on(n)
+    let k: usize = len / PAGE
+    if k <= CACHE_PAGES && cache_try() {
+        let b: u64 = cache_head[k]
+        if b != 0 {
+            cache_head[k] = *(b as *mut u64)
+            cache_count[k] = cache_count[k] - 1
+            cache_release()
+            wipe(b, len)
+            return b
+        }
+        cache_release()
+    }
     let r: i64 = syscall(SYS_MMAP, 0, len as i64, PROT_RW, MAP_PRIVATE_ANON, -1, 0)
     // mmap reports failure as -1 .. -4095
     if r < 0 && r > 0 - 4096 {
@@ -109,7 +185,19 @@ fn heap_free(p: u64, n: usize) {
     if p == 0 {
         return
     }
-    syscall(SYS_MUNMAP, p as i64, pages_on(n) as i64, 0, 0, 0, 0)
+    let len: usize = pages_on(n)
+    let k: usize = len / PAGE
+    if k <= CACHE_PAGES && cache_try() {
+        if cache_count[k] < (CACHE_CLASS_BYTES / len) as u64 {
+            *(p as *mut u64) = cache_head[k]
+            cache_head[k] = p
+            cache_count[k] = cache_count[k] + 1
+            cache_release()
+            return
+        }
+        cache_release()
+    }
+    syscall(SYS_MUNMAP, p as i64, len as i64, 0, 0, 0, 0)
 }
 
 fn mem_copy(target: u64, source: u64, n: usize) {
