@@ -12,7 +12,7 @@ explorer, editor, lists, title bars -- **built once in fUi and reused**, not onc
 | How is a menu put together? | **Providers** along the chain *target node -> root* (`lib/fui/ctxmenu.fi`), merged by group / priority, duplicates removed, nearest provider wins. | The DOM/WPF/Flutter way of "who can say something about this element". Rejected: one big function per program that knows every element (does not compose, cannot be extended by a plugin). |
 | What does the request look like? | **One event**, `EV_CONTEXT(target, x, y, source, mods)`, through the normal capture/target/bubble path; a handler may `H_PREVENT` it. Sources: mouse, touch, pen, menu key, Shift+F10, API, a11y, bus. | The DOM `contextmenu` event. Rejected: every host calling a different menu function. |
 | What is the popup? | A **small scene per level** (`lib/fui/menuview.fi`), one node per entry, own painter, own a11y tree, painted **above** the page and clipped to the bounds it is given. | Reuses measuring, styling, theme tokens, scaling, hit test and a11y of the page; does not eat the page's 128 nodes. Rejected: a widget kind that paints rows by hand (`wave2.draw_menu_item` only draws one row; no keyboard, no hit test, no submenu). |
-| Own window for the popup? | Interface and bounds are there (`mv_set_bounds`: the window now, the screen for a popup of its own); the OS-window backends (X11 override-redirect, Win32 `WS_POPUP`, OrientOS layer `L_POPUP`) are **roadmap** (r147/r168). See section 9. | An honest split: the overlay is complete and tested; a second OS window needs the window layer to deliver events for two windows. |
+| Own window for the popup? | **Yes on X11** (`lib/plat/fuipopup.fi` + `window.popup_open`): one override-redirect window per level, the first holds the pointer and keyboard grab; **the menu reaches out of the program's window.** Without such a window layer (Win32, OrientOS, Android, browser today) or when a window is refused it falls back to the overlay in the page. See section 9. | The window layer opens windows on connections of their own already (LIB-005), so a menu = up to three more of them; the view stays platform-free and talks to hooks (`mv_set_surface`). |
 
 Everything below is checked by `tools/fui/ctxmenu_main.fi` (model, 200+ checks), `tools/fui/menuview_main.fi`
 (picture, hit test, host path, speed) and `tools/fui/app_main.fi` (fui.app end to end), all in
@@ -184,6 +184,32 @@ conflicts it should not edit `action.fi`, `ctxmenu.fi`, `menuview.fi`, `ctxstd.f
 | speed (release-fast) | `menuview speed` | 3 |
 | fui.app: right click on a row selects + opens, click runs, text-field menu, select-all by menu, long press, shortcut, manifest, audit | `app_main` | 28 |
 
+## 7b. Windows of its own (X11, r168) -- how it works
+
+```
+ menuview (platform-free)             fuipopup.fi (desktop glue)               lib/window (x11.fi)
+ mv_request: screen + window origin ->  cb_screen / cb_origin  ---------->  r_origin (TranslateCoordinates)
+ build level, place in SCREEN space   cb_open(lv,x,y,w,h)  -------------->  r_popup: CreateWindow with
+ mv_present: paint level into ...     cb_ctx -> render ctx of the popup's    override-redirect, GrabPointer
+   the level's own canvas              own canvas; cb_present -> PutImage    (+ GrabKeyboard for level 0)
+ mv_pointer(x - window origin)  <----  ph_step: events of the popup windows (root coordinates -> window
+                                       coordinates) -> fuiwirt.host_pointer_* / host_key / host_char
+```
+
+* **One window per level**, because the levels need not touch (a submenu opens beside its header) and a
+  window cannot be transparent. The frame is a rectangle there (no rounded corners without a shape extension).
+* **The grab** (level 0, owner-events) makes every click on the screen arrive in the popup with ROOT
+  coordinates (the decode uses bytes 20/22 of the event, which are never negative); a click that is outside
+  every level **and** outside the program's window only closes the menu (it is not the program's click),
+  inside the program's window it closes and passes through, so the next right click opens the next menu.
+* **Close rules** keep working: the program's window moving/resizing (`EV_CONFIGURE` -> `host_popup_note`)
+  closes the menu; a refused window (a grab held by another program) falls back to the overlay with the
+  request's place converted back (`to_overlay`).
+* **Checked** by `menuview_main` section 7 (a fake platform: screen places, grab only on level 0, submenu flip on
+  the screen's edge, window-move close, refusal fallback) and by `tools/fui/ctxlive.py` on a real Xvfb (the menu
+  is visible right of the 437-px window, not cut at its edge, Esc, click on Rename runs it, click on the empty
+  screen closes, submenu window, Esc closes the submenu only, Tab + Shift+F10): 17 of 17.
+
 ## 8. Alternatives that were rejected
 
 * **A menu widget kind in the scene tree** (children = entries): eats 20-25 of the page's 128 nodes and
@@ -197,9 +223,11 @@ conflicts it should not edit `action.fi`, `ctxmenu.fi`, `menuview.fi`, `ctxstd.f
 
 ## 9. Not done yet (on the roadmap, not hidden)
 
-* **The popup as a window of its own** (r168): the overlay is clipped to the window. A menu taller or wider
-  than a small window is flipped/clamped; one that must reach outside needs X11 override-redirect / Win32
-  `WS_POPUP` / OrientOS `L_POPUP`, and the loop must step two windows. The view takes its bounds from the caller.
+* **The popup as a window of its own on Win32 and OrientOS** (r168 rest): X11 is done and tested live under
+  Xvfb (section 10); Win32 needs `WS_POPUP | WS_EX_TOPMOST | WS_EX_NOACTIVATE` + `SetCapture` in `win32.fi`
+  (`r_popup` answers false there, so menus stay in the page), OrientOS a window on layer `L_POPUP` in
+  `lib/window/osum.fi`. Both only fill in the same four backend functions (`r_popup`, `r_popup_place`,
+  `r_origin`, `r_is_popup`).
 * **Scrolling an over-tall menu** and **mirroring for right-to-left** (r169).
 * **F-keys as shortcuts** on the host (F2 rename, Alt+F4): the host maps only F10 today; Delete / Enter /
   Backspace and Ctrl/Alt+letter work.
