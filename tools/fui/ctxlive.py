@@ -78,6 +78,12 @@ def shot(name):
     return Image.open(png).convert("RGB")
 
 
+def cpu_ticks(pid):
+    with open("/proc/%d/stat" % pid) as f:
+        parts = f.read().rsplit(")", 1)[1].split()
+    return int(parts[11]) + int(parts[12])
+
+
 def diff(a, b, box):
     x0, y0, x1, y1 = box
     pa = a.load()
@@ -191,7 +197,19 @@ time.sleep(0.5)
 I = shot("ctx-live-11-closed")
 chk("Esc closes it", diff(H, I, (90, 250, 560, 560)) > 1500)
 
-# 7. the program is still alive and answers: the menu key path (focus the field with Tab, Shift+F10)
+# 7. an open menu is idle: no frames, no busy loop (a hover delay may wake it, nothing else)
+xdo("mousemove", "300", "186")
+time.sleep(0.2)
+xdo("click", "3")
+time.sleep(0.8)
+t0 = cpu_ticks(app.pid)
+time.sleep(2.0)
+t1 = cpu_ticks(app.pid)
+chk("an open menu does not spin: under 10 clock ticks of CPU in 2 s", t1 - t0 < 10, "%d ticks" % (t1 - t0))
+xdo("key", "Escape")
+time.sleep(0.4)
+
+# 8. the program is still alive and answers: the menu key path (focus the field with Tab, Shift+F10)
 chk("the program is still running", app.poll() is None)
 
 print("")
