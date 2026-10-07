@@ -422,6 +422,17 @@ else
 fi
 
 echo
+echo "== 18i2. MIT-SHM (OpenPlan r23): the same window through shared memory, through the PutImage bands, without the extension, in another IPC namespace =="
+# lib/window/x11.fi sends a picture of 64 KiB and more through a System V segment. The window must show the same
+# pixels whichever way the picture travelled; a server that cannot attach the segment (another IPC namespace) or
+# does not know the extension must leave the program on the PutImage bands (tools/fui/x11shm.py).
+if command -v python3 >/dev/null 2>&1; then
+    python3 tools/fui/x11shm.py "$W/x11demo"
+else
+    echo "  SKIP: kein python3"
+fi
+
+echo
 echo "== 18j. fUi TEMPO: DER DECKUNGS-CACHE UND DER CLIP AENDERN KEIN OKTETT =="
 # lib/fui/fcache.fi (rasterised text and icons are kept) and
 # painter.clip_rows (shapes outside the clip are not rasterised):
