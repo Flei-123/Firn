@@ -1,0 +1,193 @@
+// expect_out: reuse=1 sizes=1 limit=1 threads=0
+// tests/2244_rt_block_cache.fi -- the block cache of rt.heap_alloc/heap_free
+// (OpenPlan r66).
+//
+// A  a freed block comes back (the same address) and is ZERO again, though
+//    the program filled it with 0xAB before it gave it back
+// B  every size from 1 to 20 pages: zero over the whole rounded size after a
+//    dirty round, blocks of the cache and blocks of the kernel alike
+// C  the limit: 1000 blocks freed at once (most go back to the kernel), 1000
+//    asked for again -- all different, all zero, each keeps its own stamp
+// D  four threads on one pool allocate, stamp, check and free 20000 blocks
+//    each of mixed sizes: no block is ever handed to two threads
+//    (a stamp that changed under a thread's hands is an error)
+import std.rt
+import std.io
+import std.pool
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == pool.WORKER_KIND {
+        return pool.worker_main(arg)
+    }
+    return 0
+}
+
+fn is_zero(p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n / 8 {
+        if rt.ld64(p, i) != 0 as u64 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn dirty(p: u64, n: usize) {
+    var i: usize = 0
+    while i < n / 8 {
+        rt.st64(p, i, 12370169555311111083)
+        i = i + 1
+    }
+}
+
+fn part_a() -> bool {
+    let a: u64 = rt.heap_alloc(4096)
+    if a == 0 {
+        return false
+    }
+    dirty(a, 4096)
+    rt.heap_free(a, 4096)
+    let b: u64 = rt.heap_alloc(100)
+    var ok: bool = b == a && is_zero(b, 4096)
+    rt.heap_free(b, 100)
+    return ok
+}
+
+fn part_b() -> bool {
+    var pages: usize = 1
+    while pages <= 20 {
+        let n: usize = pages * 4096 - 17
+        var round: usize = 0
+        while round < 3 {
+            let p: u64 = rt.heap_alloc(n)
+            if p == 0 || !is_zero(p, pages * 4096) {
+                return false
+            }
+            dirty(p, pages * 4096)
+            rt.heap_free(p, n)
+            round = round + 1
+        }
+        pages = pages + 1
+    }
+    return true
+}
+
+fn part_c() -> bool {
+    var table: u64 = rt.heap_alloc(1000 * 8)
+    var i: usize = 0
+    while i < 1000 {
+        let p: u64 = rt.heap_alloc(4096)
+        if p == 0 || !is_zero(p, 4096) {
+            return false
+        }
+        rt.st64(p, 0, i as u64 + 1)
+        rt.st64(table, i, p)
+        i = i + 1
+    }
+    i = 0
+    while i < 1000 {
+        let p: u64 = rt.ld64(table, i)
+        if rt.ld64(p, 0) != i as u64 + 1 {
+            return false
+        }
+        dirty(p, 4096)
+        rt.heap_free(p, 4096)
+        i = i + 1
+    }
+    i = 0
+    while i < 1000 {
+        let p: u64 = rt.heap_alloc(4096)
+        if p == 0 || !is_zero(p, 4096) {
+            return false
+        }
+        rt.st64(p, 0, i as u64 + 1)
+        rt.st64(table, i, p)
+        i = i + 1
+    }
+    // all different: every stamp is still its own
+    i = 0
+    var ok: bool = true
+    while i < 1000 {
+        let p: u64 = rt.ld64(table, i)
+        if rt.ld64(p, 0) != i as u64 + 1 {
+            ok = false
+        }
+        rt.heap_free(p, 4096)
+        i = i + 1
+    }
+    rt.heap_free(table, 1000 * 8)
+    return ok
+}
+
+// one worker: blocks of 1..4 pages, stamped with the worker's own number
+fn hammer(me: u64) -> u64 {
+    var bad: u64 = 0
+    var i: u64 = 0
+    while i < 20000 {
+        let pages: usize = (i % 4) as usize + 1
+        let n: usize = pages * 4096
+        let p: u64 = rt.heap_alloc(n)
+        if p == 0 {
+            return bad + 1
+        }
+        if !is_zero(p, n) {
+            bad = bad + 1
+        }
+        let stamp: u64 = me * 1000000 + i
+        rt.st64(p, 0, stamp)
+        rt.st64(p, n / 8 - 1, stamp)
+        // give the other threads a chance to come in between
+        var spin: u64 = 0
+        while spin < 20 {
+            spin = spin + 1
+        }
+        if rt.ld64(p, 0) != stamp || rt.ld64(p, n / 8 - 1) != stamp {
+            bad = bad + 1
+        }
+        rt.heap_free(p, n)
+        i = i + 1
+    }
+    return bad
+}
+
+fn part_d() -> u64 {
+    var p: pool.Pool = pool.pool_new(4, 16)
+    if p.blk == 0 {
+        return 1000
+    }
+    var jobs: [u64; 4] = [0; 4]
+    var w: u64 = 0
+    while w < 4 {
+        jobs[w as usize] = pool.submit(&p, hammer, w + 1)
+        w = w + 1
+    }
+    pool.wait_idle(&p)
+    var bad: u64 = 0
+    w = 0
+    while w < 4 {
+        bad = bad + pool.job_result(jobs[w as usize])
+        pool.job_free(&p, jobs[w as usize])
+        w = w + 1
+    }
+    pool.shutdown(&p)
+    return bad
+}
+
+fn main() -> i32 {
+    var a: i64 = 0
+    var b: i64 = 0
+    var c: i64 = 0
+    if part_a() {
+        a = 1
+    }
+    if part_b() {
+        b = 1
+    }
+    if part_c() {
+        c = 1
+    }
+    let d: u64 = part_d()
+    io.fmt_print_line(f"reuse={a} sizes={b} limit={c} threads={d}")
+    return 0
+}

@@ -15,6 +15,7 @@
 //     var o: print.PrintOptions = print.print_options_default()
 //     o.copies = 2
 //     o.media = "iso_a3_297x420mm"
+//     o.scaling = print.SCALING_FIT                      // fit the page to the paper
 //     let job: u32 = print.print_pdf("Office", pdf_ptr, pdf_len, o) catch |e| ...
 //
 // A PRINTER is named either by its CUPS queue name ("Office" ->
@@ -41,8 +42,9 @@ export {
     PrintError, PrinterInfo, PrintOptions,
     print_options_default, printers, printers_at, printer_attributes,
     print_pdf, print_document, job_state, cancel_job, print_last_status,
-    printer_uri, ipp_encode_request,
+    printer_uri, ipp_encode_request, ipp_encode_job_options, scaling_keyword,
     SIDES_ONE, SIDES_LONG_EDGE, SIDES_SHORT_EDGE,
+    SCALING_DEFAULT, SCALING_AUTO, SCALING_AUTO_FIT, SCALING_FIT, SCALING_FILL, SCALING_NONE,
     COLOR_AUTO, COLOR_MONO, COLOR_COLOR,
     JOB_PENDING, JOB_HELD, JOB_PROCESSING, JOB_STOPPED, JOB_CANCELED, JOB_ABORTED, JOB_COMPLETED,
 }
@@ -58,6 +60,19 @@ error PrintError {
 const SIDES_ONE: u32 = 0
 const SIDES_LONG_EDGE: u32 = 1
 const SIDES_SHORT_EDGE: u32 = 2
+// print-scaling (PWG 5100.13, `print-scaling` of IPP Everywhere): how the
+// page of the document is placed on the paper. DEFAULT sends nothing and
+// leaves the choice to the printer; FIT scales the page DOWN or UP to the
+// printable area and keeps its proportions ("fit to page"), FILL scales
+// until the paper is covered (the page may be cut), NONE prints at 100 %,
+// AUTO lets the printer pick between fit and none, AUTO_FIT is like AUTO
+// but only ever scales DOWN.
+const SCALING_DEFAULT: u32 = 0
+const SCALING_AUTO: u32 = 1
+const SCALING_AUTO_FIT: u32 = 2
+const SCALING_FIT: u32 = 3
+const SCALING_FILL: u32 = 4
+const SCALING_NONE: u32 = 5
 const COLOR_AUTO: u32 = 0
 const COLOR_MONO: u32 = 1
 const COLOR_COLOR: u32 = 2
@@ -108,6 +123,7 @@ struct PrinterInfo {
     is_default: bool,
     media: str, // media-supported, comma-separated
     formats: str, // document-format-supported, comma-separated
+    scaling: str, // print-scaling-supported, comma-separated ("" = not told)
 }
 
 struct PrintOptions {
@@ -118,11 +134,12 @@ struct PrintOptions {
     job_name: str,
     user: str,
     landscape: bool,
+    scaling: u32, // SCALING_*
 }
 
 fn print_options_default() -> PrintOptions {
     return PrintOptions { copies: 1, sides: SIDES_ONE, color: COLOR_AUTO, media: "", job_name: "OpenPlan",
-        user: "openplan", landscape: false }
+        user: "openplan", landscape: false, scaling: SCALING_DEFAULT }
 }
 
 static mut last_status: u32 = 0
@@ -135,7 +152,7 @@ fn print_last_status() -> u32 {
 
 fn info_new() -> PrinterInfo {
     return PrinterInfo { name: "", uri: "", info: "", location: "", make: "", state: 0, accepting: false,
-        color: false, duplex: false, is_default: false, media: "", formats: "" }
+        color: false, duplex: false, is_default: false, media: "", formats: "", scaling: "" }
 }
 
 // ------------------------------------------------------------ Addresses
@@ -412,6 +429,7 @@ fn take(pi: *mut PrinterInfo, r: *mut Reader) {
     else if nm == "sides-supported" { if v.starts_with("two-sided") { (*pi).duplex = true } }
     else if nm == "media-supported" { (*pi).media = join((*pi).media, v) }
     else if nm == "document-format-supported" { (*pi).formats = join((*pi).formats, v) }
+    else if nm == "print-scaling-supported" { (*pi).scaling = join((*pi).scaling, v) }
 }
 
 fn requested(b: *mut rt.Buf) {
@@ -427,6 +445,7 @@ fn requested(b: *mut rt.Buf) {
     attr_more(b, V_KEYWORD, "sides-supported")
     attr_more(b, V_KEYWORD, "media-supported")
     attr_more(b, V_KEYWORD, "document-format-supported")
+    attr_more(b, V_KEYWORD, "print-scaling-supported")
 }
 
 // ------------------------------------------------------------ Operations
@@ -542,6 +561,57 @@ fn printer_attributes(printer: str, pi: *mut PrinterInfo) -> PrintError!bool {
     return true
 }
 
+// The IPP keyword of a SCALING_* value; "" for SCALING_DEFAULT (nothing is sent).
+fn scaling_keyword(v: u32) -> str {
+    if v == SCALING_AUTO {
+        return "auto"
+    }
+    if v == SCALING_AUTO_FIT {
+        return "auto-fit"
+    }
+    if v == SCALING_FIT {
+        return "fit"
+    }
+    if v == SCALING_FILL {
+        return "fill"
+    }
+    if v == SCALING_NONE {
+        return "none"
+    }
+    return ""
+}
+
+// The job attributes group (delimiter tag and the attributes of `o`) of a
+// Print-Job request; what `print_document` puts between the document's
+// name and format and the end-of-attributes tag. Public so that the octets
+// can be checked without a printer.
+fn ipp_encode_job_options(req: *mut rt.Buf, o: PrintOptions) {
+    put8(req, T_JOB as u32)
+    if o.copies > 1 {
+        attr_int(req, V_INTEGER, "copies", o.copies)
+    }
+    if o.sides == SIDES_LONG_EDGE {
+        attr(req, V_KEYWORD, "sides", "two-sided-long-edge")
+    } else if o.sides == SIDES_SHORT_EDGE {
+        attr(req, V_KEYWORD, "sides", "two-sided-short-edge")
+    }
+    if o.color == COLOR_MONO {
+        attr(req, V_KEYWORD, "print-color-mode", "monochrome")
+    } else if o.color == COLOR_COLOR {
+        attr(req, V_KEYWORD, "print-color-mode", "color")
+    }
+    if o.media.n > 0 {
+        attr(req, V_KEYWORD, "media", o.media)
+    }
+    if o.landscape {
+        attr_int(req, V_ENUM, "orientation-requested", 4 as u32)
+    }
+    let sc: str = scaling_keyword(o.scaling)
+    if sc.n > 0 {
+        attr(req, V_KEYWORD, "print-scaling", sc)
+    }
+}
+
 // Prints a PDF; the answer is the job id.
 fn print_pdf(printer: str, p: u64, n: usize, o: PrintOptions) -> PrintError!u32 {
     return try print_document(printer, p, n, "application/pdf", o)
@@ -561,26 +631,7 @@ fn print_document(printer: str, p: u64, n: usize, format: str, o: PrintOptions) 
     attr(&req, V_NAME, "requesting-user-name", o.user)
     attr(&req, V_NAME, "job-name", o.job_name)
     attr(&req, V_MIME, "document-format", format)
-    put8(&req, T_JOB as u32)
-    if o.copies > 1 {
-        attr_int(&req, V_INTEGER, "copies", o.copies)
-    }
-    if o.sides == SIDES_LONG_EDGE {
-        attr(&req, V_KEYWORD, "sides", "two-sided-long-edge")
-    } else if o.sides == SIDES_SHORT_EDGE {
-        attr(&req, V_KEYWORD, "sides", "two-sided-short-edge")
-    }
-    if o.color == COLOR_MONO {
-        attr(&req, V_KEYWORD, "print-color-mode", "monochrome")
-    } else if o.color == COLOR_COLOR {
-        attr(&req, V_KEYWORD, "print-color-mode", "color")
-    }
-    if o.media.n > 0 {
-        attr(&req, V_KEYWORD, "media", o.media)
-    }
-    if o.landscape {
-        attr_int(&req, V_ENUM, "orientation-requested", 4 as u32)
-    }
+    ipp_encode_job_options(&req, o)
     put8(&req, T_END as u32)
     rt.buf_push_bytes(&req, p, n)
     var ans: rt.Buf = rt.buf_new()
