@@ -1,0 +1,829 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/action.fi -- THE ACTION REGISTRY (docs/CONTEXT-MENUS.md, roadmap r161).
+//
+// ========================================================= WHY IT EXISTS
+//
+// A program that offers "Copy" offers it in five places: the context menu,
+// the menu bar, a toolbar button, Ctrl+C, and -- for a screen reader and for
+// an agent -- as "the default action" of an element. Until now every one of
+// these places wrote its own label, its own enabled test and its own handler,
+// so they drifted apart (a menu that says "Paste" while the shortcut is off).
+//
+// An ACTION is declared ONCE:
+//
+//     id        "copy"            a short verb; with the app name in front
+//                                 ("notes.copy") it is the name on the action
+//                                 bus of OrientOS (docs/ACTION-BUS.md)
+//     label     "std.copy"        a catalog key (or the plain text itself);
+//                                 "&Copy" marks the mnemonic letter
+//     icon      a Lucide id or ICON_NONE
+//     shortcut  key + modifiers   ("Ctrl+C" is SK('C') | MOD_CTRL)
+//     group     where it sorts inside a menu (G_*)
+//     level     read / write / critical -- the words of the action bus
+//     enabled / checked / visible   functions of the STATE, asked every time
+//     run       the handler
+//
+// and every surface asks the registry:
+//
+//     context menu    ctxmenu.fi collects action indices, asks enabled /
+//                     checked / visible when it BUILDS the menu
+//     shortcuts       act_dispatch_key(reg, key, mods, cx)
+//     a11y            the default action of a node = act_run(reg, i, cx)
+//     action bus      act_manifest writes the ACTIONS file of the app,
+//                     act_run_bus runs "notes.copy" for Jarvis / MCP
+//
+// There is no second table of labels or handlers anywhere. That is the
+// whole point of the file.
+//
+// ======================================================= WHAT IS NOT HERE
+//
+// N1 NO drawing, no menu, no scene: this file is pure bookkeeping -- a fixed
+//    table, no allocation, no std.rt. (It uses `str`, so it is an application
+//    module, not a kernel-profile one: `str` needs the collector there. A
+//    kernel UI would want the same table with u64 text pointers -- roadmap.)
+// N2 NO closures -- Firn has none. A handler is a named `fn(ud, cx)` and the
+//    program's pointer `ud`, the same shape as event.fi's handlers.
+// N3 NO translation engine. `act_label` asks a hook (a catalog of
+//    lib/appkit/texts.fi fits) and falls back to the small built-in
+//    catalogs of ctxstd.fi, then to the key itself -- a missing text shows
+//    its key, never an empty row (lib/i18n's rule).
+export {
+    ActCtx, Action, Actions, Catalog,
+    actions_new, actx_new, act_add, act_find, act_count, act_set_app, act_app,
+    act_set_icon, act_set_shortcut, act_set_group, act_set_level,
+    act_set_desc, act_set_flags, act_danger, act_set_enabled,
+    act_set_visible, act_set_check, act_set_radio, act_set_bus,
+    act_set_translator, act_set_catalog,
+    act_id, act_ud, act_label, act_tr, act_label_plain, act_desc, act_icon, act_group,
+    act_level, act_flags, act_key, act_mods, act_runs,
+    act_enabled, act_visible, act_checked, act_is_danger,
+    act_run, act_run_id, act_run_bus, act_match, act_dispatch_key,
+    act_mnemonic, act_manifest, act_bus_count,
+    shortcut_text, key_logical, label_clean, str_eq, str_starts,
+    catalog_new, catalog_add, catalog_find, catalog_parse,
+    ACT_MAX, ACT_NONE, ICON_NONE,
+    LV_READ, LV_WRITE, LV_CRITICAL,
+    G_PRIMARY, G_EDIT, G_SELECTION, G_VIEW, G_EXTENSION, G_DANGER, G_COUNT,
+    AF_DANGER, AF_CHECK, AF_RADIO, AF_NOBUS,
+    CHK_NONE, CHK_OFF, CHK_ON,
+    RUN_OK, RUN_UNKNOWN, RUN_DISABLED, RUN_HIDDEN,
+    SRC_NONE, SRC_MOUSE, SRC_TOUCH, SRC_PEN, SRC_MENU_KEY, SRC_SHIFT_F10,
+    SRC_API, SRC_A11Y, SRC_BUS,
+    MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_META,
+    SK_F1, SK_F10, SK_F12, SK_DELETE, SK_INSERT, SK_ENTER, SK_ESCAPE,
+    SK_BACKSPACE, SK_TAB, SK_HOME, SK_END, SK_PAGE_UP, SK_PAGE_DOWN,
+    SK_UP, SK_DOWN, SK_LEFT, SK_RIGHT, SK_MENU, SK_SPACE,
+}
+
+// How many actions one registry holds. The array length below must be the
+// same digit (Firn takes no name as an array length).
+const ACT_MAX: usize = 96
+const ACT_NONE: usize = 4294967295
+const ICON_NONE: i64 = 0 - 1
+const CATALOG_MAX: usize = 96
+
+// THE LEVEL of an action, the words of the OrientOS action bus manifest:
+// a read changes nothing, a write changes something the user can undo, a
+// critical one (delete, send, pay) always needs a human "yes" on the bus.
+const LV_READ: u32 = 0
+const LV_WRITE: u32 = 1
+const LV_CRITICAL: u32 = 2
+
+// THE GROUPS of a menu, in the order they appear. The first is on top, the
+// dangerous ones are LAST so that nobody hits "Delete" on the way to
+// something else (Windows 11 and macOS do the same).
+const G_PRIMARY: u32 = 0 // Open, Run, End task: what a click most likely wants
+const G_EDIT: u32 = 1 // Cut, Copy, Paste, Rename, Undo
+const G_SELECTION: u32 = 2 // Select all, sort, "Open with ..."
+const G_VIEW: u32 = 3 // View, Sort by, Columns, Refresh
+const G_EXTENSION: u32 = 4 // what a plugin / manifest adds
+const G_DANGER: u32 = 5 // Delete, Close window, Kill process
+const G_COUNT: u32 = 6
+
+// FLAGS
+const AF_DANGER: u32 = 1 // sorted into G_DANGER, painted in the error colour
+const AF_CHECK: u32 = 2 // a check mark entry (menuitemcheckbox)
+const AF_RADIO: u32 = 4 // a radio entry (menuitemradio)
+const AF_NOBUS: u32 = 8 // not offered on the action bus
+
+// What `checked` answers.
+const CHK_NONE: u32 = 0 // a plain entry
+const CHK_OFF: u32 = 1
+const CHK_ON: u32 = 2
+
+// What `act_run_id` answers.
+const RUN_OK: u32 = 0
+const RUN_UNKNOWN: u32 = 1
+const RUN_DISABLED: u32 = 2
+const RUN_HIDDEN: u32 = 3
+
+// WHERE a request came from. Every source makes the SAME request
+// (event.EV_CONTEXT): a right click, a long press, the menu key, Shift+F10
+// -- and a screen reader or the bus asking for the menu of an element.
+const SRC_NONE: u32 = 0
+const SRC_MOUSE: u32 = 1
+const SRC_TOUCH: u32 = 2
+const SRC_PEN: u32 = 3
+const SRC_MENU_KEY: u32 = 4
+const SRC_SHIFT_F10: u32 = 5
+const SRC_API: u32 = 6
+const SRC_A11Y: u32 = 7
+const SRC_BUS: u32 = 8
+
+// Modifier bits: the ones of lib/window/window.fi `ev_state` (X11 order).
+const MOD_SHIFT: u32 = 1
+const MOD_CTRL: u32 = 4
+const MOD_ALT: u32 = 8
+const MOD_META: u32 = 64
+
+// LOGICAL KEYS. A letter, digit or punctuation key is its upper-case ASCII
+// code ('C' = 67, '/' = 47, '1' = 49); a special key is one of these. A
+// shortcut is the logical key plus MOD_* bits -- no platform key codes, so
+// the same table serves X11, Windows, Android and the browser.
+const SK_SPACE: u32 = 32
+const SK_F1: u32 = 4097
+const SK_F10: u32 = 4106
+const SK_F12: u32 = 4108
+const SK_DELETE: u32 = 4112
+const SK_INSERT: u32 = 4113
+const SK_ENTER: u32 = 4114
+const SK_ESCAPE: u32 = 4115
+const SK_BACKSPACE: u32 = 4116
+const SK_TAB: u32 = 4117
+const SK_MENU: u32 = 4118
+const SK_HOME: u32 = 4119
+const SK_END: u32 = 4120
+const SK_PAGE_UP: u32 = 4121
+const SK_PAGE_DOWN: u32 = 4122
+const SK_UP: u32 = 4123
+const SK_DOWN: u32 = 4124
+const SK_LEFT: u32 = 4125
+const SK_RIGHT: u32 = 4126
+
+// ============================================================ STRINGS
+
+fn str_eq(a: str, b: str) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    var i: usize = 0
+    while i < a.n {
+        if *((a.p as u64 + i as u64) as *mut u8) != *((b.p as u64 + i as u64) as *mut u8) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Does `a` start with `b`?
+fn str_starts(a: str, b: str) -> bool {
+    if b.n > a.n {
+        return false
+    }
+    var i: usize = 0
+    while i < b.n {
+        if *((a.p as u64 + i as u64) as *mut u8) != *((b.p as u64 + i as u64) as *mut u8) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn byte_at(s: str, i: usize) -> u8 {
+    return *((s.p as u64 + i as u64) as *mut u8)
+}
+
+// ============================================================ THE CONTEXT
+
+// What a handler and a state function are told: the app's pointer, WHERE the
+// request came from and WHAT is selected. `ctxmenu.fi` fills it before it
+// builds a menu; a shortcut or the bus passes a plain one (actx_new).
+struct ActCtx {
+    ud: u64, // the application's pointer (App, document ...)
+    target: usize, // the node the request is about (ACT_NONE = none)
+    key: u32, // that node's key (scene.node_id), 0 = unkeyed
+    selected: usize, // how many items are selected (0 = nothing, 1, many)
+    source: u32, // SRC_*
+    mods: u32, // modifiers when it was asked
+    x: f64, // where it was asked, window coordinates
+    y: f64,
+    item: u32, // the key of the item under the pointer (a row key), 0 = none
+}
+
+fn actx_new(ud: u64) -> ActCtx {
+    return ActCtx { ud: ud, target: ACT_NONE, key: 0 as u32, selected: 0,
+        source: SRC_API, mods: 0 as u32, x: 0.0, y: 0.0, item: 0 as u32 }
+}
+
+// ============================================================ THE ACTION
+
+struct Action {
+    id: str,
+    label: str,
+    desc: str,
+    icon: i64,
+    key: u32,
+    mods: u32,
+    group: u32,
+    level: u32,
+    flags: u32,
+    runs: u64,
+    ud: u64,
+    on_run: fn(u64, *mut ActCtx),
+    on_enabled: fn(u64, *mut ActCtx) -> bool,
+    on_visible: fn(u64, *mut ActCtx) -> bool,
+    on_checked: fn(u64, *mut ActCtx) -> u32,
+}
+
+fn f_run(ud: u64, cx: *mut ActCtx) {
+}
+
+fn f_true(ud: u64, cx: *mut ActCtx) -> bool {
+    return true
+}
+
+fn f_plain(ud: u64, cx: *mut ActCtx) -> u32 {
+    return CHK_NONE
+}
+
+fn action_blank() -> Action {
+    return Action { id: "", label: "", desc: "", icon: ICON_NONE,
+        key: 0 as u32, mods: 0 as u32, group: G_EDIT, level: LV_WRITE,
+        flags: 0 as u32, runs: 0, ud: 0, on_run: f_run, on_enabled: f_true,
+        on_visible: f_true, on_checked: f_plain }
+}
+
+// A small catalog: key -> text, in the order they were added. One per
+// language; `act_set_catalog` points a registry at one (ctxstd.fi has the
+// English and German ones for the standard actions).
+struct Catalog {
+    keys: [str; 96],
+    texts: [str; 96],
+    n: usize,
+}
+
+fn catalog_new() -> Catalog {
+    return Catalog { keys: ["" ; 96], texts: ["" ; 96], n: 0 }
+}
+
+// Add one entry; false when the catalog is full. Texts are NOT copied.
+fn catalog_add(c: *mut Catalog, key: str, text: str) -> bool {
+    if (*c).n >= CATALOG_MAX {
+        return false
+    }
+    (*c).keys[(*c).n] = key
+    (*c).texts[(*c).n] = text
+    (*c).n = (*c).n + 1
+    return true
+}
+
+// The text of `key`, or `key` itself when the catalog does not know it.
+fn catalog_find(c: *mut Catalog, key: str) -> str {
+    var i: usize = 0
+    while i < (*c).n {
+        if str_eq((*c).keys[i], key) {
+            return (*c).texts[i]
+        }
+        i = i + 1
+    }
+    return key
+}
+
+// FILL a catalog from text: one `key = text` per line; empty lines and lines
+// starting with '#' are skipped; spaces around the key and the text are
+// trimmed. The strings point INTO `text`, which must outlive the catalog (an
+// embedded file, __include_str). Returns how many entries were added.
+fn catalog_parse(c: *mut Catalog, text: str) -> usize {
+    var added: usize = 0
+    var i: usize = 0
+    while i < text.n {
+        // one line: [i, e)
+        var e: usize = i
+        while e < text.n && byte_at(text, e) != (10 as u8) { e = e + 1 }
+        var a: usize = i
+        while a < e && (byte_at(text, a) == (32 as u8) || byte_at(text, a) == (9 as u8)) { a = a + 1 }
+        if a < e && byte_at(text, a) != (35 as u8) {
+            var eq: usize = a
+            while eq < e && byte_at(text, eq) != (61 as u8) { eq = eq + 1 }
+            if eq < e {
+                var k1: usize = eq
+                while k1 > a && (byte_at(text, k1 - 1) == (32 as u8) || byte_at(text, k1 - 1) == (9 as u8)) { k1 = k1 - 1 }
+                var v0: usize = eq + 1
+                while v0 < e && (byte_at(text, v0) == (32 as u8) || byte_at(text, v0) == (9 as u8)) { v0 = v0 + 1 }
+                var v1: usize = e
+                while v1 > v0 && (byte_at(text, v1 - 1) == (32 as u8) || byte_at(text, v1 - 1) == (9 as u8) || byte_at(text, v1 - 1) == (13 as u8)) { v1 = v1 - 1 }
+                let key: str = str { p: (text.p as u64 + a as u64) as *mut u8, n: k1 - a }
+                let val: str = str { p: (text.p as u64 + v0 as u64) as *mut u8, n: v1 - v0 }
+                if catalog_add(c, key, val) { added = added + 1 }
+            }
+        }
+        i = e + 1
+    }
+    return added
+}
+
+fn tr_none(ud: u64, key: str) -> str {
+    return key
+}
+
+struct Actions {
+    a: [Action; 96],
+    n: usize,
+    app: str,
+    // the translator hook (0 = none) and the built-in catalog (0 = none)
+    tr: fn(u64, str) -> str,
+    tr_ud: u64,
+    cat: u64,
+    refused: usize,
+}
+
+fn actions_new() -> Actions {
+    return Actions { a: [action_blank(); 96], n: 0, app: "app", tr: tr_none,
+        tr_ud: 0, cat: 0, refused: 0 }
+}
+
+fn act_count(r: *mut Actions) -> usize { return (*r).n }
+
+// The app's name: the front half of every bus name ("notes" -> "notes.copy").
+fn act_set_app(r: *mut Actions, app: str) {
+    (*r).app = app
+}
+
+fn act_app(r: *mut Actions) -> str { return (*r).app }
+
+// DECLARE an action. `id` is the verb, `label` the catalog key or the plain
+// text ("&Copy"), `f` the handler and `ud` what the handler gets first.
+// The index, or ACT_NONE when the registry is full. Declaring an id twice
+// REPLACES the first (a program that rebuilds its UI declares again): the
+// index stays the same, so menus and shortcuts that hold it keep working.
+fn act_add(r: *mut Actions, id: str, label: str, f: fn(u64, *mut ActCtx),
+    ud: u64) -> usize {
+    var i: usize = act_find(r, id)
+    if i == ACT_NONE {
+        if (*r).n >= ACT_MAX {
+            (*r).refused = (*r).refused + 1
+            return ACT_NONE
+        }
+        i = (*r).n
+        (*r).n = (*r).n + 1
+    }
+    (*r).a[i] = action_blank()
+    (*r).a[i].id = id
+    (*r).a[i].label = label
+    (*r).a[i].on_run = f
+    (*r).a[i].ud = ud
+    return i
+}
+
+fn act_find(r: *mut Actions, id: str) -> usize {
+    var i: usize = 0
+    while i < (*r).n {
+        if str_eq((*r).a[i].id, id) {
+            return i
+        }
+        i = i + 1
+    }
+    return ACT_NONE
+}
+
+fn act_set_icon(r: *mut Actions, i: usize, icon: i64) {
+    if i < (*r).n { (*r).a[i].icon = icon }
+}
+
+fn act_set_shortcut(r: *mut Actions, i: usize, key: u32, mods: u32) {
+    if i < (*r).n {
+        (*r).a[i].key = key
+        (*r).a[i].mods = mods
+    }
+}
+
+fn act_set_group(r: *mut Actions, i: usize, g: u32) {
+    if i < (*r).n { (*r).a[i].group = g }
+}
+
+fn act_set_level(r: *mut Actions, i: usize, lv: u32) {
+    if i < (*r).n { (*r).a[i].level = lv }
+}
+
+fn act_set_desc(r: *mut Actions, i: usize, d: str) {
+    if i < (*r).n { (*r).a[i].desc = d }
+}
+
+fn act_set_flags(r: *mut Actions, i: usize, f: u32) {
+    if i < (*r).n { (*r).a[i].flags = (*r).a[i].flags | f }
+}
+
+// A DANGEROUS action: last in the menu, painted in the error colour, and
+// "critical" on the action bus (it asks a human first).
+fn act_danger(r: *mut Actions, i: usize) {
+    if i < (*r).n {
+        (*r).a[i].flags = (*r).a[i].flags | AF_DANGER
+        (*r).a[i].group = G_DANGER
+        (*r).a[i].level = LV_CRITICAL
+    }
+}
+
+fn act_set_enabled(r: *mut Actions, i: usize, f: fn(u64, *mut ActCtx) -> bool) {
+    if i < (*r).n { (*r).a[i].on_enabled = f }
+}
+
+fn act_set_visible(r: *mut Actions, i: usize, f: fn(u64, *mut ActCtx) -> bool) {
+    if i < (*r).n { (*r).a[i].on_visible = f }
+}
+
+// A CHECK entry: `f` answers CHK_OFF / CHK_ON.
+fn act_set_check(r: *mut Actions, i: usize, f: fn(u64, *mut ActCtx) -> u32) {
+    if i < (*r).n {
+        (*r).a[i].on_checked = f
+        (*r).a[i].flags = (*r).a[i].flags | AF_CHECK
+    }
+}
+
+// A RADIO entry (one of a group, the chosen one answers CHK_ON).
+fn act_set_radio(r: *mut Actions, i: usize, f: fn(u64, *mut ActCtx) -> u32) {
+    if i < (*r).n {
+        (*r).a[i].on_checked = f
+        (*r).a[i].flags = (*r).a[i].flags | AF_RADIO
+    }
+}
+
+// Keep this action OFF the action bus (a purely visual one).
+fn act_set_bus(r: *mut Actions, i: usize, on: bool) {
+    if i < (*r).n {
+        if on {
+            (*r).a[i].flags = (*r).a[i].flags & (4294967295 as u32 - AF_NOBUS)
+        } else {
+            (*r).a[i].flags = (*r).a[i].flags | AF_NOBUS
+        }
+    }
+}
+
+// The translator hook: `f(ud, key)` answers the text of a catalog key (and
+// the key itself when it does not know it).
+fn act_set_translator(r: *mut Actions, ud: u64, f: fn(u64, str) -> str) {
+    (*r).tr = f
+    (*r).tr_ud = ud
+}
+
+// Point the registry at a built-in catalog (ctxstd.fi: std_catalog_en/de).
+fn act_set_catalog(r: *mut Actions, c: *mut Catalog) {
+    (*r).cat = c as u64
+}
+
+// The pointer the action was declared with (what its handler gets first).
+fn act_ud(r: *mut Actions, i: usize) -> u64 {
+    if i >= (*r).n { return 0 }
+    return (*r).a[i].ud
+}
+
+fn act_id(r: *mut Actions, i: usize) -> str {
+    if i >= (*r).n { return "" }
+    return (*r).a[i].id
+}
+
+// THE LABEL as it is shown: the hook first, then the catalog, else the key.
+// It may still carry a '&' (the mnemonic marker): `label_clean` strips it.
+fn act_label(r: *mut Actions, i: usize) -> str {
+    if i >= (*r).n { return "" }
+    return act_tr(r, (*r).a[i].label)
+}
+
+// Translate any catalog key (a submenu's label) the same way.
+fn act_tr(r: *mut Actions, key: str) -> str {
+    let f: fn(u64, str) -> str = (*r).tr
+    let t: str = f((*r).tr_ud, key)
+    if !str_eq(t, key) {
+        return t
+    }
+    if (*r).cat != 0 {
+        return catalog_find((*r).cat as *mut Catalog, key)
+    }
+    return key
+}
+
+fn act_label_plain(r: *mut Actions, i: usize) -> str {
+    return act_label(r, i)
+}
+
+fn act_desc(r: *mut Actions, i: usize) -> str {
+    if i >= (*r).n { return "" }
+    return (*r).a[i].desc
+}
+
+fn act_icon(r: *mut Actions, i: usize) -> i64 {
+    if i >= (*r).n { return ICON_NONE }
+    return (*r).a[i].icon
+}
+
+fn act_group(r: *mut Actions, i: usize) -> u32 {
+    if i >= (*r).n { return G_EDIT }
+    return (*r).a[i].group
+}
+
+fn act_level(r: *mut Actions, i: usize) -> u32 {
+    if i >= (*r).n { return LV_WRITE }
+    return (*r).a[i].level
+}
+
+fn act_flags(r: *mut Actions, i: usize) -> u32 {
+    if i >= (*r).n { return 0 as u32 }
+    return (*r).a[i].flags
+}
+
+fn act_key(r: *mut Actions, i: usize) -> u32 {
+    if i >= (*r).n { return 0 as u32 }
+    return (*r).a[i].key
+}
+
+fn act_mods(r: *mut Actions, i: usize) -> u32 {
+    if i >= (*r).n { return 0 as u32 }
+    return (*r).a[i].mods
+}
+
+fn act_runs(r: *mut Actions, i: usize) -> u64 {
+    if i >= (*r).n { return 0 }
+    return (*r).a[i].runs
+}
+
+fn act_is_danger(r: *mut Actions, i: usize) -> bool {
+    if i >= (*r).n { return false }
+    return ((*r).a[i].flags & AF_DANGER) != 0 as u32
+}
+
+// ====================================================== ASKING THE STATE
+
+fn act_enabled(r: *mut Actions, i: usize, cx: *mut ActCtx) -> bool {
+    if i >= (*r).n { return false }
+    let f: fn(u64, *mut ActCtx) -> bool = (*r).a[i].on_enabled
+    return f((*r).a[i].ud, cx)
+}
+
+fn act_visible(r: *mut Actions, i: usize, cx: *mut ActCtx) -> bool {
+    if i >= (*r).n { return false }
+    let f: fn(u64, *mut ActCtx) -> bool = (*r).a[i].on_visible
+    return f((*r).a[i].ud, cx)
+}
+
+fn act_checked(r: *mut Actions, i: usize, cx: *mut ActCtx) -> u32 {
+    if i >= (*r).n { return CHK_NONE }
+    let f: fn(u64, *mut ActCtx) -> u32 = (*r).a[i].on_checked
+    return f((*r).a[i].ud, cx)
+}
+
+// RUN an action: only when it is visible AND enabled (a shortcut must not
+// run what the menu would show greyed out). true when the handler ran.
+fn act_run(r: *mut Actions, i: usize, cx: *mut ActCtx) -> bool {
+    if act_run_id_at(r, i, cx) != RUN_OK {
+        return false
+    }
+    return true
+}
+
+fn act_run_id_at(r: *mut Actions, i: usize, cx: *mut ActCtx) -> u32 {
+    if i >= (*r).n { return RUN_UNKNOWN }
+    if !act_visible(r, i, cx) { return RUN_HIDDEN }
+    if !act_enabled(r, i, cx) { return RUN_DISABLED }
+    (*r).a[i].runs = (*r).a[i].runs + 1
+    let f: fn(u64, *mut ActCtx) = (*r).a[i].on_run
+    f((*r).a[i].ud, cx)
+    return RUN_OK
+}
+
+// RUN BY NAME ("copy"). RUN_OK, RUN_UNKNOWN, RUN_DISABLED or RUN_HIDDEN.
+fn act_run_id(r: *mut Actions, id: str, cx: *mut ActCtx) -> u32 {
+    return act_run_id_at(r, act_find(r, id), cx)
+}
+
+// RUN BY BUS NAME ("notes.copy"): the app prefix is stripped. This is what
+// the OrientOS action bus calls when Jarvis or a script triggers a menu entry;
+// the broker has already done the rights check and the confirmation.
+fn act_run_bus(r: *mut Actions, full: str, cx: *mut ActCtx) -> u32 {
+    let app: str = (*r).app
+    if full.n <= app.n + 1 || !str_starts(full, app)
+    || byte_at(full, app.n) != (46 as u8) {
+        return RUN_UNKNOWN
+    }
+    let verb: str = str { p: (full.p as u64 + (app.n + 1) as u64) as *mut u8,
+        n: full.n - app.n - 1 }
+    (*cx).source = SRC_BUS
+    return act_run_id(r, verb, cx)
+}
+
+// ============================================================ SHORTCUTS
+
+// The first action with this shortcut that may run now, ACT_NONE for none.
+fn act_match(r: *mut Actions, key: u32, mods: u32, cx: *mut ActCtx) -> usize {
+    if key == 0 as u32 { return ACT_NONE }
+    var i: usize = 0
+    while i < (*r).n {
+        if (*r).a[i].key == key && (*r).a[i].mods == mods
+        && act_visible(r, i, cx) && act_enabled(r, i, cx) {
+            return i
+        }
+        i = i + 1
+    }
+    return ACT_NONE
+}
+
+// A key press: run the action it belongs to. true = taken.
+fn act_dispatch_key(r: *mut Actions, key: u32, mods: u32, cx: *mut ActCtx) -> bool {
+    let i: usize = act_match(r, key, mods & (MOD_SHIFT | MOD_CTRL | MOD_ALT | MOD_META), cx)
+    if i == ACT_NONE { return false }
+    return act_run(r, i, cx)
+}
+
+// THE LOGICAL KEY of a typed character: with Ctrl held X11 and Windows send
+// a control code (3 for Ctrl+C), the browser sends 'c'; both become 'C'.
+fn key_logical(cp: u32) -> u32 {
+    if cp >= 1 as u32 && cp <= 26 as u32 {
+        return (64 as u32) + cp
+    }
+    if cp >= 97 as u32 && cp <= 122 as u32 {
+        return cp - (32 as u32)
+    }
+    return cp
+}
+
+fn put(out: *mut u8, cap: usize, n: usize, b: u8) -> usize {
+    if n < cap {
+        *((out as u64 + n as u64) as *mut u8) = b
+        return n + 1
+    }
+    return n
+}
+
+fn put_str(out: *mut u8, cap: usize, n0: usize, s: str) -> usize {
+    var n: usize = n0
+    var i: usize = 0
+    while i < s.n {
+        n = put(out, cap, n, byte_at(s, i))
+        i = i + 1
+    }
+    return n
+}
+
+// The text of a shortcut: "Ctrl+Shift+C", "Del", "F2". Returns the length.
+fn shortcut_text(key: u32, mods: u32, out: *mut u8, cap: usize) -> usize {
+    if key == 0 as u32 { return 0 }
+    var n: usize = 0
+    if (mods & MOD_CTRL) != 0 as u32 { n = put_str(out, cap, n, "Ctrl+") }
+    if (mods & MOD_ALT) != 0 as u32 { n = put_str(out, cap, n, "Alt+") }
+    if (mods & MOD_SHIFT) != 0 as u32 { n = put_str(out, cap, n, "Shift+") }
+    if (mods & MOD_META) != 0 as u32 { n = put_str(out, cap, n, "Meta+") }
+    if key >= SK_F1 && key <= SK_F12 {
+        n = put(out, cap, n, 70 as u8)
+        let f: u32 = key - SK_F1 + (1 as u32)
+        if f >= 10 as u32 {
+            n = put(out, cap, n, (48 as u8) + ((f / (10 as u32)) as u8))
+        }
+        n = put(out, cap, n, (48 as u8) + ((f % (10 as u32)) as u8))
+        return n
+    }
+    if key == SK_DELETE { return put_str(out, cap, n, "Del") }
+    if key == SK_INSERT { return put_str(out, cap, n, "Ins") }
+    if key == SK_ENTER { return put_str(out, cap, n, "Enter") }
+    if key == SK_ESCAPE { return put_str(out, cap, n, "Esc") }
+    if key == SK_BACKSPACE { return put_str(out, cap, n, "Backspace") }
+    if key == SK_TAB { return put_str(out, cap, n, "Tab") }
+    if key == SK_MENU { return put_str(out, cap, n, "Menu") }
+    if key == SK_HOME { return put_str(out, cap, n, "Home") }
+    if key == SK_END { return put_str(out, cap, n, "End") }
+    if key == SK_PAGE_UP { return put_str(out, cap, n, "PgUp") }
+    if key == SK_PAGE_DOWN { return put_str(out, cap, n, "PgDn") }
+    if key == SK_UP { return put_str(out, cap, n, "Up") }
+    if key == SK_DOWN { return put_str(out, cap, n, "Down") }
+    if key == SK_LEFT { return put_str(out, cap, n, "Left") }
+    if key == SK_RIGHT { return put_str(out, cap, n, "Right") }
+    if key == SK_SPACE { return put_str(out, cap, n, "Space") }
+    if key < 128 as u32 {
+        return put(out, cap, n, key as u8)
+    }
+    return n
+}
+
+// ============================================================ MNEMONICS
+
+// "&Copy" -> "Copy", written into `out` (cap bytes); returns the length.
+// `&&` is a literal '&'. `at` (when not 0) gets the byte index of the
+// mnemonic letter in the CLEAN text, or `n` (no mnemonic) -- the menu
+// underlines that letter and Alt/plain-letter selects it.
+fn label_clean(s: str, out: *mut u8, cap: usize, at: *mut usize) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    var found: usize = 4294967295
+    while i < s.n {
+        let b: u8 = byte_at(s, i)
+        if b == (38 as u8) && i + 1 < s.n {
+            if byte_at(s, i + 1) == (38 as u8) {
+                n = put(out, cap, n, b)
+                i = i + 2
+            } else {
+                if found == 4294967295 {
+                    found = n
+                }
+                i = i + 1
+            }
+        } else {
+            n = put(out, cap, n, b)
+            i = i + 1
+        }
+    }
+    if at as u64 != 0 {
+        if found == 4294967295 {
+            *at = n
+        } else {
+            *at = found
+        }
+    }
+    return n
+}
+
+// The mnemonic letter of an action's label as an upper-case ASCII code,
+// 0 when it has none.
+fn act_mnemonic(r: *mut Actions, i: usize) -> u32 {
+    let s: str = act_label(r, i)
+    var k: usize = 0
+    while k + 1 < s.n {
+        if byte_at(s, k) == (38 as u8) {
+            let nx: u8 = byte_at(s, k + 1)
+            if nx == (38 as u8) {
+                k = k + 2
+            } else {
+                return key_logical(nx as u32)
+            }
+        } else {
+            k = k + 1
+        }
+    }
+    return 0 as u32
+}
+
+// ====================================================== THE ACTION BUS
+
+fn act_bus_count(r: *mut Actions) -> usize {
+    var k: usize = 0
+    var i: usize = 0
+    while i < (*r).n {
+        if ((*r).a[i].flags & AF_NOBUS) == 0 as u32 {
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return k
+}
+
+// THE MANIFEST of the app in the format of docs/ACTION-BUS.md section 3
+// (the ACTIONS file next to `start`): one `action <app>.<verb> <level>
+// "<description>"` per action, so every menu entry is also something Jarvis
+// can call. `title` is the human name of the app. Returns the bytes
+// written (cut at `cap`). The description is the action's own text, else its
+// clean label; a '"' in it becomes a space.
+fn act_manifest(r: *mut Actions, title: str, out: *mut u8, cap: usize) -> usize {
+    var n: usize = 0
+    n = put_str(out, cap, n, "manifest 1\napp ")
+    n = put_str(out, cap, n, (*r).app)
+    n = put_str(out, cap, n, "\ntitle \"")
+    n = put_str(out, cap, n, title)
+    n = put_str(out, cap, n, "\"\n")
+    var i: usize = 0
+    while i < (*r).n {
+        if ((*r).a[i].flags & AF_NOBUS) == 0 as u32 {
+            n = put_str(out, cap, n, "\naction ")
+            n = put_str(out, cap, n, (*r).app)
+            n = put(out, cap, n, 46 as u8)
+            n = put_str(out, cap, n, (*r).a[i].id)
+            n = put(out, cap, n, 32 as u8)
+            let lv: u32 = (*r).a[i].level
+            if lv == LV_READ {
+                n = put_str(out, cap, n, "read")
+            } else if lv == LV_CRITICAL {
+                n = put_str(out, cap, n, "critical")
+            } else {
+                n = put_str(out, cap, n, "write")
+            }
+            n = put_str(out, cap, n, " \"")
+            var d: str = (*r).a[i].desc
+            var tmp: [u8; 96] = [0 as u8; 96]
+            var dn: usize = 0
+            if d.n == 0 {
+                var at: usize = 0
+                dn = label_clean(act_label(r, i), (&tmp[0]) as *mut u8, 96, &at)
+                d = str { p: (&tmp[0]) as *mut u8, n: dn }
+            }
+            var k: usize = 0
+            while k < d.n {
+                var b: u8 = byte_at(d, k)
+                if b == (34 as u8) || b == (10 as u8) {
+                    b = 32 as u8
+                }
+                n = put(out, cap, n, b)
+                k = k + 1
+            }
+            n = put_str(out, cap, n, "\"\n")
+        }
+        i = i + 1
+    }
+    return n
+}

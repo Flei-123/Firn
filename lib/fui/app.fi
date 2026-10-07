@@ -83,6 +83,10 @@ import plat.fuiwirt
 import fui.event
 import fui.audit
 import fui.a11y
+import fui.action
+import fui.ctxmenu
+import fui.ctxstd
+import fui.menuview
 import fui.apphost
 
 export {
@@ -90,6 +94,9 @@ export {
     list, list_item, chosen,
     set_text, append_text, set_number, text, number, quit, run,
     set_data, data, set_dark, focus, root, on, audit,
+    // r161: context menus and actions
+    actions, context, action_add, on_context, on_context_global, std_edit,
+    set_language, open_context, ctx_view,
     NONE,
     // the side a host and the tests see (lib/@*/fui/apphost.fi,
     // tools/fui/app_main.fi)
@@ -169,6 +176,8 @@ struct App {
     // what the program says for accessibility: a text field is named by its
     // hint (the grey text in the empty field)
     ax: a11y.A11y,
+    // the context menu state (CtxApp), made on first use; 0 = none (r161)
+    cs: u64,
 }
 
 fn cb_none(a: *mut App) {
@@ -199,7 +208,327 @@ fn app_blank() -> App {
         ptr_x: 0.0, ptr_y: 0.0,
         n_ed: 0, ed_bufs: 0, quit: false, user: 0,
         rt: event.router_new(), next_key: 60000 as u32, rt_on: false, lists_on: false,
-        ax: a11y.a11y_new(), tr: anim.transreg_new() }
+        ax: a11y.a11y_new(), tr: anim.transreg_new(), cs: 0 }
+}
+
+
+// ============================================================ ACTIONS AND CONTEXT MENUS (r161)
+//
+// ONE registry of actions (lib/fui/action.fi), ONE manager (lib/fui/ctxmenu.fi)
+// and ONE popup widget (lib/fui/menuview.fi) per window, made on the first
+// use -- a program that never asks for a menu pays nothing but the pointer.
+//
+//     fn copy(ud: u64, cx: *mut action.ActCtx) {
+//         let a: *mut app.App = ud as *mut app.App
+//         ...
+//     }
+//     fn rows_menu(ud: u64, pc: *mut ctxmenu.ProviderCtx) {
+//         let e: usize = ctxmenu.pc_add(pc, action.act_find(app.actions(a), "copy"))
+//     }
+//     let c: usize = app.action(a, "copy", "&Copy", copy)
+//     action.act_set_shortcut(app.actions(a), c, 67 as u32, action.MOD_CTRL)
+//     app.on_context(a, list, rows_menu)         // right click, long press,
+//                                                // menu key, Shift+F10: one menu
+//     app.std_edit(a)                            // text fields: Cut Copy Paste ...
+//
+// The handler's `ud` is the App. The same action serves the menu, its
+// shortcut, the screen reader's default action and the action bus
+// (`action.act_manifest`, `action.act_run_bus`).
+
+struct CtxApp {
+    acts: action.Actions,
+    cm: ctxmenu.Ctxm,
+    set: ctxstd.StdSet,
+    cat_en: action.Catalog,
+    cat_de: action.Catalog,
+    mv: *mut menuview.MenuView,
+    edit_on: bool,
+}
+
+
+fn app_sel_item(ud: u64, sc: *mut scene.Scene, n: usize) -> u32 {
+    let row: u32 = listrow.listrow_names().row
+    var k: usize = n
+    while k != scene.SCENE_NONE && k < scene.scene_count(sc) {
+        if scene.node_has_class(sc, k, row) {
+            return scene.node_id(sc, k)
+        }
+        k = scene.scene_parent(sc, k)
+    }
+    return 0 as u32
+}
+
+fn app_sel_is(ud: u64, key: u32) -> bool {
+    let a: *mut App = ud as *mut App
+    let n: usize = scene.scene_find_id(&(*a).sc, key)
+    if n == scene.SCENE_NONE { return false }
+    return scene.node_has_class(&(*a).sc, n, listrow.listrow_names().sel)
+}
+
+fn app_sel_only(ud: u64, key: u32) {
+    let a: *mut App = ud as *mut App
+    let n: usize = scene.scene_find_id(&(*a).sc, key)
+    if n == scene.SCENE_NONE { return }
+    let ok: bool = listrow.listrow_select(&(*a).sc, scene.scene_parent(&(*a).sc, n), key)
+    fuiwirt.host_touch(&(*a).w)
+}
+
+fn app_sel_clear(ud: u64) {
+    let a: *mut App = ud as *mut App
+    let cl: u32 = listrow.listrow_names().list
+    var i: usize = 0
+    while i < scene.scene_count(&(*a).sc) {
+        if scene.node_has_class(&(*a).sc, i, cl) {
+            let ok: bool = listrow.listrow_select(&(*a).sc, i, 0 as u32)
+        }
+        i = i + 1
+    }
+    fuiwirt.host_touch(&(*a).w)
+}
+
+fn app_sel_count(ud: u64) -> usize {
+    let a: *mut App = ud as *mut App
+    let sel: u32 = listrow.listrow_names().sel
+    var c: usize = 0
+    var i: usize = 0
+    while i < scene.scene_count(&(*a).sc) {
+        if scene.node_has_class(&(*a).sc, i, sel) { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+// A menu closed: the page repaints; the focus stays where it was.
+fn app_ctx_closed(ud: u64, reason: u32) {
+    let a: *mut App = ud as *mut App
+    fuiwirt.host_touch(&(*a).w)
+}
+
+// A LONG PRESS of a finger or a pen = a context request (the mouse has its
+// right button). The router's arena sends it only when somebody listens.
+fn app_long_press(ud: u64, e: *mut event.Ev) -> u32 {
+    let a: *mut App = ud as *mut App
+    var src: u32 = action.SRC_TOUCH
+    if event.ev_ptype(e) == event.PT_MOUSE { return event.H_GO }
+    if event.ev_ptype(e) == event.PT_PEN { src = action.SRC_PEN }
+    let ch: u32 = fuiwirt.host_context(&(*a).w, src, event.ev_target(e),
+        event.ev_x(e), event.ev_y(e), event.ev_y(e))
+    return event.H_PREVENT
+}
+
+// The state, made on first use. 0 when there is no memory.
+fn ctx_state(a: *mut App) -> *mut CtxApp {
+    if (*a).cs != 0 {
+        return (*a).cs as *mut CtxApp
+    }
+    var probe: [CtxApp; 2] = [ctxapp_blank(); 2]
+    let n: usize = ((&probe[1]) as usize) - ((&probe[0]) as usize)
+    let p: u64 = rt.heap_alloc(n)
+    if p == 0 {
+        return 0 as u64 as *mut CtxApp
+    }
+    let cs: *mut CtxApp = p as *mut CtxApp
+    *cs = ctxapp_blank()
+    (*a).cs = p
+    ctxmenu.ctxm_set_actions(&(*cs).cm, &(*cs).acts)
+    ctxmenu.ctxm_set_ud(&(*cs).cm, a as u64)
+    ctxstd.std_catalog_en(&(*cs).cat_en)
+    ctxstd.std_catalog_de(&(*cs).cat_de)
+    action.act_set_catalog(&(*cs).acts, &(*cs).cat_en)
+    (*cs).mv = menuview.mv_new(&(*cs).cm)
+    menuview.mv_attach((*cs).mv, &(*a).sc)
+    ctxmenu.ctx_set_sel_hooks(&(*cs).cm, ctxmenu.SelHooks { ud: a as u64,
+        item_of: app_sel_item, is_selected: app_sel_is, select_only: app_sel_only,
+        clear: app_sel_clear, count: app_sel_count, on: true })
+    ctxmenu.ctx_set_on_close(&(*cs).cm, a as u64, app_ctx_closed)
+    fuiwirt.host_set_context(&(*a).w, (*cs).mv as u64, menuview.mv_request)
+    fuiwirt.host_set_popup(&(*a).w, (*cs).mv as u64, menuview.mv_is_open,
+        menuview.mv_pointer, menuview.mv_key, menuview.mv_char, menuview.mv_tick,
+        menuview.mv_wait)
+    // a long press on a finger or pen: the router has to be listening
+    let lp: bool = on(a, root(a), event.ev_bit(event.EV_LONG_PRESS), app_long_press)
+    return cs
+}
+
+fn ctxapp_blank() -> CtxApp {
+    return CtxApp { acts: action.actions_new(), cm: ctxmenu.ctxm_new(),
+        set: ctxstd.std_set_new(), cat_en: action.catalog_new(),
+        cat_de: action.catalog_new(), mv: 0 as u64 as *mut menuview.MenuView,
+        edit_on: false }
+}
+
+// The window's action registry (made on first use); null without memory.
+fn actions(a: *mut App) -> *mut action.Actions {
+    let cs: *mut CtxApp = ctx_state(a)
+    if cs as u64 == 0 { return 0 as u64 as *mut action.Actions }
+    return &(*cs).acts
+}
+
+// The window's context-menu manager (providers, plugin entries, state).
+fn context(a: *mut App) -> *mut ctxmenu.Ctxm {
+    let cs: *mut CtxApp = ctx_state(a)
+    if cs as u64 == 0 { return 0 as u64 as *mut ctxmenu.Ctxm }
+    return &(*cs).cm
+}
+
+// The popup widget (menuview.fi), for a test or a program that sets bounds.
+fn ctx_view(a: *mut App) -> *mut menuview.MenuView {
+    let cs: *mut CtxApp = ctx_state(a)
+    if cs as u64 == 0 { return 0 as u64 as *mut menuview.MenuView }
+    return (*cs).mv
+}
+
+// DECLARE an action: id (a verb), label (catalog key or text, "&Copy" marks
+// the mnemonic), handler `f(ud, cx)` where `ud` is the App. Returns its index
+// in the registry (action.ACT_NONE when full).
+fn action_add(a: *mut App, id: str, label: str, f: fn(u64, *mut action.ActCtx)) -> usize {
+    let r: *mut action.Actions = actions(a)
+    if r as u64 == 0 { return action.ACT_NONE }
+    return action.act_add(r, id, label, f, a as u64)
+}
+
+// A PROVIDER for the node `node` and everything under it: it adds entries
+// (ctxmenu.pc_add ...) when a menu is requested there. false when the node is
+// bad or the table is full.
+fn on_context(a: *mut App, node: usize, f: fn(u64, *mut ctxmenu.ProviderCtx)) -> bool {
+    if node >= scene.scene_count(&(*a).sc) { return false }
+    let cm: *mut ctxmenu.Ctxm = context(a)
+    if cm as u64 == 0 { return false }
+    var key: u32 = scene.node_id(&(*a).sc, node)
+    if key == 0 as u32 {
+        key = (*a).next_key
+        (*a).next_key = (*a).next_key + 1 as u32
+        scene.node_set_id(&(*a).sc, node, key)
+    }
+    return ctxmenu.ctx_provider_key(cm, key, f, a as u64)
+}
+
+// A PROVIDER for every request in the window.
+fn on_context_global(a: *mut App, f: fn(u64, *mut ctxmenu.ProviderCtx)) -> bool {
+    let cm: *mut ctxmenu.Ctxm = context(a)
+    if cm as u64 == 0 { return false }
+    return ctxmenu.ctx_provider_global(cm, f, a as u64)
+}
+
+// OPEN THE MENU OF `node` from the program (source API): at the node's lower
+// left corner. true = a menu is open.
+fn open_context(a: *mut App, node: usize) -> bool {
+    if node >= scene.scene_count(&(*a).sc) { return false }
+    let y0: f64 = scene.node_y(&(*a).sc, node)
+    let ch: u32 = fuiwirt.host_context(&(*a).w, action.SRC_API, node,
+        scene.node_x(&(*a).sc, node), y0 + scene.node_h(&(*a).sc, node), y0)
+    return ctxmenu.ctx_is_open(context(a))
+}
+
+// "en" or "de": the language of the standard entries (the built-in catalogs).
+fn set_language(a: *mut App, lang: str) {
+    let cs: *mut CtxApp = ctx_state(a)
+    if cs as u64 == 0 { return }
+    if lang.n >= 2 && *((lang.p as u64) as *mut u8) == (100 as u8)
+    && *((lang.p as u64 + 1) as *mut u8) == (101 as u8) {
+        action.act_set_catalog(&(*cs).acts, &(*cs).cat_de)
+    } else {
+        action.act_set_catalog(&(*cs).acts, &(*cs).cat_en)
+    }
+}
+
+// ---- the text field's share: Undo Redo Cut Copy Paste Delete Select all
+
+fn edit_slot(a: *mut App, cx: *mut action.ActCtx) -> usize {
+    if cx as u64 != 0 && (*cx).target != action.ACT_NONE {
+        let k: usize = slot_of(a, (*cx).target)
+        if k != NONE { return k }
+    }
+    return focused_slot(a)
+}
+
+fn app_edit_act(ud: u64, op: u32, cx: *mut action.ActCtx) {
+    let a: *mut App = ud as *mut App
+    let k: usize = edit_slot(a, cx)
+    if k == NONE { return }
+    // the same paths a key takes, so the layout of a text area follows
+    var ch: u32 = 0 as u32
+    var r: u32 = 0 as u32
+    if op == ctxstd.OP_UNDO { ch = 122 as u32 }
+    if op == ctxstd.OP_REDO { ch = 121 as u32 }
+    if op == ctxstd.OP_CUT { ch = 120 as u32 }
+    if op == ctxstd.OP_COPY { ch = 99 as u32 }
+    if op == ctxstd.OP_PASTE { ch = 118 as u32 }
+    if op == ctxstd.OP_SELECT_ALL { ch = 97 as u32 }
+    if ch != 0 as u32 {
+        if (*a).area[k] {
+            r = textarea.ta_char(&(*a).lines[k], &(*a).ed[k], ch, editor.MOD_CTRL)
+        } else {
+            r = editor.editor_char(&(*a).ed[k], ch, editor.MOD_CTRL)
+        }
+    } else if op == ctxstd.OP_DELETE {
+        if (*a).area[k] {
+            r = textarea.ta_key(&(*a).lines[k], &(*a).ed[k], editor.KEY_DELETE, 0 as u32)
+        } else {
+            r = editor.editor_key(&(*a).ed[k], editor.KEY_DELETE, 0 as u32)
+        }
+    }
+    fuiwirt.host_touch(&(*a).w)
+}
+
+fn app_edit_can(ud: u64, op: u32, cx: *mut action.ActCtx) -> u32 {
+    let a: *mut App = ud as *mut App
+    let k: usize = edit_slot(a, cx)
+    if k == NONE { return ctxstd.CAN_OFF }
+    let t: *mut textbuf.TextBuf = editor.editor_buf(&(*a).ed[k])
+    let sel: bool = textbuf.tb_has_sel(t)
+    let secret: bool = textbuf.tb_secret(t)
+    if op == ctxstd.OP_CUT || op == ctxstd.OP_COPY {
+        if !sel || secret { return ctxstd.CAN_OFF }
+    }
+    if op == ctxstd.OP_DELETE && !sel { return ctxstd.CAN_OFF }
+    if op == ctxstd.OP_SELECT_ALL && textbuf.tb_len(t) == 0 { return ctxstd.CAN_OFF }
+    return 0 as u32
+}
+
+fn app_edit_tag(ud: u64, cx: *mut action.ActCtx) -> str {
+    return "text"
+}
+
+// THE STANDARD ENTRIES FOR EVERY TEXT FIELD AND TEXT AREA of the window:
+// Undo, Redo | Cut, Copy, Paste, Delete | Select all (English or German,
+// `set_language`), with Ctrl+Z / Y / X / C / V / A. Call once.
+fn std_edit(a: *mut App) {
+    let cs: *mut CtxApp = ctx_state(a)
+    if cs as u64 == 0 || (*cs).edit_on { return }
+    (*cs).edit_on = true
+    let ok: bool = ctxstd.std_register(&(*cs).acts, &(*cs).set, ctxstd.FAM_EDIT,
+        ctxstd.StdOps { ud: a as u64, act: app_edit_act, can: app_edit_can,
+            tag: app_edit_tag })
+    let ok2: bool = ctxmenu.ctx_provider_kind(&(*cs).cm, widget.KIND_TEXTBOX,
+        ctxstd.std_prov_edit, a as u64)
+}
+
+// ---- the shortcuts: the key a text field did not want runs an action
+
+fn shortcut_run(a: *mut App, key: u32, mods: u32) -> bool {
+    if (*a).cs == 0 { return false }
+    let cs: *mut CtxApp = (*a).cs as *mut CtxApp
+    var cx: action.ActCtx = action.actx_new(a as u64)
+    cx.source = action.SRC_NONE
+    cx.mods = mods
+    let ok: bool = action.act_dispatch_key(&(*cs).acts, key, mods, &cx)
+    if ok { fuiwirt.host_touch(&(*a).w) }
+    return ok
+}
+
+fn shortcut_char(a: *mut App, cp: u32, mods: u32) -> bool {
+    if (mods & (editor.MOD_CTRL | editor.MOD_ALT)) == 0 as u32 { return false }
+    return shortcut_run(a, action.key_logical(cp), mods)
+}
+
+fn shortcut_key(a: *mut App, key: u32, mods: u32) -> bool {
+    var sk: u32 = 0 as u32
+    if key == editor.KEY_DELETE { sk = action.SK_DELETE }
+    if key == editor.KEY_ENTER { sk = action.SK_ENTER }
+    if key == editor.KEY_BACKSPACE { sk = action.SK_BACKSPACE }
+    if sk == 0 as u32 { return false }
+    return shortcut_run(a, sk, mods)
 }
 
 // ============================================================ THE WINDOW
@@ -830,6 +1159,13 @@ fn app_paint(ud: u64, w: usize, h: usize) {
     anim.transreg_new_frame(&(*a).tr)
     scene.scene_run(&(*a).sc, &(*a).c, &(*a).sh, 0.0, 0.0, w as f64,
         h as f64)
+    // A MENU IS PAINTED ABOVE THE PAGE (r161)
+    if (*a).cs != 0 {
+        let cs: *mut CtxApp = (*a).cs as *mut CtxApp
+        menuview.mv_bind((*cs).mv, &(*a).c)
+        menuview.mv_set_bounds((*cs).mv, 0.0, 0.0, w as f64, h as f64)
+        menuview.mv_draw((*cs).mv, &(*a).c)
+    }
 }
 
 // How many lines `p`/`n` needs at width `w` -- the loop of
@@ -922,7 +1258,7 @@ fn app_key(ud: u64, key: u32, mods: u32) -> bool {
     let a: *mut App = ud as *mut App
     let k: usize = focused_slot(a)
     if k == NONE {
-        return false
+        return shortcut_key(a, key, mods)
     }
     var r: u32 = 0 as u32
     if (*a).area[k] {
@@ -932,7 +1268,7 @@ fn app_key(ud: u64, key: u32, mods: u32) -> bool {
     }
     if r == editor.RES_PASS || r == editor.RES_COMMIT
     || r == editor.RES_CANCEL {
-        return false
+        return shortcut_key(a, key, mods)
     }
     fuiwirt.host_touch(&(*a).w)
     return true
@@ -943,7 +1279,7 @@ fn app_char(ud: u64, cp: u32, mods: u32) -> bool {
     let a: *mut App = ud as *mut App
     let k: usize = focused_slot(a)
     if k == NONE {
-        return false
+        return shortcut_char(a, cp, mods)
     }
     var r: u32 = 0 as u32
     if (*a).area[k] {
@@ -952,7 +1288,7 @@ fn app_char(ud: u64, cp: u32, mods: u32) -> bool {
         r = editor.editor_char(&(*a).ed[k], cp, mods)
     }
     if r == editor.RES_PASS {
-        return false
+        return shortcut_char(a, cp, mods)
     }
     fuiwirt.host_touch(&(*a).w)
     return true

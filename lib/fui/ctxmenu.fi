@@ -1,0 +1,1770 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/ctxmenu.fi -- THE CONTEXT MENU, AS A MODEL (docs/CONTEXT-MENUS.md,
+// roadmap r161).
+//
+// ========================================================= WHY IT EXISTS
+//
+// Right click in the task manager, on the task bar, on the desktop, in the
+// explorer, in an editor, on a list row, on a window's title bar: ten places
+// that do the same thing and were written ten times. This file is the thing
+// they share. It is the MODEL -- what is in the menu, in what order, which
+// entry is focused, when it closes -- and it draws nothing. The picture is
+// lib/fui/menuview.fi, the popup on its own window layer is
+// lib/fui/popup.fi; the text field / list / title bar entries every program
+// wants are lib/fui/ctxstd.fi.
+//
+// ============================================== FROM THE REQUEST TO A MENU
+//
+//   1. THE REQUEST. A right click, a long press, the menu key and Shift+F10
+//      all make ONE request: (target node, position, source, modifiers) --
+//      event.EV_CONTEXT, which travels capture -> target -> bubble like
+//      every event, so a handler may H_PREVENT it (the DOM `contextmenu`
+//      event). What the host does with it: `ctx_request`.
+//   2. THE SELECTION RULE, Windows' (docs/CONTEXT-MENUS.md section 2): a
+//      right click on an item that is NOT selected selects it first (and
+//      drops the rest); on a selected item the selection stays, so "Delete"
+//      acts on all of them; on empty ground the selection is dropped. The
+//      program says what an item is and how to select it through
+//      `SelHooks`; without hooks nothing is touched.
+//   3. THE CHAIN. From the target node UP to the root, every node may carry
+//      PROVIDERS (a function that adds entries): keyed to the node
+//      (`ctx_provider_key`), to a widget kind (`ctx_provider_kind`: every
+//      text field), or global (`ctx_provider_global`). A provider adds
+//      ACTIONS from the registry (action.fi) -- never labels or handlers of
+//      its own -- into a GROUP, with a priority, optionally into a submenu.
+//   4. THE MERGE. Invisible actions are dropped; the same action offered by
+//      two providers appears once, the one NEARER the target wins its place;
+//      a submenu of the same label is one submenu; entries sort by
+//      (group, priority, order added) with the dangerous ones last; a
+//      separator stands between two groups, never first, never last, never
+//      twice. Plugins add entries by TAG (".txt", "dir", "*") and by right
+//      level (`ctx_set_grant`): an entry whose owner has no grant is not
+//      shown, and counted.
+//   5. THE STATE: which entry is focused, which submenus are open, the
+//      pending open/close of a submenu (hover delay), the typed-ahead
+//      letters, the close rules. A host feeds it keys, characters, hover,
+//      press, a clock tick; every answer is a bit mask (CR_*).
+//
+// ======================================================= WHAT IS NOT HERE
+//
+// N1 NO drawing and no screen. The model allocates nothing and uses no std.rt
+//    (a fixed pool); it needs only the scene tree to walk the chain. (Like
+//    action.fi it uses `str`, so a kernel-profile build would need a u64-text
+//    variant of both -- roadmap.)
+// N2 NO text engine. A label is a catalog key or text (action.fi); the clean
+//    text (no '&') is copied once into the menu's own arena when it is built.
+// N3 NO platform. A host maps its keys to action.SK_* and its pointer to an
+//    item index (menuview.fi does the hit test) and nothing else.
+export {
+    Ctxm, ProviderCtx, SelHooks, Item,
+    ctxm_new, ctxm_reset, ctxm_actions, ctxm_set_actions, ctxm_ud, ctxm_set_ud,
+    ctx_provider_key, ctx_provider_kind, ctx_provider_global, ctx_provider_off,
+    ctx_provider_count, ctx_set_sel_hooks, ctx_set_grant, ctx_set_on_close,
+    ctx_extension_add, ctx_extension_count, Place, menu_flags, menu_mpos, menu_kids,
+    ctx_request, ctx_build, ctx_apply_selection, selection_policy,
+    pc_add, pc_add_to, pc_sep, pc_submenu, pc_group, pc_prio, pc_danger,
+    pc_tag, pc_target, pc_node_key, pc_source, pc_selected, pc_item,
+    pc_actions, pc_actx, pc_count,
+    menu_count, menu_item, menu_kind, menu_parent, menu_act, menu_label,
+    menu_icon, menu_enabled, menu_checked, menu_danger, menu_key,
+    menu_mods, menu_mnemonic, menu_level_count, menu_level_at,
+    menu_index_of_act, menu_total_actions, menu_has_check, menu_has_icon,
+    ctx_selected, ctx_is_open, ctx_depth, ctx_focus, ctx_set_focus, ctx_open_sub, ctx_open_path,
+    ctx_source, ctx_touch, ctx_anchor_x, ctx_anchor_y, ctx_anchor_alt, ctx_target,
+    ctx_key, ctx_char, ctx_hover, ctx_press, ctx_tick, ctx_activate,
+    ctx_close, ctx_close_level, ctx_focus_lost, ctx_window_changed,
+    ctx_set_locked, ctx_locked,
+    ctx_last_ran, ctx_last_reason, ctx_stat, ctx_announce_seq,
+    ctx_announce_text, ctx_pending_ms, ctx_ran_count, ctx_open_count,
+    ctx_mark_changed, ctx_changed, ctx_clear_changed,
+    place_popup, place_submenu,
+    IK_ACTION, IK_SEP, IK_SUB,
+    CR_NONE, CR_CONSUMED, CR_CLOSED, CR_RAN, CR_PASS, CR_REPAINT, CR_OPENED,
+    CLOSE_NONE, CLOSE_ESC, CLOSE_OUTSIDE, CLOSE_FOCUS, CLOSE_WINDOW,
+    CLOSE_LOCK, CLOSE_RAN, CLOSE_API, CLOSE_TAB, CLOSE_NEW,
+    SEL_KEEP, SEL_REPLACE, SEL_CLEAR,
+    PM_KEY, PM_KIND, PM_GLOBAL,
+    ST_REQUESTS, ST_OPENED, ST_REFUSED, ST_DUPLICATES, ST_HIDDEN,
+    ST_DENIED, ST_PRUNED, ST_OVERFLOW, ST_PREVENTED,
+    OPEN_MS, CLOSE_MS, TYPEAHEAD_MS, MENU_MAX, SUB_DEPTH, PROV_MAX,
+    NONE, GLOBAL_KEY,
+}
+
+import fui.action
+import fui.scene
+import fui.widget
+
+const NONE: usize = 4294967295
+const GLOBAL_KEY: u32 = 4294967295
+
+// THE POOL. The numbers must match the array lengths below (Firn takes no
+// name as an array length).
+const MENU_MAX: usize = 96 // items in one menu, submenus included
+const FIN_MAX: usize = 128 // items + separators in the final order
+const PROV_MAX: usize = 48
+const EXT_MAX: usize = 16
+const TAG_MAX: usize = 8
+const ARENA_MAX: usize = 6144
+const SUB_DEPTH: usize = 3 // the menu and two submenu levels below it
+
+// TIME, in milliseconds. Windows' MenuShowDelay is 400; 250 feels right with
+// a mouse that is not trying to hit a diagonal.
+const OPEN_MS: i64 = 250
+const CLOSE_MS: i64 = 300
+const TYPEAHEAD_MS: i64 = 1000
+
+// ITEM KINDS
+const IK_ACTION: u32 = 1
+const IK_SEP: u32 = 2
+const IK_SUB: u32 = 3
+
+// WHAT AN INPUT CALL ANSWERS (bits).
+const CR_NONE: u32 = 0
+const CR_CONSUMED: u32 = 1 // the menu took it; the page must not see it
+const CR_CLOSED: u32 = 2 // the menu is closed now
+const CR_RAN: u32 = 4 // an action ran
+const CR_PASS: u32 = 8 // closed by an outside press: let the press through
+const CR_REPAINT: u32 = 16 // the picture changed
+const CR_OPENED: u32 = 32 // a menu is open now
+
+// WHY A MENU CLOSED.
+const CLOSE_NONE: u32 = 0
+const CLOSE_ESC: u32 = 1
+const CLOSE_OUTSIDE: u32 = 2 // a press outside every menu level
+const CLOSE_FOCUS: u32 = 3 // the window lost the focus
+const CLOSE_WINDOW: u32 = 4 // moved, resized, minimised, another window
+const CLOSE_LOCK: u32 = 5 // the screen lock came up (lockseal)
+const CLOSE_RAN: u32 = 6 // an entry was activated
+const CLOSE_API: u32 = 7
+const CLOSE_TAB: u32 = 8
+const CLOSE_NEW: u32 = 9 // another menu replaced it
+
+// THE SELECTION RULE. See selection_policy.
+const SEL_KEEP: u32 = 0
+const SEL_REPLACE: u32 = 1
+const SEL_CLEAR: u32 = 2
+
+// HOW A PROVIDER IS FOUND.
+const PM_KEY: u32 = 1 // the node's key (scene.node_id)
+const PM_KIND: u32 = 2 // the node's widget kind (widget.KIND_*)
+const PM_GLOBAL: u32 = 3 // every request, after the nodes
+
+// Counters, for tests and for the inspector.
+const ST_REQUESTS: usize = 0
+const ST_OPENED: usize = 1
+const ST_REFUSED: usize = 2 // locked, or nothing to show
+const ST_DUPLICATES: usize = 3
+const ST_HIDDEN: usize = 4 // invisible actions left out
+const ST_DENIED: usize = 5 // plugin entries without a grant
+const ST_PRUNED: usize = 6 // empty submenus dropped
+const ST_OVERFLOW: usize = 7 // entries the pool had no room for
+const ST_PREVENTED: usize = 8
+
+// ============================================================ THE POOL
+
+// One entry while collecting and, after ctx_build, one entry of the menu.
+struct Item {
+    kind: u32,
+    act: usize, // the action (IK_ACTION)
+    parent: usize, // the submenu header it belongs to, NONE = the menu itself
+    group: u32,
+    prio: i64,
+    seq: u32,
+    dist: u32, // how far from the target node the provider sat
+    flags: u32, // action.AF_* plus DANGER from the provider
+    icon: i64,
+    label: str, // clean text, lives in the menu's arena (after ctx_build)
+    raw: str, // what the provider gave a submenu (catalog key / text)
+    enabled: bool,
+    checked: u32,
+    mnemonic: u32, // upper-case ASCII code, 0 = none
+    mpos: usize, // byte index of the mnemonic letter in `label`
+    key: u32, // the shortcut shown on the right
+    mods: u32,
+    kids: usize, // how many children survived (IK_SUB)
+    slot: usize, // the place in the final list (after ctx_build)
+}
+
+fn item_blank() -> Item {
+    return Item { kind: IK_ACTION, act: NONE, parent: NONE, group: action.G_EDIT,
+        prio: 0, seq: 0 as u32, dist: 0 as u32, flags: 0 as u32,
+        icon: action.ICON_NONE, label: "", raw: "", enabled: true,
+        checked: action.CHK_NONE, mnemonic: 0 as u32, mpos: 0,
+        key: 0 as u32, mods: 0 as u32, kids: 0, slot: NONE }
+}
+
+struct Provider {
+    mode: u32,
+    key: u32, // PM_KEY: the node key; PM_KIND: the widget kind
+    f: fn(u64, *mut ProviderCtx),
+    ud: u64,
+    on: bool,
+}
+
+fn prov_none(ud: u64, pc: *mut ProviderCtx) {
+}
+
+fn provider_blank() -> Provider {
+    return Provider { mode: 0 as u32, key: 0 as u32, f: prov_none, ud: 0, on: false }
+}
+
+// A plugin's entry: an action of the registry that shows up in menus whose
+// providers declared a matching TAG. `owner` is who ships it (the rights
+// check asks about the owner), `tag` ".txt" / "dir" / "*".
+struct Ext {
+    act: usize,
+    owner: str,
+    tag: str,
+    prio: i64,
+    on: bool,
+}
+
+fn ext_blank() -> Ext {
+    return Ext { act: NONE, owner: "", tag: "", prio: 0, on: false }
+}
+
+// The program's say about selection (see the file head, point 2). All four
+// are optional; ud is the program's pointer.
+struct SelHooks {
+    ud: u64,
+    // the selectable item (a row key) that node `n` is, or is inside; 0 = none
+    item_of: fn(u64, *mut scene.Scene, usize) -> u32,
+    is_selected: fn(u64, u32) -> bool,
+    select_only: fn(u64, u32),
+    clear: fn(u64),
+    count: fn(u64) -> usize,
+    on: bool,
+}
+
+fn sel_item_none(ud: u64, sc: *mut scene.Scene, n: usize) -> u32 { return 0 as u32 }
+fn sel_is_none(ud: u64, k: u32) -> bool { return false }
+fn sel_only_none(ud: u64, k: u32) {
+}
+fn sel_clear_none(ud: u64) {
+}
+fn sel_count_none(ud: u64) -> usize { return 0 }
+
+fn selhooks_blank() -> SelHooks {
+    return SelHooks { ud: 0, item_of: sel_item_none, is_selected: sel_is_none,
+        select_only: sel_only_none, clear: sel_clear_none, count: sel_count_none,
+        on: false }
+}
+
+fn grant_all(ud: u64, owner: str, level: u32) -> bool { return true }
+
+fn close_none(ud: u64, reason: u32) {
+}
+
+// THE MANAGER: providers, plugin entries, the menu being built or shown,
+// and the state of the open menu. One per window. NEVER COPY IT after a
+// menu was built: the labels point into its own arena.
+struct Ctxm {
+    // ---- what is registered
+    acts: u64, // *mut action.Actions
+    ud: u64,
+    provs: [Provider; 48],
+    np: usize,
+    exts: [Ext; 16],
+    ne: usize,
+    sel: SelHooks,
+    grant: fn(u64, str, u32) -> bool,
+    grant_ud: u64,
+    on_close: fn(u64, u32),
+    close_ud: u64,
+    // ---- the menu
+    items: [Item; 96],
+    n: usize,
+    fin: [usize; 128], // item index, or NONE for a separator
+    finp: [usize; 128], // the parent of that slot
+    nf: usize,
+    arena: [u8; 6144],
+    na: usize,
+    seq: u32,
+    cur_dist: u32,
+    cur_prio_base: i64,
+    tags: [str; 8],
+    nt: usize,
+    cx: action.ActCtx,
+    // ---- the state of the open menu
+    open: bool,
+    depth: usize, // open levels, 1 = just the menu
+    path: [usize; 3], // path[d] = the submenu header opened at level d (d>=1)
+    foc: [usize; 3], // the focused item per level, NONE = none
+    pend_open: usize, // a submenu header waiting to open (hover delay)
+    pend_open_at: i64,
+    pend_close_level: usize, // the deepest level to keep when it fires, NONE = none
+    pend_close_at: i64,
+    ta: [u8; 16], // typeahead
+    nta: usize,
+    ta_at: i64,
+    ax: f64, // where it was asked
+    ay: f64,
+    ay_alt: f64, // where to flip to when there is no room below (keyboard)
+    source: u32,
+    touch: bool,
+    target: usize,
+    locked: bool,
+    last_ran: usize,
+    last_reason: u32,
+    ran: u64,
+    opened: u64,
+    changed: bool,
+    said: u64, // the announcement counter (a screen reader bridge polls it)
+    say: [u8; 96],
+    nsay: usize,
+    stat: [u64; 12],
+}
+
+fn ctxm_new() -> Ctxm {
+    return Ctxm { acts: 0, ud: 0, provs: [provider_blank(); 48], np: 0,
+        exts: [ext_blank(); 16], ne: 0, sel: selhooks_blank(),
+        grant: grant_all, grant_ud: 0, on_close: close_none, close_ud: 0,
+        items: [item_blank(); 96], n: 0, fin: [0; 128], finp: [0; 128], nf: 0,
+        arena: [0 as u8; 6144], na: 0, seq: 0 as u32, cur_dist: 0 as u32,
+        cur_prio_base: 0, tags: ["" ; 8], nt: 0, cx: action.actx_new(0),
+        open: false, depth: 0, path: [0; 3], foc: [0; 3], pend_open: NONE,
+        pend_open_at: 0, pend_close_level: NONE, pend_close_at: 0,
+        ta: [0 as u8; 16], nta: 0, ta_at: 0, ax: 0.0, ay: 0.0, ay_alt: 0.0,
+        source: action.SRC_NONE, touch: false, target: NONE, locked: false,
+        last_ran: NONE, last_reason: CLOSE_NONE, ran: 0, opened: 0,
+        changed: false, said: 0, say: [0 as u8; 96], nsay: 0, stat: [0; 12] }
+}
+
+// Forget the menu (not the providers): after a close, or before a build.
+fn ctxm_reset(m: *mut Ctxm) {
+    (*m).n = 0
+    (*m).nf = 0
+    (*m).na = 0
+    (*m).seq = 0 as u32
+    (*m).nt = 0
+    (*m).depth = 0
+    (*m).pend_open = NONE
+    (*m).pend_close_level = NONE
+    (*m).nta = 0
+    var d: usize = 0
+    while d < 3 {
+        (*m).foc[d] = NONE
+        (*m).path[d] = NONE
+        d = d + 1
+    }
+}
+
+fn ctxm_set_actions(m: *mut Ctxm, r: *mut action.Actions) {
+    (*m).acts = r as u64
+}
+
+fn ctxm_actions(m: *mut Ctxm) -> *mut action.Actions {
+    return (*m).acts as *mut action.Actions
+}
+
+fn ctxm_set_ud(m: *mut Ctxm, ud: u64) {
+    (*m).ud = ud
+    (*m).cx.ud = ud
+}
+
+fn ctxm_ud(m: *mut Ctxm) -> u64 { return (*m).ud }
+
+fn ctx_stat(m: *mut Ctxm, k: usize) -> u64 {
+    if k >= 12 { return 0 }
+    return (*m).stat[k]
+}
+
+fn bump(m: *mut Ctxm, k: usize) {
+    (*m).stat[k] = (*m).stat[k] + 1
+}
+
+// ============================================================ PROVIDERS
+
+fn prov_add(m: *mut Ctxm, mode: u32, key: u32, f: fn(u64, *mut ProviderCtx),
+    ud: u64) -> bool {
+    var i: usize = 0
+    while i < (*m).np {
+        if !(*m).provs[i].on {
+            (*m).provs[i] = Provider { mode: mode, key: key, f: f, ud: ud, on: true }
+            return true
+        }
+        i = i + 1
+    }
+    if (*m).np >= PROV_MAX {
+        return false
+    }
+    (*m).provs[(*m).np] = Provider { mode: mode, key: key, f: f, ud: ud, on: true }
+    (*m).np = (*m).np + 1
+    return true
+}
+
+// A provider for ONE NODE, named by its key (scene.node_id -- the same key
+// the event handlers and the key paths use, so it survives a rebuild).
+// It runs for a request whose target is that node OR anything below it.
+fn ctx_provider_key(m: *mut Ctxm, key: u32, f: fn(u64, *mut ProviderCtx),
+    ud: u64) -> bool {
+    return prov_add(m, PM_KEY, key, f, ud)
+}
+
+// A provider for a KIND of widget (widget.KIND_*): every text field, every
+// list. This is how the standard entries (ctxstd.fi) work without anybody
+// registering them per node.
+fn ctx_provider_kind(m: *mut Ctxm, kind: u32, f: fn(u64, *mut ProviderCtx),
+    ud: u64) -> bool {
+    return prov_add(m, PM_KIND, kind, f, ud)
+}
+
+// A provider for EVERY request (the window's own entries, "Refresh").
+fn ctx_provider_global(m: *mut Ctxm, f: fn(u64, *mut ProviderCtx), ud: u64) -> bool {
+    return prov_add(m, PM_GLOBAL, GLOBAL_KEY, f, ud)
+}
+
+// Take a provider away again (the same function and mode). Returns how many.
+fn ctx_provider_off(m: *mut Ctxm, f: fn(u64, *mut ProviderCtx)) -> usize {
+    var k: usize = 0
+    var i: usize = 0
+    while i < (*m).np {
+        if (*m).provs[i].on && (*m).provs[i].f == f {
+            (*m).provs[i].on = false
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return k
+}
+
+fn ctx_provider_count(m: *mut Ctxm) -> usize {
+    var k: usize = 0
+    var i: usize = 0
+    while i < (*m).np {
+        if (*m).provs[i].on { k = k + 1 }
+        i = i + 1
+    }
+    return k
+}
+
+fn ctx_set_sel_hooks(m: *mut Ctxm, h: SelHooks) {
+    (*m).sel = h
+    (*m).sel.on = true
+}
+
+// THE RIGHTS CHECK for plugin entries: `f(ud, owner, level)` -- an entry of
+// a plugin whose owner has no grant at that level is not shown.
+fn ctx_set_grant(m: *mut Ctxm, ud: u64, f: fn(u64, str, u32) -> bool) {
+    (*m).grant = f
+    (*m).grant_ud = ud
+}
+
+// What the app does when a menu closes (give the focus back to the target).
+fn ctx_set_on_close(m: *mut Ctxm, ud: u64, f: fn(u64, u32)) {
+    (*m).on_close = f
+    (*m).close_ud = ud
+}
+
+// A PLUGIN ENTRY: action `act` of the registry is offered in every menu one
+// of whose providers declared `tag` (pc_tag) -- or in every menu with "*".
+// `owner` is the plugin (the rights check asks about it). A critical action
+// of a plugin always sits in the danger group.
+fn ctx_extension_add(m: *mut Ctxm, act: usize, owner: str, tag: str, prio: i64) -> bool {
+    if act == NONE { return false }
+    var i: usize = 0
+    while i < (*m).ne {
+        if !(*m).exts[i].on {
+            (*m).exts[i] = Ext { act: act, owner: owner, tag: tag, prio: prio, on: true }
+            return true
+        }
+        i = i + 1
+    }
+    if (*m).ne >= EXT_MAX { return false }
+    (*m).exts[(*m).ne] = Ext { act: act, owner: owner, tag: tag, prio: prio, on: true }
+    (*m).ne = (*m).ne + 1
+    return true
+}
+
+fn ctx_extension_count(m: *mut Ctxm) -> usize {
+    var k: usize = 0
+    var i: usize = 0
+    while i < (*m).ne {
+        if (*m).exts[i].on { k = k + 1 }
+        i = i + 1
+    }
+    return k
+}
+
+// ======================================================== THE PROVIDER'S VIEW
+
+// What a provider is handed: the menu being built and the request. Every
+// `pc_*` call below takes it. (It is the manager itself; the name tells the
+// provider's author what he may do with it.)
+struct ProviderCtx {
+    m: u64,
+}
+
+fn pcm(pc: *mut ProviderCtx) -> *mut Ctxm {
+    return (*pc).m as *mut Ctxm
+}
+
+fn pc_actions(pc: *mut ProviderCtx) -> *mut action.Actions {
+    return ctxm_actions(pcm(pc))
+}
+
+// What the request is about: the context a state function would get.
+fn pc_actx(pc: *mut ProviderCtx) -> *mut action.ActCtx {
+    return &(*pcm(pc)).cx
+}
+
+fn pc_target(pc: *mut ProviderCtx) -> usize { return (*pcm(pc)).cx.target }
+fn pc_node_key(pc: *mut ProviderCtx) -> u32 { return (*pcm(pc)).cx.key }
+fn pc_source(pc: *mut ProviderCtx) -> u32 { return (*pcm(pc)).cx.source }
+
+// How many items are selected (after the selection rule ran): 0, 1, many.
+fn pc_selected(pc: *mut ProviderCtx) -> usize { return (*pcm(pc)).cx.selected }
+
+// The key of the item under the pointer, 0 = none (empty ground).
+fn pc_item(pc: *mut ProviderCtx) -> u32 { return (*pcm(pc)).cx.item }
+
+// How many entries the menu holds so far.
+fn pc_count(pc: *mut ProviderCtx) -> usize { return (*pcm(pc)).n }
+
+// Declare a TAG for plugin entries: ".txt", "dir", "desktop", "process".
+fn pc_tag(pc: *mut ProviderCtx, tag: str) {
+    let m: *mut Ctxm = pcm(pc)
+    if (*m).nt < TAG_MAX {
+        (*m).tags[(*m).nt] = tag
+        (*m).nt = (*m).nt + 1
+    }
+}
+
+fn new_item(m: *mut Ctxm) -> usize {
+    if (*m).n >= MENU_MAX {
+        bump(m, ST_OVERFLOW)
+        return NONE
+    }
+    let i: usize = (*m).n
+    (*m).n = (*m).n + 1
+    (*m).items[i] = item_blank()
+    (*m).items[i].seq = (*m).seq
+    (*m).seq = (*m).seq + (1 as u32)
+    (*m).items[i].dist = (*m).cur_dist
+    (*m).items[i].prio = (*m).cur_prio_base
+    return i
+}
+
+// The existing item of this action under this parent, NONE for none.
+fn find_act(m: *mut Ctxm, act: usize, parent: usize) -> usize {
+    var i: usize = 0
+    while i < (*m).n {
+        if (*m).items[i].kind == IK_ACTION && (*m).items[i].act == act
+        && (*m).items[i].parent == parent {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn add_action(m: *mut Ctxm, parent: usize, act: usize) -> usize {
+    let r: *mut action.Actions = ctxm_actions(m)
+    if r as u64 == 0 || act >= action.act_count(r) {
+        return NONE
+    }
+    if !action.act_visible(r, act, &(*m).cx) {
+        bump(m, ST_HIDDEN)
+        return NONE
+    }
+    // THE SAME ACTION TWICE: the provider nearer the target keeps its place.
+    let old: usize = find_act(m, act, parent)
+    if old != NONE {
+        bump(m, ST_DUPLICATES)
+        if (*m).cur_dist < (*m).items[old].dist {
+            (*m).items[old].dist = (*m).cur_dist
+            (*m).items[old].seq = (*m).seq
+            (*m).seq = (*m).seq + (1 as u32)
+        }
+        return old
+    }
+    let i: usize = new_item(m)
+    if i == NONE { return NONE }
+    (*m).items[i].kind = IK_ACTION
+    (*m).items[i].act = act
+    (*m).items[i].parent = parent
+    (*m).items[i].group = action.act_group(r, act)
+    (*m).items[i].flags = action.act_flags(r, act)
+    (*m).items[i].icon = action.act_icon(r, act)
+    (*m).items[i].key = action.act_key(r, act)
+    (*m).items[i].mods = action.act_mods(r, act)
+    (*m).items[i].enabled = action.act_enabled(r, act, &(*m).cx)
+    (*m).items[i].checked = action.act_checked(r, act, &(*m).cx)
+    if action.act_is_danger(r, act) {
+        (*m).items[i].group = action.G_DANGER
+    }
+    return i
+}
+
+// ADD an action of the registry to the menu. The entry handle comes back so
+// the provider can refine it (pc_group, pc_prio, pc_danger); NONE when the
+// action is invisible right now (it is simply left out) or the pool is full.
+fn pc_add(pc: *mut ProviderCtx, act: usize) -> usize {
+    return add_action(pcm(pc), NONE, act)
+}
+
+// ADD an action INTO a submenu made by pc_submenu.
+fn pc_add_to(pc: *mut ProviderCtx, sub: usize, act: usize) -> usize {
+    if sub == NONE { return NONE }
+    return add_action(pcm(pc), sub, act)
+}
+
+// A SEPARATOR inside the current group, before the next entry. (Between
+// groups there is one by itself; this is for a program that wants a line
+// where the groups do not give one.)
+fn pc_sep(pc: *mut ProviderCtx, group: u32) -> usize {
+    let m: *mut Ctxm = pcm(pc)
+    let i: usize = new_item(m)
+    if i == NONE { return NONE }
+    (*m).items[i].kind = IK_SEP
+    (*m).items[i].group = group
+    return i
+}
+
+// A SUBMENU. The same label twice (from two providers) is one submenu.
+// `label` is a catalog key or text, "&Sort by" marks a mnemonic.
+fn pc_submenu(pc: *mut ProviderCtx, label: str, icon: i64, group: u32) -> usize {
+    let m: *mut Ctxm = pcm(pc)
+    var k: usize = 0
+    while k < (*m).n {
+        if (*m).items[k].kind == IK_SUB && action.str_eq((*m).items[k].raw, label)
+        && (*m).items[k].parent == NONE {
+            if (*m).cur_dist < (*m).items[k].dist {
+                (*m).items[k].dist = (*m).cur_dist
+            }
+            return k
+        }
+        k = k + 1
+    }
+    let i: usize = new_item(m)
+    if i == NONE { return NONE }
+    (*m).items[i].kind = IK_SUB
+    (*m).items[i].raw = label
+    (*m).items[i].icon = icon
+    (*m).items[i].group = group
+    return i
+}
+
+fn pc_group(pc: *mut ProviderCtx, e: usize, g: u32) {
+    if e != NONE { (*pcm(pc)).items[e].group = g }
+}
+
+// The priority inside the group: lower comes first. Default 0.
+fn pc_prio(pc: *mut ProviderCtx, e: usize, p: i64) {
+    if e != NONE { (*pcm(pc)).items[e].prio = p }
+}
+
+// Mark THIS entry dangerous in this context (last, error colour) although
+// the action is not by itself.
+fn pc_danger(pc: *mut ProviderCtx, e: usize) {
+    if e != NONE {
+        (*pcm(pc)).items[e].group = action.G_DANGER
+        (*pcm(pc)).items[e].flags = (*pcm(pc)).items[e].flags | action.AF_DANGER
+    }
+}
+
+// =================================================== THE SELECTION RULE
+
+// What a right click does to the selection (Windows Explorer's rule):
+//   on an item that is selected      keep (the menu is about ALL of them),
+//   on an item that is not           replace the selection by that item,
+//   on empty ground                  clear.
+fn selection_policy(on_item: bool, item_selected: bool) -> u32 {
+    if !on_item { return SEL_CLEAR }
+    if item_selected { return SEL_KEEP }
+    return SEL_REPLACE
+}
+
+// Apply it with the program's hooks. Returns the policy that was applied
+// (SEL_KEEP when there are no hooks). Fills cx.item and cx.selected.
+fn ctx_apply_selection(m: *mut Ctxm, sc: *mut scene.Scene, target: usize) -> u32 {
+    (*m).cx.item = 0 as u32
+    (*m).cx.selected = 0
+    if !(*m).sel.on { return SEL_KEEP }
+    let ud: u64 = (*m).sel.ud
+    let fi: fn(u64, *mut scene.Scene, usize) -> u32 = (*m).sel.item_of
+    var item: u32 = 0 as u32
+    if target != NONE {
+        item = fi(ud, sc, target)
+    }
+    var is_sel: bool = false
+    if item != 0 as u32 {
+        let fs: fn(u64, u32) -> bool = (*m).sel.is_selected
+        is_sel = fs(ud, item)
+    }
+    let pol: u32 = selection_policy(item != 0 as u32, is_sel)
+    if pol == SEL_REPLACE {
+        let fo: fn(u64, u32) = (*m).sel.select_only
+        fo(ud, item)
+    } else if pol == SEL_CLEAR {
+        let fc: fn(u64) = (*m).sel.clear
+        fc(ud)
+    }
+    let fn_c: fn(u64) -> usize = (*m).sel.count
+    (*m).cx.selected = fn_c(ud)
+    (*m).cx.item = item
+    return pol
+}
+
+// =================================================== BUILDING THE MENU
+
+fn node_matches(m: *mut Ctxm, sc: *mut scene.Scene, n: usize, p: *mut Provider) -> bool {
+    if (*p).mode == PM_KEY {
+        return scene.node_id(sc, n) == (*p).key
+    }
+    if (*p).mode == PM_KIND {
+        if scene.node_kind(sc, n) != scene.N_WIDGET { return false }
+        return widget.w_kind(scene.node_widget(sc, n)) == (*p).key
+    }
+    return false
+}
+
+fn run_provider(m: *mut Ctxm, p: *mut Provider, dist: u32) {
+    (*m).cur_dist = dist
+    var pc: ProviderCtx = ProviderCtx { m: m as u64 }
+    let f: fn(u64, *mut ProviderCtx) = (*p).f
+    f((*p).ud, &pc)
+}
+
+// Collect from the providers, along the chain target -> root, then the
+// global ones, then the plugin entries. `sc` may be 0 (no tree: only global
+// providers and plugin entries run).
+fn collect(m: *mut Ctxm, sc: *mut scene.Scene, target: usize) {
+    var dist: u32 = 0 as u32
+    var n: usize = target
+    if sc as u64 != 0 {
+        while n != NONE && n < scene.scene_count(sc) {
+            var i: usize = 0
+            while i < (*m).np {
+                if (*m).provs[i].on && (*m).provs[i].mode != PM_GLOBAL
+                && node_matches(m, sc, n, &(*m).provs[i]) {
+                    run_provider(m, &(*m).provs[i], dist)
+                }
+                i = i + 1
+            }
+            n = scene.scene_parent(sc, n)
+            dist = dist + (1 as u32)
+        }
+    }
+    var g: usize = 0
+    while g < (*m).np {
+        if (*m).provs[g].on && (*m).provs[g].mode == PM_GLOBAL {
+            run_provider(m, &(*m).provs[g], dist)
+        }
+        g = g + 1
+    }
+    // PLUGIN ENTRIES: by tag, rights checked.
+    (*m).cur_dist = dist
+    var e: usize = 0
+    while e < (*m).ne {
+        if (*m).exts[e].on && ext_applies(m, &(*m).exts[e]) {
+            let r: *mut action.Actions = ctxm_actions(m)
+            let lv: u32 = action.act_level(r, (*m).exts[e].act)
+            let gr: fn(u64, str, u32) -> bool = (*m).grant
+            if gr((*m).grant_ud, (*m).exts[e].owner, lv) {
+                // an entry a provider already offers stays as the provider made it
+                let had: bool = find_act(m, (*m).exts[e].act, NONE) != NONE
+                let it: usize = add_action(m, NONE, (*m).exts[e].act)
+                if it != NONE && !had {
+                    (*m).items[it].prio = (*m).exts[e].prio
+                    if lv == action.LV_CRITICAL {
+                        (*m).items[it].group = action.G_DANGER
+                        (*m).items[it].flags = (*m).items[it].flags | action.AF_DANGER
+                    } else {
+                        (*m).items[it].group = action.G_EXTENSION
+                    }
+                }
+            } else {
+                bump(m, ST_DENIED)
+            }
+        }
+        e = e + 1
+    }
+}
+
+fn ext_applies(m: *mut Ctxm, x: *mut Ext) -> bool {
+    if action.str_eq((*x).tag, "*") { return true }
+    var i: usize = 0
+    while i < (*m).nt {
+        if action.str_eq((*m).tags[i], (*x).tag) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// The arena: copy `s` and return the copy.
+fn arena_put(m: *mut Ctxm, s: str) -> str {
+    if (*m).na + s.n > ARENA_MAX {
+        return str { p: (&(*m).arena[0]) as *mut u8, n: 0 }
+    }
+    let at: usize = (*m).na
+    var i: usize = 0
+    while i < s.n {
+        (*m).arena[at + i] = *((s.p as u64 + i as u64) as *mut u8)
+        i = i + 1
+    }
+    (*m).na = at + s.n
+    return str { p: (&(*m).arena[at]) as *mut u8, n: s.n }
+}
+
+// The clean label of an item, written straight into the arena (the label
+// text lives as long as the menu), with its mnemonic position and letter.
+fn finish_label(m: *mut Ctxm, i: usize, text: str) {
+    let at0: usize = (*m).na
+    var mp: usize = 0
+    var room: usize = 0
+    if ARENA_MAX > at0 { room = ARENA_MAX - at0 }
+    let n: usize = action.label_clean(text, (&(*m).arena[at0]) as *mut u8, room, &mp)
+    (*m).na = at0 + n
+    (*m).items[i].label = str { p: (&(*m).arena[at0]) as *mut u8, n: n }
+    (*m).items[i].mpos = mp
+    (*m).items[i].mnemonic = 0 as u32
+    if mp < n {
+        (*m).items[i].mnemonic = action.key_logical((*m).arena[at0 + mp] as u32)
+    }
+}
+
+// Is item a (sorts) before item b? by (group, prio, seq) at the top level,
+// by (prio, seq) inside a submenu.
+fn before(m: *mut Ctxm, a: usize, b: usize, in_sub: bool) -> bool {
+    if !in_sub {
+        if (*m).items[a].group != (*m).items[b].group {
+            return (*m).items[a].group < (*m).items[b].group
+        }
+    }
+    if (*m).items[a].prio != (*m).items[b].prio {
+        return (*m).items[a].prio < (*m).items[b].prio
+    }
+    return (*m).items[a].seq < (*m).items[b].seq
+}
+
+
+fn push_fin(m: *mut Ctxm, item: usize, pslot: usize) -> usize {
+    if (*m).nf >= FIN_MAX {
+        bump(m, ST_OVERFLOW)
+        return NONE
+    }
+    let s: usize = (*m).nf
+    (*m).fin[s] = item
+    (*m).finp[s] = pslot
+    (*m).nf = s + 1
+    if item != NONE {
+        (*m).items[item].slot = s
+    }
+    return s
+}
+
+// Sort the children of `parent` (NONE = the top level) and append them to
+// the final list. A separator stands between two groups (top level only) or
+// where the provider asked for one -- but it is only pushed lazily, in
+// front of the next entry, so it is never first, never last and never twice.
+fn emit_level(m: *mut Ctxm, parent: usize, pslot: usize) {
+    var idx: [usize; 96] = [0; 96]
+    var k: usize = 0
+    var i: usize = 0
+    while i < (*m).n {
+        if (*m).items[i].parent == parent && (*m).items[i].kind != (0 as u32) {
+            idx[k] = i
+            k = k + 1
+        }
+        i = i + 1
+    }
+    var a: usize = 1
+    while a < k {
+        let v: usize = idx[a]
+        var b: usize = a
+        while b > 0 && before(m, v, idx[b - 1], parent != NONE) {
+            idx[b] = idx[b - 1]
+            b = b - 1
+        }
+        idx[b] = v
+        a = a + 1
+    }
+    var out: usize = 0
+    var last_group: u32 = 0 as u32
+    var sep: bool = false
+    var q: usize = 0
+    while q < k {
+        let it: usize = idx[q]
+        if (*m).items[it].kind == IK_SEP {
+            if out > 0 { sep = true }
+        } else {
+            if out > 0 && parent == NONE && (*m).items[it].group != last_group {
+                sep = true
+            }
+            if sep && out > 0 {
+                let z: usize = push_fin(m, NONE, pslot)
+                sep = false
+            }
+            let s: usize = push_fin(m, it, pslot)
+            last_group = (*m).items[it].group
+            out = out + 1
+        }
+        q = q + 1
+    }
+}
+
+// FINISH THE MENU: drop empty submenus, resolve the labels, sort, place the
+// separators. Returns how many slots the final list has (separators
+// included). `ctx_request` calls it; a test that fills the pool by hand
+// calls it itself.
+fn ctx_build(m: *mut Ctxm) -> usize {
+    let r: *mut action.Actions = ctxm_actions(m)
+    (*m).nf = 0
+    // empty submenus go
+    var i: usize = 0
+    while i < (*m).n {
+        if (*m).items[i].kind == IK_SUB {
+            var c: usize = 0
+            var j: usize = 0
+            while j < (*m).n {
+                if (*m).items[j].parent == i && (*m).items[j].kind != IK_SEP
+                && (*m).items[j].kind != (0 as u32) {
+                    c = c + 1
+                }
+                j = j + 1
+            }
+            (*m).items[i].kids = c
+            if c == 0 {
+                (*m).items[i].kind = 0 as u32
+                bump(m, ST_PRUNED)
+            }
+        }
+        i = i + 1
+    }
+    // the labels, once, into the arena
+    i = 0
+    while i < (*m).n {
+        if (*m).items[i].kind == IK_ACTION {
+            finish_label(m, i, action.act_label(r, (*m).items[i].act))
+        } else if (*m).items[i].kind == IK_SUB {
+            finish_label(m, i, action.act_tr(r, (*m).items[i].raw))
+        }
+        i = i + 1
+    }
+    emit_level(m, NONE, NONE)
+    let top: usize = (*m).nf
+    var s: usize = 0
+    while s < top {
+        let it: usize = (*m).fin[s]
+        if it != NONE && (*m).items[it].kind == IK_SUB {
+            emit_level(m, it, s)
+        }
+        s = s + 1
+    }
+    return (*m).nf
+}
+
+// ============================================================ THE VIEW
+
+fn menu_count(m: *mut Ctxm) -> usize { return (*m).nf }
+
+fn menu_item(m: *mut Ctxm, s: usize) -> usize {
+    if s >= (*m).nf { return NONE }
+    return (*m).fin[s]
+}
+
+fn menu_kind(m: *mut Ctxm, s: usize) -> u32 {
+    if s >= (*m).nf { return 0 as u32 }
+    let it: usize = (*m).fin[s]
+    if it == NONE { return IK_SEP }
+    return (*m).items[it].kind
+}
+
+fn menu_parent(m: *mut Ctxm, s: usize) -> usize {
+    if s >= (*m).nf { return NONE }
+    return (*m).finp[s]
+}
+
+fn menu_act(m: *mut Ctxm, s: usize) -> usize {
+    let it: usize = menu_item(m, s)
+    if it == NONE { return NONE }
+    return (*m).items[it].act
+}
+
+fn menu_label(m: *mut Ctxm, s: usize) -> str {
+    let it: usize = menu_item(m, s)
+    if it == NONE { return "" }
+    return (*m).items[it].label
+}
+
+fn menu_icon(m: *mut Ctxm, s: usize) -> i64 {
+    let it: usize = menu_item(m, s)
+    if it == NONE { return action.ICON_NONE }
+    return (*m).items[it].icon
+}
+
+fn menu_enabled(m: *mut Ctxm, s: usize) -> bool {
+    let it: usize = menu_item(m, s)
+    if it == NONE { return false }
+    return (*m).items[it].enabled
+}
+
+fn menu_checked(m: *mut Ctxm, s: usize) -> u32 {
+    let it: usize = menu_item(m, s)
+    if it == NONE { return action.CHK_NONE }
+    return (*m).items[it].checked
+}
+
+fn menu_flags(m: *mut Ctxm, s: usize) -> u32 {
+    let it: usize = menu_item(m, s)
+    if it == NONE { return 0 as u32 }
+    return (*m).items[it].flags
+}
+
+fn menu_danger(m: *mut Ctxm, s: usize) -> bool {
+    return (menu_flags(m, s) & action.AF_DANGER) != 0 as u32
+}
+
+fn menu_key(m: *mut Ctxm, s: usize) -> u32 {
+    let it: usize = menu_item(m, s)
+    if it == NONE { return 0 as u32 }
+    return (*m).items[it].key
+}
+
+fn menu_mods(m: *mut Ctxm, s: usize) -> u32 {
+    let it: usize = menu_item(m, s)
+    if it == NONE { return 0 as u32 }
+    return (*m).items[it].mods
+}
+
+fn menu_mnemonic(m: *mut Ctxm, s: usize) -> u32 {
+    let it: usize = menu_item(m, s)
+    if it == NONE { return 0 as u32 }
+    return (*m).items[it].mnemonic
+}
+
+// The byte index of the mnemonic letter in menu_label (>= its length: none).
+fn menu_mpos(m: *mut Ctxm, s: usize) -> usize {
+    let it: usize = menu_item(m, s)
+    if it == NONE { return 0 }
+    return (*m).items[it].mpos
+}
+
+fn menu_kids(m: *mut Ctxm, s: usize) -> usize {
+    let it: usize = menu_item(m, s)
+    if it == NONE { return 0 }
+    return (*m).items[it].kids
+}
+
+// How many slots hang under `parent` (NONE = the menu itself), separators
+// included, and the k-th of them.
+fn menu_level_count(m: *mut Ctxm, parent: usize) -> usize {
+    var c: usize = 0
+    var s: usize = 0
+    while s < (*m).nf {
+        if (*m).finp[s] == parent { c = c + 1 }
+        s = s + 1
+    }
+    return c
+}
+
+fn menu_level_at(m: *mut Ctxm, parent: usize, k: usize) -> usize {
+    var c: usize = 0
+    var s: usize = 0
+    while s < (*m).nf {
+        if (*m).finp[s] == parent {
+            if c == k { return s }
+            c = c + 1
+        }
+        s = s + 1
+    }
+    return NONE
+}
+
+// The slot that holds action `act` (top level or in a submenu), NONE for none.
+fn menu_index_of_act(m: *mut Ctxm, act: usize) -> usize {
+    var s: usize = 0
+    while s < (*m).nf {
+        let it: usize = (*m).fin[s]
+        if it != NONE && (*m).items[it].kind == IK_ACTION && (*m).items[it].act == act {
+            return s
+        }
+        s = s + 1
+    }
+    return NONE
+}
+
+fn menu_total_actions(m: *mut Ctxm) -> usize {
+    var c: usize = 0
+    var s: usize = 0
+    while s < (*m).nf {
+        if menu_kind(m, s) == IK_ACTION { c = c + 1 }
+        s = s + 1
+    }
+    return c
+}
+
+// Does a level hold a check / radio entry (the view then keeps a gutter)?
+fn menu_has_check(m: *mut Ctxm, parent: usize) -> bool {
+    var s: usize = 0
+    while s < (*m).nf {
+        if (*m).finp[s] == parent && (menu_flags(m, s) & (action.AF_CHECK | action.AF_RADIO)) != 0 as u32 {
+            return true
+        }
+        s = s + 1
+    }
+    return false
+}
+
+fn menu_has_icon(m: *mut Ctxm, parent: usize) -> bool {
+    var s: usize = 0
+    while s < (*m).nf {
+        if (*m).finp[s] == parent && menu_icon(m, s) != action.ICON_NONE {
+            return true
+        }
+        s = s + 1
+    }
+    return false
+}
+
+// ============================================================ THE REQUEST
+
+fn is_keyboard(source: u32) -> bool {
+    return source == action.SRC_MENU_KEY || source == action.SRC_SHIFT_F10
+    || source == action.SRC_A11Y || source == action.SRC_API
+}
+
+// OPEN A MENU for a request. `sc` and `target` name the node (sc may be 0 and
+// target NONE: then only the global providers and plugin entries run); (x, y)
+// is where it was asked, `ay_alt` where a menu that does not fit below flips
+// to (the top edge of the target for a key request; y for a pointer).
+// false: nothing was opened (locked, or nothing to show) -- and a menu that
+// was open stays closed then, as the request replaced it.
+fn ctx_request(m: *mut Ctxm, sc: *mut scene.Scene, target: usize, x: f64,
+    y: f64, ay_alt: f64, source: u32, mods: u32, now: i64) -> bool {
+    bump(m, ST_REQUESTS)
+    if (*m).open {
+        let c0: u32 = ctx_close(m, CLOSE_NEW)
+    }
+    if (*m).locked {
+        bump(m, ST_REFUSED)
+        return false
+    }
+    ctxm_reset(m)
+    (*m).cx.target = target
+    (*m).cx.key = 0 as u32
+    if sc as u64 != 0 && target != NONE && target < scene.scene_count(sc) {
+        (*m).cx.key = scene.node_id(sc, target)
+    }
+    (*m).cx.source = source
+    (*m).cx.mods = mods
+    (*m).cx.x = x
+    (*m).cx.y = y
+    let pol: u32 = ctx_apply_selection(m, sc, target)
+    collect(m, sc, target)
+    let n: usize = ctx_build(m)
+    if n == 0 {
+        bump(m, ST_REFUSED)
+        return false
+    }
+    (*m).open = true
+    (*m).depth = 1
+    (*m).path[0] = NONE
+    (*m).ax = x
+    (*m).ay = y
+    (*m).ay_alt = ay_alt
+    (*m).source = source
+    (*m).touch = source == action.SRC_TOUCH || source == action.SRC_PEN
+    (*m).target = target
+    (*m).opened = (*m).opened + 1
+    bump(m, ST_OPENED)
+    (*m).changed = true
+    if is_keyboard(source) {
+        (*m).foc[0] = first_slot(m, NONE)
+    }
+    say_open(m)
+    if (*m).foc[0] != NONE {
+        say_focus(m, 0)
+    }
+    return true
+}
+
+// ============================================================ ANNOUNCING
+
+// What a screen reader is told: the text is built here, the bridge to a
+// platform (UIA, AT-SPI, a live region in the browser) polls `ctx_announce_seq`
+// and reads `ctx_announce_text`. The bridge itself is roadmap r19/r103.
+fn say_begin(m: *mut Ctxm) {
+    (*m).nsay = 0
+}
+
+fn say_s(m: *mut Ctxm, s: str) {
+    var i: usize = 0
+    while i < s.n && (*m).nsay < 96 {
+        (*m).say[(*m).nsay] = *((s.p as u64 + i as u64) as *mut u8)
+        (*m).nsay = (*m).nsay + 1
+        i = i + 1
+    }
+}
+
+fn say_n(m: *mut Ctxm, v: usize) {
+    var d: [u8; 8] = [0 as u8; 8]
+    var k: usize = 0
+    var x: usize = v
+    if x == 0 {
+        d[0] = 48 as u8
+        k = 1
+    }
+    while x > 0 && k < 8 {
+        d[k] = (48 as u8) + ((x % 10) as u8)
+        x = x / 10
+        k = k + 1
+    }
+    while k > 0 && (*m).nsay < 96 {
+        k = k - 1
+        (*m).say[(*m).nsay] = d[k]
+        (*m).nsay = (*m).nsay + 1
+    }
+}
+
+fn say_end(m: *mut Ctxm) {
+    (*m).said = (*m).said + 1
+}
+
+fn say_open(m: *mut Ctxm) {
+    say_begin(m)
+    say_s(m, "Context menu, ")
+    var c: usize = 0
+    var s: usize = 0
+    while s < (*m).nf {
+        if (*m).finp[s] == NONE && menu_kind(m, s) != IK_SEP { c = c + 1 }
+        s = s + 1
+    }
+    say_n(m, c)
+    say_s(m, " items")
+    say_end(m)
+}
+
+// "Copy, Ctrl+C, 2 of 7" -- plus "disabled", "checked", "submenu".
+fn say_focus(m: *mut Ctxm, lv: usize) {
+    let s: usize = (*m).foc[lv]
+    if s == NONE { return }
+    say_begin(m)
+    say_s(m, menu_label(m, s))
+    if menu_kind(m, s) == IK_SUB { say_s(m, ", submenu") }
+    if !menu_enabled(m, s) && menu_kind(m, s) == IK_ACTION { say_s(m, ", disabled") }
+    let ck: u32 = menu_checked(m, s)
+    if ck == action.CHK_ON { say_s(m, ", checked") }
+    if ck == action.CHK_OFF { say_s(m, ", not checked") }
+    let parent: usize = menu_parent(m, s)
+    var pos: usize = 0
+    var tot: usize = 0
+    var q: usize = 0
+    while q < (*m).nf {
+        if (*m).finp[q] == parent && menu_kind(m, q) != IK_SEP {
+            tot = tot + 1
+            if q <= s { pos = tot }
+        }
+        q = q + 1
+    }
+    say_s(m, ", ")
+    say_n(m, pos)
+    say_s(m, " of ")
+    say_n(m, tot)
+    say_end(m)
+}
+
+fn ctx_announce_seq(m: *mut Ctxm) -> u64 { return (*m).said }
+
+fn ctx_announce_text(m: *mut Ctxm) -> str {
+    return str { p: (&(*m).say[0]) as *mut u8, n: (*m).nsay }
+}
+
+// ============================================================ THE STATE
+
+fn ctx_selected(m: *mut Ctxm) -> usize { return (*m).cx.selected }
+fn ctx_is_open(m: *mut Ctxm) -> bool { return (*m).open }
+fn ctx_depth(m: *mut Ctxm) -> usize { return (*m).depth }
+fn ctx_source(m: *mut Ctxm) -> u32 { return (*m).source }
+fn ctx_touch(m: *mut Ctxm) -> bool { return (*m).touch }
+fn ctx_anchor_x(m: *mut Ctxm) -> f64 { return (*m).ax }
+fn ctx_anchor_y(m: *mut Ctxm) -> f64 { return (*m).ay }
+fn ctx_anchor_alt(m: *mut Ctxm) -> f64 { return (*m).ay_alt }
+fn ctx_target(m: *mut Ctxm) -> usize { return (*m).target }
+fn ctx_last_ran(m: *mut Ctxm) -> usize { return (*m).last_ran }
+fn ctx_last_reason(m: *mut Ctxm) -> u32 { return (*m).last_reason }
+fn ctx_ran_count(m: *mut Ctxm) -> u64 { return (*m).ran }
+fn ctx_open_count(m: *mut Ctxm) -> u64 { return (*m).opened }
+fn ctx_locked(m: *mut Ctxm) -> bool { return (*m).locked }
+
+// The focused slot of level `lv` (0 = the menu), NONE for none.
+fn ctx_focus(m: *mut Ctxm, lv: usize) -> usize {
+    if lv >= 3 { return NONE }
+    return (*m).foc[lv]
+}
+
+// The submenu header that opened level `lv` (lv >= 1).
+fn ctx_open_path(m: *mut Ctxm, lv: usize) -> usize {
+    if lv >= 3 || lv >= (*m).depth { return NONE }
+    return (*m).path[lv]
+}
+
+fn ctx_set_focus(m: *mut Ctxm, lv: usize, s: usize) {
+    if lv < 3 {
+        if (*m).foc[lv] != s {
+            (*m).foc[lv] = s
+            (*m).changed = true
+        }
+    }
+}
+
+fn ctx_mark_changed(m: *mut Ctxm) { (*m).changed = true }
+fn ctx_changed(m: *mut Ctxm) -> bool { return (*m).changed }
+fn ctx_clear_changed(m: *mut Ctxm) { (*m).changed = false }
+
+fn level_parent(m: *mut Ctxm, lv: usize) -> usize {
+    if lv == 0 { return NONE }
+    return (*m).path[lv]
+}
+
+// The level a slot lives on, NONE when its level is not open.
+fn level_of(m: *mut Ctxm, s: usize) -> usize {
+    if s >= (*m).nf { return NONE }
+    let p: usize = (*m).finp[s]
+    if p == NONE { return 0 }
+    var lv: usize = 1
+    while lv < (*m).depth {
+        if (*m).path[lv] == p { return lv }
+        lv = lv + 1
+    }
+    return NONE
+}
+
+fn first_slot(m: *mut Ctxm, parent: usize) -> usize {
+    var s: usize = 0
+    while s < (*m).nf {
+        if (*m).finp[s] == parent && menu_kind(m, s) != IK_SEP { return s }
+        s = s + 1
+    }
+    return NONE
+}
+
+fn last_slot(m: *mut Ctxm, parent: usize) -> usize {
+    var r: usize = NONE
+    var s: usize = 0
+    while s < (*m).nf {
+        if (*m).finp[s] == parent && menu_kind(m, s) != IK_SEP { r = s }
+        s = s + 1
+    }
+    return r
+}
+
+// The next (dir > 0) or previous (dir < 0) entry of the level after `from`,
+// separators skipped, wrapping around. NONE when the level is empty.
+fn step_slot(m: *mut Ctxm, parent: usize, from: usize, dir: i64) -> usize {
+    if from == NONE {
+        if dir > 0 { return first_slot(m, parent) }
+        return last_slot(m, parent)
+    }
+    var s: usize = from
+    var guard: usize = 0
+    while guard < (*m).nf + 1 {
+        if dir > 0 {
+            s = s + 1
+            if s >= (*m).nf { s = 0 }
+        } else {
+            if s == 0 { s = (*m).nf }
+            s = s - 1
+        }
+        if (*m).finp[s] == parent && menu_kind(m, s) != IK_SEP { return s }
+        guard = guard + 1
+    }
+    return from
+}
+
+// CLOSE the menu. The app's on_close hook hears the reason (it gives the
+// focus back to the node the menu was about).
+fn ctx_close(m: *mut Ctxm, reason: u32) -> u32 {
+    if !(*m).open { return CR_NONE }
+    (*m).open = false
+    (*m).depth = 0
+    (*m).pend_open = NONE
+    (*m).pend_close_level = NONE
+    (*m).last_reason = reason
+    (*m).changed = true
+    let f: fn(u64, u32) = (*m).on_close
+    f((*m).close_ud, reason)
+    return CR_CLOSED | CR_REPAINT
+}
+
+// Close only the DEEPEST submenu (Esc, Left); the menu itself when it is the
+// only level left.
+fn ctx_close_level(m: *mut Ctxm) -> u32 {
+    if !(*m).open { return CR_NONE }
+    if (*m).depth > 1 {
+        (*m).depth = (*m).depth - 1
+        (*m).pend_open = NONE
+        (*m).pend_close_level = NONE
+        (*m).changed = true
+        return CR_CONSUMED | CR_REPAINT
+    }
+    return ctx_close(m, CLOSE_ESC) | CR_CONSUMED
+}
+
+fn ctx_focus_lost(m: *mut Ctxm) -> u32 {
+    return ctx_close(m, CLOSE_FOCUS)
+}
+
+// The window moved, was resized, minimised or another window came on top.
+fn ctx_window_changed(m: *mut Ctxm) -> u32 {
+    return ctx_close(m, CLOSE_WINDOW)
+}
+
+// THE SCREEN LOCK (OrientOS lockseal): while locked no menu opens, and one
+// that is open closes at once. Nothing may stand above the lock.
+fn ctx_set_locked(m: *mut Ctxm, on: bool) -> u32 {
+    (*m).locked = on
+    if on { return ctx_close(m, CLOSE_LOCK) }
+    return CR_NONE
+}
+
+// OPEN the submenu of header slot `h`; levels below its own level are
+// replaced. `focus_first`: keyboard (Right/Enter) puts the focus in it.
+fn ctx_open_sub(m: *mut Ctxm, h: usize, focus_first: bool) -> bool {
+    if !(*m).open || menu_kind(m, h) != IK_SUB || !menu_enabled_sub(m, h) {
+        return false
+    }
+    let lv: usize = level_of(m, h)
+    if lv == NONE || lv + 1 >= SUB_DEPTH { return false }
+    (*m).depth = lv + 2
+    (*m).path[lv + 1] = h
+    (*m).foc[lv] = h
+    (*m).foc[lv + 1] = NONE
+    if focus_first {
+        (*m).foc[lv + 1] = first_slot(m, h)
+    }
+    (*m).pend_open = NONE
+    (*m).pend_close_level = NONE
+    (*m).changed = true
+    if focus_first { say_focus(m, lv + 1) }
+    return true
+}
+
+// A submenu header is as enabled as it has an enabled child; one whose
+// children are all disabled still opens (the user sees why).
+fn menu_enabled_sub(m: *mut Ctxm, h: usize) -> bool {
+    return true
+}
+
+// HOVER: the pointer is over slot `s` (NONE = over no entry: nothing
+// changes, as in Windows -- the highlight stays). Starts the delay of a
+// submenu and the delay of closing one the pointer has left.
+fn ctx_hover(m: *mut Ctxm, s: usize, now: i64) -> u32 {
+    if !(*m).open || s == NONE || menu_kind(m, s) == IK_SEP { return CR_NONE }
+    let lv: usize = level_of(m, s)
+    if lv == NONE { return CR_NONE }
+    var ch: u32 = CR_CONSUMED
+    if (*m).foc[lv] != s {
+        (*m).foc[lv] = s
+        (*m).changed = true
+        ch = ch | CR_REPAINT
+    }
+    let deeper: bool = (*m).depth > lv + 1
+    let is_open_header: bool = deeper && (*m).path[lv + 1] == s
+    if deeper {
+        if is_open_header {
+            (*m).pend_close_level = NONE
+            (*m).pend_open = NONE
+        } else {
+            (*m).pend_close_level = lv
+            (*m).pend_close_at = now + CLOSE_MS
+        }
+    }
+    // being in a deeper level keeps it
+    if (*m).pend_close_level != NONE && lv > (*m).pend_close_level {
+        (*m).pend_close_level = NONE
+    }
+    if menu_kind(m, s) == IK_SUB && !is_open_header {
+        (*m).pend_open = s
+        (*m).pend_open_at = now + OPEN_MS
+    } else if (*m).pend_open != NONE && (*m).pend_open != s {
+        (*m).pend_open = NONE
+    }
+    return ch
+}
+
+// THE CLOCK: opens the submenu whose delay ran out, closes the levels whose
+// delay ran out.
+fn ctx_tick(m: *mut Ctxm, now: i64) -> u32 {
+    if !(*m).open { return CR_NONE }
+    var ch: u32 = CR_NONE
+    if (*m).pend_close_level != NONE && now >= (*m).pend_close_at {
+        let keep: usize = (*m).pend_close_level + 1
+        (*m).pend_close_level = NONE
+        if (*m).depth > keep {
+            (*m).depth = keep
+            (*m).changed = true
+            ch = ch | CR_REPAINT
+        }
+    }
+    if (*m).pend_open != NONE && now >= (*m).pend_open_at {
+        let h: usize = (*m).pend_open
+        (*m).pend_open = NONE
+        if ctx_open_sub(m, h, false) { ch = ch | CR_REPAINT }
+    }
+    return ch
+}
+
+// How long the loop may sleep until a pending open/close is due; -1 = no
+// deadline. (fuiwirt's host_wait_ms takes the smaller of this and its own.)
+fn ctx_pending_ms(m: *mut Ctxm, now: i64) -> i64 {
+    if !(*m).open { return 0 - 1 }
+    var best: i64 = 0 - 1
+    if (*m).pend_open != NONE {
+        best = (*m).pend_open_at - now
+    }
+    if (*m).pend_close_level != NONE {
+        let d: i64 = (*m).pend_close_at - now
+        if best < 0 || d < best { best = d }
+    }
+    if best < 0 && ((*m).pend_open != NONE || (*m).pend_close_level != NONE) {
+        best = 0
+    }
+    return best
+}
+
+// ACTIVATE slot `s`: a submenu opens (focus in it), an action CLOSES the menu
+// first (so the focus is back on the target when the handler runs) and then
+// runs; a disabled entry does nothing and the menu stays.
+fn ctx_activate(m: *mut Ctxm, s: usize) -> u32 {
+    if !(*m).open || s >= (*m).nf { return CR_NONE }
+    let k: u32 = menu_kind(m, s)
+    if k == IK_SEP { return CR_CONSUMED }
+    if k == IK_SUB {
+        if ctx_open_sub(m, s, true) { return CR_CONSUMED | CR_REPAINT }
+        return CR_CONSUMED
+    }
+    if !menu_enabled(m, s) { return CR_CONSUMED }
+    let act: usize = menu_act(m, s)
+    var cx: action.ActCtx = (*m).cx
+    let c: u32 = ctx_close(m, CLOSE_RAN)
+    let r: *mut action.Actions = ctxm_actions(m)
+    var ran: u32 = CR_NONE
+    if r as u64 != 0 && action.act_run(r, act, &cx) {
+        ran = CR_RAN
+    }
+    (*m).last_ran = act
+    (*m).ran = (*m).ran + 1
+    return c | ran | CR_CONSUMED
+}
+
+// A PRESS at slot `s`; NONE = outside every open level. Outside closes the
+// menu AND lets the press through (CR_PASS), so a right click on another
+// element opens ITS menu in one go -- like Windows.
+fn ctx_press(m: *mut Ctxm, s: usize, now: i64) -> u32 {
+    if !(*m).open { return CR_NONE }
+    if s == NONE {
+        return ctx_close(m, CLOSE_OUTSIDE) | CR_PASS
+    }
+    if menu_kind(m, s) == IK_SEP { return CR_CONSUMED }
+    let lv: usize = level_of(m, s)
+    if lv != NONE {
+        (*m).foc[lv] = s
+    }
+    return ctx_activate(m, s)
+}
+
+fn lower(b: u8) -> u8 {
+    if b >= (65 as u8) && b <= (90 as u8) { return b + (32 as u8) }
+    return b
+}
+
+fn label_starts(m: *mut Ctxm, s: usize, len: usize) -> bool {
+    let l: str = menu_label(m, s)
+    if l.n < len { return false }
+    var i: usize = 0
+    while i < len {
+        if lower(*((l.p as u64 + i as u64) as *mut u8)) != (*m).ta[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// A CHARACTER typed into the open menu: a MNEMONIC letter activates its
+// entry (when two entries share the letter, it cycles between them), any
+// other text TYPES AHEAD -- the first entry whose label starts with the
+// letters typed within TYPEAHEAD_MS gets the focus. (The menu always
+// consumes characters: it is modal.)
+fn ctx_char(m: *mut Ctxm, cp: u32, now: i64) -> u32 {
+    if !(*m).open { return CR_NONE }
+    if cp < 33 as u32 { return CR_CONSUMED }
+    let lv: usize = (*m).depth - 1
+    let parent: usize = level_parent(m, lv)
+    let u: u32 = action.key_logical(cp)
+    // the mnemonic
+    var hits: usize = 0
+    var first: usize = NONE
+    var after: usize = NONE
+    var s: usize = 0
+    while s < (*m).nf {
+        if (*m).finp[s] == parent && menu_kind(m, s) != IK_SEP
+        && menu_mnemonic(m, s) == u {
+            hits = hits + 1
+            if first == NONE { first = s }
+            if after == NONE && (*m).foc[lv] != NONE && s > (*m).foc[lv] { after = s }
+        }
+        s = s + 1
+    }
+    if hits == 1 {
+        (*m).foc[lv] = first
+        return ctx_activate(m, first)
+    }
+    if hits > 1 {
+        var pick: usize = after
+        if pick == NONE { pick = first }
+        (*m).foc[lv] = pick
+        (*m).changed = true
+        say_focus(m, lv)
+        return CR_CONSUMED | CR_REPAINT
+    }
+    // typeahead
+    if now - (*m).ta_at > TYPEAHEAD_MS { (*m).nta = 0 }
+    (*m).ta_at = now
+    if cp < 128 as u32 && (*m).nta < 15 {
+        (*m).ta[(*m).nta] = lower(cp as u8)
+        (*m).nta = (*m).nta + 1
+    }
+    var from: usize = (*m).foc[lv]
+    // one letter: look AFTER the focus (so the same letter cycles);
+    // more letters: from the focus itself (so it can stay)
+    var found: usize = NONE
+    var guard: usize = 0
+    var cur: usize = from
+    if (*m).nta > 1 && from != NONE {
+        if label_starts(m, from, (*m).nta) { found = from }
+    }
+    while found == NONE && guard < (*m).nf {
+        cur = step_slot(m, parent, cur, 1)
+        if cur == NONE { guard = (*m).nf } else if label_starts(m, cur, (*m).nta) {
+            found = cur
+        }
+        guard = guard + 1
+    }
+    if found != NONE && found != (*m).foc[lv] {
+        (*m).foc[lv] = found
+        (*m).changed = true
+        say_focus(m, lv)
+        return CR_CONSUMED | CR_REPAINT
+    }
+    return CR_CONSUMED
+}
+
+// A KEY (an action.SK_* logical key) while the menu is open. The menu is
+// modal: every key is consumed, the page behind never sees one.
+fn ctx_key(m: *mut Ctxm, key: u32, mods: u32) -> u32 {
+    if !(*m).open { return CR_NONE }
+    let lv: usize = (*m).depth - 1
+    let parent: usize = level_parent(m, lv)
+    var ch: u32 = CR_CONSUMED
+    if key == action.SK_DOWN || key == action.SK_UP {
+        var d: i64 = 1
+        if key == action.SK_UP { d = 0 - 1 }
+        (*m).foc[lv] = step_slot(m, parent, (*m).foc[lv], d)
+        (*m).changed = true
+        say_focus(m, lv)
+        return ch | CR_REPAINT
+    }
+    if key == action.SK_HOME || key == action.SK_PAGE_UP {
+        (*m).foc[lv] = first_slot(m, parent)
+        (*m).changed = true
+        say_focus(m, lv)
+        return ch | CR_REPAINT
+    }
+    if key == action.SK_END || key == action.SK_PAGE_DOWN {
+        (*m).foc[lv] = last_slot(m, parent)
+        (*m).changed = true
+        say_focus(m, lv)
+        return ch | CR_REPAINT
+    }
+    if key == action.SK_RIGHT {
+        let f: usize = (*m).foc[lv]
+        if f != NONE && menu_kind(m, f) == IK_SUB {
+            if ctx_open_sub(m, f, true) { return ch | CR_REPAINT }
+        }
+        return ch
+    }
+    if key == action.SK_LEFT {
+        if (*m).depth > 1 {
+            (*m).depth = (*m).depth - 1
+            (*m).changed = true
+            return ch | CR_REPAINT
+        }
+        return ch
+    }
+    if key == action.SK_ESCAPE {
+        return ctx_close_level(m) | ch
+    }
+    if key == action.SK_ENTER || key == action.SK_SPACE {
+        let f: usize = (*m).foc[lv]
+        if f == NONE { return ch }
+        return ctx_activate(m, f) | ch
+    }
+    if key == action.SK_TAB || key == action.SK_MENU || key == action.SK_F10 {
+        return ctx_close(m, CLOSE_TAB) | ch
+    }
+    return ch
+}
+
+// ============================================================ PLACEMENT
+
+struct Place {
+    x: f64,
+    y: f64,
+    flip: u32, // bit 0: flipped to the left, bit 1: flipped up
+}
+
+// WHERE A CONTEXT MENU OPENS. It wants its top left corner at (ax, ay). With
+// no room to the right it opens to the LEFT of that point; with no room
+// below it opens ABOVE it (`ay_alt`: the pointer's y, or for a key request
+// the top edge of the target). If neither side fits, the side with more room
+// wins and the menu is clamped inside the bounds (bx, by, bw, bh) -- the
+// window now, the screen for a popup of its own.
+fn place_popup(ax: f64, ay: f64, ay_alt: f64, w: f64, h: f64, bx: f64,
+    by: f64, bw: f64, bh: f64) -> Place {
+    var x: f64 = ax
+    var flip: u32 = 0 as u32
+    if x + w > bx + bw {
+        x = ax - w
+        flip = flip | (1 as u32)
+    }
+    if x < bx { x = bx }
+    if x + w > bx + bw { x = bx + bw - w }
+    if x < bx { x = bx }
+    var y: f64 = ay
+    let below: f64 = by + bh - ay
+    let above: f64 = ay_alt - by
+    if h > below {
+        if h <= above {
+            y = ay_alt - h
+            flip = flip | (2 as u32)
+        } else if above > below {
+            y = by
+            flip = flip | (2 as u32)
+        } else {
+            y = by + bh - h
+        }
+    }
+    if y + h > by + bh { y = by + bh - h }
+    if y < by { y = by }
+    return Place { x: x, y: y, flip: flip }
+}
+
+// WHERE A SUBMENU OPENS: to the right of its parent (overlapping the edge by
+// `overlap` so the pointer can travel), its first entry level with the
+// header (`pad` above it); no room right: to the left; no room below: shifted
+// up until it fits.
+fn place_submenu(px: f64, pw: f64, iy: f64, pad: f64, overlap: f64, w: f64,
+    h: f64, bx: f64, by: f64, bw: f64, bh: f64) -> Place {
+    var x: f64 = px + pw - overlap
+    var flip: u32 = 0 as u32
+    if x + w > bx + bw {
+        x = px - w + overlap
+        flip = 1 as u32
+    }
+    if x < bx { x = bx }
+    var y: f64 = iy - pad
+    if y + h > by + bh { y = by + bh - h }
+    if y < by { y = by }
+    return Place { x: x, y: y, flip: flip }
+}
