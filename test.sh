@@ -752,6 +752,16 @@ else
     tail -20 "$WORK/no_german.log" | sed 's/^/   /' || true
 fi
 
+echo "== 21c. the shared test kit (tools/testkit): ok/bad/check/summary for sh and py, PPM reader and compare =="
+# One copy of ok()/bad() and of the PPM reader for all repos (audit 07.10.2026, ~240 + ~58 copies before).
+if bash tools/testkit/selftest.sh > "$WORK/testkit.log" 2>&1; then
+    ok
+    tail -1 "$WORK/testkit.log" | sed 's/^/   /' || true
+else
+    bad "tools/testkit/selftest.sh failed (see .test-work/testkit.log)"
+    tail -20 "$WORK/testkit.log" | sed 's/^/   /' || true
+fi
+
 echo "== 24. the formatter: canonical shape (tools/fmt/run.sh, ROUND 64) =="
 # firnfmt, written in Firn. Proven is: the token stream and the syntax tree
 # stay unchanged over the WHOLE tree, a second run changes nothing, the
