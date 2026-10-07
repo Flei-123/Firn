@@ -14,7 +14,7 @@ explorer, editor, lists, title bars -- **built once in fUi and reused**, not onc
 | What is the popup? | A **small scene per level** (`lib/fui/menuview.fi`), one node per entry, own painter, own a11y tree, painted **above** the page and clipped to the bounds it is given. | Reuses measuring, styling, theme tokens, scaling, hit test and a11y of the page; does not eat the page's 128 nodes. Rejected: a widget kind that paints rows by hand (`wave2.draw_menu_item` only draws one row; no keyboard, no hit test, no submenu). |
 | Own window for the popup? | **Yes on X11** (`lib/plat/fuipopup.fi` + `window.popup_open`): one override-redirect window per level, the first holds the pointer and keyboard grab; **the menu reaches out of the program's window.** Without such a window layer (Win32, OrientOS, Android, browser today) or when a window is refused it falls back to the overlay in the page. See section 9. | The window layer opens windows on connections of their own already (LIB-005), so a menu = up to three more of them; the view stays platform-free and talks to hooks (`mv_set_surface`). |
 
-Everything below is checked by `tools/fui/ctxmenu_main.fi` (model, 200+ checks), `tools/fui/menuview_main.fi`
+Everything below is checked by `tools/fui/ctxmenu_main.fi` (model, 254 checks), `tools/fui/menuview_main.fi`
 (picture, hit test, host path, speed) and `tools/fui/app_main.fi` (fui.app end to end), all in
 `tools/fui/run.sh` section 18q / 18p.
 
@@ -169,7 +169,7 @@ conflicts it should not edit `action.fi`, `ctxmenu.fi`, `menuview.fi`, `ctxstd.f
 
 ## 7. Tests (point 7)
 
-| What | Where | Count |
+| What | Where | Checks |
 |---|---|---|
 | actions, shortcuts, mnemonics, manifest, bus run, catalogs | `ctxmenu_main` 1 | 38 |
 | provider chain, merge, dedupe, submenu merge/prune, selection rule, plugins + rights | `ctxmenu_main` 2 | 50+ |
@@ -177,12 +177,17 @@ conflicts it should not edit `action.fi`, `ctxmenu.fi`, `menuview.fi`, `ctxstd.f
 | flip placement, clamp, submenu flip | `ctxmenu_main` 4 | 11 |
 | announcements | `ctxmenu_main` 5 | 6 |
 | standard entries (text field by widget kind, list, file, title bar states, task pin/unpin, process, en/de) | `ctxmenu_main` 6 | 40+ |
-| pixels: frame, separator, highlight, disabled/danger colours, shortcut, **icon midline**, tick, dot, arrow; dark+light | `menuview_main` 1 | 2x38 |
-| hit test, flip at the edges, touch rows, tiny window | `menuview_main` 3 | 16 |
+| entries from a manifest (proxy actions, rights, bus call), a node's default action | `ctxmenu_main` 7 | 20 |
+| pixels: frame, separator, highlight, disabled/danger colours, shortcut, **icon midline**, tick, dot, arrow; dark+light | `menuview_main` 1 | 2 x 38 |
+| flip at the edges, touch rows, tiny window | `menuview_main` 3 | 16 |
 | a11y tree of the menu and a submenu | `menuview_main` 4 | 12 |
 | host path: right press, click runs, outside press passes, keys, mnemonic, Space, menu key, Shift+F10, prevented request, lock, delay | `menuview_main` 5 | 40 |
+| windows of its own with a fake platform: screen places, grab on level 0 only, submenu flip on the screen's edge, window-move close, refusal fallback | `menuview_main` 7 | 24 |
 | speed (release-fast) | `menuview speed` | 3 |
-| fui.app: right click on a row selects + opens, click runs, text-field menu, select-all by menu, long press, shortcut, manifest, audit | `app_main` | 28 |
+| fui.app: right click on a row selects + opens, click runs, text-field menu, select-all by menu, long press, shortcut, manifest, bound button, lock, audit | `app_main` | 34 |
+| a REAL X server (Xvfb + xdotool + xwd): the menu reaches out of the window, not cut, Esc, click runs, outside click, submenu window, Shift+F10, idle CPU | `ctxlive.py` | 18 |
+
+(Totals today: `ctxmenu_main` 254 checks, `menuview_main` 201, `app_main` context part 34, `ctxlive.py` 18.)
 
 ## 7b. Windows of its own (X11, r168) -- how it works
 
@@ -208,7 +213,7 @@ conflicts it should not edit `action.fi`, `ctxmenu.fi`, `menuview.fi`, `ctxstd.f
 * **Checked** by `menuview_main` section 7 (a fake platform: screen places, grab only on level 0, submenu flip on
   the screen's edge, window-move close, refusal fallback) and by `tools/fui/ctxlive.py` on a real Xvfb (the menu
   is visible right of the 437-px window, not cut at its edge, Esc, click on Rename runs it, click on the empty
-  screen closes, submenu window, Esc closes the submenu only, Tab + Shift+F10): 17 of 17.
+  screen closes, submenu window, Esc closes the submenu only, Tab + Shift+F10): 18 of 18.
 
 ## 8. Alternatives that were rejected
 
