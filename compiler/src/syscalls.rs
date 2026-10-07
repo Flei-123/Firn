@@ -298,6 +298,7 @@ const NO_SOCKETS: &str = "a browser page has no sockets (fetch/WebSocket are not
 const NO_PROCESSES: &str = "a browser page cannot start, wait for or signal processes";
 const NO_THREADS: &str = "threads are not supported on wasm32 yet";
 const NO_SIGNALS: &str = "a browser page has no signals";
+const NO_SHM: &str = "a browser page has no System V shared memory (MIT-SHM is an X11 matter)";
 
 /// The table: the canonical number, the name both `unistd.h` spell, the
 /// answer. Sorted by the number.
@@ -328,6 +329,9 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (24, "sched_yield", Wasm::Constant(0)),
     // Advice may be ignored -- the kernel is allowed to do exactly that.
     (28, "madvise", Wasm::Constant(0)),
+    (29, "shmget", Wasm::Missing(NO_SHM)),
+    (30, "shmat", Wasm::Missing(NO_SHM)),
+    (31, "shmctl", Wasm::Missing(NO_SHM)),
     (32, "dup", Wasm::Missing(NO_FILES)),
     (33, "dup2", Wasm::Missing(NO_FILES)),
     (35, "nanosleep", Wasm::Nanosleep),
@@ -356,9 +360,12 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (61, "wait4", Wasm::Missing(NO_PROCESSES)),
     (62, "kill", Wasm::Missing(NO_PROCESSES)),
     (63, "uname", Wasm::Missing("a browser page has no kernel to name")),
+    (67, "shmdt", Wasm::Missing(NO_SHM)),
     (72, "fcntl", Wasm::Missing(NO_FILES)),
     (73, "flock", Wasm::Missing(NO_FILES)),
     (74, "fsync", Wasm::Missing(NO_FILES)),
+    // red on main before this branch: lib/db added ftruncate to the aarch64 table only
+    (77, "ftruncate", Wasm::Missing(NO_FILES)),
     (79, "getcwd", Wasm::Missing(NO_FILES)),
     (80, "chdir", Wasm::Missing(NO_FILES)),
     (82, "rename", Wasm::Missing(NO_FILES)),
