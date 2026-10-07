@@ -1,0 +1,694 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/menuview.fi -- THE POPUP MENU WIDGET (docs/CONTEXT-MENUS.md,
+// roadmap r161): the picture, the hit test and the glue to the host.
+//
+// ========================================================= WHAT IT DOES
+//
+// lib/fui/ctxmenu.fi decides WHAT is in the menu and which entry is focused;
+// this file makes it visible and answers "which entry is at (x, y)". It
+//
+//   * builds ONE SCENE PER LEVEL (the menu, an open submenu, one more) -- a
+//     small tree of its own, so a menu never eats the 128 nodes of the page
+//     and every level is measured, laid out, painted and hit-tested by the
+//     same code as the page (lib/fui/scene.fi), styled by the same theme
+//     tokens (dark / light / any theme file), scaled by the same `len_of`;
+//   * gives every ENTRY one node: key = slot + 1, a painter that draws the
+//     gutter (icon, tick, radio dot), the label with its mnemonic
+//     underlined, the shortcut at the right, the submenu arrow, in the
+//     colours of the state (focused, disabled, dangerous);
+//   * puts the ACCESSIBILITY on those nodes: role menu / menuitem /
+//     menuitemcheckbox / menuitemradio / separator, name, checked, expanded,
+//     disabled -- the same a11y_dump a page has;
+//   * positions the levels with ctxmenu.place_popup / place_submenu: flips
+//     to the left / upward when there is no room, stays inside the bounds;
+//   * is the POPUP SINK of the host (fuiwirt.host_set_popup): while a menu
+//     is open the pointer, keys and characters come here first.
+//
+// ===================================================== THE LAYER IT SITS ON
+//
+// The menu is painted ABOVE the page, after `scene_draw` of the page, into
+// the same canvas (`mv_draw`), clipped to the window -- so it is never cut
+// by a widget's clip (a scroll area, a card) and never covered by a later
+// sibling: that is the "window layer" of a menu. A menu that must reach
+// OUTSIDE a small window needs a window of its own (popup.fi, `Surface`);
+// the bounds `mv_set_bounds` get then become the screen's.
+//
+// WHAT IT DOES NOT DO: scroll a menu taller than the window (it is cut at
+// the bounds -- roadmap), mirror for right-to-left languages (the submenu
+// still opens to the right first -- roadmap).
+export {
+    MenuView, mv_new, mv_bind, mv_set_bounds, mv_sync, mv_draw, mv_hit,
+    mv_request, mv_attach, mv_model, mv_levels, mv_rect, mv_row_rect,
+    mv_a11y_dump, mv_scene, mv_open, mv_is_open, mv_pointer, mv_key, mv_char, mv_tick,
+    mv_wait, mv_rebuilds, mv_row_h_px, mv_text_px,
+    MV_NONE, MV_PAD,
+    HIT_MOVE, HIT_LEAVE, HIT_DOWN, HIT_UP, HIT_WHEEL,
+}
+
+import std.rt
+import fui.action
+import fui.ctxmenu
+import fui.scene
+import fui.sheet
+import fui.style
+import fui.flex
+import fui.render
+import fui.widget
+import fui.painter
+import fui.icon
+import fui.icons
+import fui.a11y
+import fui.theme
+
+const MV_NONE: usize = 4294967295
+const MV_PAD: usize = 4294967294 // inside a level, on no entry
+
+// The pointer kinds the host sends (fuiwirt.HOOK_*).
+const HIT_MOVE: u32 = 1
+const HIT_LEAVE: u32 = 2
+const HIT_DOWN: u32 = 3
+const HIT_UP: u32 = 4
+const HIT_WHEEL: u32 = 5
+
+// THE LOOK, in design points.
+const PAD_PT: i64 = 4 // inside the frame
+const ROW_MIN_PT: usize = 32
+const TOUCH_ROW_PT: usize = 44 // the touch target of Fluent / Material
+const SEP_PT: f64 = 9.0
+const GUTTER_PT: f64 = 28.0 // icon / tick column
+const PADX_PT: f64 = 12.0
+const GAP_PT: f64 = 24.0 // between label and shortcut
+const ARROW_PT: f64 = 22.0
+const MIN_W_PT: f64 = 140.0
+const MAX_W_PT: f64 = 420.0
+const OVERLAP_PT: f64 = 4.0
+const EDGE_PT: f64 = 6.0 // keep this far from the bounds
+
+static NM_MENU: [u8; 8] = "ctx-menu"
+static NM_ROW: [u8; 7] = "ctx-row"
+static NM_SEP: [u8; 7] = "ctx-sep"
+
+struct RowPaint {
+    v: u64, // *mut MenuView
+    lv: usize, // the level
+    slot: usize,
+}
+
+struct Level {
+    sc: scene.Scene,
+    ax: a11y.A11y,
+    on: bool,
+    root: usize,
+    parent: usize, // the submenu header slot that opened it, NONE for the menu
+    // the frame in window pixels
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    gutter: bool, // a column for icon / tick
+    padx: f64, // px
+    gut_px: f64,
+    arrow_px: f64,
+    row_px: f64, // one row's height in px
+    n_rows: usize,
+}
+
+struct MenuView {
+    cm: u64, // *mut ctxmenu.Ctxm
+    c: u64, // *mut render.Ctx
+    psc: u64, // *mut scene.Scene -- the page, for requests
+    sh: sheet.Sheet,
+    lv: [Level; 3],
+    rp: [RowPaint; 96],
+    bx: f64,
+    by: f64,
+    bw: f64,
+    bh: f64,
+    stamp: u64,
+    nlev: usize,
+    rebuilds: u64,
+    ok: bool,
+}
+
+fn level_blank() -> Level {
+    return Level { sc: scene.scene_new(), ax: a11y.a11y_new(), on: false,
+        root: scene.SCENE_NONE, parent: ctxmenu.NONE, x: 0.0, y: 0.0, w: 0.0,
+        h: 0.0, gutter: false, padx: 0.0, gut_px: 0.0, arrow_px: 0.0,
+        row_px: 0.0, n_rows: 0 }
+}
+
+fn view_blank() -> MenuView {
+    return MenuView { cm: 0, c: 0, psc: 0, sh: sheet.sheet_new(),
+        lv: [level_blank(); 3], rp: [RowPaint { v: 0, lv: 0, slot: 0 }; 96],
+        bx: 0.0, by: 0.0, bw: 0.0, bh: 0.0, stamp: 0, nlev: 0, rebuilds: 0,
+        ok: false }
+}
+
+fn view_size() -> usize {
+    var probe: [MenuView; 2] = [view_blank(); 2]
+    return ((&probe[1]) as usize) - ((&probe[0]) as usize)
+}
+
+// A VIEW for the model `cm`. On the heap (a view holds three scenes). null
+// when there is no memory.
+fn mv_new(cm: *mut ctxmenu.Ctxm) -> *mut MenuView {
+    let p: u64 = rt.heap_alloc(view_size())
+    if p == 0 {
+        return 0 as u64 as *mut MenuView
+    }
+    let v: *mut MenuView = p as *mut MenuView
+    *v = view_blank()
+    (*v).cm = cm as u64
+    mv_rules(&(*v).sh)
+    (*v).ok = true
+    return v
+}
+
+fn mv_model(v: *mut MenuView) -> *mut ctxmenu.Ctxm {
+    return (*v).cm as *mut ctxmenu.Ctxm
+}
+
+// The page's render context (theme + painter). Call once, and again if it
+// moves.
+fn mv_bind(v: *mut MenuView, c: *mut render.Ctx) {
+    (*v).c = c as u64
+}
+
+// The page's scene, for requests (provider chain from the target node up).
+fn mv_attach(v: *mut MenuView, psc: *mut scene.Scene) {
+    (*v).psc = psc as u64
+}
+
+// The rectangle menus must stay inside, window pixels: the window (overlay)
+// or the screen (a popup window of its own).
+fn mv_set_bounds(v: *mut MenuView, x: f64, y: f64, w: f64, h: f64) {
+    (*v).bx = x
+    (*v).by = y
+    (*v).bw = w
+    (*v).bh = h
+}
+
+fn mv_rules(sh: *mut sheet.Sheet) {
+    let kmenu: u32 = sheet.sheet_name((&NM_MENU[0]) as u64, 8)
+    var s0: style.Style = style.style_new()
+    s0 = style.style_set_bg(s0, style.color_token(style.TOK_SURFACE_RAISED))
+    s0 = style.style_set_border(s0, style.color_token(style.TOK_BORDER), 1)
+    s0 = style.style_set_radius(s0, 8)
+    s0 = style.style_set_fg(s0, style.color_token(style.TOK_TEXT))
+    let r0: usize = sheet.sheet_rule(sh, sheet.sel_class(kmenu), s0)
+}
+
+fn kmenu() -> u32 { return sheet.sheet_name((&NM_MENU[0]) as u64, 8) }
+fn krow() -> u32 { return sheet.sheet_name((&NM_ROW[0]) as u64, 7) }
+fn ksep() -> u32 { return sheet.sheet_name((&NM_SEP[0]) as u64, 7) }
+
+fn ctxc(v: *mut MenuView) -> *mut render.Ctx { return (*v).c as *mut render.Ctx }
+fn cmo(v: *mut MenuView) -> *mut ctxmenu.Ctxm { return (*v).cm as *mut ctxmenu.Ctxm }
+
+// ONE POINT in pixels.
+fn pt_px(c: *mut render.Ctx, pt: f64) -> f64 {
+    return render.len_of(c, 1000) * pt / 1000.0
+}
+
+fn mv_text_px(c: *mut render.Ctx) -> f64 {
+    return render.len_of(c, render.def_font(c))
+}
+
+// The height of one entry in pixels: the theme's row, taller for a finger.
+fn mv_row_h_px(c: *mut render.Ctx, touch: bool) -> f64 {
+    let fo: *mut theme.Shape = theme.theme_shape(render.ctx_theme(c))
+    var pt: usize = (*fo).row
+    if pt < ROW_MIN_PT { pt = ROW_MIN_PT }
+    if touch && pt < TOUCH_ROW_PT { pt = TOUCH_ROW_PT }
+    return render.len_of(c, pt)
+}
+
+// ============================================================ BUILDING
+
+fn shortcut_str(cm: *mut ctxmenu.Ctxm, s: usize, out: *mut u8, cap: usize) -> usize {
+    return action.shortcut_text(ctxmenu.menu_key(cm, s), ctxmenu.menu_mods(cm, s), out, cap)
+}
+
+// The role of an entry for a screen reader.
+fn role_of(cm: *mut ctxmenu.Ctxm, s: usize) -> u32 {
+    let k: u32 = ctxmenu.menu_kind(cm, s)
+    if k == ctxmenu.IK_SEP { return a11y.ROLE_SEPARATOR }
+    let fl: u32 = ctxmenu.menu_flags(cm, s)
+    if (fl & action.AF_RADIO) != 0 as u32 { return a11y.ROLE_MENUITEMRADIO }
+    if (fl & action.AF_CHECK) != 0 as u32 { return a11y.ROLE_MENUITEMCHECKBOX }
+    return a11y.ROLE_MENUITEM
+}
+
+// Build level `lv` (the entries under `parent`) into its own scene, measure
+// and size it; the position is set by `place_level`.
+fn build_level(v: *mut MenuView, lv: usize, parent: usize) {
+    let cm: *mut ctxmenu.Ctxm = cmo(v)
+    let c: *mut render.Ctx = ctxc(v)
+    let L: *mut Level = &(*v).lv[lv]
+    scene.scene_reset(&(*L).sc)
+    a11y.a11y_reset(&(*L).ax)
+    (*L).on = true
+    (*L).parent = parent
+    let touch: bool = ctxmenu.ctx_touch(cm)
+    let k: f64 = render.len_of(c, 1000) / 1000.0
+    let row_px: f64 = mv_row_h_px(c, touch)
+    let px: f64 = mv_text_px(c)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    (*L).row_px = row_px
+    (*L).gutter = ctxmenu.menu_has_check(cm, parent) || ctxmenu.menu_has_icon(cm, parent)
+    (*L).padx = pt_px(c, PADX_PT)
+    (*L).gut_px = 0.0
+    if (*L).gutter { (*L).gut_px = pt_px(c, GUTTER_PT) }
+    // widest label + shortcut + arrow
+    var wlab: f64 = 0.0
+    var wsc: f64 = 0.0
+    var has_sub: bool = false
+    var rows: usize = 0
+    var seps: usize = 0
+    var q: usize = 0
+    let n_all: usize = ctxmenu.menu_level_count(cm, parent)
+    // A MENU TALLER THAN THE BOUNDS is cut after the last entry that fits
+    // (scrolling is on the roadmap); the entries below are not built.
+    let frame: f64 = 2.0 * pt_px(c, (PAD_PT as f64)) + 2.0
+    let avail: f64 = (*v).bh - 2.0 * pt_px(c, EDGE_PT) - frame
+    let sep_px: f64 = pt_px(c, SEP_PT)
+    var used: f64 = 0.0
+    var n: usize = 0
+    var stop: bool = false
+    while n < n_all && !stop {
+        let s0: usize = ctxmenu.menu_level_at(cm, parent, n)
+        var hh: f64 = row_px
+        if ctxmenu.menu_kind(cm, s0) == ctxmenu.IK_SEP { hh = sep_px }
+        if avail > 40.0 && used + hh > avail {
+            stop = true
+        } else {
+            used = used + hh
+            n = n + 1
+        }
+    }
+    while q < n {
+        let s: usize = ctxmenu.menu_level_at(cm, parent, q)
+        let kd: u32 = ctxmenu.menu_kind(cm, s)
+        if kd == ctxmenu.IK_SEP {
+            seps = seps + 1
+        } else {
+            rows = rows + 1
+            let lab: str = ctxmenu.menu_label(cm, s)
+            let wl: f64 = painter.text_width(z, lab.p as u64, lab.n, px)
+            if wl > wlab { wlab = wl }
+            var sb: [u8; 40] = [0 as u8; 40]
+            let sn: usize = shortcut_str(cm, s, (&sb[0]) as *mut u8, 40)
+            if sn > 0 {
+                let ws: f64 = painter.text_width(z, (&sb[0]) as u64, sn, px)
+                if ws > wsc { wsc = ws }
+            }
+            if kd == ctxmenu.IK_SUB { has_sub = true }
+        }
+        q = q + 1
+    }
+    (*L).n_rows = rows
+    (*L).arrow_px = 0.0
+    if has_sub { (*L).arrow_px = pt_px(c, ARROW_PT) }
+    var gap: f64 = 0.0
+    if wsc > 0.0 { gap = pt_px(c, GAP_PT) }
+    var w: f64 = (*L).padx * 2.0 + (*L).gut_px + wlab + gap + wsc + (*L).arrow_px
+    + 2.0 * pt_px(c, (PAD_PT as f64)) + 2.0
+    let wmin: f64 = pt_px(c, MIN_W_PT)
+    let wmax: f64 = pt_px(c, MAX_W_PT)
+    if w < wmin { w = wmin }
+    if w > wmax { w = wmax }
+    // never wider than the bounds (a tiny window): the label gives way
+    let room_w: f64 = (*v).bw - 2.0 * pt_px(c, EDGE_PT)
+    if room_w > 40.0 && w > room_w { w = room_w }
+    let h: f64 = row_px * (rows as f64) + sep_px * (seps as f64)
+    + 2.0 * pt_px(c, (PAD_PT as f64)) + 2.0
+    (*L).w = w
+    (*L).h = h
+    // the tree: root frame, one node per entry
+    let root: usize = scene.scene_box(&(*L).sc, scene.SCENE_NONE, kmenu(),
+        flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_START)
+    (*L).root = root
+    scene.node_set_size(&(*L).sc, root, w / k, h / k)
+    scene.node_set_padding(&(*L).sc, root, PAD_PT, PAD_PT, PAD_PT, PAD_PT)
+    scene.node_set_gap(&(*L).sc, root, 0, 0)
+    a11y.a11y_set_role(&(*L).ax, root, a11y.ROLE_MENU)
+    let inner_w: f64 = (w - 2.0 * pt_px(c, (PAD_PT as f64)) - 2.0) / k
+    var i: usize = 0
+    while i < n {
+        let s: usize = ctxmenu.menu_level_at(cm, parent, i)
+        let kd: u32 = ctxmenu.menu_kind(cm, s)
+        var cls: u32 = krow()
+        if kd == ctxmenu.IK_SEP { cls = ksep() }
+        let nd: usize = scene.scene_box(&(*L).sc, root, cls, flex.FLEX_ROW,
+            flex.JUSTIFY_START, flex.AL_CENTER)
+        if nd != scene.SCENE_NONE {
+            scene.node_set_id(&(*L).sc, nd, (s + 1) as u32)
+            if kd == ctxmenu.IK_SEP {
+                scene.node_set_size(&(*L).sc, nd, inner_w, SEP_PT)
+            } else {
+                scene.node_set_size(&(*L).sc, nd, inner_w, row_px / k)
+            }
+            (*v).rp[s] = RowPaint { v: v as u64, lv: lv, slot: s }
+            scene.node_set_draw(&(*L).sc, nd, (&(*v).rp[s]) as u64, paint_row)
+            a11y.a11y_set_role(&(*L).ax, nd, role_of(cm, s))
+            if kd != ctxmenu.IK_SEP {
+                let lab: str = ctxmenu.menu_label(cm, s)
+                a11y.a11y_set_name(&(*L).ax, nd, lab.p as u64, lab.n)
+                if !ctxmenu.menu_enabled(cm, s) && kd == ctxmenu.IK_ACTION {
+                    scene.node_set_state(&(*L).sc, nd, style.STATE_DISABLED)
+                }
+                if ctxmenu.menu_checked(cm, s) == action.CHK_ON {
+                    widget.w_set_value(scene.node_widget(&(*L).sc, nd), 1)
+                }
+                if kd == ctxmenu.IK_SUB {
+                    a11y.a11y_set_expanded(&(*L).ax, nd, a11y.EXP_COLLAPSED)
+                }
+            }
+        }
+        i = i + 1
+    }
+    scene.scene_style(&(*L).sc, &(*v).sh)
+    scene.scene_measure(&(*L).sc, c)
+    (*v).rebuilds = (*v).rebuilds + 1
+}
+
+// Put level `lv` on the screen: the menu at the request's place, a submenu
+// beside the row of its header.
+fn place_level(v: *mut MenuView, lv: usize) {
+    let cm: *mut ctxmenu.Ctxm = cmo(v)
+    let c: *mut render.Ctx = ctxc(v)
+    let L: *mut Level = &(*v).lv[lv]
+    let e: f64 = pt_px(c, EDGE_PT)
+    var bx: f64 = (*v).bx + e
+    var by: f64 = (*v).by + e
+    var bw: f64 = (*v).bw - 2.0 * e
+    var bh: f64 = (*v).bh - 2.0 * e
+    if bw < 40.0 { bx = (*v).bx
+        bw = (*v).bw }
+    if bh < 40.0 { by = (*v).by
+        bh = (*v).bh }
+    if lv == 0 {
+        let pl: ctxmenu.Place = ctxmenu.place_popup(ctxmenu.ctx_anchor_x(cm),
+            ctxmenu.ctx_anchor_y(cm), ctxmenu.ctx_anchor_alt(cm), (*L).w, (*L).h, bx, by, bw, bh)
+        (*L).x = pl.x
+        (*L).y = pl.y
+    } else {
+        let P: *mut Level = &(*v).lv[lv - 1]
+        // the header's row in the parent: its top
+        let hs: usize = (*L).parent
+        let hn: usize = scene.scene_find_id(&(*P).sc, (hs + 1) as u32)
+        var iy: f64 = (*P).y
+        if hn != scene.SCENE_NONE { iy = scene.node_y(&(*P).sc, hn) }
+        let pl: ctxmenu.Place = ctxmenu.place_submenu((*P).x, (*P).w, iy,
+            pt_px(c, (PAD_PT as f64)) + 1.0, pt_px(c, OVERLAP_PT), (*L).w, (*L).h,
+            bx, by, bw, bh)
+        (*L).x = pl.x
+        (*L).y = pl.y
+    }
+    scene.scene_layout(&(*L).sc, c, (*L).x, (*L).y, (*L).w, (*L).h)
+}
+
+// BRING THE PICTURE UP TO DATE with the model: a new menu is built from
+// scratch, an opened submenu gets its level, a closed one loses it. Cheap
+// when nothing changed.
+fn mv_sync(v: *mut MenuView) {
+    let cm: *mut ctxmenu.Ctxm = cmo(v)
+    if !(*v).ok || (*v).c == 0 { return }
+    if !ctxmenu.ctx_is_open(cm) {
+        (*v).nlev = 0
+        return
+    }
+    if ctxmenu.ctx_open_count(cm) != (*v).stamp {
+        (*v).stamp = ctxmenu.ctx_open_count(cm)
+        var k: usize = 0
+        while k < 3 {
+            (*v).lv[k].on = false
+            k = k + 1
+        }
+    }
+    let depth: usize = ctxmenu.ctx_depth(cm)
+    var lv: usize = 0
+    while lv < depth && lv < 3 {
+        var parent: usize = ctxmenu.NONE
+        if lv > 0 { parent = ctxmenu.ctx_open_path(cm, lv) }
+        if !(*v).lv[lv].on || (*v).lv[lv].parent != parent {
+            build_level(v, lv, parent)
+            place_level(v, lv)
+        }
+        lv = lv + 1
+    }
+    var off: usize = depth
+    while off < 3 {
+        (*v).lv[off].on = false
+        off = off + 1
+    }
+    (*v).nlev = depth
+}
+
+fn mv_levels(v: *mut MenuView) -> usize { return (*v).nlev }
+fn mv_rebuilds(v: *mut MenuView) -> u64 { return (*v).rebuilds }
+fn mv_open(v: *mut MenuView) -> bool { return ctxmenu.ctx_is_open(cmo(v)) }
+fn mv_scene(v: *mut MenuView, lv: usize) -> *mut scene.Scene { return &(*v).lv[lv].sc }
+
+// The frame of level `lv` in window pixels: out = x, y, w, h. false when
+// that level is not shown.
+fn mv_rect(v: *mut MenuView, lv: usize, out: *mut [f64; 4]) -> bool {
+    if lv >= (*v).nlev || !(*v).lv[lv].on { return false }
+    (*out)[0] = (*v).lv[lv].x
+    (*out)[1] = (*v).lv[lv].y
+    (*out)[2] = (*v).lv[lv].w
+    (*out)[3] = (*v).lv[lv].h
+    return true
+}
+
+// The rectangle of one entry (window pixels).
+fn mv_row_rect(v: *mut MenuView, slot: usize, out: *mut [f64; 4]) -> bool {
+    var lv: usize = 0
+    while lv < (*v).nlev {
+        let sc: *mut scene.Scene = &(*v).lv[lv].sc
+        let nd: usize = scene.scene_find_id(sc, (slot + 1) as u32)
+        if nd != scene.SCENE_NONE {
+            (*out)[0] = scene.node_x(sc, nd)
+            (*out)[1] = scene.node_y(sc, nd)
+            (*out)[2] = scene.node_w(sc, nd)
+            (*out)[3] = scene.node_h(sc, nd)
+            return true
+        }
+        lv = lv + 1
+    }
+    return false
+}
+
+// The text form of the menu's accessibility tree, level `lv` (the same
+// a11y_dump a page has); the length written.
+fn mv_a11y_dump(v: *mut MenuView, lv: usize, p: u64, cap: usize) -> usize {
+    if lv >= 3 { return 0 }
+    return a11y.a11y_dump(&(*v).lv[lv].sc, &(*v).lv[lv].ax, p, cap)
+}
+
+// ============================================================ PAINTING
+
+fn col(c: *mut render.Ctx, tk: u32) -> u32 {
+    return render.color_of(c, style.color_token(tk))
+}
+
+fn round_i(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - round_i(0.0 - x) }
+    return ((x + 0.5) as i64) as f64
+}
+
+// ONE ENTRY: separator line, or highlight + gutter + label + shortcut + arrow.
+fn paint_row(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let rp: *mut RowPaint = ud as *mut RowPaint
+    let v: *mut MenuView = (*rp).v as *mut MenuView
+    let cm: *mut ctxmenu.Ctxm = cmo(v)
+    let s: usize = (*rp).slot
+    let L: *mut Level = &(*v).lv[(*rp).lv]
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    let kd: u32 = ctxmenu.menu_kind(cm, s)
+    if kd == ctxmenu.IK_SEP {
+        let t: f64 = round_i(pt_px(c, 1.0))
+        var th: f64 = 1.0
+        if t > 1.0 { th = t }
+        painter.surface(z, x + (*L).padx / 2.0, round_i(y + (h - th) / 2.0),
+            w - (*L).padx, th, col(c, style.TOK_SEPARATOR))
+        return
+    }
+    let focused: bool = ctxmenu.ctx_focus(cm, (*rp).lv) == s
+    let enabled: bool = ctxmenu.menu_enabled(cm, s) || kd == ctxmenu.IK_SUB
+    let danger: bool = ctxmenu.menu_danger(cm, s)
+    let dis: bool = !ctxmenu.menu_enabled(cm, s) && kd == ctxmenu.IK_ACTION
+    // the highlight: inset a hair so it does not touch the frame
+    var fg: u32 = col(c, style.TOK_TEXT)
+    var fg2: u32 = col(c, style.TOK_TEXT_MUTED)
+    if focused {
+        var bg: u32 = col(c, style.TOK_SELECTION)
+        if dis { bg = col(c, style.TOK_BUTTON_HOVER) }
+        painter.round_rect(z, x, y, w, h, pt_px(c, 5.0), bg)
+        if !dis {
+            fg = col(c, style.TOK_SELECTION_TEXT)
+            fg2 = fg
+        }
+    }
+    if danger && !dis && !focused { fg = col(c, style.TOK_ERROR) }
+    if dis {
+        fg = col(c, style.TOK_TEXT_DISABLED)
+        fg2 = fg
+    }
+    let px: f64 = mv_text_px(c)
+    let cy: f64 = round_i(y + h / 2.0)
+    let side: f64 = round_i(pt_px(c, 16.0))
+    // the gutter: tick / radio dot when checked, else the icon
+    let gx: f64 = x + (*L).padx / 2.0
+    if (*L).gutter {
+        let ck: u32 = ctxmenu.menu_checked(cm, s)
+        let fl: u32 = ctxmenu.menu_flags(cm, s)
+        if ck == action.CHK_ON && (fl & action.AF_RADIO) != 0 as u32 {
+            let d: f64 = round_i(pt_px(c, 8.0))
+            icon.dot(z, gx + (side - d) / 2.0, cy - round_i(d / 2.0), d, fg)
+        } else if ck == action.CHK_ON {
+            icon.check(z, gx, cy - round_i(side / 2.0), side, pt_px(c, 2.0), fg)
+        } else if ck == action.CHK_NONE && ctxmenu.menu_icon(cm, s) != action.ICON_NONE {
+            icons.icon_stroke(z, ctxmenu.menu_icon(cm, s), gx, cy - round_i(side / 2.0),
+                side, fg, icons.STROKE_DEFAULT)
+        } else if ck != action.CHK_NONE && ctxmenu.menu_icon(cm, s) != action.ICON_NONE {
+            // a check entry that is off still shows its icon
+            icons.icon_stroke(z, ctxmenu.menu_icon(cm, s), gx, cy - round_i(side / 2.0),
+                side, fg, icons.STROKE_DEFAULT)
+        }
+    }
+    // the label
+    let lab: str = ctxmenu.menu_label(cm, s)
+    var run: painter.TextRun = painter.run_new(px)
+    let tx: f64 = x + (*L).padx / 2.0 + (*L).gut_px + (*L).padx / 2.0
+    let by: f64 = painter.text_baseline_mid(z, y, h, px)
+    let tx1: f64 = painter.run_draw(z, &run, tx, by, 0.0, fg, lab.p as u64, lab.n, painter.TEXT_L)
+    // the mnemonic's underline (a thin bar under that letter)
+    let mp: usize = ctxmenu.menu_mpos(cm, s)
+    if mp < lab.n && !dis {
+        let before: f64 = painter.text_width(z, lab.p as u64, mp, px)
+        var cn: usize = 1
+        // a UTF-8 letter is more than one byte
+        while mp + cn < lab.n && (*((lab.p as u64 + (mp + cn) as u64) as *mut u8) & (192 as u8)) == (128 as u8) {
+            cn = cn + 1
+        }
+        let cw: f64 = painter.text_width(z, (lab.p as u64) + mp as u64, cn, px)
+        painter.surface(z, tx + before, by + round_i(pt_px(c, 2.0)), cw, 1.0, fg)
+    }
+    // the shortcut, right aligned before the arrow
+    var sb: [u8; 40] = [0 as u8; 40]
+    let sn: usize = shortcut_str(cm, s, (&sb[0]) as *mut u8, 40)
+    if sn > 0 {
+        let sw: f64 = painter.text_width(z, (&sb[0]) as u64, sn, px)
+        var run2: painter.TextRun = painter.run_new(px)
+        let sx: f64 = x + w - (*L).padx / 2.0 - (*L).arrow_px - sw
+        let sx1: f64 = painter.run_draw(z, &run2, sx, by, 0.0, fg2, (&sb[0]) as u64, sn, painter.TEXT_L)
+    }
+    // the submenu arrow
+    if kd == ctxmenu.IK_SUB {
+        let d: f64 = round_i(pt_px(c, 10.0))
+        icon.triangle_right(z, x + w - (*L).padx / 2.0 - d, cy - round_i(d / 2.0), d, fg)
+    }
+}
+
+// PAINT the open levels, above whatever the page painted. Call after the
+// page's own drawing, every frame the host paints.
+fn mv_draw(v: *mut MenuView, c: *mut render.Ctx) {
+    mv_sync(v)
+    var lv: usize = 0
+    while lv < (*v).nlev {
+        scene.scene_draw(&(*v).lv[lv].sc, c)
+        lv = lv + 1
+    }
+}
+
+// ============================================================ HIT TESTING
+
+// What is at (x, y): an entry's SLOT, MV_PAD (inside a level, on no entry:
+// the frame, its padding) or MV_NONE (outside every level). The deepest level
+// wins where two overlap.
+fn mv_hit(v: *mut MenuView, x: f64, y: f64) -> usize {
+    mv_sync(v)
+    var lv: usize = (*v).nlev
+    while lv > 0 {
+        lv = lv - 1
+        let L: *mut Level = &(*v).lv[lv]
+        if x >= (*L).x && x < (*L).x + (*L).w && y >= (*L).y && y < (*L).y + (*L).h {
+            let nd: usize = scene.scene_hit(&(*L).sc, x, y)
+            if nd != scene.SCENE_NONE {
+                let id: u32 = scene.node_id(&(*L).sc, nd)
+                if id != 0 as u32 { return (id - (1 as u32)) as usize }
+            }
+            return MV_PAD
+        }
+    }
+    return MV_NONE
+}
+
+// ============================================================ THE GLUE
+
+// THE REQUEST HOOK of the host (fuiwirt.host_set_context): open the menu of
+// `target`. true = a menu is open now.
+fn mv_request(ud: u64, target: usize, x: f64, y: f64, ay_alt: f64,
+    source: u32, mods: u32) -> bool {
+    let v: *mut MenuView = ud as *mut MenuView
+    let cm: *mut ctxmenu.Ctxm = cmo(v)
+    let ok: bool = ctxmenu.ctx_request(cm, (*v).psc as *mut scene.Scene, target,
+        x, y, ay_alt, source, mods, 0)
+    if ok { mv_sync(v) }
+    return ok
+}
+
+fn mv_is_open(ud: u64) -> bool {
+    return ctxmenu.ctx_is_open(cmo(ud as *mut MenuView))
+}
+
+// The popup sink's pointer: move = hover, down = press / outside press,
+// wheel and up are consumed. Answer: ctxmenu.CR_* bits.
+fn mv_pointer(ud: u64, kind: u32, x: f64, y: f64, btn: u32, now: i64) -> u32 {
+    let v: *mut MenuView = ud as *mut MenuView
+    let cm: *mut ctxmenu.Ctxm = cmo(v)
+    if !ctxmenu.ctx_is_open(cm) { return ctxmenu.CR_NONE }
+    if kind == HIT_LEAVE { return ctxmenu.CR_NONE }
+    let s: usize = mv_hit(v, x, y)
+    if kind == HIT_MOVE {
+        var r: u32 = ctxmenu.CR_CONSUMED
+        if s != MV_NONE && s != MV_PAD {
+            r = r | ctxmenu.ctx_hover(cm, s, now)
+        }
+        return r
+    }
+    if kind == HIT_DOWN {
+        if btn >= 4 as u32 { return ctxmenu.CR_CONSUMED }
+        if s == MV_NONE {
+            return ctxmenu.ctx_press(cm, ctxmenu.NONE, now)
+        }
+        if s == MV_PAD { return ctxmenu.CR_CONSUMED }
+        // only the main button activates; another one just points
+        if btn != 1 as u32 {
+            return ctxmenu.CR_CONSUMED | ctxmenu.ctx_hover(cm, s, now)
+        }
+        return ctxmenu.ctx_press(cm, s, now) | ctxmenu.CR_CONSUMED
+    }
+    return ctxmenu.CR_CONSUMED
+}
+
+fn mv_key(ud: u64, key: u32, mods: u32, now: i64) -> u32 {
+    return ctxmenu.ctx_key(cmo(ud as *mut MenuView), key, mods)
+}
+
+fn mv_char(ud: u64, cp: u32, mods: u32, now: i64) -> u32 {
+    return ctxmenu.ctx_char(cmo(ud as *mut MenuView), cp, now)
+}
+
+fn mv_tick(ud: u64, now: i64) -> u32 {
+    return ctxmenu.ctx_tick(cmo(ud as *mut MenuView), now)
+}
+
+fn mv_wait(ud: u64, now: i64) -> i64 {
+    return ctxmenu.ctx_pending_ms(cmo(ud as *mut MenuView), now)
+}

@@ -57,6 +57,11 @@ WANTED = [
     "loader-circle", "folder-open", "gamepad-2", "server", "hard-drive",
     "circle-x", "file-text", "rocket", "sparkles", "layers", "list",
     "terminal", "box",
+    # context menus (lib/fui/ctxstd.fi): cut / paste / undo / select, window
+    # and process entries, sort
+    "scissors", "clipboard-paste", "undo-2", "redo-2", "text-select", "minus",
+    "square", "minimize-2", "move", "move-diagonal-2", "arrow-up-down",
+    "pin-off", "list-checks", "app-window", "power",
 ]
 
 
