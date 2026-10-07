@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/region.fi -- DAMAGE AS A REGION (docs/COMPOSITOR.md stage S2: the compositor primitives as a library).
+//
+// `wm.fi` keeps ONE dirty rectangle: the bounding box of everything that changed. Two small changes in two corners
+// of the screen make it recompose nearly the whole screen. A REGION is a list of disjoint rectangles: the same two
+// changes cost two small rectangles. This file is the algebra and nothing else: integers only (`i64`), no heap, no
+// floating point, so a program in the KERNEL profile (the window server today) and one in ring 3 (the compositor
+// of the plan) can use the same code.
+//
+// A region lives in a buffer of the caller of `REGION_WORDS` words (520 octets):
+//
+//     word 0         the number of rectangles n (0..MAXR)
+//     word 1 + 4 i   x0, y0, x1, y1 of rectangle i  (half open: x0 <= x < x1, y0 <= y < y1; always x0 < x1, y0 < y1)
+//
+// THE RECTANGLES NEVER OVERLAP: `region_add` cuts what is already covered out of the new rectangle first, so the
+// area of the region is the sum of its rectangles and `region_area` is exact. When more than `MAXR` pieces would be
+// needed the region COLLAPSES to the bounding box of everything (the behaviour of today's single rectangle): a loss
+// of precision, never of damage -- the region always covers at least what was added.
+//
+//   region_clear(r)                        empty it
+//   region_add(r, x0, y0, x1, y1)          add a rectangle
+//   region_count(r)  region_rect(r, i, k)  the rectangles (k: 0 x0, 1 y0, 2 x1, 3 y1)
+//   region_bounds(r, k)                    the bounding box (k as above), 0 for an empty region
+//   region_area(r)                         the number of covered points
+//   region_contains(r, x, y)               is the point covered?
+//   region_clip(r, x0, y0, x1, y1)         keep only what lies inside the rectangle
+//   region_hits(r, x0, y0, x1, y1)         does anything of the region lie inside the rectangle?
+
+export {
+    region_clear, region_add, region_count, region_rect, region_bounds, region_area, region_contains,
+    region_clip, region_hits, MAXR, REGION_WORDS,
+}
+
+const MAXR: u64 = 16
+const REGION_WORDS: u64 = 65 // 1 + 4 * MAXR
+
+// the pieces while a rectangle is cut: up to 4 per overlap, a stack of 4 * (MAXR + 1) is enough
+static mut pc: [i64; 288] = [0 as i64; 288]
+static mut pn: u64 = 0
+
+fn wget(r: u64, w: u64) -> i64 {
+    return *((r + w * 8) as *mut i64)
+}
+
+fn wput(r: u64, w: u64, v: i64) {
+    *((r + w * 8) as *mut i64) = v
+}
+
+fn region_clear(r: u64) {
+    wput(r, 0, 0)
+}
+
+fn region_count(r: u64) -> u64 {
+    return wget(r, 0) as u64
+}
+
+fn region_rect(r: u64, i: u64, k: u64) -> i64 {
+    return wget(r, 1 + i * 4 + k)
+}
+
+fn imin(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn imax(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn piece_push(x0: i64, y0: i64, x1: i64, y1: i64) {
+    if x0 >= x1 || y0 >= y1 || pn >= 72 {
+        return
+    }
+    pc[(pn * 4) as usize] = x0
+    pc[(pn * 4 + 1) as usize] = y0
+    pc[(pn * 4 + 2) as usize] = x1
+    pc[(pn * 4 + 3) as usize] = y1
+    pn = pn + 1
+}
+
+// The bounding box of the region (k: 0 x0, 1 y0, 2 x1, 3 y1); 0 for an empty one.
+fn region_bounds(r: u64, k: u64) -> i64 {
+    let n: u64 = region_count(r)
+    if n == 0 {
+        return 0
+    }
+    var b: i64 = region_rect(r, 0, k)
+    var i: u64 = 1
+    while i < n {
+        let v: i64 = region_rect(r, i, k)
+        if k < 2 {
+            b = imin(b, v)
+        } else {
+            b = imax(b, v)
+        }
+        i = i + 1
+    }
+    return b
+}
+
+fn collapse(r: u64, x0: i64, y0: i64, x1: i64, y1: i64) {
+    var bx0: i64 = x0
+    var by0: i64 = y0
+    var bx1: i64 = x1
+    var by1: i64 = y1
+    if region_count(r) > 0 {
+        bx0 = imin(bx0, region_bounds(r, 0))
+        by0 = imin(by0, region_bounds(r, 1))
+        bx1 = imax(bx1, region_bounds(r, 2))
+        by1 = imax(by1, region_bounds(r, 3))
+    }
+    wput(r, 0, 1)
+    wput(r, 1, bx0)
+    wput(r, 2, by0)
+    wput(r, 3, bx1)
+    wput(r, 4, by1)
+}
+
+// Add a rectangle: what is already covered is cut out of it first, the rest is appended in pieces.
+fn region_add(r: u64, x0: i64, y0: i64, x1: i64, y1: i64) {
+    if x0 >= x1 || y0 >= y1 {
+        return
+    }
+    pn = 0
+    piece_push(x0, y0, x1, y1)
+    let n: u64 = region_count(r)
+    var e: u64 = 0
+    while e < n && pn > 0 {
+        let ex0: i64 = region_rect(r, e, 0)
+        let ey0: i64 = region_rect(r, e, 1)
+        let ex1: i64 = region_rect(r, e, 2)
+        let ey1: i64 = region_rect(r, e, 3)
+        // cut e out of every piece: the pieces that survive go back, the others are replaced by up to four parts
+        let cnt: u64 = pn
+        var keep: [i64; 288] = [0 as i64; 288]
+        var kn: u64 = 0
+        var q: u64 = 0
+        while q < cnt {
+            let px0: i64 = pc[(q * 4) as usize]
+            let py0: i64 = pc[(q * 4 + 1) as usize]
+            let px1: i64 = pc[(q * 4 + 2) as usize]
+            let py1: i64 = pc[(q * 4 + 3) as usize]
+            if ex0 >= px1 || ex1 <= px0 || ey0 >= py1 || ey1 <= py0 {
+                // no overlap: the piece stays whole
+                keep[(kn * 4) as usize] = px0
+                keep[(kn * 4 + 1) as usize] = py0
+                keep[(kn * 4 + 2) as usize] = px1
+                keep[(kn * 4 + 3) as usize] = py1
+                kn = kn + 1
+            } else {
+                // above, below, left, right of the overlap
+                let cx0: i64 = imax(px0, ex0)
+                let cx1: i64 = imin(px1, ex1)
+                let cy0: i64 = imax(py0, ey0)
+                let cy1: i64 = imin(py1, ey1)
+                if py0 < cy0 {
+                    keep[(kn * 4) as usize] = px0
+                    keep[(kn * 4 + 1) as usize] = py0
+                    keep[(kn * 4 + 2) as usize] = px1
+                    keep[(kn * 4 + 3) as usize] = cy0
+                    kn = kn + 1
+                }
+                if cy1 < py1 {
+                    keep[(kn * 4) as usize] = px0
+                    keep[(kn * 4 + 1) as usize] = cy1
+                    keep[(kn * 4 + 2) as usize] = px1
+                    keep[(kn * 4 + 3) as usize] = py1
+                    kn = kn + 1
+                }
+                if px0 < cx0 {
+                    keep[(kn * 4) as usize] = px0
+                    keep[(kn * 4 + 1) as usize] = cy0
+                    keep[(kn * 4 + 2) as usize] = cx0
+                    keep[(kn * 4 + 3) as usize] = cy1
+                    kn = kn + 1
+                }
+                if cx1 < px1 {
+                    keep[(kn * 4) as usize] = cx1
+                    keep[(kn * 4 + 1) as usize] = cy0
+                    keep[(kn * 4 + 2) as usize] = px1
+                    keep[(kn * 4 + 3) as usize] = cy1
+                    kn = kn + 1
+                }
+            }
+            q = q + 1
+        }
+        // keep -> pc
+        pn = 0
+        var j: u64 = 0
+        while j < kn && j < 72 {
+            piece_push(keep[(j * 4) as usize], keep[(j * 4 + 1) as usize], keep[(j * 4 + 2) as usize],
+                keep[(j * 4 + 3) as usize])
+            j = j + 1
+        }
+        e = e + 1
+    }
+    if pn == 0 {
+        return // everything was covered already
+    }
+    if n + pn > MAXR {
+        collapse(r, x0, y0, x1, y1)
+        return
+    }
+    var i: u64 = 0
+    while i < pn {
+        let at: u64 = region_count(r)
+        wput(r, 1 + at * 4, pc[(i * 4) as usize])
+        wput(r, 2 + at * 4, pc[(i * 4 + 1) as usize])
+        wput(r, 3 + at * 4, pc[(i * 4 + 2) as usize])
+        wput(r, 4 + at * 4, pc[(i * 4 + 3) as usize])
+        wput(r, 0, (at + 1) as i64)
+        i = i + 1
+    }
+}
+
+fn region_area(r: u64) -> u64 {
+    var a: u64 = 0
+    var i: u64 = 0
+    while i < region_count(r) {
+        a = a + ((region_rect(r, i, 2) - region_rect(r, i, 0)) * (region_rect(r, i, 3) - region_rect(r, i, 1))) as u64
+        i = i + 1
+    }
+    return a
+}
+
+fn region_contains(r: u64, x: i64, y: i64) -> bool {
+    var i: u64 = 0
+    while i < region_count(r) {
+        if x >= region_rect(r, i, 0) && x < region_rect(r, i, 2) && y >= region_rect(r, i, 1)
+            && y < region_rect(r, i, 3) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Keep only what lies inside the rectangle: every rectangle is cut to it, the empty ones go.
+fn region_clip(r: u64, x0: i64, y0: i64, x1: i64, y1: i64) {
+    let n: u64 = region_count(r)
+    var out: u64 = 0
+    var i: u64 = 0
+    while i < n {
+        let a: i64 = imax(region_rect(r, i, 0), x0)
+        let b: i64 = imax(region_rect(r, i, 1), y0)
+        let c: i64 = imin(region_rect(r, i, 2), x1)
+        let d: i64 = imin(region_rect(r, i, 3), y1)
+        if a < c && b < d {
+            wput(r, 1 + out * 4, a)
+            wput(r, 2 + out * 4, b)
+            wput(r, 3 + out * 4, c)
+            wput(r, 4 + out * 4, d)
+            out = out + 1
+        }
+        i = i + 1
+    }
+    wput(r, 0, out as i64)
+}
+
+fn region_hits(r: u64, x0: i64, y0: i64, x1: i64, y1: i64) -> bool {
+    var i: u64 = 0
+    while i < region_count(r) {
+        if region_rect(r, i, 0) < x1 && region_rect(r, i, 2) > x0 && region_rect(r, i, 1) < y1
+            && region_rect(r, i, 3) > y0 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
