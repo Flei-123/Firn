@@ -114,3 +114,8 @@ audit; the browser draws the same picture (`tools/wasm/appcheck.py`, files.wasm)
   row a symbol or none.
 * `lib/fui/icons.fi` pulls in the glyph cache; the kernel profile (OrientOS
   ring 0) draws its symbols itself -- then use `ICON_NONE` and `node_set_draw`.
+* Context menu on a row (07.10.2026, done): a right click / long press / menu key on a list row opens the
+  row's menu, the right-clicked row is chosen first (Windows' rule); fui.app has the hooks built in. See
+  `docs/CONTEXT-MENUS.md` (`app.on_context`, `FAM_FILE` / `FAM_LIST` standard entries). A multiple selection
+  (Ctrl / Shift click, r134) plugs into the same menu through `ctxmenu.SelHooks` (`count`, `is_selected`,
+  `select_only`, `clear`): the entries then see `pc_selected` = "many".

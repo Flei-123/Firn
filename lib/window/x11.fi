@@ -143,6 +143,8 @@ export {
     r_minimise, r_max_toggle, r_maximised, r_drag,
     r_sysmenu,
     r_screen, r_centre,
+    // r168: a POPUP window of its own (override-redirect, grabs pointer + keys)
+    r_popup, r_popup_place, r_origin, r_is_popup,
     // ROUND C-033: so that the acceptance can check the key layout.
     // It was what uncovered the missing colon.
     key_ascii,
@@ -288,6 +290,8 @@ struct Platte {
     shm_ptr: u64,
     shm_cap: usize,
     shm_fence: u32,
+    // r168: this window is a popup (events carry SCREEN coordinates)
+    popup: bool,
 }
 
 fn surface_new() -> Platte {
@@ -304,7 +308,7 @@ fn surface_new() -> Platte {
         a_xtypes: 0, a_xcopy: 0, a_urilist: 0, a_xprop: 0, dnd_on: false, dnd_src: 0, dnd_ver: 0, dnd_ok: false,
         drop: rt.buf_new(), drop_n: 0,
         shm_state: 0 as u32, shm_op: 0 as u32, shm_seg: 0 as u32, shm_id: 0, shm_ptr: 0 as u64, shm_cap: 0,
-        shm_fence: 0 as u32,
+        shm_fence: 0 as u32, popup: false,
         a_protocols: 0, a_delete: 0, dpi: 96, dark: false,
         dark_known: false, dark_us: 0, inj: 0, gift: 0, fail: 0,
         spos: 0, ein_n: 0, ein_hook: in_nothing, ein_ud: 0,
@@ -2119,6 +2123,195 @@ fn r_make(x: *mut Platte, w: usize, h: usize) -> bool {
     return ok
 }
 
+// ======================================================================
+// r168 -- A POPUP WINDOW OF ITS OWN
+// ======================================================================
+//
+// A menu that must be visible even where the program's window ends (a small
+// window, a menu at its edge) needs a window of the screen's. This is one:
+// no frame (OVERRIDE-REDIRECT: the window manager does not see it), above
+// everything, and while it is open it HOLDS the pointer and the keyboard
+// (GrabPointer / GrabKeyboard) -- so a click anywhere else arrives HERE, with
+// screen coordinates, and the menu can close itself; and no other program
+// gets a key while a menu is open.
+//
+// It is a window of its own on a connection of its own, like every Fenster of
+// this layer (LIB-005): `r_open`, then `r_popup` instead of `r_make`.
+
+// CreateWindow with an override-redirect and a position. Three values: the
+// background, override-redirect = 1, the event mask.
+fn req_create_popup(b: *mut rt.Buf, wid: u32, parent: u32, depth: u32,
+    visual: u32, sx: usize, sy: usize, w: usize, h: usize, bg: u32, mask: u32) {
+    rt.buf_push(b, 1 as u8)
+    rt.buf_push(b, depth as u8)
+    put16(b, 11 as u32)
+    put32(b, wid)
+    put32(b, parent)
+    put16(b, (sx as u32) & 65535 as u32)
+    put16(b, (sy as u32) & 65535 as u32)
+    put16(b, w as u32)
+    put16(b, h as u32)
+    put16(b, 0 as u32)
+    put16(b, 1 as u32)
+    put32(b, visual)
+    put32(b, 2562 as u32) // CWBackPixel | CWOverrideRedirect | CWEventMask
+    put32(b, bg)
+    put32(b, 1 as u32)
+    put32(b, mask)
+}
+
+// GrabPointer(26): owner-events, our window, button press/release + motion,
+// asynchronous, not confined, no cursor change, CurrentTime.
+fn req_grab_pointer(b: *mut rt.Buf, win: u32) {
+    rt.buf_push(b, 26 as u8)
+    rt.buf_push(b, 1 as u8)
+    put16(b, 6 as u32)
+    put32(b, win)
+    put16(b, 76 as u32) // ButtonPress 4 | ButtonRelease 8 | PointerMotion 64
+    rt.buf_push(b, 1 as u8)
+    rt.buf_push(b, 1 as u8)
+    put32(b, 0 as u32)
+    put32(b, 0 as u32)
+    put32(b, 0 as u32)
+}
+
+// GrabKeyboard(31): owner-events false (every key comes to the popup).
+fn req_grab_keyboard(b: *mut rt.Buf, win: u32) {
+    rt.buf_push(b, 31 as u8)
+    rt.buf_push(b, 0 as u8)
+    put16(b, 4 as u32)
+    put32(b, win)
+    put32(b, 0 as u32)
+    rt.buf_push(b, 1 as u8)
+    rt.buf_push(b, 1 as u8)
+    put16(b, 0 as u32)
+}
+
+// ConfigureWindow(12): x, y, width, height.
+fn req_configure(b: *mut rt.Buf, win: u32, sx: usize, sy: usize, w: usize, h: usize) {
+    rt.buf_push(b, 12 as u8)
+    rt.buf_push(b, 0 as u8)
+    put16(b, 7 as u32)
+    put32(b, win)
+    put16(b, 15 as u32)
+    put16(b, 0 as u32)
+    put32(b, sx as u32)
+    put32(b, sy as u32)
+    put32(b, w as u32)
+    put32(b, h as u32)
+}
+
+// TranslateCoordinates(40): a point of `src` as a point of `dst`.
+fn req_translate(b: *mut rt.Buf, src: u32, dst: u32, sx: usize, sy: usize) {
+    rt.buf_push(b, 40 as u8)
+    rt.buf_push(b, 0 as u8)
+    put16(b, 4 as u32)
+    put32(b, src)
+    put32(b, dst)
+    put16(b, sx as u32)
+    put16(b, sy as u32)
+}
+
+// Open the popup window at screen position (sx, sy), `w` x `h`, show it and
+// (`grab`) take the pointer and keyboard. false when a grab is refused (another
+// program holds one): then there is no popup and the caller falls back to
+// painting the menu inside its own window.
+fn r_popup(x: *mut Platte, sx: usize, sy: usize, w: usize, h: usize, grab: bool) -> bool {
+    (*x).popup = true
+    (*x).win = new_id(x)
+    (*x).gc = new_id(x)
+    (*x).w = w
+    (*x).h = h
+    var r: rt.Buf = rt.buf_new()
+    // Exposure | KeyPress | KeyRelease | ButtonPress | ButtonRelease | PointerMotion
+    let mask: u32 = 32768 as u32 | 1 as u32 | 2 as u32 | 4 as u32 | 8 as u32 | 64 as u32
+    (*x).mask = mask
+    (*x).full = true
+    req_create_popup(&r, (*x).win, (*x).root, (*x).depth, (*x).visual, sx, sy,
+        w, h, 16777215 as u32, mask)
+    req_create_gc(&r, (*x).gc, (*x).win)
+    req_map_window(&r, (*x).win)
+    var ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    if !ok {
+        return false
+    }
+    // A SUBMENU's window takes no grab: the first one holds them for the whole
+    // menu. The pointer, then the keyboard; each answers with a status (0 = success)
+    if !grab {
+        return true
+    }
+    var g: rt.Buf = rt.buf_new()
+    req_grab_pointer(&g, (*x).win)
+    ok = send(x, g.ptr, g.len)
+    rt.buf_free(&g)
+    if !ok {
+        return false
+    }
+    var rep: rt.Buf = rt.buf_new()
+    var granted: bool = false
+    if wait_record(x, 1 as u32, (*x).seq, 2000, &rep) {
+        granted = rt.ld8(rt.buf_ptr(&rep), 1) == 0 as u8
+    }
+    rt.buf_free(&rep)
+    if !granted {
+        return false
+    }
+    var k: rt.Buf = rt.buf_new()
+    req_grab_keyboard(&k, (*x).win)
+    ok = send(x, k.ptr, k.len)
+    rt.buf_free(&k)
+    if !ok {
+        return false
+    }
+    var rep2: rt.Buf = rt.buf_new()
+    granted = false
+    if wait_record(x, 1 as u32, (*x).seq, 2000, &rep2) {
+        granted = rt.ld8(rt.buf_ptr(&rep2), 1) == 0 as u8
+    }
+    rt.buf_free(&rep2)
+    return granted
+}
+
+fn r_is_popup(x: *mut Platte) -> bool { return (*x).popup }
+
+// Move and resize the popup.
+fn r_popup_place(x: *mut Platte, sx: usize, sy: usize, w: usize, h: usize) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    req_configure(&r, (*x).win, sx, sy, w, h)
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    (*x).w = w
+    (*x).h = h
+    return ok
+}
+
+// Where the top left corner of the window's inner area is on the screen.
+// false when the server did not answer.
+fn r_origin(x: *mut Platte, ox: *mut i64, oy: *mut i64) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    req_translate(&r, (*x).win, (*x).root, 0, 0)
+    let ok: bool = send(x, r.ptr, r.len)
+    rt.buf_free(&r)
+    if !ok {
+        return false
+    }
+    var rep: rt.Buf = rt.buf_new()
+    var got: bool = false
+    if wait_record(x, 1 as u32, (*x).seq, 2000, &rep) {
+        let p: u64 = rt.buf_ptr(&rep)
+        var vx: i64 = ld16le(p, 12) as i64
+        var vy: i64 = ld16le(p, 14) as i64
+        if vx >= 32768 { vx = vx - 65536 }
+        if vy >= 32768 { vy = vy - 65536 }
+        *ox = vx
+        *oy = vy
+        got = true
+    }
+    rt.buf_free(&rep)
+    return got
+}
+
 fn r_title(x: *mut Platte, p: u64, n: usize) -> bool {
     var r: rt.Buf = rt.buf_new()
     // WM_NAME (39), Typ STRING (31), Format 8.
@@ -2869,6 +3062,15 @@ fn r_next(x: *mut Platte, k: *mut u32, a: *mut u32, ox: *mut u32,
             let q: u64 = (*x).rb.ptr + ((*x).rpos - consume) as u64
             if decode_event(q, (*x).a_delete, &(*x).km, (*x).full, k, a,
                 ox, oy, os) {
+                // A POPUP holds the pointer grab, so a pointer event can come
+                // from anywhere on the screen and its window coordinates may be
+                // negative; the root coordinates (bytes 20 and 22) never are.
+                if (*x).popup && (*k == window.EV_BUTTON || *k == window.EV_RELEASE
+                    || *k == window.EV_MOTION || *k == window.EV_ENTER
+                    || *k == window.EV_LEAVE) {
+                    *ox = ld16le(q, 20)
+                    *oy = ld16le(q, 22)
+                }
                 return true
             }
         }

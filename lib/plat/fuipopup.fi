@@ -1,0 +1,313 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/fuipopup.fi -- THE WINDOWS OF A MENU, ON THE DESKTOP (roadmap r168).
+//
+// ========================================================= WHY IT EXISTS
+//
+// lib/fui/menuview.fi paints a context menu into the program's own canvas by
+// default, so a menu is clipped at the window's edge. A small window, a menu
+// at its edge, a task bar at the bottom of the screen: the menu has to reach
+// OUT of the window. That takes a window of the screen's own per level (the
+// menu, its submenu, one more) -- no frame, above everything, the first one
+// holding the pointer and the keyboard (lib/window `popup_open`).
+//
+// This file is the glue between three things that know nothing of each other:
+//
+//   menuview.fi      says "open a window for level 2 at (x, y), w x h", "paint
+//                    level 2 into its canvas", "show it" (mv_set_surface)
+//   lib/window       opens that window (X11: override-redirect + grabs) and
+//                    delivers its events -- with SCREEN coordinates
+//   fuiwirt.fi       takes the events as if they came from the program's own
+//                    window (shifted by where that window is on the screen),
+//                    so the menu's hover, press, keys and close rules are the
+//                    SAME code in both layers
+//
+// A platform whose window layer has no popup (Win32, OrientOS, Android, the
+// browser today) answers `popup_open` with false and the menu falls back to
+// the page: nothing here is needed there.
+//
+// ====================================================== THE LOOP'S PART
+//
+//     var ph: *mut fuipopup.PopupHost = fuipopup.ph_new(...)
+//     fuipopup.ph_bind(ph, mv, &fx, host, theme, fontset)    // once the view exists
+//     loop:
+//         fuipopup.ph_wait(ph, f, ms)       // instead of window.wait_event
+//         window_step(...)
+//         fuipopup.ph_step(ph)              // pump the menu's windows, repaint them
+import std.rt
+import font.metrics
+import paint.canvas
+import fui.painter
+import fui.render
+import fui.theme
+import fui.menuview
+import fui.action
+import plat.fuiwirt
+import plat.fuiwin
+import window.window
+
+export {
+    PopupHost, ph_new, ph_bind, ph_bound, ph_step, ph_wait, ph_any_open, ph_size,
+}
+
+const LV: usize = 3
+
+struct Pop {
+    f: window.Window,
+    cv: canvas.Canvas,
+    z: painter.Painter,
+    c: render.Ctx,
+    bgrx: u64,
+    cap: usize,
+    w: usize,
+    h: usize,
+    on: bool,
+}
+
+fn pop_blank() -> Pop {
+    return Pop { f: window.window_new(), cv: canvas.canvas_new(),
+        z: painter.painter_new(),
+        c: render.ctx_new(0 as u64 as *mut theme.Theme, 0 as u64 as *mut painter.Painter),
+        bgrx: 0, cap: 0, w: 0, h: 0, on: false }
+}
+
+struct PopupHost {
+    pops: [Pop; 3],
+    mv: u64, // *mut menuview.MenuView
+    main: u64, // *mut fuiwin.Window
+    host: u64, // *mut fuiwirt.Host
+    m: u64, // *mut theme.Theme
+    fm: u64, // the font set
+    bound: bool,
+}
+
+fn ph_size() -> usize {
+    var probe: [PopupHost; 2] = [ph_blank(); 2]
+    return ((&probe[1]) as usize) - ((&probe[0]) as usize)
+}
+
+fn ph_blank() -> PopupHost {
+    return PopupHost { pops: [pop_blank(); 3], mv: 0, main: 0, host: 0, m: 0, fm: 0,
+        bound: false }
+}
+
+// A host for the windows of a menu, on the heap; null without memory.
+fn ph_new() -> *mut PopupHost {
+    let p: u64 = rt.heap_alloc(ph_size())
+    if p == 0 {
+        return 0 as u64 as *mut PopupHost
+    }
+    let ph: *mut PopupHost = p as *mut PopupHost
+    *ph = ph_blank()
+    return ph
+}
+
+fn mainw(ph: *mut PopupHost) -> *mut window.Window {
+    return fuiwin.window_window((*ph).main as *mut fuiwin.Window)
+}
+
+// ---------------------------------------------------------- menuview's hooks
+
+fn cb_screen(ud: u64, out: *mut [f64; 4]) -> bool {
+    let ph: *mut PopupHost = ud as *mut PopupHost
+    var sw: usize = 0
+    var sh: usize = 0
+    if !window.screen(mainw(ph), &sw, &sh) { return false }
+    (*out)[0] = 0.0
+    (*out)[1] = 0.0
+    (*out)[2] = sw as f64
+    (*out)[3] = sh as f64
+    return true
+}
+
+fn cb_origin(ud: u64, out: *mut [f64; 2]) -> bool {
+    let ph: *mut PopupHost = ud as *mut PopupHost
+    var ox: i64 = 0
+    var oy: i64 = 0
+    if !window.origin(mainw(ph), &ox, &oy) { return false }
+    (*out)[0] = ox as f64
+    (*out)[1] = oy as f64
+    return true
+}
+
+fn pop_free(p: *mut Pop) {
+    if (*p).cap > 0 {
+        painter.painter_free(&(*p).z)
+        canvas.canvas_free(&(*p).cv)
+        rt.heap_free((*p).bgrx, (*p).cap)
+        (*p).cap = 0
+    }
+}
+
+// canvas, painter, buffer and render context of the popup's size
+fn pop_surfaces(ph: *mut PopupHost, p: *mut Pop, w: usize, h: usize) -> bool {
+    pop_free(p)
+    if !canvas.canvas_init(&(*p).cv, w, h) { return false }
+    if !painter.painter_init(&(*p).z, &(*p).cv, w, h) { return false }
+    painter.painter_set_font(&(*p).z, (*ph).fm)
+    (*p).bgrx = rt.heap_alloc(w * h * 4)
+    if (*p).bgrx == 0 { return false }
+    (*p).cap = w * h * 4
+    (*p).w = w
+    (*p).h = h
+    (*p).c = render.ctx_new((*ph).m as *mut theme.Theme, &(*p).z)
+    return true
+}
+
+fn cb_open(ud: u64, lv: usize, x: i64, y: i64, w: usize, h: usize) -> bool {
+    let ph: *mut PopupHost = ud as *mut PopupHost
+    if lv >= LV || w == 0 || h == 0 || x < 0 || y < 0 { return false }
+    let p: *mut Pop = &(*ph).pops[lv]
+    (*p).f = window.window_new()
+    if !window.open_window(&(*p).f, 0) { return false }
+    if !window.popup_open(&(*p).f, x as usize, y as usize, w, h, lv == 0) {
+        window.close_window(&(*p).f)
+        return false
+    }
+    if !pop_surfaces(ph, p, w, h) {
+        window.close_window(&(*p).f)
+        return false
+    }
+    (*p).on = true
+    return true
+}
+
+fn cb_place(ud: u64, lv: usize, x: i64, y: i64, w: usize, h: usize) -> bool {
+    let ph: *mut PopupHost = ud as *mut PopupHost
+    if lv >= LV || !(*ph).pops[lv].on || x < 0 || y < 0 { return false }
+    let p: *mut Pop = &(*ph).pops[lv]
+    if !window.popup_place(&(*p).f, x as usize, y as usize, w, h) { return false }
+    if w != (*p).w || h != (*p).h {
+        return pop_surfaces(ph, p, w, h)
+    }
+    return true
+}
+
+fn cb_close(ud: u64, lv: usize) {
+    let ph: *mut PopupHost = ud as *mut PopupHost
+    if lv >= LV || !(*ph).pops[lv].on { return }
+    let p: *mut Pop = &(*ph).pops[lv]
+    window.close_window(&(*p).f)
+    pop_free(p)
+    (*p).on = false
+}
+
+fn cb_ctx(ud: u64, lv: usize) -> *mut render.Ctx {
+    let ph: *mut PopupHost = ud as *mut PopupHost
+    if lv >= LV || !(*ph).pops[lv].on { return 0 as u64 as *mut render.Ctx }
+    return &(*ph).pops[lv].c
+}
+
+fn cb_present(ud: u64, lv: usize) {
+    let ph: *mut PopupHost = ud as *mut PopupHost
+    if lv >= LV || !(*ph).pops[lv].on { return }
+    let p: *mut Pop = &(*ph).pops[lv]
+    fuiwirt.rgba_to_bgrx(canvas.canvas_pixels(&(*p).cv) as u64, (*p).bgrx, (*p).w * (*p).h)
+    let ok: bool = window.image(&(*p).f, (*p).bgrx, (*p).w, (*p).h, 0, 0)
+    let ok2: bool = window.present(&(*p).f)
+}
+
+// Hook the menu view up to this host (and to the program's window, theme and
+// font set). Call once the view exists.
+fn ph_bind(ph: *mut PopupHost, mv: *mut menuview.MenuView, main: *mut fuiwin.Window,
+    host: *mut fuiwirt.Host, m: *mut theme.Theme, fm: u64) {
+    (*ph).mv = mv as u64
+    (*ph).main = main as u64
+    (*ph).host = host as u64
+    (*ph).m = m as u64
+    (*ph).fm = fm
+    menuview.mv_set_surface(mv, ph as u64, cb_screen, cb_origin, cb_open, cb_place,
+        cb_close, cb_ctx, cb_present)
+    fuiwirt.host_set_popup_note(host, menuview.mv_note)
+    (*ph).bound = true
+}
+
+fn ph_bound(ph: *mut PopupHost) -> bool {
+    return (*ph).bound
+}
+
+fn ph_any_open(ph: *mut PopupHost) -> bool {
+    var k: usize = 0
+    while k < LV {
+        if (*ph).pops[k].on { return true }
+        k = k + 1
+    }
+    return false
+}
+
+// WAIT for an event of the program's window or of a window of the menu.
+// `ms` as window.wait_event (-1 without end).
+fn ph_wait(ph: *mut PopupHost, f: *mut window.Window, ms: i64) {
+    if !(*ph).bound || !ph_any_open(ph) {
+        if ms != 0 {
+            let e: bool = window.wait_event(f, ms)
+        }
+        return
+    }
+    var wins: [u64; 8] = [0 as u64; 8]
+    var n: usize = 0
+    wins[0] = f as u64
+    n = 1
+    var k: usize = 0
+    while k < LV {
+        if (*ph).pops[k].on {
+            wins[n] = (&(*ph).pops[k].f) as u64
+            n = n + 1
+        }
+        k = k + 1
+    }
+    let hit: i64 = window.wait_any(&wins, n, ms)
+}
+
+// ONE TURN: the menu's windows' events go to the host (as the program's
+// window's would, shifted by where it is on the screen), then the windows that
+// are out of date are painted.
+fn ph_step(ph: *mut PopupHost) {
+    if !(*ph).bound { return }
+    let host: *mut fuiwirt.Host = (*ph).host as *mut fuiwirt.Host
+    let mv: *mut menuview.MenuView = (*ph).mv as *mut menuview.MenuView
+    var lv: usize = 0
+    while lv < LV {
+        var again: bool = true
+        while again && (*ph).pops[lv].on {
+            let f: *mut window.Window = &(*ph).pops[lv].f
+            let k: u32 = window.next_event(f)
+            if k == window.EV_NONE {
+                again = false
+            } else {
+                let a: u32 = window.ev_a(f)
+                let st: u32 = window.ev_state(f)
+                let xs: f64 = window.ev_x(f) as f64
+                let ys: f64 = window.ev_y(f) as f64
+                fuiwirt.host_set_mods(host, st)
+                // screen -> the program's window
+                let xw: f64 = xs - menuview.mv_win_x(mv)
+                let yw: f64 = ys - menuview.mv_win_y(mv)
+                if k == window.EV_EXPOSE {
+                    menuview.mv_expose(mv, lv)
+                } else if k == window.EV_MOTION {
+                    let c: u32 = fuiwirt.host_pointer_move(host, xw, yw)
+                } else if k == window.EV_BUTTON {
+                    // A press outside the menu AND outside the program's window
+                    // only closes the menu: it is not the program's click.
+                    let mf: *mut window.Window = mainw(ph)
+                    let inside: bool = xw >= 0.0 && yw >= 0.0
+                        && xw < window.width(mf) as f64 && yw < window.height(mf) as f64
+                    if !inside && menuview.mv_hit(mv, xs, ys) == menuview.MV_NONE {
+                        menuview.mv_note((*ph).mv, 2 as u32)
+                    } else {
+                        let c: u32 = fuiwirt.host_pointer_down(host, xw, yw, a)
+                    }
+                } else if k == window.EV_RELEASE {
+                    let c: u32 = fuiwirt.host_pointer_up(host, xw, yw, a)
+                } else if k == window.EV_KEY {
+                    let t: u32 = fuiwin.host_key_of(a)
+                    let c: u32 = fuiwirt.host_key(host, t, st)
+                } else if k == window.EV_CHAR {
+                    let c: u32 = fuiwirt.host_char(host, a, st)
+                }
+            }
+        }
+        lv = lv + 1
+    }
+    let painted: bool = menuview.mv_present(mv)
+}

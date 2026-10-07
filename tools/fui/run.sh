@@ -592,6 +592,11 @@ build menuview
 "$W/menuview"
 "$FIRNC" --opt-level=release-fast -o "$W/menuview_fast" tools/fui/menuview_main.fi
 "$W/menuview_fast" speed
+# r168: the menu in windows of its own, on a real X server: it reaches OUT of
+# the program's window; keys, hover, a click, Esc, a submenu window, Shift+F10.
+# (Needs Xvfb, xdotool, xwd, PIL; else SKIP.)
+"$FIRNC" --opt-level=release-fast -o "$W/context" examples/fui/context.fi
+python3 tools/fui/ctxlive.py "$W/context" "$W/ctxlive"
 
 echo
 echo "== 18p4. MARKDOWN VIEW (lib/fui/markdownview.fi on lib/markdown) =="
