@@ -571,7 +571,7 @@ build listrow
 "$W/listrow"
 
 echo
-echo "== 18q. CONTEXT MENUS (lib/fui/action.fi, ctxmenu.fi, menuview.fi, ctxstd.fi, r161) =="
+echo "== 18p7. CONTEXT MENUS (lib/fui/action.fi, ctxmenu.fi, menuview.fi, ctxstd.fi, r161) =="
 # ONE system for right click / long press / menu key / Shift+F10:
 #   ctxmenu     actions (id, label catalog, icon, shortcut, enabled/checked/
 #               visible, handler, bus manifest), provider chain + merge (groups,
