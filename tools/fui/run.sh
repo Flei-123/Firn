@@ -552,12 +552,12 @@ echo "== 18p. fui.app: A WINDOW IN TEN LINES, NATIVE AND IN THE BROWSER =="
 # and tools/fui/app_main.fi drives them without a window (layout, clicks,
 # keys, text fields, wrapping, scale 2). The browser half with Chromium:
 # bash tools/wasm/appdemo.sh.
-for ex in hello_window counter form touchpad notes files launcher_kit; do
+for ex in hello_window counter form touchpad notes files launcher_kit context; do
     "$FIRNC" --opt-level=dev -o "$W/app_$ex" "examples/fui/$ex.fi"
     "$FIRNC" --opt-level=dev --target=wasm32-browser -o "$W/app_$ex.wasm" \
         "examples/fui/$ex.fi"
 done
-echo "  examples/fui/{hello_window,counter,form,touchpad,notes,files,launcher_kit}.fi build native + wasm32   OK"
+echo "  examples/fui/{hello_window,counter,form,touchpad,notes,files,launcher_kit,context}.fi build native + wasm32   OK"
 build app
 "$W/app"
 
@@ -569,6 +569,29 @@ echo "== 18p3. ZEILEN MIT SYMBOLEN (lib/fui/listrow.fi, r129) =="
 # app.list_item (examples/fui/files.fi, checked in app_main). docs/fui-list-rows.md
 build listrow
 "$W/listrow"
+
+echo
+echo "== 18q. CONTEXT MENUS (lib/fui/action.fi, ctxmenu.fi, menuview.fi, ctxstd.fi, r161) =="
+# ONE system for right click / long press / menu key / Shift+F10:
+#   ctxmenu     actions (id, label catalog, icon, shortcut, enabled/checked/
+#               visible, handler, bus manifest), provider chain + merge (groups,
+#               priorities, separators, duplicates, submenus, plugin entries
+#               and their rights), selection rule, keyboard / mnemonic /
+#               typeahead / hover delay / close rules / lock, flip placement,
+#               screen-reader announcements, the standard entries (text field,
+#               list, file, title bar, taskbar, process list) in en + de
+#   menuview    the popup widget: pixels (frame, separator, highlight, disabled
+#               and danger colours, icons ON THE ROW'S MIDLINE (r441), tick,
+#               radio dot, arrow, shortcut), hit test, flip at the edges,
+#               touch rows >= 44, a11y tree, the whole host path from a right
+#               press to a running action; speed: open + paint <= 16 ms (built
+#               optimised, like tempo)
+build ctxmenu
+"$W/ctxmenu"
+build menuview
+"$W/menuview"
+"$FIRNC" --opt-level=release-fast -o "$W/menuview_fast" tools/fui/menuview_main.fi
+"$W/menuview_fast" speed
 
 echo
 echo "== 18p4. MARKDOWN VIEW (lib/fui/markdownview.fi on lib/markdown) =="
