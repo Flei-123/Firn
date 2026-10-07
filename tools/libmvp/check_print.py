@@ -34,15 +34,15 @@ if shutil.which("ippeveprinter"):
             time.sleep(0.1)
     try:
         a = run("attrs", uri).split("|")
-        if len(a) == 9 and a[0] == "FirnTest" and a[3] == "Werkstatt" and a[4] == "Firn TestPrinter" and a[5] == "3" \
+        if len(a) == 10 and a[0] == "FirnTest" and a[3] == "Werkstatt" and a[4] == "Firn TestPrinter" and a[5] == "3" \
                 and a[6][0] == "1" and a[6][2] == "1" and "iso_a4_210x297mm" in a[7] and "application/pdf" in a[8]:
             ok("Get-Printer-Attributes: name, location, model, idle, accepting, duplex, media, formats")
         else:
             fail("attributes %r" % a)
-        r = run("print", uri, pdf, "2", "1", "iso_a4_210x297mm")
+        r = run("print", uri, pdf, "2", "1", "iso_a4_210x297mm", "3")  # print-scaling=fit
         job = r.split()[1] if r.startswith("JOB ") else None
         if job:
-            ok("Print-Job accepted: job %s" % job)
+            ok("Print-Job accepted with print-scaling=fit: job %s" % job)
         else:
             fail("print: %r" % r)
         # follow the job to the end
@@ -62,7 +62,7 @@ if shutil.which("ippeveprinter"):
         else:
             fail("spool %r" % spooled)
         # a second job, cancelled while it is being processed
-        r = run("print", uri, pdf, "1", "0", "")
+        r = run("print", uri, pdf, "1", "0", "", "0")
         job2 = r.split()[1] if r.startswith("JOB ") else None
         c = run("cancel", uri, job2) if job2 else ""
         s, t0 = "", time.time()
@@ -86,9 +86,9 @@ else:
     print("  skip: ippeveprinter (cups-ipp-utils) not installed")
 
 # ---- refusals without a printer
-r = run("print", "ipp://127.0.0.1:%d/ipp/print" % free_port(), pdf, "1", "0", "")
+r = run("print", "ipp://127.0.0.1:%d/ipp/print" % free_port(), pdf, "1", "0", "", "0")
 (ok if r == "ERROR NoServer 0" else fail)("nothing listening: NoServer (%s)" % r)
-r = run("print", "ipps://printer.example/ipp/print", pdf, "1", "0", "")
+r = run("print", "ipps://printer.example/ipp/print", pdf, "1", "0", "", "0")
 (ok if r == "ERROR BadPrinter 0" else fail)("ipps:// refused: BadPrinter (%s)" % r)
 
 # ---- a stand-in for the CUPS scheduler
@@ -103,6 +103,7 @@ def attr(tag, name, value):
 def more(tag, value):
     return bytes([tag]) + struct.pack(">H", 0) + struct.pack(">H", len(value)) + value.encode()
 seen = []
+jobs = []
 class Cups(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_POST(self):
@@ -116,16 +117,21 @@ class Cups(http.server.BaseHTTPRequestHandler):
                 out += attr(0x41, "printer-info", name + " printer") + attr(0x41, "printer-location", loc)
                 out += attr(0x23, "printer-state", 3) + attr(0x22, "printer-is-accepting-jobs", True) + attr(0x22, "color-supported", color)
                 out += attr(0x44, "media-supported", "iso_a4_210x297mm") + more(0x44, "iso_a3_297x420mm")
+                if color:
+                    out += attr(0x44, "print-scaling-supported", "auto") + more(0x44, "fit") + more(0x44, "none")
         elif op == 0x4001:
             out += b"\x04" + attr(0x42, "printer-name", "Werkstatt-A3")
+        elif op == 2:
+            jobs.append(body)
+            out += b"\x05" + attr(0x21, "job-id", 7)
         out += b"\x03"
         self.send_response(200); self.send_header("Content-Type", "application/ipp"); self.send_header("Content-Length", str(len(out)))
         self.end_headers(); self.wfile.write(out)
 srv = http.server.HTTPServer(("127.0.0.1", 0), Cups)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 lines = run("list", "http://127.0.0.1:%d/" % srv.server_address[1]).splitlines()
-want = ["Office|ipp://localhost:631/printers/Office|Office printer|Buero 2||3|1100|iso_a4_210x297mm,iso_a3_297x420mm|",
-        "Werkstatt-A3|ipp://localhost:631/printers/Werkstatt-A3|Werkstatt-A3 printer|Halle||3|1001|iso_a4_210x297mm,iso_a3_297x420mm|",
+want = ["Office|ipp://localhost:631/printers/Office|Office printer|Buero 2||3|1100|iso_a4_210x297mm,iso_a3_297x420mm||auto,fit,none",
+        "Werkstatt-A3|ipp://localhost:631/printers/Werkstatt-A3|Werkstatt-A3 printer|Halle||3|1001|iso_a4_210x297mm,iso_a3_297x420mm||",
         "END"]
 if lines == want:
     ok("CUPS-Get-Printers: two printers, all fields, the default marked (CUPS-Get-Default)")
@@ -135,6 +141,15 @@ if len(seen) == 2 and all(s[0] == 0x0200 and s[2] == "application/ipp" and s[3] 
     ok("requests: IPP/2.0, application/ipp, charset and language first")
 else:
     fail("requests %r" % seen)
+# print-scaling on the wire: a Print-Job with scaling "fit" carries the keyword, one without carries nothing
+base = "http://127.0.0.1:%d/ipp/print" % srv.server_address[1]
+run("print", base, pdf, "1", "0", "", "3")
+run("print", base, pdf, "1", "0", "", "0")
+want_attr = b"\x44\x00\x0dprint-scaling\x00\x03fit"
+if len(jobs) == 2 and want_attr in jobs[0] and b"print-scaling" not in jobs[1]:
+    ok("Print-Job: print-scaling=fit goes out as keyword, the default sends nothing")
+else:
+    fail("scaling on the wire: %r" % [(want_attr in j, b"print-scaling" in j) for j in jobs])
 srv.shutdown()
 print("print: %d failed" % bad)
 sys.exit(1 if bad else 0)
