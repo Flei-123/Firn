@@ -60,7 +60,7 @@ export {
     ctxm_new, ctxm_reset, ctxm_actions, ctxm_set_actions, ctxm_ud, ctxm_set_ud,
     ctx_provider_key, ctx_provider_kind, ctx_provider_global, ctx_provider_off,
     ctx_provider_count, ctx_set_sel_hooks, ctx_set_grant, ctx_set_on_close,
-    ctx_extension_add, ctx_extension_count, Place, menu_flags, menu_mpos, menu_kids,
+    ctx_extension_add, ctx_extension_count, ctx_manifest_load, ctx_set_proxy_call, Place, menu_flags, menu_mpos, menu_kids,
     ctx_request, ctx_build, ctx_apply_selection, selection_policy,
     pc_add, pc_add_to, pc_sep, pc_submenu, pc_group, pc_prio, pc_danger,
     pc_tag, pc_target, pc_node_key, pc_source, pc_selected, pc_item,
@@ -252,6 +252,16 @@ fn selhooks_blank() -> SelHooks {
 
 fn grant_all(ud: u64, owner: str, level: u32) -> bool { return true }
 
+// One manifest entry's way back: whose action it is and which verb.
+struct Proxy {
+    m: u64, // *mut Ctxm
+    owner: str,
+    verb: str,
+}
+
+fn proxy_none(ud: u64, owner: str, verb: str, cx: *mut action.ActCtx) {
+}
+
 fn close_none(ud: u64, reason: u32) {
 }
 
@@ -267,6 +277,15 @@ struct Ctxm {
     exts: [Ext; 16],
     ne: usize,
     sel: SelHooks,
+    // plugin entries declared by a manifest (ctx_manifest_load): the call that
+    // carries one out in the plugin's app (the action bus), what the proxy
+    // actions point at, and the text of their ids
+    proxy_call: fn(u64, str, str, *mut action.ActCtx),
+    proxy_ud: u64,
+    proxies: [Proxy; 16],
+    nproxy: usize,
+    pstr: [u8; 1024],
+    npstr: usize,
     grant: fn(u64, str, u32) -> bool,
     grant_ud: u64,
     on_close: fn(u64, u32),
@@ -319,6 +338,8 @@ fn ctxm_new() -> Ctxm {
     return Ctxm { acts: 0, ud: 0, provs: [provider_blank(); 48], np: 0,
         exts: [ext_blank(); 16], ne: 0, sel: selhooks_blank(),
         grant: grant_all, grant_ud: 0, on_close: close_none, close_ud: 0,
+        proxy_call: proxy_none, proxy_ud: 0, proxies: [Proxy { m: 0, owner: "", verb: "" }; 16], nproxy: 0,
+        pstr: [0 as u8; 1024], npstr: 0,
         items: [item_blank(); 96], n: 0, fin: [0; 128], finp: [0; 128], nf: 0,
         arena: [0 as u8; 6144], na: 0, seq: 0 as u32, cur_dist: 0 as u32,
         cur_prio_base: 0, tags: ["" ; 8], nt: 0, cx: action.actx_new(0),
@@ -484,6 +505,178 @@ fn ctx_extension_count(m: *mut Ctxm) -> usize {
         i = i + 1
     }
     return k
+}
+
+
+// ================================================== ENTRIES FROM A MANIFEST
+//
+// A plugin or another program says in text which entries it adds to other
+// programs' menus -- "Open with X" for text files, "Share" for pictures:
+//
+//     # comment
+//     menu open-with-x on .txt prio 10 level write "Open with &X"
+//     menu share on .png level read "&Share ..."
+//
+// one entry per line: the plugin's verb, the TAG of the menus it wants to be in
+// (".txt", "dir", "*"), an optional priority and level (read / write /
+// critical; default write), and the label in quotes. For every line the
+// manager makes a PROXY action in the registry (`<owner>.<verb>`, kept off
+// this program's bus) and offers it like `ctx_extension_add` does -- so the
+// rights check (`ctx_set_grant`) and the danger group apply. Running the
+// proxy calls `proxy_call(ud, owner, verb, cx)`: on OrientOS that is a call of
+// the plugin's action on the action bus (the broker asks a human for a critical
+// one). `text` must outlive the manager. Returns how many entries were added.
+fn ctx_set_proxy_call(m: *mut Ctxm, ud: u64, f: fn(u64, str, str, *mut action.ActCtx)) {
+    (*m).proxy_call = f
+    (*m).proxy_ud = ud
+}
+
+fn proxy_run(ud: u64, cx: *mut action.ActCtx) {
+    let p: *mut Proxy = ud as *mut Proxy
+    let m: *mut Ctxm = (*p).m as *mut Ctxm
+    let f: fn(u64, str, str, *mut action.ActCtx) = (*m).proxy_call
+    f((*m).proxy_ud, (*p).owner, (*p).verb, cx)
+}
+
+// Copy `a`, ".", `b` into the manager's own text and return it (n = 0: no room).
+fn pstr_join(m: *mut Ctxm, a: str, b: str) -> str {
+    let n: usize = a.n + 1 + b.n
+    if (*m).npstr + n > 1024 {
+        return str { p: (&(*m).pstr[0]) as *mut u8, n: 0 }
+    }
+    let at: usize = (*m).npstr
+    var i: usize = 0
+    while i < a.n {
+        (*m).pstr[at + i] = *((a.p as u64 + i as u64) as *mut u8)
+        i = i + 1
+    }
+    (*m).pstr[at + a.n] = 46 as u8
+    i = 0
+    while i < b.n {
+        (*m).pstr[at + a.n + 1 + i] = *((b.p as u64 + i as u64) as *mut u8)
+        i = i + 1
+    }
+    (*m).npstr = at + n
+    return str { p: (&(*m).pstr[at]) as *mut u8, n: n }
+}
+
+fn tb(s: str, i: usize) -> u8 {
+    return *((s.p as u64 + i as u64) as *mut u8)
+}
+
+// The next token of the line [pos, end): skips spaces; a quoted token is
+// returned WITHOUT its quotes. `next` is where to go on.
+struct Tok {
+    s: usize,
+    e: usize,
+    next: usize,
+    quoted: bool,
+}
+
+fn next_tok(text: str, pos: usize, end: usize) -> Tok {
+    var i: usize = pos
+    while i < end && (tb(text, i) == (32 as u8) || tb(text, i) == (9 as u8) || tb(text, i) == (13 as u8)) { i = i + 1 }
+    if i >= end { return Tok { s: end, e: end, next: end, quoted: false } }
+    if tb(text, i) == (34 as u8) {
+        var j: usize = i + 1
+        while j < end && tb(text, j) != (34 as u8) { j = j + 1 }
+        var nx: usize = j + 1
+        if nx > end { nx = end }
+        return Tok { s: i + 1, e: j, next: nx, quoted: true }
+    }
+    var j2: usize = i
+    while j2 < end && tb(text, j2) != (32 as u8) && tb(text, j2) != (9 as u8) && tb(text, j2) != (13 as u8) { j2 = j2 + 1 }
+    return Tok { s: i, e: j2, next: j2, quoted: false }
+}
+
+fn tok_str(text: str, t: Tok) -> str {
+    return str { p: (text.p as u64 + t.s as u64) as *mut u8, n: t.e - t.s }
+}
+
+fn parse_num(s: str) -> i64 {
+    var v: i64 = 0
+    var i: usize = 0
+    var neg: bool = false
+    if s.n > 0 && tb(s, 0) == (45 as u8) {
+        neg = true
+        i = 1
+    }
+    while i < s.n && tb(s, i) >= (48 as u8) && tb(s, i) <= (57 as u8) {
+        v = v * 10 + ((tb(s, i) - (48 as u8)) as i64)
+        i = i + 1
+    }
+    if neg { return 0 - v }
+    return v
+}
+
+fn ctx_manifest_load(m: *mut Ctxm, owner: str, text: str) -> usize {
+    let r: *mut action.Actions = ctxm_actions(m)
+    if r as u64 == 0 { return 0 }
+    var added: usize = 0
+    var i: usize = 0
+    while i < text.n {
+        var e: usize = i
+        while e < text.n && tb(text, e) != (10 as u8) { e = e + 1 }
+        var t: Tok = next_tok(text, i, e)
+        let word: str = tok_str(text, t)
+        if word.n == 4 && action.str_eq(word, "menu") {
+            let tv: Tok = next_tok(text, t.next, e)
+            let verb: str = tok_str(text, tv)
+            var tag: str = ""
+            var prio: i64 = 0
+            var lv: u32 = action.LV_WRITE
+            var label: str = ""
+            var pos: usize = tv.next
+            var go: bool = verb.n > 0
+            while go {
+                let k: Tok = next_tok(text, pos, e)
+                if k.s >= e && k.e >= e {
+                    go = false
+                } else {
+                    let kw: str = tok_str(text, k)
+                    // a quoted token starts the label: it is the last thing on the line
+                    if k.quoted {
+                        label = kw
+                        go = false
+                    } else if action.str_eq(kw, "on") {
+                        let v1: Tok = next_tok(text, k.next, e)
+                        tag = tok_str(text, v1)
+                        pos = v1.next
+                    } else if action.str_eq(kw, "prio") {
+                        let v2: Tok = next_tok(text, k.next, e)
+                        prio = parse_num(tok_str(text, v2))
+                        pos = v2.next
+                    } else if action.str_eq(kw, "level") {
+                        let v3: Tok = next_tok(text, k.next, e)
+                        let lw: str = tok_str(text, v3)
+                        if action.str_eq(lw, "read") { lv = action.LV_READ }
+                        if action.str_eq(lw, "critical") { lv = action.LV_CRITICAL }
+                        pos = v3.next
+                    } else {
+                        pos = k.next
+                    }
+                }
+            }
+            if verb.n > 0 && tag.n > 0 && label.n > 0 && (*m).nproxy < 16 {
+                let id: str = pstr_join(m, owner, verb)
+                if id.n > 0 {
+                    let pi: usize = (*m).nproxy
+                    (*m).nproxy = pi + 1
+                    (*m).proxies[pi] = Proxy { m: m as u64, owner: owner, verb: verb }
+                    let a: usize = action.act_add(r, id, label, proxy_run, (&(*m).proxies[pi]) as u64)
+                    if a != action.ACT_NONE {
+                        action.act_set_level(r, a, lv)
+                        action.act_set_bus(r, a, false)
+                        if ctx_extension_add(m, a, owner, tag, prio) {
+                            added = added + 1
+                        }
+                    }
+                }
+            }
+        }
+        i = e + 1
+    }
+    return added
 }
 
 // ======================================================== THE PROVIDER'S VIEW
