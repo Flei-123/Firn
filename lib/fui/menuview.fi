@@ -41,6 +41,9 @@ export {
     mv_request, mv_attach, mv_model, mv_levels, mv_rect, mv_row_rect,
     mv_a11y_dump, mv_scene, mv_open, mv_is_open, mv_pointer, mv_key, mv_char, mv_tick,
     mv_wait, mv_rebuilds, mv_row_h_px, mv_text_px,
+    // r168: the popup on a window of its own
+    mv_set_surface, mv_present, mv_expose, mv_is_top, mv_surface_rect,
+    mv_note, mv_win_x, mv_win_y,
     MV_NONE, MV_PAD,
     HIT_MOVE, HIT_LEAVE, HIT_DOWN, HIT_UP, HIT_WHEEL,
 }
@@ -85,6 +88,7 @@ const OVERLAP_PT: f64 = 4.0
 const EDGE_PT: f64 = 6.0 // keep this far from the bounds
 
 static NM_MENU: [u8; 8] = "ctx-menu"
+static NM_MENU_TOP: [u8; 12] = "ctx-menu-top"
 static NM_ROW: [u8; 7] = "ctx-row"
 static NM_SEP: [u8; 7] = "ctx-sep"
 
@@ -111,6 +115,13 @@ struct Level {
     arrow_px: f64,
     row_px: f64, // one row's height in px
     n_rows: usize,
+    // what is subtracted from the frame's place to get the place in the scene's
+    // own canvas: (0, 0) when the menu is painted into the page, the frame's
+    // own corner when it has a window of its own
+    ox: f64,
+    oy: f64,
+    // the picture is out of date (built, exposed): paint it again
+    fresh: bool,
 }
 
 struct MenuView {
@@ -120,28 +131,62 @@ struct MenuView {
     sh: sheet.Sheet,
     lv: [Level; 3],
     rp: [RowPaint; 96],
+    // the rectangle menus must stay in NOW: the window's, or the screen's
     bx: f64,
     by: f64,
     bw: f64,
     bh: f64,
+    // the window's own (mv_set_bounds), kept for the fallback
+    wbx: f64,
+    wby: f64,
+    wbw: f64,
+    wbh: f64,
     stamp: u64,
     nlev: usize,
     rebuilds: u64,
     ok: bool,
+    // THE POPUP ON A WINDOW OF ITS OWN (r168). `top`: the menu being shown has
+    // one window per level on the screen; its places are SCREEN places, and
+    // (wox, woy) is where the program's window is on the screen.
+    top: bool,
+    wox: f64,
+    woy: f64,
+    has_sf: bool,
+    sf_ud: u64,
+    sf_screen: fn(u64, *mut [f64; 4]) -> bool,
+    sf_origin: fn(u64, *mut [f64; 2]) -> bool,
+    sf_open: fn(u64, usize, i64, i64, usize, usize) -> bool,
+    sf_place: fn(u64, usize, i64, i64, usize, usize) -> bool,
+    sf_close: fn(u64, usize),
+    sf_ctx: fn(u64, usize) -> *mut render.Ctx,
+    sf_present: fn(u64, usize),
+    sf_on: [bool; 3],
+}
+
+fn sf_screen_none(ud: u64, out: *mut [f64; 4]) -> bool { return false }
+fn sf_origin_none(ud: u64, out: *mut [f64; 2]) -> bool { return false }
+fn sf_open_none(ud: u64, lv: usize, x: i64, y: i64, w: usize, h: usize) -> bool { return false }
+fn sf_close_none(ud: u64, lv: usize) {
+}
+fn sf_ctx_none(ud: u64, lv: usize) -> *mut render.Ctx { return 0 as u64 as *mut render.Ctx }
+fn sf_present_none(ud: u64, lv: usize) {
 }
 
 fn level_blank() -> Level {
     return Level { sc: scene.scene_new(), ax: a11y.a11y_new(), on: false,
         root: scene.SCENE_NONE, parent: ctxmenu.NONE, x: 0.0, y: 0.0, w: 0.0,
         h: 0.0, gutter: false, padx: 0.0, gut_px: 0.0, arrow_px: 0.0,
-        row_px: 0.0, n_rows: 0 }
+        row_px: 0.0, n_rows: 0, ox: 0.0, oy: 0.0, fresh: true }
 }
 
 fn view_blank() -> MenuView {
     return MenuView { cm: 0, c: 0, psc: 0, sh: sheet.sheet_new(),
         lv: [level_blank(); 3], rp: [RowPaint { v: 0, lv: 0, slot: 0 }; 96],
-        bx: 0.0, by: 0.0, bw: 0.0, bh: 0.0, stamp: 0, nlev: 0, rebuilds: 0,
-        ok: false }
+        bx: 0.0, by: 0.0, bw: 0.0, bh: 0.0, wbx: 0.0, wby: 0.0, wbw: 0.0, wbh: 0.0,
+        stamp: 0, nlev: 0, rebuilds: 0, ok: false, top: false, wox: 0.0, woy: 0.0,
+        has_sf: false, sf_ud: 0, sf_screen: sf_screen_none, sf_origin: sf_origin_none,
+        sf_open: sf_open_none, sf_place: sf_open_none, sf_close: sf_close_none,
+        sf_ctx: sf_ctx_none, sf_present: sf_present_none, sf_on: [false; 3] }
 }
 
 fn view_size() -> usize {
@@ -182,10 +227,38 @@ fn mv_attach(v: *mut MenuView, psc: *mut scene.Scene) {
 // The rectangle menus must stay inside, window pixels: the window (overlay)
 // or the screen (a popup window of its own).
 fn mv_set_bounds(v: *mut MenuView, x: f64, y: f64, w: f64, h: f64) {
-    (*v).bx = x
-    (*v).by = y
-    (*v).bw = w
-    (*v).bh = h
+    (*v).wbx = x
+    (*v).wby = y
+    (*v).wbw = w
+    (*v).wbh = h
+    if !(*v).top {
+        (*v).bx = x
+        (*v).by = y
+        (*v).bw = w
+        (*v).bh = h
+    }
+}
+
+// THE WINDOW LAYER OF A MENU (r168). A platform that can open windows of the
+// screen's own (lib/plat/fuipopup.fi on X11) hands over: the screen's size,
+// where the program's window is on it, and how to open / move / close / paint /
+// show the window of one level. A menu then lives in its OWN windows -- cut off
+// by nothing -- and `mv_present` paints them; without hooks (or when the
+// platform refuses a window) the menu is painted into the page as before.
+fn mv_set_surface(v: *mut MenuView, ud: u64, screen: fn(u64, *mut [f64; 4]) -> bool,
+    origin: fn(u64, *mut [f64; 2]) -> bool,
+    open: fn(u64, usize, i64, i64, usize, usize) -> bool,
+    place: fn(u64, usize, i64, i64, usize, usize) -> bool, close: fn(u64, usize),
+    ctx: fn(u64, usize) -> *mut render.Ctx, present: fn(u64, usize)) {
+    (*v).sf_ud = ud
+    (*v).sf_screen = screen
+    (*v).sf_origin = origin
+    (*v).sf_open = open
+    (*v).sf_place = place
+    (*v).sf_close = close
+    (*v).sf_ctx = ctx
+    (*v).sf_present = present
+    (*v).has_sf = true
 }
 
 fn mv_rules(sh: *mut sheet.Sheet) {
@@ -196,9 +269,17 @@ fn mv_rules(sh: *mut sheet.Sheet) {
     s0 = style.style_set_radius(s0, 8)
     s0 = style.style_set_fg(s0, style.color_token(style.TOK_TEXT))
     let r0: usize = sheet.sheet_rule(sh, sheet.sel_class(kmenu), s0)
+    // the same frame for a window of its own: a rectangle (the window cannot
+    // have rounded corners without a shape extension, and a rounded border
+    // on a square fill shows)
+    let kmt: u32 = sheet.sheet_name((&NM_MENU_TOP[0]) as u64, 12)
+    var s1: style.Style = s0
+    s1 = style.style_set_radius(s1, 0)
+    let r1: usize = sheet.sheet_rule(sh, sheet.sel_class(kmt), s1)
 }
 
 fn kmenu() -> u32 { return sheet.sheet_name((&NM_MENU[0]) as u64, 8) }
+fn kmenu_top() -> u32 { return sheet.sheet_name((&NM_MENU_TOP[0]) as u64, 12) }
 fn krow() -> u32 { return sheet.sheet_name((&NM_ROW[0]) as u64, 7) }
 fn ksep() -> u32 { return sheet.sheet_name((&NM_SEP[0]) as u64, 7) }
 
@@ -320,12 +401,18 @@ fn build_level(v: *mut MenuView, lv: usize, parent: usize) {
     // never wider than the bounds (a tiny window): the label gives way
     let room_w: f64 = (*v).bw - 2.0 * pt_px(c, EDGE_PT)
     if room_w > 40.0 && w > room_w { w = room_w }
-    let h: f64 = row_px * (rows as f64) + sep_px * (seps as f64)
+    var h: f64 = row_px * (rows as f64) + sep_px * (seps as f64)
     + 2.0 * pt_px(c, (PAD_PT as f64)) + 2.0
+    // whole pixels: a window of its own has an integer size, and so has the frame
+    w = round_up(w)
+    h = round_up(h)
     (*L).w = w
     (*L).h = h
+    (*L).fresh = true
     // the tree: root frame, one node per entry
-    let root: usize = scene.scene_box(&(*L).sc, scene.SCENE_NONE, kmenu(),
+    var fcls: u32 = kmenu()
+    if (*v).top { fcls = kmenu_top() }
+    let root: usize = scene.scene_box(&(*L).sc, scene.SCENE_NONE, fcls,
         flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_START)
     (*L).root = root
     scene.node_set_size(&(*L).sc, root, w / k, h / k)
@@ -405,7 +492,64 @@ fn place_level(v: *mut MenuView, lv: usize) {
         (*L).x = pl.x
         (*L).y = pl.y
     }
-    scene.scene_layout(&(*L).sc, c, (*L).x, (*L).y, (*L).w, (*L).h)
+    (*L).x = round_i((*L).x)
+    (*L).y = round_i((*L).y)
+    (*L).ox = 0.0
+    (*L).oy = 0.0
+    if (*v).top {
+        (*L).ox = (*L).x
+        (*L).oy = (*L).y
+    }
+    scene.scene_layout(&(*L).sc, c, (*L).x - (*L).ox, (*L).y - (*L).oy, (*L).w, (*L).h)
+}
+
+// Open the window of level `lv` (or move it when it exists). false when the
+// platform refuses.
+fn surface_level(v: *mut MenuView, lv: usize) -> bool {
+    let L: *mut Level = &(*v).lv[lv]
+    if (*v).sf_on[lv] {
+        let fp: fn(u64, usize, i64, i64, usize, usize) -> bool = (*v).sf_place
+        return fp((*v).sf_ud, lv, (*L).x as i64, (*L).y as i64, (*L).w as usize, (*L).h as usize)
+    }
+    let fo: fn(u64, usize, i64, i64, usize, usize) -> bool = (*v).sf_open
+    if fo((*v).sf_ud, lv, (*L).x as i64, (*L).y as i64, (*L).w as usize, (*L).h as usize) {
+        (*v).sf_on[lv] = true
+        return true
+    }
+    return false
+}
+
+fn surfaces_close(v: *mut MenuView, from: usize) {
+    var k: usize = from
+    while k < 3 {
+        if (*v).sf_on[k] {
+            let fc: fn(u64, usize) = (*v).sf_close
+            fc((*v).sf_ud, k)
+            (*v).sf_on[k] = false
+        }
+        k = k + 1
+    }
+}
+
+// The platform refused a window: show the menu in the page after all. The
+// request's place goes back from screen to window coordinates.
+fn to_overlay(v: *mut MenuView) {
+    let cm: *mut ctxmenu.Ctxm = cmo(v)
+    surfaces_close(v, 0)
+    ctxmenu.ctx_set_anchor(cm, ctxmenu.ctx_anchor_x(cm) - (*v).wox, ctxmenu.ctx_anchor_y(cm) - (*v).woy,
+        ctxmenu.ctx_anchor_alt(cm) - (*v).woy)
+    (*v).top = false
+    (*v).wox = 0.0
+    (*v).woy = 0.0
+    (*v).bx = (*v).wbx
+    (*v).by = (*v).wby
+    (*v).bw = (*v).wbw
+    (*v).bh = (*v).wbh
+    var k: usize = 0
+    while k < 3 {
+        (*v).lv[k].on = false
+        k = k + 1
+    }
 }
 
 // BRING THE PICTURE UP TO DATE with the model: a new menu is built from
@@ -416,6 +560,10 @@ fn mv_sync(v: *mut MenuView) {
     if !(*v).ok || (*v).c == 0 { return }
     if !ctxmenu.ctx_is_open(cm) {
         (*v).nlev = 0
+        if (*v).top || (*v).sf_on[0] {
+            surfaces_close(v, 0)
+            (*v).top = false
+        }
         return
     }
     if ctxmenu.ctx_open_count(cm) != (*v).stamp {
@@ -434,6 +582,12 @@ fn mv_sync(v: *mut MenuView) {
         if !(*v).lv[lv].on || (*v).lv[lv].parent != parent {
             build_level(v, lv, parent)
             place_level(v, lv)
+            if (*v).top && !surface_level(v, lv) {
+                // no window for it: the whole menu goes back into the page
+                to_overlay(v)
+                mv_sync(v)
+                return
+            }
         }
         lv = lv + 1
     }
@@ -442,6 +596,7 @@ fn mv_sync(v: *mut MenuView) {
         (*v).lv[off].on = false
         off = off + 1
     }
+    if (*v).top { surfaces_close(v, depth) }
     (*v).nlev = depth
 }
 
@@ -461,6 +616,17 @@ fn mv_rect(v: *mut MenuView, lv: usize, out: *mut [f64; 4]) -> bool {
     return true
 }
 
+// The frame of level `lv` as the screen sees it (the same as mv_rect in
+// either mode: places are in the bounds' coordinates, the screen's for a
+// menu in windows of its own); false when the level is not shown.
+fn mv_surface_rect(v: *mut MenuView, lv: usize, out: *mut [f64; 4]) -> bool {
+    return mv_rect(v, lv, out)
+}
+
+fn mv_is_top(v: *mut MenuView) -> bool { return (*v).top }
+fn mv_win_x(v: *mut MenuView) -> f64 { return (*v).wox }
+fn mv_win_y(v: *mut MenuView) -> f64 { return (*v).woy }
+
 // The rectangle of one entry (window pixels).
 fn mv_row_rect(v: *mut MenuView, slot: usize, out: *mut [f64; 4]) -> bool {
     var lv: usize = 0
@@ -468,8 +634,8 @@ fn mv_row_rect(v: *mut MenuView, slot: usize, out: *mut [f64; 4]) -> bool {
         let sc: *mut scene.Scene = &(*v).lv[lv].sc
         let nd: usize = scene.scene_find_id(sc, (slot + 1) as u32)
         if nd != scene.SCENE_NONE {
-            (*out)[0] = scene.node_x(sc, nd)
-            (*out)[1] = scene.node_y(sc, nd)
+            (*out)[0] = scene.node_x(sc, nd) + (*v).lv[lv].ox
+            (*out)[1] = scene.node_y(sc, nd) + (*v).lv[lv].oy
             (*out)[2] = scene.node_w(sc, nd)
             (*out)[3] = scene.node_h(sc, nd)
             return true
@@ -490,6 +656,12 @@ fn mv_a11y_dump(v: *mut MenuView, lv: usize, p: u64, cap: usize) -> usize {
 
 fn col(c: *mut render.Ctx, tk: u32) -> u32 {
     return render.color_of(c, style.color_token(tk))
+}
+
+fn round_up(x: f64) -> f64 {
+    let t: f64 = (x as i64) as f64
+    if t < x { return t + 1.0 }
+    return t
 }
 
 fn round_i(x: f64) -> f64 {
@@ -599,11 +771,48 @@ fn paint_row(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
 // page's own drawing, every frame the host paints.
 fn mv_draw(v: *mut MenuView, c: *mut render.Ctx) {
     mv_sync(v)
+    if (*v).top { return }
     var lv: usize = 0
     while lv < (*v).nlev {
         scene.scene_draw(&(*v).lv[lv].sc, c)
         lv = lv + 1
     }
+}
+
+// PAINT THE WINDOWS of a menu that has them (r168): every level whose picture
+// is out of date (just built, exposed, focus or open submenu changed). The
+// platform's loop calls this after it has pumped events. true = something was
+// painted.
+fn mv_present(v: *mut MenuView) -> bool {
+    mv_sync(v)
+    if !(*v).top || (*v).nlev == 0 { return false }
+    let cm: *mut ctxmenu.Ctxm = cmo(v)
+    let all: bool = ctxmenu.ctx_changed(cm)
+    var any: bool = false
+    var lv: usize = 0
+    while lv < (*v).nlev {
+        if (all || (*v).lv[lv].fresh) && (*v).sf_on[lv] {
+            let fc: fn(u64, usize) -> *mut render.Ctx = (*v).sf_ctx
+            let c: *mut render.Ctx = fc((*v).sf_ud, lv)
+            if c as u64 != 0 {
+                painter.painter_clear(render.ctx_painter(c),
+                    theme.opaque(render.color_of(c, style.color_token(style.TOK_SURFACE_RAISED))))
+                scene.scene_draw(&(*v).lv[lv].sc, c)
+                let fp: fn(u64, usize) = (*v).sf_present
+                fp((*v).sf_ud, lv)
+                (*v).lv[lv].fresh = false
+                any = true
+            }
+        }
+        lv = lv + 1
+    }
+    ctxmenu.ctx_clear_changed(cm)
+    return any
+}
+
+// A level's window was uncovered: paint it again at the next mv_present.
+fn mv_expose(v: *mut MenuView, lv: usize) {
+    if lv < 3 { (*v).lv[lv].fresh = true }
 }
 
 // ============================================================ HIT TESTING
@@ -618,7 +827,7 @@ fn mv_hit(v: *mut MenuView, x: f64, y: f64) -> usize {
         lv = lv - 1
         let L: *mut Level = &(*v).lv[lv]
         if x >= (*L).x && x < (*L).x + (*L).w && y >= (*L).y && y < (*L).y + (*L).h {
-            let nd: usize = scene.scene_hit(&(*L).sc, x, y)
+            let nd: usize = scene.scene_hit(&(*L).sc, x - (*L).ox, y - (*L).oy)
             if nd != scene.SCENE_NONE {
                 let id: u32 = scene.node_id(&(*L).sc, nd)
                 if id != 0 as u32 { return (id - (1 as u32)) as usize }
@@ -637,8 +846,38 @@ fn mv_request(ud: u64, target: usize, x: f64, y: f64, ay_alt: f64,
     source: u32, mods: u32) -> bool {
     let v: *mut MenuView = ud as *mut MenuView
     let cm: *mut ctxmenu.Ctxm = cmo(v)
+    // A MENU IN WINDOWS OF ITS OWN when the platform has them and knows where
+    // the screen and the program's window are; else in the page.
+    (*v).top = false
+    (*v).wox = 0.0
+    (*v).woy = 0.0
+    (*v).bx = (*v).wbx
+    (*v).by = (*v).wby
+    (*v).bw = (*v).wbw
+    (*v).bh = (*v).wbh
+    if (*v).has_sf {
+        var scr: [f64; 4] = [0.0; 4]
+        var og: [f64; 2] = [0.0; 2]
+        let fs: fn(u64, *mut [f64; 4]) -> bool = (*v).sf_screen
+        let fo: fn(u64, *mut [f64; 2]) -> bool = (*v).sf_origin
+        if fs((*v).sf_ud, &scr) && fo((*v).sf_ud, &og) {
+            (*v).top = true
+            (*v).wox = og[0]
+            (*v).woy = og[1]
+            (*v).bx = scr[0]
+            (*v).by = scr[1]
+            (*v).bw = scr[2]
+            (*v).bh = scr[3]
+        }
+    }
+    surfaces_close(v, 0)
+    var k: usize = 0
+    while k < 3 {
+        (*v).lv[k].on = false
+        k = k + 1
+    }
     let ok: bool = ctxmenu.ctx_request(cm, (*v).psc as *mut scene.Scene, target,
-        x, y, ay_alt, source, mods, 0)
+        x + (*v).wox, y + (*v).woy, ay_alt + (*v).woy, source, mods, 0)
     if ok { mv_sync(v) }
     return ok
 }
@@ -654,7 +893,7 @@ fn mv_pointer(ud: u64, kind: u32, x: f64, y: f64, btn: u32, now: i64) -> u32 {
     let cm: *mut ctxmenu.Ctxm = cmo(v)
     if !ctxmenu.ctx_is_open(cm) { return ctxmenu.CR_NONE }
     if kind == HIT_LEAVE { return ctxmenu.CR_NONE }
-    let s: usize = mv_hit(v, x, y)
+    let s: usize = mv_hit(v, x + (*v).wox, y + (*v).woy)
     if kind == HIT_MOVE {
         var r: u32 = ctxmenu.CR_CONSUMED
         if s != MV_NONE && s != MV_PAD {
@@ -691,4 +930,16 @@ fn mv_tick(ud: u64, now: i64) -> u32 {
 
 fn mv_wait(ud: u64, now: i64) -> i64 {
     return ctxmenu.ctx_pending_ms(cmo(ud as *mut MenuView), now)
+}
+
+// The window or the focus changed under an open menu (`what`: 1 the window
+// moved / resized / lost its place, 2 the focus went): it closes.
+fn mv_note(ud: u64, what: u32) {
+    let v: *mut MenuView = ud as *mut MenuView
+    let cm: *mut ctxmenu.Ctxm = cmo(v)
+    if what == 2 as u32 {
+        let r: u32 = ctxmenu.ctx_focus_lost(cm)
+    } else {
+        let r: u32 = ctxmenu.ctx_window_changed(cm)
+    }
 }
