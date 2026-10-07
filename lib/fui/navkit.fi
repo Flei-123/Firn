@@ -1,0 +1,309 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/navkit.fi -- THE PARTS OF A FILE MANAGER AND A TASK MANAGER (fUi gallery).
+//
+// ========================================================= WHY
+//
+// OrientOS's file manager and task manager each had their own copy of
+// the same small things: how a size is written ("1.2 KB"), where the
+// baseline of a text goes so that it shares the centre line of the icon
+// beside it, a scroll bar that does not sit on the list like a slab, a
+// heat tint behind a number, a history curve. Written twice, they drift:
+// the manager's rows put the icon 3 px above the text (measured
+// 07.10.2026, tools/midline). Here they are ONCE, with no host in them:
+// every function takes a `painter.Painter` (or nothing at all) and
+// numbers, so any fUi program -- on OrientOS, in a browser, in a
+// window of its own -- draws the same rows and the same graph.
+//
+// ========================================================= THE PARTS
+//
+//   size_text       bytes -> "354 B", "1.2 KB", "12 MB", "3.4 GB"
+//   mid_base        the baseline of a text of `px` pixels in a box of
+//                   height `h`: the middle of the lower-case body and
+//                   the capitals stands on the middle of the box
+//   row_indent      the left edge of a tree row of a given level
+//   thumb           the thumb of a scroll bar: where and how long
+//   paint_thumb     a THIN overlay scroll bar (4 points, 6 when hot)
+//   heat_alpha      the tint of a heat cell for a value 0..1000
+//   paint_heat      the rounded plate behind a number
+//   graph_y         where a value 0..1000 lands in a graph of height h
+//   paint_graph     a history curve with an area under it and a grid
+//   paint_bar       a filled bar (a usage meter, a card's gauge)
+//
+// ========================================================= THE LOOK
+//
+// Colours come in as arguments (theme tokens of the caller's `Colors`);
+// nothing here owns a colour. Radii and widths are in points; the caller
+// scales them (a host with a scale factor passes `pt * scale`).
+import fui.painter
+
+export {
+    size_text, mid_base, row_indent, thumb_len, thumb_off,
+    paint_thumb, heat_alpha, paint_heat, graph_y, paint_graph, paint_bar,
+    ROW_H, TREE_STEP, HEAT_MIN, HEAT_MAX,
+}
+
+// The row height of every list of the gallery (points) and the step of
+// one tree level.
+const ROW_H: u64 = 32
+const TREE_STEP: u64 = 16
+// The alpha of a heat plate at value 0 and at 1000 (of 255).
+const HEAT_MIN: u64 = 20
+const HEAT_MAX: u64 = 110
+
+// ------------------------------------------------------------ sizes
+
+fn put_digit(out: u64, at: usize, cap: usize, d: u64) -> usize {
+    if at + 1 >= cap {
+        return at
+    }
+    *((out + at as u64) as *mut u8) = (48 + d) as u8
+    return at + 1
+}
+
+fn put_num(out: u64, at: usize, cap: usize, v: u64) -> usize {
+    var a: usize = at
+    var div: u64 = 1
+    while v / div >= 10 {
+        div = div * 10
+    }
+    while div > 0 {
+        a = put_digit(out, a, cap, (v / div) % 10)
+        div = div / 10
+    }
+    return a
+}
+
+fn put_str(out: u64, at: usize, cap: usize, s: str) -> usize {
+    var a: usize = at
+    var i: usize = 0
+    while i < s.n && a + 1 < cap {
+        *((out + a as u64) as *mut u8) = *((s.p as u64 + i as u64) as *mut u8)
+        a = a + 1
+        i = i + 1
+    }
+    return a
+}
+
+// A SIZE FOR A PERSON. Units of 1024; one decimal below 10 of a unit
+// ("1.2 KB"), none from there on ("12 KB"); bytes stay whole. The text
+// is NUL-terminated inside `cap`; the return value is its length.
+fn size_text(bytes: u64, out: u64, cap: usize) -> usize {
+    if cap < 2 {
+        return 0
+    }
+    var a: usize = 0
+    if bytes < 1024 {
+        a = put_num(out, a, cap, bytes)
+        a = put_str(out, a, cap, " B")
+        *((out + a as u64) as *mut u8) = 0 as u8
+        return a
+    }
+    var unit: u64 = 1024
+    var name: str = " KB"
+    if bytes >= 1024 * 1024 * 1024 {
+        unit = 1024 * 1024 * 1024
+        name = " GB"
+    } else if bytes >= 1024 * 1024 {
+        unit = 1024 * 1024
+        name = " MB"
+    }
+    // tenths, rounded half up; 9.95 KB would print "10.0": carry it into the whole part
+    var tenths: u64 = (bytes * 10 + unit / 2) / unit
+    if tenths >= 100 {
+        a = put_num(out, a, cap, (bytes + unit / 2) / unit)
+    } else {
+        a = put_num(out, a, cap, tenths / 10)
+        a = put_str(out, a, cap, ".")
+        a = put_digit(out, a, cap, tenths % 10)
+    }
+    a = put_str(out, a, cap, name)
+    *((out + a as u64) as *mut u8) = 0 as u8
+    return a
+}
+
+// ------------------------------------------------------------ rows
+
+// THE BASELINE ON THE CENTRE LINE. The middle between the x-height and
+// the cap height of Inter (0.546 and 0.727 em) is 0.6365 em above the
+// baseline; that point goes on the middle of the box. Integer arithmetic,
+// whole pixels: `top` + (h * 500 + px * 318 + 500) / 1000.
+fn mid_base(top: u64, h: u64, px: u64) -> u64 {
+    return top + (h * 500 + px * 318 + 500) / 1000
+}
+
+// The left edge of a tree row (in pixels, `step` per level).
+fn row_indent(x: u64, level: u64, step: u64) -> u64 {
+    return x + level * step
+}
+
+// ------------------------------------------------------------ scroll bars
+
+// The length of the thumb of `track` pixels for `vis` of `total` rows;
+// never shorter than `min` and never longer than the track.
+fn thumb_len(track: u64, vis: u64, total: u64, min: u64) -> u64 {
+    if total == 0 || vis >= total {
+        return track
+    }
+    var t: u64 = track * vis / total
+    if t < min {
+        t = min
+    }
+    if t > track {
+        t = track
+    }
+    return t
+}
+
+// The offset of the thumb when the first visible row is `top`.
+fn thumb_off(track: u64, tl: u64, top: u64, total: u64, vis: u64) -> u64 {
+    if total <= vis {
+        return 0
+    }
+    return (track - tl) * top / (total - vis)
+}
+
+// A THIN OVERLAY BAR: no track, only the thumb, 4 points wide and 6 when
+// the pointer is over the list (`hot`). It lies on the right edge of the
+// area (x + w), over the rows, and says in the quiet colour `col` that
+// there is more. `top` is the first visible row.
+fn paint_thumb(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
+    total: u64, vis: u64, top: u64, scale: f64, col: u32, hot: bool) {
+    if total <= vis || vis == 0 {
+        return
+    }
+    var bw: f64 = 4.0 * scale
+    if hot {
+        bw = 6.0 * scale
+    }
+    let tl: u64 = thumb_len(h as u64, vis, total, (24.0 * scale) as u64)
+    let to: u64 = thumb_off(h as u64, tl, top, total, vis)
+    painter.round_rect(z, x + w - bw - 2.0 * scale, y + to as f64, bw, tl as f64,
+        bw / 2.0, col)
+}
+
+// ------------------------------------------------------------ heat
+
+// The alpha (0..255) of the plate for a value 0..1000.
+fn heat_alpha(v: u64) -> u64 {
+    var vv: u64 = v
+    if vv > 1000 {
+        vv = 1000
+    }
+    return HEAT_MIN + vv * (HEAT_MAX - HEAT_MIN) / 1000
+}
+
+// The plate behind a number: the colour `base` (a theme accent, any alpha)
+// at `heat_alpha(v)`, rounded. A value of 0 paints nothing.
+fn paint_heat(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
+    v: u64, r: f64, base: u32) {
+    if v == 0 {
+        return
+    }
+    let al: u32 = heat_alpha(v) as u32
+    painter.round_rect(z, x, y, w, h, r, (base & 16777215 as u32) | (al << 24))
+}
+
+// ------------------------------------------------------------ graphs
+
+// Where a value 0..1000 lands in a graph whose box is `h` high: 0 on the
+// bottom edge, 1000 on the top edge (whole pixels, y counted from the top).
+fn graph_y(h: u64, v: u64) -> u64 {
+    var vv: u64 = v
+    if vv > 1000 {
+        vv = 1000
+    }
+    return h - vv * h / 1000
+}
+
+fn lerp_at(hist: u64, n: u64, num: u64, den: u64) -> u64 {
+    // the value at position num/den of the way over n samples (linear)
+    if n == 0 {
+        return 0
+    }
+    if n == 1 || den == 0 {
+        return *(hist as *mut u64)
+    }
+    let pos: u64 = num * (n - 1) * 256 / den
+    let i: u64 = pos / 256
+    let f: u64 = pos % 256
+    if i + 1 >= n {
+        return *((hist + (n - 1) * 8) as *mut u64)
+    }
+    let a: u64 = *((hist + i * 8) as *mut u64)
+    let b: u64 = *((hist + (i + 1) * 8) as *mut u64)
+    if b >= a {
+        return a + (b - a) * f / 256
+    }
+    return a - (a - b) * f / 256
+}
+
+// A HISTORY CURVE. `hist` is an array of `n` u64 values 0..1000 (oldest
+// first, laid over the whole width); the picture: a grid of four hairlines
+// (`grid`), the area under the curve in `fill` (give it a low alpha), the
+// curve itself 2 pixels thick in `line`. The box is whole pixels
+// (x, y, w, h). A curve of fewer than 2 samples draws the grid only.
+fn paint_graph(z: *mut painter.Painter, x: u64, y: u64, w: u64, h: u64,
+    hist: u64, n: u64, line: u32, fill: u32, grid: u32) {
+    if w < 4 || h < 4 {
+        return
+    }
+    var g: u64 = 1
+    while g < 4 {
+        painter.surface(z, x as f64, (y + h * g / 4) as f64, w as f64, 1.0, grid)
+        g = g + 1
+    }
+    if n < 2 {
+        return
+    }
+    var prev: u64 = 0
+    var px: u64 = 0
+    while px < w {
+        let v: u64 = lerp_at(hist, n, px, w - 1)
+        let cy: u64 = graph_y(h, v)
+        // the area from the curve down to the bottom edge
+        if cy < h {
+            painter.surface(z, (x + px) as f64, (y + cy) as f64, 1.0, (h - cy) as f64, fill)
+        }
+        // the line: 2 px thick, and it bridges a jump to the previous column
+        var a: u64 = cy
+        var b: u64 = cy
+        if px > 0 {
+            if prev < a {
+                a = prev
+            }
+            if prev > b {
+                b = prev
+            }
+        }
+        var top: u64 = a
+        if top > 0 {
+            top = top - 1
+        }
+        var bot: u64 = b + 1
+        if bot > h {
+            bot = h
+        }
+        painter.surface(z, (x + px) as f64, (y + top) as f64, 1.0, (bot - top) as f64, line)
+        prev = cy
+        px = px + 1
+    }
+}
+
+// A BAR: the track in `back`, the filled part (0..1000 of the width) in
+// `front`, both rounded with radius `r`.
+fn paint_bar(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64,
+    v: u64, r: f64, back: u32, front: u32) {
+    painter.round_rect(z, x, y, w, h, r, back)
+    var vv: u64 = v
+    if vv > 1000 {
+        vv = 1000
+    }
+    if vv == 0 {
+        return
+    }
+    var fw: f64 = w * vv as f64 / 1000.0
+    if fw < h {
+        fw = h
+    }
+    painter.round_rect(z, x, y, fw, h, r, front)
+}
