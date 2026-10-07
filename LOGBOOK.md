@@ -1,3 +1,45 @@
+## Round OPENPLAN-R23 (2026-10-07) -- the four Firn items OpenPlan waited for; branches openplan-shm, -blockcache, -printscale, -modnames
+OpenPlan (r23, r66, r69, r73 of its roadmap) was held up by four things in Firn. All four are in,
+each with a test and a measurement; the compiler changed only in its system call tables.
+r23 MIT-SHM (lib/window/x11.fi). A picture of 64 KiB and more is copied ONCE into a System V segment
+the server has attached, and one ShmPutImage (40 octets) puts it on the window; before it went in
+bands of 64 KiB through the socket (a full-window frame of 8.3 MB = 130 writes, every octet read by
+the server). The segment is made on the first big picture (extension asked for, attach checked with a
+round trip, marked for removal at once, grows, never shrinks), a GetInputFocus behind every
+ShmPutImage is the fence the next picture waits for, and everything the server cannot do (no
+extension, other IPC namespace, `shmget` refused) falls back to the PutImage bands.
+FIRN_X11_NOSHM=1 switches it off. Measured with OpenPlan's tools/desktop/x11_measure.sh on an Xvfb,
+three runs each on a machine at load 11: send of one frame 4.5 / 5.1 / 5.7 ms -> 2.2 / 2.6 / 2.7 ms
+(pan 4.9-6.4 -> 2.5-2.6 ms, pan frame 10.4-11.6 -> 7.3-7.7 ms), the window shows exactly the program's
+frame (0 pixels apart), 0 CPU ticks idle; tools/fui/x11shm.py checks that the window holds the same pixels
+through shared memory, through the PutImage bands, on a server without the extension and on one in
+another IPC namespace (the attach fails, the program notices and goes back to the bands). The aarch64 and wasm tables of syscalls.rs know the four
+calls (shmget, shmat, shmctl, shmdt); the wasm table also learned ftruncate, which was missing and
+had made `cargo test` red on main. tools/fui/x11_main checks the three requests octet by octet.
+r66 block cache (lib/rt/rt.fi). `heap_alloc` was one mmap per block (a vector of eight slots: a
+4 KiB mapping) and `heap_free` one munmap. Freed blocks of 1..16 pages are now kept on lists (at
+most 256 KiB per size, 4 MiB in all), handed out again zeroed (the whole rounded size, as before),
+and the lists are guarded by a try-lock built from `__atomic_add`: a thread that does not get it
+goes to the kernel, so nothing waits and nothing can dead-lock. It needed no compiler change: `static
+mut` (round 89) is allowed in `#[no_gc]` functions. tools/rtcache/run.sh counts at the kernel's door
+(strace): 200,000 rounds of allocate/free reach it 70 times instead of 399,943, with the
+counter-check that a program that never frees still costs one mmap per block; tests/2244 checks
+reuse, zero, every size, the limit and four threads (and fails, as it should, with the wipe or the lock
+taken out). OpenPlan `op pdf --pages=1-40` on a 1,000-page project: 203,000 mmap/munmap pairs -> 557
+calls, sys time 3.1 s -> 0.65 s, wall 6.7 s -> 3.9 s; the whole 1,000 pages: sys 11.0 s -> 5.0 s.
+r69 print scaling (lib/print). `PrintOptions.scaling` (SCALING_FIT, FILL, NONE, AUTO, AUTO_FIT;
+default sends nothing) goes out as the IPP keyword `print-scaling`; `PrinterInfo.scaling` reads
+`print-scaling-supported`. `ipp_encode_job_options` is public so the octets are checked without a
+printer (tests/1917); tools/libmvp/check_print.py sends fit through CUPS' ippeveprinter (accepted)
+and sees the keyword on the wire at a stand-in.
+r73 flat module names. Firn addresses a module by the last segment of its path, so lib/svg/stroke.fi
+and lib/paint/stroke.fi were both `stroke` and no program could import both (pictures need svg). The
+SVG file is now lib/svg/dash.fi (its content is the dash and outline code); tests/2243 imports
+paint.stroke, svg.svgimage and svg.dash together. A scan of every program under tests, tools, demos
+and examples for two modules of one name in one program found no other collision inside Firn; the
+other two names OpenPlan hit (sim/paint, report/layout against svg/paint and fui/layout) are its own
+files, which it already renamed.
+
 ## Round OPENPLAN-LIBS (2026-09-25) -- the application libraries OpenPlan asked for; branches mvp-libs, clipboard
 OpenPlan (the electrical CAD on Firn) listed what it cannot do without (LIB-001..010). Built in one
 round, each with a positive test in every build level and on AArch64, and each held against an
