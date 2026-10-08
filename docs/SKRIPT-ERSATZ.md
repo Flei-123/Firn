@@ -91,7 +91,7 @@ String-Schlüsseln. Alles geht, ist aber ausführlicher als Python.
 | `json.loads` | `json.json_parse` → Knoten-Array; `json_get/json_child/json_string/json_int/json_number/json_bool` | `lib/std/json.fi:789,907,932,950,943,968`; JSONTestSuite 318 Dateien | **da** (RFC 8259 strikt) |
 | `json.dumps` (kompakt/`indent`) | `json_write/json_write_pretty` + Streaming `jw_*` | `json.fi:1214,1220,1249` | **da**, **`sort_keys` fehlt** (24 Nutzungen) (S) |
 | `csv.DictReader/writer` | — (kein CSV in `lib/`) | – | **fehlt** (S) — Prototyp in `tools/script_port/check_lists.fi` (≈95 Zeilen, Quotes/CRLF) |
-| `re` | `regex.regex_compile/regex_find/regex_replace_all` (RE2-Syntax, linear; **kein** Lookaround/Rückverweis → `Unsupported`) | `lib/regex/regex.fi` Kopf (Z. 1–40) | **da**; `findall` per Schleife; 2 Lookaround-Muster umschreiben |
+| `re` | `regex.regex_compile/regex_find/regex_replace_all` (RE2-Syntax, linear; Lookaround `(?=` `(?!` `(?<=` `(?<!` seit r320 da — polynomiell statt linear, siehe docs/SKRIPT-LIBS.md; **kein** Rückverweis → `Unsupported`) | `lib/regex/regex.fi` Kopf (Z. 1–40) | **da**; `findall` per Schleife; die 2 Lookaround-Muster laufen unverändert |
 | `hashlib.sha256/md5` | `crypto.sha256(p,n,out)`, `md5_new`, `hashfile.hash_file_hex(path, algo)` | `lib/std/crypto/sha256.fi:238`, `lib/std/md5.fi:86`, `lib/std/hashfile.fi:274` | **da** |
 | `base64` | `base64.encode/encode_url/decode` | `lib/std/base64.fi:74,78,85` | **da** |
 | `gzip.compress` / `zlib.decompress` | `deflate.gzip_compress`, `gzip.gz_decompress`, `inflate_into` | `lib/std/deflate.fi:1738,663`, `lib/compress/gzip.fi:708` | **da** |
