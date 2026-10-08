@@ -100,6 +100,31 @@ Sorting: `f64` gets a **total order** — `math.total_cmp(a: f64, b: f64) -> i32
 and, if the language lets `f64` satisfy `Ord`, `vec_sort[f64]` works. `median` of an empty set / NaN input: documented, never a trap.
 Cross-check against `statistics` and `numpy` (if installed) on random data incl. ties, huge/small magnitudes.
 
+**Status (08.10.2026): built** — `lib/std/stats.fi`, `math.total_cmp`, `impl Ord for f64` in `lib/rt/vec.fi`; tests `tests/2350`–`2353`, `tools/stats_cross`, `examples/stats_basic.fi`.
+How the design came out (module-qualified names: `import std.stats`, then `stats.mean(p, n)`):
+
+* `f64` order: `math.total_key(x) -> u64` (monotone bit map), `math.total_cmp(a, b) -> i32` (−1/0/1), `math.total_less(a, b)`;
+  in `std.math` and `std.core` (`lib/math/core_math.fi`). `impl Ord for f64` (rt.vec) uses the same map, so **`vec_sort[f64]` works**
+  and puts NaN at the ends, −0.0 before +0.0. The language does not make f64 a `Scalar`, so `vec_at/vec_min/vec_max/vec_index_of[f64]`
+  stay closed — read elements with `vec_elem_ptr[f64]`, or use `stats.min_vec/max_vec`. A program with its own `impl Ord for f64`
+  (a workaround) must drop it, the impl is program wide.
+* Raw form `stats.f(p: *mut f64, n: usize, ...)` and Vec form `stats.f_vec(&v, ...)`: `sum mean sum_exact mean_exact min max median
+  percentile(p, n, pct) variance stdev pvariance pstdev histogram(p, n, bins, lo, hi, counts: *mut u64) -> counted sort`.
+* `median`/`percentile` work on a private copy (the data is never reordered); `median_inplace`/`percentile_inplace` (and
+  `*_vec_inplace`) use the input as working space and leave it permuted, no allocation. Quickselect, O(n), O(n log n) worst case.
+* `sum`/`mean` = Neumaier. Added beyond the draft: `sum_exact`/`mean_exact` (Shewchuk partials, **identical to `math.fsum` /
+  `statistics.fmean`**), because Neumaier is not bounded when terms of 1e30 and 1 cancel (measured, below).
+* Bad input: empty set → NaN (`sum` 0.0), variance with n < 2 → NaN, any NaN in the data → NaN, p outside [0, 100] or NaN → NaN, a null
+  pointer is the empty set. Never a trap. Infinities follow IEEE.
+* `percentile` is **bit-identical to `numpy.percentile`** (position `(n-1)*(p/100)` in doubles, numpy's `lerp`); `median` is
+  `statistics.median`'s `(a+b)/2`. `histogram` is `numpy.histogram` (edges `i*step+lo`, last bin closed, NaN/outside not counted).
+* Measured (tools/stats_cross/run.sh, 5200 data sets, 217,793 compared values, Python 3.11, numpy 2.4.6), maximum deviation in ulp:
+  `sum_exact` 0, `mean_exact` 0 (vs `fsum`, `fmean`); `median` 0; `percentile` vs numpy 0; `min`/`max` 0; `variance`/`pvariance` ≤ 3,
+  `stdev`/`pstdev` ≤ 2 (vs `statistics`, exact fractions); `mean` ≤ 1 vs `statistics.mean`, 0 vs `fmean`; `sum` 0 — except the family
+  “cancellation” (±1e30-sized terms with a residue of 1): there Neumaier is off by up to 3e15 ulp, `sum_exact` is exact.
+  `percentile` against `statistics.quantiles(inclusive)` (exact integer positions): worst 1.5·eps·(n·span+|x|) — the weight
+  `(n-1)*(p/100)` of numpy's method carries an error of n·eps, so the result is not bit-equal for p that are not exact in binary.
+
 ### std.testkit — `lib/std/testkit.fi` (r311)
 For `#[test]` functions and for plain `main` scripts.
 ```
