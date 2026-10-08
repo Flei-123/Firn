@@ -1832,6 +1832,18 @@ if [ "$GLRC" -eq 0 ]; then
 else
     bad "tools/glob_cross/run.sh failed (see .test-work/glob_cross.log)"
     grep -E 'FAIL|DIFF|differ' "$WORK/glob_cross.log" | head -12 | sed 's/^/   /' || true
+echo "== 103. std.stats against Python (tools/stats_cross/run.sh, SKRIPT-LIBS r316) =="
+# 5200 random data sets in 16 families (ties, 1e-100..1e100, ill-conditioned, denormals, byte values, cancellation)
+# through lib/std/stats.fi and compared with math.fsum, statistics.* and numpy (median, percentile, var, histogram).
+# The deviation is measured in ULP per statistic and family; the other three build levels must answer byte for byte
+# like the first. Unit tests: tests/2350_std_total_cmp.fi, 2351-2353_std_stats*.fi.
+FIRNC="$FIRNC" bash tools/stats_cross/run.sh > "$WORK/stats_cross.log" 2>&1 && SCRC=0 || SCRC=$?
+if [ "$SCRC" -eq 0 ]; then
+    ok
+    grep -E '^  (max ulp overall|percentile vs|cases above|compared values|histogram:)' "$WORK/stats_cross.log" | sed 's/^/ /'
+else
+    bad "tools/stats_cross/run.sh failed (see .test-work/stats_cross.log)"
+    grep -E 'FAIL|mismatch|MISMATCH' "$WORK/stats_cross.log" | head -8 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
