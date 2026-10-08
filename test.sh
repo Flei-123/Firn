@@ -1804,6 +1804,21 @@ else
     grep -E 'FAIL|DIFF|differ' "$WORK/csv_cross.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 114. std.glob against Python's glob and fnmatch modules (tools/glob_cross/run.sh, r314) =="
+# tests/2310, 2311 and examples/glob_find.fi are in section 3. Here lib/std/glob.fi is held against glob.glob(recursive=True,
+# root_dir=..., include_hidden=...) on random directory trees (files, directories, links to files and directories, broken links,
+# hidden names, accented/euro/emoji names, names that hold glob characters), against fnmatch.fnmatchcase on random patterns
+# and names (classes with backwards ranges included) and against glob.escape -- in the four build stages -- and three
+# counter-checks (a library with a planted bug has to be caught). GLOB_TREES / GLOB_SEEDS scale it.
+bash tools/glob_cross/run.sh > "$WORK/glob_cross.log" 2>&1 && GLRC=0 || GLRC=$?
+if [ "$GLRC" -eq 0 ]; then
+    ok
+    grep -E '^glob_cross:|counter-check' "$WORK/glob_cross.log" | sed 's/^/   /'
+else
+    bad "tools/glob_cross/run.sh failed (see .test-work/glob_cross.log)"
+    grep -E 'FAIL|DIFF|differ' "$WORK/glob_cross.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

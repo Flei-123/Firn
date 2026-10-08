@@ -1,0 +1,939 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/glob.fi -- std.glob: shell patterns (`fnmatch`) and file name
+// expansion (`glob.glob`), behaving like Python's `fnmatch` and `glob` modules.
+//
+// Round SKRIPT-LIBS (docs/SKRIPT-LIBS.md, r314/r315). "All json files two
+// levels down" is one line in a shell and in Python; here it is one call:
+//
+//     import std.glob
+//     glob.matches("*.json", "a.json")                     // true
+//     var out: rt.Buf = rt.buf_new()
+//     let n: usize = glob.expand("library/*/*.json", &out) // sorted, NUL after every name
+//     var i: usize = 0
+//     while i < n {
+//         let name: str = glob.nth(&out, i)
+//         i = i + 1
+//     }
+//     rt.buf_free(&out)
+//     glob.expand_opts("src/**/*.fi", glob.GLOB_RECURSIVE | glob.GLOB_HIDDEN, &out)
+//     glob.expand_in("/some/root", "**/*.txt", glob.GLOB_RECURSIVE, &out)    // names relative to the root
+//
+// THE PATTERN. `*` any run of characters (also none), `?` one character,
+// `[abc]` / `[a-z]` one of them, `[!x]` one that is not. A `]` right after the
+// `[` or the `[!` is a member; a `[` without a closing `]` is an ordinary `[`;
+// a range written backwards (`[z-a]`) holds nothing; `-` first or last, or
+// right after a range, is an ordinary `-`. There is no escape character:
+// `[*]` matches a star. A "character" is a UTF-8 sequence (as Python's `str`):
+// `?` matches the three bytes of a euro sign, `[a-\u{ff}]` is a range of code
+// points; a byte that is not valid UTF-8 counts as one character of its own.
+// Matching is case sensitive and takes no shortcuts with separators:
+// `matches("*", "a/b")` is true, like `fnmatch.fnmatchcase`.
+//
+// THE EXPANSION is Python's `glob._iglob` word for word:
+//   * the pattern is split at `/`; a part without `* ? [` is taken literally
+//     (and only has to EXIST, a broken symlink counts); a part with one is
+//     matched against the entries of the directory
+//   * HIDDEN: `*`, `?` and `[` do not match a name that starts with `.`, unless
+//     the pattern part itself starts with `.` -- or GLOB_HIDDEN is set
+//   * `**` as a whole part (with GLOB_RECURSIVE) is zero or more directories:
+//     "a/**/b" finds a/b, a/x/b, a/x/y/b. "a/**" lists a/ and everything below.
+//     Without GLOB_RECURSIVE `**` is the same as `*`
+//   * a pattern ending in `/` finds directories only (the name ends in `/`)
+//   * the result is SORTED bytewise (for valid UTF-8 the order of Python's
+//     `sorted()`); duplicates a pattern like "**/**" produces are kept, as in Python
+//   * nothing found is not an error: 0
+// tools/glob_cross/run.sh holds it against `glob.glob(recursive=True)` and
+// `fnmatch.fnmatchcase` on thousands of random trees and patterns.
+//
+// HONEST
+// G1  Tested on Linux and on AArch64 Linux (qemu). Under Wine (x86_64-windows) `matches`,
+//     `escape` and the walk over plain files and directories work, but the symbolic link
+//     cases of tests/2311 fail there (no links are created) -- treat expand as Linux only
+//     until a real Windows PC has run it. An unreadable directory is skipped, as in
+//     Python; there is no error report.
+// G2  `**` does NOT descend into a symbolic link to a directory (Python does,
+//     and can loop for a long time on a link cycle). GLOB_FOLLOW does follow, at
+//     most 40 links on one path (the kernel's own limit). The link itself is listed.
+// G3  No brace expansion (`{a,b}`), no `~`, no `[[:alpha:]]` classes, no
+//     escape character (use `escape` to quote a literal name, as `glob.escape`).
+// G4  Python 3.12 and later fixed "a/**" for a directory that does not exist
+//     (3.11 still returns "a/"): this library answers like the fixed versions,
+//     with nothing.
+// G5  The names are the bytes of the file system. Python decodes them as UTF-8
+//     with surrogate escapes; the order is the same for valid UTF-8. A name that
+//     holds a newline or a NUL-free control character is fine; a name with a
+//     NUL is impossible on Linux.
+// G6  The listing of a directory is read completely before it is matched: a
+//     directory that changes during the call may or may not show the new entry.
+// G7  `expand` APPENDS to the buffer; it does not clear it.
+
+import rt
+import dir
+import fs
+import vec
+
+export {
+    GLOB_RECURSIVE, GLOB_HIDDEN, GLOB_FOLLOW,
+    matches, has_magic, escape,
+    expand, expand_opts, expand_in, nth, count_names,
+}
+
+const GLOB_RECURSIVE: u32 = 1 // `**` as a whole part means zero or more directories
+const GLOB_HIDDEN: u32 = 2 // `*`, `?`, `[` and `**` also match names that start with `.`
+const GLOB_FOLLOW: u32 = 4 // `**` also walks into symbolic links to directories (at most 40 hops)
+
+const G_SLASH: u8 = 47
+const G_DOT: u8 = 46
+const G_STAR: u8 = 42
+const G_QUEST: u8 = 63
+const G_OPEN: u8 = 91
+const G_CLOSE: u8 = 93
+const G_BANG: u8 = 33
+const G_DASH: u8 = 45
+const G_MAX_HOPS: u32 = 40
+
+// ------------------------------------------------------------- characters
+
+// The UTF-8 character at `i` as a code point; `*len` gets its length in bytes.
+// A byte that does not start a valid sequence is one character of its own,
+// 0xDC00 + the byte -- the "surrogate escape" Python uses for file names.
+fn cp_at(s: str, i: usize, len: *mut usize) -> u32 {
+    let b0: u32 = (*(s.p + i)) as u32
+    *len = 1
+    if b0 < 128 as u32 {
+        return b0
+    }
+    var need: usize = 0
+    var cp: u32 = 0
+    var min: u32 = 0
+    if b0 >= 194 as u32 && b0 <= 223 as u32 {
+        need = 1
+        cp = b0 & 31 as u32
+        min = 128 as u32
+    } else if b0 >= 224 as u32 && b0 <= 239 as u32 {
+        need = 2
+        cp = b0 & 15 as u32
+        min = 2048 as u32
+    } else if b0 >= 240 as u32 && b0 <= 244 as u32 {
+        need = 3
+        cp = b0 & 7 as u32
+        min = 65536 as u32
+    } else {
+        return 56320 as u32 + b0
+    }
+    if i + need >= s.n {
+        return 56320 as u32 + b0
+    }
+    var k: usize = 1
+    while k <= need {
+        let b: u32 = (*(s.p + i + k)) as u32
+        if (b & 192 as u32) != 128 as u32 {
+            return 56320 as u32 + b0
+        }
+        cp = (cp << 6) | (b & 63 as u32)
+        k = k + 1
+    }
+    if cp < min || cp > 1114111 as u32 || (cp >= 55296 as u32 && cp <= 57343 as u32) {
+        return 56320 as u32 + b0
+    }
+    *len = need + 1
+    return cp
+}
+
+// ---------------------------------------------------------------- fnmatch
+
+const G_NONE: usize = 18446744073709551615
+
+// `s` holds one of `* ? [`.
+fn has_magic(s: str) -> bool {
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = *(s.p + i)
+        if c == G_STAR || c == G_QUEST || c == G_OPEN {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Index of the `]` that closes the class opened by the `[` at `i`, or G_NONE
+// (then the `[` is an ordinary character). A `]` straight after `[` or `[!`
+// belongs to the class.
+fn class_end(pat: str, i: usize) -> usize {
+    var j: usize = i + 1
+    if j < pat.n && *(pat.p + j) == G_BANG {
+        j = j + 1
+    }
+    if j < pat.n && *(pat.p + j) == G_CLOSE {
+        j = j + 1
+    }
+    while j < pat.n && *(pat.p + j) != G_CLOSE {
+        j = j + 1
+    }
+    if j >= pat.n {
+        return G_NONE
+    }
+    return j
+}
+
+// Is the character `cp` in the class whose inside is pat[lo, hi)?
+fn class_has(pat: str, lo: usize, hi: usize, cp: u32) -> bool {
+    var i: usize = lo
+    var negate: bool = false
+    if i < hi && *(pat.p + i) == G_BANG {
+        negate = true
+        i = i + 1
+    }
+    var hit: bool = false
+    var l1: usize = 0
+    var l2: usize = 0
+    while i < hi {
+        let c1: u32 = cp_at(pat, i, &l1)
+        i = i + l1
+        // `x-y` is a range when something follows the dash; a range written backwards holds nothing
+        if i + 1 < hi && *(pat.p + i) == G_DASH {
+            let c2: u32 = cp_at(pat, i + 1, &l2)
+            i = i + 1 + l2
+            if c1 > c2 {
+                // a range written backwards: Python's translate() cuts such ranges out of the
+                // text of the class, and what is left can read differently (see class_has_cut)
+                return class_has_cut(pat, lo, hi, cp)
+            }
+            if cp >= c1 && cp <= c2 {
+                hit = true
+            }
+        } else if cp == c1 {
+            hit = true
+        }
+    }
+    return hit != negate
+}
+
+const G_MARK: u32 = 4294967295 // an unescaped dash between two chunks of a class
+
+// The exact translation of fnmatch.translate for a class that holds a range
+// written backwards. Python cuts the two ends of such a range out of the class
+// text and then reads what is left as a regular expression class; the leftovers
+// can be a different class (`[]--!]` becomes "!", which means ANY character;
+// `[b-a!c]` becomes `[^c]`). Reproduced step by step so that the answers agree
+// even in these corners: split at the dashes (a dash is a separator unless it is
+// the first member, or one of the two characters behind a separator), cut the
+// backwards ranges from the last to the first, then read the result like `re`
+// reads a set. A class Python would refuse (an empty chunk) matches nothing.
+fn class_has_cut(pat: str, lo: usize, hi: usize, cp: u32) -> bool {
+    var cs: Vec[u32] = vec_new[u32]()
+    var i: usize = lo
+    var l: usize = 0
+    while i < hi {
+        vec_push[u32](&cs, cp_at(pat, i, &l))
+        i = i + l
+    }
+    let n: usize = vec_len[u32](&cs)
+    var t: Vec[u32] = vec_new[u32]()
+    var start: usize = 0
+    var k: usize = 1
+    if n > 0 && vec_at[u32](&cs, 0) == 33 as u32 {
+        k = 2
+    }
+    while true {
+        var f: usize = k
+        while f < n && vec_at[u32](&cs, f) != 45 as u32 {
+            f = f + 1
+        }
+        if f >= n {
+            break
+        }
+        var j: usize = start
+        while j < f {
+            vec_push[u32](&t, vec_at[u32](&cs, j))
+            j = j + 1
+        }
+        vec_push[u32](&t, G_MARK)
+        start = f + 1
+        k = f + 3
+    }
+    if start < n {
+        var j: usize = start
+        while j < n {
+            vec_push[u32](&t, vec_at[u32](&cs, j))
+            j = j + 1
+        }
+    } else {
+        // an empty last chunk: the dash belongs to the chunk before it
+        vec_pop[u32](&t)
+        vec_push[u32](&t, 45 as u32)
+    }
+    var marks: usize = 0
+    var q: usize = 0
+    while q < vec_len[u32](&t) {
+        if vec_at[u32](&t, q) == G_MARK {
+            marks = marks + 1
+        }
+        q = q + 1
+    }
+    var ok: bool = true
+    while marks >= 1 && ok {
+        // the position of the marks-th mark
+        var seen: usize = 0
+        var m: usize = 0
+        q = 0
+        while q < vec_len[u32](&t) {
+            if vec_at[u32](&t, q) == G_MARK {
+                seen = seen + 1
+                if seen == marks {
+                    m = q
+                    break
+                }
+            }
+            q = q + 1
+        }
+        let len: usize = vec_len[u32](&t)
+        if m == 0 || m + 1 >= len || vec_at[u32](&t, m - 1) == G_MARK || vec_at[u32](&t, m + 1) == G_MARK {
+            ok = false
+        } else if vec_at[u32](&t, m - 1) > vec_at[u32](&t, m + 1) {
+            vec_remove[u32](&t, m + 1)
+            vec_remove[u32](&t, m)
+            vec_remove[u32](&t, m - 1)
+        }
+        marks = marks - 1
+    }
+    var hit: bool = false
+    var negate: bool = false
+    let len: usize = vec_len[u32](&t)
+    if ok && len > 0 {
+        if len == 1 && vec_at[u32](&t, 0) == 33 as u32 {
+            // "!" alone: a negated empty set, which is any character
+            hit = true
+        } else {
+            var p: usize = 0
+            if vec_at[u32](&t, 0) == 33 as u32 {
+                negate = true
+                p = 1
+            }
+            while p < len {
+                var c1: u32 = vec_at[u32](&t, p)
+                if c1 == G_MARK {
+                    c1 = 45 as u32
+                }
+                p = p + 1
+                if p < len && vec_at[u32](&t, p) == G_MARK {
+                    if p + 1 < len {
+                        var c2: u32 = vec_at[u32](&t, p + 1)
+                        if c2 == G_MARK {
+                            c2 = 45 as u32
+                        }
+                        p = p + 2
+                        if c1 <= c2 && cp >= c1 && cp <= c2 {
+                            hit = true
+                        }
+                    } else {
+                        // a dash at the very end is an ordinary dash
+                        p = p + 1
+                        if cp == c1 || cp == 45 as u32 {
+                            hit = true
+                        }
+                    }
+                } else if cp == c1 {
+                    hit = true
+                }
+            }
+        }
+    }
+    vec_free[u32](&cs)
+    vec_free[u32](&t)
+    if !ok {
+        return false
+    }
+    return hit != negate
+}
+
+// Does the single pattern item at `pi` match the character at `ni`? Returns
+// the index after the item in the pattern, or G_NONE; `*used` gets the bytes
+// of the name that it ate.
+fn item_match(pat: str, pi: usize, name: str, ni: usize, used: *mut usize) -> usize {
+    var nl: usize = 0
+    let cn: u32 = cp_at(name, ni, &nl)
+    let c: u8 = *(pat.p + pi)
+    if c == G_QUEST {
+        *used = nl
+        return pi + 1
+    }
+    if c == G_OPEN {
+        let e: usize = class_end(pat, pi)
+        if e != G_NONE {
+            if class_has(pat, pi + 1, e, cn) {
+                *used = nl
+                return e + 1
+            }
+            return G_NONE
+        }
+    }
+    var pl: usize = 0
+    let cp: u32 = cp_at(pat, pi, &pl)
+    if cp == cn {
+        *used = nl
+        return pi + pl
+    }
+    return G_NONE
+}
+
+// fnmatch.fnmatchcase: does `name` match the shell pattern `pat`?
+// Linear in the pattern for each name byte at worst (no exponential backtracking).
+fn matches(pat: str, name: str) -> bool {
+    var pi: usize = 0
+    var ni: usize = 0
+    var star_pi: usize = G_NONE
+    var star_ni: usize = 0
+    var used: usize = 0
+    while true {
+        var failed: bool = false
+        if pi < pat.n {
+            if *(pat.p + pi) == G_STAR {
+                while pi < pat.n && *(pat.p + pi) == G_STAR {
+                    pi = pi + 1
+                }
+                if pi == pat.n {
+                    return true
+                }
+                star_pi = pi
+                star_ni = ni
+                continue
+            }
+            if ni < name.n {
+                let np: usize = item_match(pat, pi, name, ni, &used)
+                if np == G_NONE {
+                    failed = true
+                } else {
+                    pi = np
+                    ni = ni + used
+                }
+            } else {
+                failed = true
+            }
+        } else if ni == name.n {
+            return true
+        } else {
+            failed = true
+        }
+        if failed {
+            // let the last `*` eat one more character and try again
+            if star_pi == G_NONE || star_ni >= name.n {
+                return false
+            }
+            var sl: usize = 0
+            cp_at(name, star_ni, &sl)
+            star_ni = star_ni + sl
+            ni = star_ni
+            pi = star_pi
+        }
+    }
+    return false
+}
+
+// Python's glob.escape: puts every `*`, `?` and `[` of `s` in square brackets,
+// so that the result matches exactly `s`. Appends to `out`.
+fn escape(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = *(s.p + i)
+        if c == G_STAR || c == G_QUEST || c == G_OPEN {
+            rt.buf_push(out, G_OPEN)
+            rt.buf_push(out, c)
+            rt.buf_push(out, G_CLOSE)
+        } else {
+            rt.buf_push(out, c)
+        }
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------------ paths
+
+// os.path.split: the length of the head+slashes part. head = p[..k] without
+// its trailing slashes (unless it is only slashes), tail = p[k..].
+fn tail_start(p: str) -> usize {
+    var i: usize = p.n
+    while i > 0 && *(p.p + i - 1) != G_SLASH {
+        i = i - 1
+    }
+    return i
+}
+
+fn head_of(p: str) -> str {
+    let k: usize = tail_start(p)
+    var e: usize = k
+    var all_slash: bool = true
+    var i: usize = 0
+    while i < k {
+        if *(p.p + i) != G_SLASH {
+            all_slash = false
+        }
+        i = i + 1
+    }
+    if !all_slash {
+        while e > 0 && *(p.p + e - 1) == G_SLASH {
+            e = e - 1
+        }
+    }
+    return str { p: p.p, n: e }
+}
+
+fn tail_of(p: str) -> str {
+    let k: usize = tail_start(p)
+    return str { p: p.p + k, n: p.n - k }
+}
+
+fn push_str(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+// os.path.join(a, b) of two names, appended to `out`
+fn push_join(out: *mut rt.Buf, a: str, b: str) {
+    if b.n > 0 && *b.p == G_SLASH {
+        push_str(out, b)
+        return
+    }
+    push_str(out, a)
+    if a.n > 0 && *(a.p + a.n - 1) != G_SLASH {
+        rt.buf_push(out, G_SLASH)
+    }
+    push_str(out, b)
+}
+
+// glob._join: like os.path.join, but an empty side gives the other one
+fn push_join_nonempty(out: *mut rt.Buf, a: str, b: str) {
+    if a.n == 0 {
+        push_str(out, b)
+    } else if b.n == 0 {
+        push_str(out, a)
+    } else {
+        push_join(out, a, b)
+    }
+}
+
+fn view(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+// Names are stored NUL-terminated one after the other; the one at `at`
+fn name_at(b: *mut rt.Buf, at: usize) -> str {
+    let base: *mut u8 = rt.buf_data(b)
+    var e: usize = at
+    let total: usize = rt.buf_len(b)
+    while e < total && *(base + e) != 0 as u8 {
+        e = e + 1
+    }
+    return str { p: base + at, n: e - at }
+}
+
+fn lexists(path: str) -> bool {
+    let info: fs.FileInfo = fs.lstat(path) catch fs.FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    return info.kind != 255 as u8
+}
+
+// -------------------------------------------------------------- directories
+
+// What `entries` keeps per name: a flag octet, the name, a NUL.
+const E_DIR: u8 = 1 // a directory (a link to one counts)
+const E_LINK: u8 = 2 // a symbolic link
+
+// The entries of directory `path` ("" = the current one) appended to `out`.
+// With `flags` the E_DIR / E_LINK octet is right (costs a stat for links and
+// for file systems that do not say the type); without it it is 0.
+// `dironly` drops everything that is not a directory (needs the flags).
+#[allow_escape]
+fn entries(path: str, dironly: bool, flags: bool, out: *mut rt.Buf) {
+    var d: dir.Dir = dir.open(path_or_dot(path))
+    if !dir.is_open(&d) {
+        return
+    }
+    let want: bool = flags || dironly
+    while dir.next(&d) {
+        let name: str = d.name
+        var f: u8 = 0 as u8
+        if want {
+            if d.kind == dir.KIND_DIR {
+                f = E_DIR
+            } else if d.kind == dir.KIND_LINK || d.kind == dir.KIND_UNKNOWN {
+                var full: rt.Buf = rt.buf_new()
+                push_join_nonempty(&full, path, name)
+                let info: fs.FileInfo = fs.lstat(view(&full)) catch fs.FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+                if info.kind == fs.KIND_LINK {
+                    f = E_LINK
+                    if fs.is_dir(view(&full)) {
+                        f = f | E_DIR
+                    }
+                } else if info.kind == fs.KIND_DIR {
+                    f = E_DIR
+                }
+                rt.buf_free(&full)
+            }
+        }
+        if dironly && (f & E_DIR) == 0 as u8 {
+            continue
+        }
+        rt.buf_push(out, f)
+        push_str(out, name)
+        rt.buf_push(out, 0 as u8)
+    }
+    dir.close(&d)
+}
+
+fn path_or_dot(path: str) -> str {
+    if path.n == 0 {
+        return "."
+    }
+    return path
+}
+
+// ------------------------------------------------------------------ expand
+
+struct Ctx {
+    root: str,
+    recursive: bool,
+    hidden: bool,
+    follow: bool,
+}
+
+fn is_recursive(s: str) -> bool {
+    return s.n == 2 && *s.p == G_STAR && *(s.p + 1) == G_STAR
+}
+
+fn push_name(out: *mut rt.Buf, s: str) {
+    push_str(out, s)
+    rt.buf_push(out, 0 as u8)
+}
+
+// glob._glob1: the entries of `dirfs` that match `pattern`
+fn glob1(c: *mut Ctx, dirfs: str, pattern: str, dironly: bool, out: *mut rt.Buf) {
+    var list: rt.Buf = rt.buf_new()
+    entries(dirfs, dironly, false, &list)
+    // a pattern that starts with `.` sees the hidden names; any other does not (unless GLOB_HIDDEN is set)
+    let sees_hidden: bool = (*c).hidden || (pattern.n > 0 && *pattern.p == G_DOT)
+    var at: usize = 0
+    let total: usize = rt.buf_len(&list)
+    while at < total {
+        let name: str = name_at(&list, at + 1)
+        at = at + 1 + name.n + 1
+        if !sees_hidden && name.n > 0 && *name.p == G_DOT {
+            continue
+        }
+        if matches(pattern, name) {
+            push_name(out, name)
+        }
+    }
+    rt.buf_free(&list)
+}
+
+// glob._glob0: the literal name `basename` in `dirfs` (or, for an empty
+// basename, the directory itself)
+fn glob0(dirfs: str, basename: str, out: *mut rt.Buf) {
+    if basename.n > 0 {
+        var full: rt.Buf = rt.buf_new()
+        push_join_nonempty(&full, dirfs, basename)
+        if lexists(view(&full)) {
+            push_name(out, basename)
+        }
+        rt.buf_free(&full)
+    } else if fs.is_dir(dirfs) {
+        push_name(out, "")
+    }
+}
+
+// glob._rlistdir: every name below `dirfs`, relative to it, appended with the prefix `rel`
+fn rlist(c: *mut Ctx, dirfs: str, rel: str, dironly: bool, hops: u32, out: *mut rt.Buf) {
+    var list: rt.Buf = rt.buf_new()
+    entries(dirfs, dironly, true, &list)
+    var at: usize = 0
+    let total: usize = rt.buf_len(&list)
+    while at < total {
+        let f: u8 = *(rt.buf_data(&list) + at)
+        let name: str = name_at(&list, at + 1)
+        at = at + 1 + name.n + 1
+        if !(*c).hidden && name.n > 0 && *name.p == G_DOT {
+            continue
+        }
+        var r: rt.Buf = rt.buf_new()
+        push_str(&r, rel)
+        push_str(&r, name)
+        push_name(out, view(&r))
+        var descend: bool = (f & E_DIR) != 0 as u8
+        var next_hops: u32 = hops
+        if (f & E_LINK) != 0 as u8 {
+            if (*c).follow && hops < G_MAX_HOPS {
+                next_hops = hops + 1
+            } else {
+                descend = false
+            }
+        }
+        if descend {
+            var sub: rt.Buf = rt.buf_new()
+            push_join_nonempty(&sub, dirfs, name)
+            rt.buf_push(&r, G_SLASH)
+            rlist(c, view(&sub), view(&r), dironly, next_hops, out)
+            rt.buf_free(&sub)
+        }
+        rt.buf_free(&r)
+    }
+    rt.buf_free(&list)
+}
+
+// glob._glob2: "" (the directory itself) and everything below it
+fn glob2(c: *mut Ctx, dirfs: str, dironly: bool, out: *mut rt.Buf) {
+    if dirfs.n == 0 || fs.is_dir(dirfs) {
+        push_name(out, "")
+        rlist(c, dirfs, "", dironly, 0, out)
+    }
+}
+
+// glob._iglob: the names that match `pathname`, appended to `out` (NUL after each), in no order
+fn iglob(c: *mut Ctx, pathname: str, dironly: bool, out: *mut rt.Buf) {
+    let dirname: str = head_of(pathname)
+    let basename: str = tail_of(pathname)
+    if !has_magic(pathname) {
+        var full: rt.Buf = rt.buf_new()
+        if basename.n > 0 {
+            push_join_nonempty(&full, (*c).root, pathname)
+            if lexists(view(&full)) {
+                push_name(out, pathname)
+            }
+        } else {
+            push_join_nonempty(&full, (*c).root, dirname)
+            if fs.is_dir(view(&full)) {
+                push_name(out, pathname)
+            }
+        }
+        rt.buf_free(&full)
+        return
+    }
+    if dirname.n == 0 {
+        if (*c).recursive && is_recursive(basename) {
+            glob2(c, (*c).root, dironly, out)
+        } else {
+            glob1(c, (*c).root, basename, dironly, out)
+        }
+        return
+    }
+    // the directories the last part is looked for in
+    var dirs: rt.Buf = rt.buf_new()
+    if dirname.n != pathname.n && has_magic(dirname) {
+        iglob(c, dirname, true, &dirs)
+    } else {
+        push_name(&dirs, dirname)
+    }
+    var kind: u8 = 0 as u8 // 0 literal, 1 pattern, 2 `**`
+    if has_magic(basename) {
+        kind = 1 as u8
+        if (*c).recursive && is_recursive(basename) {
+            kind = 2 as u8
+        }
+    }
+    var at: usize = 0
+    let total: usize = rt.buf_len(&dirs)
+    while at < total {
+        let d: str = name_at(&dirs, at)
+        at = at + d.n + 1
+        var fsdir: rt.Buf = rt.buf_new()
+        push_join_nonempty(&fsdir, (*c).root, d)
+        var names: rt.Buf = rt.buf_new()
+        if kind == 0 as u8 {
+            glob0(view(&fsdir), basename, &names)
+        } else if kind == 1 as u8 {
+            glob1(c, view(&fsdir), basename, dironly, &names)
+        } else {
+            glob2(c, view(&fsdir), dironly, &names)
+        }
+        var nat: usize = 0
+        let ntotal: usize = rt.buf_len(&names)
+        while nat < ntotal {
+            let nm: str = name_at(&names, nat)
+            nat = nat + nm.n + 1
+            var joined: rt.Buf = rt.buf_new()
+            push_join(&joined, d, nm)
+            push_name(out, view(&joined))
+            rt.buf_free(&joined)
+        }
+        rt.buf_free(&names)
+        rt.buf_free(&fsdir)
+    }
+    rt.buf_free(&dirs)
+}
+
+// ------------------------------------------------------------------- sorting
+
+// bytewise order of two NUL-terminated names in `base`
+fn name_less(base: *mut u8, a: usize, b: usize) -> bool {
+    var i: usize = 0
+    while true {
+        let x: u8 = *(base + a + i)
+        let y: u8 = *(base + b + i)
+        if x != y {
+            return x < y
+        }
+        if x == 0 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// merge sort of the offsets in `v` by the names they point to
+fn sort_offsets(v: *mut Vec[usize], base: *mut u8) {
+    let n: usize = vec_len[usize](v)
+    if n < 2 {
+        return
+    }
+    var tmp: Vec[usize] = vec_new[usize]()
+    vec_reserve[usize](&tmp, n)
+    var i: usize = 0
+    while i < n {
+        vec_push[usize](&tmp, 0)
+        i = i + 1
+    }
+    var width: usize = 1
+    var from_v: bool = true
+    while width < n {
+        var lo: usize = 0
+        while lo < n {
+            var mid: usize = lo + width
+            if mid > n {
+                mid = n
+            }
+            var hi: usize = lo + 2 * width
+            if hi > n {
+                hi = n
+            }
+            var a: usize = lo
+            var b: usize = mid
+            var k: usize = lo
+            while k < hi {
+                var take_a: bool = false
+                if a < mid {
+                    if b >= hi {
+                        take_a = true
+                    } else {
+                        let av: usize = merge_get(v, &tmp, from_v, a)
+                        let bv: usize = merge_get(v, &tmp, from_v, b)
+                        take_a = !name_less(base, bv, av)
+                    }
+                }
+                if take_a {
+                    merge_put(v, &tmp, from_v, k, merge_get(v, &tmp, from_v, a))
+                    a = a + 1
+                } else {
+                    merge_put(v, &tmp, from_v, k, merge_get(v, &tmp, from_v, b))
+                    b = b + 1
+                }
+                k = k + 1
+            }
+            lo = lo + 2 * width
+        }
+        from_v = !from_v
+        width = width * 2
+    }
+    if !from_v {
+        // the last pass wrote into tmp
+        var j: usize = 0
+        while j < n {
+            vec_set[usize](v, j, vec_at[usize](&tmp, j))
+            j = j + 1
+        }
+    }
+    vec_free[usize](&tmp)
+}
+
+fn merge_get(v: *mut Vec[usize], t: *mut Vec[usize], from_v: bool, i: usize) -> usize {
+    if from_v {
+        return vec_at[usize](v, i)
+    }
+    return vec_at[usize](t, i)
+}
+
+fn merge_put(v: *mut Vec[usize], t: *mut Vec[usize], from_v: bool, i: usize, x: usize) {
+    if from_v {
+        vec_set[usize](t, i, x)
+    } else {
+        vec_set[usize](v, i, x)
+    }
+}
+
+// ---------------------------------------------------------------- the calls
+
+// Names matching `pat`, relative to `root` ("" = the current directory), with
+// the flags GLOB_RECURSIVE / GLOB_HIDDEN / GLOB_FOLLOW. Appends them sorted
+// to `out`, each followed by a NUL; returns how many. 0 for no match.
+fn expand_in(root: str, pat: str, flags: u32, out: *mut rt.Buf) -> usize {
+    var c: Ctx = Ctx {
+        root: root,
+        recursive: (flags & GLOB_RECURSIVE) != 0 as u32,
+        hidden: (flags & GLOB_HIDDEN) != 0 as u32,
+        follow: (flags & GLOB_FOLLOW) != 0 as u32,
+    }
+    var raw: rt.Buf = rt.buf_new()
+    iglob(&c, pat, false, &raw)
+    var offs: Vec[usize] = vec_new[usize]()
+    var at: usize = 0
+    let total: usize = rt.buf_len(&raw)
+    var first: bool = true
+    // Python drops the leading "" that `**` yields when the pattern starts with it
+    let drop_first: bool = pat.n == 0 || (c.recursive && pat.n >= 2 && *pat.p == G_STAR && *(pat.p + 1) == G_STAR)
+    while at < total {
+        let nm: str = name_at(&raw, at)
+        if !(first && drop_first && nm.n == 0) {
+            vec_push[usize](&offs, at)
+        }
+        first = false
+        at = at + nm.n + 1
+    }
+    sort_offsets(&offs, rt.buf_data(&raw))
+    var i: usize = 0
+    let n: usize = vec_len[usize](&offs)
+    while i < n {
+        push_name(out, name_at(&raw, vec_at[usize](&offs, i)))
+        i = i + 1
+    }
+    vec_free[usize](&offs)
+    rt.buf_free(&raw)
+    return n
+}
+
+fn expand_opts(pat: str, flags: u32, out: *mut rt.Buf) -> usize {
+    return expand_in("", pat, flags, out)
+}
+
+// `expand_opts` without flags: `**` is an ordinary `*`, hidden names stay hidden.
+fn expand(pat: str, out: *mut rt.Buf) -> usize {
+    return expand_in("", pat, 0 as u32, out)
+}
+
+// The `i`-th name (from 0) of a result list, "" past the end. Valid until the
+// buffer changes. A scan from the start: for a loop over all names walk the
+// buffer yourself (names are NUL terminated) or accept the quadratic cost on lists of a few thousand.
+fn nth(out: *mut rt.Buf, i: usize) -> str {
+    var at: usize = 0
+    var k: usize = 0
+    let total: usize = rt.buf_len(out)
+    while at < total {
+        let nm: str = name_at(out, at)
+        if k == i {
+            return nm
+        }
+        at = at + nm.n + 1
+        k = k + 1
+    }
+    return ""
+}
+
+// How many names a result list holds.
+fn count_names(out: *mut rt.Buf) -> usize {
+    var at: usize = 0
+    var k: usize = 0
+    let total: usize = rt.buf_len(out)
+    while at < total {
+        at = at + name_at(out, at).n + 1
+        k = k + 1
+    }
+    return k
+}
