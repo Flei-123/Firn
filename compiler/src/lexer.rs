@@ -357,6 +357,19 @@ impl<'a> Lexer<'a> {
                 Some(c) if is_ascii_blank(c) => {
                     self.bump();
                 }
+                // Shebang: `#!` as the very first two characters of a file is
+                // a line comment (`#!/usr/bin/env firn-run`). Only at offset 0
+                // -- a `#!` anywhere else stays an error. The line break is
+                // kept, so all line numbers stay stable. Must match
+                // `skip` in lib/firnc1/lexer.fi.
+                Some('#') if self.pos == 0 && self.peek2() == Some('!') => {
+                    while let Some(c) = self.peek() {
+                        if c == '\n' {
+                            break;
+                        }
+                        self.bump();
+                    }
+                }
                 Some('/') if self.peek2() == Some('/') => {
                     while let Some(c) = self.peek() {
                         if c == '\n' {
