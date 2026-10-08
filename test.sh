@@ -1802,6 +1802,8 @@ if [ "$CSVRC" -eq 0 ]; then
 else
     bad "tools/csv_cross/run.sh failed (see .test-work/csv_cross.log)"
     grep -E 'FAIL|DIFF|differ' "$WORK/csv_cross.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 102. std.fsx against Python and cp: 500 random trees, 150 files, 6000 path pairs, 6000 fnmatch pairs (tools/fsx_cross/run.sh, r314) =="
 # tests/2341 (temp dirs, registry, copy_file) and tests/2342 (fnmatch, copy_tree, walk, paths) are in section 3.
 # Here std.fsx is held against shutil.copytree and `cp -a` on random trees (plain / ignore / dirs_exist_ok /
