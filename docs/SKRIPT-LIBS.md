@@ -177,6 +177,9 @@ Cross-check: random documents → `json.dumps`.
 * Measured (tools/jsonsort_cross/run.sh): 3300 random documents × 11 variants = 35,390 outputs compared byte for byte with `json.dumps` (10,433 objects, 7,193 floats,
   15,497 integers, 45,435 strings and keys, nested up to 120 deep, quotes/controls/DEL/accents/CJK/emoji/U+2028, prefix keys, UTF-16-order traps): 0 differences.
   Writer fuzz (20,000 mutated / junk documents, 6,437 parse, 64,370 round trips parse → write → parse → write): 0 failures, no crash.
+* Speed (release-fast, loaded server): 100,000 random floats in a 2 MB document, parse + 11 writes: 6.4 s, i.e. about 0.5 s per write; Python's `json.dumps` needs
+  0.1 s. The remainder is the exact big-number digit generation of `dtoa` (about 5 µs per float); before the scratch memory of `dtoa` was handed in once per
+  document (`json_write_opts` only) it was 3.6 s per write, almost all of it 2 mmap/munmap pairs per number. The old `json_write` still pays them.
 * Other targets: tests 2360/2361 pass on aarch64-linux (qemu) and x86_64-windows (wine); `jsonsort_cli dumps` on 300 documents × 11 variants is byte for byte
   the x86-64 answer on both. The whole lib is `rt`/`str`/`num` only, so nothing is Linux specific.
 
