@@ -183,10 +183,22 @@ Cross-check: random documents → `json.dumps`.
 * Other targets: tests 2360/2361 pass on aarch64-linux (qemu) and x86_64-windows (wine); `jsonsort_cli dumps` on 300 documents × 11 variants is byte for byte
   the x86-64 answer on both. The whole lib is `rt`/`str`/`num` only, so nothing is Linux specific.
 
-### std.xml — `lib/std/xml.fi` (r319, optional, small)
-Well-formed XML only, no DTD/XSD/XPath: elements, attributes, text, CDATA, comments skipped, five entities + numeric references,
-namespaces as plain `prefix:name` strings. Flat node arrays (like `std.json`). `xml.parse`, `xml.child`, `xml.children_named`, `xml.attr`,
-`xml.text`, errors with line/column. Cross-check: `xml.etree.ElementTree` on random documents; fuzz.
+### std.xml — `lib/std/xml.fi` (r319) — DONE (08.10.2026)
+**Landed API:** `xml.doc_new()` / `xml.doc_free(&d)`; `xml.parse(&d, p, n)` / `xml.parse_str(&d, s)` (error union `XmlError`, then
+`xml.err_line/err_col/err_code/err_text(&d)` — 1-based, columns count characters); `xml.root`, `xml.kind` (`xml.ELEMENT`/`xml.TEXT`),
+`xml.name`, `xml.text` (an element: the text before its first child, like `Element.text`; a text node: its text), `xml.text_all(&d, i, &out)`
+(`itertext`), `xml.first/last/next/parent/child_count/line`; attributes `xml.attr(&d, el, "id")` ("" if absent), `xml.has_attr`,
+`xml.attr_count/attr_name/attr_value` (document order); `xml.child(&d, el, "name")`, `xml.next_named(&d, i, "name")`,
+`xml.children_named(&d, el, "name", out_ptr, cap)` (returns how many there ARE, fills at most `cap`); `xml.write(&d, node, &out)`
+(compact, iterative, round trip). Text in and out is `str`. Elements and text are siblings in document order; adjacent text/CDATA/references
+are one text node; comments and PIs leave nothing. Strict: a DOCTYPE, an encoding other than UTF-8, a missing/mismatched end tag,
+`]]>` in text, an undefined entity, `&#0;`, a control character, invalid UTF-8, a misplaced XML declaration ... are errors with
+position (all in the header of `lib/std/xml.fi`, HONEST list X1–X8). Proof: tests 2320–2322, `tools/xml_cross/run.sh` (test.sh section
+110: Python expat/`xml.etree` on 3,000 valid + 6,000 mutated documents, fuzz with a guard page behind the input, leak check,
+counter-checks), `examples/xml_read.fi`. Deviations from the sketch: the names are `doc_new/doc_free/parse/parse_str` (module-qualified,
+no `xml_` prefix), `xml.text` of an element is the first text only (use `text_all` for the rest). The cross-check's Python side is expat
+driven the way `xml.etree` drives it but WITHOUT namespace processing (ET itself rewrites `p:x` to `{uri}x` and refuses unbound prefixes);
+for documents with no colon it also asserts that `ET.fromstring` gives the same tree.
 
 ### Regex lookaround — `lib/regex/regex.fi` (was r320 in the sketch) — DONE (08.10.2026), answer: YES, polynomial
 `(?=X)`, `(?!X)`, `(?<=X)`, `(?<!X)` are supported, without backreferences, in the Pike VM: a lookaround is a zero-width instruction that
