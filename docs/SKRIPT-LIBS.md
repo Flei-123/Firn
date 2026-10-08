@@ -25,7 +25,9 @@ program that does what a 40-line Python check script does should not need
 
 ## Libraries
 
-### std.csv — `lib/std/csv.fi` (r313)
+### std.csv — `lib/std/csv.fi` (r313) — DONE (08.10.2026)
+**Landed API differences to the sketch below:** `error` is a keyword in Firn, so the reader's error is `csv.error_code(&r)` (+ `error_row`, `error_line`, `error_errno`, `error_text`, constants `csv.E_NONE/E_UNTERMINATED/E_BAD_QUOTE/E_IO`); the writer's setters are `set_writer_delimiter/_quote/_doublequote` and `set_terminator`; `reader_str(s)`, `reader_fd_sized(fd, n)`, `set_quote`, `set_doublequote`, `set_strict` (default strict = errors, `false` = Python's default), `table_load(&reader)`, `has_cell`, `row_len`, `csv.NO_COL`. Proof: `tools/csv_cross/run.sh` (test.sh section 101), tests 2300–2302, `examples/csv_report.fi`.
+
 Mirrors Python's `csv` (dialect: `delimiter`, `quotechar`, `doublequote`, `lineterminator`).
 ```
 var r: csv.Reader = csv.reader(p, n)                  // over memory

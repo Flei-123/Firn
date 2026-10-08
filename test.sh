@@ -1789,6 +1789,21 @@ else
     grep FAIL "$WORK/testkit.log" | head -10 | sed 's/^/   /' || true
 fi
 
+echo "== 113. std.csv against Python's csv module, and a fuzz run (tools/csv_cross/run.sh, r313) =="
+# tests/2300-2302 and examples/csv_report.fi are in section 3. Here lib/std/csv.fi is held against csv.reader / csv.writer:
+# thousands of random inputs with hostile bytes (read over memory and streamed with read sizes 1, 3, 64, 65536; strict and
+# non-strict; rows, error kind and error line; writer output and read back), then a fuzz run of the parser built with
+# --opt-level=release-safe (memory against stream, round trip of random tables, memory flat), and two counter-checks (a
+# library with a planted bug has to be caught). CSV_CASES / CSV_FUZZ / CSV_SEEDS scale it.
+bash tools/csv_cross/run.sh > "$WORK/csv_cross.log" 2>&1 && CSVRC=0 || CSVRC=$?
+if [ "$CSVRC" -eq 0 ]; then
+    ok
+    grep -E '^csv_cross:|counter-check' "$WORK/csv_cross.log" | sed 's/^/   /'
+else
+    bad "tools/csv_cross/run.sh failed (see .test-work/csv_cross.log)"
+    grep -E 'FAIL|DIFF|differ' "$WORK/csv_cross.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

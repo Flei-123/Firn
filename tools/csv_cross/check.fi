@@ -1,0 +1,378 @@
+// tools/csv_cross/check.fi -- std.csv against Python's csv module.
+//
+//     check <cases file> <work dir>
+//
+// The cases file comes from tools/csv_cross/gen.py (the format is described
+// there): Python decided what `csv.reader` / `csv.writer` do with every case,
+// this program asks lib/std/csv.fi the same question and compares the answer
+// byte for byte.
+//
+// Every `R` case is read THREE ways that have to agree: over memory, and
+// streamed from a file with a read size of 1, 3, 64 or 65536 bytes (so rows
+// and quotes cross the chunk edge in all possible places). Every `W` case is
+// written, compared with Python's output, and -- when Python can read its own
+// output back -- read back by std.csv.
+//
+// Exit 0 = no difference. Prints the first differences and a count.
+import std.rt
+import std.str
+import std.fs
+import std.csv
+import std.vec
+
+static mut diffs: i64 = 0
+static mut shown: i64 = 0
+static mut cases: i64 = 0
+static mut cases_read: i64 = 0
+static mut cases_write: i64 = 0
+static mut stream_runs: i64 = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.length())
+}
+
+fn say_buf(b: *mut rt.Buf) {
+    rt.write_everything(1, rt.buf_ptr(b), rt.buf_len(b))
+}
+
+fn push(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+fn hexdigit(v: u8) -> u8 {
+    if v < 10 as u8 {
+        return 48 as u8 + v
+    }
+    return 87 as u8 + v
+}
+
+fn push_hex(b: *mut rt.Buf, p: *mut u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let c: u8 = *(p + i)
+        rt.buf_push(b, hexdigit(c >> 4))
+        rt.buf_push(b, hexdigit(c & 15 as u8))
+        i = i + 1
+    }
+}
+
+fn unhex(c: u8) -> u8 {
+    if c >= 97 as u8 {
+        return c - 87 as u8
+    }
+    return c - 48 as u8
+}
+
+// hex text (`n` digits) -> bytes appended to `b`
+fn push_unhex(b: *mut rt.Buf, p: *mut u8, n: usize) {
+    var i: usize = 0
+    while i + 1 < n {
+        rt.buf_push(b, (unhex(*(p + i)) << 4) | unhex(*(p + i + 1)))
+        i = i + 2
+    }
+}
+
+// the tokens of a line: packed `start << 32 | length`
+fn tokenize(line: str, toks: *mut Vec[u64]) {
+    vec_clear[u64](toks)
+    var i: usize = 0
+    while i < line.n {
+        while i < line.n && *(line.p + i) == 32 as u8 {
+            i = i + 1
+        }
+        let start: usize = i
+        while i < line.n && *(line.p + i) != 32 as u8 {
+            i = i + 1
+        }
+        if i > start {
+            vec_push[u64](toks, ((start as u64) << 32) | (i - start) as u64)
+        }
+    }
+}
+
+fn tok(line: str, toks: *mut Vec[u64], k: usize) -> str {
+    if k >= vec_len[u64](toks) {
+        return ""
+    }
+    let v: u64 = vec_at[u64](toks, k)
+    return str { p: line.p + (v >> 32) as usize, n: (v & 4294967295) as usize }
+}
+
+// the tokens from `k` on, joined by one space
+fn join_from(line: str, toks: *mut Vec[u64], k: usize, out: *mut rt.Buf) {
+    var i: usize = k
+    while i < vec_len[u64](toks) {
+        if i > k {
+            rt.buf_push(out, 32 as u8)
+        }
+        push(out, tok(line, toks, i))
+        i = i + 1
+    }
+}
+
+fn byte_of(t: str) -> u8 {
+    return (unhex(*t.p) << 4) | unhex(*(t.p + 1))
+}
+
+fn differ(what: str, line_no: i64, expected: *mut rt.Buf, got: *mut rt.Buf, input: str) {
+    diffs = diffs + 1
+    if shown < 12 {
+        shown = shown + 1
+        say("  DIFF  ")
+        say(what)
+        say(" case ")
+        var n: rt.Buf = rt.buf_new()
+        rt.buf_push_dec_i64(&n, line_no)
+        say_buf(&n)
+        rt.buf_free(&n)
+        say("\n    input    ")
+        say(input)
+        say("\n    expected ")
+        say_buf(expected)
+        say("\n    got      ")
+        say_buf(got)
+        say("\n")
+    }
+}
+
+// the reader's answer in the format of gen.py
+fn dump_reader(r: *mut csv.Reader, out: *mut rt.Buf) {
+    var rows: usize = 0
+    while csv.next_row(r) {
+        rows = rows + 1
+        push(out, "r")
+        var i: usize = 0
+        while i < csv.field_count(r) {
+            rt.buf_push(out, 58 as u8)
+            let f: str = csv.field(r, i)
+            push_hex(out, f.p, f.n)
+            i = i + 1
+        }
+        rt.buf_push(out, 32 as u8)
+    }
+    if csv.error_code(r) == csv.E_NONE {
+        push(out, "end")
+    } else {
+        push(out, "E")
+        rt.buf_push_dec_u64(out, csv.error_code(r) as u64)
+        push(out, "@")
+        rt.buf_push_dec_u64(out, csv.error_line(r) as u64)
+        if csv.error_row(r) != rows + 1 {
+            push(out, "!row")
+        }
+    }
+}
+
+fn set_dialect(r: *mut csv.Reader, d: u8, q: u8, dq: bool, strict: bool) {
+    csv.set_delimiter(r, d)
+    csv.set_quote(r, q)
+    csv.set_doublequote(r, dq)
+    csv.set_strict(r, strict)
+}
+
+fn path_str(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn read_case(line: str, line_no: i64, toks: *mut Vec[u64], work: str) {
+    let d: u8 = byte_of(tok(line, toks, 1))
+    let q: u8 = byte_of(tok(line, toks, 2))
+    let dq: bool = *tok(line, toks, 3).p == 49 as u8
+    let strict: bool = *tok(line, toks, 4).p == 49 as u8
+    let hexin: str = tok(line, toks, 5)
+    var input: rt.Buf = rt.buf_new()
+    push_unhex(&input, hexin.p + 1, hexin.n - 1)
+    var expected: rt.Buf = rt.buf_new()
+    join_from(line, toks, 6, &expected)
+
+    var got: rt.Buf = rt.buf_new()
+    var r: csv.Reader = csv.reader(rt.buf_data(&input), rt.buf_len(&input))
+    set_dialect(&r, d, q, dq, strict)
+    dump_reader(&r, &got)
+    csv.reader_free(&r)
+    if !(rt.buf_len(&got) == rt.buf_len(&expected) && rt.mem_eq(rt.buf_ptr(&got), rt.buf_ptr(&expected), rt.buf_len(&got))) {
+        differ("memory", line_no, &expected, &got, hexin)
+    }
+
+    // the same input streamed, with a read size that cuts it in all places
+    var sizes: [usize; 4] = [1, 3, 64, 65536]
+    var path: rt.Buf = rt.buf_new()
+    push(&path, work)
+    push(&path, "/case.csv")
+    fs.write_file(path_str(&path), rt.buf_ptr(&input), rt.buf_len(&input)) catch 0
+    let fd: i64 = fs.open_read(path_str(&path)) catch -1
+    if fd >= 0 {
+        var s: usize = 0
+        while s < 4 {
+            let rs: i64 = syscall(8, fd, 0, 0, 0, 0, 0) // lseek(fd, 0, SEEK_SET)
+            if rs < 0 {
+                break
+            }
+            var st: csv.Reader = csv.reader_fd_sized(fd, sizes[s])
+            set_dialect(&st, d, q, dq, strict)
+            var got2: rt.Buf = rt.buf_new()
+            dump_reader(&st, &got2)
+            csv.reader_free(&st)
+            stream_runs = stream_runs + 1
+            if !(rt.buf_len(&got2) == rt.buf_len(&expected) && rt.mem_eq(rt.buf_ptr(&got2), rt.buf_ptr(&expected), rt.buf_len(&got2))) {
+                differ("stream", line_no, &expected, &got2, hexin)
+            }
+            rt.buf_free(&got2)
+            s = s + 1
+        }
+        fs.close_fd(fd)
+    }
+    rt.buf_free(&path)
+    rt.buf_free(&got)
+    rt.buf_free(&expected)
+    rt.buf_free(&input)
+}
+
+fn write_case(line: str, line_no: i64, toks: *mut Vec[u64]) {
+    let d: u8 = byte_of(tok(line, toks, 1))
+    let q: u8 = byte_of(tok(line, toks, 2))
+    let dq: bool = *tok(line, toks, 3).p == 49 as u8
+    let termhex: str = tok(line, toks, 4)
+    let rt1: bool = *(tok(line, toks, 5).p + 2) == 49 as u8
+    var term: rt.Buf = rt.buf_new()
+    push_unhex(&term, termhex.p + 1, termhex.n - 1)
+    // rows are tokens 6 .. (the token "=")
+    var eq: usize = 6
+    while eq < vec_len[u64](toks) && !tok(line, toks, eq).equal("=") {
+        eq = eq + 1
+    }
+    var out: rt.Buf = rt.buf_new()
+    var w: csv.Writer = csv.writer(&out)
+    csv.set_writer_delimiter(&w, d)
+    csv.set_writer_quote(&w, q)
+    csv.set_writer_doublequote(&w, dq)
+    csv.set_terminator(&w, str { p: rt.buf_data(&term), n: rt.buf_len(&term) })
+    var failed: i64 = 0
+    // the rows that were written, as `r:..` tokens, to compare with the read back
+    var done: rt.Buf = rt.buf_new()
+    var k: usize = 6
+    while k < eq {
+        let t: str = tok(line, toks, k)
+        // fields: split at ':' (first piece is "r")
+        var i: usize = 1
+        var ok: bool = true
+        while i < t.n {
+            // i is at a ':'
+            var j: usize = i + 1
+            while j < t.n && *(t.p + j) != 58 as u8 {
+                j = j + 1
+            }
+            var f: rt.Buf = rt.buf_new()
+            push_unhex(&f, t.p + i + 1, j - i - 1)
+            if !csv.put_bytes(&w, rt.buf_data(&f), rt.buf_len(&f)) {
+                ok = false
+            }
+            rt.buf_free(&f)
+            i = j
+        }
+        if !csv.end_row(&w) {
+            failed = failed + 1
+        } else {
+            if rt.buf_len(&done) > 0 {
+                rt.buf_push(&done, 32 as u8)
+            }
+            push(&done, t)
+        }
+        k = k + 1
+    }
+    var expected: rt.Buf = rt.buf_new()
+    join_from(line, toks, eq + 1, &expected)
+    var got: rt.Buf = rt.buf_new()
+    push(&got, "x")
+    push_hex(&got, rt.buf_data(&out), rt.buf_len(&out))
+    push(&got, " f")
+    rt.buf_push_dec_i64(&got, failed)
+    if !(rt.buf_len(&got) == rt.buf_len(&expected) && rt.mem_eq(rt.buf_ptr(&got), rt.buf_ptr(&expected), rt.buf_len(&got))) {
+        differ("write", line_no, &expected, &got, termhex)
+    }
+    if rt1 {
+        var r: csv.Reader = csv.reader(rt.buf_data(&out), rt.buf_len(&out))
+        set_dialect(&r, d, q, dq, true)
+        var back: rt.Buf = rt.buf_new()
+        dump_reader(&r, &back)
+        csv.reader_free(&r)
+        var want: rt.Buf = rt.buf_new()
+        push(&want, str { p: rt.buf_data(&done), n: rt.buf_len(&done) })
+        if rt.buf_len(&want) > 0 {
+            rt.buf_push(&want, 32 as u8)
+        }
+        push(&want, "end")
+        if !(rt.buf_len(&back) == rt.buf_len(&want) && rt.mem_eq(rt.buf_ptr(&back), rt.buf_ptr(&want), rt.buf_len(&back))) {
+            differ("round trip", line_no, &want, &back, termhex)
+        }
+        rt.buf_free(&back)
+        rt.buf_free(&want)
+    }
+    rt.buf_free(&got)
+    rt.buf_free(&expected)
+    rt.buf_free(&done)
+    rt.buf_free(&out)
+    rt.buf_free(&term)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        say("usage: check <cases file> <work dir>\n")
+        return 2
+    }
+    let a1: u64 = rt.arg_ptr(start, 1)
+    let a2: u64 = rt.arg_ptr(start, 2)
+    let cases_path: str = str { p: a1 as *mut u8, n: rt.c_length(a1) }
+    let work: str = str { p: a2 as *mut u8, n: rt.c_length(a2) }
+    var data: rt.Buf = rt.buf_new()
+    fs.read_file(cases_path, &data) catch 0
+    if rt.buf_len(&data) == 0 {
+        say("no cases\n")
+        return 2
+    }
+    var toks: Vec[u64] = vec_new[u64]()
+    var at: usize = 0
+    let total: usize = rt.buf_len(&data)
+    let base: *mut u8 = rt.buf_data(&data)
+    while at < total {
+        var e: usize = at
+        while e < total && *(base + e) != 10 as u8 {
+            e = e + 1
+        }
+        let line: str = str { p: base + at, n: e - at }
+        at = e + 1
+        if line.n == 0 {
+            continue
+        }
+        cases = cases + 1
+        tokenize(line, &toks)
+        let kind: u8 = *tok(line, &toks, 0).p
+        if kind == 82 as u8 {
+            cases_read = cases_read + 1
+            read_case(line, cases, &toks, work)
+        } else if kind == 87 as u8 {
+            cases_write = cases_write + 1
+            write_case(line, cases, &toks)
+        }
+    }
+    vec_free[u64](&toks)
+    rt.buf_free(&data)
+    var o: rt.Buf = rt.buf_new()
+    push(&o, "csv cross-check: ")
+    rt.buf_push_dec_i64(&o, cases)
+    push(&o, " cases (")
+    rt.buf_push_dec_i64(&o, cases_read)
+    push(&o, " read, ")
+    rt.buf_push_dec_i64(&o, cases_write)
+    push(&o, " write), ")
+    rt.buf_push_dec_i64(&o, stream_runs)
+    push(&o, " streamed runs, ")
+    rt.buf_push_dec_i64(&o, diffs)
+    push(&o, " differences\n")
+    say_buf(&o)
+    rt.buf_free(&o)
+    if diffs != 0 {
+        return 1
+    }
+    return 0
+}
