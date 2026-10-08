@@ -1,0 +1,704 @@
+// tools/xml_cross/xml_cli.fi -- `lib/std/xml.fi` as a program (r319).
+//
+//     xml_cli check <in>                 exit 0 = accepted, 1 = refused (line:col: text on stderr)
+//     xml_cli dump  <in>                 the canonical tree dump on stdout (format below)
+//     xml_cli write <in> <out>           compact XML written by xml.write
+//     xml_cli cross <dir> <n>            compare dir/<i>.xml with dir/<i>.exp for i < n
+//     xml_cli guard <in>                 parse with an unmapped page right behind the input
+//     xml_cli overread <any>             the counter-check: reads ONE octet past the input; must die (SIGSEGV)
+//     xml_cli fuzz  <seed_file> <iterations> <rng_seed> [leak]
+//                                        mutate, parse behind a guard page, round trip
+//
+// THE DUMP is what `tools/xml_cross/gen.py` writes for Python's tree, so that
+// two programs that share nothing can be compared with `cmp`:
+//
+//     <name          an element starts           @key=value   one attribute (in order)
+//     "text          a text node                 >            the element ends
+//
+// Octets outside 32..126 and the backslash are written `\xHH` (UTF-8 octets).
+//
+// `cross` expectations: a `.exp` file that is a dump, or `ERR <line> <col> <text>`
+// (the reference refused the document). The result classes:
+//   both_ok / both_err        agreement
+//   tree_diff                 both accept, the trees differ         -> failure
+//   firn_laxer                Firn accepts, the reference refuses   -> failure, except:
+//   laxer_nonascii_name_x5    ... the reference's error stands on a non-ASCII octet: expat
+//                             knows fewer name characters than XML 1.0 5th edition (X5)
+//   firn_stricter             Firn refuses, the reference accepts   -> failure unless documented:
+//   stricter_documented       ... it is a DOCTYPE (X1), an encoding other than UTF-8 (X2), the
+//                             depth/attribute limits (X4) or an XML declaration whose version is
+//                             not `1.<digits>` (expat accepts any text there)
+//   roundtrip_bad             parse(write(parse(x))) differs        -> failure
+//   line_agree                refused by both, same line number
+import std.xml
+import std.rt
+import std.io
+
+fn eq_c(p: u64, lit: str) -> bool {
+    let a: usize = rt.c_length(p)
+    if a != lit.n {
+        return false
+    }
+    return rt.mem_eq(p, lit.p as u64, a)
+}
+
+fn hexd(v: u8) -> u8 {
+    if v < 10 as u8 {
+        return 48 as u8 + v
+    }
+    return 87 as u8 + v
+}
+
+fn esc(out: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c >= 32 as u8 && c < 127 as u8 && c != 92 as u8 {
+            rt.buf_push(out, c)
+        } else {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 120 as u8)
+            rt.buf_push(out, hexd(c >> 4))
+            rt.buf_push(out, hexd(c & 15 as u8))
+        }
+        i = i + 1
+    }
+}
+
+fn line_of(out: *mut rt.Buf, mark: u8, s: str) {
+    rt.buf_push(out, mark)
+    esc(out, s.p as u64, s.n)
+}
+
+fn dump_open(d: *mut xml.Doc, i: u32, out: *mut rt.Buf) {
+    line_of(out, 60 as u8, xml.name(d, i))
+    rt.buf_push(out, 10 as u8)
+    let cnt: usize = xml.attr_count(d, i)
+    var k: usize = 0
+    while k < cnt {
+        line_of(out, 64 as u8, xml.attr_name(d, i, k))
+        rt.buf_push(out, 61 as u8)
+        let v: str = xml.attr_value(d, i, k)
+        esc(out, v.p as u64, v.n)
+        rt.buf_push(out, 10 as u8)
+        k = k + 1
+    }
+}
+
+// Iterative on purpose: a deeply nested document must not need a deep stack.
+fn dump(d: *mut xml.Doc, out: *mut rt.Buf) {
+    let node: u32 = xml.root(d)
+    var i: u32 = node
+    while true {
+        if xml.kind(d, i) == xml.TEXT {
+            line_of(out, 34 as u8, xml.text(d, i))
+            rt.buf_push(out, 10 as u8)
+        } else {
+            dump_open(d, i, out)
+            if xml.first(d, i) != xml.NONE {
+                i = xml.first(d, i)
+                continue
+            }
+            rt.buf_push(out, 62 as u8)
+            rt.buf_push(out, 10 as u8)
+        }
+        while true {
+            if i == node {
+                return
+            }
+            let nx: u32 = xml.next(d, i)
+            if nx != xml.NONE {
+                i = nx
+                break
+            }
+            i = xml.parent(d, i)
+            rt.buf_push(out, 62 as u8)
+            rt.buf_push(out, 10 as u8)
+            if i == node {
+                return
+            }
+        }
+    }
+}
+
+fn report(d: *mut xml.Doc) {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&b, xml.err_line(d) as u64)
+    rt.buf_push(&b, 58 as u8)
+    rt.buf_push_dec_u64(&b, xml.err_col(d) as u64)
+    rt.buf_push(&b, 58 as u8)
+    rt.buf_push(&b, 32 as u8)
+    let t: str = xml.err_text(d)
+    rt.buf_push_bytes(&b, t.p as u64, t.n)
+    rt.buf_push(&b, 10 as u8)
+    io.eprint_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+// ------------------------------------------------------------ guard pages
+//
+// `guard_new(n)` returns an address such that the n octets there are the
+// LAST ones before an unmapped page (and there is an unmapped page before
+// the mapping too). A parser that reads one octet past its input dies with
+// SIGSEGV instead of silently reading what happens to be next.
+struct Guarded {
+    base: u64,
+    len: usize,
+    at: u64,
+}
+
+fn guard_new(n: usize) -> Guarded {
+    var pages: usize = (n + 4095) / 4096
+    if pages == 0 {
+        pages = 1
+    }
+    let total: usize = (pages + 2) * 4096
+    let base: i64 = syscall(9, 0, total as i64, 3, 34, -1, 0)
+    // PROT_NONE for the first and the last page
+    syscall(10, base, 4096, 0, 0, 0, 0)
+    syscall(10, base + ((pages + 1) * 4096) as i64, 4096, 0, 0, 0, 0)
+    let end: u64 = (base as u64) + ((pages + 1) * 4096) as u64
+    return Guarded { base: base as u64, len: total, at: end - n as u64 }
+}
+
+fn guard_free(g: *mut Guarded) {
+    syscall(11, (*g).base as i64, (*g).len as i64, 0, 0, 0, 0)
+}
+
+// ------------------------------------------------------------- the modes
+
+fn path_of(dir: u64, i: usize, ext: str, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, dir, rt.c_length(dir))
+    rt.buf_push(out, 47 as u8)
+    rt.buf_push_dec_u64(out, i as u64)
+    rt.buf_push_bytes(out, ext.p as u64, ext.n)
+    rt.buf_push(out, 0 as u8)
+}
+
+fn parse_guarded(d: *mut xml.Doc, p: u64, n: usize) -> bool {
+    var g: Guarded = guard_new(n)
+    if n > 0 {
+        rt.mem_copy(g.at, p, n)
+    }
+    let ok: bool = xml.parse(d, g.at, n) catch false
+    guard_free(&g)
+    return ok
+}
+
+fn same_bytes(a: *mut rt.Buf, b: *mut rt.Buf) -> bool {
+    return rt.buf_len(a) == rt.buf_len(b)
+    && rt.mem_eq(rt.buf_ptr(a), rt.buf_ptr(b), rt.buf_len(a))
+}
+
+// parse -> write -> parse -> write must give the same octets twice, and the
+// two trees must be equal
+fn roundtrip_ok(d: *mut xml.Doc) -> bool {
+    var w1: rt.Buf = rt.buf_new()
+    xml.write(d, xml.root(d), &w1)
+    var d2: xml.Doc = xml.doc_new()
+    let ok: bool = xml.parse(&d2, rt.buf_ptr(&w1), rt.buf_len(&w1)) catch false
+    var same: bool = false
+    if ok {
+        var w2: rt.Buf = rt.buf_new()
+        xml.write(&d2, xml.root(&d2), &w2)
+        same = same_bytes(&w1, &w2)
+        if same {
+            var a: rt.Buf = rt.buf_new()
+            var b: rt.Buf = rt.buf_new()
+            dump(d, &a)
+            dump(&d2, &b)
+            same = same_bytes(&a, &b)
+            rt.buf_free(&a)
+            rt.buf_free(&b)
+        }
+        rt.buf_free(&w2)
+    }
+    xml.doc_free(&d2)
+    rt.buf_free(&w1)
+    return same
+}
+
+fn read_dec(p: u64, n: usize, at: usize) -> usize {
+    var v: usize = 0
+    var i: usize = at
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            break
+        }
+        v = v * 10 + (c - 48 as u8) as usize
+        i = i + 1
+    }
+    return v
+}
+
+// The octet at (line, col0) of the input, lines counted as the XML standard
+// does (LF, CR LF, CR); col0 is 0-based in octets, like Python's `offset`.
+// -1 if there is no such place.
+fn octet_at(p: u64, n: usize, line: usize, col0: usize) -> i32 {
+    var l: usize = 1
+    var i: usize = 0
+    while i < n && l < line {
+        let c: u8 = rt.ld8(p, i)
+        i = i + 1
+        if c == 13 as u8 && i < n && rt.ld8(p, i) == 10 as u8 {
+            i = i + 1
+        }
+        if c == 10 as u8 || c == 13 as u8 {
+            l = l + 1
+        }
+    }
+    if l != line || i + col0 >= n {
+        return -1
+    }
+    return rt.ld8(p, i + col0) as i32
+}
+
+fn put_kv(o: *mut rt.Buf, k: str, v: usize) {
+    rt.buf_push_bytes(o, k.p as u64, k.n)
+    rt.buf_push(o, 32 as u8)
+    rt.buf_push_dec_u64(o, v as u64)
+    rt.buf_push(o, 10 as u8)
+}
+
+fn list_case(tag: str, i: usize, ok: bool, d: *mut xml.Doc) {
+    var m: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&m, tag.p as u64, tag.n)
+    rt.buf_push(&m, 32 as u8)
+    rt.buf_push_dec_u64(&m, i as u64)
+    if !ok {
+        rt.buf_push(&m, 32 as u8)
+        rt.buf_push_dec_u64(&m, xml.err_line(d) as u64)
+        rt.buf_push(&m, 58 as u8)
+        rt.buf_push_dec_u64(&m, xml.err_col(d) as u64)
+        rt.buf_push(&m, 32 as u8)
+        let t: str = xml.err_text(d)
+        rt.buf_push_bytes(&m, t.p as u64, t.n)
+    }
+    rt.buf_push(&m, 10 as u8)
+    io.print_bytes(rt.buf_ptr(&m), rt.buf_len(&m))
+    rt.buf_free(&m)
+}
+
+fn cross(dir: u64, count: usize) -> i32 {
+    var path: rt.Buf = rt.buf_new()
+    var src: rt.Buf = rt.buf_new()
+    var exp: rt.Buf = rt.buf_new()
+    var got: rt.Buf = rt.buf_new()
+    var d: xml.Doc = xml.doc_new()
+    var both_ok: usize = 0
+    var both_err: usize = 0
+    var tree_diff: usize = 0
+    var laxer: usize = 0
+    var laxer_x5: usize = 0
+    var stricter: usize = 0
+    var stricter_doc: usize = 0
+    var rt_bad: usize = 0
+    var line_agree: usize = 0
+    var listed: usize = 0
+    var i: usize = 0
+    while i < count {
+        path_of(dir, i, ".xml", &path)
+        rt.buf_clear(&src)
+        if !rt.read_file(rt.buf_ptr(&path), &src) {
+            io.eprint_line("cannot read the document")
+            return 4
+        }
+        path_of(dir, i, ".exp", &path)
+        rt.buf_clear(&exp)
+        if !rt.read_file(rt.buf_ptr(&path), &exp) {
+            io.eprint_line("cannot read the expectation")
+            return 4
+        }
+        let ep: u64 = rt.buf_ptr(&exp)
+        let en: usize = rt.buf_len(&exp)
+        let ref_err: bool = en >= 4 && rt.ld8(ep, 0) == 69 as u8
+        && rt.ld8(ep, 1) == 82 as u8 && rt.ld8(ep, 2) == 82 as u8
+        && rt.ld8(ep, 3) == 32 as u8
+        let ok: bool = parse_guarded(&d, rt.buf_ptr(&src), rt.buf_len(&src))
+        var tag: str = ""
+        if ok && !ref_err {
+            rt.buf_clear(&got)
+            dump(&d, &got)
+            if same_bytes(&got, &exp) {
+                both_ok = both_ok + 1
+                if !roundtrip_ok(&d) {
+                    rt_bad = rt_bad + 1
+                    tag = "roundtrip_bad"
+                }
+            } else {
+                tree_diff = tree_diff + 1
+                tag = "tree_diff"
+            }
+        } else if ok && ref_err {
+            // expat refuses some non-ASCII name characters that XML 1.0 5th
+            // edition allows (X5): the reference's error stands on one
+            let rl: usize = read_dec(ep, en, 4)
+            var sp: usize = 4
+            while sp < en && rt.ld8(ep, sp) != 32 as u8 {
+                sp = sp + 1
+            }
+            let rc: usize = read_dec(ep, en, sp + 1)
+            if octet_at(rt.buf_ptr(&src), rt.buf_len(&src), rl, rc) >= 128 {
+                laxer_x5 = laxer_x5 + 1
+            } else {
+                laxer = laxer + 1
+                tag = "firn_laxer"
+            }
+        } else if !ok && !ref_err {
+            let code: usize = xml.err_code(&d)
+            if code == xml.E_XMLDECL || code == xml.E_ENCODING || code == xml.E_DTD
+            || code == xml.E_DEPTH || code == xml.E_LIMIT {
+                stricter_doc = stricter_doc + 1 // the documented deviations (X1, X2, X4, version)
+            } else {
+                stricter = stricter + 1
+                tag = "firn_stricter"
+            }
+        } else {
+            both_err = both_err + 1
+            if read_dec(ep, en, 4) == xml.err_line(&d) {
+                line_agree = line_agree + 1
+            }
+        }
+        if tag.n > 0 && listed < 40 {
+            listed = listed + 1
+            list_case(tag, i, ok, &d)
+        }
+        i = i + 1
+    }
+    var o: rt.Buf = rt.buf_new()
+    put_kv(&o, "cases", count)
+    put_kv(&o, "both_ok", both_ok)
+    put_kv(&o, "both_err", both_err)
+    put_kv(&o, "line_agree", line_agree)
+    put_kv(&o, "tree_diff", tree_diff)
+    put_kv(&o, "firn_laxer", laxer)
+    put_kv(&o, "laxer_nonascii_name_x5", laxer_x5)
+    put_kv(&o, "firn_stricter", stricter)
+    put_kv(&o, "stricter_documented", stricter_doc)
+    put_kv(&o, "roundtrip_bad", rt_bad)
+    io.print_bytes(rt.buf_ptr(&o), rt.buf_len(&o))
+    rt.buf_free(&o)
+    xml.doc_free(&d)
+    rt.buf_free(&path)
+    rt.buf_free(&src)
+    rt.buf_free(&exp)
+    rt.buf_free(&got)
+    if tree_diff > 0 || laxer > 0 || rt_bad > 0 || stricter > 0 {
+        return 1
+    }
+    return 0
+}
+
+// ------------------------------------------------------------------ fuzz
+
+struct Rng {
+    s: u64,
+}
+
+fn rng_next(r: *mut Rng) -> u64 {
+    // xorshift64*
+    var x: u64 = (*r).s
+    x = x ^ (x >> 12)
+    x = x ^ (x << 25)
+    x = x ^ (x >> 27)
+    (*r).s = x
+    return x *% 2685821657736338717
+}
+
+fn rng_below(r: *mut Rng, n: usize) -> usize {
+    return ((rng_next(r) >> 11) % n as u64) as usize
+}
+
+fn fragment(i: usize) -> str {
+    if i == 0 { return "<" }
+    if i == 1 { return ">" }
+    if i == 2 { return "</" }
+    if i == 3 { return "/>" }
+    if i == 4 { return "&" }
+    if i == 5 { return "&amp;" }
+    if i == 6 { return "&#" }
+    if i == 7 { return "&#x41;" }
+    if i == 8 { return "&#0;" }
+    if i == 9 { return "\"" }
+    if i == 10 { return "'" }
+    if i == 11 { return "=" }
+    if i == 12 { return "<!--" }
+    if i == 13 { return "-->" }
+    if i == 14 { return "--" }
+    if i == 15 { return "<![CDATA[" }
+    if i == 16 { return "]]>" }
+    if i == 17 { return "<?" }
+    if i == 18 { return "?>" }
+    if i == 19 { return " " }
+    if i == 20 { return "\n" }
+    if i == 21 { return ":" }
+    if i == 22 { return "\u{e9}" }
+    return "\r\n"
+}
+
+const FRAGMENTS: usize = 24
+
+fn buf_insert(out: *mut rt.Buf, at: usize, p: u64, n: usize) {
+    let len: usize = rt.buf_len(out)
+    var tail: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&tail, rt.buf_ptr(out) + at as u64, len - at)
+    rt.buf_set_len(out, at)
+    rt.buf_push_bytes(out, p, n)
+    rt.buf_push_bytes(out, rt.buf_ptr(&tail), rt.buf_len(&tail))
+    rt.buf_free(&tail)
+}
+
+// A mutation of `src`: byte flips, byte replaced by a syntax character,
+// deletion, insertion of a fragment, truncation, duplication of a slice.
+fn mutate(r: *mut Rng, src: u64, n: usize, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, src, n)
+    var rounds: usize = 1 + rng_below(r, 4)
+    while rounds > 0 {
+        let len: usize = rt.buf_len(out)
+        let kind: usize = rng_below(r, 8)
+        if len == 0 {
+            rt.buf_push(out, 60 as u8)
+        } else if kind == 0 {
+            let at: usize = rng_below(r, len)
+            let b: u8 = rt.ld8(rt.buf_ptr(out), at)
+            rt.st8(rt.buf_ptr(out), at, b ^ (1 as u8 << rng_below(r, 8) as u8))
+        } else if kind == 1 {
+            let at: usize = rng_below(r, len)
+            rt.st8(rt.buf_ptr(out), at, rng_below(r, 256) as u8)
+        } else if kind == 2 {
+            // delete a slice
+            let at: usize = rng_below(r, len)
+            var cut: usize = 1 + rng_below(r, 8)
+            if at + cut > len {
+                cut = len - at
+            }
+            let p: u64 = rt.buf_ptr(out)
+            var j: usize = at
+            while j + cut < len {
+                rt.st8(p, j, rt.ld8(p, j + cut))
+                j = j + 1
+            }
+            rt.buf_set_len(out, len - cut)
+        } else if kind == 3 || kind == 4 {
+            // insert a syntax fragment
+            let f: str = fragment(rng_below(r, FRAGMENTS))
+            buf_insert(out, rng_below(r, len), f.p as u64, f.n)
+        } else if kind == 5 {
+            // truncate
+            rt.buf_set_len(out, rng_below(r, len))
+        } else if kind == 6 {
+            // replace a byte by the first octet of a fragment
+            let f: str = fragment(rng_below(r, FRAGMENTS))
+            rt.st8(rt.buf_ptr(out), rng_below(r, len), rt.ld8(f.p as u64, 0))
+        } else {
+            // duplicate a slice in place
+            let at: usize = rng_below(r, len)
+            var cut: usize = 1 + rng_below(r, 16)
+            if at + cut > len {
+                cut = len - at
+            }
+            var piece: rt.Buf = rt.buf_new()
+            rt.buf_push_bytes(&piece, rt.buf_ptr(out) + at as u64, cut)
+            buf_insert(out, at, rt.buf_ptr(&piece), rt.buf_len(&piece))
+            rt.buf_free(&piece)
+        }
+        rounds = rounds - 1
+    }
+}
+
+fn rss_pages() -> u64 {
+    var path: [u8; 17] = "/proc/self/statm\0"
+    var b: rt.Buf = rt.buf_new()
+    if !rt.read_file((&path[0]) as u64, &b) {
+        rt.buf_free(&b)
+        return 0
+    }
+    let p: u64 = rt.buf_ptr(&b)
+    let n: usize = rt.buf_len(&b)
+    var i: usize = 0
+    var field: usize = 0
+    var v: u64 = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c >= 48 as u8 && c <= 57 as u8 {
+            if field == 1 {
+                v = v * 10 + (c - 48 as u8) as u64
+            }
+        } else {
+            if field == 1 && v > 0 {
+                break
+            }
+            field = field + 1
+            if field > 2 {
+                break
+            }
+        }
+        i = i + 1
+    }
+    rt.buf_free(&b)
+    return v
+}
+
+// The seed file holds documents separated by a line with just `%%`.
+// Fills `starts` with (from, to) pairs of u64 and returns how many.
+fn split_seeds(sp: u64, sn: usize, starts: *mut rt.Buf) -> usize {
+    var nseeds: usize = 0
+    var from: usize = 0
+    var i: usize = 0
+    while i <= sn {
+        var cut: bool = i == sn
+        if !cut && rt.ld8(sp, i) == 10 as u8 && i + 3 <= sn && rt.ld8(sp, i + 1) == 37 as u8
+        && rt.ld8(sp, i + 2) == 37 as u8 && (i + 3 == sn || rt.ld8(sp, i + 3) == 10 as u8) {
+            cut = true
+        }
+        if cut {
+            var a: [u64; 2] = [from as u64, i as u64]
+            rt.buf_push_bytes(starts, (&a[0]) as u64, 16)
+            nseeds = nseeds + 1
+            from = i + 4
+            i = i + 3
+        }
+        i = i + 1
+    }
+    return nseeds
+}
+
+fn fuzz(seed_file: u64, iters: usize, seed: u64, leak: bool) -> i32 {
+    var seeds: rt.Buf = rt.buf_new()
+    if !rt.read_file(seed_file, &seeds) {
+        io.eprint_line("cannot read the seed file")
+        return 4
+    }
+    var starts: rt.Buf = rt.buf_new()
+    let sp: u64 = rt.buf_ptr(&seeds)
+    let nseeds: usize = split_seeds(sp, rt.buf_len(&seeds), &starts)
+    var r: Rng = Rng { s: seed * 2 + 88172645463325252 }
+    var cur: rt.Buf = rt.buf_new()
+    var acc: usize = 0
+    var rej: usize = 0
+    var bad: usize = 0
+    var rss0: u64 = 0
+    var k: usize = 0
+    while k < iters {
+        if k == iters / 10 {
+            rss0 = rss_pages()
+        }
+        let which: usize = rng_below(&r, nseeds)
+        let a0: u64 = rt.ld64(rt.buf_ptr(&starts), which * 2)
+        let a1: u64 = rt.ld64(rt.buf_ptr(&starts), which * 2 + 1)
+        mutate(&r, sp + a0, (a1 - a0) as usize, &cur)
+        var d: xml.Doc = xml.doc_new()
+        let ok: bool = parse_guarded(&d, rt.buf_ptr(&cur), rt.buf_len(&cur))
+        if ok {
+            acc = acc + 1
+            if !roundtrip_ok(&d) {
+                bad = bad + 1
+            }
+        } else {
+            rej = rej + 1
+            if xml.err_line(&d) == 0 {
+                bad = bad + 1
+            }
+        }
+        if !leak {
+            xml.doc_free(&d)
+        }
+        k = k + 1
+    }
+    let rss1: u64 = rss_pages()
+    var o: rt.Buf = rt.buf_new()
+    put_kv(&o, "fuzz_iterations", iters)
+    put_kv(&o, "accepted", acc)
+    put_kv(&o, "refused", rej)
+    put_kv(&o, "bad", bad)
+    put_kv(&o, "rss_pages_after_10pct", rss0 as usize)
+    put_kv(&o, "rss_pages_end", rss1 as usize)
+    io.print_bytes(rt.buf_ptr(&o), rt.buf_len(&o))
+    rt.buf_free(&o)
+    rt.buf_free(&cur)
+    rt.buf_free(&starts)
+    rt.buf_free(&seeds)
+    if bad > 0 {
+        return 1
+    }
+    // a leak grows with the number of iterations; the allocator cache is noise
+    // (measured: +15 pages over 4,500 iterations)
+    if rss0 > 0 && rss1 > rss0 + (iters / 100) as u64 + 64 {
+        io.print_line("RSS grew: possible leak")
+        return 2
+    }
+    return 0
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        return 2
+    }
+    let mode: u64 = rt.arg_ptr(start, 1)
+    if eq_c(mode, "cross") {
+        if rt.arg_count(start) < 4 {
+            return 2
+        }
+        let a3: u64 = rt.arg_ptr(start, 3)
+        return cross(rt.arg_ptr(start, 2), read_dec(a3, rt.c_length(a3), 0))
+    }
+    if eq_c(mode, "fuzz") {
+        if rt.arg_count(start) < 5 {
+            return 2
+        }
+        let a3: u64 = rt.arg_ptr(start, 3)
+        let a4: u64 = rt.arg_ptr(start, 4)
+        // a sixth argument (anything) switches doc_free OFF: the counter-check for the leak test
+        return fuzz(rt.arg_ptr(start, 2), read_dec(a3, rt.c_length(a3), 0),
+            read_dec(a4, rt.c_length(a4), 0) as u64, rt.arg_count(start) > 5)
+    }
+
+    if eq_c(mode, "overread") {
+        var g: Guarded = guard_new(10)
+        let b: u8 = rt.ld8(g.at, 10)
+        guard_free(&g)
+        return b as i32 // never reached: the page behind the input is unmapped
+    }
+
+    var src: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&src)
+    if !rt.read_file(rt.arg_ptr(start, 2), &src) {
+        return 4
+    }
+    var d: xml.Doc = xml.doc_new()
+    defer xml.doc_free(&d)
+    var ok: bool = false
+    if eq_c(mode, "guard") {
+        ok = parse_guarded(&d, rt.buf_ptr(&src), rt.buf_len(&src))
+    } else {
+        ok = xml.parse(&d, rt.buf_ptr(&src), rt.buf_len(&src)) catch false
+    }
+    if !ok {
+        report(&d)
+        return 1
+    }
+    if eq_c(mode, "check") || eq_c(mode, "guard") {
+        return 0
+    }
+    var out: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&out)
+    if eq_c(mode, "dump") {
+        dump(&d, &out)
+        io.print_bytes(rt.buf_ptr(&out), rt.buf_len(&out))
+        return 0
+    }
+    if eq_c(mode, "write") {
+        if rt.arg_count(start) < 4 {
+            return 2
+        }
+        xml.write(&d, xml.root(&d), &out)
+        if !rt.write_file(rt.arg_ptr(start, 3), rt.buf_ptr(&out), rt.buf_len(&out)) {
+            return 6
+        }
+        return 0
+    }
+    return 3
+}
