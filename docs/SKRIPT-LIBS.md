@@ -188,10 +188,19 @@ Well-formed XML only, no DTD/XSD/XPath: elements, attributes, text, CDATA, comme
 namespaces as plain `prefix:name` strings. Flat node arrays (like `std.json`). `xml.parse`, `xml.child`, `xml.children_named`, `xml.attr`,
 `xml.text`, errors with line/column. Cross-check: `xml.etree.ElementTree` on random documents; fuzz.
 
-### Regex lookaround — `lib/regex/regex.fi` (r320, if feasible)
-`(?=…)`, `(?!…)`, `(?<=…)`, `(?<!…)` without backreferences, so the "no catastrophic backtracking" promise holds
-(worst case O(n·m·k), never exponential). Lookbehind: bounded length only. If it cannot be done without breaking the linear-time
-guarantee, the answer is a documented "no" plus the two OpenPlan patterns rewritten.
+### Regex lookaround — `lib/regex/regex.fi` (was r320 in the sketch) — DONE (08.10.2026), answer: YES, polynomial
+`(?=X)`, `(?!X)`, `(?<=X)`, `(?<!X)` are supported, without backreferences, in the Pike VM: a lookaround is a zero-width instruction that
+runs a Pike pass of its own over its body (`I_LOOK`; the body is compiled inline, ending in its own `I_MATCH`). **The linear-time promise
+changes for patterns that use lookaround — honestly:** without lookaround still O(n·m); a lookahead is O(k·n²·m) worst case (QUADRATIC:
+`(?=.*z)a` over `aaaa…` reads the rest of the text from every position); a lookbehind must be bounded (≤ 1000 characters) and costs
+O(n·w·m); nested lookarounds (max 3 deep) are memoised per (instruction, position), so the exponent stays 2. **Never exponential** — an
+ambiguous body such as `(?=(?:a+)+b)` is quadratic as well, where Python's `re` takes 2ⁿ. Measured (release-fast, "a"×n, no match, per
+doubling of n; `tools/regex_look/run.sh` prints the table and fails above x6.5): see test.sh section 111. Refused: a capture group inside
+a lookaround (`(?:…)` is fine), an unbounded lookbehind (`(?<=a+)`), a quantifier after a lookaround (`(?=a)*`), nesting deeper than 3,
+backreferences. Proof: tests 2330 and 1914, `tools/regex_look/run.sh` (6,000 random patterns against Python `re`, all four stages, plus the
+unchanged 20,000-pattern `tools/libmvp/check_regex.py`). The two OpenPlan patterns now run unchanged: `(?<![A-Za-z])de:` and
+`[A-ZÄÖÜ]+(?![a-zäöüß])` (both are rows of `check_look.py` and of test 2330). Note: the sketch called this r320, the roadmap's r320 is
+`png.image_pixel`; the regex item is a new roadmap point.
 
 ### firn-run and shebang (r317)
 `#!` on line 1 is skipped by the compiler; `tools/script_port/firn-run` compiles once into a content-hash cache and execs.
