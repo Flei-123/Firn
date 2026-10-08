@@ -1775,6 +1775,20 @@ else
     grep -E 'FAIL|error' "$WORK/rtcache.log" | head -8 | sed 's/^/   /'
 fi
 
+echo "== 101. std.testkit end to end: firnc --test over assertions, script style, assert in main (tools/testkit/run.sh, r311) =="
+# tests/2340_std_testkit.fi (section 3) runs every assertion FAILING in a forked child. Here the real consumers:
+# `firnc --test` reports a failed assertion with its text and the test's position and exits 1, the script style
+# prints the format of OpenPlan's Python check() and exits 0/1, an assert in a plain main ends with exit code 101,
+# plus counter-checks (docs/SKRIPT-LIBS.md).
+bash tools/testkit/run.sh > "$WORK/testkit.log" 2>&1 && TKRC=0 || TKRC=$?
+if [ "$TKRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/testkit.log" | sed 's/^/   /'
+else
+    bad "tools/testkit/run.sh failed (see .test-work/testkit.log)"
+    grep FAIL "$WORK/testkit.log" | head -10 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

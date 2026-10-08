@@ -1,0 +1,531 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/testkit.fi -- std.testkit: assertions for `#[test]` functions and
+// a counter for plain `main` scripts (docs/SKRIPT-LIBS.md, r311).
+//
+// Until this file a test had to fail by hand (`syscall(60, 1, ...)`) and a
+// script that checks things wrote its own `check()` -- OpenPlan has 103 of
+// them in Python. Two shapes, one library:
+//
+//     import std.testkit
+//
+//     #[test]
+//     fn adds_up() {
+//         testkit.assert_eq_i64(2 + 3, 5)
+//         testkit.assert_eq_str(greeting(), "hello")
+//         testkit.assert_near(sqrt2 * sqrt2, 2.0, 1e-12)
+//     }
+//
+//     fn main() -> i32 {                       // script style
+//         testkit.check(count == 3, "three rows")
+//         testkit.check(name == "x", "the name")
+//         return testkit.finish()              // prints the sum, 0 or 1
+//     }
+//
+// A FAILED ASSERTION is a PANIC: the message goes to standard error and the
+// process ends with exit code 101, the same ending as an overflow or an
+// index out of range. `firnc --test` runs every test in a process of its own
+// and reports the first line of that message as the reason of the case. A
+// plain `main` that fails an assertion ends the same way, so its exit code
+// is not 0.
+//
+// SCRIPT STYLE -- `check` / `finish`. The output is the one of OpenPlan's
+// Python `check()`, so a port stays diff-able:
+//
+//       ok    three rows
+//       FAIL  the name
+//     2 checks, 1 failed
+//
+// `check` never stops; `finish` prints the sum and returns 0 (all ok) or 1,
+// ready for `return testkit.finish()` from `main`.
+//
+// HONEST -- what this does NOT do:
+//   * The position of a failure is the one of the TEST FUNCTION, not of the
+//     assert line. `firnc --test` takes `file:line:col` from a panic message
+//     of the form `... at file:line:col` and falls back to the `fn`
+//     declaration when there is none; a library function cannot know its
+//     caller's line (the language has no caller-location intrinsic), so a
+//     failed assert prints no position. Use `testkit.context("what")` before
+//     a group of asserts: the label is added to the first line of every failure
+//     message (` [label]`).
+//   * The first failure ends the test (that is what a panic is). No
+//     "continue after failure" in `#[test]`; use `check` in a script.
+//   * Comparison of floating point is `assert_near` only. `assert_eq[T]` is
+//     for integer types (any width, signed or not).
+//   * `assert_eq_str` / `assert_eq_bytes` compare octets (UTF-8 is not
+//     interpreted); the excerpt around the first difference is cut at
+//     octets, so a multi byte character at the edge is shown as `\xNN`.
+//   * Linux; the x86-64 and AArch64 builds run (tests/2340 under qemu), the Windows build compiles and runs the script style (Wine);
+//     nothing here touches files.
+//   * Not thread safe: the counters are plain statics.
+import rt
+import num
+
+export {
+    assert_true, assert_false, fail, context,
+    assert_eq_i64, assert_eq_u64, assert_ne_i64, assert_eq, assert_eq_str, assert_eq_bytes,
+    assert_near,
+    check, check_detail, finish, finish_named, checks_run, checks_failed, reset,
+}
+
+const TK_SYS_WRITE: i64 = 1
+const TK_SYS_EXIT_GROUP: i64 = 231
+// the exit code of a panic (compiler/src/panic_rt.rs)
+const TK_PANIC_EXIT: i64 = 101
+// octets of context on each side of the first difference
+const TK_EXCERPT: usize = 24
+
+static mut tk_ctx_p: u64 = 0
+static mut tk_ctx_n: usize = 0
+static mut tk_run: usize = 0
+static mut tk_bad: usize = 0
+
+// ------------------------------------------------------------- the text
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+fn put_i64(b: *mut rt.Buf, v: i64) {
+    rt.buf_push_dec_i64(b, v)
+}
+
+// An integer of ANY width and signedness, in decimal. No cast can trap:
+// a negative value is written as `-` and its magnitude computed from
+// `-(a + 1) + 1`, which does not overflow for the minimum.
+fn tk_put_int[T: Int](b: *mut rt.Buf, a: T) {
+    if a < (0 as T) {
+        rt.buf_push(b, 45 as u8)
+        let m: u64 = ((0 as T) - (a + (1 as T))) as u64 + 1
+        rt.buf_push_dec_u64(b, m)
+    } else {
+        rt.buf_push_dec_u64(b, a as u64)
+    }
+}
+
+fn put_f64(b: *mut rt.Buf, x: f64) {
+    var nb: num.Bytes = num.Bytes { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    if num.write_f64(&nb, x) {
+        rt.buf_push_bytes(b, nb.ptr as u64, nb.len)
+    }
+    num.bytes_free(&nb)
+}
+
+// One octet as it is shown inside quotes: printable ASCII as it is, the
+// quote and the backslash escaped, `\n \r \t`, everything else `\xNN`.
+fn put_shown(b: *mut rt.Buf, c: u8) {
+    if c == 34 as u8 {
+        put(b, "\\\"")
+    } else if c == 92 as u8 {
+        put(b, "\\\\")
+    } else if c == 10 as u8 {
+        put(b, "\\n")
+    } else if c == 13 as u8 {
+        put(b, "\\r")
+    } else if c == 9 as u8 {
+        put(b, "\\t")
+    } else if c >= 32 as u8 && c < 127 as u8 {
+        rt.buf_push(b, c)
+    } else {
+        put(b, "\\x")
+        rt.buf_push_hex_u64(b, c as u64, 2)
+    }
+}
+
+fn say(fd: i64, b: *mut rt.Buf) {
+    rt.write_everything(fd, rt.buf_ptr(b), rt.buf_len(b))
+}
+
+// The panic ending: the message on standard error, then `exit_group(101)`.
+// The context label goes at the end of the FIRST line (` [label]`), because
+// that line is what `firnc --test` shows as the reason.
+fn die(b: *mut rt.Buf) {
+    var o: rt.Buf = rt.buf_new()
+    let n: usize = rt.buf_len(b)
+    var cut: usize = 0
+    while cut < n && rt.buf_at(b, cut) != 10 as u8 {
+        cut = cut + 1
+    }
+    rt.buf_push_bytes(&o, rt.buf_ptr(b), cut)
+    if tk_ctx_n > 0 {
+        put(&o, " [")
+        rt.buf_push_bytes(&o, tk_ctx_p, tk_ctx_n)
+        rt.buf_push(&o, 93 as u8)
+    }
+    rt.buf_push_bytes(&o, rt.buf_ptr(b) + cut as u64, n - cut)
+    rt.buf_push(&o, 10 as u8)
+    say(2, &o)
+    rt.buf_free(&o)
+    rt.buf_free(b)
+    syscall(TK_SYS_EXIT_GROUP, TK_PANIC_EXIT, 0, 0, 0, 0, 0)
+}
+
+// ------------------------------------------------------------ assertions
+
+// Names the group of asserts that follows; it is printed with a failure.
+// `label` must stay alive (a literal does). `context("")` clears it.
+fn context(label: str) {
+    tk_ctx_p = label.p as u64
+    tk_ctx_n = label.length()
+}
+
+// Fails the test with `msg`.
+fn fail(msg: str) {
+    var b: rt.Buf = rt.buf_new()
+    put(&b, "fail: ")
+    put(&b, msg)
+    die(&b)
+}
+
+fn assert_true(cond: bool, msg: str) {
+    if cond {
+        return
+    }
+    var b: rt.Buf = rt.buf_new()
+    put(&b, "assert failed: ")
+    put(&b, msg)
+    die(&b)
+}
+
+fn assert_false(cond: bool, msg: str) {
+    if !cond {
+        return
+    }
+    var b: rt.Buf = rt.buf_new()
+    put(&b, "assert failed (expected false): ")
+    put(&b, msg)
+    die(&b)
+}
+
+fn assert_eq_i64(a: i64, b: i64) {
+    if a == b {
+        return
+    }
+    var m: rt.Buf = rt.buf_new()
+    put(&m, "assert_eq failed: left=")
+    put_i64(&m, a)
+    put(&m, " right=")
+    put_i64(&m, b)
+    die(&m)
+}
+
+fn assert_eq_u64(a: u64, b: u64) {
+    if a == b {
+        return
+    }
+    var m: rt.Buf = rt.buf_new()
+    put(&m, "assert_eq failed: left=")
+    rt.buf_push_dec_u64(&m, a)
+    put(&m, " right=")
+    rt.buf_push_dec_u64(&m, b)
+    die(&m)
+}
+
+fn assert_ne_i64(a: i64, b: i64) {
+    if a != b {
+        return
+    }
+    var m: rt.Buf = rt.buf_new()
+    put(&m, "assert_ne failed: both are ")
+    put_i64(&m, a)
+    die(&m)
+}
+
+// The generic form for every integer type (`i8`..`i64`, `u8`..`u64`,
+// `usize`, `isize`): `testkit.assert_eq[u16](x, 7 as u16)`.
+fn assert_eq[T: Int](a: T, b: T) {
+    if a == b {
+        return
+    }
+    var m: rt.Buf = rt.buf_new()
+    put(&m, "assert_eq failed: left=")
+    tk_put_int[T](&m, a)
+    put(&m, " right=")
+    tk_put_int[T](&m, b)
+    die(&m)
+}
+
+// Position (octet index) of the first difference of two octet runs; the
+// shorter length when one is a prefix of the other; `n` when they are equal.
+fn first_diff(p: u64, n: usize, q: u64, m: usize) -> usize {
+    var lim: usize = n
+    if m < lim {
+        lim = m
+    }
+    var i: usize = 0
+    while i < lim {
+        if rt.ld8(p, i) != rt.ld8(q, i) {
+            return i
+        }
+        i = i + 1
+    }
+    return lim
+}
+
+// `"...ab[c]de..."`-style excerpt around octet `d` of the run (p, n), as a
+// quoted line; returns the column (in the output line, after the prefix) at
+// which octet `d` stands, for the caret line.
+fn put_excerpt(b: *mut rt.Buf, p: u64, n: usize, d: usize) -> usize {
+    var from: usize = 0
+    if d > TK_EXCERPT {
+        from = d - TK_EXCERPT
+    }
+    var to: usize = n
+    if d + TK_EXCERPT < n {
+        to = d + TK_EXCERPT
+    }
+    rt.buf_push(b, 34 as u8)
+    var col: usize = 1
+    if from > 0 {
+        put(b, "...")
+        col = col + 3
+    }
+    var i: usize = from
+    while i < to {
+        let before: usize = rt.buf_len(b)
+        put_shown(b, rt.ld8(p, i))
+        if i < d {
+            col = col + (rt.buf_len(b) - before)
+        }
+        i = i + 1
+    }
+    if to < n {
+        put(b, "...")
+    }
+    rt.buf_push(b, 34 as u8)
+    return col
+}
+
+// line and column (both from 1) of octet `d` in the run (p, n)
+fn put_line_col(b: *mut rt.Buf, p: u64, d: usize) {
+    var line: usize = 1
+    var col: usize = 1
+    var i: usize = 0
+    while i < d {
+        if rt.ld8(p, i) == 10 as u8 {
+            line = line + 1
+            col = 1
+        } else {
+            col = col + 1
+        }
+        i = i + 1
+    }
+    put(b, "line ")
+    rt.buf_push_dec_u64(b, line as u64)
+    put(b, " col ")
+    rt.buf_push_dec_u64(b, col as u64)
+}
+
+fn spaces(b: *mut rt.Buf, k: usize) {
+    var i: usize = 0
+    while i < k {
+        rt.buf_push(b, 32 as u8)
+        i = i + 1
+    }
+}
+
+// Two texts. On a difference the message names the lengths, the first
+// differing octet with line and column, and an excerpt of BOTH texts around
+// it with a caret under the position:
+//
+//     assert_eq_str failed: lengths 11 and 11, first difference: octet 6 (line 1 col 7)
+//       left : "hello wxrld"
+//       right: "hello world"
+//                    ^
+fn assert_eq_str(a: str, b: str) {
+    let n: usize = a.length()
+    let m: usize = b.length()
+    let pa: u64 = a.p as u64
+    let pb: u64 = b.p as u64
+    if n == m && (n == 0 || rt.mem_eq(pa, pb, n)) {
+        return
+    }
+    let d: usize = first_diff(pa, n, pb, m)
+    var o: rt.Buf = rt.buf_new()
+    put(&o, "assert_eq_str failed: lengths ")
+    rt.buf_push_dec_u64(&o, n as u64)
+    put(&o, " and ")
+    rt.buf_push_dec_u64(&o, m as u64)
+    put(&o, ", first difference: octet ")
+    rt.buf_push_dec_u64(&o, d as u64)
+    put(&o, " (")
+    put_line_col(&o, pa, d)
+    put(&o, ")\n  left : ")
+    let col: usize = put_excerpt(&o, pa, n, d)
+    put(&o, "\n  right: ")
+    put_excerpt(&o, pb, m, d)
+    put(&o, "\n         ")
+    spaces(&o, col)
+    put(&o, "^")
+    die(&o)
+}
+
+// Two octet runs, given as (address, length) pairs. The message shows both
+// runs as hex around the first difference.
+fn assert_eq_bytes(p: u64, n: usize, q: u64, m: usize) {
+    if n == m && (n == 0 || rt.mem_eq(p, q, n)) {
+        return
+    }
+    let d: usize = first_diff(p, n, q, m)
+    var o: rt.Buf = rt.buf_new()
+    put(&o, "assert_eq_bytes failed: lengths ")
+    rt.buf_push_dec_u64(&o, n as u64)
+    put(&o, " and ")
+    rt.buf_push_dec_u64(&o, m as u64)
+    put(&o, ", first difference: octet ")
+    rt.buf_push_dec_u64(&o, d as u64)
+    var from: usize = 0
+    if d > 8 {
+        from = d - 8
+    }
+    put(&o, "\n  left : ")
+    put_hex_run(&o, p, n, from, d)
+    put(&o, "\n  right: ")
+    put_hex_run(&o, q, m, from, d)
+    die(&o)
+}
+
+// up to 16 octets from `from` as hex; the one at `mark` in [brackets]
+fn put_hex_run(b: *mut rt.Buf, p: u64, n: usize, from: usize, mark: usize) {
+    if from > 0 {
+        put(b, "... ")
+    }
+    var i: usize = from
+    var shown: usize = 0
+    while i < n && shown < 16 {
+        if i == mark {
+            rt.buf_push(b, 91 as u8)
+        }
+        rt.buf_push_hex_u64(b, rt.ld8(p, i) as u64, 2)
+        if i == mark {
+            rt.buf_push(b, 93 as u8)
+        }
+        rt.buf_push(b, 32 as u8)
+        i = i + 1
+        shown = shown + 1
+    }
+    if mark >= n {
+        put(b, "[end]")
+    } else if i < n {
+        put(b, "...")
+    }
+}
+
+// |a - b| <= eps (absolute) OR |a - b| <= eps * max(|a|, |b|) (relative).
+// Equal values (also two infinities of one sign) are near; NaN is near to
+// nothing, itself included. A negative `eps` accepts only equal values.
+fn near(a: f64, b: f64, eps: f64) -> bool {
+    if a != a || b != b {
+        return false
+    }
+    if a == b {
+        return true
+    }
+    // an infinity against anything else is not near (inf - inf is NaN)
+    if a - a != 0.0 || b - b != 0.0 {
+        return false
+    }
+    var d: f64 = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    if d <= eps {
+        return true
+    }
+    var aa: f64 = a
+    if aa < 0.0 {
+        aa = 0.0 - aa
+    }
+    var ab: f64 = b
+    if ab < 0.0 {
+        ab = 0.0 - ab
+    }
+    var big: f64 = aa
+    if ab > big {
+        big = ab
+    }
+    return d <= eps * big
+}
+
+fn assert_near(a: f64, b: f64, eps: f64) {
+    if near(a, b, eps) {
+        return
+    }
+    var m: rt.Buf = rt.buf_new()
+    put(&m, "assert_near failed: left=")
+    put_f64(&m, a)
+    put(&m, " right=")
+    put_f64(&m, b)
+    put(&m, " diff=")
+    put_f64(&m, a - b)
+    put(&m, " eps=")
+    put_f64(&m, eps)
+    die(&m)
+}
+
+// ---------------------------------------------------------- script style
+
+// Prints `  ok    <what>` or `  FAIL  <what>` and counts. Never stops.
+fn check(ok: bool, what: str) {
+    check_detail(ok, what, "")
+}
+
+// Like `check`; on a failure a non-empty `detail` is printed on a line of
+// its own below (`        <detail>`).
+fn check_detail(ok: bool, what: str, detail: str) {
+    var b: rt.Buf = rt.buf_new()
+    tk_run = tk_run + 1
+    if ok {
+        put(&b, "  ok    ")
+    } else {
+        tk_bad = tk_bad + 1
+        put(&b, "  FAIL  ")
+    }
+    put(&b, what)
+    rt.buf_push(&b, 10 as u8)
+    if !ok && detail.length() > 0 {
+        put(&b, "        ")
+        put(&b, detail)
+        rt.buf_push(&b, 10 as u8)
+    }
+    say(1, &b)
+    rt.buf_free(&b)
+}
+
+fn checks_run() -> usize {
+    return tk_run
+}
+
+fn checks_failed() -> usize {
+    return tk_bad
+}
+
+// Zeroes the counters (a program that runs several suites in a row).
+fn reset() {
+    tk_run = 0
+    tk_bad = 0
+}
+
+// Prints `<n> checks, <m> failed` and returns 0 when nothing failed, else 1.
+fn finish() -> i32 {
+    return finish_named("")
+}
+
+// Same with a label in front, `find: 2 failed` style as the Python scripts
+// print it: `<label>: <n> checks, <m> failed`.
+fn finish_named(label: str) -> i32 {
+    var b: rt.Buf = rt.buf_new()
+    if label.length() > 0 {
+        put(&b, label)
+        put(&b, ": ")
+    }
+    rt.buf_push_dec_u64(&b, tk_run as u64)
+    put(&b, " checks, ")
+    rt.buf_push_dec_u64(&b, tk_bad as u64)
+    put(&b, " failed\n")
+    say(1, &b)
+    rt.buf_free(&b)
+    if tk_bad > 0 {
+        return 1
+    }
+    return 0
+}
