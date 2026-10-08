@@ -180,6 +180,9 @@ def main():
     rnd = random.Random(seed)
     lines = []
     ng = nf = ne = 0
+    # build every tree first: a pattern like `../**` looks at the neighbours, and the
+    # expected answer must not depend on how many trees existed at that moment
+    made_trees = []
     for t in range(trees):
         root = os.path.join(work, "t%d_%d" % (seed, t))
         made = None
@@ -188,7 +191,8 @@ def main():
                 import shutil
                 shutil.rmtree(root)
             made = make_tree(rnd, root)
-        paths, has_dir_link = made
+        made_trees.append((root, made[0], made[1]))
+    for root, paths, has_dir_link in made_trees:
         for _ in range(rnd.randint(5, 9)):
             flags = 0
             if rnd.random() < 0.6:

@@ -41,7 +41,8 @@ export FIRNLIB="$ROOT/lib"
 mkdir -p "$W/trees"
 
 for seed in $SEEDS; do
-    python3 tools/glob_cross/gen.py "$seed" "$TREES" "$W/trees" "$W/cases.$seed" > "$W/gen.log" || { report "gen.py failed"; cat "$W/gen.log"; exit 1; }
+    mkdir -p "$W/trees/$seed"   # one forest per seed: a pattern such as `../**` looks at the neighbour trees
+    python3 tools/glob_cross/gen.py "$seed" "$TREES" "$W/trees/$seed" "$W/cases.$seed" > "$W/gen.log" || { report "gen.py failed"; cat "$W/gen.log"; exit 1; }
     sed 's/^/  seed '"$seed"': /' "$W/gen.log"
 done
 
