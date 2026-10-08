@@ -1,0 +1,241 @@
+// tools/script_port/check_lists.fi -- PROTOTYPE: a port of OpenPlan's
+// tools/ci/check_lists.py (order list and list of unplaced functions).
+//
+//     check_lists <op binary>          (run from the OpenPlan root)
+//
+// Purpose: measure what it costs to replace a CI check script by a Firn
+// program (see docs/SKRIPT-ERSATZ.md). Everything the Python script gets from
+// its standard library (csv, subprocess, os.path, sys.exit) is written out
+// here or taken from std.process / std.fs / std.text -- that is the point.
+import std.rt
+import std.str
+import std.process
+import std.fs
+import std.text
+import std.vec
+
+static mut failed: i32 = 0
+
+// ---------------------------------------------------------------- output
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.length())
+}
+
+fn as_str(p: u64, n: usize) -> str {
+    return str { p: p as *mut u8, n: n }
+}
+
+fn push(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+fn check(ok: bool, what: str) {
+    if ok {
+        say("  ok    ")
+    } else {
+        say("  FAIL  ")
+        failed = failed + 1
+    }
+    say(what)
+    say("\n")
+}
+
+// ---------------------------------------------------------- CSV (RFC 4180)
+// One table: all cell octets in `text`, per cell `start << 32 | length` in
+// `cells`; the first row is the header.
+struct Table {
+    text: rt.Buf,
+    cells: Vec[u64],
+    cols: usize,
+}
+
+fn table_new() -> Table {
+    return Table { text: rt.buf_new(), cells: vec_new[u64](), cols: 0 }
+}
+
+fn table_free(t: *mut Table) {
+    rt.buf_free(&(*t).text)
+    vec_free[u64](&(*t).cells)
+}
+
+// Parses `src` into `t`. Quotes, doubled quotes, CRLF and blank lines as
+// Python's csv.reader reads them.
+fn csv_parse(src: str, t: *mut Table) {
+    let n: usize = src.length()
+    var in_quotes: bool = false
+    var field_start: usize = rt.buf_len(&(*t).text)
+    var in_row: usize = 0
+    var have: bool = false
+    var i: usize = 0
+    while i < n {
+        let c: u8 = src.chars(i)
+        if in_quotes {
+            if c == 34 as u8 {
+                if i + 1 < n && src.chars(i + 1) == 34 as u8 {
+                    rt.buf_push(&(*t).text, 34 as u8)
+                    i = i + 1
+                } else {
+                    in_quotes = false
+                }
+            } else {
+                rt.buf_push(&(*t).text, c)
+            }
+        } else if c == 34 as u8 {
+            in_quotes = true
+            have = true
+        } else if c == 44 as u8 || c == 10 as u8 {
+            let len: usize = rt.buf_len(&(*t).text) - field_start
+            if c == 44 as u8 || have || in_row > 0 || len > 0 {
+                vec_push[u64](&(*t).cells, ((field_start as u64) << 32) | len as u64)
+                in_row = in_row + 1
+            }
+            field_start = rt.buf_len(&(*t).text)
+            have = false
+            if c == 10 as u8 {
+                if (*t).cols == 0 {
+                    (*t).cols = in_row
+                }
+                in_row = 0
+            }
+        } else if c != 13 as u8 {
+            rt.buf_push(&(*t).text, c)
+            have = true
+        }
+        i = i + 1
+    }
+    // a last row without a newline
+    let len: usize = rt.buf_len(&(*t).text) - field_start
+    if in_row > 0 || len > 0 {
+        vec_push[u64](&(*t).cells, ((field_start as u64) << 32) | len as u64)
+        in_row = in_row + 1
+        if (*t).cols == 0 {
+            (*t).cols = in_row
+        }
+    }
+}
+
+fn table_rows(t: *mut Table) -> usize {
+    if (*t).cols == 0 {
+        return 0
+    }
+    return vec_len[u64](&(*t).cells) / (*t).cols - 1
+}
+
+fn cell_at(t: *mut Table, idx: usize) -> str {
+    let v: u64 = vec_at[u64](&(*t).cells, idx)
+    return as_str(rt.buf_ptr(&(*t).text) + (v >> 32), (v & 4294967295) as usize)
+}
+
+// the column number of a header name, or 1000000 when there is none
+fn col_of(t: *mut Table, name: str) -> usize {
+    var c: usize = 0
+    while c < (*t).cols {
+        if cell_at(t, c).equal(name) {
+            return c
+        }
+        c = c + 1
+    }
+    return 1000000
+}
+
+// the cell of data row `row` (0 based) in the column called `name`
+fn cell(t: *mut Table, row: usize, name: str) -> str {
+    let c: usize = col_of(t, name)
+    if c >= (*t).cols {
+        return ""
+    }
+    return cell_at(t, (row + 1) * (*t).cols + c)
+}
+
+// the first data row whose column `name` equals `value`, or 1000000
+fn find_row(t: *mut Table, name: str, value: str) -> usize {
+    var r: usize = 0
+    while r < table_rows(t) {
+        if cell(t, r, name).equal(value) {
+            return r
+        }
+        r = r + 1
+    }
+    return 1000000
+}
+
+fn sum_of(t: *mut Table, name: str) -> i64 {
+    var s: i64 = 0
+    var r: usize = 0
+    while r < table_rows(t) {
+        s = s + text.int(cell(t, r, name))
+        r = r + 1
+    }
+    return s
+}
+
+// ------------------------------------------------------------ the op call
+// `op report <name> --csv` with tests/golden/<project>/project.json on stdin.
+fn rows(op: str, name: str, project: str, t: *mut Table) {
+    var path: rt.Buf = rt.buf_new()
+    push(&path, "tests/golden/")
+    push(&path, project)
+    push(&path, "/project.json")
+    var data: rt.Buf = rt.buf_new()
+    fs.read_file(as_str(rt.buf_ptr(&path), rt.buf_len(&path)), &data) catch 0
+    var c: process.Command = process.command(op)
+    process.add_arg(&c, "report")
+    process.add_arg(&c, name)
+    process.add_arg(&c, "--csv")
+    var out: rt.Buf = rt.buf_new()
+    var err: rt.Buf = rt.buf_new()
+    process.run_io(&c, rt.buf_ptr(&data), rt.buf_len(&data), &out, &err, 60000) catch 99
+    csv_parse(as_str(rt.buf_ptr(&out), rt.buf_len(&out)), t)
+    process.command_free(&c)
+    rt.buf_free(&path)
+    rt.buf_free(&data)
+    rt.buf_free(&out)
+    rt.buf_free(&err)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        say("usage: check_lists <op binary>\n")
+        return 2
+    }
+    let a1: u64 = rt.arg_ptr(start, 1)
+    let op: str = as_str(a1, rt.c_length(a1))
+
+    var o: Table = table_new()
+    rows(op, "order_list", "reversing_contactor", &o)
+    let r_mcb: usize = find_row(&o, "part", "gen.mcb.1p.b16")
+    check(r_mcb < 1000000 && cell(&o, r_mcb, "quantity").equal("4") && cell(&o, r_mcb, "devices").equal("-F1, -F2, -F3, -F4"),
+        "the parts report added up per part: four breakers on one line")
+    let r_con: usize = find_row(&o, "part", "gen.contactor.3p.9a")
+    let r_mot: usize = find_row(&o, "part", "gen.motor.3ph")
+    check(r_con < 1000000 && r_mot < 1000000 && cell(&o, r_con, "quantity").equal("2") && cell(&o, r_con, "devices").equal("-K1, -K2")
+        && cell(&o, r_mot, "quantity").equal("1") && cell(&o, r_mot, "devices").equal("-M1"),
+        "two contactors, one motor")
+
+    var p: Table = table_new()
+    rows(op, "parts", "reversing_contactor", &p)
+    check(sum_of(&p, "quantity") == sum_of(&o, "quantity"), "the total is the same as in the parts report")
+
+    var u: Table = table_new()
+    rows(op, "unplaced", "cables", &u)
+    check(table_rows(&u) == 3
+        && cell(&u, 0, "device").equal("-X5") && cell(&u, 0, "definition").equal("connector")
+        && cell(&u, 1, "device").equal("-X6") && cell(&u, 1, "definition").equal("connector")
+        && cell(&u, 2, "device").equal("-W1") && cell(&u, 2, "definition").equal("cable"),
+        "the functions without a page: connectors and the cable")
+
+    var z: Table = table_new()
+    rows(op, "unplaced", "reversing_contactor", &z)
+    check(table_rows(&z) == 0, "a plan with everything on pages has none")
+
+    table_free(&o)
+    table_free(&p)
+    table_free(&u)
+    table_free(&z)
+    if failed == 0 {
+        say("lists: all checks passed\n")
+        return 0
+    }
+    say("lists: some checks FAILED\n")
+    return 1
+}
