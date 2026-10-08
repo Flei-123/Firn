@@ -130,8 +130,11 @@ w = sys.argv[1]
 rng = random.Random(3)
 parts = ['<?xml version="1.0" encoding="UTF-8"?>\n<catalog>\n']
 n = 0
-while sum(map(len, parts)) < 24_000_000:
-    parts.append('  <item id="%d" kind="k%d"><name>Item %d &amp; co</name><note><![CDATA[x<y]]> café</note></item>\n' % (n, rng.randrange(9), n))
+size = 0
+while size < 24_000_000:
+    line = '  <item id="%d" kind="k%d"><name>Item %d &amp; co</name><note><![CDATA[x<y]]> caf\u00e9</note></item>\n' % (n, rng.randrange(9), n)
+    parts.append(line)
+    size += len(line)
     n += 1
 parts.append('</catalog>\n')
 open(w + "/big.xml", "w", encoding="utf-8").write("".join(parts))
