@@ -15,9 +15,40 @@
 // linear in the length of the text times the size of the pattern, for
 // every pattern and every text. There is no backtracking, so there is no
 // pattern that takes exponential time ("catastrophic backtracking",
-// ReDoS). The price is the same as there: no backreferences (\1) and no
-// lookaround ((?=...), (?<=...)) -- both are refused with
-// `RegexError::Unsupported`, not approximated.
+// ReDoS). The price is the same as there: no backreferences (\1), refused
+// with `RegexError::Unsupported`, not approximated.
+//
+// LOOKAROUND (r320) -- `(?=X)` `(?!X)` `(?<=X)` `(?<!X)` -- is supported
+// WITHOUT giving the guarantee up, but the bound for a pattern that USES it
+// is polynomial, not linear (the honest statement, measured by
+// tools/regex_look/run.sh; n = text length, m = program size):
+//   * a pattern without lookaround: O(n m), as before.
+//   * a lookahead (?=X) / (?!X) at a position is a Pike run of X over the REST
+//     of the text, O(n m_X); it is evaluated at most once per position (the
+//     machine visits an instruction once per position), so a pattern with k
+//     lookaheads costs O(k n^2 m) in the worst case -- QUADRATIC, e.g.
+//     `(?=.*z)a` over "aaaa...a" scans the rest from every position. Text
+//     that has a "z" near the front, or lookaheads with a short reach, are
+//     fast. An ambiguous body such as `(?=(a|a)*b)` is no worse (still
+//     quadratic): there is no exponential case.
+//   * a lookbehind (?<=X) / (?<!X) must have a BOUNDED length (w characters
+//     at most, w <= 1000); all its candidate starts run in one Pike pass over
+//     the w characters before the position: O(w m_X) per position, O(n w m_X)
+//     in all -- linear in the text.
+//   * NESTED lookarounds (up to 3 deep): the answer of a lookaround at a
+//     position depends only on the instruction and the position, so each is
+//     computed once and remembered (a table of k x (n+1) bytes, built only
+//     when there are nested ones): the exponent does not grow with the depth,
+//     it stays 2 (O(k n^2 m)); without the table it would be n^(depth+1).
+//   * Python's `re` (and Perl, PCRE, Java) answer the same patterns by
+//     backtracking and take exponential time on some of them; this engine
+//     never does. It is NOT linear for lookahead, and the documentation does
+//     not pretend it is.
+// What is refused (as `Unsupported`, `Syntax` or `TooBig`): a capture group
+// inside a lookaround (write (?:...)); a lookbehind of unbounded length
+// (`(?<=a+)`, `(?<=a{2,})`) or wider than 1000 characters; lookarounds nested
+// deeper than 3; a quantifier after a lookaround (`(?=a)*`, which only
+// Python accepts, meaning nothing); backreferences.
 //
 // THE METHOD. The pattern is parsed into a tree, the tree is compiled into
 // a program for a small machine (Thompson 1968), and the program runs on
@@ -34,6 +65,7 @@
 //   \d \D \w \W \s \S (ASCII classes, as in RE2), \b \B word boundary,
 //   ^ $ (text start/end; line start/end with REGEX_MULTILINE), \A \z;
 //   ( ) capturing, (?: ) not capturing, (?P<name> ) and (?<name> ) named;
+//   (?=X) (?!X) (?<=X) (?<!X) lookahead and lookbehind (see LOOKAROUND above);
 //   | alternation; * + ? {n} {n,} {n,m} and their lazy forms *? +? ?? {..}?;
 //   inline flags (?i) (?m) (?s) (?-i) and scoped (?i: ... ).
 // The text is UTF-8 and is matched by CODE POINT: `.` is one character,
@@ -86,6 +118,15 @@ const N_ALT: u32 = 5 // left, right
 const N_REPEAT: u32 = 6 // left = child, a = min, b = max, c = 1 greedy
 const N_GROUP: u32 = 7 // left = child, a = capture index (0 = none)
 const N_ASSERT: u32 = 8 // a = kind
+const N_LOOK: u32 = 9 // left = child, a = look kind, b = min width, c = max width (INF = unbounded)
+
+// look kinds: bit 0 = negative, bit 1 = behind
+const L_AHEAD: u32 = 0
+const L_NOT_AHEAD: u32 = 1
+const L_BEHIND: u32 = 2
+const L_NOT_BEHIND: u32 = 3
+const MAX_LOOK_NEST: u32 = 3 // lookarounds inside lookarounds
+const MAX_BEHIND: u32 = 1000 // widest lookbehind, in characters
 
 // assertion kinds
 const A_TEXT_START: u32 = 0
@@ -106,6 +147,7 @@ const I_JMP: u32 = 6 // a
 const I_SAVE: u32 = 7 // a = slot
 const I_ASSERT: u32 = 8 // a = kind
 const I_MATCH: u32 = 9
+const I_LOOK: u32 = 10 // a = look kind, b = pc after the sub-program, c = index; the sub-program (ending in I_MATCH) follows
 
 struct Node {
     kind: u32,
@@ -128,6 +170,8 @@ struct Regex {
     ranges: Vec[u32], // pairs lo, hi (inclusive)
     ngroups: u32, // including group 0
     names: Vec[str], // index = group, "" = unnamed
+    looks: Vec[u32], // per lookaround instruction: min width, max width (in characters)
+    max_nest: u32, // deepest nesting of lookarounds (0 = none)
 }
 
 struct Match {
@@ -189,6 +233,8 @@ struct Parser {
     names: Vec[str],
     err: u32, // 0 fine, 1 syntax, 2 unsupported, 3 too big, 4 groups
     err_at: usize,
+    look: u32, // lookaround nesting at this point of the pattern
+    max_look: u32,
 }
 
 static mut last_error_offset: usize = 0
@@ -557,6 +603,123 @@ fn parse_flags(ps: *mut Parser, flags: *mut u32) -> bool {
     return false
 }
 
+// The width of a subtree in characters: *lo..*hi (INF = unbounded). Every
+// consuming instruction takes exactly one code point, so this is exact.
+fn width(ps: *mut Parser, k: u32, lo: *mut u32, hi: *mut u32) {
+    let n: Node = *nd(ps, k)
+    *lo = 0
+    *hi = 0
+    if n.kind == N_LIT || n.kind == N_ANY || n.kind == N_CLASS {
+        *lo = 1
+        *hi = 1
+        return
+    }
+    if n.kind == N_GROUP {
+        width(ps, n.left, lo, hi)
+        return
+    }
+    if n.kind == N_CAT || n.kind == N_ALT {
+        var l1: u32 = 0
+        var h1: u32 = 0
+        var l2: u32 = 0
+        var h2: u32 = 0
+        width(ps, n.left, &l1, &h1)
+        width(ps, n.right, &l2, &h2)
+        if n.kind == N_CAT {
+            *lo = sat_add(l1, l2)
+            *hi = sat_add(h1, h2)
+        } else {
+            *lo = l1
+            if l2 < l1 {
+                *lo = l2
+            }
+            *hi = h1
+            if h2 > h1 {
+                *hi = h2
+            }
+        }
+        return
+    }
+    if n.kind == N_REPEAT {
+        var l1: u32 = 0
+        var h1: u32 = 0
+        width(ps, n.left, &l1, &h1)
+        *lo = sat_mul(l1, n.a)
+        if h1 == 0 {
+            *hi = 0
+        } else {
+            *hi = sat_mul(h1, n.b)
+        }
+    }
+    // N_EMPTY, N_ASSERT, N_LOOK: zero width
+}
+
+fn sat_add(a: u32, b: u32) -> u32 {
+    if a == INF || b == INF {
+        return INF
+    }
+    let s: u64 = a as u64 + b as u64
+    if s >= INF as u64 {
+        return INF
+    }
+    return s as u32
+}
+
+fn sat_mul(a: u32, b: u32) -> u32 {
+    if a == 0 || b == 0 {
+        return 0
+    }
+    if a == INF || b == INF {
+        return INF
+    }
+    let s: u64 = a as u64 * b as u64
+    if s >= INF as u64 {
+        return INF
+    }
+    return s as u32
+}
+
+// The "(?=", "(?!", "(?<=" or "(?<!" is consumed; parses up to and including
+// the closing ")". No captures inside (they could not be reported in the
+// same way as outside, and Python's would not match RE2's rules anyway).
+fn parse_look(ps: *mut Parser, behind: bool, neg: bool) -> u32 {
+    if (*ps).look >= MAX_LOOK_NEST {
+        return fail(ps, 3)
+    }
+    let saved: u32 = (*ps).flags
+    (*ps).look = (*ps).look + 1
+    if (*ps).look > (*ps).max_look {
+        (*ps).max_look = (*ps).look
+    }
+    let inner: u32 = parse_alt(ps)
+    (*ps).look = (*ps).look - 1
+    (*ps).flags = saved
+    if (*ps).err != 0 {
+        return 0 as u32
+    }
+    if at_end(ps) || peek(ps) != 41 {
+        return fail(ps, 1)
+    }
+    (*ps).i = (*ps).i + 1
+    var lo: u32 = 0
+    var hi: u32 = 0
+    width(ps, inner, &lo, &hi)
+    var kind: u32 = L_AHEAD
+    if behind {
+        kind = L_BEHIND
+        if hi == INF {
+            return fail(ps, 2) // a lookbehind of unbounded length
+        }
+        if hi > MAX_BEHIND {
+            return fail(ps, 3)
+        }
+    }
+    if neg {
+        kind = kind + 1
+    }
+    return node(ps, N_LOOK, kind, lo, hi, inner, 0)
+}
+
 fn parse_group(ps: *mut Parser) -> u32 {
     (*ps).i = (*ps).i + 1 // "("
     var cap: u32 = 0
@@ -571,9 +734,11 @@ fn parse_group(ps: *mut Parser) -> u32 {
         if k == 58 { // (?:
             (*ps).i = (*ps).i + 1
         } else if k == 61 || k == 33 {
-            return fail(ps, 2) // lookahead
+            (*ps).i = (*ps).i + 1
+            return parse_look(ps, false, k == 33) // (?= (?!
         } else if k == 60 && (after == 61 || after == 33) {
-            return fail(ps, 2) // lookbehind
+            (*ps).i = (*ps).i + 2
+            return parse_look(ps, true, after == 33) // (?<= (?<!
         } else if k == 80 || k == 60 { // (?P<name> or (?<name>
             if k == 80 {
                 (*ps).i = (*ps).i + 1
@@ -596,6 +761,9 @@ fn parse_group(ps: *mut Parser) -> u32 {
             }
             let name: str = __str_copy(str { p: rt.ptr_of((*ps).p + st as u64), n: (*ps).i - st })
             (*ps).i = (*ps).i + 1
+            if (*ps).look > 0 {
+                return fail(ps, 2) // a capture inside a lookaround
+            }
             if (*ps).ngroups >= MAX_GROUPS {
                 return fail(ps, 4)
             }
@@ -617,6 +785,9 @@ fn parse_group(ps: *mut Parser) -> u32 {
             (*ps).flags = fl
         }
     } else {
+        if (*ps).look > 0 {
+            return fail(ps, 2) // a capture inside a lookaround
+        }
         if (*ps).ngroups >= MAX_GROUPS {
             return fail(ps, 4)
         }
@@ -735,8 +906,8 @@ fn parse_repeat(ps: *mut Parser) -> u32 {
             greedy = 0
         }
         let k: u32 = (*nd(ps, a)).kind
-        if k == N_EMPTY {
-            return fail(ps, 1) // (?i)* and the like
+        if k == N_EMPTY || k == N_LOOK {
+            return fail(ps, 1) // (?i)*, (?=a)+ and the like
         }
         a = node(ps, N_REPEAT, min, max, greedy, a, 0)
         // a** / a+* / a{2}{3}: refused, as RE2 and Python do
@@ -820,6 +991,17 @@ fn compile_node(r: *mut Regex, ps: *mut Parser, k: u32) -> bool {
         emit(r, I_ASSERT, n.a, 0, 0)
         return true
     }
+    if n.kind == N_LOOK {
+        // I_LOOK kind, <pc after>, index ; <sub-program> ; I_MATCH
+        let idx: u32 = (vec_len[u32](&(*r).looks) / 2) as u32
+        vec_push[u32](&(*r).looks, n.b)
+        vec_push[u32](&(*r).looks, n.c)
+        let look: u32 = emit(r, I_LOOK, n.a, 0, idx)
+        if !compile_node(r, ps, n.left) { return false }
+        emit(r, I_MATCH, 0, 0, 0)
+        (*inst(r, look)).b = pc(r)
+        return true
+    }
     if n.kind == N_CAT {
         return compile_node(r, ps, n.left) && compile_node(r, ps, n.right)
     }
@@ -897,13 +1079,14 @@ fn compile_node(r: *mut Regex, ps: *mut Parser, k: u32) -> bool {
 // REGEX_DOTALL (or'ed).
 fn regex_compile(pattern: str, flags: u32) -> RegexError!Regex {
     var ps: Parser = Parser { p: pattern.p as u64, n: pattern.n, i: 0, flags: flags & 7, nodes: vec_new[Node](),
-        ranges: vec_new[u32](), ngroups: 1, names: vec_new[str](), err: 0, err_at: 0 }
+        ranges: vec_new[u32](), ngroups: 1, names: vec_new[str](), err: 0, err_at: 0, look: 0, max_look: 0 }
     vec_push[str](&ps.names, "")
     let root: u32 = parse_alt(&ps)
     if ps.err == 0 && !at_end(&ps) {
         fail(&ps, 1) // an unmatched ")"
     }
-    var r: Regex = Regex { prog: vec_new[Inst](), ranges: ps.ranges, ngroups: ps.ngroups, names: ps.names }
+    var r: Regex = Regex { prog: vec_new[Inst](), ranges: ps.ranges, ngroups: ps.ngroups, names: ps.names,
+        looks: vec_new[u32](), max_nest: ps.max_look }
     var err: u32 = ps.err
     if err == 0 {
         emit(&r, I_SAVE, 0, 0, 0)
@@ -933,6 +1116,7 @@ fn regex_free(r: *mut Regex) {
     vec_free[Inst](&(*r).prog)
     vec_free[u32](&(*r).ranges)
     vec_free[str](&(*r).names)
+    vec_free[u32](&(*r).looks)
 }
 
 // Number of groups including group 0 (the whole match).
@@ -969,6 +1153,15 @@ struct Vm {
     cur: Vec[i64], // capture positions while following epsilon edges
     stack: Vec[u64], // (pc << 1) | 0 = visit, (slot << 33) | 1 = restore
     saved: Vec[i64], // old values for the restore entries
+    mt: u64, // *mut Matcher: the work areas of the lookaround sub-runs
+    depth: usize, // 0 = the main run, n = a sub-run inside n lookarounds
+}
+
+// The work areas of one nesting level of lookaround sub-runs.
+struct Sub {
+    vm: Vm,
+    la: Threads,
+    lb: Threads,
 }
 
 fn is_word(c: u32) -> bool {
@@ -1026,6 +1219,16 @@ fn add_thread(vm: *mut Vm, t: *mut Threads, pc0: u32, pos: usize) {
             if assert_holds(vm, ins.a, pos) {
                 vec_push[u64](&(*vm).stack, ((at + 1) as u64) << 1)
             }
+        } else if ins.op == I_LOOK {
+            // a lookaround is a zero-width test of the text at `pos`, whatever
+            // the thread did before: it is run once, as a sub-run of its own
+            var ok: bool = look_eval(vm, at, ins, pos)
+            if ins.a == L_NOT_AHEAD || ins.a == L_NOT_BEHIND {
+                ok = !ok
+            }
+            if ok {
+                vec_push[u64](&(*vm).stack, (ins.b as u64) << 1)
+            }
         } else {
             // a consuming instruction or MATCH: the thread lives here
             vec_push[u32](&(*t).pcs, at)
@@ -1036,6 +1239,164 @@ fn add_thread(vm: *mut Vm, t: *mut Threads, pc0: u32, pos: usize) {
             }
         }
     }
+}
+
+// The start of the character that ends at `q` (q > 0), as `decode` reads the
+// text forwards: a lead octet starts a character, a continuation octet belongs
+// to the lead before it only if the two make one valid sequence.
+fn prev_boundary(p: u64, n: usize, q: usize) -> usize {
+    let b: u32 = rt.ld8(p, q - 1) as u32
+    if (b & 192) != 128 {
+        return q - 1
+    }
+    var back: usize = 1
+    while back < 4 && back < q {
+        let c: u32 = rt.ld8(p, q - 1 - back) as u32
+        if (c & 192) != 128 {
+            var len: usize = 0
+            decode(p, n, q - 1 - back, &len)
+            if len == back + 1 {
+                return q - 1 - back
+            }
+            return q - 1
+        }
+        back = back + 1
+    }
+    return q - 1
+}
+
+fn has_match(r: *mut Regex, t: *mut Threads) -> bool {
+    var i: usize = 0
+    let n: usize = vec_len[u32](&(*t).pcs)
+    while i < n {
+        if (*inst(r, vec_at[u32](&(*t).pcs, i))).op == I_MATCH {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Does the body of the lookaround at `at` match at `pos`? Ahead: starting at
+// `pos`, to any length. Behind: ending at `pos`, starting between `lo` and
+// `hi` characters back. (The caller negates for (?! and (?<!.)
+//
+// This is a Pike run of its own over the body, with no captures (there are
+// none inside a lookaround): all candidate starts of a lookbehind go into ONE
+// run, so a lookbehind costs O(width x body), a lookahead O(rest of the text x
+// body). The answer depends only on (instruction, position), never on the
+// thread that asked, which is what makes the memo for nested lookarounds valid.
+fn look_eval(vm: *mut Vm, at: u32, ins: Inst, pos: usize) -> bool {
+    let mt: *mut Matcher = (*vm).mt as *mut Matcher
+    let r: *mut Regex = (*vm).r as *mut Regex
+    let n: usize = (*vm).n
+    let text: u64 = (*vm).p
+    var mi: usize = 0
+    let memo: bool = vec_len[u8](&(*mt).memo) > 0
+    if memo {
+        mi = ins.c as usize * (n + 1) + pos
+        let v: u8 = vec_at[u8](&(*mt).memo, mi)
+        if v != 0 as u8 {
+            return v == 1 as u8
+        }
+    }
+    let behind: bool = ins.a >= 2
+    let sub: *mut Sub = vec_elem_ptr[Sub](&(*mt).subs, (*vm).depth)
+    let sv: *mut Vm = &(*sub).vm
+    (*sv).r = (*vm).r
+    (*sv).p = text
+    (*sv).n = n
+    (*sv).ncap = 0
+    (*sv).mt = (*vm).mt
+    (*sv).depth = (*vm).depth + 1
+    var clist: *mut Threads = &(*sub).la
+    var nlist: *mut Threads = &(*sub).lb
+    if (*sv).gen > 3000000000 as u32 {
+        var k: usize = 0
+        while k < vec_len[u32](&(*clist).mark) {
+            vec_set[u32](&(*clist).mark, k, 0 as u32)
+            vec_set[u32](&(*nlist).mark, k, 0 as u32)
+            k = k + 1
+        }
+        (*sv).gen = 1
+    }
+    vec_clear[u32](&(*clist).pcs)
+    vec_clear[u32](&(*nlist).pcs)
+
+    var p: usize = pos
+    var starts_until: usize = pos // a lookbehind may start up to here
+    var go: bool = true
+    if behind {
+        let lo: u32 = vec_at[u32](&(*r).looks, (ins.c * 2) as usize)
+        let hi: u32 = vec_at[u32](&(*r).looks, (ins.c * 2 + 1) as usize)
+        var q: usize = pos
+        var latest: usize = pos
+        var k: u32 = 0
+        while k < hi && q > 0 {
+            q = prev_boundary(text, n, q)
+            k = k + 1
+            if k == lo {
+                latest = q
+            }
+        }
+        if k < lo {
+            go = false // fewer than `lo` characters before `pos`
+        }
+        p = q
+        starts_until = latest
+    }
+    var result: bool = false
+    (*sv).gen = (*sv).gen + 1
+    while go {
+        if behind {
+            if p <= starts_until {
+                add_thread(sv, clist, at + 1, p)
+            }
+            if p == pos {
+                result = has_match(r, clist)
+                break
+            }
+        } else {
+            if p == pos {
+                add_thread(sv, clist, at + 1, p)
+            }
+            if has_match(r, clist) {
+                result = true
+                break
+            }
+        }
+        if vec_len[u32](&(*clist).pcs) == 0 && (!behind || p >= starts_until) {
+            break
+        }
+        if p >= n {
+            break
+        }
+        var len: usize = 0
+        let c: u32 = decode(text, n, p, &len)
+        (*sv).gen = (*sv).gen + 1
+        vec_clear[u32](&(*nlist).pcs)
+        var t: usize = 0
+        let nt: usize = vec_len[u32](&(*clist).pcs)
+        while t < nt {
+            let tpc: u32 = vec_at[u32](&(*clist).pcs, t)
+            if step_matches(r, *inst(r, tpc), c) {
+                add_thread(sv, nlist, tpc + 1, p + len)
+            }
+            t = t + 1
+        }
+        p = p + len
+        let tmp: *mut Threads = clist
+        clist = nlist
+        nlist = tmp
+    }
+    if memo {
+        if result {
+            vec_set[u8](&(*mt).memo, mi, 1 as u8)
+        } else {
+            vec_set[u8](&(*mt).memo, mi, 2 as u8)
+        }
+    }
+    return result
 }
 
 fn class_has(r: *mut Regex, first: u32, count: u32, c: u32) -> bool {
@@ -1106,6 +1467,8 @@ struct Matcher {
     vm: Vm,
     la: Threads,
     lb: Threads,
+    subs: Vec[Sub], // one per nesting level of lookaround
+    memo: Vec[u8], // (look instruction, position) -> 0 unknown, 1 yes, 2 no; only with nested lookarounds
 }
 
 fn matcher_new(r: *mut Regex) -> Matcher {
@@ -1113,8 +1476,16 @@ fn matcher_new(r: *mut Regex) -> Matcher {
     let ncap: usize = (*r).ngroups as usize * 2
     var mt: Matcher = Matcher { r: r as u64,
         vm: Vm { r: r as u64, p: 0, n: 0, ncap: ncap, gen: 1, cur: vec_new[i64](), stack: vec_new[u64](),
-            saved: vec_new[i64]() },
-        la: threads_new(size), lb: threads_new(size) }
+            saved: vec_new[i64](), mt: 0, depth: 0 },
+        la: threads_new(size), lb: threads_new(size), subs: vec_new[Sub](), memo: vec_new[u8]() }
+    var lv: u32 = 0
+    while lv < (*r).max_nest {
+        vec_push[Sub](&mt.subs, Sub {
+                vm: Vm { r: 0, p: 0, n: 0, ncap: 0, gen: 1, cur: vec_new[i64](), stack: vec_new[u64](),
+                    saved: vec_new[i64](), mt: 0, depth: 0 },
+                la: threads_new(size), lb: threads_new(size) })
+        lv = lv + 1
+    }
     var k: usize = 0
     while k < ncap {
         vec_push[i64](&mt.vm.cur, -1)
@@ -1129,6 +1500,18 @@ fn matcher_free(mt: *mut Matcher) {
     vec_free[i64](&(*mt).vm.cur)
     vec_free[u64](&(*mt).vm.stack)
     vec_free[i64](&(*mt).vm.saved)
+    var i: usize = 0
+    while i < vec_len[Sub](&(*mt).subs) {
+        let sb: *mut Sub = vec_elem_ptr[Sub](&(*mt).subs, i)
+        threads_free(&(*sb).la)
+        threads_free(&(*sb).lb)
+        vec_free[i64](&(*sb).vm.cur)
+        vec_free[u64](&(*sb).vm.stack)
+        vec_free[i64](&(*sb).vm.saved)
+        i = i + 1
+    }
+    vec_free[Sub](&(*mt).subs)
+    vec_free[u8](&(*mt).memo)
 }
 
 // The leftmost-first match starting at octet `from` or later. true = found
@@ -1142,7 +1525,22 @@ fn matcher_find(mt: *mut Matcher, s: str, from: usize, m: *mut Match) -> bool {
     let vm: *mut Vm = &(*mt).vm
     (*vm).p = s.p as u64
     (*vm).n = s.n
+    (*vm).mt = mt as u64
+    (*vm).depth = 0
     var k: usize = 0
+    // nested lookarounds: remember each answer, so that the inner one is worked
+    // out once per position however many outer sub-runs ask for it
+    vec_clear[u8](&(*mt).memo)
+    if (*r).max_nest >= 2 {
+        let total: usize = (vec_len[u32](&(*r).looks) / 2) * (s.n + 1)
+        if total <= 67108864 {
+            k = 0
+            while k < total {
+                vec_push[u8](&(*mt).memo, 0 as u8)
+                k = k + 1
+            }
+        }
+    }
     if (*vm).gen > 3000000000 as u32 {
         // the generation numbers are about to wrap: clear the marks
         k = 0
