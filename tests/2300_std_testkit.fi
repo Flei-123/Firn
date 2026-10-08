@@ -1,0 +1,269 @@
+// expect_exit: 0
+// tests/2300_std_testkit.fi -- std.testkit (docs/SKRIPT-LIBS.md, r311).
+//
+// Two halves. The first shows that assertions that HOLD are silent (a
+// failing one would end this very process with exit code 101). The second
+// is the one that matters for a test library: every assertion is run FAILING
+// in a child process (fork), and the parent checks the ending -- exit code
+// 101, the exact text on standard error -- so that "an assert that never
+// fails" cannot pass this file. The script style (`check` / `finish`) is
+// captured the same way, byte for byte.
+import std.testkit
+import std.rt
+
+static mut verdict_bad: i32 = 0
+static mut cap: [u8; 4096] = [0; 4096]
+static mut cap_len: usize = 0
+static mut cap_code: i64 = 0 - 1
+static mut cap_signal: i64 = 0
+
+fn expect(ok: bool, name: str) {
+    if !ok {
+        verdict_bad = verdict_bad + 1
+        var b: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&b, "  FAIL  ".p as u64, 8)
+        rt.buf_push_bytes(&b, name.p as u64, name.length())
+        rt.buf_push(&b, 10 as u8)
+        rt.write_everything(1, rt.buf_ptr(&b), rt.buf_len(&b))
+        rt.buf_free(&b)
+    }
+}
+
+// ------------------------------------------------------------ the child
+
+// Runs `f` in a child with standard output and error on one pipe; the
+// parent keeps the text in `cap` and the ending in `cap_code`/`cap_signal`.
+fn run_child(f: fn()) {
+    var fds: [i32; 2] = [0 as i32; 2]
+    cap_len = 0
+    cap_code = 0 - 1
+    cap_signal = 0
+    if syscall(293, (&fds[0]) as i64, 0, 0, 0, 0, 0) < 0 {
+        return
+    }
+    let pid: i64 = syscall(57, 0, 0, 0, 0, 0, 0)
+    if pid == 0 {
+        syscall(3, fds[0] as i64, 0, 0, 0, 0, 0)
+        syscall(33, fds[1] as i64, 1, 0, 0, 0, 0)
+        syscall(33, fds[1] as i64, 2, 0, 0, 0, 0)
+        syscall(3, fds[1] as i64, 0, 0, 0, 0, 0)
+        syscall(37, 20, 0, 0, 0, 0, 0)
+        f()
+        syscall(231, 0, 0, 0, 0, 0, 0)
+    }
+    syscall(3, fds[1] as i64, 0, 0, 0, 0, 0)
+    var run: bool = true
+    while run {
+        let space: usize = 4096 - cap_len
+        if space == 0 {
+            run = false
+        } else {
+            let r: i64 = syscall(0, fds[0] as i64, ((&cap[0]) as i64) + cap_len as i64, space as i64, 0, 0, 0)
+            if r <= 0 {
+                run = false
+            } else {
+                cap_len = cap_len + r as usize
+            }
+        }
+    }
+    syscall(3, fds[0] as i64, 0, 0, 0, 0, 0)
+    var status: i32 = 0
+    syscall(61, pid, (&status) as i64, 0, 0, 0, 0)
+    cap_signal = (status & 127) as i64
+    if cap_signal == 0 {
+        cap_code = ((status >> 8) & 255) as i64
+    }
+}
+
+fn captured() -> str {
+    return str { p: (&cap[0]) as *mut u8, n: cap_len }
+}
+
+fn contains(hay: str, needle: str) -> bool {
+    let n: usize = needle.length()
+    let h: usize = hay.length()
+    if n > h {
+        return false
+    }
+    var i: usize = 0
+    while i + n <= h {
+        if rt.mem_eq(hay.p as u64 + i as u64, needle.p as u64, n) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The child must end with a panic (101) and say `needle`.
+fn dies_with(f: fn(), needle: str, name: str) {
+    run_child(f)
+    expect(cap_code == 101 && cap_signal == 0, name)
+    expect(contains(captured(), needle), name)
+}
+
+// The child must end with a panic and say EXACTLY `want`.
+fn dies_exactly(f: fn(), want: str, name: str) {
+    run_child(f)
+    expect(cap_code == 101 && cap_signal == 0, name)
+    expect(captured().equal(want), name)
+}
+
+fn survives(f: fn(), name: str) {
+    run_child(f)
+    expect(cap_code == 0 && cap_signal == 0 && cap_len == 0, name)
+}
+
+// --------------------------------------------------------- failing cases
+fn c_true_fails() { testkit.assert_true(1 > 2, "boom") }
+fn c_false_fails() { testkit.assert_false(2 > 1, "never") }
+fn c_fail() { testkit.fail("by hand") }
+fn c_eq_i64() { testkit.assert_eq_i64(3, 4) }
+fn c_eq_i64_neg() { testkit.assert_eq_i64(0 - 9223372036854775807 - 1, 5) }
+fn c_eq_u64() { testkit.assert_eq_u64(18446744073709551615 as u64, 1 as u64) }
+fn c_ne_i64() { testkit.assert_ne_i64(7, 7) }
+fn c_eq_i8() { assert_eq[i8](-128 as i8, 127 as i8) }
+fn c_eq_u16() { assert_eq[u16](65535 as u16, 0 as u16) }
+fn c_eq_usize() { assert_eq[usize](5 as usize, 6 as usize) }
+fn c_str_one_char() { testkit.assert_eq_str("hello wxrld", "hello world") }
+fn c_str_prefix() { testkit.assert_eq_str("abc", "abcdef") }
+fn c_str_empty() { testkit.assert_eq_str("", "x") }
+fn c_str_lines() { testkit.assert_eq_str("one\ntwo\nthree", "one\ntwo\nthrEe") }
+fn c_str_escape() { testkit.assert_eq_str("a\"b\\c\td", "a\"b\\c\te") }
+fn c_str_long() {
+    testkit.assert_eq_str("0123456789012345678901234567890123456789012345678901234567890123456789", "0123456789012345678901234567890123456789012X45678901234567890123456789")
+}
+fn c_bytes() {
+    var a: [u8; 4] = [1 as u8, 2 as u8, 3 as u8, 4 as u8]
+    var b: [u8; 4] = [1 as u8, 2 as u8, 9 as u8, 4 as u8]
+    testkit.assert_eq_bytes((&a[0]) as u64, 4, (&b[0]) as u64, 4)
+}
+fn c_bytes_len() {
+    var a: [u8; 4] = [1 as u8, 2 as u8, 3 as u8, 4 as u8]
+    testkit.assert_eq_bytes((&a[0]) as u64, 4, (&a[0]) as u64, 3)
+}
+fn c_near_far() { testkit.assert_near(1.0, 1.5, 0.1) }
+fn c_near_nan() { testkit.assert_near(0.0 / 0.0, 0.0 / 0.0, 1.0e300) }
+fn c_near_inf() { testkit.assert_near(1.0 / 0.0, 5.0, 1.0e300) }
+fn c_near_infs() { testkit.assert_near(1.0 / 0.0, 0.0 - 1.0 / 0.0, 1.0e300) }
+fn c_context_str() {
+    testkit.context("lab")
+    testkit.assert_eq_str("ab", "ac")
+}
+fn c_context() {
+    testkit.context("group A")
+    testkit.assert_eq_i64(1, 2)
+}
+
+// the script style, in a child so that its output can be read
+fn c_script() {
+    testkit.check(true, "first")
+    testkit.check(false, "second")
+    testkit.check_detail(false, "third", "why")
+    testkit.check_detail(true, "fourth", "unused")
+    syscall(231, testkit.finish() as i64, 0, 0, 0, 0, 0)
+}
+fn c_script_ok() {
+    testkit.check(true, "only")
+    syscall(231, testkit.finish_named("mine") as i64, 0, 0, 0, 0, 0)
+}
+fn c_script_empty() {
+    syscall(231, testkit.finish() as i64, 0, 0, 0, 0, 0)
+}
+fn c_script_counts() {
+    testkit.check(true, "a")
+    testkit.check(false, "b")
+    var ok: i64 = 0
+    if testkit.checks_run() == 2 && testkit.checks_failed() == 1 {
+        ok = 1
+    }
+    testkit.reset()
+    if testkit.checks_run() == 0 && testkit.checks_failed() == 0 {
+        ok = ok + 1
+    }
+    syscall(231, ok, 0, 0, 0, 0, 0)
+}
+
+// ------------------------------------------------------------ passing cases
+fn c_all_hold() {
+    testkit.assert_true(true, "t")
+    testkit.assert_false(false, "f")
+    testkit.assert_eq_i64(0 - 5, 0 - 5)
+    testkit.assert_eq_i64(0 - 9223372036854775807 - 1, 0 - 9223372036854775807 - 1)
+    testkit.assert_eq_u64(18446744073709551615 as u64, 18446744073709551615 as u64)
+    testkit.assert_ne_i64(1, 2)
+    assert_eq[i8](-128 as i8, -128 as i8)
+    assert_eq[u8](255 as u8, 255 as u8)
+    assert_eq[i32](7 as i32, 7 as i32)
+    assert_eq[usize](9 as usize, 9 as usize)
+    testkit.assert_eq_str("", "")
+    testkit.assert_eq_str("same", "same")
+    testkit.assert_eq_str("tail", "tail")
+    var a: [u8; 3] = [7 as u8, 8 as u8, 9 as u8]
+    var b: [u8; 3] = [7 as u8, 8 as u8, 9 as u8]
+    testkit.assert_eq_bytes((&a[0]) as u64, 3, (&b[0]) as u64, 3)
+    testkit.assert_eq_bytes((&a[0]) as u64, 0, (&b[0]) as u64, 0)
+    testkit.assert_near(1.0, 1.0, 0.0)
+    testkit.assert_near(0.1 + 0.2, 0.3, 1.0e-12)
+    testkit.assert_near(1.0e20, 1.0e20 + 1.0e6, 1.0e-9)
+    testkit.assert_near(1.0 / 0.0, 1.0 / 0.0, 0.0)
+    testkit.assert_near(0.0 - 1.0 / 0.0, 0.0 - 1.0 / 0.0, 0.0)
+    testkit.context("")
+}
+
+fn main() -> i32 {
+    // assertions that hold do not make a sound and do not end the process
+    survives(c_all_hold, "assertions that hold are silent")
+    c_all_hold()
+
+    dies_exactly(c_true_fails, "assert failed: boom\n", "assert_true")
+    dies_exactly(c_false_fails, "assert failed (expected false): never\n", "assert_false")
+    dies_exactly(c_fail, "fail: by hand\n", "fail")
+    dies_exactly(c_eq_i64, "assert_eq failed: left=3 right=4\n", "assert_eq_i64")
+    dies_with(c_eq_i64_neg, "left=-9223372036854775808 right=5", "assert_eq_i64 minimum")
+    dies_exactly(c_eq_u64, "assert_eq failed: left=18446744073709551615 right=1\n", "assert_eq_u64")
+    dies_exactly(c_ne_i64, "assert_ne failed: both are 7\n", "assert_ne_i64")
+    dies_exactly(c_eq_i8, "assert_eq failed: left=-128 right=127\n", "assert_eq[i8]")
+    dies_exactly(c_eq_u16, "assert_eq failed: left=65535 right=0\n", "assert_eq[u16]")
+    dies_exactly(c_eq_usize, "assert_eq failed: left=5 right=6\n", "assert_eq[usize]")
+
+    // the text diff: lengths, octet, line/col, excerpt of both, caret
+    dies_exactly(c_str_one_char,
+        "assert_eq_str failed: lengths 11 and 11, first difference: octet 7 (line 1 col 8)\n  left : \"hello wxrld\"\n  right: \"hello world\"\n                 ^\n",
+        "assert_eq_str one char")
+    dies_with(c_str_prefix, "lengths 3 and 6, first difference: octet 3 (line 1 col 4)", "assert_eq_str prefix")
+    dies_with(c_str_empty, "lengths 0 and 1, first difference: octet 0 (line 1 col 1)", "assert_eq_str empty")
+    dies_with(c_str_lines, "first difference: octet 11 (line 3 col 4)", "assert_eq_str second line")
+    dies_with(c_str_lines, "left : \"one\\ntwo\\nthree\"", "assert_eq_str shows a newline escaped")
+    dies_with(c_str_escape, "left : \"a\\\"b\\\\c\\td\"", "assert_eq_str escapes quote, backslash, tab")
+    dies_with(c_str_long, "left : \"...", "assert_eq_str cuts a long text: leading dots")
+    dies_with(c_str_long, "...\"\n  right:", "assert_eq_str cuts a long text: trailing dots")
+    dies_with(c_str_long, "first difference: octet 43", "assert_eq_str long: octet")
+    dies_with(c_bytes, "first difference: octet 2", "assert_eq_bytes octet")
+    dies_with(c_bytes, "left : 01 02 [03] 04", "assert_eq_bytes left hex")
+    dies_with(c_bytes, "right: 01 02 [09] 04", "assert_eq_bytes right hex")
+    dies_with(c_bytes_len, "lengths 4 and 3, first difference: octet 3", "assert_eq_bytes length")
+    dies_with(c_bytes_len, "right: 01 02 03 [end]", "assert_eq_bytes end marker")
+
+    dies_with(c_near_far, "assert_near failed: left=1 right=1.5 diff=-0.5 eps=0.1", "assert_near far apart")
+    dies_with(c_near_nan, "assert_near failed", "assert_near NaN is not near NaN")
+    dies_with(c_near_inf, "assert_near failed", "assert_near inf vs finite")
+    dies_with(c_near_infs, "assert_near failed", "assert_near +inf vs -inf")
+    dies_exactly(c_context, "assert_eq failed: left=1 right=2 [group A]\n", "context label ends the first line")
+    dies_with(c_context_str, "octet 1 (line 1 col 2) [lab]\n  left : \"ab\"", "context label goes before the excerpt lines")
+
+    // script style, byte for byte
+    run_child(c_script)
+    expect(cap_code == 1, "finish returns 1 after a failure")
+    expect(captured().equal("  ok    first\n  FAIL  second\n  FAIL  third\n        why\n  ok    fourth\n4 checks, 2 failed\n"),
+        "check/finish output format")
+    run_child(c_script_ok)
+    expect(cap_code == 0, "finish returns 0 when all is ok")
+    expect(captured().equal("  ok    only\nmine: 1 checks, 0 failed\n"), "finish_named prints the label")
+    run_child(c_script_empty)
+    expect(cap_code == 0 && captured().equal("0 checks, 0 failed\n"), "finish with nothing checked")
+    run_child(c_script_counts)
+    expect(cap_code == 2, "counters and reset")
+
+    return verdict_bad
+}

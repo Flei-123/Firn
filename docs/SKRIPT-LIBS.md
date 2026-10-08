@@ -91,6 +91,17 @@ testkit.finish() -> i32             // prints summary, returns 0/1 for `return` 
 Failures inside `#[test]` end the test through the panic path so `firnc --test` reports `file:line:col`.
 `check`/`finish` give the output format of OpenPlan's Python `check()` so a port stays diff-able.
 
+**Built (08.10.2026, branch `w-fsx`).** `lib/std/testkit.fi`, tests `tests/2300_std_testkit.fi` (every assert run failing in a forked child,
+exact message compared), `tools/testkit/run.sh` (test.sh section 101: `firnc --test` over assertions, script style, assert in `main`),
+`examples/testkit_script.fi`. Differences from the draft above, on purpose:
+* **No caller position.** The language has no caller-location intrinsic, so a failed assert cannot print `file:line:col` of the assert line;
+  `firnc --test` therefore reports the position of the **test function** (its fallback when the message has no ` at file:line:col`).
+  Instead `testkit.context("label")` adds ` [label]` to the first line of every failure. Open: a compiler intrinsic (e.g. `__caller_line()`)
+  would let the message carry the real position.
+* Extra: `assert_false`, `fail`, `assert_eq_u64`, `assert_ne_i64`, generic `assert_eq[T: Int]` (generic names are global in Firn, so it is
+  called without the `testkit.` prefix), `check_detail`, `finish_named(label)`, `checks_run`/`checks_failed`/`reset`.
+* `assert_near`: `|a-b| <= eps` OR `|a-b| <= eps * max(|a|,|b|)`; equal infinities are near, NaN is near to nothing.
+
 ### JSON `sort_keys` — `lib/std/json.fi` (r315)
 `json_write_opts(d, i, out, opts)` with flags `JSON_SORT_KEYS`, `JSON_ASCII`, indent width, separators; output byte-identical to
 `json.dumps(sort_keys=True, indent=N, ensure_ascii=…)`. Sort = by UTF-8 bytes (Python: by code point; identical for valid UTF-8).
