@@ -22,7 +22,7 @@
 #
 # COUNTER-CHECKS. A library with a deliberate bug has to be CAUGHT, otherwise
 # the comparison would pass with a harness that checks nothing: (1) hidden names
-# matched by `*`, (2) a class range written backwards that is not empty, (3) `?`
+# matched by `*`, (2) a class with a range written backwards that skips the exact translation, (3) `?`
 # that eats a byte and not a character.
 #
 # Needs python3. Exit 0 = no difference.
@@ -99,7 +99,7 @@ EOF
     fi
 }
 counter "hidden names matched by *" "    let sees_hidden: bool = (*c).hidden || (pattern.n > 0 && *pattern.p == G_DOT)" "    let sees_hidden: bool = true"
-counter "backwards range is not empty" "if c1 <= c2 && cp >= c1 && cp <= c2 {" "if cp >= c1 && cp <= c2 || cp == c1 {"
+counter "a class with a backwards range (Python's text cutting) answered by a plain false" "                return class_has_cut(pat, lo, hi, cp)" "                return false"
 counter "? eats one byte" "    if c == G_QUEST {
         *used = nl
         return pi + 1" "    if c == G_QUEST {
