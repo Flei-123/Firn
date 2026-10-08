@@ -1888,6 +1888,20 @@ if [ "$RLRC" -eq 0 ]; then
 else
     bad "tools/regex_look/run.sh failed (see .test-work/regex_look.log)"
     grep -E 'FAIL|DIFF|TOO FAST' "$WORK/regex_look.log" | head -12 | sed 's/^/   /' || true
+echo "== 110. std.xml against Python's expat / xml.etree, mutated documents and fuzz (tools/xml_cross/run.sh, r319) =="
+# 3,000 random well-formed documents and the tree expat builds for them (through xml.etree's TreeBuilder),
+# compared tree for tree, plus round trip; 6,000 byte-mutated documents where Python decides accepted/refused
+# (only the documented deviations of std.xml's HONEST list may differ, and they are counted); fuzz in every
+# build stage with an unmapped page behind the input (no over-read), release-safe (no overflow), a round trip of
+# whatever is accepted and an RSS check (no leak); counter-checks (the guard page kills an over-read, a
+# damaged expectation is noticed); a 24 MB document for the speed. XML_FAST=1: release-safe only.
+bash tools/xml_cross/run.sh > "$WORK/xml_cross.log" 2>&1 && XMRC=0 || XMRC=$?
+if [ "$XMRC" -eq 0 ]; then
+    ok
+    grep -E '^  xml: ' "$WORK/xml_cross.log" | sed 's/^/ /'
+else
+    bad "tools/xml_cross/run.sh failed (see .test-work/xml_cross.log)"
+    grep -E 'FAIL|differs|DIFF' "$WORK/xml_cross.log" | head -12 | sed 's/^/   /' || true
 fi
 
 TOTAL=$((PASS + FAIL))
