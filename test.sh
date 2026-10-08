@@ -1804,6 +1804,21 @@ else
     grep -E 'FAIL|DIFF|differ' "$WORK/csv_cross.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 102. std.fsx against Python and cp: 500 random trees, 150 files, 6000 path pairs, 6000 fnmatch pairs (tools/fsx_cross/run.sh, r314) =="
+# tests/2341 (temp dirs, registry, copy_file) and tests/2342 (fnmatch, copy_tree, walk, paths) are in section 3.
+# Here std.fsx is held against shutil.copytree and `cp -a` on random trees (plain / ignore / dirs_exist_ok /
+# follow symlinks; content, modes, links, empty directories), copy_file against `cp -p`, normpath/abspath/relpath
+# against os.path and fnmatch against fnmatch.fnmatchcase, with a self-test that the comparison strikes
+# (docs/SKRIPT-LIBS.md).
+bash tools/fsx_cross/run.sh > "$WORK/fsx_cross.log" 2>&1 && FXRC=0 || FXRC=$?
+if [ "$FXRC" -eq 0 ]; then
+    ok
+    grep -E '^(selftest|trees|files|paths|fnmatch|fsx_cross: seed)' "$WORK/fsx_cross.log" | sed 's/^/   /'
+else
+    bad "tools/fsx_cross/run.sh failed (see .test-work/fsx_cross.log)"
+    grep -E 'MISMATCH|FAIL|Traceback' "$WORK/fsx_cross.log" | head -10 | sed 's/^/   /' || true
+fi
+
 echo "== 114. std.glob against Python's glob and fnmatch modules (tools/glob_cross/run.sh, r314) =="
 # tests/2310, 2311 and examples/glob_find.fi are in section 3. Here lib/std/glob.fi is held against glob.glob(recursive=True,
 # root_dir=..., include_hidden=...) on random directory trees (files, directories, links to files and directories, broken links,

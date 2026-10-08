@@ -72,6 +72,25 @@ exists in `std.fs`; `fsx` only adds what is missing.
 Auto-clean: `defer` for normal exits; additionally a process-wide registry cleaned by `fsx.cleanup_all()`
 (called by the test runner and by `testkit.finish`) — a crash (signal) may leave the directory; HONEST says so.
 
+**Built (08.10.2026, branch `w-fsx`).** `lib/std/fsx.fi`; tests `tests/2341_std_fsx_temp.fi` (TempDir/TempFile, defer on the error path, registry,
+cleanup by a failing child, copy_file) and `tests/2342_std_fsx_tree.fi` (fnmatch, copy_tree, walk, paths); cross-check `tools/fsx_cross/run.sh`
+(test.sh section 102: 500 random trees against `cp -a` and `shutil.copytree`, 150 files against `cp -p`, 6000 path pairs against `os.path`, 6000
+patterns against `fnmatch.fnmatchcase`, plus a self-test that the comparison strikes); `examples/fsx_script.fi`. Differences from the draft above:
+* The call is `fsx.copy_tree(from, to, ignore)` with `ignore` = fnmatch patterns separated by `|` (matched against entry names at every level),
+  `fsx.copy_tree_opts(from, to, ignore, flags)` with `COPY_DIRS_EXIST_OK` / `COPY_FOLLOW_SYMLINKS`; the answer is the number of entries made.
+* `walk(root, cb, ctx)`: `cb(path, kind, ctx) -> i32` answers `WALK_CONTINUE` / `WALK_SKIP` / `WALK_STOP`; sorted, pre-order, links not followed.
+* Extra: `temp_dir_in(base, prefix)`, `temp_dir_keep`, `temp_file_new(prefix)` (armed in the registry), `normpath`, `cwd`, `fnmatch`, `registered_count`.
+* `temp_dir_drop` / `temp_file_drop` answer `bool` (not an error union) so that `defer` can call them.
+* `cleanup_all` is called by `testkit` (failed assertion and `finish`; testkit therefore imports fsx). It only removes what THIS process armed
+  (the registry stores the pid), so a forked child cannot delete the parent's directories. The `firnc --test` runner itself does not call it
+  (it has no imports by design); a test that fails through testkit does.
+* `copy_file_range` is not used (no entry in the AArch64/browser tables of `compiler/src/syscalls.rs`; a two-line change there would allow it);
+  `FICLONE` (reflink) is tried first, but only its fallback could be tested here (ext4).
+* Names: the fnmatch of Python merges the chunks of a reversed range (`[]-[!a]`) in a way no other glob does; std.fsx treats a reversed range as
+  empty, and the cross-check leaves such patterns out (about 0.5 %). `?` and `[...]` work on octets, not on characters.
+* Verified: x86-64 in the four build levels, AArch64 (tests 2340–2342 under qemu), Windows under Wine (temp_dir, copy_file, copy_tree; the
+  symlink calls were not exercised there).
+
 ### std.stats — `lib/std/stats.fi` (r316)
 Over `*mut f64` + `n` and over `Vec[f64]`:
 `mean` (Neumaier compensated, same result as `statistics.fmean` to 1 ulp on test data), `median`, `percentile(p)`
@@ -102,6 +121,8 @@ exact message compared), `tools/testkit/run.sh` (test.sh section 101: `firnc --t
   `firnc --test` therefore reports the position of the **test function** (its fallback when the message has no ` at file:line:col`).
   Instead `testkit.context("label")` adds ` [label]` to the first line of every failure. Open: a compiler intrinsic (e.g. `__caller_line()`)
   would let the message carry the real position.
+* The generic `assert_eq[T]` must be called **without** the `testkit.` prefix (`assert_eq[u8](a, b)`); a module-qualified generic call is refused by the
+  compiler ("only direct function names can be called").
 * Extra: `assert_false`, `fail`, `assert_eq_u64`, `assert_ne_i64`, generic `assert_eq[T: Int]` (generic names are global in Firn, so it is
   called without the `testkit.` prefix), `check_detail`, `finish_named(label)`, `checks_run`/`checks_failed`/`reset`.
 * `assert_near`: `|a-b| <= eps` OR `|a-b| <= eps * max(|a|,|b|)`; equal infinities are near, NaN is near to nothing.

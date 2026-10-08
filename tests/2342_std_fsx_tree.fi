@@ -1,0 +1,485 @@
+// expect_exit: 0
+// tests/2342_std_fsx_tree.fi -- std.fsx, the second half (docs/SKRIPT-LIBS.md,
+// r314): fnmatch, copy_tree, walk and the path functions. The expected
+// values of fnmatch / normpath / relpath come from Python
+// (fnmatch.fnmatchcase, os.path); the breadth is tools/fsx_cross.
+import std.fsx
+import std.fs
+import std.rt
+import std.dir
+import std.testkit
+
+static mut fn_bad: i32 = 0
+
+// ------------------------------------------------------------ helpers
+
+fn num_str(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, v)
+    let r: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return r
+}
+
+fn kind_of(path: str) -> u8 {
+    let info: fs.FileInfo = fs.lstat(path) catch fs.FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    return info.kind
+}
+
+fn mode_of(path: str) -> u32 {
+    let info: fs.FileInfo = fs.lstat(path) catch fs.FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    return info.mode
+}
+
+fn gone(path: str) -> bool {
+    return kind_of(path) == 255 as u8
+}
+
+fn text_of(path: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    fs.read_file(path, &b) catch 0
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn mkfile(path: str, text: str, mode: u32) -> FsError!bool {
+    try fs.write_file(path, text.p as u64, text.length())
+    return try fs.chmod(path, mode)
+}
+
+fn mkdir_m(path: str, mode: u32) -> FsError!bool {
+    try fs.mkdir_all(path)
+    return try fs.chmod(path, mode)
+}
+
+fn err_of(r: FsError) -> usize {
+    if r == FsError::NotFound { return 1002 }
+    if r == FsError::Exists { return 1017 }
+    if r == FsError::NotDir { return 1020 }
+    if r == FsError::Invalid { return 1022 }
+    if r == FsError::NameTooLong { return 1036 }
+    return 1999
+}
+
+fn tree_err(from: str, to: str, ignore: str, flags: u32) -> usize {
+    return fsx.copy_tree_opts(from, to, ignore, flags) catch | e | err_of(e)
+}
+
+// ------------------------------------------------------------ fnmatch / paths
+
+fn fn_case(pat: str, name: str, want: bool) {
+    if fsx.fnmatch(pat, name) != want {
+        fn_bad = fn_bad + 1
+        testkit.fail("fnmatch(" + pat + ", " + name + ") should be " + num_str(want as i64))
+    }
+}
+
+fn norm_case(path: str, want: str) {
+    testkit.assert_eq_str(fsx.normpath(path), want)
+}
+
+fn rel_case(path: str, base: str, want: str) {
+    testkit.assert_eq_str(fsx.relpath(path, base), want)
+}
+
+fn fnmatch_table() {
+    fn_case("*", "", true)
+    fn_case("*", "abc", true)
+    fn_case("?", "", false)
+    fn_case("?", "a", true)
+    fn_case("a*", "abc", true)
+    fn_case("*c", "abc", true)
+    fn_case("a*c", "abc", true)
+    fn_case("a*c", "ac", true)
+    fn_case("a*c", "abd", false)
+    fn_case("*.json", "x.json", true)
+    fn_case("*.json", "x.jsonx", false)
+    fn_case("*.json", ".json", true)
+    fn_case("a?c", "abc", true)
+    fn_case("a?c", "ac", false)
+    fn_case("[abc]", "b", true)
+    fn_case("[abc]", "d", false)
+    fn_case("[a-c]x", "bx", true)
+    fn_case("[a-c]x", "dx", false)
+    fn_case("[!a-c]x", "dx", true)
+    fn_case("[!a-c]x", "bx", false)
+    fn_case("[]]", "]", true)
+    fn_case("[!]]", "a", true)
+    fn_case("[!]]", "]", false)
+    fn_case("[", "[", true)
+    fn_case("a[", "a[", true)
+    fn_case("[a", "[a", true)
+    fn_case("*[", "x[", true)
+    fn_case("**", "anything", true)
+    fn_case("a**b", "ab", true)
+    fn_case("a**b", "axxb", true)
+    fn_case("*a*b*c*", "xaxbxcx", true)
+    fn_case("*a*b*c*", "xaxcxbx", false)
+    fn_case("a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaac", false)
+    fn_case("[a-]", "-", true)
+    fn_case("[a-]", "a", true)
+    fn_case("[-a]", "-", true)
+    fn_case("[a-c-e]", "d", false)
+    fn_case("tmp*", "tmp", true)
+    fn_case("tmp*", "tm", false)
+    fn_case(".*", ".git", true)
+    fn_case("*", ".hidden", true)
+    fn_case("[^a]", "^", true)
+    fn_case("[^a]", "b", false)
+    fn_case("a\\b", "a\\b", true)
+    fn_case("*.py[co]", "x.pyc", true)
+    fn_case("*.py[co]", "x.pyd", false)
+    // a hostile pattern must not take exponential time: many stars against a long text
+    var long: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 20000 {
+        rt.buf_push(&long, 97 as u8)
+        i = i + 1
+    }
+    let text: str = str { p: rt.buf_data(&long), n: rt.buf_len(&long) }
+    testkit.assert_true(!fsx.fnmatch("*a*a*a*a*a*a*a*a*a*a*b", text), "pathological pattern, no match")
+    testkit.assert_true(fsx.fnmatch("*a*a*a*a*a*a*a*a*a*a", text), "pathological pattern, match")
+    rt.buf_free(&long)
+}
+
+fn norm_table() {
+    norm_case("", ".")
+    norm_case(".", ".")
+    norm_case("..", "..")
+    norm_case("/", "/")
+    norm_case("//", "//")
+    norm_case("///", "/")
+    norm_case("////a", "/a")
+    norm_case("//a", "//a")
+    norm_case("/a//b", "/a/b")
+    norm_case("a//b", "a/b")
+    norm_case("a/./b", "a/b")
+    norm_case("a/../b", "b")
+    norm_case("a/b/..", "a")
+    norm_case("a/b/../..", ".")
+    norm_case("a/b/../../..", "..")
+    norm_case("../a", "../a")
+    norm_case("../../a/b/../c", "../../a/c")
+    norm_case("/..", "/")
+    norm_case("/../a", "/a")
+    norm_case("/a/../..", "/")
+    norm_case("a/", "a")
+    norm_case("a/b/", "a/b")
+    norm_case("./", ".")
+    norm_case("./.", ".")
+    norm_case("../", "..")
+    norm_case("a/./../b/./c/", "b/c")
+    norm_case("/./a", "/a")
+    norm_case("x//y///z/", "x/y/z")
+    norm_case("...", "...")
+    norm_case(".../a", ".../a")
+    norm_case("a/.../b", "a/.../b")
+    norm_case("a b/c d/../e", "a b/e")
+    norm_case("ä/ö/..", "ä")
+    norm_case("/usr/local/../bin/./x", "/usr/bin/x")
+}
+
+fn rel_table() {
+    rel_case("/a/b/c", "/a/x", "../b/c")
+    rel_case("/a/b", "/a/b", ".")
+    rel_case("/a/b/c", "/", "a/b/c")
+    rel_case("/", "/a/b", "../..")
+    rel_case("/a", "/a/b/c", "../..")
+    rel_case("/a/b/../c", "/a/./d", "../c")
+    rel_case("/x/y", "/p/q/r", "../../../x/y")
+    rel_case("//a/b", "/a", "b")
+    rel_case("/a/b/", "/a/b/", ".")
+    rel_case("/a/bc", "/a/b", "../bc")
+    rel_case("/a/b", "/a/bc", "../b")
+    rel_case("/", "/", ".")
+    rel_case("/a/..", "/b/..", ".")
+}
+
+// abspath needs a working directory we know: go into a directory of ours
+fn abs_table() -> FsError!bool {
+    var d: fsx.TempDir = try fsx.temp_dir("fsx2342_w_")
+    defer fsx.temp_dir_drop(&d)
+    let w: str = __str_copy(fsx.temp_dir_path(&d))
+    var c: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c, w.p as u64, w.length())
+    rt.buf_push(&c, 0 as u8)
+    let old: str = fsx.cwd()
+    syscall(80, rt.buf_ptr(&c) as i64, 0, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    testkit.assert_eq_str(fsx.cwd(), w)
+    testkit.assert_eq_str(fsx.abspath("x"), w + "/x")
+    testkit.assert_eq_str(fsx.abspath("x/../y/./z/"), w + "/y/z")
+    testkit.assert_eq_str(fsx.abspath(""), w)
+    testkit.assert_eq_str(fsx.abspath("."), w)
+    testkit.assert_eq_str(fsx.abspath("/a//b/../c"), "/a/c")
+    testkit.assert_eq_str(fsx.relpath("a/b", "."), "a/b")
+    testkit.assert_eq_str(fsx.relpath(".", "a"), "..")
+    testkit.assert_eq_str(fsx.relpath(w + "/p/q", "r/s"), "../../p/q")
+    testkit.assert_eq_str(fsx.relpath("", "x"), "")
+    // back, so that the directory can be removed
+    var o: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&o, old.p as u64, old.length())
+    rt.buf_push(&o, 0 as u8)
+    syscall(80, rt.buf_ptr(&o) as i64, 0, 0, 0, 0, 0)
+    rt.buf_free(&o)
+    testkit.assert_eq_str(fsx.cwd(), old)
+    return true
+}
+
+// ------------------------------------------------------------ copy_tree
+
+fn make_source(s: str) -> FsError!bool {
+    try mkdir_m(s, 493 as u32)
+    try mkfile(s + "/a.txt", "alpha", 420 as u32)
+    try mkfile(s + "/run.sh", "#!/bin/sh\n", 493 as u32)
+    try mkdir_m(s + "/sub", 493 as u32)
+    try mkfile(s + "/sub/b.txt", "bravo", 384 as u32)
+    try mkdir_m(s + "/sub/deeper", 448 as u32)
+    try fs.symlink("../a.txt", s + "/sub/link_rel")
+    try fs.symlink("/nonexistent/abs", s + "/sub/link_abs")
+    try fs.symlink("nowhere", s + "/sub/dangling")
+    try mkdir_m(s + "/empty", 493 as u32)
+    try mkfile(s + "/skip.tmp", "t", 420 as u32)
+    try mkfile(s + "/sub/x.tmp", "t", 420 as u32)
+    try mkdir_m(s + "/.git", 493 as u32)
+    try mkfile(s + "/.git/config", "c", 420 as u32)
+    try mkdir_m(s + "/ro", 493 as u32)
+    try mkfile(s + "/ro/c.txt", "charlie", 292 as u32)
+    // a read-only directory: filled first, closed afterwards
+    try fs.chmod(s + "/ro", 365 as u32)
+    return true
+}
+
+// the 15 entries below the top, checked against the source
+fn verify_copy(d: str, with_ignored: bool) {
+    assert_eq[u8](kind_of(d), fs.KIND_DIR)
+    assert_eq[u32](mode_of(d), 493 as u32)
+    testkit.assert_eq_str(text_of(d + "/a.txt"), "alpha")
+    assert_eq[u32](mode_of(d + "/a.txt"), 420 as u32)
+    testkit.assert_eq_str(text_of(d + "/run.sh"), "#!/bin/sh\n")
+    assert_eq[u32](mode_of(d + "/run.sh"), 493 as u32)
+    assert_eq[u8](kind_of(d + "/sub"), fs.KIND_DIR)
+    testkit.assert_eq_str(text_of(d + "/sub/b.txt"), "bravo")
+    assert_eq[u32](mode_of(d + "/sub/b.txt"), 384 as u32)
+    assert_eq[u8](kind_of(d + "/sub/deeper"), fs.KIND_DIR)
+    assert_eq[u32](mode_of(d + "/sub/deeper"), 448 as u32)
+    testkit.assert_eq_i64(count_entries(d + "/sub/deeper") as i64, 0)
+    assert_eq[u8](kind_of(d + "/sub/link_rel"), fs.KIND_LINK)
+    testkit.assert_eq_str(fs.readlink(d + "/sub/link_rel") catch "?", "../a.txt")
+    assert_eq[u8](kind_of(d + "/sub/link_abs"), fs.KIND_LINK)
+    testkit.assert_eq_str(fs.readlink(d + "/sub/link_abs") catch "?", "/nonexistent/abs")
+    assert_eq[u8](kind_of(d + "/sub/dangling"), fs.KIND_LINK)
+    testkit.assert_eq_str(fs.readlink(d + "/sub/dangling") catch "?", "nowhere")
+    assert_eq[u8](kind_of(d + "/empty"), fs.KIND_DIR)
+    testkit.assert_eq_i64(count_entries(d + "/empty") as i64, 0)
+    assert_eq[u32](mode_of(d + "/ro"), 365 as u32)
+    testkit.assert_eq_str(text_of(d + "/ro/c.txt"), "charlie")
+    assert_eq[u32](mode_of(d + "/ro/c.txt"), 292 as u32)
+    if with_ignored {
+        testkit.assert_eq_str(text_of(d + "/skip.tmp"), "t")
+        testkit.assert_eq_str(text_of(d + "/sub/x.tmp"), "t")
+        testkit.assert_eq_str(text_of(d + "/.git/config"), "c")
+    } else {
+        testkit.assert_true(gone(d + "/skip.tmp"), "skip.tmp is ignored")
+        testkit.assert_true(gone(d + "/sub/x.tmp"), "sub/x.tmp is ignored")
+        testkit.assert_true(gone(d + "/.git"), ".git is ignored with everything in it")
+    }
+}
+
+fn count_entries(path: str) -> usize {
+    var d: dir.Dir = dir.open(path)
+    var n: usize = 0
+    while dir.next(&d) {
+        n = n + 1
+    }
+    dir.close(&d)
+    return n
+}
+
+fn unlock(root: str) {
+    // a read-only directory cannot be emptied by a non-root user
+    fs.chmod(root + "/ro", 493 as u32) catch false
+}
+
+fn copy_trees() -> FsError!bool {
+    var d: fsx.TempDir = try fsx.temp_dir("fsx2342_t_")
+    defer fsx.temp_dir_drop(&d)
+    let w: str = __str_copy(fsx.temp_dir_path(&d))
+    try make_source(w + "/src")
+
+    testkit.context("plain copy")
+    let n: usize = try fsx.copy_tree(w + "/src", w + "/dst1", "")
+    testkit.assert_eq_i64(n as i64, 15)
+    verify_copy(w + "/dst1", true)
+
+    testkit.context("target exists")
+    testkit.assert_eq_i64(tree_err(w + "/src", w + "/dst1", "", 0 as u32) as i64, 1017)
+
+    testkit.context("dirs_exist_ok")
+    unlock(w + "/dst1")
+    try mkfile(w + "/dst1/a.txt", "OLD", 384 as u32)
+    try mkfile(w + "/dst1/extra.txt", "keep me", 420 as u32)
+    try fs.remove(w + "/dst1/sub/link_rel")
+    try fs.remove(w + "/dst1/sub/link_abs")
+    try fs.remove(w + "/dst1/sub/dangling")
+    let m: usize = try fsx.copy_tree_opts(w + "/src", w + "/dst1", "", fsx.COPY_DIRS_EXIST_OK)
+    testkit.assert_eq_i64(m as i64, 15)
+    verify_copy(w + "/dst1", true)
+    testkit.assert_eq_str(text_of(w + "/dst1/extra.txt"), "keep me")
+    // a link that is already there stays an error (shutil: FileExistsError)
+    testkit.assert_eq_i64(tree_err(w + "/src", w + "/dst1", "", fsx.COPY_DIRS_EXIST_OK) as i64, 1017)
+
+    testkit.context("ignore")
+    let k: usize = try fsx.copy_tree(w + "/src", w + "/dst2/with/parents", "*.tmp|.git")
+    testkit.assert_eq_i64(k as i64, 11)
+    verify_copy(w + "/dst2/with/parents", false)
+    // a pattern is matched against names at every level, not against paths
+    let k2: usize = try fsx.copy_tree(w + "/src", w + "/dst3", "sub")
+    testkit.assert_eq_i64(k2 as i64, 8)
+    testkit.assert_true(gone(w + "/dst3/sub"), "a directory is ignored by its name")
+    let k3: usize = try fsx.copy_tree(w + "/src", w + "/dst4", "?.txt|r*|e[m]pty")
+    testkit.assert_eq_i64(k3 as i64, 9)
+    testkit.assert_true(gone(w + "/dst4/a.txt") && gone(w + "/dst4/ro") && gone(w + "/dst4/run.sh") && gone(w + "/dst4/empty"), "patterns ? * [] work in a list")
+    testkit.assert_true(gone(w + "/dst4/sub/b.txt"), "?.txt also matches b.txt at the second level")
+    assert_eq[u8](kind_of(w + "/dst4/sub/deeper"), fs.KIND_DIR)
+
+    testkit.context("follow symlinks")
+    // link_abs and dangling are dangling: following them is an error
+    testkit.assert_eq_i64(tree_err(w + "/src", w + "/dst6", "", fsx.COPY_FOLLOW_SYMLINKS) as i64, 1002)
+    try fs.remove(w + "/src/sub/dangling")
+    try fs.remove(w + "/src/sub/link_abs")
+    try fs.symlink("sub", w + "/src/dirlink")
+    let f: usize = try fsx.copy_tree_opts(w + "/src", w + "/dst5", "", fsx.COPY_FOLLOW_SYMLINKS)
+    assert_eq[u8](kind_of(w + "/dst5/sub/link_rel"), fs.KIND_FILE)
+    testkit.assert_eq_str(text_of(w + "/dst5/sub/link_rel"), "alpha")
+    assert_eq[u8](kind_of(w + "/dst5/dirlink"), fs.KIND_DIR)
+    testkit.assert_eq_str(text_of(w + "/dst5/dirlink/b.txt"), "bravo")
+    testkit.assert_eq_i64(f as i64, 15 - 2 + 1 + 4)
+    // the same without following: links stay links
+    let g: usize = try fsx.copy_tree(w + "/src", w + "/dst7", "")
+    assert_eq[u8](kind_of(w + "/dst7/dirlink"), fs.KIND_LINK)
+    testkit.assert_eq_i64(g as i64, 15 - 2 + 1)
+
+    testkit.context("refusals")
+    testkit.assert_eq_i64(tree_err(w + "/missing", w + "/dst8", "", 0 as u32) as i64, 1002)
+    testkit.assert_eq_i64(tree_err(w + "/src/a.txt", w + "/dst8", "", 0 as u32) as i64, 1020)
+    testkit.assert_true(gone(w + "/dst8"), "nothing was made for a refused source")
+    // a link loop followed forever is an error, not a hang
+    try fs.mkdir_all(w + "/loop/x")
+    try fs.symlink("..", w + "/loop/x/up")
+    // (the kernel stops it with ELOOP before the depth limit does: either way an error)
+    let loop_err: usize = tree_err(w + "/loop", w + "/dst9", "", fsx.COPY_FOLLOW_SYMLINKS)
+    testkit.assert_true(loop_err == 1036 || loop_err == 1999, "a link loop is an error, not a hang")
+    unlock(w + "/src")
+    unlock(w + "/dst1")
+    unlock(w + "/dst2/with/parents")
+    unlock(w + "/dst3")
+    unlock(w + "/dst4")
+    unlock(w + "/dst5")
+    unlock(w + "/dst7")
+    return true
+}
+
+// ------------------------------------------------------------ walk
+
+fn collect(p: str, kind: u8, ctx: u64) -> i32 {
+    let b: *mut rt.Buf = ctx as *mut rt.Buf
+    rt.buf_push(b, 48 as u8 + kind)
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_bytes(b, p.p as u64, p.length())
+    rt.buf_push(b, 10 as u8)
+    return fsx.WALK_CONTINUE
+}
+
+fn collect_skip(p: str, kind: u8, ctx: u64) -> i32 {
+    collect(p, kind, ctx)
+    if fs.path_name(p) == "b" {
+        return fsx.WALK_SKIP
+    }
+    return fsx.WALK_CONTINUE
+}
+
+fn collect_stop(p: str, kind: u8, ctx: u64) -> i32 {
+    collect(p, kind, ctx)
+    if fs.path_name(p) == "deep" {
+        return fsx.WALK_STOP
+    }
+    return fsx.WALK_CONTINUE
+}
+
+fn walks() -> FsError!bool {
+    var d: fsx.TempDir = try fsx.temp_dir("fsx2342_k_")
+    defer fsx.temp_dir_drop(&d)
+    let w: str = __str_copy(fsx.temp_dir_path(&d))
+    try fs.mkdir_all(w + "/t/b/deep")
+    try mkfile(w + "/t/b/deep/z", "z", 420 as u32)
+    try mkfile(w + "/t/b/a", "a", 420 as u32)
+    try mkfile(w + "/t/a", "a", 420 as u32)
+    try mkfile(w + "/t/B", "B", 420 as u32)
+    try mkfile(w + "/t/c", "c", 420 as u32)
+    try fs.symlink("b", w + "/t/link")
+    try fs.mkdir(w + "/t/empty")
+    var out: rt.Buf = rt.buf_new()
+    let n: usize = try fsx.walk(w + "/t", collect, (&out) as u64)
+    let want: str = "1 " + w + "/t/B\n1 " + w + "/t/a\n2 " + w + "/t/b\n1 " + w + "/t/b/a\n2 " + w + "/t/b/deep\n1 " + w + "/t/b/deep/z\n1 " + w + "/t/c\n2 " + w + "/t/empty\n3 " + w + "/t/link\n"
+    testkit.assert_eq_str(str { p: rt.buf_data(&out), n: rt.buf_len(&out) }, want)
+    testkit.assert_eq_i64(n as i64, 9)
+    rt.buf_free(&out)
+
+    var out2: rt.Buf = rt.buf_new()
+    let n2: usize = try fsx.walk(w + "/t", collect_skip, (&out2) as u64)
+    testkit.assert_true(!contains(str { p: rt.buf_data(&out2), n: rt.buf_len(&out2) }, "/t/b/a"), "WALK_SKIP does not enter the directory")
+    testkit.assert_true(contains(str { p: rt.buf_data(&out2), n: rt.buf_len(&out2) }, "/t/c\n"), "but goes on with the next entry")
+    testkit.assert_true(n2 > 0, "count")
+    rt.buf_free(&out2)
+
+    var out3: rt.Buf = rt.buf_new()
+    let n3: usize = try fsx.walk(w + "/t", collect_stop, (&out3) as u64)
+    testkit.assert_eq_str(str { p: rt.buf_data(&out3), n: rt.buf_len(&out3) }, "1 " + w + "/t/B\n1 " + w + "/t/a\n2 " + w + "/t/b\n1 " + w + "/t/b/a\n2 " + w + "/t/b/deep\n")
+    testkit.assert_eq_i64(n3 as i64, 5)
+    rt.buf_free(&out3)
+    // an empty directory, a missing one, a file
+    var out4: rt.Buf = rt.buf_new()
+    let n4: usize = try fsx.walk(w + "/t/empty", collect, (&out4) as u64)
+    testkit.assert_eq_i64(n4 as i64, 0)
+    rt.buf_free(&out4)
+    var out5: rt.Buf = rt.buf_new()
+    let missing: usize = fsx.walk(w + "/nothing", collect, (&out5) as u64) catch | e | 4711
+    testkit.assert_eq_i64(missing as i64, 4711)
+    rt.buf_free(&out5)
+    return true
+}
+
+fn contains(hay: str, needle: str) -> bool {
+    let n: usize = needle.length()
+    let h: usize = hay.length()
+    if n > h {
+        return false
+    }
+    var i: usize = 0
+    while i + n <= h {
+        if rt.mem_eq(hay.p as u64 + i as u64, needle.p as u64, n) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn main() -> i32 {
+    testkit.context("fnmatch")
+    fnmatch_table()
+    testkit.context("normpath")
+    norm_table()
+    testkit.context("relpath")
+    rel_table()
+    testkit.context("abspath")
+    testkit.assert_true(abs_table() catch | e | false, "abspath scenario")
+    testkit.context("copy_tree")
+    testkit.assert_true(copy_trees() catch | e | false, "copy_tree scenario")
+    testkit.context("walk")
+    testkit.assert_true(walks() catch | e | false, "walk scenario")
+    testkit.context("")
+    return testkit.finish()
+}

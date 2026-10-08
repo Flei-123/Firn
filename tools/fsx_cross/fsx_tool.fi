@@ -1,0 +1,142 @@
+// tools/fsx_cross/fsx_tool.fi -- the command line face of std.fsx for the
+// cross-check against Python and cp (tools/fsx_cross/run.sh).
+//
+//   fsx_tool copytree FROM TO IGNORE FLAGS   -> "ok <count>" or "err <name>" (exit 1)
+//   fsx_tool copyfile FROM TO                -> "ok <octets>" or "err <name>"
+//   fsx_tool paths FILE                      -> per input line "path US base":
+//                                               "normpath US abspath US relpath"
+//   fsx_tool fnmatch FILE                    -> per input line "pattern US name": 0 or 1
+// (US is the octet 0x1f; lines end with a line feed.)
+import std.fsx
+import std.fs
+import std.rt
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.length())
+}
+
+// an error as a number no count reaches: 10^12 + class
+fn err_code(e: FsError) -> usize {
+    if e == FsError::NotFound { return 1000000000001 }
+    if e == FsError::Exists { return 1000000000002 }
+    if e == FsError::Permission { return 1000000000003 }
+    if e == FsError::NotDir { return 1000000000004 }
+    if e == FsError::IsDir { return 1000000000005 }
+    if e == FsError::NotEmpty { return 1000000000006 }
+    if e == FsError::NameTooLong { return 1000000000007 }
+    if e == FsError::Invalid { return 1000000000008 }
+    return 1000000000009
+}
+
+fn err_name(code: usize) -> str {
+    if code == 1000000000001 { return "NotFound" }
+    if code == 1000000000002 { return "Exists" }
+    if code == 1000000000003 { return "Permission" }
+    if code == 1000000000004 { return "NotDir" }
+    if code == 1000000000005 { return "IsDir" }
+    if code == 1000000000006 { return "NotEmpty" }
+    if code == 1000000000007 { return "NameTooLong" }
+    if code == 1000000000008 { return "Invalid" }
+    return "Io"
+}
+
+// "ok <n>" (exit 0) or "err <Name>" (exit 1)
+fn report(r: usize) -> i32 {
+    var b: rt.Buf = rt.buf_new()
+    var rc: i32 = 0
+    if r >= 1000000000000 {
+        rt.buf_push_bytes(&b, "err ".p as u64, 4)
+        let nm: str = err_name(r)
+        rt.buf_push_bytes(&b, nm.p as u64, nm.length())
+        rc = 1
+    } else {
+        rt.buf_push_bytes(&b, "ok ".p as u64, 3)
+        rt.buf_push_dec_u64(&b, r as u64)
+    }
+    rt.buf_push(&b, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    return rc
+}
+
+fn copytree(from: str, to: str, ignore: str, flags: u32) -> FsError!usize {
+    return try fsx.copy_tree_opts(from, to, ignore, flags)
+}
+
+fn copyfile(from: str, to: str) -> FsError!usize {
+    return try fsx.copy_file(from, to)
+}
+
+fn text_flags(s: str) -> u32 {
+    var f: u32 = 0
+    var i: usize = 0
+    while i < s.length() {
+        if s.chars(i) == 101 as u8 { f = f | fsx.COPY_DIRS_EXIST_OK } // 'e'
+        if s.chars(i) == 102 as u8 { f = f | fsx.COPY_FOLLOW_SYMLINKS } // 'f'
+        i = i + 1
+    }
+    return f
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        say("usage: fsx_tool copytree|copyfile|paths|fnmatch ...\n")
+        return 2
+    }
+    let cmd: str = arg(start, 1)
+    if cmd == "copytree" && rt.arg_count(start) >= 6 {
+        return report(copytree(arg(start, 2), arg(start, 3), arg(start, 4), text_flags(arg(start, 5))) catch | e | err_code(e))
+    }
+    if cmd == "copyfile" && rt.arg_count(start) >= 4 {
+        return report(copyfile(arg(start, 2), arg(start, 3)) catch | e | err_code(e))
+    }
+    if cmd == "paths" || cmd == "fnmatch" {
+        var data: rt.Buf = rt.buf_new()
+        fs.read_file(arg(start, 2), &data) catch 0
+        var out: rt.Buf = rt.buf_new()
+        let n: usize = rt.buf_len(&data)
+        var i: usize = 0
+        while i < n {
+            var e: usize = i
+            while e < n && rt.buf_at(&data, e) != 10 as u8 {
+                e = e + 1
+            }
+            var us: usize = i
+            while us < e && rt.buf_at(&data, us) != 31 as u8 {
+                us = us + 1
+            }
+            let a: str = str { p: (rt.buf_data(&data) as u64 + i as u64) as *mut u8, n: us - i }
+            var b: str = ""
+            if us < e {
+                b = str { p: (rt.buf_data(&data) as u64 + (us + 1) as u64) as *mut u8, n: e - us - 1 }
+            }
+            if cmd == "fnmatch" {
+                if fsx.fnmatch(a, b) {
+                    rt.buf_push(&out, 49 as u8)
+                } else {
+                    rt.buf_push(&out, 48 as u8)
+                }
+            } else {
+                rt.buf_push_bytes(&out, fsx.normpath(a).p as u64, fsx.normpath(a).length())
+                rt.buf_push(&out, 31 as u8)
+                rt.buf_push_bytes(&out, fsx.abspath(a).p as u64, fsx.abspath(a).length())
+                rt.buf_push(&out, 31 as u8)
+                let rel: str = fsx.relpath(a, b)
+                rt.buf_push_bytes(&out, rel.p as u64, rel.length())
+            }
+            rt.buf_push(&out, 10 as u8)
+            i = e + 1
+        }
+        rt.write_everything(1, rt.buf_ptr(&out), rt.buf_len(&out))
+        rt.buf_free(&out)
+        rt.buf_free(&data)
+        return 0
+    }
+    say("unknown command\n")
+    return 2
+}
