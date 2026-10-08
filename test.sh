@@ -1832,7 +1832,9 @@ if [ "$GLRC" -eq 0 ]; then
 else
     bad "tools/glob_cross/run.sh failed (see .test-work/glob_cross.log)"
     grep -E 'FAIL|DIFF|differ' "$WORK/glob_cross.log" | head -12 | sed 's/^/   /' || true
-echo "== 103. std.stats against Python (tools/stats_cross/run.sh, SKRIPT-LIBS r316) =="
+fi
+
+echo "== 115. std.stats against Python (tools/stats_cross/run.sh, SKRIPT-LIBS r316) =="
 # 5200 random data sets in 16 families (ties, 1e-100..1e100, ill-conditioned, denormals, byte values, cancellation)
 # through lib/std/stats.fi and compared with math.fsum, statistics.* and numpy (median, percentile, var, histogram).
 # The deviation is measured in ULP per statistic and family; the other three build levels must answer byte for byte
