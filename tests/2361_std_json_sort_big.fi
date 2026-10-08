@@ -1,0 +1,200 @@
+// expect_exit: 0
+// tests/2361_std_json_sort_big.fi -- json_write_opts on big objects and on
+// invalid UTF-8 (SKRIPT-LIBS r315). The sort has to be ascending by octets,
+// STABLE for equal keys, lose nothing, and be a fixed point; bad octets in
+// ASCII mode become U+FFFD instead of a lone `\ud800`.
+// Exit codes: the number of the first failing check.
+import std.rt
+import std.str
+import std.json
+
+fn next(s: u64) -> u64 {
+    return s *% 6364136223846793005 +% 1442695040888963407
+}
+
+fn hex_digit(v: u64) -> u8 {
+    if v < 10 {
+        return (48 + v) as u8
+    }
+    return (87 + v) as u8
+}
+
+// "{" "k<hex>": <value> ... "}"  with `n` members; `distinct` > 0 limits the key
+// space (so equal keys occur), 0 = random 40 bit keys.
+fn build(out: *mut rt.Buf, n: usize, distinct: u64, seed: u64) {
+    var s: u64 = seed
+    rt.buf_push(out, 123 as u8)
+    var i: usize = 0
+    while i < n {
+        s = next(s)
+        var k: u64 = (s >> 24) & 1099511627775
+        if distinct > 0 {
+            k = (s >> 24) % distinct
+        }
+        if i > 0 {
+            rt.buf_push(out, 44 as u8)
+        }
+        rt.buf_push(out, 34 as u8)
+        rt.buf_push(out, 107 as u8)
+        var sh: u64 = 40
+        while sh > 0 {
+            sh = sh - 4
+            rt.buf_push(out, hex_digit((k >> sh) & 15))
+        }
+        rt.buf_push(out, 34 as u8)
+        rt.buf_push(out, 58 as u8)
+        rt.buf_push_dec_u64(out, i as u64)
+        i = i + 1
+    }
+    rt.buf_push(out, 125 as u8)
+}
+
+// the keys of the root object must ascend (not descend: equal keys are allowed
+// when `strict` is false) and, for equal keys, the values must ascend (stability)
+fn check_sorted(d: *mut json.Json, n: usize, strict: bool) -> i32 {
+    let root: u32 = json.json_root(d)
+    if json.json_count(d, root) != n {
+        return 1
+    }
+    var c: u32 = json.json_child(d, root)
+    var prev: u32 = json.JSON_NONE
+    var total: i64 = 0
+    while c != json.JSON_NONE {
+        total = total + json.json_int(d, c)
+        if prev != json.JSON_NONE {
+            let a: str.Span = json.json_key(d, prev)
+            let b: str.Span = json.json_key(d, c)
+            var m: usize = a.n
+            if b.n < m {
+                m = b.n
+            }
+            var i: usize = 0
+            var cmp: i32 = 0
+            while i < m && cmp == 0 {
+                let x: u8 = rt.ld8(a.p as u64, i)
+                let y: u8 = rt.ld8(b.p as u64, i)
+                if x < y {
+                    cmp = 0 - 1
+                }
+                if x > y {
+                    cmp = 1
+                }
+                i = i + 1
+            }
+            if cmp == 0 {
+                if a.n < b.n {
+                    cmp = 0 - 1
+                }
+                if a.n > b.n {
+                    cmp = 1
+                }
+            }
+            if cmp > 0 {
+                return 2
+            }
+            if cmp == 0 && strict {
+                return 3
+            }
+            if cmp == 0 && json.json_int(d, prev) > json.json_int(d, c) {
+                return 4
+            }
+        }
+        prev = c
+        c = json.json_next(d, c)
+    }
+    let want: i64 = ((n as i64) * ((n as i64) - 1)) / 2
+    if total != want {
+        return 5
+    }
+    return 0
+}
+
+fn run(n: usize, distinct: u64, seed: u64, code: i32) -> i32 {
+    var src: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&src)
+    build(&src, n, distinct, seed)
+    var d: json.Json = json.json_new()
+    defer json.json_free(&d)
+    let ok: bool = json.json_parse(&d, rt.buf_ptr(&src), rt.buf_len(&src)) catch false
+    if !ok {
+        return code
+    }
+    var o: json.JsonOpts = json.json_opts_compact()
+    o.flags = json.JSON_ASCII | json.JSON_SORT_KEYS
+    var t1: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&t1)
+    if !json.json_write_opts(&d, json.json_root(&d), &t1, &o) {
+        return code + 1
+    }
+    var d2: json.Json = json.json_new()
+    defer json.json_free(&d2)
+    let ok2: bool = json.json_parse(&d2, rt.buf_ptr(&t1), rt.buf_len(&t1)) catch false
+    if !ok2 {
+        return code + 2
+    }
+    // with random 40 bit keys a collision is as good as impossible: strict ascending
+    let r: i32 = check_sorted(&d2, n, distinct == 0)
+    if r != 0 {
+        return code + 10 * (r as i32)
+    }
+    // a fixed point: writing the sorted document again gives the same octets
+    var t2: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&t2)
+    json.json_write_opts(&d2, json.json_root(&d2), &t2, &o)
+    if rt.buf_len(&t1) != rt.buf_len(&t2) {
+        return code + 3
+    }
+    if !rt.mem_eq(rt.buf_ptr(&t1), rt.buf_ptr(&t2), rt.buf_len(&t1)) {
+        return code + 4
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    // 1. unique random keys: 2000 and 20000 members (the merge sort has many rounds)
+    var r: i32 = run(2000, 0, 7, 100)
+    if r != 0 { return r }
+    r = run(20000, 0, 8, 200)
+    if r != 0 { return r }
+    // 2. many equal keys (stability): 1500 members over 12 distinct names
+    r = run(1500, 12, 9, 300)
+    if r != 0 { return r }
+    // 3. tiny objects, every size from 0 to 40
+    var n: usize = 0
+    while n <= 40 {
+        r = run(n, 0, 100 + n as u64, 400)
+        if r != 0 { return r + (n as i32) * 1000 }
+        n = n + 1
+    }
+    // 4. invalid UTF-8 in ASCII mode: one � per bad octet, never a lone surrogate
+    var bad: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&bad)
+    var pre: [u8; 3] = "[\"a"
+    rt.buf_push_bytes(&bad, (&pre[0]) as u64, 3)
+    rt.buf_push(&bad, 237 as u8)
+    rt.buf_push(&bad, 160 as u8)
+    rt.buf_push(&bad, 128 as u8)
+    var mid: [u8; 5] = "b\",\"x"
+    rt.buf_push_bytes(&bad, (&mid[0]) as u64, 5)
+    rt.buf_push(&bad, 195 as u8)
+    rt.buf_push(&bad, 40 as u8)
+    var post: [u8; 3] = "\"]\0"
+    rt.buf_push_bytes(&bad, (&post[0]) as u64, 2)
+    var d: json.Json = json.json_new()
+    defer json.json_free(&d)
+    let ok: bool = json.json_parse(&d, rt.buf_ptr(&bad), rt.buf_len(&bad)) catch false
+    if !ok { return 500 }
+    var o: json.JsonOpts = json.json_opts_new()
+    var out: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&out)
+    json.json_write_opts(&d, json.json_root(&d), &out, &o)
+    let want: str = "[\"a\\ufffd\\ufffd\\ufffdb\", \"x\\ufffd(\"]"
+    if rt.buf_len(&out) != want.length() { return 501 }
+    if !rt.mem_eq(rt.buf_ptr(&out), want.p as u64, want.length()) { return 502 }
+    // and the older writer agrees on bad octets (it shares the escaper)
+    var out2: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&out2)
+    json.json_write(&d, json.json_root(&d), &out2, true)
+    if rt.buf_len(&out2) != 35 { return 503 }
+    return 0
+}
