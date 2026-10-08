@@ -1776,7 +1776,7 @@ else
 fi
 
 echo "== 101. std.testkit end to end: firnc --test over assertions, script style, assert in main (tools/testkit/run.sh, r311) =="
-# tests/2300_std_testkit.fi (section 3) runs every assertion FAILING in a forked child. Here the real consumers:
+# tests/2340_std_testkit.fi (section 3) runs every assertion FAILING in a forked child. Here the real consumers:
 # `firnc --test` reports a failed assertion with its text and the test's position and exits 1, the script style
 # prints the format of OpenPlan's Python check() and exits 0/1, an assert in a plain main ends with exit code 101,
 # plus counter-checks (docs/SKRIPT-LIBS.md).

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/testkit/run.sh -- std.testkit end to end (docs/SKRIPT-LIBS.md, r311).
 #
-# tests/2300_std_testkit.fi runs every assertion failing inside a forked
+# tests/2340_std_testkit.fi runs every assertion failing inside a forked
 # child. This script is the other half: the REAL consumers.
 #   1. `firnc --test` over tools/testkit/cases/suite.fi: the failing cases
 #      are reported as "fail" with the assertion text as the reason and the

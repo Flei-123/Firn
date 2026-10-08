@@ -91,7 +91,7 @@ testkit.finish() -> i32             // prints summary, returns 0/1 for `return` 
 Failures inside `#[test]` end the test through the panic path so `firnc --test` reports `file:line:col`.
 `check`/`finish` give the output format of OpenPlan's Python `check()` so a port stays diff-able.
 
-**Built (08.10.2026, branch `w-fsx`).** `lib/std/testkit.fi`, tests `tests/2300_std_testkit.fi` (every assert run failing in a forked child,
+**Built (08.10.2026, branch `w-fsx`).** `lib/std/testkit.fi`, tests `tests/2340_std_testkit.fi` (every assert run failing in a forked child,
 exact message compared), `tools/testkit/run.sh` (test.sh section 101: `firnc --test` over assertions, script style, assert in `main`),
 `examples/testkit_script.fi`. Differences from the draft above, on purpose:
 * **No caller position.** The language has no caller-location intrinsic, so a failed assert cannot print `file:line:col` of the assert line;
