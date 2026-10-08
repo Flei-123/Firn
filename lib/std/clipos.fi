@@ -1,0 +1,297 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/clipos.fi -- the operating system half of std.clipboard (Linux).
+//
+// `std.clipboard` is one file for every system. Here are the helper programs
+// of a Linux desktop (wl-copy / wl-paste, xclip, xsel) and the rules for when
+// they are used; `clipos.windows.fi` is picked instead of this file by
+// `--target=x86_64-windows` and has none. Nothing in here is meant to be
+// called directly -- use `std.clipboard`.
+//
+// A helper is started with the data on its standard input (copy) or its
+// standard output collected (paste); its own output is thrown away. The
+// copying helpers fork into the background and keep the selection after
+// this program has ended -- that is why they are tried first for a copy.
+
+import rt
+import str
+import env
+import process
+
+export {
+    os_native_allowed, os_copy_first, os_paste_first,
+    os_copy, os_paste, os_clear, os_tool_name,
+}
+
+const T_NONE: u8 = 0
+const T_WL: u8 = 1
+const T_XCLIP: u8 = 2
+const T_XSEL: u8 = 3
+
+const HAND_OVER_MS: u64 = 5000
+const PASTE_MS: u64 = 4000
+
+// FIRN_CLIPBOARD: "" = automatic; native | wl-copy | xclip | xsel | none.
+fn forced() -> str {
+    return env.get("FIRN_CLIPBOARD")
+}
+
+fn has_display() -> bool {
+    return env.get("DISPLAY").length() > 0
+}
+
+fn has_wayland() -> bool {
+    return env.get("WAYLAND_DISPLAY").length() > 0
+}
+
+// Does the window layer get a try? Only with an X display (it would otherwise
+// connect to display 0 blindly) and not when the choice was forced elsewhere.
+fn os_native_allowed() -> bool {
+    let f: str = forced()
+    if f.length() > 0 && f != "native" {
+        return false
+    }
+    return has_display()
+}
+
+// The helper kinds to try, in order; T_NONE ends the list.
+fn tool_at(i: usize) -> u8 {
+    let f: str = forced()
+    if f.length() > 0 {
+        if i == 0 {
+            if f == "wl-copy" { return T_WL }
+            if f == "xclip" { return T_XCLIP }
+            if f == "xsel" { return T_XSEL }
+        }
+        return T_NONE
+    }
+    if has_wayland() {
+        if i == 0 { return T_WL }
+        if has_display() {
+            if i == 1 { return T_XCLIP }
+            if i == 2 { return T_XSEL }
+        }
+        return T_NONE
+    }
+    if has_display() {
+        if i == 0 { return T_XCLIP }
+        if i == 1 { return T_XSEL }
+    }
+    return T_NONE
+}
+
+fn copy_exe(k: u8) -> str {
+    if k == T_WL { return "wl-copy" }
+    if k == T_XCLIP { return "xclip" }
+    if k == T_XSEL { return "xsel" }
+    return ""
+}
+
+fn paste_exe(k: u8) -> str {
+    if k == T_WL { return "wl-paste" }
+    return copy_exe(k)
+}
+
+fn on_path(name: str) -> bool {
+    var tmp: rt.Buf = rt.buf_new()
+    let r: bool = env.find_executable(name, &tmp)
+    rt.buf_free(&tmp)
+    return r
+}
+
+// The name of the first helper that is installed ("" = none).
+fn os_tool_name() -> str {
+    var i: usize = 0
+    while tool_at(i) != T_NONE {
+        let k: u8 = tool_at(i)
+        if on_path(copy_exe(k)) {
+            return copy_exe(k)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Is a copy handed to a helper BEFORE the window layer is asked? Yes when a
+// helper was chosen on purpose, or in automatic mode for any non-empty
+// content (the helper outlives this program; an empty text is not worth it).
+fn os_copy_first(n: usize) -> bool {
+    let f: str = forced()
+    if f.length() > 0 {
+        return f == "wl-copy" || f == "xclip" || f == "xsel"
+    }
+    return n > 0 && tool_at(0) != T_NONE
+}
+
+// Is a paste handed to a helper first? On Wayland the helper is the way in;
+// on X11 the selection is asked directly.
+fn os_paste_first() -> bool {
+    let f: str = forced()
+    if f.length() > 0 {
+        return f == "wl-copy" || f == "xclip" || f == "xsel"
+    }
+    return has_wayland() && tool_at(0) == T_WL
+}
+
+fn is_text(mime: str) -> bool {
+    return mime == "text/plain;charset=utf-8"
+}
+
+// Fills the arguments of the copy command for helper `k`; false = this helper
+// cannot take this type.
+fn copy_args(k: u8, mime: str, c: *mut process.Command) -> bool {
+    if k == T_WL {
+        process.add_arg(c, "--type")
+        process.add_arg(c, mime)
+        return true
+    }
+    if k == T_XCLIP {
+        process.add_arg(c, "-selection")
+        process.add_arg(c, "clipboard")
+        process.add_arg(c, "-in")
+        process.add_arg(c, "-t")
+        if is_text(mime) {
+            process.add_arg(c, "UTF8_STRING")
+        } else {
+            process.add_arg(c, mime)
+        }
+        return true
+    }
+    if k == T_XSEL && is_text(mime) {
+        process.add_arg(c, "--clipboard")
+        process.add_arg(c, "--input")
+        return true
+    }
+    return false
+}
+
+fn paste_args(k: u8, mime: str, c: *mut process.Command) -> bool {
+    if k == T_WL {
+        process.add_arg(c, "--no-newline")
+        process.add_arg(c, "--type")
+        process.add_arg(c, mime)
+        return true
+    }
+    if k == T_XCLIP {
+        process.add_arg(c, "-selection")
+        process.add_arg(c, "clipboard")
+        process.add_arg(c, "-out")
+        process.add_arg(c, "-t")
+        if is_text(mime) {
+            process.add_arg(c, "UTF8_STRING")
+        } else {
+            process.add_arg(c, mime)
+        }
+        return true
+    }
+    if k == T_XSEL && is_text(mime) {
+        process.add_arg(c, "--clipboard")
+        process.add_arg(c, "--output")
+        return true
+    }
+    return false
+}
+
+fn copy_with(k: u8, mime: str, p: u64, n: usize) -> bool {
+    var c: process.Command = process.command(copy_exe(k))
+    if !copy_args(k, mime, &c) {
+        process.command_free(&c)
+        return false
+    }
+    process.set_stdin(&c, process.STDIO_PIPE)
+    process.set_stdout(&c, process.STDIO_NULL)
+    process.set_stderr(&c, process.STDIO_NULL)
+    var ch: process.Child = process.spawn(&c) catch | e | dead_child()
+    process.command_free(&c)
+    if ch.pid <= 0 {
+        return false
+    }
+    let w: i64 = process.write_in(&ch, p, n)
+    process.close_in(&ch)
+    var ok: bool = w == n as i64
+    if !process.wait_timeout(&ch, HAND_OVER_MS) {
+        process.kill(&ch)
+        process.wait(&ch)
+        ok = false
+    } else if process.exit_code(&ch) != 0 {
+        ok = false
+    }
+    process.close(&ch)
+    return ok
+}
+
+fn dead_child() -> process.Child {
+    return process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1,
+        done: false, code: 0, sig: 0, own: true }
+}
+
+fn paste_with(k: u8, mime: str, out: *mut rt.Buf) -> bool {
+    var c: process.Command = process.command(paste_exe(k))
+    if !paste_args(k, mime, &c) {
+        process.command_free(&c)
+        return false
+    }
+    var o: rt.Buf = rt.buf_new()
+    var e: rt.Buf = rt.buf_new()
+    let code: i32 = process.run_capture(&c, &o, &e, PASTE_MS) catch | er | 1000
+    process.command_free(&c)
+    var ok: bool = code == 0
+    if ok {
+        rt.buf_push_bytes(out, rt.buf_ptr(&o), rt.buf_len(&o))
+    }
+    rt.buf_free(&o)
+    rt.buf_free(&e)
+    return ok
+}
+
+// Hands the data to the first helper that is installed and takes it.
+fn os_copy(mime: str, p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while tool_at(i) != T_NONE {
+        let k: u8 = tool_at(i)
+        if on_path(copy_exe(k)) && copy_with(k, mime, p, n) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// APPENDS to `out` what the first helper that is installed and answers gives.
+fn os_paste(mime: str, out: *mut rt.Buf) -> bool {
+    var i: usize = 0
+    while tool_at(i) != T_NONE {
+        let k: u8 = tool_at(i)
+        if on_path(paste_exe(k)) && paste_with(k, mime, out) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Empties the clipboard with a helper that can (wl-copy --clear, xsel --clear).
+fn os_clear() -> bool {
+    var i: usize = 0
+    while tool_at(i) != T_NONE {
+        let k: u8 = tool_at(i)
+        if (k == T_WL || k == T_XSEL) && on_path(copy_exe(k)) {
+            var c: process.Command = process.command(copy_exe(k))
+            if k == T_WL {
+                process.add_arg(&c, "--clear")
+            } else {
+                process.add_arg(&c, "--clipboard")
+                process.add_arg(&c, "--clear")
+            }
+            process.set_stdin(&c, process.STDIO_NULL)
+            process.set_stdout(&c, process.STDIO_NULL)
+            process.set_stderr(&c, process.STDIO_NULL)
+            let code: i32 = process.run(&c) catch | er | 1000
+            process.command_free(&c)
+            if code == 0 {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}

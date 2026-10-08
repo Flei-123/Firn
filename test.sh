@@ -1743,7 +1743,8 @@ echo "== 83. the desktop libraries against programs nobody here wrote (tools/des
 # net.dbus (every D-Bus type both ways against libdbus), desktop.tray (a StatusNotifierWatcher and a dbusmenu
 # client in libdbus), desktop.notify (a notification server in libdbus), desktop.autostart (the Desktop Entry
 # spec's reading and GLib), audio (a real pulseaudio read back with parec/pactl, ffmpeg for the decoder),
-# files dropped on a window (XDND from GTK 3 and from python-xlib), the clipboard against GTK 3's, the
+# files dropped on a window (XDND from GTK 3 and from python-xlib), the clipboard against GTK 3's (also std.clipboard,
+# the windowless wrapper: text, 1.5 MiB, PNG, clear; tools/desktop/clipboard_check.py), the
 # command line channel of appkit.single_instance (tests/2221) -- and the Windows builds under Wine (tray with
 # the icon read off the screen, balloons, the Run key read by MSVCRT, waveOut into ALSA's file plugin,
 # the Windows clipboard against GTK, WM_DROPFILES, ReadDirectoryChangesW, named pipes). Parts whose tools

@@ -1,0 +1,357 @@
+// expect_exit: 0
+// tests/2370_std_clipboard_helpers.fi -- std.clipboard on Linux: the choice of backend and the helper
+// programs (wl-copy / wl-paste, xclip, xsel). The program starts ITSELF as a child with a controlled
+// environment (`argv[0] --child <mode>`) and with stand-in helper scripts in a temporary directory, so
+// the answers do not depend on the machine (no display, no real clipboard is touched).
+//
+//   none      no DISPLAY, no WAYLAND_DISPLAY: every call answers false, nothing crashes, `out` is untouched
+//   off       FIRN_CLIPBOARD=none, even with a display variable set
+//   xclip     FIRN_CLIPBOARD=xclip: exact arguments, UTF-8, empty text, PNG, replace, no "clear"
+//   xsel      FIRN_CLIPBOARD=xsel: text only (PNG is refused), "clear" works
+//   wl        FIRN_CLIPBOARD=wl-copy: exact arguments for wl-copy and wl-paste, "clear" works
+//   missing   FIRN_CLIPBOARD=xclip but no xclip installed: false, no crash
+//   autox     a (non existent) X display and xclip + xsel installed: xclip is chosen, and a paste falls
+//             through the unreachable display to the helper
+//   autoxsel  the same with xsel only: text goes to xsel, a PNG finds no taker
+//   autowl    WAYLAND_DISPLAY set and wl-copy installed: wl-copy first
+// The real X11 and Win32 backends are tested by tests/2371 and tools/desktop/clipboard_check.py.
+import std.rt
+import std.str
+import std.env
+import std.fs
+import std.fsx
+import std.process
+import std.clipboard
+
+static mut failures: i32 = 0
+
+fn say(s: str) {
+    syscall(1, 1, s.p as i64, s.length() as i64, 0, 0, 0)
+}
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn ck(cond: bool, name: str) {
+    if !cond {
+        failures = failures + 1
+        say("  FAIL  ")
+        say(name)
+        say("\n")
+    }
+}
+
+fn eq(b: *mut rt.Buf, s: str) -> bool {
+    if rt.buf_len(b) != s.length() {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(b), s.p as u64, s.length())
+}
+
+fn terr(e: ProcError) -> i32 {
+    return 1000
+}
+
+fn read_text(path: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    fs.read_file(path, &b) catch 0
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+// The text on the clipboard is exactly `want`.
+fn text_is(want: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let ok: bool = clipboard.paste_text(&b)
+    let same: bool = ok && eq(&b, want)
+    rt.buf_free(&b)
+    return same
+}
+
+// paste_text says false and leaves the buffer as it was.
+fn paste_refused() -> bool {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, "keep".p as u64, 4)
+    let ok: bool = clipboard.paste_text(&b)
+    let same: bool = eq(&b, "keep")
+    rt.buf_free(&b)
+    return !ok && same
+}
+
+static mut png: [u8; 69] = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 208, 0, 0, 3, 129, 1, 128, 162, 173, 150, 129, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]
+
+fn png_ptr() -> u64 {
+    return (&png[0]) as u64
+}
+
+fn png_is_on_board() -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let ok: bool = clipboard.paste_png(&b)
+    let same: bool = ok && rt.buf_len(&b) == 69 && rt.mem_eq(rt.buf_ptr(&b), png_ptr(), 69)
+    rt.buf_free(&b)
+    return same
+}
+
+const TEXT: str = "h\u{e9}llo w\u{f6}rld \u{65e5}\u{672c}\u{8a9e}\nline two\n\nlast"
+
+fn child_main(start: u64) -> i32 {
+    let mode: str = arg(start, 2)
+    let dir: str = env.get("FAKE_DIR")
+
+    if mode == "none" || mode == "off" {
+        ck(clipboard.backend_name() == "none", "backend_name is none")
+        ck(!clipboard.copy_text("x"), "copy_text refused")
+        ck(!clipboard.copy_text(""), "copy_text of an empty text refused")
+        ck(paste_refused(), "paste_text refused, out unchanged")
+        ck(!clipboard.has_text(), "has_text false")
+        ck(!clipboard.copy_png(png_ptr(), 69), "copy_png refused")
+        ck(!clipboard.has_png(), "has_png false")
+        ck(!clipboard.clear(), "clear refused")
+        clipboard.serve(10) // nothing to serve: returns at once
+        return failures
+    }
+
+    if mode == "xclip" {
+        ck(clipboard.backend_name() == "xclip", "backend_name xclip")
+        ck(clipboard.copy_text(TEXT), "copy_text")
+        ck(read_text(dir + "/xclip.args") == "-selection clipboard -in -t UTF8_STRING\n", "xclip copy arguments")
+        ck(read_text(dir + "/clip.UTF8_STRING") == TEXT, "xclip got the text octets")
+        ck(text_is(TEXT), "paste_text returns the text (UTF-8, line ends)")
+        ck(read_text(dir + "/xclip.args") == "-selection clipboard -out -t UTF8_STRING\n", "xclip paste arguments")
+        ck(clipboard.has_text(), "has_text")
+        // appends
+        var b: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&b, "<<".p as u64, 2)
+        ck(clipboard.paste_text(&b) && eq(&b, "<<" + TEXT), "paste_text appends")
+        rt.buf_free(&b)
+        // an empty text
+        ck(clipboard.copy_text(""), "copy_text of an empty text")
+        ck(text_is(""), "an empty text comes back empty")
+        ck(clipboard.has_text(), "has_text of an empty text")
+        // a big text
+        var big: rt.Buf = rt.buf_new()
+        var i: usize = 0
+        while i < 300000 {
+            rt.buf_push(&big, (97 + i % 26) as u8)
+            if i % 61 == 60 { rt.buf_push(&big, 10 as u8) }
+            i = i + 1
+        }
+        let bigs: str = str { p: rt.buf_data(&big), n: rt.buf_len(&big) }
+        ck(clipboard.copy_text(bigs), "copy_text of 300 KB")
+        ck(text_is(bigs), "300 KB come back exactly")
+        rt.buf_free(&big)
+        // PNG
+        ck(!clipboard.copy_png(png_ptr(), 4), "copy_png refuses octets that are not a PNG")
+        ck(clipboard.copy_png(png_ptr(), 69), "copy_png")
+        ck(read_text(dir + "/xclip.args") == "-selection clipboard -in -t image/png\n", "xclip png arguments")
+        ck(png_is_on_board(), "paste_png returns the PNG octets")
+        ck(clipboard.has_png(), "has_png")
+        // a text on the clipboard is no PNG
+        ck(clipboard.copy_text("plain"), "copy_text again")
+        ck(!clipboard.has_png(), "no PNG after a text copy")
+        // xclip has no way to clear and there is no window layer here
+        ck(!clipboard.clear(), "clear is false with xclip only")
+        return failures
+    }
+
+    if mode == "xsel" {
+        ck(clipboard.backend_name() == "xsel", "backend_name xsel")
+        ck(clipboard.copy_text(TEXT), "copy_text")
+        ck(read_text(dir + "/xsel.args") == "--clipboard --input\n", "xsel copy arguments")
+        ck(text_is(TEXT), "paste_text")
+        ck(read_text(dir + "/xsel.args") == "--clipboard --output\n", "xsel paste arguments")
+        ck(!clipboard.copy_png(png_ptr(), 69), "xsel knows no PNG")
+        ck(!clipboard.has_png(), "no PNG")
+        ck(clipboard.clear(), "clear")
+        ck(read_text(dir + "/xsel.args") == "--clipboard --clear\n", "xsel clear arguments")
+        ck(paste_refused(), "nothing to paste after clear")
+        ck(!clipboard.has_text(), "has_text false after clear")
+        return failures
+    }
+
+    if mode == "wl" || mode == "autowl" {
+        ck(clipboard.backend_name() == "wl-copy", "backend_name wl-copy")
+        ck(clipboard.copy_text(TEXT), "copy_text")
+        ck(read_text(dir + "/wl-copy.args") == "--type text/plain;charset=utf-8\n", "wl-copy arguments")
+        ck(text_is(TEXT), "paste_text")
+        ck(read_text(dir + "/wl-paste.args") == "--no-newline --type text/plain;charset=utf-8\n", "wl-paste arguments")
+        ck(clipboard.copy_png(png_ptr(), 69), "copy_png")
+        ck(read_text(dir + "/wl-copy.args") == "--type image/png\n", "wl-copy png arguments")
+        ck(png_is_on_board(), "paste_png")
+        ck(paste_refused(), "a copy replaces everything: the text is gone after the PNG")
+        ck(clipboard.clear(), "clear")
+        ck(read_text(dir + "/wl-copy.args") == "--clear\n", "wl-copy --clear")
+        ck(paste_refused(), "nothing to paste after clear")
+        return failures
+    }
+
+    if mode == "missing" {
+        ck(clipboard.backend_name() == "none", "backend_name none")
+        ck(!clipboard.copy_text("x"), "copy_text false")
+        ck(paste_refused(), "paste false")
+        ck(!clipboard.clear(), "clear false")
+        return failures
+    }
+
+    if mode == "autox" {
+        ck(clipboard.backend_name() == "xclip", "xclip first")
+        ck(clipboard.copy_text("auto"), "copy_text")
+        ck(read_text(dir + "/clip.UTF8_STRING") == "auto", "xclip got it")
+        ck(read_text(dir + "/xsel.args") == "", "xsel not asked")
+        ck(text_is("auto"), "paste falls through the unreachable display to the helper")
+        // an empty text is not worth a helper that outlives us: the window layer is asked first, then the helper
+        ck(clipboard.copy_text(""), "empty text ends at the helper")
+        return failures
+    }
+
+    if mode == "autoxsel" {
+        ck(clipboard.backend_name() == "xsel", "xsel when it is the only one")
+        ck(clipboard.copy_text("auto"), "copy_text")
+        ck(text_is("auto"), "paste")
+        ck(!clipboard.copy_png(png_ptr(), 69), "a PNG finds no taker (xsel is text only, the display is unreachable)")
+        return failures
+    }
+    return 99
+}
+
+// One script per helper. The scripts keep what they are given in $FAKE_DIR/clip.<type> and the last
+// arguments in $FAKE_DIR/<name>.args.
+fn script_xclip() -> str {
+    return "#!/bin/sh\n" +
+    "echo \"$@\" > \"$FAKE_DIR/xclip.args\"\n" +
+    "mode=none; t=\n" +
+    "while [ $# -gt 0 ]; do case \"$1\" in -in) mode=in;; -out) mode=out;; -t) shift; t=$1;; esac; shift; done\n" +
+    "key=$(printf '%s' \"$t\" | tr '/;=' '___')\n" +
+    "case $mode in\n" +
+    "  in) rm -f \"$FAKE_DIR\"/clip.*; cat > \"$FAKE_DIR/clip.$key\" ;;\n" +
+    "  out) [ -f \"$FAKE_DIR/clip.$key\" ] || exit 1; cat \"$FAKE_DIR/clip.$key\" ;;\n" +
+    "esac\n"
+}
+
+fn script_xsel() -> str {
+    return "#!/bin/sh\n" +
+    "echo \"$@\" > \"$FAKE_DIR/xsel.args\"\n" +
+    "case \"$2\" in\n" +
+    "  --input) rm -f \"$FAKE_DIR\"/clip.*; cat > \"$FAKE_DIR/clip.UTF8_STRING\" ;;\n" +
+    "  --output) [ -f \"$FAKE_DIR/clip.UTF8_STRING\" ] || exit 1; cat \"$FAKE_DIR/clip.UTF8_STRING\" ;;\n" +
+    "  --clear) rm -f \"$FAKE_DIR\"/clip.* ;;\n" +
+    "esac\n"
+}
+
+fn script_wl_copy() -> str {
+    return "#!/bin/sh\n" +
+    "echo \"$@\" > \"$FAKE_DIR/wl-copy.args\"\n" +
+    "if [ \"$1\" = \"--clear\" ]; then rm -f \"$FAKE_DIR\"/clip.*; exit 0; fi\n" +
+    "key=$(printf '%s' \"$2\" | tr '/;=' '___')\n" +
+    "rm -f \"$FAKE_DIR\"/clip.*\n" +
+    "cat > \"$FAKE_DIR/clip.$key\"\n"
+}
+
+fn script_wl_paste() -> str {
+    return "#!/bin/sh\n" +
+    "echo \"$@\" > \"$FAKE_DIR/wl-paste.args\"\n" +
+    "key=$(printf '%s' \"$3\" | tr '/;=' '___')\n" +
+    "[ -f \"$FAKE_DIR/clip.$key\" ] || exit 1\n" +
+    "cat \"$FAKE_DIR/clip.$key\"\n"
+}
+
+fn install(dir: str, name: str, body: str) -> bool {
+    let n: usize = fs.write_file_mode(dir + "/bin/" + name, body.p as u64, body.length(), 493, false) catch | e | 0
+    return n > 0
+}
+
+fn run_child(self_path: str, mode: str, dir: str, bin_in_path: bool, display: str, wayland: str, forced: str) -> i32 {
+    var c: process.Command = process.command(self_path)
+    process.add_arg(&c, "--child")
+    process.add_arg(&c, mode)
+    process.clear_env(&c)
+    if bin_in_path {
+        process.set_env(&c, "PATH", dir + "/bin:/usr/bin:/bin")
+    } else {
+        process.set_env(&c, "PATH", dir + "/empty")
+    }
+    process.set_env(&c, "FAKE_DIR", dir)
+    if display.length() > 0 { process.set_env(&c, "DISPLAY", display) }
+    if wayland.length() > 0 { process.set_env(&c, "WAYLAND_DISPLAY", wayland) }
+    if forced.length() > 0 { process.set_env(&c, "FIRN_CLIPBOARD", forced) }
+    var out: rt.Buf = rt.buf_new()
+    var err: rt.Buf = rt.buf_new()
+    let code: i32 = process.run_capture(&c, &out, &err, 60000) catch | e | terr(e)
+    process.command_free(&c)
+    if rt.buf_len(&out) > 0 {
+        say("    ")
+        syscall(1, 1, rt.buf_ptr(&out) as i64, rt.buf_len(&out) as i64, 0, 0, 0)
+    }
+    rt.buf_free(&out)
+    rt.buf_free(&err)
+    return code
+}
+
+fn wipe(dir: str) {
+    // fresh store for the next scenario: the scripts' files only, bin/ stays
+    var c: process.Command = process.command("/bin/sh")
+    process.add_arg(&c, "-c")
+    process.add_arg(&c, "rm -f \"$1\"/clip.* \"$1\"/*.args; : > \"$1\"/xsel.args")
+    process.add_arg(&c, "sh")
+    process.add_arg(&c, dir)
+    process.run(&c) catch 0
+    process.command_free(&c)
+}
+
+fn scenario(self_path: str, name: str, mode: str, dir: str, installed: bool, display: str, wayland: str, forced: str) {
+    wipe(dir)
+    let code: i32 = run_child(self_path, mode, dir, installed, display, wayland, forced)
+    if code != 0 {
+        failures = failures + 1
+        say("  FAIL  scenario ")
+        say(name)
+        say(" (child exit code ")
+        var b: rt.Buf = rt.buf_new()
+        rt.buf_push_dec_u64(&b, code as u64)
+        say(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+        rt.buf_free(&b)
+        say(")\n")
+    }
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) >= 3 && arg(start, 1) == "--child" {
+        return child_main(start)
+    }
+    let self_path: str = arg(start, 0)
+    var td: fsx.TempDir = fsx.temp_dir("firn_2370_") catch | e | fsx.TempDir { path: rt.buf_new(), armed: false }
+    if !td.armed {
+        say("cannot make a temporary directory\n")
+        return 1
+    }
+    let dir: str = __str_copy(fsx.temp_dir_path(&td))
+    fs.mkdir_all(dir + "/bin") catch false
+
+    // no helpers installed yet
+    scenario(self_path, "none", "none", dir, true, "", "", "")
+    scenario(self_path, "off", "off", dir, true, ":77", "wayland-77", "none")
+    scenario(self_path, "missing", "missing", dir, false, ":77", "", "xclip")
+
+    install(dir, "xclip", script_xclip())
+    install(dir, "xsel", script_xsel())
+    install(dir, "wl-copy", script_wl_copy())
+    install(dir, "wl-paste", script_wl_paste())
+    scenario(self_path, "xclip", "xclip", dir, true, ":77", "", "xclip")
+    scenario(self_path, "xsel", "xsel", dir, true, ":77", "", "xsel")
+    scenario(self_path, "wl", "wl", dir, true, "", "wayland-77", "wl-copy")
+    scenario(self_path, "autowl", "autowl", dir, true, "", "wayland-77", "")
+    scenario(self_path, "autox", "autox", dir, true, ":77", "", "")
+
+    // xsel alone
+    fs.remove(dir + "/bin/xclip") catch false
+    scenario(self_path, "autoxsel", "autoxsel", dir, true, ":77", "", "")
+
+    fsx.temp_dir_drop(&td)
+    if failures == 0 {
+        say("ok: std.clipboard backend choice and helpers\n")
+    }
+    return failures
+}

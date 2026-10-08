@@ -1,0 +1,270 @@
+// expect_exit: 0
+// tests/2371_std_clipboard_native.fi -- std.clipboard through the window layer's clipboard: the X11 selection
+// on Linux (in a private Xvfb that this test starts itself, so the clipboard of a real desktop is never
+// touched), the Win32 clipboard on Windows (the test machine's own, or Wine's).
+//
+//   A  text round trips: empty, one letter, a line end, UTF-8 (two, three and four octet characters),
+//      long lines, 100 KB, 1 MiB
+//   B  a second copy replaces the first, paste appends and leaves `out` alone when it fails
+//   C  has_text / clear
+//   D  PNG: a real PNG round trips, octets that are not a PNG are refused, a text copy replaces the PNG
+//   E  backend_name is "native"
+//
+// Without Xvfb (Linux) or a usable clipboard (Windows) the test says SKIP and ends with 0 (the real cross check is tools/desktop/clipboard_check.py,
+// which also asks GTK 3 and Wine's clipboard bridge). The same program runs under Wine. All messages go to
+// standard error.
+// The program starts ITSELF as a child (`argv[0] --child`) with DISPLAY set to the private server.
+import std.rt
+import std.str
+import std.env
+import std.process
+import std.osinfo
+import std.time
+import std.clipboard
+
+static mut failures: i32 = 0
+
+// Every message goes to standard error: standard output stays empty, so that the Linux build and the Windows
+// build (tools/windows/run.sh compares the two) agree whether the test ran or skipped.
+fn say(s: str) {
+    syscall(1, 2, s.p as i64, s.length() as i64, 0, 0, 0)
+}
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn ck(cond: bool, name: str) {
+    if !cond {
+        failures = failures + 1
+        say("  FAIL  ")
+        say(name)
+        say("\n")
+    }
+}
+
+fn eq(b: *mut rt.Buf, s: str) -> bool {
+    if rt.buf_len(b) != s.length() {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(b), s.p as u64, s.length())
+}
+
+fn terr(e: ProcError) -> i32 {
+    return 1000
+}
+
+static mut png: [u8; 69] = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 208, 0, 0, 3, 129, 1, 128, 162, 173, 150, 129, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]
+
+fn png_ptr() -> u64 {
+    return (&png[0]) as u64
+}
+
+// copy, paste, and compare
+fn round_trip(s: str, name: str) {
+    if !clipboard.copy_text(s) {
+        failures = failures + 1
+        say("  FAIL  copy_text: ")
+        say(name)
+        say("\n")
+        return
+    }
+    var b: rt.Buf = rt.buf_new()
+    let ok: bool = clipboard.paste_text(&b)
+    if !ok || !eq(&b, s) {
+        failures = failures + 1
+        say("  FAIL  round trip: ")
+        say(name)
+        say("\n")
+    }
+    rt.buf_free(&b)
+}
+
+fn checks() {
+    ck(clipboard.backend_name() == "native", "backend_name is native")
+    clipboard.clear()
+    // --- C: an empty clipboard has nothing to paste
+    var keep: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&keep, "keep".p as u64, 4)
+    ck(!clipboard.paste_text(&keep) && eq(&keep, "keep"), "nothing to paste after clear, out unchanged")
+    ck(!clipboard.has_text(), "has_text false after clear")
+    ck(!clipboard.has_png(), "has_png false after clear")
+    rt.buf_free(&keep)
+
+    // --- A
+    round_trip("", "empty text")
+    round_trip("a", "one letter")
+    round_trip("\n", "a line end")
+    round_trip("tab\tand  two spaces", "tab and spaces")
+    round_trip("h\u{e9}llo w\u{f6}rld \u{20ac} \u{65e5}\u{672c}\u{8a9e} \u{1f600} \u{10348}\nline two\n\nlast line", "UTF-8, 1-4 octets")
+    var big: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 100000 {
+        rt.buf_push(&big, (97 + i % 26) as u8)
+        i = i + 1
+    }
+    round_trip(str { p: rt.buf_data(&big), n: rt.buf_len(&big) }, "100 KB on one line")
+    rt.buf_free(&big)
+    var mb: rt.Buf = rt.buf_new()
+    i = 0
+    while i < 1048576 {
+        if i % 97 == 96 {
+            rt.buf_push(&mb, 10 as u8)
+        } else if i % 1000 == 7 {
+            rt.buf_push_bytes(&mb, "\u{e4}".p as u64, 2)
+            i = i + 1
+        } else {
+            rt.buf_push(&mb, (65 + i % 50) as u8)
+        }
+        i = i + 1
+    }
+    round_trip(str { p: rt.buf_data(&mb), n: rt.buf_len(&mb) }, "1 MiB")
+    rt.buf_free(&mb)
+
+    // --- B
+    ck(clipboard.copy_text("first"), "copy first")
+    ck(clipboard.copy_text("second"), "copy second")
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, ">>".p as u64, 2)
+    ck(clipboard.paste_text(&b) && eq(&b, ">>second"), "the second copy replaced the first; paste appends")
+    rt.buf_free(&b)
+
+    // --- C
+    ck(clipboard.has_text(), "has_text after a copy")
+    ck(clipboard.copy_text(""), "copy an empty text")
+    ck(clipboard.has_text(), "an empty text is a text")
+    ck(clipboard.clear(), "clear")
+    ck(!clipboard.has_text(), "has_text false after clear (again)")
+
+    // --- D
+    ck(!clipboard.copy_png(png_ptr(), 0), "copy_png of nothing refused")
+    ck(!clipboard.copy_png(png_ptr() + 1 as u64, 68), "copy_png of octets that are not a PNG refused")
+    ck(clipboard.copy_png(png_ptr(), 69), "copy_png")
+    ck(clipboard.has_png(), "has_png")
+    var pb: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&pb, "<".p as u64, 1)
+    ck(clipboard.paste_png(&pb) && rt.buf_len(&pb) == 70 && rt.mem_eq(rt.buf_ptr(&pb) + 1 as u64, png_ptr(), 69), "paste_png returns the file's octets (appended)")
+    rt.buf_free(&pb)
+    ck(clipboard.copy_text("now text"), "copy_text after a PNG")
+    ck(!clipboard.has_png(), "the text copy replaced the PNG")
+    ck(clipboard.has_text(), "and the text is there")
+    clipboard.clear()
+}
+
+// Xvfb with a free display number chosen by the server itself (-displayfd): the number is written to stdout.
+fn start_xvfb(xvfb: *mut process.Child) -> i32 {
+    var path: rt.Buf = rt.buf_new()
+    if !env.find_executable("Xvfb", &path) {
+        rt.buf_free(&path)
+        return -1
+    }
+    var c: process.Command = process.command("Xvfb")
+    process.add_arg(&c, "-displayfd")
+    process.add_arg(&c, "1")
+    process.add_arg(&c, "-screen")
+    process.add_arg(&c, "0")
+    process.add_arg(&c, "320x200x24")
+    process.add_arg(&c, "-nolisten")
+    process.add_arg(&c, "tcp")
+    process.set_stdin(&c, process.STDIO_NULL)
+    process.set_stdout(&c, process.STDIO_PIPE)
+    process.set_stderr(&c, process.STDIO_NULL)
+    var ch: process.Child = process.spawn(&c) catch | e | process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1, done: false, code: 0, sig: 0, own: true }
+    process.command_free(&c)
+    rt.buf_free(&path)
+    if ch.pid <= 0 {
+        return -2
+    }
+    *xvfb = ch
+    // wait up to 15 s for "<number>\n"
+    var line: [u8; 32] = [0 as u8; 32]
+    var have: usize = 0
+    let t0: u64 = time.monotonic_ns()
+    while time.monotonic_ns() - t0 < 15000000000 as u64 {
+        let n: i64 = process.read_out_nb(xvfb, (&line[0]) as u64 + have as u64, 31 - have)
+        if n > 0 {
+            have = have + n as usize
+            var k: usize = 0
+            while k < have {
+                if line[k] == 10 as u8 {
+                    var num: i32 = 0
+                    var j: usize = 0
+                    while j < k {
+                        num = num * 10 + (line[j] as i32 - 48)
+                        j = j + 1
+                    }
+                    return num
+                }
+                k = k + 1
+            }
+        } else if n == 0 {
+            return -3 // the server ended without a number
+        } else {
+            time.sleep_ms(20 as u64)
+        }
+    }
+    return -4
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) >= 2 && arg(start, 1) == "--child" {
+        checks()
+        if failures == 0 {
+            say("ok: std.clipboard round trips through the window layer\n")
+        }
+        return failures
+    }
+    if osinfo.is_windows() {
+        // Wine without a display (tools/windows/run.sh gives it none) cannot make the window that owns
+        // the clipboard: skip. On a real Windows machine, and under Wine on an Xvfb (clipboard_check.py), it runs.
+        if !clipboard.copy_text("probe") {
+            say("SKIP: no usable Windows clipboard here (Wine without a display?); tools/desktop/clipboard_check.py runs it on an Xvfb\n")
+            return 0
+        }
+        checks()
+        if failures == 0 {
+            say("ok: std.clipboard round trips through the window layer\n")
+        }
+        return failures
+    }
+    var xvfb: process.Child = process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1, done: false, code: 0, sig: 0, own: true }
+    let disp: i32 = start_xvfb(&xvfb)
+    if disp < 0 {
+        if xvfb.pid > 0 {
+            process.kill(&xvfb)
+            process.wait(&xvfb)
+            process.close(&xvfb)
+        }
+        if disp == -1 {
+            say("SKIP: Xvfb is not installed (apt-get install xvfb); the X11 clipboard was not run here\n")
+        } else {
+            say("SKIP: Xvfb did not start; the X11 clipboard was not run here\n")
+        }
+        return 0
+    }
+    var c: process.Command = process.command(arg(start, 0))
+    process.add_arg(&c, "--child")
+    var dv: rt.Buf = rt.buf_new()
+    rt.buf_push(&dv, 58 as u8)
+    rt.buf_push_dec_u64(&dv, disp as u64)
+    process.set_env(&c, "DISPLAY", str { p: rt.buf_data(&dv), n: rt.buf_len(&dv) })
+    process.set_env(&c, "FIRN_CLIPBOARD", "native")
+    var out: rt.Buf = rt.buf_new()
+    var err: rt.Buf = rt.buf_new()
+    let code: i32 = process.run_capture(&c, &out, &err, 120000) catch | e | terr(e)
+    process.command_free(&c)
+    process.terminate(&xvfb)
+    if !process.wait_timeout(&xvfb, 3000) {
+        process.kill(&xvfb)
+    }
+    process.wait(&xvfb)
+    process.close(&xvfb)
+    if rt.buf_len(&out) > 0 {
+        syscall(1, 2, rt.buf_ptr(&out) as i64, rt.buf_len(&out) as i64, 0, 0, 0)
+    }
+    rt.buf_free(&dv)
+    rt.buf_free(&out)
+    rt.buf_free(&err)
+    return code
+}

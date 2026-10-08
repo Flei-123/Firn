@@ -33,7 +33,7 @@ run() { "$@" || rc=1; }
 
 if [ "$WHICH" = all ] || [ "$WHICH" = linux ]; then
     step "1. build the Linux drivers in three stages (release-fast, --no-opt, dev-fast)"
-    for SRC in dbus_main tray_main notify_main autostart_main audio_main sink_main drop_main clip_main; do
+    for SRC in dbus_main tray_main notify_main autostart_main audio_main sink_main drop_main clip_main clipboard_main; do
         for STAGE in "opt:--opt-level=release-fast" "noopt:--no-opt" "dev:--opt-level=dev-fast"; do
             build "${STAGE#*:}" "$W/${SRC}_${STAGE%%:*}" "tools/desktop/$SRC.fi" || true
         done
@@ -81,6 +81,16 @@ if [ "$WHICH" = all ] || [ "$WHICH" = linux ]; then
     else
         echo "  SKIP  Xvfb or gi missing"
     fi
+
+    step "9b. std.clipboard (the windowless wrapper) against GTK 3's: text, 1.5 MiB (INCR), PNG, both directions, clear"
+    if have Xvfb && python3 -c "import gi" 2>/dev/null; then
+        run python3 tools/desktop/clipboard_check.py "$W/clipboard_main_opt"
+    else
+        echo "  SKIP  Xvfb or gi missing"
+    fi
+
+    step "9c. std.clipboard: the Linux, Android and browser files agree, and the program builds for five targets"
+    run python3 tools/desktop/clipboard_platforms.py --firnc "$FIRNC"
 fi
 
 if [ "$WHICH" = all ] || [ "$WHICH" = windows ]; then
@@ -92,7 +102,7 @@ if [ "$WHICH" = all ] || [ "$WHICH" = windows ]; then
         step "10. build the Windows programs (x86_64-windows; window programs through win32.fi)"
         WB="$W/win"; mkdir -p "$WB/wn/window"
         ln -s "$ROOT/lib/window/win32.fi" "$WB/wn/window/backend.fi"
-        for SRC in tray_main wintray_poke notify_main autostart_main sink_main audio_main; do
+        for SRC in tray_main wintray_poke notify_main autostart_main sink_main audio_main clipboard_main; do
             build "--target=x86_64-windows --opt-level=dev-fast" "$WB/$SRC.exe" "tools/desktop/$SRC.fi" || true
         done
         for SRC in windrop_main clip_main; do
@@ -131,6 +141,13 @@ if [ "$WHICH" = all ] || [ "$WHICH" = windows ]; then
         step "15. the Windows clipboard against GTK 3's (Wine bridges it to the X selections)"
         if have Xvfb && python3 -c "import gi" 2>/dev/null; then
             run python3 tools/desktop/clip_check.py "$WB/clip_main.exe" wine
+        else
+            echo "  SKIP  Xvfb or gi missing"
+        fi
+
+        step "15b. std.clipboard as a Windows program against GTK 3's (text, 1.5 MiB, PNG, clear)"
+        if have Xvfb && python3 -c "import gi" 2>/dev/null; then
+            run python3 tools/desktop/clipboard_check.py "$WB/clipboard_main.exe" wine
         else
             echo "  SKIP  Xvfb or gi missing"
         fi

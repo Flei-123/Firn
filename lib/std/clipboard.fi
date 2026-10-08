@@ -1,0 +1,348 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/clipboard.fi -- std.clipboard: the system clipboard for a program
+// WITHOUT a window of its own (a command line tool, a script, a service).
+//
+//     import std.rt
+//     import std.clipboard
+//
+//     clipboard.copy_text("héllo")                        // true = it is on the clipboard
+//     var out: rt.Buf = rt.buf_new()
+//     if clipboard.paste_text(&out) { ... rt.buf_len(&out) octets of UTF-8 ... }
+//     rt.buf_free(&out)
+//     clipboard.has_text()                                // is there text to paste?
+//     clipboard.copy_png(p, n)  /  clipboard.paste_png(&out)    // a PNG file's octets
+//     clipboard.clear()
+//     clipboard.serve(3000)                               // X11 only: stay alive and answer pasters
+//
+// Every function answers `false` when it cannot do the job (no display, no
+// clipboard in this environment, a foreign owner that does not answer, data
+// too large). None of them crashes. Every wait is bounded: one second for an
+// owner to answer, two seconds per piece of a large (INCR) transfer, four to
+// five seconds for a helper program.
+//
+// WHAT IS UNDER IT. Nothing new: the clipboard code of the window layer
+// (lib/window/window.fi: `clipboard_set` / `clipboard_get` -- X11 selections
+// in x11.fi, the Win32 clipboard in win32.fi) is used through ONE hidden 1x1
+// window that is created at the first call and kept until the program ends
+// (it is never shown, so nothing flashes). The browser build uses
+// plat.webclip (lib/@web/std/clipboard.fi), Android has none (false).
+//
+//   Windows   CF_UNICODETEXT (UTF-16 on the system side, "\n" <-> "\r\n"
+//             translated by the window layer) and the registered format "PNG".
+//             The data is copied into the system at once; it stays after the
+//             program has ended.
+//   Linux     X11 selections through the same hidden window, plus the
+//             helper programs of the desktop where they exist (see below).
+//   Wayland   `wl-copy` / `wl-paste` (wl-clipboard) when WAYLAND_DISPLAY is set.
+//   Browser   `copy_text` / `copy_png` write (inside a user gesture); reading
+//             is asynchronous there, see lib/@web/std/clipboard.fi.
+//
+// THE TEXT is UTF-8 on this side, with "\n" line ends, on every system. An
+// empty string is a valid text. Bytes are passed on as they are (no check
+// for valid UTF-8); the Windows side converts them to UTF-16 and a broken
+// sequence comes back as U+FFFD.
+//
+// THE LINUX CHOICE (copy). On X11 there is no clipboard storage: the program
+// that copies OWNS the selection and must be alive and answering when
+// somebody pastes (ICCCM 2). A command line tool that copies and exits would
+// leave nothing behind. So on Linux `copy_text` / `copy_png` first hand the
+// data to a helper that stays in the background by design -- `wl-copy`
+// (Wayland), `xclip`, `xsel` (X11) -- if one is installed, and only then fall
+// back to owning the selection itself. Pasting asks the selection directly (any
+// owner), helpers only if that fails (on Wayland: `wl-paste` first). The
+// environment variable FIRN_CLIPBOARD forces a choice: `native` (only the
+// hidden window), `wl-copy`, `xclip`, `xsel` (only that helper), or `none`.
+// `backend_name()` says what a copy would use.
+//
+// HONEST
+// B1  X11 without a helper: the data lives only while the program runs AND
+//     answers. A program that copies and then exits, or sits in a long
+//     computation, loses the content (a clipboard manager, if there is one,
+//     keeps a copy). Call `serve(ms)` before exiting to answer pasters for a
+//     while. Windows has no such limit.
+// B2  The helper paths are tested with stand-in scripts (tests/2370), not
+//     with the real wl-clipboard / xclip / xsel: they were not installed on
+//     the test machine. Flags used: `wl-copy --type T`, `wl-paste --no-newline
+//     --type T`, `xclip -selection clipboard -in|-out -t T`, `xsel --clipboard
+//     --input|--output|--clear`. `xsel` knows only text, `xclip` has no "clear".
+// B3  `copy_text` replaces everything this program offered before (a PNG
+//     copied earlier is gone). The window layer offers up to eight types.
+// B4  Size: at most 64 MiB per copy through the window layer (INCR transfer
+//     above 200,000 octets). A helper has no such limit but a time limit of
+//     five seconds for the hand-over.
+// B5  `has_text` pastes the text and throws it away: a full transfer for a
+//     big clipboard. Keep the result of `paste_text` instead when you need
+//     both.
+// B6  A program that pastes after another program has copied sees the new
+//     content (events are read before every paste); one that never calls any
+//     of these functions again is not told that its selection was taken.
+// B7  Not thread safe: the hidden window belongs to the thread that made the
+//     first call; call the functions from one thread.
+// B8  Windows opens the clipboard with a retry of about 200 ms; while another
+//     program holds it the call answers false. Tested under Wine (docs
+//     CLIPBOARD.md), not on a real Windows machine.
+
+import rt
+import str
+import time
+import window.window
+import clipos
+
+export {
+    copy_text, paste_text, has_text, clear,
+    copy_png, paste_png, has_png,
+    serve, backend_name,
+}
+
+const MIME_TEXT: str = "text/plain;charset=utf-8"
+const MIME_PNG: str = "image/png"
+
+// The one hidden window of the program: a heap address (0 = none yet).
+static mut cb_win: u64 = 0
+
+fn win_alloc[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+fn win_release[T](p: u64) {
+    rt.heap_free(p, size_of[T]())
+}
+
+// The hidden window, opened at the first use. 0 = there is no display (or
+// the window layer refused).
+fn session() -> *mut window.Window {
+    if cb_win != 0 as u64 {
+        return cb_win as *mut window.Window
+    }
+    if !clipos.os_native_allowed() {
+        return 0 as *mut window.Window
+    }
+    let p: u64 = win_alloc[window.Window]()
+    if p == 0 as u64 {
+        return 0 as *mut window.Window
+    }
+    let f: *mut window.Window = p as *mut window.Window
+    *f = window.window_new()
+    if !window.open_window(f, 0) {
+        win_release[window.Window](p)
+        return 0 as *mut window.Window
+    }
+    // 1x1 and never shown: only here to own and to ask for selections
+    if !window.make(f, 1, 1) {
+        window.close_window(f)
+        win_release[window.Window](p)
+        return 0 as *mut window.Window
+    }
+    cb_win = p
+    return f
+}
+
+// Reads what the display server has sent (a taken selection, a request for
+// ours) and answers it.
+fn pump(f: *mut window.Window) {
+    window.wait_event(f, 0)
+    var n: u32 = 0
+    while n < 1000 as u32 && window.next_event(f) != window.EV_NONE {
+        n = n + 1 as u32
+    }
+}
+
+fn native_set(mime: str, p: u64, n: usize) -> bool {
+    let f: *mut window.Window = session()
+    if f as u64 == 0 as u64 {
+        return false
+    }
+    pump(f)
+    window.clipboard_clear(f) // replace, do not add to what we offered before
+    return window.clipboard_set(f, mime, p, n)
+}
+
+fn native_get(mime: str, out: *mut rt.Buf) -> bool {
+    let f: *mut window.Window = session()
+    if f as u64 == 0 as u64 {
+        return false
+    }
+    pump(f)
+    return window.clipboard_get(f, mime, out)
+}
+
+fn copy_any(mime: str, p: u64, n: usize) -> bool {
+    var tried: bool = false
+    if clipos.os_copy_first(n) {
+        tried = true
+        if clipos.os_copy(mime, p, n) {
+            return true
+        }
+    }
+    if native_set(mime, p, n) {
+        return true
+    }
+    if !tried {
+        return clipos.os_copy(mime, p, n)
+    }
+    return false
+}
+
+fn paste_any(mime: str, out: *mut rt.Buf) -> bool {
+    let before: usize = rt.buf_len(out)
+    var tried: bool = false
+    if clipos.os_paste_first() {
+        tried = true
+        if clipos.os_paste(mime, out) {
+            return true
+        }
+        rt.buf_set_len(out, before)
+    }
+    if native_get(mime, out) {
+        return true
+    }
+    rt.buf_set_len(out, before)
+    if !tried {
+        if clipos.os_paste(mime, out) {
+            return true
+        }
+        rt.buf_set_len(out, before)
+    }
+    return false
+}
+
+fn has_png_magic(p: u64, n: usize) -> bool {
+    if n < 8 {
+        return false
+    }
+    return rt.ld8(p, 0) == 0x89 as u8 && rt.ld8(p, 1) == 0x50 as u8 && rt.ld8(p, 2) == 0x4E as u8
+    && rt.ld8(p, 3) == 0x47 as u8 && rt.ld8(p, 4) == 0x0D as u8 && rt.ld8(p, 5) == 0x0A as u8
+    && rt.ld8(p, 6) == 0x1A as u8 && rt.ld8(p, 7) == 0x0A as u8
+}
+
+// The length of the PNG file at `p` (`n` octets there): signature, then chunks up to and including
+// IEND. 0 = not a complete PNG. Windows hands out a block that may be a few octets larger than the data
+// (GlobalSize rounds up), so the end is found by the chunks, not by the size.
+fn png_exact_len(p: u64, n: usize) -> usize {
+    if !has_png_magic(p, n) {
+        return 0
+    }
+    var at: usize = 8
+    while at + 12 <= n {
+        let len: usize = ((rt.ld8(p, at) as usize) << 24) | ((rt.ld8(p, at + 1) as usize) << 16)
+        | ((rt.ld8(p, at + 2) as usize) << 8) | (rt.ld8(p, at + 3) as usize)
+        if len > n || at + 12 + len > n {
+            return 0
+        }
+        let is_end: bool = rt.ld8(p, at + 4) == 0x49 as u8 && rt.ld8(p, at + 5) == 0x45 as u8
+        && rt.ld8(p, at + 6) == 0x4E as u8 && rt.ld8(p, at + 7) == 0x44 as u8
+        at = at + 12 + len
+        if is_end {
+            return at
+        }
+    }
+    return 0
+}
+
+// Puts `s` on the clipboard as text (replacing what was there).
+fn copy_text(s: str) -> bool {
+    return copy_any(MIME_TEXT, s.p as u64, s.length())
+}
+
+// APPENDS the clipboard's text to `out`. false = no text there (and `out` is
+// unchanged).
+fn paste_text(out: *mut rt.Buf) -> bool {
+    return paste_any(MIME_TEXT, out)
+}
+
+// Is there text to paste (an empty text counts)? See B5.
+fn has_text() -> bool {
+    var tmp: rt.Buf = rt.buf_new()
+    let r: bool = paste_any(MIME_TEXT, &tmp)
+    rt.buf_free(&tmp)
+    return r
+}
+
+// Puts a PNG file (its octets, signature included) on the clipboard. false for
+// anything that does not start with the PNG signature.
+fn copy_png(p: u64, n: usize) -> bool {
+    if !has_png_magic(p, n) {
+        return false
+    }
+    return copy_any(MIME_PNG, p, n)
+}
+
+// APPENDS the clipboard's PNG file to `out` (exactly the file: up to and including its IEND chunk).
+// false = no complete PNG there (`out` unchanged).
+fn paste_png(out: *mut rt.Buf) -> bool {
+    let before: usize = rt.buf_len(out)
+    if !paste_any(MIME_PNG, out) {
+        return false
+    }
+    let exact: usize = png_exact_len(rt.buf_ptr(out) + before as u64, rt.buf_len(out) - before)
+    if exact == 0 {
+        rt.buf_set_len(out, before)
+        return false
+    }
+    rt.buf_set_len(out, before + exact) // without the padding Windows may add
+    return true
+}
+
+fn has_png() -> bool {
+    var tmp: rt.Buf = rt.buf_new()
+    let r: bool = paste_png(&tmp)
+    rt.buf_free(&tmp)
+    return r
+}
+
+// Empties the clipboard. true = it is empty now.
+fn clear() -> bool {
+    var ok: bool = false
+    if clipos.os_clear() {
+        ok = true
+    }
+    // taking the selection with an empty text and giving it up again leaves
+    // nobody as the owner (also when a helper without "clear" owned it)
+    let f: *mut window.Window = session()
+    if f as u64 != 0 as u64 {
+        pump(f)
+        window.clipboard_clear(f)
+        if window.clipboard_set(f, MIME_TEXT, 0, 0) {
+            window.clipboard_clear(f)
+            ok = true
+        }
+    }
+    return ok
+}
+
+// X11: answers other programs' paste requests for up to `ms` milliseconds
+// (see B1). Everywhere else, and when nothing was copied through the window
+// layer, it returns at once.
+fn serve(ms: i64) {
+    if cb_win == 0 as u64 || ms <= 0 {
+        return
+    }
+    let f: *mut window.Window = cb_win as *mut window.Window
+    let t0: u64 = time.monotonic_ns()
+    let limit: u64 = (ms as u64) * 1000000 as u64
+    while time.monotonic_ns() - t0 < limit {
+        window.wait_event(f, 50)
+        var n: u32 = 0
+        while n < 1000 as u32 && window.next_event(f) != window.EV_NONE {
+            n = n + 1 as u32
+        }
+    }
+}
+
+// What a copy would use now: "wl-copy", "xclip", "xsel", "native" (the window
+// layer: X11 selections or the Win32 clipboard) or "none".
+fn backend_name() -> str {
+    if clipos.os_copy_first(1) {
+        let t: str = clipos.os_tool_name()
+        if t.length() > 0 {
+            return t
+        }
+    }
+    if clipos.os_native_allowed() {
+        return "native"
+    }
+    if clipos.os_tool_name().length() > 0 {
+        return clipos.os_tool_name()
+    }
+    return "none"
+}
