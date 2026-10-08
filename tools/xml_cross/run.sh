@@ -103,6 +103,14 @@ if [ -n "$cli" ]; then
     else
         report "counter-check: the guard page did not stop an over-read (exit $rc)"
     fi
+    # a fuzz run that never frees its documents must be reported as a leak (exit 2)
+    "$cli" fuzz "$W/seeds.txt" 4000 3 leak > "$W/leak.out" 2>&1
+    rc=$?
+    if [ $rc -eq 2 ] && grep -q 'RSS grew' "$W/leak.out"; then
+        echo "  xml: counter-check: a fuzz run that leaks every document is reported (RSS $(awk '$1=="rss_pages_after_10pct"{a=$2} $1=="rss_pages_end"{b=$2} END{printf "%d -> %d pages", a, b}' "$W/leak.out")), so the leak test works"
+    else
+        report "counter-check: a leaking fuzz run was not noticed (exit $rc)"
+    fi
     mkdir -p "$W/bad"
     for i in 0 1 2; do cp "$W/valid/$i.xml" "$W/bad/$i.xml"; cp "$W/valid/$i.exp" "$W/bad/$i.exp"; done
     sed -i '2s/^/x/' "$W/bad/1.exp"
