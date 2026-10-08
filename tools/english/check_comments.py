@@ -74,12 +74,24 @@ CODESPAN = re.compile(r'`[^`]*`')
 # und weil RE_WORT ohne Ruecksicht auf Gross- und Kleinschreibung sucht,
 # meldete `MIT -- see [LICENSE](LICENSE)` eine deutsche Zeile. Die Liste
 # wird GROSS/KLEIN GENAU angewendet: `mit` faellt weiter auf.
-NAMEN = re.compile(r'\b(?:MIT)\b')
+NAMEN = re.compile(r'\b(?:MIT|DER)\b')
+
+# Quoted examples ("vor 5 Minuten", a title in quotes) are data, not prose.
+QUOTED = re.compile(r'"[^"]*"')
+
+# Documents that are written in German on purpose (the owner reads them in
+# German): one path per line in tools/english/german_docs.txt.
+def german_docs():
+    try:
+        return {z.strip() for z in open('tools/english/german_docs.txt', encoding='utf-8')
+                if z.strip() and not z.startswith('#')}
+    except OSError:
+        return set()
 
 
 def deutsch(zeilen):
     return [(i, z) for i, z in zeilen
-            if RE_WORT.search(NAMEN.sub(' ', CODESPAN.sub(' ', z)))]
+            if RE_WORT.search(NAMEN.sub(' ', QUOTED.sub(' ', CODESPAN.sub(' ', z))))]
 
 
 def bereich(pfad):
@@ -97,9 +109,10 @@ def main():
             print(f"{sys.argv[2]}:{i}: {z}")
         return 0
     je_bereich, je_datei, summe = {}, {}, 0
+    erlaubt = german_docs()
     for p in dateien():
         b = bereich(p)
-        if not b:
+        if not b or p in erlaubt:
             continue
         n = len(deutsch(kommentarzeilen(p)))
         if n:

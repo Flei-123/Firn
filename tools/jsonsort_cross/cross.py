@@ -44,7 +44,7 @@ ALPHABETS = [
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-./:",
     "\"\\/\b\f\n\r\t",
     "".join(chr(c) for c in range(0, 32)) + "\x7f",
-    "äöüßéèêñçøåÆ¿¡€£¥©®™",
+    "äöüßéèêñçøåÆ¿¡€£¥©®™",  # english: ok -- non-ASCII test data
     "日本語中文한국어ひらがなカタカナ",
     "\U0001F600\U0001F4A9\U0001F680\U00010348\U0001D11E\U0010FFFF",
     "   ​﻿�￿～퟿\u0080߿ࠀ",

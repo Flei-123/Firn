@@ -1,7 +1,7 @@
 # SKRIPT-LIBS — API design of the script libraries (r311–r320)
 
 Design note written BEFORE the code (08.10.2026). Source of the need:
-`docs/SKRIPT-ERSATZ.md` (what OpenPlan's ~120 Python scripts use). Goal: a Firn
+`docs/SCRIPT-REPLACEMENT.md` (what OpenPlan's ~120 Python scripts use). Goal: a Firn
 program that does what a 40-line Python check script does should not need
 100 lines of plumbing.
 

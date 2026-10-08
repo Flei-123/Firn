@@ -62,7 +62,7 @@ zwei komplette Läufe am 08.10.2026):
   Der Prototyp lag bei ~6 ms Overhead (22 ms gegen 16 ms), davon `firnc --version` + `sha256sum` — beides entfällt auf dem warmen Pfad
   (make-Regel mit eingebauten `-nt`-Tests statt `stat`-Prozess; `stat` allein kostete im Test ~1,8 ms).
 - **Firn-Skript gegen Python-Skript (Startzeit)**: `./x.fi` 3,0–3,3 ms gegen `python3 x.py` 25,7–25,8 ms, also **etwa 8× schneller beim Start**
-  (reiner Start eines leeren Skripts; Python mit den üblichen Importen csv/json/subprocess/… ~50 ms, siehe `docs/SKRIPT-ERSATZ.md` §4).
+  (reiner Start eines leeren Skripts; Python mit den üblichen Importen csv/json/subprocess/… ~50 ms, siehe `docs/SCRIPT-REPLACEMENT.md` §4).
 - **Kalt** (leerer Cache, Mittel aus 5 Bauten): Skript ohne Imports **62–65 ms**; Skript mit 6 `std`-Imports (`rt str process fs text vec`)
   **417 ms** (`dev-fast`, der Standard), **654 ms** (`release-fast`), **709 ms** (`release-safe`). Deshalb ist `dev-fast` der Standard von `firn-run`;
   rechenintensive Skripte: `FIRN_OPT=release-fast` (die Laufzeit-Zahlen dazu: `bench/RESULTS.md`).

@@ -1,4 +1,4 @@
-# SKRIPT-ERSATZ — Kann Firn die Python-Skripte von OpenPlan ersetzen?
+# SCRIPT-REPLACEMENT — Kann Firn die Python-Skripte von OpenPlan ersetzen?
 
 Stand 08.10.2026. Auftrag von Justin: **nur untersuchen und messen**, nichts
 Großes umbauen. Geprüft: Firn `main` 6986c77b7 (Compiler `compiler/target/release/firnc`,
