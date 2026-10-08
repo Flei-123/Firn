@@ -1608,7 +1608,7 @@ fn write_py_float(out: *mut rt.Buf, p: u64, n: usize, negative: bool) {
 }
 
 fn write_number_opts(out: *mut rt.Buf, d: *mut Json, i: u32, sc: *mut num.Bytes,
-    flags: u32) {
+    ws: *mut u8, flags: u32) {
     let nd: *mut Node = node_at(d, i)
     if (*nd).is_int {
         rt.buf_push_dec_i64(out, (*nd).inum)
@@ -1653,7 +1653,13 @@ fn write_number_opts(out: *mut rt.Buf, d: *mut Json, i: u32, sc: *mut num.Bytes,
     }
     var b: num.Bytes = *sc
     num.bytes_clear(&b)
-    if num.write_f64(&b, mag) {
+    if (ws as u64) != 0 {
+        // the scratch memory of `dtoa` is handed in once per document: the
+        // convenient `num.write_f64` takes two mmap/munmap pairs PER NUMBER
+        // (measured: 4 s of system calls for 100,000 floats)
+        num.dtoa(__bits(mag), &b, ws)
+        write_py_float(out, rt.addr_of(b.ptr), b.len, negative)
+    } else if num.write_f64(&b, mag) {
         write_py_float(out, rt.addr_of(b.ptr), b.len, negative)
     }
     *sc = b
@@ -1662,7 +1668,7 @@ fn write_number_opts(out: *mut rt.Buf, d: *mut Json, i: u32, sc: *mut num.Bytes,
 // One value. `ok` goes false when memory for a sort ran out (that object is
 // then written in document order).
 fn write_node_opts(d: *mut Json, i: u32, out: *mut rt.Buf, o: *mut JsonOpts,
-    level: usize, sc: *mut num.Bytes, ok: *mut bool) {
+    level: usize, sc: *mut num.Bytes, ws: *mut u8, ok: *mut bool) {
     let k: u8 = json_kind(d, i)
     let ascii: bool = ((*o).flags & JSON_ASCII) != 0 as u32
     if k == JSON_NULL {
@@ -1675,7 +1681,7 @@ fn write_node_opts(d: *mut Json, i: u32, out: *mut rt.Buf, o: *mut JsonOpts,
         var s: [u8; 6] = "false\0"
         push_text(out, (&s[0]) as u64, 5)
     } else if k == JSON_NUMBER {
-        write_number_opts(out, d, i, sc, (*o).flags)
+        write_number_opts(out, d, i, sc, ws, (*o).flags)
     } else if k == JSON_STRING {
         let s: str.Span = json_string(d, i)
         rt.buf_push(out, 34 as u8)
@@ -1697,7 +1703,7 @@ fn write_node_opts(d: *mut Json, i: u32, out: *mut rt.Buf, o: *mut JsonOpts,
             if (*o).indent >= 0 {
                 opts_newline(out, o, level + 1)
             }
-            write_node_opts(d, c, out, o, level + 1, sc, ok)
+            write_node_opts(d, c, out, o, level + 1, sc, ws, ok)
             first = false
             c = json_next(d, c)
         }
@@ -1740,7 +1746,7 @@ fn write_node_opts(d: *mut Json, i: u32, out: *mut rt.Buf, o: *mut JsonOpts,
             write_escaped(out, key.p as u64, key.n, ascii)
             rt.buf_push(out, 34 as u8)
             opts_put_key(out, o)
-            write_node_opts(d, c, out, o, level + 1, sc, ok)
+            write_node_opts(d, c, out, o, level + 1, sc, ws, ok)
             pos = pos + 1
             if order == 0 {
                 c = json_next(d, c)
@@ -1762,7 +1768,13 @@ fn write_node_opts(d: *mut Json, i: u32, out: *mut rt.Buf, o: *mut JsonOpts,
 fn json_write_opts(d: *mut Json, i: u32, out: *mut rt.Buf, o: *mut JsonOpts) -> bool {
     var sc: num.Bytes = num.bytes_new()
     var ok: bool = true
-    write_node_opts(d, i, out, o, 0, &sc, &ok)
+    // one scratch block for all numbers of the document (0 = out of memory:
+    // then every number takes the slower convenient path)
+    let ws: *mut u8 = rt.ptr_of(rt.heap_alloc(num.dtoa_work_bytes()))
+    write_node_opts(d, i, out, o, 0, &sc, ws, &ok)
+    if (ws as u64) != 0 {
+        rt.heap_free(ws as u64, num.dtoa_work_bytes())
+    }
     num.bytes_free(&sc)
     return ok
 }
