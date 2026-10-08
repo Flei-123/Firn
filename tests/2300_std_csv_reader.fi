@@ -1,0 +1,206 @@
+// expect_exit: 0
+// tests/2300_std_csv_reader.fi -- std.csv: the reader over memory.
+//
+// The behaviour is Python's csv.reader (the random comparison is
+// tools/csv_cross/run.sh); this file pins the rules one by one so that a
+// failure names the rule:
+//
+//   A  plain rows, line ends LF / CRLF / CR, with and without a final one
+//   B  blank lines and empty fields
+//   C  quotes: delimiter inside, doubled quote, newline inside, quote inside
+//      an unquoted field, an empty quoted field
+//   D  dialects: ';' TAB, quote character, doublequote off
+//   E  errors in strict mode (row and line numbers), non-strict mode
+//   F  odd bytes: UTF-8, NUL, a one byte read
+import std.rt
+import std.csv
+
+static mut failures: i32 = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn fail(name: str, got: *mut rt.Buf, want: str) {
+    failures = failures + 1
+    say("  FAIL  ")
+    say(name)
+    say("\n    got  ")
+    rt.write_everything(1, rt.buf_ptr(got), rt.buf_len(got))
+    say("\n    want ")
+    say(want)
+    say("\n")
+}
+
+// "('a','b')('')()" -- one parenthesis group per row, each field in single quotes
+fn render(r: *mut csv.Reader, out: *mut rt.Buf) {
+    while csv.next_row(r) {
+        rt.buf_push(out, 40 as u8)
+        var i: usize = 0
+        while i < csv.field_count(r) {
+            if i > 0 {
+                rt.buf_push(out, 44 as u8)
+            }
+            rt.buf_push(out, 39 as u8)
+            let f: str = csv.field(r, i)
+            rt.buf_push_bytes(out, f.p as u64, f.n)
+            rt.buf_push(out, 39 as u8)
+            i = i + 1
+        }
+        rt.buf_push(out, 41 as u8)
+    }
+}
+
+fn same(got: *mut rt.Buf, want: str) -> bool {
+    return rt.buf_len(got) == want.n && rt.mem_eq(rt.buf_ptr(got), want.p as u64, want.n)
+}
+
+fn expect(name: str, src: str, want: str) {
+    var r: csv.Reader = csv.reader_str(src)
+    var got: rt.Buf = rt.buf_new()
+    render(&r, &got)
+    if !same(&got, want) || csv.error_code(&r) != csv.E_NONE {
+        fail(name, &got, want)
+    }
+    csv.reader_free(&r)
+    rt.buf_free(&got)
+}
+
+// with a delimiter / quote / doublequote of its own
+fn expect_dialect(name: str, src: str, d: u8, q: u8, dq: bool, want: str) {
+    var r: csv.Reader = csv.reader_str(src)
+    csv.set_delimiter(&r, d)
+    csv.set_quote(&r, q)
+    csv.set_doublequote(&r, dq)
+    var got: rt.Buf = rt.buf_new()
+    render(&r, &got)
+    if !same(&got, want) || csv.error_code(&r) != csv.E_NONE {
+        fail(name, &got, want)
+    }
+    csv.reader_free(&r)
+    rt.buf_free(&got)
+}
+
+// the rows before the error, then the error: code, row, line
+fn expect_error(name: str, src: str, strict: bool, want: str, code: u32, row: usize, line: usize) {
+    var r: csv.Reader = csv.reader_str(src)
+    csv.set_strict(&r, strict)
+    var got: rt.Buf = rt.buf_new()
+    render(&r, &got)
+    if !same(&got, want) || csv.error_code(&r) != code || csv.error_row(&r) != row || csv.error_line(&r) != line {
+        fail(name, &got, want)
+    }
+    // once it has failed, it stays failed
+    if csv.next_row(&r) {
+        fail("after an error next_row stays false", &got, want)
+    }
+    csv.reader_free(&r)
+    rt.buf_free(&got)
+}
+
+fn main() -> i32 {
+    // --- A: rows and line ends
+    expect("one row, no final newline", "a,b,c", "('a','b','c')")
+    expect("one row, LF", "a,b\n", "('a','b')")
+    expect("two rows, CRLF", "a,b\r\nc,d\r\n", "('a','b')('c','d')")
+    expect("a lone CR ends a row", "a\rb\r", "('a')('b')")
+    expect("LF CR is two ends", "a\n\rb", "('a')()('b')")
+    expect("CR CR LF is a row end and a blank line", "a\r\r\nb", "('a')()('b')")
+    expect("mixed line ends", "a\nb\r\nc\rd", "('a')('b')('c')('d')")
+    expect("no input", "", "")
+    expect("last row without end", "a\nb", "('a')('b')")
+
+    // --- B: blank lines, empty fields
+    expect("a blank line is a row without fields", "a\n\nb\n", "('a')()('b')")
+    expect("only a newline", "\n", "()")
+    expect("two blank lines", "\r\n\r\n", "()()")
+    expect("empty fields", "a,,b", "('a','','b')")
+    expect("a lone delimiter", ",", "('','')")
+    expect("a trailing delimiter", "a,", "('a','')")
+    expect("a trailing delimiter, then a line", "a,\nb", "('a','')('b')")
+    expect("a leading delimiter", ",a", "('','a')")
+
+    // --- C: quotes
+    expect("quoted field", "\"abc\",d", "('abc','d')")
+    expect("delimiter inside quotes", "\"a,b\",c", "('a,b','c')")
+    expect("doubled quote", "\"a\"\"b\"", "('a\"b')")
+    expect("a field of one quote", "\"\"\"\"", "('\"')")
+    expect("newline inside quotes", "\"a\nb\",c\nd", "('a\nb','c')('d')")
+    expect("CRLF inside quotes is kept", "\"a\r\nb\"\r\n", "('a\r\nb')")
+    expect("empty quoted field is one empty field", "\"\"", "('')")
+    expect("empty quoted fields", "\"\",\"\"\n", "('','')")
+    expect("quote inside an unquoted field is a byte", "ab\"c\"d,e", "('ab\"c\"d','e')")
+    expect("quote after the first byte is a byte", "a\",b", "('a\"','b')")
+    expect("quoted field then end of line", "x,\"y\"\nz", "('x','y')('z')")
+    expect("quoted field at the very end", "\"a\"", "('a')")
+    expect("spaces are kept", " a , b ", "(' a ',' b ')")
+    expect("space before the quote is data", " \"a\"", "(' \"a\"')")
+
+    // --- D: dialects
+    expect_dialect("semicolon", "a;b,c\n1;2", 59 as u8, 34 as u8, true, "('a','b,c')('1','2')")
+    expect_dialect("tab", "a\tb\n", 9 as u8, 34 as u8, true, "('a','b')")
+    expect_dialect("single quote as quote character", "'a,b',\"c\"", 44 as u8, 39 as u8, true, "('a,b','\"c\"')")
+    expect_dialect("doublequote off: a quote ends the quoted part", "\"ab\"cd,e", 44 as u8, 34 as u8, false, "('abcd','e')")
+    expect_dialect("doublequote off: later quotes are data", "\"a\"b\"c,d", 44 as u8, 34 as u8, false, "('ab\"c','d')")
+    expect_dialect("a letter as delimiter", "xaybaz", 97 as u8, 34 as u8, true, "('x','yb','z')")
+    var r: csv.Reader = csv.reader_str("a")
+    if csv.set_delimiter(&r, 10 as u8) || csv.set_delimiter(&r, 13 as u8) || csv.set_quote(&r, 10 as u8) || csv.set_quote(&r, 13 as u8) {
+        failures = failures + 1
+        say("  FAIL  CR/LF accepted as delimiter or quote\n")
+    }
+    csv.reader_free(&r)
+
+    // --- E: errors
+    expect_error("unterminated quote", "a,b\n\"c,d", true, "('a','b')", csv.E_UNTERMINATED, 2, 2)
+    expect_error("unterminated quote over lines", "x\n\"a\nb\nc", true, "('x')", csv.E_UNTERMINATED, 2, 4)
+    expect_error("unterminated, final newline", "\"a\n", true, "", csv.E_UNTERMINATED, 1, 1)
+    expect_error("byte after the closing quote", "a\n\"b\"c,d\ne", true, "('a')", csv.E_BAD_QUOTE, 2, 2)
+    expect_error("quote after the closing quote is data", "\"a\"\"b\"x", true, "", csv.E_BAD_QUOTE, 1, 1)
+    expect_error("non strict: unterminated quote ends the field", "a,\"b\nc", false, "('a','b\nc')", csv.E_NONE, 0, 0)
+    expect_error("non strict: byte after the quote is data", "\"a\"b,c", false, "('ab','c')", csv.E_NONE, 0, 0)
+    var e: csv.Reader = csv.reader_str("\"x")
+    while csv.next_row(&e) {
+    }
+    if csv.error_text(csv.error_code(&e)).n == 0 || csv.error_text(csv.E_NONE).n != 0 || csv.rows_read(&e) != 0 {
+        failures = failures + 1
+        say("  FAIL  error_text / rows_read\n")
+    }
+    csv.reader_free(&e)
+
+    // --- F: odd bytes
+    expect("UTF-8 passes through", "caf\u{e9},\u{20ac}\n", "('caf\u{e9}','\u{20ac}')")
+    expect("NUL is data", "a\x00b,c", "('a\x00b','c')")
+    var one: [u8; 1] = [97 as u8]
+    var rb: csv.Reader = csv.reader(&one[0], 1)
+    var gb: rt.Buf = rt.buf_new()
+    render(&rb, &gb)
+    if !same(&gb, "('a')") {
+        fail("reader over a pointer and a length", &gb, "('a')")
+    }
+    csv.reader_free(&rb)
+    rt.buf_free(&gb)
+
+    // field() past the end, rows_read, a long row
+    var big: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 5000 {
+        rt.buf_push_bytes(&big, "abcdefghij,".p as u64, 11)
+        i = i + 1
+    }
+    rt.buf_push(&big, 10 as u8)
+    rt.buf_push(&big, 120 as u8)
+    var rl: csv.Reader = csv.reader(rt.buf_data(&big), rt.buf_len(&big))
+    var ok: bool = csv.next_row(&rl) && csv.field_count(&rl) == 5001 && csv.field(&rl, 4999).n == 10 && csv.field(&rl, 5000).n == 0
+    ok = ok && csv.field(&rl, 5001).n == 0 && csv.next_row(&rl) && csv.field_count(&rl) == 1 && !csv.next_row(&rl) && csv.rows_read(&rl) == 2
+    if !ok {
+        failures = failures + 1
+        say("  FAIL  a row of 5001 fields\n")
+    }
+    csv.reader_free(&rl)
+    rt.buf_free(&big)
+
+    if failures != 0 {
+        return 1
+    }
+    return 0
+}

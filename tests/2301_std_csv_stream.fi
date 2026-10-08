@@ -1,0 +1,237 @@
+// expect_exit: 0
+// tests/2301_std_csv_stream.fi -- std.csv: streaming from a descriptor.
+//
+//   A  the same rows come out whatever the read size (1 byte up to 64 KiB):
+//      a quote, a CRLF or a row can be cut at any place
+//   B  CONSTANT MEMORY: 8 MiB of 100 000 rows are read and the resident memory
+//      of the process does not grow by the size of the file
+//   C  a row of 3 MiB (one cell) comes through intact -- the row buffer grows
+//   D  an error found while streaming has the same row and line numbers
+//   E  a descriptor that is not a file (-1) is an I/O error, not a crash
+import std.rt
+import std.str
+import std.fs
+import std.csv
+
+static mut failures: i32 = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn fail(name: str) {
+    failures = failures + 1
+    say("  FAIL  ")
+    say(name)
+    say("\n")
+}
+
+fn temp_path(out: *mut rt.Buf) {
+    rt.buf_push_bytes(out, "/tmp/firn-csv-stream-".p as u64, 21)
+    rt.buf_push_dec_i64(out, syscall(39, 0, 0, 0, 0, 0, 0))
+    rt.buf_push_bytes(out, ".csv".p as u64, 4)
+}
+
+fn as_path(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn rss_kib() -> i64 {
+    var b: rt.Buf = rt.buf_new()
+    fs.read_file("/proc/self/status", &b) catch 0
+    var found: i64 = 0
+    let n: usize = rt.buf_len(&b)
+    let p: *mut u8 = rt.buf_data(&b)
+    var i: usize = 0
+    while i + 6 < n {
+        // "VmRSS:"
+        if *(p + i) == 86 as u8 && *(p + i + 1) == 109 as u8 && *(p + i + 2) == 82 as u8 && *(p + i + 3) == 83 as u8 && *(p + i + 4) == 83 as u8 {
+            var j: usize = i + 5
+            while j < n && (*(p + j) < 48 as u8 || *(p + j) > 57 as u8) {
+                j = j + 1
+            }
+            while j < n && *(p + j) >= 48 as u8 && *(p + j) <= 57 as u8 {
+                found = found * 10 + (*(p + j) - 48 as u8) as i64
+                j = j + 1
+            }
+            break
+        }
+        i = i + 1
+    }
+    rt.buf_free(&b)
+    return found
+}
+
+// "('a','b')" per row, as in tests/2300
+fn render(r: *mut csv.Reader, out: *mut rt.Buf) {
+    while csv.next_row(r) {
+        rt.buf_push(out, 40 as u8)
+        var i: usize = 0
+        while i < csv.field_count(r) {
+            if i > 0 {
+                rt.buf_push(out, 44 as u8)
+            }
+            rt.buf_push(out, 39 as u8)
+            let f: str = csv.field(r, i)
+            rt.buf_push_bytes(out, f.p as u64, f.n)
+            rt.buf_push(out, 39 as u8)
+            i = i + 1
+        }
+        rt.buf_push(out, 41 as u8)
+    }
+}
+
+fn main() -> i32 {
+    var path: rt.Buf = rt.buf_new()
+    temp_path(&path)
+    let p: str = as_path(&path)
+
+    // --- A: every read size gives the same rows
+    var doc: str = "id,text\r\n1,\"a,b\"\r\n2,\"line\r\nbreak\"\"q\"\"\"\r\n\r\n3,\n4,last"
+    fs.write_file(p, doc.p as u64, doc.n) catch 0
+    var want: rt.Buf = rt.buf_new()
+    var mr: csv.Reader = csv.reader_str(doc)
+    render(&mr, &want)
+    csv.reader_free(&mr)
+    var size: usize = 1
+    while size <= 70 {
+        let fd: i64 = fs.open_read(p) catch -1
+        if fd < 0 {
+            fail("cannot open the temp file")
+            break
+        }
+        var sr: csv.Reader = csv.reader_fd_sized(fd, size)
+        var got: rt.Buf = rt.buf_new()
+        render(&sr, &got)
+        if rt.buf_len(&got) != rt.buf_len(&want) || !rt.mem_eq(rt.buf_ptr(&got), rt.buf_ptr(&want), rt.buf_len(&got)) || csv.error_code(&sr) != csv.E_NONE {
+            fail("a read size cuts the rows differently")
+        }
+        csv.reader_free(&sr)
+        rt.buf_free(&got)
+        fs.close_fd(fd)
+        size = size + 1
+    }
+    if rt.buf_len(&want) == 0 {
+        fail("no rows in the reference")
+    }
+    rt.buf_free(&want)
+
+    // --- B: constant memory. 100 000 rows of about 80 bytes.
+    let wfd: i64 = fs.open_truncate(p) catch -1
+    if wfd < 0 {
+        fail("cannot create the big file")
+        return 1
+    }
+    var out: rt.Buf = rt.buf_new()
+    var w: csv.Writer = csv.writer(&out)
+    var row: i64 = 0
+    while row < 100000 {
+        csv.put_i64(&w, row)
+        csv.put(&w, "a name with, a comma and \"quotes\"")
+        csv.put(&w, "0123456789012345678901234567890123456789")
+        csv.end_row(&w)
+        if rt.buf_len(&out) > 60000 {
+            fs.write_fd_all(wfd, rt.buf_ptr(&out), rt.buf_len(&out)) catch false
+            rt.buf_clear(&out)
+        }
+        row = row + 1
+    }
+    fs.write_fd_all(wfd, rt.buf_ptr(&out), rt.buf_len(&out)) catch false
+    rt.buf_free(&out)
+    fs.close_fd(wfd)
+    let before: i64 = rss_kib()
+    let rfd: i64 = fs.open_read(p) catch -1
+    var big: csv.Reader = csv.reader_fd(rfd)
+    var count: i64 = 0
+    var sum: i64 = 0
+    var bad: bool = false
+    while csv.next_row(&big) {
+        if csv.field_count(&big) != 3 {
+            bad = true
+        }
+        sum = sum + text_int(csv.field(&big, 0))
+        if csv.field(&big, 1).n != 33 {
+            bad = true
+        }
+        count = count + 1
+    }
+    let after: i64 = rss_kib()
+    if bad || count != 100000 || sum != 4999950000 || csv.error_code(&big) != csv.E_NONE {
+        fail("100 000 rows streamed")
+    }
+    if after - before > 2048 {
+        fail("streaming 8 MiB grew the resident memory by more than 2 MiB")
+    }
+    csv.reader_free(&big)
+    fs.close_fd(rfd)
+
+    // --- C: one cell of 3 MiB between two small rows
+    var huge: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&huge, "a,\"".p as u64, 3)
+    var k: usize = 0
+    while k < 3145728 {
+        rt.buf_push(&huge, 97 as u8 + (k % 26) as u8)
+        k = k + 1
+    }
+    rt.buf_push_bytes(&huge, "\"\nlast,row\n".p as u64, 11)
+    fs.write_file(p, rt.buf_ptr(&huge), rt.buf_len(&huge)) catch 0
+    rt.buf_free(&huge)
+    let hfd: i64 = fs.open_read(p) catch -1
+    var hr: csv.Reader = csv.reader_fd(hfd)
+    var ok: bool = csv.next_row(&hr) && csv.field_count(&hr) == 2 && csv.field(&hr, 1).n == 3145728
+    if ok {
+        let c: str = csv.field(&hr, 1)
+        let lastk: usize = 3145727
+        ok = *c.p == 97 as u8 && *(c.p + 25) == 122 as u8 && *(c.p + 26) == 97 as u8 && *(c.p + lastk) == 97 as u8 + (lastk % 26) as u8
+    }
+    ok = ok && csv.next_row(&hr) && csv.field_count(&hr) == 2 && csv.field(&hr, 0).equal("last") && !csv.next_row(&hr) && csv.error_code(&hr) == csv.E_NONE
+    if !ok {
+        fail("a cell of 3 MiB")
+    }
+    csv.reader_free(&hr)
+    fs.close_fd(hfd)
+
+    // --- D: errors while streaming
+    var bad_doc: str = "a,b\nc,\"d\ne\n\"f\"g\n"
+    fs.write_file(p, bad_doc.p as u64, bad_doc.n) catch 0
+    var sz: usize = 1
+    while sz <= 9 {
+        let efd: i64 = fs.open_read(p) catch -1
+        var er: csv.Reader = csv.reader_fd_sized(efd, sz)
+        var n_rows: i64 = 0
+        while csv.next_row(&er) {
+            n_rows = n_rows + 1
+        }
+        // row 2 is `c,"d` / `e` / `"f"g`: the quoted cell closes at the quote on line 4, `f` behind it is wrong
+        if n_rows != 1 || csv.error_code(&er) != csv.E_BAD_QUOTE || csv.error_row(&er) != 2 || csv.error_line(&er) != 4 {
+            fail("an error found while streaming")
+        }
+        csv.reader_free(&er)
+        fs.close_fd(efd)
+        sz = sz + 4
+    }
+
+    // --- E: no such descriptor
+    var nr: csv.Reader = csv.reader_fd(-1)
+    if csv.next_row(&nr) || csv.error_code(&nr) != csv.E_IO || csv.error_errno(&nr) != 9 {
+        fail("a bad descriptor is an I/O error (EBADF)")
+    }
+    csv.reader_free(&nr)
+
+    fs.remove(p) catch false
+    rt.buf_free(&path)
+    if failures != 0 {
+        return 1
+    }
+    return 0
+}
+
+fn text_int(s: str) -> i64 {
+    var v: i64 = 0
+    var i: usize = 0
+    while i < s.n {
+        v = v * 10 + (*(s.p + i) - 48 as u8) as i64
+        i = i + 1
+    }
+    return v
+}
