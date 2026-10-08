@@ -1873,13 +1873,15 @@ if [ "$FRRC" -eq 0 ]; then
 else
     bad "tools/script_port/test_firn_run.sh failed (see .test-work/firnrun.log)"
     grep -E 'FAIL' "$WORK/firnrun.log" | head -10 | sed 's/^/   /' || true
+fi
+
 echo "== 111. regex lookaround against Python's re, and the measured worst case (tools/regex_look/run.sh, r320) =="
 # (?=X) (?!X) (?<=X) (?<!X) on 6,000 random patterns without backreferences (and the two OpenPlan patterns) in
 # every build stage, first match + every group offset + the replace-all result, with a counter-check (the
 # lookahead questions inverted must FAIL); the old cross-check (tools/libmvp/check_regex.py) stays green; and the
 # growth per doubling of the text for the patterns whose lookahead reads the rest of the text from every position
 # (quadratic, nested ones too, never exponential) against a linear baseline. REGEX_LOOK_FAST=1: one stage.
-bash tools/regex_look/run.sh > "$WORK/regex_look.log" 2>&1 && RLRC=0 || RLRC=$?
+FIRNC="$FIRNC" bash tools/regex_look/run.sh > "$WORK/regex_look.log" 2>&1 && RLRC=0 || RLRC=$?
 if [ "$RLRC" -eq 0 ]; then
     ok
     grep -E '^  regex: ' "$WORK/regex_look.log" | sed 's/^/ /'
