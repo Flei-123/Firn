@@ -96,7 +96,7 @@ done
 # --- 4. counter-checks (with the first stage that was built)
 cli=$(ls "$W"/xml_cli.* 2>/dev/null | head -1)
 if [ -n "$cli" ]; then
-    "$cli" overread x > /dev/null 2>&1
+    sh -c '"$1" overread x; r=$?; exit $r' _ "$cli" > /dev/null 2>&1
     rc=$?
     if [ $rc -eq 139 ]; then
         echo "  xml: counter-check: reading one octet past the input kills the process (SIGSEGV), so the guard page works"
