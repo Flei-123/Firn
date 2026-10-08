@@ -35,7 +35,7 @@ os.makedirs(out, exist_ok=True)
 
 ASCII_NAMES = ["a", "b", "item", "Node_1", "x-y", "x.y", "_u", "row", "cell", "data",
                "ns:tag", "a:b", "svg:rect", "n1:n2", "xml:lang", "xmlns:z", "root", "e1"]
-UNI_NAMES = ["é", "ünï", "日本", "привет", "Ωmega", "a·b", "x́y", "ñ-1", "😀x"[1:]]
+UNI_NAMES = ["é", "\u00fcn\u00ef", "日本", "привет", "Ωmega", "a·b", "x́y", "ñ-1", "😀x"[1:]]
 UNI_TEXT = ["é", "ü", "ß", "日本語", "Ω", "😀", "€", "я", " ", " ", "﻿", "\U0001f600"]
 SAFE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,;:!?-_()[]{}#*+/=@$^~|"
 
