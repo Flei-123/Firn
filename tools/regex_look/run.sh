@@ -66,7 +66,7 @@ cases = [
     ("a*b",                            "no lookaround (baseline)",            3.2),
     ("(?<=a{1,40})b",                  "lookbehind, width 40",                3.2),
     ("(?=.*z)a",                       "lookahead to the end, every position", 6.5),
-    ("(?=(a|a)*b)a",                   "ambiguous body (2^n for a backtracker)", 6.5),
+    ("(?=(?:a+)+b)a",                   "ambiguous body (2^n for a backtracker)", 6.5),
     ("(?=(?=.*z).*y)a",                "nested, depth 2",                     6.5),
     ("(?=(?=(?=.*z).*y).*x)a",         "nested, depth 3",                     6.5),
     ("(?<=(?=.*z))a",                  "lookahead inside a lookbehind",       6.5),
@@ -85,9 +85,9 @@ for pat, what, limit in cases:
     print("  %-28s %-38s %s   x%.1f x%.1f x%.1f (<= %.1f) %s" % (pat, what, "  ".join("%9d" % x for x in t), g[0], g[1], g[2], limit, "ok" if ok else "TOO FAST GROWING"))
 # the contrast: Python's backtracking engine on a catastrophic pattern
 tt = []
-for n in (16, 18, 20):
-    t0 = time.perf_counter(); re.search(r"(a|a)*b", "a" * n); tt.append(time.perf_counter() - t0)
-print("  regex: contrast, Python re.search('(a|a)*b', 'a'*n): n=16 %.3f s, n=18 %.3f s, n=20 %.3f s (x%.1f per +2: exponential); here (?=(a|a)*b) over n=4000 is the row above" % (tt[0], tt[1], tt[2], tt[2] / max(tt[1], 1e-9)))
+for n in (18, 20, 22):
+    t0 = time.perf_counter(); re.search(r"(a+)+b", "a" * n); tt.append(time.perf_counter() - t0)
+print("  regex: contrast, Python re.search('(a+)+b', 'a'*n): n=18 %.3f s, n=20 %.3f s, n=22 %.3f s (x%.1f per +2: exponential, 2^n); here (?=(?:a+)+b) over n=4000 is the row above" % (tt[0], tt[1], tt[2], tt[2] / max(tt[1], 1e-9)))
 sys.exit(1 if bad else 0)
 PY
 fi
