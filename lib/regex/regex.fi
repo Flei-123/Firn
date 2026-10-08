@@ -40,6 +40,13 @@
 //     computed once and remembered (a table of k x (n+1) bytes, built only
 //     when there are nested ones): the exponent does not grow with the depth,
 //     it stays 2 (O(k n^2 m)); without the table it would be n^(depth+1).
+//   * PROTECTION. Quadratic is still slow on a long hostile text (about 1.5
+//     s for `(?=.*z)a` on 30,000 characters, see tools/regex_look/run.sh).
+//     A caller that matches untrusted text sets a work limit,
+//     `regex_set_work_limit(&r, steps)`: the lookaround work of ONE find is
+//     capped, an over-long find is abandoned and returns false, and
+//     `regex_exhausted(&r)` tells "gave up" from "no match". Default: no
+//     limit. Patterns without lookaround never hit it.
 //   * Python's `re` (and Perl, PCRE, Java) answer the same patterns by
 //     backtracking and take exponential time on some of them; this engine
 //     never does. It is NOT linear for lookahead, and the documentation does
@@ -90,6 +97,7 @@ export {
     regex_group_count, regex_group_index, regex_error_offset,
     match_new, match_group, match_group_text,
     Matcher, matcher_new, matcher_free, matcher_find,
+    regex_set_work_limit, regex_exhausted,
 }
 
 error RegexError {
@@ -172,6 +180,8 @@ struct Regex {
     names: Vec[str], // index = group, "" = unnamed
     looks: Vec[u32], // per lookaround instruction: min width, max width (in characters)
     max_nest: u32, // deepest nesting of lookarounds (0 = none)
+    work_limit: u64, // lookaround work allowed per find, in thread steps (0 = no limit)
+    exhausted: bool, // the last find stopped because it ran out of work
 }
 
 struct Match {
@@ -1086,7 +1096,7 @@ fn regex_compile(pattern: str, flags: u32) -> RegexError!Regex {
         fail(&ps, 1) // an unmatched ")"
     }
     var r: Regex = Regex { prog: vec_new[Inst](), ranges: ps.ranges, ngroups: ps.ngroups, names: ps.names,
-        looks: vec_new[u32](), max_nest: ps.max_look }
+        looks: vec_new[u32](), max_nest: ps.max_look, work_limit: 0, exhausted: false }
     var err: u32 = ps.err
     if err == 0 {
         emit(&r, I_SAVE, 0, 0, 0)
@@ -1300,6 +1310,9 @@ fn look_eval(vm: *mut Vm, at: u32, ins: Inst, pos: usize) -> bool {
             return v == 1 as u8
         }
     }
+    if (*mt).stop {
+        return false
+    }
     let behind: bool = ins.a >= 2
     let sub: *mut Sub = vec_elem_ptr[Sub](&(*mt).subs, (*vm).depth)
     let sv: *mut Vm = &(*sub).vm
@@ -1377,6 +1390,12 @@ fn look_eval(vm: *mut Vm, at: u32, ins: Inst, pos: usize) -> bool {
         vec_clear[u32](&(*nlist).pcs)
         var t: usize = 0
         let nt: usize = vec_len[u32](&(*clist).pcs)
+        // the work limit (regex_set_work_limit): one unit per thread step
+        (*mt).spent = (*mt).spent + 1 + nt as u64
+        if (*r).work_limit > 0 && (*mt).spent > (*r).work_limit {
+            (*mt).stop = true
+            return false // not memoised: the answer is unknown
+        }
         while t < nt {
             let tpc: u32 = vec_at[u32](&(*clist).pcs, t)
             if step_matches(r, *inst(r, tpc), c) {
@@ -1469,6 +1488,8 @@ struct Matcher {
     lb: Threads,
     subs: Vec[Sub], // one per nesting level of lookaround
     memo: Vec[u8], // (look instruction, position) -> 0 unknown, 1 yes, 2 no; only with nested lookarounds
+    spent: u64, // lookaround work done in this find (thread steps)
+    stop: bool, // the work limit was exceeded: the find is abandoned
 }
 
 fn matcher_new(r: *mut Regex) -> Matcher {
@@ -1477,7 +1498,7 @@ fn matcher_new(r: *mut Regex) -> Matcher {
     var mt: Matcher = Matcher { r: r as u64,
         vm: Vm { r: r as u64, p: 0, n: 0, ncap: ncap, gen: 1, cur: vec_new[i64](), stack: vec_new[u64](),
             saved: vec_new[i64](), mt: 0, depth: 0 },
-        la: threads_new(size), lb: threads_new(size), subs: vec_new[Sub](), memo: vec_new[u8]() }
+        la: threads_new(size), lb: threads_new(size), subs: vec_new[Sub](), memo: vec_new[u8](), spent: 0, stop: false }
     var lv: u32 = 0
     while lv < (*r).max_nest {
         vec_push[Sub](&mt.subs, Sub {
@@ -1527,6 +1548,9 @@ fn matcher_find(mt: *mut Matcher, s: str, from: usize, m: *mut Match) -> bool {
     (*vm).n = s.n
     (*vm).mt = mt as u64
     (*vm).depth = 0
+    (*mt).spent = 0
+    (*mt).stop = false
+    (*r).exhausted = false
     var k: usize = 0
     // nested lookarounds: remember each answer, so that the inner one is worked
     // out once per position however many outer sub-runs ask for it
@@ -1561,6 +1585,9 @@ fn matcher_find(mt: *mut Matcher, s: str, from: usize, m: *mut Match) -> bool {
     var pos: usize = from
     (*vm).gen = (*vm).gen + 1
     while true {
+        if (*mt).stop {
+            break
+        }
         // a new thread at this position, lowest priority -- as long as
         // nothing has matched yet
         if !found {
@@ -1631,6 +1658,11 @@ fn matcher_find(mt: *mut Matcher, s: str, from: usize, m: *mut Match) -> bool {
         }
     }
     (*vm).gen = (*vm).gen + 1
+    if (*mt).stop {
+        // out of work: no answer, and the caller can ask why
+        (*r).exhausted = true
+        return false
+    }
     if found {
         (*m).start = (*m).caps[0]
         (*m).end = (*m).caps[1]
@@ -1641,6 +1673,23 @@ fn matcher_find(mt: *mut Matcher, s: str, from: usize, m: *mut Match) -> bool {
         }
     }
     return found
+}
+
+// WORK LIMIT (protection against the quadratic patterns, see LOOKAROUND
+// above). `regex_set_work_limit(r, steps)` caps the work the lookarounds of
+// ONE find may do (steps = thread steps inside lookaround sub-runs; 0 = no
+// limit, the default). When a find runs over the cap it is abandoned: it
+// returns false and `regex_exhausted(r)` is true until the next find. So a
+// "false" is only a real "no match" when `regex_exhausted` is false. A
+// pattern without lookaround never uses up the limit (it is linear anyway).
+// Rough scale: one step is a few ns; 10,000,000 steps are about 50 ms.
+fn regex_set_work_limit(r: *mut Regex, steps: u64) {
+    (*r).work_limit = steps
+}
+
+// Did the last find on this regex stop because of the work limit?
+fn regex_exhausted(r: *mut Regex) -> bool {
+    return (*r).exhausted
 }
 
 fn regex_find(r: *mut Regex, s: str, from: usize, m: *mut Match) -> bool {
