@@ -61,6 +61,68 @@ fn vectors(n: usize, seed: u64) -> Vec<u64> {
     out
 }
 
+/// Rust's `{:e}` rounds an EXACT TIE between two shortest candidates up (what
+/// ES5 said). ECMAScript since ES2019, Python's repr() and V8 take the EVEN
+/// digit, and lib/num/dtoa.fi does too (SKRIPT-LIBS r315). So the yardstick
+/// has to apply the same rule: given Rust's digits `digits` (value =
+/// 0.digits * 10^n), return the digits of the lower neighbour when the double
+/// lies EXACTLY half way between it and `digits` and `digits` ends in an odd
+/// digit. The exact expansion is computed in u128 (a tie needs at most 19
+/// significant digits, so only doubles with a short exact expansion qualify).
+fn even_tie(digits: &str, n: i64, x: f64) -> Option<String> {
+    let bits = x.abs().to_bits();
+    let be = ((bits >> 52) & 0x7ff) as i64;
+    let mut m = bits & ((1u64 << 52) - 1);
+    let mut e2: i64;
+    if be == 0 {
+        e2 = -1074;
+    } else {
+        m |= 1u64 << 52;
+        e2 = be - 1075;
+    }
+    if m == 0 {
+        return None;
+    }
+    let tz = m.trailing_zeros() as i64;
+    m >>= tz;
+    e2 += tz;
+    // value = m * 2^e2 with m odd
+    let (mut nn, mut exp10): (u128, i64) = if e2 >= 0 {
+        if e2 > 70 {
+            return None;
+        }
+        ((m as u128) << e2, 0)
+    } else {
+        let s = -e2;
+        if s > 31 {
+            return None;
+        }
+        (m as u128 * 5u128.pow(s as u32), -s)
+    };
+    while nn % 10 == 0 {
+        nn /= 10;
+        exp10 += 1;
+    }
+    let ns = nn.to_string();
+    if ns.len() as i64 + exp10 != n {
+        return None;
+    }
+    let k = digits.len();
+    let d: u128 = digits.parse().ok()?;
+    if d == 0 {
+        return None;
+    }
+    let lower = (d - 1).to_string();
+    if lower.len() != k {
+        return None;
+    }
+    if ns.len() == k + 1 && ns == format!("{}5", lower) && (d % 2 == 1) {
+        let t = lower.trim_end_matches('0');
+        return Some(if t.is_empty() { "0".to_string() } else { t.to_string() });
+    }
+    None
+}
+
 /// The shortest form according to ECMAScript `Number::toString`.
 fn ecma(x: f64) -> String {
     if x.is_nan() {
@@ -80,8 +142,13 @@ fn ecma(x: f64) -> String {
     let digits: String = mant.chars().filter(|c| *c != '.').collect();
     let digits = digits.trim_end_matches('0');
     let digits = if digits.is_empty() { "0" } else { digits };
-    let k = digits.len() as i64;
     let n = exp + 1; // wert = 0.digits * 10^n
+    let tied = even_tie(digits, n, x);
+    let digits: &str = match &tied {
+        Some(t) => t.as_str(),
+        None => digits,
+    };
+    let k = digits.len() as i64;
     let body = if k <= n && n <= 21 {
         format!("{}{}", digits, "0".repeat((n - k) as usize))
     } else if 0 < n && n <= 21 {

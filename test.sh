@@ -1848,6 +1848,20 @@ else
     grep -E 'FAIL|mismatch|MISMATCH' "$WORK/stats_cross.log" | head -8 | sed 's/^/   /'
 fi
 
+echo "== 116. json_write_opts against Python's json.dumps (tools/jsonsort_cross/run.sh, SKRIPT-LIBS r315) =="
+# 3300 random documents x 11 variants (sort_keys, indent=N/"\t", ensure_ascii, separators) compared byte for byte with
+# json.dumps -- floats as repr(), keys by code point, nesting up to 120 deep -- plus a writer fuzz run (20,000 mutated
+# documents: parse -> write -> parse -> write must be a fixed point). The other three build levels answer byte for byte
+# like the first. Unit tests: tests/2360_std_json_sort.fi, tests/2361_std_json_sort_big.fi.
+FIRNC="$FIRNC" bash tools/jsonsort_cross/run.sh > "$WORK/jsonsort_cross.log" 2>&1 && JSRC=0 || JSRC=$?
+if [ "$JSRC" -eq 0 ]; then
+    ok
+    grep -E '^  (jsonsort cross-check|content|mismatches|writer fuzz \[release-fast\])' "$WORK/jsonsort_cross.log" | sed 's/^/ /'
+else
+    bad "tools/jsonsort_cross/run.sh failed (see .test-work/jsonsort_cross.log)"
+    grep -E 'FAIL|MISMATCH' "$WORK/jsonsort_cross.log" | head -8 | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

@@ -124,6 +124,8 @@ How the design came out (module-qualified names: `import std.stats`, then `stats
   “cancellation” (±1e30-sized terms with a residue of 1): there Neumaier is off by up to 3e15 ulp, `sum_exact` is exact.
   `percentile` against `statistics.quantiles(inclusive)` (exact integer positions): worst 1.5·eps·(n·span+|x|) — the weight
   `(n-1)*(p/100)` of numpy's method carries an error of n·eps, so the result is not bit-equal for p that are not exact in binary.
+* Other targets: the four tests build and pass for `--target=aarch64-linux` (qemu-aarch64) and `--target=x86_64-windows` (wine); `stats_cli` answers
+  400 random data sets byte for byte like the x86-64 build (no fused multiply-add, no flush-to-zero surprises).
 
 ### std.testkit — `lib/std/testkit.fi` (r311)
 For `#[test]` functions and for plain `main` scripts.
@@ -156,6 +158,27 @@ exact message compared), `tools/testkit/run.sh` (test.sh section 101: `firnc --t
 `json_write_opts(d, i, out, opts)` with flags `JSON_SORT_KEYS`, `JSON_ASCII`, indent width, separators; output byte-identical to
 `json.dumps(sort_keys=True, indent=N, ensure_ascii=…)`. Sort = by UTF-8 bytes (Python: by code point; identical for valid UTF-8).
 Cross-check: random documents → `json.dumps`.
+
+**Status (08.10.2026): built** — `json_write_opts` in `lib/std/json.fi`; the old `json_write` / `json_write_pretty` are untouched.
+
+* `var o: json.JsonOpts = json.json_opts_new()` is `json.dumps(x)` (ensure_ascii on, one line, separators `, ` and `: `);
+  `json_opts_compact()` = `separators=(",", ":")`, `json_opts_indent(n)` = `indent=n`; `json_opts_set_indent(&o, n)` (n < 0: one line),
+  `json_opts_set_indent_text(&o, p, n)` (`indent="\t"`), `json_opts_set_separators(&o, item, n, key, m)` (≤ 16 octets each, in the struct).
+  `o.flags`: `JSON_SORT_KEYS`, `JSON_ASCII`, `JSON_PY_NONFINITE` (writes `Infinity` / `NaN` as Python; default `null`).
+* `json_write_opts(&d, node, &out, &o) -> bool` (false only if the memory for a sort ran out; that object then comes out in document order).
+  Sort: stable merge sort of the member indexes by UTF-8 octets (= Python's code point order, NOT UTF-16), O(n log n), one 8n octet block per
+  sorted object; equal keys keep the document order.
+* The float text is Python's `repr`: `1e+16`, `1e-05`, `100.0`, `-0.0`, `5e-324`. (The old writers print the shortest digits without that exponent rule.)
+* Found by the cross-check and fixed on the way: (1) `lib/num/dtoa.fi` took the LARGER digit at an exact tie of two shortest candidates (ES5); ES2019,
+  Python, V8 and Ryu take the EVEN one (`1576992552742323.25` is `...23.2`). tools/dtoa_vectors/gen.rs (Rust still rounds ties up) now applies the even rule
+  on exact ties, found with a u128 expansion, so the 300,000-vector comparison stays an independent check. (2) The writer turned invalid UTF-8 in a string
+  into `\ud800` (a lone surrogate, which reads back as something else); in ASCII mode it is now one `\ufffd` per bad octet. Valid UTF-8 is unaffected.
+* Still different from Python (J3/J4/J7 in json.fi): integers beyond i64 become doubles; a lone surrogate escape is U+FFFD; a duplicate key is kept twice.
+* Measured (tools/jsonsort_cross/run.sh): 3300 random documents × 11 variants = 35,390 outputs compared byte for byte with `json.dumps` (10,433 objects, 7,193 floats,
+  15,497 integers, 45,435 strings and keys, nested up to 120 deep, quotes/controls/DEL/accents/CJK/emoji/U+2028, prefix keys, UTF-16-order traps): 0 differences.
+  Writer fuzz (20,000 mutated / junk documents, 6,437 parse, 64,370 round trips parse → write → parse → write): 0 failures, no crash.
+* Other targets: tests 2360/2361 pass on aarch64-linux (qemu) and x86_64-windows (wine); `jsonsort_cli dumps` on 300 documents × 11 variants is byte for byte
+  the x86-64 answer on both. The whole lib is `rt`/`str`/`num` only, so nothing is Linux specific.
 
 ### std.xml — `lib/std/xml.fi` (r319, optional, small)
 Well-formed XML only, no DTD/XSD/XPath: elements, attributes, text, CDATA, comments skipped, five entities + numeric references,
