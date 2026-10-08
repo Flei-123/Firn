@@ -1,0 +1,1124 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/fsx.fi -- std.fsx: what a script needs on top of std.fs --
+// temporary directories that clean up after themselves, copying files and
+// trees, walking a tree, and path arithmetic (docs/SKRIPT-LIBS.md, r314).
+//
+// std.fs can make, rename, remove and inspect; it cannot copy and it has no
+// `mkdtemp`. A Python check script does `tempfile.mkdtemp`, `shutil.copytree`,
+// `os.walk` and `os.path.relpath` without thinking. This is the same, small:
+//
+//     import std.fsx
+//     import std.fs
+//
+//     var d: fsx.TempDir = fsx.temp_dir("trn_") catch | e | return 1
+//     defer fsx.temp_dir_drop(&d)                    // gone on every way out
+//     let work: str = fsx.temp_dir_path(&d)          // /tmp/trn_k3x9a0q1b2zz
+//     fsx.copy_tree("fixtures", work + "/in", "*.tmp|.git") catch | e | return 2
+//     fsx.copy_file(work + "/in/a.json", work + "/b.json") catch | e | return 3
+//     let rel: str = fsx.relpath(work + "/in/a.json", work)     // "in/a.json"
+//
+// TEMPORARY DIRECTORIES. `temp_dir` makes `<prefix><12 random characters>`
+// under `$TMPDIR` or `/tmp` (std.shell's `temp_dir()`), with `mkdir` mode
+// 0700 -- nobody else can look inside -- and a name from `getrandom`, so
+// two processes never meet and a name cannot be guessed. `temp_dir_drop`
+// removes the tree (symbolic links are removed, not followed) and is
+// IDEMPOTENT: dropping twice, or after the directory is already gone, is
+// fine. `temp_dir_keep` disarms the directory (the path is yours now).
+// `defer fsx.temp_dir_drop(&d)` therefore covers every `return` of the
+// function; a PANIC does not run `defer`.
+//
+// THE REGISTRY. Every directory and file that is still armed is also in a
+// process wide list. `fsx.cleanup_all()` removes all of them -- std.testkit
+// calls it when an assertion fails and in `finish`, so a failing test does
+// not leave `/tmp/trn_*` behind. Only entries made by THIS process are
+// removed (a child made by `fork` shares the list but not the ownership).
+//
+// COPYING. `copy_file` writes the content to a temporary name NEXT TO the
+// target, gives it the mode of the source and renames it over the target:
+// a reader sees the old file or the new one, never half of one. A
+// reflink (`FICLONE`) is tried first, otherwise 256 KiB read/write rounds.
+// `copy_tree` follows `shutil.copytree`: symbolic links are copied AS LINKS
+// (`COPY_FOLLOW_SYMLINKS` copies what they point to), directories get the
+// mode of the source, `COPY_DIRS_EXIST_OK` is `dirs_exist_ok=True`, and
+// `ignore` is a list of `fnmatch` patterns separated by `|` that are
+// matched against every entry NAME at every level
+// (`shutil.ignore_patterns`).
+//
+// WALKING. `walk` calls a function for every entry below a directory, in
+// pre-order, names sorted bytewise (the same order on every machine, which
+// `os.walk` does not promise). The function says whether to go on.
+//
+// PATHS. `normpath`, `abspath` and `relpath` are `os.path.normpath`,
+// `os.path.abspath` and `os.path.relpath` for POSIX paths, text only: no
+// file is looked at, no link resolved. Cross-checked against Python on
+// random paths (tools/fsx_cross).
+//
+// HONEST -- what this does NOT do:
+//   * Linux first. The code builds for AArch64 (the tests run under qemu)
+//     and for Windows, where the file calls go through the seam of
+//     compiler/src/win_seam.rs. Windows paths are not understood: the path
+//     functions work on POSIX paths (only `abspath` leaves a `C:\...` path
+//     as it is), `mkdir` has no mode there, and FICLONE is "not supported"
+//     (the plain copy is used). Run under Wine: `temp_dir`/`temp_dir_drop`,
+//     `copy_file`, `copy_tree` (without symbolic links, which need a right
+//     of their own there); the modes are not kept (Windows has none).
+//   * `copy_file` keeps the MODE, not the modification time, the owner,
+//     extended attributes, hard links or holes (a sparse file is written out
+//     in full). `copy_file_range` is not used: the AArch64 and browser tables
+//     of the compiler (compiler/src/syscalls.rs) have no entry for it.
+//     The reflink path could not be tested on the ext4 of this machine, only
+//     its fallback.
+//   * A target that is a symbolic link is REPLACED by the copy (the rename
+//     replaces the link), `cp` would write through it.
+//   * `copy_tree` stops at the FIRST error and leaves what it made;
+//     `shutil.copytree` collects errors and goes on. Fifos, sockets and
+//     device files are refused (`FsError::Invalid`); `shutil` hangs on a
+//     fifo. Following symbolic links is limited to a depth of 200, so a
+//     link loop is an error, not an endless descent.
+//   * A crash (signal, `kill -9`, power cut) does not run `defer` and does
+//     not run `cleanup_all`: the directory stays. A `#[test]` that panics
+//     through an ARITHMETIC check (not through std.testkit) leaves it too.
+//   * `fnmatch` is `*`, `?`, `[abc]`, `[a-z]`, `[!x]`, on octets, with no
+//     special treatment of a leading dot or of `/`.
+//   * Not thread safe: the registry is a plain static.
+import rt
+import fs
+import dir
+import vec
+import shell
+import osinfo
+
+export {
+    TempDir, TempFile,
+    temp_dir, temp_dir_in, temp_dir_path, temp_dir_drop, temp_dir_keep,
+    temp_file, temp_file_new, temp_file_path, temp_file_drop,
+    cleanup_all, registered_count,
+    copy_file, copy_tree, copy_tree_opts, COPY_DIRS_EXIST_OK, COPY_FOLLOW_SYMLINKS,
+    walk, WALK_STOP, WALK_CONTINUE, WALK_SKIP,
+    normpath, abspath, relpath, cwd, fnmatch,
+}
+
+const FX_SYS_GETPID: i64 = 39
+const FX_SYS_MKDIR: i64 = 83
+const FX_SYS_GETCWD: i64 = 79
+const FX_SYS_IOCTL: i64 = 16
+const FX_SYS_GETRANDOM: i64 = 318
+// _IOW(0x94, 9, int): clone the whole file (reflink)
+const FX_FICLONE: i64 = 1074041865
+
+const COPY_DIRS_EXIST_OK: u32 = 1
+const COPY_FOLLOW_SYMLINKS: u32 = 2
+
+const WALK_STOP: i32 = 0
+const WALK_CONTINUE: i32 = 1
+const WALK_SKIP: i32 = 2
+
+const FX_COPY_CHUNK: usize = 262144
+const FX_MAX_DEPTH: usize = 200
+const FX_NAME_LEN: usize = 12
+
+// every entry of the registry: kind ('d' or 'f'), owner pid, ':', path, NUL
+static mut fx_reg: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+
+// ------------------------------------------------------------ small tools
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+fn view(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn copy_of(b: *mut rt.Buf) -> str {
+    return __str_copy(str { p: rt.buf_data(b), n: rt.buf_len(b) })
+}
+
+fn has_zero(s: str) -> bool {
+    var i: usize = 0
+    while i < s.length() {
+        if s.chars(i) == 0 as u8 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// `path` with the terminating zero the kernel wants; false = empty or a
+// zero octet inside.
+fn cstr(path: str, c: *mut rt.Buf) -> bool {
+    if path.length() == 0 || has_zero(path) {
+        return false
+    }
+    put(c, path)
+    rt.buf_push(c, 0 as u8)
+    return true
+}
+
+fn errno_of(r: i64) -> FsError {
+    // fs_error is private to std.fs; the classes this module can meet
+    if r == -2 { return FsError::NotFound }
+    if r == -17 { return FsError::Exists }
+    if r == -13 || r == -1 { return FsError::Permission }
+    if r == -20 { return FsError::NotDir }
+    if r == -21 { return FsError::IsDir }
+    if r == -39 { return FsError::NotEmpty }
+    if r == -28 || r == -122 { return FsError::NoSpace }
+    if r == -30 { return FsError::ReadOnly }
+    if r == -36 { return FsError::NameTooLong }
+    if r == -22 { return FsError::Invalid }
+    return FsError::Io
+}
+
+fn getpid() -> i64 {
+    return syscall(FX_SYS_GETPID, 0, 0, 0, 0, 0, 0)
+}
+
+// ONE directory with the permission bits `mode` (the umask still applies).
+// 0 or a negative errno.
+fn mkdir_mode(path: str, mode: i64) -> i64 {
+    var c: rt.Buf = rt.buf_new()
+    if !cstr(path, &c) {
+        rt.buf_free(&c)
+        return -22
+    }
+    let r: i64 = syscall(FX_SYS_MKDIR, rt.buf_ptr(&c) as i64, mode, 0, 0, 0, 0)
+    rt.buf_free(&c)
+    return r
+}
+
+// A name part: no slash, no zero, not "." or ".."
+fn plain_name(s: str) -> bool {
+    let n: usize = s.length()
+    if n == 0 || has_zero(s) {
+        return false
+    }
+    if s == "." || s == ".." {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if s.chars(i) == 47 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------ fnmatch
+
+// Does `[...]` starting at pat[pi] (pat[pi] == '[') match the octet `c`?
+// `next` gets the index after the closing bracket; a missing closing
+// bracket makes the '[' an ordinary character (`ok` = false).
+fn class_match(pat: str, pi: usize, c: u8, next: *mut usize, ok: *mut bool) -> bool {
+    let n: usize = pat.length()
+    var i: usize = pi + 1
+    var negate: bool = false
+    if i < n && pat.chars(i) == 33 as u8 {
+        negate = true
+        i = i + 1
+    }
+    var hit: bool = false
+    var first: bool = true
+    while i < n && (first || pat.chars(i) != 93 as u8) {
+        first = false
+        let lo: u8 = pat.chars(i)
+        if i + 2 < n && pat.chars(i + 1) == 45 as u8 && pat.chars(i + 2) != 93 as u8 {
+            let hi: u8 = pat.chars(i + 2)
+            if c >= lo && c <= hi {
+                hit = true
+            }
+            i = i + 3
+        } else {
+            if c == lo {
+                hit = true
+            }
+            i = i + 1
+        }
+    }
+    if i >= n {
+        *ok = false
+        return false
+    }
+    *ok = true
+    *next = i + 1
+    return hit != negate
+}
+
+// fnmatch of the WHOLE `name` against `pat`: `*` (any run, also empty), `?`
+// (one octet), `[abc]`, `[a-z]`, `[!x]`. Iterative with one backtrack point,
+// so a hostile pattern cannot take exponential time.
+fn fnmatch(pat: str, name: str) -> bool {
+    let pn: usize = pat.length()
+    let nn: usize = name.length()
+    var pi: usize = 0
+    var ni: usize = 0
+    var star_p: usize = 0
+    var star_n: usize = 0
+    var have_star: bool = false
+    while ni < nn {
+        var matched: bool = false
+        var next_p: usize = pi
+        if pi < pn {
+            let pc: u8 = pat.chars(pi)
+            if pc == 42 as u8 {
+                have_star = true
+                star_p = pi + 1
+                star_n = ni
+                pi = pi + 1
+                continue
+            }
+            if pc == 63 as u8 {
+                matched = true
+                next_p = pi + 1
+            } else if pc == 91 as u8 {
+                var after: usize = 0
+                var closed: bool = false
+                let hit: bool = class_match(pat, pi, name.chars(ni), &after, &closed)
+                if closed {
+                    matched = hit
+                    next_p = after
+                } else {
+                    matched = name.chars(ni) == pc
+                    next_p = pi + 1
+                }
+            } else {
+                matched = name.chars(ni) == pc
+                next_p = pi + 1
+            }
+        }
+        if matched {
+            pi = next_p
+            ni = ni + 1
+        } else if have_star {
+            star_n = star_n + 1
+            ni = star_n
+            pi = star_p
+        } else {
+            return false
+        }
+    }
+    while pi < pn && pat.chars(pi) == 42 as u8 {
+        pi = pi + 1
+    }
+    return pi == pn
+}
+
+// Is `name` matched by one of the `|` separated patterns of `list`?
+fn ignored(list: str, name: str) -> bool {
+    let n: usize = list.length()
+    if n == 0 {
+        return false
+    }
+    var start: usize = 0
+    var i: usize = 0
+    while i <= n {
+        if i == n || list.chars(i) == 124 as u8 {
+            if i > start && fnmatch(list.part(start, i - start), name) {
+                return true
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ------------------------------------------------------------ the registry
+
+// "d123:/tmp/x" -- the entry for `path` of the calling process
+fn reg_entry(kind: u8, path: str, out: *mut rt.Buf) {
+    rt.buf_push(out, kind)
+    rt.buf_push_dec_i64(out, getpid())
+    rt.buf_push(out, 58 as u8)
+    put(out, path)
+    rt.buf_push(out, 0 as u8)
+}
+
+fn reg_add(kind: u8, path: str) {
+    reg_entry(kind, path, &fx_reg)
+}
+
+// Removes the entry of this process for `path`; false = there was none.
+fn reg_remove(kind: u8, path: str) -> bool {
+    var want: rt.Buf = rt.buf_new()
+    reg_entry(kind, path, &want)
+    let wn: usize = rt.buf_len(&want)
+    let total: usize = rt.buf_len(&fx_reg)
+    var i: usize = 0
+    var found: bool = false
+    while i < total && !found {
+        var e: usize = i
+        while e < total && rt.buf_at(&fx_reg, e) != 0 as u8 {
+            e = e + 1
+        }
+        // entry = [i, e], its NUL at e
+        if e + 1 - i == wn && rt.mem_eq(rt.buf_ptr(&fx_reg) + i as u64, rt.buf_ptr(&want), wn) {
+            found = true
+            let rest: usize = total - (e + 1)
+            rt.mem_copy(rt.buf_ptr(&fx_reg) + i as u64, rt.buf_ptr(&fx_reg) + (e + 1) as u64, rest)
+            rt.buf_set_len(&fx_reg, total - wn)
+        }
+        i = e + 1
+    }
+    rt.buf_free(&want)
+    return found
+}
+
+// The number of directories and files still armed in this process.
+fn registered_count() -> usize {
+    let pid: i64 = getpid()
+    var mine: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&mine, pid)
+    rt.buf_push(&mine, 58 as u8)
+    let total: usize = rt.buf_len(&fx_reg)
+    var count: usize = 0
+    var i: usize = 0
+    while i < total {
+        var e: usize = i
+        while e < total && rt.buf_at(&fx_reg, e) != 0 as u8 {
+            e = e + 1
+        }
+        if e - i > 1 + rt.buf_len(&mine) && rt.mem_eq(rt.buf_ptr(&fx_reg) + (i + 1) as u64, rt.buf_ptr(&mine), rt.buf_len(&mine)) {
+            count = count + 1
+        }
+        i = e + 1
+    }
+    rt.buf_free(&mine)
+    return count
+}
+
+// Removes every armed temporary directory and file made by THIS process and
+// empties the list. The answer is the number of entries that are gone. See
+// the head of the file: std.testkit calls this.
+#[allow_escape]
+fn cleanup_all() -> usize {
+    let pid: i64 = getpid()
+    var mine: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&mine, pid)
+    rt.buf_push(&mine, 58 as u8)
+    let mlen: usize = rt.buf_len(&mine)
+    // take the list away first: removing must not see a half edited list
+    var all: rt.Buf = fx_reg
+    fx_reg = rt.buf_new()
+    var keep: rt.Buf = rt.buf_new()
+    var gone: usize = 0
+    let total: usize = rt.buf_len(&all)
+    // newest first: a file made inside a directory goes before the directory
+    var end: usize = total
+    while end > 0 {
+        var start: usize = end - 1
+        while start > 0 && rt.buf_at(&all, start - 1) != 0 as u8 {
+            start = start - 1
+        }
+        // entry = [start, end - 1), NUL at end - 1
+        let n: usize = end - 1 - start
+        if n > 1 + mlen && rt.mem_eq(rt.buf_ptr(&all) + (start + 1) as u64, rt.buf_ptr(&mine), mlen) {
+            let path: str = __str_copy(str { p: (rt.buf_ptr(&all) + (start + 1 + mlen) as u64) as *mut u8, n: n - 1 - mlen })
+            let ok: bool = fs.remove_tree(path) catch | e | (e == FsError::NotFound)
+            if ok {
+                gone = gone + 1
+            } else {
+                // could not remove: keep it armed
+                rt.buf_push_bytes(&keep, rt.buf_ptr(&all) + start as u64, n + 1)
+            }
+        } else {
+            // somebody else's entry (a parent of a fork): untouched
+            rt.buf_push_bytes(&keep, rt.buf_ptr(&all) + start as u64, n + 1)
+        }
+        end = start
+    }
+    rt.buf_free(&all)
+    rt.buf_free(&mine)
+    fx_reg = keep
+    return gone
+}
+
+// ------------------------------------------------------------ randomness
+
+// `FX_NAME_LEN` characters of [a-z0-9] from the kernel's random source.
+fn random_name(out: *mut rt.Buf) -> bool {
+    var raw: [u8; 16] = [0 as u8; 16]
+    let r: i64 = syscall(FX_SYS_GETRANDOM, (&raw[0]) as i64, FX_NAME_LEN as i64, 0, 0, 0, 0)
+    if r != FX_NAME_LEN as i64 {
+        return false
+    }
+    var i: usize = 0
+    while i < FX_NAME_LEN {
+        let v: u8 = raw[i] % 36 as u8
+        if v < 10 as u8 {
+            rt.buf_push(out, 48 as u8 + v)
+        } else {
+            rt.buf_push(out, 87 as u8 + v) // 'a' - 10
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------ TempDir
+
+struct TempDir {
+    path: rt.Buf, // absolute, no terminating zero
+    armed: bool,
+}
+
+struct TempFile {
+    path: rt.Buf,
+    armed: bool,
+    registered: bool, // false = lives inside a TempDir, which removes it
+}
+
+// A new directory `<prefix><random>` under std.shell's `temp_dir()`
+// (`$TMPDIR` or `/tmp`), mode 0700. `prefix` is a plain name part (no `/`).
+fn temp_dir(prefix: str) -> FsError!TempDir {
+    return try temp_dir_in(shell.temp_dir(), prefix)
+}
+
+// The same under `base`, which must exist.
+fn temp_dir_in(base: str, prefix: str) -> FsError!TempDir {
+    if base.length() == 0 || has_zero(base) || prefix.length() > 100 || has_zero(prefix) {
+        return FsError::Invalid
+    }
+    var i: usize = 0
+    while i < prefix.length() {
+        if prefix.chars(i) == 47 as u8 {
+            return FsError::Invalid
+        }
+        i = i + 1
+    }
+    let root: str = abspath(base)
+    var tries: usize = 0
+    while tries < 100 {
+        tries = tries + 1
+        var name: rt.Buf = rt.buf_new()
+        put(&name, prefix)
+        if !random_name(&name) {
+            rt.buf_free(&name)
+            return FsError::Io
+        }
+        var full: rt.Buf = rt.buf_new()
+        put(&full, root)
+        if root != "/" {
+            rt.buf_push(&full, 47 as u8)
+        }
+        rt.buf_push_bytes(&full, rt.buf_ptr(&name), rt.buf_len(&name))
+        rt.buf_free(&name)
+        let made: i64 = mkdir_mode(view(&full), 448)
+        if made >= 0 {
+            reg_add(100 as u8, view(&full))
+            return TempDir { path: full, armed: true }
+        }
+        rt.buf_free(&full)
+        if made != -17 {
+            return errno_of(made)
+        }
+    }
+    return FsError::Exists
+}
+
+// The path of the directory (valid until `temp_dir_drop`/`temp_dir_keep`).
+fn temp_dir_path(d: *mut TempDir) -> str {
+    return view(&(*d).path)
+}
+
+// Removes the directory with everything in it. IDEMPOTENT. The answer says
+// whether it is gone; `false` keeps the directory armed (a later call or
+// `cleanup_all` tries again). Plain `bool`, so `defer` can call it.
+fn temp_dir_drop(d: *mut TempDir) -> bool {
+    if !(*d).armed {
+        return true
+    }
+    let path: str = view(&(*d).path)
+    let gone: bool = fs.remove_tree(path) catch | e | (e == FsError::NotFound)
+    if !gone {
+        return false
+    }
+    reg_remove(100 as u8, path)
+    rt.buf_free(&(*d).path)
+    (*d).armed = false
+    return true
+}
+
+// Disarms the directory: it stays on disk, `temp_dir_drop` does nothing
+// any more and `cleanup_all` leaves it alone. The answer is its path (a
+// copy that stays valid).
+fn temp_dir_keep(d: *mut TempDir) -> str {
+    if !(*d).armed {
+        return ""
+    }
+    let path: str = copy_of(&(*d).path)
+    reg_remove(100 as u8, path)
+    rt.buf_free(&(*d).path)
+    (*d).armed = false
+    return path
+}
+
+// ------------------------------------------------------------ TempFile
+
+// A new EMPTY file `name` (mode 0600) inside the directory. It is removed
+// with the directory; `name` must be a plain name (`FsError::Invalid`
+// otherwise), an existing file is `FsError::Exists`.
+fn temp_file(d: *mut TempDir, name: str) -> FsError!TempFile {
+    if !(*d).armed || !plain_name(name) {
+        return FsError::Invalid
+    }
+    var full: rt.Buf = rt.buf_new()
+    put(&full, view(&(*d).path))
+    rt.buf_push(&full, 47 as u8)
+    put(&full, name)
+    let fd: i64 = fs.create_excl(view(&full), 384 as u32) catch | e | -1
+    if fd < 0 {
+        let code: FsError = errno_of(0 - fs.last_errno())
+        rt.buf_free(&full)
+        return code
+    }
+    fs.close_fd(fd)
+    return TempFile { path: full, armed: true, registered: false }
+}
+
+// A new empty file `<prefix><random>` directly under `temp_dir()` (mode
+// 0600), armed in the registry: `temp_file_drop` or `cleanup_all` remove it.
+fn temp_file_new(prefix: str) -> FsError!TempFile {
+    if prefix.length() > 100 || has_zero(prefix) {
+        return FsError::Invalid
+    }
+    var i: usize = 0
+    while i < prefix.length() {
+        if prefix.chars(i) == 47 as u8 {
+            return FsError::Invalid
+        }
+        i = i + 1
+    }
+    let root: str = abspath(shell.temp_dir())
+    var tries: usize = 0
+    while tries < 100 {
+        tries = tries + 1
+        var full: rt.Buf = rt.buf_new()
+        put(&full, root)
+        if root != "/" {
+            rt.buf_push(&full, 47 as u8)
+        }
+        put(&full, prefix)
+        if !random_name(&full) {
+            rt.buf_free(&full)
+            return FsError::Io
+        }
+        let fd: i64 = fs.create_excl(view(&full), 384 as u32) catch | e | -1
+        if fd >= 0 {
+            fs.close_fd(fd)
+            reg_add(102 as u8, view(&full))
+            return TempFile { path: full, armed: true, registered: true }
+        }
+        let again: bool = fs.last_errno() == 17
+        rt.buf_free(&full)
+        if !again {
+            return errno_of(0 - fs.last_errno())
+        }
+    }
+    return FsError::Exists
+}
+
+fn temp_file_path(f: *mut TempFile) -> str {
+    return view(&(*f).path)
+}
+
+// Removes the file (already gone is fine). IDEMPOTENT; plain `bool`.
+fn temp_file_drop(f: *mut TempFile) -> bool {
+    if !(*f).armed {
+        return true
+    }
+    let path: str = view(&(*f).path)
+    let gone: bool = fs.remove(path) catch | e | (e == FsError::NotFound)
+    if !gone {
+        return false
+    }
+    if (*f).registered {
+        reg_remove(102 as u8, path)
+    }
+    rt.buf_free(&(*f).path)
+    (*f).armed = false
+    return true
+}
+
+// ------------------------------------------------------------ copy_file
+
+// `chmod` answered with an error: true when it only means "this system has no
+// permission bits" (ENOSYS, as on Windows), which a copy then ignores.
+fn no_chmod_here() -> bool {
+    return fs.last_errno() == 38
+}
+
+// All `n` octets to `fd`; 0 or a negative errno.
+fn write_all(fd: i64, p: u64, n: usize) -> i64 {
+    var done: usize = 0
+    while done < n {
+        let r: i64 = syscall(1, fd, (p + done as u64) as i64, (n - done) as i64, 0, 0, 0)
+        if r < 0 {
+            return r
+        }
+        if r == 0 {
+            return -28
+        }
+        done = done + r as usize
+    }
+    return 0
+}
+
+// Reads `from` (a regular file, symbolic links followed), writes the same
+// content with the same permission bits to `to`: first to a temporary name
+// next to `to`, then `rename` -- an existing `to` is replaced in one step.
+// The answer is the number of octets copied. `to` must not be a directory
+// (`FsError::IsDir`); its parent must exist.
+fn copy_file(from: str, to: str) -> FsError!usize {
+    let info: fs.FileInfo = try fs.stat(from)
+    if info.kind == fs.KIND_DIR {
+        return FsError::IsDir
+    }
+    if info.kind != fs.KIND_FILE {
+        return FsError::Invalid
+    }
+    if fs.is_dir(to) {
+        return FsError::IsDir
+    }
+    let src: i64 = try fs.open_read(from)
+    let tmp: str = fs.temp_name_for(to)
+    let dst: i64 = fs.create_excl(tmp, 384 as u32) catch | e | -1
+    if dst < 0 {
+        let code: FsError = errno_of(0 - fs.last_errno())
+        fs.close_fd(src)
+        return code
+    }
+    var copied: usize = 0
+    var fail: i64 = 0
+    // a reflink clones the whole file in one step where the file system can
+    let cloned: i64 = syscall(FX_SYS_IOCTL, dst, FX_FICLONE, src, 0, 0, 0)
+    if cloned == 0 {
+        copied = info.size as usize
+    } else {
+        var buf: rt.Buf = rt.buf_new()
+        rt.buf_reserve(&buf, FX_COPY_CHUNK)
+        if rt.buf_ptr(&buf) == 0 || buf.cap < FX_COPY_CHUNK {
+            fail = -28
+        }
+        while fail == 0 {
+            let got: i64 = syscall(0, src, rt.buf_ptr(&buf) as i64, FX_COPY_CHUNK as i64, 0, 0, 0)
+            if got < 0 {
+                fail = got
+                break
+            }
+            if got == 0 {
+                break
+            }
+            let wrote: i64 = write_all(dst, rt.buf_ptr(&buf), got as usize)
+            if wrote < 0 {
+                fail = wrote
+                break
+            }
+            copied = copied + got as usize
+        }
+        rt.buf_free(&buf)
+    }
+    fs.close_fd(src)
+    fs.close_fd(dst)
+    if fail != 0 {
+        fs.remove(tmp) catch false
+        return errno_of(fail)
+    }
+    let moded: bool = fs.chmod(tmp, info.mode) catch | e | no_chmod_here()
+    if !moded {
+        let code: FsError = errno_of(0 - fs.last_errno())
+        fs.remove(tmp) catch false
+        return code
+    }
+    let moved: bool = fs.rename(tmp, to) catch | e | false
+    if !moved {
+        let code: FsError = errno_of(0 - fs.last_errno())
+        fs.remove(tmp) catch false
+        return code
+    }
+    return copied
+}
+
+// ------------------------------------------------------------ copy_tree
+
+fn str_less(a: *str, b: *str) -> bool {
+    let x: str = *a
+    let y: str = *b
+    let nx: usize = x.length()
+    let ny: usize = y.length()
+    var m: usize = nx
+    if ny < m {
+        m = ny
+    }
+    var i: usize = 0
+    while i < m {
+        let cx: u8 = x.chars(i)
+        let cy: u8 = y.chars(i)
+        if cx != cy {
+            return cx < cy
+        }
+        i = i + 1
+    }
+    return nx < ny
+}
+
+// The entry names of `path` as copies; false = the directory cannot be read.
+// `#[allow_escape]`: `d.name` is a view into the frame's block, but what is
+// stored is `__str_copy` of it, on the GC heap.
+#[allow_escape]
+fn list_dir(path: str, names: *mut Vec[str], sorted: bool) -> bool {
+    var d: dir.Dir = dir.open(path)
+    if !dir.is_open(&d) {
+        return false
+    }
+    while dir.next(&d) {
+        vec_push[str](names, __str_copy(d.name))
+    }
+    dir.close(&d)
+    if sorted {
+        vec_sort_by[str](names, str_less)
+    }
+    return true
+}
+
+fn copy_dir_rec(from: str, to: str, ignore: str, flags: u32, depth: usize, count: *mut usize) -> FsError!bool {
+    if depth > FX_MAX_DEPTH {
+        return FsError::NameTooLong
+    }
+    let info: fs.FileInfo = try fs.stat(from)
+    if info.kind != fs.KIND_DIR {
+        return FsError::NotDir
+    }
+    var names: Vec[str] = vec_new[str]()
+    defer vec_free[str](&names)
+    if !list_dir(from, &names, false) {
+        return FsError::Permission
+    }
+    let parent: str = fs.path_parent(to)
+    if parent.length() > 0 {
+        try fs.mkdir_all(parent)
+    }
+    let made: i64 = mkdir_mode(to, 448)
+    // an existing directory is fine when merging was asked for
+    let merging: bool = made == -17 && (flags & COPY_DIRS_EXIST_OK) != 0 as u32 && fs.is_dir(to)
+    if made < 0 && !merging {
+        return errno_of(made)
+    }
+    var i: usize = 0
+    let n: usize = vec_len[str](&names)
+    while i < n {
+        let name: str = *vec_elem_ptr[str](&names, i)
+        i = i + 1
+        if ignored(ignore, name) {
+            continue
+        }
+        let s: str = fs.path_join(from, name)
+        let d: str = fs.path_join(to, name)
+        let li: fs.FileInfo = try fs.lstat(s)
+        var kind: u8 = li.kind
+        if kind == fs.KIND_LINK && (flags & COPY_FOLLOW_SYMLINKS) != 0 as u32 {
+            // what the link points to (a dangling link is NotFound here)
+            let ti: fs.FileInfo = try fs.stat(s)
+            kind = ti.kind
+        }
+        if kind == fs.KIND_LINK {
+            let target: str = try fs.readlink(s)
+            try fs.symlink(target, d)
+            *count = *count + 1
+        } else if kind == fs.KIND_DIR {
+            try copy_dir_rec(s, d, ignore, flags, depth + 1, count)
+            *count = *count + 1
+        } else if kind == fs.KIND_FILE {
+            try copy_file(s, d)
+            *count = *count + 1
+        } else {
+            return FsError::Invalid
+        }
+    }
+    // the mode last: a read-only directory is filled first
+    let moded: bool = fs.chmod(to, info.mode) catch | e | no_chmod_here()
+    if !moded {
+        return errno_of(0 - fs.last_errno())
+    }
+    return true
+}
+
+// Copies the directory `from` to `to` (see the head of the file). `ignore`
+// is a `|` separated list of fnmatch patterns ("" = none). The answer is
+// the number of entries made below `to` (files, links, directories).
+// Missing parents of `to` are made; an existing `to` is `FsError::Exists`
+// unless `COPY_DIRS_EXIST_OK` is in `flags`.
+fn copy_tree_opts(from: str, to: str, ignore: str, flags: u32) -> FsError!usize {
+    var count: usize = 0
+    try copy_dir_rec(from, to, ignore, flags, 0, &count)
+    return count
+}
+
+// `copy_tree_opts` with no flags: links copied as links, `to` must not exist.
+fn copy_tree(from: str, to: str, ignore: str) -> FsError!usize {
+    return try copy_tree_opts(from, to, ignore, 0 as u32)
+}
+
+// ------------------------------------------------------------ walk
+
+fn walk_rec(path: str, cb: fn(str, u8, u64) -> i32, ctx: u64, depth: usize, count: *mut usize, stop: *mut bool) -> FsError!bool {
+    if depth > FX_MAX_DEPTH {
+        return FsError::NameTooLong
+    }
+    var names: Vec[str] = vec_new[str]()
+    defer vec_free[str](&names)
+    if !list_dir(path, &names, true) {
+        return FsError::Permission
+    }
+    var i: usize = 0
+    let n: usize = vec_len[str](&names)
+    while i < n && !*stop {
+        let p: str = fs.path_join(path, *vec_elem_ptr[str](&names, i))
+        i = i + 1
+        // an entry that vanished meanwhile is skipped
+        let li: fs.FileInfo = fs.lstat(p) catch fs.FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+        if li.kind == 255 as u8 {
+            continue
+        }
+        let r: i32 = cb(p, li.kind, ctx)
+        *count = *count + 1
+        if r == WALK_STOP {
+            *stop = true
+        } else if li.kind == fs.KIND_DIR && r != WALK_SKIP {
+            try walk_rec(p, cb, ctx, depth + 1, count, stop)
+        }
+    }
+    return true
+}
+
+// Calls `cb(path, kind, ctx)` for every entry below `root` (not `root`
+// itself), directories before their contents, names sorted bytewise,
+// symbolic links reported as `fs.KIND_LINK` and never followed. `cb`
+// answers `WALK_CONTINUE`, `WALK_SKIP` (do not enter this directory) or
+// `WALK_STOP`. The path is valid during the call only. The answer is the
+// number of entries reported. Nesting deeper than 200 is
+// `FsError::NameTooLong`.
+fn walk(root: str, cb: fn(str, u8, u64) -> i32, ctx: u64) -> FsError!usize {
+    var count: usize = 0
+    var stop: bool = false
+    try walk_rec(root, cb, ctx, 0, &count, &stop)
+    return count
+}
+
+// ------------------------------------------------------------ paths
+
+// The current working directory ("/" when it cannot be told).
+fn cwd() -> str {
+    var buf: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&buf, 4097)
+    if buf.cap < 4097 {
+        rt.buf_free(&buf)
+        return "/"
+    }
+    let r: i64 = syscall(FX_SYS_GETCWD, rt.buf_ptr(&buf) as i64, 4096, 0, 0, 0, 0)
+    var out: str = "/"
+    if r > 1 {
+        out = __str_copy(str { p: rt.buf_data(&buf), n: (r - 1) as usize })
+    }
+    rt.buf_free(&buf)
+    return out
+}
+
+// index of the last '/' in the buffer, or the length when there is none
+fn last_slash(b: *mut rt.Buf) -> usize {
+    var i: usize = rt.buf_len(b)
+    while i > 0 {
+        if rt.buf_at(b, i - 1) == 47 as u8 {
+            return i - 1
+        }
+        i = i - 1
+    }
+    return rt.buf_len(b)
+}
+
+// `os.path.normpath`: collapses `//`, `.` and `..` by looking at the text.
+// "" is ".", exactly two leading slashes stay two (POSIX), three or more
+// become one, a `..` at the root is dropped and a leading `..` of a
+// relative path is kept.
+fn normpath(path: str) -> str {
+    let n: usize = path.length()
+    if n == 0 {
+        return "."
+    }
+    var slashes: usize = 0
+    if path.chars(0) == 47 as u8 {
+        slashes = 1
+        if n >= 2 && path.chars(1) == 47 as u8 && !(n >= 3 && path.chars(2) == 47 as u8) {
+            slashes = 2
+        }
+    }
+    var out: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < n {
+        while i < n && path.chars(i) == 47 as u8 {
+            i = i + 1
+        }
+        var j: usize = i
+        while j < n && path.chars(j) != 47 as u8 {
+            j = j + 1
+        }
+        let comp: str = path.part(i, j - i)
+        i = j
+        if comp.length() == 0 || comp == "." {
+            continue
+        }
+        var keep: bool = comp != ".."
+        if !keep {
+            if slashes == 0 && rt.buf_len(&out) == 0 {
+                keep = true
+            } else if rt.buf_len(&out) > 0 {
+                let ls: usize = last_slash(&out)
+                var start: usize = 0
+                if ls < rt.buf_len(&out) {
+                    start = ls + 1
+                }
+                let last: str = str { p: (rt.buf_data(&out) as u64 + start as u64) as *mut u8, n: rt.buf_len(&out) - start }
+                if last == ".." {
+                    keep = true
+                }
+            }
+        }
+        if keep {
+            if rt.buf_len(&out) > 0 {
+                rt.buf_push(&out, 47 as u8)
+            }
+            put(&out, comp)
+        } else if rt.buf_len(&out) > 0 {
+            // pop the last component
+            let ls: usize = last_slash(&out)
+            if ls < rt.buf_len(&out) {
+                rt.buf_set_len(&out, ls)
+            } else {
+                rt.buf_set_len(&out, 0)
+            }
+        }
+    }
+    var res: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < slashes {
+        rt.buf_push(&res, 47 as u8)
+        k = k + 1
+    }
+    rt.buf_push_bytes(&res, rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+    if rt.buf_len(&res) == 0 {
+        rt.buf_free(&res)
+        return "."
+    }
+    let r: str = copy_of(&res)
+    rt.buf_free(&res)
+    return r
+}
+
+// On Windows `C:\...` and `\...` are absolute; they are used as they are
+// (no normalisation). On Linux this is always false: `c:x` is a relative name.
+fn windows_absolute(path: str) -> bool {
+    if !osinfo.is_windows() || path.length() == 0 {
+        return false
+    }
+    if path.chars(0) == 92 as u8 {
+        return true
+    }
+    if path.length() < 2 || path.chars(1) != 58 as u8 {
+        return false
+    }
+    let c: u8 = path.chars(0)
+    return (c >= 65 as u8 && c <= 90 as u8) || (c >= 97 as u8 && c <= 122 as u8)
+}
+
+// `os.path.abspath`: a relative path is put after the working directory,
+// then `normpath`. No link is resolved, no file looked at.
+fn abspath(path: str) -> str {
+    if path.length() > 0 && path.chars(0) == 47 as u8 {
+        return normpath(path)
+    }
+    if windows_absolute(path) {
+        return path
+    }
+    let base: str = cwd()
+    var b: rt.Buf = rt.buf_new()
+    put(&b, base)
+    if base.length() > 0 && base.chars(base.length() - 1) != 47 as u8 {
+        rt.buf_push(&b, 47 as u8)
+    }
+    put(&b, path)
+    let joined: str = copy_of(&b)
+    rt.buf_free(&b)
+    return normpath(joined)
+}
+
+// the next non-empty component of `s` from `pos`; "" at the end
+fn next_comp(s: str, pos: *mut usize) -> str {
+    var i: usize = *pos
+    let n: usize = s.length()
+    while i < n && s.chars(i) == 47 as u8 {
+        i = i + 1
+    }
+    var j: usize = i
+    while j < n && s.chars(j) != 47 as u8 {
+        j = j + 1
+    }
+    *pos = j
+    return s.part(i, j - i)
+}
+
+// `os.path.relpath(path, base)`: how to get from the directory `base` to
+// `path`, both made absolute first; "." when they are the same. An empty
+// `path` answers "" (Python raises).
+fn relpath(path: str, base: str) -> str {
+    if path.length() == 0 {
+        return ""
+    }
+    let a: str = abspath(path)
+    let b: str = abspath(base)
+    var pa: usize = 0
+    var pb: usize = 0
+    while true {
+        let sa: usize = pa
+        let sb: usize = pb
+        let ca: str = next_comp(a, &pa)
+        let cb: str = next_comp(b, &pb)
+        if ca.length() == 0 || cb.length() == 0 || ca != cb {
+            pa = sa
+            pb = sb
+            break
+        }
+    }
+    var out: rt.Buf = rt.buf_new()
+    // one ".." for every component of `base` that is left
+    while true {
+        let c: str = next_comp(b, &pb)
+        if c.length() == 0 {
+            break
+        }
+        if rt.buf_len(&out) > 0 {
+            rt.buf_push(&out, 47 as u8)
+        }
+        put(&out, "..")
+    }
+    while true {
+        let c: str = next_comp(a, &pa)
+        if c.length() == 0 {
+            break
+        }
+        if rt.buf_len(&out) > 0 {
+            rt.buf_push(&out, 47 as u8)
+        }
+        put(&out, c)
+    }
+    if rt.buf_len(&out) == 0 {
+        rt.buf_free(&out)
+        return "."
+    }
+    let r: str = copy_of(&out)
+    rt.buf_free(&out)
+    return r
+}
