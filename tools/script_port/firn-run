@@ -1,24 +1,333 @@
 #!/bin/sh
-# firn-run -- PROTOTYPE of "firn run": compile a .fi script once, cache the
-# executable by content hash, run it.   Use as:  #!/usr/bin/env firn-run
-#   firn-run script.fi [args...]
-# The shebang line is blanked (the lexer does not know '#!'; line numbers stay).
-set -e
-src=$1; shift
-: "${FIRNC:=$(dirname "$0")/../../compiler/target/release/firnc}"
-: "${FIRNLIB:=$(dirname "$0")/../../lib}"
-export FIRNLIB
-cache=${FIRN_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/firn-run}
-mkdir -p "$cache"
-key=$( (cat "$src"; echo "$FIRNC"; "$FIRNC" --version) | sha256sum | cut -c1-32)
-exe=$cache/$key
-if [ ! -x "$exe" ]; then
-    tmp=$(mktemp -d "$cache/build.XXXXXX")
-    trap 'rm -rf "$tmp"' EXIT
-    sed '1s/^#!.*$//' "$src" > "$tmp/$(basename "$src")"
-    "$FIRNC" -o "$tmp/exe" "$tmp/$(basename "$src")"
-    mv "$tmp/exe" "$exe"
-    rm -rf "$tmp"
-    trap - EXIT
+# firn-run -- run a Firn script like a Python script.
+#
+#   firn-run [--no-cache] script.fi [args...]
+#   firn-run --clean
+#   #!/usr/bin/env firn-run          (first line of a script, chmod +x)
+#
+# The script is compiled once with firnc into an executable cache and then
+# exec'd; later runs only check a stat() signature of the script, its imports
+# and the compiler, then exec the cached binary (stdin/stdout/stderr, arguments
+# and the exit code are those of the program itself).
+#
+# Exit codes: that of the program; 125 = firn-run itself failed (usage error,
+# compile error -- the compiler output is on stderr).
+#
+# Environment:
+#   FIRNC            compiler (default: next to this file, repo build, PATH)
+#   FIRNLIB          library search path, passed on to firnc
+#   FIRN_OPT         optimisation level (default dev-fast: cold build ~0.4 s, arithmetic checked)
+#   FIRN_CACHE       cache directory (default $XDG_CACHE_HOME/firn-run or
+#                    ~/.cache/firn-run)
+#   FIRN_CACHE_MAX   size limit of the cache in MiB (default 512, oldest
+#                    access first)
+#   FIRN_CACHE_DAYS  drop entries not used for this many days (default 30)
+#   FIRN_STRICT      1 = compare inode/size/nanosecond mtime exactly instead of
+#                    the make rule (one extra process, ~+1.5 ms)
+#
+# Cache layout:  obj/<H>   executable, H = hash over (options, compiler
+#                          content, every source file read by firnc)
+#                idx/<name> fast index per script path: H, the list of source
+#                          files, and their stat() signature. A run whose
+#                          signature is unchanged does not hash anything.
+#                          If only the signature changed (touch, git checkout)
+#                          the hash is recomputed and the binary reused.
+# Writers use mktemp + mv (rename), so parallel starts are safe: in the worst
+# case two processes build the same binary and the last rename wins.
+# Limits: Linux (GNU/busybox stat -c); a new file that would SHADOW an existing
+# import (e.g. a local module with the name of a library module) is not seen
+# until the script itself changes or `--clean`.
+
+set -u
+
+NL='
+'
+
+die() {
+    printf 'firn-run: %s\n' "$*" >&2
+    exit 125
+}
+
+usage() {
+    sed -n '2,/^$/{s/^# \{0,1\}//;p}' "$0"
+}
+
+nocache=0
+clean=0
+while [ $# -gt 0 ]; do
+    case $1 in
+    --no-cache) nocache=1; shift ;;
+    --clean) clean=1; shift ;;
+    -h | --help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown option '$1' (try --help)" ;;
+    *) break ;;
+    esac
+done
+
+# ---- cache directory
+if [ -n "${FIRN_CACHE:-}" ]; then
+    cache=$FIRN_CACHE
+elif [ -n "${XDG_CACHE_HOME:-}" ]; then
+    cache=$XDG_CACHE_HOME/firn-run
+elif [ -n "${HOME:-}" ]; then
+    cache=$HOME/.cache/firn-run
+else
+    cache=${TMPDIR:-/tmp}/firn-run-$(id -u)
 fi
-exec "$exe" "$@"
+case $cache in
+/*) ;;
+*) cache=$PWD/$cache ;;
+esac
+case $cache in
+/ | "") die "refusing to use '$cache' as cache directory" ;;
+esac
+
+if [ "$clean" = 1 ]; then
+    rm -rf -- "$cache/obj" "$cache/idx" "$cache"/tmp.*
+    rmdir -- "$cache" 2>/dev/null
+    exit 0
+fi
+
+[ $# -ge 1 ] || die "no script given (try --help)"
+src=$1
+shift
+[ -f "$src" ] || die "no such script: $src"
+case $src in
+/*) ;;
+*) src=$PWD/$src ;;
+esac
+
+# ---- compiler and library path
+self=${0%/*}
+case $self in
+"$0") self=. ;;
+esac
+compiler=${FIRNC:-}
+if [ -z "$compiler" ]; then
+    if [ -x "$self/firnc" ]; then
+        compiler=$self/firnc
+    elif [ -x "$self/../../compiler/target/release/firnc" ]; then
+        compiler=$self/../../compiler/target/release/firnc
+    else
+        compiler=$(command -v firnc) || die "firnc not found (set FIRNC)"
+    fi
+fi
+case $compiler in
+*/*) ;;
+*) compiler=$(command -v "$compiler") || die "firnc not found: $compiler" ;;
+esac
+case $compiler in
+/*) ;;
+*) compiler=$PWD/$compiler ;;
+esac
+[ -x "$compiler" ] || die "compiler not executable: $compiler"
+if [ -z "${FIRNLIB:-}" ] && [ -d "$self/../../lib" ]; then
+    case $self in
+    /*) FIRNLIB=$self/../../lib ;;
+    *) FIRNLIB=$PWD/$self/../../lib ;;
+    esac
+fi
+FIRNLIB=${FIRNLIB:-}
+export FIRNLIB
+
+opt=${FIRN_OPT:-dev-fast}
+envline="opt=$opt lib=$FIRNLIB cc=$compiler"
+
+# ---- index name: the script path with '/' turned into ','
+mangle() {
+    _m=
+    _ifs=$IFS
+    IFS=/
+    set -f
+    for _p in $1; do
+        [ -n "$_p" ] && _m="$_m,$_p"
+    done
+    set +f
+    IFS=$_ifs
+    if [ ${#_m} -gt 180 ]; then
+        _m=$(printf '%s' "$1" | sha256sum | cut -c1-40)
+    fi
+    MANGLED=$_m
+}
+mangle "$src"
+idx=$cache/idx/$MANGLED@$opt
+
+# Warm check. Succeeds (and sets EXE) when the index matches the files on disk.
+warm_check() {
+    [ -r "$idx" ] || return 1
+    set -- "$compiler"
+    {
+        IFS= read -r _h || return 1
+        IFS= read -r _env || return 1
+        while IFS= read -r _l; do
+            [ "$_l" = "@" ] && break
+            set -- "$@" "$_l"
+        done
+        _stored=
+        if [ -n "${FIRN_STRICT:-}" ]; then
+            while IFS= read -r _l; do
+                _stored=$_stored$_l$NL
+            done
+        fi
+    } <"$idx"
+    [ "$_env" = "$envline" ] || return 1
+    if [ -n "${FIRN_STRICT:-}" ]; then
+        # exact: path, inode, size and nanosecond mtime must be as recorded
+        _cur=$(stat -c '%n %i %s %Y.%y' -- "$@" 2>/dev/null) || return 1
+        [ "$_stored" = "$_cur$NL" ] || return 1
+    else
+        # make rule, no fork: the index must be strictly newer than every file
+        # (a tie counts as stale). Misses a file that was replaced by an OLDER
+        # one (tar -x, cp -p); FIRN_STRICT=1 catches that.
+        for _f in "$@"; do
+            # shellcheck disable=SC3013
+            [ "$idx" -nt "$_f" ] || return 1
+        done
+    fi
+    EXE=$cache/obj/$_h
+    [ -x "$EXE" ]
+}
+
+if [ "$nocache" = 0 ] && warm_check; then
+    exec "$EXE" "$@"
+fi
+
+# ---- slow path (cold; speed matters less here)
+hash_inputs() { # $@ = source files; prints the cache key H
+    {
+        printf '%s\n' "$envline"
+        sha256sum -- "$compiler" "$@"
+    } | sha256sum | cut -c1-40
+}
+
+store_idx() { # $1 = H, rest = source files; atomic replace of the index
+    _hh=$1
+    shift
+    {
+        printf '%s\n%s\n' "$_hh" "$envline"
+        for _f in "$@"; do
+            printf '%s\n' "$_f"
+        done
+        printf '@\n'
+        stat -c '%n %i %s %Y.%y' -- "$compiler" "$@"
+    } >"$tmp/idx" || return 1
+    mkdir -p -- "$cache/idx" && mv -f -- "$tmp/idx" "$idx"
+}
+
+# The signature differs but maybe not the content (touch, git checkout):
+# hash the files listed in the index; same key -> reuse the binary.
+reuse_by_hash() {
+    [ -r "$idx" ] || return 1
+    set --
+    {
+        IFS= read -r _h || return 1
+        IFS= read -r _env || return 1
+        while IFS= read -r _l; do
+            [ "$_l" = "@" ] && break
+            set -- "$@" "$_l"
+        done
+    } <"$idx"
+    [ "$_env" = "$envline" ] || return 1
+    [ $# -gt 0 ] || return 1
+    for _f in "$@"; do
+        [ -f "$_f" ] || return 1
+    done
+    [ "$(hash_inputs "$@")" = "$_h" ] || return 1
+    EXE=$cache/obj/$_h
+    [ -x "$EXE" ] || return 1
+    store_idx "$_h" "$@"
+}
+
+build() {
+    : >"$tmp/start"
+    "$compiler" "--opt-level=$opt" "--deps-out=$tmp/deps" -o "$tmp/exe" "$src" \
+        >"$tmp/log" 2>&1
+    _rc=$?
+    if [ "$_rc" -ne 0 ] && grep -q -- '--deps-out' "$tmp/log"; then
+        # old compiler without --deps-out: only the script itself is tracked
+        "$compiler" "--opt-level=$opt" -o "$tmp/exe" "$src" >"$tmp/log" 2>&1
+        _rc=$?
+        printf '%s\n' "$src" >"$tmp/deps"
+    fi
+    if [ "$_rc" -ne 0 ]; then
+        cat "$tmp/log" >&2
+        printf 'firn-run: compile error in %s (firnc exit %s)\n' "$src" "$_rc" >&2
+        exit 125
+    fi
+    [ -s "$tmp/log" ] && cat "$tmp/log" >&2
+    # keep only real files: the compiler also lists sources that are embedded
+    # in its own binary (the GC runtime) under a name that is not a file here;
+    # those are covered by the hash of the compiler itself
+    : >"$tmp/deps.real"
+    if [ -s "$tmp/deps" ]; then
+        while IFS= read -r _l; do
+            [ -f "$_l" ] && printf '%s\n' "$_l" >>"$tmp/deps.real"
+        done <"$tmp/deps"
+    fi
+    [ -s "$tmp/deps.real" ] || printf '%s\n' "$src" >"$tmp/deps.real"
+    mv -f -- "$tmp/deps.real" "$tmp/deps"
+    return 0
+}
+
+# Move the fresh binary into the cache. Fails (-> run uncached) when a source
+# file was modified while the compiler was reading it.
+publish() {
+    set --
+    while IFS= read -r _l; do
+        set -- "$@" "$_l"
+    done <"$tmp/deps"
+    if [ -n "$(find "$@" -newer "$tmp/start" -print -quit 2>/dev/null)" ]; then
+        return 1
+    fi
+    _hk=$(hash_inputs "$@")
+    mkdir -p -- "$cache/obj" || return 1
+    EXE=$cache/obj/$_hk
+    if [ ! -x "$EXE" ]; then
+        mv -f -- "$tmp/exe" "$EXE" || return 1
+    fi
+    store_idx "$_hk" "$@"
+}
+
+prune() {
+    _days=${FIRN_CACHE_DAYS:-30}
+    _max=${FIRN_CACHE_MAX:-512}
+    case $_days in '' | *[!0-9]*) _days=30 ;; esac
+    case $_max in '' | *[!0-9]*) _max=512 ;; esac
+    find "$cache" -maxdepth 1 -name 'tmp.*' -mmin +120 -exec rm -rf -- {} + 2>/dev/null
+    find "$cache/obj" "$cache/idx" -type f -atime +"$_days" ! -path "$EXE" \
+        -exec rm -f -- {} + 2>/dev/null
+    _kb=$(du -sk -- "$cache/obj" 2>/dev/null | cut -f1)
+    [ "${_kb:-0}" -gt $((_max * 1024)) ] || return 0
+    # oldest access first, never the binary we are about to run
+    for _f in $(ls -tur -- "$cache/obj"); do
+        [ "$cache/obj/$_f" = "$EXE" ] && continue
+        _fs=$(stat -c %s -- "$cache/obj/$_f" 2>/dev/null || echo 0)
+        rm -f -- "$cache/obj/$_f"
+        _kb=$((_kb - (_fs + 1023) / 1024))
+        [ "$_kb" -gt $((_max * 1024)) ] || break
+    done
+}
+
+mkdir -p -- "$cache" || die "cannot create cache directory $cache"
+tmp=$(mktemp -d "$cache/tmp.XXXXXX") || die "cannot create a temporary directory in $cache"
+trap 'rm -rf -- "$tmp"' EXIT
+trap 'exit 143' HUP INT TERM
+
+if [ "$nocache" = 0 ] && reuse_by_hash; then
+    rm -rf -- "$tmp"
+    trap - EXIT
+    exec "$EXE" "$@"
+fi
+
+build
+if [ "$nocache" = 0 ] && publish; then
+    prune
+    rm -rf -- "$tmp"
+    trap - EXIT
+    exec "$EXE" "$@"
+fi
+
+# --no-cache, or the sources changed during the build: run once, keep nothing
+"$tmp/exe" "$@"
+exit $?

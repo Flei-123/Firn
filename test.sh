@@ -1862,6 +1862,19 @@ else
     grep -E 'FAIL|MISMATCH' "$WORK/jsonsort_cross.log" | head -8 | sed 's/^/   /'
 fi
 
+echo "== 117. firn-run: scripts with a #! line, the executable cache (tools/script_port/test_firn_run.sh, r316) =="
+# `#!` on line 1 is skipped by both lexers (tests/2390_shebang.fi, 2391, tests/neg/shebang_*.fi, lex_compare). This section runs
+# tools/script_port/firn-run: cache hit, rebuild after a change of the script / of an imported module / of a FIRNLIB module,
+# touch without change, parallel cold starts, compile error (exit 125), arguments with blanks, stdin, --no-cache, --clean, age/size limit.
+FIRNC="$FIRNC" bash tools/script_port/test_firn_run.sh > "$WORK/firnrun.log" 2>&1 && FRRC=0 || FRRC=$?
+if [ "$FRRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/firnrun.log" | sed 's/^/   /' || true
+else
+    bad "tools/script_port/test_firn_run.sh failed (see .test-work/firnrun.log)"
+    grep -E 'FAIL' "$WORK/firnrun.log" | head -10 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

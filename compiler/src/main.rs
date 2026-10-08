@@ -143,6 +143,10 @@ struct Options {
     only_object: bool,
     /// **ROUND 82** — `--timings`: wall clock per phase to stderr.
     timings: bool,
+    /// `--deps-out=<file>`: after the modules are resolved, write the
+    /// absolute path of every source file read (root first), one per line.
+    /// Used by `tools/script_port/firn-run` for its cache key.
+    deps_out: Option<String>,
     /// **ROUND 94** — `--test`: the entry point of the binary is the test
     /// runner, not the program's own `main` (`testrun.rs`).
     test_mode: bool,
@@ -259,6 +263,7 @@ fn usage() -> String {
          --strlit=<lit>     decode a string literal (\"..\", b\"..\", u\"..\")\n  \
          --stats            print the size of the FIR (instructions/blocks)\n  \
          --timings          wall clock per compiler phase (ROUND 82)\n  \
+         --deps-out=<file>  write the paths of all source files read (one per line)\n  \
          --test             build and RUN the test cases (#[test], ROUND 94)\n  \
          --format=json|tap  report of --test (default: json)\n  \
          --test-limit=<s>   time limit per case in seconds (default 30, 0 = none)\n  \
@@ -288,6 +293,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut optcfg = opt::OptConfig::default();
     let mut only_object = false;
     let mut timings = false;
+    let mut deps_out: Option<String> = None;
     let mut test_mode = false;
     let mut test_format = testrun::Format::Json;
     let mut test_limit: u32 = 30;
@@ -393,6 +399,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--keep-asm" => keep_asm = true,
             "--stats" => stats = true,
             "--timings" => timings = true,
+            _ if a.starts_with("--deps-out=") => {
+                deps_out = Some(a["--deps-out=".len()..].to_string());
+            }
             "--test" => test_mode = true,
             "--no-run" => no_run = true,
             _ if a.starts_with("--format=") => {
@@ -499,6 +508,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         optcfg,
         only_object,
         timings,
+        deps_out,
         test_mode,
         test_format,
         test_limit,
@@ -639,6 +649,18 @@ fn run(opts: &Options) -> i32 {
             return report(&dg);
         }
     };
+    if let Some(out) = &opts.deps_out {
+        let mut text = String::new();
+        for f in &files {
+            let abs = std::fs::canonicalize(&f.path).unwrap_or_else(|_| f.path.clone());
+            text.push_str(&abs.display().to_string());
+            text.push('\n');
+        }
+        if std::fs::write(out, text.as_bytes()).is_err() {
+            eprintln!("error: cannot write '{}'", out);
+            return 2;
+        }
+    }
     // --- ROUND 93: the lock file. It sits HERE, between resolving and
     // compiling: the input of the build is complete (every module is found
     // and read), and not one instruction has been emitted yet. So
