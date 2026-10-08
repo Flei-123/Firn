@@ -79,7 +79,7 @@ def python(p_py, flags, text):
 
 
 # ---- generator. A pattern is a pair (firn_text, python_text).
-SINGLE = ["a", "b", "c", "ä", "Ω", "x", ".", "\\d", "\\w", "\\s", "\\D", "\\W", "[ab]", "[^a]", "[a-cx]", "[äö]", "\\.", "-", "K"]
+SINGLE = ["a", "b", "c", "\xe4", "Ω", "x", ".", "\\d", "\\w", "\\s", "\\D", "\\W", "[ab]", "[^a]", "[a-cx]", "[\xe4\xf6]", "\\.", "-", "K"]
 ZERO = ["\\b", "\\B", "^", "$"]
 
 
@@ -173,15 +173,15 @@ def rand_pattern(rng):
 
 
 def rand_text(rng):
-    alphabet = rng.choice(["abcxäöΩK-. 12\n_", "ab", "abc x", "ab1-", "aäb Ω"])
+    alphabet = rng.choice(["abcx\xe4\xf6ΩK-. 12\n_", "ab", "abc x", "ab1-", "a\xe4b Ω"])
     return "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 16)))
 
 
 FIXED = [
     (r'["\']de["\']\s*[:=]|(?<![A-Za-z])de:|--lang=de\b', r'["\']de["\']\s*[:=]|(?<![A-Za-z])de:|--lang=de\b', 0, "x = 'de':  code:de: --lang=de"),
     (r"(?<![A-Za-z])de:", r"(?<![A-Za-z])de:", 0, "code:de: de:"),
-    (r"[A-ZÄÖÜ]+(?![a-zäöüß])", r"[A-ZÄÖÜ]+(?![a-zäöüß])", 0, "ABc DEF ÄÖü ÜB"),
-    (r"[A-ZÄÖÜ]?[a-zäöüß]+|[A-ZÄÖÜ]+(?![a-zäöüß])", r"[A-ZÄÖÜ]?[a-zäöüß]+|[A-ZÄÖÜ]+(?![a-zäöüß])", 0, "GroßeStädte HTTPServer ÄÖÜ"),
+    (r"[A-Z\xc4\xd6\xdc]+(?![a-z\xe4\xf6\xfc\xdf])", r"[A-Z\xc4\xd6\xdc]+(?![a-z\xe4\xf6\xfc\xdf])", 0, "ABc DEF \xc4\xd6\xfc \xdcB"),
+    (r"[A-Z\xc4\xd6\xdc]?[a-z\xe4\xf6\xfc\xdf]+|[A-Z\xc4\xd6\xdc]+(?![a-z\xe4\xf6\xfc\xdf])", r"[A-Z\xc4\xd6\xdc]?[a-z\xe4\xf6\xfc\xdf]+|[A-Z\xc4\xd6\xdc]+(?![a-z\xe4\xf6\xfc\xdf])", 0, "Gro\xdfeSt\xe4dte HTTPServer \xc4\xd6\xdc"),
     (r"(a)(?=b)", r"(a)(?=b)", 0, "ab"), (r"(?<=a)(b)", r"(?<=a)(b)", 0, "ab"),
     (r"(?<=(a|b))c", None, 0, "ac"),  # capture inside: refused by lib/regex, Python accepts
 ]
