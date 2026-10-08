@@ -45,7 +45,9 @@ Behaviour as Python: blank line = empty row (the Table skips it), `"` inside quo
 quoted fields with newlines, a lone `\r` ends a row, unterminated quote = error (strict) with row number.
 Cross-check: `csv.reader`/`csv.writer` on random tables with hostile characters.
 
-### std.glob — `lib/std/glob.fi` (r314/r315)
+### std.glob — `lib/std/glob.fi` (r314/r315) — DONE (08.10.2026)
+**Landed API:** `glob.matches(pat, name)`, `glob.expand(pat, &out)`, `glob.expand_opts(pat, flags, &out)`, `glob.expand_in(root, pat, flags, &out)` (names relative to `root`, like `root_dir=`), `glob.nth(&out, i)`, `glob.count_names(&out)`, `glob.has_magic`, `glob.escape(s, &out)`; flags `GLOB_RECURSIVE`, `GLOB_HIDDEN`, `GLOB_FOLLOW` (`**` also walks symlinks to directories, max 40 hops; default: listed, not walked). `?` and `[..]` work on UTF-8 characters like Python's `str`. Proof: `tools/glob_cross/run.sh` (test.sh section 102), tests 2310/2311, `examples/glob_find.fi`.
+
 ```
 glob.matches("*.json", "a.json")                      // fnmatch: * ? [abc] [a-z] [!x]; no path separators
 glob.expand("library/*/*.json", &out)                 // sorted list, NUL-separated names in a rt.Buf; returns count
