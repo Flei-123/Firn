@@ -1,0 +1,3396 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/filedlg.fi -- THE FILE DIALOG OF fUi (open / open several / save / pick a folder).
+//
+// One window of its own (`run`), built ENTIRELY on lib/fui/app.fi, with real navigation:
+//
+//   * a place bar: breadcrumb buttons (a click jumps; Ctrl+L or a click on the free part turns it into a
+//     path field), Back / Forward / Up / Refresh, "New folder" with an inline name row,
+//   * a side list of places (Home, Desktop, Documents ... from XDG user-dirs, "/", the folders visited),
+//   * THE FILE LIST: ONE scene node with its own painter, virtualised (only the visible rows are painted,
+//     so 5000 entries cost what 15 cost), a header with sortable columns, icons, hover / selection / focus,
+//     a scroll bar that can be dragged and clicked, wheel, keyboard, type-to-find,
+//   * a name field, a filter chooser (a context menu of radio entries), "Show hidden files",
+//   * the overwrite question as a row of its own in the SAME window (Replace? default No),
+//   * an OK button that is greyed out while there is nothing valid to accept, a status line.
+//
+// The data side (reading, sorting, filtering, paths) is lib/fui/filemodel.fi and knows no window.
+//
+// HOW IT IS USED
+//
+//     var out: rt.Buf = rt.buf_new()
+//     let rc: i32 = filedlg.run(2, "Save as", "/home/justin", "notes.txt", "Text|*.txt|All|*", &out)
+//     // rc 0: `out` got the path(s); 1: cancelled or closed; 12: no window possible
+//
+// modes: 0 open one, 1 open several (paths separated by LF), 2 save, 3 pick a folder. `filters` is the
+// "Label|pat;pat|Label2|pat" string of lib/std/dialog.fi ("" = everything).
+//
+// FOR A TEST OR AN EMBEDDING PROGRAM: `dlg_new` builds the window without running it, `dlg_app` is its
+// app.App, and the functions exported below (nav_to, do_ok, set_sort ...) are what the keys and clicks call.
+//
+// LIMITS (honest): Unix paths only (Windows drives are not part of this round); a path longer than 255
+// octets does not fit app.TEXT_CAP and is shown cut; the rows of the list are not separate accessibility
+// nodes (the list is one node with role "list"; the focused row's name is in the status line).
+import std.rt
+import std.fs
+import std.env
+import std.time
+import fui.filemodel
+import fui.app
+import fui.scene
+import fui.style
+import fui.sheet
+import fui.theme
+import fui.render
+import fui.painter
+import fui.widget
+import fui.event
+import fui.editor
+import fui.textbuf
+import fui.a11y
+import fui.icons
+import fui.lucide
+import fui.action
+import fui.ctxmenu
+import fui.flex
+import fui.control
+import plat.fuiwirt
+import paint.canvas
+
+export {
+    Dlg, Place, FilterCtx, dlg_new, dlg_app, run, dlg_free,
+    nav_to, nav_back, nav_forward, nav_up, refresh, do_ok, do_cancel, select_only, select_all,
+    toggle_hidden, set_sort, set_filter, activate_row, open_newfolder, create_folder,
+    start_path_edit, commit_path, end_path_edit, answer_replace, type_char, scroll_to,
+    list_rows_visible, list_row_y, list_header_h, list_row_h, row_at, ensure_visible,
+    on_key, on_char, status_text, name_text, accept_text, sync_ok, crumbs_update,
+    ent_of_view, path_of_view, crumb_slot, place_of_node, pl_label, pl_path, set_focus, focus_of,
+    selected_count, list_hit, col_size_x, col_date_x, sb_thumb, sb_visible, list_max_scroll,
+    list_content_h, list_body_h, list_x, list_y, list_w, list_h, can_back, can_forward, can_up,
+    place_current, tab_stops, select_range, select_toggle, close_newfolder, filter_label_s,
+    cb_filter, crumb_label, crumb_target, icon_of_entry, compute_ok, clock, utf8_push, muted_for,
+    MODE_OPEN, MODE_OPEN_MANY, MODE_SAVE, MODE_FOLDER,
+    WIN_W, WIN_H, set_clock, tab_move,
+}
+
+const MODE_OPEN: i32 = 0
+const MODE_OPEN_MANY: i32 = 1
+const MODE_SAVE: i32 = 2
+const MODE_FOLDER: i32 = 3
+
+const NONE: usize = 4294967295
+
+// ---- sizes in design points (96 dpi: pixels)
+const WIN_W: usize = 780
+const WIN_H: usize = 520
+const PAD: i64 = 12
+const GAP: i64 = 8
+const NAV_W: usize = 32
+const BAR_H: usize = 34
+const SIDE_W: usize = 176
+const PLACE_H: usize = 30
+const ROW_H: usize = 28
+const HDR_H: usize = 28
+const SB_W: usize = 10
+const COL_SIZE_W: usize = 84
+const COL_DATE_W: usize = 176
+const BTN_W: usize = 96
+const CTRL_H: usize = 32
+const CRUMB_H: usize = 28
+const ICON_PT: usize = 16
+
+const PLACES_MAX: usize = 16
+const FIXED_MAX: usize = 10
+const RECENT_MAX: usize = 5
+const CRUMBS_MAX: usize = 10
+const HIST_MAX: usize = 64
+const FILTERS_MAX: usize = 16
+const LABEL_CAP: usize = 64
+const TY_CAP: usize = 48
+const TY_RESET_MS: i64 = 1000
+
+struct Place {
+    src: usize,
+    loff: usize,
+    llen: usize,
+    poff: usize,
+    plen: usize,
+    icon: i64,
+}
+
+struct FilterCtx {
+    d: u64,
+    idx: usize,
+}
+
+struct Dlg {
+    a: *mut app.App,
+    mode: i32,
+    ret: i32,
+    done: bool,
+    accepted: bool,
+    out: u64,
+    m: filemodel.Model,
+    home: rt.Buf,
+    scratch: rt.Buf,
+    filters: rt.Buf,
+    nfilt: usize,
+    fidx: usize,
+    fctx: [FilterCtx; 16],
+    flabels: rt.Buf,
+    f_off: [usize; 16],
+    f_len: [usize; 16],
+    // ---- the nodes
+    n_root: usize,
+    n_back: usize,
+    n_fwd: usize,
+    n_up: usize,
+    n_ref: usize,
+    n_loc: usize,
+    n_crumb: [usize; 10],
+    n_path: usize,
+    n_newf: usize,
+    n_nf_row: usize,
+    n_nf_label: usize,
+    n_nf_entry: usize,
+    n_nf_ok: usize,
+    n_nf_cancel: usize,
+    n_side: usize,
+    n_place: [usize; 16],
+    n_list: usize,
+    n_name: usize,
+    n_filter: usize,
+    n_conf_row: usize,
+    n_conf_text: usize,
+    n_yes: usize,
+    n_no: usize,
+    n_bot: usize,
+    n_status: usize,
+    n_hidden: usize,
+    n_ok: usize,
+    n_cancel: usize,
+    // ---- places
+    fbuf: rt.Buf,
+    rbuf: rt.Buf,
+    pl: [Place; 16],
+    pl_n: usize,
+    pl_fixed: usize,
+    rc_off: [usize; 5],
+    rc_len: [usize; 5],
+    rc_n: usize,
+    pl_text: [u8; 1024],
+    // ---- crumbs
+    cr_n: usize,
+    cr_end: [usize; 10],
+    cr_lab: [u8; 640],
+    cr_len: [usize; 10],
+    cr_wpts: [usize; 10],
+    cr_w: f64,
+    cr_fit_w: f64,
+    // ---- history
+    hist: rt.Buf,
+    h_off: [usize; 64],
+    h_len: [usize; 64],
+    h_n: usize,
+    h_pos: usize,
+    // ---- the list
+    cur: usize,
+    anchor: usize,
+    scroll: f64,
+    drag: bool,
+    drag_dy: f64,
+    sb_hot: bool,
+    ty_buf: [u8; 48],
+    ty_len: usize,
+    ty_ms: i64,
+    fake_ms: i64,
+    // ---- modes of the window
+    path_edit: bool,
+    nf_open: bool,
+    confirm: bool,
+    conf_path: rt.Buf,
+    gen_text: rt.Buf,
+    st_buf: rt.Buf,
+    st_err: bool,
+    ok_ready: bool,
+    focus_pending: usize,
+    nodes_ready: bool,
+    wrote: bool,
+    hover_key: usize,
+}
+
+fn alloc_of[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+// ============================================================ SMALL HELPERS
+
+fn dlg_of(a: *mut app.App) -> *mut Dlg {
+    return app.data(a) as *mut Dlg
+}
+
+fn dlg_app(d: *mut Dlg) -> *mut app.App {
+    return (*d).a
+}
+
+fn sc_of(d: *mut Dlg) -> *mut scene.Scene {
+    return app.app_scene((*d).a)
+}
+
+fn touch(d: *mut Dlg) {
+    fuiwirt.host_touch(app.app_host((*d).a))
+}
+
+fn tc(c: *mut render.Ctx, tok: u32) -> u32 {
+    return render.color_of(c, style.color_token(tok))
+}
+
+fn pxl(c: *mut render.Ctx, pts: usize) -> f64 {
+    return render.len_of(c, pts)
+}
+
+// The quiet text colour on `ground` (a theme colour, opaque): the theme's muted text where that reads at 4.5:1,
+// else the normal text colour (the muted token is made for the plain surface, not for every ground).
+fn muted_for(m: *mut theme.Theme, ground: u32) -> u32 {
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    if theme.contrast((*f).text_muted, ground) >= 4.5 {
+        return (*f).text_muted
+    }
+    return (*f).text
+}
+
+fn muted_on(c: *mut render.Ctx, ground: u32) -> u32 {
+    return muted_for(render.ctx_theme(c), ground)
+}
+
+// A colour between the ground and the text colour (per mille towards the text).
+fn tint_of(c: *mut render.Ctx, ground: u32, permille: usize) -> u32 {
+    let f: *mut theme.Colors = theme.theme_colors(render.ctx_theme(c))
+    return theme.mix(ground, (*f).text, permille)
+}
+
+// Design points -> pixels outside a painter (handlers): the theme's scale.
+fn px_of(d: *mut Dlg, pts: usize) -> f64 {
+    return theme.theme_px(app.app_theme((*d).a), pts) as f64
+}
+
+fn round_f(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - round_f(0.0 - v)
+    }
+    return ((v + 0.5) as i64) as f64
+}
+
+fn with_alpha(col: u32, a: u32) -> u32 {
+    return (a << 24) | (col & (16777215 as u32))
+}
+
+fn node_rule(d: *mut Dlg, i: usize, st: style.Style) {
+    let a: *mut app.App = (*d).a
+    scene.node_set_id(&(*a).sc, i, (i + 1) as u32)
+    let r: usize = sheet.sheet_rule(&(*a).sh, sheet.sel_id((i + 1) as u32), st)
+}
+
+// No chrome of the kind: the node's own painter makes the whole picture. The surface colour set here is only
+// the fall-back (a transparent surface would be tweened from black by the button transitions of
+// lib/fui/anim.fi); `no_fill` keeps the kind from painting it at all.
+fn flat_rule(d: *mut Dlg, i: usize, ground: u32) {
+    var st: style.Style = style.style_new()
+    st = style.style_set_bg(st, style.color_token(ground))
+    st = style.style_set_border(st, style.color_transparent(), 0)
+    node_rule(d, i, st)
+    // the kind paints NO surface (the flag a merge group uses): the node's painter makes the picture, and a
+    // theme switch cannot leave a stale surface behind
+    (*sc_of(d)).nodes[i].no_fill = 1 as u32
+}
+
+// There is no display:none in the scene (a hidden node keeps its room), so a node that is "away" is
+// tiny and not painted, and grows back to its size when shown.
+fn show_node(d: *mut Dlg, n: usize, on: bool, w: usize, h: usize, grow: i64) {
+    let sc: *mut scene.Scene = sc_of(d)
+    scene.node_set_hidden(sc, n, !on)
+    if on {
+        scene.node_set_size(sc, n, w as f64, h as f64)
+        scene.node_set_grow(sc, n, grow, 1)
+    } else {
+        scene.node_set_size(sc, n, 0.01, 0.01)
+        scene.node_set_grow(sc, n, 0, 0)
+    }
+}
+
+// A whole row of the window away or back (the root has no gap: every row brings its own space below).
+fn show_row(d: *mut Dlg, row: usize, on: bool, below: i64) {
+    let sc: *mut scene.Scene = sc_of(d)
+    scene.node_set_hidden(sc, row, !on)
+    if on {
+        scene.node_set_size(sc, row, 0.0, 0.0)
+        scene.node_set_padding(sc, row, 0, 0, 0, below)
+    } else {
+        scene.node_set_size(sc, row, 0.01, 0.01)
+        scene.node_set_padding(sc, row, 0, 0, 0, 0)
+    }
+}
+
+fn lit_ptr(s: str) -> u64 {
+    return s.p as u64
+}
+
+fn name_it(d: *mut Dlg, n: usize, s: str) {
+    a11y.a11y_set_name(&(*(*d).a).ax, n, s.p as u64, s.n)
+}
+
+fn role_it(d: *mut Dlg, n: usize, r: u32) {
+    a11y.a11y_set_role(&(*(*d).a).ax, n, r)
+}
+
+fn node_hidden_set(d: *mut Dlg, n: usize, on: bool) {
+    scene.node_set_hidden(sc_of(d), n, on)
+}
+
+fn node_is_hidden(d: *mut Dlg, n: usize) -> bool {
+    return scene.node_hidden(sc_of(d), n)
+}
+
+fn wdg(d: *mut Dlg, n: usize) -> *mut widget.Widget {
+    return scene.node_widget(sc_of(d), n)
+}
+
+fn set_enabled(d: *mut Dlg, n: usize, on: bool) {
+    widget.w_set_disabled(wdg(d, n), !on)
+}
+
+fn is_enabled(d: *mut Dlg, n: usize) -> bool {
+    return !widget.w_is_disabled(wdg(d, n))
+}
+
+fn clock(d: *mut Dlg) -> i64 {
+    if (*d).fake_ms >= 0 {
+        return (*d).fake_ms
+    }
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000 + ts[1] / 1000000
+}
+
+// A test pins the clock (type-to-find has a one second memory); -1 = the real one.
+fn set_clock(d: *mut Dlg, ms: i64) {
+    (*d).fake_ms = ms
+}
+
+fn utf8_cut(s: str, max: usize) -> usize {
+    var n: usize = s.n
+    if n > max {
+        n = max
+        while n > 0 && (rt.ld8(s.p as u64, n) & (192 as u8)) == (128 as u8) {
+            n = n - 1
+        }
+    }
+    return n
+}
+
+fn mods_has(mods: u32, bit: u32) -> bool {
+    return (mods & bit) != (0 as u32)
+}
+
+// ============================================================ STATUS / TEXT
+
+fn set_status(d: *mut Dlg, s: str, err: bool) {
+    rt.buf_clear(&(*d).st_buf)
+    filemodel.push_str(&(*d).st_buf, s)
+    (*d).st_err = err
+    touch(d)
+}
+
+fn set_status2(d: *mut Dlg, a: str, b: str, err: bool) {
+    rt.buf_clear(&(*d).st_buf)
+    filemodel.push_str(&(*d).st_buf, a)
+    filemodel.push_str(&(*d).st_buf, b)
+    (*d).st_err = err
+    touch(d)
+}
+
+fn status_text(d: *mut Dlg) -> str {
+    return filemodel.buf_str(&(*d).st_buf)
+}
+
+fn name_text(d: *mut Dlg) -> str {
+    return app.text((*d).a, (*d).n_name)
+}
+
+// "12 items" / "1 item, 1 selected": the quiet status line.
+fn refresh_status(d: *mut Dlg) {
+    let m: *mut filemodel.Model = &(*d).m
+    rt.buf_clear(&(*d).st_buf)
+    let n: usize = filemodel.model_count(m)
+    rt.buf_push_dec_u64(&(*d).st_buf, n as u64)
+    if n == 1 {
+        filemodel.push_str(&(*d).st_buf, " item")
+    } else {
+        filemodel.push_str(&(*d).st_buf, " items")
+    }
+    let s: usize = filemodel.model_sel_count(m)
+    if s > 0 {
+        filemodel.push_str(&(*d).st_buf, ", ")
+        rt.buf_push_dec_u64(&(*d).st_buf, s as u64)
+        filemodel.push_str(&(*d).st_buf, " selected")
+    }
+    if (*d).ty_len > 0 {
+        filemodel.push_str(&(*d).st_buf, "  -  find: ")
+        filemodel.push_str(&(*d).st_buf, str { p: (&(*d).ty_buf[0]) as *mut u8, n: (*d).ty_len })
+    }
+    (*d).st_err = false
+    touch(d)
+}
+
+fn set_name_text(d: *mut Dlg, s: str) {
+    rt.buf_clear(&(*d).gen_text)
+    filemodel.push_str(&(*d).gen_text, s)
+    app.set_text((*d).a, (*d).n_name, s)
+    // the text in the field is the program's own again
+    touch(d)
+}
+
+fn name_is_generated(d: *mut Dlg) -> bool {
+    return filemodel.str_eq(name_text(d), filemodel.buf_str(&(*d).gen_text))
+}
+
+fn trim_s(s: str) -> str {
+    var a: usize = 0
+    var b: usize = s.n
+    while a < b && rt.ld8(s.p as u64, a) == (32 as u8) {
+        a = a + 1
+    }
+    while b > a && rt.ld8(s.p as u64, b - 1) == (32 as u8) {
+        b = b - 1
+    }
+    return str { p: ((s.p as u64) + a as u64) as *mut u8, n: b - a }
+}
+
+// ============================================================ PLACES
+
+fn pl_label(d: *mut Dlg, i: usize) -> str {
+    let p: *mut Place = &(*d).pl[i]
+    if (*p).src == 0 {
+        return str { p: ((rt.buf_data(&(*d).fbuf) as u64) + (*p).loff as u64) as *mut u8, n: (*p).llen }
+    }
+    return str { p: ((rt.buf_data(&(*d).rbuf) as u64) + (*p).loff as u64) as *mut u8, n: (*p).llen }
+}
+
+fn pl_path(d: *mut Dlg, i: usize) -> str {
+    let p: *mut Place = &(*d).pl[i]
+    if (*p).src == 0 {
+        return str { p: ((rt.buf_data(&(*d).fbuf) as u64) + (*p).poff as u64) as *mut u8, n: (*p).plen }
+    }
+    return str { p: ((rt.buf_data(&(*d).rbuf) as u64) + (*p).poff as u64) as *mut u8, n: (*p).plen }
+}
+
+fn add_fixed(d: *mut Dlg, label: str, path: str, icon: i64) {
+    if (*d).pl_fixed >= FIXED_MAX {
+        return
+    }
+    // skip a duplicate path (XDG may point two names at the home directory)
+    var i: usize = 0
+    while i < (*d).pl_fixed {
+        if filemodel.str_eq(pl_path(d, i), path) {
+            return
+        }
+        i = i + 1
+    }
+    let k: usize = (*d).pl_fixed
+    let p: *mut Place = &(*d).pl[k]
+    (*p).src = 0
+    (*p).loff = rt.buf_len(&(*d).fbuf)
+    (*p).llen = label.n
+    filemodel.push_str(&(*d).fbuf, label)
+    (*p).poff = rt.buf_len(&(*d).fbuf)
+    (*p).plen = path.n
+    filemodel.push_str(&(*d).fbuf, path)
+    (*p).icon = icon
+    (*d).pl_fixed = k + 1
+}
+
+// The value of a line `XDG_PICTURES_DIR="$HOME/Bilder"` of user-dirs.dirs for `key`
+// ("PICTURES"), expanded, appended to `out`. false when the file has no such line.
+fn xdg_dir(conf: str, key: str, home: str, out: *mut rt.Buf) -> bool {
+    var i: usize = 0
+    while i < conf.n {
+        var j: usize = i
+        while j < conf.n && rt.ld8(conf.p as u64, j) != (10 as u8) {
+            j = j + 1
+        }
+        let line: str = str { p: ((conf.p as u64) + i as u64) as *mut u8, n: j - i }
+        // XDG_<key>_DIR="<value>"
+        let head: usize = 4 + key.n + 6
+        if line.n > head + 1 && rt.ld8(line.p as u64, 0) == (88 as u8)
+        && filemodel.str_eq(str { p: ((line.p as u64) + 4) as *mut u8, n: key.n }, key)
+        && rt.ld8(line.p as u64, 4 + key.n) == (95 as u8) {
+            var q: usize = 4 + key.n
+            // find the opening quote
+            while q < line.n && rt.ld8(line.p as u64, q) != (34 as u8) {
+                q = q + 1
+            }
+            q = q + 1
+            var e: usize = q
+            while e < line.n && rt.ld8(line.p as u64, e) != (34 as u8) {
+                e = e + 1
+            }
+            if e > q {
+                var v: str = str { p: ((line.p as u64) + q as u64) as *mut u8, n: e - q }
+                if v.n >= 5 && rt.ld8(v.p as u64, 0) == (36 as u8) && rt.ld8(v.p as u64, 1) == (72 as u8) {
+                    // "$HOME/..."
+                    filemodel.push_str(out, home)
+                    v = str { p: ((v.p as u64) + 5) as *mut u8, n: v.n - 5 }
+                }
+                filemodel.push_str(out, v)
+                return true
+            }
+        }
+        i = j + 1
+    }
+    return false
+}
+
+fn add_xdg(d: *mut Dlg, conf: str, key: str, label: str, fallback: str, icon: i64) {
+    var p: rt.Buf = rt.buf_new()
+    let home: str = filemodel.buf_str(&(*d).home)
+    var found: bool = xdg_dir(conf, key, home, &p)
+    if !found {
+        filemodel.push_str(&p, home)
+        rt.buf_push(&p, 47 as u8)
+        filemodel.push_str(&p, fallback)
+    }
+    var n: rt.Buf = rt.buf_new()
+    filemodel.path_normalize(filemodel.buf_str(&p), &n)
+    if fs.is_dir(filemodel.buf_str(&n)) {
+        add_fixed(d, label, filemodel.buf_str(&n), icon)
+    }
+    rt.buf_free(&p)
+    rt.buf_free(&n)
+}
+
+fn places_init(d: *mut Dlg) {
+    let home: str = filemodel.buf_str(&(*d).home)
+    if home.n > 0 && fs.is_dir(home) {
+        add_fixed(d, "Home", home, lucide.HOUSE)
+    }
+    var conf: rt.Buf = rt.buf_new()
+    var cp: rt.Buf = rt.buf_new()
+    filemodel.push_str(&cp, home)
+    filemodel.push_str(&cp, "/.config/user-dirs.dirs")
+    let r: usize = fs.read_file(filemodel.buf_str(&cp), &conf) catch 0
+    let cs: str = filemodel.buf_str(&conf)
+    add_xdg(d, cs, "DESKTOP", "Desktop", "Desktop", lucide.MONITOR)
+    add_xdg(d, cs, "DOCUMENTS", "Documents", "Documents", lucide.FILE_TEXT)
+    add_xdg(d, cs, "DOWNLOAD", "Downloads", "Downloads", lucide.DOWNLOAD)
+    add_xdg(d, cs, "PICTURES", "Pictures", "Pictures", lucide.IMAGE)
+    add_xdg(d, cs, "MUSIC", "Music", "Music", lucide.LIBRARY)
+    add_xdg(d, cs, "VIDEOS", "Videos", "Videos", lucide.PLAY)
+    add_fixed(d, "Computer", "/", lucide.HARD_DRIVE)
+    rt.buf_free(&conf)
+    rt.buf_free(&cp)
+    (*d).pl_n = (*d).pl_fixed
+}
+
+fn rc_str(d: *mut Dlg, i: usize) -> str {
+    return str { p: ((rt.buf_data(&(*d).rbuf) as u64) + (*d).rc_off[i] as u64) as *mut u8, n: (*d).rc_len[i] }
+}
+
+// The folders visited this session (newest first), shown under the fixed places.
+fn recents_push(d: *mut Dlg, path: str) {
+    // not a fixed place, not already the newest
+    var i: usize = 0
+    while i < (*d).pl_fixed {
+        if filemodel.str_eq(pl_path(d, i), path) {
+            return
+        }
+        i = i + 1
+    }
+    var at: usize = NONE
+    i = 0
+    while i < (*d).rc_n {
+        if filemodel.str_eq(rc_str(d, i), path) {
+            at = i
+        }
+        i = i + 1
+    }
+    // copy the strings into a fresh buffer: newest first
+    var nb: rt.Buf = rt.buf_new()
+    var off: [usize; 5] = [0; 5]
+    var len: [usize; 5] = [0; 5]
+    var n: usize = 0
+    off[0] = 0
+    len[0] = path.n
+    filemodel.push_str(&nb, path)
+    n = 1
+    i = 0
+    while i < (*d).rc_n && n < RECENT_MAX {
+        if i != at {
+            let s: str = rc_str(d, i)
+            off[n] = rt.buf_len(&nb)
+            len[n] = s.n
+            filemodel.push_str(&nb, s)
+            n = n + 1
+        }
+        i = i + 1
+    }
+    rt.buf_free(&(*d).rbuf)
+    (*d).rbuf = nb
+    i = 0
+    while i < n {
+        (*d).rc_off[i] = off[i]
+        (*d).rc_len[i] = len[i]
+        i = i + 1
+    }
+    (*d).rc_n = n
+}
+
+// Fill the place slots: the fixed ones, then the recents with their short names.
+fn places_apply(d: *mut Dlg) {
+    var n: usize = (*d).pl_fixed
+    var i: usize = 0
+    // the recent records
+    while i < (*d).rc_n && n < PLACES_MAX {
+        let path: str = rc_str(d, i)
+        var s: usize = filemodel.last_slash(path)
+        var base: str = path
+        if s != filemodel.NONE && path.n > 1 {
+            base = str { p: ((path.p as u64) + (s + 1) as u64) as *mut u8, n: path.n - s - 1 }
+        }
+        let p: *mut Place = &(*d).pl[n]
+        (*p).src = 1
+        (*p).icon = lucide.FOLDER
+        (*p).poff = (*d).rc_off[i]
+        (*p).plen = path.n
+        (*p).loff = (*d).rc_off[i] + (path.n - base.n)
+        (*p).llen = base.n
+        n = n + 1
+        i = i + 1
+    }
+    (*d).pl_n = n
+    i = 0
+    while i < PLACES_MAX {
+        let nd: usize = (*d).n_place[i]
+        if i < n {
+            node_is_set_label(d, i)
+            show_node(d, nd, true, 0, PLACE_H, 0)
+        } else {
+            show_node(d, nd, false, 0, 0, 0)
+        }
+        i = i + 1
+    }
+}
+
+// The accessible name of place `i` lives in a fixed block (a name keeps a pointer).
+fn node_is_set_label(d: *mut Dlg, i: usize) {
+    let l: str = pl_label(d, i)
+    var n: usize = l.n
+    if n > LABEL_CAP - 1 {
+        n = utf8_cut(l, LABEL_CAP - 1)
+    }
+    var k: usize = 0
+    while k < n {
+        (*d).pl_text[i * LABEL_CAP + k] = rt.ld8(l.p as u64, k)
+        k = k + 1
+    }
+    a11y.a11y_set_name(&(*(*d).a).ax, (*d).n_place[i], (&(*d).pl_text[i * LABEL_CAP]) as u64, n)
+}
+
+fn place_of_node(d: *mut Dlg, n: usize) -> usize {
+    var i: usize = 0
+    while i < PLACES_MAX {
+        if (*d).n_place[i] == n {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// The place that stands for the open folder (the longest match is not needed: exact).
+fn place_current(d: *mut Dlg) -> usize {
+    let cur: str = filemodel.model_path(&(*d).m)
+    var i: usize = 0
+    while i < (*d).pl_n {
+        if filemodel.str_eq(pl_path(d, i), cur) {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// ============================================================ HISTORY
+
+fn hist_str(d: *mut Dlg, i: usize) -> str {
+    return str { p: ((rt.buf_data(&(*d).hist) as u64) + (*d).h_off[i] as u64) as *mut u8, n: (*d).h_len[i] }
+}
+
+fn hist_visit(d: *mut Dlg, path: str) {
+    // the same folder again changes nothing; otherwise the forward entries are dropped
+    if (*d).h_n > 0 {
+        if filemodel.str_eq(hist_str(d, (*d).h_pos), path) {
+            return
+        }
+        (*d).h_n = (*d).h_pos + 1
+    }
+    if (*d).h_n >= HIST_MAX {
+        var i: usize = 1
+        while i < (*d).h_n {
+            (*d).h_off[i - 1] = (*d).h_off[i]
+            (*d).h_len[i - 1] = (*d).h_len[i]
+            i = i + 1
+        }
+        (*d).h_n = (*d).h_n - 1
+    }
+    let k: usize = (*d).h_n
+    (*d).h_off[k] = rt.buf_len(&(*d).hist)
+    (*d).h_len[k] = path.n
+    filemodel.push_str(&(*d).hist, path)
+    (*d).h_n = k + 1
+    (*d).h_pos = k
+}
+
+fn can_back(d: *mut Dlg) -> bool {
+    return (*d).h_n > 0 && (*d).h_pos > 0
+}
+
+fn can_forward(d: *mut Dlg) -> bool {
+    return (*d).h_n > 0 && (*d).h_pos + 1 < (*d).h_n
+}
+
+fn can_up(d: *mut Dlg) -> bool {
+    return filemodel.model_path(&(*d).m).n > 1
+}
+
+fn sync_nav_buttons(d: *mut Dlg) {
+    set_enabled(d, (*d).n_back, can_back(d))
+    set_enabled(d, (*d).n_fwd, can_forward(d))
+    set_enabled(d, (*d).n_up, can_up(d))
+}
+
+// ============================================================ BREADCRUMBS
+
+// How wide `s` is in pixels at the text size (a painter once there is one, else a guess).
+fn measure(d: *mut Dlg, s: str) -> f64 {
+    let a: *mut app.App = (*d).a
+    let z: *mut painter.Painter = render.ctx_painter(&(*a).c)
+    let px: f64 = px_of(d, (*theme.theme_shape(app.app_theme(a))).font)
+    if (z as u64) != 0 && painter.painter_ok(z) {
+        return painter.text_width(z, s.p as u64, s.n, px)
+    }
+    return (s.n as f64) * px * 0.58
+}
+
+fn crumb_label(d: *mut Dlg, i: usize) -> str {
+    return str { p: (&(*d).cr_lab[i * LABEL_CAP]) as *mut u8, n: (*d).cr_len[i] }
+}
+
+fn crumb_target(d: *mut Dlg, i: usize) -> str {
+    let p: str = filemodel.model_path(&(*d).m)
+    var e: usize = (*d).cr_end[i]
+    if e == 0 { e = 1 }
+    return str { p: p.p, n: e }
+}
+
+fn set_crumb(d: *mut Dlg, slot: usize, label: str, end: usize) {
+    var n: usize = label.n
+    if n > LABEL_CAP - 1 {
+        n = utf8_cut(label, LABEL_CAP - 1)
+    }
+    var k: usize = 0
+    while k < n {
+        (*d).cr_lab[slot * LABEL_CAP + k] = rt.ld8(label.p as u64, k)
+        k = k + 1
+    }
+    (*d).cr_len[slot] = n
+    (*d).cr_end[slot] = end
+    a11y.a11y_set_name(&(*(*d).a).ax, (*d).n_crumb[slot], (&(*d).cr_lab[slot * LABEL_CAP]) as u64, n)
+}
+
+// The width one crumb button needs (design points).
+fn crumb_width_pts(d: *mut Dlg, label: str, first: bool) -> usize {
+    let px: f64 = measure(d, label)
+    let scale: f64 = (theme.theme_scale(app.app_theme((*d).a)) as f64) / 1000.0
+    var w: f64 = px / scale + 20.0
+    if !first {
+        w = w + 12.0
+    }
+    if w > 190.0 {
+        w = 190.0
+    }
+    return (w + 0.999) as usize
+}
+
+// Build the crumb buttons for the open folder: as many trailing parts as fit in the place bar, the rest
+// folded into a "..." crumb that jumps to the nearest hidden ancestor.
+fn crumbs_update(d: *mut Dlg) {
+    let path: str = filemodel.model_path(&(*d).m)
+    // the room: what the bar had at the last layout, minus its padding
+    let sc: *mut scene.Scene = sc_of(d)
+    var room: f64 = scene.node_w(sc, (*d).n_loc)
+    let scale: f64 = (theme.theme_scale(app.app_theme((*d).a)) as f64) / 1000.0
+    if room < 40.0 {
+        room = 430.0 * scale
+    }
+    (*d).cr_fit_w = room
+    var avail: f64 = room / scale - 8.0
+    // the parts
+    var starts: [usize; 64] = [0; 64]
+    var ends: [usize; 64] = [0; 64]
+    var np: usize = 0
+    var s: usize = 0
+    var e: usize = 0
+    while np < 64 && filemodel.path_split(path, np, &s, &e) {
+        starts[np] = s
+        ends[np] = e
+        np = np + 1
+    }
+    // widths of: root crumb "/" then each part
+    var wroot: usize = 34
+    var used: f64 = wroot as f64
+    var first: usize = np
+    // walk back from the last part while it fits
+    var k: usize = np
+    var ell: usize = 34
+    while k > 0 {
+        let lab: str = str { p: ((path.p as u64) + starts[k - 1] as u64) as *mut u8, n: ends[k - 1] - starts[k - 1] }
+        let w: f64 = crumb_width_pts(d, lab, false) as f64
+        var need: f64 = used + w
+        if k - 1 > 0 {
+            need = need + ell as f64
+        }
+        if need > avail && first < np {
+            break
+        }
+        if (np - (k - 1)) + 2 > CRUMBS_MAX {
+            break
+        }
+        used = used + w
+        first = k - 1
+        k = k - 1
+    }
+    var slot: usize = 0
+    // root
+    set_crumb(d, slot, "/", 1)
+    (*d).cr_wpts[slot] = wroot
+    slot = slot + 1
+    if first > 0 {
+        // "..." jumps to the parent of the first shown part
+        set_crumb(d, slot, "...", ends[first - 1])
+        (*d).cr_wpts[slot] = ell
+        slot = slot + 1
+    }
+    var j: usize = first
+    while j < np && slot < CRUMBS_MAX {
+        let lab2: str = str { p: ((path.p as u64) + starts[j] as u64) as *mut u8, n: ends[j] - starts[j] }
+        set_crumb(d, slot, lab2, ends[j])
+        (*d).cr_wpts[slot] = crumb_width_pts(d, lab2, false)
+        slot = slot + 1
+        j = j + 1
+    }
+    (*d).cr_n = slot
+    var q: usize = 0
+    while q < CRUMBS_MAX {
+        let on: bool = q < slot && !(*d).path_edit
+        if on {
+            show_node(d, (*d).n_crumb[q], true, crumb_w_pts(d, q), CRUMB_H, 0)
+        } else {
+            show_node(d, (*d).n_crumb[q], false, 0, 0, 0)
+        }
+        q = q + 1
+    }
+    show_node(d, (*d).n_path, (*d).path_edit, 0, 0, 1)
+    touch(d)
+}
+
+fn crumb_w_pts(d: *mut Dlg, slot: usize) -> usize {
+    return (*d).cr_wpts[slot]
+}
+
+// ============================================================ LIST GEOMETRY (pixels)
+
+fn list_row_h(d: *mut Dlg) -> f64 { return px_of(d, ROW_H) }
+fn list_header_h(d: *mut Dlg) -> f64 { return px_of(d, HDR_H) }
+
+fn list_x(d: *mut Dlg) -> f64 { return scene.node_x(sc_of(d), (*d).n_list) }
+fn list_y(d: *mut Dlg) -> f64 { return scene.node_y(sc_of(d), (*d).n_list) }
+fn list_w(d: *mut Dlg) -> f64 { return scene.node_w(sc_of(d), (*d).n_list) }
+fn list_h(d: *mut Dlg) -> f64 { return scene.node_h(sc_of(d), (*d).n_list) }
+
+// The height of the row area (below the header, inside the frame).
+fn list_body_h(d: *mut Dlg) -> f64 {
+    let h: f64 = list_h(d) - list_header_h(d) - 2.0
+    if h < 0.0 { return 0.0 }
+    return h
+}
+
+fn list_content_h(d: *mut Dlg) -> f64 {
+    return (filemodel.model_count(&(*d).m) as f64) * list_row_h(d)
+}
+
+fn list_max_scroll(d: *mut Dlg) -> f64 {
+    let m: f64 = list_content_h(d) - list_body_h(d)
+    if m < 0.0 { return 0.0 }
+    return m
+}
+
+// Whole rows that fit below the header (at least 1).
+fn list_rows_visible(d: *mut Dlg) -> usize {
+    let n: usize = (list_body_h(d) / list_row_h(d)) as usize
+    if n < 1 { return 1 }
+    return n
+}
+
+// The top edge of the row at view position `k` (pixels, window coordinates).
+fn list_row_y(d: *mut Dlg, k: usize) -> f64 {
+    return list_y(d) + 1.0 + list_header_h(d) + (k as f64) * list_row_h(d) - (*d).scroll
+}
+
+fn clamp_scroll(d: *mut Dlg) {
+    let mx: f64 = list_max_scroll(d)
+    if (*d).scroll > mx { (*d).scroll = mx }
+    if (*d).scroll < 0.0 { (*d).scroll = 0.0 }
+}
+
+fn scroll_to(d: *mut Dlg, y: f64) {
+    (*d).scroll = y
+    clamp_scroll(d)
+    touch(d)
+}
+
+fn ensure_visible(d: *mut Dlg, k: usize) {
+    if k == NONE { return }
+    let rh: f64 = list_row_h(d)
+    let top: f64 = (k as f64) * rh
+    let bh: f64 = list_body_h(d)
+    if top < (*d).scroll {
+        (*d).scroll = top
+    } else if top + rh > (*d).scroll + bh {
+        (*d).scroll = top + rh - bh
+    }
+    clamp_scroll(d)
+    touch(d)
+}
+
+fn sb_visible(d: *mut Dlg) -> bool {
+    return list_content_h(d) > list_body_h(d) + 0.5
+}
+
+// The scroll bar thumb: top and length in pixels (window coordinates).
+fn sb_thumb(d: *mut Dlg, top: *mut f64, len: *mut f64) {
+    let bh: f64 = list_body_h(d)
+    let ch: f64 = list_content_h(d)
+    var l: f64 = bh * bh / ch
+    let minl: f64 = px_of(d, 28)
+    if l < minl { l = minl }
+    if l > bh { l = bh }
+    let mx: f64 = list_max_scroll(d)
+    var t: f64 = 0.0
+    if mx > 0.0 {
+        t = ((*d).scroll / mx) * (bh - l)
+    }
+    *top = list_y(d) + 1.0 + list_header_h(d) + t
+    *len = l
+}
+
+// Which part of the list is under (x, y): 0 nothing, 1 header, 2 a row, 3 the scroll bar.
+// `idx` gets the view position (rows) or the column (header: 0 name, 1 size, 2 date).
+fn list_hit(d: *mut Dlg, x: f64, y: f64, idx: *mut usize) -> i32 {
+    let lx: f64 = list_x(d)
+    let ly: f64 = list_y(d)
+    let lw: f64 = list_w(d)
+    let lh: f64 = list_h(d)
+    if x < lx || x >= lx + lw || y < ly || y >= ly + lh {
+        return 0
+    }
+    let hh: f64 = list_header_h(d)
+    let sbw: f64 = px_of(d, SB_W)
+    if y < ly + 1.0 + hh {
+        *idx = col_at(d, x)
+        return 1
+    }
+    if sb_visible(d) && x >= lx + lw - 1.0 - sbw {
+        return 3
+    }
+    let rel: f64 = y - (ly + 1.0 + hh) + (*d).scroll
+    let k: usize = (rel / list_row_h(d)) as usize
+    if k >= filemodel.model_count(&(*d).m) {
+        *idx = NONE
+        return 2
+    }
+    *idx = k
+    return 2
+}
+
+// The row at (x, y), NONE if none.
+fn row_at(d: *mut Dlg, x: f64, y: f64) -> usize {
+    var k: usize = NONE
+    let z: i32 = list_hit(d, x, y, &k)
+    if z == 2 { return k }
+    return NONE
+}
+
+// x of the size column and the date column (pixels). A narrow list drops the date.
+fn col_size_x(d: *mut Dlg) -> f64 {
+    return col_date_x(d) - px_of(d, COL_SIZE_W)
+}
+
+fn col_date_x(d: *mut Dlg) -> f64 {
+    let right: f64 = list_x(d) + list_w(d) - 1.0 - px_of(d, SB_W)
+    if list_w(d) < px_of(d, 470) {
+        return right
+    }
+    return right - px_of(d, COL_DATE_W)
+}
+
+fn col_at(d: *mut Dlg, x: f64) -> usize {
+    if x >= col_date_x(d) { return 2 }
+    if x >= col_size_x(d) { return 1 }
+    return 0
+}
+
+// ============================================================ PAINTERS
+
+// A flat control's ground: pressed / hover, rounded. true when it is hot.
+fn flat_ground(c: *mut render.Ctx, e: *mut widget.Widget, r: f64) -> bool {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    if widget.w_is_disabled(e) {
+        return false
+    }
+    if widget.w_is_active(e) {
+        painter.round_rect(z, widget.w_x(e), widget.w_y(e), widget.w_w(e), widget.w_h(e), r,
+            tc(c, style.TOK_BUTTON_ACTIVE))
+        return true
+    }
+    if widget.w_is_hover(e) {
+        painter.round_rect(z, widget.w_x(e), widget.w_y(e), widget.w_w(e), widget.w_h(e), r,
+            tc(c, style.TOK_BUTTON_HOVER))
+        return true
+    }
+    return false
+}
+
+// Draw a Lucide icon of `pt` design points so its box is centred on the line y_mid.
+fn draw_icon_mid(c: *mut render.Ctx, id: i64, x: f64, ymid: f64, pt: usize, col: u32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let side: f64 = round_f(pxl(c, pt))
+    icons.icon(z, id, round_f(x), round_f(ymid - side / 2.0), side, col)
+}
+
+// One line of text vertically centred in [y, y+h], clipped to w with "..." (left aligned).
+fn draw_text_mid(c: *mut render.Ctx, s: str, x: f64, y: f64, w: f64, h: f64, col: u32, align: u32) {
+    if s.n == 0 || w <= 0.0 {
+        return
+    }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let px: f64 = pxl(c, render.def_font(c))
+    var r: painter.TextRun = painter.run_new(px)
+    let by: f64 = painter.text_baseline_mid(z, y, h, px)
+    let x1: f64 = painter.run_draw_ellipsis(z, &r, x, by, w, col, s.p as u64, s.n, align)
+}
+
+fn nav_icon_of(d: *mut Dlg, n: usize) -> i64 {
+    if n == (*d).n_back { return lucide.ARROW_LEFT }
+    if n == (*d).n_fwd { return lucide.ARROW_RIGHT }
+    if n == (*d).n_up { return lucide.ARROW_UP }
+    if n == (*d).n_ref { return lucide.REFRESH_CW }
+    return lucide.PLUS
+}
+
+// Back / Forward / Up / Refresh / New folder.
+fn draw_navbtn(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let n: usize = scene.scene_node_of(sc_of(d), e)
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    let hot: bool = flat_ground(c, e, pxl(c, 6))
+    var col: u32 = tc(c, style.TOK_TEXT)
+    if widget.w_is_disabled(e) {
+        col = tc(c, style.TOK_TEXT_DISABLED)
+    }
+    let cy: f64 = round_f(y + h / 2.0)
+    if n == (*d).n_newf {
+        // icon + words
+        let pad: f64 = pxl(c, 10)
+        draw_icon_mid(c, lucide.PLUS, x + pad, cy, ICON_PT, col)
+        let tx: f64 = x + pad + round_f(pxl(c, ICON_PT)) + pxl(c, 6)
+        draw_text_mid(c, "New folder", tx, y, w - (tx - x) - pad / 2.0, h, col, painter.TEXT_L)
+    } else {
+        let side: f64 = round_f(pxl(c, ICON_PT))
+        draw_icon_mid(c, nav_icon_of(d, n), x + round_f((w - side) / 2.0), cy, ICON_PT, col)
+    }
+    render.draw_focus_ring(c, e)
+}
+
+fn crumb_slot(d: *mut Dlg, n: usize) -> usize {
+    var i: usize = 0
+    while i < CRUMBS_MAX {
+        if (*d).n_crumb[i] == n {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn draw_crumb(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let n: usize = scene.scene_node_of(sc_of(d), e)
+    let s: usize = crumb_slot(d, n)
+    if s == NONE || s >= (*d).cr_n {
+        return
+    }
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    let hot: bool = flat_ground(c, e, pxl(c, 5))
+    var col: u32 = muted_on(c, tc(c, style.TOK_FIELD))
+    if s + 1 == (*d).cr_n {
+        col = tc(c, style.TOK_TEXT)
+    }
+    if hot {
+        col = tc(c, style.TOK_TEXT)
+    }
+    var tx: f64 = x + pxl(c, 10)
+    let cy: f64 = round_f(y + h / 2.0)
+    if s > 0 {
+        draw_icon_mid(c, lucide.CHEVRON_RIGHT, x + pxl(c, 2), cy, 12, muted_on(c, tc(c, style.TOK_FIELD)))
+        tx = x + pxl(c, 18)
+    }
+    draw_text_mid(c, crumb_label(d, s), tx, y, x + w - tx - pxl(c, 6), h, col, painter.TEXT_L)
+    render.draw_focus_ring(c, e)
+}
+
+// A focus wish that could not be met when it was made (before the first frame there is no panel; a click on
+// empty space takes the focus away AFTER the handler that wanted to give it): met at the next paint.
+fn apply_pending_focus(d: *mut Dlg) {
+    if (*d).focus_pending != NONE {
+        let fp: usize = (*d).focus_pending
+        (*d).focus_pending = NONE
+        set_focus(d, fp)
+    }
+}
+
+// The bar around the crumbs / the path field: notices a change of width and refits the crumbs.
+fn draw_loc(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let w: f64 = widget.w_w(e)
+    if !(*d).nodes_ready {
+        return
+    }
+    apply_pending_focus(d)
+    let diff: f64 = w - (*d).cr_fit_w
+    if diff > 1.0 || diff < 0.0 - 1.0 {
+        crumbs_update(d)
+    }
+}
+
+fn draw_place(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let n: usize = scene.scene_node_of(sc_of(d), e)
+    let i: usize = place_of_node(d, n)
+    if i == NONE || i >= (*d).pl_n {
+        return
+    }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    let here: bool = place_current(d) == i
+    var col: u32 = tc(c, style.TOK_TEXT)
+    if here {
+        painter.round_rect(z, x, y, w, h, pxl(c, 6), tc(c, style.TOK_BUTTON_ACTIVE))
+        painter.round_rect(z, x + 1.0, y + round_f(h * 0.2), pxl(c, 3), h - 2.0 * round_f(h * 0.2), pxl(c, 2),
+            tc(c, style.TOK_ACCENT))
+    } else {
+        let hot: bool = flat_ground(c, e, pxl(c, 6))
+    }
+    // a thin line above the first recent folder
+    if (*d).pl[i].src == 1 && (i == 0 || (*d).pl[i - 1].src == 0) {
+        painter.surface(z, x + pxl(c, 8), y - 1.0, w - pxl(c, 16), 1.0, tc(c, style.TOK_SEPARATOR))
+    }
+    let cy: f64 = round_f(y + h / 2.0)
+    draw_icon_mid(c, (*d).pl[i].icon, x + pxl(c, 12), cy, ICON_PT, col)
+    let tx: f64 = x + pxl(c, 12) + round_f(pxl(c, ICON_PT)) + pxl(c, 8)
+    draw_text_mid(c, pl_label(d, i), tx, y, x + w - tx - pxl(c, 6), h, col, painter.TEXT_L)
+    render.draw_focus_ring(c, e)
+}
+
+fn draw_filter(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    let r: f64 = pxl(c, 6)
+    var bg: u32 = tc(c, style.TOK_BUTTON)
+    if widget.w_is_disabled(e) {
+        bg = tc(c, style.TOK_BUTTON)
+    } else if widget.w_is_active(e) {
+        bg = tc(c, style.TOK_BUTTON_ACTIVE)
+    } else if widget.w_is_hover(e) {
+        bg = tc(c, style.TOK_BUTTON_HOVER)
+    }
+    painter.round_rect(z, x, y, w, h, r, bg)
+    var col: u32 = tc(c, style.TOK_TEXT)
+    if widget.w_is_disabled(e) {
+        col = tc(c, style.TOK_TEXT_DISABLED)
+    }
+    let side: f64 = round_f(pxl(c, 14))
+    let tx: f64 = x + pxl(c, 12)
+    var lab: str = "All files"
+    if (*d).nfilt > 0 {
+        lab = filter_label_s(d, (*d).fidx)
+    }
+    draw_text_mid(c, lab, tx, y, w - pxl(c, 12) - side - pxl(c, 14), h, col, painter.TEXT_L)
+    draw_icon_mid(c, lucide.CHEVRON_DOWN, x + w - pxl(c, 10) - side, round_f(y + h / 2.0), 14, col)
+    render.draw_focus_ring(c, e)
+}
+
+fn filter_label_s(d: *mut Dlg, k: usize) -> str {
+    return str { p: ((rt.buf_data(&(*d).flabels) as u64) + (*d).f_off[k] as u64) as *mut u8, n: (*d).f_len[k] }
+}
+
+// The status line: quiet text, or the error in the error colour.
+fn draw_status(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    // the OK button follows what is typed in the name field (an entry has no change hook): once a frame
+    let ok: bool = compute_ok(d)
+    if ok != (*d).ok_ready {
+        (*d).ok_ready = ok
+        set_enabled(d, (*d).n_ok, ok)
+        touch(d)
+    }
+    var col: u32 = muted_on(c, tc(c, style.TOK_BASE))
+    if (*d).st_err {
+        col = tc(c, style.TOK_ERROR)
+    }
+    draw_text_mid(c, status_text(d), widget.w_x(e), widget.w_y(e), widget.w_w(e), widget.w_h(e), col,
+        painter.TEXT_L)
+}
+
+fn icon_of_entry(ic: i32) -> i64 {
+    if ic == filemodel.IC_FOLDER { return lucide.FOLDER }
+    if ic == filemodel.IC_FOLDER_LINK { return lucide.FOLDER_OPEN }
+    if ic == filemodel.IC_IMAGE { return lucide.IMAGE }
+    if ic == filemodel.IC_TEXT { return lucide.FILE_TEXT }
+    if ic == filemodel.IC_ARCHIVE { return lucide.PACKAGE }
+    if ic == filemodel.IC_LINK { return lucide.LINK }
+    return lucide.FILE_TEXT
+}
+
+fn sort_label(col: usize) -> str {
+    if col == 1 { return "Size" }
+    if col == 2 { return "Modified" }
+    return "Name"
+}
+
+fn draw_header(d: *mut Dlg, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let hh: f64 = pxl(c, HDR_H)
+    let sbw: f64 = pxl(c, SB_W)
+    // the band
+    painter.surface(z, x + 1.0, y + 1.0, w - 2.0, hh, tc(c, style.TOK_SURFACE))
+    painter.surface(z, x + 1.0, y + 1.0 + hh - 1.0, w - 2.0, 1.0, tc(c, style.TOK_SEPARATOR))
+    let sx: f64 = col_size_x(d)
+    let dx: f64 = col_date_x(d)
+    let right: f64 = x + w - 1.0 - sbw
+    var hot: usize = NONE
+    if widget.w_is_hover(e) {
+        let ap: *mut app.App = (*d).a
+        var ix: usize = NONE
+        if list_hit(d, (*ap).ptr_x, (*ap).ptr_y, &ix) == 1 {
+            hot = ix
+        }
+    }
+    var colx: [f64; 4] = [0.0; 4]
+    colx[0] = x + 1.0
+    colx[1] = sx
+    colx[2] = dx
+    colx[3] = right
+    var i: usize = 0
+    while i < 3 {
+        if i == 2 && dx >= right - 1.0 {
+            break
+        }
+        let cx0: f64 = colx[i]
+        var cx1: f64 = colx[i + 1]
+        if i == 0 { cx1 = sx }
+        if i == 1 { cx1 = dx }
+        if i == 2 { cx1 = right }
+        if hot == i {
+            painter.surface(z, cx0, y + 1.0, cx1 - cx0, hh - 1.0, tc(c, style.TOK_BUTTON_HOVER))
+        }
+        var al: u32 = painter.TEXT_L
+        var tx: f64 = cx0 + pxl(c, 12)
+        var tw: f64 = cx1 - cx0 - pxl(c, 12) - pxl(c, 22)
+        if i == 1 {
+            al = painter.TEXT_R
+            tx = cx0 + pxl(c, 22)
+            tw = cx1 - cx0 - pxl(c, 22) - pxl(c, 12)
+        }
+        var tcol: u32 = muted_on(c, tc(c, style.TOK_SURFACE))
+        if (*d).m.sort_col as usize == i {
+            tcol = tc(c, style.TOK_TEXT)
+        }
+        if hot == i {
+            tcol = tc(c, style.TOK_TEXT)
+        }
+        draw_text_mid(c, sort_label(i), tx, y + 1.0, tw, hh, tcol, al)
+        if (*d).m.sort_col as usize == i {
+            var id: i64 = lucide.ARROW_UP
+            if (*d).m.sort_desc {
+                id = lucide.ARROW_DOWN
+            }
+            let side: f64 = round_f(pxl(c, 12))
+            var ix2: f64 = cx0 + pxl(c, 12) + filemodel_text_w(c, sort_label(i)) + pxl(c, 4)
+            if i == 1 {
+                ix2 = cx0 + pxl(c, 6)
+            }
+            draw_icon_mid(c, id, ix2, round_f(y + 1.0 + hh / 2.0), 12, tc(c, style.TOK_TEXT))
+        }
+        i = i + 1
+    }
+}
+
+fn filemodel_text_w(c: *mut render.Ctx, s: str) -> f64 {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let px: f64 = pxl(c, render.def_font(c))
+    return painter.text_width(z, s.p as u64, s.n, px)
+}
+
+fn draw_rows(d: *mut Dlg, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let m: *mut filemodel.Model = &(*d).m
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    let hh: f64 = pxl(c, HDR_H)
+    let rh: f64 = pxl(c, ROW_H)
+    let sbw: f64 = pxl(c, SB_W)
+    let focus: bool = widget.w_is_focus(e)
+    let body_y: f64 = y + 1.0 + hh
+    let body_h: f64 = h - hh - 2.0
+    let n: usize = filemodel.model_count(m)
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let pushed: bool = canvas.clip_push_rect(cv, x + 1.0, body_y, x + w - 1.0, body_y + body_h)
+    // which row is under the pointer
+    var hover: usize = NONE
+    if widget.w_is_hover(e) && !(*d).confirm {
+        let ap: *mut app.App = (*d).a
+        hover = row_at(d, (*ap).ptr_x, (*ap).ptr_y)
+    }
+    let sx: f64 = col_size_x(d)
+    let dx: f64 = col_date_x(d)
+    let right: f64 = x + w - 1.0 - sbw
+    var first: usize = 0
+    if rh > 0.0 {
+        first = ((*d).scroll / rh) as usize
+    }
+    var k: usize = first
+    var ry: f64 = body_y + (k as f64) * rh - (*d).scroll
+    let pad: f64 = pxl(c, 6)
+    while k < n && ry < body_y + body_h {
+        let ei: usize = filemodel.model_view_ent(m, k)
+        let en: *mut filemodel.Entry = filemodel.model_ent(m, ei)
+        let sel: bool = (*en).sel
+        var bg: u32 = 0 as u32
+        var fg: u32 = tc(c, style.TOK_TEXT)
+        var fg2: u32 = muted_on(c, tc(c, style.TOK_FIELD))
+        if sel {
+            if focus {
+                bg = tc(c, style.TOK_SELECTION)
+                fg = tc(c, style.TOK_SELECTION_TEXT)
+                fg2 = fg
+            } else {
+                bg = tc(c, style.TOK_BUTTON_ACTIVE)
+                fg2 = muted_on(c, bg)
+            }
+        } else if k == hover {
+            bg = tc(c, style.TOK_BUTTON_HOVER)
+            fg2 = muted_on(c, bg)
+        }
+        if bg != (0 as u32) {
+            painter.round_rect(z, x + 1.0 + pad / 2.0, ry + 1.0, w - 2.0 - pad - sbw, rh - 2.0, pxl(c, 5), bg)
+        }
+        if focus && k == (*d).cur {
+            painter.round_ring(z, x + 1.0 + pad / 2.0, ry + 1.0, w - 2.0 - pad - sbw, rh - 2.0, pxl(c, 5), 1.0,
+                tc(c, style.TOK_ACCENT))
+        }
+        let cy: f64 = round_f(ry + rh / 2.0)
+        var icol: u32 = fg
+        if (*en).broken {
+            icol = tc(c, style.TOK_TEXT_DISABLED)
+        } else if (*en).dir && !sel {
+            icol = tc(c, style.TOK_ACCENT)
+        }
+        draw_icon_mid(c, icon_of_entry((*en).icon), x + 1.0 + pad + pxl(c, 4), cy, ICON_PT, icol)
+        let tx: f64 = x + 1.0 + pad + pxl(c, 4) + round_f(pxl(c, ICON_PT)) + pxl(c, 8)
+        var ncol: u32 = fg
+        if (*en).broken {
+            ncol = tc(c, style.TOK_TEXT_DISABLED)
+        }
+        draw_text_mid(c, filemodel.model_name(m, en), tx, ry, sx - tx - pxl(c, 8), rh, ncol, painter.TEXT_L)
+        if !(*en).dir && !(*en).broken {
+            rt.buf_clear(&(*d).scratch)
+            filemodel.fmt_size((*en).size, &(*d).scratch)
+            draw_text_mid(c, filemodel.buf_str(&(*d).scratch), sx, ry, dx - sx - pxl(c, 12), rh, fg2, painter.TEXT_R)
+        }
+        if dx < right - 1.0 && !(*en).broken {
+            rt.buf_clear(&(*d).scratch)
+            filemodel.fmt_date(m, (*en).mtime, &(*d).scratch)
+            draw_text_mid(c, filemodel.buf_str(&(*d).scratch), dx + pxl(c, 16), ry, right - dx - pxl(c, 16), rh, fg2,
+                painter.TEXT_L)
+        }
+        k = k + 1
+        ry = ry + rh
+    }
+    if n == 0 {
+        draw_text_mid(c, "This folder is empty", x + 1.0, body_y, w - 2.0, rh * 2.0, muted_on(c, tc(c, style.TOK_FIELD)),
+            painter.TEXT_M)
+    }
+    if pushed {
+        canvas.clip_pop(cv)
+    }
+    // the scroll bar
+    if sb_visible(d) {
+        var tt: f64 = 0.0
+        var tl: f64 = 0.0
+        sb_thumb(d, &tt, &tl)
+        var tcol: u32 = tint_of(c, tc(c, style.TOK_FIELD), 280)
+        if (*d).drag || (*d).sb_hot {
+            tcol = tint_of(c, tc(c, style.TOK_FIELD), 520)
+        }
+        painter.round_rect(z, x + w - 1.0 - sbw + pxl(c, 2), tt, sbw - pxl(c, 4), tl, (sbw - pxl(c, 4)) / 2.0, tcol)
+    }
+}
+
+fn draw_list(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    let r: f64 = pxl(c, 8)
+    painter.round_rect(z, x, y, w, h, r, tc(c, style.TOK_FIELD))
+    painter.round_ring(z, x, y, w, h, r, 1.0, tc(c, style.TOK_BORDER))
+    if !(*d).nodes_ready {
+        return
+    }
+    apply_pending_focus(d)
+    clamp_scroll(d)
+    draw_header(d, c, e)
+    draw_rows(d, c, e)
+    if (*d).confirm {
+        painter.round_rect(z, x, y, w, h, r, with_alpha(theme.scrim_color(render.ctx_theme(c)), 96 as u32))
+    }
+    render.draw_focus_ring(c, e)
+}
+
+// ============================================================ SELECTION
+
+fn ent_of_view(d: *mut Dlg, k: usize) -> *mut filemodel.Entry {
+    return filemodel.model_ent(&(*d).m, filemodel.model_view_ent(&(*d).m, k))
+}
+
+// The full path of view position `k` appended to `out`.
+fn path_of_view(d: *mut Dlg, k: usize, out: *mut rt.Buf) {
+    let cur: str = filemodel.model_path(&(*d).m)
+    filemodel.push_str(out, cur)
+    if !(cur.n == 1) {
+        rt.buf_push(out, 47 as u8)
+    }
+    filemodel.push_str(out, filemodel.model_name(&(*d).m, ent_of_view(d, k)))
+}
+
+// What the name field shows for the selection: `a.png`, `"a.png" "b.png"`, or nothing.
+fn update_name_from_sel(d: *mut Dlg) {
+    let m: *mut filemodel.Model = &(*d).m
+    if (*d).mode == MODE_SAVE {
+        // only a click on a FILE changes the name to save under
+        return
+    }
+    var b: rt.Buf = rt.buf_new()
+    var cnt: usize = 0
+    var k: usize = 0
+    let n: usize = filemodel.model_count(m)
+    while k < n {
+        let en: *mut filemodel.Entry = ent_of_view(d, k)
+        if (*en).sel {
+            cnt = cnt + 1
+        }
+        k = k + 1
+    }
+    if cnt == 1 {
+        k = 0
+        while k < n {
+            let en2: *mut filemodel.Entry = ent_of_view(d, k)
+            if (*en2).sel {
+                filemodel.push_str(&b, filemodel.model_name(m, en2))
+            }
+            k = k + 1
+        }
+    } else if cnt > 1 {
+        k = 0
+        while k < n {
+            let en3: *mut filemodel.Entry = ent_of_view(d, k)
+            if (*en3).sel {
+                if rt.buf_len(&b) > 0 {
+                    rt.buf_push(&b, 32 as u8)
+                }
+                rt.buf_push(&b, 34 as u8)
+                filemodel.push_str(&b, filemodel.model_name(m, en3))
+                rt.buf_push(&b, 34 as u8)
+            }
+            k = k + 1
+        }
+    }
+    set_name_text(d, filemodel.buf_str(&b))
+    rt.buf_free(&b)
+}
+
+fn after_select(d: *mut Dlg) {
+    if (*d).mode == MODE_FOLDER {
+        update_folder_name(d)
+    } else if (*d).mode == MODE_SAVE {
+        // a click on a FILE chooses its name to save under; a folder leaves the name alone
+        if (*d).cur != NONE && (*d).cur < filemodel.model_count(&(*d).m) {
+            let en: *mut filemodel.Entry = ent_of_view(d, (*d).cur)
+            if (*en).sel && !(*en).dir {
+                set_name_text(d, filemodel.model_name(&(*d).m, en))
+            }
+        }
+    } else {
+        update_name_from_sel(d)
+    }
+    refresh_status(d)
+    sync_ok(d)
+}
+
+fn select_only(d: *mut Dlg, k: usize) {
+    let m: *mut filemodel.Model = &(*d).m
+    filemodel.model_clear_sel(m)
+    if k != NONE && k < filemodel.model_count(m) {
+        (*ent_of_view(d, k)).sel = true
+        (*d).cur = k
+        (*d).anchor = k
+        ensure_visible(d, k)
+    } else {
+        (*d).cur = NONE
+        (*d).anchor = NONE
+    }
+    (*d).ty_len = 0
+    after_select(d)
+}
+
+fn select_range(d: *mut Dlg, a0: usize, b0: usize) {
+    let m: *mut filemodel.Model = &(*d).m
+    filemodel.model_clear_sel(m)
+    var lo: usize = a0
+    var hi: usize = b0
+    if lo > hi {
+        lo = b0
+        hi = a0
+    }
+    var k: usize = lo
+    while k <= hi && k < filemodel.model_count(m) {
+        (*ent_of_view(d, k)).sel = true
+        k = k + 1
+    }
+    after_select(d)
+}
+
+fn select_toggle(d: *mut Dlg, k: usize) {
+    if k >= filemodel.model_count(&(*d).m) {
+        return
+    }
+    let en: *mut filemodel.Entry = ent_of_view(d, k)
+    (*en).sel = !(*en).sel
+    (*d).cur = k
+    (*d).anchor = k
+    after_select(d)
+}
+
+fn select_all(d: *mut Dlg) {
+    if (*d).mode != MODE_OPEN_MANY {
+        return
+    }
+    let m: *mut filemodel.Model = &(*d).m
+    var k: usize = 0
+    while k < filemodel.model_count(m) {
+        (*ent_of_view(d, k)).sel = true
+        k = k + 1
+    }
+    after_select(d)
+}
+
+// ============================================================ NAVIGATION
+
+fn clear_list_state(d: *mut Dlg) {
+    (*d).cur = NONE
+    (*d).anchor = NONE
+    (*d).scroll = 0.0
+    (*d).ty_len = 0
+    (*d).drag = false
+}
+
+// Go to the canonical folder `path`. false (and a red status, nothing changed) when it cannot be read.
+// `keep`: a name to select afterwards (the folder we came from).
+fn nav_to(d: *mut Dlg, path: str, push: bool, keep: str) -> bool {
+    let m: *mut filemodel.Model = &(*d).m
+    var copy: rt.Buf = rt.buf_new()
+    filemodel.push_str(&copy, path)
+    let rc: i32 = filemodel.model_open(m, filemodel.buf_str(&copy))
+    if rc != filemodel.ERR_NONE {
+        set_status2(d, filemodel.errno_text(rc), ": ", true)
+        filemodel.push_str(&(*d).st_buf, filemodel.buf_str(&copy))
+        rt.buf_free(&copy)
+        return false
+    }
+    if push {
+        hist_visit(d, filemodel.buf_str(&copy))
+    }
+    recents_push(d, filemodel.buf_str(&copy))
+    places_apply(d)
+    clear_list_state(d)
+    (*d).confirm = false
+    show_row(d, (*d).n_conf_row, false, 0)
+    show_row(d, (*d).n_bot, true, 0)
+    (*d).path_edit = false
+    crumbs_update(d)
+    app.set_text((*d).a, (*d).n_path, filemodel.buf_str(&copy))
+    sync_nav_buttons(d)
+    if keep.n > 0 {
+        let k: usize = filemodel.model_find_name(m, keep)
+        if k != NONE {
+            filemodel.model_clear_sel(m)
+            (*ent_of_view(d, k)).sel = true
+            (*d).cur = k
+            (*d).anchor = k
+            ensure_visible(d, k)
+        }
+    }
+    if (*d).mode == MODE_FOLDER {
+        update_folder_name(d)
+    } else if (*d).mode != MODE_SAVE {
+        update_name_from_sel(d)
+    }
+    refresh_status(d)
+    sync_ok(d)
+    rt.buf_free(&copy)
+    touch(d)
+    return true
+}
+
+// mode 3: the name field shows the folder that OK would pick.
+fn update_folder_name(d: *mut Dlg) {
+    let m: *mut filemodel.Model = &(*d).m
+    var b: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    var found: bool = false
+    while k < filemodel.model_count(m) {
+        if (*ent_of_view(d, k)).sel {
+            path_of_view(d, k, &b)
+            found = true
+            break
+        }
+        k = k + 1
+    }
+    if !found {
+        filemodel.push_str(&b, filemodel.model_path(m))
+    }
+    set_name_text(d, filemodel.buf_str(&b))
+    rt.buf_free(&b)
+}
+
+fn nav_up(d: *mut Dlg) {
+    let cur: str = filemodel.model_path(&(*d).m)
+    if cur.n <= 1 { return }
+    let pl: usize = filemodel.path_parent_len(cur)
+    var from: rt.Buf = rt.buf_new()
+    let s: usize = filemodel.last_slash(cur)
+    filemodel.push_str(&from, str { p: ((cur.p as u64) + (s + 1) as u64) as *mut u8, n: cur.n - s - 1 })
+    var np: rt.Buf = rt.buf_new()
+    filemodel.push_str(&np, str { p: cur.p, n: pl })
+    let ok: bool = nav_to(d, filemodel.buf_str(&np), true, filemodel.buf_str(&from))
+    rt.buf_free(&from)
+    rt.buf_free(&np)
+}
+
+fn nav_back(d: *mut Dlg) {
+    if !can_back(d) { return }
+    var p: rt.Buf = rt.buf_new()
+    filemodel.push_str(&p, hist_str(d, (*d).h_pos - 1))
+    if nav_to(d, filemodel.buf_str(&p), false, "") {
+        (*d).h_pos = (*d).h_pos - 1
+        sync_nav_buttons(d)
+    }
+    rt.buf_free(&p)
+}
+
+fn nav_forward(d: *mut Dlg) {
+    if !can_forward(d) { return }
+    var p: rt.Buf = rt.buf_new()
+    filemodel.push_str(&p, hist_str(d, (*d).h_pos + 1))
+    if nav_to(d, filemodel.buf_str(&p), false, "") {
+        (*d).h_pos = (*d).h_pos + 1
+        sync_nav_buttons(d)
+    }
+    rt.buf_free(&p)
+}
+
+// Read the open folder again; the selection stays by name, the scroll position stays.
+fn refresh(d: *mut Dlg) {
+    let m: *mut filemodel.Model = &(*d).m
+    var p: rt.Buf = rt.buf_new()
+    filemodel.push_str(&p, filemodel.model_path(m))
+    // remember the selected names
+    var names: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < filemodel.model_count(m) {
+        let en: *mut filemodel.Entry = ent_of_view(d, k)
+        if (*en).sel {
+            filemodel.push_str(&names, filemodel.model_name(m, en))
+            rt.buf_push(&names, 0 as u8)
+        }
+        k = k + 1
+    }
+    let sc: f64 = (*d).scroll
+    let rc: i32 = filemodel.model_open(m, filemodel.buf_str(&p))
+    if rc != filemodel.ERR_NONE {
+        // the folder is gone: climb to the nearest one that is still there
+        var q: rt.Buf = rt.buf_new()
+        filemodel.push_str(&q, filemodel.buf_str(&p))
+        while q.len > 1 {
+            let pl: usize = filemodel.path_parent_len(filemodel.buf_str(&q))
+            rt.buf_set_len(&q, pl)
+            if fs.is_dir(filemodel.buf_str(&q)) {
+                break
+            }
+        }
+        let ok: bool = nav_to(d, filemodel.buf_str(&q), true, "")
+        set_status2(d, "The folder is gone: ", filemodel.buf_str(&p), true)
+        rt.buf_free(&q)
+        rt.buf_free(&p)
+        rt.buf_free(&names)
+        return
+    }
+    // restore the selection
+    var i: usize = 0
+    let nb: str = filemodel.buf_str(&names)
+    while i < nb.n {
+        var j: usize = i
+        while j < nb.n && rt.ld8(nb.p as u64, j) != (0 as u8) {
+            j = j + 1
+        }
+        let kk: usize = filemodel.model_find_name(m, str { p: ((nb.p as u64) + i as u64) as *mut u8, n: j - i })
+        if kk != NONE {
+            (*ent_of_view(d, kk)).sel = true
+            if (*d).cur == NONE { (*d).cur = kk }
+        }
+        i = j + 1
+    }
+    (*d).scroll = sc
+    clamp_scroll(d)
+    (*d).cur = NONE
+    (*d).ty_len = 0
+    refresh_status(d)
+    sync_ok(d)
+    rt.buf_free(&p)
+    rt.buf_free(&names)
+    touch(d)
+}
+
+// ============================================================ SORT / FILTER / HIDDEN
+
+fn rebuild_keep_sel(d: *mut Dlg) {
+    // the cursor follows the entry it stood on
+    let m: *mut filemodel.Model = &(*d).m
+    var curname: rt.Buf = rt.buf_new()
+    if (*d).cur != NONE && (*d).cur < filemodel.model_count(m) {
+        filemodel.push_str(&curname, filemodel.model_name(m, ent_of_view(d, (*d).cur)))
+    }
+    filemodel.model_rebuild(m)
+    (*d).cur = NONE
+    if rt.buf_len(&curname) > 0 {
+        (*d).cur = filemodel.model_find_name(m, filemodel.buf_str(&curname))
+    }
+    (*d).anchor = (*d).cur
+    rt.buf_free(&curname)
+    clamp_scroll(d)
+    if (*d).cur != NONE {
+        ensure_visible(d, (*d).cur)
+    }
+    refresh_status(d)
+    sync_ok(d)
+    touch(d)
+}
+
+// Clicking a header: the same column flips the direction, another one starts ascending.
+fn set_sort(d: *mut Dlg, col: i32) {
+    let m: *mut filemodel.Model = &(*d).m
+    if filemodel.model_sort_col(m) == col {
+        filemodel.model_set_sort(m, col, !filemodel.model_sort_desc(m))
+    } else {
+        filemodel.model_set_sort(m, col, false)
+    }
+    rebuild_keep_sel(d)
+}
+
+fn toggle_hidden(d: *mut Dlg) {
+    let m: *mut filemodel.Model = &(*d).m
+    let on: bool = !filemodel.model_show_hidden(m)
+    filemodel.model_set_hidden(m, on)
+    let e: *mut widget.Widget = wdg(d, (*d).n_hidden)
+    if on {
+        widget.w_set_value(e, 1)
+    } else {
+        widget.w_set_value(e, 0)
+    }
+    widget.w_set_selected(e, on)
+    rebuild_keep_sel(d)
+}
+
+fn set_filter(d: *mut Dlg, k: usize) {
+    if k >= (*d).nfilt { return }
+    (*d).fidx = k
+    filemodel.model_set_filter_index(&(*d).m, k)
+    rebuild_keep_sel(d)
+    update_name_from_sel(d)
+}
+
+// ============================================================ THE NAME FIELD / ACCEPTING
+
+fn append_ext_of_filter(d: *mut Dlg, path: *mut rt.Buf) {
+    if (*d).mode != MODE_SAVE || (*d).nfilt == 0 {
+        return
+    }
+    if filemodel.has_dot_in_name(filemodel.buf_str(path)) {
+        return
+    }
+    let ext: str = filemodel.default_ext(filemodel.filter_pats(filemodel.buf_str(&(*d).filters), (*d).fidx))
+    if ext.n > 0 {
+        filemodel.push_str(path, ext)
+    }
+}
+
+// Why OK is grey: nothing valid is chosen or typed.
+fn compute_ok(d: *mut Dlg) -> bool {
+    if (*d).confirm { return false }
+    let t: str = trim_s(name_text(d))
+    if (*d).mode == MODE_FOLDER {
+        return true
+    }
+    if t.n > 0 {
+        return true
+    }
+    return filemodel.model_sel_count(&(*d).m) > 0
+}
+
+fn sync_ok(d: *mut Dlg) {
+    let ok: bool = compute_ok(d)
+    (*d).ok_ready = ok
+    set_enabled(d, (*d).n_ok, ok)
+    touch(d)
+}
+
+fn finish_chosen(d: *mut Dlg) {
+    (*d).accepted = true
+    (*d).ret = 0
+    (*d).done = true
+    app.quit((*d).a)
+}
+
+fn out_path(d: *mut Dlg, p: str) {
+    let ob: *mut rt.Buf = (*d).out as *mut rt.Buf
+    if (*d).wrote {
+        rt.buf_push(ob, 10 as u8)
+    }
+    (*d).wrote = true
+    filemodel.push_str(ob, p)
+}
+
+fn do_cancel(d: *mut Dlg) {
+    (*d).accepted = false
+    (*d).ret = 1
+    (*d).done = true
+    app.quit((*d).a)
+}
+
+// Accept ONE typed or chosen path `p` (canonical, absolute) for the mode. true when the dialog ends or
+// moved on; false when something is wrong (the status says what).
+fn accept_path(d: *mut Dlg, p: str) -> bool {
+    let info: fs.FileInfo = fs.stat(p) catch fs.FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    let exists: bool = info.kind != (255 as u8)
+    let isdir: bool = exists && info.kind == fs.KIND_DIR
+    if (*d).mode == MODE_FOLDER {
+        if isdir {
+            out_path(d, p)
+            finish_chosen(d)
+            return true
+        }
+        if exists {
+            set_status2(d, "Not a folder: ", p, true)
+        } else {
+            set_status2(d, "No such folder: ", p, true)
+        }
+        return false
+    }
+    if isdir {
+        // a folder typed or chosen: go in
+        let ok: bool = nav_to(d, p, true, "")
+        return ok
+    }
+    if (*d).mode == MODE_SAVE {
+        var q: rt.Buf = rt.buf_new()
+        filemodel.push_str(&q, p)
+        // the default extension of the filter, when the name has no dot
+        if !exists {
+            append_ext_of_filter(d, &q)
+        }
+        var final: str = filemodel.buf_str(&q)
+        let info2: fs.FileInfo = fs.stat(final) catch fs.FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+        if info2.kind != (255 as u8) {
+            if info2.kind == fs.KIND_DIR {
+                let ok2: bool = nav_to(d, final, true, "")
+                rt.buf_free(&q)
+                return ok2
+            }
+            // it exists: ask (in this window)
+            ask_replace(d, final)
+            rt.buf_free(&q)
+            return true
+        }
+        // the folder must exist
+        let pl: usize = filemodel.path_parent_len(final)
+        let parent: str = str { p: final.p, n: pl }
+        if !fs.is_dir(parent) {
+            set_status2(d, "No such folder: ", parent, true)
+            rt.buf_free(&q)
+            return false
+        }
+        out_path(d, final)
+        finish_chosen(d)
+        rt.buf_free(&q)
+        return true
+    }
+    if !exists {
+        set_status2(d, "File not found: ", p, true)
+        return false
+    }
+    out_path(d, p)
+    finish_chosen(d)
+    return true
+}
+
+fn ask_replace(d: *mut Dlg, path: str) {
+    rt.buf_clear(&(*d).conf_path)
+    filemodel.push_str(&(*d).conf_path, path)
+    (*d).confirm = true
+    // the question
+    rt.buf_clear(&(*d).scratch)
+    rt.buf_push(&(*d).scratch, 34 as u8)
+    let nm: usize = filemodel.last_slash(path)
+    filemodel.push_str(&(*d).scratch, str { p: ((path.p as u64) + (nm + 1) as u64) as *mut u8, n: path.n - nm - 1 })
+    filemodel.push_str(&(*d).scratch, "\" already exists. Replace it?")
+    app.set_text((*d).a, (*d).n_conf_text, filemodel.buf_str(&(*d).scratch))
+    show_row(d, (*d).n_conf_row, true, 0)
+    show_row(d, (*d).n_bot, false, 0)
+    // the safe answer has the focus
+    set_focus(d, (*d).n_no)
+    sync_ok(d)
+    set_status(d, "Replacing a file cannot be undone", false)
+    touch(d)
+}
+
+fn answer_replace(d: *mut Dlg, yes: bool) {
+    if !(*d).confirm { return }
+    (*d).confirm = false
+    show_row(d, (*d).n_conf_row, false, 0)
+    show_row(d, (*d).n_bot, true, 0)
+    if yes {
+        out_path(d, filemodel.buf_str(&(*d).conf_path))
+        finish_chosen(d)
+        return
+    }
+    set_focus(d, (*d).n_name)
+    refresh_status(d)
+    sync_ok(d)
+    touch(d)
+}
+
+// Selected view positions, in view order.
+fn selected_count(d: *mut Dlg) -> usize {
+    return filemodel.model_sel_count(&(*d).m)
+}
+
+// Accept what the name field says: one name, or `"a" "b"` in mode 1.
+fn accept_text(d: *mut Dlg) -> bool {
+    let t: str = trim_s(name_text(d))
+    let m: *mut filemodel.Model = &(*d).m
+    let cwd: str = filemodel.model_path(m)
+    let home: str = filemodel.buf_str(&(*d).home)
+    // nothing typed: mode 3 takes the open folder, the others have nothing to take
+    if t.n == 0 {
+        if (*d).mode == MODE_FOLDER {
+            return accept_path(d, cwd)
+        }
+        set_status(d, "Type a name or choose a file", true)
+        return false
+    }
+    if (*d).mode == MODE_OPEN_MANY && rt.ld8(t.p as u64, 0) == (34 as u8) {
+        // "a" "b": every quoted name is one file
+        var i: usize = 0
+        var any: bool = false
+        var bad: bool = false
+        var outs: rt.Buf = rt.buf_new()
+        while i < t.n {
+            while i < t.n && rt.ld8(t.p as u64, i) != (34 as u8) {
+                i = i + 1
+            }
+            if i >= t.n { break }
+            i = i + 1
+            var j: usize = i
+            while j < t.n && rt.ld8(t.p as u64, j) != (34 as u8) {
+                j = j + 1
+            }
+            var full: rt.Buf = rt.buf_new()
+            filemodel.path_resolve(cwd, home, str { p: ((t.p as u64) + i as u64) as *mut u8, n: j - i }, &full)
+            let info: fs.FileInfo = fs.stat(filemodel.buf_str(&full)) catch fs.FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+            if info.kind == (255 as u8) {
+                set_status2(d, "File not found: ", filemodel.buf_str(&full), true)
+                bad = true
+            } else if info.kind != fs.KIND_DIR {
+                if rt.buf_len(&outs) > 0 {
+                    rt.buf_push(&outs, 10 as u8)
+                }
+                filemodel.push_str(&outs, filemodel.buf_str(&full))
+                any = true
+            }
+            rt.buf_free(&full)
+            i = j + 1
+            if bad { break }
+        }
+        if any && !bad {
+            out_path(d, filemodel.buf_str(&outs))
+            rt.buf_free(&outs)
+            finish_chosen(d)
+            return true
+        }
+        rt.buf_free(&outs)
+        return false
+    }
+    var full2: rt.Buf = rt.buf_new()
+    filemodel.path_resolve(cwd, home, t, &full2)
+    let r: bool = accept_path(d, filemodel.buf_str(&full2))
+    rt.buf_free(&full2)
+    return r
+}
+
+// OK (button, Enter): the selection if the field still shows it, else the typed text.
+fn do_ok(d: *mut Dlg) {
+    if (*d).confirm { return }
+    if !compute_ok(d) {
+        set_status(d, "Choose a file or type a name first", true)
+        return
+    }
+    let m: *mut filemodel.Model = &(*d).m
+    let gen: bool = name_is_generated(d)
+    if gen && (*d).mode != MODE_SAVE {
+        let cnt: usize = selected_count(d)
+        if (*d).mode == MODE_FOLDER {
+            // a marked folder, else the open one
+            accept_folder_sel(d)
+            return
+        }
+        if cnt > 0 {
+            // folders alone: go in; otherwise the files
+            var files: usize = 0
+            var k: usize = 0
+            while k < filemodel.model_count(m) {
+                let en: *mut filemodel.Entry = ent_of_view(d, k)
+                if (*en).sel && !(*en).dir {
+                    files = files + 1
+                }
+                k = k + 1
+            }
+            if files == 0 {
+                // one folder: enter it
+                k = 0
+                while k < filemodel.model_count(m) {
+                    if (*ent_of_view(d, k)).sel {
+                        activate_row(d, k)
+                        return
+                    }
+                    k = k + 1
+                }
+                return
+            }
+            k = 0
+            var outs: rt.Buf = rt.buf_new()
+            var first: bool = true
+            while k < filemodel.model_count(m) {
+                let en2: *mut filemodel.Entry = ent_of_view(d, k)
+                if (*en2).sel && !(*en2).dir {
+                    if !first {
+                        rt.buf_push(&outs, 10 as u8)
+                    }
+                    first = false
+                    path_of_view(d, k, &outs)
+                }
+                k = k + 1
+            }
+            if (*d).mode == MODE_OPEN {
+                // only the first when several are marked by mistake
+                var cut: usize = 0
+                let os: str = filemodel.buf_str(&outs)
+                while cut < os.n && rt.ld8(os.p as u64, cut) != (10 as u8) {
+                    cut = cut + 1
+                }
+                rt.buf_set_len(&outs, cut)
+            }
+            out_path(d, filemodel.buf_str(&outs))
+            rt.buf_free(&outs)
+            finish_chosen(d)
+            return
+        }
+    }
+    let ok: bool = accept_text(d)
+}
+
+fn accept_folder_sel(d: *mut Dlg) {
+    let m: *mut filemodel.Model = &(*d).m
+    var k: usize = 0
+    while k < filemodel.model_count(m) {
+        if (*ent_of_view(d, k)).sel {
+            var b: rt.Buf = rt.buf_new()
+            path_of_view(d, k, &b)
+            out_path(d, filemodel.buf_str(&b))
+            rt.buf_free(&b)
+            finish_chosen(d)
+            return
+        }
+        k = k + 1
+    }
+    out_path(d, filemodel.model_path(m))
+    finish_chosen(d)
+}
+
+// Double click / Enter on a row: a folder opens, a file is accepted.
+fn activate_row(d: *mut Dlg, k: usize) {
+    if k >= filemodel.model_count(&(*d).m) { return }
+    let en: *mut filemodel.Entry = ent_of_view(d, k)
+    var b: rt.Buf = rt.buf_new()
+    path_of_view(d, k, &b)
+    if (*en).dir {
+        let ok: bool = nav_to(d, filemodel.buf_str(&b), true, "")
+        rt.buf_free(&b)
+        return
+    }
+    if (*en).broken {
+        set_status2(d, "Broken link: ", filemodel.buf_str(&b), true)
+        rt.buf_free(&b)
+        return
+    }
+    // a file: choose exactly this one
+    if (*d).mode == MODE_FOLDER {
+        rt.buf_free(&b)
+        return
+    }
+    filemodel.model_clear_sel(&(*d).m)
+    (*en).sel = true
+    (*d).cur = k
+    if (*d).mode == MODE_SAVE {
+        set_name_text(d, filemodel.model_name(&(*d).m, en))
+    } else {
+        update_name_from_sel(d)
+    }
+    refresh_status(d)
+    sync_ok(d)
+    rt.buf_free(&b)
+    do_ok(d)
+}
+
+// ============================================================ NEW FOLDER
+
+fn open_newfolder(d: *mut Dlg) {
+    if (*d).nf_open { return }
+    (*d).nf_open = true
+    show_row(d, (*d).n_nf_row, true, GAP)
+    app.set_text((*d).a, (*d).n_nf_entry, "New folder")
+    select_all_text(d, (*d).n_nf_entry)
+    set_focus(d, (*d).n_nf_entry)
+    touch(d)
+}
+
+fn close_newfolder(d: *mut Dlg) {
+    if !(*d).nf_open { return }
+    (*d).nf_open = false
+    show_row(d, (*d).n_nf_row, false, 0)
+    set_focus(d, (*d).n_list)
+    touch(d)
+}
+
+fn create_folder(d: *mut Dlg) {
+    let nm: str = trim_s(app.text((*d).a, (*d).n_nf_entry))
+    if nm.n == 0 {
+        set_status(d, "Type a name for the new folder", true)
+        return
+    }
+    var bad: bool = nm.n > 255
+    var i: usize = 0
+    while i < nm.n {
+        if rt.ld8(nm.p as u64, i) == (47 as u8) {
+            bad = true
+        }
+        i = i + 1
+    }
+    if bad || filemodel.str_eq(nm, ".") || filemodel.str_eq(nm, "..") {
+        set_status(d, "That is not a valid folder name", true)
+        return
+    }
+    var full: rt.Buf = rt.buf_new()
+    let cur: str = filemodel.model_path(&(*d).m)
+    filemodel.push_str(&full, cur)
+    if cur.n != 1 {
+        rt.buf_push(&full, 47 as u8)
+    }
+    filemodel.push_str(&full, nm)
+    var err: i32 = 0
+    let r: bool = fs.mkdir(filemodel.buf_str(&full)) catch | e | (err_code(e, &err))
+    if err == 0 {
+        close_newfolder(d)
+        var keep: rt.Buf = rt.buf_new()
+        filemodel.push_str(&keep, nm)
+        refresh(d)
+        let k: usize = filemodel.model_find_name(&(*d).m, filemodel.buf_str(&keep))
+        if k != NONE {
+            select_only(d, k)
+        }
+        rt.buf_free(&keep)
+        set_status2(d, "Folder created: ", nm, false)
+    } else if err == 1 {
+        set_status2(d, "A file or folder named this already exists: ", nm, true)
+    } else if err == 2 {
+        set_status(d, "Permission denied: cannot create a folder here", true)
+    } else {
+        set_status2(d, "Cannot create the folder: ", nm, true)
+    }
+    rt.buf_free(&full)
+}
+
+fn err_code(e: FsError, out: *mut i32) -> bool {
+    *out = 3
+    if e == FsError::Exists { *out = 1 }
+    if e == FsError::Permission { *out = 2 }
+    return false
+}
+
+// ============================================================ PATH FIELD
+
+// Select everything in the text field of node `n` (like Ctrl+A in it).
+fn select_all_text(d: *mut Dlg, n: usize) {
+    let a: *mut app.App = (*d).a
+    var k: usize = 0
+    while k < (*a).n_ed {
+        if (*a).ed_node[k] == n {
+            let r: u32 = editor.editor_char(&(*a).ed[k], 97 as u32, editor.MOD_CTRL)
+        }
+        k = k + 1
+    }
+}
+
+fn start_path_edit(d: *mut Dlg) {
+    if (*d).path_edit { return }
+    (*d).path_edit = true
+    app.set_text((*d).a, (*d).n_path, filemodel.model_path(&(*d).m))
+    select_all_text(d, (*d).n_path)
+    crumbs_update(d)
+    set_focus(d, (*d).n_path)
+    (*d).focus_pending = (*d).n_path
+    touch(d)
+}
+
+fn end_path_edit(d: *mut Dlg) {
+    if !(*d).path_edit { return }
+    (*d).path_edit = false
+    crumbs_update(d)
+    touch(d)
+}
+
+// Enter in the path field: a folder -> go there; a file -> its folder, the file selected; else red.
+fn commit_path(d: *mut Dlg) {
+    let t: str = trim_s(app.text((*d).a, (*d).n_path))
+    if t.n == 0 {
+        end_path_edit(d)
+        return
+    }
+    var full: rt.Buf = rt.buf_new()
+    filemodel.path_resolve(filemodel.model_path(&(*d).m), filemodel.buf_str(&(*d).home), t, &full)
+    let p: str = filemodel.buf_str(&full)
+    let info: fs.FileInfo = fs.stat(p) catch fs.FileInfo { kind: 255 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    if info.kind == (255 as u8) {
+        let en: i64 = fs.last_errno()
+        if en == 13 {
+            set_status2(d, "Permission denied: ", p, true)
+        } else {
+            set_status2(d, "No such file or folder: ", p, true)
+        }
+        rt.buf_free(&full)
+        return
+    }
+    if info.kind == fs.KIND_DIR {
+        if nav_to(d, p, true, "") {
+            set_focus(d, (*d).n_list)
+        }
+    } else {
+        let pl: usize = filemodel.path_parent_len(p)
+        let parent: str = str { p: p.p, n: pl }
+        let nm: str = str { p: ((p.p as u64) + (filemodel.last_slash(p) + 1) as u64) as *mut u8, n: p.n - filemodel.last_slash(p) - 1 }
+        if nav_to(d, parent, true, nm) {
+            set_focus(d, (*d).n_list)
+        }
+    }
+    rt.buf_free(&full)
+}
+
+// ============================================================ FOCUS / TAB ORDER
+
+fn set_focus(d: *mut Dlg, n: usize) {
+    let pn: *mut control.Panel = fuiwirt.host_panel(app.app_host((*d).a))
+    let ch: u32 = control.panel_set_focus(pn, n)
+    touch(d)
+}
+
+fn focus_of(d: *mut Dlg) -> usize {
+    return app.focus((*d).a)
+}
+
+fn is_crumb(d: *mut Dlg, n: usize) -> bool {
+    return crumb_slot(d, n) != NONE
+}
+
+fn is_place(d: *mut Dlg, n: usize) -> bool {
+    return place_of_node(d, n) != NONE
+}
+
+// The Tab stops in order. A group (the crumbs, the places) is ONE stop; the arrow keys move inside it.
+fn tab_stops(d: *mut Dlg, out: *mut [usize; 24]) -> usize {
+    var n: usize = 0
+    if (*d).confirm {
+        (*out)[0] = (*d).n_yes
+        (*out)[1] = (*d).n_no
+        return 2
+    }
+    if is_enabled(d, (*d).n_back) { (*out)[n] = (*d).n_back; n = n + 1 }
+    if is_enabled(d, (*d).n_fwd) { (*out)[n] = (*d).n_fwd; n = n + 1 }
+    if is_enabled(d, (*d).n_up) { (*out)[n] = (*d).n_up; n = n + 1 }
+    (*out)[n] = (*d).n_ref
+    n = n + 1
+    if (*d).path_edit {
+        (*out)[n] = (*d).n_path
+    } else {
+        (*out)[n] = (*d).n_crumb[(*d).cr_n - 1]
+    }
+    n = n + 1
+    (*out)[n] = (*d).n_newf
+    n = n + 1
+    if (*d).nf_open {
+        (*out)[n] = (*d).n_nf_entry
+        n = n + 1
+        (*out)[n] = (*d).n_nf_ok
+        n = n + 1
+        (*out)[n] = (*d).n_nf_cancel
+        n = n + 1
+    }
+    var pc: usize = place_current(d)
+    if pc == NONE { pc = 0 }
+    (*out)[n] = (*d).n_place[pc]
+    n = n + 1
+    (*out)[n] = (*d).n_list
+    n = n + 1
+    (*out)[n] = (*d).n_name
+    n = n + 1
+    (*out)[n] = (*d).n_filter
+    n = n + 1
+    (*out)[n] = (*d).n_hidden
+    n = n + 1
+    if is_enabled(d, (*d).n_ok) {
+        (*out)[n] = (*d).n_ok
+        n = n + 1
+    }
+    (*out)[n] = (*d).n_cancel
+    n = n + 1
+    return n
+}
+
+// The stop that holds node `f` (a crumb is the crumbs' stop, a place the places' stop).
+fn stop_of(d: *mut Dlg, stops: *mut [usize; 24], n: usize, f: usize) -> usize {
+    var i: usize = 0
+    while i < n {
+        let s: usize = (*stops)[i]
+        if s == f {
+            return i
+        }
+        if is_crumb(d, f) && is_crumb(d, s) {
+            return i
+        }
+        if is_place(d, f) && is_place(d, s) {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn tab_move(d: *mut Dlg, back: bool) {
+    var stops: [usize; 24] = [0; 24]
+    let n: usize = tab_stops(d, &stops)
+    if n == 0 { return }
+    let f: usize = focus_of(d)
+    var i: usize = NONE
+    if f != NONE {
+        i = stop_of(d, &stops, n, f)
+    }
+    var t: usize = 0
+    if i == NONE {
+        if back {
+            t = n - 1
+        } else {
+            t = 0
+        }
+    } else if back {
+        if i == 0 { t = n - 1 } else { t = i - 1 }
+    } else {
+        t = i + 1
+        if t >= n { t = 0 }
+    }
+    if (*d).path_edit && f == (*d).n_path && stops[t] != (*d).n_path {
+        end_path_edit(d)
+        // the stop list changed: the crumbs are back
+        var again: [usize; 24] = [0; 24]
+        let n2: usize = tab_stops(d, &again)
+        if t < n2 {
+            set_focus(d, again[t])
+            return
+        }
+    }
+    set_focus(d, stops[t])
+}
+
+// ============================================================ KEYBOARD
+
+fn move_cursor(d: *mut Dlg, to: usize, mods: u32) {
+    let n: usize = filemodel.model_count(&(*d).m)
+    if n == 0 { return }
+    var t: usize = to
+    if t >= n { t = n - 1 }
+    let shift: bool = mods_has(mods, editor.MOD_SHIFT)
+    let ctrl: bool = mods_has(mods, editor.MOD_CTRL)
+    if (*d).mode == MODE_OPEN_MANY && shift {
+        var a0: usize = (*d).anchor
+        if a0 == NONE { a0 = t }
+        (*d).cur = t
+        select_range(d, a0, t)
+        ensure_visible(d, t)
+    } else if (*d).mode == MODE_OPEN_MANY && ctrl {
+        // the cursor moves, the marks stay
+        (*d).cur = t
+        ensure_visible(d, t)
+    } else {
+        select_only(d, t)
+    }
+    touch(d)
+}
+
+fn list_key(d: *mut Dlg, key: u32, mods: u32) -> bool {
+    let n: usize = filemodel.model_count(&(*d).m)
+    let cur: usize = (*d).cur
+    let page: usize = list_rows_visible(d) - 1
+    if key == editor.KEY_UP {
+        if n == 0 { return true }
+        if cur == NONE { move_cursor(d, n - 1, mods) } else if cur > 0 { move_cursor(d, cur - 1, mods) } else { move_cursor(d, 0, mods) }
+        return true
+    }
+    if key == editor.KEY_DOWN {
+        if n == 0 { return true }
+        if cur == NONE { move_cursor(d, 0, mods) } else { move_cursor(d, cur + 1, mods) }
+        return true
+    }
+    if key == editor.KEY_HOME {
+        move_cursor(d, 0, mods)
+        return true
+    }
+    if key == editor.KEY_END {
+        if n > 0 { move_cursor(d, n - 1, mods) }
+        return true
+    }
+    if key == editor.KEY_PGUP {
+        if cur == NONE { move_cursor(d, 0, mods) } else if cur > page { move_cursor(d, cur - page, mods) } else { move_cursor(d, 0, mods) }
+        return true
+    }
+    if key == editor.KEY_PGDN {
+        if cur == NONE { move_cursor(d, page, mods) } else { move_cursor(d, cur + page, mods) }
+        return true
+    }
+    if key == editor.KEY_ENTER {
+        if (*d).mode == MODE_OPEN_MANY && selected_count(d) > 1 {
+            do_ok(d)
+        } else if cur != NONE {
+            activate_row(d, cur)
+        } else {
+            do_ok(d)
+        }
+        return true
+    }
+    if key == editor.KEY_BACKSPACE {
+        nav_up(d)
+        return true
+    }
+    return false
+}
+
+fn group_move(d: *mut Dlg, f: usize, key: u32) -> bool {
+    if is_place(d, f) {
+        let i: usize = place_of_node(d, f)
+        if key == editor.KEY_UP && i > 0 { set_focus(d, (*d).n_place[i - 1]) }
+        if key == editor.KEY_DOWN && i + 1 < (*d).pl_n { set_focus(d, (*d).n_place[i + 1]) }
+        return key == editor.KEY_UP || key == editor.KEY_DOWN
+    }
+    if is_crumb(d, f) {
+        let i: usize = crumb_slot(d, f)
+        if key == editor.KEY_LEFT && i > 0 { set_focus(d, (*d).n_crumb[i - 1]) }
+        if key == editor.KEY_RIGHT && i + 1 < (*d).cr_n { set_focus(d, (*d).n_crumb[i + 1]) }
+        return key == editor.KEY_LEFT || key == editor.KEY_RIGHT
+    }
+    return false
+}
+
+fn on_key(ud: u64, key: u32, mods: u32) -> bool {
+    let d: *mut Dlg = ud as *mut Dlg
+    let f: usize = focus_of(d)
+    let alt: bool = mods_has(mods, editor.MOD_ALT)
+    // ---- Esc closes the innermost thing
+    if key == editor.KEY_ESC {
+        if (*d).confirm {
+            answer_replace(d, false)
+        } else if (*d).nf_open {
+            close_newfolder(d)
+        } else if (*d).path_edit {
+            end_path_edit(d)
+            set_focus(d, (*d).n_list)
+        } else {
+            do_cancel(d)
+        }
+        return true
+    }
+    if key == editor.KEY_TAB {
+        tab_move(d, mods_has(mods, editor.MOD_SHIFT))
+        return true
+    }
+    if (*d).confirm {
+        // modal: only Enter / arrows on the two answers
+        if key == editor.KEY_ENTER {
+            if f == (*d).n_yes { answer_replace(d, true) } else { answer_replace(d, false) }
+            return true
+        }
+        if key == editor.KEY_LEFT && f == (*d).n_no {
+            set_focus(d, (*d).n_yes)
+        }
+        if key == editor.KEY_RIGHT && f == (*d).n_yes {
+            set_focus(d, (*d).n_no)
+        }
+        return true
+    }
+    if alt {
+        if key == editor.KEY_LEFT { nav_back(d); return true }
+        if key == editor.KEY_RIGHT { nav_forward(d); return true }
+        if key == editor.KEY_UP { nav_up(d); return true }
+    }
+    if key == app.KEYX_F5 {
+        refresh(d)
+        return true
+    }
+    if f == (*d).n_path {
+        if key == editor.KEY_ENTER {
+            commit_path(d)
+            return true
+        }
+        return false
+    }
+    if f == (*d).n_nf_entry {
+        if key == editor.KEY_ENTER {
+            create_folder(d)
+            return true
+        }
+        return false
+    }
+    if f == (*d).n_name {
+        if key == editor.KEY_ENTER {
+            do_ok(d)
+            return true
+        }
+        return false
+    }
+    if f == (*d).n_list {
+        return list_key(d, key, mods)
+    }
+    if f != NONE && (is_place(d, f) || is_crumb(d, f)) {
+        if group_move(d, f, key) {
+            return true
+        }
+        if key == editor.KEY_BACKSPACE {
+            nav_up(d)
+            return true
+        }
+        return false
+    }
+    if key == editor.KEY_ENTER {
+        if f == NONE {
+            do_ok(d)
+            return true
+        }
+        // a button: the host presses it
+        return false
+    }
+    return false
+}
+
+fn utf8_push(b: *mut u8, at: usize, cp: u32) -> usize {
+    if cp < (128 as u32) {
+        *(((b as u64) + at as u64) as *mut u8) = cp as u8
+        return 1
+    }
+    if cp < (2048 as u32) {
+        *(((b as u64) + at as u64) as *mut u8) = (192 as u32 | (cp >> 6)) as u8
+        *(((b as u64) + at as u64 + 1) as *mut u8) = (128 as u32 | (cp & (63 as u32))) as u8
+        return 2
+    }
+    if cp < (65536 as u32) {
+        *(((b as u64) + at as u64) as *mut u8) = (224 as u32 | (cp >> 12)) as u8
+        *(((b as u64) + at as u64 + 1) as *mut u8) = (128 as u32 | ((cp >> 6) & (63 as u32))) as u8
+        *(((b as u64) + at as u64 + 2) as *mut u8) = (128 as u32 | (cp & (63 as u32))) as u8
+        return 3
+    }
+    *(((b as u64) + at as u64) as *mut u8) = (240 as u32 | (cp >> 18)) as u8
+    *(((b as u64) + at as u64 + 1) as *mut u8) = (128 as u32 | ((cp >> 12) & (63 as u32))) as u8
+    *(((b as u64) + at as u64 + 2) as *mut u8) = (128 as u32 | ((cp >> 6) & (63 as u32))) as u8
+    *(((b as u64) + at as u64 + 3) as *mut u8) = (128 as u32 | (cp & (63 as u32))) as u8
+    return 4
+}
+
+// Type-to-find: the letters typed within a second of each other are a prefix; the cursor goes to the
+// next entry that starts with it (a single repeated letter cycles through the entries).
+fn type_char(d: *mut Dlg, cp: u32) {
+    let now: i64 = clock(d)
+    if now - (*d).ty_ms > TY_RESET_MS {
+        (*d).ty_len = 0
+    }
+    (*d).ty_ms = now
+    var need: usize = 4
+    if (*d).ty_len + need > TY_CAP {
+        (*d).ty_len = 0
+    }
+    let w: usize = utf8_push((&(*d).ty_buf[0]) as *mut u8, (*d).ty_len, cp)
+    (*d).ty_len = (*d).ty_len + w
+    let m: *mut filemodel.Model = &(*d).m
+    let n: usize = filemodel.model_count(m)
+    var from: usize = 0
+    if (*d).cur != NONE {
+        from = (*d).cur
+        if (*d).ty_len == w {
+            from = from + 1
+        }
+    }
+    if n > 0 && from >= n { from = 0 }
+    let pre: str = str { p: (&(*d).ty_buf[0]) as *mut u8, n: (*d).ty_len }
+    var k: usize = filemodel.model_find_prefix(m, pre, from)
+    // the same letter twice in a row: the buffer would never match "aa" -> cycle on the letter
+    if k == NONE && (*d).ty_len == 2 * w {
+        let one: str = str { p: (&(*d).ty_buf[0]) as *mut u8, n: w }
+        let second: str = str { p: (&(*d).ty_buf[w]) as *mut u8, n: w }
+        if filemodel.str_eq(one, second) {
+            (*d).ty_len = w
+            var from2: usize = 0
+            if (*d).cur != NONE { from2 = (*d).cur + 1 }
+            if n > 0 && from2 >= n { from2 = 0 }
+            k = filemodel.model_find_prefix(m, one, from2)
+        }
+    }
+    if k != NONE {
+        // select_only() ends a search; this one goes on with the next letter
+        let keep_len: usize = (*d).ty_len
+        select_only(d, k)
+        (*d).ty_len = keep_len
+    }
+    refresh_status(d)
+}
+
+fn on_char(ud: u64, cp: u32, mods: u32) -> bool {
+    let d: *mut Dlg = ud as *mut Dlg
+    let f: usize = focus_of(d)
+    let ctrl: bool = mods_has(mods, editor.MOD_CTRL)
+    let alt: bool = mods_has(mods, editor.MOD_ALT)
+    var lo: u32 = cp
+    if cp >= (65 as u32) && cp <= (90 as u32) {
+        lo = cp + (32 as u32)
+    }
+    if (*d).confirm {
+        if !ctrl && !alt {
+            if lo == (121 as u32) { answer_replace(d, true) }
+            if lo == (110 as u32) { answer_replace(d, false) }
+        }
+        return true
+    }
+    if ctrl && lo == (108 as u32) {
+        start_path_edit(d)
+        return true
+    }
+    if ctrl && lo == (104 as u32) {
+        toggle_hidden(d)
+        return true
+    }
+    if ctrl && lo == (97 as u32) && f == (*d).n_list {
+        select_all(d)
+        return true
+    }
+    if ctrl && lo == (110 as u32) {
+        open_newfolder(d)
+        return true
+    }
+    if ctrl || alt {
+        return false
+    }
+    if f == (*d).n_list {
+        if cp == (32 as u32) && (*d).ty_len == 0 {
+            // the space bar marks the row in a multiple choice; nothing otherwise
+            if (*d).mode == MODE_OPEN_MANY && (*d).cur != NONE {
+                select_toggle(d, (*d).cur)
+            }
+            return true
+        }
+        if cp >= (32 as u32) {
+            type_char(d, cp)
+            return true
+        }
+    }
+    return false
+}
+
+// ============================================================ POINTER
+
+fn on_list_pointer(ud: u64, e: *mut event.Ev) -> u32 {
+    let a: *mut app.App = ud as *mut app.App
+    let d: *mut Dlg = dlg_of(a)
+    let kind: u32 = event.ev_kind(e)
+    let x: f64 = event.ev_x(e)
+    let y: f64 = event.ev_y(e)
+    if (*d).confirm {
+        return event.H_GO
+    }
+    if kind == event.EV_POINTER_DOWN {
+        var idx: usize = NONE
+        let z: i32 = list_hit(d, x, y, &idx)
+        if z == 3 {
+            var tt: f64 = 0.0
+            var tl: f64 = 0.0
+            sb_thumb(d, &tt, &tl)
+            if y >= tt && y < tt + tl {
+                (*d).drag = true
+                (*d).drag_dy = y - tt
+                let ok: bool = event.ev_set_capture(&(*a).rt, &(*a).sc, event.ev_pid(e), (*d).n_list)
+            } else if y < tt {
+                scroll_to(d, (*d).scroll - list_body_h(d))
+            } else {
+                scroll_to(d, (*d).scroll + list_body_h(d))
+            }
+            touch(d)
+            return event.H_GO
+        }
+        if z == 2 {
+            if idx == NONE {
+                // the empty part under the last row
+                if !mods_has(fuiwirt.host_mods(&(*a).w), editor.MOD_CTRL) {
+                    select_only(d, NONE)
+                }
+                return event.H_GO
+            }
+            let mods: u32 = fuiwirt.host_mods(&(*a).w)
+            if (*d).mode == MODE_OPEN_MANY && mods_has(mods, editor.MOD_SHIFT) {
+                var a0: usize = (*d).anchor
+                if a0 == NONE { a0 = idx }
+                (*d).cur = idx
+                select_range(d, a0, idx)
+            } else if (*d).mode == MODE_OPEN_MANY && mods_has(mods, editor.MOD_CTRL) {
+                select_toggle(d, idx)
+            } else {
+                select_only(d, idx)
+            }
+            touch(d)
+        }
+        return event.H_GO
+    }
+    if kind == event.EV_POINTER_MOVE {
+        if (*d).drag {
+            var tt2: f64 = 0.0
+            var tl2: f64 = 0.0
+            sb_thumb(d, &tt2, &tl2)
+            let bh: f64 = list_body_h(d)
+            let track0: f64 = list_y(d) + 1.0 + list_header_h(d)
+            let span: f64 = bh - tl2
+            if span > 0.0 {
+                var f: f64 = (y - (*d).drag_dy - track0) / span
+                if f < 0.0 { f = 0.0 }
+                if f > 1.0 { f = 1.0 }
+                (*d).scroll = f * list_max_scroll(d)
+                touch(d)
+            }
+            return event.H_GO
+        }
+        var idx2: usize = NONE
+        let z2: i32 = list_hit(d, x, y, &idx2)
+        let hot: bool = z2 == 3
+        if hot != (*d).sb_hot {
+            (*d).sb_hot = hot
+        }
+        touch(d)
+        return event.H_GO
+    }
+    if kind == event.EV_POINTER_UP || kind == event.EV_POINTER_CANCEL {
+        if (*d).drag {
+            (*d).drag = false
+            let ok2: bool = event.ev_release_capture(&(*a).rt, event.ev_pid(e))
+            touch(d)
+        }
+        return event.H_GO
+    }
+    if kind == event.EV_TAP {
+        var idx3: usize = NONE
+        let z3: i32 = list_hit(d, x, y, &idx3)
+        if z3 == 1 {
+            set_sort(d, idx3 as i32)
+        }
+        return event.H_GO
+    }
+    if kind == event.EV_DOUBLE_TAP {
+        var idx4: usize = NONE
+        let z4: i32 = list_hit(d, x, y, &idx4)
+        if z4 == 2 && idx4 != NONE {
+            activate_row(d, idx4)
+        }
+        return event.H_GO
+    }
+    return event.H_GO
+}
+
+// A click on the free part of the place bar turns it into the path field.
+fn on_loc_pointer(ud: u64, e: *mut event.Ev) -> u32 {
+    let a: *mut app.App = ud as *mut app.App
+    let d: *mut Dlg = dlg_of(a)
+    if event.ev_kind(e) == event.EV_POINTER_DOWN && event.ev_target(e) == (*d).n_loc && !(*d).confirm {
+        start_path_edit(d)
+    }
+    return event.H_GO
+}
+
+// Any press outside the path field ends editing it.
+fn on_root_pointer(ud: u64, e: *mut event.Ev) -> u32 {
+    let a: *mut app.App = ud as *mut app.App
+    let d: *mut Dlg = dlg_of(a)
+    if event.ev_kind(e) == event.EV_POINTER_DOWN && (*d).path_edit
+    && event.ev_target(e) != (*d).n_path && event.ev_target(e) != (*d).n_loc {
+        end_path_edit(d)
+    }
+    return event.H_GO
+}
+
+// The pointer moved: the hovered row, header column or scroll bar of the list is part of its picture, but no
+// widget changed (the list is one node), so nobody would paint: say so when the thing under the pointer changed.
+fn hover_key(d: *mut Dlg, x: f64, y: f64) -> usize {
+    var idx: usize = NONE
+    let z: i32 = list_hit(d, x, y, &idx)
+    if z == 0 {
+        return NONE
+    }
+    if idx == NONE {
+        return (z as usize) * 100000000
+    }
+    return (z as usize) * 100000000 + idx + 1
+}
+
+fn on_motion(ud: u64, kind: u32, x: f64, y: f64) -> bool {
+    let d: *mut Dlg = ud as *mut Dlg
+    var key: usize = NONE
+    if kind != fuiwirt.HOOK_LEAVE {
+        key = hover_key(d, x, y)
+    }
+    if key != (*d).hover_key {
+        (*d).hover_key = key
+        return true
+    }
+    return false
+}
+
+fn on_wheel(ud: u64, x: f64, y: f64, nx: f64, ny: f64) -> bool {
+    let d: *mut Dlg = ud as *mut Dlg
+    if (*d).confirm { return false }
+    var idx: usize = NONE
+    let z: i32 = list_hit(d, x, y, &idx)
+    if z == 0 {
+        return false
+    }
+    let before: f64 = (*d).scroll
+    scroll_to(d, (*d).scroll + ny * 3.0 * list_row_h(d))
+    return (*d).scroll != before
+}
+
+// ============================================================ BUTTON CALLBACKS
+
+fn cb_back(a: *mut app.App) { nav_back(dlg_of(a)) }
+fn cb_fwd(a: *mut app.App) { nav_forward(dlg_of(a)) }
+fn cb_up(a: *mut app.App) { nav_up(dlg_of(a)) }
+fn cb_ref(a: *mut app.App) { refresh(dlg_of(a)) }
+fn cb_newf(a: *mut app.App) {
+    let d: *mut Dlg = dlg_of(a)
+    if (*d).nf_open { close_newfolder(d) } else { open_newfolder(d) }
+}
+fn cb_ok(a: *mut app.App) { do_ok(dlg_of(a)) }
+fn cb_cancel(a: *mut app.App) { do_cancel(dlg_of(a)) }
+fn cb_yes(a: *mut app.App) { answer_replace(dlg_of(a), true) }
+fn cb_no(a: *mut app.App) { answer_replace(dlg_of(a), false) }
+fn cb_nf_ok(a: *mut app.App) { create_folder(dlg_of(a)) }
+fn cb_nf_cancel(a: *mut app.App) { close_newfolder(dlg_of(a)) }
+fn cb_hidden(a: *mut app.App) {
+    let d: *mut Dlg = dlg_of(a)
+    // the checkbox flipped itself; make the model follow its state
+    let on: bool = widget.w_value(wdg(d, (*d).n_hidden)) != 0
+    if on != filemodel.model_show_hidden(&(*d).m) {
+        filemodel.model_set_hidden(&(*d).m, on)
+        rebuild_keep_sel(d)
+    }
+}
+
+fn cb_crumb(a: *mut app.App) {
+    let d: *mut Dlg = dlg_of(a)
+    let s: usize = crumb_slot(d, focus_of(d))
+    if s == NONE || s >= (*d).cr_n { return }
+    var p: rt.Buf = rt.buf_new()
+    filemodel.push_str(&p, crumb_target(d, s))
+    // the folder we leave is selected in the parent, like "Up"
+    let ok: bool = nav_to(d, filemodel.buf_str(&p), true, "")
+    rt.buf_free(&p)
+}
+
+fn cb_place(a: *mut app.App) {
+    let d: *mut Dlg = dlg_of(a)
+    let i: usize = place_of_node(d, focus_of(d))
+    if i == NONE || i >= (*d).pl_n { return }
+    var p: rt.Buf = rt.buf_new()
+    filemodel.push_str(&p, pl_path(d, i))
+    let ok: bool = nav_to(d, filemodel.buf_str(&p), true, "")
+    rt.buf_free(&p)
+}
+
+fn cb_filter(a: *mut app.App) {
+    let d: *mut Dlg = dlg_of(a)
+    if (*d).nfilt < 2 { return }
+    let ok: bool = app.open_context(a, (*d).n_filter)
+}
+
+fn filter_run(ud: u64, cx: *mut action.ActCtx) {
+    let fc: *mut FilterCtx = ud as *mut FilterCtx
+    set_filter((*fc).d as *mut Dlg, (*fc).idx)
+}
+
+fn filter_state(ud: u64, cx: *mut action.ActCtx) -> u32 {
+    let fc: *mut FilterCtx = ud as *mut FilterCtx
+    let d: *mut Dlg = (*fc).d as *mut Dlg
+    if (*d).fidx == (*fc).idx {
+        return action.CHK_ON
+    }
+    return action.CHK_OFF
+}
+
+fn filter_menu(ud: u64, pc: *mut ctxmenu.ProviderCtx) {
+    let a: *mut app.App = ud as *mut app.App
+    let d: *mut Dlg = dlg_of(a)
+    var i: usize = 0
+    while i < (*d).nfilt {
+        var id: rt.Buf = rt.buf_new()
+        let reg: *mut action.Actions = app.actions(a)
+        // the actions were declared at build time under "filter0" ...
+        rt.buf_free(&id)
+        let idx: usize = filter_action(d, i)
+        if idx != action.ACT_NONE {
+            let e: usize = ctxmenu.pc_add(pc, idx)
+        }
+        i = i + 1
+    }
+}
+
+static mut G_FACT: [usize; 16] = [0; 16]
+
+fn filter_action(d: *mut Dlg, i: usize) -> usize {
+    return G_FACT[i]
+}
+
+// ============================================================ BUILD
+
+fn row_style(d: *mut Dlg, n: usize, justify: u32) {
+    scene.node_set_flex(sc_of(d), n, flex.FLEX_ROW, justify, flex.AL_CENTER)
+    scene.node_set_gap(sc_of(d), n, GAP, GAP)
+}
+
+fn mk_check(d: *mut Dlg, label: str, f: fn(*mut app.App)) -> usize {
+    let a: *mut app.App = (*d).a
+    let i: usize = scene.scene_add(&(*a).sc, (*a).stack[(*a).depth - 1], scene.N_WIDGET)
+    scene.node_set_widget_kind(&(*a).sc, i, widget.KIND_CHECKBOX)
+    scene.node_set_text(&(*a).sc, i, label.p as u64, label.n)
+    (*a).cb[i] = f
+    (*a).has_cb[i] = true
+    return i
+}
+
+fn mk_label_node(d: *mut Dlg) -> usize {
+    let a: *mut app.App = (*d).a
+    let i: usize = scene.scene_add(&(*a).sc, (*a).stack[(*a).depth - 1], scene.N_WIDGET)
+    scene.node_set_widget_kind(&(*a).sc, i, widget.KIND_LABEL)
+    return i
+}
+
+fn mk_flat(d: *mut Dlg, f: fn(*mut app.App), draw: fn(u64, *mut render.Ctx, *mut widget.Widget),
+    w: usize, h: usize, name: str, ground: u32) -> usize {
+    let a: *mut app.App = (*d).a
+    let i: usize = app.button(a, "", f)
+    flat_rule(d, i, ground)
+    scene.node_set_size(&(*a).sc, i, w as f64, h as f64)
+    scene.node_set_draw(&(*a).sc, i, d as u64, draw)
+    if name.n > 0 {
+        name_it(d, i, name)
+    }
+    return i
+}
+
+fn build(d: *mut Dlg) {
+    let a: *mut app.App = (*d).a
+    let sc: *mut scene.Scene = &(*a).sc
+    let root: usize = app.root(a)
+    (*d).n_root = root
+    scene.node_set_flex(sc, root, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_gap(sc, root, 0, 0)
+    scene.node_set_padding(sc, root, PAD, PAD, PAD, PAD)
+    // ---- the tool row
+    let tb: usize = app.row(a)
+    row_style(d, tb, flex.JUSTIFY_START)
+    scene.node_set_padding(sc, tb, 0, 0, 0, GAP)
+    (*d).n_back = mk_flat(d, cb_back, draw_navbtn, NAV_W, NAV_W, "Back", style.TOK_BASE)
+    (*d).n_fwd = mk_flat(d, cb_fwd, draw_navbtn, NAV_W, NAV_W, "Forward", style.TOK_BASE)
+    (*d).n_up = mk_flat(d, cb_up, draw_navbtn, NAV_W, NAV_W, "Up one folder", style.TOK_BASE)
+    (*d).n_ref = mk_flat(d, cb_ref, draw_navbtn, NAV_W, NAV_W, "Refresh", style.TOK_BASE)
+    let loc: usize = app.row(a)
+    (*d).n_loc = loc
+    row_style(d, loc, flex.JUSTIFY_START)
+    scene.node_set_gap(sc, loc, 0, 0)
+    scene.node_set_padding(sc, loc, 3, 2, 3, 2)
+    scene.node_set_flexitem(sc, loc, 1, 1, 0, 0)
+    scene.node_set_size(sc, loc, 0.0, BAR_H as f64)
+    var lst: style.Style = style.style_new()
+    lst = style.style_set_bg(lst, style.color_token(style.TOK_FIELD))
+    lst = style.style_set_border(lst, style.color_token(style.TOK_BORDER), 1)
+    lst = style.style_set_radius(lst, 8)
+    node_rule(d, loc, lst)
+    scene.node_set_draw(sc, loc, d as u64, draw_loc)
+    role_it(d, loc, a11y.ROLE_TOOLBAR)
+    name_it(d, loc, "Location")
+    var i: usize = 0
+    while i < CRUMBS_MAX {
+        (*d).n_crumb[i] = mk_flat(d, cb_crumb, draw_crumb, 40, CRUMB_H, "Folder", style.TOK_FIELD)
+        i = i + 1
+    }
+    (*d).n_path = app.entry(a, "Path")
+    node_rule(d, (*d).n_path, style.style_set_width(style.style_new(), 200))
+    show_node(d, (*d).n_path, false, 0, 0, 1)
+    app.end(a)
+    (*d).n_newf = mk_flat(d, cb_newf, draw_navbtn, 124, NAV_W, "New folder", style.TOK_BASE)
+    app.end(a)
+    // ---- the new folder row (hidden until asked for)
+    let nf: usize = app.row(a)
+    (*d).n_nf_row = nf
+    row_style(d, nf, flex.JUSTIFY_START)
+    (*d).n_nf_label = app.label(a, "New folder name:", 0)
+    (*d).n_nf_entry = app.entry(a, "New folder name")
+    scene.node_set_grow(sc, (*d).n_nf_entry, 1, 1)
+    (*d).n_nf_ok = app.button(a, "Create", cb_nf_ok)
+    (*d).n_nf_cancel = app.button(a, "Cancel", cb_nf_cancel)
+    app.end(a)
+    show_row(d, nf, false, 0)
+    // ---- the body: places and files
+    let body: usize = app.row(a)
+    row_style(d, body, flex.JUSTIFY_START)
+    scene.node_set_flexitem(sc, body, 1, 1, 0, 0)
+    scene.node_set_flex(sc, body, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_padding(sc, body, 0, 0, 0, GAP)
+    let side: usize = app.column(a)
+    (*d).n_side = side
+    scene.node_set_flex(sc, side, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_gap(sc, side, 2, 2)
+    scene.node_set_padding(sc, side, 6, 6, 6, 6)
+    scene.node_set_size(sc, side, SIDE_W as f64, 0.0)
+    var ss: style.Style = style.style_new()
+    ss = style.style_set_bg(ss, style.color_token(style.TOK_SURFACE))
+    ss = style.style_set_border(ss, style.color_token(style.TOK_BORDER), 1)
+    ss = style.style_set_radius(ss, 8)
+    node_rule(d, side, ss)
+    role_it(d, side, a11y.ROLE_TREE)
+    name_it(d, side, "Places")
+    i = 0
+    while i < PLACES_MAX {
+        (*d).n_place[i] = mk_flat(d, cb_place, draw_place, 0, PLACE_H, "Place", style.TOK_SURFACE)
+        scene.node_set_size(sc, (*d).n_place[i], 0.0, PLACE_H as f64)
+        role_it(d, (*d).n_place[i], a11y.ROLE_TREEITEM)
+        i = i + 1
+    }
+    app.end(a)
+    (*d).n_list = app.button(a, "", cb_none)
+    (*a).has_cb[(*d).n_list] = false
+    flat_rule(d, (*d).n_list, style.TOK_BASE)
+    scene.node_set_flexitem(sc, (*d).n_list, 1, 1, 0, 0)
+    scene.node_set_size(sc, (*d).n_list, 0.0, 0.0)
+    scene.node_set_draw(sc, (*d).n_list, d as u64, draw_list)
+    role_it(d, (*d).n_list, a11y.ROLE_LIST)
+    name_it(d, (*d).n_list, "Files")
+    app.end(a)
+    // ---- name and filter
+    let nr: usize = app.row(a)
+    row_style(d, nr, flex.JUSTIFY_START)
+    scene.node_set_padding(sc, nr, 0, 0, 0, GAP)
+    let nl: usize = app.label(a, "Name:", 0)
+    (*d).n_name = app.entry(a, "File name")
+    scene.node_set_grow(sc, (*d).n_name, 1, 1)
+    (*d).n_filter = mk_flat(d, cb_filter, draw_filter, 230, NAV_W, "File type filter", style.TOK_BASE)
+    app.end(a)
+    // ---- the overwrite question (a row of its own, in this window)
+    let cr: usize = app.row(a)
+    (*d).n_conf_row = cr
+    row_style(d, cr, flex.JUSTIFY_START)
+    (*d).n_conf_text = app.label(a, " ", 0)
+    scene.node_set_grow(sc, (*d).n_conf_text, 1, 1)
+    node_rule(d, (*d).n_conf_text, style.style_set_align(style.style_new(), style.ALIGN_LEFT))
+    (*d).n_yes = app.button(a, "Replace", cb_yes)
+    (*d).n_no = app.button(a, "Keep both files untouched", cb_no)
+    app.set_text(a, (*d).n_no, "No, do not replace")
+    app.end(a)
+    show_row(d, cr, false, 0)
+    // ---- the bottom row
+    let bot: usize = app.row(a)
+    (*d).n_bot = bot
+    row_style(d, bot, flex.JUSTIFY_START)
+    (*d).n_status = mk_label_node(d)
+    scene.node_set_grow(sc, (*d).n_status, 1, 1)
+    scene.node_set_size(sc, (*d).n_status, 0.0, 22.0)
+    scene.node_set_draw(sc, (*d).n_status, d as u64, draw_status)
+    role_it(d, (*d).n_status, a11y.ROLE_STATUS)
+    name_it(d, (*d).n_status, "Status")
+    (*d).n_hidden = mk_check(d, "Show hidden files", cb_hidden)
+    (*d).n_ok = app.button(a, "OK", cb_ok)
+    (*d).n_cancel = app.button(a, "Cancel", cb_cancel)
+    scene.node_set_size(sc, (*d).n_ok, BTN_W as f64, NAV_W as f64)
+    scene.node_set_size(sc, (*d).n_cancel, BTN_W as f64, NAV_W as f64)
+    app.end(a)
+    // the answer buttons: same size
+    scene.node_set_size(sc, (*d).n_yes, 120.0, NAV_W as f64)
+    scene.node_set_size(sc, (*d).n_no, 200.0, NAV_W as f64)
+    scene.node_set_size(sc, (*d).n_nf_ok, 90.0, NAV_W as f64)
+    scene.node_set_size(sc, (*d).n_nf_cancel, 90.0, NAV_W as f64)
+    // the Name label stands level with its field
+    scene.node_set_size(sc, nl, 52.0, 0.0)
+}
+
+fn cb_none(a: *mut app.App) {
+}
+
+// ============================================================ CREATE / RUN
+
+fn state_init(d: *mut Dlg) {
+    (*d).m = filemodel.Model { path: rt.buf_new(), names: rt.buf_new(), ents: 0, n: 0, cap: 0, esz: 0, view: 0,
+        tmp: 0, nv: 0, sort_col: 0, sort_desc: false, show_hidden: false, dirs_only: false,
+        filters: rt.buf_new(), filter_idx: 0, off_min: 0 }
+    filemodel.model_init(&(*d).m)
+    (*d).home = rt.buf_new()
+    (*d).scratch = rt.buf_new()
+    (*d).filters = rt.buf_new()
+    (*d).flabels = rt.buf_new()
+    (*d).fbuf = rt.buf_new()
+    (*d).rbuf = rt.buf_new()
+    (*d).hist = rt.buf_new()
+    (*d).conf_path = rt.buf_new()
+    (*d).gen_text = rt.buf_new()
+    (*d).st_buf = rt.buf_new()
+    (*d).cur = NONE
+    (*d).anchor = NONE
+    (*d).fake_ms = 0 - 1
+    (*d).hover_key = NONE
+    (*d).focus_pending = NONE
+}
+
+// Build the dialog window (not shown yet). 0 when there is no memory.
+#[allow_escape]
+fn dlg_new(mode: i32, title: str, dir: str, name: str, filters: str, out: *mut rt.Buf) -> *mut Dlg {
+    let p: u64 = alloc_of[Dlg]()
+    if p == 0 {
+        return 0 as u64 as *mut Dlg
+    }
+    let d: *mut Dlg = p as *mut Dlg
+    state_init(d)
+    (*d).mode = mode
+    (*d).out = out as u64
+    let a: *mut app.App = app.window(title, WIN_W, WIN_H)
+    if (a as u64) == 0 {
+        return 0 as u64 as *mut Dlg
+    }
+    (*d).a = a
+    app.set_data(a, d as u64)
+    build(d)
+    // filters: the labels live in a block of their own (actions keep pointers to them)
+    filemodel.push_str(&(*d).filters, filters)
+    var nf: usize = filemodel.filters_count(filters)
+    if nf > FILTERS_MAX { nf = FILTERS_MAX }
+    (*d).nfilt = nf
+    var k: usize = 0
+    while k < nf {
+        let l: str = filemodel.filter_label(filters, k)
+        (*d).f_off[k] = rt.buf_len(&(*d).flabels)
+        (*d).f_len[k] = l.n
+        filemodel.push_str(&(*d).flabels, l)
+        k = k + 1
+    }
+    filemodel.model_set_filters(&(*d).m, filemodel.buf_str(&(*d).filters))
+    filemodel.model_set_dirs_only(&(*d).m, mode == MODE_FOLDER)
+    // the mode shapes the window
+    if mode == MODE_FOLDER {
+        app.set_text(a, (*d).n_name, "")
+        show_node(d, (*d).n_filter, false, 0, 0, 0)
+    }
+    if nf == 0 {
+        show_node(d, (*d).n_filter, false, 0, 0, 0)
+    }
+    // keys, wheel, pointers
+    app.set_keys(a, d as u64, on_key, on_char)
+    app.set_wheel(a, d as u64, on_wheel)
+    app.set_motion(a, d as u64, on_motion)
+    app.std_edit(a)
+    let ok1: bool = app.on(a, (*d).n_list, event.EV_POINTER_ALL | event.ev_bit(event.EV_TAP) | event.ev_bit(event.EV_DOUBLE_TAP), on_list_pointer)
+    let ok2: bool = app.on(a, (*d).n_loc, event.ev_bit(event.EV_POINTER_DOWN), on_loc_pointer)
+    let ok3: bool = app.on(a, (*d).n_root, event.ev_bit(event.EV_POINTER_DOWN), on_root_pointer)
+    // the filter menu: radio actions under "filter0" ... (declared once, here)
+    if nf > 1 {
+        k = 0
+        while k < nf {
+            (*d).fctx[k].d = d as u64
+            (*d).fctx[k].idx = k
+            var idb: rt.Buf = rt.buf_new()
+            filemodel.push_str(&idb, "filter")
+            rt.buf_push_dec_u64(&idb, k as u64)
+            // `id` must outlive the registry: keep it in the labels block (after the labels)
+            let off: usize = rt.buf_len(&(*d).flabels)
+            filemodel.push_str(&(*d).flabels, filemodel.buf_str(&idb))
+            rt.buf_free(&idb)
+            k = k + 1
+        }
+        // all pushes are done: the block does not move any more
+        var off2: usize = 0
+        k = 0
+        while k < nf {
+            off2 = (*d).f_off[nf - 1] + (*d).f_len[nf - 1]
+            k = k + 1
+        }
+        k = 0
+        var idoff: usize = off2
+        while k < nf {
+            let idn: usize = 6 + digits(k)
+            let idstr: str = str { p: ((rt.buf_data(&(*d).flabels) as u64) + idoff as u64) as *mut u8, n: idn }
+            let lab: str = filter_label_s(d, k)
+            let reg: *mut action.Actions = app.actions(a)
+            let ai: usize = action.act_add(reg, idstr, lab, filter_run, (&(*d).fctx[k]) as u64)
+            G_FACT[k] = ai
+            action.act_set_radio(reg, ai, filter_state)
+            idoff = idoff + idn
+            k = k + 1
+        }
+        let okc: bool = app.on_context(a, (*d).n_filter, filter_menu)
+    }
+    // the clock for the dates
+    let off_min: i32 = time.local_offset_min(time.now_unix_ms()) catch 0
+    filemodel.model_set_offset(&(*d).m, off_min)
+    // the places
+    let hv: str = env.get("HOME")
+    filemodel.push_str(&(*d).home, hv)
+    places_init(d)
+    (*d).nodes_ready = true
+    places_apply(d)
+    // start folder and name
+    var start: rt.Buf = rt.buf_new()
+    if dir.n > 0 {
+        filemodel.path_resolve("/", filemodel.buf_str(&(*d).home), dir, &start)
+    }
+    if rt.buf_len(&start) == 0 || !fs.is_dir(filemodel.buf_str(&start)) {
+        rt.buf_clear(&start)
+        if (*d).home.len > 0 && fs.is_dir(filemodel.buf_str(&(*d).home)) {
+            filemodel.push_str(&start, filemodel.buf_str(&(*d).home))
+        } else {
+            rt.buf_push(&start, 47 as u8)
+        }
+    }
+    var ok: bool = nav_to(d, filemodel.buf_str(&start), true, "")
+    if !ok {
+        ok = nav_to(d, "/", true, "")
+    }
+    rt.buf_free(&start)
+    if mode == MODE_SAVE {
+        set_name_text(d, name)
+    }
+    refresh_status(d)
+    sync_ok(d)
+    (*d).focus_pending = (*d).n_list
+    return d
+}
+
+fn digits(k: usize) -> usize {
+    if k >= 10 { return 2 }
+    return 1
+}
+
+fn dlg_free(d: *mut Dlg) {
+    filemodel.model_free(&(*d).m)
+}
+
+// Show the dialog and wait. 0 = chosen (`out` filled), 1 = cancelled or closed, 12 = no window possible.
+#[allow_escape]
+fn run(mode: i32, title: str, dir: str, name: str, filters: str, out: *mut rt.Buf) -> i32 {
+    let d: *mut Dlg = dlg_new(mode, title, dir, name, filters, out)
+    if (d as u64) == 0 {
+        return 12
+    }
+    let rc: i32 = app.run((*d).a)
+    if env.has("FUI_AUDIT") {
+        return rc
+    }
+    if rc != 0 {
+        return 12
+    }
+    var ret: i32 = 1
+    if (*d).accepted {
+        ret = 0
+    }
+    dlg_free(d)
+    return ret
+}
