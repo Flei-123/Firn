@@ -64,7 +64,8 @@ fn scalar_fty(t: &Type) -> Option<FTy> {
 /// assignment `target = value` overwrites? Conservative: it says yes whenever
 /// the literal mentions the variable at the root of `target`, and, when the
 /// target is reached through a pointer (which may alias anything), whenever
-/// the literal reads any variable, field, element or pointer at all.
+/// the literal reads through a field, an element, a pointer or a call (a bare
+/// scalar variable cannot be part of the aggregate that is written).
 fn literal_reads_target(target: &Expr, value: &Expr) -> bool {
     if !matches!(value.kind, ExprKind::StructLit(..) | ExprKind::ArrayLit(_)) {
         return false;
@@ -84,17 +85,21 @@ fn root_ident(e: &Expr) -> Option<&str> {
     }
 }
 
-/// Does `e` read the variable `name` (`Some`), or read any memory at all
-/// (`None`)? Unknown shapes say yes.
+/// Does `e` read the variable `name` (`Some`), or read memory through a
+/// field, an element, a pointer or a call (`None`)? Unknown shapes say yes.
 fn reads_name(e: &Expr, name: Option<&str>) -> bool {
     match &e.kind {
         ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::FloatF32(_) | ExprKind::Bool(_) => false,
-        ExprKind::Ident(n) => name.map_or(true, |w| w == n),
-        ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Text(_, a) => reads_name(a, name),
-        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::ArrayRepeat(a, b) => {
+        ExprKind::Ident(n) => name.map_or(false, |w| w == n),
+        ExprKind::Unary(op, a) => {
+            (name.is_none() && matches!(op, crate::ast::UnOp::Deref)) || reads_name(a, name)
+        }
+        ExprKind::Cast(a, _) | ExprKind::Text(_, a) => reads_name(a, name),
+        ExprKind::Binary(_, a, b) | ExprKind::ArrayRepeat(a, b) => {
             reads_name(a, name) || reads_name(b, name)
         }
-        ExprKind::Field(b, _, _) => reads_name(b, name),
+        ExprKind::Index(a, b) => name.is_none() || reads_name(a, name) || reads_name(b, name),
+        ExprKind::Field(b, _, _) => name.is_none() || reads_name(b, name),
         ExprKind::StructLit(_, fs, _) => fs.iter().any(|(_, x, _)| reads_name(x, name)),
         ExprKind::ArrayLit(xs) => xs.iter().any(|x| reads_name(x, name)),
         ExprKind::Call(_, args, _) | ExprKind::Syscall(args) => {
