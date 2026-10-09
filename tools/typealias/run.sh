@@ -81,6 +81,24 @@ sed -e 's/^import modules.alias_base$/import alias_user/' \
     tests/2401_type_alias_module.fi > "$WORK/ord/main.fi"
 both "importing module first" "$WORK/ord/main.fi"
 
+# an alias of another module as the argument of a generic: one instantiation
+mkdir -p "$WORK/gm"
+cp tests/modules/alias_base.fi "$WORK/gm/"
+cat > "$WORK/gm/main.fi" <<'EOT'
+import alias_base
+
+struct Box[T] { v: T }
+
+fn get(b: Box[u64]) -> u64 { return b.v }
+
+fn main() -> i32 {
+    let b: Box[alias_base.Count] = Box[u64] { v: 7 }
+    let c: Box[alias_base.Total] = b
+    return get(c) as i32 - 7
+}
+EOT
+both "alias of a module as a generic argument" "$WORK/gm/main.fi"
+
 # a chain over three modules, the topmost imported first
 both "chain over three modules" tools/typealias/chain_main.fi
 
