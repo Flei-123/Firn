@@ -1876,6 +1876,19 @@ else
     grep -E 'FAIL' "$WORK/firnrun.log" | head -10 | sed 's/^/   /' || true
 fi
 
+echo "== 118. type aliases in BOTH compilers (tools/typealias/run.sh, GAPS B14) =="
+# `type Idx = u32` is another name for the same type: the positive programs, the importing module in front of the
+# module it imports, a chain over three modules and every refused program (cycle, duplicate, generic alias, struct
+# clash, type arguments at a use, methods on a pointer alias, ...) go through firnc0 AND firnc1 with the same verdict.
+FIRNC="$FIRNC" bash tools/typealias/run.sh > "$WORK/typealias.log" 2>&1 && TARC=0 || TARC=$?
+if [ "$TARC" -eq 0 ]; then
+    ok
+    grep -E '^  typealias: ' "$WORK/typealias.log" | sed 's/^/ /'
+else
+    bad "tools/typealias/run.sh failed (see .test-work/typealias.log)"
+    grep -E 'DIFFERENT|WRONG|FAILED' "$WORK/typealias.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 111. regex lookaround against Python's re, and the measured worst case (tools/regex_look/run.sh, r320) =="
 # (?=X) (?!X) (?<=X) (?<!X) on 6,000 random patterns without backreferences (and the two OpenPlan patterns) in
 # every build stage, first match + every group offset + the replace-all result, with a counter-check (the

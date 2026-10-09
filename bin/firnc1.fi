@@ -666,6 +666,53 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
     return 0
 }
 
+// TYPE ALIASES (twin of the order `modules.rs` does not need): the alias of a
+// module is a node that the parser publishes once the module is parsed, so a
+// module has to be parsed BEFORE the files that import it. The queue above
+// is in the order the imports were found; this appends the module alias
+// (last element of the path) of every `import` of the lexer `l` to `out`.
+fn import_aliases(l: *mut lexer.Lexer, out: *mut Vec[u32]) {
+    var i: usize = 0
+    while i + 1 < lexer.lex_count(l) {
+        if lexer.lex_kind(l, i) != 27 {
+            i = i + 1
+            continue
+        }
+        var j: usize = i + 1
+        var last: u32 = 4294967295
+        while j < lexer.lex_count(l) {
+            if lexer.lex_kind(l, j) != 1 {
+                break
+            }
+            last = lexer.lex_nr(l, j)
+            j = j + 1
+            if j >= lexer.lex_count(l) {
+                break
+            }
+            if lexer.lex_kind(l, j) != 43 {
+                break
+            }
+            j = j + 1
+        }
+        if last != 4294967295 {
+            vec_push[u32](out, last)
+        }
+        i = j
+    }
+}
+
+// The index of the module with this alias in the queue (not the root), or -1.
+fn ml_find_alias(ml: *mut ModuleList, alias: u32) -> i64 {
+    var i: usize = 1
+    while i < ml_count(ml) {
+        if ml_alias(ml, i) == alias {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
 // A stage found errors but this driver has no detailed text for it (only the
 // lexer prints full diagnostics): say WHICH stage said no, then exit 1.
 // Before this, exit code 1 came out of `sema` without a single word.
@@ -1043,6 +1090,14 @@ fn main(start: u64) -> i32 {
         kernel_early = says_kernel(&l)
     }
 
+    // TYPE ALIASES: does any file declare one? Then the second pass parses
+    // the modules in the order of their imports (dependencies first), and
+    // `dep_from`/`dep_alias` say who imports what.
+    var alias_any: bool = parser.lex_has_alias((&l) as u64)
+    var dep_from: Vec[u32] = vec_new[u32]()
+    defer vec_free[u32](&dep_from)
+    var dep_alias: Vec[u32] = vec_new[u32]()
+    defer vec_free[u32](&dep_alias)
     var mi: usize = 1
     while mi < ml_count(&ml) {
         rt.buf_clear(&mpath)
@@ -1075,6 +1130,18 @@ fn main(start: u64) -> i32 {
             }
         }
         mono.gen_upfront(&g, (&vl) as u64)
+        if parser.lex_has_alias((&vl) as u64) {
+            alias_any = true
+        }
+        var ia: Vec[u32] = vec_new[u32]()
+        import_aliases(&vl, &ia)
+        var iq: usize = 0
+        while iq < vec_len[u32](&ia) {
+            vec_push[u32](&dep_from, mi as u32)
+            vec_push[u32](&dep_alias, vec_at[u32](&ia, iq))
+            iq = iq + 1
+        }
+        vec_free[u32](&ia)
         // Round 47: bit 4 (a finalizer dispatcher of its own) counts ONLY
         // in the root file -- module results are masked. Round 53: bit 8
         // (collections) does count in every module, just like bits 1 and 2
@@ -1177,9 +1244,65 @@ fn main(start: u64) -> i32 {
         rt.buf_free(&vq)
     }
 
+    // --- The order of the second pass. Without a type alias anywhere it is
+    // the order of the queue, as always. With one, a module comes after the
+    // modules it imports (a cycle is broken at the first module that is
+    // left), because an alias is published when its module has been parsed.
+    var order: Vec[u32] = vec_new[u32]()
+    defer vec_free[u32](&order)
+    var placed: Vec[u32] = vec_new[u32]()
+    defer vec_free[u32](&placed)
+    var oq: usize = 0
+    while oq < ml_count(&ml) {
+        vec_push[u32](&placed, 0)
+        oq = oq + 1
+    }
+    var round: usize = 1
+    while round < ml_count(&ml) {
+        var pick: usize = 0
+        var cand: usize = 1
+        while cand < ml_count(&ml) && pick == 0 {
+            if vec_at[u32](&placed, cand) == 0 {
+                var blocked: bool = false
+                if alias_any {
+                    var de: usize = 0
+                    while de < vec_len[u32](&dep_from) && !blocked {
+                        if vec_at[u32](&dep_from, de) as usize == cand {
+                            let dj: i64 = ml_find_alias(&ml, vec_at[u32](&dep_alias, de))
+                            if dj > 0 && dj as usize != cand {
+                                if vec_at[u32](&placed, dj as usize) == 0 {
+                                    blocked = true
+                                }
+                            }
+                        }
+                        de = de + 1
+                    }
+                }
+                if !blocked {
+                    pick = cand
+                }
+            }
+            cand = cand + 1
+        }
+        if pick == 0 {
+            // a cycle of imports: take the first module that is left
+            cand = 1
+            while cand < ml_count(&ml) && pick == 0 {
+                if vec_at[u32](&placed, cand) == 0 {
+                    pick = cand
+                }
+                cand = cand + 1
+            }
+        }
+        vec_set[u32](&placed, pick, 1)
+        vec_push[u32](&order, pick as u32)
+        round = round + 1
+    }
+
     // --- SECOND PASS: compile the modules.
-    mi = 1
-    while mi < ml_count(&ml) {
+    var oi: usize = 0
+    while oi < vec_len[u32](&order) {
+        mi = vec_at[u32](&order, oi) as usize
         rt.buf_clear(&mpath)
         rt.buf_push_bytes(&mpath, ml_ptr(&ml, mi), ml_length(&ml, mi))
         rt.buf_push(&mpath, 0 as u8)
@@ -1221,7 +1344,7 @@ fn main(start: u64) -> i32 {
             var stg: [u8; 19] = "the parser (module)"
             return stage_failed((&stg[0]) as u64, 19)
         }
-        mi = mi + 1
+        oi = oi + 1
     }
 
     // --- the root file last: its names stay unchanged.

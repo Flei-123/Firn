@@ -478,6 +478,17 @@ impl<'a> Parser<'a> {
                 if let Some(t) = crate::iface::hook_type(self, &name, sp) {
                     return Some(t);
                 }
+                // HOOK alias: `type X = T` -- a use is replaced by the target
+                // (alias.rs). A qualified `m.X` is the renamer's job
+                // (modules.rs): the dot has not been read yet, so a name
+                // followed by `.` is left alone here.
+                if !self.at(&TokKind::Dot) || !self.modules.contains(&name) {
+                    match crate::alias::hook_use(self, &name, sp) {
+                        crate::alias::Use::Expanded(t) => return Some(t),
+                        crate::alias::Use::Failed => return None,
+                        crate::alias::Use::NotAlias => {}
+                    }
+                }
                 if self.kind() == &TokKind::LBracket
                     && !crate::sema_generic::is_generic_struct(&name)
                 {
@@ -1037,6 +1048,8 @@ impl<'a> Parser<'a> {
 
     /// `T{ field: value, ... }` — '{' is still ahead.
     pub(crate) fn struct_lit(&mut self, name: String, name_span: Span) -> Expr {
+        // HOOK alias: `P { .. }` with `type P = Point` builds a `Point`
+        let name = crate::alias::hook_struct_name(self, name, name_span);
         self.bump(); // '{'
         let mut fields = Vec::new();
         loop {
@@ -2062,6 +2075,10 @@ compute it",
 
     fn program(&mut self) -> Program {
         let mut prog = Program::default();
+        // HOOK alias: find and read the `type X = T` declarations of this
+        // file up front, so the order of the declarations does not matter
+        // (alias.rs).
+        crate::alias::hook_begin(self);
         loop {
             while self.eat(&TokKind::Semi) {}
             if self.at_eof() {
@@ -2082,6 +2099,13 @@ compute it",
                     }
                     break;
                 }
+                if self.pos == before {
+                    self.bump();
+                }
+                continue;
+            }
+            // HOOK alias: `type X = T` (alias.rs) -- read already, skipped here
+            if crate::alias::hook_item(self) {
                 if self.pos == before {
                     self.bump();
                 }
@@ -2167,6 +2191,8 @@ pub fn parse(toks: &[Token], dg: &mut Diags) -> Program {
 pub fn reset_hooks() {
     // HOOK types: reset the registrations of this compilation (sema_match.rs)
     crate::sema_match::hook_reset();
+    // HOOK alias: the type aliases of this compilation (alias.rs)
+    crate::alias::hook_reset();
     // HOOK fehlerunionen: the same for error sets/error unions (errors.rs)
     crate::errors::hook_reset();
     // HOOK sizeof: empty the size table of this compilation (sizeof.rs)

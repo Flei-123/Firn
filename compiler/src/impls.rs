@@ -169,6 +169,28 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
     // folded here, at the ONE place where it enters the function name --
     // otherwise `int__less` and `i32__less` would both come into being and
     // a receiver of type i32 would find only one of the two.
+    // HOOK alias: `impl Idx` with `type Idx = Point` is `impl Point` (alias.rs)
+    let ty = match crate::alias::hook_impl_name(p, ty, tsp) {
+        Some(t) => t,
+        None => {
+            // skip the whole block, or its methods would be read as items
+            let mut depth = 0i32;
+            while !p.at_eof() {
+                if p.at(&TokKind::LBrace) {
+                    depth += 1;
+                } else if p.at(&TokKind::RBrace) {
+                    depth -= 1;
+                    if depth <= 0 {
+                        p.bump();
+                        break;
+                    }
+                }
+                p.bump();
+            }
+            p.recovering = false;
+            return;
+        }
+    };
     let ty = crate::types::canon_name(&ty).to_string();
     if is_for {
         crate::iface::remember_impl(first, ty.clone(), esp);

@@ -69,7 +69,9 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     // DELIBERATELY JUST ONE TYPE NAME, no full type expression:
     // `size_of[i32]`, `size_of[Point]`. Whoever needs the size of a composite
     // type gives it a name — which reads better anyway than `size_of[*mut u8]`.
-    let (ty_name, _) = p.ident("after 'size_of['")?;
+    let (ty_name, ty_span) = p.ident("after 'size_of['")?;
+    // HOOK alias: `size_of[Idx]()` with `type Idx = u32` is `size_of[u32]()`
+    let ty_name = crate::alias::hook_plain_name(p, ty_name, ty_span);
     if !p.expect(TokKind::RBracket, "after the type argument of 'size_of'") {
         return None;
     }
