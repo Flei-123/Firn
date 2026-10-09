@@ -148,8 +148,8 @@ const SAMPLE_TEXT: str = "AaBbYyZz 0123 äöü ß"
 
 // ------------------------------------------------------------ constants
 
-const WIN_W: usize = 584
-const WIN_H: usize = 612
+const WIN_W: usize = 574
+const WIN_H: usize = 564
 const FAM_W: f64 = 252.0
 const STY_W: f64 = 176.0
 const SIZ_W: f64 = 90.0
@@ -258,7 +258,8 @@ struct FontDlg {
     prev_state: u32, // 0 real face, 1 system face (cannot draw it), 2 face missing
     synth_b: bool,
     synth_i: bool,
-    scan_count: usize,
+    scan_ns: u64, // when the last walk slice ended
+    ax_last: [rt.Buf; 3], // the accessible names of the lists, with the chosen row
     ready: bool,
 }
 
@@ -281,7 +282,7 @@ fn dlg_blank() -> FontDlg {
         last_status: rt.buf_new(), init_fam: rt.buf_new(), init_pending: true,
         ta: [0 as u8; 40], ta_n: 0, ta_ns: 0,
         slots: [slot_blank(); 3], tick: 0, loads: 0, px: 0.0, py: 0.0,
-        prev_state: 0 as u32, synth_b: false, synth_i: false, scan_count: 0,
+        prev_state: 0 as u32, synth_b: false, synth_i: false, scan_ns: 0 as u64, ax_last: [rt.buf_new(); 3],
         ready: false }
 }
 
@@ -772,6 +773,41 @@ fn status_line(d: *mut FontDlg, out: *mut rt.Buf) {
     rt.buf_push_bytes(out, tr_families().p as u64, tr_families().n)
 }
 
+// The accessible name of each list: its own name and the chosen row ("Font
+// family list: DejaVu Sans"). The rows are not nodes of their own (a list is
+// one node that paints only what is in view), so the chosen one is said here.
+fn update_names(d: *mut FontDlg) {
+    var which: usize = 0
+    while which < 3 {
+        let n: usize = (*d).nodes[NODE_LIST_FAMILY + which]
+        if n != NONE {
+            var base: str = tr_family_list()
+            if which == DLG_STYLE {
+                base = tr_style_list()
+            }
+            if which == DLG_SIZE {
+                base = tr_size_list()
+            }
+            var nm: rt.Buf = rt.buf_new()
+            rt.buf_push_bytes(&nm, base.p as u64, base.n)
+            let sel: usize = sel_row(d, which)
+            if sel != NONE && sel < item_count(d, which) {
+                var tmp: rt.Buf = rt.buf_new()
+                let item: str = item_text(d, which, sel, &tmp)
+                rt.buf_push_bytes(&nm, ": ".p as u64, 2)
+                rt.buf_push_bytes(&nm, item.p as u64, item.n)
+                rt.buf_free(&tmp)
+            }
+            if !same(view_of(&nm), view_of(&(*d).ax_last[which])) {
+                set_buf(&(*d).ax_last[which], view_of(&nm))
+                a11y.a11y_set_name(&(*(*d).a).ax, n, rt.buf_ptr(&(*d).ax_last[which]), rt.buf_len(&(*d).ax_last[which]))
+            }
+            rt.buf_free(&nm)
+        }
+        which = which + 1
+    }
+}
+
 // The status line, when its text changed.
 fn show_status(d: *mut FontDlg) {
     var sl: rt.Buf = rt.buf_new()
@@ -787,10 +823,15 @@ fn show_status(d: *mut FontDlg) {
 fn sync(d: *mut FontDlg) {
     let a: *mut app.App = (*d).a
     if !fontscan.done() {
-        let before: usize = fontscan.family_count()
-        let fin: bool = fontscan.step(8 as u64)
-        if fontscan.family_count() != before || fin {
-            after_scan_step(d)
+        // one slice per frame: the painters of one frame all come here
+        let now: u64 = now_ns()
+        if now - (*d).scan_ns > 4000000 as u64 {
+            let before: usize = fontscan.family_count()
+            let fin: bool = fontscan.step(8 as u64)
+            (*d).scan_ns = now_ns()
+            if fontscan.family_count() != before || fin {
+                after_scan_step(d)
+            }
         }
         touch(d)
     }
@@ -838,6 +879,7 @@ fn sync(d: *mut FontDlg) {
         }
     }
     show_status(d)
+    update_names(d)
 }
 
 // ------------------------------------------------------------ the sample font
@@ -1429,6 +1471,44 @@ fn pick_row(d: *mut FontDlg, which: usize, r: usize) {
     }
 }
 
+// The row under the pointer in every list, a thumb being dragged, the bar's
+// hot state. true = something changed.
+fn hover_update(d: *mut FontDlg, x: f64, y: f64) -> bool {
+    var changed: bool = false
+    var i2: usize = 0
+    while i2 < 3 {
+        let l: *mut ListView = &(*d).lv[i2]
+        if (*l).drag {
+            var ty: f64 = 0.0
+            var th: f64 = 0.0
+            thumb_geometry(l, &ty, &th)
+            let ih: f64 = (*l).gh - 2.0 * (*l).inset
+            var f: f64 = (y - (*l).drag_dy - ((*l).gy + (*l).inset)) / (ih - th)
+            if f < 0.0 {
+                f = 0.0
+            }
+            if f > 1.0 {
+                f = 1.0
+            }
+            (*l).top = f * (*l).max_top
+            changed = true
+        } else {
+            var hv: usize = row_at(d, i2, x, y)
+            let bar: bool = on_bar(d, i2, x, y)
+            if bar {
+                hv = NONE
+            }
+            if hv != (*l).hover || bar != (*l).bar_hot {
+                (*l).hover = hv
+                (*l).bar_hot = bar
+                changed = true
+            }
+        }
+        i2 = i2 + 1
+    }
+    return changed
+}
+
 // The pointer hook (installed over app.app_hook's; it hands on what it does
 // not use). kind: fuiwirt.HOOK_*. true = paint again.
 fn dlg_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
@@ -1439,6 +1519,7 @@ fn dlg_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
         let w: usize = list_under(d, (*d).px, (*d).py)
         if w != NONE {
             scroll_by(d, w, y * 3.0 * (*d).lv[w].row_h)
+            let hv: bool = hover_update(d, (*d).px, (*d).py)
             touch(d)
             return true
         }
@@ -1459,36 +1540,8 @@ fn dlg_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
         (*d).py = y
     }
     if kind == fuiwirt.HOOK_MOVE {
-        var i2: usize = 0
-        while i2 < 3 {
-            let l: *mut ListView = &(*d).lv[i2]
-            if (*l).drag {
-                var ty: f64 = 0.0
-                var th: f64 = 0.0
-                thumb_geometry(l, &ty, &th)
-                let ih: f64 = (*l).gh - 2.0 * (*l).inset
-                var f: f64 = (y - (*l).drag_dy - ((*l).gy + (*l).inset)) / (ih - th)
-                if f < 0.0 {
-                    f = 0.0
-                }
-                if f > 1.0 {
-                    f = 1.0
-                }
-                (*l).top = f * (*l).max_top
-                changed = true
-            } else {
-                var hv: usize = row_at(d, i2, x, y)
-                let bar: bool = on_bar(d, i2, x, y)
-                if bar {
-                    hv = NONE
-                }
-                if hv != (*l).hover || bar != (*l).bar_hot {
-                    (*l).hover = hv
-                    (*l).bar_hot = bar
-                    changed = true
-                }
-            }
-            i2 = i2 + 1
+        if hover_update(d, x, y) {
+            changed = true
         }
     }
     if kind == fuiwirt.HOOK_DOWN {
@@ -1683,6 +1736,7 @@ fn build(a: *mut app.App, d: *mut FontDlg, family: str, size: i32) {
     // the buttons
     let bar: usize = app.row(a)
     set_box(d, bar, flex.FLEX_ROW, flex.JUSTIFY_END, flex.AL_CENTER)
+    scene.node_set_gap(sc, bar, 8, 8)
     scene.node_set_size(sc, bar, FAM_W + STY_W + SIZ_W + 24.0, 0.0)
     (*d).nodes[NODE_OK] = app.button(a, tr_ok(), cb_ok)
     (*d).nodes[NODE_CANCEL] = app.button(a, tr_cancel(), cb_cancel)
