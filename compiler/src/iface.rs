@@ -256,6 +256,8 @@ fn names_self(te: &TypeExpr) -> bool {
         TypeExpr::Fn { params, ret, .. } => {
             params.iter().any(names_self) || ret.as_ref().is_some_and(|t| names_self(t))
         }
+        // Round TUPLES: `Self` may be an element of a tuple.
+        TypeExpr::Tuple(elems, _) => elems.iter().any(names_self),
     }
 }
 
@@ -285,6 +287,11 @@ fn te_text(te: &TypeExpr) -> String {
                 Some(t) => format!("fn({}) -> {}", ps.join(", "), te_text(t)),
                 None => format!("fn({})", ps.join(", ")),
             }
+        }
+        // Round TUPLES
+        TypeExpr::Tuple(elems, _) => {
+            let es: Vec<String> = elems.iter().map(te_text).collect();
+            format!("({})", es.join(", "))
         }
     }
 }

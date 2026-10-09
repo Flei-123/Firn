@@ -270,6 +270,15 @@ pub(crate) fn type_tag(te: &TypeExpr) -> String {
             }
             s
         }
+        // Round TUPLES: `(i32, u8)` is `tup2_i32_u8` in the naming scheme.
+        TypeExpr::Tuple(elems, _) => {
+            let mut s = format!("tup{}", elems.len());
+            for e in elems {
+                s.push('_');
+                s.push_str(&type_tag(e));
+            }
+            s
+        }
     }
 }
 

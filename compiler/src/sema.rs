@@ -95,6 +95,13 @@ pub(crate) struct VarInfo {
     pub(crate) mutable: bool,
 }
 
+/// ROUND TUPLES -- `__tup#<id>#<n>` is the hidden binding that
+/// `let (a, b) = e` makes (parser.rs); `n` is the number of names.
+fn tuple_pattern_arity(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("__tup#")?;
+    rest.rsplit('#').next()?.parse().ok()
+}
+
 /// Maximum nesting depth of expressions (guards against stack overflow).
 const MAX_DEPTH: u32 = 200;
 
@@ -133,6 +140,12 @@ pub(crate) struct Checker<'a> {
     pub(crate) drops: HashSet<usize>,
     pub(crate) moved: HashSet<crate::ast::ExprId>,
     pub(crate) if_leaves: HashMap<crate::ast::ExprId, (bool, bool)>,
+    /// **Round TUPLES** -- `collect_structs` is running: a tuple type met
+    /// now is declared at once but laid out with the other structs, in
+    /// dependency order (`tuple_pending`), because its elements may be
+    /// structs whose layout is not settled yet.
+    pub(crate) tuple_phase: bool,
+    pub(crate) tuple_pending: Vec<(usize, Vec<(String, Type)>)>,
 }
 
 pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
@@ -155,6 +168,8 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         drops: HashSet::new(),
         moved: HashSet::new(),
         if_leaves: HashMap::new(),
+        tuple_phase: false,
+        tuple_pending: Vec::new(),
     };
     ck.run(prog);
     if ck.dg.has_errors() {
@@ -527,6 +542,8 @@ impl<'a> Checker<'a> {
     fn collect_structs(&mut self, prog: &Program) {
         // HOOK fehlerunionen: report the layout phase (errors.rs)
         crate::errors::hook_struct_phase(true);
+        // Round TUPLES: tuples met in the field types wait for their layout
+        self.tuple_phase = true;
         // 1. create all names (allows mutual pointer references)
         let mut idx_of: Vec<usize> = Vec::with_capacity(prog.structs.len());
         for s in &prog.structs {
@@ -564,6 +581,12 @@ impl<'a> Checker<'a> {
             resolved.push(fields);
         }
 
+        // Round TUPLES: the tuples that came into being while the fields were
+        // resolved. They are structs like the others: the same dependency
+        // graph, the same topological order for the layout.
+        self.tuple_phase = false;
+        let tuples: Vec<(usize, Vec<(String, Type)>)> = std::mem::take(&mut self.tuple_pending);
+
         // 3. detect recursion (value containment; pointers break the cycle)
         let n = self.tcx.structs.len();
         let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -574,6 +597,11 @@ impl<'a> Checker<'a> {
             };
             for (_, ty) in fields {
                 collect_value_deps(ty, &mut deps[target]);
+            }
+        }
+        for (target, fields) in &tuples {
+            for (_, ty) in fields {
+                collect_value_deps(ty, &mut deps[*target]);
             }
         }
         let mut state = vec![0u8; n]; // 0 = new, 1 = on the path, 2 = done
@@ -603,6 +631,11 @@ impl<'a> Checker<'a> {
                 if fields_by_idx[*t].is_none() {
                     fields_by_idx[*t] = Some(fields);
                 }
+            }
+        }
+        for (t, fields) in tuples {
+            if fields_by_idx[t].is_none() {
+                fields_by_idx[t] = Some(fields);
             }
         }
         for idx in order {
@@ -1459,6 +1492,44 @@ constants declared before it, and '+ - * /'"
                         }
                     }
                 };
+                // ROUND TUPLES: `let (a, b) = e` -- the hidden binding of `e`
+                // carries the number of names in its name (parser.rs).
+                let t = match tuple_pattern_arity(name) {
+                    Some(k) if !t.is_error() => match &t {
+                        Type::Struct(i) => match self.tuple_elems(*i) {
+                            Some(es) if es.len() == k => t,
+                            Some(es) => {
+                                self.dg.error_note(
+                                    init.span,
+                                    format!(
+                                        "the pattern has {} names, but the tuple has {} elements",
+                                        k,
+                                        es.len()
+                                    ),
+                                    format!("its type is {}", self.tcx.name_of(&t)),
+                                );
+                                Type::Error
+                            }
+                            None => {
+                                self.dg.error_note(
+                                    init.span,
+                                    format!("a tuple pattern needs a tuple, found {}", self.tcx.name_of(&t)),
+                                    "the pattern `(a, b)` takes a value of type `(A, B)` apart",
+                                );
+                                Type::Error
+                            }
+                        },
+                        _ => {
+                            self.dg.error_note(
+                                init.span,
+                                format!("a tuple pattern needs a tuple, found {}", self.tcx.name_of(&t)),
+                                "the pattern `(a, b)` takes a value of type `(A, B)` apart",
+                            );
+                            Type::Error
+                        }
+                    },
+                    _ => t,
+                };
                 self.declare_var(name, t, *mutable, *span);
             }
             Stmt::Assign { target, value, span } => {
@@ -1763,6 +1834,116 @@ constants declared before it, and '+ - * /'"
         }
     }
 
+    // ------------------------------------------------------------- Tuples
+    //
+    // A tuple is no new kind of thing: `(i32, u8)` is a struct named
+    // "(i32, u8)" whose fields are called `0` and `1`, laid out like any
+    // other struct (declaration order, natural alignment) and passed and
+    // returned like one. Two tuples are the same type exactly when their
+    // element types are the same, because the name is made from them.
+
+    /// The name of the tuple struct with these element types.
+    pub(crate) fn tuple_name(&self, elems: &[Type]) -> String {
+        let names: Vec<String> = elems.iter().map(|t| self.tcx.name_of(t)).collect();
+        format!("({})", names.join(", "))
+    }
+
+    /// Finds or makes the tuple struct. While `collect_structs` runs the
+    /// layout waits (`tuple_pending`): the elements may be structs whose own
+    /// layout is not settled yet, and the tuple belongs into the topological
+    /// order with them.
+    pub(crate) fn tuple_type(&mut self, elems: &[Type]) -> Type {
+        let name = self.tuple_name(elems);
+        if let Some(i) = self.tcx.lookup(&name) {
+            return Type::Struct(i);
+        }
+        let idx = self.tcx.declare(&name);
+        let fields: Vec<(String, Type)> = elems
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i.to_string(), t.clone()))
+            .collect();
+        if self.tuple_phase {
+            self.tuple_pending.push((idx, fields));
+        } else {
+            self.tcx.set_fields(idx, fields);
+        }
+        Type::Struct(idx)
+    }
+
+    /// The element types, if struct `i` is a tuple.
+    pub(crate) fn tuple_elems(&self, i: usize) -> Option<Vec<Type>> {
+        let d = self.tcx.structs.get(i)?;
+        if !d.name.starts_with('(') {
+            return None;
+        }
+        Some(d.fields.iter().map(|f| f.ty.clone()).collect())
+    }
+
+    /// `(a, b, ..)` (a struct literal named `ast::TUPLE_LIT`). The context
+    /// may name the tuple type (`let t: (i64, u8) = (1, 2)`), and then it
+    /// types the elements; without it every element has the type it has on
+    /// its own (an untyped literal is `i32` / `f64`).
+    fn tuple_lit(
+        &mut self,
+        fields: &[(String, Expr, Span)],
+        nspan: Span,
+        hint: Option<&Type>,
+    ) -> Type {
+        let want: Option<Vec<Type>> = match hint {
+            Some(Type::Struct(i)) => self.tuple_elems(*i).filter(|v| v.len() == fields.len()),
+            _ => None,
+        };
+        let mut tys: Vec<Type> = Vec::new();
+        let mut failed = false;
+        for (k, (_, fe, _)) in fields.iter().enumerate() {
+            let w: Option<Type> = want.as_ref().map(|v| v[k].clone());
+            let t = match &w {
+                Some(wt) => {
+                    // HOOK fehlerunionen: implicit conversion (errors.rs)
+                    if crate::errors::hook_coerce(self, fe, wt) {
+                        wt.clone()
+                    } else {
+                        let got = self.expr(fe, Some(wt));
+                        if !got.is_error() && !assignable(&got, wt) {
+                            self.dg.error(
+                                fe.span,
+                                format!(
+                                    "element {} of the tuple has type {}, expected {}",
+                                    k,
+                                    self.tcx.name_of(&got),
+                                    self.tcx.name_of(wt)
+                                ),
+                            );
+                            failed = true;
+                        }
+                        wt.clone()
+                    }
+                }
+                None => {
+                    let got = self.expr(fe, None);
+                    if matches!(got, Type::Void) {
+                        self.dg.error(
+                            fe.span,
+                            "the expression yields no value and cannot be an element of a tuple",
+                        );
+                        failed = true;
+                    }
+                    got
+                }
+            };
+            if t.is_error() {
+                failed = true;
+            }
+            tys.push(t);
+        }
+        let _ = nspan;
+        if failed {
+            return Type::Error;
+        }
+        self.tuple_type(&tys)
+    }
+
     fn field_type(&mut self, base: &Type, name: &str, nspan: Span, bspan: Span) -> Type {
         // HOOK gc: field access through a `Gc[T]` (gc.rs, SPEC 3.5.1). A Gc
         // pointer is followed without `(*p).field` — it is first class.
@@ -1779,6 +1960,16 @@ constants declared before it, and '+ - * /'"
                         .get(*i)
                         .map(|s| s.name.clone())
                         .unwrap_or_else(|| "<struct>".to_string());
+                    // Round TUPLES: `.2` on a pair
+                    if sname.starts_with('(') && name.bytes().all(|b| b.is_ascii_digit()) {
+                        let n = self.tcx.structs.get(*i).map(|s| s.fields.len()).unwrap_or(0);
+                        self.dg.error_note(
+                            nspan,
+                            format!("the tuple {} has no element {}", sname, name),
+                            format!("its elements are numbered 0 to {}", n.saturating_sub(1)),
+                        );
+                        return Type::Error;
+                    }
                     let hint = self.field_hint(*i, name);
                     self.dg.error_maybe_help(
                         nspan,
@@ -1801,6 +1992,19 @@ constants declared before it, and '+ - * /'"
                 Type::Error
             }
             other => {
+                // Round TUPLES: `.0` on something that is no tuple
+                if name.bytes().all(|b| b.is_ascii_digit()) {
+                    self.dg.error_note(
+                        bspan,
+                        format!(
+                            "'.{}' needs a tuple, found {}",
+                            name,
+                            self.tcx.name_of(other)
+                        ),
+                        "a tuple is written `(a, b)` and has the type `(A, B)`",
+                    );
+                    return Type::Error;
+                }
                 self.dg.error(
                     bspan,
                     format!(
@@ -2184,6 +2388,10 @@ constants declared before it, and '+ - * /'"
                     return Type::Error;
                 }
                 dst
+            }
+            // Round TUPLES: `(a, b)` -- see `tuple_lit`
+            ExprKind::StructLit(name, fields, nspan) if name == crate::ast::TUPLE_LIT => {
+                self.tuple_lit(fields, *nspan, hint)
             }
             ExprKind::StructLit(name, fields, nspan) => self.struct_lit(name, fields, *nspan),
             ExprKind::ArrayRepeat(val, count) => {
@@ -3024,6 +3232,15 @@ constants declared before it, and '+ - * /'"
             }
             ExprKind::Syscall(_) => Some(Type::I64),
             ExprKind::Cast(_, te) => self.resolve_ty_quiet(te),
+            // Round TUPLES: the type of `(a, b)` from the types of the
+            // elements, if the tuple exists already
+            ExprKind::StructLit(name, fs, _) if name == crate::ast::TUPLE_LIT => {
+                let mut tys = Vec::new();
+                for (_, x, _) in fs {
+                    tys.push(self.probe_d(x, d + 1)?);
+                }
+                self.tcx.lookup(&self.tuple_name(&tys)).map(Type::Struct)
+            }
             ExprKind::StructLit(name, _, _) => self.tcx.lookup(name).map(Type::Struct),
             ExprKind::ArrayRepeat(..) => None,
             ExprKind::Lambda(d) => crate::fnval::probe_lambda(self, d),
@@ -3111,6 +3328,18 @@ constants declared before it, and '+ - * /'"
                 }
                 Type::Array(Box::new(t), *len)
             }
+            // Round TUPLES: `(T1, T2, ..)` is a struct with the fields `0`, `1`, ..
+            TypeExpr::Tuple(elems, _) => {
+                let mut tys = Vec::new();
+                for x in elems {
+                    let t = self.resolve_ty_d(x, d + 1);
+                    if t.is_error() {
+                        return Type::Error;
+                    }
+                    tys.push(t);
+                }
+                self.tuple_type(&tys)
+            }
             // Round 58: `fn(T1, T2) -> R` — a function as a value.
             TypeExpr::Fn { params, ret, .. } => {
                 let mut ps = Vec::new();
@@ -3151,6 +3380,15 @@ constants declared before it, and '+ - * /'"
             TypeExpr::Array { elem, len, .. } => self
                 .resolve_ty_quiet(elem)
                 .map(|t| Type::Array(Box::new(t), *len)),
+            // Round TUPLES: only a tuple that exists already can be found
+            // without making it.
+            TypeExpr::Tuple(elems, _) => {
+                let mut tys = Vec::new();
+                for x in elems {
+                    tys.push(self.resolve_ty_quiet(x)?);
+                }
+                self.tcx.lookup(&self.tuple_name(&tys)).map(Type::Struct)
+            }
             TypeExpr::Fn { params, ret, .. } => {
                 let mut ps = Vec::new();
                 for p in params {
@@ -3724,6 +3962,8 @@ mod tests {
             drops: HashSet::new(),
             moved: HashSet::new(),
             if_leaves: HashMap::new(),
+            tuple_phase: false,
+            tuple_pending: Vec::new(),
             prog: None,
         };
         ck.run(first);

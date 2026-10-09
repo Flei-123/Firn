@@ -966,6 +966,12 @@ impl<'a, 'b> Renamer<'a, 'b> {
             }
             TypeExpr::Ptr { inner, .. } => self.ty(inner),
             TypeExpr::Array { elem, .. } => self.ty(elem),
+            // Round TUPLES: every element is a type name like any other.
+            TypeExpr::Tuple(elems, _) => {
+                for e in elems.iter_mut() {
+                    self.ty(e);
+                }
+            }
             // Round 58: the names in the signature of a function value get
             // qualified like every other type name.
             TypeExpr::Fn { params, ret, .. } => {

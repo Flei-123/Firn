@@ -226,6 +226,8 @@ fn satisfies(te: &TypeExpr, b: &Bound) -> bool {
             TypeExpr::Array { .. } => false,
             // Round 58: a function value is one word wide, so it is a scalar.
             TypeExpr::Fn { .. } => true,
+            // Round TUPLES: a tuple is a struct, not a scalar.
+            TypeExpr::Tuple(..) => false,
         },
         // Interfaces are decided by `iface.rs`, not by the type shape.
         Bound::Iface(_) => false,
@@ -264,6 +266,11 @@ fn subst_ty(
             ret: ret.as_ref().map(|r| Box::new(subst_ty(r, map, queue))),
             span: *span,
         },
+        // Round TUPLES: `(T, T)` inside a template.
+        TypeExpr::Tuple(elems, span) => TypeExpr::Tuple(
+            elems.iter().map(|e| subst_ty(e, map, queue)).collect(),
+            *span,
+        ),
     }
 }
 
@@ -335,6 +342,7 @@ fn with_span(t: &TypeExpr, sp: Span) -> TypeExpr {
             len: *len,
             span: sp,
         },
+        TypeExpr::Tuple(elems, _) => TypeExpr::Tuple(elems.clone(), sp),
     }
 }
 
@@ -611,6 +619,11 @@ fn check_bare_ty(te: &TypeExpr, out: &mut Vec<(Span, String)>) {
             }
         }
         TypeExpr::Array { elem, .. } => check_bare_ty(elem, out),
+        TypeExpr::Tuple(elems, _) => {
+            for e in elems {
+                check_bare_ty(e, out);
+            }
+        }
     }
 }
 

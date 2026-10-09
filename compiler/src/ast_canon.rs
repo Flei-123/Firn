@@ -105,6 +105,11 @@ fn ty(t: &TypeExpr) -> String {
             };
             format!("(fnty ({}) {})", ps.join(" "), r)
         }
+        // Round TUPLES: a tuple type. `(tup T1 T2 ..)`.
+        TypeExpr::Tuple(elems, _) => {
+            let es: Vec<String> = elems.iter().map(ty).collect();
+            format!("(tup {})", es.join(" "))
+        }
     }
 }
 

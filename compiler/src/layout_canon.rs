@@ -131,6 +131,11 @@ fn resolve(t: &TypeExpr, idx: &HashMap<String, usize>) -> Type {
                 None => Type::Void,
             }),
         },
+        // Round TUPLES: the type checker makes the struct of a tuple when it
+        // meets the type; this yardstick resolves the declarations of the
+        // root file only, and `lib/firnc1/types.fi` does the same -- both
+        // say `?`, so the comparison stays exact.
+        TypeExpr::Tuple(..) => Type::Error,
         // ROUND 70: the second spelling folds onto the canonical name.
         TypeExpr::Named(n, _) => match crate::types::canon_name(n.as_str()) {
             "i8" => Type::I8,
