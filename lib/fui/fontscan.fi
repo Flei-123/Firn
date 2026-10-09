@@ -1,0 +1,1113 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/fontscan.fi -- THE FONTS THE SYSTEM HAS: found, named, grouped.
+//
+// A font dialog needs a list, and the list is not in any one place: the
+// faces lie as files in a few directories, and what a face is CALLED
+// ("DejaVu Sans" / "Condensed Bold Oblique") is written inside the file,
+// in its `name` table. This module walks the directories once, reads the
+// head of every .ttf/.otf/.ttc file (the table directory, `head`, `OS/2`
+// and `name` -- a few kilobytes by pread, never the glyphs), and keeps
+// ONE sorted table: families, and under each family its faces.
+//
+//     fontscan.run_all()                        // or begin() + step(ms)
+//     var i: usize = 0
+//     while i < fontscan.family_count() {
+//         fontscan.family_name(i)               // "DejaVu Sans"
+//         fontscan.family_face(i, 0)            // a face id
+//         ...
+//
+// WHERE IT LOOKS. /usr/share/fonts, /usr/local/share/fonts, ~/.fonts and
+// ~/.local/share/fonts, recursively (depth 8, at most 2000 directories and
+// 20000 files). `FUI_FONT_DIRS=dir:dir` replaces that list (the tests use
+// it to be deterministic); `set_dirs` does the same from code. A symbolic
+// link to a FILE is followed; a link to a DIRECTORY below a root is not
+// (that is how a loop cannot eat the budget -- a root itself may be a link).
+// Unreadable files and directories are skipped without a word.
+//
+// WHICH NAME. The typographic names (name ID 16 family / 17 style) win over
+// the legacy pair (1 / 2): that is how "DejaVu Sans Condensed Bold" becomes
+// the style "Condensed Bold" of the family "DejaVu Sans" and "Light",
+// "Medium" and the like are rows of their own. English names win over other
+// languages; the Mac Roman strings of older fonts are read as well. The
+// style "Book", "Roman" and "Normal" are shown as "Regular".
+//
+// WHICH FACE IS BOLD. The weight class of OS/2 is 600 or more, or the Mac
+// style bit of `head` says so; italic is the OS/2 italic or oblique bit or
+// the Mac style bit. A face is "plain" when its style is only a combination
+// of Regular / Bold / Italic / Oblique -- the four a Bold and an Italic
+// check box can choose between (`pick_face`).
+//
+// WHAT CAN BE DRAWN. `lib/font/ttf.fi` reads TrueType outlines (glyf) of
+// one font per file. A face with CFF outlines (.otf from Adobe, URW) or a
+// face inside a .ttc collection is LISTED but `face_drawable` is false: a
+// preview has to use the system face for it.
+//
+// TIME. The scan runs in slices (`step(budget_ms)`), so a program with a
+// large font folder can keep painting; `run_all` is the same in one go.
+// `fallback_active` is true when no font was found at all: the table then
+// holds one entry, "DejaVu Sans", the face of lib/plat/sysfont.fi.
+import std.rt
+import std.fs
+import std.dir
+import std.env
+import std.time
+
+export {
+    NONE, set_dirs, begin, step, run_all, done, files_seen, dirs_seen,
+    millis, fallback_active,
+    family_count, family_name, family_face_count, family_face,
+    face_style, face_path, face_weight, face_bold, face_italic,
+    face_plain, face_drawable, face_index, face_family,
+    find_family, find_face_style, pick_face, fold_eq, fold_cmp, fold_has,
+    FACES_MAX,
+}
+
+const NONE: usize = 4294967295
+const FACES_MAX: usize = 4096
+const QUEUE_MAX: usize = 512
+const DEPTH_MAX: usize = 8
+const DIRS_MAX: usize = 2000
+const FILES_MAX: usize = 20000
+const NAME_CAP: usize = 524288
+
+const FL_BOLD: u32 = 1
+const FL_ITALIC: u32 = 2
+const FL_DRAW: u32 = 4
+const FL_PLAIN: u32 = 8
+const FL_FALLBACK: u32 = 16
+
+static mut NF: usize = 0
+static mut F_FO: [u32; 4096] = [0 as u32; 4096]
+static mut F_FL: [u32; 4096] = [0 as u32; 4096]
+static mut F_SO: [u32; 4096] = [0 as u32; 4096]
+static mut F_SL: [u32; 4096] = [0 as u32; 4096]
+static mut F_PO: [u32; 4096] = [0 as u32; 4096]
+static mut F_PL: [u32; 4096] = [0 as u32; 4096]
+static mut F_W: [u32; 4096] = [0 as u32; 4096]
+static mut F_FLAG: [u32; 4096] = [0 as u32; 4096]
+static mut F_IDX: [u32; 4096] = [0 as u32; 4096]
+static mut F_RANK: [u32; 4096] = [0 as u32; 4096]
+static mut ORD: [u32; 4096] = [0 as u32; 4096]
+static mut NORD: usize = 0
+static mut FAM_FIRST: [u32; 4096] = [0 as u32; 4096]
+static mut FAM_N: [u32; 4096] = [0 as u32; 4096]
+static mut NFAM: usize = 0
+
+static mut POOL: u64 = 0
+static mut NAMEBUF: u64 = 0
+static mut QBUF: u64 = 0
+static mut QST: [u32; 512] = [0 as u32; 512]
+static mut QN: usize = 0
+static mut CURBUF: u64 = 0
+static mut CURDIR: u64 = 0
+static mut CUR_OPEN: bool = false
+static mut CUR_DEPTH: usize = 0
+static mut STATE: u32 = 0
+static mut NFILES: usize = 0
+static mut NDIRS: usize = 0
+static mut MS: u64 = 0
+static mut DIRTY: bool = false
+static mut OVERRIDE: u64 = 0
+static mut HAS_OVERRIDE: bool = false
+static mut FALLBACK: bool = false
+
+// ------------------------------------------------------------ the pool
+
+fn fscan_alloc_of[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+fn pool() -> *mut rt.Buf {
+    if POOL == 0 {
+        POOL = fscan_alloc_of[rt.Buf]()
+        *(POOL as *mut rt.Buf) = rt.buf_new()
+    }
+    return POOL as *mut rt.Buf
+}
+
+fn pool_add(p: u64, n: usize) -> u32 {
+    let b: *mut rt.Buf = pool()
+    let at: usize = rt.buf_len(b)
+    rt.buf_push_bytes(b, p, n)
+    return at as u32
+}
+
+fn pool_str(off: u32, n: u32) -> str {
+    let b: *mut rt.Buf = pool()
+    return str { p: (rt.buf_ptr(b) + (off as u64)) as *mut u8, n: n as usize }
+}
+
+fn pool_reset() {
+    let b: *mut rt.Buf = pool()
+    rt.buf_clear(b)
+}
+
+fn new_buf() -> u64 {
+    let p: u64 = fscan_alloc_of[rt.Buf]()
+    *(p as *mut rt.Buf) = rt.buf_new()
+    return p
+}
+
+// ------------------------------------------------------------ strings
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+// Compare two byte strings without regard to the case of ASCII letters.
+fn fold_cmp(a: str, b: str) -> i32 {
+    var i: usize = 0
+    while i < a.n && i < b.n {
+        let x: u8 = lower(rt.ld8(a.p as u64, i))
+        let y: u8 = lower(rt.ld8(b.p as u64, i))
+        if x < y {
+            return 0 - 1
+        }
+        if x > y {
+            return 1
+        }
+        i = i + 1
+    }
+    if a.n < b.n {
+        return 0 - 1
+    }
+    if a.n > b.n {
+        return 1
+    }
+    return 0
+}
+
+fn fold_eq(a: str, b: str) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    return fold_cmp(a, b) == 0
+}
+
+// Does `hay` contain `needle` (ASCII case folded)? An empty needle is in everything.
+fn fold_has(hay: str, needle: str) -> bool {
+    if needle.n == 0 {
+        return true
+    }
+    if needle.n > hay.n {
+        return false
+    }
+    var i: usize = 0
+    while i + needle.n <= hay.n {
+        var j: usize = 0
+        while j < needle.n && lower(rt.ld8(hay.p as u64, i + j)) == lower(rt.ld8(needle.p as u64, j)) {
+            j = j + 1
+        }
+        if j == needle.n {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ------------------------------------------------------------ big endian
+
+fn be16(p: u64, o: usize) -> u32 {
+    return ((rt.ld8(p, o) as u32) << 8) | (rt.ld8(p, o + 1) as u32)
+}
+
+fn be32(p: u64, o: usize) -> u32 {
+    return (be16(p, o) << 16) | be16(p, o + 2)
+}
+
+fn pread_at(fd: i64, p: u64, n: usize, off: u64) -> i64 {
+    return syscall(17, fd, p as i64, n as i64, off as i64, 0, 0)
+}
+
+// ------------------------------------------------------------ Mac Roman
+
+static MACROMAN: [u16; 128] = [
+    196 as u16, 197 as u16, 199 as u16, 201 as u16, 209 as u16, 214 as u16,
+    220 as u16, 225 as u16, 224 as u16, 226 as u16, 228 as u16, 227 as u16,
+    229 as u16, 231 as u16, 233 as u16, 232 as u16, 234 as u16, 235 as u16,
+    237 as u16, 236 as u16, 238 as u16, 239 as u16, 241 as u16, 243 as u16,
+    242 as u16, 244 as u16, 246 as u16, 245 as u16, 250 as u16, 249 as u16,
+    251 as u16, 252 as u16, 8224 as u16, 176 as u16, 162 as u16, 163 as u16,
+    167 as u16, 8226 as u16, 182 as u16, 223 as u16, 174 as u16, 169 as u16,
+    8482 as u16, 180 as u16, 168 as u16, 8800 as u16, 198 as u16, 216 as u16,
+    8734 as u16, 177 as u16, 8804 as u16, 8805 as u16, 165 as u16, 181 as u16,
+    8706 as u16, 8721 as u16, 8719 as u16, 960 as u16, 8747 as u16, 170 as u16,
+    186 as u16, 937 as u16, 230 as u16, 248 as u16, 191 as u16, 161 as u16,
+    172 as u16, 8730 as u16, 402 as u16, 8776 as u16, 8710 as u16, 171 as u16,
+    187 as u16, 8230 as u16, 160 as u16, 192 as u16, 195 as u16, 213 as u16,
+    338 as u16, 339 as u16, 8211 as u16, 8212 as u16, 8220 as u16, 8221 as u16,
+    8216 as u16, 8217 as u16, 247 as u16, 9674 as u16, 255 as u16, 376 as u16,
+    8260 as u16, 8364 as u16, 8249 as u16, 8250 as u16, 64257 as u16,
+    64258 as u16, 8225 as u16, 183 as u16, 8218 as u16, 8222 as u16,
+    8240 as u16, 194 as u16, 202 as u16, 193 as u16, 203 as u16, 200 as u16,
+    205 as u16, 206 as u16, 207 as u16, 204 as u16, 211 as u16, 212 as u16,
+    63743 as u16, 210 as u16, 218 as u16, 219 as u16, 217 as u16, 305 as u16,
+    710 as u16, 732 as u16, 175 as u16, 728 as u16, 729 as u16, 730 as u16,
+    184 as u16, 733 as u16, 731 as u16, 711 as u16,
+]
+
+fn put_utf8(out: u64, n: usize, cap: usize, cp: u32) -> usize {
+    if cp < 128 as u32 {
+        if n + 1 > cap {
+            return n
+        }
+        rt.st8(out, n, cp as u8)
+        return n + 1
+    }
+    if cp < 2048 as u32 {
+        if n + 2 > cap {
+            return n
+        }
+        rt.st8(out, n, (192 as u32 | (cp >> 6)) as u8)
+        rt.st8(out, n + 1, (128 as u32 | (cp & 63 as u32)) as u8)
+        return n + 2
+    }
+    if cp < 65536 as u32 {
+        if n + 3 > cap {
+            return n
+        }
+        rt.st8(out, n, (224 as u32 | (cp >> 12)) as u8)
+        rt.st8(out, n + 1, (128 as u32 | ((cp >> 6) & 63 as u32)) as u8)
+        rt.st8(out, n + 2, (128 as u32 | (cp & 63 as u32)) as u8)
+        return n + 3
+    }
+    if n + 4 > cap {
+        return n
+    }
+    rt.st8(out, n, (240 as u32 | (cp >> 18)) as u8)
+    rt.st8(out, n + 1, (128 as u32 | ((cp >> 12) & 63 as u32)) as u8)
+    rt.st8(out, n + 2, (128 as u32 | ((cp >> 6) & 63 as u32)) as u8)
+    rt.st8(out, n + 3, (128 as u32 | (cp & 63 as u32)) as u8)
+    return n + 4
+}
+
+// A name string of the file -> UTF-8 in `out` (at most `cap` octets). `mac`:
+// one octet per character (Mac Roman); else UTF-16 big endian.
+fn decode_name(src: u64, n: usize, mac: bool, out: u64, cap: usize) -> usize {
+    var o: usize = 0
+    if mac {
+        var i: usize = 0
+        while i < n {
+            let c: u8 = rt.ld8(src, i)
+            if c < 128 as u8 {
+                o = put_utf8(out, o, cap, c as u32)
+            } else {
+                o = put_utf8(out, o, cap, MACROMAN[(c - 128 as u8) as usize] as u32)
+            }
+            i = i + 1
+        }
+        return o
+    }
+    var j: usize = 0
+    while j + 1 < n {
+        var cp: u32 = be16(src, j)
+        j = j + 2
+        if cp >= 55296 as u32 && cp < 56320 as u32 && j + 1 < n {
+            let lo: u32 = be16(src, j)
+            if lo >= 56320 as u32 && lo < 57344 as u32 {
+                cp = 65536 as u32 + ((cp - 55296 as u32) << 10) + (lo - 56320 as u32)
+                j = j + 2
+            }
+        }
+        o = put_utf8(out, o, cap, cp)
+    }
+    return o
+}
+
+// ------------------------------------------------------------ one face
+
+// Style names: "Book", "Roman", "Normal" are the regular face under other names.
+fn style_is(s: str, w: str) -> bool {
+    return fold_eq(s, w)
+}
+
+fn is_regularish(s: str) -> bool {
+    return style_is(s, "Regular") || style_is(s, "Book") || style_is(s, "Roman")
+    || style_is(s, "Normal") || s.n == 0
+}
+
+// The sort rank of a PLAIN style (the four of a Windows font dialog) and 4
+// for every other.
+fn style_rank(s: str, bold: bool, italic: bool) -> u32 {
+    if is_regularish(s) {
+        return 0 as u32
+    }
+    if style_is(s, "Italic") || style_is(s, "Oblique") {
+        return 1 as u32
+    }
+    if style_is(s, "Bold") {
+        return 2 as u32
+    }
+    if style_is(s, "Bold Italic") || style_is(s, "Bold Oblique") {
+        return 3 as u32
+    }
+    return 4 as u32
+}
+
+fn add_face(fam: str, sty: str, path: str, weight: u32, flags: u32, idx: u32) -> bool {
+    if NF >= FACES_MAX {
+        return false
+    }
+    var st: str = sty
+    if is_regularish(sty) {
+        st = "Regular"
+    }
+    let i: usize = NF
+    F_FO[i] = pool_add(fam.p as u64, fam.n)
+    F_FL[i] = fam.n as u32
+    F_SO[i] = pool_add(st.p as u64, st.n)
+    F_SL[i] = st.n as u32
+    F_PO[i] = pool_add(path.p as u64, path.n)
+    F_PL[i] = path.n as u32
+    F_W[i] = weight
+    let rank: u32 = style_rank(st, (flags & FL_BOLD) != 0 as u32, (flags & FL_ITALIC) != 0 as u32)
+    var fl: u32 = flags
+    if rank < 4 as u32 {
+        fl = fl | FL_PLAIN
+    }
+    F_FLAG[i] = fl
+    F_IDX[i] = idx
+    F_RANK[i] = rank
+    NF = NF + 1
+    DIRTY = true
+    return true
+}
+
+// Find a table in the directory read at `dp` (n records of 16 octets).
+fn find_table(dp: u64, n: usize, a: u8, b: u8, c: u8, d: u8, off: *mut u32, len: *mut u32) -> bool {
+    var i: usize = 0
+    while i < n {
+        let r: usize = i * 16
+        if rt.ld8(dp, r) == a && rt.ld8(dp, r + 1) == b && rt.ld8(dp, r + 2) == c
+        && rt.ld8(dp, r + 3) == d {
+            *off = be32(dp, r + 8)
+            *len = be32(dp, r + 12)
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn basename_of(path: str) -> str {
+    var s: usize = 0
+    var i: usize = 0
+    while i < path.n {
+        if rt.ld8(path.p as u64, i) == 47 as u8 {
+            s = i + 1
+        }
+        i = i + 1
+    }
+    var e: usize = path.n
+    var k: usize = path.n
+    while k > s {
+        if rt.ld8(path.p as u64, k - 1) == 46 as u8 {
+            e = k - 1
+            k = s
+        } else {
+            k = k - 1
+        }
+    }
+    return str { p: (path.p as u64 + (s as u64)) as *mut u8, n: e - s }
+}
+
+// One font (the sfnt at `base`) of the open file. How many faces were added.
+// `add_face` copies both names into the pool, so the stack buffers do not outlive the call.
+#[allow_escape]
+fn parse_font(fd: i64, fsize: u64, base: u64, path: str, idx: u32, in_collection: bool) -> usize {
+    var hd: [u8; 16] = [0 as u8; 16]
+    let hp: u64 = (&hd[0]) as u64
+    if pread_at(fd, hp, 12, base) < 12 {
+        return 0
+    }
+    let ver: u32 = be32(hp, 0)
+    var cff: bool = false
+    if ver == 1330926671 as u32 {
+        cff = true // 'OTTO'
+    } else if ver != 65536 as u32 && ver != 1953658213 as u32 {
+        return 0
+    }
+    var nt: usize = be16(hp, 4) as usize
+    if nt == 0 || nt > 64 {
+        return 0
+    }
+    var td: [u8; 1032] = [0 as u8; 1032]
+    let dp: u64 = (&td[0]) as u64
+    if pread_at(fd, dp, nt * 16, base + 12) < ((nt * 16) as i64) {
+        return 0
+    }
+    var no: u32 = 0 as u32
+    var nl: u32 = 0 as u32
+    var o: u32 = 0 as u32
+    var l: u32 = 0 as u32
+    // a font whose tables run past the end of the file is broken: not listed
+    var k0: usize = 0
+    while k0 < nt {
+        if (be32(dp, k0 * 16 + 8) as u64) + (be32(dp, k0 * 16 + 12) as u64) > fsize {
+            return 0
+        }
+        k0 = k0 + 1
+    }
+    if !find_table(dp, nt, 104, 101, 97, 100, &o, &l) {
+        return 0
+    }
+    var drawable: bool = !cff && !in_collection
+    if drawable {
+        if !find_table(dp, nt, 103, 108, 121, 102, &o, &l) { drawable = false }
+        if !find_table(dp, nt, 108, 111, 99, 97, &o, &l) { drawable = false }
+        if !find_table(dp, nt, 104, 109, 116, 120, &o, &l) { drawable = false }
+        if !find_table(dp, nt, 99, 109, 97, 112, &o, &l) { drawable = false }
+        if !find_table(dp, nt, 104, 104, 101, 97, &o, &l) { drawable = false }
+        if !find_table(dp, nt, 109, 97, 120, 112, &o, &l) { drawable = false }
+    }
+    // head: macStyle (octet 44)
+    var mac: u32 = 0 as u32
+    if find_table(dp, nt, 104, 101, 97, 100, &o, &l) && l >= 54 as u32 {
+        var hb: [u8; 64] = [0 as u8; 64]
+        if pread_at(fd, (&hb[0]) as u64, 54, o as u64) >= 54 {
+            mac = be16((&hb[0]) as u64, 44)
+        }
+    }
+    // OS/2: weight class (octet 4), fsSelection (octet 62)
+    var weight: u32 = 0 as u32
+    var sel: u32 = 0 as u32
+    if find_table(dp, nt, 79, 83, 47, 50, &o, &l) && l >= 64 as u32 {
+        var ob: [u8; 72] = [0 as u8; 72]
+        if pread_at(fd, (&ob[0]) as u64, 64, o as u64) >= 64 {
+            weight = be16((&ob[0]) as u64, 4)
+            sel = be16((&ob[0]) as u64, 62)
+        }
+    }
+    // name table
+    if !find_table(dp, nt, 110, 97, 109, 101, &no, &nl) {
+        nl = 0 as u32
+    }
+    // best string per name id: 0 = id 1, 1 = id 2, 2 = id 16, 3 = id 17
+    var best: [u32; 4] = [0 as u32; 4]
+    var boff: [u32; 4] = [0 as u32; 4]
+    var blen: [u32; 4] = [0 as u32; 4]
+    var bmac: [u32; 4] = [0 as u32; 4]
+    var nb: u64 = NAMEBUF
+    if nb == 0 {
+        NAMEBUF = rt.heap_alloc(NAME_CAP)
+        nb = NAMEBUF
+    }
+    if nl >= 8 as u32 && nb != 0 {
+        var want: usize = nl as usize
+        if want > NAME_CAP {
+            want = NAME_CAP
+        }
+        let got: i64 = pread_at(fd, nb, want, no as u64)
+        if got >= 8 {
+            let cnt: usize = be16(nb, 2) as usize
+            let so: usize = be16(nb, 4) as usize
+            var k: usize = 0
+            while k < cnt && 6 + (k + 1) * 12 <= (got as usize) {
+                let r: usize = 6 + k * 12
+                let pl: u32 = be16(nb, r)
+                let en: u32 = be16(nb, r + 2)
+                let la: u32 = be16(nb, r + 4)
+                let id: u32 = be16(nb, r + 6)
+                let ln: usize = be16(nb, r + 8) as usize
+                let of: usize = so + (be16(nb, r + 10) as usize)
+                var slot: usize = 9
+                if id == 1 as u32 { slot = 0 }
+                if id == 2 as u32 { slot = 1 }
+                if id == 16 as u32 { slot = 2 }
+                if id == 17 as u32 { slot = 3 }
+                if slot < 4 && ln > 0 && of + ln <= (got as usize) {
+                    var sc: u32 = 0 as u32
+                    if pl == 3 as u32 && la == 1033 as u32 { sc = 6 as u32 }
+                    else if pl == 1 as u32 && en == 0 as u32 && la == 0 as u32 { sc = 5 as u32 }
+                    else if pl == 3 as u32 && (la & 255 as u32) == 9 as u32 { sc = 4 as u32 }
+                    else if pl == 0 as u32 { sc = 3 as u32 }
+                    else if pl == 3 as u32 { sc = 2 as u32 }
+                    else if pl == 1 as u32 && en == 0 as u32 { sc = 1 as u32 }
+                    if sc > best[slot] {
+                        best[slot] = sc
+                        boff[slot] = of as u32
+                        blen[slot] = ln as u32
+                        bmac[slot] = 0 as u32
+                        if pl == 1 as u32 {
+                            bmac[slot] = 1 as u32
+                        }
+                    }
+                }
+                k = k + 1
+            }
+        }
+    }
+    var fbuf: [u8; 260] = [0 as u8; 260]
+    var sbuf: [u8; 260] = [0 as u8; 260]
+    var fn_: usize = 0
+    var sn: usize = 0
+    var fs_slot: usize = 0
+    if best[2] > 0 as u32 {
+        fs_slot = 2
+    } else if best[0] > 0 as u32 {
+        fs_slot = 0
+    } else {
+        fs_slot = 9
+    }
+    if fs_slot < 4 {
+        fn_ = decode_name(nb + (boff[fs_slot] as u64), blen[fs_slot] as usize, bmac[fs_slot] != 0 as u32,
+            (&fbuf[0]) as u64, 256)
+    }
+    var ss_slot: usize = 9
+    if best[3] > 0 as u32 && best[2] > 0 as u32 {
+        ss_slot = 3
+    } else if best[1] > 0 as u32 && best[2] == 0 as u32 {
+        ss_slot = 1
+    } else if best[1] > 0 as u32 {
+        ss_slot = 1
+    }
+    if ss_slot < 4 {
+        sn = decode_name(nb + (boff[ss_slot] as u64), blen[ss_slot] as usize, bmac[ss_slot] != 0 as u32,
+            (&sbuf[0]) as u64, 256)
+    }
+    var fam: str = str { p: (&fbuf[0]) as *mut u8, n: fn_ }
+    if fn_ == 0 {
+        fam = basename_of(path)
+    }
+    let sty: str = str { p: (&sbuf[0]) as *mut u8, n: sn }
+    var flags: u32 = 0 as u32
+    var w: u32 = weight
+    if w == 0 as u32 {
+        w = 400 as u32
+        if (mac & 1 as u32) != 0 as u32 {
+            w = 700 as u32
+        }
+    }
+    if w >= 600 as u32 || (mac & 1 as u32) != 0 as u32 {
+        flags = flags | FL_BOLD
+    }
+    if (sel & 1 as u32) != 0 as u32 || (sel & 512 as u32) != 0 as u32 || (mac & 2 as u32) != 0 as u32 {
+        flags = flags | FL_ITALIC
+    }
+    if fold_has(sty, "italic") || fold_has(sty, "oblique") {
+        flags = flags | FL_ITALIC
+    }
+    if drawable {
+        flags = flags | FL_DRAW
+    }
+    if add_face(fam, sty, path, w, flags, idx) {
+        return 1
+    }
+    return 0
+}
+
+// A whole file: one sfnt, or every font of a collection.
+fn parse_file(path: str) -> usize {
+    let fd: i64 = fs.open_read(path) catch (0 - 1)
+    if fd < 0 {
+        return 0
+    }
+    var h: [u8; 16] = [0 as u8; 16]
+    let hp: u64 = (&h[0]) as u64
+    var added: usize = 0
+    // the size of the file: seek to the end (octet offsets are checked against it)
+    let end: i64 = syscall(8, fd, 0, 2, 0, 0, 0)
+    if end < 12 {
+        fs.close_fd(fd)
+        return 0
+    }
+    let fsize: u64 = end as u64
+    if pread_at(fd, hp, 12, 0) >= 12 {
+        if be32(hp, 0) == 1953784678 as u32 {
+            // 'ttcf': the offsets of the fonts follow the count
+            var cnt: usize = be32(hp, 8) as usize
+            if cnt > 16 {
+                cnt = 16
+            }
+            var offs: [u8; 64] = [0 as u8; 64]
+            if cnt > 0 && pread_at(fd, (&offs[0]) as u64, cnt * 4, 12) >= ((cnt * 4) as i64) {
+                var k: usize = 0
+                while k < cnt {
+                    added = added + parse_font(fd, fsize, be32((&offs[0]) as u64, k * 4) as u64, path, k as u32, true)
+                    k = k + 1
+                }
+            }
+        } else {
+            added = parse_font(fd, fsize, 0, path, 0 as u32, false)
+        }
+    }
+    fs.close_fd(fd)
+    return added
+}
+
+// ------------------------------------------------------------ sorting
+
+fn fam_str(i: usize) -> str {
+    return pool_str(F_FO[i], F_FL[i])
+}
+
+fn sty_str(i: usize) -> str {
+    return pool_str(F_SO[i], F_SL[i])
+}
+
+// Is face a before face b?
+fn before(a: usize, b: usize) -> bool {
+    let c: i32 = fold_cmp(fam_str(a), fam_str(b))
+    if c != 0 {
+        return c < 0
+    }
+    if F_RANK[a] != F_RANK[b] {
+        return F_RANK[a] < F_RANK[b]
+    }
+    if F_W[a] != F_W[b] {
+        return F_W[a] < F_W[b]
+    }
+    let ia: u32 = F_FLAG[a] & FL_ITALIC
+    let ib: u32 = F_FLAG[b] & FL_ITALIC
+    if ia != ib {
+        return ia < ib
+    }
+    let d: i32 = fold_cmp(sty_str(a), sty_str(b))
+    if d != 0 {
+        return d < 0
+    }
+    return a < b
+}
+
+fn shell_sort(n: usize) {
+    var gaps: [usize; 9] = [1750, 701, 301, 132, 57, 23, 10, 4, 1]
+    var g: usize = 0
+    while g < 9 {
+        let gap: usize = gaps[g]
+        var i: usize = gap
+        while i < n {
+            let v: u32 = ORD[i]
+            var j: usize = i
+            while j >= gap && before(v as usize, ORD[j - gap] as usize) {
+                ORD[j] = ORD[j - gap]
+                j = j - gap
+            }
+            ORD[j] = v
+            i = i + 1
+        }
+        g = g + 1
+    }
+}
+
+// Sort all faces; drop a face whose family and style equal the one before
+// (the same font found twice: the first found stays); group by family.
+fn rebuild() {
+    var n: usize = 0
+    while n < NF {
+        ORD[n] = n as u32
+        n = n + 1
+    }
+    shell_sort(NF)
+    var kept: usize = 0
+    var k: usize = 0
+    while k < NF {
+        let f: usize = ORD[k] as usize
+        var dup: bool = false
+        if kept > 0 {
+            let p: usize = ORD[kept - 1] as usize
+            if fold_eq(fam_str(f), fam_str(p)) && fold_eq(sty_str(f), sty_str(p)) {
+                dup = true
+            }
+        }
+        if !dup {
+            ORD[kept] = f as u32
+            kept = kept + 1
+        }
+        k = k + 1
+    }
+    NORD = kept
+    NFAM = 0
+    var i: usize = 0
+    while i < NORD {
+        let f: usize = ORD[i] as usize
+        if NFAM > 0 && fold_eq(fam_str(f), fam_str(ORD[FAM_FIRST[NFAM - 1] as usize] as usize)) {
+            FAM_N[NFAM - 1] = FAM_N[NFAM - 1] + 1 as u32
+        } else {
+            if NFAM < FACES_MAX {
+                FAM_FIRST[NFAM] = i as u32
+                FAM_N[NFAM] = 1 as u32
+                NFAM = NFAM + 1
+            }
+        }
+        i = i + 1
+    }
+    DIRTY = false
+}
+
+// ------------------------------------------------------------ the walk
+
+fn has_ext(name: str) -> bool {
+    if name.n < 5 {
+        return false
+    }
+    let a: str = str { p: (name.p as u64 + ((name.n - 4) as u64)) as *mut u8, n: 4 }
+    return fold_eq(a, ".ttf") || fold_eq(a, ".otf") || fold_eq(a, ".ttc") || fold_eq(a, ".otc")
+}
+
+fn queue_push(path: str, depth: usize) {
+    if QBUF == 0 {
+        QBUF = new_buf()
+    }
+    if QN >= QUEUE_MAX {
+        return
+    }
+    let b: *mut rt.Buf = QBUF as *mut rt.Buf
+    QST[QN] = rt.buf_len(b) as u32
+    QN = QN + 1
+    rt.buf_push(b, depth as u8)
+    rt.buf_push_bytes(b, path.p as u64, path.n)
+    rt.buf_push(b, 0 as u8)
+}
+
+fn push_roots(list: str) {
+    // colon separated; the first root must be walked first, so push them last to first
+    var starts: [usize; 32] = [0; 32]
+    var ends: [usize; 32] = [0; 32]
+    var cnt: usize = 0
+    var s: usize = 0
+    var i: usize = 0
+    while i <= list.n {
+        if i == list.n || rt.ld8(list.p as u64, i) == 58 as u8 {
+            if i > s && cnt < 32 {
+                starts[cnt] = s
+                ends[cnt] = i
+                cnt = cnt + 1
+            }
+            s = i + 1
+        }
+        i = i + 1
+    }
+    var k: usize = cnt
+    while k > 0 {
+        k = k - 1
+        queue_push(str { p: (list.p as u64 + (starts[k] as u64)) as *mut u8, n: ends[k] - starts[k] }, 0)
+    }
+}
+
+// Replace the directories to scan (colon separated). Call before `begin`.
+fn set_dirs(list: str) {
+    if OVERRIDE == 0 {
+        OVERRIDE = new_buf()
+    }
+    let b: *mut rt.Buf = OVERRIDE as *mut rt.Buf
+    rt.buf_clear(b)
+    rt.buf_push_bytes(b, list.p as u64, list.n)
+    HAS_OVERRIDE = true
+}
+
+// Forget everything and prepare a new walk.
+fn begin() {
+    NF = 0
+    NORD = 0
+    NFAM = 0
+    NFILES = 0
+    NDIRS = 0
+    MS = 0
+    QN = 0
+    DIRTY = false
+    FALLBACK = false
+    pool_reset()
+    if QBUF != 0 {
+        rt.buf_clear(QBUF as *mut rt.Buf)
+    }
+    if CUR_OPEN {
+        dir.close(CURDIR as *mut dir.Dir)
+        CUR_OPEN = false
+    }
+    if HAS_OVERRIDE {
+        let b: *mut rt.Buf = OVERRIDE as *mut rt.Buf
+        push_roots(str { p: rt.buf_data(b), n: rt.buf_len(b) })
+    } else {
+        var ev: rt.Buf = rt.buf_new()
+        if env.get_into("FUI_FONT_DIRS", &ev) {
+            push_roots(str { p: rt.buf_data(&ev), n: rt.buf_len(&ev) })
+        } else {
+            let home: str = env.get("HOME")
+            var l: rt.Buf = rt.buf_new()
+            rt.buf_push_bytes(&l, "/usr/share/fonts:/usr/local/share/fonts".p as u64, 38)
+            if home.n > 0 {
+                rt.buf_push(&l, 58 as u8)
+                rt.buf_push_bytes(&l, home.p as u64, home.n)
+                rt.buf_push_bytes(&l, "/.fonts:".p as u64, 8)
+                rt.buf_push_bytes(&l, home.p as u64, home.n)
+                rt.buf_push_bytes(&l, "/.local/share/fonts".p as u64, 19)
+            }
+            push_roots(str { p: rt.buf_data(&l), n: rt.buf_len(&l) })
+            rt.buf_free(&l)
+        }
+        rt.buf_free(&ev)
+    }
+    STATE = 1
+}
+
+// Take the next directory off the queue; false = the queue is empty.
+fn open_next_dir() -> bool {
+    while QN > 0 {
+        QN = QN - 1
+        let b: *mut rt.Buf = QBUF as *mut rt.Buf
+        let st: usize = QST[QN] as usize
+        let depth: usize = rt.ld8(rt.buf_ptr(b), st) as usize
+        var e: usize = st + 1
+        while e < rt.buf_len(b) && rt.ld8(rt.buf_ptr(b), e) != 0 as u8 {
+            e = e + 1
+        }
+        if CURBUF == 0 {
+            CURBUF = new_buf()
+        }
+        if CURDIR == 0 {
+            CURDIR = fscan_alloc_of[dir.Dir]()
+        }
+        let cb: *mut rt.Buf = CURBUF as *mut rt.Buf
+        rt.buf_clear(cb)
+        rt.buf_push_bytes(cb, rt.buf_ptr(b) + ((st + 1) as u64), e - st - 1)
+        rt.buf_set_len(b, st)
+        *(CURDIR as *mut dir.Dir) = dir.open(str { p: rt.buf_data(cb), n: rt.buf_len(cb) })
+        if dir.is_open(CURDIR as *mut dir.Dir) {
+            CUR_OPEN = true
+            CUR_DEPTH = depth
+            NDIRS = NDIRS + 1
+            return true
+        }
+    }
+    return false
+}
+
+// One directory entry of the open directory.
+fn handle_entry() {
+    let d: *mut dir.Dir = CURDIR as *mut dir.Dir
+    let name: str = (*d).name
+    var kind: u8 = (*d).kind
+    let cb: *mut rt.Buf = CURBUF as *mut rt.Buf
+    let keep: usize = rt.buf_len(cb)
+    rt.buf_push(cb, 47 as u8)
+    rt.buf_push_bytes(cb, name.p as u64, name.n)
+    let full: str = str { p: rt.buf_data(cb), n: rt.buf_len(cb) }
+    var is_link: bool = false
+    if kind == dir.KIND_LINK || kind == dir.KIND_UNKNOWN {
+        let info: fs.FileInfo = fs.stat(full) catch fs.FileInfo { kind: fs.KIND_OTHER, mode: 0 as u32, size: 0, mtime_ns: 0 }
+        is_link = kind == dir.KIND_LINK
+        if info.kind == fs.KIND_FILE {
+            kind = dir.KIND_FILE
+        } else if info.kind == fs.KIND_DIR {
+            kind = dir.KIND_DIR
+        } else {
+            kind = dir.KIND_UNKNOWN
+        }
+    }
+    if kind == dir.KIND_DIR && !is_link {
+        if CUR_DEPTH + 1 <= DEPTH_MAX && NDIRS + QN < DIRS_MAX {
+            queue_push(full, CUR_DEPTH + 1)
+        }
+    } else if kind == dir.KIND_FILE && has_ext(name) {
+        if NFILES < FILES_MAX {
+            NFILES = NFILES + 1
+            let added: usize = parse_file(full)
+        }
+    }
+    rt.buf_set_len(cb, keep)
+}
+
+fn finish() {
+    if CUR_OPEN {
+        dir.close(CURDIR as *mut dir.Dir)
+        CUR_OPEN = false
+    }
+    if NF == 0 {
+        // nothing found: the face the system font loader uses, as the only entry
+        add_face("DejaVu Sans", "Regular", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 400 as u32,
+            FL_DRAW | FL_FALLBACK, 0 as u32)
+        FALLBACK = true
+    }
+    rebuild()
+    STATE = 2
+}
+
+// Walk for at most `budget_ms` milliseconds (0 = until done). true = done.
+fn step(budget_ms: u64) -> bool {
+    if STATE == 2 {
+        return true
+    }
+    if STATE == 0 {
+        begin()
+    }
+    let t0: u64 = time.monotonic_ns()
+    var fin: bool = false
+    while !fin {
+        if budget_ms > 0 && (time.monotonic_ns() - t0) / 1000000 >= budget_ms {
+            break
+        }
+        if !CUR_OPEN {
+            if !open_next_dir() {
+                fin = true
+            }
+        }
+        if !fin {
+            if dir.next(CURDIR as *mut dir.Dir) {
+                handle_entry()
+            } else {
+                dir.close(CURDIR as *mut dir.Dir)
+                CUR_OPEN = false
+            }
+        }
+    }
+    if fin {
+        finish()
+    } else if DIRTY {
+        rebuild()
+    }
+    MS = MS + (time.monotonic_ns() - t0) / 1000000
+    return fin
+}
+
+// The whole walk in one go (a fresh one; an earlier result is dropped).
+fn run_all() {
+    begin()
+    let d: bool = step(0)
+}
+
+fn done() -> bool {
+    return STATE == 2
+}
+
+fn files_seen() -> usize { return NFILES }
+
+fn dirs_seen() -> usize { return NDIRS }
+
+// Milliseconds spent walking (the sum of the slices).
+fn millis() -> u64 { return MS }
+
+fn fallback_active() -> bool { return FALLBACK }
+
+// ------------------------------------------------------------ the answers
+
+fn family_count() -> usize { return NFAM }
+
+fn family_name(i: usize) -> str {
+    if i >= NFAM {
+        return ""
+    }
+    return fam_str(ORD[FAM_FIRST[i] as usize] as usize)
+}
+
+fn family_face_count(i: usize) -> usize {
+    if i >= NFAM {
+        return 0
+    }
+    return FAM_N[i] as usize
+}
+
+// The face id of face `j` (in the order Regular, Italic, Bold, Bold Italic,
+// then the others by weight) of family `i`; NONE when out of range.
+fn family_face(i: usize, j: usize) -> usize {
+    if i >= NFAM || j >= (FAM_N[i] as usize) {
+        return NONE
+    }
+    return ORD[(FAM_FIRST[i] as usize) + j] as usize
+}
+
+fn face_style(f: usize) -> str {
+    if f >= NF { return "" }
+    return sty_str(f)
+}
+
+fn face_family(f: usize) -> str {
+    if f >= NF { return "" }
+    return fam_str(f)
+}
+
+fn face_path(f: usize) -> str {
+    if f >= NF { return "" }
+    return pool_str(F_PO[f], F_PL[f])
+}
+
+fn face_weight(f: usize) -> u32 {
+    if f >= NF { return 400 as u32 }
+    return F_W[f]
+}
+
+fn face_bold(f: usize) -> bool {
+    return f < NF && (F_FLAG[f] & FL_BOLD) != 0 as u32
+}
+
+fn face_italic(f: usize) -> bool {
+    return f < NF && (F_FLAG[f] & FL_ITALIC) != 0 as u32
+}
+
+fn face_plain(f: usize) -> bool {
+    return f < NF && (F_FLAG[f] & FL_PLAIN) != 0 as u32
+}
+
+fn face_drawable(f: usize) -> bool {
+    return f < NF && (F_FLAG[f] & FL_DRAW) != 0 as u32
+}
+
+fn face_index(f: usize) -> u32 {
+    if f >= NF { return 0 as u32 }
+    return F_IDX[f]
+}
+
+// The family with this name (ASCII case folded), NONE if there is none.
+fn find_family(name: str) -> usize {
+    var i: usize = 0
+    while i < NFAM {
+        if fold_eq(family_name(i), name) {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// Index `j` within family `fam` of the face whose style is `style`, else NONE.
+fn find_face_style(fam: usize, style: str) -> usize {
+    var j: usize = 0
+    while j < family_face_count(fam) {
+        if fold_eq(face_style(family_face(fam, j)), style) {
+            return j
+        }
+        j = j + 1
+    }
+    return NONE
+}
+
+// THE FACE FOR A BOLD AND AN ITALIC CHECK BOX: within family `fam` the face
+// (index) with exactly this boldness and slant; a plain style (Regular, Bold,
+// Italic, Bold Italic) beats any other ("Condensed Bold"), then the weight
+// closest to 400 / 700. NONE when the family has no such face.
+fn pick_face(fam: usize, bold: bool, italic: bool) -> usize {
+    var best: usize = NONE
+    var best_score: u32 = 0 as u32
+    var j: usize = 0
+    while j < family_face_count(fam) {
+        let f: usize = family_face(fam, j)
+        if face_bold(f) == bold && face_italic(f) == italic {
+            var sc: u32 = 1 as u32
+            if face_plain(f) {
+                sc = sc + 2000 as u32
+            }
+            var target: u32 = 400 as u32
+            if bold {
+                target = 700 as u32
+            }
+            var dist: u32 = 0 as u32
+            if face_weight(f) > target {
+                dist = face_weight(f) - target
+            } else {
+                dist = target - face_weight(f)
+            }
+            if dist < 1000 as u32 {
+                sc = sc + (1000 as u32 - dist)
+            }
+            if sc > best_score {
+                best_score = sc
+                best = j
+            }
+        }
+        j = j + 1
+    }
+    return best
+}
