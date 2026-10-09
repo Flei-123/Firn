@@ -70,7 +70,7 @@ nobj = bus.get_object("org.freedesktop.Notifications", "/org/freedesktop/Notific
 ni = dbus.Interface(nobj, "org.freedesktop.Notifications")
 check("GetCapabilities", [str(c) for c in ni.GetCapabilities()] == ["body", "actions", "persistence"], ni.GetCapabilities())
 check("GetServerInformation", [str(x) for x in ni.GetServerInformation()] == ["OrientOS toast", "Fleitec", "1", "1.2"], ni.GetServerInformation())
-i1 = int(ni.Notify("Firefox", 0, "icon", "Summary äö 日本", "Body\nline two\ttab", ["default", "Open"],
+i1 = int(ni.Notify("Firefox", 0, "icon", "Summary äö 日本", "Body\nline two\ttab", ["default", "Open"],  # english: ok
                    {"urgency": dbus.Byte(2), "category": "x", "n": dbus.Int32(5), "arr": dbus.Array([1, 2], signature="i")}, 5000,
                    signature="susssasa{sv}i"))
 i2 = int(ni.Notify("Other", 0, "", "Second", "", [], {}, -1, signature="susssasa{sv}i"))
@@ -81,7 +81,7 @@ check("three toasts in the sink", len(lines) == 3, lines)
 if len(lines) == 3:
     f = lines[0].split("\t")
     check("first toast: id, urgency 2 (a byte hint), app, summary and body with TAB / line feed escaped, UTF-8",
-          f == ["TOAST", "1", "2", "Firefox", "Summary äö 日本", "Body\\nline two\\ttab"], f)
+          f == ["TOAST", "1", "2", "Firefox", "Summary äö 日本", "Body\\nline two\\ttab"], f)  # english: ok
     check("second toast: no urgency hint is 1", lines[1].split("\t")[:3] == ["TOAST", "2", "1"], lines[1])
     check("third toast replaced id 1", lines[2].split("\t")[:2] == ["TOAST", "1"] and lines[2].split("\t")[4] == "Replaced", lines[2])
 ni.CloseNotification(dbus.UInt32(2), signature="u")
@@ -113,7 +113,7 @@ def wait_response(n, timeout=8):
         time.sleep(0.05)
     return responses[n - 1] if len(responses) >= n else None
 
-answer("ok\t/tmp/a b.png\\n/tmp/ü.png\n")
+answer("ok\t/tmp/a b.png\\n/tmp/ü.png\n")  # english: ok
 h = fc.OpenFile("x11:123", "Pick pictures", {"handle_token": "tok1", "multiple": True, "current_folder": dbus.ByteArray(b"/tmp/x\0"),
                 "filters": dbus.Array([("Pics", dbus.Array([(dbus.UInt32(0), "*.png"), (dbus.UInt32(0), "*.jpg"), (dbus.UInt32(1), "image/gif")], signature="(us)")),
                                        ("All", dbus.Array([(dbus.UInt32(0), "*")], signature="(us)"))], signature="(sa(us))")}, signature="ssa{sv}")
