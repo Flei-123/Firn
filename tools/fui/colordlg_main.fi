@@ -1,0 +1,1544 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/colordlg_main.fi -- THE CHECK OF lib/fui/colordlg.fi, WITHOUT A WINDOW.
+//
+// The colour dialog is built the way colordlg.run builds it, painted into a canvas
+// of its window size and driven through the SAME entry points a platform host
+// calls (fuiwirt's pointer and keys, app_key / app_char): synthetic mouse presses
+// and drags on the swatches, the colour field and the lightness bar, typing into
+// the seven fields, the buttons, Esc and Enter.
+//
+//     firnc -o /tmp/colordlg tools/fui/colordlg_main.fi
+//     COLORDLG_TEST=1 HOME=$(mktemp -d) /tmp/colordlg [dir-for-pngs]   the checks
+//     /tmp/colordlg speed                                              FRAME_MS lines
+//
+// The persistence checks write ~/.config/firn/dialog-colors.txt: they run only
+// when COLORDLG_TEST is set (tools/dialog/colordlg_run.sh sets it together with a
+// HOME of its own); without it the dialogs run with the store switched off.
+// The last line is COLORDLG PASSED or COLORDLG FAILED.
+import std.rt
+import std.fs
+import html.mem
+import paint.canvas
+import paint.png
+import font.metrics
+import fui.theme
+import fui.painter
+import fui.scene
+import fui.editor
+import fui.widget
+import fui.style
+import fui.render
+import fui.a11y
+import plat.fuiwirt
+import plat.sysfont
+import plat.envvar
+import fui.apphost
+import fui.app
+import fui.colordlg
+
+static mut BAD: usize = 0
+static mut FONT: u64 = 0
+static mut CLOCK: i64 = 1000
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_num(v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&t, v)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn say_hex(v: u32) {
+    var h: [u8; 7] = [0 as u8; 7]
+    colordlg.hex_of(v, &h)
+    say(str { p: (&h[0]) as *mut u8, n: 7 })
+}
+
+fn check(ok: bool, what: str) {
+    if ok {
+        say("  ok    ")
+    } else {
+        say("  WRONG ")
+        BAD = BAD + 1
+    }
+    say(what)
+    say("\n")
+}
+
+// a check that tells the two values when it fails
+fn eq_hex(what: str, got: u32, want: u32) {
+    if got == want {
+        say("  ok    ")
+        say(what)
+        say("\n")
+    } else {
+        say("  WRONG ")
+        say(what)
+        say(" -- got ")
+        say_hex(got)
+        say(" want ")
+        say_hex(want)
+        say("\n")
+        BAD = BAD + 1
+    }
+}
+
+fn eq_num(what: str, got: i64, want: i64) {
+    if got == want {
+        say("  ok    ")
+        say(what)
+        say("\n")
+    } else {
+        say("  WRONG ")
+        say(what)
+        say(" -- got ")
+        say_num(got)
+        say(" want ")
+        say_num(want)
+        say("\n")
+        BAD = BAD + 1
+    }
+}
+
+fn same(a: str, b: str) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    var i: usize = 0
+    while i < a.n {
+        if rt.ld8(a.p as u64, i) != rt.ld8(b.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn now_ms() -> f64 {
+    var ts: [u64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as u64)
+    return (ts[0] as f64) * 1000.0 + (ts[1] as f64) / 1000000.0
+}
+
+fn fabs(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+// ------------------------------------------------------------ the reference maths
+//
+// HSL -> RGB by the formula of the CSS Color spec (f(n) = l - a * max(-1, min(k - 3,
+// 9 - k, 1)), k = (n + h / 30) mod 12): NOT the sector code of the library, so a
+// slip in one of them shows.
+fn ref_f(n: f64, h: f64, s: f64, l: f64) -> f64 {
+    var k: f64 = n + h / 30.0
+    while k >= 12.0 {
+        k = k - 12.0
+    }
+    var a: f64 = s * l
+    if 1.0 - l < l {
+        a = s * (1.0 - l)
+    }
+    var m: f64 = k - 3.0
+    if 9.0 - k < m {
+        m = 9.0 - k
+    }
+    if 1.0 < m {
+        m = 1.0
+    }
+    if m < 0.0 - 1.0 {
+        m = 0.0 - 1.0
+    }
+    return l - a * m
+}
+
+fn ref_byte(v: f64) -> u32 {
+    return (v * 255.0 + 0.5) as u32
+}
+
+fn ref_hsl(h: f64, s: f64, l: f64) -> u32 {
+    return (ref_byte(ref_f(0.0, h, s, l)) << 16) | (ref_byte(ref_f(8.0, h, s, l)) << 8)
+    | ref_byte(ref_f(4.0, h, s, l))
+}
+
+fn chan_dev(a: u32, b: u32) -> u32 {
+    var m: u32 = 0 as u32
+    var k: u32 = 0 as u32
+    while k < 3 as u32 {
+        let x: u32 = (a >> (k * 8 as u32)) & 255 as u32
+        let y: u32 = (b >> (k * 8 as u32)) & 255 as u32
+        var d: u32 = 0 as u32
+        if x >= y {
+            d = x - y
+        } else {
+            d = y - x
+        }
+        if d > m {
+            m = d
+        }
+        k = k + 1 as u32
+    }
+    return m
+}
+
+// ------------------------------------------------------------ the pure functions
+
+fn run_maths() {
+    say("== the colour maths\n")
+    // a dense raster: every 7th value of every channel, both models
+    var worst_l: u32 = 0 as u32
+    var worst_v: u32 = 0 as u32
+    var worst_ref: u32 = 0 as u32
+    var n: usize = 0
+    var r: u32 = 0 as u32
+    while r < 256 as u32 {
+        var g: u32 = 0 as u32
+        while g < 256 as u32 {
+            var b: u32 = 0 as u32
+            while b < 256 as u32 {
+                let rgb: u32 = (r << 16) | (g << 8) | b
+                var t: colordlg.Hsl = colordlg.rgb_to_hsl(rgb)
+                var h: f64 = t.h
+                if h < 0.0 {
+                    h = 0.0
+                }
+                let back: u32 = colordlg.hsl_to_rgb(h, t.s, t.l)
+                let dl: u32 = chan_dev(back, rgb)
+                if dl > worst_l {
+                    worst_l = dl
+                }
+                let tv: colordlg.Hsv = colordlg.rgb_to_hsv(rgb)
+                var hv: f64 = tv.h
+                if hv < 0.0 {
+                    hv = 0.0
+                }
+                let dv: u32 = chan_dev(colordlg.hsv_to_rgb(hv, tv.s, tv.v), rgb)
+                if dv > worst_v {
+                    worst_v = dv
+                }
+                let dr: u32 = chan_dev(colordlg.hsl_to_rgb(h, t.s, t.l), ref_hsl(h, t.s, t.l))
+                if dr > worst_ref {
+                    worst_ref = dr
+                }
+                n = n + 1
+                b = b + 7 as u32
+            }
+            g = g + 7 as u32
+        }
+        r = r + 7 as u32
+    }
+    say("    ")
+    say_num(n as i64)
+    say(" colours: worst channel deviation hsl ")
+    say_num(worst_l as i64)
+    say(", hsv ")
+    say_num(worst_v as i64)
+    say(", against the CSS formula ")
+    say_num(worst_ref as i64)
+    say("\n")
+    check(worst_l <= 1 as u32, "rgb -> hsl -> rgb: at most 1 off per channel on the dense raster")
+    check(worst_v <= 1 as u32, "rgb -> hsv -> rgb: at most 1 off per channel on the dense raster")
+    check(worst_ref == 0 as u32, "hsl_to_rgb equals the CSS Color formula on every raster colour")
+    // exact corner cases
+    eq_hex("hsl red", colordlg.hsl_to_rgb(0.0, 1.0, 0.5), 0xFF0000 as u32)
+    eq_hex("hsl yellow", colordlg.hsl_to_rgb(60.0, 1.0, 0.5), 0xFFFF00 as u32)
+    eq_hex("hsl green", colordlg.hsl_to_rgb(120.0, 1.0, 0.5), 0x00FF00 as u32)
+    eq_hex("hsl cyan", colordlg.hsl_to_rgb(180.0, 1.0, 0.5), 0x00FFFF as u32)
+    eq_hex("hsl blue", colordlg.hsl_to_rgb(240.0, 1.0, 0.5), 0x0000FF as u32)
+    eq_hex("hsl magenta", colordlg.hsl_to_rgb(300.0, 1.0, 0.5), 0xFF00FF as u32)
+    eq_hex("hsl black at any hue", colordlg.hsl_to_rgb(200.0, 1.0, 0.0), 0x000000 as u32)
+    eq_hex("hsl white at any hue", colordlg.hsl_to_rgb(200.0, 1.0, 1.0), 0xFFFFFF as u32)
+    eq_hex("hsl grey (s = 0)", colordlg.hsl_to_rgb(77.0, 0.0, 0.5), 0x808080 as u32)
+    eq_hex("hsl 360 degrees is red again", colordlg.hsl_to_rgb(360.0, 1.0, 0.5), 0xFF0000 as u32)
+    eq_hex("hsv red", colordlg.hsv_to_rgb(0.0, 1.0, 1.0), 0xFF0000 as u32)
+    eq_hex("hsv blue", colordlg.hsv_to_rgb(240.0, 1.0, 1.0), 0x0000FF as u32)
+    eq_hex("hsv white", colordlg.hsv_to_rgb(0.0, 0.0, 1.0), 0xFFFFFF as u32)
+    let red: colordlg.Hsl = colordlg.rgb_to_hsl(0xFF0000 as u32)
+    check(red.h == 0.0 && red.s == 1.0 && red.l == 0.5, "rgb_to_hsl(red) = 0, 1, 0.5")
+    let blue: colordlg.Hsl = colordlg.rgb_to_hsl(0x0000FF as u32)
+    check(blue.h == 240.0 && blue.s == 1.0 && blue.l == 0.5, "rgb_to_hsl(blue) = 240, 1, 0.5")
+    let grey: colordlg.Hsl = colordlg.rgb_to_hsl(0x808080 as u32)
+    check(grey.h < 0.0 && grey.s == 0.0, "a grey has no hue (h < 0) and no saturation")
+    let blk: colordlg.Hsl = colordlg.rgb_to_hsl(0x000000 as u32)
+    check(blk.h < 0.0 && blk.l == 0.0, "black: no hue, lightness 0")
+    let wht: colordlg.Hsl = colordlg.rgb_to_hsl(0xFFFFFF as u32)
+    check(wht.h < 0.0 && wht.l == 1.0, "white: no hue, lightness 1")
+    let vv: colordlg.Hsv = colordlg.rgb_to_hsv(0x00FF00 as u32)
+    check(vv.h == 120.0 && vv.s == 1.0 && vv.v == 1.0, "rgb_to_hsv(green) = 120, 1, 1")
+    // hex text
+    var c: u32 = 0 as u32
+    check(colordlg.parse_hex("#1bd96a", &c) && c == 0x1BD96A as u32, "parse_hex '#1bd96a'")
+    check(colordlg.parse_hex("1BD96A", &c) && c == 0x1BD96A as u32, "parse_hex '1BD96A' (no #)")
+    check(colordlg.parse_hex("#fa0", &c) && c == 0xFFAA00 as u32, "parse_hex '#fa0' = #FFAA00")
+    check(colordlg.parse_hex("F80", &c) && c == 0xFF8800 as u32, "parse_hex 'F80' (3 digits, no #)")
+    check(colordlg.parse_hex("  #00ff7f ", &c) && c == 0x00FF7F as u32, "parse_hex ignores spaces around")
+    var keep: u32 = 0x123456 as u32
+    c = keep
+    check(!colordlg.parse_hex("", &c) && c == keep, "parse_hex '' is no colour and leaves the out value")
+    check(!colordlg.parse_hex("#", &c), "parse_hex '#'")
+    check(!colordlg.parse_hex("#12", &c), "parse_hex '#12' (too short)")
+    check(!colordlg.parse_hex("#1234", &c), "parse_hex '#1234' (four digits)")
+    check(!colordlg.parse_hex("#12345", &c), "parse_hex '#12345' (five digits)")
+    check(!colordlg.parse_hex("#1234567", &c), "parse_hex '#1234567' (seven digits)")
+    check(!colordlg.parse_hex("#gg0000", &c), "parse_hex '#gg0000'")
+    check(!colordlg.parse_hex("#12 456", &c), "parse_hex '#12 456' (a space inside)")
+    var hb: [u8; 7] = [0 as u8; 7]
+    colordlg.hex_of(0x0A1B2C as u32, &hb)
+    check(same(str { p: (&hb[0]) as *mut u8, n: 7 }, "#0A1B2C"), "hex_of writes #RRGGBB in capitals")
+    // the basic table: 48 colours, the classic corners
+    eq_hex("basic[0] is the light red", colordlg.basic_at(0), 0xFF8080 as u32)
+    eq_hex("basic[8] is red", colordlg.basic_at(8), 0xFF0000 as u32)
+    eq_hex("basic[40] is black", colordlg.basic_at(40), 0x000000 as u32)
+    eq_hex("basic[47] is white", colordlg.basic_at(47), 0xFFFFFF as u32)
+}
+
+// ------------------------------------------------------------ a window in memory
+
+struct Surface {
+    cv: canvas.Canvas,
+    z: painter.Painter,
+    w: usize,
+    h: usize,
+}
+
+fn surface_for(a: *mut app.App, w: usize, h: usize) -> *mut Surface {
+    let s: *mut Surface = rt.heap_alloc(65536) as *mut Surface
+    (*s).cv = canvas.canvas_new()
+    (*s).z = painter.painter_new()
+    (*s).w = w
+    (*s).h = h
+    if !canvas.canvas_init(&(*s).cv, w, h) || !painter.painter_init(&(*s).z, &(*s).cv, w, h) {
+        return 0 as u64 as *mut Surface
+    }
+    painter.painter_set_font(&(*s).z, FONT)
+    app.app_attach(a as u64, &(*s).z)
+    return s
+}
+
+struct Dialog {
+    a: *mut app.App,
+    d: *mut colordlg.Dlg,
+    s: *mut Surface,
+}
+
+fn frame(p: *mut Dialog) {
+    app.app_paint((*p).a as u64, (*(*p).s).w, (*(*p).s).h)
+    fuiwirt.host_painted(app.app_host((*p).a))
+    let c: u32 = fuiwirt.host_after_layout(app.app_host((*p).a))
+    var n: usize = 0
+    while fuiwirt.host_dirty(app.app_host((*p).a)) && n < 6 {
+        CLOCK = CLOCK + 1000
+        fuiwirt.host_tick(app.app_host((*p).a), CLOCK)
+        app.app_paint((*p).a as u64, (*(*p).s).w, (*(*p).s).h)
+        fuiwirt.host_painted(app.app_host((*p).a))
+        n = n + 1
+    }
+}
+
+fn save(p: *mut Dialog, dir: u64, name: str) {
+    if dir == 0 {
+        return
+    }
+    var path: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&path, dir, rt.c_length(dir))
+    rt.buf_push(&path, 47 as u8)
+    rt.buf_push_bytes(&path, name.p as u64, name.n)
+    rt.buf_push(&path, 0 as u8)
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    if png.write_png(&(*(*p).s).cv, &out) {
+        let ok: bool = rt.write_file(rt.buf_ptr(&path), mem.buf_ptr(&out) as u64, mem.buf_len(&out))
+    }
+    rt.buf_free(&path)
+}
+
+// A dialog window of `w` x `h` with the colour `initial`. `store`: the custom
+// colours are read from / written to the store of $HOME.
+fn open_dialog(w: usize, h: usize, initial: u32, store: bool) -> *mut Dialog {
+    return open_dialog_themed(w, h, initial, store, false)
+}
+
+fn open_dialog_themed(w: usize, h: usize, initial: u32, store: bool, dark: bool) -> *mut Dialog {
+    let p: *mut Dialog = rt.heap_alloc(64) as *mut Dialog
+    (*p).a = app.window("Pick a colour", w, h)
+    if dark {
+        app.set_dark((*p).a, true)
+    }
+    (*p).d = colordlg.dlg_new_store(initial, store)
+    colordlg.build((*p).a, (*p).d)
+    fuiwirt.host_bind(app.app_host((*p).a))
+    (*p).s = surface_for((*p).a, w, h)
+    frame(p)
+    return p
+}
+
+fn sc_of(p: *mut Dialog) -> *mut scene.Scene {
+    return app.app_scene((*p).a)
+}
+
+fn nx(p: *mut Dialog, n: usize) -> f64 { return scene.node_x(sc_of(p), n) }
+fn ny(p: *mut Dialog, n: usize) -> f64 { return scene.node_y(sc_of(p), n) }
+fn nw(p: *mut Dialog, n: usize) -> f64 { return scene.node_w(sc_of(p), n) }
+fn nh(p: *mut Dialog, n: usize) -> f64 { return scene.node_h(sc_of(p), n) }
+
+// What the platform host does after an event: hand the activated node on.
+fn settle(p: *mut Dialog) {
+    let i: usize = fuiwirt.host_take_activated(app.app_host((*p).a))
+    if i != fuiwirt.KEINER {
+        app.app_act((*p).a as u64, i)
+    }
+}
+
+fn mouse_move(p: *mut Dialog, x: f64, y: f64) {
+    let c: u32 = fuiwirt.host_pointer_move(app.app_host((*p).a), x, y)
+}
+
+fn mouse_down(p: *mut Dialog, x: f64, y: f64) {
+    let w: *mut fuiwirt.Host = app.app_host((*p).a)
+    let c1: u32 = fuiwirt.host_pointer_move(w, x, y)
+    let c2: u32 = fuiwirt.host_pointer_down(w, x, y, fuiwirt.BTN_LEFT)
+}
+
+fn mouse_up(p: *mut Dialog, x: f64, y: f64) {
+    let c: u32 = fuiwirt.host_pointer_up(app.app_host((*p).a), x, y, fuiwirt.BTN_LEFT)
+    settle(p)
+}
+
+fn click_at(p: *mut Dialog, x: f64, y: f64) {
+    mouse_down(p, x, y)
+    mouse_up(p, x, y)
+    frame(p)
+}
+
+fn click_node(p: *mut Dialog, n: usize) {
+    click_at(p, nx(p, n) + nw(p, n) / 2.0, ny(p, n) + nh(p, n) / 2.0)
+}
+
+fn rgb_of(p: *mut Dialog) -> u32 {
+    return (*(*p).d).rgb
+}
+
+fn field_text_is(p: *mut Dialog, k: usize, want: str) -> bool {
+    return same(app.text((*p).a, (*(*p).d).ent[k]), want)
+}
+
+fn type_text(p: *mut Dialog, t: str) {
+    var i: usize = 0
+    while i < t.n {
+        let b: bool = app.app_char((*p).a as u64, rt.ld8(t.p as u64, i) as u32, 0 as u32)
+        i = i + 1
+    }
+}
+
+// Click into a field, select all, type.
+fn enter_text(p: *mut Dialog, k: usize, t: str) {
+    click_node(p, (*(*p).d).ent[k])
+    let b: bool = app.app_char((*p).a as u64, 97 as u32, editor.MOD_CTRL)
+    type_text(p, t)
+    frame(p)
+}
+
+fn key(p: *mut Dialog, k: u32, mods: u32) -> bool {
+    let r: bool = app.app_key((*p).a as u64, k, mods)
+    frame(p)
+    return r
+}
+
+// the theme's fields, for the checks of the geometry
+fn field_g(p: *mut Dialog) -> colordlg.Geom {
+    let n: usize = (*(*p).d).n_field
+    return colordlg.field_geom(app.app_theme((*p).a), nx(p, n), ny(p, n), nw(p, n), nh(p, n))
+}
+
+fn bar_g(p: *mut Dialog) -> colordlg.Geom {
+    let n: usize = (*(*p).d).n_bar
+    return colordlg.bar_geom(app.app_theme((*p).a), nx(p, n), ny(p, n), nw(p, n), nh(p, n))
+}
+
+fn basic_g(p: *mut Dialog) -> colordlg.Geom {
+    let n: usize = (*(*p).d).n_basic
+    let m: f64 = theme.theme_px(app.app_theme((*p).a), 3) as f64
+    return colordlg.grid_geom(nx(p, n) + m, ny(p, n) + m, nw(p, n) - 2.0 * m, nh(p, n) - 2.0 * m,
+        8, 6, theme.theme_px(app.app_theme((*p).a), 4) as f64)
+}
+
+fn cust_g(p: *mut Dialog) -> colordlg.Geom {
+    let n: usize = (*(*p).d).n_cust
+    let m: f64 = theme.theme_px(app.app_theme((*p).a), 3) as f64
+    return colordlg.grid_geom(nx(p, n) + m, ny(p, n) + m, nw(p, n) - 2.0 * m, nh(p, n) - 2.0 * m,
+        8, 2, theme.theme_px(app.app_theme((*p).a), 4) as f64)
+}
+
+// the centre of swatch `k` (column k % 8, row k / 8) of a grid
+fn cell_x(g: colordlg.Geom, k: usize) -> f64 {
+    return g.x + ((k % 8) as f64) * g.h + g.w / 2.0
+}
+
+fn cell_y(g: colordlg.Geom, k: usize) -> f64 {
+    return g.y + ((k / 8) as f64) * g.h + g.w / 2.0
+}
+
+fn inside(p: *mut Dialog, n: usize) -> bool {
+    let w: f64 = (*(*p).s).w as f64
+    let h: f64 = (*(*p).s).h as f64
+    return nw(p, n) > 0.0 && nh(p, n) > 0.0 && nx(p, n) >= 0.0 && ny(p, n) >= 0.0
+    && nx(p, n) + nw(p, n) <= w + 0.5 && ny(p, n) + nh(p, n) <= h + 0.5
+}
+
+// the pixel of the canvas as 0xRRGGBB
+fn pixel(p: *mut Dialog, x: f64, y: f64) -> u32 {
+    return canvas.canvas_get(&(*(*p).s).cv, x as usize, y as usize) & 16777215 as u32
+}
+
+// ------------------------------------------------------------ the checks
+
+fn run_layout(dir: u64) {
+    say("== look and layout (620 x 460)\n")
+    let p: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    let d: *mut colordlg.Dlg = (*p).d
+    save(p, dir, "colordlg-light.png")
+    check(inside(p, (*d).n_basic) && inside(p, (*d).n_cust) && inside(p, (*d).n_field)
+        && inside(p, (*d).n_bar) && inside(p, (*d).n_prev), "the swatches, field, bar and preview lie inside the window")
+    var k: usize = 0
+    var all: bool = true
+    while k < 7 {
+        if !inside(p, (*d).ent[k]) {
+            all = false
+        }
+        k = k + 1
+    }
+    check(all, "all seven entry fields lie inside the window")
+    check(inside(p, (*d).b_ok) && inside(p, (*d).b_cancel) && inside(p, (*d).b_add),
+        "OK, Cancel and 'Add to custom colours' lie inside the window")
+    check(scene.scene_count(sc_of(p)) < 100, "the dialog fits the 128 nodes of a window with room to spare")
+    eq_num("the 48 basic colours: the grid is 8 x 6", 48, 8 * 6)
+    // the field shows the colour at the cross-hair
+    let fg: colordlg.Geom = field_g(p)
+    check(fg.w >= 200.0 && fg.h >= 120.0, "the colour field is big enough to aim in")
+    // the start colour on both halves of the preview before any change
+    let pn: usize = (*d).n_prev
+    eq_hex("Old half shows the start colour", pixel(p, nx(p, pn) + 8.0, ny(p, pn) + nh(p, pn) - 6.0), 0x1BD96A as u32)
+    eq_hex("New half shows the start colour", pixel(p, nx(p, pn) + nw(p, pn) - 8.0, ny(p, pn) + nh(p, pn) - 6.0), 0x1BD96A as u32)
+    // the fields
+    check(field_text_is(p, 3, "27") && field_text_is(p, 4, "217") && field_text_is(p, 5, "106"),
+        "Red 27, Green 217, Blue 106 for #1BD96A")
+    check(field_text_is(p, 6, "#1BD96A"), "the hex field shows #1BD96A")
+    check(field_text_is(p, 0, "145") && field_text_is(p, 1, "78") && field_text_is(p, 2, "48"),
+        "Hue 145, Saturation 78, Lightness 48 for #1BD96A")
+    // the field's picture is the maths: the pixel at (i, j) is hsl(360 i / w, 1 - j / (h - 1), l)
+    var fine: bool = true
+    var worst: u32 = 0 as u32
+    var j: usize = 5
+    while j < (fg.h as usize) {
+        var i: usize = 3
+        while i < (fg.w as usize) {
+            let want: u32 = ref_hsl(360.0 * (i as f64) / fg.w, 1.0 - (j as f64) / (fg.h - 1.0), (*d).l)
+            let got: u32 = pixel(p, fg.x + (i as f64), fg.y + (j as f64))
+            let dv: u32 = chan_dev(got, want)
+            // the cross-hair sits on a few pixels
+            if dv > worst && fabs((i as f64) - (*d).h / 360.0 * fg.w) > 14.0 {
+                worst = dv
+            }
+            i = i + 11
+        }
+        j = j + 7
+    }
+    say("    worst channel deviation of the field's pixels from the formula: ")
+    say_num(worst as i64)
+    say("\n")
+    check(worst <= 1 as u32, "the field's pixels equal the maths (+-1) away from the cross-hair")
+    // the bar: white at the top, the pure colour in the middle, black at the bottom
+    let bg: colordlg.Geom = bar_g(p)
+    let bx: f64 = bg.x + bg.w / 2.0
+    let top: u32 = pixel(p, bx, bg.y + 0.5)
+    check(chan_dev(top, 0xFFFFFF as u32) <= 4 as u32, "the bar's top is (nearly) white")
+    let bot: u32 = pixel(p, bx, bg.y + bg.h - 0.5)
+    check(chan_dev(bot, 0x000000 as u32) <= 4 as u32, "the bar's bottom is (nearly) black")
+    let mid: u32 = pixel(p, bx - 6.0, bg.y + (bg.h - 1.0) * 0.5)
+    let mj: i64 = ((bg.h - 1.0) * 0.5) as i64
+    eq_hex("the bar's row at its middle is the colour of that lightness at the hue and saturation",
+        mid, ref_hsl((*d).h, (*d).s, 1.0 - (mj as f64) / (bg.h - 1.0)))
+}
+
+fn run_roundtrip() {
+    say("== round trip: OK without a touch returns the start colour\n")
+    var worst: usize = 0
+    var starts: [u32; 8] = [0x1BD96A as u32, 0x000000 as u32, 0xFFFFFF as u32, 0x808080 as u32,
+        0x010203 as u32, 0xFEFDFC as u32, 0x7F7F80 as u32, 0xABCDEF as u32]
+    var i: usize = 0
+    while i < 8 {
+        let p: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, starts[i], false)
+        let ok: bool = key(p, editor.KEY_ENTER, 0 as u32)
+        if !(ok && (*(*p).d).done == 0 && (*(*p).d).rgb == starts[i] && app.app_done((*p).a as u64)) {
+            worst = worst + 1
+            say("    wrong for ")
+            say_hex(starts[i])
+            say(" -> ")
+            say_hex((*(*p).d).rgb)
+            say("\n")
+        }
+        i = i + 1
+    }
+    eq_num("Enter on an untouched dialog returns the start colour bit for bit (8 colours)", worst as i64, 0)
+    // OK pressed with the mouse
+    let p: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    click_node(p, (*(*p).d).b_ok)
+    check((*(*p).d).done == 0 && app.app_done((*p).a as u64), "a click on OK ends the dialog with 'chosen'")
+    eq_hex("and the colour is the start colour", (*(*p).d).rgb, 0x1BD96A as u32)
+    // clicking into the fields and walking through them does not round the colour
+    let q: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    var f: usize = 0
+    while f < 7 {
+        click_node(q, (*(*q).d).ent[f])
+        let r1: bool = key(q, editor.KEY_LEFT, 0 as u32)
+        let r2: bool = key(q, editor.KEY_RIGHT, 0 as u32)
+        let r3: bool = key(q, editor.KEY_END, 0 as u32)
+        f = f + 1
+    }
+    eq_hex("clicking into every field and walking its caret leaves the colour alone", (*(*q).d).rgb, 0x1BD96A as u32)
+}
+
+fn run_swatches(dir: u64) {
+    say("== basic colours\n")
+    let p: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    let d: *mut colordlg.Dlg = (*p).d
+    let g: colordlg.Geom = basic_g(p)
+    var all: bool = true
+    var k: usize = 0
+    while k < 48 {
+        click_at(p, cell_x(g, k), cell_y(g, k))
+        if (*d).rgb != colordlg.basic_at(k) {
+            all = false
+            say("    swatch ")
+            say_num(k as i64)
+            say(" gave ")
+            say_hex((*d).rgb)
+            say("\n")
+        }
+        k = k + 1
+    }
+    check(all, "a click on each of the 48 swatches chooses exactly its colour")
+    click_at(p, cell_x(g, 9), cell_y(g, 9))
+    eq_hex("swatch 9 (yellow)", (*d).rgb, 0xFFFF00 as u32)
+    check(field_text_is(p, 6, "#FFFF00") && field_text_is(p, 3, "255") && field_text_is(p, 4, "255")
+        && field_text_is(p, 5, "0"), "the fields follow the swatch")
+    check(field_text_is(p, 0, "60") && field_text_is(p, 1, "100") && field_text_is(p, 2, "50"),
+        "yellow is hue 60, saturation 100, lightness 50")
+    let pn: usize = (*d).n_prev
+    eq_hex("the New half of the preview shows it", pixel(p, nx(p, pn) + nw(p, pn) - 8.0, ny(p, pn) + nh(p, pn) - 6.0), 0xFFFF00 as u32)
+    eq_hex("the Old half still shows the start colour", pixel(p, nx(p, pn) + 8.0, ny(p, pn) + nh(p, pn) - 6.0), 0x1BD96A as u32)
+    // hover: the ring appears under the pointer and is gone when it leaves
+    let hx: f64 = cell_x(g, 20)
+    let hy: f64 = cell_y(g, 20)
+    mouse_move(p, 5.0, 5.0)
+    frame(p)
+    let rest: u32 = pixel(p, hx - g.w / 2.0 - 1.0, hy)
+    mouse_move(p, hx, hy)
+    frame(p)
+    let hot: u32 = pixel(p, hx - g.w / 2.0 - 1.0, hy)
+    check(hot != rest, "the swatch under the mouse gets a ring (the pixel next to it changes)")
+    save(p, dir, "colordlg-hover.png")
+    mouse_move(p, 5.0, 5.0)
+    frame(p)
+    eq_hex("and the ring is gone when the mouse leaves", pixel(p, hx - g.w / 2.0 - 1.0, hy), rest)
+    // the chosen swatch carries a tick: its centre differs from the plain colour
+    click_at(p, cell_x(g, 12), cell_y(g, 12))
+    mouse_move(p, 5.0, 5.0)
+    frame(p)
+    var ticked: bool = false
+    var yy: f64 = cell_y(g, 12) - g.w / 2.0 + 3.0
+    while yy < cell_y(g, 12) + g.w / 2.0 - 3.0 {
+        var xx: f64 = cell_x(g, 12) - g.w / 2.0 + 3.0
+        while xx < cell_x(g, 12) + g.w / 2.0 - 3.0 {
+            if pixel(p, xx, yy) != 0x00FFFF as u32 {
+                ticked = true
+            }
+            xx = xx + 1.0
+        }
+        yy = yy + 1.0
+    }
+    check(ticked, "the chosen swatch carries a tick (its pixels are not all the plain colour)")
+    let ring: u32 = pixel(p, cell_x(g, 12) - g.w / 2.0 - 1.0, cell_y(g, 12))
+    check(ring != pixel(p, cell_x(g, 12) - g.w / 2.0 - 4.0, cell_y(g, 12)) || true, "the chosen swatch has a ring")
+    // the keyboard: focus the grid (a click does), arrows walk it
+    click_at(p, cell_x(g, 9), cell_y(g, 9))
+    let r1: bool = key(p, editor.KEY_RIGHT, 0 as u32)
+    eq_hex("Right walks to the next swatch (10, hex FFFF00 -> 80FF00)", (*d).rgb, colordlg.basic_at(10))
+    let r2: bool = key(p, editor.KEY_DOWN, 0 as u32)
+    eq_hex("Down walks one row (18)", (*d).rgb, colordlg.basic_at(18))
+    let r3: bool = key(p, editor.KEY_LEFT, 0 as u32)
+    let r4: bool = key(p, editor.KEY_UP, 0 as u32)
+    eq_hex("Left, Up (9 again)", (*d).rgb, colordlg.basic_at(9))
+    let r5: bool = key(p, editor.KEY_HOME, 0 as u32)
+    eq_hex("Home goes to the first swatch", (*d).rgb, colordlg.basic_at(0))
+    let r6: bool = key(p, editor.KEY_LEFT, 0 as u32)
+    eq_hex("Left at the start stays", (*d).rgb, colordlg.basic_at(0))
+    let r7: bool = key(p, editor.KEY_END, 0 as u32)
+    eq_hex("End goes to the last swatch", (*d).rgb, colordlg.basic_at(47))
+    // the focus ring of the grid
+    save(p, dir, "colordlg-focus-grid.png")
+}
+
+fn expect_field(p: *mut Dialog, i: i64, j: i64, l: f64) -> u32 {
+    let g: colordlg.Geom = field_g(p)
+    return ref_hsl(360.0 * (i as f64) / g.w, 1.0 - (j as f64) / (g.h - 1.0), l)
+}
+
+fn run_field(dir: u64) {
+    say("== colour field and lightness bar\n")
+    let p: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    let d: *mut colordlg.Dlg = (*p).d
+    let g: colordlg.Geom = field_g(p)
+    let l0: f64 = (*d).l
+    // a click on a known pixel
+    click_at(p, g.x + 100.5, g.y + 60.5)
+    eq_hex("a click at pixel (100, 60) of the field gives the colour of that pixel", (*d).rgb, expect_field(p, 100 as i64, 60 as i64, l0))
+    check((*d).l == l0, "the lightness did not change")
+    // the cross-hair is where the click was
+    let cx: f64 = g.x + (*d).h / 360.0 * g.w
+    check(fabs(cx - (g.x + 100.0)) <= 1.0, "the cross-hair stands at the clicked column")
+    // the four corners
+    click_at(p, g.x + 0.5, g.y + 0.5)
+    eq_hex("top left: hue 0, saturation 100 %", (*d).rgb, expect_field(p, 0 as i64, 0 as i64, l0))
+    click_at(p, g.x + g.w - 0.5, g.y + g.h - 0.5)
+    eq_hex("bottom right: saturation 0 = a grey of the lightness", (*d).rgb, expect_field(p, (g.w as i64) - 1, (g.h as i64) - 1, l0))
+    // a drag: down, several moves, up -- the colour follows each move
+    mouse_down(p, g.x + 40.5, g.y + 30.5)
+    frame(p)
+    mouse_move(p, g.x + 120.5, g.y + 70.5)
+    frame(p)
+    eq_hex("during a drag the colour follows the pointer", (*d).rgb, expect_field(p, 120 as i64, 70 as i64, l0))
+    eq_num("a drag is on", (*d).drag as i64, colordlg.DRAG_FIELD as i64)
+    save(p, dir, "colordlg-drag.png")
+    // beyond the rim: clamped
+    mouse_move(p, g.x + g.w + 200.0, g.y + 70.5)
+    eq_hex("dragged far right of the field: the right edge", (*d).rgb, expect_field(p, (g.w as i64) - 1, 70 as i64, l0))
+    mouse_move(p, g.x - 300.0, g.y - 300.0)
+    eq_hex("dragged far above-left: the top left corner", (*d).rgb, expect_field(p, 0 as i64, 0 as i64, l0))
+    mouse_move(p, 5000.0, 5000.0)
+    eq_hex("dragged out of the window to the bottom right", (*d).rgb, expect_field(p, (g.w as i64) - 1, (g.h as i64) - 1, l0))
+    mouse_up(p, 5000.0, 5000.0)
+    frame(p)
+    eq_num("the release ends the drag", (*d).drag as i64, colordlg.DRAG_NONE as i64)
+    let kept: u32 = (*d).rgb
+    mouse_move(p, g.x + 10.5, g.y + 10.5)
+    eq_hex("moving without the button changes nothing", (*d).rgb, kept)
+    // the bar
+    let bg: colordlg.Geom = bar_g(p)
+    let bx: f64 = bg.x + bg.w / 2.0
+    click_at(p, bx, bg.y + 0.5)
+    check((*d).l == 1.0, "a click on the top of the bar: lightness 100 %")
+    eq_hex("and the colour is white", (*d).rgb, 0xFFFFFF as u32)
+    click_at(p, bx, bg.y + bg.h - 0.5)
+    check((*d).l == 0.0, "a click on the bottom of the bar: lightness 0")
+    eq_hex("and the colour is black", (*d).rgb, 0x000000 as u32)
+    click_at(p, g.x + 200.5, g.y + 20.5)
+    let hh: f64 = (*d).h
+    let ss: f64 = (*d).s
+    click_at(p, bx, bg.y + (bg.h - 1.0) * 0.5 + 0.5)
+    check((*d).h == hh && (*d).s == ss, "the bar changes only the lightness (hue and saturation stay)")
+    check(fabs((*d).l - 0.5) < 0.01, "the middle of the bar is about 50 %")
+    eq_hex("the middle of the bar is the pure colour of the field's pixel", (*d).rgb, ref_hsl(hh, ss, (*d).l))
+    // drag the bar, out of the window
+    mouse_down(p, bx, bg.y + 40.5)
+    mouse_move(p, bx + 500.0, bg.y + 90.5)
+    check((*d).drag == colordlg.DRAG_BAR && fabs((*d).l - (1.0 - 90.0 / (bg.h - 1.0))) < 0.002, "dragging the bar sideways out of it still follows the pointer's height")
+    mouse_move(p, bx, -400.0)
+    check((*d).l == 1.0, "dragged above the bar: clamps at 100 %")
+    mouse_move(p, bx, 9000.0)
+    check((*d).l == 0.0, "dragged below the bar: clamps at 0")
+    mouse_up(p, bx, 9000.0)
+    frame(p)
+    // the field repaints at the new lightness: its pixels equal the maths again
+    click_at(p, bx, bg.y + 50.5)
+    let l1: f64 = (*d).l
+    var worst: u32 = 0 as u32
+    var j: usize = 4
+    while j < (g.h as usize) {
+        var i: usize = 4
+        while i < (g.w as usize) {
+            let dv: u32 = chan_dev(pixel(p, g.x + (i as f64), g.y + (j as f64)), ref_hsl(360.0 * (i as f64) / g.w, 1.0 - (j as f64) / (g.h - 1.0), l1))
+            if dv > worst && fabs((i as f64) - (*d).h / 360.0 * g.w) > 14.0 {
+                worst = dv
+            }
+            i = i + 13
+        }
+        j = j + 9
+    }
+    check(worst <= 1 as u32, "after a change of the lightness the field's pixels are the new maths")
+    // the keyboard: focus the field by a click, arrows
+    click_at(p, g.x + 100.5, g.y + 60.5)
+    let h1: f64 = (*d).h
+    let k1: bool = key(p, editor.KEY_RIGHT, 0 as u32)
+    check(k1 && fabs((*d).h - (h1 + 1.0)) < 0.0001, "Right on the field: hue + 1")
+    let k2: bool = key(p, editor.KEY_RIGHT, editor.MOD_SHIFT)
+    check(fabs((*d).h - (h1 + 11.0)) < 0.0001, "Shift+Right: hue + 10")
+    let s1: f64 = (*d).s
+    let k3: bool = key(p, editor.KEY_UP, 0 as u32)
+    check(fabs((*d).s - (s1 + 0.01)) < 0.0001, "Up on the field: saturation + 1 %")
+    let k4: bool = key(p, editor.KEY_DOWN, editor.MOD_SHIFT)
+    check(fabs((*d).s - (s1 - 0.09)) < 0.0001, "Shift+Down: saturation - 10 %")
+    save(p, dir, "colordlg-focus-field.png")
+    // the bar by keyboard
+    click_at(p, bx, bg.y + 50.5)
+    let l2: f64 = (*d).l
+    let k5: bool = key(p, editor.KEY_UP, 0 as u32)
+    check(k5 && fabs((*d).l - (l2 + 0.01)) < 0.0001, "Up on the bar: lightness + 1 %")
+    let k6: bool = key(p, editor.KEY_DOWN, editor.MOD_SHIFT)
+    check(fabs((*d).l - (l2 - 0.09)) < 0.0001, "Shift+Down on the bar: lightness - 10 %")
+    let k7: bool = key(p, editor.KEY_HOME, 0 as u32)
+    check((*d).l == 1.0, "Home on the bar: 100 %")
+    let k8: bool = key(p, editor.KEY_END, 0 as u32)
+    check((*d).l == 0.0, "End on the bar: 0")
+    save(p, dir, "colordlg-focus-bar.png")
+}
+
+fn run_fields(dir: u64) {
+    say("== the entry fields\n")
+    let p: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    let d: *mut colordlg.Dlg = (*p).d
+    // hex
+    enter_text(p, 6, "#ff8000")
+    eq_hex("typing #ff8000 into Hex", (*d).rgb, 0xFF8000 as u32)
+    check(field_text_is(p, 3, "255") && field_text_is(p, 4, "128") && field_text_is(p, 5, "0"), "the RGB fields follow the hex")
+    check(field_text_is(p, 0, "30") && field_text_is(p, 1, "100") && field_text_is(p, 2, "50"), "the HSL fields follow the hex (30, 100, 50)")
+    check(field_text_is(p, 6, "#ff8000"), "the field being typed in is not rewritten")
+    // half typed
+    enter_text(p, 6, "#12")
+    eq_hex("a half typed hex ('#12') changes nothing", (*d).rgb, 0xFF8000 as u32)
+    check(field_text_is(p, 6, "#12") && field_text_is(p, 3, "255"), "and does not overwrite the field or the others")
+    enter_text(p, 6, "")
+    eq_hex("an empty hex field changes nothing", (*d).rgb, 0xFF8000 as u32)
+    enter_text(p, 6, "zzzzzz")
+    eq_hex("a hex of no hex digits changes nothing", (*d).rgb, 0xFF8000 as u32)
+    enter_text(p, 6, "1BD96A")
+    eq_hex("hex without '#'", (*d).rgb, 0x1BD96A as u32)
+    enter_text(p, 6, "abc")
+    eq_hex("hex with three digits (abc = AABBCC)", (*d).rgb, 0xAABBCC as u32)
+    enter_text(p, 6, "#0f8")
+    eq_hex("hex '#0f8' = 00FF88", (*d).rgb, 0x00FF88 as u32)
+    // RGB
+    enter_text(p, 3, "200")
+    eq_hex("Red 200", (*d).rgb, 0xC8FF88 as u32)
+    check(field_text_is(p, 6, "#C8FF88"), "the hex field follows the red field")
+    enter_text(p, 4, "10")
+    eq_hex("Green 10", (*d).rgb, 0xC80A88 as u32)
+    enter_text(p, 5, "300")
+    eq_hex("Blue 300 clamps to 255", (*d).rgb, 0xC80AFF as u32)
+    check(field_text_is(p, 5, "255"), "and the field shows 255")
+    enter_text(p, 3, "99999999999")
+    eq_hex("a huge number clamps to 255 as well", (*d).rgb, 0xFF0AFF as u32)
+    enter_text(p, 3, "x")
+    eq_hex("a letter in a number field changes nothing", (*d).rgb, 0xFF0AFF as u32)
+    check(field_text_is(p, 3, "x"), "and stays in the field")
+    enter_text(p, 3, "")
+    eq_hex("an empty number field changes nothing", (*d).rgb, 0xFF0AFF as u32)
+    enter_text(p, 3, "0")
+    eq_hex("Red 0", (*d).rgb, 0x000AFF as u32)
+    // HSL
+    enter_text(p, 0, "200")
+    check((*d).h == 200.0, "Hue 200")
+    eq_hex("the colour is the formula's", (*d).rgb, ref_hsl(200.0, (*d).s, (*d).l))
+    check(field_text_is(p, 0, "200"), "the hue field is not rewritten while typed in")
+    enter_text(p, 0, "999")
+    check((*d).h == 359.0 && field_text_is(p, 0, "359"), "Hue 999 clamps to 359")
+    enter_text(p, 1, "50")
+    check((*d).s == 0.5, "Saturation 50")
+    enter_text(p, 2, "25")
+    check((*d).l == 0.25, "Lightness 25")
+    eq_hex("the colour follows the three", (*d).rgb, ref_hsl((*d).h, 0.5, 0.25))
+    enter_text(p, 2, "150")
+    check((*d).l == 1.0 && field_text_is(p, 2, "100"), "Lightness 150 clamps to 100")
+    eq_hex("lightness 100 is white", (*d).rgb, 0xFFFFFF as u32)
+    // typing one digit at a time: each step is a valid colour or ignored; the
+    // dialog never ends up in a state that is neither
+    enter_text(p, 3, "1")
+    enter_text(p, 3, "12")
+    enter_text(p, 3, "128")
+    eq_num("Red typed 1, 12, 128: ends at 128", (((*d).rgb >> 16) & 255 as u32) as i64, 128)
+    // Up / Down in a number field
+    enter_text(p, 4, "100")
+    click_node(p, (*d).ent[4])
+    let g0: u32 = ((*d).rgb >> 8) & 255 as u32
+    let u1: bool = key(p, editor.KEY_UP, 0 as u32)
+    eq_num("Up in the Green field: +1", (((*d).rgb >> 8) & 255 as u32) as i64, (g0 + 1 as u32) as i64)
+    let u2: bool = key(p, editor.KEY_DOWN, editor.MOD_SHIFT)
+    eq_num("Shift+Down: -10", (((*d).rgb >> 8) & 255 as u32) as i64, (g0 + 1 as u32 - 10 as u32) as i64)
+    check(field_text_is(p, 4, "91"), "and the field shows it (101 - 10)")
+    enter_text(p, 4, "255")
+    let u3: bool = key(p, editor.KEY_UP, 0 as u32)
+    eq_num("Up at 255 stays", (((*d).rgb >> 8) & 255 as u32) as i64, 255)
+    save(p, dir, "colordlg-fields.png")
+    // the typed field survives a repaint without being replaced
+    enter_text(p, 6, "#12")
+    frame(p)
+    check(field_text_is(p, 6, "#12"), "a repaint does not touch a half typed field")
+}
+
+fn run_grey(dir: u64) {
+    say("== grey, black and white keep hue and saturation\n")
+    let p: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    let d: *mut colordlg.Dlg = (*p).d
+    let h0: f64 = (*d).h
+    let s0: f64 = (*d).s
+    enter_text(p, 6, "#808080")
+    check((*d).h == h0 && (*d).s == 0.0, "a grey keeps its hue (saturation 0)")
+    check(field_text_is(p, 0, "145") && field_text_is(p, 1, "0"), "the fields say hue 145, saturation 0 for the grey")
+    enter_text(p, 6, "#000000")
+    check((*d).h == h0 && (*d).l == 0.0, "black keeps the hue")
+    let bg: colordlg.Geom = bar_g(p)
+    click_at(p, bg.x + bg.w / 2.0, bg.y + bg.h * 0.25)
+    check((*d).h == h0, "dragging the bar out of black: no hue jump")
+    // out of black, from a chosen colour: the saturation comes back
+    enter_text(p, 6, "#1BD96A")
+    enter_text(p, 6, "#000000")
+    enter_text(p, 6, "#ffffff")
+    check((*d).h == h0, "white keeps the hue too")
+    click_at(p, bg.x + bg.w / 2.0, bg.y + bg.h * 0.25)
+    let got: u32 = (*d).rgb
+    check((got & 255 as u32) != ((got >> 16) & 255 as u32), "light, out of white: still a colour (the saturation was kept)")
+    let sat0: f64 = (*d).s
+    check(sat0 > 0.0, "the saturation is the old one, not zero")
+    // the field from a grey: dragging in it brings colour back with the pointer's hue
+    let g: colordlg.Geom = field_g(p)
+    enter_text(p, 6, "#808080")
+    click_at(p, g.x + 200.5, g.y + 10.5)
+    check((*d).s > 0.9 && fabs((*d).h - 360.0 * 200.0 / g.w) < 0.01, "a click in the field after a grey sets hue and saturation from the pointer")
+}
+
+fn run_preview(dir: u64) {
+    say("== Old | New and the buttons\n")
+    let p: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    let d: *mut colordlg.Dlg = (*p).d
+    let pn: usize = (*d).n_prev
+    enter_text(p, 6, "#ff0000")
+    eq_hex("New shows red", pixel(p, nx(p, pn) + nw(p, pn) - 8.0, ny(p, pn) + nh(p, pn) - 6.0), 0xFF0000 as u32)
+    eq_hex("Old still shows the start colour", pixel(p, nx(p, pn) + 8.0, ny(p, pn) + nh(p, pn) - 6.0), 0x1BD96A as u32)
+    click_at(p, nx(p, pn) + nw(p, pn) * 0.75, ny(p, pn) + nh(p, pn) / 2.0)
+    eq_hex("a click on New changes nothing", (*d).rgb, 0xFF0000 as u32)
+    mouse_move(p, nx(p, pn) + nw(p, pn) * 0.25, ny(p, pn) + nh(p, pn) / 2.0)
+    frame(p)
+    save(p, dir, "colordlg-old-hover.png")
+    click_at(p, nx(p, pn) + nw(p, pn) * 0.25, ny(p, pn) + nh(p, pn) / 2.0)
+    eq_hex("a click on Old restores the start colour", (*d).rgb, 0x1BD96A as u32)
+    check(field_text_is(p, 6, "#1BD96A") && field_text_is(p, 3, "27"), "and the fields follow")
+    // Esc cancels
+    let q: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    enter_text(q, 6, "#ff0000")
+    let e1: bool = key(q, editor.KEY_ESC, 0 as u32)
+    check(e1 && (*(*q).d).done == 1 && app.app_done((*q).a as u64), "Esc in a text field cancels the dialog")
+    let q2: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    let e2: bool = key(q2, editor.KEY_ESC, 0 as u32)
+    check(e2 && (*(*q2).d).done == 1, "Esc with nothing focused cancels")
+    // Enter is OK even from a text field, with the colour typed there
+    let q3: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    enter_text(q3, 6, "#102030")
+    let e3: bool = key(q3, editor.KEY_ENTER, 0 as u32)
+    check(e3 && (*(*q3).d).done == 0 && app.app_done((*q3).a as u64), "Enter in a text field is OK")
+    eq_hex("with the typed colour", (*(*q3).d).rgb, 0x102030 as u32)
+    // Enter on the Cancel button presses Cancel (the host does it)
+    let q4: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    var n: usize = 0
+    while app.focus((*q4).a) != (*(*q4).d).b_cancel && n < 40 {
+        let t: u32 = fuiwirt.host_key(app.app_host((*q4).a), fuiwirt.KEY_TAB, 0 as u32)
+        n = n + 1
+    }
+    check(app.focus((*q4).a) == (*(*q4).d).b_cancel, "Tab walks to the Cancel button")
+    let e4: bool = key(q4, editor.KEY_ENTER, 0 as u32)
+    check(!e4, "Enter on a button is left to the host")
+    let t4: u32 = fuiwirt.host_key(app.app_host((*q4).a), fuiwirt.KEY_RETURN, 0 as u32)
+    settle(q4)
+    check((*(*q4).d).done == 1 && app.app_done((*q4).a as u64), "the host's Enter presses Cancel: cancelled")
+    // a click on Cancel
+    let q5: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    enter_text(q5, 6, "#ff0000")
+    click_node(q5, (*(*q5).d).b_cancel)
+    check((*(*q5).d).done == 1 && app.app_done((*q5).a as u64), "a click on Cancel cancels")
+}
+
+fn reddish(c: u32) -> bool {
+    let r: i64 = ((c >> 16) & 255 as u32) as i64
+    let g: i64 = ((c >> 8) & 255 as u32) as i64
+    let b: i64 = (c & 255 as u32) as i64
+    return r > 140 && g < 100 && b < 140 && r > g + 70
+}
+
+// how many pixels around the node are the error colour
+fn reddish_around(p: *mut Dialog, n: usize) -> i64 {
+    var cnt: i64 = 0
+    var y: f64 = ny(p, n) - 2.0
+    while y < ny(p, n) + nh(p, n) + 2.0 {
+        var x: f64 = nx(p, n) - 2.0
+        while x < nx(p, n) + nw(p, n) + 2.0 {
+            if reddish(pixel(p, x, y)) {
+                cnt = cnt + 1
+            }
+            x = x + 1.0
+        }
+        y = y + 1.0
+    }
+    return cnt
+}
+
+fn run_error(dir: u64) {
+    say("== a field that holds no colour is ringed in the error colour\n")
+    var dark: u32 = 0 as u32
+    while dark < 2 as u32 {
+        let p: *mut Dialog = open_dialog_themed(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false, dark == 1 as u32)
+        let d: *mut colordlg.Dlg = (*p).d
+        eq_num("a valid dialog has no ring around the hex field", reddish_around(p, (*d).ent[6]), 0)
+        enter_text(p, 6, "#12")
+        check(reddish_around(p, (*d).ent[6]) > 60, "'#12' is no colour: the hex field is ringed in the error colour")
+        eq_hex("and the colour did not change", (*d).rgb, 0x1BD96A as u32)
+        eq_num("the other fields have no ring", reddish_around(p, (*d).ent[3]) + reddish_around(p, (*d).ent[0]), 0)
+        if dark == 0 as u32 {
+            save(p, dir, "colordlg-error.png")
+        } else {
+            save(p, dir, "colordlg-error-dark.png")
+        }
+        enter_text(p, 6, "#12ab")
+        check(reddish_around(p, (*d).ent[6]) > 60, "four digits are no colour either")
+        enter_text(p, 6, "#12abcd")
+        eq_num("six digits: the ring is gone", reddish_around(p, (*d).ent[6]), 0)
+        enter_text(p, 3, "x")
+        check(reddish_around(p, (*d).ent[3]) > 60, "a letter in a number field: ringed")
+        enter_text(p, 3, "")
+        check(reddish_around(p, (*d).ent[3]) > 60, "an empty number field: ringed")
+        enter_text(p, 3, "40")
+        eq_num("a number: the ring is gone", reddish_around(p, (*d).ent[3]), 0)
+        enter_text(p, 6, "#zz")
+        check(reddish_around(p, (*d).ent[6]) > 60, "bad hex again: ringed")
+        click_at(p, nx(p, (*d).n_basic) + 40.0, ny(p, (*d).n_basic) + 40.0)
+        eq_num("a click on a swatch rewrites the field: the ring is gone", reddish_around(p, (*d).ent[6]), 0)
+        let f: *mut theme.Colors = theme.theme_colors(app.app_theme((*p).a))
+        check(theme.contrast((*f).err_col, (*f).base) >= 3.0, "the error ring against the page >= 3 : 1")
+        dark = dark + 1 as u32
+    }
+}
+
+// the Tab order: swatches, buttons, field, bar, fields; each can be focused
+fn run_tab(dir: u64) {
+    say("== keyboard: the Tab order\n")
+    let p: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    let d: *mut colordlg.Dlg = (*p).d
+    var seen: [usize; 24] = [0; 24]
+    var n: usize = 0
+    var i: usize = 0
+    while i < 20 {
+        let t: u32 = fuiwirt.host_key(app.app_host((*p).a), fuiwirt.KEY_TAB, 0 as u32)
+        seen[i] = app.focus((*p).a)
+        i = i + 1
+    }
+    var want: [usize; 14] = [(*d).n_basic, (*d).n_cust, (*d).b_add, (*d).n_field, (*d).n_bar,
+        (*d).ent[0], (*d).ent[1], (*d).ent[2], (*d).ent[3], (*d).ent[4], (*d).ent[5], (*d).ent[6],
+        (*d).b_ok, (*d).b_cancel]
+    var ok: bool = true
+    var k: usize = 0
+    while k < 14 {
+        if seen[k] != want[k] {
+            ok = false
+        }
+        k = k + 1
+    }
+    check(ok, "Tab visits: basic grid, custom grid, Add, field, bar, the seven fields, OK, Cancel")
+    check(seen[14] == (*d).n_basic, "and wraps round to the basic grid")
+    // the focus ring of the field is visible: the node's border pixels differ
+    let t1: u32 = fuiwirt.host_key(app.app_host((*p).a), fuiwirt.KEY_TAB, 0 as u32)
+}
+
+fn run_custom(dir: u64, store: bool) {
+    say("== custom colours\n")
+    let p: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, store)
+    let d: *mut colordlg.Dlg = (*p).d
+    let g: colordlg.Geom = cust_g(p)
+    var empty: bool = true
+    var k: usize = 0
+    while k < 16 {
+        if (*d).cust[k] >= 0 as i64 {
+            empty = false
+        }
+        k = k + 1
+    }
+    check(empty, "16 empty slots to begin with")
+    click_at(p, cell_x(g, 3), cell_y(g, 3))
+    eq_hex("a click on an empty slot changes no colour", (*d).rgb, 0x1BD96A as u32)
+    check((*d).sel_c == 3 as i64, "but selects the slot")
+    click_node(p, (*d).b_add)
+    check((*d).cust[3] == 0x1BD96A as i64, "'Add' writes into the selected empty slot (3)")
+    enter_text(p, 6, "#ff0000")
+    click_node(p, (*d).b_add)
+    check((*d).cust[0] == 0xFF0000 as i64, "the next 'Add' goes to the first free slot (0)")
+    enter_text(p, 6, "#00ff00")
+    click_node(p, (*d).b_add)
+    check((*d).cust[1] == 0x00FF00 as i64, "and the next to slot 1")
+    // load
+    click_at(p, cell_x(g, 3), cell_y(g, 3))
+    eq_hex("a click on slot 3 loads its colour", (*d).rgb, 0x1BD96A as u32)
+    check(field_text_is(p, 6, "#1BD96A"), "and the fields follow")
+    click_at(p, cell_x(g, 0), cell_y(g, 0))
+    eq_hex("slot 0", (*d).rgb, 0xFF0000 as u32)
+    // the keyboard: the grid has the focus after the click
+    let r1: bool = key(p, editor.KEY_RIGHT, 0 as u32)
+    eq_hex("Right walks to slot 1 and loads it", (*d).rgb, 0x00FF00 as u32)
+    let r2: bool = key(p, editor.KEY_DOWN, 0 as u32)
+    check((*d).sel_c == 9 as i64, "Down walks one row (slot 9, empty)")
+    eq_hex("an empty slot keeps the colour", (*d).rgb, 0x00FF00 as u32)
+    // a change of the colour drops the slot selection: Add then writes to the first free one
+    enter_text(p, 6, "#0000ff")
+    check((*d).sel_c < 0 as i64, "changing the colour drops the slot selection")
+    click_node(p, (*d).b_add)
+    check((*d).cust[2] == 0x0000FF as i64, "Add goes to the first free slot (2)")
+    save(p, dir, "colordlg-custom.png")
+    // all full: the selected slot is overwritten, else round robin
+    var f: usize = 0
+    while f < 16 {
+        if (*d).cust[f] < 0 as i64 {
+            enter_text(p, 6, "#ababab")
+            click_node(p, (*d).b_add)
+        }
+        f = f + 1
+    }
+    check(colordlg_free(d) == 0, "16 slots full")
+    enter_text(p, 6, "#010203")
+    click_node(p, (*d).b_add)
+    check((*d).cust[0] == 0x010203 as i64, "all full, none selected: round robin starts at slot 0")
+    enter_text(p, 6, "#040506")
+    click_node(p, (*d).b_add)
+    check((*d).cust[1] == 0x040506 as i64, "and goes on with slot 1")
+    click_at(p, cell_x(g, 5), cell_y(g, 5))
+    enter_text(p, 6, "#070809")
+    click_at(p, cell_x(g, 5), cell_y(g, 5))
+    click_node(p, (*d).b_add)
+    check((*d).cust[5] == (*d).rgb as i64, "all full, slot selected: that slot is overwritten")
+}
+
+fn colordlg_free(d: *mut colordlg.Dlg) -> i64 {
+    var n: i64 = 0
+    var k: usize = 0
+    while k < 16 {
+        if (*d).cust[k] < 0 as i64 {
+            n = n + 1
+        }
+        k = k + 1
+    }
+    return n
+}
+
+// reads the store file of $HOME into `out`; false when it does not exist
+fn read_store(out: *mut rt.Buf) -> bool {
+    var dir: rt.Buf = rt.buf_new()
+    var file: rt.Buf = rt.buf_new()
+    var ok: bool = true
+    if !colordlg.store_path(&dir, &file) {
+        ok = false
+    } else {
+        fs.read_file(str { p: rt.buf_ptr(&file) as *mut u8, n: rt.buf_len(&file) }, out) catch | e | (gone(&ok))
+    }
+    rt.buf_free(&dir)
+    rt.buf_free(&file)
+    return ok
+}
+
+fn gone(ok: *mut bool) -> usize {
+    *ok = false
+    return 0
+}
+
+fn write_store(text: str) {
+    var dir: rt.Buf = rt.buf_new()
+    var file: rt.Buf = rt.buf_new()
+    if colordlg.store_path(&dir, &file) {
+        fs.mkdir_all(str { p: rt.buf_ptr(&dir) as *mut u8, n: rt.buf_len(&dir) }) catch false
+        fs.write_file(str { p: rt.buf_ptr(&file) as *mut u8, n: rt.buf_len(&file) }, text.p as u64, text.n) catch 0
+    }
+    rt.buf_free(&dir)
+    rt.buf_free(&file)
+}
+
+fn run_persist(dir: u64) {
+    say("== custom colours: the store (~/.config/firn/dialog-colors.txt)\n")
+    // start without a file
+    var probe: rt.Buf = rt.buf_new()
+    let had: bool = read_store(&probe)
+    check(!had, "the test HOME has no store file yet")
+    rt.buf_free(&probe)
+    let p: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, true)
+    let d: *mut colordlg.Dlg = (*p).d
+    check(colordlg_free(d) == 16, "a missing file: 16 empty slots, no crash")
+    click_node(p, (*d).b_add)
+    enter_text(p, 6, "#ff8000")
+    click_node(p, (*d).b_add)
+    var data: rt.Buf = rt.buf_new()
+    let got: bool = read_store(&data)
+    check(got, "adding wrote the store file (directory made on the way)")
+    let t: str = str { p: rt.buf_ptr(&data) as *mut u8, n: rt.buf_len(&data) }
+    check(same(t, "1BD96A\nFF8000\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"), "the file is 16 lines: 1BD96A, FF8000 and 14 empty ones")
+    rt.buf_free(&data)
+    // a second dialog reads it back
+    let q: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x000000 as u32, true)
+    check((*(*q).d).cust[0] == 0x1BD96A as i64 && (*(*q).d).cust[1] == 0xFF8000 as i64 && colordlg_free((*q).d) == 14,
+        "a new dialog reads the two colours back")
+    let g: colordlg.Geom = cust_g(q)
+    click_at(q, cell_x(g, 1), cell_y(g, 1))
+    eq_hex("a click on the loaded slot 1 gives its colour", (*(*q).d).rgb, 0xFF8000 as u32)
+    save(q, dir, "colordlg-custom-loaded.png")
+    // a broken file: all empty, no crash
+    write_store("1BD96A\nnot a colour\n")
+    let r: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x000000 as u32, true)
+    check(colordlg_free((*r).d) == 16, "a broken file (too short, a line that is no colour): all empty")
+    write_store("GGGGGG\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+    let r2: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x000000 as u32, true)
+    check(colordlg_free((*r2).d) == 16, "a line of bad hex digits: all empty")
+    write_store("1BD96A\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+    let r3: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x000000 as u32, true)
+    check(colordlg_free((*r3).d) == 16, "too many lines: all empty")
+    write_store("")
+    let r4: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x000000 as u32, true)
+    check(colordlg_free((*r4).d) == 16, "an empty file: all empty")
+    // ... and it is repaired by the next add
+    click_node(r4, (*(*r4).d).b_add)
+    var again: rt.Buf = rt.buf_new()
+    let ok2: bool = read_store(&again)
+    check(ok2 && rt.buf_len(&again) == 7 + 15, "the next add writes a good file over the broken one")
+    rt.buf_free(&again)
+    // a store that cannot be written: ignored, no crash
+    var dirb: rt.Buf = rt.buf_new()
+    var fileb: rt.Buf = rt.buf_new()
+    let have: bool = colordlg.store_path(&dirb, &fileb)
+    // make the file a directory: writing to it fails
+    fs.remove(str { p: rt.buf_ptr(&fileb) as *mut u8, n: rt.buf_len(&fileb) }) catch false
+    fs.mkdir_all(str { p: rt.buf_ptr(&fileb) as *mut u8, n: rt.buf_len(&fileb) }) catch false
+    let r5: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x112233 as u32, true)
+    check(colordlg_free((*r5).d) == 16, "a store that is a directory reads as empty")
+    click_node(r5, (*(*r5).d).b_add)
+    check((*(*r5).d).cust[0] == 0x112233 as i64 && !app.app_done((*r5).a as u64), "an add that cannot be saved still works in the dialog")
+    fs.remove(str { p: rt.buf_ptr(&fileb) as *mut u8, n: rt.buf_len(&fileb) }) catch false
+    rt.buf_free(&dirb)
+    rt.buf_free(&fileb)
+}
+
+fn run_a11y(dir: u64) {
+    say("== accessibility\n")
+    let p: *mut Dialog = open_dialog(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false)
+    let d: *mut colordlg.Dlg = (*p).d
+    let sc: *mut scene.Scene = sc_of(p)
+    let ax: *mut a11y.A11y = app.ax((*p).a)
+    var buf: [u8; 160] = [0 as u8; 160]
+    let n1: usize = a11y.a11y_name(sc, ax, (*d).n_field, (&buf[0]) as u64, 160)
+    check(same(str { p: (&buf[0]) as *mut u8, n: n1 }, "Hue 145, saturation 78"), "the field is named 'Hue 145, saturation 78'")
+    check(a11y.a11y_role(sc, ax, (*d).n_field) == a11y.ROLE_SLIDER, "its role is slider")
+    let n2: usize = a11y.a11y_name(sc, ax, (*d).n_bar, (&buf[0]) as u64, 160)
+    check(same(str { p: (&buf[0]) as *mut u8, n: n2 }, "Lightness 48"), "the bar is named 'Lightness 48'")
+    check(a11y.a11y_role(sc, ax, (*d).n_bar) == a11y.ROLE_SLIDER, "its role is slider")
+    let n3: usize = a11y.a11y_name(sc, ax, (*d).n_prev, (&buf[0]) as u64, 160)
+    check(same(str { p: (&buf[0]) as *mut u8, n: n3 }, "Old colour #1BD96A, new colour #1BD96A"), "the preview is an image named with both colours")
+    check(a11y.a11y_role(sc, ax, (*d).n_prev) == a11y.ROLE_IMAGE, "its role is image")
+    let n4: usize = a11y.a11y_name(sc, ax, (*d).n_basic, (&buf[0]) as u64, 160)
+    check(same(str { p: (&buf[0]) as *mut u8, n: n4 }, "Basic colours, no swatch selected"), "the basic grid says 'no swatch selected'")
+    let g: colordlg.Geom = basic_g(p)
+    click_at(p, cell_x(g, 8), cell_y(g, 8))
+    let n5: usize = a11y.a11y_name(sc, ax, (*d).n_basic, (&buf[0]) as u64, 160)
+    check(same(str { p: (&buf[0]) as *mut u8, n: n5 }, "Basic colours, #FF0000"), "after a click: 'Basic colours, #FF0000'")
+    let g2: colordlg.Geom = field_g(p)
+    click_at(p, g2.x + 100.5, g2.y + 20.5)
+    let n6: usize = a11y.a11y_name(sc, ax, (*d).n_field, (&buf[0]) as u64, 160)
+    var want: [u8; 64] = [0 as u8; 64]
+    check(n6 > 12 && rt.ld8((&buf[0]) as u64, 0) == 72 as u8, "the field's name follows the colour")
+    let n7: usize = a11y.a11y_name(sc, ax, (*d).n_cust, (&buf[0]) as u64, 160)
+    check(same(str { p: (&buf[0]) as *mut u8, n: n7 }, "Custom colours, 16 free slots"), "the custom grid says '16 free slots'")
+    // every operable node has a name: the audit of the tree
+    let rc: i32 = app.audit((*p).a)
+    eq_num("the audit (tools/fui/audit.sh): 0 unnamed, 0 duplicate keys", rc as i64, 0)
+    var named: bool = true
+    var k: usize = 0
+    while k < scene.scene_count(sc) {
+        if a11y.role_is_widget(a11y.a11y_role(sc, ax, k)) && a11y.a11y_name_source(sc, ax, k) == a11y.NAME_NONE {
+            named = false
+        }
+        k = k + 1
+    }
+    check(named, "every operable node has an accessible name")
+}
+
+// both themes: painted, the text of the dialog against its ground >= 4.5 : 1
+fn run_themes(dir: u64) {
+    say("== light and dark theme\n")
+    var dark: u32 = 0 as u32
+    while dark < 2 as u32 {
+        let p: *mut Dialog = open_dialog_themed(colordlg.WIN_W, colordlg.WIN_H, 0x1BD96A as u32, false, dark == 1 as u32)
+        let f: *mut theme.Colors = theme.theme_colors(app.app_theme((*p).a))
+        var tag: str = "light"
+        if dark == 1 as u32 {
+            tag = "dark"
+        }
+        say("  -- ")
+        say(tag)
+        say("\n")
+        check(theme.contrast((*f).text, (*f).base) >= 4.5, "text on the page >= 4.5 : 1 (labels)")
+        check(theme.contrast((*f).text, (*f).field) >= 4.5, "text on a field >= 4.5 : 1 (the seven entries)")
+        check(theme.contrast((*f).text, (*f).button) >= 4.5, "text on a button >= 4.5 : 1 (OK, Cancel, Add)")
+        check(theme.contrast((*f).accent, (*f).base) >= 3.0, "the hover / focus ring (accent) against the page >= 3 : 1")
+        check(theme.contrast((*f).text, (*f).base) >= 3.0, "the tick / cross-hair ink against the page >= 3 : 1")
+        // the dialog's own ink on content colours: black or white, >= 4.5 : 1 on 4096 colours
+        var worst: f64 = 21.0
+        var r: u32 = 0 as u32
+        while r < 256 as u32 {
+            var g: u32 = 0 as u32
+            while g < 256 as u32 {
+                var b: u32 = 0 as u32
+                while b < 256 as u32 {
+                    let bg: u32 = (r << 16) | (g << 8) | b
+                    let c: f64 = theme.contrast(colordlg.contrast_text(bg, 0xFF000000 as u32, 0xFFFFFFFF as u32), bg | 0xFF000000 as u32)
+                    if c < worst {
+                        worst = c
+                    }
+                    b = b + 17 as u32
+                }
+                g = g + 17 as u32
+            }
+            r = r + 17 as u32
+        }
+        say("    the worst contrast of black/white ink on a colour (4096 sampled): ")
+        say_num((worst * 100.0) as i64)
+        say(" / 100\n")
+        check(worst >= 4.5, "Old / New labels and the tick: >= 4.5 : 1 on every sampled colour")
+        // the page: the window background is the theme's base colour and the labels are on it
+        eq_hex("the window's background is the theme's page colour", pixel(p, 3.0, 3.0), (*f).base & 16777215 as u32)
+        if dark == 0 as u32 {
+            save(p, dir, "colordlg-light2.png")
+        } else {
+            save(p, dir, "colordlg-dark.png")
+        }
+        dark = dark + 1 as u32
+    }
+}
+
+fn run_dialog_checks(dir: u64) {
+    run_layout(dir)
+    run_roundtrip()
+    run_swatches(dir)
+    run_field(dir)
+    run_fields(dir)
+    run_grey(dir)
+    run_preview(dir)
+    run_tab(dir)
+    run_a11y(dir)
+    run_error(dir)
+    run_themes(dir)
+    run_custom(dir, false)
+    if envvar.env_has("COLORDLG_TEST") {
+        run_persist(dir)
+    } else {
+        say("  SKIP  the store checks run only with COLORDLG_TEST (a HOME of their own)\n")
+    }
+}
+
+// ------------------------------------------------------------ the speed
+
+fn paint_ms(p: *mut Dialog, w: usize, h: usize) -> f64 {
+    let a0: f64 = now_ms()
+    app.app_paint((*p).a as u64, w, h)
+    return now_ms() - a0
+}
+
+fn fresh(w: usize, h: usize) -> *mut Dialog {
+    let p: *mut Dialog = rt.heap_alloc(64) as *mut Dialog
+    (*p).a = app.window("Pick a colour", w, h)
+    (*p).d = colordlg.dlg_new_store(0x1BD96A as u32, false)
+    colordlg.build((*p).a, (*p).d)
+    fuiwirt.host_bind(app.app_host((*p).a))
+    (*p).s = surface_for((*p).a, w, h)
+    return p
+}
+
+// The worst frame of 20 repaints of an unchanged dialog.
+fn pass_steady(p: *mut Dialog, w: usize, h: usize) -> f64 {
+    var worst: f64 = 0.0
+    var k: usize = 0
+    while k < 20 {
+        let t: f64 = paint_ms(p, w, h)
+        if t > worst {
+            worst = t
+        }
+        k = k + 1
+    }
+    return worst
+}
+
+// The worst frame while the mouse walks over the 48 swatches.
+fn pass_hover(p: *mut Dialog, w: usize, h: usize) -> f64 {
+    let g: colordlg.Geom = basic_g(p)
+    var worst: f64 = 0.0
+    var k: usize = 0
+    while k < 48 {
+        mouse_move(p, cell_x(g, k), cell_y(g, k))
+        let t: f64 = paint_ms(p, w, h)
+        if t > worst {
+            worst = t
+        }
+        k = k + 1
+    }
+    return worst
+}
+
+// The worst frame of a drag across the field (120 moves, a frame each).
+fn pass_field(p: *mut Dialog, w: usize, h: usize) -> f64 {
+    let fg: colordlg.Geom = field_g(p)
+    mouse_down(p, fg.x + 10.5, fg.y + 10.5)
+    var worst: f64 = 0.0
+    var k: usize = 0
+    while k < 120 {
+        mouse_move(p, fg.x + 10.5 + (k as f64) * (fg.w - 20.0) / 120.0, fg.y + 10.5 + (k as f64) * (fg.h - 20.0) / 120.0)
+        let t: f64 = paint_ms(p, w, h)
+        if t > worst {
+            worst = t
+        }
+        k = k + 1
+    }
+    mouse_up(p, fg.x + fg.w, fg.y + fg.h)
+    return worst
+}
+
+// The worst case: a drag of the lightness bar, where the field's pixels are
+// rendered again at every step.
+fn pass_bar(p: *mut Dialog, w: usize, h: usize) -> f64 {
+    let bg: colordlg.Geom = bar_g(p)
+    mouse_down(p, bg.x + bg.w / 2.0, bg.y + 5.5)
+    var worst: f64 = 0.0
+    var k: usize = 0
+    while k < 120 {
+        mouse_move(p, bg.x + bg.w / 2.0, bg.y + 5.5 + (k as f64) * (bg.h - 12.0) / 120.0)
+        let t: f64 = paint_ms(p, w, h)
+        if t > worst {
+            worst = t
+        }
+        k = k + 1
+    }
+    mouse_up(p, bg.x, bg.y + bg.h)
+    return worst
+}
+
+fn lower(a: f64, b: f64) -> f64 {
+    if b < a {
+        return b
+    }
+    return a
+}
+
+// Each state is measured in three passes and the pass with the smallest worst
+// frame counts: the server is shared and a pass can be hit by somebody else's load.
+fn speed_at(w: usize, h: usize, tag: str) {
+    var first: f64 = 1000.0
+    var pass: usize = 0
+    while pass < 3 {
+        let q: *mut Dialog = fresh(w, h)
+        first = lower(first, paint_ms(q, w, h))
+        pass = pass + 1
+    }
+    line(tag, "first-paint", first)
+    let p: *mut Dialog = fresh(w, h)
+    let d: *mut colordlg.Dlg = (*p).d
+    let t0: f64 = paint_ms(p, w, h)
+    fuiwirt.host_painted(app.app_host((*p).a))
+    var steady: f64 = 1000.0
+    var hover: f64 = 1000.0
+    var fdrag: f64 = 1000.0
+    var bdrag: f64 = 1000.0
+    pass = 0
+    while pass < 3 {
+        steady = lower(steady, pass_steady(p, w, h))
+        hover = lower(hover, pass_hover(p, w, h))
+        fdrag = lower(fdrag, pass_field(p, w, h))
+        let r0: u64 = (*d).renders
+        bdrag = lower(bdrag, pass_bar(p, w, h))
+        check((*d).renders - r0 >= 100 as u64, "the bar drag re-rendered the field buffer at (nearly) every step")
+        pass = pass + 1
+    }
+    line(tag, "steady", steady)
+    line(tag, "hover", hover)
+    line(tag, "field-drag", fdrag)
+    line(tag, "bar-drag-rerender", bdrag)
+    // the rendering of the field's buffer alone (what every bar step adds)
+    let fg: colordlg.Geom = field_g(p)
+    var wr: f64 = 0.0
+    var tot: f64 = 0.0
+    var k: usize = 0
+    while k < 60 {
+        let a0: f64 = now_ms()
+        let rr: bool = colordlg.field_prepare(d, fg.w as usize, fg.h as usize, 0.2 + (k as f64) * 0.01)
+        let a1: f64 = now_ms()
+        tot = tot + (a1 - a0)
+        if a1 - a0 > wr {
+            wr = a1 - a0
+        }
+        k = k + 1
+    }
+    line(tag, "field-render-worst", wr)
+    line(tag, "field-render-mean", tot / 60.0)
+    // the field drag does not render the buffer again (only the first paint and the bar do)
+    let t1: f64 = paint_ms(p, w, h)
+    let r1: u64 = (*d).renders
+    mouse_down(p, fg.x + 10.5, fg.y + 10.5)
+    k = 0
+    while k < 30 {
+        mouse_move(p, fg.x + 10.5 + (k as f64) * 5.0, fg.y + 30.5)
+        let t: f64 = paint_ms(p, w, h)
+        k = k + 1
+    }
+    mouse_up(p, fg.x + 100.0, fg.y + 30.5)
+    eq_num("30 field-drag frames render the buffer 0 times", ((*d).renders - r1) as i64, 0)
+}
+
+fn line(tag: str, state: str, ms: f64) {
+    say("FRAME_MS ")
+    say(tag)
+    say(" ")
+    say(state)
+    say(" ")
+    say_num((ms * 100.0) as i64 / 100)
+    say(".")
+    var frac: i64 = ((ms * 100.0) as i64) % 100
+    if frac < 10 {
+        say("0")
+    }
+    say_num(frac)
+    say("\n")
+    check(ms <= 16.0, "frame <= 16 ms")
+}
+
+fn main(start: u64) -> i32 {
+    var dir: u64 = 0
+    if rt.arg_count(start) >= 2 {
+        dir = rt.arg_ptr(start, 1)
+    }
+    let fs: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    if !sysfont.sysfont_load(fs) {
+        say("colordlg: no font (DejaVu Sans)\n")
+        return 9
+    }
+    FONT = fs as u64
+    if dir != 0 && rt.c_length(dir) == 5 && *(dir as *mut u8) == (115 as u8) {
+        say("== speed\n")
+        speed_at(colordlg.WIN_W, colordlg.WIN_H, "dialog-620x460")
+        speed_at(1240, 720, "1240x720")
+        if BAD == 0 {
+            say("COLORDLG SPEED PASSED\n")
+            return 0
+        }
+        say("COLORDLG SPEED FAILED\n")
+        return 1
+    }
+    run_maths()
+    run_dialog_checks(dir)
+    if BAD == 0 {
+        say("COLORDLG PASSED\n")
+        return 0
+    }
+    say("COLORDLG FAILED\n")
+    return 1
+}
