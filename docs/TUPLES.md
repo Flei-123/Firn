@@ -112,6 +112,8 @@ no frame grows (`tools/result_location`). `tests/2413_tuple_swap_alias.fi`.
   `(`, so it could not be told from an expression), not in a `for` or a
   parameter. Write `let (a, b) = f()` or `t = f()` and read `t.0`.
 * **No comparison** of tuples with `==` (structs have none either).
+* **Not in `comptime` blocks**: the compile-time interpreter takes literals, names, operators,
+  conversions and calls only (a struct literal is refused the same way).
 * **`Self` in a tuple of an interface method** is resolved like a pointer or
   an array (`(Self, i32)` works).
 * **A tuple inside an `enum` payload** is laid out when the enum is: if its
