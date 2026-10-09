@@ -98,6 +98,8 @@ export {
     actions, context, action_add, on_context, on_context_global, std_edit,
     set_language, open_context, ctx_view, bind_action, set_locked, menu_manifest,
     set_proxy_call,
+    // additive hooks for dialogs (colordlg): a custom node, key and edit hooks
+    custom, ax, on_key, on_edit, on_pointer, set_width,
     NONE,
     // the side a host and the tests see (lib/@*/fui/apphost.fi,
     // tools/fui/app_main.fi)
@@ -179,9 +181,29 @@ struct App {
     ax: a11y.A11y,
     // the context menu state (CtxApp), made on first use; 0 = none (r161)
     cs: u64,
+    // dialogs: a key hook that hears every key BEFORE the focused text field
+    // (true = taken) and an edit hook that hears a text field AFTER it changed
+    key_hook: fn(*mut App, u32, u32) -> bool,
+    has_key_hook: bool,
+    edit_hook: fn(*mut App, usize),
+    has_edit_hook: bool,
+    // dialogs: the raw pointer (HOOK_MOVE / LEAVE / DOWN / UP) with its position
+    ptr_hook: fn(*mut App, u32, f64, f64) -> bool,
+    has_ptr_hook: bool,
 }
 
 fn cb_none(a: *mut App) {
+}
+
+fn key_none(a: *mut App, key: u32, mods: u32) -> bool {
+    return false
+}
+
+fn edit_none(a: *mut App, id: usize) {
+}
+
+fn ptr_none(a: *mut App, kind: u32, x: f64, y: f64) -> bool {
+    return false
 }
 
 // How big an App is -- measured like lib/plat/web.fi measures a Web:
@@ -209,7 +231,9 @@ fn app_blank() -> App {
         ptr_x: 0.0, ptr_y: 0.0,
         n_ed: 0, ed_bufs: 0, quit: false, user: 0,
         rt: event.router_new(), next_key: 60000 as u32, rt_on: false, lists_on: false,
-        ax: a11y.a11y_new(), tr: anim.transreg_new(), cs: 0 }
+        ax: a11y.a11y_new(), tr: anim.transreg_new(), cs: 0,
+        key_hook: key_none, has_key_hook: false, edit_hook: edit_none,
+        has_edit_hook: false, ptr_hook: ptr_none, has_ptr_hook: false }
 }
 
 // ============================================================ ACTIONS AND CONTEXT MENUS (r161)
@@ -520,6 +544,7 @@ fn app_edit_act(ud: u64, op: u32, cx: *mut action.ActCtx) {
         }
     }
     fuiwirt.host_touch(&(*a).w)
+    edit_done(a, k)
 }
 
 fn app_edit_can(ud: u64, op: u32, cx: *mut action.ActCtx) -> u32 {
@@ -766,6 +791,72 @@ fn spacer(a: *mut App, w: usize, h: usize) -> usize {
     }
     scene.node_set_size(&(*a).sc, i, w as f64, h as f64)
     return i
+}
+
+// ============================================================ HOOKS FOR DIALOGS
+//
+// ADDITIVE (09.10.2026, lib/fui/colordlg.fi). A dialog has parts the stock
+// widgets are not: a colour field, a grid of swatches. They are ONE node each
+// with a painter of their own (scene.node_set_draw) and need three things the
+// app layer did not give yet:
+//
+//   custom   a node of a widget kind (focusable, in the Tab chain) with a
+//            fixed size, standing in the current row/column
+//   ax       the accessibility statements of the window (a11y_set_name/role)
+//   on_key   hears every key BEFORE the focused text field; true = taken
+//            (arrows on a grid, Enter = OK, Esc = Cancel). Keys are editor.KEY_*.
+//   on_edit  hears a text field AFTER its text changed (typing, paste, cut):
+//            `id` is the field's node
+//   on_pointer  hears the raw pointer (fuiwirt.HOOK_MOVE / LEAVE / DOWN / UP) with
+//            its position, also while a button is held outside the window
+//            (a drag); true = paint again
+
+// A node of widget kind `kind` (widget.KIND_*) of `w` x `h` design points in
+// the current container. NONE when the window is full.
+fn custom(a: *mut App, kind: u32, w: usize, h: usize) -> usize {
+    let i: usize = scene.scene_add(&(*a).sc, parent(a), scene.N_WIDGET)
+    if i == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_widget_kind(&(*a).sc, i, kind)
+    scene.node_set_size(&(*a).sc, i, w as f64, h as f64)
+    return i
+}
+
+fn ax(a: *mut App) -> *mut a11y.A11y {
+    return &(*a).ax
+}
+
+fn on_key(a: *mut App, f: fn(*mut App, u32, u32) -> bool) {
+    (*a).key_hook = f
+    (*a).has_key_hook = true
+}
+
+fn on_pointer(a: *mut App, f: fn(*mut App, u32, f64, f64) -> bool) {
+    (*a).ptr_hook = f
+    (*a).has_ptr_hook = true
+}
+
+fn on_edit(a: *mut App, f: fn(*mut App, usize)) {
+    (*a).edit_hook = f
+    (*a).has_edit_hook = true
+}
+
+// A fixed width (design points) for one node of the window: a text field
+// that is not the stock 240 wide, a label that lines up with its neighbours.
+fn set_width(a: *mut App, id: usize, w: usize) {
+    if id >= scene.scene_count(&(*a).sc) {
+        return
+    }
+    node_rule(a, id, style.style_set_width(style.style_new(), w))
+    fuiwirt.host_touch(&(*a).w)
+}
+
+fn edit_done(a: *mut App, k: usize) {
+    if (*a).has_edit_hook && k < ENTRIES_MAX {
+        let f: fn(*mut App, usize) = (*a).edit_hook
+        f(a, (*a).ed_node[k])
+    }
 }
 
 // ============================================================ LISTS
@@ -1308,6 +1399,13 @@ fn focused_slot(a: *mut App) -> usize {
 // (Tab moves the focus, Enter presses the focused button).
 fn app_key(ud: u64, key: u32, mods: u32) -> bool {
     let a: *mut App = ud as *mut App
+    if (*a).has_key_hook {
+        let hf: fn(*mut App, u32, u32) -> bool = (*a).key_hook
+        if hf(a, key, mods) {
+            fuiwirt.host_touch(&(*a).w)
+            return true
+        }
+    }
     let k: usize = focused_slot(a)
     if k == NONE {
         return shortcut_key(a, key, mods)
@@ -1323,6 +1421,7 @@ fn app_key(ud: u64, key: u32, mods: u32) -> bool {
         return shortcut_key(a, key, mods)
     }
     fuiwirt.host_touch(&(*a).w)
+    edit_done(a, k)
     return true
 }
 
@@ -1343,6 +1442,7 @@ fn app_char(ud: u64, cp: u32, mods: u32) -> bool {
         return shortcut_char(a, cp, mods)
     }
     fuiwirt.host_touch(&(*a).w)
+    edit_done(a, k)
     return true
 }
 
@@ -1378,6 +1478,17 @@ fn press_field(a: *mut App, k: usize, x: f64, y: f64) {
 }
 
 fn app_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
+    let a: *mut App = ud as *mut App
+    var heard: bool = false
+    if (*a).has_ptr_hook && kind != fuiwirt.HOOK_WHEEL {
+        let pf: fn(*mut App, u32, f64, f64) -> bool = (*a).ptr_hook
+        heard = pf(a, kind, x, y)
+    }
+    let r: bool = app_hook_text(ud, kind, x, y)
+    return r || heard
+}
+
+fn app_hook_text(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     let a: *mut App = ud as *mut App
     if kind == fuiwirt.HOOK_WHEEL {
         let k: usize = slot_at(a, (*a).ptr_x, (*a).ptr_y)
@@ -1533,6 +1644,7 @@ fn app_entry_edited(ud: u64) {
     let k: usize = focused_slot(a)
     if k != NONE {
         editor.editor_caret_wake(&(*a).ed[k])
+        edit_done(a, k)
     }
 }
 
