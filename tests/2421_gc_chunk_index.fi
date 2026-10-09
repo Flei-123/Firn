@@ -1,0 +1,149 @@
+// expect_exit: 0
+// The address index of the heap chunks (round M1 of the Certus fork): the
+// collector finds the chunk of an address by binary search in a sorted array
+// instead of walking the list, and a direct-mapped cache sits in front of it.
+// The index is kept up to date where chunks come and go, so this test makes
+// chunks come AND go: a heap of ~16 MiB (60+ chunks of 256 KiB) is built,
+// checked, dropped, given back to the operating system, and built again.
+// Everything that is kept alive has to be intact afterwards -- a stale or
+// missing index entry would let the collector free live objects.
+
+gc class Blob {
+    next: Gc[Blob],
+    id: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    e: u64,
+    f: u64,
+}
+
+fn chain(n: u64, base: u64) -> AllocError!Gc[Blob] {
+    var head: Gc[Blob] = gc_null[Blob]()
+    var i: u64 = 0
+    while i < n {
+        head = try gc Blob { next: head, id: base + i, a: i, b: i, c: i, d: i, e: i, f: i }
+        i = i + 1
+    }
+    return head
+}
+
+// Walks the chain; 0 = fine, otherwise the number of the broken invariant.
+fn check(head: Gc[Blob], n: u64, base: u64) -> u64 {
+    var count: u64 = 0
+    var sum: u64 = 0
+    var c: Gc[Blob] = head
+    while c != gc_null[Blob]() {
+        // the payload words must still match the id
+        let want: u64 = c.id - base
+        if c.a != want || c.f != want || c.c != want {
+            return 1
+        }
+        sum = sum + c.id
+        count = count + 1
+        c = c.next
+    }
+    if count != n {
+        return 2
+    }
+    // ids are base + (n-1) down to base
+    if sum != n * base + n * (n - 1) / 2 {
+        return 3
+    }
+    return 0
+}
+
+// The scan is conservative: stale pointers in dead stack frames keep chains
+// alive. Clear the area below this frame so that dropping the chain really
+// drops it.
+fn scrub(n: u64) {
+    var buffer: [u64; 256] = [0; 256]
+    let p: u64 = (&buffer) as u64
+    var i: u64 = 0
+    while i < 256 {
+        *((p + i * 8) as *mut u64) = 0
+        i = i + 1
+    }
+    if n > 0 {
+        scrub(n - 1)
+    }
+}
+
+// Builds a chain of `n` blobs, checks it, runs the collector over it and
+// returns the heap size while it was alive (>= 1000), or an error code
+// (< 1000). The chain lives in THIS frame only; once the function has
+// returned, `scrub` can wipe every copy of its head.
+fn phase(n: u64, base: u64) -> u64 {
+    let a: Gc[Blob] = chain(n, base) catch gc_null[Blob]()
+    if a == gc_null[Blob]() {
+        return 91
+    }
+    if check(a, n, base) != 0 {
+        return 1
+    }
+    gc_collect()
+    if check(a, n, base) != 0 {
+        return 2
+    }
+    if gc_live_objects() < n {
+        return 3
+    }
+    return gc_heap_bytes()
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    // 200 000 blobs of 64 octets payload + header: ~16 MiB, 60+ chunks. The
+    // collector runs several times while this is built.
+    let grown: u64 = phase(200000, 1000)
+    if grown < 1000 {
+        return grown as i32
+    }
+    if grown < 10 * 1048576 {
+        return 92
+    }
+
+    // A second chain next to the first one's remains: its chunks interleave
+    // with the first one's in the index. It stays alive to the end.
+    let b: Gc[Blob] = chain(50000, 500000) catch gc_null[Blob]()
+    if b == gc_null[Blob]() {
+        return 93
+    }
+    // The first chain is dead now. A chunk is given back after it has been
+    // empty for two sweeps in a row, so collect a few times.
+    scrub(40)
+    gc_collect()
+    gc_collect()
+    gc_collect()
+    gc_collect()
+    // the small chain survived all of this
+    if check(b, 50000, 500000) != 0 {
+        return 6
+    }
+    let shrunk: u64 = gc_heap_bytes()
+    if shrunk * 2 > grown {
+        // fewer than half of the octets given back: the chunks did not go
+        return 7
+    }
+
+    // Build a big chain again on top of the holes: the index gets entries
+    // inserted between the surviving ones.
+    let again: u64 = phase(200000, 9000)
+    if again < 1000 {
+        return again as i32 + 100
+    }
+    if check(b, 50000, 500000) != 0 {
+        return 9
+    }
+    gc_collect()
+    if check(b, 50000, 500000) != 0 {
+        return 10
+    }
+    if gc_live_objects() < 50000 {
+        return 11
+    }
+    return 0
+}

@@ -1,0 +1,225 @@
+// expect_exit: 0
+// The per-class census of the collector runtime (rounds C-043 / C-045 of the
+// Certus fork, now in lib/gc/gc.fi): how many live objects of which class,
+// the class names out of the type table, the length buckets, the field value
+// counts and "who points at whom".
+//
+// The numbers are exact because the test builds the heap itself: 300 `Alpha`
+// in a chain (every third one has `tag == 7`), 100 `Beta` that each point at
+// one `Alpha`, and nothing else is kept alive by the program.
+
+gc class Alpha {
+    next: Gc[Alpha],
+    tag: u32,
+    len: u32,
+}
+
+gc class Beta {
+    target: Gc[Alpha],
+    weight: u64,
+}
+
+fn build_alphas(n: u32) -> AllocError!Gc[Alpha] {
+    var head: Gc[Alpha] = gc_null[Alpha]()
+    var i: u32 = 0
+    while i < n {
+        var tag: u32 = 1
+        if i % 3 == 0 {
+            tag = 7
+        }
+        head = try gc Alpha { next: head, tag: tag, len: i % 30 }
+        i = i + 1
+    }
+    return head
+}
+
+fn build_betas(alphas: Gc[Alpha], n: u32) -> AllocError!Gc[Beta] {
+    // the Betas are chained through their `target` only in the sense that
+    // each one points at the head of the Alpha chain; the Beta objects
+    // themselves are kept alive by the array of roots below
+    var last: Gc[Beta] = gc_null[Beta]()
+    var i: u32 = 0
+    while i < n {
+        last = try gc Beta { target: alphas, weight: 0 }
+        i = i + 1
+    }
+    return last
+}
+
+// Does the zero terminated text at `p` equal `want`?
+fn name_is(p: u64, want: str) -> bool {
+    if p == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < want.n {
+        let got: u8 = *((p + i as u64) as *mut u8)
+        let exp: u8 = *((want.p as u64 + i as u64) as *mut u8)
+        if got != exp {
+            return false
+        }
+        i = i + 1
+    }
+    return (*((p + want.n as u64) as *mut u8)) == 0
+}
+
+fn class_id(want: str) -> u64 {
+    var t: u64 = 1
+    while t <= gc_class_total() {
+        if name_is(gc_class_name(t), want) {
+            return t
+        }
+        t = t + 1
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    let alphas = build_alphas(300) catch gc_null[Alpha]()
+    if alphas == gc_null[Alpha]() {
+        return 91
+    }
+    // 100 Betas: keep them reachable through a chain of their own so that
+    // the census sees all of them. Beta has no `next`, so hold them in a
+    // GcVec.
+    let held = gcvec_new() catch gc_null[GcVec]()
+    if (held as u64) == 0 {
+        return 92
+    }
+    var b: u32 = 0
+    while b < 100 {
+        let one = build_betas(alphas, 1) catch gc_null[Beta]()
+        if one == gc_null[Beta]() {
+            return 93
+        }
+        let ok = gcvec_append[Beta](held, one) catch false
+        if !ok {
+            return 94
+        }
+        b = b + 1
+    }
+    gc_collect()
+
+    // --- the type table knows the classes by name -------------------------
+    let ta: u64 = class_id("Alpha")
+    let tb: u64 = class_id("Beta")
+    if ta == 0 {
+        return 1
+    }
+    if tb == 0 {
+        return 2
+    }
+    if ta == tb {
+        return 3
+    }
+    if gc_class_total() < 2 {
+        return 4
+    }
+
+    // --- the census -------------------------------------------------------
+    let total: u64 = gc_count_classes()
+    if total == 0 {
+        return 5
+    }
+    if gc_class_count(ta) != 300 {
+        return 6
+    }
+    if gc_class_count(tb) != 100 {
+        return 7
+    }
+    // occupied octets are at least payload * count
+    if gc_class_bytes(ta) < gc_class_size(ta) * 300 {
+        return 8
+    }
+    if gc_class_size(ta) != 16 {
+        return 9
+    }
+    // the sum over all classes is the number of occupied blocks
+    if total < 400 {
+        return 10
+    }
+    // an id outside the table answers 0, never reads outside it
+    if gc_class_count(100000) != 0 {
+        return 11
+    }
+    if gc_class_name(0) != 0 {
+        return 12
+    }
+    if gc_class_name(100000) != 0 {
+        return 13
+    }
+
+    // --- field value counts -----------------------------------------------
+    // Alpha layout: next (8), tag (u32 at 8), len (u32 at 12)
+    let sevens: u64 = gc_field_count32(ta, 8, 7)
+    if sevens != 100 {
+        return 20
+    }
+    let ones: u64 = gc_field_count32(ta, 8, 1)
+    if ones != 200 {
+        return 21
+    }
+    // the last Alpha of the chain has a null `next`: exactly one
+    if gc_field_count64(ta, 0, 0) != 1 {
+        return 22
+    }
+
+    // --- length buckets: `len` is i % 30 -----------------------------------
+    // values 0..29 ten times each -> bucket 0: v==0 (10), 1: 1..2 (20),
+    // 2: 3..4 (20), 3: 5..8 (40), 4: 9..12 (40), 5: 13..16 (40),
+    // 6: 17..24 (80), 7: 25+ (50)
+    let seen: u64 = gc_len_histogram(ta, 12)
+    if seen != 300 {
+        return 30
+    }
+    if gc_len_bucket(0) != 10 {
+        return 31
+    }
+    if gc_len_bucket(1) != 20 {
+        return 32
+    }
+    if gc_len_bucket(2) != 20 {
+        return 33
+    }
+    if gc_len_bucket(3) != 40 {
+        return 34
+    }
+    if gc_len_bucket(6) != 80 {
+        return 35
+    }
+    if gc_len_bucket(7) != 50 {
+        return 36
+    }
+    if gc_len_bucket(8) != 0 {
+        return 37
+    }
+
+    // --- who points at Alpha ----------------------------------------------
+    // every Beta points at the head Alpha; the Alphas point at each other
+    // 299 times (the tail has none). With holder 0: all holders.
+    if gc_refs_to(tb, ta) != 100 {
+        return 40
+    }
+    if gc_refs_to(ta, ta) != 299 {
+        return 41
+    }
+    if gc_refs_to(0, ta) != 399 {
+        return 42
+    }
+    // the GcVec slot buffer holds 100 pointers to Betas, none to Alphas
+    if gc_slot_refs_to(tb) != 100 {
+        return 43
+    }
+    if gc_slot_refs_to(ta) != 0 {
+        return 44
+    }
+
+    // --- the census is repeatable and independent of the buckets ------------
+    if gc_count_classes() != total {
+        return 50
+    }
+    return 0
+}

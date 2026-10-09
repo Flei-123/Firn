@@ -62,9 +62,10 @@ const P_AS: &str = "__gc#as:";
 
 /// Call names of the runtime (`lib/gc/gc.fi`) that can trigger a collection
 /// run or touch the state of the collector.
-const RUNTIME_COLLECTS: [&str; 4] = ["gc_init", "gc_collect", "__gc_alloc_raw", "__gc_collect_now"];
+const RUNTIME_COLLECTS: [&str; 5] =
+    ["gc_init", "gc_collect", "__gc_alloc_raw", "__gc_collect_now", "gc_bottom_swap"];
 /// Further runtime names: pure queries, but part of the collector.
-const RUNTIME_QUERY: [&str; 11] = [
+const RUNTIME_QUERY: [&str; 23] = [
     "gc_set_max_bytes",
     "gc_max_bytes",
     "gc_total_bytes",
@@ -76,6 +77,23 @@ const RUNTIME_QUERY: [&str; 11] = [
     "gc_pause_ns_max",
     "gc_pause_ns_total",
     "gc_barriers",
+    // Round C-043 (memory): the breakdown of the live objects per class. Pure
+    // queries -- they start no collection run, they only read through the
+    // heap and the type table.
+    "gc_count_classes",
+    "gc_class_count",
+    "gc_class_bytes",
+    "gc_class_total",
+    "gc_class_name",
+    "gc_class_size",
+    "gc_len_histogram",
+    "gc_len_bucket",
+    "gc_field_count32",
+    // Round C-045: the same for a 64-bit field (pointer questions).
+    "gc_field_count64",
+    // Round C-045: who points at a class.
+    "gc_refs_to",
+    "gc_slot_refs_to",
 ];
 
 /// Compiler intrinsics that `gc_lower.rs` turns into `Op::GcAddr`.
@@ -1382,8 +1400,32 @@ pub(crate) fn ty_table_asm() -> String {
             let _ = writeln!(out, "    .quad {}", k.weak_offs.len());
             let _ = writeln!(out, "    .quad {}.w{}", TABLE_LABEL, k.tid);
             let _ = writeln!(out, "    .quad {}", k.tid);
-            let _ = writeln!(out, "    .quad 0");
+            // Round C-043 (memory): the eighth word of the entry used to be
+            // a fixed 0 -- pure padding so that an entry measures a round 64
+            // octets. It now carries the POINTER TO THE CLASS NAME (zero
+            // terminated, in the same section).
+            //
+            // WHY: the block header knows only a u32 type id. A count per id
+            // says "class 37 occurs 400 000 times" -- and nobody knows which
+            // class 37 is, because the numbers arise from the declaration
+            // order over the whole tree and shift with every new `gc class`.
+            // Without the name the breakdown is unreadable and therefore
+            // worthless.
+            //
+            // Cost: 8 octets per class plus the name itself, ONCE in the
+            // program image (about 250 classes -> 4 KB of .rodata). No run
+            // time cost: no collect, mark or allocation path reads this word,
+            // only the table query `gc_class_name`.
+            let _ = writeln!(out, "    .quad {}.n{}", TABLE_LABEL, k.tid);
         }
+        // The class names. They stand AFTER the entries so that the entry
+        // table itself stays contiguous (the collector computes with a fixed
+        // stride of 64 octets).
+        for k in &reg.classes {
+            let _ = writeln!(out, "{}.n{}:", TABLE_LABEL, k.tid);
+            let _ = writeln!(out, "    .asciz \"{}\"", crate::fir::asm_escape(&k.name));
+        }
+        let _ = writeln!(out, "{}", crate::target::align(8));
         for k in &reg.classes {
             let _ = writeln!(out, "{}.s{}:", TABLE_LABEL, k.tid);
             for o in &k.strong_offs {
