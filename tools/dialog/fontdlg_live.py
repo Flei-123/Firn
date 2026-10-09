@@ -110,7 +110,11 @@ class Run:
             time.sleep(0.2)
         time.sleep(0.8)
         if self.win:
-            g = dict(l.split("=") for l in xdo("getwindowgeometry", "--shell", self.win).splitlines() if "=" in l)
+            for _ in range(20):
+                g = dict(l.split("=") for l in xdo("getwindowgeometry", "--shell", self.win).splitlines() if "=" in l)
+                if "X" in g and int(g.get("WIDTH", 0)) > 100:
+                    break
+                time.sleep(0.5)
             self.x, self.y, self.w, self.h = int(g["X"]), int(g["Y"]), int(g["WIDTH"]), int(g["HEIGHT"])
             self.scale = self.w / 574.0
             xdo("windowfocus", self.win)
@@ -122,6 +126,18 @@ class Run:
         subprocess.run([sys.executable, os.path.join(ROOT, "tools/fui/xwd2png.py"), x, p], check=True, capture_output=True)
         im = Image.open(p).convert("RGB").crop((self.x, self.y, self.x + self.w, self.y + self.h))
         im.load()
+        if PNGDIR and name:
+            os.makedirs(PNGDIR, exist_ok=True)
+            im.save(os.path.join(PNGDIR, name))
+        return im
+
+    def poll(self, cond, timeout=10.0, name=None):
+        """Screenshots until cond(picture) holds: the dialog answers an event a moment later, a loaded machine later still."""
+        end = time.time() + timeout
+        im = self.shot()
+        while not cond(im) and time.time() < end:
+            time.sleep(0.4)
+            im = self.shot()
         if PNGDIR and name:
             os.makedirs(PNGDIR, exist_ok=True)
             im.save(os.path.join(PNGDIR, name))
@@ -154,7 +170,7 @@ class Run:
     def alive(self):
         return self.p.poll() is None
 
-    def finish(self, timeout=6):
+    def finish(self, timeout=12):
         """The driver's answer lines (waits for it to end)."""
         try:
             out, err = self.p.communicate(timeout=timeout)
@@ -365,7 +381,7 @@ if r.win:
         hy = sel[1] + rowh // 2
         hx = fb[0] + int(40 * s)
         r.move(hx, hy)
-        im1 = r.shot("live-hover.png")
+        im1 = r.poll(lambda im: len(bands(im, fb, s)[1]) == 2, name="live-hover.png")
         f1, bd1 = bands(im1, fb, s)
         check("hover paints the row under the pointer in a colour of its own", len(bd1) == 2 and any(
             b[2] != sel[2] and b[2] != f1 for b in bd1), bd1)
@@ -374,7 +390,7 @@ if r.win:
               im1.getpixel((px_x, hy)) != f1, (im0.getpixel((px_x, hy)), im1.getpixel((px_x, hy)), f1))
         # click that row: Test Box
         r.click(hx, hy)
-        im2 = r.shot("live-focus.png")
+        im2 = r.poll(lambda im: ink(im, P["preview"], s)[0] > ink0 * 3, name="live-focus.png")
         ink2, bb2 = ink(im2, P["preview"], s)
         check("a click on the row below chooses Test Box: the sample is drawn with ITS face (squares carry far more ink "
               "than bars)", ink2 > ink0 * 3, (ink0, ink2))
@@ -387,20 +403,25 @@ if r.win:
         # the filter field
         r.click(*mid(P["filter"]))
         r.type("test b")
-        im3 = r.shot("live-filter.png")
+        im3 = r.poll(lambda im: text_lines(im, fb, s) == 2, name="live-filter.png")
         f3, bd3 = bands(im3, fb, s)
-        check("typing 'test b' into the filter narrows the family list (the chosen row sits at the top, the list has "
-              "no scroll bar)", len(bd3) >= 1 and bd3[0][0] < fb[1] + 3 * rowh, bd3)
-        # choose Test Box by the second row
+        check("typing 'test b' into the filter narrows the family list to two lines (Test Bar, Test Box)",
+              text_lines(im3, fb, s) == 2, text_lines(im3, fb, s))
+        check("... the chosen row (Test Box) is the second one", len(bd3) >= 1 and abs(bd3[0][0] - (fb[1] + int(2 * s) + rowh)) <= 3 * s,
+              bd3)
+        # choose Test Bar by the first row, then Test Box by the second
+        r.click(fb[0] + int(40 * s), fb[1] + int(2 * s) + int(0.5 * rowh))
+        imb = r.poll(lambda im: ink(im, P["preview"], s)[0] < ink0 * 2)
+        check("its first row is Test Bar (thin bars again)", ink(imb, P["preview"], s)[0] < ink0 * 2, ink(imb, P["preview"], s)[0])
         r.click(fb[0] + int(40 * s), fb[1] + int(2 * s) + int(1.5 * rowh))
-        im3b = r.shot()
+        im3b = r.poll(lambda im: ink(im, P["preview"], s)[0] > ink0 * 3)
         ink3, bb3 = ink(im3b, P["preview"], s)
         check("... and its second row is Test Box", ink3 > ink0 * 3, (ink0, ink3))
         # the size field
         r.click(*mid(P["sizeentry"]))
         r.key("ctrl+a")
         r.type("48")
-        im4 = r.shot("live-size48.png")
+        im4 = r.poll(lambda im: ink(im, P["preview"], s)[0] > ink3 * 5, name="live-size48.png")
         ink4, bb4 = ink(im4, P["preview"], s)
         check("size 48 typed into the size field: the sample is much bigger than at 12", ink4 > ink3 * 5, (ink3, ink4))
         check("... and its height grows (the ink box of 48 is at least 2x the one of 12)",
@@ -408,7 +429,7 @@ if r.win:
         # Bold
         c0 = im4.getpixel(mid(P["bold"]))
         r.click(*mid(P["bold"]))
-        im5 = r.shot("live-bold.png")
+        im5 = r.poll(lambda im: im.getpixel(mid(P["bold"])) != c0, name="live-bold.png")
         check("the Bold check box turns on (its box changes colour)", im5.getpixel(mid(P["bold"])) != c0)
         sty0 = bands(im4, P["sty"], s)[1]
         sty5 = bands(im5, P["sty"], s)[1]
@@ -416,7 +437,7 @@ if r.win:
               sty0 and sty5 and sty5[0][0] - sty0[0][0] >= int(1.5 * rowh), (sty0, sty5))
         # Underline
         r.click(*mid(P["under"]))
-        im6 = r.shot("live-underline.png")
+        im6 = r.poll(lambda im: ink(im, P["preview"], s)[0] > ink4 + 100, name="live-underline.png")
         ink6, bb6 = ink(im6, P["preview"], s)
         check("Underline adds a line below the text", ink6 > ink4 + 100 and bb6[3] > bb4[3], (ink4, ink6, bb4, bb6))
         # OK
@@ -553,10 +574,10 @@ if r.win:
         fb = P["fam"]
         # DejaVu Sans is the first row: scroll the list to the top, click it
         r.wheel(fb[0] + int(40 * s), fb[1] + int(40 * s), False, 3)
-        im1 = r.shot("live-wheel.png")
+        im1 = r.poll(lambda im: not same_image(im0, im, fb), name="live-wheel.png")
         check("the wheel scrolls the list under the pointer (the list picture changed)", not same_image(im0, im1, fb))
         r.click(fb[0] + int(40 * s), fb[1] + int(2 * s) + int(0.5 * round(24 * s)))
-        im2 = r.shot()
+        im2 = r.poll(lambda im: not same_image(im0, im, P["preview"]))
         ink_sans, bbsans = ink(im2, P["preview"], s)
         check("DejaVu Sans and DejaVu Serif draw differently in the sample (the real faces)", ink_sans != ink_serif and
               not same_image(im0, im2, P["preview"]), (ink_serif, ink_sans))
@@ -566,7 +587,7 @@ if r.win:
         r.click(*mid(P["sizeentry"]))
         r.key("ctrl+a")
         r.type("5000")
-        im3 = r.shot("live-size999.png")
+        im3 = r.poll(lambda im: ink(im, P["preview"], s)[0] > 1000, name="live-size999.png")
         ink9, bb9 = ink(im3, P["preview"], s)
         pv = P["preview"]
         check("5000 is clamped to 999 and the sample stays inside its box (capped, clipped)",
