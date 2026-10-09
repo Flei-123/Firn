@@ -381,6 +381,12 @@ impl<'a> Checker<'a> {
                     "'#[link_name(...)]' only belongs on an 'extern fn' declaration",
                 );
             }
+            if attrs.iter().any(|a| a.name == "link_lib") && f.extern_info.is_none() {
+                self.dg.error(
+                    f.span,
+                    "'#[link_lib(...)]' only belongs on an 'extern fn' declaration",
+                );
+            }
             if has_export_c && f.extern_info.is_some() {
                 self.dg.error(
                     f.span,

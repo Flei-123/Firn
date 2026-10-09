@@ -100,6 +100,13 @@ pub const ATTRS: &[AttrInfo] = &[
         what: "explicit C link name for 'extern fn', e.g. #[link_name(exit)] (SPEC 14.5)",
     },
     AttrInfo {
+        name: "link_lib",
+        target: Target::Func,
+        args: 1,
+        implemented: true,
+        what: "dynamic link on x86_64-linux: #[link_lib(c)] on an 'extern fn' makes the image a dynamically linked ELF (PT_INTERP + DT_NEEDED) so dlopen/dlsym resolve; ignored on Windows (docs/FFI.md)",
+    },
+    AttrInfo {
         name: "win_callback",
         target: Target::Func,
         args: 0,
@@ -320,6 +327,7 @@ mod tests {
                 "interrupt",
                 "arch",
                 "link_name",
+                "link_lib",
                 "win_callback",
                 "export_c",
                 "inline",

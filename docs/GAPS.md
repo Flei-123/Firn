@@ -53,7 +53,7 @@ Effect is estimated as T (speed), C (amount of code / workaround), F
 | B13 | closed, see A11 | | | | | |
 | B14 | closed, see A15 | | | | | |
 | B15 | **Runtime names of the collector are a fixed list in the compiler** (`gc.rs` RUNTIME_QUERY) -- a new function in `lib/gc/gc.fi` needs a compiler patch | confirmed | certus `vendor/firn/patches/compiler-0005-*`, `0006-*` | 0 | 1 | 2 |
-| B16 | **Windows import table is a list in `win.rs`** -- every new Win32 call is a compiler patch | confirmed (firnc-gc) | certus `vendor/firn/patches/compiler-0007-dwmapi-*` | 0 | 1 | 2 |
+| B16 | closed on branch `w-ffi`, see `docs/FFI.md`: `LoadLibraryA/W` + `FreeLibrary` + the generic Win64 call gate (`win64_call`) behind `std.dynlib` -- a new Win32 call needs no compiler patch (merges into firnc-gc with r68) | |
 | B17 | **`lib/fui` patches that no longer apply** (0001-fui-painter-fontreq, 0002, 0004; uipaint<->painter rename) -- Certus freezes copies (`.fui-c073`) | confirmed (bauen-win.sh:17-24) | certus build scripts | 0 | 2 | 3 |
 | B18 | closed, see A10 | | | | | |
 | B19 | **No SIMD multiply** (vector blending) | not re-checked | certus `docs/RUNDE-RASTERN.md:43` | 2 | 0 | 0 |

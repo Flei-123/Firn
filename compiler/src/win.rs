@@ -58,6 +58,13 @@ use std::collections::{BTreeMap, BTreeSet};
 /// (`modules.rs`): reserved, and no source text can produce it.
 pub const PREFIX: &str = "_Fwin.";
 
+/// The generic Win64 call gates behind `std.dynlib` (round FFI). A Firn
+/// indirect call is System V, so a pointer from `GetProcAddress` cannot be
+/// called directly; these two thunks call ANY Win64 function from an
+/// argument array, so no new Win32 call needs a compiler patch (GAPS B16).
+pub const DYNCALL: &str = "win64_call";
+pub const DYNCALLF: &str = "win64_callf";
+
 /// The stack probe. Called with the frame size in `rax`.
 pub const CHKSTK: &str = "_Fwin.chkstk";
 
@@ -173,6 +180,15 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("MoveFileExW", "KERNEL32.dll", 3),
     ("GetModuleHandleW", "KERNEL32.dll", 1),
     ("GetProcAddress", "KERNEL32.dll", 2),
+    // --- std.dynlib (docs/FFI.md): load ANY dll at run time ---------------
+    ("LoadLibraryA", "KERNEL32.dll", 1),
+    ("LoadLibraryW", "KERNEL32.dll", 1),
+    ("FreeLibrary", "KERNEL32.dll", 1),
+    // The two generic Win64 call gates (not imports: DLL "" = internal).
+    // `win64_call(fn, argv, n) -> rax`, `win64_callf` the same but the
+    // result is xmm0's low 64 bits. See `dyncall_asm`.
+    (DYNCALL, "", 3),
+    (DYNCALLF, "", 3),
     // --- kernel32: starting a helper process and reading its answer ----
     // Round UPDATE-CHECK (Certus). Certus called these three through
     // GetProcAddress + a Firn function pointer -- and a Firn indirect call
@@ -593,6 +609,39 @@ fn align_up(x: u64, a: u64) -> u64 {
     (x + a - 1) / a * a
 }
 
+/// **The generic Win64 call gate.**
+///
+/// System V in: `rdi` = target, `rsi` = argv (at least 4 readable slots),
+/// `rdx` = argument count (clamped to 16). Win64 out: slots 0-3 go into
+/// `rcx, rdx, r8, r9` AND `xmm0-xmm3` (Win64 numbers integer and float
+/// arguments by POSITION, so the callee reads whichever register its
+/// prototype names; a `float` is the low 32 bits of its slot), slots 4..
+/// onto the stack above 32 octets of shadow space. `float_result` returns
+/// `xmm0` (as raw bits) instead of `rax`.
+fn dyncall_asm(float_result: bool) -> String {
+    let name = if float_result { DYNCALLF } else { DYNCALL };
+    let mut s = String::new();
+    s.push_str(&format!("\n.globl {}\n{}:\n", thunk(name), thunk(name)));
+    s.push_str("    push rbp\n    mov rbp, rsp\n");
+    s.push_str("    sub rsp, 128\n"); // 32 shadow + 12 stack args = 16 slots, aligned
+    s.push_str("    mov r10, rdi\n    mov r11, rsi\n    mov rax, rdx\n");
+    s.push_str("    cmp rax, 16\n    jbe 1f\n    mov rax, 16\n1:\n");
+    s.push_str("    mov rcx, 4\n");
+    s.push_str("2:\n    cmp rcx, rax\n    jnb 3f\n");
+    s.push_str("    mov rdx, qword ptr [r11+rcx*8]\n");
+    s.push_str("    mov qword ptr [rsp+rcx*8], rdx\n"); // slot i at rsp+32+8*(i-4)
+    s.push_str("    inc rcx\n    jmp 2b\n3:\n");
+    s.push_str("    mov rcx, qword ptr [r11]\n    mov rdx, qword ptr [r11+8]\n");
+    s.push_str("    mov r8, qword ptr [r11+16]\n    mov r9, qword ptr [r11+24]\n");
+    s.push_str("    movq xmm0, rcx\n    movq xmm1, rdx\n    movq xmm2, r8\n    movq xmm3, r9\n");
+    s.push_str("    call r10\n");
+    if float_result {
+        s.push_str("    movq rax, xmm0\n");
+    }
+    s.push_str("    leave\n    ret\n");
+    s
+}
+
 /// **One System V → Win64 thunk.**
 ///
 /// On entry the System V arguments sit in `rdi, rsi, rdx, rcx, r8, r9` and,
@@ -929,7 +978,11 @@ pub fn runtime_asm() -> String {
     s.push_str(".text\n");
     for u in &used {
         let (_, argc) = known(u).expect("registered import is known");
-        s.push_str(&thunk_asm(u, argc));
+        if u == DYNCALL || u == DYNCALLF {
+            s.push_str(&dyncall_asm(u == DYNCALLF));
+        } else {
+            s.push_str(&thunk_asm(u, argc));
+        }
     }
     let cbs: Vec<(String, u32)> =
         CBUSED.with(|c| c.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect());
@@ -945,8 +998,14 @@ pub fn runtime_asm() -> String {
     if sysstub_used() {
         s.push_str(&sysstub_asm());
     }
-    if !used.is_empty() {
-        s.push_str(&idata_asm(&used));
+    // The call gates are code, not imports: they get no descriptor.
+    let imports: Vec<String> = used
+        .iter()
+        .filter(|u| u.as_str() != DYNCALL && u.as_str() != DYNCALLF)
+        .cloned()
+        .collect();
+    if !imports.is_empty() {
+        s.push_str(&idata_asm(&imports));
     }
     s
 }
@@ -963,6 +1022,26 @@ pub fn note_baseline() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_call_gate_loads_registers_and_stack_slots() {
+        let a = dyncall_asm(false);
+        assert!(a.contains("mov r9, qword ptr [r11+24]"), "{}", a);
+        assert!(a.contains("movq xmm3, r9"), "{}", a);
+        assert!(a.contains("mov qword ptr [rsp+rcx*8], rdx"), "{}", a);
+        assert!(!a.contains("movq rax, xmm0"), "{}", a);
+        assert!(dyncall_asm(true).contains("movq rax, xmm0"));
+    }
+
+    #[test]
+    fn the_call_gates_are_no_imports() {
+        reset();
+        assert_eq!(note("win64_call"), Some("_Fwin.win64_call".to_string()));
+        assert_eq!(note("LoadLibraryA"), Some("_Fwin.LoadLibraryA".to_string()));
+        let asm = runtime_asm();
+        assert!(asm.contains("_Fwin.win64_call:"), "{}", asm);
+        assert!(!asm.contains("__imp_win64_call"), "{}", asm);
+    }
 
     #[test]
     fn only_known_functions_become_imports() {

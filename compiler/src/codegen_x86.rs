@@ -392,7 +392,15 @@ pub fn emit(m: &Module) -> Result<String, String> {
     e.line("and rsp, -16");
     e.line(&format!("call {}", label("main")));
     e.line("mov edi, eax");
-    e.line("mov eax, 60");
+    // A dynamically linked image (`#[link_lib]`, std.dynlib) may have
+    // threads of its own that a foreign library started (Mesa's llvmpipe):
+    // `exit` would end only this one and leave the process alive and hung.
+    // `exit_group` ends all. A static image keeps `exit` bit for bit.
+    if crate::extfn::link_libs().is_empty() {
+        e.line("mov eax, 60");
+    } else {
+        e.line("mov eax, 231");
+    }
     e.line("syscall");
     e.line("hlt");
     }

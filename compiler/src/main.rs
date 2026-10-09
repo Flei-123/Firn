@@ -1306,10 +1306,21 @@ fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
         // never appears here, and no foreign object file enters the image.
         cmd.arg("-e").arg("_start");
         cmd.arg("--subsystem").arg(win::subsystem());
+    } else if !extfn::link_libs().is_empty() && t == target::Target::X86_64 {
+        // `#[link_lib(..)]` (docs/FFI.md): a dynamically linked image --
+        // PT_INTERP + DT_NEEDED, so that `dlopen`/`dlsym` of libc resolve.
+        // No `-n`: the loader maps page aligned segments.
+        cmd.arg("-dynamic-linker").arg("/lib64/ld-linux-x86-64.so.2");
     } else if !crate::statics::any() {
         cmd.arg("-n");
     }
-    let st = cmd.arg("-o").arg(out).arg(obj).status();
+    cmd.arg("-o").arg(out).arg(obj);
+    if !target::windows() && t == target::Target::X86_64 {
+        for l in extfn::link_libs() {
+            cmd.arg(extfn::link_lib_arg(&l));
+        }
+    }
+    let st = cmd.status();
     match st {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => {

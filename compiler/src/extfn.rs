@@ -53,6 +53,8 @@ thread_local! {
     static EXTERNS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
     /// internal names of functions marked `#[export_c]`
     static EXPORTED: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// libraries named by `#[link_lib(..)]`, in first-seen order
+    static LIBS: RefCell<Vec<String>> = RefCell::new(Vec::new());
 }
 
 /// Only for self tests, which compile several programs in ONE process.
@@ -60,6 +62,25 @@ thread_local! {
 pub(crate) fn reset() {
     EXTERNS.with(|e| e.borrow_mut().clear());
     EXPORTED.with(|e| e.borrow_mut().clear());
+    LIBS.with(|e| e.borrow_mut().clear());
+}
+
+/// The libraries `#[link_lib(..)]` asked for (empty = a static image).
+pub fn link_libs() -> Vec<String> {
+    LIBS.with(|e| e.borrow().clone())
+}
+
+/// The `ld` argument for one `#[link_lib(name)]`. The well known names map
+/// to the versioned runtime file (`libc.so.6`), because the unversioned
+/// `libc.so` is a linker script that only exists with the dev package.
+pub fn link_lib_arg(name: &str) -> String {
+    match name {
+        "c" => "-l:libc.so.6".to_string(),
+        "dl" => "-l:libdl.so.2".to_string(),
+        "m" => "-l:libm.so.6".to_string(),
+        "pthread" => "-l:libpthread.so.0".to_string(),
+        other => format!("-l{}", other),
+    }
 }
 
 /// Registers one `extern fn`. `internal_name` is what `Op::Call` carries
@@ -100,6 +121,16 @@ pub fn export_link_name(name: &str) -> Option<String> {
 /// `sema::check` at all).
 pub fn register(prog: &crate::ast::Program) {
     for f in &prog.funcs {
+        for a in f.attrs.iter().filter(|a| a.name == "link_lib") {
+            if let Some(l) = a.args.first() {
+                LIBS.with(|e| {
+                    let mut v = e.borrow_mut();
+                    if !v.contains(l) {
+                        v.push(l.clone());
+                    }
+                });
+            }
+        }
         if let Some(info) = &f.extern_info {
             let link = info.link_name.clone().unwrap_or_else(|| source_name(&f.name));
             mark_extern(&f.name, &link);

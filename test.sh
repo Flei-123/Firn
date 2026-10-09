@@ -1920,6 +1920,19 @@ else
     grep -E 'FAIL|differs|DIFF' "$WORK/xml_cross.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 118. std.dynlib: dlopen/dlsym on Linux, LoadLibrary + the Win64 call gate on Windows, a real GL context each (tools/ffi/run.sh, docs/FFI.md) =="
+# #[link_lib(c)] makes a program (and only that program) a dynamically linked ELF; libc, libm, libEGL + libGLESv2 are
+# called through function pointers (headless and on Xvfb). On Windows LoadLibraryA/GetProcAddress + win64_call load
+# kernel32/msvcrt/user32/gdi32/opengl32 and open a wgl context under Wine. A missing environment is SKIP, not FAIL.
+FIRNC="$FIRNC" bash tools/ffi/run.sh > "$WORK/ffi.log" 2>&1 && FFRC=0 || FFRC=$?
+if [ "$FFRC" -eq 0 ]; then
+    ok
+    grep -E '^   (ok|SKIP)' "$WORK/ffi.log" | sed 's/^/ /'
+else
+    bad "tools/ffi/run.sh failed (see .test-work/ffi.log)"
+    grep -E 'FAIL' "$WORK/ffi.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
