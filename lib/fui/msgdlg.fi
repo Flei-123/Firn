@@ -1,0 +1,1168 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/msgdlg.fi -- THE MESSAGE BOX: information, question, warning, error.
+//
+// ========================================================= WHAT IT IS
+//
+// The window the Windows MessageBox is, in fUi's own look: an icon on the
+// left (a disc with an "i", a "?" or a cross, a triangle with a "!"), the text
+// beside it, the buttons right-aligned in a strip below. It replaces the three
+// labels and the buttons that dialogd put into a window (tools/dialogd).
+//
+//     import fui.msgdlg
+//
+//     var answer: i32 = 0
+//     let r: i32 = msgdlg.run(msgdlg.KIND_QUESTION, "Delete", "Delete 3 files?\nThis cannot be undone.",
+//         msgdlg.BTNS_YES_NO, &answer)
+//     if r == 0 && answer == msgdlg.ANS_YES { ... }
+//
+// `run` opens its OWN window, blocks until the user is done and returns
+//   0   a button (or its accelerator, or Enter) decided; `answer` is that button's
+//   1   the user dismissed it (Esc, the window's close button); `answer` is
+//       what closing means for this button set: Cancel when there is a Cancel
+//       button, else No when there are Yes / No, else OK (the rule of std.dialog)
+//   12  no window is possible (no display, no font); `answer` is untouched
+//
+// The answer constants are the numbers of lib/std/dialog.fi (ANS_OK = 1 ...).
+//
+// ========================================================= THE LOOK
+//
+//   * the icon is 32 pixels at 96 dpi: a disc (information, question, error) or
+//     a rounded triangle (warning) in the theme's accent / warning / error
+//     colour, with the glyph in the colour that reads on it. The colours come
+//     from the theme tokens only (kitcolor.tone lifts one that would not reach
+//     3:1 on the card); `draw_kind_icon` is exported so a toast or an info bar
+//     paints the same four marks.
+//   * ICON AND TEXT ON ONE LINE (roadmap r441): with a one-line text the middle
+//     of the icon and the middle of the line are the same pixel row; with more
+//     lines the icon's top is the first line's top.
+//   * the window fits the text: 360 .. 560 points wide, the text wraps at the
+//     width, "\n" breaks a line. More than 12 lines scroll (wheel, Up / Down,
+//     PageUp / PageDown, Home / End, scroll bar). Nothing is ever cut.
+//   * the buttons are one width (at least 88 points), the default button is
+//     filled with the accent: OK or Yes, and No when the box is a warning or an
+//     error that asks Yes / No (the safe one).
+//
+// ========================================================= THE KEYS
+//
+//   Enter       the button that has the focus (the default one at the start)
+//   Esc         dismisses (the answer of the close rule above)
+//   Tab, Left, Right   move the focus between the buttons
+//   Alt+letter  the button whose letter is underlined (Y / N / O / C)
+//   Ctrl+C      copies "title\ntext" to the clipboard (std.clipboard; no
+//               clipboard on this system: nothing happens)
+//
+// Every user-visible string is in the `tr_*` functions below, ONE place, so a
+// translation replaces four bodies.
+//
+// ========================================================= HONEST
+//
+//   L1  The line breaks are computed once, at the design scale (96 dpi), by
+//       `measure`; on a screen with another scale the lines are drawn from
+//       that table at the larger font. The window has the room (8 points of
+//       slack per line), but a font with very different advances at other
+//       sizes could make a line longer by a pixel or two.
+//   L2  The text is cut at 32,000 bytes and at 1,024 lines (a "..." ends it).
+//   L3  Not thread safe: one dialog at a time per process (the measuring
+//       painter is shared).
+//   L4  The text is not selectable; Ctrl+C copies all of it. Where there is no clipboard helper
+//       (xclip, wl-copy) the selection lives in this process: Ctrl+C answers requests for 400 ms
+//       (the window waits), which is enough for a clipboard manager to take a copy.
+import std.rt
+import std.clipboard
+import font.metrics
+import paint.canvas
+import plat.sysfont
+import plat.fuiwirt
+import fui.theme
+import fui.style
+import fui.sheet
+import fui.painter
+import fui.render
+import fui.scene
+import fui.flex
+import fui.widget
+import fui.control
+import fui.action
+import fui.a11y
+import fui.viewport
+import fui.kitcolor
+import fui.icons
+import fui.app
+
+export {
+    run, build, measure, Size, set_font,
+    draw_kind_icon, kind_fill, kind_glyph,
+    chosen, dismissed, button_count, button_node, default_button, press_button, text_node,
+    icon_node, body_node, footer_node, win_size, line_count, scrolls, close_answer, scroll_y,
+    viewport_node,
+    tr_button, tr_mnemonic, tr_kind_name, copy_string,
+    KIND_INFO, KIND_QUESTION, KIND_WARNING, KIND_ERROR,
+    BTNS_OK, BTNS_OK_CANCEL, BTNS_YES_NO, BTNS_YES_NO_CANCEL,
+    ANS_OK, ANS_CANCEL, ANS_YES, ANS_NO,
+    ICON_PT, FOOT_PT, PAD_PT, MAX_VISIBLE_LINES,
+}
+
+// The numbers of lib/std/dialog.fi (kept in step by tools/fui/msgdlg_main.fi).
+const KIND_INFO: i32 = 0
+const KIND_QUESTION: i32 = 1
+const KIND_WARNING: i32 = 2
+const KIND_ERROR: i32 = 3
+
+const BTNS_OK: i32 = 0
+const BTNS_OK_CANCEL: i32 = 1
+const BTNS_YES_NO: i32 = 2
+const BTNS_YES_NO_CANCEL: i32 = 3
+
+const ANS_OK: i32 = 1
+const ANS_CANCEL: i32 = 2
+const ANS_YES: i32 = 3
+const ANS_NO: i32 = 4
+
+// ---- the measures, in design points (1 point = 1 pixel at 96 dpi)
+const ICON_PT: usize = 32
+const ICON_GAP_PT: usize = 16
+const PAD_PT: usize = 24
+const MIN_W_PT: usize = 360
+const MAX_W_PT: usize = 560
+const BTN_H_PT: usize = 32
+const BTN_MIN_W_PT: usize = 88
+const BTN_PAD_PT: usize = 20
+const BTN_GAP_PT: usize = 8
+const FOOT_PT: usize = 56
+const BAR_PT: usize = 12
+const SLACK_PT: usize = 8
+const MAX_VISIBLE_LINES: usize = 12
+const MAX_LINES: usize = 1024
+const TEXT_CAP: usize = 32000
+const NONE: usize = 4294967295
+const KEY_BASE: u32 = 7000 as u32
+
+// ============================================================ THE STRINGS
+//
+// ONE place. `tr_button` is the label of a button by its answer, `tr_mnemonic`
+// the ASCII letter (upper case) that Alt+<letter> presses it with (0 = none);
+// the letter must be in the label, it is underlined there.
+fn tr_button(ans: i32) -> str {
+    if ans == ANS_YES { return "Yes" }
+    if ans == ANS_NO { return "No" }
+    if ans == ANS_CANCEL { return "Cancel" }
+    return "OK"
+}
+
+fn tr_mnemonic(ans: i32) -> u32 {
+    if ans == ANS_YES { return 89 as u32 }
+    if ans == ANS_NO { return 78 as u32 }
+    if ans == ANS_CANCEL { return 67 as u32 }
+    return 79 as u32
+}
+
+fn tr_kind_name(kind: i32) -> str {
+    if kind == KIND_QUESTION { return "Question" }
+    if kind == KIND_WARNING { return "Warning" }
+    if kind == KIND_ERROR { return "Error" }
+    return "Information"
+}
+
+fn tr_ellipsis() -> str {
+    return "..."
+}
+
+// ============================================================ THE STATE
+
+struct Size {
+    w: usize,
+    h: usize,
+}
+
+struct Dlg {
+    kind: i32,
+    buttons: i32,
+    nb: usize,
+    ans: [i32; 3],
+    btn: [usize; 3],
+    def_i: usize,
+    esc_ans: i32,
+    answer: *mut i32,
+    done: bool,
+    picked: bool,
+    // owned copies: the window title and the text as it is shown (no CR, tabs
+    // as spaces, no trailing blank lines)
+    title: rt.Buf,
+    text: rt.Buf,
+    // the geometry, design points at scale 1
+    win_w: usize,
+    win_h: usize,
+    text_w: usize,
+    view_h: usize,
+    cont_w: usize,
+    cont_h: usize,
+    btn_w: usize,
+    pitch: usize,
+    scroll: bool,
+    nlines: usize,
+    ls: [u32; 1024],
+    ll: [u32; 1024],
+    // the tree
+    a: *mut app.App,
+    body: usize,
+    icon: usize,
+    vpn: usize,
+    txn: usize,
+    foot: usize,
+    vp: viewport.Viewport,
+    focus_set: bool,
+    hov_col: u32,
+    act_col: u32,
+}
+
+fn dlg_blank() -> Dlg {
+    return Dlg { kind: 0, buttons: 0, nb: 0, ans: [0; 3], btn: [NONE; 3], def_i: 0,
+        esc_ans: ANS_OK, answer: 0 as u64 as *mut i32, done: false, picked: false,
+        title: rt.buf_new(), text: rt.buf_new(),
+        win_w: 0, win_h: 0, text_w: 0, view_h: 0, cont_w: 0, cont_h: 0, btn_w: 0,
+        pitch: 0, scroll: false, nlines: 0, ls: [0 as u32; 1024], ll: [0 as u32; 1024],
+        a: 0 as u64 as *mut app.App, body: NONE, icon: NONE, vpn: NONE, txn: NONE,
+        foot: NONE, vp: viewport.viewport_new(0.0, 0.0, 10.0, 10.0, 10.0, 10.0),
+        focus_set: false, hov_col: 0 as u32, act_col: 0 as u32 }
+}
+
+fn dlg_size() -> usize {
+    var probe: [Dlg; 2] = [dlg_blank(); 2]
+    return ((&probe[1]) as usize) - ((&probe[0]) as usize)
+}
+
+fn dlg_new() -> *mut Dlg {
+    let p: u64 = rt.heap_alloc(dlg_size())
+    if p == 0 {
+        return 0 as u64 as *mut Dlg
+    }
+    let d: *mut Dlg = p as *mut Dlg
+    *d = dlg_blank()
+    return d
+}
+
+// ============================================================ MEASURING
+//
+// The window has to be made before it is painted, and its size depends on the
+// text, so the text is measured with a small painter of its own (a 4 x 4
+// canvas and the system font), the same font and size the dialog paints with.
+struct Meas {
+    cv: canvas.Canvas,
+    z: painter.Painter,
+}
+
+static mut G_FM: u64 = 0
+static mut G_MEAS: u64 = 0
+static mut G_SCRATCH: u64 = 0
+
+// Use this font set (a *mut metrics.FontSet) for measuring instead of loading the
+// system font: the test programs have loaded theirs already.
+fn set_font(fm: u64) {
+    G_FM = fm
+    G_MEAS = 0
+}
+
+fn meas_painter() -> *mut painter.Painter {
+    if G_MEAS != 0 {
+        let m0: *mut Meas = G_MEAS as *mut Meas
+        return &(*m0).z
+    }
+    if G_FM == 0 {
+        let fs: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+        if fs as u64 == 0 || !sysfont.sysfont_load(fs) {
+            return 0 as u64 as *mut painter.Painter
+        }
+        G_FM = fs as u64
+    }
+    let m: *mut Meas = rt.heap_alloc(65536) as *mut Meas
+    if m as u64 == 0 {
+        return 0 as u64 as *mut painter.Painter
+    }
+    (*m).cv = canvas.canvas_new()
+    (*m).z = painter.painter_new()
+    if !canvas.canvas_init(&(*m).cv, 8, 8) || !painter.painter_init(&(*m).z, &(*m).cv, 8, 8) {
+        return 0 as u64 as *mut painter.Painter
+    }
+    painter.painter_set_font(&(*m).z, G_FM)
+    G_MEAS = m as u64
+    return &(*m).z
+}
+
+fn font_pt() -> usize {
+    return 15
+}
+
+fn line_pitch_pt() -> usize {
+    return font_pt() * 14 / 10
+}
+
+fn is_blank(p: u64, a: usize, b: usize) -> bool {
+    var i: usize = a
+    while i < b {
+        if rt.ld8(p, i) != 32 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The byte length of the UTF-8 character at i (at least 1, at most what is left).
+fn char_len(p: u64, n: usize, i: usize) -> usize {
+    let b: u8 = rt.ld8(p, i)
+    var k: usize = 1
+    if b >= 240 as u8 {
+        k = 4
+    } else if b >= 224 as u8 {
+        k = 3
+    } else if b >= 192 as u8 {
+        k = 2
+    }
+    if i + k > n {
+        k = n - i
+    }
+    if k < 1 {
+        k = 1
+    }
+    return k
+}
+
+// Copy `s` into `out` the way it is shown: CR dropped (CRLF is one line break), a tab
+// is four spaces, other control characters are spaces; cut at TEXT_CAP bytes on a
+// character boundary (then "..." ends it); trailing line breaks and spaces dropped.
+fn sanitise(s: str, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    var i: usize = 0
+    var cut: bool = false
+    while i < s.n {
+        if rt.buf_len(out) >= TEXT_CAP {
+            cut = true
+            break
+        }
+        let b: u8 = rt.ld8(s.p as u64, i)
+        if b == 13 as u8 {
+            i = i + 1
+        } else if b == 9 as u8 {
+            rt.buf_push_bytes(out, "    ".p as u64, 4)
+            i = i + 1
+        } else if b < 32 as u8 && b != 10 as u8 {
+            rt.buf_push(out, 32 as u8)
+            i = i + 1
+        } else if b == 127 as u8 {
+            rt.buf_push(out, 32 as u8)
+            i = i + 1
+        } else {
+            let k: usize = char_len(s.p as u64, s.n, i)
+            rt.buf_push_bytes(out, (s.p as u64) + (i as u64), k)
+            i = i + k
+        }
+    }
+    var n: usize = rt.buf_len(out)
+    while n > 0 && (rt.buf_at(out, n - 1) == 10 as u8 || rt.buf_at(out, n - 1) == 32 as u8) {
+        n = n - 1
+    }
+    rt.buf_set_len(out, n)
+    if cut {
+        // do not end in the middle of a character
+        var m: usize = rt.buf_len(out)
+        while m > 0 && (rt.buf_at(out, m - 1) & 192 as u8) == 128 as u8 {
+            m = m - 1
+        }
+        if m > 0 && rt.buf_at(out, m - 1) >= 192 as u8 {
+            m = m - 1
+        }
+        rt.buf_set_len(out, m)
+        rt.buf_push_bytes(out, tr_ellipsis().p as u64, 3)
+    }
+}
+
+// Break the text into lines no wider than `w` pixels: the table (start, length) in
+// d.ls / d.ll. "\n" ends a line; a word wider than the line is split by character.
+fn wrap(d: *mut Dlg, z: *mut painter.Painter, w: f64) -> usize {
+    var r: painter.TextRun = painter.run_new(font_pt() as f64)
+    let p: u64 = rt.buf_ptr(&(*d).text)
+    let n: usize = rt.buf_len(&(*d).text)
+    var cnt: usize = 0
+    var ps: usize = 0
+    if n == 0 {
+        return 0
+    }
+    while ps <= n && cnt < MAX_LINES {
+        var pe: usize = ps
+        while pe < n && rt.ld8(p, pe) != 10 as u8 {
+            pe = pe + 1
+        }
+        if pe == ps || is_blank(p, ps, pe) {
+            (*d).ls[cnt] = ps as u32
+            (*d).ll[cnt] = 0 as u32
+            cnt = cnt + 1
+        } else {
+            var i: usize = ps
+            while i < pe && cnt < MAX_LINES {
+                var next: usize = 0
+                var len: usize = painter.run_line_upto(z, &r, p + (i as u64), pe - i, w, &next)
+                if len == 0 {
+                    len = char_len(p, pe, i)
+                    next = len
+                }
+                if next == 0 {
+                    next = len
+                }
+                (*d).ls[cnt] = i as u32
+                (*d).ll[cnt] = len as u32
+                cnt = cnt + 1
+                i = i + next
+                if is_blank(p, i, pe) {
+                    i = pe
+                }
+            }
+        }
+        ps = pe + 1
+    }
+    return cnt
+}
+
+fn max_label_w(z: *mut painter.Painter, d: *mut Dlg) -> f64 {
+    var m: f64 = 0.0
+    var i: usize = 0
+    while i < (*d).nb {
+        let s: str = tr_button((*d).ans[i])
+        let w: f64 = painter.text_width(z, s.p as u64, s.n, font_pt() as f64)
+        if w > m {
+            m = w
+        }
+        i = i + 1
+    }
+    return m
+}
+
+fn ceil_pt(v: f64) -> usize {
+    var n: usize = v as usize
+    if (n as f64) < v {
+        n = n + 1
+    }
+    return n
+}
+
+// Which buttons: the answers left to right (the order of the Windows MessageBox),
+// the default one and what closing the window answers.
+fn set_buttons(d: *mut Dlg, kind: i32, buttons: i32) {
+    (*d).kind = kind
+    (*d).buttons = buttons
+    (*d).def_i = 0
+    if buttons == BTNS_OK_CANCEL {
+        (*d).nb = 2
+        (*d).ans[0] = ANS_OK
+        (*d).ans[1] = ANS_CANCEL
+        (*d).esc_ans = ANS_CANCEL
+    } else if buttons == BTNS_YES_NO {
+        (*d).nb = 2
+        (*d).ans[0] = ANS_YES
+        (*d).ans[1] = ANS_NO
+        (*d).esc_ans = ANS_NO
+        // a warning or an error that asks Yes / No: the safe answer is the default
+        if kind == KIND_WARNING || kind == KIND_ERROR {
+            (*d).def_i = 1
+        }
+    } else if buttons == BTNS_YES_NO_CANCEL {
+        (*d).nb = 3
+        (*d).ans[0] = ANS_YES
+        (*d).ans[1] = ANS_NO
+        (*d).ans[2] = ANS_CANCEL
+        (*d).esc_ans = ANS_CANCEL
+        if kind == KIND_WARNING || kind == KIND_ERROR {
+            (*d).def_i = 1
+        }
+    } else {
+        (*d).nb = 1
+        (*d).ans[0] = ANS_OK
+        (*d).esc_ans = ANS_OK
+    }
+}
+
+// Fill the geometry of `d` for its text (design points, scale 1).
+fn layout(d: *mut Dlg, z: *mut painter.Painter) {
+    let px: f64 = font_pt() as f64
+    (*d).pitch = line_pitch_pt()
+    // the buttons
+    var bw: usize = ceil_pt(max_label_w(z, d)) + 2 * BTN_PAD_PT
+    if bw < BTN_MIN_W_PT {
+        bw = BTN_MIN_W_PT
+    }
+    (*d).btn_w = bw
+    let strip: usize = (*d).nb * bw + ((*d).nb - 1) * BTN_GAP_PT
+    // the widest paragraph without wrapping
+    var r: painter.TextRun = painter.run_new(px)
+    let p: u64 = rt.buf_ptr(&(*d).text)
+    let n: usize = rt.buf_len(&(*d).text)
+    var widest: f64 = 0.0
+    var ps: usize = 0
+    while ps <= n {
+        var pe: usize = ps
+        while pe < n && rt.ld8(p, pe) != 10 as u8 {
+            pe = pe + 1
+        }
+        if pe > ps {
+            let lw: f64 = painter.run_width(z, &r, p + (ps as u64), pe - ps)
+            if lw > widest {
+                widest = lw
+            }
+        }
+        ps = pe + 1
+    }
+    let chrome: usize = 2 * PAD_PT + ICON_PT + ICON_GAP_PT
+    var min_text: usize = MIN_W_PT - chrome
+    let max_text: usize = MAX_W_PT - chrome
+    if strip + 2 * PAD_PT > chrome + min_text {
+        min_text = strip + 2 * PAD_PT - chrome
+    }
+    var tw: usize = ceil_pt(widest) + SLACK_PT
+    if tw < min_text {
+        tw = min_text
+    }
+    if tw > max_text {
+        tw = max_text
+    }
+    (*d).text_w = tw
+    var wrap_w: usize = tw
+    var cnt: usize = wrap(d, z, (wrap_w - SLACK_PT) as f64)
+    (*d).scroll = false
+    if cnt > MAX_VISIBLE_LINES {
+        // the bar takes its width from the text
+        (*d).scroll = true
+        wrap_w = tw - BAR_PT
+        cnt = wrap(d, z, (wrap_w - SLACK_PT) as f64)
+    }
+    (*d).nlines = cnt
+    (*d).cont_w = wrap_w
+    var shown: usize = cnt
+    if shown > MAX_VISIBLE_LINES {
+        shown = MAX_VISIBLE_LINES
+    }
+    if shown < 1 {
+        shown = 1
+    }
+    (*d).view_h = shown * (*d).pitch
+    var ch: usize = cnt * (*d).pitch
+    if ch < (*d).view_h {
+        ch = (*d).view_h
+    }
+    (*d).cont_h = ch
+    var body_h: usize = (*d).view_h
+    if body_h < ICON_PT {
+        body_h = ICON_PT
+    }
+    (*d).win_w = chrome + tw
+    (*d).win_h = PAD_PT + body_h + PAD_PT + FOOT_PT
+}
+
+// Everything `build` and `measure` share: the copies, the buttons, the geometry.
+// False when there is no font to measure with.
+fn prepare(d: *mut Dlg, kind: i32, title: str, text: str, buttons: i32) -> bool {
+    var k: i32 = kind
+    if k < KIND_INFO || k > KIND_ERROR {
+        k = KIND_INFO
+    }
+    var b: i32 = buttons
+    if b < BTNS_OK || b > BTNS_YES_NO_CANCEL {
+        b = BTNS_OK
+    }
+    set_buttons(d, k, b)
+    rt.buf_clear(&(*d).title)
+    rt.buf_push_bytes(&(*d).title, title.p as u64, title.n)
+    sanitise(text, &(*d).text)
+    let z: *mut painter.Painter = meas_painter()
+    if z as u64 == 0 {
+        return false
+    }
+    layout(d, z)
+    return true
+}
+
+// The size (design points) the window of this message needs. 0 x 0 when there is no font.
+fn measure(kind: i32, title: str, text: str, buttons: i32) -> Size {
+    if G_SCRATCH == 0 {
+        G_SCRATCH = dlg_new() as u64
+    }
+    let d: *mut Dlg = G_SCRATCH as *mut Dlg
+    if d as u64 == 0 || !prepare(d, kind, title, text, buttons) {
+        return Size { w: 0, h: 0 }
+    }
+    return Size { w: (*d).win_w, h: (*d).win_h }
+}
+
+// ============================================================ THE ICON
+//
+// Four marks, painted with path_draw on the 24 grid so they are sharp at every
+// scale. The colours: the fill is the theme token of the kind (accent for
+// information and question, warning, error), lifted to 3:1 on the card by
+// kitcolor.tone; the glyph is the base or the text colour, whichever reads on the fill.
+fn token_of(m: *mut theme.Theme, kind: i32) -> u32 {
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    if kind == KIND_WARNING {
+        return (*f).warning
+    }
+    if kind == KIND_ERROR {
+        return (*f).err_col
+    }
+    return (*f).accent
+}
+
+// The fill colour of the icon of `kind` (opaque 0xFFRRGGBB).
+fn kind_fill(c: *mut render.Ctx, kind: i32) -> u32 {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    return theme.opaque(kitcolor.tone(m, token_of(m, kind), (*f).surface_raised & 16777215 as u32,
+            kitcolor.MIN_UI_CONTRAST))
+}
+
+// The glyph colour on that fill (opaque).
+fn kind_glyph(c: *mut render.Ctx, kind: i32) -> u32 {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let fill: u32 = kind_fill(c, kind)
+    return theme.opaque(kitcolor.on_color(m, fill))
+}
+
+fn round_px(v: f64) -> f64 {
+    return ((v + 0.5) as i64) as f64
+}
+
+// The icon of `kind` in the rectangle (x, y, w, h), device pixels: a square of the
+// smaller side, centred, on whole pixels.
+fn draw_kind_icon(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, kind: i32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var s: f64 = w
+    if h < s {
+        s = h
+    }
+    s = round_px(s)
+    if s < 4.0 {
+        return
+    }
+    let ox: f64 = round_px(x + (w - s) / 2.0)
+    let oy: f64 = round_px(y + (h - s) / 2.0)
+    let fill: u32 = kind_fill(c, kind)
+    let ink: u32 = kind_glyph(c, kind)
+    if kind == KIND_WARNING {
+        // a triangle with rounded corners: the filled path and a round stroke over its edge
+        icons.path_draw(z, "M12 4 L21 19.6 L3 19.6 Z", ox, oy, s, fill, 0.0)
+        icons.path_draw(z, "M12 4 L21 19.6 L3 19.6 Z", ox, oy, s, fill, 3.0)
+        icons.path_draw(z, "M12 9.6 L12 14.4", ox, oy, s, ink, 2.4)
+        icons.path_draw(z, "M12 17.3 L12.01 17.3", ox, oy, s, ink, 2.6)
+        return
+    }
+    painter.round_rect(z, ox, oy, s, s, s / 2.0, fill)
+    if kind == KIND_ERROR {
+        icons.path_draw(z, "M8.6 8.6 L15.4 15.4 M15.4 8.6 L8.6 15.4", ox, oy, s, ink, 2.4)
+    } else if kind == KIND_QUESTION {
+        icons.path_draw(z, "M9.3 9.6 C9.3 5.9 14.7 5.9 14.7 9.6 C14.7 12.2 12 12.2 12 14.6", ox, oy, s,
+            ink, 2.3)
+        icons.path_draw(z, "M12 17.9 L12.01 17.9", ox, oy, s, ink, 2.6)
+    } else {
+        icons.path_draw(z, "M12 7.7 L12.01 7.7", ox, oy, s, ink, 2.6)
+        icons.path_draw(z, "M12 11.4 L12 16.3", ox, oy, s, ink, 2.4)
+    }
+}
+
+// ============================================================ THE PAINTERS
+
+fn dlg_of(a: *mut app.App) -> *mut Dlg {
+    return app.data(a) as *mut Dlg
+}
+
+fn tok(c: *mut render.Ctx, t: u32) -> u32 {
+    return render.color_of(c, style.color_token(t))
+}
+
+// The card (the body) and the strip of buttons. Painted once per frame with the
+// body; the first frame also puts the focus on the default button.
+fn paint_body(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    painter.surface(z, widget.w_x(e), widget.w_y(e), widget.w_w(e), widget.w_h(e),
+        tok(c, style.TOK_SURFACE_RAISED))
+    // the content of the scrolled area follows the scale
+    let cw: f64 = render.len_of(c, (*d).cont_w)
+    let ch: f64 = render.len_of(c, (*d).cont_h)
+    if viewport.viewport_content_w(&(*d).vp) != cw || viewport.viewport_content_h(&(*d).vp) != ch {
+        viewport.viewport_set_content(&(*d).vp, cw, ch)
+        fuiwirt.host_touch(app.app_host((*d).a))
+    }
+    sync_default(d, c)
+    if !(*d).focus_set {
+        (*d).focus_set = true
+        let pn: *mut control.Panel = fuiwirt.host_panel(app.app_host((*d).a))
+        let ch2: u32 = control.panel_set_focus(pn, (*d).btn[(*d).def_i])
+        fuiwirt.host_touch(app.app_host((*d).a))
+    }
+}
+
+fn paint_foot(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    // the line between the card and the strip
+    painter.surface(z, widget.w_x(e), widget.w_y(e), widget.w_w(e), render.len_of(c, 1),
+        tok(c, style.TOK_BORDER))
+}
+
+fn paint_icon(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    draw_kind_icon(c, widget.w_x(e), widget.w_y(e), widget.w_w(e), widget.w_h(e), (*d).kind)
+}
+
+// The text: the visible lines of the table. Line i starts at the scaled i * pitch (the scaled total, not
+// i times a scaled pitch: at a scale like 104 % a rounded line pitch would drift away from the content
+// height the scroll area was given).
+fn paint_text(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let px: f64 = render.len_of(c, font_pt())
+    var r: painter.TextRun = painter.run_new(px)
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let y0: f64 = canvas.clip_y0(cv)
+    let y1: f64 = canvas.clip_y1(cv)
+    let col: u32 = tok(c, style.TOK_TEXT)
+    let p: u64 = rt.buf_ptr(&(*d).text)
+    var i: usize = 0
+    while i < (*d).nlines {
+        let ty: f64 = widget.w_y(e) + render.len_of(c, i * (*d).pitch)
+        let tb: f64 = widget.w_y(e) + render.len_of(c, (i + 1) * (*d).pitch)
+        if tb >= y0 && ty <= y1 && (*d).ll[i] > 0 as u32 {
+            let by: f64 = painter.text_baseline_mid(z, ty, tb - ty, px)
+            let x1: f64 = painter.run_draw(z, &r, widget.w_x(e), by, 0.0, col,
+                p + ((*d).ls[i] as u64), (*d).ll[i] as usize, painter.TEXT_L)
+        }
+        i = i + 1
+    }
+}
+
+// Over a button: the underlined mnemonic, and on the default button (which is filled with the
+// accent, where the focus ring would vanish) an inner ring when it has the focus.
+fn paint_button(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let sc: *mut scene.Scene = app.app_scene((*d).a)
+    let node: usize = scene.scene_node_of(sc, e)
+    var bi: usize = 0
+    while bi < (*d).nb && (*d).btn[bi] != node {
+        bi = bi + 1
+    }
+    if bi >= (*d).nb {
+        return
+    }
+    let px: f64 = render.len_of(c, font_pt())
+    let label: str = tr_button((*d).ans[bi])
+    var fg: u32 = tok(c, style.TOK_TEXT)
+    if bi == (*d).def_i {
+        fg = tok(c, style.TOK_TEXT_ON_ACCENT)
+        if widget.w_is_focus(e) {
+            let g: f64 = render.len_of(c, 3)
+            painter.round_ring(z, widget.w_x(e) + g, widget.w_y(e) + g, widget.w_w(e) - 2.0 * g,
+                widget.w_h(e) - 2.0 * g, render.len_of(c, 5), render.len_of(c, 1), fg)
+        }
+    }
+    // the underline of the mnemonic letter
+    let mn: u32 = tr_mnemonic((*d).ans[bi])
+    if mn == 0 as u32 {
+        return
+    }
+    var at: usize = 0
+    while at < label.n {
+        var ch: u32 = rt.ld8(label.p as u64, at) as u32
+        if ch >= 97 as u32 && ch <= 122 as u32 {
+            ch = ch - 32 as u32
+        }
+        if ch == mn {
+            break
+        }
+        at = at + 1
+    }
+    if at >= label.n {
+        return
+    }
+    let full: f64 = painter.text_width(z, label.p as u64, label.n, px)
+    let before: f64 = painter.text_width(z, label.p as u64, at, px)
+    let one: f64 = painter.text_width(z, (label.p as u64) + (at as u64), 1, px)
+    let x0: f64 = widget.w_x(e) + (widget.w_w(e) - full) / 2.0 + before
+    let by: f64 = painter.text_baseline_mid(z, widget.w_y(e), widget.w_h(e), px)
+    var th: f64 = render.len_of(c, 1)
+    painter.surface(z, round_px(x0), by + render.len_of(c, 2), round_px(one), th, fg)
+}
+
+// ============================================================ THE ACTIONS
+
+// A button was pressed (or its key): that is the answer.
+fn finish(a: *mut app.App, ans: i32, picked: bool) {
+    let d: *mut Dlg = dlg_of(a)
+    if d as u64 == 0 || (*d).done {
+        return
+    }
+    (*d).done = true
+    (*d).picked = picked
+    if (*d).answer as u64 != 0 {
+        *(*d).answer = ans
+    }
+    app.quit(a)
+}
+
+fn answer_of(a: *mut app.App, i: usize) -> i32 {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).ans[i]
+}
+
+fn on_b0(a: *mut app.App) { finish(a, answer_of(a, 0), true) }
+fn on_b1(a: *mut app.App) { finish(a, answer_of(a, 1), true) }
+fn on_b2(a: *mut app.App) { finish(a, answer_of(a, 2), true) }
+
+fn act_esc(ud: u64, cx: *mut action.ActCtx) {
+    let a: *mut app.App = ud as *mut app.App
+    finish(a, close_answer(a), false)
+}
+
+fn move_focus(a: *mut app.App, back: bool) {
+    let w: *mut fuiwirt.Host = app.app_host(a)
+    let ch: u32 = control.key_tab(fuiwirt.host_panel(w), back)
+    fuiwirt.host_touch(w)
+}
+
+fn act_left(ud: u64, cx: *mut action.ActCtx) {
+    move_focus(ud as *mut app.App, true)
+}
+
+fn act_right(ud: u64, cx: *mut action.ActCtx) {
+    move_focus(ud as *mut app.App, false)
+}
+
+fn act_m0(ud: u64, cx: *mut action.ActCtx) {
+    let a: *mut app.App = ud as *mut app.App
+    finish(a, answer_of(a, 0), true)
+}
+
+fn act_m1(ud: u64, cx: *mut action.ActCtx) {
+    let a: *mut app.App = ud as *mut app.App
+    finish(a, answer_of(a, 1), true)
+}
+
+fn act_m2(ud: u64, cx: *mut action.ActCtx) {
+    let a: *mut app.App = ud as *mut app.App
+    finish(a, answer_of(a, 2), true)
+}
+
+// "title\ntext" into `out` (what Ctrl+C copies).
+fn copy_string(a: *mut app.App, out: *mut rt.Buf) {
+    let d: *mut Dlg = dlg_of(a)
+    rt.buf_push_bytes(out, rt.buf_ptr(&(*d).title), rt.buf_len(&(*d).title))
+    rt.buf_push(out, 10 as u8)
+    rt.buf_push_bytes(out, rt.buf_ptr(&(*d).text), rt.buf_len(&(*d).text))
+}
+
+fn act_copy(ud: u64, cx: *mut action.ActCtx) {
+    var b: rt.Buf = rt.buf_new()
+    copy_string(ud as *mut app.App, &b)
+    let s: str = str { p: rt.buf_ptr(&b) as *mut u8, n: rt.buf_len(&b) }
+    let ok: bool = clipboard.copy_text(s)
+    // Without a helper program (xclip, wl-copy) the selection lives in this process: answer the
+    // first requests (a clipboard manager asks at once) before going back to the window.
+    if ok && clipboard.backend_name() == "native" {
+        clipboard.serve(400)
+    }
+    rt.buf_free(&b)
+}
+
+// ============================================================ THE WINDOW
+
+// Build the window and its tree for this message, not yet shown. `answer` is
+// filled when the dialog ends. Null when there is no font or no memory.
+#[allow_escape]
+fn build(kind: i32, title: str, text: str, buttons: i32, answer: *mut i32) -> *mut app.App {
+    let d: *mut Dlg = dlg_new()
+    if d as u64 == 0 {
+        return 0 as u64 as *mut app.App
+    }
+    if !prepare(d, kind, title, text, buttons) {
+        return 0 as u64 as *mut app.App
+    }
+    (*d).answer = answer
+    let tl: str = str { p: rt.buf_ptr(&(*d).title) as *mut u8, n: rt.buf_len(&(*d).title) }
+    let a: *mut app.App = app.window(tl, (*d).win_w, (*d).win_h)
+    if a as u64 == 0 {
+        return a
+    }
+    (*d).a = a
+    app.set_data(a, d as u64)
+    let sc: *mut scene.Scene = app.app_scene(a)
+
+    // the window: a column of two stripes, no padding
+    let root: usize = app.root(a)
+    scene.node_set_flex(sc, root, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_gap(sc, root, 0, 0)
+    scene.node_set_padding(sc, root, 0, 0, 0, 0)
+
+    // the card: icon and text
+    let body: usize = app.row(a)
+    (*d).body = body
+    var align: u32 = flex.AL_START
+    if (*d).nlines <= 1 {
+        align = flex.AL_CENTER
+    }
+    scene.node_set_flex(sc, body, flex.FLEX_ROW, flex.JUSTIFY_START, align)
+    scene.node_set_gap(sc, body, ICON_GAP_PT as i64, 0)
+    scene.node_set_padding(sc, body, PAD_PT as i64, PAD_PT as i64, PAD_PT as i64, PAD_PT as i64)
+    scene.node_set_grow(sc, body, 0, 0)
+    scene.node_set_draw(sc, body, d as u64, paint_body)
+    let ic: usize = scene.scene_add(sc, body, scene.N_BOX)
+    (*d).icon = ic
+    scene.node_set_size(sc, ic, ICON_PT as f64, ICON_PT as f64)
+    scene.node_set_grow(sc, ic, 0, 0)
+    scene.node_set_draw(sc, ic, d as u64, paint_icon)
+    (*d).vp = viewport.viewport_new(0.0, 0.0, (*d).text_w as f64, (*d).view_h as f64,
+        (*d).cont_w as f64, (*d).cont_h as f64)
+    viewport.viewport_set_bar(&(*d).vp, BAR_PT)
+    let vn: usize = scene.scene_add(sc, body, scene.N_VIEWPORT)
+    (*d).vpn = vn
+    scene.node_set_viewport(sc, vn, &(*d).vp)
+    scene.node_set_size(sc, vn, (*d).text_w as f64, (*d).view_h as f64)
+    scene.node_set_grow(sc, vn, 0, 0)
+    let tn: usize = scene.scene_add(sc, vn, scene.N_BOX)
+    (*d).txn = tn
+    scene.node_set_size(sc, tn, (*d).cont_w as f64, (*d).cont_h as f64)
+    scene.node_set_grow(sc, tn, 0, 0)
+    scene.node_set_draw(sc, tn, d as u64, paint_text)
+    app.end(a)
+
+    // the strip of buttons, right-aligned
+    let foot: usize = app.row(a)
+    (*d).foot = foot
+    scene.node_set_flex(sc, foot, flex.FLEX_ROW, flex.JUSTIFY_END, flex.AL_CENTER)
+    scene.node_set_gap(sc, foot, BTN_GAP_PT as i64, 0)
+    scene.node_set_padding(sc, foot, PAD_PT as i64, 1, PAD_PT as i64, 0)
+    scene.node_set_size(sc, foot, 0.0, FOOT_PT as f64)
+    scene.node_set_grow(sc, foot, 0, 0)
+    scene.node_set_draw(sc, foot, d as u64, paint_foot)
+    var i: usize = 0
+    while i < (*d).nb {
+        var cb: fn(*mut app.App) = on_b0
+        if i == 1 {
+            cb = on_b1
+        } else if i == 2 {
+            cb = on_b2
+        }
+        let b: usize = app.button(a, tr_button((*d).ans[i]), cb)
+        (*d).btn[i] = b
+        scene.node_set_size(sc, b, (*d).btn_w as f64, BTN_H_PT as f64)
+        scene.node_set_grow(sc, b, 0, 0)
+        scene.node_set_id(sc, b, KEY_BASE + (i as u32))
+        scene.node_set_draw(sc, b, d as u64, paint_button)
+        i = i + 1
+    }
+    app.end(a)
+    style_default(a, d)
+    keys_and_names(a, d)
+    return a
+}
+
+// The default button is filled with the accent (the hover and pressed colours follow the theme,
+// see sync_default).
+fn style_default(a: *mut app.App, d: *mut Dlg) {
+    let sh: *mut sheet.Sheet = &(*a).sh
+    let key: u32 = KEY_BASE + ((*d).def_i as u32)
+    let base: style.Style = style.style_set_border(
+        style.style_set_fg(style.style_set_bg(style.style_new(), style.color_token(style.TOK_ACCENT)),
+            style.color_token(style.TOK_TEXT_ON_ACCENT)),
+        style.color_token(style.TOK_ACCENT), 1)
+    let r0: usize = sheet.sheet_rule(sh, sheet.sel_id(key), base)
+}
+
+// The hovered and the pressed colour of the default button: the accent moved away from the colour its label
+// is written in (towards black under a light label, towards white under a dark one), so the label keeps
+// its contrast. Computed from the theme at every frame (a theme switch changes them), and only written
+// when they changed.
+fn sync_default(d: *mut Dlg, c: *mut render.Ctx) {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    let acc: u32 = (*f).accent & 16777215 as u32
+    var toward: u32 = 0 as u32
+    if theme.luminance((*f).text_on_accent & 16777215 as u32) < 0.5 {
+        toward = 16777215 as u32
+    }
+    let hov: u32 = theme.mix(acc, toward, 130)
+    let act: u32 = theme.mix(acc, toward, 260)
+    if hov == (*d).hov_col && act == (*d).act_col {
+        return
+    }
+    (*d).hov_col = hov
+    (*d).act_col = act
+    let sc: *mut scene.Scene = app.app_scene((*d).a)
+    let e: *mut widget.Widget = scene.node_widget(sc, (*d).btn[(*d).def_i])
+    let z: *mut style.StyleSet = widget.w_styleset(e)
+    var oh: style.Override = style.override_new()
+    oh = style.override_set_bg(oh, style.color_literal(hov))
+    oh = style.override_set_border(oh, style.color_literal(hov))
+    style.styleset_set_override(z, style.STATE_HOVER, oh)
+    var oa: style.Override = style.override_new()
+    oa = style.override_set_bg(oa, style.color_literal(act))
+    oa = style.override_set_border(oa, style.color_literal(act))
+    style.styleset_set_override(z, style.STATE_ACTIVE, oa)
+    fuiwirt.host_touch(app.app_host((*d).a))
+}
+
+// Shortcuts and the accessibility statements.
+fn keys_and_names(a: *mut app.App, d: *mut Dlg) {
+    let acts: *mut action.Actions = app.actions(a)
+    let ie: usize = app.action_add(a, "msg.dismiss", "Dismiss", act_esc)
+    action.act_set_shortcut(acts, ie, action.SK_ESCAPE, 0 as u32)
+    let il: usize = app.action_add(a, "msg.left", "Previous button", act_left)
+    action.act_set_shortcut(acts, il, action.SK_LEFT, 0 as u32)
+    let ir: usize = app.action_add(a, "msg.right", "Next button", act_right)
+    action.act_set_shortcut(acts, ir, action.SK_RIGHT, 0 as u32)
+    let ic: usize = app.action_add(a, "msg.copy", "Copy", act_copy)
+    action.act_set_shortcut(acts, ic, 67 as u32, action.MOD_CTRL)
+    var i: usize = 0
+    while i < (*d).nb {
+        var f: fn(u64, *mut action.ActCtx) = act_m0
+        if i == 1 {
+            f = act_m1
+        } else if i == 2 {
+            f = act_m2
+        }
+        var id: str = "msg.b0"
+        if i == 1 {
+            id = "msg.b1"
+        } else if i == 2 {
+            id = "msg.b2"
+        }
+        let im: usize = app.action_add(a, id, tr_button((*d).ans[i]), f)
+        action.act_set_shortcut(acts, im, tr_mnemonic((*d).ans[i]), action.MOD_ALT)
+        i = i + 1
+    }
+    // names: the card says what the window says
+    let ax: *mut a11y.A11y = &(*a).ax
+    a11y.a11y_set_role(ax, (*d).icon, a11y.ROLE_IMAGE)
+    let kn: str = tr_kind_name((*d).kind)
+    a11y.a11y_set_name(ax, (*d).icon, kn.p as u64, kn.n)
+    a11y.a11y_set_role(ax, (*d).txn, a11y.ROLE_TEXT)
+    a11y.a11y_set_name(ax, (*d).txn, rt.buf_ptr(&(*d).text), rt.buf_len(&(*d).text))
+    // a message that asks for a decision interrupts: alertdialog; an information is a plain dialog
+    var role: u32 = a11y.ROLE_ALERTDIALOG
+    if (*d).kind == KIND_INFO {
+        role = a11y.ROLE_DIALOG
+    }
+    a11y.a11y_set_role(ax, (*d).body, role)
+    a11y.a11y_set_name(ax, (*d).body, rt.buf_ptr(&(*d).title), rt.buf_len(&(*d).title))
+}
+
+// Show the message and wait for the user. See the head of this file.
+#[allow_escape]
+fn run(kind: i32, title: str, text: str, buttons: i32, answer: *mut i32) -> i32 {
+    let a: *mut app.App = build(kind, title, text, buttons, answer)
+    if a as u64 == 0 {
+        return 12
+    }
+    let d: *mut Dlg = dlg_of(a)
+    // closing the window without a button is the close rule's answer
+    var before: i32 = 0
+    if answer as u64 != 0 {
+        before = *answer
+        *answer = (*d).esc_ans
+    }
+    let rc: i32 = app.run(a)
+    let done: bool = (*d).done
+    let picked: bool = (*d).picked
+    // the dialog's own memory goes back (the window's stays with the process: app.fi has no way to free it)
+    rt.buf_free(&(*d).title)
+    rt.buf_free(&(*d).text)
+    rt.heap_free(d as u64, dlg_size())
+    if rc != 0 && !done {
+        // no display, no font: the answer stays as the caller had it
+        if answer as u64 != 0 {
+            *answer = before
+        }
+        return 12
+    }
+    if picked {
+        return 0
+    }
+    return 1
+}
+
+// ============================================================ FOR THE TESTS
+
+fn chosen(a: *mut app.App) -> bool {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).picked
+}
+
+fn dismissed(a: *mut app.App) -> bool {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).done && !(*d).picked
+}
+
+fn button_count(a: *mut app.App) -> usize {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).nb
+}
+
+fn button_node(a: *mut app.App, i: usize) -> usize {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).btn[i]
+}
+
+fn default_button(a: *mut app.App) -> usize {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).def_i
+}
+
+// The answer of button i.
+fn press_button(a: *mut app.App, i: usize) -> i32 {
+    return answer_of(a, i)
+}
+
+fn text_node(a: *mut app.App) -> usize {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).txn
+}
+
+fn icon_node(a: *mut app.App) -> usize {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).icon
+}
+
+fn body_node(a: *mut app.App) -> usize {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).body
+}
+
+fn footer_node(a: *mut app.App) -> usize {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).foot
+}
+
+fn line_count(a: *mut app.App) -> usize {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).nlines
+}
+
+fn scrolls(a: *mut app.App) -> bool {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).scroll
+}
+
+fn close_answer(a: *mut app.App) -> i32 {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).esc_ans
+}
+
+fn win_size(a: *mut app.App) -> Size {
+    let d: *mut Dlg = dlg_of(a)
+    return Size { w: (*d).win_w, h: (*d).win_h }
+}
+
+// The scroll position of the text (device pixels), and the node that scrolls.
+fn scroll_y(a: *mut app.App) -> f64 {
+    let d: *mut Dlg = dlg_of(a)
+    return viewport.viewport_off_y(&(*d).vp)
+}
+
+fn viewport_node(a: *mut app.App) -> usize {
+    let d: *mut Dlg = dlg_of(a)
+    return (*d).vpn
+}

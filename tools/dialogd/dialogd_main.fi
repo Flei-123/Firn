@@ -1,45 +1,36 @@
 // SPDX-License-Identifier: MPL-2.0
-// tools/dialogd/dialogd_main.fi -- dialogd, the fUi dialog service (SPIKE; docs/DIALOG.md, "The dialog service").
+// tools/dialogd/dialogd_main.fi -- dialogd, the fUi dialog service (docs/DIALOG.md, "The dialog service").
 //
 //     dialogd --stdio          reads ONE request line on standard input, shows the dialog, writes ONE answer line
 //
 // The line protocol is lib/std/dialogproto.fi's: TAB separated, escaped. std.dialog starts this program when the
 // machine has neither zenity nor kdialog (FIRN_DIALOG=service forces it); on OrientOS the same lines travel over
-// the action bus (dialog.open_file, dialog.save_file, dialog.pick_folder, dialog.pick_color, dialog.message).
+// the action bus (dialog.open_file, dialog.save_file, dialog.pick_folder, dialog.pick_color, dialog.pick_font,
+// dialog.message).
 //
 //   message      kind title text buttons              -> ok<TAB>ans_ok|ans_cancel|ans_yes|ans_no | cancel
 //   open_file    title dir filters                    -> ok<TAB>path | cancel
-//   open_files   title dir filters                    -> ok<TAB>path1\npath2 | cancel     (several: write them with `;` between)
+//   open_files   title dir filters                    -> ok<TAB>path1\npath2 | cancel
 //   save_file    title dir name filters               -> ok<TAB>path | cancel
 //   pick_folder  title dir                            -> ok<TAB>path | cancel
 //   pick_color   title rrggbb                         -> ok<TAB>rrggbb | cancel
-//   pick_font    title family size                    -> failed (no font chooser yet)
+//   pick_font    title family size                    -> ok<TAB>family<TAB>size<TAB>bold<TAB>italic | cancel
 //
-// Closing the window is a cancel. Built ENTIRELY on fui.app (lib/fui/app.fi): labels, buttons, one text field, a list
-// of rows. The file dialog is a path field with the start directory listed under it (a click on a row copies its path
-// into the field); there is no navigation inside the dialog yet and no preview -- that wants fUi's own interactive
-// file dialog (fUi roadmap r177), which will replace this body without changing the protocol.
+// This file is only the PROTOCOL. The dialogs themselves are fUi building blocks that any fUi program can use as
+// well (roadmap fUi r177):
+//
+//   lib/fui/filedlg.fi   file / files / save / folder dialog with real navigation
+//   lib/fui/colordlg.fi  colour chooser (basic colours, spectrum + brightness, RGB / HSV / hex, custom colours)
+//   lib/fui/fontdlg.fi   font chooser (families, styles, sizes, preview)
+//   lib/fui/msgdlg.fi    message / question box with icons
+//
+// Closing the window is a cancel. A dialog that cannot open a window (no display, no font) answers `failed`.
 import std.rt
-import std.str
-import std.fs
-import std.dir
-import fui.app
-import fui.scene
-import fui.style
-import fui.sheet
 import std.dialogproto
-
-static mut MODE: i32 = 0 // 0 open, 1 open several, 2 save, 3 folder
-static mut ENTRY: usize = 0
-static mut LIST: usize = 0
-static mut STATUS: usize = 0
-static mut SWATCH: usize = 0
-static mut ARMED: bool = false // save: the file exists and the user was told
-static mut REPLY: u64 = 0 // heap address of the answer rt.Buf (0 = none: cancel)
-static mut NAMES: u64 = 0 // heap address of an rt.Buf: the paths of the listed rows, NUL separated
-static mut OFFS: [usize; 24] = [0; 24]
-static mut ROWNODE: [usize; 24] = [0; 24] // the scene node of each listed row
-static mut NROWS: usize = 0
+import fui.filedlg
+import fui.colordlg
+import fui.fontdlg
+import fui.msgdlg
 
 fn say_err(s: str) {
     syscall(1, 2, s.p as i64, s.length() as i64, 0, 0, 0)
@@ -58,337 +49,18 @@ fn view(b: *mut rt.Buf) -> str {
     return str { p: rt.buf_data(b), n: rt.buf_len(b) }
 }
 
-fn buf_alloc_of[T]() -> u64 {
-    return rt.heap_alloc(size_of[T]())
-}
-
-fn buf_alloc() -> u64 {
-    return buf_alloc_of[rt.Buf]()
-}
-
-// ---------------------------------------------------------------- the answer
-
-// Starts the answer "ok" with `value` as its first field (escaped) and ends the window.
-fn accept(a: *mut app.App, value: str) {
-    if REPLY == 0 as u64 {
-        REPLY = buf_alloc()
-        *(REPLY as *mut rt.Buf) = rt.buf_new()
-    }
-    let b: *mut rt.Buf = REPLY as *mut rt.Buf
-    rt.buf_clear(b)
-    dialogproto.push_field(b, "ok", true)
-    dialogproto.push_field(b, value, false)
-    app.quit(a)
-}
-
-fn status(a: *mut app.App, s: str) {
-    if STATUS != 0 {
-        app.set_text(a, STATUS, s)
-    }
-}
-
-// ---------------------------------------------------------------- message
-
-fn b_ok(a: *mut app.App) { accept(a, "ans_ok") }
-fn b_cancel(a: *mut app.App) { accept(a, "ans_cancel") }
-fn b_yes(a: *mut app.App) { accept(a, "ans_yes") }
-fn b_no(a: *mut app.App) { accept(a, "ans_no") }
-
+// Decimal digits at the start of `s` (stops at the first other byte).
 fn num(s: str) -> i32 {
     var v: i32 = 0
     var i: usize = 0
-    while i < s.length() && s.chars(i) >= 48 as u8 && s.chars(i) <= 57 as u8 {
+    while i < s.length() && s.chars(i) >= 48 as u8 && s.chars(i) <= 57 as u8 && v < 100000000 {
         v = v * 10 + (s.chars(i) - 48 as u8) as i32
         i = i + 1
     }
     return v
 }
 
-fn run_message(line: str) -> i32 {
-    var k: rt.Buf = rt.buf_new()
-    var title: rt.Buf = rt.buf_new()
-    var text: rt.Buf = rt.buf_new()
-    var btn: rt.Buf = rt.buf_new()
-    dialogproto.field_at(line, 1, &k)
-    dialogproto.field_at(line, 2, &title)
-    dialogproto.field_at(line, 3, &text)
-    dialogproto.field_at(line, 4, &btn)
-    let kind: i32 = num(view(&k))
-    let buttons: i32 = num(view(&btn))
-    let a: *mut app.App = app.window(view(&title), 440, 220)
-    if a as u64 == 0 as u64 {
-        return 12
-    }
-    var head: str = "Information"
-    if kind == 1 { head = "Question" }
-    if kind == 2 { head = "Warning" }
-    if kind == 3 { head = "Error" }
-    app.label(a, head, 11)
-    app.label(a, view(&text), 0)
-    app.row(a)
-    if buttons == 2 || buttons == 3 {
-        app.button(a, "Yes", b_yes)
-        app.button(a, "No", b_no)
-    } else {
-        app.button(a, "OK", b_ok)
-    }
-    if buttons == 1 || buttons == 3 {
-        app.button(a, "Cancel", b_cancel)
-    }
-    app.end(a)
-    return app.run(a)
-}
-
-// ---------------------------------------------------------------- files
-
-fn ends_with_ci(s: str, suffix: str) -> bool {
-    if suffix.length() > s.length() {
-        return false
-    }
-    var i: usize = 0
-    while i < suffix.length() {
-        var x: u8 = s.chars(s.length() - suffix.length() + i)
-        var y: u8 = suffix.chars(i)
-        if x >= 65 as u8 && x <= 90 as u8 { x = x + 32 as u8 }
-        if y >= 65 as u8 && y <= 90 as u8 { y = y + 32 as u8 }
-        if x != y {
-            return false
-        }
-        i = i + 1
-    }
-    return true
-}
-
-// Does `name` match one of the patterns of the FIRST filter pair ("Label|pat;pat|...")? No filter: yes.
-fn matches(name: str, filters: str) -> bool {
-    if filters.length() == 0 {
-        return true
-    }
-    var i: usize = 0
-    while i < filters.length() && filters.chars(i) != 124 as u8 {
-        i = i + 1
-    }
-    i = i + 1
-    var start: usize = i
-    while i <= filters.length() {
-        if i == filters.length() || filters.chars(i) == 124 as u8 || filters.chars(i) == 59 as u8 {
-            let pat: str = str { p: ((filters.p as u64) + start as u64) as *mut u8, n: i - start }
-            if pat.length() == 1 && pat.chars(0) == 42 as u8 {
-                return true
-            }
-            if pat.length() > 1 && pat.chars(0) == 42 as u8 && ends_with_ci(name, str { p: ((pat.p as u64) + 1) as *mut u8, n: pat.length() - 1 }) {
-                return true
-            }
-            if pat.length() > 0 && pat.chars(0) != 42 as u8 && name == pat {
-                return true
-            }
-            if i < filters.length() && filters.chars(i) == 124 as u8 {
-                return false
-            }
-            start = i + 1
-        }
-        i = i + 1
-    }
-    return false
-}
-
-fn pick_row(a: *mut app.App) {
-    let node: usize = app.chosen(a, LIST)
-    if node == app.NONE {
-        return
-    }
-    var i: usize = 0
-    while i < NROWS && ROWNODE[i] != node {
-        i = i + 1
-    }
-    if i >= NROWS {
-        return
-    }
-    let nb: *mut rt.Buf = NAMES as *mut rt.Buf
-    let at: u64 = rt.buf_ptr(nb) + OFFS[i] as u64
-    let p: str = str { p: at as *mut u8, n: rt.c_length(at) }
-    app.set_text(a, ENTRY, p)
-    ARMED = false
-}
-
-fn add_row(a: *mut app.App, base: str, name: str, is_dir: bool) {
-    if NROWS >= 24 {
-        return
-    }
-    let nb: *mut rt.Buf = NAMES as *mut rt.Buf
-    OFFS[NROWS] = rt.buf_len(nb)
-    rt.buf_push_bytes(nb, base.p as u64, base.length())
-    if base.length() > 0 && base.chars(base.length() - 1) != 47 as u8 {
-        rt.buf_push(nb, 47 as u8)
-    }
-    rt.buf_push_bytes(nb, name.p as u64, name.length())
-    if is_dir {
-        rt.buf_push(nb, 47 as u8)
-    }
-    rt.buf_push(nb, 0 as u8)
-    var label: rt.Buf = rt.buf_new()
-    rt.buf_push_bytes(&label, name.p as u64, name.length())
-    if is_dir {
-        rt.buf_push(&label, 47 as u8)
-    }
-    var icon: str = "file"
-    if is_dir {
-        icon = "folder"
-    }
-    ROWNODE[NROWS] = app.list_item(a, icon, view(&label), "", "", pick_row)
-    rt.buf_free(&label)
-    NROWS = NROWS + 1
-}
-
-fn fill_list(a: *mut app.App, base: str, filters: str, only_dirs: bool) {
-    var d: dir.Dir = dir.open(base)
-    while dir.next(&d) {
-        if d.kind == dir.KIND_DIR {
-            add_row(a, base, d.name, true)
-        }
-    }
-    dir.close(&d)
-    if only_dirs {
-        return
-    }
-    var d2: dir.Dir = dir.open(base)
-    while dir.next(&d2) {
-        if d2.kind != dir.KIND_DIR && matches(d2.name, filters) {
-            add_row(a, base, d2.name, false)
-        }
-    }
-    dir.close(&d2)
-}
-
-// The directory part of a path ("/a/b" -> "/a", "b" -> ".").
-fn parent_of(path: str, out: *mut rt.Buf) {
-    var i: usize = path.length()
-    while i > 0 && path.chars(i - 1) != 47 as u8 {
-        i = i - 1
-    }
-    if i == 0 {
-        rt.buf_push(out, 46 as u8)
-        return
-    }
-    if i == 1 {
-        rt.buf_push(out, 47 as u8)
-        return
-    }
-    rt.buf_push_bytes(out, path.p as u64, i - 1)
-}
-
-// One path acceptable for the mode?
-fn path_ok(path: str) -> bool {
-    if path.length() == 0 {
-        return false
-    }
-    if MODE == 3 {
-        return fs.is_dir(path)
-    }
-    if MODE == 2 {
-        var par: rt.Buf = rt.buf_new()
-        parent_of(path, &par)
-        let ok: bool = fs.is_dir(view(&par)) && !fs.is_dir(path)
-        rt.buf_free(&par)
-        return ok
-    }
-    return fs.is_file(path)
-}
-
-fn file_ok(a: *mut app.App) {
-    let typed: str = __str_copy(app.text(a, ENTRY))
-    var joined: rt.Buf = rt.buf_new()
-    var start: usize = 0
-    var i: usize = 0
-    var all_ok: bool = typed.length() > 0
-    while i <= typed.length() {
-        if i == typed.length() || (MODE == 1 && typed.chars(i) == 59 as u8) {
-            let one: str = str { p: ((typed.p as u64) + start as u64) as *mut u8, n: i - start }
-            if !path_ok(one) {
-                all_ok = false
-            }
-            if rt.buf_len(&joined) > 0 {
-                rt.buf_push(&joined, 10 as u8)
-            }
-            rt.buf_push_bytes(&joined, one.p as u64, one.length())
-            start = i + 1
-        }
-        i = i + 1
-    }
-    if !all_ok {
-        status(a, "Not found, or not the right kind of path.")
-        rt.buf_free(&joined)
-        return
-    }
-    if MODE == 2 && fs.exists(typed) && !ARMED {
-        ARMED = true
-        status(a, "This file exists. Press OK again to replace it.")
-        rt.buf_free(&joined)
-        return
-    }
-    accept(a, view(&joined))
-    rt.buf_free(&joined)
-}
-
-fn file_cancel(a: *mut app.App) {
-    app.quit(a)
-}
-
-fn run_file(verb: str, line: str) -> i32 {
-    var title: rt.Buf = rt.buf_new()
-    var dirp: rt.Buf = rt.buf_new()
-    var name: rt.Buf = rt.buf_new()
-    var filters: rt.Buf = rt.buf_new()
-    dialogproto.field_at(line, 1, &title)
-    dialogproto.field_at(line, 2, &dirp)
-    if verb == "save_file" {
-        dialogproto.field_at(line, 3, &name)
-        dialogproto.field_at(line, 4, &filters)
-        MODE = 2
-    } else if verb == "pick_folder" {
-        MODE = 3
-    } else {
-        dialogproto.field_at(line, 3, &filters)
-        MODE = 0
-        if verb == "open_files" {
-            MODE = 1
-        }
-    }
-    if rt.buf_len(&dirp) == 0 {
-        rt.buf_push(&dirp, 46 as u8)
-    }
-    NAMES = buf_alloc()
-    *(NAMES as *mut rt.Buf) = rt.buf_new()
-    let a: *mut app.App = app.window(view(&title), 540, 600)
-    if a as u64 == 0 as u64 {
-        return 12
-    }
-    app.label(a, view(&title), 13)
-    var start: rt.Buf = rt.buf_new()
-    rt.buf_push_bytes(&start, rt.buf_ptr(&dirp), rt.buf_len(&dirp))
-    if rt.buf_at(&start, rt.buf_len(&start) - 1) != 47 as u8 {
-        rt.buf_push(&start, 47 as u8)
-    }
-    rt.buf_push_bytes(&start, rt.buf_ptr(&name), rt.buf_len(&name))
-    ENTRY = app.entry(a, "path")
-    app.set_text(a, ENTRY, view(&start))
-    rt.buf_free(&start)
-    if MODE == 1 {
-        app.label(a, "Several files: write the paths with ; between them.", 10)
-    }
-    LIST = app.list(a)
-    fill_list(a, view(&dirp), view(&filters), MODE == 3)
-    app.end(a)
-    STATUS = app.label(a, " ", 10)
-    app.row(a)
-    app.button(a, "OK", file_ok)
-    app.button(a, "Cancel", file_cancel)
-    app.end(a)
-    return app.run(a)
-}
-
-// ---------------------------------------------------------------- colour
-
+// "#rrggbb", "rrggbb": false when it is not six hex digits.
 fn parse_hex(s: str, out: *mut u32) -> bool {
     var i: usize = 0
     if i < s.length() && s.chars(i) == 35 as u8 {
@@ -412,35 +84,92 @@ fn parse_hex(s: str, out: *mut u32) -> bool {
     return true
 }
 
-fn show_swatch(a: *mut app.App, rgb: u32) {
-    // a rule for the swatch's id: the newest rule of a selector wins
-    scene.node_set_id(app.app_scene(a), SWATCH, 9000 as u32)
-    sheet.sheet_rule(&(*a).sh, sheet.sel_id(9000 as u32), style.style_set_bg(style.style_new(), style.color_literal(rgb)))
+// One answer: "failed", "cancel", or "ok" + the fields.
+fn reply_failed(o: *mut rt.Buf) {
+    rt.buf_push_bytes(o, "failed\n".p as u64, 7)
 }
 
-fn color_preview(a: *mut app.App) {
-    var rgb: u32 = 0 as u32
-    if parse_hex(app.text(a, ENTRY), &rgb) {
-        show_swatch(a, rgb)
-        status(a, "Preview")
+fn reply_cancel(o: *mut rt.Buf) {
+    rt.buf_push_bytes(o, "cancel\n".p as u64, 7)
+}
+
+fn reply_status(o: *mut rt.Buf, rc: i32) -> bool {
+    if rc == 0 {
+        return true
+    }
+    if rc == 1 {
+        reply_cancel(o)
     } else {
-        status(a, "Write the colour as #rrggbb.")
+        reply_failed(o)
     }
+    return false
 }
 
-fn color_ok(a: *mut app.App) {
-    var rgb: u32 = 0 as u32
-    if !parse_hex(app.text(a, ENTRY), &rgb) {
-        status(a, "Write the colour as #rrggbb.")
-        return
+fn serve_message(line: str, o: *mut rt.Buf) {
+    var k: rt.Buf = rt.buf_new()
+    var title: rt.Buf = rt.buf_new()
+    var text: rt.Buf = rt.buf_new()
+    var btn: rt.Buf = rt.buf_new()
+    dialogproto.field_at(line, 1, &k)
+    dialogproto.field_at(line, 2, &title)
+    dialogproto.field_at(line, 3, &text)
+    dialogproto.field_at(line, 4, &btn)
+    var answer: i32 = 0
+    let rc: i32 = msgdlg.run(num(view(&k)), view(&title), view(&text), num(view(&btn)), &answer)
+    if reply_status(o, rc) {
+        dialogproto.push_field(o, "ok", true)
+        if answer == 3 {
+            dialogproto.push_field(o, "ans_yes", false)
+        } else if answer == 4 {
+            dialogproto.push_field(o, "ans_no", false)
+        } else if answer == 2 {
+            dialogproto.push_field(o, "ans_cancel", false)
+        } else {
+            dialogproto.push_field(o, "ans_ok", false)
+        }
+        rt.buf_push(o, 10 as u8)
     }
-    var hx: rt.Buf = rt.buf_new()
-    rt.buf_push_hex_u64(&hx, rgb as u64, 6)
-    accept(a, view(&hx))
-    rt.buf_free(&hx)
+    rt.buf_free(&k)
+    rt.buf_free(&title)
+    rt.buf_free(&text)
+    rt.buf_free(&btn)
 }
 
-fn run_color(line: str) -> i32 {
+fn serve_file(verb: str, line: str, o: *mut rt.Buf) {
+    var title: rt.Buf = rt.buf_new()
+    var dirp: rt.Buf = rt.buf_new()
+    var name: rt.Buf = rt.buf_new()
+    var filters: rt.Buf = rt.buf_new()
+    dialogproto.field_at(line, 1, &title)
+    dialogproto.field_at(line, 2, &dirp)
+    var mode: i32 = 0
+    if verb == "save_file" {
+        dialogproto.field_at(line, 3, &name)
+        dialogproto.field_at(line, 4, &filters)
+        mode = 2
+    } else if verb == "pick_folder" {
+        mode = 3
+    } else {
+        dialogproto.field_at(line, 3, &filters)
+        if verb == "open_files" {
+            mode = 1
+        }
+    }
+    var paths: rt.Buf = rt.buf_new()
+    let rc: i32 = filedlg.run(mode, view(&title), view(&dirp), view(&name), view(&filters), &paths)
+    if reply_status(o, rc) {
+        dialogproto.push_field(o, "ok", true)
+        dialogproto.push_field(o, view(&paths), false)
+        rt.buf_push(o, 10 as u8)
+    }
+    rt.buf_free(&paths)
+    rt.buf_free(&title)
+    rt.buf_free(&dirp)
+    rt.buf_free(&name)
+    rt.buf_free(&filters)
+}
+
+fn serve_color(line: str, o: *mut rt.Buf) {
     var title: rt.Buf = rt.buf_new()
     var init: rt.Buf = rt.buf_new()
     dialogproto.field_at(line, 1, &title)
@@ -449,29 +178,58 @@ fn run_color(line: str) -> i32 {
     if !parse_hex(view(&init), &rgb) {
         rgb = 0 as u32
     }
-    let a: *mut app.App = app.window(view(&title), 360, 340)
-    if a as u64 == 0 as u64 {
-        return 12
+    var chosen: u32 = rgb
+    let rc: i32 = colordlg.run(view(&title), rgb, &chosen)
+    if reply_status(o, rc) {
+        var hx: rt.Buf = rt.buf_new()
+        rt.buf_push_hex_u64(&hx, chosen as u64, 6)
+        dialogproto.push_field(o, "ok", true)
+        dialogproto.push_field(o, view(&hx), false)
+        rt.buf_push(o, 10 as u8)
+        rt.buf_free(&hx)
     }
-    app.label(a, view(&title), 13)
-    SWATCH = app.spacer(a, 220, 90)
-    show_swatch(a, rgb)
-    ENTRY = app.entry(a, "#rrggbb")
-    var hx: rt.Buf = rt.buf_new()
-    rt.buf_push(&hx, 35 as u8)
-    rt.buf_push_hex_u64(&hx, rgb as u64, 6)
-    app.set_text(a, ENTRY, view(&hx))
-    rt.buf_free(&hx)
-    STATUS = app.label(a, " ", 10)
-    app.row(a)
-    app.button(a, "Preview", color_preview)
-    app.button(a, "OK", color_ok)
-    app.button(a, "Cancel", file_cancel)
-    app.end(a)
-    return app.run(a)
+    rt.buf_free(&title)
+    rt.buf_free(&init)
 }
 
-// ---------------------------------------------------------------- main
+fn serve_font(line: str, o: *mut rt.Buf) {
+    var title: rt.Buf = rt.buf_new()
+    var family: rt.Buf = rt.buf_new()
+    var size: rt.Buf = rt.buf_new()
+    dialogproto.field_at(line, 1, &title)
+    dialogproto.field_at(line, 2, &family)
+    dialogproto.field_at(line, 3, &size)
+    var sz: i32 = num(view(&size))
+    if sz < 1 {
+        sz = 12
+    }
+    var picked_family: rt.Buf = rt.buf_new()
+    var pick: fontdlg.FontPick = fontdlg.FontPick { size: sz, bold: false, italic: false, underline: false, strike: false }
+    let rc: i32 = fontdlg.run(view(&title), view(&family), sz, &picked_family, &pick)
+    if reply_status(o, rc) {
+        var d: rt.Buf = rt.buf_new()
+        rt.buf_push_dec_u64(&d, pick.size as u64)
+        dialogproto.push_field(o, "ok", true)
+        dialogproto.push_field(o, view(&picked_family), false)
+        dialogproto.push_field(o, view(&d), false)
+        if pick.bold {
+            dialogproto.push_field(o, "1", false)
+        } else {
+            dialogproto.push_field(o, "0", false)
+        }
+        if pick.italic {
+            dialogproto.push_field(o, "1", false)
+        } else {
+            dialogproto.push_field(o, "0", false)
+        }
+        rt.buf_push(o, 10 as u8)
+        rt.buf_free(&d)
+    }
+    rt.buf_free(&picked_family)
+    rt.buf_free(&title)
+    rt.buf_free(&family)
+    rt.buf_free(&size)
+}
 
 fn main(start: u64) -> i32 {
     if rt.arg_count(start) < 2 || arg(start, 1) != "--stdio" {
@@ -488,29 +246,18 @@ fn main(start: u64) -> i32 {
     let line: str = view(&req)
     var verb: rt.Buf = rt.buf_new()
     dialogproto.field_at(line, 0, &verb)
-    var rc: i32 = 1
     let v: str = view(&verb)
-    if v == "message" {
-        rc = run_message(line)
-    } else if v == "open_file" || v == "open_files" || v == "save_file" || v == "pick_folder" {
-        rc = run_file(v, line)
-    } else if v == "pick_color" {
-        rc = run_color(line)
-    } else {
-        var f: rt.Buf = rt.buf_new()
-        rt.buf_push_bytes(&f, "failed\n".p as u64, 7)
-        out(&f)
-        return 0
-    }
     var o: rt.Buf = rt.buf_new()
-    if rc != 0 {
-        rt.buf_push_bytes(&o, "failed\n".p as u64, 7)
-    } else if REPLY != 0 as u64 {
-        let r: *mut rt.Buf = REPLY as *mut rt.Buf
-        rt.buf_push_bytes(&o, rt.buf_ptr(r), rt.buf_len(r))
-        rt.buf_push(&o, 10 as u8)
+    if v == "message" {
+        serve_message(line, &o)
+    } else if v == "open_file" || v == "open_files" || v == "save_file" || v == "pick_folder" {
+        serve_file(v, line, &o)
+    } else if v == "pick_color" {
+        serve_color(line, &o)
+    } else if v == "pick_font" {
+        serve_font(line, &o)
     } else {
-        rt.buf_push_bytes(&o, "cancel\n".p as u64, 7)
+        reply_failed(&o)
     }
     out(&o)
     return 0

@@ -1,0 +1,1985 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/colordlg.fi -- THE COLOUR DIALOG (Windows ChooseColor, in the fUi style).
+//
+// ========================================================= WHAT IT IS
+//
+//     var rgb: u32 = 0
+//     let rc: i32 = colordlg.run("Pick a colour", 0x1BD96A as u32, &rgb)
+//     // 0 = the user chose (rgb = 0xRRGGBB, no alpha), 1 = cancelled or closed,
+//     // 12 = no window possible (no display, no font)
+//
+// One window of its own (app.window + app.run), modal by being the only
+// thing the process does. The same state also builds into a window of a
+// normal fUi program: `dlg_new` + `build` (see the end of the file).
+//
+// The dialog:
+//
+//   * BASIC COLOURS    8 x 6 swatches, the classic Windows table (BASIC below).
+//                      Click chooses, the swatch under the mouse has a ring,
+//                      the chosen one has a ring and a tick, the arrow keys
+//                      walk the grid when it has the focus.
+//   * CUSTOM COLOURS   2 x 8 slots. A click loads the colour of a slot, the
+//                      button "Add to custom colours" writes the current colour
+//                      into the selected empty slot, else the next free one
+//                      (when all 16 are full: the selected slot, else round
+//                      robin). Kept best effort in ~/.config/firn/dialog-colors.txt
+//                      (16 lines, `RRGGBB` or an empty line); a missing or
+//                      broken file means 16 empty slots; a write that fails is
+//                      ignored.
+//   * COLOUR FIELD     ONE scene node with its own painter: hue horizontal
+//                      (0 .. 360 degrees, left to right), saturation vertical
+//                      (100 % at the top, 0 % at the bottom), at the current
+//                      lightness. Mouse press/drag (the drag goes on outside the
+//                      node and the window, the value clamps at the rim), arrow keys (1 step, Shift = 10)
+//                      when focused. The pixels of the field are rendered into a
+//                      buffer only when the LIGHTNESS changes (the field does not
+//                      depend on anything else) and blitted row by row.
+//   * LIGHTNESS BAR    vertical, white at the top over the pure colour (L = 50 %)
+//                      to black at the bottom. THE MODEL IS HSL, NOT HSV (the
+//                      choice the order asked to document): black -> pure colour
+//                      -> white is exactly the HSL lightness axis, the field
+//                      (hue x saturation at a fixed L) and the bar match the
+//                      H / S / L entry fields and the maths of hsl_to_rgb.
+//   * ENTRY FIELDS     Hue 0..359, Saturation 0..100, Lightness 0..100, Red,
+//                      Green, Blue 0..255, Hex (#RRGGBB, RRGGBB, #RGB, RGB).
+//                      Live while typing: a change in one field updates the
+//                      others at once; a half typed or invalid text changes
+//                      nothing, the field is ringed in the error colour until it
+//                      is valid, and the field being typed in is not overwritten;
+//                      a number above its range clamps (300 -> 255); Up/Down in
+//                      a number field is +-1 (Shift +-10).
+//   * PREVIEW          "Old | New" split swatch; a click on Old restores the
+//                      colour the dialog started with.
+//   * OK / Cancel      Enter = OK, Esc = Cancel, closing the window = Cancel.
+//
+// ================================================== ROUND TRIP (the colour is the truth)
+//
+// `rgb` is the truth. The HSL triple is a view of it that keeps what an RGB
+// value does not determine (the hue of a grey, the hue and saturation of black
+// and white), so dragging out of grey does not jump to hue 0. The triple is
+// recomputed from `rgb` only when the user sets an RGB value (RGB fields, hex,
+// basic/custom swatch, Old); `rgb` is recomputed from the triple only when the
+// user moves the field, the bar, an H/S/L field or a key. Pressing OK on an
+// untouched dialog therefore returns the start colour bit for bit (no HSL
+// rounding in between). An entry field that is merely clicked into or walked
+// through with the arrow keys does not "edit": its number is compared with the
+// number shown for the current colour first.
+//
+// ====================================================== LOOK
+//
+// Theme tokens only. The parts that ARE colour content (the swatches, the field,
+// the bar) are not tokens, but everything around them is: ring, border, tick,
+// cross-hair (outlined with the page colour so it shows on every colour), text.
+// The tick and the labels on a swatch are black or white, whichever reads better.
+//
+// Texts: every English string of the dialog is a `tr_*` function below.
+import std.rt
+import std.env
+import std.fs
+import paint.canvas
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.scene
+import fui.widget
+import fui.editor
+import fui.event
+import fui.a11y
+import fui.app
+import fui.wave3
+import fui.gpu
+import plat.fuiwirt
+
+export {
+    run, dlg_new, dlg_new_store, dlg_size, build, dlg_result, dlg_set_rgb, dlg_cancel, dlg_ok,
+    Dlg, Hsl, Hsv, Geom,
+    hsl_to_rgb, rgb_to_hsl, hsv_to_rgb, rgb_to_hsv, parse_hex, hex_of,
+    contrast_text, BASIC, basic_at,
+    field_pixel, field_geom, bar_geom, grid_geom, grid_hit, field_prepare,
+    DRAG_NONE, DRAG_FIELD, DRAG_BAR,
+    WIN_W, WIN_H, STORE_N,
+    load_custom, save_custom, store_path,
+    tr_basic, tr_custom, tr_add, tr_ok, tr_cancel,
+}
+
+const WIN_W: usize = 620
+const WIN_H: usize = 460
+const STORE_N: usize = 16
+
+const BASIC_COLS: usize = 8
+const BASIC_ROWS: usize = 6
+const CUST_COLS: usize = 8
+const CUST_ROWS: usize = 2
+// swatch size and gap, design points
+const CELL_PT: usize = 24
+const GAP_PT: usize = 4
+// the field and the bar: the node is the picture plus 4 points all round (a
+// 3 point ring zone for the focus ring and a 1 point border)
+const FIELD_W: usize = 260
+const FIELD_H: usize = 168
+const BAR_W: usize = 28
+const PREV_H: usize = 38
+const FRAME_PT: usize = 3
+
+const DRAG_NONE: u32 = 0
+const DRAG_FIELD: u32 = 1
+const DRAG_BAR: u32 = 2
+
+// the entry fields: their order in Dlg.ent
+const F_HUE: usize = 0
+const F_SAT: usize = 1
+const F_LUM: usize = 2
+const F_RED: usize = 3
+const F_GREEN: usize = 4
+const F_BLUE: usize = 5
+const F_HEX: usize = 6
+const F_COUNT: usize = 7
+
+// ============================================================ THE TEXTS
+
+fn tr_basic() -> str { return "Basic colours" }
+fn tr_custom() -> str { return "Custom colours" }
+fn tr_add() -> str { return "Add to custom colours" }
+fn tr_ok() -> str { return "OK" }
+fn tr_cancel() -> str { return "Cancel" }
+fn tr_hue() -> str { return "Hue" }
+fn tr_sat() -> str { return "Saturation" }
+fn tr_lum() -> str { return "Lightness" }
+fn tr_red() -> str { return "Red" }
+fn tr_green() -> str { return "Green" }
+fn tr_blue() -> str { return "Blue" }
+fn tr_hex() -> str { return "Hex" }
+fn tr_old() -> str { return "Old" }
+fn tr_new() -> str { return "New" }
+fn tr_name_basic() -> str { return "Basic colours, " }
+fn tr_name_none() -> str { return "no swatch selected" }
+fn tr_name_custom() -> str { return "Custom colours, " }
+fn tr_name_slot() -> str { return "slot " }
+fn tr_name_of() -> str { return " of 16 selected" }
+fn tr_name_free() -> str { return " free slots" }
+fn tr_name_hue() -> str { return "Hue " }
+fn tr_name_sat() -> str { return ", saturation " }
+fn tr_name_lum() -> str { return "Lightness " }
+fn tr_name_old() -> str { return "Old colour " }
+fn tr_name_new() -> str { return ", new colour " }
+fn tr_name_prev() -> str { return "Old and new colour. Click Old to restore it" }
+
+fn label_of(k: usize) -> str {
+    if k == F_HUE { return tr_hue() }
+    if k == F_SAT { return tr_sat() }
+    if k == F_LUM { return tr_lum() }
+    if k == F_RED { return tr_red() }
+    if k == F_GREEN { return tr_green() }
+    if k == F_BLUE { return tr_blue() }
+    return tr_hex()
+}
+
+// ============================================================ THE COLOUR MATHS
+//
+// Pure functions on 0xRRGGBB (the high byte is ignored on the way in and zero
+// on the way out). Floats are f64; hue in degrees [0, 360), s / l / v in [0, 1].
+
+struct Hsl {
+    h: f64, // < 0 = undefined (the colour is a grey)
+    s: f64,
+    l: f64,
+}
+
+struct Hsv {
+    h: f64, // < 0 = undefined
+    s: f64,
+    v: f64,
+}
+
+fn fabs(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+fn clamp01(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0
+    }
+    if v > 1.0 {
+        return 1.0
+    }
+    return v
+}
+
+fn to_byte(v: f64) -> u32 {
+    var t: f64 = v * 255.0 + 0.5
+    if t < 0.0 {
+        t = 0.0
+    }
+    if t > 255.0 {
+        t = 255.0
+    }
+    return t as u32
+}
+
+fn pack(r: u32, g: u32, b: u32) -> u32 {
+    return (r << 16) | (g << 8) | b
+}
+
+fn wrap_hue(h: f64) -> f64 {
+    var v: f64 = h
+    while v >= 360.0 {
+        v = v - 360.0
+    }
+    while v < 0.0 {
+        v = v + 360.0
+    }
+    return v
+}
+
+// The six sectors of the hue circle as the weights of (r, g, b) around the
+// pure colour: the largest channel is `c`, the middle one `x`, the smallest 0.
+fn sector_rgb(h: f64, c: f64, m: f64) -> u32 {
+    let hp: f64 = wrap_hue(h) / 60.0
+    let i: i64 = hp as i64
+    let f: f64 = hp - (i as f64)
+    var x: f64 = c * f
+    if i == 1 as i64 || i == 3 as i64 || i == 5 as i64 {
+        x = c * (1.0 - f)
+    }
+    var r: f64 = 0.0
+    var g: f64 = 0.0
+    var b: f64 = 0.0
+    if i == 0 as i64 {
+        r = c
+        g = x
+    } else if i == 1 as i64 {
+        r = x
+        g = c
+    } else if i == 2 as i64 {
+        g = c
+        b = x
+    } else if i == 3 as i64 {
+        g = x
+        b = c
+    } else if i == 4 as i64 {
+        r = x
+        b = c
+    } else {
+        r = c
+        b = x
+    }
+    return pack(to_byte(r + m), to_byte(g + m), to_byte(b + m))
+}
+
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> u32 {
+    let ss: f64 = clamp01(s)
+    let ll: f64 = clamp01(l)
+    let c: f64 = (1.0 - fabs(2.0 * ll - 1.0)) * ss
+    return sector_rgb(h, c, ll - c / 2.0)
+}
+
+// The hue (degrees, [0, 360)) of a colour, -1 when it has none (r = g = b).
+fn hue_of(r: f64, g: f64, b: f64, mx: f64, d: f64) -> f64 {
+    if d <= 0.0 {
+        return 0.0 - 1.0
+    }
+    var hh: f64 = 0.0
+    if mx == r {
+        hh = (g - b) / d
+        if hh < 0.0 {
+            hh = hh + 6.0
+        }
+    } else if mx == g {
+        hh = (b - r) / d + 2.0
+    } else {
+        hh = (r - g) / d + 4.0
+    }
+    return hh * 60.0
+}
+
+fn rgb_to_hsl(rgb: u32) -> Hsl {
+    let r: f64 = (((rgb >> 16) & 255 as u32) as f64) / 255.0
+    let g: f64 = (((rgb >> 8) & 255 as u32) as f64) / 255.0
+    let b: f64 = ((rgb & 255 as u32) as f64) / 255.0
+    var mx: f64 = r
+    var mn: f64 = r
+    if g > mx { mx = g }
+    if b > mx { mx = b }
+    if g < mn { mn = g }
+    if b < mn { mn = b }
+    let l: f64 = (mx + mn) / 2.0
+    let d: f64 = mx - mn
+    var s: f64 = 0.0
+    if d > 0.0 {
+        s = d / (1.0 - fabs(2.0 * l - 1.0))
+    }
+    return Hsl { h: hue_of(r, g, b, mx, d), s: clamp01(s), l: l }
+}
+
+// HSV, the other model. It is NOT what the dialog shows (see the header);
+// wave3's colour picker uses it, so the conversion stays in one place.
+fn hsv_to_rgb(h: f64, s: f64, v: f64) -> u32 {
+    return wave3.hsv_rgb(h, clamp01(s), clamp01(v)) & 16777215 as u32
+}
+
+fn rgb_to_hsv(rgb: u32) -> Hsv {
+    let r: f64 = (((rgb >> 16) & 255 as u32) as f64) / 255.0
+    let g: f64 = (((rgb >> 8) & 255 as u32) as f64) / 255.0
+    let b: f64 = ((rgb & 255 as u32) as f64) / 255.0
+    var mx: f64 = r
+    var mn: f64 = r
+    if g > mx { mx = g }
+    if b > mx { mx = b }
+    if g < mn { mn = g }
+    if b < mn { mn = b }
+    let d: f64 = mx - mn
+    var s: f64 = 0.0
+    if mx > 0.0 {
+        s = d / mx
+    }
+    return Hsv { h: hue_of(r, g, b, mx, d), s: clamp01(s), v: mx }
+}
+
+fn hex_digit(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return (c - 97 as u8) as i32 + 10
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return (c - 65 as u8) as i32 + 10
+    }
+    return 0 - 1
+}
+
+// `#RRGGBB`, `RRGGBB`, `#RGB`, `RGB` (letters of either case, spaces around are
+// ignored). false = not a colour (yet); `out` is then untouched.
+fn parse_hex(s: str, out: *mut u32) -> bool {
+    var i: usize = 0
+    var n: usize = s.n
+    while i < n && rt.ld8(s.p as u64, i) == 32 as u8 {
+        i = i + 1
+    }
+    while n > i && rt.ld8(s.p as u64, n - 1) == 32 as u8 {
+        n = n - 1
+    }
+    if i < n && rt.ld8(s.p as u64, i) == 35 as u8 {
+        i = i + 1
+    }
+    let len: usize = n - i
+    if len != 3 && len != 6 {
+        return false
+    }
+    var v: u32 = 0 as u32
+    var k: usize = 0
+    while k < len {
+        let dg: i32 = hex_digit(rt.ld8(s.p as u64, i + k))
+        if dg < 0 {
+            return false
+        }
+        if len == 3 {
+            v = (v << 8) | ((dg as u32) << 4) | (dg as u32)
+        } else {
+            v = (v << 4) | (dg as u32)
+        }
+        k = k + 1
+    }
+    *out = v & 16777215 as u32
+    return true
+}
+
+fn hex_char(v: u32) -> u8 {
+    if v < 10 as u32 {
+        return (48 as u32 + v) as u8
+    }
+    return (55 as u32 + v) as u8
+}
+
+// `#RRGGBB` in upper case into 7 bytes.
+fn hex_of(rgb: u32, out: *mut [u8; 7]) {
+    (*out)[0] = 35 as u8
+    var i: usize = 0
+    while i < 6 {
+        (*out)[1 + i] = hex_char((rgb >> ((5 - i) * 4) as u32) & 15 as u32)
+        i = i + 1
+    }
+}
+
+// Whichever of `a` and `b` (theme colours) reads better on `bg`.
+fn contrast_text(bg: u32, a: u32, b: u32) -> u32 {
+    if theme.contrast(a, bg) >= theme.contrast(b, bg) {
+        return a
+    }
+    return b
+}
+
+// Ink on a colour that is CONTENT (a swatch, the preview): black or white, the
+// better of the two. They are the one pair that reads on every colour -- the worst
+// case, a mid grey, is 4.58 : 1; the theme's own text colour is not as black as
+// that and would fall below 4.5 : 1 on some mid tones.
+fn on_content(bg: u32) -> u32 {
+    return contrast_text(bg, 4278190080 as u32, 4294967295 as u32)
+}
+
+// ============================================================ THE BASIC COLOURS
+//
+// The classic Windows table (ChooseColor): 8 columns, 6 rows, row by row.
+// Row 5 and row 6 both hold 0x400040 -- the original has that twin as well.
+static BASIC: [u32; 48] = [
+    0xFF8080, 0xFFFF80, 0x80FF80, 0x00FF80, 0x80FFFF, 0x0080FF, 0xFF80C0, 0xFF80FF,
+    0xFF0000, 0xFFFF00, 0x80FF00, 0x00FF40, 0x00FFFF, 0x0080C0, 0x8080C0, 0xFF00FF,
+    0x804040, 0xFF8040, 0x00FF00, 0x008080, 0x004080, 0x8080FF, 0x800040, 0xFF0080,
+    0x800000, 0xFF8000, 0x008000, 0x008040, 0x0000FF, 0x0000A0, 0x800080, 0x8000FF,
+    0x400000, 0x804000, 0x004000, 0x004040, 0x000080, 0x000040, 0x400040, 0x400080,
+    0x000000, 0x808000, 0x808040, 0x808080, 0x408080, 0xC0C0C0, 0x400040, 0xFFFFFF
+]
+
+fn basic_at(i: usize) -> u32 {
+    if i >= 48 {
+        return 0 as u32
+    }
+    return BASIC[i]
+}
+
+// ============================================================ THE STATE
+
+struct NameBuf {
+    b: [u8; 120],
+    n: usize,
+}
+
+fn nb_new() -> NameBuf {
+    return NameBuf { b: [0 as u8; 120], n: 0 }
+}
+
+fn nb_str(nb: *mut NameBuf, s: str) {
+    var i: usize = 0
+    while i < s.n && (*nb).n < 120 {
+        (*nb).b[(*nb).n] = rt.ld8(s.p as u64, i)
+        (*nb).n = (*nb).n + 1
+        i = i + 1
+    }
+}
+
+fn nb_num(nb: *mut NameBuf, v: i64) {
+    var t: [u8; 24] = [0 as u8; 24]
+    var n: usize = 0
+    var u: u64 = v as u64
+    if v < 0 {
+        nb_str(nb, "-")
+        u = (0 - v) as u64
+    }
+    if u == 0 as u64 {
+        t[23] = 48 as u8
+        n = 1
+    }
+    while u > 0 as u64 {
+        t[23 - n] = (48 as u64 + u % 10 as u64) as u8
+        u = u / 10 as u64
+        n = n + 1
+    }
+    nb_str(nb, str { p: (&t[24 - n]) as *mut u8, n: n })
+}
+
+fn nb_hex(nb: *mut NameBuf, rgb: u32) {
+    var h: [u8; 7] = [0 as u8; 7]
+    hex_of(rgb, &h)
+    nb_str(nb, str { p: (&h[0]) as *mut u8, n: 7 })
+}
+
+fn nb_view(nb: *mut NameBuf) -> str {
+    return str { p: (&(*nb).b[0]) as *mut u8, n: (*nb).n }
+}
+
+struct Dlg {
+    // THE COLOUR: rgb is the truth, h / s / l the view that remembers what rgb
+    // does not say (header)
+    rgb: u32,
+    old: u32,
+    h: f64,
+    s: f64,
+    l: f64,
+    // -1 = still open, 0 = OK, 1 = cancelled
+    done: i32,
+    // the nodes
+    n_basic: usize,
+    n_cust: usize,
+    n_field: usize,
+    n_bar: usize,
+    n_prev: usize,
+    ent: [usize; 7],
+    b_add: usize,
+    b_ok: usize,
+    b_cancel: usize,
+    // the custom colours: -1 = empty slot, else 0xRRGGBB
+    cust: [i64; 16],
+    sel_c: i64,
+    next_c: i64,
+    // the basic grid: the swatch that holds the keyboard cursor / is chosen
+    cur_b: i64,
+    // hover: the swatch under the mouse (-1 = none); drag: DRAG_*
+    hov_b: i64,
+    hov_c: i64,
+    hov_p: i64,
+    drag: u32,
+    // TYPING A COLOUR passes through colours that are not meant (the three digits
+    // of '#808' on the way to '#808080'): while one field is being edited the hue
+    // and saturation the dialog had when the typing began are kept, so a grey that
+    // arrives at the end still has the hue it would have had. edit_k = the field
+    // (NONE: no typing); any other change of the colour ends it.
+    edit_k: usize,
+    snap_h: f64,
+    snap_s: f64,
+    // the pixels of the colour field: rendered for the lightness `fl` at
+    // `fw` x `fh` into `fbuf` (0xAABBGGRR as the canvas stores bytes: r g b a)
+    fbuf: u64,
+    fcap: usize,
+    fw: usize,
+    fh: usize,
+    fl: f64,
+    renders: u64,
+    // with the store switched off (tests that must not touch ~/.config)
+    store_on: bool,
+    // names for the accessibility tree (they must stay alive)
+    nm_field: NameBuf,
+    nm_bar: NameBuf,
+    nm_basic: NameBuf,
+    nm_cust: NameBuf,
+    nm_prev: NameBuf,
+    tmp: NameBuf,
+}
+
+fn dlg_blank() -> Dlg {
+    return Dlg { rgb: 0 as u32, old: 0 as u32, h: 0.0, s: 0.0, l: 0.0, done: 0 - 1,
+        n_basic: app.NONE, n_cust: app.NONE, n_field: app.NONE, n_bar: app.NONE,
+        n_prev: app.NONE, ent: [app.NONE; 7], b_add: app.NONE, b_ok: app.NONE,
+        b_cancel: app.NONE, cust: [0 - 1; 16], sel_c: 0 - 1, next_c: 0,
+        cur_b: 0, hov_b: 0 - 1, hov_c: 0 - 1, hov_p: 0 - 1, drag: DRAG_NONE,
+        edit_k: app.NONE, snap_h: 0.0, snap_s: 0.0,
+        fbuf: 0, fcap: 0, fw: 0, fh: 0, fl: 0.0 - 1.0, renders: 0,
+        store_on: true,
+        nm_field: nb_new(), nm_bar: nb_new(), nm_basic: nb_new(),
+        nm_cust: nb_new(), nm_prev: nb_new(), tmp: nb_new() }
+}
+
+// How big a Dlg is (no size_of in stage 0: measured like app.fi measures an App).
+fn dlg_size() -> usize {
+    var probe: [Dlg; 2] = [dlg_blank(); 2]
+    return ((&probe[1]) as usize) - ((&probe[0]) as usize)
+}
+
+// A dialog state for the start colour `initial`; the custom colours are read
+// from the store. 0 when there is no memory.
+fn dlg_new(initial: u32) -> *mut Dlg {
+    return dlg_new_store(initial, true)
+}
+
+// The same with the store of the custom colours switched on or off (tests
+// that must not touch ~/.config).
+fn dlg_new_store(initial: u32, store: bool) -> *mut Dlg {
+    let p: u64 = rt.heap_alloc(dlg_size())
+    if p == 0 as u64 {
+        return 0 as u64 as *mut Dlg
+    }
+    let d: *mut Dlg = p as *mut Dlg
+    *d = dlg_blank()
+    (*d).store_on = store
+    (*d).old = initial & 16777215 as u32
+    sync_from_rgb(d, (*d).old)
+    load_custom(d)
+    return d
+}
+
+// 0 = OK, 1 = cancelled / closed, -1 = still open; and the colour.
+fn dlg_result(d: *mut Dlg) -> i32 {
+    return (*d).done
+}
+
+fn dlg_ok(d: *mut Dlg) {
+    (*d).done = 0
+}
+
+fn dlg_cancel(d: *mut Dlg) {
+    (*d).done = 1
+}
+
+// ---- how the colour changes
+
+// The user set an RGB value (fields, hex, swatch, Old): rgb is exactly it, the
+// HSL view follows -- except for what a grey does not say.
+fn sync_from_rgb(d: *mut Dlg, rgb: u32) {
+    (*d).rgb = rgb & 16777215 as u32
+    let t: Hsl = rgb_to_hsl((*d).rgb)
+    (*d).l = t.l
+    if t.h >= 0.0 {
+        (*d).h = t.h
+        (*d).s = t.s
+    } else if t.l > 0.0 && t.l < 1.0 {
+        // a grey keeps its hue, has no saturation. Black and white keep both:
+        // dragging the bar out of black brings the colour that was chosen before.
+        (*d).s = 0.0
+    }
+    (*d).sel_c = 0 - 1
+}
+
+// The same while a field is being typed in: a grey takes the hue and saturation
+// the dialog had when the typing began (see Dlg.edit_k).
+fn sync_typing(d: *mut Dlg, rgb: u32) {
+    if (*d).edit_k != app.NONE && rgb_to_hsl(rgb).h < 0.0 {
+        (*d).h = (*d).snap_h
+        (*d).s = (*d).snap_s
+    }
+    sync_from_rgb(d, rgb)
+}
+
+// The user moved a part of the HSL view: rgb is computed from it.
+fn set_hsl(d: *mut Dlg, h: f64, s: f64, l: f64) {
+    var hh: f64 = h
+    if hh < 0.0 {
+        hh = 0.0
+    }
+    if hh > 359.999 {
+        hh = 359.999
+    }
+    let ss: f64 = clamp01(s)
+    let ll: f64 = clamp01(l)
+    if hh == (*d).h && ss == (*d).s && ll == (*d).l {
+        return
+    }
+    (*d).h = hh
+    (*d).s = ss
+    (*d).l = ll
+    (*d).rgb = hsl_to_rgb(hh, ss, ll)
+    (*d).sel_c = 0 - 1
+}
+
+// The shown integers of the HSL view.
+fn int_hue(d: *mut Dlg) -> i64 {
+    var v: i64 = ((*d).h + 0.5) as i64
+    if v > 359 as i64 {
+        v = 359 as i64
+    }
+    return v
+}
+
+fn int_sat(d: *mut Dlg) -> i64 {
+    return ((*d).s * 100.0 + 0.5) as i64
+}
+
+fn int_lum(d: *mut Dlg) -> i64 {
+    return ((*d).l * 100.0 + 0.5) as i64
+}
+
+// ---- the custom colours and their store
+
+struct StorePath {
+    dir: rt.Buf,
+    file: rt.Buf,
+}
+
+fn buf_put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn buf_view(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_ptr(b) as *mut u8, n: rt.buf_len(b) }
+}
+
+// $HOME/.config/firn/dialog-colors.txt into `file` (and its directory into
+// `dir`); false when HOME is not set.
+fn store_path(dir: *mut rt.Buf, file: *mut rt.Buf) -> bool {
+    let home: str = env.get("HOME")
+    if home.n == 0 {
+        return false
+    }
+    buf_put(dir, home)
+    buf_put(dir, "/.config/firn")
+    buf_put(file, home)
+    buf_put(file, "/.config/firn/dialog-colors.txt")
+    return true
+}
+
+// The file is exactly 16 lines, each `RRGGBB` or empty. Anything else (a line
+// that is no colour, too few or too many lines) is a broken file: all slots stay
+// empty.
+fn load_custom(d: *mut Dlg) {
+    var i: usize = 0
+    while i < 16 {
+        (*d).cust[i] = 0 - 1
+        i = i + 1
+    }
+    (*d).sel_c = 0 - 1
+    (*d).next_c = 0
+    if !(*d).store_on {
+        return
+    }
+    var dir: rt.Buf = rt.buf_new()
+    var file: rt.Buf = rt.buf_new()
+    var data: rt.Buf = rt.buf_new()
+    if store_path(&dir, &file) {
+        var ok: bool = true
+        fs.read_file(buf_view(&file), &data) catch | e | (read_failed(&ok))
+        if ok {
+            parse_store(d, buf_view(&data))
+        }
+    }
+    rt.buf_free(&dir)
+    rt.buf_free(&file)
+    rt.buf_free(&data)
+}
+
+fn read_failed(ok: *mut bool) -> usize {
+    *ok = false
+    return 0
+}
+
+fn parse_store(d: *mut Dlg, s: str) {
+    var vals: [i64; 16] = [0 - 1; 16]
+    var line: usize = 0
+    var start: usize = 0
+    var i: usize = 0
+    while i <= s.n {
+        if i == s.n || rt.ld8(s.p as u64, i) == 10 as u8 {
+            if i == s.n && start == i {
+                // the text ends with a line feed: no further line
+            } else {
+                if line >= 16 {
+                    return
+                }
+                let t: str = str { p: ((s.p as u64) + start as u64) as *mut u8, n: i - start }
+                if t.n > 0 {
+                    var v: u32 = 0 as u32
+                    if t.n != 6 || !parse_hex(t, &v) {
+                        return
+                    }
+                    vals[line] = v as i64
+                }
+                line = line + 1
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if line != 16 {
+        return
+    }
+    var k: usize = 0
+    while k < 16 {
+        (*d).cust[k] = vals[k]
+        k = k + 1
+    }
+}
+
+// Best effort: a directory or a file that cannot be written is ignored.
+fn save_custom(d: *mut Dlg) {
+    if !(*d).store_on {
+        return
+    }
+    var dir: rt.Buf = rt.buf_new()
+    var file: rt.Buf = rt.buf_new()
+    var data: rt.Buf = rt.buf_new()
+    if store_path(&dir, &file) {
+        var i: usize = 0
+        while i < 16 {
+            if (*d).cust[i] >= 0 as i64 {
+                var h: [u8; 7] = [0 as u8; 7]
+                hex_of((*d).cust[i] as u32, &h)
+                rt.buf_push_bytes(&data, (&h[1]) as u64, 6)
+            }
+            rt.buf_push(&data, 10 as u8)
+            i = i + 1
+        }
+        fs.mkdir_all(buf_view(&dir)) catch false
+        fs.write_atomic(buf_view(&file), rt.buf_ptr(&data), rt.buf_len(&data)) catch false
+    }
+    rt.buf_free(&dir)
+    rt.buf_free(&file)
+    rt.buf_free(&data)
+}
+
+fn free_slots(d: *mut Dlg) -> i64 {
+    var n: i64 = 0
+    var i: usize = 0
+    while i < 16 {
+        if (*d).cust[i] < 0 as i64 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Where "Add to custom colours" writes: the selected slot if it is empty, else
+// the first empty one, else (all full) the selected slot, else round robin.
+fn add_target(d: *mut Dlg) -> usize {
+    if (*d).sel_c >= 0 as i64 && (*d).cust[(*d).sel_c as usize] < 0 as i64 {
+        return (*d).sel_c as usize
+    }
+    var i: usize = 0
+    while i < 16 {
+        if (*d).cust[i] < 0 as i64 {
+            return i
+        }
+        i = i + 1
+    }
+    if (*d).sel_c >= 0 as i64 {
+        return (*d).sel_c as usize
+    }
+    let t: usize = (*d).next_c as usize
+    (*d).next_c = ((*d).next_c + 1) % 16
+    return t
+}
+
+fn add_custom(d: *mut Dlg) -> usize {
+    let t: usize = add_target(d)
+    (*d).cust[t] = (*d).rgb as i64
+    (*d).sel_c = t as i64
+    save_custom(d)
+    return t
+}
+
+// ============================================================ THE GEOMETRY
+//
+// ONE place for "which pixel is which colour": the painters and the pointer
+// handlers both go through these, so what is drawn and what is picked cannot
+// disagree.
+
+struct Geom {
+    x: f64, // the picture's rectangle (inside ring zone and border), pixels
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+fn round_px(v: f64) -> f64 {
+    return ((v + 0.5) as i64) as f64
+}
+
+fn inset_of(m: *mut theme.Theme) -> f64 {
+    return (theme.theme_px(m, FRAME_PT + 1)) as f64
+}
+
+// The picture inside a field / bar node at (x, y, w, h) pixels.
+fn pic_geom(m: *mut theme.Theme, x: f64, y: f64, w: f64, h: f64) -> Geom {
+    let k: f64 = inset_of(m)
+    return Geom { x: round_px(x + k), y: round_px(y + k), w: round_px(w - 2.0 * k),
+        h: round_px(h - 2.0 * k) }
+}
+
+fn field_geom(m: *mut theme.Theme, x: f64, y: f64, w: f64, h: f64) -> Geom {
+    return pic_geom(m, x, y, w, h)
+}
+
+fn bar_geom(m: *mut theme.Theme, x: f64, y: f64, w: f64, h: f64) -> Geom {
+    return pic_geom(m, x, y, w, h)
+}
+
+fn clamp_i(v: i64, lo: i64, hi: i64) -> i64 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+// The hue and the saturation at pixel column `i` and row `j` of the picture.
+fn hue_at(i: i64, iw: i64) -> f64 {
+    return 360.0 * (i as f64) / (iw as f64)
+}
+
+fn sat_at(j: i64, ih: i64) -> f64 {
+    if ih <= 1 as i64 {
+        return 1.0
+    }
+    return 1.0 - (j as f64) / ((ih - 1) as f64)
+}
+
+fn lum_at(j: i64, ih: i64) -> f64 {
+    return sat_at(j, ih)
+}
+
+// The colour of the field at pixel (i, j) for lightness `l`: what the painter
+// writes and what a click there chooses.
+fn field_pixel(i: i64, j: i64, iw: i64, ih: i64, l: f64) -> u32 {
+    return hsl_to_rgb(hue_at(i, iw), sat_at(j, ih), l)
+}
+
+// A grid of swatches in a node (x, y, w, h): the cell size is the largest whole
+// pixel size that fits, the grid is centred in the node.
+fn grid_geom(x: f64, y: f64, w: f64, h: f64, cols: usize, rows: usize, gap: f64) -> Geom {
+    var cw: f64 = (w - gap * ((cols - 1) as f64)) / (cols as f64)
+    let ch: f64 = (h - gap * ((rows - 1) as f64)) / (rows as f64)
+    if ch < cw {
+        cw = ch
+    }
+    cw = ((cw as i64) as f64)
+    if cw < 1.0 {
+        cw = 1.0
+    }
+    let gw: f64 = cw * (cols as f64) + gap * ((cols - 1) as f64)
+    let gh: f64 = cw * (rows as f64) + gap * ((rows - 1) as f64)
+    // x, y: the first cell; w: the cell size; h: the step (cell + gap)
+    return Geom { x: round_px(x + (w - gw) / 2.0), y: round_px(y + (h - gh) / 2.0),
+        w: cw, h: cw + gap }
+}
+
+// The swatch under a point (-1 = none). A point in a gap belongs to the swatch
+// before it, so a stroke across the grid has no dead lines.
+fn grid_hit(g: Geom, cols: usize, rows: usize, px: f64, py: f64) -> i64 {
+    let fx: f64 = (px - g.x) / g.h
+    let fy: f64 = (py - g.y) / g.h
+    if px < g.x || py < g.y {
+        return 0 - 1
+    }
+    let i: i64 = fx as i64
+    let j: i64 = fy as i64
+    if i >= cols as i64 || j >= rows as i64 {
+        return 0 - 1
+    }
+    return j * (cols as i64) + i
+}
+
+// ============================================================ PAINTING
+
+fn token(c: *mut render.Ctx, t: u32) -> u32 {
+    return render.color_of(c, style.color_token(t))
+}
+
+fn opaque(rgb: u32) -> u32 {
+    return (rgb & 16777215 as u32) | 4278190080 as u32
+}
+
+// Make `fbuf` hold the field for lightness `l` at iw x ih pixels (once per
+// lightness / size). The pixel at column i, row j is field_pixel(i, j, iw, ih, l);
+// the maths below is that function with the saturation pulled out of the loop
+// (every channel is linear in the saturation at a fixed hue and lightness).
+fn field_prepare(d: *mut Dlg, iw: usize, ih: usize, l: f64) -> bool {
+    if iw == 0 || ih == 0 {
+        return false
+    }
+    if (*d).fbuf != 0 as u64 && (*d).fw == iw && (*d).fh == ih && (*d).fl == l {
+        return true
+    }
+    let need: usize = iw * ih * 4
+    if need > (*d).fcap {
+        if (*d).fbuf != 0 as u64 {
+            rt.heap_free((*d).fbuf, (*d).fcap)
+        }
+        (*d).fbuf = rt.heap_alloc(need)
+        (*d).fcap = need
+        if (*d).fbuf == 0 as u64 {
+            (*d).fcap = 0
+            return false
+        }
+    }
+    let ll: f64 = clamp01(l)
+    // the fully saturated colour of every column, in 0..1 channels
+    let cmax: f64 = 1.0 - fabs(2.0 * ll - 1.0)
+    let m: f64 = ll - cmax / 2.0
+    let cols: u64 = rt.heap_alloc(iw * 24)
+    if cols == 0 as u64 {
+        return false
+    }
+    var i: usize = 0
+    while i < iw {
+        let hp: f64 = wrap_hue(hue_at(i as i64, iw as i64)) / 60.0
+        let sec: i64 = hp as i64
+        let f: f64 = hp - (sec as f64)
+        var x: f64 = cmax * f
+        if sec == 1 as i64 || sec == 3 as i64 || sec == 5 as i64 {
+            x = cmax * (1.0 - f)
+        }
+        var r: f64 = 0.0
+        var g: f64 = 0.0
+        var b: f64 = 0.0
+        if sec == 0 as i64 {
+            r = cmax
+            g = x
+        } else if sec == 1 as i64 {
+            r = x
+            g = cmax
+        } else if sec == 2 as i64 {
+            g = cmax
+            b = x
+        } else if sec == 3 as i64 {
+            g = x
+            b = cmax
+        } else if sec == 4 as i64 {
+            r = x
+            b = cmax
+        } else {
+            r = cmax
+            b = x
+        }
+        *((cols + (i * 24) as u64) as *mut f64) = r + m
+        *((cols + (i * 24 + 8) as u64) as *mut f64) = g + m
+        *((cols + (i * 24 + 16) as u64) as *mut f64) = b + m
+        i = i + 1
+    }
+    var j: usize = 0
+    while j < ih {
+        let s: f64 = sat_at(j as i64, ih as i64)
+        let row: u64 = (*d).fbuf + (j * iw * 4) as u64
+        var k: usize = 0
+        while k < iw {
+            let r1: f64 = *((cols + (k * 24) as u64) as *mut f64)
+            let g1: f64 = *((cols + (k * 24 + 8) as u64) as *mut f64)
+            let b1: f64 = *((cols + (k * 24 + 16) as u64) as *mut f64)
+            // channel = grey + s * (full - grey)
+            let rr: u32 = to_byte(ll + s * (r1 - ll))
+            let gg: u32 = to_byte(ll + s * (g1 - ll))
+            let bb: u32 = to_byte(ll + s * (b1 - ll))
+            *((row + (k * 4) as u64) as *mut u32) = rr | (gg << 8) | (bb << 16) | 4278190080 as u32
+            k = k + 1
+        }
+        j = j + 1
+    }
+    rt.heap_free(cols, iw * 24)
+    (*d).fw = iw
+    (*d).fh = ih
+    (*d).fl = l
+    (*d).renders = (*d).renders + 1 as u64
+    return true
+}
+
+// The buffer onto the canvas at whole pixel (x0, y0): row by row straight into
+// the canvas bytes when the clip lets all of it through and no GPU is behind
+// the canvas; else pixel by pixel through the canvas' own blend.
+fn blit_field(z: *mut painter.Painter, d: *mut Dlg, x0: i64, y0: i64) {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    let iw: usize = (*d).fw
+    let ih: usize = (*d).fh
+    if x0 < 0 as i64 || y0 < 0 as i64 {
+        return
+    }
+    let cw: usize = canvas.canvas_width(cv)
+    let chh: usize = canvas.canvas_height(cv)
+    if (x0 as usize) + iw > cw || (y0 as usize) + ih > chh {
+        return
+    }
+    let g: *mut gpu.Gpu = gpu.gpu_of(cv)
+    var fast: bool = g as u64 == 0 as u64
+    if fast {
+        let fx0: f64 = x0 as f64
+        let fy0: f64 = y0 as f64
+        let fx1: f64 = (x0 as usize + iw) as f64
+        let fy1: f64 = (y0 as usize + ih) as f64
+        if canvas.clip_x0(cv) > fx0 || canvas.clip_y0(cv) > fy0
+        || canvas.clip_x1(cv) < fx1 || canvas.clip_y1(cv) < fy1 {
+            fast = false
+        } else if canvas.clip_factor(cv, x0 as usize, y0 as usize) < 1.0
+        || canvas.clip_factor(cv, x0 as usize + iw - 1, y0 as usize) < 1.0
+        || canvas.clip_factor(cv, x0 as usize, y0 as usize + ih - 1) < 1.0
+        || canvas.clip_factor(cv, x0 as usize + iw - 1, y0 as usize + ih - 1) < 1.0
+        || canvas.clip_factor(cv, x0 as usize + iw / 2, y0 as usize + ih / 2) < 1.0 {
+            fast = false
+        }
+    }
+    var j: usize = 0
+    if fast {
+        let base: u64 = canvas.canvas_pixels(cv) as u64
+        while j < ih {
+            let dst: u64 = base + ((((y0 as usize) + j) * cw + (x0 as usize)) * 4) as u64
+            rt.mem_copy(dst, (*d).fbuf + (j * iw * 4) as u64, iw * 4)
+            j = j + 1
+        }
+        return
+    }
+    while j < ih {
+        var i: usize = 0
+        while i < iw {
+            let v: u32 = *(((*d).fbuf + ((j * iw + i) * 4) as u64) as *mut u32)
+            // the buffer holds r g b a bytes; the colour wants 0xAARRGGBB
+            let col: u32 = 4278190080 as u32 | ((v & 255 as u32) << 16) | (v & 65280 as u32)
+            | ((v >> 16) & 255 as u32)
+            if g as u64 != 0 as u64 {
+                painter.surface(z, (x0 as f64) + (i as f64), (y0 as f64) + (j as f64), 1.0, 1.0, col)
+            } else {
+                canvas.canvas_blend(cv, (x0 as usize) + i, (y0 as usize) + j, col, 1.0)
+            }
+            i = i + 1
+        }
+        j = j + 1
+    }
+}
+
+// The cross-hair: four arms with a gap in the middle, each outlined in the page
+// colour so it shows on every colour of the field.
+fn draw_cross(z: *mut painter.Painter, c: *mut render.Ctx, cx: f64, cy: f64,
+    clip: Geom) {
+    let ink: u32 = token(c, style.TOK_TEXT)
+    let halo: u32 = token(c, style.TOK_BASE)
+    let gap: f64 = render.len_of(c, 3)
+    let arm: f64 = render.len_of(c, 9)
+    let t: f64 = render.len_of(c, 2)
+    var pass: usize = 0
+    while pass < 2 {
+        var col: u32 = halo
+        var e: f64 = 1.0
+        if pass == 1 {
+            col = ink
+            e = 0.0
+        }
+        // left, right, up, down
+        cross_arm(z, cx - gap - arm - e, cy - t / 2.0 - e, arm + e, t + 2.0 * e, col, clip)
+        cross_arm(z, cx + gap, cy - t / 2.0 - e, arm + e, t + 2.0 * e, col, clip)
+        cross_arm(z, cx - t / 2.0 - e, cy - gap - arm - e, t + 2.0 * e, arm + e, col, clip)
+        cross_arm(z, cx - t / 2.0 - e, cy + gap, t + 2.0 * e, arm + e, col, clip)
+        pass = pass + 1
+    }
+}
+
+// A rectangle cut to the picture (the cross-hair may sit at the rim).
+fn cross_arm(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64, col: u32, clip: Geom) {
+    var x0: f64 = round_px(x)
+    var y0: f64 = round_px(y)
+    var x1: f64 = round_px(x + w)
+    var y1: f64 = round_px(y + h)
+    if x0 < clip.x { x0 = clip.x }
+    if y0 < clip.y { y0 = clip.y }
+    if x1 > clip.x + clip.w { x1 = clip.x + clip.w }
+    if y1 > clip.y + clip.h { y1 = clip.y + clip.h }
+    if x1 > x0 && y1 > y0 {
+        painter.surface(z, x0, y0, x1 - x0, y1 - y0, col)
+    }
+}
+
+// The frame of a field / bar: page colour, a 1 point border (accent when the
+// mouse is on it or it is dragged).
+fn draw_frame(z: *mut painter.Painter, c: *mut render.Ctx, e: *mut widget.Widget,
+    g: Geom, hot: bool) {
+    painter.surface(z, widget.w_x(e), widget.w_y(e), widget.w_w(e), widget.w_h(e),
+        token(c, style.TOK_BASE))
+    var bc: u32 = token(c, style.TOK_BORDER)
+    if hot {
+        bc = token(c, style.TOK_ACCENT)
+    }
+    let bw: f64 = render.len_of(c, 1)
+    painter.surface(z, g.x - bw, g.y - bw, g.w + 2.0 * bw, g.h + 2.0 * bw, bc)
+}
+
+fn draw_field(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let g: Geom = field_geom(render.ctx_theme(c), widget.w_x(e), widget.w_y(e),
+        widget.w_w(e), widget.w_h(e))
+    draw_frame(z, c, e, g, widget.w_is_hover(e) || (*d).drag == DRAG_FIELD)
+    if g.w >= 2.0 && g.h >= 2.0 && field_prepare(d, g.w as usize, g.h as usize, (*d).l) {
+        blit_field(z, d, g.x as i64, g.y as i64)
+    }
+    let cx: f64 = g.x + (*d).h / 360.0 * g.w
+    var cy: f64 = g.y + (1.0 - (*d).s) * (g.h - 1.0)
+    draw_cross(z, c, round_px(cx - 0.5) + 0.5, round_px(cy - 0.5) + 0.5, g)
+    render.draw_focus_ring(c, e)
+}
+
+fn draw_bar(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let g: Geom = bar_geom(render.ctx_theme(c), widget.w_x(e), widget.w_y(e),
+        widget.w_w(e), widget.w_h(e))
+    draw_frame(z, c, e, g, widget.w_is_hover(e) || (*d).drag == DRAG_BAR)
+    // white at the top over the pure colour to black at the bottom, one row of
+    // pixels per step
+    let ih: i64 = g.h as i64
+    var j: i64 = 0
+    while j < ih {
+        let col: u32 = opaque(hsl_to_rgb((*d).h, (*d).s, lum_at(j, ih)))
+        painter.surface(z, g.x, g.y + (j as f64), g.w, 1.0, col)
+        j = j + 1
+    }
+    // the thumb: a bar across, outlined in the page colour
+    let ty: f64 = g.y + (1.0 - (*d).l) * (g.h - 1.0)
+    let t: f64 = render.len_of(c, 3)
+    var y0: f64 = round_px(ty + 0.5 - t / 2.0)
+    var y1: f64 = y0 + t
+    if y0 < g.y { y0 = g.y }
+    if y1 > g.y + g.h { y1 = g.y + g.h }
+    var oy0: f64 = y0 - 1.0
+    var oy1: f64 = y1 + 1.0
+    if oy0 < g.y { oy0 = g.y }
+    if oy1 > g.y + g.h { oy1 = g.y + g.h }
+    painter.surface(z, g.x, oy0, g.w, oy1 - oy0, token(c, style.TOK_BASE))
+    painter.surface(z, g.x, y0, g.w, y1 - y0, token(c, style.TOK_TEXT))
+    render.draw_focus_ring(c, e)
+}
+
+// A tick in a swatch of `cw` pixels at (x, y), as small squares along two lines.
+fn draw_tick(z: *mut painter.Painter, x: f64, y: f64, cw: f64, col: u32) {
+    let u: f64 = cw / 24.0
+    var t: f64 = 2.0 * u
+    if t < 2.0 {
+        t = 2.0
+    }
+    // down-right leg (6,12) -> (10,17), up-right leg (10,17) -> (18,7)
+    var k: i64 = 0
+    while k <= 10 {
+        let f: f64 = (k as f64) / 10.0
+        painter.surface(z, round_px(x + (6.0 + 4.0 * f) * u), round_px(y + (12.0 + 5.0 * f) * u), t, t, col)
+        painter.surface(z, round_px(x + (10.0 + 8.0 * f) * u), round_px(y + (17.0 - 10.0 * f) * u), t, t, col)
+        k = k + 1
+    }
+}
+
+// One swatch. `ring` 0 none, 1 hover, 2 cursor (keyboard), 3 chosen.
+fn draw_swatch(z: *mut painter.Painter, c: *mut render.Ctx, x: f64, y: f64, cw: f64,
+    rgb: i64, hover: bool, cursor: bool, chosen: bool) {
+    let r: f64 = render.len_of(c, 2)
+    let bw: f64 = render.len_of(c, 1)
+    if rgb < 0 as i64 {
+        // an empty custom slot: the field colour with a border
+        painter.round_rect(z, x, y, cw, cw, r, token(c, style.TOK_BORDER))
+        painter.round_rect(z, x + bw, y + bw, cw - 2.0 * bw, cw - 2.0 * bw, r,
+            token(c, style.TOK_FIELD))
+    } else {
+        painter.round_rect(z, x, y, cw, cw, r, token(c, style.TOK_BORDER))
+        painter.round_rect(z, x + bw, y + bw, cw - 2.0 * bw, cw - 2.0 * bw, r,
+            opaque(rgb as u32))
+    }
+    let rw: f64 = render.len_of(c, 2)
+    if chosen {
+        painter.round_ring(z, x - rw, y - rw, cw + 2.0 * rw, cw + 2.0 * rw, r + rw, rw,
+            token(c, style.TOK_TEXT))
+        if rgb >= 0 as i64 {
+            draw_tick(z, x, y, cw, on_content(rgb as u32))
+        }
+    } else if hover || cursor {
+        painter.round_ring(z, x - rw, y - rw, cw + 2.0 * rw, cw + 2.0 * rw, r + rw, rw,
+            token(c, style.TOK_ACCENT))
+    }
+}
+
+fn basic_geom(c: *mut render.Ctx, e: *mut widget.Widget) -> Geom {
+    let f: f64 = render.len_of(c, 4) / 4.0
+    var m: f64 = render.len_of(c, 3)
+    // leave room for the ring that sticks out of the outer swatches
+    return grid_geom(widget.w_x(e) + m, widget.w_y(e) + m, widget.w_w(e) - 2.0 * m,
+        widget.w_h(e) - 2.0 * m, BASIC_COLS, BASIC_ROWS, render.len_of(c, GAP_PT))
+}
+
+fn cust_geom(c: *mut render.Ctx, e: *mut widget.Widget) -> Geom {
+    let m: f64 = render.len_of(c, 3)
+    return grid_geom(widget.w_x(e) + m, widget.w_y(e) + m, widget.w_w(e) - 2.0 * m,
+        widget.w_h(e) - 2.0 * m, CUST_COLS, CUST_ROWS, render.len_of(c, GAP_PT))
+}
+
+// The chosen swatch of the basic grid: the cursor's one if it has the current
+// colour, else the first one that has it, else -1.
+fn basic_chosen(d: *mut Dlg) -> i64 {
+    if (*d).cur_b >= 0 as i64 && (*d).cur_b < 48 as i64
+    && BASIC[(*d).cur_b as usize] == (*d).rgb {
+        return (*d).cur_b
+    }
+    var i: usize = 0
+    while i < 48 {
+        if BASIC[i] == (*d).rgb {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn draw_basic(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    painter.surface(z, widget.w_x(e), widget.w_y(e), widget.w_w(e), widget.w_h(e),
+        token(c, style.TOK_BASE))
+    let g: Geom = basic_geom(c, e)
+    let chosen: i64 = basic_chosen(d)
+    let focus: bool = widget.w_is_focus(e)
+    let hot: bool = widget.w_is_hover(e)
+    var j: usize = 0
+    while j < BASIC_ROWS {
+        var i: usize = 0
+        while i < BASIC_COLS {
+            let k: usize = j * BASIC_COLS + i
+            draw_swatch(z, c, g.x + (i as f64) * g.h, g.y + (j as f64) * g.h, g.w,
+                BASIC[k] as i64, hot && (*d).hov_b == k as i64,
+                focus && (*d).cur_b == k as i64, chosen == k as i64)
+            i = i + 1
+        }
+        j = j + 1
+    }
+    render.draw_focus_ring(c, e)
+}
+
+fn draw_custom(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    painter.surface(z, widget.w_x(e), widget.w_y(e), widget.w_w(e), widget.w_h(e),
+        token(c, style.TOK_BASE))
+    let g: Geom = cust_geom(c, e)
+    let focus: bool = widget.w_is_focus(e)
+    let hot: bool = widget.w_is_hover(e)
+    var j: usize = 0
+    while j < CUST_ROWS {
+        var i: usize = 0
+        while i < CUST_COLS {
+            let k: usize = j * CUST_COLS + i
+            draw_swatch(z, c, g.x + (i as f64) * g.h, g.y + (j as f64) * g.h, g.w,
+                (*d).cust[k], hot && (*d).hov_c == k as i64,
+                focus && (*d).sel_c == k as i64,
+                (*d).sel_c == k as i64 && (*d).cust[k] >= 0 as i64
+                && (*d).cust[k] == (*d).rgb as i64)
+            i = i + 1
+        }
+        j = j + 1
+    }
+    render.draw_focus_ring(c, e)
+}
+
+// A label centred in a rectangle, in the colour that reads best on `bg`.
+fn draw_label_on(z: *mut painter.Painter, c: *mut render.Ctx, e: *mut widget.Widget,
+    s: str, x: f64, y: f64, w: f64, h: f64, bg: u32) {
+    let px: f64 = render.field_px(c, e)
+    var r: painter.TextRun = render.text_run_of(c, e, px)
+    let tw: f64 = painter.run_width(z, &r, s.p as u64, s.n)
+    let by: f64 = painter.text_baseline_mid(z, y, h, px)
+    let col: u32 = on_content(bg)
+    let x1: f64 = painter.run_draw(z, &r, x + (w - tw) / 2.0, by, 0.0, col, s.p as u64,
+        s.n, painter.TEXT_L)
+}
+
+fn draw_preview(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let d: *mut Dlg = ud as *mut Dlg
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    painter.surface(z, x, y, w, h, token(c, style.TOK_BASE))
+    let m: f64 = render.len_of(c, 1)
+    let half: f64 = round_px(w / 2.0)
+    painter.surface(z, x, y, w, h, token(c, style.TOK_BORDER))
+    painter.surface(z, x + m, y + m, half - m, h - 2.0 * m, opaque((*d).old))
+    painter.surface(z, x + half, y + m, w - half - m, h - 2.0 * m, opaque((*d).rgb))
+    if widget.w_is_hover(e) && (*d).hov_p == 0 as i64 {
+        painter.round_ring(z, x, y, half, h, 0.0, render.len_of(c, 2), token(c, style.TOK_ACCENT))
+    }
+    draw_label_on(z, c, e, tr_old(), x + m, y + m, half - m, h - 2.0 * m, opaque((*d).old))
+    draw_label_on(z, c, e, tr_new(), x + half, y + m, w - half - m, h - 2.0 * m, opaque((*d).rgb))
+}
+
+// ============================================================ KEEPING THE VIEWS IN STEP
+
+fn same(a: str, b: str) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    var i: usize = 0
+    while i < a.n {
+        if rt.ld8(a.p as u64, i) != rt.ld8(b.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The text field `k` shows for the current colour.
+fn field_text(d: *mut Dlg, k: usize, nb: *mut NameBuf) {
+    (*nb).n = 0
+    if k == F_HUE { nb_num(nb, int_hue(d)) }
+    if k == F_SAT { nb_num(nb, int_sat(d)) }
+    if k == F_LUM { nb_num(nb, int_lum(d)) }
+    if k == F_RED { nb_num(nb, (((*d).rgb >> 16) & 255 as u32) as i64) }
+    if k == F_GREEN { nb_num(nb, (((*d).rgb >> 8) & 255 as u32) as i64) }
+    if k == F_BLUE { nb_num(nb, ((*d).rgb & 255 as u32) as i64) }
+    if k == F_HEX { nb_hex(nb, (*d).rgb) }
+}
+
+fn set_name(a: *mut app.App, id: usize, nb: *mut NameBuf, role: u32) {
+    if id >= scene_count(a) {
+        return
+    }
+    a11y.a11y_set_name(app.ax(a), id, (&(*nb).b[0]) as u64, (*nb).n)
+    a11y.a11y_set_role(app.ax(a), id, role)
+}
+
+fn scene_count(a: *mut app.App) -> usize {
+    return scene.scene_count(app.app_scene(a))
+}
+
+// Everything that shows the colour follows `d`: the seven fields (except the one
+// being typed in, `skip`), the accessible names and values, the host is told to
+// paint.
+fn refresh(a: *mut app.App, d: *mut Dlg, skip: usize) {
+    if skip == app.NONE {
+        (*d).edit_k = app.NONE
+    }
+    var k: usize = 0
+    while k < F_COUNT {
+        if k != skip && (*d).ent[k] != app.NONE {
+            app.set_invalid(a, (*d).ent[k], false)
+            field_text(d, k, &(*d).tmp)
+            if !same(app.text(a, (*d).ent[k]), nb_view(&(*d).tmp)) {
+                app.set_text(a, (*d).ent[k], nb_view(&(*d).tmp))
+            }
+        }
+        k = k + 1
+    }
+    let sc: *mut scene.Scene = app.app_scene(a)
+    if (*d).n_field != app.NONE {
+        (*d).nm_field.n = 0
+        nb_str(&(*d).nm_field, tr_name_hue())
+        nb_num(&(*d).nm_field, int_hue(d))
+        nb_str(&(*d).nm_field, tr_name_sat())
+        nb_num(&(*d).nm_field, int_sat(d))
+        set_name(a, (*d).n_field, &(*d).nm_field, a11y.ROLE_SLIDER)
+        widget.w_set_value(scene.node_widget(sc, (*d).n_field), ((*d).h / 360.0 * 1000.0) as i64)
+    }
+    if (*d).n_bar != app.NONE {
+        (*d).nm_bar.n = 0
+        nb_str(&(*d).nm_bar, tr_name_lum())
+        nb_num(&(*d).nm_bar, int_lum(d))
+        set_name(a, (*d).n_bar, &(*d).nm_bar, a11y.ROLE_SLIDER)
+        widget.w_set_value(scene.node_widget(sc, (*d).n_bar), ((*d).l * 1000.0) as i64)
+    }
+    if (*d).n_basic != app.NONE {
+        (*d).nm_basic.n = 0
+        nb_str(&(*d).nm_basic, tr_name_basic())
+        let ch: i64 = basic_chosen(d)
+        if ch >= 0 as i64 {
+            nb_hex(&(*d).nm_basic, BASIC[ch as usize])
+        } else {
+            nb_str(&(*d).nm_basic, tr_name_none())
+        }
+        set_name(a, (*d).n_basic, &(*d).nm_basic, a11y.ROLE_LIST)
+    }
+    if (*d).n_cust != app.NONE {
+        (*d).nm_cust.n = 0
+        nb_str(&(*d).nm_cust, tr_name_custom())
+        if (*d).sel_c >= 0 as i64 {
+            nb_str(&(*d).nm_cust, tr_name_slot())
+            nb_num(&(*d).nm_cust, (*d).sel_c + 1)
+            nb_str(&(*d).nm_cust, tr_name_of())
+        } else {
+            nb_num(&(*d).nm_cust, free_slots(d))
+            nb_str(&(*d).nm_cust, tr_name_free())
+        }
+        set_name(a, (*d).n_cust, &(*d).nm_cust, a11y.ROLE_LIST)
+    }
+    if (*d).n_prev != app.NONE {
+        (*d).nm_prev.n = 0
+        nb_str(&(*d).nm_prev, tr_name_old())
+        nb_hex(&(*d).nm_prev, (*d).old)
+        nb_str(&(*d).nm_prev, tr_name_new())
+        nb_hex(&(*d).nm_prev, (*d).rgb)
+        set_name(a, (*d).n_prev, &(*d).nm_prev, a11y.ROLE_IMAGE)
+    }
+    fuiwirt.host_touch(app.app_host(a))
+}
+
+// dialogs of a program that embeds this one: set the colour from outside.
+fn dlg_set_rgb(a: *mut app.App, d: *mut Dlg, rgb: u32) {
+    sync_from_rgb(d, rgb)
+    refresh(a, d, app.NONE)
+}
+
+// ============================================================ THE INPUT
+
+fn data_of(a: *mut app.App) -> *mut Dlg {
+    return app.data(a) as *mut Dlg
+}
+
+// An unsigned number from a field's text; -1 when it is empty or has anything
+// else than digits (a half typed value changes nothing).
+fn parse_uint(s: str) -> i64 {
+    var i: usize = 0
+    var n: usize = s.n
+    while i < n && rt.ld8(s.p as u64, i) == 32 as u8 {
+        i = i + 1
+    }
+    while n > i && rt.ld8(s.p as u64, n - 1) == 32 as u8 {
+        n = n - 1
+    }
+    if i >= n || n - i > 9 {
+        if n - i > 9 {
+            return 999999999 as i64
+        }
+        return 0 - 1
+    }
+    var v: i64 = 0
+    while i < n {
+        let c: u8 = rt.ld8(s.p as u64, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return 0 - 1
+        }
+        v = v * 10 + (c - 48 as u8) as i64
+        i = i + 1
+    }
+    return v
+}
+
+fn field_max(k: usize) -> i64 {
+    if k == F_HUE { return 359 as i64 }
+    if k == F_SAT || k == F_LUM { return 100 as i64 }
+    return 255 as i64
+}
+
+// The number field `k` shows for the colour now.
+fn field_int(d: *mut Dlg, k: usize) -> i64 {
+    if k == F_HUE { return int_hue(d) }
+    if k == F_SAT { return int_sat(d) }
+    if k == F_LUM { return int_lum(d) }
+    if k == F_RED { return (((*d).rgb >> 16) & 255 as u32) as i64 }
+    if k == F_GREEN { return (((*d).rgb >> 8) & 255 as u32) as i64 }
+    return ((*d).rgb & 255 as u32) as i64
+}
+
+// A number field takes the integer `v` (already clamped). Same number as shown
+// = nothing happens (the colour is not rounded by looking at it).
+fn apply_number(d: *mut Dlg, k: usize, v: i64) {
+    if v == field_int(d, k) {
+        return
+    }
+    if k == F_HUE {
+        set_hsl(d, v as f64, (*d).s, (*d).l)
+    } else if k == F_SAT {
+        set_hsl(d, (*d).h, (v as f64) / 100.0, (*d).l)
+    } else if k == F_LUM {
+        set_hsl(d, (*d).h, (*d).s, (v as f64) / 100.0)
+    } else {
+        var r: u32 = ((*d).rgb >> 16) & 255 as u32
+        var g: u32 = ((*d).rgb >> 8) & 255 as u32
+        var b: u32 = (*d).rgb & 255 as u32
+        if k == F_RED { r = v as u32 }
+        if k == F_GREEN { g = v as u32 }
+        if k == F_BLUE { b = v as u32 }
+        sync_typing(d, pack(r, g, b))
+    }
+}
+
+fn field_of_node(d: *mut Dlg, id: usize) -> usize {
+    var k: usize = 0
+    while k < F_COUNT {
+        if (*d).ent[k] == id {
+            return k
+        }
+        k = k + 1
+    }
+    return app.NONE
+}
+
+// A text field changed (typing, paste, cut): read it, update the rest.
+fn on_edit(a: *mut app.App, id: usize) {
+    let d: *mut Dlg = data_of(a)
+    let k: usize = field_of_node(d, id)
+    if k == app.NONE {
+        return
+    }
+    if (*d).edit_k != k {
+        (*d).edit_k = k
+        (*d).snap_h = (*d).h
+        (*d).snap_s = (*d).s
+    }
+    let t: str = app.text(a, id)
+    if k == F_HEX {
+        var rgb: u32 = 0 as u32
+        let good: bool = parse_hex(t, &rgb)
+        app.set_invalid(a, id, !good)
+        if good && rgb != (*d).rgb {
+            sync_typing(d, rgb)
+            refresh(a, d, k)
+        }
+        return
+    }
+    let v: i64 = parse_uint(t)
+    app.set_invalid(a, id, v < 0 as i64)
+    if v < 0 as i64 {
+        return
+    }
+    let mx: i64 = field_max(k)
+    if v > mx {
+        // 300 -> 255: the field shows what was taken
+        apply_number(d, k, mx)
+        refresh(a, d, app.NONE)
+        return
+    }
+    apply_number(d, k, v)
+    refresh(a, d, k)
+}
+
+// Pointer in the colour field / on the bar.
+fn pick_field(a: *mut app.App, d: *mut Dlg, px: f64, py: f64) {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let n: usize = (*d).n_field
+    let g: Geom = field_geom(app.app_theme(a), scene.node_x(sc, n), scene.node_y(sc, n),
+        scene.node_w(sc, n), scene.node_h(sc, n))
+    let iw: i64 = g.w as i64
+    let ih: i64 = g.h as i64
+    if iw < 1 as i64 || ih < 1 as i64 {
+        return
+    }
+    let i: i64 = clamp_i((px - g.x) as i64, 0 as i64, iw - 1)
+    var j: i64 = clamp_i((py - g.y) as i64, 0 as i64, ih - 1)
+    // a point above / left of the picture floors towards zero in the cast
+    var fi: i64 = i
+    if px < g.x { fi = 0 as i64 }
+    if py < g.y { j = 0 as i64 }
+    set_hsl(d, hue_at(fi, iw), sat_at(j, ih), (*d).l)
+    refresh(a, d, app.NONE)
+}
+
+fn pick_bar(a: *mut app.App, d: *mut Dlg, py: f64) {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let n: usize = (*d).n_bar
+    let g: Geom = bar_geom(app.app_theme(a), scene.node_x(sc, n), scene.node_y(sc, n),
+        scene.node_w(sc, n), scene.node_h(sc, n))
+    let ih: i64 = g.h as i64
+    if ih < 1 as i64 {
+        return
+    }
+    var j: i64 = clamp_i((py - g.y) as i64, 0 as i64, ih - 1)
+    if py < g.y { j = 0 as i64 }
+    set_hsl(d, (*d).h, (*d).s, lum_at(j, ih))
+    refresh(a, d, app.NONE)
+}
+
+fn pick_basic(a: *mut app.App, d: *mut Dlg, k: usize) {
+    (*d).cur_b = k as i64
+    sync_from_rgb(d, BASIC[k])
+    refresh(a, d, app.NONE)
+}
+
+fn pick_custom(a: *mut app.App, d: *mut Dlg, k: usize) {
+    if (*d).cust[k] >= 0 as i64 {
+        sync_from_rgb(d, (*d).cust[k] as u32)
+    }
+    (*d).sel_c = k as i64
+    refresh(a, d, app.NONE)
+}
+
+fn node_geom_basic(a: *mut app.App, d: *mut Dlg) -> Geom {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let n: usize = (*d).n_basic
+    let m: f64 = theme.theme_px(app.app_theme(a), 3) as f64
+    return grid_geom(scene.node_x(sc, n) + m, scene.node_y(sc, n) + m,
+        scene.node_w(sc, n) - 2.0 * m, scene.node_h(sc, n) - 2.0 * m, BASIC_COLS,
+        BASIC_ROWS, theme.theme_px(app.app_theme(a), GAP_PT) as f64)
+}
+
+fn node_geom_cust(a: *mut app.App, d: *mut Dlg) -> Geom {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let n: usize = (*d).n_cust
+    let m: f64 = theme.theme_px(app.app_theme(a), 3) as f64
+    return grid_geom(scene.node_x(sc, n) + m, scene.node_y(sc, n) + m,
+        scene.node_w(sc, n) - 2.0 * m, scene.node_h(sc, n) - 2.0 * m, CUST_COLS,
+        CUST_ROWS, theme.theme_px(app.app_theme(a), GAP_PT) as f64)
+}
+
+fn inside(sc: *mut scene.Scene, n: usize, x: f64, y: f64) -> bool {
+    return x >= scene.node_x(sc, n) && x < scene.node_x(sc, n) + scene.node_w(sc, n)
+    && y >= scene.node_y(sc, n) && y < scene.node_y(sc, n) + scene.node_h(sc, n)
+}
+
+// 0 = the left half (Old), 1 = the right half of the preview.
+fn preview_side(sc: *mut scene.Scene, n: usize, x: f64) -> i64 {
+    if x < scene.node_x(sc, n) + scene.node_w(sc, n) / 2.0 {
+        return 0 as i64
+    }
+    return 1 as i64
+}
+
+// The raw pointer (app.on_pointer): a press starts what the node under it
+// does, moves go on with a drag wherever the pointer is (the value clamps at
+// the rim), a release ends it. The same moves update the hover of the swatches.
+fn on_pointer(a: *mut app.App, kind: u32, x: f64, y: f64) -> bool {
+    let d: *mut Dlg = data_of(a)
+    let sc: *mut scene.Scene = app.app_scene(a)
+    if kind == fuiwirt.HOOK_DOWN {
+        let n: usize = scene.scene_hit(sc, x, y)
+        if n == app.NONE || n >= scene.scene_count(sc) {
+            return false
+        }
+        if n == (*d).n_field {
+            (*d).drag = DRAG_FIELD
+            pick_field(a, d, x, y)
+            return true
+        }
+        if n == (*d).n_bar {
+            (*d).drag = DRAG_BAR
+            pick_bar(a, d, y)
+            return true
+        }
+        if n == (*d).n_basic {
+            let i: i64 = grid_hit(node_geom_basic(a, d), BASIC_COLS, BASIC_ROWS, x, y)
+            if i >= 0 as i64 {
+                pick_basic(a, d, i as usize)
+            }
+            return true
+        }
+        if n == (*d).n_cust {
+            let i: i64 = grid_hit(node_geom_cust(a, d), CUST_COLS, CUST_ROWS, x, y)
+            if i >= 0 as i64 {
+                pick_custom(a, d, i as usize)
+            }
+            return true
+        }
+        if n == (*d).n_prev {
+            if preview_side(sc, n, x) == 0 as i64 {
+                sync_from_rgb(d, (*d).old)
+                refresh(a, d, app.NONE)
+            }
+            return true
+        }
+        return false
+    }
+    if kind == fuiwirt.HOOK_UP {
+        if (*d).drag != DRAG_NONE {
+            (*d).drag = DRAG_NONE
+            return true
+        }
+        return false
+    }
+    if kind == fuiwirt.HOOK_MOVE {
+        if (*d).drag == DRAG_FIELD {
+            pick_field(a, d, x, y)
+            return true
+        }
+        if (*d).drag == DRAG_BAR {
+            pick_bar(a, d, y)
+            return true
+        }
+    }
+    // hover: the swatch under the pointer (none when it left)
+    var hb: i64 = 0 - 1
+    var hc: i64 = 0 - 1
+    var hp: i64 = 0 - 1
+    if kind == fuiwirt.HOOK_MOVE {
+        if inside(sc, (*d).n_basic, x, y) {
+            hb = grid_hit(node_geom_basic(a, d), BASIC_COLS, BASIC_ROWS, x, y)
+        }
+        if inside(sc, (*d).n_cust, x, y) {
+            hc = grid_hit(node_geom_cust(a, d), CUST_COLS, CUST_ROWS, x, y)
+        }
+        if inside(sc, (*d).n_prev, x, y) {
+            hp = preview_side(sc, (*d).n_prev, x)
+        }
+    }
+    if hb != (*d).hov_b || hc != (*d).hov_c || hp != (*d).hov_p {
+        (*d).hov_b = hb
+        (*d).hov_c = hc
+        (*d).hov_p = hp
+        return true
+    }
+    return false
+}
+
+// ---- the keyboard
+
+fn step_of(mods: u32) -> i64 {
+    if (mods & editor.MOD_SHIFT) != 0 as u32 {
+        return 10 as i64
+    }
+    return 1 as i64
+}
+
+fn grid_step(key: u32, cols: i64, cur: i64, count: i64) -> i64 {
+    var t: i64 = cur
+    if key == editor.KEY_LEFT { t = cur - 1 }
+    if key == editor.KEY_RIGHT { t = cur + 1 }
+    if key == editor.KEY_UP { t = cur - cols }
+    if key == editor.KEY_DOWN { t = cur + cols }
+    if key == editor.KEY_HOME { t = 0 as i64 }
+    if key == editor.KEY_END { t = count - 1 }
+    return clamp_i(t, 0 as i64, count - 1)
+}
+
+fn is_arrow(key: u32) -> bool {
+    return key == editor.KEY_LEFT || key == editor.KEY_RIGHT || key == editor.KEY_UP
+    || key == editor.KEY_DOWN || key == editor.KEY_HOME || key == editor.KEY_END
+}
+
+// Every key, BEFORE the focused text field (app.on_key). true = taken.
+fn on_key(a: *mut app.App, key: u32, mods: u32) -> bool {
+    let d: *mut Dlg = data_of(a)
+    let f: usize = app.focus(a)
+    if key == editor.KEY_ESC {
+        (*d).done = 1
+        app.quit(a)
+        return true
+    }
+    if key == editor.KEY_ENTER {
+        // Enter on a button presses that button (the host does it)
+        if f == (*d).b_add || f == (*d).b_ok || f == (*d).b_cancel {
+            return false
+        }
+        (*d).done = 0
+        app.quit(a)
+        return true
+    }
+    if f == app.NONE {
+        return false
+    }
+    let st: i64 = step_of(mods)
+    if f == (*d).n_basic && is_arrow(key) {
+        pick_basic(a, d, grid_step(key, BASIC_COLS as i64, basic_cursor(d), 48) as usize)
+        return true
+    }
+    if f == (*d).n_cust && is_arrow(key) {
+        var cur: i64 = (*d).sel_c
+        if cur < 0 as i64 {
+            cur = 0 as i64
+            pick_custom(a, d, 0)
+            return true
+        }
+        pick_custom(a, d, grid_step(key, CUST_COLS as i64, cur, 16) as usize)
+        return true
+    }
+    if f == (*d).n_field && is_arrow(key) {
+        var h: f64 = (*d).h
+        var s: f64 = (*d).s
+        if key == editor.KEY_LEFT { h = h - (st as f64) }
+        if key == editor.KEY_RIGHT { h = h + (st as f64) }
+        if key == editor.KEY_UP { s = s + (st as f64) / 100.0 }
+        if key == editor.KEY_DOWN { s = s - (st as f64) / 100.0 }
+        if key == editor.KEY_HOME { h = 0.0 }
+        if key == editor.KEY_END { h = 359.999 }
+        set_hsl(d, h, s, (*d).l)
+        refresh(a, d, app.NONE)
+        return true
+    }
+    if f == (*d).n_bar && is_arrow(key) {
+        var l: f64 = (*d).l
+        if key == editor.KEY_UP { l = l + (st as f64) / 100.0 }
+        if key == editor.KEY_DOWN { l = l - (st as f64) / 100.0 }
+        if key == editor.KEY_HOME { l = 1.0 }
+        if key == editor.KEY_END { l = 0.0 }
+        set_hsl(d, (*d).h, (*d).s, l)
+        refresh(a, d, app.NONE)
+        return true
+    }
+    // Up / Down in a number field: +-1 (Shift +-10)
+    if key == editor.KEY_UP || key == editor.KEY_DOWN {
+        let k: usize = field_of_node(d, f)
+        if k != app.NONE && k != F_HEX {
+            var v: i64 = field_int(d, k)
+            if key == editor.KEY_UP {
+                v = v + st
+            } else {
+                v = v - st
+            }
+            apply_number(d, k, clamp_i(v, 0 as i64, field_max(k)))
+            refresh(a, d, app.NONE)
+            return true
+        }
+    }
+    return false
+}
+
+fn basic_cursor(d: *mut Dlg) -> i64 {
+    let ch: i64 = basic_chosen(d)
+    if ch >= 0 as i64 {
+        return ch
+    }
+    return clamp_i((*d).cur_b, 0 as i64, 47 as i64)
+}
+
+// ---- the buttons
+
+fn cb_add(a: *mut app.App) {
+    let d: *mut Dlg = data_of(a)
+    add_custom(d)
+    refresh(a, d, app.NONE)
+}
+
+fn cb_ok(a: *mut app.App) {
+    (*data_of(a)).done = 0
+    app.quit(a)
+}
+
+fn cb_cancel(a: *mut app.App) {
+    (*data_of(a)).done = 1
+    app.quit(a)
+}
+
+// ============================================================ BUILDING THE WINDOW
+
+// One labelled number field: the label above the field.
+fn field_cell(a: *mut app.App, d: *mut Dlg, k: usize, w: usize) {
+    app.column(a)
+    let l: usize = app.label(a, label_of(k), 0)
+    let id: usize = app.entry(a, label_of(k))
+    app.set_width(a, id, w)
+    (*d).ent[k] = id
+    app.end(a)
+}
+
+// Builds the dialog into the window `a` (any size from about 600 x 460 on).
+// `d` is its state (dlg_new); it stays valid for the life of the window.
+fn build(a: *mut app.App, d: *mut Dlg) {
+    app.set_data(a, d as u64)
+    app.on_key(a, on_key)
+    app.on_edit(a, on_edit)
+    app.on_pointer(a, on_pointer)
+    app.row(a)
+    // ---- left: the swatches
+    app.column(a)
+    app.label(a, tr_basic(), 0)
+    (*d).n_basic = app.custom(a, widget.KIND_TILE, 8 * CELL_PT + 7 * GAP_PT + 6, 6 * CELL_PT + 5 * GAP_PT + 6)
+    app.label(a, tr_custom(), 0)
+    (*d).n_cust = app.custom(a, widget.KIND_TILE, 8 * CELL_PT + 7 * GAP_PT + 6, 2 * CELL_PT + GAP_PT + 6)
+    (*d).b_add = app.button(a, tr_add(), cb_add)
+    app.end(a)
+    // ---- right: field, bar, preview, fields
+    app.column(a)
+    app.row(a)
+    (*d).n_field = app.custom(a, widget.KIND_TILE, FIELD_W, FIELD_H)
+    (*d).n_bar = app.custom(a, widget.KIND_TILE, BAR_W, FIELD_H)
+    app.end(a)
+    (*d).n_prev = app.custom(a, widget.KIND_BADGE, FIELD_W + BAR_W + 10, PREV_H)
+    app.row(a)
+    field_cell(a, d, F_HUE, 84)
+    field_cell(a, d, F_SAT, 84)
+    field_cell(a, d, F_LUM, 84)
+    app.end(a)
+    app.row(a)
+    field_cell(a, d, F_RED, 84)
+    field_cell(a, d, F_GREEN, 84)
+    field_cell(a, d, F_BLUE, 84)
+    app.end(a)
+    // ---- the last row: the hex field and the buttons
+    app.row(a)
+    field_cell(a, d, F_HEX, 108)
+    app.spacer(a, 24, 4)
+    (*d).b_ok = app.button(a, tr_ok(), cb_ok)
+    (*d).b_cancel = app.button(a, tr_cancel(), cb_cancel)
+    app.end(a)
+    app.end(a)
+    app.end(a)
+    let sc: *mut scene.Scene = app.app_scene(a)
+    scene.node_set_draw(sc, (*d).n_field, d as u64, draw_field)
+    scene.node_set_draw(sc, (*d).n_bar, d as u64, draw_bar)
+    scene.node_set_draw(sc, (*d).n_basic, d as u64, draw_basic)
+    scene.node_set_draw(sc, (*d).n_cust, d as u64, draw_custom)
+    scene.node_set_draw(sc, (*d).n_prev, d as u64, draw_preview)
+    refresh(a, d, app.NONE)
+}
+
+// ============================================================ THE ENTRY POINT
+
+// 0 = chosen (`out` = 0xRRGGBB), 1 = cancelled / window closed, 12 = no window.
+fn run(title: str, initial: u32, out: *mut u32) -> i32 {
+    let a: *mut app.App = app.window(title, WIN_W, WIN_H)
+    if a as u64 == 0 as u64 {
+        return 12
+    }
+    let d: *mut Dlg = dlg_new(initial)
+    if d as u64 == 0 as u64 {
+        return 12
+    }
+    build(a, d)
+    let rc: i32 = app.run(a)
+    if rc != 0 {
+        return 12
+    }
+    if (*d).done == 0 {
+        *out = (*d).rgb
+        return 0
+    }
+    return 1
+}

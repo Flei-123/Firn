@@ -70,7 +70,7 @@ No, else `ANS_OK`.
 |---|---|---|
 | Windows | `comdlg32` (`GetOpenFileNameW`, `GetSaveFileNameW`, `ChooseColorW`, `ChooseFontW`), `SHBrowseForFolderW` (shell32, with a callback that selects the start folder), `MessageBoxW` (user32); bound in the compiler's import table (`compiler/src/win.rs`) | `lib/std/dialogos.windows.fi` |
 | Linux | the helpers of the desktop: `zenity` (GTK), `kdialog` (KDE); `kdialog` first in a KDE session, else `zenity`; without a display nothing is tried | `lib/std/dialogos.fi` |
-| Linux, OrientOS | no helper: the **dialog service** `dialogd` (below), a fUi program, started per request | `tools/dialogd/` (spike) |
+| Linux, OrientOS | no helper: the **dialog service** `dialogd` (below), a fUi program, started per request | `tools/dialogd/` |
 | browser | `alert` / `confirm` for `message` / `confirm` (synchronous); colour and files are asynchronous requests (`lib/plat/webdialog.fi`) and answer `NO_BACKEND` through `std.dialog` | `lib/@web/std/dialogos.fi` |
 | Android | the system pickers need an Activity result; not in this round: `NO_BACKEND` | `lib/@android/std/dialogos.fi` |
 
@@ -127,11 +127,42 @@ one connection per program and offers events as `poll` or as a callback (`dispat
 
 ## What fUi has and what this adds
 
-`lib/fui/wave3.fi` has the PICTURES of a dialog: `draw_dialog` (frame, title, buttons), `draw_filedialog` (frame + list +
-name field) and `draw_colorpicker` (saturation/value field + hue strip, `hsv_rgb`). They draw; none of them holds a state or
-reads an event, and there is no service. `dialogd` is built on `fui.app` (labels, buttons, a text field, a list) and adds
-what was missing: the state, the keyboard and mouse handling, and the request/answer protocol. If fUi grows interactive
-dialog widgets, `dialogd` moves to them -- agreed with the fUi project as its roadmap item r177.
+The dialogs are fUi building blocks (roadmap fUi r177, Firn r348); `dialogd` is only their protocol shell
+(`tools/dialogd/dialogd_main.fi`: parse the request line, call `run`, write the answer line). Any fUi program can call the
+same `run` functions without `dialogd`, or embed a dialog in its own window (`dlg_new_in` / `build`).
+
+| module | `run` | what it is |
+|---|---|---|
+| `lib/fui/msgdlg.fi` | `run(kind, title, text, buttons, answer)` | message / question box: four icons (info, question, warning, error; theme tokens), 360-560 wide and as high as the text, scrolling above 12 lines, default button in the accent colour (No for warning / error with Yes/No), Enter, Esc, Alt+Y/N/O/C, Ctrl+C copies the text, roles dialog / alertdialog |
+| `lib/fui/filedlg.fi`, `filemodel.fi` | `run(mode, title, dir, name, filters, out)` | open / open several / save / folder: breadcrumb and editable path (Ctrl+L, Tab completion), back / forward / up / refresh, places, new folder, columns Name / Size / Modified with sorting, filter menu, hidden files (Ctrl+H), type-to-find, multi-select, overwrite question inside the window, default extension from the filter; one virtualised list node (5000 entries) |
+| `lib/fui/colordlg.fi` | `run(title, initial, out)` | like Windows' colour dialog: 48 basic colours, 16 custom colours (stored in `~/.config/firn/dialog-colors.txt`), hue x saturation field with lightness bar (HSL), RGB / HSV / hex fields, old / new preview. The RGB value is the truth: OK without a change returns the start colour bit for bit |
+| `lib/fui/fontdlg.fi`, `fontscan.fi` | `run(title, family, size, out_family, out)` | family list (search), style list, size list + field, bold / italic / underline / strike, preview in the REAL font (TrueType loaded at run time, 3 kept in an LRU). `FUI_FONT_DIRS=a:b` overrides the scanned folders |
+
+All four: keyboard and mouse, hover / focus / disabled states from the theme tokens (light, dark and the four themes of
+`themelist`), accessibility names (audit: 0 unnamed), texts in one catalogue place (`tr_*`), frames <= 16 ms (table below).
+`lib/fui/wave3.fi` still has the PICTURES (`draw_dialog`, `draw_filedialog`, `draw_colorpicker`); the interactive modules paint
+their own parts, so those three remain for callers that only want a picture.
+
+Hooks added to `lib/fui/app.fi` for custom controls (additive): `custom`, `ax`, `set_width`, `set_invalid`, `on_key`, `on_edit`,
+`on_pointer` (colour dialog) and `set_keys`, `set_wheel`, `set_motion` (file dialog). The Linux host (`apphost.fi`) now forwards
+PageUp, PageDown and F5; a `textarea` therefore scrolls by pages with them. `lib/fui/painter.fi`: the synthetic italic leaned
+up instead of right (one line fixed). `lib/fui/a11y.fi`: roles dialog and alertdialog. `lib/fui/icons.fi`: `path_draw`.
+
+Frame time (CPU ms, `release-fast`, best of three runs, on a loaded server; limit 16 ms), as measured by the workers' acceptance
+runs `tools/dialog/*_run.sh`:
+
+| dialog | first frame | steady | hover | worst case | at 1240x720 (worst) |
+|---|---|---|---|---|---|
+| message (4000 characters) | 10.3 | 4.6 | 4.8 | 6.3 scroll | 6.9 |
+| file (5000 entries, PageDown) | 8.5 | 5.8 | 6.1 | 6.5 | 15.0 first / 9.8 |
+| colour (drag in the field) | 10.3 | 3.9 | 3.9 | 4.4 | 6.1 |
+| font (510 families) | 6.6 | 4.5 | 4.4 | 5.6 size change | 7.6 |
+
+Limits: Unix paths only (no Windows drive list); the file dialog's path field holds 255 bytes (`app.TEXT_CAP`); list rows are not
+single accessibility nodes (a virtualised list is one node with the role list); the font list shows the names in the system font,
+not each in its own; `.otf` (CFF) and `.ttc` fonts are listed but `lib/font/ttf.fi` cannot draw them (the preview falls back and
+says so); the warning icon is brown in the light theme because the `warning` token is; the Win32 / Android / Web hosts do not
+forward the new keys and hooks yet.
 
 ## The dialog service (`dialogd`)
 
@@ -152,10 +183,10 @@ message    <kind> <title> <text> <buttons>                    ->  ok <ans_ok|ans
 ```
 
 `std.dialog` starts `dialogd --stdio` for one request, writes the line to its standard input and reads the answer from its
-standard output. What `dialogd` does today: every message box; the file dialogs as a path field with the start directory
-listed under it (a click on a row copies its path; wrong paths are refused; saving over an existing file asks twice);
-the colour dialog as a hex field with a swatch and a Preview button. It has **no font chooser** (`failed`), no navigation
-inside the file dialog, no real colour picker (fUi's `draw_colorpicker` is the planned body). On OrientOS the same lines
+standard output. `dialogd` answers all seven requests with the modules above (the message box, the four file requests, the colour and the font
+dialog). Closing the window is a `cancel`; a dialog that cannot open a window (no display, no font) answers `failed`. The whole
+chain (std.dialog -> line -> dialogd -> dialog -> line -> std.dialog) is checked on a real X server by
+`tools/dialog/dialog_check.py`; each dialog's look and interaction by `tools/dialog/{msg,file,color,font}dlg_run.sh`. On OrientOS the same lines
 travel over the action bus as the actions `dialog.open_file`, `dialog.save_file`, `dialog.pick_folder`, `dialog.pick_color`,
 `dialog.pick_font`, `dialog.message` (level `write`, OrientOS `docs/ACTION-BUS.md`); a resident service answers many
 requests in order. That wiring is OrientOS-side work (roadmap there), not done here.

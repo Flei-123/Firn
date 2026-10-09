@@ -1331,4 +1331,14 @@ if [ "$1" = "--images" ]; then
 fi
 
 echo
+echo "== THE INTERACTIVE DIALOGS (roadmap r177, docs/DIALOG.md): message, colour, font, file =="
+# Each script builds its own in-memory test and live driver, runs the checks without a window, the
+# FRAME_MS limit (<= 16 ms) with release-fast, the accessibility audit, and the live test on a private
+# Xvfb (SKIP when Xvfb / xdotool / xwd / PIL are missing). Last lines: "... PASSED".
+for n in msgdlg colordlg fontdlg; do
+    bash "tools/dialog/${n}_run.sh"
+done
+bash tools/dialog/filedlg_run.sh all
+
+echo
 echo "ALL CHECKS PASSED."
