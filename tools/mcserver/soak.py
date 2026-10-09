@@ -13,7 +13,8 @@ Two things are measured, because they fail differently:
 
   * PINGS -- short connections. Each one is a thread that is created and has
     to be collected again. This is what found the bug of round 76: without
-    `reap()` the 64th connection got a closed socket, because
+    `reap()` the 64th connection got a closed socket (the thread table had
+    64 entries then, 1024 now), because
     `__thread_slot_new` only hands out entries that `thread_wait` has
     released.
   * LOGINS -- the whole handshake through to the world. Four buffers per

@@ -21,7 +21,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
-FIRNC=compiler/target/release/firnc
+FIRNC=${FIRNC:-compiler/target/release/firnc}
 SECS=${STRESS_SEK:-130}
 THREADS=${STRESS_THREADS:-4}
 LOCAL_LISTS=${STRESS_LOCAL:-0}

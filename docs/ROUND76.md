@@ -493,3 +493,16 @@ was fetched from `piston-data.mojang.com` (1.20.4 server, 49,150,256 octets),
 run with `online-mode=false` and `level-type=flat`, and its registry data and
 offline UUIDs were captured with the same harness. The four UUIDs it produced
 are pinned in `tests/1603_md5_uuid.fi`.
+
+---
+
+## Addendum (round T1, 2026-10-09): thread table of 1024
+
+The limit of 63 simultaneous threads described in 4.5 and in section 6
+(point 2) is gone: `THREAD_MAX` is 1024 (1023 workers), `thread_detach`
+returns entries without a `thread_wait`, and `thread_start` reports a full
+table as 0 with `thread_error()` = 1. Details and measurements:
+`docs/THREAD_TABLE.md`. `demos/mcserver` and `tools/net/echo.fi` now serve up
+to 1000 connections at the same time; counter-check A in
+`tools/mcserver/run.sh` expects the server without `reap()` to die at
+connection 1024. The numbers 63/64 in the text above describe round 76.

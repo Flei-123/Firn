@@ -1,0 +1,260 @@
+// expect_exit: 0
+// tests/2395_thread_table_many.fi -- the thread table holds more than 63
+// threads (it held 64 entries, the main thread one of them), a full table is
+// a clean 0, and a detached thread gives its entry back by itself.
+//
+// A  200 THREADS AT THE SAME TIME, each with a chain of GC cells on its own
+//    stack, all parked while the main thread forces collections: every chain
+//    has to be intact afterwards (the root scan reaches stacks of entries
+//    far beyond the old limit of 63).
+// B  THE TABLE RUNS FULL: threads are started until `thread_start` returns 0.
+//    That is exactly `thread_limit()` threads, the failure is a plain 0 with
+//    `thread_error()` = 1 (never a crash), it stays 0 on a second try, and
+//    after the join every entry can be handed out again.
+// C  DETACH: 3000 short threads that are never joined. Their entries are
+//    recycled; the counter ends at exactly 3000.
+// D  MISUSE does not hurt: handles that are 0, out of range, joined twice or
+//    detached return 0 / false and change nothing; `thread_wait` on a
+//    detached handle does not block.
+import std.rt
+
+gc class Cell {
+    next: Gc[Cell],
+    value: u64,
+}
+
+const F_SYS_MMAP: i64 = 9
+const F_PROT_RW: i64 = 3
+const F_MAP_ANON: i64 = 34
+
+fn page() -> u64 {
+    let r: i64 = syscall(F_SYS_MMAP, 0, 65536, F_PROT_RW, F_MAP_ANON, -1, 0)
+    if r < 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn ld(a: u64, o: u64) -> u64 {
+    return *((a + o) as *mut u64)
+}
+
+fn st(a: u64, o: u64, v: u64) {
+    *((a + o) as *mut u64) = v
+}
+
+// shared block (octet offsets)
+const Z_GATE_A: u64 = 0
+const Z_GATE_B: u64 = 8
+const Z_GATE_D: u64 = 16
+const Z_READY: u64 = 24
+const Z_DONE: u64 = 32
+
+const CHAIN: u64 = 20
+
+fn mk(i: u64, next: Gc[Cell]) -> AllocError!Gc[Cell] {
+    let c: Gc[Cell] = try gc Cell { next: next, value: i }
+    return c
+}
+
+// Parked = reported as blocked, so a collection does not wait for us.
+fn park(z: u64, gate: u64) {
+    while ld(z, gate) == 0 {
+        thread_sleep(1)
+    }
+}
+
+// A chain of CHAIN cells with the values k .. k + CHAIN - 1.
+fn chain_work(z: u64, k: u64) -> u64 {
+    var head: Gc[Cell] = gc_null[Cell]()
+    var i: u64 = 0
+    while i < CHAIN {
+        head = mk(k + i, head) catch gc_null[Cell]()
+        if head == gc_null[Cell]() {
+            return 0
+        }
+        i = i + 1
+    }
+    __atomic_add((z + Z_READY) as *mut u64, 1)
+    park(z, Z_GATE_A)
+    var sum: u64 = 0
+    var n: u64 = 0
+    var p: Gc[Cell] = head
+    while p != gc_null[Cell]() {
+        sum = sum + p.value
+        n = n + 1
+        p = p.next
+    }
+    if n != CHAIN || sum != CHAIN * k + CHAIN * (CHAIN - 1) / 2 {
+        return 0
+    }
+    return k * 3 + 1
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    let z: u64 = arg & 281474976710655
+    let k: u64 = arg >> 48
+    if kind == 1 {
+        return chain_work(z, k)
+    }
+    if kind == 2 {
+        __atomic_add((z + Z_READY) as *mut u64, 1)
+        park(z, Z_GATE_B)
+        return k + 7
+    }
+    if kind == 3 {
+        __atomic_add((z + Z_DONE) as *mut u64, 1)
+        return 0
+    }
+    if kind == 4 {
+        park(z, Z_GATE_D)
+        __atomic_add((z + Z_DONE) as *mut u64, 1)
+        return 0
+    }
+    return 0
+}
+
+fn wait_for(z: u64, off: u64, want: u64) -> bool {
+    var spins: u64 = 0
+    while ld(z, off) != want {
+        thread_sleep(2)
+        spins = spins + 1
+        if spins > 20000 {
+            return false
+        }
+    }
+    return true
+}
+
+fn main() -> i32 {
+    let z: u64 = page()
+    if z == 0 { return 1 as i32 }
+    if thread_limit() < 200 { return 2 as i32 }
+
+    // ---------------------------------------------------------------- A
+    var hs: [u64; 200] = [0; 200]
+    var k: u64 = 0
+    while k < 200 {
+        hs[k as usize] = thread_start(1, z | ((k + 1) << 48))
+        if hs[k as usize] == 0 { return 3 as i32 }
+        k = k + 1
+    }
+    if !wait_for(z, Z_READY, 200) { return 4 as i32 }
+    if thread_count() != 201 { return 5 as i32 }
+    let before: u64 = gc_collections()
+    var round: u64 = 0
+    while round < 4 {
+        gc_collect()
+        var g: u64 = 0
+        while g < 2000 {
+            mk(g, gc_null[Cell]()) catch gc_null[Cell]()
+            g = g + 1
+        }
+        round = round + 1
+    }
+    if gc_collections() < before + 4 { return 6 as i32 }
+    st(z, Z_GATE_A, 1)
+    var bad: u64 = 0
+    k = 0
+    while k < 200 {
+        let r: u64 = thread_wait(hs[k as usize])
+        if r != (k + 1) * 3 + 1 {
+            bad = bad + 1
+        }
+        k = k + 1
+    }
+    if bad != 0 { return 7 as i32 }
+    if thread_count() != 1 { return 8 as i32 }
+
+    // ---------------------------------------------------------------- B
+    thread_stack_set(65536)
+    st(z, Z_READY, 0)
+    var hb: [u64; 1100] = [0; 1100]
+    var started: u64 = 0
+    var last: u64 = 1
+    while last != 0 && started < 1100 {
+        last = thread_start(2, z | (started << 48))
+        if last != 0 {
+            hb[started as usize] = last
+            started = started + 1
+        }
+    }
+    if started != thread_limit() { return 9 as i32 }
+    if thread_error() != 1 { return 10 as i32 }
+    if thread_start(2, z) != 0 { return 11 as i32 }
+    if thread_error() != 1 { return 12 as i32 }
+    if !wait_for(z, Z_READY, started) { return 13 as i32 }
+    if thread_count() != started + 1 { return 14 as i32 }
+    gc_collect()
+    st(z, Z_GATE_B, 1)
+    var sum: u64 = 0
+    var expect: u64 = 0
+    k = 0
+    while k < started {
+        sum = sum + thread_wait(hb[k as usize])
+        expect = expect + k + 7
+        k = k + 1
+    }
+    if sum != expect { return 15 as i32 }
+    if thread_count() != 1 { return 16 as i32 }
+    // every entry can be handed out again
+    st(z, Z_GATE_B, 1)
+    let again: u64 = thread_start(2, z)
+    if again == 0 { return 17 as i32 }
+    if thread_error() != 0 { return 18 as i32 }
+    if thread_wait(again) != 7 { return 19 as i32 }
+
+    // ---------------------------------------------------------------- C
+    var total: u64 = 0
+    var tries: u64 = 0
+    while total < 3000 {
+        let h: u64 = thread_start(3, z)
+        if h == 0 {
+            if thread_error() != 1 { return 20 as i32 }
+            // table full of threads that have not ended yet: let them finish
+            thread_sleep(1)
+            tries = tries + 1
+            if tries > 200000 { return 21 as i32 }
+        } else {
+            if !thread_detach(h) { return 22 as i32 }
+            total = total + 1
+        }
+    }
+    if !wait_for(z, Z_DONE, 3000) { return 23 as i32 }
+    // the last ones may still be on their way out of the kernel
+    var left: u64 = 0
+    while thread_count() != 1 && left < 5000 {
+        thread_sleep(1)
+        left = left + 1
+    }
+    if thread_count() != 1 { return 24 as i32 }
+
+    // ---------------------------------------------------------------- D
+    if thread_wait(0) != 0 { return 25 as i32 }
+    if thread_wait(5000) != 0 { return 26 as i32 }
+    if thread_wait(thread_limit() + 1) != 0 { return 27 as i32 }
+    if thread_detach(0) { return 28 as i32 }
+    if thread_detach(5000) { return 29 as i32 }
+    let hj: u64 = thread_start(3, z)
+    if hj == 0 { return 30 as i32 }
+    thread_wait(hj)
+    // joined once: the entry is free, a second wait / detach changes nothing
+    if thread_wait(hj) != 0 { return 31 as i32 }
+    if thread_detach(hj) { return 32 as i32 }
+    // detached while still running: `thread_wait` does not block and returns 0
+    st(z, Z_DONE, 0)
+    let hp: u64 = thread_start(4, z)
+    if hp == 0 { return 33 as i32 }
+    if !thread_detach(hp) { return 34 as i32 }
+    if thread_detach(hp) { return 35 as i32 }
+    if thread_wait(hp) != 0 { return 36 as i32 }
+    st(z, Z_GATE_D, 1)
+    if !wait_for(z, Z_DONE, 1) { return 37 as i32 }
+    var left2: u64 = 0
+    while thread_count() != 1 && left2 < 5000 {
+        thread_sleep(1)
+        left2 = left2 + 1
+    }
+    if thread_count() != 1 { return 38 as i32 }
+    return 0
+}
