@@ -8,6 +8,14 @@
 //      clearing the `GcVec`: cleared. So the collection really holds
 //      strongly, and it really does not hold any longer.
 //   B  The same for the VALUE of a `GcMap`.
+//
+//      A and B use EIGHT objects each and promise "at most one is kept by
+//      accident". The stack scan is conservative, and one stale word -- the
+//      link to the next free block, left by an earlier allocation in a frame
+//      slot that nothing writes again -- can keep exactly one of them alive.
+//      On aarch64 with the register allocator it does (docs/ROUND-A64-
+//      REGALLOC.md, third finding); with a single object the test would
+//      then depend on the frame layout of the runtime.
 //   C  Finalizers on objects that a collection holds: they run exactly
 //      once, and only once the collection lets go of them.
 //   D  `GcMap` incrementally: move values between maps while
@@ -19,6 +27,10 @@ const T_PROT_RW: i64 = 3
 const T_MAP_ANON: i64 = 34
 const Z_COUNT: u64 = 0
 const Z_SUM: u64 = 8
+
+// A and B: eight objects each, of which at most one may be kept by accident.
+const N_OBJ: u64 = 8
+const MAX_KEPT: u64 = 1
 
 gc class Handle {
     next: Gc[Handle],
@@ -90,13 +102,28 @@ fn hang_vec(v: Gc[GcVec], b: Gc[Observer], z: u64, depth: u64) -> AllocError!boo
     return try gcvec_append[Handle](v, g)
 }
 
-fn hang_map(m: Gc[GcMap], b: Gc[Observer], z: u64, depth: u64) -> AllocError!bool {
+fn hang_map(m: Gc[GcMap], b: Gc[Observer], z: u64, key: u64, depth: u64) -> AllocError!bool {
     if depth > 0 {
-        return try hang_map(m, b, z, depth - 1)
+        return try hang_map(m, b, z, key, depth - 1)
     }
     let g: Gc[Handle] = try handle(z, 1)
     b.target = weak(g)
-    return try gcmap_set_value[Handle](m, 4711, g)
+    return try gcmap_set_value[Handle](m, key, g)
+}
+
+// How many of the observers in `obs` still see their object? (`lives` is
+// recursive on purpose, see below.)
+fn count_alive(obs: Gc[GcVec], n: u64) -> u64 {
+    var alive: u64 = 0
+    var i: u64 = 0
+    while i < n {
+        let b: Gc[Observer] = gcvec_read[Observer](obs, i)
+        if lives(b, 2) {
+            alive = alive + 1
+        }
+        i = i + 1
+    }
+    return alive
 }
 
 // RECURSIVE on purpose: a recursive function is never inlined
@@ -229,18 +256,27 @@ fn main() -> i32 {
     }
 
     // --- A: GcVec holds strongly, and only as long as it should ---------
-    let b1: Gc[Observer] = gc Observer { target: weak_null[Handle]() } catch gc_null[Observer]()
+    let obs_a: Gc[GcVec] = gcvec_new() catch gc_null[GcVec]()
     let v: Gc[GcVec] = gcvec_new() catch gc_null[GcVec]()
-    if (b1 as u64) == 0 || (v as u64) == 0 {
+    if (obs_a as u64) == 0 || (v as u64) == 0 {
         return 92
     }
-    let oa: bool = hang_vec(v, b1, z, 3) catch false
-    if !oa {
-        return 1
+    var ia: u64 = 0
+    while ia < N_OBJ {
+        let b1: Gc[Observer] = gc Observer { target: weak_null[Handle]() } catch gc_null[Observer]()
+        if (b1 as u64) == 0 {
+            return 92
+        }
+        let kept: bool = gcvec_append[Observer](obs_a, b1) catch false
+        let oa: bool = hang_vec(v, b1, z, 3) catch false
+        if !kept || !oa {
+            return 1
+        }
+        ia = ia + 1
     }
     scrub(3)
     gc_collect()
-    if !lives(b1, 2) {
+    if count_alive(obs_a, N_OBJ) != N_OBJ {
         return 2
     }
     gcvec_clear(v)
@@ -252,24 +288,40 @@ fn main() -> i32 {
     gc_stack_clean()
     gc_collect()
     gc_collect()
-    if lives(b1, 2) {
+    if count_alive(obs_a, N_OBJ) > MAX_KEPT {
         return 3
     }
 
     // --- B: the same for the value of a GcMap ---------------------------
-    let b2: Gc[Observer] = gc Observer { target: weak_null[Handle]() } catch gc_null[Observer]()
+    let obs_b: Gc[GcVec] = gcvec_new() catch gc_null[GcVec]()
     let mm: Gc[GcMap] = gcmap_new(false, true) catch gc_null[GcMap]()
-    let ob: bool = hang_map(mm, b2, z, 3) catch false
-    if !ob {
-        return 4
+    if (obs_b as u64) == 0 || (mm as u64) == 0 {
+        return 92
+    }
+    var ib: u64 = 0
+    while ib < N_OBJ {
+        let b2: Gc[Observer] = gc Observer { target: weak_null[Handle]() } catch gc_null[Observer]()
+        if (b2 as u64) == 0 {
+            return 92
+        }
+        let kept: bool = gcvec_append[Observer](obs_b, b2) catch false
+        let ob: bool = hang_map(mm, b2, z, 4711 + ib, 3) catch false
+        if !kept || !ob {
+            return 4
+        }
+        ib = ib + 1
     }
     scrub(3)
     gc_collect()
-    if !lives(b2, 2) {
+    if count_alive(obs_b, N_OBJ) != N_OBJ {
         return 5
     }
-    if !gcmap_remove(mm, 4711) {
-        return 6
+    ib = 0
+    while ib < N_OBJ {
+        if !gcmap_remove(mm, 4711 + ib) {
+            return 6
+        }
+        ib = ib + 1
     }
     scrub(3)
     // ROUND ANLEGEWEG: clean the dead stack before the assertion that
@@ -279,7 +331,7 @@ fn main() -> i32 {
     gc_stack_clean()
     gc_collect()
     gc_collect()
-    if lives(b2, 2) {
+    if count_alive(obs_b, N_OBJ) > MAX_KEPT {
         return 7
     }
 
