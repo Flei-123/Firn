@@ -14,6 +14,12 @@
 #      error (exit 1 or 5), never "not core" (3) and never a crash
 #   4. the hidden bindings of `let (a, b)` carry the same names in the two
 #      syntax trees (`--emit=ast-canon` against `bin/astdump.fi`)
+#   5. random programs full of tuples (tools/tuples/gen.py: tuples of every
+#      integer width, floats, bool, nested tuples and a struct as parameters
+#      and results, up to five elements, folded into one checksum) print the
+#      same number from firnc1, from firnc0 on all four build levels and from
+#      firnc0 for aarch64 under qemu -- a tuple passed or returned the wrong
+#      way (register class, alignment, the hidden result pointer) changes it
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -107,6 +113,40 @@ for src in tests/2410_tuple_basic.fi tests/2411_tuple_abi.fi tests/2412_tuple_dr
         fail=$((fail+1))
     fi
 done
+
+# random programs: the checksum has to be the same everywhere
+SEEDS=${TUPLE_FUZZ:-24}
+fz_bad=0
+for seed in $(seq 1 "$SEEDS"); do
+    python3 tools/tuples/gen.py "$seed" > "$WORK/fz.fi"
+    ref=""
+    for flags in "--opt-level=release-fast" "--no-opt" "--opt-level=dev-fast" "--opt-level=release-safe"; do
+        if ! "$FIRNC" $flags -o "$WORK/fz0" "$WORK/fz.fi" > "$WORK/fz.err" 2>&1; then
+            say "fuzz seed $seed [$flags]" "firnc0 FAILED"; head -3 "$WORK/fz.err"; fz_bad=$((fz_bad+1)); continue 2
+        fi
+        out=$("$WORK/fz0" 2>&1)
+        [ -z "$ref" ] && ref="$out"
+        if [ "$out" != "$ref" ]; then
+            say "fuzz seed $seed [$flags]" "DIFFERENT ($out against $ref)"; fz_bad=$((fz_bad+1))
+        fi
+    done
+    if ! "$FC1" "$WORK/fz.fi" -o "$WORK/fz1" > "$WORK/fz.err" 2>&1; then
+        say "fuzz seed $seed [firnc1]" "FAILED"; head -3 "$WORK/fz.err"; fz_bad=$((fz_bad+1)); continue
+    fi
+    out=$("$WORK/fz1" 2>&1)
+    [ "$out" != "$ref" ] && { say "fuzz seed $seed [firnc1]" "DIFFERENT ($out against $ref)"; fz_bad=$((fz_bad+1)); }
+    if command -v qemu-aarch64 > /dev/null 2>&1; then
+        if "$FIRNC" --target=aarch64-linux -o "$WORK/fza" "$WORK/fz.fi" > "$WORK/fz.err" 2>&1; then
+            out=$(qemu-aarch64 "$WORK/fza" 2>&1)
+            [ "$out" != "$ref" ] && { say "fuzz seed $seed [aarch64]" "DIFFERENT ($out against $ref)"; fz_bad=$((fz_bad+1)); }
+        else
+            say "fuzz seed $seed [aarch64]" "firnc0 FAILED"; head -3 "$WORK/fz.err"; fz_bad=$((fz_bad+1))
+        fi
+    fi
+done
+n=$((n+SEEDS))
+fail=$((fail+fz_bad))
+say "fuzz: $SEEDS random tuple programs (firnc1, 4 levels of firnc0, aarch64)" "$([ "$fz_bad" = 0 ] && echo OK || echo "$fz_bad DEVIATIONS")"
 
 echo "  tuples: $n checks through both compilers, $fail deviations"
 [ "$fail" -eq 0 ]
