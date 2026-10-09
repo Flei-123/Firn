@@ -172,10 +172,23 @@ pub(crate) struct Frame {
     saved_at: u64,
 }
 
+/// Marker in `Frame::slot`: this value has NO slot, it lives in a register
+/// or is rebuilt from an immediate (ROUND BILLIG, compact frames).
+const NO_SLOT: u64 = u64::MAX;
+
 impl Frame {
     /// Distance of a slot from `sp` (that is what an `ldr` gets to see).
     fn off(&self, v: Val) -> u64 {
-        self.size - self.slot[v as usize]
+        let s = self.slot[v as usize];
+        // A register resident value asked for its slot: a code path forgot to
+        // ask `fr.ra` first. Fail loudly -- reading the slot would hand out
+        // whatever an earlier call left there.
+        assert!(
+            s != NO_SLOT,
+            "internal error: value %{} lives in a register and has no frame slot",
+            v
+        );
+        self.size - s
     }
     fn alloca(&self, v: Val) -> Option<u64> {
         self.alloca_off[v as usize].map(|o| self.size - o)
@@ -184,9 +197,26 @@ impl Frame {
 
 fn layout(f: &Func) -> Frame {
     let n = f.val_types.len();
-    let mut slot = vec![0u64; n];
+    // ROUND BILLIG, COMPACT FRAMES. The allocation comes FIRST, so that a
+    // value that lives in a register (or is rebuilt from an immediate) does
+    // not get a slot at all.
+    //
+    // WHY: the collector scans the stack conservatively. A frame slot that
+    // nothing ever writes keeps whatever an earlier, deeper call left in that
+    // stack area -- and the frames of `gc_collect` and `__gc_collect_now` are
+    // live while the scan runs. With one slot per value, a frame held a
+    // handful of live words and dozens of slots nobody writes (a value in a
+    // register never touches its slot). A frame of only the values that
+    // really sit in memory has far fewer of those holes, and it is a lot
+    // smaller: `gc_collect` 384 -> 176 octets, `__gc_collect_now`
+    // 1472 -> 768 (docs/ROUND-A64-REGALLOC.md, third finding).
+    let ra = regalloc_a64::allocate(f);
+    let mut slot = vec![NO_SLOT; n];
     let mut cursor = 0u64;
     for (idx, s) in slot.iter_mut().enumerate() {
+        if ra.reg(idx as Val).is_some() || ra.imm(idx as Val).is_some() {
+            continue;
+        }
         // ROUND 91: a `v128` value needs SIXTEEN octets, and it wants them at
         // a sixteen octet boundary so that `ldr q`/`str q` reach the slot in
         // ONE instruction (their immediate is scaled by sixteen). `sp` stays
@@ -248,7 +278,6 @@ fn layout(f: &Func) -> Frame {
     // in this backend, the slots are addressed from the top of the frame
     // (`size - slot`), and the arguments from the bottom. The gap in between
     // was padding until this round.
-    let ra = regalloc_a64::allocate(f);
     let saved_bytes = align_up(8 * ra.saved.len() as u64, 16);
     Frame {
         slot,
@@ -1960,6 +1989,28 @@ mod tests {
         // syscalls.rs.
         assert!(s.contains("mov x8, #93"), "{}", s);
         assert!(s.contains("svc #0"), "{}", s);
+    }
+
+    /// ROUND BILLIG, compact frames: a value that lives in a register or is
+    /// rebuilt from an immediate has no slot. Thirty-three values here, all of
+    /// them in registers (the six that the allocator hands out) or immediates:
+    /// the frame holds the saved registers and little else. Before the change it
+    /// was one 8-octet slot per value.
+    #[test]
+    fn values_in_registers_have_no_slot() {
+        let mut f = Func::new("main", vec![], FTy::I32);
+        let mut acc = f.push(0, FTy::I32, Op::Const(1));
+        for k in 0..16 {
+            let c = f.push(0, FTy::I32, Op::Const(100 + k));
+            acc = f.push(0, FTy::I32, Op::Bin(crate::fir::BinOp::Add, acc, c));
+        }
+        f.set_term(0, Term::Ret(Some(acc)));
+        let n = f.val_types.len() as u64;
+        let fr = layout(&f);
+        assert!(fr.size < 8 * n / 2, "frame of {} octets for {} values", fr.size, n);
+        // and the program still builds: no path asks for a slot that is not there
+        let s = build(&Module { funcs: vec![f] });
+        assert!(s.contains("ret"), "{}", s);
     }
 
     #[test]
