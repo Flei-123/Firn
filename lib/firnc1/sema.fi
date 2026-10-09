@@ -1132,6 +1132,28 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
         return ast_ty(s, ast.e_b(b, e))
     }
     if a == ast.E_SLIT {
+        // ROUND TUPLES: the type of `(a, b)` from the types of the elements,
+        // if the tuple exists already
+        if is_tuple_literal(s, ast.e_a(b, e)) {
+            var pe: Vec[u32] = vec_new[u32]()
+            var pk: u32 = 0
+            while pk < ast.e_c(b, e) {
+                let ptt: u32 = probe_t(s, ast.child_at(b, ast.e_b(b, e) + pk * 2 + 1), d + 1)
+                if ptt == NONE {
+                    vec_free[u32](&pe)
+                    return NONE
+                }
+                vec_push[u32](&pe, ptt)
+                pk = pk + 1
+            }
+            let pn: u32 = tuple_name_nr(s, &pe)
+            vec_free[u32](&pe)
+            let psi: i32 = types.struct_index(table(s), pn)
+            if psi < 0 {
+                return NONE
+            }
+            return types.new_ty(table(s), types.K_STRUCT, psi as u32, 0)
+        }
         let si: i32 = types.struct_index(table(s), ast.e_a(b, e))
         if si < 0 {
             return NONE
@@ -3398,11 +3420,120 @@ fn call(s: *mut Sema, e: u32) -> u32 {
     return types.ret_ty_the_func(table(s), f as usize)
 }
 
-fn struct_literal(s: *mut Sema, e: u32) -> u32 {
+// The interned name `(T1, T2)` of the tuple with these element types.
+fn tuple_name_nr(s: *mut Sema, el: *mut Vec[u32]) -> u32 {
+    var nm: rt.Buf = rt.buf_new()
+    rt.buf_push(&nm, 40 as u8)
+    var k: usize = 0
+    while k < vec_len[u32](el) {
+        if k > 0 {
+            var cm: [u8; 2] = ", "
+            rt.buf_push_bytes(&nm, (&cm[0]) as u64, 2)
+        }
+        types.name_of(table(s), names(s), &nm, vec_at[u32](el, k))
+        k = k + 1
+    }
+    rt.buf_push(&nm, 41 as u8)
+    let nr: u32 = intern.intern_number(names(s), rt.buf_ptr(&nm), rt.buf_len(&nm)) as u32
+    rt.buf_free(&nm)
+    return nr
+}
+
+// ROUND TUPLES: is this struct literal `(a, b, ..)`? Its name is `(tuple)`,
+// which no source can write (twin of `ast::TUPLE_LIT`).
+fn is_tuple_literal(s: *mut Sema, name: u32) -> bool {
+    var nm: [u8; 7] = "(tuple)"
+    return intern.intern_equal(names(s), name, (&nm[0]) as u64, 7)
+}
+
+// The element types of the tuple struct `si`, or `false` if it is none.
+fn tuple_elems(s: *mut Sema, si: usize, out: *mut Vec[u32]) -> bool {
+    let nr: u32 = types.st_name(table(s), si)
+    if intern.intern_length(names(s), nr) == 0 {
+        return false
+    }
+    if *(intern.intern_ptr(names(s), nr) as *mut u8) != 40 as u8 {
+        return false
+    }
+    let off: u32 = types.st_foff(table(s), si)
+    let cnt: u32 = types.st_flen(table(s), si)
+    var k: u32 = 0
+    while k < cnt {
+        vec_push[u32](out, types.sf_ty(table(s), off + k))
+        k = k + 1
+    }
+    return true
+}
+
+// `(a, b, ..)` (sema.rs::tuple_lit). The context may name the tuple type, and
+// then it types the elements; without it every element has the type it has on
+// its own.
+fn tuple_literal(s: *mut Sema, e: u32, note: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    var want: Vec[u32] = vec_new[u32]()
+    var have_want: bool = false
+    if note != NONE {
+        if types.ty_kind(table(s), note) == types.K_STRUCT {
+            have_want = tuple_elems(s, types.ty_a(table(s), note) as usize, &want)
+            if have_want && vec_len[u32](&want) != cnt as usize {
+                have_want = false
+            }
+        }
+    }
+    var got: Vec[u32] = vec_new[u32]()
+    var failed: bool = false
+    var k: u32 = 0
+    while k < cnt {
+        let fexpr: u32 = ast.child_at(b, off + k * 2 + 1)
+        var et: u32 = NONE
+        if have_want {
+            let wt: u32 = vec_at[u32](&want, k as usize)
+            // HOOK error unions: implicit conversion of an element.
+            var converted: bool = false
+            if has_fe(s) {
+                converted = coerce_check(s, fexpr, wt)
+            }
+            if !converted {
+                let g: u32 = expr(s, fexpr, wt)
+                if !is_error(s, g) && !types.compatible(table(s), g, wt) {
+                    complain(s)
+                    failed = true
+                }
+            }
+            et = wt
+        } else {
+            et = expr(s, fexpr, NONE)
+            if types.ty_kind(table(s), et) == types.K_VOID {
+                complain(s)
+                failed = true
+            }
+        }
+        if is_error(s, et) {
+            failed = true
+        }
+        vec_push[u32](&got, et)
+        k = k + 1
+    }
+    vec_free[u32](&want)
+    if failed {
+        vec_free[u32](&got)
+        return (*s).t_error
+    }
+    let si: u32 = types.tuple_ty(table(s), tree(s), names(s), &got)
+    vec_free[u32](&got)
+    return si
+}
+
+fn struct_literal(s: *mut Sema, e: u32, note: u32) -> u32 {
     let b: *mut ast.Tree = tree(s)
     let name: u32 = ast.e_a(b, e)
     let off: u32 = ast.e_b(b, e)
     let cnt: u32 = ast.e_c(b, e)
+    if is_tuple_literal(s, name) {
+        return tuple_literal(s, e, note)
+    }
     let si: i32 = types.struct_index(table(s), name)
     if si < 0 {
         var k: u32 = 0
@@ -3652,7 +3783,7 @@ fn expr_inner(s: *mut Sema, e: u32, note: u32) -> u32 {
         return dst
     }
     if a == ast.E_SLIT {
-        return struct_literal(s, e)
+        return struct_literal(s, e, note)
     }
     if a == ast.E_AWDH {
         let value: u32 = ast.e_a(b, e)
@@ -4237,6 +4368,32 @@ fn cond(s: *mut Sema, e: u32) {
     }
 }
 
+// ROUND TUPLES: `__tup#<k>#<n>` is the hidden binding that `let (a, b) = e`
+// makes; the number of names `n`, or -1 if this is no such name.
+fn tuple_pattern_arity(s: *mut Sema, nr: u32) -> i64 {
+    let it: *mut intern.Interner = names(s)
+    var pf: [u8; 6] = "__tup#"
+    if !intern.intern_prefix(it, nr, (&pf[0]) as u64, 6) {
+        return -1
+    }
+    let p: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    var j: usize = n
+    while j > 0 {
+        j = j - 1
+        if *((p + j as u64) as *mut u8) == 35 as u8 {
+            break
+        }
+    }
+    var v: i64 = 0
+    var q: usize = j + 1
+    while q < n {
+        v = v * 10 + (*((p + q as u64) as *mut u8) - 48 as u8) as i64
+        q = q + 1
+    }
+    return v
+}
+
 fn stmt(s: *mut Sema, i: u32) {
     let b: *mut ast.Tree = tree(s)
     let a: u32 = ast.s_kind(b, i)
@@ -4265,6 +4422,25 @@ fn stmt(s: *mut Sema, i: u32) {
                 t = (*s).t_error
             } else {
                 t = got
+            }
+        }
+        // ROUND TUPLES: `let (a, b) = e` -- the hidden binding of `e` carries
+        // the number of names in its name (parser.fi::let_tuple).
+        let want_n: i64 = tuple_pattern_arity(s, ast.s_a(b, i))
+        if want_n >= 0 && !is_error(s, t) {
+            var ok_n: bool = false
+            if types.ty_kind(table(s), t) == types.K_STRUCT {
+                var te2: Vec[u32] = vec_new[u32]()
+                if tuple_elems(s, types.ty_a(table(s), t) as usize, &te2) {
+                    if vec_len[u32](&te2) as i64 == want_n {
+                        ok_n = true
+                    }
+                }
+                vec_free[u32](&te2)
+            }
+            if !ok_n {
+                complain(s)
+                t = (*s).t_error
             }
         }
         var_create(s, ast.s_a(b, i), t)

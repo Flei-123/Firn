@@ -779,6 +779,86 @@ fn apply_moves(l: *mut Lower, i: u32) {
     }
 }
 
+// ROUND TUPLES -- the variable at the root of an lvalue, or `NONE` if the
+// lvalue is reached through a pointer (twin of lower.rs::root_ident).
+fn root_name(b: *mut ast.Tree, e: u32) -> u32 {
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_ID {
+        return ast.e_a(b, e)
+    }
+    if a == ast.E_FIELD || a == ast.E_IDX {
+        return root_name(b, ast.e_a(b, e))
+    }
+    return NONE
+}
+
+// Does `e` read the variable `name` (or, with `NONE`, any memory at all)?
+// Unknown shapes say yes (twin of lower.rs::reads_name).
+fn reads_name(b: *mut ast.Tree, e: u32, name: u32) -> bool {
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_INT || a == ast.E_FLOAT || a == ast.E_FLOAT32 || a == ast.E_BOOL {
+        return false
+    }
+    if a == ast.E_ID {
+        return name == NONE || name == ast.e_a(b, e)
+    }
+    if a == ast.E_UN {
+        return reads_name(b, ast.e_b(b, e), name)
+    }
+    if a == ast.E_AS || a == ast.E_TEXT {
+        return reads_name(b, ast.e_a(b, e), name)
+    }
+    if a == ast.E_BIN {
+        return reads_name(b, ast.e_b(b, e), name) || reads_name(b, ast.e_c(b, e), name)
+    }
+    if a == ast.E_IDX || a == ast.E_AWDH {
+        return reads_name(b, ast.e_a(b, e), name) || reads_name(b, ast.e_b(b, e), name)
+    }
+    if a == ast.E_FIELD {
+        return reads_name(b, ast.e_a(b, e), name)
+    }
+    if a == ast.E_SLIT {
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            if reads_name(b, ast.child_at(b, ast.e_b(b, e) + k * 2 + 1), name) {
+                return true
+            }
+            k = k + 1
+        }
+        return false
+    }
+    if a == ast.E_ALIT || a == ast.E_CALL || a == ast.E_SYSCALL {
+        var q: u32 = 0
+        while q < ast.e_c(b, e) {
+            if reads_name(b, ast.child_at(b, ast.e_b(b, e) + q), name) {
+                return true
+            }
+            q = q + 1
+        }
+        // a call may read anything through a global
+        if a != ast.E_ALIT && name == NONE {
+            return true
+        }
+        return false
+    }
+    if a == ast.E_IFEX {
+        return reads_name(b, ast.e_a(b, e), name) || reads_name(b, ast.e_b(b, e), name)
+        || reads_name(b, ast.e_c(b, e), name)
+    }
+    return true
+}
+
+// ROUND TUPLES -- does the aggregate literal `value` read memory that the
+// assignment `target = value` overwrites? (twin of lower.rs::literal_reads_target)
+fn literal_reads_target(l: *mut Lower, target: u32, value: u32) -> bool {
+    let b: *mut ast.Tree = tree(l)
+    let k: u32 = ast.e_kind(b, value)
+    if k != ast.E_SLIT && k != ast.E_ALIT {
+        return false
+    }
+    return reads_name(b, value, root_name(b, target))
+}
+
 // Is there an active `errdefer` in this function? (`has_errdefer`)
 fn has_errdefer(l: *mut Lower) -> bool {
     var i: usize = 0
@@ -2861,7 +2941,19 @@ fn stmt(l: *mut Lower, i: u32) {
     }
     if a == ast.S_ZUW {
         let addr: u32 = address(l, ast.s_a(b, i))
-        write_after(l, addr, ast.s_b(b, i))
+        // ROUND TUPLES (lower.rs): a literal that reads the place it is
+        // written to -- `t = (t.1, t.0)` -- is built in a place of its own and
+        // copied afterwards; written field by field into the target, the
+        // second field would read what the first one has overwritten.
+        if literal_reads_target(l, ast.s_a(b, i), ast.s_b(b, i)) {
+            let lt: u32 = sema.sema_ty(sm(l), ast.s_a(b, i))
+            let lsz: u64 = q_size(l, lt)
+            let ltmp: u32 = alloca(l, lsz, q_align(l, lt))
+            write_after(l, ltmp, ast.s_b(b, i))
+            copymem(l, addr, ltmp, lsz)
+        } else {
+            write_after(l, addr, ast.s_b(b, i))
+        }
         // HOOK gc (gc_lower.rs::hook_assign): the insertion barrier AFTER
         // writing a Gc pointer into a heap field.
         if has_gc(l) {

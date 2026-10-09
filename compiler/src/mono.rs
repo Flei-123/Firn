@@ -358,8 +358,12 @@ fn subst_call_name(
     // substituted here as well — otherwise the type checker reports
     // "unknown type 'T'" as soon as the template is instantiated.
     if let Some(param) = n.strip_prefix("size_of$") {
-        if let Some(TypeExpr::Named(concrete, _)) = map.get(param) {
-            return format!("size_of${}", concrete);
+        match map.get(param) {
+            Some(TypeExpr::Named(concrete, _)) => return format!("size_of${}", concrete),
+            // Round TUPLES: `Vec[(i32, i32)]`, `Vec[*mut u8]` -- the call name
+            // can only carry a name, so the type goes aside (sizeof.rs)
+            Some(other) => return crate::sizeof::stash_type(other),
+            None => {}
         }
     }
     match subst_name(n, sp, map, queue, true) {

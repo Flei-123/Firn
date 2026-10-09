@@ -777,6 +777,14 @@ fn resolve_with_self(ck: &mut Checker, te: &TypeExpr, slf: &Type) -> Type {
         TypeExpr::Array { elem, len, .. } => {
             Type::Array(Box::new(resolve_with_self(ck, elem, slf)), *len)
         }
+        // Round TUPLES: `(Self, i32)`
+        TypeExpr::Tuple(elems, _) => {
+            let tys: Vec<Type> = elems.iter().map(|e| resolve_with_self(ck, e, slf)).collect();
+            if tys.iter().any(|t| t.is_error()) {
+                return Type::Error;
+            }
+            ck.tuple_type(&tys)
+        }
         _ => ck.resolve_ty(te),
     }
 }

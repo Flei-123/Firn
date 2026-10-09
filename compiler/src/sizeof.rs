@@ -48,11 +48,27 @@ const P_SIZE: &str = "size_of$";
 thread_local! {
     /// Identifier -> size. Filled by the type checker, read by lowering.
     static VALUES: RefCell<HashMap<String, i128>> = RefCell::new(HashMap::new());
+    /// Round TUPLES: the type arguments that are no plain name (`(i32, i32)`,
+    /// `*mut u8`) which `size_of[T]()` met inside a template. The call name
+    /// can only carry a name, so it carries `#<index>` into this list.
+    static TYPES: RefCell<Vec<TypeExpr>> = RefCell::new(Vec::new());
 }
 
 /// Resets the table (one per compilation, `parser::reset_hooks`).
 pub(crate) fn hook_reset() {
     VALUES.with(|w| w.borrow_mut().clear());
+    TYPES.with(|w| w.borrow_mut().clear());
+}
+
+/// Round TUPLES: the call name for `size_of[T]()` with `T` bound to a type
+/// that is not a plain name (`mono.rs::subst_call_name`).
+pub(crate) fn stash_type(te: &TypeExpr) -> String {
+    let idx = TYPES.with(|t| {
+        let mut t = t.borrow_mut();
+        t.push(te.clone());
+        t.len() - 1
+    });
+    format!("{}#{}", P_SIZE, idx)
 }
 
 /// `// HOOK sizeof` in `parser.rs::primary` — `size_of[T]()`.
@@ -103,7 +119,14 @@ pub(crate) fn hook_call(
         ck.dg.error(span, "'size_of' takes no arguments".to_string());
         return Some(Type::Error);
     }
-    let te = TypeExpr::Named(ty_text.to_string(), span);
+    // Round TUPLES: `#<index>` names a stashed type expression
+    let te = match ty_text.strip_prefix('#').and_then(|i| i.parse::<usize>().ok()) {
+        Some(i) => match TYPES.with(|t| t.borrow().get(i).cloned()) {
+            Some(te) => te,
+            None => TypeExpr::Named(ty_text.to_string(), span),
+        },
+        None => TypeExpr::Named(ty_text.to_string(), span),
+    };
     let t = ck.resolve_ty(&te);
     if t.is_error() {
         return Some(Type::Error);

@@ -54,6 +54,10 @@ pub(crate) struct Parser<'a> {
     /// being parsed (`block` appends them): the bindings of
     /// `let (a, b) = f()`.
     pub(crate) after: Vec<Stmt>,
+    /// **Round TUPLES** -- how many hidden tuple bindings this file has made
+    /// (`__tup#<k>#<n>`); `lib/firnc1/parser.fi` counts the same way, so the
+    /// two syntax trees carry the same names.
+    pub(crate) tup_seq: u32,
     /// > 0: an interpolation is already running — nesting does not exist yet.
     pub(crate) interp_depth: u32,
     /// **ROUND 79** — `[T; _]` is only allowed where an initializer follows
@@ -1437,7 +1441,8 @@ impl<'a> Parser<'a> {
                     span: *nsp,
                 }),
                 TuplePat::Tuple(inner, isp) => {
-                    let sub_tmp = format!("__tup#{}#{}", field.id, inner.len());
+                    let sub_tmp = format!("__tup#{}#{}", self.tup_seq, inner.len());
+                    self.tup_seq += 1;
                     out.push(Stmt::Let {
                         name: sub_tmp.clone(),
                         mutable: false,
@@ -1548,7 +1553,8 @@ impl<'a> Parser<'a> {
             TuplePat::Tuple(e, _) => e.len(),
             _ => 0,
         };
-        let tmp = format!("__tup#{}#{}", init.id, n);
+        let tmp = format!("__tup#{}#{}", self.tup_seq, n);
+        self.tup_seq += 1;
         let mut extra = Vec::new();
         self.tuple_bindings(&pat, &tmp, mutable, &mut extra);
         self.after.append(&mut extra);
@@ -1880,7 +1886,10 @@ compute it",
                     self.bump();
                     ref_kind = Some(false);
                 } else if matches!(self.kind(), TokKind::Ident(n) if n == "inout")
-                    && self.next_starts_type()
+                    && (self.next_starts_type()
+                        // ROUND TUPLES: `x: inout (A, B)` -- after the colon a
+                        // type is coming, so a `(` is a tuple type
+                        || matches!(self.toks.get(self.pos + 1).map(|t| &t.kind), Some(TokKind::LParen)))
                 {
                     self.bump();
                     ref_kind = Some(true);
@@ -2659,6 +2668,7 @@ fn in_expr(
         pending_attrs: Vec::new(),
         hoist: Vec::new(),
         after: Vec::new(),
+        tup_seq: 0,
         interp_depth: 1,
         allow_ref_params: false,
         ref_params: Vec::new(),
@@ -2716,6 +2726,7 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         pending_attrs: Vec::new(),
         hoist: Vec::new(),
         after: Vec::new(),
+        tup_seq: 0,
         interp_depth: 0,
         allow_ref_params: false,
         ref_params: Vec::new(),
