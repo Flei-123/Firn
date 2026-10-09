@@ -157,8 +157,9 @@ for stage in $STAGES; do
         report "$name: the pid of the server was not found (endurance run skipped)"
     fi
 
-    # COUNTER-CHECK A: without `reap()` the server HAS to stop at the 64th
-    # connection. Without this the endurance run above would prove nothing --
+    # COUNTER-CHECK A: without `reap()` the server HAS to stop when the thread
+    # table is used up (the 1024th connection; it was the 64th while the table
+    # had 64 entries). Without this the endurance run above would prove nothing --
     # it would pass with a server that leaks thread table entries, as long as
     # the leak is not RSS. This is the bug round 76 found.
     sed 's/^                reap(base)$//' demos/mcserver/main.fi > "$W/noreap.fi"
@@ -173,12 +174,12 @@ for stage in $STAGES; do
             [ -n "$NRPORT" ] && break
             sleep 0.05; i=$((i + 1))
         done
-        NRC=$(timeout 60 python3 tools/mcserver/soak.py "$NRPORT" "$NRP" 300 1 2>&1 \
-              | grep -c 'FAILED at connection 6[0-9]')
+        NRC=$(timeout 120 python3 tools/mcserver/soak.py "$NRPORT" "$NRP" 1200 1 2>&1 \
+              | grep -c 'FAILED at connection 10[0-9][0-9]')
         kill -9 $NRP 2>/dev/null
         wait $NRP 2>/dev/null
         if [ "$NRC" -ge 1 ]; then
-            echo "  $name: counter-check -- without reap() the server dies in the sixties, as it must"
+            echo "  $name: counter-check -- without reap() the server dies when the thread table is full, as it must"
         else
             report "$name: WITHOUT reap() the server did NOT die -- the endurance run proves nothing"
         fi

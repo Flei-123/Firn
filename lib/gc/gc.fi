@@ -259,6 +259,13 @@ const S_ZBUDGET: u64 = 2136
 // 0 = not yet determined.
 const S_STR_TID: u64 = 2144
 
+// ROUND T1: the thread table grew from 64 to THREAD_MAX entries. The collector
+// loops (stop the world, root scan, local lists) must not walk all of them on
+// every cycle: this is the HIGH-WATER MARK, the number of table entries that
+// were ever handed out (entry 0 is the main thread, so it is >= 1 once the
+// table exists). Entries at or above it are untouched zero pages.
+const S_THREAD_HI: u64 = 2152
+
 // The state word of a block header (see the comment at the top).
 const M_MARK: u32 = 3
 const M_WITHOUT_MARK: u32 = 4294967292
@@ -2912,8 +2919,33 @@ const FT_REGS: u64 = 80
 // size class, plus the number of blocks lying in it.
 const FT_FREE: u64 = 128
 const FT_FREIN: u64 = 240
+// 1 = nobody will ever join this thread (`thread_detach`): the table entry is
+// recycled by the next `thread_start` once the thread has really ended.
+const FT_DETACH: u64 = 248
+// Why the last `thread_start` of THIS thread returned 0 (THREAD_ERR_*).
+const FT_ERR: u64 = 256
 const FT_BYTES: u64 = 512
-const THREAD_MAX: u64 = 64
+
+// The number of entries of the thread table (the main thread holds entry 0,
+// so THREAD_MAX - 1 workers can exist at the same time).
+//
+// WHY A FIXED TABLE: the address of a thread's entry is its `fs` base (and
+// `fs:0` points to itself), so an entry can never move -- a growing table
+// would need either a chain of tables or a reserved address range. The range
+// is the simple answer: `thread_init` maps THREAD_MAX * FT_BYTES (512 KiB)
+// ONCE; an anonymous mapping costs address space only, the pages are touched
+// when an entry is first used. The collector walks only the entries below the
+// high-water mark S_THREAD_HI, so the unused part costs nothing per cycle.
+// What a thread DOES cost is its stack (STACK_BYTES of address space, 2 map
+// entries because of the guard page) -- 1023 threads are about 1 GiB of
+// address space, not of memory.
+const THREAD_MAX: u64 = 1024
+
+// `thread_error()` after a `thread_start` that returned 0.
+const THREAD_ERR_NONE: u64 = 0
+const THREAD_ERR_FULL: u64 = 1
+const THREAD_ERR_STACK: u64 = 2
+const THREAD_ERR_CLONE: u64 = 3
 // The default stack size per thread (1 MiB, of which 4 KiB is a guard page).
 const STACK_BYTES: u64 = 1048576
 
@@ -3167,8 +3199,9 @@ fn __gc_stw_an() {
     __gc_st64(st + S_STOPP, 1)
     let slf: u64 = __thread_tcb()
     let tab: u64 = __gc_ld64(st + S_THREAD_TAB)
+    let hi: u64 = __gc_ld64(st + S_THREAD_HI)
     var i: u64 = 0
-    while i < THREAD_MAX {
+    while i < hi {
         let t: u64 = tab + i * FT_BYTES
         if t != slf {
             var n: u64 = 0
@@ -3236,8 +3269,9 @@ fn __gc_threads_scan() {
         return
     }
     let slf: u64 = __thread_tcb()
+    let hi: u64 = __gc_ld64(st + S_THREAD_HI)
     var i: u64 = 0
-    while i < THREAD_MAX {
+    while i < hi {
         let t: u64 = tab + i * FT_BYTES
         let z: u64 = __gc_ld64(t + FT_STATE)
         if t != slf && z != Z_FREE {
@@ -3257,17 +3291,56 @@ fn __gc_threads_scan() {
 
 // -------------------------------------------------------- The thread table
 
+// Give a finished thread's entry back: unmap its stack, clear the entry.
+// The caller has made sure the thread has really ended (its TID word is 0:
+// the kernel nulls it only after it has left the stack for good).
+fn __thread_slot_free(tcb: u64) {
+    let sp: u64 = __gc_ld64(tcb + FT_STACK)
+    let n: u64 = __gc_ld64(tcb + FT_STAPELN)
+    __gc_st64(tcb + FT_STACK, 0)
+    __gc_st64(tcb + FT_SP, 0)
+    __gc_st64(tcb + FT_BOTTOM, 0)
+    __gc_st64(tcb + FT_RES, 0)
+    __gc_st64(tcb + FT_DETACH, 0)
+    __gc_st64(tcb + FT_STATE, Z_FREE)
+    if sp != 0 {
+        __gc_munmap(sp, n)
+    }
+}
+
+// The first usable entry, 0 = the table is full. Caller holds S_TSPERRE.
+// Entries of DETACHED threads that have ended are recycled on the way.
+// Entries are taken below the high-water mark first, the mark moves up by one
+// only when every entry below it is taken.
 fn __thread_slot_new(st: u64) -> u64 {
     let tab: u64 = __gc_ld64(st + S_THREAD_TAB)
+    let hi: u64 = __gc_ld64(st + S_THREAD_HI)
     var i: u64 = 1
-    while i < THREAD_MAX {
+    while i < hi {
         let t: u64 = tab + i * FT_BYTES
-        if __gc_ld64(t + FT_STATE) == Z_FREE {
+        let z: u64 = __gc_ld64(t + FT_STATE)
+        if z == Z_FREE {
+            return t
+        }
+        if z == Z_DEAD && __gc_ld64(t + FT_DETACH) != 0 && __gc_ld32(t + FT_TID) == 0 {
+            __thread_slot_free(t)
             return t
         }
         i = i + 1
     }
+    if hi < THREAD_MAX {
+        __gc_st64(st + S_THREAD_HI, hi + 1)
+        return tab + hi * FT_BYTES
+    }
     return 0
+}
+
+// Set the error code of the calling thread (see `thread_error`).
+fn __thread_err_set(code: u64) {
+    let tcb: u64 = __thread_tcb()
+    if tcb != 0 {
+        __gc_st64(tcb + FT_ERR, code)
+    }
 }
 
 // Once, before the first `thread_start`. It registers the MAIN THREAD --
@@ -3293,6 +3366,7 @@ fn thread_init() -> bool {
     __gc_st64(tab + FT_TID, __thread_gettid())
     __gc_st64(st + S_MAIN, tab)
     __gc_st64(st + S_THREAD_MAX, THREAD_MAX)
+    __gc_st64(st + S_THREAD_HI, 1)
     __gc_st64(st + S_THREAD_N, 1)
     if __gc_ld64(st + S_STAPELN) == 0 {
         __gc_st64(st + S_STAPELN, STACK_BYTES)
@@ -3313,7 +3387,12 @@ fn thread_stack_set(n: u64) {
 // Start a thread. `kind` and `arg` go unchanged to the dispatcher
 // `__thread_work(kind, arg)` of the program -- the same solution as with the
 // dispatcher of the finalizers (round 47), because stage 0 has no function
-// pointers. Return value: the handle (1..63) for `thread_wait`, 0 = failed.
+// pointers. Return value: the handle (1..THREAD_MAX-1) for `thread_wait` /
+// `thread_detach`, 0 = failed. A failure is a plain 0, never a crash;
+// `thread_error()` tells why (table full, no stack, no clone).
+//
+// EVERY handle that is not detached has to be given to `thread_wait` exactly
+// once -- that is what returns the entry and the stack (see `thread_wait`).
 fn thread_start(kind: u64, arg: u64) -> u64 {
     let st: u64 = __gc_state() as u64
     if __gc_ld64(st + S_THREAD_TAB) == 0 {
@@ -3321,17 +3400,20 @@ fn thread_start(kind: u64, arg: u64) -> u64 {
             return 0
         }
     }
+    __thread_err_set(THREAD_ERR_NONE)
     __thread_safepoint()
     __thread_lock(st + S_TSPERRE)
     let tcb: u64 = __thread_slot_new(st)
     if tcb == 0 {
         __thread_unlock(st + S_TSPERRE)
+        __thread_err_set(THREAD_ERR_FULL)
         return 0
     }
     let n: u64 = __gc_ld64(st + S_STAPELN)
     let sp: u64 = __gc_mmap(n)
     if sp == 0 {
         __thread_unlock(st + S_TSPERRE)
+        __thread_err_set(THREAD_ERR_STACK)
         return 0
     }
     // A guard page right at the bottom: a stack overflow ends with a clean
@@ -3347,6 +3429,8 @@ fn thread_start(kind: u64, arg: u64) -> u64 {
     __gc_st64(tcb + FT_RES, 0)
     __gc_st64(tcb + FT_TID, 0)
     __gc_st64(tcb + FT_FREIN, 0)
+    __gc_st64(tcb + FT_DETACH, 0)
+    __gc_st64(tcb + FT_ERR, 0)
     var i: u64 = 0
     while i < 6 {
         __gc_st64(tcb + FT_REGS + i * 8, 0)
@@ -3378,6 +3462,7 @@ fn thread_start(kind: u64, arg: u64) -> u64 {
         __atomic_add((st + S_THREAD_N) as *mut u64, THREAD_MINUS1)
         __gc_munmap(sp, n)
         __thread_unlock(st + S_TSPERRE)
+        __thread_err_set(THREAD_ERR_CLONE)
         return 0
     }
     __thread_unlock(st + S_TSPERRE)
@@ -3405,13 +3490,29 @@ fn __thread_entry(tcb: u64) -> i32 {
 // Wait for the end of a thread and fetch its result. The kernel nulls the
 // TID word when the thread ends and wakes on it -- exactly the mechanism
 // `pthread_join` works with too, only without pthread.
+//
+// SHARP EDGE (R2): this is JOIN and FREE in one. A thread that has run to its
+// end keeps its table entry and its stack until somebody calls `thread_wait`
+// for it -- the only other way out is `thread_detach`. So:
+//   * a program that starts threads and never waits for them runs out of
+//     entries after THREAD_MAX - 1 starts (`thread_start` then returns 0,
+//     `thread_error()` is THREAD_ERR_FULL);
+//   * the handle is valid until the first `thread_wait` returns; after that
+//     it may be handed out again to a NEW thread, so a second `thread_wait`
+//     with the old handle can join the wrong thread. Call it once per handle;
+//   * two threads must not wait for the same handle.
+// A handle that is out of range, free (never started, already joined) or
+// detached returns 0 and changes nothing.
 fn thread_wait(h: u64) -> u64 {
     let st: u64 = __gc_state() as u64
     let tab: u64 = __gc_ld64(st + S_THREAD_TAB)
-    if tab == 0 || h == 0 || h >= THREAD_MAX {
+    if tab == 0 || h == 0 || h >= __gc_ld64(st + S_THREAD_HI) {
         return 0
     }
     let tcb: u64 = tab + h * FT_BYTES
+    if __gc_ld64(tcb + FT_STATE) == Z_FREE || __gc_ld64(tcb + FT_DETACH) != 0 {
+        return 0
+    }
     __thread_blocked_an()
     var t: u32 = __gc_ld32(tcb + FT_TID)
     while t != 0 {
@@ -3420,17 +3521,47 @@ fn thread_wait(h: u64) -> u64 {
     }
     __thread_blocked_out()
     let r: u64 = __gc_ld64(tcb + FT_RES)
-    let sp: u64 = __gc_ld64(tcb + FT_STACK)
-    let n: u64 = __gc_ld64(tcb + FT_STAPELN)
-    __gc_st64(tcb + FT_STACK, 0)
-    __gc_st64(tcb + FT_SP, 0)
-    __gc_st64(tcb + FT_BOTTOM, 0)
-    __gc_st64(tcb + FT_RES, 0)
-    __gc_st64(tcb + FT_STATE, Z_FREE)
-    if sp != 0 {
-        __gc_munmap(sp, n)
-    }
+    __thread_slot_free(tcb)
     return r
+}
+
+// Nobody will join this thread: its table entry and stack are recycled by the
+// next `thread_start` after the thread has really ended (its result is
+// dropped). Returns false for a handle that is out of range, free, or
+// already detached. After `thread_detach` the handle must not be used
+// again -- not for `thread_wait` (which then returns 0) and not at all once
+// the thread has ended, because the entry may belong to a new thread by then.
+// Backward compatible: threads that are joined work exactly as before.
+fn thread_detach(h: u64) -> bool {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_THREAD_TAB)
+    if tab == 0 || h == 0 || h >= __gc_ld64(st + S_THREAD_HI) {
+        return false
+    }
+    let tcb: u64 = tab + h * FT_BYTES
+    __thread_lock(st + S_TSPERRE)
+    var ok: bool = false
+    if __gc_ld64(tcb + FT_STATE) != Z_FREE && __gc_ld64(tcb + FT_DETACH) == 0 {
+        __gc_st64(tcb + FT_DETACH, 1)
+        ok = true
+    }
+    __thread_unlock(st + S_TSPERRE)
+    return ok
+}
+
+// How many workers can exist at the same time.
+fn thread_limit() -> u64 {
+    return THREAD_MAX - 1
+}
+
+// Why the last `thread_start` of the calling thread returned 0:
+// 0 none, 1 table full, 2 no memory for the stack, 3 clone failed.
+fn thread_error() -> u64 {
+    let tcb: u64 = __thread_tcb()
+    if tcb == 0 {
+        return THREAD_ERR_NONE
+    }
+    return __gc_ld64(tcb + FT_ERR)
 }
 
 fn thread_count() -> u64 {
@@ -3569,8 +3700,9 @@ fn __thread_lists_all_back() {
     if tab == 0 {
         return
     }
+    let hi: u64 = __gc_ld64(st + S_THREAD_HI)
     var i: u64 = 0
-    while i < THREAD_MAX {
+    while i < hi {
         let t: u64 = tab + i * FT_BYTES
         if __gc_ld64(t + FT_STATE) != Z_FREE {
             __thread_lists_back(t)

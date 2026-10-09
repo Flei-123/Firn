@@ -1,0 +1,172 @@
+// tools/thread/table_bench.fi -- what the size of the thread table costs.
+//
+// Usage: table_bench N [ROUNDS]
+//   N       threads that stay parked (blocked in a sleep) during the measurement
+//   ROUNDS  number of forced collections / start-join pairs (default 200)
+//
+// One line of output (key=value, nanoseconds):
+//   start_ns         mean cost of `thread_start` for the N parked threads
+//   startjoin_ns     mean cost of a start + join of a trivial thread while the
+//                    N threads are alive (the table is as full as N makes it)
+//   collect_mean_ns  mean wall time of `gc_collect()` with N threads parked
+//   collect_max_ns   the longest one
+//   stw_wait_max_ns  longest wait until the world stood (runtime counter)
+//
+// The heap holds a fixed chain of live cells, so the marking work is the same
+// for every N: what differs between runs is the thread part.
+import std.rt
+import std.time
+
+gc class Cell {
+    next: Gc[Cell],
+    value: u64,
+}
+
+const F_SYS_MMAP: i64 = 9
+const F_PROT_RW: i64 = 3
+const F_MAP_ANON: i64 = 34
+
+fn page() -> u64 {
+    let r: i64 = syscall(F_SYS_MMAP, 0, 4096, F_PROT_RW, F_MAP_ANON, -1, 0)
+    if r < 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn ld(a: u64, o: u64) -> u64 {
+    return *((a + o) as *mut u64)
+}
+
+fn st(a: u64, o: u64, v: u64) {
+    *((a + o) as *mut u64) = v
+}
+
+const Z_GATE: u64 = 0
+const Z_READY: u64 = 8
+
+fn mk(i: u64, next: Gc[Cell]) -> AllocError!Gc[Cell] {
+    let c: Gc[Cell] = try gc Cell { next: next, value: i }
+    return c
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == 1 {
+        __atomic_add((arg + Z_READY) as *mut u64, 1)
+        while ld(arg, Z_GATE) == 0 {
+            thread_sleep(200)
+        }
+    }
+    return 0
+}
+
+fn parse_dec(p: u64, fallback: u64) -> u64 {
+    let n: usize = rt.c_length(p)
+    if n == 0 {
+        return fallback
+    }
+    var v: u64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return fallback
+        }
+        v = v * 10 + (c - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
+
+fn emit(out: *mut rt.Buf, key: str, v: u64) {
+    rt.buf_push_bytes(out, key.p as u64, key.length())
+    rt.buf_push_dec_u64(out, v)
+}
+
+fn main(start: u64) -> i32 {
+    var n: u64 = 0
+    var rounds: u64 = 200
+    if rt.arg_count(start) > 1 {
+        n = parse_dec(rt.arg_ptr(start, 1), 0)
+    }
+    if rt.arg_count(start) > 2 {
+        rounds = parse_dec(rt.arg_ptr(start, 2), 200)
+    }
+    let z: u64 = page()
+    if z == 0 { return 1 as i32 }
+    thread_stack_set(65536)
+
+    // live data: 20000 cells in one chain
+    var head: Gc[Cell] = gc_null[Cell]()
+    var i: u64 = 0
+    while i < 20000 {
+        head = mk(i, head) catch gc_null[Cell]()
+        i = i + 1
+    }
+
+    var hs: [u64; 1100] = [0; 1100]
+    let t0: u64 = time.monotonic_ns()
+    i = 0
+    while i < n {
+        hs[i as usize] = thread_start(1, z)
+        if hs[i as usize] == 0 { return 2 as i32 }
+        i = i + 1
+    }
+    let t1: u64 = time.monotonic_ns()
+    var spins: u64 = 0
+    while ld(z, Z_READY) != n && spins < 20000 {
+        thread_sleep(1)
+        spins = spins + 1
+    }
+    if ld(z, Z_READY) != n { return 3 as i32 }
+
+    // start + join of a trivial thread
+    let t2: u64 = time.monotonic_ns()
+    i = 0
+    while i < rounds {
+        let h: u64 = thread_start(2, z)
+        if h == 0 { return 4 as i32 }
+        thread_wait(h)
+        i = i + 1
+    }
+    let t3: u64 = time.monotonic_ns()
+
+    // forced collections
+    var sum: u64 = 0
+    var mx: u64 = 0
+    i = 0
+    while i < rounds {
+        let c0: u64 = time.monotonic_ns()
+        gc_collect()
+        let c1: u64 = time.monotonic_ns()
+        let d: u64 = c1 - c0
+        sum = sum + d
+        if d > mx {
+            mx = d
+        }
+        i = i + 1
+    }
+
+    var out: rt.Buf = rt.buf_new()
+    emit(&out, "N=", n)
+    var sp0: u64 = 0
+    if n > 0 {
+        sp0 = (t1 - t0) / n
+    }
+    emit(&out, " start_ns=", sp0)
+    emit(&out, " startjoin_ns=", (t3 - t2) / rounds)
+    emit(&out, " collect_mean_ns=", sum / rounds)
+    emit(&out, " collect_max_ns=", mx)
+    emit(&out, " stw_wait_max_ns=", gc_stw_wait_max())
+    rt.buf_push(&out, 10 as u8)
+    rt.write_everything(1, rt.buf_data(&out) as u64, rt.buf_len(&out))
+
+    st(z, Z_GATE, 1)
+    i = 0
+    while i < n {
+        thread_wait(hs[i as usize])
+        i = i + 1
+    }
+    if head == gc_null[Cell]() { return 5 as i32 }
+    return 0
+}
