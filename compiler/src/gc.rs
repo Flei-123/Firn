@@ -65,7 +65,7 @@ const P_AS: &str = "__gc#as:";
 const RUNTIME_COLLECTS: [&str; 5] =
     ["gc_init", "gc_collect", "__gc_alloc_raw", "__gc_collect_now", "gc_bottom_swap"];
 /// Further runtime names: pure queries, but part of the collector.
-const RUNTIME_QUERY: [&str; 23] = [
+const RUNTIME_QUERY: [&str; 26] = [
     "gc_set_max_bytes",
     "gc_max_bytes",
     "gc_total_bytes",
@@ -77,6 +77,10 @@ const RUNTIME_QUERY: [&str; 23] = [
     "gc_pause_ns_max",
     "gc_pause_ns_total",
     "gc_barriers",
+    // The growth factor of the allocation budget (settable, readable).
+    "gc_set_growth",
+    "gc_growth_num",
+    "gc_growth_den",
     // Round C-043 (memory): the breakdown of the live objects per class. Pure
     // queries -- they start no collection run, they only read through the
     // heap and the type table.
