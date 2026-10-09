@@ -261,6 +261,12 @@ def start(args, extra_env=None):
     return r
 
 
+def cpu_ticks(pid):
+    with open("/proc/%d/stat" % pid) as f:
+        parts = f.read().rsplit(")", 1)[1].split()
+    return int(parts[11]) + int(parts[12])
+
+
 def px(im, x, y):
     return im.getpixel((int(x), int(y)))
 
@@ -276,6 +282,11 @@ if r:
     L = r.L
     check("the window is 780x520 at 96 dpi", (L.w, L.h) == (780, 520), (L.w, L.h))
     r.move(740, 400, 0.3)         # inside the window, on nothing, so that no row is hovered
+    time.sleep(1.0)
+    t0 = cpu_ticks(r.p.pid)
+    time.sleep(3.0)
+    t1 = cpu_ticks(r.p.pid)
+    check("an idle dialog paints nothing: no CPU in 3 seconds (%d ticks)" % (t1 - t0), t1 - t0 <= 6, t1 - t0)
     im = screenshot("filedlg-live-rest.png")
     check("initial look: the list stands on the field colour", near(px(im, LIST_X + 300, LIST_Y + L.list_h - 20), LIGHT["field"]),
           px(im, LIST_X + 300, LIST_Y + L.list_h - 20))
