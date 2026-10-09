@@ -1067,6 +1067,26 @@ fn run(opts: &Options) -> i32 {
         eprintln!("error: {}", e);
         return 1;
     }
+    // ROUND TK2 (r136): the same for the recursive callers kept for the frame
+    // budget (codegen_x86::emit chooses between the two bodies).
+    {
+        let mut kept = inline::rec_originals_take();
+        for f in kept.values_mut() {
+            if let Err(e) = phi::eliminate_func(f) {
+                eprintln!("error: {}", e);
+                return 1;
+            }
+        }
+        inline::rec_originals_put(kept);
+        let mut small = inline::rec_small_take();
+        for f in small.values_mut() {
+            if let Err(e) = phi::eliminate_func(f) {
+                eprintln!("error: {}", e);
+                return 1;
+            }
+        }
+        inline::rec_small_put(small);
+    }
     // ROUND WASM: the third target writes no assembler text. Its module is
     // finished in memory, so it leaves the pipeline here, before `as`/`ld`.
     if target::active().is_wasm() {

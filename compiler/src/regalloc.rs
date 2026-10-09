@@ -461,6 +461,11 @@ pub struct Alloc {
     /// the exact crossings do, and nobody should pay for them in a normal
     /// build.
     stats: Option<RaStats>,
+    /// ROUND TK2: the value slots are the first `value_slots` slots of the
+    /// frame (offsets 8..=value_slots*8) -- the bound the register descriptor
+    /// pass tells value slots from `alloca` places by. Without compaction:
+    /// one per value.
+    value_slots: usize,
 }
 
 /// ROUND 87 -- the cause distribution behind the one number "spilled".
@@ -1376,6 +1381,7 @@ pub fn allocate(f: &Func) -> Alloc {
         call_saves: HashMap::new(),
         frame,
         stats: None,
+        value_slots: nv,
     };
     // Safety net against an explosion of memory/time on huge functions:
     // then it stays with the (correct) stack model.
@@ -2806,6 +2812,9 @@ pub fn allocate(f: &Func) -> Alloc {
     // ONE EXCEPTION is mandatory: the target of the call. If it is merged with
     // a saved value (`x = f(x)` in a loop), it stands
     // in the same register, and restoring would overwrite the result.
+    // ROUND TK2: which value owns the slot named in a save entry (the frame
+    // is compacted below, and the entries have to follow their values).
+    let mut save_owner: HashMap<u64, Val> = HashMap::new();
     if !save_set.is_empty() {
         let mut sv: Vec<Val> = save_set.iter().copied().collect();
         sv.sort_unstable();
@@ -2851,13 +2860,251 @@ pub fn allocate(f: &Func) -> Alloc {
                     continue;
                 }
                 list.push((r, off, f.val_ty(v)));
+                save_owner.insert(off, v);
             }
             if !list.is_empty() {
                 alloc.call_saves.insert((bi, ii), list);
             }
         }
     }
+    // ROUND TK2: the value slots by lifetime. Only when the liveness reached
+    // its fixed point (below the round limit its sets may be too small).
+    if live.converged && ra_compact_enabled() {
+        compact_frame(f, &mut alloc, &live, &used_saved, &save_owner);
+    }
     alloc
+}
+
+/// ROUND TK2: `FIRN_RA_COMPACT=0` gives the old frame layout (A/B).
+fn ra_compact_enabled() -> bool {
+    !matches!(std::env::var("FIRN_RA_COMPACT").as_deref(), Ok("0"))
+}
+
+/// ROUND TK2 (Certus, r47/r136) -- THE VALUE SLOTS BY LIFETIME.
+///
+/// `layout` gives EVERY value of the function its own 8-octet slot -- also
+/// every value that lives in a register, and two values that are never alive
+/// at the same time never share one. A frame is therefore 8 octets per
+/// value: in the Certus browser `interp.bc_exec_n` had 25 KiB, `winterp.lauf`
+/// 47 KiB and the regexp backtracker 7.8 KiB per recursion level (the sum of
+/// all frames: 33 MB). Every site embedded into a recursive caller made its
+/// frame larger on top of that, which is why the inliner had to keep
+/// recursive callers out of the size-ordered phase.
+///
+/// Here, after the allocation, only the values still homed in a slot get
+/// one, and values whose live ranges do not overlap share it (a linear scan
+/// over the slots). The range of a value is conservative: from the first to
+/// the last position where it is defined, used, or live at a block boundary
+/// (live-in: the start of the block, live-out: its end; parameters are
+/// defined at position 0). Both ends are closed, so the operand and the
+/// result of one instruction never share a slot.
+///
+/// What main has that the version this was written for did not:
+///
+/// * Values that SHARE a slot already (TEMPO 10: the copy on a back edge is
+///   dropped when source and target are in one slot) form a group and keep
+///   sharing: the group has the union of the ranges.
+/// * A value that lives in a caller-saved register across a call is stored
+///   into its slot before the call and loaded after it (`call_saves`). The
+///   slot has to be there for the whole interval, so such a value keeps a
+///   slot of its own, and the entries are rewritten to the new offset.
+/// * A function with a `v128` value (16 octets, 16 aligned) keeps the old
+///   layout.
+///
+/// Secret values keep a slot of their own too. The layout stays: value slots
+/// first (8..=K*8), then the `alloca` places, then the save slots of the
+/// callee-saved registers. The descriptor pass depends on that order
+/// (`Alloc::value_slots`).
+fn compact_frame(
+    f: &Func,
+    alloc: &mut Alloc,
+    live: &Live,
+    used_saved: &[&'static str],
+    save_owner: &HashMap<u64, Val>,
+) {
+    let nv = f.val_types.len();
+    if f.val_types.iter().any(|t| *t == FTy::V128) {
+        return;
+    }
+    let mut lo = vec![usize::MAX; nv];
+    let mut hi = vec![0usize; nv];
+    fn touch(v: Val, p: usize, lo: &mut [usize], hi: &mut [usize]) {
+        let v = v as usize;
+        if v < lo.len() {
+            if p < lo[v] {
+                lo[v] = p;
+            }
+            if p > hi[v] {
+                hi[v] = p;
+            }
+        }
+    }
+    for i in 0..f.params.len() {
+        touch(i as Val, 0, &mut lo, &mut hi);
+    }
+    let mut buf: Vec<Val> = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            let p = live.pos[bi][ii];
+            buf.clear();
+            inst.op.uses(&mut buf);
+            for &u in buf.iter() {
+                touch(u, p, &mut lo, &mut hi);
+            }
+            if let Some(d) = inst.dst {
+                touch(d, p, &mut lo, &mut hi);
+            }
+        }
+        let t = match &b.term {
+            Term::BrCond { cond, .. } => Some(*cond),
+            Term::Switch { val, .. } => Some(*val),
+            Term::Ret(Some(v)) => Some(*v),
+            _ => None,
+        };
+        if let Some(v) = t {
+            touch(v, live.block_end[bi], &mut lo, &mut hi);
+        }
+        let (bs, be) = (live.block_start[bi], live.block_end[bi]);
+        for v in 0..nv {
+            if live.live_in[bi][v] {
+                touch(v as Val, bs, &mut lo, &mut hi);
+            }
+            if live.live_out[bi][v] {
+                touch(v as Val, be, &mut lo, &mut hi);
+            }
+        }
+    }
+    // The values still homed in a slot, grouped by the slot they have now.
+    let mut groups: HashMap<u64, Vec<Val>> = HashMap::new();
+    for v in 0..nv {
+        if let Loc::Slot(off) = alloc.locs[v] {
+            if off != 0 {
+                groups.entry(off).or_default().push(v as Val);
+            }
+        }
+    }
+    // A value with a register that is saved around calls needs its old slot
+    // as a slot of its own; its group is just itself.
+    let mut owned: Vec<(u64, Val)> = save_owner.iter().map(|(o, v)| (*o, *v)).collect();
+    owned.sort_unstable();
+    // (range start, range end, members, old slot) per group that can share
+    let mut cand: Vec<(usize, usize, Vec<Val>, u64)> = Vec::new();
+    let mut private: Vec<(Vec<Val>, u64)> = Vec::new();
+    let mut untouched: Vec<(Vec<Val>, u64)> = Vec::new();
+    let mut keys: Vec<u64> = groups.keys().copied().collect();
+    keys.sort_unstable();
+    for off in keys {
+        let members = groups.remove(&off).unwrap_or_default();
+        if members.iter().any(|v| f.is_secret(*v)) {
+            private.push((members, off));
+            continue;
+        }
+        let (mut g_lo, mut g_hi) = (usize::MAX, 0usize);
+        for v in &members {
+            let i = *v as usize;
+            if lo[i] != usize::MAX {
+                g_lo = g_lo.min(lo[i]);
+                g_hi = g_hi.max(hi[i]);
+            }
+        }
+        if g_lo == usize::MAX {
+            untouched.push((members, off));
+        } else {
+            cand.push((g_lo, g_hi, members, off));
+        }
+    }
+    for (off, v) in &owned {
+        private.push((vec![*v], *off));
+    }
+    cand.sort_by(|a, b| (a.0, a.1, a.3).cmp(&(b.0, b.1, b.3)));
+    // linear scan over the slots
+    let mut slot_no: HashMap<u64, u64> = HashMap::new(); // old slot -> new slot number
+    let mut nslots: u64 = 0;
+    let mut free: Vec<u64> = Vec::new();
+    let mut active: std::collections::BinaryHeap<std::cmp::Reverse<(usize, u64)>> =
+        std::collections::BinaryHeap::new();
+    for (s, e, _members, old) in &cand {
+        while let Some(std::cmp::Reverse((end, sl))) = active.peek().copied() {
+            if end < *s {
+                active.pop();
+                free.push(sl);
+            } else {
+                break;
+            }
+        }
+        let sl = match free.pop() {
+            Some(x) => x,
+            None => {
+                nslots += 1;
+                nslots
+            }
+        };
+        slot_no.insert(*old, sl);
+        active.push(std::cmp::Reverse((*e, sl)));
+    }
+    for (_members, old) in &private {
+        nslots += 1;
+        slot_no.insert(*old, nslots);
+    }
+    if !untouched.is_empty() {
+        // A value no instruction mentions: nobody reads or writes the slot,
+        // but its home has to exist. One slot for all of them.
+        nslots += 1;
+        for (_members, old) in &untouched {
+            slot_no.insert(*old, nslots);
+        }
+    }
+    // the new layout: value slots, allocas, save slots
+    let mut new_slot = vec![0u64; nv];
+    for (members, old) in cand.iter().map(|c| (&c.2, c.3)).chain(
+        private.iter().map(|p| (&p.0, p.1)).chain(untouched.iter().map(|u| (&u.0, u.1))),
+    ) {
+        let off = slot_no[&old] * 8;
+        for v in members {
+            new_slot[*v as usize] = off;
+            // A register value with a save slot keeps its register.
+            if matches!(alloc.locs[*v as usize], Loc::Slot(_)) {
+                alloc.locs[*v as usize] = Loc::Slot(off);
+            }
+        }
+    }
+    let mut cursor = nslots * 8;
+    let mut alloca_off: Vec<Option<u64>> = vec![None; nv];
+    for b in &f.blocks {
+        if b.id != f.entry() && b.insts.iter().any(|i| matches!(i.op, Op::Alloca { .. })) {
+            continue;
+        }
+        for i in &b.insts {
+            if let Op::Alloca { size, align } = i.op {
+                if let Some(d) = i.dst {
+                    let a = if align == 0 { 1 } else { align.min(16) };
+                    cursor = align_up(cursor + size.max(1), a);
+                    alloca_off[d as usize] = Some(cursor);
+                }
+            }
+        }
+    }
+    let mut saved: Vec<(&'static str, u64)> = Vec::new();
+    for r in used_saved {
+        cursor += 8;
+        saved.push((*r, cursor));
+    }
+    for (d, off) in alloc.frame_addr.iter_mut() {
+        if let Some(Some(o)) = alloca_off.get(*d as usize).copied() {
+            *off = o;
+        }
+    }
+    // The entries of the saves around calls follow their values.
+    for list in alloc.call_saves.values_mut() {
+        for entry in list.iter_mut() {
+            if let Some(v) = save_owner.get(&entry.1) {
+                entry.1 = new_slot[*v as usize];
+            }
+        }
+    }
+    alloc.frame = Frame { slot: new_slot, alloca_off, size: align_up(cursor, 16) };
+    alloc.saved = saved;
+    alloc.value_slots = nslots as usize;
 }
 
 // ------------------------------------------------------------- Emission ---
@@ -3736,6 +3983,15 @@ fn interferes(
 
 /// Register aware emission of a function.
 /// `None` = this path is not responsible, the base path takes over.
+/// ROUND TK2 (r136): the frame this function will get -- the one of the
+/// register path (after `compact_frame`) or of the base path.
+pub(crate) fn frame_bytes(f: &Func) -> u64 {
+    if !supported(f) {
+        return crate::codegen_x86::base_frame_bytes(f);
+    }
+    allocate(f).frame.size
+}
+
 pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), String>> {
     if !supported(f) {
         return None;
@@ -3955,8 +4211,8 @@ fn emit_variant(f: &Func) -> Result<String, String> {
     // with the rest -- every one of them starts with a `.L` label,
     // which resets the descriptor, so they can believe nothing.
     tmp.flush_cold();
-    let nv = f.val_types.len();
-    Ok(descriptor_peephole(&tmp.out, nv))
+    // ROUND TK2: the value slots are 8..=value_slots*8 (compact_frame)
+    Ok(descriptor_peephole(&tmp.out, a.value_slots))
 }
 
 // ------------------------------------------------- Register descriptor ---

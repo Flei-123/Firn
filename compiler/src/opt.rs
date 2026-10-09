@@ -417,6 +417,18 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         for f in m.funcs.iter_mut() {
             optimize_func(f, &mut st, cfg, &mut clk);
         }
+        // ROUND TK2 (r136): the recursive callers kept for the frame budget go
+        // through the same passes as the module.
+        let mut kept = crate::inline::rec_originals_take();
+        for f in kept.values_mut() {
+            optimize_func(f, &mut st, cfg, &mut clk);
+        }
+        crate::inline::rec_originals_put(kept);
+        let mut small = crate::inline::rec_small_take();
+        for f in small.values_mut() {
+            optimize_func(f, &mut st, cfg, &mut clk);
+        }
+        crate::inline::rec_small_put(small);
         // TEMPO 15: a second round on the cleaned up bodies (see
         // `inline_module_again`); only the callers that got something are
         // optimized once more. `FIRN_NO_INLINE2=1` switches it off.

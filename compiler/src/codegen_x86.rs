@@ -85,6 +85,11 @@ pub(crate) struct Frame {
     pub(crate) size: u64,
 }
 
+/// ROUND TK2: the frame size of the base path (regalloc::frame_bytes).
+pub(crate) fn base_frame_bytes(f: &Func) -> u64 {
+    layout(f).size
+}
+
 fn layout(f: &Func) -> Frame {
     let n = f.val_types.len();
     let mut slot = vec![0u64; n];
@@ -426,13 +431,58 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // Byte range of every function (with its cold half) in `e.out`, for
     // the pruning below.
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(m.funcs.len());
+    // ROUND TK2 (r136): a recursive caller that took embeddings of the
+    // size-ordered phase goes out embedded only while its frame stays in the
+    // budget (inline.rs, REC_ORIGINALS); otherwise as it was before, or as the
+    // middle version with the small bodies only.
+    let mut kept = crate::inline::rec_originals_take();
+    let mut small = crate::inline::rec_small_take();
+    let budget_dbg = std::env::var_os("FIRNC_INLINE_STATS").is_some();
+    let (mut rec_in, mut rec_small, mut rec_out) = (0usize, 0usize, 0usize);
     for f in &m.funcs {
         let start = e.out.len();
         if fsec {
             e.raw(&format!(".section .text.{},\"ax\",@progbits", label(&f.name)));
         }
-        emit_func(&mut e, f)?;
+        let mut chosen: Option<Func> = None;
+        if let Some(orig) = kept.remove(&f.name) {
+            let fe = crate::regalloc::frame_bytes(f);
+            let fk = crate::regalloc::frame_bytes(&orig);
+            if crate::inline::rec_frame_within_budget(fe, fk) {
+                rec_in += 1;
+            } else {
+                let mid = small.remove(&f.name).filter(|mid| {
+                    crate::inline::rec_frame_within_budget(crate::regalloc::frame_bytes(mid), fk)
+                });
+                match mid {
+                    Some(mid) => {
+                        if budget_dbg {
+                            eprintln!(
+                                "frame-budget: {} {} -> {} octets, small bodies only",
+                                f.name, fk, fe
+                            );
+                        }
+                        rec_small += 1;
+                        chosen = Some(mid);
+                    }
+                    None => {
+                        if budget_dbg {
+                            eprintln!("frame-budget: {} {} -> {} octets, kept as it was", f.name, fk, fe);
+                        }
+                        rec_out += 1;
+                        chosen = Some(orig);
+                    }
+                }
+            }
+        }
+        emit_func(&mut e, chosen.as_ref().unwrap_or(f))?;
         ranges.push((start, e.out.len()));
+    }
+    if budget_dbg {
+        eprintln!(
+            "frame-budget: {} recursive callers embedded, {} small bodies only, {} kept as they were",
+            rec_in, rec_small, rec_out
+        );
     }
     if fsec {
         e.raw(".text");

@@ -58,6 +58,73 @@ const MAX_PRIO_INLINES: usize = 200_000;
 /// Growth guard of the size-ordered phase, in percent of the module size
 /// before it started.
 const MAX_GROWTH_PCT: usize = 40;
+/// Largest callee embedded into a (self-)recursive caller in the middle
+/// version kept for the frame budget (see `REC_SMALL`).
+const REC_CALLER_TIER: usize = 10;
+
+/// ROUND TK2 (Certus, r136) -- THE FRAME BUDGET OF A RECURSIVE CALLER.
+///
+/// A recursive caller pays every octet of frame growth once per recursion
+/// level, which is why the size-ordered phase gave it nothing (round INLGZ).
+/// Since the value slots are shared by lifetime (regalloc.rs,
+/// `compact_frame`) an embedded body costs a recursive frame little -- but
+/// "little" is a measurement, not a promise. So a recursive caller now takes
+/// the same sites as every other caller (`FIRNC_INLINE_REC=2`, the default on
+/// x86-64), its body as it was BEFORE the first such embedding is kept here,
+/// optimised and phi-eliminated like the module (opt.rs, main.rs), and the
+/// code generator compiles both and keeps the embedded one only if its frame
+/// stays within `rec_frame_within_budget` (codegen_x86::emit). Otherwise the
+/// function goes out as it was. `FIRNC_INLINE_REC=0` is round INLGZ (nothing
+/// into recursive callers), `=1` the old one-block experiment.
+static REC_ORIGINALS: std::sync::Mutex<Option<HashMap<String, Func>>> =
+    std::sync::Mutex::new(None);
+/// The same callers as they stood after the tiers up to `REC_CALLER_TIER` --
+/// only the small bodies embedded. The code generator falls back to this
+/// middle version when the full one breaks the budget (the frame of the
+/// Certus `parse_primary` grew 112 -> 960 octets with everything embedded,
+/// 112 -> 128 with the small bodies only).
+static REC_SMALL: std::sync::Mutex<Option<HashMap<String, Func>>> =
+    std::sync::Mutex::new(None);
+
+fn table_take(t: &std::sync::Mutex<Option<HashMap<String, Func>>>) -> HashMap<String, Func> {
+    t.lock().map(|mut g| g.take().unwrap_or_default()).unwrap_or_default()
+}
+
+fn table_put(t: &std::sync::Mutex<Option<HashMap<String, Func>>>, m: HashMap<String, Func>) {
+    if let Ok(mut g) = t.lock() {
+        match g.as_mut() {
+            Some(x) => x.extend(m),
+            None => *g = Some(m),
+        }
+    }
+}
+
+/// The kept bodies (the table is empty afterwards).
+pub fn rec_originals_take() -> HashMap<String, Func> {
+    table_take(&REC_ORIGINALS)
+}
+
+/// Put (back) kept bodies.
+pub fn rec_originals_put(m: HashMap<String, Func>) {
+    table_put(&REC_ORIGINALS, m)
+}
+
+/// The middle versions (small bodies only), taken like the kept ones.
+pub fn rec_small_take() -> HashMap<String, Func> {
+    table_take(&REC_SMALL)
+}
+
+/// Put (back) middle versions.
+pub fn rec_small_put(m: HashMap<String, Func>) {
+    table_put(&REC_SMALL, m)
+}
+
+/// The frame of the embedded body may be this much larger than the frame of
+/// the kept one: 64 octets or an eighth, whichever is more.
+pub fn rec_frame_within_budget(embedded: u64, kept: u64) -> bool {
+    let slack = std::cmp::max(64, kept / 8);
+    embedded <= kept + slack
+}
 
 fn env_usize(name: &str, dflt: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(dflt)
@@ -830,10 +897,15 @@ impl CallGraph {
 /// Eligibility is the same as in the first-come loop (`inlinable`, caller
 /// bound, recursion, self recursion, constant time).
 ///
-/// A (self-)recursive CALLER takes nothing here: every octet of frame growth
-/// is paid once per recursion level. Measured: with every site up to 40
-/// instructions embedded the regexp backtracker's frame grew 7.8 -> 10.5 KiB
-/// and `/(a|b)*c/` over 60 000 characters ran off the stack. LIMIT: the call
+/// A (self-)recursive CALLER is special: every octet of frame growth is paid
+/// once per recursion level. Measured: with every site up to 40 instructions
+/// embedded and one slot per value, the regexp backtracker's frame grew
+/// 7.8 -> 10.5 KiB and `/(a|b)*c/` over 60 000 characters ran off the stack.
+/// With the value slots shared by lifetime (regalloc.rs `compact_frame`) the
+/// growth is small, so on x86-64 (`FIRNC_INLINE_REC=2`, see `REC_ORIGINALS`)
+/// a recursive caller takes the same sites as everybody else, and the code
+/// generator decides per function whether the embedded body fits the frame
+/// budget. Elsewhere (`FIRNC_INLINE_REC=0`) it takes nothing. LIMIT: the call
 /// graph sees direct calls only.
 ///
 /// `FIRNC_INLINE_OLD=1` skips this phase (A/B), `FIRNC_INLINE_BUDGET` and
@@ -843,17 +915,25 @@ fn inline_by_size(m: &mut Module, dbg: bool, changed: &mut Vec<usize>) -> usize 
     let budget = env_usize("FIRNC_INLINE_BUDGET", MAX_PRIO_INLINES);
     let growth_pct = env_usize("FIRNC_INLINE_GROWTH", MAX_GROWTH_PCT);
     let stats = std::env::var_os("FIRNC_INLINE_STATS").is_some();
-    inline_by_size_with(m, dbg || stats, changed, budget, growth_pct)
+    // The frame budget is decided in codegen_x86 and only the x86-64 frames
+    // share slots by lifetime; the other back ends keep round INLGZ.
+    let rec_default = if matches!(crate::target::active(), crate::target::Target::X86_64) { 2 } else { 0 };
+    let rec_mode = env_usize("FIRNC_INLINE_REC", rec_default);
+    inline_by_size_with(m, dbg || stats, changed, budget, growth_pct, rec_mode)
 }
 
-/// `inline_by_size` with the two bounds as parameters (the unit tests set them
-/// without touching the process environment).
+/// `inline_by_size` with the two bounds and the recursion mode as parameters
+/// (the unit tests set them without touching the process environment).
+/// `rec_mode`: 0 nothing into recursive callers, 1 only one-block bodies up to
+/// `REC_CALLER_TIER`, 2 everything, with the originals kept for the frame
+/// budget.
 fn inline_by_size_with(
     m: &mut Module,
     dbg: bool,
     changed: &mut Vec<usize>,
     budget: usize,
     growth_pct: usize,
+    rec_mode: usize,
 ) -> usize {
     let idx: HashMap<String, usize> =
         m.funcs.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
@@ -865,6 +945,8 @@ fn inline_by_size_with(
     let mut grown = 0usize;
     let mut n = 0usize;
     let mut per_tier: Vec<usize> = Vec::new();
+    let mut kept: HashMap<String, Func> = HashMap::new();
+    let mut small: HashMap<String, Func> = HashMap::new();
     // One tier per callee size, from just above the trivial leaves up: when
     // the growth guard stops the phase, it stops at a size boundary.
     let tiers: Vec<usize> = (MAX_TRIVIAL_INSTS + 1..=MAX_CALLEE_INSTS).collect();
@@ -885,7 +967,7 @@ fn inline_by_size_with(
                     v
                 }
             };
-            if caller_rec {
+            if caller_rec && (rec_mode == 0 || (rec_mode == 1 && tier > REC_CALLER_TIER)) {
                 continue;
             }
             let mut start_b = 0usize;
@@ -925,6 +1007,18 @@ fn inline_by_size_with(
                         if inst.dst.is_some() && callee.ret == FTy::Void {
                             continue;
                         }
+                        // Mode 1: into a recursive caller only bodies that
+                        // leave no frame slot behind (one block, no alloca).
+                        if caller_rec
+                            && rec_mode == 1
+                            && !(callee.blocks.len() == 1
+                                && !callee.blocks[0]
+                                    .insts
+                                    .iter()
+                                    .any(|i| matches!(i.op, Op::Alloca { .. })))
+                        {
+                            continue;
+                        }
                         if cg.reaches(gi, ci) {
                             continue;
                         }
@@ -956,6 +1050,11 @@ fn inline_by_size_with(
                             );
                         }
                         grown += m.funcs[gi].inst_count();
+                        // ROUND TK2 (r136): keep the recursive caller as it
+                        // was before its first embedding of this phase.
+                        if caller_rec && rec_mode >= 2 && !kept.contains_key(&m.funcs[ci].name) {
+                            kept.insert(m.funcs[ci].name.clone(), m.funcs[ci].clone());
+                        }
                         inline_one(m, ci, bi, ii, gi);
                         changed.push(ci);
                         n += 1;
@@ -966,13 +1065,25 @@ fn inline_by_size_with(
             }
         }
         per_tier.push(n - at_start);
+        // ROUND TK2 (r136): after the last small tier, the recursive callers
+        // that took something so far are snapshot as the middle version
+        // (small bodies only).
+        if rec_mode >= 2 && tier == REC_CALLER_TIER {
+            for name in kept.keys() {
+                if let Some(&ci) = idx.get(name) {
+                    small.insert(name.clone(), m.funcs[ci].clone());
+                }
+            }
+        }
     }
     if dbg {
         eprintln!(
-            "inline-by-size: {} sites, tiers {:?} -> {:?}, module {} insts, +{} copied (guard {})",
-            n, tiers, per_tier, base, grown, max_growth
+            "inline-by-size: {} sites, tiers {:?} -> {:?}, module {} insts, +{} copied (guard {}), {} recursive callers kept for the frame budget",
+            n, tiers, per_tier, base, grown, max_growth, kept.len()
         );
     }
+    rec_originals_put(kept);
+    rec_small_put(small);
     n
 }
 
@@ -1325,15 +1436,15 @@ mod tests {
         f
     }
 
-    fn calls_to(m: &Module, caller: &str, callee: &str) -> usize {
-        m.funcs
-            .iter()
-            .find(|f| f.name == caller)
-            .expect("caller")
-            .blocks
+    fn calls_to_func(f: &Func, callee: &str) -> usize {
+        f.blocks
             .iter()
             .map(|b| b.insts.iter().filter(|i| matches!(&i.op, Op::Call { name, .. } if name == callee)).count())
             .sum()
+    }
+
+    fn calls_to(m: &Module, caller: &str, callee: &str) -> usize {
+        calls_to_func(m.funcs.iter().find(|f| f.name == caller).expect("caller"), callee)
     }
 
     #[test]
@@ -1370,7 +1481,7 @@ mod tests {
         m.funcs.push(chain_fn("small", 8));
         m.funcs.push(caller_of("user", &["big", "small"]));
         let mut changed = Vec::new();
-        let n = inline_by_size_with(&mut m, false, &mut changed, 1, 100);
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1, 100, 0);
         assert_eq!(n, 1);
         assert_eq!(calls_to(&m, "user", "small"), 0);
         assert_eq!(calls_to(&m, "user", "big"), 1);
@@ -1389,7 +1500,7 @@ mod tests {
         m.funcs.push(chain_fn("filler", 1190));
         assert_eq!(m.inst_count(), 1203);
         let mut changed = Vec::new();
-        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 1);
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 1, 0);
         assert_eq!(n, 2);
         assert_eq!(calls_to(&m, "user", "small"), 2);
     }
@@ -1402,9 +1513,62 @@ mod tests {
         m.funcs.push(chain_fn("small", 8));
         m.funcs.push(caller_of("rec", &["small", "rec"]));
         let mut changed = Vec::new();
-        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100);
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100, 0);
         assert_eq!(n, 0);
         assert_eq!(calls_to(&m, "rec", "small"), 1);
+    }
+
+    /// The tables of the frame budget are process wide, so the tests that
+    /// use them take turns.
+    static REC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn size_ordered_phase_keeps_the_original_of_a_recursive_caller() {
+        // mode 2: `rec` takes the small body, and its body as it was before is
+        // kept for the frame budget; the middle version (after the small
+        // tiers) is kept too because the body is below REC_CALLER_TIER.
+        let _guard = REC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = rec_originals_take();
+        let _ = rec_small_take();
+        let mut m = Module::new();
+        m.funcs.push(chain_fn("small", 8));
+        m.funcs.push(caller_of("rec_k", &["small", "rec_k"]));
+        let mut changed = Vec::new();
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100, 2);
+        assert_eq!(n, 1);
+        assert_eq!(calls_to(&m, "rec_k", "small"), 0);
+        let kept = rec_originals_take();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(calls_to_func(&kept["rec_k"], "small"), 1, "the original still calls the body");
+        let mid = rec_small_take();
+        assert_eq!(mid.len(), 1);
+        assert_eq!(calls_to_func(&mid["rec_k"], "small"), 0, "the middle version has the small body in");
+    }
+
+    #[test]
+    fn size_ordered_phase_mode_one_takes_only_one_block_bodies() {
+        let _guard = REC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = rec_originals_take();
+        let _ = rec_small_take();
+        let mut m = Module::new();
+        m.funcs.push(chain_fn("small", 8));
+        m.funcs.push(caller_of("rec_1", &["small", "rec_1"]));
+        let mut changed = Vec::new();
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100, 1);
+        // `chain_fn` is a single block without an alloca: taken, and nothing
+        // is kept in mode 1
+        assert_eq!(n, 1);
+        assert!(rec_originals_take().is_empty());
+        assert!(rec_small_take().is_empty());
+    }
+
+    #[test]
+    fn the_frame_budget_is_sixty_four_octets_or_an_eighth() {
+        assert!(rec_frame_within_budget(112, 112));
+        assert!(rec_frame_within_budget(176, 112)); // 112 + 64
+        assert!(!rec_frame_within_budget(177, 112));
+        assert!(rec_frame_within_budget(1_150, 1_024)); // 1_024 + 128
+        assert!(!rec_frame_within_budget(1_153, 1_024));
     }
 
     #[test]
@@ -1414,7 +1578,7 @@ mod tests {
         m.funcs.push(caller_of("a", &["b"]));
         m.funcs.push(caller_of("b", &["a"]));
         let mut changed = Vec::new();
-        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100);
+        let n = inline_by_size_with(&mut m, false, &mut changed, 1000, 100, 0);
         assert_eq!(n, 0);
     }
 }
