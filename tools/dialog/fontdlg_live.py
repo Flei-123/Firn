@@ -496,8 +496,11 @@ if r.win:
     r.close_window()
     out = r.finish()
     check("closing the window (WM_DELETE_WINDOW) = cancelled", out == "STATUS canceled\n", out)
-envn = dict(ENV)
-envn.pop("DISPLAY")
+# no display: DISPLAY must name a server that is not there (unset means display 0, and a busy machine has one)
+nodisp = 7000
+while os.path.exists("/tmp/.X11-unix/X%d" % nodisp):
+    nodisp += 1
+envn = dict(ENV, DISPLAY=":%d" % nodisp)
 p = subprocess.run([DRIVER, "Test Box", "20"], env=envn, capture_output=True, text=True, timeout=20)
 check("no display: no window (the driver reports it, nothing hangs)", p.stdout == "STATUS nowindow\n", p.stdout)
 
