@@ -140,5 +140,10 @@ no frame grows (`tools/result_location`). `tests/2413_tuple_swap_alias.fi`.
 
 `tools/tuples/run.sh` runs every positive program through both compilers,
 every refused program through both (they must both say no, with a real
-error), and compares the syntax trees (`--emit=ast-canon` against
-`bin/astdump.fi`).
+error), compares the syntax trees (`--emit=ast-canon` against
+`bin/astdump.fi`), and runs random programs (`tools/tuples/gen.py`: tuples of
+every integer width, floats, `bool`, nested tuples and a struct as parameters
+and results, up to five elements, folded into one checksum) through `firnc1`,
+`firnc0` on all four build levels and `firnc0` for aarch64 under qemu -- the
+checksum has to be the same everywhere (a wrong register class, alignment or
+hidden result pointer changes it).
