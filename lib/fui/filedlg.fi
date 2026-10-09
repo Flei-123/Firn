@@ -33,6 +33,7 @@
 import std.rt
 import std.fs
 import std.env
+import std.dir
 import std.time
 import fui.filemodel
 import fui.app
@@ -66,7 +67,7 @@ export {
     ent_of_view, path_of_view, crumb_slot, place_of_node, pl_label, pl_path, set_focus, focus_of,
     selected_count, list_hit, col_size_x, col_date_x, sb_thumb, sb_visible, list_max_scroll,
     list_content_h, list_body_h, list_x, list_y, list_w, list_h, can_back, can_forward, can_up,
-    place_current, tab_stops, select_range, select_toggle, close_newfolder, filter_label_s,
+    xdg_dir, complete_path, place_current, tab_stops, select_range, select_toggle, close_newfolder, filter_label_s,
     cb_filter, crumb_label, crumb_target, icon_of_entry, compute_ok, clock, utf8_push, muted_for,
     MODE_OPEN, MODE_OPEN_MANY, MODE_SAVE, MODE_FOLDER,
     WIN_W, WIN_H, set_clock, tab_move,
@@ -136,6 +137,10 @@ struct Dlg {
     nfilt: usize,
     fidx: usize,
     fctx: [FilterCtx; 16],
+    fact: [usize; 16],
+    fids: rt.Buf,
+    fid_off: [usize; 16],
+    fid_len: [usize; 16],
     flabels: rt.Buf,
     f_off: [usize; 16],
     f_len: [usize; 16],
@@ -549,7 +554,7 @@ fn xdg_dir(conf: str, key: str, home: str, out: *mut rt.Buf) -> bool {
     return false
 }
 
-fn add_xdg(d: *mut Dlg, conf: str, key: str, label: str, fallback: str, icon: i64) {
+fn add_xdg(d: *mut Dlg, conf: str, key: str, label: str, fallback: str, alt: str, icon: i64) {
     var p: rt.Buf = rt.buf_new()
     let home: str = filemodel.buf_str(&(*d).home)
     var found: bool = xdg_dir(conf, key, home, &p)
@@ -560,6 +565,15 @@ fn add_xdg(d: *mut Dlg, conf: str, key: str, label: str, fallback: str, icon: i6
     }
     var n: rt.Buf = rt.buf_new()
     filemodel.path_normalize(filemodel.buf_str(&p), &n)
+    if !fs.is_dir(filemodel.buf_str(&n)) && !found && alt.n > 0 {
+        // no user-dirs.dirs: the German name of the folder, if that is the one that exists
+        rt.buf_clear(&n)
+        rt.buf_clear(&p)
+        filemodel.push_str(&p, home)
+        rt.buf_push(&p, 47 as u8)
+        filemodel.push_str(&p, alt)
+        filemodel.path_normalize(filemodel.buf_str(&p), &n)
+    }
     if fs.is_dir(filemodel.buf_str(&n)) {
         add_fixed(d, label, filemodel.buf_str(&n), icon)
     }
@@ -578,12 +592,12 @@ fn places_init(d: *mut Dlg) {
     filemodel.push_str(&cp, "/.config/user-dirs.dirs")
     let r: usize = fs.read_file(filemodel.buf_str(&cp), &conf) catch 0
     let cs: str = filemodel.buf_str(&conf)
-    add_xdg(d, cs, "DESKTOP", "Desktop", "Desktop", lucide.MONITOR)
-    add_xdg(d, cs, "DOCUMENTS", "Documents", "Documents", lucide.FILE_TEXT)
-    add_xdg(d, cs, "DOWNLOAD", "Downloads", "Downloads", lucide.DOWNLOAD)
-    add_xdg(d, cs, "PICTURES", "Pictures", "Pictures", lucide.IMAGE)
-    add_xdg(d, cs, "MUSIC", "Music", "Music", lucide.LIBRARY)
-    add_xdg(d, cs, "VIDEOS", "Videos", "Videos", lucide.PLAY)
+    add_xdg(d, cs, "DESKTOP", "Desktop", "Desktop", "Schreibtisch", lucide.MONITOR)
+    add_xdg(d, cs, "DOCUMENTS", "Documents", "Documents", "Dokumente", lucide.FILE_TEXT)
+    add_xdg(d, cs, "DOWNLOAD", "Downloads", "Downloads", "", lucide.DOWNLOAD)
+    add_xdg(d, cs, "PICTURES", "Pictures", "Pictures", "Bilder", lucide.IMAGE)
+    add_xdg(d, cs, "MUSIC", "Music", "Music", "Musik", lucide.LIBRARY)
+    add_xdg(d, cs, "VIDEOS", "Videos", "Videos", "Filme", lucide.PLAY)
     add_fixed(d, "Computer", "/", lucide.HARD_DRIVE)
     rt.buf_free(&conf)
     rt.buf_free(&cp)
@@ -850,7 +864,7 @@ fn crumbs_update(d: *mut Dlg) {
     var first: usize = np
     // walk back from the last part while it fits
     var k: usize = np
-    var ell: usize = 34
+    var ell: usize = 52
     while k > 0 {
         let lab: str = str { p: ((path.p as u64) + starts[k - 1] as u64) as *mut u8, n: ends[k - 1] - starts[k - 1] }
         let w: f64 = crumb_width_pts(d, lab, false) as f64
@@ -1552,6 +1566,12 @@ fn update_name_from_sel(d: *mut Dlg) {
                 rt.buf_push(&b, 34 as u8)
             }
             k = k + 1
+        }
+        // the field holds 255 octets: a longer list is a count (the choice itself is what OK takes)
+        if rt.buf_len(&b) > 200 {
+            rt.buf_clear(&b)
+            rt.buf_push_dec_u64(&b, cnt as u64)
+            filemodel.push_str(&b, " files chosen")
         }
     }
     set_name_text(d, filemodel.buf_str(&b))
@@ -2363,6 +2383,111 @@ fn commit_path(d: *mut Dlg) {
     rt.buf_free(&full)
 }
 
+// Tab in the path field: complete the last part of the typed path with the folders of its parent folder. One
+// match: the name and a "/"; several: what they share, and the status line names them; none: a note.
+// true = the key was used here (the focus stays in the field).
+#[allow_escape]
+fn complete_path(d: *mut Dlg) -> bool {
+    let t: str = app.text((*d).a, (*d).n_path)
+    if t.n == 0 {
+        return false
+    }
+    let ls: usize = filemodel.last_slash(t)
+    var head: str = ""
+    var pre: str = t
+    if ls != filemodel.NONE {
+        head = str { p: t.p, n: ls + 1 }
+        pre = str { p: ((t.p as u64) + (ls + 1) as u64) as *mut u8, n: t.n - ls - 1 }
+    }
+    var pb: rt.Buf = rt.buf_new()
+    var lookup: str = head
+    if head.n == 0 {
+        lookup = "."
+    }
+    filemodel.path_resolve(filemodel.model_path(&(*d).m), filemodel.buf_str(&(*d).home), lookup, &pb)
+    var dd: dir.Dir = dir.open(filemodel.buf_str(&pb))
+    if !dir.is_open(&dd) {
+        dir.close(&dd)
+        rt.buf_free(&pb)
+        return false
+    }
+    var common: rt.Buf = rt.buf_new()
+    var names: rt.Buf = rt.buf_new()
+    var full: rt.Buf = rt.buf_new()
+    var hits: usize = 0
+    while dir.next(&dd) {
+        let nm: str = dd.name
+        if nm.n < pre.n || nm.n == 0 {
+            continue
+        }
+        if !filemodel.str_eq(str { p: nm.p, n: pre.n }, pre) {
+            continue
+        }
+        // a hidden folder only when a dot was typed
+        if rt.ld8(nm.p as u64, 0) == (46 as u8) && pre.n == 0 {
+            continue
+        }
+        var isdir: bool = dd.kind == dir.KIND_DIR
+        if dd.kind == dir.KIND_LINK || dd.kind == dir.KIND_UNKNOWN {
+            rt.buf_clear(&full)
+            filemodel.push_str(&full, filemodel.buf_str(&pb))
+            if pb.len != 1 {
+                rt.buf_push(&full, 47 as u8)
+            }
+            filemodel.push_str(&full, nm)
+            isdir = fs.is_dir(filemodel.buf_str(&full))
+        }
+        if !isdir {
+            continue
+        }
+        if hits == 0 {
+            filemodel.push_str(&common, nm)
+        } else {
+            // keep only the leading bytes both names share
+            let cs: str = filemodel.buf_str(&common)
+            var k: usize = 0
+            while k < cs.n && k < nm.n && rt.ld8(cs.p as u64, k) == rt.ld8(nm.p as u64, k) {
+                k = k + 1
+            }
+            rt.buf_set_len(&common, k)
+        }
+        if hits < 8 {
+            if hits > 0 {
+                filemodel.push_str(&names, ", ")
+            }
+            filemodel.push_str(&names, nm)
+        }
+        hits = hits + 1
+    }
+    dir.close(&dd)
+    var used: bool = true
+    if hits == 0 {
+        set_status2(d, "No folder starts with: ", pre, true)
+    } else if hits == 1 {
+        var nt: rt.Buf = rt.buf_new()
+        filemodel.push_str(&nt, head)
+        filemodel.push_str(&nt, filemodel.buf_str(&common))
+        rt.buf_push(&nt, 47 as u8)
+        app.set_text((*d).a, (*d).n_path, filemodel.buf_str(&nt))
+        rt.buf_free(&nt)
+        refresh_status(d)
+    } else {
+        if common.len > pre.n {
+            var nt2: rt.Buf = rt.buf_new()
+            filemodel.push_str(&nt2, head)
+            filemodel.push_str(&nt2, filemodel.buf_str(&common))
+            app.set_text((*d).a, (*d).n_path, filemodel.buf_str(&nt2))
+            rt.buf_free(&nt2)
+        }
+        set_status2(d, "Folders: ", filemodel.buf_str(&names), false)
+    }
+    rt.buf_free(&pb)
+    rt.buf_free(&common)
+    rt.buf_free(&names)
+    rt.buf_free(&full)
+    return used
+}
+
 // ============================================================ FOCUS / TAB ORDER
 
 fn set_focus(d: *mut Dlg, n: usize) {
@@ -2594,6 +2719,9 @@ fn on_key(ud: u64, key: u32, mods: u32) -> bool {
         return true
     }
     if key == editor.KEY_TAB {
+        if f == (*d).n_path && !mods_has(mods, editor.MOD_SHIFT) && !(*d).confirm && complete_path(d) {
+            return true
+        }
         tab_move(d, mods_has(mods, editor.MOD_SHIFT))
         return true
     }
@@ -3025,10 +3153,6 @@ fn filter_menu(ud: u64, pc: *mut ctxmenu.ProviderCtx) {
     let d: *mut Dlg = dlg_of(a)
     var i: usize = 0
     while i < (*d).nfilt {
-        var id: rt.Buf = rt.buf_new()
-        let reg: *mut action.Actions = app.actions(a)
-        // the actions were declared at build time under "filter0" ...
-        rt.buf_free(&id)
         let idx: usize = filter_action(d, i)
         if idx != action.ACT_NONE {
             let e: usize = ctxmenu.pc_add(pc, idx)
@@ -3037,10 +3161,8 @@ fn filter_menu(ud: u64, pc: *mut ctxmenu.ProviderCtx) {
     }
 }
 
-static mut G_FACT: [usize; 16] = [0; 16]
-
 fn filter_action(d: *mut Dlg, i: usize) -> usize {
-    return G_FACT[i]
+    return (*d).fact[i]
 }
 
 // ============================================================ BUILD
@@ -3237,6 +3359,7 @@ fn state_init(d: *mut Dlg) {
     (*d).st_buf = rt.buf_new()
     (*d).cur = NONE
     (*d).anchor = NONE
+    (*d).fids = rt.buf_new()
     (*d).fake_ms = 0 - 1
     (*d).hover_key = NONE
     (*d).focus_pending = NONE
@@ -3244,7 +3367,7 @@ fn state_init(d: *mut Dlg) {
 
 // Build the dialog window (not shown yet). 0 when there is no memory.
 #[allow_escape]
-fn dlg_new(mode: i32, title: str, dir: str, name: str, filters: str, out: *mut rt.Buf) -> *mut Dlg {
+fn dlg_new(mode: i32, title: str, start_dir: str, name: str, filters: str, out: *mut rt.Buf) -> *mut Dlg {
     let p: u64 = alloc_of[Dlg]()
     if p == 0 {
         return 0 as u64 as *mut Dlg
@@ -3291,39 +3414,26 @@ fn dlg_new(mode: i32, title: str, dir: str, name: str, filters: str, out: *mut r
     let ok1: bool = app.on(a, (*d).n_list, event.EV_POINTER_ALL | event.ev_bit(event.EV_TAP) | event.ev_bit(event.EV_DOUBLE_TAP), on_list_pointer)
     let ok2: bool = app.on(a, (*d).n_loc, event.ev_bit(event.EV_POINTER_DOWN), on_loc_pointer)
     let ok3: bool = app.on(a, (*d).n_root, event.ev_bit(event.EV_POINTER_DOWN), on_root_pointer)
-    // the filter menu: radio actions under "filter0" ... (declared once, here)
+    // the filter menu: radio actions "filter0", "filter1" ... (declared once, here). The registry keeps the
+    // strings it is given, so they live in blocks of the dialog that do not move any more (all pushes first).
     if nf > 1 {
         k = 0
         while k < nf {
             (*d).fctx[k].d = d as u64
             (*d).fctx[k].idx = k
-            var idb: rt.Buf = rt.buf_new()
-            filemodel.push_str(&idb, "filter")
-            rt.buf_push_dec_u64(&idb, k as u64)
-            // `id` must outlive the registry: keep it in the labels block (after the labels)
-            let off: usize = rt.buf_len(&(*d).flabels)
-            filemodel.push_str(&(*d).flabels, filemodel.buf_str(&idb))
-            rt.buf_free(&idb)
+            (*d).fid_off[k] = rt.buf_len(&(*d).fids)
+            filemodel.push_str(&(*d).fids, "filter")
+            rt.buf_push_dec_u64(&(*d).fids, k as u64)
+            (*d).fid_len[k] = rt.buf_len(&(*d).fids) - (*d).fid_off[k]
             k = k + 1
         }
-        // all pushes are done: the block does not move any more
-        var off2: usize = 0
+        let reg: *mut action.Actions = app.actions(a)
         k = 0
         while k < nf {
-            off2 = (*d).f_off[nf - 1] + (*d).f_len[nf - 1]
-            k = k + 1
-        }
-        k = 0
-        var idoff: usize = off2
-        while k < nf {
-            let idn: usize = 6 + digits(k)
-            let idstr: str = str { p: ((rt.buf_data(&(*d).flabels) as u64) + idoff as u64) as *mut u8, n: idn }
-            let lab: str = filter_label_s(d, k)
-            let reg: *mut action.Actions = app.actions(a)
-            let ai: usize = action.act_add(reg, idstr, lab, filter_run, (&(*d).fctx[k]) as u64)
-            G_FACT[k] = ai
+            let idstr: str = str { p: ((rt.buf_data(&(*d).fids) as u64) + (*d).fid_off[k] as u64) as *mut u8, n: (*d).fid_len[k] }
+            let ai: usize = action.act_add(reg, idstr, filter_label_s(d, k), filter_run, (&(*d).fctx[k]) as u64)
+            (*d).fact[k] = ai
             action.act_set_radio(reg, ai, filter_state)
-            idoff = idoff + idn
             k = k + 1
         }
         let okc: bool = app.on_context(a, (*d).n_filter, filter_menu)
@@ -3339,8 +3449,8 @@ fn dlg_new(mode: i32, title: str, dir: str, name: str, filters: str, out: *mut r
     places_apply(d)
     // start folder and name
     var start: rt.Buf = rt.buf_new()
-    if dir.n > 0 {
-        filemodel.path_resolve("/", filemodel.buf_str(&(*d).home), dir, &start)
+    if start_dir.n > 0 {
+        filemodel.path_resolve("/", filemodel.buf_str(&(*d).home), start_dir, &start)
     }
     if rt.buf_len(&start) == 0 || !fs.is_dir(filemodel.buf_str(&start)) {
         rt.buf_clear(&start)
@@ -3364,19 +3474,14 @@ fn dlg_new(mode: i32, title: str, dir: str, name: str, filters: str, out: *mut r
     return d
 }
 
-fn digits(k: usize) -> usize {
-    if k >= 10 { return 2 }
-    return 1
-}
-
 fn dlg_free(d: *mut Dlg) {
     filemodel.model_free(&(*d).m)
 }
 
 // Show the dialog and wait. 0 = chosen (`out` filled), 1 = cancelled or closed, 12 = no window possible.
 #[allow_escape]
-fn run(mode: i32, title: str, dir: str, name: str, filters: str, out: *mut rt.Buf) -> i32 {
-    let d: *mut Dlg = dlg_new(mode, title, dir, name, filters, out)
+fn run(mode: i32, title: str, start_dir: str, name: str, filters: str, out: *mut rt.Buf) -> i32 {
+    let d: *mut Dlg = dlg_new(mode, title, start_dir, name, filters, out)
     if (d as u64) == 0 {
         return 12
     }

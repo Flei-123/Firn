@@ -27,6 +27,9 @@ rc=0
 make_tree() {
   local T=$1
   mkdir -p "$T"/alpha/sub1 "$T"/beta "$T"/zeta "$T"/.hidden_dir "$T"/noaccess "$T"/big
+  : > "$T"/beta/Ärger.txt
+  : > "$T"/beta/ünï.txt
+  : > "$T"/beta/zebra.txt
   echo x > "$T"/alpha/inner.txt
   head -c 10 /dev/zero > "$T"/a.png
   head -c 5000 /dev/zero > "$T"/B.PNG
