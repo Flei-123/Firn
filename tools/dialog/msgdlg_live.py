@@ -281,6 +281,11 @@ for mode, pal, env in (("light", LIGHT, ENV_LIGHT), ("dark", DARK, ENV_DARK)):
         res = r.result()
         check("%s %s: Esc dismisses (rc 1, answer Cancel)" % (NAMES[kind], mode), res is not None and res[:2] == (1, 2), res)
         check("%s %s: nothing on stderr" % (NAMES[kind], mode), res is not None and res[2] == "", res)
+        sz = getattr(r, "size", None)
+        if sz:
+            sw, sh = w.w / sz[0], w.h / sz[1]
+            check("%s %s: the window is the size `measure` said, at the screen's scale (%.3f / %.3f)" % (NAMES[kind], mode, sw, sh),
+                  abs(sw - sh) < 0.02 and 0.95 <= sw <= 1.6, (sz, w.w, w.h))
 
 # ---------------------------------------------------------------- 2. the keyboard and the mouse
 ENV = ENV_LIGHT
