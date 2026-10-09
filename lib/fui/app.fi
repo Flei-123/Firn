@@ -98,6 +98,10 @@ export {
     actions, context, action_add, on_context, on_context_global, std_edit,
     set_language, open_context, ctx_view, bind_action, set_locked, menu_manifest,
     set_proxy_call,
+    // r177 (file dialog): the keys, characters and wheel a program with a custom
+    // control wants before anyone else (KEYX_* = keys the hosts forward as codes
+    // of their own)
+    set_keys, set_wheel, set_motion, KEYX_F5,
     NONE,
     // the side a host and the tests see (lib/@*/fui/apphost.fi,
     // tools/fui/app_main.fi)
@@ -108,6 +112,8 @@ export {
 }
 
 const NONE: usize = 4294967295
+// keys beyond editor.KEY_*: F5 (a host that forwards it uses this code)
+const KEYX_F5: u32 = 100
 const ENTRIES_MAX: usize = 8
 const TEXT_CAP: usize = 256
 const STACK_MAX: usize = 16
@@ -179,10 +185,24 @@ struct App {
     ax: a11y.A11y,
     // the context menu state (CtxApp), made on first use; 0 = none (r161)
     cs: u64,
+    // r177: a program's first look at keys, characters and the wheel (set_keys,
+    // set_wheel); kh_on false = nobody
+    kh_on: bool,
+    kh_ud: u64,
+    kh_key: fn(u64, u32, u32) -> bool,
+    kh_chr: fn(u64, u32, u32) -> bool,
+    wh_on: bool,
+    wh_f: fn(u64, f64, f64, f64, f64) -> bool,
+    mo_on: bool,
+    mo_f: fn(u64, u32, f64, f64) -> bool,
 }
 
 fn cb_none(a: *mut App) {
 }
+
+fn kh_key_none(ud: u64, key: u32, mods: u32) -> bool { return false }
+fn wh_none(ud: u64, x: f64, y: f64, nx: f64, ny: f64) -> bool { return false }
+fn mo_none(ud: u64, kind: u32, x: f64, y: f64) -> bool { return false }
 
 // How big an App is -- measured like lib/plat/web.fi measures a Web:
 // there is no size_of in stage 0, and a written number would be wrong the
@@ -209,7 +229,9 @@ fn app_blank() -> App {
         ptr_x: 0.0, ptr_y: 0.0,
         n_ed: 0, ed_bufs: 0, quit: false, user: 0,
         rt: event.router_new(), next_key: 60000 as u32, rt_on: false, lists_on: false,
-        ax: a11y.a11y_new(), tr: anim.transreg_new(), cs: 0 }
+        ax: a11y.a11y_new(), tr: anim.transreg_new(), cs: 0,
+        kh_on: false, kh_ud: 0, kh_key: kh_key_none, kh_chr: kh_key_none,
+        wh_on: false, wh_f: wh_none, mo_on: false, mo_f: mo_none }
 }
 
 // ============================================================ ACTIONS AND CONTEXT MENUS (r161)
@@ -712,6 +734,37 @@ fn set_data(a: *mut App, p: u64) {
 
 fn data(a: *mut App) -> u64 {
     return (*a).user
+}
+
+// THE FIRST LOOK AT THE KEYBOARD (r177). A program with a control of its own
+// (a list that is one node with its own painter) hears every key and every
+// character BEFORE the text fields and the shortcuts do, whoever has the
+// focus: `key(ud, key, mods)` with editor.KEY_* (and KEYX_F5), `chr(ud, cp,
+// mods)` with the code point. true = taken. `ud` is passed back.
+fn set_keys(a: *mut App, ud: u64, key: fn(u64, u32, u32) -> bool,
+    chr: fn(u64, u32, u32) -> bool) {
+    (*a).kh_ud = ud
+    (*a).kh_key = key
+    (*a).kh_chr = chr
+    (*a).kh_on = true
+}
+
+// THE WHEEL WHERE NO SCROLL AREA IS (r177): `f(ud, x, y, nx, ny)` with the
+// pointer and the notches (positive = down / right). true = something changed.
+fn set_wheel(a: *mut App, ud: u64, f: fn(u64, f64, f64, f64, f64) -> bool) {
+    (*a).kh_ud = ud
+    (*a).wh_f = f
+    (*a).wh_on = true
+}
+
+// THE POINTER FOR A CONTROL OF THE PROGRAM'S OWN (r177): `f(ud, kind, x, y)` hears every move, leave, press and
+// release (fuiwirt.HOOK_*) with the pointer in device pixels. true = the picture changed (a hovered row of a list
+// that is one node): paint again. Nobody else needs to know where the pointer is: `ptr_x` / `ptr_y` of the App
+// stay where the last event put them.
+fn set_motion(a: *mut App, ud: u64, f: fn(u64, u32, f64, f64) -> bool) {
+    (*a).kh_ud = ud
+    (*a).mo_f = f
+    (*a).mo_on = true
 }
 
 // Force light (false) or dark (true) instead of the system's choice.
@@ -1308,6 +1361,13 @@ fn focused_slot(a: *mut App) -> usize {
 // (Tab moves the focus, Enter presses the focused button).
 fn app_key(ud: u64, key: u32, mods: u32) -> bool {
     let a: *mut App = ud as *mut App
+    if (*a).kh_on {
+        let f: fn(u64, u32, u32) -> bool = (*a).kh_key
+        if f((*a).kh_ud, key, mods) {
+            fuiwirt.host_touch(&(*a).w)
+            return true
+        }
+    }
     let k: usize = focused_slot(a)
     if k == NONE {
         return shortcut_key(a, key, mods)
@@ -1329,6 +1389,13 @@ fn app_key(ud: u64, key: u32, mods: u32) -> bool {
 // A character (a code point). true = a text field took it.
 fn app_char(ud: u64, cp: u32, mods: u32) -> bool {
     let a: *mut App = ud as *mut App
+    if (*a).kh_on {
+        let f: fn(u64, u32, u32) -> bool = (*a).kh_chr
+        if f((*a).kh_ud, cp, mods) {
+            fuiwirt.host_touch(&(*a).w)
+            return true
+        }
+    }
     let k: usize = focused_slot(a)
     if k == NONE {
         return shortcut_char(a, cp, mods)
@@ -1379,7 +1446,26 @@ fn press_field(a: *mut App, k: usize, x: f64, y: f64) {
 
 fn app_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     let a: *mut App = ud as *mut App
+    var extra: bool = false
+    if (*a).mo_on && kind != fuiwirt.HOOK_WHEEL {
+        (*a).ptr_x = x
+        (*a).ptr_y = y
+        let mf: fn(u64, u32, f64, f64) -> bool = (*a).mo_f
+        extra = mf((*a).kh_ud, kind, x, y)
+    }
+    let r: bool = app_hook_core(ud, kind, x, y)
+    return r || extra
+}
+
+fn app_hook_core(ud: u64, kind: u32, x: f64, y: f64) -> bool {
+    let a: *mut App = ud as *mut App
     if kind == fuiwirt.HOOK_WHEEL {
+        if (*a).wh_on {
+            let wf: fn(u64, f64, f64, f64, f64) -> bool = (*a).wh_f
+            if wf((*a).kh_ud, (*a).ptr_x, (*a).ptr_y, x, y) {
+                return true
+            }
+        }
         let k: usize = slot_at(a, (*a).ptr_x, (*a).ptr_y)
         if k == NONE || !(*a).area[k] {
             return false
