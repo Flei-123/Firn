@@ -64,7 +64,9 @@
 //   L2  The text is cut at 32,000 bytes and at 1,024 lines (a "..." ends it).
 //   L3  Not thread safe: one dialog at a time per process (the measuring
 //       painter is shared).
-//   L4  The text is not selectable; Ctrl+C copies all of it.
+//   L4  The text is not selectable; Ctrl+C copies all of it. Where there is no clipboard helper
+//       (xclip, wl-copy) the selection lives in this process: Ctrl+C answers requests for 400 ms
+//       (the window waits), which is enough for a clipboard manager to take a copy.
 import std.rt
 import std.clipboard
 import font.metrics
@@ -707,12 +709,13 @@ fn paint_icon(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
     draw_kind_icon(c, widget.w_x(e), widget.w_y(e), widget.w_w(e), widget.w_h(e), (*d).kind)
 }
 
-// The text: the visible lines of the table, each at its slot of the content.
+// The text: the visible lines of the table. Line i starts at the scaled i * pitch (the scaled total, not
+// i times a scaled pitch: at a scale like 104 % a rounded line pitch would drift away from the content
+// height the scroll area was given).
 fn paint_text(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
     let d: *mut Dlg = ud as *mut Dlg
     let z: *mut painter.Painter = render.ctx_painter(c)
     let px: f64 = render.len_of(c, font_pt())
-    let pitch: f64 = render.len_of(c, (*d).pitch)
     var r: painter.TextRun = painter.run_new(px)
     let cv: *mut canvas.Canvas = painter.painter_canvas(z)
     let y0: f64 = canvas.clip_y0(cv)
@@ -721,9 +724,10 @@ fn paint_text(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
     let p: u64 = rt.buf_ptr(&(*d).text)
     var i: usize = 0
     while i < (*d).nlines {
-        let ty: f64 = widget.w_y(e) + (i as f64) * pitch
-        if ty + pitch >= y0 && ty <= y1 && (*d).ll[i] > 0 as u32 {
-            let by: f64 = painter.text_baseline_mid(z, ty, pitch, px)
+        let ty: f64 = widget.w_y(e) + render.len_of(c, i * (*d).pitch)
+        let tb: f64 = widget.w_y(e) + render.len_of(c, (i + 1) * (*d).pitch)
+        if tb >= y0 && ty <= y1 && (*d).ll[i] > 0 as u32 {
+            let by: f64 = painter.text_baseline_mid(z, ty, tb - ty, px)
             let x1: f64 = painter.run_draw(z, &r, widget.w_x(e), by, 0.0, col,
                 p + ((*d).ls[i] as u64), (*d).ll[i] as usize, painter.TEXT_L)
         }
@@ -856,6 +860,11 @@ fn act_copy(ud: u64, cx: *mut action.ActCtx) {
     copy_string(ud as *mut app.App, &b)
     let s: str = str { p: rt.buf_ptr(&b) as *mut u8, n: rt.buf_len(&b) }
     let ok: bool = clipboard.copy_text(s)
+    // Without a helper program (xclip, wl-copy) the selection lives in this process: answer the
+    // first requests (a clipboard manager asks at once) before going back to the window.
+    if ok && clipboard.backend_name() == "native" {
+        clipboard.serve(400)
+    }
     rt.buf_free(&b)
 }
 
@@ -1032,7 +1041,12 @@ fn keys_and_names(a: *mut app.App, d: *mut Dlg) {
     a11y.a11y_set_name(ax, (*d).icon, kn.p as u64, kn.n)
     a11y.a11y_set_role(ax, (*d).txn, a11y.ROLE_TEXT)
     a11y.a11y_set_name(ax, (*d).txn, rt.buf_ptr(&(*d).text), rt.buf_len(&(*d).text))
-    a11y.a11y_set_role(ax, (*d).body, a11y.ROLE_GROUP)
+    // a message that asks for a decision interrupts: alertdialog; an information is a plain dialog
+    var role: u32 = a11y.ROLE_ALERTDIALOG
+    if (*d).kind == KIND_INFO {
+        role = a11y.ROLE_DIALOG
+    }
+    a11y.a11y_set_role(ax, (*d).body, role)
     a11y.a11y_set_name(ax, (*d).body, rt.buf_ptr(&(*d).title), rt.buf_len(&(*d).title))
 }
 
@@ -1045,14 +1059,26 @@ fn run(kind: i32, title: str, text: str, buttons: i32, answer: *mut i32) -> i32 
     }
     let d: *mut Dlg = dlg_of(a)
     // closing the window without a button is the close rule's answer
+    var before: i32 = 0
     if answer as u64 != 0 {
+        before = *answer
         *answer = (*d).esc_ans
     }
     let rc: i32 = app.run(a)
-    if rc != 0 && !(*d).done {
+    let done: bool = (*d).done
+    let picked: bool = (*d).picked
+    // the dialog's own memory goes back (the window's stays with the process: app.fi has no way to free it)
+    rt.buf_free(&(*d).title)
+    rt.buf_free(&(*d).text)
+    rt.heap_free(d as u64, dlg_size())
+    if rc != 0 && !done {
+        // no display, no font: the answer stays as the caller had it
+        if answer as u64 != 0 {
+            *answer = before
+        }
         return 12
     }
-    if (*d).picked {
+    if picked {
         return 0
     }
     return 1
@@ -1124,7 +1150,6 @@ fn close_answer(a: *mut app.App) -> i32 {
     let d: *mut Dlg = dlg_of(a)
     return (*d).esc_ans
 }
-
 
 fn win_size(a: *mut app.App) -> Size {
     let d: *mut Dlg = dlg_of(a)
