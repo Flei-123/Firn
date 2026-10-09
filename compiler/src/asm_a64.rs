@@ -1960,6 +1960,55 @@ impl Asm {
                 }
             }
         }
+        // floating point on vectors: `fadd v0.4s, v1.4s, v2.4s` (4s or 2d)
+        if let Some(base) = match m {
+            "fadd" => Some(0x0E20_D400u32),
+            "fsub" => Some(0x0EA0_D400),
+            "fmul" => Some(0x2E20_DC00),
+            "fdiv" => Some(0x2E20_FC00),
+            "fmax" => Some(0x0E20_F400),
+            "fmin" => Some(0x0EA0_F400),
+            "fcmeq" => Some(0x0E20_E400),
+            "fcmge" => Some(0x2E20_E400),
+            "fcmgt" => Some(0x2EA0_E400),
+            _ => None,
+        } {
+            if ops.len() == 3 {
+                if let (Some(a), Some(b), Some(c)) =
+                    (parse_vec(&ops[0]), parse_vec(&ops[1]), parse_vec(&ops[2]))
+                {
+                    let q = if a.count * elem_bits(a.elem) == 128 { 1u32 } else { 0 };
+                    let sz = if a.elem == 'd' { 1u32 } else { 0 };
+                    self.word(base | (q << 30) | (sz << 22) | rm(c.reg) | rn(b.reg) | rd(a.reg));
+                    return Ok(Some(()));
+                }
+            }
+        }
+        // conversions between integer and floating point on vectors
+        if let Some(base) = match m {
+            "fcvtzs" => Some(0x0EA1_B800u32),
+            "scvtf" => Some(0x0E21_D800),
+            "fcvtzu" => Some(0x2EA1_B800),
+            "ucvtf" => Some(0x2E21_D800),
+            _ => None,
+        } {
+            if ops.len() == 2 {
+                if let (Some(a), Some(b)) = (parse_vec(&ops[0]), parse_vec(&ops[1])) {
+                    let q = if a.count * elem_bits(a.elem) == 128 { 1u32 } else { 0 };
+                    let sz = if a.elem == 'd' { 1u32 } else { 0 };
+                    self.word(base | (q << 30) | (sz << 22) | rn(b.reg) | rd(a.reg));
+                    return Ok(Some(()));
+                }
+            }
+        }
+        // bitwise NOT on vectors: `mvn v0.16b, v1.16b` (= `not`)
+        if matches!(m, "mvn" | "not") && ops.len() == 2 {
+            if let (Some(a), Some(b)) = (parse_vec(&ops[0]), parse_vec(&ops[1])) {
+                let q = if a.count * elem_bits(a.elem) == 128 { 1u32 } else { 0 };
+                self.word(0x2E20_5800 | (q << 30) | rn(b.reg) | rd(a.reg));
+                return Ok(Some(()));
+            }
+        }
         // add/sub on vectors
         if matches!(m, "add" | "sub") && ops.len() == 3 {
             if let (Some(a), Some(b), Some(c)) =
@@ -2073,5 +2122,51 @@ fn elem_bits(c: char) -> u32 {
         's' => 32,
         'd' => 64,
         _ => 128,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The words of `.text` for a piece of assembler text.
+    fn words_of(s: &str) -> Vec<u32> {
+        let a = assemble(&format!(".text\n{}\n", s)).expect("assembles");
+        a.sections[SEC_TEXT]
+            .bytes
+            .chunks(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    /// The words `as` produces (objdump of the same lines), checked in by hand
+    /// once: the floating point operations of the `v128` type.
+    #[test]
+    fn vector_floating_point_operations_match_as() {
+        let cases: &[(&str, u32)] = &[
+            ("fadd v19.4s, v16.4s, v17.4s", 0x4e31d613),
+            ("fsub v0.4s, v1.4s, v2.4s", 0x4ea2d420),
+            ("fmul v3.4s, v4.4s, v5.4s", 0x6e25dc83),
+            ("fdiv v3.4s, v4.4s, v5.4s", 0x6e25fc83),
+            ("fadd v0.2d, v1.2d, v2.2d", 0x4e62d420),
+            ("fadd v0.2s, v1.2s, v2.2s", 0x0e22d420),
+            ("fmax v0.4s, v1.4s, v2.4s", 0x4e22f420),
+            ("fmin v0.4s, v1.4s, v2.4s", 0x4ea2f420),
+            ("fcmeq v0.4s, v1.4s, v2.4s", 0x4e22e420),
+            ("fcmge v0.4s, v1.4s, v2.4s", 0x6e22e420),
+            ("fcmgt v0.4s, v1.4s, v2.4s", 0x6ea2e420),
+            ("fcvtzs v0.4s, v1.4s", 0x4ea1b820),
+            ("scvtf v0.4s, v1.4s", 0x4e21d820),
+            ("fcvtzu v0.4s, v1.4s", 0x6ea1b820),
+            ("ucvtf v0.4s, v1.4s", 0x6e21d820),
+            ("fcvtzs v0.2d, v1.2d", 0x4ee1b820),
+            ("scvtf v31.4s, v30.4s", 0x4e21dbdf),
+            ("mvn v19.16b, v19.16b", 0x6e205a73),
+            ("mvn v0.8b, v1.8b", 0x2e205820),
+            ("not v3.16b, v4.16b", 0x6e205883),
+        ];
+        for (src, want) in cases {
+            assert_eq!(words_of(src), vec![*want], "{}", src);
+        }
     }
 }

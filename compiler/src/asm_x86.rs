@@ -696,6 +696,11 @@ impl Asm {
                 let (dr, bits) = reg_of(&d).ok_or_else(|| self.err("cmov needs a register"))?;
                 return Ok((Inst::Cmovcc { cc, dst: dr, bits, src: p(b, bits)? }, syms));
             }
+            // The compare pseudo operations: `cmpltps x, y` is `cmpps x, y, 1`
+            // (the predicate is part of the mnemonic, `as` fills the imm8 in).
+            if let Some(pred) = cmp_ps_predicate(m) {
+                return self.sse2(m, a, b, Some(pred), 0x00, 0, 0xC2, SseForm::RmI, &mut syms);
+            }
             // Everything from the 0F space
             if let Some((pfx, esc, op, form)) = sse_table(m) {
                 return self.sse2(m, a, b, None, pfx, esc, op, form, &mut syms);
@@ -1610,6 +1615,22 @@ enum SseForm {
     Digit(u8),
 }
 
+/// The predicate (the imm8 of `cmpps`) of a compare pseudo operation such as
+/// `cmpltps`, as the text of an immediate.
+fn cmp_ps_predicate(m: &str) -> Option<&'static str> {
+    Some(match m {
+        "cmpeqps" => "0",
+        "cmpltps" => "1",
+        "cmpleps" => "2",
+        "cmpunordps" => "3",
+        "cmpneqps" => "4",
+        "cmpnltps" => "5",
+        "cmpnleps" => "6",
+        "cmpordps" => "7",
+        _ => return None,
+    })
+}
+
 /// The instructions from the `0F` space that Firn's code generator emits.
 ///
 /// Established from `compiler/src/simd.rs` and from counting the tree; every
@@ -1639,6 +1660,21 @@ fn sse_table(m: &str) -> Option<(u8, u8, u8, SseForm)> {
         "comiss" => (0x00, 0, 0x2F, Rm),
         "cvtss2sd" => (0xF3, 0, 0x5A, Rm),
         "cvtsd2ss" => (0xF2, 0, 0x5A, Rm),
+        // --- floating point, packed single (the v128 f32 operations) ---
+        "addps" => (0x00, 0, 0x58, Rm),
+        "subps" => (0x00, 0, 0x5C, Rm),
+        "mulps" => (0x00, 0, 0x59, Rm),
+        "divps" => (0x00, 0, 0x5E, Rm),
+        "sqrtps" => (0x00, 0, 0x51, Rm),
+        "minps" => (0x00, 0, 0x5D, Rm),
+        "maxps" => (0x00, 0, 0x5F, Rm),
+        "cvtdq2ps" => (0x00, 0, 0x5B, Rm),
+        "cvtps2dq" => (0x66, 0, 0x5B, Rm),
+        "cvttps2dq" => (0xF3, 0, 0x5B, Rm),
+        "unpcklps" => (0x00, 0, 0x14, Rm),
+        "unpckhps" => (0x00, 0, 0x15, Rm),
+        "shufps" => (0x00, 0, 0xC6, RmI),
+        "cmpps" => (0x00, 0, 0xC2, RmI),
         // --- moving (load and store form) ---------------------------
         "movsd" => (0xF2, 0, 0x10, Mov(0x11)),
         "movss" => (0xF3, 0, 0x10, Mov(0x11)),
@@ -1646,6 +1682,8 @@ fn sse_table(m: &str) -> Option<(u8, u8, u8, SseForm)> {
         "movapd" => (0x66, 0, 0x28, Mov(0x29)),
         "movups" => (0x00, 0, 0x10, Mov(0x11)),
         "movupd" => (0x66, 0, 0x10, Mov(0x11)),
+        "movlps" => (0x00, 0, 0x12, Mov(0x13)),
+        "movhps" => (0x00, 0, 0x16, Mov(0x17)),
         "movdqa" => (0x66, 0, 0x6F, Mov(0x7F)),
         "movdqu" => (0xF3, 0, 0x6F, Mov(0x7F)),
         // --- bitwise, integer --------------------------------------
@@ -1786,4 +1824,53 @@ pub fn assemble_to_object(text: &str) -> Result<Vec<u8>, String> {
         })
         .collect();
     Ok(crate::elfobj::write(crate::elfobj::EM_X86_64, &secs, &syms))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The octets of `.text` for a piece of assembler text.
+    fn text_of(s: &str) -> String {
+        let a = assemble(&format!(".intel_syntax noprefix\n.text\n{}\n", s)).expect("assembles");
+        a.sections[SEC_TEXT].bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+    }
+
+    /// The octets `as` produces (objdump of the same lines), checked in by hand
+    /// once: the packed single operations of the `v128` type.
+    #[test]
+    fn packed_single_operations_match_as() {
+        let cases: &[(&str, &str)] = &[
+            ("addps xmm0, xmm1", "0f 58 c1"),
+            ("subps xmm2, xmm3", "0f 5c d3"),
+            ("mulps xmm8, xmm9", "45 0f 59 c1"),
+            ("divps xmm1, xmmword ptr [rax]", "0f 5e 08"),
+            ("sqrtps xmm1, xmm2", "0f 51 ca"),
+            ("minps xmm1, xmm2", "0f 5d ca"),
+            ("maxps xmm1, xmm2", "0f 5f ca"),
+            ("cvtdq2ps xmm1, xmm2", "0f 5b ca"),
+            ("cvtps2dq xmm1, xmm2", "66 0f 5b ca"),
+            ("cvttps2dq xmm1, xmm2", "f3 0f 5b ca"),
+            ("unpcklps xmm1, xmm2", "0f 14 ca"),
+            ("unpckhps xmm1, xmm2", "0f 15 ca"),
+            ("shufps xmm0, xmm1, 0x1b", "0f c6 c1 1b"),
+            ("cmpps xmm0, xmm1, 3", "0f c2 c1 03"),
+            ("cmpeqps xmm0, xmm1", "0f c2 c1 00"),
+            ("cmpltps xmm0, xmm1", "0f c2 c1 01"),
+            ("cmpleps xmm2, xmm3", "0f c2 d3 02"),
+            ("cmpunordps xmm0, xmm1", "0f c2 c1 03"),
+            ("cmpneqps xmm0, xmm1", "0f c2 c1 04"),
+            ("cmpnltps xmm9, xmm10", "45 0f c2 ca 05"),
+            ("cmpnleps xmm0, xmm1", "0f c2 c1 06"),
+            ("cmpordps xmm0, xmm1", "0f c2 c1 07"),
+            ("movlps xmm0, qword ptr [rax]", "0f 12 00"),
+            ("movlps qword ptr [rax], xmm1", "0f 13 08"),
+            ("movlps qword ptr [rbp - 8], xmm9", "44 0f 13 4d f8"),
+            ("movhps xmm0, qword ptr [rax]", "0f 16 00"),
+            ("movhps qword ptr [rax], xmm1", "0f 17 08"),
+        ];
+        for (src, want) in cases {
+            assert_eq!(&text_of(src), want, "{}", src);
+        }
+    }
 }
