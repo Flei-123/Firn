@@ -26,7 +26,17 @@ pub enum TypeExpr {
     /// **Round 58** — `fn(T1, T2) -> R`, a function as a value.
     /// `ret == None` is the function without a result (`fn(i32)`).
     Fn { params: Vec<TypeExpr>, ret: Option<Box<TypeExpr>>, span: Span },
+    /// **Round TUPLES** -- `(T1, T2, ..)`, at least two elements. A tuple is
+    /// a struct whose fields are called `0`, `1`, ... (docs/TUPLES.md); the
+    /// type checker makes the struct when it meets the type.
+    Tuple(Vec<TypeExpr>, Span),
 }
+
+/// **Round TUPLES** -- the name of the struct literal that a tuple literal
+/// `(a, b)` is read as. It can never be spelled in a source text; the type
+/// checker finds the struct from the types of the elements. The fields are
+/// called `0`, `1`, ... in order.
+pub const TUPLE_LIT: &str = "(tuple)";
 
 impl TypeExpr {
     pub fn span(&self) -> Span {
@@ -35,6 +45,7 @@ impl TypeExpr {
             TypeExpr::Ptr { span, .. } => *span,
             TypeExpr::Array { span, .. } => *span,
             TypeExpr::Fn { span, .. } => *span,
+            TypeExpr::Tuple(_, span) => *span,
         }
     }
 }

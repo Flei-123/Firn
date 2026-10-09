@@ -806,6 +806,9 @@ fn value_named(te: &TypeExpr) -> Option<String> {
         TypeExpr::Ptr { .. } => None,
         // Round 58: a function value is one word, not a struct by value.
         TypeExpr::Fn { .. } => None,
+        // Round TUPLES: not followed (a cycle through a tuple is found by the
+        // struct check once the tuple is a struct).
+        TypeExpr::Tuple(..) => None,
     }
 }
 

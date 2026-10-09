@@ -1876,6 +1876,20 @@ else
     grep -E 'FAIL' "$WORK/firnrun.log" | head -10 | sed 's/^/   /' || true
 fi
 
+echo "== 119. tuples in BOTH compilers (tools/tuples/run.sh, GAPS B5) =="
+# `(A, B)`, `(a, b)`, `t.0`, `let (a, b) = f()` and `-> (A, B)`: a tuple is a struct with the fields 0, 1, .. The
+# positive programs (layout and ABI of every size, drop order, modules, generics, the swap that reads its own target)
+# and every refused program (pattern of the wrong size, partial move out of a tuple with a `drop`, ...) go through
+# firnc0 AND firnc1 with the same verdict, and the syntax trees of the core programs are equal (ast-canon vs astdump).
+FIRNC="$FIRNC" bash tools/tuples/run.sh > "$WORK/tuples.log" 2>&1 && TURC=0 || TURC=$?
+if [ "$TURC" -eq 0 ]; then
+    ok
+    grep -E '^  tuples: ' "$WORK/tuples.log" | sed 's/^/ /'
+else
+    bad "tools/tuples/run.sh failed (see .test-work/tuples.log)"
+    grep -E 'DIFFERENT|WRONG|FAILED' "$WORK/tuples.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 118. type aliases in BOTH compilers (tools/typealias/run.sh, GAPS B14) =="
 # `type Idx = u32` is another name for the same type: the positive programs, the importing module in front of the
 # module it imports, a chain over three modules and every refused program (cycle, duplicate, generic alias, struct

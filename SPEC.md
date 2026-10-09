@@ -1143,6 +1143,27 @@ and nothing else. See `docs/TYPE_ALIASES.md`; proof in
 `tests/2400_type_alias.fi`, `tests/2401_type_alias_module.fi`,
 `tests/neg/2400..2407_alias_*.fi` and `tools/typealias/run.sh` (both compilers).
 
+### 12.9 Tuples (round TUPLES)
+
+```firn
+fn divmod(a: i32, b: i32) -> (i32, i32) { return (a / b, a % b) }
+
+let (q, r) = divmod(17, 5)
+let t: (i64, u8) = (10, 3)
+let x = t.0
+```
+
+`(A, B)` is a type, `(a, b)` builds a value, `t.0` reads an element,
+`let (a, b) = e` takes one apart (`_` skips, tuples nest, `var` makes the
+names writable), and a function returns several values with `-> (A, B)`. A
+tuple is a **struct whose fields are called `0`, `1`, ..**: declaration
+order, natural alignment, passed and returned like a struct, copied by
+value, an owner when an element has a `drop` (`let (a, b)` is then refused:
+no partial moves). Two tuple types are the same type when their element types
+are. At least two elements. See `docs/TUPLES.md`; proof in
+`tests/2410..2415_tuple_*.fi`, `tests/neg/2410..2419_tuple_*.fi` and
+`tools/tuples/run.sh` (both compilers).
+
 ### 12.1 The grammar of the v0 subset (EBNF)
 
 This is the grammar that `firnc0` **really** implements. The extensions from
@@ -1167,7 +1188,9 @@ type        = "i8"|"i16"|"i32"|"i64"|"u8"|"u16"|"u32"|"u64"|"usize"|"isize"|"boo
             | "*" [ "mut" ] type
             | "[" type ";" int_lit "]"
             | fn_type                              (* round 58 *)
+            | tuple_type                           (* round TUPLES, 12.9 *)
             | ident ;
+tuple_type  = "(" type "," type { "," type } [ "," ] ")" ;
 fn_type     = "fn" "(" [ type { "," type } ] ")" [ "->" type ] ;
 
 block       = "{" { stmt } "}" ;
@@ -1176,8 +1199,12 @@ stmt        = let_stmt | var_stmt | assign | if_stmt | while_stmt
             | return_stmt | expr_stmt | block ;
 for_stmt    = "for" ident "in" expr ".." expr block ;      (* round 2 *)
 jump_stmt   = "break" | "continue" ;                       (* round 2 *)
-let_stmt    = "let" ident [ ":" type ] "=" expr ;
-var_stmt    = "var" ident [ ":" type ] "=" expr ;
+let_stmt    = "let" ident [ ":" type ] "=" expr
+            | "let" tuple_pat [ ":" type ] "=" expr ;      (* round TUPLES *)
+var_stmt    = "var" ident [ ":" type ] "=" expr
+            | "var" tuple_pat [ ":" type ] "=" expr ;
+tuple_pat   = "(" pat "," pat { "," pat } [ "," ] ")" ;
+pat         = ident | "_" | tuple_pat ;
 assign      = lvalue "=" expr ;
 lvalue      = ident | lvalue "." ident | lvalue "[" expr "]" | "*" lvalue ;
 if_stmt     = "if" expr block [ "else" ( block | if_stmt ) ] ;
@@ -1191,8 +1218,9 @@ cmp_expr    = add_expr [ ( "=="|"!="|"<"|"<="|">"|">=" ) add_expr ] ;
 add_expr    = mul_expr { ( "+"|"-"|"|"|"^" ) mul_expr } ;
 mul_expr    = unary   { ( "*"|"/"|"%"|"&"|"<<"|">>" ) unary } ;
 unary       = ( "-" | "!" | "~" | "&" | "*" ) unary | postfix ;  (* ~ round 68 *)
-postfix     = primary { "." ident | "[" expr "]" | "(" [ args ] ")" | "as" type } ;
+postfix     = primary { "." ident | "." int_lit | "[" expr "]" | "(" [ args ] ")" | "as" type } ;
 primary     = int_lit | bool_lit | qualified | "(" expr ")" | struct_lit
+            | "(" expr "," expr { "," expr } [ "," ] ")"      (* tuple, round TUPLES *)
             | array_lit | "syscall" "(" args ")"
             | closure ;                            (* round 58 *)
 closure     = [ "gc" ] "fn" "(" [ params ] ")" [ "->" type ] block ;

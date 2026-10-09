@@ -60,6 +60,59 @@ fn scalar_fty(t: &Type) -> Option<FTy> {
     })
 }
 
+/// ROUND TUPLES -- does the aggregate literal `value` read memory that the
+/// assignment `target = value` overwrites? Conservative: it says yes whenever
+/// the literal mentions the variable at the root of `target`, and, when the
+/// target is reached through a pointer (which may alias anything), whenever
+/// the literal reads through a field, an element, a pointer or a call (a bare
+/// scalar variable cannot be part of the aggregate that is written).
+fn literal_reads_target(target: &Expr, value: &Expr) -> bool {
+    if !matches!(value.kind, ExprKind::StructLit(..) | ExprKind::ArrayLit(_)) {
+        return false;
+    }
+    match root_ident(target) {
+        Some(name) => reads_name(value, Some(name)),
+        None => reads_name(value, None),
+    }
+}
+
+/// The variable at the root of an lvalue; `None` = reached through a pointer.
+fn root_ident(e: &Expr) -> Option<&str> {
+    match &e.kind {
+        ExprKind::Ident(n) => Some(n.as_str()),
+        ExprKind::Field(b, _, _) | ExprKind::Index(b, _) => root_ident(b),
+        _ => None,
+    }
+}
+
+/// Does `e` read the variable `name` (`Some`), or read memory through a
+/// field, an element, a pointer or a call (`None`)? Unknown shapes say yes.
+fn reads_name(e: &Expr, name: Option<&str>) -> bool {
+    match &e.kind {
+        ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::FloatF32(_) | ExprKind::Bool(_) => false,
+        ExprKind::Ident(n) => name.map_or(false, |w| w == n),
+        ExprKind::Unary(op, a) => {
+            (name.is_none() && matches!(op, crate::ast::UnOp::Deref)) || reads_name(a, name)
+        }
+        ExprKind::Cast(a, _) | ExprKind::Text(_, a) => reads_name(a, name),
+        ExprKind::Binary(_, a, b) | ExprKind::ArrayRepeat(a, b) => {
+            reads_name(a, name) || reads_name(b, name)
+        }
+        ExprKind::Index(a, b) => name.is_none() || reads_name(a, name) || reads_name(b, name),
+        ExprKind::Field(b, _, _) => name.is_none() || reads_name(b, name),
+        ExprKind::StructLit(_, fs, _) => fs.iter().any(|(_, x, _)| reads_name(x, name)),
+        ExprKind::ArrayLit(xs) => xs.iter().any(|x| reads_name(x, name)),
+        ExprKind::Call(_, args, _) | ExprKind::Syscall(args) => {
+            // a call may read anything through its arguments or a global
+            args.iter().any(|x| reads_name(x, name)) || name.is_none()
+        }
+        ExprKind::IfElse(c, a, b) => {
+            reads_name(c, name) || reads_name(a, name) || reads_name(b, name)
+        }
+        ExprKind::Lambda(_) => true,
+    }
+}
+
 /// The names of the variables that the expression `e` moves (ROUND OWN-2).
 fn collect_moved(e: &Expr, moved: &HashSet<crate::ast::ExprId>, out: &mut Vec<String>) {
     if let ExprKind::Ident(n) = &e.kind {
@@ -1881,7 +1934,20 @@ impl<'a> Lower<'a> {
             }
             Stmt::Assign { target, value, .. } => {
                 let addr = self.lower_addr(target)?;
-                self.write_into(addr, value)?;
+                // ROUND TUPLES: a literal that reads the place it is written
+                // to -- `t = (t.1, t.0)`, `p = P { x: p.y, y: p.x }` -- is
+                // built in a place of its own and copied afterwards; written
+                // field by field into the target, the second field would
+                // read what the first one has already overwritten.
+                if literal_reads_target(target, value) {
+                    let t = self.ty_of(target);
+                    let (size, align) = self.size_align(&t);
+                    let tmp = self.alloca(size, align);
+                    self.write_into(tmp, value)?;
+                    self.push_void(FTy::Void, Op::CopyMem { dst: addr, src: tmp, size });
+                } else {
+                    self.write_into(addr, value)?;
+                }
                 // HOOK gc: insertion barrier when writing a Gc pointer into
                 // the heap (gc_lower.rs, SPEC 3.5.3)
                 crate::gc_lower::hook_assign(self, target, addr)

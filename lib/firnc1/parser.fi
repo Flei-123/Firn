@@ -322,6 +322,12 @@ struct Parser {
     //   al_node   the type node of the target (state 2)
     //   al_bad    1 = declared twice or clashing with a struct: read to
     //             find its end, never used
+    // ROUND TUPLES: statements that stand right AFTER the statement being
+    // parsed (`block` appends them) -- the bindings of `let (a, b) = f()` --
+    // and the number of hidden tuple bindings made so far (`__tup#<k>#<n>`;
+    // compiler/src/parser.rs counts the same way).
+    after: Vec[u32],
+    tup_seq: u32,
     al_name: Vec[u32],
     al_head: Vec[u32],
     al_pos: Vec[u32],
@@ -347,6 +353,7 @@ fn par_new(lx: u64) -> Parser {
         hoist: vec_new[u32](), interp: 0,
         file: 0, esc_pending: 0, arch_pending: 0, infer_len_ok: false,
         estart: 0, eallow_p: 0, eallow_n: 0, enotes: 0,
+        after: vec_new[u32](), tup_seq: 0,
         al_name: vec_new[u32](), al_head: vec_new[u32](), al_pos: vec_new[u32](),
         al_end: vec_new[u32](), al_state: vec_new[u32](), al_node: vec_new[u32](),
         al_bad: vec_new[u32](),
@@ -451,6 +458,7 @@ fn par_free(p: *mut Parser) {
     vec_free[u32](&(*p).rp_name)
     vec_free[u32](&(*p).rp_flag)
     vec_free[u32](&(*p).rp_mark)
+    vec_free[u32](&(*p).after)
     vec_free[u32](&(*p).al_name)
     vec_free[u32](&(*p).al_head)
     vec_free[u32](&(*p).al_pos)
@@ -1228,6 +1236,45 @@ fn alias_plain_name(p: *mut Parser, raw: u32) -> u32 {
 // -------------------------------------------------------------------- types
 
 fn ty(p: *mut Parser) -> u32 {
+    // ROUND TUPLES (parser.rs::parse_type_inner): `(T1, T2, ..)`, at least
+    // two elements.
+    if actual(p, A_LPAREN) {
+        next_bump(p)
+        var tl: Vec[u32] = vec_new[u32]()
+        while !actual(p, A_RPAREN) {
+            let et: u32 = ty(p)
+            if et == ast.NOTHING {
+                vec_free[u32](&tl)
+                return ast.NOTHING
+            }
+            vec_push[u32](&tl, et)
+            if actual(p, A_COMMA) {
+                next_bump(p)
+                continue
+            }
+            break
+        }
+        if !expect(p, A_RPAREN) {
+            vec_free[u32](&tl)
+            return ast.NOTHING
+        }
+        if vec_len[u32](&tl) < 2 {
+            complain(p)
+            vec_free[u32](&tl)
+            return ast.NOTHING
+        }
+        // the element types have to lie WITHOUT GAPS in `children` (see the
+        // function type below)
+        let toff: u32 = ast.child_start(par_tree(p))
+        var tk: usize = 0
+        while tk < vec_len[u32](&tl) {
+            ast.child_add(par_tree(p), vec_at[u32](&tl, tk))
+            tk = tk + 1
+        }
+        let tcnt: u64 = vec_len[u32](&tl) as u64
+        vec_free[u32](&tl)
+        return ast.ty_new(par_tree(p), ast.T_TUP, ast.NOTHING, ((toff as u64) << 32) | tcnt)
+    }
     // ROUND 58 (fnval.rs): `fn(T1, T2) -> R`, the type of a function VALUE.
     // Unambiguous: in a type position the keyword `fn` can mean nothing
     // else, and a declaration always carries a name after it.
@@ -1912,6 +1959,17 @@ fn after_expr(p: *mut Parser) -> u32 {
                 let off4: u32 = list_store(p, &tmp4)
                 vec_free[u32](&tmp4)
                 e = ast.expr_new(par_tree(p), ast.E_CALL, an, off4, 1, 0)
+                pos_default(p, e, base_pos)
+                continue
+            }
+            // ROUND TUPLES -- `t.0`: the lexer reads the digits behind a `.`
+            // as an integer (lexer.fi::lex_tuple_index). The field is
+            // called by the digits.
+            if actual(p, A_INT) {
+                let inr: u32 = index_name(p, number(p))
+                next_bump(p)
+                e = rp_base(p, e, false)
+                e = ast.expr_new(par_tree(p), ast.E_FIELD, e, inr, 0, 0)
                 pos_default(p, e, base_pos)
                 continue
             }
@@ -2914,6 +2972,12 @@ fn basic_expr_at(p: *mut Parser) -> u32 {
     if a == A_LPAREN {
         next_bump(p)
         let e: u32 = inner_expr(p)
+        // ROUND TUPLES -- `(a, b, ..)`: a tuple literal, read as a struct
+        // literal with a name no source can write and fields `0`, `1`, ..
+        // (parser.rs, ast::TUPLE_LIT).
+        if actual(p, A_COMMA) {
+            return tuple_literal(p, e)
+        }
         expect(p, A_RPAREN)
         return e
     }
@@ -3210,6 +3274,13 @@ fn block(p: *mut Parser) -> u32 {
         }
         vec_clear[u32](&(*p).hoist)
         vec_push[u32](&own, s)
+        // ROUND TUPLES: the bindings of `let (a, b) = ..` follow it
+        var ai: usize = 0
+        while ai < vec_len[u32](&(*p).after) {
+            vec_push[u32](&own, vec_at[u32](&(*p).after, ai))
+            ai = ai + 1
+        }
+        vec_clear[u32](&(*p).after)
         if (*p).pos == before {
             next_bump(p)
         }
@@ -3232,12 +3303,182 @@ fn block(p: *mut Parser) -> u32 {
     return bi
 }
 
+// ---------------------------------------------------------------- tuples
+//
+// Twin of the tuple parts of compiler/src/parser.rs; docs/TUPLES.md says what
+// they mean. A tuple is a struct whose fields are called `0`, `1`, ...; the
+// type checker makes the struct from the types of the elements.
+
+// The interned name of the field `n` of a tuple: its decimal digits.
+fn index_name(p: *mut Parser, n: u64) -> u32 {
+    rt.buf_clear(&(*p).scratch)
+    rt.buf_push_dec_u64(&(*p).scratch, n)
+    return intern.intern_number(lexer.lex_names(lx(p)), rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
+}
+
+// The interned name of a hidden tuple binding: `__tup#<k>#<n>`.
+fn tuple_temp_name(p: *mut Parser, count: usize) -> u32 {
+    rt.buf_clear(&(*p).scratch)
+    var pf: [u8; 6] = "__tup#"
+    rt.buf_push_bytes(&(*p).scratch, (&pf[0]) as u64, 6)
+    rt.buf_push_dec_u64(&(*p).scratch, (*p).tup_seq as u64)
+    rt.buf_push(&(*p).scratch, 35 as u8)
+    rt.buf_push_dec_u64(&(*p).scratch, count as u64)
+    (*p).tup_seq = (*p).tup_seq + 1
+    return intern.intern_number(lexer.lex_names(lx(p)), rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
+}
+
+// `(a, b, ..)`: the first element has been read, a `,` is next.
+fn tuple_literal(p: *mut Parser, first: u32) -> u32 {
+    var tmp: Vec[u32] = vec_new[u32]()
+    var count: u32 = 0
+    vec_push[u32](&tmp, index_name(p, 0))
+    vec_push[u32](&tmp, first)
+    count = 1
+    while eat(p, A_COMMA) {
+        if actual(p, A_RPAREN) {
+            break
+        }
+        let x: u32 = inner_expr(p)
+        vec_push[u32](&tmp, index_name(p, count as u64))
+        vec_push[u32](&tmp, x)
+        count = count + 1
+    }
+    expect(p, A_RPAREN)
+    if count < 2 {
+        complain(p)
+    }
+    let off: u32 = list_store(p, &tmp)
+    vec_free[u32](&tmp)
+    var nm: [u8; 7] = "(tuple)"
+    let name: u32 = intern.intern_number(lexer.lex_names(lx(p)), (&nm[0]) as u64, 7) as u32
+    return ast.expr_new(par_tree(p), ast.E_SLIT, name, off, count, 0)
+}
+
+// A pattern of `let (a, b) = ..` as a flat list, in the order it was read:
+//   name   [0, identifier]
+//   `_`    [1, 0]
+//   tuple  [2, number of elements] followed by the encoded elements
+// Returns false (and counts the error) if it is none of the three.
+fn tuple_pattern(p: *mut Parser, enc: *mut Vec[u32]) -> bool {
+    if actual(p, A_IDENT) {
+        let nr: u32 = tok_nr(p, 0)
+        next_bump(p)
+        var us: [u8; 1] = "_"
+        if intern.intern_equal(lexer.lex_names(lx(p)), nr, (&us[0]) as u64, 1) {
+            vec_push[u32](enc, 1)
+            vec_push[u32](enc, 0)
+        } else {
+            vec_push[u32](enc, 0)
+            vec_push[u32](enc, nr)
+        }
+        return true
+    }
+    if !actual(p, A_LPAREN) {
+        complain(p)
+        return false
+    }
+    next_bump(p)
+    let hdr: usize = vec_len[u32](enc)
+    vec_push[u32](enc, 2)
+    vec_push[u32](enc, 0)
+    var count: u32 = 0
+    while !actual(p, A_RPAREN) {
+        if !tuple_pattern(p, enc) {
+            return false
+        }
+        count = count + 1
+        if actual(p, A_COMMA) {
+            next_bump(p)
+            continue
+        }
+        break
+    }
+    if !expect(p, A_RPAREN) {
+        return false
+    }
+    if count < 2 {
+        complain(p)
+        return false
+    }
+    vec_set[u32](enc, hdr + 1, count)
+    return true
+}
+
+// The statements that take the tuple `tmp` apart: one `let` per name, one
+// hidden `let __tup#<k>#<n>` per nested tuple (parser.rs::tuple_bindings).
+// `cur` stands on the header of the pattern that belongs to `tmp`.
+fn tuple_bindings(p: *mut Parser, enc: *mut Vec[u32], cur: *mut usize, tmp: u32, kind_s: u32) {
+    let count: u32 = vec_at[u32](enc, *cur + 1)
+    *cur = *cur + 2
+    var i: u32 = 0
+    while i < count {
+        let k: u32 = vec_at[u32](enc, *cur)
+        let v: u32 = vec_at[u32](enc, *cur + 1)
+        if k == 1 {
+            *cur = *cur + 2
+            i = i + 1
+            continue
+        }
+        let base: u32 = ast.expr_new(par_tree(p), ast.E_ID, tmp, 0, 0, 0)
+        let field: u32 = ast.expr_new(par_tree(p), ast.E_FIELD, base, index_name(p, i as u64), 0, 0)
+        if k == 0 {
+            *cur = *cur + 2
+            vec_push[u32](&(*p).after, ast.stmt_new(par_tree(p), kind_s, v, ast.NOTHING, field, 0))
+            rp_shadow(p, v)
+            loc_add(p, v)
+        } else {
+            let sub: u32 = tuple_temp_name(p, v as usize)
+            vec_push[u32](&(*p).after, ast.stmt_new(par_tree(p), ast.S_LET, sub, ast.NOTHING, field, 0))
+            tuple_bindings(p, enc, cur, sub, kind_s)
+        }
+        i = i + 1
+    }
+}
+
+// `let (a, b) = e` is `let t = e; let a = t.0; let b = t.1`. The hidden `t`
+// carries the number of names in its own name (`__tup#<k>#<n>`): the type
+// checker refuses a tuple of another size there. `kind_s` is `S_LET` or
+// `S_VAR` for the names.
+fn let_tuple(p: *mut Parser, kind_s: u32) -> u32 {
+    var enc: Vec[u32] = vec_new[u32]()
+    if !tuple_pattern(p, &enc) {
+        vec_free[u32](&enc)
+        return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+    }
+    var t: u32 = ast.NOTHING
+    if eat(p, A_COLON) {
+        t = ty(p)
+        if t == ast.NOTHING {
+            vec_free[u32](&enc)
+            return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+        }
+    }
+    if !expect(p, A_ASSIGN) {
+        vec_free[u32](&enc)
+        return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let init: u32 = expr(p)
+    end_stmt(p)
+    let tmp: u32 = tuple_temp_name(p, vec_at[u32](&enc, 1) as usize)
+    var cur: usize = 0
+    tuple_bindings(p, &enc, &cur, tmp, kind_s)
+    vec_free[u32](&enc)
+    return ast.stmt_new(par_tree(p), ast.S_LET, tmp, t, init, 0)
+}
+
 fn let_stmt(p: *mut Parser) -> u32 {
     var kind_s: u32 = ast.S_LET
     if actual(p, A_KWVAR) {
         kind_s = ast.S_VAR
     }
     next_bump(p)
+    // ROUND TUPLES -- `let (a, b) = f()`
+    if actual(p, A_LPAREN) {
+        return let_tuple(p, kind_s)
+    }
     if !actual(p, A_IDENT) {
         complain(p)
         return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
@@ -3711,7 +3952,9 @@ fn param_list(p: *mut Parser) -> u32 {
         if actual(p, A_AMP) {
             next_bump(p)
             rk = 1
-        } else if at_inout(p) && next_starts_type(p) {
+        } else if at_inout(p) && (next_starts_type(p) || kind(p, 1) == A_LPAREN) {
+            // ROUND TUPLES: `x: inout (A, B)` -- after the colon a type is
+            // coming, so a `(` is a tuple type
             next_bump(p)
             rk = 2
         }

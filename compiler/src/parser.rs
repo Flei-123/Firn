@@ -50,6 +50,14 @@ pub(crate) struct Parser<'a> {
     /// Hidden `var _fseg<N>` of the string interpolation (round 39): they get
     /// hoisted AHEAD of the next statement (`block` empties the list).
     pub(crate) hoist: Vec<Stmt>,
+    /// **Round TUPLES** -- statements that stand right AFTER the statement
+    /// being parsed (`block` appends them): the bindings of
+    /// `let (a, b) = f()`.
+    pub(crate) after: Vec<Stmt>,
+    /// **Round TUPLES** -- how many hidden tuple bindings this file has made
+    /// (`__tup#<k>#<n>`); `lib/firnc1/parser.fi` counts the same way, so the
+    /// two syntax trees carry the same names.
+    pub(crate) tup_seq: u32,
     /// > 0: an interpolation is already running — nesting does not exist yet.
     pub(crate) interp_depth: u32,
     /// **ROUND 79** — `[T; _]` is only allowed where an initializer follows
@@ -61,6 +69,13 @@ pub(crate) struct Parser<'a> {
     /// `inout T` while it parses its list (`refparam.rs`).
     pub(crate) allow_ref_params: bool,
     pub(crate) ref_params: Vec<crate::refparam::RefParam>,
+}
+
+/// **Round TUPLES** -- the pattern of `let (a, b) = ..`.
+enum TuplePat {
+    Name(String, Span),
+    Skip,
+    Tuple(Vec<TuplePat>, Span),
 }
 
 fn starts_stmt(k: &TokKind) -> bool {
@@ -408,6 +423,36 @@ impl<'a> Parser<'a> {
                 }
                 Some(TypeExpr::Fn { params, ret, span: Parser::join(start, end) })
             }
+            // ROUND TUPLES -- `(T1, T2, ..)`: at least two elements.
+            TokKind::LParen => {
+                let start = self.bump();
+                let mut elems = Vec::new();
+                loop {
+                    if self.at(&TokKind::RParen) {
+                        break;
+                    }
+                    elems.push(self.parse_type()?);
+                    if self.eat(&TokKind::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+                let end = self.span();
+                if !self.expect(TokKind::RParen, "after the element types of a tuple type") {
+                    return None;
+                }
+                let span = Parser::join(start, end);
+                if elems.len() < 2 {
+                    self.dg.error_note(
+                        span,
+                        "a tuple type has at least two elements",
+                        "write `(T1, T2)`; a single type needs no parentheses",
+                    );
+                    self.recovering = true;
+                    return None;
+                }
+                Some(TypeExpr::Tuple(elems, span))
+            }
             TokKind::Star => {
                 let start = self.bump();
                 let mutable = self.eat(&TokKind::KwMut);
@@ -752,6 +797,18 @@ impl<'a> Parser<'a> {
                         e = g;
                         continue;
                     }
+                    // ROUND TUPLES -- `t.0`: the lexer reads the digits behind a
+                    // `.` as an integer (lexer.rs::tuple_index).
+                    let index_name = match self.kind() {
+                        TokKind::Int(v) => Some(v.to_string()),
+                        _ => None,
+                    };
+                    if let Some(name) = index_name {
+                        let sp = self.bump();
+                        let full = Parser::join(e.span, sp);
+                        e = self.mk(full, ExprKind::Field(Box::new(e), name, sp));
+                        continue;
+                    }
                     match self.ident("after '.' in the field access") {
                         Some((name, sp)) => {
                             // HOOK impl: `x.m(args)` is a method call,
@@ -967,8 +1024,44 @@ impl<'a> Parser<'a> {
                 self.mk(sp, ExprKind::Bool(false))
             }
             TokKind::LParen => {
-                self.bump();
+                let start = self.bump();
                 let e = self.nested_expr();
+                // ROUND TUPLES -- `(a, b, ..)`: a tuple literal. It is read
+                // as a struct literal with a name no source can write and
+                // fields called `0`, `1`, .. (ast::TUPLE_LIT); the type
+                // checker finds the struct from the types of the elements.
+                if self.at(&TokKind::Comma) && !self.recovering {
+                    let mut elems = vec![e];
+                    while self.eat(&TokKind::Comma) {
+                        if self.at(&TokKind::RParen) {
+                            break;
+                        }
+                        elems.push(self.nested_expr());
+                        if self.recovering {
+                            break;
+                        }
+                    }
+                    let end = self.span();
+                    self.close(TokKind::RParen, "after the elements of a tuple");
+                    let sp = Parser::join(start, end);
+                    if elems.len() < 2 && !self.recovering {
+                        self.dg.error_note(
+                            sp,
+                            "a tuple has at least two elements",
+                            "`(a,)` is no tuple; write `(a, b)`, or `a` for a single value",
+                        );
+                        self.recovering = true;
+                    }
+                    let fields: Vec<(String, Expr, Span)> = elems
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, x)| {
+                            let xs = x.span;
+                            (i.to_string(), x, xs)
+                        })
+                        .collect();
+                    return self.mk(sp, ExprKind::StructLit(crate::ast::TUPLE_LIT.to_string(), fields, start));
+                }
                 self.close(TokKind::RParen, "after the parenthesized expression");
                 e
             }
@@ -1123,6 +1216,10 @@ impl<'a> Parser<'a> {
                 stmts.append(&mut self.hoist);
             }
             stmts.push(s);
+            // ROUND TUPLES: the bindings of `let (a, b) = ..`
+            if !self.after.is_empty() {
+                stmts.append(&mut self.after);
+            }
             if self.pos == before {
                 self.bump();
             }
@@ -1265,11 +1362,110 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// **ROUND TUPLES** -- the pattern of `let (a, b) = ..`: names, `_` and
+    /// nested tuples. Anything else is refused at the spot.
+    fn tuple_pattern(&mut self) -> Option<TuplePat> {
+        match self.kind().clone() {
+            TokKind::LParen => {
+                let start = self.bump();
+                let mut elems = Vec::new();
+                loop {
+                    if self.at(&TokKind::RParen) {
+                        break;
+                    }
+                    elems.push(self.tuple_pattern()?);
+                    if self.eat(&TokKind::Comma) {
+                        continue;
+                    }
+                    break;
+                }
+                let end = self.span();
+                if !self.expect(TokKind::RParen, "after the names of a tuple pattern") {
+                    return None;
+                }
+                let sp = Parser::join(start, end);
+                if elems.len() < 2 {
+                    self.dg.error_note(
+                        sp,
+                        "a tuple pattern has at least two names",
+                        "write `let (a, b) = ..`",
+                    );
+                    self.recovering = true;
+                    return None;
+                }
+                Some(TuplePat::Tuple(elems, sp))
+            }
+            TokKind::Ident(n) => {
+                let sp = self.bump();
+                if n == "_" {
+                    Some(TuplePat::Skip)
+                } else {
+                    Some(TuplePat::Name(n, sp))
+                }
+            }
+            other => {
+                if !self.recovering {
+                    self.error_here(format!(
+                        "expected a name, `_` or a tuple pattern, found '{}'",
+                        other.text()
+                    ));
+                }
+                None
+            }
+        }
+    }
+
+    /// `let (a, b) = e` is `let t = e; let a = t.0; let b = t.1`. The
+    /// hidden `t` carries the number of names in its own name
+    /// (`__tup#<id>#<n>`): the type checker refuses a tuple of another size
+    /// there (`sema.rs::check_stmt`).
+    fn tuple_bindings(&mut self, pat: &TuplePat, tmp: &str, mutable: bool, out: &mut Vec<Stmt>) {
+        let elems = match pat {
+            TuplePat::Tuple(e, _) => e,
+            _ => return,
+        };
+        for (i, sub) in elems.iter().enumerate() {
+            let sp = match sub {
+                TuplePat::Name(_, sp) => *sp,
+                TuplePat::Tuple(_, sp) => *sp,
+                TuplePat::Skip => continue,
+            };
+            let base = self.mk(sp, ExprKind::Ident(tmp.to_string()));
+            let field = self.mk(sp, ExprKind::Field(Box::new(base), i.to_string(), sp));
+            match sub {
+                TuplePat::Name(n, nsp) => out.push(Stmt::Let {
+                    name: n.clone(),
+                    mutable,
+                    ty: None,
+                    init: field,
+                    span: *nsp,
+                }),
+                TuplePat::Tuple(inner, isp) => {
+                    let sub_tmp = format!("__tup#{}#{}", self.tup_seq, inner.len());
+                    self.tup_seq += 1;
+                    out.push(Stmt::Let {
+                        name: sub_tmp.clone(),
+                        mutable: false,
+                        ty: None,
+                        init: field,
+                        span: *isp,
+                    });
+                    self.tuple_bindings(sub, &sub_tmp, mutable, out);
+                }
+                TuplePat::Skip => {}
+            }
+        }
+    }
+
     fn let_stmt(&mut self) -> Stmt {
         let start = self.span();
         let mutable = self.at(&TokKind::KwVar);
         let kw = self.kind().text();
         self.bump();
+        // ROUND TUPLES -- `let (a, b) = f()`
+        if self.at(&TokKind::LParen) {
+            return self.let_tuple(start, mutable, &kw);
+        }
         let name = match self.ident(&format!("after '{}'", kw)) {
             Some((n, _)) => n,
             None => {
@@ -1318,6 +1514,51 @@ impl<'a> Parser<'a> {
         } else {
             Stmt::Let { name, mutable, ty, init, span: sp }
         }
+    }
+
+    fn let_tuple(&mut self, start: Span, mutable: bool, kw: &str) -> Stmt {
+        let pat = match self.tuple_pattern() {
+            Some(p) => p,
+            None => {
+                self.recovering = false;
+                self.sync_stmt();
+                return Stmt::Error(start);
+            }
+        };
+        let ty = if self.eat(&TokKind::Colon) {
+            match self.parse_type() {
+                Some(t) => Some(t),
+                None => {
+                    self.recovering = false;
+                    self.sync_stmt();
+                    return Stmt::Error(start);
+                }
+            }
+        } else {
+            None
+        };
+        if !self.expect(TokKind::Assign, &format!("after the pattern in a '{}' statement", kw)) {
+            self.recovering = false;
+            self.sync_stmt();
+            return Stmt::Error(start);
+        }
+        let init = self.expr();
+        let broken = self.recovering;
+        let sp = Parser::join(start, init.span);
+        self.end_stmt();
+        if broken {
+            return Stmt::Error(start);
+        }
+        let n = match &pat {
+            TuplePat::Tuple(e, _) => e.len(),
+            _ => 0,
+        };
+        let tmp = format!("__tup#{}#{}", self.tup_seq, n);
+        self.tup_seq += 1;
+        let mut extra = Vec::new();
+        self.tuple_bindings(&pat, &tmp, mutable, &mut extra);
+        self.after.append(&mut extra);
+        Stmt::Let { name: tmp, mutable: false, ty, init, span: sp }
     }
 
     /// **ROUND 79** — replaces the `_` of an array length with the number of
@@ -1645,7 +1886,10 @@ compute it",
                     self.bump();
                     ref_kind = Some(false);
                 } else if matches!(self.kind(), TokKind::Ident(n) if n == "inout")
-                    && self.next_starts_type()
+                    && (self.next_starts_type()
+                        // ROUND TUPLES: `x: inout (A, B)` -- after the colon a
+                        // type is coming, so a `(` is a tuple type
+                        || matches!(self.toks.get(self.pos + 1).map(|t| &t.kind), Some(TokKind::LParen)))
                 {
                     self.bump();
                     ref_kind = Some(true);
@@ -2423,6 +2667,8 @@ fn in_expr(
         loop_depth: 0,
         pending_attrs: Vec::new(),
         hoist: Vec::new(),
+        after: Vec::new(),
+        tup_seq: 0,
         interp_depth: 1,
         allow_ref_params: false,
         ref_params: Vec::new(),
@@ -2479,6 +2725,8 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         loop_depth: 0,
         pending_attrs: Vec::new(),
         hoist: Vec::new(),
+        after: Vec::new(),
+        tup_seq: 0,
         interp_depth: 0,
         allow_ref_params: false,
         ref_params: Vec::new(),

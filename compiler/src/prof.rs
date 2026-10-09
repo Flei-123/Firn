@@ -298,6 +298,11 @@ impl Guard<'_> {
             }
             TypeExpr::Ptr { inner, .. } => self.ty(inner),
             TypeExpr::Array { elem, .. } => self.ty(elem),
+            TypeExpr::Tuple(elems, _) => {
+                for e in elems {
+                    self.ty(e);
+                }
+            }
             TypeExpr::Fn { params, ret, .. } => {
                 for p in params {
                     self.ty(p);

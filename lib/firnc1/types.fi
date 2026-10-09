@@ -42,7 +42,9 @@ export { Types, types_new, types_free, types_resolve,
     base_ty_name, st_field_ty,
     STR_INDEX, str_is_view, str_same_view, str_like, str_is_builtin,
     types_struct_reserve, types_struct_define,
-    types_struct_append, types_error_set, types_gc_set }
+    types_struct_append, types_error_set, types_gc_set,
+    // tuples
+    tuple_ty, types_tuple_off }
 
 const K_I8: u32 = 0
 const K_I16: u32 = 1
@@ -117,6 +119,17 @@ struct Types {
     fn_plen: Vec[u32],
     fn_ptyp: Vec[u32],
     fn_ret: Vec[u32],
+    // ROUND TUPLES: the state vector of the struct layout (`lst`) and
+    // whether it is in use (`lay` = 1): while the field types are being
+    // resolved, a tuple lays out the structs it contains first, like a field
+    // would.
+    lay: u32,
+    lst: Vec[u32],
+    sc: rt.Buf,
+    // 1 = tuple types stay unresolved (`layoutdump`: the yardstick
+    // `layout_canon.rs` resolves the root file's declarations only and says
+    // `?` for a tuple).
+    tup_off: u32,
 }
 
 fn types_new() -> Types {
@@ -129,6 +142,7 @@ fn types_new() -> Types {
         ft_off: vec_new[u32](), ft_len: vec_new[u32](), ft_par: vec_new[u32](),
         fn_poff: vec_new[u32](), fn_plen: vec_new[u32](), fn_ptyp: vec_new[u32](),
         fn_ret: vec_new[u32](),
+        lay: 0, lst: vec_new[u32](), sc: rt.buf_new(), tup_off: 0,
     }
 }
 
@@ -151,6 +165,8 @@ fn types_free(t: *mut Types) {
     vec_free[u32](&(*t).fn_plen)
     vec_free[u32](&(*t).fn_ptyp)
     vec_free[u32](&(*t).fn_ret)
+    rt.buf_free(&(*t).sc)
+    vec_free[u32](&(*t).lst)
 }
 
 fn ty_kind(t: *mut Types, i: u32) -> u32 { return vec_at[u32](&(*t).kind, i as usize) }
@@ -569,6 +585,33 @@ fn resolve(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner, te: u32) -
         }
         return new_ty(t, K_ARR, elem, ast.t_b(b, te))
     }
+    // ROUND TUPLES: `(T1, T2, ..)` is a struct with the fields `0`, `1`, ..
+    if a == ast.T_TUP {
+        if (*t).tup_off != 0 {
+            return new_ty(t, K_ERROR, 0, 0)
+        }
+        let tpacked: u64 = ast.t_b(b, te)
+        let toff: u32 = (tpacked >> 32) as u32
+        let tcnt: u32 = (tpacked & 4294967295) as u32
+        var el: Vec[u32] = vec_new[u32]()
+        var tbad: bool = false
+        var tk: u32 = 0
+        while tk < tcnt {
+            let et: u32 = resolve(t, b, it, ast.child_at(b, toff + tk))
+            if ty_kind(t, et) == K_ERROR {
+                tbad = true
+            }
+            vec_push[u32](&el, et)
+            tk = tk + 1
+        }
+        if tbad {
+            vec_free[u32](&el)
+            return new_ty(t, K_ERROR, 0, 0)
+        }
+        let tr: u32 = tuple_ty(t, b, it, &el)
+        vec_free[u32](&el)
+        return tr
+    }
     // ROUND 58 (fnval.rs): `fn(T1, T2) -> R`.
     if a == ast.T_FN {
         let packed: u64 = ast.t_b(b, te)
@@ -616,6 +659,68 @@ fn resolve(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner, te: u32) -
         return new_ty(t, K_STRUCT, si as u32, 0)
     }
     return new_ty(t, K_ERROR, 0, 0)
+}
+
+// `layoutdump` runs without tuples (see `tup_off`). Again BEFORE `types_resolve`.
+fn types_tuple_off(t: *mut Types) { (*t).tup_off = 1 }
+
+// The struct that is the tuple with these (resolved) element types: found by
+// its name `(T1, T2)`, made when it is new. Its fields are called `0`, `1`, ..,
+// its layout is the layout of a struct with those fields (declaration order,
+// natural alignment). While the layout of the structs of the tree is being
+// computed (`lay`), the structs the elements are made of are laid out first.
+// Twin of `Checker::tuple_type` in compiler/src/sema.rs.
+fn tuple_ty(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner, el: *mut Vec[u32]) -> u32 {
+    var nm: rt.Buf = rt.buf_new()
+    rt.buf_push(&nm, 40 as u8)
+    var k: usize = 0
+    while k < vec_len[u32](el) {
+        if k > 0 {
+            var cm: [u8; 2] = ", "
+            rt.buf_push_bytes(&nm, (&cm[0]) as u64, 2)
+        }
+        name_of(t, it, &nm, vec_at[u32](el, k))
+        k = k + 1
+    }
+    rt.buf_push(&nm, 41 as u8)
+    let nr: u32 = intern.intern_number(it, rt.buf_ptr(&nm), rt.buf_len(&nm)) as u32
+    rt.buf_free(&nm)
+    let known: i32 = struct_index(t, nr)
+    if known >= 0 {
+        return new_ty(t, K_STRUCT, known as u32, 0)
+    }
+    if (*t).lay != 0 {
+        k = 0
+        while k < vec_len[u32](el) {
+            size_request(t, b, it, vec_at[u32](el, k), &(*t).lst)
+            k = k + 1
+        }
+    }
+    let idx: u32 = types_struct_append(t, nr)
+    let off: u32 = vec_len[u32](&(*t).f_name) as u32
+    var offset: u64 = 0
+    var max_a: u64 = 1
+    k = 0
+    while k < vec_len[u32](el) {
+        let ety: u32 = vec_at[u32](el, k)
+        var au: u64 = alignment_of(t, ety)
+        if au < 1 { au = 1 }
+        let gr: u64 = size_of(t, ety)
+        if au > max_a { max_a = au }
+        offset = round_up(offset, au)
+        rt.buf_clear(&(*t).sc)
+        rt.buf_push_dec_u64(&(*t).sc, k as u64)
+        vec_push[u32](&(*t).f_name, intern.intern_number(it, rt.buf_ptr(&(*t).sc), rt.buf_len(&(*t).sc)) as u32)
+        vec_push[u32](&(*t).f_ty, ety)
+        vec_push[u64](&(*t).f_offset, offset)
+        offset = offset + gr
+        k = k + 1
+    }
+    vec_set[u32](&(*t).s_foff, idx as usize, off)
+    vec_set[u32](&(*t).s_flen, idx as usize, vec_len[u32](el) as u32)
+    vec_set[u64](&(*t).s_size, idx as usize, round_up(offset, max_a))
+    vec_set[u64](&(*t).s_align, idx as usize, max_a)
+    return new_ty(t, K_STRUCT, idx, 0)
 }
 
 fn ty_the_root(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner, te: u32) -> u32 {
@@ -730,22 +835,24 @@ fn types_resolve(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner) {
         // (`hook_struct_phase`, errors.rs, reported in collect_structs).
         err.error_structphase((*t).feh, true)
     }
-    var state: Vec[u32] = vec_new[u32]()
+    vec_clear[u32](&(*t).lst)
     i = 0
     while i < st_count(t) {
         var z: u32 = 0
         if (i as u32) < (*t).eoff {
             z = 2
         }
-        vec_push[u32](&state, z)
+        vec_push[u32](&(*t).lst, z)
         i = i + 1
     }
+    // ROUND TUPLES: a tuple met in a field type lays out its elements first
+    (*t).lay = 1
     i = 0
     while i < ast.structure_count(b) {
-        struct_layout(t, b, it, i as u32, i as u32 + (*t).eoff, &state)
+        struct_layout(t, b, it, i as u32, i as u32 + (*t).eoff, &(*t).lst)
         i = i + 1
     }
-    vec_free[u32](&state)
+    (*t).lay = 0
     if (*t).feh != 0 {
         // HOOK error unions: layout phase over -- from here on the
         // success type of a union may be a struct (signatures, bodies).

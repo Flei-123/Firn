@@ -486,7 +486,45 @@ impl<'a> Lexer<'a> {
         self.push(TokKind::Float(v.to_bits(), single), line, col, ncols.max(1));
     }
 
+    /// A number right behind a `.` token is the index of a tuple field
+    /// (`t.0`, `t.0.1`): plain digits, never a float. Without this rule
+    /// `t.0.1` would read as `t`, `.`, the float `0.1`.
+    fn after_dot(&self) -> bool {
+        matches!(self.out.last().map(|t| &t.kind), Some(TokKind::Dot))
+    }
+
+    fn tuple_index(&mut self) {
+        let (line, col) = (self.line, self.col);
+        let mut val: u64 = 0;
+        let mut width = 0u32;
+        let mut big = false;
+        while let Some(c) = self.peek() {
+            let d = match c.to_digit(10) {
+                Some(d) => d as u64,
+                None => break,
+            };
+            match val.checked_mul(10).and_then(|v| v.checked_add(d)) {
+                Some(v) => val = v,
+                None => big = true,
+            }
+            self.bump();
+            width += 1;
+        }
+        if big {
+            self.dg.error(
+                self.sp(line, col, width.max(1)),
+                "integer literal is too large (more than 64 bit)",
+            );
+            self.push(TokKind::Int(0), line, col, width.max(1));
+            return;
+        }
+        self.push(TokKind::Int(val as i128), line, col, width.max(1));
+    }
+
     fn number(&mut self) {
+        if self.after_dot() {
+            return self.tuple_index();
+        }
         let (line, col) = (self.line, self.col);
         let mut ncols = 0u32;
         let mut digits = String::new();
