@@ -22,6 +22,7 @@
 //! namespaces, no separate object file format — there is no `.o` file per
 //! module and there are no interface files.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -553,6 +554,11 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         for x in &p.statics {
             items.insert(x.name.clone());
         }
+        // HOOK alias: a type alias is an item of its module like a struct
+        // (`m.Idx`, `export { Idx }`; alias.rs).
+        for (n, _, _) in crate::alias::decls_of_file(f.id) {
+            items.insert(n);
+        }
         for imp in &p.imports {
             // HOOK profil (prof.rs, round 52/73): under the kernel profile the
             // standard library is barred, unless the module being imported
@@ -583,6 +589,34 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     merged.profile = progs.first().and_then(|p| p.profile.clone());
     merged.expr_count = base_id;
 
+    // HOOK alias (alias.rs): every alias of every file under its final name,
+    // and the imports of every file — the renamer puts the target in where
+    // an alias of ANOTHER module is used (`m.Idx`), and it has to rename that
+    // target from the point of view of the module that wrote it.
+    let acx = AliasCtx {
+        decls: files
+            .iter()
+            .enumerate()
+            .flat_map(|(i, f)| {
+                let m = infos[i].name.clone();
+                crate::alias::decls_of_file(f.id)
+                    .into_iter()
+                    .map(move |(n, t, sp)| (mangle(&m, &n), AliasDecl { home: i, ty: t, span: sp }))
+            })
+            .collect(),
+        imports: progs
+            .iter()
+            .map(|p| {
+                p.imports
+                    .iter()
+                    .map(|i| (i.alias.clone(), i.path.last().cloned().unwrap_or_default()))
+                    .collect()
+            })
+            .collect(),
+        done: RefCell::new(HashMap::new()),
+        visiting: RefCell::new(HashSet::new()),
+    };
+
     for (idx, mut p) in progs.into_iter().enumerate() {
         let mut r = Renamer {
             me: idx,
@@ -594,6 +628,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
                 .collect(),
             dg,
             locals: Vec::new(),
+            acx: &acx,
         };
         // First rename the own declarations ...
         let m = infos[idx].name.clone();
@@ -693,8 +728,29 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     Some(merged)
 }
 
+/// One type alias with the module that declared it (alias.rs).
+struct AliasDecl {
+    home: usize,
+    ty: TypeExpr,
+    #[allow(dead_code)]
+    span: Span,
+}
+
+/// Everything the renamer needs to expand an alias of another module.
+struct AliasCtx {
+    /// final name (`m__Idx`) -> declaration
+    decls: HashMap<String, AliasDecl>,
+    /// per file: import alias -> module name
+    imports: Vec<HashMap<String, String>>,
+    /// final name -> the expanded target (`None` = broken, reported)
+    done: RefCell<HashMap<String, Option<TypeExpr>>>,
+    /// aliases being expanded right now — a second visit is a cycle
+    visiting: RefCell<HashSet<String>>,
+}
+
 /// Rewrites names in the AST of a module to their final form.
 struct Renamer<'a, 'b> {
+    acx: &'a AliasCtx,
     me: usize,
     infos: &'a [ModuleInfo],
     /// alias name -> last path part (= module name of the target file)
@@ -834,7 +890,54 @@ impl<'a, 'b> Renamer<'a, 'b> {
         Some(mangled)
     }
 
+    /// HOOK alias (alias.rs): `mangled` is the final name of an alias ->
+    /// the target, renamed as its own module sees it, with `span` at its
+    /// head. `None` = not an alias.
+    fn expand_alias(&mut self, mangled: &str, span: Span) -> Option<TypeExpr> {
+        let acx: &'a AliasCtx = self.acx;
+        let decl = acx.decls.get(mangled)?;
+        let cached = acx.done.borrow().get(mangled).cloned();
+        if let Some(c) = cached {
+            return Some(match c {
+                Some(t) => t,
+                None => TypeExpr::Named(mangled.to_string(), span),
+            });
+        }
+        if !acx.visiting.borrow_mut().insert(mangled.to_string()) {
+            let short = mangled.rsplit("__").next().unwrap_or(mangled).to_string();
+            self.dg.error_note(
+                span,
+                format!("the type alias '{}' refers to itself", short),
+                "an alias is another name for a type; a cycle of aliases names no type at all",
+            );
+            acx.done.borrow_mut().insert(mangled.to_string(), None);
+            return Some(TypeExpr::Named(mangled.to_string(), span));
+        }
+        let mut t = decl.ty.clone();
+        {
+            let mut r = Renamer {
+                acx,
+                me: decl.home,
+                infos: self.infos,
+                alias: acx.imports[decl.home].clone(),
+                dg: &mut *self.dg,
+                locals: Vec::new(),
+            };
+            r.push_scope();
+            r.ty(&mut t);
+        }
+        acx.visiting.borrow_mut().remove(mangled);
+        let out = acx.done.borrow().get(mangled).cloned();
+        if let Some(None) = out {
+            // a cycle through this alias was found while it was expanded
+            return Some(TypeExpr::Named(mangled.to_string(), span));
+        }
+        acx.done.borrow_mut().insert(mangled.to_string(), Some(t.clone()));
+        Some(t)
+    }
+
     fn ty(&mut self, t: &mut TypeExpr) {
+        let mut repl: Option<TypeExpr> = None;
         match t {
             TypeExpr::Named(name, span) => {
                 // HOOK fehlerunionen (round 76): `E!T` leaves only the
@@ -853,7 +956,12 @@ impl<'a, 'b> Renamer<'a, 'b> {
                     return;
                 }
                 if let Some(n) = self.resolve(name, *span, false) {
-                    *name = n;
+                    // HOOK alias: a name of another module that is an alias
+                    // becomes its target (alias.rs).
+                    match self.expand_alias(&n, *span) {
+                        Some(x) => repl = Some(x),
+                        None => *name = n,
+                    }
                 }
             }
             TypeExpr::Ptr { inner, .. } => self.ty(inner),
@@ -868,6 +976,9 @@ impl<'a, 'b> Renamer<'a, 'b> {
                     self.ty(r);
                 }
             }
+        }
+        if let Some(r) = repl {
+            *t = r;
         }
     }
 
@@ -1014,7 +1125,20 @@ impl<'a, 'b> Renamer<'a, 'b> {
                 if let Some(n) = self.inst(name) {
                     *name = n;
                 } else if let Some(n) = self.resolve(name, *nspan, false) {
-                    *name = n;
+                    // HOOK alias: `m.P { .. }` where `P` is an alias for a
+                    // struct builds that struct (alias.rs).
+                    match self.expand_alias(&n, *nspan) {
+                        Some(TypeExpr::Named(target, _)) => *name = target,
+                        Some(_) => {
+                            self.dg.error_note(
+                                *nspan,
+                                format!("the type alias '{}' does not name a struct", name),
+                                "only an alias for a struct can build one with `Name { field: value }`",
+                            );
+                            *name = n;
+                        }
+                        None => *name = n,
+                    }
                 }
                 for (_, v, _) in fields.iter_mut() {
                     self.expr(v);

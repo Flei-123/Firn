@@ -6,6 +6,7 @@
 //! `as` and `ld` get used EXCLUSIVELY as assembler/linker.
 
 mod abi;
+mod alias;
 mod archsel;
 mod ast;
 mod ast_canon;

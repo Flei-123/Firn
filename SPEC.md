@@ -1120,6 +1120,29 @@ nothing is lost: whoever wants the old value writes it down.
 `let` stays immutable. `x += 1` on a `let` binding runs into exactly the
 same wall as `x = x + 1`, with the same message.
 
+### 12.8 Type aliases (round TUPLES)
+
+```firn
+type Idx = u32
+type Row = [Idx; 4]
+type Cb = fn(Idx) -> Idx
+type Vi = Vec[i32]
+type Span2 = core.Span
+```
+
+`type Name = Type` is another name for the **same** type -- not a new type.
+`Idx` and `u32` pass into each other without a cast and `Vec[Idx]` is
+`Vec[u32]`. The declarations may stand in any order, an alias may name an
+alias, a module may export one (`export { Idx }`, used as `m.Idx`), and
+`P { .. }` / `impl P { .. }` with `type P = Point` mean `Point`. An alias is
+replaced while the program is read, so nothing after the parser knows it.
+Refused: a cycle, a second declaration, a type parameter (`type V[T] = ..`),
+the name of a struct of the same file, type arguments at a use, methods on an
+alias for a pointer or an array. `type` is not a keyword; it starts an item
+and nothing else. See `docs/TYPE_ALIASES.md`; proof in
+`tests/2400_type_alias.fi`, `tests/2401_type_alias_module.fi`,
+`tests/neg/2400..2407_alias_*.fi` and `tools/typealias/run.sh` (both compilers).
+
 ### 12.1 The grammar of the v0 subset (EBNF)
 
 This is the grammar that `firnc0` **really** implements. The extensions from
@@ -1129,7 +1152,8 @@ deliberately not contained in it yet.
 ```ebnf
 program     = { item } ;
 item        = fn_decl | struct_decl | const_decl | profile_decl
-            | import_decl | export_decl ;          (* round 2 *)
+            | import_decl | export_decl | alias_decl ;   (* round 2 *)
+alias_decl  = "type" ident "=" type ;               (* round TUPLES, 12.8 *)
 profile_decl= "profile" ident ;
 import_decl = "import" ident { "." ident } ;       (* round 2 *)
 export_decl = "export" "{" [ ident { "," ident } ] "}" ;   (* round 2 *)

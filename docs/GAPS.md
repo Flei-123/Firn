@@ -32,6 +32,7 @@ Effect is estimated as T (speed), C (amount of code / workaround), F
 | A12 | **No unchecked narrowing cast** (was B12) -- `u32 as i32` panics on dev-fast, only masks helped | certus `paint/ico.fi:99`, every hash/checksum/pixel packing | `x as% T`: integer to integer, never checked on any level (the `+% -% *%` promise for the conversion); an untyped literal inside takes the widest type, not the target; in a constant it is `as`; both compilers | `tests/1661_wrapping_cast.fi` (four levels, aarch64, firnc1), `tests/neg/1661_wrap_cast_float.fi` |
 | A13 | **No `readdir` in std** (was B23) | certus `tools/android/bau.sh:144` (ships its own TLS root store because `"Firn kann kein readdir"`) | `lib/std/dir.fi`: `dir.open(path)`, `dir.next(&d)` -> `d.name` (view into the block, valid until the next call), `d.kind` (`KIND_FILE`, `KIND_DIR`, `KIND_LINK`, ...), `dir.close`; one `getdents64` per 4 KiB, no allocation, "." and ".." left out; x86-64 and AArch64 through the syscall table | `tests/1662_std_dir.fi` (four levels, aarch64, firnc1) |
 | A14 | **No `include_str`** (was B21) | `tools/gen_gctext.sh` (packs `lib/gc/gc.fi` into u64 words for firnc1) | `__include_str("path")`: the file's octets as a text literal at build time, relative to the source file, at most 1 MiB, `str` or `[u8; N]` by context; firnc1: not core (the prescan says so) | `tests/1663_include_str.fi` (four levels, aarch64, from another working directory), `tests/neg/1663_include_missing.fi` |
+| A15 | **No type aliases** (was B14) | firn `std/core.fi:2405`, `num/core_comfort.fi:14` (`core.Span` and `str.Span` as two types of the same shape) | `type Idx = u32`: another name for the SAME type (primitive, pointer, array, function type, generic instantiation, a type of another module, a struct); order of the declarations free; an alias never reaches the type checker; both compilers; generic aliases refused (`docs/TYPE_ALIASES.md`) | `tests/2400_type_alias.fi`, `tests/2401_type_alias_module.fi`, `tests/neg/2400..2407_alias_*.fi`, `tools/typealias/run.sh` |
 
 ## B. Open, sorted by effect
 
@@ -50,7 +51,7 @@ Effect is estimated as T (speed), C (amount of code / workaround), F
 | B11 | closed, see A6 | | | | | |
 | B12 | closed, see A12 | | | | | |
 | B13 | closed, see A11 | | | | | |
-| B14 | **No type aliases** (`type Idx = u32`) | confirmed | firn `std/core.fi:2405`, `num/core_comfort.fi:14` | 0 | 1 | 0 |
+| B14 | closed, see A15 | | | | | |
 | B15 | **Runtime names of the collector are a fixed list in the compiler** (`gc.rs` RUNTIME_QUERY) -- a new function in `lib/gc/gc.fi` needs a compiler patch | confirmed | certus `vendor/firn/patches/compiler-0005-*`, `0006-*` | 0 | 1 | 2 |
 | B16 | **Windows import table is a list in `win.rs`** -- every new Win32 call is a compiler patch | confirmed (firnc-gc) | certus `vendor/firn/patches/compiler-0007-dwmapi-*` | 0 | 1 | 2 |
 | B17 | **`lib/fui` patches that no longer apply** (0001-fui-painter-fontreq, 0002, 0004; uipaint<->painter rename) -- Certus freezes copies (`.fui-c073`) | confirmed (bauen-win.sh:17-24) | certus build scripts | 0 | 2 | 3 |
