@@ -107,7 +107,7 @@ const wait = async (p, k) => { await p.waitForFunction((k) => localStorage.getIt
         await p.keyboard.press('l');
         const fc = await chooser;
         check('files: the input is multiple and accepts .txt', fc.isMultiple() === true, fc.isMultiple());
-        await fc.setFiles([{ name: 'a.txt', mimeType: 'text/plain', buffer: Buffer.from('hello ä') },
+        await fc.setFiles([{ name: 'a.txt', mimeType: 'text/plain', buffer: Buffer.from('hello \u00e4') },
                            { name: 'b.txt', mimeType: 'text/plain', buffer: Buffer.from('second') }]);
         await p.waitForFunction(() => (localStorage.getItem('dlg_ev') || '').startsWith('|'), null, { timeout: 5000 }).catch(() => {});
         a = await ls(p, 'dlg_ev');

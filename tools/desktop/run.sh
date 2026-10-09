@@ -43,6 +43,7 @@ if [ "$WHICH" = all ] || [ "$WHICH" = linux ]; then
     build "--opt-level=release-fast" "$W/dialog_main" tools/dialog/dialog_main.fi || true
     build "--opt-level=release-fast" "$W/dialogd" tools/dialogd/dialogd_main.fi || true
     build "--opt-level=release-fast" "$W/toast_main" tools/dialog/toast_main.fi || true
+    build "--opt-level=release-fast" "$W/portald" tools/portald/portald_main.fi || true
     echo "   built"
 
     step "2. python3 tools/desktop/platforms.py (the five platform files of every module)"
@@ -106,6 +107,13 @@ if [ "$WHICH" = all ] || [ "$WHICH" = linux ]; then
     step "9e. std.toast against a notification server written with libdbus: every option, a replacement, a close, a click as a callback"
     if have dbus-daemon && python3 -c "import dbus, gi" 2>/dev/null; then
         run python3 tools/dialog/toast_check.py "$W/toast_main"
+    else
+        echo "  SKIP  dbus-daemon or python3 dbus/gi missing"
+    fi
+
+    step "9e2. orient-portald (Level 2 spike): org.freedesktop.Notifications and the portal FileChooser / Settings against dbus-python, gdbus, dbus-send"
+    if have dbus-daemon && python3 -c "import dbus, gi" 2>/dev/null; then
+        run python3 tools/portald/portald_check.py "$W/portald"
     else
         echo "  SKIP  dbus-daemon or python3 dbus/gi missing"
     fi

@@ -1,0 +1,528 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/portald/portald_main.fi -- orient-portald, the LEVEL 2 spike of docs/DIALOG.md: the Linux desktop interfaces answered
+// by a Firn service, so that foreign GTK / Qt / Firefox programs can use OrientOS' own toast and dialogs unchanged.
+//
+//     portald [--toast-file PATH] [--dark]
+//
+// It connects to the session bus (DBUS_SESSION_BUS_ADDRESS) and owns two names:
+//
+//   org.freedesktop.Notifications    /org/freedesktop/Notifications
+//       Notify, CloseNotification, GetCapabilities, GetServerInformation; the signal NotificationClosed.
+//       A notification goes to the TOAST SINK: one line per toast appended to the file `--toast-file`
+//           TOAST<TAB>id<TAB>urgency<TAB>app<TAB>summary<TAB>body        (escaped like lib/std/dialogproto.fi)
+//       On OrientOS the sink is the kernel's NOTIPOST (lib/desktop/notify_osum.fi); the file is the dev stand-in.
+//   org.freedesktop.portal.Desktop   /org/freedesktop/portal/desktop
+//       FileChooser.OpenFile, SaveFile  -> a Request object; the answer is the signal Request.Response(u, a{sv}) with
+//                                          "uris" (as, file:// URIs). The dialog is std.dialog's: whatever it uses on this
+//                                          system (zenity, the fUi service dialogd, ...).
+//       Settings.Read, ReadOne, ReadAll -> org.freedesktop.appearance: color-scheme (u: 1 dark, 2 light), accent-color (ddd)
+//
+// SPIKE LIMITS: one request at a time (the daemon is busy while a dialog is open); no SaveFiles, no Screenshot / ColorPicker,
+// Introspect only for the two objects, no properties; filters: the first filter's glob patterns; `current_folder` and `current_name` are honoured;
+// "multiple" and "directory" are honoured. Docs: docs/DIALOG.md, "Level 2".
+import std.rt
+import std.str
+import std.num
+import std.dialog
+import std.dialogproto
+import net.dbus
+
+static mut NEXT_ID: u32 = 1
+static mut TOAST_FILE: u64 = 0 // heap copy of the path, NUL terminated (0 = no sink)
+static mut DARK: bool = false
+
+fn say_err(s: str) {
+    syscall(1, 2, s.p as i64, s.length() as i64, 0, 0, 0)
+}
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn view(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn push_s(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+// ------------------------------------------------------------------ the toast sink
+
+fn sink_toast(id: u32, urgency: i32, app: str, summary: str, body: str) {
+    if TOAST_FILE == 0 as u64 {
+        return
+    }
+    var line: rt.Buf = rt.buf_new()
+    dialogproto.push_field(&line, "TOAST", true)
+    var n: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&n, id as u64)
+    dialogproto.push_field(&line, view(&n), false)
+    rt.buf_clear(&n)
+    rt.buf_push_dec_i64(&n, urgency as i64)
+    dialogproto.push_field(&line, view(&n), false)
+    rt.buf_free(&n)
+    dialogproto.push_field(&line, app, false)
+    dialogproto.push_field(&line, summary, false)
+    dialogproto.push_field(&line, body, false)
+    rt.buf_push(&line, 10 as u8)
+    // open(path, O_WRONLY | O_CREAT | O_APPEND, 0644)
+    let fd: i64 = syscall(2, TOAST_FILE as i64, 1089, 420, 0, 0, 0)
+    if fd >= 0 {
+        syscall(1, fd, rt.buf_ptr(&line) as i64, rt.buf_len(&line) as i64, 0, 0, 0)
+        syscall(3, fd, 0, 0, 0, 0, 0)
+    }
+    rt.buf_free(&line)
+}
+
+// ------------------------------------------------------------------ org.freedesktop.Notifications
+
+fn notify_caps(b: *mut dbus.Bus, m: *mut dbus.Msg) {
+    var body: rt.Buf = rt.buf_new()
+    let at: usize = dbus.w_array_begin(&body, 4)
+    dbus.w_str(&body, "body")
+    dbus.w_str(&body, "actions")
+    dbus.w_str(&body, "persistence")
+    dbus.w_array_end(&body, at, 4)
+    dbus.bus_reply(b, m, "as", &body)
+    rt.buf_free(&body)
+}
+
+fn notify_info(b: *mut dbus.Bus, m: *mut dbus.Msg) {
+    var body: rt.Buf = rt.buf_new()
+    dbus.w_str(&body, "OrientOS toast")
+    dbus.w_str(&body, "Fleitec")
+    dbus.w_str(&body, "1")
+    dbus.w_str(&body, "1.2")
+    dbus.bus_reply(b, m, "ssss", &body)
+    rt.buf_free(&body)
+}
+
+// Notify(susssasa{sv}i) -> u
+fn notify_call(b: *mut dbus.Bus, m: *mut dbus.Msg) {
+    var rd: dbus.Rd = dbus.msg_body(m)
+    let app: str = __str_copy(dbus.rd_str(&rd))
+    let replaces: u32 = dbus.rd_u32(&rd)
+    dbus.rd_str(&rd) // the icon
+    let summary: str = __str_copy(dbus.rd_str(&rd))
+    let body: str = __str_copy(dbus.rd_str(&rd))
+    let aend: usize = dbus.rd_array_begin(&rd, 4) // the actions are not shown by the spike
+    while dbus.rd_array_more(&rd, aend) {
+        dbus.rd_str(&rd)
+    }
+    var urgency: i32 = 1
+    let hend: usize = dbus.rd_array_begin(&rd, 8)
+    while dbus.rd_array_more(&rd, hend) {
+        dbus.rd_align(&rd, 8)
+        let key: str = dbus.rd_str(&rd)
+        let sig: str = dbus.rd_sig(&rd)
+        if key == "urgency" && sig == "y" {
+            urgency = dbus.rd_byte(&rd) as i32
+        } else {
+            var i: usize = 0
+            dbus.rd_skip_value(&rd, sig, &i)
+        }
+    }
+    dbus.rd_i32(&rd) // the timeout
+    if !rd.ok {
+        dbus.bus_reply_error(b, m, "org.freedesktop.DBus.Error.InvalidArgs", "Notify: bad arguments")
+        return
+    }
+    var id: u32 = replaces
+    if id == 0 as u32 {
+        id = NEXT_ID
+        NEXT_ID = NEXT_ID + 1 as u32
+    }
+    sink_toast(id, urgency, app, summary, body)
+    var out: rt.Buf = rt.buf_new()
+    dbus.w_u32(&out, id)
+    dbus.bus_reply(b, m, "u", &out)
+    rt.buf_free(&out)
+}
+
+fn notify_close(b: *mut dbus.Bus, m: *mut dbus.Msg) {
+    var rd: dbus.Rd = dbus.msg_body(m)
+    let id: u32 = dbus.rd_u32(&rd)
+    if !rd.ok {
+        dbus.bus_reply_error(b, m, "org.freedesktop.DBus.Error.InvalidArgs", "CloseNotification: bad arguments")
+        return
+    }
+    dbus.bus_reply(b, m, "", 0 as *mut rt.Buf)
+    var out: rt.Buf = rt.buf_new()
+    dbus.w_u32(&out, id)
+    dbus.w_u32(&out, 3 as u32) // closed by a call
+    dbus.bus_signal(b, "/org/freedesktop/Notifications", "org.freedesktop.Notifications", "NotificationClosed", "uu", &out)
+    rt.buf_free(&out)
+}
+
+// ------------------------------------------------------------------ org.freedesktop.portal.Settings
+
+// The value (a variant) of org.freedesktop.appearance / `key`. false = unknown.
+fn appearance_value(out: *mut rt.Buf, key: str) -> bool {
+    if key == "color-scheme" {
+        dbus.w_variant(out, "u")
+        if DARK {
+            dbus.w_u32(out, 1 as u32)
+        } else {
+            dbus.w_u32(out, 2 as u32)
+        }
+        return true
+    }
+    if key == "accent-color" {
+        dbus.w_variant(out, "(ddd)")
+        dbus.w_struct_begin(out)
+        dbus.w_f64_bits(out, num.f64_bits(0.106)) // the launcher accent #1bd96a
+        dbus.w_f64_bits(out, num.f64_bits(0.851))
+        dbus.w_f64_bits(out, num.f64_bits(0.416))
+        return true
+    }
+    return false
+}
+
+fn settings_read(b: *mut dbus.Bus, m: *mut dbus.Msg, double_wrapped: bool) {
+    var rd: dbus.Rd = dbus.msg_body(m)
+    let ns: str = __str_copy(dbus.rd_str(&rd))
+    let key: str = __str_copy(dbus.rd_str(&rd))
+    if !rd.ok || ns != "org.freedesktop.appearance" || (key != "color-scheme" && key != "accent-color") {
+        dbus.bus_reply_error(b, m, "org.freedesktop.portal.Error.NotFound", "unknown namespace or key")
+        return
+    }
+    var out: rt.Buf = rt.buf_new()
+    if double_wrapped {
+        // Read (version 1 of the interface): a variant that holds the variant of the value
+        dbus.w_variant(&out, "v")
+    }
+    appearance_value(&out, key)
+    dbus.bus_reply(b, m, "v", &out)
+    rt.buf_free(&out)
+}
+
+// ReadAll(as) -> a{sa{sv}}: the appearance namespace only
+fn settings_read_all(b: *mut dbus.Bus, m: *mut dbus.Msg) {
+    var out: rt.Buf = rt.buf_new()
+    let at: usize = dbus.w_array_begin(&out, 8)
+    dbus.w_struct_begin(&out)
+    dbus.w_str(&out, "org.freedesktop.appearance")
+    let at2: usize = dbus.w_array_begin(&out, 8)
+    dbus.w_struct_begin(&out)
+    dbus.w_str(&out, "color-scheme")
+    appearance_value(&out, "color-scheme")
+    dbus.w_struct_begin(&out)
+    dbus.w_str(&out, "accent-color")
+    appearance_value(&out, "accent-color")
+    dbus.w_array_end(&out, at2, 8)
+    dbus.w_array_end(&out, at, 8)
+    dbus.bus_reply(b, m, "a{sa{sv}}", &out)
+    rt.buf_free(&out)
+}
+
+// ------------------------------------------------------------------ org.freedesktop.portal.FileChooser
+
+struct Options {
+    token: rt.Buf,
+    name: rt.Buf,
+    folder: rt.Buf,
+    filters: rt.Buf, // "Label|pat;pat" of the first filter
+    multiple: bool,
+    directory: bool,
+}
+
+// a(sa(us)): the first filter as "Label|pat;pat" (glob patterns only, type 0)
+fn read_filters(rd: *mut dbus.Rd, out: *mut rt.Buf) {
+    let end: usize = dbus.rd_array_begin(rd, 8)
+    var first: bool = true
+    while dbus.rd_array_more(rd, end) {
+        dbus.rd_align(rd, 8)
+        let label: str = dbus.rd_str(rd)
+        let pend: usize = dbus.rd_array_begin(rd, 8)
+        if first {
+            push_s(out, label)
+            rt.buf_push(out, 124 as u8)
+        }
+        var np: usize = 0
+        while dbus.rd_array_more(rd, pend) {
+            dbus.rd_align(rd, 8)
+            let kind: u32 = dbus.rd_u32(rd)
+            let pat: str = dbus.rd_str(rd)
+            if first && kind == 0 as u32 {
+                if np > 0 {
+                    rt.buf_push(out, 59 as u8)
+                }
+                push_s(out, pat)
+                np = np + 1
+            }
+        }
+        first = false
+    }
+}
+
+fn read_options(rd: *mut dbus.Rd, o: *mut Options) {
+    let end: usize = dbus.rd_array_begin(rd, 8)
+    while dbus.rd_array_more(rd, end) {
+        dbus.rd_align(rd, 8)
+        let key: str = dbus.rd_str(rd)
+        let sig: str = dbus.rd_sig(rd)
+        if key == "handle_token" && sig == "s" {
+            push_s(&(*o).token, dbus.rd_str(rd))
+        } else if key == "current_name" && sig == "s" {
+            push_s(&(*o).name, dbus.rd_str(rd))
+        } else if key == "multiple" && sig == "b" {
+            (*o).multiple = dbus.rd_bool(rd)
+        } else if key == "directory" && sig == "b" {
+            (*o).directory = dbus.rd_bool(rd)
+        } else if key == "current_folder" && sig == "ay" {
+            let n: u32 = dbus.rd_u32(rd)
+            var i: u32 = 0 as u32
+            while i < n && (*rd).ok {
+                let c: u8 = dbus.rd_byte(rd)
+                if c != 0 as u8 {
+                    rt.buf_push(&(*o).folder, c)
+                }
+                i = i + 1 as u32
+            }
+        } else if key == "filters" && sig == "a(sa(us))" {
+            read_filters(rd, &(*o).filters)
+        } else {
+            var i: usize = 0
+            dbus.rd_skip_value(rd, sig, &i)
+        }
+    }
+}
+
+// "/org/freedesktop/portal/desktop/request/<sender without ':' and '.' as '_'>/<token>"
+fn request_path(sender: str, token: str, out: *mut rt.Buf) {
+    push_s(out, "/org/freedesktop/portal/desktop/request/")
+    var i: usize = 0
+    while i < sender.length() {
+        let c: u8 = sender.chars(i)
+        if c == 46 as u8 {
+            rt.buf_push(out, 95 as u8)
+        } else if c != 58 as u8 {
+            rt.buf_push(out, c)
+        }
+        i = i + 1
+    }
+    rt.buf_push(out, 47 as u8)
+    push_s(out, token)
+}
+
+fn hex_up(d: u32) -> u8 {
+    if d < 10 as u32 {
+        return (48 as u32 + d) as u8
+    }
+    return (55 as u32 + d) as u8
+}
+
+// "file://" + the path, percent-encoded as the spec wants (everything but unreserved characters and "/")
+fn push_uri(out: *mut rt.Buf, path: str) {
+    push_s(out, "file://")
+    var i: usize = 0
+    while i < path.length() {
+        let c: u8 = path.chars(i)
+        let plain: bool = (c >= 48 as u8 && c <= 57 as u8) || (c >= 65 as u8 && c <= 90 as u8) || (c >= 97 as u8 && c <= 122 as u8)
+        || c == 45 as u8 || c == 46 as u8 || c == 95 as u8 || c == 126 as u8 || c == 47 as u8
+        if plain {
+            rt.buf_push(out, c)
+        } else {
+            rt.buf_push(out, 37 as u8)
+            rt.buf_push(out, hex_up((c >> 4) as u32))
+            rt.buf_push(out, hex_up((c & 15 as u8) as u32))
+        }
+        i = i + 1
+    }
+}
+
+// OpenFile / SaveFile (parent_window s, title s, options a{sv}) -> o ; then the Response signal.
+fn chooser_call(b: *mut dbus.Bus, m: *mut dbus.Msg, save: bool) {
+    var rd: dbus.Rd = dbus.msg_body(m)
+    dbus.rd_str(&rd) // the parent window
+    let title: str = __str_copy(dbus.rd_str(&rd))
+    var o: Options = Options { token: rt.buf_new(), name: rt.buf_new(), folder: rt.buf_new(), filters: rt.buf_new(),
+        multiple: false, directory: false }
+    read_options(&rd, &o)
+    if !rd.ok {
+        dbus.bus_reply_error(b, m, "org.freedesktop.DBus.Error.InvalidArgs", "bad arguments")
+        return
+    }
+    if rt.buf_len(&o.token) == 0 {
+        push_s(&o.token, "t")
+    }
+    let sender: str = __str_copy((*m).f.sender)
+    var req: rt.Buf = rt.buf_new()
+    request_path(sender, view(&o.token), &req)
+    let reqs: str = __str_copy(view(&req))
+    // the Request object is the answer to the call
+    var out: rt.Buf = rt.buf_new()
+    dbus.w_path(&out, reqs)
+    dbus.bus_reply(b, m, "o", &out)
+    rt.buf_free(&out)
+
+    // the dialog (blocks until the user answers)
+    var res: rt.Buf = rt.buf_new()
+    var r: i32 = dialog.FAILED
+    if save {
+        r = dialog.save_file(title, view(&o.folder), view(&o.name), view(&o.filters), &res)
+    } else if o.directory {
+        r = dialog.pick_folder(title, view(&o.folder), &res)
+    } else if o.multiple {
+        r = dialog.open_files(title, view(&o.folder), view(&o.filters), &res)
+    } else {
+        r = dialog.open_file(title, view(&o.folder), view(&o.filters), &res)
+    }
+
+    // Response(u response, a{sv} results): 0 = chosen, 1 = cancelled, 2 = ended in another way
+    var sig: rt.Buf = rt.buf_new()
+    var code: u32 = 2 as u32
+    if r == dialog.OK {
+        code = 0 as u32
+    } else if r == dialog.CANCELED {
+        code = 1 as u32
+    }
+    dbus.w_u32(&sig, code)
+    let at: usize = dbus.w_array_begin(&sig, 8)
+    if code == 0 as u32 {
+        dbus.w_struct_begin(&sig)
+        dbus.w_str(&sig, "uris")
+        dbus.w_variant(&sig, "as")
+        let at2: usize = dbus.w_array_begin(&sig, 4)
+        let all: str = view(&res)
+        var start: usize = 0
+        var i: usize = 0
+        while i <= all.length() {
+            if i == all.length() || all.chars(i) == 10 as u8 {
+                var uri: rt.Buf = rt.buf_new()
+                push_uri(&uri, str { p: ((all.p as u64) + start as u64) as *mut u8, n: i - start })
+                dbus.w_str(&sig, view(&uri))
+                rt.buf_free(&uri)
+                start = i + 1
+            }
+            i = i + 1
+        }
+        dbus.w_array_end(&sig, at2, 4)
+    }
+    dbus.w_array_end(&sig, at, 8)
+    var f: dbus.Fields = dbus.fields_signal(reqs, "org.freedesktop.portal.Request", "Response", "ua{sv}")
+    f.dest = sender
+    dbus.bus_send(b, &f, &sig)
+    rt.buf_free(&sig)
+    rt.buf_free(&res)
+    rt.buf_free(&req)
+    rt.buf_free(&o.token)
+    rt.buf_free(&o.name)
+    rt.buf_free(&o.folder)
+    rt.buf_free(&o.filters)
+}
+
+// ------------------------------------------------------------------ Introspect
+
+// Clients such as gdbus and dbus-python ask for the signatures of the methods before they marshal the arguments.
+fn introspect_xml(path: str, out: *mut rt.Buf) -> bool {
+    push_s(out, "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\" \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n<node>\n")
+    if path == "/org/freedesktop/Notifications" {
+        push_s(out, "<interface name=\"org.freedesktop.Notifications\">\n")
+        push_s(out, "<method name=\"GetCapabilities\"><arg direction=\"out\" type=\"as\" name=\"capabilities\"/></method>\n")
+        push_s(out, "<method name=\"Notify\"><arg direction=\"in\" type=\"s\" name=\"app_name\"/><arg direction=\"in\" type=\"u\" name=\"replaces_id\"/>")
+        push_s(out, "<arg direction=\"in\" type=\"s\" name=\"app_icon\"/><arg direction=\"in\" type=\"s\" name=\"summary\"/><arg direction=\"in\" type=\"s\" name=\"body\"/>")
+        push_s(out, "<arg direction=\"in\" type=\"as\" name=\"actions\"/><arg direction=\"in\" type=\"a{sv}\" name=\"hints\"/><arg direction=\"in\" type=\"i\" name=\"expire_timeout\"/>")
+        push_s(out, "<arg direction=\"out\" type=\"u\" name=\"id\"/></method>\n")
+        push_s(out, "<method name=\"CloseNotification\"><arg direction=\"in\" type=\"u\" name=\"id\"/></method>\n")
+        push_s(out, "<method name=\"GetServerInformation\"><arg direction=\"out\" type=\"s\" name=\"name\"/><arg direction=\"out\" type=\"s\" name=\"vendor\"/>")
+        push_s(out, "<arg direction=\"out\" type=\"s\" name=\"version\"/><arg direction=\"out\" type=\"s\" name=\"spec_version\"/></method>\n")
+        push_s(out, "<signal name=\"NotificationClosed\"><arg type=\"u\" name=\"id\"/><arg type=\"u\" name=\"reason\"/></signal>\n")
+        push_s(out, "<signal name=\"ActionInvoked\"><arg type=\"u\" name=\"id\"/><arg type=\"s\" name=\"action_key\"/></signal>\n</interface>\n</node>\n")
+        return true
+    }
+    if path == "/org/freedesktop/portal/desktop" {
+        push_s(out, "<interface name=\"org.freedesktop.portal.FileChooser\">\n")
+        push_s(out, "<method name=\"OpenFile\"><arg type=\"s\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/><arg type=\"a{sv}\" direction=\"in\"/><arg type=\"o\" direction=\"out\"/></method>\n")
+        push_s(out, "<method name=\"SaveFile\"><arg type=\"s\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/><arg type=\"a{sv}\" direction=\"in\"/><arg type=\"o\" direction=\"out\"/></method>\n")
+        push_s(out, "</interface>\n<interface name=\"org.freedesktop.portal.Settings\">\n")
+        push_s(out, "<method name=\"ReadAll\"><arg type=\"as\" direction=\"in\"/><arg type=\"a{sa{sv}}\" direction=\"out\"/></method>\n")
+        push_s(out, "<method name=\"Read\"><arg type=\"s\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/><arg type=\"v\" direction=\"out\"/></method>\n")
+        push_s(out, "<method name=\"ReadOne\"><arg type=\"s\" direction=\"in\"/><arg type=\"s\" direction=\"in\"/><arg type=\"v\" direction=\"out\"/></method>\n")
+        push_s(out, "</interface>\n</node>\n")
+        return true
+    }
+    push_s(out, "</node>\n")
+    return true
+}
+
+// ------------------------------------------------------------------ dispatch
+
+fn handler(ctx: u64, b: *mut dbus.Bus, m: *mut dbus.Msg) -> bool {
+    if !dbus.msg_is_call(m) {
+        return false
+    }
+    let iface: str = (*m).f.iface
+    let member: str = (*m).f.member
+    if iface == "org.freedesktop.Notifications" {
+        if member == "GetCapabilities" { notify_caps(b, m); return true }
+        if member == "GetServerInformation" { notify_info(b, m); return true }
+        if member == "Notify" { notify_call(b, m); return true }
+        if member == "CloseNotification" { notify_close(b, m); return true }
+    }
+    if iface == "org.freedesktop.portal.FileChooser" {
+        if member == "OpenFile" { chooser_call(b, m, false); return true }
+        if member == "SaveFile" { chooser_call(b, m, true); return true }
+    }
+    if iface == "org.freedesktop.portal.Settings" {
+        if member == "Read" { settings_read(b, m, true); return true }
+        if member == "ReadOne" { settings_read(b, m, false); return true }
+        if member == "ReadAll" { settings_read_all(b, m); return true }
+    }
+    if iface == "org.freedesktop.DBus.Introspectable" && member == "Introspect" {
+        var xml: rt.Buf = rt.buf_new()
+        introspect_xml((*m).f.path, &xml)
+        var out: rt.Buf = rt.buf_new()
+        dbus.w_str(&out, view(&xml))
+        dbus.bus_reply(b, m, "s", &out)
+        rt.buf_free(&out)
+        rt.buf_free(&xml)
+        return true
+    }
+    if iface == "org.freedesktop.DBus.Peer" && member == "Ping" {
+        dbus.bus_reply(b, m, "", 0 as *mut rt.Buf)
+        return true
+    }
+    dbus.bus_reply_error(b, m, "org.freedesktop.DBus.Error.UnknownMethod", "no such method")
+    return true
+}
+
+fn main(start: u64) -> i32 {
+    var i: usize = 1
+    while i < rt.arg_count(start) {
+        let a: str = arg(start, i)
+        if a == "--dark" {
+            DARK = true
+        } else if a == "--toast-file" && i + 1 < rt.arg_count(start) {
+            i = i + 1
+            let p: str = arg(start, i)
+            TOAST_FILE = rt.heap_alloc(p.length() + 1)
+            rt.mem_copy(TOAST_FILE, p.p as u64, p.length())
+            rt.st8(TOAST_FILE, p.length(), 0 as u8)
+        } else {
+            say_err("usage: portald [--toast-file PATH] [--dark]\n")
+            return 2
+        }
+        i = i + 1
+    }
+    var bus: dbus.Bus = dbus.bus_new()
+    if !dbus.bus_connect_session(&bus) {
+        say_err("portald: no session bus (DBUS_SESSION_BUS_ADDRESS)\n")
+        return 1
+    }
+    if dbus.bus_request_name(&bus, "org.freedesktop.Notifications", dbus.REQ_DO_NOT_QUEUE) != dbus.NAME_PRIMARY as i32 {
+        say_err("portald: org.freedesktop.Notifications is owned by another program\n")
+        return 1
+    }
+    if dbus.bus_request_name(&bus, "org.freedesktop.portal.Desktop", dbus.REQ_DO_NOT_QUEUE) != dbus.NAME_PRIMARY as i32 {
+        say_err("portald: org.freedesktop.portal.Desktop is owned by another program\n")
+        return 1
+    }
+    syscall(1, 1, "READY\n".p as i64, 6, 0, 0, 0)
+    while dbus.bus_is_open(&bus) {
+        dbus.bus_pump(&bus, 1000, handler, 0 as u64)
+    }
+    return 0
+}

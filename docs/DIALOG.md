@@ -177,12 +177,18 @@ What exists and what is missing (looked at 09.10.2026):
 | the dialog on OrientOS | not there; `dialogd` is its first body |
 | Wayland (foreign GUI programs) | the Wayland round of the OrientOS department (`wayd`, `docs/RUNDE-WAYLAND.md`, roadmap r498-r503): `wl_data_device`, seat, formats, GPU. It does not cover D-Bus or portals; nothing here duplicates it |
 
-The service (`orient-portald`, spike in `tools/portald`) owns `org.freedesktop.Notifications` (`Notify`,
-`CloseNotification`, `GetCapabilities`, `GetServerInformation`, the two signals) and `org.freedesktop.portal.Desktop`
-(`FileChooser.OpenFile` / `SaveFile`, `Settings.Read` / `ReadAll` for `org.freedesktop.appearance` `color-scheme` and
-`accent-color`, and later `Screenshot.PickColor`). A notification goes to a *toast sink*, a file chooser request to a
-`dialogd` request. The spike is tested with `dbus-send` / `gdbus` / a Python client against a private bus on Linux; on
-OrientOS it needs the broker above.
+The service (`orient-portald`, spike in `tools/portald`, built, tested, 32 checks) owns `org.freedesktop.Notifications`
+(`Notify`, `CloseNotification`, `GetCapabilities`, `GetServerInformation`, the signal `NotificationClosed`) and
+`org.freedesktop.portal.Desktop`: `FileChooser.OpenFile` / `SaveFile` (a Request object and the signal `Request.Response(u, a{sv})`
+with `uris`; the options `multiple`, `directory`, `current_folder`, `current_name`, `handle_token` and the first filter's glob
+patterns are honoured) and `Settings.Read` / `ReadOne` / `ReadAll` for `org.freedesktop.appearance` (`color-scheme`,
+`accent-color`); `Introspect` for both objects, because gdbus and dbus-python ask for the signatures before they marshal. A
+notification goes to a toast sink (a file on Linux; `notify_osum.fi`'s `NOTIPOST` on OrientOS), a file chooser request goes to
+`std.dialog`, i.e. to whatever dialog the machine has (on OrientOS: `dialogd`). Tested on a private bus against dbus-python
+(libdbus), `gdbus` (GLib) and `dbus-send`, with a stand-in dialog service whose request lines are compared exactly. Not done:
+`SaveFiles`, `Screenshot` / `PickColor`, properties, several requests at once (the daemon is busy while a dialog is open), actions
+and clicks back to the sender (`ActionInvoked`), and the broker on OrientOS (above) -- without it a foreign program there finds no
+bus.
 
 **Not built, only an idea (roadmap):** compatibility with the Windows API in Wine's way (so that a Windows program's
 `GetOpenFileNameW` would show our dialog).
@@ -218,7 +224,8 @@ OrientOS it needs the broker above.
 |---|---|---|
 | zenity / kdialog / service command lines and answers, backend choice | test 2380: stand-in scripts, 8 environments | real run (Linux), a mutation made it fail |
 | the fUi dialogs | `tools/dialog/dialog_check.py`: Xvfb, xdotool, screenshots, WM_DELETE_WINDOW | real run, 30 checks |
-| Windows dialogs | `tools/dialog/dialog_check_win.py`: Wine + a pilot program | see the report of the round |
+| Windows dialogs | `tools/dialog/dialog_check_win.py`: Wine 8 (real comdlg32 / shell32 / user32) + a pilot program that presses the buttons | real run, 19 checks (not on Microsoft's Windows) |
 | browser | `tools/dialog/check_webdialog.cjs`: Chromium (Playwright) | real run, 17 checks |
 | toast on Linux | `tools/dialog/toast_check.py`: a notification server written with libdbus | real run |
+| orient-portald | `tools/portald/portald_check.py`: dbus-daemon + dbus-python, gdbus, dbus-send | real run, 32 checks |
 | Android, OrientOS | `tools/dialog/platforms.py`, `tools/desktop/platforms.py`: type-check and build only | compiled only |
