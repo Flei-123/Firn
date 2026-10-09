@@ -25,6 +25,12 @@ mod codegen_a64;
 mod codegen_switch;
 mod codegen_wasm;
 mod codegen_x86;
+mod x86enc;
+mod asm_intern;
+mod asm_x86;
+mod a64enc;
+mod asm_a64;
+mod elfobj;
 mod comptime;
 mod env;
 mod config;
@@ -399,6 +405,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 }
             }
             "--keep-asm" => keep_asm = true,
+            // ROUND KODIERER: use the compiler's own binary encoder instead of `as`.
+            // The default stays `as` until the counter check over the whole tree
+            // is octet-identical (tools/kodierer/run.sh).
+            "--asm-intern" => asm_intern::set(true),
             "--stats" => stats = true,
             "--timings" => timings = true,
             _ if a.starts_with("--deps-out=") => {
@@ -530,6 +540,14 @@ fn main() {
     if args.len() == 1 && args[0] == "--lsp" {
         std::process::exit(lsp::serve());
     }
+    // ROUND KODIERER: `--object-only` takes a finished .s file and makes an
+    // object file out of it -- the way `tools/kodierer/compare.py` sends the
+    // same text once through `as` and once through the own encoder. Without
+    // the language front end, so that the comparison really measures only the
+    // encoder.
+    if args.iter().any(|a| a == "--object-only") {
+        std::process::exit(object_only(&args));
+    }
     let opts = match parse_args(&args) {
         Ok(o) => o,
         Err(e) => {
@@ -547,6 +565,43 @@ fn main() {
         eprint!("{}", env::manifest());
     }
     std::process::exit(rc);
+}
+
+/// `--object-only [--asm-intern] [--target=…] -o <out.o> <in.s>`
+fn object_only(args: &[String]) -> i32 {
+    let mut out: Option<PathBuf> = None;
+    let mut inp: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--object-only" => {}
+            "--asm-intern" => asm_intern::set(true),
+            "-o" => {
+                i += 1;
+                out = args.get(i).map(PathBuf::from);
+            }
+            a if a.starts_with("--target=") => {
+                if let Err(e) = target::flag_set(&a["--target=".len()..]) {
+                    eprintln!("error: {}", e);
+                    return 2;
+                }
+            }
+            a if a.starts_with('-') => {}
+            a => inp = Some(PathBuf::from(a)),
+        }
+        i += 1;
+    }
+    let (inp, out) = match (inp, out) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            eprintln!("error: --object-only needs <in.s> and -o <out.o>");
+            return 2;
+        }
+    };
+    match assemble(&inp, &out) {
+        Ok(()) => 0,
+        Err(c) => c,
+    }
 }
 
 fn run(opts: &Options) -> i32 {
@@ -1269,6 +1324,46 @@ fn default_output(input: &Path) -> PathBuf {
 /// Assemble only (`as --64 -o x.o x.s`) — the freestanding output.
 fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
     let t = target::active();
+    // ROUND KODIERER: the own way -- no process, no `as`.
+    if asm_intern::get() {
+        let text = match std::fs::read_to_string(asm) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: cannot read '{}': {}", asm.display(), e);
+                return Err(3);
+            }
+        };
+        // The assembler writes ELF objects. Windows needs PE/COFF and stays
+        // on the default path through the system assembler, and a
+        // WebAssembly build has no assembler at all.
+        let res = if target::windows() {
+            Err(String::from(
+                "the integrated assembler writes ELF objects; x86_64-windows needs \
+                 PE/COFF and stays on the default path through `as`",
+            ))
+        } else {
+            match t {
+                target::Target::X86_64 => asm_x86::assemble_to_object(&text),
+                target::Target::Aarch64 => asm_a64::assemble_to_object(&text),
+                target::Target::Wasm32Browser => {
+                    Err(String::from("the integrated assembler has no WebAssembly target"))
+                }
+            }
+        };
+        return match res {
+            Ok(bytes) => match std::fs::write(obj, &bytes) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("error: cannot write '{}': {}", obj.display(), e);
+                    Err(3)
+                }
+            },
+            Err(e) => {
+                eprintln!("error: integrated assembler: {}", e);
+                Err(3)
+            }
+        };
+    }
     // ROUND 93 (reproducibility, ACCEPTANCE item 5): `as` builds a
     // `.debug_line` out of our `.file`/`.loc` directives and puts ITS OWN
     // working directory into it as `DW_AT_comp_dir`. Two checkouts at
