@@ -1336,9 +1336,9 @@ echo "== THE INTERACTIVE DIALOGS (roadmap r177, docs/DIALOG.md): message, colour
 # FRAME_MS limit (<= 16 ms) with release-fast, the accessibility audit, and the live test on a private
 # Xvfb (SKIP when Xvfb / xdotool / xwd / PIL are missing). Last lines: "... PASSED".
 for n in msgdlg colordlg fontdlg; do
-    sh "tools/dialog/${n}_run.sh"
+    bash "tools/dialog/${n}_run.sh"
 done
-sh tools/dialog/filedlg_run.sh all
+bash tools/dialog/filedlg_run.sh all
 
 echo
 echo "ALL CHECKS PASSED."
