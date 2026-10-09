@@ -15,12 +15,15 @@
 #   3. every tests/neg alias program is REFUSED by both, with a real error
 #      (exit 1/5), never "not core" (3) and never a crash
 #   4. a cycle of aliases across two modules is refused by both
+#   5. the syntax tree of a core program with aliases is the same in both
+#      (`--emit=ast-canon` against `bin/astdump.fi`): the alias is gone
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
 export FIRNLIB="$(pwd)/lib"
 FIRNC=compiler/target/release/firnc
 FC1=${FIRNC1:-./.firnc1}
+DUMP=${ASTDUMP:-./.astdump}
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -38,6 +41,11 @@ if [ -x "$FC1" ]; then
 fi
 if [ "$rebuild" -eq 1 ]; then
     "$FIRNC" bin/firnc1.fi -o "$FC1" || exit 1
+fi
+
+if [ ! -x "$DUMP" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$DUMP" -print -quit)" ]; then
+    rm -f "$DUMP"
+    "$FIRNC" bin/astdump.fi -o "$DUMP" || exit 1
 fi
 
 fail=0
@@ -92,6 +100,21 @@ for f in tests/neg/24*alias*.fi tools/typealias/cyc_main.fi; do
         fail=$((fail+1))
     fi
 done
+
+# the syntax tree of a core program: the alias is gone, the same in both
+for src in tools/typealias/core_alias.fi; do
+    "$FIRNC" --emit=ast-canon "$src" > "$WORK/t0.txt" 2>/dev/null
+    "$DUMP" "$src" > "$WORK/t1.txt" 2>/dev/null; rd=$?
+    n=$((n+1))
+    if [ "$rd" = "0" ] && cmp -s "$WORK/t0.txt" "$WORK/t1.txt" && ! grep -q "Idx\|Octet\|Chain" "$WORK/t0.txt"; then
+        say "same syntax tree: $src" "OK ($(wc -l < "$WORK/t0.txt") lines, no alias name left)"
+    else
+        say "same syntax tree: $src" "DIFFERENT (astdump exit $rd)"
+        diff "$WORK/t0.txt" "$WORK/t1.txt" | head -6
+        fail=$((fail+1))
+    fi
+done
+both "core program with aliases" tools/typealias/core_alias.fi
 
 echo "  typealias: $n programs through both compilers, $fail deviations"
 [ "$fail" -eq 0 ]
