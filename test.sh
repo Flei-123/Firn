@@ -1876,7 +1876,7 @@ else
     grep -E 'FAIL' "$WORK/firnrun.log" | head -10 | sed 's/^/   /' || true
 fi
 
-echo "== 112. type aliases in BOTH compilers (tools/typealias/run.sh, GAPS B14) =="
+echo "== 118. type aliases in BOTH compilers (tools/typealias/run.sh, GAPS B14) =="
 # `type Idx = u32` is another name for the same type: the positive programs, the importing module in front of the
 # module it imports, a chain over three modules and every refused program (cycle, duplicate, generic alias, struct
 # clash, type arguments at a use, methods on a pointer alias, ...) go through firnc0 AND firnc1 with the same verdict.
