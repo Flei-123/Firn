@@ -1,0 +1,1497 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/msgdlg_main.fi -- THE CHECK OF THE MESSAGE BOX (lib/fui/msgdlg.fi), WITHOUT A WINDOW.
+//
+// The dialog is built through its public calls, painted into a canvas of its own window size and driven
+// through the SAME entry points a platform host calls (app_key / app_char / app_act and fuiwirt's pointer
+// and keys), so what is checked here is what an X11 window does, minus the window.
+//
+//   1  the constants are the ones of lib/std/dialog.fi
+//   2  all 4 kinds x 4 button sets: geometry, labels, default button, focus, icon colour, pictures
+//   3  the icon: colour from the theme token, the glyph in the middle of its disc, icon and text on one line
+//   4  the keyboard: Enter, Esc, Tab, Left / Right, Alt+mnemonic, Ctrl+C, for every case
+//   5  the mouse: a click on every button gives its answer; hover and focus ring change the picture
+//   6  texts: 4,000 characters (scrolls), empty, umlauts / CJK / emoji, CRLF, a word wider than the window
+//   7  scrolling: wheel, Down / PageDown / End
+//   8  contrast in light, dark and the four built-in themes
+//   9  accessibility: names, audit 0
+//  10  scale 2
+//  11  speed: FRAME_MS lines (checked against 16 ms with `speed`, build with --opt-level=release-fast)
+//
+//     firnc -o /tmp/msgdlg tools/fui/msgdlg_main.fi && /tmp/msgdlg [dir-for-pngs | speed]
+//
+// The last line is MSGDLG PASSED or MSGDLG FAILED.
+import std.rt
+import std.dialog
+import html.mem
+import paint.canvas
+import paint.png
+import font.metrics
+import fui.theme
+import fui.painter
+import fui.scene
+import fui.editor
+import fui.widget
+import fui.style
+import fui.render
+import fui.viewport
+import fui.a11y
+import fui.themefile
+import fui.themelist
+import fui.msgdlg
+import plat.fuiwirt
+import plat.sysfont
+import fui.app
+
+static mut BAD: usize = 0
+static mut FONT: u64 = 0
+static mut SPEED: bool = false
+static mut CLOCK: i64 = 1000
+static mut SCALE_PM: usize = 1000
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_num(v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&t, v)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn check(ok: bool, what: str) {
+    if ok {
+        say("  ok    ")
+    } else {
+        say("  WRONG ")
+        BAD = BAD + 1
+    }
+    say(what)
+    say("\n")
+}
+
+fn eq(what: str, got: i64, want: i64) {
+    if got == want {
+        say("  ok    ")
+        say(what)
+        say("\n")
+    } else {
+        say("  WRONG ")
+        say(what)
+        say("  got ")
+        say_num(got)
+        say(" want ")
+        say_num(want)
+        say("\n")
+        BAD = BAD + 1
+    }
+}
+
+// A measured value against its target, with both numbers when it is wrong (hundredths).
+fn chk_near(what: str, got: f64, want: f64, tol: f64) {
+    if absf(got - want) <= tol {
+        say("  ok    ")
+        say(what)
+        say("\n")
+    } else {
+        say("  WRONG ")
+        say(what)
+        say("  got ")
+        say_num((got * 100.0) as i64)
+        say(" want ")
+        say_num((want * 100.0) as i64)
+        say(" (hundredths)\n")
+        BAD = BAD + 1
+    }
+}
+
+fn same(a: str, b: str) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    var i: usize = 0
+    while i < a.n {
+        if rt.ld8(a.p as u64, i) != rt.ld8(b.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn now_ms() -> f64 {
+    var ts: [u64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as u64)
+    return (ts[0] as f64) * 1000.0 + (ts[1] as f64) / 1000000.0
+}
+
+fn absf(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+fn near(a: f64, b: f64, tol: f64) -> bool {
+    return absf(a - b) <= tol
+}
+
+// ------------------------------------------------------------ a dialog under test
+
+struct Case {
+    a: *mut app.App,
+    cv: canvas.Canvas,
+    z: painter.Painter,
+    w: usize,
+    h: usize,
+    ans: i32,
+}
+
+fn case_free(k: *mut Case) {
+    if k as u64 == 0 as u64 {
+        return
+    }
+    canvas.canvas_free(&(*k).cv)
+    rt.heap_free(k as u64, 131072)
+}
+
+// Build the dialog, bind the host, give it a canvas of `w` x `h` (0 = the window's own size) and paint.
+// themei: -1 = the plain light/dark set, else the built-in theme of themelist.
+fn open_raw(kind: i32, buttons: i32, title: str, text: str, dark: bool, themei: i32,
+    w: usize, h: usize) -> *mut Case {
+    let k: *mut Case = rt.heap_alloc(131072) as *mut Case
+    (*k).ans = 0
+    let a: *mut app.App = msgdlg.build(kind, title, text, buttons, &(*k).ans)
+    if a as u64 == 0 {
+        say("  (build failed)\n")
+        BAD = BAD + 1
+        return 0 as u64 as *mut Case
+    }
+    (*k).a = a
+    app.set_dark(a, dark)
+    if themei >= 0 {
+        var n: usize = 0
+        let tp: u64 = themelist.builtin_text(themei as usize, &n)
+        var r: themefile.ThemeFile = themefile.themefile_new()
+        let ok: bool = themefile.themefile_apply(app.app_theme(a), tp, n, &r)
+        check(ok, "the built-in theme loads")
+    }
+    if SCALE_PM != 1000 {
+        fuiwirt.host_set_scale(app.app_host(a), app.app_theme(a), SCALE_PM)
+    }
+    var sz: msgdlg.Size = msgdlg.win_size(a)
+    (*k).w = w
+    (*k).h = h
+    if w == 0 {
+        (*k).w = sz.w * SCALE_PM / 1000
+        (*k).h = sz.h * SCALE_PM / 1000
+    }
+    (*k).cv = canvas.canvas_new()
+    (*k).z = painter.painter_new()
+    if !canvas.canvas_init(&(*k).cv, (*k).w, (*k).h) || !painter.painter_init(&(*k).z, &(*k).cv, (*k).w, (*k).h) {
+        say("  (canvas failed)\n")
+        BAD = BAD + 1
+        return 0 as u64 as *mut Case
+    }
+    painter.painter_set_font(&(*k).z, FONT)
+    app.app_attach(a as u64, &(*k).z)
+    fuiwirt.host_bind(app.app_host(a))
+    return k
+}
+
+fn open_sized(kind: i32, buttons: i32, title: str, text: str, dark: bool, themei: i32,
+    w: usize, h: usize) -> *mut Case {
+    let k: *mut Case = open_raw(kind, buttons, title, text, dark, themei, w, h)
+    if k as u64 != 0 as u64 {
+        frame(k)
+    }
+    return k
+}
+
+fn open(kind: i32, buttons: i32, title: str, text: str, dark: bool) -> *mut Case {
+    return open_sized(kind, buttons, title, text, dark, 0 - 1, 0, 0)
+}
+
+// One frame, then the further frames a host paints while a hover glides (until nothing is dirty).
+fn frame(k: *mut Case) {
+    let a: *mut app.App = (*k).a
+    app.app_paint(a as u64, (*k).w, (*k).h)
+    fuiwirt.host_painted(app.app_host(a))
+    let c: u32 = fuiwirt.host_after_layout(app.app_host(a))
+    var n: usize = 0
+    while fuiwirt.host_dirty(app.app_host(a)) && n < 6 {
+        CLOCK = CLOCK + 1000
+        fuiwirt.host_tick(app.app_host(a), CLOCK)
+        app.app_paint(a as u64, (*k).w, (*k).h)
+        fuiwirt.host_painted(app.app_host(a))
+        n = n + 1
+    }
+}
+
+fn settle(k: *mut Case) {
+    let a: *mut app.App = (*k).a
+    let i: usize = fuiwirt.host_take_activated(app.app_host(a))
+    if i != fuiwirt.KEINER {
+        app.app_act(a as u64, i)
+    }
+    frame(k)
+}
+
+// A key the way the X11 host delivers it: the application's hook first, then the host.
+fn key(k: *mut Case, ek: u32, hk: u32, mods: u32) {
+    let a: *mut app.App = (*k).a
+    let taken: bool = app.app_key(a as u64, ek, mods)
+    if !taken && hk != 0 as u32 {
+        let c: u32 = fuiwirt.host_key(app.app_host(a), hk, mods)
+    }
+    settle(k)
+}
+
+fn chr(k: *mut Case, cp: u32, mods: u32) {
+    let a: *mut app.App = (*k).a
+    let taken: bool = app.app_char(a as u64, cp, mods)
+    if !taken {
+        let c: u32 = fuiwirt.host_char(app.app_host(a), cp, mods)
+    }
+    settle(k)
+}
+
+fn key_enter(k: *mut Case) { key(k, editor.KEY_ENTER, fuiwirt.KEY_RETURN, 0 as u32) }
+fn key_esc(k: *mut Case) { key(k, editor.KEY_ESC, fuiwirt.KEY_ESCAPE, 0 as u32) }
+fn key_tab(k: *mut Case) { key(k, editor.KEY_TAB, fuiwirt.KEY_TAB, 0 as u32) }
+fn key_left(k: *mut Case) { key(k, editor.KEY_LEFT, fuiwirt.KEY_LEFT, 0 as u32) }
+fn key_right(k: *mut Case) { key(k, editor.KEY_RIGHT, fuiwirt.KEY_RIGHT, 0 as u32) }
+
+fn click_node(k: *mut Case, id: usize) {
+    let a: *mut app.App = (*k).a
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let x: f64 = scene.node_x(sc, id) + scene.node_w(sc, id) / 2.0
+    let y: f64 = scene.node_y(sc, id) + scene.node_h(sc, id) / 2.0
+    let w: *mut fuiwirt.Host = app.app_host(a)
+    let c1: u32 = fuiwirt.host_pointer_move(w, x, y)
+    let c2: u32 = fuiwirt.host_pointer_down(w, x, y, fuiwirt.BTN_LEFT)
+    let c3: u32 = fuiwirt.host_pointer_up(w, x, y, fuiwirt.BTN_LEFT)
+    settle(k)
+}
+
+fn move_to(k: *mut Case, x: f64, y: f64) {
+    let a: *mut app.App = (*k).a
+    let c: u32 = fuiwirt.host_pointer_move(app.app_host(a), x, y)
+    frame(k)
+}
+
+fn node_cx(k: *mut Case, id: usize) -> f64 {
+    let sc: *mut scene.Scene = app.app_scene((*k).a)
+    return scene.node_x(sc, id) + scene.node_w(sc, id) / 2.0
+}
+
+fn node_cy(k: *mut Case, id: usize) -> f64 {
+    let sc: *mut scene.Scene = app.app_scene((*k).a)
+    return scene.node_y(sc, id) + scene.node_h(sc, id) / 2.0
+}
+
+// ------------------------------------------------------------ pixels
+
+fn px(k: *mut Case, x: f64, y: f64) -> u32 {
+    if x < 0.0 || y < 0.0 || x >= (*k).w as f64 || y >= (*k).h as f64 {
+        return 0 as u32
+    }
+    return canvas.canvas_get(&(*k).cv, x as usize, y as usize) & 16777215 as u32
+}
+
+fn tok(k: *mut Case, t: u32) -> u32 {
+    var c: render.Ctx = render.ctx_new(app.app_theme((*k).a), &(*k).z)
+    return theme.opaque(render.color_of(&c, style.color_token(t))) & 16777215 as u32
+}
+
+fn chan(c: u32, i: u32) -> i64 {
+    return ((c >> (i * 8 as u32)) & 255 as u32) as i64
+}
+
+fn cdist(a: u32, b: u32) -> i64 {
+    var d: i64 = 0
+    var i: u32 = 0 as u32
+    while i < 3 as u32 {
+        var e: i64 = chan(a, i) - chan(b, i)
+        if e < 0 {
+            e = 0 - e
+        }
+        d = d + e
+        i = i + 1 as u32
+    }
+    return d
+}
+
+// How many pixels of the box are exactly `want`?
+fn count_colour(k: *mut Case, x0: f64, y0: f64, w: f64, h: f64, want: u32) -> usize {
+    var n: usize = 0
+    var y: f64 = y0
+    while y < y0 + h {
+        var x: f64 = x0
+        while x < x0 + w {
+            if px(k, x, y) == want {
+                n = n + 1
+            }
+            x = x + 1.0
+        }
+        y = y + 1.0
+    }
+    return n
+}
+
+fn count_differ(k: *mut Case, x0: f64, y0: f64, w: f64, h: f64, base: u32) -> usize {
+    var n: usize = 0
+    var y: f64 = y0
+    while y < y0 + h {
+        var x: f64 = x0
+        while x < x0 + w {
+            if cdist(px(k, x, y), base) > 24 {
+                n = n + 1
+            }
+            x = x + 1.0
+        }
+        y = y + 1.0
+    }
+    return n
+}
+
+// The glyph of an icon: its coverage-weighted centre (cx, cy) and the middle of its bounding box (bx, by) in
+// the box (x0, y0, w, h), where a pixel's coverage is how far it has moved from `fill` towards `ink`.
+// Returns the sum of coverage (0 = no glyph found).
+fn glyph_centre(k: *mut Case, x0: f64, y0: f64, w: f64, h: f64, fill: u32, ink: u32,
+    cx: *mut f64, cy: *mut f64, bx: *mut f64, by: *mut f64) -> f64 {
+    let span: i64 = cdist(fill, ink)
+    var sum: f64 = 0.0
+    var sx: f64 = 0.0
+    var sy: f64 = 0.0
+    var minx: f64 = 100000.0
+    var maxx: f64 = 0.0 - 100000.0
+    var miny: f64 = 100000.0
+    var maxy: f64 = 0.0 - 100000.0
+    var y: f64 = y0
+    while y < y0 + h {
+        var x: f64 = x0
+        while x < x0 + w {
+            let p: u32 = px(k, x, y)
+            var cov: f64 = (cdist(p, fill) as f64) / (span as f64)
+            if cov > 1.0 {
+                cov = 1.0
+            }
+            if cov > 0.04 && cdist(p, ink) < cdist(p, fill) + span {
+                sum = sum + cov
+                sx = sx + cov * (x + 0.5)
+                sy = sy + cov * (y + 0.5)
+                if cov > 0.5 {
+                    if x < minx { minx = x }
+                    if x + 1.0 > maxx { maxx = x + 1.0 }
+                    if y < miny { miny = y }
+                    if y + 1.0 > maxy { maxy = y + 1.0 }
+                }
+            }
+            x = x + 1.0
+        }
+        y = y + 1.0
+    }
+    if sum <= 0.0 {
+        return 0.0
+    }
+    *cx = sx / sum
+    *cy = sy / sum
+    *bx = (minx + maxx) / 2.0
+    *by = (miny + maxy) / 2.0
+    return sum
+}
+
+fn save(k: *mut Case, dir: u64, name: str) {
+    if dir == 0 {
+        return
+    }
+    var path: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&path, dir, rt.c_length(dir))
+    rt.buf_push(&path, 47 as u8)
+    rt.buf_push_bytes(&path, name.p as u64, name.n)
+    rt.buf_push(&path, 0 as u8)
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    if png.write_png(&(*k).cv, &out) {
+        let ok: bool = rt.write_file(rt.buf_ptr(&path), mem.buf_ptr(&out) as u64, mem.buf_len(&out))
+    }
+    rt.buf_free(&path)
+}
+
+fn kind_name(kind: i32) -> str {
+    if kind == 1 { return "question" }
+    if kind == 2 { return "warning" }
+    if kind == 3 { return "error" }
+    return "info"
+}
+
+fn btns_name(b: i32) -> str {
+    if b == 1 { return "okcancel" }
+    if b == 2 { return "yesno" }
+    if b == 3 { return "yesnocancel" }
+    return "ok"
+}
+
+// "msg-<kind>-<buttons>-<mode>.png"
+fn png_name(kind: i32, b: i32, mode: str) -> str {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, "msg-".p as u64, 4)
+    let kn: str = kind_name(kind)
+    rt.buf_push_bytes(&t, kn.p as u64, kn.n)
+    rt.buf_push(&t, 45 as u8)
+    let bn: str = btns_name(b)
+    rt.buf_push_bytes(&t, bn.p as u64, bn.n)
+    rt.buf_push(&t, 45 as u8)
+    rt.buf_push_bytes(&t, mode.p as u64, mode.n)
+    rt.buf_push_bytes(&t, ".png".p as u64, 4)
+    return str { p: rt.buf_ptr(&t) as *mut u8, n: rt.buf_len(&t) }
+}
+
+fn expect_nb(b: i32) -> usize {
+    if b == 0 { return 1 }
+    if b == 3 { return 3 }
+    return 2
+}
+
+fn expect_ans(b: i32, i: usize) -> i32 {
+    if b == 1 {
+        if i == 0 { return std_ok() }
+        return std_cancel()
+    }
+    if b == 2 {
+        if i == 0 { return std_yes() }
+        return std_no()
+    }
+    if b == 3 {
+        if i == 0 { return std_yes() }
+        if i == 1 { return std_no() }
+        return std_cancel()
+    }
+    return std_ok()
+}
+
+fn std_ok() -> i32 { return dialog.ANS_OK }
+fn std_cancel() -> i32 { return dialog.ANS_CANCEL }
+fn std_yes() -> i32 { return dialog.ANS_YES }
+fn std_no() -> i32 { return dialog.ANS_NO }
+
+fn expect_label(ans: i32) -> str {
+    if ans == dialog.ANS_YES { return "Yes" }
+    if ans == dialog.ANS_NO { return "No" }
+    if ans == dialog.ANS_CANCEL { return "Cancel" }
+    return "OK"
+}
+
+fn expect_close(b: i32) -> i32 {
+    if b == 1 || b == 3 { return dialog.ANS_CANCEL }
+    if b == 2 { return dialog.ANS_NO }
+    return dialog.ANS_OK
+}
+
+fn expect_def(kind: i32, b: i32) -> usize {
+    if (b == 2 || b == 3) && (kind == 2 || kind == 3) {
+        return 1
+    }
+    return 0
+}
+
+fn token_fill(k: *mut Case, kind: i32) -> u32 {
+    let f: *mut theme.Colors = theme.theme_colors(app.app_theme((*k).a))
+    var t: u32 = (*f).accent
+    if kind == 2 { t = (*f).warning }
+    if kind == 3 { t = (*f).err_col }
+    return t & 16777215 as u32
+}
+
+fn t1() -> str { return "Delete files" }
+fn x1() -> str { return "Delete 3 files from the project?\nThis cannot be undone." }
+
+// ------------------------------------------------------------ 1. constants
+
+fn run_consts() {
+    say("== 1. the constants are the ones of lib/std/dialog.fi ==\n")
+    eq("KIND_INFO", msgdlg.KIND_INFO as i64, dialog.KIND_INFO as i64)
+    eq("KIND_QUESTION", msgdlg.KIND_QUESTION as i64, dialog.KIND_QUESTION as i64)
+    eq("KIND_WARNING", msgdlg.KIND_WARNING as i64, dialog.KIND_WARNING as i64)
+    eq("KIND_ERROR", msgdlg.KIND_ERROR as i64, dialog.KIND_ERROR as i64)
+    eq("BTNS_OK", msgdlg.BTNS_OK as i64, dialog.BTNS_OK as i64)
+    eq("BTNS_OK_CANCEL", msgdlg.BTNS_OK_CANCEL as i64, dialog.BTNS_OK_CANCEL as i64)
+    eq("BTNS_YES_NO", msgdlg.BTNS_YES_NO as i64, dialog.BTNS_YES_NO as i64)
+    eq("BTNS_YES_NO_CANCEL", msgdlg.BTNS_YES_NO_CANCEL as i64, dialog.BTNS_YES_NO_CANCEL as i64)
+    eq("ANS_OK", msgdlg.ANS_OK as i64, dialog.ANS_OK as i64)
+    eq("ANS_CANCEL", msgdlg.ANS_CANCEL as i64, dialog.ANS_CANCEL as i64)
+    eq("ANS_YES", msgdlg.ANS_YES as i64, dialog.ANS_YES as i64)
+    eq("ANS_NO", msgdlg.ANS_NO as i64, dialog.ANS_NO as i64)
+}
+
+// ------------------------------------------------------------ 2. the 16 cases
+
+fn matrix_case(kind: i32, b: i32, dark: bool, dir: u64) {
+    let k: *mut Case = open(kind, b, t1(), x1(), dark)
+    if k as u64 == 0 as u64 {
+        return
+    }
+    let a: *mut app.App = (*k).a
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let sz: msgdlg.Size = msgdlg.win_size(a)
+    var mode: str = "light"
+    if dark {
+        mode = "dark"
+    }
+    save(k, dir, png_name(kind, b, mode))
+    let nb: usize = msgdlg.button_count(a)
+    eq("the number of buttons", nb as i64, expect_nb(b) as i64)
+    check(sz.w >= 360 && sz.w <= 560, "the window is 360 .. 560 wide")
+    check(sz.h >= 130 && sz.h <= 200, "a two-line text: a window of 130 .. 200")
+    var i: usize = 0
+    var all_label: bool = true
+    var all_same_w: bool = true
+    var all_in: bool = true
+    var all_ans: bool = true
+    let w0: f64 = scene.node_w(sc, msgdlg.button_node(a, 0))
+    while i < nb {
+        let n: usize = msgdlg.button_node(a, i)
+        let want: str = expect_label(expect_ans(b, i))
+        if !same(app.text(a, n), want) {
+            all_label = false
+        }
+        if !near(scene.node_w(sc, n), w0, 0.5) {
+            all_same_w = false
+        }
+        if scene.node_x(sc, n) < 0.0 || scene.node_x(sc, n) + scene.node_w(sc, n) > sz.w as f64
+        || scene.node_y(sc, n) < 0.0 || scene.node_y(sc, n) + scene.node_h(sc, n) > sz.h as f64 {
+            all_in = false
+        }
+        if msgdlg.press_button(a, i) != expect_ans(b, i) {
+            all_ans = false
+        }
+        i = i + 1
+    }
+    check(all_label, "the labels are Yes / No / OK / Cancel in the order of the Windows MessageBox")
+    check(all_ans, "the answers of the buttons are the ANS_ constants in that order")
+    check(all_same_w, "every button has the same width")
+    check(w0 >= 88.0, "at least 88 wide")
+    check(all_in, "every button lies inside the window")
+    let last: usize = msgdlg.button_node(a, nb - 1)
+    check(near(scene.node_x(sc, last) + scene.node_w(sc, last), sz.w as f64 - 24.0, 1.0),
+        "the buttons are right-aligned (24 from the edge)")
+    let foot: usize = msgdlg.footer_node(a)
+    check(near(node_cy(k, last), scene.node_y(sc, foot) + 1.0 + (scene.node_h(sc, foot) - 1.0) / 2.0, 1.5),
+        "the buttons stand in the middle of their strip")
+    eq("the default button", msgdlg.default_button(a) as i64, expect_def(kind, b) as i64)
+    check(app.focus(a) == msgdlg.button_node(a, msgdlg.default_button(a)), "the default button has the focus at the start")
+    eq("closing the window answers", msgdlg.close_answer(a) as i64, expect_close(b) as i64)
+    check(!fuiwirt.host_dirty(app.app_host(a)) && fuiwirt.host_wait_ms(app.app_host(a)) == fuiwirt.WAIT_FOREVER,
+        "after the first frames nothing is dirty: the host sleeps until an event comes (a quiet window)")
+    // the picture: the icon's disc / triangle has the token colour (the glyph does not cover it all)
+    let ic: usize = msgdlg.icon_node(a)
+    let fill: u32 = token_fill(k, kind)
+    let area: usize = count_colour(k, scene.node_x(sc, ic), scene.node_y(sc, ic), 32.0, 32.0, fill)
+    check(area > 300, "the icon is painted in the token colour of its kind")
+    // and in no other kind's colour
+    var o: i32 = 0
+    var foreign: usize = 0
+    while o < 4 {
+        if o != kind && token_fill(k, o) != fill {
+            foreign = foreign + count_colour(k, scene.node_x(sc, ic), scene.node_y(sc, ic), 32.0, 32.0, token_fill(k, o))
+        }
+        o = o + 1
+    }
+    eq("no pixel of another kind's colour in the icon", foreign as i64, 0)
+    // the card is the raised surface and the strip the base
+    check(px(k, 4.0, 4.0) == tok(k, style.TOK_SURFACE_RAISED), "the card is the raised surface")
+    check(px(k, 4.0, sz.h as f64 - 4.0) == tok(k, style.TOK_BASE), "the strip is the base")
+}
+
+fn run_matrix(dir: u64) {
+    say("== 2. every kind with every button set ==\n")
+    var kind: i32 = 0
+    while kind < 4 {
+        var b: i32 = 0
+        while b < 4 {
+            say("-- ")
+            say(kind_name(kind))
+            say(" / ")
+            say(btns_name(b))
+            say("\n")
+            matrix_case(kind, b, false, dir)
+            b = b + 1
+        }
+        kind = kind + 1
+    }
+    // the dark set: all kinds with Yes / No / Cancel
+    kind = 0
+    while kind < 4 {
+        say("-- dark ")
+        say(kind_name(kind))
+        say("\n")
+        matrix_case(kind, 3, true, dir)
+        kind = kind + 1
+    }
+}
+
+// ------------------------------------------------------------ 3. the icon
+
+fn icon_case(kind: i32, dark: bool) {
+    let k: *mut Case = open(kind, 0, "T", "One line.", dark)
+    if k as u64 == 0 as u64 {
+        return
+    }
+    let a: *mut app.App = (*k).a
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let ic: usize = msgdlg.icon_node(a)
+    let ix: f64 = scene.node_x(sc, ic)
+    let iy: f64 = scene.node_y(sc, ic)
+    let iw: f64 = scene.node_w(sc, ic)
+    var rc: render.Ctx = render.ctx_new(app.app_theme(a), &(*k).z)
+    let fill: u32 = msgdlg.kind_fill(&rc, kind) & 16777215 as u32
+    let ink: u32 = msgdlg.kind_glyph(&rc, kind) & 16777215 as u32
+    let tokc: u32 = token_fill(k, kind)
+    check(fill == tokc, "the fill is the theme token itself (it already has 3:1 on the card)")
+    check(theme.contrast(fill, tok(k, style.TOK_SURFACE_RAISED)) >= 3.0, "the fill has 3:1 on the card")
+    check(theme.contrast(ink, fill) >= 4.5, "the glyph has 4.5:1 on the fill")
+    eq("the icon is 32 pixels", iw as i64, 32)
+    // the glyph's centre: inside the disc only (the triangle's glyph is lower, by design)
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var bx: f64 = 0.0
+    var by: f64 = 0.0
+    var x0: f64 = ix + 6.0
+    var y0: f64 = iy + 6.0
+    var w0: f64 = 20.0
+    var h0: f64 = 20.0
+    if kind == 2 {
+        x0 = ix + 9.0
+        y0 = iy + 11.0
+        w0 = 14.0
+        h0 = 15.0
+    }
+    let sum: f64 = glyph_centre(k, x0, y0, w0, h0, fill, ink, &cx, &cy, &bx, &by)
+    check(sum > 10.0, "the glyph is there")
+    say("    glyph centroid (")
+    say_num(((cx - ix) * 100.0) as i64)
+    say(", ")
+    say_num(((cy - iy) * 100.0) as i64)
+    say(") box middle (")
+    say_num(((bx - ix) * 100.0) as i64)
+    say(", ")
+    say_num(((by - iy) * 100.0) as i64)
+    say(") hundredths of a pixel in the 32 x 32 icon\n")
+    if kind == 1 {
+        // a question mark is top-heavy: its ink's centroid lies above the middle of its box whatever the
+        // font; the box is centred (as in every icon set), the centroid may be 2 px high
+        check(near(cx, ix + 16.0, 1.0) && near(cy, iy + 16.0, 2.0), "the glyph's centroid is within 1 px (2 px high) of the disc's middle")
+        check(near(bx, ix + 16.0, 1.0) && near(by, iy + 16.0, 1.0), "and its bounding box is within 1 px")
+    } else if kind != 2 {
+        check(near(cx, ix + 16.0, 1.0) && near(cy, iy + 16.0, 1.0), "the glyph's centroid is within 1 px of the disc's middle")
+        check(near(bx, ix + 16.0, 1.0) && near(by, iy + 16.0, 1.0), "and its bounding box is as well")
+    } else {
+        check(near(cx, ix + 16.0, 1.0), "the triangle's glyph is on the middle line")
+        check(cy > iy + 16.0 && cy < iy + 24.0, "and in the lower part of the triangle")
+    }
+    // the icon's rows against the text's line (rule r441)
+    let txn: usize = msgdlg.text_node(a)
+    let line_mid: f64 = scene.node_y(sc, txn) + 21.0 / 2.0
+    check(near(iy + 16.0, line_mid, 1.0), "a one-line text: the icon's middle row is the line's middle row")
+}
+
+fn run_icons() {
+    say("== 3. the icon ==\n")
+    var kind: i32 = 0
+    while kind < 4 {
+        say("-- ")
+        say(kind_name(kind))
+        say(" light\n")
+        icon_case(kind, false)
+        say("-- ")
+        say(kind_name(kind))
+        say(" dark\n")
+        icon_case(kind, true)
+        kind = kind + 1
+    }
+    // several lines: the icon's top is the first line's top
+    let k: *mut Case = open(1, 2, "T", "Line one\nline two\nline three", false)
+    if k as u64 != 0 as u64 {
+        let sc: *mut scene.Scene = app.app_scene((*k).a)
+        let ic: usize = msgdlg.icon_node((*k).a)
+        let tx: usize = msgdlg.text_node((*k).a)
+        eq("three lines", msgdlg.line_count((*k).a) as i64, 3)
+        check(near(scene.node_y(sc, ic), scene.node_y(sc, tx), 1.0),
+            "a text of several lines: the icon is level with the top of the first line")
+    }
+}
+
+// ------------------------------------------------------------ 4. the keyboard
+
+fn first_letter(ans: i32) -> u32 {
+    let s: str = expect_label(ans)
+    return (rt.ld8(s.p as u64, 0) as u32) + 32 as u32
+}
+
+fn kb_case(kind: i32, b: i32) {
+    let nb: usize = expect_nb(b)
+    let def: usize = expect_def(kind, b)
+    // Enter: the focused (default) button
+    var k: *mut Case = open(kind, b, t1(), x1(), false)
+    if k as u64 == 0 as u64 {
+        return
+    }
+    key_enter(k)
+    check(msgdlg.chosen((*k).a) && app.app_done((*k).a as u64), "Enter presses the default button and ends the dialog")
+    eq("Enter answers the default button's answer", (*k).ans as i64, expect_ans(b, def) as i64)
+    case_free(k)
+    // Esc
+    k = open(kind, b, t1(), x1(), false)
+    key_esc(k)
+    check(msgdlg.dismissed((*k).a) && app.app_done((*k).a as u64) && !msgdlg.chosen((*k).a), "Esc dismisses")
+    eq("Esc answers like closing the window (Cancel / No / OK)", (*k).ans as i64, expect_close(b) as i64)
+    case_free(k)
+    // Tab / Shift+Tab / Right / Left
+    k = open(kind, b, t1(), x1(), false)
+    let a: *mut app.App = (*k).a
+    key_tab(k)
+    eq("Tab moves the focus to the next button", app.focus(a) as i64, msgdlg.button_node(a, (def + 1) % nb) as i64)
+    key(k, editor.KEY_TAB, fuiwirt.KEY_TAB, fuiwirt.MOD_SHIFT)
+    eq("Shift+Tab moves it back", app.focus(a) as i64, msgdlg.button_node(a, def) as i64)
+    key_right(k)
+    eq("Right moves the focus to the next button", app.focus(a) as i64, msgdlg.button_node(a, (def + 1) % nb) as i64)
+    check(!app.app_done(a as u64), "Right does not end the dialog")
+    key_left(k)
+    eq("Left moves it back", app.focus(a) as i64, msgdlg.button_node(a, def) as i64)
+    if nb > 1 {
+        key_right(k)
+        key_enter(k)
+        eq("Right, Enter presses the other button", (*k).ans as i64, expect_ans(b, (def + 1) % nb) as i64)
+    }
+    case_free(k)
+    // the space bar presses the focused button
+    k = open(kind, b, t1(), x1(), false)
+    chr(k, 32 as u32, 0 as u32)
+    eq("the space bar presses the focused button", (*k).ans as i64, expect_ans(b, def) as i64)
+    case_free(k)
+    // Alt + the underlined letter, lower and upper case
+    var i: usize = 0
+    while i < nb {
+        k = open(kind, b, t1(), x1(), false)
+        chr(k, first_letter(expect_ans(b, i)), fuiwirt.MOD_ALT)
+        eq("Alt + letter presses its button", (*k).ans as i64, expect_ans(b, i) as i64)
+        check(msgdlg.chosen((*k).a), "... as a choice")
+        case_free(k)
+        k = open(kind, b, t1(), x1(), false)
+        chr(k, first_letter(expect_ans(b, i)) - 32 as u32, fuiwirt.MOD_ALT)
+        eq("Alt + upper-case letter too", (*k).ans as i64, expect_ans(b, i) as i64)
+        case_free(k)
+        i = i + 1
+    }
+    // a bare letter is not a shortcut (there is no text field to protect, but Windows' rule keeps the box calm)
+    k = open(kind, b, t1(), x1(), false)
+    chr(k, first_letter(expect_ans(b, 0)), 0 as u32)
+    check(!app.app_done((*k).a as u64), "a letter without Alt does nothing")
+    // Ctrl+C is taken and does not end the dialog
+    chr(k, 3 as u32, fuiwirt.MOD_CTRL)
+    check(!app.app_done((*k).a as u64), "Ctrl+C does not end the dialog")
+    case_free(k)
+}
+
+fn run_keys() {
+    say("== 4. the keyboard ==\n")
+    var kind: i32 = 0
+    while kind < 4 {
+        var b: i32 = 0
+        while b < 4 {
+            say("-- ")
+            say(kind_name(kind))
+            say(" / ")
+            say(btns_name(b))
+            say("\n")
+            kb_case(kind, b)
+            b = b + 1
+        }
+        kind = kind + 1
+    }
+    // what Ctrl+C copies
+    let k: *mut Case = open(1, 2, "Delete files", "Line one\r\nLine two\tx\n\n", false)
+    var out: rt.Buf = rt.buf_new()
+    msgdlg.copy_string((*k).a, &out)
+    let got: str = str { p: rt.buf_ptr(&out) as *mut u8, n: rt.buf_len(&out) }
+    check(same(got, "Delete files\nLine one\nLine two    x"), "Ctrl+C copies title, a line break and the text (CR dropped, tab as spaces, no trailing blank lines)")
+    rt.buf_free(&out)
+}
+
+// ------------------------------------------------------------ 5. the mouse
+
+fn mouse_case(kind: i32, b: i32) {
+    let nb: usize = expect_nb(b)
+    var i: usize = 0
+    while i < nb {
+        let k: *mut Case = open(kind, b, t1(), x1(), false)
+        click_node(k, msgdlg.button_node((*k).a, i))
+        eq("a click on the button gives its answer", (*k).ans as i64, expect_ans(b, i) as i64)
+        check(msgdlg.chosen((*k).a) && app.app_done((*k).a as u64), "... and ends the dialog")
+        case_free(k)
+        i = i + 1
+    }
+}
+
+fn run_mouse() {
+    say("== 5. the mouse, hover, press and focus ==\n")
+    var kind: i32 = 0
+    while kind < 4 {
+        var b: i32 = 0
+        while b < 4 {
+            say("-- ")
+            say(kind_name(kind))
+            say(" / ")
+            say(btns_name(b))
+            say("\n")
+            mouse_case(kind, b)
+            b = b + 1
+        }
+        kind = kind + 1
+    }
+    // a click beside the buttons does nothing
+    var k: *mut Case = open(1, 3, t1(), x1(), false)
+    move_to(k, 40.0, 40.0)
+    let c1: u32 = fuiwirt.host_pointer_down(app.app_host((*k).a), 40.0, 40.0, fuiwirt.BTN_LEFT)
+    let c2: u32 = fuiwirt.host_pointer_up(app.app_host((*k).a), 40.0, 40.0, fuiwirt.BTN_LEFT)
+    settle(k)
+    check(!app.app_done((*k).a as u64), "a click on the text does not end the dialog")
+    case_free(k)
+    // hover, press, focus ring on a plain button (No of Yes / No / Cancel on a question: Yes is the default)
+    k = open(1, 3, t1(), x1(), false)
+    let a: *mut app.App = (*k).a
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let yes: usize = msgdlg.button_node(a, 0)
+    let no: usize = msgdlg.button_node(a, 1)
+    let cancel: usize = msgdlg.button_node(a, 2)
+    let nx: f64 = scene.node_x(sc, no) + 8.0
+    let ny: f64 = node_cy(k, no)
+    check(px(k, nx, ny) == tok(k, style.TOK_BUTTON), "a resting button is the button colour")
+    check(px(k, scene.node_x(sc, no) + 1.0, ny) != tok(k, style.TOK_ACCENT), "no ring on a button without the focus")
+    move_to(k, node_cx(k, no), ny)
+    check(px(k, nx, ny) == tok(k, style.TOK_BUTTON_HOVER), "hovered: the hover colour")
+    let d1: u32 = fuiwirt.host_pointer_down(app.app_host(a), node_cx(k, no), ny, fuiwirt.BTN_LEFT)
+    frame(k)
+    check(px(k, nx, ny) == tok(k, style.TOK_BUTTON_ACTIVE), "pressed: the pressed colour")
+    // leave without a click: release outside
+    let d2: u32 = fuiwirt.host_pointer_up(app.app_host(a), 40.0, 40.0, fuiwirt.BTN_LEFT)
+    settle(k)
+    check(!app.app_done(a as u64), "a press that is released elsewhere does not click")
+    move_to(k, 40.0, 40.0)
+    check(px(k, nx, ny) == tok(k, style.TOK_BUTTON), "the pointer away: rest again")
+    // a press focuses the button: the ring is two pixels of the accent on its edge
+    check(app.focus(a) == no, "a press puts the focus on the button")
+    check(px(k, scene.node_x(sc, no) + 1.0, ny) == tok(k, style.TOK_ACCENT), "the focus ring is the accent")
+    check(px(k, scene.node_x(sc, no) + 4.0, ny) == tok(k, style.TOK_BUTTON), "... two pixels wide")
+    key_tab(k)
+    check(app.focus(a) == cancel, "Tab: the focus is on Cancel")
+    check(px(k, scene.node_x(sc, cancel) + 1.0, node_cy(k, cancel)) == tok(k, style.TOK_ACCENT), "the ring moved with it")
+    check(px(k, scene.node_x(sc, no) + 1.0, ny) != tok(k, style.TOK_ACCENT), "... and left No")
+    // the default button: accent fill, and the hover changes it
+    let yx: f64 = scene.node_x(sc, yes) + 8.0
+    let yy: f64 = node_cy(k, yes)
+    check(px(k, yx, yy) == tok(k, style.TOK_ACCENT), "the default button is filled with the accent")
+    move_to(k, node_cx(k, yes), yy)
+    say("    default button: rest ")
+    say_num(tok(k, style.TOK_ACCENT) as i64)
+    say(" hovered ")
+    say_num(px(k, yx, yy) as i64)
+    say("\n")
+    check(cdist(px(k, yx, yy), tok(k, style.TOK_ACCENT)) > 12, "hovering the default button changes its colour")
+    let d3: u32 = fuiwirt.host_pointer_down(app.app_host(a), node_cx(k, yes), yy, fuiwirt.BTN_LEFT)
+    frame(k)
+    check(cdist(px(k, yx, yy), tok(k, style.TOK_ACCENT)) > 30, "pressing it changes it more")
+    case_free(k)
+}
+
+// ------------------------------------------------------------ 6. texts
+
+fn long_text() -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while rt.buf_len(&b) < 4000 {
+        rt.buf_push_bytes(&b, "Paragraph ".p as u64, 10)
+        rt.buf_push_dec_i64(&b, i as i64)
+        rt.buf_push_bytes(&b, ": the quick brown fox jumps over the lazy dog, and then the dog gets up and does the same. ".p as u64, 91)
+        if i % 5 == 4 {
+            rt.buf_push(&b, 10 as u8)
+        }
+        i = i + 1
+    }
+    return b
+}
+
+fn text_ink(k: *mut Case) -> usize {
+    let a: *mut app.App = (*k).a
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let vn: usize = msgdlg.viewport_node(a)
+    return count_differ(k, scene.node_x(sc, vn), scene.node_y(sc, vn), scene.node_w(sc, vn), scene.node_h(sc, vn),
+        tok(k, style.TOK_SURFACE_RAISED))
+}
+
+fn text_case(what: str, title: str, text: str, dir: u64, png: str) -> *mut Case {
+    say("-- ")
+    say(what)
+    say("\n")
+    let k: *mut Case = open(3, 1, title, text, false)
+    if k as u64 == 0 as u64 {
+        return k
+    }
+    let a: *mut app.App = (*k).a
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let sz: msgdlg.Size = msgdlg.win_size(a)
+    check(sz.w >= 360 && sz.w <= 560, "the window is 360 .. 560 wide")
+    check(sz.h * 100 <= 768 * 60, "and at most 60 % of a 768 pixel screen high")
+    let tx: usize = msgdlg.text_node(a)
+    let vn: usize = msgdlg.viewport_node(a)
+    check(scene.node_x(sc, vn) + scene.node_w(sc, vn) <= sz.w as f64 - 24.0 + 0.5, "the text area ends inside the right margin")
+    let bn: usize = msgdlg.button_node(a, 0)
+    check(scene.node_y(sc, bn) + scene.node_h(sc, bn) <= sz.h as f64, "the buttons are inside the window")
+    check(scene.node_y(sc, vn) + scene.node_h(sc, vn) <= scene.node_y(sc, msgdlg.footer_node(a)), "the text area ends above the button strip")
+    save(k, dir, png)
+    return k
+}
+
+fn run_texts(dir: u64) {
+    say("== 6. texts ==\n")
+    var lt: rt.Buf = long_text()
+    let longs: str = str { p: rt.buf_ptr(&lt) as *mut u8, n: rt.buf_len(&lt) }
+    var k: *mut Case = text_case("4,000 characters", "A long message", longs, dir, "msg-long-light.png")
+    var a: *mut app.App = (*k).a
+    check(msgdlg.scrolls(a), "it scrolls")
+    check(msgdlg.line_count(a) > 12, "more than 12 lines")
+    check(text_ink(k) > 1500, "text is painted")
+    let sz: msgdlg.Size = msgdlg.win_size(a)
+    eq("the window height: 24 + 12 lines of 21 + 24 + 56", sz.h as i64, 24 + 252 + 24 + 56)
+    case_free(k)
+    rt.buf_free(&lt)
+
+    k = text_case("empty text", "Nothing to say", "", dir, "msg-empty-light.png")
+    eq("no lines", msgdlg.line_count((*k).a) as i64, 0)
+    check(!msgdlg.scrolls((*k).a), "no scrolling")
+    key_enter(k)
+    eq("and the box still answers", (*k).ans as i64, 1)
+    case_free(k)
+
+    k = text_case("umlauts", "Ünïcödé ñ", "ÄÖÜ äöü ß € é ñ ç?\nÀÉÎÕÛ àéîõû œ æ", dir, "msg-umlauts-light.png")
+    eq("two lines", msgdlg.line_count((*k).a) as i64, 2)
+    check(text_ink(k) > 400, "text is painted")
+    case_free(k)
+
+    k = text_case("CJK, Cyrillic, Arabic", "你好", "你好，世界。\nこれはテストです\nПривет, мир\nمرحبا", dir, "msg-cjk-light.png")
+    eq("four lines", msgdlg.line_count((*k).a) as i64, 4)
+    case_free(k)
+
+    k = text_case("emoji and symbols the font may lack", "Done 😀", "All done 😀 👍 ✔ ✨ 🚀", dir, "msg-emoji-light.png")
+    check(text_ink(k) > 100, "text is painted")
+    case_free(k)
+
+    k = text_case("CRLF, tabs, trailing blank lines", "T", "one\r\ntwo\tx\r\n\r\n\n", dir, "")
+    eq("two lines", msgdlg.line_count((*k).a) as i64, 2)
+    case_free(k)
+
+    k = text_case("blank lines in the middle", "T", "one\n\n\ntwo", dir, "")
+    eq("four lines (two of them blank)", msgdlg.line_count((*k).a) as i64, 4)
+    case_free(k)
+
+    var w: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 600 {
+        rt.buf_push(&w, 88 as u8)
+        i = i + 1
+    }
+    let ws: str = str { p: rt.buf_ptr(&w) as *mut u8, n: rt.buf_len(&w) }
+    k = text_case("one word of 600 letters", "T", ws, dir, "msg-longword-light.png")
+    check(msgdlg.line_count((*k).a) >= 10, "split by character over many lines")
+    check(msgdlg.scrolls((*k).a), "and scrolled")
+    case_free(k)
+    rt.buf_free(&w)
+
+    var nl: rt.Buf = rt.buf_new()
+    rt.buf_push(&nl, 120 as u8)
+    i = 0
+    while i < 3000 {
+        rt.buf_push(&nl, 10 as u8)
+        i = i + 1
+    }
+    rt.buf_push(&nl, 121 as u8)
+    let nls: str = str { p: rt.buf_ptr(&nl) as *mut u8, n: rt.buf_len(&nl) }
+    k = text_case("3,000 line breaks", "T", nls, dir, "")
+    eq("cut at 1,024 lines", msgdlg.line_count((*k).a) as i64, 1024)
+    case_free(k)
+    rt.buf_free(&nl)
+
+    var big: rt.Buf = rt.buf_new()
+    i = 0
+    while i < 50000 {
+        rt.buf_push(&big, 97 as u8 + (i % 26) as u8)
+        if i % 7 == 6 {
+            rt.buf_push(&big, 32 as u8)
+        }
+        i = i + 1
+    }
+    let bigs: str = str { p: rt.buf_ptr(&big) as *mut u8, n: rt.buf_len(&big) }
+    k = text_case("50,000 characters", "T", bigs, dir, "")
+    check(msgdlg.line_count((*k).a) > 100, "many lines, cut at 32,000 bytes")
+    case_free(k)
+    rt.buf_free(&big)
+
+    // bytes that are not UTF-8
+    var bad: [u8; 12] = [72 as u8, 255 as u8, 192 as u8, 128 as u8, 226 as u8, 130 as u8, 10 as u8, 240 as u8, 159 as u8, 1 as u8, 0 as u8, 65 as u8]
+    let bads: str = str { p: (&bad[0]) as *mut u8, n: 12 }
+    k = text_case("bytes that are not UTF-8, a control character, a NUL", "T", bads, dir, "")
+    case_free(k)
+
+    var tt: rt.Buf = rt.buf_new()
+    i = 0
+    while i < 300 {
+        rt.buf_push(&tt, 84 as u8)
+        i = i + 1
+    }
+    let tts: str = str { p: rt.buf_ptr(&tt) as *mut u8, n: rt.buf_len(&tt) }
+    k = text_case("a title of 300 letters and an empty one", tts, "text", dir, "")
+    case_free(k)
+    k = text_case("an empty title", "", "text", dir, "")
+    case_free(k)
+    rt.buf_free(&tt)
+}
+
+// ------------------------------------------------------------ 7. scrolling
+
+fn hkey(k: *mut Case, hk: u32) {
+    let c: u32 = fuiwirt.host_key(app.app_host((*k).a), hk, 0 as u32)
+    settle(k)
+}
+
+fn run_scroll() {
+    say("== 7. scrolling ==\n")
+    var lt: rt.Buf = long_text()
+    let longs: str = str { p: rt.buf_ptr(&lt) as *mut u8, n: rt.buf_len(&lt) }
+    let k: *mut Case = open(0, 0, "Long", longs, false)
+    let a: *mut app.App = (*k).a
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let vn: usize = msgdlg.viewport_node(a)
+    let cx: f64 = scene.node_x(sc, vn) + 100.0
+    let cy: f64 = scene.node_y(sc, vn) + 100.0
+    eq("it starts at the top", msgdlg.scroll_y(a) as i64, 0)
+    let before: u32 = px(k, cx, cy)
+    move_to(k, cx, cy)
+    let w1: u32 = fuiwirt.host_pointer_down(app.app_host(a), cx, cy, fuiwirt.BTN_WHEEL_DOWN)
+    frame(k)
+    check(msgdlg.scroll_y(a) > 10.0, "the wheel scrolls the text")
+    let at1: f64 = msgdlg.scroll_y(a)
+    let w2: u32 = fuiwirt.host_pointer_down(app.app_host(a), cx, cy, fuiwirt.BTN_WHEEL_UP)
+    frame(k)
+    check(msgdlg.scroll_y(a) < at1, "and back")
+    hkey(k, fuiwirt.KEY_PAGE_DOWN)
+    check(msgdlg.scroll_y(a) > 100.0, "PageDown scrolls a page")
+    hkey(k, fuiwirt.KEY_HOME)
+    eq("Home goes to the top", msgdlg.scroll_y(a) as i64, 0)
+    hkey(k, fuiwirt.KEY_DOWN)
+    check(msgdlg.scroll_y(a) > 5.0, "Down scrolls a step")
+    hkey(k, fuiwirt.KEY_END)
+    let end_y: f64 = msgdlg.scroll_y(a)
+    let want_end: f64 = (msgdlg.line_count(a) * 21) as f64 - 252.0
+    check(near(end_y, want_end, 1.0), "End shows the last line (content height - view height)")
+    // the last line is painted at the bottom: ink in the last 21 rows of the area
+    let vy: f64 = scene.node_y(sc, vn)
+    check(count_differ(k, scene.node_x(sc, vn), vy + 252.0 - 21.0, scene.node_w(sc, vn) - 14.0, 21.0, tok(k, style.TOK_SURFACE_RAISED)) > 50,
+        "and it is painted there")
+    // keys of the dialog still work while scrolled
+    key_esc(k)
+    check(msgdlg.dismissed(a), "Esc still dismisses")
+    case_free(k)
+    rt.buf_free(&lt)
+    // sixty lines that wrap, a warning with one button (the live test's text)
+    var sixty: rt.Buf = rt.buf_new()
+    var i: usize = 1
+    while i <= 60 {
+        rt.buf_push_bytes(&sixty, "Line ".p as u64, 5)
+        rt.buf_push_dec_i64(&sixty, i as i64)
+        rt.buf_push_bytes(&sixty, ": the quick brown fox jumps over the lazy dog.".p as u64, 46)
+        if i < 60 {
+            rt.buf_push(&sixty, 10 as u8)
+        }
+        i = i + 1
+    }
+    let s60: str = str { p: rt.buf_ptr(&sixty) as *mut u8, n: rt.buf_len(&sixty) }
+    let k2: *mut Case = open(2, 0, "Long", s60, false)
+    let b: *mut app.App = (*k2).a
+    let sc2: *mut scene.Scene = app.app_scene(b)
+    let vn2: usize = msgdlg.viewport_node(b)
+    hkey(k2, fuiwirt.KEY_END)
+    chk_near("60 lines: End is content height - view height", msgdlg.scroll_y(b), (msgdlg.line_count(b) * 21) as f64 - 252.0, 1.0)
+    let vy2: f64 = scene.node_y(sc2, vn2)
+    check(count_differ(k2, scene.node_x(sc2, vn2), vy2 + 252.0 - 21.0, scene.node_w(sc2, vn2) - 14.0, 21.0, tok(k2, style.TOK_SURFACE_RAISED)) > 50,
+        "the last row of the area holds the end of the last line")
+    check(count_differ(k2, scene.node_x(sc2, vn2), vy2 + 252.0, scene.node_w(sc2, vn2) - 14.0, 10.0, tok(k2, style.TOK_SURFACE_RAISED)) == 0,
+        "and nothing is painted below the area")
+    save(k2, 0, "")
+    case_free(k2)
+    rt.buf_free(&sixty)
+}
+
+// ------------------------------------------------------------ 8. contrast, light / dark / the built-in themes
+
+// The pixel of the box that is furthest from `ground` (the contrast it reaches there).
+fn best_contrast(k: *mut Case, x0: f64, y0: f64, w: f64, h: f64, ground: u32) -> f64 {
+    var best: f64 = 1.0
+    var y: f64 = y0
+    while y < y0 + h {
+        var x: f64 = x0
+        while x < x0 + w {
+            let c: f64 = theme.contrast(px(k, x, y), ground)
+            if c > best {
+                best = c
+            }
+            x = x + 1.0
+        }
+        y = y + 1.0
+    }
+    return best
+}
+
+fn theme_case(name: str, dark: bool, themei: i32, dir: u64) {
+    say("-- ")
+    say(name)
+    say("\n")
+    var kind: i32 = 0
+    while kind < 4 {
+        let k: *mut Case = open_sized(kind, 3, t1(), x1(), dark, themei, 0, 0)
+        if k as u64 == 0 as u64 {
+            return
+        }
+        let a: *mut app.App = (*k).a
+        let sc: *mut scene.Scene = app.app_scene(a)
+        let f: *mut theme.Colors = theme.theme_colors(app.app_theme(a))
+        let raised: u32 = (*f).surface_raised & 16777215 as u32
+        var rc: render.Ctx = render.ctx_new(app.app_theme(a), &(*k).z)
+        let fill: u32 = msgdlg.kind_fill(&rc, kind) & 16777215 as u32
+        let ink: u32 = msgdlg.kind_glyph(&rc, kind) & 16777215 as u32
+        let ic: usize = msgdlg.icon_node(a)
+        check(theme.contrast(fill, raised) >= 3.0, "the icon's fill has 3:1 on the card")
+        check(theme.contrast(ink, fill) >= 3.0, "the glyph has 3:1 on the fill")
+        check(count_colour(k, scene.node_x(sc, ic), scene.node_y(sc, ic), 32.0, 32.0, fill) > 300, "the icon is painted in that fill")
+        if kind == 1 {
+            check(theme.contrast((*f).text & 16777215 as u32, raised) >= 4.5, "text on the card: 4.5:1 by the tokens")
+            check(theme.contrast((*f).text & 16777215 as u32, (*f).button & 16777215 as u32) >= 4.5, "button label on the button: 4.5:1")
+            check(theme.contrast((*f).text & 16777215 as u32, (*f).button_hover & 16777215 as u32) >= 4.5, "... on the hovered button")
+            check(theme.contrast((*f).text & 16777215 as u32, (*f).button_active & 16777215 as u32) >= 4.5, "... on the pressed button")
+            check(theme.contrast((*f).text_on_accent & 16777215 as u32, (*f).accent & 16777215 as u32) >= 4.5, "the default button's label on the accent: 4.5:1")
+            // and in the picture
+            let tx: usize = msgdlg.text_node(a)
+            let seen: f64 = best_contrast(k, scene.node_x(sc, tx), scene.node_y(sc, tx), scene.node_w(sc, tx), scene.node_h(sc, tx), raised)
+            check(seen >= 4.5, "the painted text reaches 4.5:1 on the card")
+            let yes: usize = msgdlg.button_node(a, 0)
+            let seen2: f64 = best_contrast(k, scene.node_x(sc, yes) + 10.0, scene.node_y(sc, yes) + 6.0, scene.node_w(sc, yes) - 20.0, scene.node_h(sc, yes) - 12.0, tok(k, style.TOK_ACCENT))
+            check(seen2 >= 4.5, "the painted label of the default button reaches 4.5:1 on the accent")
+            let no: usize = msgdlg.button_node(a, 1)
+            let seen3: f64 = best_contrast(k, scene.node_x(sc, no) + 10.0, scene.node_y(sc, no) + 6.0, scene.node_w(sc, no) - 20.0, scene.node_h(sc, no) - 12.0, tok(k, style.TOK_BUTTON))
+            check(seen3 >= 4.5, "the painted label of a plain button reaches 4.5:1 on the button")
+            var nm: rt.Buf = rt.buf_new()
+            rt.buf_push_bytes(&nm, "msg-theme-".p as u64, 10)
+            rt.buf_push_bytes(&nm, name.p as u64, name.n)
+            rt.buf_push_bytes(&nm, ".png".p as u64, 4)
+            save(k, dir, str { p: rt.buf_ptr(&nm) as *mut u8, n: rt.buf_len(&nm) })
+        }
+        case_free(k)
+        kind = kind + 1
+    }
+}
+
+fn run_themes(dir: u64) {
+    say("== 8. contrast: light, dark and the four built-in themes ==\n")
+    theme_case("light", false, 0 - 1, dir)
+    theme_case("dark", true, 0 - 1, dir)
+    theme_case("nord", false, 0, dir)
+    theme_case("solarized-light", false, 1, dir)
+    theme_case("high-contrast", false, 2, dir)
+    theme_case("classic", false, 3, dir)
+}
+
+// ------------------------------------------------------------ 9. accessibility
+
+fn name_is(sc: *mut scene.Scene, ax: *mut a11y.A11y, n: usize, want: str) -> bool {
+    var buf: [u8; 512] = [0 as u8; 512]
+    let len: usize = a11y.a11y_name(sc, ax, n, (&buf[0]) as u64, 512)
+    return same(str { p: (&buf[0]) as *mut u8, n: len }, want)
+}
+
+fn run_a11y() {
+    say("== 9. accessibility ==\n")
+    let k: *mut Case = open(1, 3, "Delete files", "Delete 3 files?", false)
+    let a: *mut app.App = (*k).a
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let ax: *mut a11y.A11y = &(*a).ax
+    eq("operable nodes without a name", a11y.a11y_unnamed(sc, ax) as i64, 0)
+    eq("the audit (lib/fui/audit.fi)", app.audit(a) as i64, 0)
+    check(a11y.a11y_widgets(sc, ax) >= 3, "the three buttons count as controls")
+    check(a11y.a11y_role(sc, ax, msgdlg.button_node(a, 0)) == a11y.ROLE_BUTTON, "a button is a button")
+    check(name_is(sc, ax, msgdlg.button_node(a, 0), "Yes") && name_is(sc, ax, msgdlg.button_node(a, 1), "No")
+        && name_is(sc, ax, msgdlg.button_node(a, 2), "Cancel"), "the buttons are named Yes, No, Cancel")
+    check(name_is(sc, ax, msgdlg.text_node(a), "Delete 3 files?"), "the text is the text node's name")
+    check(name_is(sc, ax, msgdlg.body_node(a), "Delete files"), "the card is named by the title")
+    check(a11y.a11y_role(sc, ax, msgdlg.body_node(a)) == a11y.ROLE_ALERTDIALOG, "and is an alertdialog (a question)")
+    var rn: [u8; 32] = [0 as u8; 32]
+    let rl: usize = a11y.a11y_role_name(a11y.ROLE_ALERTDIALOG, (&rn[0]) as u64, 32)
+    check(same(str { p: (&rn[0]) as *mut u8, n: rl }, "alertdialog"), "whose role name is alertdialog")
+    let ki: *mut Case = open(0, 0, "Info", "Done.", false)
+    check(a11y.a11y_role(app.app_scene((*ki).a), &(*(*ki).a).ax, msgdlg.body_node((*ki).a)) == a11y.ROLE_DIALOG, "an information is a dialog")
+    case_free(ki)
+    check(name_is(sc, ax, msgdlg.icon_node(a), "Question"), "the icon says what kind it is")
+    check(a11y.a11y_role(sc, ax, msgdlg.icon_node(a)) == a11y.ROLE_IMAGE, "as an image")
+    case_free(k)
+}
+
+// ------------------------------------------------------------ 10. scale 2
+
+// The widest text that wraps (the 60 lines of the live test): is the end of the last line shown, is the
+// rightmost column of the text area free of ink (a line wider than its area is cut there)?
+fn scale_case(pm: usize, dir: u64) {
+    SCALE_PM = pm
+    say("-- scale ")
+    say_num(pm as i64)
+    say(" per mille\n")
+    var sixty: rt.Buf = rt.buf_new()
+    var i: usize = 1
+    while i <= 60 {
+        rt.buf_push_bytes(&sixty, "Line ".p as u64, 5)
+        rt.buf_push_dec_i64(&sixty, i as i64)
+        rt.buf_push_bytes(&sixty, ": the quick brown fox jumps over the lazy dog, and again.".p as u64, 56)
+        if i < 60 {
+            rt.buf_push(&sixty, 10 as u8)
+        }
+        i = i + 1
+    }
+    let s60: str = str { p: rt.buf_ptr(&sixty) as *mut u8, n: rt.buf_len(&sixty) }
+    let k: *mut Case = open(2, 1, "Long", s60, false)
+    let a: *mut app.App = (*k).a
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let vn: usize = msgdlg.viewport_node(a)
+    let sf: f64 = (pm as f64) / 1000.0
+    check(msgdlg.scrolls(a), "it scrolls")
+    hkey(k, fuiwirt.KEY_END)
+    let vx: f64 = scene.node_x(sc, vn)
+    let vy: f64 = scene.node_y(sc, vn)
+    let vw: f64 = scene.node_w(sc, vn)
+    let vh: f64 = scene.node_h(sc, vn)
+    let ground: u32 = tok(k, style.TOK_SURFACE_RAISED)
+    check(count_differ(k, vx, vy + vh - 18.0 * sf, vw - 14.0 * sf, 18.0 * sf, ground) > 30, "the end of the last line is in the bottom rows of the area")
+    check(count_differ(k, vx, vy + vh + 1.0, vw - 14.0 * sf, 6.0, ground) == 0, "and nothing is painted below the area")
+    // the right edge of the text column (left of the scroll bar) stays free of ink
+    var worst: usize = 0
+    hkey(k, fuiwirt.KEY_HOME)
+    var pass: usize = 0
+    while pass < 6 {
+        worst = worst + count_differ(k, vx + vw - 14.0 * sf - 2.0, vy, 2.0, vh, ground)
+        hkey(k, fuiwirt.KEY_PAGE_DOWN)
+        pass = pass + 1
+    }
+    eq("no ink in the last two columns of the text column (no line is cut)", worst as i64, 0)
+    if pm == 1500 {
+        save(k, dir, "msg-scale15-long-light.png")
+    }
+    case_free(k)
+    rt.buf_free(&sixty)
+    SCALE_PM = 1000
+}
+
+fn run_scale(dir: u64) {
+    say("== 10. other scales (96 dpi is 1000 per mille) ==\n")
+    SCALE_PM = 2000
+    var lt: rt.Buf = long_text()
+    var k: *mut Case = open(2, 2, t1(), "One line of text.", false)
+    let a: *mut app.App = (*k).a
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let ic: usize = msgdlg.icon_node(a)
+    eq("the icon is 64 pixels", scene.node_w(sc, ic) as i64, 64)
+    eq("the canvas is twice the window", (*k).w as i64, (msgdlg.win_size(a).w * 2) as i64)
+    let last: usize = msgdlg.button_node(a, 1)
+    check(near(scene.node_x(sc, last) + scene.node_w(sc, last), (*k).w as f64 - 48.0, 1.0), "the buttons keep their margin (48 pixels)")
+    let tx: usize = msgdlg.text_node(a)
+    chk_near("the text line stays level with the icon's middle", scene.node_y(sc, tx) + 21.0, scene.node_y(sc, ic) + 32.0, 1.5)
+    save(k, dir, "msg-scale2-light.png")
+    case_free(k)
+    let longs: str = str { p: rt.buf_ptr(&lt) as *mut u8, n: rt.buf_len(&lt) }
+    k = open(0, 0, "Long", longs, false)
+    let a2: *mut app.App = (*k).a
+    hkey(k, fuiwirt.KEY_END)
+    let want_end: f64 = (msgdlg.line_count(a2) * 42) as f64 - 504.0
+    check(near(msgdlg.scroll_y(a2), want_end, 2.0), "scrolled to the end at scale 2: the content height followed the scale")
+    check(text_ink(k) > 3000, "and the text is painted")
+    case_free(k)
+    rt.buf_free(&lt)
+    SCALE_PM = 1000
+    scale_case(1042, dir)
+    scale_case(1250, dir)
+    scale_case(1500, dir)
+    scale_case(2000, dir)
+}
+
+// ------------------------------------------------------------ 11. speed
+
+fn fmt_ms(ms: f64) {
+    let h: i64 = (ms * 100.0 + 0.5) as i64
+    say_num(h / 100)
+    say(".")
+    let f: i64 = h % 100
+    if f < 10 {
+        say("0")
+    }
+    say_num(f)
+}
+
+fn frame_line(state: str, ms: f64) {
+    say("FRAME_MS ")
+    say(state)
+    say(" ")
+    fmt_ms(ms)
+    say("\n")
+    if SPEED {
+        check(ms <= 16.0, "at most 16 ms")
+    }
+}
+
+fn one_paint(k: *mut Case) {
+    let a: *mut app.App = (*k).a
+    app.app_paint(a as u64, (*k).w, (*k).h)
+    fuiwirt.host_painted(app.app_host(a))
+    let c: u32 = fuiwirt.host_after_layout(app.app_host(a))
+}
+
+fn speed_set(tag: str, text: str, w: usize, h: usize) {
+    var lbl: rt.Buf = rt.buf_new()
+    let k: *mut Case = open_raw(2, 3, t1(), text, false, 0 - 1, w, h)
+    if k as u64 == 0 as u64 {
+        return
+    }
+    let a: *mut app.App = (*k).a
+    let t0: f64 = now_ms()
+    one_paint(k)
+    let t1: f64 = now_ms()
+    frame_line(join(tag, "first"), t1 - t0)
+    // the settle frames the host paints after the first (focus, transitions)
+    frame(k)
+    var worst: f64 = 0.0
+    var i: usize = 0
+    while i < 20 {
+        let s0: f64 = now_ms()
+        one_paint(k)
+        let s1: f64 = now_ms()
+        if s1 - s0 > worst {
+            worst = s1 - s0
+        }
+        i = i + 1
+    }
+    frame_line(join(tag, "steady"), worst)
+    // hover: the pointer goes onto and over the buttons
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let no: usize = msgdlg.button_node(a, 1)
+    let cx: f64 = node_cx(k, no)
+    let cy: f64 = node_cy(k, no)
+    worst = 0.0
+    i = 0
+    while i < 20 {
+        var x: f64 = cx - 20.0 + (i as f64) * 2.0
+        if i % 2 == 1 {
+            x = 5.0
+        }
+        let h0: f64 = now_ms()
+        let c: u32 = fuiwirt.host_pointer_move(app.app_host(a), x, cy)
+        CLOCK = CLOCK + 16
+        fuiwirt.host_tick(app.app_host(a), CLOCK)
+        one_paint(k)
+        let h1: f64 = now_ms()
+        if h1 - h0 > worst {
+            worst = h1 - h0
+        }
+        i = i + 1
+    }
+    frame_line(join(tag, "hover"), worst)
+    // a scroll step (only a scrolling text)
+    if msgdlg.scrolls(a) {
+        worst = 0.0
+        i = 0
+        while i < 20 {
+            let w0: f64 = now_ms()
+            let c: u32 = fuiwirt.host_pointer_down(app.app_host(a), cx, scene.node_y(sc, msgdlg.viewport_node(a)) + 50.0, fuiwirt.BTN_WHEEL_DOWN)
+            one_paint(k)
+            let w1: f64 = now_ms()
+            if w1 - w0 > worst {
+                worst = w1 - w0
+            }
+            i = i + 1
+        }
+        frame_line(join(tag, "scroll"), worst)
+    }
+    case_free(k)
+}
+
+static mut JOIN_BUF: [u8; 64] = [0 as u8; 64]
+
+fn join(a: str, b: str) -> str {
+    var i: usize = 0
+    while i < a.n {
+        JOIN_BUF[i] = rt.ld8(a.p as u64, i)
+        i = i + 1
+    }
+    var j: usize = 0
+    while j < b.n {
+        JOIN_BUF[i + j] = rt.ld8(b.p as u64, j)
+        j = j + 1
+    }
+    return str { p: (&JOIN_BUF[0]) as *mut u8, n: a.n + b.n }
+}
+
+fn run_speed() {
+    say("== 11. speed ==\n")
+    var lt: rt.Buf = long_text()
+    let longs: str = str { p: rt.buf_ptr(&lt) as *mut u8, n: rt.buf_len(&lt) }
+    speed_set("short-", x1(), 0, 0)
+    speed_set("long-", longs, 0, 0)
+    speed_set("short-1240x720-", x1(), 1240, 720)
+    speed_set("long-1240x720-", longs, 1240, 720)
+    rt.buf_free(&lt)
+}
+
+fn main(start: u64) -> i32 {
+    var dir: u64 = 0
+    if rt.arg_count(start) >= 2 {
+        dir = rt.arg_ptr(start, 1)
+        if rt.c_length(dir) == 5 && *(dir as *mut u8) == (115 as u8) {
+            SPEED = true
+            dir = 0
+        }
+    }
+    let fs: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    if !sysfont.sysfont_load(fs) {
+        say("msgdlg: no font (DejaVu Sans)\n")
+        return 9
+    }
+    FONT = fs as u64
+    msgdlg.set_font(FONT)
+    if SPEED {
+        run_speed()
+    } else {
+        run_consts()
+        run_matrix(dir)
+        run_icons()
+        run_keys()
+        run_mouse()
+        run_texts(dir)
+        run_scroll()
+        run_themes(dir)
+        run_a11y()
+        run_scale(dir)
+        run_speed()
+    }
+    if BAD == 0 {
+        say("MSGDLG PASSED\n")
+        return 0
+    }
+    say("MSGDLG FAILED (")
+    say_num(BAD as i64)
+    say(")\n")
+    return 1
+}
