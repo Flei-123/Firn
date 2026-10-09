@@ -319,6 +319,29 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("CredReadW", "ADVAPI32.dll", 4),
     ("CredDeleteW", "ADVAPI32.dll", 3),
     ("CredFree", "ADVAPI32.dll", 1),
+    // --- comdlg32 + shell32 + ole32 + user32: THE SYSTEM DIALOGS (std.dialog, round DIALOG) ----
+    // The file, colour and font dialogs every Windows program shows, the shell's folder picker and the
+    // message box. Bound here because an indirect call through GetProcAddress is System V, not Win64
+    // (see `GetModuleFileNameW`). Each takes one pointer to a structure (OPENFILENAMEW, CHOOSECOLORW,
+    // CHOOSEFONTW, BROWSEINFOW); CommDlgExtendedError tells a Cancel (0) from a failure.
+    ("GetOpenFileNameW", "COMDLG32.dll", 1),
+    ("GetSaveFileNameW", "COMDLG32.dll", 1),
+    ("ChooseColorW", "COMDLG32.dll", 1),
+    ("ChooseFontW", "COMDLG32.dll", 1),
+    ("CommDlgExtendedError", "COMDLG32.dll", 0),
+    ("SHBrowseForFolderW", "SHELL32.dll", 1),
+    ("SHGetPathFromIDListW", "SHELL32.dll", 2),
+    ("CoInitializeEx", "OLE32.dll", 2),
+    ("CoTaskMemFree", "OLE32.dll", 1),
+    ("MessageBoxW", "USER32.dll", 4),
+    // ... and what a test needs to press the buttons of a dialog of ANOTHER process: find the dialog
+    // window (class #32770), look a control up, send it a message (tools/dialog, tests/2381).
+    ("GetDlgItem", "USER32.dll", 2),
+    ("SendMessageW", "USER32.dll", 4),
+    ("FindWindowExW", "USER32.dll", 4),
+    ("GetWindowThreadProcessId", "USER32.dll", 2),
+    ("IsWindowVisible", "USER32.dll", 1),
+    ("GetWindowTextW", "USER32.dll", 3),
     // --- dwmapi: THE TITLE BAR (round CERTUS C-039) -------------------
     // Justin, 18.09.2026: "the window bar at the top does not fit the
     // style either". Certus painted its shell dark, while Windows

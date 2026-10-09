@@ -1,0 +1,942 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/dialogos.fi -- the operating system half of std.dialog on Linux. `lib/std/dialogos.windows.fi` is picked
+// instead of this file by `--target=x86_64-windows`. Nothing in here is meant to be called directly -- use `std.dialog`.
+//
+// Linux has no dialog API in the system itself; the toolkits bring their own. What a program without a toolkit can
+// do is start the dialog program of the desktop and read its answer, which is what Firefox' "choose a file"
+// fallbacks and many scripts do:
+//
+//   zenity    GTK (GNOME and most others). Files, folders, colour, font, message boxes.     exit 0 ok, 1 cancel
+//   kdialog   KDE. Files, folders, colour, message boxes (no font chooser).                  exit 0 ok, 1 no, 2 cancel
+//   service   `dialogd`, the fUi dialog service of this repository (tools/dialogd, docs/DIALOG.md): the same
+//             dialogs with the theme of the system, for a machine that has neither (OrientOS, a minimal Linux).
+//
+// The choice: FIRN_DIALOG forces `zenity`, `kdialog`, `service` or `none`. Otherwise `kdialog` when the session is KDE
+// (XDG_CURRENT_DESKTOP) and it is installed, else `zenity`, else `kdialog`, else the service (FIRN_DIALOG_SERVICE
+// names its program, default `dialogd` on PATH). Without a display (no DISPLAY / WAYLAND_DISPLAY) nothing is tried:
+// NO_BACKEND.
+//
+// zenity manual (3.44), the options used: --file-selection [--multiple --separator= --save --confirm-overwrite
+// --directory --filename= --file-filter=], --color-selection [--color=], --font-selection, --info --warning --error
+// --question [--ok-label= --cancel-label= --extra-button=] --text= --title= --no-markup --icon-name=.
+// kdialog manual: --getopenfilename --getsavefilename --getexistingdirectory [--multiple --separate-output]
+// --getcolor [--default] --msgbox --sorry --error --yesno --yesnocancel [--yes-label --no-label] --title.
+
+import rt
+import str
+import env
+import process
+import dialogproto
+
+export { os_name, os_file, os_color, os_font, os_message }
+
+const OK: i32 = 0
+const CANCELED: i32 = 1
+const NO_BACKEND: i32 = 2
+const FAILED: i32 = 3
+
+const T_NONE: u8 = 0
+const T_ZENITY: u8 = 1
+const T_KDIALOG: u8 = 2
+const T_SERVICE: u8 = 3
+
+// a dialog waits for a person: a day
+const WAIT_MS: u64 = 86400000
+
+// ------------------------------------------------------------------ small helpers
+
+fn view(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn push_s(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+fn has_sub(s: str, sub: str) -> bool {
+    if sub.length() > s.length() {
+        return false
+    }
+    var i: usize = 0
+    while i + sub.length() <= s.length() {
+        var j: usize = 0
+        while j < sub.length() && s.chars(i + j) == sub.chars(j) {
+            j = j + 1
+        }
+        if j == sub.length() {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn on_path(name: str) -> bool {
+    var tmp: rt.Buf = rt.buf_new()
+    let r: bool = env.find_executable(name, &tmp)
+    rt.buf_free(&tmp)
+    return r
+}
+
+fn has_session() -> bool {
+    return env.get("DISPLAY").length() > 0 || env.get("WAYLAND_DISPLAY").length() > 0
+}
+
+// The dialog service program: FIRN_DIALOG_SERVICE, else `dialogd` on PATH. false = none.
+fn service_exe(out: *mut rt.Buf) -> bool {
+    let e: str = env.get("FIRN_DIALOG_SERVICE")
+    if e.length() > 0 {
+        push_s(out, e)
+        return true
+    }
+    return env.find_executable("dialogd", out)
+}
+
+fn choose() -> u8 {
+    let f: str = env.get("FIRN_DIALOG")
+    if f == "none" || !has_session() {
+        return T_NONE
+    }
+    var tmp: rt.Buf = rt.buf_new()
+    var t: u8 = T_NONE
+    if f.length() > 0 {
+        if f == "zenity" && on_path("zenity") {
+            t = T_ZENITY
+        } else if f == "kdialog" && on_path("kdialog") {
+            t = T_KDIALOG
+        } else if f == "service" && service_exe(&tmp) {
+            t = T_SERVICE
+        }
+    } else if has_sub(env.get("XDG_CURRENT_DESKTOP"), "KDE") && on_path("kdialog") {
+        t = T_KDIALOG
+    } else if on_path("zenity") {
+        t = T_ZENITY
+    } else if on_path("kdialog") {
+        t = T_KDIALOG
+    } else if service_exe(&tmp) {
+        t = T_SERVICE
+    }
+    rt.buf_free(&tmp)
+    return t
+}
+
+fn os_name() -> str {
+    let t: u8 = choose()
+    if t == T_ZENITY { return "zenity" }
+    if t == T_KDIALOG { return "kdialog" }
+    if t == T_SERVICE { return "fui" }
+    return "none"
+}
+
+// "--name=value" as ONE argument.
+fn arg_kv(c: *mut process.Command, key: str, value: str) {
+    var b: rt.Buf = rt.buf_new()
+    push_s(&b, key)
+    push_s(&b, value)
+    process.add_arg(c, view(&b))
+    rt.buf_free(&b)
+}
+
+// Runs a helper to the end: its exit code, its standard output APPENDED to `out`. -1 = could not start.
+fn run_helper(c: *mut process.Command, out: *mut rt.Buf) -> i32 {
+    process.set_stdin(c, process.STDIO_NULL)
+    var err: rt.Buf = rt.buf_new()
+    let code: i32 = process.run_capture(c, out, &err, WAIT_MS) catch | e | -1
+    rt.buf_free(&err)
+    return code
+}
+
+// Removes ONE trailing line end.
+fn chomp(b: *mut rt.Buf) {
+    var n: usize = rt.buf_len(b)
+    if n > 0 && rt.buf_at(b, n - 1) == 10 as u8 {
+        n = n - 1
+        if n > 0 && rt.buf_at(b, n - 1) == 13 as u8 {
+            n = n - 1
+        }
+        rt.buf_set_len(b, n)
+    }
+}
+
+// A zenity / kdialog exit code as a status for the dialogs that have only OK and Cancel.
+fn plain_status(code: i32) -> i32 {
+    if code == 0 {
+        return OK
+    }
+    if code == 1 {
+        return CANCELED
+    }
+    return FAILED
+}
+
+// ------------------------------------------------------------------ filters
+
+// "Label|pat;pat|Label|pat" -> calls `emit(label, patterns separated by `sep`)` for every pair. Done with two
+// scans: the pairs are found here, written by the two builders below.
+fn filter_zenity(c: *mut process.Command, f: str) {
+    var i: usize = 0
+    var label: rt.Buf = rt.buf_new()
+    var pats: rt.Buf = rt.buf_new()
+    var in_label: bool = true
+    while i <= f.length() {
+        let end: bool = i == f.length()
+        if end || f.chars(i) == 124 as u8 {
+            if !in_label || end {
+                if rt.buf_len(&label) > 0 || rt.buf_len(&pats) > 0 {
+                    var a: rt.Buf = rt.buf_new()
+                    push_s(&a, "--file-filter=")
+                    push_s(&a, view(&label))
+                    push_s(&a, " |")
+                    push_s(&a, view(&pats))
+                    process.add_arg(c, view(&a))
+                    rt.buf_free(&a)
+                }
+                rt.buf_clear(&label)
+                rt.buf_clear(&pats)
+                in_label = true
+            } else {
+                in_label = false
+            }
+        } else if in_label {
+            rt.buf_push(&label, f.chars(i))
+        } else if f.chars(i) == 59 as u8 {
+            rt.buf_push(&pats, 32 as u8)
+        } else {
+            if rt.buf_len(&pats) == 0 {
+                rt.buf_push(&pats, 32 as u8)
+            }
+            rt.buf_push(&pats, f.chars(i))
+        }
+        i = i + 1
+    }
+    rt.buf_free(&label)
+    rt.buf_free(&pats)
+}
+
+// kdialog: "pat pat|Label" lines.
+fn filter_kdialog(f: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    var label: rt.Buf = rt.buf_new()
+    var pats: rt.Buf = rt.buf_new()
+    var in_label: bool = true
+    while i <= f.length() {
+        let end: bool = i == f.length()
+        if end || f.chars(i) == 124 as u8 {
+            if !in_label || end {
+                if rt.buf_len(&label) > 0 || rt.buf_len(&pats) > 0 {
+                    if rt.buf_len(out) > 0 {
+                        rt.buf_push(out, 10 as u8)
+                    }
+                    push_s(out, view(&pats))
+                    rt.buf_push(out, 124 as u8)
+                    push_s(out, view(&label))
+                }
+                rt.buf_clear(&label)
+                rt.buf_clear(&pats)
+                in_label = true
+            } else {
+                in_label = false
+            }
+        } else if in_label {
+            rt.buf_push(&label, f.chars(i))
+        } else if f.chars(i) == 59 as u8 {
+            rt.buf_push(&pats, 32 as u8)
+        } else {
+            rt.buf_push(&pats, f.chars(i))
+        }
+        i = i + 1
+    }
+    rt.buf_free(&label)
+    rt.buf_free(&pats)
+}
+
+// ------------------------------------------------------------------ files
+
+// mode: 0 open, 1 open several, 2 save, 3 folder.
+fn zenity_file(mode: i32, title: str, dir: str, name: str, filters: str, out: *mut rt.Buf) -> i32 {
+    var c: process.Command = process.command("zenity")
+    process.add_arg(&c, "--file-selection")
+    if title.length() > 0 {
+        arg_kv(&c, "--title=", title)
+    }
+    if mode == 1 {
+        process.add_arg(&c, "--multiple")
+        process.add_arg(&c, "--separator=\n")
+    }
+    if mode == 2 {
+        process.add_arg(&c, "--save")
+        process.add_arg(&c, "--confirm-overwrite")
+    }
+    if mode == 3 {
+        process.add_arg(&c, "--directory")
+    }
+    if dir.length() > 0 || name.length() > 0 {
+        var fn_: rt.Buf = rt.buf_new()
+        push_s(&fn_, "--filename=")
+        push_s(&fn_, dir)
+        if dir.length() > 0 && dir.chars(dir.length() - 1) != 47 as u8 {
+            rt.buf_push(&fn_, 47 as u8)
+        }
+        push_s(&fn_, name)
+        process.add_arg(&c, view(&fn_))
+        rt.buf_free(&fn_)
+    }
+    if mode != 3 {
+        filter_zenity(&c, filters)
+    }
+    var o: rt.Buf = rt.buf_new()
+    let code: i32 = run_helper(&c, &o)
+    process.command_free(&c)
+    var r: i32 = plain_status(code)
+    if r == OK {
+        chomp(&o)
+        if rt.buf_len(&o) == 0 {
+            r = CANCELED
+        } else {
+            push_s(out, view(&o))
+        }
+    }
+    rt.buf_free(&o)
+    return r
+}
+
+fn kdialog_file(mode: i32, title: str, dir: str, name: str, filters: str, out: *mut rt.Buf) -> i32 {
+    var c: process.Command = process.command("kdialog")
+    if title.length() > 0 {
+        process.add_arg(&c, "--title")
+        process.add_arg(&c, title)
+    }
+    if mode == 1 {
+        process.add_arg(&c, "--multiple")
+        process.add_arg(&c, "--separate-output")
+    }
+    if mode == 2 {
+        process.add_arg(&c, "--getsavefilename")
+    } else if mode == 3 {
+        process.add_arg(&c, "--getexistingdirectory")
+    } else {
+        process.add_arg(&c, "--getopenfilename")
+    }
+    var start: rt.Buf = rt.buf_new()
+    push_s(&start, dir)
+    if name.length() > 0 {
+        if dir.length() > 0 && dir.chars(dir.length() - 1) != 47 as u8 {
+            rt.buf_push(&start, 47 as u8)
+        }
+        push_s(&start, name)
+    }
+    if rt.buf_len(&start) == 0 {
+        rt.buf_push(&start, 46 as u8)
+    }
+    process.add_arg(&c, view(&start))
+    rt.buf_free(&start)
+    if mode != 3 && filters.length() > 0 {
+        var fb: rt.Buf = rt.buf_new()
+        filter_kdialog(filters, &fb)
+        process.add_arg(&c, view(&fb))
+        rt.buf_free(&fb)
+    }
+    var o: rt.Buf = rt.buf_new()
+    let code: i32 = run_helper(&c, &o)
+    process.command_free(&c)
+    var r: i32 = plain_status(code)
+    if r == OK {
+        chomp(&o)
+        if rt.buf_len(&o) == 0 {
+            r = CANCELED
+        } else {
+            push_s(out, view(&o))
+        }
+    }
+    rt.buf_free(&o)
+    return r
+}
+
+// ------------------------------------------------------------------ the dialog service
+
+// One request line (no line end) in, one reply line (no line end) out. false = the service did not answer.
+fn service_call(req: *mut rt.Buf, reply: *mut rt.Buf) -> bool {
+    var exe: rt.Buf = rt.buf_new()
+    if !service_exe(&exe) {
+        rt.buf_free(&exe)
+        return false
+    }
+    var c: process.Command = process.command(view(&exe))
+    process.add_arg(&c, "--stdio")
+    process.set_stdin(&c, process.STDIO_PIPE)
+    process.set_stdout(&c, process.STDIO_PIPE)
+    process.set_stderr(&c, process.STDIO_NULL)
+    var ch: process.Child = process.spawn(&c) catch | e | dead_child()
+    process.command_free(&c)
+    rt.buf_free(&exe)
+    if ch.pid <= 0 {
+        return false
+    }
+    rt.buf_push(req, 10 as u8)
+    let w: i64 = process.write_in(&ch, rt.buf_ptr(req), rt.buf_len(req))
+    process.close_in(&ch)
+    var got: bool = false
+    if w == rt.buf_len(req) as i64 {
+        var chunk: [u8; 512] = [0 as u8; 512]
+        while true {
+            let n: i64 = process.read_out(&ch, (&chunk[0]) as u64, 512)
+            if n <= 0 {
+                break
+            }
+            rt.buf_push_bytes(reply, (&chunk[0]) as u64, n as usize)
+            if rt.buf_at(reply, rt.buf_len(reply) - 1) == 10 as u8 {
+                break
+            }
+        }
+        if rt.buf_len(reply) > 0 && rt.buf_at(reply, rt.buf_len(reply) - 1) == 10 as u8 {
+            rt.buf_set_len(reply, rt.buf_len(reply) - 1)
+            got = true
+        }
+    }
+    if !process.wait_timeout(&ch, 3000) {
+        process.kill(&ch)
+    }
+    process.wait(&ch)
+    process.close(&ch)
+    return got
+}
+
+fn dead_child() -> process.Child {
+    return process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1,
+        done: false, code: 0, sig: 0, own: true }
+}
+
+// The first word of a reply as a status; the fields after it are for the caller.
+fn reply_status(reply: str) -> i32 {
+    var head: rt.Buf = rt.buf_new()
+    dialogproto.field_at(reply, 0, &head)
+    var r: i32 = FAILED
+    if view(&head) == "ok" {
+        r = OK
+    } else if view(&head) == "cancel" {
+        r = CANCELED
+    }
+    rt.buf_free(&head)
+    return r
+}
+
+fn service_file(mode: i32, title: str, dir: str, name: str, filters: str, out: *mut rt.Buf) -> i32 {
+    var q: rt.Buf = rt.buf_new()
+    if mode == 0 { dialogproto.push_field(&q, "open_file", true) }
+    if mode == 1 { dialogproto.push_field(&q, "open_files", true) }
+    if mode == 2 { dialogproto.push_field(&q, "save_file", true) }
+    if mode == 3 { dialogproto.push_field(&q, "pick_folder", true) }
+    dialogproto.push_field(&q, title, false)
+    dialogproto.push_field(&q, dir, false)
+    if mode == 2 {
+        dialogproto.push_field(&q, name, false)
+    }
+    if mode != 3 {
+        dialogproto.push_field(&q, filters, false)
+    }
+    var rep: rt.Buf = rt.buf_new()
+    var r: i32 = FAILED
+    if service_call(&q, &rep) {
+        r = reply_status(view(&rep))
+        if r == OK {
+            if !dialogproto.field_at(view(&rep), 1, out) {
+                r = FAILED
+            }
+        }
+    }
+    rt.buf_free(&q)
+    rt.buf_free(&rep)
+    return r
+}
+
+// mode: 0 open, 1 open several, 2 save, 3 folder.
+fn os_file(mode: i32, title: str, dir: str, name: str, filters: str, out: *mut rt.Buf) -> i32 {
+    let t: u8 = choose()
+    if t == T_ZENITY { return zenity_file(mode, title, dir, name, filters, out) }
+    if t == T_KDIALOG { return kdialog_file(mode, title, dir, name, filters, out) }
+    if t == T_SERVICE { return service_file(mode, title, dir, name, filters, out) }
+    return NO_BACKEND
+}
+
+// ------------------------------------------------------------------ colour
+
+fn put_hex2(out: *mut rt.Buf, v: u32) {
+    rt.buf_push_hex_u64(out, v as u64, 2)
+}
+
+// "#rrggbb", "#rrggbbaa", "#rrrrggggbbbb", "rgb(r,g,b)", "rgba(r,g,b,a)" -> 0xRRGGBB.
+fn parse_color(s: str, out: *mut u32) -> bool {
+    var i: usize = 0
+    while i < s.length() && (s.chars(i) == 32 as u8 || s.chars(i) == 10 as u8) {
+        i = i + 1
+    }
+    if i < s.length() && s.chars(i) == 35 as u8 {
+        var digits: [u32; 16] = [0 as u32; 16]
+        var n: usize = 0
+        i = i + 1
+        while i < s.length() && n < 16 {
+            let d: i32 = dialogproto.hex_digit(s.chars(i))
+            if d < 0 {
+                break
+            }
+            digits[n] = d as u32
+            n = n + 1
+            i = i + 1
+        }
+        if n == 6 || n == 8 {
+            *out = (digits[0] << 20) | (digits[1] << 16) | (digits[2] << 12) | (digits[3] << 8) | (digits[4] << 4) | digits[5]
+            return true
+        }
+        if n == 12 || n == 16 {
+            // 16 bits per channel: the high octet of each
+            *out = (digits[0] << 20) | (digits[1] << 16) | (digits[4] << 12) | (digits[5] << 8) | (digits[8] << 4) | digits[9]
+            return true
+        }
+        return false
+    }
+    if i + 3 < s.length() && s.chars(i) == 114 as u8 && s.chars(i + 1) == 103 as u8 && s.chars(i + 2) == 98 as u8 {
+        while i < s.length() && s.chars(i) != 40 as u8 {
+            i = i + 1
+        }
+        i = i + 1
+        var comp: [u32; 3] = [0 as u32; 3]
+        var k: usize = 0
+        while k < 3 {
+            while i < s.length() && s.chars(i) == 32 as u8 {
+                i = i + 1
+            }
+            var v: u32 = 0 as u32
+            var seen: bool = false
+            while i < s.length() && s.chars(i) >= 48 as u8 && s.chars(i) <= 57 as u8 {
+                v = v * 10 as u32 + (s.chars(i) - 48 as u8) as u32
+                seen = true
+                i = i + 1
+            }
+            if !seen || v > 255 as u32 {
+                return false
+            }
+            comp[k] = v
+            k = k + 1
+            while i < s.length() && s.chars(i) == 32 as u8 {
+                i = i + 1
+            }
+            if k < 3 {
+                if i >= s.length() || s.chars(i) != 44 as u8 {
+                    return false
+                }
+                i = i + 1
+            }
+        }
+        *out = (comp[0] << 16) | (comp[1] << 8) | comp[2]
+        return true
+    }
+    return false
+}
+
+fn hex6(rgb: u32, out: *mut rt.Buf) {
+    rt.buf_push(out, 35 as u8)
+    put_hex2(out, (rgb >> 16) & 255 as u32)
+    put_hex2(out, (rgb >> 8) & 255 as u32)
+    put_hex2(out, rgb & 255 as u32)
+}
+
+fn os_color(title: str, initial: u32, out: *mut u32) -> i32 {
+    let t: u8 = choose()
+    if t == T_NONE {
+        return NO_BACKEND
+    }
+    if t == T_SERVICE {
+        var q: rt.Buf = rt.buf_new()
+        dialogproto.push_field(&q, "pick_color", true)
+        dialogproto.push_field(&q, title, false)
+        var h: rt.Buf = rt.buf_new()
+        rt.buf_push_hex_u64(&h, initial as u64, 6)
+        dialogproto.push_field(&q, view(&h), false)
+        rt.buf_free(&h)
+        var rep: rt.Buf = rt.buf_new()
+        var r: i32 = FAILED
+        if service_call(&q, &rep) {
+            r = reply_status(view(&rep))
+            if r == OK {
+                var f: rt.Buf = rt.buf_new()
+                var hx: rt.Buf = rt.buf_new()
+                rt.buf_push(&hx, 35 as u8)
+                if dialogproto.field_at(view(&rep), 1, &hx) && parse_color(view(&hx), out) {
+                    r = OK
+                } else {
+                    r = FAILED
+                }
+                rt.buf_free(&f)
+                rt.buf_free(&hx)
+            }
+        }
+        rt.buf_free(&q)
+        rt.buf_free(&rep)
+        return r
+    }
+    var c: process.Command = process.command("zenity")
+    if t == T_ZENITY {
+        process.add_arg(&c, "--color-selection")
+        if title.length() > 0 {
+            arg_kv(&c, "--title=", title)
+        }
+        var hv: rt.Buf = rt.buf_new()
+        push_s(&hv, "--color=")
+        hex6(initial, &hv)
+        process.add_arg(&c, view(&hv))
+        rt.buf_free(&hv)
+    } else {
+        c = process.command("kdialog")
+        if title.length() > 0 {
+            process.add_arg(&c, "--title")
+            process.add_arg(&c, title)
+        }
+        process.add_arg(&c, "--getcolor")
+        process.add_arg(&c, "--default")
+        var hv: rt.Buf = rt.buf_new()
+        hex6(initial, &hv)
+        process.add_arg(&c, view(&hv))
+        rt.buf_free(&hv)
+    }
+    var o: rt.Buf = rt.buf_new()
+    let code: i32 = run_helper(&c, &o)
+    process.command_free(&c)
+    var r: i32 = plain_status(code)
+    if r == OK {
+        chomp(&o)
+        if rt.buf_len(&o) == 0 {
+            r = CANCELED
+        } else if !parse_color(view(&o), out) {
+            r = FAILED
+        }
+    }
+    rt.buf_free(&o)
+    return r
+}
+
+// ------------------------------------------------------------------ font
+
+fn word_is_style(w: str) -> bool {
+    return w == "Bold" || w == "Italic" || w == "Oblique" || w == "Regular" || w == "Normal" || w == "Medium"
+    || w == "Light" || w == "Semi-Bold" || w == "Semi-Light" || w == "Heavy" || w == "Ultra-Bold"
+    || w == "Book" || w == "Roman" || w == "Condensed" || w == "Semi-Condensed" || w == "Expanded"
+}
+
+// A Pango font description ("DejaVu Sans Bold Italic 12", "Sans 10.5") -> family, whole points, flags.
+fn parse_font(s: str, fam: *mut rt.Buf, size: *mut u32, flags: *mut u32) -> bool {
+    // the words, remembered as (start, end) pairs
+    var st: [usize; 24] = [0; 24]
+    var en: [usize; 24] = [0; 24]
+    var n: usize = 0
+    var i: usize = 0
+    while i < s.length() && n < 24 {
+        while i < s.length() && (s.chars(i) == 32 as u8 || s.chars(i) == 10 as u8) {
+            i = i + 1
+        }
+        if i >= s.length() {
+            break
+        }
+        st[n] = i
+        while i < s.length() && s.chars(i) != 32 as u8 && s.chars(i) != 10 as u8 {
+            i = i + 1
+        }
+        en[n] = i
+        n = n + 1
+    }
+    if n < 1 {
+        return false
+    }
+    // the size: the last word when it is a number
+    var last: usize = n
+    var pt: u32 = 0 as u32
+    var j: usize = st[n - 1]
+    var digits: bool = true
+    var frac: u32 = 0 as u32
+    var in_frac: bool = false
+    while j < en[n - 1] {
+        let ch: u8 = s.chars(j)
+        if ch >= 48 as u8 && ch <= 57 as u8 {
+            if in_frac {
+                if frac == 0 as u32 {
+                    frac = (ch - 48 as u8) as u32
+                }
+            } else {
+                pt = pt * 10 as u32 + (ch - 48 as u8) as u32
+            }
+        } else if ch == 46 as u8 && !in_frac {
+            in_frac = true
+        } else {
+            digits = false
+        }
+        j = j + 1
+    }
+    if digits && n > 1 {
+        if frac >= 5 as u32 {
+            pt = pt + 1 as u32
+        }
+        last = n - 1
+    } else {
+        pt = 0 as u32
+    }
+    // the style words at the end of the rest
+    var fl: u32 = 0 as u32
+    var cut: usize = last
+    while cut > 1 {
+        let w: str = str { p: ((s.p as u64) + st[cut - 1] as u64) as *mut u8, n: en[cut - 1] - st[cut - 1] }
+        if !word_is_style(w) {
+            break
+        }
+        if w == "Bold" || w == "Semi-Bold" || w == "Heavy" || w == "Ultra-Bold" {
+            fl = fl | 1 as u32
+        }
+        if w == "Italic" || w == "Oblique" {
+            fl = fl | 2 as u32
+        }
+        cut = cut - 1
+    }
+    var k: usize = 0
+    while k < cut {
+        if k > 0 {
+            rt.buf_push(fam, 32 as u8)
+        }
+        rt.buf_push_bytes(fam, (s.p as u64) + st[k] as u64, en[k] - st[k])
+        k = k + 1
+    }
+    *size = pt
+    *flags = fl
+    return true
+}
+
+fn os_font(title: str, family: str, size: u32, out_family: *mut rt.Buf, out_size: *mut u32, out_flags: *mut u32) -> i32 {
+    let t: u8 = choose()
+    if t == T_KDIALOG || t == T_NONE {
+        return NO_BACKEND
+    }
+    if t == T_SERVICE {
+        var q: rt.Buf = rt.buf_new()
+        dialogproto.push_field(&q, "pick_font", true)
+        dialogproto.push_field(&q, title, false)
+        dialogproto.push_field(&q, family, false)
+        var sz: rt.Buf = rt.buf_new()
+        rt.buf_push_dec_u64(&sz, size as u64)
+        dialogproto.push_field(&q, view(&sz), false)
+        rt.buf_free(&sz)
+        var rep: rt.Buf = rt.buf_new()
+        var r: i32 = FAILED
+        if service_call(&q, &rep) {
+            r = reply_status(view(&rep))
+            if r == OK {
+                // ok <family> <size> <bold> <italic>
+                var f2: rt.Buf = rt.buf_new()
+                var f3: rt.Buf = rt.buf_new()
+                var f4: rt.Buf = rt.buf_new()
+                var f5: rt.Buf = rt.buf_new()
+                if dialogproto.field_at(view(&rep), 1, out_family) && dialogproto.field_at(view(&rep), 2, &f3)
+                && dialogproto.field_at(view(&rep), 3, &f4) && dialogproto.field_at(view(&rep), 4, &f5) {
+                    var v: u32 = 0 as u32
+                    var i: usize = 0
+                    while i < rt.buf_len(&f3) && rt.buf_at(&f3, i) >= 48 as u8 && rt.buf_at(&f3, i) <= 57 as u8 {
+                        v = v * 10 as u32 + (rt.buf_at(&f3, i) - 48 as u8) as u32
+                        i = i + 1
+                    }
+                    *out_size = v
+                    var fl: u32 = 0 as u32
+                    if rt.buf_len(&f4) > 0 && rt.buf_at(&f4, 0) == 49 as u8 { fl = fl | 1 as u32 }
+                    if rt.buf_len(&f5) > 0 && rt.buf_at(&f5, 0) == 49 as u8 { fl = fl | 2 as u32 }
+                    *out_flags = fl
+                } else {
+                    r = FAILED
+                }
+                rt.buf_free(&f2)
+                rt.buf_free(&f3)
+                rt.buf_free(&f4)
+                rt.buf_free(&f5)
+            }
+        }
+        rt.buf_free(&q)
+        rt.buf_free(&rep)
+        return r
+    }
+    var c: process.Command = process.command("zenity")
+    process.add_arg(&c, "--font-selection")
+    if title.length() > 0 {
+        arg_kv(&c, "--title=", title)
+    }
+    var o: rt.Buf = rt.buf_new()
+    let code: i32 = run_helper(&c, &o)
+    process.command_free(&c)
+    var r: i32 = plain_status(code)
+    if r == OK {
+        chomp(&o)
+        if rt.buf_len(&o) == 0 {
+            r = CANCELED
+        } else if !parse_font(view(&o), out_family, out_size, out_flags) {
+            r = FAILED
+        }
+    }
+    rt.buf_free(&o)
+    return r
+}
+
+// ------------------------------------------------------------------ message boxes
+
+// The answer when the box was closed without a button.
+fn closed_answer(buttons: i32) -> i32 {
+    if buttons == 1 || buttons == 3 {
+        return 2
+    }
+    if buttons == 2 {
+        return 4
+    }
+    return 1
+}
+
+fn zenity_message(kind: i32, title: str, text: str, buttons: i32, answer: *mut i32) -> i32 {
+    var c: process.Command = process.command("zenity")
+    if buttons == 0 {
+        if kind == 3 {
+            process.add_arg(&c, "--error")
+        } else if kind == 2 {
+            process.add_arg(&c, "--warning")
+        } else {
+            process.add_arg(&c, "--info")
+        }
+    } else {
+        process.add_arg(&c, "--question")
+        if buttons == 1 {
+            process.add_arg(&c, "--ok-label=OK")
+            process.add_arg(&c, "--cancel-label=Cancel")
+        } else {
+            process.add_arg(&c, "--ok-label=Yes")
+            process.add_arg(&c, "--cancel-label=No")
+        }
+        if buttons == 3 {
+            process.add_arg(&c, "--extra-button=Cancel")
+        }
+    }
+    if kind == 1 && buttons == 0 {
+        process.add_arg(&c, "--icon-name=dialog-question")
+    }
+    process.add_arg(&c, "--no-markup")
+    if title.length() > 0 {
+        arg_kv(&c, "--title=", title)
+    }
+    arg_kv(&c, "--text=", text)
+    var o: rt.Buf = rt.buf_new()
+    let code: i32 = run_helper(&c, &o)
+    process.command_free(&c)
+    chomp(&o)
+    var r: i32 = OK
+    if code == 0 {
+        if buttons == 0 || buttons == 1 { *answer = 1 } else { *answer = 3 }
+    } else if code == 1 {
+        if buttons == 3 && view(&o) == "Cancel" {
+            *answer = 2
+        } else if buttons == 1 {
+            *answer = 2
+        } else if buttons == 0 {
+            *answer = 1
+        } else {
+            *answer = 4
+        }
+    } else {
+        r = FAILED
+    }
+    rt.buf_free(&o)
+    return r
+}
+
+fn kdialog_message(kind: i32, title: str, text: str, buttons: i32, answer: *mut i32) -> i32 {
+    var c: process.Command = process.command("kdialog")
+    if title.length() > 0 {
+        process.add_arg(&c, "--title")
+        process.add_arg(&c, title)
+    }
+    if buttons == 0 {
+        if kind == 3 {
+            process.add_arg(&c, "--error")
+        } else if kind == 2 {
+            process.add_arg(&c, "--sorry")
+        } else {
+            process.add_arg(&c, "--msgbox")
+        }
+    } else if buttons == 3 {
+        process.add_arg(&c, "--yesnocancel")
+    } else {
+        process.add_arg(&c, "--yesno")
+        if buttons == 1 {
+            process.add_arg(&c, "--yes-label")
+            process.add_arg(&c, "OK")
+            process.add_arg(&c, "--no-label")
+            process.add_arg(&c, "Cancel")
+        }
+    }
+    process.add_arg(&c, text)
+    var o: rt.Buf = rt.buf_new()
+    let code: i32 = run_helper(&c, &o)
+    process.command_free(&c)
+    rt.buf_free(&o)
+    if buttons == 0 {
+        if code != 0 && code != 1 { return FAILED }
+        *answer = 1
+        return OK
+    }
+    if code == 0 {
+        if buttons == 1 { *answer = 1 } else { *answer = 3 }
+        return OK
+    }
+    if code == 1 {
+        if buttons == 1 { *answer = 2 } else { *answer = 4 }
+        return OK
+    }
+    if code == 2 && buttons == 3 {
+        *answer = 2
+        return OK
+    }
+    return FAILED
+}
+
+fn service_message(kind: i32, title: str, text: str, buttons: i32, answer: *mut i32) -> i32 {
+    var q: rt.Buf = rt.buf_new()
+    dialogproto.push_field(&q, "message", true)
+    var k: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&k, kind as u64)
+    dialogproto.push_field(&q, view(&k), false)
+    dialogproto.push_field(&q, title, false)
+    dialogproto.push_field(&q, text, false)
+    rt.buf_clear(&k)
+    rt.buf_push_dec_u64(&k, buttons as u64)
+    dialogproto.push_field(&q, view(&k), false)
+    rt.buf_free(&k)
+    var rep: rt.Buf = rt.buf_new()
+    var r: i32 = FAILED
+    if service_call(&q, &rep) {
+        r = reply_status(view(&rep))
+        if r == CANCELED {
+            *answer = closed_answer(buttons)
+            r = OK
+        } else if r == OK {
+            var a: rt.Buf = rt.buf_new()
+            if dialogproto.field_at(view(&rep), 1, &a) {
+                if view(&a) == "ans_yes" { *answer = 3 }
+                else if view(&a) == "ans_no" { *answer = 4 }
+                else if view(&a) == "ans_cancel" { *answer = 2 }
+                else { *answer = 1 }
+            } else {
+                r = FAILED
+            }
+            rt.buf_free(&a)
+        }
+    }
+    rt.buf_free(&q)
+    rt.buf_free(&rep)
+    return r
+}
+
+fn os_message(kind: i32, title: str, text: str, buttons: i32, answer: *mut i32) -> i32 {
+    let t: u8 = choose()
+    if t == T_ZENITY { return zenity_message(kind, title, text, buttons, answer) }
+    if t == T_KDIALOG { return kdialog_message(kind, title, text, buttons, answer) }
+    if t == T_SERVICE { return service_message(kind, title, text, buttons, answer) }
+    return NO_BACKEND
+}

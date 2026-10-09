@@ -39,6 +39,10 @@ if [ "$WHICH" = all ] || [ "$WHICH" = linux ]; then
         done
     done
     build "--opt-level=release-fast" "$W/mp3_ref" lib/ton/mp3_main.fi || true
+    # std.dialog, std.toast and the fUi dialog service (tools/dialog, tools/dialogd; docs/DIALOG.md)
+    build "--opt-level=release-fast" "$W/dialog_main" tools/dialog/dialog_main.fi || true
+    build "--opt-level=release-fast" "$W/dialogd" tools/dialogd/dialogd_main.fi || true
+    build "--opt-level=release-fast" "$W/toast_main" tools/dialog/toast_main.fi || true
     echo "   built"
 
     step "2. python3 tools/desktop/platforms.py (the five platform files of every module)"
@@ -91,6 +95,36 @@ if [ "$WHICH" = all ] || [ "$WHICH" = linux ]; then
 
     step "9c. std.clipboard: the Linux, Android and browser files agree, and the program builds for five targets"
     run python3 tools/desktop/clipboard_platforms.py --firnc "$FIRNC"
+
+    step "9d. std.dialog against the REAL dialogs of the fUi service: buttons found in a screenshot and pressed, a closed window, a wrong path"
+    if have Xvfb && have xdotool && have xwd && python3 -c "import Xlib, PIL" 2>/dev/null; then
+        run python3 tools/dialog/dialog_check.py "$W/dialog_main" "$W/dialogd"
+    else
+        echo "  SKIP  Xvfb/xdotool/xwd/python-xlib/PIL missing"
+    fi
+
+    step "9e. std.toast against a notification server written with libdbus: every option, a replacement, a close, a click as a callback"
+    if have dbus-daemon && python3 -c "import dbus, gi" 2>/dev/null; then
+        run python3 tools/dialog/toast_check.py "$W/toast_main"
+    else
+        echo "  SKIP  dbus-daemon or python3 dbus/gi missing"
+    fi
+
+    step "9f. std.dialog and std.toast: the platform files agree, and a program that calls everything builds for five targets"
+    run python3 tools/dialog/platforms.py --firnc "$FIRNC"
+
+    step "9g. std.dialog, std.toast and plat.webdialog in a real Chromium (Playwright)"
+    PW="${PLAYWRIGHT:-}"
+    [ -n "$PW" ] || { [ -d /root/jarvis/node_modules/playwright ] && PW=/root/jarvis/node_modules/playwright; }
+    if have node && { [ -n "$PW" ] || node -e 'require("playwright")' 2>/dev/null; }; then
+        if "$FIRNC" --target=wasm32-browser -o "$W/webdialog_probe.wasm" tools/dialog/webdialog_probe.fi > "$W/webdialog.log" 2>&1; then
+            PLAYWRIGHT="${PW:-playwright}" run node tools/dialog/check_webdialog.cjs "$W/webdialog_probe.wasm"
+        else
+            echo "  FAIL  webdialog_probe does not build"; head -5 "$W/webdialog.log"; rc=1
+        fi
+    else
+        echo "  SKIP  node or playwright missing"
+    fi
 fi
 
 if [ "$WHICH" = all ] || [ "$WHICH" = windows ]; then
@@ -109,6 +143,8 @@ if [ "$WHICH" = all ] || [ "$WHICH" = windows ]; then
             cp "tools/desktop/$SRC.fi" "$WB/wn/"
             build "--target=x86_64-windows --opt-level=dev-fast" "$WB/$SRC.exe" "$WB/wn/$SRC.fi" || true
         done
+        build "--target=x86_64-windows --opt-level=dev-fast" "$WB/dialog_main.exe" tools/dialog/dialog_main.fi || true
+        build "--target=x86_64-windows --opt-level=dev-fast" "$WB/pilot.exe" tools/dialog/pilot_main.fi || true
         build "--target=x86_64-windows --opt-level=dev-fast" "$WB/t2220.exe" tests/2220_desktop_watch.fi || true
         build "--target=x86_64-windows --opt-level=dev-fast" "$WB/t2221.exe" tests/2221_appkit_ipc.fi || true
         if have x86_64-w64-mingw32-gcc; then
@@ -150,6 +186,13 @@ if [ "$WHICH" = all ] || [ "$WHICH" = windows ]; then
             run python3 tools/desktop/clipboard_check.py "$WB/clipboard_main.exe" wine
         else
             echo "  SKIP  Xvfb or gi missing"
+        fi
+
+        step "15c. std.dialog as a Windows program: Wine's comdlg32 / shell32 / user32 dialogs, pressed by a second program"
+        if have Xvfb; then
+            run python3 tools/dialog/dialog_check_win.py "$WB/dialog_main.exe" "$WB/pilot.exe"
+        else
+            echo "  SKIP  Xvfb missing"
         fi
 
         step "16. WM_DROPFILES with a real HDROP (the program posts it to itself)"

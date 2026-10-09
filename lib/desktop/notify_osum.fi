@@ -1,10 +1,29 @@
 // SPDX-License-Identifier: MPL-2.0
-// lib/desktop/notify_osum.fi -- desktop.notify for OrientOS. STUB: OrientOS has no notification service yet.
+// lib/desktop/notify_osum.fi -- desktop.notify for OrientOS: a notification through the SYSTEM BUS of the kernel.
 //
-// Every function answers "not available" (false / 0 / nothing) and has the signature of the Linux
-// reference lib/desktop/notify.fi; `tools/desktop/platforms.py` compares export lists and signatures and
-// type-checks this file. A real back end replaces the bodies, not the interface.
+// OrientOS has no D-Bus daemon on purpose (OrientOS docs/SYSTEMBUS.md, "Warum es ihn gibt": a broker in ring 3 costs
+// two context switches per call and is not there when it is needed). A notification is the bus call NOTIPOST
+//
+//     rax = 1960 (SYS_OSUM_BUS), rdi = 19, rsi = urgency (1 = hint, 2 = serious), rdx = text address, r10 = length
+//
+// and the task bar does the rest: it shows the text as a TOAST (a scene window, the acceptance run is
+// tools/barpop/run.sh of the OrientOS tree), keeps it in the notification list and counts it in the bar's "Meldg"
+// field. This file is the Firn side of that call and nothing else; it has the signature of the Linux reference
+// lib/desktop/notify.fi (tools/desktop/platforms.py compares export lists and types and type-checks this file).
+//
+// WHAT MAPS TO WHAT
+//   summary + body       -> ONE text "summary: body", cut to 95 octets at a character boundary (the bus takes one line)
+//   urgency              -> URGENCY_CRITICAL = 2 (serious), everything else 1 (hint)
+//   icon, actions, category, timeout, replaces -> ignored (the bar decides how long a toast stays)
+//   the id               -> a counter of this program (the bus has no notification ids)
+//
+// HONEST
+// N1  NOT RUN on OrientOS by this round: the file compiles and type-checks here (platforms.py), the call is the one
+//     `kernel/user/notify.fi` of the OrientOS tree makes. A run needs the OrientOS test guest (QEMU, tools/barpop/run.sh).
+// N2  No clicks, no closes (`notify_poll` is always false), no recall (`notify_close` is false).
+// N3  Without the bus (`nobus` boot option) the kernel answers -ENODEV: `notify_ready` is false.
 import std.rt
+import std.str
 
 export {
     Notifier, Note, NotifyEvent,
@@ -62,14 +81,95 @@ fn notify_event_zero() -> NotifyEvent {
     return NotifyEvent { kind: 0 as u32, id: 0 as u32, reason: 0 as u32 }
 }
 
-fn notify_open(app: str) -> Notifier { return Notifier { ok: false } }
+const SYS_BUS: i64 = 1960
+const BUS_NOTIPOST: i64 = 19
+const BUS_NOTIINFO: i64 = 21
+const TEXT_MAX: usize = 95
+
+static mut serial: u32 = 0
+
+fn bus3(op: i64, a1: i64, a2: i64, a3: i64) -> i64 {
+    return syscall(SYS_BUS, op, a1, a2, a3, 0, 0)
+}
+
+fn notify_open(app: str) -> Notifier {
+    // the count of notifications answers when the bus is there
+    return Notifier { ok: bus3(BUS_NOTIINFO, 0, 0, 0) >= 0 }
+}
+
 fn notify_close_bus(n: *mut Notifier) {}
-fn notify_ready(n: *mut Notifier) -> bool { return false }
-fn notify_server_info(n: *mut Notifier, out: *mut rt.Buf) -> bool { return false }
-fn notify_capabilities(n: *mut Notifier, out: *mut rt.Buf) -> usize { return 0 }
-fn notify_show(n: *mut Notifier, note: *mut Note) -> u32 { return 0 as u32 }
+
+fn notify_ready(n: *mut Notifier) -> bool { return (*n).ok }
+
+fn notify_server_info(n: *mut Notifier, out: *mut rt.Buf) -> bool {
+    if !(*n).ok {
+        return false
+    }
+    let s: str = "OrientOS toast\nFleitec\n1\n1.2\n"
+    rt.buf_push_bytes(out, s.p as u64, s.length())
+    return true
+}
+
+fn notify_capabilities(n: *mut Notifier, out: *mut rt.Buf) -> usize {
+    if !(*n).ok {
+        return 0
+    }
+    let s: str = "persistence\n"
+    rt.buf_push_bytes(out, s.p as u64, s.length())
+    return 1
+}
+
+// "summary: body" cut to TEXT_MAX octets without splitting a UTF-8 sequence.
+fn make_text(summary: str, body: str, out: *mut rt.Buf) {
+    rt.buf_push_bytes(out, summary.p as u64, summary.length())
+    if body.length() > 0 {
+        rt.buf_push(out, 58 as u8)
+        rt.buf_push(out, 32 as u8)
+        rt.buf_push_bytes(out, body.p as u64, body.length())
+    }
+    var n: usize = rt.buf_len(out)
+    if n > TEXT_MAX {
+        n = TEXT_MAX
+        while n > 0 && (rt.buf_at(out, n) & 192 as u8) == 128 as u8 {
+            n = n - 1
+        }
+        rt.buf_set_len(out, n)
+    }
+}
+
+fn post(summary: str, body: str, urgency: i32) -> bool {
+    var t: rt.Buf = rt.buf_new()
+    make_text(summary, body, &t)
+    var u: i64 = 1
+    if urgency == URGENCY_CRITICAL {
+        u = 2
+    }
+    var ok: bool = false
+    if rt.buf_len(&t) > 0 {
+        ok = bus3(BUS_NOTIPOST, u, rt.buf_ptr(&t) as i64, rt.buf_len(&t) as i64) >= 0
+    }
+    rt.buf_free(&t)
+    return ok
+}
+
+fn notify_show(n: *mut Notifier, note: *mut Note) -> u32 {
+    if !(*n).ok || !post((*note).summary, (*note).body, (*note).urgency) {
+        return 0 as u32
+    }
+    serial = serial + 1 as u32
+    return serial
+}
+
 fn notify_close(n: *mut Notifier, id: u32) -> bool { return false }
 fn notify_poll(n: *mut Notifier, ms: i64, ev: *mut NotifyEvent) -> bool { return false }
 fn notify_event_key(n: *mut Notifier) -> str { return "" }
-fn notify_once(app: str, summary: str, body: str) -> bool { return false }
+
+fn notify_once(app: str, summary: str, body: str) -> bool {
+    var n: Notifier = notify_open(app)
+    if !n.ok {
+        return false
+    }
+    return post(summary, body, URGENCY_DEFAULT)
+}
+
 fn notify_fd(n: *mut Notifier) -> i32 { return -1 }

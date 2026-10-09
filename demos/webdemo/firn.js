@@ -28,6 +28,7 @@ const firnTag = document.currentScript;
     const text = new TextDecoder();
     let mem = null, x = null; // the memory and the exports
     let clipKeep = null; // the last copy the browser refused (firn_web_clip_write)
+    let notifySeq = 0; const notes = {}; // the live Notifications by number (firn_web_notify)
     const bytes = (p, n) => new Uint8Array(mem.buffer, p >>> 0, n >>> 0);
     const str = (p, n) => text.decode(bytes(p, n).slice());
     const give = (v) => { // octets into the module: [address, length]
@@ -250,6 +251,76 @@ const firnTag = document.currentScript;
                     if (it.types.includes(t)) return answer(new Uint8Array(await (await it.getType(t)).arrayBuffer()), true);
                 kept();
             }, kept);
+        },
+        // THE SYSTEM DIALOGS AND NOTIFICATIONS (lib/plat/webdialog.fi). A message box is alert/confirm
+        // (synchronous); a colour and files are inputs that answer later through firn_web_dialog; a
+        // notification is a Notification whose click and close come back the same way.
+        firn_web_dialog_message(kind, tp, tn, xp, xn, buttons) {
+            const title = str(tp, tn), body = str(xp, xn);
+            const msg = title ? title + '\n\n' + body : body;
+            try {
+                if (buttons === 0) { alert(msg); return 1; }
+                if (buttons === 1) return confirm(msg) ? 1 : 2;
+                if (buttons === 2) return confirm(msg) ? 3 : 4;
+            } catch (e) { /* a page that may not show boxes */ }
+            return 0;
+        },
+        firn_web_dialog_color(tp, tn, rgb) {
+            const answer = (hex, ok) => ev(x.firn_web_dialog(...give('color'), ...give(hex), ok ? 1 : 0, 0));
+            const inp = document.createElement('input');
+            inp.type = 'color';
+            inp.id = 'firn-dialog-color';
+            inp.value = '#' + ((rgb >>> 0) & 0xFFFFFF).toString(16).padStart(6, '0');
+            inp.style.cssText = 'position:fixed;left:-100px;top:-100px;opacity:0';
+            document.body.appendChild(inp);
+            const done = (hex, ok) => { inp.remove(); answer(hex, ok); };
+            inp.addEventListener('change', () => done(inp.value.replace('#', ''), true));
+            inp.addEventListener('cancel', () => done('', false));
+            try { inp.click(); } catch (e) { inp.remove(); return 0; }
+            return 1;
+        },
+        firn_web_dialog_file(ap, an, multi) {
+            const inp = document.createElement('input');
+            inp.type = 'file';
+            inp.id = 'firn-dialog-file';
+            inp.accept = str(ap, an);
+            inp.multiple = !!multi;
+            inp.style.cssText = 'position:fixed;left:-100px;top:-100px;opacity:0';
+            document.body.appendChild(inp);
+            inp.addEventListener('change', async () => {
+                const files = Array.from(inp.files);
+                inp.remove();
+                for (let i = 0; i < files.length; i++) {
+                    const data = new Uint8Array(await files[i].arrayBuffer());
+                    ev(x.firn_web_dialog(...give(files[i].name), ...give(data), 1, i));
+                }
+                ev(x.firn_web_dialog(0, 0, 0, 0, files.length ? 2 : 0, 0));
+            });
+            inp.addEventListener('cancel', () => { inp.remove(); ev(x.firn_web_dialog(0, 0, 0, 0, 0, 0)); });
+            try { inp.click(); } catch (e) { inp.remove(); return 0; }
+            return 1;
+        },
+        firn_web_notify(tp, tn, bp, bn, ip, inn, tagp, tagn) {
+            if (typeof Notification === 'undefined') return 0;
+            if (Notification.permission === 'default') { Notification.requestPermission(); return 0; }
+            if (Notification.permission !== 'granted') return 0;
+            const opts = { body: str(bp, bn) };
+            if (inn) opts.icon = str(ip, inn);
+            if (tagn) opts.tag = str(tagp, tagn);
+            let n;
+            try { n = new Notification(str(tp, tn), opts); } catch (e) { return 0; }
+            const id = ++notifySeq;
+            notes[id] = n;
+            window.firnNotes = notes;           // the test of a page can reach them
+            n.onclick = () => ev(x.firn_web_dialog(...give('notify-click'), 0, 0, 1, id));
+            n.onclose = () => { delete notes[id]; ev(x.firn_web_dialog(...give('notify-close'), 0, 0, 1, id)); };
+            return id;
+        },
+        firn_web_notify_close(id) {
+            const n = notes[id];
+            if (!n) return 0;
+            n.close();
+            return 1;
         },
     };
 

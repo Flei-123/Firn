@@ -1,0 +1,514 @@
+// expect_exit: 0
+// tests/2380_std_dialog_helpers.fi -- std.dialog on Linux: the choice of backend, the exact command lines of
+// zenity and kdialog, the reading of their answers (paths, colours as rgb() / rgba() / #hex, Pango font
+// descriptions, exit codes), and the line protocol of the dialog service. The program starts ITSELF as a
+// child (`argv[0] --child <mode>`) with a controlled environment and with stand-in helper scripts in a
+// temporary directory, so the answers do not depend on the machine (no display is touched).
+//
+// The stand-ins write their arguments, one per line, to $FAKE_DIR/<name>.args and answer with the files
+// $FAKE_DIR/<name>.out (standard output) and <name>.rc (exit code), which the child sets before each call.
+// The real dialogs are tested by tests/2381 (Windows, under Wine) and tools/dialogd (the fUi service).
+//
+//   none     no DISPLAY, no WAYLAND_DISPLAY: NO_BACKEND, nothing crashes, the out parameters are untouched
+//   off      FIRN_DIALOG=none with a display variable set
+//   missing  FIRN_DIALOG=zenity but no zenity installed
+//   zenity   FIRN_DIALOG=zenity: files, folders, colours, fonts, message boxes
+//   kdialog  FIRN_DIALOG=kdialog: the same, no font chooser
+//   service  FIRN_DIALOG=service: one request line, one answer line
+//   auto     no FIRN_DIALOG: KDE session prefers kdialog, else zenity, else kdialog, else the service, else nothing
+import std.rt
+import std.str
+import std.env
+import std.fs
+import std.fsx
+import std.process
+import std.dialog
+
+static mut failures: i32 = 0
+
+fn say(s: str) {
+    syscall(1, 1, s.p as i64, s.length() as i64, 0, 0, 0)
+}
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn ck(cond: bool, name: str) {
+    if !cond {
+        failures = failures + 1
+        say("  FAIL  ")
+        say(name)
+        say("\n")
+    }
+}
+
+fn eq(b: *mut rt.Buf, s: str) -> bool {
+    if rt.buf_len(b) != s.length() {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(b), s.p as u64, s.length())
+}
+
+fn terr(e: ProcError) -> i32 {
+    return 1000
+}
+
+fn read_text(path: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    fs.read_file(path, &b) catch 0
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn has_sub(s: str, sub: str) -> bool {
+    if sub.length() > s.length() {
+        return false
+    }
+    var i: usize = 0
+    while i + sub.length() <= s.length() {
+        var j: usize = 0
+        while j < sub.length() && s.chars(i + j) == sub.chars(j) {
+            j = j + 1
+        }
+        if j == sub.length() {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn put(path: str, body: str) {
+    fs.write_file_mode(path, body.p as u64, body.length(), 420, false) catch 0
+}
+
+// What the stand-in `name` answers next.
+fn canned(name: str, out: str, rc: str) {
+    let dir: str = env.get("FAKE_DIR")
+    put(dir + "/" + name + ".out", out)
+    put(dir + "/" + name + ".rc", rc)
+    put(dir + "/" + name + ".args", "")
+}
+
+// The arguments of the last call contain the line `line`.
+fn called_with(name: str, line: str) -> bool {
+    let a: str = "\n" + read_text(env.get("FAKE_DIR") + "/" + name + ".args")
+    return has_sub(a, "\n" + line + "\n")
+}
+
+fn status_is(r: i32, want: i32, name: str) {
+    if r != want {
+        failures = failures + 1
+        say("  FAIL  ")
+        say(name)
+        say(" (status ")
+        say(dialog.status_name(r))
+        say(", wanted ")
+        say(dialog.status_name(want))
+        say(")\n")
+    }
+}
+
+fn zenity_files() {
+    var out: rt.Buf = rt.buf_new()
+    canned("zenity", "/home/x/a b.png\n", "0")
+    status_is(dialog.open_file("Open a picture", "/home/x", "Pictures|*.png;*.jpg|All files|*", &out), dialog.OK, "zenity open_file")
+    ck(eq(&out, "/home/x/a b.png"), "zenity open_file path, one line end removed")
+    ck(called_with("zenity", "--file-selection"), "zenity: --file-selection")
+    ck(called_with("zenity", "--title=Open a picture"), "zenity: title")
+    ck(called_with("zenity", "--filename=/home/x/"), "zenity: start directory with a slash")
+    ck(called_with("zenity", "--file-filter=Pictures | *.png *.jpg"), "zenity: first filter")
+    ck(called_with("zenity", "--file-filter=All files | *"), "zenity: second filter")
+
+    rt.buf_clear(&out)
+    canned("zenity", "", "1")
+    status_is(dialog.open_file("t", "", "", &out), dialog.CANCELED, "zenity cancel")
+    ck(rt.buf_len(&out) == 0, "cancel leaves the buffer alone")
+    canned("zenity", "", "255")
+    status_is(dialog.open_file("t", "", "", &out), dialog.FAILED, "zenity error exit code")
+    canned("zenity", "\n", "0")
+    status_is(dialog.open_file("t", "", "", &out), dialog.CANCELED, "an empty answer is a cancel")
+
+    canned("zenity", "/a\n/b c\n", "0")
+    status_is(dialog.open_files("Several", "", "", &out), dialog.OK, "zenity open_files")
+    ck(eq(&out, "/a\n/b c"), "open_files: one path per line")
+    ck(called_with("zenity", "--multiple"), "zenity: --multiple")
+    ck(has_sub(read_text(env.get("FAKE_DIR") + "/zenity.args"), "--separator=\n\n"), "zenity: separator is a line feed")
+
+    rt.buf_clear(&out)
+    canned("zenity", "/tmp/dir/doc.txt\n", "0")
+    status_is(dialog.save_file("Save", "/tmp/dir", "doc.txt", "Text|*.txt", &out), dialog.OK, "zenity save_file")
+    ck(eq(&out, "/tmp/dir/doc.txt"), "save path")
+    ck(called_with("zenity", "--save"), "zenity: --save")
+    ck(called_with("zenity", "--confirm-overwrite"), "zenity: --confirm-overwrite")
+    ck(called_with("zenity", "--filename=/tmp/dir/doc.txt"), "zenity: suggested name")
+
+    rt.buf_clear(&out)
+    canned("zenity", "/srv/data\n", "0")
+    status_is(dialog.pick_folder("Folder", "/srv", &out), dialog.OK, "zenity pick_folder")
+    ck(eq(&out, "/srv/data"), "folder path")
+    ck(called_with("zenity", "--directory"), "zenity: --directory")
+    rt.buf_free(&out)
+}
+
+fn zenity_colors() {
+    var rgb: u32 = 0 as u32
+    canned("zenity", "rgb(255,128,0)\n", "0")
+    status_is(dialog.pick_color("Colour", 0x1BD96A as u32, &rgb), dialog.OK, "zenity colour")
+    ck(rgb == 0xFF8000 as u32, "rgb(255,128,0) is 0xFF8000")
+    ck(called_with("zenity", "--color-selection"), "zenity: --color-selection")
+    ck(called_with("zenity", "--color=#1bd96a"), "zenity: start colour as #rrggbb")
+    canned("zenity", "#00ff7f\n", "0")
+    status_is(dialog.pick_color("Colour", 0 as u32, &rgb), dialog.OK, "#rrggbb")
+    ck(rgb == 0x00FF7F as u32, "#00ff7f")
+    canned("zenity", "rgba(1, 2, 3, 0.5)\n", "0")
+    status_is(dialog.pick_color("Colour", 0 as u32, &rgb), dialog.OK, "rgba()")
+    ck(rgb == 0x010203 as u32, "rgba(1, 2, 3, 0.5) is 0x010203")
+    canned("zenity", "#ffff80000000\n", "0")
+    status_is(dialog.pick_color("Colour", 0 as u32, &rgb), dialog.OK, "#rrrrggggbbbb")
+    ck(rgb == 0xFF8000 as u32, "16 bits per channel: the high octets")
+    canned("zenity", "#12345678\n", "0")
+    status_is(dialog.pick_color("Colour", 0 as u32, &rgb), dialog.OK, "#rrggbbaa")
+    ck(rgb == 0x123456 as u32, "#rrggbbaa drops the alpha")
+    rgb = 7 as u32
+    canned("zenity", "purple\n", "0")
+    status_is(dialog.pick_color("Colour", 0 as u32, &rgb), dialog.FAILED, "a name is not understood")
+    ck(rgb == 7 as u32, "a failed colour leaves the value")
+    canned("zenity", "", "1")
+    status_is(dialog.pick_color("Colour", 0 as u32, &rgb), dialog.CANCELED, "colour cancel")
+}
+
+fn zenity_fonts() {
+    var fam: rt.Buf = rt.buf_new()
+    var f: dialog.FontChoice = dialog.FontChoice { size: 0 as u32, bold: false, italic: false }
+    canned("zenity", "Sans Bold 12\n", "0")
+    status_is(dialog.pick_font("Font", "", 0 as u32, &fam, &f), dialog.OK, "zenity font")
+    ck(eq(&fam, "Sans") && f.size == 12 as u32 && f.bold && !f.italic, "Sans Bold 12")
+    ck(called_with("zenity", "--font-selection"), "zenity: --font-selection")
+    rt.buf_clear(&fam)
+    canned("zenity", "DejaVu Sans Mono Bold Italic 10.5\n", "0")
+    status_is(dialog.pick_font("Font", "", 0 as u32, &fam, &f), dialog.OK, "font with a fraction")
+    ck(eq(&fam, "DejaVu Sans Mono") && f.size == 11 as u32 && f.bold && f.italic, "DejaVu Sans Mono Bold Italic 10.5")
+    rt.buf_clear(&fam)
+    canned("zenity", "Noto Sans 9\n", "0")
+    status_is(dialog.pick_font("Font", "", 0 as u32, &fam, &f), dialog.OK, "plain font")
+    ck(eq(&fam, "Noto Sans") && f.size == 9 as u32 && !f.bold && !f.italic, "Noto Sans 9")
+    rt.buf_clear(&fam)
+    canned("zenity", "Sans Oblique\n", "0")
+    status_is(dialog.pick_font("Font", "", 0 as u32, &fam, &f), dialog.OK, "font without a size")
+    ck(eq(&fam, "Sans") && f.size == 0 as u32 && f.italic, "Sans Oblique: size 0")
+    rt.buf_free(&fam)
+}
+
+fn zenity_messages() {
+    var a: i32 = 0
+    canned("zenity", "", "0")
+    status_is(dialog.message(dialog.KIND_INFO, "Title", "Hello <b>&amp;", dialog.BTNS_OK, &a), dialog.OK, "zenity info")
+    ck(a == dialog.ANS_OK, "info answers OK")
+    ck(called_with("zenity", "--info"), "zenity: --info")
+    ck(called_with("zenity", "--no-markup"), "zenity: --no-markup, the text is not markup")
+    ck(called_with("zenity", "--title=Title"), "zenity: message title")
+    ck(called_with("zenity", "--text=Hello <b>&amp;"), "zenity: text passed as it is")
+    canned("zenity", "", "0")
+    dialog.message(dialog.KIND_ERROR, "T", "x", dialog.BTNS_OK, &a)
+    ck(called_with("zenity", "--error"), "zenity: --error")
+    dialog.message(dialog.KIND_WARNING, "T", "x", dialog.BTNS_OK, &a)
+    ck(called_with("zenity", "--warning"), "zenity: --warning")
+    dialog.message(dialog.KIND_QUESTION, "T", "x", dialog.BTNS_OK, &a)
+    ck(called_with("zenity", "--icon-name=dialog-question"), "zenity: a question mark for KIND_QUESTION")
+
+    var yes: bool = false
+    canned("zenity", "", "0")
+    status_is(dialog.confirm("Delete?", "Delete 3 files?", &yes), dialog.OK, "zenity confirm yes")
+    ck(yes, "exit 0 is Yes")
+    ck(called_with("zenity", "--question"), "zenity: --question")
+    ck(called_with("zenity", "--ok-label=Yes"), "zenity: Yes label")
+    ck(called_with("zenity", "--cancel-label=No"), "zenity: No label")
+    canned("zenity", "", "1")
+    status_is(dialog.confirm("Delete?", "x", &yes), dialog.OK, "zenity confirm no")
+    ck(!yes, "exit 1 is No")
+    canned("zenity", "", "255")
+    status_is(dialog.confirm("Delete?", "x", &yes), dialog.FAILED, "zenity confirm error")
+
+    canned("zenity", "", "1")
+    dialog.message(dialog.KIND_WARNING, "T", "x", dialog.BTNS_OK_CANCEL, &a)
+    ck(a == dialog.ANS_CANCEL, "OK / Cancel: exit 1 is Cancel")
+    ck(called_with("zenity", "--ok-label=OK") && called_with("zenity", "--cancel-label=Cancel"), "zenity: OK / Cancel labels")
+    canned("zenity", "Cancel\n", "1")
+    dialog.message(dialog.KIND_QUESTION, "T", "x", dialog.BTNS_YES_NO_CANCEL, &a)
+    ck(a == dialog.ANS_CANCEL, "Yes / No / Cancel: the extra button")
+    ck(called_with("zenity", "--extra-button=Cancel"), "zenity: --extra-button=Cancel")
+    canned("zenity", "", "1")
+    dialog.message(dialog.KIND_QUESTION, "T", "x", dialog.BTNS_YES_NO_CANCEL, &a)
+    ck(a == dialog.ANS_NO, "Yes / No / Cancel: exit 1 without the extra button is No")
+    canned("zenity", "", "0")
+    dialog.message(dialog.KIND_QUESTION, "T", "x", dialog.BTNS_YES_NO_CANCEL, &a)
+    ck(a == dialog.ANS_YES, "Yes / No / Cancel: exit 0 is Yes")
+    status_is(dialog.message(9, "T", "x", dialog.BTNS_OK, &a), dialog.FAILED, "a kind that does not exist")
+    status_is(dialog.message(0, "T", "x", 9, &a), dialog.FAILED, "buttons that do not exist")
+}
+
+fn kdialog_all() {
+    var out: rt.Buf = rt.buf_new()
+    canned("kdialog", "/home/x/a.png\n", "0")
+    status_is(dialog.open_file("Open", "/home/x", "Pictures|*.png;*.jpg|All files|*", &out), dialog.OK, "kdialog open_file")
+    ck(eq(&out, "/home/x/a.png"), "kdialog path")
+    ck(called_with("kdialog", "--getopenfilename"), "kdialog: --getopenfilename")
+    ck(called_with("kdialog", "/home/x"), "kdialog: start directory")
+    ck(called_with("kdialog", "*.png *.jpg|Pictures"), "kdialog: first filter line")
+    ck(called_with("kdialog", "*|All files"), "kdialog: second filter line")
+    ck(called_with("kdialog", "--title") && called_with("kdialog", "Open"), "kdialog: title")
+    rt.buf_clear(&out)
+    canned("kdialog", "", "1")
+    status_is(dialog.save_file("Save", "/tmp", "x.txt", "", &out), dialog.CANCELED, "kdialog save cancel")
+    ck(called_with("kdialog", "--getsavefilename") && called_with("kdialog", "/tmp/x.txt"), "kdialog: save call")
+    canned("kdialog", "/srv\n", "0")
+    status_is(dialog.pick_folder("F", "/", &out), dialog.OK, "kdialog folder")
+    ck(called_with("kdialog", "--getexistingdirectory"), "kdialog: --getexistingdirectory")
+    canned("kdialog", "/a\n/b\n", "0")
+    rt.buf_clear(&out)
+    status_is(dialog.open_files("F", "", "", &out), dialog.OK, "kdialog several")
+    ck(called_with("kdialog", "--multiple") && called_with("kdialog", "--separate-output"), "kdialog: several")
+    rt.buf_free(&out)
+
+    var rgb: u32 = 0 as u32
+    canned("kdialog", "#ff8000\n", "0")
+    status_is(dialog.pick_color("C", 0x1BD96A as u32, &rgb), dialog.OK, "kdialog colour")
+    ck(rgb == 0xFF8000 as u32, "kdialog colour value")
+    ck(called_with("kdialog", "--getcolor") && called_with("kdialog", "--default") && called_with("kdialog", "#1bd96a"), "kdialog: colour call")
+
+    var fam: rt.Buf = rt.buf_new()
+    var f: dialog.FontChoice = dialog.FontChoice { size: 0 as u32, bold: false, italic: false }
+    status_is(dialog.pick_font("F", "", 0 as u32, &fam, &f), dialog.NO_BACKEND, "kdialog has no font chooser")
+    rt.buf_free(&fam)
+
+    var a: i32 = 0
+    canned("kdialog", "", "0")
+    dialog.message(dialog.KIND_INFO, "T", "hello", dialog.BTNS_OK, &a)
+    ck(a == dialog.ANS_OK && called_with("kdialog", "--msgbox") && called_with("kdialog", "hello"), "kdialog msgbox")
+    dialog.message(dialog.KIND_ERROR, "T", "x", dialog.BTNS_OK, &a)
+    ck(called_with("kdialog", "--error"), "kdialog --error")
+    dialog.message(dialog.KIND_WARNING, "T", "x", dialog.BTNS_OK, &a)
+    ck(called_with("kdialog", "--sorry"), "kdialog --sorry")
+    canned("kdialog", "", "2")
+    dialog.message(dialog.KIND_QUESTION, "T", "x", dialog.BTNS_YES_NO_CANCEL, &a)
+    ck(a == dialog.ANS_CANCEL && called_with("kdialog", "--yesnocancel"), "kdialog yesnocancel: exit 2 is Cancel")
+    canned("kdialog", "", "1")
+    dialog.message(dialog.KIND_QUESTION, "T", "x", dialog.BTNS_YES_NO, &a)
+    ck(a == dialog.ANS_NO && called_with("kdialog", "--yesno"), "kdialog yesno: exit 1 is No")
+    dialog.message(dialog.KIND_QUESTION, "T", "x", dialog.BTNS_OK_CANCEL, &a)
+    ck(a == dialog.ANS_CANCEL && called_with("kdialog", "--yes-label") && called_with("kdialog", "OK"), "kdialog OK / Cancel through yesno labels")
+    canned("kdialog", "", "9")
+    status_is(dialog.message(dialog.KIND_QUESTION, "T", "x", dialog.BTNS_YES_NO, &a), dialog.FAILED, "kdialog odd exit code")
+}
+
+fn service_all() {
+    var out: rt.Buf = rt.buf_new()
+    canned("svc", "ok\t/home/x/a.png\n", "0")
+    status_is(dialog.open_file("Open\ta", "/home/x", "Pics|*.png", &out), dialog.OK, "service open_file")
+    ck(eq(&out, "/home/x/a.png"), "service path")
+    ck(read_text(env.get("FAKE_DIR") + "/svc.req") == "open_file\tOpen\\ta\t/home/x\tPics|*.png\n", "service request line, TAB escaped")
+    canned("svc", "ok\t/a\\n/b\n", "0")
+    rt.buf_clear(&out)
+    status_is(dialog.open_files("Open", "", "", &out), dialog.OK, "service open_files")
+    ck(eq(&out, "/a\n/b"), "service: escaped line feed in the answer")
+    canned("svc", "cancel\n", "0")
+    status_is(dialog.save_file("Save", "/t", "n.txt", "", &out), dialog.CANCELED, "service cancel")
+    ck(read_text(env.get("FAKE_DIR") + "/svc.req") == "save_file\tSave\t/t\tn.txt\t\n", "service save request")
+    canned("svc", "failed\n", "0")
+    status_is(dialog.pick_folder("F", "", &out), dialog.FAILED, "service failed")
+    ck(read_text(env.get("FAKE_DIR") + "/svc.req") == "pick_folder\tF\t\n", "service folder request")
+    canned("svc", "", "0")
+    status_is(dialog.pick_folder("F", "", &out), dialog.FAILED, "a service that says nothing is a failure")
+    rt.buf_free(&out)
+
+    var rgb: u32 = 0 as u32
+    canned("svc", "ok\tff8000\n", "0")
+    status_is(dialog.pick_color("C", 0x1BD96A as u32, &rgb), dialog.OK, "service colour")
+    ck(rgb == 0xFF8000 as u32, "service colour value")
+    ck(read_text(env.get("FAKE_DIR") + "/svc.req") == "pick_color\tC\t1bd96a\n", "service colour request")
+
+    var fam: rt.Buf = rt.buf_new()
+    var f: dialog.FontChoice = dialog.FontChoice { size: 0 as u32, bold: false, italic: false }
+    canned("svc", "ok\tDejaVu Sans\t11\t1\t0\n", "0")
+    status_is(dialog.pick_font("F", "Sans", 10 as u32, &fam, &f), dialog.OK, "service font")
+    ck(eq(&fam, "DejaVu Sans") && f.size == 11 as u32 && f.bold && !f.italic, "service font value")
+    ck(read_text(env.get("FAKE_DIR") + "/svc.req") == "pick_font\tF\tSans\t10\n", "service font request")
+    rt.buf_free(&fam)
+
+    var a: i32 = 0
+    canned("svc", "ok\tans_yes\n", "0")
+    status_is(dialog.message(dialog.KIND_QUESTION, "T", "Sure?", dialog.BTNS_YES_NO, &a), dialog.OK, "service message")
+    ck(a == dialog.ANS_YES, "service ans_yes")
+    ck(read_text(env.get("FAKE_DIR") + "/svc.req") == "message\t1\tT\tSure?\t2\n", "service message request")
+    canned("svc", "cancel\n", "0")
+    dialog.message(dialog.KIND_INFO, "T", "x", dialog.BTNS_YES_NO_CANCEL, &a)
+    ck(a == dialog.ANS_CANCEL, "a closed box with a Cancel button answers Cancel")
+    dialog.message(dialog.KIND_INFO, "T", "x", dialog.BTNS_YES_NO, &a)
+    ck(a == dialog.ANS_NO, "a closed Yes / No box answers No")
+}
+
+fn child_main(start: u64) -> i32 {
+    let mode: str = arg(start, 2)
+    var out: rt.Buf = rt.buf_new()
+    var rgb: u32 = 5 as u32
+    var a: i32 = 0
+    if mode == "none" || mode == "off" || mode == "missing" {
+        ck(dialog.backend_name() == "none", "backend_name is none")
+        status_is(dialog.open_file("t", "", "", &out), dialog.NO_BACKEND, "open_file")
+        status_is(dialog.open_files("t", "", "", &out), dialog.NO_BACKEND, "open_files")
+        status_is(dialog.save_file("t", "", "n", "", &out), dialog.NO_BACKEND, "save_file")
+        status_is(dialog.pick_folder("t", "", &out), dialog.NO_BACKEND, "pick_folder")
+        status_is(dialog.pick_color("t", 1 as u32, &rgb), dialog.NO_BACKEND, "pick_color")
+        status_is(dialog.message(dialog.KIND_INFO, "t", "x", dialog.BTNS_OK, &a), dialog.NO_BACKEND, "message")
+        var yes: bool = true
+        status_is(dialog.confirm("t", "x", &yes), dialog.NO_BACKEND, "confirm")
+        var fam: rt.Buf = rt.buf_new()
+        var f: dialog.FontChoice = dialog.FontChoice { size: 0 as u32, bold: false, italic: false }
+        status_is(dialog.pick_font("t", "", 0 as u32, &fam, &f), dialog.NO_BACKEND, "pick_font")
+        ck(rt.buf_len(&out) == 0 && rgb == 5 as u32 && a == 0 && yes && rt.buf_len(&fam) == 0, "out parameters untouched")
+        rt.buf_free(&fam)
+        rt.buf_free(&out)
+        return failures
+    }
+    if mode == "zenity" {
+        ck(dialog.backend_name() == "zenity", "backend_name zenity")
+        zenity_files()
+        zenity_colors()
+        zenity_fonts()
+        zenity_messages()
+    }
+    if mode == "kdialog" {
+        ck(dialog.backend_name() == "kdialog", "backend_name kdialog")
+        kdialog_all()
+    }
+    if mode == "service" {
+        ck(dialog.backend_name() == "fui", "backend_name fui")
+        service_all()
+    }
+    if mode == "auto-zenity" {
+        ck(dialog.backend_name() == "zenity", "auto: zenity when both are installed and the session is not KDE")
+    }
+    if mode == "auto-kde" {
+        ck(dialog.backend_name() == "kdialog", "auto: kdialog when the session is KDE")
+    }
+    if mode == "auto-kdialog" {
+        ck(dialog.backend_name() == "kdialog", "auto: kdialog when it is the only helper")
+    }
+    if mode == "auto-service" {
+        ck(dialog.backend_name() == "fui", "auto: the service when no helper is installed")
+    }
+    if mode == "auto-none" {
+        ck(dialog.backend_name() == "none", "auto: nothing")
+    }
+    rt.buf_free(&out)
+    return failures
+}
+
+fn script(name: str) -> str {
+    return "#!/bin/sh\n" +
+    "printf '%s\\n' \"$@\" > \"$FAKE_DIR/" + name + ".args\"\n" +
+    "cat \"$FAKE_DIR/" + name + ".out\" 2>/dev/null\n" +
+    "exit $(cat \"$FAKE_DIR/" + name + ".rc\" 2>/dev/null || echo 0)\n"
+}
+
+fn script_service() -> str {
+    return "#!/bin/sh\n" +
+    "[ \"$1\" = \"--stdio\" ] || exit 2\n" +
+    "IFS= read -r line\n" +
+    "printf '%s\\n' \"$line\" > \"$FAKE_DIR/svc.req\"\n" +
+    "cat \"$FAKE_DIR/svc.out\" 2>/dev/null\n"
+}
+
+fn install(dir: str, name: str, body: str) -> bool {
+    let n: usize = fs.write_file_mode(dir + "/bin/" + name, body.p as u64, body.length(), 493, false) catch | e | 0
+    return n > 0
+}
+
+fn run_child(self_path: str, mode: str, dir: str, bin_in_path: bool, display: str, forced: str, desktop: str) -> i32 {
+    var c: process.Command = process.command(self_path)
+    process.add_arg(&c, "--child")
+    process.add_arg(&c, mode)
+    process.clear_env(&c)
+    if bin_in_path {
+        process.set_env(&c, "PATH", dir + "/bin:/usr/bin:/bin")
+    } else {
+        process.set_env(&c, "PATH", dir + "/empty")
+    }
+    process.set_env(&c, "FAKE_DIR", dir)
+    if display.length() > 0 { process.set_env(&c, "DISPLAY", display) }
+    if forced.length() > 0 { process.set_env(&c, "FIRN_DIALOG", forced) }
+    if desktop.length() > 0 { process.set_env(&c, "XDG_CURRENT_DESKTOP", desktop) }
+    if forced == "service" {
+        process.set_env(&c, "FIRN_DIALOG_SERVICE", dir + "/bin/dialogd")
+    }
+    var out: rt.Buf = rt.buf_new()
+    var err: rt.Buf = rt.buf_new()
+    let code: i32 = process.run_capture(&c, &out, &err, 60000) catch | e | terr(e)
+    process.command_free(&c)
+    if rt.buf_len(&out) > 0 {
+        say("    ")
+        syscall(1, 1, rt.buf_ptr(&out) as i64, rt.buf_len(&out) as i64, 0, 0, 0)
+    }
+    rt.buf_free(&out)
+    rt.buf_free(&err)
+    return code
+}
+
+fn scenario(self_path: str, name: str, mode: str, dir: str, installed: bool, display: str, forced: str, desktop: str) {
+    let code: i32 = run_child(self_path, mode, dir, installed, display, forced, desktop)
+    if code != 0 {
+        failures = failures + 1
+        say("  FAIL  scenario ")
+        say(name)
+        say(" (child exit code ")
+        var b: rt.Buf = rt.buf_new()
+        rt.buf_push_dec_u64(&b, code as u64)
+        say(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+        rt.buf_free(&b)
+        say(")\n")
+    }
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) >= 3 && arg(start, 1) == "--child" {
+        return child_main(start)
+    }
+    let self_path: str = arg(start, 0)
+    var td: fsx.TempDir = fsx.temp_dir("firn_2380_") catch | e | fsx.TempDir { path: rt.buf_new(), armed: false }
+    if !td.armed {
+        say("cannot make a temporary directory\n")
+        return 1
+    }
+    let dir: str = __str_copy(fsx.temp_dir_path(&td))
+    fs.mkdir_all(dir + "/bin") catch false
+
+    scenario(self_path, "none", "none", dir, true, "", "", "")
+    scenario(self_path, "off", "off", dir, true, ":77", "none", "")
+    scenario(self_path, "missing", "missing", dir, false, ":77", "zenity", "")
+    // nothing installed, no service: automatic choice finds nothing
+    scenario(self_path, "auto-none", "auto-none", dir, false, ":77", "", "")
+
+    install(dir, "zenity", script("zenity"))
+    install(dir, "kdialog", script("kdialog"))
+    install(dir, "dialogd", script_service())
+    scenario(self_path, "zenity", "zenity", dir, true, ":77", "zenity", "")
+    scenario(self_path, "kdialog", "kdialog", dir, true, ":77", "kdialog", "")
+    scenario(self_path, "service", "service", dir, true, ":77", "service", "")
+    scenario(self_path, "auto-zenity", "auto-zenity", dir, true, ":77", "", "GNOME")
+    scenario(self_path, "auto-kde", "auto-kde", dir, true, ":77", "", "KDE")
+
+    fs.remove(dir + "/bin/zenity") catch false
+    scenario(self_path, "auto-kdialog", "auto-kdialog", dir, true, ":77", "", "")
+    fs.remove(dir + "/bin/kdialog") catch false
+    scenario(self_path, "auto-service", "auto-service", dir, true, ":77", "", "")
+
+    fsx.temp_dir_drop(&td)
+    if failures == 0 {
+        say("ok: std.dialog backend choice, helpers and service protocol\n")
+    }
+    return failures
+}
