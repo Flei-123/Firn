@@ -97,7 +97,7 @@ String-Schlüsseln. Alles geht, ist aber ausführlicher als Python.
 | `gzip.compress` / `zlib.decompress` | `deflate.gzip_compress`, `gzip.gz_decompress`, `inflate_into` | `lib/std/deflate.fi:1738,663`, `lib/compress/gzip.fi:708` | **da** |
 | `struct.pack/unpack` | `bytes.put_u16/u32/u64/f64…`, `get_*` | `lib/std/bytes.fi:340–375` | **da** |
 | `time.sleep/time/perf_counter` | `time.sleep_ms/now_unix_ms/monotonic_ns` | `lib/std/time.fi:103,88,94` | **da** |
-| `xml.etree` | `lib/svg/xml.fi` (Elemente, Attribute, Text, CDATA, Entities, fehlertolerant) und HTML-Tokenizer/DOM | `lib/svg/xml.fi` Kopf; `lib/html/`, `lib/dom/` | **teilweise** — für SVG gebaut, kein Namespace-/Pfad-API (M) |
+| `xml.etree` | `lib/svg/svgxml.fi` (Elemente, Attribute, Text, CDATA, Entities, fehlertolerant) und HTML-Tokenizer/DOM | `lib/svg/xml.fi` Kopf; `lib/html/`, `lib/dom/` | **teilweise** — für SVG gebaut, kein Namespace-/Pfad-API (M) |
 | `html.parser` | `lib/html/tokenizer.fi` (html5lib-geprüft) | `lib/html/tokenizer.fi` | **da** |
 | `socket` TCP-Client/Server | `net.connect_tcp/listen_tcp/accept/read/write/read_full/write_all/connect_tcp_timeout`; Port 0 + `listener_port` | `lib/std/net.fi:443,370,406,533,554,598,610,455,656` | **da** (nur IPv4 `u32`) |
 | `socket.AF_UNIX` | `unix.unix_connect/unix_listen/unix_accept/fd_wait` | `lib/net/unix.fi:105,126,150,179` | **da** |
@@ -207,7 +207,7 @@ Zweites Experiment: `tools/script_port/pngdiff.fi` (57 Z.) = PIL+numpy-Kern von 
 | 6 | **`std.stats` + Pixel-Helfer** (`median`, `percentile`, `mean`, `stddev`; `count_diff`, `count_color`, `upscale`) | S | `webcheck.py` (6× median, 4× numpy), `check_key_profile`, `check_image` |
 | 7 | **Test-Kit**: `assert`/`expect_eq(a,b,msg)` mit Position; `#[test]` ohne `syscall(60,…)` | S | Test-Rahmen ohne Vergleichs-Hilfen; jedes Skript baut sein `check()` selbst (103×) |
 | 8 | **WebSocket-Client gegen Chromium-DevTools prüfen** (`suppress_origin`, Fragmente, IPv4-localhost) + HTTP-Cookie-Jar | S (Prüfen) / M (Cookies) | `webcheck.py`, `openplc_upload.py` |
-| 9 | **Generischer XML-Baum** (Namespaces, Attribut-Suche, einfache Pfade) auf Basis `lib/svg/xml.fi` | M | xml.etree 3 Dateien |
+| 9 | **Generischer XML-Baum** (Namespaces, Attribut-Suche, einfache Pfade) auf Basis `lib/svg/svgxml.fi` | M | xml.etree 3 Dateien |
 | 10 | **Regex-Lookaround**: nur die zwei Muster umschreiben (kein Engine-Umbau, RE2-Garantie bleibt) | S | 85 `re`-Aufrufe, 2 Muster mit Lookaround |
 | 11 | JSON-Schema (Draft 2020-12) | **L** | 4 Dateien — besser in Python lassen |
 | 12 | XSD (lxml), PDF-Leser (pypdf), YAML, Zwischenablage (tkinter → `xclip` per Prozess) | L / extern | je 1 Datei, alle **optional** |
