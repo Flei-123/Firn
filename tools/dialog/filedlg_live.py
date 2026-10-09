@@ -159,7 +159,7 @@ def geometry(win):
     return int(wh[0]), int(wh[1]), int(pos[0]), int(pos[1])
 
 
-def screenshot(name=None):
+def screenshot(name=None, crop=(0, 0, 780, 520)):
     x = os.path.join(td, "s.xwd")
     p = os.path.join(td, "s.png")
     subprocess.run(["xwd", "-root", "-display", DISP, "-out", x], check=True, env=ENV)
@@ -167,7 +167,7 @@ def screenshot(name=None):
     im = Image.open(p).convert("RGB")
     if name and PNGDIR:
         os.makedirs(PNGDIR, exist_ok=True)
-        im.crop((0, 0, 780, 520)).save(os.path.join(PNGDIR, name))
+        im.crop(crop).save(os.path.join(PNGDIR, name))
     return im
 
 
@@ -316,7 +316,7 @@ if r:
     # the filter menu: a context menu with one radio entry per filter (a window of its own, below the button)
     r.click(L.w - PAD - 100, L.name_y)
     time.sleep(0.5)
-    full = screenshot("filedlg-live-filtermenu.png")
+    full = screenshot("filedlg-live-filtermenu.png", crop=(0, 0, 780, 580))
     below = px(full, 600, L.h + 12)
     check("the filter button opens a menu (a window of its own, it reaches below the dialog)", below != (0, 0, 0), below)
     r.key("Escape")
