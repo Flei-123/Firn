@@ -173,12 +173,15 @@ def simulate(block, start, yaw, ticks):
 
 
 # ---------------------------------------------------------------- picking (slab test, brute force)
-def pick(block, o, d, reach):
+def pick(block, o, d, reach, is_pick=None):
+    """is_pick: optional predicate on a block id (default: ids 1 and 2, the test worlds)"""
     ln = math.sqrt((d[0] * d[0] + d[1] * d[1]) + d[2] * d[2])
     d = [d[0] / ln, d[1] / ln, d[2] / ln]
 
     def pickable(x, y, z):
         b = block(x, y, z)
+        if is_pick is not None:
+            return b is not None and b >= 0 and is_pick(b)
         return b is not None and b in (1, 2)
 
     cell = [math.floor(o[i]) for i in range(3)]

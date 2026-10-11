@@ -27,6 +27,18 @@ spec = importlib.util.spec_from_file_location("raster_ref", os.path.join(HERE, "
 raster_ref = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(raster_ref)
 
+def load_ref(name, rel):
+    sp = importlib.util.spec_from_file_location(name, os.path.join(HERE, "..", rel))
+    m = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(m)
+    return m
+
+
+sky_ref = load_ref("sky_ref", "sky/ref.py")
+hud_ref = load_ref("hud_ref", "hud/ref.py")
+input_ref = load_ref("input_ref", "input/ref.py")
+
+PF_SKY, PF_BOX, PF_HUD = 1, 2, 4
 UNKNOWN = 65535
 NEIGH = [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)]   # (dx, dy, dz) per face
 
@@ -59,6 +71,13 @@ def read_view(path):
         elif k == "cam":
             x = [f64(a) for a in t[1:]]
             v["cam"] = dict(pos=x[0:3], right=x[3:6], up=x[6:9], fwd=x[9:12], near=x[12], tan_x=x[13], tan_y=x[14])
+        elif k == "post":
+            v["post"] = dict(flags=int(t[1]), ticks=int(t[2]), rain=int(t[3]), reach=int(t[4]), slot=int(t[5]), box=int(t[6], 16))
+        elif k == "pick":
+            v["pick"] = [int(a) for a in t[1:9]]          # has x y z nx ny nz id
+        elif k == "dbg":
+            v["dbg_fps"] = int(t[1])
+            v["cam_yaw"], v["cam_pitch"] = f64(t[5]), f64(t[6])
         elif k == "hash":
             v["hash"] = t[1]
         elif k == "T":
@@ -211,7 +230,19 @@ def main():
     atlas = dict(tile=16, cols=16, w=256, data=open(os.path.join(d, "atlas.bin"), "rb").read())
     sc = dict(name="view", w=view["w"], h=view["h"], cull=True, fog=view["fog"], fs=view["fs"], fe=view["fe"],
               clear=view["clear"], cam=cam)
+    post = view.get("post", dict(flags=0))
+    pf = post["flags"]
+    W, H = view["w"], view["h"]
+    if pf & PF_SKY:
+        # sky pass: own state + per pixel render of sky/ref.py; the fog colour is the horizon colour (mc_sky contract)
+        sky_st = sky_ref.state(post["ticks"], post["rain"])
+        if view["fog"]:
+            sc["fogc"] = tuple(sky_st["hor"])
     scene = raster_ref.Scene(sc, atlas)
+    if pf & PF_SKY:
+        sky_cam = (cam["right"] + cam["up"] + cam["fwd"] + [cam["tan_x"], cam["tan_y"]])
+        sky_img = sky_ref.render(W, H, sky_cam, sky_st, False)
+        scene.color = list(struct.unpack("<%dI" % (W * H), sky_img))
     ccx, ccz = math.floor(cam["pos"][0]) // 16, math.floor(cam["pos"][2]) // 16
     fwd = cam["fwd"]
     order = []
@@ -245,12 +276,65 @@ def main():
         nq += len(quads)
         ntri += len(idx) // 3
         scene.draw_mesh(dict(o=[cx * 16, min_y + sy * 16, cz * 16], verts=verts, idx=idx))
+    problems = 0
+    if pf & PF_SKY:                                                  # light tint of the world pixels (depth entry)
+        tr, tg, tb = sky_st["tint"]
+        col, dep = scene.color, scene.depth
+        for i in range(W * H):
+            if dep[i] > 0.0:
+                c = col[i]
+                col[i] = (((c & 255) * tr) // 256) | ((((c >> 8) & 255) * tg) // 256) << 8 | ((((c >> 16) & 255) * tb) // 256) << 16 | 0xFF000000
+    hit = None
+    if pf & (PF_BOX | PF_HUD):                                       # own pick (brute force slab test, tools/mc/input/ref.py)
+        pickable = set(sid for sid, (o, t) in view["tables"].items() if sum(t) != 0)
+
+        def block(x, y, z):
+            col = cols.get((x // 16, z // 16))
+            if col is None:
+                return None
+            row = y - min_y
+            if row < 0 or row >= col.shape[0]:
+                return -2
+            return int(col[row, z % 16, x % 16])
+        hit = input_ref.pick(block, cam["pos"], cam["fwd"], float(post["reach"]), lambda b: b in pickable)
+        fp = view["pick"]
+        if hit is None:
+            mine = [0, 0, 0, 0, 0, 0, 0, 0]
+        else:
+            mine = [1] + list(hit[0]) + list(hit[1]) + [block(*hit[0])]
+        if hit is None and fp[0] == 0:
+            pass
+        elif mine != fp:
+            print("  DIFF  pick: python %s, firn %s" % (mine, fp))
+            problems += 1
+        else:
+            print("  ok    pick: block %s face %s id %d (python slab test == Firn DDA)" % (tuple(fp[1:4]), tuple(fp[4:7]), fp[7]))
+    if (pf & PF_BOX) and hit is not None:
+        fb = bytearray(scene.rgba())
+        bc = post["box"]
+        input_ref.draw_box(fb, W, H, scene.depth, (cam["pos"], cam["right"], cam["up"], cam["fwd"], cam["near"], cam["tan_x"], cam["tan_y"]),
+                           hit[0], bytes((bc & 255, (bc >> 8) & 255, (bc >> 16) & 255, (bc >> 24) & 255)))
+        scene.color = list(struct.unpack("<%dI" % (W * H), bytes(fb)))
     img = scene.rgba()
+    if pf & PF_HUD:                                                  # HUD last (tools/mc/hud/ref.py Img on the frame)
+        im = hud_ref.Img.__new__(hud_ref.Img)
+        im.w, im.h = W, H
+        im.px = [[(c & 255, (c >> 8) & 255, (c >> 16) & 255) for c in scene.color[y * W:(y + 1) * W]] for y in range(H)]
+        s_ = hud_ref.scale_for(W, H)
+        im.crosshair(s_)
+        im.hotbar(s_, post["slot"])
+        if hit is None:
+            blk = (False, 0, 0, 0, 0, 0, 0, 0)
+        else:
+            blk = (True,) + tuple(hit[0]) + (block(*hit[0]),) + tuple(hit[1])
+        dbg = (view["dbg_fps"], cam["pos"][0], cam["pos"][1], cam["pos"][2], view["cam_yaw"], view["cam_pitch"]) + blk
+        im.debug(s_, dbg)
+        img = im.bytes()
     hx = hashlib.sha256(img).hexdigest()
     open(os.path.join(d, "ref.rgba"), "wb").write(img)
     fb = open(os.path.join(d, "view.rgba"), "rb").read()
     diff = sum(1 for i in range(0, len(fb), 4) if fb[i:i + 4] != img[i:i + 4]) if len(fb) == len(img) else -1
-    painted = sum(1 for c in scene.color if c != view["clear"])
+    painted = sum(1 for d_ in scene.depth if d_ > 0.0)
     same_hash = hx == view["hash"]
     print("  %s python reference: %d sections meshed, %d quads, %d triangles, %d painted pixels, differing pixels %d" % (
         "ok  " if diff == 0 and same_hash else "DIFF", len(order), nq, ntri, painted, diff))
@@ -258,7 +342,7 @@ def main():
     if painted < view["w"] * view["h"] // 20:
         print("  DIFF  the image is nearly empty (%d painted pixels): the comparison would prove nothing" % painted)
         return 1
-    return 0 if (diff == 0 and same_hash) else 1
+    return 0 if (diff == 0 and same_hash and problems == 0) else 1
 
 
 if __name__ == "__main__":

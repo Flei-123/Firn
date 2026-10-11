@@ -1,0 +1,140 @@
+// expect_exit: 0
+// tests/2763_mc_render_grow.fi -- mc_render_world with > 1000 cached sections: the cache grows INSIDE the first frame (regression:
+// stale slots after grow()), so frame 1 must equal frame 2, a budgeted run must converge to the same image, and unloading a
+// column (wr_drop_chunk) must give exactly the image of a fresh renderer on the reduced world.
+import std.rt
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_render_world
+
+const COLS: i32 = 24
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+fn same64(a: u64, b: u64) -> bool {
+    var i: usize = 0
+    while i < 64 {
+        if rt.ld8(a, i) != rt.ld8(b, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn draw(wr: *mut mc_render_world.WorldRender, w: *mut mc_world.World, r: *mut mc_raster.Raster, cam: *mut mc_camera.Camera, budget: i32, out: u64) {
+    mc_raster.backend_begin(r, cam, 0xFF000000 as u32)
+    mc_render_world.wr_render(wr, w, r, cam, budget)
+    mc_raster.raster_hash_hex(r, out)
+}
+
+fn main() -> i32 {
+    var a: mc_texture.Atlas = mc_texture.atlas_default()
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: rt.heap_alloc(32768), tiles: rt.heap_alloc(32768 * 6 * 2) }
+    var i: usize = 0
+    while i < 32768 {
+        rt.st8(tb.opaque, i, 0 as u8)
+        i = i + 1
+    }
+    i = 0
+    while i < 32768 * 6 {
+        rt.st16(tb.tiles, i, 0 as u16)
+        i = i + 1
+    }
+    i = 0
+    while i < 6 {
+        rt.st16(tb.tiles, 6 + i, (1 + i) as u16)
+        i = i + 1
+    }
+    rt.st8(tb.opaque, 1, 1 as u8)
+    // 24 x 24 columns of 2 sections = 1152 sections; floor of 4 layers plus a pillar whose height depends on the column
+    var w: mc_world.World = mc_world.world_new()
+    let ids: u64 = rt.heap_alloc(2 * 4096 * 2)
+    var cx: i32 = 0
+    while cx < COLS {
+        var cz: i32 = 0
+        while cz < COLS {
+            i = 0
+            while i < 8192 {
+                rt.st16(ids, i, 0 as u16)
+                i = i + 1
+            }
+            i = 0
+            while i < 4 * 256 {
+                rt.st16(ids, i, 1 as u16)
+                i = i + 1
+            }
+            var y: usize = 4
+            while y < 4 + ((cx * 7 + cz * 3) % 12) as usize {
+                rt.st16(ids, (y * 16 + 8) * 16 + 8, 1 as u16)
+                y = y + 1
+            }
+            check(mc_world.world_put(&w, mc_render_world.wr_make_chunk(cx, cz, 2, ids)), 1)
+            cz = cz + 1
+        }
+        cx = cx + 1
+    }
+    var cam: mc_camera.Camera = mc_camera.camera_new(160, 90)
+    mc_camera.camera_set_pos(&cam, 192.0, 0.0 - 64.0 + 200.0, 192.0)
+    mc_camera.camera_set_angles(&cam, 0.0, 90.0)
+    mc_camera.camera_set_lens(&cam, 120.0, 0.05, 900.0)
+    mc_camera.camera_update(&cam)
+    var r: mc_raster.Raster = mc_raster.raster_new(160, 90)
+    mc_raster.backend_upload_atlas(&r, &a)
+    let h1: u64 = rt.heap_alloc(64)
+    let h2: u64 = rt.heap_alloc(64)
+    let h3: u64 = rt.heap_alloc(64)
+
+    // frame 1 meshes (and grows the cache several times inside the frame), frame 2 only draws
+    var wr: mc_render_world.WorldRender = mc_render_world.wr_new(0 - 64, 20, &tb)
+    draw(&wr, &w, &r, &cam, 0 - 1, h1)
+    check(mc_render_world.wr_cached(&wr) > 1000, 2)
+    check(wr.st.meshed > 1000 as u32, 3)
+    check(r.st.pixels > 1500 as u64, 4)
+    draw(&wr, &w, &r, &cam, 0 - 1, h2)
+    check(wr.st.meshed == 0 as u32, 5)
+    check(same64(h1, h2), 6)
+
+    // a second renderer with a mesh budget (the cache grows across frames) converges to the same image
+    var bud: mc_render_world.WorldRender = mc_render_world.wr_new(0 - 64, 20, &tb)
+    var n: i32 = 0
+    while n < 40 {
+        draw(&bud, &w, &r, &cam, 37, h3)
+        n = n + 1
+    }
+    check(bud.st.deferred == 0 as u32 && mc_render_world.wr_cached(&bud) == mc_render_world.wr_cached(&wr), 7)
+    check(same64(h1, h3), 8)
+
+    // unload: drop the cache entries of column (5, 5), remove it from the world; image == fresh renderer on the reduced world
+    check(mc_render_world.wr_drop_chunk(&wr, &r, 5, 5) == 2, 9)
+    check(mc_render_world.wr_cached(&wr) == 1150, 10)
+    check(mc_render_world.wr_drop_chunk(&wr, &r, 5, 5) == 0, 11)
+    check(mc_world.world_remove(&w, 5, 5), 12)
+    draw(&wr, &w, &r, &cam, 0 - 1, h2)
+    check(!same64(h1, h2), 13)
+    check(wr.st.meshed >= 2 as u32 && wr.st.meshed <= 18 as u32, 14)
+    var fresh: mc_render_world.WorldRender = mc_render_world.wr_new(0 - 64, 20, &tb)
+    draw(&fresh, &w, &r, &cam, 0 - 1, h3)
+    check(same64(h2, h3), 15)
+    // unloading everything leaves an empty cache
+    cx = 0
+    while cx < COLS {
+        var cz: i32 = 0
+        while cz < COLS {
+            mc_render_world.wr_drop_chunk(&wr, &r, cx, cz)
+            cz = cz + 1
+        }
+        cx = cx + 1
+    }
+    check(mc_render_world.wr_cached(&wr) == 0, 16)
+    mc_render_world.wr_free(&wr, &r)
+    mc_render_world.wr_free(&bud, &r)
+    mc_render_world.wr_free(&fresh, &r)
+    return 0
+}

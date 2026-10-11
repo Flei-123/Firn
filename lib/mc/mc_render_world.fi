@@ -23,7 +23,7 @@ import mc.mc_raster
 
 export {
     WorldRender, RenderStats, wr_set_flags, wr_new, wr_free, wr_clear, wr_mark_block, wr_mark_chunk, wr_render,
-    wr_cached, wr_make_chunk,
+    wr_cached, wr_make_chunk, wr_drop_chunk,
 }
 
 const EW: usize = 4 // words per cache entry: key, handle, state, quads
@@ -204,6 +204,56 @@ fn wr_mark_chunk(wr: *mut WorldRender, cx: i32, cz: i32) {
         }
         i = i + 1
     }
+}
+
+// A chunk column was unloaded (the caller removes it from the world with mc_world.world_remove): frees the backend meshes
+// of its sections (`r`, 0 = skip), deletes the cache entries (table rebuilt, no tombstones) and dirties the 3x3 neighbourhood.
+// Returns the number of cache entries removed.
+fn wr_drop_chunk(wr: *mut WorldRender, r: *mut mc_raster.Raster, cx: i32, cz: i32) -> usize {
+    if (*wr).cap == 0 { return 0 }
+    var removed: usize = 0
+    var i: usize = 0
+    while i < (*wr).cap {
+        if rt.ld64((*wr).cache, i * EW + 2) != ST_EMPTY {
+            let key: u64 = rt.ld64((*wr).cache, i * EW)
+            let kx: i32 = ((key & 2097151 as u64) as i32) - 1048576
+            let kz: i32 = (((key >> 21 as u64) & 2097151 as u64) as i32) - 1048576
+            if kx == cx && kz == cz {
+                let h: usize = rt.ld64((*wr).cache, i * EW + 1) as usize
+                if h != 0 && r as u64 != 0 { mc_raster.backend_mesh_free(r, h) }
+                rt.st64((*wr).cache, i * EW + 2, ST_EMPTY)
+                removed = removed + 1
+            }
+        }
+        i = i + 1
+    }
+    if removed == 0 { return 0 }
+    // rebuild: reinsert the survivors into a fresh table of the same size (open addressing has no cheap delete)
+    let oc: u64 = (*wr).cache
+    let ocap: usize = (*wr).cap
+    let nc: u64 = rt.heap_alloc(ocap * EW * 8)
+    i = 0
+    while i < ocap * EW {
+        rt.st64(nc, i, 0 as u64)
+        i = i + 1
+    }
+    (*wr).cache = nc
+    i = 0
+    while i < ocap {
+        if rt.ld64(oc, i * EW + 2) != ST_EMPTY {
+            let s: usize = probe(wr, rt.ld64(oc, i * EW))
+            var k: usize = 0
+            while k < EW {
+                rt.st64(nc, s * EW + k, rt.ld64(oc, i * EW + k))
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    rt.heap_free(oc, ocap * EW * 8)
+    (*wr).n = (*wr).n - removed
+    wr_mark_chunk(wr, cx, cz)
+    return removed
 }
 
 // ---- meshing --------------------------------------------------------------------------------
