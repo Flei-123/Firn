@@ -1,0 +1,392 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/mc/encode/check.fi -- conformance check of the schema driven WRITER (lib/mc/mc_encode.fi)
+// against fixtures made by the REFERENCE serializer (tools/mcgen/gen_fixtures.cjs).
+//
+// usage: check <fixture-dir> <protocol>
+//
+// Per fixture (every packet, every state, BOTH directions; the serverbound ones are the ones
+// a client sends, the clientbound ones stress the writer harder):
+//   1. values := mc_schema.walk_values(body)          (the lossless decoder)
+//   2. encode(schema, values) must reproduce `body` BYTE FOR BYTE;
+//   3. the same values with the lines in REVERSE order (cursor misses, search fallback);
+//   4. the same values without the `=#N` count lines (the elements are counted instead; only
+//      reported, an array of elements that leave no line cannot be counted that way);
+//   5. damaged stores (a line dropped, a value garbled) must never crash or hang, and when
+//      they are accepted the result must still follow the schema (encode checks that).
+// Output: `check key=value` lines, `FAIL ...` lines, exit 1 on any violation.
+
+import std.rt
+import std.bytes
+import std.time
+import mc.mc_schema
+import mc.mc_encode
+import mc.mc_version
+import mc.mc_versions
+
+struct Stats {
+    fixtures: u64,
+    c2s: u64,
+    pass: u64,
+    pass_c2s: u64,
+    fail: u64,
+    values_fail: u64,
+    rev_pass: u64,
+    rev_fail: u64,
+    nocount_pass: u64,
+    nocount_fail: u64,
+    damaged: u64,
+    damaged_accepted: u64,
+    rng: u64,
+    shown: u64,
+}
+
+fn rnd(s: *mut Stats) -> u64 {
+    var x: u64 = (*s).rng
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    (*s).rng = x
+    return x
+}
+
+fn say(b: *mut rt.Buf) {
+    rt.write_everything(1, rt.buf_ptr(b), rt.buf_len(b))
+    rt.buf_clear(b)
+}
+
+fn push_text(b: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(b, p, n)
+}
+
+fn kv(b: *mut rt.Buf, key: str, v: u64) {
+    rt.buf_push_bytes(b, key.p as u64, key.n)
+    rt.buf_push(b, 61)
+    rt.buf_push_dec_u64(b, v)
+    rt.buf_push(b, 10)
+}
+
+fn token(p: u64, n: usize, at: *mut usize, st: *mut usize) -> usize {
+    var i: usize = *at
+    while i < n && rt.ld8(p, i) == 32 {
+        i = i + 1
+    }
+    *st = i
+    while i < n && rt.ld8(p, i) != 32 && rt.ld8(p, i) != 10 {
+        i = i + 1
+    }
+    *at = i
+    return i - *st
+}
+
+fn dec(p: u64, st: usize, n: usize) -> i32 {
+    var v: i32 = 0
+    var i: usize = 0
+    while i < n {
+        v = v * 10 + (rt.ld8(p, st + i) as i32 - 48)
+        i = i + 1
+    }
+    return v
+}
+
+// a FAIL line: `msg name detail err`
+fn fail_line(s: *mut Stats, msg: str, name: u64, nlen: usize, detail: u64, err: *mut rt.Buf) {
+    (*s).fail = (*s).fail + 1
+    if (*s).shown >= 40 {
+        return
+    }
+    (*s).shown = (*s).shown + 1
+    var o: rt.Buf = rt.buf_new()
+    push_text(&o, msg.p as u64, msg.n)
+    rt.buf_push(&o, 32)
+    push_text(&o, name, nlen)
+    rt.buf_push(&o, 32)
+    rt.buf_push_dec_u64(&o, detail)
+    if rt.buf_len(err) > 0 {
+        rt.buf_push(&o, 32)
+        rt.buf_push_bytes(&o, rt.buf_ptr(err), rt.buf_len(err))
+    }
+    rt.buf_push(&o, 10)
+    say(&o)
+    rt.buf_free(&o)
+}
+
+// index of the first differing octet, the shorter length when one is a prefix of the other,
+// u64 max when equal
+fn first_diff(a: u64, an: usize, b: u64, bn: usize) -> u64 {
+    var i: usize = 0
+    while i < an && i < bn {
+        if rt.ld8(a, i) != rt.ld8(b, i) {
+            return i as u64
+        }
+        i = i + 1
+    }
+    if an == bn {
+        return 18446744073709551615
+    }
+    if an < bn {
+        return an as u64
+    }
+    return bn as u64
+}
+
+// encodes the store, true when the result equals the body
+fn roundtrip(sch: u64, vp: u64, vn: usize, bp: u64, bn: usize, err: *mut rt.Buf, diff: *mut u64) -> bool {
+    var out: bytes.Bytes = bytes.bytes_new()
+    rt.buf_clear(err)
+    let ok: bool = mc_encode.encode(sch, vp, vn, &out, err)
+    var same: bool = false
+    *diff = 0
+    if ok {
+        *diff = first_diff(bytes.bytes_data(&out), bytes.bytes_len(&out), bp, bn)
+        same = *diff == 18446744073709551615
+    }
+    bytes.bytes_free(&out)
+    return ok && same
+}
+
+// the store with its lines in reverse order
+fn reversed(src: u64, n: usize, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    var end: usize = n
+    while end > 0 {
+        // the line [start, end) ends with '\n' at end-1
+        var start: usize = end - 1
+        while start > 0 && rt.ld8(src, start - 1) != 10 {
+            start = start - 1
+        }
+        rt.buf_push_bytes(out, src + start as u64, end - start)
+        end = start
+    }
+}
+
+// the store without the `=#N` lines
+fn without_counts(src: u64, n: usize, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    var ls: usize = 0
+    while ls < n {
+        var le: usize = ls
+        while le < n && rt.ld8(src, le) != 10 {
+            le = le + 1
+        }
+        var eq: usize = ls
+        while eq < le && rt.ld8(src, eq) != 61 {
+            eq = eq + 1
+        }
+        var is_count: bool = false
+        if eq + 1 < le && rt.ld8(src, eq + 1) == 35 {
+            is_count = true
+        }
+        if !is_count {
+            rt.buf_push_bytes(out, src + ls as u64, le + 1 - ls)
+        }
+        ls = le + 1
+    }
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        return 2
+    }
+    let dir: u64 = rt.arg_ptr(start, 1)
+    let dirlen: usize = rt.c_length(dir)
+    var proto: i32 = 763
+    if rt.arg_count(start) >= 3 {
+        let pa: u64 = rt.arg_ptr(start, 2)
+        proto = dec(pa, 0, rt.c_length(pa))
+    }
+    var ver: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(proto, &ver) {
+        return 4
+    }
+    var mpath: rt.Buf = rt.buf_new()
+    push_text(&mpath, dir, dirlen)
+    push_text(&mpath, "/manifest.txt\0".p as u64, 14)
+    var man: rt.Buf = rt.buf_new()
+    if !rt.read_file(rt.buf_ptr(&mpath), &man) {
+        return 3
+    }
+    let mp: u64 = rt.buf_ptr(&man)
+    let mn: usize = rt.buf_len(&man)
+
+    var st: Stats = Stats {
+        fixtures: 0, c2s: 0, pass: 0, pass_c2s: 0, fail: 0, values_fail: 0,
+        rev_pass: 0, rev_fail: 0, nocount_pass: 0, nocount_fail: 0,
+        damaged: 0, damaged_accepted: 0, rng: 88172645463325252, shown: 0,
+    }
+    var err: rt.Buf = rt.buf_new()
+    var rev: rt.Buf = rt.buf_new()
+    var nocnt: rt.Buf = rt.buf_new()
+    var dmg: rt.Buf = rt.buf_new()
+    var work: bytes.Bytes = bytes.bytes_new()
+    var value_lines: u64 = 0
+    var value_bytes: u64 = 0
+    var body_bytes: u64 = 0
+    var enc_ns: u64 = 0
+    var line_at: usize = 0
+    while line_at < mn {
+        var at: usize = line_at
+        var s0: usize = 0
+        let n0: usize = token(mp, mn, &at, &s0)
+        if n0 == 0 {
+            line_at = line_at + 1
+            continue
+        }
+        let state: i32 = dec(mp, s0, n0)
+        var s1: usize = 0
+        let n1: usize = token(mp, mn, &at, &s1)
+        let d: i32 = dec(mp, s1, n1)
+        var s2: usize = 0
+        let n2: usize = token(mp, mn, &at, &s2)
+        let id: i32 = dec(mp, s2, n2)
+        var s3: usize = 0
+        let n3: usize = token(mp, mn, &at, &s3)
+        var s4: usize = 0
+        let n4: usize = token(mp, mn, &at, &s4)
+        while at < mn && rt.ld8(mp, at) != 10 {
+            at = at + 1
+        }
+        line_at = at + 1
+
+        st.fixtures = st.fixtures + 1
+        if d == 0 {
+            st.c2s = st.c2s + 1
+        }
+        var fpath: rt.Buf = rt.buf_new()
+        push_text(&fpath, dir, dirlen)
+        rt.buf_push(&fpath, 47)
+        push_text(&fpath, mp + s4 as u64, n4)
+        rt.buf_push(&fpath, 0)
+        var body: rt.Buf = rt.buf_new()
+        if !rt.read_file(rt.buf_ptr(&fpath), &body) {
+            fail_line(&st, "FAIL read", mp + s3 as u64, n3, 0, &err)
+            rt.buf_free(&fpath)
+            rt.buf_free(&body)
+            continue
+        }
+        rt.buf_free(&fpath)
+        let bp: u64 = rt.buf_ptr(&body)
+        let bn: usize = rt.buf_len(&body)
+        let sch: u64 = ver.schema_of(state, d, id)
+
+        // 1. values
+        bytes.bytes_clear(&work)
+        if bn > 0 {
+            bytes.put_raw(&work, bp, bn)
+        }
+        bytes.bytes_set_pos(&work, 0)
+        var vals: rt.Buf = rt.buf_new()
+        if !mc_schema.walk_values(sch, &work, &vals) {
+            st.values_fail = st.values_fail + 1
+            fail_line(&st, "FAIL walk_values", mp + s3 as u64, n3, bn as u64, &err)
+            rt.buf_free(&vals)
+            rt.buf_free(&body)
+            continue
+        }
+        let vp: u64 = rt.buf_ptr(&vals)
+        let vn: usize = rt.buf_len(&vals)
+        value_bytes = value_bytes + vn as u64
+        body_bytes = body_bytes + bn as u64
+        var k: usize = 0
+        while k < vn {
+            if rt.ld8(vp, k) == 10 {
+                value_lines = value_lines + 1
+            }
+            k = k + 1
+        }
+
+        // 2. encode == body
+        var diff: u64 = 0
+        let t0: u64 = time.monotonic_ns()
+        let same: bool = roundtrip(sch, vp, vn, bp, bn, &err, &diff)
+        enc_ns = enc_ns + (time.monotonic_ns() - t0)
+        if same {
+            st.pass = st.pass + 1
+            if d == 0 {
+                st.pass_c2s = st.pass_c2s + 1
+            }
+        } else {
+            fail_line(&st, "FAIL encode", mp + s3 as u64, n3, diff, &err)
+        }
+
+        // 3. reversed order
+        reversed(vp, vn, &rev)
+        if roundtrip(sch, rt.buf_ptr(&rev), rt.buf_len(&rev), bp, bn, &err, &diff) {
+            st.rev_pass = st.rev_pass + 1
+        } else {
+            st.rev_fail = st.rev_fail + 1
+            if st.rev_fail <= 3 {
+                fail_line(&st, "note reversed", mp + s3 as u64, n3, diff, &err)
+                st.fail = st.fail - 1
+            }
+        }
+
+        // 4. without count lines
+        without_counts(vp, vn, &nocnt)
+        if roundtrip(sch, rt.buf_ptr(&nocnt), rt.buf_len(&nocnt), bp, bn, &err, &diff) {
+            st.nocount_pass = st.nocount_pass + 1
+        } else {
+            st.nocount_fail = st.nocount_fail + 1
+        }
+
+        // 5. damaged stores: drop one line / garble one octet
+        var round: u64 = 0
+        while round < 6 && vn > 0 {
+            rt.buf_clear(&dmg)
+            rt.buf_push_bytes(&dmg, vp, vn)
+            let pos: usize = (rnd(&st) % (vn as u64)) as usize
+            if (round & 1) == 0 {
+                var ls: usize = pos
+                while ls > 0 && rt.ld8(vp, ls - 1) != 10 {
+                    ls = ls - 1
+                }
+                var le: usize = pos
+                while le < vn && rt.ld8(vp, le) != 10 {
+                    le = le + 1
+                }
+                rt.buf_clear(&dmg)
+                rt.buf_push_bytes(&dmg, vp, ls)
+                if le + 1 < vn {
+                    rt.buf_push_bytes(&dmg, vp + (le + 1) as u64, vn - le - 1)
+                }
+            } else {
+                rt.st8(rt.buf_ptr(&dmg), pos, (rnd(&st) & 255) as u8)
+            }
+            var out: bytes.Bytes = bytes.bytes_new()
+            rt.buf_clear(&err)
+            let ok: bool = mc_encode.encode(sch, rt.buf_ptr(&dmg), rt.buf_len(&dmg), &out, &err)
+            st.damaged = st.damaged + 1
+            if ok {
+                st.damaged_accepted = st.damaged_accepted + 1
+            }
+            bytes.bytes_free(&out)
+            round = round + 1
+        }
+        rt.buf_free(&vals)
+        rt.buf_free(&body)
+    }
+
+    var o: rt.Buf = rt.buf_new()
+    kv(&o, "check fixtures", st.fixtures)
+    kv(&o, "check fixtures_c2s", st.c2s)
+    kv(&o, "check pass_exact", st.pass)
+    kv(&o, "check pass_c2s", st.pass_c2s)
+    kv(&o, "check walk_values_fail", st.values_fail)
+    kv(&o, "check reversed_pass", st.rev_pass)
+    kv(&o, "check reversed_fail", st.rev_fail)
+    kv(&o, "check nocount_pass", st.nocount_pass)
+    kv(&o, "check nocount_fail", st.nocount_fail)
+    kv(&o, "check damaged", st.damaged)
+    kv(&o, "check damaged_accepted", st.damaged_accepted)
+    kv(&o, "metric value_bytes", value_bytes)
+    kv(&o, "metric body_bytes", body_bytes)
+    kv(&o, "metric value_lines", value_lines)
+    if enc_ns > 0 {
+        kv(&o, "metric encode_kpackets_per_s", (st.fixtures * 1000000) / enc_ns)
+    }
+    say(&o)
+    rt.buf_free(&o)
+    if st.fail > 0 {
+        return 1
+    }
+    return 0
+}

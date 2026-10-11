@@ -172,17 +172,26 @@ The real gaps for a join (honest list):
 * Not proven: any join with a version other than 1.20.1; any chunk format other than
   `CF_CONTAINERS_118`.
 
-## 7. Schema-driven client packet writer (design, NOT built yet, roadmap r16)
+## 7. Schema-driven packet writer (`lib/mc/mc_encode.fi`, roadmap r16: DONE)
 
-Goal: `mc_schema.encode(schema, values, out)` builds serverbound bodies from the same generated
-programs, so no per-version hand written writer is needed. Design decided in this round:
-* Values are a flat text store `path=value` (the walker's dump paths: `a.b[2].c`), tokens: decimal,
-  `true/false`, `0x..` raw bits (floats), `"..."` strings, `hex:..` buffers/NBT/lpVec3, `uuid:..`;
-  prefix counts as `path#=N`, options as `path?=0|1`; holder id form `path.<baseName>=N`.
-* The encoder interprets the same bytecode (registers for switch keys and CK_REG counts, TOPBIT bit 7
-  patched afterwards, RCALL register save) and finishes with `mc_schema.walk` on its own output.
-* Test: `gen_fixtures.cjs` writes a flattened `<n>.pv` next to each reference body; Firn must
-  reproduce every `.bin` byte for byte, in all versions (then hand writers become fallbacks).
+`mc_encode.encode(schema, values, len, out, err)` builds a packet body from the same generated programs the
+walker reads, for every version in `versions.json` (no hand written per-version writer). Value model
+(full description at the top of `mc_encode.fi`): a text store of `path=value` lines in the walker's dump paths
+(`a.b[2].c`); integers decimal/hex (range checked), bool, floats as raw bits `0x..`, `uuid:..`, strings `"..."`
+(`\xHH` escapes), buffers / NBT / lpVec3 as `hex:..`, array counts `path=#N` (optional, else counted), options
+`path?=0|1` (else present iff some line starts with the path), holders `path.<idName>=N` or the inline value under
+`path.<inlineName>`, holder sets `path.<tag>` or `path.<list>=#N` + `[i]`. The encoder takes the lines in order
+(cursor) and searches the store when the cursor misses, so hand written stores may be unordered; unused lines
+are ignored (one store can serve several versions, e.g. Client Information). The result is checked with
+`mc_schema.walk` before it is returned. `mc_schema.walk_values` is the lossless decoder (same format).
+* Test: `bash tools/mc/encode/run.sh` -- per version every fixture of `gen_fixtures.cjs` (both directions):
+  decode -> encode must give the reference bytes, also with the store reversed, plus damaged stores
+  (never crash). Known answers and refusals: `tests/2651_mc_encode_basic.fi`.
+* Client: `mc_client.client_send_values(c, state, sem, &store)` (sem -> wire id and schema per version).
+  Teleport Confirm, Position+Look, Chunk Batch Received and Client Information use it; the hand built bodies
+  stay as fallback.
+* Limits: topBitSetTerminatedArray patches bit 7 of the first octet of an element (an i8 in all versions);
+  unlisted bits of a bitflags field are written as 0.
 
 ## 8. Round 2026-10-11 (worker voxel-client-1-12-2-chunks-join-1-20)
 

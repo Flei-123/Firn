@@ -1,0 +1,1488 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_encode.fi -- the schema driven WRITER: values -> packet body.
+//
+// The generated schema programs (lib/mc/vNNN/mc_proto_vNNN.fi) describe the layout of every
+// packet body. lib/mc/mc_schema.fi interprets them over a received buffer (the walker); this
+// file interprets the SAME bytecode in the other direction: it reads field values from a
+// VALUE STORE and appends the octets. No per-version hand written writer is needed: the
+// client names the semantic packet (mc_sem.SEM_*), the version object gives wire id and
+// schema, and `encode` does the rest.
+//
+// ------------------------------------------------------------------ VALUE STORE
+//
+// Plain text, one `path=value` per line (UTF-8, '\n'; blank lines and lines that start with
+// '#' are ignored). The paths are the walker's dump paths: field names joined by '.', array
+// elements as `[i]`: `position.x`, `items[2].count`. A top level scalar is just `name`.
+//
+//   integers           `42`, `-7`, `0x2A`   (range checked against the field type; a varint
+//                      takes -2^31 .. 2^32-1, a long -2^63 .. 2^64-1 for unsigned kinds)
+//   bool               `true` / `false` (or 1 / 0)
+//   float / double     the raw IEEE bits as `0x...` (8 / 16 hex digits max); helpers
+//                      vals_f32 / vals_f64 write them from an f32 / f64
+//   uuid               `uuid:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (dashes optional)
+//   string             `"text"` with `\xHH` for control octets, `"` and `\`  (or `hex:...`)
+//   buffer / rest      `hex:00ff..`   (nbt, lpVec3, byte arrays); `hex:` is the empty one
+//   array              `path=#N` the element count (optional: without it the elements
+//                      `path[0]`, `path[1]`, ... are counted); `top bit` arrays and entity
+//                      metadata loops have no count line and are counted by their elements
+//   option             `path?=1` / `path?=0`; without a `path?` line the option is present
+//                      exactly when some line starts with `path` (so an absent one is simply
+//                      omitted); an optional NBT that is omitted is written as the 0 tag
+//   bitfield member    `path.member=N`;  bitflags: `path.flag=true`, a flag that is not
+//                      listed is false
+//   registry holder    `path.<idName>=N` (registry id) or the inline value under
+//                      `path.<inlineName>...`
+//   holder set         `path.<tagName>=...` (a tag name) or `path.<listName>=#N` + elements
+//                      `path.<listName>[i]`
+//
+// The store of `mc_schema.walk_values` (the lossless decoder) is exactly this format and is
+// written in schema order. The encoder consumes the lines IN ORDER first (a cursor), and
+// falls back to a search over the whole store, so hand written stores may be in any order.
+// The only repeated path is an option or an optional scalar (`a?=1` then `a=5`), which the
+// `?` marker keeps apart.
+//
+// ------------------------------------------------------------------ GUARANTEES
+//
+// * Every value is range checked against its type; a missing required value, a malformed
+//   token, an oversized buffer or a deep recursion makes `encode` return false (and name the
+//   path in the optional `err` buffer). `out` is only appended to on success.
+// * The result is held against the walker (`mc_schema.walk`, exact consumption) before it is
+//   returned, so a store that produces a layout the receiver would not accept is refused.
+// * Registers (switch keys, counts that come from earlier fields) are recomputed from the
+//   values written, exactly like the walker does; a count taken from a register must match
+//   the number of elements / octets given.
+// * Honest limits: topBitSetTerminatedArray patches bit 7 of the FIRST octet of each element
+//   (set on all but the last, cleared on the last): the first field of such an element must
+//   be a single octet field (it is an i8 in all versions). An unlisted bit of a bitflags
+//   field cannot be expressed (it is written as 0).
+
+import std.rt
+import std.bytes
+import std.math
+import mc.mc_schema
+
+const PATH_MAX: usize = 1024
+const REGS: usize = 128
+const MAX_CALL_DEPTH: u64 = 64
+const MAX_COUNT: u64 = 1048576
+
+struct E {
+    vals: u64, // the value store
+    vlen: usize,
+    vpos: usize, // the cursor: start of the line expected next
+    vs: usize, // value token of the last successful find
+    vn: usize,
+    pc: u64,
+    bad: bool,
+    budget: u64,
+    regs: u64,
+    out: *mut rt.Buf,
+    path: u64,
+    plen: usize,
+    last: u64,
+    calls: u64,
+    err: *mut rt.Buf,
+    errset: bool,
+}
+
+// ------------------------------------------------------------------- helpers
+
+fn rd_u(e: *mut E) -> u64 {
+    var v: u64 = 0
+    var shift: u64 = 0
+    while true {
+        let b: u64 = rt.ld8((*e).pc, 0) as u64
+        (*e).pc = (*e).pc + 1
+        v = v | ((b & 63) << shift)
+        if (b & 64) == 0 {
+            return v
+        }
+        shift = shift + 6
+        if shift > 66 {
+            return v
+        }
+    }
+    return v
+}
+
+// reports the first problem: `msg: path`
+fn fail_at(e: *mut E, msg: str) {
+    if !(*e).errset {
+        (*e).errset = true
+        if (*e).err as u64 != 0 {
+            rt.buf_push_bytes((*e).err, msg.p as u64, msg.n)
+            rt.buf_push((*e).err, 58)
+            rt.buf_push((*e).err, 32)
+            rt.buf_push_bytes((*e).err, (*e).path, (*e).plen)
+        }
+    }
+    (*e).bad = true
+}
+
+fn hexv(c: u8) -> i32 {
+    if c >= 48 && c <= 57 {
+        return c as i32 - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c as i32 - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c as i32 - 55
+    }
+    return 0 - 1
+}
+
+fn vb(e: *mut E, i: usize) -> u8 {
+    return rt.ld8((*e).vals, i)
+}
+
+// ---- path
+
+fn path_push(e: *mut E, p: u64, n: usize, dot: bool) {
+    var need: usize = n
+    if dot && (*e).plen > 0 {
+        need = need + 1
+    }
+    if (*e).plen + need > PATH_MAX {
+        fail_at(e, "path too long")
+        return
+    }
+    if dot && (*e).plen > 0 {
+        rt.st8((*e).path, (*e).plen, 46)
+        (*e).plen = (*e).plen + 1
+    }
+    var i: usize = 0
+    while i < n {
+        rt.st8((*e).path, (*e).plen + i, rt.ld8(p, i))
+        i = i + 1
+    }
+    (*e).plen = (*e).plen + n
+}
+
+fn path_index(e: *mut E, idx: u64) {
+    if (*e).plen + 24 > PATH_MAX {
+        fail_at(e, "path too long")
+        return
+    }
+    rt.st8((*e).path, (*e).plen, 91)
+    (*e).plen = (*e).plen + 1
+    var digits: [u8; 24] = [0; 24]
+    var nd: usize = 0
+    var v: u64 = idx
+    if v == 0 {
+        digits[0] = 48
+        nd = 1
+    }
+    while v > 0 {
+        digits[nd] = (48 + (v % 10)) as u8
+        v = v / 10
+        nd = nd + 1
+    }
+    while nd > 0 {
+        nd = nd - 1
+        rt.st8((*e).path, (*e).plen, digits[nd])
+        (*e).plen = (*e).plen + 1
+    }
+    rt.st8((*e).path, (*e).plen, 93)
+    (*e).plen = (*e).plen + 1
+}
+
+// ---- the value store: lines
+
+// end of the line that starts at ls (index of '\n' or vlen)
+fn line_stop(e: *mut E, ls: usize) -> usize {
+    var i: usize = ls
+    while i < (*e).vlen && vb(e, i) != 10 {
+        i = i + 1
+    }
+    return i
+}
+
+// does the line at ls start with the current path? `q`: followed by `?=` (the option marker),
+// otherwise by `=`. On success the value token is in vs / vn (trailing blanks trimmed).
+fn match_at(e: *mut E, ls: usize, q: bool) -> bool {
+    let n: usize = (*e).plen
+    var i: usize = 0
+    while i < n {
+        if ls + i >= (*e).vlen {
+            return false
+        }
+        if vb(e, ls + i) != rt.ld8((*e).path, i) {
+            return false
+        }
+        i = i + 1
+    }
+    var p: usize = ls + n
+    if p >= (*e).vlen {
+        return false
+    }
+    if q {
+        if vb(e, p) != 63 {
+            return false
+        }
+        p = p + 1
+        if p >= (*e).vlen {
+            return false
+        }
+    }
+    if vb(e, p) != 61 {
+        return false
+    }
+    p = p + 1
+    var stop: usize = line_stop(e, p)
+    while stop > p && (vb(e, stop - 1) == 13 || vb(e, stop - 1) == 32) {
+        stop = stop - 1
+    }
+    (*e).vs = p
+    (*e).vn = stop - p
+    return true
+}
+
+// Finds the line of the current path (cursor line first, then a search over the whole store)
+// and moves the cursor behind it.
+fn find(e: *mut E, q: bool) -> bool {
+    if (*e).vpos < (*e).vlen {
+        if match_at(e, (*e).vpos, q) {
+            (*e).vpos = line_stop(e, (*e).vpos) + 1
+            return true
+        }
+    }
+    var ls: usize = 0
+    while ls < (*e).vlen {
+        if match_at(e, ls, q) {
+            (*e).vpos = line_stop(e, ls) + 1
+            return true
+        }
+        ls = line_stop(e, ls) + 1
+    }
+    return false
+}
+
+// does the line at ls start with the current path as a whole path segment prefix?
+fn prefix_at(e: *mut E, ls: usize) -> bool {
+    let n: usize = (*e).plen
+    var i: usize = 0
+    while i < n {
+        if ls + i >= (*e).vlen {
+            return false
+        }
+        if vb(e, ls + i) != rt.ld8((*e).path, i) {
+            return false
+        }
+        i = i + 1
+    }
+    if ls + n >= (*e).vlen {
+        return false
+    }
+    let c: u8 = vb(e, ls + n)
+    return c == 61 || c == 46 || c == 91
+}
+
+fn has_prefix(e: *mut E) -> bool {
+    if (*e).vpos < (*e).vlen {
+        if prefix_at(e, (*e).vpos) {
+            return true
+        }
+    }
+    var ls: usize = 0
+    while ls < (*e).vlen {
+        if prefix_at(e, ls) {
+            return true
+        }
+        ls = line_stop(e, ls) + 1
+    }
+    return false
+}
+
+// ---- tokens
+
+// is the value token the text `t`?
+fn tok_is(e: *mut E, t: str) -> bool {
+    if (*e).vn != t.n {
+        return false
+    }
+    var i: usize = 0
+    while i < t.n {
+        if vb(e, (*e).vs + i) != rt.ld8(t.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn tok_starts(e: *mut E, t: str) -> bool {
+    if (*e).vn < t.n {
+        return false
+    }
+    var i: usize = 0
+    while i < t.n {
+        if vb(e, (*e).vs + i) != rt.ld8(t.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Integer token (decimal or 0x hex, optional '-') from `from` to the end of the token:
+// magnitude + sign. false on junk or overflow of 64 bits.
+fn parse_num(e: *mut E, from: usize, neg: *mut bool, mag: *mut u64) -> bool {
+    var i: usize = from
+    let end: usize = (*e).vs + (*e).vn
+    *neg = false
+    *mag = 0
+    if i >= end {
+        return false
+    }
+    if vb(e, i) == 45 {
+        *neg = true
+        i = i + 1
+    }
+    if i >= end {
+        return false
+    }
+    var v: u64 = 0
+    if i + 2 < end && vb(e, i) == 48 && (vb(e, i + 1) == 120 || vb(e, i + 1) == 88) {
+        i = i + 2
+        if i >= end {
+            return false
+        }
+        var nd: u64 = 0
+        while i < end {
+            let h: i32 = hexv(vb(e, i))
+            if h < 0 {
+                return false
+            }
+            nd = nd + 1
+            if nd > 16 {
+                return false
+            }
+            v = (v << 4) | (h as u64)
+            i = i + 1
+        }
+        *mag = v
+        return true
+    }
+    while i < end {
+        let c: u8 = vb(e, i)
+        if c < 48 || c > 57 {
+            return false
+        }
+        let d: u64 = (c as u64) - 48
+        if v > 1844674407370955161 {
+            return false
+        }
+        if v == 1844674407370955161 && d > 5 {
+            return false
+        }
+        v = v * 10 + d
+        i = i + 1
+    }
+    *mag = v
+    return true
+}
+
+// ---- output
+
+fn put(e: *mut E, v: u8) {
+    rt.buf_push((*e).out, v)
+}
+
+fn put_be(e: *mut E, n: usize, v: u64) {
+    var i: usize = n
+    while i > 0 {
+        i = i - 1
+        put(e, ((v >> (8 * i as u64)) & 255) as u8)
+    }
+}
+
+fn put_varint(e: *mut E, raw: u64) {
+    var v: u64 = raw & 4294967295
+    while v >= 128 {
+        put(e, ((v & 127) | 128) as u8)
+        v = v >> 7
+    }
+    put(e, v as u8)
+}
+
+fn put_varlong(e: *mut E, raw: u64) {
+    var v: u64 = raw
+    while v >= 128 {
+        put(e, ((v & 127) | 128) as u8)
+        v = v >> 7
+    }
+    put(e, v as u8)
+}
+
+// ---- scalars
+
+// octets of a fixed kind (0 for varint kinds)
+fn kind_size(kind: u64) -> usize {
+    if kind == mc_schema.K_U8 || kind == mc_schema.K_I8 || kind == mc_schema.K_BOOL {
+        return 1
+    }
+    if kind == mc_schema.K_U16 || kind == mc_schema.K_I16 {
+        return 2
+    }
+    if kind == mc_schema.K_U32 || kind == mc_schema.K_I32 || kind == mc_schema.K_F32 {
+        return 4
+    }
+    if kind == mc_schema.K_U64 || kind == mc_schema.K_I64 || kind == mc_schema.K_F64 {
+        return 8
+    }
+    if kind == mc_schema.K_UUID {
+        return 16
+    }
+    return 0
+}
+
+fn kind_signed(kind: u64) -> bool {
+    return kind == mc_schema.K_I8 || kind == mc_schema.K_I16 || kind == mc_schema.K_I32 || kind == mc_schema.K_I64 || kind == mc_schema.K_VARINT || kind == mc_schema.K_VARLONG
+}
+
+// Does (neg, mag) fit the integer kind?
+fn fits(kind: u64, neg: bool, mag: u64) -> bool {
+    if kind == mc_schema.K_VARINT {
+        if neg {
+            return mag <= 2147483648
+        }
+        return mag <= 4294967295
+    }
+    if kind == mc_schema.K_VARLONG {
+        if neg {
+            return mag <= 9223372036854775808
+        }
+        return true
+    }
+    let n: usize = kind_size(kind)
+    if n == 0 {
+        return false
+    }
+    if kind_signed(kind) {
+        let half: u64 = 1 << (8 * n as u64 - 1)
+        if neg {
+            return mag <= half
+        }
+        return mag < half
+    }
+    if neg && mag != 0 {
+        return false
+    }
+    if n >= 8 {
+        return true
+    }
+    return mag < (1 << (8 * n as u64))
+}
+
+// two's complement of (neg, mag)
+fn raw_of(neg: bool, mag: u64) -> u64 {
+    if neg && mag != 0 {
+        return 18446744073709551615 - mag + 1
+    }
+    return mag
+}
+
+// the value the walker's register would hold for the raw bits of `kind`
+fn reg_value(kind: u64, raw: u64) -> u64 {
+    if kind == mc_schema.K_I8 {
+        let v: u64 = raw & 255
+        if (v & 128) != 0 {
+            return v | 18446744073709551360
+        }
+        return v
+    }
+    if kind == mc_schema.K_I16 {
+        let v: u64 = raw & 65535
+        if (v & 32768) != 0 {
+            return v | 18446744073709486080
+        }
+        return v
+    }
+    if kind == mc_schema.K_I32 || kind == mc_schema.K_VARINT {
+        let v: u64 = raw & 4294967295
+        if (v & 2147483648) != 0 {
+            return v | 18446744069414584320
+        }
+        return v
+    }
+    let n: usize = kind_size(kind)
+    if n > 0 && n < 8 {
+        return raw & ((1 << (8 * n as u64)) - 1)
+    }
+    return raw
+}
+
+// writes the raw bits of a scalar of `kind` (not a uuid)
+fn put_scalar(e: *mut E, kind: u64, raw: u64) {
+    if kind == mc_schema.K_VARINT {
+        put_varint(e, raw)
+    } else if kind == mc_schema.K_VARLONG {
+        put_varlong(e, raw)
+    } else {
+        put_be(e, kind_size(kind), raw)
+    }
+}
+
+// Reads the current value token as an integer / bool / float bits of `kind`; true and the raw
+// bits in *raw. The token is in vs / vn already.
+fn token_scalar(e: *mut E, kind: u64, raw: *mut u64) -> bool {
+    if kind == mc_schema.K_BOOL {
+        if tok_is(e, "true") || tok_is(e, "1") {
+            *raw = 1
+            return true
+        }
+        if tok_is(e, "false") || tok_is(e, "0") {
+            *raw = 0
+            return true
+        }
+        return false
+    }
+    var neg: bool = false
+    var mag: u64 = 0
+    if !parse_num(e, (*e).vs, &neg, &mag) {
+        return false
+    }
+    if kind == mc_schema.K_F32 || kind == mc_schema.K_F64 {
+        if neg {
+            return false
+        }
+        if kind == mc_schema.K_F32 && mag > 4294967295 {
+            return false
+        }
+        *raw = mag
+        return true
+    }
+    if !fits(kind, neg, mag) {
+        return false
+    }
+    *raw = raw_of(neg, mag)
+    return true
+}
+
+fn enc_uuid(e: *mut E) {
+    if !find(e, false) {
+        fail_at(e, "missing value")
+        return
+    }
+    if !tok_starts(e, "uuid:") {
+        fail_at(e, "bad uuid")
+        return
+    }
+    var digits: usize = 0
+    var hi: u64 = 0
+    var acc: u64 = 0
+    var i: usize = (*e).vs + 5
+    let end: usize = (*e).vs + (*e).vn
+    var first: u64 = 0
+    while i < end {
+        let c: u8 = vb(e, i)
+        if c != 45 {
+            let h: i32 = hexv(c)
+            if h < 0 || digits >= 32 {
+                fail_at(e, "bad uuid")
+                return
+            }
+            acc = (acc << 4) | (h as u64)
+            digits = digits + 1
+            if digits == 16 {
+                first = acc
+                acc = 0
+            }
+        }
+        i = i + 1
+    }
+    if digits != 32 {
+        fail_at(e, "bad uuid")
+        return
+    }
+    hi = first
+    put_be(e, 8, hi)
+    put_be(e, 8, acc)
+    (*e).last = hi
+}
+
+fn enc_scalar(e: *mut E, kind: u64) {
+    if kind == mc_schema.K_UUID {
+        enc_uuid(e)
+        return
+    }
+    if !find(e, false) {
+        fail_at(e, "missing value")
+        return
+    }
+    var raw: u64 = 0
+    if !token_scalar(e, kind, &raw) {
+        fail_at(e, "bad value")
+        return
+    }
+    put_scalar(e, kind, raw)
+    (*e).last = reg_value(kind, raw)
+}
+
+// ---- strings and blobs (the token is in vs / vn)
+
+// Decodes a quoted string or a `hex:` token. write = false: only measure. Returns the octet
+// count, or MAX_COUNT * 1024 on a malformed token.
+fn text_octets(e: *mut E, write: bool, hash: *mut u64) -> usize {
+    let bad: usize = 1073741824
+    var n: usize = 0
+    var i: usize = (*e).vs
+    let end: usize = (*e).vs + (*e).vn
+    if tok_starts(e, "hex:") {
+        i = i + 4
+        if ((end - i) & 1) != 0 {
+            return bad
+        }
+        while i < end {
+            let a: i32 = hexv(vb(e, i))
+            let b: i32 = hexv(vb(e, i + 1))
+            if a < 0 || b < 0 {
+                return bad
+            }
+            let c: u8 = (a * 16 + b) as u8
+            if write {
+                put(e, c)
+                *hash = (*hash ^ (c as u64)) *% 1099511628211
+            }
+            n = n + 1
+            i = i + 2
+        }
+        return n
+    }
+    if (*e).vn < 2 || vb(e, i) != 34 || vb(e, end - 1) != 34 {
+        return bad
+    }
+    i = i + 1
+    let stop: usize = end - 1
+    while i < stop {
+        var c: u8 = vb(e, i)
+        if c == 92 {
+            if i + 1 >= stop {
+                return bad
+            }
+            let k: u8 = vb(e, i + 1)
+            if k == 120 {
+                if i + 3 >= stop {
+                    return bad
+                }
+                let a: i32 = hexv(vb(e, i + 2))
+                let b: i32 = hexv(vb(e, i + 3))
+                if a < 0 || b < 0 {
+                    return bad
+                }
+                c = (a * 16 + b) as u8
+                i = i + 4
+            } else if k == 92 || k == 34 {
+                c = k
+                i = i + 2
+            } else {
+                return bad
+            }
+        } else {
+            i = i + 1
+        }
+        if write {
+            put(e, c)
+            *hash = (*hash ^ (c as u64)) *% 1099511628211
+        }
+        n = n + 1
+    }
+    return n
+}
+
+// the length prefix of a string / buffer / array
+fn put_len(e: *mut E, kind: u64, n: u64) {
+    var neg: bool = false
+    if !fits(kind, neg, n) {
+        fail_at(e, "length out of range")
+        return
+    }
+    put_scalar(e, kind, n)
+}
+
+fn enc_string(e: *mut E) {
+    let kind: u64 = rd_u(e)
+    rd_u(e)
+    if !find(e, false) {
+        fail_at(e, "missing value")
+        return
+    }
+    var h: u64 = 14695981039346656037
+    let n: usize = text_octets(e, false, &h)
+    if n >= 1073741824 {
+        fail_at(e, "bad string")
+        return
+    }
+    put_len(e, kind, n as u64)
+    if (*e).bad {
+        return
+    }
+    text_octets(e, true, &h)
+    (*e).last = h
+}
+
+fn enc_buffer(e: *mut E) {
+    let ck: u64 = rd_u(e)
+    let ca: u64 = rd_u(e)
+    if !find(e, false) {
+        fail_at(e, "missing value")
+        return
+    }
+    var h: u64 = 0
+    let n: usize = text_octets(e, false, &h)
+    if n >= 1073741824 {
+        fail_at(e, "bad buffer")
+        return
+    }
+    if ck == mc_schema.CK_CONST {
+        if n as u64 != ca {
+            fail_at(e, "buffer length")
+            return
+        }
+    } else if ck == mc_schema.CK_REG {
+        if n as u64 != rt.ld64((*e).regs, ca as usize) {
+            fail_at(e, "buffer length")
+            return
+        }
+    } else {
+        put_len(e, ck, n as u64)
+        if (*e).bad {
+            return
+        }
+    }
+    text_octets(e, true, &h)
+}
+
+fn enc_restbuf(e: *mut E) {
+    // a missing rest is empty
+    if !find(e, false) {
+        return
+    }
+    var h: u64 = 0
+    let n: usize = text_octets(e, false, &h)
+    if n >= 1073741824 {
+        fail_at(e, "bad buffer")
+        return
+    }
+    text_octets(e, true, &h)
+}
+
+// ---- counts
+
+// Element count of the array at the current path: the `=#N` line, or the number of
+// consecutive elements `[0]`, `[1]`, ... present in the store.
+fn probe_count(e: *mut E) -> u64 {
+    var i: u64 = 0
+    while i < MAX_COUNT {
+        let mark: usize = (*e).plen
+        path_index(e, i)
+        let present: bool = has_prefix(e)
+        (*e).plen = mark
+        if !present {
+            return i
+        }
+        i = i + 1
+    }
+    return i
+}
+
+// an explicit `path=#N` line: true and N
+fn count_line(e: *mut E, n: *mut u64) -> bool {
+    if (*e).vpos < (*e).vlen {
+        if !match_at(e, (*e).vpos, false) {
+            // not at the cursor: search quietly, only accept a '#' line
+            var ls: usize = 0
+            var found: bool = false
+            while ls < (*e).vlen && !found {
+                if match_at(e, ls, false) {
+                    found = true
+                } else {
+                    ls = line_stop(e, ls) + 1
+                }
+            }
+            if !found || !tok_starts(e, "#") {
+                return false
+            }
+            (*e).vpos = line_stop(e, ls) + 1
+        } else {
+            if !tok_starts(e, "#") {
+                return false
+            }
+            (*e).vpos = line_stop(e, (*e).vpos) + 1
+        }
+    } else {
+        if !find(e, false) {
+            return false
+        }
+        if !tok_starts(e, "#") {
+            return false
+        }
+    }
+    var neg: bool = false
+    var mag: u64 = 0
+    if !parse_num(e, (*e).vs + 1, &neg, &mag) || neg || mag > MAX_COUNT {
+        fail_at(e, "bad count")
+        return false
+    }
+    *n = mag
+    return true
+}
+
+fn enc_array(e: *mut E) {
+    let ck: u64 = rd_u(e)
+    let ca: u64 = rd_u(e)
+    rd_u(e)
+    let blen: u64 = rd_u(e)
+    let body: u64 = (*e).pc
+    var n: u64 = 0
+    var given: u64 = 0
+    let has_line: bool = count_line(e, &given)
+    if (*e).bad {
+        return
+    }
+    if ck == mc_schema.CK_CONST {
+        n = ca
+    } else if ck == mc_schema.CK_REG {
+        n = rt.ld64((*e).regs, ca as usize)
+    } else if has_line {
+        n = given
+    } else {
+        n = probe_count(e)
+    }
+    if has_line && n != given {
+        fail_at(e, "count differs from the register")
+        return
+    }
+    if n > MAX_COUNT {
+        fail_at(e, "count too big")
+        return
+    }
+    if ck != mc_schema.CK_CONST && ck != mc_schema.CK_REG {
+        put_len(e, ck, n)
+        if (*e).bad {
+            return
+        }
+    }
+    var i: u64 = 0
+    while i < n {
+        if (*e).bad {
+            return
+        }
+        let mark: usize = (*e).plen
+        path_index(e, i)
+        (*e).pc = body
+        exec_type(e)
+        (*e).plen = mark
+        i = i + 1
+    }
+    (*e).pc = body + blen
+}
+
+// ---- NBT / lpVec3: the value is the exact octets
+fn enc_blob(e: *mut E, optional_nbt: bool) {
+    if !find(e, false) {
+        if optional_nbt {
+            put(e, 0)
+            return
+        }
+        fail_at(e, "missing value")
+        return
+    }
+    var h: u64 = 0
+    let n: usize = text_octets(e, false, &h)
+    if n >= 1073741824 {
+        fail_at(e, "bad blob")
+        return
+    }
+    text_octets(e, true, &h)
+}
+
+// ---- bitfield / bitflags
+
+fn enc_bitfield(e: *mut E) {
+    let nbytes: u64 = rd_u(e)
+    let nsub: u64 = rd_u(e)
+    var raw: u64 = 0
+    var used: u64 = 0
+    var i: u64 = 0
+    while i < nsub {
+        let size: u64 = rd_u(e)
+        let signed: u64 = rd_u(e)
+        let reg1: u64 = rd_u(e)
+        let nl: u64 = rd_u(e)
+        let name: u64 = (*e).pc
+        (*e).pc = (*e).pc + nl
+        let shift: u64 = nbytes * 8 - used - size
+        let mark: usize = (*e).plen
+        path_push(e, name, nl as usize, true)
+        var v: u64 = 0
+        if !(*e).bad {
+            if !find(e, false) {
+                fail_at(e, "missing value")
+            } else {
+                var neg: bool = false
+                var mag: u64 = 0
+                if !parse_num(e, (*e).vs, &neg, &mag) {
+                    fail_at(e, "bad value")
+                } else if signed != 0 {
+                    let half: u64 = 1 << (size - 1)
+                    var ok: bool = mag < half
+                    if neg {
+                        ok = mag <= half
+                    }
+                    if size >= 64 {
+                        ok = true
+                    }
+                    if !ok {
+                        fail_at(e, "bit field out of range")
+                    }
+                    v = raw_of(neg, mag)
+                } else {
+                    if (neg && mag != 0) || (size < 64 && mag >= (1 << size)) {
+                        fail_at(e, "bit field out of range")
+                    }
+                    v = mag
+                }
+            }
+        }
+        (*e).plen = mark
+        if (*e).bad {
+            return
+        }
+        var field: u64 = v
+        if size < 64 {
+            field = v & ((1 << size) - 1)
+        }
+        raw = raw | (field << shift)
+        used = used + size
+        if reg1 != 0 {
+            rt.st64((*e).regs, (reg1 - 1) as usize, v)
+        }
+        i = i + 1
+    }
+    put_be(e, nbytes as usize, raw)
+    (*e).last = raw
+}
+
+fn enc_bitflags(e: *mut E) {
+    let kind: u64 = rd_u(e)
+    let nflags: u64 = rd_u(e)
+    var raw: u64 = 0
+    var i: u64 = 0
+    while i < nflags {
+        let bit: u64 = rd_u(e)
+        let reg1: u64 = rd_u(e)
+        let nl: u64 = rd_u(e)
+        let name: u64 = (*e).pc
+        (*e).pc = (*e).pc + nl
+        let mark: usize = (*e).plen
+        path_push(e, name, nl as usize, true)
+        var v: u64 = 0
+        if find(e, false) {
+            if tok_is(e, "true") || tok_is(e, "1") {
+                v = 1
+            } else if !(tok_is(e, "false") || tok_is(e, "0")) {
+                fail_at(e, "bad value")
+            }
+        }
+        (*e).plen = mark
+        if (*e).bad {
+            return
+        }
+        raw = raw | (v << bit)
+        if reg1 != 0 {
+            rt.st64((*e).regs, (reg1 - 1) as usize, v)
+        }
+        i = i + 1
+    }
+    put_scalar(e, kind, raw)
+    (*e).last = raw
+}
+
+// ---- the engine
+
+fn exec_field(e: *mut E) {
+    let op: u64 = rt.ld8((*e).pc, 0) as u64
+    (*e).pc = (*e).pc + 1
+    if op != mc_schema.O_FIELD {
+        (*e).bad = true
+        return
+    }
+    let nl: u64 = rd_u(e)
+    let name: u64 = (*e).pc
+    (*e).pc = (*e).pc + nl
+    let reg1: u64 = rd_u(e)
+    let mark: usize = (*e).plen
+    if nl > 0 {
+        path_push(e, name, nl as usize, true)
+    }
+    exec_type(e)
+    if (*e).bad {
+        return
+    }
+    if reg1 != 0 {
+        rt.st64((*e).regs, (reg1 - 1) as usize, (*e).last)
+    }
+    (*e).plen = mark
+}
+
+// CALL / RCALL operand: 4 groups of 6 bits, zigzag, relative to the end of the operand
+fn call_target(e: *mut E, ret: *mut u64) -> u64 {
+    var zz: u64 = 0
+    var i: u64 = 0
+    while i < 4 {
+        zz = zz | ((rt.ld8((*e).pc, i as usize) as u64) << (6 * i))
+        i = i + 1
+    }
+    (*e).pc = (*e).pc + 4
+    *ret = (*e).pc
+    if (zz & 1) == 0 {
+        return *ret + (zz >> 1)
+    }
+    return *ret - ((zz + 1) >> 1)
+}
+
+fn exec_type(e: *mut E) {
+    if (*e).bad {
+        return
+    }
+    if (*e).budget == 0 {
+        fail_at(e, "budget")
+        return
+    }
+    (*e).budget = (*e).budget - 1
+    let op: u64 = rt.ld8((*e).pc, 0) as u64
+    (*e).pc = (*e).pc + 1
+    if op == mc_schema.O_SCALAR {
+        let kind: u64 = rd_u(e)
+        rd_u(e)
+        enc_scalar(e, kind)
+    } else if op == mc_schema.O_VOID {
+        (*e).last = 0
+    } else if op == mc_schema.O_CONTAINER {
+        let blen: u64 = rd_u(e)
+        let end: u64 = (*e).pc + blen
+        while (*e).pc < end {
+            if (*e).bad {
+                return
+            }
+            exec_field(e)
+        }
+        (*e).pc = end
+    } else if op == mc_schema.O_BITFIELD {
+        enc_bitfield(e)
+    } else if op == mc_schema.O_BITFLAGS {
+        enc_bitflags(e)
+    } else if op == mc_schema.O_STRING {
+        enc_string(e)
+    } else if op == mc_schema.O_BUFFER {
+        enc_buffer(e)
+    } else if op == mc_schema.O_RESTBUF {
+        enc_restbuf(e)
+    } else if op == mc_schema.O_ARRAY {
+        enc_array(e)
+    } else if op == mc_schema.O_OPTION {
+        let blen: u64 = rd_u(e)
+        let end: u64 = (*e).pc + blen
+        var present: bool = false
+        if find(e, true) {
+            if tok_is(e, "1") {
+                present = true
+            } else if !tok_is(e, "0") {
+                fail_at(e, "bad presence")
+                return
+            }
+        } else {
+            present = has_prefix(e)
+        }
+        if present {
+            put(e, 1)
+            exec_type(e)
+        } else {
+            put(e, 0)
+        }
+        (*e).pc = end
+    } else if op == mc_schema.O_SWITCH {
+        exec_switch(e)
+    } else if op == mc_schema.O_CALL {
+        var ret: u64 = 0
+        let target: u64 = call_target(e, &ret)
+        if (*e).calls >= MAX_CALL_DEPTH {
+            fail_at(e, "call depth")
+            return
+        }
+        (*e).calls = (*e).calls + 1
+        (*e).pc = target
+        exec_type(e)
+        (*e).calls = (*e).calls - 1
+        (*e).pc = ret
+    } else if op == mc_schema.O_TOPBIT {
+        exec_topbit(e)
+    } else if op == mc_schema.O_EMETA {
+        exec_emeta(e)
+    } else if op == mc_schema.O_NBT {
+        let mode: u64 = rd_u(e)
+        enc_blob(e, mode >= 2)
+    } else if op == mc_schema.O_REGHOLDER {
+        exec_holder(e)
+    } else if op == mc_schema.O_RCALL {
+        exec_rcall(e)
+    } else if op == mc_schema.O_REGSET {
+        exec_regset(e)
+    } else if op == mc_schema.O_LPVEC3 {
+        enc_blob(e, false)
+    } else {
+        (*e).bad = true
+    }
+}
+
+fn exec_rcall(e: *mut E) {
+    var ret: u64 = 0
+    let target: u64 = call_target(e, &ret)
+    if (*e).calls >= MAX_CALL_DEPTH {
+        fail_at(e, "call depth")
+        return
+    }
+    var saved: [u64; 128] = [0; 128]
+    var k: usize = 0
+    while k < REGS {
+        saved[k] = rt.ld64((*e).regs, k)
+        k = k + 1
+    }
+    (*e).calls = (*e).calls + 1
+    (*e).pc = target
+    exec_type(e)
+    (*e).calls = (*e).calls - 1
+    (*e).pc = ret
+    k = 0
+    while k < REGS {
+        rt.st64((*e).regs, k, saved[k])
+        k = k + 1
+    }
+}
+
+// elements counted by their lines (no count prefix on the wire)
+fn exec_topbit(e: *mut E) {
+    let blen: u64 = rd_u(e)
+    let body: u64 = (*e).pc
+    let n: u64 = probe_count(e)
+    if n == 0 {
+        fail_at(e, "needs at least one element")
+        return
+    }
+    var i: u64 = 0
+    while i < n {
+        if (*e).bad {
+            return
+        }
+        let mark: usize = (*e).plen
+        path_index(e, i)
+        let first: usize = rt.buf_len((*e).out)
+        (*e).pc = body
+        exec_type(e)
+        (*e).plen = mark
+        if (*e).bad {
+            return
+        }
+        if rt.buf_len((*e).out) <= first {
+            fail_at(e, "empty element")
+            return
+        }
+        let cur: u8 = rt.ld8(rt.buf_ptr((*e).out), first)
+        if i + 1 < n {
+            rt.st8(rt.buf_ptr((*e).out), first, cur | 128)
+        } else {
+            rt.st8(rt.buf_ptr((*e).out), first, cur & 127)
+        }
+        i = i + 1
+    }
+    (*e).pc = body + blen
+}
+
+fn exec_emeta(e: *mut E) {
+    let endv: u64 = rd_u(e)
+    let blen: u64 = rd_u(e)
+    let body: u64 = (*e).pc
+    let n: u64 = probe_count(e)
+    var i: u64 = 0
+    while i < n {
+        if (*e).bad {
+            return
+        }
+        let mark: usize = (*e).plen
+        path_index(e, i)
+        (*e).pc = body
+        exec_type(e)
+        (*e).plen = mark
+        i = i + 1
+    }
+    put(e, endv as u8)
+    (*e).pc = body + blen
+}
+
+fn exec_switch(e: *mut E) {
+    let reg: u64 = rd_u(e)
+    let ncases: u64 = rd_u(e)
+    let val: u64 = rt.ld64((*e).regs, reg as usize)
+    var chosen: u64 = 0
+    var found: bool = false
+    var i: u64 = 0
+    while i < ncases {
+        let key: u64 = rd_u(e)
+        let blen: u64 = rd_u(e)
+        if !found && key == val {
+            chosen = (*e).pc
+            found = true
+        }
+        (*e).pc = (*e).pc + blen
+        i = i + 1
+    }
+    let dlen: u64 = rd_u(e)
+    let dpc: u64 = (*e).pc
+    let end: u64 = dpc + dlen
+    if found {
+        (*e).pc = chosen
+    } else {
+        (*e).pc = dpc
+    }
+    exec_type(e)
+    (*e).pc = end
+}
+
+// registryEntryHolder: `path.<idName>=N` or the inline value under `path.<inlineName>`
+fn exec_holder(e: *mut E) {
+    let nl: u64 = rd_u(e)
+    let name1: u64 = (*e).pc
+    (*e).pc = (*e).pc + nl
+    let nl2: u64 = rd_u(e)
+    let name2: u64 = (*e).pc
+    (*e).pc = (*e).pc + nl2
+    let blen: u64 = rd_u(e)
+    let end: u64 = (*e).pc + blen
+    let outer: usize = (*e).plen
+    path_push(e, name1, nl as usize, true)
+    var as_id: bool = false
+    if !(*e).bad && find(e, false) {
+        var neg: bool = false
+        var mag: u64 = 0
+        if !parse_num(e, (*e).vs, &neg, &mag) || neg || mag > 2147483646 {
+            fail_at(e, "bad value")
+        }
+        put_varint(e, mag + 1)
+        as_id = true
+    }
+    (*e).plen = outer
+    if !as_id && !(*e).bad {
+        put(e, 0)
+        path_push(e, name2, nl2 as usize, true)
+        exec_type(e)
+        (*e).plen = outer
+    }
+    (*e).pc = end
+}
+
+// registryEntryHolderSet: a tag name (`path.<tagName>`) or a list (`path.<listName>[i]`)
+fn exec_regset(e: *mut E) {
+    let nl1: u64 = rd_u(e)
+    let name1: u64 = (*e).pc
+    (*e).pc = (*e).pc + nl1
+    let nl2: u64 = rd_u(e)
+    let name2: u64 = (*e).pc
+    (*e).pc = (*e).pc + nl2
+    rd_u(e)
+    let blen1: u64 = rd_u(e)
+    let base: u64 = (*e).pc
+    (*e).pc = base + blen1
+    let blen2: u64 = rd_u(e)
+    let elem: u64 = (*e).pc
+    let end: u64 = elem + blen2
+    let outer: usize = (*e).plen
+    path_push(e, name1, nl1 as usize, true)
+    let is_tag: bool = !(*e).bad && has_prefix(e)
+    (*e).plen = outer
+    if is_tag {
+        put(e, 0)
+        path_push(e, name1, nl1 as usize, true)
+        (*e).pc = base
+        exec_type(e)
+        (*e).plen = outer
+    } else if !(*e).bad {
+        path_push(e, name2, nl2 as usize, true)
+        var given: u64 = 0
+        var cnt: u64 = 0
+        if count_line(e, &given) {
+            cnt = given
+        } else {
+            cnt = probe_count(e)
+        }
+        if cnt > MAX_COUNT {
+            fail_at(e, "count too big")
+            return
+        }
+        put_varint(e, cnt + 1)
+        var i: u64 = 0
+        while i < cnt {
+            if (*e).bad {
+                return
+            }
+            let mark: usize = (*e).plen
+            path_index(e, i)
+            (*e).pc = elem
+            exec_type(e)
+            (*e).plen = mark
+            i = i + 1
+        }
+        (*e).plen = outer
+    }
+    (*e).pc = end
+}
+
+// ----------------------------------------------------------------- public API
+
+// Encodes the value store `vals` (vlen octets of text) with `schema` (a handle from
+// the version's schema_of / packet_schema) and APPENDS the body to `out`. false when a value
+// is missing / malformed / out of range or the result does not follow the schema; then `out`
+// is unchanged and `err` (may be 0) holds `reason: path`.
+fn encode(schema: u64, vals: u64, vlen: usize, out: *mut bytes.Bytes, err: *mut rt.Buf) -> bool {
+    if schema == 0 {
+        return false
+    }
+    var regs: [u64; 128] = [0; 128]
+    var path: [u8; 1024] = [0; 1024]
+    var tmp: rt.Buf = rt.buf_new()
+    var e: E = E {
+        vals: vals,
+        vlen: vlen,
+        vpos: 0,
+        vs: 0,
+        vn: 0,
+        pc: schema,
+        bad: false,
+        budget: 4194304 + 64 * (vlen as u64),
+        regs: (&regs[0]) as u64,
+        out: &tmp,
+        path: (&path[0]) as u64,
+        plen: 0,
+        last: 0,
+        calls: 0,
+        err: err,
+        errset: false,
+    }
+    exec_type(&e)
+    var ok: bool = !e.bad
+    if ok {
+        // the result must be exactly what the walker accepts
+        var chk: bytes.Bytes = bytes.bytes_new()
+        if rt.buf_len(&tmp) > 0 {
+            bytes.put_raw(&chk, rt.buf_ptr(&tmp), rt.buf_len(&tmp))
+        }
+        bytes.bytes_set_pos(&chk, 0)
+        ok = mc_schema.walk(schema, &chk, 0 as *mut rt.Buf)
+        bytes.bytes_free(&chk)
+        if !ok && (err as u64) != 0 {
+            rt.buf_push_bytes(err, "result does not follow the schema".p as u64, 33)
+        }
+    }
+    if ok && rt.buf_len(&tmp) > 0 {
+        bytes.put_raw(out, rt.buf_ptr(&tmp), rt.buf_len(&tmp))
+    }
+    rt.buf_free(&tmp)
+    return ok
+}
+
+// the same, the store as a Buf (see the vals_* builders below)
+fn encode_buf(schema: u64, vals: *mut rt.Buf, out: *mut bytes.Bytes, err: *mut rt.Buf) -> bool {
+    return encode(schema, rt.buf_ptr(vals), rt.buf_len(vals), out, err)
+}
+
+// ---- value store builders (path as a str literal)
+
+fn vals_key(b: *mut rt.Buf, path: str) {
+    rt.buf_push_bytes(b, path.p as u64, path.n)
+    rt.buf_push(b, 61)
+}
+
+fn vals_i64(b: *mut rt.Buf, path: str, v: i64) {
+    vals_key(b, path)
+    rt.buf_push_dec_i64(b, v)
+    rt.buf_push(b, 10)
+}
+
+fn vals_u64(b: *mut rt.Buf, path: str, v: u64) {
+    vals_key(b, path)
+    rt.buf_push_dec_u64(b, v)
+    rt.buf_push(b, 10)
+}
+
+fn vals_bool(b: *mut rt.Buf, path: str, v: bool) {
+    vals_key(b, path)
+    if v {
+        rt.buf_push_bytes(b, "true".p as u64, 4)
+    } else {
+        rt.buf_push_bytes(b, "false".p as u64, 5)
+    }
+    rt.buf_push(b, 10)
+}
+
+fn vals_f64(b: *mut rt.Buf, path: str, v: f64) {
+    vals_key(b, path)
+    rt.buf_push_bytes(b, "0x".p as u64, 2)
+    rt.buf_push_hex_u64(b, math.math_bits(v), 16)
+    rt.buf_push(b, 10)
+}
+
+fn vals_f32(b: *mut rt.Buf, path: str, v: f32) {
+    vals_key(b, path)
+    rt.buf_push_bytes(b, "0x".p as u64, 2)
+    rt.buf_push_hex_u64(b, math.math_bits32(v) as u64, 8)
+    rt.buf_push(b, 10)
+}
+
+// a string of n octets at p (quoted, control octets escaped)
+fn vals_text(b: *mut rt.Buf, path: str, p: u64, n: usize) {
+    vals_key(b, path)
+    rt.buf_push(b, 34)
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 32 || c == 127 || c == 34 || c == 92 {
+            rt.buf_push(b, 92)
+            rt.buf_push(b, 120)
+            rt.buf_push_hex_u64(b, c as u64, 2)
+        } else {
+            rt.buf_push(b, c)
+        }
+        i = i + 1
+    }
+    rt.buf_push(b, 34)
+    rt.buf_push(b, 10)
+}
+
+// n octets as `hex:..`
+fn vals_hex(b: *mut rt.Buf, path: str, p: u64, n: usize) {
+    vals_key(b, path)
+    rt.buf_push_bytes(b, "hex:".p as u64, 4)
+    var i: usize = 0
+    while i < n {
+        rt.buf_push_hex_u64(b, rt.ld8(p, i) as u64, 2)
+        i = i + 1
+    }
+    rt.buf_push(b, 10)
+}
+
+// a uuid from its two halves
+fn vals_uuid(b: *mut rt.Buf, path: str, high: u64, low: u64) {
+    vals_key(b, path)
+    rt.buf_push_bytes(b, "uuid:".p as u64, 5)
+    rt.buf_push_hex_u64(b, high, 16)
+    rt.buf_push_hex_u64(b, low, 16)
+    rt.buf_push(b, 10)
+}
+
+// a free line `path=text` (counts `#N`, presence ...); `text` is written as is
+fn vals_raw(b: *mut rt.Buf, path: str, text: str) {
+    vals_key(b, path)
+    rt.buf_push_bytes(b, text.p as u64, text.n)
+    rt.buf_push(b, 10)
+}

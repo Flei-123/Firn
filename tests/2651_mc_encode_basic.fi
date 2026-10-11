@@ -1,0 +1,234 @@
+// expect_exit: 0
+// Known answers for the schema driven writer (lib/mc/mc_encode.fi): hand computed bodies of
+// serverbound packets of 1.20.1 (763) and 1.8.9 (47), the value store builders, refusals
+// (missing value, out of range, bad token) and a decode -> encode round trip.
+import std.rt
+import std.bytes
+import mc.mc_schema
+import mc.mc_encode
+import mc.mc_version
+import mc.v763.mc_proto_v763
+import mc.v47.mc_proto_v47
+
+fn say(msg: str, extra: str) {
+    var o: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&o, msg.p as u64, msg.n)
+    rt.buf_push(&o, 32)
+    rt.buf_push_bytes(&o, extra.p as u64, extra.n)
+    rt.buf_push(&o, 10)
+    rt.write_everything(1, rt.buf_ptr(&o), rt.buf_len(&o))
+    rt.buf_free(&o)
+}
+
+fn hexval(c: u8) -> i32 {
+    if c >= 48 && c <= 57 {
+        return c as i32 - 48
+    }
+    return c as i32 - 87
+}
+
+// encode `vals` and compare with the hex text `want`
+fn enc_is(failures: *mut i32, name: str, sch: u64, vals: *mut rt.Buf, want: str) {
+    var out: bytes.Bytes = bytes.bytes_new()
+    var err: rt.Buf = rt.buf_new()
+    let ok: bool = mc_encode.encode_buf(sch, vals, &out, &err)
+    if !ok {
+        say("FAIL encode refused:", name)
+        rt.write_everything(1, rt.buf_ptr(&err), rt.buf_len(&err))
+        *failures = *failures + 1
+    } else {
+        var same: bool = bytes.bytes_len(&out) * 2 == want.n
+        var i: usize = 0
+        while same && i < bytes.bytes_len(&out) {
+            let b: i32 = hexval(rt.ld8(want.p as u64, 2 * i)) * 16 + hexval(rt.ld8(want.p as u64, 2 * i + 1))
+            if bytes.bytes_at(&out, i) as i32 != b {
+                same = false
+            }
+            i = i + 1
+        }
+        if !same {
+            say("FAIL bytes differ:", name)
+            var hx: rt.Buf = rt.buf_new()
+            var j: usize = 0
+            while j < bytes.bytes_len(&out) {
+                rt.buf_push_hex_u64(&hx, bytes.bytes_at(&out, j) as u64, 2)
+                j = j + 1
+            }
+            rt.buf_push(&hx, 10)
+            rt.write_everything(1, rt.buf_ptr(&hx), rt.buf_len(&hx))
+            rt.buf_free(&hx)
+            *failures = *failures + 1
+        }
+    }
+    bytes.bytes_free(&out)
+    rt.buf_free(&err)
+}
+
+// the encoder must refuse
+fn enc_refused(failures: *mut i32, name: str, sch: u64, vals: *mut rt.Buf, reason: str) {
+    var out: bytes.Bytes = bytes.bytes_new()
+    var err: rt.Buf = rt.buf_new()
+    let ok: bool = mc_encode.encode_buf(sch, vals, &out, &err)
+    if ok || bytes.bytes_len(&out) != 0 {
+        say("FAIL accepted:", name)
+        *failures = *failures + 1
+    } else {
+        // the report names the problem and the path
+        var found: bool = false
+        var i: usize = 0
+        while i + reason.n <= rt.buf_len(&err) {
+            if rt.mem_eq(rt.buf_ptr(&err) + i as u64, reason.p as u64, reason.n) {
+                found = true
+            }
+            i = i + 1
+        }
+        if !found {
+            say("FAIL wrong reason:", name)
+            rt.write_everything(1, rt.buf_ptr(&err), rt.buf_len(&err))
+            *failures = *failures + 1
+        }
+    }
+    bytes.bytes_free(&out)
+    rt.buf_free(&err)
+}
+
+fn main() -> i32 {
+    var failures: i32 = 0
+    let pos: u64 = mc_proto_v763.packet_schema(mc_version.ST_PLAY, mc_version.DIR_C2S, mc_proto_v763.PLAY_C2S_POSITION)
+    let tp: u64 = mc_proto_v763.packet_schema(mc_version.ST_PLAY, mc_version.DIR_C2S, mc_proto_v763.PLAY_C2S_TELEPORT_CONFIRM)
+    let st: u64 = mc_proto_v763.packet_schema(mc_version.ST_PLAY, mc_version.DIR_C2S, mc_proto_v763.PLAY_C2S_SETTINGS)
+    let lg: u64 = mc_proto_v763.packet_schema(mc_version.ST_LOGIN, mc_version.DIR_C2S, mc_proto_v763.LOGIN_C2S_LOGIN_START)
+    let hs: u64 = mc_proto_v763.packet_schema(mc_version.ST_HANDSHAKE, mc_version.DIR_C2S, mc_proto_v763.HANDSHAKE_C2S_SET_PROTOCOL)
+    if pos == 0 || tp == 0 || st == 0 || lg == 0 || hs == 0 {
+        say("FAIL schema handles", "")
+        return 1
+    }
+
+    // Position: f64 x, y, z + bool
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_f64(&v, "x", 1.5)
+    mc_encode.vals_f64(&v, "y", 64.0)
+    mc_encode.vals_f64(&v, "z", -2.0)
+    mc_encode.vals_bool(&v, "onGround", true)
+    enc_is(&failures, "position", pos, &v, "3ff80000000000004050000000000000c00000000000000001")
+    // the same in another order (the search fallback)
+    rt.buf_clear(&v)
+    mc_encode.vals_bool(&v, "onGround", true)
+    mc_encode.vals_f64(&v, "z", -2.0)
+    mc_encode.vals_f64(&v, "y", 64.0)
+    mc_encode.vals_f64(&v, "x", 1.5)
+    enc_is(&failures, "position unordered", pos, &v, "3ff80000000000004050000000000000c00000000000000001")
+
+    // Teleport Confirm: varint 300 = ac 02
+    rt.buf_clear(&v)
+    mc_encode.vals_i64(&v, "teleportId", 300)
+    enc_is(&failures, "teleport confirm", tp, &v, "ac02")
+    rt.buf_clear(&v)
+    mc_encode.vals_raw(&v, "teleportId", "-1")
+    enc_is(&failures, "negative varint", tp, &v, "ffffffff0f")
+    rt.buf_clear(&v)
+    mc_encode.vals_raw(&v, "teleportId", "0x7f")
+    enc_is(&failures, "hex varint", tp, &v, "7f")
+
+    // Client Information 1.20.1
+    rt.buf_clear(&v)
+    mc_encode.vals_text(&v, "locale", "en_us".p as u64, 5)
+    mc_encode.vals_i64(&v, "viewDistance", 10)
+    mc_encode.vals_i64(&v, "chatFlags", 0)
+    mc_encode.vals_bool(&v, "chatColors", true)
+    mc_encode.vals_i64(&v, "skinParts", 127)
+    mc_encode.vals_i64(&v, "mainHand", 1)
+    mc_encode.vals_bool(&v, "enableTextFiltering", false)
+    mc_encode.vals_bool(&v, "enableServerListing", true)
+    enc_is(&failures, "settings", st, &v, "05656e5f75730a00017f010001")
+
+    // Login Start: name + optional uuid (present / absent)
+    rt.buf_clear(&v)
+    mc_encode.vals_text(&v, "username", "Bob".p as u64, 3)
+    mc_encode.vals_uuid(&v, "playerUUID", 0x0102030405060708, 0x090a0b0c0d0e0f10)
+    enc_is(&failures, "login start with uuid", lg, &v, "03426f62010102030405060708090a0b0c0d0e0f10")
+    rt.buf_clear(&v)
+    mc_encode.vals_text(&v, "username", "Bob".p as u64, 3)
+    enc_is(&failures, "login start without uuid", lg, &v, "03426f6200")
+    rt.buf_clear(&v)
+    mc_encode.vals_text(&v, "username", "Bob".p as u64, 3)
+    mc_encode.vals_raw(&v, "playerUUID?", "0")
+    enc_is(&failures, "login start explicit absent", lg, &v, "03426f6200")
+
+    // Handshake: protocol, host, port u16, next state
+    rt.buf_clear(&v)
+    mc_encode.vals_i64(&v, "protocolVersion", 763)
+    mc_encode.vals_text(&v, "serverHost", "mc.example".p as u64, 10)
+    mc_encode.vals_i64(&v, "serverPort", 25565)
+    mc_encode.vals_i64(&v, "nextState", 2)
+    enc_is(&failures, "handshake", hs, &v, "fb050a6d632e6578616d706c6563dd02")
+
+    // 1.8.9: a different layout of the same semantic packet (Position is x, y, z, onGround, too)
+    let pos47: u64 = mc_proto_v47.packet_schema(mc_version.ST_PLAY, mc_version.DIR_C2S, mc_proto_v47.PLAY_C2S_POSITION)
+    rt.buf_clear(&v)
+    mc_encode.vals_f64(&v, "x", 1.5)
+    mc_encode.vals_f64(&v, "y", 64.0)
+    mc_encode.vals_f64(&v, "z", -2.0)
+    mc_encode.vals_bool(&v, "onGround", false)
+    enc_is(&failures, "position 1.8.9", pos47, &v, "3ff80000000000004050000000000000c00000000000000000")
+
+    // refusals
+    rt.buf_clear(&v)
+    mc_encode.vals_f64(&v, "x", 1.5)
+    mc_encode.vals_f64(&v, "y", 64.0)
+    mc_encode.vals_bool(&v, "onGround", true)
+    enc_refused(&failures, "missing z", pos, &v, "missing value: z")
+    rt.buf_clear(&v)
+    mc_encode.vals_text(&v, "locale", "en_us".p as u64, 5)
+    mc_encode.vals_i64(&v, "viewDistance", 200) // an i8
+    mc_encode.vals_i64(&v, "chatFlags", 0)
+    mc_encode.vals_bool(&v, "chatColors", true)
+    mc_encode.vals_i64(&v, "skinParts", 127)
+    mc_encode.vals_i64(&v, "mainHand", 1)
+    mc_encode.vals_bool(&v, "enableTextFiltering", false)
+    mc_encode.vals_bool(&v, "enableServerListing", true)
+    enc_refused(&failures, "i8 out of range", st, &v, "bad value: viewDistance")
+    rt.buf_clear(&v)
+    mc_encode.vals_raw(&v, "teleportId", "banana")
+    enc_refused(&failures, "junk integer", tp, &v, "bad value: teleportId")
+    rt.buf_clear(&v)
+    mc_encode.vals_raw(&v, "teleportId", "4294967296")
+    enc_refused(&failures, "varint too big", tp, &v, "bad value: teleportId")
+
+    // decode -> encode: the lossless dump of what we encoded is the store again
+    rt.buf_clear(&v)
+    mc_encode.vals_text(&v, "username", "B\"o\\b".p as u64, 4)
+    mc_encode.vals_uuid(&v, "playerUUID", 0x0102030405060708, 0x090a0b0c0d0e0f10)
+    var body: bytes.Bytes = bytes.bytes_new()
+    var err: rt.Buf = rt.buf_new()
+    if !mc_encode.encode_buf(lg, &v, &body, &err) {
+        say("FAIL round trip encode", "")
+        failures = failures + 1
+    } else {
+        bytes.bytes_set_pos(&body, 0)
+        var dump: rt.Buf = rt.buf_new()
+        if !mc_schema.walk_values(lg, &body, &dump) {
+            say("FAIL round trip walk_values", "")
+            failures = failures + 1
+        } else {
+            var again: bytes.Bytes = bytes.bytes_new()
+            if !mc_encode.encode_buf(lg, &dump, &again, &err) || bytes.bytes_len(&again) != bytes.bytes_len(&body) {
+                say("FAIL round trip second encode", "")
+                failures = failures + 1
+            } else if !rt.mem_eq(bytes.bytes_data(&again), bytes.bytes_data(&body), bytes.bytes_len(&body)) {
+                say("FAIL round trip bytes", "")
+                failures = failures + 1
+            }
+            bytes.bytes_free(&again)
+        }
+        rt.buf_free(&dump)
+    }
+    bytes.bytes_free(&body)
+    rt.buf_free(&err)
+    rt.buf_free(&v)
+    if failures == 0 {
+        say("ok mc_encode basic", "")
+        return 0
+    }
+    return 1
+}

@@ -75,11 +75,12 @@ Mojang code. All of it runs with `bash tools/mc/run.sh` (about 10 minutes).
 | `mc_math` | Vec3 / AABB / voxel raycast / mat4 / frustum (sub-worker C) | **done** | numpy, brute force | 2680 |
 | `mc_mesh` | CPU greedy meshing + AO (sub-worker C wrote it, lead finished) | **done** | 128 meshes vs python brute force | 2730 |
 | `mc_noise` | RNGs, Perlin, simplex, octaves | **done** | real `java.util.Random`, python bit-identical, published vectors | 2700 |
+| `mc_encode` | schema driven packet WRITER: value store (`path=value` text) -> body, any packet of any generated version (same bytecode as the walker, SCHEMA_FORMAT 2 incl. holder sets, lpVec3, recursion) | **done** (byte-identical to the reference serializer for every fixture of 10 versions, both directions) | `tools/mc/encode/run.sh`: decode (`mc_schema.walk_values`) -> encode == fixture, reversed store, damaged stores | 2651 |
 | `mc_anvil` | .mca region files read / write | **done** | independent python reader / writer, fuzz | 2710 |
 | `demos/mcclient` | **final integration**: join a real server, dump + checksum == node-minecraft-protocol | **done** (M0 accepted, see ROUND-M0.md) | node-minecraft-protocol on a real 1.20.1 server | - |
 
 Not built (explicitly): rendering / GPU (blocked by H3), Wasm mod host, physics, inventory, entity decoding, online-mode login against
-the live Microsoft / Mojang services (needs a real account), schema-driven client packet writers (design: docs/MC-VERSIONS.md section 7), an epoll based `mc_net`, chunk
+the live Microsoft / Mojang services (needs a real account), an epoll based `mc_net`, chunk
 strategies other than 1.18+ (see MC-VERSIONS.md).
 
 ## Work split (sub-workers, separate git worktrees)
