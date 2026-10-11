@@ -25,6 +25,7 @@ import mc.mc_codec
 import mc.mc_version
 import mc.mc_sem
 import mc.mc_schema
+import mc.mc_encode
 
 export {
     Client,
@@ -101,6 +102,28 @@ fn send(c: *mut Client, st: i32, sem: usize, body: *mut bytes.Bytes) -> bool {
 // Sends the semantic packet `sem` of connection state `st` (checked against the version's schema).
 fn client_send(c: *mut Client, st: i32, sem: usize, body: *mut bytes.Bytes) -> bool {
     return send(c, st, sem, body)
+}
+
+// Sends the semantic packet `sem` of connection state `st`; the body is ENCODED from the value
+// store `vals` (lib/mc/mc_encode.fi: `path=value` lines, built with mc_encode.vals_*) with the
+// version's generated schema of that packet, so no per-version writer is needed. false when the
+// version has no such packet, a value is missing / out of range, or the result does not fit.
+fn client_send_values(c: *mut Client, st: i32, sem: usize, vals: *mut rt.Buf) -> bool {
+    let id: i32 = pid(c, sem)
+    if id < 0 {
+        return false
+    }
+    let sch: u64 = (*c).ver.schema_of(st, mc_version.DIR_C2S, id)
+    if sch == 0 {
+        return false
+    }
+    var body: bytes.Bytes = bytes.bytes_new()
+    var ok: bool = mc_encode.encode_buf(sch, vals, &body, 0 as *mut rt.Buf)
+    if ok {
+        ok = send(c, st, sem, &body)
+    }
+    bytes.bytes_free(&body)
+    return ok
 }
 
 fn wire_code(e: WireError) -> i32 {
@@ -305,43 +328,89 @@ fn client_auto_reply(c: *mut Client, id: i32) -> bool {
         field_f32(c, id, "yaw".p as u64, 3, &yaw)
         field_f32(c, id, "pitch".p as u64, 5, &pitch)
         if has_tid && pid(c, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM) >= 0 {
-            var r: bytes.Bytes = bytes.bytes_new()
-            bytes.put_varint(&r, tid)
-            send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM, &r)
-            bytes.bytes_free(&r)
+            // schema driven writer (mc_encode); the hand written body stays as the fallback
+            var tv: rt.Buf = rt.buf_new()
+            mc_encode.vals_i64(&tv, "teleportId", tid as i64)
+            let sent: bool = client_send_values(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM, &tv)
+            rt.buf_free(&tv)
+            if !sent {
+                var r: bytes.Bytes = bytes.bytes_new()
+                bytes.put_varint(&r, tid)
+                send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM, &r)
+                bytes.bytes_free(&r)
+            }
         }
-        var p: bytes.Bytes = bytes.bytes_new()
-        bytes.put_f64(&p, x)
-        bytes.put_f64(&p, y)
-        bytes.put_f64(&p, z)
-        bytes.put_f32(&p, yaw)
-        bytes.put_f32(&p, pitch)
-        bytes.put_bool(&p, false)
-        send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_POSITION_LOOK, &p)
-        bytes.bytes_free(&p)
+        var pv: rt.Buf = rt.buf_new()
+        mc_encode.vals_f64(&pv, "x", x)
+        mc_encode.vals_f64(&pv, "y", y)
+        mc_encode.vals_f64(&pv, "z", z)
+        mc_encode.vals_f32(&pv, "yaw", yaw)
+        mc_encode.vals_f32(&pv, "pitch", pitch)
+        mc_encode.vals_bool(&pv, "onGround", false)
+        let sent_pl: bool = client_send_values(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_POSITION_LOOK, &pv)
+        rt.buf_free(&pv)
+        if !sent_pl {
+            var p: bytes.Bytes = bytes.bytes_new()
+            bytes.put_f64(&p, x)
+            bytes.put_f64(&p, y)
+            bytes.put_f64(&p, z)
+            bytes.put_f32(&p, yaw)
+            bytes.put_f32(&p, pitch)
+            bytes.put_bool(&p, false)
+            send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_POSITION_LOOK, &p)
+            bytes.bytes_free(&p)
+        }
         (*c).teleports = (*c).teleports + 1 as u64
         return true
     }
     if mc_version.version_has(&(*c).ver, mc_version.FLAG_CHUNK_BATCHES) && client_is(c, id, mc_sem.SEM_PLAY_S2C_CHUNK_BATCH_FINISHED) {
-        var r: bytes.Bytes = bytes.bytes_new()
-        bytes.put_f32(&r, 10.0f) // desired chunks per tick
-        send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_CHUNK_BATCH_RECEIVED, &r)
-        bytes.bytes_free(&r)
+        var cv: rt.Buf = rt.buf_new()
+        mc_encode.vals_f32(&cv, "chunksPerTick", 10.0f) // desired chunks per tick
+        let sent_cb: bool = client_send_values(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_CHUNK_BATCH_RECEIVED, &cv)
+        rt.buf_free(&cv)
+        if !sent_cb {
+            var r: bytes.Bytes = bytes.bytes_new()
+            bytes.put_f32(&r, 10.0f) // desired chunks per tick
+            send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_CHUNK_BATCH_RECEIVED, &r)
+            bytes.bytes_free(&r)
+        }
         return true
     }
     return false
 }
 
-// Client Information (view distance, chat settings). Three layouts exist: 1.17 and later append the
-// text filtering and server listing flags (1.20.1 / 1.20.2 shape); 1.9 - 1.16 end after the main
-// hand; 1.8 has no main hand at all. They are tried against the version's generated schema in that order -- `send` refuses a body
-// that does not fit, so the wrong guess never reaches the wire (docs/MC-VERSIONS.md).
+// Client Information (view distance, chat settings). One value store for every version: the
+// schema driven writer takes the fields the version's packet has and ignores the rest (1.8: no
+// main hand, 1.9 - 1.16: no text filtering / server listing, 1.17+: all eight). The hand built
+// bodies of the two known layouts stay as the fallback if the writer refuses.
 fn client_send_settings(c: *mut Client, view: i32) -> bool {
+    let sem_state: i32 = (*c).state
+    var st: i32 = mc_version.ST_PLAY
+    var sem: usize = mc_sem.SEM_PLAY_C2S_SETTINGS
+    if sem_state == mc_version.ST_CONFIG {
+        st = mc_version.ST_CONFIG
+        sem = mc_sem.SEM_CONFIG_C2S_SETTINGS
+    }
+    var v: rt.Buf = rt.buf_new()
+    var loc: [u8; 6] = "en_us\0"
+    mc_encode.vals_text(&v, "locale", (&loc[0]) as u64, 5)
+    mc_encode.vals_i64(&v, "viewDistance", view as i64)
+    mc_encode.vals_i64(&v, "chatFlags", 0) // chat: enabled
+    mc_encode.vals_bool(&v, "chatColors", true)
+    mc_encode.vals_i64(&v, "skinParts", 127)
+    mc_encode.vals_i64(&v, "mainHand", 1) // right
+    mc_encode.vals_bool(&v, "enableTextFiltering", false)
+    mc_encode.vals_bool(&v, "enableServerListing", true)
+    let done: bool = client_send_values(c, st, sem, &v)
+    rt.buf_free(&v)
+    if done {
+        return true
+    }
     var tried: i32 = 0
     while tried < 3 {
         var b: bytes.Bytes = bytes.bytes_new()
-        var loc: [u8; 6] = "en_us\0"
-        bytes.put_string_c(&b, (&loc[0]) as u64)
+        var loc2: [u8; 6] = "en_us\0"
+        bytes.put_string_c(&b, (&loc2[0]) as u64)
         bytes.put_i8(&b, view as i8)
         bytes.put_varint(&b, 0) // chat: enabled
         bytes.put_bool(&b, true) // chat colors
@@ -353,12 +422,7 @@ fn client_send_settings(c: *mut Client, view: i32) -> bool {
             bytes.put_bool(&b, false) // text filtering
             bytes.put_bool(&b, true) // server listing
         }
-        var ok: bool = false
-        if (*c).state == mc_version.ST_CONFIG {
-            ok = send(c, mc_version.ST_CONFIG, mc_sem.SEM_CONFIG_C2S_SETTINGS, &b)
-        } else {
-            ok = send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_SETTINGS, &b)
-        }
+        let ok: bool = send(c, st, sem, &b)
         bytes.bytes_free(&b)
         if ok {
             return true
