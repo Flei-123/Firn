@@ -78,6 +78,9 @@ const O_TOPBIT: u64 = 14
 const O_EMETA: u64 = 15
 const O_NBT: u64 = 16
 const O_REGHOLDER: u64 = 17
+const O_REGSET: u64 = 18
+const O_LPVEC3: u64 = 19
+const O_RCALL: u64 = 20
 
 // scalar kinds
 const K_U8: u64 = 0
@@ -98,7 +101,7 @@ const K_UUID: u64 = 13
 const CK_CONST: u64 = 32
 const CK_REG: u64 = 33
 
-const SCHEMA_FORMAT: i32 = 1
+const SCHEMA_FORMAT: i32 = 2
 
 // ---- limits
 const MAX_EMPTY: u64 = 65536 // elements count for arrays whose elements may be empty
@@ -774,6 +777,8 @@ fn exec_type(w: *mut W) {
     } else if op == O_REGHOLDER {
         let nl: u64 = rd_u(w)
         (*w).pc = (*w).pc + nl
+        let nl2: u64 = rd_u(w)
+        (*w).pc = (*w).pc + nl2
         let blen: u64 = rd_u(w)
         let end: u64 = (*w).pc + blen
         let n: u64 = rd_varint(w)
@@ -785,9 +790,137 @@ fn exec_type(w: *mut W) {
             exec_type(w)
         }
         (*w).pc = end
+    } else if op == O_RCALL {
+        exec_rcall(w)
+    } else if op == O_REGSET {
+        exec_regset(w)
+    } else if op == O_LPVEC3 {
+        exec_lpvec3(w)
     } else {
         fail(w)
     }
+}
+
+// A recursive reference (a type that holds itself, e.g. a slot component that holds a
+// slot). Same operand as CALL. The callee may overwrite registers that the caller still
+// needs (the same subroutine runs again), so the whole register file is saved here and
+// restored after the call. Depth is limited by MAX_CALL_DEPTH.
+fn exec_rcall(w: *mut W) {
+    var zz: u64 = 0
+    var i: u64 = 0
+    while i < 4 {
+        zz = zz | ((rt.ld8((*w).pc, i as usize) as u64) << (6 * i))
+        i = i + 1
+    }
+    (*w).pc = (*w).pc + 4
+    let ret: u64 = (*w).pc
+    var target: u64 = 0
+    if (zz & 1) == 0 {
+        target = ret + (zz >> 1)
+    } else {
+        target = ret - ((zz + 1) >> 1)
+    }
+    if (*w).calls >= MAX_CALL_DEPTH {
+        fail(w)
+        return
+    }
+    var saved: [u64; 128] = [0; 128]
+    var k: usize = 0
+    while k < REGS {
+        saved[k] = rt.ld64((*w).regs, k)
+        k = k + 1
+    }
+    (*w).calls = (*w).calls + 1
+    (*w).pc = target
+    exec_type(w)
+    (*w).calls = (*w).calls - 1
+    (*w).pc = ret
+    k = 0
+    while k < REGS {
+        rt.st64((*w).regs, k, saved[k])
+        k = k + 1
+    }
+}
+
+// lpVec3 (1.21.9+): u8 a; a == 0: a zero vector, nothing follows; else u8 b, u32 c and,
+// when bit 2 of a is set, one varint (the scale extension): 6 or 6+varint octets.
+fn exec_lpvec3(w: *mut W) {
+    if left(w) < 1 {
+        fail(w)
+        return
+    }
+    let a: u64 = be(w, 1)
+    var n: usize = 1
+    if a != 0 {
+        if left(w) < 5 {
+            fail(w)
+            return
+        }
+        be(w, 5)
+        n = 6
+        if (a & 4) != 0 {
+            let before: usize = (*w).pos
+            rd_varint(w)
+            if (*w).bad {
+                return
+            }
+            n = n + ((*w).pos - before)
+        }
+    }
+    dump_len(w, n)
+}
+
+// registryEntryHolderSet: varint n; n == 0: the base type (a tag name); else n-1
+// elements of the element type. The count is a claim of the peer: every element needs
+// at least `minsz` octets (generator), so n-1 <= left/minsz; zero width elements are
+// capped by MAX_EMPTY and the operation budget.
+fn exec_regset(w: *mut W) {
+    let nl1: u64 = rd_u(w)
+    (*w).pc = (*w).pc + nl1
+    let nl2: u64 = rd_u(w)
+    (*w).pc = (*w).pc + nl2
+    let minsz: u64 = rd_u(w)
+    let blen1: u64 = rd_u(w)
+    let base: u64 = (*w).pc
+    (*w).pc = base + blen1
+    let blen2: u64 = rd_u(w)
+    let elem: u64 = (*w).pc
+    let end: u64 = elem + blen2
+    let n: u64 = rd_varint(w)
+    if (*w).bad {
+        return
+    }
+    dump_scalar(w, K_VARINT, n)
+    if n == 0 {
+        (*w).pc = base
+        exec_type(w)
+    } else {
+        let cnt: u64 = n - 1
+        if minsz > 0 {
+            if cnt > (left(w) as u64) / minsz {
+                fail(w)
+                return
+            }
+        } else {
+            if cnt > MAX_EMPTY {
+                fail(w)
+                return
+            }
+        }
+        var i: u64 = 0
+        while i < cnt {
+            if (*w).bad {
+                return
+            }
+            let mark: usize = (*w).plen
+            path_index(w, i)
+            (*w).pc = elem
+            exec_type(w)
+            (*w).plen = mark
+            i = i + 1
+        }
+    }
+    (*w).pc = end
 }
 
 fn exec_field(w: *mut W) {
