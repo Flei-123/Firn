@@ -109,6 +109,8 @@ player-idle-timeout=0
 motd=mcclient test server
 EOF
   
+  # 1.8.x: the Netty epoll transport of the old server fails on Java 9+ ("Unable to access address of buffer"); use NIO
+  case "$MCV" in 1.8*) echo "use-native-transport=false" >> "$W/srv/server.properties" ;; esac
   mkfifo "$W/in"
   exec 3<>"$W/in"
   ( cd "$W/srv" && exec "$JAVA" -Xmx1G -Xms256M -jar server.jar nogui < "$W/in" > "$W/server.log" 2>&1 ) &
@@ -216,7 +218,7 @@ fi
 
 echo "== metrics =="
 metric() { grep -h "^metric $2=" "$W/out/$1.metrics" 2>/dev/null | head -1 | cut -d= -f2-; }
-KEYS="connect_ms join_ms first_chunk_ms total_ms packets bytes_in bytes_decompressed packets_per_s chunks walk_ok walk_fail"
+KEYS="connect_ms join_ms first_chunk_ms total_ms packets bytes_in bytes_decompressed packets_per_s chunks walk_ok walk_fail bulk_packets bulk_columns"
 COLS="A B A2$EXTRA_LABELS"
 printf '%-20s' key; for c in $COLS; do printf '%-14s' "$c"; done; echo
 for k in $KEYS; do

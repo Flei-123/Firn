@@ -39,7 +39,7 @@ import mc.mc_version
 export {
     Container, Section, Chunk, Scratch,
     scratch_new, scratch_free, scratch_set_sky,
-    chunk_decode, chunk_decode_anon, chunk_decode_118, chunk_decode_19, chunk_decode_114, chunk_decode_for, container_remap, chunk_remap_blocks, chunk_merge_update, chunk_format_supported, chunk_free, chunk_section, chunk_alloc, chunk_release,
+    chunk_decode, chunk_decode_anon, chunk_decode_118, chunk_decode_19, chunk_decode_114, chunk_decode_legacy8, chunk_is_unload_legacy8, Legacy8Bulk, legacy8_bulk_open, legacy8_bulk_next, legacy8_bulk_complete, legacy8_bulk_free, legacy8_data_len, chunk_decode_for, container_remap, chunk_remap_blocks, chunk_merge_update, chunk_format_supported, chunk_free, chunk_section, chunk_alloc, chunk_release,
     container_get, container_bits, container_palette_size,
     BLOCKS_PER_SECTION, BIOMES_PER_SECTION, HM_ENTRIES, HM_MAX, HM_NAME_MAX,
 }
@@ -660,10 +660,11 @@ fn read_light(b: *mut bytes.Bytes, h: *mut u64) -> BytesError!i32 {
 //                      NBT, separate light packet, biomes as int array, longs do not span  (1.14/1.15/1.17: open)
 //   CF_SECTIONS_19     implemented (chunk_decode_19): paletted blocks only, inline light, biome
 //                      bytes, block ids are id<<4|meta (no flattening)  1.9 - 1.12.2 (1.13 differs, see docs/MC-VERSIONS.md)
-//   CF_LEGACY_8        not implemented: unpaletted arrays        1.8
+//   CF_LEGACY_8        implemented (chunk_decode_legacy8 + legacy8_bulk_*): unpaletted u16 LE arrays,
+//                      light per column, map_chunk_bulk, unload = empty ground-up column  1.8 - 1.8.9
 fn chunk_format_supported(fmt: i32) -> bool {
     return fmt == mc_version.CF_CONTAINERS_118 || fmt == mc_version.CF_SECTIONS_19
-    || fmt == mc_version.CF_SECTIONS_114
+    || fmt == mc_version.CF_SECTIONS_114 || fmt == mc_version.CF_LEGACY_8
 }
 
 // Strategy dispatch on the version's chunk format. Returns BytesError::Range for a
@@ -679,6 +680,9 @@ fn chunk_decode_for(v: *mut mc_version.Version, b: *mut bytes.Bytes, sc: *mut Sc
     }
     if (*v).chunk_format == mc_version.CF_SECTIONS_114 {
         return try chunk_decode_114(b, sc, c, (*v).protocol)
+    }
+    if (*v).chunk_format == mc_version.CF_LEGACY_8 {
+        return try chunk_decode_legacy8(b, sc, c)
     }
     return BytesError::Range
 }
@@ -1194,4 +1198,250 @@ fn chunk_merge_update(dst: *mut Chunk, upd: *mut Chunk) -> i32 {
     (*dst).block_n = (*dst).block_n + (*upd).block_n
     (*dst).sky_n = (*dst).sky_n + (*upd).sky_n
     return merged
+}
+
+// ------------------------------------------------------------ CF_LEGACY_8 (1.8 - 1.8.9)
+//
+// map_chunk body: x (i32), z (i32), groundUp (bool), bitMap (u16, bit i = section i present),
+// chunkData (varint length + octets). NO block entities and no block-entity count in this packet.
+// chunkData, in this order (NOT per section):
+//     every present section: 4096 blocks as u16 LITTLE endian (id << 4 | meta), index (y*16 + z)*16 + x,
+//     every present section: 2048 octets block light,
+//     every present section: 2048 octets sky light (only if the dimension has a sky),
+//     groundUp: 256 biome octets.
+// map_chunk_bulk body: skyLightSent (bool), count (varint), count x { x (i32), z (i32), bitMap (u16) },
+// then the chunk data of all columns back to back (each laid out as above; every column of a bulk
+// has groundUp = true, so every column ends with its 256 biome octets).
+// A chunk UNLOAD is a map_chunk with groundUp = true, bitMap = 0 and an EMPTY chunkData (no biomes).
+// Block values stay `id << 4 | meta` (no flattening). The neutral Chunk gets all 16 sections (an
+// absent one is all air), `count` = number of non-air blocks, biomes of a section = single value 0
+// (the real biomes are the column array Chunk.bio), light is hashed in wire order (all block light,
+// then all sky light).
+
+const L8_BLOCK_OCTETS: usize = 8192
+const L8_LIGHT_OCTETS: usize = 2048
+
+fn legacy8_popcount(m: i32) -> usize {
+    var n: usize = 0
+    var i: u32 = 0
+    while i < 16 as u32 {
+        if ((m >> i) & 1) != 0 {
+            n = n + 1
+        }
+        i = i + 1 as u32
+    }
+    return n
+}
+
+// Octets of the chunk data of one column.
+fn legacy8_data_len(mask: i32, ground_up: bool, sky: bool) -> usize {
+    let n: usize = legacy8_popcount(mask)
+    var per: usize = L8_BLOCK_OCTETS + L8_LIGHT_OCTETS
+    if sky {
+        per = per + L8_LIGHT_OCTETS
+    }
+    var len: usize = n * per
+    if ground_up {
+        len = len + 256
+    }
+    return len
+}
+
+// true for the "column is gone" form of Chunk (map_chunk, groundUp, bitMap 0, empty data)
+fn chunk_is_unload_legacy8(c: *mut Chunk) -> bool {
+    return (*c).ground_up == 1 && (*c).nsec == 0 && (*c).bio == 0
+}
+
+// Decodes the chunk data `data` of ONE column (must be consumed exactly) into `c`.
+// On error `c` may be half built: call chunk_free on it either way.
+fn legacy8_column(data: *mut bytes.Bytes, x: i32, z: i32, mask: i32, ground_up: bool, sky: bool,
+    sc: *mut Scratch, c: *mut Chunk) -> BytesError!bool {
+    (*c).x = x
+    (*c).z = z
+    (*c).ground_up = 0
+    if ground_up {
+        (*c).ground_up = 1
+    }
+    (*c).nsec = 0
+    (*c).secs = 0
+    (*c).nhm = 0
+    (*c).hm_val = 0
+    (*c).bio = 0
+    (*c).nbe = 0
+    (*c).sky_n = 0
+    (*c).block_n = 0
+    (*c).light_hash = 14695981039346656037 as u64
+    if mask < 0 || mask > 65535 {
+        return BytesError::Range
+    }
+    let nset: usize = legacy8_popcount(mask)
+    if ground_up && mask == 0 && bytes.bytes_remaining(data) == 0 {
+        return true // unload marker: no sections, no biomes (chunk_is_unload_legacy8)
+    }
+    let need: usize = legacy8_data_len(mask, ground_up, sky)
+    if bytes.bytes_remaining(data) < need {
+        return BytesError::Underflow
+    }
+    if bytes.bytes_remaining(data) != need {
+        return BytesError::Range // wrong sky light assumption or garbage: never guess
+    }
+    var bp: u64 = 0
+    var lp: u64 = 0
+    var sp: u64 = 0
+    if nset > 0 {
+        bp = try bytes.get_span(data, nset * L8_BLOCK_OCTETS)
+        lp = try bytes.get_span(data, nset * L8_LIGHT_OCTETS)
+        if sky {
+            sp = try bytes.get_span(data, nset * L8_LIGHT_OCTETS)
+        }
+    }
+    var h: u64 = (*c).light_hash
+    hash_span(&h, lp, nset * L8_LIGHT_OCTETS)
+    if sky {
+        hash_span(&h, sp, nset * L8_LIGHT_OCTETS)
+        (*c).sky_n = nset as i32
+    }
+    (*c).block_n = nset as i32
+    (*c).light_hash = h
+    let base: u64 = rt.heap_alloc(16 * section_size())
+    if base == 0 {
+        return BytesError::OutOfMemory
+    }
+    (*c).secs = base
+    var k: usize = 0
+    var i: usize = 0
+    while i < 16 {
+        let s: *mut Section = ((*c).secs + (i * section_size()) as u64) as *mut Section
+        (*s).blocks = container_empty()
+        (*s).biomes = container_empty()
+        (*c).nsec = i + 1
+        (*s).count = 0
+        if ((mask >> (i as u32)) & 1) != 0 {
+            let sec: u64 = bp + (k * L8_BLOCK_OCTETS) as u64
+            var nonair: i32 = 0
+            var q: usize = 0
+            while q < BLOCKS_PER_SECTION {
+                let v: u16 = (rt.ld8(sec, q * 2) as u16) | ((rt.ld8(sec, q * 2 + 1) as u16) << 8)
+                if v >= 32768 as u16 {
+                    return BytesError::Range // beyond the id table of the neutral model (vanilla 1.8 stays below 4096 << 4)
+                }
+                rt.st16((*sc).ids, q, v)
+                if v != 0 as u16 {
+                    nonair = nonair + 1
+                }
+                q = q + 1
+            }
+            (*s).count = nonair
+            try container_build(sc, BLOCKS_PER_SECTION, &(*s).blocks)
+            k = k + 1
+        } else {
+            try container_zero(sc, BLOCKS_PER_SECTION, &(*s).blocks)
+        }
+        try container_zero(sc, BIOMES_PER_SECTION, &(*s).biomes)
+        i = i + 1
+    }
+    if ground_up {
+        let bio: u64 = try bytes.get_span(data, 256)
+        (*c).bio = rt.heap_alloc(256)
+        if (*c).bio == 0 {
+            return BytesError::OutOfMemory
+        }
+        rt.mem_copy((*c).bio, bio, 256)
+    }
+    return true
+}
+
+// Decodes a whole 1.8 `map_chunk` body (cursor behind the packet id). Whether sky light is present
+// comes from the dimension: scratch_set_sky. An unload (see above) yields a chunk for which
+// chunk_is_unload_legacy8 is true. On error `c` may be half built: call chunk_free on it either way.
+fn chunk_decode_legacy8(b: *mut bytes.Bytes, sc: *mut Scratch, c: *mut Chunk) -> BytesError!bool {
+    let x: i32 = try bytes.get_i32(b)
+    let z: i32 = try bytes.get_i32(b)
+    let gu: u8 = try bytes.get_u8(b)
+    let mask: i32 = (try bytes.get_u16(b)) as i32
+    let dl: i32 = try bytes.get_varint(b)
+    if dl < 0 || dl as usize > bytes.bytes_remaining(b) {
+        return BytesError::Range
+    }
+    let dp: u64 = try bytes.get_span(b, dl as usize)
+    var data: bytes.Bytes = bytes.Bytes { data: dp, cap: dl as usize, len: dl as usize, pos: 0, bad: false }
+    try legacy8_column(&data, x, z, mask, gu != 0 as u8, (*sc).sky, sc, c)
+    if bytes.bytes_remaining(b) != 0 {
+        return BytesError::Range // the packet must be consumed exactly
+    }
+    return true
+}
+
+// ---- map_chunk_bulk: header first, then one call per column
+struct Legacy8Bulk {
+    sky: bool, // skyLightSent
+    n: usize, // number of columns
+    next: usize, // next column to decode
+    meta: u64, // u64 [n*3]: x, z (as i32 sign extended), bitMap
+}
+
+// Reads the bulk header (skyLightSent, count, per-column metadata); the cursor then stands at the
+// first column's data. Release with legacy8_bulk_free.
+fn legacy8_bulk_open(b: *mut bytes.Bytes, h: *mut Legacy8Bulk) -> BytesError!bool {
+    (*h).sky = false
+    (*h).n = 0
+    (*h).next = 0
+    (*h).meta = 0
+    let sky: u8 = try bytes.get_u8(b)
+    let n: i32 = try bytes.get_varint(b)
+    if n < 0 || n > 4096 {
+        return BytesError::Range
+    }
+    if (n as usize) * 10 > bytes.bytes_remaining(b) {
+        return BytesError::Underflow
+    }
+    (*h).sky = sky != 0 as u8
+    if n > 0 {
+        (*h).meta = rt.heap_alloc((n as usize) * 3 * 8)
+        if (*h).meta == 0 {
+            return BytesError::OutOfMemory
+        }
+        (*h).n = n as usize
+    }
+    var i: usize = 0
+    while i < (*h).n {
+        rt.st64((*h).meta, i * 3, (try bytes.get_i32(b)) as i64 as u64)
+        rt.st64((*h).meta, i * 3 + 1, (try bytes.get_i32(b)) as i64 as u64)
+        rt.st64((*h).meta, i * 3 + 2, (try bytes.get_u16(b)) as u64)
+        i = i + 1
+    }
+    return true
+}
+
+// Decodes the next column of the bulk into `c` (a fresh chunk_alloc). Error if none is left.
+fn legacy8_bulk_next(b: *mut bytes.Bytes, h: *mut Legacy8Bulk, sc: *mut Scratch, c: *mut Chunk) -> BytesError!bool {
+    let i: usize = (*h).next
+    if i >= (*h).n {
+        return BytesError::Range
+    }
+    (*h).next = i + 1
+    let x: i32 = rt.ld64((*h).meta, i * 3) as i64 as i32
+    let z: i32 = rt.ld64((*h).meta, i * 3 + 1) as i64 as i32
+    let mask: i32 = rt.ld64((*h).meta, i * 3 + 2) as i32
+    let len: usize = legacy8_data_len(mask, true, (*h).sky)
+    if len > bytes.bytes_remaining(b) {
+        return BytesError::Underflow
+    }
+    let dp: u64 = try bytes.get_span(b, len)
+    var data: bytes.Bytes = bytes.Bytes { data: dp, cap: len, len: len, pos: 0, bad: false }
+    return try legacy8_column(&data, x, z, mask, true, (*h).sky, sc, c)
+}
+
+// true when every column was decoded and the packet is consumed exactly
+fn legacy8_bulk_complete(b: *mut bytes.Bytes, h: *mut Legacy8Bulk) -> bool {
+    return (*h).next == (*h).n && bytes.bytes_remaining(b) == 0
+}
+
+fn legacy8_bulk_free(h: *mut Legacy8Bulk) {
+    if (*h).meta != 0 {
+        rt.heap_free((*h).meta, (*h).n * 3 * 8)
+    }
+    (*h).meta = 0
+    (*h).n = 0
+    (*h).next = 0
 }

@@ -22,6 +22,7 @@
 const NMP_VERSION = process.env.MC_NMP || '1.20.1'
 const PROTOCOL = parseInt(process.env.MC_PROTOCOL || '763', 10)
 const LEGACY_SECTIONS = PROTOCOL <= 340 && PROTOCOL >= 107 // 1.9 - 1.12.2: CF_SECTIONS_19
+const LEGACY8 = PROTOCOL <= 47 // 1.8 - 1.8.9: CF_LEGACY_8 (map_chunk + map_chunk_bulk, unpaletted u16 LE blocks)
 const SECTIONS_114 = PROTOCOL >= 751 && PROTOCOL <= 754 // 1.16.2 - 1.16.5: CF_SECTIONS_114
 
 const fs = require('fs')
@@ -338,6 +339,62 @@ function decodeChunk114 (p) {
   }
 }
 
+// ---------------------------------------------------------------- 1.8 - 1.8.9 (CF_LEGACY_8)
+// Column data (map_chunk chunkData, or one slice of map_chunk_bulk): for every present section 4096 blocks
+// as u16 LITTLE endian (id << 4 | meta); then for every present section 2048 octets block light; then (only
+// with sky light) for every present section 2048 octets sky light; a ground-up column ends with 256 biome
+// octets. The light is hashed in wire order. Independent of the Firn decoder (own offsets, no shared code).
+function legacy8Len (mask, hasSky, groundUp) {
+  let n = 0
+  for (let i = 0; i < 16; i++) if (mask & (1 << i)) n++
+  return n * (8192 + 2048 + (hasSky ? 2048 : 0)) + (groundUp ? 256 : 0)
+}
+
+function decodeLegacy8Column (x, z, mask, groundUp, hasSky, data) {
+  if (data.length !== legacy8Len(mask, hasSky, groundUp)) {
+    throw new Error(`legacy8 data length ${data.length}, expected ${legacy8Len(mask, hasSky, groundUp)}`)
+  }
+  const present = []
+  for (let i = 0; i < 16; i++) if (mask & (1 << i)) present.push(i)
+  const n = present.length
+  const f = new Fnv64()
+  const lightOff = n * 8192
+  for (let k = 0; k < n * 2048; k++) f.byte(data[lightOff + k])
+  let skyN = 0
+  if (hasSky) {
+    for (let k = 0; k < n * 2048; k++) f.byte(data[lightOff + n * 2048 + k])
+    skyN = n
+  }
+  const sections = []
+  for (let i = 0; i < 16; i++) {
+    const k = present.indexOf(i)
+    if (k < 0) {
+      sections.push({ blockCount: 0, blocksHash: hashU16(new Array(4096).fill(0)), distinct: 1, ids: null })
+      continue
+    }
+    const ids = new Array(4096)
+    for (let q = 0; q < 4096; q++) ids[q] = data.readUInt16LE(k * 8192 + q * 2)
+    let nonAir = 0
+    for (const v of ids) if (v !== 0) nonAir++
+    sections.push({ blockCount: nonAir, blocksHash: hashU16(ids), distinct: new Set(ids).size, ids })
+  }
+  let biomes = null
+  if (groundUp) {
+    const off = n * (8192 + 2048 + (hasSky ? 2048 : 0))
+    biomes = Array.from(data.subarray(off, off + 256))
+  }
+  return {
+    x,
+    z,
+    sections,
+    legacy: true,
+    biomesHash: biomes ? hashU16(biomes) : null,
+    blockEntities: 0,
+    hm: [],
+    light: { sky: skyN, block: n, h: f.hex() }
+  }
+}
+
 function decodeChunk (p, numSections) {
   const sections = decodeSections(p.chunkData, numSections)
   const hm = []
@@ -429,6 +486,8 @@ function main () {
   let idleTimer = null
   let finished = false
   let chunkErrors = 0
+  let bulkPackets = 0
+  let bulkColumns = 0 // 1.8: map_chunk_bulk packets / columns they carried
   let numSections = 24
 
   const client = mc.createClient({ host, port, username: name, version: NMP_VERSION, auth: 'offline', viewDistance: String(viewDistance), hideErrors: false })
@@ -458,6 +517,8 @@ function main () {
       walk_fail: walkFail + chunkErrors,
       num_sections: numSections,
       partial_chunks: partialChunks,
+      bulk_packets: bulkPackets,
+      bulk_columns: bulkColumns,
       trailing_nonzero_chunks: trailingNonZero,
       checksum: sum
     }
@@ -489,7 +550,7 @@ function main () {
   let partialChunks = 0
   client.on('login', (p) => {
     m.join_ms = Date.now() - t0
-    if (LEGACY_SECTIONS) {
+    if (LEGACY_SECTIONS || LEGACY8) {
       hasSky = p.dimension === 0 // 1.12.2: -1 nether, 0 overworld, 1 end (only the overworld has a sky)
       client.write('settings', {
         locale: 'en_US', viewDistance, chatFlags: 0, chatColors: true, skinParts: 0x7f, mainHand: 1
@@ -511,10 +572,23 @@ function main () {
     })
   })
   client.on('chunk_batch_finished', () => { client.write('chunk_batch_received', { chunksPerTick: 10 }) })
-  client.on('position', (p) => { client.write('teleport_confirm', { teleportId: p.teleportId }) })
+  client.on('position', (p) => { if (!LEGACY8) client.write('teleport_confirm', { teleportId: p.teleportId }) }) // 1.8 has no teleport confirm
 
   client.on('map_chunk', (p) => {
     if (m.first_chunk_ms < 0) m.first_chunk_ms = Date.now() - t0
+    if (LEGACY8) {
+      try {
+        if (p.groundUp && p.bitMap === 0 && p.chunkData.length === 0) { chunks.delete(`${p.x},${p.z}`); armIdle(); return } // 1.8 unload
+        if (!p.groundUp) { partialChunks++; armIdle(); return } // section-only update: ignored (documented)
+        const c = decodeLegacy8Column(p.x, p.z, p.bitMap, true, hasSky, p.chunkData)
+        chunks.set(`${c.x},${c.z}`, c)
+      } catch (e) {
+        chunkErrors++
+        console.error(`chunk decode failed at ${p.x},${p.z}: ${e.message}`)
+      }
+      armIdle()
+      return
+    }
     try {
       if ((LEGACY_SECTIONS || SECTIONS_114) && !p.groundUp) { partialChunks++; armIdle(); return } // section-only update: ignored (documented)
       const c = LEGACY_SECTIONS ? decodeLegacyColumn(p, hasSky) : SECTIONS_114 ? decodeChunk114(p) : decodeChunk(p, numSections)
@@ -524,6 +598,25 @@ function main () {
       console.error(`chunk decode failed at ${p.x},${p.z}: ${e.message}`)
       if (process.env.MC_REF_DEBUG_FILE) fs.writeFileSync(process.env.MC_REF_DEBUG_FILE, Buffer.from(p.chunkData).toString('hex'))
       if (process.env.MC_REF_DEBUG) console.error(`  debug chunkData(${p.chunkData.length}) head=${Buffer.from(p.chunkData).subarray(0, 96).toString('hex')}`)
+    }
+    armIdle()
+  })
+
+  client.on('map_chunk_bulk', (p) => {
+    if (m.first_chunk_ms < 0) m.first_chunk_ms = Date.now() - t0
+    bulkPackets++; bulkColumns += p.meta.length
+    try {
+      let off = 0
+      for (const e of p.meta) {
+        const len = legacy8Len(e.bitMap, p.skyLightSent, true)
+        const c = decodeLegacy8Column(e.x, e.z, e.bitMap, true, p.skyLightSent, p.data.subarray(off, off + len))
+        off += len
+        chunks.set(`${c.x},${c.z}`, c)
+      }
+      if (off !== p.data.length) throw new Error(`bulk data ${p.data.length} octets, columns use ${off}`)
+    } catch (e) {
+      chunkErrors++
+      console.error(`bulk decode failed: ${e.message}`)
     }
     armIdle()
   })
