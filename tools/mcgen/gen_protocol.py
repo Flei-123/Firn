@@ -78,6 +78,9 @@ import json
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gen_registry  # noqa: E402
+
 FORMAT = 1
 
 K = dict(u8=0, i8=1, u16=2, i16=3, u32=4, i32=5, u64=6, i64=7, f32=8, f64=9,
@@ -659,6 +662,7 @@ def generate(data_dir, version, out_path):
     w("import std.rt")
     w("import mc.mc_version")
     w("import mc.mc_sem")
+    w("import mc.v%d.mc_reg_v%d" % (pver, pver))
     w("")
     w("const PROTOCOL_VERSION: i32 = %d" % pver)
     w("const SCHEMA_FORMAT: i32 = %d" % FORMAT)
@@ -768,6 +772,7 @@ fn packet_id_limit(state: i32, dir: i32) -> i32 {
     w("    v.id_limit = packet_id_limit")
     w("    v.name_of = packet_name")
     w("    v.schema_of = packet_schema")
+    w("    v.registry_of = mc_reg_v%d.registry_make" % pver)
     states_by_name = {sname: si for si, (sname, _) in enumerate(STATES)}
     dirs_by_name = {dname: di for di, (dname, _) in enumerate(DIRS)}
     for e in sem:
@@ -862,6 +867,7 @@ def main():
             d = os.path.join(libdir, "v%d" % pver)
             os.makedirs(d, exist_ok=True)
             generate(data_dir, vkey, os.path.join(d, "mc_proto_v%d.fi" % pver))
+            gen_registry.generate(data_dir, vkey, os.path.join(d, "mc_reg_v%d.fi" % pver))
             entries.append((pver, vkey))
         write_registry(os.path.join(libdir, "mc_versions.fi"), entries)
         return

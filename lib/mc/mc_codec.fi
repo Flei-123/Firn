@@ -34,12 +34,14 @@ import std.net
 import std.bytes
 import std.rt
 import std.deflate
+import std.crypto.aes
 
 export {
     WireError, Wire,
     wire_open, wire_close, wire_set_threshold, wire_read_packet,
     wire_send_packet, wire_timeout, wire_stat_in, wire_stat_inflated,
-    wire_stat_packets, wire_stat_compressed,
+    wire_stat_packets, wire_stat_compressed, wire_enable_encryption,
+    wire_encrypted, wire_view_rest,
     MAX_PACKET, MAX_INFLATED,
 }
 
@@ -76,13 +78,19 @@ struct Wire {
     n_inflated: u64, // octets after inflation (payload sizes)
     n_packets: u64,
     n_compressed: u64, // packets that arrived compressed
+    crypt: bool, // AES-128-CFB8 on the whole connection (after Encryption Response)
+    aes: aes.Aes,
+    iv_rx: [u8; 16], // the CFB8 shift registers, one per direction, for the life of the connection
+    iv_tx: [u8; 16],
 }
 
 fn wire_open(c: net.Conn) -> Wire {
+    var zero16: [u8; 16] = [0; 16]
     return Wire { conn: c, rbuf: 0, rcap: 0, rstart: 0, rend: 0,
         threshold: 0 - 1, zin: rt.buf_new(), zout: rt.buf_new(),
         frame: bytes.bytes_new(), n_in: 0, n_inflated: 0, n_packets: 0,
-        n_compressed: 0 }
+        n_compressed: 0, crypt: false, aes: aes.aes128_new((&zero16[0]) as u64),
+        iv_rx: [0; 16], iv_tx: [0; 16] }
 }
 
 fn wire_close(w: *mut Wire) {
@@ -95,6 +103,31 @@ fn wire_close(w: *mut Wire) {
     rt.buf_free(&(*w).zin)
     rt.buf_free(&(*w).zout)
     bytes.bytes_free(&(*w).frame)
+}
+
+// Switches AES-128-CFB8 on in BOTH directions from the next octet on. Key and IV are
+// the 16 octet shared secret (the protocol uses the secret for both). Octets that
+// are already in the receive buffer are NOT decrypted -- call it between packets,
+// at the point where the protocol says "everything after this is encrypted".
+fn wire_enable_encryption(w: *mut Wire, secret: u64) {
+    (*w).aes = aes.aes128_new(secret)
+    var i: usize = 0
+    while i < 16 {
+        (*w).iv_rx[i] = rt.ld8(secret, i)
+        (*w).iv_tx[i] = rt.ld8(secret, i)
+        i = i + 1
+    }
+    (*w).crypt = true
+}
+
+fn wire_encrypted(w: *mut Wire) -> bool { return (*w).crypt }
+
+// A Bytes view on the part of a received packet behind the cursor (the body after
+// the id) -- what wire_send_packet wants for an echo or a forward.
+fn wire_view_rest(body: *mut bytes.Bytes) -> bytes.Bytes {
+    let pos: usize = bytes.bytes_pos(body)
+    let n: usize = bytes.bytes_len(body) - pos
+    return bytes.Bytes { data: bytes.bytes_ptr(body) + pos as u64, cap: n, len: n, pos: 0, bad: false }
 }
 
 fn wire_set_threshold(w: *mut Wire, t: i32) {
@@ -173,6 +206,10 @@ fn fill(w: *mut Wire, n: usize) -> WireError!bool {
         }
         if got == 0 {
             return WireError::Closed
+        }
+        if (*w).crypt {
+            let at: u64 = (*w).rbuf + (*w).rend as u64
+            aes.aes_cfb8_decrypt(&(*w).aes, (&(*w).iv_rx[0]) as u64, at, got, at)
         }
         (*w).rend = (*w).rend + got
         (*w).n_in = (*w).n_in + got as u64
@@ -311,6 +348,10 @@ fn wire_send_packet(w: *mut Wire, id: i32, body: *mut bytes.Bytes) -> WireError!
     }
     if !bytes.bytes_ok(f) {
         return WireError::TooBig
+    }
+    if (*w).crypt {
+        aes.aes_cfb8_encrypt(&(*w).aes, (&(*w).iv_tx[0]) as u64, bytes.bytes_ptr(f),
+            bytes.bytes_len(f), bytes.bytes_ptr(f))
     }
     let sent: usize = net.write_all(&(*w).conn, bytes.bytes_ptr(f), bytes.bytes_len(f)) catch 0
     if sent != bytes.bytes_len(f) {
