@@ -1,0 +1,377 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_registry.fi -- blocks, block states, items, entities and biomes of ONE game
+// version as compact generated tables (GDD 8.6: version = data).
+//
+// The tables are produced by tools/mcgen/gen_registry.py out of minecraft-data
+// (blocks.json, items.json, entities.json, biomes.json) into lib/mc/vNNN/mc_reg_vNNN.fi;
+// that module only holds the blob and `registry_make()`. Everything that READS the blob
+// is here and is the same for every version.
+//
+// BLOB (every number is a u28 stored in 4 octets of 7 bits, most significant group
+// first, so the whole blob is ASCII-clean and can be a Firn string literal):
+//
+//   "FRG1"
+//   header: nblocks nstates(= highest state id + 1) blocks_off nitems items_off nentities entities_off
+//           nbiomes biomes_off                                     (9 numbers)
+//   string pool: NUL terminated names; offset 0 is the empty string
+//   block record x8:   name_off min_state max_state default_state props_off flags
+//                      hardness_milli stack_size
+//       flags: bit0 solid box (boundingBox "block"), bit1 transparent, bit2 diggable,
+//              bits 4-7 filterLight, bits 8-11 emitLight
+//       hardness_milli: hardness * 1000, 0xFFFFFFF = none (unbreakable)
+//   property list at props_off: nprops, then per property x4:
+//                      name_off type(0 bool, 1 enum, 2 int) num_values values_off
+//       values_off: 0, or num_values name offsets (every enum and the ints that carry
+//       explicit value names, e.g. leaves distance 1..7)
+//   item record x2:    name_off stack_size                 (index = item id)
+//   entity record x5:  name_off width_milli height_milli kind_off id  (dense, sorted by id,
+//                      kind, name; the id is NOT unique before 1.13: objects and mobs differ)
+//   biome record x4:   name_off category_off color id     (dense, sorted by id, name)
+//
+// Block states: block `b` owns the state ids min_state..max_state; the property values
+// of a state are the mixed radix digits of (state - min_state), the LAST property varying
+// fastest. For a bool the value index 0 means `true`, 1 means `false`; an int property
+// has the value index itself (minecraft-data gives no lower bound). Blocks are stored
+// sorted by min_state, so state -> block is a binary search.
+//
+// The biome ids of this table are the ids of minecraft-data. Since 1.18 the biome ids
+// inside chunk sections index the registry the SERVER sends in Join Game (dimension
+// codec); the mapping name -> id for a connection must be built from that packet.
+
+import std.rt
+import std.bytes
+
+export {
+    Registry, registry_open, registry_ok,
+    reg_block_count, reg_state_count, reg_item_count, reg_entity_count, reg_biome_count,
+    reg_block_of_state, reg_block_name, reg_block_by_name,
+    reg_block_min_state, reg_block_max_state, reg_block_default_state,
+    reg_block_flags, reg_block_hardness_milli, reg_block_stack_size,
+    reg_prop_count, reg_prop_name, reg_prop_type, reg_prop_values, reg_prop_value_name,
+    reg_state_prop_value, reg_state_text,
+    reg_item_name, reg_item_stack, reg_item_by_name,
+    reg_entity_name, reg_entity_id, reg_entity_find, reg_entity_width_milli, reg_entity_height_milli, reg_entity_kind,
+    reg_biome_name, reg_biome_id, reg_biome_find, reg_biome_category, reg_biome_color,
+    reg_fill_opaque,
+    RF_SOLID, RF_TRANSPARENT, RF_DIGGABLE,
+}
+
+const RF_SOLID: u32 = 1
+const RF_TRANSPARENT: u32 = 2
+const RF_DIGGABLE: u32 = 4
+const NO_HARDNESS: u32 = 268435455
+
+struct Registry {
+    blob: u64,
+    nblocks: u32,
+    nstates: u32,
+    blocks_off: u32,
+    nitems: u32,
+    items_off: u32,
+    nentities: u32,
+    entities_off: u32,
+    nbiomes: u32,
+    biomes_off: u32,
+}
+
+fn num(blob: u64, at: u32) -> u32 {
+    let a: usize = at as usize
+    return ((rt.ld8(blob, a) as u32) << 21) | ((rt.ld8(blob, a + 1) as u32) << 14) | ((rt.ld8(blob, a + 2) as u32) << 7) | (rt.ld8(blob, a + 3) as u32)
+}
+
+// Reads the header of a blob; check `registry_ok` afterwards.
+fn registry_open(blob: u64) -> Registry {
+    var r: Registry = Registry { blob: blob, nblocks: 0 as u32, nstates: 0 as u32, blocks_off: 0 as u32,
+        nitems: 0 as u32, items_off: 0 as u32, nentities: 0 as u32, entities_off: 0 as u32,
+        nbiomes: 0 as u32, biomes_off: 0 as u32 }
+    if blob == 0 || rt.ld8(blob, 0) != 70 as u8 || rt.ld8(blob, 1) != 82 as u8 || rt.ld8(blob, 2) != 71 as u8 || rt.ld8(blob, 3) != 49 as u8 {
+        r.blob = 0
+        return r
+    }
+    r.nblocks = num(blob, 4 as u32)
+    r.nstates = num(blob, 8 as u32)
+    r.blocks_off = num(blob, 12 as u32)
+    r.nitems = num(blob, 16 as u32)
+    r.items_off = num(blob, 20 as u32)
+    r.nentities = num(blob, 24 as u32)
+    r.entities_off = num(blob, 28 as u32)
+    r.nbiomes = num(blob, 32 as u32)
+    r.biomes_off = num(blob, 36 as u32)
+    return r
+}
+
+fn registry_ok(r: *mut Registry) -> bool { return (*r).blob != 0 }
+
+fn reg_block_count(r: *mut Registry) -> i32 { return (*r).nblocks as i32 }
+fn reg_state_count(r: *mut Registry) -> i32 { return (*r).nstates as i32 }
+fn reg_item_count(r: *mut Registry) -> i32 { return (*r).nitems as i32 }
+fn reg_entity_count(r: *mut Registry) -> i32 { return (*r).nentities as i32 }
+fn reg_biome_count(r: *mut Registry) -> i32 { return (*r).nbiomes as i32 }
+
+// ---- helpers over the records ------------------------------------------------
+fn block_field(r: *mut Registry, b: i32, f: u32) -> u32 {
+    return num((*r).blob, (*r).blocks_off + (b as u32) * 32 as u32 + f * 4 as u32)
+}
+
+// NUL terminated name at pool offset `off`; `*len` gets its length
+fn pool_str(r: *mut Registry, off: u32, len: *mut usize) -> u64 {
+    if off == 0 as u32 {
+        *len = 0 // offset 0 = "no name" (a gap in the id space)
+        return (*r).blob
+    }
+    let p: u64 = (*r).blob + off as u64
+    var n: usize = 0
+    while rt.ld8(p, n) != 0 as u8 {
+        n = n + 1
+    }
+    *len = n
+    return p
+}
+
+// ---- blocks ----------------------------------------------------------------------
+fn reg_block_name(r: *mut Registry, b: i32, len: *mut usize) -> u64 {
+    return pool_str(r, block_field(r, b, 0 as u32), len)
+}
+
+fn reg_block_min_state(r: *mut Registry, b: i32) -> i32 { return block_field(r, b, 1 as u32) as i32 }
+fn reg_block_max_state(r: *mut Registry, b: i32) -> i32 { return block_field(r, b, 2 as u32) as i32 }
+fn reg_block_default_state(r: *mut Registry, b: i32) -> i32 { return block_field(r, b, 3 as u32) as i32 }
+fn reg_block_flags(r: *mut Registry, b: i32) -> u32 { return block_field(r, b, 5 as u32) }
+fn reg_block_stack_size(r: *mut Registry, b: i32) -> i32 { return block_field(r, b, 7 as u32) as i32 }
+
+// hardness * 1000, or -1 for "none" (unbreakable)
+fn reg_block_hardness_milli(r: *mut Registry, b: i32) -> i32 {
+    let h: u32 = block_field(r, b, 6 as u32)
+    if h == NO_HARDNESS {
+        return 0 - 1
+    }
+    return h as i32
+}
+
+// block that owns `state`, or -1
+fn reg_block_of_state(r: *mut Registry, state: i32) -> i32 {
+    if state < 0 || state as u32 >= (*r).nstates {
+        return 0 - 1
+    }
+    var lo: i32 = 0
+    var hi: i32 = (*r).nblocks as i32 - 1
+    while lo <= hi {
+        let mid: i32 = (lo + hi) / 2
+        if state < reg_block_min_state(r, mid) {
+            hi = mid - 1
+        } else if state > reg_block_max_state(r, mid) {
+            lo = mid + 1
+        } else {
+            return mid
+        }
+    }
+    return 0 - 1
+}
+
+fn name_eq(r: *mut Registry, off: u32, p: u64, n: usize) -> bool {
+    var len: usize = 0
+    let q: u64 = pool_str(r, off, &len)
+    if len != n {
+        return false
+    }
+    return rt.mem_eq(q, p, n)
+}
+
+// block with exactly this name (without "minecraft:"), or -1
+fn reg_block_by_name(r: *mut Registry, p: u64, n: usize) -> i32 {
+    var i: i32 = 0
+    while i < (*r).nblocks as i32 {
+        if name_eq(r, block_field(r, i, 0 as u32), p, n) {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ---- properties ----------------------------------------------------------------
+fn props_off(r: *mut Registry, b: i32) -> u32 { return block_field(r, b, 4 as u32) }
+
+fn reg_prop_count(r: *mut Registry, b: i32) -> i32 {
+    let po: u32 = props_off(r, b)
+    if po == 0 as u32 {
+        return 0
+    }
+    return num((*r).blob, po) as i32
+}
+
+fn prop_field(r: *mut Registry, b: i32, i: i32, f: u32) -> u32 {
+    return num((*r).blob, props_off(r, b) + 4 as u32 + (i as u32) * 16 as u32 + f * 4 as u32)
+}
+
+fn reg_prop_name(r: *mut Registry, b: i32, i: i32, len: *mut usize) -> u64 {
+    return pool_str(r, prop_field(r, b, i, 0 as u32), len)
+}
+
+// 0 bool, 1 enum, 2 int
+fn reg_prop_type(r: *mut Registry, b: i32, i: i32) -> i32 { return prop_field(r, b, i, 1 as u32) as i32 }
+fn reg_prop_values(r: *mut Registry, b: i32, i: i32) -> i32 { return prop_field(r, b, i, 2 as u32) as i32 }
+
+// value index `v` of property `i` as text: "true"/"false", the enum name, or the number
+// (written into `out`, which then holds the text; returns its length)
+fn reg_prop_value_name(r: *mut Registry, b: i32, i: i32, v: i32, out: *mut rt.Buf) {
+    let t: i32 = reg_prop_type(r, b, i)
+    if prop_field(r, b, i, 3 as u32) != 0 as u32 {
+        let vo: u32 = prop_field(r, b, i, 3 as u32)
+        var len: usize = 0
+        let p: u64 = pool_str(r, num((*r).blob, vo + (v as u32) * 4 as u32), &len)
+        rt.buf_push_bytes(out, p, len)
+    } else if t == 0 {
+        if v == 0 {
+            rt.buf_push_bytes(out, "true".p as u64, 4)
+        } else {
+            rt.buf_push_bytes(out, "false".p as u64, 5)
+        }
+    } else {
+        rt.buf_push_dec_i64(out, v as i64)
+    }
+}
+
+// value index of property `i` of `state` (mixed radix digit, last property fastest)
+fn reg_state_prop_value(r: *mut Registry, state: i32, i: i32) -> i32 {
+    let b: i32 = reg_block_of_state(r, state)
+    if b < 0 {
+        return 0 - 1
+    }
+    let n: i32 = reg_prop_count(r, b)
+    if i < 0 || i >= n {
+        return 0 - 1
+    }
+    var data: i32 = state - reg_block_min_state(r, b)
+    var k: i32 = n - 1
+    while k > i {
+        data = data / reg_prop_values(r, b, k)
+        k = k - 1
+    }
+    return data % reg_prop_values(r, b, i)
+}
+
+// "name" or "name[prop=value,prop=value]" appended to `out`; false if the state is unknown
+fn reg_state_text(r: *mut Registry, state: i32, out: *mut rt.Buf) -> bool {
+    let b: i32 = reg_block_of_state(r, state)
+    if b < 0 {
+        return false
+    }
+    var len: usize = 0
+    let p: u64 = reg_block_name(r, b, &len)
+    rt.buf_push_bytes(out, p, len)
+    let n: i32 = reg_prop_count(r, b)
+    if n > 0 {
+        rt.buf_push(out, 91 as u8)
+        var i: i32 = 0
+        while i < n {
+            if i > 0 {
+                rt.buf_push(out, 44 as u8)
+            }
+            var pl: usize = 0
+            let pp: u64 = reg_prop_name(r, b, i, &pl)
+            rt.buf_push_bytes(out, pp, pl)
+            rt.buf_push(out, 61 as u8)
+            reg_prop_value_name(r, b, i, reg_state_prop_value(r, state, i), out)
+            i = i + 1
+        }
+        rt.buf_push(out, 93 as u8)
+    }
+    return true
+}
+
+// ---- items, entities, biomes -------------------------------------------------------
+fn rec(r: *mut Registry, base: u32, size: u32, idx: i32, f: u32) -> u32 {
+    return num((*r).blob, base + (idx as u32) * size * 4 as u32 + f * 4 as u32)
+}
+
+fn reg_item_name(r: *mut Registry, id: i32, len: *mut usize) -> u64 {
+    return pool_str(r, rec(r, (*r).items_off, 2 as u32, id, 0 as u32), len)
+}
+
+fn reg_item_stack(r: *mut Registry, id: i32) -> i32 { return rec(r, (*r).items_off, 2 as u32, id, 1 as u32) as i32 }
+
+fn reg_item_by_name(r: *mut Registry, p: u64, n: usize) -> i32 {
+    var i: i32 = 0
+    while i < (*r).nitems as i32 {
+        let o: u32 = rec(r, (*r).items_off, 2 as u32, i, 0 as u32)
+        if o != 0 as u32 && name_eq(r, o, p, n) {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn reg_entity_name(r: *mut Registry, i: i32, len: *mut usize) -> u64 {
+    return pool_str(r, rec(r, (*r).entities_off, 5 as u32, i, 0 as u32), len)
+}
+
+// the protocol id of entity record `i`
+fn reg_entity_id(r: *mut Registry, i: i32) -> i32 { return rec(r, (*r).entities_off, 5 as u32, i, 4 as u32) as i32 }
+
+// first entity record with this protocol id, or -1
+fn reg_entity_find(r: *mut Registry, id: i32) -> i32 {
+    var i: i32 = 0
+    while i < (*r).nentities as i32 {
+        if reg_entity_id(r, i) == id {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn reg_entity_width_milli(r: *mut Registry, i: i32) -> i32 { return rec(r, (*r).entities_off, 5 as u32, i, 1 as u32) as i32 }
+fn reg_entity_height_milli(r: *mut Registry, i: i32) -> i32 { return rec(r, (*r).entities_off, 5 as u32, i, 2 as u32) as i32 }
+
+fn reg_entity_kind(r: *mut Registry, i: i32, len: *mut usize) -> u64 {
+    return pool_str(r, rec(r, (*r).entities_off, 5 as u32, i, 3 as u32), len)
+}
+
+fn reg_biome_name(r: *mut Registry, i: i32, len: *mut usize) -> u64 {
+    return pool_str(r, rec(r, (*r).biomes_off, 4 as u32, i, 0 as u32), len)
+}
+
+fn reg_biome_category(r: *mut Registry, i: i32, len: *mut usize) -> u64 {
+    return pool_str(r, rec(r, (*r).biomes_off, 4 as u32, i, 1 as u32), len)
+}
+
+fn reg_biome_color(r: *mut Registry, i: i32) -> i32 { return rec(r, (*r).biomes_off, 4 as u32, i, 2 as u32) as i32 }
+
+// the protocol id of biome record `i`
+fn reg_biome_id(r: *mut Registry, i: i32) -> i32 { return rec(r, (*r).biomes_off, 4 as u32, i, 3 as u32) as i32 }
+
+// first biome record with this id, or -1
+fn reg_biome_find(r: *mut Registry, id: i32) -> i32 {
+    var i: i32 = 0
+    while i < (*r).nbiomes as i32 {
+        if reg_biome_id(r, i) == id {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// One octet per state id (0 .. nstates): 1 if the block is a solid, non-transparent box --
+// the table mc_mesh wants for hidden face culling. `out` must hold nstates octets.
+fn reg_fill_opaque(r: *mut Registry, out: u64) {
+    var s: usize = 0
+    while s < (*r).nstates as usize {
+        rt.st8(out, s, 0 as u8)
+        s = s + 1
+    }
+    var b: i32 = 0
+    while b < (*r).nblocks as i32 {
+        let f: u32 = reg_block_flags(r, b)
+        if (f & RF_SOLID) != 0 as u32 && (f & RF_TRANSPARENT) == 0 as u32 {
+            var st: i32 = reg_block_min_state(r, b)
+            while st <= reg_block_max_state(r, b) {
+                rt.st8(out, st as usize, 1 as u8)
+                st = st + 1
+            }
+        }
+        b = b + 1
+    }
+}
