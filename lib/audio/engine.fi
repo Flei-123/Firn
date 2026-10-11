@@ -1,0 +1,1858 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/engine.fi -- audio.engine: a game audio engine after the design of
+// AULOS (C++, /root/projects/aulos). Events, voices, buses, 3D, master limiter.
+// Function-by-function mapping: docs/AUDIO.md.
+//
+//     import audio.engine
+//
+//     var e: engine.Engine = engine.engine_new(48000 as u32, 64 as u32)
+//     engine.engine_ensure_bus(&e, "sfx", "master")
+//     let s: i32 = engine.engine_add_sample(&e, f32_ptr, frames, 1 as u32)   // or engine_load_wav / engine_load_mp3
+//     let ev: i32 = engine.engine_add_event(&e, "step", engine.engine_bus_id(&e, "sfx"))
+//     engine.engine_event_add_sample(&e, ev, s)
+//     let h: u32 = engine.engine_play_3d(&e, ev, -1, 3.0, 0.0, -4.0)         // handle
+//     engine.engine_update(&e)                                                // once per frame
+//     engine.engine_render(&e, out_f32_stereo, 1024)                          // offline, or
+//     engine.engine_pump(&e, &sink, 4096)                                     // into an audio.sink
+//
+// THE MATH IS AULOS' MATH, IN f32 (same order of operations):
+//   voice gain   = base_volume * user_volume * fade * param curves (* 3D attenuation)
+//   2D mono      = centre pan law cos/sin(pi/4) = 0.70710678 per side; 2D stereo passes at 1.0
+//   3D           = inverse (min / (min + rolloff * (d - min))) or linear rolloff; pan from
+//                  dot(rel, right) / distance, equal power: cos/sin((pan + 1) * pi/4)
+//   Doppler      = (343 - k * v_listener) / (343 - k * v_source), clamped 0.25 .. 4
+//   per block    = gains ramp linearly over the 128 frame block (no zipper noise)
+//   buses        = deepest first into their parent, own gain ramps per block, mute is a flag
+//   limiter      = master, ceiling 0.97, attack 1 ms, release 250 ms
+//
+// HONEST DIFFERENCES TO AULOS (see docs/AUDIO.md):
+// E1  Events are built with calls (`engine_add_event`), NOT read from a JSON bank (no loader yet)
+// E2  One mutex around the whole API and `engine_render` (Aulos is lock free with a
+//     command ring). Commands still land at the START of the next render, like Aulos.
+// E3  Sample rate conversion is plain linear interpolation (Aulos: miniaudio's
+//     resampler with a low pass). Same rate = no conversion = bit identical decode.
+// E4  A parameter curve holds up to 16 points, an event up to 16 samples / 8 parameters.
+// E5  sin/cos/exp are `std.math` (f64, rounded to f32): up to 1 ulp(f32) from libm's float versions.
+import std.rt
+import std.math
+import std.str
+import audio.sink
+import ton.mp3
+import ton.mp3_tab
+
+export {
+    Engine, EventDef, ParamMap, Stats, Sample, Bus, Voice, Shared, Cmd, Reclaim, Targets,
+    engine_new, engine_free, engine_ensure_bus, engine_bus_id,
+    engine_set_bus_volume, engine_get_bus_volume, engine_set_bus_mute, engine_get_bus_mute,
+    engine_bus_effective_volume,
+    engine_add_sample, engine_load_wav, engine_load_mp3, engine_sample_frames,
+    engine_add_event, engine_event_add_sample, engine_event_add_param, engine_event, engine_find_event,
+    engine_set_listener, engine_play, engine_play_3d, engine_stop, engine_stop_all, engine_is_playing,
+    engine_set_position, engine_set_volume, engine_set_pitch, engine_set_param,
+    engine_update, engine_render, engine_pump, engine_stats,
+    PARAM_VOLUME, PARAM_PITCH, PARAM_LOWPASS,
+}
+
+const BLOCK: usize = 128
+const MAX_PARAMS: usize = 8
+const MAX_BUSES: usize = 32
+const MAX_SAMPLES: usize = 512
+const MAX_EVENTS: usize = 512
+const MAX_POOL: usize = 4096
+const CMD_CAP: usize = 4096
+const PARAM_VOLUME: u32 = 0
+const PARAM_PITCH: u32 = 1
+const PARAM_LOWPASS: u32 = 2
+
+const CMD_START: u32 = 0
+const CMD_STOP: u32 = 1
+const CMD_STOP_ALL: u32 = 2
+const CMD_SET_POSITION: u32 = 3
+const CMD_SET_VOLUME: u32 = 4
+const CMD_SET_PITCH: u32 = 5
+const CMD_SET_PARAM: u32 = 6
+
+struct Sample {
+    data: u64, // f32, interleaved
+    frames: u64,
+    channels: u32,
+}
+
+struct ParamMap {
+    name_p: u64,
+    name_n: usize,
+    target: u32,
+    default_value: f32,
+    curve_first: u32, // index into the curve pool
+    curve_n: u32,
+}
+
+struct EventDef {
+    name_p: u64,
+    name_n: usize,
+    sample_first: u32, // index into the sample id pool
+    sample_n: u32,
+    bus: i32,
+    volume: f32,
+    volume_random: f32,
+    pitch: f32,
+    pitch_random: f32,
+    looping: bool,
+    priority: i32,
+    spatial: bool,
+    min_distance: f32,
+    max_distance: f32,
+    rolloff: i32, // 0 inverse, 1 linear
+    rolloff_factor: f32,
+    doppler: f32,
+    max_instances: i32,
+    lowpass_hz: f32,
+    param_first: u32,
+    param_n: u32,
+}
+
+struct Bus {
+    name_p: u64,
+    name_n: usize,
+    parent: i32,
+    target: f32,
+    muted: bool,
+    current: f32,
+    buffer: u64, // BLOCK * 2 f32
+}
+
+struct Voice {
+    playing: bool,
+    generation: u32,
+    event_id: i32,
+    sample_id: i32,
+    bus: i32,
+    cursor: f64,
+    base_pitch: f32,
+    base_volume: f32,
+    user_volume: f32,
+    user_pitch: f32,
+    looping: bool,
+    spatial: bool,
+    px: f32, py: f32, pz: f32,
+    vx: f32, vy: f32, vz: f32,
+    param_values: [f32; 8],
+    fade: f32,
+    fade_delta: f32,
+    stopping: bool,
+    gain_l: f32,
+    gain_r: f32,
+    primed: bool,
+    lp_l: f32, lp_r: f32, lp2_l: f32, lp2_r: f32,
+}
+
+struct Shared {
+    generation: u32,
+    active: bool,
+    event_plus_one: u32,
+    priority: u32,
+    sequence: u64,
+}
+
+struct Cmd {
+    kind: u32,
+    slot: u32,
+    generation: u32,
+    a: i32,
+    b: i32,
+    bus_override: i32,
+    f0: f32, f1: f32,
+    px: f32, py: f32, pz: f32,
+    vx: f32, vy: f32, vz: f32,
+}
+
+struct Reclaim {
+    slot: u32,
+    generation: u32,
+}
+
+struct Stats {
+    active_voices: u32,
+    max_voices: u32,
+    started: u64,
+    stolen: u64,
+    dropped: u64,
+    commands_dropped: u64,
+    peak_left: f32,
+    peak_right: f32,
+}
+
+struct Engine {
+    rate: u32,
+    max_voices: u32,
+    lock: u64, // address of one word (futex mutex)
+    samples: u64, n_samples: usize,
+    events: u64, n_events: usize,
+    buses: u64, n_buses: usize,
+    bus_order: u64, // i32 per bus, deepest first
+    params: u64, n_params: usize,
+    curve_x: u64, curve_y: u64, n_curve: usize,
+    sample_ids: u64, n_sample_ids: usize,
+    voices: u64, shared: u64,
+    free_list: u64, n_free: usize,
+    cmds: u64, cmd_head: usize, cmd_tail: usize,
+    reclaims: u64, rc_head: usize, rc_tail: usize,
+    sequence: u64,
+    rng: u32,
+    lx: f32, ly: f32, lz: f32,
+    fx: f32, fy: f32, fz: f32,
+    ux: f32, uy: f32, uz: f32,
+    lvx: f32, lvy: f32, lvz: f32,
+    started: u64, stolen: u64, dropped: u64, cmd_dropped: u64,
+    active: u32,
+    lim_gain: f32,
+    peak_l: f32, peak_r: f32,
+    scratch: u64, // 4096 stereo f32 for pump
+    pcm_out: u64, // 4096 stereo s16 for pump
+}
+
+// ----------------------------------------------------------------- memory helpers
+
+fn at[T](base: u64, i: usize) -> *mut T {
+    return (base + (bytes_of[T](i)) as u64) as *mut T
+}
+
+fn bytes_of[T](n: usize) -> usize {
+    return n * size_of[T]()
+}
+
+fn alloc_zero[T](n: usize) -> u64 {
+    let p: u64 = rt.heap_alloc(bytes_of[T](n))
+    if p != 0 {
+        rt.mem_set(p, 0 as u8, bytes_of[T](n))
+    }
+    return p
+}
+
+fn ldf(p: u64, i: usize) -> f32 {
+    return *((p + (i * 4) as u64) as *mut f32)
+}
+
+fn stf(p: u64, i: usize, v: f32) {
+    *((p + (i * 4) as u64) as *mut f32) = v
+}
+
+fn copy_name(p: u64, n: usize) -> u64 {
+    let q: u64 = rt.heap_alloc(n + 1)
+    if q != 0 {
+        rt.mem_copy(q, p, n)
+    }
+    return q
+}
+
+fn name_eq(ap: u64, an: usize, bp: u64, bn: usize) -> bool {
+    if an != bn {
+        return false
+    }
+    var i: usize = 0
+    while i < an {
+        if rt.ld8(ap, i) != rt.ld8(bp, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn absf(v: f32) -> f32 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+fn lock(e: *mut Engine) {
+    thread_lock((*e).lock as *mut u64)
+}
+
+fn unlock(e: *mut Engine) {
+    thread_unlock((*e).lock as *mut u64)
+}
+
+// ------------------------------------------------------------------------ lifetime
+
+// Aulos: aul_create (offline form; the device is an `audio.sink`, see engine_pump).
+fn engine_new(rate: u32, max_voices: u32) -> Engine {
+    var mv: u32 = max_voices
+    if mv == 0 as u32 {
+        mv = 64 as u32
+    }
+    if mv > 65534 as u32 {
+        mv = 65534 as u32
+    }
+    var r: u32 = rate
+    if r == 0 as u32 {
+        r = 48000 as u32
+    }
+    var e: Engine = Engine {
+        rate: r, max_voices: mv, lock: alloc_zero[u64](1),
+        samples: alloc_zero[Sample](MAX_SAMPLES), n_samples: 0,
+        events: alloc_zero[EventDef](MAX_EVENTS), n_events: 0,
+        buses: alloc_zero[Bus](MAX_BUSES), n_buses: 0,
+        bus_order: alloc_zero[i32](MAX_BUSES),
+        params: alloc_zero[ParamMap](MAX_POOL), n_params: 0,
+        curve_x: alloc_zero[f32](MAX_POOL), curve_y: alloc_zero[f32](MAX_POOL), n_curve: 0,
+        sample_ids: alloc_zero[i32](MAX_POOL), n_sample_ids: 0,
+        voices: alloc_zero[Voice](mv as usize), shared: alloc_zero[Shared](mv as usize),
+        free_list: alloc_zero[u32](mv as usize), n_free: 0,
+        cmds: alloc_zero[Cmd](CMD_CAP), cmd_head: 0, cmd_tail: 0,
+        reclaims: alloc_zero[Reclaim](CMD_CAP), rc_head: 0, rc_tail: 0,
+        sequence: 1, rng: 19088743 as u32,
+        lx: 0.0, ly: 0.0, lz: 0.0, fx: 0.0, fy: 0.0, fz: 0.0 - 1.0, ux: 0.0, uy: 1.0, uz: 0.0,
+        lvx: 0.0, lvy: 0.0, lvz: 0.0,
+        started: 0, stolen: 0, dropped: 0, cmd_dropped: 0, active: 0 as u32,
+        lim_gain: 1.0, peak_l: 0.0, peak_r: 0.0,
+        scratch: rt.heap_alloc(4096 * 2 * 4), pcm_out: rt.heap_alloc(4096 * 2 * 2),
+    }
+    // slot 0 is handed out first, like Aulos' free list (filled back to front)
+    var i: u32 = 0 as u32
+    while i < mv {
+        stu32(e.free_list, i as usize, mv - 1 as u32 - i)
+        i = i + 1 as u32
+    }
+    e.n_free = mv as usize
+    var k: usize = 0
+    while k < mv as usize {
+        (*at[Shared](e.shared, k)).generation = 1 as u32
+        k = k + 1
+    }
+    engine_ensure_bus(&e, "master", "")
+    return e
+}
+
+fn stu32(p: u64, i: usize, v: u32) {
+    *((p + (i * 4) as u64) as *mut u32) = v
+}
+
+fn ldu32(p: u64, i: usize) -> u32 {
+    return *((p + (i * 4) as u64) as *mut u32)
+}
+
+fn engine_free(e: *mut Engine) {
+    var i: usize = 0
+    while i < (*e).n_samples {
+        let s: *mut Sample = at[Sample]((*e).samples, i)
+        if (*s).data != 0 {
+            rt.heap_free((*s).data, ((*s).frames * (*s).channels as u64 * 4) as usize)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < (*e).n_buses {
+        let b: *mut Bus = at[Bus]((*e).buses, i)
+        rt.heap_free((*b).buffer, BLOCK * 2 * 4)
+        rt.heap_free((*b).name_p, (*b).name_n + 1)
+        i = i + 1
+    }
+    i = 0
+    while i < (*e).n_events {
+        let ev: *mut EventDef = at[EventDef]((*e).events, i)
+        rt.heap_free((*ev).name_p, (*ev).name_n + 1)
+        i = i + 1
+    }
+    i = 0
+    while i < (*e).n_params {
+        let pm: *mut ParamMap = at[ParamMap]((*e).params, i)
+        rt.heap_free((*pm).name_p, (*pm).name_n + 1)
+        i = i + 1
+    }
+    let mv: usize = (*e).max_voices as usize
+    rt.heap_free((*e).lock, 8)
+    rt.heap_free((*e).samples, bytes_of[Sample](MAX_SAMPLES))
+    rt.heap_free((*e).events, bytes_of[EventDef](MAX_EVENTS))
+    rt.heap_free((*e).buses, bytes_of[Bus](MAX_BUSES))
+    rt.heap_free((*e).bus_order, MAX_BUSES * 4)
+    rt.heap_free((*e).params, bytes_of[ParamMap](MAX_POOL))
+    rt.heap_free((*e).curve_x, MAX_POOL * 4)
+    rt.heap_free((*e).curve_y, MAX_POOL * 4)
+    rt.heap_free((*e).sample_ids, MAX_POOL * 4)
+    rt.heap_free((*e).voices, bytes_of[Voice](mv))
+    rt.heap_free((*e).shared, bytes_of[Shared](mv))
+    rt.heap_free((*e).free_list, mv * 4)
+    rt.heap_free((*e).cmds, bytes_of[Cmd](CMD_CAP))
+    rt.heap_free((*e).reclaims, bytes_of[Reclaim](CMD_CAP))
+    rt.heap_free((*e).scratch, 4096 * 2 * 4)
+    rt.heap_free((*e).pcm_out, 4096 * 2 * 2)
+    (*e).n_samples = 0
+    (*e).n_buses = 0
+    (*e).n_events = 0
+    (*e).n_params = 0
+}
+
+// ---------------------------------------------------------------------------- buses
+
+// Id of a bus by name, or -1.
+fn engine_bus_id(e: *mut Engine, name: str) -> i32 {
+    var i: usize = 0
+    while i < (*e).n_buses {
+        let b: *mut Bus = at[Bus]((*e).buses, i)
+        if name_eq((*b).name_p, (*b).name_n, name.p as u64, name.length()) {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn find_or_create_bus(e: *mut Engine, name: str) -> i32 {
+    let id: i32 = engine_bus_id(e, name)
+    if id >= 0 {
+        return id
+    }
+    if (*e).n_buses >= MAX_BUSES {
+        return -1
+    }
+    let i: usize = (*e).n_buses
+    let b: *mut Bus = at[Bus]((*e).buses, i)
+    (*b).name_p = copy_name(name.p as u64, name.length())
+    (*b).name_n = name.length()
+    (*b).parent = -1
+    (*b).target = 1.0
+    (*b).muted = false
+    (*b).current = 1.0
+    (*b).buffer = alloc_zero[f32](BLOCK * 2)
+    (*e).n_buses = i + 1
+    return i as i32
+}
+
+fn bus_depth(e: *mut Engine, i: usize) -> i32 {
+    var d: i32 = 0
+    var p: i32 = (*at[Bus]((*e).buses, i)).parent
+    var guard: usize = 0
+    while p >= 0 && guard < (*e).n_buses {
+        d = d + 1
+        guard = guard + 1
+        p = (*at[Bus]((*e).buses, p as usize)).parent
+    }
+    return d
+}
+
+// deepest first, stable (Aulos: std::sort over a handful of buses = insertion sort)
+fn rebuild_bus_order(e: *mut Engine) {
+    let n: usize = (*e).n_buses
+    var i: usize = 0
+    while i < n {
+        *at[i32]((*e).bus_order, i) = i as i32
+        i = i + 1
+    }
+    i = 1
+    while i < n {
+        let key: i32 = *at[i32]((*e).bus_order, i)
+        let kd: i32 = bus_depth(e, key as usize)
+        var j: usize = i
+        while j > 0 && bus_depth(e, (*at[i32]((*e).bus_order, j - 1)) as usize) < kd {
+            *at[i32]((*e).bus_order, j) = *at[i32]((*e).bus_order, j - 1)
+            j = j - 1
+        }
+        *at[i32]((*e).bus_order, j) = key
+        i = i + 1
+    }
+}
+
+// Aulos: aul_ensure_bus. `parent` may be "" (no parent), applied only to a new bus. 1 = exists afterwards.
+fn engine_ensure_bus(e: *mut Engine, name: str, parent: str) -> bool {
+    if name.length() == 0 {
+        return false
+    }
+    lock(e)
+    let id: i32 = find_or_create_bus(e, name)
+    if id < 0 {
+        unlock(e)
+        return false
+    }
+    let b: *mut Bus = at[Bus]((*e).buses, id as usize)
+    if parent.length() > 0 && (*b).parent < 0 && !name_eq(name.p as u64, name.length(), parent.p as u64, parent.length()) {
+        (*b).parent = find_or_create_bus(e, parent)
+    }
+    rebuild_bus_order(e)
+    unlock(e)
+    return true
+}
+
+fn engine_set_bus_volume(e: *mut Engine, name: str, volume: f32) {
+    let id: i32 = engine_bus_id(e, name)
+    if id < 0 {
+        return
+    }
+    var v: f32 = volume
+    if v < 0.0 {
+        v = 0.0
+    }
+    (*at[Bus]((*e).buses, id as usize)).target = v
+}
+
+fn engine_get_bus_volume(e: *mut Engine, name: str) -> f32 {
+    let id: i32 = engine_bus_id(e, name)
+    if id < 0 {
+        return 0.0
+    }
+    return (*at[Bus]((*e).buses, id as usize)).target
+}
+
+fn engine_set_bus_mute(e: *mut Engine, name: str, muted: bool) {
+    let id: i32 = engine_bus_id(e, name)
+    if id < 0 {
+        return
+    }
+    (*at[Bus]((*e).buses, id as usize)).muted = muted
+}
+
+fn engine_get_bus_mute(e: *mut Engine, name: str) -> bool {
+    let id: i32 = engine_bus_id(e, name)
+    if id < 0 {
+        return false
+    }
+    return (*at[Bus]((*e).buses, id as usize)).muted
+}
+
+// What the mixer applies right now: 0 while muted, else the (smoothed) volume.
+fn engine_bus_effective_volume(e: *mut Engine, name: str) -> f32 {
+    let id: i32 = engine_bus_id(e, name)
+    if id < 0 {
+        return 0.0
+    }
+    let b: *mut Bus = at[Bus]((*e).buses, id as usize)
+    if (*b).muted {
+        return 0.0
+    }
+    return (*b).current
+}
+
+// -------------------------------------------------------------------------- samples
+
+// Copies `frames` frames (interleaved f32, 1 or 2 channels) into the engine. Id or -1.
+fn engine_add_sample(e: *mut Engine, data: u64, frames: u64, channels: u32) -> i32 {
+    if (*e).n_samples >= MAX_SAMPLES || frames == 0 || channels == 0 as u32 {
+        return -1
+    }
+    let n: usize = (frames * channels as u64 * 4) as usize
+    let p: u64 = rt.heap_alloc(n)
+    if p == 0 {
+        return -1
+    }
+    rt.mem_copy(p, data, n)
+    let i: usize = (*e).n_samples
+    let s: *mut Sample = at[Sample]((*e).samples, i)
+    (*s).data = p
+    (*s).frames = frames
+    (*s).channels = channels
+    (*e).n_samples = i + 1
+    return i as i32
+}
+
+fn engine_sample_frames(e: *mut Engine, id: i32) -> u64 {
+    if id < 0 || id as usize >= (*e).n_samples {
+        return 0
+    }
+    return (*at[Sample]((*e).samples, id as usize)).frames
+}
+
+// Linear sample rate conversion into a fresh buffer (E3). Returns the new frame count; `out` gets the buffer.
+fn resample_linear(src: u64, frames: u64, channels: u32, from: u32, to: u32, out: *mut u64) -> u64 {
+    let nf: u64 = frames * to as u64 / from as u64
+    let ch: usize = channels as usize
+    let buf: u64 = rt.heap_alloc((nf * channels as u64 * 4) as usize)
+    var i: u64 = 0
+    while i < nf {
+        let pos: f64 = (i as f64) * (from as f64) / (to as f64)
+        var i0: u64 = pos as u64
+        if i0 >= frames {
+            i0 = frames - 1
+        }
+        var i1: u64 = i0 + 1
+        if i1 >= frames {
+            i1 = i0
+        }
+        let fr: f32 = (pos - (i0 as f64)) as f32
+        var c: usize = 0
+        while c < ch {
+            let a: f32 = ldf(src, i0 as usize * ch + c)
+            let b: f32 = ldf(src, i1 as usize * ch + c)
+            stf(buf, i as usize * ch + c, a + (b - a) * fr)
+            c = c + 1
+        }
+        i = i + 1
+    }
+    *out = buf
+    return nf
+}
+
+// Adds PCM decoded elsewhere, converting the rate if needed.
+fn add_decoded(e: *mut Engine, data: u64, frames: u64, channels: u32, rate: u32) -> i32 {
+    if rate == (*e).rate || rate == 0 as u32 {
+        return engine_add_sample(e, data, frames, channels)
+    }
+    var cv: u64 = 0
+    let nf: u64 = resample_linear(data, frames, channels, rate, (*e).rate, &cv)
+    if cv == 0 || nf == 0 {
+        return -1
+    }
+    let id: i32 = engine_add_sample(e, cv, nf, channels)
+    rt.heap_free(cv, (nf * channels as u64 * 4) as usize)
+    return id
+}
+
+fn rd16(p: u64, o: usize) -> u32 {
+    return (rt.ld8(p, o) as u32) | ((rt.ld8(p, o + 1) as u32) << 8)
+}
+
+fn rd32(p: u64, o: usize) -> u32 {
+    return rd16(p, o) | (rd16(p, o + 2) << 16)
+}
+
+// RIFF/WAVE from memory: PCM 8/16/24/32 bit and IEEE float32, 1 or 2 channels (more: the first two).
+// Same conversion as miniaudio: s16 -> f32 = s / 32768. Returns the sample id or -1.
+fn engine_load_wav(e: *mut Engine, p: u64, n: usize) -> i32 {
+    if n < 44 || rd32(p, 0) != 1179011410 as u32 || rd32(p, 8) != 1163280727 as u32 {
+        return -1
+    }
+    var pos: usize = 12
+    var fmt_tag: u32 = 0 as u32
+    var ch: u32 = 0 as u32
+    var rate: u32 = 0 as u32
+    var bits: u32 = 0 as u32
+    var data_at: usize = 0
+    var data_n: usize = 0
+    while pos + 8 <= n {
+        let id: u32 = rd32(p, pos)
+        var sz: usize = rd32(p, pos + 4) as usize
+        if id == 544501094 as u32 { // "fmt "
+            fmt_tag = rd16(p, pos + 8)
+            ch = rd16(p, pos + 10)
+            rate = rd32(p, pos + 12)
+            bits = rd16(p, pos + 22)
+            if fmt_tag == 65534 as u32 && sz >= 26 {
+                fmt_tag = rd16(p, pos + 32) // WAVE_FORMAT_EXTENSIBLE: sub format
+            }
+        } else if id == 1635017060 as u32 { // "data"
+            data_at = pos + 8
+            if data_at + sz > n {
+                sz = n - data_at
+            }
+            data_n = sz
+            break
+        }
+        pos = pos + 8 + sz + (sz & 1)
+    }
+    if data_at == 0 || ch == 0 as u32 || rate == 0 as u32 {
+        return -1
+    }
+    let bps: usize = (bits / 8 as u32) as usize
+    if bps == 0 || (fmt_tag != 1 as u32 && fmt_tag != 3 as u32) {
+        return -1
+    }
+    let frames: usize = data_n / (bps * ch as usize)
+    if frames == 0 {
+        return -1
+    }
+    var oc: u32 = ch
+    if oc > 2 as u32 {
+        oc = 2 as u32
+    }
+    let buf: u64 = rt.heap_alloc(frames * oc as usize * 4)
+    var f: usize = 0
+    while f < frames {
+        var c: usize = 0
+        while c < oc as usize {
+            let o: usize = data_at + (f * ch as usize + c) * bps
+            var v: f32 = 0.0
+            if fmt_tag == 3 as u32 && bps == 4 {
+                v = std_math_f32(rd32(p, o))
+            } else if bps == 1 {
+                v = ((rt.ld8(p, o) as i32 - 128) as f32) / 128.0
+            } else if bps == 2 {
+                var s: i32 = rd16(p, o) as i32
+                if s >= 32768 {
+                    s = s - 65536
+                }
+                v = (s as f32) / 32768.0
+            } else if bps == 3 {
+                var s: i32 = (rd16(p, o) | ((rt.ld8(p, o + 2) as u32) << 16)) as i32
+                if s >= 8388608 {
+                    s = s - 16777216
+                }
+                v = (s as f32) / 8388608.0
+            } else if bps == 4 {
+                let u: u32 = rd32(p, o)
+                var s: i64 = u as i64
+                if s >= 2147483648 {
+                    s = s - 4294967296
+                }
+                v = (s as f32) / 2147483648.0
+            }
+            stf(buf, f * oc as usize + c, v)
+            c = c + 1
+        }
+        f = f + 1
+    }
+    let id: i32 = add_decoded(e, buf, frames as u64, oc, rate)
+    rt.heap_free(buf, frames * oc as usize * 4)
+    return id
+}
+
+fn std_math_f32(bits: u32) -> f32 {
+    return math.math_f32(bits)
+}
+
+// Position of "Xing"/"Info" in a frame (offset from the frame start), or 0.
+fn xing_tag_at(f: u64) -> usize {
+    let h1: u32 = rt.ld8(f, 1) as u32
+    let h3: u32 = rt.ld8(f, 3) as u32
+    let mpeg1: bool = ((h1 >> 3) & 3 as u32) == 3 as u32
+    let mono: bool = ((h3 >> 6) & 3 as u32) == 3 as u32
+    var side: usize = 32
+    if mpeg1 && mono {
+        side = 17
+    } else if !mpeg1 && mono {
+        side = 9
+    } else if !mpeg1 {
+        side = 17
+    }
+    var at: usize = 4 + side
+    if (h1 & 1 as u32) == 0 as u32 {
+        at = at + 2 // CRC
+    }
+    let t: u32 = rd32(f, at)
+    if t == 1735289176 as u32 || t == 1868983881 as u32 { // "Xing" / "Info"
+        return at
+    }
+    return 0
+}
+
+// LAME extension of the tag: encoder delay (true) or end padding (false) in frames. 0 if there is none.
+fn lame_delay(f: u64, tag_at: usize, frame_bytes: usize, want_delay: bool) -> usize {
+    var o: usize = tag_at + 4
+    let flags: u32 = rd32(f, o) >> 24 // big endian flags: the last octet
+    o = o + 4
+    if (flags & 1 as u32) != 0 as u32 { o = o + 4 }
+    if (flags & 2 as u32) != 0 as u32 { o = o + 4 }
+    if (flags & 4 as u32) != 0 as u32 { o = o + 100 }
+    if (flags & 8 as u32) != 0 as u32 { o = o + 4 }
+    if o + 24 > frame_bytes {
+        return 0
+    }
+    if rt.ld8(f, o) != 76 as u8 { // "LAME" / "Lavc" (ffmpeg's libmp3lame): the 9 octet encoder string
+        return 0
+    }
+    let b0: u32 = rt.ld8(f, o + 21) as u32
+    let b1: u32 = rt.ld8(f, o + 22) as u32
+    let b2: u32 = rt.ld8(f, o + 23) as u32
+    if want_delay {
+        return ((b0 << 4) | (b1 >> 4)) as usize
+    }
+    return (((b1 & 15 as u32) << 8) | b2) as usize
+}
+
+// MP3 from memory (lib/ton/mp3.fi), whole file -> one memory sample. s16 -> f32 = s / 32768.
+fn engine_load_mp3(e: *mut Engine, p: u64, n: usize) -> i32 {
+    let tabs: mp3_tab.Tabs = mp3_tab.tabs_new()
+    var t: mp3_tab.Tabs = tabs
+    var dec: mp3.Mp3Dec = mp3.mp3_new()
+    var scr: mp3.Mp3Scratch = mp3.mp3_scratch_new()
+    var info: mp3.Mp3Info = mp3.Mp3Info { frame_bytes: 0, frame_offset: 0, channels: 0, hz: 0, layer: 0, bitrate_kbps: 0 }
+    let pcm: u64 = rt.heap_alloc(2304 * 2)
+    var cap: usize = 1 << 16 // frames * channels (f32 count)
+    var buf: u64 = rt.heap_alloc(cap * 4)
+    var used: usize = 0
+    var chans: i32 = 0
+    var hz: i32 = 0
+    var pos: usize = 0
+    var delay: usize = 0 // gapless: LAME encoder delay / end padding in frames (from the Xing/Info tag)
+    var padding: usize = 0
+    var first: bool = true
+    while pos < n {
+        let got: i32 = mp3.mp3_decode_frame(&t, &dec, &scr, p + pos as u64, (n - pos) as i32, pcm, &info)
+        if info.frame_bytes == 0 {
+            break
+        }
+        let frame_at: u64 = p + (pos + info.frame_offset as usize) as u64
+        let frame_bytes: usize = info.frame_bytes as usize
+        pos = pos + info.frame_bytes as usize
+        if got > 0 {
+            if chans == 0 {
+                chans = info.channels
+                hz = info.hz
+            }
+            if info.channels != chans {
+                continue
+            }
+            if first {
+                first = false
+                // a Xing/Info frame is metadata, not sound (dr_mp3 / miniaudio drop it too)
+                let tag_at: usize = xing_tag_at(frame_at)
+                if tag_at != 0 {
+                    delay = lame_delay(frame_at, tag_at, frame_bytes, true)
+                    padding = lame_delay(frame_at, tag_at, frame_bytes, false)
+                    continue
+                }
+            }
+            let cnt: usize = got as usize * chans as usize
+            if used + cnt > cap {
+                var ncap: usize = cap * 2
+                while used + cnt > ncap {
+                    ncap = ncap * 2
+                }
+                let nb: u64 = rt.heap_alloc(ncap * 4)
+                rt.mem_copy(nb, buf, used * 4)
+                rt.heap_free(buf, cap * 4)
+                buf = nb
+                cap = ncap
+            }
+            var i: usize = 0
+            while i < cnt {
+                var s: i32 = rd16(pcm, i * 2) as i32
+                if s >= 32768 {
+                    s = s - 65536
+                }
+                stf(buf, used + i, (s as f32) / 32768.0)
+                i = i + 1
+            }
+            used = used + cnt
+        }
+    }
+    rt.heap_free(pcm, 2304 * 2)
+    var id: i32 = -1
+    if chans > 0 && used > 0 {
+        let all: usize = used / chans as usize
+        // LAME gapless: skip encoder delay + the 529 frame decoder delay, trim padding - 529 at the end
+        var from: usize = 0
+        var upto: usize = all
+        if delay > 0 || padding > 0 {
+            from = delay + 529
+            if padding > 529 && padding - 529 < all {
+                upto = all - (padding - 529)
+            }
+        }
+        if from >= upto {
+            from = 0
+            upto = all
+        }
+        id = add_decoded(e, buf + (from * chans as usize * 4) as u64, (upto - from) as u64, chans as u32, hz as u32)
+    }
+    rt.heap_free(buf, cap * 4)
+    return id
+}
+
+// --------------------------------------------------------------------------- events
+
+// New event, defaults as in a bank without fields. Returns the id or -1. Add its samples and
+// parameters BEFORE adding the next event (they share contiguous pools).
+fn engine_add_event(e: *mut Engine, name: str, bus: i32) -> i32 {
+    if (*e).n_events >= MAX_EVENTS || bus < 0 || bus as usize >= (*e).n_buses {
+        return -1
+    }
+    let i: usize = (*e).n_events
+    let ev: *mut EventDef = at[EventDef]((*e).events, i)
+    (*ev).name_p = copy_name(name.p as u64, name.length())
+    (*ev).name_n = name.length()
+    (*ev).sample_first = (*e).n_sample_ids as u32
+    (*ev).sample_n = 0 as u32
+    (*ev).bus = bus
+    (*ev).volume = 1.0
+    (*ev).volume_random = 0.0
+    (*ev).pitch = 1.0
+    (*ev).pitch_random = 0.0
+    (*ev).looping = false
+    (*ev).priority = 128
+    (*ev).spatial = false
+    (*ev).min_distance = 1.0
+    (*ev).max_distance = 100.0
+    (*ev).rolloff = 0
+    (*ev).rolloff_factor = 1.0
+    (*ev).doppler = 0.0
+    (*ev).max_instances = 0
+    (*ev).lowpass_hz = 22000.0
+    (*ev).param_first = (*e).n_params as u32
+    (*ev).param_n = 0 as u32
+    (*e).n_events = i + 1
+    return i as i32
+}
+
+// Direct access to the fields (volume, pitch, loop, spatial, distances, ...).
+fn engine_event(e: *mut Engine, id: i32) -> *mut EventDef {
+    if id < 0 || id as usize >= (*e).n_events {
+        return 0 as *mut EventDef
+    }
+    return at[EventDef]((*e).events, id as usize)
+}
+
+fn engine_find_event(e: *mut Engine, name: str) -> i32 {
+    var i: usize = 0
+    while i < (*e).n_events {
+        let ev: *mut EventDef = at[EventDef]((*e).events, i)
+        if name_eq((*ev).name_p, (*ev).name_n, name.p as u64, name.length()) {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Only for the LAST event added (E4: at most 16 samples).
+fn engine_event_add_sample(e: *mut Engine, ev: i32, sample: i32) -> bool {
+    if ev < 0 || ev as usize + 1 != (*e).n_events || sample < 0 || sample as usize >= (*e).n_samples {
+        return false
+    }
+    let d: *mut EventDef = at[EventDef]((*e).events, ev as usize)
+    if (*d).sample_n >= 16 as u32 || (*e).n_sample_ids >= MAX_POOL {
+        return false
+    }
+    *at[i32]((*e).sample_ids, (*e).n_sample_ids) = sample
+    (*e).n_sample_ids = (*e).n_sample_ids + 1
+    (*d).sample_n = (*d).sample_n + 1 as u32
+    return true
+}
+
+// Parameter with a piecewise linear curve (xs ascending). Only for the LAST event (E4: 8 params, 16 points).
+fn engine_event_add_param(e: *mut Engine, ev: i32, name: str, target: u32, default_value: f32,
+    n: usize, xs: u64, ys: u64) -> bool {
+    if ev < 0 || ev as usize + 1 != (*e).n_events || n == 0 || n > 16 {
+        return false
+    }
+    let d: *mut EventDef = at[EventDef]((*e).events, ev as usize)
+    if (*d).param_n >= MAX_PARAMS as u32 || (*e).n_params >= MAX_POOL || (*e).n_curve + n > MAX_POOL {
+        return false
+    }
+    let pm: *mut ParamMap = at[ParamMap]((*e).params, (*e).n_params)
+    (*pm).name_p = copy_name(name.p as u64, name.length())
+    (*pm).name_n = name.length()
+    (*pm).target = target
+    (*pm).default_value = default_value
+    (*pm).curve_first = (*e).n_curve as u32
+    (*pm).curve_n = n as u32
+    var i: usize = 0
+    while i < n {
+        stf((*e).curve_x, (*e).n_curve + i, ldf(xs, i))
+        stf((*e).curve_y, (*e).n_curve + i, ldf(ys, i))
+        i = i + 1
+    }
+    (*e).n_curve = (*e).n_curve + n
+    (*e).n_params = (*e).n_params + 1
+    (*d).param_n = (*d).param_n + 1 as u32
+    return true
+}
+
+fn evaluate_curve(e: *mut Engine, first: u32, n: u32, x: f32, fallback: f32) -> f32 {
+    if n == 0 as u32 {
+        return fallback
+    }
+    let f: usize = first as usize
+    let last: usize = f + n as usize - 1
+    if x <= ldf((*e).curve_x, f) {
+        return ldf((*e).curve_y, f)
+    }
+    if x >= ldf((*e).curve_x, last) {
+        return ldf((*e).curve_y, last)
+    }
+    var i: usize = f + 1
+    while i <= last {
+        if x <= ldf((*e).curve_x, i) {
+            let x0: f32 = ldf((*e).curve_x, i - 1)
+            let y0: f32 = ldf((*e).curve_y, i - 1)
+            let x1: f32 = ldf((*e).curve_x, i)
+            let y1: f32 = ldf((*e).curve_y, i)
+            let span: f32 = x1 - x0
+            if span <= 0.000000001 {
+                return y1
+            }
+            let t: f32 = (x - x0) / span
+            return y0 + (y1 - y0) * t
+        }
+        i = i + 1
+    }
+    return ldf((*e).curve_y, last)
+}
+
+// ------------------------------------------------------------------------- commands
+
+fn push_cmd(e: *mut Engine, c: Cmd) -> bool {
+    let next: usize = ((*e).cmd_head + 1) % CMD_CAP
+    if next == (*e).cmd_tail {
+        (*e).cmd_dropped = (*e).cmd_dropped + 1
+        return false
+    }
+    *at[Cmd]((*e).cmds, (*e).cmd_head) = c
+    (*e).cmd_head = next
+    return true
+}
+
+fn new_cmd(kind: u32) -> Cmd {
+    return Cmd { kind: kind, slot: 0 as u32, generation: 0 as u32, a: 0, b: 0, bus_override: -1,
+        f0: 0.0, f1: 0.0, px: 0.0, py: 0.0, pz: 0.0, vx: 0.0, vy: 0.0, vz: 0.0 }
+}
+
+fn push_reclaim(e: *mut Engine, slot: u32, generation: u32) {
+    let next: usize = ((*e).rc_head + 1) % CMD_CAP
+    if next == (*e).rc_tail {
+        return
+    }
+    let r: *mut Reclaim = at[Reclaim]((*e).reclaims, (*e).rc_head)
+    (*r).slot = slot
+    (*r).generation = generation
+    (*e).rc_head = next
+}
+
+// A handle is (slot + 1) | generation << 16; stale handles are no-ops. Returns the slot or -1.
+fn decode_handle(e: *mut Engine, h: u32, gen_out: *mut u32) -> i64 {
+    if h == 0 as u32 {
+        return -1
+    }
+    let slot: u32 = (h & 65535 as u32) - 1 as u32
+    let g: u32 = h >> 16
+    if slot >= (*e).max_voices {
+        return -1
+    }
+    if (*at[Shared]((*e).shared, slot as usize)).generation != g {
+        return -1
+    }
+    *gen_out = g
+    return slot as i64
+}
+
+fn next_random(e: *mut Engine) -> u32 {
+    var x: u32 = (*e).rng
+    x = x ^ (x << 13)
+    x = x ^ (x >> 17)
+    x = x ^ (x << 5)
+    (*e).rng = x
+    return x
+}
+
+fn random_bipolar(e: *mut Engine) -> f32 {
+    return (((next_random(e) >> 8) as f32) / 8388608.0) - 1.0
+}
+
+// ----------------------------------------------------------------------- game thread
+
+fn acquire_slot(e: *mut Engine, priority: i32, out: *mut u32) -> bool {
+    if (*e).n_free > 0 {
+        (*e).n_free = (*e).n_free - 1
+        *out = ldu32((*e).free_list, (*e).n_free)
+        return true
+    }
+    var best: i64 = -1
+    var best_pri: u32 = 0 as u32
+    var best_seq: u64 = 0
+    var i: usize = 0
+    while i < (*e).max_voices as usize {
+        let s: *mut Shared = at[Shared]((*e).shared, i)
+        if !(*s).active {
+            best = i as i64
+            best_pri = 0 as u32
+            best_seq = 0
+            break
+        }
+        if best < 0 || (*s).priority < best_pri || ((*s).priority == best_pri && (*s).sequence < best_seq) {
+            best = i as i64
+            best_pri = (*s).priority
+            best_seq = (*s).sequence
+        }
+        i = i + 1
+    }
+    if best < 0 {
+        return false
+    }
+    if best_pri as i64 > priority as i64 {
+        return false
+    }
+    (*e).stolen = (*e).stolen + 1
+    *out = best as u32
+    return true
+}
+
+fn enforce_instance_limit(e: *mut Engine, event_id: i32, limit: i32) {
+    if limit <= 0 {
+        return
+    }
+    while true {
+        var count: i32 = 0
+        var oldest: i64 = -1
+        var oldest_seq: u64 = 0
+        var i: usize = 0
+        while i < (*e).max_voices as usize {
+            let s: *mut Shared = at[Shared]((*e).shared, i)
+            if (*s).active && (*s).event_plus_one as i64 == event_id as i64 + 1 {
+                count = count + 1
+                if oldest < 0 || (*s).sequence < oldest_seq {
+                    oldest = i as i64
+                    oldest_seq = (*s).sequence
+                }
+            }
+            i = i + 1
+        }
+        if count < limit || oldest < 0 {
+            return
+        }
+        var c: Cmd = new_cmd(CMD_STOP)
+        c.slot = oldest as u32
+        c.generation = (*at[Shared]((*e).shared, oldest as usize)).generation
+        push_cmd(e, c)
+        let s: *mut Shared = at[Shared]((*e).shared, oldest as usize)
+        (*s).active = false
+        (*s).event_plus_one = 0 as u32
+        (*s).priority = 0 as u32
+        stu32((*e).free_list, (*e).n_free, oldest as u32)
+        (*e).n_free = (*e).n_free + 1
+    }
+}
+
+// Aulos: aul_play / aul_play_3d / aul_play_on_bus / aul_play_3d_on_bus. bus < 0 = the event's own bus.
+// Returns a handle, 0 = nothing started.
+fn start_event(e: *mut Engine, event_id: i32, bus: i32, spatial: bool, x: f32, y: f32, z: f32) -> u32 {
+    if event_id < 0 || event_id as usize >= (*e).n_events {
+        return 0 as u32
+    }
+    lock(e)
+    let def: *mut EventDef = at[EventDef]((*e).events, event_id as usize)
+    var bus_override: i32 = -1
+    if bus >= 0 && (bus as usize) < (*e).n_buses {
+        bus_override = bus
+    }
+    enforce_instance_limit(e, event_id, (*def).max_instances)
+    var slot: u32 = 0 as u32
+    if !acquire_slot(e, (*def).priority, &slot) {
+        (*e).dropped = (*e).dropped + 1
+        unlock(e)
+        return 0 as u32
+    }
+    let sh: *mut Shared = at[Shared]((*e).shared, slot as usize)
+    var generation: u32 = ((*sh).generation + 1 as u32) & 65535 as u32
+    if generation == 0 as u32 {
+        generation = 1 as u32
+    }
+    let pick: u32 = next_random(e) % (*def).sample_n
+    let sample_id: i32 = *at[i32]((*e).sample_ids, (*def).sample_first as usize + pick as usize)
+    var volume: f32 = (*def).volume * (1.0 + (*def).volume_random * random_bipolar(e))
+    var pitch: f32 = (*def).pitch * (1.0 + (*def).pitch_random * random_bipolar(e))
+    if volume < 0.0 {
+        volume = 0.0
+    }
+    if pitch < 0.01 {
+        pitch = 0.01
+    }
+    let seq: u64 = (*e).sequence
+    (*e).sequence = seq + 1
+    (*sh).generation = generation
+    (*sh).event_plus_one = event_id as u32 + 1 as u32
+    var pri: i32 = (*def).priority
+    if pri < 0 {
+        pri = 0
+    }
+    (*sh).priority = pri as u32
+    (*sh).sequence = seq
+    (*sh).active = true
+    var c: Cmd = new_cmd(CMD_START)
+    c.slot = slot
+    c.generation = generation
+    c.a = event_id
+    c.b = sample_id
+    c.bus_override = bus_override
+    c.f0 = volume
+    c.f1 = pitch
+    if spatial || (*def).spatial {
+        c.px = x
+        c.py = y
+        c.pz = z
+    }
+    if !push_cmd(e, c) {
+        (*sh).active = false
+        (*sh).event_plus_one = 0 as u32
+        stu32((*e).free_list, (*e).n_free, slot)
+        (*e).n_free = (*e).n_free + 1
+        unlock(e)
+        return 0 as u32
+    }
+    (*e).started = (*e).started + 1
+    unlock(e)
+    return (slot + 1 as u32) | (generation << 16)
+}
+
+fn engine_play(e: *mut Engine, event_id: i32, bus: i32) -> u32 {
+    return start_event(e, event_id, bus, false, 0.0, 0.0, 0.0)
+}
+
+fn engine_play_3d(e: *mut Engine, event_id: i32, bus: i32, x: f32, y: f32, z: f32) -> u32 {
+    return start_event(e, event_id, bus, true, x, y, z)
+}
+
+fn engine_stop(e: *mut Engine, h: u32, fade_seconds: f32) {
+    var g: u32 = 0 as u32
+    lock(e)
+    let slot: i64 = decode_handle(e, h, &g)
+    if slot >= 0 {
+        var c: Cmd = new_cmd(CMD_STOP)
+        c.slot = slot as u32
+        c.generation = g
+        if fade_seconds > 0.0 {
+            c.f0 = fade_seconds
+        }
+        push_cmd(e, c)
+    }
+    unlock(e)
+}
+
+fn engine_stop_all(e: *mut Engine, fade_seconds: f32) {
+    lock(e)
+    var c: Cmd = new_cmd(CMD_STOP_ALL)
+    if fade_seconds > 0.0 {
+        c.f0 = fade_seconds
+    }
+    push_cmd(e, c)
+    unlock(e)
+}
+
+// Stays true after a one-shot ended until the next engine_update (same as aul_is_playing).
+fn engine_is_playing(e: *mut Engine, h: u32) -> bool {
+    var g: u32 = 0 as u32
+    lock(e)
+    let slot: i64 = decode_handle(e, h, &g)
+    var r: bool = false
+    if slot >= 0 {
+        r = (*at[Shared]((*e).shared, slot as usize)).active
+    }
+    unlock(e)
+    return r
+}
+
+fn engine_set_position(e: *mut Engine, h: u32, x: f32, y: f32, z: f32, vx: f32, vy: f32, vz: f32) {
+    var g: u32 = 0 as u32
+    lock(e)
+    let slot: i64 = decode_handle(e, h, &g)
+    if slot >= 0 {
+        var c: Cmd = new_cmd(CMD_SET_POSITION)
+        c.slot = slot as u32
+        c.generation = g
+        c.px = x
+        c.py = y
+        c.pz = z
+        c.vx = vx
+        c.vy = vy
+        c.vz = vz
+        push_cmd(e, c)
+    }
+    unlock(e)
+}
+
+fn engine_set_volume(e: *mut Engine, h: u32, volume: f32) {
+    var g: u32 = 0 as u32
+    lock(e)
+    let slot: i64 = decode_handle(e, h, &g)
+    if slot >= 0 {
+        var c: Cmd = new_cmd(CMD_SET_VOLUME)
+        c.slot = slot as u32
+        c.generation = g
+        c.f0 = volume
+        if volume < 0.0 {
+            c.f0 = 0.0
+        }
+        push_cmd(e, c)
+    }
+    unlock(e)
+}
+
+fn engine_set_pitch(e: *mut Engine, h: u32, pitch: f32) {
+    var g: u32 = 0 as u32
+    lock(e)
+    let slot: i64 = decode_handle(e, h, &g)
+    if slot >= 0 {
+        var c: Cmd = new_cmd(CMD_SET_PITCH)
+        c.slot = slot as u32
+        c.generation = g
+        c.f0 = pitch
+        if pitch < 0.01 {
+            c.f0 = 0.01
+        }
+        push_cmd(e, c)
+    }
+    unlock(e)
+}
+
+// Unknown names are ignored (the sound designer owns the list).
+fn engine_set_param(e: *mut Engine, h: u32, name: str, value: f32) {
+    var g: u32 = 0 as u32
+    lock(e)
+    let slot: i64 = decode_handle(e, h, &g)
+    if slot >= 0 {
+        let ev1: u32 = (*at[Shared]((*e).shared, slot as usize)).event_plus_one
+        if ev1 != 0 as u32 {
+            let def: *mut EventDef = at[EventDef]((*e).events, (ev1 - 1 as u32) as usize)
+            var idx: i32 = -1
+            var i: usize = 0
+            while i < (*def).param_n as usize {
+                let pm: *mut ParamMap = at[ParamMap]((*e).params, (*def).param_first as usize + i)
+                if name_eq((*pm).name_p, (*pm).name_n, name.p as u64, name.length()) {
+                    idx = i as i32
+                    break
+                }
+                i = i + 1
+            }
+            if idx >= 0 {
+                var c: Cmd = new_cmd(CMD_SET_PARAM)
+                c.slot = slot as u32
+                c.generation = g
+                c.a = idx
+                c.f0 = value
+                push_cmd(e, c)
+            }
+        }
+    }
+    unlock(e)
+}
+
+// Aulos: aul_set_listener. Right handed, looks down its forward axis, right = cross(forward, up).
+fn engine_set_listener(e: *mut Engine, px: f32, py: f32, pz: f32, fx: f32, fy: f32, fz: f32,
+    ux: f32, uy: f32, uz: f32, vx: f32, vy: f32, vz: f32) {
+    lock(e)
+    (*e).lx = px
+    (*e).ly = py
+    (*e).lz = pz
+    (*e).fx = fx
+    (*e).fy = fy
+    (*e).fz = fz
+    (*e).ux = ux
+    (*e).uy = uy
+    (*e).uz = uz
+    (*e).lvx = vx
+    (*e).lvy = vy
+    (*e).lvz = vz
+    unlock(e)
+}
+
+// Aulos: aul_update. Once per frame: finished voices go back to the free list.
+fn engine_update(e: *mut Engine) {
+    lock(e)
+    while (*e).rc_tail != (*e).rc_head {
+        let r: *mut Reclaim = at[Reclaim]((*e).reclaims, (*e).rc_tail)
+        let slot: u32 = (*r).slot
+        let g: u32 = (*r).generation
+        (*e).rc_tail = ((*e).rc_tail + 1) % CMD_CAP
+        if slot >= (*e).max_voices {
+            continue
+        }
+        let s: *mut Shared = at[Shared]((*e).shared, slot as usize)
+        if (*s).generation != g {
+            continue // stolen
+        }
+        if !(*s).active {
+            continue // already back
+        }
+        (*s).active = false
+        (*s).event_plus_one = 0 as u32
+        (*s).priority = 0 as u32
+        stu32((*e).free_list, (*e).n_free, slot)
+        (*e).n_free = (*e).n_free + 1
+    }
+    unlock(e)
+}
+
+fn engine_stats(e: *mut Engine) -> Stats {
+    return Stats { active_voices: (*e).active, max_voices: (*e).max_voices, started: (*e).started,
+        stolen: (*e).stolen, dropped: (*e).dropped, commands_dropped: (*e).cmd_dropped,
+        peak_left: (*e).peak_l, peak_right: (*e).peak_r }
+}
+
+// ------------------------------------------------------------------- audio thread
+
+fn voice_reset(v: *mut Voice) {
+    (*v).playing = false
+    (*v).generation = 0 as u32
+    (*v).event_id = -1
+    (*v).sample_id = -1
+    (*v).bus = 0
+    (*v).cursor = 0.0
+    (*v).base_pitch = 1.0
+    (*v).base_volume = 1.0
+    (*v).user_volume = 1.0
+    (*v).user_pitch = 1.0
+    (*v).looping = false
+    (*v).spatial = false
+    (*v).px = 0.0
+    (*v).py = 0.0
+    (*v).pz = 0.0
+    (*v).vx = 0.0
+    (*v).vy = 0.0
+    (*v).vz = 0.0
+    var i: usize = 0
+    while i < MAX_PARAMS {
+        (*v).param_values[i] = 0.0
+        i = i + 1
+    }
+    (*v).fade = 1.0
+    (*v).fade_delta = 0.0
+    (*v).stopping = false
+    (*v).gain_l = 0.0
+    (*v).gain_r = 0.0
+    (*v).primed = false
+    (*v).lp_l = 0.0
+    (*v).lp_r = 0.0
+    (*v).lp2_l = 0.0
+    (*v).lp2_r = 0.0
+}
+
+fn start_stop(e: *mut Engine, v: *mut Voice, slot: u32, fade: f32) {
+    if fade <= 0.0 {
+        (*v).playing = false
+        push_reclaim(e, slot, (*v).generation)
+    } else {
+        (*v).stopping = true
+        (*v).fade_delta = 0.0 - 1.0 / (fade * ((*e).rate as f32))
+    }
+}
+
+fn process_commands(e: *mut Engine) {
+    while (*e).cmd_tail != (*e).cmd_head {
+        let c: *mut Cmd = at[Cmd]((*e).cmds, (*e).cmd_tail)
+        (*e).cmd_tail = ((*e).cmd_tail + 1) % CMD_CAP
+        if (*c).kind == CMD_STOP_ALL {
+            var i: u32 = 0 as u32
+            while i < (*e).max_voices {
+                let v: *mut Voice = at[Voice]((*e).voices, i as usize)
+                if (*v).playing {
+                    start_stop(e, v, i, (*c).f0)
+                }
+                i = i + 1 as u32
+            }
+            continue
+        }
+        if (*c).slot >= (*e).max_voices {
+            continue
+        }
+        let v: *mut Voice = at[Voice]((*e).voices, (*c).slot as usize)
+        if (*c).kind == CMD_START {
+            voice_reset(v)
+            (*v).playing = true
+            (*v).generation = (*c).generation
+            (*v).event_id = (*c).a
+            (*v).sample_id = (*c).b
+            (*v).base_volume = (*c).f0
+            (*v).base_pitch = (*c).f1
+            (*v).px = (*c).px
+            (*v).py = (*c).py
+            (*v).pz = (*c).pz
+            (*v).vx = (*c).vx
+            (*v).vy = (*c).vy
+            (*v).vz = (*c).vz
+            let def: *mut EventDef = at[EventDef]((*e).events, (*c).a as usize)
+            (*v).bus = (*def).bus
+            if (*c).bus_override >= 0 && ((*c).bus_override as usize) < (*e).n_buses {
+                (*v).bus = (*c).bus_override
+            }
+            (*v).looping = (*def).looping
+            (*v).spatial = (*def).spatial
+            var p: usize = 0
+            while p < (*def).param_n as usize && p < MAX_PARAMS {
+                (*v).param_values[p] = (*at[ParamMap]((*e).params, (*def).param_first as usize + p)).default_value
+                p = p + 1
+            }
+            continue
+        }
+        if !(*v).playing || (*v).generation != (*c).generation {
+            continue
+        }
+        if (*c).kind == CMD_STOP {
+            start_stop(e, v, (*c).slot, (*c).f0)
+        } else if (*c).kind == CMD_SET_POSITION {
+            (*v).px = (*c).px
+            (*v).py = (*c).py
+            (*v).pz = (*c).pz
+            (*v).vx = (*c).vx
+            (*v).vy = (*c).vy
+            (*v).vz = (*c).vz
+        } else if (*c).kind == CMD_SET_VOLUME {
+            (*v).user_volume = (*c).f0
+        } else if (*c).kind == CMD_SET_PITCH {
+            (*v).user_pitch = (*c).f0
+        } else if (*c).kind == CMD_SET_PARAM {
+            if (*c).a >= 0 && (*c).a < MAX_PARAMS as i32 {
+                (*v).param_values[(*c).a as usize] = (*c).f0
+            }
+        }
+    }
+}
+
+struct Targets {
+    gain_l: f32,
+    gain_r: f32,
+    pitch: f64,
+    cutoff: f32,
+}
+
+fn vlen(x: f32, y: f32, z: f32) -> f32 {
+    return math.sqrt32(x * x + y * y + z * z)
+}
+
+// normalized, (0,0,0) for tiny vectors
+fn vnorm(x: f32, y: f32, z: f32, ox: *mut f32, oy: *mut f32, oz: *mut f32) {
+    let l: f32 = vlen(x, y, z)
+    if l < 0.000001 {
+        *ox = 0.0
+        *oy = 0.0
+        *oz = 0.0
+        return
+    }
+    *ox = x / l
+    *oy = y / l
+    *oz = z / l
+}
+
+fn cosf(x: f32) -> f32 {
+    return math.cos(x as f64) as f32
+}
+
+fn sinf(x: f32) -> f32 {
+    return math.sin(x as f64) as f32
+}
+
+fn expf(x: f32) -> f32 {
+    return math.exp(x as f64) as f32
+}
+
+// Aulos: aulComputeVoiceTargets -- gains, pitch, cutoff for one block.
+fn compute_targets(e: *mut Engine, v: *mut Voice, def: *mut EventDef, stereo_source: bool) -> Targets {
+    let pi: f32 = 3.14159265358979323846
+    var volume: f32 = (*v).base_volume * (*v).user_volume * (*v).fade
+    var pitch: f64 = ((*v).base_pitch as f64) * ((*v).user_pitch as f64)
+    var cutoff: f32 = (*def).lowpass_hz
+    var p: usize = 0
+    while p < (*def).param_n as usize && p < MAX_PARAMS {
+        let m: *mut ParamMap = at[ParamMap]((*e).params, (*def).param_first as usize + p)
+        let mapped: f32 = evaluate_curve(e, (*m).curve_first, (*m).curve_n, (*v).param_values[p], 1.0)
+        if (*m).target == PARAM_VOLUME {
+            volume = volume * mapped
+        } else if (*m).target == PARAM_PITCH {
+            pitch = pitch * (mapped as f64)
+        } else if (*m).target == PARAM_LOWPASS {
+            if mapped < cutoff {
+                cutoff = mapped
+            }
+        }
+        p = p + 1
+    }
+    var pan_l: f32 = 0.70710678
+    var pan_r: f32 = 0.70710678
+    if (*v).spatial {
+        let rx: f32 = (*v).px - (*e).lx
+        let ry: f32 = (*v).py - (*e).ly
+        let rz: f32 = (*v).pz - (*e).lz
+        let distance: f32 = vlen(rx, ry, rz)
+        var attenuation: f32 = 0.0
+        let d: f32 = clampf(distance, (*def).min_distance, (*def).max_distance)
+        if (*def).rolloff == 1 {
+            let span: f32 = (*def).max_distance - (*def).min_distance
+            if span <= 0.000001 {
+                attenuation = 1.0
+            } else {
+                attenuation = ((*def).max_distance - d) / span
+            }
+        } else {
+            attenuation = (*def).min_distance / ((*def).min_distance + (*def).rolloff_factor * (d - (*def).min_distance))
+        }
+        volume = volume * clampf(attenuation, 0.0, 1.0)
+        // right = normalized(cross(normalized(forward), normalized(up)))
+        var fx: f32 = 0.0
+        var fy: f32 = 0.0
+        var fz: f32 = 0.0
+        var ux: f32 = 0.0
+        var uy: f32 = 0.0
+        var uz: f32 = 0.0
+        vnorm((*e).fx, (*e).fy, (*e).fz, &fx, &fy, &fz)
+        vnorm((*e).ux, (*e).uy, (*e).uz, &ux, &uy, &uz)
+        let cx: f32 = fy * uz - fz * uy
+        let cy: f32 = fz * ux - fx * uz
+        let cz: f32 = fx * uy - fy * ux
+        var rgx: f32 = 0.0
+        var rgy: f32 = 0.0
+        var rgz: f32 = 0.0
+        vnorm(cx, cy, cz, &rgx, &rgy, &rgz)
+        var pan: f32 = 0.0
+        if distance > 0.00001 {
+            pan = clampf((rx * rgx + ry * rgy + rz * rgz) / distance, 0.0 - 1.0, 1.0)
+        }
+        let angle: f32 = (pan + 1.0) * (pi * 0.25)
+        pan_l = cosf(angle)
+        pan_r = sinf(angle)
+        if (*def).doppler > 0.0 {
+            var dx: f32 = 0.0
+            var dy: f32 = 0.0
+            var dz: f32 = 0.0
+            vnorm((*e).lx - (*v).px, (*e).ly - (*v).py, (*e).lz - (*v).pz, &dx, &dy, &dz)
+            let sl: f32 = dx * (*e).lvx + dy * (*e).lvy + dz * (*e).lvz
+            let ss: f32 = dx * (*v).vx + dy * (*v).vy + dz * (*v).vz
+            let num: f32 = 343.0 - (*def).doppler * sl
+            let den: f32 = 343.0 - (*def).doppler * ss
+            if den > 0.001 && num > 0.001 {
+                pitch = pitch * (clampf(num / den, 0.25, 4.0) as f64)
+            }
+        }
+    }
+    if stereo_source && !(*v).spatial {
+        pan_l = 1.0
+        pan_r = 1.0
+    }
+    var op: f64 = pitch
+    if op < 0.01 {
+        op = 0.01
+    } else if op > 16.0 {
+        op = 16.0
+    }
+    return Targets { gain_l: volume * pan_l, gain_r: volume * pan_r, pitch: op, cutoff: cutoff }
+}
+
+fn render_block(e: *mut Engine, out: u64, frames: usize) {
+    let pi: f32 = 3.14159265358979323846
+    let nb: usize = (*e).n_buses
+    var b: usize = 0
+    while b < nb {
+        rt.mem_set((*at[Bus]((*e).buses, b)).buffer, 0 as u8, frames * 2 * 4)
+        b = b + 1
+    }
+    rt.mem_set(out, 0 as u8, frames * 2 * 4)
+    let sample_rate: f64 = (*e).rate as f64
+    var active_count: u32 = 0 as u32
+    let ff: f32 = frames as f32
+
+    var i: u32 = 0 as u32
+    while i < (*e).max_voices {
+        let v: *mut Voice = at[Voice]((*e).voices, i as usize)
+        i = i + 1 as u32
+        if !(*v).playing {
+            continue
+        }
+        active_count = active_count + 1 as u32
+        let def: *mut EventDef = at[EventDef]((*e).events, (*v).event_id as usize)
+        let smp: *mut Sample = at[Sample]((*e).samples, (*v).sample_id as usize)
+        let t: Targets = compute_targets(e, v, def, (*smp).channels >= 2 as u32)
+        if !(*v).primed {
+            (*v).gain_l = t.gain_l
+            (*v).gain_r = t.gain_r
+            (*v).primed = true
+        }
+        let step_l: f32 = (t.gain_l - (*v).gain_l) / ff
+        let step_r: f32 = (t.gain_r - (*v).gain_r) / ff
+        let use_filter: bool = (t.cutoff as f64) < sample_rate * 0.45
+        var filter_a: f32 = 1.0
+        if use_filter {
+            let fc: f32 = clampf(t.cutoff, 20.0, (sample_rate * 0.45) as f32)
+            filter_a = 1.0 - expf((0.0 - 2.0) * pi * fc / ((*e).rate as f32))
+        }
+        let dst: u64 = (*at[Bus]((*e).buses, (*v).bus as usize)).buffer
+        let channels: usize = (*smp).channels as usize
+        let sample_frames: u64 = (*smp).frames
+        let data: u64 = (*smp).data
+        var finished: bool = false
+        var n: usize = 0
+        while n < frames {
+            if (*v).cursor >= (sample_frames as f64) {
+                if (*v).looping {
+                    (*v).cursor = (*v).cursor - (sample_frames as f64)
+                    if (*v).cursor < 0.0 {
+                        (*v).cursor = 0.0
+                    }
+                } else {
+                    finished = true
+                    break
+                }
+            }
+            let i0: u64 = (*v).cursor as u64
+            var i1: u64 = i0 + 1
+            if i1 >= sample_frames {
+                if (*v).looping {
+                    i1 = 0
+                } else {
+                    i1 = i0
+                }
+            }
+            let frac: f32 = ((*v).cursor - (i0 as f64)) as f32
+            var left: f32 = 0.0
+            var right: f32 = 0.0
+            if channels == 1 {
+                let a: f32 = ldf(data, i0 as usize)
+                let bb: f32 = ldf(data, i1 as usize)
+                left = a + (bb - a) * frac
+                right = left
+            } else {
+                let a0: f32 = ldf(data, i0 as usize * channels)
+                let b0: f32 = ldf(data, i1 as usize * channels)
+                let a1: f32 = ldf(data, i0 as usize * channels + 1)
+                let b1: f32 = ldf(data, i1 as usize * channels + 1)
+                left = a0 + (b0 - a0) * frac
+                right = a1 + (b1 - a1) * frac
+            }
+            if use_filter {
+                (*v).lp_l = (*v).lp_l + filter_a * (left - (*v).lp_l)
+                (*v).lp2_l = (*v).lp2_l + filter_a * ((*v).lp_l - (*v).lp2_l)
+                if channels == 1 {
+                    left = (*v).lp2_l
+                    right = left
+                } else {
+                    (*v).lp_r = (*v).lp_r + filter_a * (right - (*v).lp_r)
+                    (*v).lp2_r = (*v).lp2_r + filter_a * ((*v).lp_r - (*v).lp2_r)
+                    left = (*v).lp2_l
+                    right = (*v).lp2_r
+                }
+            }
+            (*v).gain_l = (*v).gain_l + step_l
+            (*v).gain_r = (*v).gain_r + step_r
+            stf(dst, n * 2, ldf(dst, n * 2) + left * (*v).gain_l)
+            stf(dst, n * 2 + 1, ldf(dst, n * 2 + 1) + right * (*v).gain_r)
+            (*v).cursor = (*v).cursor + t.pitch
+            if (*v).stopping {
+                (*v).fade = (*v).fade + (*v).fade_delta
+                if (*v).fade <= 0.0 {
+                    (*v).fade = 0.0
+                    finished = true
+                    break
+                }
+            }
+            n = n + 1
+        }
+        if finished {
+            (*v).playing = false
+            push_reclaim(e, i - 1 as u32, (*v).generation)
+        }
+    }
+
+    // fold buses into their parents, deepest first
+    var k: usize = 0
+    while k < nb {
+        let bus: *mut Bus = at[Bus]((*e).buses, (*at[i32]((*e).bus_order, k)) as usize)
+        k = k + 1
+        var target: f32 = (*bus).target
+        if (*bus).muted {
+            target = 0.0
+        }
+        var gain: f32 = (*bus).current
+        let step: f32 = (target - gain) / ff
+        let src: u64 = (*bus).buffer
+        var d: u64 = out
+        if (*bus).parent >= 0 {
+            d = (*at[Bus]((*e).buses, (*bus).parent as usize)).buffer
+        }
+        var n: usize = 0
+        while n < frames {
+            gain = gain + step
+            stf(d, n * 2, ldf(d, n * 2) + ldf(src, n * 2) * gain)
+            stf(d, n * 2 + 1, ldf(d, n * 2 + 1) + ldf(src, n * 2 + 1) * gain)
+            n = n + 1
+        }
+        (*bus).current = target
+    }
+
+    // master limiter: ceiling 0.97, attack ~1 ms, release ~250 ms
+    let ceiling: f32 = 0.97
+    let rate_f: f32 = (*e).rate as f32
+    let atk: f32 = 1.0 - expf((0.0 - 1.0) / (0.001 * rate_f))
+    let rel: f32 = 1.0 - expf((0.0 - 1.0) / (0.25 * rate_f))
+    var g: f32 = (*e).lim_gain
+    var n2: usize = 0
+    while n2 < frames {
+        var pk: f32 = absf(ldf(out, n2 * 2))
+        let pr: f32 = absf(ldf(out, n2 * 2 + 1))
+        if pr > pk {
+            pk = pr
+        }
+        var want: f32 = 1.0
+        if pk > ceiling {
+            want = ceiling / pk
+        }
+        if want < g {
+            g = g + atk * (want - g)
+        } else {
+            g = g + rel * (want - g)
+        }
+        if g > 1.0 {
+            g = 1.0
+        }
+        if g < 0.0 {
+            g = 0.0
+        }
+        stf(out, n2 * 2, ldf(out, n2 * 2) * g)
+        stf(out, n2 * 2 + 1, ldf(out, n2 * 2 + 1) * g)
+        n2 = n2 + 1
+    }
+    (*e).lim_gain = g
+
+    var pl: f32 = 0.0
+    var pr2: f32 = 0.0
+    var m: usize = 0
+    while m < frames {
+        let a: f32 = absf(ldf(out, m * 2))
+        let c: f32 = absf(ldf(out, m * 2 + 1))
+        if a > pl {
+            pl = a
+        }
+        if c > pr2 {
+            pr2 = c
+        }
+        m = m + 1
+    }
+    (*e).peak_l = pl
+    (*e).peak_r = pr2
+    (*e).active = active_count
+}
+
+// Aulos: aul_render. `out` = interleaved stereo f32, `frames` frames. Commands queued so far
+// apply at the start; the work goes in blocks of 128 frames.
+fn engine_render(e: *mut Engine, out: u64, frames: usize) {
+    lock(e)
+    process_commands(e)
+    var done: usize = 0
+    while done < frames {
+        var blk: usize = BLOCK
+        if frames - done < blk {
+            blk = frames - done
+        }
+        render_block(e, out + (done * 8) as u64, blk)
+        done = done + blk
+    }
+    unlock(e)
+}
+
+// Renders what the sink has room for (max 4096 frames) and writes it as S16 (clamped,
+// round half up: floor(x * 32767 + 0.5)). Returns the frames written.
+fn engine_pump(e: *mut Engine, s: *mut sink.Sink, max_frames: usize) -> usize {
+    if sink.sink_channels(s) != 2 as u32 {
+        return 0
+    }
+    var n: usize = sink.sink_writable(s)
+    if n > max_frames {
+        n = max_frames
+    }
+    if n > 4096 {
+        n = 4096
+    }
+    if n == 0 {
+        return 0
+    }
+    engine_render(e, (*e).scratch, n)
+    var i: usize = 0
+    while i < n * 2 {
+        let x: f32 = clampf(ldf((*e).scratch, i), 0.0 - 1.0, 1.0)
+        let q: f64 = math.floor((x as f64) * 32767.0 + 0.5)
+        var iv: i64 = q as i64
+        if iv < 0 {
+            iv = iv + 65536
+        }
+        rt.st16((*e).pcm_out, i, iv as u16)
+        i = i + 1
+    }
+    if !sink.sink_write(s, (*e).pcm_out, n) {
+        return 0
+    }
+    return n
+}
