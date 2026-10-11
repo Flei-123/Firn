@@ -1,0 +1,483 @@
+// lib/mc/mc_mesh.fi -- chunk section -> vertex / index buffers on the CPU (no GPU).
+//
+// INPUT is a "padded" 18x18x18 block of ids: the 16^3 section plus a one block
+// shell taken from the neighbours (needed for the faces on the section border
+// and for ambient occlusion). Index of padded cell (x, y, z), each 0..17:
+// (y*18 + z)*18 + x; the section block (bx, by, bz) is padded (bx+1, by+1, bz+1).
+// Two ways to get it:
+//   mesh_section  builds it from a mc_chunk.Section and its 6 FACE neighbours
+//                 (edge / corner cells of the shell are "missing")
+//   mesh_padded   takes a padded array the caller assembled (e.g. from a 3x3x3
+//                 neighbourhood: then even the AO on section edges is exact)
+//
+// Block data comes from the caller's MeshTables:
+//   opaque : u8  [32768]      1 = hides the faces of its neighbours
+//   tiles  : u16 [32768 * 6]  texture tile id per face (order -x +x -y +y -z +z);
+//                             0 = this block has no face there (air, or an
+//                             invisible block). Tiles are 1..65535.
+// The id 65535 in the padded array means "unknown" (neighbour not loaded): faces
+// toward an unknown cell are NOT emitted and it does not occlude (AO).
+//
+// OUTPUT (in the Mesher): 8 byte vertices + u32 indices (6 per quad).
+//   word0 = x | y<<8 | z<<16 | face<<24 | ao<<27     x,y,z = 0..16 (block units
+//                                                      inside the section)
+//   word1 = tile | u<<16 | v<<24                      u,v = 0..w / 0..h of the quad
+//                                                      (repeat the tile with them)
+// face: 0 -x, 1 +x, 2 -y, 3 +y, 4 -z, 5 +z. ao: 0..3, 3 = fully lit, 0 = darkest.
+// Vertex order of a quad (u axis = (axis+1)%3, v axis = (axis+2)%3): (0,0) (1,0)
+// (1,1) (0,1); front faces are counter-clockwise seen from outside. The quad is
+// split along the diagonal that joins the brighter pair of corners (anisotropy flip).
+//
+// MODES (flags): F_GREEDY merges equal faces into rectangles. Two faces merge when
+// tile and AO of all four corners are equal AND the AO is constant along the
+// direction of the merge (otherwise interpolation across the merged quad would
+// shade differently from the single faces). Without F_GREEDY every visible face
+// is one 1x1 quad (the reference). F_AO computes AO; without it all ao = 3 and
+// merging is unrestricted. F_CULL_SAME hides the faces between two identical
+// non-opaque blocks (glass next to glass).
+
+import std.rt
+import mc.mc_chunk
+
+export {
+    MeshTables, Mesher,
+    F_GREEDY, F_AO, F_CULL_SAME, MISSING_AIR, MISSING_UNKNOWN, UNKNOWN_ID, MAX_QUADS,
+    mesher_new, mesher_free, mesh_section, mesh_padded, mesh_used_bytes,
+    vtx_x, vtx_y, vtx_z, vtx_face, vtx_ao, vtx_tile, vtx_u, vtx_v,
+    section_pack, section_free,
+}
+
+const F_GREEDY: u32 = 1
+const F_AO: u32 = 2
+const F_CULL_SAME: u32 = 4
+const MISSING_AIR: u32 = 0
+const MISSING_UNKNOWN: u32 = 1
+const UNKNOWN_ID: u16 = 65535
+const PADN: usize = 5832
+// Upper bound of quads of one section in naive mode: faces between neighbouring
+// blocks (3*16*16*15 = 11520) + the 6*256 border faces = 13056.
+const MAX_QUADS: usize = 13056
+
+struct MeshTables {
+    opaque: u64,
+    tiles: u64,
+}
+
+struct Mesher {
+    pad: u64, // u16 [5832]
+    mask: u64, // u32 [256]
+    verts: u64, // u32 [MAX_QUADS * 4 * 2]
+    idx: u64, // u32 [MAX_QUADS * 6]
+    nverts: u32,
+    nidx: u32,
+    nquads: u32,
+    nfaces: u32, // visible block faces found (== sum of quad areas)
+}
+
+fn mesher_new() -> Mesher {
+    var m: Mesher = Mesher { pad: 0, mask: 0, verts: 0, idx: 0, nverts: 0 as u32, nidx: 0 as u32,
+        nquads: 0 as u32, nfaces: 0 as u32 }
+    m.pad = rt.heap_alloc(PADN * 2)
+    m.mask = rt.heap_alloc(256 * 4)
+    m.verts = rt.heap_alloc(MAX_QUADS * 4 * 8)
+    m.idx = rt.heap_alloc(MAX_QUADS * 6 * 4)
+    return m
+}
+
+fn mesher_free(m: *mut Mesher) {
+    rt.heap_free((*m).pad, PADN * 2)
+    rt.heap_free((*m).mask, 256 * 4)
+    rt.heap_free((*m).verts, MAX_QUADS * 4 * 8)
+    rt.heap_free((*m).idx, MAX_QUADS * 6 * 4)
+    (*m).pad = 0
+    (*m).mask = 0
+    (*m).verts = 0
+    (*m).idx = 0
+}
+
+// Bytes a caller has to upload: vertices + indices of the last mesh.
+fn mesh_used_bytes(m: *mut Mesher) -> usize {
+    return ((*m).nverts as usize) * 8 + ((*m).nidx as usize) * 4
+}
+
+// ---- vertex accessors (word0 / word1 as stored) --------------------------------
+fn vtx_x(w0: u32) -> u32 { return w0 & 255 as u32 }
+fn vtx_y(w0: u32) -> u32 { return (w0 >> 8 as u32) & 255 as u32 }
+fn vtx_z(w0: u32) -> u32 { return (w0 >> 16 as u32) & 255 as u32 }
+fn vtx_face(w0: u32) -> u32 { return (w0 >> 24 as u32) & 7 as u32 }
+fn vtx_ao(w0: u32) -> u32 { return (w0 >> 27 as u32) & 3 as u32 }
+fn vtx_tile(w1: u32) -> u32 { return w1 & 65535 as u32 }
+fn vtx_u(w1: u32) -> u32 { return (w1 >> 16 as u32) & 255 as u32 }
+fn vtx_v(w1: u32) -> u32 { return (w1 >> 24 as u32) & 255 as u32 }
+
+// ---- padded array ----------------------------------------------------------------
+
+fn pad_fill(m: *mut Mesher, v: u16) {
+    var i: usize = 0
+    while i < PADN {
+        rt.st16((*m).pad, i, v)
+        i = i + 1
+    }
+}
+
+// Copies the 16^3 blocks of `c` (index (y*16+z)*16+x) into the padded array at
+// the shell offset (ox, oy, oz) (0 or 17 = a one-block layer; 1 = the interior).
+fn section_to_pad(m: *mut Mesher, sec: *mut mc_chunk.Section) {
+    var y: usize = 0
+    while y < 16 {
+        var z: usize = 0
+        while z < 16 {
+            var x: usize = 0
+            while x < 16 {
+                let id: u16 = mc_chunk.container_get(&(*sec).blocks, (y * 16 + z) * 16 + x)
+                rt.st16((*m).pad, ((y + 1) * 18 + (z + 1)) * 18 + (x + 1), id)
+                x = x + 1
+            }
+            z = z + 1
+        }
+        y = y + 1
+    }
+}
+
+// One layer of a neighbour: face f of the neighbour that touches the section.
+fn layer_to_pad(m: *mut Mesher, nb: *mut mc_chunk.Section, f: usize) {
+    let axis: usize = f / 2
+    var nl: usize = 15 // layer of the neighbour: its far side...
+    var pl: usize = 0 // ...goes to the shell layer on this side
+    if f % 2 == 1 {
+        nl = 0
+        pl = 17
+    }
+    var a: usize = 0
+    while a < 16 {
+        var b: usize = 0
+        while b < 16 {
+            // (a, b) run over the two other axes in (u, v) order: u = (axis+1)%3, v = (axis+2)%3
+            var c: [usize; 3] = [0, 0, 0]
+            c[axis] = nl
+            c[(axis + 1) % 3] = a
+            c[(axis + 2) % 3] = b
+            let id: u16 = mc_chunk.container_get(&(*nb).blocks, (c[1] * 16 + c[2]) * 16 + c[0])
+            c[axis] = pl
+            c[(axis + 1) % 3] = a + 1
+            c[(axis + 2) % 3] = b + 1
+            rt.st16((*m).pad, (c[1] * 18 + c[2]) * 18 + c[0], id)
+            b = b + 1
+        }
+        a = a + 1
+    }
+}
+
+// ---- block predicates -------------------------------------------------------------
+
+fn is_opaque(t: *mut MeshTables, id: u16) -> bool {
+    if id >= 32768 as u16 { return false }
+    return rt.ld8((*t).opaque, id as usize) != 0 as u8
+}
+
+// Does a block occlude (AO)? Unknown cells do not.
+fn occludes(t: *mut MeshTables, id: u16) -> u32 {
+    if id >= 32768 as u16 { return 0 as u32 }
+    if rt.ld8((*t).opaque, id as usize) != 0 as u8 { return 1 as u32 }
+    return 0 as u32
+}
+
+// ---- emit -----------------------------------------------------------------------
+
+// One quad: face f, plane coordinate pc, rectangle (u0, v0, w, h), tile and the
+// four corner AO values (corner order (0,0) (1,0) (1,1) (0,1)).
+fn emit_quad(m: *mut Mesher, f: usize, pc: usize, u0: usize, v0: usize, w: usize, h: usize,
+    tile: u32, a0: u32, a1: u32, a2: u32, a3: u32) {
+    let axis: usize = f / 2
+    let ua: usize = (axis + 1) % 3
+    let va: usize = (axis + 2) % 3
+    let vbase: u32 = (*m).nverts
+    var k: usize = 0
+    while k < 4 {
+        var su: usize = 0
+        var sv: usize = 0
+        var ao: u32 = a0
+        if k == 1 {
+            su = 1
+            ao = a1
+        } else if k == 2 {
+            su = 1
+            sv = 1
+            ao = a2
+        } else if k == 3 {
+            sv = 1
+            ao = a3
+        }
+        var pos: [usize; 3] = [0, 0, 0]
+        pos[axis] = pc
+        pos[ua] = u0 + su * w
+        pos[va] = v0 + sv * h
+        let w0: u32 = (pos[0] as u32) | ((pos[1] as u32) << 8 as u32) | ((pos[2] as u32) << 16 as u32) |
+        ((f as u32) << 24 as u32) | (ao << 27 as u32)
+        let w1: u32 = tile | (((su * w) as u32) << 16 as u32) | (((sv * h) as u32) << 24 as u32)
+        let vi: usize = (((*m).nverts) as usize) * 2
+        rt.st32((*m).verts, vi, w0)
+        rt.st32((*m).verts, vi + 1, w1)
+        (*m).nverts = (*m).nverts + 1 as u32
+        k = k + 1
+    }
+    // diagonal: join the brighter pair of corners
+    var q: [u32; 6] = [0 as u32, 1 as u32, 2 as u32, 0 as u32, 2 as u32, 3 as u32]
+    if a1 + a3 > a0 + a2 {
+        q = [1 as u32, 2 as u32, 3 as u32, 1 as u32, 3 as u32, 0 as u32]
+    }
+    var ii: usize = 0
+    while ii < 6 {
+        var e: u32 = q[ii]
+        if f % 2 == 0 {
+            // negative faces: reverse the winding (swap the 2nd and 3rd index of each triangle)
+            let r: usize = ii % 3
+            if r == 1 { e = q[ii + 1] }
+            if r == 2 { e = q[ii - 1] }
+        }
+        rt.st32((*m).idx, ((*m).nidx as usize) + ii, vbase + e)
+        ii = ii + 1
+    }
+    (*m).nidx = (*m).nidx + 6 as u32
+    (*m).nquads = (*m).nquads + 1 as u32
+}
+
+// ---- the mesher -------------------------------------------------------------------
+
+// Meshes the interior of the padded array in (*m).pad. Clears the previous mesh.
+fn mesh_run(m: *mut Mesher, t: *mut MeshTables, flags: u32) {
+    (*m).nverts = 0 as u32
+    (*m).nidx = 0 as u32
+    (*m).nquads = 0 as u32
+    (*m).nfaces = 0 as u32
+    let greedy: bool = (flags & F_GREEDY) != 0 as u32
+    let use_ao: bool = (flags & F_AO) != 0 as u32
+    let cull_same: bool = (flags & F_CULL_SAME) != 0 as u32
+    let strides: [usize; 3] = [1, 324, 18]
+    var f: usize = 0
+    while f < 6 {
+        let axis: usize = f / 2
+        let ua: usize = (axis + 1) % 3
+        let va: usize = (axis + 2) % 3
+        let sa: usize = strides[axis]
+        let su: usize = strides[ua]
+        let sv: usize = strides[va]
+        let pos_face: bool = f % 2 == 1
+        var s: usize = 0
+        while s < 16 {
+            // ---- mask of the slice: key 0 = no face
+            var any: bool = false
+            var j: usize = 0
+            while j < 16 {
+                var i: usize = 0
+                while i < 16 {
+                    let p: usize = (s + 1) * sa + (i + 1) * su + (j + 1) * sv
+                    let a: u16 = rt.ld16((*m).pad, p)
+                    var key: u32 = 0 as u32
+                    if a < 32768 as u16 {
+                        let tile: u16 = rt.ld16((*t).tiles, (a as usize) * 6 + f)
+                        if tile != 0 as u16 {
+                            var fr: usize = p - sa
+                            if pos_face { fr = p + sa }
+                            let b: u16 = rt.ld16((*m).pad, fr)
+                            var hidden: bool = false
+                            if b == UNKNOWN_ID {
+                                hidden = true
+                            } else if is_opaque(t, b) {
+                                hidden = true
+                            } else if cull_same && b == a {
+                                hidden = true
+                            }
+                            if !hidden {
+                                var ao0: u32 = 3 as u32
+                                var ao1: u32 = 3 as u32
+                                var ao2: u32 = 3 as u32
+                                var ao3: u32 = 3 as u32
+                                if use_ao {
+                                    let um: u32 = occludes(t, rt.ld16((*m).pad, fr - su))
+                                    let up: u32 = occludes(t, rt.ld16((*m).pad, fr + su))
+                                    let vm: u32 = occludes(t, rt.ld16((*m).pad, fr - sv))
+                                    let vp: u32 = occludes(t, rt.ld16((*m).pad, fr + sv))
+                                    let c00: u32 = occludes(t, rt.ld16((*m).pad, fr - su - sv))
+                                    let c10: u32 = occludes(t, rt.ld16((*m).pad, fr + su - sv))
+                                    let c11: u32 = occludes(t, rt.ld16((*m).pad, fr + su + sv))
+                                    let c01: u32 = occludes(t, rt.ld16((*m).pad, fr - su + sv))
+                                    ao0 = ao_level(um, vm, c00)
+                                    ao1 = ao_level(up, vm, c10)
+                                    ao2 = ao_level(up, vp, c11)
+                                    ao3 = ao_level(um, vp, c01)
+                                }
+                                key = (tile as u32) | (ao0 << 16 as u32) | (ao1 << 18 as u32) |
+                                (ao2 << 20 as u32) | (ao3 << 22 as u32) | (1 as u32 << 24 as u32)
+                                (*m).nfaces = (*m).nfaces + 1 as u32
+                                any = true
+                            }
+                        }
+                    }
+                    rt.st32((*m).mask, j * 16 + i, key)
+                    i = i + 1
+                }
+                j = j + 1
+            }
+            if any {
+                var pc: usize = s
+                if pos_face { pc = s + 1 }
+                j = 0
+                while j < 16 {
+                    var i: usize = 0
+                    while i < 16 {
+                        let key: u32 = rt.ld32((*m).mask, j * 16 + i)
+                        if key == 0 as u32 {
+                            i = i + 1
+                        } else {
+                            let ao0: u32 = (key >> 16 as u32) & 3 as u32
+                            let ao1: u32 = (key >> 18 as u32) & 3 as u32
+                            let ao2: u32 = (key >> 20 as u32) & 3 as u32
+                            let ao3: u32 = (key >> 22 as u32) & 3 as u32
+                            var w: usize = 1
+                            var h: usize = 1
+                            if greedy {
+                                if ao0 == ao1 && ao3 == ao2 {
+                                    while i + w < 16 && rt.ld32((*m).mask, j * 16 + i + w) == key {
+                                        w = w + 1
+                                    }
+                                }
+                                if ao0 == ao3 && ao1 == ao2 {
+                                    var grow: bool = true
+                                    while grow && j + h < 16 {
+                                        var q: usize = 0
+                                        while q < w {
+                                            if rt.ld32((*m).mask, (j + h) * 16 + i + q) != key { grow = false }
+                                            q = q + 1
+                                        }
+                                        if grow { h = h + 1 }
+                                    }
+                                }
+                                // clear the rectangle
+                                var rj: usize = 0
+                                while rj < h {
+                                    var ri: usize = 0
+                                    while ri < w {
+                                        rt.st32((*m).mask, (j + rj) * 16 + i + ri, 0 as u32)
+                                        ri = ri + 1
+                                    }
+                                    rj = rj + 1
+                                }
+                            }
+                            emit_quad(m, f, pc, i, j, w, h, key & 65535 as u32, ao0, ao1, ao2, ao3)
+                            i = i + w
+                        }
+                    }
+                    j = j + 1
+                }
+            }
+            s = s + 1
+        }
+        f = f + 1
+    }
+}
+
+// Classic voxel AO (0fps): two occluding sides = darkest; otherwise 3 - (sides + corner).
+fn ao_level(s1: u32, s2: u32, c: u32) -> u32 {
+    if s1 == 1 as u32 && s2 == 1 as u32 { return 0 as u32 }
+    return 3 as u32 - (s1 + s2 + c)
+}
+
+// Meshes an already assembled padded array (u16 [5832], layout in the header).
+// The array is copied; the Mesher keeps no pointer to it.
+fn mesh_padded(m: *mut Mesher, pad: u64, t: *mut MeshTables, flags: u32) {
+    rt.mem_copy((*m).pad, pad, PADN * 2)
+    mesh_run(m, t, flags)
+}
+
+// Meshes `sec` with its 6 face neighbours. `nbrs` = address of 6 u64 (order -x +x
+// -y +y -z +z), each the address of a mc_chunk.Section or 0 = not loaded. `missing`
+// is MISSING_AIR (not loaded counts as air: border faces are drawn) or
+// MISSING_UNKNOWN (not loaded = unknown: no faces toward it, no AO from it). The
+// edge / corner cells of the shell (no face neighbour contains them) are "missing"
+// as well.
+fn mesh_section(m: *mut Mesher, sec: *mut mc_chunk.Section, nbrs: u64, missing: u32,
+    t: *mut MeshTables, flags: u32) {
+    if missing == MISSING_UNKNOWN {
+        pad_fill(m, UNKNOWN_ID)
+    } else {
+        pad_fill(m, 0 as u16)
+    }
+    section_to_pad(m, sec)
+    var f: usize = 0
+    while f < 6 {
+        let nb: u64 = rt.ld64(nbrs, f)
+        if nb != 0 {
+            layer_to_pad(m, nb as *mut mc_chunk.Section, f)
+        }
+        f = f + 1
+    }
+    mesh_run(m, t, flags)
+}
+
+// ---- test support: build / free a Section from 4096 plain ids ----------------------
+
+// Packs `ids` (u16 [4096], index (y*16+z)*16+x) into a normalised palette container
+// exactly like the chunk decoder does (1 distinct id = palette only, else dense
+// indexes of ceil(log2(n)) bits). Biomes are left empty. Returns false on out of memory.
+fn section_pack(ids: u64, out: *mut mc_chunk.Section) -> bool {
+    let map: u64 = rt.heap_alloc(65536 * 2) // palette index + 1 per id, 0 = absent
+    let pal: u64 = rt.heap_alloc(4096 * 2)
+    if map == 0 || pal == 0 { return false }
+    var pn: usize = 0
+    var i: usize = 0
+    while i < 4096 {
+        let id: u16 = rt.ld16(ids, i)
+        if rt.ld16(map, id as usize) == 0 as u16 {
+            rt.st16(pal, pn, id)
+            pn = pn + 1
+            rt.st16(map, id as usize, pn as u16)
+        }
+        i = i + 1
+    }
+    var bits: u32 = 0 as u32
+    var words: usize = 0
+    var data: u64 = 0
+    if pn > 1 {
+        bits = 1 as u32
+        while (1 as usize << bits) < pn { bits = bits + 1 as u32 }
+        words = (4096 * (bits as usize) + 63) / 64
+        data = rt.heap_alloc(words * 8)
+        var k: usize = 0
+        while k < 4096 {
+            let idx: u64 = (rt.ld16(map, rt.ld16(ids, k) as usize) - 1 as u16) as u64
+            let bit: usize = k * (bits as usize)
+            let w: usize = bit / 64
+            let off: u32 = (bit % 64) as u32
+            rt.st64(data, w, rt.ld64(data, w) | (idx << off))
+            if (off as usize) + (bits as usize) > 64 {
+                rt.st64(data, w + 1, rt.ld64(data, w + 1) | (idx >> (64 as u32 - off)))
+            }
+            k = k + 1
+        }
+    }
+    let pal2: u64 = rt.heap_alloc(pn * 2)
+    rt.mem_copy(pal2, pal, pn * 2)
+    rt.heap_free(map, 65536 * 2)
+    rt.heap_free(pal, 4096 * 2)
+    (*out).count = 0
+    (*out).blocks.bits = bits
+    (*out).blocks.pal_n = pn as u32
+    (*out).blocks.pal = pal2
+    (*out).blocks.data = data
+    (*out).blocks.words = words
+    (*out).biomes.bits = 0 as u32
+    (*out).biomes.pal_n = 0 as u32
+    (*out).biomes.pal = 0
+    (*out).biomes.data = 0
+    (*out).biomes.words = 0
+    return true
+}
+
+// Frees what section_pack allocated.
+fn section_free(sec: *mut mc_chunk.Section) {
+    if (*sec).blocks.pal != 0 { rt.heap_free((*sec).blocks.pal, ((*sec).blocks.pal_n as usize) * 2) }
+    if (*sec).blocks.data != 0 { rt.heap_free((*sec).blocks.data, (*sec).blocks.words * 8) }
+    (*sec).blocks.pal = 0
+    (*sec).blocks.data = 0
+}
