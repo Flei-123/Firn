@@ -89,10 +89,10 @@ The client picks the version from the protocol number in the server-list ping.
 | Version | Protocol | Tables generated | Walker conformance (reference fixtures) | Chunk strategy | Joins a real server |
 |---|---|---|---|---|---|
 | 1.8.9 | 47 | yes | yes (448 packets x 4 stages) | `CF_LEGACY_8` not implemented | no |
-| 1.12.2 | 340 | yes | yes (500) | `CF_SECTIONS_19` not implemented | no |
+| **1.12.2** | **340** | yes | yes (500) | `CF_SECTIONS_19` **implemented** (`mc_chunk.chunk_decode_19`) | **yes** (11.10.2026: real 1.12.2 server, dump byte-identical to the reference client, 81 chunks) |
 | 1.16.5 | 754 | yes | yes (616) | `CF_SECTIONS_114` not implemented | no |
 | **1.20.1** | **763** | yes | yes (704) | `CF_CONTAINERS_118` **implemented** | in progress (M0) |
-| 1.20.2 | 764 | yes (has the Configuration state) | yes (788) | `CF_CONTAINERS_118` (same) | no |
+| **1.20.2** | **764** | yes (has the Configuration state) | yes (788) | `CF_CONTAINERS_118` (same, nameless NBT roots) | **yes** (11.10.2026: real 1.20.2 server incl. configuration phase, dump byte-identical, 109 chunks) |
 | 1.21.x | 767+ | **no**: generator stops at `registryEntryHolderSet` | - | - | no |
 | 26.1 | 775 (in minecraft-data) | **no**: generator stops at `lpVec3` | - | - | no |
 
@@ -153,3 +153,31 @@ The real gaps for a join (honest list):
   function-value lookups) of 763, 340, 764 coexist in one binary and are selected at run time.
 * Not proven: any join with a version other than 1.20.1; any chunk format other than
   `CF_CONTAINERS_118`.
+
+## 7. Round 2026-10-11 (worker voxel-client-1-12-2-chunks-join-1-20)
+
+Measured against the OFFICIAL servers (jar from piston-meta, SHA-1 checked, offline mode, Java 17, seed 4242,
+view distance 4), `MC_VERSION=<release> bash tools/mcclient/run.sh <firn client>`: reference client A (node-minecraft-protocol
++ independent decoder in `tools/mcclient/ref_dump.cjs`) == A2 and Firn client B == A.
+
+* **1.12.2 (340)**: PASS, checksum `cea711cdf4a3...`, 81 chunks, walk_fail 0. New: `mc_chunk.chunk_decode_19`
+  (bits per block u8, palette, packed longs **that may span two longs**, block light, sky light only in the overworld,
+  256 biome octets of a ground-up column). The dimension comes from Join Game / Respawn
+  (`mc_dimension.dim_legacy_id`, `mc_chunk.scratch_set_sky`). Values stay `id << 4 | meta` (the `mc_reg_v340` states).
+  Client Information is sent in the 1.9-1.16 layout (`client_send_settings` tries the 1.17+ layout first; the schema check
+  refuses what does not fit). A section-only update (`groundUp = false`) is NOT merged: it is counted
+  (`partial_chunks`) and dropped in both clients -- a real merge is open.
+* **1.20.2 (764)**: PASS, checksum `87ad3f91c1ad...`, 109 chunks. Bug found by the real server and fixed: from 1.20.2 the
+  NBT roots in the chunk packet (heightmaps, block entities) have **no name** (`FLAG_NBT_ANON`);
+  `chunk_decode_anon` honours the flag, `chunk_decode_for` passes it. The configuration phase
+  (Login Acknowledged -> Configuration -> Finish) worked unchanged against the real server.
+* Dump format for `CF_SECTIONS_19` (demos/mcclient/DESIGN.md): `S` lines without `biomes=`, one `B x z <h64>` line per ground-up
+  column (FNV-1a over the 256 biome octets as u16 LE), `count` = number of non-air blocks, absent sections = all air.
+* Harness: `MC_VERSION` (+ `MC_NMP`, `MC_PROTOCOL` taken from `tools/mcgen/versions.json`); the protocol number is also the
+  7th argument of the Firn client.
+
+### Flattening (id<<4|meta -> 1.13+ states): state of the work
+`tools/mcgen/legacy_flat.json` holds the hand written rules (legacy block name -> modern name + properties as a function of the
+metadata nibble; 143 rules, own words, no GPL tables). The generator that turns it plus `blocks.json` of 1.12.2 and 1.20.1 into
+`lib/mc/v340/mc_flat_v340.fi` and the application step (`mc_chunk` container remap) are **not written yet** (roadmap r18).
+Known loss by design: properties that are not in the rules fall back to the default state of the matched block.

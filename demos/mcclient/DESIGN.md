@@ -87,3 +87,11 @@ stable) and B == A (byte-identical dump file, same checksum).
 Each version has `lib/mc/vNNN/mc_proto_vNNN.fi` with constants `<STATE>_<DIR>_<NAME>` (upper snake case of the protocol.json packet name),
 `packet_name`, `packet_schema` and `version_make()`. Engine code does not use these constants: it asks the Version object for the wire id of a
 SEMANTIC packet (`mc_version.version_pid(&v, mc_sem.SEM_PLAY_S2C_MAP_CHUNK)`), see docs/MC-VERSIONS.md.
+
+## Dump of CF_SECTIONS_19 (1.9 - 1.12.2, added 2026-10-11)
+
+Same header (`protocol 340`). Per chunk: `C` line, then `B <x> <z> <h64>` (FNV-1a 64 over the 256 biome octets, each as 2 bytes LE;
+only for ground-up columns), then 16 `S` lines `S x z i count=<non-air blocks> distinct=<D> blocks=<h64>` (no `biomes=`; a section
+that is absent in the packet is all air: count 0, distinct 1), no `H` lines, then `L` (`sky` = sky light arrays, `block` = block light
+arrays, `h` over block light then sky light of each section in packet order). `blocks` hashes the wire values `id << 4 | meta`.
+Section-only updates (groundUp = false) are not stored; the clients report them as `partial_chunks`.
