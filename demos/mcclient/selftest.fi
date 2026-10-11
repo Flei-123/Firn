@@ -23,6 +23,7 @@ import dump
 
 struct Gen {
     x: u64,
+    nolen: bool, // 1.21.5+ shape: no data array length in paletted containers
 }
 
 fn gen_next(g: *mut Gen) -> u64 {
@@ -32,10 +33,12 @@ fn gen_next(g: *mut Gen) -> u64 {
 
 // ---- wire writers (vanilla layout: entries never span two longs) -------------
 
-fn put_longs(b: *mut bytes.Bytes, ids: u64, n: usize, bits: u32) {
+fn put_longs(b: *mut bytes.Bytes, ids: u64, n: usize, bits: u32, nolen: bool) {
     let epl: usize = 64 / (bits as usize)
     let words: usize = (n + epl - 1) / epl
-    bytes.put_varint(b, words as i32)
+    if !nolen {
+        bytes.put_varint(b, words as i32)
+    }
     var w: usize = 0
     while w < words {
         var word: u64 = 0
@@ -51,10 +54,12 @@ fn put_longs(b: *mut bytes.Bytes, ids: u64, n: usize, bits: u32) {
 }
 
 // single value
-fn put_single(b: *mut bytes.Bytes, v: i32) {
+fn put_single(b: *mut bytes.Bytes, v: i32, nolen: bool) {
     bytes.put_u8(b, 0 as u8)
     bytes.put_varint(b, v)
-    bytes.put_varint(b, 0)
+    if !nolen {
+        bytes.put_varint(b, 0)
+    }
 }
 
 // indirect: palette[j] = base + step*j, entries drawn as r % pn
@@ -72,7 +77,7 @@ fn put_indirect(b: *mut bytes.Bytes, g: *mut Gen, n: usize, bits: u32, pn: usize
         rt.st16(ids, i, (gen_next(g) % (pn as u64)) as u16)
         i = i + 1
     }
-    put_longs(b, ids, n, bits)
+    put_longs(b, ids, n, bits, (*g).nolen)
 }
 
 // direct: global ids r % modulo
@@ -83,11 +88,13 @@ fn put_direct(b: *mut bytes.Bytes, g: *mut Gen, n: usize, bits: u32, modulo: u64
         rt.st16(ids, i, (gen_next(g) % modulo) as u16)
         i = i + 1
     }
-    put_longs(b, ids, n, bits)
+    put_longs(b, ids, n, bits, (*g).nolen)
 }
 
 fn main(start: u64) -> i32 {
-    var g: Gen = Gen { x: 12345 as u64 }
+    // any extra argument: the 1.21.5+ shape (heightmaps as varint keyed map, nameless NBT roots)
+    let hmmap: bool = rt.arg_count(start) > 1
+    var g: Gen = Gen { x: 12345 as u64, nolen: hmmap }
     let ids: u64 = rt.heap_alloc(4096 * 2)
     var body: bytes.Bytes = bytes.bytes_new()
     bytes.put_i32(&body, 0 - 3) // x
@@ -95,7 +102,11 @@ fn main(start: u64) -> i32 {
 
     // heightmaps: MOTION_BLOCKING, WORLD_SURFACE (declared in this order; the
     // dump sorts by name), 256 values of 9 bit, 7 per long
-    nbt.nbt_root_begin(&body, 0, 0)
+    if hmmap {
+        bytes.put_varint(&body, 2)
+    } else {
+        nbt.nbt_root_begin(&body, 0, 0)
+    }
     var names: [u8; 32] = "WORLD_SURFACE\0MOTION_BLOCKING\0\0\0"
     var k: usize = 0
     while k < 2 {
@@ -112,17 +123,34 @@ fn main(start: u64) -> i32 {
             longs[i / 7] = longs[i / 7] | (v << (((i % 7) as u32) * 9 as u32))
             i = i + 1
         }
-        nbt.nbt_long_array(&body, ((&names[0]) as u64) + off, nl, (&longs[0]) as u64, 37)
+        if hmmap {
+            // type enum: 1 WORLD_SURFACE, 4 MOTION_BLOCKING
+            if k == 0 {
+                bytes.put_varint(&body, 1)
+            } else {
+                bytes.put_varint(&body, 4)
+            }
+            bytes.put_varint(&body, 37)
+            var wi: usize = 0
+            while wi < 37 {
+                bytes.put_i64(&body, longs[wi] as i64)
+                wi = wi + 1
+            }
+        } else {
+            nbt.nbt_long_array(&body, ((&names[0]) as u64) + off, nl, (&longs[0]) as u64, 37)
+        }
         k = k + 1
     }
-    nbt.nbt_end(&body)
+    if !hmmap {
+        nbt.nbt_end(&body)
+    }
 
     // chunkData: 4 sections
     var cd: bytes.Bytes = bytes.bytes_new()
     // section 0: air, single biome
     bytes.put_i16(&cd, 0 as i16)
-    put_single(&cd, 0)
-    put_single(&cd, 1)
+    put_single(&cd, 0, hmmap)
+    put_single(&cd, 1, hmmap)
     // section 1: indirect 4 bit blocks (16 entries), indirect 2 bit biomes
     bytes.put_i16(&cd, 4000 as i16)
     put_indirect(&cd, &g, 4096, 4 as u32, 16, 100, 7, ids)
@@ -152,7 +180,11 @@ fn main(start: u64) -> i32 {
     bytes.put_u8(&body, 0x34 as u8)
     bytes.put_i16(&body, 0 - 10 as i16)
     bytes.put_varint(&body, 9)
-    nbt.nbt_root_begin(&body, 0, 0)
+    if hmmap {
+        nbt.nbt_root_begin_anon(&body)
+    } else {
+        nbt.nbt_root_begin(&body, 0, 0)
+    }
     nbt.nbt_end(&body)
 
     // light: four masks, then 2 sky arrays and 1 block array of 2048 octets
@@ -185,7 +217,12 @@ fn main(start: u64) -> i32 {
     var sc: mc_chunk.Scratch = mc_chunk.scratch_new()
     var w: mc_world.World = mc_world.world_new()
     let p: u64 = mc_chunk.chunk_alloc()
-    let ok: bool = mc_chunk.chunk_decode(&body, &sc, p as *mut mc_chunk.Chunk, 4) catch false
+    var ok: bool = false
+    if hmmap {
+        ok = mc_chunk.chunk_decode_118(&body, &sc, p as *mut mc_chunk.Chunk, 4, true, true) catch false
+    } else {
+        ok = mc_chunk.chunk_decode(&body, &sc, p as *mut mc_chunk.Chunk, 4) catch false
+    }
     if !ok {
         io.eprint_line("selftest: chunk_decode failed")
         return 1
@@ -193,7 +230,11 @@ fn main(start: u64) -> i32 {
     mc_world.world_put(&w, p)
     var out: rt.Buf = rt.buf_new()
     var digest: [u8; 32] = [0; 32]
-    dump.dump_build(&w, 763, &out, (&digest[0]) as u64)
+    var proto: i32 = 763
+    if hmmap {
+        proto = 775
+    }
+    dump.dump_build(&w, proto, &out, (&digest[0]) as u64)
     io.print_bytes(rt.buf_ptr(&out), rt.buf_len(&out))
     rt.buf_free(&out)
     mc_world.world_free(&w)

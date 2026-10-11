@@ -159,6 +159,9 @@ class Reader {
   }
 }
 
+// 1.21.5+ (protocol 770): a paletted container has no data array length any more (derived from the bits per entry).
+const NO_LEN = Number(process.env.MC_PROTOCOL || 0) >= 770
+
 // One paletted container. kind 'blocks' (4096, indirect 4..8) or 'biomes' (64, indirect 1..3).
 // Returns array of global ids.
 function readContainer (r, kind) {
@@ -168,7 +171,7 @@ function readContainer (r, kind) {
   let bits = r.u8()
   if (bits === 0) {
     const v = r.varint()
-    const len = r.varint()
+    const len = NO_LEN ? 0 : r.varint()
     if (len !== 0) throw new Error('single-value container with data')
     return new Array(count).fill(v)
   }
@@ -179,8 +182,8 @@ function readContainer (r, kind) {
     palette = new Array(n)
     for (let i = 0; i < n; i++) palette[i] = r.varint()
   }
-  const nl = r.varint()
   const per = Math.floor(64 / bits)
+  const nl = NO_LEN ? Math.ceil(count / per) : r.varint()
   if (nl !== Math.ceil(count / per)) throw new Error(`container long count ${nl} != ${Math.ceil(count / per)} (bits ${bits})`)
   const ids = unpackLongs(r.longs(nl), bits, count)
   if (palette) {
@@ -303,6 +306,10 @@ function decodeChunk (p, numSections) {
     const e = entries[name]
     if (!e || e.type !== 'longArray') continue
     hm.push({ name, hash: hashU16(heightmapValues(e.value)) })
+  }
+  if (Array.isArray(root)) {
+    // 1.21.5+: heightmaps = [{ type: 'motion_blocking', data: [[hi, lo], ...] }, ...] (protodef mapper names)
+    for (const e of root) hm.push({ name: String(e.type).toUpperCase(), hash: hashU16(heightmapValues(e.data)) })
   }
   hm.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
   const f = new Fnv64()
@@ -447,6 +454,7 @@ function main () {
     } catch (e) {
       chunkErrors++
       console.error(`chunk decode failed at ${p.x},${p.z}: ${e.message}`)
+      if (process.env.MC_REF_DEBUG) console.error(`  debug chunkData(${p.chunkData.length}) head=${Buffer.from(p.chunkData).subarray(0, 96).toString('hex')}`)
     }
     armIdle()
   })

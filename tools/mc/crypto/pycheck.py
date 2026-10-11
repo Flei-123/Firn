@@ -9,7 +9,10 @@ xcheck, tmp = sys.argv[1], sys.argv[2]
 bad = 0
 n = 0
 for bits in (1024, 2048):
-    with open(os.path.join(tmp, f"priv{bits}.pem"), "rb") as f:
+    pem = os.path.join(tmp, f"priv{bits}.pem")
+    if not os.path.exists(pem):
+        sys.exit(f"pycheck: missing {pem} (run.sh creates it with openssl; check.js writes it as fallback)")
+    with open(pem, "rb") as f:
         key = serialization.load_pem_private_key(f.read(), password=None)
     spki = os.path.join(tmp, f"spki{bits}.bin")
     for mlen in (16, 4, (bits // 8) - 11):

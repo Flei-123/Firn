@@ -162,7 +162,7 @@ run_firn() { # label
   timeout 150 "$BIN" 127.0.0.1 "$PORT" "$NAME" "$W/out/$label.dump" "$VIEW" "$IDLE" "$PROTO" > "$W/out/$label.metrics" 2> "$W/out/$label.err"
   local rc=$?
   [ -s "$W/out/$label.err" ] && { echo "  stderr of $label:"; head -3 "$W/out/$label.err" | sed 's/^/    /'; }
-  [ $rc -eq 0 ] || { echo "run.sh: Firn client $label failed (rc $rc)" >&2; return 1; }
+  [ $rc -eq 0 ] || { echo "run.sh: Firn client $label failed (rc $rc)" >&2; head -5 "$W/out/$label.metrics" | sed 's/^/    /' >&2; return 1; }
   wait_left
 }
 

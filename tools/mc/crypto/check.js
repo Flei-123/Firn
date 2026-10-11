@@ -62,7 +62,15 @@ console.log(`  cfb8: ${cfbCases} chunked runs (sizes 1..300000, default + soft p
 const hexOf = (b64u) => Buffer.from(b64u, 'base64url').toString('hex');
 const keys = {};
 for (const bits of [512, 1024, 2048, 3072, 4096]) {
-  const { publicKey, privateKey } = c.generateKeyPairSync('rsa', { modulusLength: bits });
+  // run.sh pre-generates priv<bits>.pem with openssl into T; fall back to node keygen when run by hand
+  const pemPath = path.join(T, `priv${bits}.pem`);
+  let publicKey, privateKey;
+  if (fs.existsSync(pemPath)) {
+    privateKey = c.createPrivateKey(fs.readFileSync(pemPath));
+    publicKey = c.createPublicKey(privateKey);
+  } else {
+    ({ publicKey, privateKey } = c.generateKeyPairSync('rsa', { modulusLength: bits }));
+  }
   const spki = publicKey.export({ type: 'spki', format: DER_FORMAT });
   const jwk = publicKey.export({ format: 'jwk' });
   const dp = path.join(T, `spki${bits}.bin`);
