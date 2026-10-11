@@ -88,7 +88,7 @@ The client picks the version from the protocol number in the server-list ping.
 
 | Version | Protocol | Tables generated | Walker conformance (reference fixtures) | Chunk strategy | Joins a real server |
 |---|---|---|---|---|---|
-| **1.8.9** | **47** | yes | yes (448 packets x 4 stages) | `CF_LEGACY_8` **implemented** (`mc_chunk.chunk_decode_legacy8`, `legacy8_bulk_*`) | **yes** (11.10.2026, see section 9) |
+| **1.8.9** | **47** | yes | yes (448 packets x 4 stages) | `CF_LEGACY_8` **implemented** (`mc_chunk.chunk_decode_legacy8`, `legacy8_bulk_*`) | **yes** (11.10.2026: real 1.8.9 server, dump byte-identical to the reference client, 81 chunks) |
 | **1.12.2** | **340** | yes | yes (500) | `CF_SECTIONS_19` **implemented** (`mc_chunk.chunk_decode_19`) | **yes** (11.10.2026: real 1.12.2 server, dump byte-identical to the reference client, 81 chunks) |
 | 1.16.5 | 754 | yes | yes (616) | `CF_SECTIONS_114` not implemented | no |
 | **1.20.1** | **763** | yes | yes (704) | `CF_CONTAINERS_118` **implemented** | in progress (M0) |
@@ -233,5 +233,6 @@ Known loss by design: properties that are not in the rules fall back to the defa
 * **Server setup**: the official 1.8.9 server runs on Java 17 only with `use-native-transport=false` in `server.properties`
   (otherwise Netty epoll dies with "Unable to access address of buffer" and every connection is reset). `tools/mcclient/run.sh` sets it for 1.8.x.
 * Tests: `tests/2747_mc_chunk_legacy8.fi` (hand built packets: values, light hash, biomes, no-sky, wrong sky, truncations, unload, bulk).
-  Real server: see the report of the round (checksum, chunk count).
+  Real server (official 1.8.9, Java 17, seed 4242, view 4, `MC_SETTLE_MS=40000`): PASS, A == A2 and Firn B == A byte identical,
+  checksum `56c7050923f4...`, 81 chunks (80 columns in 8 `map_chunk_bulk` packets + 1 single `map_chunk`), walk_fail 0.
 * Section updates (groundUp = false) are counted and dropped in both clients, like for 1.12.2 (merge still open, r30).
