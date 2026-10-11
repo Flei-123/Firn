@@ -1,0 +1,408 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/gl_mc.fi -- gpu.gl_mc: the OpenGL 3.3 back end of the voxel client (docs/GPU.md, docs/MC-RENDER.md 4).
+//
+//     import gpu.gl_mc
+//     var gb: gl_mc.GlBackend = gl_mc.glbe_open(640, 360)        // EGL / wgl context + FBO + program
+//     if gb.ok {
+//         var b: mc_backend.Backend = gl_mc.glbe_backend(&gb)    // same table as mc_backend.backend_cpu
+//         b.upload_atlas(b.obj, (&atlas) as u64)
+//         b.begin(b.obj, (&cam) as u64, 0xFFE6BE96 as u32)
+//         let h: usize = b.mesh_upload(b.obj, key, verts, nverts, idx, nidx)
+//         b.draw(b.obj, h, ox, oy, oz)
+//         b.end(b.obj)
+//         let px: u64 = b.present(b.obj)                         // w*h*4 bytes RGBA, row 0 = top
+//     }
+//
+// Rendering goes into an FBO (RGBA8 colour texture + D24); `present` reads it back top-down, so a window layer
+// shows the frame exactly like the CPU rasterizer's colour buffer (variant b of docs/FFI.md: Firn window + PutImage).
+// Shaders: lib/gpu/mc_vs.glsl + mc_fs.glsl (embedded). Camera: u_rv = projection * view rotation (no translation,
+// f64 -> f32), u_origin = section origin - camera position computed in f64 on the CPU (small f32 values, no jitter
+// far from the world origin). Call from the thread that made the context (docs/FFI.md).
+
+import std.rt
+import mc.mc_backend
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_math
+import gpu.glctx
+import gpu.gl33
+
+export {
+    GlBackend, glbe_open, glbe_open_with, glbe_close, glbe_backend, glbe_set_fog, glbe_set_cull,
+    glbe_gl, glbe_renderer, glbe_draws, glbe_tris,
+}
+
+const VS_SRC: str = __include_str("mc_vs.glsl")
+const FS_SRC: str = __include_str("mc_fs.glsl")
+
+// mesh slot: vao, vbo, ibo, nidx, used, key
+const SLOT_WORDS: usize = 6
+
+struct GlBackend {
+    ok: bool,
+    step: i32, // 0 = ok, 1 context, 2 GL load, 3 program, 4 framebuffer
+    ctx: glctx.GlCtx,
+    g: gl33.Gl,
+    fbo: gl33.Fbo,
+    prog: u32,
+    atlas_tex: u32,
+    l_rv: i32,
+    l_origin: i32,
+    l_atlas: i32,
+    l_tiles: i32,
+    l_fog: i32,
+    l_fogc: i32,
+    w: i32,
+    h: i32,
+    atile: i32,
+    acols: i32,
+    cx: f64,
+    cy: f64,
+    cz: f64,
+    rv: [f32; 16],
+    fog_on: bool,
+    fog_start: f64,
+    fog_end: f64,
+    fog_r: f64,
+    fog_g: f64,
+    fog_b: f64,
+    cull: bool,
+    slots: u64,
+    slot_cap: usize,
+    pix: u64, // w*h*4, the read back frame
+    tmp: u64, // w*h*4 scratch of the flip
+    fresh: bool, // pix holds the current frame
+    draws: u64,
+    tris: u64,
+    log: [u8; 512], // shader / link log of a failed open
+}
+
+fn empty(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
+    return GlBackend { ok: false, step: 0, ctx: c, g: gl33.gl_new(),
+        fbo: gl33.Fbo { fbo: 0 as u32, color: 0 as u32, depth: 0 as u32, w: w, h: h },
+        prog: 0 as u32, atlas_tex: 0 as u32, l_rv: 0 - 1, l_origin: 0 - 1, l_atlas: 0 - 1, l_tiles: 0 - 1, l_fog: 0 - 1,
+        l_fogc: 0 - 1, w: w, h: h, atile: 16, acols: 16, cx: 0.0, cy: 0.0, cz: 0.0, rv: [0.0 as f32; 16],
+        fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0.0, fog_g: 0.0, fog_b: 0.0, cull: true,
+        slots: 0, slot_cap: 0, pix: 0, tmp: 0, fresh: false, draws: 0, tris: 0, log: [0; 512] }
+}
+
+// Opens a headless context (EGL surfaceless / pbuffer on Linux, a hidden window + wgl on Windows) of w x h and
+// builds the program + FBO. `ok` false = see `step` and `log` (glbe_renderer is empty then).
+fn glbe_open(w: i32, h: i32) -> GlBackend {
+    return glbe_open_with(glctx.ctx_open(w, h), w, h)
+}
+
+// The same on a context the caller already made (it must be current on this thread).
+#[allow_escape]
+fn glbe_open_with(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
+    var gb: GlBackend = empty(c, w, h)
+    if !gb.ctx.ok {
+        gb.step = 1
+        return gb
+    }
+    if !gl33.gl_load(&gb.ctx, &gb.g) {
+        gb.step = 2
+        return gb
+    }
+    gb.prog = gl33.gl_program(&gb.g, VS_SRC.p as u64, VS_SRC.n, FS_SRC.p as u64, FS_SRC.n, (&gb.log[0]) as u64, 512)
+    if gb.prog == 0 as u32 {
+        gb.step = 3
+        return gb
+    }
+    gb.l_rv = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_rv")
+    gb.l_origin = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_origin")
+    gb.l_atlas = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_atlas")
+    gb.l_tiles = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_tiles")
+    gb.l_fog = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_fog")
+    gb.l_fogc = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_fogc")
+    gb.fbo = gl33.gl_fbo_new(&gb.g, w, h)
+    if gb.fbo.fbo == 0 as u32 {
+        gb.step = 4
+        return gb
+    }
+    let n: usize = (w as usize) * (h as usize) * 4
+    gb.pix = rt.heap_alloc(n)
+    gb.tmp = rt.heap_alloc(n)
+    if gb.pix == 0 || gb.tmp == 0 {
+        gb.step = 4
+        return gb
+    }
+    gb.ok = true
+    return gb
+}
+
+fn glbe_gl(gb: *mut GlBackend) -> *mut gl33.Gl {
+    return &(*gb).g
+}
+
+// GL_RENDERER of the context ("llvmpipe ...", the GPU name) as a C string address.
+fn glbe_renderer(gb: *mut GlBackend) -> u64 {
+    return gl33.gl_string(&(*gb).g, gl33.GL_RENDERER)
+}
+
+fn glbe_draws(gb: *mut GlBackend) -> u64 {
+    return (*gb).draws
+}
+
+fn glbe_tris(gb: *mut GlBackend) -> u64 {
+    return (*gb).tris
+}
+
+// Linear fog like mc_raster.raster_set_fog (colour channels 0..255, distance along the view direction).
+fn glbe_set_fog(gb: *mut GlBackend, on: bool, start: f64, end: f64, r: u32, g: u32, b: u32) {
+    (*gb).fog_on = on
+    (*gb).fog_start = start
+    (*gb).fog_end = end
+    (*gb).fog_r = r as f64
+    (*gb).fog_g = g as f64
+    (*gb).fog_b = b as f64
+}
+
+fn glbe_set_cull(gb: *mut GlBackend, on: bool) {
+    (*gb).cull = on
+}
+
+fn glbe_close(gb: *mut GlBackend) {
+    if (*gb).ctx.ok {
+        var s: usize = 0
+        while s < (*gb).slot_cap {
+            free_slot(gb, s + 1)
+            s = s + 1
+        }
+        if (*gb).atlas_tex != 0 as u32 {
+            gl33.gl_delete_tex(&(*gb).g, (*gb).atlas_tex)
+        }
+        if (*gb).prog != 0 as u32 {
+            gl33.gl_delete_program(&(*gb).g, (*gb).prog)
+        }
+        gl33.gl_fbo_free(&(*gb).g, &(*gb).fbo)
+        glctx.ctx_close(&(*gb).ctx)
+    }
+    let n: usize = ((*gb).w as usize) * ((*gb).h as usize) * 4
+    if (*gb).pix != 0 {
+        rt.heap_free((*gb).pix, n)
+    }
+    if (*gb).tmp != 0 {
+        rt.heap_free((*gb).tmp, n)
+    }
+    if (*gb).slots != 0 {
+        rt.heap_free((*gb).slots, (*gb).slot_cap * SLOT_WORDS * 8)
+    }
+    (*gb).pix = 0
+    (*gb).tmp = 0
+    (*gb).slots = 0
+    (*gb).slot_cap = 0
+    (*gb).ok = false
+}
+
+// ---- Backend table ----------------------------------------------------------------------------------
+
+fn be_atlas(o: u64, a: u64) {
+    let gb: *mut GlBackend = o as *mut GlBackend
+    let at: *mut mc_texture.Atlas = a as *mut mc_texture.Atlas
+    if (*at).px == 0 {
+        return
+    }
+    if (*gb).atlas_tex != 0 as u32 {
+        gl33.gl_delete_tex(&(*gb).g, (*gb).atlas_tex)
+    }
+    (*gb).atlas_tex = gl33.gl_tex_rgba8(&(*gb).g, (*at).w, (*at).h, (*at).px, gl33.GL_NEAREST, gl33.GL_NEAREST)
+    (*gb).atile = (*at).tile
+    (*gb).acols = (*at).cols
+}
+
+fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize) -> usize {
+    let gb: *mut GlBackend = o as *mut GlBackend
+    var s: usize = 0
+    var found: bool = false
+    while s < (*gb).slot_cap {
+        if rt.ld64((*gb).slots, s * SLOT_WORDS + 4) == 0 as u64 {
+            found = true
+            break
+        }
+        s = s + 1
+    }
+    if !found {
+        let ncap: usize = (*gb).slot_cap * 2 + 64
+        let ns: u64 = rt.heap_alloc(ncap * SLOT_WORDS * 8)
+        if ns == 0 {
+            return 0
+        }
+        var i: usize = 0
+        while i < ncap * SLOT_WORDS {
+            var v: u64 = 0
+            if i < (*gb).slot_cap * SLOT_WORDS {
+                v = rt.ld64((*gb).slots, i)
+            }
+            rt.st64(ns, i, v)
+            i = i + 1
+        }
+        if (*gb).slots != 0 {
+            rt.heap_free((*gb).slots, (*gb).slot_cap * SLOT_WORDS * 8)
+        }
+        s = (*gb).slot_cap
+        (*gb).slots = ns
+        (*gb).slot_cap = ncap
+    }
+    let b: usize = s * SLOT_WORDS
+    var vao: u32 = 0 as u32
+    var vbo: u32 = 0 as u32
+    var ibo: u32 = 0 as u32
+    if nverts > 0 && nidx > 0 {
+        let g: *mut gl33.Gl = &(*gb).g
+        vao = gl33.gl_gen_vao(g)
+        gl33.gl_bind_vao(g, vao)
+        vbo = gl33.gl_gen_buffer(g)
+        gl33.gl_bind_buffer(g, gl33.GL_ARRAY_BUFFER, vbo)
+        gl33.gl_buffer_data(g, gl33.GL_ARRAY_BUFFER, verts, nverts * 8, gl33.GL_STATIC_DRAW)
+        gl33.gl_enable_attrib(g, 0 as u32)
+        gl33.gl_attrib_i(g, 0 as u32, 2, gl33.GL_UNSIGNED_INT, 8, 0)
+        ibo = gl33.gl_gen_buffer(g)
+        gl33.gl_bind_buffer(g, gl33.GL_ELEMENT_ARRAY_BUFFER, ibo)
+        gl33.gl_buffer_data(g, gl33.GL_ELEMENT_ARRAY_BUFFER, idx, nidx * 4, gl33.GL_STATIC_DRAW)
+        gl33.gl_bind_vao(g, 0 as u32)
+    }
+    rt.st64((*gb).slots, b, vao as u64)
+    rt.st64((*gb).slots, b + 1, vbo as u64)
+    rt.st64((*gb).slots, b + 2, ibo as u64)
+    rt.st64((*gb).slots, b + 3, nidx as u64)
+    rt.st64((*gb).slots, b + 4, 1 as u64)
+    rt.st64((*gb).slots, b + 5, key)
+    return s + 1
+}
+
+fn free_slot(gb: *mut GlBackend, handle: usize) {
+    if handle < 1 || handle > (*gb).slot_cap {
+        return
+    }
+    let b: usize = (handle - 1) * SLOT_WORDS
+    if rt.ld64((*gb).slots, b + 4) == 0 as u64 {
+        return
+    }
+    let g: *mut gl33.Gl = &(*gb).g
+    let vao: u32 = rt.ld64((*gb).slots, b) as u32
+    let vbo: u32 = rt.ld64((*gb).slots, b + 1) as u32
+    let ibo: u32 = rt.ld64((*gb).slots, b + 2) as u32
+    if vao != 0 as u32 {
+        gl33.gl_delete_vao(g, vao)
+    }
+    if vbo != 0 as u32 {
+        gl33.gl_delete_buffer(g, vbo)
+    }
+    if ibo != 0 as u32 {
+        gl33.gl_delete_buffer(g, ibo)
+    }
+    rt.st64((*gb).slots, b + 4, 0 as u64)
+}
+
+fn be_free(o: u64, h: usize) {
+    free_slot(o as *mut GlBackend, h)
+}
+
+fn be_begin(o: u64, cam: u64, rgba: u32) {
+    let gb: *mut GlBackend = o as *mut GlBackend
+    let c: *mut mc_camera.Camera = cam as *mut mc_camera.Camera
+    let g: *mut gl33.Gl = &(*gb).g
+    (*gb).cx = (*c).x
+    (*gb).cy = (*c).y
+    (*gb).cz = (*c).z
+    // projection * view rotation: the camera translation is applied on the CPU per draw (u_origin)
+    var rot: mc_math.Mat4 = (*c).view
+    rot.m[12] = 0.0
+    rot.m[13] = 0.0
+    rot.m[14] = 0.0
+    var rv: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
+    mc_math.mat4_mul(&rv, &(*c).proj, &rot)
+    gl33.gl_mat4_f64_to_f32((&rv.m[0]) as u64, (&(*gb).rv[0]) as u64)
+    gl33.gl_fbo_bind(g, &(*gb).fbo)
+    gl33.gl_viewport(g, 0, 0, (*gb).w, (*gb).h)
+    gl33.gl_disable(g, gl33.GL_BLEND)
+    gl33.gl_disable(g, gl33.GL_SCISSOR_TEST)
+    gl33.gl_enable(g, gl33.GL_DEPTH_TEST)
+    gl33.gl_depth_func(g, gl33.GL_LESS)
+    gl33.gl_depth_mask(g, true)
+    gl33.gl_color_mask(g, true, true, true, true)
+    gl33.gl_front_face(g, gl33.GL_CCW)
+    if (*gb).cull {
+        gl33.gl_enable(g, gl33.GL_CULL_FACE)
+        gl33.gl_cull_face(g, gl33.GL_BACK)
+    } else {
+        gl33.gl_disable(g, gl33.GL_CULL_FACE)
+    }
+    let r: f64 = ((rgba & 255 as u32) as f64) / 255.0
+    let gr: f64 = (((rgba >> 8 as u32) & 255 as u32) as f64) / 255.0
+    let b: f64 = (((rgba >> 16 as u32) & 255 as u32) as f64) / 255.0
+    let a: f64 = (((rgba >> 24 as u32) & 255 as u32) as f64) / 255.0
+    gl33.gl_clear_color(g, r, gr, b, a)
+    gl33.gl_clear(g, gl33.GL_COLOR_BUFFER_BIT | gl33.GL_DEPTH_BUFFER_BIT)
+    gl33.gl_use(g, (*gb).prog)
+    gl33.gl_bind_tex(g, 0 as u32, (*gb).atlas_tex)
+    gl33.gl_u1i(g, (*gb).l_atlas, 0)
+    gl33.gl_uniform_mat4(g, (*gb).l_rv, (&(*gb).rv[0]) as u64)
+    gl33.gl_u2f(g, (*gb).l_tiles, (*gb).atile as f64, (*gb).acols as f64)
+    gl33.gl_u4f(g, (*gb).l_fog, if (*gb).fog_on { 1.0 } else { 0.0 }, (*gb).fog_start, (*gb).fog_end, 0.0)
+    gl33.gl_u3f(g, (*gb).l_fogc, (*gb).fog_r, (*gb).fog_g, (*gb).fog_b)
+    (*gb).fresh = false
+}
+
+fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
+    let gb: *mut GlBackend = o as *mut GlBackend
+    if h < 1 || h > (*gb).slot_cap {
+        return 0 as u64
+    }
+    let b: usize = (h - 1) * SLOT_WORDS
+    if rt.ld64((*gb).slots, b + 4) == 0 as u64 {
+        return 0 as u64
+    }
+    let nidx: usize = rt.ld64((*gb).slots, b + 3) as usize
+    if nidx < 3 {
+        return 0 as u64
+    }
+    let g: *mut gl33.Gl = &(*gb).g
+    gl33.gl_u3f(g, (*gb).l_origin, ox - (*gb).cx, oy - (*gb).cy, oz - (*gb).cz)
+    gl33.gl_bind_vao(g, rt.ld64((*gb).slots, b) as u32)
+    gl33.gl_draw_elements(g, gl33.GL_TRIANGLES, nidx as i32, gl33.GL_UNSIGNED_INT, 0)
+    let t: u64 = (nidx / 3) as u64
+    (*gb).draws = (*gb).draws + 1 as u64
+    (*gb).tris = (*gb).tris + t
+    return t
+}
+
+fn be_end(o: u64) {
+    let gb: *mut GlBackend = o as *mut GlBackend
+    gl33.gl_bind_vao(&(*gb).g, 0 as u32)
+    gl33.gl_flush(&(*gb).g)
+}
+
+// Reads the finished frame back (blocks until the GPU is done): w*h*4 bytes RGBA, row 0 = top.
+fn be_present(o: u64) -> u64 {
+    let gb: *mut GlBackend = o as *mut GlBackend
+    if !(*gb).fresh {
+        gl33.gl_fbo_bind(&(*gb).g, &(*gb).fbo)
+        gl33.gl_read_rgba_top_down(&(*gb).g, (*gb).w, (*gb).h, (*gb).pix, (*gb).tmp)
+        (*gb).fresh = true
+    }
+    return (*gb).pix
+}
+
+fn be_read(o: u64, out: u64) {
+    let gb: *mut GlBackend = o as *mut GlBackend
+    let p: u64 = be_present(o)
+    rt.mem_copy(out, p, ((*gb).w as usize) * ((*gb).h as usize) * 4)
+}
+
+// The GL back end as a mc_backend.Backend table. `gb` must outlive the table.
+fn glbe_backend(gb: *mut GlBackend) -> mc_backend.Backend {
+    var b: mc_backend.Backend = mc_backend.backend_new()
+    b.kind = mc_backend.KIND_GL
+    b.obj = gb as u64
+    b.upload_atlas = be_atlas
+    b.mesh_upload = be_upload
+    b.mesh_free = be_free
+    b.begin = be_begin
+    b.draw = be_draw
+    b.end = be_end
+    b.present = be_present
+    b.read_pixels = be_read
+    return b
+}

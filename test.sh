@@ -1960,6 +1960,19 @@ else
     grep -E 'FAIL' "$WORK/ffi.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 119. OpenGL 3.3 voxel back end (lib/gpu/gl_mc.fi) against the CPU rasterizer, Linux + Windows twin under Wine (tools/gpu/run.sh, docs/GPU.md) =="
+# Same Backend calls on mc_raster and on GL (Mesa llvmpipe): triangle, textured quad, cut-out, voxel chunk, fog, camera inside,
+# far from the origin -- coverage + PSNR thresholds (the GL rasterizer is float, mc_raster snaps to 1/16 px, so NOT byte equal),
+# ms/frame GPU vs CPU. A missing libEGL / Wine / Xvfb is SKIP, not FAIL.
+FIRNC="$FIRNC" bash tools/gpu/run.sh > "$WORK/gpu.log" 2>&1 && GPRC=0 || GPRC=$?
+if [ "$GPRC" -eq 0 ]; then
+    ok
+    grep -E '^   (ok|SKIP)|metric' "$WORK/gpu.log" | sed 's/^/ /'
+else
+    bad "tools/gpu/run.sh failed (see .test-work/gpu.log)"
+    grep -E 'FAIL|scene .*FAIL' "$WORK/gpu.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
