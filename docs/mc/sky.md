@@ -67,7 +67,7 @@ r54 (target < 5 ms at sunset) was NOT reached; what was learned (AMD EPYC 7571, 
   with the intrinsic in isolation; inside `sky_draw` replacing it by `__sqrt` was consistently 40 % SLOWER, left as is).
 * The big win was code shape, not math: indexed helpers (`rt.ld32/st32`, `x * 8` with overflow checks, `tab[f]` bounds checks)
   were ~70 % of a glow pixel. Pointer-walking loops, shifts and one function per lit row (`sky_glow_row`) took the glow part
-  from ~6.5 to ~2.9 ms and the gradient search from ~3 to ~1.5 ms.
-* Remaining at sunset (bench scene): gradient search ~66k exact evaluations (sqrt + division each, ~2.2 ms; the number of distinct
-  f levels per row is inherent), per-pixel dot products for the glow test ~2 ms, glow pixels ~2.9 ms, discs ~0.5 ms. Below 5 ms would need
+  from ~6.5 to ~2.9 ms and day/night frames (gradient search + fill) from 4.5 to 2.4 ms.
+* Remaining at sunset (bench scene, rough split): gradient search 66k exact evaluations (sqrt + division each; the number of
+  distinct f levels per row is inherent), per-pixel dot products for the glow test ~2 ms, glow pixels ~2.9 ms, discs and fill the rest. Below 5 ms would need
   SIMD or a faster sqrt/div path in the compiler (or giving up bit identity with the plain model), see roadmap r54.
