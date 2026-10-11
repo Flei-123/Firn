@@ -22,6 +22,9 @@ const path = require('path')
 const mcData = require('minecraft-data')
 const nbt = require('prismarine-nbt')
 const { createSerializer, createDeserializer } = require('minecraft-protocol/src/transforms/serializer')
+const { ProtoDefCompiler } = require('protodef').Compiler
+const { Serializer, FullPacketParser } = require('protodef')
+const nmpVersions = require('minecraft-protocol/src/version').supportedVersions
 
 const outDir = process.argv[2]
 const version = process.argv[3] || '1.20.1'
@@ -31,6 +34,131 @@ fs.mkdirSync(outDir, { recursive: true })
 
 const data = mcData(version)
 const proto = data.protocol
+
+// ---- the reference codec.
+// Versions that node-minecraft-protocol supports use ITS serializer. For newer versions
+// (nmp 1.54 stops at 1.21.4) the same protodef compiler + the same minecraft datatypes are
+// used directly on the minecraft-data protocol.json, plus ONE extra native type written
+// here from the public format description: lpVec3 (1.21.9+). It is independent of the Firn
+// walker; its value is the raw field set { lowest, middle, highest, ext }.
+function writeVarint (v, buffer, offset) {
+  v >>>= 0
+  while (v >= 0x80) { buffer[offset++] = (v & 0x7f) | 0x80; v >>>= 7 }
+  buffer[offset++] = v
+  return offset
+}
+function sizeVarint (v) { v >>>= 0; let n = 1; while (v >= 0x80) { n++; v >>>= 7 } return n }
+const LPVEC3 = {
+  Read: {
+    lpVec3: ['native', (buffer, offset) => {
+      const lowest = buffer.readUInt8(offset)
+      if (lowest === 0) return { value: { lowest, middle: 0, highest: 0, ext: 0 }, size: 1 }
+      const middle = buffer.readUInt8(offset + 1)
+      const highest = buffer.readUInt32BE(offset + 2)
+      let size = 6
+      let ext = 0
+      if ((lowest & 4) !== 0) {
+        let shift = 0
+        let b
+        do { b = buffer.readUInt8(offset + size); size++; ext |= (b & 0x7f) << shift; shift += 7 } while (b & 0x80)
+        ext >>>= 0
+      }
+      return { value: { lowest, middle, highest, ext }, size }
+    }]
+  },
+  Write: {
+    lpVec3: ['native', (value, buffer, offset) => {
+      buffer.writeUInt8(value.lowest, offset++)
+      if (value.lowest === 0) return offset
+      buffer.writeUInt8(value.middle, offset++)
+      buffer.writeUInt32BE(value.highest, offset); offset += 4
+      if ((value.lowest & 4) !== 0) offset = writeVarint(value.ext, buffer, offset)
+      return offset
+    }]
+  },
+  SizeOf: {
+    lpVec3: ['native', (value) => {
+      if (value.lowest === 0) return 1
+      return 6 + ((value.lowest & 4) !== 0 ? sizeVarint(value.ext) : 0)
+    }]
+  }
+}
+// node-minecraft-protocol's registryEntryHolder is wrong in all three directions for the
+// INLINE form (varint 0, then the value): the reader calls the inline type at the wrong offset
+// and returns `holder.data`, the writer and sizeOf forget the leading 0. It cannot read its
+// own output, and the bytes it writes are not the protocol. Corrected versions replace them
+// here (the registry-id form is fine and unchanged in behaviour).
+const holderParts = (opts) => ({
+  base: `value.${opts.baseName}`,
+  other: `value.${opts.otherwise.name}`
+})
+const FIXED_HOLDER = {
+  Read: {
+    registryEntryHolder: ['parametrizable', (compiler, opts) => compiler.wrapCode(`
+const { value: n, size: nSize } = ${compiler.callType('varint')}
+if (n !== 0) {
+  return { value: { ${opts.baseName}: n - 1 }, size: nSize }
+}
+const holder = ${compiler.callType(opts.otherwise.type, 'offset + nSize')}
+return { value: { ${opts.otherwise.name}: holder.value }, size: nSize + holder.size }
+`.trim())]
+  },
+  Write: {
+    registryEntryHolder: ['parametrizable', (compiler, opts) => {
+      const h = holderParts(opts)
+      return compiler.wrapCode(`
+if (${h.base} !== undefined) {
+  offset = ${compiler.callType(`${h.base} + 1`, 'varint')}
+} else if (${h.other} !== undefined) {
+  offset = ${compiler.callType(0, 'varint')}
+  offset = ${compiler.callType(h.other, opts.otherwise.type)}
+} else {
+  throw new Error('registryEntryHolder needs ${opts.baseName} or ${opts.otherwise.name}')
+}
+return offset
+`.trim())
+    }]
+  },
+  SizeOf: {
+    registryEntryHolder: ['parametrizable', (compiler, opts) => {
+      const h = holderParts(opts)
+      return compiler.wrapCode(`
+let size = 0
+if (${h.base} !== undefined) {
+  size += ${compiler.callType(`${h.base} + 1`, 'varint')}
+} else if (${h.other} !== undefined) {
+  size += ${compiler.callType(0, 'varint')}
+  size += ${compiler.callType(h.other, opts.otherwise.type)}
+} else {
+  throw new Error('registryEntryHolder needs ${opts.baseName} or ${opts.otherwise.name}')
+}
+return size
+`.trim())
+    }]
+  }
+}
+const customProtocols = {}
+function customProtocol (state, direction) {
+  const key = state + ';' + direction
+  if (customProtocols[key]) return customProtocols[key]
+  const compiler = new ProtoDefCompiler()
+  compiler.addTypes(require('minecraft-protocol/src/datatypes/compiler-minecraft'))
+  compiler.addTypes(LPVEC3)
+  compiler.addTypes(FIXED_HOLDER)
+  compiler.addProtocol(proto, [state, direction])
+  nbt.addTypesToCompiler('big', compiler)
+  customProtocols[key] = compiler.compileProtoDefSync()
+  return customProtocols[key]
+}
+const viaNmp = nmpVersions.includes(version) && !JSON.stringify(proto).includes('"registryEntryHolder",')
+function makeSerializer (state, isServer) {
+  if (viaNmp) return createSerializer({ state, isServer, version })
+  return new Serializer(customProtocol(state, isServer ? 'toClient' : 'toServer'), 'packet')
+}
+function makeDeserializer (state, isServer) {
+  if (viaNmp) return createDeserializer({ state, isServer, version, noErrorLogging: true })
+  return new FullPacketParser(customProtocol(state, isServer ? 'toServer' : 'toClient'), 'packet', true)
+}
 const STATES = ['handshaking', 'status', 'login', 'play', 'configuration']
 const DIRS = ['toServer', 'toClient'] // index = the dir number used by the Firn side
 
@@ -53,6 +181,7 @@ class Gen {
   constructor (seed, level, localTypes) {
     this.r = mulberry32(seed)
     this.level = level // 0 = smallest values, 1.. = bigger
+    this.nest = 0 // depth of named composite types
     this.local = localTypes
   }
 
@@ -160,6 +289,18 @@ class Gen {
         if (this.chance(0.5)) return { [a.baseName]: this.int(1, 300) }
         return { [a.otherwise.name]: this.value(a.otherwise.type, ctx) }
       }
+      case 'registryEntryHolderSet': {
+        // n == 0: the base value (never empty: the reference writer tests it for truthiness)
+        if (this.chance(0.4)) {
+          let b = this.value(a.base.type, ctx)
+          if (b === '') b = 'a'
+          return { [a.base.name]: b }
+        }
+        const n = this.level === 0 ? this.pick([0, 1]) : this.int(0, 3)
+        const arr = []
+        for (let i = 0; i < n; i++) arr.push(this.value(a.otherwise.type, ctx))
+        return { [a.otherwise.name]: arr }
+      }
       default: {
         // a parametrized named type, e.g. ["particleData", {compareTo: "particleId"}]
         return this.named(h, ctx, a, hint)
@@ -208,6 +349,12 @@ class Gen {
         return s
       }
       case 'void': return undefined
+      case 'lpVec3': {
+        if (this.chance(0.3)) return { lowest: 0, middle: 0, highest: 0, ext: 0 }
+        const lowest = this.int(1, 255)
+        return { lowest, middle: this.int(0, 255), highest: this.int(0, 4294967295),
+          ext: (lowest & 4) !== 0 ? this.pick([0, 1, 127, 128, 300, this.int(0, 1000000)]) : 0 }
+      }
       case 'restBuffer': return this.buf(this.level === 0 ? 0 : this.int(0, 12))
       case 'nbt': return this.nbtRoot()
       case 'optionalNbt': return this.chance(0.5) ? undefined : this.nbtRoot()
@@ -228,8 +375,11 @@ class Gen {
       return this.value(tt, ctx)
     }
     // a named type is a fresh context (compareTo paths inside it are relative to it)
-    if (def[0] === 'container') return this.container(def[1], [undefined])
-    return this.value(def, ctx, hint)
+    this.nest++
+    try {
+      if (def[0] === 'container') return this.container(def[1], [undefined])
+      return this.value(def, ctx, hint)
+    } finally { this.nest-- }
   }
 
   container (fields, ctx) {
@@ -242,7 +392,12 @@ class Gen {
         const keys = []
         for (let j = i + 1; j < fields.length; j++) this.keysOfSwitchOn(fields[j].type, f.name, keys)
         if (keys.length > 0) {
-          const k = this.pick(keys)
+          let k = this.pick(keys)
+          // also reach the `default` branch of a numeric switch (a key no case names),
+          // but not when we are already deep inside nested slots / components
+          if (this.nest < 4 && keys.every(x => /^\d+$/.test(x)) && this.chance(0.4)) {
+            k = String(Math.max(...keys.map(Number)) + 1 + this.int(0, 1))
+          }
           hint = k
         }
       }
@@ -284,7 +439,7 @@ class Gen {
         case 4: o[name] = nbt.float(this.r() * 10); break
         case 5: o[name] = nbt.double(this.r() * 10); break
         case 6: o[name] = nbt.string(this.str()); break
-        case 7: o[name] = nbt.byteArray(Array.from(this.buf(this.int(0, 5)))); break
+        case 7: o[name] = nbt.byteArray(Array.from(this.buf(this.int(0, 5))).map(b => (b > 127 ? b - 256 : b))); break
         case 8: o[name] = nbt.list(nbt.int([this.int(0, 9), this.int(0, 9)])); break
         default: o[name] = nbt.comp(this.nbtCompound(depth - 1)); break
       }
@@ -294,16 +449,18 @@ class Gen {
 }
 
 // does the packet type end in a restBuffer (any tail is valid then)?
-function endsInRest (t, local) {
+function endsInRest (t, local, seen = new Set()) {
   if (typeof t === 'string') {
     if (t === 'restBuffer') return true
+    if (seen.has(t)) return false // recursive types (a slot inside a slot component)
+    seen.add(t)
     const def = (local && local[t]) || proto.types[t]
-    if (def && def !== 'native') return endsInRest(def, local)
+    if (def && def !== 'native') return endsInRest(def, local, seen)
     return false
   }
-  if (t[0] === 'container') return t[1].length > 0 && endsInRest(t[1][t[1].length - 1].type, local)
-  if (t[0] === 'option') return endsInRest(t[1], local)
-  if (t[0] === 'switch') return Object.values(t[1].fields).some(x => endsInRest(x, local)) || (t[1].default ? endsInRest(t[1].default, local) : false)
+  if (t[0] === 'container') return t[1].length > 0 && endsInRest(t[1][t[1].length - 1].type, local, seen)
+  if (t[0] === 'option') return endsInRest(t[1], local, seen)
+  if (t[0] === 'switch') return Object.values(t[1].fields).some(x => endsInRest(x, local, seen)) || (t[1].default ? endsInRest(t[1].default, local, seen) : false)
   return false
 }
 
@@ -319,8 +476,8 @@ for (let si = 0; si < STATES.length; si++) {
     const pk = dirTypes.packet
     const mapping = pk[1][0].type[1].mappings
     const isServerSerializer = di === 1 // the serializer of toClient packets is the server's
-    const ser = createSerializer({ state: STATES[si], isServer: isServerSerializer, version })
-    const des = createDeserializer({ state: STATES[si], isServer: di === 0, version, noErrorLogging: true })
+    const ser = makeSerializer(STATES[si], isServerSerializer)
+    const des = makeDeserializer(STATES[si], di === 0)
     for (const [idStr, pname] of Object.entries(mapping)) {
       const id = Number(idStr)
       const tname = pk[1][1].type[1].fields[pname]
