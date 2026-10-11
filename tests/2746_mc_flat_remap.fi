@@ -1,0 +1,133 @@
+// expect_exit: 0
+// tests/2746_mc_flat_remap.fi -- mc_flat (flattening table id << 4 | meta -> 1.20.1 state id) and the
+// container remap of mc_chunk. The whole 4096 entry table is compared with an independent Node
+// implementation by tools/mc/flat/run.sh; this test pins the Firn side: reader, fallbacks, and the
+// palette handling of container_remap / chunk_remap_blocks (distinct palette entries, re-packed bits).
+import std.bytes
+import std.rt
+import mc.mc_chunk
+import mc.mc_flat
+import mc.v340.mc_flat_v340
+
+const N: usize = 4096
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+// one 1.12.2 section with the given legacy palette (entry i = palette[i % np]), 4 bits per block
+fn legacy_packet(body: *mut bytes.Bytes, pal: *[i32; 8], np: i32) {
+    var d: bytes.Bytes = bytes.bytes_new()
+    bytes.put_u8(&d, 4 as u8)
+    bytes.put_varint(&d, np)
+    var k: i32 = 0
+    while k < np {
+        bytes.put_varint(&d, (*pal)[k as usize])
+        k = k + 1
+    }
+    bytes.put_varint(&d, 256)
+    var w: usize = 0
+    while w < 256 {
+        var word: u64 = 0 as u64
+        var e: usize = 0
+        while e < 16 {
+            let i: usize = w * 16 + e
+            word = word | (((i % (np as usize)) as u64) << ((e * 4) as u32))
+            e = e + 1
+        }
+        bytes.put_u64(&d, word)
+        w = w + 1
+    }
+    bytes.put_zero(&d, 2048) // block light
+    bytes.put_i32(body, 0)
+    bytes.put_i32(body, 0)
+    bytes.put_bool(body, false)
+    bytes.put_varint(body, 1)
+    bytes.put_varint(body, bytes.bytes_len(&d) as i32)
+    bytes.put_bytes(body, &d)
+    bytes.put_varint(body, 0)
+    bytes.bytes_free(&d)
+}
+
+// decodes a packet with that palette, remaps it and checks the result against `want` (per palette entry)
+fn run_case(sc: *mut mc_chunk.Scratch, f: *mut mc_flat.Flat, pal: *[i32; 8], np: i32, want: *[i32; 8],
+    want_distinct: u32, want_bits: u32, code: i32) {
+    var body: bytes.Bytes = bytes.bytes_new()
+    legacy_packet(&body, pal, np)
+    let p: u64 = mc_chunk.chunk_alloc()
+    check(p != 0, code)
+    let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+    check(mc_chunk.chunk_decode_19(&body, sc, c) catch false, code + 1)
+    let ok: bool = mc_chunk.chunk_remap_blocks(c, sc, mc_flat.flat_table(f), mc_flat.flat_len(f)) catch false
+    check(ok, code + 2)
+    let s: *mut mc_chunk.Section = mc_chunk.chunk_section(c, 0)
+    check(mc_chunk.container_palette_size(&(*s).blocks) == want_distinct, code + 3)
+    check(mc_chunk.container_bits(&(*s).blocks) == want_bits, code + 4)
+    var nonair: i32 = 0
+    var i: usize = 0
+    while i < N {
+        let w: i32 = (*want)[i % (np as usize)]
+        check(mc_chunk.container_get(&(*s).blocks, i) as i32 == w, code + 5)
+        if w != 0 {
+            nonair = nonair + 1
+        }
+        i = i + 1
+    }
+    check((*s).count == nonair, code + 6)
+    // sections that were not sent stay air
+    check((*mc_chunk.chunk_section(c, 1)).count == 0, code + 7)
+    mc_chunk.chunk_release(p)
+    bytes.bytes_free(&body)
+}
+
+fn main() -> i32 {
+    var f: mc_flat.Flat = mc_flat_v340.flat_make()
+    check(mc_flat.flat_ok(&f), 1)
+
+    // ---- the reader: hand known 1.20.1 state ids ---------------------------------------------------------
+    check(mc_flat.flat_get(&f, 0 as u32) == 0 as u16, 2) // air
+    check(mc_flat.flat_get(&f, 16 as u32) == 1 as u16, 3) // stone
+    check(mc_flat.flat_get(&f, 17 as u32) == 2 as u16, 4) // granite
+    check(mc_flat.flat_get(&f, 32 as u32) == 9 as u16, 5) // grass -> grass_block (snowy=false)
+    check(mc_flat.flat_get(&f, 80 as u32) == 15 as u16, 6) // planks meta 0 -> oak_planks
+    check(mc_flat.flat_get(&f, 4096 as u32) == 0 as u16, 7) // outside the table: air
+    check(mc_flat.flat_get(&f, (253 * 16 + 3) as u32) == 0 as u16, 8) // id 253: no such block in 1.12.2
+    // an unknown meta combination falls back to meta 0 of the same id (sapling meta 6 / 7 do not exist)
+    check(mc_flat.flat_get(&f, (6 * 16 + 6) as u32) == mc_flat.flat_get(&f, (6 * 16) as u32), 9)
+    check(mc_flat.flat_get(&f, (1 * 16 + 7) as u32) == mc_flat.flat_get(&f, (1 * 16) as u32), 10)
+    // a property is applied: sapling meta 8 = stage 1 differs from meta 0
+    check(mc_flat.flat_get(&f, (6 * 16 + 8) as u32) != mc_flat.flat_get(&f, (6 * 16) as u32), 11)
+    // two different metas of one block id stay different where the rules say so (stone variants)
+    check(mc_flat.flat_get(&f, 18 as u32) != mc_flat.flat_get(&f, 17 as u32), 12)
+    // no modern state id may exceed the 15 bit limit of the chunk containers
+    var i: u32 = 0 as u32
+    while (i as usize) < N {
+        check((mc_flat.flat_get(&f, i) as u32) < 32768 as u32, 13)
+        i = i + 1 as u32
+    }
+
+    var sc: mc_chunk.Scratch = mc_chunk.scratch_new()
+    mc_chunk.scratch_set_sky(&sc, false)
+
+    // ---- remap without duplicates: palette stays, only the values change ----------------------------------------
+    var pal_a: [i32; 8] = [0, 16, 17, 32, 0, 0, 0, 0]
+    var want_a: [i32; 8] = [0, 1, 2, 9, 0, 0, 0, 0]
+    run_case(&sc, &f, &pal_a, 4, &want_a, 4 as u32, 2 as u32, 100)
+
+    // ---- two legacy values map to ONE state (grass meta 0 and 1) plus an id outside the table (-> air, which
+    //      equals the first entry): the palette is rebuilt with distinct entries and fewer bits ----------------------
+    var pal_b: [i32; 8] = [0, 16, 17, 32, 33, 5000, 0, 0]
+    var want_b: [i32; 8] = [0, 1, 2, 9, 9, 0, 0, 0]
+    run_case(&sc, &f, &pal_b, 6, &want_b, 4 as u32, 2 as u32, 200)
+
+    // ---- everything collapses to one value: the container turns into a single value without index array ----------
+    var pal_c: [i32; 8] = [32, 33, 34, 0, 0, 0, 0, 0]
+    var want_c: [i32; 8] = [9, 9, 9, 0, 0, 0, 0, 0]
+    run_case(&sc, &f, &pal_c, 3, &want_c, 1 as u32, 0 as u32, 300)
+
+    mc_chunk.scratch_free(&sc)
+    mc_flat.flat_free(&f)
+    return 0
+}
