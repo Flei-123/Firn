@@ -90,7 +90,7 @@ The client picks the version from the protocol number in the server-list ping.
 |---|---|---|---|---|---|
 | 1.8.9 | 47 | yes | yes (448 packets x 4 stages) | `CF_LEGACY_8` not implemented | no |
 | **1.12.2** | **340** | yes | yes (500) | `CF_SECTIONS_19` **implemented** (`mc_chunk.chunk_decode_19`) | **yes** (11.10.2026: real 1.12.2 server, dump byte-identical to the reference client, 81 chunks) |
-| 1.16.5 | 754 | yes | yes (616) | `CF_SECTIONS_114` not implemented | no |
+| **1.16.5** | **754** | yes | yes (616) | `CF_SECTIONS_114` **implemented** (`mc_chunk.chunk_decode_114`, protocols 751-754) | **yes** (11.10.2026: real 1.16.5 server, dump byte-identical to the reference client, 121 chunks) |
 | **1.20.1** | **763** | yes | yes (704) | `CF_CONTAINERS_118` **implemented** | in progress (M0) |
 | **1.20.2** | **764** | yes (has the Configuration state) | yes (788) | `CF_CONTAINERS_118` (same, nameless NBT roots) | **yes** (11.10.2026: real 1.20.2 server incl. configuration phase, dump byte-identical, 109 chunks) |
 | 1.21.1 | 767 | yes | yes (904) | `CF_CONTAINERS_118` (assumed, unverified) | no |
@@ -211,3 +211,20 @@ view distance 4), `MC_VERSION=<release> bash tools/mcclient/run.sh <firn client>
 metadata nibble; 143 rules, own words, no GPL tables). The generator that turns it plus `blocks.json` of 1.12.2 and 1.20.1 into
 `lib/mc/v340/mc_flat_v340.fi` and the application step (`mc_chunk` container remap) are **not written yet** (roadmap r18).
 Known loss by design: properties that are not in the rules fall back to the default state of the matched block.
+
+## 9. Round 2026-10-11 (worker mc-w3-1-16-5-join-cf-sections-114)
+
+* **1.16.5 (754)**: PASS against the OFFICIAL 1.16.5 server (`MC_VERSION=1.16.5 MC_SETTLE_MS=40000 bash tools/mcclient/run.sh <client>`),
+  checksum `6670360b0dd2...`, 121 chunks, walk_fail 0, A == A2 and B == A. No change was needed in the state machine or the schema walker.
+* New: `mc_chunk.chunk_decode_114` (CF_SECTIONS_114, protocols 751-754 = 1.16.2 - 1.16.5): groundUp, bitMap (VarInt, bit i = section i),
+  heightmaps as a named NBT compound (37 longs of 9 bits, 7 per long), biomes as `varint count (1024) + varints` ONLY in a ground-up column,
+  chunkData with `blockCount` (i16) + paletted blocks (indirect 4-8 bit, direct 15 bit) whose longs **never span** (same layout as
+  `container_decode`), block entities as named NBT. Block ids are already flat states: no flattening.
+* Fixed 16 sections (a 1.16 column is 256 high; the dimension height of Join Game is not read for this format).
+  The 1024 biome ints are ordered `(y*4+z)*4+x`, so section i owns entries `i*64 .. i*64+63` = the neutral `Section.biomes`;
+  the dump keeps the per-section `biomes=` hash (no `B` line).
+* Light is NOT part of the chunk packet (separate `update_light`, not decoded): `L` lines show `sky=0 block=0` and the FNV offset basis
+  in both clients. A section-only update (`groundUp = false`) is dropped in both (`partial_chunks`), like for 1.12.2.
+* NOT covered (decoder refuses with Range): 1.14 / 1.15 (spanning longs, 256 biome ints in 1.14), 1.16.0 / 1.16.1 (extra ignoreOldData bool),
+  1.17+ (long-array bitmask; 1.17 still uses this format family). Offline test: `tests/2745_mc_chunk114.fi` (hand-built packet, every block,
+  biome, heightmap value, counters, error and truncation paths).
