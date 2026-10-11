@@ -54,7 +54,16 @@ BYTECODE (must match lib/mc/mc_schema.fi, which holds the same table):
   14 TOPBIT      block-with-ONE-type-op
   15 EMETA       endval block-with-ONE-type-op
   16 NBT         mode (0 named, 1 anonymous, 2 optional named, 3 optional anon)
-  17 REGHOLDER   name block-with-ONE-type-op   (registryEntryHolder)
+  17 REGHOLDER   basename othername block-with-ONE-type-op   (registryEntryHolder:
+                 varint n; n != 0 -> registry id n-1, n == 0 -> the inline type)
+  18 REGSET      basename othername minsz block(base type) block(element type)
+                 (registryEntryHolderSet: varint n; n == 0 -> the base type (a tag
+                 name), n != 0 -> n-1 elements of the element type)
+  20 RCALL       same operand as CALL, used where a type refers back to itself
+                 (a slot component that holds a slot, 1.20.5+); the walker saves and
+                 restores its register file around the call
+  19 LPVEC3      (low precision Vec3 of 1.21.9+: u8 a; a == 0 -> done (zero vector);
+                 else u8, u32 and, if bit 2 of a is set, a varint)
 
   K_ (scalar kinds): 0 u8, 1 i8, 2 u16, 3 i16, 4 u32, 5 i32, 6 u64, 7 i64,
   8 f32, 9 f64, 10 bool, 11 varint, 12 varlong, 13 uuid (16 octets).
@@ -81,7 +90,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gen_registry  # noqa: E402
 
-FORMAT = 1
+FORMAT = 2
 
 K = dict(u8=0, i8=1, u16=2, i16=3, u32=4, i32=5, u64=6, i64=7, f32=8, f64=9,
          bool=10, varint=11, varlong=12, UUID=13)
@@ -91,7 +100,7 @@ CK_REG = 33
 
 (O_END, O_FIELD, O_SCALAR, O_VOID, O_CONTAINER, O_BITFIELD, O_BITFLAGS,
  O_STRING, O_BUFFER, O_RESTBUF, O_ARRAY, O_OPTION, O_SWITCH, O_CALL, O_TOPBIT,
- O_EMETA, O_NBT, O_REGHOLDER) = range(18)
+ O_EMETA, O_NBT, O_REGHOLDER, O_REGSET, O_LPVEC3, O_RCALL) = range(21)
 
 SCALAR_SIZE = dict(u8=1, i8=1, u16=2, i16=2, u32=4, i32=4, u64=8, i64=8, f32=4,
                    f64=8, bool=1, varint=1, varlong=1, UUID=16)
@@ -178,6 +187,7 @@ class Gen:
         self.sub_order = []
         self.vars = []
         self.stack = []  # recursion guard for subroutine construction
+        self.warnings = []  # data inconsistencies that were worked around
 
     # ---- type lookup
     def lookup(self, name):
@@ -227,7 +237,12 @@ class Gen:
         if head == "registryEntryHolder":
             ot = a["otherwise"]
             body, _ = self.build(ot["type"], scope, arg)
-            return ("regholder", a["baseName"], body), Var()
+            return ("regholder", a["baseName"], ot["name"], body), Var()
+        if head == "registryEntryHolderSet":
+            # varint n; n == 0: `base` (e.g. a tag name); else n-1 elements of `otherwise`
+            base, _ = self.build(a["base"]["type"], scope, arg)
+            elem, _ = self.build(a["otherwise"]["type"], scope, arg)
+            return ("regset", a["base"]["name"], a["otherwise"]["name"], min_size(elem, self), base, elem), Var()
         if head in self.types or head in self.local:
             # a parametrized named type: ["particleData", {"compareTo": "particleId"}]
             return self.build_named(head, a, scope, arg)
@@ -251,6 +266,8 @@ class Gen:
             return ("void",), Var()
         if name == "restBuffer":
             return ("restbuf",), Var()
+        if name == "lpVec3":
+            return ("lpvec3",), Var()
         if name in ("nbt", "optionalNbt", "anonymousNbt", "anonOptionalNbt"):
             mode = dict(nbt=0, anonymousNbt=1, optionalNbt=2, anonOptionalNbt=3)[name]
             return ("nbt", mode), Var()
@@ -261,7 +278,7 @@ class Gen:
             return self.build_named(d, params, scope, arg)
         head = d[0]
         if head in ("pstring", "buffer", "mapper", "bitfield", "bitflags",
-                    "registryEntryHolder"):
+                    "registryEntryHolder", "registryEntryHolderSet"):
             return self.build(d, scope, arg)  # small: inline
         # composite: a shared subroutine. A "$compareTo" parameter makes an instance
         # per argument variable.
@@ -271,10 +288,19 @@ class Gen:
             argvar.used = True
         key = (name, id(argvar) if argvar is not None else 0)
         if key in self.subs and self.subs[key] is None:
-            raise ValueError("recursive type %r: the walker has no recursion" % name)
+            # a type that refers back to itself (still under construction): the walker
+            # recurses (depth-limited, registers saved/restored around the call)
+            return ("rcall", key), Var()
         if key not in self.subs:
             self.subs[key] = None
-            ir, _ = self.build(d, Scope(None), argvar)
+            self.stack.append(name)
+            try:
+                ir, _ = self.build(d, Scope(None), argvar)
+            except ValueError as e:
+                if "[in " not in str(e):
+                    raise ValueError("%s [in %s]" % (e, "/".join(self.stack))) from None
+                raise
+            self.stack.pop()
             self.subs[key] = ir
             self.sub_order.append(key)
         return ("call", key), Var()
@@ -350,6 +376,16 @@ class Gen:
             i += 1
             if sc is None:
                 raise ValueError("compareTo %r climbs above the root" % path)
+        if i == 0 and parts[0] not in sc.names:
+            # protodef compiles a nested container into a closure of its parent, so a
+            # name that is not a field of the current container is looked up in the
+            # enclosing containers (1.21.11: DebugSubscriptionUpdate.default.payload
+            # switches on the `type` of the outer container)
+            up = sc.parent
+            while up is not None and parts[0] not in up.names:
+                up = up.parent
+            if up is not None:
+                sc = up
         cur = sc.names
         node = None
         for j in range(i, len(parts)):
@@ -376,6 +412,13 @@ class Gen:
         var.used = True
         cases = []
         for key, t in a["fields"].items():
+            if var.kind == "map" and key not in var.rev and key not in ("true", "false"):
+                # minecraft-data lists a case whose key the mapper never produces (a data
+                # inconsistency, e.g. a recipe serializer or data component that is only in
+                # one of the two tables): protodef can never select it, so it is dropped,
+                # and reported in the generator log.
+                self.warnings.append("switch case %r is not a mapper output: dropped" % key)
+                continue
             body, _ = self.build(t, scope, arg)
             cases.append((key_value(key, var), body))
         dflt = ("void",)
@@ -441,8 +484,10 @@ def min_size(ir, gen):
         return 1
     if k == "nbt":
         return {0: 3, 1: 1, 2: 1, 3: 1}[ir[1]]
-    if k == "regholder":
+    if k in ("regholder", "regset", "lpvec3"):
         return 1
+    if k == "rcall":
+        return 0
     raise ValueError(k)
 
 
@@ -499,6 +544,8 @@ def enc(ir):
         f.block(enc(ir[3]))
     elif k == "call":
         f.op(O_CALL); f.call(ir[1])
+    elif k == "rcall":
+        f.op(O_RCALL); f.call(ir[1])
     elif k == "topbit":
         f.op(O_TOPBIT); f.block(enc(ir[1]))
     elif k == "emeta":
@@ -506,7 +553,11 @@ def enc(ir):
     elif k == "nbt":
         f.op(O_NBT); f.u(ir[1])
     elif k == "regholder":
-        f.op(O_REGHOLDER); f.name(ir[1]); f.block(enc(ir[2]))
+        f.op(O_REGHOLDER); f.name(ir[1]); f.name(ir[2]); f.block(enc(ir[3]))
+    elif k == "regset":
+        f.op(O_REGSET); f.name(ir[1]); f.name(ir[2]); f.u(ir[3]); f.block(enc(ir[4])); f.block(enc(ir[5]))
+    elif k == "lpvec3":
+        f.op(O_LPVEC3)
     else:
         raise ValueError(k)
     return f
@@ -792,8 +843,13 @@ fn packet_id_limit(state: i32, dir: i32) -> i32 {
     w('const VERSION_NAME: str = "%s"' % version)
     with open(out_path, "w") as fh:
         fh.write("\n".join(L) + "\n")
-    sys.stderr.write("gen_protocol: %s protocol %d: %d packets, %d subroutines, blob %d octets, %d registers\n" % (
-        version, pver, count, len(gen.sub_order), len(blob.buf), nregs))
+    uniq = sorted(set(gen.warnings))
+    sys.stderr.write("gen_protocol: %s protocol %d: %d packets, %d subroutines, blob %d octets, %d registers%s\n" % (
+        version, pver, count, len(gen.sub_order), len(blob.buf), nregs,
+        (", %d data warnings (MCGEN_VERBOSE=1 lists them)" % len(uniq)) if uniq else ""))
+    if os.environ.get("MCGEN_VERBOSE"):
+        for m in uniq:
+            sys.stderr.write("  warning: %s\n" % m)
     return pver
 
 

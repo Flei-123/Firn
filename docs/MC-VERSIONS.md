@@ -93,14 +93,32 @@ The client picks the version from the protocol number in the server-list ping.
 | 1.16.5 | 754 | yes | yes (616) | `CF_SECTIONS_114` not implemented | no |
 | **1.20.1** | **763** | yes | yes (704) | `CF_CONTAINERS_118` **implemented** | in progress (M0) |
 | **1.20.2** | **764** | yes (has the Configuration state) | yes (788) | `CF_CONTAINERS_118` (same, nameless NBT roots) | **yes** (11.10.2026: real 1.20.2 server incl. configuration phase, dump byte-identical, 109 chunks) |
-| 1.21.x | 767+ | **no**: generator stops at `registryEntryHolderSet` | - | - | no |
-| 26.1 | 775 (in minecraft-data) | **no**: generator stops at `lpVec3` | - | - | no |
+| 1.21.1 | 767 | yes | yes (904) | `CF_CONTAINERS_118` (assumed, unverified) | no |
+| 1.21.4 | 769 | yes | yes (948) | same | no |
+| 1.21.8 | 772 | yes | yes (980) | same | no |
+| 1.21.11 | 774 | yes | yes (1008) | same | no |
+| 26.1 | 775 (in minecraft-data) | yes | yes (1028) | same | no |
+
+Tables for 1.20.5+ needed four generator/walker extensions (all in this round, no data typed by hand):
+`registryEntryHolderSet` (op 18), `lpVec3` (op 19, 1.21.9+; format from the public protocol
+description: u8 a; a == 0 -> zero vector, else u8 + u32 + varint when bit 2 of a is set),
+recursive types (op 20 RCALL: a slot component that holds a slot; the walker saves/restores its
+registers around the call, depth limit 64), and name lookup in enclosing containers (1.21.11
+`DebugSubscriptionUpdate`). Two `minecraft-data` inconsistencies are worked around and counted by
+the generator (`MCGEN_VERBOSE=1` lists them): a switch case whose key the mapper never produces
+(`minecraft:crafting_special_banneraddpattern` in 1.20.5/1.21.1, `zombie_nautilus/variant` in 26.1)
+is dropped. Fixtures for versions that node-minecraft-protocol (1.54) does not support
+(>= 1.21.5) come from the same protodef compiler on the minecraft-data protocol plus a
+`lpVec3` type written in `gen_fixtures.cjs`. node-minecraft-protocol's INLINE `registryEntryHolder`
+is broken in reader, writer and sizeOf (no leading 0, wrong offset, `holder.data`); corrected
+versions are used for the reference (documented in `gen_fixtures.cjs`). Only the walker is
+proven for these versions; no join, no chunk check (1.21.5 changed the heightmap encoding).
 
 "26.2" (named by the owner): the `minecraft-data` copy on the server knows `26.1` (protocol
 775) but not `26.2`; its protocol number is therefore **not known here and not guessed**.
 When a 26.2 server exists, the protocol number comes from its status ping and the data from a
-newer `minecraft-data`. Expect the same two generator gaps as 26.1 (`lpVec3`, and
-`registryEntryHolderSet` from 1.21.x on): both are single new protodef types.
+newer `minecraft-data`. Both generator gaps (`lpVec3`, `registryEntryHolderSet`) are closed, so a 26.2 entry
+is one `versions.json` block once its data exists (r24 stays open until then).
 
 ## 5. Theoretical walk-through: adding 1.12.2 (protocol 340) all the way to a join
 
@@ -154,7 +172,19 @@ The real gaps for a join (honest list):
 * Not proven: any join with a version other than 1.20.1; any chunk format other than
   `CF_CONTAINERS_118`.
 
-## 7. Round 2026-10-11 (worker voxel-client-1-12-2-chunks-join-1-20)
+## 7. Schema-driven client packet writer (design, NOT built yet, roadmap r16)
+
+Goal: `mc_schema.encode(schema, values, out)` builds serverbound bodies from the same generated
+programs, so no per-version hand written writer is needed. Design decided in this round:
+* Values are a flat text store `path=value` (the walker's dump paths: `a.b[2].c`), tokens: decimal,
+  `true/false`, `0x..` raw bits (floats), `"..."` strings, `hex:..` buffers/NBT/lpVec3, `uuid:..`;
+  prefix counts as `path#=N`, options as `path?=0|1`; holder id form `path.<baseName>=N`.
+* The encoder interprets the same bytecode (registers for switch keys and CK_REG counts, TOPBIT bit 7
+  patched afterwards, RCALL register save) and finishes with `mc_schema.walk` on its own output.
+* Test: `gen_fixtures.cjs` writes a flattened `<n>.pv` next to each reference body; Firn must
+  reproduce every `.bin` byte for byte, in all versions (then hand writers become fallbacks).
+
+## 8. Round 2026-10-11 (worker voxel-client-1-12-2-chunks-join-1-20)
 
 Measured against the OFFICIAL servers (jar from piston-meta, SHA-1 checked, offline mode, Java 17, seed 4242,
 view distance 4), `MC_VERSION=<release> bash tools/mcclient/run.sh <firn client>`: reference client A (node-minecraft-protocol

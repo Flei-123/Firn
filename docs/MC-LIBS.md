@@ -59,7 +59,7 @@ Mojang code. All of it runs with `bash tools/mc/run.sh` (about 10 minutes).
 | Lib | Purpose | Status | Cross-check | Test numbers |
 |---|---|---|---|---|
 | `std.bytes`, `std.net`, `lib/async`, `std.deflate`, `std.crypto.*`, `std.json`, `std.nbt` | building blocks | existed | - | - |
-| `mc_version` + `mc_sem` + `mc_versions` + `vNNN/mc_proto_vNNN.fi` + `tools/mcgen` | Version object (protocol, FLAG_*, chunk format, semantic packet ids), generator `protocol.json` -> tables for **1.8.9, 1.12.2, 1.16.5, 1.20.1, 1.20.2** | **done** | 3056 packets from node-minecraft-protocol consumed exactly, 5 versions x 4 build stages | 2650 |
+| `mc_version` + `mc_sem` + `mc_versions` + `vNNN/mc_proto_vNNN.fi` + `tools/mcgen` | Version object (protocol, FLAG_*, chunk format, semantic packet ids), generator `protocol.json` -> tables for **1.8.9, 1.12.2, 1.16.5, 1.20.1, 1.20.2, 1.21.1, 1.21.4, 1.21.8, 1.21.11, 26.1** | **done** | ~9500 reference packets consumed exactly, 10 versions x 4 build stages (nmp up to 1.21.4, protodef + own lpVec3 beyond) | 2650 |
 | `mc_schema` | generic packet walker / validator (any packet of any generated version) | **done** (~0.8 M packets/s) | same fixtures + truncation / extension / mutation / random input | 2650 |
 | `mc_registry` + `vNNN/mc_reg_vNNN.fi` | blocks, ALL block states with properties, items, entities, biomes per version | **done** | minecraft-data + prismarine-block, 5 versions, 24135 states for 1.20.1 | 2690 |
 | `mc_packet` | bounds-checked Reader / Writer for protocol types (sub-worker B) | **done** (1.20.1 / 1.20.2 hooks) | node protodef serializer | 2660-2662 |
@@ -79,7 +79,7 @@ Mojang code. All of it runs with `bash tools/mc/run.sh` (about 10 minutes).
 | `demos/mcclient` | **final integration**: join a real server, dump + checksum == node-minecraft-protocol | **done** (M0 accepted, see ROUND-M0.md) | node-minecraft-protocol on a real 1.20.1 server | - |
 
 Not built (explicitly): rendering / GPU (blocked by H3), Wasm mod host, physics, inventory, entity decoding, online-mode login against
-the live Microsoft / Mojang services (needs a real account), schema-driven client packet writers, an epoll based `mc_net`, chunk
+the live Microsoft / Mojang services (needs a real account), schema-driven client packet writers (design: docs/MC-VERSIONS.md section 7), an epoll based `mc_net`, chunk
 strategies other than 1.18+ (see MC-VERSIONS.md).
 
 ## Work split (sub-workers, separate git worktrees)
@@ -133,3 +133,7 @@ strategies other than 1.18+ (see MC-VERSIONS.md).
   scope); schema walker moved to `lib/mc/mc_schema.fi`; conformance for 5 versions passes
   (`bash tools/mc/schema/run.sh`). Generator gaps for newer versions recorded in
   `docs/MC-VERSIONS.md` (`registryEntryHolderSet`, `lpVec3`).
+
+* 2026-10-11 (worker B): generator/walker extended (`registryEntryHolderSet`, `lpVec3`, recursive
+  types, SCHEMA_FORMAT 2); tables for 1.21.1/1.21.4/1.21.8/1.21.11/26.1; `bash tools/mc/schema/run.sh`
+  now compiles the check program once per build stage and runs 10 versions (about 35 s).
