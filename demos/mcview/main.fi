@@ -1,8 +1,14 @@
 // demos/mcview/main.fi -- joins a real Minecraft server (offline mode), waits until the chunks have settled and
 // renders the world around the player with mc_render_world + mc_raster into a PNG (CPU only, no window).
 //
-//   live:    mcview <host-ipv4> <port> <name> <out-dir> [view=6] [settle-ms=3000] [yaw=0] [pitch=20] [protocol=763] [up=2]
-//   replay:  mcview --replay <out-dir> <world-file> [yaw] [pitch]
+//   live:    mcview [flags] <host-ipv4> <port> <name> <out-dir> [view=6] [settle-ms=3000] [yaw=0] [pitch=20] [protocol=763] [up=2]
+//   replay:  mcview [flags] --replay <out-dir> <world-file> [yaw] [pitch]
+//   flags (anywhere on the command line, not counted as positional arguments):
+//     --sky   sky pass (mc_sky: gradient, sun / moon, sky fog colour, light tint of the world pixels)
+//     --box   selection box (mc_input.input_draw_box) around the block under the crosshair
+//     --hud   crosshair, hotbar and debug lines (mc_hud)
+//     --all   all three.   Without flags the image is exactly the plain world render (hash equal to the python renderer).
+//   Frame order: raster_clear -> sky_draw -> sky_set_raster_fog -> world -> sky_tint_frame -> selection box -> HUD.
 //
 // live mode writes <out-dir>/world.mcw (the received world, text, run length coded, format below) and then renders
 // it exactly like replay mode does. Replay renders a world file WITHOUT a server (offline test, fixtures).
@@ -12,12 +18,16 @@
 //
 // Environment: MCVIEW_GREEDY=1 (greedy meshing; default 0 = one quad per face, the python reference needs this)
 //              MCVIEW_FOG=0 (fog off; default on)   MCVIEW_W / MCVIEW_H (image size, default 640x360)
+//              MCVIEW_TICKS (time of day 0..23999, default 2000)  MCVIEW_RAIN (0..256, default 0)  MCVIEW_REACH (pick reach in
+//              blocks, default 24)  MCVIEW_SLOT (hotbar slot 0..8, default 0)  MCVIEW_FPS (value shown in the debug lines;
+//              default = measured from the cached frame; set it for a reproducible image hash)
 //
 // World file (text, LF): `mcworld 1`, `protocol <n>`, `min_y <n>`, `cam <x> <y> <z> <yaw> <pitch>` (f64 bit patterns,
 // hex), `view <chunks>`, `chunks <N>`; per chunk `C <x> <z> <nsec>` followed by one line per section:
 // `U <i> <id>` (uniform) or `R <i> <runs> <id> <len> <id> <len> ...` (runs over the 4096 ids, index (y*16+z)*16+x).
 // Chunks ascending by x, then z.
 //
+// Live mode applies unload packets (column removed from the world, its meshes freed via wr_drop_chunk).
 // Nothing here names a packet id: positions come from mc_client (last Synchronize Player Position), chunks from
 // mc_chunk. Versions without chunk columns of the post-1.9 kind (1.8 bulk) are not supported by this demo.
 
@@ -41,6 +51,9 @@ import mc.mc_camera
 import mc.mc_texture
 import mc.mc_raster
 import mc.mc_render_world
+import mc.mc_sky
+import mc.mc_input
+import mc.mc_hud
 
 const DEFAULT_VIEW: i32 = 6
 const DEFAULT_SETTLE_MS: u64 = 3000
@@ -50,6 +63,13 @@ const PLAY_TIMEOUT_MS: u64 = 120000
 const FOG_R: u32 = 150
 const FOG_G: u32 = 190
 const FOG_B: u32 = 230
+const PF_SKY: u32 = 1
+const PF_BOX: u32 = 2
+const PF_HUD: u32 = 4
+const PF_BAD: u32 = 128
+const BOX_RGBA: u32 = 0xFF000000
+const DEFAULT_TICKS: i32 = 2000
+const DEFAULT_REACH: i32 = 24
 
 fn now_ns() -> u64 {
     var ts: [i64; 2] = [0; 2]
@@ -147,6 +167,79 @@ fn env_int(name: str, fallback: i32) -> i32 {
     return parse_dec(v.p as u64, v.length(), fallback as i64) as i32
 }
 
+// ---- command line: flags (--sky --box --hud --all) are skipped by argn/argp so the positional layout stays as before
+
+fn c_eq(p: u64, lit: str) -> bool {
+    if rt.c_length(p) != lit.n {
+        return false
+    }
+    var k: usize = 0
+    while k < lit.n {
+        if rt.ld8(p, k) != lit.chars(k) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+fn is_flag(p: u64) -> bool {
+    return rt.c_length(p) >= 3 && rt.ld8(p, 0) == 45 as u8 && rt.ld8(p, 1) == 45 as u8 && !c_eq(p, "--replay")
+}
+
+fn argn(start: u64) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < rt.arg_count(start) {
+        if !is_flag(rt.arg_ptr(start, i)) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn argp(start: u64, k: usize) -> u64 {
+    var n: usize = 0
+    var i: usize = 0
+    while i < rt.arg_count(start) {
+        let p: u64 = rt.arg_ptr(start, i)
+        if !is_flag(p) {
+            if n == k {
+                return p
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// post-processing flags of the command line; PF_BAD when an unknown flag is present
+fn post_flags(start: u64) -> u32 {
+    var f: u32 = 0 as u32
+    var i: usize = 0
+    while i < rt.arg_count(start) {
+        let p: u64 = rt.arg_ptr(start, i)
+        i = i + 1
+        if !is_flag(p) {
+            continue
+        }
+        if c_eq(p, "--sky") {
+            f = f | PF_SKY
+        } else if c_eq(p, "--box") {
+            f = f | PF_BOX
+        } else if c_eq(p, "--hud") {
+            f = f | PF_HUD
+        } else if c_eq(p, "--all") {
+            f = f | PF_SKY | PF_BOX | PF_HUD
+        } else {
+            f = f | PF_BAD
+        }
+    }
+    return f
+}
+
 // ---- small buffer helpers ---------------------------------------------------------------------------
 
 fn push_lit(b: *mut rt.Buf, s: str) {
@@ -198,6 +291,12 @@ struct Cfg {
     cz: f64,
     yaw: f64,
     pitch: f64,
+    post: u32, // PF_* flags
+    ticks: i32,
+    rain: i32,
+    fps: i32, // shown by the HUD; < 0 = measured
+    reach: i32,
+    slot: i32,
 }
 
 fn sort_chunks(w: *mut mc_world.World, order: u64) {
@@ -507,18 +606,107 @@ fn metric(m: *mut rt.Buf, key: str, v: i64) {
     rt.buf_push(m, 10 as u8)
 }
 
-// Renders `w` with the camera of `cfg`, writes view.png / view.rgba / view.txt / atlas.bin into `dir`.
-fn render(w: *mut mc_world.World, cfg: *mut Cfg, ver: *mut mc_version.Version, dir: u64) -> i32 {
+// Everything the renderer owns: atlas, block tables, rasterizer, world renderer (section mesh cache). Built once; in live mode it
+// exists while the packets arrive so that an unload packet can free the meshes of the column.
+struct Gfx {
+    atlas: mc_texture.Atlas,
+    tb: mc_mesh.MeshTables,
+    r: mc_raster.Raster,
+    wr: mc_render_world.WorldRender,
+    ok: bool,
+}
+
+fn gfx_new(w: i32, h: i32, ver: *mut mc_version.Version, min_y: i32, view: i32) -> Gfx {
     var atlas: mc_texture.Atlas = mc_texture.atlas_default()
     var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
     mc_texture.tex_alloc_tables(&tb)
     var reg: mc_registry.Registry = ver.registry_of()
-    if !mc_registry.registry_ok(&reg) {
+    let ok: bool = mc_registry.registry_ok(&reg)
+    if ok {
+        mc_texture.tex_build_tables(&reg, &tb)
+    }
+    var r: mc_raster.Raster = mc_raster.raster_new(w, h)
+    mc_raster.backend_upload_atlas(&r, &atlas)
+    var wr: mc_render_world.WorldRender = mc_render_world.wr_new(min_y, view, &tb)
+    return Gfx { atlas: atlas, tb: tb, r: r, wr: wr, ok: ok }
+}
+
+// Pick table for the selection box: a block state is targetable when any face is drawn (so fluids that have a texture are
+// targetable too -- vanilla skips them); solid = opaque.
+fn pick_tables(tb: *mut mc_mesh.MeshTables) -> mc_input.InputTables {
+    let pk: u64 = rt.heap_alloc(32768)
+    let so: u64 = rt.heap_alloc(32768)
+    var id: usize = 0
+    while id < 32768 {
+        var any: u8 = 0 as u8
+        var f: usize = 0
+        while f < 6 {
+            if rt.ld16((*tb).tiles, id * 6 + f) != 0 as u16 { any = 1 as u8 }
+            f = f + 1
+        }
+        rt.st8(pk, id, any)
+        rt.st8(so, id, rt.ld8((*tb).opaque, id))
+        id = id + 1
+    }
+    return mc_input.InputTables { pick: pk, solid: so, n: 32768 }
+}
+
+// One frame in the fixed order: clear -> sky -> sky fog -> world -> light tint -> selection box -> HUD.
+// Returns true when the pick ray hit a block (`pk` is filled then).
+fn frame(g: *mut Gfx, w: *mut mc_world.World, cam: *mut mc_camera.Camera, cfg: *mut Cfg, sky: *mut mc_sky.Sky,
+    itb: *mut mc_input.InputTables, clear: u32, fog_start: f64, fog_end: f64, fps: i32, pk: *mut mc_input.Pick) -> bool {
+    let r: *mut mc_raster.Raster = &(*g).r
+    let post: u32 = (*cfg).post
+    mc_raster.backend_begin(r, cam, clear)
+    if (post & PF_SKY) != 0 as u32 {
+        mc_sky.sky_draw(sky, r)
+        if (*cfg).fog {
+            mc_sky.sky_set_raster_fog(sky, r, fog_start, fog_end)
+        }
+    }
+    mc_render_world.wr_render(&(*g).wr, w, r, cam, 0 - 1)
+    if (post & PF_SKY) != 0 as u32 {
+        mc_sky.sky_tint_frame(sky, r)
+    }
+    var hit: bool = false
+    if (post & (PF_BOX | PF_HUD)) != 0 as u32 {
+        hit = mc_input.input_pick_camera(w, (*cfg).min_y, itb, cam, (*cfg).reach as f64, pk)
+    }
+    if (post & PF_BOX) != 0 as u32 && hit {
+        mc_input.input_draw_box(r, (*pk).x, (*pk).y, (*pk).z, BOX_RGBA)
+    }
+    if (post & PF_HUD) != 0 as u32 {
+        var d: mc_hud.HudDebug = mc_hud.hud_debug_new()
+        d.fps = fps
+        d.x = (*cam).x
+        d.y = (*cam).y
+        d.z = (*cam).z
+        d.yaw = (*cfg).yaw
+        d.pitch = (*cfg).pitch
+        d.has_block = hit
+        if hit {
+            d.bx = (*pk).x
+            d.by = (*pk).y
+            d.bz = (*pk).z
+            d.id = (*pk).id
+            d.nx = (*pk).nx
+            d.ny = (*pk).ny
+            d.nz = (*pk).nz
+        }
+        mc_hud.hud_frame(r, mc_hud.hud_scale((*cfg).w, (*cfg).h), mc_hud.HUD_CROSSHAIR | mc_hud.HUD_HOTBAR | mc_hud.HUD_DEBUG,
+            (*cfg).slot, &d)
+    }
+    return hit
+}
+
+// Renders `w` with the camera of `cfg`, writes view.png / view.rgba / view.txt / atlas.bin into `dir`.
+// Frame 1 meshes every section (cold cache), frame 2 is the cached frame (must equal frame 1), frame 3 is the final image
+// (the HUD shows the measured frame rate there, or MCVIEW_FPS).
+fn render(w: *mut mc_world.World, cfg: *mut Cfg, ver: *mut mc_version.Version, dir: u64, g: *mut Gfx) -> i32 {
+    if !(*g).ok {
         io.eprint_line("mcview: this version has no block registry")
         return 5
     }
-    mc_texture.tex_build_tables(&reg, &tb)
-
     let far: f64 = ((*cfg).view as f64 + 2.0) * 16.0 * 1.5
     var cam: mc_camera.Camera = mc_camera.camera_new((*cfg).w, (*cfg).h)
     mc_camera.camera_set_pos(&cam, (*cfg).cx, (*cfg).cy, (*cfg).cz)
@@ -526,28 +714,29 @@ fn render(w: *mut mc_world.World, cfg: *mut Cfg, ver: *mut mc_version.Version, d
     mc_camera.camera_set_lens(&cam, 70.0, 0.05, far)
     mc_camera.camera_update(&cam)
 
-    var r: mc_raster.Raster = mc_raster.raster_new((*cfg).w, (*cfg).h)
-    mc_raster.backend_upload_atlas(&r, &atlas)
+    let r: *mut mc_raster.Raster = &(*g).r
     let fog_start: f64 = ((*cfg).view as f64) * 16.0 * 0.5
     let fog_end: f64 = ((*cfg).view as f64) * 16.0 + 8.0
-    mc_raster.raster_set_fog(&r, (*cfg).fog, fog_start, fog_end, FOG_R, FOG_G, FOG_B)
+    mc_raster.raster_set_fog(r, (*cfg).fog, fog_start, fog_end, FOG_R, FOG_G, FOG_B)
     let clear: u32 = (255 as u32 << 24 as u32) | (FOG_B << 16 as u32) | (FOG_G << 8 as u32) | FOG_R
-    var wr: mc_render_world.WorldRender = mc_render_world.wr_new((*cfg).min_y, (*cfg).view, &tb)
-    mc_render_world.wr_set_flags(&wr, (*cfg).flags)
+    (*g).wr.min_y = (*cfg).min_y
+    (*g).wr.dist = (*cfg).view
+    mc_render_world.wr_set_flags(&(*g).wr, (*cfg).flags)
+    var sky: mc_sky.Sky = mc_sky.sky_new()
+    mc_sky.sky_set_time(&sky, (*cfg).ticks as i64, (*cfg).rain)
+    var itb: mc_input.InputTables = pick_tables(&(*g).tb)
+    var pk: mc_input.Pick = mc_input.Pick { x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, dist: 0.0, id: 0 }
 
-    // frame 1: meshes every section (cold cache), frame 2: the cached frame
     let t0: u64 = now_ns()
-    mc_raster.backend_begin(&r, &cam, clear)
-    mc_render_world.wr_render(&wr, w, &r, &cam, 0 - 1)
+    frame(g, w, &cam, cfg, &sky, &itb, clear, fog_start, fog_end, 0, &pk)
     let t1: u64 = now_ns()
-    let st1: mc_render_world.RenderStats = wr.st
+    let st1: mc_render_world.RenderStats = (*g).wr.st
     var h1: rt.Buf = rt.buf_new()
-    hex_of(&r, &h1)
-    mc_raster.backend_begin(&r, &cam, clear)
-    mc_render_world.wr_render(&wr, w, &r, &cam, 0 - 1)
+    hex_of(r, &h1)
+    frame(g, w, &cam, cfg, &sky, &itb, clear, fog_start, fog_end, 0, &pk)
     let t2: u64 = now_ns()
     var h2: rt.Buf = rt.buf_new()
-    hex_of(&r, &h2)
+    hex_of(r, &h2)
     var same: bool = rt.buf_len(&h1) == rt.buf_len(&h2)
     var k: usize = 0
     while same && k < rt.buf_len(&h1) {
@@ -558,6 +747,20 @@ fn render(w: *mut mc_world.World, cfg: *mut Cfg, ver: *mut mc_version.Version, d
         io.eprint_line("mcview: the cached frame differs from the first frame")
         return 6
     }
+    let us2: i64 = ((t2 - t1) / 1000 as u64) as i64
+    var fps: i32 = (*cfg).fps
+    if fps < 0 {
+        fps = 0
+        if us2 > 0 {
+            fps = (1000000 / us2) as i32
+        }
+    }
+    // final image (the third frame only differs from the second one through the frame rate shown by the HUD)
+    let t3: u64 = now_ns()
+    let hit: bool = frame(g, w, &cam, cfg, &sky, &itb, clear, fog_start, fog_end, fps, &pk)
+    let t4: u64 = now_ns()
+    var hf: rt.Buf = rt.buf_new()
+    hex_of(r, &hf)
 
     // block tables of every state id that occurs in the world
     let used: u64 = rt.heap_alloc(32768)
@@ -612,8 +815,35 @@ fn render(w: *mut mc_world.World, cfg: *mut Cfg, ver: *mut mc_version.Version, d
     push_f(&txt, cam.near)
     push_f(&txt, cam.tan_x)
     push_f(&txt, cam.tan_y)
+    push_lit(&txt, "\npost")
+    push_dec(&txt, (*cfg).post as i64)
+    push_dec(&txt, (*cfg).ticks as i64)
+    push_dec(&txt, (*cfg).rain as i64)
+    push_dec(&txt, (*cfg).reach as i64)
+    push_dec(&txt, (*cfg).slot as i64)
+    push_hex(&txt, BOX_RGBA as u64)
+    if ((*cfg).post & (PF_BOX | PF_HUD)) != 0 as u32 {
+        var hi: i64 = 0
+        if hit { hi = 1 }
+        push_lit(&txt, "\npick")
+        push_dec(&txt, hi)
+        push_dec(&txt, pk.x as i64)
+        push_dec(&txt, pk.y as i64)
+        push_dec(&txt, pk.z as i64)
+        push_dec(&txt, pk.nx as i64)
+        push_dec(&txt, pk.ny as i64)
+        push_dec(&txt, pk.nz as i64)
+        push_dec(&txt, pk.id as i64)
+    }
+    push_lit(&txt, "\ndbg")
+    push_dec(&txt, fps as i64)
+    push_f(&txt, cam.x)
+    push_f(&txt, cam.y)
+    push_f(&txt, cam.z)
+    push_f(&txt, (*cfg).yaw)
+    push_f(&txt, (*cfg).pitch)
     push_lit(&txt, "\nhash ")
-    rt.buf_push_bytes(&txt, rt.buf_ptr(&h1), rt.buf_len(&h1))
+    rt.buf_push_bytes(&txt, rt.buf_ptr(&hf), rt.buf_len(&hf))
     rt.buf_push(&txt, 10 as u8)
     var nstates: i64 = 0
     i = 0
@@ -621,10 +851,10 @@ fn render(w: *mut mc_world.World, cfg: *mut Cfg, ver: *mut mc_version.Version, d
         if rt.ld8(used, i) != 0 as u8 {
             push_lit(&txt, "T")
             push_dec(&txt, i as i64)
-            push_dec(&txt, rt.ld8(tb.opaque, i) as i64)
+            push_dec(&txt, rt.ld8((*g).tb.opaque, i) as i64)
             var f: usize = 0
             while f < 6 {
-                push_dec(&txt, rt.ld16(tb.tiles, i * 6 + f) as i64)
+                push_dec(&txt, rt.ld16((*g).tb.tiles, i * 6 + f) as i64)
                 f = f + 1
             }
             rt.buf_push(&txt, 10 as u8)
@@ -634,10 +864,11 @@ fn render(w: *mut mc_world.World, cfg: *mut Cfg, ver: *mut mc_version.Version, d
     }
     var m: rt.Buf = rt.buf_new()
     let us1: i64 = ((t1 - t0) / 1000 as u64) as i64
-    let us2: i64 = ((t2 - t1) / 1000 as u64) as i64
+    let us4: i64 = ((t4 - t3) / 1000 as u64) as i64
     metric(&m, "frame_cold_ms", us1 / 1000)
     metric(&m, "frame_cached_ms", us2 / 1000)
     metric(&m, "frame_cached_us", us2)
+    metric(&m, "frame_final_us", us4)
     metric(&m, "chunks_rendered", st1.chunks as i64)
     metric(&m, "chunks_far", st1.far_chunks as i64)
     metric(&m, "sections_tested", st1.sections as i64)
@@ -645,7 +876,7 @@ fn render(w: *mut mc_world.World, cfg: *mut Cfg, ver: *mut mc_version.Version, d
     metric(&m, "sections_meshed", st1.meshed as i64)
     metric(&m, "sections_drawn", st1.drawn as i64)
     metric(&m, "triangles", st1.tris as i64)
-    metric(&m, "pixels_written", r.st.pixels as i64)
+    metric(&m, "pixels_written", (*r).st.pixels as i64)
     var cps: i64 = 0
     var sps: i64 = 0
     if us1 > 0 {
@@ -659,17 +890,17 @@ fn render(w: *mut mc_world.World, cfg: *mut Cfg, ver: *mut mc_version.Version, d
     rt.buf_push_bytes(&txt, rt.buf_ptr(&m), rt.buf_len(&m))
 
     var ok: bool = write_to(dir, "view.txt", rt.buf_ptr(&txt), rt.buf_len(&txt))
-    ok = write_to(dir, "atlas.bin", atlas.px, (atlas.w as usize) * (atlas.h as usize) * 4) && ok
-    ok = write_to(dir, "view.rgba", mc_raster.backend_present(&r), ((*cfg).w as usize) * ((*cfg).h as usize) * 4) && ok
+    ok = write_to(dir, "atlas.bin", (*g).atlas.px, ((*g).atlas.w as usize) * ((*g).atlas.h as usize) * 4) && ok
+    ok = write_to(dir, "view.rgba", mc_raster.backend_present(r), ((*cfg).w as usize) * ((*cfg).h as usize) * 4) && ok
     var pp: rt.Buf = rt.buf_new()
     path_of(&pp, dir, "view.png")
-    ok = mc_raster.raster_write_png(&r, rt.buf_ptr(&pp)) && ok
+    ok = mc_raster.raster_write_png(r, rt.buf_ptr(&pp)) && ok
     if !ok {
         io.eprint_line("mcview: cannot write the output files")
         return 7
     }
     say(f"metric hash=")
-    io.print_bytes(rt.buf_ptr(&h1), rt.buf_len(&h1))
+    io.print_bytes(rt.buf_ptr(&hf), rt.buf_len(&hf))
     say(f"\n")
     io.print_bytes(rt.buf_ptr(&m), rt.buf_len(&m))
     return 0
@@ -683,6 +914,7 @@ struct Stats {
     chunks: u64,
     bad: u64,
     join: bool,
+    unloads: u64,
     dim: mc_dimension.Dimension,
 }
 
@@ -707,8 +939,27 @@ fn on_map_chunk(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc
     (*st).chunks = (*st).chunks + 1 as u64
 }
 
+// Unload Chunk: two i32 -- x then z up to 1.20.1 (protocol 763), z then x from 1.20.2 (protocol 764); minecraft-data, checked for
+// 1.12.2 / 1.20.2 / 1.21.4. The column leaves the world and its cached section meshes are freed.
+fn on_unload(cl: *mut mc_client.Client, w: *mut mc_world.World, st: *mut Stats, g: *mut Gfx) {
+    let b: *mut bytes.Bytes = mc_client.client_body(cl)
+    let first: i32 = bytes.get_i32(b) catch 0
+    let second: i32 = bytes.get_i32(b) catch 0
+    var cx: i32 = first
+    var cz: i32 = second
+    if (*cl).ver.protocol >= 764 {
+        cx = second
+        cz = first
+    }
+    mc_render_world.wr_drop_chunk(&(*g).wr, &(*g).r, cx, cz)
+    if mc_world.world_remove(w, cx, cz) {
+        (*st).unloads = (*st).unloads + 1 as u64
+    }
+}
+
 // Plays until no new chunk arrived for `settle_ms` (after the first one).
-fn play_loop(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc_world.World, st: *mut Stats, settle_ms: u64, view: i32) -> i32 {
+fn play_loop(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc_world.World, st: *mut Stats, settle_ms: u64, view: i32,
+    g: *mut Gfx) -> i32 {
     let deadline: u64 = now_ms() + PLAY_TIMEOUT_MS
     var result: i32 = 0 - 100
     var running: bool = true
@@ -731,10 +982,13 @@ fn play_loop(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc_wo
                 if !(*st).join {
                     (*st).join = true
                     mc_dimension.dim_from_join(&(*cl).ver, id, mc_client.client_body(cl), &(*st).dim)
+                    (*g).wr.min_y = (*st).dim.min_y
                     mc_client.client_send_settings(cl, view)
                 }
             } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_MAP_CHUNK) {
                 on_map_chunk(cl, sc, w, st)
+            } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_UNLOAD_CHUNK) {
+                on_unload(cl, w, st, g)
             } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_KICK_DISCONNECT) {
                 result = 0 - 2
                 running = false
@@ -744,7 +998,13 @@ fn play_loop(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc_wo
     return result
 }
 
-fn finish_cfg(cfg: *mut Cfg) {
+fn finish_cfg(cfg: *mut Cfg, post: u32) {
+    (*cfg).post = post
+    (*cfg).ticks = env_int("MCVIEW_TICKS", DEFAULT_TICKS)
+    (*cfg).rain = env_int("MCVIEW_RAIN", 0)
+    (*cfg).fps = env_int("MCVIEW_FPS", 0 - 1)
+    (*cfg).reach = env_int("MCVIEW_REACH", DEFAULT_REACH)
+    (*cfg).slot = env_int("MCVIEW_SLOT", 0)
     (*cfg).flags = mc_mesh.F_AO | mc_mesh.F_CULL_SAME
     if env_flag("MCVIEW_GREEDY", false) {
         (*cfg).flags = (*cfg).flags | mc_mesh.F_GREEDY
@@ -755,39 +1015,42 @@ fn finish_cfg(cfg: *mut Cfg) {
 }
 
 fn main_replay(start: u64) -> i32 {
-    if rt.arg_count(start) < 4 {
-        io.eprint_line("usage: mcview --replay <out-dir> <world-file> [yaw] [pitch]")
+    let post: u32 = post_flags(start)
+    if argn(start) < 4 || (post & PF_BAD) != 0 as u32 {
+        io.eprint_line("usage: mcview [--sky] [--box] [--hud] [--all] --replay <out-dir> <world-file> [yaw] [pitch]")
         return 2
     }
-    let dir: u64 = rt.arg_ptr(start, 2)
-    let wpath: u64 = rt.arg_ptr(start, 3)
+    let dir: u64 = argp(start, 2)
+    let wpath: u64 = argp(start, 3)
     var blob: rt.Buf = rt.buf_new()
     if !rt.read_file(wpath, &blob) {
         io.eprint_line("mcview: cannot read the world file")
         return 3
     }
     var cfg: Cfg = Cfg { protocol: 0, min_y: 0, view: 0, w: 640, h: 360, flags: 0 as u32, fog: true,
-        cx: 0.0, cy: 0.0, cz: 0.0, yaw: 0.0, pitch: 0.0 }
+        cx: 0.0, cy: 0.0, cz: 0.0, yaw: 0.0, pitch: 0.0, post: 0 as u32, ticks: 0, rain: 0, fps: 0 - 1, reach: 0, slot: 0 }
     var world: mc_world.World = mc_world.world_new()
     if !world_parse(rt.buf_ptr(&blob), rt.buf_len(&blob), &world, &cfg) {
         io.eprint_line("mcview: bad world file")
         return 4
     }
-    if rt.arg_count(start) > 4 {
-        let p: u64 = rt.arg_ptr(start, 4)
+    if argn(start) > 4 {
+        let p: u64 = argp(start, 4)
         cfg.yaw = parse_dec(p, rt.c_length(p), cfg.yaw as i64) as f64
     }
-    if rt.arg_count(start) > 5 {
-        let p: u64 = rt.arg_ptr(start, 5)
+    if argn(start) > 5 {
+        let p: u64 = argp(start, 5)
         cfg.pitch = parse_dec(p, rt.c_length(p), cfg.pitch as i64) as f64
     }
-    finish_cfg(&cfg)
+    finish_cfg(&cfg, post)
     var ver: mc_version.Version = mc_version.version_empty()
     if !mc_versions.version_by_protocol(cfg.protocol, &ver) {
         io.eprint_line("mcview: no tables for that protocol number")
         return 2
     }
-    let rc: i32 = render(&world, &cfg, &ver, dir)
+    var g: Gfx = gfx_new(cfg.w, cfg.h, &ver, cfg.min_y, cfg.view)
+    let rc: i32 = render(&world, &cfg, &ver, dir, &g)
+    mc_render_world.wr_free(&g.wr, &g.r)
     mc_world.world_free(&world)
     return rc
 }
@@ -798,53 +1061,55 @@ fn metric_net(t0: u64, t_login: u64, t_play: u64, st: *mut Stats, wt: *mut rt.Bu
     say(f"metric settled_ms={t_play - t0}\n")
     say(f"metric chunk_packets={(*st).chunks}\n")
     say(f"metric chunk_bad={(*st).bad}\n")
+    say(f"metric chunk_unloads={(*st).unloads}\n")
     say(f"metric world_file_bytes={rt.buf_len(wt)}\n")
 }
 
 fn main(start: u64) -> i32 {
-    if rt.arg_count(start) > 1 {
-        let a1: u64 = rt.arg_ptr(start, 1)
-        if rt.c_length(a1) == 8 && rt.ld8(a1, 0) == 45 as u8 && rt.ld8(a1, 2) == 114 as u8 {
+    if argn(start) > 1 {
+        let a1: u64 = argp(start, 1)
+        if c_eq(a1, "--replay") {
             return main_replay(start)
         }
     }
-    if rt.arg_count(start) < 5 {
-        io.eprint_line("usage: mcview <host-ipv4> <port> <name> <out-dir> [view=6] [settle-ms=3000] [yaw=0] [pitch=20] [protocol=763] [up=2]")
-        io.eprint_line("       mcview --replay <out-dir> <world-file> [yaw] [pitch]")
+    let post: u32 = post_flags(start)
+    if argn(start) < 5 || (post & PF_BAD) != 0 as u32 {
+        io.eprint_line("usage: mcview [--sky] [--box] [--hud] [--all] <host-ipv4> <port> <name> <out-dir> [view=6] [settle-ms=3000] [yaw=0] [pitch=20] [protocol=763] [up=2]")
+        io.eprint_line("       mcview [flags] --replay <out-dir> <world-file> [yaw] [pitch]")
         return 2
     }
-    let host: u64 = rt.arg_ptr(start, 1)
-    let pp: u64 = rt.arg_ptr(start, 2)
-    let name: u64 = rt.arg_ptr(start, 3)
-    let dir: u64 = rt.arg_ptr(start, 4)
+    let host: u64 = argp(start, 1)
+    let pp: u64 = argp(start, 2)
+    let name: u64 = argp(start, 3)
+    let dir: u64 = argp(start, 4)
     var view: i32 = DEFAULT_VIEW
     var settle: u64 = DEFAULT_SETTLE_MS
     var yaw: i64 = 0
     var pitch: i64 = 20
     var proto: i32 = DEFAULT_PROTOCOL
     var up: i64 = 2
-    if rt.arg_count(start) > 5 {
-        let p: u64 = rt.arg_ptr(start, 5)
+    if argn(start) > 5 {
+        let p: u64 = argp(start, 5)
         view = parse_dec(p, rt.c_length(p), DEFAULT_VIEW as i64) as i32
     }
-    if rt.arg_count(start) > 6 {
-        let p: u64 = rt.arg_ptr(start, 6)
+    if argn(start) > 6 {
+        let p: u64 = argp(start, 6)
         settle = parse_dec(p, rt.c_length(p), DEFAULT_SETTLE_MS as i64) as u64
     }
-    if rt.arg_count(start) > 7 {
-        let p: u64 = rt.arg_ptr(start, 7)
+    if argn(start) > 7 {
+        let p: u64 = argp(start, 7)
         yaw = parse_dec(p, rt.c_length(p), 0)
     }
-    if rt.arg_count(start) > 8 {
-        let p: u64 = rt.arg_ptr(start, 8)
+    if argn(start) > 8 {
+        let p: u64 = argp(start, 8)
         pitch = parse_dec(p, rt.c_length(p), 20)
     }
-    if rt.arg_count(start) > 9 {
-        let p: u64 = rt.arg_ptr(start, 9)
+    if argn(start) > 9 {
+        let p: u64 = argp(start, 9)
         proto = parse_dec(p, rt.c_length(p), DEFAULT_PROTOCOL as i64) as i32
     }
-    if rt.arg_count(start) > 10 {
-        let p: u64 = rt.arg_ptr(start, 10)
+    if argn(start) > 10 {
+        let p: u64 = argp(start, 10)
         up = parse_dec(p, rt.c_length(p), 2)
     }
     let port: i64 = parse_dec(pp, rt.c_length(pp), 0 - 1)
@@ -864,10 +1129,14 @@ fn main(start: u64) -> i32 {
         return 3
     }
     net.set_no_delay(&conn, true) catch false
+    var cfg0: Cfg = Cfg { protocol: proto, min_y: 0, view: view, w: 640, h: 360, flags: 0 as u32, fog: true,
+        cx: 0.0, cy: 0.0, cz: 0.0, yaw: 0.0, pitch: 0.0, post: 0 as u32, ticks: 0, rain: 0, fps: 0 - 1, reach: 0, slot: 0 }
+    finish_cfg(&cfg0, post)
+    var g: Gfx = gfx_new(cfg0.w, cfg0.h, &ver, 0, view)
     var cl: mc_client.Client = mc_client.client_new(conn, ver)
     var world: mc_world.World = mc_world.world_new()
     var sc: mc_chunk.Scratch = mc_chunk.scratch_new()
-    var st: Stats = Stats { t_first: 0, t_last: 0, chunks: 0, bad: 0, join: false, dim: mc_dimension.dim_default_overworld() }
+    var st: Stats = Stats { t_first: 0, t_last: 0, chunks: 0, bad: 0, join: false, unloads: 0, dim: mc_dimension.dim_default_overworld() }
     mc_codec.wire_timeout(&cl.w, 100)
     let t0: u64 = now_ms()
     if !mc_client.client_handshake(&cl, host, port as u16, 2) {
@@ -880,7 +1149,7 @@ fn main(start: u64) -> i32 {
         return 5
     }
     let t_login: u64 = now_ms()
-    let pr: i32 = play_loop(&cl, &sc, &world, &st, settle, view)
+    let pr: i32 = play_loop(&cl, &sc, &world, &st, settle, view, &g)
     let t_play: u64 = now_ms()
     var px: f64 = 0.0
     var py: f64 = 0.0
@@ -896,8 +1165,9 @@ fn main(start: u64) -> i32 {
     }
     if rc == 0 {
         var cfg: Cfg = Cfg { protocol: proto, min_y: st.dim.min_y, view: view, w: 640, h: 360, flags: 0 as u32, fog: true,
-            cx: px, cy: py + 1.62 + (up as f64), cz: pz, yaw: yaw as f64, pitch: pitch as f64 }
-        finish_cfg(&cfg)
+            cx: px, cy: py + 1.62 + (up as f64), cz: pz, yaw: yaw as f64, pitch: pitch as f64,
+            post: 0 as u32, ticks: 0, rain: 0, fps: 0 - 1, reach: 0, slot: 0 }
+        finish_cfg(&cfg, post)
         var wt: rt.Buf = rt.buf_new()
         world_text(&world, &cfg, &wt)
         if !write_to(dir, "world.mcw", rt.buf_ptr(&wt), rt.buf_len(&wt)) {
@@ -906,10 +1176,11 @@ fn main(start: u64) -> i32 {
         }
         metric_net(t0, t_login, t_play, &st, &wt)
         if rc == 0 {
-            rc = render(&world, &cfg, &ver, dir)
+            rc = render(&world, &cfg, &ver, dir, &g)
         }
         rt.buf_free(&wt)
     }
+    mc_render_world.wr_free(&g.wr, &g.r)
     mc_world.world_free(&world)
     mc_chunk.scratch_free(&sc)
     mc_client.client_free(&cl)
