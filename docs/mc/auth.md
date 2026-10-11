@@ -29,7 +29,8 @@ description). Offline UUID of `Notch` = `b50ad385-829d-3141-a216-7e7d7539ba7f` (
 * Real: hash and UUID against python (400 random hashes incl. negative / short results, 200 names), JSON body
   and headers of the join request, status mapping, refused connection, no-send cases -- against a local python
   `http.server` mock on loopback.
-* NOT done: the real sessionserver.mojang.com (needs a real account) -- **only tested against a mock**.
+* NOT done: a successful join at the real sessionserver.mojang.com (needs a real account). A bogus token over the real
+  TLS path gets the expected 403 (`tools/mc/online`, w6); the end to end login with mock session servers is in `docs/mc/client.md`.
   https to a mock with a test CA is possible (`session_add_trust_pem`) but was not run; the TLS client is the
   one tested elsewhere (`tools/oauth`). Timeout behaviour is configurable but not asserted.
 

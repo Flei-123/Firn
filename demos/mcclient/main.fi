@@ -14,12 +14,22 @@
 //   mc_chunk / mc_world        palette sections, chunk store
 //   dump.fi                    the canonical dump (test artefact)
 //
+// ONLINE mode (env): MC_ONLINE=1 logs in with a Microsoft/Minecraft account instead of the offline
+// name: MC_ACCOUNT_FILE=<path> (chmod 600, outside any repo; lines `mc_token=...`, `uuid=<32 hex>`,
+// `name=...`; the file's name is the login name), MC_SESSION_BASE=<url> (optional, default
+// https://sessionserver.mojang.com; plain http only for loopback test mocks). The token is read
+// from the file only, never printed, and wiped from memory at the end; errors name the failing
+// step without any token value.
+//
 // Nothing in this file names a packet id or a protocol number except the command line default.
 
 import std.net
 import std.bytes
 import std.rt
 import std.io
+import std.env
+import mc.mc_auth
+import mc.mc_crypto
 import mc.mc_codec
 import mc.mc_chunk
 import mc.mc_world
@@ -108,6 +118,69 @@ fn rel(t: u64, t0: u64) -> i64 {
 
 fn say(f: io.Fmt) {
     io.fmt_print(f)
+}
+
+// ---- online account (MC_ONLINE=1) ------------------------------------------------
+
+// Value of the line `key=value` of the blob [p, n) into `out` (without the line end); false if absent.
+fn file_value(p: u64, n: usize, key: str, out: *mut rt.Buf) -> bool {
+    var i: usize = 0
+    while i < n {
+        var e: usize = i
+        while e < n && rt.ld8(p, e) != 10 as u8 {
+            e = e + 1
+        }
+        let kn: usize = key.length()
+        if e - i > kn && rt.ld8(p, i + kn) == 61 as u8 {
+            var same: bool = true
+            var k: usize = 0
+            while k < kn && same {
+                if rt.ld8(p, i + k) != key.chars(k) {
+                    same = false
+                }
+                k = k + 1
+            }
+            if same {
+                var end: usize = e
+                if end > i && rt.ld8(p, end - 1) == 13 as u8 {
+                    end = end - 1
+                }
+                rt.buf_push_bytes(out, p + (i + kn + 1) as u64, end - i - kn - 1)
+                return true
+            }
+        }
+        i = e + 1
+    }
+    return false
+}
+
+fn wipe_buf(b: *mut rt.Buf) {
+    let p: u64 = rt.buf_ptr(b)
+    var i: usize = 0
+    while i < (*b).cap {
+        rt.st8(p, i, 0 as u8)
+        i = i + 1
+    }
+}
+
+fn describe_failure(cl: *mut mc_client.Client, lr: i32, sess: *mut mc_auth.SessionClient) {
+    say(f"mcclient: login failed at step: {mc_client.client_error_text(lr)} (code {lr})\n")
+    if lr == mc_client.CL_SESSION {
+        let jc: i64 = mc_client.client_detail(cl)
+        say(f"mcclient: session_join result={mc_auth.join_error_text(jc)} http_status={mc_auth.session_status(sess)} net_error={mc_auth.session_net_error(sess)}\n")
+        say(f"mcclient: session server says: {mc_auth.session_error(sess)} / {mc_auth.session_error_message(sess)}\n")
+    } else if lr == mc_client.CL_RSA {
+        say(f"mcclient: rsa/key error: {mc_crypto.error_name(mc_client.client_detail(cl) as i32)}\n")
+    } else if lr == mc_client.CL_KICKED {
+        var why: rt.Buf = rt.buf_new()
+        if mc_client.client_kick_text(cl, &why) {
+            rt.buf_push(&why, 0 as u8)
+            say(f"mcclient: server disconnect text: ")
+            io.print_bytes(rt.buf_ptr(&why), rt.buf_len(&why) - 1)
+            say(f"\n")
+        }
+        rt.buf_free(&why)
+    }
 }
 
 struct Stats {
@@ -329,16 +402,78 @@ fn main(start: u64) -> i32 {
         walk_ok: 0, walk_fail: 0, chunk_bad: 0, partial: 0, kicked: false, dim: mc_dimension.dim_default_overworld(), dim_known: false }
     mc_codec.wire_timeout(&cl.w, 100)
 
+    // ---- online account (optional)
+    var online: bool = false
+    var acct_blob: rt.Buf = rt.buf_new()
+    var tok: rt.Buf = rt.buf_new()
+    var acct_name: rt.Buf = rt.buf_new()
+    var base_buf: rt.Buf = rt.buf_new()
+    var sess: mc_auth.SessionClient = mc_auth.session_new()
+    var acct: mc_client.OnlineAccount = mc_client.account_new("", &sess)
+    var login_name: u64 = name
     var rc: i32 = 0
-    if !mc_client.client_handshake(&cl, host, port as u16, 2) {
+    if env.has("MC_ONLINE") && env.get("MC_ONLINE").length() == 1 && env.get("MC_ONLINE").chars(0) == 49 as u8 {
+        online = true
+        var path: rt.Buf = rt.buf_new()
+        var fail: str = ""
+        if !env.get_into("MC_ACCOUNT_FILE", &path) {
+            fail = "MC_ONLINE=1 needs MC_ACCOUNT_FILE"
+        } else {
+            rt.buf_push(&path, 0 as u8)
+            if !rt.read_file(rt.buf_ptr(&path), &acct_blob) {
+                fail = "cannot read MC_ACCOUNT_FILE"
+            }
+        }
+        rt.buf_free(&path)
+        var uuid_txt: rt.Buf = rt.buf_new()
+        if fail.length() == 0 {
+            let bp: u64 = rt.buf_ptr(&acct_blob)
+            let bn: usize = rt.buf_len(&acct_blob)
+            if !file_value(bp, bn, "mc_token", &tok) || rt.buf_len(&tok) == 0 {
+                fail = "account file has no mc_token line"
+            } else if !file_value(bp, bn, "uuid", &uuid_txt) || !mc_auth.uuid_from_text(rt.buf_ptr(&uuid_txt), rt.buf_len(&uuid_txt), (&acct.uuid[0]) as u64) {
+                fail = "account file has no valid uuid line"
+            } else if !file_value(bp, bn, "name", &acct_name) || rt.buf_len(&acct_name) == 0 {
+                fail = "account file has no name line"
+            }
+        }
+        wipe_buf(&acct_blob)
+        rt.buf_free(&acct_blob)
+        rt.buf_free(&uuid_txt)
+        if fail.length() == 0 && !mc_auth.session_init(&sess) {
+            fail = "cannot initialise the session client (TLS)"
+        }
+        if fail.length() > 0 {
+            say(f"mcclient: online login setup failed: {fail}\n")
+            rc = 8
+        } else {
+            mc_auth.session_set_system_trust(&sess, true)
+            if env.get_into("MC_SESSION_BASE", &base_buf) && rt.buf_len(&base_buf) > 0 {
+                mc_auth.session_set_base(&sess, str { p: rt.buf_data(&base_buf), n: base_buf.len })
+            }
+            acct.token = str { p: rt.buf_data(&tok), n: tok.len }
+            rt.buf_push(&acct_name, 0 as u8)
+            login_name = rt.buf_ptr(&acct_name)
+        }
+    }
+    if rc == 0 && !mc_client.client_handshake(&cl, host, port as u16, 2) {
         io.eprint_line("mcclient: could not send the handshake")
         rc = 4
     }
     var t_login: u64 = 0
     if rc == 0 {
-        let lr: i32 = mc_client.client_login_offline(&cl, name, LOGIN_WAITS)
+        var lr: i32 = 0
+        if online {
+            lr = mc_client.client_login_online(&cl, login_name, &acct, LOGIN_WAITS)
+        } else {
+            lr = mc_client.client_login_offline(&cl, login_name, LOGIN_WAITS)
+        }
         if lr != 0 {
-            say(f"mcclient: login failed ({lr})\n")
+            if online || lr == mc_client.CL_ONLINE_MODE {
+                describe_failure(&cl, lr, &sess)
+            } else {
+                say(f"mcclient: login failed ({lr})\n")
+            }
             rc = 5
         }
         t_login = now_ms()
@@ -409,5 +544,11 @@ fn main(start: u64) -> i32 {
     mc_world.world_free(&world)
     mc_chunk.scratch_free(&sc)
     mc_client.client_free(&cl)
+    // the token must not outlive the run
+    wipe_buf(&tok)
+    rt.buf_free(&tok)
+    rt.buf_free(&acct_name)
+    rt.buf_free(&base_buf)
+    mc_auth.session_free(&sess)
     return rc
 }

@@ -11,9 +11,12 @@
 //     1.20.1 / 1.20.2) but every one is held against the version's generated schema before
 //     it is sent (`send`): a layout that does not fit the version is refused, never sent.
 //     Schema driven writers are the proper fix (docs/MC-VERSIONS.md, "client-written packets");
-//   * login is OFFLINE mode here: an Encryption Request is reported as CL_ONLINE_MODE (the
-//     online path -- RSA, CFB8, session server -- is mc_crypto / mc_auth plus the codec's
-//     wire_enable_encryption and is wired in by the integration step);
+//   * login: `client_login_offline` (no account: an Encryption Request is reported as
+//     CL_ONLINE_MODE) and `client_login_online` (OnlineAccount: Encryption Request -> RSA with
+//     mc_crypto -> session join at the session server with mc_auth BEFORE the answer ->
+//     Encryption Response -> AES-128-CFB8 on the wire). Proven against a local online-mode
+//     server + mock session server (tools/mc/online); the real Mojang chain needs a real
+//     account and was not run. Tokens are never logged; error codes carry no token value;
 //   * the configuration phase (1.20.2+) is implemented from the protocol description and
 //     only compiled / schema-tested, not run against a real 1.20.2 server.
 
@@ -26,9 +29,13 @@ import mc.mc_version
 import mc.mc_sem
 import mc.mc_schema
 import mc.mc_encode
+import mc.mc_crypto
+import mc.mc_auth
 
 export {
-    Client,
+    Client, OnlineAccount, account_new,
+    client_login_online, client_error_text, client_detail, client_kick_text,
+    CL_NO_ACCOUNT, CL_BAD_ENCRYPTION_REQUEST, CL_RSA, CL_SESSION, CL_SECRET, CL_ENC_REJECTED,
     client_new, client_free, client_handshake, client_send, client_login_offline, client_next,
     client_is, client_auto_reply, client_send_settings, client_body,
     CL_OK, CL_TIMEOUT, CL_CLOSED, CL_BROKEN, CL_TOO_BIG, CL_BAD_PACKET, CL_KICKED,
@@ -45,6 +52,12 @@ const CL_KICKED: i32 = 0 - 2 // Disconnect in login / configuration / play
 const CL_ONLINE_MODE: i32 = 0 - 3 // the server wants encryption
 const CL_UNEXPECTED: i32 = 0 - 4 // a packet that has no meaning in this state
 const CL_SEND: i32 = 0 - 5 // writing failed
+const CL_NO_ACCOUNT: i32 = 0 - 6 // Encryption Request but the login has no account / token
+const CL_BAD_ENCRYPTION_REQUEST: i32 = 0 - 7 // Encryption Request that cannot be parsed
+const CL_RSA: i32 = 0 - 8 // public key refused or RSA failed (client_detail = mc_crypto code)
+const CL_SESSION: i32 = 0 - 9 // session join failed (client_detail = mc_auth JOIN_* code)
+const CL_SECRET: i32 = 0 - 10 // no random octets for the shared secret
+const CL_ENC_REJECTED: i32 = 0 - 11 // after the Encryption Response only garbage / a closed connection came
 
 struct Client {
     w: mc_codec.Wire,
@@ -53,11 +66,25 @@ struct Client {
     body: bytes.Bytes, // VIEW on the last packet read (valid until the next client_next)
     teleports: u64,
     keepalives: u64,
+    detail: i64, // number behind the last CL_RSA / CL_SESSION failure (never a token value)
+}
+
+// The account of an online login. `token` is the Minecraft access token (a str view: the owner
+// keeps the memory and wipes it), `uuid` the 16 octet profile id, `session` the (initialised)
+// session server client from mc_auth (base URL, trust). Nothing here is printed by the library.
+struct OnlineAccount {
+    uuid: [u8; 16],
+    token: str,
+    session: *mut mc_auth.SessionClient,
+}
+
+fn account_new(token: str, session: *mut mc_auth.SessionClient) -> OnlineAccount {
+    return OnlineAccount { uuid: [0; 16], token: token, session: session }
 }
 
 fn client_new(conn: net.Conn, ver: mc_version.Version) -> Client {
     return Client { w: mc_codec.wire_open(conn), ver: ver, state: mc_version.ST_HANDSHAKE,
-        body: bytes.bytes_new(), teleports: 0, keepalives: 0 }
+        body: bytes.bytes_new(), teleports: 0, keepalives: 0, detail: 0 }
 }
 
 fn client_free(c: *mut Client) {
@@ -159,12 +186,34 @@ fn client_handshake(c: *mut Client, host: u64, port: u16, next_state: i32) -> bo
     return ok
 }
 
-fn send_login_start(c: *mut Client, name: u64) -> bool {
+fn be64(p: u64, off: usize) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < 8 {
+        v = (v << 8 as u64) | rt.ld8(p, off + i) as u64
+        i = i + 1
+    }
+    return v
+}
+
+fn has_account(a: *mut OnlineAccount) -> bool {
+    return (a as u64) != 0 as u64
+}
+
+// Login Start. With an account the profile UUID is the account's, otherwise the offline UUID.
+fn send_login_start(c: *mut Client, name: u64, acct: *mut OnlineAccount) -> bool {
     var high: u64 = 0
     var low: u64 = 0
     var b: bytes.Bytes = bytes.bytes_new()
     bytes.put_string(&b, name, rt.c_length(name))
-    let has_uuid: bool = md5.md5_offline_uuid(name, rt.c_length(name), &high, &low)
+    var has_uuid: bool = false
+    if has_account(acct) {
+        high = be64((&(*acct).uuid[0]) as u64, 0)
+        low = be64((&(*acct).uuid[0]) as u64, 8)
+        has_uuid = true
+    } else {
+        has_uuid = md5.md5_offline_uuid(name, rt.c_length(name), &high, &low)
+    }
     if mc_version.version_has(&(*c).ver, mc_version.FLAG_LOGIN_UUID_OPTIONAL) {
         bytes.put_bool(&b, has_uuid)
         if has_uuid {
@@ -191,16 +240,197 @@ fn reply_copy(c: *mut Client, st: i32, sem: usize) -> bool {
     return send(c, st, sem, &rest)
 }
 
+// Octets of a length prefixed byte array of the current body (span into the body), 0 on error.
+fn take_array(b: *mut bytes.Bytes, max: i32, out_n: *mut usize) -> u64 {
+    *out_n = 0
+    let n: i32 = bytes.get_varint(b) catch 0 - 1
+    if n <= 0 || n > max {
+        return 0
+    }
+    let p: u64 = bytes.get_span(b, n as usize) catch 0
+    if p != 0 {
+        *out_n = n as usize
+    }
+    return p
+}
+
+fn wipe(p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.st8(p, i, 0 as u8)
+        i = i + 1
+    }
+}
+
+// Answers the Encryption Request in the current body: parse (serverId, public key DER, verify
+// token [, shouldAuthenticate]), draw the shared secret, RSA-PKCS1 encrypt secret and token,
+// tell the session server (hash of serverId + secret + key) BEFORE the answer, send the answer,
+// switch the wire to AES-128-CFB8. The secret is wiped from the stack afterwards.
+fn encryption(c: *mut Client, acct: *mut OnlineAccount) -> i32 {
+    let b: *mut bytes.Bytes = &(*c).body
+    var sid_n: usize = 0
+    let sid: u64 = bytes.get_string(b, &sid_n) catch 0
+    var pk_n: usize = 0
+    var vt_n: usize = 0
+    var pk: u64 = 0
+    var vt: u64 = 0
+    if sid != 0 {
+        pk = take_array(b, 1024, &pk_n)
+    }
+    if pk != 0 {
+        vt = take_array(b, 256, &vt_n)
+    }
+    if sid == 0 || pk == 0 || vt == 0 || sid_n > 20 {
+        return CL_BAD_ENCRYPTION_REQUEST
+    }
+    var should_auth: bool = true // 1.20.5+ sends the flag; before it authentication is always on
+    if bytes.bytes_remaining(b) > 0 {
+        should_auth = bytes.get_bool(b) catch true
+    }
+    var key: mc_crypto.RsaKey = mc_crypto.RsaKey { n: [0; 512], nlen: 0, e: [0; 8], elen: 0 }
+    let kr: i32 = mc_crypto.rsa_key_from_spki(pk, pk_n, &key)
+    if kr != mc_crypto.CR_OK {
+        (*c).detail = kr as i64
+        return CL_RSA
+    }
+    var secret: [u8; 16] = [0; 16]
+    let sp: u64 = (&secret[0]) as u64
+    if !mc_crypto.shared_secret_new(sp) {
+        return CL_SECRET
+    }
+    var enc_s: [u8; 512] = [0; 512]
+    var enc_v: [u8; 512] = [0; 512]
+    var ls: usize = 0
+    var lv: usize = 0
+    var rc: i32 = CL_OK
+    let r1: i32 = mc_crypto.rsa_encrypt_pkcs1(&key, sp, 16, (&enc_s[0]) as u64, 512, &ls)
+    let r2: i32 = mc_crypto.rsa_encrypt_pkcs1(&key, vt, vt_n, (&enc_v[0]) as u64, 512, &lv)
+    if r1 != mc_crypto.CR_OK || r2 != mc_crypto.CR_OK {
+        (*c).detail = r1 as i64
+        if r1 == mc_crypto.CR_OK {
+            (*c).detail = r2 as i64
+        }
+        rc = CL_RSA
+    }
+    if rc == CL_OK && should_auth {
+        // the session server must know the hash before the game server asks for it
+        var hash: rt.Buf = rt.buf_new()
+        var idtxt: rt.Buf = rt.buf_new()
+        if mc_auth.server_hash(sid, sid_n, sp, 16, pk, pk_n, &hash) {
+            mc_auth.uuid_to_text((&(*acct).uuid[0]) as u64, false, &idtxt)
+            let hs: str = str { p: rt.buf_data(&hash), n: hash.len }
+            let ids: str = str { p: rt.buf_data(&idtxt), n: idtxt.len }
+            let jr: i64 = mc_auth.session_join((*acct).session, (*acct).token, ids, hs)
+            if jr != mc_auth.JOIN_OK {
+                (*c).detail = jr
+                rc = CL_SESSION
+            }
+        } else {
+            rc = CL_BAD_ENCRYPTION_REQUEST
+        }
+        rt.buf_free(&hash)
+        rt.buf_free(&idtxt)
+    }
+    if rc == CL_OK {
+        var v: rt.Buf = rt.buf_new()
+        mc_encode.vals_hex(&v, "sharedSecret", (&enc_s[0]) as u64, ls)
+        mc_encode.vals_hex(&v, "verifyToken", (&enc_v[0]) as u64, lv)
+        var sent: bool = client_send_values(c, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_C2S_ENCRYPTION_BEGIN, &v)
+        rt.buf_free(&v)
+        if !sent {
+            // hand written fallback: two length prefixed arrays (layouts before 1.19 / from 1.19.3)
+            var r: bytes.Bytes = bytes.bytes_new()
+            bytes.put_varint(&r, ls as i32)
+            bytes.put_raw(&r, (&enc_s[0]) as u64, ls)
+            bytes.put_varint(&r, lv as i32)
+            bytes.put_raw(&r, (&enc_v[0]) as u64, lv)
+            sent = send(c, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_C2S_ENCRYPTION_BEGIN, &r)
+            bytes.bytes_free(&r)
+        }
+        if sent {
+            // everything after the answer is encrypted in both directions
+            mc_codec.wire_enable_encryption(&(*c).w, sp)
+        } else {
+            rc = CL_SEND
+        }
+    }
+    wipe(sp, 16)
+    return rc
+}
+
+// Number behind the last CL_RSA (mc_crypto code) / CL_SESSION (mc_auth JOIN_* code) failure.
+fn client_detail(c: *mut Client) -> i64 {
+    return (*c).detail
+}
+
+// Short name of a CL_* code for messages (no secrets).
+fn client_error_text(code: i32) -> str {
+    if code == CL_OK { return "ok" }
+    if code == CL_TIMEOUT { return "timeout" }
+    if code == CL_CLOSED { return "connection closed by the server" }
+    if code == CL_BROKEN { return "broken packet stream" }
+    if code == CL_TOO_BIG { return "packet too big" }
+    if code == CL_BAD_PACKET { return "bad packet" }
+    if code == CL_KICKED { return "disconnected by the server" }
+    if code == CL_ONLINE_MODE { return "server wants encryption (online mode) but no account was given" }
+    if code == CL_UNEXPECTED { return "unexpected packet" }
+    if code == CL_SEND { return "writing a packet failed" }
+    if code == CL_NO_ACCOUNT { return "no account for an online login" }
+    if code == CL_BAD_ENCRYPTION_REQUEST { return "encryption request cannot be parsed" }
+    if code == CL_RSA { return "public key refused / RSA failed" }
+    if code == CL_SESSION { return "session server refused the join" }
+    if code == CL_SECRET { return "no random octets for the shared secret" }
+    if code == CL_ENC_REJECTED { return "server did not accept the encryption response (verify token / secret)" }
+    return "unknown"
+}
+
+// The reason text of a Disconnect packet that client_next just returned (login / configuration:
+// a JSON string): printable ASCII only, at most 300 octets, appended to `out`. false if absent.
+fn client_kick_text(c: *mut Client, out: *mut rt.Buf) -> bool {
+    var n: usize = 0
+    let p: u64 = bytes.get_string(&(*c).body, &n) catch 0
+    if p == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < n && i < 300 {
+        let ch: u8 = rt.ld8(p, i)
+        if ch >= 32 as u8 && ch < 127 as u8 {
+            rt.buf_push(out, ch)
+        } else {
+            rt.buf_push(out, 63 as u8)
+        }
+        i = i + 1
+    }
+    return true
+}
+
 // Offline login: Login Start, then packets until Play begins. Handles Set Compression,
 // refuses Encryption Request (CL_ONLINE_MODE), answers login plugin requests with "not
 // understood", and runs the configuration phase when the version has one. Returns CL_OK when
 // the connection is in Play, otherwise a CL_* code. `deadline_ms` bounds the number of
 // receive timeouts (each wire_timeout period counts as one wait), the caller sets the period.
 fn client_login_offline(c: *mut Client, name: u64, max_waits: i32) -> i32 {
-    if !send_login_start(c, name) {
+    return login(c, name, 0 as *mut OnlineAccount, max_waits)
+}
+
+// Online login: like client_login_offline, but an Encryption Request is answered (see `encryption`).
+// Every failing step has its own code: CL_BAD_ENCRYPTION_REQUEST, CL_RSA, CL_SECRET, CL_SESSION
+// (client_detail = JOIN_* code, the session client has HTTP status / error text), CL_SEND, and
+// CL_KICKED (client_kick_text has the server's reason). After CL_OK the wire is encrypted.
+fn client_login_online(c: *mut Client, name: u64, acct: *mut OnlineAccount, max_waits: i32) -> i32 {
+    if !has_account(acct) {
+        return CL_NO_ACCOUNT
+    }
+    return login(c, name, acct, max_waits)
+}
+
+fn login(c: *mut Client, name: u64, acct: *mut OnlineAccount, max_waits: i32) -> i32 {
+    if !send_login_start(c, name, acct) {
         return CL_SEND
     }
     var waits: i32 = 0
+    var enc_fresh: bool = false // the Encryption Response is out and no valid packet came since
     while true {
         let id: i32 = client_next(c)
         if id == CL_TIMEOUT {
@@ -209,8 +439,15 @@ fn client_login_offline(c: *mut Client, name: u64, max_waits: i32) -> i32 {
                 return CL_TIMEOUT
             }
         } else if id < 0 {
+            if enc_fresh {
+                // a server that refuses the secret / verify token answers (or closes) in PLAIN text,
+                // which the now encrypting reader sees as noise
+                return CL_ENC_REJECTED
+            }
             return id
         } else if (*c).state == mc_version.ST_LOGIN {
+            let was_fresh: bool = enc_fresh
+            enc_fresh = false
             if client_is(c, id, mc_sem.SEM_LOGIN_S2C_COMPRESS) {
                 let t: i32 = bytes.get_varint(&(*c).body) catch 0 - 1
                 mc_codec.wire_set_threshold(&(*c).w, t)
@@ -230,7 +467,14 @@ fn client_login_offline(c: *mut Client, name: u64, max_waits: i32) -> i32 {
             } else if client_is(c, id, mc_sem.SEM_LOGIN_S2C_DISCONNECT) {
                 return CL_KICKED
             } else if client_is(c, id, mc_sem.SEM_LOGIN_S2C_ENCRYPTION_BEGIN) {
-                return CL_ONLINE_MODE
+                if !has_account(acct) {
+                    return CL_ONLINE_MODE
+                }
+                let er: i32 = encryption(c, acct)
+                if er != CL_OK {
+                    return er
+                }
+                enc_fresh = true
             } else if client_is(c, id, mc_sem.SEM_LOGIN_S2C_PLUGIN_REQUEST) {
                 let mid: i32 = bytes.get_varint(&(*c).body) catch 0 - 1
                 var r: bytes.Bytes = bytes.bytes_new()
@@ -239,6 +483,9 @@ fn client_login_offline(c: *mut Client, name: u64, max_waits: i32) -> i32 {
                 send(c, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_C2S_PLUGIN_RESPONSE, &r)
                 bytes.bytes_free(&r)
             } else {
+                if was_fresh {
+                    return CL_ENC_REJECTED
+                }
                 return CL_UNEXPECTED
             }
         } else if (*c).state == mc_version.ST_CONFIG {
