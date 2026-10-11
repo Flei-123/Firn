@@ -27,6 +27,7 @@ const SECTIONS_114 = PROTOCOL >= 751 && PROTOCOL <= 754 // 1.16.2 - 1.16.5: CF_S
 
 const fs = require('fs')
 const crypto = require('crypto')
+const { EntityTracker } = require('./ref_entities.cjs')
 
 // ---------------------------------------------------------------- FNV-1a 64 (two 32-bit halves)
 class Fnv64 {
@@ -488,7 +489,9 @@ function main () {
   let chunkErrors = 0
   let bulkPackets = 0
   let bulkColumns = 0 // 1.8: map_chunk_bulk packets / columns they carried
+  let entityErrors = 0
   let numSections = 24
+  const tracker = new EntityTracker(PROTOCOL)
 
   const client = mc.createClient({ host, port, username: name, version: NMP_VERSION, auth: 'offline', viewDistance: String(viewDistance), hideErrors: false })
 
@@ -502,6 +505,7 @@ function main () {
     if (code !== 0) process.exit(code)
     const { text, sum } = buildDump(chunks)
     fs.writeFileSync(dumpFile, text)
+    fs.writeFileSync(dumpFile + '.entities', tracker.dump()) // entity side file; the chunk dump stays as it was
     const secs = Math.max(total, 1) / 1000
     const out = {
       connect_ms: m.connect_ms,
@@ -520,6 +524,9 @@ function main () {
       bulk_packets: bulkPackets,
       bulk_columns: bulkColumns,
       trailing_nonzero_chunks: trailingNonZero,
+      entities: tracker.ents.size,
+      entity_spawns: tracker.count.spawn,
+      entity_errors: entityErrors,
       checksum: sum
     }
     for (const k of Object.keys(out)) console.log(`metric ${k}=${out[k]}`)
@@ -543,6 +550,7 @@ function main () {
   })
   client.on('packet', (data, meta, buffer, full) => {
     packets++; walkOk++
+    try { tracker.onPacket(meta.name, data) } catch (e) { entityErrors++; console.error('entity packet ' + meta.name + ': ' + e.message) }
     bytesDec += (full || buffer || Buffer.alloc(0)).length
   })
 

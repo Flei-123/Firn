@@ -56,4 +56,15 @@ if [ "$full" -ne 0 ] && [ "$stable" -eq 0 ] && [ "$light" -eq 0 ]; then
   echo "  only the tail differs (checksum / trailing bytes):"
   diff "$A" "$B" | head -6 | sed 's/^/    /'
 fi
-[ "$full" -eq 0 ]
+# entity side files (<dump>.entities, written by both clients): compared with the entity ids and the
+# uuids of non-player entities masked (the server numbers new mobs up and draws random uuids per session;
+# everything else -- kind, type, name, position/rotation as raw f64 bits, on_ground -- must be identical)
+ent=0
+if [ -f "$A.entities" ] && [ -f "$B.entities" ]; then
+  mask() { sed -E 's/^E -?[0-9]+ /E # /; /kind=[01] /s/ uuid=[0-9a-f]{32} / uuid=* /' "$1"; }
+  mask "$A.entities" > "$T/a.ent"; mask "$B.entities" > "$T/b.ent"
+  cmp -s "$T/a.ent" "$T/b.ent" && ent=0 || ent=1
+  echo "  entities (ids/mob uuids masked): $(verdict $ent) ($(head -1 "$A.entities" | cut -d' ' -f2) vs $(head -1 "$B.entities" | cut -d' ' -f2) entities)"
+  if [ "$ent" -ne 0 ]; then diff "$T/a.ent" "$T/b.ent" | head -10 | sed 's/^/    /'; fi
+fi
+[ "$full" -eq 0 ] && [ "$ent" -eq 0 ]

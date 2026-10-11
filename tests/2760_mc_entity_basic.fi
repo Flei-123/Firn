@@ -1,0 +1,374 @@
+// expect_exit: 0
+// Known answers for the entity tracker (lib/mc/mc_entity.fi): hand built packet bodies for
+// 1.20.1 (763, f64 positions, i16 deltas) and 1.8.9 (47, fixed point /32, i8 deltas),
+// spawn / move / look / teleport / velocity / destroy, player info (names, remove), hostile input.
+import std.rt
+import std.io
+import std.bytes
+import std.math
+import mc.mc_entity
+import mc.mc_sem
+import mc.mc_encode
+import mc.mc_version
+import mc.v763.mc_proto_v763
+import mc.v47.mc_proto_v47
+import mc.v774.mc_proto_v774
+
+fn say(msg: str, extra: str) {
+    io.fmt_print(f"{msg} {extra}\n")
+}
+
+fn check(failures: *mut i32, ok: bool, what: str) {
+    if !ok {
+        say("FAIL", what)
+        *failures = *failures + 1
+    }
+}
+
+fn near(a: f64, b: f64) -> bool {
+    return a == b
+}
+
+// feeds the body with packet id `sem` of the version; the body is consumed (freed)
+fn feed(s: *mut mc_entity.Store, ver: *mut mc_version.Version, sem: usize, b: *mut bytes.Bytes) -> bool {
+    bytes.bytes_set_pos(b, 0)
+    let id: i32 = (*ver).sem[sem]
+    let r: bool = mc_entity.entity_on_packet(s, ver, id, b)
+    bytes.bytes_clear(b)
+    return r
+}
+
+fn feed_info(s: *mut mc_entity.Store, ver: *mut mc_version.Version, sem: usize, text: str) -> bool {
+    var vals: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&vals, text.p as u64, text.n)
+    var out: bytes.Bytes = bytes.bytes_new()
+    var err: rt.Buf = rt.buf_new()
+    let id: i32 = (*ver).sem[sem]
+    let sch: u64 = (*ver).schema_of(mc_version.ST_PLAY, mc_version.DIR_S2C, id)
+    let ok: bool = mc_encode.encode_buf(sch, &vals, &out, &err)
+    var r: bool = false
+    if ok {
+        bytes.bytes_set_pos(&out, 0)
+        r = mc_entity.entity_on_packet(s, ver, id, &out)
+    } else {
+        io.print_bytes(rt.buf_ptr(&err), rt.buf_len(&err))
+    }
+    bytes.bytes_free(&out)
+    rt.buf_free(&vals)
+    rt.buf_free(&err)
+    return ok && r
+}
+
+fn name_is(e: *mut mc_entity.Entity, want: str) -> bool {
+    if (*e).name_len != want.n {
+        return false
+    }
+    return rt.mem_eq((&(*e).name[0]) as u64, want.p as u64, want.n)
+}
+
+// ---------------------------------------------------------------------------------- 1.20.1
+fn test_763(failures: *mut i32) {
+    var ver: mc_version.Version = mc_proto_v763.version_make()
+    var s: mc_entity.Store = mc_entity.store_new()
+    // player info: add "Bot" (uuid 00..02)
+    check(failures, feed_info(&s, &ver, mc_sem.SEM_PLAY_S2C_PLAYER_INFO, "action.add_player=true\ndata=#1\ndata[0].uuid=uuid:00000000-0000-0000-0000-000000000002\ndata[0].player.name=\"Bot\"\ndata[0].player.properties=#0\n"), "763 player info add")
+    check(failures, mc_entity.store_player_count(&s) == 1, "763 one player")
+    // named entity spawn id 9: x=1.5 y=64 z=-2.25 yaw=64 (90 deg) pitch=32 (45 deg)
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&b, 9)
+    bytes.put_uuid(&b, 0 as u64, 2 as u64)
+    bytes.put_f64(&b, 1.5)
+    bytes.put_f64(&b, 64.0)
+    bytes.put_f64(&b, 0.0 - 2.25)
+    bytes.put_i8(&b, 64 as i8)
+    bytes.put_i8(&b, 32 as i8)
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_NAMED_ENTITY_SPAWN, &b), "763 named spawn handled")
+    let e: *mut mc_entity.Entity = mc_entity.store_get(&s, 9)
+    check(failures, (e as u64) != 0 as u64, "763 entity 9 exists")
+    if (e as u64) != 0 as u64 {
+        check(failures, (*e).kind == mc_entity.KIND_PLAYER && (*e).has_uuid && (*e).uuid_lo == 2 as u64, "763 player kind + uuid")
+        check(failures, near((*e).x, 1.5) && near((*e).y, 64.0) && near((*e).z, 0.0 - 2.25), "763 position")
+        check(failures, near((*e).yaw, 90.0) && near((*e).pitch, 45.0), "763 angles")
+        check(failures, name_is(e, "Bot"), "763 name from player info")
+    }
+    // spawn object id 7 (type 5): x=10 y=20 z=30
+    bytes.put_varint(&b, 7)
+    bytes.put_uuid(&b, 1 as u64, 1 as u64)
+    bytes.put_varint(&b, 5)
+    bytes.put_f64(&b, 10.0)
+    bytes.put_f64(&b, 20.0)
+    bytes.put_f64(&b, 30.0)
+    bytes.put_i8(&b, 0 as i8)
+    bytes.put_u8(&b, 128 as u8) // yaw byte 128 = 180 deg
+    bytes.put_i8(&b, 0 as i8) // head pitch
+    bytes.put_varint(&b, 0) // object data
+    bytes.put_i16(&b, 0 as i16)
+    bytes.put_i16(&b, 0 as i16)
+    bytes.put_i16(&b, 0 as i16)
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_SPAWN_ENTITY, &b), "763 spawn object handled")
+    check(failures, mc_entity.store_count(&s) == 2, "763 two entities")
+    let o: *mut mc_entity.Entity = mc_entity.store_get(&s, 7)
+    check(failures, (o as u64) != 0 as u64 && (*o).type_id == 5 && near((*o).yaw, 180.0) && (*o).kind == mc_entity.KIND_OBJECT, "763 object fields")
+    // relative move of 7: +1.0, -0.5, 0, on ground
+    bytes.put_varint(&b, 7)
+    bytes.put_i16(&b, 4096 as i16)
+    bytes.put_i16(&b, 0 - 2048 as i16)
+    bytes.put_i16(&b, 0 as i16)
+    bytes.put_bool(&b, true)
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_REL_ENTITY_MOVE, &b), "763 rel move handled")
+    check(failures, near((*o).x, 11.0) && near((*o).y, 19.5) && near((*o).z, 30.0) && (*o).on_ground, "763 rel move applied")
+    // move + look
+    bytes.put_varint(&b, 7)
+    bytes.put_i16(&b, 1 as i16)
+    bytes.put_i16(&b, 0 as i16)
+    bytes.put_i16(&b, 0 as i16)
+    bytes.put_i8(&b, 0 - 64 as i8) // 192 = 270 deg
+    bytes.put_i8(&b, 0 as i8)
+    bytes.put_bool(&b, false)
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_ENTITY_MOVE_LOOK, &b), "763 move look handled")
+    check(failures, near((*o).x, 11.000244140625) && near((*o).yaw, 270.0) && !(*o).on_ground, "763 move look applied")
+    // look
+    bytes.put_varint(&b, 7)
+    bytes.put_i8(&b, 16 as i8)
+    bytes.put_i8(&b, 8 as i8)
+    bytes.put_bool(&b, true)
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_ENTITY_LOOK, &b), "763 look handled")
+    check(failures, near((*o).yaw, 22.5) && near((*o).pitch, 11.25), "763 look applied")
+    // teleport
+    bytes.put_varint(&b, 7)
+    bytes.put_f64(&b, 100.25)
+    bytes.put_f64(&b, 0.0 - 5.0)
+    bytes.put_f64(&b, 0.5)
+    bytes.put_i8(&b, 0 as i8)
+    bytes.put_i8(&b, 0 as i8)
+    bytes.put_bool(&b, true)
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_ENTITY_TELEPORT, &b), "763 teleport handled")
+    check(failures, near((*o).x, 100.25) && near((*o).y, 0.0 - 5.0) && near((*o).z, 0.5) && near((*o).yaw, 0.0), "763 teleport applied")
+    // velocity
+    bytes.put_varint(&b, 7)
+    bytes.put_i16(&b, 100 as i16)
+    bytes.put_i16(&b, 0 - 200 as i16)
+    bytes.put_i16(&b, 300 as i16)
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_ENTITY_VELOCITY, &b), "763 velocity handled")
+    check(failures, (*o).vx == 100 && (*o).vy == 0 - 200 && (*o).vz == 300, "763 velocity applied")
+    // a move for an unknown entity is counted, not stored
+    bytes.put_varint(&b, 12345)
+    bytes.put_i16(&b, 1 as i16)
+    bytes.put_i16(&b, 1 as i16)
+    bytes.put_i16(&b, 1 as i16)
+    bytes.put_bool(&b, true)
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_REL_ENTITY_MOVE, &b), "763 unknown move handled")
+    check(failures, s.misses == 1 as u64 && mc_entity.store_count(&s) == 2, "763 unknown entity counted")
+    // truncated packet: nothing changes, counted as bad
+    bytes.put_varint(&b, 7)
+    bytes.put_i16(&b, 4096 as i16)
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_REL_ENTITY_MOVE, &b), "763 truncated handled")
+    check(failures, s.bad == 1 as u64 && near((*o).x, 100.25), "763 truncated changes nothing")
+    // hostile destroy count
+    bytes.put_varint(&b, 2147483647)
+    bytes.put_varint(&b, 7)
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_ENTITY_DESTROY, &b), "763 hostile destroy handled")
+    check(failures, s.bad == 2 as u64 && mc_entity.store_count(&s) == 2, "763 hostile destroy changes nothing")
+    // destroy 7 and a missing id
+    bytes.put_varint(&b, 2)
+    bytes.put_varint(&b, 7)
+    bytes.put_varint(&b, 777)
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_ENTITY_DESTROY, &b), "763 destroy handled")
+    check(failures, mc_entity.store_count(&s) == 1 && (mc_entity.store_get(&s, 7) as u64) == 0 as u64, "763 destroyed")
+    // player remove
+    check(failures, feed_info(&s, &ver, mc_sem.SEM_PLAY_S2C_PLAYER_REMOVE, "players=#1\nplayers[0]=uuid:00000000-0000-0000-0000-000000000002\n"), "763 player remove")
+    check(failures, mc_entity.store_player_count(&s) == 0, "763 player removed")
+    // dump
+    var out: rt.Buf = rt.buf_new()
+    mc_entity.entity_dump(&s, &out)
+    check(failures, rt.buf_len(&out) > 20, "763 dump written")
+    rt.buf_free(&out)
+    // an id that is no entity packet
+    var nb: bytes.Bytes = bytes.bytes_new()
+    check(failures, !mc_entity.entity_on_packet(&s, &ver, 0 - 1, &nb), "763 id -1 is not an entity packet")
+    bytes.bytes_free(&nb)
+    bytes.bytes_free(&b)
+    mc_entity.store_free(&s)
+}
+
+// ----------------------------------------------------------------------------------- 1.8.9
+fn test_47(failures: *mut i32) {
+    var ver: mc_version.Version = mc_proto_v47.version_make()
+    var s: mc_entity.Store = mc_entity.store_new()
+    // 1.8 player info: action 0 (add_player)
+    check(failures, feed_info(&s, &ver, mc_sem.SEM_PLAY_S2C_PLAYER_INFO, "action=0\ndata=#1\ndata[0].uuid=uuid:00000000-0000-0000-0000-000000000002\ndata[0].name=\"Bot\"\ndata[0].properties=#0\ndata[0].gamemode=0\ndata[0].ping=5\ndata[0].displayName?=0\n"), "47 player info add")
+    check(failures, mc_entity.store_player_count(&s) == 1, "47 one player")
+    // named entity spawn: fixed point x=320/32 = 10, y=2080/32 = 65, z=-48/32 = -1.5
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&b, 300)
+    bytes.put_uuid(&b, 0 as u64, 2 as u64)
+    bytes.put_i32(&b, 320)
+    bytes.put_i32(&b, 2080)
+    bytes.put_i32(&b, 0 - 48)
+    bytes.put_u8(&b, 128 as u8) // yaw 180
+    bytes.put_i8(&b, 64 as i8) // pitch 90
+    bytes.put_i16(&b, 0 as i16) // current item
+    bytes.put_u8(&b, 127 as u8) // empty metadata terminator
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_NAMED_ENTITY_SPAWN, &b), "47 named spawn handled")
+    let e: *mut mc_entity.Entity = mc_entity.store_get(&s, 300)
+    check(failures, (e as u64) != 0 as u64, "47 entity 300 exists")
+    if (e as u64) != 0 as u64 {
+        check(failures, near((*e).x, 10.0) && near((*e).y, 65.0) && near((*e).z, 0.0 - 1.5), "47 fixed point position")
+        check(failures, near((*e).yaw, 180.0) && near((*e).pitch, 90.0) && name_is(e, "Bot"), "47 angles + name")
+        // rel move: i8 deltas /32: +16 = 0.5, -32 = -1.0
+        bytes.put_varint(&b, 300)
+        bytes.put_i8(&b, 16 as i8)
+        bytes.put_i8(&b, 0 - 32 as i8)
+        bytes.put_i8(&b, 1 as i8)
+        bytes.put_bool(&b, true)
+        check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_REL_ENTITY_MOVE, &b), "47 rel move handled")
+        check(failures, near((*e).x, 10.5) && near((*e).y, 64.0) && near((*e).z, 0.0 - 1.5 + 0.03125) && (*e).on_ground, "47 rel move applied")
+        // teleport (fixed point)
+        bytes.put_varint(&b, 300)
+        bytes.put_i32(&b, 3200)
+        bytes.put_i32(&b, 64)
+        bytes.put_i32(&b, 0 - 32)
+        bytes.put_i8(&b, 32 as i8)
+        bytes.put_i8(&b, 0 as i8)
+        bytes.put_bool(&b, false)
+        check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_ENTITY_TELEPORT, &b), "47 teleport handled")
+        check(failures, near((*e).x, 100.0) && near((*e).y, 2.0) && near((*e).z, 0.0 - 1.0) && near((*e).yaw, 45.0) && !(*e).on_ground, "47 teleport applied")
+    }
+    // spawn living (mob): type u8
+    bytes.put_varint(&b, 5)
+    bytes.put_u8(&b, 90 as u8)
+    bytes.put_i32(&b, 32)
+    bytes.put_i32(&b, 64)
+    bytes.put_i32(&b, 96)
+    bytes.put_i8(&b, 0 as i8)
+    bytes.put_i8(&b, 0 as i8)
+    bytes.put_i8(&b, 0 as i8)
+    bytes.put_i16(&b, 0 as i16)
+    bytes.put_i16(&b, 0 as i16)
+    bytes.put_i16(&b, 0 as i16)
+    bytes.put_u8(&b, 127 as u8)
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_SPAWN_ENTITY_LIVING, &b), "47 spawn living handled")
+    let m: *mut mc_entity.Entity = mc_entity.store_get(&s, 5)
+    check(failures, (m as u64) != 0 as u64 && (*m).kind == mc_entity.KIND_LIVING && (*m).type_id == 90 && near((*m).z, 3.0), "47 living fields")
+    // destroy both
+    bytes.put_varint(&b, 2)
+    bytes.put_varint(&b, 5)
+    bytes.put_varint(&b, 300)
+    check(failures, feed(&s, &ver, mc_sem.SEM_PLAY_S2C_ENTITY_DESTROY, &b), "47 destroy handled")
+    check(failures, mc_entity.store_count(&s) == 0, "47 all destroyed")
+    // 1.8 remove_player (action 4)
+    check(failures, feed_info(&s, &ver, mc_sem.SEM_PLAY_S2C_PLAYER_INFO, "action=4\ndata=#1\ndata[0].uuid=uuid:00000000-0000-0000-0000-000000000002\n"), "47 player remove")
+    check(failures, mc_entity.store_player_count(&s) == 0, "47 player removed")
+    bytes.bytes_free(&b)
+    mc_entity.store_free(&s)
+}
+
+// many entities: growth, deletion with tombstones, lookups afterwards
+fn test_many(failures: *mut i32) {
+    var ver: mc_version.Version = mc_proto_v763.version_make()
+    var s: mc_entity.Store = mc_entity.store_new()
+    var b: bytes.Bytes = bytes.bytes_new()
+    var i: i32 = 0
+    while i < 5000 {
+        bytes.put_varint(&b, i * 3 + 1)
+        bytes.put_uuid(&b, 9 as u64, i as u64)
+        bytes.put_varint(&b, 1)
+        bytes.put_f64(&b, i as f64)
+        bytes.put_f64(&b, 0.0)
+        bytes.put_f64(&b, 0.0)
+        bytes.put_i8(&b, 0 as i8)
+        bytes.put_i8(&b, 0 as i8)
+        bytes.put_i8(&b, 0 as i8)
+        bytes.put_varint(&b, 0)
+        bytes.put_i16(&b, 0 as i16)
+        bytes.put_i16(&b, 0 as i16)
+        bytes.put_i16(&b, 0 as i16)
+        feed(&s, &ver, mc_sem.SEM_PLAY_S2C_SPAWN_ENTITY, &b)
+        i = i + 1
+    }
+    check(failures, mc_entity.store_count(&s) == 5000, "many: 5000 spawned")
+    i = 0
+    while i < 5000 {
+        if i % 2 == 0 {
+            bytes.put_varint(&b, 1)
+            bytes.put_varint(&b, i * 3 + 1)
+            feed(&s, &ver, mc_sem.SEM_PLAY_S2C_ENTITY_DESTROY, &b)
+        }
+        i = i + 1
+    }
+    check(failures, mc_entity.store_count(&s) == 2500, "many: 2500 left")
+    i = 0
+    var all: bool = true
+    while i < 5000 {
+        let e: *mut mc_entity.Entity = mc_entity.store_get(&s, i * 3 + 1)
+        if i % 2 == 0 {
+            if (e as u64) != 0 as u64 {
+                all = false
+            }
+        } else if (e as u64) == 0 as u64 || !near((*e).x, i as f64) {
+            all = false
+        }
+        i = i + 1
+    }
+    check(failures, all, "many: lookups after deletions")
+    mc_entity.store_clear(&s)
+    check(failures, mc_entity.store_count(&s) == 0, "many: clear")
+    bytes.bytes_free(&b)
+    mc_entity.store_free(&s)
+}
+
+// ---------------------------------------------------------------------------------- 1.21.9+ lpVec3
+// spawn_entity has `velocity: lpVec3` BEFORE the angles: the skip must cover the 1-byte zero form and the
+// 6 (+ varint when bit 2 of the first octet is set) octet form (regression: bytes_skip returns the position).
+fn spawn_774(s: *mut mc_entity.Store, ver: *mut mc_version.Version, id: i32, lowest: u8, ext: i32, failures: *mut i32, what: str) {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&b, id)
+    bytes.put_uuid(&b, 3 as u64, id as u64)
+    bytes.put_varint(&b, 9)
+    bytes.put_f64(&b, 4.0)
+    bytes.put_f64(&b, 5.0)
+    bytes.put_f64(&b, 6.0)
+    bytes.put_u8(&b, lowest)
+    if lowest != 0 as u8 {
+        bytes.put_u8(&b, 17 as u8)
+        bytes.put_u32(&b, 0x01020304 as u32)
+        if (lowest & 4 as u8) != 0 as u8 {
+            bytes.put_varint(&b, ext)
+        }
+    }
+    bytes.put_i8(&b, 64 as i8) // pitch
+    bytes.put_i8(&b, 32 as i8) // yaw
+    bytes.put_i8(&b, 0 as i8) // head pitch
+    bytes.put_varint(&b, 0)
+    check(failures, feed(s, ver, mc_sem.SEM_PLAY_S2C_SPAWN_ENTITY, &b), what)
+}
+
+fn test_774(failures: *mut i32) {
+    var ver: mc_version.Version = mc_proto_v774.version_make()
+    var s: mc_entity.Store = mc_entity.store_new()
+    spawn_774(&s, &ver, 1, 0 as u8, 0, failures, "774 zero velocity")
+    spawn_774(&s, &ver, 2, 1 as u8, 0, failures, "774 short velocity")
+    spawn_774(&s, &ver, 3, 5 as u8, 0, failures, "774 velocity with a one octet extension")
+    spawn_774(&s, &ver, 4, 7 as u8, 300, failures, "774 velocity with a two octet extension")
+    check(failures, mc_entity.store_count(&s) == 4 && s.bad == 0 as u64, "774 four spawns, none bad")
+    let e: *mut mc_entity.Entity = mc_entity.store_get(&s, 4)
+    check(failures, (e as u64) != 0 as u64, "774 entity 4 exists")
+    if (e as u64) != 0 as u64 {
+        check(failures, near((*e).x, 4.0) && near((*e).z, 6.0) && near((*e).yaw, 45.0) && near((*e).pitch, 90.0) && (*e).type_id == 9, "774 fields behind the velocity")
+    }
+    mc_entity.store_free(&s)
+}
+
+fn main() -> i32 {
+    var failures: i32 = 0
+    test_763(&failures)
+    test_47(&failures)
+    test_many(&failures)
+    test_774(&failures)
+    if failures != 0 {
+        io.fmt_print(f"entity basic: {failures} failures\n")
+        return 1
+    }
+    io.fmt_print(f"entity basic: all ok\n")
+    return 0
+}

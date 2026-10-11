@@ -27,6 +27,9 @@
 #      REF_EXTRA          number of additional reference runs (A3, A4, ...) for stability checks
 #      ALLOW_SKIP=1       exit 0 when B is skipped and A == A2 (default: exit 3)
 #      JAVA               java binary (default /usr/bin/java)
+#      MC_ENTITIES        1 (default for a real server) = entity scenario: a second client (bot.cjs) stays online, a script
+#                         summons / teleports / kills NoAI mobs and walks the bot WHILE each dumper is connected; the
+#                         `<dump>.entities` files (Firn vs reference tracker) are compared as well. 0 = off (--mock is always off).
 #      MC_VERSION         release to test (default 1.20.1; also 1.12.2, 1.20.2 ...). The protocol number and the
 #                         node-minecraft-protocol version come from tools/mcgen/versions.json; the same value is
 #                         exported to ref_dump.cjs (MC_NMP, MC_PROTOCOL) and passed to the Firn client (arg 7).
@@ -41,13 +44,14 @@ VIEW="${MC_VIEW:-4}"
 IDLE="${MC_IDLE_MS:-2500}"
 COMP="${MC_COMPRESSION:-256}"
 MOCK=0
+ENT="${MC_ENTITIES:-1}"
 NAME="Dumper"
 SETTLE="${MC_SETTLE_MS:-45000}"
 BIN="${MCCLIENT_BIN:-}"
 for a in "$@"; do
   case "$a" in
     --no-compression) COMP=-1 ;;
-    --mock) MOCK=1 ;;
+    --mock) MOCK=1; ENT=0 ;;
     -*) echo "run.sh: unknown option $a" >&2; exit 2 ;;
     *) BIN="$a" ;;
   esac
@@ -63,8 +67,11 @@ export MC_NMP="$NMPV" MC_PROTOCOL="$PROTO"
 LEGACY=0; DIFF=peaceful; case "$MCV" in 1.8*|1.9*|1.10*|1.11*|1.12*) LEGACY=1; DIFF=0 ;; esac
 W=$(mktemp -d)
 SRV_PID=""
+BOT_PID=""
 cleanup() {
   exec 3>&- 2>/dev/null || true
+  exec 4>&- 2>/dev/null || true
+  [ -n "${BOT_PID:-}" ] && kill "$BOT_PID" 2>/dev/null
   if [ -n "$SRV_PID" ] && kill -0 "$SRV_PID" 2>/dev/null; then
     kill "$SRV_PID" 2>/dev/null; sleep 1; kill -9 "$SRV_PID" 2>/dev/null
   fi
@@ -109,6 +116,7 @@ player-idle-timeout=0
 motd=mcclient test server
 EOF
   
+  [ "$ENT" -eq 1 ] && echo "allow-flight=true" >> "$W/srv/server.properties"
   # 1.8.x: the Netty epoll transport of the old server fails on Java 9+ ("Unable to access address of buffer"); use NIO
   case "$MCV" in 1.8*) echo "use-native-transport=false" >> "$W/srv/server.properties" ;; esac
   mkfifo "$W/in"
@@ -139,8 +147,52 @@ EOF
     sleep 2
   fi
   
+  if [ "$ENT" -eq 1 ]; then
+    for gr in "doMobLoot false" "doEntityDrops false" "doTileDrops false" "mob_drops false" "entity_drops false" "block_drops false"; do
+      echo "gamerule $gr" >&3
+    done
+    sleep 1
+  fi
 fi
 LEAVE_PATTERN="${LEAVE_PATTERN:-left the game}"
+
+
+# ---------------------------------------------------------------- entity scenario (MC_ENTITIES=1)
+# The bot (a second client) stays online. Around every dumper session the script below runs against the
+# server console: the SAME events in the SAME order, so A, B and A2 end in the same entity state. Entity ids
+# and mob uuids differ from session to session (the server counts up / draws random uuids): compare.sh masks them.
+if [ "$ENT" -eq 1 ]; then
+  PIG=pig; CHICKEN=chicken; STAND=armor_stand; ITEM=item; PLAYER=player; EXEC_AT="execute at $NAME run"
+  case "$MCV" in 1.8*) PIG=Pig; CHICKEN=Chicken; STAND=ArmorStand; ITEM=Item; PLAYER=Player ;; esac
+  [ "$LEGACY" -eq 1 ] && EXEC_AT="execute $NAME ~ ~ ~"
+  [ "$IDLE" -lt 7000 ] && [ -z "${MC_IDLE_MS:-}" ] && IDLE=7000
+  mkfifo "$W/botin"
+  exec 4<>"$W/botin"
+  ( exec node "$HERE/bot.cjs" 127.0.0.1 "$PORT" Bot < "$W/botin" > "$W/bot.log" 2> "$W/bot.err" ) &
+  BOT_PID=$!
+  for i in $(seq 1 60); do grep -q '^ready' "$W/bot.log" 2>/dev/null && break; sleep 0.5; done
+  grep -q '^ready' "$W/bot.log" 2>/dev/null || { cat "$W/bot.err" >&2; die "bot did not join"; }
+  echo "(entity scenario on: bot joined, idle time ${IDLE} ms)"
+fi
+ent_clear() { # no dumper online: remove every non-player entity and every dropped item
+  [ "$ENT" -eq 1 ] || return 0
+  echo "kill @e[type=!$PLAYER]" >&3; sleep 0.5; echo "kill @e[type=$ITEM]" >&3; sleep 1
+}
+ent_script() { # $1 = number of the join line to wait for; then plays the events (about 4.5 s)
+  local n=$1 i
+  for i in $(seq 1 200); do
+    [ "$(grep -c "$NAME joined the game" "$W/server.log")" -ge "$n" ] && break
+    sleep 0.1
+  done
+  sleep 0.4
+  echo "$EXEC_AT summon $PIG ~3 ~3 ~3 {NoAI:1b}" >&3; sleep 0.5
+  echo "$EXEC_AT summon $STAND ~-2 ~ ~ {NoGravity:1b}" >&3; sleep 0.5
+  echo "tp Bot 8.5 70 0.5" >&3; sleep 0.6
+  echo "walk 6 0.25 0.125 120" >&4; sleep 1.1
+  echo "$EXEC_AT tp @e[type=$PIG] ~ ~3 ~-3" >&3; sleep 0.5
+  echo "$EXEC_AT summon $CHICKEN ~ ~2 ~-3 {NoAI:1b}" >&3; sleep 0.5
+  echo "kill @e[type=$CHICKEN]" >&3; sleep 0.3
+}
 
 # wait until the Nth leave line appears so the player position is saved
 LEFT=0
@@ -156,8 +208,11 @@ wait_left() {
 run_ref() { # label [idle_ms]
   local label="$1" idle="${2:-$IDLE}"
   echo "== reference client $label =="
+  local spid=""
+  if [ "$ENT" -eq 1 ] && [ "$label" != W0 ]; then ent_clear; ent_script $(( $(grep -c "$NAME joined the game" "$W/server.log") + 1 )) & spid=$!; fi
   timeout 200 node "$HERE/ref_dump.cjs" 127.0.0.1 "$PORT" "$NAME" "$W/out/$label.dump" "$VIEW" "$idle" > "$W/out/$label.metrics" 2> "$W/out/$label.err"
   local rc=$?
+  [ -n "$spid" ] && wait "$spid"
   [ -s "$W/out/$label.err" ] && { echo "  stderr of $label:"; head -3 "$W/out/$label.err" | sed 's/^/    /'; }
   [ $rc -eq 0 ] || { echo "run.sh: reference client $label failed (rc $rc)" >&2; return 1; }
   wait_left
@@ -166,8 +221,11 @@ run_ref() { # label [idle_ms]
 run_firn() { # label
   local label="$1"
   echo "== Firn client $label ($BIN) =="
+  local spid=""
+  if [ "$ENT" -eq 1 ]; then ent_clear; ent_script $(( $(grep -c "$NAME joined the game" "$W/server.log") + 1 )) & spid=$!; fi
   timeout 150 "$BIN" 127.0.0.1 "$PORT" "$NAME" "$W/out/$label.dump" "$VIEW" "$IDLE" "$PROTO" > "$W/out/$label.metrics" 2> "$W/out/$label.err"
   local rc=$?
+  [ -n "$spid" ] && wait "$spid"
   [ -s "$W/out/$label.err" ] && { echo "  stderr of $label:"; head -3 "$W/out/$label.err" | sed 's/^/    /'; }
   [ $rc -eq 0 ] || { echo "run.sh: Firn client $label failed (rc $rc)" >&2; head -5 "$W/out/$label.metrics" | sed 's/^/    /' >&2; return 1; }
   wait_left
@@ -191,6 +249,7 @@ for n in $(seq 1 "${REF_EXTRA:-0}"); do
   run_ref "A$((n + 2))" && EXTRA_LABELS="$EXTRA_LABELS A$((n + 2))" || OK=0
 done
 
+if [ "$ENT" -eq 1 ]; then echo quit >&4; sleep 1; fi
 echo "== stopping server =="
 [ "$MOCK" -eq 1 ] || echo stop >&3
 [ "$MOCK" -eq 1 ] && kill "$SRV_PID" 2>/dev/null
@@ -216,9 +275,16 @@ else
   echo "Firn client B: SKIPPED (not compared)"
 fi
 
+if [ "$ENT" -eq 1 ] && [ -f "$W/out/A.dump.entities" ]; then
+  ne=$(head -1 "$W/out/A.dump.entities" | cut -d' ' -f2)
+  echo "entity scenario: reference sees $ne entities (A)"
+  grep -q 'name=Bot' "$W/out/A.dump.entities" && [ "$ne" -ge 3 ] || { echo "run.sh: entity scenario produced too few entities (bot + pig + armor stand expected): the entity comparison proves nothing"; RESULT=1; }
+  grep -E "Unknown|Incorrect|Expected|No entity|Invalid|Could not|Found no|Summoned|Teleported|Killed" "$W/server.log" | sed -E 's/^\[[0-9:]+\] //; s/[0-9]+\.[0-9]+/N/g; s/-?[0-9]+/N/g' | sort | uniq -c | head -14 | sed 's/^/  server: /'
+  [ -n "${MC_ENT_DEBUG:-}" ] && for l in A B A2; do echo "--- $l.entities"; cat "$W/out/$l.dump.entities"; done
+fi
 echo "== metrics =="
 metric() { grep -h "^metric $2=" "$W/out/$1.metrics" 2>/dev/null | head -1 | cut -d= -f2-; }
-KEYS="connect_ms join_ms first_chunk_ms total_ms packets bytes_in bytes_decompressed packets_per_s chunks walk_ok walk_fail bulk_packets bulk_columns"
+KEYS="entities entity_spawns connect_ms join_ms first_chunk_ms total_ms packets bytes_in bytes_decompressed packets_per_s chunks walk_ok walk_fail bulk_packets bulk_columns"
 COLS="A B A2$EXTRA_LABELS"
 printf '%-20s' key; for c in $COLS; do printf '%-14s' "$c"; done; echo
 for k in $KEYS; do

@@ -82,6 +82,7 @@ Mojang code. All of it runs with `bash tools/mc/run.sh` (about 10 minutes).
 | `mc_noise` | RNGs, Perlin, simplex, octaves | **done** | real `java.util.Random`, python bit-identical, published vectors | 2700 |
 | `mc_encode` | schema driven packet WRITER: value store (`path=value` text) -> body, any packet of any generated version (same bytecode as the walker, SCHEMA_FORMAT 2 incl. holder sets, lpVec3, recursion) | **done** (byte-identical to the reference serializer for every fixture of 10 versions, both directions) | `tools/mc/encode/run.sh`: decode (`mc_schema.walk_values`) -> encode == fixture, reversed store, damaged stores | 2651 |
 | `mc_anvil` | .mca region files read / write | **done** | independent python reader / writer, fuzz | 2710 |
+| `mc_entity` (+ `mc_entity_layout`, `tools/mcgen/gen_entity.py`) | entity tracking: spawn / move / look / teleport / destroy / velocity / player names, layouts generated per version | **lib + unit tests done**, demo dump / real-server proof open (docs/mc/entity.md) | planned: protodef serializer (`tools/mc/entity`) | 2760 |
 | `demos/mcclient` | **final integration**: join a real server, dump + checksum == node-minecraft-protocol | **done** (M0 accepted, see ROUND-M0.md) | node-minecraft-protocol on a real 1.20.1 server | - |
 
 Not built (explicitly): GPU rendering (analysis and plan: `docs/MC-RENDER.md`; software renderer first), Wasm mod host, physics, inventory, entity decoding, online-mode login against
