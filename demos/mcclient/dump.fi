@@ -1,0 +1,174 @@
+// demos/mcclient/dump.fi -- the world store and the canonical world dump (M0).
+//
+// The dump is the acceptance artefact of milestone M0: a text file in the
+// format of DESIGN.md that a COMPLETELY SEPARATE decoder (the node reference
+// client in tools/mcclient/ref_dump.cjs) has to reproduce byte for byte. Every
+// line is derived from global ids and raw numbers, never from this engine's
+// palette layout, so a different internal representation produces the same
+// file.
+
+import std.bytes
+import std.rt
+import std.io
+import std.crypto.sha256
+import mc.mc_chunk
+import mc.mc_world
+
+export {
+    dump_build, hex_digest,
+}
+
+const FNV_OFFSET: u64 = 14695981039346656037
+const FNV_PRIME: u64 = 1099511628211
+
+// ------------------------------------------------------------------- Dump
+
+fn put_f(out: *mut rt.Buf, f: io.Fmt) {
+    var g: io.Fmt = f
+    rt.buf_push_bytes(out, rt.buf_ptr(&g.b), rt.buf_len(&g.b))
+    io.fmt_free(g)
+}
+
+fn put_hex(out: *mut rt.Buf, v: u64) {
+    rt.buf_push_hex_u64(out, v, 16)
+}
+
+fn fnv16(h: u64, v: u16) -> u64 {
+    var x: u64 = h
+    x = (x ^ ((v as u64) & 255 as u64)) *% FNV_PRIME
+    x = (x ^ ((v as u64) >> 8)) *% FNV_PRIME
+    return x
+}
+
+fn hash_container(c: *mut mc_chunk.Container, n: usize) -> u64 {
+    var h: u64 = FNV_OFFSET
+    var i: usize = 0
+    while i < n {
+        h = fnv16(h, mc_chunk.container_get(c, i))
+        i = i + 1
+    }
+    return h
+}
+
+// true when heightmap name slot `a` sorts before slot `b` (byte order)
+fn hm_less(c: *mut mc_chunk.Chunk, a: usize, b: usize) -> bool {
+    let la: usize = (*c).hm_nlen[a]
+    let lb: usize = (*c).hm_nlen[b]
+    var i: usize = 0
+    while i < la && i < lb {
+        let x: u8 = (*c).hm_name[a * mc_chunk.HM_NAME_MAX + i]
+        let y: u8 = (*c).hm_name[b * mc_chunk.HM_NAME_MAX + i]
+        if x != y {
+            return x < y
+        }
+        i = i + 1
+    }
+    return la < lb
+}
+
+fn dump_chunk(out: *mut rt.Buf, c: *mut mc_chunk.Chunk) {
+    put_f(out, f"C {(*c).x} {(*c).z} sections={(*c).nsec} blockentities={(*c).nbe}\n")
+    var i: usize = 0
+    while i < (*c).nsec {
+        let s: *mut mc_chunk.Section = mc_chunk.chunk_section(c, i)
+        put_f(out, f"S {(*c).x} {(*c).z} {i} count={(*s).count} distinct={mc_chunk.container_palette_size(&(*s).blocks)} blocks=")
+        put_hex(out, hash_container(&(*s).blocks, mc_chunk.BLOCKS_PER_SECTION))
+        put_f(out, f" biomes=")
+        put_hex(out, hash_container(&(*s).biomes, mc_chunk.BIOMES_PER_SECTION))
+        put_f(out, f"\n")
+        i = i + 1
+    }
+    // heightmaps in byte order of their names (selection sort over <= 4 slots)
+    var done: [bool; 4] = [false; 4]
+    var emitted: usize = 0
+    while emitted < (*c).nhm {
+        var best: usize = 99
+        var k: usize = 0
+        while k < (*c).nhm {
+            if !done[k] {
+                if best == 99 || hm_less(c, k, best) {
+                    best = k
+                }
+            }
+            k = k + 1
+        }
+        done[best] = true
+        emitted = emitted + 1
+        put_f(out, f"H {(*c).x} {(*c).z} ")
+        rt.buf_push_bytes(out, (&(*c).hm_name[best * mc_chunk.HM_NAME_MAX]) as u64, (*c).hm_nlen[best])
+        put_f(out, f" ")
+        var h: u64 = FNV_OFFSET
+        var e: usize = 0
+        while e < mc_chunk.HM_ENTRIES {
+            h = fnv16(h, rt.ld16((*c).hm_val, best * mc_chunk.HM_ENTRIES + e))
+            e = e + 1
+        }
+        put_hex(out, h)
+        put_f(out, f"\n")
+    }
+    put_f(out, f"L {(*c).x} {(*c).z} sky={(*c).sky_n} block={(*c).block_n} h=")
+    put_hex(out, (*c).light_hash)
+    put_f(out, f"\n")
+}
+
+// Builds the complete dump (header, chunks ascending by x then z, checksum
+// line) into `out`. `digest` receives the 32 octet SHA-256 of everything above
+// the checksum line.
+fn dump_build(w: *mut mc_world.World, protocol: i32, out: *mut rt.Buf, digest: u64) {
+    rt.buf_clear(out)
+    put_f(out, f"mcdump 1\nprotocol {protocol}\nchunks {(*w).n}\n")
+    // order: insertion sort of an index array by (x, z)
+    let order: u64 = rt.heap_alloc(((*w).n + 1) * 8)
+    var i: usize = 0
+    while i < (*w).n {
+        rt.st64(order, i, rt.ld64((*w).items, i))
+        i = i + 1
+    }
+    i = 1
+    while i < (*w).n {
+        let key: u64 = rt.ld64(order, i)
+        let kc: *mut mc_chunk.Chunk = key as *mut mc_chunk.Chunk
+        var j: usize = i
+        while j > 0 {
+            let pc: *mut mc_chunk.Chunk = rt.ld64(order, j - 1) as *mut mc_chunk.Chunk
+            let after: bool = (*pc).x > (*kc).x || ((*pc).x == (*kc).x && (*pc).z > (*kc).z)
+            if !after {
+                break
+            }
+            rt.st64(order, j, rt.ld64(order, j - 1))
+            j = j - 1
+        }
+        rt.st64(order, j, key)
+        i = i + 1
+    }
+    i = 0
+    while i < (*w).n {
+        dump_chunk(out, rt.ld64(order, i) as *mut mc_chunk.Chunk)
+        i = i + 1
+    }
+    rt.heap_free(order, ((*w).n + 1) * 8)
+    sha256.sha256(rt.buf_ptr(out), rt.buf_len(out), digest)
+    put_f(out, f"checksum sha256 ")
+    hex_digest(out, digest, 32)
+    put_f(out, f"\n")
+}
+
+fn hex_digest(out: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let by: u8 = rt.ld8(p, i)
+        let hi: u8 = by >> 4
+        let lo: u8 = by & 15 as u8
+        var a: u8 = 48 as u8 + hi
+        if hi > 9 as u8 {
+            a = 87 as u8 + hi
+        }
+        var b: u8 = 48 as u8 + lo
+        if lo > 9 as u8 {
+            b = 87 as u8 + lo
+        }
+        rt.buf_push(out, a)
+        rt.buf_push(out, b)
+        i = i + 1
+    }
+}

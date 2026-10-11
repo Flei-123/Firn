@@ -1,0 +1,170 @@
+// expect_exit: 0
+// tests/2660_mc_packet_wire.fi -- mc_packet against the wire table of the protocol
+// (octets written out by hand from the public protocol description, NOT produced by
+// the library), then read back by the Reader.
+import mc.mc_packet
+import std.bytes
+import std.rt
+
+// Compares the writer content against n octets at `want`, empties the writer.
+fn is(w: *mut mc_packet.Writer, want: u64, n: usize) -> bool {
+    if mc_packet.wr_len(w) != n { return false }
+    var i: usize = 0
+    let p: u64 = mc_packet.wr_ptr(w)
+    while i < n {
+        if rt.ld8(p, i) != rt.ld8(want, i) { return false }
+        i = i + 1
+    }
+    mc_packet.writer_clear(w)
+    return true
+}
+
+fn main() -> i32 {
+    var w: mc_packet.Writer = mc_packet.writer_new()
+    defer mc_packet.writer_free(&w)
+
+    // ---- scalars (big endian)
+    var e1: [u8; 2] = [0x12, 0x34]
+    mc_packet.wr_u16(&w, 0x1234 as u16)
+    if !is(&w, (&e1[0]) as u64, 2) { return 1 }
+    var e2: [u8; 4] = [0xff, 0xff, 0xff, 0xfe]
+    mc_packet.wr_i32(&w, -2)
+    if !is(&w, (&e2[0]) as u64, 4) { return 2 }
+    var e3: [u8; 8] = [0x80, 0, 0, 0, 0, 0, 0, 0]
+    mc_packet.wr_i64(&w, -9223372036854775807 - 1)
+    if !is(&w, (&e3[0]) as u64, 8) { return 3 }
+    var e4: [u8; 4] = [0x3f, 0x80, 0, 0]
+    mc_packet.wr_f32(&w, 1.0f)
+    if !is(&w, (&e4[0]) as u64, 4) { return 4 }
+    var e5: [u8; 8] = [0x40, 0x09, 0x21, 0xfb, 0x54, 0x44, 0x2d, 0x18]
+    mc_packet.wr_f64(&w, 3.141592653589793)
+    if !is(&w, (&e5[0]) as u64, 8) { return 5 }
+
+    // ---- VarInt / VarLong (wiki table)
+    var v1: [u8; 5] = [0xff, 0xff, 0xff, 0xff, 0x0f]
+    mc_packet.wr_varint(&w, -1)
+    if !is(&w, (&v1[0]) as u64, 5) { return 6 }
+    var v2: [u8; 2] = [0xff, 0x01]
+    mc_packet.wr_varint(&w, 255)
+    if !is(&w, (&v2[0]) as u64, 2) { return 7 }
+    var v3: [u8; 10] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]
+    mc_packet.wr_varlong(&w, -1 as i64)
+    if !is(&w, (&v3[0]) as u64, 10) { return 8 }
+
+    // ---- string, identifier
+    var s1: [u8; 6] = [0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f]
+    var hello: [u8; 6] = "hello\0"
+    mc_packet.wr_string(&w, (&hello[0]) as u64, 5, 16)
+    if !is(&w, (&s1[0]) as u64, 6) { return 9 }
+    // "ä€😀" = c3 a4 / e2 82 ac / f0 9f 98 80: 4 UTF-16 units, 9 octets
+    var u8t: [u8; 9] = [0xc3, 0xa4, 0xe2, 0x82, 0xac, 0xf0, 0x9f, 0x98, 0x80]
+    var s2: [u8; 10] = [0x09, 0xc3, 0xa4, 0xe2, 0x82, 0xac, 0xf0, 0x9f, 0x98, 0x80]
+    mc_packet.wr_string(&w, (&u8t[0]) as u64, 9, 4)
+    if !is(&w, (&s2[0]) as u64, 10) { return 10 }
+    mc_packet.wr_string(&w, (&u8t[0]) as u64, 9, 3) // 4 units > 3
+    if mc_packet.wr_err(&w) != mc_packet.PE_TOO_LONG { return 11 }
+    mc_packet.writer_clear(&w)
+    var mc: [u8; 16] = "minecraft:stone\0"
+    mc_packet.wr_identifier(&w, (&mc[0]) as u64, 15)
+    if !mc_packet.wr_ok(&w) { return 12 }
+    var rd: mc_packet.Reader = mc_packet.Reader { b: bytes.bytes_new(), err: 0 }
+    mc_packet.reader_init(&rd, mc_packet.wr_ptr(&w), mc_packet.wr_len(&w))
+    var n: usize = 0
+    let p: u64 = mc_packet.rd_identifier(&rd, &n)
+    if !mc_packet.rd_ok(&rd) || n != 15 || !rt.mem_eq(p, (&mc[0]) as u64, 15) { return 13 }
+    if mc_packet.rd_remaining(&rd) != 0 { return 14 }
+    mc_packet.writer_clear(&w)
+
+    // ---- uuid, position, angle
+    var u1: [u8; 16] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10]
+    mc_packet.wr_uuid(&w, 0x0123456789abcdef as u64, 0xfedcba9876543210 as u64)
+    if !is(&w, (&u1[0]) as u64, 16) { return 15 }
+    // wiki example: x=18357644 y=831 z=-20882616 -> 0x4607632C15B4833F
+    var p1: [u8; 8] = [0x46, 0x07, 0x63, 0x2c, 0x15, 0xb4, 0x83, 0x3f]
+    mc_packet.wr_position(&w, 18357644, 831, -20882616)
+    if !is(&w, (&p1[0]) as u64, 8) { return 16 }
+    mc_packet.reader_init(&rd, (&p1[0]) as u64, 8)
+    var x: i32 = 0
+    var y: i32 = 0
+    var z: i32 = 0
+    mc_packet.rd_position(&rd, &x, &y, &z)
+    if !mc_packet.rd_ok(&rd) || x != 18357644 || y != 831 || z != -20882616 { return 17 }
+    mc_packet.wr_position(&w, -33554432, -2048, 33554431)
+    if !mc_packet.wr_ok(&w) { return 18 }
+    mc_packet.reader_init(&rd, mc_packet.wr_ptr(&w), 8)
+    mc_packet.rd_position(&rd, &x, &y, &z)
+    if x != -33554432 || y != -2048 || z != 33554431 { return 19 }
+    mc_packet.writer_clear(&w)
+    mc_packet.wr_position(&w, 33554432, 0, 0) // out of range
+    if mc_packet.wr_err(&w) != mc_packet.PE_BAD_VALUE { return 20 }
+    mc_packet.writer_clear(&w)
+    if mc_packet.degrees_to_angle(90.0f) != 64 as u8 { return 21 }
+    if mc_packet.degrees_to_angle(-90.0f) != 192 as u8 { return 22 }
+    if mc_packet.angle_to_degrees(128 as u8) != 180.0f { return 23 }
+
+    // ---- bitset
+    var words: [u64; 2] = [0x8000000000000001 as u64, 0x2 as u64]
+    var b1: [u8; 17] = [0x02, 0x80, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x02]
+    mc_packet.wr_bitset(&w, (&words[0]) as u64, 2)
+    if !is(&w, (&b1[0]) as u64, 17) { return 24 }
+    var got: [u64; 2] = [0 as u64, 0 as u64]
+    mc_packet.reader_init(&rd, (&b1[0]) as u64, 17)
+    let cnt: usize = mc_packet.rd_bitset(&rd, (&got[0]) as u64, 2)
+    if cnt != 2 || got[0] != words[0] || got[1] != words[1] { return 25 }
+    if !mc_packet.bitset_get((&got[0]) as u64, 2, 0) { return 26 }
+    if !mc_packet.bitset_get((&got[0]) as u64, 2, 63) { return 27 }
+    if mc_packet.bitset_get((&got[0]) as u64, 2, 64) { return 28 }
+    if !mc_packet.bitset_get((&got[0]) as u64, 2, 65) { return 29 }
+    mc_packet.bitset_set((&got[0]) as u64, 2, 64, true)
+    if !mc_packet.bitset_get((&got[0]) as u64, 2, 64) { return 30 }
+    mc_packet.bitset_set((&got[0]) as u64, 2, 64, false)
+    if mc_packet.bitset_get((&got[0]) as u64, 2, 64) { return 31 }
+
+    // ---- optional + array prefix + rest
+    var o1: [u8; 5] = [0x01, 0x03, 0x0a, 0x0b, 0x0c]
+    mc_packet.wr_optional(&w, true)
+    mc_packet.wr_array_count(&w, 3)
+    mc_packet.wr_u8(&w, 0x0a as u8)
+    mc_packet.wr_u8(&w, 0x0b as u8)
+    mc_packet.wr_u8(&w, 0x0c as u8)
+    if !is(&w, (&o1[0]) as u64, 5) { return 32 }
+    mc_packet.reader_init(&rd, (&o1[0]) as u64, 5)
+    if !mc_packet.rd_optional(&rd) { return 33 }
+    if mc_packet.rd_array_count(&rd, 1, 100) != 3 { return 34 }
+    var rn: usize = 0
+    let rp: u64 = mc_packet.rd_rest(&rd, &rn)
+    if rn != 3 || rt.ld8(rp, 0) != 0x0a as u8 || mc_packet.rd_remaining(&rd) != 0 { return 35 }
+
+    // ---- slot 1.20.1: present, id 276, count 1, nbt {} (named, empty name)
+    var sl: [u8; 8] = [0x01, 0x94, 0x02, 0x01, 0x0a, 0x00, 0x00, 0x00]
+    var slot: mc_packet.Slot = mc_packet.Slot { present: false, item_id: 0, count: 0 as i8, nbt: 0, nbt_len: 0 }
+    mc_packet.reader_init(&rd, (&sl[0]) as u64, 8)
+    mc_packet.rd_slot(&rd, 763, &slot)
+    if !mc_packet.rd_ok(&rd) || !slot.present || slot.item_id != 276 || slot.count != 1 as i8 { return 36 }
+    if slot.nbt_len != 4 || mc_packet.rd_remaining(&rd) != 0 { return 37 }
+    mc_packet.wr_slot(&w, 763, &slot)
+    if !mc_packet.wr_ok(&w) || mc_packet.wr_len(&w) != 8 { return 38 }
+    if !is(&w, (&sl[0]) as u64, 8) { return 39 }
+    // empty slot
+    var sl0: [u8; 1] = [0x00]
+    mc_packet.reader_init(&rd, (&sl0[0]) as u64, 1)
+    mc_packet.rd_slot(&rd, 763, &slot)
+    if !mc_packet.rd_ok(&rd) || slot.present { return 40 }
+    // slot without nbt (a lone TAG_End)
+    var sl1: [u8; 5] = [0x01, 0x01, 0x40, 0x00, 0x7f]
+    mc_packet.reader_init(&rd, (&sl1[0]) as u64, 5)
+    mc_packet.rd_slot(&rd, 763, &slot)
+    if !mc_packet.rd_ok(&rd) || slot.item_id != 1 || slot.count != 64 as i8 || slot.nbt_len != 0 { return 41 }
+    if mc_packet.rd_remaining(&rd) != 1 { return 42 }
+    // version hook: 1.20.2 slot uses the nameless NBT root
+    var sl2: [u8; 6] = [0x01, 0x01, 0x01, 0x0a, 0x00, 0x7f]
+    mc_packet.reader_init(&rd, (&sl2[0]) as u64, 6)
+    mc_packet.rd_slot(&rd, 764, &slot)
+    if !mc_packet.rd_ok(&rd) || slot.nbt_len != 2 || mc_packet.rd_remaining(&rd) != 1 { return 43 }
+    // an unsupported version (data components) is refused
+    mc_packet.reader_init(&rd, (&sl2[0]) as u64, 6)
+    mc_packet.rd_slot(&rd, 766, &slot)
+    if mc_packet.rd_err(&rd) != mc_packet.PE_BAD_VALUE { return 44 }
+
+    return 0
+}

@@ -1,0 +1,323 @@
+// expect_exit: 0
+// tests/2662_mc_packet_fuzz.fi -- mc_packet property test + fuzz.
+//   1. 3000 random packets (random field kinds, random values) are written and read
+//      back; every value must be identical, the reader must end exactly at the end.
+//   2. Each packet is damaged (bit flips, truncation, 0xff runs, random garbage) and
+//      read again with the same field script: it may succeed or fail, but it must
+//      never crash, never hang (all loops are bounded by the data) and never read
+//      past the end (the final cursor is checked).
+import mc.mc_packet
+import std.bytes
+import std.rt
+import std.io
+
+const KINDS: u32 = 15
+
+fn rnd(st: *mut u64) -> u64 {
+    *st = *st *% 6364136223846793005 as u64 +% 1442695040888963407 as u64
+    return *st >> 29
+}
+
+fn rnd_below(st: *mut u64, n: u64) -> u64 {
+    return rnd(st) % n
+}
+
+// A random valid UTF-8 text of `chars` characters into `dst`; returns octets.
+fn gen_text(st: *mut u64, dst: u64, chars: usize) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < chars {
+        let k: u64 = rnd_below(st, 4 as u64)
+        if k == 0 as u64 {
+            rt.st8(dst, n, (97 as u64 + rnd_below(st, 26 as u64)) as u8)
+            n = n + 1
+        } else if k == 1 as u64 {
+            rt.st8(dst, n, 0xc3 as u8)
+            rt.st8(dst, n + 1, (0x80 as u64 + rnd_below(st, 64 as u64)) as u8)
+            n = n + 2
+        } else if k == 2 as u64 {
+            rt.st8(dst, n, 0xe2 as u8)
+            rt.st8(dst, n + 1, (0x82 as u64 + rnd_below(st, 4 as u64)) as u8)
+            rt.st8(dst, n + 2, (0x80 as u64 + rnd_below(st, 64 as u64)) as u8)
+            n = n + 3
+        } else {
+            rt.st8(dst, n, 0xf0 as u8)
+            rt.st8(dst, n + 1, (0x9f as u64) as u8)
+            rt.st8(dst, n + 2, (0x98 as u64 + rnd_below(st, 4 as u64)) as u8)
+            rt.st8(dst, n + 3, (0x80 as u64 + rnd_below(st, 64 as u64)) as u8)
+            n = n + 4
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// units of the text above: 1 unit per char except 4 octet chars (2 units)
+fn gen_pos(st: *mut u64, o: u64) -> i32 {
+    // o = range size
+    return ((rnd_below(st, o) as i64) - ((o / 2 as u64) as i64)) as i32
+}
+
+// Writes one random field of `kind`; the Reader side replays the same draws.
+fn gen_field(kind: u32, st: *mut u64, w: *mut mc_packet.Writer, tmp: u64) {
+    if kind == 0 {
+        mc_packet.wr_u8(w, rnd_below(st, 256 as u64) as u8)
+    } else if kind == 1 {
+        mc_packet.wr_i16(w, bytes.bits_i16(rnd_below(st, 65536 as u64) as u16))
+    } else if kind == 2 {
+        mc_packet.wr_i32(w, bytes.bits_i32(rnd_below(st, 4294967296 as u64) as u32))
+    } else if kind == 3 {
+        let a: u64 = (rnd(st) << 40) ^ (rnd(st) << 20) ^ rnd(st)
+        mc_packet.wr_i64(w, bytes.bits_i64(a))
+    } else if kind == 4 {
+        mc_packet.wr_f32(w, (rnd_below(st, 100000 as u64) as f32) / 8.0f)
+    } else if kind == 5 {
+        mc_packet.wr_f64(w, (rnd_below(st, 100000 as u64) as f64) / 16.0)
+    } else if kind == 6 {
+        mc_packet.wr_bool(w, rnd_below(st, 2 as u64) == 1 as u64)
+    } else if kind == 7 {
+        mc_packet.wr_varint(w, bytes.bits_i32(rnd_below(st, 4294967296 as u64) as u32) >> (rnd_below(st, 32 as u64) as u32))
+    } else if kind == 8 {
+        let a: u64 = (rnd(st) << 40) ^ (rnd(st) << 20) ^ rnd(st)
+        mc_packet.wr_varlong(w, bytes.bits_i64(a) >> (rnd_below(st, 64 as u64) as u32))
+    } else if kind == 9 {
+        let chars: usize = rnd_below(st, 40 as u64) as usize
+        let n: usize = gen_text(st, tmp, chars)
+        mc_packet.wr_string(w, tmp, n, 64)
+    } else if kind == 10 {
+        mc_packet.wr_uuid(w, (rnd(st) << 33) ^ rnd(st), (rnd(st) << 33) ^ rnd(st))
+    } else if kind == 11 {
+        let x: i32 = gen_pos(st, 67108864 as u64)
+        let z: i32 = gen_pos(st, 67108864 as u64)
+        let y: i32 = gen_pos(st, 4096 as u64)
+        mc_packet.wr_position(w, x, y, z)
+    } else if kind == 12 {
+        let cnt: usize = rnd_below(st, 5 as u64) as usize
+        var i: usize = 0
+        mc_packet.wr_array_count(w, cnt)
+        while i < cnt {
+            mc_packet.wr_u64(w, (rnd(st) << 33) ^ rnd(st))
+            i = i + 1
+        }
+    } else if kind == 13 {
+        let cnt: usize = rnd_below(st, 30 as u64) as usize
+        var i: usize = 0
+        while i < cnt {
+            rt.st8(tmp, i, rnd_below(st, 256 as u64) as u8)
+            i = i + 1
+        }
+        mc_packet.wr_byte_array(w, tmp, cnt)
+    } else {
+        // optional<varint>
+        let present: bool = rnd_below(st, 2 as u64) == 1 as u64
+        mc_packet.wr_optional(w, present)
+        if present {
+            mc_packet.wr_varint(w, rnd_below(st, 1000000 as u64) as i32)
+        }
+    }
+}
+
+// Reads the same field and compares with the replayed draws. Returns false on
+// ANY difference. When `strict` is false only the reading happens (damaged data).
+fn read_field(kind: u32, st: *mut u64, r: *mut mc_packet.Reader, tmp: u64, strict: bool) -> bool {
+    var ok: bool = true
+    if kind == 0 {
+        let e: u8 = rnd_below(st, 256 as u64) as u8
+        if mc_packet.rd_u8(r) != e { ok = false }
+    } else if kind == 1 {
+        let e: i16 = bytes.bits_i16(rnd_below(st, 65536 as u64) as u16)
+        if mc_packet.rd_i16(r) != e { ok = false }
+    } else if kind == 2 {
+        let e: i32 = bytes.bits_i32(rnd_below(st, 4294967296 as u64) as u32)
+        if mc_packet.rd_i32(r) != e { ok = false }
+    } else if kind == 3 {
+        let a: u64 = (rnd(st) << 40) ^ (rnd(st) << 20) ^ rnd(st)
+        if mc_packet.rd_i64(r) != bytes.bits_i64(a) { ok = false }
+    } else if kind == 4 {
+        let e: f32 = (rnd_below(st, 100000 as u64) as f32) / 8.0f
+        if mc_packet.rd_f32(r) != e { ok = false }
+    } else if kind == 5 {
+        let e: f64 = (rnd_below(st, 100000 as u64) as f64) / 16.0
+        if mc_packet.rd_f64(r) != e { ok = false }
+    } else if kind == 6 {
+        let e: bool = rnd_below(st, 2 as u64) == 1 as u64
+        if mc_packet.rd_bool(r) != e { ok = false }
+    } else if kind == 7 {
+        let e: i32 = bytes.bits_i32(rnd_below(st, 4294967296 as u64) as u32) >> (rnd_below(st, 32 as u64) as u32)
+        if mc_packet.rd_varint(r) != e { ok = false }
+    } else if kind == 8 {
+        let a: u64 = (rnd(st) << 40) ^ (rnd(st) << 20) ^ rnd(st)
+        let e: i64 = bytes.bits_i64(a) >> (rnd_below(st, 64 as u64) as u32)
+        if mc_packet.rd_varlong(r) != e { ok = false }
+    } else if kind == 9 {
+        let chars: usize = rnd_below(st, 40 as u64) as usize
+        let n: usize = gen_text(st, tmp, chars)
+        var gn: usize = 0
+        let p: u64 = mc_packet.rd_string(r, 64, &gn)
+        if mc_packet.rd_ok(r) {
+            if gn != n || !rt.mem_eq(p, tmp, n) { ok = false }
+        }
+    } else if kind == 10 {
+        let eh: u64 = (rnd(st) << 33) ^ rnd(st)
+        let el: u64 = (rnd(st) << 33) ^ rnd(st)
+        var h: u64 = 0
+        var l: u64 = 0
+        mc_packet.rd_uuid(r, &h, &l)
+        if h != eh || l != el { ok = false }
+    } else if kind == 11 {
+        let ex: i32 = gen_pos(st, 67108864 as u64)
+        let ez: i32 = gen_pos(st, 67108864 as u64)
+        let ey: i32 = gen_pos(st, 4096 as u64)
+        var x: i32 = 0
+        var y: i32 = 0
+        var z: i32 = 0
+        mc_packet.rd_position(r, &x, &y, &z)
+        if x != ex || y != ey || z != ez { ok = false }
+    } else if kind == 12 {
+        let cnt: usize = rnd_below(st, 5 as u64) as usize
+        var i: usize = 0
+        var expect: [u64; 5] = [0 as u64; 5]
+        while i < cnt {
+            expect[i] = (rnd(st) << 33) ^ rnd(st)
+            i = i + 1
+        }
+        var got: [u64; 8] = [0 as u64; 8]
+        let n: usize = mc_packet.rd_bitset(r, (&got[0]) as u64, 8)
+        if mc_packet.rd_ok(r) {
+            if n != cnt { ok = false }
+            i = 0
+            while i < cnt && i < 5 {
+                if got[i] != expect[i] { ok = false }
+                i = i + 1
+            }
+        }
+    } else if kind == 13 {
+        let cnt: usize = rnd_below(st, 30 as u64) as usize
+        var i: usize = 0
+        while i < cnt {
+            rt.st8(tmp, i, rnd_below(st, 256 as u64) as u8)
+            i = i + 1
+        }
+        var gn: usize = 0
+        let p: u64 = mc_packet.rd_byte_array(r, 1000, &gn)
+        if mc_packet.rd_ok(r) {
+            if gn != cnt || !rt.mem_eq(p, tmp, cnt) { ok = false }
+        }
+    } else {
+        let present: bool = rnd_below(st, 2 as u64) == 1 as u64
+        var ev: i32 = 0
+        if present { ev = rnd_below(st, 1000000 as u64) as i32 }
+        let gp: bool = mc_packet.rd_optional(r)
+        if mc_packet.rd_ok(r) {
+            if gp != present { ok = false }
+            if gp {
+                if mc_packet.rd_varint(r) != ev { ok = false }
+            }
+        }
+    }
+    if !strict { return true }
+    return ok && mc_packet.rd_ok(r)
+}
+
+// A damaged packet is read with a script that is NOT tied to the data. Reads
+// everything until an error or the end; returns the number of fields read.
+fn read_blind(st: *mut u64, r: *mut mc_packet.Reader, tmp: u64, nfields: usize) -> usize {
+    var i: usize = 0
+    var done: usize = 0
+    while i < nfields {
+        let kind: u32 = rnd_below(st, KINDS as u64) as u32
+        read_field(kind, st, r, tmp, false)
+        if !mc_packet.rd_ok(r) { return done }
+        done = done + 1
+        i = i + 1
+    }
+    return done
+}
+
+fn main() -> i32 {
+    var seed: u64 = 12345 as u64
+    let tmp: u64 = rt.heap_alloc(8192)
+    let dmg: u64 = rt.heap_alloc(65536)
+    var w: mc_packet.Writer = mc_packet.writer_new()
+    defer mc_packet.writer_free(&w)
+    var iter: u32 = 0
+    var fields_total: usize = 0
+    var survived: usize = 0
+    var failed: usize = 0
+    while iter < 3000 as u32 {
+        mc_packet.writer_clear(&w)
+        let nf: usize = 1 + rnd_below(&seed, 12 as u64) as usize
+        var pseed: u64 = rnd(&seed)
+        let start: u64 = pseed
+        var i: usize = 0
+        while i < nf {
+            let kind: u32 = rnd_below(&pseed, KINDS as u64) as u32
+            gen_field(kind, &pseed, &w, tmp)
+            i = i + 1
+        }
+        if !mc_packet.wr_ok(&w) { return 1 }
+        // 1. clean read, replaying the same draws
+        var rs: u64 = start
+        var r: mc_packet.Reader = mc_packet.Reader { b: bytes.bytes_new(), err: 0 }
+        mc_packet.reader_init(&r, mc_packet.wr_ptr(&w), mc_packet.wr_len(&w))
+        i = 0
+        while i < nf {
+            let kind: u32 = rnd_below(&rs, KINDS as u64) as u32
+            if !read_field(kind, &rs, &r, tmp, true) { return 3 }
+            i = i + 1
+        }
+        if mc_packet.rd_remaining(&r) != 0 { return 4 }
+        fields_total = fields_total + nf
+
+        // 2. damage and read blindly
+        let len: usize = mc_packet.wr_len(&w)
+        rt.mem_copy(dmg, mc_packet.wr_ptr(&w), len)
+        var dlen: usize = len
+        let mode: u64 = rnd_below(&seed, 5 as u64)
+        if mode == 0 as u64 && len > 0 {
+            let at: usize = rnd_below(&seed, len as u64) as usize
+            rt.st8(dmg, at, rt.ld8(dmg, at) ^ (1 as u8 << (rnd_below(&seed, 8 as u64) as u32)))
+        } else if mode == 1 as u64 && len > 0 {
+            dlen = rnd_below(&seed, len as u64) as usize
+        } else if mode == 2 as u64 && len > 4 {
+            let at: usize = rnd_below(&seed, (len - 3) as u64) as usize
+            rt.st8(dmg, at, 0xff as u8)
+            rt.st8(dmg, at + 1, 0xff as u8)
+            rt.st8(dmg, at + 2, 0xff as u8)
+        } else if mode == 3 as u64 {
+            dlen = rnd_below(&seed, 200 as u64) as usize
+            var q: usize = 0
+            while q < dlen {
+                rt.st8(dmg, q, rnd_below(&seed, 256 as u64) as u8)
+                q = q + 1
+            }
+        } else if len > 0 {
+            let at: usize = rnd_below(&seed, len as u64) as usize
+            rt.st8(dmg, at, rnd_below(&seed, 256 as u64) as u8)
+        }
+        var r2: mc_packet.Reader = mc_packet.Reader { b: bytes.bytes_new(), err: 0 }
+        mc_packet.reader_init(&r2, dmg, dlen)
+        var bs: u64 = start
+        i = 0
+        while i < nf && mc_packet.rd_ok(&r2) {
+            let kind: u32 = rnd_below(&bs, KINDS as u64) as u32
+            read_field(kind, &bs, &r2, tmp, false)
+            i = i + 1
+        }
+        let replay_ok: bool = mc_packet.rd_ok(&r2)
+        // plus one blind pass with a random script
+        var bs2: u64 = rnd(&seed)
+        mc_packet.reader_init(&r2, dmg, dlen)
+        read_blind(&bs2, &r2, tmp, 12)
+        if mc_packet.rd_pos(&r2) > dlen { return 5 }
+        if replay_ok { survived = survived + 1 } else { failed = failed + 1 }
+        iter = iter + 1
+    }
+    rt.heap_free(tmp, 8192)
+    rt.heap_free(dmg, 65536)
+    io.fmt_print_line(f"fuzz: survived {survived} failed {failed} fields {fields_total}")
+    // the fuzz must exercise both outcomes
+    if failed < 300 || survived < 300 { return 6 }
+    if fields_total < 10000 { return 7 }
+    return 0
+}

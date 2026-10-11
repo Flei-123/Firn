@@ -1,0 +1,748 @@
+// lib/mc/mc_packet.fi -- bounds checked Reader / Writer for the protocol types
+// of Minecraft: Java Edition 1.20.1 (protocol 763).
+//
+// Design
+//   * Built on std.bytes (big endian scalars, VarInt/VarLong layout).
+//   * STICKY ERROR FLAG instead of an error union on every call: the first
+//     failure is stored in the Reader / Writer, every later call is a no-op
+//     that returns a zero value. A packet driver reads ten fields and checks
+//     `rd_err` once at the end. Because failed reads never advance the
+//     cursor and never allocate, a half decoded packet is harmless.
+//   * Every length that comes from the peer is checked against what is really
+//     there BEFORE anything is reserved (no allocation from a forged count).
+//   * Reader: rd_*   Writer: wr_*   (see docs/mc/packet.md)
+//
+// Error codes (PE_*): Underflow, TooLong, BadUtf8, BadValue, VarInt, Negative,
+// OutOfMemory, BadIdentifier, BadNbt.
+
+import std.bytes
+import std.rt
+import std.nbt
+import std.math
+
+export {
+    Reader, Writer, Slot,
+    reader_init, reader_from_bytes, rd_ok, rd_err, rd_remaining, rd_pos, rd_seek, rd_skip,
+    rd_u8, rd_i8, rd_u16, rd_i16, rd_u32, rd_i32, rd_u64, rd_i64, rd_f32, rd_f64,
+    rd_bool, rd_varint, rd_varlong, rd_string, rd_identifier, rd_uuid, rd_position,
+    rd_angle, rd_bitset, rd_array_count, rd_optional, rd_rest, rd_bytes, rd_byte_array,
+    rd_nbt, rd_slot, rd_fail,
+    writer_new, writer_free, writer_clear, wr_ok, wr_err, wr_len, wr_ptr, wr_fail,
+    wr_u8, wr_i8, wr_u16, wr_i16, wr_u32, wr_i32, wr_u64, wr_i64, wr_f32, wr_f64,
+    wr_bool, wr_varint, wr_varlong, wr_string, wr_identifier, wr_uuid, wr_position,
+    wr_angle, wr_bitset, wr_array_count, wr_optional, wr_raw, wr_byte_array,
+    wr_nbt, wr_slot,
+    angle_to_degrees, degrees_to_angle, bitset_get, bitset_set, bitset_words,
+    utf8_check, identifier_valid,
+    PE_OK, PE_UNDERFLOW, PE_TOO_LONG, PE_BAD_UTF8, PE_BAD_VALUE, PE_VARINT,
+    PE_NEGATIVE, PE_OOM, PE_BAD_IDENT, PE_BAD_NBT,
+    STRING_MAX, IDENT_MAX, ARRAY_MAX_DEFAULT, VER_1_20_1, VER_1_20_2,
+}
+
+const PE_OK: u32 = 0
+const PE_UNDERFLOW: u32 = 1 // fewer octets left than the read needs
+const PE_TOO_LONG: u32 = 2 // string / array / bitset over its maximum
+const PE_BAD_UTF8: u32 = 3 // string is not strict UTF-8
+const PE_BAD_VALUE: u32 = 4 // bool other than 0/1, position out of range, ...
+const PE_VARINT: u32 = 5 // VarInt longer than 5 / VarLong longer than 10 octets
+const PE_NEGATIVE: u32 = 6 // negative length / count
+const PE_OOM: u32 = 7 // the writer could not grow
+const PE_BAD_IDENT: u32 = 8 // not a valid 'namespace:path'
+const PE_BAD_NBT: u32 = 9 // malformed / too deep NBT
+
+const STRING_MAX: usize = 32767
+const IDENT_MAX: usize = 32767
+const ARRAY_MAX_DEFAULT: usize = 1048576
+const VER_1_20_1: i32 = 763
+const VER_1_20_2: i32 = 764
+
+struct Reader {
+    b: bytes.Bytes, // non owning view: data/len set by reader_init, never freed
+    err: u32,
+}
+
+struct Writer {
+    b: bytes.Bytes, // owning
+    err: u32,
+}
+
+// A 1.20.1 slot. `nbt` / `nbt_len`: raw NBT octets of the item tag (a span into
+// the packet), nbt_len 0 = no tag.
+struct Slot {
+    present: bool,
+    item_id: i32,
+    count: i8,
+    nbt: u64,
+    nbt_len: usize,
+}
+
+// ============================================================ Reader
+
+fn reader_init(r: *mut Reader, p: u64, n: usize) {
+    (*r).b = bytes.bytes_new()
+    (*r).b.data = p
+    (*r).b.cap = n
+    (*r).b.len = n
+    (*r).b.pos = 0
+    (*r).err = 0
+}
+
+// A view over the written part of a Bytes buffer (the buffer stays the owner).
+fn reader_from_bytes(r: *mut Reader, src: *mut bytes.Bytes) {
+    reader_init(r, bytes.bytes_data(src), bytes.bytes_len(src))
+}
+
+fn rd_ok(r: *mut Reader) -> bool { return (*r).err == 0 }
+fn rd_err(r: *mut Reader) -> u32 { return (*r).err }
+fn rd_remaining(r: *mut Reader) -> usize { return bytes.bytes_remaining(&(*r).b) }
+fn rd_pos(r: *mut Reader) -> usize { return (*r).b.pos }
+
+fn rd_fail(r: *mut Reader, code: u32) {
+    if (*r).err == 0 {
+        (*r).err = code
+    }
+}
+
+fn rd_seek(r: *mut Reader, p: usize) {
+    if (*r).err == 0 {
+        bytes.bytes_set_pos(&(*r).b, p)
+    }
+}
+
+// True when `n` octets are left; otherwise sets the sticky Underflow.
+fn need(r: *mut Reader, n: usize) -> bool {
+    if (*r).err != 0 {
+        return false
+    }
+    if bytes.bytes_remaining(&(*r).b) < n {
+        (*r).err = PE_UNDERFLOW
+        return false
+    }
+    return true
+}
+
+fn rd_skip(r: *mut Reader, n: usize) {
+    if need(r, n) {
+        (*r).b.pos = (*r).b.pos + n
+    }
+}
+
+fn rd_u8(r: *mut Reader) -> u8 {
+    if !need(r, 1) { return 0 as u8 }
+    return bytes.get_u8(&(*r).b) catch 0 as u8
+}
+fn rd_i8(r: *mut Reader) -> i8 {
+    if !need(r, 1) { return 0 as i8 }
+    return bytes.get_i8(&(*r).b) catch 0 as i8
+}
+fn rd_u16(r: *mut Reader) -> u16 {
+    if !need(r, 2) { return 0 as u16 }
+    return bytes.get_u16(&(*r).b) catch 0 as u16
+}
+fn rd_i16(r: *mut Reader) -> i16 {
+    if !need(r, 2) { return 0 as i16 }
+    return bytes.get_i16(&(*r).b) catch 0 as i16
+}
+fn rd_u32(r: *mut Reader) -> u32 {
+    if !need(r, 4) { return 0 as u32 }
+    return bytes.get_u32(&(*r).b) catch 0 as u32
+}
+fn rd_i32(r: *mut Reader) -> i32 {
+    if !need(r, 4) { return 0 }
+    return bytes.get_i32(&(*r).b) catch 0
+}
+fn rd_u64(r: *mut Reader) -> u64 {
+    if !need(r, 8) { return 0 as u64 }
+    return bytes.get_u64(&(*r).b) catch 0 as u64
+}
+fn rd_i64(r: *mut Reader) -> i64 {
+    if !need(r, 8) { return 0 as i64 }
+    return bytes.get_i64(&(*r).b) catch 0 as i64
+}
+fn rd_f32(r: *mut Reader) -> f32 {
+    if !need(r, 4) { return 0.0f }
+    return bytes.get_f32(&(*r).b) catch 0.0f
+}
+fn rd_f64(r: *mut Reader) -> f64 {
+    if !need(r, 8) { return 0.0 }
+    return bytes.get_f64(&(*r).b) catch 0.0
+}
+
+// Strict: only 0 and 1 are a boolean.
+fn rd_bool(r: *mut Reader) -> bool {
+    let v: u8 = rd_u8(r)
+    if (*r).err != 0 { return false }
+    if v > 1 as u8 {
+        (*r).err = PE_BAD_VALUE
+        return false
+    }
+    return v == 1 as u8
+}
+
+// VarInt: at most 5 octets. Like the vanilla reader, bits beyond 32 in the fifth
+// octet are dropped and non minimal encodings are accepted.
+fn rd_varint(r: *mut Reader) -> i32 {
+    if (*r).err != 0 { return 0 }
+    var result: u32 = 0
+    var shift: u32 = 0
+    var n: usize = 0
+    while n < 5 {
+        if bytes.bytes_remaining(&(*r).b) < 1 {
+            (*r).err = PE_UNDERFLOW
+            return 0
+        }
+        let by: u8 = bytes.get_u8(&(*r).b) catch 0 as u8
+        var part: u32 = (by & 127 as u8) as u32
+        if shift == 28 as u32 {
+            part = part & 15 as u32
+        }
+        result = result | (part << shift)
+        n = n + 1
+        if (by & 128 as u8) == 0 as u8 {
+            return bytes.bits_i32(result)
+        }
+        shift = shift + 7 as u32
+    }
+    (*r).err = PE_VARINT
+    return 0
+}
+
+fn rd_varlong(r: *mut Reader) -> i64 {
+    if (*r).err != 0 { return 0 as i64 }
+    var result: u64 = 0
+    var shift: u64 = 0
+    var n: usize = 0
+    while n < 10 {
+        if bytes.bytes_remaining(&(*r).b) < 1 {
+            (*r).err = PE_UNDERFLOW
+            return 0 as i64
+        }
+        let by: u8 = bytes.get_u8(&(*r).b) catch 0 as u8
+        var part: u64 = (by & 127 as u8) as u64
+        if shift == 63 as u64 {
+            part = part & 1 as u64
+        }
+        result = result | (part << shift)
+        n = n + 1
+        if (by & 128 as u8) == 0 as u8 {
+            return bytes.bits_i64(result)
+        }
+        shift = shift + 7 as u64
+    }
+    (*r).err = PE_VARINT
+    return 0 as i64
+}
+
+// ---- UTF-8 ------------------------------------------------------------------
+
+// Strict UTF-8 (no overlong forms, no surrogates, nothing above U+10FFFF).
+// `*units` gets the length in UTF-16 code units, which is what the protocol's
+// "max length" of a string counts. Returns false on invalid input.
+fn utf8_check(p: u64, n: usize, units: *mut usize) -> bool {
+    var i: usize = 0
+    var u: usize = 0
+    while i < n {
+        let c: u32 = rt.ld8(p, i) as u32
+        if c < 128 as u32 {
+            i = i + 1
+            u = u + 1
+        } else if c >= 194 as u32 && c <= 223 as u32 {
+            if i + 1 >= n { return false }
+            if (rt.ld8(p, i + 1) as u32 & 192 as u32) != 128 as u32 { return false }
+            i = i + 2
+            u = u + 1
+        } else if c >= 224 as u32 && c <= 239 as u32 {
+            if i + 2 >= n { return false }
+            let c1: u32 = rt.ld8(p, i + 1) as u32
+            let c2: u32 = rt.ld8(p, i + 2) as u32
+            if (c1 & 192 as u32) != 128 as u32 || (c2 & 192 as u32) != 128 as u32 { return false }
+            if c == 224 as u32 && c1 < 160 as u32 { return false } // overlong
+            if c == 237 as u32 && c1 >= 160 as u32 { return false } // surrogates
+            i = i + 3
+            u = u + 1
+        } else if c >= 240 as u32 && c <= 244 as u32 {
+            if i + 3 >= n { return false }
+            let c1: u32 = rt.ld8(p, i + 1) as u32
+            let c2: u32 = rt.ld8(p, i + 2) as u32
+            let c3: u32 = rt.ld8(p, i + 3) as u32
+            if (c1 & 192 as u32) != 128 as u32 || (c2 & 192 as u32) != 128 as u32 || (c3 & 192 as u32) != 128 as u32 {
+                return false
+            }
+            if c == 240 as u32 && c1 < 144 as u32 { return false } // overlong
+            if c == 244 as u32 && c1 >= 144 as u32 { return false } // > U+10FFFF
+            i = i + 4
+            u = u + 2
+        } else {
+            return false
+        }
+    }
+    *units = u
+    return true
+}
+
+// String: VarInt octet length, then UTF-8. `max_chars` is the protocol maximum
+// in UTF-16 units (32767 for most); the octet length may be at most 3 * max_chars
+// (checked BEFORE the octets are touched). Returns a span INTO the packet.
+fn rd_string(r: *mut Reader, max_chars: usize, out_n: *mut usize) -> u64 {
+    *out_n = 0
+    let n: i32 = rd_varint(r)
+    if (*r).err != 0 { return 0 }
+    if n < 0 {
+        (*r).err = PE_NEGATIVE
+        return 0
+    }
+    let len: usize = n as usize
+    if len > max_chars * 3 {
+        (*r).err = PE_TOO_LONG
+        return 0
+    }
+    if !need(r, len) { return 0 }
+    let p: u64 = bytes.bytes_data(&(*r).b) + (*r).b.pos as u64
+    var units: usize = 0
+    if !utf8_check(p, len, &units) {
+        (*r).err = PE_BAD_UTF8
+        return 0
+    }
+    if units > max_chars {
+        (*r).err = PE_TOO_LONG
+        return 0
+    }
+    (*r).b.pos = (*r).b.pos + len
+    *out_n = len
+    return p
+}
+
+fn ident_char(c: u8, in_path: bool) -> bool {
+    if c >= 97 as u8 && c <= 122 as u8 { return true } // a-z
+    if c >= 48 as u8 && c <= 57 as u8 { return true } // 0-9
+    if c == 95 as u8 || c == 45 as u8 || c == 46 as u8 { return true } // _ - .
+    if in_path && c == 47 as u8 { return true } // /
+    return false
+}
+
+// 'namespace:path' or 'path' (namespace implied). Namespace: [a-z0-9_.-],
+// path: [a-z0-9_./-], at most one ':'. An empty namespace or path is accepted
+// (the vanilla character check does the same).
+fn identifier_valid(p: u64, n: usize) -> bool {
+    if n > IDENT_MAX { return false }
+    var colon: usize = n
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) == 58 as u8 {
+            if colon != n { return false }
+            colon = i
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        if i != colon {
+            if !ident_char(rt.ld8(p, i), i > colon) { return false }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn rd_identifier(r: *mut Reader, out_n: *mut usize) -> u64 {
+    let p: u64 = rd_string(r, IDENT_MAX, out_n)
+    if (*r).err != 0 { return 0 }
+    if !identifier_valid(p, *out_n) {
+        (*r).err = PE_BAD_IDENT
+        *out_n = 0
+        return 0
+    }
+    return p
+}
+
+fn rd_uuid(r: *mut Reader, hi: *mut u64, lo: *mut u64) {
+    *hi = 0 as u64
+    *lo = 0 as u64
+    if !need(r, 16) { return }
+    *hi = bytes.get_u64(&(*r).b) catch 0 as u64
+    *lo = bytes.get_u64(&(*r).b) catch 0 as u64
+}
+
+// Position: x 26 bits, z 26 bits, y 12 bits (signed each).
+fn rd_position(r: *mut Reader, x: *mut i32, y: *mut i32, z: *mut i32) {
+    *x = 0
+    *y = 0
+    *z = 0
+    if !need(r, 8) { return }
+    bytes.get_position(&(*r).b, x, y, z) catch false
+}
+
+// Angle: one octet, 1/256 of a full turn.
+fn rd_angle(r: *mut Reader) -> u8 { return rd_u8(r) }
+
+fn angle_to_degrees(a: u8) -> f32 {
+    return (a as f32) * 360.0f / 256.0f
+}
+
+fn degrees_to_angle(d: f32) -> u8 {
+    // wraps into [0, 360), then scales
+    var v: f32 = d
+    while v < 0.0f { v = v + 360.0f }
+    while v >= 360.0f { v = v - 360.0f }
+    var a: i32 = (v * 256.0f / 360.0f) as i32
+    if a < 0 { a = 0 }
+    if a > 255 { a = 255 }
+    return a as u8
+}
+
+// Bitset: VarInt number of longs, then the longs. They are decoded into `dst`
+// (machine order, room for `cap_longs`). Returns the number of longs.
+fn rd_bitset(r: *mut Reader, dst: u64, cap_longs: usize) -> usize {
+    let n: i32 = rd_varint(r)
+    if (*r).err != 0 { return 0 }
+    if n < 0 {
+        (*r).err = PE_NEGATIVE
+        return 0
+    }
+    let cnt: usize = n as usize
+    if cnt > bytes.bytes_remaining(&(*r).b) / 8 {
+        (*r).err = PE_UNDERFLOW
+        return 0
+    }
+    if cnt > cap_longs {
+        (*r).err = PE_TOO_LONG
+        return 0
+    }
+    var i: usize = 0
+    while i < cnt {
+        rt.st64(dst, i, bytes.get_u64(&(*r).b) catch 0 as u64)
+        i = i + 1
+    }
+    return cnt
+}
+
+fn bitset_words(nbits: usize) -> usize { return (nbits + 63) / 64 }
+
+fn bitset_get(words: u64, nwords: usize, bit: usize) -> bool {
+    let w: usize = bit / 64
+    if w >= nwords { return false }
+    return ((rt.ld64(words, w) >> ((bit % 64) as u64)) & 1 as u64) == 1 as u64
+}
+
+fn bitset_set(words: u64, nwords: usize, bit: usize, v: bool) {
+    let w: usize = bit / 64
+    if w >= nwords { return }
+    let m: u64 = (1 as u64) << ((bit % 64) as u64)
+    let cur: u64 = rt.ld64(words, w)
+    if v {
+        rt.st64(words, w, cur | m)
+    } else {
+        rt.st64(words, w, cur & (m ^ 18446744073709551615 as u64))
+    }
+}
+
+// Array count with VarInt prefix. `min_elem` is the smallest possible encoded
+// size of ONE element (>= 1): count * min_elem is checked against the octets that
+// are left, so a forged count never leads to a big loop or allocation.
+// `max` is the caller's hard cap (use ARRAY_MAX_DEFAULT when unsure).
+fn rd_array_count(r: *mut Reader, min_elem: usize, max: usize) -> usize {
+    let n: i32 = rd_varint(r)
+    if (*r).err != 0 { return 0 }
+    if n < 0 {
+        (*r).err = PE_NEGATIVE
+        return 0
+    }
+    let cnt: usize = n as usize
+    var me: usize = min_elem
+    if me < 1 { me = 1 }
+    if cnt > max {
+        (*r).err = PE_TOO_LONG
+        return 0
+    }
+    if cnt > bytes.bytes_remaining(&(*r).b) / me {
+        (*r).err = PE_UNDERFLOW
+        return 0
+    }
+    return cnt
+}
+
+// Optional<T>: a boolean prefix; the caller reads T when this returns true.
+fn rd_optional(r: *mut Reader) -> bool { return rd_bool(r) }
+
+// All remaining octets as a span (the "rest buffer", e.g. plugin message data).
+fn rd_rest(r: *mut Reader, out_n: *mut usize) -> u64 {
+    *out_n = 0
+    if (*r).err != 0 { return 0 }
+    let n: usize = bytes.bytes_remaining(&(*r).b)
+    let p: u64 = bytes.bytes_data(&(*r).b) + (*r).b.pos as u64
+    (*r).b.pos = (*r).b.len
+    *out_n = n
+    return p
+}
+
+fn rd_bytes(r: *mut Reader, n: usize) -> u64 {
+    if !need(r, n) { return 0 }
+    let p: u64 = bytes.bytes_data(&(*r).b) + (*r).b.pos as u64
+    (*r).b.pos = (*r).b.pos + n
+    return p
+}
+
+// Byte array with VarInt length, capped at `max`.
+fn rd_byte_array(r: *mut Reader, max: usize, out_n: *mut usize) -> u64 {
+    *out_n = 0
+    let n: usize = rd_array_count(r, 1, max)
+    if (*r).err != 0 { return 0 }
+    let p: u64 = rd_bytes(r, n)
+    if (*r).err != 0 { return 0 }
+    *out_n = n
+    return p
+}
+
+// ---- NBT glue -----------------------------------------------------------------
+
+// One NBT value: validated structurally (std.nbt pull skipper, depth limit 256)
+// and handed out as a raw span. `anon` = false: named root (1.20.1 / files:
+// root must be a compound); `anon` = true: nameless root (1.20.2+ network form,
+// any tag type). A lone TAG_End (0x00) is "no NBT" and gives a 1 octet span.
+fn rd_nbt(r: *mut Reader, anon: bool, out_n: *mut usize) -> u64 {
+    *out_n = 0
+    if (*r).err != 0 { return 0 }
+    let start: usize = (*r).b.pos
+    let t: u8 = nbt.nbt_read_type(&(*r).b) catch 255 as u8
+    if t == 255 as u8 {
+        if start >= (*r).b.len { (*r).err = PE_UNDERFLOW } else { (*r).err = PE_BAD_NBT }
+        return 0
+    }
+    if t != nbt.TAG_END {
+        if !anon && t != nbt.TAG_COMPOUND {
+            (*r).err = PE_BAD_NBT
+            return 0
+        }
+        if !anon {
+            var nl: usize = 0
+            nbt.nbt_read_name(&(*r).b, &nl) catch 0 as u64
+            if bytes.bytes_remaining(&(*r).b) == 0 && (*r).b.pos < start + 3 {
+                (*r).err = PE_UNDERFLOW
+                return 0
+            }
+        }
+        let ok: bool = nbt.nbt_skip_payload(&(*r).b, t) catch false
+        if !ok {
+            (*r).err = PE_BAD_NBT
+            return 0
+        }
+    }
+    *out_n = (*r).b.pos - start
+    return bytes.bytes_data(&(*r).b) + start as u64
+}
+
+// ---- Slot (version hook) --------------------------------------------------------
+//
+// 1.20.1 / 1.20.2: present bool, itemId VarInt, count i8, optional NBT (named root
+// in 763, nameless in 764/765). >= 1.20.5 uses data components: not supported
+// (BadValue).
+fn rd_slot(r: *mut Reader, ver: i32, s: *mut Slot) {
+    (*s).present = false
+    (*s).item_id = 0
+    (*s).count = 0 as i8
+    (*s).nbt = 0
+    (*s).nbt_len = 0
+    if ver < 763 || ver > 765 {
+        rd_fail(r, PE_BAD_VALUE)
+        return
+    }
+    let present: bool = rd_bool(r)
+    if (*r).err != 0 || !present { return }
+    (*s).item_id = rd_varint(r)
+    (*s).count = rd_i8(r)
+    var n: usize = 0
+    let p: u64 = rd_nbt(r, ver >= 764, &n)
+    if (*r).err != 0 { return }
+    (*s).present = true
+    if n > 1 {
+        (*s).nbt = p
+        (*s).nbt_len = n
+    }
+}
+
+// ============================================================ Writer
+
+fn writer_new() -> Writer {
+    return Writer { b: bytes.bytes_new(), err: 0 }
+}
+
+fn writer_free(w: *mut Writer) {
+    bytes.bytes_free(&(*w).b)
+    (*w).err = 0
+}
+
+fn writer_clear(w: *mut Writer) {
+    bytes.bytes_clear(&(*w).b)
+    (*w).err = 0
+}
+
+fn wr_fail(w: *mut Writer, code: u32) {
+    if (*w).err == 0 {
+        (*w).err = code
+    }
+}
+
+// Also folds in an allocator failure of the underlying buffer.
+fn wr_ok(w: *mut Writer) -> bool {
+    if (*w).err == 0 && !bytes.bytes_ok(&(*w).b) {
+        (*w).err = PE_OOM
+    }
+    return (*w).err == 0
+}
+fn wr_err(w: *mut Writer) -> u32 {
+    wr_ok(w)
+    return (*w).err
+}
+fn wr_len(w: *mut Writer) -> usize { return bytes.bytes_len(&(*w).b) }
+fn wr_ptr(w: *mut Writer) -> u64 { return bytes.bytes_data(&(*w).b) }
+
+fn wr_u8(w: *mut Writer, v: u8) { if (*w).err == 0 { bytes.put_u8(&(*w).b, v) } }
+fn wr_i8(w: *mut Writer, v: i8) { if (*w).err == 0 { bytes.put_i8(&(*w).b, v) } }
+fn wr_u16(w: *mut Writer, v: u16) { if (*w).err == 0 { bytes.put_u16(&(*w).b, v) } }
+fn wr_i16(w: *mut Writer, v: i16) { if (*w).err == 0 { bytes.put_i16(&(*w).b, v) } }
+fn wr_u32(w: *mut Writer, v: u32) { if (*w).err == 0 { bytes.put_u32(&(*w).b, v) } }
+fn wr_i32(w: *mut Writer, v: i32) { if (*w).err == 0 { bytes.put_i32(&(*w).b, v) } }
+fn wr_u64(w: *mut Writer, v: u64) { if (*w).err == 0 { bytes.put_u64(&(*w).b, v) } }
+fn wr_i64(w: *mut Writer, v: i64) { if (*w).err == 0 { bytes.put_i64(&(*w).b, v) } }
+fn wr_f32(w: *mut Writer, v: f32) { if (*w).err == 0 { bytes.put_f32(&(*w).b, v) } }
+fn wr_f64(w: *mut Writer, v: f64) { if (*w).err == 0 { bytes.put_f64(&(*w).b, v) } }
+fn wr_bool(w: *mut Writer, v: bool) { if (*w).err == 0 { bytes.put_bool(&(*w).b, v) } }
+fn wr_varint(w: *mut Writer, v: i32) { if (*w).err == 0 { bytes.put_varint(&(*w).b, v) } }
+fn wr_varlong(w: *mut Writer, v: i64) { if (*w).err == 0 { bytes.put_varlong(&(*w).b, v) } }
+
+// A null pointer with n > 0 (typically the result of a failed read) is refused
+// instead of dereferenced.
+fn wr_raw(w: *mut Writer, p: u64, n: usize) {
+    if (*w).err != 0 { return }
+    if p == 0 && n > 0 {
+        (*w).err = PE_BAD_VALUE
+        return
+    }
+    bytes.put_raw(&(*w).b, p, n)
+}
+
+// String with the same limits as the reader: UTF-8 must be strict and at most
+// `max_chars` UTF-16 units / 3 * max_chars octets, otherwise TooLong / BadUtf8
+// and NOTHING is written.
+fn wr_string(w: *mut Writer, p: u64, n: usize, max_chars: usize) {
+    if (*w).err != 0 { return }
+    if p == 0 && n > 0 {
+        (*w).err = PE_BAD_VALUE
+        return
+    }
+    if n > max_chars * 3 {
+        (*w).err = PE_TOO_LONG
+        return
+    }
+    var units: usize = 0
+    if !utf8_check(p, n, &units) {
+        (*w).err = PE_BAD_UTF8
+        return
+    }
+    if units > max_chars {
+        (*w).err = PE_TOO_LONG
+        return
+    }
+    bytes.put_varint(&(*w).b, n as i32)
+    bytes.put_raw(&(*w).b, p, n)
+}
+
+fn wr_identifier(w: *mut Writer, p: u64, n: usize) {
+    if (*w).err != 0 { return }
+    if !identifier_valid(p, n) {
+        (*w).err = PE_BAD_IDENT
+        return
+    }
+    wr_string(w, p, n, IDENT_MAX)
+}
+
+fn wr_uuid(w: *mut Writer, hi: u64, lo: u64) {
+    if (*w).err == 0 { bytes.put_uuid(&(*w).b, hi, lo) }
+}
+
+// x, z in [-2^25, 2^25), y in [-2^11, 2^11); out of range -> BadValue.
+fn wr_position(w: *mut Writer, x: i32, y: i32, z: i32) {
+    if (*w).err != 0 { return }
+    if x < -33554432 || x > 33554431 || z < -33554432 || z > 33554431 || y < -2048 || y > 2047 {
+        (*w).err = PE_BAD_VALUE
+        return
+    }
+    bytes.put_position(&(*w).b, x, y, z)
+}
+
+fn wr_angle(w: *mut Writer, a: u8) { wr_u8(w, a) }
+
+fn wr_bitset(w: *mut Writer, words: u64, nwords: usize) {
+    if (*w).err != 0 { return }
+    if nwords > 2147483647 {
+        (*w).err = PE_TOO_LONG
+        return
+    }
+    if words == 0 && nwords > 0 {
+        (*w).err = PE_BAD_VALUE
+        return
+    }
+    bytes.put_varint(&(*w).b, nwords as i32)
+    var i: usize = 0
+    while i < nwords {
+        bytes.put_u64(&(*w).b, rt.ld64(words, i))
+        i = i + 1
+    }
+}
+
+fn wr_array_count(w: *mut Writer, n: usize) {
+    if (*w).err != 0 { return }
+    if n > 2147483647 {
+        (*w).err = PE_TOO_LONG
+        return
+    }
+    bytes.put_varint(&(*w).b, n as i32)
+}
+
+// Optional<T>: writes the presence flag; the caller writes T when `present`.
+fn wr_optional(w: *mut Writer, present: bool) { wr_bool(w, present) }
+
+fn wr_byte_array(w: *mut Writer, p: u64, n: usize) {
+    if p == 0 && n > 0 {
+        wr_fail(w, PE_BAD_VALUE)
+        return
+    }
+    wr_array_count(w, n)
+    wr_raw(w, p, n)
+}
+
+// Raw NBT octets (as handed out by rd_nbt). Re validated, so a Writer never
+// emits a malformed tag. `n` 0 writes a lone TAG_End.
+fn wr_nbt(w: *mut Writer, anon: bool, p: u64, n: usize) {
+    if (*w).err != 0 { return }
+    if n == 0 {
+        bytes.put_u8(&(*w).b, 0 as u8)
+        return
+    }
+    if p == 0 {
+        (*w).err = PE_BAD_VALUE
+        return
+    }
+    var v: Reader = Reader { b: bytes.bytes_new(), err: 0 }
+    reader_init(&v, p, n)
+    var got: usize = 0
+    rd_nbt(&v, anon, &got)
+    if v.err != 0 || got != n {
+        (*w).err = PE_BAD_NBT
+        return
+    }
+    bytes.put_raw(&(*w).b, p, n)
+}
+
+fn wr_slot(w: *mut Writer, ver: i32, s: *mut Slot) {
+    if (*w).err != 0 { return }
+    if ver < 763 || ver > 765 {
+        (*w).err = PE_BAD_VALUE
+        return
+    }
+    wr_bool(w, (*s).present)
+    if !(*s).present { return }
+    wr_varint(w, (*s).item_id)
+    wr_i8(w, (*s).count)
+    wr_nbt(w, ver >= 764, (*s).nbt, (*s).nbt_len)
+}
