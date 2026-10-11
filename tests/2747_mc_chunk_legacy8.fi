@@ -1,0 +1,359 @@
+// expect_exit: 0
+// tests/2747_mc_chunk_legacy8.fi -- mc_chunk CF_LEGACY_8 (1.8 - 1.8.9) with HAND BUILT packets.
+// map_chunk: sections 0 and 2 present (u16 LE blocks, block light, sky light, biomes), checked
+// value by value; no-sky dimension; wrong sky assumption and every truncation must fail (never
+// crash); unload form; map_chunk_bulk with two columns (one with sections, one biomes only).
+import std.bytes
+import std.rt
+import mc.mc_chunk
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+// block value of section `sec` at index `i` (stone-ish pattern with meta; 0 = air sometimes)
+fn val(sec: usize, i: usize) -> u16 {
+    if sec == 0 {
+        if i % 7 == 0 {
+            return 0 as u16
+        }
+        return ((((i * 5) % 1500) + 1) * 16 + (i % 16)) as u16
+    }
+    if sec == 2 {
+        return 16 as u16 // id 1, meta 0 everywhere
+    }
+    return (((i / 256) % 200) as u16) * 16 as u16 + 3 as u16 // column-like pattern, never 0
+}
+
+fn lb(k: usize, i: usize) -> u8 {
+    return ((i * 3 + k * 17) % 251) as u8
+}
+fn sb(k: usize, i: usize) -> u8 {
+    return ((i * 7 + k * 29 + 5) % 253) as u8
+}
+fn bio(i: usize) -> u8 {
+    return ((i * 11) % 90) as u8
+}
+
+fn fnv(h: u64, by: u8) -> u64 {
+    return (h ^ (by as u64)) *% 1099511628211 as u64
+}
+
+// Builds the chunk data octets into `d` (not length prefixed)
+fn build_data(d: *mut bytes.Bytes, mask: i32, sky: bool, ground_up: bool, h: *mut u64) {
+    var k: usize = 0
+    var i: usize = 0
+    var s: usize = 0
+    while s < 16 {
+        if ((mask >> (s as u32)) & 1) != 0 {
+            i = 0
+            while i < 4096 {
+                let v: u16 = val(s, i)
+                bytes.put_u8(d, (v & 255 as u16) as u8)
+                bytes.put_u8(d, (v >> 8) as u8)
+                i = i + 1
+            }
+        }
+        s = s + 1
+    }
+    s = 0
+    k = 0
+    while s < 16 {
+        if ((mask >> (s as u32)) & 1) != 0 {
+            i = 0
+            while i < 2048 {
+                bytes.put_u8(d, lb(s, i))
+                *h = fnv(*h, lb(s, i))
+                i = i + 1
+            }
+        }
+        s = s + 1
+    }
+    if sky {
+        s = 0
+        while s < 16 {
+            if ((mask >> (s as u32)) & 1) != 0 {
+                i = 0
+                while i < 2048 {
+                    bytes.put_u8(d, sb(s, i))
+                    *h = fnv(*h, sb(s, i))
+                    i = i + 1
+                }
+            }
+            s = s + 1
+        }
+    }
+    if ground_up {
+        i = 0
+        while i < 256 {
+            bytes.put_u8(d, bio(i))
+            i = i + 1
+        }
+    }
+}
+
+fn build_chunk(b: *mut bytes.Bytes, x: i32, z: i32, mask: i32, sky: bool, ground_up: bool, h: *mut u64) {
+    var d: bytes.Bytes = bytes.bytes_new()
+    build_data(&d, mask, sky, ground_up, h)
+    bytes.put_i32(b, x)
+    bytes.put_i32(b, z)
+    bytes.put_bool(b, ground_up)
+    bytes.put_u16(b, mask as u16)
+    bytes.put_varint(b, d.len as i32)
+    bytes.put_bytes(b, &d)
+    bytes.bytes_free(&d)
+}
+
+// every value of the decoded column against the generator
+fn verify(c: *mut mc_chunk.Chunk, mask: i32, sky: bool, ground_up: bool, h: u64) {
+    check((*c).nsec == 16, 20)
+    check((*c).nbe == 0, 21)
+    var nset: i32 = 0
+    var s: usize = 0
+    while s < 16 {
+        let sec: *mut mc_chunk.Section = mc_chunk.chunk_section(c, s)
+        var nonair: i32 = 0
+        var i: usize = 0
+        let present: bool = ((mask >> (s as u32)) & 1) != 0
+        while i < 4096 {
+            var want: u16 = 0 as u16
+            if present {
+                want = val(s, i)
+            }
+            check(mc_chunk.container_get(&(*sec).blocks, i) == want, 22)
+            if want != 0 as u16 {
+                nonair = nonair + 1
+            }
+            i = i + 1
+        }
+        check((*sec).count == nonair, 23)
+        if present {
+            nset = nset + 1
+        }
+        s = s + 1
+    }
+    check((*c).block_n == nset, 24)
+    if sky {
+        check((*c).sky_n == nset, 25)
+    } else {
+        check((*c).sky_n == 0, 26)
+    }
+    check((*c).light_hash == h, 27)
+    if ground_up {
+        check((*c).bio != 0, 28)
+        var q: usize = 0
+        while q < 256 {
+            check(rt.ld8((*c).bio, q) == bio(q), 29)
+            q = q + 1
+        }
+        check((*c).ground_up == 1, 30)
+    } else {
+        check((*c).bio == 0, 31)
+        check((*c).ground_up == 0, 32)
+    }
+}
+
+// decodes `b` (reset to the start, cut to `n` octets); true when the decoder accepted it
+fn try_decode(b: *mut bytes.Bytes, n: usize, sc: *mut mc_chunk.Scratch) -> bool {
+    var v: bytes.Bytes = bytes.Bytes { data: (*b).data, cap: n, len: n, pos: 0, bad: false }
+    let p: u64 = mc_chunk.chunk_alloc()
+    check(p != 0, 40)
+    let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+    let ok: bool = mc_chunk.chunk_decode_legacy8(&v, sc, c) catch false
+    mc_chunk.chunk_release(p)
+    return ok
+}
+
+fn test_single() {
+    var sc: mc_chunk.Scratch = mc_chunk.scratch_new()
+    // 1. overworld column: sections 0 and 2, sky light, biomes
+    {
+        var h: u64 = 14695981039346656037 as u64
+        var b: bytes.Bytes = bytes.bytes_new()
+        build_chunk(&b, 0 - 3, 5, 5, true, true, &h)
+        mc_chunk.scratch_set_sky(&sc, true)
+        var v: bytes.Bytes = bytes.Bytes { data: b.data, cap: b.len, len: b.len, pos: 0, bad: false }
+        let p: u64 = mc_chunk.chunk_alloc()
+        let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+        let ok: bool = mc_chunk.chunk_decode_legacy8(&v, &sc, c) catch false
+        check(ok, 1)
+        check((*c).x == 0 - 3 && (*c).z == 5, 2)
+        check(!mc_chunk.chunk_is_unload_legacy8(c), 3)
+        verify(c, 5, true, true, h)
+        mc_chunk.chunk_release(p)
+        // via the strategy dispatcher's twin: the same bytes with the wrong sky assumption fail
+        mc_chunk.scratch_set_sky(&sc, false)
+        check(!try_decode(&b, b.len, &sc), 4)
+        // truncations: a sample of prefixes (all must fail, none may crash)
+        mc_chunk.scratch_set_sky(&sc, true)
+        var cut: usize = 0
+        while cut < b.len {
+            check(!try_decode(&b, cut, &sc), 5)
+            cut = cut + 997
+        }
+        check(!try_decode(&b, b.len - 1, &sc), 6)
+        check(try_decode(&b, b.len, &sc), 7)
+        bytes.bytes_free(&b)
+    }
+    // 2. nether style: no sky light, column with section 15 and 1
+    {
+        var h: u64 = 14695981039346656037 as u64
+        var b: bytes.Bytes = bytes.bytes_new()
+        build_chunk(&b, 7, 0 - 9, 32770, false, true, &h)
+        mc_chunk.scratch_set_sky(&sc, false)
+        var v: bytes.Bytes = bytes.Bytes { data: b.data, cap: b.len, len: b.len, pos: 0, bad: false }
+        let p: u64 = mc_chunk.chunk_alloc()
+        let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+        check(mc_chunk.chunk_decode_legacy8(&v, &sc, c) catch false, 8)
+        verify(c, 32770, false, true, h)
+        mc_chunk.chunk_release(p)
+        mc_chunk.scratch_set_sky(&sc, true)
+        check(!try_decode(&b, b.len, &sc), 9)
+        bytes.bytes_free(&b)
+    }
+    // 3. section update (groundUp = false): no biomes, ground_up flag 0
+    {
+        var h: u64 = 14695981039346656037 as u64
+        var b: bytes.Bytes = bytes.bytes_new()
+        build_chunk(&b, 1, 1, 4, true, false, &h)
+        mc_chunk.scratch_set_sky(&sc, true)
+        var v: bytes.Bytes = bytes.Bytes { data: b.data, cap: b.len, len: b.len, pos: 0, bad: false }
+        let p: u64 = mc_chunk.chunk_alloc()
+        let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+        check(mc_chunk.chunk_decode_legacy8(&v, &sc, c) catch false, 10)
+        verify(c, 4, true, false, h)
+        mc_chunk.chunk_release(p)
+        bytes.bytes_free(&b)
+    }
+    // 4. unload: groundUp, bitMap 0, empty data
+    {
+        var b: bytes.Bytes = bytes.bytes_new()
+        bytes.put_i32(&b, 12)
+        bytes.put_i32(&b, 0 - 12)
+        bytes.put_bool(&b, true)
+        bytes.put_u16(&b, 0 as u16)
+        bytes.put_varint(&b, 0)
+        var v: bytes.Bytes = bytes.Bytes { data: b.data, cap: b.len, len: b.len, pos: 0, bad: false }
+        let p: u64 = mc_chunk.chunk_alloc()
+        let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+        check(mc_chunk.chunk_decode_legacy8(&v, &sc, c) catch false, 11)
+        check((*c).x == 12 && (*c).z == 0 - 12, 12)
+        check(mc_chunk.chunk_is_unload_legacy8(c), 13)
+        mc_chunk.chunk_release(p)
+        bytes.bytes_free(&b)
+    }
+    // 5. empty overworld column that DOES carry biomes (mask 0) is a column, not an unload
+    {
+        var h: u64 = 14695981039346656037 as u64
+        var b: bytes.Bytes = bytes.bytes_new()
+        build_chunk(&b, 2, 2, 0, true, true, &h)
+        var v: bytes.Bytes = bytes.Bytes { data: b.data, cap: b.len, len: b.len, pos: 0, bad: false }
+        let p: u64 = mc_chunk.chunk_alloc()
+        let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+        check(mc_chunk.chunk_decode_legacy8(&v, &sc, c) catch false, 14)
+        check(!mc_chunk.chunk_is_unload_legacy8(c), 15)
+        verify(c, 0, true, true, h)
+        mc_chunk.chunk_release(p)
+        bytes.bytes_free(&b)
+    }
+    // 6. a block value beyond the neutral id table (>= 32768) is an error, not a crash
+    {
+        var d: bytes.Bytes = bytes.bytes_new()
+        var i: usize = 0
+        while i < 4096 {
+            bytes.put_u8(&d, 255 as u8)
+            bytes.put_u8(&d, 255 as u8)
+            i = i + 1
+        }
+        bytes.put_zero(&d, 2048)
+        var b: bytes.Bytes = bytes.bytes_new()
+        bytes.put_i32(&b, 0)
+        bytes.put_i32(&b, 0)
+        bytes.put_bool(&b, false)
+        bytes.put_u16(&b, 1 as u16)
+        bytes.put_varint(&b, d.len as i32)
+        bytes.put_bytes(&b, &d)
+        mc_chunk.scratch_set_sky(&sc, false)
+        check(!try_decode(&b, b.len, &sc), 16)
+        bytes.bytes_free(&b)
+        bytes.bytes_free(&d)
+    }
+    mc_chunk.scratch_free(&sc)
+}
+
+fn test_bulk() {
+    var sc: mc_chunk.Scratch = mc_chunk.scratch_new()
+    var b: bytes.Bytes = bytes.bytes_new()
+    var h0: u64 = 14695981039346656037 as u64
+    var h1: u64 = 14695981039346656037 as u64
+    bytes.put_bool(&b, true) // skyLightSent
+    bytes.put_varint(&b, 2)
+    bytes.put_i32(&b, 0 - 1)
+    bytes.put_i32(&b, 0 - 2)
+    bytes.put_u16(&b, 8 as u16) // section 3
+    bytes.put_i32(&b, 100)
+    bytes.put_i32(&b, 200)
+    bytes.put_u16(&b, 0 as u16) // biomes only
+    var d0: bytes.Bytes = bytes.bytes_new()
+    build_data(&d0, 8, true, true, &h0)
+    bytes.put_bytes(&b, &d0)
+    var d1: bytes.Bytes = bytes.bytes_new()
+    build_data(&d1, 0, true, true, &h1)
+    bytes.put_bytes(&b, &d1)
+    // decode
+    var v: bytes.Bytes = bytes.Bytes { data: b.data, cap: b.len, len: b.len, pos: 0, bad: false }
+    var hd: mc_chunk.Legacy8Bulk = mc_chunk.Legacy8Bulk { sky: false, n: 0, next: 0, meta: 0 }
+    check(mc_chunk.legacy8_bulk_open(&v, &hd) catch false, 50)
+    check(hd.n == 2 && hd.sky, 51)
+    let p0: u64 = mc_chunk.chunk_alloc()
+    let c0: *mut mc_chunk.Chunk = p0 as *mut mc_chunk.Chunk
+    check(mc_chunk.legacy8_bulk_next(&v, &hd, &sc, c0) catch false, 52)
+    check((*c0).x == 0 - 1 && (*c0).z == 0 - 2, 53)
+    verify(c0, 8, true, true, h0)
+    check(!mc_chunk.legacy8_bulk_complete(&v, &hd), 54)
+    let p1: u64 = mc_chunk.chunk_alloc()
+    let c1: *mut mc_chunk.Chunk = p1 as *mut mc_chunk.Chunk
+    check(mc_chunk.legacy8_bulk_next(&v, &hd, &sc, c1) catch false, 55)
+    check((*c1).x == 100 && (*c1).z == 200, 56)
+    verify(c1, 0, true, true, h1)
+    check(!mc_chunk.chunk_is_unload_legacy8(c1), 57)
+    check(mc_chunk.legacy8_bulk_complete(&v, &hd), 58)
+    let p2: u64 = mc_chunk.chunk_alloc()
+    check(!(mc_chunk.legacy8_bulk_next(&v, &hd, &sc, p2 as *mut mc_chunk.Chunk) catch false), 59)
+    mc_chunk.chunk_release(p2)
+    mc_chunk.chunk_release(p0)
+    mc_chunk.chunk_release(p1)
+    mc_chunk.legacy8_bulk_free(&hd)
+    // truncated bulks: either the header, a column or the final consumption check fails
+    var cut: usize = 0
+    while cut < b.len {
+        var t: bytes.Bytes = bytes.Bytes { data: b.data, cap: cut, len: cut, pos: 0, bad: false }
+        var th: mc_chunk.Legacy8Bulk = mc_chunk.Legacy8Bulk { sky: false, n: 0, next: 0, meta: 0 }
+        var good: bool = mc_chunk.legacy8_bulk_open(&t, &th) catch false
+        var i: usize = 0
+        while good && i < th.n {
+            let pp: u64 = mc_chunk.chunk_alloc()
+            good = mc_chunk.legacy8_bulk_next(&t, &th, &sc, pp as *mut mc_chunk.Chunk) catch false
+            mc_chunk.chunk_release(pp)
+            i = i + 1
+        }
+        if good {
+            good = mc_chunk.legacy8_bulk_complete(&t, &th)
+        }
+        mc_chunk.legacy8_bulk_free(&th)
+        check(!good, 60)
+        cut = cut + 1531
+    }
+    bytes.bytes_free(&d0)
+    bytes.bytes_free(&d1)
+    bytes.bytes_free(&b)
+    mc_chunk.scratch_free(&sc)
+}
+
+fn main() -> i32 {
+    test_single()
+    test_bulk()
+    return 0
+}

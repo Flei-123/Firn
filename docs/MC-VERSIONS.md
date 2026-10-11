@@ -88,7 +88,7 @@ The client picks the version from the protocol number in the server-list ping.
 
 | Version | Protocol | Tables generated | Walker conformance (reference fixtures) | Chunk strategy | Joins a real server |
 |---|---|---|---|---|---|
-| 1.8.9 | 47 | yes | yes (448 packets x 4 stages) | `CF_LEGACY_8` not implemented | no |
+| **1.8.9** | **47** | yes | yes (448 packets x 4 stages) | `CF_LEGACY_8` **implemented** (`mc_chunk.chunk_decode_legacy8`, `legacy8_bulk_*`) | **yes** (11.10.2026: real 1.8.9 server, dump byte-identical to the reference client, 81 chunks) |
 | **1.12.2** | **340** | yes | yes (500) | `CF_SECTIONS_19` **implemented** (`mc_chunk.chunk_decode_19`) | **yes** (11.10.2026: real 1.12.2 server, dump byte-identical to the reference client, 81 chunks) |
 | **1.16.5** | **754** | yes | yes (616) | `CF_SECTIONS_114` **implemented** (`mc_chunk.chunk_decode_114`, protocols 751-754) | **yes** (11.10.2026: real 1.16.5 server, dump byte-identical to the reference client, 121 chunks) |
 | **1.20.1** | **763** | yes | yes (704) | `CF_CONTAINERS_118` **implemented** | in progress (M0) |
@@ -252,3 +252,28 @@ the original packet) or drops an update for an unknown column (`APPLY_DROPPED`).
 * NOT covered (decoder refuses with Range): 1.14 / 1.15 (spanning longs, 256 biome ints in 1.14), 1.16.0 / 1.16.1 (extra ignoreOldData bool),
   1.17+ (long-array bitmask; 1.17 still uses this format family). Offline test: `tests/2745_mc_chunk114.fi` (hand-built packet, every block,
   biome, heightmap value, counters, error and truncation paths).
+
+## 10. Round 2026-10-11 (worker mc-w4-1-8-9-join-cf-legacy-8): 1.8.9
+
+* **Chunk format `CF_LEGACY_8`** (`lib/mc/mc_chunk.fi`, own self contained functions): `map_chunk` = x, z (i32), groundUp, bitMap
+  (**u16**), chunkData (varint length + octets); **no block entities** in the packet. Data order is per ARRAY, not per section:
+  all present sections' blocks (4096 x u16 **little endian**, `id << 4 | meta`), then all block light (2048 per section), then all sky light
+  (only if the dimension has a sky), then (groundUp) 256 biome octets. `map_chunk_bulk` (0x26): skyLightSent, count, count x
+  {x, z, bitMap}, then the columns' data back to back (every column ground-up, so every column has biomes). **There is no unload
+  packet**: an unload is a `map_chunk` with groundUp = true, bitMap = 0 and EMPTY data (no biome octets either);
+  `chunk_is_unload_legacy8(c)` tells, the client removes the column (`mc_world.world_remove`). A block value >= 32768 (id >= 2048)
+  is rejected (the neutral model's id table), vanilla 1.8 stays far below.
+* API: `chunk_decode_legacy8(b, sc, c)` for `map_chunk` (reached through `chunk_decode_for`), for the bulk
+  `legacy8_bulk_open(b, &h)` -> `legacy8_bulk_next(b, &h, sc, c)` x `h.n` -> `legacy8_bulk_complete`; `legacy8_bulk_free`. Sky light of a
+  single `map_chunk` comes from the dimension (`scratch_set_sky`, Join Game `dimension` is an **i8** in 1.8, Respawn an i32:
+  `mc_dimension.dim_legacy_id` takes both); the data length is checked EXACTLY (a wrong sky assumption is an error, never a guess).
+  Light is hashed in wire order (all block light, then all sky light) in both clients.
+* Login: Set Compression, Login Start has no UUID, Login Success carries the UUID as a string (not parsed). Client Information has no
+  main hand (3rd layout tried by `client_send_settings`). No teleport confirm in 1.8 (`SEM_PLAY_C2S_TELEPORT_CONFIRM` is -1); the
+  Position packet is answered with Position+Look. New semantic packet `SEM_PLAY_S2C_MAP_CHUNK_BULK` (`semantic.json`).
+* **Server setup**: the official 1.8.9 server runs on Java 17 only with `use-native-transport=false` in `server.properties`
+  (otherwise Netty epoll dies with "Unable to access address of buffer" and every connection is reset). `tools/mcclient/run.sh` sets it for 1.8.x.
+* Tests: `tests/2747_mc_chunk_legacy8.fi` (hand built packets: values, light hash, biomes, no-sky, wrong sky, truncations, unload, bulk).
+  Real server (official 1.8.9, Java 17, seed 4242, view 4, `MC_SETTLE_MS=40000`): PASS, A == A2 and Firn B == A byte identical,
+  checksum `56c7050923f4...`, 81 chunks (80 columns in 8 `map_chunk_bulk` packets + 1 single `map_chunk`), walk_fail 0.
+* Section updates (groundUp = false) are counted and dropped in both clients, like for 1.12.2 (merge still open, r30).

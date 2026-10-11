@@ -126,16 +126,11 @@ struct Stats {
     dim_known: bool,
 }
 
-fn on_map_chunk(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc_world.World, st: *mut Stats) {
-    let p: u64 = mc_chunk.chunk_alloc()
-    if p == 0 {
-        (*st).chunk_bad = (*st).chunk_bad + 1 as u64
-        return
-    }
+// Stores one decoded column (or counts it as bad / partial). Takes ownership of `p`.
+fn store_chunk(w: *mut mc_world.World, st: *mut Stats, p: u64, ok: bool) {
     let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
-    let ok: bool = mc_chunk.chunk_decode_for(&(*cl).ver, mc_client.client_body(cl), sc, c, mc_dimension.dim_sections(&(*st).dim)) catch false
     if ok && (*c).ground_up == 0 {
-        // a CF_SECTIONS_19 section update must be MERGED into its column; this client keeps whole columns only
+        // a legacy section update must be MERGED into its column; this client keeps whole columns only
         mc_chunk.chunk_release(p)
         (*st).partial = (*st).partial + 1 as u64
         return
@@ -153,9 +148,58 @@ fn on_map_chunk(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc
     (*st).chunks = (*st).chunks + 1 as u64
 }
 
-// CF_SECTIONS_19: the sky light arrays exist only in the overworld; Join Game and Respawn say which dimension.
+fn on_map_chunk(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc_world.World, st: *mut Stats) {
+    let p: u64 = mc_chunk.chunk_alloc()
+    if p == 0 {
+        (*st).chunk_bad = (*st).chunk_bad + 1 as u64
+        return
+    }
+    let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+    let ok: bool = mc_chunk.chunk_decode_for(&(*cl).ver, mc_client.client_body(cl), sc, c, mc_dimension.dim_sections(&(*st).dim)) catch false
+    if ok && (*cl).ver.chunk_format == mc_version.CF_LEGACY_8 && mc_chunk.chunk_is_unload_legacy8(c) {
+        // 1.8 has no unload packet: an empty ground-up column removes the chunk
+        mc_world.world_remove(w, (*c).x, (*c).z)
+        mc_chunk.chunk_release(p)
+        (*st).unloads = (*st).unloads + 1 as u64
+        return
+    }
+    store_chunk(w, st, p, ok)
+}
+
+// 1.8 map_chunk_bulk: several columns in one packet
+fn on_map_chunk_bulk(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc_world.World, st: *mut Stats) {
+    var h: mc_chunk.Legacy8Bulk = mc_chunk.Legacy8Bulk { sky: false, n: 0, next: 0, meta: 0 }
+    let b: *mut bytes.Bytes = mc_client.client_body(cl)
+    if !(mc_chunk.legacy8_bulk_open(b, &h) catch false) {
+        (*st).chunk_bad = (*st).chunk_bad + 1 as u64
+        mc_chunk.legacy8_bulk_free(&h)
+        return
+    }
+    var i: usize = 0
+    while i < h.n {
+        let p: u64 = mc_chunk.chunk_alloc()
+        if p == 0 {
+            (*st).chunk_bad = (*st).chunk_bad + 1 as u64
+            mc_chunk.legacy8_bulk_free(&h)
+            return
+        }
+        let ok: bool = mc_chunk.legacy8_bulk_next(b, &h, sc, p as *mut mc_chunk.Chunk) catch false
+        store_chunk(w, st, p, ok)
+        if !ok {
+            mc_chunk.legacy8_bulk_free(&h)
+            return // the cursor is lost after a bad column
+        }
+        i = i + 1
+    }
+    if !mc_chunk.legacy8_bulk_complete(b, &h) {
+        (*st).chunk_bad = (*st).chunk_bad + 1 as u64
+    }
+    mc_chunk.legacy8_bulk_free(&h)
+}
+
+// CF_SECTIONS_19 / CF_LEGACY_8: the sky light arrays exist only in the overworld; Join Game and Respawn say which dimension.
 fn set_sky_from_dimension(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, id: i32) {
-    if (*cl).ver.chunk_format != mc_version.CF_SECTIONS_19 {
+    if (*cl).ver.chunk_format != mc_version.CF_SECTIONS_19 && (*cl).ver.chunk_format != mc_version.CF_LEGACY_8 {
         return
     }
     let d: i32 = mc_dimension.dim_legacy_id(&(*cl).ver, id, mc_client.client_body(cl))
@@ -218,6 +262,8 @@ fn play_loop(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc_wo
                     set_sky_from_dimension(cl, sc, id)
                 } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_MAP_CHUNK) {
                     on_map_chunk(cl, sc, w, st)
+                } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_MAP_CHUNK_BULK) {
+                    on_map_chunk_bulk(cl, sc, w, st)
                 } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_UNLOAD_CHUNK) {
                     (*st).unloads = (*st).unloads + 1 as u64
                 } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_KICK_DISCONNECT) {
