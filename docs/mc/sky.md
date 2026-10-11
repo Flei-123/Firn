@@ -40,6 +40,22 @@ f64 operation order: state fields, f64 bits of the sun direction, framebuffer an
 midnight dark, glow only at the horizon, tick wrap, sine error); 3 build stages byte-equal; counter-check (damaged sun
 path) detected. Not independently checked: the look (colours are choices, not Mojang values).
 
-## Measured (server, release, Load ~10)
-`sky_draw` 640x360: ~28 ms/frame (125 ns per pixel: normalise = sqrt + 3 divisions in f64). Too slow for 60 fps;
-options: draw at half resolution, cache the gradient per (time, camera orientation), or per-row/column incremental rays.
+## Fast pass (`sky_draw`) vs definition (`sky_draw_plain`)
+`sky_draw_plain` is the per-pixel model above (one normalisation per pixel) and the definition of the image. `sky_draw` gives
+exactly the same pixels, only evaluated lazily (tests/2761 compares both on 120 random scenes: any time, rain, yaw / pitch,
+lens 20..170 degrees, odd sizes; a damaged threshold or box is detected):
+* column part of the ray precomputed once per frame (same expressions), gradient colour = 257 entry table indexed by `f`;
+* per row `f` is evaluated exactly only at a few columns and bisected: along a row `ny = (Py + ex ry) / |P + ex R|` has ONE
+  extremum (closed form `ex* = (Py (P.R) - ry (P.P)) / ((P.R) ry - Py (R.R))`, the `ex^2` terms cancel), so left and right of
+  it `f` is monotone and equal end values mean equal inside (5 columns around the extremum are exact; lenses wider than
+  ~152 degrees evaluate every pixel);
+* glow: floor(d3 (1-gg) glow) >= 1 needs `dsun^3 >= 1/(glow (1-gg))`; a conservative test on squares (no sqrt, per-`f` table,
+  safety 0.9) lets only those pixels through; there `dsun`/`ny` come from one sqrt + one division and are re-done with the
+  plain formulas when the value is within 1e-7 of an integer (rounding error ~1e-12);
+* discs: plain-model pixels only inside a conservative screen box of each disc (interval arithmetic on the camera basis,
+  margin 0.12 rad for the 0.07 rad disc; empty box when the disc is behind the camera).
+
+## Measured (server, release, Load ~1-10)
+`sky_draw` 640x360: noon / night ~4.5 ms/frame, sunset with glow ~13 ms (28 ms before; `tools/mc/sky/bench.fi` prints all
+three). The glow needs 1 sqrt + 1 division per pixel over a wide cone (81 degrees at full glow), that is the remaining cost;
+the plain model costs ~28 ms.

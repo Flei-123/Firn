@@ -1,0 +1,325 @@
+// lib/mc/mc_hud.fi -- 2D overlay for the CPU rasterizer: own 5x7 bitmap font (mc_hud_font), text with shadow, crosshair,
+// hotbar frame with the selected slot, debug lines (FPS, XYZ, looked-at block, facing, yaw / pitch).
+//
+// Everything draws into the colour buffer of an `mc_raster.Raster` AFTER the world (the depth buffer is not touched) with
+// integer maths only, so the image is bit-identical on every build stage and tools/mc/hud/ref.py reproduces it exactly.
+// Colours are 0xAABBGGRR like the raster; the alpha of a colour is a blend factor 0..255 (alpha 0 = nothing is drawn).
+// Blend per channel: (src * a + dst * (255 - a)) / 255 (integer division); the destination alpha stays 255.
+// GUI scale `scale` (>= 1) multiplies every size: a font pixel is scale x scale pixels, a glyph advances 6 * scale.
+
+import std.rt
+import mc.mc_raster
+import mc.mc_hud_font
+
+export {
+    HudDebug, hud_debug_new, hud_scale, hud_rect, hud_invert, hud_glyph, hud_text, hud_text_bytes, hud_text_width, hud_crosshair,
+    hud_hotbar, hud_debug_line, hud_debug, hud_frame, hud_push_int, hud_push_fixed,
+    HUD_CROSSHAIR, HUD_HOTBAR, HUD_DEBUG, HUD_DEBUG_LINES, HUD_NO_SHADOW,
+}
+
+const HUD_CROSSHAIR: u32 = 1
+const HUD_HOTBAR: u32 = 2
+const HUD_DEBUG: u32 = 4
+const HUD_DEBUG_LINES: i32 = 5
+const HUD_NO_SHADOW: u32 = 0 // alpha 0 = no shadow
+
+const COL_WHITE: u32 = 0xFFFFFFFF
+const COL_GREY: u32 = 0xFFAAAAAA
+const COL_LINE: u32 = 0xFF8B8B8B
+const COL_BAR: u32 = 0x78000000
+const COL_SHADOW: u32 = 0xFF3F3F3F
+const COL_DEBUG_BG: u32 = 0x78000000
+
+// What the debug lines show. `has_block` = the pick ray hit a block (mc_input.Pick: bx.. and block state id, face normal).
+struct HudDebug {
+    fps: i32,
+    x: f64, y: f64, z: f64,
+    yaw: f64, pitch: f64,
+    has_block: bool,
+    bx: i32, by: i32, bz: i32, id: i32,
+    nx: i32, ny: i32, nz: i32,
+}
+
+fn hud_debug_new() -> HudDebug {
+    return HudDebug {
+        fps: 0, x: 0.0, y: 0.0, z: 0.0, yaw: 0.0, pitch: 0.0,
+        has_block: false, bx: 0, by: 0, bz: 0, id: 0, nx: 0, ny: 0, nz: 0,
+    }
+}
+
+// GUI scale for a frame size: 1 up to 639 x 479, 2 from 640 x 480, ... (at most 4)
+fn hud_scale(w: i32, h: i32) -> i32 {
+    var s: i32 = w / 320
+    if h / 240 < s { s = h / 240 }
+    if s < 1 { s = 1 }
+    if s > 4 { s = 4 }
+    return s
+}
+
+fn put(r: *mut mc_raster.Raster, x: i32, y: i32, c: u32) {
+    rt.st32((*r).color, (y as usize) * ((*r).w as usize) + (x as usize), c)
+}
+
+// Filled rectangle, clipped to the buffer; alpha of `c` is the blend factor (255 = opaque copy).
+fn hud_rect(r: *mut mc_raster.Raster, x: i32, y: i32, w: i32, h: i32, c: u32) {
+    let a: u32 = c >> 24 as u32
+    if a == 0 as u32 { return }
+    var x0: i32 = x
+    var y0: i32 = y
+    var x1: i32 = x + w
+    var y1: i32 = y + h
+    if x0 < 0 { x0 = 0 }
+    if y0 < 0 { y0 = 0 }
+    if x1 > (*r).w { x1 = (*r).w }
+    if y1 > (*r).h { y1 = (*r).h }
+    if x1 <= x0 || y1 <= y0 { return }
+    let sr: u32 = c & 255 as u32
+    let sg: u32 = (c >> 8 as u32) & 255 as u32
+    let sb: u32 = (c >> 16 as u32) & 255 as u32
+    var yy: i32 = y0
+    while yy < y1 {
+        var xx: i32 = x0
+        while xx < x1 {
+            if a == 255 as u32 {
+                put(r, xx, yy, 0xFF000000 as u32 | (sb << 16 as u32) | (sg << 8 as u32) | sr)
+            } else {
+                let d: u32 = rt.ld32((*r).color, (yy as usize) * ((*r).w as usize) + (xx as usize))
+                let ia: u32 = 255 as u32 - a
+                let nr: u32 = (sr * a + (d & 255 as u32) * ia) / 255 as u32
+                let ng: u32 = (sg * a + ((d >> 8 as u32) & 255 as u32) * ia) / 255 as u32
+                let nb: u32 = (sb * a + ((d >> 16 as u32) & 255 as u32) * ia) / 255 as u32
+                put(r, xx, yy, 0xFF000000 as u32 | (nb << 16 as u32) | (ng << 8 as u32) | nr)
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// Inverts the colour of every pixel in the rectangle (clipped): visible on any background.
+fn hud_invert(r: *mut mc_raster.Raster, x: i32, y: i32, w: i32, h: i32) {
+    var x0: i32 = x
+    var y0: i32 = y
+    var x1: i32 = x + w
+    var y1: i32 = y + h
+    if x0 < 0 { x0 = 0 }
+    if y0 < 0 { y0 = 0 }
+    if x1 > (*r).w { x1 = (*r).w }
+    if y1 > (*r).h { y1 = (*r).h }
+    var yy: i32 = y0
+    while yy < y1 {
+        var xx: i32 = x0
+        while xx < x1 {
+            let d: u32 = rt.ld32((*r).color, (yy as usize) * ((*r).w as usize) + (xx as usize))
+            put(r, xx, yy, 0xFF000000 as u32 | ((d ^ 0x00FFFFFF as u32) & 0x00FFFFFF as u32))
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// One glyph (ASCII 32..126, anything else is drawn as '?') with its top-left corner at (x, y).
+fn hud_glyph(r: *mut mc_raster.Raster, x: i32, y: i32, scale: i32, c: u32, code: u32) {
+    var g: u32 = code
+    if g < 32 as u32 || g > 126 as u32 { g = 63 as u32 }
+    let base: usize = ((g - 32 as u32) as usize) * 7
+    var row: i32 = 0
+    while row < 7 {
+        let bits: u32 = rt.ld8(mc_hud_font.HUD_FONT.p as u64, base + (row as usize)) as u32
+        var col: i32 = 0
+        while col < 5 {
+            if ((bits >> ((4 - col) as u32)) & 1 as u32) != 0 as u32 {
+                hud_rect(r, x + col * scale, y + row * scale, scale, scale, c)
+            }
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+// Width in pixels of n glyphs (advance 6, the gap after the last one is not counted).
+fn hud_text_width(n: usize, scale: i32) -> i32 {
+    if n == 0 { return 0 }
+    return ((n as i32) * 6 - 1) * scale
+}
+
+// n bytes at p; the shadow (alpha != 0) is the same text moved by (scale, scale) and drawn first.
+fn hud_text_bytes(r: *mut mc_raster.Raster, x: i32, y: i32, scale: i32, c: u32, shadow: u32, p: u64, n: usize) {
+    if (shadow >> 24 as u32) != 0 as u32 {
+        var i: usize = 0
+        while i < n {
+            hud_glyph(r, x + scale + (i as i32) * 6 * scale, y + scale, scale, shadow, rt.ld8(p, i) as u32)
+            i = i + 1
+        }
+    }
+    var j: usize = 0
+    while j < n {
+        hud_glyph(r, x + (j as i32) * 6 * scale, y, scale, c, rt.ld8(p, j) as u32)
+        j = j + 1
+    }
+}
+
+fn hud_text(r: *mut mc_raster.Raster, x: i32, y: i32, scale: i32, c: u32, shadow: u32, text: str) {
+    hud_text_bytes(r, x, y, scale, c, shadow, text.p as u64, text.n)
+}
+
+// Plus-shaped crosshair in the middle of the frame, drawn by inverting the pixels (arm length 4 * scale, thickness scale).
+fn hud_crosshair(r: *mut mc_raster.Raster, scale: i32) {
+    let cx: i32 = (*r).w / 2
+    let cy: i32 = (*r).h / 2
+    let t: i32 = scale
+    let l: i32 = 4 * scale
+    hud_invert(r, cx - l - t / 2, cy - t / 2, 2 * l + t, t)
+    hud_invert(r, cx - t / 2, cy - t / 2 - l, t, l)
+    hud_invert(r, cx - t / 2, cy - t / 2 + t, t, l)
+}
+
+// Hotbar at the bottom centre: translucent bar, 10 divider lines, slot numbers 1..9, white frame around `slot` (0..8).
+fn hud_hotbar(r: *mut mc_raster.Raster, scale: i32, slot: i32) {
+    let s: i32 = scale
+    var sl: i32 = slot
+    if sl < 0 { sl = 0 }
+    if sl > 8 { sl = 8 }
+    let bw: i32 = 181 * s
+    let x0: i32 = ((*r).w - bw) / 2
+    let y0: i32 = (*r).h - 23 * s
+    hud_rect(r, x0, y0, bw, 22 * s, COL_BAR)
+    hud_rect(r, x0, y0, bw, s, COL_LINE)
+    hud_rect(r, x0, y0 + 21 * s, bw, s, COL_LINE)
+    var k: i32 = 0
+    while k <= 9 {
+        hud_rect(r, x0 + k * 20 * s, y0 + s, s, 20 * s, COL_LINE)
+        k = k + 1
+    }
+    var i: i32 = 0
+    while i < 9 {
+        var col: u32 = COL_GREY
+        if i == sl { col = COL_WHITE }
+        hud_glyph(r, x0 + i * 20 * s + 8 * s, y0 + s + (13 * s) / 2, s, col, (49 + i) as u32)
+        i = i + 1
+    }
+    let xs: i32 = x0 + sl * 20 * s - 2 * s
+    let ys: i32 = y0 - s
+    hud_rect(r, xs, ys, 24 * s, 2 * s, COL_WHITE)
+    hud_rect(r, xs, ys + 22 * s, 24 * s, 2 * s, COL_WHITE)
+    hud_rect(r, xs, ys + 2 * s, 2 * s, 20 * s, COL_WHITE)
+    hud_rect(r, xs + 22 * s, ys + 2 * s, 2 * s, 20 * s, COL_WHITE)
+}
+
+// ---- number formatting (integers only, so the text is the same everywhere)
+
+fn hud_push_int(b: *mut rt.Buf, v: i64) {
+    rt.buf_push_dec_i64(b, v)
+}
+
+// Fixed point with `dec` (0..3) decimals, rounded half up on |v|; "?" for NaN and |v| >= 1e12; no "-0.00".
+fn hud_push_fixed(b: *mut rt.Buf, v: f64, dec: i32) {
+    if !(v < 1000000000000.0 && v > -1000000000000.0) {
+        rt.buf_push(b, 63 as u8)
+        return
+    }
+    var a: f64 = v
+    if a < 0.0 { a = 0.0 - a }
+    var p: i64 = 1
+    var i: i32 = 0
+    while i < dec {
+        p = p * 10 as i64
+        i = i + 1
+    }
+    let sc: i64 = (a * (p as f64) + 0.5) as i64
+    if v < 0.0 && sc != 0 as i64 { rt.buf_push(b, 45 as u8) }
+    rt.buf_push_dec_i64(b, sc / p)
+    if dec > 0 {
+        rt.buf_push(b, 46 as u8)
+        var q: i64 = p / 10 as i64
+        let fr: i64 = sc % p
+        while q > 0 as i64 {
+            rt.buf_push(b, (48 + (fr / q) % 10 as i64) as u8)
+            q = q / 10 as i64
+        }
+    }
+}
+
+fn push_lit(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn push_sp(b: *mut rt.Buf) {
+    rt.buf_push(b, 32 as u8)
+}
+
+// Text of debug line k (0..4) appended to b:
+//   0 "FPS: 60"   1 "XYZ: 12.350 64.000 -3.500"   2 "Block: 12 63 -4 (id 1)" or "Block: none"
+//   3 "Face: +y" ("Face: inside" when the ray started inside the block, "Face: -" without a block)   4 "Yaw: 45.0 Pitch: -10.0"
+fn hud_debug_line(d: *mut HudDebug, k: i32, b: *mut rt.Buf) {
+    if k == 0 {
+        push_lit(b, "FPS: ")
+        hud_push_int(b, (*d).fps as i64)
+    } else if k == 1 {
+        push_lit(b, "XYZ: ")
+        hud_push_fixed(b, (*d).x, 3)
+        push_sp(b)
+        hud_push_fixed(b, (*d).y, 3)
+        push_sp(b)
+        hud_push_fixed(b, (*d).z, 3)
+    } else if k == 2 {
+        if (*d).has_block {
+            push_lit(b, "Block: ")
+            hud_push_int(b, (*d).bx as i64)
+            push_sp(b)
+            hud_push_int(b, (*d).by as i64)
+            push_sp(b)
+            hud_push_int(b, (*d).bz as i64)
+            push_lit(b, " (id ")
+            hud_push_int(b, (*d).id as i64)
+            rt.buf_push(b, 41 as u8)
+        } else {
+            push_lit(b, "Block: none")
+        }
+    } else if k == 3 {
+        push_lit(b, "Face: ")
+        if !(*d).has_block {
+            rt.buf_push(b, 45 as u8)
+        } else if (*d).nx == 0 && (*d).ny == 0 && (*d).nz == 0 {
+            push_lit(b, "inside")
+        } else if (*d).nx != 0 {
+            if (*d).nx > 0 { rt.buf_push(b, 43 as u8) } else { rt.buf_push(b, 45 as u8) }
+            rt.buf_push(b, 120 as u8)
+        } else if (*d).ny != 0 {
+            if (*d).ny > 0 { rt.buf_push(b, 43 as u8) } else { rt.buf_push(b, 45 as u8) }
+            rt.buf_push(b, 121 as u8)
+        } else {
+            if (*d).nz > 0 { rt.buf_push(b, 43 as u8) } else { rt.buf_push(b, 45 as u8) }
+            rt.buf_push(b, 122 as u8)
+        }
+    } else {
+        push_lit(b, "Yaw: ")
+        hud_push_fixed(b, (*d).yaw, 1)
+        push_lit(b, " Pitch: ")
+        hud_push_fixed(b, (*d).pitch, 1)
+    }
+}
+
+// Debug block at the top left: one line per row with a translucent background strip (1 px padding), white text + shadow.
+fn hud_debug(r: *mut mc_raster.Raster, scale: i32, d: *mut HudDebug) {
+    var b: rt.Buf = rt.buf_new()
+    var k: i32 = 0
+    while k < HUD_DEBUG_LINES {
+        rt.buf_clear(&b)
+        hud_debug_line(d, k, &b)
+        let n: usize = rt.buf_len(&b)
+        let x: i32 = 2 * scale
+        let y: i32 = 2 * scale + k * 10 * scale
+        hud_rect(r, x - scale, y - scale, hud_text_width(n, scale) + 3 * scale, 9 * scale, COL_DEBUG_BG)
+        hud_text_bytes(r, x, y, scale, COL_WHITE, COL_SHADOW, rt.buf_ptr(&b), n)
+        k = k + 1
+    }
+    rt.buf_free(&b)
+}
+
+// Whole overlay: crosshair, hotbar (slot = Player.slot), debug lines, in this order, as selected by `flags`.
+fn hud_frame(r: *mut mc_raster.Raster, scale: i32, flags: u32, slot: i32, d: *mut HudDebug) {
+    if (flags & HUD_CROSSHAIR) != 0 as u32 { hud_crosshair(r, scale) }
+    if (flags & HUD_HOTBAR) != 0 as u32 { hud_hotbar(r, scale, slot) }
+    if (flags & HUD_DEBUG) != 0 as u32 { hud_debug(r, scale, d) }
+}
