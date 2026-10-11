@@ -53,9 +53,13 @@ for stage in "" "--no-opt"; do
 done
 # counter-check: damage the stored payload of the Firn-written file -> python lines must differ
 python3 -I - "$W/a.mca" "$W/a_bad.mca" <<'PY'
-import sys
+import struct, sys
 raw = bytearray(open(sys.argv[1], "rb").read())
-raw[-100] ^= 1
+for s in range(1024):
+    e = struct.unpack(">I", raw[s * 4:s * 4 + 4])[0]
+    if e:
+        raw[(e >> 8) * 4096 + 8] ^= 1   # inside the first stored payload
+        break
 open(sys.argv[2], "wb").write(raw)
 PY
 python3 -I tools/mc/anvil/ref.py read "$W/a_bad.mca" > "$W/bad.txt" 2>/dev/null

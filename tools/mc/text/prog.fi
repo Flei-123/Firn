@@ -1,0 +1,148 @@
+// tools/mc/text/prog.fi -- the Firn side of the mc_text cross-check.
+//
+//     prog json <case.json> <lang.json>    flatten the component, print spans / plain / legacy / ansi
+//     prog legacy <text-file>              the same for a string with section-sign codes
+//     prog fuzz <case.json> <rounds> <seed>   damaged copies: no crash, no hang
+//
+// The output format is the one ref.py computes independently.
+import std.rt
+import std.io
+import mc.mc_text
+
+fn put_hex_bytes(out: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push_hex_u64(out, rt.ld8(p, i) as u64, 2)
+        i = i + 1
+    }
+}
+
+fn render(t: *mut mc_text.TextDoc, out: *mut rt.Buf) {
+    var k: usize = 0
+    while k < mc_text.text_span_count(t) {
+        let col: i32 = mc_text.text_span_color(t, k)
+        rt.buf_push_bytes(out, "span ".p as u64, 5)
+        rt.buf_push_dec_i64(out, k as i64)
+        rt.buf_push_bytes(out, " color=".p as u64, 7)
+        if col == mc_text.NO_COLOR {
+            rt.buf_push(out, 45 as u8)
+        } else {
+            rt.buf_push_hex_u64(out, col as u64, 6)
+        }
+        rt.buf_push_bytes(out, " flags=".p as u64, 7)
+        rt.buf_push_dec_i64(out, mc_text.text_span_flags(t, k) as i64)
+        rt.buf_push_bytes(out, " len=".p as u64, 5)
+        rt.buf_push_dec_i64(out, mc_text.text_span_len(t, k) as i64)
+        rt.buf_push_bytes(out, " hex=".p as u64, 5)
+        put_hex_bytes(out, mc_text.text_ptr(t) + mc_text.text_span_off(t, k) as u64, mc_text.text_span_len(t, k))
+        rt.buf_push(out, 10 as u8)
+        k = k + 1
+    }
+    var b: rt.Buf = rt.buf_new()
+    mc_text.text_plain(t, &b)
+    rt.buf_push_bytes(out, "plain hex=".p as u64, 10)
+    put_hex_bytes(out, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_push(out, 10 as u8)
+    rt.buf_clear(&b)
+    mc_text.text_legacy(t, &b)
+    rt.buf_push_bytes(out, "legacy hex=".p as u64, 11)
+    put_hex_bytes(out, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_push(out, 10 as u8)
+    rt.buf_clear(&b)
+    mc_text.text_ansi(t, &b)
+    rt.buf_push_bytes(out, "ansi hex=".p as u64, 9)
+    put_hex_bytes(out, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_push(out, 10 as u8)
+    rt.buf_free(&b)
+}
+
+fn parse(p: u64) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < rt.c_length(p) {
+        v = v * 10 as u64 + (rt.ld8(p, i) - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
+
+struct Gen {
+    x: u64,
+}
+
+fn gen_next(g: *mut Gen) -> u64 {
+    (*g).x = ((*g).x * 1103515245 as u64 + 12345 as u64) % 2147483648 as u64
+    return (*g).x >> 8
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        return 2
+    }
+    let mode: u8 = rt.ld8(rt.arg_ptr(start, 1), 0)
+    var input: rt.Buf = rt.buf_new()
+    if !rt.read_file(rt.arg_ptr(start, 2), &input) {
+        return 3
+    }
+    var t: mc_text.TextDoc = mc_text.text_new()
+    var out: rt.Buf = rt.buf_new()
+    if mode == 106 as u8 {
+        var tr: mc_text.Translations = mc_text.tr_new()
+        var lang: rt.Buf = rt.buf_new()
+        if rt.arg_count(start) > 3 && rt.read_file(rt.arg_ptr(start, 3), &lang) {
+            mc_text.tr_load(&tr, lang.ptr, lang.len)
+        }
+        if !mc_text.text_from_json(&t, input.ptr, input.len, &tr) {
+            io.fmt_print(f"not json\n")
+            return 4
+        }
+        render(&t, &out)
+        mc_text.tr_free(&tr)
+        rt.buf_free(&lang)
+    } else if mode == 108 as u8 {
+        mc_text.text_from_legacy(&t, input.ptr, input.len)
+        render(&t, &out)
+    } else {
+        var tr: mc_text.Translations = mc_text.tr_new()
+        let rounds: u64 = parse(rt.arg_ptr(start, 3))
+        var g: Gen = Gen { x: parse(rt.arg_ptr(start, 4)) }
+        var okc: u64 = 0
+        var bad: u64 = 0
+        var k: u64 = 0
+        while k < rounds {
+            let n: usize = input.len
+            let copy: u64 = rt.heap_alloc(n + 1)
+            rt.mem_copy(copy, input.ptr, n)
+            let flips: u64 = 1 as u64 + gen_next(&g) % 5 as u64
+            var f: u64 = 0
+            while f < flips {
+                rt.st8(copy, (gen_next(&g) % (n as u64)) as usize, (gen_next(&g) % 256 as u64) as u8)
+                f = f + 1 as u64
+            }
+            var m: usize = n
+            if gen_next(&g) % 3 as u64 == 0 as u64 {
+                m = (gen_next(&g) % (n as u64)) as usize
+            }
+            var d: mc_text.TextDoc = mc_text.text_new()
+            if mc_text.text_from_json(&d, copy, m, &tr) {
+                okc = okc + 1 as u64
+                var b: rt.Buf = rt.buf_new()
+                mc_text.text_plain(&d, &b)
+                mc_text.text_legacy(&d, &b)
+                mc_text.text_ansi(&d, &b)
+                rt.buf_free(&b)
+            } else {
+                bad = bad + 1 as u64
+            }
+            mc_text.text_free(&d)
+            rt.heap_free(copy, n + 1)
+            k = k + 1 as u64
+        }
+        io.fmt_print(f"fuzz rounds={rounds} flattened={okc} refused={bad}\n")
+        mc_text.tr_free(&tr)
+    }
+    io.print_bytes(rt.buf_ptr(&out), rt.buf_len(&out))
+    mc_text.text_free(&t)
+    rt.buf_free(&out)
+    return 0
+}

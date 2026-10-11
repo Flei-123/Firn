@@ -1,0 +1,257 @@
+// tools/mc/nbt/prog.fi -- the Firn side of the mc_nbt cross-check.
+//
+//     prog dump <file> <anon:0|1>     read the tree, print the dump lines, check write-back == input
+//     prog fuzz <file> <rounds> <seed>   damaged copies: no crash, no hang, write-back is stable
+//
+// The dump format is the one ref.cjs computes from the tree it generated (see there).
+import std.rt
+import std.io
+import std.bytes
+import std.nbt
+import mc.mc_nbt
+
+fn fnv(p: u64, n: usize) -> u64 {
+    var h: u64 = 14695981039346656037 as u64
+    var i: usize = 0
+    while i < n {
+        h = (h ^ (rt.ld8(p, i) as u64)) *% 1099511628211 as u64
+        i = i + 1
+    }
+    return h
+}
+
+fn kind_name(k: u8) -> u64 {
+    if k == nbt.TAG_BYTE {
+        return "byte\0".p as u64
+    }
+    if k == nbt.TAG_SHORT {
+        return "short\0".p as u64
+    }
+    if k == nbt.TAG_INT {
+        return "int\0".p as u64
+    }
+    if k == nbt.TAG_LONG {
+        return "long\0".p as u64
+    }
+    if k == nbt.TAG_FLOAT {
+        return "float\0".p as u64
+    }
+    if k == nbt.TAG_DOUBLE {
+        return "double\0".p as u64
+    }
+    if k == nbt.TAG_STRING {
+        return "string\0".p as u64
+    }
+    if k == nbt.TAG_BYTE_ARRAY {
+        return "byte_array\0".p as u64
+    }
+    if k == nbt.TAG_INT_ARRAY {
+        return "int_array\0".p as u64
+    }
+    if k == nbt.TAG_LONG_ARRAY {
+        return "long_array\0".p as u64
+    }
+    if k == nbt.TAG_LIST {
+        return "list\0".p as u64
+    }
+    if k == nbt.TAG_COMPOUND {
+        return "compound\0".p as u64
+    }
+    return "end\0".p as u64
+}
+
+fn put_c(out: *mut rt.Buf, p: u64) {
+    rt.buf_push_bytes(out, p, rt.c_length(p))
+}
+
+fn put_hex_bytes(out: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push_hex_u64(out, rt.ld8(p, i) as u64, 2)
+        i = i + 1
+    }
+}
+
+fn dump_node(d: *mut mc_nbt.Doc, n: u32, path: *mut rt.Buf, out: *mut rt.Buf) {
+    let k: u8 = mc_nbt.nbt_kind(d, n)
+    rt.buf_push_bytes(out, rt.buf_ptr(path), rt.buf_len(path))
+    rt.buf_push(out, 32 as u8)
+    put_c(out, kind_name(k))
+    rt.buf_push(out, 32 as u8)
+    if k == nbt.TAG_BYTE || k == nbt.TAG_SHORT || k == nbt.TAG_INT || k == nbt.TAG_LONG {
+        rt.buf_push_dec_i64(out, mc_nbt.nbt_i64(d, n))
+    } else if k == nbt.TAG_FLOAT {
+        rt.buf_push_hex_u64(out, mc_nbt.nbt_f32(d, n) as u64, 8)
+    } else if k == nbt.TAG_DOUBLE {
+        rt.buf_push_hex_u64(out, mc_nbt.nbt_f64(d, n), 16)
+    } else if k == nbt.TAG_STRING {
+        var sl: usize = 0
+        let sp: u64 = mc_nbt.nbt_str(d, n, &sl)
+        rt.buf_push_bytes(out, "len=".p as u64, 4)
+        rt.buf_push_dec_i64(out, sl as i64)
+        rt.buf_push_bytes(out, " hex=".p as u64, 5)
+        put_hex_bytes(out, sp, sl)
+    } else if k == nbt.TAG_BYTE_ARRAY || k == nbt.TAG_INT_ARRAY || k == nbt.TAG_LONG_ARRAY {
+        var w: usize = 1
+        if k == nbt.TAG_INT_ARRAY {
+            w = 4
+        } else if k == nbt.TAG_LONG_ARRAY {
+            w = 8
+        }
+        let cnt: u32 = mc_nbt.nbt_count(d, n)
+        rt.buf_push_bytes(out, "n=".p as u64, 2)
+        rt.buf_push_dec_i64(out, cnt as i64)
+        rt.buf_push_bytes(out, " fnv=".p as u64, 5)
+        rt.buf_push_hex_u64(out, fnv(mc_nbt.nbt_arr_ptr(d, n), (cnt as usize) * w), 16)
+    } else if k == nbt.TAG_LIST {
+        rt.buf_push_bytes(out, "elem=".p as u64, 5)
+        put_c(out, kind_name(mc_nbt.nbt_elem_kind(d, n)))
+        rt.buf_push_bytes(out, " n=".p as u64, 3)
+        rt.buf_push_dec_i64(out, mc_nbt.nbt_count(d, n) as i64)
+    } else if k == nbt.TAG_COMPOUND {
+        rt.buf_push_bytes(out, "n=".p as u64, 2)
+        rt.buf_push_dec_i64(out, mc_nbt.nbt_count(d, n) as i64)
+    }
+    rt.buf_push(out, 10 as u8)
+    let keep: usize = rt.buf_len(path)
+    if k == nbt.TAG_LIST {
+        var c: u32 = mc_nbt.nbt_first(d, n)
+        var i: i64 = 0
+        while c != 0 as u32 {
+            rt.buf_push(path, 91 as u8)
+            rt.buf_push_dec_i64(path, i)
+            rt.buf_push(path, 93 as u8)
+            dump_node(d, c, path, out)
+            rt.buf_set_len(path, keep)
+            c = mc_nbt.nbt_next(d, c)
+            i = i + 1
+        }
+    } else if k == nbt.TAG_COMPOUND {
+        var c: u32 = mc_nbt.nbt_first(d, n)
+        while c != 0 as u32 {
+            var nl: usize = 0
+            let np: u64 = mc_nbt.nbt_name(d, c, &nl)
+            rt.buf_push(path, 47 as u8)
+            put_hex_bytes(path, np, nl)
+            dump_node(d, c, path, out)
+            rt.buf_set_len(path, keep)
+            c = mc_nbt.nbt_next(d, c)
+        }
+    }
+}
+
+fn parse(p: u64) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < rt.c_length(p) {
+        v = v * 10 as u64 + (rt.ld8(p, i) - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
+
+struct Gen {
+    x: u64,
+}
+
+fn gen_next(g: *mut Gen) -> u64 {
+    (*g).x = ((*g).x * 1103515245 as u64 + 12345 as u64) % 2147483648 as u64
+    return (*g).x >> 8
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 4 {
+        return 2
+    }
+    let mode: u8 = rt.ld8(rt.arg_ptr(start, 1), 0)
+    let file: u64 = rt.arg_ptr(start, 2)
+    var input: rt.Buf = rt.buf_new()
+    if !rt.read_file(file, &input) {
+        return 3
+    }
+    if mode == 100 as u8 {
+        let anon: bool = parse(rt.arg_ptr(start, 3)) == 1 as u64
+        var d: mc_nbt.Doc = mc_nbt.doc_new()
+        var b: bytes.Bytes = bytes.Bytes { data: input.ptr, cap: input.len, len: input.len, pos: 0, bad: false }
+        let ok: bool = mc_nbt.doc_parse(&d, &b, anon, true) catch false
+        if !ok {
+            io.fmt_print(f"parse FAILED\n")
+            return 3
+        }
+        var out: rt.Buf = rt.buf_new()
+        var path: rt.Buf = rt.buf_new()
+        if !anon {
+            var rl: usize = 0
+            let rp: u64 = mc_nbt.doc_root_name(&d, &rl)
+            rt.buf_push_bytes(&out, "root-name hex=".p as u64, 14)
+            put_hex_bytes(&out, rp, rl)
+            rt.buf_push(&out, 10 as u8)
+        } else {
+            rt.buf_push_bytes(&out, "root-name hex=".p as u64, 14)
+            rt.buf_push(&out, 10 as u8)
+        }
+        dump_node(&d, mc_nbt.doc_root(&d), &path, &out)
+        io.print_bytes(rt.buf_ptr(&out), rt.buf_len(&out))
+        // write back: must be the input, byte for byte
+        var w: bytes.Bytes = bytes.bytes_new()
+        mc_nbt.doc_write(&d, &w)
+        let same: bool = bytes.bytes_len(&w) == input.len && rt.mem_eq(bytes.bytes_ptr(&w), input.ptr, input.len)
+        if !same {
+            io.fmt_print(f"WRITE-BACK DIFFERS\n")
+            return 4
+        }
+        bytes.bytes_free(&w)
+        rt.buf_free(&out)
+        rt.buf_free(&path)
+        mc_nbt.doc_free(&d)
+        return 0
+    }
+    // fuzz
+    let rounds: u64 = parse(rt.arg_ptr(start, 3))
+    var g: Gen = Gen { x: parse(rt.arg_ptr(start, 4)) }
+    var parsed: u64 = 0
+    var refused: u64 = 0
+    var stable: u64 = 0
+    var k: u64 = 0
+    while k < rounds {
+        let n: usize = input.len
+        let copy: u64 = rt.heap_alloc(n)
+        rt.mem_copy(copy, input.ptr, n)
+        let flips: u64 = 1 as u64 + gen_next(&g) % 6 as u64
+        var f: u64 = 0
+        while f < flips {
+            let at: usize = (gen_next(&g) % (n as u64)) as usize
+            rt.st8(copy, at, (gen_next(&g) % 256 as u64) as u8)
+            f = f + 1 as u64
+        }
+        var m: usize = n
+        if gen_next(&g) % 3 as u64 == 0 as u64 {
+            m = (gen_next(&g) % (n as u64)) as usize
+        }
+        var d: mc_nbt.Doc = mc_nbt.doc_new()
+        var b: bytes.Bytes = bytes.Bytes { data: copy, cap: m, len: m, pos: 0, bad: false }
+        let anon: bool = gen_next(&g) % 2 as u64 == 0 as u64
+        let ok: bool = mc_nbt.doc_parse(&d, &b, anon, false) catch false
+        if ok {
+            parsed = parsed + 1 as u64
+            var w: bytes.Bytes = bytes.bytes_new()
+            mc_nbt.doc_write(&d, &w)
+            // what was read must write back to the octets that were consumed
+            let used: usize = bytes.bytes_pos(&b)
+            if bytes.bytes_len(&w) == used && rt.mem_eq(bytes.bytes_ptr(&w), copy, used) {
+                stable = stable + 1 as u64
+            }
+            bytes.bytes_free(&w)
+        } else {
+            refused = refused + 1 as u64
+        }
+        mc_nbt.doc_free(&d)
+        rt.heap_free(copy, n)
+        k = k + 1 as u64
+    }
+    io.fmt_print(f"fuzz rounds={rounds} parsed={parsed} refused={refused} write_back_identical={stable}\n")
+    if stable != parsed {
+        return 5
+    }
+    return 0
+}
