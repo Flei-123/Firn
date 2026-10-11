@@ -22,6 +22,7 @@
 const NMP_VERSION = process.env.MC_NMP || '1.20.1'
 const PROTOCOL = parseInt(process.env.MC_PROTOCOL || '763', 10)
 const LEGACY_SECTIONS = PROTOCOL <= 340 && PROTOCOL >= 107 // 1.9 - 1.12.2: CF_SECTIONS_19
+const SECTIONS_114 = PROTOCOL >= 751 && PROTOCOL <= 754 // 1.16.2 - 1.16.5: CF_SECTIONS_114
 
 const fs = require('fs')
 const crypto = require('crypto')
@@ -297,6 +298,46 @@ function decodeLegacyColumn (p, hasSky) {
   }
 }
 
+// ---------------------------------------------------------------- 1.16.2 - 1.16.5 (CF_SECTIONS_114)
+// map_chunk: x, z, groundUp, bitMap (section i present), heightmaps (NBT), biomes (int[1024], ground-up only),
+// chunkData, blockEntities. Per present section: blockCount (i16), bits per block (u8), palette (bits <= 8),
+// packed longs that NEVER span two longs. A 1.16 column is 256 high = 16 sections; an absent one is all air.
+// The biome array is ordered (y*4+z)*4+x over 64 cells of 4 blocks, so section i owns entries i*64 .. i*64+63.
+// Light is a separate packet (update_light) and not part of the dump: sky=0 block=0, h = FNV offset basis.
+function decodeChunk114 (p) {
+  const r = new Reader(p.chunkData)
+  const sections = []
+  for (let i = 0; i < 16; i++) {
+    let blockCount = 0
+    let ids = new Array(4096).fill(0)
+    if (p.bitMap & (1 << i)) {
+      blockCount = r.i16()
+      ids = readContainer(r, 'blocks')
+    }
+    const bio = p.groundUp ? p.biomes.slice(i * 64, i * 64 + 64) : new Array(64).fill(0)
+    if (bio.length !== 64) throw new Error('biome array too short')
+    sections.push({ blockCount, blocksHash: hashU16(ids), biomesHash: hashU16(bio), distinct: new Set(ids).size })
+  }
+  if (p.groundUp && p.biomes.length !== 1024) throw new Error(`biome count ${p.biomes.length}`)
+  if (!r.eof()) trailingNonZero++ // 1.16 pads nothing: any leftover is reported
+  const hm = []
+  const entries = (p.heightmaps && p.heightmaps.value) || {}
+  for (const name of Object.keys(entries)) {
+    const e = entries[name]
+    if (!e || e.type !== 'longArray') continue
+    hm.push({ name, hash: hashU16(heightmapValues(e.value)) })
+  }
+  hm.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  return {
+    x: p.x,
+    z: p.z,
+    sections,
+    blockEntities: p.blockEntities.length,
+    hm,
+    light: { sky: 0, block: 0, h: new Fnv64().hex() }
+  }
+}
+
 function decodeChunk (p, numSections) {
   const sections = decodeSections(p.chunkData, numSections)
   const hm = []
@@ -455,7 +496,7 @@ function main () {
       })
       return
     }
-    if (p.dimensionCodec) {
+    if (p.dimensionCodec && !SECTIONS_114) {
       try {
         const nbt = require('prismarine-nbt')
         const codec = nbt.simplify(p.dimensionCodec)
@@ -475,8 +516,8 @@ function main () {
   client.on('map_chunk', (p) => {
     if (m.first_chunk_ms < 0) m.first_chunk_ms = Date.now() - t0
     try {
-      if (LEGACY_SECTIONS && !p.groundUp) { partialChunks++; armIdle(); return } // section-only update: ignored (documented)
-      const c = LEGACY_SECTIONS ? decodeLegacyColumn(p, hasSky) : decodeChunk(p, numSections)
+      if ((LEGACY_SECTIONS || SECTIONS_114) && !p.groundUp) { partialChunks++; armIdle(); return } // section-only update: ignored (documented)
+      const c = LEGACY_SECTIONS ? decodeLegacyColumn(p, hasSky) : SECTIONS_114 ? decodeChunk114(p) : decodeChunk(p, numSections)
       chunks.set(`${c.x},${c.z}`, c)
     } catch (e) {
       chunkErrors++

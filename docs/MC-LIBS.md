@@ -69,17 +69,19 @@ Mojang code. All of it runs with `bash tools/mc/run.sh` (about 10 minutes).
 | `mc_crypto` | RSA SPKI parse, PKCS#1 v1.5 encrypt, shared secret, CFB8 stream (sub-worker A) | **done** | node crypto (RSA decrypt, aes-128-cfb8) | 2670-2672 |
 | `mc_auth` | offline UUID, server hash, session join, MSA review (sub-worker A) | done, **session join only against a mock**, MSA never run against the live service | python mock server, published hash vectors | 2675 |
 | `mc_chunk` + `mc_world` | palette sections, heightmaps, light, coordinate math | **done** | independent python decoder / dump; real 1.20.1 server (109 chunks) | - |
+| `mc_flat` (+ `v340/mc_flat_v340`) | flattening table 1.12.2 `id<<4\|meta` -> 1.20.1 state ids, container remap | **done** | independent Node implementation (4096 entries), `tests/2746_mc_flat_remap.fi` | other legacy versions (1.8.9) need their own table |
 | `mc_dimension` | min_y / height from the Join Game codec | **done** | real 1.20.1 server | 2691 |
 | `mc_client` | Handshake -> Login -> (Configuration) -> Play for any version | done for 1.20.1 (real server); configuration phase **only compiled** | real 1.20.1 server | - |
 | `mc_net` | connect with retry / back-off, server list ping | **done** | python status server | - |
 | `mc_math` | Vec3 / AABB / voxel raycast / mat4 / frustum (sub-worker C) | **done** | numpy, brute force | 2680 |
 | `mc_mesh` | CPU greedy meshing + AO (sub-worker C wrote it, lead finished) | **done** | 128 meshes vs python brute force | 2730 |
 | `mc_noise` | RNGs, Perlin, simplex, octaves | **done** | real `java.util.Random`, python bit-identical, published vectors | 2700 |
+| `mc_encode` | schema driven packet WRITER: value store (`path=value` text) -> body, any packet of any generated version (same bytecode as the walker, SCHEMA_FORMAT 2 incl. holder sets, lpVec3, recursion) | **done** (byte-identical to the reference serializer for every fixture of 10 versions, both directions) | `tools/mc/encode/run.sh`: decode (`mc_schema.walk_values`) -> encode == fixture, reversed store, damaged stores | 2651 |
 | `mc_anvil` | .mca region files read / write | **done** | independent python reader / writer, fuzz | 2710 |
 | `demos/mcclient` | **final integration**: join a real server, dump + checksum == node-minecraft-protocol | **done** (M0 accepted, see ROUND-M0.md) | node-minecraft-protocol on a real 1.20.1 server | - |
 
 Not built (explicitly): rendering / GPU (blocked by H3), Wasm mod host, physics, inventory, entity decoding, online-mode login against
-the live Microsoft / Mojang services (needs a real account), schema-driven client packet writers (design: docs/MC-VERSIONS.md section 7), an epoll based `mc_net`, chunk
+the live Microsoft / Mojang services (needs a real account), an epoll based `mc_net`, chunk
 strategies other than 1.18+ (see MC-VERSIONS.md).
 
 ## Work split (sub-workers, separate git worktrees)

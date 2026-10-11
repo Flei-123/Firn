@@ -39,7 +39,7 @@ import mc.mc_version
 export {
     Container, Section, Chunk, Scratch,
     scratch_new, scratch_free, scratch_set_sky,
-    chunk_decode, chunk_decode_anon, chunk_decode_118, chunk_decode_19, chunk_decode_for, chunk_format_supported, chunk_free, chunk_section, chunk_alloc, chunk_release,
+    chunk_decode, chunk_decode_anon, chunk_decode_118, chunk_decode_19, chunk_decode_114, chunk_decode_for, container_remap, chunk_remap_blocks, chunk_merge_update, chunk_format_supported, chunk_free, chunk_section, chunk_alloc, chunk_release,
     container_get, container_bits, container_palette_size,
     BLOCKS_PER_SECTION, BIOMES_PER_SECTION, HM_ENTRIES, HM_MAX, HM_NAME_MAX,
 }
@@ -89,6 +89,7 @@ struct Chunk {
     light_hash: u64, // FNV-1a over all light arrays as sent
     bio: u64, // 256 biome octets of a ground-up CF_SECTIONS_19 column (index z*16+x), or 0
     ground_up: i32, // CF_SECTIONS_19: 1 = whole column, 0 = section update (the caller must not replace a column with it)
+    sec_mask: i32, // CF_SECTIONS_19 / 114: bit i = section i was sent in this packet (other formats: 65535)
 }
 
 // Reusable scratch memory for the decoder (one per decoding thread).
@@ -379,7 +380,7 @@ fn chunk_free(c: *mut Chunk) {
 fn chunk_size() -> usize {
     var a: [Chunk; 2] = [Chunk { x: 0, z: 0, nsec: 0, secs: 0, nbe: 0, nhm: 0,
             hm_name: [0; 128], hm_nlen: [0; 4], hm_val: 0, sky_n: 0, block_n: 0,
-            light_hash: 0 as u64, bio: 0, ground_up: 1 }; 2]
+            light_hash: 0 as u64, bio: 0, ground_up: 1, sec_mask: 65535 }; 2]
     return ((&a[1]) as u64 - (&a[0]) as u64) as usize
 }
 
@@ -401,6 +402,7 @@ fn chunk_alloc() -> u64 {
     (*c).light_hash = 0 as u64
     (*c).bio = 0
     (*c).ground_up = 1
+    (*c).sec_mask = 65535
     var i: usize = 0
     while i < 4 {
         (*c).hm_nlen[i] = 0
@@ -654,13 +656,14 @@ fn read_light(b: *mut bytes.Bytes, h: *mut u64) -> BytesError!i32 {
 // is one more function plus one `if` in chunk_decode_for (docs/MC-VERSIONS.md).
 //
 //   CF_CONTAINERS_118  implemented (chunk_decode below)         1.18 - 1.20.x
-//   CF_SECTIONS_114    not implemented: bitmask of sections, heightmaps NBT, separate
-//                      light packet, biomes as int array          1.14 - 1.17
+//   CF_SECTIONS_114    implemented for 1.16.2 - 1.16.5 (chunk_decode_114): bitmask of sections, heightmaps
+//                      NBT, separate light packet, biomes as int array, longs do not span  (1.14/1.15/1.17: open)
 //   CF_SECTIONS_19     implemented (chunk_decode_19): paletted blocks only, inline light, biome
 //                      bytes, block ids are id<<4|meta (no flattening)  1.9 - 1.12.2 (1.13 differs, see docs/MC-VERSIONS.md)
 //   CF_LEGACY_8        not implemented: unpaletted arrays        1.8
 fn chunk_format_supported(fmt: i32) -> bool {
     return fmt == mc_version.CF_CONTAINERS_118 || fmt == mc_version.CF_SECTIONS_19
+    || fmt == mc_version.CF_SECTIONS_114
 }
 
 // Strategy dispatch on the version's chunk format. Returns BytesError::Range for a
@@ -673,6 +676,9 @@ fn chunk_decode_for(v: *mut mc_version.Version, b: *mut bytes.Bytes, sc: *mut Sc
     }
     if (*v).chunk_format == mc_version.CF_SECTIONS_19 {
         return try chunk_decode_19(b, sc, c)
+    }
+    if (*v).chunk_format == mc_version.CF_SECTIONS_114 {
+        return try chunk_decode_114(b, sc, c, (*v).protocol)
     }
     return BytesError::Range
 }
@@ -860,6 +866,7 @@ fn chunk_decode_19(b: *mut bytes.Bytes, sc: *mut Scratch, c: *mut Chunk) -> Byte
     if mask < 0 || mask > 65535 {
         return BytesError::Range
     }
+    (*c).sec_mask = mask
     let dl: i32 = try bytes.get_varint(b)
     if dl < 0 || dl as usize > bytes.bytes_remaining(b) {
         return BytesError::Range
@@ -920,6 +927,9 @@ fn chunk_decode_19(b: *mut bytes.Bytes, sc: *mut Scratch, c: *mut Chunk) -> Byte
         }
         rt.mem_copy((*c).bio, bp, 256)
     }
+    if bytes.bytes_remaining(&data) != 0 {
+        return BytesError::Range // the section data must be consumed exactly (a wrong sky light flag shows up here)
+    }
     // block entities: varint count, then that many NBT compounds (named roots)
     let nbe: i32 = try bytes.get_varint(b)
     if nbe < 0 || nbe > 65536 {
@@ -943,4 +953,245 @@ fn chunk_decode_19(b: *mut bytes.Bytes, sc: *mut Scratch, c: *mut Chunk) -> Byte
         return BytesError::Range // the packet must be consumed exactly
     }
     return true
+}
+
+// ------------------------------------------------------------ CF_SECTIONS_114 (1.16.2 - 1.16.5)
+//
+// map_chunk body (protocol 751 - 754): x (i32), z (i32), groundUp (bool), bitMap (varint, bit i = section i
+// present), heightmaps (named NBT compound), biomes (ONLY when groundUp: varint count = 1024, then that many
+// varints), chunkData (varint length + octets), block entities (varint count + NBT compounds).
+// chunkData, per present section (lowest first):
+//     blockCount (i16), bits per block (u8), [palette length (varint) + entries (varint) when bits <= 8],
+//     data length in longs (varint), the packed longs -- an entry NEVER spans two longs (unlike 1.9 - 1.12.2).
+// Direct (global) ids use 15 bits in 1.16.5. There is NO light in this packet (separate update_light packet,
+// not decoded: sky/block counts are 0 and the light hash is the FNV offset basis).
+// The 1024 biome entries are ordered (y*4 + z)*4 + x with y = 0..63 (4 block cells), so section i owns the
+// entries i*64 .. i*64+63 in exactly the neutral Section.biomes order.
+//
+// A 1.16 column is always 256 blocks high (16 sections) -- datapack heights came with 1.17 -- so the
+// number of sections does not depend on the dimension. An absent section is all air (count 0).
+// 1.14 / 1.15 (longs span, 256 biome ints in 1.14) and 1.16.0 / 1.16.1 (extra ignoreOldData bool) and
+// 1.17 (long array mask) are NOT covered; the caller gets BytesError::Range for those protocols.
+const SECTIONS_114: usize = 16
+const BIOMES_114: usize = 1024
+
+fn chunk_decode_114(b: *mut bytes.Bytes, sc: *mut Scratch, c: *mut Chunk, protocol: i32) -> BytesError!bool {
+    if protocol < 751 || protocol > 754 {
+        return BytesError::Range
+    }
+    (*c).x = try bytes.get_i32(b)
+    (*c).z = try bytes.get_i32(b)
+    let gu: u8 = try bytes.get_u8(b)
+    (*c).ground_up = 0
+    if gu != 0 as u8 {
+        (*c).ground_up = 1
+    }
+    (*c).nsec = 0
+    (*c).secs = 0
+    (*c).nhm = 0
+    (*c).hm_val = 0
+    (*c).bio = 0
+    (*c).nbe = 0
+    (*c).sky_n = 0
+    (*c).block_n = 0
+    (*c).light_hash = 14695981039346656037 as u64
+    let mask: i32 = try bytes.get_varint(b)
+    if mask < 0 || mask > 65535 {
+        return BytesError::Range
+    }
+    (*c).sec_mask = mask
+    try read_heightmaps(b, c, false)
+    // biomes: 1024 varints, only in a ground-up column
+    var bio: u64 = 0
+    if (*c).ground_up == 1 {
+        let bn: i32 = try bytes.get_varint(b)
+        if bn != (BIOMES_114 as i32) {
+            return BytesError::Range
+        }
+        bio = rt.heap_alloc(BIOMES_114 * 2)
+        if bio == 0 {
+            return BytesError::OutOfMemory
+        }
+        var q: usize = 0
+        while q < BIOMES_114 {
+            let e: i32 = bytes.get_varint(b) catch 0 - 1
+            if e < 0 || e > 32767 {
+                rt.heap_free(bio, BIOMES_114 * 2)
+                return BytesError::Range
+            }
+            rt.st16(bio, q, e as u16)
+            q = q + 1
+        }
+    }
+    let r: bool = chunk_sections_114(b, sc, c, mask, bio) catch false
+    if bio != 0 {
+        rt.heap_free(bio, BIOMES_114 * 2)
+    }
+    if !r {
+        return BytesError::Range
+    }
+    return true
+}
+
+// chunkData + block entities of a 1.16.2 - 1.16.5 packet; `bio` = the 1024 biome ids (u16) or 0.
+fn chunk_sections_114(b: *mut bytes.Bytes, sc: *mut Scratch, c: *mut Chunk, mask: i32, bio: u64) -> BytesError!bool {
+    let dl: i32 = try bytes.get_varint(b)
+    if dl < 0 || dl as usize > bytes.bytes_remaining(b) {
+        return BytesError::Range
+    }
+    let dp: u64 = try bytes.get_span(b, dl as usize)
+    var data: bytes.Bytes = bytes.Bytes { data: dp, cap: dl as usize, len: dl as usize, pos: 0, bad: false }
+    let base: u64 = rt.heap_alloc(SECTIONS_114 * section_size())
+    if base == 0 {
+        return BytesError::OutOfMemory
+    }
+    (*c).secs = base
+    var i: usize = 0
+    while i < SECTIONS_114 {
+        let s: *mut Section = ((*c).secs + (i * section_size()) as u64) as *mut Section
+        (*s).blocks = container_empty()
+        (*s).biomes = container_empty()
+        (*c).nsec = i + 1
+        (*s).count = 0
+        if ((mask >> (i as u32)) & 1) != 0 {
+            (*s).count = (try bytes.get_i16(&data)) as i32
+            try container_decode(&data, BLOCKS_PER_SECTION, BLOCK_MAX_INDIRECT_BITS, sc, &(*s).blocks)
+        } else {
+            try container_zero(sc, BLOCKS_PER_SECTION, &(*s).blocks)
+        }
+        // biomes of this section: its 64 entries of the column array (all 0 without one)
+        var q: usize = 0
+        while q < BIOMES_PER_SECTION {
+            var v: u16 = 0 as u16
+            if bio != 0 {
+                v = rt.ld16(bio, i * BIOMES_PER_SECTION + q)
+            }
+            rt.st16((*sc).ids, q, v)
+            q = q + 1
+        }
+        try container_build(sc, BIOMES_PER_SECTION, &(*s).biomes)
+        i = i + 1
+    }
+    // block entities: varint count, then that many NBT compounds (named roots)
+    let nbe: i32 = try bytes.get_varint(b)
+    if nbe < 0 || nbe > 65536 {
+        return BytesError::Range
+    }
+    var n: i32 = 0
+    while n < nbe {
+        let t: u8 = nbt.nbt_read_type(b) catch 255 as u8
+        if t != nbt.TAG_COMPOUND {
+            return BytesError::Range
+        }
+        let nl: u16 = try bytes.get_u16(b)
+        try bytes.bytes_skip(b, nl as usize)
+        if !(nbt.nbt_skip_payload(b, t) catch false) {
+            return BytesError::Range
+        }
+        n = n + 1
+    }
+    (*c).nbe = nbe
+    if bytes.bytes_remaining(b) != 0 {
+        return BytesError::Range // the packet must be consumed exactly
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- flattening remap
+
+// Maps every value of `c` (n entries) through `table` (u16 [tn], e.g. the flattening table of
+// mc_flat); a value >= tn becomes 0 (air). Two old values may map to ONE new value: the palette
+// is then rebuilt (palette entries stay distinct, the index width shrinks if it can).
+fn container_remap(sc: *mut Scratch, c: *mut Container, n: usize, table: u64, tn: usize) -> BytesError!bool {
+    let pn: usize = (*c).pal_n as usize
+    if pn == 0 {
+        return true
+    }
+    var dup: bool = false
+    var k: usize = 0
+    while k < pn {
+        let v: usize = rt.ld16((*c).pal, k) as usize
+        var m: u16 = 0 as u16
+        if v < tn {
+            m = rt.ld16(table, v)
+        }
+        rt.st16((*sc).pal, k, m)
+        if rt.ld16((*sc).map, m as usize) != NONE16 {
+            dup = true
+        } else {
+            rt.st16((*sc).map, m as usize, k as u16)
+        }
+        k = k + 1
+    }
+    k = 0
+    while k < pn {
+        rt.st16((*sc).map, rt.ld16((*sc).pal, k) as usize, NONE16)
+        k = k + 1
+    }
+    if !dup {
+        rt.mem_copy((*c).pal, (*sc).pal, pn * 2)
+        return true
+    }
+    var i: usize = 0
+    while i < n {
+        let v: usize = container_get(c, i) as usize
+        var m: u16 = 0 as u16
+        if v < tn {
+            m = rt.ld16(table, v)
+        }
+        rt.st16((*sc).ids, i, m)
+        i = i + 1
+    }
+    var nc: Container = container_empty()
+    try container_build(sc, n, &nc)
+    container_free(c)
+    *c = nc
+    return true
+}
+
+// Remaps the blocks of every section of `c` through `table` (legacy id << 4 | meta -> global state id) and
+// recounts the non-air blocks (`Section.count`); biomes are not touched.
+fn chunk_remap_blocks(c: *mut Chunk, sc: *mut Scratch, table: u64, tn: usize) -> BytesError!bool {
+    var i: usize = 0
+    while i < (*c).nsec {
+        let s: *mut Section = chunk_section(c, i)
+        try container_remap(sc, &(*s).blocks, BLOCKS_PER_SECTION, table, tn)
+        var nonair: i32 = 0
+        var q: usize = 0
+        while q < BLOCKS_PER_SECTION {
+            if container_get(&(*s).blocks, q) != 0 as u16 {
+                nonair = nonair + 1
+            }
+            q = q + 1
+        }
+        (*s).count = nonair
+        i = i + 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- section updates
+
+// CF_SECTIONS_19: merges a section update `upd` (groundUp = false) into the stored column `dst`: every
+// section named in upd.sec_mask REPLACES the section of dst (the blocks container moves, `upd` keeps an
+// empty one and may be released). Biomes, heightmaps and block entities of dst stay; the light counters
+// add up, `light_hash` stays the hash of the original packet. Returns the number of sections merged.
+fn chunk_merge_update(dst: *mut Chunk, upd: *mut Chunk) -> i32 {
+    var merged: i32 = 0
+    var i: usize = 0
+    while i < (*dst).nsec && i < (*upd).nsec {
+        if (((*upd).sec_mask >> (i as u32)) & 1) != 0 {
+            let d: *mut Section = chunk_section(dst, i)
+            let u: *mut Section = chunk_section(upd, i)
+            container_free(&(*d).blocks)
+            (*d).blocks = (*u).blocks
+            (*u).blocks = container_empty()
+            (*d).count = (*u).count
+            merged = merged + 1
+        }
+        i = i + 1
+    }
+    (*dst).block_n = (*dst).block_n + (*upd).block_n
+    (*dst).sky_n = (*dst).sky_n + (*upd).sky_n
+    return merged
 }
