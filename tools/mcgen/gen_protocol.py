@@ -648,7 +648,7 @@ def generate(data_dir, version, out_path):
     w("//")
     w("// lib/mc/v%d/%s.fi -- Minecraft Java %s, protocol %d." % (pver, modname, version, pver))
     w("//")
-    w("// Source: minecraft-data (PrismarineJS, MIT), %s/protocol.json, plus the hand written" % proto_dir)
+    w("// Source: minecraft-data (PrismarineJS, open source), %s/protocol.json, plus the hand written" % proto_dir)
     w("// facts of tools/mcgen/versions.json. Regenerate everything with")
     w("//   python3 tools/mcgen/gen_protocol.py --all <minecraft-data>/data lib/mc")
     w("//")

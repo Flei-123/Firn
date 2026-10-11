@@ -192,7 +192,7 @@ def generate(data_dir, version, out_path):
     w("//")
     w("// lib/mc/v%d/mc_reg_v%d.fi -- registries of Minecraft Java %s (protocol %d):" % (pver, pver, version, pver))
     w("// %d blocks, %d block states, %d items, %d entities, %d biomes (%d octets)." % (nb, ns, ni, ne, nbi, len(blob)))
-    w("// Source: minecraft-data (PrismarineJS, MIT) data/%s. The reader is lib/mc/mc_registry.fi." % key)
+    w("// Source: minecraft-data (PrismarineJS, open source) data/%s. The reader is lib/mc/mc_registry.fi." % key)
     w("")
     w("import mc.mc_registry")
     w("")
