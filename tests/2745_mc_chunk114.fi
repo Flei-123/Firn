@@ -1,0 +1,206 @@
+// expect_exit: 0
+// tests/2745_mc_chunk114.fi -- mc_chunk.chunk_decode_114 (CF_SECTIONS_114, 1.16.2 - 1.16.5, protocol 754).
+// A map_chunk body is built BY HAND in the 1.16.5 wire layout (groundUp, bitMap, heightmaps NBT, 1024 biome
+// varints, chunkData with non-spanning packed longs, block entities) and decoded; every block, every biome,
+// the heightmap, the counters and the error paths are checked against the values the builder used.
+import std.bytes
+import std.rt
+import std.nbt
+import mc.mc_chunk
+import mc.mc_version
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+// section 0: indirect 5 bit, 20 palette entries (global id = 100 + 7 * index), index = (i * 31 + 7) % 20
+fn idx0(i: usize) -> usize {
+    return (i * 31 + 7) % 20
+}
+
+// section 2: direct 15 bit global ids
+fn dir2(i: usize) -> u16 {
+    return ((i * 7919 + 13) % 20000) as u16
+}
+
+// biome of column entry e (0..1023)
+fn bio_of(e: usize) -> u16 {
+    return ((e * 5 + e / 64) % 9) as u16
+}
+
+// writes `n` values of `bits` bits (never spanning a long) as a counted long array
+fn put_packed(b: *mut bytes.Bytes, n: usize, bits: u32, kind: i32) {
+    let epl: usize = 64 / (bits as usize)
+    let words: usize = (n + epl - 1) / epl
+    bytes.put_varint(b, words as i32)
+    var w: usize = 0
+    while w < words {
+        var word: u64 = 0
+        var e: usize = 0
+        while e < epl && w * epl + e < n {
+            var v: u64 = 0
+            if kind == 0 {
+                v = idx0(w * epl + e) as u64
+            } else {
+                v = dir2(w * epl + e) as u64
+            }
+            word = word | (v << ((e as u32) * bits))
+            e = e + 1
+        }
+        bytes.put_u64(b, word)
+        w = w + 1
+    }
+}
+
+// gu: groundUp flag; pn: declared palette length of section 0 (20 = valid, 19 = index out of range)
+fn build(body: *mut bytes.Bytes, gu: i32, pn: i32) {
+    bytes.put_i32(body, 0 - 2)
+    bytes.put_i32(body, 5)
+    bytes.put_u8(body, gu as u8)
+    bytes.put_varint(body, 5) // sections 0 and 2
+    // heightmaps: one MOTION_BLOCKING, 256 x 9 bit, 7 per long -> 37 longs
+    nbt.nbt_root_begin(body, 0, 0)
+    var longs: [u64; 37] = [0; 37]
+    var i: usize = 0
+    while i < 256 {
+        let v: u64 = ((i * 3 + 64) % 300) as u64
+        longs[i / 7] = longs[i / 7] | (v << (((i % 7) as u32) * 9 as u32))
+        i = i + 1
+    }
+    nbt.nbt_long_array(body, "MOTION_BLOCKING".p as u64, 15, (&longs[0]) as u64, 37)
+    nbt.nbt_end(body)
+    if gu != 0 {
+        bytes.put_varint(body, 1024)
+        var e: usize = 0
+        while e < 1024 {
+            bytes.put_varint(body, bio_of(e) as i32)
+            e = e + 1
+        }
+    }
+    // chunkData
+    var cd: bytes.Bytes = bytes.bytes_new()
+    bytes.put_i16(&cd, 100 as i16)
+    bytes.put_u8(&cd, 5 as u8)
+    bytes.put_varint(&cd, pn)
+    var j: i32 = 0
+    while j < pn {
+        bytes.put_varint(&cd, 100 + 7 * j)
+        j = j + 1
+    }
+    put_packed(&cd, 4096, 5 as u32, 0)
+    bytes.put_i16(&cd, 4090 as i16)
+    bytes.put_u8(&cd, 15 as u8)
+    put_packed(&cd, 4096, 15 as u32, 1)
+    bytes.put_varint(body, bytes.bytes_len(&cd) as i32)
+    bytes.put_bytes(body, &cd)
+    bytes.bytes_free(&cd)
+    // one block entity: named root compound (empty name) with an empty body
+    bytes.put_varint(body, 1)
+    nbt.nbt_root_begin(body, 0, 0)
+    nbt.nbt_end(body)
+}
+
+fn decode(body: *mut bytes.Bytes, sc: *mut mc_chunk.Scratch, p: *mut u64, protocol: i32) -> bool {
+    *p = mc_chunk.chunk_alloc()
+    bytes.bytes_set_pos(body, 0)
+    return mc_chunk.chunk_decode_114(body, sc, (*p) as *mut mc_chunk.Chunk, protocol) catch false
+}
+
+fn main(start: u64) -> i32 {
+    var sc: mc_chunk.Scratch = mc_chunk.scratch_new()
+    var body: bytes.Bytes = bytes.bytes_new()
+    build(&body, 1, 20)
+    var p: u64 = 0
+    check(decode(&body, &sc, &p, 754), 1)
+    let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+    check((*c).x == 0 - 2 && (*c).z == 5, 2)
+    check((*c).ground_up == 1 && (*c).nsec == 16 && (*c).nbe == 1, 3)
+    check((*c).sky_n == 0 && (*c).block_n == 0, 4)
+    check((*c).light_hash == 14695981039346656037 as u64, 5)
+    // heightmap
+    check((*c).nhm == 1 && (*c).hm_nlen[0] == 15, 6)
+    var hi: usize = 0
+    while hi < 256 {
+        check(rt.ld16((*c).hm_val, hi) == ((hi * 3 + 64) % 300) as u16, 7)
+        hi = hi + 1
+    }
+    // sections
+    var s: usize = 0
+    while s < 16 {
+        let sec: *mut mc_chunk.Section = mc_chunk.chunk_section(c, s)
+        var q: usize = 0
+        while q < 64 {
+            check(mc_chunk.container_get(&(*sec).biomes, q) == bio_of(s * 64 + q), 10)
+            q = q + 1
+        }
+        var i: usize = 0
+        while i < 4096 {
+            var want: u16 = 0 as u16
+            if s == 0 {
+                want = (100 + 7 * idx0(i)) as u16
+            } else if s == 2 {
+                want = dir2(i)
+            }
+            check(mc_chunk.container_get(&(*sec).blocks, i) == want, 11)
+            i = i + 1
+        }
+        if s == 0 {
+            check((*sec).count == 100, 12)
+            check(mc_chunk.container_palette_size(&(*sec).blocks) == 20 as u32, 13)
+        } else if s == 2 {
+            check((*sec).count == 4090, 14)
+        } else {
+            check((*sec).count == 0 && mc_chunk.container_palette_size(&(*sec).blocks) == 1 as u32, 15)
+        }
+        s = s + 1
+    }
+    mc_chunk.chunk_release(p)
+
+    // no ground-up: no biome array, still decodes; biomes are all 0 then
+    var body2: bytes.Bytes = bytes.bytes_new()
+    build(&body2, 0, 20)
+    check(decode(&body2, &sc, &p, 754), 20)
+    let c2: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+    check((*c2).ground_up == 0 && (*c2).nsec == 16, 21)
+    check(mc_chunk.container_get(&(*mc_chunk.chunk_section(c2, 3)).biomes, 9) == 0 as u16, 22)
+    mc_chunk.chunk_release(p)
+    bytes.bytes_free(&body2)
+
+    // protocols outside 751 .. 754 are refused (1.14 / 1.15 / 1.16.0 / 1.17 differ)
+    check(!decode(&body, &sc, &p, 755), 30)
+    mc_chunk.chunk_release(p)
+    check(!decode(&body, &sc, &p, 750), 31)
+    mc_chunk.chunk_release(p)
+
+    // palette index out of range (declared 19 entries, index 19 used)
+    var body3: bytes.Bytes = bytes.bytes_new()
+    build(&body3, 1, 19)
+    check(!decode(&body3, &sc, &p, 754), 32)
+    mc_chunk.chunk_release(p)
+    bytes.bytes_free(&body3)
+
+    // one trailing octet: the packet must be consumed exactly
+    bytes.put_u8(&body, 0 as u8)
+    check(!decode(&body, &sc, &p, 754), 33)
+    mc_chunk.chunk_release(p)
+
+    // every truncation is an error, never a crash
+    var full: bytes.Bytes = bytes.bytes_new()
+    build(&full, 1, 20)
+    let total: usize = bytes.bytes_len(&full)
+    var cut: usize = 0
+    while cut < total {
+        var tr: bytes.Bytes = bytes.Bytes { data: full.data, cap: cut, len: cut, pos: 0, bad: false }
+        let pp: u64 = mc_chunk.chunk_alloc()
+        let r: bool = mc_chunk.chunk_decode_114(&tr, &sc, pp as *mut mc_chunk.Chunk, 754) catch false
+        check(!r, 40)
+        mc_chunk.chunk_release(pp)
+        cut = cut + 997
+    }
+    bytes.bytes_free(&full)
+    bytes.bytes_free(&body)
+    mc_chunk.scratch_free(&sc)
+    return 0
+}
