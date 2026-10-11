@@ -46,6 +46,18 @@ window.cursor_delta(f, out)           captured: (dx, dy) since last call, pointe
 bits from the first call (fUi asks 0/0, a game 24/8). X11/Android/Osum return
 false/0 (stubs); MC-A fills the Linux side.
 
+## gpu.glctx on Windows (twin of MC-A's lib/gpu/glctx.fi)
+
+`lib/gpu/glctx.windows.fi` has the names of the EGL file (`GlCtx`, `ctx_open`,
+`ctx_open_x11`, `ctx_proc`, `ctx_swap`, `ctx_swap_interval`, `ctx_close`,
+`ctx_x11_pending/pump`) plus `ctx_borrow()` (use the context that
+`window.gpu_gl` made). `lib/gpu/gl33.fi` only needs `ctx_proc` + `dynlib.callx`,
+so it builds for Windows unchanged once `glctx.fi` is on main (it is on branch
+staff/firn-mv47zsn1 today; `import gpu.glctx` on Linux fails until then).
+`ctx_open` = hidden helper window; `ctx_open_x11` = visible window (name kept
+for the shared API). Probe: `tools/ffi/win_glctx_probe.fi` (Wine: headless
+clear+readback, window + swap, borrow: ok). gl33 itself was not run on Windows.
+
 ## How the context is made (`lib/gpu/wgl.windows.fi`)
 
 GetDC, ChoosePixelFormat/SetPixelFormat, legacy `wglCreateContext` to be able
