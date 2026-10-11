@@ -193,9 +193,10 @@ class Scene:
                     t = (z - self.sc["fs"]) / (self.sc["fe"] - self.sc["fs"])
                     t = min(1.0, max(0.0, t))
                     fg = int(math.floor(t * 256.0))
-                    r = (r * (256 - fg) + 150 * fg) // 256
-                    g = (g * (256 - fg) + 190 * fg) // 256
-                    b = (b * (256 - fg) + 230 * fg) // 256
+                    fr, fgc, fb = self.sc.get("fogc", (150, 190, 230))
+                    r = (r * (256 - fg) + fr * fg) // 256
+                    g = (g * (256 - fg) + fgc * fg) // 256
+                    b = (b * (256 - fg) + fb * fg) // 256
                 self.depth[i] = zinv
                 self.color[i] = r | (g << 8) | (b << 16) | 0xFF000000
 
