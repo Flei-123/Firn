@@ -120,6 +120,7 @@ struct Stats {
     walk_ok: u64,
     walk_fail: u64,
     chunk_bad: u64,
+    partial: u64, // section-only updates (groundUp = false) that were not stored
     kicked: bool,
     dim: mc_dimension.Dimension, // from the Join Game packet (default: overworld)
     dim_known: bool,
@@ -133,6 +134,12 @@ fn on_map_chunk(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc
     }
     let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
     let ok: bool = mc_chunk.chunk_decode_for(&(*cl).ver, mc_client.client_body(cl), sc, c, mc_dimension.dim_sections(&(*st).dim)) catch false
+    if ok && (*c).ground_up == 0 {
+        // a CF_SECTIONS_19 section update must be MERGED into its column; this client keeps whole columns only
+        mc_chunk.chunk_release(p)
+        (*st).partial = (*st).partial + 1 as u64
+        return
+    }
     if !ok || !mc_world.world_put(w, p) {
         mc_chunk.chunk_release(p)
         (*st).chunk_bad = (*st).chunk_bad + 1 as u64
@@ -144,6 +151,17 @@ fn on_map_chunk(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc
     }
     (*st).t_last_chunk = t
     (*st).chunks = (*st).chunks + 1 as u64
+}
+
+// CF_SECTIONS_19: the sky light arrays exist only in the overworld; Join Game and Respawn say which dimension.
+fn set_sky_from_dimension(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, id: i32) {
+    if (*cl).ver.chunk_format != mc_version.CF_SECTIONS_19 {
+        return
+    }
+    let d: i32 = mc_dimension.dim_legacy_id(&(*cl).ver, id, mc_client.client_body(cl))
+    if d != 0 - 2 {
+        mc_chunk.scratch_set_sky(sc, d == 0)
+    }
 }
 
 // Returns 0 when it ended by the idle rule (all chunks in), negative otherwise.
@@ -190,11 +208,14 @@ fn play_loop(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc_wo
                     if (*st).t_join == 0 as u64 {
                         (*st).t_join = now_ms()
                         (*st).dim_known = mc_dimension.dim_from_join(&(*cl).ver, id, mc_client.client_body(cl), &(*st).dim)
+                        set_sky_from_dimension(cl, sc, id)
                         // Client Information goes out only NOW: sent right after Login Success
                         // (before the first Play packet is read) the vanilla 1.20.1 server drops
                         // the connection with a DecoderException (measured, docs/mc/client.md).
                         mc_client.client_send_settings(cl, view)
                     }
+                } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_RESPAWN) {
+                    set_sky_from_dimension(cl, sc, id)
                 } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_MAP_CHUNK) {
                     on_map_chunk(cl, sc, w, st)
                 } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_UNLOAD_CHUNK) {
@@ -259,7 +280,7 @@ fn main(start: u64) -> i32 {
     var world: mc_world.World = mc_world.world_new()
     var sc: mc_chunk.Scratch = mc_chunk.scratch_new()
     var st: Stats = Stats { t_first_chunk: 0, t_last_chunk: 0, t_join: 0, t_last_packet: 0, chunks: 0, unloads: 0,
-        walk_ok: 0, walk_fail: 0, chunk_bad: 0, kicked: false, dim: mc_dimension.dim_default_overworld(), dim_known: false }
+        walk_ok: 0, walk_fail: 0, chunk_bad: 0, partial: 0, kicked: false, dim: mc_dimension.dim_default_overworld(), dim_known: false }
     mc_codec.wire_timeout(&cl.w, 100)
 
     var rc: i32 = 0
@@ -292,7 +313,7 @@ fn main(start: u64) -> i32 {
     if st.chunks > 0 as u64 {
         var out: rt.Buf = rt.buf_new()
         var digest: [u8; 32] = [0; 32]
-        dump.dump_build(&world, ver.protocol, &out, (&digest[0]) as u64)
+        dump.dump_build_fmt(&world, ver.protocol, ver.chunk_format, &out, (&digest[0]) as u64)
         if !rt.write_file(out_path, rt.buf_ptr(&out), rt.buf_len(&out)) {
             io.eprint_line("mcclient: cannot write the dump file")
             rc = 7
@@ -334,6 +355,7 @@ fn main(start: u64) -> i32 {
     say(f"metric chunk_packets={st.chunks}\n")
     say(f"metric chunk_bad={st.chunk_bad}\n")
     say(f"metric unloads={st.unloads}\n")
+    say(f"metric partial_chunks={st.partial}\n")
     say(f"metric walk_ok={st.walk_ok}\n")
     say(f"metric walk_fail={st.walk_fail}\n")
     say(f"metric dimension_from_join={st.dim_known} min_y={st.dim.min_y} height={st.dim.height}\n")

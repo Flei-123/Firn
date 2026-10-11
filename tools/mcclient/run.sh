@@ -27,6 +27,9 @@
 #      REF_EXTRA          number of additional reference runs (A3, A4, ...) for stability checks
 #      ALLOW_SKIP=1       exit 0 when B is skipped and A == A2 (default: exit 3)
 #      JAVA               java binary (default /usr/bin/java)
+#      MC_VERSION         release to test (default 1.20.1; also 1.12.2, 1.20.2 ...). The protocol number and the
+#                         node-minecraft-protocol version come from tools/mcgen/versions.json; the same value is
+#                         exported to ref_dump.cjs (MC_NMP, MC_PROTOCOL) and passed to the Firn client (arg 7).
 # Exit: 0 all equal, 1 mismatch, 2 setup/server failure, 3 reference stable but B skipped.
 set -uo pipefail
 
@@ -50,6 +53,14 @@ for a in "$@"; do
   esac
 done
 
+MCV="${MC_VERSION:-1.20.1}"
+read -r PROTO NMPV < <(node -e '
+  const v = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).versions[process.argv[2]];
+  if (!v) { console.error("unknown version " + process.argv[2]); process.exit(1); }
+  console.log(v.protocol + " " + (v.nmp || process.argv[2]));
+' "$HERE/../mcgen/versions.json" "$MCV") || { echo "run.sh: version $MCV not in versions.json" >&2; exit 2; }
+export MC_NMP="$NMPV" MC_PROTOCOL="$PROTO"
+LEGACY=0; DIFF=peaceful; case "$MCV" in 1.8*|1.9*|1.10*|1.11*|1.12*) LEGACY=1; DIFF=0 ;; esac
 W=$(mktemp -d)
 SRV_PID=""
 cleanup() {
@@ -74,9 +85,9 @@ if [ "$MOCK" -eq 1 ]; then
   [ -n "$PORT" ] || { cat "$W/server.log" >&2; die "mock server did not start"; }
   LEAVE_PATTERN='MOCK - not a real server: .* left'
 else
-echo "== setup (compression threshold $COMP, seed $SEED, view distance $VIEW) =="
+echo "== setup (version $MCV, protocol $PROTO, compression threshold $COMP, seed $SEED, view distance $VIEW) =="
   mkdir -p "$W/srv" "$W/out"
-  bash "$HERE/fetch_server.sh" "$W/srv" 1.20.1 || die "server download failed"
+  bash "$HERE/fetch_server.sh" "$W/srv" "$MCV" || die "server download failed"
   
   echo "eula=true" > "$W/srv/eula.txt"
   PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
@@ -90,7 +101,7 @@ simulation-distance=$VIEW
 spawn-protection=0
 max-players=4
 enable-command-block=false
-difficulty=peaceful
+difficulty=$DIFF
 network-compression-threshold=$COMP
 enable-rcon=false
 enable-query=false
@@ -117,7 +128,9 @@ EOF
   for gr in "randomTickSpeed 0" "doFireTick false" "doMobSpawning false" "doWeatherCycle false" "doDaylightCycle false" "doTraderSpawning false" "doPatrolSpawning false" "doInsomnia false"; do
     echo "gamerule $gr" >&3
   done
-  for i in $(seq 1 20); do grep -q 'Gamerule doInsomnia is now set' "$W/server.log" && break; sleep 0.5; done
+  if [ "$LEGACY" -eq 1 ]; then sleep 3; else
+    for i in $(seq 1 20); do grep -q 'Gamerule doInsomnia is now set' "$W/server.log" && break; sleep 0.5; done
+  fi
   
 fi
 LEAVE_PATTERN="${LEAVE_PATTERN:-left the game}"
@@ -146,7 +159,7 @@ run_ref() { # label [idle_ms]
 run_firn() { # label
   local label="$1"
   echo "== Firn client $label ($BIN) =="
-  timeout 150 "$BIN" 127.0.0.1 "$PORT" "$NAME" "$W/out/$label.dump" "$VIEW" "$IDLE" > "$W/out/$label.metrics" 2> "$W/out/$label.err"
+  timeout 150 "$BIN" 127.0.0.1 "$PORT" "$NAME" "$W/out/$label.dump" "$VIEW" "$IDLE" "$PROTO" > "$W/out/$label.metrics" 2> "$W/out/$label.err"
   local rc=$?
   [ -s "$W/out/$label.err" ] && { echo "  stderr of $label:"; head -3 "$W/out/$label.err" | sed 's/^/    /'; }
   [ $rc -eq 0 ] || { echo "run.sh: Firn client $label failed (rc $rc)" >&2; return 1; }

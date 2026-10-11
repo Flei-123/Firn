@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// ref_dump.cjs -- reference client for the M0 protocol prototype (MC 1.20.1, protocol 763).
+// ref_dump.cjs -- reference client for the M0 protocol prototype (MC 1.20.1, protocol 763; also 1.20.2 and 1.12.2
+// through MC_NMP / MC_PROTOCOL, see tools/mcclient/run.sh).
 //
 //   NODE_PATH=/root/firn/tools/mcserver/node_modules \
 //     node ref_dump.cjs <host> <port> <name> <dump_file> [view_distance=4] [idle_ms=2500]
@@ -17,6 +18,10 @@
 //   * sections = number of sections of the dimension (height / 16 from the Join Game codec); the vanilla
 //     server pads chunkData with zero octets behind them, so "until the buffer ends" is wrong.
 'use strict'
+
+const NMP_VERSION = process.env.MC_NMP || '1.20.1'
+const PROTOCOL = parseInt(process.env.MC_PROTOCOL || '763', 10)
+const LEGACY_SECTIONS = PROTOCOL <= 340 && PROTOCOL >= 107 // 1.9 - 1.12.2: CF_SECTIONS_19
 
 const fs = require('fs')
 const crypto = require('crypto')
@@ -131,6 +136,18 @@ class Reader {
     }
     return r
   }
+  bytes (n) {
+    if (this.p + n > this.b.length) throw new Error('byte run past end')
+    const out = this.b.subarray(this.p, this.p + n)
+    this.p += n
+    return out
+  }
+  longsBig (n) {
+    if (this.p + n * 8 > this.b.length) throw new Error('long array past end')
+    const out = new Array(n)
+    for (let i = 0; i < n; i++) { out[i] = this.b.readBigUInt64BE(this.p); this.p += 8 }
+    return out
+  }
   longs (n) {
     if (this.p + n * 8 > this.b.length) throw new Error('long array past end')
     const out = new Array(n)
@@ -205,6 +222,78 @@ function heightmapValues (arr) {
   return unpackLongs(longs, 9, 256)
 }
 
+
+// ---------------------------------------------------------------- 1.9 - 1.12.2 (CF_SECTIONS_19)
+// Section: bits per block (u8), palette length (varint; 0 = direct ids), palette entries (varint),
+// data array length (varint, in longs), the longs (an entry MAY span two longs in this format),
+// 2048 octets block light, 2048 octets sky light (only when the dimension has a sky).
+// Block value on the wire = id << 4 | metadata. A ground-up column ends with 256 biome octets.
+function unpackSpanning (longs, bits, count) {
+  const out = new Array(count)
+  const mask = (1n << BigInt(bits)) - 1n
+  for (let i = 0; i < count; i++) {
+    const bit = i * bits
+    const w = Math.floor(bit / 64)
+    const off = BigInt(bit % 64)
+    if (w >= longs.length) throw new Error('packed array too short')
+    let v = longs[w] >> off
+    if (off + BigInt(bits) > 64n) {
+      if (w + 1 >= longs.length) throw new Error('packed array too short')
+      v |= longs[w + 1] << (64n - off)
+    }
+    out[i] = Number(v & mask)
+  }
+  return out
+}
+
+function decodeLegacyColumn (p, hasSky) {
+  const r = new Reader(p.chunkData)
+  const sections = []
+  const f = new Fnv64()
+  let skyN = 0; let blockN = 0
+  for (let i = 0; i < 16; i++) {
+    if (!(p.bitMap & (1 << i))) {
+      sections.push({ blockCount: 0, blocksHash: hashU16(new Array(4096).fill(0)), distinct: 1, ids: null })
+      continue
+    }
+    let bits = r.u8()
+    const pn = r.varint()
+    const palette = []
+    for (let k = 0; k < pn; k++) palette.push(r.varint())
+    const nl = r.varint()
+    if (bits < 4) bits = 4
+    if (nl !== Math.ceil(4096 * bits / 64)) throw new Error(`legacy long count ${nl} for ${bits} bits`)
+    const ids = unpackSpanning(r.longsBig(nl), bits, 4096)
+    if (pn > 0) {
+      for (let k = 0; k < 4096; k++) {
+        if (ids[k] >= pn) throw new Error('legacy palette index out of range')
+        ids[k] = palette[ids[k]]
+      }
+    }
+    for (const b of r.bytes(2048)) f.byte(b)
+    blockN++
+    if (hasSky) { for (const b of r.bytes(2048)) f.byte(b); skyN++ }
+    let nonAir = 0
+    for (const v of ids) if (v !== 0) nonAir++
+    sections.push({ blockCount: nonAir, blocksHash: hashU16(ids), distinct: new Set(ids).size, ids })
+  }
+  let biomes = null
+  if (p.groundUp) {
+    biomes = Array.from(r.bytes(256))
+  }
+  for (let i = r.p; i < p.chunkData.length; i++) if (p.chunkData[i] !== 0) { trailingNonZero++; break }
+  return {
+    x: p.x,
+    z: p.z,
+    sections,
+    legacy: true,
+    biomesHash: biomes ? hashU16(biomes) : null,
+    blockEntities: p.blockEntities.length,
+    hm: [],
+    light: { sky: skyN, block: blockN, h: f.hex() }
+  }
+}
+
 function decodeChunk (p, numSections) {
   const sections = decodeSections(p.chunkData, numSections)
   const hm = []
@@ -230,12 +319,14 @@ function decodeChunk (p, numSections) {
 
 function buildDump (chunks) {
   const list = [...chunks.values()].sort((a, b) => a.x - b.x || a.z - b.z)
-  let s = 'mcdump 1\nprotocol 763\n'
+  let s = `mcdump 1\nprotocol ${PROTOCOL}\n`
   s += `chunks ${list.length}\n`
   for (const c of list) {
     s += `C ${c.x} ${c.z} sections=${c.sections.length} blockentities=${c.blockEntities}\n`
+    if (c.legacy && c.biomesHash) s += `B ${c.x} ${c.z} ${c.biomesHash}\n`
     c.sections.forEach((sec, i) => {
-      s += `S ${c.x} ${c.z} ${i} count=${sec.blockCount} distinct=${sec.distinct} blocks=${sec.blocksHash} biomes=${sec.biomesHash}\n`
+      if (c.legacy) s += `S ${c.x} ${c.z} ${i} count=${sec.blockCount} distinct=${sec.distinct} blocks=${sec.blocksHash}\n`
+      else s += `S ${c.x} ${c.z} ${i} count=${sec.blockCount} distinct=${sec.distinct} blocks=${sec.blocksHash} biomes=${sec.biomesHash}\n`
     })
     for (const h of c.hm) s += `H ${c.x} ${c.z} ${h.name} ${h.hash}\n`
     s += `L ${c.x} ${c.z} sky=${c.light.sky} block=${c.light.block} h=${c.light.h}\n`
@@ -265,7 +356,7 @@ function main () {
   let chunkErrors = 0
   let numSections = 24
 
-  const client = mc.createClient({ host, port, username: name, version: '1.20.1', auth: 'offline', viewDistance: String(viewDistance), hideErrors: false })
+  const client = mc.createClient({ host, port, username: name, version: NMP_VERSION, auth: 'offline', viewDistance: String(viewDistance), hideErrors: false })
 
   const finish = (code, msg) => {
     if (finished) return
@@ -291,6 +382,7 @@ function main () {
       walk_ok: walkOk,
       walk_fail: walkFail + chunkErrors,
       num_sections: numSections,
+      partial_chunks: partialChunks,
       trailing_nonzero_chunks: trailingNonZero,
       checksum: sum
     }
@@ -318,26 +410,39 @@ function main () {
     bytesDec += (full || buffer || Buffer.alloc(0)).length
   })
 
+  let hasSky = true
+  let partialChunks = 0
   client.on('login', (p) => {
     m.join_ms = Date.now() - t0
-    try {
-      const nbt = require('prismarine-nbt')
-      const codec = nbt.simplify(p.dimensionCodec)
-      const list = codec['minecraft:dimension_type'].value
-      const e = list.find((x) => x.name === p.worldType)
-      if (e && e.element && e.element.height > 0) numSections = e.element.height / 16
-    } catch (err) { console.error('dimension height lookup failed, assuming 24 sections: ' + err.message) }
+    if (LEGACY_SECTIONS) {
+      hasSky = p.dimension === 0 // 1.12.2: -1 nether, 0 overworld, 1 end (only the overworld has a sky)
+      client.write('settings', {
+        locale: 'en_US', viewDistance, chatFlags: 0, chatColors: true, skinParts: 0x7f, mainHand: 1
+      })
+      return
+    }
+    if (p.dimensionCodec) {
+      try {
+        const nbt = require('prismarine-nbt')
+        const codec = nbt.simplify(p.dimensionCodec)
+        const list = codec['minecraft:dimension_type'].value
+        const e = list.find((x) => x.name === p.worldType)
+        if (e && e.element && e.element.height > 0) numSections = e.element.height / 16
+      } catch (err) { console.error('dimension height lookup failed, assuming 24 sections: ' + err.message) }
+    } // 1.20.2+: the registries arrive in the configuration phase; the vanilla overworld has 24 sections
     client.write('settings', {
       locale: 'en_US', viewDistance, chatFlags: 0, chatColors: true,
       skinParts: 0x7f, mainHand: 1, enableTextFiltering: false, enableServerListing: true
     })
   })
+  client.on('chunk_batch_finished', () => { client.write('chunk_batch_received', { chunksPerTick: 10 }) })
   client.on('position', (p) => { client.write('teleport_confirm', { teleportId: p.teleportId }) })
 
   client.on('map_chunk', (p) => {
     if (m.first_chunk_ms < 0) m.first_chunk_ms = Date.now() - t0
     try {
-      const c = decodeChunk(p, numSections)
+      if (LEGACY_SECTIONS && !p.groundUp) { partialChunks++; armIdle(); return } // section-only update: ignored (documented)
+      const c = LEGACY_SECTIONS ? decodeLegacyColumn(p, hasSky) : decodeChunk(p, numSections)
       chunks.set(`${c.x},${c.z}`, c)
     } catch (e) {
       chunkErrors++
