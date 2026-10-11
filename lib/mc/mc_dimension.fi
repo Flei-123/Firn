@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_dimension.fi -- the height of the dimension a client is in.
+//
+// A chunk packet does not say how many sections its column has; the client knows it from the
+// DIMENSION TYPE (`min_y`, `height`; 16 blocks per section). Servers of 1.16.2 - 1.20.1 send
+// the registry of dimension types in the Join Game packet (`dimensionCodec`, NBT) and name
+// the one in use (`worldType`, a string). This file finds `min_y` and `height` of that entry
+// with the pull reader of std.nbt, without building a tree and without allocating.
+//
+//   dim_from_join(ver, join_body_view, &dim) -> bool
+//
+// 1.20.2+ sends the registries in the Configuration phase and names the dimension type
+// differently; those versions are not covered yet (the function returns false and the caller
+// keeps its default). The default for the overworld of every release since 1.18 is
+// min_y -64, height 384 (24 sections).
+
+import std.bytes
+import std.rt
+import std.nbt
+import mc.mc_version
+import mc.mc_schema
+
+export {
+    Dimension, dim_default_overworld, dim_sections, dim_from_join, dim_from_codec,
+}
+
+struct Dimension {
+    min_y: i32,
+    height: i32,
+}
+
+fn dim_default_overworld() -> Dimension {
+    return Dimension { min_y: 0 - 64, height: 384 }
+}
+
+// number of 16 block sections of the column (0 if the height is nonsense)
+fn dim_sections(d: *mut Dimension) -> usize {
+    if (*d).height <= 0 || (*d).height > 4096 || (*d).height % 16 != 0 {
+        return 0
+    }
+    return ((*d).height / 16) as usize
+}
+
+fn name_is(p: u64, n: usize, want: u64, wn: usize) -> bool {
+    return n == wn && rt.mem_eq(p, want, n)
+}
+
+// an "element" compound of one dimension type: min_y and height (ints)
+fn read_element(b: *mut bytes.Bytes, min_y: *mut i32, height: *mut i32, have_min: *mut bool, have_h: *mut bool) -> bool {
+    var go: bool = true
+    while go {
+        let t: u8 = nbt.nbt_read_type(b) catch 255 as u8
+        if t == 255 as u8 {
+            return false
+        }
+        if t == nbt.TAG_END {
+            return true
+        }
+        var nl: usize = 0
+        let np: u64 = nbt.nbt_read_name(b, &nl) catch 0
+        if t == nbt.TAG_INT && name_is(np, nl, "min_y".p as u64, 5) {
+            *min_y = nbt.nbt_read_i32(b) catch 0
+            *have_min = true
+        } else if t == nbt.TAG_INT && name_is(np, nl, "height".p as u64, 6) {
+            *height = nbt.nbt_read_i32(b) catch 0
+            *have_h = true
+        } else if !(nbt.nbt_skip_payload(b, t) catch false) {
+            return false
+        }
+    }
+    return false
+}
+
+// one entry of the dimension type list: { name, id, element }
+fn read_entry(b: *mut bytes.Bytes, want: u64, wn: usize, d: *mut Dimension, found: *mut bool) -> bool {
+    var matched: bool = false
+    var min_y: i32 = 0
+    var height: i32 = 0
+    var have_min: bool = false
+    var have_h: bool = false
+    while true {
+        let t: u8 = nbt.nbt_read_type(b) catch 255 as u8
+        if t == 255 as u8 {
+            return false
+        }
+        if t == nbt.TAG_END {
+            break
+        }
+        var nl: usize = 0
+        let np: u64 = nbt.nbt_read_name(b, &nl) catch 0
+        if t == nbt.TAG_STRING && name_is(np, nl, "name".p as u64, 4) {
+            var sl: usize = 0
+            let sp: u64 = nbt.nbt_read_string(b, &sl) catch 0
+            matched = sp != 0 && name_is(sp, sl, want, wn)
+        } else if t == nbt.TAG_COMPOUND && name_is(np, nl, "element".p as u64, 7) {
+            if !read_element(b, &min_y, &height, &have_min, &have_h) {
+                return false
+            }
+        } else if !(nbt.nbt_skip_payload(b, t) catch false) {
+            return false
+        }
+    }
+    if matched && have_min && have_h {
+        (*d).min_y = min_y
+        (*d).height = height
+        *found = true
+    }
+    return true
+}
+
+// Scans a `dimensionCodec` NBT (named root compound, cursor on the type octet) for the dimension
+// type called `want` (e.g. "minecraft:overworld"). false if it is not there or the NBT is damaged.
+fn dim_from_codec(b: *mut bytes.Bytes, want: u64, wn: usize, d: *mut Dimension) -> bool {
+    var rn: usize = 0
+    if (nbt.nbt_read_root(b, &rn) catch 0) == 0 && rn != 0 {
+        return false
+    }
+    var found: bool = false
+    while true {
+        let t: u8 = nbt.nbt_read_type(b) catch 255 as u8
+        if t == 255 as u8 || t == nbt.TAG_END {
+            return found
+        }
+        var nl: usize = 0
+        let np: u64 = nbt.nbt_read_name(b, &nl) catch 0
+        if t == nbt.TAG_COMPOUND && name_is(np, nl, "minecraft:dimension_type".p as u64, 24) {
+            // { "type": string, "value": list of compounds }
+            while true {
+                let t2: u8 = nbt.nbt_read_type(b) catch 255 as u8
+                if t2 == 255 as u8 {
+                    return false
+                }
+                if t2 == nbt.TAG_END {
+                    break
+                }
+                var nl2: usize = 0
+                let np2: u64 = nbt.nbt_read_name(b, &nl2) catch 0
+                if t2 == nbt.TAG_LIST && name_is(np2, nl2, "value".p as u64, 5) {
+                    var elem: u8 = 0
+                    var cnt: i32 = 0
+                    if !(nbt.nbt_read_list_header(b, &elem, &cnt) catch false) {
+                        return false
+                    }
+                    var i: i32 = 0
+                    while i < cnt {
+                        if !read_entry(b, want, wn, d, &found) {
+                            return false
+                        }
+                        i = i + 1
+                    }
+                } else if !(nbt.nbt_skip_payload(b, t2) catch false) {
+                    return false
+                }
+            }
+            return found
+        } else if !(nbt.nbt_skip_payload(b, t) catch false) {
+            return false
+        }
+    }
+    return found
+}
+
+// The dimension of a Join Game body (1.19 - 1.20.1 layout: `worldType` string + `dimensionCodec` NBT).
+// `join` is the received packet view (cursor behind the id); the cursor is not moved. false when
+// the version's join packet does not have these fields or the dimension is not in the codec.
+fn dim_from_join(ver: *mut mc_version.Version, id: i32, join: *mut bytes.Bytes, d: *mut Dimension) -> bool {
+    let sch: u64 = (*ver).schema_of(mc_version.ST_PLAY, mc_version.DIR_S2C, id)
+    if sch == 0 {
+        return false
+    }
+    var woff: usize = 0
+    var wlen: usize = 0
+    var coff: usize = 0
+    var clen: usize = 0
+    if !mc_schema.field_range(sch, "worldType".p as u64, 9, join, &woff, &wlen) {
+        return false
+    }
+    if !mc_schema.field_range(sch, "dimensionCodec".p as u64, 14, join, &coff, &clen) {
+        return false
+    }
+    let base: u64 = bytes.bytes_ptr(join)
+    var nb: bytes.Bytes = bytes.Bytes { data: base + coff as u64, cap: clen, len: clen, pos: 0, bad: false }
+    return dim_from_codec(&nb, base + woff as u64, wlen, d)
+}

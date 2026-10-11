@@ -1,0 +1,651 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_text.fi -- chat components: the JSON text format, legacy section-sign codes, styled spans.
+//
+// A server sends text (chat, kick reasons, item names, MOTD) as a JSON "component": a string, an object
+// {text | translate(+with) | keybind | score | selector, color, bold, italic, underlined, strikethrough,
+// obfuscated, extra: [...]} or an array of components. This file flattens such a component into a
+// TextDoc: the plain text plus a list of SPANS, each with one effective style. Styles are inherited by
+// `extra` entries, by the arguments of `translate` and by the remaining elements of an array (an array
+// [a, b, c] is `a` with the extra components b and c).
+//
+//   text_from_json(&doc, json, n, &tr)    parse + flatten (tr = translations, may be an empty table)
+//   text_from_legacy(&doc, p, n)          a string with section-sign codes ("§a" colours, "§l" bold, "§r" reset ...)
+//   text_plain / text_legacy / text_ansi  render a TextDoc
+//   text_span_count / _off / _len / _color / _flags        walk the spans
+//
+// Things this module does NOT do: resolve `score` / `selector` / `keybind` (they are shown as their
+// placeholder text), render fonts, or load a game language file (the caller gives a Translations table;
+// the community language.json of minecraft-data is a flat JSON object and works with `tr_load`).
+//
+// Hostile input: nesting is limited (MAX_DEPTH), the output is limited (MAX_TEXT, MAX_SPANS), JSON errors
+// are reported, nothing is read outside the input.
+
+import std.rt
+import std.bytes
+import std.json
+import std.str
+
+export {
+    TextDoc, Translations,
+    text_new, text_free, text_from_json, text_from_legacy,
+    text_plain, text_legacy, text_ansi,
+    text_span_count, text_span_off, text_span_len, text_span_color, text_span_flags, text_ptr, text_len,
+    tr_new, tr_free, tr_load, tr_count,
+    F_BOLD, F_ITALIC, F_UNDERLINED, F_STRIKETHROUGH, F_OBFUSCATED, NO_COLOR,
+    MAX_DEPTH, MAX_TEXT, MAX_SPANS,
+}
+
+const F_BOLD: u32 = 1
+const F_ITALIC: u32 = 2
+const F_UNDERLINED: u32 = 4
+const F_STRIKETHROUGH: u32 = 8
+const F_OBFUSCATED: u32 = 16
+const NO_COLOR: i32 = 0 - 1
+const MAX_DEPTH: i32 = 32
+const MAX_TEXT: usize = 1048576
+const MAX_SPANS: usize = 262144
+const SPAN_BYTES: usize = 16 // off u32, len u32, color i32, flags u32
+
+struct TextDoc {
+    text: rt.Buf,
+    spans: rt.Buf, // SPAN_BYTES per span
+    failed: bool, // a limit was hit: the content is truncated
+}
+
+struct Translations {
+    doc: json.Json,
+    root: u32,
+    ok: bool,
+}
+
+fn text_new() -> TextDoc {
+    return TextDoc { text: rt.buf_new(), spans: rt.buf_new(), failed: false }
+}
+
+fn text_free(t: *mut TextDoc) {
+    rt.buf_free(&(*t).text)
+    rt.buf_free(&(*t).spans)
+}
+
+fn text_ptr(t: *mut TextDoc) -> u64 { return rt.buf_ptr(&(*t).text) }
+fn text_len(t: *mut TextDoc) -> usize { return rt.buf_len(&(*t).text) }
+fn text_span_count(t: *mut TextDoc) -> usize { return rt.buf_len(&(*t).spans) / SPAN_BYTES }
+fn span_field(t: *mut TextDoc, i: usize, f: usize) -> u32 { return rt.ld32(rt.buf_ptr(&(*t).spans), i * 4 + f) }
+fn text_span_off(t: *mut TextDoc, i: usize) -> usize { return span_field(t, i, 0) as usize }
+fn text_span_len(t: *mut TextDoc, i: usize) -> usize { return span_field(t, i, 1) as usize }
+fn text_span_color(t: *mut TextDoc, i: usize) -> i32 { return bytes.bits_i32(span_field(t, i, 2)) }
+fn text_span_flags(t: *mut TextDoc, i: usize) -> u32 { return span_field(t, i, 3) }
+
+fn put32(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 16) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 24) & 255 as u32) as u8)
+}
+
+// ---- translations ------------------------------------------------------------------
+
+fn tr_new() -> Translations {
+    return Translations { doc: json.json_new(), root: 0 as u32, ok: false }
+}
+
+fn tr_free(t: *mut Translations) {
+    json.json_free(&(*t).doc)
+}
+
+// A flat JSON object {"key": "value with %s and %1$s", ...} (minecraft-data's language.json).
+fn tr_load(t: *mut Translations, p: u64, n: usize) -> bool {
+    json.json_free(&(*t).doc)
+    (*t).doc = json.json_new()
+    (*t).ok = json.json_parse(&(*t).doc, p, n) catch false
+    (*t).root = json.json_root(&(*t).doc)
+    if (*t).ok && json.json_kind(&(*t).doc, (*t).root) != json.JSON_OBJECT {
+        (*t).ok = false
+    }
+    return (*t).ok
+}
+
+fn tr_count(t: *mut Translations) -> usize {
+    if !(*t).ok {
+        return 0
+    }
+    return json.json_count(&(*t).doc, (*t).root)
+}
+
+// the format string for `key`, or an empty span
+fn tr_find(t: *mut Translations, key: u64, kn: usize) -> str.Span {
+    if !(*t).ok {
+        return str.span_empty()
+    }
+    let v: u32 = json.json_get(&(*t).doc, (*t).root, key, kn)
+    if v == json.JSON_NONE || json.json_kind(&(*t).doc, v) != json.JSON_STRING {
+        return str.span_empty()
+    }
+    return json.json_string(&(*t).doc, v)
+}
+
+// ---- colours -------------------------------------------------------------------------
+
+fn named_color(p: u64, n: usize) -> i32 {
+    if n == 5 && rt.mem_eq(p, "black".p as u64, 5) {
+        return 0
+    }
+    if n == 9 && rt.mem_eq(p, "dark_blue".p as u64, 9) {
+        return 170
+    }
+    if n == 10 && rt.mem_eq(p, "dark_green".p as u64, 10) {
+        return 43520
+    }
+    if n == 9 && rt.mem_eq(p, "dark_aqua".p as u64, 9) {
+        return 43690
+    }
+    if n == 8 && rt.mem_eq(p, "dark_red".p as u64, 8) {
+        return 11141120
+    }
+    if n == 11 && rt.mem_eq(p, "dark_purple".p as u64, 11) {
+        return 11141290
+    }
+    if n == 4 && rt.mem_eq(p, "gold".p as u64, 4) {
+        return 16755200
+    }
+    if n == 4 && rt.mem_eq(p, "gray".p as u64, 4) {
+        return 11184810
+    }
+    if n == 9 && rt.mem_eq(p, "dark_gray".p as u64, 9) {
+        return 5592405
+    }
+    if n == 4 && rt.mem_eq(p, "blue".p as u64, 4) {
+        return 5592575
+    }
+    if n == 5 && rt.mem_eq(p, "green".p as u64, 5) {
+        return 5635925
+    }
+    if n == 4 && rt.mem_eq(p, "aqua".p as u64, 4) {
+        return 5636095
+    }
+    if n == 3 && rt.mem_eq(p, "red".p as u64, 3) {
+        return 16733525
+    }
+    if n == 12 && rt.mem_eq(p, "light_purple".p as u64, 12) {
+        return 16733695
+    }
+    if n == 6 && rt.mem_eq(p, "yellow".p as u64, 6) {
+        return 16777045
+    }
+    if n == 5 && rt.mem_eq(p, "white".p as u64, 5) {
+        return 16777215
+    }
+    return NO_COLOR
+}
+
+fn hexval(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return (c - 87 as u8) as i32
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return (c - 55 as u8) as i32
+    }
+    return 0 - 1
+}
+
+// "red" / "#RRGGBB" -> 0xRRGGBB, anything else (including "reset") -> NO_COLOR
+fn parse_color(p: u64, n: usize) -> i32 {
+    if n == 7 && rt.ld8(p, 0) == 35 as u8 {
+        var v: i32 = 0
+        var i: usize = 1
+        while i < 7 {
+            let h: i32 = hexval(rt.ld8(p, i))
+            if h < 0 {
+                return NO_COLOR
+            }
+            v = v * 16 + h
+            i = i + 1
+        }
+        return v
+    }
+    return named_color(p, n)
+}
+
+// the 16 legacy colours in code order 0-9 a-f
+fn legacy_rgb(i: i32) -> i32 {
+    if i == 0 {
+        return 0
+    }
+    if i == 1 {
+        return 170
+    }
+    if i == 2 {
+        return 43520
+    }
+    if i == 3 {
+        return 43690
+    }
+    if i == 4 {
+        return 11141120
+    }
+    if i == 5 {
+        return 11141290
+    }
+    if i == 6 {
+        return 16755200
+    }
+    if i == 7 {
+        return 11184810
+    }
+    if i == 8 {
+        return 5592405
+    }
+    if i == 9 {
+        return 5592575
+    }
+    if i == 10 {
+        return 5635925
+    }
+    if i == 11 {
+        return 5636095
+    }
+    if i == 12 {
+        return 16733525
+    }
+    if i == 13 {
+        return 16733695
+    }
+    if i == 14 {
+        return 16777045
+    }
+    return 16777215
+}
+
+// ---- flattening -------------------------------------------------------------------------
+
+struct Style {
+    color: i32,
+    flags: u32,
+}
+
+fn emit(t: *mut TextDoc, p: u64, n: usize, st: Style) {
+    if n == 0 {
+        return
+    }
+    if rt.buf_len(&(*t).text) + n > MAX_TEXT {
+        (*t).failed = true
+        return
+    }
+    let off: usize = rt.buf_len(&(*t).text)
+    rt.buf_push_bytes(&(*t).text, p, n)
+    // merge with the previous span when the style is the same
+    let cnt: usize = text_span_count(t)
+    if cnt > 0 {
+        let last: usize = cnt - 1
+        if text_span_color(t, last) == st.color && text_span_flags(t, last) == st.flags {
+            rt.st32(rt.buf_ptr(&(*t).spans), last * 4 + 1, (text_span_len(t, last) + n) as u32)
+            return
+        }
+    }
+    if cnt >= MAX_SPANS {
+        (*t).failed = true
+        return
+    }
+    put32(&(*t).spans, off as u32)
+    put32(&(*t).spans, n as u32)
+    put32(&(*t).spans, bytes.bits_u32(st.color))
+    put32(&(*t).spans, st.flags)
+}
+
+fn flag_prop(j: *mut json.Json, o: u32, key: u64, kn: usize, bit: u32, st: *mut Style) {
+    let v: u32 = json.json_get(j, o, key, kn)
+    if v == json.JSON_NONE {
+        return
+    }
+    let k: u8 = json.json_kind(j, v)
+    if k == json.JSON_TRUE {
+        (*st).flags = (*st).flags | bit
+    } else if k == json.JSON_FALSE {
+        (*st).flags = (*st).flags & (4294967295 as u32 - bit)
+    }
+}
+
+// the effective style of component object `o` given the inherited `st`
+fn apply_style(j: *mut json.Json, o: u32, st: Style) -> Style {
+    var s: Style = st
+    let c: u32 = json.json_get(j, o, "color".p as u64, 5)
+    if c != json.JSON_NONE && json.json_kind(j, c) == json.JSON_STRING {
+        let sp: str.Span = json.json_string(j, c)
+        let rgb: i32 = parse_color(sp.p as u64, sp.n)
+        if rgb != NO_COLOR {
+            s.color = rgb
+        } else if sp.n == 5 && rt.mem_eq(sp.p as u64, "reset".p as u64, 5) {
+            s.color = NO_COLOR
+        }
+    }
+    flag_prop(j, o, "bold".p as u64, 4, F_BOLD, &s)
+    flag_prop(j, o, "italic".p as u64, 6, F_ITALIC, &s)
+    flag_prop(j, o, "underlined".p as u64, 10, F_UNDERLINED, &s)
+    flag_prop(j, o, "strikethrough".p as u64, 13, F_STRIKETHROUGH, &s)
+    flag_prop(j, o, "obfuscated".p as u64, 10, F_OBFUSCATED, &s)
+    return s
+}
+
+fn emit_span(t: *mut TextDoc, sp: str.Span, st: Style) {
+    emit(t, sp.p as u64, sp.n, st)
+}
+
+// "%s", "%1$s", "%%": the format string of a translation, arguments are the elements of `with`
+fn emit_translated(t: *mut TextDoc, j: *mut json.Json, tr: *mut Translations, fmt: str.Span, with: u32, st: Style, depth: i32) {
+    let p: u64 = fmt.p as u64
+    var seg: usize = 0
+    var i: usize = 0
+    var next_arg: usize = 0
+    while i < fmt.n {
+        if rt.ld8(p, i) == 37 as u8 && i + 1 < fmt.n {
+            let c: u8 = rt.ld8(p, i + 1)
+            if c == 37 as u8 {
+                emit(t, p + seg as u64, i - seg + 1, st) // up to and including one '%'
+                i = i + 2
+                seg = i
+            } else if c == 115 as u8 {
+                emit(t, p + seg as u64, i - seg, st)
+                emit_arg(t, j, tr, with, next_arg, st, depth)
+                next_arg = next_arg + 1
+                i = i + 2
+                seg = i
+            } else if c >= 49 as u8 && c <= 57 as u8 && i + 3 < fmt.n && rt.ld8(p, i + 2) == 36 as u8 && rt.ld8(p, i + 3) == 115 as u8 {
+                emit(t, p + seg as u64, i - seg, st)
+                emit_arg(t, j, tr, with, (c - 49 as u8) as usize, st, depth)
+                i = i + 4
+                seg = i
+            } else {
+                i = i + 1
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    emit(t, p + seg as u64, fmt.n - seg, st)
+}
+
+fn emit_arg(t: *mut TextDoc, j: *mut json.Json, tr: *mut Translations, with: u32, k: usize, st: Style, depth: i32) {
+    if with == json.JSON_NONE || json.json_kind(j, with) != json.JSON_ARRAY {
+        return
+    }
+    let a: u32 = json.json_child_at(j, with, k)
+    if a != json.JSON_NONE {
+        flatten(t, j, tr, a, st, depth + 1)
+    }
+}
+
+fn flatten(t: *mut TextDoc, j: *mut json.Json, tr: *mut Translations, n: u32, st: Style, depth: i32) {
+    if depth > MAX_DEPTH {
+        (*t).failed = true
+        return
+    }
+    let k: u8 = json.json_kind(j, n)
+    if k == json.JSON_STRING {
+        emit_span(t, json.json_string(j, n), st)
+        return
+    }
+    if k == json.JSON_NUMBER || k == json.JSON_TRUE || k == json.JSON_FALSE {
+        // vanilla shows a primitive as its text; numbers are printed as integers when they are
+        if k == json.JSON_TRUE {
+            emit(t, "true".p as u64, 4, st)
+        } else if k == json.JSON_FALSE {
+            emit(t, "false".p as u64, 5, st)
+        } else {
+            var b: rt.Buf = rt.buf_new()
+            rt.buf_push_dec_i64(&b, json.json_int(j, n))
+            emit(t, rt.buf_ptr(&b), rt.buf_len(&b), st)
+            rt.buf_free(&b)
+        }
+        return
+    }
+    if k == json.JSON_ARRAY {
+        // [a, b, c] = a with the extra components b, c: they inherit a's style
+        let first: u32 = json.json_child(j, n)
+        if first == json.JSON_NONE {
+            return
+        }
+        var inherited: Style = st
+        if json.json_kind(j, first) == json.JSON_OBJECT {
+            inherited = apply_style(j, first, st)
+        }
+        flatten(t, j, tr, first, st, depth + 1)
+        var c: u32 = json.json_next(j, first)
+        while c != json.JSON_NONE {
+            flatten(t, j, tr, c, inherited, depth + 1)
+            c = json.json_next(j, c)
+        }
+        return
+    }
+    if k != json.JSON_OBJECT {
+        return
+    }
+    let s: Style = apply_style(j, n, st)
+    let tx: u32 = json.json_get(j, n, "text".p as u64, 4)
+    let trk: u32 = json.json_get(j, n, "translate".p as u64, 9)
+    if tx != json.JSON_NONE {
+        let tk: u8 = json.json_kind(j, tx)
+        if tk == json.JSON_STRING {
+            emit_span(t, json.json_string(j, tx), s)
+        } else if tk == json.JSON_NUMBER {
+            var b: rt.Buf = rt.buf_new()
+            rt.buf_push_dec_i64(&b, json.json_int(j, tx))
+            emit(t, rt.buf_ptr(&b), rt.buf_len(&b), s)
+            rt.buf_free(&b)
+        }
+    } else if trk != json.JSON_NONE && json.json_kind(j, trk) == json.JSON_STRING {
+        let key: str.Span = json.json_string(j, trk)
+        var fmt: str.Span = tr_find(tr, key.p as u64, key.n)
+        if fmt.n == 0 {
+            let fb: u32 = json.json_get(j, n, "fallback".p as u64, 8)
+            if fb != json.JSON_NONE && json.json_kind(j, fb) == json.JSON_STRING {
+                fmt = json.json_string(j, fb)
+            }
+        }
+        if fmt.n == 0 {
+            emit_span(t, key, s) // an unknown key shows as itself
+        } else {
+            emit_translated(t, j, tr, fmt, json.json_get(j, n, "with".p as u64, 4), s, depth)
+        }
+    } else {
+        let kb: u32 = json.json_get(j, n, "keybind".p as u64, 7)
+        let sc: u32 = json.json_get(j, n, "score".p as u64, 5)
+        let se: u32 = json.json_get(j, n, "selector".p as u64, 8)
+        if kb != json.JSON_NONE && json.json_kind(j, kb) == json.JSON_STRING {
+            emit_span(t, json.json_string(j, kb), s)
+        } else if sc != json.JSON_NONE && json.json_kind(j, sc) == json.JSON_OBJECT {
+            let v: u32 = json.json_get(j, sc, "value".p as u64, 5)
+            let nm: u32 = json.json_get(j, sc, "name".p as u64, 4)
+            if v != json.JSON_NONE && json.json_kind(j, v) == json.JSON_STRING {
+                emit_span(t, json.json_string(j, v), s)
+            } else if nm != json.JSON_NONE && json.json_kind(j, nm) == json.JSON_STRING {
+                emit_span(t, json.json_string(j, nm), s)
+            }
+        } else if se != json.JSON_NONE && json.json_kind(j, se) == json.JSON_STRING {
+            emit_span(t, json.json_string(j, se), s)
+        }
+    }
+    let ex: u32 = json.json_get(j, n, "extra".p as u64, 5)
+    if ex != json.JSON_NONE && json.json_kind(j, ex) == json.JSON_ARRAY {
+        var c: u32 = json.json_child(j, ex)
+        while c != json.JSON_NONE {
+            flatten(t, j, tr, c, s, depth + 1)
+            c = json.json_next(j, c)
+        }
+    }
+}
+
+// Parses `n` octets of JSON and flattens the component into `t`. false: not JSON (nothing is added);
+// the document's `failed` flag tells if a limit cut the content short.
+fn text_from_json(t: *mut TextDoc, p: u64, n: usize, tr: *mut Translations) -> bool {
+    var j: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&j, p, n) catch false
+    if !ok {
+        json.json_free(&j)
+        return false
+    }
+    flatten(t, &j, tr, json.json_root(&j), Style { color: NO_COLOR, flags: 0 as u32 }, 0)
+    json.json_free(&j)
+    return true
+}
+
+// ---- legacy codes -----------------------------------------------------------------------
+
+// section sign (U+00A7) is the two octets C2 A7
+fn text_from_legacy(t: *mut TextDoc, p: u64, n: usize) {
+    var st: Style = Style { color: NO_COLOR, flags: 0 as u32 }
+    var seg: usize = 0
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) == 194 as u8 && i + 2 < n && rt.ld8(p, i + 1) == 167 as u8 {
+            emit(t, p + seg as u64, i - seg, st)
+            var c: u8 = rt.ld8(p, i + 2)
+            if c >= 65 as u8 && c <= 90 as u8 {
+                c = c + 32 as u8
+            }
+            if (c >= 48 as u8 && c <= 57 as u8) || (c >= 97 as u8 && c <= 102 as u8) {
+                st.color = legacy_rgb(hexval(c))
+                st.flags = 0 as u32 // a colour code resets the formatting, as in the game
+            } else if c == 107 as u8 {
+                st.flags = st.flags | F_OBFUSCATED
+            } else if c == 108 as u8 {
+                st.flags = st.flags | F_BOLD
+            } else if c == 109 as u8 {
+                st.flags = st.flags | F_STRIKETHROUGH
+            } else if c == 110 as u8 {
+                st.flags = st.flags | F_UNDERLINED
+            } else if c == 111 as u8 {
+                st.flags = st.flags | F_ITALIC
+            } else if c == 114 as u8 {
+                st.color = NO_COLOR
+                st.flags = 0 as u32
+            }
+            i = i + 3
+            seg = i
+        } else {
+            i = i + 1
+        }
+    }
+    emit(t, p + seg as u64, n - seg, st)
+}
+
+// ---- rendering ----------------------------------------------------------------------------
+
+fn text_plain(t: *mut TextDoc, out: *mut rt.Buf) {
+    rt.buf_push_bytes(out, text_ptr(t), text_len(t))
+}
+
+// nearest of the 16 legacy colours
+fn nearest_legacy(rgb: i32) -> i32 {
+    var best: i32 = 15
+    var bd: i64 = 1000000000
+    var i: i32 = 0
+    while i < 16 {
+        let c: i32 = legacy_rgb(i)
+        let dr: i64 = ((c >> 16) & 255) as i64 - ((rgb >> 16) & 255) as i64
+        let dg: i64 = ((c >> 8) & 255) as i64 - ((rgb >> 8) & 255) as i64
+        let db: i64 = (c & 255) as i64 - (rgb & 255) as i64
+        let d: i64 = dr * dr + dg * dg + db * db
+        if d < bd {
+            bd = d
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn legacy_code(i: i32) -> u8 {
+    if i < 10 {
+        return 48 as u8 + i as u8
+    }
+    return 97 as u8 + (i - 10) as u8
+}
+
+fn put_sign(out: *mut rt.Buf, code: u8) {
+    rt.buf_push(out, 194 as u8)
+    rt.buf_push(out, 167 as u8)
+    rt.buf_push(out, code)
+}
+
+// Every span starts with a reset, then its colour (nearest of the 16), then its flags -- the form the
+// game itself accepts. A span without colour and flags is written plain.
+fn text_legacy(t: *mut TextDoc, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < text_span_count(t) {
+        let col: i32 = text_span_color(t, i)
+        let fl: u32 = text_span_flags(t, i)
+        if col != NO_COLOR || fl != 0 as u32 {
+            put_sign(out, 114 as u8)
+            if col != NO_COLOR {
+                put_sign(out, legacy_code(nearest_legacy(col)))
+            }
+            if (fl & F_OBFUSCATED) != 0 as u32 {
+                put_sign(out, 107 as u8)
+            }
+            if (fl & F_BOLD) != 0 as u32 {
+                put_sign(out, 108 as u8)
+            }
+            if (fl & F_STRIKETHROUGH) != 0 as u32 {
+                put_sign(out, 109 as u8)
+            }
+            if (fl & F_UNDERLINED) != 0 as u32 {
+                put_sign(out, 110 as u8)
+            }
+            if (fl & F_ITALIC) != 0 as u32 {
+                put_sign(out, 111 as u8)
+            }
+        } else if i > 0 {
+            put_sign(out, 114 as u8)
+        }
+        rt.buf_push_bytes(out, text_ptr(t) + text_span_off(t, i) as u64, text_span_len(t, i))
+        i = i + 1
+    }
+}
+
+fn put_esc(out: *mut rt.Buf) {
+    rt.buf_push(out, 27 as u8)
+    rt.buf_push(out, 91 as u8)
+}
+
+// ANSI terminal text: ESC[0m, 24 bit colour (38;2;R;G;B), 1 bold, 3 italic, 4 underline, 9 strikethrough,
+// 5 (blink) for obfuscated; a final reset closes the line.
+fn text_ansi(t: *mut TextDoc, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < text_span_count(t) {
+        let col: i32 = text_span_color(t, i)
+        let fl: u32 = text_span_flags(t, i)
+        put_esc(out)
+        rt.buf_push_bytes(out, "0".p as u64, 1)
+        if col != NO_COLOR {
+            rt.buf_push_bytes(out, ";38;2;".p as u64, 6)
+            rt.buf_push_dec_i64(out, ((col >> 16) & 255) as i64)
+            rt.buf_push(out, 59 as u8)
+            rt.buf_push_dec_i64(out, ((col >> 8) & 255) as i64)
+            rt.buf_push(out, 59 as u8)
+            rt.buf_push_dec_i64(out, (col & 255) as i64)
+        }
+        if (fl & F_BOLD) != 0 as u32 {
+            rt.buf_push_bytes(out, ";1".p as u64, 2)
+        }
+        if (fl & F_ITALIC) != 0 as u32 {
+            rt.buf_push_bytes(out, ";3".p as u64, 2)
+        }
+        if (fl & F_UNDERLINED) != 0 as u32 {
+            rt.buf_push_bytes(out, ";4".p as u64, 2)
+        }
+        if (fl & F_OBFUSCATED) != 0 as u32 {
+            rt.buf_push_bytes(out, ";5".p as u64, 2)
+        }
+        if (fl & F_STRIKETHROUGH) != 0 as u32 {
+            rt.buf_push_bytes(out, ";9".p as u64, 2)
+        }
+        rt.buf_push(out, 109 as u8)
+        rt.buf_push_bytes(out, text_ptr(t) + text_span_off(t, i) as u64, text_span_len(t, i))
+        i = i + 1
+    }
+    put_esc(out)
+    rt.buf_push_bytes(out, "0m".p as u64, 2)
+}

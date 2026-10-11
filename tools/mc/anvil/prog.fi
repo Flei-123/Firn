@@ -1,0 +1,239 @@
+// tools/mc/anvil/prog.fi -- the Firn side of the mc_anvil cross-check.
+//
+//     prog write <file> <seed>      run the scenario (80 writes / removals) and save the region
+//     prog read <file>              print one line per chunk: `c <slot> stamp=<s> len=<n> fnv=<h>`
+//     prog fuzz <file> <rounds> <seed>   damage copies of the file at random: no crash, no hang
+//
+// The scenario is a pure function of the seed (an LCG), reimplemented in ref.py; the python side
+// writes / reads the files with its own implementation of the public format.
+import std.rt
+import std.io
+import std.bytes
+import mc.mc_anvil
+
+struct Gen {
+    x: u64,
+}
+
+fn gen_next(g: *mut Gen) -> u64 {
+    (*g).x = ((*g).x * 1103515245 as u64 + 12345 as u64) % 2147483648 as u64
+    return (*g).x >> 8
+}
+
+fn fnv(p: u64, n: usize) -> u64 {
+    var h: u64 = 14695981039346656037 as u64
+    var i: usize = 0
+    while i < n {
+        h = (h ^ (rt.ld8(p, i) as u64)) *% 1099511628211 as u64
+        i = i + 1
+    }
+    return h
+}
+
+fn size_of_choice(i: u64) -> usize {
+    if i == 0 as u64 {
+        return 1
+    }
+    if i == 1 as u64 {
+        return 100
+    }
+    if i == 2 as u64 {
+        return 4091
+    }
+    if i == 3 as u64 {
+        return 4092
+    }
+    if i == 4 as u64 {
+        return 4096
+    }
+    if i == 5 as u64 {
+        return 8183
+    }
+    if i == 6 as u64 {
+        return 8187
+    }
+    if i == 7 as u64 {
+        return 20000
+    }
+    if i == 8 as u64 {
+        return 70000
+    }
+    if i == 9 as u64 {
+        return 250000
+    }
+    return 900000
+}
+
+fn ctype_of_choice(i: u64) -> u8 {
+    if i == 0 as u64 {
+        return 2 as u8
+    }
+    if i == 1 as u64 {
+        return 2 as u8
+    }
+    if i == 2 as u64 {
+        return 3 as u8
+    }
+    return 1 as u8
+}
+
+fn scenario(r: *mut mc_anvil.Region, seed: u64) -> bool {
+    var g: Gen = Gen { x: seed }
+    var step: u64 = 0
+    while step < 80 as u64 {
+        let act: u64 = gen_next(&g) % 10 as u64
+        let x: i32 = (gen_next(&g) % 6 as u64) as i32 - 3
+        let z: i32 = (gen_next(&g) % 6 as u64) as i32 - 3
+        if act < 8 as u64 {
+            let n: usize = size_of_choice(gen_next(&g) % 11 as u64)
+            let ct: u8 = ctype_of_choice(gen_next(&g) % 4 as u64)
+            let buf: u64 = rt.heap_alloc(n)
+            var i: usize = 0
+            let low: bool = step % 3 as u64 == 0 as u64
+            while i < n {
+                if low {
+                    rt.st8(buf, i, (gen_next(&g) % 7 as u64) as u8)
+                } else {
+                    rt.st8(buf, i, (gen_next(&g) % 256 as u64) as u8)
+                }
+                i = i + 1
+            }
+            let ok: bool = mc_anvil.region_write(r, x, z, buf, n, ct, (1000 as u64 + step) as u32) catch false
+            rt.heap_free(buf, n)
+            if !ok {
+                return false
+            }
+        } else {
+            mc_anvil.region_remove(r, x, z)
+        }
+        step = step + 1 as u64
+    }
+    return true
+}
+
+fn print_chunks(r: *mut mc_anvil.Region) {
+    var s: i32 = 0
+    while s < 1024 {
+        let x: i32 = s % 32
+        let z: i32 = s / 32
+        if mc_anvil.region_has(r, x, z) {
+            var out: rt.Buf = rt.buf_new()
+            let n: usize = mc_anvil.region_read(r, x, z, &out) catch 99999999999
+            if n == 99999999999 {
+                io.fmt_print(f"c {s} ERROR\n")
+            } else {
+                io.fmt_print(f"c {s} stamp={mc_anvil.region_timestamp(r, x, z)} len={n} fnv=")
+                var h: rt.Buf = rt.buf_new()
+                rt.buf_push_hex_u64(&h, fnv(out.ptr, out.len), 16)
+                io.print_bytes(rt.buf_ptr(&h), rt.buf_len(&h))
+                rt.buf_free(&h)
+                io.fmt_print(f"\n")
+            }
+            rt.buf_free(&out)
+        }
+        s = s + 1
+    }
+}
+
+fn parse(p: u64) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < rt.c_length(p) {
+        v = v * 10 as u64 + (rt.ld8(p, i) - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        return 2
+    }
+    let mode: u64 = rt.arg_ptr(start, 1)
+    let file: u64 = rt.arg_ptr(start, 2)
+    let m: u8 = rt.ld8(mode, 0)
+    if m == 119 as u8 {
+        var r: mc_anvil.Region = mc_anvil.region_new()
+        if !scenario(&r, parse(rt.arg_ptr(start, 3))) {
+            return 3
+        }
+        let chk: usize = mc_anvil.region_check(&r) catch 99999999999
+        if chk == 99999999999 {
+            io.fmt_print(f"region_check FAILED after the scenario\n")
+            return 4
+        }
+        if !mc_anvil.region_save(&r, file) {
+            return 5
+        }
+        mc_anvil.region_free(&r)
+        return 0
+    }
+    if m == 114 as u8 {
+        var r: mc_anvil.Region = mc_anvil.region_new()
+        mc_anvil.region_free(&r)
+        let ok: bool = mc_anvil.region_load(file, &r) catch false
+        if !ok {
+            io.fmt_print(f"load FAILED\n")
+            return 3
+        }
+        print_chunks(&r)
+        mc_anvil.region_free(&r)
+        return 0
+    }
+    // fuzz: damage a copy of the file 'rounds' times at random and exercise everything
+    var orig: rt.Buf = rt.buf_new()
+    if !rt.read_file(file, &orig) {
+        return 3
+    }
+    let rounds: u64 = parse(rt.arg_ptr(start, 3))
+    var g: Gen = Gen { x: parse(rt.arg_ptr(start, 4)) }
+    var loaded: u64 = 0
+    var read_ok: u64 = 0
+    var read_err: u64 = 0
+    var k: u64 = 0
+    while k < rounds {
+        let n: usize = orig.len
+        let copy: u64 = rt.heap_alloc(n)
+        rt.mem_copy(copy, orig.ptr, n)
+        let flips: u64 = 1 as u64 + gen_next(&g) % 8 as u64
+        var f: u64 = 0
+        while f < flips {
+            var at: usize = (gen_next(&g) % (n as u64)) as usize
+            if gen_next(&g) % 2 as u64 == 0 as u64 {
+                at = (gen_next(&g) % 8192 as u64) as usize
+            }
+            rt.st8(copy, at, (gen_next(&g) % 256 as u64) as u8)
+            f = f + 1 as u64
+        }
+        var m2: usize = n
+        if gen_next(&g) % 4 as u64 == 0 as u64 {
+            m2 = (gen_next(&g) % (n as u64)) as usize
+        }
+        var rr: mc_anvil.Region = mc_anvil.region_new()
+        mc_anvil.region_free(&rr)
+        let ok: bool = mc_anvil.region_from_bytes(copy, m2, &rr) catch false
+        if ok {
+            loaded = loaded + 1 as u64
+            mc_anvil.region_check(&rr) catch 0
+            var s: i32 = 0
+            while s < 1024 {
+                var out: rt.Buf = rt.buf_new()
+                let got: usize = mc_anvil.region_read(&rr, s % 32, s / 32, &out) catch 99999999999
+                if got == 99999999999 {
+                    read_err = read_err + 1 as u64
+                } else {
+                    read_ok = read_ok + 1 as u64
+                }
+                rt.buf_free(&out)
+                s = s + 1
+            }
+            var tiny: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8]
+            mc_anvil.region_write(&rr, 1, 1, (&tiny[0]) as u64, 8, 2 as u8, 1 as u32) catch false
+            mc_anvil.region_free(&rr)
+        }
+        rt.heap_free(copy, n)
+        k = k + 1 as u64
+    }
+    io.fmt_print(f"fuzz rounds={rounds} loaded={loaded} chunk_reads_ok={read_ok} chunk_reads_refused={read_err}\n")
+    return 0
+}

@@ -1,0 +1,98 @@
+// expect_exit: 0
+// tests/2710_mc_anvil_basic.fi -- mc_anvil in memory: write / read / replace / remove, sector reuse,
+// hostile headers. The cross-check against an independent python reader / writer is tools/mc/anvil/run.sh.
+import std.rt
+import mc.mc_anvil
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+fn fill(p: u64, n: usize, seed: u8) {
+    var i: usize = 0
+    while i < n {
+        rt.st8(p, i, ((i * 7 + seed as usize) & 255) as u8)
+        i = i + 1
+    }
+}
+
+fn same(p: u64, q: u64, n: usize) -> bool {
+    return rt.mem_eq(p, q, n)
+}
+
+fn main() -> i32 {
+    var r: mc_anvil.Region = mc_anvil.region_new()
+    check(mc_anvil.region_sector_count(&r) == 2 && mc_anvil.region_count(&r) == 0, 1)
+    let a: u64 = rt.heap_alloc(10000)
+    let b: u64 = rt.heap_alloc(3000)
+    fill(a, 10000, 1 as u8)
+    fill(b, 3000, 9 as u8)
+    // write, read back (all three compressions), negative coordinates wrap into the region
+    check(mc_anvil.region_write(&r, 0 - 1, 33, a, 10000, 2 as u8, 77 as u32) catch false, 2)
+    check(mc_anvil.region_has(&r, 31, 1), 3)
+    check(mc_anvil.region_write(&r, 5, 5, b, 3000, 3 as u8, 78 as u32) catch false, 4)
+    check(mc_anvil.region_write(&r, 6, 5, b, 3000, 1 as u8, 79 as u32) catch false, 5)
+    check(mc_anvil.region_count(&r) == 3, 6)
+    check((mc_anvil.region_check(&r) catch 0) == 3, 7)
+    var out: rt.Buf = rt.buf_new()
+    check((mc_anvil.region_read(&r, 31, 1, &out) catch 0) == 10000 && same(out.ptr, a, 10000), 8)
+    rt.buf_clear(&out)
+    check((mc_anvil.region_read(&r, 5, 5, &out) catch 0) == 3000 && same(out.ptr, b, 3000), 9)
+    rt.buf_clear(&out)
+    check((mc_anvil.region_read(&r, 6, 5, &out) catch 0) == 3000 && same(out.ptr, b, 3000), 10)
+    check(mc_anvil.region_timestamp(&r, 5, 5) == 78 as u32, 11)
+    // a chunk that does not exist
+    rt.buf_clear(&out)
+    check((mc_anvil.region_read(&r, 1, 1, &out) catch 99) == 99, 12)
+    // replacing with something smaller keeps the place; larger moves it; the file stays consistent
+    let sectors: usize = mc_anvil.region_sector_count(&r)
+    check(mc_anvil.region_write(&r, 5, 5, b, 100, 3 as u8, 80 as u32) catch false, 13)
+    check(mc_anvil.region_sector_count(&r) == sectors, 14)
+    check(mc_anvil.region_write(&r, 5, 5, a, 10000, 3 as u8, 81 as u32) catch false, 15)
+    check((mc_anvil.region_check(&r) catch 0) == 3, 16)
+    rt.buf_clear(&out)
+    check((mc_anvil.region_read(&r, 5, 5, &out) catch 0) == 10000 && same(out.ptr, a, 10000), 17)
+    // removal frees the sectors for reuse
+    check(mc_anvil.region_remove(&r, 6, 5), 18)
+    check(!mc_anvil.region_remove(&r, 6, 5), 19)
+    check(mc_anvil.region_count(&r) == 2, 20)
+    let before: usize = mc_anvil.region_sector_count(&r)
+    check(mc_anvil.region_write(&r, 7, 7, b, 3000, 3 as u8, 82 as u32) catch false, 21)
+    check(mc_anvil.region_sector_count(&r) == before, 22) // went into the freed place
+    // too big for 255 sectors
+    let big: u64 = rt.heap_alloc(1100000)
+    fill(big, 1100000, 3 as u8)
+    check(!(mc_anvil.region_write(&r, 8, 8, big, 1100000, 3 as u8, 1 as u32) catch false), 23)
+    rt.heap_free(big, 1100000)
+    // hostile files: too short, not a sector multiple, an entry pointing outside, two chunks on one sector
+    var bad: mc_anvil.Region = mc_anvil.region_new()
+    mc_anvil.region_free(&bad)
+    let junk: u64 = rt.heap_alloc(16384)
+    var i: usize = 0
+    while i < 16384 {
+        rt.st8(junk, i, 0 as u8)
+        i = i + 1
+    }
+    check(!(mc_anvil.region_from_bytes(junk, 100, &bad) catch false), 24)
+    check(!(mc_anvil.region_from_bytes(junk, 8193, &bad) catch false), 25)
+    rt.st8(junk, 0, 0 as u8)
+    rt.st8(junk, 1, 0 as u8)
+    rt.st8(junk, 2, 200 as u8)
+    rt.st8(junk, 3, 1 as u8) // sector 200 of a 4 sector file
+    check(!(mc_anvil.region_from_bytes(junk, 16384, &bad) catch false), 26)
+    rt.st8(junk, 2, 2 as u8) // slot 0 -> sector 2, 1 sector
+    rt.st8(junk, 6, 2 as u8)
+    rt.st8(junk, 7, 1 as u8) // slot 1 -> sector 2 as well
+    rt.st8(junk, 8192 + 3, 20 as u8) // length 20 at sector 2
+    check(mc_anvil.region_from_bytes(junk, 16384, &bad) catch false, 27) // each entry alone is plausible
+    check((mc_anvil.region_check(&bad) catch 99999) == 99999, 28) // but they share a sector
+    mc_anvil.region_free(&bad)
+    rt.heap_free(junk, 16384)
+    rt.buf_free(&out)
+    mc_anvil.region_free(&r)
+    rt.heap_free(a, 10000)
+    rt.heap_free(b, 3000)
+    return 0
+}

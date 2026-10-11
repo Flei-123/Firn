@@ -1,0 +1,528 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_noise.fi -- deterministic random numbers and gradient noise for world generation.
+//
+// Everything here is bit-reproducible on any machine: integer generators use the wrapping
+// operators, the noise functions only add, multiply and floor f64 values in a fixed order
+// (no fused multiply-add, no library calls except `std.math.floor` and `sqrt`).
+//
+//   RNGs
+//     SplitMix64      one u64 of state; the standard seeding generator
+//     Xoshiro256SS    xoshiro256** 1.0, seeded through SplitMix64
+//     JavaRandom      the 48-bit linear congruential generator that java.util.Random is
+//                     specified to be (its JavaDoc gives the algorithm): next(bits), nextInt(),
+//                     nextInt(bound), nextLong(), nextDouble(), nextBoolean(). Cross-checked
+//                     against the real java.util.Random by tools/mc/noise/run.sh.
+//   Noise (3D unless noted; all return roughly -1 .. 1)
+//     perlin_*        Ken Perlin's "improved noise" (2002, public domain reference
+//                     implementation); `Perlin` holds a permutation table, either the
+//                     reference table (perlin_reference) or one shuffled from a seed
+//     simplex2/3      Gustavson's simplex noise ("Simplex noise demystified", public domain)
+//     octaves         fractal sum: frequency *= lacunarity, amplitude *= persistence, normalised
+//   Heightfield helper: a 16x16 column heightmap as an example of use.
+//
+// No dependency on any game version.
+
+import std.rt
+import std.math
+
+export {
+    SplitMix64, splitmix_new, splitmix_next,
+    Xoshiro, xoshiro_new, xoshiro_next,
+    JavaRandom, jrandom_new, jrandom_next_bits, jrandom_next_int, jrandom_next_int_bound,
+    jrandom_next_long, jrandom_next_double, jrandom_next_bool,
+    Perlin, perlin_reference, perlin_seeded, perlin3, perlin2,
+    simplex2, simplex3,
+    perlin_octaves3, simplex_octaves2,
+    heightmap_16x16,
+}
+
+// ================================================================== RNGs
+
+struct SplitMix64 {
+    s: u64,
+}
+
+fn splitmix_new(seed: u64) -> SplitMix64 {
+    return SplitMix64 { s: seed }
+}
+
+fn splitmix_next(g: *mut SplitMix64) -> u64 {
+    (*g).s = (*g).s +% 11400714819323198485 as u64
+    var z: u64 = (*g).s
+    z = (z ^ (z >> 30)) *% 13787848793156543929 as u64
+    z = (z ^ (z >> 27)) *% 10723151780598845931 as u64
+    return z ^ (z >> 31)
+}
+
+struct Xoshiro {
+    s0: u64,
+    s1: u64,
+    s2: u64,
+    s3: u64,
+}
+
+fn rotl(x: u64, k: u32) -> u64 {
+    return (x << k) | (x >> (64 as u32 - k))
+}
+
+// xoshiro256** seeded the way its authors recommend: four outputs of SplitMix64
+fn xoshiro_new(seed: u64) -> Xoshiro {
+    var sm: SplitMix64 = splitmix_new(seed)
+    var x: Xoshiro = Xoshiro { s0: 0 as u64, s1: 0 as u64, s2: 0 as u64, s3: 0 as u64 }
+    x.s0 = splitmix_next(&sm)
+    x.s1 = splitmix_next(&sm)
+    x.s2 = splitmix_next(&sm)
+    x.s3 = splitmix_next(&sm)
+    return x
+}
+
+fn xoshiro_next(g: *mut Xoshiro) -> u64 {
+    let result: u64 = rotl((*g).s1 *% 5 as u64, 7 as u32) *% 9 as u64
+    let t: u64 = (*g).s1 << 17
+    (*g).s2 = (*g).s2 ^ (*g).s0
+    (*g).s3 = (*g).s3 ^ (*g).s1
+    (*g).s1 = (*g).s1 ^ (*g).s2
+    (*g).s0 = (*g).s0 ^ (*g).s3
+    (*g).s2 = (*g).s2 ^ t
+    (*g).s3 = rotl((*g).s3, 45 as u32)
+    return result
+}
+
+const JMASK: u64 = 281474976710655 // 2^48 - 1
+const JMULT: u64 = 25214903917 // 0x5DEECE66D
+const JADD: u64 = 11
+
+struct JavaRandom {
+    seed: u64, // 48 bits
+}
+
+fn jrandom_new(seed: i64) -> JavaRandom {
+    return JavaRandom { seed: ((seed as u64) ^ JMULT) & JMASK }
+}
+
+// next(bits) of java.util.Random: the high `bits` bits of the new 48 bit state, as a signed 32 bit int
+fn jrandom_next_bits(g: *mut JavaRandom, bits: u32) -> i32 {
+    (*g).seed = ((*g).seed *% JMULT +% JADD) & JMASK
+    let v: u64 = (*g).seed >> (48 as u32 - bits)
+    return bytes_i32(v & 4294967295 as u64)
+}
+
+// reinterpret the low 32 bits as a signed int (the cast Java does implicitly)
+fn bytes_i32(v: u64) -> i32 {
+    if v >= 2147483648 as u64 {
+        return (v as i64 - 4294967296) as i32
+    }
+    return v as i32
+}
+
+fn jrandom_next_int(g: *mut JavaRandom) -> i32 {
+    return jrandom_next_bits(g, 32 as u32)
+}
+
+// nextInt(bound), bound > 0: power of two by multiplication, otherwise rejection sampling
+fn jrandom_next_int_bound(g: *mut JavaRandom, bound: i32) -> i32 {
+    var r: i32 = jrandom_next_bits(g, 31 as u32)
+    let m: i32 = bound - 1
+    if (bound & m) == 0 {
+        return ((bound as i64 * r as i64) >> 31) as i32
+    }
+    var u: i32 = r
+    r = u % bound
+    // Java: while (u - r + m < 0) with 32 bit wrap-around. In i64: reject when the sum leaves int range
+    while (u as i64) - (r as i64) + (m as i64) >= 2147483648 {
+        u = jrandom_next_bits(g, 31 as u32)
+        r = u % bound
+    }
+    return r
+}
+
+fn jrandom_next_long(g: *mut JavaRandom) -> i64 {
+    let hi: i64 = jrandom_next_bits(g, 32 as u32) as i64
+    let lo: i64 = jrandom_next_bits(g, 32 as u32) as i64
+    return (hi << 32) + lo
+}
+
+#[allow_fp]
+fn jrandom_next_double(g: *mut JavaRandom) -> f64 {
+    let a: i64 = jrandom_next_bits(g, 26 as u32) as i64
+    let b: i64 = jrandom_next_bits(g, 27 as u32) as i64
+    return ((a << 27) + b) as f64 * 0.00000000000000011102230246251565
+}
+
+fn jrandom_next_bool(g: *mut JavaRandom) -> bool {
+    return jrandom_next_bits(g, 1 as u32) != 0
+}
+
+// ================================================================== Perlin (improved noise)
+
+struct Perlin {
+    p: [u8; 512], // the permutation, repeated once
+}
+
+// Ken Perlin's reference permutation table (the 256 values of his 2002 implementation)
+fn reference_table() -> [u8; 256] {
+    return [151 as u8, 160 as u8, 137 as u8, 91 as u8, 90 as u8, 15 as u8, 131 as u8, 13 as u8, 201 as u8, 95 as u8, 96 as u8, 53 as u8, 194 as u8, 233 as u8, 7 as u8, 225 as u8, 140 as u8, 36 as u8, 103 as u8, 30 as u8, 69 as u8, 142 as u8, 8 as u8, 99 as u8, 37 as u8, 240 as u8, 21 as u8, 10 as u8, 23 as u8, 190 as u8, 6 as u8, 148 as u8, 247 as u8, 120 as u8, 234 as u8, 75 as u8, 0 as u8, 26 as u8, 197 as u8, 62 as u8, 94 as u8, 252 as u8, 219 as u8, 203 as u8, 117 as u8, 35 as u8, 11 as u8, 32 as u8, 57 as u8, 177 as u8, 33 as u8, 88 as u8, 237 as u8, 149 as u8, 56 as u8, 87 as u8, 174 as u8, 20 as u8, 125 as u8, 136 as u8, 171 as u8, 168 as u8, 68 as u8, 175 as u8, 74 as u8, 165 as u8, 71 as u8, 134 as u8, 139 as u8, 48 as u8, 27 as u8, 166 as u8, 77 as u8, 146 as u8, 158 as u8, 231 as u8, 83 as u8, 111 as u8, 229 as u8, 122 as u8, 60 as u8, 211 as u8, 133 as u8, 230 as u8, 220 as u8, 105 as u8, 92 as u8, 41 as u8, 55 as u8, 46 as u8, 245 as u8, 40 as u8, 244 as u8, 102 as u8, 143 as u8, 54 as u8, 65 as u8, 25 as u8, 63 as u8, 161 as u8, 1 as u8, 216 as u8, 80 as u8, 73 as u8, 209 as u8, 76 as u8, 132 as u8, 187 as u8, 208 as u8, 89 as u8, 18 as u8, 169 as u8, 200 as u8, 196 as u8, 135 as u8, 130 as u8, 116 as u8, 188 as u8, 159 as u8, 86 as u8, 164 as u8, 100 as u8, 109 as u8, 198 as u8, 173 as u8, 186 as u8, 3 as u8, 64 as u8, 52 as u8, 217 as u8, 226 as u8, 250 as u8, 124 as u8, 123 as u8, 5 as u8, 202 as u8, 38 as u8, 147 as u8, 118 as u8, 126 as u8, 255 as u8, 82 as u8, 85 as u8, 212 as u8, 207 as u8, 206 as u8, 59 as u8, 227 as u8, 47 as u8, 16 as u8, 58 as u8, 17 as u8, 182 as u8, 189 as u8, 28 as u8, 42 as u8, 223 as u8, 183 as u8, 170 as u8, 213 as u8, 119 as u8, 248 as u8, 152 as u8, 2 as u8, 44 as u8, 154 as u8, 163 as u8, 70 as u8, 221 as u8, 153 as u8, 101 as u8, 155 as u8, 167 as u8, 43 as u8, 172 as u8, 9 as u8, 129 as u8, 22 as u8, 39 as u8, 253 as u8, 19 as u8, 98 as u8, 108 as u8, 110 as u8, 79 as u8, 113 as u8, 224 as u8, 232 as u8, 178 as u8, 185 as u8, 112 as u8, 104 as u8, 218 as u8, 246 as u8, 97 as u8, 228 as u8, 251 as u8, 34 as u8, 242 as u8, 193 as u8, 238 as u8, 210 as u8, 144 as u8, 12 as u8, 191 as u8, 179 as u8, 162 as u8, 241 as u8, 81 as u8, 51 as u8, 145 as u8, 235 as u8, 249 as u8, 14 as u8, 239 as u8, 107 as u8, 49 as u8, 192 as u8, 214 as u8, 31 as u8, 181 as u8, 199 as u8, 106 as u8, 157 as u8, 184 as u8, 84 as u8, 204 as u8, 176 as u8, 115 as u8, 121 as u8, 50 as u8, 45 as u8, 127 as u8, 4 as u8, 150 as u8, 254 as u8, 138 as u8, 236 as u8, 205 as u8, 93 as u8, 222 as u8, 114 as u8, 67 as u8, 29 as u8, 24 as u8, 72 as u8, 243 as u8, 141 as u8, 128 as u8, 195 as u8, 78 as u8, 66 as u8, 215 as u8, 61 as u8, 156 as u8, 180 as u8]
+}
+
+fn perlin_reference() -> Perlin {
+    var pl: Perlin = Perlin { p: [0; 512] }
+    let t: [u8; 256] = reference_table()
+    var i: usize = 0
+    while i < 256 {
+        pl.p[i] = t[i]
+        pl.p[i + 256] = t[i]
+        i = i + 1
+    }
+    return pl
+}
+
+// permutation shuffled (Fisher-Yates) with the Java compatible generator: the same seed gives
+// the same noise on every machine
+fn perlin_seeded(seed: i64) -> Perlin {
+    var pl: Perlin = Perlin { p: [0; 512] }
+    var t: [u8; 256] = [0; 256]
+    var i: usize = 0
+    while i < 256 {
+        t[i] = i as u8
+        i = i + 1
+    }
+    var g: JavaRandom = jrandom_new(seed)
+    i = 0
+    while i < 256 {
+        let j: usize = i + jrandom_next_int_bound(&g, (256 - i) as i32) as usize
+        let tmp: u8 = t[i]
+        t[i] = t[j]
+        t[j] = tmp
+        i = i + 1
+    }
+    i = 0
+    while i < 256 {
+        pl.p[i] = t[i]
+        pl.p[i + 256] = t[i]
+        i = i + 1
+    }
+    return pl
+}
+
+#[allow_fp]
+fn fade(t: f64) -> f64 {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+#[allow_fp]
+fn lerp(t: f64, a: f64, b: f64) -> f64 {
+    return a + t * (b - a)
+}
+
+#[allow_fp]
+fn grad3(hash: i32, x: f64, y: f64, z: f64) -> f64 {
+    let h: i32 = hash & 15
+    var u: f64 = y
+    if h < 8 {
+        u = x
+    }
+    var v: f64 = z
+    if h < 4 {
+        v = y
+    } else if h == 12 || h == 14 {
+        v = x
+    }
+    var a: f64 = u
+    if (h & 1) != 0 {
+        a = 0.0 - u
+    }
+    var b: f64 = v
+    if (h & 2) != 0 {
+        b = 0.0 - v
+    }
+    return a + b
+}
+
+#[allow_fp]
+fn perlin3(pl: *mut Perlin, x0: f64, y0: f64, z0: f64) -> f64 {
+    let fx: f64 = math.floor(x0)
+    let fy: f64 = math.floor(y0)
+    let fz: f64 = math.floor(z0)
+    let xi: i32 = (fx as i64 & 255) as i32
+    let yi: i32 = (fy as i64 & 255) as i32
+    let zi: i32 = (fz as i64 & 255) as i32
+    let x: f64 = x0 - fx
+    let y: f64 = y0 - fy
+    let z: f64 = z0 - fz
+    let u: f64 = fade(x)
+    let v: f64 = fade(y)
+    let w: f64 = fade(z)
+    let a: i32 = (*pl).p[xi as usize] as i32 + yi
+    let aa: i32 = (*pl).p[a as usize] as i32 + zi
+    let ab: i32 = (*pl).p[(a + 1) as usize] as i32 + zi
+    let b: i32 = (*pl).p[(xi + 1) as usize] as i32 + yi
+    let ba: i32 = (*pl).p[b as usize] as i32 + zi
+    let bb: i32 = (*pl).p[(b + 1) as usize] as i32 + zi
+    return lerp(w, lerp(v, lerp(u, grad3((*pl).p[aa as usize] as i32, x, y, z),
+                grad3((*pl).p[ba as usize] as i32, x - 1.0, y, z)),
+            lerp(u, grad3((*pl).p[ab as usize] as i32, x, y - 1.0, z),
+                grad3((*pl).p[bb as usize] as i32, x - 1.0, y - 1.0, z))),
+        lerp(v, lerp(u, grad3((*pl).p[(aa + 1) as usize] as i32, x, y, z - 1.0),
+                grad3((*pl).p[(ba + 1) as usize] as i32, x - 1.0, y, z - 1.0)),
+            lerp(u, grad3((*pl).p[(ab + 1) as usize] as i32, x, y - 1.0, z - 1.0),
+                grad3((*pl).p[(bb + 1) as usize] as i32, x - 1.0, y - 1.0, z - 1.0))))
+}
+
+// the 2D slice (z = 0) of the improved noise
+#[allow_fp]
+fn perlin2(pl: *mut Perlin, x: f64, y: f64) -> f64 {
+    return perlin3(pl, x, y, 0.0)
+}
+
+// ================================================================== Simplex (Gustavson)
+
+// the 2D code uses the x and y parts of the 12 cube gradients (Gustavson's original)
+#[allow_fp]
+fn grad2d(hash: i32, x: f64, y: f64) -> f64 {
+    return grad3s(hash, x, y, 0.0)
+}
+
+#[allow_fp]
+fn simplex2(pl: *mut Perlin, xin: f64, yin: f64) -> f64 {
+    let f2: f64 = 0.5 * (math.sqrt(3.0) - 1.0)
+    let g2: f64 = (3.0 - math.sqrt(3.0)) / 6.0
+    let s: f64 = (xin + yin) * f2
+    let i: i32 = math.floor(xin + s) as i32
+    let j: i32 = math.floor(yin + s) as i32
+    let t: f64 = (i + j) as f64 * g2
+    let x0: f64 = xin - (i as f64 - t)
+    let y0: f64 = yin - (j as f64 - t)
+    var i1: i32 = 0
+    var j1: i32 = 1
+    if x0 > y0 {
+        i1 = 1
+        j1 = 0
+    }
+    let x1: f64 = x0 - i1 as f64 + g2
+    let y1: f64 = y0 - j1 as f64 + g2
+    let x2: f64 = x0 - 1.0 + 2.0 * g2
+    let y2: f64 = y0 - 1.0 + 2.0 * g2
+    let ii: i32 = i & 255
+    let jj: i32 = j & 255
+    let gi0: i32 = (*pl).p[(ii + (*pl).p[jj as usize] as i32) as usize] as i32
+    let gi1: i32 = (*pl).p[(ii + i1 + (*pl).p[(jj + j1) as usize] as i32) as usize] as i32
+    let gi2: i32 = (*pl).p[(ii + 1 + (*pl).p[(jj + 1) as usize] as i32) as usize] as i32
+    var n0: f64 = 0.0
+    var n1: f64 = 0.0
+    var n2: f64 = 0.0
+    var t0: f64 = 0.5 - x0 * x0 - y0 * y0
+    if t0 >= 0.0 {
+        t0 = t0 * t0
+        n0 = t0 * t0 * grad2d(gi0, x0, y0)
+    }
+    var t1: f64 = 0.5 - x1 * x1 - y1 * y1
+    if t1 >= 0.0 {
+        t1 = t1 * t1
+        n1 = t1 * t1 * grad2d(gi1, x1, y1)
+    }
+    var t2: f64 = 0.5 - x2 * x2 - y2 * y2
+    if t2 >= 0.0 {
+        t2 = t2 * t2
+        n2 = t2 * t2 * grad2d(gi2, x2, y2)
+    }
+    return 70.0 * (n0 + n1 + n2)
+}
+
+// the 12 edge midpoint gradients of the cube (Gustavson's grad3 table)
+#[allow_fp]
+fn grad3s(hash: i32, x: f64, y: f64, z: f64) -> f64 {
+    let h: i32 = hash % 12
+    var gx: f64 = 0.0
+    var gy: f64 = 0.0
+    var gz: f64 = 0.0
+    if h == 0 {
+        gx = 1.0
+        gy = 1.0
+    } else if h == 1 {
+        gx = 0.0 - 1.0
+        gy = 1.0
+    } else if h == 2 {
+        gx = 1.0
+        gy = 0.0 - 1.0
+    } else if h == 3 {
+        gx = 0.0 - 1.0
+        gy = 0.0 - 1.0
+    } else if h == 4 {
+        gx = 1.0
+        gz = 1.0
+    } else if h == 5 {
+        gx = 0.0 - 1.0
+        gz = 1.0
+    } else if h == 6 {
+        gx = 1.0
+        gz = 0.0 - 1.0
+    } else if h == 7 {
+        gx = 0.0 - 1.0
+        gz = 0.0 - 1.0
+    } else if h == 8 {
+        gy = 1.0
+        gz = 1.0
+    } else if h == 9 {
+        gy = 0.0 - 1.0
+        gz = 1.0
+    } else if h == 10 {
+        gy = 1.0
+        gz = 0.0 - 1.0
+    } else {
+        gy = 0.0 - 1.0
+        gz = 0.0 - 1.0
+    }
+    return gx * x + gy * y + gz * z
+}
+
+#[allow_fp]
+fn simplex3(pl: *mut Perlin, xin: f64, yin: f64, zin: f64) -> f64 {
+    let f3: f64 = 1.0 / 3.0
+    let g3: f64 = 1.0 / 6.0
+    let s: f64 = (xin + yin + zin) * f3
+    let i: i32 = math.floor(xin + s) as i32
+    let j: i32 = math.floor(yin + s) as i32
+    let k: i32 = math.floor(zin + s) as i32
+    let t: f64 = (i + j + k) as f64 * g3
+    let x0: f64 = xin - (i as f64 - t)
+    let y0: f64 = yin - (j as f64 - t)
+    let z0: f64 = zin - (k as f64 - t)
+    var i1: i32 = 0
+    var j1: i32 = 0
+    var k1: i32 = 0
+    var i2: i32 = 0
+    var j2: i32 = 0
+    var k2: i32 = 0
+    if x0 >= y0 {
+        if y0 >= z0 {
+            i1 = 1
+            i2 = 1
+            j2 = 1
+        } else if x0 >= z0 {
+            i1 = 1
+            i2 = 1
+            k2 = 1
+        } else {
+            k1 = 1
+            i2 = 1
+            k2 = 1
+        }
+    } else {
+        if y0 < z0 {
+            k1 = 1
+            j2 = 1
+            k2 = 1
+        } else if x0 < z0 {
+            j1 = 1
+            j2 = 1
+            k2 = 1
+        } else {
+            j1 = 1
+            i2 = 1
+            j2 = 1
+        }
+    }
+    let x1: f64 = x0 - i1 as f64 + g3
+    let y1: f64 = y0 - j1 as f64 + g3
+    let z1: f64 = z0 - k1 as f64 + g3
+    let x2: f64 = x0 - i2 as f64 + 2.0 * g3
+    let y2: f64 = y0 - j2 as f64 + 2.0 * g3
+    let z2: f64 = z0 - k2 as f64 + 2.0 * g3
+    let x3: f64 = x0 - 1.0 + 3.0 * g3
+    let y3: f64 = y0 - 1.0 + 3.0 * g3
+    let z3: f64 = z0 - 1.0 + 3.0 * g3
+    let ii: i32 = i & 255
+    let jj: i32 = j & 255
+    let kk: i32 = k & 255
+    let gi0: i32 = (*pl).p[(ii + (*pl).p[(jj + (*pl).p[kk as usize] as i32) as usize] as i32) as usize] as i32
+    let gi1: i32 = (*pl).p[(ii + i1 + (*pl).p[(jj + j1 + (*pl).p[(kk + k1) as usize] as i32) as usize] as i32) as usize] as i32
+    let gi2: i32 = (*pl).p[(ii + i2 + (*pl).p[(jj + j2 + (*pl).p[(kk + k2) as usize] as i32) as usize] as i32) as usize] as i32
+    let gi3: i32 = (*pl).p[(ii + 1 + (*pl).p[(jj + 1 + (*pl).p[(kk + 1) as usize] as i32) as usize] as i32) as usize] as i32
+    var n0: f64 = 0.0
+    var n1: f64 = 0.0
+    var n2: f64 = 0.0
+    var n3: f64 = 0.0
+    var t0: f64 = 0.6 - x0 * x0 - y0 * y0 - z0 * z0
+    if t0 >= 0.0 {
+        t0 = t0 * t0
+        n0 = t0 * t0 * grad3s(gi0, x0, y0, z0)
+    }
+    var t1: f64 = 0.6 - x1 * x1 - y1 * y1 - z1 * z1
+    if t1 >= 0.0 {
+        t1 = t1 * t1
+        n1 = t1 * t1 * grad3s(gi1, x1, y1, z1)
+    }
+    var t2: f64 = 0.6 - x2 * x2 - y2 * y2 - z2 * z2
+    if t2 >= 0.0 {
+        t2 = t2 * t2
+        n2 = t2 * t2 * grad3s(gi2, x2, y2, z2)
+    }
+    var t3: f64 = 0.6 - x3 * x3 - y3 * y3 - z3 * z3
+    if t3 >= 0.0 {
+        t3 = t3 * t3
+        n3 = t3 * t3 * grad3s(gi3, x3, y3, z3)
+    }
+    return 32.0 * (n0 + n1 + n2 + n3)
+}
+
+// ================================================================== octaves and a heightfield
+
+// fractal sum of `octaves` layers of improved noise, normalised to about -1 .. 1
+#[allow_fp]
+fn perlin_octaves3(pl: *mut Perlin, x: f64, y: f64, z: f64, octaves: i32, lacunarity: f64, persistence: f64) -> f64 {
+    var sum: f64 = 0.0
+    var amp: f64 = 1.0
+    var freq: f64 = 1.0
+    var norm: f64 = 0.0
+    var o: i32 = 0
+    while o < octaves {
+        sum = sum + amp * perlin3(pl, x * freq, y * freq, z * freq)
+        norm = norm + amp
+        amp = amp * persistence
+        freq = freq * lacunarity
+        o = o + 1
+    }
+    if norm == 0.0 {
+        return 0.0
+    }
+    return sum / norm
+}
+
+#[allow_fp]
+fn simplex_octaves2(pl: *mut Perlin, x: f64, y: f64, octaves: i32, lacunarity: f64, persistence: f64) -> f64 {
+    var sum: f64 = 0.0
+    var amp: f64 = 1.0
+    var freq: f64 = 1.0
+    var norm: f64 = 0.0
+    var o: i32 = 0
+    while o < octaves {
+        sum = sum + amp * simplex2(pl, x * freq, y * freq)
+        norm = norm + amp
+        amp = amp * persistence
+        freq = freq * lacunarity
+        o = o + 1
+    }
+    if norm == 0.0 {
+        return 0.0
+    }
+    return sum / norm
+}
+
+// Heights (block y) of the 16 x 16 columns of chunk (cx, cz): sea level + 24 * fractal simplex.
+// `out` receives 256 i32 values, index z * 16 + x. An example of use; no claim to match any game.
+#[allow_fp]
+fn heightmap_16x16(pl: *mut Perlin, cx: i32, cz: i32, out: u64) {
+    var z: i32 = 0
+    while z < 16 {
+        var x: i32 = 0
+        while x < 16 {
+            let wx: f64 = (cx * 16 + x) as f64 * 0.01
+            let wz: f64 = (cz * 16 + z) as f64 * 0.01
+            let n: f64 = simplex_octaves2(pl, wx, wz, 4, 2.0, 0.5)
+            let h: i32 = 64 + math.floor(n * 24.0 + 0.5) as i32
+            rt.st32(out, (z * 16 + x) as usize, h as u32)
+            x = x + 1
+        }
+        z = z + 1
+    }
+}

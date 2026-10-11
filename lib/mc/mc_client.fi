@@ -1,0 +1,356 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_client.fi -- the client side connection state machine of a Minecraft Java
+// connection: Handshake -> Login -> (Configuration) -> Play, for ANY generated version.
+//
+// Nothing here names a protocol number or a packet id. Every id comes from the Version
+// object (`mc_version.version_pid(&ver, mc_sem.SEM_*)`), every behaviour difference from
+// its flags (`FLAG_LOGIN_UUID_*`, `FLAG_CONFIG_PHASE`, `FLAG_CHUNK_BATCHES`), and the few
+// values the replies need are found with the schema walker (`field_range`), not with a
+// hard coded offset. Honest limits:
+//   * client written packets are built by hand (Client Information only in the layout of
+//     1.20.1 / 1.20.2) but every one is held against the version's generated schema before
+//     it is sent (`send`): a layout that does not fit the version is refused, never sent.
+//     Schema driven writers are the proper fix (docs/MC-VERSIONS.md, "client-written packets");
+//   * login is OFFLINE mode here: an Encryption Request is reported as CL_ONLINE_MODE (the
+//     online path -- RSA, CFB8, session server -- is mc_crypto / mc_auth plus the codec's
+//     wire_enable_encryption and is wired in by the integration step);
+//   * the configuration phase (1.20.2+) is implemented from the protocol description and
+//     only compiled / schema-tested, not run against a real 1.20.2 server.
+
+import std.net
+import std.bytes
+import std.rt
+import std.md5
+import mc.mc_codec
+import mc.mc_version
+import mc.mc_sem
+import mc.mc_schema
+
+export {
+    Client,
+    client_new, client_free, client_handshake, client_send, client_login_offline, client_next,
+    client_is, client_auto_reply, client_send_settings, client_body,
+    CL_OK, CL_TIMEOUT, CL_CLOSED, CL_BROKEN, CL_TOO_BIG, CL_BAD_PACKET, CL_KICKED,
+    CL_ONLINE_MODE, CL_UNEXPECTED, CL_SEND,
+}
+
+const CL_OK: i32 = 0
+const CL_TIMEOUT: i32 = 0 - 20
+const CL_CLOSED: i32 = 0 - 21
+const CL_BROKEN: i32 = 0 - 22
+const CL_TOO_BIG: i32 = 0 - 23
+const CL_BAD_PACKET: i32 = 0 - 24
+const CL_KICKED: i32 = 0 - 2 // Disconnect in login / configuration / play
+const CL_ONLINE_MODE: i32 = 0 - 3 // the server wants encryption
+const CL_UNEXPECTED: i32 = 0 - 4 // a packet that has no meaning in this state
+const CL_SEND: i32 = 0 - 5 // writing failed
+
+struct Client {
+    w: mc_codec.Wire,
+    ver: mc_version.Version,
+    state: i32, // mc_version.ST_*
+    body: bytes.Bytes, // VIEW on the last packet read (valid until the next client_next)
+    teleports: u64,
+    keepalives: u64,
+}
+
+fn client_new(conn: net.Conn, ver: mc_version.Version) -> Client {
+    return Client { w: mc_codec.wire_open(conn), ver: ver, state: mc_version.ST_HANDSHAKE,
+        body: bytes.bytes_new(), teleports: 0, keepalives: 0 }
+}
+
+fn client_free(c: *mut Client) {
+    mc_codec.wire_close(&(*c).w)
+}
+
+fn client_body(c: *mut Client) -> *mut bytes.Bytes {
+    return &(*c).body
+}
+
+fn pid(c: *mut Client, sem: usize) -> i32 {
+    return mc_version.version_pid(&(*c).ver, sem)
+}
+
+// does packet id `id` of the CURRENT state/direction S2C mean the semantic packet `sem`?
+fn client_is(c: *mut Client, id: i32, sem: usize) -> bool {
+    return id >= 0 && id == pid(c, sem)
+}
+
+// Sends the semantic packet `sem` of connection state `st`. The body is first held against the
+// version's generated schema of that packet (mc_schema.walk): a hand built layout that does
+// not fit this version is REFUSED instead of sent, so a wrong guess can never put a
+// malformed packet on the wire.
+fn send(c: *mut Client, st: i32, sem: usize, body: *mut bytes.Bytes) -> bool {
+    let id: i32 = pid(c, sem)
+    if id < 0 {
+        return false
+    }
+    let sch: u64 = (*c).ver.schema_of(st, mc_version.DIR_C2S, id)
+    if sch != 0 {
+        bytes.bytes_set_pos(body, 0)
+        let fits: bool = mc_schema.walk(sch, body, 0 as *mut rt.Buf)
+        bytes.bytes_set_pos(body, 0)
+        if !fits {
+            return false
+        }
+    }
+    let n: usize = mc_codec.wire_send_packet(&(*c).w, id, body) catch 0
+    return n > 0
+}
+
+// Sends the semantic packet `sem` of connection state `st` (checked against the version's schema).
+fn client_send(c: *mut Client, st: i32, sem: usize, body: *mut bytes.Bytes) -> bool {
+    return send(c, st, sem, body)
+}
+
+fn wire_code(e: WireError) -> i32 {
+    if e == WireError::Timeout {
+        return CL_TIMEOUT
+    }
+    if e == WireError::Closed {
+        return CL_CLOSED
+    }
+    if e == WireError::TooBig {
+        return CL_TOO_BIG
+    }
+    if e == WireError::Broken {
+        return CL_BROKEN
+    }
+    return CL_BAD_PACKET
+}
+
+// ---------------------------------------------------------------- handshake / login
+
+// Handshake; `next_state` 1 = status, 2 = login. Moves the client into that state.
+fn client_handshake(c: *mut Client, host: u64, port: u16, next_state: i32) -> bool {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&b, (*c).ver.protocol)
+    bytes.put_string(&b, host, rt.c_length(host))
+    bytes.put_u16(&b, port)
+    bytes.put_varint(&b, next_state)
+    let ok: bool = send(c, mc_version.ST_HANDSHAKE, mc_sem.SEM_HANDSHAKE_C2S_SET_PROTOCOL, &b)
+    bytes.bytes_free(&b)
+    if ok {
+        (*c).state = next_state
+    }
+    return ok
+}
+
+fn send_login_start(c: *mut Client, name: u64) -> bool {
+    var high: u64 = 0
+    var low: u64 = 0
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_string(&b, name, rt.c_length(name))
+    let has_uuid: bool = md5.md5_offline_uuid(name, rt.c_length(name), &high, &low)
+    if mc_version.version_has(&(*c).ver, mc_version.FLAG_LOGIN_UUID_OPTIONAL) {
+        bytes.put_bool(&b, has_uuid)
+        if has_uuid {
+            bytes.put_uuid(&b, high, low)
+        }
+    } else if mc_version.version_has(&(*c).ver, mc_version.FLAG_LOGIN_UUID_REQUIRED) {
+        bytes.put_uuid(&b, high, low)
+    }
+    let ok: bool = send(c, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_C2S_LOGIN_START, &b)
+    bytes.bytes_free(&b)
+    return ok
+}
+
+// The next packet of the connection. >= 0: its id (body in client_body(), cursor behind
+// the id); < 0: CL_* (CL_TIMEOUT leaves the connection intact, call again).
+fn client_next(c: *mut Client) -> i32 {
+    let id: i32 = mc_codec.wire_read_packet(&(*c).w, &(*c).body) catch | e | (wire_code(e))
+    return id
+}
+
+fn reply_copy(c: *mut Client, st: i32, sem: usize) -> bool {
+    // reply with the same payload (keep alive in config/play: the answer echoes the id)
+    var rest: bytes.Bytes = mc_codec.wire_view_rest(&(*c).body)
+    return send(c, st, sem, &rest)
+}
+
+// Offline login: Login Start, then packets until Play begins. Handles Set Compression,
+// refuses Encryption Request (CL_ONLINE_MODE), answers login plugin requests with "not
+// understood", and runs the configuration phase when the version has one. Returns CL_OK when
+// the connection is in Play, otherwise a CL_* code. `deadline_ms` bounds the number of
+// receive timeouts (each wire_timeout period counts as one wait), the caller sets the period.
+fn client_login_offline(c: *mut Client, name: u64, max_waits: i32) -> i32 {
+    if !send_login_start(c, name) {
+        return CL_SEND
+    }
+    var waits: i32 = 0
+    while true {
+        let id: i32 = client_next(c)
+        if id == CL_TIMEOUT {
+            waits = waits + 1
+            if waits > max_waits {
+                return CL_TIMEOUT
+            }
+        } else if id < 0 {
+            return id
+        } else if (*c).state == mc_version.ST_LOGIN {
+            if client_is(c, id, mc_sem.SEM_LOGIN_S2C_COMPRESS) {
+                let t: i32 = bytes.get_varint(&(*c).body) catch 0 - 1
+                mc_codec.wire_set_threshold(&(*c).w, t)
+            } else if client_is(c, id, mc_sem.SEM_LOGIN_S2C_SUCCESS) {
+                if mc_version.version_has(&(*c).ver, mc_version.FLAG_CONFIG_PHASE) {
+                    var empty: bytes.Bytes = bytes.bytes_new()
+                    let ok: bool = send(c, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_C2S_LOGIN_ACKNOWLEDGED, &empty)
+                    bytes.bytes_free(&empty)
+                    if !ok {
+                        return CL_SEND
+                    }
+                    (*c).state = mc_version.ST_CONFIG
+                } else {
+                    (*c).state = mc_version.ST_PLAY
+                    return CL_OK
+                }
+            } else if client_is(c, id, mc_sem.SEM_LOGIN_S2C_DISCONNECT) {
+                return CL_KICKED
+            } else if client_is(c, id, mc_sem.SEM_LOGIN_S2C_ENCRYPTION_BEGIN) {
+                return CL_ONLINE_MODE
+            } else if client_is(c, id, mc_sem.SEM_LOGIN_S2C_PLUGIN_REQUEST) {
+                let mid: i32 = bytes.get_varint(&(*c).body) catch 0 - 1
+                var r: bytes.Bytes = bytes.bytes_new()
+                bytes.put_varint(&r, mid)
+                bytes.put_bool(&r, false)
+                send(c, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_C2S_PLUGIN_RESPONSE, &r)
+                bytes.bytes_free(&r)
+            } else {
+                return CL_UNEXPECTED
+            }
+        } else if (*c).state == mc_version.ST_CONFIG {
+            if client_is(c, id, mc_sem.SEM_CONFIG_S2C_KEEP_ALIVE) {
+                reply_copy(c, mc_version.ST_CONFIG, mc_sem.SEM_CONFIG_C2S_KEEP_ALIVE)
+            } else if client_is(c, id, mc_sem.SEM_CONFIG_S2C_FINISH) {
+                var empty: bytes.Bytes = bytes.bytes_new()
+                let ok: bool = send(c, mc_version.ST_CONFIG, mc_sem.SEM_CONFIG_C2S_FINISH, &empty)
+                bytes.bytes_free(&empty)
+                if !ok {
+                    return CL_SEND
+                }
+                (*c).state = mc_version.ST_PLAY
+                return CL_OK
+            } else if client_is(c, id, mc_sem.SEM_CONFIG_S2C_DISCONNECT) {
+                return CL_KICKED
+            }
+            // registry data, tags, feature flags, custom payloads ... are not needed to join
+        } else {
+            return CL_UNEXPECTED
+        }
+    }
+    return CL_UNEXPECTED
+}
+
+// ---------------------------------------------------------------- play replies
+
+fn field_varint(c: *mut Client, id: i32, name: u64, n: usize, out: *mut i32) -> bool {
+    let sch: u64 = (*c).ver.schema_of(mc_version.ST_PLAY, mc_version.DIR_S2C, id)
+    if sch == 0 {
+        return false
+    }
+    var off: usize = 0
+    var len: usize = 0
+    if !mc_schema.field_range(sch, name, n, &(*c).body, &off, &len) {
+        return false
+    }
+    var v: bytes.Bytes = bytes.Bytes { data: bytes.bytes_ptr(&(*c).body) + off as u64, cap: len, len: len, pos: 0, bad: false }
+    *out = bytes.get_varint(&v) catch 0 - 1
+    return *out >= 0
+}
+
+fn field_f64(c: *mut Client, id: i32, name: u64, n: usize, out: *mut f64) -> bool {
+    let sch: u64 = (*c).ver.schema_of(mc_version.ST_PLAY, mc_version.DIR_S2C, id)
+    var off: usize = 0
+    var len: usize = 0
+    if sch == 0 || !mc_schema.field_range(sch, name, n, &(*c).body, &off, &len) || len != 8 {
+        return false
+    }
+    var v: bytes.Bytes = bytes.Bytes { data: bytes.bytes_ptr(&(*c).body) + off as u64, cap: 8, len: 8, pos: 0, bad: false }
+    *out = bytes.get_f64(&v) catch 0.0
+    return true
+}
+
+fn field_f32(c: *mut Client, id: i32, name: u64, n: usize, out: *mut f32) -> bool {
+    let sch: u64 = (*c).ver.schema_of(mc_version.ST_PLAY, mc_version.DIR_S2C, id)
+    var off: usize = 0
+    var len: usize = 0
+    if sch == 0 || !mc_schema.field_range(sch, name, n, &(*c).body, &off, &len) || len != 4 {
+        return false
+    }
+    var v: bytes.Bytes = bytes.Bytes { data: bytes.bytes_ptr(&(*c).body) + off as u64, cap: 4, len: 4, pos: 0, bad: false }
+    *out = bytes.get_f32(&v) catch 0.0f
+    return true
+}
+
+// Answers the Play packets every client has to answer to stay connected: Keep Alive
+// (echo), Synchronize Player Position (Teleport Confirm + position acknowledge) and, where
+// the version has batches, Chunk Batch Finished. Returns true when `id` was handled.
+fn client_auto_reply(c: *mut Client, id: i32) -> bool {
+    if client_is(c, id, mc_sem.SEM_PLAY_S2C_KEEP_ALIVE) {
+        reply_copy(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_KEEP_ALIVE)
+        (*c).keepalives = (*c).keepalives + 1 as u64
+        return true
+    }
+    if client_is(c, id, mc_sem.SEM_PLAY_S2C_POSITION) {
+        var tid: i32 = 0 - 1
+        var x: f64 = 0.0
+        var y: f64 = 0.0
+        var z: f64 = 0.0
+        var yaw: f32 = 0.0f
+        var pitch: f32 = 0.0f
+        let has_tid: bool = field_varint(c, id, "teleportId".p as u64, 10, &tid)
+        field_f64(c, id, "x".p as u64, 1, &x)
+        field_f64(c, id, "y".p as u64, 1, &y)
+        field_f64(c, id, "z".p as u64, 1, &z)
+        field_f32(c, id, "yaw".p as u64, 3, &yaw)
+        field_f32(c, id, "pitch".p as u64, 5, &pitch)
+        if has_tid && pid(c, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM) >= 0 {
+            var r: bytes.Bytes = bytes.bytes_new()
+            bytes.put_varint(&r, tid)
+            send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM, &r)
+            bytes.bytes_free(&r)
+        }
+        var p: bytes.Bytes = bytes.bytes_new()
+        bytes.put_f64(&p, x)
+        bytes.put_f64(&p, y)
+        bytes.put_f64(&p, z)
+        bytes.put_f32(&p, yaw)
+        bytes.put_f32(&p, pitch)
+        bytes.put_bool(&p, false)
+        send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_POSITION_LOOK, &p)
+        bytes.bytes_free(&p)
+        (*c).teleports = (*c).teleports + 1 as u64
+        return true
+    }
+    if mc_version.version_has(&(*c).ver, mc_version.FLAG_CHUNK_BATCHES) && client_is(c, id, mc_sem.SEM_PLAY_S2C_CHUNK_BATCH_FINISHED) {
+        var r: bytes.Bytes = bytes.bytes_new()
+        bytes.put_f32(&r, 10.0f) // desired chunks per tick
+        send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_CHUNK_BATCH_RECEIVED, &r)
+        bytes.bytes_free(&r)
+        return true
+    }
+    return false
+}
+
+// Client Information (view distance, chat settings). The body is built in the layout of
+// 1.20.1 / 1.20.2; `send` refuses it for a version whose schema does not accept that layout.
+fn client_send_settings(c: *mut Client, view: i32) -> bool {
+    var b: bytes.Bytes = bytes.bytes_new()
+    var loc: [u8; 6] = "en_us\0"
+    bytes.put_string_c(&b, (&loc[0]) as u64)
+    bytes.put_i8(&b, view as i8)
+    bytes.put_varint(&b, 0) // chat: enabled
+    bytes.put_bool(&b, true) // chat colors
+    bytes.put_u8(&b, 127 as u8) // skin parts
+    bytes.put_varint(&b, 1) // main hand: right
+    bytes.put_bool(&b, false) // text filtering
+    bytes.put_bool(&b, true) // server listing
+    var ok: bool = false
+    if (*c).state == mc_version.ST_CONFIG {
+        ok = send(c, mc_version.ST_CONFIG, mc_sem.SEM_CONFIG_C2S_SETTINGS, &b)
+    } else {
+        ok = send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_SETTINGS, &b)
+    }
+    bytes.bytes_free(&b)
+    return ok
+}
