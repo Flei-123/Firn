@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_backend.fi -- the exchangeable render back end of the voxel client (docs/MC-RENDER.md 4, docs/GPU.md).
+//
+// A `Backend` is a table of functions plus an object pointer `obj`; the world renderer (mc_render_world) draws
+// through it and does not know whether the pixels come from the CPU rasterizer (mc_raster, the reference) or
+// from OpenGL 3.3 (lib/gpu/gl_mc.fi). THIS FILE HAS NO GPU IMPORT, so a program that only needs the CPU path stays a
+// static image (std.dynlib makes a program dynamically linked, docs/FFI.md).
+//
+//     var r: mc_raster.Raster = mc_raster.raster_new(640, 360)
+//     var b: mc_backend.Backend = mc_backend.backend_cpu(&r)        // or gl_mc.glbe_backend(&gb)
+//     b.upload_atlas(b.obj, (&atlas) as u64)
+//     b.begin(b.obj, (&cam) as u64, 0xFFE6BE96 as u32)
+//     let h: usize = b.mesh_upload(b.obj, key, verts, nverts, idx, nidx)
+//     let tris: u64 = b.draw(b.obj, h, ox, oy, oz)
+//     b.end(b.obj)
+//     let px: u64 = b.present(b.obj)       // address of w*h*4 bytes RGBA, row 0 = top
+//
+// Meaning of the calls = the `backend_*` functions of mc_raster.fi (same names, same semantics).
+
+import std.rt
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+
+export {
+    Backend, KIND_NONE, KIND_CPU, KIND_GL, backend_new, backend_cpu,
+}
+
+const KIND_NONE: i32 = 0
+const KIND_CPU: i32 = 1
+const KIND_GL: i32 = 2
+
+struct Backend {
+    kind: i32,
+    obj: u64, // the back end's own state (Raster / GlBackend)
+    // (obj, atlas) -- an mc_texture.Atlas
+    upload_atlas: fn(u64, u64),
+    // (obj, key, verts, nverts, idx, nidx) -> handle (>= 1, 0 = failed); verts = 2 x u32 per vertex (mc_mesh)
+    mesh_upload: fn(u64, u64, u64, usize, u64, usize) -> usize,
+    mesh_free: fn(u64, usize),
+    // (obj, camera, clear colour 0xAABBGGRR) -- an mc_camera.Camera (camera_update done)
+    begin: fn(u64, u64, u32),
+    // (obj, handle, section origin x, y, z in world blocks) -> triangles submitted
+    draw: fn(u64, usize, f64, f64, f64) -> u64,
+    end: fn(u64),
+    // address of the finished frame: w*h*4 bytes, R G B A, row 0 = top (CPU: the colour buffer, GL: a read back copy)
+    present: fn(u64) -> u64,
+    read_pixels: fn(u64, u64),
+}
+
+fn nop_atlas(o: u64, a: u64) { }
+fn nop_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize) -> usize { return 0 }
+fn nop_free(o: u64, h: usize) { }
+fn nop_begin(o: u64, cam: u64, rgba: u32) { }
+fn nop_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 { return 0 as u64 }
+fn nop_end(o: u64) { }
+fn nop_present(o: u64) -> u64 { return 0 as u64 }
+fn nop_read(o: u64, out: u64) { }
+
+// A table whose every entry does nothing (kind NONE); the back ends overwrite the entries.
+fn backend_new() -> Backend {
+    return Backend { kind: KIND_NONE, obj: 0, upload_atlas: nop_atlas, mesh_upload: nop_upload, mesh_free: nop_free,
+        begin: nop_begin, draw: nop_draw, end: nop_end, present: nop_present, read_pixels: nop_read }
+}
+
+fn cpu_atlas(o: u64, a: u64) {
+    mc_raster.backend_upload_atlas(o as *mut mc_raster.Raster, a as *mut mc_texture.Atlas)
+}
+
+fn cpu_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize) -> usize {
+    return mc_raster.backend_mesh_upload(o as *mut mc_raster.Raster, key, verts, nverts, idx, nidx)
+}
+
+fn cpu_free(o: u64, h: usize) {
+    mc_raster.backend_mesh_free(o as *mut mc_raster.Raster, h)
+}
+
+fn cpu_begin(o: u64, cam: u64, rgba: u32) {
+    mc_raster.backend_begin(o as *mut mc_raster.Raster, cam as *mut mc_camera.Camera, rgba)
+}
+
+fn cpu_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
+    let r: *mut mc_raster.Raster = o as *mut mc_raster.Raster
+    let t0: u64 = (*r).st.tris_in
+    mc_raster.backend_draw(r, h, ox, oy, oz)
+    return (*r).st.tris_in - t0
+}
+
+fn cpu_end(o: u64) {
+    mc_raster.backend_end(o as *mut mc_raster.Raster)
+}
+
+fn cpu_present(o: u64) -> u64 {
+    return mc_raster.backend_present(o as *mut mc_raster.Raster)
+}
+
+fn cpu_read(o: u64, out: u64) {
+    mc_raster.backend_read_pixels(o as *mut mc_raster.Raster, out)
+}
+
+// The CPU rasterizer as a back end (the reference). `r` must outlive the table.
+fn backend_cpu(r: *mut mc_raster.Raster) -> Backend {
+    var b: Backend = backend_new()
+    b.kind = KIND_CPU
+    b.obj = r as u64
+    b.upload_atlas = cpu_atlas
+    b.mesh_upload = cpu_upload
+    b.mesh_free = cpu_free
+    b.begin = cpu_begin
+    b.draw = cpu_draw
+    b.end = cpu_end
+    b.present = cpu_present
+    b.read_pixels = cpu_read
+    return b
+}
