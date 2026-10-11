@@ -1,9 +1,9 @@
-// tools/mc/crypto/check.js -- cross-check of mc_crypto (Firn) against node's
+// tools/mc/crypto/check.cjs -- cross-check of mc_crypto (Firn) against node's
 // crypto module (OpenSSL). Run by run.sh under
 // `node --security-revert=CVE-2023-46809` (needed only so that node may do the
 // PKCS#1 v1.5 *decryption* of our ciphertexts; the Firn side only encrypts).
 //
-// usage: node check.js <xcheck-binary> <tmpdir>
+// usage: node check.cjs <xcheck-binary> <tmpdir>
 // env MC_TAMPER=1: flips one octet of every Firn output before comparing -- the
 // run must then FAIL (counter-check that the comparison can go red).
 'use strict';

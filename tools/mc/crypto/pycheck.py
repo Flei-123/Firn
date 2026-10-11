@@ -11,7 +11,7 @@ n = 0
 for bits in (1024, 2048):
     pem = os.path.join(tmp, f"priv{bits}.pem")
     if not os.path.exists(pem):
-        sys.exit(f"pycheck: missing {pem} (run.sh creates it with openssl; check.js writes it as fallback)")
+        sys.exit(f"pycheck: missing {pem} (run.sh creates it with openssl; check.cjs writes it as fallback)")
     with open(pem, "rb") as f:
         key = serialization.load_pem_private_key(f.read(), password=None)
     spki = os.path.join(tmp, f"spki{bits}.bin")

@@ -30,7 +30,7 @@ for stage in "" "--no-opt" "--opt-level=dev-fast"; do
     fi
     mkdir -p "$W/t"
     cp "$W"/keys/priv*.pem "$W/t/"
-    node --security-revert=CVE-2023-46809 tools/mc/crypto/check.js "$W/xcheck" "$W/t" >"$W/node.out" 2>&1
+    node --security-revert=CVE-2023-46809 tools/mc/crypto/check.cjs "$W/xcheck" "$W/t" >"$W/node.out" 2>&1
     rc=$?
     grep -v "SECURITY WARNING" "$W/node.out"
     if [ $rc -ne 0 ]; then echo "  FAIL  node cross-check [$name]"; ERR=1; else echo "  ok    node cross-check [$name]"; fi
@@ -42,7 +42,7 @@ for stage in "" "--no-opt" "--opt-level=dev-fast"; do
             echo "  FAIL  python cryptography check"; ERR=1
         fi
         # counter-check: with one octet flipped in every Firn output the run MUST fail
-        MC_TAMPER=1 node --security-revert=CVE-2023-46809 tools/mc/crypto/check.js "$W/xcheck" "$W/t" >"$W/tamper.out" 2>&1
+        MC_TAMPER=1 node --security-revert=CVE-2023-46809 tools/mc/crypto/check.cjs "$W/xcheck" "$W/t" >"$W/tamper.out" 2>&1
         trc=$?
         if [ $trc -eq 1 ] && grep -q "  FAIL  " "$W/tamper.out"; then
             echo "  ok    counter-check: tampered outputs are detected ($(grep -c '  FAIL  ' "$W/tamper.out") failing checks)"
