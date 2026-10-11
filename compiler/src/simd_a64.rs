@@ -457,6 +457,22 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
             }
             vstore(e, fr, d, VR);
         }
+        SimdKind::UnpackLo8 => bin(e, fr, "zip1", "16b", need(dst)?, args[0], args[1]),
+        SimdKind::UnpackHi8 => bin(e, fr, "zip2", "16b", need(dst)?, args[0], args[1]),
+        SimdKind::MulLo16 => bin(e, fr, "mul", "8h", need(dst)?, args[0], args[1]),
+        SimdKind::Add16 => bin(e, fr, "add", "8h", need(dst)?, args[0], args[1]),
+        SimdKind::Sub16 => bin(e, fr, "sub", "8h", need(dst)?, args[0], args[1]),
+        SimdKind::Srl16 => shift(e, fr, "ushr", "8h", need(dst)?, args[0], imm),
+        // `packuswb d, s`: signed 16 -> unsigned 8 with saturation, `a` in the low half,
+        // `b` in the high half. `sqxtun` + `sqxtun2` is exactly that pair.
+        SimdKind::Packus16 => {
+            let d = need(dst)?;
+            vload(e, fr, VA, args[0]);
+            vload(e, fr, VB, args[1]);
+            e.line(&format!("sqxtun {}.8b, {}.8h", VR, VA));
+            e.line(&format!("sqxtun2 {}.16b, {}.8h", VR, VB));
+            vstore(e, fr, d, VR);
+        }
         SimdKind::UnpackLo32 => bin(e, fr, "zip1", "4s", need(dst)?, args[0], args[1]),
         SimdKind::UnpackHi32 => bin(e, fr, "zip2", "4s", need(dst)?, args[0], args[1]),
         SimdKind::UnpackLo64 => bin(e, fr, "zip1", "2d", need(dst)?, args[0], args[1]),

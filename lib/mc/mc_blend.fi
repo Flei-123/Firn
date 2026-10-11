@@ -1,0 +1,144 @@
+// lib/mc/mc_blend.fi -- pixel blending four RGBA pixels at a time (SSE2 / NEON through the v128 type).
+//
+// One function, one formula, the one the rasterizer uses for fog and shading (mc_raster.fi):
+//
+//     channel' = (channel * (256 - f) + src * f) >> 8        f = 0..256
+//
+// applied to the four channels of every pixel (R, G, B, A in memory order, the byte layout of the
+// framebuffer: one u32 per pixel, 0xAABBGGRR). The alpha lane of the source is forced to 255, so a
+// framebuffer whose alpha is 255 keeps alpha 255 (255 * 256 >> 8 = 255).
+//
+//   mix_span(dst, n, rgb, f)   n pixels at dst: mix with the colour rgb (0x00BBGGRR), weight f/256.
+//                              f = 0 keeps the pixel, f = 256 gives rgb. Fog = mix with the fog colour,
+//                              darkening (shade) = mix with 0, a HUD veil = mix with the veil colour.
+//   mix_span_scalar(...)       the same on plain integers: the reference and the tail loop.
+//   mix_pixel(p, rgb, f)       one pixel (what the scalar loop calls).
+//
+//   blend_span(dst, n, rgb, a) the formula of mc_hud.fi: channel' = (src * a + dst * (255 - a)) / 255 with integer
+//                              (truncating) division, a = 0..255. Exact division by 255 on u16 lanes:
+//                              t / 255 = (t + 1 + (t >> 8)) >> 8 for 0 <= t <= 65025.
+//   blend_span_scalar / blend_pixel   the scalar reference and the tail loop.
+//
+// HOW (x86-64 and aarch64, no run time check needed: SSE2 / NEON are baseline there): four pixels are
+// one 128 bit register. Bytes are widened to eight u16 lanes against zero (punpcklbw / punpckhbw),
+// multiplied by (256 - f) (pmullw), the pre-multiplied colour f * src is added (paddw), the lanes are
+// shifted right by 8 (psrlw) and narrowed back (packuswb). No lane can overflow:
+// 255 * (256 - f) + 255 * f = 65280 < 65536. The result is BIT IDENTICAL to mix_span_scalar
+// (tests/2756_mc_blend.fi compares every f of a ramp against the scalar version).
+//
+// Not available on wasm32 yet (the v128 kinds 8-bit unpack / 16-bit multiply are refused there with
+// their name); use mix_span_scalar in a browser build. docs/MC-FLOATS.md has the plan.
+import std.rt
+
+export { mix_span, mix_span_scalar, mix_pixel, blend_span, blend_span_scalar, blend_pixel }
+
+fn mix_pixel(p: u32, rgb: u32, f: u32) -> u32 {
+    let inv: u32 = (256 as u32) - f
+    let c0: u32 = p & 255 as u32
+    let c1: u32 = (p >> 8 as u32) & 255 as u32
+    let c2: u32 = (p >> 16 as u32) & 255 as u32
+    let c3: u32 = p >> 24 as u32
+    let k0: u32 = rgb & 255 as u32
+    let k1: u32 = (rgb >> 8 as u32) & 255 as u32
+    let k2: u32 = (rgb >> 16 as u32) & 255 as u32
+    let k3: u32 = 255 as u32
+    let o0: u32 = (c0 * inv + k0 * f) >> 8 as u32
+    let o1: u32 = (c1 * inv + k1 * f) >> 8 as u32
+    let o2: u32 = (c2 * inv + k2 * f) >> 8 as u32
+    let o3: u32 = (c3 * inv + k3 * f) >> 8 as u32
+    return o0 | (o1 << 8 as u32) | (o2 << 16 as u32) | (o3 << 24 as u32)
+}
+
+fn mix_span_scalar(dst: u64, n: usize, rgb: u32, f: u32) {
+    var i: usize = 0
+    while i < n {
+        rt.st32(dst, i, mix_pixel(rt.ld32(dst, i), rgb, f))
+        i = i + 1
+    }
+}
+
+fn mix_span(dst: u64, n: usize, rgb: u32, f: u32) {
+    var fw: u32 = f
+    if fw > 256 as u32 { fw = 256 as u32 }
+    let fi: u64 = fw as u64
+    let inv: u64 = (256 as u64) - fi
+    let invq: u64 = inv | (inv << 16 as u64) | (inv << 32 as u64) | (inv << 48 as u64)
+    let kr: u64 = ((rgb & 255 as u32) as u64) * fi
+    let kg: u64 = (((rgb >> 8 as u32) & 255 as u32) as u64) * fi
+    let kb: u64 = (((rgb >> 16 as u32) & 255 as u32) as u64) * fi
+    let ka: u64 = (255 as u64) * fi
+    let kq: u64 = kr | (kg << 16 as u64) | (kb << 32 as u64) | (ka << 48 as u64)
+    let vinv: v128 = __v128_from_u64(invq, invq)
+    let vk: v128 = __v128_from_u64(kq, kq)
+    let zero: v128 = __v128_zero()
+    var i: usize = 0
+    while i + 4 <= n {
+        let at: u64 = dst + ((i * 4) as u64)
+        let v: v128 = __v128_load(at as *u8)
+        let lo: v128 = __v128_srl16(__v128_add16(__v128_mullo16(__v128_unpacklo8(v, zero), vinv), vk), 8)
+        let hi: v128 = __v128_srl16(__v128_add16(__v128_mullo16(__v128_unpackhi8(v, zero), vinv), vk), 8)
+        __v128_store(at as *mut u8, __v128_packus16(lo, hi))
+        i = i + 4
+    }
+    while i < n {
+        rt.st32(dst, i, mix_pixel(rt.ld32(dst, i), rgb, fw))
+        i = i + 1
+    }
+}
+
+fn blend_pixel(p: u32, rgb: u32, a: u32) -> u32 {
+    let inv: u32 = (255 as u32) - a
+    let c0: u32 = p & 255 as u32
+    let c1: u32 = (p >> 8 as u32) & 255 as u32
+    let c2: u32 = (p >> 16 as u32) & 255 as u32
+    let c3: u32 = p >> 24 as u32
+    let k0: u32 = rgb & 255 as u32
+    let k1: u32 = (rgb >> 8 as u32) & 255 as u32
+    let k2: u32 = (rgb >> 16 as u32) & 255 as u32
+    let o0: u32 = (c0 * inv + k0 * a) / (255 as u32)
+    let o1: u32 = (c1 * inv + k1 * a) / (255 as u32)
+    let o2: u32 = (c2 * inv + k2 * a) / (255 as u32)
+    let o3: u32 = (c3 * inv + (255 as u32) * a) / (255 as u32)
+    return o0 | (o1 << 8 as u32) | (o2 << 16 as u32) | (o3 << 24 as u32)
+}
+
+fn blend_span_scalar(dst: u64, n: usize, rgb: u32, a: u32) {
+    var i: usize = 0
+    while i < n {
+        rt.st32(dst, i, blend_pixel(rt.ld32(dst, i), rgb, a))
+        i = i + 1
+    }
+}
+
+fn blend_span(dst: u64, n: usize, rgb: u32, a: u32) {
+    var aw: u32 = a
+    if aw > 255 as u32 { aw = 255 as u32 }
+    let ai: u64 = aw as u64
+    let inv: u64 = (255 as u64) - ai
+    let invq: u64 = inv | (inv << 16 as u64) | (inv << 32 as u64) | (inv << 48 as u64)
+    let kr: u64 = ((rgb & 255 as u32) as u64) * ai
+    let kg: u64 = (((rgb >> 8 as u32) & 255 as u32) as u64) * ai
+    let kb: u64 = (((rgb >> 16 as u32) & 255 as u32) as u64) * ai
+    let ka: u64 = (255 as u64) * ai
+    let kq: u64 = kr | (kg << 16 as u64) | (kb << 32 as u64) | (ka << 48 as u64)
+    let one: u64 = 1 as u64 | (1 as u64 << 16 as u64) | (1 as u64 << 32 as u64) | (1 as u64 << 48 as u64)
+    let vinv: v128 = __v128_from_u64(invq, invq)
+    let vk: v128 = __v128_from_u64(kq, kq)
+    let vone: v128 = __v128_from_u64(one, one)
+    let zero: v128 = __v128_zero()
+    var i: usize = 0
+    while i + 4 <= n {
+        let at: u64 = dst + ((i * 4) as u64)
+        let v: v128 = __v128_load(at as *u8)
+        let tl: v128 = __v128_add16(__v128_mullo16(__v128_unpacklo8(v, zero), vinv), vk)
+        let th: v128 = __v128_add16(__v128_mullo16(__v128_unpackhi8(v, zero), vinv), vk)
+        let lo: v128 = __v128_srl16(__v128_add16(__v128_add16(tl, vone), __v128_srl16(tl, 8)), 8)
+        let hi: v128 = __v128_srl16(__v128_add16(__v128_add16(th, vone), __v128_srl16(th, 8)), 8)
+        __v128_store(at as *mut u8, __v128_packus16(lo, hi))
+        i = i + 4
+    }
+    while i < n {
+        rt.st32(dst, i, blend_pixel(rt.ld32(dst, i), rgb, aw))
+        i = i + 1
+    }
+}
