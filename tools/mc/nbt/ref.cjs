@@ -21,10 +21,10 @@ function fnvBytes (buf) {
   return h.toString(16).padStart(16, '0')
 }
 
-const NAMES = ['alpha', 'b', 'c d', 'ünï', 'x/y', 'long_name_' + 'z'.repeat(40), '', 'minecraft:thing', 'k9']
+const NAMES = ['alpha', 'b', 'c d', '\u00fcn\u00ef', 'x/y', 'long_name_' + 'z'.repeat(40), '', 'minecraft:thing', 'k9']
 function name () { return NAMES[pick(NAMES.length)] + (pick(3) === 0 ? String(pick(100)) : '') }
 function str () {
-  const parts = ['', 'a', 'hello world', 'ünïcödé', '日本語', 'emoji-free text with spaces', 'x'.repeat(300)]
+  const parts = ['', 'a', 'hello world', '\u00fcnic\u00f6d\u00e9', '日本語', 'emoji-free text with spaces', 'x'.repeat(300)]
   return parts[pick(parts.length)] + (pick(2) ? String(pick(1000)) : '')
 }
 function i32 () { return [0, 1, -1, 127, -128, 32767, -32768, 2147483647, -2147483648, pick(1000000) - 500000][pick(10)] }

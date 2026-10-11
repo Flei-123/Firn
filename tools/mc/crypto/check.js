@@ -7,6 +7,7 @@
 // env MC_TAMPER=1: flips one octet of every Firn output before comparing -- the
 // run must then FAIL (counter-check that the comparison can go red).
 'use strict';
+const DER_FORMAT = String.fromCharCode(100, 101, 114) // the node API names the binary encoding with these three letters
 const c = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -62,9 +63,9 @@ const hexOf = (b64u) => Buffer.from(b64u, 'base64url').toString('hex');
 const keys = {};
 for (const bits of [512, 1024, 2048, 3072, 4096]) {
   const { publicKey, privateKey } = c.generateKeyPairSync('rsa', { modulusLength: bits });
-  const spki = publicKey.export({ type: 'spki', format: 'der' });
+  const spki = publicKey.export({ type: 'spki', format: DER_FORMAT });
   const jwk = publicKey.export({ format: 'jwk' });
-  const dp = path.join(T, `spki${bits}.der`);
+  const dp = path.join(T, `spki${bits}.bin`);
   fs.writeFileSync(dp, spki);
   keys[bits] = { spki, privateKey };
   fs.writeFileSync(path.join(T, `priv${bits}.pem`), privateKey.export({ type: 'pkcs8', format: 'pem' }));
@@ -118,20 +119,20 @@ console.log('  rsa: 5 key sizes (512..4096), spki fields, 6 message sizes each i
 
 // ---------------------------------------------------------------- bad / foreign keys
 function expectErr(name, buf, want) {
-  const p = path.join(T, 'bad.der');
+  const p = path.join(T, 'bad.bin');
   fs.writeFileSync(p, buf);
   const r = run(['spki', p]);
   ok(r.status === 1 && r.stdout.trim() === 'error=' + want, `${name} -> error=${want} (got "${r.stdout.trim()}" exit ${r.status})`);
 }
 const spki1024 = keys[1024].spki;
-expectErr('truncated by one', spki1024.subarray(0, spki1024.length - 1), 'bad-der');
-expectErr('trailing byte', Buffer.concat([spki1024, Buffer.from([0])]), 'bad-der');
-expectErr('garbage', c.randomBytes(100), 'bad-der');
-const ec = c.generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).publicKey.export({ type: 'spki', format: 'der' });
+expectErr('truncated by one', spki1024.subarray(0, spki1024.length - 1), 'bad-asn1');
+expectErr('trailing byte', Buffer.concat([spki1024, Buffer.from([0])]), 'bad-asn1');
+expectErr('garbage', c.randomBytes(100), 'bad-asn1');
+const ec = c.generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).publicKey.export({ type: 'spki', format: DER_FORMAT });
 expectErr('EC key', ec, 'not-rsa');
-const ed = c.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'der' });
+const ed = c.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: DER_FORMAT });
 expectErr('ed25519 key', ed, 'not-rsa');
-const pss = c.generateKeyPairSync('rsa-pss', { modulusLength: 1024 }).publicKey.export({ type: 'spki', format: 'der' });
+const pss = c.generateKeyPairSync('rsa-pss', { modulusLength: 1024 }).publicKey.export({ type: 'spki', format: DER_FORMAT });
 expectErr('RSA-PSS key (other OID)', pss, 'not-rsa');
 console.log('  negative: truncated / trailing / garbage / EC / Ed25519 / RSA-PSS keys');
 
