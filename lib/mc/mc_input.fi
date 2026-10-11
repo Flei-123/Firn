@@ -1,0 +1,502 @@
+// lib/mc/mc_input.fi -- player input -> camera, movement, block picking, selection box. Pure data, no window:
+// the caller fills an InputEvents struct (mouse delta, key mask, edge flags) once per game tick (20 Hz).
+//
+//   * Mouse look: vanilla formula, degrees = pixels * (s*0.6+0.2)^3 * 8 * 0.15 with sensitivity s (default 0.5 -> 0.15 deg / pixel);
+//     yaw grows to the right (0 = south, 90 = west), pitch > 0 looks down, clamped to +-90.
+//   * Movement per tick, speeds in blocks per tick (x20 = blocks per second): walk 0.21585 (4.317), sprint 0.28060 (5.612),
+//     sneak 0.0648 (1.295), fly 0.546 (10.92, x2 sprinting), fly up / down 0.375. Diagonals are normalised. Ground: instant
+//     horizontal speed (no inertia), gravity vy = (vy - 0.08) * 0.98, jump 0.42, box 0.6 x 1.8 (sneaking 1.5), eye 1.62 (1.27).
+//     Fly mode (`flying`): no gravity; `noclip` additionally ignores all blocks. Collision: a 9x9x9 snapshot of the world around
+//     the player (unloaded chunks count as solid) + mc_math.grid_move. No step-up, no water / ladders.
+//   * Pick: Amanatides-Woo DDA directly over mc_world (reach 5, creative 6). Hit = block + entered face (normal) + distance.
+//   * Selection box: the 12 edges of the block (+-0.002) as lines (near clipped, 1/16-pixel snapped, integer DDA, depth test
+//     with a small tolerance, no depth write) -- tools/mc/input/ref.py repeats every rule.
+
+import std.rt
+import std.math
+import mc.mc_math
+import mc.mc_camera
+import mc.mc_raster
+import mc.mc_world
+import mc.mc_chunk
+
+export {
+    InputEvents, InputTables, Player, Pick, input_events_new, player_new, player_free, player_look, player_tick,
+    player_set_camera, player_reach, player_eye, input_pick, input_pick_camera, input_draw_box, world_block_id,
+    K_FORWARD, K_BACK, K_LEFT, K_RIGHT, K_JUMP, K_SNEAK, K_SPRINT,
+}
+
+const K_FORWARD: u32 = 1
+const K_BACK: u32 = 2
+const K_LEFT: u32 = 4
+const K_RIGHT: u32 = 8
+const K_JUMP: u32 = 16
+const K_SNEAK: u32 = 32
+const K_SPRINT: u32 = 64
+
+const SPEED_WALK: f64 = 0.21585
+const SPEED_SPRINT: f64 = 0.2806
+const SPEED_SNEAK: f64 = 0.0648
+const SPEED_FLY: f64 = 0.546
+const SPEED_FLY_VERT: f64 = 0.375
+const DIAG: f64 = 0.7071067811865476
+const SNAP_N: i32 = 9
+
+struct InputEvents {
+    dx: f64, dy: f64, // mouse movement in pixels since the last tick (right / down positive)
+    keys: u32, // K_* bit mask (held keys)
+    toggle_fly: bool, // edge: fly mode on / off
+    toggle_noclip: bool, // edge: noclip on / off
+    slot_delta: i32, // mouse wheel: hotbar slot change (any size, wraps)
+}
+
+// u8 per block id (ids >= n count as 0): pick = outlined / targetable (everything but air and fluids in vanilla),
+// solid = blocks the player.
+struct InputTables {
+    pick: u64,
+    solid: u64,
+    n: usize,
+}
+
+struct Player {
+    x: f64, y: f64, z: f64, // feet
+    yaw: f64, pitch: f64, // degrees
+    vy: f64, // vertical velocity in blocks per tick (ground mode)
+    on_ground: bool,
+    flying: bool,
+    noclip: bool,
+    creative: bool,
+    sneaking: bool,
+    sprinting: bool,
+    sens: f64, // 0..1
+    slot: i32, // selected hotbar slot 0..8
+    snap: u64, // u16 [9^3] collision snapshot
+    cls: u64, // u8 [2] class table (0 passable, 1 solid)
+}
+
+struct Pick {
+    x: i32, y: i32, z: i32, // block
+    nx: i32, ny: i32, nz: i32, // face that was entered (points back to the ray origin); 0,0,0 when the origin is inside the block
+    dist: f64,
+    id: i32,
+}
+
+fn input_events_new() -> InputEvents {
+    return InputEvents { dx: 0.0, dy: 0.0, keys: 0 as u32, toggle_fly: false, toggle_noclip: false, slot_delta: 0 }
+}
+
+fn player_new(x: f64, y: f64, z: f64) -> Player {
+    var p: Player = Player {
+        x: x, y: y, z: z, yaw: 0.0, pitch: 0.0, vy: 0.0, on_ground: false, flying: false, noclip: false, creative: false,
+        sneaking: false, sprinting: false, sens: 0.5, slot: 0, snap: 0, cls: 0,
+    }
+    p.snap = rt.heap_alloc((SNAP_N * SNAP_N * SNAP_N) as usize * 2)
+    p.cls = rt.heap_alloc(2)
+    rt.st8(p.cls, 0, 0 as u8)
+    rt.st8(p.cls, 1, 1 as u8)
+    return p
+}
+
+fn player_free(p: *mut Player) {
+    if (*p).snap != 0 { rt.heap_free((*p).snap, (SNAP_N * SNAP_N * SNAP_N) as usize * 2) }
+    if (*p).cls != 0 { rt.heap_free((*p).cls, 2) }
+    (*p).snap = 0
+    (*p).cls = 0
+}
+
+fn player_eye(p: *mut Player) -> f64 {
+    if (*p).sneaking { return 1.27 }
+    return 1.62
+}
+
+fn player_reach(p: *mut Player) -> f64 {
+    if (*p).creative { return 6.0 }
+    return 5.0
+}
+
+fn wrap_yaw(yaw: f64) -> f64 {
+    var y: f64 = yaw - 360.0 * math.floor((yaw + 180.0) / 360.0)
+    if y >= 180.0 { y = y - 360.0 }
+    return y
+}
+
+// Mouse delta (pixels) -> yaw / pitch.
+fn player_look(p: *mut Player, dx: f64, dy: f64) {
+    let f: f64 = (*p).sens * 0.6 + 0.2
+    let k: f64 = (f * f * f * 8.0) * 0.15
+    (*p).yaw = wrap_yaw((*p).yaw + dx * k)
+    var pt: f64 = (*p).pitch + dy * k
+    if pt > 90.0 { pt = 90.0 }
+    if pt < -90.0 { pt = -90.0 }
+    (*p).pitch = pt
+}
+
+fn player_set_camera(p: *mut Player, cam: *mut mc_camera.Camera) {
+    mc_camera.camera_set_pos(cam, (*p).x, (*p).y + player_eye(p), (*p).z)
+    mc_camera.camera_set_angles(cam, (*p).yaw, (*p).pitch)
+    mc_camera.camera_update(cam)
+}
+
+// ---------------------------------------------------------------- world access (with a one chunk cache)
+
+struct WorldView {
+    w: *mut mc_world.World,
+    min_y: i32,
+    cx: i32, cz: i32,
+    chunk: u64,
+    have: bool,
+}
+
+// block id at (x, y, z): -1 = chunk not loaded, -2 = above / below the stored sections
+fn view_id(v: *mut WorldView, x: i32, y: i32, z: i32) -> i32 {
+    let cx: i32 = mc_world.floor_div(x, 16)
+    let cz: i32 = mc_world.floor_div(z, 16)
+    if !(*v).have || cx != (*v).cx || cz != (*v).cz {
+        (*v).chunk = mc_world.world_find((*v).w, cx, cz)
+        (*v).cx = cx
+        (*v).cz = cz
+        (*v).have = true
+    }
+    if (*v).chunk == 0 { return -1 }
+    let c: *mut mc_chunk.Chunk = (*v).chunk as *mut mc_chunk.Chunk
+    let ly: i32 = y - (*v).min_y
+    let sy: i32 = mc_world.floor_div(ly, 16)
+    if sy < 0 || (sy as usize) >= (*c).nsec { return -2 }
+    let sec: *mut mc_chunk.Section = mc_chunk.chunk_section(c, sy as usize)
+    let i: usize = ((mc_world.floor_mod(ly, 16) * 16 + mc_world.floor_mod(z, 16)) * 16 + mc_world.floor_mod(x, 16)) as usize
+    return mc_chunk.container_get(&(*sec).blocks, i) as i32
+}
+
+fn view_new(w: *mut mc_world.World, min_y: i32) -> WorldView {
+    return WorldView { w: w, min_y: min_y, cx: 0, cz: 0, chunk: 0, have: false }
+}
+
+// block id in the world (min_y = world bottom, -64 in 1.20.1): -1 not loaded, -2 outside the stored height
+fn world_block_id(w: *mut mc_world.World, min_y: i32, x: i32, y: i32, z: i32) -> i32 {
+    var v: WorldView = view_new(w, min_y)
+    return view_id(&v, x, y, z)
+}
+
+fn table_flag(t: u64, n: usize, id: i32) -> bool {
+    if id < 0 || (id as usize) >= n { return false }
+    return rt.ld8(t, id as usize) != 0 as u8
+}
+
+// ---------------------------------------------------------------- movement
+
+fn snapshot(p: *mut Player, v: *mut WorldView, tb: *mut InputTables, out: *mut mc_math.BlockGrid) {
+    let ox: i32 = (math.floor((*p).x) as i32) - 4
+    let oy: i32 = (math.floor((*p).y) as i32) - 4
+    let oz: i32 = (math.floor((*p).z) as i32) - 4
+    var y: i32 = 0
+    while y < SNAP_N {
+        var z: i32 = 0
+        while z < SNAP_N {
+            var x: i32 = 0
+            while x < SNAP_N {
+                let id: i32 = view_id(v, ox + x, oy + y, oz + z)
+                var c: u16 = 0 as u16
+                if id == -1 || table_flag((*tb).solid, (*tb).n, id) { c = 1 as u16 }
+                rt.st16((*p).snap, ((y * SNAP_N + z) * SNAP_N + x) as usize, c)
+                x = x + 1
+            }
+            z = z + 1
+        }
+        y = y + 1
+    }
+    *out = mc_math.grid_view(ox, oy, oz, SNAP_N, SNAP_N, SNAP_N, (*p).snap, (*p).cls, 2 as u32, false)
+}
+
+// One game tick (20 Hz): mouse look, key movement, gravity / fly, collision. `w` may be an empty world (everything unloaded =
+// solid, so the player stands still in ground mode; use noclip / flying + noclip for a free camera).
+fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb: *mut InputTables, min_y: i32) {
+    if (*ev).toggle_fly {
+        (*p).flying = !(*p).flying
+        (*p).vy = 0.0
+    }
+    if (*ev).toggle_noclip { (*p).noclip = !(*p).noclip }
+    if (*ev).slot_delta != 0 {
+        (*p).slot = mc_world.floor_mod((*p).slot + (*ev).slot_delta, 9)
+    }
+    player_look(p, (*ev).dx, (*ev).dy)
+    let keys: u32 = (*ev).keys
+    (*p).sneaking = (keys & K_SNEAK) != 0 as u32
+    let fwd: bool = (keys & K_FORWARD) != 0 as u32
+    (*p).sprinting = (keys & K_SPRINT) != 0 as u32 && fwd && !(*p).sneaking
+    var mx: f64 = 0.0
+    var mz: f64 = 0.0
+    if (keys & K_RIGHT) != 0 as u32 { mx = mx + 1.0 }
+    if (keys & K_LEFT) != 0 as u32 { mx = mx - 1.0 }
+    if fwd { mz = mz + 1.0 }
+    if (keys & K_BACK) != 0 as u32 { mz = mz - 1.0 }
+    let yr: f64 = (*p).yaw * (math.PI() / 180.0)
+    let sn: f64 = math.sin(yr)
+    let cs: f64 = math.cos(yr)
+    // forward = (-sin, cos), right = (-cos, -sin) in (x, z)
+    var wx: f64 = (0.0 - cs) * mx + (0.0 - sn) * mz
+    var wz: f64 = (0.0 - sn) * mx + cs * mz
+    if mx != 0.0 && mz != 0.0 {
+        wx = wx * DIAG
+        wz = wz * DIAG
+    }
+    var speed: f64 = SPEED_WALK
+    if (*p).flying {
+        speed = SPEED_FLY
+        if (*p).sprinting { speed = SPEED_FLY * 2.0 }
+    } else if (*p).sneaking {
+        speed = SPEED_SNEAK
+    } else if (*p).sprinting {
+        speed = SPEED_SPRINT
+    }
+    let dx: f64 = wx * speed
+    let dz: f64 = wz * speed
+    var dy: f64 = 0.0
+    if (*p).flying {
+        if (keys & K_JUMP) != 0 as u32 { dy = dy + SPEED_FLY_VERT }
+        if (keys & K_SNEAK) != 0 as u32 { dy = dy - SPEED_FLY_VERT }
+    } else {
+        if (keys & K_JUMP) != 0 as u32 && (*p).on_ground { (*p).vy = 0.42 }
+        dy = (*p).vy
+    }
+    if (*p).noclip {
+        (*p).x = (*p).x + dx
+        (*p).y = (*p).y + dy
+        (*p).z = (*p).z + dz
+        (*p).on_ground = false
+        if !(*p).flying { (*p).vy = ((*p).vy - 0.08) * 0.98 }
+        return
+    }
+    var v: WorldView = view_new(w, min_y)
+    var g: mc_math.BlockGrid = mc_math.grid_view(0, 0, 0, 0, 0, 0, 0, 0, 0 as u32, false)
+    snapshot(p, &v, tb, &g)
+    var h: f64 = 1.8
+    if (*p).sneaking { h = 1.5 }
+    var b: mc_math.Aabb = mc_math.Aabb { x0: (*p).x - 0.3, y0: (*p).y, z0: (*p).z - 0.3, x1: (*p).x + 0.3, y1: (*p).y + h, z1: (*p).z + 0.3 }
+    var res: mc_math.MoveResult = mc_math.MoveResult { dx: 0.0, dy: 0.0, dz: 0.0, hit_x: false, hit_y: false, hit_z: false }
+    mc_math.grid_move(&g, &b, dx, dy, dz, &res)
+    (*p).x = (*p).x + res.dx
+    (*p).y = (*p).y + res.dy
+    (*p).z = (*p).z + res.dz
+    (*p).on_ground = res.hit_y && dy < 0.0
+    if (*p).flying {
+        (*p).vy = 0.0
+    } else {
+        if res.hit_y { (*p).vy = 0.0 }
+        (*p).vy = ((*p).vy - 0.08) * 0.98
+    }
+}
+
+// ---------------------------------------------------------------- picking
+
+fn pick_hit(out: *mut Pick, x: i32, y: i32, z: i32, nx: i32, ny: i32, nz: i32, dist: f64, id: i32) {
+    (*out).x = x
+    (*out).y = y
+    (*out).z = z
+    (*out).nx = nx
+    (*out).ny = ny
+    (*out).nz = nz
+    (*out).dist = dist
+    (*out).id = id
+}
+
+// Voxel raycast over the world: first block with a non-zero `pick` entry that the ray o + t*d (d normalised, t in [0, reach])
+// touches. Unloaded chunks count as air. An origin inside a pickable block is a hit at distance 0 with a zero normal.
+fn input_pick(w: *mut mc_world.World, min_y: i32, tb: *mut InputTables, ox: f64, oy: f64, oz: f64, dx0: f64, dy0: f64, dz0: f64,
+    reach: f64, out: *mut Pick) -> bool {
+    let len: f64 = math.sqrt((dx0 * dx0 + dy0 * dy0) + dz0 * dz0)
+    if !(len > 0.0) || !math.is_finite(len) { return false }
+    if !math.is_finite(ox) || !math.is_finite(oy) || !math.is_finite(oz) || !(math.fabs(ox) < 1000000000.0)
+    || !(math.fabs(oy) < 1000000000.0) || !(math.fabs(oz) < 1000000000.0) {
+        return false
+    }
+    let dx: f64 = dx0 / len
+    let dy: f64 = dy0 / len
+    let dz: f64 = dz0 / len
+    var v: WorldView = view_new(w, min_y)
+    var cx: i32 = math.floor(ox) as i32
+    var cy: i32 = math.floor(oy) as i32
+    var cz: i32 = math.floor(oz) as i32
+    var id: i32 = view_id(&v, cx, cy, cz)
+    if table_flag((*tb).pick, (*tb).n, id) {
+        pick_hit(out, cx, cy, cz, 0, 0, 0, 0.0, id)
+        return true
+    }
+    var sx: i32 = 0
+    var sy: i32 = 0
+    var sz: i32 = 0
+    var tdx: f64 = math.INF()
+    var tdy: f64 = math.INF()
+    var tdz: f64 = math.INF()
+    var tmx: f64 = math.INF()
+    var tmy: f64 = math.INF()
+    var tmz: f64 = math.INF()
+    if dx > 0.0 {
+        sx = 1
+        tdx = 1.0 / dx
+        tmx = ((cx + 1) as f64 - ox) / dx
+    } else if dx < 0.0 {
+        sx = -1
+        tdx = -1.0 / dx
+        tmx = (ox - cx as f64) / (0.0 - dx)
+    }
+    if dy > 0.0 {
+        sy = 1
+        tdy = 1.0 / dy
+        tmy = ((cy + 1) as f64 - oy) / dy
+    } else if dy < 0.0 {
+        sy = -1
+        tdy = -1.0 / dy
+        tmy = (oy - cy as f64) / (0.0 - dy)
+    }
+    if dz > 0.0 {
+        sz = 1
+        tdz = 1.0 / dz
+        tmz = ((cz + 1) as f64 - oz) / dz
+    } else if dz < 0.0 {
+        sz = -1
+        tdz = -1.0 / dz
+        tmz = (oz - cz as f64) / (0.0 - dz)
+    }
+    while true {
+        var axis: i32 = 0
+        var t: f64 = tmx
+        if tmy < t {
+            axis = 1
+            t = tmy
+        }
+        if tmz < t {
+            axis = 2
+            t = tmz
+        }
+        if !(t <= reach) { return false }
+        var nx: i32 = 0
+        var ny: i32 = 0
+        var nz: i32 = 0
+        if axis == 0 {
+            cx = cx + sx
+            tmx = tmx + tdx
+            nx = 0 - sx
+        } else if axis == 1 {
+            cy = cy + sy
+            tmy = tmy + tdy
+            ny = 0 - sy
+        } else {
+            cz = cz + sz
+            tmz = tmz + tdz
+            nz = 0 - sz
+        }
+        id = view_id(&v, cx, cy, cz)
+        if table_flag((*tb).pick, (*tb).n, id) {
+            pick_hit(out, cx, cy, cz, nx, ny, nz, t, id)
+            return true
+        }
+    }
+    return false
+}
+
+// Pick along the view direction of an updated camera (origin = camera position).
+fn input_pick_camera(w: *mut mc_world.World, min_y: i32, tb: *mut InputTables, cam: *mut mc_camera.Camera, reach: f64, out: *mut Pick) -> bool {
+    return input_pick(w, min_y, tb, (*cam).x, (*cam).y, (*cam).z, (*cam).fx, (*cam).fy, (*cam).fz, reach, out)
+}
+
+// ---------------------------------------------------------------- selection box lines
+
+fn floor_div64(a: i64, b: i64) -> i64 {
+    var q: i64 = a / b
+    if (a % b != 0 as i64) && ((a < 0 as i64) != (b < 0 as i64)) { q = q - 1 as i64 }
+    return q
+}
+
+// one 3D line (world coordinates) into the colour buffer: near clip, project, snap to 1/16 pixel, integer DDA over the pixel cells,
+// pixel written when 1/z * 1.002 > stored 1/z (depth is not written).
+fn draw_line3(r: *mut mc_raster.Raster, ax: f64, ay: f64, az: f64, bx: f64, by: f64, bz: f64, rgba: u32) {
+    let rax: f64 = ax - (*r).cx
+    let ray: f64 = ay - (*r).cy
+    let raz: f64 = az - (*r).cz
+    let rbx: f64 = bx - (*r).cx
+    let rby: f64 = by - (*r).cy
+    let rbz: f64 = bz - (*r).cz
+    var x0: f64 = (rax * (*r).rx + ray * (*r).ry) + raz * (*r).rz
+    var y0: f64 = (rax * (*r).ux + ray * (*r).uy) + raz * (*r).uz
+    var z0: f64 = (rax * (*r).fx + ray * (*r).fy) + raz * (*r).fz
+    var x1: f64 = (rbx * (*r).rx + rby * (*r).ry) + rbz * (*r).rz
+    var y1: f64 = (rbx * (*r).ux + rby * (*r).uy) + rbz * (*r).uz
+    var z1: f64 = (rbx * (*r).fx + rby * (*r).fy) + rbz * (*r).fz
+    let near: f64 = (*r).near
+    if z0 < near && z1 < near { return }
+    if z0 < near {
+        let t: f64 = (near - z0) / (z1 - z0)
+        x0 = x0 + (x1 - x0) * t
+        y0 = y0 + (y1 - y0) * t
+        z0 = near
+    } else if z1 < near {
+        let t: f64 = (near - z1) / (z0 - z1)
+        x1 = x1 + (x0 - x1) * t
+        y1 = y1 + (y0 - y1) * t
+        z1 = near
+    }
+    let iz0: f64 = 1.0 / z0
+    let iz1: f64 = 1.0 / z1
+    let sx0: f64 = (*r).hw + (x0 * iz0) * (*r).fpx
+    let sy0: f64 = (*r).hh - (y0 * iz0) * (*r).fpy
+    let sx1: f64 = (*r).hw + (x1 * iz1) * (*r).fpx
+    let sy1: f64 = (*r).hh - (y1 * iz1) * (*r).fpy
+    let lim: f64 = 100000.0
+    if !(math.fabs(sx0) < lim && math.fabs(sy0) < lim && math.fabs(sx1) < lim && math.fabs(sy1) < lim) { return }
+    let px0: i64 = floor_div64(math.floor(sx0 * 16.0 + 0.5) as i64, 16 as i64)
+    let py0: i64 = floor_div64(math.floor(sy0 * 16.0 + 0.5) as i64, 16 as i64)
+    let px1: i64 = floor_div64(math.floor(sx1 * 16.0 + 0.5) as i64, 16 as i64)
+    let py1: i64 = floor_div64(math.floor(sy1 * 16.0 + 0.5) as i64, 16 as i64)
+    let ddx: i64 = px1 - px0
+    let ddy: i64 = py1 - py0
+    var adx: i64 = ddx
+    if adx < 0 as i64 { adx = 0 as i64 - adx }
+    var ady: i64 = ddy
+    if ady < 0 as i64 { ady = 0 as i64 - ady }
+    var n: i64 = adx
+    if ady > n { n = ady }
+    let w: i64 = (*r).w as i64
+    let h: i64 = (*r).h as i64
+    var i: i64 = 0
+    while i <= n {
+        var px: i64 = px0
+        var py: i64 = py0
+        var t: f64 = 0.0
+        if n > 0 as i64 {
+            px = px0 + floor_div64(2 as i64 * ddx * i + n, 2 as i64 * n)
+            py = py0 + floor_div64(2 as i64 * ddy * i + n, 2 as i64 * n)
+            t = (i as f64) / (n as f64)
+        }
+        if px >= 0 as i64 && py >= 0 as i64 && px < w && py < h {
+            let iz: f64 = iz0 + (iz1 - iz0) * t
+            let idx: usize = (py as usize) * (w as usize) + (px as usize)
+            let d: f64 = *(((*r).depth + (idx as u64) * (8 as u64)) as *mut f64)
+            if iz * 1.002 > d { rt.st32((*r).color, idx, rgba) }
+        }
+        i = i + 1 as i64
+    }
+}
+
+// The 12 edges of block (x, y, z), grown by 0.002 on every side (against z-fighting with the block faces).
+fn input_draw_box(r: *mut mc_raster.Raster, x: i32, y: i32, z: i32, rgba: u32) {
+    let e: f64 = 0.002
+    let x0: f64 = (x as f64) - e
+    let y0: f64 = (y as f64) - e
+    let z0: f64 = (z as f64) - e
+    let x1: f64 = (x as f64) + 1.0 + e
+    let y1: f64 = (y as f64) + 1.0 + e
+    let z1: f64 = (z as f64) + 1.0 + e
+    // bottom ring, top ring, 4 verticals
+    draw_line3(r, x0, y0, z0, x1, y0, z0, rgba)
+    draw_line3(r, x1, y0, z0, x1, y0, z1, rgba)
+    draw_line3(r, x1, y0, z1, x0, y0, z1, rgba)
+    draw_line3(r, x0, y0, z1, x0, y0, z0, rgba)
+    draw_line3(r, x0, y1, z0, x1, y1, z0, rgba)
+    draw_line3(r, x1, y1, z0, x1, y1, z1, rgba)
+    draw_line3(r, x1, y1, z1, x0, y1, z1, rgba)
+    draw_line3(r, x0, y1, z1, x0, y1, z0, rgba)
+    draw_line3(r, x0, y0, z0, x0, y1, z0, rgba)
+    draw_line3(r, x1, y0, z0, x1, y1, z0, rgba)
+    draw_line3(r, x1, y0, z1, x1, y1, z1, rgba)
+    draw_line3(r, x0, y0, z1, x0, y1, z1, rgba)
+}
