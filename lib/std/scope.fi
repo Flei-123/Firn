@@ -1,0 +1,303 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/scope.fi -- std.scope: the release convention for things that are
+// not garbage collected (GPU handles, file descriptors, audio devices, mapped
+// memory). Three tools and one counter:
+//
+//   1. THE RULE      one owner per resource; the owner is a struct with
+//                    `fn drop(inout self)` (runs where the owner dies, in
+//                    reverse order, also on `return`, `break`, `try`) or the
+//                    code that holds it calls `defer release(h)` right after
+//                    the acquire. Nothing else is needed for ONE resource.
+//   2. Arena         many small blocks, one lifetime (a frame, a chunk mesh,
+//                    a parse): `arena_alloc` bumps, `arena_reset` forgets them
+//                    all at once, `drop` gives the memory back. No per-block free.
+//   3. Scope         a DYNAMIC number of resources of different kinds with one
+//                    lifetime (every texture and buffer a world uses): register
+//                    `(release_fn, handle)` as you acquire, and they are released in
+//                    reverse order by `scope_close` or by `drop`.
+//   4. Tracker       `track_acquire(kind)` / `track_release(kind)` count live
+//                    resources per kind (0..15); a test (or the exit of a debug
+//                    build) asserts `track_live(kind) == 0`: the leak detector.
+//
+//     import std.scope
+//
+//     fn free_texture(h: u64) { gpu_delete_texture(h); scope.track_release(1) }
+//
+//     fn load_level() {
+//         var s: scope.Scope = scope.scope_new()
+//         let t: u64 = gpu_make_texture(...)
+//         scope.track_acquire(1)
+//         scope.scope_add(&s, free_texture, t)
+//         ...
+//     }                                  // `s` dies here: free_texture(t) runs
+//
+//     fn frame() {
+//         var a: scope.Arena = scope.arena_new(65536)
+//         let p: u64 = scope.arena_alloc(&a, 4096, 16)   // 0 = out of memory
+//         ...
+//     }                                  // memory back, no free() per block
+//
+// HONEST
+// S1  `drop` exists for structs (SPEC round OWN), NOT yet for `gc class` or
+//     `Rc[T]`: an Arena or a Scope must not be a field of a gc class. Keep
+//     them in a plain struct or a local.
+// S2  A Scope/Arena is MOVED, not copied: after `let b = a` the name `a` is
+//     dead (the compiler checks it). Pass `&a` to functions that only use it.
+// S3  Release functions are `fn(u64)`: no captured variables, the handle is a
+//     number or an address. They must not call `scope_add` on the scope that is
+//     being closed.
+// S4  Not thread-safe. One owner thread per Arena/Scope; the tracker uses
+//     atomic adds and may be called from any thread.
+// S5  `arena_alloc` memory is NOT zeroed unless it comes from a fresh block;
+//     after `arena_reset` old bytes are still there. Use `arena_alloc_zero`.
+import std.rt
+
+export {
+    Arena, arena_new, arena_alloc, arena_alloc_zero, arena_reset, arena_used, arena_blocks,
+    Scope, scope_new, scope_add, scope_close, scope_len, scope_cancel,
+    track_acquire, track_release, track_live,
+}
+
+// ---------------------------------------------------------------- Arena
+// block: [0] next block, [1] size of the block in bytes, data from byte 16
+const AB_NEXT: usize = 0
+const AB_SIZE: usize = 1
+const AB_HDR: u64 = 16
+
+struct Arena {
+    first: u64, // first block (0 = none)
+    cur: u64, // block that is being filled
+    off: u64, // next free byte in `cur`, counted from the block start
+    block_bytes: u64, // size of a regular block
+    used: u64, // bytes handed out since the last reset
+    blocks: u64,
+}
+
+fn arena_new(block_bytes: u64) -> Arena {
+    var bb: u64 = block_bytes
+    if bb < 256 {
+        bb = 256
+    }
+    return Arena { first: 0, cur: 0, off: 0, block_bytes: bb, used: 0, blocks: 0 }
+}
+
+fn block_new(size: u64) -> u64 {
+    let b: u64 = rt.heap_alloc(size as usize)
+    if b == 0 {
+        return 0
+    }
+    rt.st64(b, AB_NEXT, 0)
+    rt.st64(b, AB_SIZE, size)
+    return b
+}
+
+// `bytes` with alignment `align` (a power of two, at most 4096); 0 when the
+// memory could not be had.
+fn arena_alloc(a: *mut Arena, bytes: u64, align: u64) -> u64 {
+    var al: u64 = align
+    if al < 1 {
+        al = 1
+    }
+    if (*a).cur != 0 {
+        let start: u64 = ((*a).cur + (*a).off + al - 1) / al * al
+        let end: u64 = start + bytes
+        if end <= (*a).cur + rt.ld64((*a).cur, AB_SIZE) {
+            (*a).off = end - (*a).cur
+            (*a).used = (*a).used + bytes
+            return start
+        }
+    }
+    // next block: the one after `cur` if a reset kept it, else a new one
+    var nb: u64 = 0
+    if (*a).cur != 0 {
+        nb = rt.ld64((*a).cur, AB_NEXT)
+    }
+    var need: u64 = AB_HDR + bytes + al
+    if need < (*a).block_bytes {
+        need = (*a).block_bytes
+    }
+    if nb != 0 && rt.ld64(nb, AB_SIZE) < AB_HDR + bytes + al {
+        nb = 0 // a kept block that is too small for this request: new block in front of it
+    }
+    if nb == 0 {
+        nb = block_new(need)
+        if nb == 0 {
+            return 0
+        }
+        if (*a).cur != 0 {
+            rt.st64(nb, AB_NEXT, rt.ld64((*a).cur, AB_NEXT))
+            rt.st64((*a).cur, AB_NEXT, nb)
+        } else {
+            rt.st64(nb, AB_NEXT, (*a).first)
+            (*a).first = nb
+        }
+        (*a).blocks = (*a).blocks + 1
+    }
+    (*a).cur = nb
+    (*a).off = AB_HDR
+    let start2: u64 = (nb + AB_HDR + al - 1) / al * al
+    (*a).off = start2 + bytes - nb
+    (*a).used = (*a).used + bytes
+    return start2
+}
+
+fn arena_alloc_zero(a: *mut Arena, bytes: u64, align: u64) -> u64 {
+    let p: u64 = arena_alloc(a, bytes, align)
+    if p != 0 {
+        rt.mem_set(p, 0 as u8, bytes as usize)
+    }
+    return p
+}
+
+// Forgets everything handed out; keeps the blocks for the next round.
+fn arena_reset(a: *mut Arena) {
+    (*a).cur = (*a).first
+    (*a).off = AB_HDR
+    (*a).used = 0
+}
+
+fn arena_used(a: *mut Arena) -> u64 {
+    return (*a).used
+}
+
+fn arena_blocks(a: *mut Arena) -> u64 {
+    return (*a).blocks
+}
+
+impl Arena {
+    fn drop(inout self) {
+        var b: u64 = self.first
+        while b != 0 {
+            let nx: u64 = rt.ld64(b, AB_NEXT)
+            rt.heap_free(b, rt.ld64(b, AB_SIZE) as usize)
+            b = nx
+        }
+        self.first = 0
+        self.cur = 0
+    }
+}
+
+// ---------------------------------------------------------------- Scope
+// block: [0] count, [1] capacity, then pairs (fn, handle)
+struct Scope {
+    blk: u64,
+}
+
+fn scope_new() -> Scope {
+    return Scope { blk: 0 }
+}
+
+// Registers `release(handle)` to run when the scope closes. False: out of
+// memory (the caller must release the handle itself then).
+fn scope_add(s: *mut Scope, release: fn(u64), handle: u64) -> bool {
+    var blk: u64 = (*s).blk
+    var n: u64 = 0
+    var cap: u64 = 0
+    if blk != 0 {
+        n = rt.ld64(blk, 0)
+        cap = rt.ld64(blk, 1)
+    }
+    if blk == 0 || n == cap {
+        var ncap: u64 = cap * 2
+        if ncap < 8 {
+            ncap = 8
+        }
+        let nb: u64 = rt.heap_alloc((2 + ncap * 2) as usize * 8)
+        if nb == 0 {
+            return false
+        }
+        if blk != 0 {
+            rt.mem_copy(nb + 16, blk + 16, (n * 2) as usize * 8)
+            rt.heap_free(blk, (2 + cap * 2) as usize * 8)
+        }
+        rt.st64(nb, 0, n)
+        rt.st64(nb, 1, ncap)
+        blk = nb
+        (*s).blk = nb
+    }
+    rt.st64(blk, (2 + n * 2) as usize, release as u64)
+    rt.st64(blk, (3 + n * 2) as usize, handle)
+    rt.st64(blk, 0, n + 1)
+    return true
+}
+
+fn scope_len(s: *mut Scope) -> u64 {
+    if (*s).blk == 0 {
+        return 0
+    }
+    return rt.ld64((*s).blk, 0)
+}
+
+// Forgets the registration of `handle` WITHOUT releasing it (ownership went
+// elsewhere). True if it was registered.
+fn scope_cancel(s: *mut Scope, handle: u64) -> bool {
+    let blk: u64 = (*s).blk
+    if blk == 0 {
+        return false
+    }
+    var i: u64 = rt.ld64(blk, 0)
+    while i > 0 {
+        i = i - 1
+        if rt.ld64(blk, (3 + i * 2) as usize) == handle {
+            rt.st64(blk, (2 + i * 2) as usize, 0)
+            return true
+        }
+    }
+    return false
+}
+
+// Releases everything in reverse order of registration; the scope can be
+// used again afterwards.
+fn scope_close(s: *mut Scope) {
+    scope_run((*s).blk)
+}
+
+fn scope_run(blk: u64) {
+    if blk == 0 {
+        return
+    }
+    var n: u64 = rt.ld64(blk, 0)
+    // the count drops BEFORE each call, so a release function that panics
+    // or closes again cannot release twice
+    while n > 0 {
+        n = n - 1
+        rt.st64(blk, 0, n)
+        let f: u64 = rt.ld64(blk, (2 + n * 2) as usize)
+        if f != 0 {
+            let r: fn(u64) = f as fn(u64)
+            r(rt.ld64(blk, (3 + n * 2) as usize))
+        }
+    }
+}
+
+impl Scope {
+    fn drop(inout self) {
+        scope_run(self.blk)
+        if self.blk != 0 {
+            rt.heap_free(self.blk, (2 + rt.ld64(self.blk, 1) * 2) as usize * 8)
+            self.blk = 0
+        }
+    }
+}
+
+// -------------------------------------------------------------- Tracker
+static mut TRACK: [u64; 16] = [0; 16]
+
+fn track_acquire(kind: u64) {
+    if kind < 16 {
+        __atomic_add((&TRACK[kind as usize]) as *mut u64, 1)
+    }
+}
+
+fn track_release(kind: u64) {
+    if kind < 16 {
+        __atomic_add((&TRACK[kind as usize]) as *mut u64, 18446744073709551615)
+    }
+}
+
+fn track_live(kind: u64) -> u64 {
+    if kind < 16 {
+        return TRACK[kind as usize]
+    }
+    return 0
+}

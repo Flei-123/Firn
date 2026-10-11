@@ -1,0 +1,533 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/mixer.fi -- audio.mixer: many sounds into one stereo stream.
+// Voices play sounds from memory (one-shots and loops) or stream from an
+// `audio.ring`; each has a volume and a pan; the sum goes through a master
+// volume and a clamp. The result is S16LE stereo, ready for `audio.sink`.
+//
+//     import audio.mixer
+//     import audio.sink
+//
+//     var m: mixer.Mixer = mixer.mixer_new(48000)
+//     let h: u64 = mixer.mixer_play(&m, pcm_ptr, frames, 1, 100, -50, false)   // mono, 100 %, a bit left
+//     mixer.mixer_set_volume(&m, h, 60)
+//     // once per game frame (or on its own thread):
+//     mixer.mixer_pump(&m, &sink, 4096)                // mixes what the device has room for
+//     // or, without a device:
+//     mixer.mixer_mix(&m, out_ptr, 1024)               // 1024 stereo frames
+//
+// THE MATH (exact, so a test can reproduce every sample):
+//   vol16   = pcm_gain(volume %)        65536 = 1.0, volume 0 .. 400
+//   mono source, pan p in -100 .. 100:  L = s * (vol16 * (100 - p) / 200) / 65536,
+//                                       R = s * (vol16 * (100 + p) / 200) / 65536
+//   stereo source (pan = balance):      L = l * (vol16 * (p > 0 ? 100 - p : 100) / 100) / 65536,
+//                                       R = r * (vol16 * (p < 0 ? 100 + p : 100) / 100) / 65536
+//   mix:     acc = sum of the voices (64 bit), out = clamp(acc * master16 / 65536)
+//   "/" is the integer division that truncates toward zero.
+//   At pan 0 a mono voice is 50 % per side (-6 dB), the sum of both sides is the source.
+//
+// HONEST
+// M1  NO RESAMPLING. Every source must have the mixer's rate; convert before
+//     (the sound server of the device only converts the mixer's own output).
+// M2  Memory sounds are NOT copied: the caller keeps the samples alive until
+//     the voice ended (or `mixer_stop`). Streams are read from the ring.
+// M3  Up to 32 voices; `mixer_play` returns 0 when all are busy (no stealing).
+// M4  Every call takes the mixer's lock (a futex mutex), so the game thread may
+//     change voices while another thread calls `mixer_mix` / `mixer_pump`. A
+//     block is mixed in one go: changes land at the next block (<= 4096 frames).
+// M5  A stream voice whose ring runs dry is silent for the missing frames and
+//     counted in `mixer_underruns`; it ends when the ring is finished
+//     (`ring_close_write` and empty).
+// M6  Handles carry a generation: a handle of a voice that ended is dead and
+//     all calls with it do nothing (return false).
+import std.rt
+import audio.pcm
+import audio.ring
+import audio.sink
+
+export {
+    Mixer, mixer_new, mixer_free, mixer_play, mixer_play_stream, mixer_stop, mixer_stop_all,
+    mixer_set_volume, mixer_set_pan, mixer_pause, mixer_is_playing, mixer_set_master,
+    mixer_mix, mixer_pump, mixer_voices, mixer_underruns, mixer_frames_mixed, mixer_rate,
+    VOICES_MAX, BLOCK_MAX,
+}
+
+const VOICES_MAX: usize = 32
+const BLOCK_MAX: usize = 4096
+
+// mixer block, in 64 bit words
+const M_LOCK: usize = 0
+const M_RATE: usize = 1
+const M_MASTER: usize = 2
+const M_UNDER: usize = 3
+const M_MIXED: usize = 4
+const M_GEN: usize = 5
+const M_ACC: usize = 6 // address of BLOCK_MAX * 2 i64 accumulators
+const M_TMP: usize = 7 // address of BLOCK_MAX stereo S16 frames (stream read buffer)
+const M_OUT: usize = 8 // address of BLOCK_MAX stereo S16 frames (pump output)
+const M_VOICE0: usize = 16
+const V_WORDS: usize = 16
+const M_WORDS: usize = 16 + 32 * 16
+
+// voice, in words
+const V_STATE: usize = 0 // 0 free, 1 playing, 2 paused
+const V_KIND: usize = 1 // 0 memory, 1 ring
+const V_DATA: usize = 2 // samples, or the ring block
+const V_FRAMES: usize = 3
+const V_CH: usize = 4
+const V_POS: usize = 5
+const V_LOOP: usize = 6
+const V_VOL: usize = 7 // percent
+const V_PAN: usize = 8 // -100 .. 100, stored +100
+const V_GEN: usize = 9
+
+struct Mixer {
+    blk: u64,
+}
+
+fn mixer_new(rate: u32) -> Mixer {
+    let blk: u64 = rt.heap_alloc(M_WORDS * 8)
+    if blk == 0 {
+        return Mixer { blk: 0 }
+    }
+    rt.mem_set(blk, 0 as u8, M_WORDS * 8)
+    let acc: u64 = rt.heap_alloc(BLOCK_MAX * 2 * 8)
+    let tmp: u64 = rt.heap_alloc(BLOCK_MAX * 4)
+    let out: u64 = rt.heap_alloc(BLOCK_MAX * 4)
+    if acc == 0 || tmp == 0 || out == 0 {
+        if acc != 0 { rt.heap_free(acc, BLOCK_MAX * 2 * 8) }
+        if tmp != 0 { rt.heap_free(tmp, BLOCK_MAX * 4) }
+        if out != 0 { rt.heap_free(out, BLOCK_MAX * 4) }
+        rt.heap_free(blk, M_WORDS * 8)
+        return Mixer { blk: 0 }
+    }
+    rt.st64(blk, M_RATE, rate as u64)
+    rt.st64(blk, M_MASTER, 100)
+    rt.st64(blk, M_ACC, acc)
+    rt.st64(blk, M_TMP, tmp)
+    rt.st64(blk, M_OUT, out)
+    return Mixer { blk: blk }
+}
+
+fn mixer_free(m: *mut Mixer) {
+    let blk: u64 = (*m).blk
+    if blk == 0 {
+        return
+    }
+    rt.heap_free(rt.ld64(blk, M_ACC), BLOCK_MAX * 2 * 8)
+    rt.heap_free(rt.ld64(blk, M_TMP), BLOCK_MAX * 4)
+    rt.heap_free(rt.ld64(blk, M_OUT), BLOCK_MAX * 4)
+    rt.heap_free(blk, M_WORDS * 8)
+    (*m).blk = 0
+}
+
+fn lock_of(blk: u64) -> *mut u64 {
+    return (blk + (M_LOCK * 8) as u64) as *mut u64
+}
+
+fn voice_at(blk: u64, i: usize) -> u64 {
+    return blk + ((M_VOICE0 + i * V_WORDS) * 8) as u64
+}
+
+fn mixer_rate(m: *mut Mixer) -> u32 {
+    if (*m).blk == 0 {
+        return 0 as u32
+    }
+    return rt.ld64((*m).blk, M_RATE) as u32
+}
+
+fn mixer_underruns(m: *mut Mixer) -> u64 {
+    if (*m).blk == 0 {
+        return 0
+    }
+    return rt.ld64((*m).blk, M_UNDER)
+}
+
+fn mixer_frames_mixed(m: *mut Mixer) -> u64 {
+    if (*m).blk == 0 {
+        return 0
+    }
+    return rt.ld64((*m).blk, M_MIXED)
+}
+
+fn clamp_pan(p: i32) -> u64 {
+    var v: i32 = p
+    if v < -100 {
+        v = -100
+    }
+    if v > 100 {
+        v = 100
+    }
+    return (v + 100) as u64
+}
+
+fn clamp_vol(v: u32) -> u64 {
+    if v > 400 as u32 {
+        return 400
+    }
+    return v as u64
+}
+
+fn start_voice(blk: u64, kind: u64, data: u64, frames: u64, ch: u64, vol: u32, pan: i32, looping: bool) -> u64 {
+    if ch != 1 && ch != 2 {
+        return 0
+    }
+    let lock: *mut u64 = lock_of(blk)
+    thread_lock(lock)
+    var i: usize = 0
+    var h: u64 = 0
+    while i < VOICES_MAX {
+        let v: u64 = voice_at(blk, i)
+        if rt.ld64(v, V_STATE) == 0 {
+            let gen: u64 = (rt.ld64(blk, M_GEN) + 1) & 16777215
+            rt.st64(blk, M_GEN, gen)
+            rt.st64(v, V_KIND, kind)
+            rt.st64(v, V_DATA, data)
+            rt.st64(v, V_FRAMES, frames)
+            rt.st64(v, V_CH, ch)
+            rt.st64(v, V_POS, 0)
+            if looping {
+                rt.st64(v, V_LOOP, 1)
+            } else {
+                rt.st64(v, V_LOOP, 0)
+            }
+            rt.st64(v, V_VOL, clamp_vol(vol))
+            rt.st64(v, V_PAN, clamp_pan(pan))
+            rt.st64(v, V_GEN, gen)
+            rt.st64(v, V_STATE, 1)
+            h = (gen << 8) | (i + 1) as u64
+            break
+        }
+        i = i + 1
+    }
+    thread_unlock(lock)
+    return h
+}
+
+// Plays `frames` frames at `data` (S16LE, 1 or 2 channels, the mixer's rate).
+// volume in percent (0 .. 400), pan -100 (left) .. 100 (right). Returns the
+// handle, 0 if all voices are busy or the arguments are wrong.
+fn mixer_play(m: *mut Mixer, data: u64, frames: usize, channels: u32, volume: u32, pan: i32, looping: bool) -> u64 {
+    if (*m).blk == 0 || data == 0 || frames == 0 {
+        return 0
+    }
+    return start_voice((*m).blk, 0, data, frames as u64, channels as u64, volume, pan, looping)
+}
+
+// A voice that reads from a ring until the ring is finished.
+fn mixer_play_stream(m: *mut Mixer, r: *mut ring.Ring, volume: u32, pan: i32) -> u64 {
+    if (*m).blk == 0 || ring.ring_blk(r) == 0 {
+        return 0
+    }
+    return start_voice((*m).blk, 1, ring.ring_blk(r), 0, ring.ring_channels(r) as u64, volume, pan, false)
+}
+
+// The voice record of a live handle, or 0. The lock must be held.
+fn find(blk: u64, h: u64) -> u64 {
+    let idx: u64 = h & 255
+    if idx == 0 || idx > VOICES_MAX as u64 {
+        return 0
+    }
+    let v: u64 = voice_at(blk, (idx - 1) as usize)
+    if rt.ld64(v, V_STATE) == 0 || rt.ld64(v, V_GEN) != (h >> 8) {
+        return 0
+    }
+    return v
+}
+
+fn mixer_stop(m: *mut Mixer, h: u64) -> bool {
+    let blk: u64 = (*m).blk
+    if blk == 0 {
+        return false
+    }
+    let lock: *mut u64 = lock_of(blk)
+    thread_lock(lock)
+    let v: u64 = find(blk, h)
+    if v != 0 {
+        rt.st64(v, V_STATE, 0)
+    }
+    thread_unlock(lock)
+    return v != 0
+}
+
+fn mixer_stop_all(m: *mut Mixer) {
+    let blk: u64 = (*m).blk
+    if blk == 0 {
+        return
+    }
+    let lock: *mut u64 = lock_of(blk)
+    thread_lock(lock)
+    var i: usize = 0
+    while i < VOICES_MAX {
+        rt.st64(voice_at(blk, i), V_STATE, 0)
+        i = i + 1
+    }
+    thread_unlock(lock)
+}
+
+fn mixer_set_volume(m: *mut Mixer, h: u64, volume: u32) -> bool {
+    let blk: u64 = (*m).blk
+    if blk == 0 {
+        return false
+    }
+    let lock: *mut u64 = lock_of(blk)
+    thread_lock(lock)
+    let v: u64 = find(blk, h)
+    if v != 0 {
+        rt.st64(v, V_VOL, clamp_vol(volume))
+    }
+    thread_unlock(lock)
+    return v != 0
+}
+
+fn mixer_set_pan(m: *mut Mixer, h: u64, pan: i32) -> bool {
+    let blk: u64 = (*m).blk
+    if blk == 0 {
+        return false
+    }
+    let lock: *mut u64 = lock_of(blk)
+    thread_lock(lock)
+    let v: u64 = find(blk, h)
+    if v != 0 {
+        rt.st64(v, V_PAN, clamp_pan(pan))
+    }
+    thread_unlock(lock)
+    return v != 0
+}
+
+fn mixer_pause(m: *mut Mixer, h: u64, on: bool) -> bool {
+    let blk: u64 = (*m).blk
+    if blk == 0 {
+        return false
+    }
+    let lock: *mut u64 = lock_of(blk)
+    thread_lock(lock)
+    let v: u64 = find(blk, h)
+    if v != 0 {
+        if on {
+            rt.st64(v, V_STATE, 2)
+        } else {
+            rt.st64(v, V_STATE, 1)
+        }
+    }
+    thread_unlock(lock)
+    return v != 0
+}
+
+fn mixer_is_playing(m: *mut Mixer, h: u64) -> bool {
+    let blk: u64 = (*m).blk
+    if blk == 0 {
+        return false
+    }
+    let lock: *mut u64 = lock_of(blk)
+    thread_lock(lock)
+    let v: u64 = find(blk, h)
+    let r: bool = v != 0 && rt.ld64(v, V_STATE) == 1
+    thread_unlock(lock)
+    return r
+}
+
+fn mixer_voices(m: *mut Mixer) -> u64 {
+    let blk: u64 = (*m).blk
+    if blk == 0 {
+        return 0
+    }
+    let lock: *mut u64 = lock_of(blk)
+    thread_lock(lock)
+    var n: u64 = 0
+    var i: usize = 0
+    while i < VOICES_MAX {
+        if rt.ld64(voice_at(blk, i), V_STATE) != 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    thread_unlock(lock)
+    return n
+}
+
+fn mixer_set_master(m: *mut Mixer, percent: u32) {
+    if (*m).blk != 0 {
+        rt.st64((*m).blk, M_MASTER, clamp_vol(percent))
+    }
+}
+
+fn s16(p: u64, idx: u64) -> i64 {
+    let v: i64 = rt.ld16(p, idx as usize) as i64
+    if v >= 32768 {
+        return v - 65536
+    }
+    return v
+}
+
+// The accumulators are stored with a bias: a negative i64 cannot be cast to u64.
+const ACC_BIAS: i64 = 1099511627776
+
+fn acc_get(acc: u64, i: u64) -> i64 {
+    return (rt.ld64(acc, i as usize) as i64) - ACC_BIAS
+}
+
+fn acc_add(acc: u64, i: u64, d: i64) {
+    rt.st64(acc, i as usize, ((rt.ld64(acc, i as usize) as i64) + d) as u64)
+}
+
+// Adds `n` frames of voice `v` from `src` (S16, its own channel count), the
+// frames start at output frame `at`.
+fn add_frames(acc: u64, at: u64, src: u64, n: u64, ch: u64, vol: u64, panv: u64) {
+    let vol16: i64 = pcm.pcm_gain(vol as u32) as i64
+    let pan: i64 = panv as i64 - 100
+    var gl: i64 = 0
+    var gr: i64 = 0
+    var f: u64 = 0
+    if ch == 1 {
+        gl = vol16 * (100 - pan) / 200
+        gr = vol16 * (100 + pan) / 200
+        while f < n {
+            let s: i64 = s16(src, f)
+            let a: u64 = (at + f) * 2
+            acc_add(acc, a, s * gl / 65536)
+            acc_add(acc, a + 1, s * gr / 65536)
+            f = f + 1
+        }
+    } else {
+        gl = vol16
+        gr = vol16
+        if pan > 0 {
+            gl = vol16 * (100 - pan) / 100
+        }
+        if pan < 0 {
+            gr = vol16 * (100 + pan) / 100
+        }
+        while f < n {
+            let l: i64 = s16(src, f * 2)
+            let r: i64 = s16(src, f * 2 + 1)
+            let a: u64 = (at + f) * 2
+            acc_add(acc, a, l * gl / 65536)
+            acc_add(acc, a + 1, r * gr / 65536)
+            f = f + 1
+        }
+    }
+}
+
+// One block (<= BLOCK_MAX frames), lock held.
+fn mix_block(blk: u64, out: u64, frames: u64) {
+    let acc: u64 = rt.ld64(blk, M_ACC)
+    let tmp: u64 = rt.ld64(blk, M_TMP)
+    var z: u64 = 0
+    while z < frames * 2 {
+        rt.st64(acc, z as usize, ACC_BIAS as u64)
+        z = z + 1
+    }
+    var i: usize = 0
+    while i < VOICES_MAX {
+        let v: u64 = voice_at(blk, i)
+        if rt.ld64(v, V_STATE) == 1 {
+            let vol: u64 = rt.ld64(v, V_VOL)
+            let pan: u64 = rt.ld64(v, V_PAN)
+            let ch: u64 = rt.ld64(v, V_CH)
+            if rt.ld64(v, V_KIND) == 0 {
+                let data: u64 = rt.ld64(v, V_DATA)
+                let total: u64 = rt.ld64(v, V_FRAMES)
+                var pos: u64 = rt.ld64(v, V_POS)
+                var done: u64 = 0
+                var alive: bool = true
+                while done < frames && alive {
+                    var n: u64 = total - pos
+                    if n > frames - done {
+                        n = frames - done
+                    }
+                    add_frames(acc, done, data + pos * ch * 2, n, ch, vol, pan)
+                    done = done + n
+                    pos = pos + n
+                    if pos >= total {
+                        if rt.ld64(v, V_LOOP) != 0 {
+                            pos = 0
+                        } else {
+                            alive = false
+                        }
+                    }
+                }
+                rt.st64(v, V_POS, pos)
+                if !alive {
+                    rt.st64(v, V_STATE, 0)
+                }
+            } else {
+                var r: ring.Ring = ring.Ring { blk: rt.ld64(v, V_DATA) }
+                var want: u64 = frames
+                if want > BLOCK_MAX as u64 {
+                    want = BLOCK_MAX as u64
+                }
+                let got: u64 = ring.ring_read(&r, tmp, want as usize) as u64
+                if got > 0 {
+                    add_frames(acc, 0, tmp, got, ch, vol, pan)
+                }
+                if got < frames {
+                    if ring.ring_is_finished(&r) {
+                        rt.st64(v, V_STATE, 0)
+                    } else {
+                        __atomic_add((blk + (M_UNDER * 8) as u64) as *mut u64, 1)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    let master16: i64 = pcm.pcm_gain(rt.ld64(blk, M_MASTER) as u32) as i64
+    var f: u64 = 0
+    while f < frames * 2 {
+        var s: i64 = acc_get(acc, f) * master16 / 65536
+        if s > 32767 {
+            s = 32767
+        }
+        if s < -32768 {
+            s = -32768
+        }
+        rt.st16(out, f as usize, (s & 65535) as u16)
+        f = f + 1
+    }
+    rt.st64(blk, M_MIXED, rt.ld64(blk, M_MIXED) + frames)
+}
+
+// Mixes `frames` stereo frames (S16LE interleaved) into `out`.
+fn mixer_mix(m: *mut Mixer, out: u64, frames: usize) {
+    let blk: u64 = (*m).blk
+    if blk == 0 {
+        return
+    }
+    let lock: *mut u64 = lock_of(blk)
+    var done: usize = 0
+    while done < frames {
+        var n: usize = frames - done
+        if n > BLOCK_MAX {
+            n = BLOCK_MAX
+        }
+        thread_lock(lock)
+        mix_block(blk, out + (done * 4) as u64, n as u64)
+        thread_unlock(lock)
+        done = done + n
+    }
+}
+
+// Mixes as many frames as the stereo sink has room for (at most `max_frames`)
+// and writes them. Returns the frames written. Never waits for the device.
+fn mixer_pump(m: *mut Mixer, s: *mut sink.Sink, max_frames: usize) -> usize {
+    let blk: u64 = (*m).blk
+    if blk == 0 || sink.sink_channels(s) != 2 as u32 {
+        return 0
+    }
+    var n: usize = sink.sink_writable(s)
+    if n > max_frames {
+        n = max_frames
+    }
+    if n > BLOCK_MAX {
+        n = BLOCK_MAX
+    }
+    if n == 0 {
+        return 0
+    }
+    let out: u64 = rt.ld64(blk, M_OUT)
+    mixer_mix(m, out, n)
+    if !sink.sink_write(s, out, n) {
+        return 0
+    }
+    return n
+}

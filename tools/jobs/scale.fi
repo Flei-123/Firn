@@ -1,0 +1,215 @@
+// tools/jobs/scale.fi -- how lib/jobs scales with the number of threads.
+//
+// Usage: scale T [REPS]
+//   T     threads that work = T - 1 workers + the caller
+//   REPS  repetitions per measurement (default 7), the MEDIAN is printed
+//
+// Output, one line, key=value:
+//   heavy_ms     wall time of a parallel_for over 2048 items of ~100 us each
+//   heavy_ok     1 when the checksum equals the sequential one
+//   tiny_ns      nanoseconds per item for 400,000 trivial items, chunk 1
+//                (the cost of the queue under contention)
+//   chunk64_ns   the same with chunk 64
+//   wake_us      round trip of an (almost) empty parallel_for: queue, wake the
+//                workers, run, wake the caller
+//   spawn_us     spawn + join of an empty task
+import std.rt
+import std.time
+import jobs.jobs
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND {
+        return jobs.worker_main(arg)
+    }
+    return 0
+}
+
+const HEAVY_ITEMS: u64 = 2048
+const HEAVY_ROUNDS: u64 = 30000
+
+fn xs(v: u64) -> u64 {
+    var x: u64 = v ^ 88172645463325252
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    return x
+}
+
+fn item(i: u64) -> u64 {
+    var x: u64 = i + 1
+    var k: u64 = 0
+    while k < HEAVY_ROUNDS {
+        x = xs(x)
+        k = k + 1
+    }
+    return x
+}
+
+fn body_heavy(ctx: u64, lo: u64, hi: u64) {
+    var i: u64 = lo
+    while i < hi {
+        rt.st64(ctx, i as usize, item(i))
+        i = i + 1
+    }
+}
+
+fn body_nop(ctx: u64, lo: u64, hi: u64) {
+    __atomic_add(ctx as *mut u64, hi - lo)
+}
+
+fn task_nop(arg: u64) -> u64 {
+    return arg
+}
+
+static mut g_sink: u64 = 0
+
+fn parse_dec(p: u64, fallback: u64) -> u64 {
+    let n: usize = rt.c_length(p)
+    if n == 0 {
+        return fallback
+    }
+    var v: u64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return fallback
+        }
+        v = v * 10 + (c - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
+
+fn emit(out: *mut rt.Buf, key: str, v: u64) {
+    rt.buf_push_bytes(out, key.p as u64, key.length())
+    rt.buf_push_dec_u64(out, v)
+}
+
+fn median(a: u64, n: u64) -> u64 {
+    // insertion sort of n words at a
+    var i: u64 = 1
+    while i < n {
+        let v: u64 = rt.ld64(a, i as usize)
+        var k: u64 = i
+        while k > 0 && rt.ld64(a, (k - 1) as usize) > v {
+            rt.st64(a, k as usize, rt.ld64(a, (k - 1) as usize))
+            k = k - 1
+        }
+        rt.st64(a, k as usize, v)
+        i = i + 1
+    }
+    return rt.ld64(a, (n / 2) as usize)
+}
+
+fn main(start: u64) -> i32 {
+    var t: u64 = 4
+    var reps: u64 = 7
+    if rt.arg_count(start) > 1 {
+        t = parse_dec(rt.arg_ptr(start, 1), 4)
+    }
+    if rt.arg_count(start) > 2 {
+        reps = parse_dec(rt.arg_ptr(start, 2), 7)
+    }
+    if reps > 60 {
+        reps = 60
+    }
+    if t < 1 {
+        t = 1
+    }
+    var j: jobs.Jobs = jobs.create(t - 1)
+    let times: u64 = rt.heap_alloc(64 * 8)
+    let res: u64 = rt.heap_alloc(HEAVY_ITEMS as usize * 8)
+
+    // sequential reference checksum
+    var ref: u64 = 0
+    var i: u64 = 0
+    while i < HEAVY_ITEMS {
+        ref = ref ^ item(i)
+        i = i + 1
+    }
+
+    var r: u64 = 0
+    var ok: u64 = 1
+    while r < reps {
+        let t0: u64 = time.monotonic_ns()
+        jobs.parallel_for(&j, 0, HEAVY_ITEMS, 8, body_heavy, res)
+        rt.st64(times, r as usize, time.monotonic_ns() - t0)
+        var c: u64 = 0
+        i = 0
+        while i < HEAVY_ITEMS {
+            c = c ^ rt.ld64(res, i as usize)
+            i = i + 1
+        }
+        if c != ref {
+            ok = 0
+        }
+        r = r + 1
+    }
+    let heavy: u64 = median(times, reps)
+
+    r = 0
+    while r < reps {
+        g_sink = 0
+        let t0: u64 = time.monotonic_ns()
+        jobs.parallel_for(&j, 0, 400000, 1, body_nop, (&g_sink) as u64)
+        rt.st64(times, r as usize, (time.monotonic_ns() - t0) / 400000)
+        if g_sink != 400000 {
+            ok = 0
+        }
+        r = r + 1
+    }
+    let tiny: u64 = median(times, reps)
+
+    r = 0
+    while r < reps {
+        g_sink = 0
+        let t0: u64 = time.monotonic_ns()
+        jobs.parallel_for(&j, 0, 4000000, 64, body_nop, (&g_sink) as u64)
+        rt.st64(times, r as usize, (time.monotonic_ns() - t0) / 4000000)
+        if g_sink != 4000000 {
+            ok = 0
+        }
+        r = r + 1
+    }
+    let c64: u64 = median(times, reps)
+
+    r = 0
+    while r < 31 {
+        g_sink = 0
+        let t0: u64 = time.monotonic_ns()
+        jobs.parallel_for(&j, 0, 2 * t, 1, body_nop, (&g_sink) as u64)
+        rt.st64(times, r as usize, time.monotonic_ns() - t0)
+        r = r + 1
+    }
+    let wake: u64 = median(times, 31)
+
+    r = 0
+    while r < 31 {
+        let t0: u64 = time.monotonic_ns()
+        let h: u64 = jobs.spawn(&j, task_nop, r)
+        let v: u64 = jobs.join(&j, h)
+        if v != r {
+            ok = 0
+        }
+        rt.st64(times, r as usize, time.monotonic_ns() - t0)
+        r = r + 1
+    }
+    let spawn: u64 = median(times, 31)
+
+    var out: rt.Buf = rt.buf_new()
+    emit(&out, "T=", t)
+    emit(&out, " heavy_ms=", heavy / 1000000)
+    emit(&out, " heavy_us=", heavy / 1000)
+    emit(&out, " heavy_ok=", ok)
+    emit(&out, " tiny_ns=", tiny)
+    emit(&out, " chunk64_ns=", c64)
+    emit(&out, " wake_us=", wake / 1000)
+    emit(&out, " spawn_us=", spawn / 1000)
+    emit(&out, " by_workers=", jobs.executed_by_workers(&j))
+    emit(&out, " by_caller=", jobs.executed_by_callers(&j))
+    rt.buf_push(&out, 10 as u8)
+    rt.write_everything(1, rt.buf_data(&out) as u64, rt.buf_len(&out))
+    jobs.destroy(&j)
+    return 0
+}
