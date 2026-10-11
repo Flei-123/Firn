@@ -1,0 +1,406 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/addrinfo.fi -- getaddrinfo-style resolution and "Happy Eyeballs"
+// connecting (round MC-E).
+//
+//   addrs_resolve(res, host, hlen, out)   numeric v4 / v6 literal, "localhost",
+//                                         or A + AAAA through net.dns; the list
+//                                         alternates v6, v4, v6, v4 ... (RFC 8305 s4)
+//   addrs_connect(list, port, stagger_ms, total_ms, nonblocking, which, err)
+//                                         dial the list: start the first, start the
+//                                         next after `stagger_ms` without cancelling
+//                                         the earlier ones, first to finish wins
+//   resolve_service(res, prefix, host, hlen, port, default_port, out)
+//                                         SRV first (`_minecraft._tcp.` + host) unless
+//                                         `port != 0` or the host is a literal, then
+//                                         addrs of the target; falls back to host:default_port
+//
+// HONEST LIMITS: blocking DNS (net.dns is blocking, D8) -- call it from a worker
+// thread (async.post bridge) when a loop must stay responsive. No RFC 6724
+// destination sorting, no zone ids, at most 12 addresses per list.
+import std.rt
+import std.net
+import net.dns
+import net.ip6
+
+export {
+    AddrList, addrs_new, addrs_resolve, addrs_connect, addrs_text,
+    Service, service_new, resolve_service,
+    MAX_ADDR_LIST,
+}
+
+const MAX_ADDR_LIST: usize = 12
+const SYS_POLL: i64 = 7
+const POLLOUT: i16 = 4
+
+struct AddrList {
+    n: usize,
+    fam: [u8; 12], // 4 or 6
+    v4: [u32; 12], // host order
+    v6: [u8; 192], // 12 x 16 octets
+}
+
+fn addrs_new() -> AddrList {
+    return AddrList { n: 0, fam: [0; 12], v4: [0; 12], v6: [0; 192] }
+}
+
+fn push4(l: *mut AddrList, a: u32) {
+    if (*l).n < MAX_ADDR_LIST {
+        (*l).fam[(*l).n] = 4 as u8
+        (*l).v4[(*l).n] = a
+        (*l).n = (*l).n + 1
+    }
+}
+
+fn push6(l: *mut AddrList, p: u64) {
+    if (*l).n < MAX_ADDR_LIST {
+        let at: usize = (*l).n
+        (*l).fam[at] = 6 as u8
+        var i: usize = 0
+        while i < 16 {
+            (*l).v6[at * 16 + i] = rt.ld8(p, i)
+            i = i + 1
+        }
+        (*l).n = at + 1
+    }
+}
+
+fn is_name(p: u64, n: usize, lit: str) -> bool {
+    if n != lit.n {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        var c: u8 = rt.ld8(p, i)
+        if c >= 65 as u8 && c <= 90 as u8 {
+            c = c + 32 as u8
+        }
+        if c != *(lit.p + i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn addrs_resolve(res: *mut dns.Resolver, host: u64, hlen: usize,
+    out: *mut AddrList) -> DnsError!bool {
+    (*out).n = 0
+    var n: usize = hlen
+    if n > 0 && rt.ld8(host, n - 1) == 46 as u8 {
+        n = n - 1
+    }
+    var lit: [u8; 16] = [0; 16]
+    if ip6.ip6_parse(host, n, &lit) {
+        if ip6.ip6_is_mapped_v4((&lit[0]) as u64) {
+            push4(out, ip6.ip6_mapped_v4((&lit[0]) as u64))
+        } else {
+            push6(out, (&lit[0]) as u64)
+        }
+        return true
+    }
+    var v4: u32 = 0
+    if dns.dns_parse_ipv4(host, n, &v4) {
+        push4(out, v4)
+        return true
+    }
+    if is_name(host, n, "localhost") {
+        var lo: [u8; 16] = [0; 16]
+        lo[15] = 1 as u8
+        push6(out, (&lo[0]) as u64)
+        push4(out, net.ADDR_LOCAL)
+        return true
+    }
+    var ra: dns.Resolved = dns.resolved_new()
+    var r6: dns.Resolved = dns.resolved_new()
+    var ea: bool = false
+    var e6: bool = false
+    var first_err: u32 = 0 as u32
+    let oka: bool = dns.dns_resolve(res, host, n, dns.T_A, &ra) catch false
+    if !oka {
+        ea = true
+        first_err = dns.resolver_last_error(res)
+    }
+    let ok6: bool = dns.dns_resolve(res, host, n, dns.T_AAAA, &r6) catch false
+    if !ok6 {
+        e6 = true
+        if first_err == 0 as u32 {
+            first_err = dns.resolver_last_error(res)
+        }
+    }
+    var i4: usize = 0
+    var i6: usize = 0
+    let n4: usize = ra.n
+    let n6: usize = r6.n6
+    if ea {
+        i4 = n4
+    }
+    if e6 {
+        i6 = n6
+    }
+    // alternate, v6 first
+    var turn6: bool = true
+    while (i4 < n4 && !ea) || (i6 < n6 && !e6) {
+        if turn6 && i6 < n6 && !e6 {
+            push6(out, (&r6.addr6[i6 * 16]) as u64)
+            i6 = i6 + 1
+        } else if !turn6 && i4 < n4 && !ea {
+            push4(out, ra.addr[i4])
+            i4 = i4 + 1
+        } else if i6 < n6 && !e6 {
+            push6(out, (&r6.addr6[i6 * 16]) as u64)
+            i6 = i6 + 1
+        } else if i4 < n4 && !ea {
+            push4(out, ra.addr[i4])
+            i4 = i4 + 1
+        }
+        turn6 = !turn6
+    }
+    if (*out).n == 0 {
+        if first_err == 7 as u32 {
+            return DnsError::NxDomain
+        }
+        if first_err == 3 as u32 {
+            return DnsError::Timeout
+        }
+        if first_err == 1 as u32 {
+            return DnsError::Name
+        }
+        if first_err == 2 as u32 {
+            return DnsError::NoServers
+        }
+        return DnsError::NoData
+    }
+    return true
+}
+
+// "1.2.3.4" or "2001:db8::1" for entry `i`.
+fn addrs_text(l: *mut AddrList, i: usize, out: *mut rt.Buf) {
+    if (*l).fam[i] == 4 as u8 {
+        net.ipv4_text((*l).v4[i], out)
+    } else {
+        ip6.ip6_format((&(*l).v6[i * 16]) as u64, out)
+    }
+}
+
+fn mono_ms() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000 + ts[1] / 1000000
+}
+
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+// Dials the list with staggered, overlapping attempts. The winner comes back
+// non-blocking when `nonblocking`, else blocking. `*which` = index of the
+// winning address. `*err` = last errno (positive) on failure.
+fn addrs_connect(l: *mut AddrList, port: u16, stagger_ms: i64, total_ms: i64,
+    nonblocking: bool, which: *mut usize, err: *mut i64) -> NetError!net.Conn {
+    var conns: [net.Conn; 12] = [net.conn_from_fd(0 - 1); 12]
+    var live: [bool; 12] = [false; 12]
+    var nlive: usize = 0
+    var next: usize = 0
+    let t0: i64 = mono_ms()
+    var last_start: i64 = 0 - 1000000
+    *err = 0
+    while true {
+        let now: i64 = mono_ms()
+        if now - t0 >= total_ms {
+            break
+        }
+        // start the next attempt when due (or when nothing is running)
+        if next < (*l).n && (nlive == 0 || now - last_start >= stagger_ms) {
+            var pending: bool = false
+            var e: i64 = 0
+            var started: bool = false
+            var c: net.Conn = net.conn_from_fd(0 - 1)
+            var ok: bool = true
+            if (*l).fam[next] == 4 as u8 {
+                c = net.connect_nb((*l).v4[next], port, &pending, &e) catch net.conn_from_fd(0 - 1)
+            } else {
+                c = net.connect6_nb((&(*l).v6[next * 16]) as u64, port, &pending, &e) catch net.conn_from_fd(0 - 1)
+            }
+            ok = net.conn_is_open(&c)
+            if ok {
+                if !pending {
+                    // connected at once; close the others
+                    var x: usize = 0
+                    while x < 12 {
+                        if live[x] {
+                            net.close(&conns[x])
+                        }
+                        x = x + 1
+                    }
+                    *which = next
+                    if !nonblocking {
+                        net.set_nonblocking(&c, false) catch false
+                    }
+                    return c
+                }
+                conns[next] = c
+                live[next] = true
+                nlive = nlive + 1
+                started = true
+            } else {
+                *err = e
+            }
+            last_start = now
+            next = next + 1
+            if !started {
+                continue // a refused start does not wait for the stagger
+            }
+        }
+        if nlive == 0 && next >= (*l).n {
+            break
+        }
+        // wait for any pending attempt
+        var pfd: [PollFd; 12] = [PollFd { fd: 0 - 1, events: 0 as i16, revents: 0 as i16 }; 12]
+        var idx: [usize; 12] = [0; 12]
+        var np: usize = 0
+        var k: usize = 0
+        while k < 12 {
+            if live[k] {
+                pfd[np].fd = conns[k].fd
+                pfd[np].events = POLLOUT
+                idx[np] = k
+                np = np + 1
+            }
+            k = k + 1
+        }
+        var wait: i64 = total_ms - (mono_ms() - t0)
+        if next < (*l).n {
+            let w2: i64 = stagger_ms - (mono_ms() - last_start)
+            if w2 < wait {
+                wait = w2
+            }
+        }
+        if wait < 0 {
+            wait = 0
+        }
+        syscall(SYS_POLL, (&pfd[0]) as i64, np as i64, wait, 0, 0, 0)
+        var m: usize = 0
+        while m < np {
+            if pfd[m].revents != 0 as i16 {
+                let ci: usize = idx[m]
+                var e2: i64 = 0
+                let fin: bool = net.connect_finish(&conns[ci], &e2) catch false
+                if fin {
+                    var x2: usize = 0
+                    while x2 < 12 {
+                        if live[x2] && x2 != ci {
+                            net.close(&conns[x2])
+                        }
+                        x2 = x2 + 1
+                    }
+                    *which = ci
+                    var win: net.Conn = conns[ci]
+                    if !nonblocking {
+                        net.set_nonblocking(&win, false) catch false
+                    }
+                    return win
+                }
+                *err = e2
+                net.close(&conns[ci])
+                live[ci] = false
+                nlive = nlive - 1
+            }
+            m = m + 1
+        }
+    }
+    var y: usize = 0
+    while y < 12 {
+        if live[y] {
+            net.close(&conns[y])
+        }
+        y = y + 1
+    }
+    return NetError::Connect
+}
+
+// ---------------------------------------------------------- service lookup
+
+struct Service {
+    addrs: AddrList,
+    port: u16,
+    host: [u8; 96], // the name the addresses belong to (SRV target or the input)
+    hlen: usize,
+    used_srv: bool,
+    srv_tried: bool,
+}
+
+fn service_new() -> Service {
+    return Service { addrs: addrs_new(), port: 0 as u16, host: [0; 96],
+        hlen: 0, used_srv: false, srv_tried: false }
+}
+
+fn svc_set_host(o: *mut Service, p: u64, n: usize) {
+    var m: usize = n
+    if m > 95 {
+        m = 95
+    }
+    var i: usize = 0
+    while i < m {
+        (*o).host[i] = rt.ld8(p, i)
+        i = i + 1
+    }
+    (*o).hlen = m
+}
+
+// `prefix` is e.g. "_minecraft._tcp." . `port` 0 = the user gave none.
+// Like the Java client: SRV is asked only when no port was given and the host
+// is not an IP literal; if no SRV target resolves the plain host is used
+// with `default_port`.
+fn resolve_service(res: *mut dns.Resolver, prefix: str, host: u64, hlen: usize,
+    port: u16, default_port: u16, out: *mut Service) -> DnsError!bool {
+    (*out).used_srv = false
+    (*out).srv_tried = false
+    var lit: AddrList = addrs_new()
+    var is_lit: bool = false
+    var l16: [u8; 16] = [0; 16]
+    var l4: u32 = 0
+    if ip6.ip6_parse(host, hlen, &l16) || dns.dns_parse_ipv4(host, hlen, &l4) {
+        is_lit = true
+    }
+    if port == 0 as u16 && !is_lit && hlen + prefix.n < 250 {
+        (*out).srv_tried = true
+        var q: [u8; 256] = [0; 256]
+        var i: usize = 0
+        while i < prefix.n {
+            q[i] = *(prefix.p + i)
+            i = i + 1
+        }
+        var j: usize = 0
+        while j < hlen {
+            q[prefix.n + j] = rt.ld8(host, j)
+            j = j + 1
+        }
+        var set: dns.SrvSet = dns.srvset_new()
+        let got: bool = dns.dns_resolve_srv(res, (&q[0]) as u64, prefix.n + hlen, &set) catch false
+        if got {
+            var k: usize = 0
+            while k < set.n {
+                if set.nlen[k] > 0 {
+                    let tgt: u64 = dns.srv_target(&set, k)
+                    let ok: bool = addrs_resolve(res, tgt, set.nlen[k], &(*out).addrs) catch false
+                    if ok {
+                        (*out).port = set.port[k] as u16
+                        svc_set_host(out, tgt, set.nlen[k])
+                        (*out).used_srv = true
+                        return true
+                    }
+                }
+                k = k + 1
+            }
+        }
+    }
+    let ok2: bool = try addrs_resolve(res, host, hlen, &(*out).addrs)
+    (*out).port = port
+    if port == 0 as u16 {
+        (*out).port = default_port
+    }
+    svc_set_host(out, host, hlen)
+    return ok2
+}

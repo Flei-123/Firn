@@ -1,0 +1,260 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/ffi/win_wgl_probe.fi -- window.gpu_gl on Windows (lib/gpu/wgl.windows.fi),
+// under Wine + Xvfb (tools/ffi/run.sh) or on a real Windows PC.
+//
+// 1. a real window of lib/window, a GL 3.3 core context (wglCreateContextAttribsARB)
+// 2. GL functions found with window.gpu_proc (wglGetProcAddress / opengl32 export)
+// 3. a green triangle on a red clear colour drawn with raw GL calls, read back,
+//    pixel + count + 32-bit FNV-1a hash of the 128x128 readback
+// 4. the same through fUi's GlApi table (window.gpu_open -> lib/plat/glwin.fi):
+//    a blue triangle drawn only with table calls
+// 5. swap, vsync, full screen on/off, mouse capture + delta
+// Prints "KEY value" lines and ends with "PROBE OK" / exit 0; any other exit
+// code is the number of the failed step. HONEST: not run on real Windows.
+import window.window
+import paint.gl
+import gpu.wgl
+import std.io
+import std.rt
+
+const VS: str = "#version 330 core\nlayout(location=0) in vec2 p;\nvoid main(){gl_Position=vec4(p,0.0,1.0);}\n"
+const FS_G: str = "#version 330 core\nout vec4 c;\nvoid main(){c=vec4(0.0,1.0,0.0,1.0);}\n"
+const FS_B: str = "#version 330 core\nout vec4 c;\nvoid main(){c=vec4(0.0,0.0,1.0,1.0);}\n"
+
+static mut PX: [u8; 65536] = [0 as u8; 65536]
+static mut LOG: [u8; 512] = [0 as u8; 512]
+static mut TRI: [f32; 6] = [0.0; 6]
+
+fn say(k: str, v: i64) {
+    io.print(k)
+    io.print(" ")
+    var f: io.Fmt = io.fmt_new()
+    f = io.fmt_number(f, v)
+    io.fmt_print(f)
+    io.fmt_free(f)
+    io.new_line()
+}
+
+fn fnv(n: usize) -> u64 {
+    var h: u64 = 2166136261
+    var i: usize = 0
+    while i < n {
+        h = ((h ^ (PX[i] as u64)) * 16777619) & 0xFFFFFFFF
+        i = i + 1
+    }
+    return h
+}
+
+// count pixels with (r,g,b) and sample one pixel
+fn count(w: usize, h: usize, r: u8, g: u8, b: u8) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < w * h {
+        if PX[i * 4] == r && PX[i * 4 + 1] == g && PX[i * 4 + 2] == b {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn shader(f: *mut window.Window, ty: u64, src: str) -> u64 {
+    let sh: u64 = wgl.call1(window.gpu_proc(f, "glCreateShader"), ty)
+    var ptrs: [u64; 1] = [src.p as u64]
+    var lens: [i32; 1] = [src.n as i32]
+    wgl.call4(window.gpu_proc(f, "glShaderSource"), sh, 1, (&ptrs[0]) as u64, (&lens[0]) as u64)
+    wgl.call1(window.gpu_proc(f, "glCompileShader"), sh)
+    var ok: [i32; 1] = [0]
+    wgl.call3(window.gpu_proc(f, "glGetShaderiv"), sh, 0x8B81, (&ok[0]) as u64)
+    if ok[0] == 0 {
+        wgl.call4(window.gpu_proc(f, "glGetShaderInfoLog"), sh, 500, 0, (&LOG[0]) as u64)
+        io.print("SHADER LOG ")
+        io.print_c((&LOG[0]) as u64)
+        io.new_line()
+        return 0
+    }
+    return sh
+}
+
+fn main() -> i32 {
+    var w: window.Window = window.window_new()
+    if !window.open_window(&w, 0) {
+        io.print_line("NOWINDOW")
+        return 1 as i32
+    }
+    window.make(&w, 128, 128)
+    window.show_window(&w)
+    let pw: usize = window.width(&w)
+    let ph: usize = window.height(&w)
+    say("WINDOW_W", pw as i64)
+    say("WINDOW_H", ph as i64)
+    // 1. context
+    if !window.gpu_gl(&w, 3 as u32, 3 as u32, 24 as u32, 8 as u32) {
+        io.print_line(wgl.last_error())
+        return 2 as i32
+    }
+    var s: [u8; 128] = [0 as u8; 128]
+    var n: usize = wgl.get_string(0x1F02 as u32, (&s[0]) as u64, 128)
+    io.print("GL_VERSION ")
+    io.print_line_bytes((&s[0]) as u64, n)
+    n = wgl.get_string(0x1F01 as u32, (&s[0]) as u64, 128)
+    io.print("GL_RENDERER ")
+    io.print_line_bytes((&s[0]) as u64, n)
+    // 2. loader
+    if window.gpu_proc(&w, "glCreateShader") == 0 || window.gpu_proc(&w, "glClear") == 0 ||
+    window.gpu_proc(&w, "glGenVertexArrays") == 0 {
+        io.print_line("NOPROC")
+        return 3 as i32
+    }
+    if window.gpu_proc(&w, "glNoSuchFunction123") != 0 {
+        io.print_line("PROC FOR NOTHING")
+        return 3 as i32
+    }
+    // 3. raw GL: green triangle on red
+    let vs: u64 = shader(&w, 0x8B31, VS)
+    let fs: u64 = shader(&w, 0x8B30, FS_G)
+    if vs == 0 || fs == 0 {
+        return 4 as i32
+    }
+    let prog: u64 = wgl.call0(window.gpu_proc(&w, "glCreateProgram"))
+    wgl.call2(window.gpu_proc(&w, "glAttachShader"), prog, vs)
+    wgl.call2(window.gpu_proc(&w, "glAttachShader"), prog, fs)
+    wgl.call1(window.gpu_proc(&w, "glLinkProgram"), prog)
+    var ok: [i32; 1] = [0]
+    wgl.call3(window.gpu_proc(&w, "glGetProgramiv"), prog, 0x8B82, (&ok[0]) as u64)
+    if ok[0] == 0 {
+        return 4 as i32
+    }
+    TRI[0] = 0.0 - 0.5
+    TRI[1] = 0.0 - 0.5
+    TRI[2] = 0.5
+    TRI[3] = 0.0 - 0.5
+    TRI[4] = 0.0
+    TRI[5] = 0.5
+    var vao: [u32; 1] = [0 as u32]
+    var vbo: [u32; 1] = [0 as u32]
+    wgl.call2(window.gpu_proc(&w, "glGenVertexArrays"), 1, (&vao[0]) as u64)
+    wgl.call1(window.gpu_proc(&w, "glBindVertexArray"), vao[0] as u64)
+    wgl.call2(window.gpu_proc(&w, "glGenBuffers"), 1, (&vbo[0]) as u64)
+    wgl.call2(window.gpu_proc(&w, "glBindBuffer"), 0x8892, vbo[0] as u64)
+    wgl.call4(window.gpu_proc(&w, "glBufferData"), 0x8892, 24, (&TRI[0]) as u64, 0x88E4)
+    wgl.call6(window.gpu_proc(&w, "glVertexAttribPointer"), 0, 2, 0x1406, 0, 8, 0)
+    wgl.call1(window.gpu_proc(&w, "glEnableVertexAttribArray"), 0)
+    wgl.call4(window.gpu_proc(&w, "glViewport"), 0, 0, pw as u64, ph as u64)
+    wgl.call4(window.gpu_proc(&w, "glClearColor"), wgl.bits32(1.0), 0, 0, wgl.bits32(1.0))
+    wgl.call1(window.gpu_proc(&w, "glClear"), 0x4100)
+    wgl.call1(window.gpu_proc(&w, "glUseProgram"), prog)
+    wgl.call3(window.gpu_proc(&w, "glDrawArrays"), 4, 0, 3)
+    wgl.call7(window.gpu_proc(&w, "glReadPixels"), 0, 0, pw as u64, ph as u64, 0x1908, 0x1401, (&PX[0]) as u64)
+    let err: u64 = wgl.call0(window.gpu_proc(&w, "glGetError")) & 0xFFFFFFFF
+    say("GL_ERROR", err as i64)
+    let mid: usize = ((ph / 2) * pw + pw / 2) * 4
+    say("MID_R", PX[mid] as i64)
+    say("MID_G", PX[mid + 1] as i64)
+    say("MID_B", PX[mid + 2] as i64)
+    say("CORNER_R", PX[0] as i64)
+    say("CORNER_G", PX[1] as i64)
+    let green: usize = count(pw, ph, 0 as u8, 255 as u8, 0 as u8)
+    say("GREEN_PIXELS", green as i64)
+    say("HASH_RAW", fnv(pw * ph * 4) as i64)
+    if err != 0 || PX[mid] != 0 as u8 || PX[mid + 1] != 255 as u8 || PX[0] != 255 as u8 {
+        return 5 as i32
+    }
+    // area = 0.5 * (w/2) * (h/2) pixels, edges aside
+    let want: usize = pw * ph / 8
+    if green < want - want / 10 || green > want + want / 10 {
+        return 5 as i32
+    }
+    if !window.gpu_gl(&w, 3 as u32, 3 as u32, 24 as u32, 8 as u32) {
+        return 5 as i32
+    }
+    // 4. fUi's table
+    var api: gl.GlApi = gl.gl_api_new()
+    if !window.gpu_open(&w, (&api) as u64) || !gl.gl_api_ok(&api) {
+        io.print_line("NOAPI")
+        return 6 as i32
+    }
+    let ap: u64 = api.program(VS.p as u64, VS.n, FS_B.p as u64, FS_B.n, (&LOG[0]) as u64, 500)
+    if ap == 0 {
+        io.print("API PROGRAM LOG ")
+        io.print_c((&LOG[0]) as u64)
+        io.new_line()
+        return 6 as i32
+    }
+    let avao: u64 = api.create_vertex_array()
+    api.bind_vertex_array(avao)
+    let abuf: u64 = api.create_buffer()
+    api.bind_buffer(0x8892, abuf)
+    api.buffer_data(0x8892, (&TRI[0]) as u64, 24, 0x88E4)
+    api.vertex_attrib_pointer(0, 2, 0x1406, 0, 8, 0)
+    api.enable_vertex_attrib_array(0)
+    api.viewport(0, 0, pw as i64, ph as i64)
+    api.clear_color(0.0, 0.0, 0.0, 1.0)
+    api.clear(gl.GL_COLOR_BUFFER_BIT as u64)
+    api.use_program(ap)
+    api.draw_arrays(4, 0, 3)
+    api.read_pixels(0, 0, pw as i64, ph as i64, (&PX[0]) as u64)
+    say("API_GL_ERROR", api.get_error() as i64)
+    let blue: usize = count(pw, ph, 0 as u8, 0 as u8, 255 as u8)
+    say("BLUE_PIXELS", blue as i64)
+    say("HASH_API", fnv(pw * ph * 4) as i64)
+    if PX[mid + 2] != 255 as u8 || PX[0] != 0 as u8 || blue < want - want / 10 || blue > want + want / 10 {
+        return 6 as i32
+    }
+    // fUi's own shaders are "#version 300 es": does this driver take them in a
+    // core context? (Reported, not required: Mesa does, real drivers may not.)
+    let es_vs: str = "#version 300 es\nlayout(location=0) in vec2 p;\nvoid main(){gl_Position=vec4(p,0.0,1.0);}\n"
+    let es_fs: str = "#version 300 es\nprecision mediump float;\nout vec4 c;\nvoid main(){c=vec4(1.0);}\n"
+    let esp: u64 = api.program(es_vs.p as u64, es_vs.n, es_fs.p as u64, es_fs.n, (&LOG[0]) as u64, 500)
+    var es_ok: i64 = 0
+    if esp != 0 {
+        es_ok = 1
+    }
+    say("ES300_SHADER_ACCEPTED", es_ok)
+    // 5. swap, vsync, full screen, mouse
+    if !window.gpu_swap(&w) {
+        io.print_line("NOSWAP")
+        return 7 as i32
+    }
+    say("VSYNC_OFF", window.gpu_vsync(&w, false) as i64)
+    say("VSYNC_ON", window.gpu_vsync(&w, true) as i64)
+    say("FULLSCREEN_ON", window.fullscreen(&w, true) as i64)
+    say("IS_FULLSCREEN", window.is_fullscreen(&w) as i64)
+    var k: usize = 0
+    while k < 5 {
+        window.next_event(&w)
+        k = k + 1
+    }
+    // the window now covers the monitor (Xvfb screen of tools/ffi/run.sh: 800x600)
+    say("FULLSCREEN_W", window.width(&w) as i64)
+    say("FULLSCREEN_H", window.height(&w) as i64)
+    if window.width(&w) <= pw {
+        return 7 as i32
+    }
+    say("FULLSCREEN_OFF", window.fullscreen(&w, false) as i64)
+    say("IS_FULLSCREEN_AFTER", window.is_fullscreen(&w) as i64)
+    say("CURSOR_CAPTURE", window.cursor_mode(&w, window.CURSOR_CAPTURED) as i64)
+    var d: [i64; 2] = [0; 2]
+    window.cursor_delta(&w, (&d[0]) as u64)
+    // move the pointer by (+5,+3) from the middle by hand, then read the delta
+    var ms: [i32; 2] = [0; 2]
+    let gcp: u64 = wgl.dll_sym("user32.dll", "GetCursorPos")
+    let scp: u64 = wgl.dll_sym("user32.dll", "SetCursorPos")
+    wgl.call1(gcp, (&ms[0]) as u64)
+    wgl.call2(scp, (ms[0] + 5) as u64, (ms[1] + 3) as u64)
+    var d2: [i64; 2] = [0; 2]
+    window.cursor_delta(&w, (&d2[0]) as u64)
+    say("DELTA2_X", d2[0])
+    say("DELTA2_Y", d2[1])
+    var d3: [i64; 2] = [0; 2]
+    window.cursor_delta(&w, (&d3[0]) as u64)
+    say("DELTA3_X", d3[0])
+    if d2[0] != 5 || d2[1] != 3 || d3[0] != 0 || d3[1] != 0 {
+        return 8 as i32
+    }
+    say("CURSOR_NORMAL", window.cursor_mode(&w, window.CURSOR_NORMAL) as i64)
+    window.gpu_close(&w)
+    window.close_window(&w)
+    io.print_line("PROBE OK")
+    return 0 as i32
+}

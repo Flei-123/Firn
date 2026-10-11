@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/glctx.windows.fi -- gpu.glctx on Windows: an OpenGL 3.3 CORE context through WGL.
+// The twin of lib/gpu/glctx.fi (EGL on Linux): same names, same `GlCtx` use, so lib/gpu/gl33.fi (which only
+// calls glctx.ctx_proc and dynlib.callx) and everything on top of it builds for Windows unchanged.
+//
+//     import gpu.glctx
+//     var c: glctx.GlCtx = glctx.ctx_open(0, 0)    // headless: a hidden helper window carries the context
+//     var c2: glctx.GlCtx = glctx.ctx_open_x11(640, 360)   // a visible window (the name is the Linux twin's);
+//                                                   // glctx.ctx_swap shows the frame, ctx_x11_pump drains messages
+//     var c3: glctx.GlCtx = glctx.ctx_borrow()     // the context window.gpu_gl made for a lib/window window
+//     let f: u64 = glctx.ctx_proc(&c, "glCreateShader")
+//
+// The loader is gpu.wgl.proc (wglGetProcAddress, then the opengl32.dll export). Everything is reached through
+// LoadLibrary + the Win64 call gate, no compiler import list entry (GAPS B16). Call from the thread that made the
+// context current. Tested under Wine + Mesa only (tools/ffi/win_glctx_probe.fi); real Windows UNTESTED.
+import std.rt
+import gpu.wgl
+
+export {
+    GlCtx, ctx_open, ctx_open_x11, ctx_close, ctx_proc, ctx_swap, ctx_swap_interval,
+    ctx_x11_pending, ctx_x11_pump, ctx_borrow,
+}
+
+// failure steps (GlCtx.step): 0 = ok; the numbers follow the EGL twin where the step exists
+const S_NO_EGL: i32 = 1 // opengl32/user32/gdi32 missing
+const S_NO_SURFACE: i32 = 5 // the helper window could not be made
+const S_NO_CONTEXT: i32 = 6 // pixel format / context / ARB entry point failed
+const S_NO_CURRENT: i32 = 7 // borrow: no context is current
+
+struct GlCtx {
+    ok: bool,
+    step: i32,
+    // true: a visible window of this context (ctx_swap shows the frame)
+    window: bool,
+    // true: made by ctx_borrow, nothing here to close
+    borrowed: bool,
+    hwnd: u64,
+    w: i32,
+    h: i32,
+    gl: wgl.Wgl,
+}
+
+fn new_ctx(w: i32, h: i32) -> GlCtx {
+    return GlCtx { ok: false, step: 0, window: false, borrowed: false, hwnd: 0, w: w, h: h,
+        gl: wgl.wgl_new() }
+}
+
+// CreateWindowExA(0, "STATIC", "firn", style, 0, 0, w, h, 0, 0, 0, 0)
+fn make_window(style: u64, w: i32, h: i32) -> u64 {
+    let cw: u64 = wgl.dll_sym("user32.dll", "CreateWindowExA")
+    if cw == 0 {
+        return 0
+    }
+    var cls: [u8; 7] = "STATIC\0"
+    var nm: [u8; 5] = "firn\0"
+    var ww: i32 = w
+    var hh: i32 = h
+    if ww < 1 { ww = 1 }
+    if hh < 1 { hh = 1 }
+    return wgl.call12(cw, 0, (&cls[0]) as u64, (&nm[0]) as u64, style, 0, 0, ww as u64, hh as u64, 0, 0, 0, 0)
+}
+
+fn open_on(c: *mut GlCtx, style: u64) -> bool {
+    let h: u64 = make_window(style, (*c).w, (*c).h)
+    if h == 0 {
+        (*c).step = S_NO_SURFACE
+        return false
+    }
+    (*c).hwnd = h
+    if !wgl.open(&(*c).gl, h, 3 as u32, 3 as u32, wgl.C_CORE, 24 as u32, 8 as u32) {
+        (*c).step = S_NO_CONTEXT
+        wgl.call1(wgl.dll_sym("user32.dll", "DestroyWindow"), h)
+        (*c).hwnd = 0
+        return false
+    }
+    return true
+}
+
+// A headless GL 3.3 core context (w/h are only stored; the frame lives in an FBO). A hidden helper window of
+// style WS_POPUP carries the pixel format. Check `.ok`; on failure `.step` says what failed.
+fn ctx_open(w: i32, h: i32) -> GlCtx {
+    var c: GlCtx = new_ctx(w, h)
+    if open_on(&c, 0x80000000) {
+        c.ok = true
+    }
+    return c
+}
+
+// A visible top-level window w x h (client size is a little smaller: the plain frame is not adjusted) with a
+// GL 3.3 core context. ctx_swap shows the frame; ctx_x11_pump drains the window's messages.
+fn ctx_open_x11(w: i32, h: i32) -> GlCtx {
+    var c: GlCtx = new_ctx(w, h)
+    // WS_OVERLAPPEDWINDOW 0x00CF0000 | WS_VISIBLE 0x10000000
+    if open_on(&c, 0x10CF0000) {
+        c.window = true
+        c.ok = true
+    }
+    return c
+}
+
+// The context that is current on this thread (made by window.gpu_gl / gpu_open for a lib/window window).
+// ctx_proc then works; ctx_swap is false (use window.gpu_swap), ctx_close does nothing.
+fn ctx_borrow() -> GlCtx {
+    var c: GlCtx = new_ctx(0, 0)
+    if wgl.current_context() == 0 {
+        c.step = S_NO_CURRENT
+        return c
+    }
+    c.borrowed = true
+    c.ok = true
+    return c
+}
+
+// Address of the GL function `name` (0 = the driver does not have it). Needs a current context for GL 1.2+.
+fn ctx_proc(c: *mut GlCtx, name: str) -> u64 {
+    return wgl.proc(name)
+}
+
+fn ctx_swap(c: *mut GlCtx) -> bool {
+    if !(*c).window || !(*c).ok {
+        return false
+    }
+    return wgl.swap(&(*c).gl)
+}
+
+// 0 = do not wait for the vertical blank, 1 = wait.
+fn ctx_swap_interval(c: *mut GlCtx, n: i32) -> bool {
+    if (*c).borrowed || !(*c).ok {
+        return false
+    }
+    return wgl.swap_interval(&(*c).gl, n as u32)
+}
+
+// 1 if a message waits for this thread, else 0 (PeekMessageA with PM_NOREMOVE).
+fn ctx_x11_pending(c: *mut GlCtx) -> i32 {
+    if !(*c).window {
+        return 0
+    }
+    let pm: u64 = wgl.dll_sym("user32.dll", "PeekMessageA")
+    if pm == 0 {
+        return 0
+    }
+    var msg: [u64; 6] = [0; 6]
+    if (wgl.call5(pm, (&msg[0]) as u64, 0, 0, 0, 0) & 0xFFFFFFFF) != 0 {
+        return 1
+    }
+    return 0
+}
+
+// Handles all waiting messages; returns how many.
+fn ctx_x11_pump(c: *mut GlCtx) -> i32 {
+    if !(*c).window {
+        return 0
+    }
+    let pm: u64 = wgl.dll_sym("user32.dll", "PeekMessageA")
+    let dm: u64 = wgl.dll_sym("user32.dll", "DispatchMessageA")
+    if pm == 0 || dm == 0 {
+        return 0
+    }
+    var msg: [u64; 6] = [0; 6]
+    var n: i32 = 0
+    // PM_REMOVE = 1
+    while n < 1000 && (wgl.call5(pm, (&msg[0]) as u64, 0, 0, 0, 1) & 0xFFFFFFFF) != 0 {
+        wgl.call1(dm, (&msg[0]) as u64)
+        n = n + 1
+    }
+    return n
+}
+
+fn ctx_close(c: *mut GlCtx) {
+    if (*c).borrowed {
+        (*c).ok = false
+        return
+    }
+    if (*c).gl.ok {
+        wgl.close(&(*c).gl)
+    }
+    if (*c).hwnd != 0 {
+        wgl.call1(wgl.dll_sym("user32.dll", "DestroyWindow"), (*c).hwnd)
+    }
+    (*c).hwnd = 0
+    (*c).ok = false
+    (*c).window = false
+}

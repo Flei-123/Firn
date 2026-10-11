@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/modreload/host.fi -- hot-reload host prototype (see docs/MOD-RELOAD.md).
+//
+//   host <so1> <so2> <so3> <trigger-file>
+//
+// Loads <so1>, ticks 3 times, then WAITS until <trigger-file> exists (run.sh
+// rebuilds the mod meanwhile), unloads <so1>, loads <so2> with the SAME state
+// block, ticks 3 times again; then the same once more for <so3>. Prints one
+// line per tick. The state block lives in the host, so the counter continues.
+import std.rt
+import std.dynlib
+
+struct Mod {
+    h: u64,
+    f_abi: u64,
+    f_init: u64,
+    f_migrate: u64,
+    f_tick: u64,
+    f_shutdown: u64,
+}
+
+fn load(path: u64) -> Mod {
+    var m: Mod = Mod { h: 0, f_abi: 0, f_init: 0, f_migrate: 0, f_tick: 0, f_shutdown: 0 }
+    m.h = dynlib.open_c(path)
+    if m.h == 0 {
+        return m
+    }
+    m.f_abi = dynlib.sym(m.h, "mod_abi")
+    m.f_init = dynlib.sym(m.h, "mod_init")
+    m.f_migrate = dynlib.sym(m.h, "mod_migrate")
+    m.f_tick = dynlib.sym(m.h, "mod_tick")
+    m.f_shutdown = dynlib.sym(m.h, "mod_shutdown")
+    return m
+}
+
+fn exists(path: u64) -> bool {
+    return syscall(21, path as i64, 0, 0, 0, 0, 0) == 0 // access(F_OK)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 5 {
+        return 2
+    }
+    var state: [u64; 16] = [0; 16]
+    var out: [u8; 256] = [0; 256]
+    var nap: [i64; 2] = [0, 5000000]
+    var round: usize = 0
+    var old_abi: u64 = 0
+    var m: Mod = Mod { h: 0, f_abi: 0, f_init: 0, f_migrate: 0, f_tick: 0, f_shutdown: 0 }
+    while round < 3 {
+        if round > 0 {
+            // wait for run.sh to say "the next build is ready"
+            var tries: i32 = 0
+            while !exists(rt.arg_ptr(start, 4)) && tries < 2000 {
+                syscall(35, (&nap[0]) as i64, 0, 0, 0, 0, 0) // nanosleep 5 ms
+                tries = tries + 1
+            }
+            syscall(87, rt.arg_ptr(start, 4) as i64, 0, 0, 0, 0, 0) // unlink trigger
+        }
+        let p: u64 = rt.arg_ptr(start, 1 + round)
+        m = load(p)
+        if m.h == 0 || m.f_tick == 0 || m.f_abi == 0 {
+            var e: [u8; 12] = "LOAD FAILED\n"
+            rt.write_everything(1, (&e[0]) as u64, 12)
+            return 1
+        }
+        let abi: u64 = dynlib.ci0(m.f_abi)
+        if round == 0 {
+            dynlib.ci1(m.f_init, (&state[0]) as u64)
+        } else {
+            dynlib.ci2(m.f_migrate, (&state[0]) as u64, old_abi)
+        }
+        old_abi = abi
+        var t: i32 = 0
+        while t < 3 {
+            let n: u64 = dynlib.ci3(m.f_tick, (&state[0]) as u64, (&out[0]) as u64, 256)
+            out[n as usize] = 10 as u8
+            rt.write_everything(1, (&out[0]) as u64, (n + 1) as usize)
+            t = t + 1
+        }
+        dynlib.ci1(m.f_shutdown, (&state[0]) as u64)
+        dynlib.close(m.h)
+        round = round + 1
+    }
+    return 0
+}

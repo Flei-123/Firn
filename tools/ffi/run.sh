@@ -93,7 +93,7 @@ else
     if [ -z "$DISP" ]; then
         skip "Xvfb is missing (Wine needs a display)"
     else
-        for t in win_probe win_gl_probe; do
+        for t in win_probe win_gl_probe win_wgl_probe win_glctx_probe; do
             if ! "$FIRNC" --target=x86_64-windows -o "$D/$t.exe" "$ROOT/tools/ffi/$t.fi" >"$D/c.log" 2>&1; then
                 bad "$t: compile failed: $(head -3 "$D/c.log")"; continue
             fi
