@@ -150,7 +150,11 @@ const PAGE: u32 = 65536;
 
 /// The functions of the collector runtime that get a body of their own on
 /// this target (see the module comment). Nothing else is overridden.
-const OVERRIDES: [&str; 2] = ["__gc_stack_bottom_maps", "__gc_stack_bottom"];
+///
+/// `__gc_vdso_find` reads `/proc/self/auxv` to find the vDSO of the Linux
+/// kernel (the fast clock of the collector); a browser has neither, so it
+/// answers 1 = "there is none here" and `__gc_now_ns` takes the host clock.
+const OVERRIDES: [&str; 3] = ["__gc_stack_bottom_maps", "__gc_stack_bottom", "__gc_vdso_find"];
 
 /// The imports the host provides, in index order.
 const HOST: [(&str, &[VT], &[VT]); 6] = [
@@ -338,7 +342,9 @@ impl Image {
                         }
                     }
                 }
-                ".ascii" => {
+                // `.asciz` is `.ascii` plus the closing zero octet (the class names in
+                // the type table of the collector, gc.rs::ty_table_asm).
+                ".ascii" | ".asciz" => {
                     let s = sec.ok_or("wasm32: .ascii outside a section")?;
                     let body = rest.trim_start_matches('"').trim_end_matches('"');
                     let mut it = body.chars();
@@ -356,6 +362,9 @@ impl Image {
                             let mut b = [0u8; 4];
                             self.secs[s].extend_from_slice(c.encode_utf8(&mut b).as_bytes());
                         }
+                    }
+                    if dir == ".asciz" {
+                        self.secs[s].push(0);
                     }
                 }
                 other => return Err(format!("wasm32: unknown data directive '{}'", other)),
@@ -933,6 +942,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
                 let ty = g.type_index(sig);
                 if OVERRIDES.contains(&f.name.as_str()) {
                     let body = match class(f.ret) {
+                        Some(VT::I64) if f.name == "__gc_vdso_find" => vec![Ins::I64Const(1)],
                         Some(VT::I64) => vec![Ins::I64Const(g.stack_top as i64)],
                         _ => return Err(format!("internal error: the override '{}' has no u64 result", f.name)),
                     };
@@ -3588,5 +3598,22 @@ impl<'a> Fx<'a> {
             Sys::Missing(_) => return Err("internal error: wasm32: a refused system call reached the translation".into()),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `.asciz` is `.ascii` plus a closing zero octet: the class names in the
+    /// type table of the collector are written that way (gc.rs::ty_table_asm).
+    #[test]
+    fn asciz_is_ascii_plus_a_zero_octet() {
+        let mut img = Image::default();
+        img.parse(".section .rodata\na:\n    .asciz \"Handle\"\nb:\n    .ascii \"ab\"\nc:\n    .asciz \"x\\ty\"\n")
+            .expect("parses");
+        assert_eq!(&img.secs[0][..], b"Handle\0abx\ty\0");
+        assert_eq!(img.labels["b"], (0, 7));
+        assert_eq!(img.labels["c"], (0, 9));
     }
 }

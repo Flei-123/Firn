@@ -266,6 +266,105 @@ const S_STR_TID: u64 = 2144
 // table exists). Entries at or above it are untouched zero pages.
 const S_THREAD_HI: u64 = 2152
 
+// ROUND ANLEGEWEG -- THE FAST REJECTION.
+//
+// `__gc_block_of` walks the chunk list. For an address that does not lie
+// in the heap at all it walks it TO THE END -- measured 274 ns on a heap
+// of 9.7 MiB (37 chunks). And that is by far the most frequent case: the
+// CONSERVATIVE stack scan (SPEC 3.5.3) hands EVERY word of the stack and
+// every saved register to `__gc_mark`, and the fewest of them are
+// pointers.
+//
+// These two words hold the LOWEST and the HIGHEST address the heap has
+// ever occupied. Everything outside is refused in four instructions.
+// The pair is only ever widened, never narrowed -- a chunk that is given
+// back to the operating system leaves the bounds where they are. That is
+// deliberate: the answer stays CORRECT (an address inside the bounds is
+// still looked for properly), only a little less sharp. Narrowing it
+// would need a walk of the list at exactly the moment that is meant to
+// become cheap.
+//
+// The empty state is LO = the largest possible number and HI = 0; then
+// `a < LO` holds for every address and the rejection fires -- which is
+// right, because without a chunk nothing can lie in the heap.
+const S_HEAPLO: u64 = 2160
+const S_HEAPHI: u64 = 2168
+
+// CERTUS ROUND M1 (js runtime): THE ADDRESS INDEX OF THE CHUNKS.
+//
+// Whenever the one-entry cache missed, `__gc_block_of` walked the LINKED LIST
+// OF ALL CHUNKS. A chunk is 256 KiB, so a heap of 320 MiB (youtube.com,
+// measured: 320 588 kB resident) has about 1300 of them. Marking follows the
+// object graph and jumps across all chunks; the single cache entry almost
+// never hits. Every pointer marked therefore cost O(chunks), a whole mark
+// round O(live objects * chunks): the collector work was QUADRATIC in the
+// heap. Invisible on wikipedia (few chunks), deadly on youtube.
+//
+// Next to the list there now is an array of the chunk starts, SORTED by
+// address. `__gc_block_of` finds the chunk by binary search in O(log n) --
+// 11 steps instead of 1300. The list stays as it was (the sweep still walks
+// it); the array is kept up to date at the only two places where the list
+// changes (`__gc_chunk_new`, and giving a chunk back during the sweep).
+//
+// S_IDXP    address of the array (0 = none yet)
+// S_IDXN    number of entries
+// S_IDXK    capacity of the array (in entries of 8 octets)
+// S_IDXBAD  1 = the array is incomplete (mmap failed); the search then falls
+//           back to the old walk over the list. Without that fallback a
+//           missing entry would make live objects look "not in the heap" --
+//           memory corruption.
+const S_IDXP: u64 = 2176
+const S_IDXN: u64 = 2184
+const S_IDXK: u64 = 2192
+const S_IDXBAD: u64 = 2200
+
+// PROFILE ROUND GC ALLOCATION (13.09.2026): the SUM of the time per phase.
+// Only the MAXIMA per type (S_PMAX_START) existed -- they cannot say where
+// the 7.1 s on duckduckgo go. These fields add up the same durations that
+// `__gc_pause_record` computes anyway:
+// 0 start (roots), 1 mark, 2 sweep, 3 end, 4 full run.
+const S_TSUM_START: u64 = 2208
+// Number of slices per type (5 fields, 2248..2288).
+const S_TCNT_START: u64 = 2248
+// Words the conservative root scan has looked at (sum).
+const S_SCANW: u64 = 2296
+// Blocks the sweep has looked at / has really freed.
+const S_SWEPT: u64 = 2304
+const S_FREED: u64 = 2312
+// ROUND C-043 (MEMORY): pointer to the COUNT TABLE PER CLASS. 0 = none yet.
+// The table itself does NOT live in the state block (full: S_REGS sits at
+// 3968) but in an mmap page of its own: CLASS_MAX entries of 16 octets
+// (count, octets).
+const S_KLTAB: u64 = 2320
+// ROUND TK2 (Certus): the direct-mapped cache in front of the chunk index
+// (__gc_block_of). A pointer to its own mmap page(s) -- like S_KLTAB --
+// 0 = not yet made, 1 = could not be made (no cache).
+const S_BOCACHE: u64 = 2328
+const BOCACHE_N: u64 = 2048
+// ROUND VDSO (Certus, 07.10.2026): the monotonic clock WITHOUT a system call.
+// `__gc_now_ns` was a real `clock_gettime` system call -- 396-431 ns on the
+// server -- and the collector reads the clock several times per allocation
+// while a cycle runs (the whole stretch at the allocation site, the start and
+// the end of every slice, one probe per TIME_PROBE objects). On youtube.com
+// 75-95 % of all clock system calls of the page came from here, and
+// `__gc_now_ns` alone was 3.3-4.5 % of the samples. The kernel maps the vDSO
+// into every process; its `__vdso_clock_gettime` answers from a shared page
+// in about 28 ns. The address is looked for ONCE (at the first read):
+// `AT_SYSINFO_EHDR` out of /proc/self/auxv, then the dynamic symbol table of
+// that ELF image (DT_HASH gives the number of symbols).
+//   0 = not looked for yet, 1 = there is none (another machine than x86-64,
+//   no /proc, a kernel without a vDSO, no DT_HASH): then the system call
+//   stays exactly as it was, otherwise the code address of the function.
+// The word is also the CELL a Firn `fn` value points at: a `fn` value is the
+// address of a record whose word 0 is the code address (fnval.rs), and the
+// call passes the record as one more last argument, which System V lets a
+// function ignore.
+const S_VDSO: u64 = 2336
+// Growth of the allocation budget between two runs: limit = live * numerator / denominator.
+// Both words 0 = the default 1/1 (see `gc_set_growth`).
+const S_GROWN: u64 = 2344
+const S_GROWD: u64 = 2352
+
 // The state word of a block header (see the comment at the top).
 const M_MARK: u32 = 3
 const M_WITHOUT_MARK: u32 = 4294967292
@@ -343,11 +442,35 @@ const CHUNK_HEADER: u64 = 64
 const CHUNK_BYTES: u64 = 262144
 const CLASSES: u64 = 13
 const MARK_BYTES: u64 = 1048576
+// Default growth of the allocation budget between two runs: limit = live * 1 / 1,
+// i.e. the next run starts when as much has been allocated since as is alive.
+// A program that trades memory for speed raises it at run time with
+// `gc_set_growth` (Certus runs at 2/1: the collector share of a page load drops,
+// the heap peaks at about three times the live set instead of two).
+const GROW_NUM: u64 = 1
+const GROW_DEN: u64 = 1
 const MIN_LIMIT: u64 = 1048576
 // The largest distance between two collection runs (in freshly allocated
 // bytes): the memory overhead above the live set thereby always stays
 // smaller than this amount -- no matter how large the heap once was.
-const MAX_LIMIT: u64 = 4194304
+//
+// CERTUS ROUND M1 (js runtime): 4 MiB was an ABSOLUTE cap, and youtube.com
+// starved on exactly that. The rule one line up ("the next run when as much
+// has been allocated since as is alive") is relative and right: it keeps the
+// collector work per allocated byte constant. The absolute cap defeats it as
+// soon as the live set is larger than 4 MiB -- then the WHOLE live set is
+// marked again every 4 MiB. With 200 MiB alive that is 50 marks of the full
+// graph per 4 MiB allocated, a factor of 50 in pure collector work; with
+// 400 MiB a factor of 100. The cost grows with the square of the page size --
+// the signature of "runs forever instead of crashing" on youtube/amazon.
+// Measured (gdb samples): 12 of 14 samples of a hanging youtube run were in
+// `__gc_mark`.
+//
+// The cap stays, but it is now an EMERGENCY BRAKE against the phase change
+// described above (the live set collapses) and no longer the normal case:
+// 256 MiB. Memory use stays at most live set + 256 MiB, and the collector
+// work is amortised constant again for every realistic page.
+const MAX_LIMIT: u64 = 268435456
 const WEAK_XOR: u64 = 6510615555426900570
 
 // ------------------------------------------------------------------ Memory
@@ -396,12 +519,175 @@ fn __gc_cpu_ns() -> u64 {
     return __gc_ld64(buf) * 1000000000 + __gc_ld64(buf + 8)
 }
 
+// Reads of the vDSO image (it is mapped read+execute, never written).
+fn __gc_vd_b(a: u64) -> u64 {
+    return (*(a as *mut u8)) as u64
+}
+
+fn __gc_vd_h(a: u64) -> u64 {
+    return (*(a as *mut u16)) as u64
+}
+
+fn __gc_vd_w(a: u64) -> u64 {
+    return (*(a as *mut u32)) as u64
+}
+
+// Is the zero terminated name at `p` "__vdso_clock_gettime"?
+fn __gc_vd_is_name(p: u64) -> bool {
+    var want: [u8; 21] = "__vdso_clock_gettime\0"
+    var i: u64 = 0
+    while i < 21 {
+        if __gc_vd_b(p + i) != (want[i as usize] as u64) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The code address of `__vdso_clock_gettime`, or 1 = there is none here.
+fn __gc_vdso_find() -> u64 {
+    var path: [u8; 16] = "/proc/self/auxv\0"
+    var buf: [u64; 128] = [0; 128]
+    let fd: i64 = syscall(GC_SYS_OPEN, (&path) as u64 as i64, 0, 0, 0, 0, 0)
+    if fd < 0 {
+        return 1
+    }
+    var len: u64 = 0
+    var more: bool = true
+    while more {
+        let n: i64 = syscall(GC_SYS_READ, fd, ((&buf) as u64 + len) as i64, (1024 - len) as i64, 0, 0, 0)
+        if n <= 0 {
+            more = false
+        } else {
+            len = len + n as u64
+            if len >= 1024 {
+                more = false
+            }
+        }
+    }
+    syscall(GC_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    var base: u64 = 0
+    var i: u64 = 0
+    while i + 16 <= len {
+        let t: u64 = buf[(i / 8) as usize]
+        let v: u64 = buf[(i / 8 + 1) as usize]
+        if t == 0 {
+            break
+        }
+        if t == 33 {
+            base = v
+        }
+        i = i + 16
+    }
+    if base == 0 || (base & 4095) != 0 {
+        return 1
+    }
+    // ELF64, little endian, x86-64 (e_machine 62): the name alone would not
+    // tell another machine's image from this one -- the calling convention
+    // would be the wrong one.
+    if __gc_vd_w(base) != 1179403647 {
+        return 1
+    }
+    if __gc_vd_b(base + 4) != 2 || __gc_vd_b(base + 5) != 1 {
+        return 1
+    }
+    if __gc_vd_h(base + 18) != 62 {
+        return 1
+    }
+    let phoff: u64 = __gc_ld64(base + 32)
+    let phentsize: u64 = __gc_vd_h(base + 54)
+    let phnum: u64 = __gc_vd_h(base + 56)
+    if phentsize != 56 || phnum == 0 || phnum > 32 || phoff > 4096 {
+        return 1
+    }
+    var load_off: u64 = 0
+    var have_load: bool = false
+    var dynp: u64 = 0
+    var k: u64 = 0
+    while k < phnum {
+        let ph: u64 = base + phoff + k * phentsize
+        let pt: u64 = __gc_vd_w(ph)
+        if pt == 1 && !have_load {
+            have_load = true
+            load_off = base + __gc_ld64(ph + 8) - __gc_ld64(ph + 16)
+        }
+        if pt == 2 {
+            dynp = base + __gc_ld64(ph + 8)
+        }
+        k = k + 1
+    }
+    if !have_load || dynp == 0 {
+        return 1
+    }
+    var symtab: u64 = 0
+    var strtab: u64 = 0
+    var hash: u64 = 0
+    var d: u64 = dynp
+    var guard: u64 = 0
+    while guard < 64 {
+        let tag: u64 = __gc_ld64(d)
+        if tag == 0 {
+            break
+        }
+        let val: u64 = __gc_ld64(d + 8)
+        if tag == 4 {
+            hash = load_off + val
+        }
+        if tag == 5 {
+            strtab = load_off + val
+        }
+        if tag == 6 {
+            symtab = load_off + val
+        }
+        d = d + 16
+        guard = guard + 1
+    }
+    if symtab == 0 || strtab == 0 || hash == 0 {
+        return 1
+    }
+    let nsym: u64 = __gc_vd_w(hash + 4)
+    var s: u64 = 0
+    while s < nsym && s < 256 {
+        let sy: u64 = symtab + s * 24
+        // STT_FUNC, defined (st_shndx != SHN_UNDEF), the right name
+        if (__gc_vd_b(sy + 4) & 15) == 2 && __gc_vd_h(sy + 6) != 0 && __gc_vd_is_name(strtab + __gc_vd_w(sy)) {
+            let code: u64 = load_off + __gc_ld64(sy + 8)
+            if code > 1 {
+                return code
+            }
+        }
+        s = s + 1
+    }
+    return 1
+}
+
+struct GcVdsoCall { f: fn(i64, u64) -> i64 }
+
+// Calls the function whose record is `cell` (the state word S_VDSO).
+fn __gc_vdso_call(cell: u64, clock: i64, buf: u64) -> i64 {
+    var holder: [u64; 1] = [0; 1]
+    holder[0] = cell
+    let h: *mut GcVdsoCall = (&holder[0]) as *mut GcVdsoCall
+    let f: fn(i64, u64) -> i64 = (*h).f
+    return f(clock, buf)
+}
+
 fn __gc_now_ns() -> u64 {
     let st: u64 = __gc_state() as u64
     let buf: u64 = st + S_TIME
     __gc_st64(buf, 0)
     __gc_st64(buf + 8, 0)
-    syscall(GC_SYS_CLOCK_GETTIME, GC_CLOCK_MONOTONIC, buf as i64, 0, 0, 0, 0)
+    var code: u64 = __gc_ld64(st + S_VDSO)
+    if code == 0 {
+        code = __gc_vdso_find()
+        __gc_st64(st + S_VDSO, code)
+    }
+    if code > 1 {
+        __gc_vdso_call(st + S_VDSO, GC_CLOCK_MONOTONIC, buf)
+    } else {
+        syscall(GC_SYS_CLOCK_GETTIME, GC_CLOCK_MONOTONIC, buf as i64, 0, 0, 0, 0)
+    }
     return __gc_ld64(buf) * 1000000000 + __gc_ld64(buf + 8)
 }
 
@@ -633,35 +919,40 @@ fn gc_diag(i: u64) -> u64 {
     return __gc_ld64(__gc_state() as u64 + S_D_CN_RUHE + i * 8)
 }
 
+// ROUND ANLEGEWEG: the same table, but as a BINARY search -- at most four
+// comparisons instead of up to thirteen. The values are unchanged:
+// 32 48 64 96 128 192 256 384 512 768 1024 2048 4096. This table is the
+// contract with `compiler/src/gc.rs` (`CLASS_BYTES`, checked by the test
+// `class_table_matches_the_runtime`) and with `lib/firnc1/gc.fi`.
 fn __gc_classes_bytes(k: u64) -> u64 {
-    if k == 0 {
-        return 32
-    }
-    if k == 1 {
-        return 48
-    }
-    if k == 2 {
-        return 64
-    }
-    if k == 3 {
+    if k < 4 {
+        if k < 2 {
+            if k == 0 {
+                return 32
+            }
+            return 48
+        }
+        if k == 2 {
+            return 64
+        }
         return 96
     }
-    if k == 4 {
-        return 128
-    }
-    if k == 5 {
-        return 192
-    }
-    if k == 6 {
-        return 256
-    }
-    if k == 7 {
+    if k < 8 {
+        if k < 6 {
+            if k == 4 {
+                return 128
+            }
+            return 192
+        }
+        if k == 6 {
+            return 256
+        }
         return 384
     }
-    if k == 8 {
-        return 512
-    }
-    if k == 9 {
+    if k < 10 {
+        if k == 8 {
+            return 512
+        }
         return 768
     }
     if k == 10 {
@@ -673,15 +964,65 @@ fn __gc_classes_bytes(k: u64) -> u64 {
     return 4096
 }
 
+// ROUND ANLEGEWEG: up to here this was a LOOP that CALLED
+// `__gc_classes_bytes` once per round. Measured on the same bench:
+// 5.2 ns for 24 octets and 27.8 ns for 200 -- for a question whose answer
+// is four comparisons. Now it is a binary search without a single call.
+// The answer is identical for every size.
 fn __gc_class_for(size: u64) -> u64 {
-    var k: u64 = 0
-    while k < CLASSES {
-        if size <= __gc_classes_bytes(k) {
-            return k
+    if size <= 128 {
+        if size <= 48 {
+            if size <= 32 {
+                return 0
+            }
+            return 1
         }
-        k = k + 1
+        if size <= 64 {
+            return 2
+        }
+        if size <= 96 {
+            return 3
+        }
+        return 4
+    }
+    if size <= 512 {
+        if size <= 192 {
+            return 5
+        }
+        if size <= 256 {
+            return 6
+        }
+        if size <= 384 {
+            return 7
+        }
+        return 8
+    }
+    if size <= 1024 {
+        if size <= 768 {
+            return 9
+        }
+        return 10
+    }
+    if size <= 2048 {
+        return 11
+    }
+    if size <= 4096 {
+        return 12
     }
     return CLASSES
+}
+
+// ROUND ANLEGEWEG: size class AND payload size of that class in ONE go --
+// the fast path needs both, and every call is measurable there. Packed:
+// the class in the lowest four bits, the payload size above them. The
+// table itself stands only in `__gc_classes_bytes`.
+// `CLASSES` (= 13) as the answer means: no size class of its own.
+fn __gc_class_and_bytes(size: u64) -> u64 {
+    let k: u64 = __gc_class_for(size)
+    if k >= CLASSES {
+        return CLASSES
+    }
+    return k +% (__gc_classes_bytes(k) *% 16)
 }
 
 // ------------------------------------------------------------------ Chunks
@@ -715,7 +1056,16 @@ fn __gc_chunk_new(class: u64, payload: u64) -> u64 {
     __gc_st64(p + 32, CHUNK_HEADER)
     __gc_st64(p + 40, class)
     __gc_st64(st + S_CHUNKS, p)
+    // CERTUS ROUND M1: the same chunk goes into the sorted index.
+    __gc_idx_add(p)
     __gc_st64(st + S_HEAP, __gc_ld64(st + S_HEAP) + real)
+    // ROUND ANLEGEWEG: widen the bounds of the fast rejection.
+    if p < __gc_ld64(st + S_HEAPLO) {
+        __gc_st64(st + S_HEAPLO, p)
+    }
+    if p + real > __gc_ld64(st + S_HEAPHI) {
+        __gc_st64(st + S_HEAPHI, p + real)
+    }
     // All blocks into the free list of the class
     if class < CLASSES {
         let header: u64 = st + S_FREE + class * 8
@@ -740,10 +1090,176 @@ fn __gc_chunk_new(class: u64, payload: u64) -> u64 {
     return p
 }
 
+// --- CERTUS ROUND M1: the sorted address index of the chunks ---
+
+// The capacity of the array doubles. False = out of memory; S_IDXBAD is set
+// then and everything falls back to walking the list.
+fn __gc_idx_grow() -> bool {
+    let st: u64 = __gc_state() as u64
+    let kap: u64 = __gc_ld64(st + S_IDXK)
+    var grown: u64 = kap + kap
+    if grown < 256 {
+        grown = 256
+    }
+    let p: u64 = __gc_mmap(grown * 8)
+    if p == 0 {
+        __gc_st64(st + S_IDXBAD, 1)
+        return false
+    }
+    let old: u64 = __gc_ld64(st + S_IDXP)
+    let n: u64 = __gc_ld64(st + S_IDXN)
+    var i: u64 = 0
+    while i < n {
+        __gc_st64(p + i * 8, __gc_ld64(old + i * 8))
+        i = i + 1
+    }
+    if old != 0 {
+        __gc_munmap(old, kap * 8)
+    }
+    __gc_st64(st + S_IDXP, p)
+    __gc_st64(st + S_IDXK, grown)
+    return true
+}
+
+// The first position whose entry is >= a (binary search).
+fn __gc_idx_pos(a: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let base: u64 = __gc_ld64(st + S_IDXP)
+    var lo: u64 = 0
+    var hi: u64 = __gc_ld64(st + S_IDXN)
+    while lo < hi {
+        let mid: u64 = lo + (hi - lo) / 2
+        if __gc_ld64(base + mid * 8) < a {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return lo
+}
+
+fn __gc_idx_add(c: u64) {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_IDXBAD) != 0 {
+        return
+    }
+    if __gc_ld64(st + S_IDXN) >= __gc_ld64(st + S_IDXK) {
+        if !__gc_idx_grow() {
+            return
+        }
+    }
+    let base: u64 = __gc_ld64(st + S_IDXP)
+    let n: u64 = __gc_ld64(st + S_IDXN)
+    let pos: u64 = __gc_idx_pos(c)
+    var i: u64 = n
+    while i > pos {
+        __gc_st64(base + i * 8, __gc_ld64(base + (i - 1) * 8))
+        i = i - 1
+    }
+    __gc_st64(base + pos * 8, c)
+    __gc_st64(st + S_IDXN, n + 1)
+}
+
+fn __gc_idx_del(c: u64) {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_IDXBAD) != 0 {
+        return
+    }
+    let base: u64 = __gc_ld64(st + S_IDXP)
+    let n: u64 = __gc_ld64(st + S_IDXN)
+    if base == 0 || n == 0 {
+        return
+    }
+    let pos: u64 = __gc_idx_pos(c)
+    if pos >= n {
+        return
+    }
+    if __gc_ld64(base + pos * 8) != c {
+        return
+    }
+    var i: u64 = pos
+    while i + 1 < n {
+        __gc_st64(base + i * 8, __gc_ld64(base + (i + 1) * 8))
+        i = i + 1
+    }
+    __gc_st64(st + S_IDXN, n - 1)
+}
+
+// The chunk the address lies in -- 0 = none. The caller has already
+// checked the heap bounds.
+fn __gc_idx_chunk(a: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let base: u64 = __gc_ld64(st + S_IDXP)
+    let n: u64 = __gc_ld64(st + S_IDXN)
+    if base == 0 || n == 0 {
+        return 0
+    }
+    var k: u64 = __gc_idx_pos(a)
+    if k >= n {
+        k = n - 1
+    } else {
+        if __gc_ld64(base + k * 8) > a {
+            if k == 0 {
+                return 0
+            }
+            k = k - 1
+        }
+    }
+    let c: u64 = __gc_ld64(base + k * 8)
+    if a < c {
+        return 0
+    }
+    if a >= c + __gc_ld64(c + 8) {
+        return 0
+    }
+    return c
+}
+
+// ROUND TK2 (Certus): the table of the block-of cache, made on first use.
+// 0 or 1 = none (1: the mmap failed once -- then never again asked).
+fn __gc_bocache() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let t: u64 = __gc_ld64(st + S_BOCACHE)
+    if t != 0 {
+        return t
+    }
+    let p: u64 = __gc_mmap(BOCACHE_N * 8)
+    if p == 0 {
+        __gc_st64(st + S_BOCACHE, 1)
+        return 1
+    }
+    __gc_st64(st + S_BOCACHE, p)
+    return p
+}
+
+// A chunk is about to be unmapped: no slot may name it any more.
+fn __gc_bocache_drop(c: u64) {
+    let t: u64 = __gc_ld64(__gc_state() as u64 + S_BOCACHE)
+    if t <= 1 {
+        return
+    }
+    var i: u64 = 0
+    while i < BOCACHE_N {
+        if __gc_ld64(t + i * 8) == c {
+            __gc_st64(t + i * 8, 0)
+        }
+        i = i + 1
+    }
+}
+
 // Which block does the address belong to? 0 = not a heap address.
 // Interior pointers are expressly allowed (the conservative scan).
 fn __gc_block_of(a: u64) -> u64 {
     let st: u64 = __gc_state() as u64
+    // ROUND ANLEGEWEG: everything outside the heap bounds is out in four
+    // instructions instead of a walk of the whole chunk list. Measured on
+    // a heap of 9.7 MiB: 274 ns -> 3 ns.
+    if a < *((st +% S_HEAPLO) as *mut u64) {
+        return 0
+    }
+    if a >= *((st +% S_HEAPHI) as *mut u64) {
+        return 0
+    }
     let cc: u64 = __gc_ld64(st + S_CHUNK_CACHE)
     if cc != 0 {
         let data0: u64 = cc + CHUNK_HEADER
@@ -751,6 +1267,52 @@ fn __gc_block_of(a: u64) -> u64 {
         if a >= data0 && a < end0 {
             return data0 + (a - data0) / __gc_ld64(cc + 16) * __gc_ld64(cc + 16)
         }
+    }
+    // CERTUS ROUND M1: binary search in the address index instead of a walk
+    // over all chunks.
+    if __gc_ld64(st + S_IDXBAD) == 0 {
+        // ROUND TK2 (Certus): first the direct-mapped cache, one slot per
+        // 256 KiB granule of the address (mod BOCACHE_N) holding the chunk
+        // found there last. MEASURED (callgrind, one github.com load):
+        // half of the 7.7 million calls missed the one-entry cache above
+        // and paid the binary search -- __gc_idx_pos 148 + __gc_idx_chunk
+        // 41 instructions each, 2.7 % of the whole load. A slot is only a
+        // guess: the hit is checked against the chunk's data range like
+        // the one-entry cache (another chunk can share the granule), and
+        // a released chunk leaves every slot before its munmap
+        // (__gc_bocache_drop), so a slot never names unmapped memory.
+        var bt: u64 = __gc_ld64(st + S_BOCACHE)
+        if bt == 0 {
+            bt = __gc_bocache()
+        }
+        var slot: u64 = 0
+        if bt > 1 {
+            slot = bt + ((a >> 18) & (BOCACHE_N - 1)) * 8
+            let c2: u64 = __gc_ld64(slot)
+            if c2 != 0 {
+                let data2: u64 = c2 + CHUNK_HEADER
+                let block2: u64 = __gc_ld64(c2 + 16)
+                if a >= data2 && a < data2 + block2 * __gc_ld64(c2 + 24) {
+                    __gc_st64(st + S_CHUNK_CACHE, c2)
+                    return data2 + (a - data2) / block2 * block2
+                }
+            }
+        }
+        let ci: u64 = __gc_idx_chunk(a)
+        if ci == 0 {
+            return 0
+        }
+        let datai: u64 = ci + CHUNK_HEADER
+        let blocki: u64 = __gc_ld64(ci + 16)
+        let endi: u64 = datai + blocki * __gc_ld64(ci + 24)
+        if a >= datai && a < endi {
+            __gc_st64(st + S_CHUNK_CACHE, ci)
+            if slot != 0 {
+                __gc_st64(slot, ci)
+            }
+            return datai + (a - datai) / blocki * blocki
+        }
+        return 0
     }
     var c: u64 = __gc_ld64(st + S_CHUNKS)
     while c != 0 {
@@ -773,6 +1335,13 @@ fn __gc_block_of(a: u64) -> u64 {
 // cache.
 fn __gc_chunk_of(a: u64) -> u64 {
     let st: u64 = __gc_state() as u64
+    // ROUND ANLEGEWEG: the same fast rejection as in `__gc_block_of`.
+    if a < *((st +% S_HEAPLO) as *mut u64) {
+        return 0
+    }
+    if a >= *((st +% S_HEAPHI) as *mut u64) {
+        return 0
+    }
     // The same one entry cache as in __gc_block_of: consecutive finalizers
     // almost always hit the same chunk.
     let cc: u64 = __gc_ld64(st + S_CHUNK_CACHE)
@@ -782,6 +1351,20 @@ fn __gc_chunk_of(a: u64) -> u64 {
         if a >= d0 && a < e0 {
             return cc
         }
+    }
+    // CERTUS ROUND M1: the same index as in `__gc_block_of`.
+    if __gc_ld64(st + S_IDXBAD) == 0 {
+        let ci: u64 = __gc_idx_chunk(a)
+        if ci == 0 {
+            return 0
+        }
+        let d1: u64 = ci + CHUNK_HEADER
+        let e1: u64 = d1 + __gc_ld64(ci + 16) * __gc_ld64(ci + 24)
+        if a >= d1 && a < e1 {
+            __gc_st64(st + S_CHUNK_CACHE, ci)
+            return ci
+        }
+        return 0
     }
     var c: u64 = __gc_ld64(st + S_CHUNKS)
     while c != 0 {
@@ -981,6 +1564,10 @@ fn __gc_catchup() {
 // A conservative scan of a memory area (the stack, or the register save area).
 fn __gc_scan(lo: u64, hi: u64) {
     var a: u64 = (lo + 7) / 8 * 8
+    if hi > a {
+        let stp: u64 = __gc_state() as u64
+        __gc_st64(stp + S_SCANW, __gc_ld64(stp + S_SCANW) + (hi - a) / 8)
+    }
     while a + 8 <= hi {
         __gc_mark(__gc_ld64(a))
         a = a + 8
@@ -1051,6 +1638,7 @@ fn __gc_sweep_step(t0: u64) -> u64 {
         }
         var dead: u64 = 0
         var i: u64 = 0
+        __gc_st64(st + S_SWEPT, __gc_ld64(st + S_SWEPT) + count)
         // Remember the list head BEFORE this chunk: the dead blocks are
         // linked in right away; if the chunk is given back to the OS
         // afterwards, a single reset of the head cuts its (contiguous)
@@ -1105,6 +1693,7 @@ fn __gc_sweep_step(t0: u64) -> u64 {
             }
             i = i + 1
         }
+        __gc_st64(st + S_FREED, __gc_ld64(st + S_FREED) + dead)
         // Hysteresis: an empty chunk is given back only once it has been
         // empty for TWO sweeps in a row (a flag in the chunk header, offset 48).
         // Otherwise a phased workload oscillates between munmap and mmap.
@@ -1132,6 +1721,10 @@ fn __gc_sweep_step(t0: u64) -> u64 {
             if __gc_ld64(st + S_CHUNK_CACHE) == c {
                 __gc_st64(st + S_CHUNK_CACHE, 0)
             }
+            // CERTUS ROUND M1: out of the index first, then release.
+            __gc_idx_del(c)
+            // ROUND TK2: and out of the block-of cache.
+            __gc_bocache_drop(c)
             __gc_munmap(c, bytes)
         } else {
             before = c
@@ -1277,6 +1870,27 @@ fn __gc_own_bottom(st: u64) -> u64 {
 // and never dereferenced (SPEC 3.5.3). The escape analysis of round 79
 // cannot see that and says so; the exception is written down here rather
 // than the check being weakened (docs/ROUND79.md 3).
+// ROUND FASER (Certus, KERN-3) -- THE STACK BOTTOM, SWAPPED. A coroutine
+// that runs on a stack of its own (lib/kern/faser.fi) in the SAME thread
+// has to tell the collector where that stack ends: the conservative scan
+// goes from the current stack pointer to the bottom of THIS thread, and
+// on the foreign stack that bottom would lie in another mapping. The
+// caller swaps the bottom in before the switch and back after it, and
+// registers the sleeping stack as an external root area meanwhile.
+// Returns the bottom that was in force before.
+fn gc_bottom_swap(neu: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let tcb: u64 = __thread_tcb()
+    if tcb != 0 && __gc_ld64(tcb + FT_BOTTOM) != 0 {
+        let alt: u64 = __gc_ld64(tcb + FT_BOTTOM)
+        __gc_st64(tcb + FT_BOTTOM, neu)
+        return alt
+    }
+    let alt2: u64 = __gc_ld64(st + S_BOTTOM)
+    __gc_st64(st + S_BOTTOM, neu)
+    return alt2
+}
+
 #[allow_escape]
 fn __gc_sp_below(n: u64) -> u64 {
     var a: u64 = 0
@@ -1336,6 +1950,8 @@ fn __gc_collect_now() -> u64 {
     if duration > __gc_ld64(tf) {
         __gc_st64(tf, duration)
     }
+    __gc_st64(st + S_TSUM_START + 4 * 8, __gc_ld64(st + S_TSUM_START + 4 * 8) + duration)
+    __gc_st64(st + S_TCNT_START + 4 * 8, __gc_ld64(st + S_TCNT_START + 4 * 8) + 1)
     __gc_st64(st + S_FULL, __gc_ld64(st + S_FULL) + 1)
     __gc_st64(st + S_SINCE, 0)
     // The next collection run when as much has been allocated since as is
@@ -1344,7 +1960,7 @@ fn __gc_collect_now() -> u64 {
     // (a phase change), the old limit was huge and there was NEVER another
     // collection -- the dead chunks of the old phase stayed mapped (measured
     // in the phase test: 300 rounds, 3.8 MiB allocated, 0 runs).
-    var limit: u64 = __gc_ld64(st + S_LIVEBYTES)
+    var limit: u64 = __gc_grow_limit(__gc_ld64(st + S_LIVEBYTES))
     if limit < MIN_LIMIT {
         limit = MIN_LIMIT
     }
@@ -1481,6 +2097,10 @@ fn __gc_pause_record_h(t0: u64, ty: u64, htyp: u64) {
     if duration > __gc_ld64(tfield) {
         __gc_st64(tfield, duration)
     }
+    if ty < 5 {
+        __gc_st64(st + S_TSUM_START + ty * 8, __gc_ld64(st + S_TSUM_START + ty * 8) + duration)
+        __gc_st64(st + S_TCNT_START + ty * 8, __gc_ld64(st + S_TCNT_START + ty * 8) + 1)
+    }
     __gc_hist_record(duration, htyp)
 }
 
@@ -1524,6 +2144,39 @@ fn gc_pause_max_ty(ty: u64) -> u64 {
     return __gc_ld64(__gc_state() as u64 + S_PMAX_START + ty * 8)
 }
 
+// PROFILE ROUND: sum of the duration per phase (ns) and number of slices.
+// ty: 0 start, 1 mark, 2 sweep, 3 end, 4 full run.
+fn gc_time_by_phase(ty: u64) -> u64 {
+    if ty > 4 {
+        return 0
+    }
+    return __gc_ld64(__gc_state() as u64 + S_TSUM_START + ty * 8)
+}
+
+fn gc_slices_by_phase(ty: u64) -> u64 {
+    if ty > 4 {
+        return 0
+    }
+    return __gc_ld64(__gc_state() as u64 + S_TCNT_START + ty * 8)
+}
+
+// Words the conservative root scan has looked at (sum over all cycles).
+fn gc_scan_words() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_SCANW)
+}
+
+fn gc_swept() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_SWEPT)
+}
+
+fn gc_freed() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FREED)
+}
+
+fn gc_allok_n() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_D_ALLOK)
+}
+
 // Begin a cycle: the only atomic root work -- scan the registers and the
 // stack, fill the grey set. That is the shortest conceivable pause; the
 // tracing and sweeping proper run in slices after it.
@@ -1560,7 +2213,7 @@ fn __gc_cycle_end() {
     __gc_drain()
     __gc_st64(st + S_LIVE, __gc_ld64(st + S_SWLEB))
     __gc_st64(st + S_LIVEBYTES, __gc_ld64(st + S_SWLEBB))
-    var limit: u64 = __gc_ld64(st + S_LIVEBYTES)
+    var limit: u64 = __gc_grow_limit(__gc_ld64(st + S_LIVEBYTES))
     if limit < MIN_LIMIT {
         limit = MIN_LIMIT
     }
@@ -1733,10 +2386,111 @@ fn __gc_alloc_locked(st: u64) {
     __gc_error_fin_alloc()
 }
 
+// ROUND ANLEGEWEG -- THE FAST PATH OF THE ALLOCATION.
+//
+// Until this round `__gc_alloc_raw` cost 144 ns for an object of 24 octets --
+// and with the collector switched OFF exactly the same, so it was never the
+// collecting. It was the way there: some three dozen FUNCTION CALLS. Every
+// single word access went through `__gc_ld64`/`__gc_st64` (which stay
+// functions of their own, about 3 ns each), the size class through a loop
+// that called `__gc_classes_bytes` once per round, and on top of that three
+// counter works and a nulling loop with one call per word.
+//
+// This function asks in ONE go whether the ordinary case holds. Every
+// condition is the same one the long path checks; not one is skipped:
+//
+//   S_INIT  == 1        the collector is ready. 0 = `gc_init()` is missing,
+//                       2 = a finalizer is running -- both belong to the long
+//                       path, which reports them properly.
+//   S_MULTI == 0        one thread. With several threads the safepoint, the
+//                       GC lock and the per thread free lists apply; all of
+//                       that stays untouched below.
+//   S_PHASE == 0        no cycle running. During a cycle a fresh object has
+//                       to become GREY and go onto the mark stack.
+//   S_SINCE <  S_LIMIT  the allocation limit has not been reached. The start
+//                       of a cycle hangs off exactly this comparison.
+//   class < CLASSES     the size has a size class (anything larger gets a
+//                       chunk of its own).
+//   the free list of that class is not empty
+//
+// After that the block is unhooked, its payload nulled, and the header
+// written: type id, the current white, serial number. The counters
+// (S_SINCE, S_TOTAL, S_D_ALLOK) are the same ones and are kept in the same
+// way -- `gc_total_bytes()`, `gc_diag(6)` and the serial numbers of `GcWeak`
+// keep their meaning down to the last octet.
+//
+// The arithmetic is `+%` (wrapping) throughout. These are ADDRESSES inside
+// the state block and inside a chunk; an overflow is impossible by
+// construction there, and the check on every single one of them was
+// measurably a good part of what made the way slow.
+//
+// Return value: the payload address, or 0 when the ordinary case does not
+// hold -- the caller then walks the old, complete path. A payload address
+// can never be 0 (it comes from `mmap`), so the two cannot be confused.
+//
+// SINCE THE SAME ROUND THE CALL SITE CARRIES THIS PATH ITSELF: `gc C{ }`
+// is lowered with `class` and `step` folded into constants
+// (`compiler/src/gc_lower.rs`, `lib/firnc1/lower.fi`). This function stays
+// for everything that reaches the runtime WITHOUT a call site of its own --
+// the slot buffers of `GcVec`/`GcMap`, and every direct call of
+// `__gc_alloc_raw`.
+fn __gc_alloc_fast(st: u64, tid: u64, size: u64) -> u64 {
+    if *((st +% S_INIT) as *mut u64) != 1 {
+        return 0
+    }
+    if *((st +% S_MULTI) as *mut u64) != 0 {
+        return 0
+    }
+    if *((st +% S_PHASE) as *mut u64) != 0 {
+        return 0
+    }
+    let since0: u64 = *((st +% S_SINCE) as *mut u64)
+    if since0 >= *((st +% S_LIMIT) as *mut u64) {
+        return 0
+    }
+    let kb: u64 = __gc_class_and_bytes(size)
+    let class: u64 = kb & 15
+    if class >= CLASSES {
+        return 0
+    }
+    let step: u64 = HEADER +% (kb >> 4)
+    let header: u64 = st +% S_FREE +% (class *% 8)
+    let b: u64 = *(header as *mut u64)
+    if b == 0 {
+        return 0
+    }
+    // Unhook: the link of the free list lies in the first word of the payload.
+    let obj0: u64 = b +% HEADER
+    *(header as *mut u64) = *(obj0 as *mut u64)
+    // Null the payload: a half filled object has to be traceable at any
+    // moment (a field initialisation can allocate again itself).
+    var i: u64 = 0
+    while i < size {
+        *((obj0 +% i) as *mut u64) = 0
+        i = i +% 8
+    }
+    let series: u64 = (*((st +% S_SERIES) as *mut u64)) +% 1
+    *((st +% S_SERIES) as *mut u64) = series
+    *(b as *mut u32) = (tid & 4294967295) as u32
+    *((b +% 4) as *mut u32) = ((*((st +% S_PAR) as *mut u64)) & 4294967295) as u32
+    *((b +% 8) as *mut u64) = series
+    *((st +% S_SINCE) as *mut u64) = since0 +% step
+    *((st +% S_TOTAL) as *mut u64) = (*((st +% S_TOTAL) as *mut u64)) +% step
+    *((st +% S_D_ALLOK) as *mut u64) = (*((st +% S_D_ALLOK) as *mut u64)) +% 1
+    return obj0
+}
+
 // Returns the payload address (= the value of a `Gc[T]`) or 0.
 // On exhaustion: FIRST a collection run, THEN the failure.
 fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
     let st: u64 = __gc_state() as u64
+    // ROUND ANLEGEWEG: the fast path first. It yields 0 as soon as anything
+    // is out of the ordinary -- and then everything below runs exactly as
+    // it always did.
+    let fast: u64 = __gc_alloc_fast(st, tid, size)
+    if fast != 0 {
+        return fast as *mut u8
+    }
     // S_INIT: 0 = gc_init() is missing, 1 = ready, 2 = a finalizer is running.
     // The lock sits DELIBERATELY inside this one check, which is there
     // anyway -- a finalizer that allocates would start a collection run out
@@ -2695,6 +3449,11 @@ fn gc_init() -> bool {
     __gc_st64(st + S_INKRAB, INCR_FROM)
     // Round 47: determine once whether any class has a weak field at all.
     // Programs without GcWeak then pay nothing for the nulling.
+    // ROUND ANLEGEWEG: the empty bounds -- LO larger than every address,
+    // HI smaller than every address. Every `__gc_block_of` then refuses at
+    // once, which is correct as long as there is no chunk.
+    __gc_st64(st + S_HEAPLO, 18446744073709551615)
+    __gc_st64(st + S_HEAPHI, 0)
     __gc_st64(st + S_HATWEAK, __gc_weak_present())
     __gc_st64(st + S_WEAKMASK, __gc_weak_mask())
     __gc_st64(st + S_INIT, 1)
@@ -2756,12 +3515,496 @@ fn gc_set_limit(n: u64) {
     __gc_st64(__gc_state() as u64 + S_LIMIT, n)
 }
 
+// ---------------------------------------------------------------------
+// ROUND C-056 (APK): gc_cycle_finish -- THE CALL THAT HAD NO FUNCTION.
+//
+// Round C-047 (speed) changed `sammler_anhalten()` in lib/android/a_main.fi
+// to call `gc_cycle_finish()`, with this reasoning: what is needed is NOT a
+// full mark run (`gc_collect`, measured 270 ms at 25 MB and 741 ms at 40 MB
+// live, on EVERY navigation on the main thread) but only the promise that no
+// cycle is RUNNING any more -- and that costs nothing when none is running.
+//
+// The CALL was written; the FUNCTION never was. On the desk that goes
+// unnoticed because lib/android/ is not compiled there -- the Android build
+// stopped with "unknown function 'gc_cycle_finish'", and no APK could be
+// built since C-047.
+//
+// It is the outer shell around `__gc_cycle_done`, which does exactly what
+// C-047 describes: finish a RUNNING cycle (phase 1 -> 2 -> 3) and nothing
+// else. The check of S_INIT is the one `gc_collect` makes: a collector that
+// is not set up has nothing to finish.
+fn gc_cycle_finish() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_INIT) != 1 {
+        return
+    }
+    __gc_cycle_done()
+}
+
+// The allocation budget for a live set of `live` octets under the current
+// growth factor.
+fn __gc_grow_limit(live: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    var num: u64 = __gc_ld64(st + S_GROWN)
+    var den: u64 = __gc_ld64(st + S_GROWD)
+    if num == 0 || den == 0 {
+        num = GROW_NUM
+        den = GROW_DEN
+    }
+    return live * num / den
+}
+
+// Sets the growth factor of the allocation budget: after a run the next one
+// starts when `live * num / denom` octets have been allocated (never less than
+// MIN_LIMIT, never more than MAX_LIMIT). `gc_set_growth(0, 0)` restores the
+// default 1/1. Larger factors collect less often and keep a larger heap.
+fn gc_set_growth(num: u64, den: u64) {
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st + S_GROWN, num)
+    __gc_st64(st + S_GROWD, den)
+}
+
+fn gc_growth_num() -> u64 {
+    let n: u64 = __gc_ld64(__gc_state() as u64 + S_GROWN)
+    if n == 0 || __gc_ld64(__gc_state() as u64 + S_GROWD) == 0 {
+        return GROW_NUM
+    }
+    return n
+}
+
+fn gc_growth_den() -> u64 {
+    let d: u64 = __gc_ld64(__gc_state() as u64 + S_GROWD)
+    if d == 0 || __gc_ld64(__gc_state() as u64 + S_GROWN) == 0 {
+        return GROW_DEN
+    }
+    return d
+}
+
 fn gc_limit() -> u64 {
     return __gc_ld64(__gc_state() as u64 + S_LIMIT)
 }
 
 fn gc_collections() -> u64 {
     return __gc_ld64(__gc_state() as u64 + S_RUNS)
+}
+
+// ------------------------------------------- ROUND C-043: COUNT PER CLASS
+//
+// WHY THIS COUNT EXISTS
+//
+// Complaint: why does Certus need so much RAM when idle -- 534 MB in the task
+// manager for one (incomplete) github page. Measured afterwards: 1 580 022
+// live objects for 1768 elements, i.e. 894 OBJECTS PER ELEMENT. A browser
+// needs a handful per element (node, style, box, text run). At nearly nine
+// hundred the question is not "how do we save" but FIRST "what are they".
+//
+// `gc_live_objects()` returns only the SUM. A sum does not say which class
+// makes it up, and every optimisation without this breakdown would be a
+// guess. The block header carries the type id anyway (octets 0..4), and the
+// type table carries the class name since this round (gc.rs, word +56) --
+// together they make a readable table.
+//
+// HOW IT MEASURES
+//
+// One pass over all chunks, the way the sweep makes it: per chunk the
+// blocks, and a block counts when its type id is not 0 (0 = free). That is
+// the notion of "alive" `__gc_sweep_step` uses, so the sum fits
+// `gc_live_objects()`.
+//
+// WHEN IT IS VALID
+//
+// Only directly AFTER a full collection run is "occupied" equal to "alive":
+// in between there are dead blocks the next run has yet to collect. The
+// caller therefore calls `gc_collect()` first.
+//
+// WHAT IT COSTS
+//
+// Nothing in normal operation. No allocation, mark or sweep path calls any
+// of this; the table comes into being at the first call of
+// `gc_count_classes()` and is read by diagnostic output only.
+
+// So many classes fit the table. The certus tree has about 137 `gc class`
+// of its own plus those of the shared Firn tree -- 512 leaves plenty of air.
+// Firn wants a LITERAL number here, not a constant (known trap).
+const CLASS_MAX: u64 = 512
+
+// Makes the count table if there is none yet. 16 octets per class:
+// [0] count, [8] octets. Returns 0 = out of memory.
+fn __gc_cltab() -> u64 {
+    let st: u64 = __gc_state() as u64
+    var t: u64 = __gc_ld64(st + S_KLTAB)
+    if t != 0 {
+        return t
+    }
+    // CLASS_MAX * 16 for the class count, 8 * 8 for the length buckets
+    // behind it.
+    t = __gc_mmap(CLASS_MAX * 16 + 64)
+    if t == 0 {
+        return 0
+    }
+    __gc_st64(st + S_KLTAB, t)
+    return t
+}
+
+// Counts the live blocks per class. Returns the sum of all objects counted
+// (it must equal `gc_live_objects()` when called right after a full run).
+fn gc_count_classes() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let t: u64 = __gc_cltab()
+    if t == 0 {
+        return 0
+    }
+    // Zero first -- the count is repeatable.
+    var k: u64 = 0
+    while k < CLASS_MAX {
+        __gc_st64(t + k * 16, 0)
+        __gc_st64(t + k * 16 + 8, 0)
+        k = k + 1
+    }
+    var total: u64 = 0
+    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    while c != 0 {
+        let next: u64 = __gc_ld64(c)
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = __gc_ld64(c + 16)
+        let count: u64 = __gc_ld64(c + 24)
+        var i: u64 = 0
+        while i < count {
+            let b: u64 = data + i * block
+            let tid: u64 = __gc_ld32(b) as u64
+            // Type id 0 means free -- the same test as in the sweep.
+            if tid != 0 {
+                var idx: u64 = tid
+                if idx >= CLASS_MAX {
+                    idx = 0
+                }
+                __gc_st64(t + idx * 16, __gc_ld64(t + idx * 16) + 1)
+                __gc_st64(t + idx * 16 + 8, __gc_ld64(t + idx * 16 + 8) + block)
+                total = total + 1
+            }
+            i = i + 1
+        }
+        c = next
+    }
+    return total
+}
+
+// ROUND C-043: THE LENGTH DISTRIBUTION OF A CLASS.
+//
+// The count per class says "252 952 strands, 34.7 MB". It does not say
+// whether the strands are FULL. A strand holds 28 characters and always
+// occupies 144 octets -- whether a 3 character colour value is in it or 28.
+// That is the difference between "the text is simply big" and "we waste five
+// times what we need".
+//
+// For every live block of class `tid` this reads a u32 FIELD at a given
+// offset (for a strand: `len`, offset 8) and spreads it over 8 buckets:
+// 0, 1..2, 3..4, 5..8, 9..12, 13..16, 17..24, 25+. One line then shows what
+// the occupancy really looks like. The buckets live in the same mmap page as
+// the class count, behind its CLASS_MAX * 16 octets.
+fn gc_len_histogram(tid: u64, field_off: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let t: u64 = __gc_cltab()
+    if t == 0 {
+        return 0
+    }
+    let f: u64 = t + CLASS_MAX * 16
+    var k: u64 = 0
+    while k < 8 {
+        __gc_st64(f + k * 8, 0)
+        k = k + 1
+    }
+    var total: u64 = 0
+    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    while c != 0 {
+        let next: u64 = __gc_ld64(c)
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = __gc_ld64(c + 16)
+        let count: u64 = __gc_ld64(c + 24)
+        var i: u64 = 0
+        while i < count {
+            let b: u64 = data + i * block
+            if __gc_ld32(b) as u64 == tid {
+                let v: u64 = __gc_ld32(b + HEADER + field_off) as u64
+                var bucket: u64 = 7
+                if v == 0 {
+                    bucket = 0
+                } else if v <= 2 {
+                    bucket = 1
+                } else if v <= 4 {
+                    bucket = 2
+                } else if v <= 8 {
+                    bucket = 3
+                } else if v <= 12 {
+                    bucket = 4
+                } else if v <= 16 {
+                    bucket = 5
+                } else if v <= 24 {
+                    bucket = 6
+                }
+                __gc_st64(f + bucket * 8, __gc_ld64(f + bucket * 8) + 1)
+                total = total + 1
+            }
+            i = i + 1
+        }
+        c = next
+    }
+    return total
+}
+
+// ROUND C-043: HOW OFTEN A u32 FIELD HAS A GIVEN VALUE.
+//
+// The length buckets answer "how full". This count answers "of what": for a
+// `Cv` the field `kind` holds the token kind, and the question is how many
+// of the 365 205 nodes are mere WHITESPACE -- the parser hangs them into the
+// declaration value, the cascade skips them when reading. They live for ever
+// without ever being read.
+//
+// Returns the number of objects of class `tid` whose u32 field at
+// `field_off` is exactly `value`.
+fn gc_field_count32(tid: u64, field_off: u64, value: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    var hits: u64 = 0
+    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    while c != 0 {
+        let next: u64 = __gc_ld64(c)
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = __gc_ld64(c + 16)
+        let count: u64 = __gc_ld64(c + 24)
+        var i: u64 = 0
+        while i < count {
+            let b: u64 = data + i * block
+            if __gc_ld32(b) as u64 == tid {
+                if __gc_ld32(b + HEADER + field_off) as u64 == value {
+                    hits = hits + 1
+                }
+            }
+            i = i + 1
+        }
+        c = next
+    }
+    return hits
+}
+
+// ROUND C-045: THE SAME FOR A 64-BIT FIELD (a POINTER).
+//
+// `gc_field_count32` reads with `__gc_ld32` and so can only do u32 fields.
+// The question of this round is a POINTER question: how many `Cv` have
+// neither an `extra` nor a `unit`? A null pointer means "this field never
+// carries anything" -- and a field that never carries anything can vanish
+// from the class. Without this number, shrinking `Cv` would be a guess
+// instead of a measurement.
+//
+// Returns the number of objects of class `tid` whose u64 field at
+// `field_off` is exactly `value` (for the null pointer question: value = 0).
+fn gc_field_count64(tid: u64, field_off: u64, value: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    var hits: u64 = 0
+    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    while c != 0 {
+        let next: u64 = __gc_ld64(c)
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = __gc_ld64(c + 16)
+        let count: u64 = __gc_ld64(c + 24)
+        var i: u64 = 0
+        while i < count {
+            let b: u64 = data + i * block
+            if __gc_ld32(b) as u64 == tid {
+                if __gc_ld64(b + HEADER + field_off) == value {
+                    hits = hits + 1
+                }
+            }
+            i = i + 1
+        }
+        c = next
+    }
+    return hits
+}
+
+// ROUND C-045: WHO POINTS AT THIS CLASS?
+//
+// The question of the round could not be closed with any other tool.
+// Measured, only 31.5 % of the `Cv` hang on a declaration value; for the
+// rest no holder could be found in the source, and three collection runs in
+// a row free nothing (so it is no stale stack garbage either). Instead of
+// guessing on, this walks the whole heap and counts which CLASS points at
+// objects of class `target` -- exactly through the type table, the way
+// `__gc_trace` does.
+//
+// Returns the number of POINTERS (not objects) that lead from objects of
+// class `holder` to an object of class `target`. With `holder == 0` it sums
+// over all holder classes.
+//
+// Cost: one pass over the heap per call, called from diagnostic output only.
+fn gc_refs_to(holder: u64, target: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_TABLE)
+    if tab == 0 {
+        return 0
+    }
+    var hits: u64 = 0
+    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    while c != 0 {
+        let next: u64 = __gc_ld64(c)
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = __gc_ld64(c + 16)
+        let count: u64 = __gc_ld64(c + 24)
+        var i: u64 = 0
+        while i < count {
+            let b: u64 = data + i * block
+            let tid: u64 = __gc_ld32(b) as u64
+            if tid != 0 && tid <= __gc_ld64(tab) {
+                if holder == 0 || tid == holder {
+                    let obj: u64 = b + HEADER
+                    let entry: u64 = tab + 8 + (tid - 1) * 64
+                    let n: u64 = __gc_ld64(entry + 16)
+                    let offs: u64 = __gc_ld64(entry + 24)
+                    var k: u64 = 0
+                    while k < n {
+                        let z: u64 = __gc_ld64(obj + __gc_ld64(offs + k * 8))
+                        // A strong field does not necessarily carry a
+                        // pointer into the heap: an empty GcVec stands as a
+                        // small number (measured: crash "integer overflow
+                        // a=1 b=16"), and a value outside the heap cannot be
+                        // read (measured: SIGSEGV, rc=139). `__gc_block_of`
+                        // answers both in four instructions and gives 0 when
+                        // it is no heap address -- the same test the
+                        // conservative root scan uses.
+                        if z > HEADER && __gc_block_of(z) == z - HEADER {
+                            // The type id of the TARGET is in its header.
+                            if __gc_ld32(z - HEADER) as u64 == target {
+                                hits = hits + 1
+                            }
+                        }
+                        k = k + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+        c = next
+    }
+    return hits
+}
+
+// ROUND C-045: HOW MANY POINTERS FROM SLOT BUFFERS HIT A CLASS?
+//
+// `gc_refs_to` walks the pointer table of the classes and so finds
+// everything that stands in an ordinary field. A `GcVec`, however, keeps its
+// entries in a SLOT BUFFER (`GcSlots`, flag F_SLOTS), and that has no
+// pointer table -- the collector walks it through `__gc_trace_slots`.
+// Without this second count exactly the part of the tree that carries the
+// children is missing: for `Cv` the children hang in `kids: GcVec[Gc[Cv]]`,
+// i.e. in slots.
+//
+// Returns the number of pointers from slot buffers to an object of class
+// `target`. Only up to `n` (the occupied length) is counted, exactly as the
+// collector marks.
+fn gc_slot_refs_to(target: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    var hits: u64 = 0
+    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    while c != 0 {
+        let next: u64 = __gc_ld64(c)
+        let data: u64 = c + CHUNK_HEADER
+        let block: u64 = __gc_ld64(c + 16)
+        let count: u64 = __gc_ld64(c + 24)
+        var i: u64 = 0
+        while i < count {
+            let b: u64 = data + i * block
+            let tid: u64 = __gc_ld32(b) as u64
+            if tid != 0 && (__gc_ld32(b + 4) & F_SLOTS) != 0 {
+                let obj: u64 = b + HEADER
+                let n: u64 = __gc_ld64(obj)
+                let desc: u64 = __gc_ld64(obj + 8)
+                let mask: u64 = desc >> 8
+                if mask != 0 {
+                    let step: u64 = desc & 255
+                    let base: u64 = obj + SLOT_HEADER
+                    var k: u64 = 0
+                    while k < n {
+                        var j: u64 = 0
+                        while j < step {
+                            if ((mask >> j) & 1) != 0 {
+                                let v: u64 = __gc_ld64(base + (k * step + j) * 8)
+                                if v > HEADER {
+                                    if __gc_block_of(v) == v - HEADER {
+                                        if __gc_ld32(v - HEADER) as u64 == target {
+                                            hits = hits + 1
+                                        }
+                                    }
+                                }
+                            }
+                            j = j + 1
+                        }
+                        k = k + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+        c = next
+    }
+    return hits
+}
+
+// One bucket of the last length distribution (0..7).
+fn gc_len_bucket(i: u64) -> u64 {
+    let t: u64 = __gc_ld64(__gc_state() as u64 + S_KLTAB)
+    if t == 0 || i >= 8 {
+        return 0
+    }
+    return __gc_ld64(t + CLASS_MAX * 16 + i * 8)
+}
+
+// The number of objects of class `tid` from the last count.
+fn gc_class_count(tid: u64) -> u64 {
+    let t: u64 = __gc_ld64(__gc_state() as u64 + S_KLTAB)
+    if t == 0 || tid >= CLASS_MAX {
+        return 0
+    }
+    return __gc_ld64(t + tid * 16)
+}
+
+// The OCCUPIED octets of class `tid` (block size times count, i.e. including
+// the waste of the size class).
+fn gc_class_bytes(tid: u64) -> u64 {
+    let t: u64 = __gc_ld64(__gc_state() as u64 + S_KLTAB)
+    if t == 0 || tid >= CLASS_MAX {
+        return 0
+    }
+    return __gc_ld64(t + tid * 16 + 8)
+}
+
+// How many classes the type table knows.
+fn gc_class_total() -> u64 {
+    let tab: u64 = __gc_ld64(__gc_state() as u64 + S_TABLE)
+    if tab == 0 {
+        return 0
+    }
+    return __gc_ld64(tab)
+}
+
+// The NAME of class `tid` as a pointer to zero terminated text (0 = no
+// name). It stands in the eighth word of the table entry -- see gc.rs,
+// ty_table_asm, round C-043.
+fn gc_class_name(tid: u64) -> u64 {
+    let tab: u64 = __gc_ld64(__gc_state() as u64 + S_TABLE)
+    if tab == 0 || tid == 0 || tid > __gc_ld64(tab) {
+        return 0
+    }
+    return __gc_ld64(tab + 8 + (tid - 1) * 64 + 56)
+}
+
+// The payload size of class `tid` according to the type table (without the
+// block header, without waste) -- so payload size can be set against block
+// size.
+fn gc_class_size(tid: u64) -> u64 {
+    let tab: u64 = __gc_ld64(__gc_state() as u64 + S_TABLE)
+    if tab == 0 || tid == 0 || tid > __gc_ld64(tab) {
+        return 0
+    }
+    return __gc_ld64(tab + 8 + (tid - 1) * 64)
 }
 
 fn gc_live_objects() -> u64 {

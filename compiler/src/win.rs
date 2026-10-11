@@ -140,6 +140,11 @@ const KNOWN: &[(&str, &str, u32)] = &[
     // collector needs them, because there is no /proc to read.
     ("GetCurrentThreadStackLimits", "KERNEL32.dll", 2),
     ("GetCurrentProcess", "KERNEL32.dll", 0),
+    // The process heap, for callers that need small blocks of their own
+    // (the waveOut buffer headers of Certus' sound back end).
+    ("GetProcessHeap", "KERNEL32.dll", 0),
+    ("HeapAlloc", "KERNEL32.dll", 3),
+    ("HeapFree", "KERNEL32.dll", 3),
     ("DuplicateHandle", "KERNEL32.dll", 7),
     ("GetEnvironmentStringsW", "KERNEL32.dll", 0),
     // --- ws2_32: the sockets ------------------------------------------
@@ -241,6 +246,9 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("AdjustWindowRectEx", "USER32.dll", 4),
     ("GetSystemMetrics", "USER32.dll", 1),
     ("GetKeyState", "USER32.dll", 1),
+    // Touch vs mouse (Certus 0.68): the extra info of the last mouse message
+    // says whether a finger made it (signature 0xFF515700).
+    ("GetMessageExtraInfo", "USER32.dll", 0),
     ("SetWindowLongPtrW", "USER32.dll", 3),
     ("GetWindowLongPtrW", "USER32.dll", 2),
     ("SetCapture", "USER32.dll", 1),
@@ -425,6 +433,7 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("waveOutRestart", "WINMM.dll", 1),
     ("waveOutGetNumDevs", "WINMM.dll", 0),
     ("waveOutGetPosition", "WINMM.dll", 3),
+    ("waveOutSetVolume", "WINMM.dll", 2),
     ("RegQueryValueExW", "ADVAPI32.dll", 6),
     ("RegDeleteValueW", "ADVAPI32.dll", 2),
 ];

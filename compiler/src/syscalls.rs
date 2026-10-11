@@ -143,6 +143,7 @@ const TABLE: &[(i64, A64)] = &[
     (20, A64::Direct(66)),           // writev
     (21, A64::AtFdcwd(48)),          // access    -> faccessat (Firn r64)
     (24, A64::Direct(124)),          // sched_yield
+    (25, A64::Direct(216)),          // mremap
     (28, A64::Direct(233)),          // madvise
     // OPENPLAN r23 (lib/window/x11.fi): the System V shared memory of MIT-SHM
     (29, A64::Direct(194)),          // shmget
@@ -327,6 +328,10 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     // when no other thread is runnable.
     (21, "access", Wasm::Missing(NO_FILES)),
     (24, "sched_yield", Wasm::Constant(0)),
+    // WebAssembly linear memory cannot be remapped in place: a caller that
+    // wants to grow a block maps a new one and copies (Certus lib/html/mem.fi
+    // takes that way when the answer is an error).
+    (25, "mremap", Wasm::Missing("WebAssembly memory cannot be remapped (map a new block and copy)")),
     // Advice may be ignored -- the kernel is allowed to do exactly that.
     (28, "madvise", Wasm::Constant(0)),
     (29, "shmget", Wasm::Missing(NO_SHM)),
@@ -418,7 +423,7 @@ mod tests {
     #[test]
     fn the_calls_the_library_makes_are_all_in_the_table() {
         // Exactly the numbers that appear in lib/std/*.fi and tests/*.fi.
-        for n in [0i64, 1, 2, 3, 7, 9, 11, 29, 30, 31, 41, 42, 44, 45, 48, 49, 50, 51, 52, 54, 59, 60, 61, 67, 231, 288]
+        for n in [0i64, 1, 2, 3, 7, 9, 11, 25, 29, 30, 31, 41, 42, 44, 45, 48, 49, 50, 51, 52, 54, 59, 60, 61, 67, 231, 288]
         {
             assert!(aarch64(n).is_some(), "syscall {} missing from the table", n);
         }
