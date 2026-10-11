@@ -1,0 +1,200 @@
+// demos/mcclient/selftest.fi -- offline self test of the chunk decoder and the
+// dump writer (no network).
+//
+// It BUILDS a `map_chunk` body by hand, with a deterministic pseudo random
+// content, in all three shapes of a paletted container the wire knows
+// (single value, indirect palette, direct/global ids), feeds it to
+// mc_chunk.chunk_decode, and prints the canonical dump. tools/mcclient/unit.sh
+// compares that text with the dump a PYTHON script computes from the same
+// generator, so the packing/unpacking, the palette normalisation, the
+// heightmap decoding, the light hash and the FNV/SHA-256 code are all held
+// against a second implementation.
+//
+// The generator is a plain LCG, small enough that nothing overflows:
+//     x = (x * 1103515245 + 12345) mod 2^31, value = x >> 8
+
+import std.bytes
+import std.rt
+import std.nbt
+import std.io
+import mc.mc_chunk
+import mc.mc_world
+import dump
+
+struct Gen {
+    x: u64,
+}
+
+fn gen_next(g: *mut Gen) -> u64 {
+    (*g).x = ((*g).x * 1103515245 as u64 + 12345 as u64) % 2147483648 as u64
+    return (*g).x >> 8
+}
+
+// ---- wire writers (vanilla layout: entries never span two longs) -------------
+
+fn put_longs(b: *mut bytes.Bytes, ids: u64, n: usize, bits: u32) {
+    let epl: usize = 64 / (bits as usize)
+    let words: usize = (n + epl - 1) / epl
+    bytes.put_varint(b, words as i32)
+    var w: usize = 0
+    while w < words {
+        var word: u64 = 0
+        var e: usize = 0
+        while e < epl && w * epl + e < n {
+            let v: u64 = rt.ld16(ids, w * epl + e) as u64
+            word = word | (v << ((e as u32) * bits))
+            e = e + 1
+        }
+        bytes.put_u64(b, word)
+        w = w + 1
+    }
+}
+
+// single value
+fn put_single(b: *mut bytes.Bytes, v: i32) {
+    bytes.put_u8(b, 0 as u8)
+    bytes.put_varint(b, v)
+    bytes.put_varint(b, 0)
+}
+
+// indirect: palette[j] = base + step*j, entries drawn as r % pn
+fn put_indirect(b: *mut bytes.Bytes, g: *mut Gen, n: usize, bits: u32, pn: usize,
+    base: i32, step: i32, ids: u64) {
+    bytes.put_u8(b, bits as u8)
+    bytes.put_varint(b, pn as i32)
+    var j: usize = 0
+    while j < pn {
+        bytes.put_varint(b, base + step * (j as i32))
+        j = j + 1
+    }
+    var i: usize = 0
+    while i < n {
+        rt.st16(ids, i, (gen_next(g) % (pn as u64)) as u16)
+        i = i + 1
+    }
+    put_longs(b, ids, n, bits)
+}
+
+// direct: global ids r % modulo
+fn put_direct(b: *mut bytes.Bytes, g: *mut Gen, n: usize, bits: u32, modulo: u64, ids: u64) {
+    bytes.put_u8(b, bits as u8)
+    var i: usize = 0
+    while i < n {
+        rt.st16(ids, i, (gen_next(g) % modulo) as u16)
+        i = i + 1
+    }
+    put_longs(b, ids, n, bits)
+}
+
+fn main(start: u64) -> i32 {
+    var g: Gen = Gen { x: 12345 as u64 }
+    let ids: u64 = rt.heap_alloc(4096 * 2)
+    var body: bytes.Bytes = bytes.bytes_new()
+    bytes.put_i32(&body, 0 - 3) // x
+    bytes.put_i32(&body, 7) // z
+
+    // heightmaps: MOTION_BLOCKING, WORLD_SURFACE (declared in this order; the
+    // dump sorts by name), 256 values of 9 bit, 7 per long
+    nbt.nbt_root_begin(&body, 0, 0)
+    var names: [u8; 32] = "WORLD_SURFACE\0MOTION_BLOCKING\0\0\0"
+    var k: usize = 0
+    while k < 2 {
+        var off: u64 = 0
+        var nl: usize = 13
+        if k == 1 {
+            off = 14
+            nl = 15
+        }
+        var longs: [u64; 37] = [0; 37]
+        var i: usize = 0
+        while i < 256 {
+            let v: u64 = gen_next(&g) % 385 as u64
+            longs[i / 7] = longs[i / 7] | (v << (((i % 7) as u32) * 9 as u32))
+            i = i + 1
+        }
+        nbt.nbt_long_array(&body, ((&names[0]) as u64) + off, nl, (&longs[0]) as u64, 37)
+        k = k + 1
+    }
+    nbt.nbt_end(&body)
+
+    // chunkData: 4 sections
+    var cd: bytes.Bytes = bytes.bytes_new()
+    // section 0: air, single biome
+    bytes.put_i16(&cd, 0 as i16)
+    put_single(&cd, 0)
+    put_single(&cd, 1)
+    // section 1: indirect 4 bit blocks (16 entries), indirect 2 bit biomes
+    bytes.put_i16(&cd, 4000 as i16)
+    put_indirect(&cd, &g, 4096, 4 as u32, 16, 100, 7, ids)
+    put_indirect(&cd, &g, 64, 2 as u32, 4, 1, 4, ids)
+    // section 2: indirect 8 bit blocks (200 entries), direct 6 bit biomes
+    bytes.put_i16(&cd, 4096 as i16)
+    put_indirect(&cd, &g, 4096, 8 as u32, 200, 1000, 13, ids)
+    put_direct(&cd, &g, 64, 6 as u32, 50 as u64, ids)
+    // section 3: direct 15 bit blocks, indirect 1 bit biomes
+    bytes.put_i16(&cd, 4095 as i16)
+    put_direct(&cd, &g, 4096, 15 as u32, 20000 as u64, ids)
+    put_indirect(&cd, &g, 64, 1 as u32, 2, 3, 1, ids)
+    bytes.put_varint(&body, bytes.bytes_len(&cd) as i32)
+    bytes.put_bytes(&body, &cd)
+    bytes.bytes_free(&cd)
+
+    // block entities: 2 (one without NBT, one with an empty compound)
+    bytes.put_varint(&body, 2)
+    bytes.put_u8(&body, 0x12 as u8)
+    bytes.put_i16(&body, 64 as i16)
+    bytes.put_varint(&body, 5)
+    bytes.put_u8(&body, 0 as u8)
+    bytes.put_u8(&body, 0x34 as u8)
+    bytes.put_i16(&body, 0 - 10 as i16)
+    bytes.put_varint(&body, 9)
+    nbt.nbt_root_begin(&body, 0, 0)
+    nbt.nbt_end(&body)
+
+    // light: four masks, then 2 sky arrays and 1 block array of 2048 octets
+    bytes.put_varint(&body, 1)
+    bytes.put_i64(&body, 3)
+    bytes.put_varint(&body, 1)
+    bytes.put_i64(&body, 1)
+    bytes.put_varint(&body, 0)
+    bytes.put_varint(&body, 0)
+    bytes.put_varint(&body, 2)
+    var a: usize = 0
+    while a < 2 {
+        bytes.put_varint(&body, 2048)
+        var i: usize = 0
+        while i < 2048 {
+            bytes.put_u8(&body, (gen_next(&g) % 256 as u64) as u8)
+            i = i + 1
+        }
+        a = a + 1
+    }
+    bytes.put_varint(&body, 1)
+    bytes.put_varint(&body, 2048)
+    var i: usize = 0
+    while i < 2048 {
+        bytes.put_u8(&body, (gen_next(&g) % 256 as u64) as u8)
+        i = i + 1
+    }
+
+    // ---- decode and dump
+    var sc: mc_chunk.Scratch = mc_chunk.scratch_new()
+    var w: mc_world.World = mc_world.world_new()
+    let p: u64 = mc_chunk.chunk_alloc()
+    let ok: bool = mc_chunk.chunk_decode(&body, &sc, p as *mut mc_chunk.Chunk) catch false
+    if !ok {
+        io.eprint_line("selftest: chunk_decode failed")
+        return 1
+    }
+    mc_world.world_put(&w, p)
+    var out: rt.Buf = rt.buf_new()
+    var digest: [u8; 32] = [0; 32]
+    dump.dump_build(&w, 763, &out, (&digest[0]) as u64)
+    io.print_bytes(rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+    mc_world.world_free(&w)
+    mc_chunk.scratch_free(&sc)
+    bytes.bytes_free(&body)
+    rt.heap_free(ids, 4096 * 2)
+    return 0
+}

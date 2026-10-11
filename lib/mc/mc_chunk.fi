@@ -1,0 +1,582 @@
+// lib/mc/mc_chunk.fi -- chunk columns as PALETTE SECTIONS (M0, GDD 6).
+//
+// The server sends a chunk column as a `map_chunk` packet. This file turns it
+// into the engine's own world representation:
+//
+//   Chunk   = x, z, a list of Sections, heightmaps, counters
+//   Section = 16x16x16 blocks + 4x4x4 biomes, each stored as a Container
+//   Container = PALETTE (distinct global ids, u16) + DENSE index array
+//
+// The wire format has three shapes of a "paletted container": a single value
+// (bits per entry 0), an indirect palette (few distinct values, small
+// indexes) and a direct one (global ids, 15 bits for blocks). Those shapes are
+// a property of the PROTOCOL VERSION, not of the engine, so the decoder
+// normalises all three into ONE internal form:
+//
+//   * 1 distinct value  -> only the palette, no index array at all ("air
+//     costs nothing", GDD 6.1)
+//   * n distinct values -> palette of n global ids + indexes packed densely at
+//     ceil(log2(n)) bits each, entries are allowed to span two 64 bit words
+//     (the wire format does not allow that; the engine format does, because
+//     padding costs memory and the section is read-only after decoding)
+//
+// A direct (global) container therefore shrinks to its real palette; an
+// indirect one is re-packed with exactly the bits it needs. What the wire sent
+// and what the engine keeps are different on purpose; the dump (dump.fi)
+// resolves back to global ids, so it can be compared with a decoder that
+// knows nothing about this representation.
+//
+// The numbers that belong to the protocol version (the largest indirect bit
+// count of blocks and of biomes) are constants at the top, in one place, so
+// that GDD 8.6 ("version = data") can move them into the version
+// description later.
+
+import std.bytes
+import std.rt
+import std.nbt
+
+export {
+    Container, Section, Chunk, Scratch,
+    scratch_new, scratch_free,
+    chunk_decode, chunk_free, chunk_section, chunk_alloc, chunk_release,
+    container_get, container_bits, container_palette_size,
+    BLOCKS_PER_SECTION, BIOMES_PER_SECTION, HM_ENTRIES, HM_MAX, HM_NAME_MAX,
+}
+
+// ---- version dependent constants (1.20.1) -----------------------------------
+const BLOCK_MAX_INDIRECT_BITS: u32 = 8 // above this the blocks are sent as global ids
+const BIOME_MAX_INDIRECT_BITS: u32 = 3
+const GLOBAL_BITS_MAX: u32 = 15 // global ids must fit this many bits
+const HM_BITS: u32 = 9 // bits of one heightmap entry (world height 384 -> 9)
+
+// ---- sizes -------------------------------------------------------------------
+const BLOCKS_PER_SECTION: usize = 4096
+const BIOMES_PER_SECTION: usize = 64
+const MAX_SECTIONS: usize = 64 // a column is never taller than 1024 blocks
+const HM_ENTRIES: usize = 256
+const HM_MAX: usize = 4
+const HM_NAME_MAX: usize = 32
+const NONE16: u16 = 65535
+
+struct Container {
+    bits: u32, // bits per index in `data`; 0 = single value, no index array
+    pal_n: u32, // number of palette entries
+    pal: u64, // u16 array [pal_n] of global ids
+    data: u64, // dense u64 words, or 0
+    words: usize, // number of words in `data`
+}
+
+struct Section {
+    count: i32, // the blockCount short as sent
+    blocks: Container, // 4096 entries, index (y*16 + z)*16 + x
+    biomes: Container, // 64 entries, index (y*4 + z)*4 + x
+}
+
+struct Chunk {
+    x: i32,
+    z: i32,
+    nsec: usize,
+    secs: u64, // array of Section
+    nbe: i32, // number of block entities in the packet
+    nhm: usize,
+    hm_name: [u8; 128], // HM_MAX names of up to HM_NAME_MAX octets
+    hm_nlen: [usize; 4],
+    hm_val: u64, // HM_MAX * HM_ENTRIES u16 values, or 0
+    sky_n: i32, // light arrays in the packet
+    block_n: i32,
+    light_hash: u64, // FNV-1a over all light arrays as sent
+}
+
+// Reusable scratch memory for the decoder (one per decoding thread).
+struct Scratch {
+    ids: u64, // u16 [4096]  resolved global ids of one container
+    map: u64, // u16 [32768] global id -> palette index, NONE16 = not present
+    pal: u64, // u16 [4096]  wire palette
+    idx: u64, // u16 [4096]  new palette indexes
+}
+
+fn scratch_new() -> Scratch {
+    var s: Scratch = Scratch { ids: 0, map: 0, pal: 0, idx: 0 }
+    s.ids = rt.heap_alloc(BLOCKS_PER_SECTION * 2)
+    s.map = rt.heap_alloc(32768 * 2)
+    s.pal = rt.heap_alloc(BLOCKS_PER_SECTION * 2)
+    s.idx = rt.heap_alloc(BLOCKS_PER_SECTION * 2)
+    var i: usize = 0
+    if s.map != 0 {
+        while i < 32768 {
+            rt.st16(s.map, i, NONE16)
+            i = i + 1
+        }
+    }
+    return s
+}
+
+fn scratch_free(s: *mut Scratch) {
+    rt.heap_free((*s).ids, BLOCKS_PER_SECTION * 2)
+    rt.heap_free((*s).map, 32768 * 2)
+    rt.heap_free((*s).pal, BLOCKS_PER_SECTION * 2)
+    rt.heap_free((*s).idx, BLOCKS_PER_SECTION * 2)
+    (*s).ids = 0
+    (*s).map = 0
+    (*s).pal = 0
+    (*s).idx = 0
+}
+
+// ------------------------------------------------------------------ Containers
+
+fn container_empty() -> Container {
+    return Container { bits: 0 as u32, pal_n: 0 as u32, pal: 0, data: 0, words: 0 }
+}
+
+fn container_free(c: *mut Container) {
+    if (*c).pal != 0 {
+        rt.heap_free((*c).pal, ((*c).pal_n as usize) * 2)
+    }
+    if (*c).data != 0 {
+        rt.heap_free((*c).data, (*c).words * 8)
+    }
+    (*c).pal = 0
+    (*c).data = 0
+    (*c).pal_n = 0 as u32
+    (*c).words = 0
+    (*c).bits = 0 as u32
+}
+
+fn container_bits(c: *mut Container) -> u32 { return (*c).bits }
+fn container_palette_size(c: *mut Container) -> u32 { return (*c).pal_n }
+
+// The global id at index `i`.
+fn container_get(c: *mut Container, i: usize) -> u16 {
+    if (*c).bits == 0 as u32 {
+        return rt.ld16((*c).pal, 0)
+    }
+    let b: usize = (*c).bits as usize
+    let bit: usize = i * b
+    let w: usize = bit / 64
+    let off: u32 = (bit % 64) as u32
+    var v: u64 = rt.ld64((*c).data, w) >> off
+    if off as usize + b > 64 {
+        v = v | (rt.ld64((*c).data, w + 1) << (64 as u32 - off))
+    }
+    let mask: u64 = (1 as u64 << (b as u32)) - 1 as u64
+    return rt.ld16((*c).pal, (v & mask) as usize)
+}
+
+// smallest b >= 1 with 2^b >= n
+fn bits_for(n: u32) -> u32 {
+    var b: u32 = 1 as u32
+    while (1 as u32 << b) < n {
+        b = b + 1 as u32
+    }
+    return b
+}
+
+// Builds the normalised container out of the `n` resolved ids in `sc.ids`.
+fn container_build(sc: *mut Scratch, n: usize, out: *mut Container) -> BytesError!bool {
+    var pn: u32 = 0 as u32
+    var i: usize = 0
+    while i < n {
+        let id: u16 = rt.ld16((*sc).ids, i)
+        var k: u16 = rt.ld16((*sc).map, id as usize)
+        if k == NONE16 {
+            k = pn as u16
+            rt.st16((*sc).map, id as usize, k)
+            rt.st16((*sc).pal, pn as usize, id)
+            pn = pn + 1 as u32
+        }
+        rt.st16((*sc).idx, i, k)
+        i = i + 1
+    }
+    // leave the map clean for the next container
+    var j: u32 = 0 as u32
+    while j < pn {
+        rt.st16((*sc).map, rt.ld16((*sc).pal, j as usize) as usize, NONE16)
+        j = j + 1 as u32
+    }
+    let pal: u64 = rt.heap_alloc((pn as usize) * 2)
+    if pal == 0 {
+        return BytesError::OutOfMemory
+    }
+    rt.mem_copy(pal, (*sc).pal, (pn as usize) * 2)
+    (*out).pal = pal
+    (*out).pal_n = pn
+    if pn == 1 as u32 {
+        (*out).bits = 0 as u32
+        (*out).data = 0
+        (*out).words = 0
+        return true
+    }
+    let b: u32 = bits_for(pn)
+    let words: usize = (n * (b as usize) + 63) / 64
+    let data: u64 = rt.heap_alloc(words * 8)
+    if data == 0 {
+        rt.heap_free(pal, (pn as usize) * 2)
+        (*out).pal = 0
+        (*out).pal_n = 0 as u32
+        return BytesError::OutOfMemory
+    }
+    var w: usize = 0
+    while w < words {
+        rt.st64(data, w, 0 as u64)
+        w = w + 1
+    }
+    i = 0
+    while i < n {
+        let v: u64 = rt.ld16((*sc).idx, i) as u64
+        let bit: usize = i * (b as usize)
+        let wi: usize = bit / 64
+        let off: u32 = (bit % 64) as u32
+        rt.st64(data, wi, rt.ld64(data, wi) | (v << off))
+        if off as usize + (b as usize) > 64 {
+            rt.st64(data, wi + 1, rt.ld64(data, wi + 1) | (v >> (64 as u32 - off)))
+        }
+        i = i + 1
+    }
+    (*out).bits = b
+    (*out).data = data
+    (*out).words = words
+    return true
+}
+
+// One paletted container of `n` entries off the wire.
+fn container_decode(b: *mut bytes.Bytes, n: usize, max_indirect: u32,
+    sc: *mut Scratch, out: *mut Container) -> BytesError!bool {
+    *out = container_empty()
+    let bpe: u32 = (try bytes.get_u8(b)) as u32
+    if bpe > GLOBAL_BITS_MAX {
+        return BytesError::Range
+    }
+    if bpe == 0 as u32 {
+        let v: i32 = try bytes.get_varint(b)
+        if v < 0 || v > 32767 {
+            return BytesError::Range
+        }
+        let dl: i32 = try bytes.get_varint(b)
+        if dl < 0 {
+            return BytesError::Range
+        }
+        try bytes.bytes_skip(b, (dl as usize) * 8)
+        var i: usize = 0
+        while i < n {
+            rt.st16((*sc).ids, i, v as u16)
+            i = i + 1
+        }
+        return try container_build(sc, n, out)
+    }
+    var pn: usize = 0
+    let indirect: bool = bpe <= max_indirect
+    if indirect {
+        let pl: i32 = try bytes.get_varint(b)
+        if pl < 1 || pl > 4096 {
+            return BytesError::Range
+        }
+        pn = pl as usize
+        var k: usize = 0
+        while k < pn {
+            let e: i32 = try bytes.get_varint(b)
+            if e < 0 || e > 32767 {
+                return BytesError::Range
+            }
+            rt.st16((*sc).pal, k, e as u16)
+            k = k + 1
+        }
+    }
+    let dl: i32 = try bytes.get_varint(b)
+    if dl < 0 {
+        return BytesError::Range
+    }
+    let epl: usize = 64 / (bpe as usize)
+    let need: usize = (n + epl - 1) / epl
+    if dl as usize != need {
+        return BytesError::Range
+    }
+    if bytes.bytes_remaining(b) < need * 8 {
+        return BytesError::Underflow
+    }
+    let mask: u64 = (1 as u64 << bpe) - 1 as u64
+    var i: usize = 0
+    var wi: usize = 0
+    while wi < need {
+        let word: u64 = try bytes.get_u64(b)
+        var e: usize = 0
+        while e < epl && i < n {
+            let v: usize = ((word >> ((e as u32) * bpe)) & mask) as usize
+            if indirect {
+                if v >= pn {
+                    return BytesError::Range
+                }
+                rt.st16((*sc).ids, i, rt.ld16((*sc).pal, v))
+            } else {
+                rt.st16((*sc).ids, i, v as u16)
+            }
+            i = i + 1
+            e = e + 1
+        }
+        wi = wi + 1
+    }
+    return try container_build(sc, n, out)
+}
+
+// --------------------------------------------------------------------- Chunks
+
+// size_of[Section]() is "unknown type" inside a non-root module (BLOCKER.md,
+// 2026-10-11); the stride is measured from a two element array instead.
+fn section_size() -> usize {
+    var a: [Section; 2] = [Section { count: 0, blocks: container_empty(),
+        biomes: container_empty() }; 2]
+    return ((&a[1]) as u64 - (&a[0]) as u64) as usize
+}
+
+fn chunk_section(c: *mut Chunk, i: usize) -> *mut Section {
+    return ((*c).secs + (i * section_size()) as u64) as *mut Section
+}
+
+fn chunk_free(c: *mut Chunk) {
+    var i: usize = 0
+    while i < (*c).nsec {
+        let s: *mut Section = chunk_section(c, i)
+        container_free(&(*s).blocks)
+        container_free(&(*s).biomes)
+        i = i + 1
+    }
+    if (*c).secs != 0 {
+        rt.heap_free((*c).secs, (*c).nsec * section_size())
+    }
+    if (*c).hm_val != 0 {
+        rt.heap_free((*c).hm_val, HM_MAX * HM_ENTRIES * 2)
+    }
+    (*c).secs = 0
+    (*c).hm_val = 0
+    (*c).nsec = 0
+    (*c).nhm = 0
+}
+
+// A heap allocated Chunk (the world keeps pointers to them). Same
+// non-root-module size_of workaround as section_size().
+fn chunk_size() -> usize {
+    var a: [Chunk; 2] = [Chunk { x: 0, z: 0, nsec: 0, secs: 0, nbe: 0, nhm: 0,
+        hm_name: [0; 128], hm_nlen: [0; 4], hm_val: 0, sky_n: 0, block_n: 0,
+        light_hash: 0 as u64 }; 2]
+    return ((&a[1]) as u64 - (&a[0]) as u64) as usize
+}
+
+fn chunk_alloc() -> u64 {
+    let p: u64 = rt.heap_alloc(chunk_size())
+    if p == 0 {
+        return 0
+    }
+    let c: *mut Chunk = p as *mut Chunk
+    (*c).x = 0
+    (*c).z = 0
+    (*c).nsec = 0
+    (*c).secs = 0
+    (*c).nbe = 0
+    (*c).nhm = 0
+    (*c).hm_val = 0
+    (*c).sky_n = 0
+    (*c).block_n = 0
+    (*c).light_hash = 0 as u64
+    var i: usize = 0
+    while i < 4 {
+        (*c).hm_nlen[i] = 0
+        i = i + 1
+    }
+    return p
+}
+
+fn chunk_release(p: u64) {
+    chunk_free(p as *mut Chunk)
+    rt.heap_free(p, chunk_size())
+}
+
+fn fnv_step(h: u64, by: u8) -> u64 {
+    return (h ^ (by as u64)) *% 1099511628211 as u64
+}
+
+// Heightmaps: one NBT compound whose entries are long arrays of 9 bit values,
+// 7 per long (no value spans two longs).
+fn read_heightmaps(b: *mut bytes.Bytes, c: *mut Chunk) -> BytesError!bool {
+    var rn: usize = 0
+    let rp: u64 = nbt.nbt_read_root(b, &rn) catch 0
+    if rp == 0 && bytes.bytes_remaining(b) == 0 {
+        return BytesError::Underflow
+    }
+    (*c).hm_val = rt.heap_alloc(HM_MAX * HM_ENTRIES * 2)
+    if (*c).hm_val == 0 {
+        return BytesError::OutOfMemory
+    }
+    while true {
+        let t: u8 = nbt.nbt_read_type(b) catch 255 as u8
+        if t == 255 as u8 {
+            return BytesError::Range
+        }
+        if t == nbt.TAG_END {
+            return true
+        }
+        var nl: usize = 0
+        let np: u64 = nbt.nbt_read_name(b, &nl) catch 0
+        if np == 0 && nl == 0 {
+            // an empty name is legal, but a failed read leaves no span either;
+            // the following read will notice a damaged buffer
+        }
+        if t == nbt.TAG_LONG_ARRAY && (*c).nhm < HM_MAX && nl <= HM_NAME_MAX {
+            let cnt: i32 = nbt.nbt_read_array_len(b, 8) catch 0 - 1
+            if cnt < 0 {
+                return BytesError::Range
+            }
+            let per: usize = 64 / (HM_BITS as usize)
+            if (cnt as usize) != (HM_ENTRIES + per - 1) / per {
+                return BytesError::Range
+            }
+            let slot: usize = (*c).nhm
+            var q: usize = 0
+            while q < nl {
+                (*c).hm_name[slot * HM_NAME_MAX + q] = rt.ld8(np, q)
+                q = q + 1
+            }
+            (*c).hm_nlen[slot] = nl
+            let mask: u64 = (1 as u64 << HM_BITS) - 1 as u64
+            var i: usize = 0
+            var li: usize = 0
+            while li < (cnt as usize) {
+                let word: u64 = try bytes.get_u64(b)
+                var e: usize = 0
+                while e < per && i < HM_ENTRIES {
+                    let v: u64 = (word >> ((e as u32) * HM_BITS)) & mask
+                    rt.st16((*c).hm_val, slot * HM_ENTRIES + i, v as u16)
+                    i = i + 1
+                    e = e + 1
+                }
+                li = li + 1
+            }
+            (*c).nhm = slot + 1
+        } else {
+            nbt.nbt_skip_payload(b, t) catch false
+        }
+    }
+    return true
+}
+
+// The `chunkData` buffer: sections until the buffer is used up.
+fn read_sections(data: *mut bytes.Bytes, c: *mut Chunk, sc: *mut Scratch) -> BytesError!bool {
+    // The number of sections is not announced; it is "until the end".
+    let cap: usize = MAX_SECTIONS
+    let base: u64 = rt.heap_alloc(cap * section_size())
+    if base == 0 {
+        return BytesError::OutOfMemory
+    }
+    (*c).secs = base
+    var n: usize = 0
+    while bytes.bytes_remaining(data) > 0 {
+        if n >= cap {
+            (*c).nsec = n
+            return BytesError::Range
+        }
+        let s: *mut Section = ((*c).secs + (n * section_size()) as u64) as *mut Section
+        (*s).blocks = container_empty()
+        (*s).biomes = container_empty()
+        (*c).nsec = n + 1
+        (*s).count = (try bytes.get_i16(data)) as i32
+        try container_decode(data, BLOCKS_PER_SECTION, BLOCK_MAX_INDIRECT_BITS, sc, &(*s).blocks)
+        try container_decode(data, BIOMES_PER_SECTION, BIOME_MAX_INDIRECT_BITS, sc, &(*s).biomes)
+        n = n + 1
+    }
+    return true
+}
+
+// Skips one block entity: packed x/z (u8), y (i16), type (varint), optional NBT.
+fn skip_block_entity(b: *mut bytes.Bytes) -> BytesError!bool {
+    try bytes.get_u8(b)
+    try bytes.get_i16(b)
+    try bytes.get_varint(b)
+    let t: u8 = try bytes.get_u8(b)
+    if t == 0 as u8 {
+        return true // no NBT
+    }
+    // the type octet has been read; a named root follows: u16 name length
+    let nl: u16 = try bytes.get_u16(b)
+    try bytes.bytes_skip(b, nl as usize)
+    nbt.nbt_skip_payload(b, t) catch false
+    return true
+}
+
+// Counted arrays of i64 (the light masks): returns the count, skips the data.
+fn skip_long_array(b: *mut bytes.Bytes) -> BytesError!i32 {
+    let n: i32 = try bytes.get_varint(b)
+    if n < 0 || n > 4096 {
+        return BytesError::Range
+    }
+    try bytes.bytes_skip(b, (n as usize) * 8)
+    return n
+}
+
+// Counted array of light arrays; hashes their octets into `h`.
+fn read_light(b: *mut bytes.Bytes, h: *mut u64) -> BytesError!i32 {
+    let n: i32 = try bytes.get_varint(b)
+    if n < 0 || n > 4096 {
+        return BytesError::Range
+    }
+    var i: i32 = 0
+    while i < n {
+        let l: i32 = try bytes.get_varint(b)
+        if l < 0 || l as usize > bytes.bytes_remaining(b) {
+            return BytesError::Range
+        }
+        let p: u64 = try bytes.get_span(b, l as usize)
+        var k: usize = 0
+        while k < (l as usize) {
+            *h = fnv_step(*h, rt.ld8(p, k))
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Decodes a whole `map_chunk` body (cursor behind the packet id) into `c`.
+// On error `c` may be half built: call chunk_free on it either way.
+fn chunk_decode(b: *mut bytes.Bytes, sc: *mut Scratch, c: *mut Chunk) -> BytesError!bool {
+    (*c).x = try bytes.get_i32(b)
+    (*c).z = try bytes.get_i32(b)
+    (*c).nsec = 0
+    (*c).secs = 0
+    (*c).nhm = 0
+    (*c).hm_val = 0
+    (*c).nbe = 0
+    (*c).sky_n = 0
+    (*c).block_n = 0
+    (*c).light_hash = 14695981039346656037 as u64
+    try read_heightmaps(b, c)
+    // chunkData: varint length + octets, decoded in place as a sub view
+    let dl: i32 = try bytes.get_varint(b)
+    if dl < 0 || dl as usize > bytes.bytes_remaining(b) {
+        return BytesError::Range
+    }
+    let dp: u64 = try bytes.get_span(b, dl as usize)
+    var data: bytes.Bytes = bytes.Bytes { data: dp, cap: dl as usize, len: dl as usize, pos: 0, bad: false }
+    try read_sections(&data, c, sc)
+    // block entities
+    let nbe: i32 = try bytes.get_varint(b)
+    if nbe < 0 || nbe > 65536 {
+        return BytesError::Range
+    }
+    var i: i32 = 0
+    while i < nbe {
+        try skip_block_entity(b)
+        i = i + 1
+    }
+    (*c).nbe = nbe
+    // four masks (counts only), then the sky and block light arrays
+    try skip_long_array(b)
+    try skip_long_array(b)
+    try skip_long_array(b)
+    try skip_long_array(b)
+    var h: u64 = (*c).light_hash
+    (*c).sky_n = try read_light(b, &h)
+    (*c).block_n = try read_light(b, &h)
+    (*c).light_hash = h
+    if bytes.bytes_remaining(b) != 0 {
+        return BytesError::Range // the packet must be consumed exactly
+    }
+    return true
+}

@@ -971,6 +971,19 @@ else
     grep -E 'FAIL|RESULT' "$WORK/mcserver.log" | head -10 | sed 's/^/   /' || true
 fi
 
+echo "== 38b. Minecraft libraries (tools/mc/run.sh, docs/MC-LIBS.md) =="
+# Every lib/mc/mc_*.fi has tests in tests/*_mc_*.fi (three build stages) and a
+# cross-check against an independent python / node reference in tools/mc/<lib>/.
+# No network, no Java here: the end-to-end run against a real 1.20.1 server is
+# tools/mcclient/run.sh and is started by hand (it needs the official server JAR).
+if bash tools/mc/run.sh > "$WORK/mc.log" 2>&1; then
+    ok
+    grep -E '^(RESULT|mc tests)' "$WORK/mc.log" | sed 's/^/ /'
+else
+    bad "tools/mc/run.sh failed (see .test-work/mc.log)"
+    grep -E 'FAIL|RESULT' "$WORK/mc.log" | head -10 | sed 's/^/   /' || true
+fi
+
 echo "== 39. foreign functions in both directions (tools/extfn/run.sh, ROUND 75) =="
 # Round 75 built `extern fn` and a proof script for it, and then did not
 # hang the proof into this suite -- so a later round could have broken the

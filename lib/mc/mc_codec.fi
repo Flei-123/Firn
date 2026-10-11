@@ -1,0 +1,320 @@
+// lib/mc/mc_codec.fi -- the wire layer of the Minecraft client (M0).
+//
+// Framing, compression and (later) encryption of one TCP connection. It
+// knows nothing about packet numbers or fields: those are data and come from
+// the generated tables (versions/v763/protocol.fi) -- see DESIGN.md.
+//
+// FRAMING. Without compression a packet is
+//
+//     [VarInt length] [VarInt id] [body]
+//
+// With compression (after the server's Set Compression, threshold >= 0)
+//
+//     [VarInt length] [VarInt dataLength] [payload]
+//
+// where `dataLength` 0 means "payload is id+body, NOT compressed" and
+// anything else is the size of the payload after zlib inflation. The length
+// counts everything behind itself. The sender compresses only when the
+// uncompressed packet is at least `threshold` octets long.
+//
+// THE READER IS BUFFERED. The demo server of round 76 read the length VarInt
+// one octet per system call. A client that receives 20 MiB of chunks cannot
+// afford that, so this reader owns one linear buffer, refills it with large
+// `recv` calls and parses packets out of it. A packet is only consumed once it
+// is COMPLETE in the buffer: a receive timeout in the middle of a packet leaves
+// the partial bytes where they are and the next call continues from there, so
+// a timeout is not an error, it is "nothing yet".
+//
+// ZERO COPY. For an uncompressed packet the returned `Bytes` is a VIEW into
+// the receive buffer; for a compressed one a view into the inflate buffer.
+// The view stays valid until the next `wire_read_packet`. Never `bytes_free`
+// such a view.
+
+import std.net
+import std.bytes
+import std.rt
+import std.deflate
+
+export {
+    WireError, Wire,
+    wire_open, wire_close, wire_set_threshold, wire_read_packet,
+    wire_send_packet, wire_timeout, wire_stat_in, wire_stat_inflated,
+    wire_stat_packets, wire_stat_compressed,
+    MAX_PACKET, MAX_INFLATED,
+}
+
+// The vanilla server refuses anything above 2 MiB compressed and the
+// inflated size field is capped at 8 MiB. Without a limit a peer announces a
+// length of two billion and the client reserves it.
+const MAX_PACKET: usize = 2097152
+const MAX_INFLATED: usize = 8388608
+const RBUF_START: usize = 262144
+
+// EAGAIN as stored in Conn.err (negated errno)
+const ERR_AGAIN: i32 = 0 - 11
+
+error WireError {
+    Closed, // the peer closed the connection
+    Broken, // the socket failed
+    Timeout, // nothing complete arrived within the receive timeout
+    TooBig, // a length above the limits
+    Malformed, // a length <= 0, a VarInt that never ends, a bad id
+    Inflate, // the zlib stream is bad or has the wrong size
+}
+
+struct Wire {
+    conn: net.Conn,
+    rbuf: u64, // linear receive buffer
+    rcap: usize,
+    rstart: usize, // first unconsumed octet
+    rend: usize, // one behind the last received octet
+    threshold: i32, // -1 = compression off
+    zin: rt.Buf, // inflate output
+    zout: rt.Buf, // deflate output (sending)
+    frame: bytes.Bytes, // send scratch
+    n_in: u64, // octets received from the socket
+    n_inflated: u64, // octets after inflation (payload sizes)
+    n_packets: u64,
+    n_compressed: u64, // packets that arrived compressed
+}
+
+fn wire_open(c: net.Conn) -> Wire {
+    return Wire { conn: c, rbuf: 0, rcap: 0, rstart: 0, rend: 0,
+        threshold: 0 - 1, zin: rt.buf_new(), zout: rt.buf_new(),
+        frame: bytes.bytes_new(), n_in: 0, n_inflated: 0, n_packets: 0,
+        n_compressed: 0 }
+}
+
+fn wire_close(w: *mut Wire) {
+    net.close(&(*w).conn)
+    if (*w).rbuf != 0 {
+        rt.heap_free((*w).rbuf, (*w).rcap)
+    }
+    (*w).rbuf = 0
+    (*w).rcap = 0
+    rt.buf_free(&(*w).zin)
+    rt.buf_free(&(*w).zout)
+    bytes.bytes_free(&(*w).frame)
+}
+
+fn wire_set_threshold(w: *mut Wire, t: i32) {
+    (*w).threshold = t
+}
+
+fn wire_timeout(w: *mut Wire, ms: u64) -> bool {
+    return net.set_timeout(&(*w).conn, ms) catch false
+}
+
+fn wire_stat_in(w: *mut Wire) -> u64 { return (*w).n_in }
+fn wire_stat_inflated(w: *mut Wire) -> u64 { return (*w).n_inflated }
+fn wire_stat_packets(w: *mut Wire) -> u64 { return (*w).n_packets }
+fn wire_stat_compressed(w: *mut Wire) -> u64 { return (*w).n_compressed }
+
+// ------------------------------------------------------------ the receive buffer
+
+// Makes room for `need` more octets behind `rend`: first by moving the
+// unconsumed part to the front, then (if the packet is simply larger than the
+// buffer) by growing. Returns false if memory is out.
+fn make_room(w: *mut Wire, need: usize) -> bool {
+    if (*w).rstart > 0 {
+        let live: usize = (*w).rend - (*w).rstart
+        if live > 0 {
+            rt.mem_copy((*w).rbuf, (*w).rbuf + (*w).rstart as u64, live)
+        }
+        (*w).rstart = 0
+        (*w).rend = live
+    }
+    if (*w).rcap - (*w).rend >= need {
+        return true
+    }
+    var cap: usize = (*w).rcap
+    if cap == 0 {
+        cap = RBUF_START
+    }
+    while cap - (*w).rend < need {
+        cap = cap * 2
+    }
+    let nb: u64 = rt.heap_alloc(cap)
+    if nb == 0 {
+        return false
+    }
+    if (*w).rend > 0 {
+        rt.mem_copy(nb, (*w).rbuf, (*w).rend)
+    }
+    if (*w).rbuf != 0 {
+        rt.heap_free((*w).rbuf, (*w).rcap)
+    }
+    (*w).rbuf = nb
+    (*w).rcap = cap
+    return true
+}
+
+// Blocks until at least `n` unconsumed octets are in the buffer.
+fn fill(w: *mut Wire, n: usize) -> WireError!bool {
+    while (*w).rend - (*w).rstart < n {
+        let have: usize = (*w).rend - (*w).rstart
+        // ask for a generous read, but at least what is missing
+        var want: usize = 65536
+        if n - have > want {
+            want = n - have
+        }
+        if (*w).rcap == 0 || (*w).rcap - (*w).rend < want {
+            if !make_room(w, want) {
+                return WireError::TooBig
+            }
+        }
+        let room: usize = (*w).rcap - (*w).rend
+        let got: usize = net.read(&(*w).conn, (*w).rbuf + (*w).rend as u64, room) catch 99999999999
+        if got == 99999999999 {
+            if net.conn_error(&(*w).conn) == ERR_AGAIN {
+                return WireError::Timeout
+            }
+            return WireError::Broken
+        }
+        if got == 0 {
+            return WireError::Closed
+        }
+        (*w).rend = (*w).rend + got
+        (*w).n_in = (*w).n_in + got as u64
+    }
+    return true
+}
+
+// A VarInt at offset `at` behind rstart (without consuming it). Returns the
+// value; `*used` is the number of octets. Fills the buffer as needed.
+fn peek_varint(w: *mut Wire, at: usize, used: *mut usize) -> WireError!i32 {
+    var result: u32 = 0
+    var shift: u32 = 0
+    var k: usize = 0
+    while k < 5 {
+        try fill(w, at + k + 1)
+        let by: u8 = rt.ld8((*w).rbuf, (*w).rstart + at + k)
+        result = result | (((by & 127 as u8) as u32) << shift)
+        k = k + 1
+        if (by & 128 as u8) == 0 as u8 {
+            *used = k
+            return bytes.bits_i32(result)
+        }
+        shift = shift + 7 as u32
+    }
+    return WireError::Malformed
+}
+
+// ------------------------------------------------------------- reading a packet
+
+// The next packet. On success `body` is a VIEW on the packet with the cursor
+// BEHIND the packet id, and the id is returned. Timeout leaves everything in
+// place; call again.
+fn wire_read_packet(w: *mut Wire, body: *mut bytes.Bytes) -> WireError!i32 {
+    // The previous packet's octets are released only now, so that its view was
+    // valid until this call.
+    var len_used: usize = 0
+    let len: i32 = try peek_varint(w, 0, &len_used)
+    if len <= 0 {
+        return WireError::Malformed
+    }
+    if len as usize > MAX_PACKET {
+        return WireError::TooBig
+    }
+    try fill(w, len_used + len as usize)
+    let pstart: usize = (*w).rstart + len_used
+    let plen: usize = len as usize
+    // consume: advance now; the octets stay valid until the next call because
+    // make_room only runs from fill, which only runs from the next read.
+    // (make_room moves live data, not consumed data, so consume lazily by
+    // remembering the end.)
+    let base: u64 = (*w).rbuf + pstart as u64
+    (*w).rstart = pstart + plen
+    (*w).n_packets = (*w).n_packets + 1 as u64
+
+    if (*w).threshold < 0 {
+        *body = bytes.Bytes { data: base, cap: plen, len: plen, pos: 0, bad: false }
+        let id: i32 = bytes.get_varint(body) catch 0 - 1
+        if id < 0 {
+            return WireError::Malformed
+        }
+        return id
+    }
+    // compressed framing: [dataLength] [payload]
+    *body = bytes.Bytes { data: base, cap: plen, len: plen, pos: 0, bad: false }
+    let dlen: i32 = bytes.get_varint(body) catch 0 - 1
+    if dlen < 0 {
+        return WireError::Malformed
+    }
+    if dlen == 0 {
+        // not compressed: the rest is id+body
+        let id: i32 = bytes.get_varint(body) catch 0 - 1
+        if id < 0 {
+            return WireError::Malformed
+        }
+        return id
+    }
+    if dlen as usize > MAX_INFLATED {
+        return WireError::TooBig
+    }
+    let used: usize = bytes.bytes_pos(body)
+    rt.buf_clear(&(*w).zin)
+    rt.buf_reserve(&(*w).zin, dlen as usize)
+    let got: usize = deflate.zlib_decompress(base + used as u64, plen - used,
+        &(*w).zin) catch 99999999999
+    if got == 99999999999 || got != dlen as usize {
+        return WireError::Inflate
+    }
+    (*w).n_compressed = (*w).n_compressed + 1 as u64
+    (*w).n_inflated = (*w).n_inflated + got as u64
+    *body = bytes.Bytes { data: (*w).zin.ptr, cap: (*w).zin.cap, len: got, pos: 0, bad: false }
+    let id: i32 = bytes.get_varint(body) catch 0 - 1
+    if id < 0 {
+        return WireError::Malformed
+    }
+    return id
+}
+
+// ------------------------------------------------------------- sending a packet
+
+// id + body, framed (and compressed above the threshold), in ONE write.
+fn wire_send_packet(w: *mut Wire, id: i32, body: *mut bytes.Bytes) -> WireError!usize {
+    let idn: usize = bytes.varint_size(id)
+    let total: usize = idn + bytes.bytes_len(body)
+    if total > MAX_PACKET {
+        return WireError::TooBig
+    }
+    let f: *mut bytes.Bytes = &(*w).frame
+    bytes.bytes_clear(f)
+    bytes.bytes_reserve(f, total + 16)
+    if (*w).threshold < 0 {
+        bytes.put_varint(f, total as i32)
+        bytes.put_varint(f, id)
+        bytes.put_bytes(f, body)
+    } else if (total as i32) < (*w).threshold {
+        // below the threshold: dataLength 0, payload as is
+        bytes.put_varint(f, (total + 1) as i32)
+        bytes.put_varint(f, 0)
+        bytes.put_varint(f, id)
+        bytes.put_bytes(f, body)
+    } else {
+        // above: payload = zlib(id + body)
+        var raw: bytes.Bytes = bytes.bytes_new()
+        bytes.bytes_reserve(&raw, total)
+        bytes.put_varint(&raw, id)
+        bytes.put_bytes(&raw, body)
+        rt.buf_clear(&(*w).zout)
+        let n: usize = deflate.zlib_compress(bytes.bytes_ptr(&raw),
+            bytes.bytes_len(&raw), 6, &(*w).zout) catch 99999999999
+        bytes.bytes_free(&raw)
+        if n == 99999999999 {
+            return WireError::Inflate
+        }
+        bytes.put_varint(f, (bytes.varint_size(total as i32) + n) as i32)
+        bytes.put_varint(f, total as i32)
+        bytes.put_raw(f, (*w).zout.ptr, n)
+    }
+    if !bytes.bytes_ok(f) {
+        return WireError::TooBig
+    }
+    let sent: usize = net.write_all(&(*w).conn, bytes.bytes_ptr(f), bytes.bytes_len(f)) catch 0
+    if sent != bytes.bytes_len(f) {
+        return WireError::Broken
+    }
+    return sent
+}
