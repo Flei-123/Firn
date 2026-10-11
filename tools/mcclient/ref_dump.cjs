@@ -14,7 +14,8 @@
 // Dump rules that DESIGN.md leaves open (the Firn client must do the same):
 //   * a second map_chunk for the same (x, z) replaces the first one (last wins);
 //   * unload_chunk packets are ignored (the dump is "everything that was sent");
-//   * sections = number of sections parsed until the chunkData buffer is used up.
+//   * sections = number of sections of the dimension (height / 16 from the Join Game codec); the vanilla
+//     server pads chunkData with zero octets behind them, so "until the buffer ends" is wrong.
 'use strict'
 
 const fs = require('fs')

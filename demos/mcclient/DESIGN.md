@@ -8,33 +8,22 @@ a test subject only (downloaded to a temp dir, never read, never in the repo).
 
 1.20.1 has NO configuration phase: Handshake -> Login -> Play.
 
-## Layout
+## Layout (final, after the library round)
 
 ```
 demos/mcclient/
-  main.fi                  CLI + state machine                  (lead)
-  wire.fi                  framing, zlib threshold, CFB8 hook   (lead)
-  chunk.fi                 map_chunk -> palette sections        (lead)
-  dump.fi                  canonical dump + checksum            (lead)
-  schema.fi                generic packet-schema walker         (worker G)
-  versions/v763/protocol.fi  GENERATED packet tables + schemas  (worker G)
-tools/mcclient/
-  gen_protocol.py          generator: minecraft-data -> Firn    (worker G)
-  run.sh                   end-to-end test (real server)        (worker T)
-  fetch_server.sh          official download into a temp dir    (worker T)
-  ref_dump.cjs             reference client (node-minecraft-protocol) (worker T)
-  compare.sh / metrics     (worker T)
-tests/26xx_mcclient_*.fi   unit tests                           (lead / G)
+  main.fi          thin glue: version by protocol number, mc_client, schema walk of every packet, chunk store, dump
+  dump.fi          the canonical dump + checksum (test artefact)
+  selftest.fi      offline test of mc_chunk + dump against tools/mc/chunk/expected.py
+lib/mc/            the libraries (docs/MC-LIBS.md): mc_client, mc_codec, mc_schema, mc_chunk, mc_world, mc_dimension, mc_version ...
+tools/mcgen/       generators (packet tables + registries from minecraft-data)
+tools/mcclient/    end-to-end harness: real 1.20.1 server + reference client (run.sh, ref_dump.cjs, compare.sh, fetch_server.sh, mock_server.cjs)
 ```
-
-Version = data (GDD 8.6): nothing about packet numbers or field layouts is typed
-by hand. `gen_protocol.py <minecraft-data-dir> <version> <out.fi>` produces the
-tables; a new version = rerun the generator with another version string.
 
 ## CLI contract of the Firn client
 
 ```
-mcclient <host> <port> <name> <dump_file> [view_distance=4] [idle_ms=2500]
+mcclient <host-ipv4> <port> <name> <dump_file> [view_distance=4] [idle_ms=2500] [protocol=763]
 ```
 * Offline login, same `name` => same offline UUID.
 * Sends Client Information (view distance as given, rest default), answers Keep
@@ -93,11 +82,8 @@ for all clients so the spawn position is identical:
 `ref_dump (A) -> firn mcclient (B) -> ref_dump (A2)`; pass = A == A2 (reference
 stable) and B == A (byte-identical dump file, same checksum).
 
-## Packet/field naming of the generated module (worker G)
+## Packet naming of the generated modules
 
-Constants `<STATE>_<DIR>_<NAME>` in upper snake case with the protocol.json
-packet name, e.g. `HANDSHAKE_C2S_SET_PROTOCOL`, `LOGIN_S2C_SUCCESS`,
-`PLAY_S2C_MAP_CHUNK`, `PLAY_C2S_KEEP_ALIVE`; STATE in HANDSHAKE|STATUS|LOGIN|PLAY,
-DIR in C2S|S2C (`toServer` = C2S, `toClient` = S2C). Plus
-`packet_name(state, dir, id) -> u64` (NUL-terminated C string or 0) and
-`packet_schema(state, dir, id) -> u64` (handle for `schema.walk`, 0 if unknown).
+Each version has `lib/mc/vNNN/mc_proto_vNNN.fi` with constants `<STATE>_<DIR>_<NAME>` (upper snake case of the protocol.json packet name),
+`packet_name`, `packet_schema` and `version_make()`. Engine code does not use these constants: it asks the Version object for the wire id of a
+SEMANTIC packet (`mc_version.version_pid(&v, mc_sem.SEM_PLAY_S2C_MAP_CHUNK)`), see docs/MC-VERSIONS.md.
