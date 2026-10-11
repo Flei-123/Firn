@@ -96,8 +96,8 @@ The client picks the version from the protocol number in the server-list ping.
 | **1.21.1** | **767** | yes | yes (904) | `CF_CONTAINERS_118` **verified** | **yes** (11.10.2026: real 1.21.1 server, Known Packs answered, dump byte-identical to the reference, 109 chunks) |
 | **1.21.4** | **769** | yes | yes (948) | `CF_CONTAINERS_118` **verified** | **yes** (11.10.2026: real 1.21.4 server, client information with particle status, dump byte-identical, 117 chunks) |
 | **1.21.8** | **772** | yes | yes (980) | `CF_CONTAINERS_118` + 1.21.5 shape (`FLAG_HM_MAP`) **verified** | **yes** (11.10.2026: real 1.21.8 server, heightmap map + containers without length, dump byte-identical, 117 chunks) |
-| 1.21.11 | 774 | yes | yes (1008) | same | no |
-| 26.1 | 775 (in minecraft-data) | yes | yes (1028) | same | no |
+| 1.21.11 | 774 | yes | yes (1008) | `CF_CONTAINERS_118` + 1.21.5 shape: Firn joins and decodes all 117 chunks without a decode error, but **byte equality NOT proven** (see below) | joins; dump compare open |
+| 26.1 | 775 (in minecraft-data) | yes | yes (1028) | **NOT verified**: the 26.1 section data is not read by the 1.21.8 rules (see below) | joins; chunks open |
 
 Tables for 1.20.5+ needed four generator/walker extensions (all in this round, no data typed by hand):
 `registryEntryHolderSet` (op 18), `lpVec3` (op 19, 1.21.9+; format from the public protocol
@@ -112,7 +112,29 @@ is dropped. Fixtures for versions that node-minecraft-protocol (1.54) does not s
 `lpVec3` type written in `gen_fixtures.cjs`. node-minecraft-protocol's INLINE `registryEntryHolder`
 is broken in reader, writer and sizeOf (no leading 0, wrong offset, `holder.data`); corrected
 versions are used for the reference (documented in `gen_fixtures.cjs`). Only the walker is
-proven for these versions; no join, no chunk check (1.21.5 changed the heightmap encoding).
+proven for these versions (join and chunk check: see the section below).
+
+### 1.21.x chunk round (11.10.2026, real servers, `MC_VERSION=<rel> bash tools/mcclient/run.sh <client>`)
+
+`CF_CONTAINERS_118` stays one function (`chunk_decode_118`); 1.21.5 changed two things, both behind
+`FLAG_HM_MAP` (versions.json: 1.21.8, 1.21.11, 26.1): heightmaps are `varint count` + (`varint type`,
+`varint longCount`, longs) instead of NBT (type 0 world_surface_wg, 1 world_surface, 2 ocean_floor_wg,
+3 ocean_floor, 4 motion_blocking, 5 motion_blocking_no_leaves, names from minecraft-data), and a paletted
+container carries no data array length (derived from the bits per entry; a single value container
+ends after the value). Offline: `tools/mc/chunk/run.sh` builds both shapes by hand (`selftest map`) and
+compares with `expected.py`. Join fixes found by the real servers: 1.20.5+ **Select Known Packs** must be
+answered (empty list) or the server never sends the registries; 1.21.2+ **Client Information** has a trailing
+particle status (without it the server falls back to view distance 2: 49 instead of 117 chunks).
+
+| Version | Result |
+|---|---|
+| 1.21.1 (767) | PASS: A == A2, B == A, 109 chunks, byte identical |
+| 1.21.4 (769) | PASS: 117 chunks, byte identical |
+| 1.21.8 (772) | PASS: 117 chunks, byte identical (reference reads the new shape: `MC_PROTOCOL >= 770` in `ref_dump.cjs`) |
+| 1.21.11 (774) | Firn: 117 chunks, no decode or walk error. The reference needed an `lpVec3` reader for nmp 1.54 (added in `ref_dump.cjs`). A vs A2 differ in a few sections (world not frozen: the game rules were renamed to snake_case in 1.21.11; `run.sh` now sends both spellings) -> equality **not proven** |
+| 26.1 (775) | **not verified**: the reference itself fails on most chunks ("palette index out of range", "long array past end") and Firn gets only a few chunks, so the section layout of 26.1 differs from the 1.21.8 rules (cause not found yet; raw chunk bytes via `MC_REF_DEBUG_FILE=<path>`) |
+| 1.21.5 (770), 1.21.6/7 | no table in this repo (versions.json has 1.21.8 for 772); not tested |
+| 26.2 | protocol number unknown here; jar exists in the piston manifest, minecraft-data does not know it |
 
 "26.2" (named by the owner): the `minecraft-data` copy on the server knows `26.1` (protocol
 775) but not `26.2`; its protocol number is therefore **not known here and not guessed**.

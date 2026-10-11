@@ -128,8 +128,13 @@ EOF
   for gr in "randomTickSpeed 0" "doFireTick false" "doMobSpawning false" "doWeatherCycle false" "doDaylightCycle false" "doTraderSpawning false" "doPatrolSpawning false" "doInsomnia false"; do
     echo "gamerule $gr" >&3
   done
+  # 1.21.11 / 26.x renamed the game rules to snake_case; unknown names only print an error, so both are sent
+  for gr in "random_tick_speed 0" "fire_spread_radius_around_player 0" "spawn_mobs false" "advance_weather false" "advance_time false" "spawn_traders false" "spawn_patrols false" "spawn_phantoms false"; do
+    echo "gamerule $gr" >&3
+  done
   if [ "$LEGACY" -eq 1 ]; then sleep 3; else
-    for i in $(seq 1 20); do grep -q 'Gamerule doInsomnia is now set' "$W/server.log" && break; sleep 0.5; done
+    for i in $(seq 1 20); do grep -qE 'Gamerule (doInsomnia|spawn_phantoms) is now set' "$W/server.log" && break; sleep 0.5; done
+    sleep 2
   fi
   
 fi

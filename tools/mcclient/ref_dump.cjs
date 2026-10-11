@@ -522,6 +522,7 @@ function main () {
     } catch (e) {
       chunkErrors++
       console.error(`chunk decode failed at ${p.x},${p.z}: ${e.message}`)
+      if (process.env.MC_REF_DEBUG_FILE) fs.writeFileSync(process.env.MC_REF_DEBUG_FILE, Buffer.from(p.chunkData).toString('hex'))
       if (process.env.MC_REF_DEBUG) console.error(`  debug chunkData(${p.chunkData.length}) head=${Buffer.from(p.chunkData).subarray(0, 96).toString('hex')}`)
     }
     armIdle()
