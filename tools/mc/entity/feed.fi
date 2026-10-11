@@ -1,0 +1,163 @@
+// tools/mc/entity/feed.fi -- feeds a packet script into lib/mc/mc_entity.fi and prints the result.
+//
+//   usage: feed <protocol> <script-file> [--break]
+//
+// script line:  <packet name> <hex of the packet body (without the packet id)>
+// names: spawn_entity spawn_entity_living named_entity_spawn entity_teleport rel_entity_move entity_move_look
+//        entity_look entity_destroy entity_velocity sync_entity_position player_info player_remove
+// stdout: the entity_dump text, then `counters ...` and `rate <packets/s>`.
+// --break: gegenprobe -- feeds every spawn as a rel_entity_move (wrong packet id), the output must then differ.
+import std.rt
+import std.io
+import std.bytes
+import mc.mc_entity
+import mc.mc_sem
+import mc.mc_version
+import mc.mc_versions
+
+const SYS_CLOCK_GETTIME: i64 = 228
+const CLOCK_MONOTONIC: i64 = 1
+
+fn now_us() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000000 as u64 + (ts[1] as u64) / 1000 as u64
+}
+
+fn arg_i64(start: u64, i: usize) -> i64 {
+    let p: u64 = rt.arg_ptr(start, i)
+    let n: usize = rt.c_length(p)
+    var v: i64 = 0
+    var k: usize = 0
+    while k < n {
+        v = v * 10 + (rt.ld8(p, k) - 48 as u8) as i64
+        k = k + 1
+    }
+    return v
+}
+
+fn hexv(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return c as i32 - 48
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return c as i32 - 87
+    }
+    return 0 - 1
+}
+
+// name at p[0..n) -> semantic index, or -1
+fn sem_of(p: u64, n: usize) -> i32 {
+    if name_is(p, n, "spawn_entity") { return mc_sem.SEM_PLAY_S2C_SPAWN_ENTITY as i32 }
+    if name_is(p, n, "spawn_entity_living") { return mc_sem.SEM_PLAY_S2C_SPAWN_ENTITY_LIVING as i32 }
+    if name_is(p, n, "named_entity_spawn") { return mc_sem.SEM_PLAY_S2C_NAMED_ENTITY_SPAWN as i32 }
+    if name_is(p, n, "entity_teleport") { return mc_sem.SEM_PLAY_S2C_ENTITY_TELEPORT as i32 }
+    if name_is(p, n, "rel_entity_move") { return mc_sem.SEM_PLAY_S2C_REL_ENTITY_MOVE as i32 }
+    if name_is(p, n, "entity_move_look") { return mc_sem.SEM_PLAY_S2C_ENTITY_MOVE_LOOK as i32 }
+    if name_is(p, n, "entity_look") { return mc_sem.SEM_PLAY_S2C_ENTITY_LOOK as i32 }
+    if name_is(p, n, "entity_destroy") { return mc_sem.SEM_PLAY_S2C_ENTITY_DESTROY as i32 }
+    if name_is(p, n, "entity_velocity") { return mc_sem.SEM_PLAY_S2C_ENTITY_VELOCITY as i32 }
+    if name_is(p, n, "sync_entity_position") { return mc_sem.SEM_PLAY_S2C_SYNC_ENTITY_POSITION as i32 }
+    if name_is(p, n, "player_info") { return mc_sem.SEM_PLAY_S2C_PLAYER_INFO as i32 }
+    if name_is(p, n, "player_remove") { return mc_sem.SEM_PLAY_S2C_PLAYER_REMOVE as i32 }
+    return 0 - 1
+}
+
+fn name_is(p: u64, n: usize, lit: str) -> bool {
+    return n == lit.n && rt.mem_eq(p, lit.p as u64, n)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        io.eprint_line("usage: feed <protocol> <script-file> [--break]")
+        return 2
+    }
+    let proto: i32 = arg_i64(start, 1) as i32
+    var brk: bool = false
+    if rt.arg_count(start) > 3 {
+        brk = true
+    }
+    var ver: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(proto, &ver) {
+        io.eprint_line("feed: unknown protocol")
+        return 2
+    }
+    var blob: rt.Buf = rt.buf_new()
+    if !rt.read_file(rt.arg_ptr(start, 2), &blob) {
+        io.eprint_line("feed: cannot read the script")
+        return 2
+    }
+    // pass 1: decode every line into one arena: [sem:i32][len:u32][body...]
+    var arena: rt.Buf = rt.buf_new()
+    let base: u64 = rt.buf_ptr(&blob)
+    let total: usize = rt.buf_len(&blob)
+    var pos: usize = 0
+    var packets: u64 = 0
+    while pos < total {
+        var e: usize = pos
+        while e < total && rt.ld8(base, e) != 10 as u8 {
+            e = e + 1
+        }
+        var sp: usize = pos
+        while sp < e && rt.ld8(base, sp) != 32 as u8 {
+            sp = sp + 1
+        }
+        let sem: i32 = sem_of(base + (pos as u64), sp - pos)
+        if sem >= 0 && sp < e {
+            var k: usize = sp + 1
+            let blen: usize = (e - k) / 2
+            var head: [u8; 8] = [0 as u8; 8]
+            head[0] = (sem & 255) as u8
+            head[1] = ((sem >> 8) & 255) as u8
+            head[4] = (blen & 255) as u8
+            head[5] = ((blen >> 8) & 255) as u8
+            head[6] = ((blen >> 16) & 255) as u8
+            head[7] = ((blen >> 24) & 255) as u8
+            rt.buf_push_bytes(&arena, (&head[0]) as u64, 8)
+            while k + 1 < e {
+                rt.buf_push(&arena, (hexv(rt.ld8(base, k)) * 16 + hexv(rt.ld8(base, k + 1))) as u8)
+                k = k + 2
+            }
+            packets = packets + 1 as u64
+        }
+        pos = e + 1
+    }
+    // pass 2: timed feed
+    var st: mc_entity.Store = mc_entity.store_new()
+    let t0: u64 = now_us()
+    var pass: i32 = 0
+    while pass < 1 {
+        var off: usize = 0
+        let ab: u64 = rt.buf_ptr(&arena)
+        let an: usize = rt.buf_len(&arena)
+        while off < an {
+            var sem: i32 = (rt.ld8(ab, off) as i32) | ((rt.ld8(ab, off + 1) as i32) << 8)
+            let blen: usize = (rt.ld8(ab, off + 4) as usize) | ((rt.ld8(ab, off + 5) as usize) << 8) | ((rt.ld8(ab, off + 6) as usize) << 16) | ((rt.ld8(ab, off + 7) as usize) << 24)
+            if brk && (sem == mc_sem.SEM_PLAY_S2C_SPAWN_ENTITY as i32 || sem == mc_sem.SEM_PLAY_S2C_NAMED_ENTITY_SPAWN as i32) {
+                sem = mc_sem.SEM_PLAY_S2C_REL_ENTITY_MOVE as i32
+            }
+            var b: bytes.Bytes = bytes.bytes_new()
+            bytes.put_raw(&b, ab + ((off + 8) as u64), blen)
+            bytes.bytes_set_pos(&b, 0)
+            mc_entity.entity_on_packet(&st, &ver, ver.sem[sem as usize], &b)
+            bytes.bytes_free(&b)
+            off = off + 8 + blen
+        }
+        pass = pass + 1
+    }
+    let t1: u64 = now_us()
+    var out: rt.Buf = rt.buf_new()
+    mc_entity.entity_dump(&st, &out)
+    io.print_bytes(rt.buf_ptr(&out), rt.buf_len(&out))
+    io.fmt_print(f"counters spawns={st.spawns} moves={st.moves} teleports={st.teleports} looks={st.looks} destroys={st.destroys} velocities={st.velocities} infos={st.infos} misses={st.misses} bad={st.bad} dropped={st.dropped}\n")
+    var us: u64 = t1 - t0
+    if us == 0 as u64 {
+        us = 1
+    }
+    io.fmt_print(f"rate packets={packets} us={us} per_s={packets * 1000000 as u64 / us}\n")
+    rt.buf_free(&out)
+    rt.buf_free(&arena)
+    rt.buf_free(&blob)
+    mc_entity.store_free(&st)
+    return 0
+}

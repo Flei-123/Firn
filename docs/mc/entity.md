@@ -22,8 +22,17 @@ Entity { id, kind (0 object, 1 living, 2 player), type_id, uuid, x y z (f64 bloc
   store capped (MAX_ENTITIES 1M, MAX_PLAYERS 64k). Entity id -2^31 is a read-failure sentinel.
 * Tests: `tests/2760_mc_entity_basic.fi` (1.20.1 + 1.8.9 known answers, hostile input, 5000 entities, tombstones).
 
-## Status / open
-* Not yet: demo dump (`<dump>.entities`), ref_dump.cjs entity side, bot in run.sh, tools/mc/entity/run.sh cross-check
-  against the protodef serializer, real-server proof (1.20.1 / 1.8.9).
-* Check on a real 1.21.2+ server: minecraft-data (1.21.4+) still lists `entity_teleport` with the OLD layout
-  (yaw i8); the real packet may differ (vanilla 1.21.2 changed it). If the real server disagrees, add an override in gen_entity.py.
+## Proof
+* Cross-check `bash tools/mc/entity/run.sh` (`RESULT mc-entity: ok`): random packet streams for all 10 versions, serialized by the
+  protodef serializer (`gen.cjs`), expected state from `tools/mcclient/ref_entities.cjs`, compared with `entity_dump` (`feed.fi`);
+  counter-check (wrong spawn id) must change the dump; ~120k-280k packets/s. It found a real bug (skip of lpVec3 on 1.21.9+).
+* Demo: `demos/mcclient` writes `<dump>.entities` (chunk dump + checksum untouched). `ref_dump.cjs` builds the same text with
+  `ref_entities.cjs`. `tools/mcclient/run.sh` (MC_ENTITIES=1 default on a real server): `bot.cjs` stays online, a console script
+  summons a pig + armor stand (NoAI), teleports the pig, walks the bot (relative moves), summons + kills a chicken WHILE each dumper
+  is connected (idle 7 s); `compare.sh` compares the entity files with entity ids and mob uuids masked (the server counts up / draws
+  uuids per session).
+* Real vanilla servers byte-identical to node-minecraft-protocol: 1.20.1, 1.8.9 (see the report of w10 for 1.21.4).
+
+## Open
+* 1.21.2+ `entity_teleport`: minecraft-data lists the OLD layout (yaw i8); check against a real 1.21.4 server (override in gen_entity.py if it differs).
+* 1.20.2+: players arrive as spawn_entity; name is resolved by uuid from player_info (cross-check yes, real server only via the bot).
