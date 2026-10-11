@@ -1,0 +1,122 @@
+// tools/mc/codec/peer.fi -- the Firn side of the mc_codec cross-check.
+//
+//     peer <port> <threshold> <key-hex|-> <mode>
+//
+// Connects to the python peer (tools/mc/codec/run.sh), switches compression
+// (threshold, -1 = off) and AES-128-CFB8 (16 octet key as 32 hex digits, "-" = off)
+// on, then
+//   mode "echo":   reads packets and sends every one back unchanged (same id, same
+//                  body) until the peer closes; prints `packets=N`
+//   mode "reject": reads ONE packet and prints `error=<name>`
+// All the interesting inputs (sizes around the threshold, 2 MiB, incompressible data,
+// random write splits, hostile frames) are made by the python side, independently.
+
+import std.net
+import std.bytes
+import std.rt
+import std.io
+import mc.mc_codec
+
+fn hexval(c: u8) -> u8 {
+    if c >= 97 as u8 {
+        return c - 87 as u8
+    }
+    return c - 48 as u8
+}
+
+fn err_name(e: WireError) -> i32 {
+    if e == WireError::Closed {
+        return 1
+    }
+    if e == WireError::TooBig {
+        return 2
+    }
+    if e == WireError::Inflate {
+        return 3
+    }
+    if e == WireError::Malformed {
+        return 4
+    }
+    if e == WireError::Timeout {
+        return 5
+    }
+    return 6
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 5 {
+        return 2
+    }
+    let pa: u64 = rt.arg_ptr(start, 1)
+    var port: i64 = 0
+    var i: usize = 0
+    while i < rt.c_length(pa) {
+        port = port * 10 + (rt.ld8(pa, i) - 48 as u8) as i64
+        i = i + 1
+    }
+    let ta: u64 = rt.arg_ptr(start, 2)
+    var thr: i32 = 0 - 1
+    if rt.ld8(ta, 0) != 45 as u8 {
+        var t: i32 = 0
+        i = 0
+        while i < rt.c_length(ta) {
+            t = t * 10 + (rt.ld8(ta, i) - 48 as u8) as i32
+            i = i + 1
+        }
+        thr = t
+    }
+    let ka: u64 = rt.arg_ptr(start, 3)
+    let ma: u64 = rt.arg_ptr(start, 4)
+    let conn: net.Conn = net.connect_tcp(net.ADDR_LOCAL, port as u16) catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&conn) {
+        return 3
+    }
+    var w: mc_codec.Wire = mc_codec.wire_open(conn)
+    if thr >= 0 {
+        mc_codec.wire_set_threshold(&w, thr)
+    }
+    if rt.ld8(ka, 0) != 45 as u8 {
+        var key: [u8; 16] = [0; 16]
+        i = 0
+        while i < 16 {
+            key[i] = hexval(rt.ld8(ka, i * 2)) * 16 as u8 + hexval(rt.ld8(ka, i * 2 + 1))
+            i = i + 1
+        }
+        mc_codec.wire_enable_encryption(&w, (&key[0]) as u64)
+    }
+    var body: bytes.Bytes = bytes.bytes_new()
+    var n: u64 = 0
+    var rc: i32 = 0
+    var running: bool = true
+    let reject: bool = rt.ld8(ma, 0) == 114 as u8
+    while running {
+        let id: i32 = mc_codec.wire_read_packet(&w, &body) catch | e | (0 - err_name(e))
+        if id < 0 {
+            let code: i32 = 0 - id
+            if reject {
+                io.fmt_print(f"error={code}\n")
+            } else if code != 1 {
+                io.fmt_print(f"error={code} after {n} packets\n")
+                rc = 4
+            }
+            running = false
+        } else if reject {
+            io.fmt_print(f"error=0\n")
+            running = false
+        } else {
+            var rest: bytes.Bytes = mc_codec.wire_view_rest(&body)
+            let sent: usize = mc_codec.wire_send_packet(&w, id, &rest) catch 0
+            if sent == 0 {
+                io.fmt_print(f"error=send after {n} packets\n")
+                rc = 5
+                running = false
+            }
+            n = n + 1
+        }
+    }
+    if !reject {
+        io.fmt_print(f"packets={n} in={mc_codec.wire_stat_in(&w)} inflated={mc_codec.wire_stat_inflated(&w)} compressed_packets={mc_codec.wire_stat_compressed(&w)}\n")
+    }
+    mc_codec.wire_close(&w)
+    return rc
+}
