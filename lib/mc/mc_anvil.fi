@@ -1,0 +1,431 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_anvil.fi -- Anvil region files (.mca): read and write, in memory or through a file.
+//
+// Format (public, documented by the community): a region holds 32 x 32 chunks.
+//   sector 0  1024 location entries, 4 octets each: sector offset (3 octets, big endian) and
+//             sector count (1 octet); 0 = chunk not present
+//   sector 1  1024 timestamps (u32 big endian, seconds)
+//   from sector 2 on, in 4096 octet sectors: per chunk
+//             length (u32 BE, counts the next octet and the data) | compression (1 gzip, 2 zlib,
+//             3 none; 4 = LZ4 in the newest releases, reported as unsupported here) | data
+// The chunk (x, z) (any integers, the low 5 bits are used) lives in entry (x & 31) + (z & 31) * 32.
+//
+// What this module does NOT do: it does not interpret the NBT payload (use std.nbt / mc_nbt), and
+// it does not touch the file system except `region_load` / `region_save`.
+//
+// Hostile input: every location entry is validated before it is used (inside the file, not in the
+// two header sectors, length field within its sectors, known compression); `region_check` also
+// finds overlapping sectors. A damaged file gives an error, never an out-of-bounds read.
+
+import std.rt
+import std.deflate
+
+export {
+    Region, AnvilError,
+    region_new, region_free, region_from_bytes, region_load, region_save, region_check,
+    region_has, region_count, region_sector_count, region_timestamp,
+    region_read, region_read_raw, region_write, region_remove,
+    CT_GZIP, CT_ZLIB, CT_NONE, CT_LZ4,
+    MAX_SECTORS_PER_CHUNK, MAX_CHUNK_BYTES,
+}
+
+const SECTOR: usize = 4096
+const CT_GZIP: u8 = 1
+const CT_ZLIB: u8 = 2
+const CT_NONE: u8 = 3
+const CT_LZ4: u8 = 4
+const MAX_SECTORS_PER_CHUNK: usize = 255 // the count is one octet
+const MAX_CHUNK_BYTES: usize = 1044480 // 255 sectors minus the 5 octet header, rounded down
+const MAX_INFLATED: usize = 67108864 // 64 MiB cap on a decompressed chunk (bomb guard)
+
+error AnvilError {
+    Format, // not a region file (shorter than the header, size not a sector multiple)
+    Range, // a location entry points outside the file / into the header / length too big
+    Overlap, // two chunks share a sector
+    Missing, // no such chunk
+    Compression, // unknown or unsupported compression octet
+    Inflate, // the compressed data is damaged
+    TooBig, // the chunk does not fit in 255 sectors
+    Memory, // out of memory
+}
+
+struct Region {
+    buf: rt.Buf, // the whole file, always a multiple of SECTOR long, at least 2 * SECTOR
+}
+
+fn ld32be(p: u64, o: usize) -> u32 {
+    return ((rt.ld8(p, o) as u32) << 24) | ((rt.ld8(p, o + 1) as u32) << 16) | ((rt.ld8(p, o + 2) as u32) << 8) | (rt.ld8(p, o + 3) as u32)
+}
+
+fn st32be(p: u64, o: usize, v: u32) {
+    rt.st8(p, o, (v >> 24) as u8)
+    rt.st8(p, o + 1, ((v >> 16) & 255 as u32) as u8)
+    rt.st8(p, o + 2, ((v >> 8) & 255 as u32) as u8)
+    rt.st8(p, o + 3, (v & 255 as u32) as u8)
+}
+
+fn slot(x: i32, z: i32) -> usize {
+    return ((x & 31) + (z & 31) * 32) as usize
+}
+
+fn region_new() -> Region {
+    var r: Region = Region { buf: rt.buf_new() }
+    rt.buf_reserve(&r.buf, 2 * SECTOR)
+    var i: usize = 0
+    while i < 2 * SECTOR {
+        rt.buf_push(&r.buf, 0 as u8)
+        i = i + 1
+    }
+    return r
+}
+
+fn region_free(r: *mut Region) {
+    rt.buf_free(&(*r).buf)
+}
+
+fn base(r: *mut Region) -> u64 { return (*r).buf.ptr }
+fn flen(r: *mut Region) -> usize { return (*r).buf.len }
+fn nsectors(r: *mut Region) -> usize { return (*r).buf.len / SECTOR }
+
+// the location entry of slot `s`: sector offset and count
+fn loc_off(r: *mut Region, s: usize) -> usize {
+    let e: u32 = ld32be(base(r), s * 4)
+    return (e >> 8) as usize
+}
+
+fn loc_cnt(r: *mut Region, s: usize) -> usize {
+    let e: u32 = ld32be(base(r), s * 4)
+    return (e & 255 as u32) as usize
+}
+
+fn set_loc(r: *mut Region, s: usize, off: usize, cnt: usize) {
+    st32be(base(r), s * 4, ((off as u32) << 8) | (cnt as u32))
+}
+
+// ---- opening ----------------------------------------------------------------------
+
+// Takes a copy of `n` octets. Validates the size and the header (not the chunk bodies).
+fn region_from_bytes(p: u64, n: usize, out: *mut Region) -> AnvilError!bool {
+    *out = Region { buf: rt.buf_new() }
+    if n < 2 * SECTOR || n % SECTOR != 0 {
+        return AnvilError::Format
+    }
+    rt.buf_reserve(&(*out).buf, n)
+    if (*out).buf.cap < n {
+        return AnvilError::Memory
+    }
+    rt.mem_copy((*out).buf.ptr, p, n)
+    (*out).buf.len = n
+    var s: usize = 0
+    while s < 1024 {
+        if !entry_ok(out, s) {
+            rt.buf_free(&(*out).buf)
+            return AnvilError::Range
+        }
+        s = s + 1
+    }
+    return true
+}
+
+fn region_load(path: u64, out: *mut Region) -> AnvilError!bool {
+    var f: rt.Buf = rt.buf_new()
+    if !rt.read_file(path, &f) {
+        rt.buf_free(&f)
+        return AnvilError::Format
+    }
+    let ok: bool = region_from_bytes(f.ptr, f.len, out) catch false
+    rt.buf_free(&f)
+    if !ok {
+        return AnvilError::Format
+    }
+    return true
+}
+
+fn region_save(r: *mut Region, path: u64) -> bool {
+    return rt.write_file(path, base(r), flen(r))
+}
+
+// a location entry is plausible: 0, or inside the file and outside the two header sectors
+fn entry_ok(r: *mut Region, s: usize) -> bool {
+    let off: usize = loc_off(r, s)
+    let cnt: usize = loc_cnt(r, s)
+    if off == 0 && cnt == 0 {
+        return true
+    }
+    if off < 2 || cnt == 0 {
+        return false
+    }
+    if off + cnt > nsectors(r) {
+        return false
+    }
+    return true
+}
+
+// Consistency of the whole header: every entry plausible, the length field of every chunk within
+// its sectors, no two chunks sharing a sector. Returns the number of chunks.
+fn region_check(r: *mut Region) -> AnvilError!usize {
+    let ns: usize = nsectors(r)
+    let used: u64 = rt.heap_alloc(ns)
+    if used == 0 {
+        return AnvilError::Memory
+    }
+    var i: usize = 0
+    while i < ns {
+        rt.st8(used, i, 0 as u8)
+        i = i + 1
+    }
+    var count: usize = 0
+    var s: usize = 0
+    while s < 1024 {
+        if !entry_ok(r, s) {
+            rt.heap_free(used, ns)
+            return AnvilError::Range
+        }
+        let off: usize = loc_off(r, s)
+        let cnt: usize = loc_cnt(r, s)
+        if cnt > 0 {
+            count = count + 1
+            let len: u32 = ld32be(base(r), off * SECTOR)
+            if len < 1 as u32 || (len as usize) + 4 > cnt * SECTOR {
+                rt.heap_free(used, ns)
+                return AnvilError::Range
+            }
+            var k: usize = 0
+            while k < cnt {
+                if rt.ld8(used, off + k) != 0 as u8 {
+                    rt.heap_free(used, ns)
+                    return AnvilError::Overlap
+                }
+                rt.st8(used, off + k, 1 as u8)
+                k = k + 1
+            }
+        }
+        s = s + 1
+    }
+    rt.heap_free(used, ns)
+    return count
+}
+
+fn region_has(r: *mut Region, x: i32, z: i32) -> bool {
+    return loc_cnt(r, slot(x, z)) > 0
+}
+
+fn region_count(r: *mut Region) -> usize {
+    var n: usize = 0
+    var s: usize = 0
+    while s < 1024 {
+        if loc_cnt(r, s) > 0 {
+            n = n + 1
+        }
+        s = s + 1
+    }
+    return n
+}
+
+fn region_sector_count(r: *mut Region) -> usize {
+    return nsectors(r)
+}
+
+fn region_timestamp(r: *mut Region, x: i32, z: i32) -> u32 {
+    return ld32be(base(r), SECTOR + slot(x, z) * 4)
+}
+
+// ---- reading -----------------------------------------------------------------------
+
+// The stored payload of chunk (x, z) as it is on disk (still compressed): appended to `out`;
+// `*ctype` gets the compression octet. Returns the number of octets appended.
+fn region_read_raw(r: *mut Region, x: i32, z: i32, ctype: *mut u8, out: *mut rt.Buf) -> AnvilError!usize {
+    let s: usize = slot(x, z)
+    if loc_cnt(r, s) == 0 {
+        return AnvilError::Missing
+    }
+    if !entry_ok(r, s) {
+        return AnvilError::Range
+    }
+    let off: usize = loc_off(r, s)
+    let cnt: usize = loc_cnt(r, s)
+    let at: usize = off * SECTOR
+    let len: u32 = ld32be(base(r), at)
+    if len < 1 as u32 || (len as usize) + 4 > cnt * SECTOR {
+        return AnvilError::Range
+    }
+    *ctype = rt.ld8(base(r), at + 4)
+    let n: usize = (len as usize) - 1
+    rt.buf_push_bytes(out, base(r) + (at + 5) as u64, n)
+    return n
+}
+
+// The decompressed NBT bytes of chunk (x, z), appended to `out`. Returns their number.
+fn region_read(r: *mut Region, x: i32, z: i32, out: *mut rt.Buf) -> AnvilError!usize {
+    var raw: rt.Buf = rt.buf_new()
+    var ct: u8 = 0
+    let n: usize = region_read_raw(r, x, z, &ct, &raw) catch 99999999999
+    if n == 99999999999 {
+        rt.buf_free(&raw)
+        if loc_cnt(r, slot(x, z)) == 0 {
+            return AnvilError::Missing
+        }
+        return AnvilError::Range
+    }
+    var got: usize = 0
+    if ct == CT_NONE {
+        rt.buf_push_bytes(out, raw.ptr, n)
+        got = n
+    } else if ct == CT_ZLIB {
+        let before: usize = (*out).len
+        got = deflate.zlib_decompress(raw.ptr, n, out) catch 99999999999
+        if got == 99999999999 {
+            (*out).len = before
+            rt.buf_free(&raw)
+            return AnvilError::Inflate
+        }
+    } else if ct == CT_GZIP {
+        let before: usize = (*out).len
+        got = deflate.gzip_decompress_limited(raw.ptr, n, MAX_INFLATED, out) catch 99999999999
+        if got == 99999999999 {
+            (*out).len = before
+            rt.buf_free(&raw)
+            return AnvilError::Inflate
+        }
+    } else {
+        rt.buf_free(&raw)
+        return AnvilError::Compression
+    }
+    rt.buf_free(&raw)
+    return got
+}
+
+// ---- writing -----------------------------------------------------------------------
+
+// first run of `need` free sectors at or after sector 2 (0 = none inside the file)
+fn find_free(r: *mut Region, need: usize, ignore_slot: usize) -> usize {
+    let ns: usize = nsectors(r)
+    let used: u64 = rt.heap_alloc(ns + 1)
+    if used == 0 {
+        return 0
+    }
+    var i: usize = 0
+    while i <= ns {
+        rt.st8(used, i, 0 as u8)
+        i = i + 1
+    }
+    var s: usize = 0
+    while s < 1024 {
+        if s != ignore_slot && loc_cnt(r, s) > 0 {
+            var k: usize = 0
+            let off: usize = loc_off(r, s)
+            while k < loc_cnt(r, s) && off + k < ns {
+                rt.st8(used, off + k, 1 as u8)
+                k = k + 1
+            }
+        }
+        s = s + 1
+    }
+    var run: usize = 0
+    var found: usize = 0
+    i = 2
+    while i < ns && found == 0 {
+        if rt.ld8(used, i) == 0 as u8 {
+            run = run + 1
+            if run == need {
+                found = i + 1 - need
+            }
+        } else {
+            run = 0
+        }
+        i = i + 1
+    }
+    rt.heap_free(used, ns + 1)
+    return found
+}
+
+fn grow_to(r: *mut Region, sectors: usize) -> bool {
+    let want: usize = sectors * SECTOR
+    rt.buf_reserve(&(*r).buf, want)
+    if (*r).buf.cap < want {
+        return false
+    }
+    while (*r).buf.len < want {
+        rt.buf_push(&(*r).buf, 0 as u8)
+    }
+    return true
+}
+
+// Stores `n` octets of NBT as chunk (x, z) with compression `ctype` (CT_ZLIB, CT_GZIP or CT_NONE).
+// An existing chunk is replaced in place when the new data fits its sectors, otherwise it moves to
+// the first free run (or the end of the file). `stamp` is the timestamp (seconds).
+fn region_write(r: *mut Region, x: i32, z: i32, p: u64, n: usize, ctype: u8, stamp: u32) -> AnvilError!bool {
+    var packed: rt.Buf = rt.buf_new()
+    var src: u64 = p
+    var m: usize = n
+    if ctype == CT_ZLIB {
+        let k: usize = deflate.zlib_compress(p, n, 6, &packed) catch 99999999999
+        if k == 99999999999 {
+            rt.buf_free(&packed)
+            return AnvilError::Memory
+        }
+        src = packed.ptr
+        m = k
+    } else if ctype == CT_GZIP {
+        let k: usize = deflate.gzip_compress(p, n, 6, &packed) catch 99999999999
+        if k == 99999999999 {
+            rt.buf_free(&packed)
+            return AnvilError::Memory
+        }
+        src = packed.ptr
+        m = k
+    } else if ctype != CT_NONE {
+        rt.buf_free(&packed)
+        return AnvilError::Compression
+    }
+    let total: usize = m + 5
+    let need: usize = (total + SECTOR - 1) / SECTOR
+    if need > MAX_SECTORS_PER_CHUNK {
+        rt.buf_free(&packed)
+        return AnvilError::TooBig
+    }
+    let s: usize = slot(x, z)
+    var off: usize = 0
+    if loc_cnt(r, s) > 0 && entry_ok(r, s) && loc_cnt(r, s) >= need {
+        off = loc_off(r, s) // reuse the old place (it may be larger than needed: the tail stays reserved)
+    } else {
+        off = find_free(r, need, s)
+        if off == 0 {
+            off = nsectors(r)
+            if !grow_to(r, off + need) {
+                rt.buf_free(&packed)
+                return AnvilError::Memory
+            }
+        }
+    }
+    var cnt: usize = need
+    if loc_cnt(r, s) > 0 && loc_off(r, s) == off && loc_cnt(r, s) > need {
+        cnt = loc_cnt(r, s)
+    }
+    let at: usize = off * SECTOR
+    st32be(base(r), at, (m + 1) as u32)
+    rt.st8(base(r), at + 4, ctype)
+    rt.mem_copy(base(r) + (at + 5) as u64, src, m)
+    // zero the rest of the last sector so the file is deterministic
+    var z0: usize = at + 5 + m
+    let end: usize = off * SECTOR + need * SECTOR
+    while z0 < end {
+        rt.st8(base(r), z0, 0 as u8)
+        z0 = z0 + 1
+    }
+    set_loc(r, s, off, cnt)
+    st32be(base(r), SECTOR + s * 4, stamp)
+    rt.buf_free(&packed)
+    return true
+}
+
+// Removes chunk (x, z) (its sectors become free); false if it was not there.
+fn region_remove(r: *mut Region, x: i32, z: i32) -> bool {
+    let s: usize = slot(x, z)
+    if loc_cnt(r, s) == 0 {
+        return false
+    }
+    set_loc(r, s, 0, 0)
+    st32be(base(r), SECTOR + s * 4, 0 as u32)
+    return true
+}
