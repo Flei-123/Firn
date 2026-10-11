@@ -56,6 +56,18 @@ lens 20..170 degrees, odd sizes; a damaged threshold or box is detected):
   margin 0.12 rad for the 0.07 rad disc; empty box when the disc is behind the camera).
 
 ## Measured (server, release, Load ~1-10)
-`sky_draw` 640x360: noon / night ~4.5 ms/frame, sunset with glow ~13 ms (28 ms before; `tools/mc/sky/bench.fi` prints all
-three). The glow needs 1 sqrt + 1 division per pixel over a wide cone (81 degrees at full glow), that is the remaining cost;
-the plain model costs ~28 ms.
+`sky_draw` 640x360 (`tools/mc/sky/bench.fi`): noon / night ~2.4 ms/frame, sunset with glow ~8.6 ms (before r54: 4.5 / 13 ms;
+the plain model costs ~28 ms). 1120 scenes (320x180, all yaw/pitch/tick combinations) are byte identical to `sky_draw_plain`.
+
+r54 (target < 5 ms at sunset) was NOT reached; what was learned (AMD EPYC 7571, Firn stage 0 codegen):
+* The glow region covers ~50 % of the frame at full glow (115k of 230k pixels at tick 11800): the value `floor(d3 (1-gg) glow)`
+  changes about every pixel (0..190 over ~200 px), so no coarse evaluation / interpolation can be exact; a rigorous second
+  derivative bound for bilinear interpolation gives an error > 1 level even for 2x2 cells, so the guard band would catch everything.
+* Per glow pixel one sqrt + one division are needed (the sqrt via `math.sqrt` is a call: a call + sqrt + div costs ~14 ns vs 7 ns
+  with the intrinsic in isolation; inside `sky_draw` replacing it by `__sqrt` was consistently 40 % SLOWER, left as is).
+* The big win was code shape, not math: indexed helpers (`rt.ld32/st32`, `x * 8` with overflow checks, `tab[f]` bounds checks)
+  were ~70 % of a glow pixel. Pointer-walking loops, shifts and one function per lit row (`sky_glow_row`) took the glow part
+  from ~6.5 to ~2.9 ms and the gradient search from ~3 to ~1.5 ms.
+* Remaining at sunset (bench scene): gradient search ~66k exact evaluations (sqrt + division each, ~2.2 ms; the number of distinct
+  f levels per row is inherent), per-pixel dot products for the glow test ~2 ms, glow pixels ~2.9 ms, discs ~0.5 ms. Below 5 ms would need
+  SIMD or a faster sqrt/div path in the compiler (or giving up bit identity with the plain model), see roadmap r54.
