@@ -1,0 +1,977 @@
+// lib/mc/mc_math.fi -- vectors, boxes, rays, matrices, frustum (CPU only).
+//
+// Everything a voxel client needs around the world, without a GPU:
+//
+//   * Vec3 / IVec3        points, directions, block and chunk coordinates
+//   * floor_div/floor_mod integer division that rounds toward -infinity
+//   * Aabb                axis aligned boxes (overlap, union, offset, expand)
+//   * ray_aabb            ray / box entry distance (slab method)
+//   * BlockGrid           a dense box of block ids + a caller-provided
+//                         "id -> solid?" table; the queries below run on it
+//   * grid_raycast        voxel raycast, Amanatides-Woo DDA
+//   * grid_move           axis-separated sweep of a box against solid blocks
+//   * Mat4                4x4 matrix, COLUMN-major (element row r, column c is
+//                         m[c*4 + r]), right-handed view space, camera looks
+//                         down -z; multiply, translate/rotate/scale,
+//                         perspective, look_at, invert
+//   * Frustum             six planes out of a view-projection matrix, tests
+//                         for boxes, spheres and 16^3 sections
+//
+// WIDTH: everything is f64. Measured (docs/mc/math.md): f32 is not faster in
+// Firn today (the compiler has no float register allocation, round 71 F1) and
+// f64 keeps block coordinates exact up to the world border (30 million blocks
+// need 25 bits, an f32 has 24). Conversion for GPU upload: mat4_to_f32.
+//
+// SPEED: struct arguments and results are passed through memory. The by-value
+// helpers (v3_add, ...) are convenient but about 7x slower than the pointer
+// forms (`*_to`, Mat4 functions, the scalar signatures of the hot queries).
+// The hot paths (raycast, sweep, frustum tests) use scalars and pointers only.
+//
+// Conventions: a box is the half-open product [min, max); two boxes OVERLAP
+// only if they share volume (touching faces do not overlap). A block at
+// integer position (x, y, z) occupies [x, x+1) x [y, y+1) x [z, z+1).
+
+import std.math
+import std.rt
+
+export {
+    Vec3, IVec3, Aabb, Mat4, Frustum, BlockGrid, RayHit, MoveResult,
+    deg_to_rad, floor_i, floor_div, floor_mod, chunk_of, local_of, local_index, section_of_y,
+    v3, v3_add, v3_sub, v3_scale, v3_dot, v3_cross, v3_len, v3_normalize, v3_lerp,
+    v3_add_to, v3_sub_to, v3_scale_to, v3_cross_to, v3_normalize_to,
+    iv3, iv3_add, iv3_sub, iv3_floor, iv3_chunk, iv3_local,
+    aabb_new, aabb_block, aabb_overlap, aabb_union_to, aabb_contains, aabb_offset, aabb_expand,
+    ray_aabb,
+    grid_view, grid_id, grid_is_solid, grid_raycast, grid_move,
+    mat4_identity, mat4_mul, mat4_translation, mat4_scaling, mat4_rotation_x, mat4_rotation_y,
+    mat4_rotation_z, mat4_perspective, mat4_look_at, mat4_invert, mat4_transpose,
+    mat4_transform_point, mat4_transform_dir, mat4_to_f32,
+    frustum_from_matrix, frustum_test_box, frustum_test_aabb, frustum_test_sphere,
+    frustum_test_section,
+}
+
+// ------------------------------------------------------------------ Types
+
+struct Vec3 { x: f64, y: f64, z: f64 }
+struct IVec3 { x: i32, y: i32, z: i32 }
+
+// Box [x0,x1) x [y0,y1) x [z0,z1); the constructors do not reorder.
+struct Aabb { x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64 }
+
+// Column-major: element (row r, column c) = m[c*4 + r]. Translation = m[12..14].
+struct Mat4 { m: [f64; 16] }
+
+// Six planes a*x + b*y + c*z + d >= 0 = inside, normalised; order: left, right,
+// bottom, top, near, far. p[i*4 .. i*4+3] = a, b, c, d.
+struct Frustum { p: [f64; 24] }
+
+// A dense box of block ids. `ids` is a u16 array of nx*ny*nz entries, index
+// ((y - oy) * nz + (z - oz)) * nx + (x - ox) (the section layout (y*16+z)*16+x
+// for a 16^3 grid). `solid` is a u8 table indexed by block id (`nsolid` entries,
+// 0 = passable, anything else = solid; ids >= nsolid count as passable).
+// Cells OUTSIDE the box are solid iff `outside_solid`.
+struct BlockGrid {
+    ox: i32, oy: i32, oz: i32,
+    nx: i32, ny: i32, nz: i32,
+    ids: u64,
+    solid: u64,
+    nsolid: u32,
+    outside_solid: bool,
+}
+
+// Result of grid_raycast. (nx, ny, nz) is the normal of the face that was
+// entered (points back toward the ray origin); (0,0,0) if the origin itself
+// was inside a solid block. dist is measured along the NORMALISED direction.
+struct RayHit {
+    x: i32, y: i32, z: i32,
+    nx: i32, ny: i32, nz: i32,
+    dist: f64,
+    id: i32,
+}
+
+// Result of grid_move: the distance actually moved per axis (same sign as the
+// request) and which axes were blocked.
+struct MoveResult {
+    dx: f64, dy: f64, dz: f64,
+    hit_x: bool, hit_y: bool, hit_z: bool,
+}
+
+// ------------------------------------------------------------------ Scalars
+
+fn deg_to_rad(d: f64) -> f64 { return d * (math.PI() / 180.0) }
+
+// floor(x) as i32, saturating at +-2^30 (NaN -> 0). A plain `as i32` of an
+// out-of-range float would abort.
+fn floor_i(x: f64) -> i32 {
+    if x != x { return 0 }
+    var f: f64 = math.floor(x)
+    if f > 1073741823.0 { f = 1073741823.0 }
+    if f < -1073741824.0 { f = -1073741824.0 }
+    return f as i32
+}
+
+// Division rounding toward -infinity. b must be > 0 (not checked beyond b != 0).
+fn floor_div(a: i32, b: i32) -> i32 {
+    var q: i32 = a / b
+    if a % b != 0 {
+        if (a < 0) != (b < 0) { q = q - 1 }
+    }
+    return q
+}
+
+// The matching modulo: result in [0, b) for b > 0.
+fn floor_mod(a: i32, b: i32) -> i32 {
+    return a - floor_div(a, b) * b
+}
+
+// Block coordinate -> chunk / section coordinate (16 blocks), and the position inside it.
+fn chunk_of(v: i32) -> i32 { return floor_div(v, 16) }
+fn local_of(v: i32) -> i32 { return floor_mod(v, 16) }
+
+// Index of a block inside its section: (y*16 + z)*16 + x with local coordinates.
+fn local_index(x: i32, y: i32, z: i32) -> usize {
+    return ((local_of(y) * 16 + local_of(z)) * 16 + local_of(x)) as usize
+}
+
+// Section index of a block height: (y - min_y) / 16 rounded down (min_y = -64 in 1.20.1).
+fn section_of_y(y: i32, min_y: i32) -> i32 { return floor_div(y - min_y, 16) }
+
+// ------------------------------------------------------------------ Vec3 / IVec3
+
+fn v3(x: f64, y: f64, z: f64) -> Vec3 { return Vec3 { x: x, y: y, z: z } }
+fn v3_add(a: Vec3, b: Vec3) -> Vec3 { return Vec3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z } }
+fn v3_sub(a: Vec3, b: Vec3) -> Vec3 { return Vec3 { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z } }
+fn v3_scale(a: Vec3, s: f64) -> Vec3 { return Vec3 { x: a.x * s, y: a.y * s, z: a.z * s } }
+fn v3_dot(a: Vec3, b: Vec3) -> f64 { return a.x * b.x + a.y * b.y + a.z * b.z }
+fn v3_len(a: Vec3) -> f64 { return math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z) }
+fn v3_lerp(a: Vec3, b: Vec3, t: f64) -> Vec3 {
+    return Vec3 { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, z: a.z + (b.z - a.z) * t }
+}
+fn v3_cross(a: Vec3, b: Vec3) -> Vec3 {
+    return Vec3 {
+        x: a.y * b.z - a.z * b.y,
+        y: a.z * b.x - a.x * b.z,
+        z: a.x * b.y - a.y * b.x,
+    }
+}
+// Unit vector; the zero vector (and NaN) stays zero.
+fn v3_normalize(a: Vec3) -> Vec3 {
+    let l: f64 = math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z)
+    if !(l > 0.0) { return Vec3 { x: 0.0, y: 0.0, z: 0.0 } }
+    return Vec3 { x: a.x / l, y: a.y / l, z: a.z / l }
+}
+
+// Pointer forms (o may alias a or b).
+fn v3_add_to(o: *mut Vec3, a: *mut Vec3, b: *mut Vec3) {
+    (*o).x = (*a).x + (*b).x
+    (*o).y = (*a).y + (*b).y
+    (*o).z = (*a).z + (*b).z
+}
+fn v3_sub_to(o: *mut Vec3, a: *mut Vec3, b: *mut Vec3) {
+    (*o).x = (*a).x - (*b).x
+    (*o).y = (*a).y - (*b).y
+    (*o).z = (*a).z - (*b).z
+}
+fn v3_scale_to(o: *mut Vec3, a: *mut Vec3, s: f64) {
+    (*o).x = (*a).x * s
+    (*o).y = (*a).y * s
+    (*o).z = (*a).z * s
+}
+fn v3_cross_to(o: *mut Vec3, a: *mut Vec3, b: *mut Vec3) {
+    let x: f64 = (*a).y * (*b).z - (*a).z * (*b).y
+    let y: f64 = (*a).z * (*b).x - (*a).x * (*b).z
+    let z: f64 = (*a).x * (*b).y - (*a).y * (*b).x
+    (*o).x = x
+    (*o).y = y
+    (*o).z = z
+}
+fn v3_normalize_to(o: *mut Vec3, a: *mut Vec3) {
+    let l: f64 = math.sqrt((*a).x * (*a).x + (*a).y * (*a).y + (*a).z * (*a).z)
+    if !(l > 0.0) {
+        (*o).x = 0.0
+        (*o).y = 0.0
+        (*o).z = 0.0
+        return
+    }
+    (*o).x = (*a).x / l
+    (*o).y = (*a).y / l
+    (*o).z = (*a).z / l
+}
+
+fn iv3(x: i32, y: i32, z: i32) -> IVec3 { return IVec3 { x: x, y: y, z: z } }
+fn iv3_add(a: IVec3, b: IVec3) -> IVec3 { return IVec3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z } }
+fn iv3_sub(a: IVec3, b: IVec3) -> IVec3 { return IVec3 { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z } }
+// The block containing a point.
+fn iv3_floor(a: Vec3) -> IVec3 { return IVec3 { x: floor_i(a.x), y: floor_i(a.y), z: floor_i(a.z) } }
+// Block position -> chunk / section position, and -> position inside the section.
+fn iv3_chunk(a: IVec3) -> IVec3 { return IVec3 { x: chunk_of(a.x), y: chunk_of(a.y), z: chunk_of(a.z) } }
+fn iv3_local(a: IVec3) -> IVec3 { return IVec3 { x: local_of(a.x), y: local_of(a.y), z: local_of(a.z) } }
+
+// ------------------------------------------------------------------ Aabb
+
+fn aabb_new(x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> Aabb {
+    return Aabb { x0: x0, y0: y0, z0: z0, x1: x1, y1: y1, z1: z1 }
+}
+
+// The unit box of block (x, y, z).
+fn aabb_block(x: i32, y: i32, z: i32) -> Aabb {
+    return Aabb {
+        x0: x as f64, y0: y as f64, z0: z as f64,
+        x1: (x + 1) as f64, y1: (y + 1) as f64, z1: (z + 1) as f64,
+    }
+}
+
+// True iff the boxes share volume (touching faces: false).
+fn aabb_overlap(a: *mut Aabb, b: *mut Aabb) -> bool {
+    return (*a).x0 < (*b).x1 && (*b).x0 < (*a).x1 &&
+        (*a).y0 < (*b).y1 && (*b).y0 < (*a).y1 &&
+        (*a).z0 < (*b).z1 && (*b).z0 < (*a).z1
+}
+
+// o = smallest box that contains a and b (o may alias a or b).
+fn aabb_union_to(o: *mut Aabb, a: *mut Aabb, b: *mut Aabb) {
+    (*o).x0 = math.fmin((*a).x0, (*b).x0)
+    (*o).y0 = math.fmin((*a).y0, (*b).y0)
+    (*o).z0 = math.fmin((*a).z0, (*b).z0)
+    (*o).x1 = math.fmax((*a).x1, (*b).x1)
+    (*o).y1 = math.fmax((*a).y1, (*b).y1)
+    (*o).z1 = math.fmax((*a).z1, (*b).z1)
+}
+
+// Point inside (min inclusive, max exclusive).
+fn aabb_contains(a: *mut Aabb, x: f64, y: f64, z: f64) -> bool {
+    return x >= (*a).x0 && x < (*a).x1 && y >= (*a).y0 && y < (*a).y1 && z >= (*a).z0 && z < (*a).z1
+}
+
+fn aabb_offset(a: *mut Aabb, dx: f64, dy: f64, dz: f64) {
+    (*a).x0 = (*a).x0 + dx
+    (*a).x1 = (*a).x1 + dx
+    (*a).y0 = (*a).y0 + dy
+    (*a).y1 = (*a).y1 + dy
+    (*a).z0 = (*a).z0 + dz
+    (*a).z1 = (*a).z1 + dz
+}
+
+// Grow by d on every side of each axis (negative d shrinks).
+fn aabb_expand(a: *mut Aabb, dx: f64, dy: f64, dz: f64) {
+    (*a).x0 = (*a).x0 - dx
+    (*a).x1 = (*a).x1 + dx
+    (*a).y0 = (*a).y0 - dy
+    (*a).y1 = (*a).y1 + dy
+    (*a).z0 = (*a).z0 - dz
+    (*a).z1 = (*a).z1 + dz
+}
+
+// ------------------------------------------------------------------ Ray / box
+
+// Distance t >= 0 (in units of the direction vector) where the ray o + t*d
+// ENTERS the box; 0.0 if the origin is inside; -1.0 if the ray misses it (also
+// if the box lies behind the origin, or d is the zero vector and o is outside).
+fn ray_aabb(ox: f64, oy: f64, oz: f64, dx: f64, dy: f64, dz: f64, b: *mut Aabb) -> f64 {
+    var tmin: f64 = 0.0
+    var tmax: f64 = math.INF()
+    // x slab
+    if dx == 0.0 {
+        if ox < (*b).x0 || ox >= (*b).x1 { return -1.0 }
+    } else {
+        var t0: f64 = ((*b).x0 - ox) / dx
+        var t1: f64 = ((*b).x1 - ox) / dx
+        if t0 > t1 {
+            let s: f64 = t0
+            t0 = t1
+            t1 = s
+        }
+        if t0 > tmin { tmin = t0 }
+        if t1 < tmax { tmax = t1 }
+        if tmin > tmax { return -1.0 }
+    }
+    if dy == 0.0 {
+        if oy < (*b).y0 || oy >= (*b).y1 { return -1.0 }
+    } else {
+        var t0: f64 = ((*b).y0 - oy) / dy
+        var t1: f64 = ((*b).y1 - oy) / dy
+        if t0 > t1 {
+            let s: f64 = t0
+            t0 = t1
+            t1 = s
+        }
+        if t0 > tmin { tmin = t0 }
+        if t1 < tmax { tmax = t1 }
+        if tmin > tmax { return -1.0 }
+    }
+    if dz == 0.0 {
+        if oz < (*b).z0 || oz >= (*b).z1 { return -1.0 }
+    } else {
+        var t0: f64 = ((*b).z0 - oz) / dz
+        var t1: f64 = ((*b).z1 - oz) / dz
+        if t0 > t1 {
+            let s: f64 = t0
+            t0 = t1
+            t1 = s
+        }
+        if t0 > tmin { tmin = t0 }
+        if t1 < tmax { tmax = t1 }
+        if tmin > tmax { return -1.0 }
+    }
+    return tmin
+}
+
+// ------------------------------------------------------------------ BlockGrid
+
+fn grid_view(ox: i32, oy: i32, oz: i32, nx: i32, ny: i32, nz: i32, ids: u64, solid: u64,
+             nsolid: u32, outside_solid: bool) -> BlockGrid {
+    return BlockGrid {
+        ox: ox, oy: oy, oz: oz, nx: nx, ny: ny, nz: nz,
+        ids: ids, solid: solid, nsolid: nsolid, outside_solid: outside_solid,
+    }
+}
+
+// The block id at world position (x, y, z); -1 outside the box.
+fn grid_id(g: *mut BlockGrid, x: i32, y: i32, z: i32) -> i32 {
+    let lx: i32 = x - (*g).ox
+    let ly: i32 = y - (*g).oy
+    let lz: i32 = z - (*g).oz
+    if lx < 0 || ly < 0 || lz < 0 || lx >= (*g).nx || ly >= (*g).ny || lz >= (*g).nz { return -1 }
+    let i: usize = ((ly * (*g).nz + lz) * (*g).nx + lx) as usize
+    return rt.ld16((*g).ids, i) as i32
+}
+
+fn grid_is_solid(g: *mut BlockGrid, x: i32, y: i32, z: i32) -> bool {
+    let id: i32 = grid_id(g, x, y, z)
+    if id < 0 { return (*g).outside_solid }
+    if (id as u32) >= (*g).nsolid { return false }
+    return rt.ld8((*g).solid, id as usize) != 0 as u8
+}
+
+// Voxel raycast (Amanatides & Woo, "A Fast Voxel Traversal Algorithm for Ray
+// Tracing", 1987). Walks the cells the ray o + t*dir passes, t in [0, maxd]
+// (dir is normalised first, so t is a distance in blocks), and returns true
+// with `out` filled at the first solid cell. A solid start cell is a hit at
+// distance 0 with a zero normal. A zero / non-finite direction is a miss.
+// Cells that are exactly touched by an edge or corner are visited in the order
+// x, y, z (ties). Rays that leave a box whose outside is passable stop early.
+fn grid_raycast(g: *mut BlockGrid, ox: f64, oy: f64, oz: f64, dx0: f64, dy0: f64, dz0: f64,
+                maxd: f64, out: *mut RayHit) -> bool {
+    let len: f64 = math.sqrt(dx0 * dx0 + dy0 * dy0 + dz0 * dz0)
+    if !(len > 0.0) || !math.is_finite(len) { return false }
+    if !math.is_finite(ox) || !math.is_finite(oy) || !math.is_finite(oz) { return false }
+    let dx: f64 = dx0 / len
+    let dy: f64 = dy0 / len
+    let dz: f64 = dz0 / len
+    var cx: i32 = floor_i(ox)
+    var cy: i32 = floor_i(oy)
+    var cz: i32 = floor_i(oz)
+    if grid_is_solid(g, cx, cy, cz) {
+        (*out).x = cx
+        (*out).y = cy
+        (*out).z = cz
+        (*out).nx = 0
+        (*out).ny = 0
+        (*out).nz = 0
+        (*out).dist = 0.0
+        (*out).id = grid_id(g, cx, cy, cz)
+        return true
+    }
+    var sx: i32 = 0
+    var sy: i32 = 0
+    var sz: i32 = 0
+    var tdx: f64 = math.INF()
+    var tdy: f64 = math.INF()
+    var tdz: f64 = math.INF()
+    var tmx: f64 = math.INF()
+    var tmy: f64 = math.INF()
+    var tmz: f64 = math.INF()
+    if dx > 0.0 {
+        sx = 1
+        tdx = 1.0 / dx
+        tmx = ((cx + 1) as f64 - ox) / dx
+    } else if dx < 0.0 {
+        sx = -1
+        tdx = -1.0 / dx
+        tmx = (ox - cx as f64) / (0.0 - dx)
+    }
+    if dy > 0.0 {
+        sy = 1
+        tdy = 1.0 / dy
+        tmy = ((cy + 1) as f64 - oy) / dy
+    } else if dy < 0.0 {
+        sy = -1
+        tdy = -1.0 / dy
+        tmy = (oy - cy as f64) / (0.0 - dy)
+    }
+    if dz > 0.0 {
+        sz = 1
+        tdz = 1.0 / dz
+        tmz = ((cz + 1) as f64 - oz) / dz
+    } else if dz < 0.0 {
+        sz = -1
+        tdz = -1.0 / dz
+        tmz = (oz - cz as f64) / (0.0 - dz)
+    }
+    let hx: i32 = (*g).ox + (*g).nx
+    let hy: i32 = (*g).oy + (*g).ny
+    let hz: i32 = (*g).oz + (*g).nz
+    let can_leave: bool = !(*g).outside_solid
+    while true {
+        var axis: i32 = 0
+        var t: f64 = tmx
+        if tmy < t {
+            axis = 1
+            t = tmy
+        }
+        if tmz < t {
+            axis = 2
+            t = tmz
+        }
+        if !(t <= maxd) { return false }
+        var nx: i32 = 0
+        var ny: i32 = 0
+        var nz: i32 = 0
+        if axis == 0 {
+            cx = cx + sx
+            tmx = tmx + tdx
+            nx = 0 - sx
+        } else if axis == 1 {
+            cy = cy + sy
+            tmy = tmy + tdy
+            ny = 0 - sy
+        } else {
+            cz = cz + sz
+            tmz = tmz + tdz
+            nz = 0 - sz
+        }
+        if grid_is_solid(g, cx, cy, cz) {
+            (*out).x = cx
+            (*out).y = cy
+            (*out).z = cz
+            (*out).nx = nx
+            (*out).ny = ny
+            (*out).nz = nz
+            (*out).dist = t
+            (*out).id = grid_id(g, cx, cy, cz)
+            return true
+        }
+        if can_leave {
+            // outside the box on an axis and moving away on it: never comes back
+            if (cx < (*g).ox && sx <= 0) || (cx >= hx && sx >= 0) { return false }
+            if (cy < (*g).oy && sy <= 0) || (cy >= hy && sy >= 0) { return false }
+            if (cz < (*g).oz && sz <= 0) || (cz >= hz && sz >= 0) { return false }
+        }
+    }
+    return false
+}
+
+// Moves `box` by (dx, dy, dz) against the solid blocks of the grid, one axis
+// after the other in the order y, x, z (the order vanilla uses for entities),
+// stopping at the first block face on each axis. Blocks the box already
+// overlaps do not block (no push-out). On the two OTHER axes a block counts as
+// overlapping only if it penetrates by more than 1e-9 (so a box that landed
+// on a floor with a rounding error of one ulp can still slide along it). Block shapes are full unit cubes.
+// `box` itself is not changed; `out` gets the distance moved and blocked axes.
+fn grid_move(g: *mut BlockGrid, b: *mut Aabb, dx: f64, dy: f64, dz: f64, out: *mut MoveResult) {
+    (*out).dx = 0.0
+    (*out).dy = 0.0
+    (*out).dz = 0.0
+    (*out).hit_x = false
+    (*out).hit_y = false
+    (*out).hit_z = false
+    if !math.is_finite(dx) || !math.is_finite(dy) || !math.is_finite(dz) { return }
+    var x0: f64 = (*b).x0
+    var x1: f64 = (*b).x1
+    var y0: f64 = (*b).y0
+    var y1: f64 = (*b).y1
+    var z0: f64 = (*b).z0
+    var z1: f64 = (*b).z1
+    // cell range that can matter: the box swept along the full request
+    let rx0: i32 = floor_i(x0 + math.fmin(dx, 0.0))
+    let rx1: i32 = floor_i(x1 + math.fmax(dx, 0.0))
+    let ry0: i32 = floor_i(y0 + math.fmin(dy, 0.0))
+    let ry1: i32 = floor_i(y1 + math.fmax(dy, 0.0))
+    let rz0: i32 = floor_i(z0 + math.fmin(dz, 0.0))
+    let rz1: i32 = floor_i(z1 + math.fmax(dz, 0.0))
+    // axis 1 = y
+    var d: f64 = dy
+    var cy: i32 = ry0
+    while cy <= ry1 {
+        var cz: i32 = rz0
+        while cz <= rz1 {
+            var cx: i32 = rx0
+            while cx <= rx1 {
+                if grid_is_solid(g, cx, cy, cz) {
+                    let bx0: f64 = cx as f64
+                    let bz0: f64 = cz as f64
+                    if x0 + 1e-9 < bx0 + 1.0 && bx0 + 1e-9 < x1 && z0 + 1e-9 < bz0 + 1.0 && bz0 + 1e-9 < z1 {
+                        let by0: f64 = cy as f64
+                        if d > 0.0 && y1 <= by0 {
+                            d = math.fmin(d, by0 - y1)
+                        } else if d < 0.0 && y0 >= by0 + 1.0 {
+                            d = math.fmax(d, by0 + 1.0 - y0)
+                        }
+                    }
+                }
+                cx = cx + 1
+            }
+            cz = cz + 1
+        }
+        cy = cy + 1
+    }
+    if d != dy { (*out).hit_y = true }
+    (*out).dy = d
+    y0 = y0 + d
+    y1 = y1 + d
+    // axis 0 = x
+    d = dx
+    cy = ry0
+    while cy <= ry1 {
+        var cz: i32 = rz0
+        while cz <= rz1 {
+            var cx: i32 = rx0
+            while cx <= rx1 {
+                if grid_is_solid(g, cx, cy, cz) {
+                    let by0: f64 = cy as f64
+                    let bz0: f64 = cz as f64
+                    if y0 + 1e-9 < by0 + 1.0 && by0 + 1e-9 < y1 && z0 + 1e-9 < bz0 + 1.0 && bz0 + 1e-9 < z1 {
+                        let bx0: f64 = cx as f64
+                        if d > 0.0 && x1 <= bx0 {
+                            d = math.fmin(d, bx0 - x1)
+                        } else if d < 0.0 && x0 >= bx0 + 1.0 {
+                            d = math.fmax(d, bx0 + 1.0 - x0)
+                        }
+                    }
+                }
+                cx = cx + 1
+            }
+            cz = cz + 1
+        }
+        cy = cy + 1
+    }
+    if d != dx { (*out).hit_x = true }
+    (*out).dx = d
+    x0 = x0 + d
+    x1 = x1 + d
+    // axis 2 = z
+    d = dz
+    cy = ry0
+    while cy <= ry1 {
+        var cz: i32 = rz0
+        while cz <= rz1 {
+            var cx: i32 = rx0
+            while cx <= rx1 {
+                if grid_is_solid(g, cx, cy, cz) {
+                    let by0: f64 = cy as f64
+                    let bx0: f64 = cx as f64
+                    if y0 + 1e-9 < by0 + 1.0 && by0 + 1e-9 < y1 && x0 + 1e-9 < bx0 + 1.0 && bx0 + 1e-9 < x1 {
+                        let bz0: f64 = cz as f64
+                        if d > 0.0 && z1 <= bz0 {
+                            d = math.fmin(d, bz0 - z1)
+                        } else if d < 0.0 && z0 >= bz0 + 1.0 {
+                            d = math.fmax(d, bz0 + 1.0 - z0)
+                        }
+                    }
+                }
+                cx = cx + 1
+            }
+            cz = cz + 1
+        }
+        cy = cy + 1
+    }
+    if d != dz { (*out).hit_z = true }
+    (*out).dz = d
+}
+
+// ------------------------------------------------------------------ Mat4
+
+fn mat4_identity(o: *mut Mat4) {
+    var i: usize = 0
+    while i < 16 {
+        (*o).m[i] = 0.0
+        i = i + 1
+    }
+    (*o).m[0] = 1.0
+    (*o).m[5] = 1.0
+    (*o).m[10] = 1.0
+    (*o).m[15] = 1.0
+}
+
+// o = a * b (apply b first, then a, for column vectors). o may alias a or b.
+fn mat4_mul(o: *mut Mat4, a: *mut Mat4, b: *mut Mat4) {
+    var t: [f64; 16] = [0.0; 16]
+    var c: usize = 0
+    while c < 4 {
+        var r: usize = 0
+        while r < 4 {
+            t[c * 4 + r] = (*a).m[r] * (*b).m[c * 4] + (*a).m[4 + r] * (*b).m[c * 4 + 1] +
+                (*a).m[8 + r] * (*b).m[c * 4 + 2] + (*a).m[12 + r] * (*b).m[c * 4 + 3]
+            r = r + 1
+        }
+        c = c + 1
+    }
+    var i: usize = 0
+    while i < 16 {
+        (*o).m[i] = t[i]
+        i = i + 1
+    }
+}
+
+fn mat4_translation(o: *mut Mat4, x: f64, y: f64, z: f64) {
+    mat4_identity(o)
+    (*o).m[12] = x
+    (*o).m[13] = y
+    (*o).m[14] = z
+}
+
+fn mat4_scaling(o: *mut Mat4, x: f64, y: f64, z: f64) {
+    mat4_identity(o)
+    (*o).m[0] = x
+    (*o).m[5] = y
+    (*o).m[10] = z
+}
+
+// Right-handed rotations by `a` radians (counter-clockwise looking against the axis).
+fn mat4_rotation_x(o: *mut Mat4, a: f64) {
+    let c: f64 = math.cos(a)
+    let s: f64 = math.sin(a)
+    mat4_identity(o)
+    (*o).m[5] = c
+    (*o).m[6] = s
+    (*o).m[9] = 0.0 - s
+    (*o).m[10] = c
+}
+
+fn mat4_rotation_y(o: *mut Mat4, a: f64) {
+    let c: f64 = math.cos(a)
+    let s: f64 = math.sin(a)
+    mat4_identity(o)
+    (*o).m[0] = c
+    (*o).m[2] = 0.0 - s
+    (*o).m[8] = s
+    (*o).m[10] = c
+}
+
+fn mat4_rotation_z(o: *mut Mat4, a: f64) {
+    let c: f64 = math.cos(a)
+    let s: f64 = math.sin(a)
+    mat4_identity(o)
+    (*o).m[0] = c
+    (*o).m[1] = s
+    (*o).m[4] = 0.0 - s
+    (*o).m[5] = c
+}
+
+// Perspective projection, camera looking down -z. fovy in radians (vertical),
+// aspect = width / height. zero_to_one = false: OpenGL clip depth [-1, 1];
+// true: Vulkan / D3D / Metal clip depth [0, 1]. Needs 0 < near < far, fovy in (0, pi).
+fn mat4_perspective(o: *mut Mat4, fovy: f64, aspect: f64, near: f64, far: f64, zero_to_one: bool) {
+    let f: f64 = 1.0 / math.tan(fovy * 0.5)
+    var i: usize = 0
+    while i < 16 {
+        (*o).m[i] = 0.0
+        i = i + 1
+    }
+    (*o).m[0] = f / aspect
+    (*o).m[5] = f
+    (*o).m[11] = -1.0
+    if zero_to_one {
+        (*o).m[10] = far / (near - far)
+        (*o).m[14] = far * near / (near - far)
+    } else {
+        (*o).m[10] = (far + near) / (near - far)
+        (*o).m[14] = 2.0 * far * near / (near - far)
+    }
+}
+
+// View matrix: eye at (ex,ey,ez), looking at (cx,cy,cz), `up` roughly (ux,uy,uz).
+// Degenerate input (eye == center, up parallel to the view direction) gives the
+// identity rotation part for the broken axis (no NaN).
+fn mat4_look_at(o: *mut Mat4, ex: f64, ey: f64, ez: f64, cx: f64, cy: f64, cz: f64,
+                ux: f64, uy: f64, uz: f64) {
+    var f: Vec3 = v3(cx - ex, cy - ey, cz - ez)
+    v3_normalize_to(&f, &f)
+    var up: Vec3 = v3(ux, uy, uz)
+    var s: Vec3 = v3(0.0, 0.0, 0.0)
+    v3_cross_to(&s, &f, &up)
+    v3_normalize_to(&s, &s)
+    var u: Vec3 = v3(0.0, 0.0, 0.0)
+    v3_cross_to(&u, &s, &f)
+    mat4_identity(o)
+    (*o).m[0] = s.x
+    (*o).m[4] = s.y
+    (*o).m[8] = s.z
+    (*o).m[1] = u.x
+    (*o).m[5] = u.y
+    (*o).m[9] = u.z
+    (*o).m[2] = 0.0 - f.x
+    (*o).m[6] = 0.0 - f.y
+    (*o).m[10] = 0.0 - f.z
+    (*o).m[12] = 0.0 - (s.x * ex + s.y * ey + s.z * ez)
+    (*o).m[13] = 0.0 - (u.x * ex + u.y * ey + u.z * ez)
+    (*o).m[14] = f.x * ex + f.y * ey + f.z * ez
+}
+
+fn mat4_transpose(o: *mut Mat4, a: *mut Mat4) {
+    var t: [f64; 16] = [0.0; 16]
+    var c: usize = 0
+    while c < 4 {
+        var r: usize = 0
+        while r < 4 {
+            t[r * 4 + c] = (*a).m[c * 4 + r]
+            r = r + 1
+        }
+        c = c + 1
+    }
+    var i: usize = 0
+    while i < 16 {
+        (*o).m[i] = t[i]
+        i = i + 1
+    }
+}
+
+// o = a^-1 by Gauss-Jordan with partial pivoting. Returns false (and leaves o
+// unchanged) if a is singular (a pivot below 1e-13 times the largest element,
+// i.e. a condition number of about 1e13 or worse) or contains NaN.
+fn mat4_invert(o: *mut Mat4, a: *mut Mat4) -> bool {
+    var w: [f64; 16] = [0.0; 16]
+    var inv: [f64; 16] = [0.0; 16]
+    var i: usize = 0
+    while i < 16 {
+        w[i] = (*a).m[i]
+        i = i + 1
+    }
+    inv[0] = 1.0
+    inv[5] = 1.0
+    inv[10] = 1.0
+    inv[15] = 1.0
+    var scale: f64 = 0.0
+    i = 0
+    while i < 16 {
+        scale = math.fmax(scale, math.fabs(w[i]))
+        i = i + 1
+    }
+    let tiny: f64 = scale * 1e-13
+    var col: usize = 0
+    while col < 4 {
+        // pivot row = largest |w[row][col]| for row >= col
+        var piv: usize = col
+        var best: f64 = math.fabs(w[col * 4 + col])
+        var r: usize = col + 1
+        while r < 4 {
+            let v: f64 = math.fabs(w[col * 4 + r])
+            if v > best {
+                best = v
+                piv = r
+            }
+            r = r + 1
+        }
+        if !(best > tiny) || !(best > 1e-300) { return false }
+        if piv != col {
+            var c: usize = 0
+            while c < 4 {
+                let t1: f64 = w[c * 4 + col]
+                w[c * 4 + col] = w[c * 4 + piv]
+                w[c * 4 + piv] = t1
+                let t2: f64 = inv[c * 4 + col]
+                inv[c * 4 + col] = inv[c * 4 + piv]
+                inv[c * 4 + piv] = t2
+                c = c + 1
+            }
+        }
+        let p: f64 = w[col * 4 + col]
+        var c2: usize = 0
+        while c2 < 4 {
+            w[c2 * 4 + col] = w[c2 * 4 + col] / p
+            inv[c2 * 4 + col] = inv[c2 * 4 + col] / p
+            c2 = c2 + 1
+        }
+        var rr: usize = 0
+        while rr < 4 {
+            if rr != col {
+                let fct: f64 = w[col * 4 + rr]
+                if fct != 0.0 {
+                    var c3: usize = 0
+                    while c3 < 4 {
+                        w[c3 * 4 + rr] = w[c3 * 4 + rr] - fct * w[c3 * 4 + col]
+                        inv[c3 * 4 + rr] = inv[c3 * 4 + rr] - fct * inv[c3 * 4 + col]
+                        c3 = c3 + 1
+                    }
+                }
+            }
+            rr = rr + 1
+        }
+        col = col + 1
+    }
+    var k: usize = 0
+    while k < 16 {
+        if inv[k] != inv[k] { return false }
+        k = k + 1
+    }
+    k = 0
+    while k < 16 {
+        (*o).m[k] = inv[k]
+        k = k + 1
+    }
+    return true
+}
+
+// out = M * (x, y, z, 1) with the perspective divide NOT applied; writes 4 f64.
+fn mat4_transform_point(a: *mut Mat4, x: f64, y: f64, z: f64, out: *mut Vec3) -> f64 {
+    let m: *mut Mat4 = a
+    let rx: f64 = (*m).m[0] * x + (*m).m[4] * y + (*m).m[8] * z + (*m).m[12]
+    let ry: f64 = (*m).m[1] * x + (*m).m[5] * y + (*m).m[9] * z + (*m).m[13]
+    let rz: f64 = (*m).m[2] * x + (*m).m[6] * y + (*m).m[10] * z + (*m).m[14]
+    let rw: f64 = (*m).m[3] * x + (*m).m[7] * y + (*m).m[11] * z + (*m).m[15]
+    (*out).x = rx
+    (*out).y = ry
+    (*out).z = rz
+    return rw
+}
+
+// out = M * (x, y, z, 0): rotation / scale only, no translation.
+fn mat4_transform_dir(a: *mut Mat4, x: f64, y: f64, z: f64, out: *mut Vec3) {
+    let rx: f64 = (*a).m[0] * x + (*a).m[4] * y + (*a).m[8] * z
+    let ry: f64 = (*a).m[1] * x + (*a).m[5] * y + (*a).m[9] * z
+    let rz: f64 = (*a).m[2] * x + (*a).m[6] * y + (*a).m[10] * z
+    (*out).x = rx
+    (*out).y = ry
+    (*out).z = rz
+}
+
+// Writes the 16 elements as f32 (column-major, the layout of a GPU uniform) to
+// the address `dst` (64 bytes).
+fn mat4_to_f32(a: *mut Mat4, dst: u64) {
+    var i: usize = 0
+    while i < 16 {
+        *((dst + (i as u64) * 4) as *mut f32) = (*a).m[i] as f32
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------------ Frustum
+
+// Gribb & Hartmann: the planes are sums / differences of the rows of the
+// view-projection matrix. zero_to_one must match the projection (the near plane
+// differs). Planes are normalised so distances are in world units.
+fn frustum_from_matrix(f: *mut Frustum, vp: *mut Mat4, zero_to_one: bool) {
+    var k: usize = 0
+    while k < 6 {
+        var a: f64 = 0.0
+        var b: f64 = 0.0
+        var c: f64 = 0.0
+        var d: f64 = 0.0
+        // rows: r(i) = (m[i], m[4+i], m[8+i], m[12+i])
+        if k == 0 {
+            a = (*vp).m[3] + (*vp).m[0]
+            b = (*vp).m[7] + (*vp).m[4]
+            c = (*vp).m[11] + (*vp).m[8]
+            d = (*vp).m[15] + (*vp).m[12]
+        } else if k == 1 {
+            a = (*vp).m[3] - (*vp).m[0]
+            b = (*vp).m[7] - (*vp).m[4]
+            c = (*vp).m[11] - (*vp).m[8]
+            d = (*vp).m[15] - (*vp).m[12]
+        } else if k == 2 {
+            a = (*vp).m[3] + (*vp).m[1]
+            b = (*vp).m[7] + (*vp).m[5]
+            c = (*vp).m[11] + (*vp).m[9]
+            d = (*vp).m[15] + (*vp).m[13]
+        } else if k == 3 {
+            a = (*vp).m[3] - (*vp).m[1]
+            b = (*vp).m[7] - (*vp).m[5]
+            c = (*vp).m[11] - (*vp).m[9]
+            d = (*vp).m[15] - (*vp).m[13]
+        } else if k == 4 {
+            if zero_to_one {
+                a = (*vp).m[2]
+                b = (*vp).m[6]
+                c = (*vp).m[10]
+                d = (*vp).m[14]
+            } else {
+                a = (*vp).m[3] + (*vp).m[2]
+                b = (*vp).m[7] + (*vp).m[6]
+                c = (*vp).m[11] + (*vp).m[10]
+                d = (*vp).m[15] + (*vp).m[14]
+            }
+        } else {
+            a = (*vp).m[3] - (*vp).m[2]
+            b = (*vp).m[7] - (*vp).m[6]
+            c = (*vp).m[11] - (*vp).m[10]
+            d = (*vp).m[15] - (*vp).m[14]
+        }
+        let l: f64 = math.sqrt(a * a + b * b + c * c)
+        if l > 0.0 {
+            a = a / l
+            b = b / l
+            c = c / l
+            d = d / l
+        }
+        (*f).p[k * 4] = a
+        (*f).p[k * 4 + 1] = b
+        (*f).p[k * 4 + 2] = c
+        (*f).p[k * 4 + 3] = d
+        k = k + 1
+    }
+}
+
+// Box [x0,x1] x [y0,y1] x [z0,z1] against the frustum: 0 = completely outside,
+// 1 = intersecting (or possibly intersecting: the test is conservative, a box
+// near a frustum edge that touches no plane's inside can still report 1),
+// 2 = completely inside. Never reports 0 for a box that has a point inside.
+fn frustum_test_box(f: *mut Frustum, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> i32 {
+    var all_in: bool = true
+    var k: usize = 0
+    while k < 6 {
+        let a: f64 = (*f).p[k * 4]
+        let b: f64 = (*f).p[k * 4 + 1]
+        let c: f64 = (*f).p[k * 4 + 2]
+        let d: f64 = (*f).p[k * 4 + 3]
+        var px: f64 = x0
+        var nx: f64 = x1
+        if a >= 0.0 {
+            px = x1
+            nx = x0
+        }
+        var py: f64 = y0
+        var ny: f64 = y1
+        if b >= 0.0 {
+            py = y1
+            ny = y0
+        }
+        var pz: f64 = z0
+        var nz: f64 = z1
+        if c >= 0.0 {
+            pz = z1
+            nz = z0
+        }
+        if a * px + b * py + c * pz + d < 0.0 { return 0 }
+        if a * nx + b * ny + c * nz + d < 0.0 { all_in = false }
+        k = k + 1
+    }
+    if all_in { return 2 }
+    return 1
+}
+
+fn frustum_test_aabb(f: *mut Frustum, b: *mut Aabb) -> i32 {
+    return frustum_test_box(f, (*b).x0, (*b).y0, (*b).z0, (*b).x1, (*b).y1, (*b).z1)
+}
+
+// Sphere: 0 outside, 1 intersecting, 2 inside.
+fn frustum_test_sphere(f: *mut Frustum, cx: f64, cy: f64, cz: f64, r: f64) -> i32 {
+    var all_in: bool = true
+    var k: usize = 0
+    while k < 6 {
+        let dist: f64 = (*f).p[k * 4] * cx + (*f).p[k * 4 + 1] * cy + (*f).p[k * 4 + 2] * cz + (*f).p[k * 4 + 3]
+        if dist < 0.0 - r { return 0 }
+        if dist < r { all_in = false }
+        k = k + 1
+    }
+    if all_in { return 2 }
+    return 1
+}
+
+// The 16^3 box of chunk column (cx, cz) and section index sy (min_y = lowest
+// world height, -64 in 1.20.1).
+fn frustum_test_section(f: *mut Frustum, cx: i32, sy: i32, cz: i32, min_y: i32) -> i32 {
+    let x0: f64 = (cx * 16) as f64
+    let y0: f64 = (min_y + sy * 16) as f64
+    let z0: f64 = (cz * 16) as f64
+    return frustum_test_box(f, x0, y0, z0, x0 + 16.0, y0 + 16.0, z0 + 16.0)
+}
