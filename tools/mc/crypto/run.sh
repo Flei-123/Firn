@@ -14,6 +14,14 @@ export FIRNLIB="$(pwd)/lib"
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 ERR=0
+# RSA test keys: generated here with openssl (fresh per run, inside the temp dir, removed on exit)
+# so no stage depends on files left over from another stage or on a manual setup step.
+mkdir -p "$W/keys"
+for bits in 512 1024 2048 3072 4096; do
+    if ! openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:$bits -out "$W/keys/priv$bits.pem" 2>/dev/null; then
+        echo "  FAIL  openssl cannot generate a $bits bit RSA key"; echo "RESULT mc-crypto: FAIL"; exit 1
+    fi
+done
 for stage in "" "--no-opt" "--opt-level=dev-fast"; do
     name=${stage:-release-fast}
     echo "== build stage: $name =="
@@ -21,6 +29,7 @@ for stage in "" "--no-opt" "--opt-level=dev-fast"; do
         echo "  FAIL  xcheck.fi does not compile [$name]"; head -10 "$W/err"; ERR=1; continue
     fi
     mkdir -p "$W/t"
+    cp "$W"/keys/priv*.pem "$W/t/"
     node --security-revert=CVE-2023-46809 tools/mc/crypto/check.js "$W/xcheck" "$W/t" >"$W/node.out" 2>&1
     rc=$?
     grep -v "SECURITY WARNING" "$W/node.out"

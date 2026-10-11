@@ -130,8 +130,13 @@ EOF
   for gr in "randomTickSpeed 0" "doFireTick false" "doMobSpawning false" "doWeatherCycle false" "doDaylightCycle false" "doTraderSpawning false" "doPatrolSpawning false" "doInsomnia false"; do
     echo "gamerule $gr" >&3
   done
+  # 1.21.11 / 26.x renamed the game rules to snake_case; unknown names only print an error, so both are sent
+  for gr in "random_tick_speed 0" "fire_spread_radius_around_player 0" "spawn_mobs false" "advance_weather false" "advance_time false" "spawn_traders false" "spawn_patrols false" "spawn_phantoms false"; do
+    echo "gamerule $gr" >&3
+  done
   if [ "$LEGACY" -eq 1 ]; then sleep 3; else
-    for i in $(seq 1 20); do grep -q 'Gamerule doInsomnia is now set' "$W/server.log" && break; sleep 0.5; done
+    for i in $(seq 1 20); do grep -qE 'Gamerule (doInsomnia|spawn_phantoms) is now set' "$W/server.log" && break; sleep 0.5; done
+    sleep 2
   fi
   
 fi
@@ -164,7 +169,7 @@ run_firn() { # label
   timeout 150 "$BIN" 127.0.0.1 "$PORT" "$NAME" "$W/out/$label.dump" "$VIEW" "$IDLE" "$PROTO" > "$W/out/$label.metrics" 2> "$W/out/$label.err"
   local rc=$?
   [ -s "$W/out/$label.err" ] && { echo "  stderr of $label:"; head -3 "$W/out/$label.err" | sed 's/^/    /'; }
-  [ $rc -eq 0 ] || { echo "run.sh: Firn client $label failed (rc $rc)" >&2; return 1; }
+  [ $rc -eq 0 ] || { echo "run.sh: Firn client $label failed (rc $rc)" >&2; head -5 "$W/out/$label.metrics" | sed 's/^/    /' >&2; return 1; }
   wait_left
 }
 

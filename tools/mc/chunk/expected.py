@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # Computes the dump that demos/mcclient/selftest.fi must print, from the same
 # LCG, with an independent implementation of packing, FNV-1a 64 and SHA-256.
-# Usage: python3 -I unit_expected.py
+# Usage: python3 -I expected.py [map]    ("map" = the 1.21.5+ shape, protocol 775 in the header)
 import hashlib
+import sys
 
 state = 12345
 
@@ -56,7 +57,7 @@ light = bytes(nxt() % 256 for _ in range(3 * 2048))
 
 x, z = -3, 7
 out = []
-out.append("mcdump 1\nprotocol 763\nchunks 1\n")
+out.append("mcdump 1\nprotocol %d\nchunks 1\n" % (775 if len(sys.argv) > 1 else 763))
 out.append("C %d %d sections=%d blockentities=%d\n" % (x, z, len(sections), 2))
 for i, (cnt, blocks, biomes) in enumerate(sections):
     out.append("S %d %d %d count=%d distinct=%d blocks=%016x biomes=%016x\n" % (

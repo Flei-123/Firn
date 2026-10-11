@@ -27,6 +27,14 @@ for stage in "" "--no-opt" "--opt-level=dev-fast"; do
     else
         echo "  FAIL  $name: dump differs"; diff "$W/got.txt" "$W/want.txt" | head -10; ERR=1
     fi
+    # the 1.21.5+ shape: heightmaps as a varint keyed map, nameless NBT roots (FLAG_HM_MAP)
+    "$W/selftest" map > "$W/got_m.txt" 2>"$W/stderr"
+    python3 -I tools/mc/chunk/expected.py map > "$W/want_m.txt"
+    if cmp -s "$W/got_m.txt" "$W/want_m.txt" && [ -s "$W/got_m.txt" ]; then
+        echo "  ok    $name: 1.21.5+ heightmap map shape == independent python dump"
+    else
+        echo "  FAIL  $name: 1.21.5+ map shape dump differs"; diff "$W/got_m.txt" "$W/want_m.txt" | head -10; ERR=1
+    fi
 done
 # counter-check: a one-bit change in the expectation must be detected
 sed 's/blocks=\([0-9a-f]\)/blocks=0\1/' "$W/want.txt" > "$W/bad.txt"

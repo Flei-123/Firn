@@ -161,6 +161,9 @@ class Reader {
   }
 }
 
+// 1.21.5+ (protocol 770): a paletted container has no data array length any more (derived from the bits per entry).
+const NO_LEN = Number(process.env.MC_PROTOCOL || 0) >= 770
+
 // One paletted container. kind 'blocks' (4096, indirect 4..8) or 'biomes' (64, indirect 1..3).
 // Returns array of global ids.
 function readContainer (r, kind) {
@@ -170,7 +173,7 @@ function readContainer (r, kind) {
   let bits = r.u8()
   if (bits === 0) {
     const v = r.varint()
-    const len = r.varint()
+    const len = NO_LEN ? 0 : r.varint()
     if (len !== 0) throw new Error('single-value container with data')
     return new Array(count).fill(v)
   }
@@ -181,8 +184,8 @@ function readContainer (r, kind) {
     palette = new Array(n)
     for (let i = 0; i < n; i++) palette[i] = r.varint()
   }
-  const nl = r.varint()
   const per = Math.floor(64 / bits)
+  const nl = NO_LEN ? Math.ceil(count / per) : r.varint()
   if (nl !== Math.ceil(count / per)) throw new Error(`container long count ${nl} != ${Math.ceil(count / per)} (bits ${bits})`)
   const ids = unpackLongs(r.longs(nl), bits, count)
   if (palette) {
@@ -402,6 +405,10 @@ function decodeChunk (p, numSections) {
     if (!e || e.type !== 'longArray') continue
     hm.push({ name, hash: hashU16(heightmapValues(e.value)) })
   }
+  if (Array.isArray(root)) {
+    // 1.21.5+: heightmaps = [{ type: 'motion_blocking', data: [[hi, lo], ...] }, ...] (protodef mapper names)
+    for (const e of root) hm.push({ name: String(e.type).toUpperCase(), hash: hashU16(heightmapValues(e.data)) })
+  }
   hm.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
   const f = new Fnv64()
   for (const arr of [...p.skyLight, ...p.blockLight]) for (const b of arr) f.byte(b)
@@ -444,6 +451,33 @@ function main () {
   const viewDistance = parseInt(vdS || '4', 10)
   const idleMs = parseInt(idleS || '2500', 10)
   const mc = require('minecraft-protocol')
+  // lpVec3 (1.21.9+ low precision vector) is unknown to node-minecraft-protocol 1.54: a reader written from the
+  // public format description (u8 a; a == 0 -> zero vector; else u8 + u32 + varint when bit 2 of a is set)
+  // is registered in its protodef compiler. Same type as tools/mcgen/gen_fixtures.cjs; the value is not used.
+  {
+    const cm = require('minecraft-protocol/src/datatypes/compiler-minecraft')
+    const varintSize = (v) => { v >>>= 0; let n = 1; while (v >= 0x80) { n++; v >>>= 7 } return n }
+    cm.Read.lpVec3 = ['native', (buffer, offset) => {
+      const lowest = buffer.readUInt8(offset)
+      if (lowest === 0) return { value: { lowest, middle: 0, highest: 0, ext: 0 }, size: 1 }
+      const middle = buffer.readUInt8(offset + 1)
+      const highest = buffer.readUInt32BE(offset + 2)
+      let size = 6
+      let ext = 0
+      if ((lowest & 4) !== 0) {
+        let shift = 0
+        let b
+        do { b = buffer.readUInt8(offset + size); size++; ext |= (b & 0x7f) << shift; shift += 7 } while (b & 0x80)
+        ext >>>= 0
+      }
+      return { value: { lowest, middle, highest, ext }, size }
+    }]
+    cm.Write.lpVec3 = ['native', (value, buffer, offset) => {
+      buffer.writeUInt8(value.lowest, offset++)
+      return offset
+    }]
+    cm.SizeOf.lpVec3 = ['native', (value) => (value.lowest === 0 ? 1 : 6 + ((value.lowest & 4) !== 0 ? varintSize(value.ext) : 0))]
+  }
 
   const t0 = Date.now()
   const m = { connect_ms: -1, join_ms: -1, first_chunk_ms: -1 }
@@ -562,6 +596,8 @@ function main () {
     } catch (e) {
       chunkErrors++
       console.error(`chunk decode failed at ${p.x},${p.z}: ${e.message}`)
+      if (process.env.MC_REF_DEBUG_FILE) fs.writeFileSync(process.env.MC_REF_DEBUG_FILE, Buffer.from(p.chunkData).toString('hex'))
+      if (process.env.MC_REF_DEBUG) console.error(`  debug chunkData(${p.chunkData.length}) head=${Buffer.from(p.chunkData).subarray(0, 96).toString('hex')}`)
     }
     armIdle()
   })
