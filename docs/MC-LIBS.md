@@ -10,6 +10,23 @@ reference implementations are python / node (`node-minecraft-protocol`, `crypto`
 independent re-implementations from public format descriptions. No Mojang code or files
 are copied, read or decompiled; the official server JAR is only a *test subject*.
 
+## Design rule: version-modular (binding for every lib, decided 2026-10-11)
+
+Further game versions (1.12.2, 1.8.9, 1.16.5, newer releases, "26.x") must be addable later
+without touching the core. Version = data + small version modules; see
+**`docs/MC-VERSIONS.md`** (principle, checklist, theoretical 1.12.2 walk-through, status).
+For library authors that means:
+
+* No protocol number, packet id, field layout, block id or chunk layout in an engine lib.
+  Take a `mc_version.Version` (flags, semantic packet ids `mc_sem.SEM_*`, chunk format) or
+  work on the version-neutral model (`mc_chunk.Chunk`, `mc_world.World`).
+* Version dependent behaviour is a FLAG or a strategy chosen from the Version, with a test
+  per branch. Version dependent tables are GENERATED from `minecraft-data` (`tools/mcgen/`).
+* If a type genuinely differs per version (slot, entity metadata, NBT root name, UUID in
+  login) the lib takes the version/flag as a parameter -- no hard coded 1.20.1 assumption.
+* Exactly one version is a join target now (1.20.1); a second/third version only proves
+  the modularity (tables + walker conformance).
+
 ## Conventions
 
 * Libraries live in `lib/mc/`. **File names are `mc_<name>.fi`**: Firn names a module by
@@ -23,6 +40,9 @@ are copied, read or decompiled; the official server JAR is only a *test subject*
   `RESULT mc-<lib>: ok`). `bash tools/mc/run.sh [lib]` runs everything,
   `bash tools/mc/testmc.sh [pattern]` only the `tests/*_mc_*.fi` in three build stages.
 * API doc per library: `docs/mc/<lib>.md` (functions, error cases, measured numbers).
+* Every `.fi` file must be in the canonical shape of `firnfmt` (`test.sh` section 23 fails
+  otherwise): build it with `firnc -o /tmp/x/firnfmt tools/fmt/firnfmt.fi`, then `firnfmt -w <files>`;
+  `bash tools/mc/run.sh` checks it. Generated files are emitted in that shape.
 * Parsers get a fuzz test (mutated / truncated / oversized input: 0 crashes, 0 hangs).
 * Wrapping arithmetic (hashes, LCGs) uses `*% +% -%`; plain `*` aborts on overflow.
 * Platform code only in `platform/` or `*.windows.fi`. Everything here is portable Linux/Windows.
@@ -42,7 +62,8 @@ extend; **no** = build.
 | `std.net` + `lib/async` (epoll loop, stream, TLS stream), `lib/net/dns` | sockets, non-blocking, DNS | **yes** | - | 0 | - |
 | `std.deflate` (zlib/gzip), `std.crypto.aes` (CFB8 with in-place shift register), `sha1/sha256/md5/hmac/random`, `std.json`, `std.nbt` | building blocks | **yes** | - | 0 | - |
 | `mc_packet` | bounds-checked Reader/Writer for protocol types: string(max len), uuid, position, angle, bitset (long array), optional, array-prefixed, rest-buffer, f32/f64, slot (version hook), anonymous-NBT glue; sticky error flag | part (`std.bytes` has the scalars) | M | 1 | 2660-2669 |
-| `mc_protocol` + `mc_schema` + `tools/mcgen` | generator `protocol.json` -> packet tables and schema programs; generic schema walker that decodes/validates/dumps ANY packet of a version ("version = data") | **no** (in progress: `demos/mcclient/versions/v763`, `schema.fi`) | L | 1 | 2650-2659 |
+| `mc_version` + `mc_sem` + `mc_versions` + `lib/mc/vNNN/mc_proto_vNNN.fi` + `tools/mcgen` | the Version object (protocol, FLAG_*, chunk format, semantic packet ids, lookup function values); generator `protocol.json` -> packet tables and schema programs for 1.8.9, 1.12.2, 1.16.5, 1.20.1, 1.20.2 | **done** (this branch; conformance for 5 versions, `tools/mc/schema/run.sh`) | L | 1 | 2650-2659 |
+| `mc_schema` | generic packet walker / validator over the generated schema programs: any packet of any generated version, exact-consumption check, field dump, field ranges | **done** (≈ 800k packets/s; 3056 reference fixtures) | L | 1 | 2650-2659 |
 | `mc_codec` | frame reader/writer: length VarInt, compression threshold, zlib, AES-CFB8 stream (both directions), packet-size limits, state machine Handshake/Status/Login/Play, stats | part (first version from `demos/mcclient/wire.fi`, no CFB8 yet) | M | 2 | 2690-2699 |
 | `mc_crypto` | RSA public key from X.509 SubjectPublicKeyInfo DER, PKCS#1 v1.5 encryption for the login, shared-secret generation, CFB8 wrapper | part (`rsa.fi` verify only, `tls/der.fi`, `x509.fi`, `random.fi`) | M | 2 | 2670-2679 |
 | `mc_auth` | offline UUID (md5), server-id digest (SHA-1 as signed hex), session `join` call (HTTPS), profile; MSA/Xbox chain (`lib/auth/msa.fi`) re-checked | part (`md5_offline_uuid`, `msa.fi` exist, never run against the live services) | M | 3 | 2670-2679 |
@@ -64,13 +85,13 @@ inventory logic -- those are later milestones of the GDD.
 
 | Worker | Libs | Worktree / branch |
 |---|---|---|
-| G | `mc_protocol`, `mc_schema`, `tools/mcgen` (+ `mc_registry` after) | `/root/firn-w-mcclient`, `w-mcclient` |
+| G (done) | generator, `mc_schema` (first version), later reworked by the lead into `lib/mc` + `tools/mcgen` | `/root/firn-w-mcclient`, `w-mcclient` |
 | T | test harness: real 1.20.1 server + reference client (`tools/mcclient/`) | same |
 | A | `mc_crypto`, `mc_auth` | `/root/firn-w-mc-auth`, `w-mc-auth` |
 | B | `mc_packet`, `mc_nbt`, `mc_text` | `/root/firn-w-mc-packet`, `w-mc-packet` |
 | C | `mc_math`, `mc_mesh` | `/root/firn-w-mc-mesh`, `w-mc-mesh` |
-| D | `mc_noise`, Anvil part of `mc_world` | `/root/firn-w-mc-noise`, `w-mc-noise` |
-| lead | `mc_chunk`, `mc_world`, `mc_codec`, `mc_net`, merging, docs, the final client | `/root/firn-w-mcclient` |
+| D (not started: sub-worker cap per run) | `mc_noise`, `mc_anvil` | `/root/firn-w-mc-noise`, `w-mc-noise` (worktree exists) |
+| lead | `mc_version`/generator rework, `mc_chunk`, `mc_world`, `mc_codec`, `mc_net`, `mc_registry`, merging, docs, the final client | `/root/firn-w-mcclient` |
 
 ## Status log
 
@@ -104,3 +125,10 @@ inventory logic -- those are later milestones of the GDD.
 * Command line: `fn main(start: u64) -> i32` with `rt.arg_count(start)`, `rt.arg_ptr(start, i)`.
 * Style reference for a finished library with tests and an independent cross-check:
   `lib/mc/mc_chunk.fi`, `demos/mcclient/selftest.fi`, `tools/mc/chunk/`.
+
+* 2026-10-11 (later): version-modular rework. `lib/mc/mc_version.fi` (Version object),
+  generated `mc_sem.fi`, `mc_versions.fi`, `v47/v340/v754/v763/v764/mc_proto_vNNN.fi`;
+  generator moved to `tools/mcgen/` and extended (configuration state, anonymous container
+  scope); schema walker moved to `lib/mc/mc_schema.fi`; conformance for 5 versions passes
+  (`bash tools/mc/schema/run.sh`). Generator gaps for newer versions recorded in
+  `docs/MC-VERSIONS.md` (`registryEntryHolderSet`, `lpVec3`).
