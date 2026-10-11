@@ -69,6 +69,7 @@ Mojang code. All of it runs with `bash tools/mc/run.sh` (about 10 minutes).
 | `mc_crypto` | RSA SPKI parse, PKCS#1 v1.5 encrypt, shared secret, CFB8 stream (sub-worker A) | **done** | node crypto (RSA decrypt, aes-128-cfb8) | 2670-2672 |
 | `mc_auth` | offline UUID, server hash, session join, MSA review (sub-worker A) | done, **session join only against a mock**, MSA never run against the live service | python mock server, published hash vectors | 2675 |
 | `mc_chunk` + `mc_world` | palette sections, heightmaps, light, coordinate math | **done** | independent python decoder / dump; real 1.20.1 server (109 chunks) | - |
+| `mc_flat` (+ `v340/mc_flat_v340`) | flattening table 1.12.2 `id<<4\|meta` -> 1.20.1 state ids, container remap | **done** | independent Node implementation (4096 entries), `tests/2746_mc_flat_remap.fi` | other legacy versions (1.8.9) need their own table |
 | `mc_dimension` | min_y / height from the Join Game codec | **done** | real 1.20.1 server | 2691 |
 | `mc_client` | Handshake -> Login -> (Configuration) -> Play for any version | done for 1.20.1 (real server); configuration phase **only compiled** | real 1.20.1 server | - |
 | `mc_net` | connect with retry / back-off, server list ping | **done** | python status server | - |

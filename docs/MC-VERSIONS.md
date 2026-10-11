@@ -195,8 +195,8 @@ view distance 4), `MC_VERSION=<release> bash tools/mcclient/run.sh <firn client>
   256 biome octets of a ground-up column). The dimension comes from Join Game / Respawn
   (`mc_dimension.dim_legacy_id`, `mc_chunk.scratch_set_sky`). Values stay `id << 4 | meta` (the `mc_reg_v340` states).
   Client Information is sent in the 1.9-1.16 layout (`client_send_settings` tries the 1.17+ layout first; the schema check
-  refuses what does not fit). A section-only update (`groundUp = false`) is NOT merged: it is counted
-  (`partial_chunks`) and dropped in both clients -- a real merge is open.
+  refuses what does not fit). A section-only update (`groundUp = false`) is counted
+  (`partial_chunks`) and dropped in both clients; the library merge exists since the flattening round (see below).
 * **1.20.2 (764)**: PASS, checksum `87ad3f91c1ad...`, 109 chunks. Bug found by the real server and fixed: from 1.20.2 the
   NBT roots in the chunk packet (heightmaps, block entities) have **no name** (`FLAG_NBT_ANON`);
   `chunk_decode_anon` honours the flag, `chunk_decode_for` passes it. The configuration phase
@@ -206,8 +206,23 @@ view distance 4), `MC_VERSION=<release> bash tools/mcclient/run.sh <firn client>
 * Harness: `MC_VERSION` (+ `MC_NMP`, `MC_PROTOCOL` taken from `tools/mcgen/versions.json`); the protocol number is also the
   7th argument of the Firn client.
 
-### Flattening (id<<4|meta -> 1.13+ states): state of the work
-`tools/mcgen/legacy_flat.json` holds the hand written rules (legacy block name -> modern name + properties as a function of the
-metadata nibble; 143 rules, own words, no GPL tables). The generator that turns it plus `blocks.json` of 1.12.2 and 1.20.1 into
-`lib/mc/v340/mc_flat_v340.fi` and the application step (`mc_chunk` container remap) are **not written yet** (roadmap r18).
-Known loss by design: properties that are not in the rules fall back to the default state of the matched block.
+### Flattening (id<<4|meta -> 1.13+ states): done (2026-10-11, worker mc-w1)
+* Rules: `tools/mcgen/legacy_flat.json` (143 rules, own words, no GPL tables). Generator: `tools/mcgen/gen_flat.py <minecraft-data/data> lib/mc/v340/mc_flat_v340.fi`
+  (1.12.2 `blocks.json` ids/names + 1.20.1 `blocks.json` states). Reader: `lib/mc/mc_flat.fi` (`flat_open` -> heap `u16[4096]`).
+* Target = the **1.20.1 global block state id** (max 19216 for 1.12.2 blocks, fits the 15 bit limit). State id = `minStateId + sum(index * stride)`, first property most
+  significant, bool order `[true, false]`.
+* Decisions: a legacy id without a block -> 0 (air); a block without a rule keeps its name + default state; properties listed in a rule with several targets
+  (`names`/`by_meta`) are skipped for targets that lack them (torch: `facing` only on `wall_torch`); `props` without `map`/`offset` use the bits as the value.
+  **Unknown meta combination** (index beyond `names`/`by_meta`/`map`, or illegal value) -> the result for **meta 0 of the same id** (91 of 4096 entries, e.g. sapling meta 6/7).
+  Lost by design: properties not in the rules (redstone wire power/shape, fence/wall connections, stair shape) keep the default.
+* Application: `mc_chunk.container_remap` / `chunk_remap_blocks(c, sc, table, n)` map the palette (rebuild with distinct entries and fewer bits when two legacy states
+  collapse; a value >= table size -> air) and recount `Section.count`. Opt-in: the dump path of the demo client still prints the raw `id << 4 | meta`.
+* Tests: `bash tools/mc/flat/run.sh` (Firn table == independent Node implementation `ref_flat.cjs`, 4096 entries, three build stages, counter-check),
+  `tests/2746_mc_flat_remap.fi`.
+
+### Section updates (CF_SECTIONS_19, groundUp = false): merged in the library
+`Chunk.sec_mask` says which sections a packet carried. `mc_world.world_apply(w, p)` stores a whole column (`APPLY_STORED`), merges an update into the stored column
+(`APPLY_MERGED`, `mc_chunk.chunk_merge_update`: the sections of the mask replace the stored ones; biomes/heightmaps/block entities stay, `light_hash` stays that of
+the original packet) or drops an update for an unknown column (`APPLY_DROPPED`). `chunk_decode_19` now also requires the section data to be consumed exactly.
+`tests/2745_mc_chunk19.fi` covers decode (5/13/4 bit, spanning longs, sky/no sky, biomes, truncation) and the merge. **Open**: the demo client + `ref_dump.cjs` still drop updates
+(`partial_chunks`); switching both to merge changes the dump contract.
