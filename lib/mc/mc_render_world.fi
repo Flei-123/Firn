@@ -20,10 +20,11 @@ import mc.mc_world
 import mc.mc_mesh
 import mc.mc_camera
 import mc.mc_raster
+import mc.mc_backend
 
 export {
     WorldRender, RenderStats, wr_set_flags, wr_new, wr_free, wr_clear, wr_mark_block, wr_mark_chunk, wr_render,
-    wr_cached, wr_make_chunk, wr_drop_chunk,
+    wr_cached, wr_make_chunk, wr_drop_chunk, wr_clear_b, wr_free_b, wr_drop_chunk_b, wr_render_b,
 }
 
 const EW: usize = 4 // words per cache entry: key, handle, state, quads
@@ -75,11 +76,21 @@ fn wr_set_flags(wr: *mut WorldRender, flags: u32) {
 
 // Frees the cache; the backend meshes are freed too when `r` is given (0 = skip).
 fn wr_clear(wr: *mut WorldRender, r: *mut mc_raster.Raster) {
+    if r as u64 == 0 {
+        wr_clear_b(wr, 0 as u64 as *mut mc_backend.Backend)
+        return
+    }
+    var b: mc_backend.Backend = mc_backend.backend_cpu(r)
+    wr_clear_b(wr, &b)
+}
+
+// The same through any back end (mc_backend; 0 = skip freeing the back end meshes).
+fn wr_clear_b(wr: *mut WorldRender, b: *mut mc_backend.Backend) {
     var i: usize = 0
     while i < (*wr).cap {
         if rt.ld64((*wr).cache, i * EW + 2) != ST_EMPTY {
             let h: usize = rt.ld64((*wr).cache, i * EW + 1) as usize
-            if h != 0 && r as u64 != 0 { mc_raster.backend_mesh_free(r, h) }
+            if h != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, h) }
         }
         i = i + 1
     }
@@ -91,6 +102,15 @@ fn wr_clear(wr: *mut WorldRender, r: *mut mc_raster.Raster) {
 
 fn wr_free(wr: *mut WorldRender, r: *mut mc_raster.Raster) {
     wr_clear(wr, r)
+    wr_free_rest(wr)
+}
+
+fn wr_free_b(wr: *mut WorldRender, b: *mut mc_backend.Backend) {
+    wr_clear_b(wr, b)
+    wr_free_rest(wr)
+}
+
+fn wr_free_rest(wr: *mut WorldRender) {
     mc_mesh.mesher_free(&(*wr).mesher)
     rt.heap_free((*wr).pad, 5832 * 2)
     if (*wr).vis != 0 { rt.heap_free((*wr).vis, (*wr).vcap * 16) }
@@ -210,6 +230,12 @@ fn wr_mark_chunk(wr: *mut WorldRender, cx: i32, cz: i32) {
 // of its sections (`r`, 0 = skip), deletes the cache entries (table rebuilt, no tombstones) and dirties the 3x3 neighbourhood.
 // Returns the number of cache entries removed.
 fn wr_drop_chunk(wr: *mut WorldRender, r: *mut mc_raster.Raster, cx: i32, cz: i32) -> usize {
+    if r as u64 == 0 { return wr_drop_chunk_b(wr, 0 as u64 as *mut mc_backend.Backend, cx, cz) }
+    var b: mc_backend.Backend = mc_backend.backend_cpu(r)
+    return wr_drop_chunk_b(wr, &b, cx, cz)
+}
+
+fn wr_drop_chunk_b(wr: *mut WorldRender, b: *mut mc_backend.Backend, cx: i32, cz: i32) -> usize {
     if (*wr).cap == 0 { return 0 }
     var removed: usize = 0
     var i: usize = 0
@@ -220,7 +246,7 @@ fn wr_drop_chunk(wr: *mut WorldRender, r: *mut mc_raster.Raster, cx: i32, cz: i3
             let kz: i32 = (((key >> 21 as u64) & 2097151 as u64) as i32) - 1048576
             if kx == cx && kz == cz {
                 let h: usize = rt.ld64((*wr).cache, i * EW + 1) as usize
-                if h != 0 && r as u64 != 0 { mc_raster.backend_mesh_free(r, h) }
+                if h != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, h) }
                 rt.st64((*wr).cache, i * EW + 2, ST_EMPTY)
                 removed = removed + 1
             }
@@ -334,17 +360,17 @@ fn gather(wr: *mut WorldRender, w: *mut mc_world.World, cx: i32, sy: i32, cz: i3
     return true
 }
 
-fn mesh_entry(wr: *mut WorldRender, w: *mut mc_world.World, r: *mut mc_raster.Raster, slot: usize,
+fn mesh_entry(wr: *mut WorldRender, w: *mut mc_world.World, b: *mut mc_backend.Backend, slot: usize,
     cx: i32, sy: i32, cz: i32) {
     let old: usize = rt.ld64((*wr).cache, slot * EW + 1) as usize
-    if old != 0 { mc_raster.backend_mesh_free(r, old) }
+    if old != 0 { (*b).mesh_free((*b).obj, old) }
     var handle: usize = 0
     var nq: u64 = 0
     let sp: u64 = rt.heap_alloc(27 * 8)
     if gather(wr, w, cx, sy, cz, sp) {
         mc_mesh.mesh_padded(&(*wr).mesher, (*wr).pad, &(*wr).tables, (*wr).flags)
         if (*wr).mesher.nverts > 0 as u32 {
-            handle = mc_raster.backend_mesh_upload(r, rt.ld64((*wr).cache, slot * EW), (*wr).mesher.verts,
+            handle = (*b).mesh_upload((*b).obj, rt.ld64((*wr).cache, slot * EW), (*wr).mesher.verts,
                 (*wr).mesher.nverts as usize, (*wr).mesher.idx, (*wr).mesher.nidx as usize)
             nq = (*wr).mesher.nquads as u64
         }
@@ -400,6 +426,13 @@ fn vis_sort(wr: *mut WorldRender, n: usize) {
 // Draws the world into the backend `r` (call mc_raster.backend_begin first: camera + clear). `max_mesh` < 0 = no limit.
 fn wr_render(wr: *mut WorldRender, w: *mut mc_world.World, r: *mut mc_raster.Raster, cam: *mut mc_camera.Camera,
     max_mesh: i32) {
+    var b: mc_backend.Backend = mc_backend.backend_cpu(r)
+    wr_render_b(wr, w, &b, cam, max_mesh)
+}
+
+// The same through any back end (CPU mc_backend.backend_cpu, GL gl_mc.glbe_backend). Call b.begin first.
+fn wr_render_b(wr: *mut WorldRender, w: *mut mc_world.World, b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera,
+    max_mesh: i32) {
     (*wr).st = RenderStats { chunks: 0 as u32, far_chunks: 0 as u32, sections: 0 as u32, culled: 0 as u32,
         meshed: 0 as u32, deferred: 0 as u32, drawn: 0 as u32, tris: 0 as u64 }
     let ccx: i32 = mc_world.block_to_chunk(mc_math_floor(cam))
@@ -453,7 +486,7 @@ fn wr_render(wr: *mut WorldRender, w: *mut mc_world.World, r: *mut mc_raster.Ras
                 let cx: i32 = ((key & 2097151 as u64) as i32) - 1048576
                 let cz: i32 = (((key >> 21 as u64) & 2097151 as u64) as i32) - 1048576
                 let sy: i32 = ((key >> 42 as u64) & 255 as u64) as i32
-                mesh_entry(wr, w, r, slot, cx, sy, cz)
+                mesh_entry(wr, w, b, slot, cx, sy, cz)
             }
         }
         let h: usize = rt.ld64((*wr).cache, slot * EW + 1) as usize
@@ -462,9 +495,8 @@ fn wr_render(wr: *mut WorldRender, w: *mut mc_world.World, r: *mut mc_raster.Ras
             let cx: i32 = ((key & 2097151 as u64) as i32) - 1048576
             let cz: i32 = (((key >> 21 as u64) & 2097151 as u64) as i32) - 1048576
             let sy: i32 = ((key >> 42 as u64) & 255 as u64) as i32
-            let t0: u64 = (*r).st.tris_in
-            mc_raster.backend_draw(r, h, (cx * 16) as f64, ((*wr).min_y + sy * 16) as f64, (cz * 16) as f64)
-            (*wr).st.tris = (*wr).st.tris + ((*r).st.tris_in - t0)
+            let nt: u64 = (*b).draw((*b).obj, h, (cx * 16) as f64, ((*wr).min_y + sy * 16) as f64, (cz * 16) as f64)
+            (*wr).st.tris = (*wr).st.tris + nt
             (*wr).st.drawn = (*wr).st.drawn + 1 as u32
         }
     }
