@@ -79,3 +79,28 @@ inventory logic -- those are later milestones of the GDD.
   (`bash tools/mc/run.sh chunk`). Generator output for v763 exists (worker G).
   Firn finding: `size_of[T]()` of a struct of an imported module is "unknown type"
   (BLOCKER.md); module names must be unique by basename (hence `mc_` prefix).
+
+## Firn pitfalls found while building the first libraries (read before writing code)
+
+* Build: `FIRNLIB=<worktree>/lib /root/firn/compiler/target/release/firnc [--no-opt|--opt-level=dev-fast] -o OUT file.fi`.
+  Run the three build stages; they differ (checked arithmetic is on in the safe stages).
+* No implicit integer conversions; `as` between integers is a CHECKED value cast. Literals
+  need a type context (`0 as u8`, `let x: u64 = 5`). Reinterpret signed/unsigned with
+  `bytes.bits_i32 / bits_u64 ...`. Plain `+ - *` abort on overflow; hashes/LCGs use
+  `+% -% *%`.
+* Pointers are mostly `u64` addresses read/written with `rt.ld8/ld16/ld32/ld64(p, index)` and
+  `rt.st*` (index in ELEMENTS of that width); structs are used through `*mut T` and `(*p).field`.
+* Error unions have no payload: `fn f() -> BytesError!i32`, `try g()` only inside a function
+  with the SAME error set, otherwise `g() catch <fallback>`. Error/enum values are written
+  bare, `BytesError::Range`, also for types from imported modules.
+* `size_of[T]()` fails for a struct declared in an imported module ("unknown type", see
+  BLOCKER.md). Use the stride of a two element array:
+  `((&a[1]) as u64 - (&a[0]) as u64)` (see `lib/mc/mc_chunk.fi`, `section_size`).
+* Module names are the last path component and must be unique in a program (`std.text` vs
+  `mc.text` clash) -> `mc_` prefix for every file in `lib/mc`.
+* Text output: `io.fmt_print(f"a={x}\n")` (f-strings build an `io.Fmt`, integers only),
+  raw bytes `io.print_bytes(ptr, n)`, files `rt.write_file(cstr, ptr, n)`, `rt.read_file`.
+  Append an f-string to an `rt.Buf` with the `put_f` helper in `demos/mcclient/dump.fi`.
+* Command line: `fn main(start: u64) -> i32` with `rt.arg_count(start)`, `rt.arg_ptr(start, i)`.
+* Style reference for a finished library with tests and an independent cross-check:
+  `lib/mc/mc_chunk.fi`, `demos/mcclient/selftest.fi`, `tools/mc/chunk/`.
