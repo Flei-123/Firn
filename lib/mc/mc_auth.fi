@@ -1,0 +1,405 @@
+// lib/mc/mc_auth.fi -- the identity side of the Minecraft login (protocol 763).
+//
+// Offline mode (server `online-mode=false`):
+//     the player's UUID is a version 3 UUID of the MD5 of "OfflinePlayer:<name>"
+//     -> offline_uuid / uuid_to_text.
+//
+// Online mode: after `encryption_begin` the client proves its account to
+// Mojang's session server BEFORE it answers the server:
+//
+//     hash = server_hash(serverId, sharedSecret, publicKeyDer)
+//     POST <session base>/session/minecraft/join
+//          {"accessToken":..., "selectedProfile":<uuid, 32 hex>, "serverId":hash}
+//          -> 204 No Content, or 403 {"error":..,"errorMessage":"Invalid session"}
+//
+// and then sends its encrypted answer; the server asks the same session
+// server `hasJoined` itself. This file covers the client half:
+//
+//   1. offline_uuid, uuid_to_text, uuid_from_text
+//   2. server_hash                 SHA-1 over serverId || secret || publicKey,
+//                                  printed as a SIGNED big endian two's complement
+//                                  number in lowercase hex (Java BigInteger.toString(16))
+//   3. SessionClient + session_join  HTTPS POST with a configurable base URL
+//
+// The Microsoft / Xbox / Minecraft-services chain that yields the access token
+// and the profile id is lib/auth/msa.fi (reviewed in docs/mc/auth.md).
+//
+// Honest limits:
+//   * session_join was exercised ONLY against local mock servers (plain http on
+//     loopback and https with a test CA). The real sessionserver.mojang.com needs
+//     a real account and has never been called from here.
+//   * No `hasJoined` (that is the server side), no profile lookups, no skin data.
+//
+// Clean room: the digest layout is from the public protocol description
+// (wiki.vg "Protocol Encryption"), checked against Python hashlib; nothing from
+// Mojang's code.
+
+import std.rt
+import std.str
+import std.json
+import std.md5
+import std.crypto.sha1
+import net.http
+import auth.oauth
+
+export {
+    SessionClient,
+    JOIN_OK, JOIN_NET, JOIN_FORBIDDEN, JOIN_RATE, JOIN_HTTP, JOIN_ARG, JOIN_CONFIG,
+    JOIN_UNAUTHORIZED,
+    DEFAULT_SESSION_BASE, UUID_BYTES, SERVER_HASH_MAX,
+    offline_uuid, uuid_to_text, uuid_from_text,
+    server_hash, digest_to_signed_hex, join_body,
+    session_new, session_init, session_free, session_set_base, session_set_timeout,
+    session_add_trust_pem, session_set_system_trust, session_join,
+    session_status, session_error, session_error_message, session_net_error,
+    join_error_text,
+}
+
+const UUID_BYTES: usize = 16
+const SERVER_HASH_MAX: usize = 41 // "-" + 40 hex digits
+const DEFAULT_SESSION_BASE: str = "https://sessionserver.mojang.com"
+
+const JOIN_OK: i64 = 0
+const JOIN_NET: i64 = 1 // no HTTP answer (session_net_error has the net.http error number)
+const JOIN_FORBIDDEN: i64 = 2 // 403: the session server did not accept the token / profile
+const JOIN_RATE: i64 = 3 // 429
+const JOIN_HTTP: i64 = 4 // any other status
+const JOIN_ARG: i64 = 5 // empty token, malformed profile id or malformed hash: nothing was sent
+const JOIN_CONFIG: i64 = 6 // base URL is neither https nor loopback http: nothing was sent
+const JOIN_UNAUTHORIZED: i64 = 7 // 401
+
+fn join_error_text(code: i64) -> str {
+    if code == JOIN_OK { return "ok" }
+    if code == JOIN_NET { return "network" }
+    if code == JOIN_FORBIDDEN { return "forbidden" }
+    if code == JOIN_RATE { return "rate-limited" }
+    if code == JOIN_HTTP { return "http-status" }
+    if code == JOIN_ARG { return "bad-argument" }
+    if code == JOIN_CONFIG { return "bad-base-url" }
+    if code == JOIN_UNAUTHORIZED { return "unauthorized" }
+    return "unknown"
+}
+
+// ---- hex helpers ---------------------------------------------------------------
+
+fn hex_digit(v: u8) -> u8 {
+    if v < 10 as u8 {
+        return 48 as u8 + v
+    }
+    return 87 as u8 + v // 'a' - 10
+}
+
+// 0..15, or 255 when `c` is no hex digit (upper and lower case accepted).
+fn hex_value(c: u8) -> u8 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return c - 48 as u8
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return c - 87 as u8
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return c - 55 as u8
+    }
+    return 255 as u8
+}
+
+// ---- 1. UUIDs ------------------------------------------------------------------
+
+// The offline UUID of a player name: 16 octets into `out`.
+// UUID.nameUUIDFromBytes("OfflinePlayer:" + name): MD5, version 3, variant RFC 4122.
+// The name is used as the raw (UTF-8) octets; 1..114 octets.
+fn offline_uuid(name: u64, n: usize, out: u64) -> bool {
+    if n == 0 || n > 114 {
+        return false
+    }
+    var hi: u64 = 0
+    var lo: u64 = 0
+    if !md5.md5_offline_uuid(name, n, &hi, &lo) {
+        return false
+    }
+    var i: usize = 0
+    while i < 8 {
+        rt.st8(out, i, ((hi >> ((7 - i) as u64 * 8)) & 255) as u8)
+        rt.st8(out, 8 + i, ((lo >> ((7 - i) as u64 * 8)) & 255) as u8)
+        i = i + 1
+    }
+    return true
+}
+
+// Appends the text form of 16 octets: 8-4-4-4-12 with dashes, or 32 hex digits
+// without (the form the session server and the profile API use), lowercase.
+fn uuid_to_text(u: u64, dashed: bool, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < 16 {
+        if dashed && (i == 4 || i == 6 || i == 8 || i == 10) {
+            rt.buf_push(out, 45 as u8)
+        }
+        let b: u8 = rt.ld8(u, i)
+        rt.buf_push(out, hex_digit(b >> 4 as u8))
+        rt.buf_push(out, hex_digit(b & 15 as u8))
+        i = i + 1
+    }
+}
+
+// Parses 32 hex digits or the dashed 36 character form (either case) into 16 octets.
+fn uuid_from_text(p: u64, n: usize, out: u64) -> bool {
+    var hex: [u8; 32] = [0; 32]
+    var k: usize = 0
+    if n == 32 {
+        var i: usize = 0
+        while i < 32 {
+            hex[i] = rt.ld8(p, i)
+            i = i + 1
+        }
+        k = 32
+    } else if n == 36 {
+        var i: usize = 0
+        while i < 36 {
+            let c: u8 = rt.ld8(p, i)
+            if i == 8 || i == 13 || i == 18 || i == 23 {
+                if c != 45 as u8 {
+                    return false
+                }
+            } else {
+                hex[k] = c
+                k = k + 1
+            }
+            i = i + 1
+        }
+    } else {
+        return false
+    }
+    if k != 32 {
+        return false
+    }
+    var j: usize = 0
+    while j < 16 {
+        let a: u8 = hex_value(hex[2 * j])
+        let b: u8 = hex_value(hex[2 * j + 1])
+        if a == 255 as u8 || b == 255 as u8 {
+            return false
+        }
+        rt.st8(out, j, (a << 4 as u8) | b)
+        j = j + 1
+    }
+    return true
+}
+
+// ---- 2. the server hash ----------------------------------------------------------
+
+// SHA-1(serverId || secret || publicKey) as Minecraft prints it: the 20 octets are
+// a big endian two's complement integer; negative values get a '-' and the
+// magnitude, no leading zeros, lowercase ("0" for zero). Appended to `out`
+// (1..41 characters). serverId is ASCII (empty for vanilla servers).
+fn server_hash(sid: u64, sid_n: usize, secret: u64, secret_n: usize,
+    pubkey: u64, pk_n: usize, out: *mut rt.Buf) -> bool {
+    var st: sha1.Sha1 = sha1.sha1_new()
+    sha1.sha1_update(&st, sid, sid_n)
+    sha1.sha1_update(&st, secret, secret_n)
+    sha1.sha1_update(&st, pubkey, pk_n)
+    var d: [u8; 20] = [0; 20]
+    sha1.sha1_final(&st, (&d[0]) as u64)
+    return digest_to_signed_hex((&d[0]) as u64, out)
+}
+
+// The same conversion on a ready 20 octet digest (also what the test vectors use).
+fn digest_to_signed_hex(dp: u64, out: *mut rt.Buf) -> bool {
+    var d: [u8; 20] = [0; 20]
+    var i: usize = 0
+    while i < 20 {
+        d[i] = rt.ld8(dp, i)
+        i = i + 1
+    }
+    let neg: bool = (d[0] & 128 as u8) != 0 as u8
+    if neg {
+        // two's complement negation: invert, add one
+        var carry: u32 = 1
+        var j: usize = 20
+        while j > 0 {
+            j = j - 1
+            let v: u32 = ((d[j] ^ 255 as u8) as u32) + carry
+            d[j] = (v & 255) as u8
+            carry = v >> 8
+        }
+    }
+    if neg {
+        rt.buf_push(out, 45 as u8)
+    }
+    var started: bool = false
+    var k: usize = 0
+    while k < 20 {
+        let hi: u8 = d[k] >> 4 as u8
+        let lo: u8 = d[k] & 15 as u8
+        if started || hi != 0 as u8 {
+            rt.buf_push(out, hex_digit(hi))
+            started = true
+        }
+        if started || lo != 0 as u8 {
+            rt.buf_push(out, hex_digit(lo))
+            started = true
+        }
+        k = k + 1
+    }
+    if !started {
+        rt.buf_push(out, 48 as u8)
+    }
+    return true
+}
+
+// ---- 3. the session join -----------------------------------------------------------
+
+struct SessionClient {
+    cl: http.Client,
+    base: str, // no trailing slash needed; "/session/minecraft/join" is appended
+    last_status: u32,
+    net_err: u32,
+    err: str, // "error" of the last JSON error answer
+    err_msg: str, // "errorMessage" of it
+    body: rt.Buf,
+}
+
+fn session_new() -> SessionClient {
+    return SessionClient { cl: http.client_new(), base: DEFAULT_SESSION_BASE,
+        last_status: 0 as u32, net_err: 0 as u32, err: "", err_msg: "", body: rt.buf_new() }
+}
+
+fn session_init(c: *mut SessionClient) -> bool {
+    if !http.client_init(&(*c).cl) {
+        return false
+    }
+    http.client_set_timeout(&(*c).cl, 10000)
+    return true
+}
+
+fn session_free(c: *mut SessionClient) {
+    http.client_free(&(*c).cl)
+    rt.buf_free(&(*c).body)
+}
+
+// Base URL of the session server, e.g. "http://127.0.0.1:8080" for a local mock
+// (plain http is accepted for loopback hosts only; everything else must be https).
+fn session_set_base(c: *mut SessionClient, base: str) { (*c).base = base }
+fn session_set_timeout(c: *mut SessionClient, ms: u64) { http.client_set_timeout(&(*c).cl, ms) }
+// A private CA (PEM text) so a local https mock with a test certificate is trusted.
+fn session_add_trust_pem(c: *mut SessionClient, pem: str) -> usize {
+    return http.client_add_trust_pem(&(*c).cl, pem.p as u64, pem.length())
+}
+fn session_set_system_trust(c: *mut SessionClient, on: bool) {
+    http.client_set_system_trust(&(*c).cl, on)
+}
+fn session_status(c: *mut SessionClient) -> u32 { return (*c).last_status }
+fn session_net_error(c: *mut SessionClient) -> u32 { return (*c).net_err }
+fn session_error(c: *mut SessionClient) -> str { return (*c).err }
+fn session_error_message(c: *mut SessionClient) -> str { return (*c).err_msg }
+
+// {"accessToken":..,"selectedProfile":..,"serverId":..} into `out`. The JSON writer
+// escapes every character that needs it.
+fn join_body(access_token: str, player: str, hash: str, out: *mut rt.Buf) {
+    var w: json.JsonWriter = json.jw_new(out, false)
+    json.jw_begin_object(&w)
+    json.jw_key(&w, "accessToken".p as u64, 11)
+    json.jw_string(&w, access_token.p as u64, access_token.length())
+    json.jw_key(&w, "selectedProfile".p as u64, 15)
+    json.jw_string(&w, player.p as u64, player.length())
+    json.jw_key(&w, "serverId".p as u64, 8)
+    json.jw_string(&w, hash.p as u64, hash.length())
+    json.jw_end(&w)
+    json.jw_free(&w)
+}
+
+fn valid_hash(h: str) -> bool {
+    let n: usize = h.length()
+    if n == 0 || n > SERVER_HASH_MAX {
+        return false
+    }
+    var i: usize = 0
+    if h.chars(0) == 45 as u8 {
+        i = 1
+        if n == 1 {
+            return false
+        }
+    }
+    while i < n {
+        let c: u8 = h.chars(i)
+        if !((c >= 48 as u8 && c <= 57 as u8) || (c >= 97 as u8 && c <= 102 as u8)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Tells the session server that this account joins a server with `hash`.
+// `profile` is the player's UUID (32 hex digits or dashed); `hash` the output of
+// server_hash. JOIN_OK on 204 (200 is tolerated). On a JSON error answer the
+// fields are in session_error / session_error_message.
+fn session_join(c: *mut SessionClient, access_token: str, player: str, hash: str) -> i64 {
+    (*c).last_status = 0 as u32
+    (*c).net_err = 0 as u32
+    (*c).err = ""
+    (*c).err_msg = ""
+    rt.buf_clear(&(*c).body)
+    if access_token.length() == 0 || !valid_hash(hash) {
+        return JOIN_ARG
+    }
+    var raw: [u8; 16] = [0; 16]
+    if !uuid_from_text(player.p as u64, player.length(), (&raw[0]) as u64) {
+        return JOIN_ARG
+    }
+    var pid: rt.Buf = rt.buf_new()
+    uuid_to_text((&raw[0]) as u64, false, &pid)
+    let pid_s: str = str { p: rt.buf_data(&pid), n: pid.len }
+
+    var base: str = (*c).base
+    while base.length() > 0 && base.chars(base.length() - 1) == 47 as u8 {
+        base = str { p: base.p, n: base.length() - 1 }
+    }
+    let target: str = base + "/session/minecraft/join"
+    if !oauth.oa_endpoint_ok(target) {
+        rt.buf_free(&pid)
+        return JOIN_CONFIG
+    }
+    var body: rt.Buf = rt.buf_new()
+    join_body(access_token, pid_s, hash, &body)
+    rt.buf_free(&pid)
+    let hdr: str = "Accept: application/json\r\n"
+    http.client_set_headers(&(*c).cl, hdr.p as u64, hdr.length())
+    var r: http.Response = http.resp_new()
+    let ctype: str = "application/json"
+    let ne: u32 = http.http_post_num(&(*c).cl, target.p as u64, target.length(),
+        rt.buf_ptr(&body), rt.buf_len(&body), ctype.p as u64, ctype.length(), &r)
+    http.client_clear_headers(&(*c).cl)
+    rt.buf_free(&body)
+    if ne != 0 as u32 {
+        http.client_close(&(*c).cl)
+        http.resp_free(&r)
+        (*c).net_err = ne
+        return JOIN_NET
+    }
+    (*c).last_status = http.resp_status(&r)
+    rt.buf_push_bytes(&(*c).body, http.resp_body_ptr(&r), http.resp_body_len(&r))
+    http.resp_free(&r)
+    let st: u32 = (*c).last_status
+    if st == 204 as u32 || st == 200 as u32 {
+        return JOIN_OK
+    }
+    read_error_body(c)
+    if st == 403 as u32 { return JOIN_FORBIDDEN }
+    if st == 401 as u32 { return JOIN_UNAUTHORIZED }
+    if st == 429 as u32 { return JOIN_RATE }
+    return JOIN_HTTP
+}
+
+// {"error":"ForbiddenOperationException","errorMessage":"Invalid session"} -> fields
+fn read_error_body(c: *mut SessionClient) {
+    if rt.buf_len(&(*c).body) == 0 {
+        return
+    }
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, rt.buf_ptr(&(*c).body), rt.buf_len(&(*c).body)) catch false
+    if ok && json.json_kind(&d, json.json_root(&d)) == json.JSON_OBJECT {
+        (*c).err = oauth.oa_json_str(&d, json.json_root(&d), "error")
+        (*c).err_msg = oauth.oa_json_str(&d, json.json_root(&d), "errorMessage")
+    }
+    json.json_free(&d)
+}

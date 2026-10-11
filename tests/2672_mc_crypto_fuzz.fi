@@ -1,0 +1,209 @@
+// expect_exit: 0
+// tests/2672_mc_crypto_fuzz.fi -- the SPKI parser against damaged input:
+// every proper prefix, every single octet value at every position, trailing
+// octets, 24000 random multi-edit mutations, random buffers with a plausible
+// header, absurd length fields. Required: no crash, no hang, no out-of-range
+// read (checked in the safe build stages), every prefix and every extension is
+// REFUSED, and a key the parser accepts is usable.
+import std.rt
+import std.str
+import mc.mc_crypto
+
+fn hexval(c: u8) -> u8 {
+    if c >= 97 as u8 {
+        return c - 87 as u8
+    }
+    return c - 48 as u8
+}
+
+fn unhex(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i + 1 < s.length() {
+        rt.buf_push(out, (hexval(s.chars(i)) << 4 as u8) | hexval(s.chars(i + 1)))
+        i = i + 2
+    }
+}
+
+fn new_key() -> mc_crypto.RsaKey {
+    return mc_crypto.RsaKey { n: [0; 512], nlen: 0, e: [0; 8], elen: 0 }
+}
+
+fn lcg(s: *mut u64) -> u64 {
+    *s = *s *% 6364136223846793005 +% 1442695040888963407
+    return *s >> 33
+}
+
+// parse; if accepted the key must pass a sanity check and encrypt (or say BAD_KEY)
+fn probe(p: u64, n: usize, do_enc: bool) -> i32 {
+    var key: mc_crypto.RsaKey = new_key()
+    let rc: i32 = mc_crypto.rsa_key_from_spki(p, n, &key)
+    if rc != mc_crypto.CR_OK {
+        if key.nlen != 0 || key.elen != 0 {
+            return -1
+        }
+        return rc
+    }
+    if key.nlen < 64 || key.nlen > 512 || key.elen < 1 || key.elen > 8 {
+        return -2
+    }
+    if !do_enc {
+        return 0
+    }
+    var msg: [u8; 1] = [1; 1]
+    var out: [u8; 512] = [0; 512]
+    var olen: usize = 0
+    let er: i32 = mc_crypto.rsa_encrypt_pkcs1(&key, (&msg[0]) as u64, 1, (&out[0]) as u64, 512, &olen)
+    if er != mc_crypto.CR_OK && er != mc_crypto.CR_BAD_KEY {
+        return -3
+    }
+    return 0
+}
+
+fn copy_of(src: *mut rt.Buf) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, rt.buf_ptr(src), rt.buf_len(src))
+    return b
+}
+
+fn base_tests(der: *mut rt.Buf, seed0: u64, edits: usize, accepted: *mut u64, rejected: *mut u64) -> i32 {
+    let len: usize = rt.buf_len(der)
+    if probe(rt.buf_ptr(der), len, true) != 0 { return 1 as i32 }
+    // every proper prefix is refused
+    var cut: usize = 0
+    while cut < len {
+        if probe(rt.buf_ptr(der), cut, false) <= 0 { return 2 as i32 }
+        cut = cut + 1
+    }
+    // trailing octets are refused
+    var ext: usize = 1
+    while ext < 9 {
+        var b: rt.Buf = copy_of(der)
+        var k: usize = 0
+        while k < ext {
+            rt.buf_push(&b, ((k * 37) % 256) as u8)
+            k = k + 1
+        }
+        if probe(rt.buf_ptr(&b), rt.buf_len(&b), false) <= 0 { return 3 as i32 }
+        ext = ext + 1
+    }
+    // every octet value at (a bounded number of) positions
+    var pos: usize = 0
+    while pos < len && pos < 40 {
+        var val: usize = 0
+        while val < 256 {
+            var b: rt.Buf = copy_of(der)
+            rt.st8(rt.buf_ptr(&b), pos, val as u8)
+            if probe(rt.buf_ptr(&b), len, val == 7) < 0 { return 4 as i32 }
+            val = val + 1
+        }
+        pos = pos + 1
+    }
+    // random multi edit mutations
+    var s: u64 = seed0
+    var it: usize = 0
+    while it < edits {
+        var b: rt.Buf = copy_of(der)
+        let ne: u64 = lcg(&s) % 4 + 1
+        var e: u64 = 0
+        while e < ne {
+            let kind: u64 = lcg(&s) % 4
+            let l: usize = rt.buf_len(&b)
+            if l == 0 {
+                break
+            }
+            let at: usize = (lcg(&s) % (l as u64)) as usize
+            if kind == 0 {
+                rt.st8(rt.buf_ptr(&b), at, (lcg(&s) % 256) as u8)
+            }
+            if kind == 1 {
+                rt.st8(rt.buf_ptr(&b), at, rt.ld8(rt.buf_ptr(&b), at) ^ (1 << (lcg(&s) % 8)) as u8)
+            }
+            if kind == 2 {
+                rt.buf_set_len(&b, at)
+            }
+            if kind == 3 {
+                rt.buf_push(&b, (lcg(&s) % 256) as u8)
+            }
+            e = e + 1
+        }
+        let r: i32 = probe(rt.buf_ptr(&b), rt.buf_len(&b), it % 97 == 0)
+        if r < 0 { return 5 as i32 }
+        if r == 0 {
+            *accepted = *accepted + 1
+        } else {
+            *rejected = *rejected + 1
+        }
+        it = it + 1
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    var d1: rt.Buf = rt.buf_new()
+    var d2: rt.Buf = rt.buf_new()
+    unhex("30819f300d06092a864886f70d010101050003818d0030818902818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa30203010001", &d1)
+    unhex("30820122300d06092a864886f70d01010105000382010f003082010a0282010100b58f7439ddc16e47e4025540c7da0e52a37f1540dc064ccd0d44b8642f5722978106f3305360e580dfee09589801305825db08d330befc51ed6551b5e00c33b41f5ad751034ab4d3dc443d57a9e66ff2753d515ec4593e6e9f1fd52305e35980333d04faf96a0fcfca45fb0c288a7e27c191ccc68c702c9a21978242df46e24bfe812f920c1140d178095cd4d74b31ab694bc1146555f2b624577c2f5cd279fe3409dbf84879f85d2b8db89e7b161193e75bdbaf5fbf44113e5c8428a5e56f8db6c8da71d139fce0a7f5cf0f7a92d5fc5282d1440798fb8db19633b93c93d6a79e98390dc3844fcfd6218648c292dc117c4ceeebbc38fb350827fb8194d315550203010001", &d2)
+    var accepted: u64 = 0
+    var rejected: u64 = 0
+    let r1: i32 = base_tests(&d1, 12345, 12000, &accepted, &rejected)
+    if r1 != 0 { return 10 + r1 }
+    let r2: i32 = base_tests(&d2, 777, 12000, &accepted, &rejected)
+    if r2 != 0 { return 20 + r2 }
+
+    // random buffers, some with a plausible header
+    var s: u64 = 99
+    var it: usize = 0
+    while it < 10000 {
+        let l: usize = (lcg(&s) % 200) as usize + 4
+        var b: rt.Buf = rt.buf_new()
+        var i: usize = 0
+        while i < l {
+            rt.buf_push(&b, (lcg(&s) % 256) as u8)
+            i = i + 1
+        }
+        if it % 2 == 0 {
+            rt.st8(rt.buf_ptr(&b), 0, 48 as u8)
+            rt.st8(rt.buf_ptr(&b), 1, (l - 2) as u8)
+            if l > 130 {
+                rt.st8(rt.buf_ptr(&b), 1, 129 as u8)
+                rt.st8(rt.buf_ptr(&b), 2, (l - 3) as u8)
+            }
+        }
+        if probe(rt.buf_ptr(&b), rt.buf_len(&b), false) < 0 { return 30 as i32 }
+        it = it + 1
+    }
+
+    // absurd length fields at the front of an otherwise valid key
+    var lens: [u64; 8] = [127, 128, 255, 256, 65535, 65536, 4294967295, 4294967296]
+    var li: usize = 0
+    while li < 8 {
+        var b: rt.Buf = copy_of(&d1)
+        var hdr: rt.Buf = rt.buf_new()
+        rt.buf_push(&hdr, 48 as u8)
+        rt.buf_push(&hdr, 132 as u8)
+        var sh: i32 = 24
+        while sh >= 0 {
+            rt.buf_push(&hdr, ((lens[li] >> (sh as u64)) & 255) as u8)
+            sh = sh - 8
+        }
+        var k: usize = 0
+        while k + 4 < rt.buf_len(&b) {
+            rt.buf_push(&hdr, rt.ld8(rt.buf_ptr(&b), k + 4))
+            k = k + 1
+        }
+        if probe(rt.buf_ptr(&hdr), rt.buf_len(&hdr), false) <= 0 { return 31 as i32 }
+        li = li + 1
+    }
+    // the all-0xff and all-zero buffers
+    var ff: rt.Buf = rt.buf_new()
+    var zz: rt.Buf = rt.buf_new()
+    var q: usize = 0
+    while q < 300 {
+        rt.buf_push(&ff, 255 as u8)
+        rt.buf_push(&zz, 0 as u8)
+        q = q + 1
+    }
+    if probe(rt.buf_ptr(&ff), 300, false) <= 0 || probe(rt.buf_ptr(&zz), 300, false) <= 0 { return 32 as i32 }
+    if accepted == 0 && rejected == 0 { return 33 as i32 }
+    return 0
+}

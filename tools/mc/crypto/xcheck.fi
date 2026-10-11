@@ -1,0 +1,251 @@
+// tools/mc/crypto/xcheck.fi -- command line driver of mc_crypto for the
+// cross-check against node (tools/mc/crypto/run.sh) and for the benchmark.
+//
+//   xcheck cfb8 <enc|dec> <keyfile16> <in> <out> <seed> [soft]
+//        runs the file through ONE Cfb8Stream in randomly sized chunks (LCG seed)
+//   xcheck spki <der>                 prints n=<hex> e=<hex> bits=<N> or error=<name>
+//   xcheck rsaenc <der> <msg> <out>   PKCS#1 v1.5 encryption of the file <msg>
+//   xcheck bench                      prints throughput / operation rates
+import std.rt
+import std.io
+import std.time
+import mc.mc_crypto
+
+fn carg(start: u64, i: usize) -> u64 {
+    return rt.arg_ptr(start, i)
+}
+
+fn streq(a: u64, want: str) -> bool {
+    if rt.c_length(a) != want.length() {
+        return false
+    }
+    var i: usize = 0
+    while i < want.length() {
+        if rt.ld8(a, i) != want.chars(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn parse_u64(a: u64) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    let n: usize = rt.c_length(a)
+    while i < n {
+        v = v *% 10 +% ((rt.ld8(a, i) - 48 as u8) as u64)
+        i = i + 1
+    }
+    return v
+}
+
+fn push_str(b: *mut rt.Buf, s: str) {
+    var i: usize = 0
+    while i < s.length() {
+        rt.buf_push(b, s.chars(i))
+        i = i + 1
+    }
+}
+
+fn hex_push(b: *mut rt.Buf, p: u64, n: usize) {
+    var d: [u8; 16] = "0123456789abcdef"
+    var i: usize = 0
+    while i < n {
+        let v: u8 = rt.ld8(p, i)
+        rt.buf_push(b, d[(v >> 4 as u8) as usize])
+        rt.buf_push(b, d[(v & 15 as u8) as usize])
+        i = i + 1
+    }
+}
+
+fn cmd_cfb8(start: u64) -> i32 {
+    if rt.arg_count(start) < 7 {
+        return 2
+    }
+    let enc: bool = streq(carg(start, 2), "enc")
+    var key: rt.Buf = rt.buf_new()
+    var data: rt.Buf = rt.buf_new()
+    if !rt.read_file(carg(start, 3), &key) || rt.buf_len(&key) != 16 {
+        return 3
+    }
+    if !rt.read_file(carg(start, 4), &data) {
+        return 3
+    }
+    var soft: bool = false
+    if rt.arg_count(start) > 7 {
+        soft = streq(carg(start, 7), "soft")
+    }
+    var s: mc_crypto.Cfb8Stream = mc_crypto.cfb8_new(rt.buf_ptr(&key))
+    if soft {
+        s = mc_crypto.cfb8_new_soft(rt.buf_ptr(&key))
+    }
+    var seed: u64 = parse_u64(carg(start, 6))
+    let total: usize = rt.buf_len(&data)
+    let base: u64 = rt.buf_ptr(&data)
+    var at: usize = 0
+    while at < total {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407
+        var step: usize = ((seed >> 33) % 97) as usize + 1
+        if (seed >> 20) % 11 == 0 {
+            step = ((seed >> 40) % 700) as usize + 1
+        }
+        if at + step > total {
+            step = total - at
+        }
+        if enc {
+            mc_crypto.cfb8_encrypt(&s, base + at as u64, step)
+        } else {
+            mc_crypto.cfb8_decrypt(&s, base + at as u64, step)
+        }
+        at = at + step
+    }
+    if !rt.write_file(carg(start, 5), base, total) {
+        return 4
+    }
+    return 0
+}
+
+fn cmd_spki(start: u64) -> i32 {
+    var der: rt.Buf = rt.buf_new()
+    if rt.arg_count(start) < 3 || !rt.read_file(carg(start, 2), &der) {
+        return 3
+    }
+    var key: mc_crypto.RsaKey = mc_crypto.RsaKey { n: [0; 512], nlen: 0, e: [0; 8], elen: 0 }
+    let rc: i32 = mc_crypto.rsa_key_from_spki(rt.buf_ptr(&der), rt.buf_len(&der), &key)
+    var out: rt.Buf = rt.buf_new()
+    if rc != mc_crypto.CR_OK {
+        push_str(&out, "error=")
+        push_str(&out, mc_crypto.error_name(rc))
+        rt.buf_push(&out, 10 as u8)
+        io.print_bytes(rt.buf_ptr(&out), rt.buf_len(&out))
+        return 1
+    }
+    push_str(&out, "n=")
+    hex_push(&out, (&key.n[0]) as u64, key.nlen)
+    push_str(&out, "\ne=")
+    hex_push(&out, (&key.e[0]) as u64, key.elen)
+    rt.buf_push(&out, 10 as u8)
+    io.print_bytes(rt.buf_ptr(&out), rt.buf_len(&out))
+    io.fmt_print(f"bits={mc_crypto.rsa_key_bits(&key)}\n")
+    return 0
+}
+
+fn cmd_rsaenc(start: u64) -> i32 {
+    var der: rt.Buf = rt.buf_new()
+    var msg: rt.Buf = rt.buf_new()
+    if rt.arg_count(start) < 5 {
+        return 2
+    }
+    if !rt.read_file(carg(start, 2), &der) || !rt.read_file(carg(start, 3), &msg) {
+        return 3
+    }
+    var key: mc_crypto.RsaKey = mc_crypto.RsaKey { n: [0; 512], nlen: 0, e: [0; 8], elen: 0 }
+    if mc_crypto.rsa_key_from_spki(rt.buf_ptr(&der), rt.buf_len(&der), &key) != mc_crypto.CR_OK {
+        return 5
+    }
+    var out: [u8; 512] = [0; 512]
+    var olen: usize = 0
+    let rc: i32 = mc_crypto.rsa_encrypt_pkcs1(&key, rt.buf_ptr(&msg), rt.buf_len(&msg),
+        (&out[0]) as u64, 512, &olen)
+    if rc != mc_crypto.CR_OK {
+        return 6
+    }
+    if !rt.write_file(carg(start, 4), (&out[0]) as u64, olen) {
+        return 4
+    }
+    return 0
+}
+
+// A fixed 1024 bit test modulus is not needed: any odd 1024/2048 bit number
+// works for timing a public operation, so the bench builds one.
+fn bench_key(bits_bytes: usize) -> mc_crypto.RsaKey {
+    var key: mc_crypto.RsaKey = mc_crypto.RsaKey { n: [0; 512], nlen: bits_bytes, e: [0; 8], elen: 3 }
+    var i: usize = 0
+    while i < bits_bytes {
+        key.n[i] = ((i * 37 + 91) % 251) as u8
+        i = i + 1
+    }
+    key.n[0] = 200 as u8
+    key.n[bits_bytes - 1] = 241 as u8
+    key.e[0] = 1 as u8
+    key.e[1] = 0 as u8
+    key.e[2] = 1 as u8
+    return key
+}
+
+fn bench_rsa(bytes: usize, iters: u64) -> u64 {
+    var key: mc_crypto.RsaKey = bench_key(bytes)
+    var msg: [u8; 16] = [7; 16]
+    var out: [u8; 512] = [0; 512]
+    var olen: usize = 0
+    let t0: u64 = time.monotonic_ns()
+    var i: u64 = 0
+    while i < iters {
+        mc_crypto.rsa_encrypt_pkcs1(&key, (&msg[0]) as u64, 16, (&out[0]) as u64, 512, &olen)
+        i = i + 1
+    }
+    let dt: u64 = time.monotonic_ns() - t0
+    return iters * 1000000000 / (dt + 1)
+}
+
+fn bench_cfb8(soft: bool, dec: bool, mib: usize) -> u64 {
+    var secret: [u8; 16] = [3; 16]
+    var s: mc_crypto.Cfb8Stream = mc_crypto.cfb8_new((&secret[0]) as u64)
+    if soft {
+        s = mc_crypto.cfb8_new_soft((&secret[0]) as u64)
+    }
+    let chunk: usize = 65536
+    var buf: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&buf, chunk)
+    rt.buf_set_len(&buf, chunk)
+    let t0: u64 = time.monotonic_ns()
+    var done: usize = 0
+    while done < mib * 1048576 {
+        if dec {
+            mc_crypto.cfb8_decrypt(&s, rt.buf_ptr(&buf), chunk)
+        } else {
+            mc_crypto.cfb8_encrypt(&s, rt.buf_ptr(&buf), chunk)
+        }
+        done = done + chunk
+    }
+    let dt: u64 = time.monotonic_ns() - t0
+    // KiB per second
+    return (done as u64 / 1024) * 1000000000 / (dt + 1)
+}
+
+fn cmd_bench() -> i32 {
+    let hw: u64 = bench_cfb8(false, false, 32)
+    let hd: u64 = bench_cfb8(false, true, 128)
+    let sw: u64 = bench_cfb8(true, false, 4)
+    let sd: u64 = bench_cfb8(true, true, 4)
+    let r1: u64 = bench_rsa(128, 300)
+    let r2: u64 = bench_rsa(256, 100)
+    io.fmt_print(f"cfb8_encrypt_KiB_per_s={hw}\n")
+    io.fmt_print(f"cfb8_decrypt_KiB_per_s={hd}\n")
+    io.fmt_print(f"cfb8_soft_encrypt_KiB_per_s={sw}\n")
+    io.fmt_print(f"cfb8_soft_decrypt_KiB_per_s={sd}\n")
+    io.fmt_print(f"rsa1024_encrypt_per_s={r1}\n")
+    io.fmt_print(f"rsa2048_encrypt_per_s={r2}\n")
+    return 0
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        return 2
+    }
+    let c: u64 = carg(start, 1)
+    if streq(c, "cfb8") {
+        return cmd_cfb8(start)
+    }
+    if streq(c, "spki") {
+        return cmd_spki(start)
+    }
+    if streq(c, "rsaenc") {
+        return cmd_rsaenc(start)
+    }
+    if streq(c, "bench") {
+        return cmd_bench()
+    }
+    return 2
+}
