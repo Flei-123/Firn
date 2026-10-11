@@ -1,0 +1,455 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/jobs/jobs.fi -- jobs: a thread pool for CPU work (meshing, world
+// generation, decoding) with chunked parallel loops, wait groups and join
+// handles. The caller HELPS while it waits, so `T` threads of work need only
+// `T - 1` workers and a nested wait can never deadlock.
+//
+//     import jobs.jobs
+//
+//     fn mesh_chunks(ctx: u64, lo: u64, hi: u64) {      // runs on any thread
+//         var i: u64 = lo
+//         while i < hi { build_mesh(ctx, i); i = i + 1 }
+//     }
+//
+//     fn __thread_work(kind: u64, arg: u64) -> u64 {    // ONE line to wire it
+//         if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+//         return 0
+//     }
+//
+//     fn main() -> i32 {
+//         var j: jobs.Jobs = jobs.create(7)             // 7 workers + the caller = 8 threads
+//         jobs.parallel_for(&j, 0, 4096, 16, mesh_chunks, world_addr)
+//         let t: u64 = jobs.spawn(&j, load_file, 5)     // a future
+//         ...
+//         let r: u64 = jobs.join(&j, t)                 // waits (and helps), then the result
+//         jobs.destroy(&j)
+//         return 0
+//     }
+//
+// MODEL. A BATCH is a range [begin, end) cut into chunks plus a function
+// `body(ctx, lo, hi)`. Batches sit in a FIFO under one futex lock. A thread
+// (worker or a waiting caller) takes the NEXT CHUNK of the front batch under
+// that lock -- a dozen instructions -- and runs it outside the lock. The batch
+// leaves the queue when its last chunk has been taken, so a long batch is
+// shared by everybody and a short one costs one queue visit. Finished items are
+// counted in a GROUP (`pending`, a futex word); when it reaches 0 the waiter
+// is woken. This is dynamic load balancing by chunk: a slow chunk never holds
+// back the others, which is what stealing buys, without per-thread deques.
+//
+// HONEST
+// J1  NO WORK STEALING (deque per thread). Firn has `__atomic_add` and
+//     `__atomic_swap` but no compare-and-swap, so a Chase-Lev deque is not
+//     possible; one locked queue with chunk claiming replaces it. It stays
+//     cheap while one chunk runs for more than ~1 us; `docs/JOBS.md` has the
+//     measured per-task cost. Pick `chunk` so a chunk is >= 20 us of work.
+// J2  `ctx`, the arguments and everything `body` touches are numbers /
+//     addresses. They must stay alive until the group is waited for; the
+//     collector does not look into the queue (as in std.pool Q1). The thread
+//     that waits holds `ctx` in its own frame, which is enough for
+//     `parallel_for`; for `group_go` / `spawn` keep it referenced until the
+//     `group_wait` / `join`.
+// J3  `body` must not write to the same memory from two chunks unless it is
+//     the caller's job to make that safe (disjoint [lo,hi) is the contract).
+// J4  A `body` that computes for seconds without allocating or blocking
+//     delays the collector like any thread (std.pool Q5): keep chunks short.
+// J5  `create` asks for at most 255 workers (thread table: 1023 entries).
+//     `create(0)` is legal: everything then runs on the caller inside the
+//     wait -- the sequential baseline with the same code path.
+// J6  Linux and Windows (futex on the Windows target is WaitOnAddress).
+//     Counters in futex words stay below 2^32 (items per group < 4 billion).
+// J7  `destroy` needs all groups waited for. A worker that is still inside a
+//     `body` is joined, not killed.
+
+import std.rt
+
+export {
+    Jobs, WORKER_KIND,
+    create, destroy, worker_main, worker_count,
+    parallel_for, parallel_each,
+    group_new, group_free, group_go, group_wait, group_pending,
+    spawn, join, task_done,
+    executed_by_workers, executed_by_callers,
+}
+
+// The thread kind of a jobs worker ("jobs" in ASCII).
+const WORKER_KIND: u64 = 1650813811
+
+const MINUS1: u64 = 18446744073709551615
+const WORKERS_MAX: u64 = 255
+
+// pool block, in 64 bit words
+const P_LOCK: usize = 0
+const P_SEQ: usize = 1 // futex word: bumped on every push, workers sleep on it
+const P_HEAD: usize = 2
+const P_TAIL: usize = 3
+const P_STOP: usize = 4
+const P_WORKERS: usize = 5
+const P_EXEC_W: usize = 6 // chunks run by workers
+const P_EXEC_C: usize = 7 // chunks run by callers while waiting
+const P_HANDLES: usize = 8 // up to 255 thread handles
+const P_WORDS: usize = 264
+
+// batch record, in words
+const B_FN: usize = 0
+const B_CTX: usize = 1
+const B_NEXT_LO: usize = 2 // next index to hand out
+const B_END: usize = 3
+const B_CHUNK: usize = 4
+const B_GROUP: usize = 5
+const B_KIND: usize = 6 // 0 = body(ctx, lo, hi); 1 = fn(ctx) -> u64, result into the group
+const B_LINK: usize = 7
+const BATCH_WORDS: usize = 8
+
+// group record, in words (the first word is the futex word)
+const G_PENDING: usize = 0
+const G_RESULT: usize = 1
+const GROUP_WORDS: usize = 2
+
+struct Jobs {
+    blk: u64, // 0 = could not be created
+}
+
+fn lock_of(blk: u64) -> *mut u64 {
+    return (blk + (P_LOCK * 8) as u64) as *mut u64
+}
+
+fn word_addr(base: u64, w: usize) -> u64 {
+    return base + (w * 8) as u64
+}
+
+// Starts `workers` threads (0 to 255). `Jobs.blk == 0` when it did not work.
+fn create(workers: u64) -> Jobs {
+    var w: u64 = workers
+    if w > WORKERS_MAX {
+        w = WORKERS_MAX
+    }
+    let blk: u64 = rt.heap_alloc(P_WORDS * 8)
+    if blk == 0 {
+        return Jobs { blk: 0 }
+    }
+    rt.mem_set(blk, 0 as u8, P_WORDS * 8)
+    var started: u64 = 0
+    while started < w {
+        let h: u64 = thread_start(WORKER_KIND, blk)
+        if h == 0 {
+            break
+        }
+        rt.st64(blk, P_HANDLES + started as usize, h)
+        started = started + 1
+    }
+    rt.st64(blk, P_WORKERS, started)
+    return Jobs { blk: blk }
+}
+
+fn worker_count(j: *mut Jobs) -> u64 {
+    if (*j).blk == 0 {
+        return 0
+    }
+    return rt.ld64((*j).blk, P_WORKERS)
+}
+
+fn executed_by_workers(j: *mut Jobs) -> u64 {
+    if (*j).blk == 0 {
+        return 0
+    }
+    return rt.ld64((*j).blk, P_EXEC_W)
+}
+
+fn executed_by_callers(j: *mut Jobs) -> u64 {
+    if (*j).blk == 0 {
+        return 0
+    }
+    return rt.ld64((*j).blk, P_EXEC_C)
+}
+
+// Takes the next chunk of the front batch and runs it. False when the queue
+// is empty. `counter` is P_EXEC_W or P_EXEC_C.
+fn run_one(blk: u64, counter: usize) -> bool {
+    let lock: *mut u64 = lock_of(blk)
+    thread_lock(lock)
+    let b: u64 = rt.ld64(blk, P_HEAD)
+    if b == 0 {
+        thread_unlock(lock)
+        return false
+    }
+    let lo: u64 = rt.ld64(b, B_NEXT_LO)
+    let end: u64 = rt.ld64(b, B_END)
+    let chunk: u64 = rt.ld64(b, B_CHUNK)
+    var hi: u64 = lo + chunk
+    if hi > end {
+        hi = end
+    }
+    rt.st64(b, B_NEXT_LO, hi)
+    let f: u64 = rt.ld64(b, B_FN)
+    let ctx: u64 = rt.ld64(b, B_CTX)
+    let g: u64 = rt.ld64(b, B_GROUP)
+    let kind: u64 = rt.ld64(b, B_KIND)
+    var gone: bool = false
+    if hi >= end {
+        // last chunk taken: the batch leaves the queue
+        let nx: u64 = rt.ld64(b, B_LINK)
+        rt.st64(blk, P_HEAD, nx)
+        if nx == 0 {
+            rt.st64(blk, P_TAIL, 0)
+        }
+        gone = true
+    }
+    thread_unlock(lock)
+    if gone {
+        rt.heap_free(b, BATCH_WORDS * 8)
+    }
+    __atomic_add(word_addr(blk, counter) as *mut u64, 1)
+    if kind == 0 {
+        let body: fn(u64, u64, u64) = f as fn(u64, u64, u64)
+        body(ctx, lo, hi)
+    } else {
+        let fr: fn(u64) -> u64 = f as fn(u64) -> u64
+        rt.st64(g, G_RESULT, fr(ctx))
+    }
+    // count the items; the locked add orders the body's writes before it
+    let n: u64 = hi - lo
+    let old: u64 = __atomic_add(word_addr(g, G_PENDING) as *mut u64, MINUS1 - n + 1)
+    if old == n {
+        __thread_futex_wake(word_addr(g, G_PENDING), 1024)
+    }
+    return true
+}
+
+// What the dispatcher calls for WORKER_KIND (see the head of this file).
+fn worker_main(blk: u64) -> u64 {
+    while true {
+        // read the sequence BEFORE looking: a push after this read changes it
+        // and the wait below returns at once
+        let seq: u64 = rt.ld64(blk, P_SEQ)
+        if run_one(blk, P_EXEC_W) {
+            continue
+        }
+        if rt.ld64(blk, P_STOP) != 0 {
+            break
+        }
+        __thread_blocked_an()
+        __thread_futex_wait(word_addr(blk, P_SEQ), seq)
+        __thread_blocked_out()
+    }
+    return 0
+}
+
+fn push_batch(blk: u64, b: u64, wake: u64) {
+    let lock: *mut u64 = lock_of(blk)
+    thread_lock(lock)
+    rt.st64(b, B_LINK, 0)
+    let t: u64 = rt.ld64(blk, P_TAIL)
+    if t == 0 {
+        rt.st64(blk, P_HEAD, b)
+    } else {
+        rt.st64(t, B_LINK, b)
+    }
+    rt.st64(blk, P_TAIL, b)
+    rt.st64(blk, P_SEQ, (rt.ld64(blk, P_SEQ) + 1) & 4294967295)
+    thread_unlock(lock)
+    __thread_futex_wake(word_addr(blk, P_SEQ), wake)
+}
+
+// A group counts items; `group_wait` returns when all items added with
+// `group_go` are done. 0 = out of memory.
+fn group_new(j: *mut Jobs) -> u64 {
+    let g: u64 = rt.heap_alloc(GROUP_WORDS * 8)
+    if g == 0 {
+        return 0
+    }
+    rt.mem_set(g, 0 as u8, GROUP_WORDS * 8)
+    return g
+}
+
+fn group_free(j: *mut Jobs, g: u64) {
+    if g != 0 {
+        rt.heap_free(g, GROUP_WORDS * 8)
+    }
+}
+
+fn group_pending(g: u64) -> u64 {
+    return rt.ld64(g, G_PENDING)
+}
+
+// Adds the loop [begin, end) in chunks of `chunk` items to the group and
+// returns at once. Result false: out of memory (nothing was queued).
+fn group_go(j: *mut Jobs, g: u64, begin: u64, end: u64, chunk: u64, body: fn(u64, u64, u64), ctx: u64) -> bool {
+    let blk: u64 = (*j).blk
+    if blk == 0 || g == 0 {
+        return false
+    }
+    if end <= begin {
+        return true
+    }
+    var c: u64 = chunk
+    if c < 1 {
+        c = 1
+    }
+    let b: u64 = rt.heap_alloc(BATCH_WORDS * 8)
+    if b == 0 {
+        return false
+    }
+    rt.st64(b, B_FN, body as u64)
+    rt.st64(b, B_CTX, ctx)
+    rt.st64(b, B_NEXT_LO, begin)
+    rt.st64(b, B_END, end)
+    rt.st64(b, B_CHUNK, c)
+    rt.st64(b, B_GROUP, g)
+    rt.st64(b, B_KIND, 0)
+    __atomic_add(word_addr(g, G_PENDING) as *mut u64, end - begin)
+    let chunks: u64 = (end - begin + c - 1) / c
+    var wake: u64 = chunks
+    let nw: u64 = rt.ld64(blk, P_WORKERS)
+    if wake > nw {
+        wake = nw
+    }
+    push_batch(blk, b, wake)
+    return true
+}
+
+// Waits until the group is empty. The caller runs chunks of ANY batch while
+// it waits (so a job may wait for other jobs and `create(0)` works).
+fn group_wait(j: *mut Jobs, g: u64) {
+    let blk: u64 = (*j).blk
+    if blk == 0 || g == 0 {
+        return
+    }
+    while true {
+        let p: u64 = rt.ld64(g, G_PENDING)
+        if p == 0 {
+            break
+        }
+        if run_one(blk, P_EXEC_C) {
+            continue
+        }
+        __thread_blocked_an()
+        __thread_futex_wait(word_addr(g, G_PENDING), p)
+        __thread_blocked_out()
+    }
+}
+
+// Runs the range [begin, end) chunk by chunk on the calling thread.
+fn run_inline(begin: u64, end: u64, c: u64, body: fn(u64, u64, u64), ctx: u64) {
+    var lo: u64 = begin
+    while lo < end {
+        var hi: u64 = lo + c
+        if hi > end {
+            hi = end
+        }
+        body(ctx, lo, hi)
+        lo = hi
+    }
+}
+
+// body(ctx, lo, hi) for every chunk of [begin, end); returns when all are
+// done. Chunks are disjoint, together exactly the range. Result false: could
+// not be queued (the range was then run on the caller, so it IS complete).
+fn parallel_for(j: *mut Jobs, begin: u64, end: u64, chunk: u64, body: fn(u64, u64, u64), ctx: u64) -> bool {
+    if end <= begin {
+        return true
+    }
+    var c: u64 = chunk
+    if c < 1 {
+        c = 1
+    }
+    if (*j).blk == 0 || rt.ld64((*j).blk, P_WORKERS) == 0 || end - begin <= c {
+        // nobody to share with: the same chunks, in order, right here
+        run_inline(begin, end, c, body, ctx)
+        return true
+    }
+    let g: u64 = group_new(j)
+    if g == 0 {
+        run_inline(begin, end, c, body, ctx)
+        return false
+    }
+    let ok: bool = group_go(j, g, begin, end, c, body, ctx)
+    if !ok {
+        run_inline(begin, end, c, body, ctx)
+        group_free(j, g)
+        return false
+    }
+    group_wait(j, g)
+    group_free(j, g)
+    return true
+}
+
+// One item per chunk: body(ctx, i, i + 1) for i in 0..n. For heavy items
+// (one world chunk each).
+fn parallel_each(j: *mut Jobs, n: u64, body: fn(u64, u64, u64), ctx: u64) -> bool {
+    return parallel_for(j, 0, n, 1, body, ctx)
+}
+
+// A future: runs `f(arg)` on the pool. The result is the handle (0 = out of
+// memory); `join` gives the result and frees it. `task_done` does not block.
+fn spawn(j: *mut Jobs, f: fn(u64) -> u64, arg: u64) -> u64 {
+    let blk: u64 = (*j).blk
+    if blk == 0 {
+        return 0
+    }
+    let g: u64 = group_new(j)
+    if g == 0 {
+        return 0
+    }
+    let b: u64 = rt.heap_alloc(BATCH_WORDS * 8)
+    if b == 0 {
+        group_free(j, g)
+        return 0
+    }
+    rt.st64(b, B_FN, f as u64)
+    rt.st64(b, B_CTX, arg)
+    rt.st64(b, B_NEXT_LO, 0)
+    rt.st64(b, B_END, 1)
+    rt.st64(b, B_CHUNK, 1)
+    rt.st64(b, B_GROUP, g)
+    rt.st64(b, B_KIND, 1)
+    __atomic_add(word_addr(g, G_PENDING) as *mut u64, 1)
+    push_batch(blk, b, 1)
+    return g
+}
+
+fn task_done(t: u64) -> bool {
+    return rt.ld64(t, G_PENDING) == 0
+}
+
+// Waits for the task (helping with other work) and returns its result. The
+// handle is invalid afterwards -- join each task exactly once (R2 of
+// FIRN-GAPS: the handle is freed here, like `thread_wait`).
+fn join(j: *mut Jobs, t: u64) -> u64 {
+    if t == 0 {
+        return 0
+    }
+    group_wait(j, t)
+    let r: u64 = rt.ld64(t, G_RESULT)
+    group_free(j, t)
+    return r
+}
+
+// Ends the workers (after the queue is empty) and frees everything. The
+// caller has waited for all groups and tasks (J7).
+fn destroy(j: *mut Jobs) {
+    let blk: u64 = (*j).blk
+    if blk == 0 {
+        return
+    }
+    rt.st64(blk, P_STOP, 1)
+    let lock: *mut u64 = lock_of(blk)
+    thread_lock(lock)
+    rt.st64(blk, P_SEQ, (rt.ld64(blk, P_SEQ) + 1) & 4294967295)
+    thread_unlock(lock)
+    __thread_futex_wake(word_addr(blk, P_SEQ), 1024)
+    let n: u64 = rt.ld64(blk, P_WORKERS)
+    var i: u64 = 0
+    while i < n {
+        thread_wait(rt.ld64(blk, P_HANDLES + i as usize))
+        i = i + 1
+    }
+    // batches nobody took (a caller that never waited): give the memory back
+    var b: u64 = rt.ld64(blk, P_HEAD)
+    while b != 0 {
+        let nx: u64 = rt.ld64(b, B_LINK)
+        rt.heap_free(b, BATCH_WORDS * 8)
+        b = nx
+    }
+    rt.heap_free(blk, P_WORDS * 8)
+    (*j).blk = 0
+}

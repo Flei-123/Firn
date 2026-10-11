@@ -1,0 +1,203 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/ring.fi -- audio.ring: a single-producer single-consumer ring of
+// PCM frames (S16LE, interleaved) for streaming. A decoder thread (or the
+// game thread) writes, the mixer reads, neither waits for the other.
+//
+//     import audio.ring
+//     var r: ring.Ring = ring.ring_new(16384, 2)         // 16384 frames of stereo
+//     let n: usize = ring.ring_write(&r, pcm_ptr, 4096)   // how many fitted (0 .. 4096)
+//     let m: usize = ring.ring_read(&r, out_ptr, 1024)    // how many were there
+//     ring.ring_close_write(&r)                           // the producer is finished
+//     ring.ring_free(&r)
+//
+// HONEST
+// R1  ONE writer thread and ONE reader thread. Two writers (or readers) at the
+//     same time corrupt it. `ring_clear` must be called by the READER side only.
+// R2  Positions are published with a locked add (`__atomic_add`), which is a
+//     full barrier on x86-64 and aarch64: the samples are visible before the
+//     new write position is.
+// R3  Capacity is rounded up to a power of two (at most 2^26 frames).
+// R4  Memory is not garbage collected: `ring_free` is the owner's job (or
+//     keep the Ring in a std.scope.Scope).
+import std.rt
+
+export {
+    Ring, ring_new, ring_free, ring_write, ring_read, ring_avail, ring_space,
+    ring_clear, ring_close_write, ring_is_finished, ring_channels, ring_capacity, ring_blk,
+}
+
+// block, in 64 bit words
+const R_WPOS: usize = 0 // frames written, ever (wraps at 2^64, never in practice)
+const R_RPOS: usize = 1
+const R_CAP: usize = 2 // frames, power of two
+const R_CH: usize = 3
+const R_DATA: usize = 4 // address of the samples
+const R_CLOSED: usize = 5
+const R_BYTES: usize = 6 // bytes of the sample block
+const R_WORDS: usize = 8
+
+struct Ring {
+    blk: u64, // 0 = could not be created
+}
+
+fn ring_new(frames: usize, channels: u32) -> Ring {
+    if (channels != 1 as u32 && channels != 2 as u32) || frames == 0 {
+        return Ring { blk: 0 }
+    }
+    var cap: usize = 16
+    while cap < frames && cap < 67108864 {
+        cap = cap * 2
+    }
+    let blk: u64 = rt.heap_alloc(R_WORDS * 8)
+    if blk == 0 {
+        return Ring { blk: 0 }
+    }
+    let bytes: usize = cap * channels as usize * 2
+    let data: u64 = rt.heap_alloc(bytes)
+    if data == 0 {
+        rt.heap_free(blk, R_WORDS * 8)
+        return Ring { blk: 0 }
+    }
+    rt.mem_set(blk, 0 as u8, R_WORDS * 8)
+    rt.st64(blk, R_CAP, cap as u64)
+    rt.st64(blk, R_CH, channels as u64)
+    rt.st64(blk, R_DATA, data)
+    rt.st64(blk, R_BYTES, bytes as u64)
+    return Ring { blk: blk }
+}
+
+fn ring_blk(r: *mut Ring) -> u64 {
+    return (*r).blk
+}
+
+fn ring_free(r: *mut Ring) {
+    let blk: u64 = (*r).blk
+    if blk == 0 {
+        return
+    }
+    rt.heap_free(rt.ld64(blk, R_DATA), rt.ld64(blk, R_BYTES) as usize)
+    rt.heap_free(blk, R_WORDS * 8)
+    (*r).blk = 0
+}
+
+fn ring_channels(r: *mut Ring) -> u32 {
+    if (*r).blk == 0 {
+        return 0 as u32
+    }
+    return rt.ld64((*r).blk, R_CH) as u32
+}
+
+fn ring_capacity(r: *mut Ring) -> usize {
+    if (*r).blk == 0 {
+        return 0
+    }
+    return rt.ld64((*r).blk, R_CAP) as usize
+}
+
+fn ring_avail(r: *mut Ring) -> usize {
+    let blk: u64 = (*r).blk
+    if blk == 0 {
+        return 0
+    }
+    return (rt.ld64(blk, R_WPOS) - rt.ld64(blk, R_RPOS)) as usize
+}
+
+fn ring_space(r: *mut Ring) -> usize {
+    let blk: u64 = (*r).blk
+    if blk == 0 {
+        return 0
+    }
+    return rt.ld64(blk, R_CAP) as usize - ring_avail(r)
+}
+
+// Copies up to `frames` frames in; returns how many fitted.
+fn ring_write(r: *mut Ring, p: u64, frames: usize) -> usize {
+    let blk: u64 = (*r).blk
+    if blk == 0 || frames == 0 {
+        return 0
+    }
+    var n: usize = ring_space(r)
+    if frames < n {
+        n = frames
+    }
+    if n == 0 {
+        return 0
+    }
+    let cap: u64 = rt.ld64(blk, R_CAP)
+    let fb: usize = rt.ld64(blk, R_CH) as usize * 2 // bytes per frame
+    let data: u64 = rt.ld64(blk, R_DATA)
+    let w: u64 = rt.ld64(blk, R_WPOS)
+    let start: u64 = w & (cap - 1)
+    var first: usize = n
+    if start + n as u64 > cap {
+        first = (cap - start) as usize
+    }
+    rt.mem_copy(data + start * fb as u64, p, first * fb)
+    if first < n {
+        rt.mem_copy(data, p + (first * fb) as u64, (n - first) * fb)
+    }
+    __atomic_add((blk + (R_WPOS * 8) as u64) as *mut u64, n as u64)
+    return n
+}
+
+// Copies up to `frames` frames out; returns how many there were.
+fn ring_read(r: *mut Ring, out: u64, frames: usize) -> usize {
+    let blk: u64 = (*r).blk
+    if blk == 0 || frames == 0 {
+        return 0
+    }
+    var n: usize = ring_avail(r)
+    if frames < n {
+        n = frames
+    }
+    if n == 0 {
+        return 0
+    }
+    let cap: u64 = rt.ld64(blk, R_CAP)
+    let fb: usize = rt.ld64(blk, R_CH) as usize * 2
+    let data: u64 = rt.ld64(blk, R_DATA)
+    let rp: u64 = rt.ld64(blk, R_RPOS)
+    let start: u64 = rp & (cap - 1)
+    var first: usize = n
+    if start + n as u64 > cap {
+        first = (cap - start) as usize
+    }
+    rt.mem_copy(out, data + start * fb as u64, first * fb)
+    if first < n {
+        rt.mem_copy(out + (first * fb) as u64, data, (n - first) * fb)
+    }
+    __atomic_add((blk + (R_RPOS * 8) as u64) as *mut u64, n as u64)
+    return n
+}
+
+// Reader side: drops everything that is queued.
+fn ring_clear(r: *mut Ring) {
+    let blk: u64 = (*r).blk
+    if blk == 0 {
+        return
+    }
+    let n: u64 = rt.ld64(blk, R_WPOS) - rt.ld64(blk, R_RPOS)
+    if n > 0 {
+        __atomic_add((blk + (R_RPOS * 8) as u64) as *mut u64, n)
+    }
+}
+
+// Producer side: no more frames will come.
+fn ring_close_write(r: *mut Ring) {
+    if (*r).blk != 0 {
+        __atomic_add(((*r).blk + (R_CLOSED * 8) as u64) as *mut u64, 1)
+    }
+}
+
+// Closed by the producer and everything has been read.
+fn ring_is_finished(r: *mut Ring) -> bool {
+    let blk: u64 = (*r).blk
+    if blk == 0 {
+        return true
+    }
+    // read CLOSED first: frames written before the close are then visible
+    if rt.ld64(blk, R_CLOSED) == 0 {
+        return false
+    }
+    return ring_avail(r) == 0
+}

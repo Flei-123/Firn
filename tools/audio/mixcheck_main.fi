@@ -1,0 +1,116 @@
+// tools/audio/mixcheck_main.fi -- writes the deterministic sine and mixer
+// scenario of lib/audio to files, for tools/audio/check.py (bit for bit
+// against an independent Python implementation) and prints their CRC-32.
+//
+//   mixcheck DIR      writes DIR/sine.pcm, DIR/sine_mono.pcm, DIR/mix.pcm
+//
+// Output: "CRC sine=<n> sine_mono=<n> mix=<n> underruns=<n>"
+import std.rt
+import audio.pcm
+import audio.synth
+import audio.mixer
+import audio.ring
+
+fn path_join(dir: u64, name: str, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, dir, rt.c_length(dir))
+    rt.buf_push(out, 47 as u8)
+    rt.buf_push_bytes(out, name.p as u64, name.length())
+    rt.buf_push(out, 0 as u8)
+}
+
+fn emit(out: *mut rt.Buf, key: str, v: u64) {
+    rt.buf_push_bytes(out, key.p as u64, key.length())
+    rt.buf_push_dec_u64(out, v)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        return 2
+    }
+    let dir: u64 = rt.arg_ptr(start, 1)
+    var path: rt.Buf = rt.buf_new()
+
+    // ---- sine: stereo in three calls (the phase continues), then mono
+    let sbuf: u64 = rt.heap_alloc(3000 * 4)
+    var ph: u32 = 0 as u32
+    ph = synth.sine_fill(sbuf, 1000, 2 as u32, 440 as u32, 48000 as u32, 20000 as u32, ph)
+    ph = synth.sine_fill(sbuf + 4000, 1000, 2 as u32, 440 as u32, 48000 as u32, 20000 as u32, ph)
+    ph = synth.sine_fill(sbuf + 8000, 1000, 2 as u32, 440 as u32, 48000 as u32, 20000 as u32, ph)
+    path_join(dir, "sine.pcm", &path)
+    rt.write_file(rt.buf_ptr(&path), sbuf, 12000)
+    let crc_sine: u32 = pcm.crc32(sbuf, 12000)
+    let mbuf: u64 = rt.heap_alloc(500 * 2)
+    synth.sine_fill(mbuf, 500, 1 as u32, 1000 as u32, 48000 as u32, 32767 as u32, 1073741824 as u32)
+    path_join(dir, "sine_mono.pcm", &path)
+    rt.write_file(rt.buf_ptr(&path), mbuf, 1000)
+    let crc_mono: u32 = pcm.crc32(mbuf, 1000)
+
+    // ---- mixer scenario
+    var m: mixer.Mixer = mixer.mixer_new(48000 as u32)
+    mixer.mixer_set_master(&m, 90 as u32)
+    // A: mono 1500 frames
+    let a: u64 = rt.heap_alloc(1500 * 2)
+    var i: u64 = 0
+    while i < 1500 {
+        rt.st16(a, i as usize, (((i * 37) % 2001 + 65536 - 1000) * 20 % 65536) as u16)
+        i = i + 1
+    }
+    // B: stereo 700 frames
+    let b: u64 = rt.heap_alloc(700 * 4)
+    i = 0
+    while i < 700 {
+        rt.st16(b, (i * 2) as usize, (((i * 91) % 3001 + 65536 - 1500) * 10 % 65536) as u16)
+        rt.st16(b, (i * 2 + 1) as usize, (((i * 53) % 2501 + 65536 - 1250) * 12 % 65536) as u16)
+        i = i + 1
+    }
+    // C: mono 3000 frames, constant 30000 (clips against the others)
+    let c: u64 = rt.heap_alloc(3000 * 2)
+    i = 0
+    while i < 3000 {
+        rt.st16(c, i as usize, 30000 as u16)
+        i = i + 1
+    }
+    // D: stream of 1500 stereo frames, a ramp
+    var r: ring.Ring = ring.ring_new(4096, 2 as u32)
+    let d: u64 = rt.heap_alloc(1500 * 4)
+    i = 0
+    while i < 1500 {
+        rt.st16(d, (i * 2) as usize, ((i * 20) % 65536) as u16)
+        rt.st16(d, (i * 2 + 1) as usize, ((65536 - (i * 20) % 65536) % 65536) as u16)
+        i = i + 1
+    }
+    if ring.ring_write(&r, d, 1500) != 1500 { return 3 }
+    ring.ring_close_write(&r)
+
+    let h1: u64 = mixer.mixer_play(&m, a, 1500, 1 as u32, 100 as u32, -50, true)
+    let h2: u64 = mixer.mixer_play(&m, b, 700, 2 as u32, 150 as u32, 30, false)
+    let h3: u64 = mixer.mixer_play(&m, c, 3000, 1 as u32, 200 as u32, 0, false)
+    let h4: u64 = mixer.mixer_play_stream(&m, &r, 80 as u32, -100)
+    if h1 == 0 || h2 == 0 || h3 == 0 || h4 == 0 { return 4 }
+    if mixer.mixer_voices(&m) != 4 { return 5 }
+
+    let out: u64 = rt.heap_alloc(3000 * 4)
+    mixer.mixer_mix(&m, out, 1000)
+    mixer.mixer_set_volume(&m, h1, 30 as u32)
+    mixer.mixer_set_pan(&m, h1, 100)
+    mixer.mixer_mix(&m, out + 4000, 777)
+    mixer.mixer_stop(&m, h3)
+    if mixer.mixer_is_playing(&m, h3) { return 6 }
+    if mixer.mixer_set_volume(&m, h3, 10 as u32) { return 7 } // dead handle
+    mixer.mixer_mix(&m, out + 7108, 1223)
+    path_join(dir, "mix.pcm", &path)
+    rt.write_file(rt.buf_ptr(&path), out, 12000)
+    let crc_mix: u32 = pcm.crc32(out, 12000)
+
+    var line: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&line, "CRC".p as u64, 3)
+    emit(&line, " sine=", crc_sine as u64)
+    emit(&line, " sine_mono=", crc_mono as u64)
+    emit(&line, " mix=", crc_mix as u64)
+    emit(&line, " underruns=", mixer.mixer_underruns(&m))
+    emit(&line, " voices_left=", mixer.mixer_voices(&m))
+    rt.buf_push(&line, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&line), rt.buf_len(&line))
+    return 0
+}
