@@ -216,9 +216,11 @@ struct RowCtx {
 
 // gradient index f of column x, exactly the plain model (dx, dy, dz, len, ny, g, gg)
 fn sky_f_at(c: *mut RowCtx, x: usize) -> u32 {
-    let dx: f64 = *(((*c).cols + (x as u64) * (8 as u64)) as *mut f64) + (*c).eyx
-    let dy: f64 = *(((*c).cols + (((*c).wn + x) as u64) * (8 as u64)) as *mut f64) + (*c).eyy
-    let dz: f64 = *(((*c).cols + (((*c).wn * 2 + x) as u64) * (8 as u64)) as *mut f64) + (*c).eyz
+    let o: u64 = (x as u64) << (3 as u64)
+    let ws: u64 = ((*c).wn as u64) << (3 as u64)
+    let dx: f64 = *((((*c).cols) + o) as *mut f64) + (*c).eyx
+    let dy: f64 = *((((*c).cols) + ws + o) as *mut f64) + (*c).eyy
+    let dz: f64 = *((((*c).cols) + ws + ws + o) as *mut f64) + (*c).eyz
     let len: f64 = math.sqrt((dx * dx + dy * dy) + dz * dz)
     let ny: f64 = dy / len
     var g: f64 = ny * 1.6
@@ -235,10 +237,11 @@ fn sky_fill(c: *mut RowCtx, a: usize, b: usize) {
     let fb: u32 = rt.ld32((*c).fcol, b)
     if b - a <= 1 { return }
     if fa == fb {
-        var i: usize = a + 1
-        while i < b {
-            rt.st32((*c).fcol, i, fa)
-            i = i + 1
+        var pp: u64 = (*c).fcol + (((a + 1) as u64) << (2 as u64))
+        let pe: u64 = (*c).fcol + ((b as u64) << (2 as u64))
+        while pp < pe {
+            *(pp as *mut u32) = fa
+            pp = pp + (4 as u64)
         }
         return
     }
@@ -301,6 +304,99 @@ fn sky_glow_pixel(s: *mut Sky, px: u32, dx: f64, dy: f64, dz: f64, ss: f64, du: 
     let cg: i64 = ((((px >> 8 as u32) & 255 as u32) as i64) * k + (*s).lg as i64 * fg) >> 8 as i64
     let cb: i64 = ((((px >> 16 as u32) & 255 as u32) as i64) * k + (*s).lb as i64 * fg) >> 8 as i64
     return (cr as u32) | ((cg as u32) << 8 as u32) | ((cb as u32) << 16 as u32) | 0xFF000000 as u32
+}
+
+// One lit row: gradient colour from the table, glow where the conservative test passes (see sky_draw).
+// Pointer walking instead of indexed helper calls: this loop is the hot spot of the sunset frame.
+// d . sun is linear in the column: columns whose value is below -1e-3 cannot glow (they need d . sun > 0), they are
+// plain table copies; only the (conservatively widened) range [lo, hi) gets the per pixel test.
+fn sky_glow_row(s: *mut Sky, cols: u64, wn: usize, eyx: f64, eyy: f64, eyz: f64, fcol: u64, tab: u64, gsq: u64, out: u64) {
+    let glowf: f64 = (*s).glow as f64
+    let sunx: f64 = (*s).sunx
+    let suny: f64 = (*s).suny
+    let sunz: f64 = (*s).sunz
+    let lr: i64 = (*s).lr as i64
+    let lg: i64 = (*s).lg as i64
+    let lb: i64 = (*s).lb as i64
+    let step: u64 = 8 as u64
+    let wb: u64 = (wn as u64) << (3 as u64)
+    // du at the first and the last column (same expression as in the loop)
+    let last: u64 = wb - step
+    let d0: f64 = ((*(cols as *mut f64) + eyx) * sunx + (*((cols + wb) as *mut f64) + eyy) * suny) + (*((cols + wb + wb) as *mut f64) + eyz) * sunz
+    let d1: f64 = ((*((cols + last) as *mut f64) + eyx) * sunx + (*((cols + wb + last) as *mut f64) + eyy) * suny) + (*((cols + wb + wb + last) as *mut f64) + eyz) * sunz
+    var lo: usize = 0
+    var hi: usize = wn
+    let thr: f64 = -0.001
+    if d0 < thr && d1 < thr {
+        hi = 0
+    } else if d0 < thr || d1 < thr {
+        let xs: f64 = (thr - d0) / (d1 - d0) * ((wn as f64) - 1.0)
+        if d0 < thr {
+            var l: f64 = xs - 3.0
+            if l < 0.0 { l = 0.0 }
+            if l > (wn as f64) { l = wn as f64 }
+            lo = l as usize
+        } else {
+            var h: f64 = xs + 4.0
+            if h < 0.0 { h = 0.0 }
+            if h > (wn as f64) { h = wn as f64 }
+            hi = h as usize
+        }
+    }
+    if hi < lo { hi = lo }
+    var pdx: u64 = cols + ((lo as u64) << (3 as u64))
+    var pdy: u64 = pdx + wb
+    var pdz: u64 = pdy + wb
+    var pf: u64 = fcol
+    var po: u64 = out
+    let pa: u64 = fcol + ((lo as u64) << (2 as u64))
+    let pb: u64 = fcol + ((hi as u64) << (2 as u64))
+    let pend: u64 = fcol + ((wn as u64) << (2 as u64))
+    while pf < pa {
+        *(po as *mut u32) = *((tab + ((*(pf as *mut u32)) as u64) * (4 as u64)) as *mut u32)
+        pf = pf + (4 as u64)
+        po = po + (4 as u64)
+    }
+    while pf < pb {
+        let f: u64 = (*(pf as *mut u32)) as u64
+        var px: u32 = *((tab + f * (4 as u64)) as *mut u32)
+        let dx: f64 = *(pdx as *mut f64) + eyx
+        let dy: f64 = *(pdy as *mut f64) + eyy
+        let dz: f64 = *(pdz as *mut f64) + eyz
+        let ss: f64 = (dx * dx + dy * dy) + dz * dz
+        let du: f64 = (dx * sunx + dy * suny) + dz * sunz
+        if du > 0.0 && du * du > *((gsq + f * step) as *mut f64) * ss {
+            let il: f64 = 1.0 / math.sqrt(ss)
+            let dsun: f64 = du * il
+            var g: f64 = (dy * il) * 1.6
+            if g < 0.0 { g = 0.0 }
+            if g > 1.0 { g = 1.0 }
+            let om: f64 = 1.0 - g
+            let v: f64 = ((dsun * dsun) * dsun) * (om * om) * glowf
+            let fg: i64 = v as i64
+            let fr: f64 = v - (fg as f64)
+            if dsun < 1.0e-7 || fr < 1.0e-7 || fr > 0.9999999 {
+                px = sky_pixel_plain(s, dx, dy, dz)
+            } else {
+                let kk: i64 = 256 as i64 - fg
+                let cr: i64 = (((px & 255 as u32) as i64) * kk + lr * fg) >> 8 as i64
+                let cg: i64 = ((((px >> 8 as u32) & 255 as u32) as i64) * kk + lg * fg) >> 8 as i64
+                let cb: i64 = ((((px >> 16 as u32) & 255 as u32) as i64) * kk + lb * fg) >> 8 as i64
+                px = (cr as u32) | ((cg as u32) << 8 as u32) | ((cb as u32) << 16 as u32) | 0xFF000000 as u32
+            }
+        }
+        *(po as *mut u32) = px
+        pdx = pdx + step
+        pdy = pdy + step
+        pdz = pdz + step
+        pf = pf + (4 as u64)
+        po = po + (4 as u64)
+    }
+    while pf < pend {
+        *(po as *mut u32) = *((tab + ((*(pf as *mut u32)) as u64) * (4 as u64)) as *mut u32)
+        pf = pf + (4 as u64)
+        po = po + (4 as u64)
+    }
 }
 
 struct Box { x0: i32, x1: i32, y0: i32, y1: i32 } // inclusive pixel ranges; empty when x1 < x0
@@ -489,24 +585,16 @@ fn sky_draw(s: *mut Sky, r: *mut mc_raster.Raster) {
         let base: usize = (y as usize) * wn
         var x: usize = 0
         if lit {
-            while x < wn {
-                let f: usize = rt.ld32(rc.fcol, x) as usize
-                var px: u32 = tab[f]
-                let dx: f64 = *((rc.cols + (x as u64) * (8 as u64)) as *mut f64) + rc.eyx
-                let dy: f64 = *((rc.cols + ((wn + x) as u64) * (8 as u64)) as *mut f64) + rc.eyy
-                let dz: f64 = *((rc.cols + ((wn * 2 + x) as u64) * (8 as u64)) as *mut f64) + rc.eyz
-                let ss: f64 = (dx * dx + dy * dy) + dz * dz
-                let du: f64 = (dx * sunx + dy * suny) + dz * sunz
-                if du > 0.0 && du * du > gsq[f] * ss {
-                    px = sky_glow_pixel(s, px, dx, dy, dz, ss, du, glowf)
-                }
-                rt.st32(col, base + x, px)
-                x = x + 1
-            }
+            sky_glow_row(s, rc.cols, wn, rc.eyx, rc.eyy, rc.eyz, rc.fcol, (&tab[0]) as u64, (&gsq[0]) as u64, col + (base as u64) * (4 as u64))
         } else {
-            while x < wn {
-                rt.st32(col, base + x, tab[rt.ld32(rc.fcol, x) as usize])
-                x = x + 1
+            var pf: u64 = rc.fcol
+            var po: u64 = col + (base as u64) * (4 as u64)
+            let pend: u64 = rc.fcol + (wn as u64) * (4 as u64)
+            let tb: u64 = (&tab[0]) as u64
+            while pf < pend {
+                *(po as *mut u32) = *((tb + ((*(pf as *mut u32)) as u64) * (4 as u64)) as *mut u32)
+                pf = pf + (4 as u64)
+                po = po + (4 as u64)
             }
         }
         // ---- discs: plain-model pixels inside the boxes
