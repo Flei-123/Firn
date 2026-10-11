@@ -1,0 +1,220 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_net.fi -- connecting to a server: retry with back-off, and the server list ping.
+//
+//   net_connect_retry(addr, port, attempts, backoff_ms)   TCP connect; on failure wait and try again
+//                                                         (the wait doubles each time, capped at 8 s)
+//   net_status(addr, port, host, &version, attempts, &st) the Status exchange of the protocol (no login):
+//                                                         handshake -> request -> server info (JSON) ->
+//                                                         ping -> pong. Fills Status: the server's
+//                                                         protocol number and version name, players, the
+//                                                         MOTD as plain text and the round trip time.
+//
+// The point of net_status for the rest of the library: the PROTOCOL NUMBER in the answer selects the
+// Version object (`mc_versions.version_by_protocol`) before the client logs in -- one binary, several
+// versions (docs/MC-VERSIONS.md). The status exchange itself is the same in every version, so any
+// known Version can be used to speak it.
+//
+// "Non-blocking" here means: no call blocks for longer than the timeouts you give (every receive uses
+// the codec's receive timeout, mc_codec.wire_timeout); an epoll based variant on lib/async is not built.
+
+import std.net
+import std.bytes
+import std.rt
+import std.json
+import std.str
+import mc.mc_codec
+import mc.mc_client
+import mc.mc_sem
+import mc.mc_text
+import mc.mc_version
+
+export {
+    Status, status_new, status_free,
+    net_connect_retry, net_status,
+    NS_OK, NS_CONNECT, NS_SEND, NS_TIMEOUT, NS_BAD_REPLY, NS_CLOSED,
+}
+
+const NS_OK: i32 = 0
+const NS_CONNECT: i32 = 0 - 1
+const NS_SEND: i32 = 0 - 2
+const NS_TIMEOUT: i32 = 0 - 3
+const NS_BAD_REPLY: i32 = 0 - 4
+const NS_CLOSED: i32 = 0 - 5
+const MAX_BACKOFF_MS: u64 = 8000
+
+struct Status {
+    protocol: i32, // protocol number the server announces (-1 if absent)
+    name: [u8; 64], // its version name, e.g. "1.20.1"
+    name_len: usize,
+    online: i32,
+    max: i32,
+    latency_ms: u64, // ping -> pong
+    motd: rt.Buf, // plain text of the description
+}
+
+fn status_new() -> Status {
+    return Status { protocol: 0 - 1, name: [0; 64], name_len: 0, online: 0 - 1, max: 0 - 1, latency_ms: 0, motd: rt.buf_new() }
+}
+
+fn status_free(s: *mut Status) {
+    rt.buf_free(&(*s).motd)
+}
+
+fn now_ms() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000 as u64 + (ts[1] as u64) / 1000000 as u64
+}
+
+fn sleep_ms(ms: u64) {
+    var ts: [i64; 2] = [0; 2]
+    ts[0] = (ms / 1000 as u64) as i64
+    ts[1] = ((ms % 1000 as u64) * 1000000 as u64) as i64
+    syscall(35, (&ts[0]) as i64, 0, 0, 0, 0, 0)
+}
+
+// Connects; waits `backoff_ms` (doubling, at most 8 s) between up to `attempts` tries. A closed
+// connection is returned when every attempt failed (check net.conn_is_open).
+fn net_connect_retry(addr: u32, port: u16, attempts: i32, backoff_ms: u64) -> net.Conn {
+    var wait: u64 = backoff_ms
+    var k: i32 = 0
+    while k < attempts {
+        let c: net.Conn = net.connect_tcp(addr, port) catch net.conn_from_fd(0 - 1)
+        if net.conn_is_open(&c) {
+            return c
+        }
+        k = k + 1
+        if k < attempts {
+            sleep_ms(wait)
+            wait = wait * 2 as u64
+            if wait > MAX_BACKOFF_MS {
+                wait = MAX_BACKOFF_MS
+            }
+        }
+    }
+    return net.conn_from_fd(0 - 1)
+}
+
+// reads the answer JSON into `st`
+fn read_info(st: *mut Status, p: u64, n: usize) -> bool {
+    var j: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&j, p, n) catch false
+    if !ok {
+        json.json_free(&j)
+        return false
+    }
+    let root: u32 = json.json_root(&j)
+    let ver: u32 = json.json_get(&j, root, "version".p as u64, 7)
+    if ver != json.JSON_NONE {
+        let pr: u32 = json.json_get(&j, ver, "protocol".p as u64, 8)
+        if pr != json.JSON_NONE {
+            (*st).protocol = json.json_int(&j, pr) as i32
+        }
+        let nm: u32 = json.json_get(&j, ver, "name".p as u64, 4)
+        if nm != json.JSON_NONE && json.json_kind(&j, nm) == json.JSON_STRING {
+            let sp: str.Span = json.json_string(&j, nm)
+            var l: usize = sp.n
+            if l > 64 {
+                l = 64
+            }
+            var i: usize = 0
+            while i < l {
+                (*st).name[i] = rt.ld8(sp.p as u64, i)
+                i = i + 1
+            }
+            (*st).name_len = l
+        }
+    }
+    let pl: u32 = json.json_get(&j, root, "players".p as u64, 7)
+    if pl != json.JSON_NONE {
+        let on: u32 = json.json_get(&j, pl, "online".p as u64, 6)
+        let mx: u32 = json.json_get(&j, pl, "max".p as u64, 3)
+        if on != json.JSON_NONE {
+            (*st).online = json.json_int(&j, on) as i32
+        }
+        if mx != json.JSON_NONE {
+            (*st).max = json.json_int(&j, mx) as i32
+        }
+    }
+    let ds: u32 = json.json_get(&j, root, "description".p as u64, 11)
+    if ds != json.JSON_NONE {
+        // the description is a chat component: serialise it back and flatten with mc_text
+        var raw: rt.Buf = rt.buf_new()
+        json.json_write(&j, ds, &raw, false)
+        var t: mc_text.TextDoc = mc_text.text_new()
+        var tr: mc_text.Translations = mc_text.tr_new()
+        mc_text.text_from_json(&t, rt.buf_ptr(&raw), rt.buf_len(&raw), &tr)
+        mc_text.text_plain(&t, &(*st).motd)
+        mc_text.tr_free(&tr)
+        mc_text.text_free(&t)
+        rt.buf_free(&raw)
+    }
+    json.json_free(&j)
+    return true
+}
+
+// The status exchange. `host` is the NUL terminated address string put into the handshake. Returns NS_OK
+// or a NS_* code. `attempts` / a 250 ms start back-off as in net_connect_retry; `max_waits` receive timeouts
+// (200 ms each) are tolerated while waiting for the answers.
+fn net_status(addr: u32, port: u16, host: u64, ver: *mut mc_version.Version, attempts: i32, max_waits: i32, st: *mut Status) -> i32 {
+    var conn: net.Conn = net_connect_retry(addr, port, attempts, 250 as u64)
+    if !net.conn_is_open(&conn) {
+        return NS_CONNECT
+    }
+    net.set_no_delay(&conn, true) catch false
+    var cl: mc_client.Client = mc_client.client_new(conn, *ver)
+    mc_codec.wire_timeout(&cl.w, 200)
+    var rc: i32 = NS_OK
+    if !mc_client.client_handshake(&cl, host, port, 1) {
+        rc = NS_SEND
+    }
+    if rc == NS_OK {
+        var empty: bytes.Bytes = bytes.bytes_new()
+        if !mc_client.client_send(&cl, mc_version.ST_STATUS, mc_sem.SEM_STATUS_C2S_PING_START, &empty) {
+            rc = NS_SEND
+        }
+        bytes.bytes_free(&empty)
+    }
+    var got_info: bool = false
+    var got_pong: bool = false
+    var t_ping: u64 = 0
+    var waits: i32 = 0
+    while rc == NS_OK && !got_pong {
+        let id: i32 = mc_client.client_next(&cl)
+        if id == mc_client.CL_TIMEOUT {
+            waits = waits + 1
+            if waits > max_waits {
+                rc = NS_TIMEOUT
+            }
+        } else if id < 0 {
+            rc = NS_CLOSED
+        } else if mc_client.client_is(&cl, id, mc_sem.SEM_STATUS_S2C_SERVER_INFO) {
+            let body: *mut bytes.Bytes = mc_client.client_body(&cl)
+            var sl: usize = 0
+            let sp: u64 = bytes.get_string(body, &sl) catch 0
+            if sp == 0 || !read_info(st, sp, sl) {
+                rc = NS_BAD_REPLY
+            } else {
+                got_info = true
+                var pb: bytes.Bytes = bytes.bytes_new()
+                t_ping = now_ms()
+                bytes.put_i64(&pb, t_ping as i64)
+                if !mc_client.client_send(&cl, mc_version.ST_STATUS, mc_sem.SEM_STATUS_C2S_PING, &pb) {
+                    rc = NS_SEND
+                }
+                bytes.bytes_free(&pb)
+            }
+        } else if mc_client.client_is(&cl, id, mc_sem.SEM_STATUS_S2C_PING) {
+            if !got_info {
+                rc = NS_BAD_REPLY
+            } else {
+                (*st).latency_ms = now_ms() - t_ping
+                got_pong = true
+            }
+        } else {
+            rc = NS_BAD_REPLY
+        }
+    }
+    mc_client.client_free(&cl)
+    return rc
+}

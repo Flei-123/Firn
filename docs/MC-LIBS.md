@@ -53,33 +53,34 @@ For library authors that means:
 
 ## The list
 
-Legend for "Exists today": **yes** = nothing to build, only cross-checks; **part** =
-extend; **no** = build.
+Status 2026-10-11 (end of the library round). "Cross-check" = against an INDEPENDENT reference (python / node / java), never against
+Mojang code. All of it runs with `bash tools/mc/run.sh` (about 10 minutes).
 
-| Lib | Purpose | Exists today? | Effort | Order | Test numbers |
-|---|---|---|---|---|---|
-| `std.bytes` (VarInt/VarLong, ZigZag, string, uuid, position, BE ints/floats) | wire primitives | **yes** (`tests/1601`) | - | 0 | - |
-| `std.net` + `lib/async` (epoll loop, stream, TLS stream), `lib/net/dns` | sockets, non-blocking, DNS | **yes** | - | 0 | - |
-| `std.deflate` (zlib/gzip), `std.crypto.aes` (CFB8 with in-place shift register), `sha1/sha256/md5/hmac/random`, `std.json`, `std.nbt` | building blocks | **yes** | - | 0 | - |
-| `mc_packet` | bounds-checked Reader/Writer for protocol types: string(max len), uuid, position, angle, bitset (long array), optional, array-prefixed, rest-buffer, f32/f64, slot (version hook), anonymous-NBT glue; sticky error flag | part (`std.bytes` has the scalars) | M | 1 | 2660-2669 |
-| `mc_version` + `mc_sem` + `mc_versions` + `lib/mc/vNNN/mc_proto_vNNN.fi` + `tools/mcgen` | the Version object (protocol, FLAG_*, chunk format, semantic packet ids, lookup function values); generator `protocol.json` -> packet tables and schema programs for 1.8.9, 1.12.2, 1.16.5, 1.20.1, 1.20.2 | **done** (this branch; conformance for 5 versions, `tools/mc/schema/run.sh`) | L | 1 | 2650-2659 |
-| `mc_schema` | generic packet walker / validator over the generated schema programs: any packet of any generated version, exact-consumption check, field dump, field ranges | **done** (≈ 800k packets/s; 3056 reference fixtures) | L | 1 | 2650-2659 |
-| `mc_codec` | frame reader/writer: length VarInt, compression threshold, zlib, AES-CFB8 stream (both directions), packet-size limits, state machine Handshake/Status/Login/Play, stats | part (first version from `demos/mcclient/wire.fi`, no CFB8 yet) | M | 2 | 2690-2699 |
-| `mc_crypto` | RSA public key from X.509 SubjectPublicKeyInfo DER, PKCS#1 v1.5 encryption for the login, shared-secret generation, CFB8 wrapper | part (`rsa.fi` verify only, `tls/der.fi`, `x509.fi`, `random.fi`) | M | 2 | 2670-2679 |
-| `mc_auth` | offline UUID (md5), server-id digest (SHA-1 as signed hex), session `join` call (HTTPS), profile; MSA/Xbox chain (`lib/auth/msa.fi`) re-checked | part (`md5_offline_uuid`, `msa.fi` exist, never run against the live services) | M | 3 | 2670-2679 |
-| `mc_nbt` (extension) | tree/DOM reader over `std.nbt` pull reader, typed getters, long-array helpers, writer from tree, SNBT print (optional) | part (`std.nbt` pull API) | S-M | 3 | 2660-2669 |
-| `mc_chunk` | chunk column -> palette sections (block states + biomes), heightmaps, light, block-entity count; normalised dense palette storage | **done** (this branch, cross-checked against an independent python decoder) | M | 2 | 2690-2699 |
-| `mc_world` | chunk store by (x,z), coordinate math (floor div), section index, later change lists, Anvil region read/write | part (store + math done; Anvil: no) | M | 3 | 2700-2709 |
-| `mc_registry` + `tools/mcgen` | block states (id <-> name + properties, default state, flags), items, entities, biomes, particles as compact generated tables | **no** | L | 3 | 2650-2659 |
-| `mc_text` | chat components: JSON (`std.json`) and legacy `§` codes -> styled spans, plain text, ANSI; translate keys with a caller-provided table | **no** | M | 4 | 2660-2669 |
-| `mc_math` | Vec3/IVec3/AABB, ray-AABB, voxel raycast (DDA), frustum planes from a matrix, 4x4 matrices | **no** (`lib/math/core_math.fi` is scalar only) | M | 4 | 2680-2689 |
-| `mc_mesh` | chunk -> vertex/index buffers on the CPU: culling of hidden faces, greedy meshing, ambient occlusion, no GPU | **no** | L | 5 | 2680-2689 |
-| `mc_noise` | deterministic RNGs (splitmix64, xoshiro256**, Java-style 48-bit LCG as documented), Perlin (improved), Simplex, octave / fBm | **no** | M | 5 | 2700-2709 |
-| `mc_net` | non-blocking client on `lib/async`: connect, reconnect with backoff, status ping (server list, latency), keep-alive handling | part (async stream exists) | M | 6 | 2710-2719 |
-| `demos/mcclient` | **final integration**: Handshake -> Login (offline) -> Play -> chunk dump + checksum == node-minecraft-protocol, against a real 1.20.1 server | in progress (works against the libs above) | S | 7 (last) | - |
+| Lib | Purpose | Status | Cross-check | Test numbers |
+|---|---|---|---|---|
+| `std.bytes`, `std.net`, `lib/async`, `std.deflate`, `std.crypto.*`, `std.json`, `std.nbt` | building blocks | existed | - | - |
+| `mc_version` + `mc_sem` + `mc_versions` + `vNNN/mc_proto_vNNN.fi` + `tools/mcgen` | Version object (protocol, FLAG_*, chunk format, semantic packet ids), generator `protocol.json` -> tables for **1.8.9, 1.12.2, 1.16.5, 1.20.1, 1.20.2** | **done** | 3056 packets from node-minecraft-protocol consumed exactly, 5 versions x 4 build stages | 2650 |
+| `mc_schema` | generic packet walker / validator (any packet of any generated version) | **done** (~0.8 M packets/s) | same fixtures + truncation / extension / mutation / random input | 2650 |
+| `mc_registry` + `vNNN/mc_reg_vNNN.fi` | blocks, ALL block states with properties, items, entities, biomes per version | **done** | minecraft-data + prismarine-block, 5 versions, 24135 states for 1.20.1 | 2690 |
+| `mc_packet` | bounds-checked Reader / Writer for protocol types (sub-worker B) | **done** (1.20.1 / 1.20.2 hooks) | node protodef serializer | 2660-2662 |
+| `mc_nbt` | NBT tree, byte-identical write-back, SNBT | **done** | 60 random trees written by prismarine-nbt, both root forms, fuzz | 2741 |
+| `mc_text` | chat components, legacy codes, ANSI, translations | **done** | 200 random components vs a python re-implementation | 2742 |
+| `mc_codec` | frames, zlib threshold, AES-128-CFB8 both directions | **done** | independent python peer, compression x encryption, hostile frames | - |
+| `mc_crypto` | RSA SPKI parse, PKCS#1 v1.5 encrypt, shared secret, CFB8 stream (sub-worker A) | **done** | node crypto (RSA decrypt, aes-128-cfb8) | 2670-2672 |
+| `mc_auth` | offline UUID, server hash, session join, MSA review (sub-worker A) | done, **session join only against a mock**, MSA never run against the live service | python mock server, published hash vectors | 2675 |
+| `mc_chunk` + `mc_world` | palette sections, heightmaps, light, coordinate math | **done** | independent python decoder / dump; real 1.20.1 server (109 chunks) | - |
+| `mc_dimension` | min_y / height from the Join Game codec | **done** | real 1.20.1 server | 2691 |
+| `mc_client` | Handshake -> Login -> (Configuration) -> Play for any version | done for 1.20.1 (real server); configuration phase **only compiled** | real 1.20.1 server | - |
+| `mc_net` | connect with retry / back-off, server list ping | **done** | python status server | - |
+| `mc_math` | Vec3 / AABB / voxel raycast / mat4 / frustum (sub-worker C) | **done** | numpy, brute force | 2680 |
+| `mc_mesh` | CPU greedy meshing + AO (sub-worker C wrote it, lead finished) | **done** | 128 meshes vs python brute force | 2730 |
+| `mc_noise` | RNGs, Perlin, simplex, octaves | **done** | real `java.util.Random`, python bit-identical, published vectors | 2700 |
+| `mc_anvil` | .mca region files read / write | **done** | independent python reader / writer, fuzz | 2710 |
+| `demos/mcclient` | **final integration**: join a real server, dump + checksum == node-minecraft-protocol | **done** (M0 accepted, see ROUND-M0.md) | node-minecraft-protocol on a real 1.20.1 server | - |
 
-Not planned (explicitly): rendering, GPU (blocked by H3), Wasm mod host (M8), physics,
-inventory logic -- those are later milestones of the GDD.
+Not built (explicitly): rendering / GPU (blocked by H3), Wasm mod host, physics, inventory, entity decoding, online-mode login against
+the live Microsoft / Mojang services (needs a real account), schema-driven client packet writers, an epoll based `mc_net`, chunk
+strategies other than 1.18+ (see MC-VERSIONS.md).
 
 ## Work split (sub-workers, separate git worktrees)
 
