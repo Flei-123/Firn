@@ -113,7 +113,7 @@ The loading problem is solved; these are left:
    `glXGetProcAddress` / `wglGetProcAddress` and has to be called after a
    context is current). The table is all-64-bit on purpose, so the shapes are
    few: ints, a float, pointers.
-2. **Windows window**: `window.gpu_open` for `backend.windows.fi`: the HWND exists,
+2. **Windows window** (DONE in round MC-B, see `docs/WINDOWS_GPU.md`; Wine only): `window.gpu_open` for `backend.windows.fi`: the HWND exists,
    so `GetDC`, `ChoosePixelFormat`/`SetPixelFormat`, `wglCreateContext` is the
    sequence `win_gl_probe.fi` already runs; for GL 3.3 core
    `wglCreateContextAttribsARB` through `wglGetProcAddress`; `SwapBuffers` from
