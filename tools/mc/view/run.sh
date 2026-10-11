@@ -19,7 +19,7 @@ ERR=0
 $FIRNC -o "$W/mcview" demos/mcview/main.fi 2>"$W/err" || { echo "  FAIL  demos/mcview does not compile"; head -10 "$W/err"; echo "RESULT mc-view: FAIL"; exit 1; }
 
 compare() { # <dir> <label> [world file]
-    python3 -I tools/mc/view/ref_render.py "$1" $3 > "$W/cmp.txt" 2>&1; rc=$?
+    python3 -I tools/mc/view/ref_render.py "$1" ${3:-} > "$W/cmp.txt" 2>&1; rc=$?
     sed 's/^/  /' "$W/cmp.txt"
     [ $rc -eq 0 ] && echo "  ok    $2: python renderer == Firn image" || { echo "  FAIL  $2 (code $rc)"; ERR=1; }
 }

@@ -16,7 +16,7 @@ import mc.mc_camera
 import mc.mc_raster
 
 export {
-    Sky, sky_new, sky_set_time, sky_draw, sky_set_raster_fog, sky_tint_frame, sky_sin_deg, sky_cos_deg,
+    Sky, sky_new, sky_set_time, sky_draw, sky_draw_plain, sky_set_raster_fog, sky_tint_frame, sky_sin_deg, sky_cos_deg,
 }
 
 const SUN_COS: f64 = 0.9976 // disc radius about 4 degrees
@@ -66,7 +66,7 @@ fn sky_cos_deg(x: f64) -> f64 {
 }
 
 fn lerp(a: i64, b: i64, t: i64) -> i64 {
-    return (a * (256 as i64 - t) + b * t) / 256 as i64
+    return (a * (256 as i64 - t) + b * t) >> 8 as i64
 }
 
 fn clamp01(x: f64) -> f64 {
@@ -144,9 +144,9 @@ fn pack(r: i64, g: i64, b: i64) -> u32 {
     return (r as u32) | ((g as u32) << 8 as u32) | ((b as u32) << 16 as u32) | 0xFF000000 as u32
 }
 
-// Background pass: writes every pixel of the colour buffer (the depth buffer is not touched).
-// `raster_set_camera` must have been called with the camera of this frame.
-fn sky_draw(s: *mut Sky, r: *mut mc_raster.Raster) {
+// Plain model of the background pass (one normalisation per pixel, no shortcuts). This is the definition of the image;
+// `sky_draw` must produce exactly the same pixels (tests/2754_mc_sky.fi compares both on random scenes).
+fn sky_draw_plain(s: *mut Sky, r: *mut mc_raster.Raster) {
     let w: i32 = (*r).w
     let h: i32 = (*r).h
     let glowf: f64 = (*s).glow as f64
@@ -203,6 +203,336 @@ fn sky_draw(s: *mut Sky, r: *mut mc_raster.Raster) {
         }
         y = y + 1
     }
+}
+
+// Per row state of the gradient search: the column part of the ray (3 tables of w f64: fx + ex*rx, fy + ex*ry,
+// fz + ex*rz, same expressions as the plain model), the row part (ey * u) and the output f per column.
+struct RowCtx {
+    cols: u64, // 3 * w f64
+    fcol: u64, // w u32: f = floor(256 gg) per column
+    wn: usize,
+    eyx: f64, eyy: f64, eyz: f64,
+}
+
+// gradient index f of column x, exactly the plain model (dx, dy, dz, len, ny, g, gg)
+fn sky_f_at(c: *mut RowCtx, x: usize) -> u32 {
+    let dx: f64 = *(((*c).cols + (x as u64) * (8 as u64)) as *mut f64) + (*c).eyx
+    let dy: f64 = *(((*c).cols + (((*c).wn + x) as u64) * (8 as u64)) as *mut f64) + (*c).eyy
+    let dz: f64 = *(((*c).cols + (((*c).wn * 2 + x) as u64) * (8 as u64)) as *mut f64) + (*c).eyz
+    let len: f64 = math.sqrt((dx * dx + dy * dy) + dz * dz)
+    let ny: f64 = dy / len
+    var g: f64 = ny * 1.6
+    if g < 0.0 { g = 0.0 }
+    if g > 1.0 { g = 1.0 }
+    let gg: f64 = 1.0 - (1.0 - g) * (1.0 - g)
+    return (gg * 256.0) as u32 // gg >= 0: truncation == floor
+}
+
+// Fills fcol[a..b] (both ends already set) for a segment on which ny is monotone: if both ends agree the whole
+// segment has that value, otherwise bisect.
+fn sky_fill(c: *mut RowCtx, a: usize, b: usize) {
+    let fa: u32 = rt.ld32((*c).fcol, a)
+    let fb: u32 = rt.ld32((*c).fcol, b)
+    if b - a <= 1 { return }
+    if fa == fb {
+        var i: usize = a + 1
+        while i < b {
+            rt.st32((*c).fcol, i, fa)
+            i = i + 1
+        }
+        return
+    }
+    let m: usize = (a + b) / 2
+    rt.st32((*c).fcol, m, sky_f_at(c, m))
+    sky_fill(c, a, m)
+    sky_fill(c, m, b)
+}
+
+// one pixel of the plain model from the (unnormalised) ray d
+fn sky_pixel_plain(s: *mut Sky, dx: f64, dy: f64, dz: f64) -> u32 {
+    let len: f64 = math.sqrt((dx * dx + dy * dy) + dz * dz)
+    let nx: f64 = dx / len
+    let ny: f64 = dy / len
+    let nz: f64 = dz / len
+    let g: f64 = clamp01(ny * 1.6)
+    let gg: f64 = 1.0 - (1.0 - g) * (1.0 - g)
+    let f: i64 = math.floor(gg * 256.0) as i64
+    var cr: i64 = lerp((*s).hr as i64, (*s).zr as i64, f)
+    var cg: i64 = lerp((*s).hg as i64, (*s).zg as i64, f)
+    var cb: i64 = lerp((*s).hb as i64, (*s).zb as i64, f)
+    let dsun: f64 = (nx * (*s).sunx + ny * (*s).suny) + nz * (*s).sunz
+    if dsun > 0.0 && (*s).glow > 0 {
+        let d3: f64 = (dsun * dsun) * dsun
+        let wgt: f64 = d3 * (1.0 - gg)
+        let fg: i64 = math.floor(wgt * ((*s).glow as f64)) as i64
+        cr = lerp(cr, (*s).lr as i64, fg)
+        cg = lerp(cg, (*s).lg as i64, fg)
+        cb = lerp(cb, (*s).lb as i64, fg)
+    }
+    if (*s).discs {
+        if dsun >= SUN_COS {
+            cr = 255
+            cg = 248
+            cb = 200
+        } else if (0.0 - dsun) >= MOON_COS {
+            cr = 226
+            cg = 228
+            cb = 240
+        }
+    }
+    return pack(cr, cg, cb)
+}
+
+// Glow pixel for a pixel the conservative test lets through (px = gradient colour, ss = |d|^2, du = d.sun):
+// dsun and ny from one sqrt + one division; near an integer boundary of floor(d3 (1-gg) glow) the plain formulas decide.
+fn sky_glow_pixel(s: *mut Sky, px: u32, dx: f64, dy: f64, dz: f64, ss: f64, du: f64, glowf: f64) -> u32 {
+    let il: f64 = 1.0 / math.sqrt(ss)
+    let dsun: f64 = du * il
+    var g: f64 = (dy * il) * 1.6
+    if g < 0.0 { g = 0.0 }
+    if g > 1.0 { g = 1.0 }
+    let gg: f64 = 1.0 - (1.0 - g) * (1.0 - g)
+    let v: f64 = ((dsun * dsun) * dsun) * (1.0 - gg) * glowf
+    let fg: i64 = v as i64
+    let fr: f64 = v - (fg as f64)
+    if dsun < 1.0e-7 || fr < 1.0e-7 || fr > 0.9999999 { return sky_pixel_plain(s, dx, dy, dz) }
+    let k: i64 = 256 as i64 - fg
+    let cr: i64 = (((px & 255 as u32) as i64) * k + (*s).lr as i64 * fg) >> 8 as i64
+    let cg: i64 = ((((px >> 8 as u32) & 255 as u32) as i64) * k + (*s).lg as i64 * fg) >> 8 as i64
+    let cb: i64 = ((((px >> 16 as u32) & 255 as u32) as i64) * k + (*s).lb as i64 * fg) >> 8 as i64
+    return (cr as u32) | ((cg as u32) << 8 as u32) | ((cb as u32) << 16 as u32) | 0xFF000000 as u32
+}
+
+struct Box { x0: i32, x1: i32, y0: i32, y1: i32 } // inclusive pixel ranges; empty when x1 < x0
+
+// Conservative screen box of the disc around direction (sx, sy, sz): every pixel whose normalised ray is within 0.12 rad
+// of the direction lies inside (interval arithmetic on the camera basis; the discs are 0.07 rad); the whole screen when
+// the direction is too close to the image plane.
+fn sky_disc_box(r: *mut mc_raster.Raster, sx: f64, sy: f64, sz: f64) -> Box {
+    let full: Box = Box { x0: 0, x1: (*r).w - 1, y0: 0, y1: (*r).h - 1 }
+    let sf: f64 = (sx * (*r).fx + sy * (*r).fy) + sz * (*r).fz
+    let sr: f64 = (sx * (*r).rx + sy * (*r).ry) + sz * (*r).rz
+    let su: f64 = (sx * (*r).ux + sy * (*r).uy) + sz * (*r).uz
+    let m: f64 = 0.12
+    let amin: f64 = sf - m
+    let amax: f64 = sf + m
+    // a pixel ray makes an angle with the view axis of at most the corner angle: cos = 1 / sqrt(1 + tx^2 + ty^2)
+    let tx: f64 = (*r).hw / (*r).fpx
+    let ty: f64 = (*r).hh / (*r).fpy
+    let cmin: f64 = 0.9 / math.sqrt(1.0 + tx * tx + ty * ty)
+    if amax < cmin * 0.5 { return Box { x0: 0, x1: -1, y0: 0, y1: -1 } }
+    if amin < 0.1 { return full }
+    // ex = b / a with a in [amin, amax], b in [sr - m, sr + m]
+    var exmin: f64 = (sr - m) / amin
+    if sr - m >= 0.0 { exmin = (sr - m) / amax }
+    var exmax: f64 = (sr + m) / amax
+    if sr + m >= 0.0 { exmax = (sr + m) / amin }
+    var eymin: f64 = (su - m) / amin
+    if su - m >= 0.0 { eymin = (su - m) / amax }
+    var eymax: f64 = (su + m) / amax
+    if su + m >= 0.0 { eymax = (su + m) / amin }
+    // pixel x = ex * fpx + hw - 0.5, pixel y = hh - ey * fpy - 0.5
+    var x0: i64 = ((exmin * (*r).fpx + (*r).hw) as i64) - 2 as i64
+    var x1: i64 = ((exmax * (*r).fpx + (*r).hw) as i64) + 2 as i64
+    var y0: i64 = (((*r).hh - eymax * (*r).fpy) as i64) - 2 as i64
+    var y1: i64 = (((*r).hh - eymin * (*r).fpy) as i64) + 2 as i64
+    if exmin * (*r).fpx + (*r).hw < -1000000.0 || exmax * (*r).fpx + (*r).hw > 1000000.0 { return full }
+    if (*r).hh - eymax * (*r).fpy < -1000000.0 || (*r).hh - eymin * (*r).fpy > 1000000.0 { return full }
+    if x0 < 0 as i64 { x0 = 0 }
+    if y0 < 0 as i64 { y0 = 0 }
+    if x1 > ((*r).w as i64) - 1 as i64 { x1 = ((*r).w as i64) - 1 as i64 }
+    if y1 > ((*r).h as i64) - 1 as i64 { y1 = ((*r).h as i64) - 1 as i64 }
+    return Box { x0: x0 as i32, x1: x1 as i32, y0: y0 as i32, y1: y1 as i32 }
+}
+
+// Background pass: writes every pixel of the colour buffer (the depth buffer is not touched).
+// `raster_set_camera` must have been called with the camera of this frame.
+// The result is bit-identical to `sky_draw_plain` (the model of docs/mc/sky.md), only evaluated lazily:
+//  * gradient colour = 257 entry table indexed by f = floor(256 gg); f is computed exactly for a few columns per row and
+//    bisected: along one row ny is monotone left and right of one extremum (the ray moves on a great circle arc,
+//    ny = (Py + ex ry) / |P + ex R| has a closed-form extremum column), so equal ends mean equal inside,
+//  * glow: only where a conservative test on the unnormalised dot product (squares, no sqrt) says floor(d3 (1-gg) glow) can
+//    be >= 1; there the value comes from one sqrt + one division and is re-done with the plain formulas when it lies within
+//    1e-7 of an integer or of the dsun > 0 edge (rounding error is ~1e-12),
+//  * sun / moon discs: exact plain-model pixels inside a conservative screen bounding box of each disc only.
+fn sky_draw(s: *mut Sky, r: *mut mc_raster.Raster) {
+    let w: i32 = (*r).w
+    let h: i32 = (*r).h
+    let glowi: i32 = (*s).glow
+    let glowf: f64 = glowi as f64
+    let discs: bool = (*s).discs
+    let sunx: f64 = (*s).sunx
+    let suny: f64 = (*s).suny
+    let sunz: f64 = (*s).sunz
+    let zr: i64 = (*s).zr as i64
+    let zg: i64 = (*s).zg as i64
+    let zb: i64 = (*s).zb as i64
+    let hr: i64 = (*s).hr as i64
+    let hg: i64 = (*s).hg as i64
+    let hb: i64 = (*s).hb as i64
+    let lr: i64 = (*s).lr as i64
+    let lg: i64 = (*s).lg as i64
+    let lb: i64 = (*s).lb as i64
+    let hw: f64 = (*r).hw
+    let hh: f64 = (*r).hh
+    let fpx: f64 = (*r).fpx
+    let fpy: f64 = (*r).fpy
+    let fx: f64 = (*r).fx
+    let fy: f64 = (*r).fy
+    let fz: f64 = (*r).fz
+    let rx: f64 = (*r).rx
+    let ry: f64 = (*r).ry
+    let rz: f64 = (*r).rz
+    let ux: f64 = (*r).ux
+    let uy: f64 = (*r).uy
+    let uz: f64 = (*r).uz
+    let col: u64 = (*r).color
+    let wn: usize = w as usize
+    // gradient colours and the glow thresholds per f: glow needs floor(d3 * (1 - gg) * glow) >= 1, i.e.
+    // dsun^3 >= 1 / (glow * (1 - gg)) with 1 - gg < (257 - f) / 256; gsq[f] = (lower bound of dsun)^2 (safety factor 0.9)
+    var tab: [u32; 257] = [0 as u32; 257]
+    var gsq: [f64; 257] = [0.0; 257]
+    var k: i64 = 0
+    while k <= 256 as i64 {
+        tab[k as usize] = pack(lerp(hr, zr, k), lerp(hg, zg, k), lerp(hb, zb, k))
+        if glowi > 0 {
+            let ub: f64 = ((257 as i64 - k) as f64) / 256.0
+            var t: f64 = 0.0
+            while (t + 0.01) * (t + 0.01) * (t + 0.01) * (glowf * ub) < 0.9 && t < 1.2 { t = t + 0.01 }
+            gsq[k as usize] = t * t
+        }
+        k = k + 1
+    }
+    let lit: bool = glowi > 0
+    var rc: RowCtx = RowCtx { cols: rt.heap_alloc(wn * 3 * 8), fcol: rt.heap_alloc(wn * 4), wn: wn, eyx: 0.0, eyy: 0.0, eyz: 0.0 }
+    var cx: i32 = 0
+    while cx < w {
+        let ex: f64 = (((cx as f64) + 0.5) - hw) / fpx
+        *((rc.cols + (cx as u64) * (8 as u64)) as *mut f64) = fx + ex * rx
+        *((rc.cols + ((wn as u64) + (cx as u64)) * (8 as u64)) as *mut f64) = fy + ex * ry
+        *((rc.cols + ((wn as u64) * (2 as u64) + (cx as u64)) * (8 as u64)) as *mut f64) = fz + ex * rz
+        cx = cx + 1
+    }
+    // the bisection needs one extremum per row (an arc below 180 degrees): very wide lenses evaluate every pixel
+    let fast: bool = hw < 4.0 * fpx
+    var sunbox: Box = Box { x0: 0, x1: -1, y0: 0, y1: -1 }
+    var moonbox: Box = Box { x0: 0, x1: -1, y0: 0, y1: -1 }
+    if discs {
+        sunbox = sky_disc_box(r, sunx, suny, sunz)
+        moonbox = sky_disc_box(r, 0.0 - sunx, 0.0 - suny, 0.0 - sunz)
+    }
+    var y: i32 = 0
+    while y < h {
+        let ey: f64 = (hh - ((y as f64) + 0.5)) / fpy
+        rc.eyx = ey * ux
+        rc.eyy = ey * uy
+        rc.eyz = ey * uz
+        // ---- gradient index per column
+        if fast {
+            // extremum of ny along the row: d(ex) = P + ex R, ny = (Py + ex ry) / |d|, derivative zero at
+            // ex* = (Py (P.R) - ry (P.P)) / ((P.R) ry - Py (R.R))  (the ex^2 terms cancel)
+            let px: f64 = fx + rc.eyx
+            let py: f64 = fy + rc.eyy
+            let pz: f64 = fz + rc.eyz
+            let pp: f64 = (px * px + py * py) + pz * pz
+            let pr: f64 = (px * rx + py * ry) + pz * rz
+            let rr: f64 = (rx * rx + ry * ry) + rz * rz
+            let den: f64 = pr * ry - py * rr
+            var xs: f64 = -10.0 // column of the extremum (outside = none)
+            if den != 0.0 {
+                let exs: f64 = (py * pr - ry * pp) / den
+                xs = exs * fpx + hw - 0.5
+            }
+            var lo: i64 = -10 as i64
+            var hi: i64 = -10 as i64
+            if xs > -3.0 && xs < (wn as f64) + 3.0 {
+                lo = (xs as i64) - 2 as i64 // truncation: within 1 column of floor; the 5 columns lo..hi are exact
+                hi = lo + 4 as i64
+            }
+            // segments [0, lo-1] and [hi+1, w-1] are monotone; the columns lo..hi are evaluated one by one
+            var a0: i64 = 0
+            var b1: i64 = (wn as i64) - 1 as i64
+            var seg_lo_end: i64 = b1
+            var seg_hi_start: i64 = 0
+            if lo != -10 as i64 {
+                seg_lo_end = lo - 1 as i64
+                seg_hi_start = hi + 1 as i64
+                var e: i64 = lo
+                if e < 0 as i64 { e = 0 }
+                while e <= hi && e <= b1 {
+                    rt.st32(rc.fcol, e as usize, sky_f_at(&rc, e as usize))
+                    e = e + 1
+                }
+            } else {
+                seg_hi_start = b1 + 1 as i64 // everything is one segment [0, w-1]
+            }
+            if seg_lo_end > b1 { seg_lo_end = b1 }
+            if seg_lo_end >= a0 {
+                rt.st32(rc.fcol, a0 as usize, sky_f_at(&rc, a0 as usize))
+                rt.st32(rc.fcol, seg_lo_end as usize, sky_f_at(&rc, seg_lo_end as usize))
+                sky_fill(&rc, a0 as usize, seg_lo_end as usize)
+            }
+            if seg_hi_start < a0 { seg_hi_start = a0 }
+            if seg_hi_start <= b1 && lo != -10 as i64 {
+                rt.st32(rc.fcol, seg_hi_start as usize, sky_f_at(&rc, seg_hi_start as usize))
+                rt.st32(rc.fcol, b1 as usize, sky_f_at(&rc, b1 as usize))
+                sky_fill(&rc, seg_hi_start as usize, b1 as usize)
+            }
+        } else {
+            var q: usize = 0
+            while q < wn {
+                rt.st32(rc.fcol, q, sky_f_at(&rc, q))
+                q = q + 1
+            }
+        }
+        // ---- pixels
+        let base: usize = (y as usize) * wn
+        var x: usize = 0
+        if lit {
+            while x < wn {
+                let f: usize = rt.ld32(rc.fcol, x) as usize
+                var px: u32 = tab[f]
+                let dx: f64 = *((rc.cols + (x as u64) * (8 as u64)) as *mut f64) + rc.eyx
+                let dy: f64 = *((rc.cols + ((wn + x) as u64) * (8 as u64)) as *mut f64) + rc.eyy
+                let dz: f64 = *((rc.cols + ((wn * 2 + x) as u64) * (8 as u64)) as *mut f64) + rc.eyz
+                let ss: f64 = (dx * dx + dy * dy) + dz * dz
+                let du: f64 = (dx * sunx + dy * suny) + dz * sunz
+                if du > 0.0 && du * du > gsq[f] * ss {
+                    px = sky_glow_pixel(s, px, dx, dy, dz, ss, du, glowf)
+                }
+                rt.st32(col, base + x, px)
+                x = x + 1
+            }
+        } else {
+            while x < wn {
+                rt.st32(col, base + x, tab[rt.ld32(rc.fcol, x) as usize])
+                x = x + 1
+            }
+        }
+        // ---- discs: plain-model pixels inside the boxes
+        if discs {
+            var bi: i32 = 0
+            while bi < 2 {
+                var bx: Box = sunbox
+                if bi == 1 { bx = moonbox }
+                if y >= bx.y0 && y <= bx.y1 {
+                    var xx: i32 = bx.x0
+                    while xx <= bx.x1 {
+                        let u: usize = xx as usize
+                        let dx: f64 = *((rc.cols + (u as u64) * (8 as u64)) as *mut f64) + rc.eyx
+                        let dy: f64 = *((rc.cols + ((wn + u) as u64) * (8 as u64)) as *mut f64) + rc.eyy
+                        let dz: f64 = *((rc.cols + ((wn * 2 + u) as u64) * (8 as u64)) as *mut f64) + rc.eyz
+                        rt.st32(col, base + u, sky_pixel_plain(s, dx, dy, dz))
+                        xx = xx + 1
+                    }
+                }
+                bi = bi + 1
+            }
+        }
+        y = y + 1
+    }
+    rt.heap_free(rc.cols, wn * 3 * 8)
+    rt.heap_free(rc.fcol, wn * 4)
 }
 
 // Sets the rasterizer fog to the sky's fog colour (linear from `start` to `end` view depth).
