@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/netmc/probe.fi -- driver for net.ip6, SRV, net.addrinfo, IPv6 sockets.
+// tools/netmc/run.sh runs it against Python servers and compares.
+//
+//   probe ip6 <text>                          parse + canonical text, or BAD
+//   probe [-s ip:port] srv <name>             SRV set, one line per entry
+//   probe [-s ip:port] addrs <host>           address list
+//   probe [-s ip:port] svc <host> [port]      resolve_service for _minecraft._tcp.
+//   probe [-s ip:port] dial <host> <port> [stagger_ms]
+//                                             resolve, happy-eyeballs dial, send
+//                                             "ping\n", print the first reply line
+//   probe serve6                              listen on [::1]:0, print the port,
+//                                             accept one client, echo one line
+import std.rt
+import std.net
+import net.dns
+import net.ip6
+import net.addrinfo
+
+fn parse_u32(p: u64, n: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        if ch < 48 as u8 || ch > 57 as u8 {
+            break
+        }
+        v = v * 10 as u32 + (ch - 48 as u8) as u32
+        i = i + 1
+    }
+    return v
+}
+
+fn word(out: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(out, s.p as u64, s.n)
+}
+
+fn flush(out: *mut rt.Buf) {
+    rt.write_everything(1, (*out).ptr, (*out).len)
+    rt.buf_clear(out)
+}
+
+fn mono_ms() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000 + ts[1] / 1000000
+}
+
+fn print_list(out: *mut rt.Buf, l: *mut addrinfo.AddrList) {
+    var i: usize = 0
+    while i < (*l).n {
+        word(out, "addr ")
+        addrinfo.addrs_text(l, i, out)
+        rt.buf_push(out, 10 as u8)
+        i = i + 1
+    }
+}
+
+fn main(start: u64) -> i32 {
+    var res: dns.Resolver = dns.resolver_new()
+    dns.resolver_init(&res)
+    var out: rt.Buf = rt.buf_new()
+    let argc: usize = rt.arg_count(start)
+    var i: usize = 1
+    // options
+    while i + 1 < argc && rt.ld8(rt.arg_ptr(start, i), 0) == 45 as u8 {
+        let vp: u64 = rt.arg_ptr(start, i + 1)
+        let vn: usize = rt.c_length(vp)
+        var colon: usize = vn
+        var k: usize = 0
+        while k < vn {
+            if rt.ld8(vp, k) == 58 as u8 {
+                colon = k
+            }
+            k = k + 1
+        }
+        var ip: u32 = 0
+        if dns.dns_parse_ipv4(vp, colon, &ip) {
+            dns.resolver_clear_servers(&res)
+            dns.resolver_add_server(&res, ip)
+            if colon < vn {
+                dns.resolver_set_port(&res, parse_u32(vp + (colon + 1) as u64, vn - colon - 1) as u16)
+            }
+        }
+        dns.resolver_set_retries(&res, 1 as u32)
+        dns.resolver_set_timeout(&res, 800 as u64)
+        i = i + 2
+    }
+    if i >= argc {
+        return 2
+    }
+    let cmd: u64 = rt.arg_ptr(start, i)
+    let c0: u8 = rt.ld8(cmd, 0)
+    let c1: u8 = rt.ld8(cmd, 1)
+    let a1: u64 = rt.arg_ptr(start, i + 1)
+    let n1: usize = rt.c_length(a1)
+    var rc: i32 = 0
+    if c0 == 105 as u8 { // ip6
+        var a: [u8; 16] = [0; 16]
+        if ip6.ip6_parse(a1, n1, &a) {
+            ip6.ip6_format((&a[0]) as u64, &out)
+        } else {
+            word(&out, "BAD")
+        }
+        rt.buf_push(&out, 10 as u8)
+    } else if c0 == 115 as u8 && c1 == 114 as u8 { // srv
+        var set: dns.SrvSet = dns.srvset_new()
+        let ok: bool = dns.dns_resolve_srv(&res, a1, n1, &set) catch false
+        if ok {
+            var q: usize = 0
+            while q < set.n {
+                word(&out, "srv ")
+                rt.buf_push_dec_u64(&out, set.prio[q] as u64)
+                rt.buf_push(&out, 32 as u8)
+                rt.buf_push_dec_u64(&out, set.weight[q] as u64)
+                rt.buf_push(&out, 32 as u8)
+                rt.buf_push_dec_u64(&out, set.port[q] as u64)
+                rt.buf_push(&out, 32 as u8)
+                rt.buf_push_bytes(&out, dns.srv_target(&set, q), set.nlen[q])
+                rt.buf_push(&out, 10 as u8)
+                q = q + 1
+            }
+        } else {
+            word(&out, "ERR ")
+            dns.dns_err_name(dns.resolver_last_error(&res), &out)
+            rt.buf_push(&out, 10 as u8)
+        }
+    } else if c0 == 97 as u8 { // addrs
+        var l: addrinfo.AddrList = addrinfo.addrs_new()
+        let ok2: bool = addrinfo.addrs_resolve(&res, a1, n1, &l) catch false
+        if ok2 {
+            print_list(&out, &l)
+        } else {
+            word(&out, "ERR ")
+            dns.dns_err_name(dns.resolver_last_error(&res), &out)
+            rt.buf_push(&out, 10 as u8)
+        }
+    } else if c0 == 115 as u8 && c1 == 118 as u8 { // svc
+        var port: u16 = 0 as u16
+        if i + 2 < argc {
+            let pp: u64 = rt.arg_ptr(start, i + 2)
+            port = parse_u32(pp, rt.c_length(pp)) as u16
+        }
+        var sv: addrinfo.Service = addrinfo.service_new()
+        let ok3: bool = addrinfo.resolve_service(&res, "_minecraft._tcp.", a1, n1, port, 25565 as u16, &sv) catch false
+        if ok3 {
+            word(&out, "svc port=")
+            rt.buf_push_dec_u64(&out, sv.port as u64)
+            word(&out, " srv=")
+            var flag: u64 = 0
+            if sv.used_srv {
+                flag = 1
+            }
+            rt.buf_push_dec_u64(&out, flag)
+            word(&out, " host=")
+            rt.buf_push_bytes(&out, (&sv.host[0]) as u64, sv.hlen)
+            rt.buf_push(&out, 10 as u8)
+            print_list(&out, &sv.addrs)
+        } else {
+            word(&out, "ERR ")
+            dns.dns_err_name(dns.resolver_last_error(&res), &out)
+            rt.buf_push(&out, 10 as u8)
+        }
+    } else if c0 == 100 as u8 { // dial
+        let pp2: u64 = rt.arg_ptr(start, i + 2)
+        let port2: u16 = parse_u32(pp2, rt.c_length(pp2)) as u16
+        var stagger: i64 = 250
+        if i + 3 < argc {
+            let sp: u64 = rt.arg_ptr(start, i + 3)
+            stagger = parse_u32(sp, rt.c_length(sp)) as i64
+        }
+        var l2: addrinfo.AddrList = addrinfo.addrs_new()
+        let ok4: bool = addrinfo.addrs_resolve(&res, a1, n1, &l2) catch false
+        if !ok4 {
+            word(&out, "ERR resolve\n")
+        } else {
+            var which: usize = 0
+            var err: i64 = 0
+            let t0: i64 = mono_ms()
+            var c: net.Conn = addrinfo.addrs_connect(&l2, port2, stagger, 3000, false, &which, &err) catch net.conn_from_fd(0 - 1)
+            let dt: i64 = mono_ms() - t0
+            if !net.conn_is_open(&c) {
+                word(&out, "ERR connect errno=")
+                rt.buf_push_dec_i64(&out, err)
+                rt.buf_push(&out, 10 as u8)
+            } else {
+                word(&out, "connected via ")
+                addrinfo.addrs_text(&l2, which, &out)
+                word(&out, " ms=")
+                rt.buf_push_dec_i64(&out, dt)
+                rt.buf_push(&out, 10 as u8)
+                var ping: [u8; 5] = "ping\n"
+                net.write_all(&c, (&ping[0]) as u64, 5) catch 0
+                var rb: [u8; 64] = [0; 64]
+                let got: usize = net.read(&c, (&rb[0]) as u64, 64) catch 0
+                word(&out, "reply ")
+                rt.buf_push_bytes(&out, (&rb[0]) as u64, got)
+                net.close(&c)
+            }
+        }
+    } else if c0 == 115 as u8 { // serve6
+        var lo: [u8; 16] = [0; 16]
+        lo[15] = 1 as u8
+        var ls: net.Listener = net.listen_tcp6((&lo[0]) as u64, 0 as u16, 8) catch net.listener_from_fd(0 - 1)
+        if !net.listener_is_open(&ls) {
+            word(&out, "ERR listen6\n")
+            rc = 1
+        } else {
+            rt.buf_push_dec_u64(&out, net.listener_port(&ls) as u64)
+            rt.buf_push(&out, 10 as u8)
+            flush(&out)
+            var c2: net.Conn = net.accept(&ls) catch net.conn_from_fd(0 - 1)
+            var rb2: [u8; 64] = [0; 64]
+            let g2: usize = net.read(&c2, (&rb2[0]) as u64, 64) catch 0
+            var hd: [u8; 5] = "v6ok:"
+            net.write_all(&c2, (&hd[0]) as u64, 5) catch 0
+            net.write_all(&c2, (&rb2[0]) as u64, g2) catch 0
+            net.close(&c2)
+            net.close_listener(&ls)
+        }
+    }
+    flush(&out)
+    rt.buf_free(&out)
+    dns.resolver_free(&res)
+    return rc
+}

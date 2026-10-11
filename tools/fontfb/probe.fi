@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fontfb/probe.fi -- font chain + COLR probe.
+//   probe <font0> <font1> <font2> -- <text>
+// Prints, per run: "run <off> <len> <font>"; then for each code point of
+// font 2 given as text: "layers <cp> <n> <gid:colour>...".
+import std.rt
+import font.ttf
+import font.colr
+import font.fallback
+
+fn word(o: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(o, s.p as u64, s.n)
+}
+
+fn slurp(path: u64, f: *mut ttf.Font) -> bool {
+    let fd: i64 = syscall(2, path as i64, 0, 0, 0, 0, 0)
+    if fd < 0 {
+        return false
+    }
+    let cap: usize = 1 << 20
+    let buf: u64 = rt.heap_alloc(cap)
+    let n: i64 = syscall(0, fd, buf as i64, cap as i64, 0, 0, 0)
+    syscall(3, fd, 0, 0, 0, 0, 0)
+    if n <= 0 {
+        return false
+    }
+    return ttf.font_init(f, buf as *mut u8, n as usize)
+}
+
+fn main(start: u64) -> i32 {
+    var f0: ttf.Font = ttf.font_new()
+    var f1: ttf.Font = ttf.font_new()
+    var f2: ttf.Font = ttf.font_new()
+    if !slurp(rt.arg_ptr(start, 1), &f0) || !slurp(rt.arg_ptr(start, 2), &f1) || !slurp(rt.arg_ptr(start, 3), &f2) {
+        return 2
+    }
+    var c: fallback.Chain = fallback.chain_new()
+    fallback.chain_add(&c, &f0, fallback.K_LATIN)
+    fallback.chain_add(&c, &f1, fallback.K_CJK)
+    fallback.chain_add(&c, &f2, fallback.K_EMOJI)
+    let tp: u64 = rt.arg_ptr(start, 5)
+    let tn: usize = rt.c_length(tp)
+    var runs: [fallback.Run; 64] = [fallback.Run { off: 0, len: 0, font: 0 }; 64]
+    let nr: usize = fallback.chain_segment(&c, tp, tn, &runs, 64)
+    var out: rt.Buf = rt.buf_new()
+    var r: usize = 0
+    while r < nr {
+        word(&out, "run ")
+        rt.buf_push_dec_u64(&out, runs[r].off as u64)
+        rt.buf_push(&out, 32 as u8)
+        rt.buf_push_dec_u64(&out, runs[r].len as u64)
+        rt.buf_push(&out, 32 as u8)
+        rt.buf_push_dec_u64(&out, runs[r].font as u64)
+        rt.buf_push(&out, 10 as u8)
+        r = r + 1
+    }
+    // COLR layers of every code point of the text in font 2
+    var i: usize = 0
+    while i < tn {
+        var l: usize = 1
+        let cp: u32 = fallback.utf8_next(tp, tn, i, &l)
+        i = i + l
+        let gid: u32 = ttf.font_glyph_for(&f2, cp)
+        var gids: [u32; 32] = [0; 32]
+        var idx: [u32; 32] = [0; 32]
+        let nl: usize = colr.colr_layers(&f2, gid, &gids, &idx)
+        if nl > 0 {
+            word(&out, "layers ")
+            rt.buf_push_dec_u64(&out, cp as u64)
+            var k: usize = 0
+            while k < nl {
+                var col: u32 = 0
+                colr.cpal_color(&f2, 0, idx[k], &col)
+                rt.buf_push(&out, 32 as u8)
+                rt.buf_push_dec_u64(&out, gids[k] as u64)
+                rt.buf_push(&out, 58 as u8)
+                rt.buf_push_dec_u64(&out, col as u64)
+                k = k + 1
+            }
+            rt.buf_push(&out, 10 as u8)
+        }
+    }
+    // paint smoke test: 96x24 buffer, white text on black
+    var cx: fallback.PaintCtx = fallback.ctx_new()
+    let pix: u64 = rt.heap_alloc(96 * 24 * 4)
+    var q: usize = 0
+    while q < 96 * 24 {
+        rt.st32(pix, q, 0xFF000000 as u32)
+        q = q + 1
+    }
+    let adv: f64 = fallback.chain_paint(&cx, &c, tp, tn, 16.0, 2.0, 18.0, 0xFFFFFFFF as u32, 0 as u32, pix, 96, 24)
+    var lit_n: u64 = 0
+    var sum: u64 = 0
+    q = 0
+    while q < 96 * 24 {
+        let v: u32 = rt.ld32(pix, q)
+        if v != 0xFF000000 as u32 {
+            lit_n = lit_n + 1
+        }
+        sum = sum + (v & 0xFFFFFF as u32) as u64
+        q = q + 1
+    }
+    word(&out, "paint adv=")
+    rt.buf_push_dec_u64(&out, adv as u64)
+    word(&out, " lit=")
+    rt.buf_push_dec_u64(&out, lit_n)
+    word(&out, " sum=")
+    rt.buf_push_dec_u64(&out, sum)
+    rt.buf_push(&out, 10 as u8)
+    rt.write_everything(1, out.ptr, out.len)
+    return 0
+}

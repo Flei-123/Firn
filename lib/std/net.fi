@@ -74,8 +74,10 @@
 //     (`NetError::WouldBlock` instead of a failure), `connect_nb` +
 //     `connect_finish` and `sock_error`. The event loop that waits for many
 //     of them at once is `lib/async/loop.fi`.
-// N2  IPv4 ONLY. `AF_INET`, not `AF_INET6`. A `sockaddr_in6` is 28 bytes
-//     and needs a scope id; nothing in this round wants it.
+// N2  IPv4 ONLY -- except for the six calls at the END of this file (round
+//     MC-E): `connect6`, `connect6_nb`, `listen_tcp6` take a 16 octet
+//     address (`sockaddr_in6`, 28 bytes, scope id 0). A `Conn` made that
+//     way has `peer == 0`; `peer_is_v6` tells it from a real 0.0.0.0.
 // N3  NO NAME RESOLUTION HERE. `connect_tcp` takes a numeric address. Names
 //     are resolved by `lib/net/dns.fi` (round DNS: resolv.conf / hosts, UDP
 //     and TCP, CNAME chains, a TTL cache), which `lib/net/http.fi` calls
@@ -112,6 +114,8 @@ export {
     set_nonblocking, set_nonblocking_fd, listener_set_nonblocking,
     read_nb, write_nb, accept_nb, connect_nb, connect_finish, sock_error,
     conn_from_fd_peer, listener_new_nb,
+    // round MC-E -- IPv6 transport (Linux; the Windows seam is untested)
+    connect6_nb, connect6, listen_tcp6, peer_is_v6,
 }
 
 // ------------------------------------------------------------ System calls
@@ -936,4 +940,134 @@ fn connect_finish(c: *mut Conn, err: *mut i64) -> NetError!bool {
 // A Conn around a descriptor that also knows the peer (accepted elsewhere).
 fn conn_from_fd_peer(fd: i32, peer: u32, port: u16) -> Conn {
     return Conn { fd: fd, err: 0, peer: peer, peer_port: port }
+}
+
+// ------------------------------------------------------------------- IPv6
+// (round MC-E) A `sockaddr_in6` is 28 octets: family, port (network order),
+// flow label, the 16 address octets, scope id. Addresses are passed as a
+// pointer to 16 octets in network order, the form `net.ip6` parses into.
+
+const AF_INET6: u16 = 10
+const IPPROTO_IPV6: i64 = 41
+const IPV6_V6ONLY: i64 = 26
+
+struct SockAddrIn6 {
+    family: u16,
+    port: u16,
+    flow: u32,
+    addr: [u8; 16],
+    scope: u32,
+}
+
+fn sa6_new() -> SockAddrIn6 {
+    return SockAddrIn6 { family: AF_INET6, port: 0 as u16, flow: 0 as u32,
+        addr: [0; 16], scope: 0 as u32 }
+}
+
+fn sa6_fill(sa: *mut SockAddrIn6, addr: u64, port: u16) {
+    (*sa).family = AF_INET6
+    (*sa).port = host_to_net_16(port)
+    (*sa).flow = 0 as u32
+    (*sa).scope = 0 as u32
+    var i: usize = 0
+    while i < 16 {
+        (*sa).addr[i] = rt.ld8(addr, i)
+        i = i + 1
+    }
+}
+
+// True for a Conn made by `connect6*` / `peer6` (peer address not in `peer`).
+fn peer_is_v6(c: *mut Conn) -> bool {
+    return (*c).peer == 0 as u32 && (*c).peer_port != 0 as u16
+}
+
+// Starts an IPv6 connect on a non-blocking socket. Same contract as
+// `connect_nb`: `*pending` true = wait for writable, then `connect_finish`.
+fn connect6_nb(addr: u64, port: u16, pending: *mut bool, err: *mut i64) -> NetError!Conn {
+    *pending = false
+    if err as u64 != 0 as u64 {
+        *err = 0
+    }
+    let fd: i64 = syscall(SYS_SOCKET, AF_INET6 as i64, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, 0, 0, 0)
+    if failed(fd) {
+        if err as u64 != 0 as u64 {
+            *err = 0 - fd
+        }
+        return NetError::Socket
+    }
+    var sa: SockAddrIn6 = sa6_new()
+    sa6_fill(&sa, addr, port)
+    var r: i64 = 0
+    var again: bool = true
+    while again {
+        r = syscall(SYS_CONNECT, fd, (&sa) as i64, 28, 0, 0, 0)
+        if r != EINTR {
+            again = false
+        }
+    }
+    if r == EINPROGRESS || r == EAGAIN {
+        *pending = true
+    } else if failed(r) {
+        if err as u64 != 0 as u64 {
+            *err = 0 - r
+        }
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        return NetError::Connect
+    }
+    return Conn { fd: fd as i32, err: 0, peer: 0 as u32, peer_port: port }
+}
+
+// Blocking IPv6 connect.
+fn connect6(addr: u64, port: u16) -> NetError!Conn {
+    let fd: i64 = syscall(SYS_SOCKET, AF_INET6 as i64, SOCK_STREAM | SOCK_CLOEXEC, 0, 0, 0, 0)
+    if failed(fd) {
+        return NetError::Socket
+    }
+    var sa: SockAddrIn6 = sa6_new()
+    sa6_fill(&sa, addr, port)
+    var r: i64 = 0
+    var again: bool = true
+    while again {
+        r = syscall(SYS_CONNECT, fd, (&sa) as i64, 28, 0, 0, 0)
+        if r != EINTR {
+            again = false
+        }
+    }
+    if failed(r) {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        return NetError::Connect
+    }
+    return Conn { fd: fd as i32, err: 0, peer: 0 as u32, peer_port: port }
+}
+
+// A listening IPv6-only socket (IPV6_V6ONLY on, so it never shadows the v4
+// port). `addr` = 16 octets (all zero = `::`, ...::1 = loopback).
+fn listen_tcp6(addr: u64, port: u16, backlog: i32) -> NetError!Listener {
+    let fd: i64 = syscall(SYS_SOCKET, AF_INET6 as i64, SOCK_STREAM | SOCK_CLOEXEC, 0, 0, 0, 0)
+    if failed(fd) {
+        return NetError::Socket
+    }
+    let ro: i64 = set_int_option(fd as i32, SOL_SOCKET, SO_REUSEADDR, 1)
+    let rv: i64 = set_int_option(fd as i32, IPPROTO_IPV6, IPV6_V6ONLY, 1)
+    if failed(ro) || failed(rv) {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        return NetError::Options
+    }
+    var sa: SockAddrIn6 = sa6_new()
+    sa6_fill(&sa, addr, port)
+    if failed(syscall(SYS_BIND, fd, (&sa) as i64, 28, 0, 0, 0)) {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        return NetError::Bind
+    }
+    if failed(syscall(SYS_LISTEN, fd, backlog as i64, 0, 0, 0, 0)) {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        return NetError::Listen
+    }
+    var got: SockAddrIn6 = sa6_new()
+    var len: i32 = 28
+    if failed(syscall(SYS_GETSOCKNAME, fd, (&got) as i64, (&len) as i64, 0, 0, 0)) {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        return NetError::Address
+    }
+    return Listener { fd: fd as i32, port: host_to_net_16(got.port), err: 0 }
 }

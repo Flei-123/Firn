@@ -1,0 +1,548 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/wgl.windows.fi -- an OpenGL context for a Windows window (WGL), and
+// the function loader that goes with it. Windows only: the compiler takes this
+// file for `import gpu.wgl` on --target=x86_64-windows; there is no twin for
+// other targets (the Linux GL path lives in the other lib/gpu files).
+//
+// NO COMPILER PATCH (GAPS B16): every Win32 / WGL / GL function is reached with
+// LoadLibraryA + GetProcAddress and the generic Win64 call gate (`win64_call`,
+// the same one std.dynlib uses). A new DLL function is one line here, not a
+// table entry in compiler/src/win.rs.
+//
+// Steps of `open` (the classic WGL sequence):
+//   1. GetDC(hwnd); ChoosePixelFormat + SetPixelFormat with a double-buffered
+//      RGBA8 + depth + stencil format;
+//   2. wglCreateContext (legacy) + wglMakeCurrent, only to be able to ask
+//      wglGetProcAddress for `wglCreateContextAttribsARB`;
+//   3. wglCreateContextAttribsARB(major, minor, core or compatibility);
+//      make it current, delete the legacy one. If the extension is missing
+//      the legacy context stays (`core` is then false and `major/minor` are
+//      what glGetIntegerv reports, 0 for GL < 3.0);
+//   4. wglSwapIntervalEXT is looked up for `swap_interval`.
+//
+// `proc(name)` is the loader: wglGetProcAddress first (GL 1.2+ and extensions,
+// needs a current context), then the export of opengl32.dll (GL 1.1). The
+// documented failure values of wglGetProcAddress (0, 1, 2, 3, -1) count as
+// "not found" and fall back to the export.
+//
+// THREADS: a GL context belongs to the thread that made it current. Make the
+// context current and call GL from one thread (the window thread).
+//
+// HONEST: tested under Wine 8 (Mesa llvmpipe through GLX) only -- see
+// docs/WINDOWS_GPU.md. Real Windows with a real driver: UNTESTED.
+import std.rt
+
+export {
+    Wgl, wgl_new, open, close, make_current, release_current, swap, swap_interval,
+    proc, dll_sym, get_string, last_error, is_open, C_CORE, C_COMPAT,
+    call0, call1, call2, call3, call4, call5, call6, call7, call8, call9, call10, bits32,
+}
+
+extern fn LoadLibraryA(name: u64) -> u64;
+extern fn GetProcAddress(h: u64, name: u64) -> u64;
+extern fn win64_call(f: u64, argv: u64, n: u64) -> u64;
+
+// context kinds for `open`
+const C_CORE: u32 = 1
+const C_COMPAT: u32 = 2
+
+struct Wgl {
+    hwnd: u64,
+    hdc: u64,
+    ctx: u64,
+    // the version the context really has (glGetIntegerv), 0 = unknown
+    major: u32,
+    minor: u32,
+    // true: made by wglCreateContextAttribsARB with the core profile
+    core: bool,
+    // wglSwapIntervalEXT (0 = the driver has none)
+    swap_fn: u64,
+    pixel_format: u32,
+    ok: bool,
+}
+
+fn wgl_new() -> Wgl {
+    return Wgl { hwnd: 0, hdc: 0, ctx: 0, major: 0, minor: 0, core: false,
+        swap_fn: 0, pixel_format: 0, ok: false }
+}
+
+// ---------------------------------------------------------------------
+// the DLL functions, looked up once
+// ---------------------------------------------------------------------
+static mut G_USER32: u64 = 0
+static mut G_GDI32: u64 = 0
+static mut G_GL32: u64 = 0
+static mut G_GETDC: u64 = 0
+static mut G_RELEASEDC: u64 = 0
+static mut G_CHOOSE: u64 = 0
+static mut G_SETFMT: u64 = 0
+static mut G_SWAP: u64 = 0
+static mut G_WCREATE: u64 = 0
+static mut G_WDELETE: u64 = 0
+static mut G_WMAKE: u64 = 0
+static mut G_WPROC: u64 = 0
+static mut G_GETSTRING: u64 = 0
+static mut G_GETINTV: u64 = 0
+static mut G_ERR: u32 = 0
+static mut G_NAME: [u8; 128] = [0 as u8; 128]
+
+fn last_error() -> str {
+    let e: u32 = G_ERR
+    if e == 0 as u32 { return "no error" }
+    if e == 1 as u32 { return "wgl: user32/gdi32/opengl32 could not be loaded" }
+    if e == 2 as u32 { return "wgl: GetDC failed" }
+    if e == 3 as u32 { return "wgl: ChoosePixelFormat found no format" }
+    if e == 4 as u32 { return "wgl: SetPixelFormat failed" }
+    if e == 5 as u32 { return "wgl: wglCreateContext failed" }
+    if e == 6 as u32 { return "wgl: wglMakeCurrent failed" }
+    if e == 7 as u32 { return "wgl: the requested GL version is not available" }
+    return "wgl: unknown error"
+}
+
+fn cname(s: str) -> u64 {
+    let n: usize = s.length()
+    if n > 127 {
+        return 0
+    }
+    var i: usize = 0
+    while i < n {
+        G_NAME[i] = s.chars(i)
+        i = i + 1
+    }
+    G_NAME[n] = 0 as u8
+    return (&G_NAME[0]) as u64
+}
+
+fn lib(name: str) -> u64 {
+    let p: u64 = cname(name)
+    if p == 0 {
+        return 0
+    }
+    return LoadLibraryA(p)
+}
+
+fn sym(h: u64, name: str) -> u64 {
+    if h == 0 {
+        return 0
+    }
+    let p: u64 = cname(name)
+    if p == 0 {
+        return 0
+    }
+    return GetProcAddress(h, p)
+}
+
+// Any export of any DLL, no import-table entry needed: dll_sym("user32.dll",
+// "ShowCursor"). 0 = DLL or function not found. Call it with call0..call10.
+fn dll_sym(dll: str, name: str) -> u64 {
+    let h: u64 = lib(dll)
+    if h == 0 {
+        return 0
+    }
+    return sym(h, name)
+}
+
+fn init() -> bool {
+    if G_GL32 != 0 {
+        return true
+    }
+    let u: u64 = lib("user32.dll")
+    let g: u64 = lib("gdi32.dll")
+    let o: u64 = lib("opengl32.dll")
+    if u == 0 || g == 0 || o == 0 {
+        G_ERR = 1 as u32
+        return false
+    }
+    G_USER32 = u
+    G_GDI32 = g
+    G_GETDC = sym(u, "GetDC")
+    G_RELEASEDC = sym(u, "ReleaseDC")
+    G_CHOOSE = sym(g, "ChoosePixelFormat")
+    G_SETFMT = sym(g, "SetPixelFormat")
+    G_SWAP = sym(g, "SwapBuffers")
+    G_WCREATE = sym(o, "wglCreateContext")
+    G_WDELETE = sym(o, "wglDeleteContext")
+    G_WMAKE = sym(o, "wglMakeCurrent")
+    G_WPROC = sym(o, "wglGetProcAddress")
+    G_GETSTRING = sym(o, "glGetString")
+    G_GETINTV = sym(o, "glGetIntegerv")
+    if G_GETDC == 0 || G_CHOOSE == 0 || G_SETFMT == 0 || G_SWAP == 0 ||
+    G_WCREATE == 0 || G_WDELETE == 0 || G_WMAKE == 0 || G_WPROC == 0 {
+        G_ERR = 1 as u32
+        return false
+    }
+    G_GL32 = o
+    return true
+}
+
+// ---------------------------------------------------------------------
+// calls: up to 10 integer / pointer arguments through the Win64 gate.
+// (Floats: put the f32 bits in the low half of the slot, see bits32.)
+// ---------------------------------------------------------------------
+fn bits32(x: f32) -> u64 {
+    return (__bits(x) as u64) & 0xFFFFFFFF
+}
+
+fn call0(f: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 1] = [0; 1]
+    return win64_call(f, (&v[0]) as u64, 0)
+}
+
+fn call1(f: u64, a0: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 1] = [0; 1]
+    v[0] = a0
+    return win64_call(f, (&v[0]) as u64, 1)
+}
+
+fn call2(f: u64, a0: u64, a1: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 2] = [0; 2]
+    v[0] = a0
+    v[1] = a1
+    return win64_call(f, (&v[0]) as u64, 2)
+}
+
+fn call3(f: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 3] = [0; 3]
+    v[0] = a0
+    v[1] = a1
+    v[2] = a2
+    return win64_call(f, (&v[0]) as u64, 3)
+}
+
+fn call4(f: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 4] = [0; 4]
+    v[0] = a0
+    v[1] = a1
+    v[2] = a2
+    v[3] = a3
+    return win64_call(f, (&v[0]) as u64, 4)
+}
+
+fn call5(f: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 5] = [0; 5]
+    v[0] = a0
+    v[1] = a1
+    v[2] = a2
+    v[3] = a3
+    v[4] = a4
+    return win64_call(f, (&v[0]) as u64, 5)
+}
+
+fn call6(f: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 6] = [0; 6]
+    v[0] = a0
+    v[1] = a1
+    v[2] = a2
+    v[3] = a3
+    v[4] = a4
+    v[5] = a5
+    return win64_call(f, (&v[0]) as u64, 6)
+}
+
+fn call7(f: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 7] = [0; 7]
+    v[0] = a0
+    v[1] = a1
+    v[2] = a2
+    v[3] = a3
+    v[4] = a4
+    v[5] = a5
+    v[6] = a6
+    return win64_call(f, (&v[0]) as u64, 7)
+}
+
+fn call8(f: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 8] = [0; 8]
+    v[0] = a0
+    v[1] = a1
+    v[2] = a2
+    v[3] = a3
+    v[4] = a4
+    v[5] = a5
+    v[6] = a6
+    v[7] = a7
+    return win64_call(f, (&v[0]) as u64, 8)
+}
+
+fn call9(f: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 9] = [0; 9]
+    v[0] = a0
+    v[1] = a1
+    v[2] = a2
+    v[3] = a3
+    v[4] = a4
+    v[5] = a5
+    v[6] = a6
+    v[7] = a7
+    v[8] = a8
+    return win64_call(f, (&v[0]) as u64, 9)
+}
+
+fn call10(f: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64, a9: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 10] = [0; 10]
+    v[0] = a0
+    v[1] = a1
+    v[2] = a2
+    v[3] = a3
+    v[4] = a4
+    v[5] = a5
+    v[6] = a6
+    v[7] = a7
+    v[8] = a8
+    v[9] = a9
+    return win64_call(f, (&v[0]) as u64, 10)
+}
+
+// ---------------------------------------------------------------------
+// the loader
+// ---------------------------------------------------------------------
+// The address of GL function `name` ("glClear", "glCreateShader", an
+// extension "glDebugMessageCallback", ...). 0 = not found. GL 1.2+ and
+// extensions only resolve while a context is current on this thread.
+fn proc(name: str) -> u64 {
+    if !init() {
+        return 0
+    }
+    let p: u64 = cname(name)
+    if p == 0 {
+        return 0
+    }
+    let a: u64 = call1(G_WPROC, p)
+    // wglGetProcAddress answers 0, 1, 2, 3 or -1 for "not there"
+    if a > 3 && a != 0xFFFFFFFFFFFFFFFF {
+        return a
+    }
+    return GetProcAddress(G_GL32, p)
+}
+
+// Copy a GL string (GL_VERSION = 0x1F02, GL_RENDERER = 0x1F01,
+// GL_VENDOR = 0x1F00) into `out` (cap bytes, NUL ended). Returns its length.
+fn get_string(name: u32, out: u64, cap: usize) -> usize {
+    if cap == 0 || out == 0 {
+        return 0
+    }
+    rt.st8(out, 0, 0 as u8)
+    if G_GETSTRING == 0 {
+        return 0
+    }
+    let s: u64 = call1(G_GETSTRING, name as u64)
+    if s == 0 {
+        return 0
+    }
+    var n: usize = 0
+    while n + 1 < cap {
+        let c: u8 = rt.ld8(s, n)
+        if c == 0 as u8 {
+            break
+        }
+        rt.st8(out, n, c)
+        n = n + 1
+    }
+    rt.st8(out, n, 0 as u8)
+    return n
+}
+
+// ---------------------------------------------------------------------
+// the context
+// ---------------------------------------------------------------------
+fn is_open(w: *mut Wgl) -> bool {
+    return (*w).ok && (*w).ctx != 0
+}
+
+// A double-buffered RGBA8 format with `depth` and `stencil` bits.
+fn pick_format(hdc: u64, depth: u32, stencil: u32) -> u32 {
+    var pfd: [u8; 40] = [0 as u8; 40]
+    let p: u64 = (&pfd[0]) as u64
+    rt.st16(p, 0, 40 as u16) // nSize
+    rt.st16(p, 1, 1 as u16) // nVersion
+    // PFD_DRAW_TO_WINDOW 4 | PFD_SUPPORT_OPENGL 0x20 | PFD_DOUBLEBUFFER 1
+    // | PFD_SUPPORT_COMPOSITION 0x8000
+    rt.st32(p, 1, 0x8025 as u32)
+    pfd[8] = 0 as u8 // PFD_TYPE_RGBA
+    pfd[9] = 32 as u8 // cColorBits
+    pfd[16] = 8 as u8 // cAlphaBits
+    pfd[23] = depth as u8 // cDepthBits
+    pfd[24] = stencil as u8 // cStencilBits
+    let f: u64 = call2(G_CHOOSE, hdc, p) & 0xFFFFFFFF
+    if f == 0 {
+        G_ERR = 3 as u32
+        return 0 as u32
+    }
+    if (call3(G_SETFMT, hdc, f, p) & 0xFFFFFFFF) == 0 {
+        G_ERR = 4 as u32
+        return 0 as u32
+    }
+    return f as u32
+}
+
+fn read_version(w: *mut Wgl) {
+    if G_GETINTV == 0 {
+        return
+    }
+    var v: [i32; 2] = [0; 2]
+    // GL_MAJOR_VERSION 0x821B, GL_MINOR_VERSION 0x821C (GL 3.0+; an older
+    // context leaves the numbers 0 and keeps the GL_VERSION string)
+    call2(G_GETINTV, 0x821B, (&v[0]) as u64)
+    call2(G_GETINTV, 0x821C, (&v[1]) as u64)
+    (*w).major = v[0] as u32
+    (*w).minor = v[1] as u32
+}
+
+// Make a GL context of at least `major.minor` for the window `hwnd`. `kind`
+// is C_CORE (core profile, what GL 3.3 programs want) or C_COMPAT. `depth`
+// and `stencil` are bit counts (24 / 8 are the usual). The context is current
+// on this thread when this returns true; on false `last_error()` says why.
+fn open(w: *mut Wgl, hwnd: u64, major: u32, minor: u32, kind: u32,
+    depth: u32, stencil: u32) -> bool {
+    *w = wgl_new()
+    G_ERR = 0 as u32
+    if hwnd == 0 || !init() {
+        if G_ERR == 0 as u32 { G_ERR = 2 as u32 }
+        return false
+    }
+    let hdc: u64 = call1(G_GETDC, hwnd)
+    if hdc == 0 {
+        G_ERR = 2 as u32
+        return false
+    }
+    (*w).hwnd = hwnd
+    (*w).hdc = hdc
+    let fmt: u32 = pick_format(hdc, depth, stencil)
+    if fmt == 0 as u32 {
+        call2(G_RELEASEDC, hwnd, hdc)
+        (*w).hdc = 0
+        return false
+    }
+    (*w).pixel_format = fmt
+    let legacy: u64 = call1(G_WCREATE, hdc)
+    if legacy == 0 {
+        G_ERR = 5 as u32
+        return false
+    }
+    if (call2(G_WMAKE, hdc, legacy) & 0xFFFFFFFF) == 0 {
+        G_ERR = 6 as u32
+        call1(G_WDELETE, legacy)
+        return false
+    }
+    // WGL_CONTEXT_MAJOR_VERSION_ARB 0x2091, MINOR 0x2092, PROFILE_MASK 0x9126
+    let mk: u64 = proc("wglCreateContextAttribsARB")
+    var ctx: u64 = 0
+    if mk != 0 {
+        var at: [i32; 7] = [0; 7]
+        at[0] = 0x2091
+        at[1] = major as i32
+        at[2] = 0x2092
+        at[3] = minor as i32
+        var n: usize = 4
+        if kind == C_CORE || kind == C_COMPAT {
+            at[4] = 0x9126
+            if kind == C_CORE { at[5] = 1 } else { at[5] = 2 }
+            n = 6
+        }
+        at[n] = 0
+        ctx = call3(mk, hdc, 0, (&at[0]) as u64)
+    }
+    if ctx != 0 {
+        if (call2(G_WMAKE, hdc, ctx) & 0xFFFFFFFF) == 0 {
+            G_ERR = 6 as u32
+            call1(G_WDELETE, ctx)
+            ctx = 0
+        } else {
+            call1(G_WDELETE, legacy)
+            (*w).core = kind == C_CORE
+        }
+    }
+    if ctx == 0 {
+        // no ARB entry point (or the version was refused): keep the legacy
+        // context, if it is good enough
+        if major >= 3 as u32 {
+            // the program asked for 3.x and the driver said no
+            G_ERR = 7 as u32
+            call2(G_WMAKE, 0, 0)
+            call1(G_WDELETE, legacy)
+            return false
+        }
+        ctx = legacy
+    }
+    (*w).ctx = ctx
+    (*w).swap_fn = proc("wglSwapIntervalEXT")
+    read_version(w)
+    (*w).ok = true
+    return true
+}
+
+fn make_current(w: *mut Wgl) -> bool {
+    if (*w).ctx == 0 {
+        return false
+    }
+    return (call2(G_WMAKE, (*w).hdc, (*w).ctx) & 0xFFFFFFFF) != 0
+}
+
+fn release_current() {
+    if G_WMAKE != 0 {
+        call2(G_WMAKE, 0, 0)
+    }
+}
+
+// Show the finished frame (gdi32 SwapBuffers).
+fn swap(w: *mut Wgl) -> bool {
+    if (*w).hdc == 0 {
+        return false
+    }
+    return (call1(G_SWAP, (*w).hdc) & 0xFFFFFFFF) != 0
+}
+
+// 0 = no vertical sync, 1 = every refresh. False: the driver has no
+// WGL_EXT_swap_control.
+fn swap_interval(w: *mut Wgl, n: u32) -> bool {
+    if (*w).swap_fn == 0 || (*w).ctx == 0 {
+        return false
+    }
+    return (call1((*w).swap_fn, n as u64) & 0xFFFFFFFF) != 0
+}
+
+fn close(w: *mut Wgl) {
+    if G_WMAKE != 0 {
+        call2(G_WMAKE, 0, 0)
+    }
+    if (*w).ctx != 0 {
+        call1(G_WDELETE, (*w).ctx)
+    }
+    if (*w).hdc != 0 && (*w).hwnd != 0 && G_RELEASEDC != 0 {
+        call2(G_RELEASEDC, (*w).hwnd, (*w).hdc)
+    }
+    *w = wgl_new()
+}

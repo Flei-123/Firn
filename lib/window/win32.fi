@@ -44,6 +44,9 @@ import std.str
 import window.window
 import window.pointers
 import std.cmdline
+import paint.gl
+import plat.glwin
+import gpu.wgl
 // ROUND C-040 -- THE INPUT PRIORITY, SHARED INSTEAD OF TWICE.
 //
 // Until this round `G_EIN_VORRANG` occurred ONLY in lib/android/a_main.fi
@@ -73,6 +76,7 @@ export {
     r_clip_set, r_clip_get, r_clip_types, r_clip_clear, r_event_fd, r_drop_accept, r_drop_take,
     // fUi tempo, stage 2b: THE GPU (only Android has it so far)
     r_gpu_open, r_gpu_swap, r_gpu_close, r_gpu_place, r_gpu_lost,
+    r_gpu_gl, r_gpu_proc, r_gpu_vsync, r_fullscreen, r_is_fullscreen, r_cursor_mode, r_cursor_delta,
     Platte, surface_new, r_input_hook, r_full_input, r_pointers,
     r_next_pointer, r_pointer_mouse, r_text_input, r_text_sync,
     r_open, r_make, r_show, r_title, r_close, r_is_open,
@@ -601,6 +605,19 @@ struct Platte {
     drop_n: usize,
     // the clipboard is ours (we filled it and nobody has taken it since)
     clip_own: bool,
+    // GPU (lib/gpu/wgl.windows.fi): the WGL context of this window
+    gl: wgl.Wgl,
+    gpu: bool,
+    // borderless full screen: the style and the box to go back to
+    fs: bool,
+    fs_style: i64,
+    fs_x: i64,
+    fs_y: i64,
+    fs_w: i64,
+    fs_h: i64,
+    // 0 normal, 1 hidden, 2 captured (hidden + confined + relative)
+    cur_mode: u32,
+    cur_hidden: bool,
 }
 
 // The holder with which a Firn function value becomes an address.
@@ -628,7 +645,9 @@ fn surface_new() -> Platte {
         bar_rgb: 0, bar_at: 0, frame: 0, header_h: 0,
         knopf_x0: 0, knopf_x1: 0, war_max: 0,
         ein_hook: in_nothing, ein_ud: 0, pq: pointers.pointers_new(),
-        drop: rt.buf_new(), drop_n: 0, clip_own: false }
+        drop: rt.buf_new(), drop_n: 0, clip_own: false,
+        gl: wgl.wgl_new(), gpu: false, fs: false, fs_style: 0, fs_x: 0, fs_y: 0,
+        fs_w: 0, fs_h: 0, cur_mode: 0 as u32, cur_hidden: false }
 }
 
 fn in_nothing(ud: u64) {}
@@ -1925,6 +1944,7 @@ fn r_wait(w: *mut Platte, ms: i64) -> bool {
 }
 
 fn r_close(w: *mut Platte) {
+    r_gpu_close(w)
     dib_free(w)
     if (*w).hwnd != 0 {
         if IsWindow((*w).hwnd) != 0 {
@@ -2253,31 +2273,251 @@ fn r_in_front(x: *mut Platte) -> bool {
 }
 
 // ===================================================================
-// THE GPU (fUi tempo, stage 2b; see lib/window/android.fi, ON THE GPU)
+// THE GPU (fUi tempo, stage 2b; programs with their own GL: mc/voxel round)
 // ===================================================================
-// Not here (yet): a Firn program on this system has no way to the
-// system's GL library (it is linked statically, without the dynamic
-// loader). Honest `false` -- the program paints in memory as before.
+// A WGL context for the window's HWND (lib/gpu/wgl.windows.fi): GL 3.3 core,
+// double buffered, RGBA8. No compiler import is involved: opengl32/gdi32 are
+// reached with LoadLibrary + GetProcAddress and the Win64 call gate.
+//
+//   r_gpu_open   fUi: context (3.3 core, no depth) + the GlApi table of
+//                lib/plat/glwin.fi (the same text as the Android table)
+//   r_gpu_gl     a program with its own GL calls: context of at least
+//                major.minor with depth/stencil bits; afterwards r_gpu_proc
+//                gives the function addresses (wglGetProcAddress + opengl32)
+//   r_gpu_swap   SwapBuffers; r_gpu_vsync: wglSwapIntervalEXT
+//
+// The first r_gpu_open / r_gpu_gl decides the pixel format (Windows allows
+// SetPixelFormat once per window); later calls reuse the context.
+// TESTED UNDER WINE + MESA ONLY (tools/ffi/win_wgl_probe.fi, docs/WINDOWS_GPU.md);
+// real Windows with a real driver is UNTESTED.
+fn gl_start(x: *mut Platte, major: u32, minor: u32, depth: u32, stencil: u32) -> bool {
+    if (*x).hwnd == 0 || !(*x).open {
+        return false
+    }
+    if (*x).gpu {
+        return wgl.make_current(&(*x).gl)
+    }
+    if !wgl.open(&(*x).gl, (*x).hwnd as u64, major, minor, wgl.C_CORE, depth, stencil) {
+        return false
+    }
+    (*x).gpu = true
+    wgl.swap_interval(&(*x).gl, 1 as u32)
+    return true
+}
+
 fn r_gpu_open(x: *mut Platte, api: u64) -> bool {
-    return false
+    if !gl_start(x, 3 as u32, 3 as u32, 0 as u32, 0 as u32) {
+        return false
+    }
+    if !glwin.glwin_api(api as *mut gl.GlApi) {
+        r_gpu_close(x)
+        return false
+    }
+    return true
+}
+
+fn r_gpu_gl(x: *mut Platte, major: u32, minor: u32, depth: u32, stencil: u32) -> bool {
+    return gl_start(x, major, minor, depth, stencil)
+}
+
+fn r_gpu_proc(x: *mut Platte, name: str) -> u64 {
+    if !(*x).gpu {
+        return 0
+    }
+    return wgl.proc(name)
+}
+
+fn r_gpu_vsync(x: *mut Platte, on: bool) -> bool {
+    if !(*x).gpu {
+        return false
+    }
+    var n: u32 = 0 as u32
+    if on {
+        n = 1 as u32
+    }
+    return wgl.swap_interval(&(*x).gl, n)
 }
 
 fn r_gpu_swap(x: *mut Platte) -> bool {
-    return false
+    if !(*x).gpu {
+        return false
+    }
+    return wgl.swap(&(*x).gl)
 }
 
 fn r_gpu_close(x: *mut Platte) {
+    if (*x).gpu {
+        wgl.close(&(*x).gl)
+        (*x).gpu = false
+    }
 }
 
+// Where the content lies on the surface: the whole client area.
 fn r_gpu_place(x: *mut Platte, out: u64) {
     *(out as *mut u64) = 0
     *((out + 8) as *mut u64) = 0
-    *((out + 16) as *mut u64) = 0
-    *((out + 24) as *mut u64) = 0
+    *((out + 16) as *mut u64) = (*x).w as u64
+    *((out + 24) as *mut u64) = (*x).h as u64
 }
 
+// WGL contexts are not lost like EGL ones (a display driver reset kills the
+// process's GL calls, not a flag we could read).
 fn r_gpu_lost(x: *mut Platte) -> bool {
     return false
+}
+
+// ===================================================================
+// FULL SCREEN, MOUSE POINTER (hide / capture / relative) -- for programs
+// that own the whole picture (games). Windows functions that the compiler's
+// import list does not carry are looked up with wgl.dll_sym (GAPS B16).
+// ===================================================================
+static mut G_SHOWCUR: u64 = 0
+static mut G_CLIPCUR: u64 = 0
+static mut G_GETCUR: u64 = 0
+static mut G_SETCUR: u64 = 0
+static mut G_C2S: u64 = 0
+static mut G_MONFW: u64 = 0
+static mut G_GMI: u64 = 0
+
+fn wx_once() {
+    if G_SHOWCUR != 0 {
+        return
+    }
+    G_CLIPCUR = wgl.dll_sym("user32.dll", "ClipCursor")
+    G_GETCUR = wgl.dll_sym("user32.dll", "GetCursorPos")
+    G_SETCUR = wgl.dll_sym("user32.dll", "SetCursorPos")
+    G_C2S = wgl.dll_sym("user32.dll", "ClientToScreen")
+    G_MONFW = wgl.dll_sym("user32.dll", "MonitorFromWindow")
+    G_GMI = wgl.dll_sym("user32.dll", "GetMonitorInfoW")
+    G_SHOWCUR = wgl.dll_sym("user32.dll", "ShowCursor")
+}
+
+// WS_POPUP | WS_VISIBLE for the borderless state.
+fn r_fullscreen(x: *mut Platte, on: bool) -> bool {
+    if (*x).hwnd == 0 || !(*x).open {
+        return false
+    }
+    wx_once()
+    if G_MONFW == 0 || G_GMI == 0 {
+        return false
+    }
+    if on == (*x).fs {
+        return true
+    }
+    if on {
+        var rc: [i32; 4] = [0; 4]
+        GetWindowRect((*x).hwnd, (&rc[0]) as u64)
+        (*x).fs_x = rc[0] as i64
+        (*x).fs_y = rc[1] as i64
+        (*x).fs_w = (rc[2] - rc[0]) as i64
+        (*x).fs_h = (rc[3] - rc[1]) as i64
+        (*x).fs_style = GetWindowLongPtrW((*x).hwnd, 0 - 16)
+        // MONITOR_DEFAULTTONEAREST = 2
+        let mon: u64 = wgl.call2(G_MONFW, (*x).hwnd as u64, 2)
+        var mi: [i32; 10] = [0; 10]
+        mi[0] = 40
+        if mon == 0 || (wgl.call2(G_GMI, mon, (&mi[0]) as u64) & 0xFFFFFFFF) == 0 {
+            return false
+        }
+        SetWindowLongPtrW((*x).hwnd, 0 - 16, 0x90000000)
+        // HWND_TOP 0; SWP_FRAMECHANGED 0x20 | SWP_SHOWWINDOW 0x40
+        SetWindowPos((*x).hwnd, 0, mi[1] as i64, mi[2] as i64,
+            (mi[3] - mi[1]) as i64, (mi[4] - mi[2]) as i64, 0x60)
+        (*x).fs = true
+    } else {
+        SetWindowLongPtrW((*x).hwnd, 0 - 16, (*x).fs_style)
+        SetWindowPos((*x).hwnd, 0, (*x).fs_x, (*x).fs_y, (*x).fs_w, (*x).fs_h, 0x60)
+        (*x).fs = false
+    }
+    return true
+}
+
+fn r_is_fullscreen(x: *mut Platte) -> bool {
+    return (*x).fs
+}
+
+// ShowCursor keeps a counter; one hide / one show per mode change.
+fn cur_hide(x: *mut Platte, hide: bool) {
+    if hide == (*x).cur_hidden {
+        return
+    }
+    if hide {
+        wgl.call1(G_SHOWCUR, 0)
+    } else {
+        wgl.call1(G_SHOWCUR, 1)
+    }
+    (*x).cur_hidden = hide
+}
+
+// The client area's centre in screen coordinates -> out[0], out[1];
+// the client rectangle in screen coordinates -> rc (left, top, right, bottom).
+fn client_screen(x: *mut Platte, rc: u64) {
+    var cr: [i32; 4] = [0; 4]
+    GetClientRect((*x).hwnd, (&cr[0]) as u64)
+    var tl: [i32; 2] = [0; 2]
+    wgl.call2(G_C2S, (*x).hwnd as u64, (&tl[0]) as u64)
+    rt.st32(rc, 0, tl[0] as u32)
+    rt.st32(rc, 1, tl[1] as u32)
+    rt.st32(rc, 2, (tl[0] + cr[2]) as u32)
+    rt.st32(rc, 3, (tl[1] + cr[3]) as u32)
+}
+
+fn centre_cursor(x: *mut Platte) {
+    var r: [i32; 4] = [0; 4]
+    client_screen(x, (&r[0]) as u64)
+    wgl.call2(G_SETCUR, ((r[0] + r[2]) / 2) as u64, ((r[1] + r[3]) / 2) as u64)
+}
+
+// mode 0 = normal, 1 = hidden, 2 = captured: hidden, kept inside the window
+// (ClipCursor) and read as deltas with r_cursor_delta.
+fn r_cursor_mode(x: *mut Platte, mode: u32) -> bool {
+    if (*x).hwnd == 0 || !(*x).open || mode > 2 as u32 {
+        return false
+    }
+    wx_once()
+    if G_SHOWCUR == 0 || G_CLIPCUR == 0 || G_GETCUR == 0 || G_SETCUR == 0 || G_C2S == 0 {
+        return false
+    }
+    if mode == 0 as u32 {
+        wgl.call1(G_CLIPCUR, 0)
+        cur_hide(x, false)
+    } else if mode == 1 as u32 {
+        wgl.call1(G_CLIPCUR, 0)
+        cur_hide(x, true)
+    } else {
+        cur_hide(x, true)
+        var r: [i32; 4] = [0; 4]
+        client_screen(x, (&r[0]) as u64)
+        wgl.call1(G_CLIPCUR, (&r[0]) as u64)
+        centre_cursor(x)
+    }
+    (*x).cur_mode = mode
+    return true
+}
+
+// Captured mode: how far the pointer moved since the last call (out[0] = dx,
+// out[1] = dy, i64 each); the pointer is put back to the middle. In the other
+// modes the deltas are 0 and false is returned.
+fn r_cursor_delta(x: *mut Platte, out: u64) -> bool {
+    *(out as *mut i64) = 0
+    *((out + 8) as *mut i64) = 0
+    if (*x).cur_mode != 2 as u32 || (*x).hwnd == 0 {
+        return false
+    }
+    var r: [i32; 4] = [0; 4]
+    client_screen(x, (&r[0]) as u64)
+    // the ClipCursor box follows a moved / resized window
+    wgl.call1(G_CLIPCUR, (&r[0]) as u64)
+    var pt: [i32; 2] = [0; 2]
+    if (wgl.call1(G_GETCUR, (&pt[0]) as u64) & 0xFFFFFFFF) == 0 {
+        return false
+    }
+    let cx: i32 = (r[0] + r[2]) / 2
+    let cy: i32 = (r[1] + r[3]) / 2
+    *(out as *mut i64) = (pt[0] - cx) as i64
+    *((out + 8) as *mut i64) = (pt[1] - cy) as i64
+    wgl.call2(G_SETCUR, cx as u64, cy as u64)
+    return true
 }
 
 // ===================================================================
