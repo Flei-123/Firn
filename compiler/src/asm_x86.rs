@@ -1713,6 +1713,9 @@ fn sse_table(m: &str) -> Option<(u8, u8, u8, SseForm)> {
         "pcmpeqd" => (0x66, 0, 0x76, Rm),
         "pcmpgtd" => (0x66, 0, 0x66, Rm),
         "punpcklbw" => (0x66, 0, 0x60, Rm),
+        "punpckhbw" => (0x66, 0, 0x68, Rm),
+        "pmullw" => (0x66, 0, 0xD5, Rm),
+        "packuswb" => (0x66, 0, 0x67, Rm),
         "punpckldq" => (0x66, 0, 0x62, Rm),
         "punpckhdq" => (0x66, 0, 0x6A, Rm),
         "punpcklqdq" => (0x66, 0, 0x6C, Rm),
@@ -1868,6 +1871,24 @@ mod tests {
             ("movlps qword ptr [rbp - 8], xmm9", "44 0f 13 4d f8"),
             ("movhps xmm0, qword ptr [rax]", "0f 16 00"),
             ("movhps qword ptr [rax], xmm1", "0f 17 08"),
+        ];
+        for (src, want) in cases {
+            assert_eq!(&text_of(src), want, "{}", src);
+        }
+    }
+
+    /// The 16-bit lane / byte interleave instructions of the pixel blending intrinsics
+    /// (round MC-B19); octets from `as` + `objdump`.
+    #[test]
+    fn pixel_blend_operations_match_as() {
+        let cases: &[(&str, &str)] = &[
+            ("pmullw xmm1, xmm2", "66 0f d5 ca"),
+            ("punpckhbw xmm8, xmm9", "66 45 0f 68 c1"),
+            ("packuswb xmm1, xmm2", "66 0f 67 ca"),
+            ("punpcklbw xmm0, xmm1", "66 0f 60 c1"),
+            ("psrlw xmm3, 8", "66 0f 71 d3 08"),
+            ("paddw xmm1, xmm2", "66 0f fd ca"),
+            ("psubw xmm9, xmm2", "66 44 0f f9 ca"),
         ];
         for (src, want) in cases {
             assert_eq!(&text_of(src), want, "{}", src);

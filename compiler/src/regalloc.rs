@@ -111,6 +111,12 @@ pub(crate) fn v128_ra_kind(k: crate::simd::SimdKind) -> bool {
             | K::Zero
             | K::UnpackLo32
             | K::UnpackHi32
+            | K::UnpackLo8
+            | K::UnpackHi8
+            | K::MulLo16
+            | K::Add16
+            | K::Sub16
+            | K::Packus16
             | K::AddF32
             | K::SubF32
             | K::MulF32
@@ -159,6 +165,12 @@ pub(crate) fn two_address_simd(k: crate::simd::SimdKind) -> bool {
             | K::Sub32
             | K::UnpackLo32
             | K::UnpackHi32
+            | K::UnpackLo8
+            | K::UnpackHi8
+            | K::MulLo16
+            | K::Add16
+            | K::Sub16
+            | K::Packus16
     )
 }
 
@@ -6182,7 +6194,13 @@ fn emit_inst(
                 | K::Add32
                 | K::Sub32
                 | K::UnpackLo32
-                | K::UnpackHi32 => {
+                | K::UnpackHi32
+                | K::UnpackLo8
+                | K::UnpackHi8
+                | K::MulLo16
+                | K::Add16
+                | K::Sub16
+                | K::Packus16 => {
                     let d = i.dst.ok_or("internal error: vector arithmetic without target")?;
                     let m = match kind {
                         K::AddF32 => "addps",
@@ -6201,6 +6219,12 @@ fn emit_inst(
                         K::Add32 => "paddd",
                         K::UnpackLo32 => "punpckldq",
                         K::UnpackHi32 => "punpckhdq",
+                        K::UnpackLo8 => "punpcklbw",
+                        K::UnpackHi8 => "punpckhbw",
+                        K::MulLo16 => "pmullw",
+                        K::Add16 => "paddw",
+                        K::Sub16 => "psubw",
+                        K::Packus16 => "packuswb",
                         _ => "psubd",
                     };
                     let w = ra.v_work(d);

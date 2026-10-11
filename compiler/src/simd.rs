@@ -167,6 +167,19 @@ pub enum SimdKind {
     CmpNltF32,
     /// Vergleich GANZER Zahlen je Spur: `a > b` (vorzeichenbehaftet).
     CmpGt32,
+    // --- 16-bit lanes and byte interleave (pixel arithmetic, round MC-B19) ---
+    //
+    // Eight `u16` lanes: widen bytes with the unpacks (against zero), multiply /
+    // add / subtract / shift per lane, narrow back with the SATURATING pack.
+    // Four RGBA pixels are one register; a blend of four pixels is ~10
+    // instructions instead of four times ~25 scalar ones.
+    UnpackLo8,
+    UnpackHi8,
+    MulLo16,
+    Add16,
+    Sub16,
+    Srl16,
+    Packus16,
     // --- shuffling and shifting ---------------------------------------
     ShuffleB,
     Shuffle32,
@@ -282,6 +295,13 @@ static TABLE: &[Sig] = &[
     s("__v128_cmple_f32", SimdKind::CmpLeF32, &[P::V, P::V], None, Some(P::V)),
     s("__v128_cmpnlt_f32", SimdKind::CmpNltF32, &[P::V, P::V], None, Some(P::V)),
     s("__v128_cmpgt_i32", SimdKind::CmpGt32, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_unpacklo8", SimdKind::UnpackLo8, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_unpackhi8", SimdKind::UnpackHi8, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_mullo16", SimdKind::MulLo16, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_add16", SimdKind::Add16, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_sub16", SimdKind::Sub16, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_srl16", SimdKind::Srl16, &[P::V], Some(15), Some(P::V)),
+    s("__v128_packus16", SimdKind::Packus16, &[P::V, P::V], None, Some(P::V)),
     s("__v128_shuffle8", SimdKind::ShuffleB, &[P::V, P::V], None, Some(P::V)),
     s("__v128_shuffle32", SimdKind::Shuffle32, &[P::V], Some(255), Some(P::V)),
     s("__v128_alignr", SimdKind::AlignR, &[P::V, P::V], Some(31), Some(P::V)),
@@ -1202,6 +1222,13 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
         SimdKind::CmpNltF32 => bin(e, fr, "cmpnltps", need(dst)?, args[0], args[1]),
         SimdKind::CmpGt32 => bin(e, fr, "pcmpgtd", need(dst)?, args[0], args[1]),
         SimdKind::ShuffleB => bin(e, fr, "pshufb", need(dst)?, args[0], args[1]),
+        SimdKind::UnpackLo8 => bin(e, fr, "punpcklbw", need(dst)?, args[0], args[1]),
+        SimdKind::UnpackHi8 => bin(e, fr, "punpckhbw", need(dst)?, args[0], args[1]),
+        SimdKind::MulLo16 => bin(e, fr, "pmullw", need(dst)?, args[0], args[1]),
+        SimdKind::Add16 => bin(e, fr, "paddw", need(dst)?, args[0], args[1]),
+        SimdKind::Sub16 => bin(e, fr, "psubw", need(dst)?, args[0], args[1]),
+        SimdKind::Srl16 => un_destr(e, fr, "psrlw", need(dst)?, args[0], imm),
+        SimdKind::Packus16 => bin(e, fr, "packuswb", need(dst)?, args[0], args[1]),
         SimdKind::UnpackLo32 => bin(e, fr, "punpckldq", need(dst)?, args[0], args[1]),
         SimdKind::UnpackHi32 => bin(e, fr, "punpckhdq", need(dst)?, args[0], args[1]),
         SimdKind::UnpackLo64 => bin(e, fr, "punpcklqdq", need(dst)?, args[0], args[1]),

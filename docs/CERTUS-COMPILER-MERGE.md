@@ -118,4 +118,41 @@ Results are in section 6.
 
 ## 6. Results and commits
 
-(filled in as the stages land)
+State 11.10.2026 (round MC-C). Which stage is where:
+
+| stage | state | commit / branch |
+|---|---|---|
+| E1 GC runtime set | **on main** | `14e637e8e`, `77a598d39` (`gc_set_growth`) |
+| E2 small tables (5 Win32 imports, `mremap` aarch64 + browser) | **on main** | `8a78932e8` |
+| E3 inliner | trivial leaves + size-ordered phase **on main** since the merge below (`3af90abdf`); recursive frame budget + compact x86 frames (`5e012a175`) merged with it | merge of `w-fin` |
+| E4 BILLIG (`regalloc_a64.rs`, aarch64 compact frames) | **on main** with the merge below | `045ba4c73`, `406524221` |
+| E5 KODIERER (integrated assembler, opt-in `--asm-intern`) | **on main** with the merge below | `b53d29375`, `670f3db15` |
+| E6 ARM-FREESTANDING rest (`x86_64-none` / `aarch64-none`, A64 inline-asm tables, kernel profile defaults, A64 panic runtime) | **open** | branches `arm-freestanding`, `archiv/arm-freestanding`; conflicts in 5 files with main's own target design (see the table in section 3) |
+
+The branch `w-fin` (7 commits, 09.10.2026: E3 rest, E4, E5, test 843 hardening, SSE/NEON float forms for the assembler) was
+finished and tested by its author but never merged. It merged into main WITHOUT a conflict (3-way, 26 files, +10 000 lines,
+mostly new files), `cargo test --release` of the compiler: 331 passed. Differential run of every `tests/*.fi` (default and
+`--opt-level=release-fast`) with the compiler before and after the merge: see the report
+`reports/20261011-mcC-compiler.md` for the count of differences (none that was green before). aarch64 spot check under
+`qemu-aarch64` (every 25th test) also compared before / after.
+
+### The fork stops here (B1)
+
+What is left in `/root/firnc-gc` that main does not have is the Certus build recipe, not compiler code: after E1-E5 main
+has every feature of the patch series except E6 (not used by Certus on x86) and the policy `GROW 2/1` (now
+`gc_set_growth(2, 1)` in the entry points). The files that still `differ` in `tools/certus/fork_guard.sh --report` (63 of 82)
+differ because main moved on (rounds after 04.09.2026), not because the fork has something extra.
+
+Rules, in force from now on:
+
+1. **No new edit in `/root/firnc-gc`.** A compiler or `lib/gc`, `lib/test` change is made on Firn main. The state of the fork is
+   frozen in `tools/certus/firnc-gc.sha256`; `bash tools/certus/fork_guard.sh --check` exits 1 and lists every file that
+   changed since (put it into the Certus daily run `tools/certus/daily/run_all.sh`, and the pre-build step of `build-c073.sh`).
+2. **Certus switches to a main build** by the gate of section 5 (same Certus sources built with fork and main compiler, callgrind
+   instruction counts N = 30 000): rename the census API (`bash tools/certus/gc_api_rename.sh <dir>`, section 4), add
+   `gc_set_growth(2, 1)` after `gc_init()` in the four entry points, point `FIRNC=` at `compiler/target/release/firnc` of main.
+   This is a Certus change and was NOT done (Certus workers are running; Certus files untouched).
+3. When the gate is green: delete `/root/firnc-gc` (keep the sha256 manifest) and remove `FIRNC=/root/firnc-gc/...` from the scripts.
+
+Still to do for the gate: run it (needs a Certus worker; ~1 h with `heavy`), and E6 only if Certus wants the freestanding targets.
+
