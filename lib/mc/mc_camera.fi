@@ -1,0 +1,254 @@
+// lib/mc/mc_camera.fi -- the player camera: position + yaw/pitch -> view and projection
+// matrices, frustum, pick ray, world point -> pixel (CPU only, no GPU API).
+//
+// CONVENTIONS (the Minecraft ones; world is right handed: +x east, +y up, +z south)
+//   yaw    degrees, 0 looks toward +z (south), 90 toward -x (west), -90 toward +x (east)
+//   pitch  degrees, positive looks DOWN, clamped to [-90, 90]
+//   forward = (-sin(yaw) cos(pitch), -sin(pitch), cos(yaw) cos(pitch))
+//   right   = (-cos(yaw), 0, -sin(yaw))        (no division, so no NaN at pitch = +-90)
+//   up      = right x forward
+//   pixel   (0, 0) is the top left corner of the top left pixel; the centre of pixel (i, j)
+//           is (i + 0.5, j + 0.5); y grows downward.
+//
+// WIDTH: everything is f64 (as mc_math; the reason is measured in docs/mc/math.md). The
+// matrices are the mc_math ones (column-major, GL clip depth [-1, 1] unless `zero_to_one`
+// is set). For a GPU upload use mc_math.mat4_to_f32; for far-from-origin worlds subtract
+// the camera position in f64 first (camera_rel) and upload small f32 values.
+//
+// HOT PATHS take scalars and pointers only: camera_to_view (3 scalars in, 3 out),
+// camera_pick_ray, camera_project, camera_section_visible. camera_update recomputes the
+// derived data (basis, matrices, frustum) and has to be called after any setter.
+
+import std.rt
+import std.math
+import mc.mc_math
+
+export {
+    Camera, camera_new, camera_set_pos, camera_set_angles, camera_set_lens, camera_resize,
+    camera_look_at, camera_update, camera_forward, camera_to_view, camera_rel, camera_project,
+    camera_pick_ray, camera_pick_block, camera_box_visible, camera_section_visible,
+}
+
+struct Camera {
+    x: f64, y: f64, z: f64,
+    yaw: f64, pitch: f64, // degrees
+    fov: f64, // vertical field of view, degrees
+    near: f64, far: f64,
+    width: i32, height: i32,
+    zero_to_one: bool,
+    // derived (camera_update)
+    fx: f64, fy: f64, fz: f64,
+    rx: f64, ry: f64, rz: f64,
+    ux: f64, uy: f64, uz: f64,
+    tan_y: f64, tan_x: f64, // tan(fov/2) and tan_y * aspect
+    view: mc_math.Mat4,
+    proj: mc_math.Mat4,
+    vp: mc_math.Mat4,
+    inv_vp: mc_math.Mat4,
+    frustum: mc_math.Frustum,
+}
+
+// A camera at the origin looking south, fov 70, near 0.05, far 512, viewport w x h.
+fn camera_new(w: i32, h: i32) -> Camera {
+    var c: Camera = Camera {
+        x: 0.0, y: 0.0, z: 0.0, yaw: 0.0, pitch: 0.0, fov: 70.0, near: 0.05, far: 512.0,
+        width: w, height: h, zero_to_one: false,
+        fx: 0.0, fy: 0.0, fz: 1.0, rx: -1.0, ry: 0.0, rz: 0.0, ux: 0.0, uy: 1.0, uz: 0.0,
+        tan_y: 1.0, tan_x: 1.0,
+        view: mc_math.Mat4 { m: [0.0; 16] }, proj: mc_math.Mat4 { m: [0.0; 16] },
+        vp: mc_math.Mat4 { m: [0.0; 16] }, inv_vp: mc_math.Mat4 { m: [0.0; 16] },
+        frustum: mc_math.Frustum { p: [0.0; 24] },
+    }
+    camera_update(&c)
+    return c
+}
+
+fn camera_set_pos(c: *mut Camera, x: f64, y: f64, z: f64) {
+    (*c).x = x
+    (*c).y = y
+    (*c).z = z
+}
+
+// yaw is wrapped into [-180, 180), pitch clamped to [-90, 90]. NaN keeps the old value.
+fn camera_set_angles(c: *mut Camera, yaw: f64, pitch: f64) {
+    if yaw == yaw && math.is_finite(yaw) {
+        var y: f64 = yaw - 360.0 * math.floor((yaw + 180.0) / 360.0)
+        if y >= 180.0 { y = y - 360.0 }
+        (*c).yaw = y
+    }
+    if pitch == pitch {
+        var p: f64 = pitch
+        if p > 90.0 { p = 90.0 }
+        if p < -90.0 { p = -90.0 }
+        (*c).pitch = p
+    }
+}
+
+// Lens: vertical fov in degrees (clamped to [1, 170]), 0 < near < far.
+fn camera_set_lens(c: *mut Camera, fov: f64, near: f64, far: f64) {
+    var f: f64 = fov
+    if !(f >= 1.0) { f = 1.0 }
+    if f > 170.0 { f = 170.0 }
+    (*c).fov = f
+    var n: f64 = near
+    if !(n > 0.0001) { n = 0.0001 }
+    var fr: f64 = far
+    if !(fr > n * 2.0) { fr = n * 2.0 }
+    (*c).near = n
+    (*c).far = fr
+}
+
+fn camera_resize(c: *mut Camera, w: i32, h: i32) {
+    var ww: i32 = w
+    var hh: i32 = h
+    if ww < 1 { ww = 1 }
+    if hh < 1 { hh = 1 }
+    (*c).width = ww
+    (*c).height = hh
+}
+
+// Turns the camera so that it looks at the point (tx, ty, tz). Nothing happens when the
+// point is the camera position.
+fn camera_look_at(c: *mut Camera, tx: f64, ty: f64, tz: f64) {
+    let dx: f64 = tx - (*c).x
+    let dy: f64 = ty - (*c).y
+    let dz: f64 = tz - (*c).z
+    let h: f64 = math.sqrt(dx * dx + dz * dz)
+    if h < 1.0e-12 && math.fabs(dy) < 1.0e-12 { return }
+    var yaw: f64 = (*c).yaw
+    if h > 1.0e-12 {
+        // forward = (-sin yaw, ., cos yaw): yaw = atan2(-dx, dz)
+        yaw = math.atan2(0.0 - dx, dz) * (180.0 / math.PI())
+    }
+    let pitch: f64 = math.atan2(0.0 - dy, h) * (180.0 / math.PI())
+    camera_set_angles(c, yaw, pitch)
+}
+
+// Recomputes basis, view, projection, view-projection, its inverse and the frustum.
+fn camera_update(c: *mut Camera) {
+    let yr: f64 = mc_math.deg_to_rad((*c).yaw)
+    let pr: f64 = mc_math.deg_to_rad((*c).pitch)
+    let sy: f64 = math.sin(yr)
+    let cy: f64 = math.cos(yr)
+    let sp: f64 = math.sin(pr)
+    let cp: f64 = math.cos(pr)
+    (*c).fx = 0.0 - sy * cp
+    (*c).fy = 0.0 - sp
+    (*c).fz = cy * cp
+    (*c).rx = 0.0 - cy
+    (*c).ry = 0.0
+    (*c).rz = 0.0 - sy
+    // up = right x forward
+    (*c).ux = (*c).ry * (*c).fz - (*c).rz * (*c).fy
+    (*c).uy = (*c).rz * (*c).fx - (*c).rx * (*c).fz
+    (*c).uz = (*c).rx * (*c).fy - (*c).ry * (*c).fx
+    let aspect: f64 = ((*c).width as f64) / ((*c).height as f64)
+    (*c).tan_y = math.tan(mc_math.deg_to_rad((*c).fov) * 0.5)
+    (*c).tan_x = (*c).tan_y * aspect
+    // view matrix (column-major): rows are right, up, -forward
+    mc_math.mat4_identity(&(*c).view)
+    (*c).view.m[0] = (*c).rx
+    (*c).view.m[4] = (*c).ry
+    (*c).view.m[8] = (*c).rz
+    (*c).view.m[1] = (*c).ux
+    (*c).view.m[5] = (*c).uy
+    (*c).view.m[9] = (*c).uz
+    (*c).view.m[2] = 0.0 - (*c).fx
+    (*c).view.m[6] = 0.0 - (*c).fy
+    (*c).view.m[10] = 0.0 - (*c).fz
+    (*c).view.m[12] = 0.0 - ((*c).rx * (*c).x + (*c).ry * (*c).y + (*c).rz * (*c).z)
+    (*c).view.m[13] = 0.0 - ((*c).ux * (*c).x + (*c).uy * (*c).y + (*c).uz * (*c).z)
+    (*c).view.m[14] = (*c).fx * (*c).x + (*c).fy * (*c).y + (*c).fz * (*c).z
+    mc_math.mat4_perspective(&(*c).proj, mc_math.deg_to_rad((*c).fov), aspect, (*c).near, (*c).far,
+        (*c).zero_to_one)
+    mc_math.mat4_mul(&(*c).vp, &(*c).proj, &(*c).view)
+    if !mc_math.mat4_invert(&(*c).inv_vp, &(*c).vp) {
+        mc_math.mat4_identity(&(*c).inv_vp)
+    }
+    mc_math.frustum_from_matrix(&(*c).frustum, &(*c).vp, (*c).zero_to_one)
+}
+
+fn camera_forward(c: *mut Camera, out: *mut mc_math.Vec3) {
+    (*out).x = (*c).fx
+    (*out).y = (*c).fy
+    (*out).z = (*c).fz
+}
+
+// World point -> view space (x right, y up, z = distance ALONG the view direction, positive
+// in front). Pure scalar function of the derived basis.
+fn camera_to_view(c: *mut Camera, wx: f64, wy: f64, wz: f64, out: *mut mc_math.Vec3) {
+    let dx: f64 = wx - (*c).x
+    let dy: f64 = wy - (*c).y
+    let dz: f64 = wz - (*c).z
+    (*out).x = (*c).rx * dx + (*c).ry * dy + (*c).rz * dz
+    (*out).y = (*c).ux * dx + (*c).uy * dy + (*c).uz * dz
+    (*out).z = (*c).fx * dx + (*c).fy * dy + (*c).fz * dz
+}
+
+// World point minus the camera position (camera-relative coordinates, exact in f64, small
+// numbers for an f32 upload).
+fn camera_rel(c: *mut Camera, wx: f64, wy: f64, wz: f64, out: *mut mc_math.Vec3) {
+    (*out).x = wx - (*c).x
+    (*out).y = wy - (*c).y
+    (*out).z = wz - (*c).z
+}
+
+// World point -> pixel. out = (pixel x, pixel y, distance along the view direction).
+// Returns false when the point is not in front of the near plane (out is still written).
+fn camera_project(c: *mut Camera, wx: f64, wy: f64, wz: f64, out: *mut mc_math.Vec3) -> bool {
+    var v: mc_math.Vec3 = mc_math.v3(0.0, 0.0, 0.0)
+    camera_to_view(c, wx, wy, wz, &v)
+    (*out).z = v.z
+    if !(v.z > (*c).near) {
+        (*out).x = 0.0
+        (*out).y = 0.0
+        return false
+    }
+    let w: f64 = (*c).width as f64
+    let h: f64 = (*c).height as f64
+    (*out).x = (0.5 + 0.5 * v.x / (v.z * (*c).tan_x)) * w
+    (*out).y = (0.5 - 0.5 * v.y / (v.z * (*c).tan_y)) * h
+    return true
+}
+
+// Ray through the pixel position (px, py) (use i + 0.5 for the centre of pixel i): origin =
+// camera position, dir = unit vector.
+fn camera_pick_ray(c: *mut Camera, px: f64, py: f64, origin: *mut mc_math.Vec3, dir: *mut mc_math.Vec3) {
+    let nx: f64 = 2.0 * px / ((*c).width as f64) - 1.0
+    let ny: f64 = 1.0 - 2.0 * py / ((*c).height as f64)
+    let a: f64 = nx * (*c).tan_x
+    let b: f64 = ny * (*c).tan_y
+    var dx: f64 = (*c).fx + (*c).rx * a + (*c).ux * b
+    var dy: f64 = (*c).fy + (*c).ry * a + (*c).uy * b
+    var dz: f64 = (*c).fz + (*c).rz * a + (*c).uz * b
+    let l: f64 = math.sqrt(dx * dx + dy * dy + dz * dz)
+    dx = dx / l
+    dy = dy / l
+    dz = dz / l
+    (*origin).x = (*c).x
+    (*origin).y = (*c).y
+    (*origin).z = (*c).z
+    (*dir).x = dx
+    (*dir).y = dy
+    (*dir).z = dz
+}
+
+// Pick the block under the pixel: pick ray + voxel raycast on `grid` up to `reach` blocks.
+fn camera_pick_block(c: *mut Camera, grid: *mut mc_math.BlockGrid, px: f64, py: f64, reach: f64,
+    out: *mut mc_math.RayHit) -> bool {
+    var o: mc_math.Vec3 = mc_math.v3(0.0, 0.0, 0.0)
+    var d: mc_math.Vec3 = mc_math.v3(0.0, 0.0, 0.0)
+    camera_pick_ray(c, px, py, &o, &d)
+    return mc_math.grid_raycast(grid, o.x, o.y, o.z, d.x, d.y, d.z, reach, out)
+}
+
+// Box against the frustum: 0 outside, 1 intersecting (conservative, see mc_math), 2 inside.
+fn camera_box_visible(c: *mut Camera, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> i32 {
+    return mc_math.frustum_test_box(&(*c).frustum, x0, y0, z0, x1, y1, z1)
+}
+
+// The 16^3 section (chunk column cx, cz; section index sy from the world's lowest section,
+// min_y = lowest world height, -64 in 1.20.1): 0 outside, 1 intersecting, 2 inside.
+fn camera_section_visible(c: *mut Camera, cx: i32, sy: i32, cz: i32, min_y: i32) -> i32 {
+    return mc_math.frustum_test_section(&(*c).frustum, cx, sy, cz, min_y)
+}

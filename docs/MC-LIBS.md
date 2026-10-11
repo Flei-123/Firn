@@ -75,13 +75,15 @@ Mojang code. All of it runs with `bash tools/mc/run.sh` (about 10 minutes).
 | `mc_net` | connect with retry / back-off, server list ping | **done** | python status server | - |
 | `mc_math` | Vec3 / AABB / voxel raycast / mat4 / frustum (sub-worker C) | **done** | numpy, brute force | 2680 |
 | `mc_mesh` | CPU greedy meshing + AO (sub-worker C wrote it, lead finished) | **done** | 128 meshes vs python brute force | 2730 |
+| `mc_camera` | camera: yaw/pitch/pos -> view + projection, frustum, pick ray, world->pixel, box/section visibility (`docs/mc/camera.md`) | **done** | numpy, exact separating-axis test | 2750 |
+| `mc_texture` | procedural default atlas (no Mojang files), tile -> UV, nearest sampling, state -> tile/opaque tables for mc_mesh (`docs/mc/texture.md`) | **done** (patterned tiles only structurally checked) | python re-derivation from minecraft-data (24135 states) | 2751 |
 | `mc_noise` | RNGs, Perlin, simplex, octaves | **done** | real `java.util.Random`, python bit-identical, published vectors | 2700 |
 | `mc_encode` | schema driven packet WRITER: value store (`path=value` text) -> body, any packet of any generated version (same bytecode as the walker, SCHEMA_FORMAT 2 incl. holder sets, lpVec3, recursion) | **done** (byte-identical to the reference serializer for every fixture of 10 versions, both directions) | `tools/mc/encode/run.sh`: decode (`mc_schema.walk_values`) -> encode == fixture, reversed store, damaged stores | 2651 |
 | `mc_anvil` | .mca region files read / write | **done** | independent python reader / writer, fuzz | 2710 |
 | `mc_entity` (+ `mc_entity_layout`, `tools/mcgen/gen_entity.py`) | entity tracking: spawn / move / look / teleport / destroy / velocity / player names, layouts generated per version | **lib + unit tests done**, demo dump / real-server proof open (docs/mc/entity.md) | planned: protodef serializer (`tools/mc/entity`) | 2760 |
 | `demos/mcclient` | **final integration**: join a real server, dump + checksum == node-minecraft-protocol | **done** (M0 accepted, see ROUND-M0.md) | node-minecraft-protocol on a real 1.20.1 server | - |
 
-Not built (explicitly): rendering / GPU (blocked by H3), Wasm mod host, physics, inventory, entity decoding, online-mode login against
+Not built (explicitly): GPU rendering (analysis and plan: `docs/MC-RENDER.md`; software renderer first), Wasm mod host, physics, inventory, entity decoding, online-mode login against
 the live Microsoft / Mojang services (needs a real account), an epoll based `mc_net`, chunk
 strategies other than 1.18+ (see MC-VERSIONS.md).
 

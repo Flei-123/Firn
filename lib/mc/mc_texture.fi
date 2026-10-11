@@ -1,0 +1,587 @@
+// lib/mc/mc_texture.fi -- texture atlas + block-state -> tile tables for mc_mesh / mc_raster.
+//
+// NO MOJANG FILES. The default pack is generated in code: integer hash noise plus a few
+// patterns, 16x16 texels per tile. Your own / free textures replace single tiles with
+// atlas_set_tile (RGBA8, e.g. decoded by paint.png.decode_png); nothing here reads a file.
+//
+// ATLAS: `cols` x `rows` tiles of `tile` x `tile` texels (tile = power of two), RGBA8 in memory
+// (byte order R G B A, so a u32 read on a little endian machine is 0xAABBGGRR). Tile id t >= 1
+// lives at index t-1: column (t-1) % cols, row (t-1) / cols. Tile 0 means "no face".
+// UV rect of a tile = pixel rect / atlas size (atlas_tile_uv). Sampling is NEAREST; a quad
+// that repeats the tile (greedy meshing) samples with tile-local coordinates (atlas_texel,
+// atlas_sample): the wrap happens inside the tile, so there is no bleeding between tiles and
+// no padding is needed. Mipmaps: not built; atlas_avg gives the average colour of a tile (use
+// it for distant faces).
+//
+// DEFAULT TILE IDS (names are the contract of docs/mc/texture.md):
+//    1 stone  2 dirt  3 grass_top  4 grass_side  5 sand  6 gravel  7 log_side  8 log_top
+//    9 planks  10 leaves (alpha 0 holes)  11 water (alpha 190)  12 cobblestone  13 bedrock
+//   14 snow  15 ice  16 glass (alpha 0 inside)  17 sandstone  18 ore  19 lava  20 bricks
+//   21 netherrack  22 clay  23 deepslate  24 terracotta  25..40 the 16 dye colours
+//   41..56 16 generic hash colours  57 unknown (magenta/black)  58 test (red/green/blue/white)
+//
+// BLOCK TABLES (tex_build_tables): for a Registry (any version) fills the MeshTables arrays of
+// mc_mesh: `opaque` (solid and not transparent) and `tiles` (u16[32768*6],
+// face order -x +x -y +y -z +z). Rules in order: invisible blocks (air, barrier, light, ...) ->
+// 0; exact names (grass_block has top / side / bottom tiles, logs side / end); suffixes
+// (_planks, _log, _wood, _leaves, _ore, glass, ...); dye colour prefix (white_..., red_...);
+// any other SOLID block -> one of the 16 generic hash tiles chosen from its name (stable,
+// every block looks different from most others); any other non-solid block (plants, torches,
+// rails, ...) -> 0 until cross / partial models exist. Non-cube blocks (stairs, slabs, fences)
+// are full cubes of their material for now. Block axis / facing properties are ignored.
+
+import std.rt
+import mc.mc_math
+import mc.mc_registry
+import mc.mc_mesh
+
+export {
+    Atlas, atlas_new, atlas_free, atlas_set_tile, atlas_tile_uv, atlas_tile_x, atlas_tile_y,
+    atlas_texel, atlas_sample, atlas_avg, atlas_build_avg, atlas_fill_default, atlas_default,
+    pack_pixel, tex_alloc_tables, tex_free_tables, tex_build_tables, tex_tiles_for_name,
+    T_STONE, T_DIRT, T_GRASS_TOP, T_GRASS_SIDE, T_SAND, T_GRAVEL, T_LOG_SIDE, T_LOG_TOP, T_PLANKS,
+    T_LEAVES, T_WATER, T_COBBLE, T_BEDROCK, T_SNOW, T_ICE, T_GLASS, T_SANDSTONE, T_ORE, T_LAVA,
+    T_BRICKS, T_NETHERRACK, T_CLAY, T_DEEPSLATE, T_TERRACOTTA, T_DYE0, T_HASH0, T_UNKNOWN, T_TEST,
+    DEFAULT_TILES,
+}
+
+const T_STONE: u32 = 1
+const T_DIRT: u32 = 2
+const T_GRASS_TOP: u32 = 3
+const T_GRASS_SIDE: u32 = 4
+const T_SAND: u32 = 5
+const T_GRAVEL: u32 = 6
+const T_LOG_SIDE: u32 = 7
+const T_LOG_TOP: u32 = 8
+const T_PLANKS: u32 = 9
+const T_LEAVES: u32 = 10
+const T_WATER: u32 = 11
+const T_COBBLE: u32 = 12
+const T_BEDROCK: u32 = 13
+const T_SNOW: u32 = 14
+const T_ICE: u32 = 15
+const T_GLASS: u32 = 16
+const T_SANDSTONE: u32 = 17
+const T_ORE: u32 = 18
+const T_LAVA: u32 = 19
+const T_BRICKS: u32 = 20
+const T_NETHERRACK: u32 = 21
+const T_CLAY: u32 = 22
+const T_DEEPSLATE: u32 = 23
+const T_TERRACOTTA: u32 = 24
+const T_DYE0: u32 = 25
+const T_HASH0: u32 = 41
+const T_UNKNOWN: u32 = 57
+const T_TEST: u32 = 58
+const DEFAULT_TILES: u32 = 58
+
+struct Atlas {
+    px: u64, // RGBA8, w * h * 4
+    avg: u64, // u32 per tile index (average colour, premultiplied alpha ignored)
+    w: i32,
+    h: i32,
+    tile: i32,
+    cols: i32,
+    rows: i32,
+}
+
+fn atlas_new(tile: i32, cols: i32, rows: i32) -> Atlas {
+    var a: Atlas = Atlas { px: 0, avg: 0, w: 0, h: 0, tile: 0, cols: 0, rows: 0 }
+    if tile < 1 || (tile & (tile - 1)) != 0 || cols < 1 || rows < 1 { return a }
+    a.tile = tile
+    a.cols = cols
+    a.rows = rows
+    a.w = tile * cols
+    a.h = tile * rows
+    a.px = rt.heap_alloc((a.w as usize) * (a.h as usize) * 4)
+    a.avg = rt.heap_alloc((cols as usize) * (rows as usize) * 4)
+    var i: usize = 0
+    while i < (a.w as usize) * (a.h as usize) {
+        rt.st32(a.px, i, 0 as u32)
+        i = i + 1
+    }
+    i = 0
+    while i < (cols as usize) * (rows as usize) {
+        rt.st32(a.avg, i, 0 as u32)
+        i = i + 1
+    }
+    return a
+}
+
+fn atlas_free(a: *mut Atlas) {
+    if (*a).px != 0 {
+        rt.heap_free((*a).px, ((*a).w as usize) * ((*a).h as usize) * 4)
+        rt.heap_free((*a).avg, ((*a).cols as usize) * ((*a).rows as usize) * 4)
+    }
+    (*a).px = 0
+    (*a).avg = 0
+}
+
+fn pack_pixel(r: u32, g: u32, b: u32, al: u32) -> u32 {
+    return r | (g << 8 as u32) | (b << 16 as u32) | (al << 24 as u32)
+}
+
+// Pixel origin of tile `t` (>= 1) in the atlas; -1 for an invalid id.
+fn atlas_tile_x(a: *mut Atlas, t: u32) -> i32 {
+    if t < 1 as u32 || (t as i32) > (*a).cols * (*a).rows { return 0 - 1 }
+    return (((t as i32) - 1) % (*a).cols) * (*a).tile
+}
+
+fn atlas_tile_y(a: *mut Atlas, t: u32) -> i32 {
+    if t < 1 as u32 || (t as i32) > (*a).cols * (*a).rows { return 0 - 1 }
+    return (((t as i32) - 1) / (*a).cols) * (*a).tile
+}
+
+// UV rectangle (u0, v0, u1, v1) of tile `t`, v grows downward like the pixel rows. False for an invalid id.
+fn atlas_tile_uv(a: *mut Atlas, t: u32, out: *mut [f64; 4]) -> bool {
+    let x: i32 = atlas_tile_x(a, t)
+    if x < 0 { return false }
+    let y: i32 = atlas_tile_y(a, t)
+    (*out)[0] = (x as f64) / ((*a).w as f64)
+    (*out)[1] = (y as f64) / ((*a).h as f64)
+    (*out)[2] = ((x + (*a).tile) as f64) / ((*a).w as f64)
+    (*out)[3] = ((y + (*a).tile) as f64) / ((*a).h as f64)
+    return true
+}
+
+// Copies tile x tile RGBA8 texels (4 bytes each, row major) into tile `t`.
+fn atlas_set_tile(a: *mut Atlas, t: u32, rgba: u64) -> bool {
+    let x0: i32 = atlas_tile_x(a, t)
+    if x0 < 0 { return false }
+    let y0: i32 = atlas_tile_y(a, t)
+    var y: i32 = 0
+    while y < (*a).tile {
+        var x: i32 = 0
+        while x < (*a).tile {
+            let v: u32 = rt.ld32(rgba, (y * (*a).tile + x) as usize)
+            rt.st32((*a).px, ((y0 + y) * (*a).w + x0 + x) as usize, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return true
+}
+
+// Texel (tx, ty) of tile `t`; both wrap inside the tile (tile is a power of two). Tile 0 / invalid -> 0.
+fn atlas_texel(a: *mut Atlas, t: u32, tx: i32, ty: i32) -> u32 {
+    let x0: i32 = atlas_tile_x(a, t)
+    if x0 < 0 { return 0 as u32 }
+    let y0: i32 = atlas_tile_y(a, t)
+    let m: i32 = (*a).tile - 1
+    return rt.ld32((*a).px, ((y0 + (ty & m)) * (*a).w + x0 + (tx & m)) as usize)
+}
+
+// Nearest sample with tile-local coordinates in TILE units: (0..1) is one repetition of the
+// tile, (0..w) with w > 1 repeats it (greedy quads). u grows right, v grows DOWN.
+fn atlas_sample(a: *mut Atlas, t: u32, u: f64, v: f64) -> u32 {
+    let ts: f64 = (*a).tile as f64
+    let iu: i32 = mc_math.floor_i(u * ts)
+    let iv: i32 = mc_math.floor_i(v * ts)
+    return atlas_texel(a, t, iu, iv)
+}
+
+fn atlas_avg(a: *mut Atlas, t: u32) -> u32 {
+    if atlas_tile_x(a, t) < 0 { return 0 as u32 }
+    return rt.ld32((*a).avg, (t - 1 as u32) as usize)
+}
+
+// Average colour (RGB, straight alpha ignored; alpha = average alpha) of every tile.
+fn atlas_build_avg(a: *mut Atlas) {
+    var t: i32 = 1
+    while t <= (*a).cols * (*a).rows {
+        var sr: u32 = 0 as u32
+        var sg: u32 = 0 as u32
+        var sb: u32 = 0 as u32
+        var sa: u32 = 0 as u32
+        var y: i32 = 0
+        while y < (*a).tile {
+            var x: i32 = 0
+            while x < (*a).tile {
+                let v: u32 = atlas_texel(a, t as u32, x, y)
+                sr = sr + (v & 255 as u32)
+                sg = sg + ((v >> 8 as u32) & 255 as u32)
+                sb = sb + ((v >> 16 as u32) & 255 as u32)
+                sa = sa + ((v >> 24 as u32) & 255 as u32)
+                x = x + 1
+            }
+            y = y + 1
+        }
+        let n: u32 = ((*a).tile * (*a).tile) as u32
+        rt.st32((*a).avg, (t - 1) as usize, pack_pixel(sr / n, sg / n, sb / n, sa / n))
+        t = t + 1
+    }
+}
+
+// ---------------------------------------------------------------- default pack
+
+// 32 bit integer hash of three numbers; the Python reference (tools/mc/texture/check.py) has
+// the same formula.
+fn hash3(a: u32, b: u32, c: u32) -> u32 {
+    var h: u32 = a *% 0x9E3779B1 as u32 +% b *% 0x85EBCA6B as u32 +% c *% 0xC2B2AE35 as u32
+    h = h ^ (h >> 15 as u32)
+    h = h *% 0x2C1B3C6D as u32
+    h = h ^ (h >> 12 as u32)
+    h = h *% 0x297A2D39 as u32
+    h = h ^ (h >> 15 as u32)
+    return h
+}
+
+fn noise8(t: u32, x: i32, y: i32, k: u32) -> i32 {
+    return ((hash3(t +% k *% 977 as u32, x as u32, y as u32) >> 8 as u32) & 255 as u32) as i32
+}
+
+fn clamp8(v: i32) -> u32 {
+    if v < 0 { return 0 as u32 }
+    if v > 255 { return 255 as u32 }
+    return v as u32
+}
+
+// colour = base + noise in [-var, var), same offset for the three channels
+fn noisy(t: u32, x: i32, y: i32, r: i32, g: i32, b: i32, amp: i32, extra: i32) -> u32 {
+    let d: i32 = (noise8(t, x, y, 0 as u32) * amp) / 128 - amp + extra
+    return pack_pixel(clamp8(r + d), clamp8(g + d), clamp8(b + d), 255 as u32)
+}
+
+fn dye_r(i: i32) -> i32 {
+    var tab: [i32; 16] = [233, 240, 189, 58, 248, 112, 237, 62, 142, 21, 137, 53, 114, 84, 160, 20]
+    return tab[i as usize]
+}
+
+fn dye_g(i: i32) -> i32 {
+    var tab: [i32; 16] = [236, 118, 68, 175, 198, 185, 141, 68, 142, 137, 50, 57, 71, 109, 39, 21]
+    return tab[i as usize]
+}
+
+fn dye_b(i: i32) -> i32 {
+    var tab: [i32; 16] = [236, 19, 179, 217, 39, 25, 172, 71, 134, 145, 184, 157, 40, 27, 34, 25]
+    return tab[i as usize]
+}
+
+// One texel of the default pack; x, y in 0..15.
+fn default_pixel(t: u32, x: i32, y: i32) -> u32 {
+    if t == 1 as u32 { return noisy(t, x, y, 125, 125, 125, 14, 0) }
+    if t == 2 as u32 { return noisy(t, x, y, 134, 96, 67, 14, 0) }
+    if t == 3 as u32 { return noisy(t, x, y, 95, 159, 53, 16, 0) }
+    if t == 4 as u32 {
+        let depth: i32 = 3 + noise8(t, x, 99, 1 as u32) % 3
+        if y < depth { return noisy(t, x, y, 95, 159, 53, 16, 0) }
+        return noisy(t, x, y, 134, 96, 67, 14, 0)
+    }
+    if t == 5 as u32 { return noisy(t, x, y, 219, 207, 142, 8, 0) }
+    if t == 6 as u32 { return noisy(t, x, y, 131, 127, 126, 28, 0) }
+    if t == 7 as u32 {
+        var e: i32 = 0
+        if x % 4 == 0 { e = -22 }
+        return noisy(t, x, y, 102, 81, 50, 10, e)
+    }
+    if t == 8 as u32 {
+        let dx: i32 = 2 * x - 15
+        let dy: i32 = 2 * y - 15
+        let ring: i32 = (dx * dx + dy * dy) / 24
+        if ring % 2 == 0 { return noisy(t, x, y, 166, 133, 82, 6, 0) }
+        return noisy(t, x, y, 130, 104, 62, 6, 0)
+    }
+    if t == 9 as u32 {
+        var e: i32 = 0
+        if y % 4 == 3 {
+            e = -30
+        } else if x == ((y / 4) % 2) * 8 {
+            e = -20
+        }
+        return noisy(t, x, y, 162, 130, 78, 8, e)
+    }
+    if t == 10 as u32 {
+        let c: u32 = noisy(t, x, y, 58, 125, 38, 30, 0)
+        if noise8(t, x, y + 100, 2 as u32) < 48 { return c & 0x00FFFFFF as u32 }
+        return c
+    }
+    if t == 11 as u32 {
+        let c: u32 = noisy(t, x, y, 48, 100, 200, 10, 0)
+        return (c & 0x00FFFFFF as u32) | (190 as u32) << 24 as u32
+    }
+    if t == 12 as u32 {
+        let cell: i32 = noise8(t, x / 5, y / 5, 3 as u32) % 60
+        if x % 5 == 4 || y % 5 == 4 { return noisy(t, x, y, 70, 70, 70, 6, 0) }
+        return noisy(t, x, y, 100 + cell, 100 + cell, 100 + cell, 6, 0)
+    }
+    if t == 13 as u32 { return noisy(t, x, y, 60, 60, 60, 40, 0) }
+    if t == 14 as u32 { return noisy(t, x, y, 245, 248, 250, 4, 0) }
+    if t == 15 as u32 { return noisy(t, x, y, 150, 190, 250, 10, 0) }
+    if t == 16 as u32 {
+        if x == 0 || y == 0 || x == 15 || y == 15 { return pack_pixel(200 as u32, 230 as u32, 240 as u32, 255 as u32) }
+        let s: i32 = x + y
+        if (s == 9 || s == 10) && x >= 2 && x <= 13 && y >= 2 && y <= 13 {
+            return pack_pixel(255 as u32, 255 as u32, 255 as u32, 255 as u32)
+        }
+        return pack_pixel(200 as u32, 230 as u32, 240 as u32, 0 as u32)
+    }
+    if t == 17 as u32 {
+        var e: i32 = 0
+        if y % 8 == 0 { e = -16 }
+        return noisy(t, x, y, 216, 203, 155, 6, e)
+    }
+    if t == 18 as u32 {
+        if noise8(t, x / 2, y / 2, 4 as u32) < 60 { return noisy(t, x, y, 40, 40, 40, 6, 0) }
+        return noisy(t, x, y, 125, 125, 125, 14, 0)
+    }
+    if t == 19 as u32 { return noisy(t, x, y, 230, 100, 20, 50, 0) }
+    if t == 20 as u32 {
+        let col: i32 = (x + (y / 4 % 2) * 4) % 8
+        if y % 4 == 3 || col == 7 { return noisy(t, x, y, 170, 170, 165, 4, 0) }
+        return noisy(t, x, y, 150, 70, 55, 10, 0)
+    }
+    if t == 21 as u32 { return noisy(t, x, y, 110, 50, 50, 20, 0) }
+    if t == 22 as u32 { return noisy(t, x, y, 160, 166, 178, 6, 0) }
+    if t == 23 as u32 { return noisy(t, x, y, 80, 80, 86, 12, 0) }
+    if t == 24 as u32 { return noisy(t, x, y, 152, 94, 67, 8, 0) }
+    if t >= 25 as u32 && t <= 40 as u32 {
+        let i: i32 = (t as i32) - 25
+        return noisy(t, x, y, dye_r(i), dye_g(i), dye_b(i), 6, 0)
+    }
+    if t >= 41 as u32 && t <= 56 as u32 {
+        let i: i32 = (t as i32) - 41
+        return noisy(t, x, y, 60 + (i * 53) % 160, 60 + (i * 97) % 160, 60 + (i * 151) % 160, 14, 0)
+    }
+    if t == 57 as u32 {
+        if ((x / 8) + (y / 8)) % 2 == 0 { return pack_pixel(255 as u32, 0 as u32, 255 as u32, 255 as u32) }
+        return pack_pixel(0 as u32, 0 as u32, 0 as u32, 255 as u32)
+    }
+    if t == 58 as u32 {
+        if x == 0 || y == 0 || x == 15 || y == 15 { return pack_pixel(0 as u32, 0 as u32, 0 as u32, 255 as u32) }
+        if x >= 2 && x <= 3 && y >= 2 && y <= 3 { return pack_pixel(0 as u32, 0 as u32, 0 as u32, 255 as u32) }
+        if y < 8 {
+            if x < 8 { return pack_pixel(220 as u32, 40 as u32, 40 as u32, 255 as u32) }
+            return pack_pixel(40 as u32, 200 as u32, 40 as u32, 255 as u32)
+        }
+        if x < 8 { return pack_pixel(40 as u32, 40 as u32, 220 as u32, 255 as u32) }
+        return pack_pixel(235 as u32, 235 as u32, 235 as u32, 255 as u32)
+    }
+    return pack_pixel(0 as u32, 0 as u32, 0 as u32, 0 as u32)
+}
+
+// Fills the first DEFAULT_TILES tiles with the default pack (needs a 16 texel tile and room for 58 tiles).
+fn atlas_fill_default(a: *mut Atlas) -> bool {
+    if (*a).tile != 16 || (*a).cols * (*a).rows < DEFAULT_TILES as i32 { return false }
+    var t: u32 = 1 as u32
+    while t <= DEFAULT_TILES {
+        let x0: i32 = atlas_tile_x(a, t)
+        let y0: i32 = atlas_tile_y(a, t)
+        var y: i32 = 0
+        while y < 16 {
+            var x: i32 = 0
+            while x < 16 {
+                rt.st32((*a).px, ((y0 + y) * (*a).w + x0 + x) as usize, default_pixel(t, x, y))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        t = t + 1 as u32
+    }
+    atlas_build_avg(a)
+    return true
+}
+
+// The standard atlas: 16 x 16 tiles of 16 texels = 256 x 256, default pack in it.
+fn atlas_default() -> Atlas {
+    var a: Atlas = atlas_new(16, 16, 16)
+    atlas_fill_default(&a)
+    return a
+}
+
+// ---------------------------------------------------------------- block -> tile rules
+
+fn name_is(p: u64, n: usize, s: str) -> bool {
+    if n != s.n { return false }
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) != rt.ld8(s.p as u64, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn name_starts(p: u64, n: usize, s: str) -> bool {
+    let m: usize = s.n
+    if n < m { return false }
+    var i: usize = 0
+    while i < m {
+        if rt.ld8(p, i) != rt.ld8(s.p as u64, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn name_ends(p: u64, n: usize, s: str) -> bool {
+    let m: usize = s.n
+    if n < m { return false }
+    var i: usize = 0
+    while i < m {
+        if rt.ld8(p, n - m + i) != rt.ld8(s.p as u64, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn all6(out: *mut [u16; 6], t: u32) {
+    var f: usize = 0
+    while f < 6 {
+        (*out)[f] = t as u16
+        f = f + 1
+    }
+}
+
+// dye colour index (0..15) of a name that STARTS with a colour word, else -1. The two word
+// colours (light_blue, light_gray) are tested before blue / gray.
+fn dye_of(p: u64, n: usize) -> i32 {
+    if name_starts(p, n, "white_") { return 0 }
+    if name_starts(p, n, "orange_") { return 1 }
+    if name_starts(p, n, "magenta_") { return 2 }
+    if name_starts(p, n, "light_blue_") { return 3 }
+    if name_starts(p, n, "yellow_") { return 4 }
+    if name_starts(p, n, "lime_") { return 5 }
+    if name_starts(p, n, "pink_") { return 6 }
+    if name_starts(p, n, "light_gray_") { return 8 }
+    if name_starts(p, n, "gray_") { return 7 }
+    if name_starts(p, n, "cyan_") { return 9 }
+    if name_starts(p, n, "purple_") { return 10 }
+    if name_starts(p, n, "blue_") { return 11 }
+    if name_starts(p, n, "brown_") { return 12 }
+    if name_starts(p, n, "green_") { return 13 }
+    if name_starts(p, n, "red_") { return 14 }
+    if name_starts(p, n, "black_") { return 15 }
+    return 0 - 1
+}
+
+// FNV-1a over the name, folded to 0..15
+fn name_hash16(p: u64, n: usize) -> i32 {
+    var h: u32 = 2166136261 as u32
+    var i: usize = 0
+    while i < n {
+        h = (h ^ (rt.ld8(p, i) as u32)) *% 16777619 as u32
+        i = i + 1
+    }
+    return ((h ^ (h >> 16 as u32)) & 15 as u32) as i32
+}
+
+// Face tiles of the block called `name` (no namespace prefix, as in the registry). `solid` is
+// the registry's RF_SOLID flag. Order -x +x -y +y -z +z; 0 = no face.
+fn tex_tiles_for_name(p: u64, n: usize, solid: bool, out: *mut [u16; 6]) {
+    all6(out, 0 as u32)
+    if name_is(p, n, "air") || name_is(p, n, "cave_air") || name_is(p, n, "void_air") { return }
+    if name_is(p, n, "barrier") || name_is(p, n, "light") || name_is(p, n, "structure_void") { return }
+    if name_is(p, n, "grass_block") {
+        all6(out, T_GRASS_SIDE)
+        (*out)[2] = T_DIRT as u16
+        (*out)[3] = T_GRASS_TOP as u16
+        return
+    }
+    if name_is(p, n, "stone") || name_is(p, n, "stone_bricks") || name_is(p, n, "smooth_stone") {
+        all6(out, T_STONE)
+        return
+    }
+    if name_is(p, n, "dirt") || name_is(p, n, "coarse_dirt") || name_is(p, n, "rooted_dirt") ||
+    name_is(p, n, "farmland") || name_is(p, n, "dirt_path") {
+        all6(out, T_DIRT)
+        return
+    }
+    if name_is(p, n, "sand") { all6(out, T_SAND); return }
+    if name_is(p, n, "gravel") { all6(out, T_GRAVEL); return }
+    if name_is(p, n, "cobblestone") || name_is(p, n, "mossy_cobblestone") { all6(out, T_COBBLE); return }
+    if name_is(p, n, "bedrock") { all6(out, T_BEDROCK); return }
+    if name_is(p, n, "snow_block") || name_is(p, n, "snow") || name_is(p, n, "powder_snow") { all6(out, T_SNOW); return }
+    if name_is(p, n, "ice") || name_is(p, n, "packed_ice") || name_is(p, n, "blue_ice") { all6(out, T_ICE); return }
+    if name_is(p, n, "water") || name_is(p, n, "bubble_column") { all6(out, T_WATER); return }
+    if name_is(p, n, "lava") { all6(out, T_LAVA); return }
+    if name_is(p, n, "glass") { all6(out, T_GLASS); return }
+    if name_is(p, n, "sandstone") || name_is(p, n, "cut_sandstone") || name_is(p, n, "smooth_sandstone") ||
+    name_is(p, n, "chiseled_sandstone") {
+        all6(out, T_SANDSTONE)
+        return
+    }
+    if name_is(p, n, "bricks") { all6(out, T_BRICKS); return }
+    if name_is(p, n, "netherrack") { all6(out, T_NETHERRACK); return }
+    if name_is(p, n, "clay") { all6(out, T_CLAY); return }
+    if name_is(p, n, "deepslate") { all6(out, T_DEEPSLATE); return }
+    if name_is(p, n, "terracotta") { all6(out, T_TERRACOTTA); return }
+    if name_ends(p, n, "_planks") { all6(out, T_PLANKS); return }
+    if name_ends(p, n, "_log") || name_ends(p, n, "_wood") || name_ends(p, n, "_stem") || name_ends(p, n, "_hyphae") {
+        all6(out, T_LOG_SIDE)
+        (*out)[2] = T_LOG_TOP as u16
+        (*out)[3] = T_LOG_TOP as u16
+        return
+    }
+    if name_ends(p, n, "_leaves") { all6(out, T_LEAVES); return }
+    if name_ends(p, n, "_ore") { all6(out, T_ORE); return }
+    if name_ends(p, n, "_glass") { all6(out, T_GLASS); return }
+    if name_ends(p, n, "_terracotta") {
+        let d: i32 = dye_of(p, n)
+        if d >= 0 { all6(out, T_DYE0 + (d as u32)) } else { all6(out, T_TERRACOTTA) }
+        return
+    }
+    let d: i32 = dye_of(p, n)
+    if d >= 0 && solid {
+        all6(out, T_DYE0 + (d as u32))
+        return
+    }
+    if solid {
+        all6(out, T_HASH0 + (name_hash16(p, n) as u32))
+    }
+}
+
+// ---------------------------------------------------------------- tables for mc_mesh
+
+// Allocates zeroed MeshTables arrays (opaque u8[32768], tiles u16[32768 * 6]).
+fn tex_alloc_tables(t: *mut mc_mesh.MeshTables) {
+    (*t).opaque = rt.heap_alloc(32768)
+    (*t).tiles = rt.heap_alloc(32768 * 6 * 2)
+    var i: usize = 0
+    while i < 32768 {
+        rt.st8((*t).opaque, i, 0 as u8)
+        i = i + 1
+    }
+    i = 0
+    while i < 32768 * 6 {
+        rt.st16((*t).tiles, i, 0 as u16)
+        i = i + 1
+    }
+}
+
+fn tex_free_tables(t: *mut mc_mesh.MeshTables) {
+    if (*t).opaque != 0 {
+        rt.heap_free((*t).opaque, 32768)
+        rt.heap_free((*t).tiles, 32768 * 6 * 2)
+    }
+    (*t).opaque = 0
+    (*t).tiles = 0
+}
+
+// Fills `t` (from tex_alloc_tables) for every block state of the registry: opaque = solid and not
+// transparent (same rule as mc_registry.reg_fill_opaque); states >= 32768 are ignored (mc_mesh
+// tables hold 32768 states).
+fn tex_build_tables(r: *mut mc_registry.Registry, t: *mut mc_mesh.MeshTables) {
+    let ns: i32 = mc_registry.reg_state_count(r)
+    var lim: i32 = ns
+    if lim > 32768 { lim = 32768 }
+    var b: i32 = 0
+    var faces: [u16; 6] = [0 as u16; 6]
+    while b < mc_registry.reg_block_count(r) {
+        var len: usize = 0
+        let p: u64 = mc_registry.reg_block_name(r, b, &len)
+        let solid: bool = (mc_registry.reg_block_flags(r, b) & mc_registry.RF_SOLID) != 0 as u32
+        let fl: u32 = mc_registry.reg_block_flags(r, b)
+        var opq: u8 = 0 as u8
+        if solid && (fl & mc_registry.RF_TRANSPARENT) == 0 as u32 { opq = 1 as u8 }
+        tex_tiles_for_name(p, len, solid, &faces)
+        var st: i32 = mc_registry.reg_block_min_state(r, b)
+        while st <= mc_registry.reg_block_max_state(r, b) && st < lim {
+            rt.st8((*t).opaque, st as usize, opq)
+            var f: usize = 0
+            while f < 6 {
+                rt.st16((*t).tiles, (st as usize) * 6 + f, faces[f])
+                f = f + 1
+            }
+            st = st + 1
+        }
+        b = b + 1
+    }
+}
