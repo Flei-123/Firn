@@ -1,0 +1,297 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/ip6.fi -- IPv6 address text (round MC-E).
+//
+//   ip6_parse(p, n, out)   "2001:db8::1", "::", "::1", "::ffff:1.2.3.4",
+//                          "[::1]" (brackets are stripped). No zone id ("%eth0")
+//                          and no prefix length: refused, not guessed.
+//   ip6_format(addr, buf)  RFC 5952: lower case, no leading zeros, the LONGEST
+//                          run of at least two zero groups becomes "::" (the
+//                          first one on a tie), an IPv4-mapped address
+//                          (::ffff:a.b.c.d) is written with the dotted tail.
+//
+// An address is 16 octets in network order, `*mut [u8; 16]` for the parser and
+// a `u64` pointer for the formatter (so it works on slices of bigger tables).
+import std.rt
+import net.dns
+
+export {
+    ip6_parse, ip6_format, ip6_is_mapped_v4, ip6_mapped_v4,
+}
+
+fn hexval(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return (c - 97 as u8) as i32 + 10
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return (c - 65 as u8) as i32 + 10
+    }
+    return 0 - 1
+}
+
+fn ip6_parse(p0: u64, n0: usize, out: *mut [u8; 16]) -> bool {
+    var p: u64 = p0
+    var n: usize = n0
+    if n >= 2 && rt.ld8(p, 0) == 91 as u8 && rt.ld8(p, n - 1) == 93 as u8 {
+        p = p + 1 as u64
+        n = n - 2
+    }
+    if n < 2 {
+        return false
+    }
+    var groups: [u32; 8] = [0; 8]
+    var ng: usize = 0 // groups written before "::" (or all)
+    var tail: [u32; 8] = [0; 8]
+    var nt: usize = 0 // groups after "::"
+    var seen_gap: bool = false
+    var i: usize = 0
+    // a leading "::" or ":" only valid as "::"
+    if rt.ld8(p, 0) == 58 as u8 {
+        if rt.ld8(p, 1) != 58 as u8 {
+            return false
+        }
+        seen_gap = true
+        i = 2
+        if i == n {
+            var z: usize = 0
+            while z < 16 {
+                (*out)[z] = 0 as u8
+                z = z + 1
+            }
+            return true
+        }
+    }
+    var need_group: bool = true
+    while i < n {
+        // one group: 1..4 hex digits, or a dotted quad as the last element
+        let start: usize = i
+        var v: u32 = 0
+        var digits: usize = 0
+        var dotted: bool = false
+        while i < n && rt.ld8(p, i) != 58 as u8 {
+            let c: u8 = rt.ld8(p, i)
+            if c == 46 as u8 {
+                dotted = true
+            }
+            i = i + 1
+        }
+        if dotted {
+            var ip: u32 = 0
+            if !dns.dns_parse_ipv4(p + start as u64, i - start, &ip) {
+                return false
+            }
+            if i != n {
+                return false
+            }
+            let hi: u32 = ip >> 16
+            let lo: u32 = ip & 65535 as u32
+            if seen_gap {
+                if nt + 2 + ng > 7 {
+                    return false
+                }
+                tail[nt] = hi
+                tail[nt + 1] = lo
+                nt = nt + 2
+            } else {
+                if ng + 2 > 8 {
+                    return false
+                }
+                groups[ng] = hi
+                groups[ng + 1] = lo
+                ng = ng + 2
+            }
+            need_group = false
+        } else {
+            digits = i - start
+            if digits < 1 || digits > 4 {
+                return false
+            }
+            var k: usize = start
+            while k < i {
+                let h: i32 = hexval(rt.ld8(p, k))
+                if h < 0 {
+                    return false
+                }
+                v = (v << 4) | (h as u32)
+                k = k + 1
+            }
+            if seen_gap {
+                if nt + ng >= 7 {
+                    return false
+                }
+                tail[nt] = v
+                nt = nt + 1
+            } else {
+                if ng >= 8 {
+                    return false
+                }
+                groups[ng] = v
+                ng = ng + 1
+            }
+            need_group = false
+        }
+        if i == n {
+            break
+        }
+        // at a ':'
+        i = i + 1
+        if i < n && rt.ld8(p, i) == 58 as u8 {
+            if seen_gap {
+                return false
+            }
+            seen_gap = true
+            i = i + 1
+            need_group = false
+            if i == n {
+                break
+            }
+        } else if i == n {
+            return false // trailing single ':'
+        } else {
+            need_group = true
+        }
+    }
+    if need_group && i >= n && !seen_gap {
+        return false
+    }
+    if seen_gap {
+        if ng + nt > 7 {
+            return false
+        }
+    } else if ng != 8 {
+        return false
+    }
+    var all: [u32; 8] = [0; 8]
+    var a: usize = 0
+    while a < ng {
+        all[a] = groups[a]
+        a = a + 1
+    }
+    var b: usize = 0
+    while b < nt {
+        all[8 - nt + b] = tail[b]
+        b = b + 1
+    }
+    var g: usize = 0
+    while g < 8 {
+        (*out)[g * 2] = (all[g] >> 8) as u8
+        (*out)[g * 2 + 1] = (all[g] & 255 as u32) as u8
+        g = g + 1
+    }
+    return true
+}
+
+fn ip6_is_mapped_v4(a: u64) -> bool {
+    var i: usize = 0
+    while i < 10 {
+        if rt.ld8(a, i) != 0 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return rt.ld8(a, 10) == 255 as u8 && rt.ld8(a, 11) == 255 as u8
+}
+
+// The IPv4 address (host order) inside an IPv4-mapped IPv6 address.
+fn ip6_mapped_v4(a: u64) -> u32 {
+    return ((rt.ld8(a, 12) as u32) << 24) | ((rt.ld8(a, 13) as u32) << 16)
+        | ((rt.ld8(a, 14) as u32) << 8) | (rt.ld8(a, 15) as u32)
+}
+
+fn put_dec(buf: *mut rt.Buf, v: u32) {
+    var t: [u8; 4] = [0; 4]
+    var n: usize = 0
+    var x: u32 = v
+    if x == 0 as u32 {
+        t[0] = 48 as u8
+        n = 1
+    }
+    while x > 0 as u32 {
+        t[n] = (48 as u32 + x % 10 as u32) as u8
+        x = x / 10 as u32
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        rt.buf_push(buf, t[n])
+    }
+}
+
+fn put_hex(buf: *mut rt.Buf, v: u32) {
+    var started: bool = false
+    var sh: i32 = 12
+    while sh >= 0 {
+        let d: u32 = (v >> (sh as u32)) & 15 as u32
+        if d != 0 as u32 || started || sh == 0 {
+            started = true
+            if d < 10 as u32 {
+                rt.buf_push(buf, (48 as u32 + d) as u8)
+            } else {
+                rt.buf_push(buf, (87 as u32 + d) as u8)
+            }
+        }
+        sh = sh - 4
+    }
+}
+
+fn ip6_format(a: u64, buf: *mut rt.Buf) {
+    var g: [u32; 8] = [0; 8]
+    var i: usize = 0
+    while i < 8 {
+        g[i] = ((rt.ld8(a, i * 2) as u32) << 8) | (rt.ld8(a, i * 2 + 1) as u32)
+        i = i + 1
+    }
+    // longest zero run (>= 2), first on a tie
+    var best_at: usize = 8
+    var best_len: usize = 0
+    var j: usize = 0
+    while j < 8 {
+        if g[j] == 0 as u32 {
+            var k: usize = j
+            while k < 8 && g[k] == 0 as u32 {
+                k = k + 1
+            }
+            if k - j > best_len {
+                best_len = k - j
+                best_at = j
+            }
+            j = k
+        } else {
+            j = j + 1
+        }
+    }
+    if best_len < 2 {
+        best_at = 8
+        best_len = 0
+    }
+    let mapped: bool = ip6_is_mapped_v4(a)
+    var m: usize = 0
+    while m < 8 {
+        if m == best_at {
+            rt.buf_push(buf, 58 as u8)
+            rt.buf_push(buf, 58 as u8)
+            m = m + best_len
+        } else {
+            if mapped && m == 6 {
+                if m > 0 && m != best_at + best_len {
+                    rt.buf_push(buf, 58 as u8)
+                }
+                put_dec(buf, g[6] >> 8)
+                rt.buf_push(buf, 46 as u8)
+                put_dec(buf, g[6] & 255 as u32)
+                rt.buf_push(buf, 46 as u8)
+                put_dec(buf, g[7] >> 8)
+                rt.buf_push(buf, 46 as u8)
+                put_dec(buf, g[7] & 255 as u32)
+                return
+            }
+            if m > 0 && m != best_at + best_len {
+                rt.buf_push(buf, 58 as u8)
+            }
+            put_hex(buf, g[m])
+            m = m + 1
+        }
+    }
+}

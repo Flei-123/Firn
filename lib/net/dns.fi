@@ -90,7 +90,8 @@ export {
     dns_resolve, dns_resolve_a, dns_lookup_a, dns_err_num, dns_err_name,
     dns_build_query, dns_parse_reply, reply_new, dns_name_valid,
     dns_parse_ipv4, dns_parse_resolv_conf, dns_hosts_lookup,
-    T_A, T_CNAME, T_AAAA,
+    T_A, T_CNAME, T_AAAA, T_SRV,
+    SrvSet, srvset_new, dns_resolve_srv, srv_target,
     VIA_NUMERIC, VIA_LOCALHOST, VIA_HOSTS, VIA_CACHE, VIA_UDP, VIA_TCP,
 }
 
@@ -110,6 +111,9 @@ error DnsError {
 const T_A: u32 = 1
 const T_CNAME: u32 = 5
 const T_AAAA: u32 = 28
+const T_SRV: u32 = 33
+const MAX_SRV: usize = 8
+const SRV_NAME: usize = 96
 const CLASS_IN: u32 = 1
 
 const VIA_NUMERIC: u32 = 1
@@ -345,13 +349,20 @@ struct Reply {
     cur: [u8; 256], // the name at the end of the chain, lower case
     ncur: usize,
     looped: bool, // the chain was longer than MAX_CNAME or a cycle
+    nsrv: usize, // SRV records on the chain (round MC-E)
+    srv_prio: [u32; 8],
+    srv_weight: [u32; 8],
+    srv_port: [u32; 8],
+    srv_nlen: [usize; 8], // 0 = the target "." (service not available)
+    srv_name: [u8; 768], // 8 targets of 96 octets, lower case dotted text
 }
 
 fn reply_new() -> Reply {
     return Reply { id: 0 as u32, rcode: 0 as u32, truncated: false,
         naddr: 0, addr: [0; 8], naddr6: 0, addr6: [0; 64],
         ttl: TTL_NONE, ncname: 0 as u32, cur: [0; 256], ncur: 0,
-        looped: false }
+        looped: false, nsrv: 0, srv_prio: [0; 8], srv_weight: [0; 8],
+        srv_port: [0; 8], srv_nlen: [0; 8], srv_name: [0; 768] }
 }
 
 fn reply_reset(r: *mut Reply) {
@@ -364,6 +375,7 @@ fn reply_reset(r: *mut Reply) {
     (*r).ncname = 0 as u32
     (*r).ncur = 0
     (*r).looped = false
+    (*r).nsrv = 0
 }
 
 // Reads a name at `off` -- plain labels or a compression pointer, or a
@@ -597,6 +609,24 @@ fn dns_parse_reply(msg: u64, n: usize, qname: u64, qlen: usize, qtype: u32,
                 }
                 (*r).naddr6 = (*r).naddr6 + 1
                 ttl_note(r, rr.ttl)
+            } else if rr.typ == T_SRV && rr.rdlen >= 7 && (*r).nsrv < MAX_SRV {
+                var nx3: usize = 0
+                let sl: usize = name_read(msg, n, rr.rdoff + 6,
+                    (&tmp[0]) as u64, &nx3)
+                if sl != BAD && sl < SRV_NAME {
+                    let at: usize = (*r).nsrv
+                    (*r).srv_prio[at] = be16(msg, rr.rdoff)
+                    (*r).srv_weight[at] = be16(msg, rr.rdoff + 2)
+                    (*r).srv_port[at] = be16(msg, rr.rdoff + 4)
+                    (*r).srv_nlen[at] = sl
+                    var q2: usize = 0
+                    while q2 < sl {
+                        (*r).srv_name[at * SRV_NAME + q2] = tmp[q2]
+                        q2 = q2 + 1
+                    }
+                    (*r).nsrv = at + 1
+                    ttl_note(r, rr.ttl)
+                }
             }
         }
         off2 = rr.next
@@ -1292,4 +1322,133 @@ fn dns_err_name(code: u32, out: *mut rt.Buf) {
         c = 10
     }
     rt.buf_push_bytes(out, (&t[0]) as u64 + off[c] as u64, off[c + 1] - off[c])
+}
+
+
+// ---------------------------------------------------------------------- SRV
+// (round MC-E) `_minecraft._tcp.example.com` -> host and port to dial.
+//
+// RFC 2782 says: lowest priority first; inside one priority a WEIGHTED RANDOM
+// pick. Here the order is deterministic instead -- priority ascending, then
+// weight DESCENDING (ties keep the order of the answer) -- so a client always
+// tries the heaviest server first and a test can name the winner. Not cached
+// (a launcher asks once per connect). A target of "." (RFC 2782: the service
+// is decidedly not available) comes out with length 0; callers treat a set
+// that holds only such entries as NoData.
+
+struct SrvSet {
+    n: usize,
+    prio: [u32; 8],
+    weight: [u32; 8],
+    port: [u32; 8],
+    nlen: [usize; 8],
+    name: [u8; 768],
+    ttl: u32,
+    via: u32,
+}
+
+fn srvset_new() -> SrvSet {
+    return SrvSet { n: 0, prio: [0; 8], weight: [0; 8], port: [0; 8],
+        nlen: [0; 8], name: [0; 768], ttl: 0 as u32, via: 0 as u32 }
+}
+
+// Pointer to the target name of entry `i` (`nlen[i]` octets, not terminated).
+fn srv_target(o: *mut SrvSet, i: usize) -> u64 {
+    return (&(*o).name[i * SRV_NAME]) as u64
+}
+
+fn dns_resolve_srv(r: *mut Resolver, name: u64, nlen: usize,
+    out: *mut SrvSet) -> DnsError!bool {
+    (*out).n = 0
+    (*r).last_err = 0 as u32
+    var nl: usize = nlen
+    if nl > 0 && rt.ld8(name, nl - 1) == 46 as u8 {
+        nl = nl - 1
+    }
+    if !dns_name_valid(name, nl) {
+        (*r).last_err = 1 as u32
+        return DnsError::Name
+    }
+    if (*r).nservers == 0 {
+        (*r).last_err = 2 as u32
+        return DnsError::NoServers
+    }
+    (*r).n_queries = (*r).n_queries + 1 as u64
+    var qn: [u8; 256] = [0; 256]
+    copy_lower((&qn[0]) as u64, name, nl)
+    var rep: Reply = reply_new()
+    var res: Resolved = resolved_new()
+    let st: i32 = ask(r, (&qn[0]) as u64, nl, T_SRV, &rep, &res)
+    if st != X_OK {
+        let code: u32 = fail_of(r, st)
+        if code == 3 as u32 {
+            return DnsError::Timeout
+        }
+        if code == 4 as u32 {
+            return DnsError::Network
+        }
+        if code == 5 as u32 {
+            return DnsError::Format
+        }
+        if code == 6 as u32 {
+            return DnsError::ServerFail
+        }
+        return DnsError::Random
+    }
+    (*out).via = res.via
+    if rep.rcode == 3 as u32 {
+        (*r).last_err = 7 as u32
+        return DnsError::NxDomain
+    }
+    if rep.looped {
+        (*r).last_err = 9 as u32
+        return DnsError::CnameLoop
+    }
+    if rep.nsrv == 0 {
+        (*r).last_err = 8 as u32
+        return DnsError::NoData
+    }
+    // insertion sort of the indices: priority ascending, weight descending
+    var order: [usize; 8] = [0; 8]
+    var i: usize = 0
+    while i < rep.nsrv {
+        var j: usize = i
+        while j > 0 {
+            let a: usize = order[j - 1]
+            let better: bool = rep.srv_prio[i] < rep.srv_prio[a]
+                || (rep.srv_prio[i] == rep.srv_prio[a] && rep.srv_weight[i] > rep.srv_weight[a])
+            if better {
+                order[j] = a
+                j = j - 1
+            } else {
+                break
+            }
+        }
+        order[j] = i
+        i = i + 1
+    }
+    var k: usize = 0
+    while k < rep.nsrv {
+        let src: usize = order[k]
+        (*out).prio[k] = rep.srv_prio[src]
+        (*out).weight[k] = rep.srv_weight[src]
+        (*out).port[k] = rep.srv_port[src]
+        (*out).nlen[k] = rep.srv_nlen[src]
+        var c: usize = 0
+        while c < rep.srv_nlen[src] {
+            (*out).name[k * SRV_NAME + c] = rep.srv_name[src * SRV_NAME + c]
+            c = c + 1
+        }
+        k = k + 1
+    }
+    (*out).n = rep.nsrv
+    var ttl: u32 = rep.ttl
+    if ttl == TTL_NONE {
+        ttl = 0 as u32
+    }
+    if ttl > TTL_MAX_S {
+        ttl = TTL_MAX_S
+    }
+    (*out).ttl = ttl
+    return true
 }
