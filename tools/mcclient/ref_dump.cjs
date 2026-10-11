@@ -411,6 +411,8 @@ function main () {
   let idleTimer = null
   let finished = false
   let chunkErrors = 0
+  let bulkPackets = 0
+  let bulkColumns = 0 // 1.8: map_chunk_bulk packets / columns they carried
   let numSections = 24
 
   const client = mc.createClient({ host, port, username: name, version: NMP_VERSION, auth: 'offline', viewDistance: String(viewDistance), hideErrors: false })
@@ -440,6 +442,8 @@ function main () {
       walk_fail: walkFail + chunkErrors,
       num_sections: numSections,
       partial_chunks: partialChunks,
+      bulk_packets: bulkPackets,
+      bulk_columns: bulkColumns,
       trailing_nonzero_chunks: trailingNonZero,
       checksum: sum
     }
@@ -523,6 +527,7 @@ function main () {
 
   client.on('map_chunk_bulk', (p) => {
     if (m.first_chunk_ms < 0) m.first_chunk_ms = Date.now() - t0
+    bulkPackets++; bulkColumns += p.meta.length
     try {
       let off = 0
       for (const e of p.meta) {
