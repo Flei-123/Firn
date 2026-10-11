@@ -1,0 +1,230 @@
+// lib/mc/mc_sky.fi -- deterministic sky: time of day -> sky / fog / light colours, sun and moon discs, background pass.
+//
+// Everything is a pure function of (ticks, rain): no libm (sine = a rational approximation built from + - * /),
+// colours are integer lerps (a*(256-t) + b*t) >> 8, so the image is the same bit for bit on every build stage
+// and tools/mc/sky/ref.py reproduces it exactly.
+//
+// TIME: ticks 0..23999 like the game (0 = sunrise, 6000 = noon, 12000 = sunset, 18000 = midnight); any i64 is wrapped.
+// sky_set_time computes the Sky: sun direction (the moon is exactly opposite), daylight 0..256, sunset glow 0..256,
+// zenith / horizon / fog colour and the light tint (multipliers 0..256 per channel for the world pixels).
+// DRAW ORDER: raster_clear -> sky_draw (gradient + glow + discs into the colour buffer, depth untouched)
+// -> world (the fog colour = sky_set_raster_fog) -> optional sky_tint_frame (tints pixels with depth > 0).
+
+import std.rt
+import std.math
+import mc.mc_camera
+import mc.mc_raster
+
+export {
+    Sky, sky_new, sky_set_time, sky_draw, sky_set_raster_fog, sky_tint_frame, sky_sin_deg, sky_cos_deg,
+}
+
+const SUN_COS: f64 = 0.9976 // disc radius about 4 degrees
+const MOON_COS: f64 = 0.9984 // about 3.2 degrees
+
+struct Sky {
+    time: i64, // wrapped to 0..23999
+    rain: i32, // 0..256
+    daylight: i32, // 0 (night) .. 256 (day)
+    glow: i32, // sunset / sunrise strength 0..256
+    discs: bool, // sun and moon are drawn (false in heavy rain)
+    sunx: f64, suny: f64, sunz: f64, // unit-ish direction to the sun (world: +x east, +y up, +z south)
+    zr: i32, zg: i32, zb: i32, // zenith
+    hr: i32, hg: i32, hb: i32, // horizon
+    fr: i32, fg: i32, fb: i32, // fog colour (= horizon)
+    lr: i32, lg: i32, lb: i32, // sunset glow colour
+    tr: i32, tg: i32, tb: i32, // light tint multipliers 0..256
+}
+
+fn sky_new() -> Sky {
+    var s: Sky = Sky {
+        time: 0, rain: 0, daylight: 0, glow: 0, discs: true,
+        sunx: 1.0, suny: 0.0, sunz: 0.0,
+        zr: 0, zg: 0, zb: 0, hr: 0, hg: 0, hb: 0, fr: 0, fg: 0, fb: 0, lr: 255, lg: 120, lb: 60,
+        tr: 256, tg: 256, tb: 256,
+    }
+    sky_set_time(&s, 6000 as i64, 0)
+    return s
+}
+
+// sine of an angle in degrees, x in [0, 360): Bhaskara's rational approximation (max error 0.0016)
+fn sky_sin_deg(x: f64) -> f64 {
+    var a: f64 = x
+    var sign: f64 = 1.0
+    if a > 180.0 {
+        a = a - 180.0
+        sign = -1.0
+    }
+    let p: f64 = a * (180.0 - a)
+    return sign * ((4.0 * p) / (40500.0 - p))
+}
+
+fn sky_cos_deg(x: f64) -> f64 {
+    var c: f64 = x + 90.0
+    if c >= 360.0 { c = c - 360.0 }
+    return sky_sin_deg(c)
+}
+
+fn lerp(a: i64, b: i64, t: i64) -> i64 {
+    return (a * (256 as i64 - t) + b * t) / 256 as i64
+}
+
+fn clamp01(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn sky_set_time(s: *mut Sky, ticks: i64, rain: i32) {
+    var t: i64 = ticks % (24000 as i64)
+    if t < 0 as i64 { t = t + 24000 as i64 }
+    var rn: i64 = rain as i64
+    if rn < 0 as i64 { rn = 0 }
+    if rn > 256 as i64 { rn = 256 }
+    (*s).time = t
+    (*s).rain = rn as i32
+    (*s).discs = rn < 128 as i64
+    let ang: f64 = ((t as f64) * 360.0) / 24000.0
+    let sn: f64 = sky_sin_deg(ang)
+    let cs: f64 = sky_cos_deg(ang)
+    (*s).sunx = cs
+    (*s).suny = sn * 0.9
+    (*s).sunz = sn * 0.4358898943540674
+    let sy: f64 = (*s).suny
+    let d: f64 = clamp01((sy + 0.1) / 0.3)
+    let dl: i64 = math.floor(d * 256.0) as i64
+    (*s).daylight = dl as i32
+    var a: f64 = 1.0 - math.fabs(sy) / 0.35
+    if a < 0.0 { a = 0.0 }
+    var gl: i64 = math.floor((256.0 * a) * a) as i64
+    gl = gl * (256 as i64 - rn) / 256 as i64
+    (*s).glow = gl as i32
+    // day / night colours, rain pulls both towards a grey that follows the daylight
+    let gy: i64 = lerp(14 as i64, 150 as i64, dl)
+    let gz: i64 = (gy * 3 as i64) / 4 as i64
+    var zr: i64 = lerp(3 as i64, 82 as i64, dl)
+    var zg: i64 = lerp(4 as i64, 131 as i64, dl)
+    var zb: i64 = lerp(14 as i64, 235 as i64, dl)
+    var hr: i64 = lerp(10 as i64, 190 as i64, dl)
+    var hg: i64 = lerp(12 as i64, 214 as i64, dl)
+    var hb: i64 = lerp(30 as i64, 255 as i64, dl)
+    zr = lerp(zr, gz, rn)
+    zg = lerp(zg, gz + 1 as i64, rn)
+    zb = lerp(zb, gz + 4 as i64, rn)
+    hr = lerp(hr, gy, rn)
+    hg = lerp(hg, gy + 2 as i64, rn)
+    hb = lerp(hb, gy + 6 as i64, rn)
+    (*s).zr = zr as i32
+    (*s).zg = zg as i32
+    (*s).zb = zb as i32
+    (*s).hr = hr as i32
+    (*s).hg = hg as i32
+    (*s).hb = hb as i32
+    (*s).fr = hr as i32
+    (*s).fg = hg as i32
+    (*s).fb = hb as i32
+    // light tint: night is dark blue, sunset is warm, rain is a bit grey
+    var tr: i64 = lerp(96 as i64, 256 as i64, dl)
+    var tg: i64 = lerp(110 as i64, 256 as i64, dl)
+    var tb: i64 = lerp(190 as i64, 256 as i64, dl)
+    let wg: i64 = gl / 2 as i64
+    tr = lerp(tr, 256 as i64, wg)
+    tg = lerp(tg, 224 as i64, wg)
+    tb = lerp(tb, 184 as i64, wg)
+    let rh: i64 = rn / 2 as i64
+    tr = lerp(tr, 216 as i64, rh)
+    tg = lerp(tg, 220 as i64, rh)
+    tb = lerp(tb, 232 as i64, rh)
+    (*s).tr = tr as i32
+    (*s).tg = tg as i32
+    (*s).tb = tb as i32
+}
+
+fn pack(r: i64, g: i64, b: i64) -> u32 {
+    return (r as u32) | ((g as u32) << 8 as u32) | ((b as u32) << 16 as u32) | 0xFF000000 as u32
+}
+
+// Background pass: writes every pixel of the colour buffer (the depth buffer is not touched).
+// `raster_set_camera` must have been called with the camera of this frame.
+fn sky_draw(s: *mut Sky, r: *mut mc_raster.Raster) {
+    let w: i32 = (*r).w
+    let h: i32 = (*r).h
+    let glowf: f64 = (*s).glow as f64
+    let zr: i64 = (*s).zr as i64
+    let zg: i64 = (*s).zg as i64
+    let zb: i64 = (*s).zb as i64
+    let hr: i64 = (*s).hr as i64
+    let hg: i64 = (*s).hg as i64
+    let hb: i64 = (*s).hb as i64
+    let lr: i64 = (*s).lr as i64
+    let lg: i64 = (*s).lg as i64
+    let lb: i64 = (*s).lb as i64
+    var y: i32 = 0
+    while y < h {
+        let ey: f64 = ((*r).hh - ((y as f64) + 0.5)) / (*r).fpy
+        var x: i32 = 0
+        while x < w {
+            let ex: f64 = (((x as f64) + 0.5) - (*r).hw) / (*r).fpx
+            let dx: f64 = ((*r).fx + ex * (*r).rx) + ey * (*r).ux
+            let dy: f64 = ((*r).fy + ex * (*r).ry) + ey * (*r).uy
+            let dz: f64 = ((*r).fz + ex * (*r).rz) + ey * (*r).uz
+            let len: f64 = math.sqrt((dx * dx + dy * dy) + dz * dz)
+            let nx: f64 = dx / len
+            let ny: f64 = dy / len
+            let nz: f64 = dz / len
+            let g: f64 = clamp01(ny * 1.6)
+            let gg: f64 = 1.0 - (1.0 - g) * (1.0 - g)
+            let f: i64 = math.floor(gg * 256.0) as i64
+            var cr: i64 = lerp(hr, zr, f)
+            var cg: i64 = lerp(hg, zg, f)
+            var cb: i64 = lerp(hb, zb, f)
+            let dsun: f64 = (nx * (*s).sunx + ny * (*s).suny) + nz * (*s).sunz
+            if dsun > 0.0 && glowf > 0.0 {
+                let d3: f64 = (dsun * dsun) * dsun
+                let wgt: f64 = d3 * (1.0 - gg)
+                let fg: i64 = math.floor(wgt * glowf) as i64
+                cr = lerp(cr, lr, fg)
+                cg = lerp(cg, lg, fg)
+                cb = lerp(cb, lb, fg)
+            }
+            if (*s).discs {
+                if dsun >= SUN_COS {
+                    cr = 255
+                    cg = 248
+                    cb = 200
+                } else if (0.0 - dsun) >= MOON_COS {
+                    cr = 226
+                    cg = 228
+                    cb = 240
+                }
+            }
+            rt.st32((*r).color, (y as usize) * (w as usize) + (x as usize), pack(cr, cg, cb))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// Sets the rasterizer fog to the sky's fog colour (linear from `start` to `end` view depth).
+fn sky_set_raster_fog(s: *mut Sky, r: *mut mc_raster.Raster, start: f64, end: f64) {
+    mc_raster.raster_set_fog(r, true, start, end, (*s).fr as u32, (*s).fg as u32, (*s).fb as u32)
+}
+
+// Light tint for the world: every pixel with a depth entry (geometry was drawn there) is multiplied by the tint.
+fn sky_tint_frame(s: *mut Sky, r: *mut mc_raster.Raster) {
+    let n: usize = ((*r).w as usize) * ((*r).h as usize)
+    let tr: i64 = (*s).tr as i64
+    let tg: i64 = (*s).tg as i64
+    let tb: i64 = (*s).tb as i64
+    var i: usize = 0
+    while i < n {
+        if *(((*r).depth + (i as u64) * (8 as u64)) as *mut f64) > 0.0 {
+            let p: u32 = rt.ld32((*r).color, i)
+            let cr: i64 = (((p & 255 as u32) as i64) * tr) / 256 as i64
+            let cg: i64 = ((((p >> 8 as u32) & 255 as u32) as i64) * tg) / 256 as i64
+            let cb: i64 = ((((p >> 16 as u32) & 255 as u32) as i64) * tb) / 256 as i64
+            rt.st32((*r).color, i, pack(cr, cg, cb))
+        }
+        i = i + 1
+    }
+}
