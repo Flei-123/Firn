@@ -1,0 +1,391 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/mc/schema/check.fi -- conformance check of the schema walker against
+// fixtures made by the REFERENCE serializer (tools/mcgen/gen_fixtures.cjs).
+//
+// usage: check <fixture-dir> [throughput-rounds=20] [protocol=763]
+//
+// The fixture dir holds manifest.txt (`<state> <dir> <id> <name> <file> <flags>`)
+// and the packet bodies. Driven by tools/mc/schema/conformance.sh.
+//
+// Checks, per fixture:
+//   1. packet_name(state, dir, id) equals the name in the manifest;
+//   2. the walker consumes the body EXACTLY (walk == true), and `walk` also
+//      leaves the cursor at the end;
+//   3. counter-checks (not for packets ending in a restBuffer, where any tail
+//      is a valid tail): every strict prefix of the body must be rejected
+//      (all of them for small bodies, a spread for big ones) and the body with
+//      one extra octet appended must be rejected;
+//   4. hostile input: single octet mutations of the body and random garbage must
+//      never crash or hang the walker (the result itself may be either);
+//   5. throughput: all fixtures walked `rounds` times, in packets/s and MB/s.
+// Output: `check key=value` lines, `FAIL ...` lines for every violation, exit 1
+// if there is any.
+
+import std.rt
+import std.bytes
+import std.time
+import mc.mc_schema
+import mc.mc_version
+import mc.mc_versions
+
+struct Stats {
+    fixtures: u64,
+    pass_exact: u64,
+    fail_exact: u64,
+    name_mismatch: u64,
+    prefix_checked: u64,
+    prefix_accepted: u64,
+    ext_checked: u64,
+    ext_accepted: u64,
+    mutations: u64,
+    mutations_ok: u64,
+    garbage: u64,
+    garbage_ok: u64,
+    rng: u64,
+}
+
+fn rnd(s: *mut Stats) -> u64 {
+    var x: u64 = (*s).rng
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    (*s).rng = x
+    return x
+}
+
+fn say(b: *mut rt.Buf) {
+    rt.write_everything(1, rt.buf_ptr(b), rt.buf_len(b))
+    rt.buf_clear(b)
+}
+
+fn push_text(b: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(b, p, n)
+}
+
+fn kv(b: *mut rt.Buf, key: str, v: u64) {
+    rt.buf_push_bytes(b, key.p as u64, key.n)
+    rt.buf_push(b, 61)
+    rt.buf_push_dec_u64(b, v)
+    rt.buf_push(b, 10)
+}
+
+// next token of a manifest line: skips blanks, returns the end; start in *from
+fn token(p: u64, n: usize, at: *mut usize, st: *mut usize) -> usize {
+    var i: usize = *at
+    while i < n && rt.ld8(p, i) == 32 {
+        i = i + 1
+    }
+    *st = i
+    while i < n && rt.ld8(p, i) != 32 && rt.ld8(p, i) != 10 {
+        i = i + 1
+    }
+    *at = i
+    return i - *st
+}
+
+fn dec(p: u64, st: usize, n: usize) -> i32 {
+    var v: i32 = 0
+    var i: usize = 0
+    while i < n {
+        v = v * 10 + (rt.ld8(p, st + i) as i32 - 48)
+        i = i + 1
+    }
+    return v
+}
+
+fn load_bytes(body: u64, n: usize, extra: usize, b: *mut bytes.Bytes) {
+    bytes.bytes_clear(b)
+    if n > 0 {
+        bytes.put_raw(b, body, n)
+    }
+    var i: usize = 0
+    while i < extra {
+        bytes.put_u8(b, 0)
+        i = i + 1
+    }
+}
+
+fn fail_line(msg: str, name: u64, nlen: usize, idx: u64, detail: u64) {
+    var o: rt.Buf = rt.buf_new()
+    push_text(&o, msg.p as u64, msg.n)
+    rt.buf_push(&o, 32)
+    push_text(&o, name, nlen)
+    rt.buf_push(&o, 32)
+    rt.buf_push_dec_u64(&o, idx)
+    rt.buf_push(&o, 32)
+    rt.buf_push_dec_u64(&o, detail)
+    rt.buf_push(&o, 10)
+    say(&o)
+    rt.buf_free(&o)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        return 2
+    }
+    let dir: u64 = rt.arg_ptr(start, 1)
+    let dirlen: usize = rt.c_length(dir)
+    var rounds: u64 = 20
+    if rt.arg_count(start) >= 3 {
+        let ra: u64 = rt.arg_ptr(start, 2)
+        rounds = dec(ra, 0, rt.c_length(ra)) as u64
+    }
+    var proto: i32 = 763
+    if rt.arg_count(start) >= 4 {
+        let pa: u64 = rt.arg_ptr(start, 3)
+        proto = dec(pa, 0, rt.c_length(pa))
+    }
+    var ver: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(proto, &ver) {
+        return 4
+    }
+    var mpath: rt.Buf = rt.buf_new()
+    push_text(&mpath, dir, dirlen)
+    push_text(&mpath, "/manifest.txt\0".p as u64, 14)
+    var man: rt.Buf = rt.buf_new()
+    if !rt.read_file(rt.buf_ptr(&mpath), &man) {
+        return 3
+    }
+    let mp: u64 = rt.buf_ptr(&man)
+    let mn: usize = rt.buf_len(&man)
+
+    var st: Stats = Stats {
+        fixtures: 0, pass_exact: 0, fail_exact: 0, name_mismatch: 0,
+        prefix_checked: 0, prefix_accepted: 0, ext_checked: 0, ext_accepted: 0,
+        mutations: 0, mutations_ok: 0, garbage: 0, garbage_ok: 0,
+        rng: 88172645463325252,
+    }
+    var work: bytes.Bytes = bytes.bytes_new()
+    var total_bytes: u64 = 0
+    var biggest: usize = 0
+    var line_at: usize = 0
+    // keep every fixture (schema handle + body) for the throughput loop
+    var bodies: rt.Buf = rt.buf_new() // concatenated bodies
+    var index: rt.Buf = rt.buf_new() // per fixture: schema, offset, len (3 x u64)
+    while line_at < mn {
+        var at: usize = line_at
+        var s0: usize = 0
+        var n0: usize = token(mp, mn, &at, &s0)
+        if n0 == 0 {
+            line_at = line_at + 1
+            continue
+        }
+        let state: i32 = dec(mp, s0, n0)
+        var s1: usize = 0
+        let n1: usize = token(mp, mn, &at, &s1)
+        let d: i32 = dec(mp, s1, n1)
+        var s2: usize = 0
+        let n2: usize = token(mp, mn, &at, &s2)
+        let id: i32 = dec(mp, s2, n2)
+        var s3: usize = 0
+        let n3: usize = token(mp, mn, &at, &s3)
+        var s4: usize = 0
+        let n4: usize = token(mp, mn, &at, &s4)
+        var s5: usize = 0
+        let n5: usize = token(mp, mn, &at, &s5)
+        // skip to the end of the line
+        while at < mn && rt.ld8(mp, at) != 10 {
+            at = at + 1
+        }
+        line_at = at + 1
+        let is_rest: bool = n5 == 4
+
+        st.fixtures = st.fixtures + 1
+        // 1. the name
+        let pn: u64 = ver.name_of(state, d, id)
+        var name_ok: bool = pn != 0
+        if name_ok {
+            var i: usize = 0
+            while i < n3 {
+                if rt.ld8(pn, i) != rt.ld8(mp, s3 + i) {
+                    name_ok = false
+                }
+                i = i + 1
+            }
+            if rt.ld8(pn, n3) != 0 {
+                name_ok = false
+            }
+        }
+        if !name_ok {
+            st.name_mismatch = st.name_mismatch + 1
+            fail_line("FAIL name", mp + s3 as u64, n3, id as u64, 0)
+        }
+        // read the body
+        var fpath: rt.Buf = rt.buf_new()
+        push_text(&fpath, dir, dirlen)
+        rt.buf_push(&fpath, 47)
+        push_text(&fpath, mp + s4 as u64, n4)
+        rt.buf_push(&fpath, 0)
+        var body: rt.Buf = rt.buf_new()
+        if !rt.read_file(rt.buf_ptr(&fpath), &body) {
+            fail_line("FAIL read", mp + s4 as u64, n4, 0, 0)
+            rt.buf_free(&fpath)
+            rt.buf_free(&body)
+            continue
+        }
+        rt.buf_free(&fpath)
+        let bp: u64 = rt.buf_ptr(&body)
+        let bn: usize = rt.buf_len(&body)
+        let sch: u64 = ver.schema_of(state, d, id)
+
+        // 2. exact consumption
+        load_bytes(bp, bn, 0, &work)
+        if mc_schema.walk(sch, &work, 0 as *mut rt.Buf) && bytes.bytes_pos(&work) == bn {
+            st.pass_exact = st.pass_exact + 1
+        } else {
+            st.fail_exact = st.fail_exact + 1
+            fail_line("FAIL exact", mp + s3 as u64, n3, id as u64, bn as u64)
+        }
+        total_bytes = total_bytes + bn as u64
+        if bn > biggest {
+            biggest = bn
+        }
+        // remember for the throughput loop
+        let off: u64 = rt.buf_len(&bodies) as u64
+        if bn > 0 {
+            rt.buf_push_bytes(&bodies, bp, bn)
+        }
+        rt.buf_push_bytes(&index, (&sch) as u64, 8)
+        rt.buf_push_bytes(&index, (&off) as u64, 8)
+        var bn64: u64 = bn as u64
+        rt.buf_push_bytes(&index, (&bn64) as u64, 8)
+
+        // 3. counter checks
+        if !is_rest {
+            var cut: usize = 0
+            while cut < bn {
+                var go: bool = bn <= 96
+                if !go {
+                    go = cut < 8 || cut + 8 >= bn || (rnd(&st) % 17) == 0
+                }
+                if go {
+                    load_bytes(bp, cut, 0, &work)
+                    st.prefix_checked = st.prefix_checked + 1
+                    if mc_schema.walk(sch, &work, 0 as *mut rt.Buf) {
+                        st.prefix_accepted = st.prefix_accepted + 1
+                        fail_line("FAIL prefix", mp + s3 as u64, n3, id as u64, cut as u64)
+                    }
+                }
+                cut = cut + 1
+            }
+            load_bytes(bp, bn, 1, &work)
+            st.ext_checked = st.ext_checked + 1
+            if mc_schema.walk(sch, &work, 0 as *mut rt.Buf) {
+                st.ext_accepted = st.ext_accepted + 1
+                fail_line("FAIL extend", mp + s3 as u64, n3, id as u64, bn as u64)
+            }
+        }
+
+        // 4. hostile input: no crash, no hang (the result is not judged)
+        var m: u64 = 0
+        while m < 40 && bn > 0 {
+            load_bytes(bp, bn, 0, &work)
+            let at2: usize = (rnd(&st) % (bn as u64)) as usize
+            let nv: u8 = (rnd(&st) & 255) as u8
+            bytes.bytes_patch_u8(&work, at2, nv)
+            mc_schema.walk(sch, &work, 0 as *mut rt.Buf)
+            st.mutations = st.mutations + 1
+            m = m + 1
+        }
+        var g: u64 = 0
+        while g < 10 {
+            bytes.bytes_clear(&work)
+            let gl: u64 = rnd(&st) % 200
+            var q: u64 = 0
+            while q < gl {
+                bytes.put_u8(&work, (rnd(&st) & 255) as u8)
+                q = q + 1
+            }
+            mc_schema.walk(sch, &work, 0 as *mut rt.Buf)
+            st.garbage = st.garbage + 1
+            g = g + 1
+        }
+        rt.buf_free(&body)
+    }
+
+    // 5. throughput over the stored fixtures, with and without the dump
+    let nfix: usize = rt.buf_len(&index) / 24
+    let ip: u64 = rt.buf_ptr(&index)
+    let bpall: u64 = rt.buf_ptr(&bodies)
+    var done: u64 = 0
+    var okc: u64 = 0
+    let t0: u64 = time.monotonic_ns()
+    var r: u64 = 0
+    while r < rounds {
+        var f: usize = 0
+        while f < nfix {
+            let sch: u64 = rt.ld64(ip, f * 3)
+            let off: u64 = rt.ld64(ip, f * 3 + 1)
+            let ln: usize = rt.ld64(ip, f * 3 + 2) as usize
+            load_bytes(bpall + off, ln, 0, &work)
+            if mc_schema.walk(sch, &work, 0 as *mut rt.Buf) {
+                okc = okc + 1
+            }
+            done = done + 1
+            f = f + 1
+        }
+        r = r + 1
+    }
+    let t1: u64 = time.monotonic_ns()
+    // the biggest fixture alone, many times
+    var bigi: usize = 0
+    var bigl: usize = 0
+    var f2: usize = 0
+    while f2 < nfix {
+        let ln: usize = rt.ld64(ip, f2 * 3 + 2) as usize
+        if ln > bigl {
+            bigl = ln
+            bigi = f2
+        }
+        f2 = f2 + 1
+    }
+    let t2: u64 = time.monotonic_ns()
+    var big_done: u64 = 0
+    if nfix > 0 {
+        var k: u64 = 0
+        while k < 2000 {
+            load_bytes(bpall + rt.ld64(ip, bigi * 3 + 1), bigl, 0, &work)
+            mc_schema.walk(rt.ld64(ip, bigi * 3), &work, 0 as *mut rt.Buf)
+            big_done = big_done + 1
+            k = k + 1
+        }
+    }
+    let t3: u64 = time.monotonic_ns()
+
+    var o: rt.Buf = rt.buf_new()
+    kv(&o, "check fixtures", st.fixtures)
+    kv(&o, "check pass_exact", st.pass_exact)
+    kv(&o, "check fail_exact", st.fail_exact)
+    kv(&o, "check name_mismatch", st.name_mismatch)
+    kv(&o, "check prefix_checked", st.prefix_checked)
+    kv(&o, "check prefix_accepted", st.prefix_accepted)
+    kv(&o, "check ext_checked", st.ext_checked)
+    kv(&o, "check ext_accepted", st.ext_accepted)
+    kv(&o, "check mutations", st.mutations)
+    kv(&o, "check garbage", st.garbage)
+    kv(&o, "check total_body_bytes", total_bytes)
+    kv(&o, "check biggest_body", biggest as u64)
+    // throughput
+    var dt: u64 = t1 - t0
+    if dt == 0 {
+        dt = 1
+    }
+    kv(&o, "metric walk_packets_per_s", done * 1000000000 / dt)
+    kv(&o, "metric walk_ok_in_loop", okc)
+    var bt: u64 = t3 - t2
+    if bt == 0 {
+        bt = 1
+    }
+    kv(&o, "metric big_fixture_bytes", bigl as u64)
+    kv(&o, "metric big_fixture_walks_per_s", big_done * 1000000000 / bt)
+    kv(&o, "metric big_fixture_kb_per_s", (big_done * (bigl as u64) / 1024) * 1000000000 / bt)
+    say(&o)
+    var bad: u64 = st.fail_exact + st.name_mismatch + st.prefix_accepted + st.ext_accepted
+    if st.fixtures == 0 {
+        bad = bad + 1
+    }
+    if bad != 0 {
+        return 1
+    }
+    return 0
+}

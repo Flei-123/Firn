@@ -11,6 +11,19 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
 ONLY=${1:-}
+FIRNC=${FIRNC:-compiler/target/release/firnc}
+[ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
+# every .fi file of the tree must be in the canonical shape of firnfmt (test.sh section 23
+# fails otherwise): format with `build/firnfmt -w <file>`; this builds it into a temp dir.
+if [ -z "$ONLY" ]; then
+    FT=$(mktemp -d)
+    trap 'rm -rf "$FT"' EXIT
+    if FIRNLIB="$(pwd)/lib" "$FIRNC" -o "$FT/firnfmt" tools/fmt/firnfmt.fi 2>"$FT/err"; then
+        files=$(ls lib/mc/*.fi lib/mc/v*/*.fi tests/*_mc_*.fi demos/mcclient/*.fi 2>/dev/null; find tools/mc -name '*.fi')
+        if bad=$("$FT/firnfmt" -c $files 2>&1) ; then echo "  ok    all mc sources are in canonical shape (firnfmt -c)"
+        else echo "  FAIL  not formatted (run firnfmt -w):"; echo "$bad" | head -10 | sed 's/^/        /'; ERR=$((ERR+1)); fi
+    else echo "  FAIL  cannot build tools/fmt/firnfmt.fi"; head -5 "$FT/err"; ERR=$((ERR+1)); fi
+fi
 if [ -z "$ONLY" ]; then
     bash tools/mc/testmc.sh || ERR=$((ERR+1))
 fi
