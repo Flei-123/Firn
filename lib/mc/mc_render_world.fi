@@ -1,0 +1,443 @@
+// lib/mc/mc_render_world.fi -- world (mc_world) -> section meshes (mc_mesh) -> image (mc_raster backend).
+//
+// For every frame wr_render
+//   1. walks the loaded chunk columns within `dist` chunks (chebyshev) of the camera column,
+//   2. drops every 16^3 section outside the camera frustum (mc_camera.camera_section_visible),
+//   3. looks the section up in the MESH CACHE (hash table keyed by chunk x, section index, chunk z);
+//      a missing or DIRTY section is meshed from its 3x3x3 neighbourhood (mesh_padded, so AO on the
+//      section borders is exact; an unloaded neighbour or the space above / below the world is
+//      "unknown" = no faces towards it) and uploaded to the backend (mc_raster.backend_mesh_upload),
+//   4. sorts the visible sections FRONT TO BACK (squared distance of the section centre) and draws them.
+// `max_mesh` bounds the sections meshed per frame (nearest first; the rest shows up in later frames).
+//
+// CHANGES: wr_mark_block(x, y, z) dirties the section of the block and every neighbour section whose
+// padded shell contains it (up to 8); wr_mark_chunk(cx, cz) dirties the 3x3 columns around a chunk
+// (use it when a chunk is (re)loaded or unloaded). Nothing is remeshed until the next wr_render.
+
+import std.rt
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_raster
+
+export {
+    WorldRender, RenderStats, wr_new, wr_free, wr_clear, wr_mark_block, wr_mark_chunk, wr_render,
+    wr_cached, wr_make_chunk,
+}
+
+const EW: usize = 4 // words per cache entry: key, handle, state, quads
+const ST_EMPTY: u64 = 0
+const ST_CLEAN: u64 = 1
+const ST_DIRTY: u64 = 2
+
+struct RenderStats {
+    chunks: u32, // columns considered (loaded and in range)
+    far_chunks: u32, // columns skipped for distance
+    sections: u32, // sections tested against the frustum
+    culled: u32, // sections outside the frustum
+    meshed: u32, // sections (re)meshed this frame
+    deferred: u32, // sections that needed a mesh but were over the budget
+    drawn: u32, // sections drawn (with at least one triangle)
+    tris: u64, // triangles handed to the rasterizer this frame
+}
+
+struct WorldRender {
+    min_y: i32,
+    dist: i32,
+    tables: mc_mesh.MeshTables,
+    mesher: mc_mesh.Mesher,
+    pad: u64, // u16 [18^3]
+    cache: u64, // EW words per slot
+    cap: usize, // slots (power of two)
+    n: usize, // used slots
+    vis: u64, // u64 [vcap * 2]: entry slot, squared distance
+    vcap: usize,
+    st: RenderStats,
+}
+
+fn wr_new(min_y: i32, dist: i32, t: *mut mc_mesh.MeshTables) -> WorldRender {
+    var w: WorldRender = WorldRender {
+        min_y: min_y, dist: dist, tables: mc_mesh.MeshTables { opaque: (*t).opaque, tiles: (*t).tiles },
+        mesher: mc_mesh.mesher_new(), pad: rt.heap_alloc(5832 * 2), cache: 0, cap: 0, n: 0, vis: 0, vcap: 0,
+        st: RenderStats { chunks: 0 as u32, far_chunks: 0 as u32, sections: 0 as u32, culled: 0 as u32,
+            meshed: 0 as u32, deferred: 0 as u32, drawn: 0 as u32, tris: 0 as u64 },
+    }
+    return w
+}
+
+// Frees the cache; the backend meshes are freed too when `r` is given (0 = skip).
+fn wr_clear(wr: *mut WorldRender, r: *mut mc_raster.Raster) {
+    var i: usize = 0
+    while i < (*wr).cap {
+        if rt.ld64((*wr).cache, i * EW + 2) != ST_EMPTY {
+            let h: usize = rt.ld64((*wr).cache, i * EW + 1) as usize
+            if h != 0 && r as u64 != 0 { mc_raster.backend_mesh_free(r, h) }
+        }
+        i = i + 1
+    }
+    if (*wr).cache != 0 { rt.heap_free((*wr).cache, (*wr).cap * EW * 8) }
+    (*wr).cache = 0
+    (*wr).cap = 0
+    (*wr).n = 0
+}
+
+fn wr_free(wr: *mut WorldRender, r: *mut mc_raster.Raster) {
+    wr_clear(wr, r)
+    mc_mesh.mesher_free(&(*wr).mesher)
+    rt.heap_free((*wr).pad, 5832 * 2)
+    if (*wr).vis != 0 { rt.heap_free((*wr).vis, (*wr).vcap * 16) }
+    (*wr).vis = 0
+}
+
+fn pack_key(cx: i32, sy: i32, cz: i32) -> u64 {
+    return ((cx + 1048576) as u64) | (((cz + 1048576) as u64) << 21 as u64) | ((sy as u64) << 42 as u64)
+}
+
+fn hash_key(k: u64) -> u64 {
+    var h: u64 = k *% 0x9E3779B97F4A7C15 as u64
+    h = h ^ (h >> 29 as u64)
+    return h
+}
+
+// slot of `key`, or the empty slot where it belongs; cap must be > 0
+fn probe(wr: *mut WorldRender, key: u64) -> usize {
+    let mask: usize = (*wr).cap - 1
+    var i: usize = (hash_key(key) as usize) & mask
+    while rt.ld64((*wr).cache, i * EW + 2) != ST_EMPTY && rt.ld64((*wr).cache, i * EW) != key {
+        i = (i + 1) & mask
+    }
+    return i
+}
+
+fn grow(wr: *mut WorldRender) {
+    let ocap: usize = (*wr).cap
+    let oc: u64 = (*wr).cache
+    var ncap: usize = 256
+    if ocap > 0 { ncap = ocap * 2 }
+    let nc: u64 = rt.heap_alloc(ncap * EW * 8)
+    var i: usize = 0
+    while i < ncap * EW {
+        rt.st64(nc, i, 0 as u64)
+        i = i + 1
+    }
+    (*wr).cache = nc
+    (*wr).cap = ncap
+    i = 0
+    while i < ocap {
+        if rt.ld64(oc, i * EW + 2) != ST_EMPTY {
+            let s: usize = probe(wr, rt.ld64(oc, i * EW))
+            var k: usize = 0
+            while k < EW {
+                rt.st64(nc, s * EW + k, rt.ld64(oc, i * EW + k))
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    if oc != 0 { rt.heap_free(oc, ocap * EW * 8) }
+}
+
+// slot of the entry for (cx, sy, cz); creates a DIRTY one when absent
+fn entry_slot(wr: *mut WorldRender, cx: i32, sy: i32, cz: i32) -> usize {
+    if (*wr).cap == 0 || ((*wr).n + 1) * 2 > (*wr).cap { grow(wr) }
+    let key: u64 = pack_key(cx, sy, cz)
+    let s: usize = probe(wr, key)
+    if rt.ld64((*wr).cache, s * EW + 2) == ST_EMPTY {
+        rt.st64((*wr).cache, s * EW, key)
+        rt.st64((*wr).cache, s * EW + 1, 0 as u64)
+        rt.st64((*wr).cache, s * EW + 2, ST_DIRTY)
+        rt.st64((*wr).cache, s * EW + 3, 0 as u64)
+        (*wr).n = (*wr).n + 1
+    }
+    return s
+}
+
+// number of cached sections (for tests / statistics)
+fn wr_cached(wr: *mut WorldRender) -> usize {
+    return (*wr).n
+}
+
+fn mark_section(wr: *mut WorldRender, cx: i32, sy: i32, cz: i32) {
+    if (*wr).cap == 0 { return }
+    let key: u64 = pack_key(cx, sy, cz)
+    let s: usize = probe(wr, key)
+    if rt.ld64((*wr).cache, s * EW + 2) != ST_EMPTY { rt.st64((*wr).cache, s * EW + 2, ST_DIRTY) }
+}
+
+// Block (x, y, z) in world coordinates changed: dirty its section and the neighbours that see it in their shell.
+fn wr_mark_block(wr: *mut WorldRender, x: i32, y: i32, z: i32) {
+    var dz: i32 = 0 - 1
+    while dz <= 1 {
+        var dy: i32 = 0 - 1
+        while dy <= 1 {
+            var dx: i32 = 0 - 1
+            while dx <= 1 {
+                mark_section(wr, mc_world.block_to_chunk(x + dx), mc_world.section_index(y + dy, (*wr).min_y),
+                    mc_world.block_to_chunk(z + dz))
+                dx = dx + 1
+            }
+            dy = dy + 1
+        }
+        dz = dz + 1
+    }
+}
+
+// A chunk column was loaded, replaced or unloaded: dirty the sections of the 3x3 columns around it.
+fn wr_mark_chunk(wr: *mut WorldRender, cx: i32, cz: i32) {
+    var i: usize = 0
+    while i < (*wr).cap {
+        if rt.ld64((*wr).cache, i * EW + 2) != ST_EMPTY {
+            let key: u64 = rt.ld64((*wr).cache, i * EW)
+            let kx: i32 = ((key & 2097151 as u64) as i32) - 1048576
+            let kz: i32 = (((key >> 21 as u64) & 2097151 as u64) as i32) - 1048576
+            if kx >= cx - 1 && kx <= cx + 1 && kz >= cz - 1 && kz <= cz + 1 {
+                rt.st64((*wr).cache, i * EW + 2, ST_DIRTY)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ---- meshing --------------------------------------------------------------------------------
+
+fn is_invisible(wr: *mut WorldRender, id: u16) -> bool {
+    var f: usize = 0
+    while f < 6 {
+        if rt.ld16((*wr).tables.tiles, (id as usize) * 6 + f) != 0 as u16 { return false }
+        f = f + 1
+    }
+    return true
+}
+
+// Builds the padded 18^3 array of the section (cx, sy, cz) from the 27 sections around it.
+// Returns false when the section itself is a single invisible block (air): it has no faces.
+fn gather(wr: *mut WorldRender, w: *mut mc_world.World, cx: i32, sy: i32, cz: i32, sp: u64) -> bool {
+    var dz: i32 = 0 - 1
+    while dz <= 1 {
+        let ch: u64 = mc_world.world_find(w, cx + (0 - 0), cz + dz)
+        var dx: i32 = 0 - 1
+        while dx <= 1 {
+            var c: u64 = ch
+            if dx != 0 { c = mc_world.world_find(w, cx + dx, cz + dz) }
+            var dy: i32 = 0 - 1
+            while dy <= 1 {
+                var p: u64 = 0
+                if c != 0 {
+                    let s: i32 = sy + dy
+                    let cp: *mut mc_chunk.Chunk = c as *mut mc_chunk.Chunk
+                    if s >= 0 && (s as usize) < (*cp).nsec { p = mc_chunk.chunk_section(cp, s as usize) as u64 }
+                }
+                rt.st64(sp, ((dy + 1) * 9 + (dz + 1) * 3 + (dx + 1)) as usize, p)
+                dy = dy + 1
+            }
+            dx = dx + 1
+        }
+        dz = dz + 1
+    }
+    let mid: u64 = rt.ld64(sp, 13)
+    if mid == 0 { return false }
+    let ms: *mut mc_chunk.Section = mid as *mut mc_chunk.Section
+    if mc_chunk.container_bits(&(*ms).blocks) == 0 as u32 && is_invisible(wr, mc_chunk.container_get(&(*ms).blocks, 0)) {
+        return false
+    }
+    var py: i32 = 0
+    while py < 18 {
+        let gy: i32 = py - 1
+        var ddy: i32 = 0
+        if gy < 0 { ddy = 0 - 1 }
+        if gy > 15 { ddy = 1 }
+        let ly: i32 = gy - ddy * 16
+        var pz: i32 = 0
+        while pz < 18 {
+            let gz: i32 = pz - 1
+            var ddz: i32 = 0
+            if gz < 0 { ddz = 0 - 1 }
+            if gz > 15 { ddz = 1 }
+            let lz: i32 = gz - ddz * 16
+            var px: i32 = 0
+            while px < 18 {
+                let gx: i32 = px - 1
+                var ddx: i32 = 0
+                if gx < 0 { ddx = 0 - 1 }
+                if gx > 15 { ddx = 1 }
+                let lx: i32 = gx - ddx * 16
+                let p: u64 = rt.ld64(sp, ((ddy + 1) * 9 + (ddz + 1) * 3 + (ddx + 1)) as usize)
+                var id: u16 = mc_mesh.UNKNOWN_ID
+                if p != 0 {
+                    id = mc_chunk.container_get(&(*(p as *mut mc_chunk.Section)).blocks, ((ly * 16 + lz) * 16 + lx) as usize)
+                }
+                rt.st16((*wr).pad, ((py * 18 + pz) * 18 + px) as usize, id)
+                px = px + 1
+            }
+            pz = pz + 1
+        }
+        py = py + 1
+    }
+    return true
+}
+
+fn mesh_entry(wr: *mut WorldRender, w: *mut mc_world.World, r: *mut mc_raster.Raster, slot: usize,
+    cx: i32, sy: i32, cz: i32) {
+    let old: usize = rt.ld64((*wr).cache, slot * EW + 1) as usize
+    if old != 0 { mc_raster.backend_mesh_free(r, old) }
+    var handle: usize = 0
+    var nq: u64 = 0
+    let sp: u64 = rt.heap_alloc(27 * 8)
+    if gather(wr, w, cx, sy, cz, sp) {
+        mc_mesh.mesh_padded(&(*wr).mesher, (*wr).pad, &(*wr).tables, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+        if (*wr).mesher.nverts > 0 as u32 {
+            handle = mc_raster.backend_mesh_upload(r, rt.ld64((*wr).cache, slot * EW), (*wr).mesher.verts,
+                (*wr).mesher.nverts as usize, (*wr).mesher.idx, (*wr).mesher.nidx as usize)
+            nq = (*wr).mesher.nquads as u64
+        }
+    }
+    rt.heap_free(sp, 27 * 8)
+    rt.st64((*wr).cache, slot * EW + 1, handle as u64)
+    rt.st64((*wr).cache, slot * EW + 2, ST_CLEAN)
+    rt.st64((*wr).cache, slot * EW + 3, nq)
+    (*wr).st.meshed = (*wr).st.meshed + 1 as u32
+}
+
+// ---- frame --------------------------------------------------------------------------------------
+
+fn vis_push(wr: *mut WorldRender, n: usize, slot: usize, d: u64) {
+    if n >= (*wr).vcap {
+        var nc: usize = (*wr).vcap * 2
+        if nc == 0 { nc = 1024 }
+        let nv: u64 = rt.heap_alloc(nc * 16)
+        if (*wr).vis != 0 {
+            rt.mem_copy(nv, (*wr).vis, (*wr).vcap * 16)
+            rt.heap_free((*wr).vis, (*wr).vcap * 16)
+        }
+        (*wr).vis = nv
+        (*wr).vcap = nc
+    }
+    rt.st64((*wr).vis, n * 2, slot as u64)
+    rt.st64((*wr).vis, n * 2 + 1, d)
+}
+
+// shell sort by distance (ascending), ties by slot so the order is deterministic
+fn vis_sort(wr: *mut WorldRender, n: usize) {
+    var gap: usize = n / 2
+    while gap > 0 {
+        var i: usize = gap
+        while i < n {
+            let s: u64 = rt.ld64((*wr).vis, i * 2)
+            let d: u64 = rt.ld64((*wr).vis, i * 2 + 1)
+            var j: usize = i
+            while j >= gap && (rt.ld64((*wr).vis, (j - gap) * 2 + 1) > d
+                || (rt.ld64((*wr).vis, (j - gap) * 2 + 1) == d && rt.ld64((*wr).vis, (j - gap) * 2) > s)) {
+                rt.st64((*wr).vis, j * 2, rt.ld64((*wr).vis, (j - gap) * 2))
+                rt.st64((*wr).vis, j * 2 + 1, rt.ld64((*wr).vis, (j - gap) * 2 + 1))
+                j = j - gap
+            }
+            rt.st64((*wr).vis, j * 2, s)
+            rt.st64((*wr).vis, j * 2 + 1, d)
+            i = i + 1
+        }
+        gap = gap / 2
+    }
+}
+
+// Draws the world into the backend `r` (call mc_raster.backend_begin first: camera + clear). `max_mesh` < 0 = no limit.
+fn wr_render(wr: *mut WorldRender, w: *mut mc_world.World, r: *mut mc_raster.Raster, cam: *mut mc_camera.Camera,
+    max_mesh: i32) {
+    (*wr).st = RenderStats { chunks: 0 as u32, far_chunks: 0 as u32, sections: 0 as u32, culled: 0 as u32,
+        meshed: 0 as u32, deferred: 0 as u32, drawn: 0 as u32, tris: 0 as u64 }
+    let ccx: i32 = mc_world.block_to_chunk(mc_math_floor(cam))
+    let ccz: i32 = mc_world.block_to_chunk(mc_math_floor_z(cam))
+    var nv: usize = 0
+    var i: usize = 0
+    while i < mc_world.world_count(w) {
+        let ch: *mut mc_chunk.Chunk = mc_world.world_chunk_at(w, i)
+        i = i + 1
+        var ax: i32 = (*ch).x - ccx
+        var az: i32 = (*ch).z - ccz
+        if ax < 0 { ax = 0 - ax }
+        if az < 0 { az = 0 - az }
+        if ax > (*wr).dist || az > (*wr).dist {
+            (*wr).st.far_chunks = (*wr).st.far_chunks + 1 as u32
+            continue
+        }
+        (*wr).st.chunks = (*wr).st.chunks + 1 as u32
+        var s: usize = 0
+        while s < (*ch).nsec {
+            (*wr).st.sections = (*wr).st.sections + 1 as u32
+            if mc_camera.camera_section_visible(cam, (*ch).x, s as i32, (*ch).z, (*wr).min_y) == 0 {
+                (*wr).st.culled = (*wr).st.culled + 1 as u32
+                s = s + 1
+                continue
+            }
+            let slot: usize = entry_slot(wr, (*ch).x, s as i32, (*ch).z)
+            let ox: f64 = ((*ch).x * 16 + 8) as f64 - (*cam).x
+            let oy: f64 = ((*wr).min_y + (s as i32) * 16 + 8) as f64 - (*cam).y
+            let oz: f64 = ((*ch).z * 16 + 8) as f64 - (*cam).z
+            vis_push(wr, nv, slot, (ox * ox + oy * oy + oz * oz) as u64)
+            nv = nv + 1
+            s = s + 1
+        }
+    }
+    vis_sort(wr, nv)
+    var k: usize = 0
+    while k < nv {
+        let slot: usize = rt.ld64((*wr).vis, k * 2) as usize
+        k = k + 1
+        if rt.ld64((*wr).cache, slot * EW + 2) == ST_DIRTY {
+            if max_mesh >= 0 && ((*wr).st.meshed as i32) >= max_mesh {
+                (*wr).st.deferred = (*wr).st.deferred + 1 as u32
+                // an old mesh (dirty) is still drawn; a never meshed one (handle 0) shows nothing yet
+            } else {
+                let key: u64 = rt.ld64((*wr).cache, slot * EW)
+                let cx: i32 = ((key & 2097151 as u64) as i32) - 1048576
+                let cz: i32 = (((key >> 21 as u64) & 2097151 as u64) as i32) - 1048576
+                let sy: i32 = ((key >> 42 as u64) & 255 as u64) as i32
+                mesh_entry(wr, w, r, slot, cx, sy, cz)
+            }
+        }
+        let h: usize = rt.ld64((*wr).cache, slot * EW + 1) as usize
+        if h != 0 {
+            let key: u64 = rt.ld64((*wr).cache, slot * EW)
+            let cx: i32 = ((key & 2097151 as u64) as i32) - 1048576
+            let cz: i32 = (((key >> 21 as u64) & 2097151 as u64) as i32) - 1048576
+            let sy: i32 = ((key >> 42 as u64) & 255 as u64) as i32
+            let t0: u64 = (*r).st.tris_in
+            mc_raster.backend_draw(r, h, (cx * 16) as f64, ((*wr).min_y + sy * 16) as f64, (cz * 16) as f64)
+            (*wr).st.tris = (*wr).st.tris + ((*r).st.tris_in - t0)
+            (*wr).st.drawn = (*wr).st.drawn + 1 as u32
+        }
+    }
+}
+
+fn mc_math_floor(cam: *mut mc_camera.Camera) -> i32 {
+    var x: i32 = (*cam).x as i32
+    if ((x as f64) > (*cam).x) { x = x - 1 }
+    return x
+}
+
+fn mc_math_floor_z(cam: *mut mc_camera.Camera) -> i32 {
+    var z: i32 = (*cam).z as i32
+    if ((z as f64) > (*cam).z) { z = z - 1 }
+    return z
+}
+
+// ---- test support -----------------------------------------------------------------------------------
+
+// A chunk column from `nsec` * 4096 plain ids (u16, index per section (y*16+z)*16+x, sections bottom to top).
+// Returns the address of the heap allocated Chunk (give it to mc_world.world_put), 0 on failure.
+fn wr_make_chunk(cx: i32, cz: i32, nsec: usize, ids: u64) -> u64 {
+    let p: u64 = mc_chunk.chunk_alloc()
+    if p == 0 { return 0 }
+    let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+    (*c).x = cx
+    (*c).z = cz
+    (*c).secs = rt.heap_alloc(nsec * mc_chunk.section_size())
+    if (*c).secs == 0 { return 0 }
+    (*c).nsec = nsec
+    var i: usize = 0
+    while i < nsec {
+        if !mc_mesh.section_pack(ids + (i * 8192) as u64, mc_chunk.chunk_section(c, i)) { return 0 }
+        i = i + 1
+    }
+    return p
+}
