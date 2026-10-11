@@ -1,0 +1,168 @@
+// expect_exit: 0
+// tests/2670_mc_crypto_cfb8.fi -- Cfb8Stream of lib/mc/mc_crypto.fi.
+//
+//  A  known answer: 100 octets under key = IV = 00..0f, ciphertext produced by
+//     python `cryptography` (CFB8) -- checked on the default path AND the scalar path
+//  B  chunking never matters: one call, 1 octet at a time, 3, 16, 17 octets per
+//     call give the same ciphertext; decrypting in other chunk sizes restores it
+//  C  the AES-NI decrypt path (segments of 4096, 8 octets in parallel) equals the
+//     scalar path for every length 0..40 and around the segment edges
+//  D  5000 octets crossing a segment edge: sha256 of the ciphertext equals python's
+//  E  the stream is stateful: two directions use two independent streams
+import std.rt
+import std.str
+import std.crypto.sha256
+import mc.mc_crypto
+
+fn hexval(c: u8) -> u8 {
+    if c >= 97 as u8 {
+        return c - 87 as u8
+    }
+    return c - 48 as u8
+}
+
+fn unhex(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i + 1 < s.length() {
+        rt.buf_push(out, (hexval(s.chars(i)) << 4 as u8) | hexval(s.chars(i + 1)))
+        i = i + 2
+    }
+}
+
+
+fn pat(n: usize, mul: usize, add: usize, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(out, ((i * mul + add) % 251) as u8)
+        i = i + 1
+    }
+}
+
+fn make(secret: u64, soft: bool) -> mc_crypto.Cfb8Stream {
+    if soft {
+        return mc_crypto.cfb8_new_soft(secret)
+    }
+    return mc_crypto.cfb8_new(secret)
+}
+
+// run `n` octets through the stream, `chunk` octets per call (decrypt or encrypt)
+fn run_chunks(s: *mut mc_crypto.Cfb8Stream, p: u64, n: usize, chunk: usize, dec: bool) {
+    var at: usize = 0
+    while at < n {
+        var step: usize = chunk
+        if at + step > n {
+            step = n - at
+        }
+        if dec {
+            mc_crypto.cfb8_decrypt(s, p + at as u64, step)
+        } else {
+            mc_crypto.cfb8_encrypt(s, p + at as u64, step)
+        }
+        at = at + step
+    }
+}
+
+fn main() -> i32 {
+    var key: rt.Buf = rt.buf_new()
+    var want: rt.Buf = rt.buf_new()
+    var pt: rt.Buf = rt.buf_new()
+    unhex("000102030405060708090a0b0c0d0e0f", &key)
+    unhex("096b06fb59870ac3ca977fa00231e3423699d97baa2a1167471432d3883f2acecaaf67e925664f96aa99090607f28ca057482d59c0b9482751d413995f29cbfc41c8d8511c3f7f6c2d8f6d0c05f77467d4cdfadcc627b49902839d1cd8c5a01559857b08", &want)
+    pat(100, 7, 3, &pt)
+
+    // ---- A. known answer, both paths, both directions
+    var mode: usize = 0
+    while mode < 2 {
+        let soft: bool = mode == 1
+        var buf: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&buf, rt.buf_ptr(&pt), 100)
+        var se: mc_crypto.Cfb8Stream = make(rt.buf_ptr(&key), soft)
+        mc_crypto.cfb8_encrypt(&se, rt.buf_ptr(&buf), 100)
+        if !rt.mem_eq(rt.buf_ptr(&buf), rt.buf_ptr(&want), 100) { return 1 as i32 }
+        var sd: mc_crypto.Cfb8Stream = make(rt.buf_ptr(&key), soft)
+        mc_crypto.cfb8_decrypt(&sd, rt.buf_ptr(&buf), 100)
+        if !rt.mem_eq(rt.buf_ptr(&buf), rt.buf_ptr(&pt), 100) { return 2 as i32 }
+        mode = mode + 1
+    }
+
+    // ---- B. chunking never matters
+    var chunks: [usize; 6] = [1, 3, 16, 17, 99, 100]
+    var ci: usize = 0
+    while ci < 6 {
+        var buf: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&buf, rt.buf_ptr(&pt), 100)
+        var se: mc_crypto.Cfb8Stream = make(rt.buf_ptr(&key), false)
+        run_chunks(&se, rt.buf_ptr(&buf), 100, chunks[ci], false)
+        if !rt.mem_eq(rt.buf_ptr(&buf), rt.buf_ptr(&want), 100) { return 10 as i32 }
+        var sd: mc_crypto.Cfb8Stream = make(rt.buf_ptr(&key), false)
+        run_chunks(&sd, rt.buf_ptr(&buf), 100, chunks[5 - ci], true)
+        if !rt.mem_eq(rt.buf_ptr(&buf), rt.buf_ptr(&pt), 100) { return 11 as i32 }
+        ci = ci + 1
+    }
+
+    // ---- C. default path == scalar path for many lengths (segment edges: 4096)
+    var lens: [usize; 14] = [4095, 4096, 4097, 4111, 4112, 4113, 8191, 8192, 8193, 8208, 10000, 12288, 12289, 20000]
+    var li: usize = 0
+    while li < 54 {
+        var n: usize = li
+        if li >= 40 {
+            n = lens[li - 40]
+        }
+        var plain: rt.Buf = rt.buf_new()
+        pat(n, 11, 5, &plain)
+        var a: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&a, rt.buf_ptr(&plain), n)
+        var b: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&b, rt.buf_ptr(&plain), n)
+        var sa: mc_crypto.Cfb8Stream = make(rt.buf_ptr(&key), false)
+        var sb: mc_crypto.Cfb8Stream = make(rt.buf_ptr(&key), true)
+        mc_crypto.cfb8_encrypt(&sa, rt.buf_ptr(&a), n)
+        mc_crypto.cfb8_encrypt(&sb, rt.buf_ptr(&b), n)
+        if !rt.mem_eq(rt.buf_ptr(&a), rt.buf_ptr(&b), n) { return 20 as i32 }
+        // decrypt the same ciphertext with the default path in odd chunks and with the scalar path
+        var da: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&da, rt.buf_ptr(&a), n)
+        var db: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&db, rt.buf_ptr(&a), n)
+        var dsa: mc_crypto.Cfb8Stream = make(rt.buf_ptr(&key), false)
+        var dsb: mc_crypto.Cfb8Stream = make(rt.buf_ptr(&key), true)
+        run_chunks(&dsa, rt.buf_ptr(&da), n, 4093, true)
+        mc_crypto.cfb8_decrypt(&dsb, rt.buf_ptr(&db), n)
+        if !rt.mem_eq(rt.buf_ptr(&da), rt.buf_ptr(&plain), n) { return 21 as i32 }
+        if !rt.mem_eq(rt.buf_ptr(&db), rt.buf_ptr(&plain), n) { return 22 as i32 }
+        // both streams must also END in the same state: encrypt 5 more octets
+        var x: [u8; 5] = [1, 2, 3, 4, 5]
+        var y: [u8; 5] = [1, 2, 3, 4, 5]
+        mc_crypto.cfb8_encrypt(&dsa, (&x[0]) as u64, 5)
+        mc_crypto.cfb8_encrypt(&dsb, (&y[0]) as u64, 5)
+        if !rt.mem_eq((&x[0]) as u64, (&y[0]) as u64, 5) { return 23 as i32 }
+        li = li + 1
+    }
+
+    // ---- D. 5000 octets (crosses the 4096 segment edge) against python's sha256
+    var key5: rt.Buf = rt.buf_new()
+    unhex("01060b10151a1f24292e33383d42474c", &key5)
+    var p5: rt.Buf = rt.buf_new()
+    pat(5000, 13, 5, &p5)
+    var c5: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&c5, rt.buf_ptr(&p5), 5000)
+    var s5: mc_crypto.Cfb8Stream = make(rt.buf_ptr(&key5), false)
+    mc_crypto.cfb8_encrypt(&s5, rt.buf_ptr(&c5), 5000)
+    var dig: [u8; 32] = [0; 32]
+    sha256.sha256(rt.buf_ptr(&c5), 5000, (&dig[0]) as u64)
+    var wd: rt.Buf = rt.buf_new()
+    unhex("8f432c19405e0c97d73513f30fdc4b31e3c6e95162ec1809f0e88bb81bb97611", &wd)
+    if !rt.mem_eq((&dig[0]) as u64, rt.buf_ptr(&wd), 32) { return 30 as i32 }
+    var s5d: mc_crypto.Cfb8Stream = make(rt.buf_ptr(&key5), false)
+    mc_crypto.cfb8_decrypt(&s5d, rt.buf_ptr(&c5), 5000)
+    if !rt.mem_eq(rt.buf_ptr(&c5), rt.buf_ptr(&p5), 5000) { return 31 as i32 }
+
+    // ---- E. wipe clears key schedule and register
+    mc_crypto.cfb8_wipe(&s5d)
+    var i: usize = 0
+    while i < 16 {
+        if s5d.iv[i] != 0 as u8 { return 40 as i32 }
+        i = i + 1
+    }
+    return 0
+}

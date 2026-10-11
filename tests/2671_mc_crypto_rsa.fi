@@ -1,0 +1,182 @@
+// expect_exit: 0
+// tests/2671_mc_crypto_rsa.fi -- SPKI parsing + PKCS#1 v1.5 encryption of lib/mc/mc_crypto.fi.
+//
+//  A  a real 1024 bit SPKI (made by OpenSSL via python `cryptography`): n, e, bit length
+//  B  encrypt 6 message sizes (0 .. 117 = maximum) 20 times each; the private exponent d
+//     (test only: plain modular exponentiation with std.crypto.rsa.rsa_public_op) opens
+//     it again and the block must be 00 02 PS(>= 8, no zero octet) 00 M
+//  C  limits: 118 octets too long, output too small, empty key; same message twice differs
+//  D  twenty hand made SPKI variants (e = 0/1/2/even/9 octets, even or tiny or oversized
+//     modulus, negative modulus, bad parameters, unused bits, trailing octets, EC key, other
+//     OID, absent NULL, leading zeros) with their exact expected result code
+//  The same keys are also decrypted by node and python in tools/mc/crypto/run.sh.
+import std.rt
+import std.str
+import std.crypto.rsa
+import mc.mc_crypto
+
+fn hexval(c: u8) -> u8 {
+    if c >= 97 as u8 {
+        return c - 87 as u8
+    }
+    return c - 48 as u8
+}
+
+fn unhex(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i + 1 < s.length() {
+        rt.buf_push(out, (hexval(s.chars(i)) << 4 as u8) | hexval(s.chars(i + 1)))
+        i = i + 2
+    }
+}
+
+fn new_key() -> mc_crypto.RsaKey {
+    return mc_crypto.RsaKey { n: [0; 512], nlen: 0, e: [0; 8], elen: 0 }
+}
+
+fn expect(hex: str, code: i32, id: i32) -> bool {
+    var der: rt.Buf = rt.buf_new()
+    unhex(hex, &der)
+    var key: mc_crypto.RsaKey = new_key()
+    let rc: i32 = mc_crypto.rsa_key_from_spki(rt.buf_ptr(&der), rt.buf_len(&der), &key)
+    if rc != code {
+        return false
+    }
+    if rc != mc_crypto.CR_OK {
+        // a refused key leaves an EMPTY key behind
+        return mc_crypto.rsa_key_bytes(&key) == 0
+    }
+    // an accepted key must be usable
+    var msg: [u8; 16] = [9; 16]
+    var out: [u8; 512] = [0; 512]
+    var olen: usize = 0
+    var mlen: usize = 16
+    if key.nlen < 27 + 16 {
+        mlen = 4
+    }
+    if mc_crypto.rsa_encrypt_pkcs1(&key, (&msg[0]) as u64, mlen, (&out[0]) as u64, 512, &olen) != mc_crypto.CR_OK {
+        return false
+    }
+    return olen == key.nlen
+}
+
+// d-side check of one ciphertext: returns the message length found, or 1000 on a malformed block
+fn open_block(nb: u64, nlen: usize, d: u64, dlen: usize, ct: u64, mlen: usize, msg: u64) -> bool {
+    var em: [u8; 128] = [0; 128]
+    if !rsa.rsa_public_op(nb, nlen, d, dlen, ct, nlen, (&em[0]) as u64) {
+        return false
+    }
+    if em[0] != 0 as u8 || em[1] != 2 as u8 {
+        return false
+    }
+    let z: usize = nlen - mlen - 1
+    if z < 10 {
+        return false
+    }
+    var i: usize = 2
+    while i < z {
+        if em[i] == 0 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    if em[z] != 0 as u8 {
+        return false
+    }
+    return rt.mem_eq((&em[0]) as u64 + (z + 1) as u64, msg, mlen)
+}
+
+fn main() -> i32 {
+    var der: rt.Buf = rt.buf_new()
+    var n: rt.Buf = rt.buf_new()
+    var e: rt.Buf = rt.buf_new()
+    var d: rt.Buf = rt.buf_new()
+    unhex("30819f300d06092a864886f70d010101050003818d0030818902818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa30203010001", &der)
+    unhex("a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa3", &n)
+    unhex("010001", &e)
+    unhex("6738e1a01de40770897defae0d57a91d2ac0269309614a7ba7dc682981d1325ac078bdb480e2c2c6bea31ba359e51f7b138bc08332938575e882a5bc21e318d2824872b15e98b708ba638251f51603701daf6622ddbfd5729b631d3e2030a2e9172b5e7065b280c66d7d89a20644cac4d0d76d0fc0bbedfacf4718c08ad6b241", &d)
+
+    // ---- A
+    var key: mc_crypto.RsaKey = new_key()
+    if mc_crypto.rsa_key_from_spki(rt.buf_ptr(&der), rt.buf_len(&der), &key) != mc_crypto.CR_OK { return 1 as i32 }
+    if key.nlen != 128 || key.elen != 3 { return 2 as i32 }
+    if !rt.mem_eq((&key.n[0]) as u64, rt.buf_ptr(&n), 128) { return 3 as i32 }
+    if !rt.mem_eq((&key.e[0]) as u64, rt.buf_ptr(&e), 3) { return 4 as i32 }
+    if mc_crypto.rsa_key_bits(&key) != 1024 || mc_crypto.rsa_key_bytes(&key) != 128 { return 5 as i32 }
+
+    // ---- B
+    var sizes: [usize; 6] = [0, 1, 16, 32, 100, 117]
+    var si: usize = 0
+    while si < 6 {
+        let mlen: usize = sizes[si]
+        var msg: rt.Buf = rt.buf_new()
+        var i: usize = 0
+        while i < mlen {
+            rt.buf_push(&msg, ((i * 29 + 7) % 251) as u8)
+            i = i + 1
+        }
+        var rep: usize = 0
+        while rep < 20 {
+            var ct: [u8; 128] = [0; 128]
+            var olen: usize = 0
+            if mc_crypto.rsa_encrypt_pkcs1(&key, rt.buf_ptr(&msg), mlen, (&ct[0]) as u64, 128, &olen) != mc_crypto.CR_OK { return 10 as i32 }
+            if olen != 128 { return 11 as i32 }
+            if !open_block(rt.buf_ptr(&n), 128, rt.buf_ptr(&d), 128, (&ct[0]) as u64, mlen, rt.buf_ptr(&msg)) { return 12 as i32 }
+            rep = rep + 1
+        }
+        si = si + 1
+    }
+
+    // ---- C
+    var m16: [u8; 16] = [5; 16]
+    var c1: [u8; 128] = [0; 128]
+    var c2: [u8; 128] = [0; 128]
+    var olen2: usize = 7
+    mc_crypto.rsa_encrypt_pkcs1(&key, (&m16[0]) as u64, 16, (&c1[0]) as u64, 128, &olen2)
+    mc_crypto.rsa_encrypt_pkcs1(&key, (&m16[0]) as u64, 16, (&c2[0]) as u64, 128, &olen2)
+    if rt.mem_eq((&c1[0]) as u64, (&c2[0]) as u64, 128) { return 20 as i32 }
+    var big: [u8; 130] = [1; 130]
+    if mc_crypto.rsa_encrypt_pkcs1(&key, (&big[0]) as u64, 118, (&c1[0]) as u64, 128, &olen2) != mc_crypto.CR_MSG_TOO_LONG { return 21 as i32 }
+    if olen2 != 0 { return 22 as i32 }
+    if mc_crypto.rsa_encrypt_pkcs1(&key, (&big[0]) as u64, 117, (&c1[0]) as u64, 127, &olen2) != mc_crypto.CR_OUT_SMALL { return 23 as i32 }
+    var empty: mc_crypto.RsaKey = new_key()
+    if mc_crypto.rsa_encrypt_pkcs1(&empty, (&big[0]) as u64, 1, (&c1[0]) as u64, 128, &olen2) != mc_crypto.CR_ARG { return 24 as i32 }
+    if mc_crypto.rsa_key_bits(&empty) != 0 { return 25 as i32 }
+    if mc_crypto.rsa_key_from_spki(0, 0, &empty) != mc_crypto.CR_ARG { return 26 as i32 }
+    var sec: [u8; 16] = [0; 16]
+    var sec2: [u8; 16] = [0; 16]
+    if !mc_crypto.shared_secret_new((&sec[0]) as u64) || !mc_crypto.shared_secret_new((&sec2[0]) as u64) { return 27 as i32 }
+    if rt.mem_eq((&sec[0]) as u64, (&sec2[0]) as u64, 16) { return 28 as i32 }
+    var nz: usize = 0
+    var q: usize = 0
+    while q < 16 {
+        if sec[q] != 0 as u8 {
+            nz = nz + 1
+        }
+        q = q + 1
+    }
+    if nz == 0 { return 29 as i32 }
+
+    // ---- D
+    if !expect("30819d300d06092a864886f70d010101050003818b0030818702818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa3020101", mc_crypto.CR_BAD_KEY, 1) { return 100 as i32 }
+    if !expect("30819d300d06092a864886f70d010101050003818b0030818702818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa3020102", mc_crypto.CR_BAD_KEY, 2) { return 101 as i32 }
+    if !expect("30819d300d06092a864886f70d010101050003818b0030818702818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa3020100", mc_crypto.CR_BAD_KEY, 3) { return 102 as i32 }
+    if !expect("3081a5300d06092a864886f70d01010105000381930030818f02818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa30209010000000000000000", mc_crypto.CR_BAD_KEY, 4) { return 103 as i32 }
+    if !expect("30819f300d06092a864886f70d010101050003818d0030818902818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa30203010000", mc_crypto.CR_BAD_KEY, 5) { return 104 as i32 }
+    if !expect("30819f300d06092a864886f70d010101050003818d0030818902818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa20203010001", mc_crypto.CR_BAD_KEY, 6) { return 105 as i32 }
+    if !expect("303c300d06092a864886f70d0101010500032b003028022100b324feeecd2a6304560ed209db89eb5ee992899748eddba2f5be4fea36692be50203010001", mc_crypto.CR_BAD_KEY, 7) { return 106 as i32 }
+    if !expect("305b300d06092a864886f70d0101010500034a003047024000b8791aa279ddafce5d366fe49d4b2d4351a5ac3be49db6d6e8eb2771fa0334c95c955b23590c418943b0a98180e6c2182abed91b5ffc7fbe84516898c545e70203010001", mc_crypto.CR_BAD_KEY, 8) { return 107 as i32 }
+    if !expect("305c300d06092a864886f70d0101010500034b003048024100c1bc198a24dfc2c6cbc1b309fe2bd21c95f0e18a68e1c0e36ca6c42b4dc4dbd9346f0be767bec8079a96d85594c116217cfdda30487a6aa004a197dc0ff0c5210203010001", mc_crypto.CR_OK, 9) { return 108 as i32 }
+    if !expect("30820222300d06092a864886f70d01010105000382020f003082020a0282020100f12afd3d0ead7cbaab64b715e26d45070e96bb7635ee298027e452664f63efd0b743e367d60125499dcd4c51ec44ab3e706eeb1a0a47ba47184a6a166b6e380fda24217731bbb23e4f7c176b7d92a05b0c20ba09c891701f85d88bd31ee06f8801417e78dbbbf3bc025bff3eaddd6bdfde66c60ee28e8b598703b33cea9857d9ffc27301475268a8e28d985d2547584d8a4fec4d62685d685eca830dc7d669a2042650ae857564c979a827b04ea2961fa5eb63d732621e91dacb88a5c123eede667d3e46d40966b784c0453d42970cfe17f676954d3b02e3672eac40e5603239803bb26476e9c1fef91717a5accd43e46a5dec27b9e35e854f599910c20d3a785d785864a6e50252cc18c813d9445a0db14833737604fbf70e0c8618269093970e490a6c2bb0832e7aed31d69db1ee25dd49910b0e61159668792ec6f607559a1dd1ece9e86b768f88fec4ed1e6d930cbc497e4af1d87d5891643fe1e069e7b54151c0d577c0270fe745e79d27b4bbce152258e15e4b3c337aa2c760c5ed8beae8f2f151f5f4d952f47613fea05c278cdccb2e5ba628cac6324abd18ebb32c412b42405a84d9375212410cb23d211cb278cd70a5d4cfe65ae23f77df83a84cccb96eeeee67413e56ef958b76d8803a1156137e5098b94922aca711c2c10207d28fffb53865637cabdc89ed8a70fd97a38be7c81119b834b51e0fd110681b90130203010001", mc_crypto.CR_OK, 10) { return 109 as i32 }
+    if !expect("30820223300d06092a864886f70d010101050003820210003082020b0282020200b813040d39a831da28ab97edb69a8557ff63ecbcb89bfde537108743d39624d97a465ee113f5640175260351ed21d2e2fd39212590d99b49b47e530a6dad2e3d57ae6e2406f5b4689eb6c03a12426dc9bb808b94305fd079b4e6372daba59c48a83db2f27b07eff9e4042aa25d17ca1e42524ff7bc84303d3b941a4f11cba86143cf0a52d3c003d82b11eef7806ea833cb1a6acf296d387345cd46564a04c9fd4480a23a2ac1cf0141f0d3cf258638b21b9bbc6df5429ebea32bbf17a1432b642d2542cc0650650ad573d6317a4591d56465f41521a3cdca94fe77be972abd884253286684ee51c06a74547e854e5827c450368de5ac1230761151d2db40817157611d1ea48c0f3192587fc1b21c524b1df6a3b1fbad98e5639a0e3bc778252472b1856c0f2dca743b0ec54e89b3a3e6ea58fc84aa40955caa1d36121383ffa4cef4b248cc00bc0531dfe2c4ce096b6504aa6c6aa21e23d3fc97060d3c27fb7ec6cb67437fc4c2e299d80e546fd03a2d61ade6948d8306cb4400d2e67755182f36c2f6783bdc1df79c19d15d596a03136fa6a78b24e9b8226e001e7b14871d94c5c092b9e872319fcc88c86a5b9786f5185c250cb6f8471632e5f5413d41ab3f4ab946a41888d1bd3529d1b2cde2a2060066e58692099c9f9beba37fe1b0b7f1e411c890c8d74bbaf0400bb0cca64b2c5caf5fdf2a21ef03f205d0fb7b9a898dd50203010001", mc_crypto.CR_BAD_KEY, 11) { return 110 as i32 }
+    if !expect("30819e300d06092a864886f70d010101050003818c00308188028180a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa30203010001", mc_crypto.CR_BAD_DER, 12) { return 111 as i32 }
+    if !expect("30819d300b06092a864886f70d01010103818d0030818902818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa30203010001", mc_crypto.CR_OK, 13) { return 112 as i32 }
+    if !expect("3081a0300e06092a864886f70d01010102010003818d0030818902818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa30203010001", mc_crypto.CR_BAD_DER, 14) { return 113 as i32 }
+    if !expect("3081a0300e06092a864886f70d01010105010003818d0030818902818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa30203010001", mc_crypto.CR_BAD_DER, 15) { return 114 as i32 }
+    if !expect("30819f300d06092a864886f70d010101050003818d0130818902818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa30203010001", mc_crypto.CR_BAD_DER, 16) { return 115 as i32 }
+    if !expect("3081a2300d06092a864886f70d01010105000381900030818c02818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa30203010001020101", mc_crypto.CR_BAD_DER, 17) { return 116 as i32 }
+    if !expect("3081a0300d06092a864886f70d010101050003818e0030818a0281820000a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa30203010001", mc_crypto.CR_OK, 18) { return 117 as i32 }
+    if !expect("3059301306072a8648ce3d020106082a8648ce3d03010703420004c9b219561c212e4455acdcbd50c17810a1f31eaf372b858d8f7526177f0cf8ef66e3ae9d2ed523d372d62fb3a05816aec5c6cdbc375857260db55ce1827c405b", mc_crypto.CR_NOT_RSA, 19) { return 118 as i32 }
+    if !expect("30819f300d06092a864886f70d01010a050003818d0030818902818100a4bd5fdce2d994b3733f723c20f3b8b60fd7cf71762d4f2147b7e21ce396cb0f21167b4510da44c8e613d05c7fed9af53243da63910615b42e095d8144f8561f665c2a3b11e4252086ca1d58128b18658f9c0119c758415cf06b4bb4f15c61db0c1deb17f64db47055b87441c4e95dbdbb2cc0c4071f0b233580f7daf715caa30203010001", mc_crypto.CR_NOT_RSA, 20) { return 119 as i32 }
+    return 0
+}
