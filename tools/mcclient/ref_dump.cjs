@@ -353,6 +353,33 @@ function main () {
   const viewDistance = parseInt(vdS || '4', 10)
   const idleMs = parseInt(idleS || '2500', 10)
   const mc = require('minecraft-protocol')
+  // lpVec3 (1.21.9+ low precision vector) is unknown to node-minecraft-protocol 1.54: a reader written from the
+  // public format description (u8 a; a == 0 -> zero vector; else u8 + u32 + varint when bit 2 of a is set)
+  // is registered in its protodef compiler. Same type as tools/mcgen/gen_fixtures.cjs; the value is not used.
+  {
+    const cm = require('minecraft-protocol/src/datatypes/compiler-minecraft')
+    const varintSize = (v) => { v >>>= 0; let n = 1; while (v >= 0x80) { n++; v >>>= 7 } return n }
+    cm.Read.lpVec3 = ['native', (buffer, offset) => {
+      const lowest = buffer.readUInt8(offset)
+      if (lowest === 0) return { value: { lowest, middle: 0, highest: 0, ext: 0 }, size: 1 }
+      const middle = buffer.readUInt8(offset + 1)
+      const highest = buffer.readUInt32BE(offset + 2)
+      let size = 6
+      let ext = 0
+      if ((lowest & 4) !== 0) {
+        let shift = 0
+        let b
+        do { b = buffer.readUInt8(offset + size); size++; ext |= (b & 0x7f) << shift; shift += 7 } while (b & 0x80)
+        ext >>>= 0
+      }
+      return { value: { lowest, middle, highest, ext }, size }
+    }]
+    cm.Write.lpVec3 = ['native', (value, buffer, offset) => {
+      buffer.writeUInt8(value.lowest, offset++)
+      return offset
+    }]
+    cm.SizeOf.lpVec3 = ['native', (value) => (value.lowest === 0 ? 1 : 6 + ((value.lowest & 4) !== 0 ? varintSize(value.ext) : 0))]
+  }
 
   const t0 = Date.now()
   const m = { connect_ms: -1, join_ms: -1, first_chunk_ms: -1 }

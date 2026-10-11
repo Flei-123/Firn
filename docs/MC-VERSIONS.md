@@ -93,9 +93,9 @@ The client picks the version from the protocol number in the server-list ping.
 | 1.16.5 | 754 | yes | yes (616) | `CF_SECTIONS_114` not implemented | no |
 | **1.20.1** | **763** | yes | yes (704) | `CF_CONTAINERS_118` **implemented** | in progress (M0) |
 | **1.20.2** | **764** | yes (has the Configuration state) | yes (788) | `CF_CONTAINERS_118` (same, nameless NBT roots) | **yes** (11.10.2026: real 1.20.2 server incl. configuration phase, dump byte-identical, 109 chunks) |
-| 1.21.1 | 767 | yes | yes (904) | `CF_CONTAINERS_118` (assumed, unverified) | no |
-| 1.21.4 | 769 | yes | yes (948) | same | no |
-| 1.21.8 | 772 | yes | yes (980) | same | no |
+| **1.21.1** | **767** | yes | yes (904) | `CF_CONTAINERS_118` **verified** | **yes** (11.10.2026: real 1.21.1 server, Known Packs answered, dump byte-identical to the reference, 109 chunks) |
+| **1.21.4** | **769** | yes | yes (948) | `CF_CONTAINERS_118` **verified** | **yes** (11.10.2026: real 1.21.4 server, client information with particle status, dump byte-identical, 117 chunks) |
+| **1.21.8** | **772** | yes | yes (980) | `CF_CONTAINERS_118` + 1.21.5 shape (`FLAG_HM_MAP`) **verified** | **yes** (11.10.2026: real 1.21.8 server, heightmap map + containers without length, dump byte-identical, 117 chunks) |
 | 1.21.11 | 774 | yes | yes (1008) | same | no |
 | 26.1 | 775 (in minecraft-data) | yes | yes (1028) | same | no |
 
