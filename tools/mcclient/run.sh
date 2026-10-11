@@ -109,6 +109,8 @@ player-idle-timeout=0
 motd=mcclient test server
 EOF
   
+  # 1.8.x: the Netty epoll transport of the old server fails on Java 9+ ("Unable to access address of buffer"); use NIO
+  case "$MCV" in 1.8*) echo "use-native-transport=false" >> "$W/srv/server.properties" ;; esac
   mkfifo "$W/in"
   exec 3<>"$W/in"
   ( cd "$W/srv" && exec "$JAVA" -Xmx1G -Xms256M -jar server.jar nogui < "$W/in" > "$W/server.log" 2>&1 ) &
