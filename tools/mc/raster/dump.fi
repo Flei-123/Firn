@@ -1,0 +1,460 @@
+// tools/mc/raster/dump.fi -- renders the mc_raster test scenes and writes everything the independent
+// python reference (ref.py) needs: scenes.txt (cameras as f64 bit patterns, mesh words, indices, the
+// Firn image hash) and <scene>.rgba (the Firn framebuffer). The python side renders the same scenes
+// from scenes.txt + atlas.bin and compares byte for byte.
+//   usage: dump <outdir>      (the directory exists)
+import std.rt
+import std.io
+import std.core
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+
+struct Ctx {
+    out: rt.Buf,
+    dir: u64, // address of the directory path (NUL terminated)
+    dirn: usize,
+    r: mc_raster.Raster,
+    atlas: mc_texture.Atlas,
+    cam: mc_camera.Camera,
+    name: [u8; 32],
+    namen: usize,
+}
+
+fn push_str(b: *mut rt.Buf, s: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(b, rt.ld8(s, i))
+        i = i + 1
+    }
+}
+
+fn push_lit(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn push_hex(b: *mut rt.Buf, v: u64) {
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_hex_u64(b, v, 1)
+}
+
+fn push_dec(b: *mut rt.Buf, v: u64) {
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_dec_u64(b, v)
+}
+
+fn push_f(b: *mut rt.Buf, x: f64) {
+    push_hex(b, core.f64_bits(x))
+}
+
+fn now_ns() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000000000 as u64 + (ts[1] as u64)
+}
+
+// ---- tables and padded sections ----------------------------------------------------------
+fn tables(t: *mut mc_mesh.MeshTables) {
+    let opaque: u64 = rt.heap_alloc(32768)
+    let tiles: u64 = rt.heap_alloc(32768 * 6 * 2)
+    var i: usize = 0
+    while i < 32768 {
+        rt.st8(opaque, i, 0 as u8)
+        i = i + 1
+    }
+    i = 0
+    while i < 32768 * 6 {
+        rt.st16(tiles, i, 0 as u16)
+        i = i + 1
+    }
+    // 1 grass block (side 4, bottom 2, top 3), 2 test tile, 3 leaves (cutout, not opaque), 4 stone, 5 bricks
+    let g: [u16; 6] = [4 as u16, 4 as u16, 2 as u16, 3 as u16, 4 as u16, 4 as u16]
+    var f: usize = 0
+    while f < 6 {
+        rt.st16(tiles, 1 * 6 + f, g[f])
+        rt.st16(tiles, 2 * 6 + f, 58 as u16)
+        rt.st16(tiles, 3 * 6 + f, 10 as u16)
+        rt.st16(tiles, 4 * 6 + f, 1 as u16)
+        rt.st16(tiles, 5 * 6 + f, 20 as u16)
+        f = f + 1
+    }
+    rt.st8(opaque, 1, 1 as u8)
+    rt.st8(opaque, 2, 1 as u8)
+    rt.st8(opaque, 4, 1 as u8)
+    rt.st8(opaque, 5, 1 as u8)
+    (*t).opaque = opaque
+    (*t).tiles = tiles
+}
+
+fn pad_clear(pad: u64) {
+    var i: usize = 0
+    while i < 5832 {
+        rt.st16(pad, i, 0 as u16)
+        i = i + 1
+    }
+}
+
+// block (x, y, z) of the section (0..15) = padded cell (x+1, y+1, z+1)
+fn pad_set(pad: u64, x: i32, y: i32, z: i32, id: u16) {
+    rt.st16(pad, (((y + 1) * 18 + (z + 1)) * 18 + (x + 1)) as usize, id)
+}
+
+// ---- scene output -----------------------------------------------------------------------------
+fn scene_begin(c: *mut Ctx, name: str, w: i32, h: i32, cull: bool, fog: bool, fs: f64, fe: f64, clear: u32) {
+    mc_raster.raster_free(&(*c).r)
+    (*c).r = mc_raster.raster_new(w, h)
+    mc_camera.camera_resize(&(*c).cam, w, h)
+    mc_camera.camera_update(&(*c).cam)
+    mc_raster.raster_set_camera(&(*c).r, &(*c).cam)
+    mc_raster.raster_set_atlas(&(*c).r, &(*c).atlas)
+    mc_raster.raster_set_cull(&(*c).r, cull)
+    mc_raster.raster_set_fog(&(*c).r, fog, fs, fe, 150 as u32, 190 as u32, 230 as u32)
+    mc_raster.raster_clear(&(*c).r, clear)
+    var i: usize = 0
+    while i < name.n && i < 32 {
+        (*c).name[i] = *(name.p + i)
+        i = i + 1
+    }
+    (*c).namen = i
+    let b: *mut rt.Buf = &(*c).out
+    push_lit(b, "scene ")
+    var k: usize = 0
+    while k < (*c).namen {
+        rt.buf_push(b, (*c).name[k])
+        k = k + 1
+    }
+    push_dec(b, w as u64)
+    push_dec(b, h as u64)
+    var cu: u64 = 0
+    if cull { cu = 1 }
+    push_dec(b, cu)
+    var fo: u64 = 0
+    if fog { fo = 1 }
+    push_dec(b, fo)
+    push_f(b, fs)
+    push_f(b, fe)
+    push_hex(b, clear as u64)
+    rt.buf_push(b, 10 as u8)
+    push_lit(b, "cam")
+    push_f(b, (*c).cam.x)
+    push_f(b, (*c).cam.y)
+    push_f(b, (*c).cam.z)
+    push_f(b, (*c).cam.rx)
+    push_f(b, (*c).cam.ry)
+    push_f(b, (*c).cam.rz)
+    push_f(b, (*c).cam.ux)
+    push_f(b, (*c).cam.uy)
+    push_f(b, (*c).cam.uz)
+    push_f(b, (*c).cam.fx)
+    push_f(b, (*c).cam.fy)
+    push_f(b, (*c).cam.fz)
+    push_f(b, (*c).cam.near)
+    push_f(b, (*c).cam.tan_x)
+    push_f(b, (*c).cam.tan_y)
+    rt.buf_push(b, 10 as u8)
+}
+
+fn scene_mesh(c: *mut Ctx, verts: u64, nv: usize, idx: u64, ni: usize, ox: i32, oy: i32, oz: i32) {
+    let b: *mut rt.Buf = &(*c).out
+    push_lit(b, "mesh")
+    push_dec(b, (ox + 1000000) as u64)
+    push_dec(b, (oy + 1000000) as u64)
+    push_dec(b, (oz + 1000000) as u64)
+    push_dec(b, nv as u64)
+    push_dec(b, ni as u64)
+    rt.buf_push(b, 10 as u8)
+    var i: usize = 0
+    while i < nv {
+        push_lit(b, "v")
+        push_hex(b, rt.ld32(verts, i * 2) as u64)
+        push_hex(b, rt.ld32(verts, i * 2 + 1) as u64)
+        rt.buf_push(b, 10 as u8)
+        i = i + 1
+    }
+    push_lit(b, "i")
+    i = 0
+    while i < ni {
+        push_dec(b, rt.ld32(idx, i) as u64)
+        i = i + 1
+    }
+    rt.buf_push(b, 10 as u8)
+    mc_raster.raster_draw_mesh(&(*c).r, verts, nv, idx, ni, ox as f64, oy as f64, oz as f64)
+}
+
+fn image_path(c: *mut Ctx, ext: str) -> rt.Buf {
+    var path: rt.Buf = rt.buf_new()
+    push_str(&path, (*c).dir, (*c).dirn)
+    rt.buf_push(&path, 47 as u8)
+    var k: usize = 0
+    while k < (*c).namen {
+        rt.buf_push(&path, (*c).name[k])
+        k = k + 1
+    }
+    push_lit(&path, ext)
+    rt.buf_push(&path, 0 as u8)
+    return path
+}
+
+fn write_images(c: *mut Ctx) {
+    var p1: rt.Buf = image_path(c, ".png")
+    mc_raster.raster_write_png(&(*c).r, rt.buf_ptr(&p1))
+    rt.buf_free(&p1)
+    var p2: rt.Buf = image_path(c, ".ppm")
+    mc_raster.raster_write_ppm(&(*c).r, rt.buf_ptr(&p2))
+    rt.buf_free(&p2)
+}
+
+fn scene_end(c: *mut Ctx) {
+    let b: *mut rt.Buf = &(*c).out
+    let hx: u64 = rt.heap_alloc(64)
+    mc_raster.raster_hash_hex(&(*c).r, hx)
+    push_lit(b, "hash ")
+    push_str(b, hx, 64)
+    rt.buf_push(b, 10 as u8)
+    // raw framebuffer
+    var path: rt.Buf = rt.buf_new()
+    push_str(&path, (*c).dir, (*c).dirn)
+    rt.buf_push(&path, 47 as u8)
+    var k: usize = 0
+    while k < (*c).namen {
+        rt.buf_push(&path, (*c).name[k])
+        k = k + 1
+    }
+    push_lit(&path, ".rgba")
+    rt.buf_push(&path, 0 as u8)
+    rt.write_file(rt.buf_ptr(&path), (*c).r.color, ((*c).r.w as usize) * ((*c).r.h as usize) * 4)
+    rt.buf_free(&path)
+    write_images(c)
+    push_lit(b, "end\n")
+    // image files of the main scenes (PNG for people)
+    rt.heap_free(hx, 64)
+}
+
+fn cam_set(c: *mut Ctx, x: f64, y: f64, z: f64, yaw: f64, pitch: f64, fov: f64, near: f64, far: f64) {
+    mc_camera.camera_set_pos(&(*c).cam, x, y, z)
+    mc_camera.camera_set_angles(&(*c).cam, yaw, pitch)
+    mc_camera.camera_set_lens(&(*c).cam, fov, near, far)
+    mc_camera.camera_update(&(*c).cam)
+}
+
+fn lcg(s: *mut u64) -> u32 {
+    *s = (*s * 1103515245 as u64 + 12345 as u64) & 0x7FFFFFFF as u64
+    return (*s >> 8 as u64) as u32
+}
+
+// 300 random quads (two triangles each) inside a 16^3 box: vertices anywhere, so triangles are skinny,
+// huge, behind the camera, crossing the near plane, back and front facing.
+fn random_mesh(m: *mut mc_mesh.Mesher, seed: u64, nq: usize) {
+    var s: u64 = seed
+    var q: usize = 0
+    while q < nq {
+        let tile: u32 = 1 as u32 + lcg(&s) % 58 as u32
+        let face: u32 = lcg(&s) % 6 as u32
+        let wq: u32 = 1 as u32 + lcg(&s) % 4 as u32
+        let hq: u32 = 1 as u32 + lcg(&s) % 4 as u32
+        var k: usize = 0
+        while k < 4 {
+            let x: u32 = lcg(&s) % 17 as u32
+            let y: u32 = lcg(&s) % 17 as u32
+            let z: u32 = lcg(&s) % 17 as u32
+            let ao: u32 = lcg(&s) % 4 as u32
+            var u: u32 = 0
+            var v: u32 = 0
+            if k == 1 || k == 2 { u = wq }
+            if k == 2 || k == 3 { v = hq }
+            rt.st32((*m).verts, (q * 4 + k) * 2, x | (y << 8 as u32) | (z << 16 as u32) | (face << 24 as u32) | (ao << 27 as u32))
+            rt.st32((*m).verts, (q * 4 + k) * 2 + 1, tile | (u << 16 as u32) | (v << 24 as u32))
+            k = k + 1
+        }
+        let b: u32 = (q * 4) as u32
+        rt.st32((*m).idx, q * 6, b)
+        rt.st32((*m).idx, q * 6 + 1, b + 1 as u32)
+        rt.st32((*m).idx, q * 6 + 2, b + 2 as u32)
+        rt.st32((*m).idx, q * 6 + 3, b)
+        rt.st32((*m).idx, q * 6 + 4, b + 2 as u32)
+        rt.st32((*m).idx, q * 6 + 5, b + 3 as u32)
+        q = q + 1
+    }
+    (*m).nverts = (nq * 4) as u32
+    (*m).nidx = (nq * 6) as u32
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 { return 2 }
+    var c: Ctx = Ctx {
+        out: rt.buf_new(), dir: rt.arg_ptr(start, 1), dirn: 0,
+        r: mc_raster.raster_new(4, 4), atlas: mc_texture.atlas_default(), cam: mc_camera.camera_new(64, 48),
+        name: [0; 32], namen: 0,
+    }
+    while rt.ld8(c.dir, c.dirn) != 0 as u8 { c.dirn = c.dirn + 1 }
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    tables(&tb)
+    var m: mc_mesh.Mesher = mc_mesh.mesher_new()
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    let sk: u32 = mc_mesh.F_GREEDY | mc_mesh.F_AO
+
+    // ---- 1. cube: single grass block, naive quads
+    pad_clear(pad)
+    pad_set(pad, 5, 5, 5, 1 as u16)
+    mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO)
+    cam_set(&c, 3.0, 8.4, 2.2, 20.0, 35.0, 70.0, 0.05, 512.0)
+    scene_begin(&c, "cube", 160, 120, true, false, 0.0, 1.0, 0xFFE6BE96 as u32)
+    scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0)
+    scene_end(&c)
+
+    // ---- 2. stairs of 6 steps (greedy + AO), test tile on one block
+    pad_clear(pad)
+    var i: i32 = 0
+    while i < 6 {
+        var z: i32 = 0
+        while z < 4 {
+            var y: i32 = 0
+            while y <= i {
+                pad_set(pad, 2 + i, y, 3 + z, 4 as u16)
+                y = y + 1
+            }
+            z = z + 1
+        }
+        i = i + 1
+    }
+    pad_set(pad, 9, 0, 3, 2 as u16)
+    pad_set(pad, 9, 0, 4, 5 as u16)
+    mc_mesh.mesh_padded(&m, pad, &tb, sk)
+    cam_set(&c, 0.0, 9.0, -2.0, -25.0, 35.0, 70.0, 0.05, 512.0)
+    scene_begin(&c, "stairs", 200, 120, true, false, 0.0, 1.0, 0xFF90B4D8 as u32)
+    scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0)
+    scene_end(&c)
+
+    // ---- 3. greedy floor with holes: quads that repeat the tile (u, v up to 16)
+    pad_clear(pad)
+    var x: i32 = 0
+    while x < 16 {
+        var z: i32 = 0
+        while z < 16 {
+            pad_set(pad, x, 3, z, 1 as u16)
+            z = z + 1
+        }
+        x = x + 1
+    }
+    pad_set(pad, 5, 3, 5, 0 as u16)
+    pad_set(pad, 6, 3, 5, 0 as u16)
+    pad_set(pad, 10, 3, 12, 0 as u16)
+    pad_set(pad, 12, 4, 6, 3 as u16)
+    mc_mesh.mesh_padded(&m, pad, &tb, sk)
+    cam_set(&c, 8.0, 7.0, -4.0, 0.0, 28.0, 70.0, 0.05, 512.0)
+    scene_begin(&c, "greedy", 256, 144, true, false, 0.0, 1.0, 0xFFC8A078 as u32)
+    scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0)
+    scene_end(&c)
+    // same mesh, fog
+    cam_set(&c, 8.0, 5.0, -3.0, 10.0, 12.0, 70.0, 0.05, 512.0)
+    scene_begin(&c, "greedy_fog", 256, 144, true, true, 4.0, 22.0, 0xFF96BEE6 as u32)
+    scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0)
+    scene_end(&c)
+
+    // ---- 4. depth: two cubes (second one partly behind the first), both draw orders must give one image
+    pad_clear(pad)
+    pad_set(pad, 5, 5, 5, 4 as u16)
+    pad_set(pad, 6, 5, 5, 2 as u16)
+    mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO)
+    cam_set(&c, 2.0, 9.5, -6.0, 15.0, 22.0, 70.0, 0.05, 512.0)
+    scene_begin(&c, "depth_ab", 160, 120, true, false, 0.0, 1.0, 0xFF303030 as u32)
+    scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0)
+    scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 3)
+    scene_end(&c)
+    scene_begin(&c, "depth_ba", 160, 120, true, false, 0.0, 1.0, 0xFF303030 as u32)
+    scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 3)
+    scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0)
+    scene_end(&c)
+
+    // ---- 5. near clip: camera 0.03 above a floor and inside a wall block row
+    pad_clear(pad)
+    x = 0
+    while x < 16 {
+        var z: i32 = 0
+        while z < 16 {
+            pad_set(pad, x, 0, z, 1 as u16)
+            if z == 9 && x > 3 && x < 12 { pad_set(pad, x, 1, z, 5 as u16) }
+            z = z + 1
+        }
+        x = x + 1
+    }
+    mc_mesh.mesh_padded(&m, pad, &tb, sk)
+    cam_set(&c, 8.0, 1.03, 6.0, 0.0, 30.0, 70.0, 0.05, 512.0)
+    scene_begin(&c, "nearclip", 192, 108, true, false, 0.0, 1.0, 0xFFB0C0D0 as u32)
+    scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0)
+    scene_end(&c)
+    cam_set(&c, 8.0, 1.2, 8.5, 0.0, 5.0, 90.0, 0.3, 512.0)
+    scene_begin(&c, "nearclip_wall", 192, 108, true, false, 0.0, 1.0, 0xFFB0C0D0 as u32)
+    scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0)
+    scene_end(&c)
+
+    // ---- 6. cutout leaves in front of the floor, fog, culling on / off from the inside of a block
+    pad_clear(pad)
+    x = 0
+    while x < 16 {
+        var z: i32 = 0
+        while z < 16 {
+            pad_set(pad, x, 0, z, 4 as u16)
+            z = z + 1
+        }
+        x = x + 1
+    }
+    pad_set(pad, 7, 1, 7, 3 as u16)
+    pad_set(pad, 8, 1, 7, 3 as u16)
+    pad_set(pad, 7, 2, 7, 3 as u16)
+    pad_set(pad, 7, 1, 10, 2 as u16)
+    mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+    cam_set(&c, 8.0, 3.2, 3.0, 5.0, 25.0, 70.0, 0.05, 512.0)
+    scene_begin(&c, "leaves", 192, 108, true, true, 6.0, 30.0, 0xFF88B0D8 as u32)
+    scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0)
+    scene_end(&c)
+    pad_clear(pad)
+    pad_set(pad, 7, 7, 7, 2 as u16)
+    mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO)
+    cam_set(&c, 7.5, 7.5, 7.5, 30.0, -10.0, 90.0, 0.05, 512.0)
+    scene_begin(&c, "inside_cull", 128, 96, true, false, 0.0, 1.0, 0xFF202020 as u32)
+    scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0)
+    scene_end(&c)
+    scene_begin(&c, "inside_nocull", 128, 96, false, false, 0.0, 1.0, 0xFF202020 as u32)
+    scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0)
+    scene_end(&c)
+
+    // ---- 7. random triangles (skinny, huge, behind the camera, across the near plane), 3 seeds
+    var sd: u64 = 1
+    while sd <= 3 {
+        random_mesh(&m, sd * 7919 as u64, 300)
+        var yaw: f64 = 10.0
+        var cx: f64 = 8.0
+        var cz: f64 = -6.0
+        if sd == 2 {
+            cz = 8.0
+            yaw = 140.0
+        }
+        if sd == 3 {
+            cx = 20.0
+            cz = 20.0
+            yaw = 150.0
+        }
+        cam_set(&c, cx, 9.0, cz, yaw, 12.0, 75.0, 0.1, 512.0)
+        if sd == 1 { scene_begin(&c, "random1", 160, 120, true, true, 5.0, 40.0, 0xFF405060 as u32) }
+        if sd == 2 { scene_begin(&c, "random2", 160, 120, false, false, 0.0, 1.0, 0xFF405060 as u32) }
+        if sd == 3 { scene_begin(&c, "random3", 128, 128, true, false, 0.0, 1.0, 0xFF405060 as u32) }
+        scene_mesh(&c, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0)
+        scene_end(&c)
+        sd = sd + 1 as u64
+    }
+
+    // ---- write the description + the atlas
+    var p1: rt.Buf = rt.buf_new()
+    push_str(&p1, c.dir, c.dirn)
+    push_lit(&p1, "/scenes.txt")
+    rt.buf_push(&p1, 0 as u8)
+    rt.write_file(rt.buf_ptr(&p1), rt.buf_ptr(&c.out), rt.buf_len(&c.out))
+    var p2: rt.Buf = rt.buf_new()
+    push_str(&p2, c.dir, c.dirn)
+    push_lit(&p2, "/atlas.bin")
+    rt.buf_push(&p2, 0 as u8)
+    rt.write_file(rt.buf_ptr(&p2), c.atlas.px, 256 * 256 * 4)
+    return 0
+}

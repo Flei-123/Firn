@@ -1,0 +1,211 @@
+// expect_exit: 0
+// tests/2752_mc_raster.fi -- mc_raster: coverage rule, culling, near clip, depth, cutout, fog, hash,
+// backend interface. The byte-exact comparison with the python renderer is tools/mc/raster/run.sh.
+import std.rt
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+fn vtx(p: u64, i: usize, x: f64, y: f64, z: f64, u: f64, v: f64, ao: f64) {
+    *((p + ((i * 6 + 0) * 8) as u64) as *mut f64) = x
+    *((p + ((i * 6 + 1) * 8) as u64) as *mut f64) = y
+    *((p + ((i * 6 + 2) * 8) as u64) as *mut f64) = z
+    *((p + ((i * 6 + 3) * 8) as u64) as *mut f64) = u
+    *((p + ((i * 6 + 4) * 8) as u64) as *mut f64) = v
+    *((p + ((i * 6 + 5) * 8) as u64) as *mut f64) = ao
+}
+
+// camera 64x64, fov 90 -> pixel x = 32 + 16 * view_x at view depth 2 (right = -x world)
+fn setup(r: *mut mc_raster.Raster, cam: *mut mc_camera.Camera, a: *mut mc_texture.Atlas) {
+    mc_camera.camera_set_lens(cam, 90.0, 0.05, 512.0)
+    mc_camera.camera_update(cam)
+    mc_raster.raster_set_camera(r, cam)
+    mc_raster.raster_set_atlas(r, a)
+    mc_raster.raster_clear(r, 0xFF000000 as u32)
+}
+
+fn main() -> i32 {
+    var a: mc_texture.Atlas = mc_texture.atlas_default()
+    var cam: mc_camera.Camera = mc_camera.camera_new(64, 64)
+    var r: mc_raster.Raster = mc_raster.raster_new(64, 64)
+    setup(&r, &cam, &a)
+    let t: u64 = rt.heap_alloc(6 * 8 * 8)
+    // ---- one front facing triangle (counter clockwise in view space), z = 2
+    vtx(t, 0, -1.0, -1.0, 2.0, 0.5, 0.5, 3.0)
+    vtx(t, 1, 1.0, -1.0, 2.0, 0.5, 0.5, 3.0)
+    vtx(t, 2, 0.0, 1.0, 2.0, 0.5, 0.5, 3.0)
+    mc_raster.raster_draw_tri(&r, t, t + 48 as u64, t + 96 as u64, 1 as u32, 256 as u32)
+    check(r.st.pixels > 480 as u64 && r.st.pixels < 540 as u64, 1)
+    // the same triangle reversed is a back face: culled, nothing new
+    let n1: u64 = r.st.pixels
+    mc_raster.raster_draw_tri(&r, t, t + 96 as u64, t + 48 as u64, 1 as u32, 256 as u32)
+    check(r.st.pixels == n1 && r.st.tris_culled == 1 as u64, 2)
+    // culling off: the reversed triangle covers the same pixels (depth equal -> no new write)
+    mc_raster.raster_clear(&r, 0xFF000000 as u32)
+    mc_raster.raster_set_cull(&r, false)
+    mc_raster.raster_stats_reset(&r)
+    mc_raster.raster_draw_tri(&r, t, t + 96 as u64, t + 48 as u64, 1 as u32, 256 as u32)
+    check(r.st.pixels == n1, 3)
+    mc_raster.raster_set_cull(&r, true)
+    // ---- two triangles share a diagonal and the box edges run through pixel centres: exactly 32 x 32 pixels
+    mc_raster.raster_clear(&r, 0xFF000000 as u32)
+    mc_raster.raster_stats_reset(&r)
+    let lo: f64 = 0.0 - 0.96875
+    let hi: f64 = 1.03125
+    vtx(t, 0, lo, lo, 2.0, 0.5, 0.5, 3.0)
+    vtx(t, 1, hi, lo, 2.0, 0.5, 0.5, 3.0)
+    vtx(t, 2, hi, hi, 2.0, 0.5, 0.5, 3.0)
+    vtx(t, 3, lo, hi, 2.0, 0.5, 0.5, 3.0)
+    mc_raster.raster_draw_tri(&r, t, t + 48 as u64, t + 96 as u64, 1 as u32, 256 as u32)
+    mc_raster.raster_draw_tri(&r, t, t + 96 as u64, t + 144 as u64, 1 as u32, 256 as u32)
+    check(r.st.pixels == 1024 as u64, 4)
+    // box edges x = 16.5 / 48.5, y = 15.5 (top) / 47.5 (bottom): the left / top pixel row lies ON the edge and is
+    // inside (top-left rule), the right / bottom one is outside
+    check(mc_raster.raster_pixel(&r, 16, 15) != 0xFF000000 as u32, 5)
+    check(mc_raster.raster_pixel(&r, 47, 46) != 0xFF000000 as u32, 6)
+    check(mc_raster.raster_pixel(&r, 48, 30) == 0xFF000000 as u32 && mc_raster.raster_pixel(&r, 30, 47) == 0xFF000000 as u32, 7)
+    check(mc_raster.raster_pixel(&r, 15, 30) == 0xFF000000 as u32 && mc_raster.raster_pixel(&r, 30, 14) == 0xFF000000 as u32, 8)
+    // ---- depth: a near triangle of another tile wins in either draw order
+    vtx(t, 0, -2.0, -2.0, 4.0, 0.5, 0.5, 3.0)
+    vtx(t, 1, 2.0, -2.0, 4.0, 0.5, 0.5, 3.0)
+    vtx(t, 2, 0.0, 2.0, 4.0, 0.5, 0.5, 3.0)
+    vtx(t, 3, -1.0, -1.0, 2.0, 0.5, 0.5, 3.0)
+    vtx(t, 4, 1.0, -1.0, 2.0, 0.5, 0.5, 3.0)
+    vtx(t, 5, 0.0, 1.0, 2.0, 0.5, 0.5, 3.0)
+    mc_raster.raster_clear(&r, 0xFF000000 as u32)
+    mc_raster.raster_draw_tri(&r, t, t + 48 as u64, t + 96 as u64, 20 as u32, 256 as u32)
+    mc_raster.raster_draw_tri(&r, t + 144 as u64, t + 192 as u64, t + 240 as u64, 1 as u32, 256 as u32)
+    let p_ab: u32 = mc_raster.raster_pixel(&r, 32, 36)
+    mc_raster.raster_clear(&r, 0xFF000000 as u32)
+    mc_raster.raster_draw_tri(&r, t + 144 as u64, t + 192 as u64, t + 240 as u64, 1 as u32, 256 as u32)
+    mc_raster.raster_draw_tri(&r, t, t + 48 as u64, t + 96 as u64, 20 as u32, 256 as u32)
+    let p_ba: u32 = mc_raster.raster_pixel(&r, 32, 36)
+    check(p_ab == p_ba && p_ab == mc_texture.atlas_texel(&a, 1 as u32, 8, 8) | 0xFF000000 as u32, 9)
+    // ---- near plane: one vertex behind the camera is clipped (4 vertices), all behind draws nothing
+    mc_raster.raster_clear(&r, 0xFF000000 as u32)
+    mc_raster.raster_stats_reset(&r)
+    vtx(t, 0, -1.0, -1.0, 2.0, 0.5, 0.5, 3.0)
+    vtx(t, 1, 1.0, -1.0, 2.0, 0.5, 0.5, 3.0)
+    vtx(t, 2, 0.0, 1.0, -1.0, 0.5, 0.5, 3.0)
+    mc_raster.raster_draw_tri(&r, t, t + 48 as u64, t + 96 as u64, 1 as u32, 256 as u32)
+    check(r.st.tris_clipped == 1 as u64 && r.st.pixels > 0 as u64, 10)
+    mc_raster.raster_stats_reset(&r)
+    vtx(t, 0, -1.0, -1.0, -2.0, 0.5, 0.5, 3.0)
+    vtx(t, 1, 1.0, -1.0, -2.0, 0.5, 0.5, 3.0)
+    vtx(t, 2, 0.0, 1.0, 0.01, 0.5, 0.5, 3.0)
+    mc_raster.raster_draw_tri(&r, t, t + 48 as u64, t + 96 as u64, 1 as u32, 256 as u32)
+    check(r.st.pixels == 0 as u64, 11)
+    // ---- cutout: the middle of the glass tile is transparent
+    mc_raster.raster_clear(&r, 0xFF000000 as u32)
+    mc_raster.raster_stats_reset(&r)
+    vtx(t, 0, -1.0, -1.0, 2.0, 8.0 / 16.0, 8.0 / 16.0, 3.0)
+    vtx(t, 1, 1.0, -1.0, 2.0, 8.0 / 16.0, 8.0 / 16.0, 3.0)
+    vtx(t, 2, 0.0, 1.0, 2.0, 8.0 / 16.0, 8.0 / 16.0, 3.0)
+    mc_raster.raster_draw_tri(&r, t, t + 48 as u64, t + 96 as u64, 16 as u32, 256 as u32)
+    check(r.st.pixels == 0 as u64 && r.st.tris_drawn == 1 as u64, 12)
+    // ---- fog: far = fully fog coloured
+    mc_raster.raster_clear(&r, 0xFF000000 as u32)
+    mc_raster.raster_set_fog(&r, true, 0.0, 1.0, 150 as u32, 190 as u32, 230 as u32)
+    vtx(t, 0, -1.0, -1.0, 2.0, 0.5, 0.5, 3.0)
+    vtx(t, 1, 1.0, -1.0, 2.0, 0.5, 0.5, 3.0)
+    vtx(t, 2, 0.0, 1.0, 2.0, 0.5, 0.5, 3.0)
+    mc_raster.raster_draw_tri(&r, t, t + 48 as u64, t + 96 as u64, 1 as u32, 256 as u32)
+    check(mc_raster.raster_pixel(&r, 32, 36) == 0xFFE6BE96 as u32, 13)
+    mc_raster.raster_set_fog(&r, false, 0.0, 1.0, 0 as u32, 0 as u32, 0 as u32)
+    // ---- shading: AO 0 darker than AO 3, bottom face darker than top
+    mc_raster.raster_clear(&r, 0xFF000000 as u32)
+    vtx(t, 0, -1.0, -1.0, 2.0, 0.5, 0.5, 0.0)
+    vtx(t, 1, 1.0, -1.0, 2.0, 0.5, 0.5, 0.0)
+    vtx(t, 2, 0.0, 1.0, 2.0, 0.5, 0.5, 0.0)
+    mc_raster.raster_draw_tri(&r, t, t + 48 as u64, t + 96 as u64, 1 as u32, 256 as u32)
+    let dark: u32 = mc_raster.raster_pixel(&r, 32, 36)
+    check((dark & 255 as u32) < (mc_texture.atlas_texel(&a, 1 as u32, 8, 8) & 255 as u32), 14)
+    check((dark & 255 as u32) == (((mc_texture.atlas_texel(&a, 1 as u32, 8, 8) & 255 as u32) * 100 as u32) >> 8 as u32), 15)
+    // ---- hash: 64 lowercase hex chars, stable, changes with the image
+    let h1: u64 = rt.heap_alloc(64)
+    let h2: u64 = rt.heap_alloc(64)
+    mc_raster.raster_hash_hex(&r, h1)
+    mc_raster.raster_hash_hex(&r, h2)
+    var i: usize = 0
+    while i < 64 {
+        let c: u8 = rt.ld8(h1, i)
+        check((c >= 48 as u8 && c <= 57 as u8) || (c >= 97 as u8 && c <= 102 as u8), 16)
+        check(c == rt.ld8(h2, i), 17)
+        i = i + 1
+    }
+    mc_raster.raster_clear(&r, 0xFF123456 as u32)
+    mc_raster.raster_hash_hex(&r, h2)
+    var same: bool = true
+    i = 0
+    while i < 64 {
+        if rt.ld8(h1, i) != rt.ld8(h2, i) { same = false }
+        i = i + 1
+    }
+    check(!same, 18)
+    // ---- backend interface: upload a mesh, draw by handle == draw the mesh directly
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    tb.opaque = rt.heap_alloc(32768)
+    tb.tiles = rt.heap_alloc(32768 * 6 * 2)
+    i = 0
+    while i < 32768 {
+        rt.st8(tb.opaque, i, 0 as u8)
+        i = i + 1
+    }
+    i = 0
+    while i < 32768 * 6 {
+        rt.st16(tb.tiles, i, 0 as u16)
+        i = i + 1
+    }
+    i = 0
+    while i < 6 {
+        rt.st16(tb.tiles, 6 + i, (3 + i) as u16)
+        i = i + 1
+    }
+    rt.st8(tb.opaque, 1, 1 as u8)
+    var m: mc_mesh.Mesher = mc_mesh.mesher_new()
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    i = 0
+    while i < 5832 {
+        rt.st16(pad, i, 0 as u16)
+        i = i + 1
+    }
+    rt.st16(pad, (6 * 18 + 6) * 18 + 6, 1 as u16)
+    mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO)
+    check(m.nverts == 24 as u32 && m.nidx == 36 as u32, 19)
+    mc_camera.camera_set_pos(&cam, 5.0, 8.0, 3.0)
+    mc_camera.camera_set_angles(&cam, 15.0, 30.0)
+    mc_camera.camera_update(&cam)
+    mc_raster.backend_begin(&r, &cam, 0xFF804020 as u32)
+    mc_raster.raster_draw_mesh(&r, m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0.0, 0.0, 0.0)
+    mc_raster.backend_end(&r)
+    mc_raster.raster_hash_hex(&r, h1)
+    check(r.st.pixels > 100 as u64, 20)
+    let handle: usize = mc_raster.backend_mesh_upload(&r, 77 as u64, m.verts, m.nverts as usize, m.idx, m.nidx as usize)
+    check(handle >= 1, 21)
+    mc_raster.backend_begin(&r, &cam, 0xFF804020 as u32)
+    mc_raster.backend_draw(&r, handle, 0.0, 0.0, 0.0)
+    mc_raster.raster_hash_hex(&r, h2)
+    i = 0
+    while i < 64 {
+        check(rt.ld8(h1, i) == rt.ld8(h2, i), 22)
+        i = i + 1
+    }
+    let px: u64 = rt.heap_alloc(64 * 64 * 4)
+    mc_raster.backend_read_pixels(&r, px)
+    check(rt.ld32(px, 0) == 0xFF804020 as u32, 23)
+    mc_raster.backend_mesh_free(&r, handle)
+    mc_raster.backend_begin(&r, &cam, 0xFF804020 as u32)
+    mc_raster.backend_draw(&r, handle, 0.0, 0.0, 0.0)
+    check(mc_raster.raster_pixel(&r, 32, 32) == 0xFF804020 as u32, 24)
+    // the slot is reused by the next upload
+    check(mc_raster.backend_mesh_upload(&r, 78 as u64, m.verts, m.nverts as usize, m.idx, m.nidx as usize) == handle, 25)
+    mc_raster.raster_free(&r)
+    return 0
+}
