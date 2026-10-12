@@ -1,0 +1,741 @@
+// expect_exit: 0
+// tests/2810_input_textcore.fi -- lib/input/textcore.fi: UTF-8 / UTF-16, the compose tables, dead keys, Compose sequences,
+// pre-edit edits (XIM replace semantics), segments, commit splitting, the event ring, the cursor rect, and 30000 random
+// operations against a model (a linear-scan re-implementation that logs the events it expects).
+import std.rt
+import input.textcore
+import input.composedata
+
+static mut SEED: u64 = 2024
+
+fn rnd() -> u64 {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return SEED / 65536
+}
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+// ---- helpers: drain the real queue into a flat log: kind, n, cps... ----------------------------------------------------
+struct Log {
+    d: [u32; 8192],
+    n: usize,
+}
+
+fn log_new() -> Log {
+    return Log { d: [0 as u32; 8192], n: 0 }
+}
+
+fn log_add(l: *mut Log, kind: u32, p: u64, n: usize) {
+    if (*l).n + 2 + n > 8192 {
+        rt.finish(90 as i64)
+    }
+    (*l).d[(*l).n] = kind
+    (*l).d[(*l).n + 1] = n as u32
+    var i: usize = 0
+    while i < n {
+        (*l).d[(*l).n + 2 + i] = rt.ld32(p, i)
+        i = i + 1
+    }
+    (*l).n = (*l).n + 2 + n
+}
+
+fn drain(t: *mut textcore.Text, l: *mut Log) {
+    var ev: textcore.TextEvent = textcore.TextEvent { kind: 0 as u32, n: 0, cp: [0 as u32; 32] }
+    while textcore.text_event_next(t, &ev) != textcore.TE_NONE {
+        log_add(l, ev.kind, (&ev.cp[0]) as u64, ev.n)
+    }
+}
+
+fn log_eq(a: *mut Log, b: *mut Log) -> bool {
+    if (*a).n != (*b).n { return false }
+    var i: usize = 0
+    while i < (*a).n {
+        if (*a).d[i] != (*b).d[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// commits are split by the core into events of at most 32: merge consecutive commits of both logs before comparing
+fn merge_commits(a: *mut Log, out: *mut Log) {
+    (*out).n = 0
+    var i: usize = 0
+    var last_commit: bool = false
+    var last_at: usize = 0
+    while i < (*a).n {
+        let k: u32 = (*a).d[i]
+        let n: usize = (*a).d[i + 1] as usize
+        if k == textcore.TE_COMMIT && last_commit {
+            var j: usize = 0
+            while j < n {
+                (*out).d[(*out).n + j] = (*a).d[i + 2 + j]
+                j = j + 1
+            }
+            (*out).n = (*out).n + n
+            (*out).d[last_at + 1] = (*out).d[last_at + 1] + n as u32
+        } else {
+            last_at = (*out).n
+            var j: usize = 0
+            (*out).d[(*out).n] = k
+            (*out).d[(*out).n + 1] = n as u32
+            while j < n {
+                (*out).d[(*out).n + 2 + j] = (*a).d[i + 2 + j]
+                j = j + 1
+            }
+            (*out).n = (*out).n + 2 + n
+            last_commit = k == textcore.TE_COMMIT
+        }
+        i = i + 2 + n
+    }
+}
+
+// ---- the model -----------------------------------------------------------------------------------------------------
+struct Model {
+    on: bool,
+    pre: [u32; 256],
+    fb: [u32; 256],
+    pn: usize,
+    caret: usize,
+    mode: u32,
+    dead: u32,
+    ck: [u32; 3],
+    cn: usize,
+}
+
+fn model_new() -> Model {
+    return Model { on: true, pre: [0 as u32; 256], fb: [0 as u32; 256], pn: 0, caret: 0, mode: 0 as u32, dead: 0 as u32,
+        ck: [0 as u32; 3], cn: 0 }
+}
+
+fn m_notify(m: *mut Model, was: usize, l: *mut Log) {
+    var z: [u32; 1] = [0 as u32; 1]
+    let p: u64 = (&z[0]) as u64
+    if was == 0 && (*m).pn > 0 {
+        log_add(l, textcore.TE_PREEDIT_BEGIN, p, 0)
+        log_add(l, textcore.TE_PREEDIT, p, 0)
+    } else if was > 0 && (*m).pn == 0 {
+        log_add(l, textcore.TE_PREEDIT_END, p, 0)
+    } else if (*m).pn > 0 {
+        log_add(l, textcore.TE_PREEDIT, p, 0)
+    }
+}
+
+fn m_cancel(m: *mut Model, l: *mut Log) {
+    let was: usize = (*m).pn
+    (*m).pn = 0
+    (*m).caret = 0
+    (*m).mode = 0 as u32
+    (*m).cn = 0
+    m_notify(m, was, l)
+}
+
+fn m_commit(m: *mut Model, p: u64, n: usize, l: *mut Log) {
+    m_cancel(m, l)
+    if n > 0 {
+        log_add(l, textcore.TE_COMMIT, p, n)
+    }
+}
+
+fn m_commit1(m: *mut Model, a: u32, l: *mut Log) {
+    var b: [u32; 1] = [0 as u32; 1]
+    b[0] = a
+    m_commit(m, (&b[0]) as u64, 1, l)
+}
+
+fn m_show(m: *mut Model, p: u64, n: usize, l: *mut Log) {
+    let was: usize = (*m).pn
+    var i: usize = 0
+    while i < n {
+        (*m).pre[i] = rt.ld32(p, i)
+        (*m).fb[i] = 2 as u32
+        i = i + 1
+    }
+    (*m).pn = n
+    (*m).caret = n
+    m_notify(m, was, l)
+}
+
+// linear scans over the generated tables
+fn m_dead(d: u32, cp: u32) -> u32 {
+    let key: u32 = d * 2097152 as u32 + cp
+    var i: usize = 0
+    while i < composedata.DEAD_N {
+        if composedata.DEAD_KEY[i] == key { return composedata.DEAD_RES[i] }
+        i = i + 1
+    }
+    return 0 as u32
+}
+
+fn m_seq(key: u32) -> u32 {
+    var i: usize = 0
+    while i < composedata.SEQ_N {
+        if composedata.SEQ_KEY[i] == key { return composedata.SEQ_RES[i] }
+        i = i + 1
+    }
+    return 0 as u32
+}
+
+fn m_seq_prefix(lo: u32, hi: u32) -> bool {
+    var i: usize = 0
+    while i < composedata.SEQ_N {
+        let k: u32 = composedata.SEQ_KEY[i]
+        if k >= lo && k < hi { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn m_dead_idx(ks: u32) -> u32 {
+    if ks >= 65104 as u32 && ks <= 65116 as u32 { return ks - 65104 as u32 }
+    if ks >= 65120 as u32 && ks <= 65122 as u32 { return ks - 65120 as u32 + 13 as u32 }
+    return 16 as u32
+}
+
+fn m_modifier(ks: u32) -> bool {
+    return (ks >= 65505 as u32 && ks <= 65518 as u32) || (ks >= 65025 as u32 && ks <= 65043 as u32) || ks == 65406 as u32 || ks == 65407 as u32
+}
+
+fn m_cp(ks: u32) -> u32 {
+    if (ks >= 32 as u32 && ks <= 126 as u32) || (ks >= 160 as u32 && ks <= 255 as u32) { return ks }
+    if ks >= 16777216 as u32 && ks <= 17891327 as u32 { return ks - 16777216 as u32 }
+    return 0 as u32
+}
+
+fn m_key(m: *mut Model, ks: u32, mods: u32, l: *mut Log) -> u32 {
+    if !(*m).on || m_modifier(ks) { return 0 as u32 }
+    let held: bool = (mods & 12 as u32) != 0 as u32
+    if (*m).mode == 0 as u32 {
+        if held { return 0 as u32 }
+        let d: u32 = m_dead_idx(ks)
+        if d < 16 as u32 {
+            (*m).mode = 1 as u32
+            (*m).dead = d
+            var b: [u32; 1] = [0 as u32; 1]
+            b[0] = composedata.DEAD_SPACING[d as usize]
+            m_show(m, (&b[0]) as u64, 1, l)
+            return 1 as u32
+        }
+        if ks == 65312 as u32 {
+            (*m).mode = 2 as u32
+            (*m).cn = 0
+            return 1 as u32
+        }
+        return 0 as u32
+    }
+    if ks == 65307 as u32 || ks == 65288 as u32 {
+        m_cancel(m, l)
+        return 1 as u32
+    }
+    if held {
+        m_cancel(m, l)
+        return 0 as u32
+    }
+    let cp: u32 = m_cp(ks)
+    if (*m).mode == 1 as u32 {
+        let sp: u32 = composedata.DEAD_SPACING[(*m).dead as usize]
+        let d2: u32 = m_dead_idx(ks)
+        if d2 < 16 as u32 {
+            if d2 == (*m).dead {
+                m_commit1(m, sp, l)
+                return 2 as u32
+            }
+            m_commit1(m, sp, l)
+            (*m).mode = 1 as u32
+            (*m).dead = d2
+            var b: [u32; 1] = [0 as u32; 1]
+            b[0] = composedata.DEAD_SPACING[d2 as usize]
+            m_show(m, (&b[0]) as u64, 1, l)
+            return 2 as u32
+        }
+        if cp == 0 as u32 {
+            m_commit1(m, sp, l)
+            return 0 as u32
+        }
+        if cp == 32 as u32 {
+            m_commit1(m, sp, l)
+            return 2 as u32
+        }
+        let r: u32 = m_dead((*m).dead, cp)
+        if r != 0 as u32 {
+            m_commit1(m, r, l)
+        } else {
+            var b: [u32; 2] = [0 as u32; 2]
+            b[0] = sp
+            b[1] = cp
+            m_commit(m, (&b[0]) as u64, 2, l)
+        }
+        return 2 as u32
+    }
+    if cp < 32 as u32 || cp > 126 as u32 {
+        m_cancel(m, l)
+        if cp == 0 as u32 && m_dead_idx(ks) >= 16 as u32 { return 0 as u32 }
+        return 1 as u32
+    }
+    if (*m).cn >= 3 {
+        m_cancel(m, l)
+        return 1 as u32
+    }
+    (*m).ck[(*m).cn] = cp
+    (*m).cn = (*m).cn + 1
+    var k2: u32 = 0 as u32
+    var k3: u32 = 0 as u32
+    if (*m).cn >= 2 { k2 = (*m).ck[1] }
+    if (*m).cn >= 3 { k3 = (*m).ck[2] }
+    let key: u32 = ((*m).ck[0] << 14 as u32) | (k2 << 7 as u32) | k3
+    if (*m).cn >= 2 {
+        let r: u32 = m_seq(key)
+        if r != 0 as u32 {
+            m_commit1(m, r, l)
+            return 2 as u32
+        }
+    }
+    var more: bool = false
+    if (*m).cn == 1 { more = m_seq_prefix((*m).ck[0] << 14 as u32, ((*m).ck[0] + 1 as u32) << 14 as u32) }
+    if (*m).cn == 2 { more = m_seq_prefix(key + 1 as u32, key + 128 as u32) }
+    if more {
+        var b: [u32; 3] = [0 as u32; 3]
+        b[0] = (*m).ck[0]
+        b[1] = (*m).ck[1]
+        b[2] = (*m).ck[2]
+        let n: usize = (*m).cn
+        m_show(m, (&b[0]) as u64, n, l)
+        return 1 as u32
+    }
+    m_cancel(m, l)
+    return 1 as u32
+}
+
+fn m_replace(m: *mut Model, first0: usize, len0: usize, cps: u64, n0: usize, fbs: u64, caret: usize, l: *mut Log) {
+    let was: usize = (*m).pn
+    var first: usize = first0
+    if first > (*m).pn { first = (*m).pn }
+    var len: usize = len0
+    if len > (*m).pn - first { len = (*m).pn - first }
+    var n: usize = n0
+    if (*m).pn - len + n > 256 { n = 256 - ((*m).pn - len) }
+    // build the new arrays element by element
+    var nc: [u32; 256] = [0 as u32; 256]
+    var nf: [u32; 256] = [0 as u32; 256]
+    var w: usize = 0
+    var i: usize = 0
+    while i < first {
+        nc[w] = (*m).pre[i]
+        nf[w] = (*m).fb[i]
+        w = w + 1
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        nc[w] = rt.ld32(cps, i)
+        if fbs == 0 as u64 { nf[w] = 2 as u32 } else { nf[w] = rt.ld32(fbs, i) }
+        w = w + 1
+        i = i + 1
+    }
+    i = first + len
+    while i < (*m).pn {
+        nc[w] = (*m).pre[i]
+        nf[w] = (*m).fb[i]
+        w = w + 1
+        i = i + 1
+    }
+    i = 0
+    while i < w {
+        (*m).pre[i] = nc[i]
+        (*m).fb[i] = nf[i]
+        i = i + 1
+    }
+    (*m).pn = w
+    if caret > w { (*m).caret = w } else { (*m).caret = caret }
+    m_notify(m, was, l)
+}
+
+fn same_state(t: *mut textcore.Text, m: *mut Model) -> bool {
+    if textcore.text_preedit_len(t) != (*m).pn { return false }
+    if textcore.text_preedit_caret_pos(t) != (*m).caret { return false }
+    if textcore.text_composing(t) != ((*m).mode != 0 as u32) { return false }
+    var i: usize = 0
+    while i < (*m).pn {
+        if textcore.text_preedit_cp(t, i) != (*m).pre[i] { return false }
+        if textcore.text_preedit_fb(t, i) != (*m).fb[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ---- directed tests ----------------------------------------------------------------------------------------------------
+fn first_commit(t: *mut textcore.Text) -> u32 {
+    var ev: textcore.TextEvent = textcore.TextEvent { kind: 0 as u32, n: 0, cp: [0 as u32; 32] }
+    var r: u32 = 0 as u32
+    while textcore.text_event_next(t, &ev) != textcore.TE_NONE {
+        if ev.kind == textcore.TE_COMMIT && ev.n >= 1 && r == 0 as u32 {
+            r = ev.cp[0]
+        }
+    }
+    return r
+}
+
+fn typed(t: *mut textcore.Text, a: u32, b: u32) -> u32 {
+    textcore.text_reset(t)
+    first_commit(t)
+    textcore.text_key(t, a, 0 as u32)
+    textcore.text_key(t, b, 0 as u32)
+    return first_commit(t)
+}
+
+fn typed3(t: *mut textcore.Text, k0: u32, a: u32, b: u32, c: u32) -> u32 {
+    textcore.text_reset(t)
+    first_commit(t)
+    textcore.text_key(t, k0, 0 as u32)
+    textcore.text_key(t, a, 0 as u32)
+    textcore.text_key(t, b, 0 as u32)
+    textcore.text_key(t, c, 0 as u32)
+    return first_commit(t)
+}
+
+fn main() -> i32 {
+    // ---- UTF-8 ----
+    var u: [u32; 16] = [0 as u32; 16]
+    var b: [u8; 64] = [0 as u8; 64]
+    var cps: [u32; 8] = [0 as u32; 8]
+    cps[0] = 36 as u32
+    cps[1] = 233 as u32
+    cps[2] = 8364 as u32
+    cps[3] = 128512 as u32
+    var n: usize = 0
+    var i: usize = 0
+    while i < 4 {
+        n = n + textcore.utf8_encode(cps[i], (&b[0]) as u64 + n as u64)
+        i = i + 1
+    }
+    check(n == 1 + 2 + 3 + 4, 1)
+    check(textcore.utf8_decode((&b[0]) as u64, n, (&u[0]) as u64, 16) == 4 && u[1] == 233 as u32 && u[3] == 128512 as u32, 2)
+    // ill-formed: lone continuation, overlong C0 80, surrogate ED A0 80, truncated E2 82, F5
+    b[0] = 0x80 as u8
+    b[1] = 0xC0 as u8
+    b[2] = 0x80 as u8
+    b[3] = 0xED as u8
+    b[4] = 0xA0 as u8
+    b[5] = 0x80 as u8
+    b[6] = 0xE2 as u8
+    b[7] = 0x82 as u8
+    b[8] = 0xF5 as u8
+    b[9] = 0x41 as u8
+    let m8: usize = textcore.utf8_decode((&b[0]) as u64, 10, (&u[0]) as u64, 16)
+    check(m8 == 10 && u[0] == 65533 as u32 && u[9] == 65 as u32 && u[8] == 65533 as u32, 3)
+    // UTF-16 with a pair and an unpaired surrogate
+    var w: [u16; 8] = [0 as u16; 8]
+    w[0] = 0x41 as u16
+    w[1] = 0xD83D as u16
+    w[2] = 0xDE00 as u16
+    w[3] = 0xDC00 as u16
+    w[4] = 0xD800 as u16
+    check(textcore.utf16_decode((&w[0]) as u64, 5, (&u[0]) as u64, 16) == 4 && u[1] == 128512 as u32 && u[2] == 65533 as u32 && u[3] == 65533 as u32, 4)
+
+    // ---- tables: sortedness, a few known entries ----
+    i = 1
+    while i < composedata.DEAD_N {
+        check(composedata.DEAD_KEY[i - 1] < composedata.DEAD_KEY[i], 5)
+        i = i + 1
+    }
+    i = 1
+    while i < composedata.SEQ_N {
+        check(composedata.SEQ_KEY[i - 1] < composedata.SEQ_KEY[i], 6)
+        i = i + 1
+    }
+    check(composedata.DEAD_N == 541 && composedata.SEQ_N == 1147, 7)
+    // every table entry is found by the binary search
+    i = 0
+    while i < composedata.DEAD_N {
+        let d: u32 = composedata.DEAD_KEY[i] / 2097152 as u32
+        let cp: u32 = composedata.DEAD_KEY[i] % 2097152 as u32
+        check(textcore.dead_lookup(d, cp) == composedata.DEAD_RES[i], 8)
+        i = i + 1
+    }
+    i = 0
+    while i < composedata.SEQ_N {
+        check(textcore.seq_lookup(composedata.SEQ_KEY[i]) == composedata.SEQ_RES[i], 9)
+        i = i + 1
+    }
+    check(textcore.dead_lookup(1 as u32, 97 as u32) == 225 as u32, 10) // acute a = U+00E1
+    check(textcore.seq_lookup((39 as u32 << 14 as u32) | (101 as u32 << 7 as u32)) == 233 as u32, 11) // ' e = U+00E9
+    var di: usize = 0
+    while di < 13 {
+        check(textcore.dead_index(65104 as u32 + di as u32) == di as u32, 12)
+        di = di + 1
+    }
+    check(textcore.dead_index(65120 as u32) == 13 as u32 && textcore.dead_index(65122 as u32) == 15 as u32 && textcore.dead_index(97 as u32) == 16 as u32, 13)
+
+    // ---- the engine, directed ----
+    var t: textcore.Text = textcore.text_new()
+    check(typed(&t, 65105 as u32, 97 as u32) == 225 as u32, 20) // dead_acute a
+    check(typed(&t, 65104 as u32, 101 as u32) == 232 as u32, 21) // dead_grave e
+    check(typed(&t, 65107 as u32, 110 as u32) == 241 as u32, 22) // dead_tilde n
+    check(typed(&t, 65111 as u32, 111 as u32) == 246 as u32, 23) // dead_diaeresis o
+    check(typed(&t, 65106 as u32, 32 as u32) == 94 as u32, 24) // dead_circumflex space = ^
+    check(typed(&t, 65105 as u32, 65105 as u32) == 180 as u32, 25) // dead_acute twice = acute accent
+    check(typed(&t, 65105 as u32, 120 as u32) == 180 as u32, 26) // dead_acute x = accent then x
+    check(typed(&t, 65312 as u32, 39 as u32) == 0 as u32, 27) // Multi_key ' alone: nothing yet
+    check(textcore.text_composing(&t), 28)
+    check(typed3(&t, 65312 as u32, 39 as u32, 101 as u32, 0 as u32) == 233 as u32, 29) // Multi_key ' e
+    check(typed3(&t, 65312 as u32, 111 as u32, 101 as u32, 0 as u32) == 339 as u32, 30) // o e = oe ligature
+    check(typed3(&t, 65312 as u32, 33 as u32, 43 as u32, 79 as u32) == 7906 as u32, 31) // ! + O = U+1EE2 (three keys)
+    // dead key shows the accent in the pre-edit text; Escape cancels
+    textcore.text_reset(&t)
+    first_commit(&t)
+    check(textcore.text_key(&t, 65105 as u32, 0 as u32) == textcore.KR_EAT && textcore.text_preedit_len(&t) == 1 && textcore.text_preedit_cp(&t, 0) == 180 as u32, 32)
+    check(textcore.text_key(&t, 65307 as u32, 0 as u32) == textcore.KR_EAT && textcore.text_preedit_len(&t) == 0 && !textcore.text_composing(&t), 33)
+    // plain key with nothing pending passes; Shift while composing changes nothing; Ctrl cancels and passes
+    check(textcore.text_key(&t, 97 as u32, 0 as u32) == textcore.KR_PASS, 34)
+    textcore.text_key(&t, 65105 as u32, 0 as u32)
+    check(textcore.text_key(&t, 65505 as u32, 0 as u32) == textcore.KR_PASS && textcore.text_composing(&t), 35)
+    check(textcore.text_key(&t, 97 as u32, textcore.MOD_CTRL) == textcore.KR_PASS && !textcore.text_composing(&t), 36)
+    // an invalid Compose sequence is swallowed and cancels
+    textcore.text_reset(&t)
+    first_commit(&t)
+    textcore.text_key(&t, 65312 as u32, 0 as u32)
+    textcore.text_key(&t, 39 as u32, 0 as u32)
+    check(textcore.text_key(&t, 113 as u32, 0 as u32) == textcore.KR_EAT && !textcore.text_composing(&t), 37)
+    textcore.text_reset(&t)
+    first_commit(&t)
+    // an inactive field ignores keys
+    textcore.text_set_active(&t, false)
+    check(textcore.text_key(&t, 65105 as u32, 0 as u32) == textcore.KR_PASS, 38)
+    textcore.text_set_active(&t, true)
+
+    // ---- pre-edit with feedback: segments ----
+    t = textcore.text_new()
+    var pc: [u32; 6] = [0 as u32; 6]
+    var pf: [u32; 6] = [0 as u32; 6]
+    pc[0] = 20320 as u32
+    pc[1] = 22909 as u32
+    pc[2] = 21527 as u32
+    pc[3] = 97 as u32
+    pc[4] = 98 as u32
+    pf[0] = textcore.FB_PRIMARY | textcore.FB_UNDERLINE
+    pf[1] = textcore.FB_PRIMARY | textcore.FB_UNDERLINE
+    pf[2] = textcore.FB_REVERSE
+    pf[3] = textcore.FB_UNDERLINE
+    pf[4] = textcore.FB_UNDERLINE
+    textcore.text_preedit_set(&t, (&pc[0]) as u64, 5, (&pf[0]) as u64, 3)
+    check(textcore.text_preedit_seg_count(&t) == 3, 40)
+    var s0: usize = 0
+    var s1: usize = 0
+    var cl: u32 = 0 as u32
+    check(textcore.text_preedit_seg(&t, 1, &s0, &s1, &cl) && s0 == 2 && s1 == 3 && cl == textcore.SEG_TARGET, 41)
+    check(textcore.text_preedit_seg(&t, 2, &s0, &s1, &cl) && s0 == 3 && s1 == 5 && cl == textcore.SEG_INPUT, 42)
+    check(textcore.text_preedit_seg(&t, 0, &s0, &s1, &cl) && s0 == 0 && s1 == 2 && cl == textcore.SEG_CONVERTED, 43)
+    check(!textcore.text_preedit_seg(&t, 3, &s0, &s1, &cl), 44)
+    // UTF-8 view: 3 + 3 + 3 + 1 + 1 octets, caret after 3 code points = 9 octets
+    var o: [u8; 32] = [0 as u8; 32]
+    check(textcore.text_preedit_utf8(&t, (&o[0]) as u64, 32) == 11 && textcore.text_preedit_caret_bytes(&t) == 9, 45)
+    check(textcore.text_preedit_utf8(&t, (&o[0]) as u64, 7) == 6, 46) // cut at a code point border
+    // XIM replace: delete 2 from index 1, insert one; caret clamps
+    pc[0] = 120 as u32
+    textcore.text_preedit_replace(&t, 1, 2, (&pc[0]) as u64, 1, 0 as u64, 99)
+    check(textcore.text_preedit_len(&t) == 4 && textcore.text_preedit_cp(&t, 1) == 120 as u32 && textcore.text_preedit_cp(&t, 2) == 97 as u32 && textcore.text_preedit_caret_pos(&t) == 4, 47)
+    check(textcore.text_preedit_fb(&t, 1) == textcore.FB_UNDERLINE, 48)
+    // finish composing = commit as it is
+    var l: Log = log_new()
+    drain(&t, &l)
+    textcore.text_preedit_commit(&t)
+    drain(&t, &l)
+    check(textcore.text_preedit_len(&t) == 0 && l.d[l.n - 2 - 4] == textcore.TE_COMMIT && l.d[l.n - 4] == 20320 as u32, 49)
+    // a commit of 70 code points splits into 32 + 32 + 6, in order, and ends a pre-edit text first
+    t = textcore.text_new()
+    var big: [u32; 70] = [0 as u32; 70]
+    i = 0
+    while i < 70 {
+        big[i] = 1000 as u32 + i as u32
+        i = i + 1
+    }
+    textcore.text_preedit_set(&t, (&big[0]) as u64, 3, 0 as u64, 1)
+    textcore.text_commit(&t, (&big[0]) as u64, 70)
+    var ev: textcore.TextEvent = textcore.TextEvent { kind: 0 as u32, n: 0, cp: [0 as u32; 32] }
+    var kinds: [u32; 8] = [0 as u32; 8]
+    var ns: [usize; 8] = [0; 8]
+    var ne: usize = 0
+    while textcore.text_event_next(&t, &ev) != textcore.TE_NONE {
+        if ne < 8 {
+            kinds[ne] = ev.kind
+            ns[ne] = ev.n
+        }
+        ne = ne + 1
+    }
+    check(ne == 6 && kinds[0] == textcore.TE_PREEDIT_BEGIN && kinds[1] == textcore.TE_PREEDIT && kinds[2] == textcore.TE_PREEDIT_END, 50)
+    check(kinds[3] == textcore.TE_COMMIT && ns[3] == 32 && ns[4] == 32 && kinds[5] == textcore.TE_COMMIT && ns[5] == 6 && ev.cp[5] == 1069 as u32, 51)
+    // UTF-8 commit: a string of 1500 octets (> the 512-code-point chunk) arrives complete
+    t = textcore.text_new()
+    var bigb: [u8; 1500] = [0 as u8; 1500]
+    i = 0
+    while i < 1500 {
+        bigb[i] = (97 + (i % 26)) as u8
+        i = i + 1
+    }
+    textcore.text_commit_utf8(&t, (&bigb[0]) as u64, 1500)
+    var total: usize = 0
+    while textcore.text_event_next(&t, &ev) != textcore.TE_NONE {
+        total = total + ev.n
+    }
+    check(total == 1500, 52)
+    // the cursor rect reports a change once
+    var sp: [i32; 4] = [0 as i32; 4]
+    check(!textcore.text_spot_take(&t, &sp), 53)
+    textcore.text_set_spot(&t, 10 as i32, 20 as i32, 2 as i32, 16 as i32)
+    check(textcore.text_spot_take(&t, &sp) && sp[0] == 10 as i32 && sp[3] == 16 as i32, 54)
+    textcore.text_set_spot(&t, 10 as i32, 20 as i32, 2 as i32, 16 as i32)
+    check(!textcore.text_spot_take(&t, &sp), 55)
+    // the ring drops the OLDEST when nobody reads, and counts it
+    t = textcore.text_new()
+    i = 0
+    while i < 300 {
+        textcore.text_commit(&t, (&big[0]) as u64, 1)
+        i = i + 1
+    }
+    check(textcore.text_events_lost(&t) == (300 - 127) as u64, 56)
+    var seen: usize = 0
+    while textcore.text_event_next(&t, &ev) != textcore.TE_NONE {
+        seen = seen + 1
+    }
+    check(seen == 127, 57)
+
+    // ---- random operations against the model ----
+    var keys: [u32; 40] = [0 as u32; 40]
+    keys[0] = 97 as u32
+    keys[1] = 101 as u32
+    keys[2] = 110 as u32
+    keys[3] = 111 as u32
+    keys[4] = 39 as u32
+    keys[5] = 34 as u32
+    keys[6] = 126 as u32
+    keys[7] = 32 as u32
+    keys[8] = 65105 as u32
+    keys[9] = 65104 as u32
+    keys[10] = 65106 as u32
+    keys[11] = 65107 as u32
+    keys[12] = 65111 as u32
+    keys[13] = 65112 as u32
+    keys[14] = 65122 as u32
+    keys[15] = 65312 as u32
+    keys[16] = 65312 as u32
+    keys[17] = 65312 as u32
+    keys[18] = 65307 as u32
+    keys[19] = 65288 as u32
+    keys[20] = 65505 as u32
+    keys[21] = 65361 as u32
+    keys[22] = 33 as u32
+    keys[23] = 43 as u32
+    keys[24] = 79 as u32
+    keys[25] = 60 as u32
+    keys[26] = 99 as u32
+    keys[27] = 47 as u32
+    keys[28] = 49 as u32
+    keys[29] = 50 as u32
+    keys[30] = 83 as u32
+    keys[31] = 115 as u32
+    keys[32] = 16777216 as u32 + 233 as u32
+    keys[33] = 65293 as u32
+    keys[34] = 65027 as u32
+    keys[35] = 45 as u32
+    keys[36] = 76 as u32
+    keys[37] = 111 as u32
+    keys[38] = 101 as u32
+    keys[39] = 65105 as u32
+    t = textcore.text_new()
+    var m: Model = model_new()
+    var tl: Log = log_new()
+    var ml: Log = log_new()
+    var tm: Log = log_new()
+    var mm: Log = log_new()
+    var rc: [u32; 40] = [0 as u32; 40]
+    var rf: [u32; 40] = [0 as u32; 40]
+    var step: usize = 0
+    var keys_hit: usize = 0
+    var kc: usize = 0
+    var commits: usize = 0
+    while step < 30000 {
+        tl.n = 0
+        ml.n = 0
+        let op: u64 = rnd() % 100 as u64
+        if op < 62 as u64 {
+            let ks: u32 = keys[(rnd() % 40 as u64) as usize]
+            var mods: u32 = 0 as u32
+            if rnd() % 20 as u64 == 0 as u64 { mods = textcore.MOD_CTRL }
+            if rnd() % 25 as u64 == 0 as u64 { mods = textcore.MOD_ALT }
+            if rnd() % 7 as u64 == 0 as u64 { mods = mods | textcore.MOD_SHIFT }
+            let a: u32 = textcore.text_key(&t, ks, mods)
+            let e: u32 = m_key(&m, ks, mods, &ml)
+            check(a == e, 60)
+            if a != 0 as u32 { keys_hit = keys_hit + 1 }
+            if a == 2 as u32 { kc = kc + 1 }
+        } else if op < 76 as u64 {
+            let first: usize = (rnd() % 12 as u64) as usize
+            let len: usize = (rnd() % 8 as u64) as usize
+            var cn: usize = (rnd() % 10 as u64) as usize
+            if rnd() % 60 as u64 == 0 as u64 { cn = 40 }
+            var j: usize = 0
+            while j < cn {
+                rc[j] = 100 as u32 + (rnd() % 50 as u64) as u32
+                rf[j] = (rnd() % 64 as u64) as u32
+                j = j + 1
+            }
+            var fp: u64 = (&rf[0]) as u64
+            if rnd() % 3 as u64 == 0 as u64 { fp = 0 as u64 }
+            let caret: usize = (rnd() % 14 as u64) as usize
+            textcore.text_preedit_replace(&t, first, len, (&rc[0]) as u64, cn, fp, caret)
+            m_replace(&m, first, len, (&rc[0]) as u64, cn, fp, caret, &ml)
+        } else if op < 84 as u64 {
+            var cn: usize = (rnd() % 5 as u64) as usize
+            var j: usize = 0
+            while j < cn {
+                rc[j] = 200 as u32 + (rnd() % 50 as u64) as u32
+                j = j + 1
+            }
+            textcore.text_commit(&t, (&rc[0]) as u64, cn)
+            m_commit(&m, (&rc[0]) as u64, cn, &ml)
+            commits = commits + 1
+        } else if op < 90 as u64 {
+            textcore.text_preedit_cancel(&t)
+            m_cancel(&m, &ml)
+        } else if op < 94 as u64 {
+            // finish composing
+            textcore.text_preedit_commit(&t)
+            if m.pn > 0 {
+                var cc: [u32; 256] = [0 as u32; 256]
+                var j: usize = 0
+                while j < m.pn {
+                    cc[j] = m.pre[j]
+                    j = j + 1
+                }
+                let pn: usize = m.pn
+                m_commit(&m, (&cc[0]) as u64, pn, &ml)
+            }
+        } else if op < 98 as u64 {
+            let pos: usize = (rnd() % 14 as u64) as usize
+            textcore.text_preedit_caret(&t, pos)
+            if m.pn > 0 {
+                if pos > m.pn { m.caret = m.pn } else { m.caret = pos }
+                var z: [u32; 1] = [0 as u32; 1]
+                log_add(&ml, textcore.TE_PREEDIT, (&z[0]) as u64, 0)
+            }
+        } else {
+            let on: bool = rnd() % 2 as u64 == 0 as u64
+            textcore.text_set_active(&t, on)
+            if !on { m_cancel(&m, &ml) }
+            m.on = on
+        }
+        drain(&t, &tl)
+        merge_commits(&tl, &tm)
+        merge_commits(&ml, &mm)
+        check(log_eq(&tm, &mm), 61)
+        check(same_state(&t, &m), 62)
+        step = step + 1
+    }
+    check(keys_hit > 2000, 63)
+    check(commits > 1000, 64)
+    check(kc > 500, 65)
+    return 0
+}

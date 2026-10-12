@@ -1,0 +1,613 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/input/textsys.fi -- input.textsys: X11 INPUT METHODS (XIM) for lib/input/textcore. Linux twin; the Windows twin is
+// textsys.windows.fi (IMM32).
+//
+//     import input.textcore
+//     import input.textsys
+//
+//     var t: textcore.Text = textcore.text_new()
+//     var s: textsys.TextSys = textsys.sys_new()          // both variables must NOT move after sys_open
+//     if textsys.sys_open(&s, &t) {                       // else: no XIM -> use textcore.text_key on EV_KEY keysyms
+//         ...
+//         // every EV_RAWKEY / EV_RAWKEY_UP of the window (ev_a = Linux scancode, ev_state = modifiers):
+//         let eaten: bool = textsys.sys_key(&s, &t, down, scancode + 8, xstate, time_ms)
+//         textsys.sys_pump(&s, &t)                        // events the input method sent on its own (commit from ibus ...)
+//         textcore.text_set_spot(&t, caret_x, caret_y, 1, line_h)
+//         textsys.sys_spot(&s, &t)                        // forwards a changed cursor rectangle to the IME
+//         // then read textcore.text_event_next(&t, &ev): TE_PREEDIT / TE_COMMIT ...
+//     }
+//
+// WHY A SECOND CONNECTION. lib/window talks the X11 protocol by itself (no Xlib), but XIM is Xlib's: the XIM transport is
+// ClientMessages on a window of the Xlib connection that Xlib created itself, and a window of ours cannot receive them. So:
+// libX11.so.6 by dlopen, a second connection (DISPLAY), one tiny unmapped window of its own as XNClientWindow / XNFocusWindow.
+// The keys of the real window are replayed into that connection as SYNTHETIC XKeyEvents (display, window of the second
+// connection; time/keycode/state of the real event) and go through XFilterEvent: True = the input method took the key (dead
+// key, Compose, a Chinese/Japanese engine ...), False = a plain key -> Xutf8LookupString gives its text.
+// WHAT COMES BACK. The text of a key (or a commit forwarded by the IME as a KeyPress with keycode 0 that arrives on the
+// second connection: sys_pump) -> textcore.text_commit. The pre-edit text: style XIMPreeditCallbacks (preferred) -> the four
+// callbacks below write straight into the Text (XIMPreeditDraw = XIM's replace semantics = text_preedit_replace); with the
+// XIMPreeditNothing fallback the IME draws its own pre-edit window (not in the Text).
+// The locale: setlocale(LC_ALL, "") + XSetLocaleModifiers("") (XMODIFIERS=@im=ibus / fcitx / none). `@im=none` is Xlib's own
+// built-in input method: dead keys + the locale's Compose file, no pre-edit callbacks.
+// NOT proven: any real IME (ibus, fcitx, uim): only Xlib's built-in one, and the callbacks driven by hand-made call data.
+// Calls into Xlib belong on the thread that opened the display (the main thread; see std.dynlib).
+import std.rt
+import std.dynlib
+import input.textcore
+
+export {
+    TextSys, sys_new, sys_open, sys_close, sys_key, sys_pump, sys_spot, sys_focus, sys_ok, sys_style, sys_callbacks, sys_step,
+    sys_fallbacks, sys_last_keysym, sys_last_status, pick_style, code_of3, cb_start, cb_done, cb_draw, cb_caret, sys_callback_code,
+    XIM_PREEDIT_CALLBACKS, XIM_PREEDIT_NOTHING, XIM_PREEDIT_NONE, XIM_STATUS_NOTHING, XIM_STATUS_NONE, XIM_PREEDIT_POSITION,
+    XIM_PREEDIT_AREA, XIM_STATUS_AREA, XIM_STATUS_CALLBACKS,
+}
+
+const XIM_PREEDIT_AREA: u64 = 1
+const XIM_PREEDIT_CALLBACKS: u64 = 2
+const XIM_PREEDIT_POSITION: u64 = 4
+const XIM_PREEDIT_NOTHING: u64 = 8
+const XIM_PREEDIT_NONE: u64 = 16
+const XIM_STATUS_AREA: u64 = 256
+const XIM_STATUS_CALLBACKS: u64 = 512
+const XIM_STATUS_NOTHING: u64 = 1024
+const XIM_STATUS_NONE: u64 = 2048
+
+// offsets of the NUL terminated names inside nbuf
+const N_STYLE: usize = 0 // inputStyle
+const N_CLIENT: usize = 16 // clientWindow
+const N_FOCUS: usize = 32 // focusWindow
+const N_PREATTR: usize = 48 // preeditAttributes
+const N_START: usize = 80 // preeditStartCallback
+const N_DONE: usize = 112 // preeditDoneCallback
+const N_DRAW: usize = 144 // preeditDrawCallback
+const N_CARET: usize = 176 // preeditCaretCallback
+const N_QUERY: usize = 208 // queryInputStyle
+const N_SPOT: usize = 240 // spotLocation
+const N_EMPTY: usize = 256 // ""
+
+struct TextSys {
+    ok: bool,
+    step: u32, // 0 ok, else the step that failed (see sys_open)
+    x11: u64,
+    libc: u64,
+    dpy: u64,
+    win: u64,
+    root: u64,
+    im: u64,
+    ic: u64,
+    style: u64,
+    callbacks: bool,
+    fallbacks: u64, // keys that XIM did not handle and textcore.text_key did
+    spot_fail: bool,
+    // Xlib entry points
+    f_pending: u64,
+    f_next: u64,
+    f_filter: u64,
+    f_lookup: u64,
+    f_flush: u64,
+    f_setvals: u64,
+    f_nested: u64,
+    f_free: u64,
+    f_setfocus: u64,
+    f_unfocus: u64,
+    f_reset: u64,
+    nbuf: [u8; 288],
+    cbs: [u64; 8], // 4 x XIMCallback { client_data, proc }
+    ev: [u64; 24], // XEvent (192 octets)
+    lk: [u8; 256],
+    wake: [u64; 2],
+    last_ks: u32, // keysym / status of the last Xutf8LookupString (diagnostics)
+    last_status: i32,
+}
+
+fn sys_new() -> TextSys {
+    return TextSys { ok: false, step: 0 as u32, x11: 0, libc: 0, dpy: 0, win: 0, root: 0, im: 0, ic: 0, style: 0, callbacks: false,
+        fallbacks: 0, spot_fail: false,
+        f_pending: 0, f_next: 0, f_filter: 0, f_lookup: 0, f_flush: 0, f_setvals: 0, f_nested: 0, f_free: 0, f_setfocus: 0,
+        f_unfocus: 0, f_reset: 0,
+        nbuf: [0 as u8; 288], cbs: [0; 8], ev: [0; 24], lk: [0 as u8; 256], wake: [0; 2], last_ks: 0 as u32, last_status: 0 as i32 }
+}
+
+fn sys_ok(s: *mut TextSys) -> bool { return (*s).ok }
+fn sys_style(s: *mut TextSys) -> u64 { return (*s).style }
+fn sys_callbacks(s: *mut TextSys) -> bool { return (*s).callbacks }
+fn sys_step(s: *mut TextSys) -> u32 { return (*s).step }
+fn sys_fallbacks(s: *mut TextSys) -> u64 { return (*s).fallbacks }
+fn sys_last_keysym(s: *mut TextSys) -> u32 { return (*s).last_ks }
+fn sys_last_status(s: *mut TextSys) -> i32 { return (*s).last_status }
+
+// ---- callbacks (called by Xlib from inside XFilterEvent) ---------------------------------------------------------------
+// `cd` = client_data = the Text. call_data layouts (LP64):
+//   XIMPreeditDrawCallbackStruct { int caret @0; int chg_first @4; int chg_length @8; XIMText *text @16 }
+//   XIMText { unsigned short length @0; XIMFeedback *feedback @8; Bool encoding_is_wchar @16; char *multi_byte / wchar_t *wide @24 }
+//   XIMFeedback = unsigned long (8 octets); wchar_t = 4 octets (UCS-4 on glibc).
+//   XIMPreeditCaretCallbackStruct { int position @0; XIMCaretDirection direction @4; XIMCaretStyle style @8 }
+
+fn cb_start(ic: u64, cd: u64, call: u64) -> i32 {
+    return 0 - 1 // no length limit
+}
+
+fn cb_done(ic: u64, cd: u64, call: u64) -> i32 {
+    textcore.text_preedit_cancel(cd as *mut textcore.Text)
+    return 0
+}
+
+fn nonneg(v: u32) -> usize {
+    if v > 2147483647 as u32 {
+        return 0
+    }
+    return v as usize
+}
+
+fn cb_draw(ic: u64, cd: u64, call: u64) -> i32 {
+    if cd == 0 || call == 0 {
+        return 0
+    }
+    let t: *mut textcore.Text = cd as *mut textcore.Text
+    let caret: usize = nonneg(rt.ld32(call, 0))
+    let first: usize = nonneg(rt.ld32(call, 1))
+    let len: usize = nonneg(rt.ld32(call, 2))
+    let xt: u64 = rt.ld64(call, 2)
+    if xt == 0 {
+        // text == NULL: delete the range
+        textcore.text_preedit_replace(t, first, len, 0 as u64, 0, 0 as u64, caret)
+        return 0
+    }
+    var cps: [u32; 256] = [0 as u32; 256]
+    var fbs: [u32; 256] = [0 as u32; 256]
+    let length: usize = rt.ld16(xt, 0) as usize
+    let fbp: u64 = rt.ld64(xt, 1)
+    let wide: u32 = rt.ld32(xt, 4)
+    let str: u64 = rt.ld64(xt, 3)
+    var n: usize = 0
+    if str != 0 {
+        if wide != 0 as u32 {
+            while n < length && n < 256 {
+                cps[n] = rt.ld32(str, n)
+                n = n + 1
+            }
+        } else {
+            var bytes: usize = 0
+            while bytes < 4096 && rt.ld8(str, bytes) != 0 as u8 {
+                bytes = bytes + 1
+            }
+            n = textcore.utf8_decode(str, bytes, (&cps[0]) as u64, 256)
+        }
+    }
+    var i: usize = 0
+    while i < n {
+        if fbp != 0 {
+            fbs[i] = rt.ld32(fbp, i * 2) // the low half of the 8 octet word
+        } else {
+            fbs[i] = textcore.FB_UNDERLINE
+        }
+        i = i + 1
+    }
+    textcore.text_preedit_replace(t, first, len, (&cps[0]) as u64, n, (&fbs[0]) as u64, caret)
+    return 0
+}
+
+fn cb_caret(ic: u64, cd: u64, call: u64) -> i32 {
+    if cd == 0 || call == 0 {
+        return 0
+    }
+    let t: *mut textcore.Text = cd as *mut textcore.Text
+    let pos: usize = nonneg(rt.ld32(call, 0))
+    let dir: u32 = rt.ld32(call, 1)
+    // 0 forward char, 1 backward char, 8 line start, 9 line end, 10 absolute position; the rest does not move the caret
+    let cur: usize = textcore.text_preedit_caret_pos(t)
+    if dir == 10 as u32 {
+        textcore.text_preedit_caret(t, pos)
+    } else if dir == 0 as u32 {
+        textcore.text_preedit_caret(t, cur + 1)
+    } else if dir == 1 as u32 {
+        if cur > 0 {
+            textcore.text_preedit_caret(t, cur - 1)
+        }
+    } else if dir == 8 as u32 {
+        textcore.text_preedit_caret(t, 0)
+    } else if dir == 9 as u32 {
+        textcore.text_preedit_caret(t, textcore.text_preedit_len(t))
+    }
+    return 0
+}
+
+// A Firn fn value is a pointer to a record whose first word is the code address; C wants the address itself.
+struct Holder3 { f: fn(u64, u64, u64) -> i32 }
+
+fn code_of3(f: fn(u64, u64, u64) -> i32) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut Holder3 = (&roh[0]) as *mut Holder3
+    (*h).f = f
+    return *((roh[0]) as *mut u64)
+}
+
+// 0 start, 1 done, 2 draw, 3 caret: the C address of the callbacks (the tests call them through this, like Xlib does)
+fn sys_callback_code(which: u32) -> u64 {
+    if which == 0 as u32 { return code_of3(cb_start) }
+    if which == 1 as u32 { return code_of3(cb_done) }
+    if which == 2 as u32 { return code_of3(cb_draw) }
+    return code_of3(cb_caret)
+}
+
+// ---- setup ---------------------------------------------------------------------------------------------------------------
+
+fn put_name(s: *mut TextSys, off: usize, name: str) {
+    let n: usize = name.length()
+    var i: usize = 0
+    while i < n && off + i < 287 {
+        (*s).nbuf[off + i] = name.chars(i)
+        i = i + 1
+    }
+    (*s).nbuf[off + i] = 0 as u8
+}
+
+fn nm(s: *mut TextSys, off: usize) -> u64 {
+    return (&(*s).nbuf[0]) as u64 + off as u64
+}
+
+fn c0(f: u64) -> u64 { return dynlib.ci0(f) }
+
+// Choose the XIM input style: pre-edit callbacks first (we draw), then the IME's own pre-edit window, then nothing at all.
+// `supported` = array of `count` words (XIMStyle = unsigned long). 0 = none usable.
+fn pick_style(supported: u64, count: usize) -> u64 {
+    var want: [u64; 6] = [0; 6]
+    want[0] = XIM_PREEDIT_CALLBACKS | XIM_STATUS_NOTHING
+    want[1] = XIM_PREEDIT_CALLBACKS | XIM_STATUS_NONE
+    want[2] = XIM_PREEDIT_NOTHING | XIM_STATUS_NOTHING
+    want[3] = XIM_PREEDIT_NOTHING | XIM_STATUS_NONE
+    want[4] = XIM_PREEDIT_NONE | XIM_STATUS_NOTHING
+    want[5] = XIM_PREEDIT_NONE | XIM_STATUS_NONE
+    var w: usize = 0
+    while w < 6 {
+        var i: usize = 0
+        while i < count {
+            if rt.ld64(supported, i) == want[w] {
+                return want[w]
+            }
+            i = i + 1
+        }
+        w = w + 1
+    }
+    return 0 as u64
+}
+
+// Open the second connection, the input window and the input method / context. Steps that can fail (sys_step):
+// 1 no libX11, 2 no locale support, 3 no display, 4 no input method, 5 no usable style, 6 no context.
+fn sys_open(s: *mut TextSys, t: *mut textcore.Text) -> bool {
+    (*s).ok = false
+    put_name(s, N_STYLE, "inputStyle")
+    put_name(s, N_CLIENT, "clientWindow")
+    put_name(s, N_FOCUS, "focusWindow")
+    put_name(s, N_PREATTR, "preeditAttributes")
+    put_name(s, N_START, "preeditStartCallback")
+    put_name(s, N_DONE, "preeditDoneCallback")
+    put_name(s, N_DRAW, "preeditDrawCallback")
+    put_name(s, N_CARET, "preeditCaretCallback")
+    put_name(s, N_QUERY, "queryInputStyle")
+    put_name(s, N_SPOT, "spotLocation")
+    put_name(s, N_EMPTY, "")
+    (*s).x11 = dynlib.open("libX11.so.6")
+    if (*s).x11 == 0 {
+        (*s).step = 1 as u32
+        return false
+    }
+    (*s).libc = dynlib.open("libc.so.6")
+    let f_setlocale: u64 = dynlib.sym((*s).libc, "setlocale")
+    if f_setlocale != 0 {
+        dynlib.ci2(f_setlocale, 6, nm(s, N_EMPTY)) // LC_ALL
+    }
+    let x: u64 = (*s).x11
+    let f_supports: u64 = dynlib.sym(x, "XSupportsLocale")
+    let f_mods: u64 = dynlib.sym(x, "XSetLocaleModifiers")
+    let f_open: u64 = dynlib.sym(x, "XOpenDisplay")
+    let f_root: u64 = dynlib.sym(x, "XDefaultRootWindow")
+    let f_mk: u64 = dynlib.sym(x, "XCreateSimpleWindow")
+    let f_oim: u64 = dynlib.sym(x, "XOpenIM")
+    let f_getim: u64 = dynlib.sym(x, "XGetIMValues")
+    let f_mkic: u64 = dynlib.sym(x, "XCreateIC")
+    (*s).f_pending = dynlib.sym(x, "XPending")
+    (*s).f_next = dynlib.sym(x, "XNextEvent")
+    (*s).f_filter = dynlib.sym(x, "XFilterEvent")
+    (*s).f_lookup = dynlib.sym(x, "Xutf8LookupString")
+    (*s).f_flush = dynlib.sym(x, "XFlush")
+    (*s).f_setvals = dynlib.sym(x, "XSetICValues")
+    (*s).f_nested = dynlib.sym(x, "XVaCreateNestedList")
+    (*s).f_free = dynlib.sym(x, "XFree")
+    (*s).f_setfocus = dynlib.sym(x, "XSetICFocus")
+    (*s).f_unfocus = dynlib.sym(x, "XUnsetICFocus")
+    (*s).f_reset = dynlib.sym(x, "Xutf8ResetIC")
+    if f_supports == 0 || f_mods == 0 || f_open == 0 || f_root == 0 || f_mk == 0 || f_oim == 0 || f_getim == 0 || f_mkic == 0
+        || (*s).f_pending == 0 || (*s).f_next == 0 || (*s).f_filter == 0 || (*s).f_lookup == 0 || (*s).f_setvals == 0
+        || (*s).f_nested == 0 {
+        (*s).step = 1 as u32
+        return false
+    }
+    if (dynlib.ci0(f_supports) & 255) == 0 {
+        (*s).step = 2 as u32
+        return false
+    }
+    dynlib.ci1(f_mods, nm(s, N_EMPTY)) // XMODIFIERS (@im=...)
+    (*s).dpy = dynlib.ci1(f_open, 0)
+    if (*s).dpy == 0 {
+        (*s).step = 3 as u32
+        return false
+    }
+    (*s).root = dynlib.ci1(f_root, (*s).dpy)
+    var a: [u64; 12] = [0; 12]
+    a[0] = (*s).dpy
+    a[1] = (*s).root
+    a[4] = 1
+    a[5] = 1
+    (*s).win = dynlib.callx(f_mk, "iiiiiiiii", (&a[0]) as u64, false)
+    (*s).im = dynlib.ci4(f_oim, (*s).dpy, 0, 0, 0)
+    if (*s).im == 0 {
+        (*s).step = 4 as u32
+        return false
+    }
+    // the styles the method offers: XIMStyles { unsigned short count_styles @0; XIMStyle *supported_styles @8 }
+    var styles: [u64; 2] = [0; 2]
+    dynlib.ci4(f_getim, (*s).im, nm(s, N_QUERY), (&styles[0]) as u64, 0)
+    if styles[0] == 0 {
+        (*s).step = 5 as u32
+        return false
+    }
+    let count: usize = rt.ld16(styles[0], 0) as usize
+    (*s).style = pick_style(rt.ld64(styles[0], 1), count)
+    if (*s).f_free != 0 {
+        dynlib.ci1((*s).f_free, styles[0])
+    }
+    if (*s).style == 0 as u64 {
+        (*s).step = 5 as u32
+        return false
+    }
+    (*s).callbacks = ((*s).style & XIM_PREEDIT_CALLBACKS) != 0 as u64
+    var b: [u64; 12] = [0; 12]
+    if (*s).callbacks {
+        var k: usize = 0
+        while k < 4 {
+            (*s).cbs[k * 2] = t as u64
+            (*s).cbs[k * 2 + 1] = sys_callback_code(k as u32)
+            k = k + 1
+        }
+        // XVaCreateNestedList(0, name, &cb, ..., NULL)
+        b[0] = 0
+        b[1] = nm(s, N_START)
+        b[2] = (&(*s).cbs[0]) as u64
+        b[3] = nm(s, N_DONE)
+        b[4] = (&(*s).cbs[2]) as u64
+        b[5] = nm(s, N_DRAW)
+        b[6] = (&(*s).cbs[4]) as u64
+        b[7] = nm(s, N_CARET)
+        b[8] = (&(*s).cbs[6]) as u64
+        b[9] = 0
+        let nested: u64 = dynlib.callx((*s).f_nested, "iiiiiiiiii", (&b[0]) as u64, false)
+        // XCreateIC(im, XNInputStyle, style, XNClientWindow, win, XNFocusWindow, win, XNPreeditAttributes, nested, NULL)
+        var c: [u64; 12] = [0; 12]
+        c[0] = (*s).im
+        c[1] = nm(s, N_STYLE)
+        c[2] = (*s).style
+        c[3] = nm(s, N_CLIENT)
+        c[4] = (*s).win
+        c[5] = nm(s, N_FOCUS)
+        c[6] = (*s).win
+        c[7] = nm(s, N_PREATTR)
+        c[8] = nested
+        c[9] = 0
+        (*s).ic = dynlib.callx(f_mkic, "iiiiiiiiii", (&c[0]) as u64, false)
+        if (*s).f_free != 0 && nested != 0 {
+            dynlib.ci1((*s).f_free, nested)
+        }
+    } else {
+        var c: [u64; 12] = [0; 12]
+        c[0] = (*s).im
+        c[1] = nm(s, N_STYLE)
+        c[2] = (*s).style
+        c[3] = nm(s, N_CLIENT)
+        c[4] = (*s).win
+        c[5] = nm(s, N_FOCUS)
+        c[6] = (*s).win
+        c[7] = 0
+        (*s).ic = dynlib.callx(f_mkic, "iiiiiiii", (&c[0]) as u64, false)
+    }
+    if (*s).ic == 0 {
+        (*s).step = 6 as u32
+        return false
+    }
+    if (*s).f_setfocus != 0 {
+        dynlib.ci1((*s).f_setfocus, (*s).ic)
+    }
+    (*s).step = 0 as u32
+    (*s).ok = true
+    return true
+}
+
+fn sys_close(s: *mut TextSys) {
+    if !(*s).ok && (*s).dpy == 0 {
+        return
+    }
+    let x: u64 = (*s).x11
+    if (*s).ic != 0 {
+        dynlib.ci1(dynlib.sym(x, "XDestroyIC"), (*s).ic)
+    }
+    if (*s).im != 0 {
+        dynlib.ci1(dynlib.sym(x, "XCloseIM"), (*s).im)
+    }
+    if (*s).dpy != 0 && (*s).win != 0 {
+        dynlib.ci2(dynlib.sym(x, "XDestroyWindow"), (*s).dpy, (*s).win)
+    }
+    if (*s).dpy != 0 {
+        dynlib.ci1(dynlib.sym(x, "XCloseDisplay"), (*s).dpy)
+    }
+    (*s).ic = 0
+    (*s).im = 0
+    (*s).win = 0
+    (*s).dpy = 0
+    (*s).ok = false
+}
+
+// ---- keys ----------------------------------------------------------------------------------------------------------------
+
+// The text of a KeyPress for the context (Xutf8LookupString) -> commit; returns the keysym (0 = none) and whether text came.
+fn lookup_commit(s: *mut TextSys, t: *mut textcore.Text, got_text: *mut bool) -> u32 {
+    var ks: [u64; 1] = [0; 1]
+    var st: [i32; 2] = [0 as i32; 2]
+    var a: [u64; 6] = [0; 6]
+    a[0] = (*s).ic
+    a[1] = (&(*s).ev[0]) as u64
+    a[2] = (&(*s).lk[0]) as u64
+    a[3] = 255
+    a[4] = (&ks[0]) as u64
+    a[5] = (&st[0]) as u64
+    let n: u64 = dynlib.callx((*s).f_lookup, "iiiiii", (&a[0]) as u64, false) & 4294967295
+    *got_text = false
+    (*s).last_status = st[0]
+    (*s).last_ks = (ks[0] & 4294967295) as u32
+    // XLookupChars 2 / XLookupBoth 4 carry text; XBufferOverflow -1 carries none
+    if (st[0] == 2 as i32 || st[0] == 4 as i32) && n > 0 && n < 256 {
+        // a lone control character (Return, BackSpace, Tab, Esc) is a key, not text: the window reports it as EV_KEY
+        let c0v: u8 = (*s).lk[0]
+        if !(n == 1 && (c0v < 32 as u8 || c0v == 127 as u8)) {
+            textcore.text_commit_utf8(t, (&(*s).lk[0]) as u64, n as usize)
+            *got_text = true
+        }
+    }
+    if st[0] == 3 as i32 || st[0] == 4 as i32 {
+        return (ks[0] & 4294967295) as u32
+    }
+    return 0 as u32
+}
+
+// Replay one key of the real window into the input method. `down`: press or release; `keycode`: the X11 keycode (Linux
+// scancode + 8); `state`: the X modifier mask (Shift 1, Lock 2, Control 4, Mod1 8 ... plus the group in bits 13-14);
+// `time_ms`: the event time. True = the input method (or its built-in compose) took the key: do not use it as a character
+// or shortcut. False = it is a plain key (any text it produces was already queued as TE_COMMIT).
+fn sys_key(s: *mut TextSys, t: *mut textcore.Text, down: bool, keycode: u32, state: u32, time_ms: u32) -> bool {
+    if !(*s).ok || !textcore.text_active(t) {
+        return false
+    }
+    // XKeyEvent: type @0 (int), serial @8, send_event @16, display @24, window @32, root @40, subwindow @48, time @56,
+    // x @64, y @68, x_root @72, y_root @76, state @80, keycode @84, same_screen @88
+    var i: usize = 0
+    while i < 24 {
+        (*s).ev[i] = 0
+        i = i + 1
+    }
+    let e: u64 = (&(*s).ev[0]) as u64
+    if down {
+        rt.st32(e, 0, 2 as u32)
+    } else {
+        rt.st32(e, 0, 3 as u32)
+    }
+    rt.st64(e, 3, (*s).dpy)
+    rt.st64(e, 4, (*s).win)
+    rt.st64(e, 5, (*s).root)
+    rt.st64(e, 7, time_ms as u64)
+    rt.st32(e, 20, state)
+    rt.st32(e, 21, keycode)
+    rt.st32(e, 22, 1 as u32)
+    let filtered: bool = (dynlib.ci2((*s).f_filter, e, 0) & 255) != 0
+    if filtered {
+        return true
+    }
+    if !down {
+        return false
+    }
+    var got: bool = false
+    let ks: u32 = lookup_commit(s, t, &got)
+    if got {
+        return false
+    }
+    // no text from the input method: dead keys / Compose it does not know are the engine's job
+    if ks != 0 as u32 && (textcore.text_composing(t) || textcore.dead_index(ks) < 16 as u32 || ks == textcore.KS_MULTI_KEY) {
+        var mods: u32 = 0 as u32
+        if (state & 1 as u32) != 0 as u32 { mods = mods | textcore.MOD_SHIFT }
+        if (state & 4 as u32) != 0 as u32 { mods = mods | textcore.MOD_CTRL }
+        if (state & 8 as u32) != 0 as u32 { mods = mods | textcore.MOD_ALT }
+        let r: u32 = textcore.text_key(t, ks, mods)
+        if r != textcore.KR_PASS {
+            (*s).fallbacks = (*s).fallbacks + 1 as u64
+            return true
+        }
+    }
+    return false
+}
+
+// Events that arrived on the second connection by themselves (the commit of an IME comes as a KeyPress with keycode 0).
+fn sys_pump(s: *mut TextSys, t: *mut textcore.Text) {
+    if !(*s).ok {
+        return
+    }
+    var guard: usize = 0
+    while guard < 256 && (dynlib.ci1((*s).f_pending, (*s).dpy) & 4294967295) > 0 as u64 {
+        dynlib.ci2((*s).f_next, (*s).dpy, (&(*s).ev[0]) as u64)
+        let e: u64 = (&(*s).ev[0]) as u64
+        let typ: u32 = rt.ld32(e, 0)
+        let filtered: bool = (dynlib.ci2((*s).f_filter, e, 0) & 255) != 0
+        if !filtered && typ == 2 as u32 {
+            var got: bool = false
+            lookup_commit(s, t, &got)
+        }
+        guard = guard + 1
+    }
+}
+
+// The cursor rectangle changed (textcore.text_set_spot): tell the input method. XNSpotLocation takes the POINT where the
+// candidate window may appear (the bottom-left of the caret).
+fn sys_spot(s: *mut TextSys, t: *mut textcore.Text) {
+    if !(*s).ok || (*s).spot_fail || (*s).f_setvals == 0 {
+        return
+    }
+    var r: [i32; 4] = [0 as i32; 4]
+    if !textcore.text_spot_take(t, &r) {
+        return
+    }
+    var pt: [i16; 2] = [0 as i16; 2]
+    var px: i32 = r[0]
+    var py: i32 = r[1] + r[3]
+    if px < 0 as i32 { px = 0 as i32 }
+    if py < 0 as i32 { py = 0 as i32 }
+    if px > 32000 as i32 { px = 32000 as i32 }
+    if py > 32000 as i32 { py = 32000 as i32 }
+    pt[0] = px as i16
+    pt[1] = py as i16
+    var b: [u64; 4] = [0; 4]
+    b[0] = 0
+    b[1] = nm(s, N_SPOT)
+    b[2] = (&pt[0]) as u64
+    b[3] = 0
+    let nested: u64 = dynlib.callx((*s).f_nested, "iiii", (&b[0]) as u64, false)
+    if nested == 0 {
+        return
+    }
+    var c: [u64; 4] = [0; 4]
+    c[0] = (*s).ic
+    c[1] = nm(s, N_PREATTR)
+    c[2] = nested
+    c[3] = 0
+    // returns NULL when it worked, else the name of the first value that failed
+    let bad: u64 = dynlib.callx((*s).f_setvals, "iiii", (&c[0]) as u64, false)
+    if bad != 0 {
+        (*s).spot_fail = true
+    }
+    if (*s).f_free != 0 {
+        dynlib.ci1((*s).f_free, nested)
+    }
+    if (*s).f_flush != 0 {
+        dynlib.ci1((*s).f_flush, (*s).dpy)
+    }
+}
+
+// The text field got (true) or lost (false) the keyboard focus.
+fn sys_focus(s: *mut TextSys, t: *mut textcore.Text, on: bool) {
+    textcore.text_set_active(t, on)
+    if !(*s).ok {
+        return
+    }
+    if on {
+        if (*s).f_setfocus != 0 { dynlib.ci1((*s).f_setfocus, (*s).ic) }
+    } else {
+        if (*s).f_reset != 0 { dynlib.ci1((*s).f_reset, (*s).ic) }
+        if (*s).f_unfocus != 0 { dynlib.ci1((*s).f_unfocus, (*s).ic) }
+    }
+}
