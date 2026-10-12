@@ -80,3 +80,16 @@ Fix `compiler/src/regalloc.rs` (Sqrt/Bits stay in the register path) built and v
 * `tools/mc/raster/run.sh` and `tools/mc/sky/run.sh`: all scenes bit-identical (hashes), counter-checks fire.
 * 102 float-using tests (tests/*.fi, tests/opt) x release-fast / release-safe / dev-fast: 306 runs, 0 failures.
 * NOT run: full `test.sh`, cargo test, fir/sema compare (front end untouched). Machine was busy (load 8-17); times are min of 5.
+
+## RESULT 2 (2026-10-12, worker gpu-i)
+* Rebuilt `firnc` from main (release): `tools/perf/rf_repro.sh` = no RA-BASE for `shade`, frame 176 B (dev-fast 208 B), min user
+  time dev-fast 1.15 s, release-safe 0.47 s, release-fast 0.41 s, fast-noinline 1.07 s, checksum 602946897 in all 4 stages.
+  `FIRN_RA_WARN=1` on the raster bench at release-fast: the only RA-BASE functions left are the `accel.*` AES/SHA-NI ones
+  (vector instructions outside the narrow set), none in mc_*/math_*. Raster bench (640x360) release-fast: 21-25 ms/frame.
+* Signed `/ 2^L` and `% 2^L` (L <= 30) in the register path: `emit_div_const` now emits shift + sign correction
+  (`mov; sar; shr; add; sar`, remainder via `and -2^L`) instead of the magic-number `imul`. Result: correct (test 2797, identity
+  q*k+r==x at four build levels), but NO measurable speed change on the raster bench (min of 7 interleaved: 21 ms old and new).
+  The remaining `idiv` in the raster bench are divisions by VARIABLES (`atlas_texel` / texture size modulo), not by 256.
+* The pixel loop's `divsd` (zinv = sum / area2f, u/v/ao = (...) / sum) stay: replacing three `/ sum` by one `1/sum` and multiplies changes the
+  rounding (floor of u*tsz can flip), so the images would no longer match `ref.py` bit for bit. The compiler may not do it (IEEE); it is a
+  renderer algorithm change that needs an explicit tolerance decision (see MC-FLOATS section 3).

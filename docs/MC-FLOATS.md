@@ -12,7 +12,7 @@ Instructions per frame = (run with 6 frames - run with 2 frames) / 4, so set-up 
 
 | build | metric | no xmm-ra | xmm-ra | change |
 |---|---|---|---|---|
-| default (release-safe, what `tools/mc/*/run.sh` builds) | raster Ir / frame | 417.30 M | 415.96 M | -0.3 % |
+| default (dev-fast: the CLI default, no inliner; what `tools/mc/*/run.sh` builds) | raster Ir / frame | 417.30 M | 415.96 M | -0.3 % |
 | | sky Ir / iteration (3 scenes) | 82.71 M | 79.84 M | -3.5 % |
 | | sky sunset, median wall | 10.57 ms | 9.61 ms | about -9 % (noise +-10 %) |
 | release-fast | raster Ir / frame | 398.08 M | 396.66 M | -0.4 % |
@@ -24,16 +24,16 @@ and on plain main are equal to within 0.4 % (raster 415.96 M both, sky 79.84 M b
 **Verdict: B3 is on main and works, but it is worth only 0-4 % on the renderer loops.** Why, measured in the emitted
 assembly of `draw_clipped_tri` (the pixel loop):
 
-* default (release-safe): 19 `call mc_raster.ldd`, 4 `call math.floor`, 6 `call math.fabs`, `st32`, `ld32`, `stf` stay REAL
-  calls. The helpers contain overflow-check sites (`jo .Lchksite`), which keeps the inliner away. Floats cannot live in `xmm`
-  registers across a call (all `xmm` are caller-saved), so the allocator has nothing to keep: 196 -> 174 float memory
-  operands only.
-* release-fast: all those calls are inlined (0 calls left), the function grows 2272 -> 2799 lines, and the instruction count
-  drops 5 % -- **but the wall time gets WORSE, by about 60 %** (interleaved runs on the same host, same compiler, six runs
-  each: raster 60-68 ms release-safe against 98-109 ms release-fast; sky sunset 8.2-10.1 ms against 14.4-17.5 ms). Plain main
-  shows the same (raster 95-99 ms release-fast). Fewer instructions, more time: this is a latency / dependency problem of
-  the generated code, not a work problem. Not diagnosed (no `perf` in this VM). It is the biggest open item for the
-  renderer: **the production build of the client should use release-safe until it is understood** (roadmap).
+* default (dev-fast, NOT release-safe -- the CLI default is dev-fast, see docs/RELEASE-FAST-REGRESSION.md): no inliner, so
+  19 `call mc_raster.ldd`, 4 `call math.floor`, 6 `call math.fabs`, `st32`, `ld32`, `stf` stay REAL calls (the `jo` check
+  sites were never the reason). Floats cannot live in `xmm` registers across a call (all `xmm` are caller-saved), so the
+  allocator has nothing to keep: 196 -> 174 float memory operands only.
+* release-fast / release-safe (inliner on): all those calls are inlined, the function grows 2272 -> 2799 lines, the
+  instruction count drops 5 % -- but the wall time was WORSE by about 60 %. **Cause found (12.10.): the inliner pulled
+  `math.floor/fabs/sqrt` (`__bits`/`__sqrt`) into `draw_clipped_tri`, and `regalloc.rs` sent every function containing
+  such an op to the slow base path (12 KB frame, no registers). Fixed on main (28eb2bb3d): release-fast now needs
+  ~25 ms/frame (raster bench 640x360) instead of 121 ms.** Details: docs/RELEASE-FAST-REGRESSION.md. The "use release-safe
+  until it is understood" advice no longer applies; `release-fast` is the production build.
 
 Practical consequence for the client: the speed is in the algorithm (per-pixel `f64` divisions: 9 `divsd` in the pixel
 loop, perspective-correct `u`, `v`, `ao` each divided by `sum`), not in the register allocation. The next step is
@@ -88,7 +88,7 @@ not started.
 
 ## 3. Next
 
-1. Find out why release-fast is 60 % slower than release-safe on these loops (instruction count is lower).
+1. (done 12.10.) release-fast 60 % slower: it was the register allocator's base-path rule, fixed.
 2. Reciprocal-multiply in the pixel loop; then SIMD edge functions.
 3. WASM encodings for the seven kinds (browser client).
 4. `hud_rect` -> `blend_span` (owner of `mc_hud.fi` is another worker; the formula is the same, test against the HUD
