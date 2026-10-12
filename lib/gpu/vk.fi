@@ -1,0 +1,1494 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/vk.fi -- gpu.vk: a small Vulkan 1.0 layer (round gpu-g, docs/GL-VS-VULKAN.md). NOT a renderer yet: loader,
+// instance, device + queue, an offscreen colour target with read back, a graphics pipeline from SPIR-V and a swapchain on
+// an X11 window. Everything goes through std.dynlib (no link-time Vulkan), so a machine without a Vulkan loader gets an
+// honest `ok == false` and `step == STEP_NO_LOADER`.
+//
+//     import gpu.vk
+//     var v: vk.Vk = vk.vk_new()
+//     if !vk.open(&v, false, true) { ... v.step says which step failed ... }     // want_surface, allow_cpu
+//     var t: vk.Target = vk.target_new_blank()
+//     vk.target_new(&v, &t, 320, 180)                                            // RGBA8 colour image + host read back buffer
+//     var p: vk.Pipe = vk.pipe_blank()
+//     vk.pipeline_tri(&v, &p, t.rpass)                                           // the embedded test shaders (spv/tri.*)
+//     var b: vk.Buf = vk.buf_blank()
+//     vk.buf_new(&v, &b, 3 * 20)                                                 // host visible vertex buffer: x y r g b (f32)
+//     vk.draw(&v, &t, &p, &b, 3, 0xFF000000)                                     // render, copy to the buffer, wait
+//     vk.read_pixels(&t, out)                                                    // RGBA octets, row 0 = top
+//
+// Vertex format of `pipeline_tri`: stride 20 = vec2 position in NDC (y down) + vec3 colour. Shaders: lib/gpu/spv/tri.vert/.frag
+// (GLSL 450, SPIR-V committed as .spv; rebuild with lib/gpu/spv/build.sh).
+//
+// Swapchain: `sc_open` (surface of an X11 window by XID: VK_KHR_xlib_surface or VK_KHR_xcb_surface, see vkplat.fi),
+// `sc_frame` (acquire, render, submit, present, wait), `sc_resize`, `sc_close`.
+//
+// Struct layouts are written by byte offset (x86_64 / the Vulkan 1.0 headers); the offsets are checked by the tests.
+// THREADS: main thread only (docs/FFI.md, glibc TLS). Vulkan 1.0 core only, no validation layer, no allocator callbacks.
+
+import std.rt
+import std.dynlib
+import gpu.vkplat
+
+export {
+    Vk, Target, Pipe, Buf, Sc, vk_new, target_new_blank, pipe_blank, buf_blank, sc_blank,
+    open, close, idle, device_name, is_cpu, device_type, api_version, has_surface_ext, has_swapchain, mem_type,
+    target_new, target_free, read_pixels, pipeline_tri, pipeline_new, pipeline_free,
+    buf_new, buf_write, buf_free, draw,
+    sc_open, sc_resize, sc_frame, sc_close, window_pixels,
+    STEP_NO_LOADER, STEP_NO_SYMBOL, STEP_NO_INSTANCE, STEP_NO_DEVICE, STEP_NO_QUEUE, STEP_NO_LOGICAL, STEP_NO_POOL,
+    DEV_OTHER, DEV_INTEGRATED, DEV_DISCRETE, DEV_VIRTUAL, DEV_CPU,
+    FRAME_OK, FRAME_RESIZE, FRAME_ERROR,
+}
+
+const STEP_NO_LOADER: i32 = 1
+const STEP_NO_SYMBOL: i32 = 2
+const STEP_NO_INSTANCE: i32 = 3
+const STEP_NO_DEVICE: i32 = 4
+const STEP_NO_QUEUE: i32 = 5
+const STEP_NO_LOGICAL: i32 = 6
+const STEP_NO_POOL: i32 = 7
+
+const DEV_OTHER: i32 = 0
+const DEV_INTEGRATED: i32 = 1
+const DEV_DISCRETE: i32 = 2
+const DEV_VIRTUAL: i32 = 3
+const DEV_CPU: i32 = 4
+
+const FRAME_OK: i32 = 0
+const FRAME_RESIZE: i32 = 1
+const FRAME_ERROR: i32 = 2
+
+const TRI_VS: str = __include_str("spv/tri.vert.spv")
+const TRI_FS: str = __include_str("spv/tri.frag.spv")
+
+// ---- function table (index = what the code below calls) ------------------------------------------------------
+const F_CREATE_INSTANCE: usize = 0
+const F_ENUM_INST_EXT: usize = 1
+const F_DESTROY_INSTANCE: usize = 2
+const F_ENUM_PHYS: usize = 3
+const F_PHYS_PROPS: usize = 4
+const F_QUEUE_PROPS: usize = 5
+const F_MEM_PROPS: usize = 6
+const F_CREATE_DEVICE: usize = 7
+const F_ENUM_DEV_EXT: usize = 8
+const F_SURF_SUPPORT: usize = 9
+const F_SURF_CAPS: usize = 10
+const F_SURF_FMTS: usize = 11
+const F_DESTROY_SURFACE: usize = 12
+const F_DESTROY_DEVICE: usize = 13
+const F_GET_QUEUE: usize = 14
+const F_CREATE_POOL: usize = 15
+const F_DESTROY_POOL: usize = 16
+const F_ALLOC_CMD: usize = 17
+const F_CREATE_FENCE: usize = 18
+const F_DESTROY_FENCE: usize = 19
+const F_WAIT_FENCES: usize = 20
+const F_RESET_FENCES: usize = 21
+const F_CREATE_SEM: usize = 22
+const F_DESTROY_SEM: usize = 23
+const F_CREATE_IMAGE: usize = 24
+const F_DESTROY_IMAGE: usize = 25
+const F_IMG_REQ: usize = 26
+const F_ALLOC_MEM: usize = 27
+const F_FREE_MEM: usize = 28
+const F_BIND_IMG: usize = 29
+const F_CREATE_VIEW: usize = 30
+const F_DESTROY_VIEW: usize = 31
+const F_CREATE_BUFFER: usize = 32
+const F_DESTROY_BUFFER: usize = 33
+const F_BUF_REQ: usize = 34
+const F_BIND_BUF: usize = 35
+const F_MAP: usize = 36
+const F_UNMAP: usize = 37
+const F_CREATE_RP: usize = 38
+const F_DESTROY_RP: usize = 39
+const F_CREATE_FB: usize = 40
+const F_DESTROY_FB: usize = 41
+const F_CREATE_SHADER: usize = 42
+const F_DESTROY_SHADER: usize = 43
+const F_CREATE_PLAYOUT: usize = 44
+const F_DESTROY_PLAYOUT: usize = 45
+const F_CREATE_GPIPE: usize = 46
+const F_DESTROY_PIPE: usize = 47
+const F_BEGIN_CMD: usize = 48
+const F_END_CMD: usize = 49
+const F_RESET_CMD: usize = 50
+const F_CMD_BEGIN_RP: usize = 51
+const F_CMD_END_RP: usize = 52
+const F_CMD_BIND_PIPE: usize = 53
+const F_CMD_BIND_VB: usize = 54
+const F_CMD_DRAW: usize = 55
+const F_CMD_SET_VP: usize = 56
+const F_CMD_SET_SC: usize = 57
+const F_CMD_COPY_I2B: usize = 58
+const F_SUBMIT: usize = 59
+const F_QWAIT: usize = 60
+const F_DEV_WAIT: usize = 61
+const F_CREATE_SC: usize = 62
+const F_DESTROY_SC: usize = 63
+const F_GET_SC_IMAGES: usize = 64
+const F_ACQUIRE: usize = 65
+const F_PRESENT: usize = 66
+const F_COUNT: usize = 72
+
+const SCRATCH: usize = 16384
+
+struct Vk {
+    ok: bool,
+    step: i32, // 0 = ok, else STEP_*
+    lib: u64, // libvulkan handle
+    gipa: u64, // vkGetInstanceProcAddr
+    ft: u64, // function table (F_COUNT u64)
+    scratch: u64, // SCRATCH bytes for the structs of one call sequence
+    top: usize,
+    inst: u64,
+    phys: u64,
+    dev: u64,
+    queue: u64,
+    qfam: u64,
+    pool: u64,
+    cmd: u64,
+    fence: u64,
+    dev_type: i32,
+    api_ver: u64,
+    vendor: u64,
+    name: u64, // 256 octets, NUL terminated
+    mprops: u64, // VkPhysicalDeviceMemoryProperties (520 octets)
+    ext_mask: u64, // instance surface extensions enabled (bit i = vkplat.surface_ext_name(i))
+    swapchain: bool, // VK_KHR_swapchain enabled on the device
+    plat: vkplat.PlatState,
+}
+
+struct Target {
+    ok: bool,
+    w: i32,
+    h: i32,
+    image: u64,
+    mem: u64,
+    view: u64,
+    rpass: u64,
+    fb: u64,
+    rbuf: u64, // read back buffer (host visible, coherent)
+    rmem: u64,
+    rptr: u64, // mapped rbuf
+}
+
+struct Pipe {
+    ok: bool,
+    pipe: u64,
+    layout: u64,
+    vs: u64,
+    fs: u64,
+}
+
+struct Buf {
+    ok: bool,
+    buf: u64,
+    mem: u64,
+    ptr: u64,
+    size: usize,
+}
+
+struct Sc {
+    ok: bool,
+    surface: u64,
+    chain: u64,
+    fmt: u64,
+    w: i32,
+    h: i32,
+    n: u64, // image count
+    images: u64,
+    views: u64,
+    fbs: u64,
+    rpass: u64,
+    sem_acq: u64,
+    sem_done: u64,
+    xid: u64,
+    mode: i32, // 0 xlib, 1 xcb
+    frames: u64,
+}
+
+fn vk_new() -> Vk {
+    return Vk { ok: false, step: 0, lib: 0, gipa: 0, ft: 0, scratch: 0, top: 0, inst: 0, phys: 0, dev: 0, queue: 0, qfam: 0,
+        pool: 0, cmd: 0, fence: 0, dev_type: 0, api_ver: 0, vendor: 0, name: 0, mprops: 0, ext_mask: 0, swapchain: false,
+        plat: vkplat.plat_new() }
+}
+
+fn target_new_blank() -> Target {
+    return Target { ok: false, w: 0, h: 0, image: 0, mem: 0, view: 0, rpass: 0, fb: 0, rbuf: 0, rmem: 0, rptr: 0 }
+}
+
+fn pipe_blank() -> Pipe {
+    return Pipe { ok: false, pipe: 0, layout: 0, vs: 0, fs: 0 }
+}
+
+fn buf_blank() -> Buf {
+    return Buf { ok: false, buf: 0, mem: 0, ptr: 0, size: 0 }
+}
+
+fn sc_blank() -> Sc {
+    return Sc { ok: false, surface: 0, chain: 0, fmt: 0, w: 0, h: 0, n: 0, images: 0, views: 0, fbs: 0, rpass: 0, sem_acq: 0,
+        sem_done: 0, xid: 0, mode: 0, frames: 0 }
+}
+
+// ---- raw access helpers --------------------------------------------------------------------------------------
+fn w32(p: u64, off: usize, x: u64) {
+    rt.st32(p, off / 4, x as u32)
+}
+
+fn w64(p: u64, off: usize, x: u64) {
+    rt.st64(p, off / 8, x)
+}
+
+fn wf(p: u64, off: usize, x: f64) {
+    rt.st32(p, off / 4, __bits(x as f32) as u32)
+}
+
+fn r32(p: u64, off: usize) -> u64 {
+    return rt.ld32(p, off / 4) as u64
+}
+
+fn r64(p: u64, off: usize) -> u64 {
+    return rt.ld64(p, off / 8)
+}
+
+fn good(r: u64) -> bool {
+    return (r & 0xFFFFFFFF) == 0
+}
+
+// zeroed scratch bytes (valid until the next stage resets `top`)
+fn sa(v: *mut Vk, n: usize) -> u64 {
+    let p: u64 = (*v).scratch + ((*v).top as u64)
+    let m: usize = (n + 15) / 16 * 16
+    if (*v).top + m > SCRATCH {
+        return (*v).scratch
+    }
+    rt.mem_set(p, 0 as u8, m)
+    (*v).top = (*v).top + m
+    return p
+}
+
+fn cstr(v: *mut Vk, s: str) -> u64 {
+    let n: usize = s.length()
+    let p: u64 = sa(v, n + 1)
+    var i: usize = 0
+    while i < n {
+        rt.st8(p, i, s.chars(i))
+        i = i + 1
+    }
+    return p
+}
+
+fn fn_at(v: *mut Vk, i: usize) -> u64 {
+    return rt.ld64((*v).ft, i)
+}
+
+fn call(f: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    var a: [u64; 8] = [0; 8]
+    a[0] = a0
+    a[1] = a1
+    a[2] = a2
+    a[3] = a3
+    a[4] = a4
+    a[5] = a5
+    return dynlib.callx(f, "iiiiii", (&a[0]) as u64, false)
+}
+
+// call function table entry `i` (up to 6 integer / pointer arguments)
+fn c(v: *mut Vk, i: usize, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    return call(fn_at(v, i), a0, a1, a2, a3, a4, a5)
+}
+
+// global symbol straight out of the loader library
+fn gsym(v: *mut Vk, i: usize, name: str) -> bool {
+    let p: u64 = dynlib.sym((*v).lib, name)
+    rt.st64((*v).ft, i, p)
+    return p != 0
+}
+
+// instance / device level entry point through vkGetInstanceProcAddr(inst, name)
+fn isym(v: *mut Vk, i: usize, name: str) -> bool {
+    let p: u64 = call((*v).gipa, (*v).inst, cstr(v, name), 0, 0, 0, 0)
+    rt.st64((*v).ft, i, p)
+    return p != 0
+}
+
+fn ext_found(props: u64, n: u64, name: str) -> bool {
+    let len: usize = name.length()
+    var i: u64 = 0
+    while i < n {
+        let b: u64 = props + i * 260
+        var same: bool = true
+        var k: usize = 0
+        while k < len {
+            if rt.ld8(b, k) != name.chars(k) {
+                same = false
+                k = len
+            } else {
+                k = k + 1
+            }
+        }
+        if same && rt.ld8(b, len) == (0 as u8) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ---- open ----------------------------------------------------------------------------------------------------
+fn load_instance_level(v: *mut Vk) -> bool {
+    var ok: bool = true
+    if !isym(v, F_DESTROY_INSTANCE, "vkDestroyInstance") { ok = false }
+    if !isym(v, F_ENUM_PHYS, "vkEnumeratePhysicalDevices") { ok = false }
+    if !isym(v, F_PHYS_PROPS, "vkGetPhysicalDeviceProperties") { ok = false }
+    if !isym(v, F_QUEUE_PROPS, "vkGetPhysicalDeviceQueueFamilyProperties") { ok = false }
+    if !isym(v, F_MEM_PROPS, "vkGetPhysicalDeviceMemoryProperties") { ok = false }
+    if !isym(v, F_CREATE_DEVICE, "vkCreateDevice") { ok = false }
+    if !isym(v, F_ENUM_DEV_EXT, "vkEnumerateDeviceExtensionProperties") { ok = false }
+    // surface functions only exist when the extension is enabled (0 otherwise)
+    isym(v, F_SURF_SUPPORT, "vkGetPhysicalDeviceSurfaceSupportKHR")
+    isym(v, F_SURF_CAPS, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
+    isym(v, F_SURF_FMTS, "vkGetPhysicalDeviceSurfaceFormatsKHR")
+    isym(v, F_DESTROY_SURFACE, "vkDestroySurfaceKHR")
+    return ok
+}
+
+fn load_device_level(v: *mut Vk) -> bool {
+    var ok: bool = true
+    if !isym(v, F_DESTROY_DEVICE, "vkDestroyDevice") { ok = false }
+    if !isym(v, F_GET_QUEUE, "vkGetDeviceQueue") { ok = false }
+    if !isym(v, F_CREATE_POOL, "vkCreateCommandPool") { ok = false }
+    if !isym(v, F_DESTROY_POOL, "vkDestroyCommandPool") { ok = false }
+    if !isym(v, F_ALLOC_CMD, "vkAllocateCommandBuffers") { ok = false }
+    if !isym(v, F_CREATE_FENCE, "vkCreateFence") { ok = false }
+    if !isym(v, F_DESTROY_FENCE, "vkDestroyFence") { ok = false }
+    if !isym(v, F_WAIT_FENCES, "vkWaitForFences") { ok = false }
+    if !isym(v, F_RESET_FENCES, "vkResetFences") { ok = false }
+    if !isym(v, F_CREATE_SEM, "vkCreateSemaphore") { ok = false }
+    if !isym(v, F_DESTROY_SEM, "vkDestroySemaphore") { ok = false }
+    if !isym(v, F_CREATE_IMAGE, "vkCreateImage") { ok = false }
+    if !isym(v, F_DESTROY_IMAGE, "vkDestroyImage") { ok = false }
+    if !isym(v, F_IMG_REQ, "vkGetImageMemoryRequirements") { ok = false }
+    if !isym(v, F_ALLOC_MEM, "vkAllocateMemory") { ok = false }
+    if !isym(v, F_FREE_MEM, "vkFreeMemory") { ok = false }
+    if !isym(v, F_BIND_IMG, "vkBindImageMemory") { ok = false }
+    if !isym(v, F_CREATE_VIEW, "vkCreateImageView") { ok = false }
+    if !isym(v, F_DESTROY_VIEW, "vkDestroyImageView") { ok = false }
+    if !isym(v, F_CREATE_BUFFER, "vkCreateBuffer") { ok = false }
+    if !isym(v, F_DESTROY_BUFFER, "vkDestroyBuffer") { ok = false }
+    if !isym(v, F_BUF_REQ, "vkGetBufferMemoryRequirements") { ok = false }
+    if !isym(v, F_BIND_BUF, "vkBindBufferMemory") { ok = false }
+    if !isym(v, F_MAP, "vkMapMemory") { ok = false }
+    if !isym(v, F_UNMAP, "vkUnmapMemory") { ok = false }
+    if !isym(v, F_CREATE_RP, "vkCreateRenderPass") { ok = false }
+    if !isym(v, F_DESTROY_RP, "vkDestroyRenderPass") { ok = false }
+    if !isym(v, F_CREATE_FB, "vkCreateFramebuffer") { ok = false }
+    if !isym(v, F_DESTROY_FB, "vkDestroyFramebuffer") { ok = false }
+    if !isym(v, F_CREATE_SHADER, "vkCreateShaderModule") { ok = false }
+    if !isym(v, F_DESTROY_SHADER, "vkDestroyShaderModule") { ok = false }
+    if !isym(v, F_CREATE_PLAYOUT, "vkCreatePipelineLayout") { ok = false }
+    if !isym(v, F_DESTROY_PLAYOUT, "vkDestroyPipelineLayout") { ok = false }
+    if !isym(v, F_CREATE_GPIPE, "vkCreateGraphicsPipelines") { ok = false }
+    if !isym(v, F_DESTROY_PIPE, "vkDestroyPipeline") { ok = false }
+    if !isym(v, F_BEGIN_CMD, "vkBeginCommandBuffer") { ok = false }
+    if !isym(v, F_END_CMD, "vkEndCommandBuffer") { ok = false }
+    if !isym(v, F_RESET_CMD, "vkResetCommandBuffer") { ok = false }
+    if !isym(v, F_CMD_BEGIN_RP, "vkCmdBeginRenderPass") { ok = false }
+    if !isym(v, F_CMD_END_RP, "vkCmdEndRenderPass") { ok = false }
+    if !isym(v, F_CMD_BIND_PIPE, "vkCmdBindPipeline") { ok = false }
+    if !isym(v, F_CMD_BIND_VB, "vkCmdBindVertexBuffers") { ok = false }
+    if !isym(v, F_CMD_DRAW, "vkCmdDraw") { ok = false }
+    if !isym(v, F_CMD_SET_VP, "vkCmdSetViewport") { ok = false }
+    if !isym(v, F_CMD_SET_SC, "vkCmdSetScissor") { ok = false }
+    if !isym(v, F_CMD_COPY_I2B, "vkCmdCopyImageToBuffer") { ok = false }
+    if !isym(v, F_SUBMIT, "vkQueueSubmit") { ok = false }
+    if !isym(v, F_QWAIT, "vkQueueWaitIdle") { ok = false }
+    if !isym(v, F_DEV_WAIT, "vkDeviceWaitIdle") { ok = false }
+    if (*v).swapchain {
+        isym(v, F_CREATE_SC, "vkCreateSwapchainKHR")
+        isym(v, F_DESTROY_SC, "vkDestroySwapchainKHR")
+        isym(v, F_GET_SC_IMAGES, "vkGetSwapchainImagesKHR")
+        isym(v, F_ACQUIRE, "vkAcquireNextImageKHR")
+        isym(v, F_PRESENT, "vkQueuePresentKHR")
+        if fn_at(v, F_CREATE_SC) == 0 || fn_at(v, F_PRESENT) == 0 || fn_at(v, F_ACQUIRE) == 0 || fn_at(v, F_GET_SC_IMAGES) == 0 {
+            (*v).swapchain = false
+        }
+    }
+    return ok
+}
+
+// the instance, with the surface extensions that exist (retries without them)
+fn make_instance(v: *mut Vk, want_surface: bool) -> bool {
+    (*v).top = 0
+    var mask: u64 = 0
+    if want_surface {
+        let pc: u64 = sa(v, 8)
+        c(v, F_ENUM_INST_EXT, 0, pc, 0, 0, 0, 0)
+        let n: u64 = r32(pc, 0)
+        if n > 0 && n < 512 {
+            let props: u64 = rt.heap_alloc((n as usize) * 260)
+            if props != 0 {
+                c(v, F_ENUM_INST_EXT, 0, pc, props, 0, 0, 0)
+                var i: i32 = 0
+                while i < vkplat.surface_ext_count() {
+                    if ext_found(props, r32(pc, 0), vkplat.surface_ext_name(i)) {
+                        mask = mask | (1 << (i as u64))
+                    }
+                    i = i + 1
+                }
+                rt.heap_free(props, (n as usize) * 260)
+            }
+        }
+        if (mask & 1) == 0 || mask == 1 {
+            mask = 0
+        }
+    }
+    var attempt: i32 = 0
+    while attempt < 2 {
+        (*v).top = 0
+        let app: u64 = sa(v, 48)
+        w32(app, 0, 0) // VK_STRUCTURE_TYPE_APPLICATION_INFO
+        w64(app, 16, cstr(v, "firn"))
+        w32(app, 24, 1)
+        w64(app, 32, cstr(v, "firn gpu.vk"))
+        w32(app, 40, 1)
+        w32(app, 44, 4194304) // VK_API_VERSION_1_0
+        let names: u64 = sa(v, 8 * 4)
+        var cnt: u64 = 0
+        var i: i32 = 0
+        while i < vkplat.surface_ext_count() {
+            if (mask & (1 << (i as u64))) != 0 {
+                rt.st64(names, cnt as usize, cstr(v, vkplat.surface_ext_name(i)))
+                cnt = cnt + 1
+            }
+            i = i + 1
+        }
+        let ci: u64 = sa(v, 64)
+        w32(ci, 0, 1) // INSTANCE_CREATE_INFO
+        w64(ci, 24, app)
+        w32(ci, 48, cnt)
+        w64(ci, 56, names)
+        let out: u64 = sa(v, 8)
+        let r: u64 = c(v, F_CREATE_INSTANCE, ci, 0, out, 0, 0, 0)
+        if good(r) {
+            (*v).inst = r64(out, 0)
+            (*v).ext_mask = mask
+            return true
+        }
+        if mask == 0 {
+            return false
+        }
+        mask = 0
+        attempt = attempt + 1
+    }
+    return false
+}
+
+fn device_rank(t: u64) -> i32 {
+    if t == 2 { return 5 }
+    if t == 1 { return 4 }
+    if t == 3 { return 3 }
+    if t == 0 { return 2 }
+    return 1
+}
+
+// picks the best physical device with a graphics queue family. A CPU device (llvmpipe/lavapipe) only if allow_cpu.
+fn pick_device(v: *mut Vk, allow_cpu: bool) -> bool {
+    (*v).top = 0
+    let pc: u64 = sa(v, 8)
+    c(v, F_ENUM_PHYS, (*v).inst, pc, 0, 0, 0, 0)
+    var n: u64 = r32(pc, 0)
+    if n == 0 {
+        return false
+    }
+    if n > 16 {
+        n = 16
+    }
+    w32(pc, 0, n)
+    let devs: u64 = sa(v, 16 * 8)
+    c(v, F_ENUM_PHYS, (*v).inst, pc, devs, 0, 0, 0)
+    n = r32(pc, 0)
+    let props: u64 = sa(v, 1024)
+    let qc: u64 = sa(v, 8)
+    let qp: u64 = sa(v, 32 * 24)
+    var best: i32 = 0
+    var i: u64 = 0
+    while i < n {
+        let d: u64 = rt.ld64(devs, i as usize)
+        c(v, F_PHYS_PROPS, d, props, 0, 0, 0, 0)
+        let t: u64 = r32(props, 16)
+        w32(qc, 0, 32)
+        c(v, F_QUEUE_PROPS, d, qc, qp, 0, 0, 0)
+        let nq: u64 = r32(qc, 0)
+        var fam: u64 = 99
+        var k: u64 = 0
+        while k < nq {
+            if fam == 99 && (r32(qp + k * 24, 0) & 1) != 0 {
+                fam = k
+            }
+            k = k + 1
+        }
+        let rank: i32 = device_rank(t)
+        if fam != 99 && (allow_cpu || t != 4) && rank > best {
+            best = rank
+            (*v).phys = d
+            (*v).qfam = fam
+            (*v).dev_type = t as i32
+            (*v).api_ver = r32(props, 0)
+            (*v).vendor = r32(props, 8)
+            var j: usize = 0
+            while j < 255 && rt.ld8(props, 20 + j) != (0 as u8) {
+                rt.st8((*v).name, j, rt.ld8(props, 20 + j))
+                j = j + 1
+            }
+            rt.st8((*v).name, j, 0 as u8)
+        }
+        i = i + 1
+    }
+    return best > 0
+}
+
+fn make_device(v: *mut Vk) -> bool {
+    (*v).top = 0
+    var use_swap: bool = false
+    if (*v).ext_mask != 0 {
+        let pc: u64 = sa(v, 8)
+        c(v, F_ENUM_DEV_EXT, (*v).phys, 0, pc, 0, 0, 0)
+        let n: u64 = r32(pc, 0)
+        if n > 0 && n < 1024 {
+            let props: u64 = rt.heap_alloc((n as usize) * 260)
+            if props != 0 {
+                c(v, F_ENUM_DEV_EXT, (*v).phys, 0, pc, props, 0, 0)
+                use_swap = ext_found(props, r32(pc, 0), "VK_KHR_swapchain")
+                rt.heap_free(props, (n as usize) * 260)
+            }
+        }
+    }
+    (*v).top = 0
+    let prio: u64 = sa(v, 4)
+    wf(prio, 0, 1.0)
+    let qci: u64 = sa(v, 40)
+    w32(qci, 0, 2) // DEVICE_QUEUE_CREATE_INFO
+    w32(qci, 20, (*v).qfam)
+    w32(qci, 24, 1)
+    w64(qci, 32, prio)
+    let names: u64 = sa(v, 8)
+    var cnt: u64 = 0
+    if use_swap {
+        rt.st64(names, 0, cstr(v, "VK_KHR_swapchain"))
+        cnt = 1
+    }
+    let dci: u64 = sa(v, 72)
+    w32(dci, 0, 3) // DEVICE_CREATE_INFO
+    w32(dci, 20, 1)
+    w64(dci, 24, qci)
+    w32(dci, 48, cnt)
+    w64(dci, 56, names)
+    let out: u64 = sa(v, 8)
+    let r: u64 = c(v, F_CREATE_DEVICE, (*v).phys, dci, 0, out, 0, 0)
+    if !good(r) {
+        return false
+    }
+    (*v).dev = r64(out, 0)
+    (*v).swapchain = use_swap
+    return true
+}
+
+// Loads the loader, creates instance + device + queue + command pool/buffer + fence.
+// want_surface: also enable the window surface extensions (and VK_KHR_swapchain when the device has it).
+// allow_cpu: accept a software device (lavapipe). Returns v.ok; on false `v.step` is the failed STEP_*.
+fn open(v: *mut Vk, want_surface: bool, allow_cpu: bool) -> bool {
+    (*v).ok = false
+    (*v).step = 0
+    (*v).scratch = rt.heap_alloc(SCRATCH)
+    (*v).ft = rt.heap_alloc(F_COUNT * 8)
+    (*v).name = rt.heap_alloc(256)
+    (*v).mprops = rt.heap_alloc(528)
+    if (*v).scratch == 0 || (*v).ft == 0 || (*v).name == 0 || (*v).mprops == 0 {
+        (*v).step = STEP_NO_LOADER
+        return false
+    }
+    (*v).lib = vkplat.lib_open()
+    if (*v).lib == 0 {
+        (*v).step = STEP_NO_LOADER
+        return false
+    }
+    (*v).gipa = dynlib.sym((*v).lib, "vkGetInstanceProcAddr")
+    if (*v).gipa == 0 || !gsym(v, F_CREATE_INSTANCE, "vkCreateInstance") || !gsym(v, F_ENUM_INST_EXT, "vkEnumerateInstanceExtensionProperties") {
+        (*v).step = STEP_NO_SYMBOL
+        return false
+    }
+    if !make_instance(v, want_surface) {
+        (*v).step = STEP_NO_INSTANCE
+        return false
+    }
+    if !load_instance_level(v) {
+        (*v).step = STEP_NO_SYMBOL
+        return false
+    }
+    if !pick_device(v, allow_cpu) {
+        (*v).step = STEP_NO_DEVICE
+        return false
+    }
+    c(v, F_MEM_PROPS, (*v).phys, (*v).mprops, 0, 0, 0, 0)
+    if !make_device(v) {
+        (*v).step = STEP_NO_LOGICAL
+        return false
+    }
+    if !load_device_level(v) {
+        (*v).step = STEP_NO_SYMBOL
+        return false
+    }
+    (*v).top = 0
+    let q: u64 = sa(v, 8)
+    c(v, F_GET_QUEUE, (*v).dev, (*v).qfam, 0, q, 0, 0)
+    (*v).queue = r64(q, 0)
+    if (*v).queue == 0 {
+        (*v).step = STEP_NO_QUEUE
+        return false
+    }
+    let pi: u64 = sa(v, 24)
+    w32(pi, 0, 39) // COMMAND_POOL_CREATE_INFO
+    w32(pi, 16, 2) // RESET_COMMAND_BUFFER_BIT
+    w32(pi, 20, (*v).qfam)
+    let out: u64 = sa(v, 8)
+    if !good(c(v, F_CREATE_POOL, (*v).dev, pi, 0, out, 0, 0)) {
+        (*v).step = STEP_NO_POOL
+        return false
+    }
+    (*v).pool = r64(out, 0)
+    let ai: u64 = sa(v, 32)
+    w32(ai, 0, 40) // COMMAND_BUFFER_ALLOCATE_INFO
+    w64(ai, 16, (*v).pool)
+    w32(ai, 28, 1)
+    if !good(c(v, F_ALLOC_CMD, (*v).dev, ai, out, 0, 0, 0)) {
+        (*v).step = STEP_NO_POOL
+        return false
+    }
+    (*v).cmd = r64(out, 0)
+    let fi: u64 = sa(v, 24)
+    w32(fi, 0, 8) // FENCE_CREATE_INFO
+    if !good(c(v, F_CREATE_FENCE, (*v).dev, fi, 0, out, 0, 0)) {
+        (*v).step = STEP_NO_POOL
+        return false
+    }
+    (*v).fence = r64(out, 0)
+    (*v).ok = true
+    return true
+}
+
+fn idle(v: *mut Vk) {
+    if (*v).dev != 0 {
+        c(v, F_DEV_WAIT, (*v).dev, 0, 0, 0, 0, 0)
+    }
+}
+
+fn close(v: *mut Vk) {
+    if (*v).dev != 0 {
+        idle(v)
+        if (*v).fence != 0 { c(v, F_DESTROY_FENCE, (*v).dev, (*v).fence, 0, 0, 0, 0) }
+        if (*v).pool != 0 { c(v, F_DESTROY_POOL, (*v).dev, (*v).pool, 0, 0, 0, 0) }
+        c(v, F_DESTROY_DEVICE, (*v).dev, 0, 0, 0, 0, 0)
+    }
+    if (*v).inst != 0 {
+        c(v, F_DESTROY_INSTANCE, (*v).inst, 0, 0, 0, 0, 0)
+    }
+    vkplat.plat_close(&(*v).plat)
+    (*v).fence = 0
+    (*v).pool = 0
+    (*v).dev = 0
+    (*v).inst = 0
+    (*v).ok = false
+}
+
+fn device_name(v: *mut Vk) -> u64 {
+    return (*v).name // NUL terminated octets (io.print_c)
+}
+
+fn device_type(v: *mut Vk) -> i32 {
+    return (*v).dev_type
+}
+
+fn is_cpu(v: *mut Vk) -> bool {
+    return (*v).dev_type == DEV_CPU
+}
+
+fn api_version(v: *mut Vk) -> u64 {
+    return (*v).api_ver
+}
+
+fn has_surface_ext(v: *mut Vk) -> bool {
+    return (*v).ext_mask != 0
+}
+
+fn has_swapchain(v: *mut Vk) -> bool {
+    return (*v).swapchain
+}
+
+// index of a memory type with all `want` property bits inside `type_bits`, -1 = none
+fn mem_type(v: *mut Vk, type_bits: u64, want: u64) -> i64 {
+    let n: u64 = r32((*v).mprops, 0)
+    var i: u64 = 0
+    while i < n && i < 32 {
+        if (type_bits & (1 << i)) != 0 && (r32((*v).mprops, 4 + (i as usize) * 8) & want) == want {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// allocates memory for the requirements at `req` (24 octets) with the wanted property bits; 0 on failure
+fn alloc_for(v: *mut Vk, req: u64, want: u64) -> u64 {
+    let mt: i64 = mem_type(v, r32(req, 16), want)
+    if mt < 0 {
+        return 0
+    }
+    let ai: u64 = sa(v, 32)
+    w32(ai, 0, 5) // MEMORY_ALLOCATE_INFO
+    w64(ai, 16, r64(req, 0))
+    w32(ai, 24, mt as u64)
+    let out: u64 = sa(v, 8)
+    if !good(c(v, F_ALLOC_MEM, (*v).dev, ai, 0, out, 0, 0)) {
+        return 0
+    }
+    return r64(out, 0)
+}
+
+// ---- buffer (host visible, coherent, persistently mapped) ----------------------------------------------------
+const MEM_HOST: u64 = 6 // HOST_VISIBLE | HOST_COHERENT
+
+// usage 0x80 = VERTEX_BUFFER, 0x2 = TRANSFER_DST
+fn buffer_make(v: *mut Vk, b: *mut Buf, size: usize, usage: u64) -> bool {
+    (*v).top = 0
+    (*b).ok = false
+    let bi: u64 = sa(v, 56)
+    w32(bi, 0, 12) // BUFFER_CREATE_INFO
+    w64(bi, 24, size as u64)
+    w32(bi, 32, usage)
+    let out: u64 = sa(v, 8)
+    if !good(c(v, F_CREATE_BUFFER, (*v).dev, bi, 0, out, 0, 0)) {
+        return false
+    }
+    (*b).buf = r64(out, 0)
+    let req: u64 = sa(v, 24)
+    c(v, F_BUF_REQ, (*v).dev, (*b).buf, req, 0, 0, 0)
+    (*b).mem = alloc_for(v, req, MEM_HOST)
+    if (*b).mem == 0 {
+        c(v, F_DESTROY_BUFFER, (*v).dev, (*b).buf, 0, 0, 0, 0)
+        return false
+    }
+    if !good(c(v, F_BIND_BUF, (*v).dev, (*b).buf, (*b).mem, 0, 0, 0)) {
+        return false
+    }
+    if !good(c(v, F_MAP, (*v).dev, (*b).mem, 0, size as u64, 0, out)) {
+        return false
+    }
+    (*b).ptr = r64(out, 0)
+    (*b).size = size
+    (*b).ok = true
+    return true
+}
+
+fn buf_new(v: *mut Vk, b: *mut Buf, size: usize) -> bool {
+    return buffer_make(v, b, size, 0x82)
+}
+
+fn buf_write(b: *mut Buf, src: u64, n: usize) -> bool {
+    if !(*b).ok || n > (*b).size {
+        return false
+    }
+    rt.mem_copy((*b).ptr, src, n)
+    return true
+}
+
+fn buf_free(v: *mut Vk, b: *mut Buf) {
+    if !(*b).ok {
+        return
+    }
+    c(v, F_UNMAP, (*v).dev, (*b).mem, 0, 0, 0, 0)
+    c(v, F_DESTROY_BUFFER, (*v).dev, (*b).buf, 0, 0, 0, 0)
+    c(v, F_FREE_MEM, (*v).dev, (*b).mem, 0, 0, 0, 0)
+    (*b).ok = false
+}
+
+// ---- render pass / offscreen target ---------------------------------------------------------------------------
+// mode 0: offscreen (final layout TRANSFER_SRC, a dependency to the transfer stage); mode 1: swapchain (final PRESENT_SRC)
+fn rpass_make(v: *mut Vk, fmt: u64, mode: i32) -> u64 {
+    (*v).top = 0
+    let att: u64 = sa(v, 36)
+    w32(att, 4, fmt)
+    w32(att, 8, 1) // 1 sample
+    w32(att, 12, 1) // load op CLEAR
+    w32(att, 16, 0) // store op STORE
+    w32(att, 20, 2) // stencil DONT_CARE
+    w32(att, 24, 2)
+    w32(att, 28, 0) // initial UNDEFINED
+    if mode == 0 {
+        w32(att, 32, 6) // TRANSFER_SRC_OPTIMAL
+    } else {
+        w32(att, 32, 1000001002) // PRESENT_SRC_KHR
+    }
+    let ref: u64 = sa(v, 8)
+    w32(ref, 0, 0)
+    w32(ref, 4, 2) // COLOR_ATTACHMENT_OPTIMAL
+    let sub: u64 = sa(v, 72)
+    w32(sub, 4, 0) // GRAPHICS
+    w32(sub, 24, 1)
+    w64(sub, 32, ref)
+    let deps: u64 = sa(v, 56)
+    // external -> 0: wait for the colour attachment stage
+    w32(deps, 0, 0xFFFFFFFF)
+    w32(deps, 4, 0)
+    w32(deps, 8, 0x400)
+    w32(deps, 12, 0x400)
+    w32(deps, 16, 0)
+    w32(deps, 20, 0x100)
+    var nd: u64 = 1
+    if mode == 0 {
+        // 0 -> external: colour writes visible to the transfer read
+        w32(deps, 28, 0)
+        w32(deps, 32, 0xFFFFFFFF)
+        w32(deps, 36, 0x400)
+        w32(deps, 40, 0x1000)
+        w32(deps, 44, 0x100)
+        w32(deps, 48, 0x800)
+        nd = 2
+    }
+    let ci: u64 = sa(v, 64)
+    w32(ci, 0, 38) // RENDER_PASS_CREATE_INFO
+    w32(ci, 20, 1)
+    w64(ci, 24, att)
+    w32(ci, 32, 1)
+    w64(ci, 40, sub)
+    w32(ci, 48, nd)
+    w64(ci, 56, deps)
+    let out: u64 = sa(v, 8)
+    if !good(c(v, F_CREATE_RP, (*v).dev, ci, 0, out, 0, 0)) {
+        return 0
+    }
+    return r64(out, 0)
+}
+
+fn view_make(v: *mut Vk, image: u64, fmt: u64) -> u64 {
+    (*v).top = 0
+    let vi: u64 = sa(v, 80)
+    w32(vi, 0, 15) // IMAGE_VIEW_CREATE_INFO
+    w64(vi, 24, image)
+    w32(vi, 32, 1) // 2D
+    w32(vi, 36, fmt)
+    w32(vi, 56, 1) // COLOR aspect
+    w32(vi, 64, 1) // level count
+    w32(vi, 72, 1) // layer count
+    let out: u64 = sa(v, 8)
+    if !good(c(v, F_CREATE_VIEW, (*v).dev, vi, 0, out, 0, 0)) {
+        return 0
+    }
+    return r64(out, 0)
+}
+
+fn fb_make(v: *mut Vk, rpass: u64, view: u64, w: i32, h: i32) -> u64 {
+    (*v).top = 0
+    let att: u64 = sa(v, 8)
+    w64(att, 0, view)
+    let fi: u64 = sa(v, 64)
+    w32(fi, 0, 37) // FRAMEBUFFER_CREATE_INFO
+    w64(fi, 24, rpass)
+    w32(fi, 32, 1)
+    w64(fi, 40, att)
+    w32(fi, 48, w as u64)
+    w32(fi, 52, h as u64)
+    w32(fi, 56, 1)
+    let out: u64 = sa(v, 8)
+    if !good(c(v, F_CREATE_FB, (*v).dev, fi, 0, out, 0, 0)) {
+        return 0
+    }
+    return r64(out, 0)
+}
+
+const FMT_RGBA8: u64 = 37 // R8G8B8A8_UNORM
+
+// An RGBA8 colour image w x h (device local), its view, render pass, framebuffer and a mapped read back buffer.
+fn target_new(v: *mut Vk, t: *mut Target, w: i32, h: i32) -> bool {
+    (*t).ok = false
+    (*t).w = w
+    (*t).h = h
+    (*v).top = 0
+    let ii: u64 = sa(v, 88)
+    w32(ii, 0, 14) // IMAGE_CREATE_INFO
+    w32(ii, 20, 1) // 2D
+    w32(ii, 24, FMT_RGBA8)
+    w32(ii, 28, w as u64)
+    w32(ii, 32, h as u64)
+    w32(ii, 36, 1)
+    w32(ii, 40, 1)
+    w32(ii, 44, 1)
+    w32(ii, 48, 1)
+    w32(ii, 52, 0) // OPTIMAL
+    w32(ii, 56, 0x11) // COLOR_ATTACHMENT | TRANSFER_SRC
+    w32(ii, 80, 0) // UNDEFINED
+    let out: u64 = sa(v, 8)
+    if !good(c(v, F_CREATE_IMAGE, (*v).dev, ii, 0, out, 0, 0)) {
+        return false
+    }
+    (*t).image = r64(out, 0)
+    let req: u64 = sa(v, 24)
+    c(v, F_IMG_REQ, (*v).dev, (*t).image, req, 0, 0, 0)
+    var mem: u64 = alloc_for(v, req, 1) // DEVICE_LOCAL
+    if mem == 0 {
+        mem = alloc_for(v, req, 0)
+    }
+    if mem == 0 {
+        return false
+    }
+    (*t).mem = mem
+    if !good(c(v, F_BIND_IMG, (*v).dev, (*t).image, mem, 0, 0, 0)) {
+        return false
+    }
+    (*t).view = view_make(v, (*t).image, FMT_RGBA8)
+    if (*t).view == 0 {
+        return false
+    }
+    (*t).rpass = rpass_make(v, FMT_RGBA8, 0)
+    if (*t).rpass == 0 {
+        return false
+    }
+    (*t).fb = fb_make(v, (*t).rpass, (*t).view, w, h)
+    if (*t).fb == 0 {
+        return false
+    }
+    var rb: Buf = buf_blank()
+    if !buffer_make(v, &rb, (w as usize) * (h as usize) * 4, 0x2) { // TRANSFER_DST
+        return false
+    }
+    (*t).rbuf = rb.buf
+    (*t).rmem = rb.mem
+    (*t).rptr = rb.ptr
+    (*t).ok = true
+    return true
+}
+
+fn target_free(v: *mut Vk, t: *mut Target) {
+    if (*t).image == 0 {
+        return
+    }
+    idle(v)
+    if (*t).rptr != 0 { c(v, F_UNMAP, (*v).dev, (*t).rmem, 0, 0, 0, 0) }
+    if (*t).rbuf != 0 { c(v, F_DESTROY_BUFFER, (*v).dev, (*t).rbuf, 0, 0, 0, 0) }
+    if (*t).rmem != 0 { c(v, F_FREE_MEM, (*v).dev, (*t).rmem, 0, 0, 0, 0) }
+    if (*t).fb != 0 { c(v, F_DESTROY_FB, (*v).dev, (*t).fb, 0, 0, 0, 0) }
+    if (*t).rpass != 0 { c(v, F_DESTROY_RP, (*v).dev, (*t).rpass, 0, 0, 0, 0) }
+    if (*t).view != 0 { c(v, F_DESTROY_VIEW, (*v).dev, (*t).view, 0, 0, 0, 0) }
+    c(v, F_DESTROY_IMAGE, (*v).dev, (*t).image, 0, 0, 0, 0)
+    if (*t).mem != 0 { c(v, F_FREE_MEM, (*v).dev, (*t).mem, 0, 0, 0, 0) }
+    (*t).image = 0
+    (*t).rptr = 0
+    (*t).ok = false
+}
+
+// Copies the last drawn frame (after `draw`) to `out`: w*h*4 octets R G B A, row 0 = top.
+fn read_pixels(t: *mut Target, out: u64) -> bool {
+    if !(*t).ok || (*t).rptr == 0 {
+        return false
+    }
+    rt.mem_copy(out, (*t).rptr, ((*t).w as usize) * ((*t).h as usize) * 4)
+    return true
+}
+
+// ---- pipeline ---------------------------------------------------------------------------------------------------
+fn shader_make(v: *mut Vk, code: u64, size: usize) -> u64 {
+    if size == 0 || (size % 4) != 0 {
+        return 0
+    }
+    let copy: u64 = rt.heap_alloc(size) // 4-aligned copy: pCode must be a uint32 pointer
+    if copy == 0 {
+        return 0
+    }
+    rt.mem_copy(copy, code, size)
+    (*v).top = 0
+    let si: u64 = sa(v, 40)
+    w32(si, 0, 16) // SHADER_MODULE_CREATE_INFO
+    w64(si, 24, size as u64)
+    w64(si, 32, copy)
+    let out: u64 = sa(v, 8)
+    let r: u64 = c(v, F_CREATE_SHADER, (*v).dev, si, 0, out, 0, 0)
+    rt.heap_free(copy, size)
+    if !good(r) {
+        return 0
+    }
+    return r64(out, 0)
+}
+
+// Graphics pipeline for render pass `rpass`: vertex stride 20 = vec2 position (location 0) + vec3 colour (location 1),
+// triangle list, no culling, no depth, opaque, dynamic viewport + scissor. SPIR-V from memory (vs/fs: octets, size in octets).
+fn pipeline_new(v: *mut Vk, p: *mut Pipe, rpass: u64, vs: u64, vs_size: usize, fs: u64, fs_size: usize) -> bool {
+    (*p).ok = false
+    (*p).vs = shader_make(v, vs, vs_size)
+    (*p).fs = shader_make(v, fs, fs_size)
+    if (*p).vs == 0 || (*p).fs == 0 {
+        return false
+    }
+    (*v).top = 0
+    let out: u64 = sa(v, 8)
+    let li: u64 = sa(v, 48)
+    w32(li, 0, 30) // PIPELINE_LAYOUT_CREATE_INFO
+    if !good(c(v, F_CREATE_PLAYOUT, (*v).dev, li, 0, out, 0, 0)) {
+        return false
+    }
+    (*p).layout = r64(out, 0)
+    let main: u64 = cstr(v, "main")
+    let st: u64 = sa(v, 96)
+    w32(st, 0, 18) // PIPELINE_SHADER_STAGE_CREATE_INFO
+    w32(st, 20, 1) // VERTEX
+    w64(st, 24, (*p).vs)
+    w64(st, 32, main)
+    w32(st, 48, 18)
+    w32(st, 68, 0x10) // FRAGMENT
+    w64(st, 72, (*p).fs)
+    w64(st, 80, main)
+    let bind: u64 = sa(v, 12)
+    w32(bind, 0, 0)
+    w32(bind, 4, 20)
+    w32(bind, 8, 0) // per vertex
+    let attr: u64 = sa(v, 32)
+    w32(attr, 0, 0)
+    w32(attr, 4, 0)
+    w32(attr, 8, 103) // R32G32_SFLOAT
+    w32(attr, 12, 0)
+    w32(attr, 16, 1)
+    w32(attr, 20, 0)
+    w32(attr, 24, 106) // R32G32B32_SFLOAT
+    w32(attr, 28, 8)
+    let vi: u64 = sa(v, 48)
+    w32(vi, 0, 19) // VERTEX_INPUT_STATE
+    w32(vi, 20, 1)
+    w64(vi, 24, bind)
+    w32(vi, 32, 2)
+    w64(vi, 40, attr)
+    let ia: u64 = sa(v, 32)
+    w32(ia, 0, 20)
+    w32(ia, 20, 3) // TRIANGLE_LIST
+    let vp: u64 = sa(v, 48)
+    w32(vp, 0, 22)
+    w32(vp, 20, 1) // viewports and scissors are dynamic: only the counts
+    w32(vp, 32, 1)
+    let rs: u64 = sa(v, 64)
+    w32(rs, 0, 23)
+    w32(rs, 28, 0) // FILL
+    w32(rs, 32, 0) // no culling
+    w32(rs, 36, 0) // counter clockwise
+    wf(rs, 56, 1.0)
+    let ms: u64 = sa(v, 48)
+    w32(ms, 0, 24)
+    w32(ms, 20, 1)
+    let cba: u64 = sa(v, 32)
+    w32(cba, 28, 0xF) // RGBA write mask, no blending
+    let cb: u64 = sa(v, 56)
+    w32(cb, 0, 26)
+    w32(cb, 28, 1)
+    w64(cb, 32, cba)
+    let dyn: u64 = sa(v, 8)
+    w32(dyn, 0, 0) // VIEWPORT
+    w32(dyn, 4, 1) // SCISSOR
+    let ds: u64 = sa(v, 32)
+    w32(ds, 0, 27)
+    w32(ds, 20, 2)
+    w64(ds, 24, dyn)
+    let gi: u64 = sa(v, 144)
+    w32(gi, 0, 28) // GRAPHICS_PIPELINE_CREATE_INFO
+    w32(gi, 20, 2)
+    w64(gi, 24, st)
+    w64(gi, 32, vi)
+    w64(gi, 40, ia)
+    w64(gi, 56, vp)
+    w64(gi, 64, rs)
+    w64(gi, 72, ms)
+    w64(gi, 88, cb)
+    w64(gi, 96, ds)
+    w64(gi, 104, (*p).layout)
+    w64(gi, 112, rpass)
+    w32(gi, 136, 0xFFFFFFFF)
+    if !good(c(v, F_CREATE_GPIPE, (*v).dev, 0, 1, gi, 0, out)) {
+        return false
+    }
+    (*p).pipe = r64(out, 0)
+    (*p).ok = true
+    return true
+}
+
+// the embedded test shaders (lib/gpu/spv/tri.vert.spv + tri.frag.spv)
+fn pipeline_tri(v: *mut Vk, p: *mut Pipe, rpass: u64) -> bool {
+    return pipeline_new(v, p, rpass, TRI_VS.p as u64, TRI_VS.n, TRI_FS.p as u64, TRI_FS.n)
+}
+
+fn pipeline_free(v: *mut Vk, p: *mut Pipe) {
+    if (*p).pipe != 0 { c(v, F_DESTROY_PIPE, (*v).dev, (*p).pipe, 0, 0, 0, 0) }
+    if (*p).layout != 0 { c(v, F_DESTROY_PLAYOUT, (*v).dev, (*p).layout, 0, 0, 0, 0) }
+    if (*p).vs != 0 { c(v, F_DESTROY_SHADER, (*v).dev, (*p).vs, 0, 0, 0, 0) }
+    if (*p).fs != 0 { c(v, F_DESTROY_SHADER, (*v).dev, (*p).fs, 0, 0, 0, 0) }
+    (*p).pipe = 0
+    (*p).layout = 0
+    (*p).vs = 0
+    (*p).fs = 0
+    (*p).ok = false
+}
+
+// ---- recording --------------------------------------------------------------------------------------------------
+fn clear_channel(clear: u32, k: u32) -> f64 {
+    return (((clear >> (k * (8 as u32))) & (255 as u32)) as f64) / 255.0
+}
+
+// begin command buffer + render pass (clear) + bind pipeline / vertex buffer + draw `nverts` vertices; the pass is left open
+fn record_pass(v: *mut Vk, rpass: u64, fb: u64, w: i32, h: i32, p: *mut Pipe, vb: *mut Buf, nverts: u64, clear: u32) -> bool {
+    (*v).top = 0
+    c(v, F_RESET_CMD, (*v).cmd, 0, 0, 0, 0, 0)
+    let bi: u64 = sa(v, 32)
+    w32(bi, 0, 42) // COMMAND_BUFFER_BEGIN_INFO
+    w32(bi, 16, 1) // ONE_TIME_SUBMIT
+    if !good(c(v, F_BEGIN_CMD, (*v).cmd, bi, 0, 0, 0, 0)) {
+        return false
+    }
+    let cv: u64 = sa(v, 16)
+    wf(cv, 0, clear_channel(clear, 0 as u32))
+    wf(cv, 4, clear_channel(clear, 1 as u32))
+    wf(cv, 8, clear_channel(clear, 2 as u32))
+    wf(cv, 12, clear_channel(clear, 3 as u32))
+    let rb: u64 = sa(v, 64)
+    w32(rb, 0, 43) // RENDER_PASS_BEGIN_INFO
+    w64(rb, 16, rpass)
+    w64(rb, 24, fb)
+    w32(rb, 40, w as u64)
+    w32(rb, 44, h as u64)
+    w32(rb, 48, 1)
+    w64(rb, 56, cv)
+    c(v, F_CMD_BEGIN_RP, (*v).cmd, rb, 0, 0, 0, 0)
+    c(v, F_CMD_BIND_PIPE, (*v).cmd, 0, (*p).pipe, 0, 0, 0)
+    let vp: u64 = sa(v, 24)
+    wf(vp, 8, w as f64)
+    wf(vp, 12, h as f64)
+    wf(vp, 20, 1.0)
+    c(v, F_CMD_SET_VP, (*v).cmd, 0, 1, vp, 0, 0)
+    let sc: u64 = sa(v, 16)
+    w32(sc, 8, w as u64)
+    w32(sc, 12, h as u64)
+    c(v, F_CMD_SET_SC, (*v).cmd, 0, 1, sc, 0, 0)
+    if nverts > 0 {
+        let bufs: u64 = sa(v, 8)
+        w64(bufs, 0, (*vb).buf)
+        let offs: u64 = sa(v, 8)
+        c(v, F_CMD_BIND_VB, (*v).cmd, 0, 1, bufs, offs, 0)
+        c(v, F_CMD_DRAW, (*v).cmd, nverts, 1, 0, 0, 0)
+    }
+    c(v, F_CMD_END_RP, (*v).cmd, 0, 0, 0, 0, 0)
+    return true
+}
+
+// end + submit + wait for the fence. wait_sem / signal_sem may be 0.
+fn submit_wait(v: *mut Vk, wait_sem: u64, signal_sem: u64) -> bool {
+    if !good(c(v, F_END_CMD, (*v).cmd, 0, 0, 0, 0, 0)) {
+        return false
+    }
+    (*v).top = 0
+    let fe: u64 = sa(v, 8)
+    w64(fe, 0, (*v).fence)
+    c(v, F_RESET_FENCES, (*v).dev, 1, fe, 0, 0, 0)
+    let cb: u64 = sa(v, 8)
+    w64(cb, 0, (*v).cmd)
+    let ws: u64 = sa(v, 8)
+    w64(ws, 0, wait_sem)
+    let ss: u64 = sa(v, 8)
+    w64(ss, 0, signal_sem)
+    let stage: u64 = sa(v, 4)
+    w32(stage, 0, 0x400)
+    let si: u64 = sa(v, 72)
+    w32(si, 0, 4) // SUBMIT_INFO
+    if wait_sem != 0 {
+        w32(si, 16, 1)
+        w64(si, 24, ws)
+        w64(si, 32, stage)
+    }
+    w32(si, 40, 1)
+    w64(si, 48, cb)
+    if signal_sem != 0 {
+        w32(si, 56, 1)
+        w64(si, 64, ss)
+    }
+    if !good(c(v, F_SUBMIT, (*v).queue, 1, si, (*v).fence, 0, 0)) {
+        return false
+    }
+    // timeout 10 s (ns); all fences
+    return good(c(v, F_WAIT_FENCES, (*v).dev, 1, fe, 1, 10000000000, 0))
+}
+
+// Renders `nverts` vertices of `vb` with `p` into the target (clear colour packed 0xAABBGGRR), copies the image into the
+// target's read back buffer, waits. Then `read_pixels`.
+fn draw(v: *mut Vk, t: *mut Target, p: *mut Pipe, vb: *mut Buf, nverts: u64, clear: u32) -> bool {
+    if !(*v).ok || !(*t).ok || !(*p).ok {
+        return false
+    }
+    if !record_pass(v, (*t).rpass, (*t).fb, (*t).w, (*t).h, p, vb, nverts, clear) {
+        return false
+    }
+    (*v).top = 0
+    let reg: u64 = sa(v, 56)
+    w32(reg, 16, 1) // COLOR
+    w32(reg, 28, 1) // layers
+    w32(reg, 44, (*t).w as u64)
+    w32(reg, 48, (*t).h as u64)
+    w32(reg, 52, 1)
+    c(v, F_CMD_COPY_I2B, (*v).cmd, (*t).image, 6, (*t).rbuf, 1, reg) // layout TRANSFER_SRC_OPTIMAL
+    return submit_wait(v, 0, 0)
+}
+
+// ---- swapchain on an X11 window -----------------------------------------------------------------------------------
+const FMT_BGRA8: u64 = 44
+
+fn sc_destroy_chain(v: *mut Vk, s: *mut Sc) {
+    var i: u64 = 0
+    while i < (*s).n {
+        if (*s).fbs != 0 && rt.ld64((*s).fbs, i as usize) != 0 {
+            c(v, F_DESTROY_FB, (*v).dev, rt.ld64((*s).fbs, i as usize), 0, 0, 0, 0)
+        }
+        if (*s).views != 0 && rt.ld64((*s).views, i as usize) != 0 {
+            c(v, F_DESTROY_VIEW, (*v).dev, rt.ld64((*s).views, i as usize), 0, 0, 0, 0)
+        }
+        i = i + 1
+    }
+    if (*s).fbs != 0 { rt.heap_free((*s).fbs, 64 * 8) }
+    if (*s).views != 0 { rt.heap_free((*s).views, 64 * 8) }
+    if (*s).images != 0 { rt.heap_free((*s).images, 64 * 8) }
+    (*s).fbs = 0
+    (*s).views = 0
+    (*s).images = 0
+    (*s).n = 0
+    if (*s).chain != 0 {
+        c(v, F_DESTROY_SC, (*v).dev, (*s).chain, 0, 0, 0, 0)
+        (*s).chain = 0
+    }
+}
+
+// swapchain + image views + framebuffers for a w x h window (the surface exists)
+fn sc_build(v: *mut Vk, s: *mut Sc, w: i32, h: i32) -> bool {
+    (*v).top = 0
+    let caps: u64 = sa(v, 64)
+    if !good(c(v, F_SURF_CAPS, (*v).phys, (*s).surface, caps, 0, 0, 0)) {
+        return false
+    }
+    var ew: u64 = r32(caps, 8)
+    var eh: u64 = r32(caps, 12)
+    if ew == 0xFFFFFFFF {
+        ew = w as u64
+        eh = h as u64
+    }
+    if ew == 0 || eh == 0 {
+        return false
+    }
+    var minc: u64 = r32(caps, 0)
+    if minc < 2 {
+        minc = 2
+    }
+    let maxc: u64 = r32(caps, 4)
+    if maxc != 0 && minc > maxc {
+        minc = maxc
+    }
+    let nf: u64 = sa(v, 8)
+    w32(nf, 0, 16)
+    let fm: u64 = sa(v, 16 * 8)
+    c(v, F_SURF_FMTS, (*v).phys, (*s).surface, nf, fm, 0, 0)
+    var fmt: u64 = r32(fm, 0)
+    var cs: u64 = r32(fm, 4)
+    var i: u64 = 0
+    var found: bool = false
+    while i < r32(nf, 0) {
+        if !found && (r32(fm, (i as usize) * 8) == FMT_BGRA8 || r32(fm, (i as usize) * 8) == FMT_RGBA8) {
+            fmt = r32(fm, (i as usize) * 8)
+            cs = r32(fm, (i as usize) * 8 + 4)
+            found = true
+        }
+        i = i + 1
+    }
+    var alpha: u64 = 1
+    let supp: u64 = r32(caps, 44)
+    if (supp & 1) == 0 {
+        alpha = 2
+        if (supp & 2) == 0 { alpha = 4 }
+        if (supp & 6) == 0 { alpha = 8 }
+    }
+    let ci: u64 = sa(v, 104)
+    w32(ci, 0, 1000001000) // SWAPCHAIN_CREATE_INFO_KHR
+    w64(ci, 24, (*s).surface)
+    w32(ci, 32, minc)
+    w32(ci, 36, fmt)
+    w32(ci, 40, cs)
+    w32(ci, 44, ew)
+    w32(ci, 48, eh)
+    w32(ci, 52, 1)
+    w32(ci, 56, 0x10) // COLOR_ATTACHMENT
+    w32(ci, 80, r32(caps, 40)) // current transform
+    w32(ci, 84, alpha)
+    w32(ci, 88, 2) // FIFO (always supported)
+    w32(ci, 92, 1)
+    let out: u64 = sa(v, 8)
+    if !good(c(v, F_CREATE_SC, (*v).dev, ci, 0, out, 0, 0)) {
+        return false
+    }
+    (*s).chain = r64(out, 0)
+    (*s).fmt = fmt
+    (*s).w = ew as i32
+    (*s).h = eh as i32
+    let cnt: u64 = sa(v, 8)
+    c(v, F_GET_SC_IMAGES, (*v).dev, (*s).chain, cnt, 0, 0, 0)
+    var n: u64 = r32(cnt, 0)
+    if n == 0 || n > 64 {
+        return false
+    }
+    (*s).images = rt.heap_alloc(64 * 8)
+    (*s).views = rt.heap_alloc(64 * 8)
+    (*s).fbs = rt.heap_alloc(64 * 8)
+    if (*s).images == 0 || (*s).views == 0 || (*s).fbs == 0 {
+        return false
+    }
+    c(v, F_GET_SC_IMAGES, (*v).dev, (*s).chain, cnt, (*s).images, 0, 0)
+    n = r32(cnt, 0)
+    (*s).n = n
+    if (*s).rpass == 0 {
+        (*s).rpass = rpass_make(v, fmt, 1)
+        if (*s).rpass == 0 {
+            return false
+        }
+    }
+    i = 0
+    while i < n {
+        let vw: u64 = view_make(v, rt.ld64((*s).images, i as usize), fmt)
+        if vw == 0 {
+            return false
+        }
+        rt.st64((*s).views, i as usize, vw)
+        let fb: u64 = fb_make(v, (*s).rpass, vw, (*s).w, (*s).h)
+        if fb == 0 {
+            return false
+        }
+        rt.st64((*s).fbs, i as usize, fb)
+        i = i + 1
+    }
+    return true
+}
+
+// Surface of the X11 window `xid` + swapchain (mode 0 = VK_KHR_xlib_surface, 1 = VK_KHR_xcb_surface). Needs open(.., true, ..).
+// The swapchain is BGRA8 or RGBA8 (whatever the surface offers first); `s.fmt` says which.
+fn sc_open(v: *mut Vk, s: *mut Sc, xid: u64, w: i32, h: i32, mode: i32) -> bool {
+    (*s).ok = false
+    if !(*v).ok || !(*v).swapchain || fn_at(v, F_SURF_CAPS) == 0 {
+        return false
+    }
+    (*s).xid = xid
+    (*s).mode = mode
+    (*v).top = 0
+    let sf: u64 = sa(v, 8)
+    let scr: u64 = sa(v, 256)
+    if !vkplat.surface_create(&(*v).plat, (*v).gipa, (*v).inst, (*v).ext_mask, xid, mode, scr, sf) {
+        return false
+    }
+    (*s).surface = r64(sf, 0)
+    (*v).top = 0
+    let sup: u64 = sa(v, 8)
+    if !good(c(v, F_SURF_SUPPORT, (*v).phys, (*v).qfam, (*s).surface, sup, 0, 0)) || r32(sup, 0) == 0 {
+        return false
+    }
+    if !sc_build(v, s, w, h) {
+        sc_destroy_chain(v, s)
+        return false
+    }
+    (*v).top = 0
+    let si: u64 = sa(v, 24)
+    w32(si, 0, 9) // SEMAPHORE_CREATE_INFO
+    let out: u64 = sa(v, 8)
+    if !good(c(v, F_CREATE_SEM, (*v).dev, si, 0, out, 0, 0)) {
+        return false
+    }
+    (*s).sem_acq = r64(out, 0)
+    if !good(c(v, F_CREATE_SEM, (*v).dev, si, 0, out, 0, 0)) {
+        return false
+    }
+    (*s).sem_done = r64(out, 0)
+    (*s).ok = true
+    return true
+}
+
+// The window changed its size: new swapchain (the old one is destroyed after the queue is idle). False = failed.
+fn sc_resize(v: *mut Vk, s: *mut Sc, w: i32, h: i32) -> bool {
+    idle(v)
+    sc_destroy_chain(v, s)
+    return sc_build(v, s, w, h)
+}
+
+// One frame: acquire, render `nverts` vertices (clear colour 0xAABBGGRR), present, wait. FRAME_RESIZE = swapchain out of
+// date (call sc_resize and retry), FRAME_ERROR = failed.
+fn sc_frame(v: *mut Vk, s: *mut Sc, p: *mut Pipe, vb: *mut Buf, nverts: u64, clear: u32) -> i32 {
+    if !(*s).ok || !(*p).ok {
+        return FRAME_ERROR
+    }
+    (*v).top = 0
+    let idx: u64 = sa(v, 8)
+    let ra: u64 = c(v, F_ACQUIRE, (*v).dev, (*s).chain, 0xFFFFFFFFFFFFFFFF, (*s).sem_acq, 0, idx) & 0xFFFFFFFF
+    if ra == 0xC4653214 { // VK_ERROR_OUT_OF_DATE_KHR (-1000001004)
+        return FRAME_RESIZE
+    }
+    if ra != 0 && ra != 1000001003 { // SUBOPTIMAL is fine
+        return FRAME_ERROR
+    }
+    let i: u64 = r32(idx, 0)
+    if !record_pass(v, (*s).rpass, rt.ld64((*s).fbs, i as usize), (*s).w, (*s).h, p, vb, nverts, clear) {
+        return FRAME_ERROR
+    }
+    if !submit_wait(v, (*s).sem_acq, (*s).sem_done) {
+        return FRAME_ERROR
+    }
+    (*v).top = 0
+    let ch: u64 = sa(v, 8)
+    w64(ch, 0, (*s).chain)
+    let ix: u64 = sa(v, 8)
+    w32(ix, 0, i)
+    let wsm: u64 = sa(v, 8)
+    w64(wsm, 0, (*s).sem_done)
+    let pi: u64 = sa(v, 64)
+    w32(pi, 0, 1000001001) // PRESENT_INFO_KHR
+    w32(pi, 16, 1)
+    w64(pi, 24, wsm)
+    w32(pi, 32, 1)
+    w64(pi, 40, ch)
+    w64(pi, 48, ix)
+    let rp: u64 = c(v, F_PRESENT, (*v).queue, pi, 0, 0, 0, 0) & 0xFFFFFFFF
+    (*s).frames = (*s).frames + 1
+    if rp == 0xC4653214 {
+        return FRAME_RESIZE
+    }
+    if rp != 0 && rp != 1000001003 {
+        return FRAME_ERROR
+    }
+    return FRAME_OK
+}
+
+// What the X server currently shows in the window (XGetImage): w*h RGBA octets. Waits for the queue first.
+fn window_pixels(v: *mut Vk, s: *mut Sc, out: u64) -> bool {
+    c(v, F_QWAIT, (*v).queue, 0, 0, 0, 0, 0)
+    return vkplat.read_window(&(*v).plat, (*s).xid, (*s).w, (*s).h, out)
+}
+
+fn sc_close(v: *mut Vk, s: *mut Sc) {
+    if (*s).surface == 0 && (*s).chain == 0 {
+        return
+    }
+    idle(v)
+    sc_destroy_chain(v, s)
+    if (*s).rpass != 0 { c(v, F_DESTROY_RP, (*v).dev, (*s).rpass, 0, 0, 0, 0) }
+    if (*s).sem_acq != 0 { c(v, F_DESTROY_SEM, (*v).dev, (*s).sem_acq, 0, 0, 0, 0) }
+    if (*s).sem_done != 0 { c(v, F_DESTROY_SEM, (*v).dev, (*s).sem_done, 0, 0, 0, 0) }
+    if (*s).surface != 0 { c(v, F_DESTROY_SURFACE, (*v).inst, (*s).surface, 0, 0, 0, 0) }
+    (*s).rpass = 0
+    (*s).sem_acq = 0
+    (*s).sem_done = 0
+    (*s).surface = 0
+    (*s).ok = false
+}

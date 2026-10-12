@@ -1,0 +1,452 @@
+// tools/gpu/vk/vkprobe.fi -- gpu.vk (lib/gpu/vk.fi) against the CPU rasterizer and on an X11 swapchain. Mesa lavapipe is the proven device.
+//   vkprobe          loader, instance, device, offscreen triangles (flat vs mc_raster, gradient vs a float CPU reference),
+//                    then (DISPLAY set and VK_KHR_swapchain present) a swapchain on a Firn window: xlib and xcb surface,
+//                    present, read the window back with XGetImage, resize.
+//   vkprobe nolib    expects NO loader (FIRN_VK_LIB=<missing library>): open must return false with STEP_NO_LOADER.
+// Exit 0 = all checks passed, 3 = a check failed, 4 = no Vulkan loader / no device (the gate prints SKIP).
+import std.rt
+import std.io
+import std.env
+import std.math
+import std.time
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import window.window
+import window.backend
+import gpu.vk
+
+const W: i32 = 320
+const H: i32 = 180
+
+struct Cmp {
+    psnr_x100: u64,
+    cov_a: u64,
+    cov_b: u64,
+    cov_mm: u64,
+    max_diff: u32,
+}
+
+fn print_f2(v: f64) {
+    var x: f64 = v
+    if x < 0.0 { x = 0.0 }
+    let i: i64 = x as i64
+    var f: i64 = ((x - (i as f64)) * 100.0 + 0.5) as i64
+    var ii: i64 = i
+    if f >= 100 as i64 {
+        f = f - 100 as i64
+        ii = ii + 1 as i64
+    }
+    if f < 10 as i64 {
+        io.fmt_print(f"{ii}.0{f}")
+    } else {
+        io.fmt_print(f"{ii}.{f}")
+    }
+}
+
+fn putf(p: u64, i: usize, x: f64) {
+    rt.st32(p, i, __bits(x as f32) as u32)
+}
+
+// RGB PSNR of two RGBA octet buffers (alpha ignored) + coverage (pixel != clear) mismatch
+fn compare(a: u64, b: u64, n: usize, clear: u32, out: *mut Cmp) {
+    (*out).cov_a = 0 as u64
+    (*out).cov_b = 0 as u64
+    (*out).cov_mm = 0 as u64
+    (*out).max_diff = 0 as u32
+    var sq: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let pa: u32 = rt.ld32(a, i)
+        let pb: u32 = rt.ld32(b, i)
+        let ca: bool = (pa & (0x00FFFFFF as u32)) != (clear & (0x00FFFFFF as u32))
+        let cb: bool = (pb & (0x00FFFFFF as u32)) != (clear & (0x00FFFFFF as u32))
+        if ca { (*out).cov_a = (*out).cov_a + 1 as u64 }
+        if cb { (*out).cov_b = (*out).cov_b + 1 as u64 }
+        if ca != cb { (*out).cov_mm = (*out).cov_mm + 1 as u64 }
+        var k: u32 = 0 as u32
+        while k < 3 as u32 {
+            let ba: i32 = ((pa >> (k * 8 as u32)) & 255 as u32) as i32
+            let bb: i32 = ((pb >> (k * 8 as u32)) & 255 as u32) as i32
+            var d: i32 = ba - bb
+            if d < 0 { d = 0 - d }
+            sq = sq + (d * d) as f64
+            if (d as u32) > (*out).max_diff { (*out).max_diff = d as u32 }
+            k = k + 1 as u32
+        }
+        i = i + 1
+    }
+    var psnr: f64 = 99.0
+    if sq > 0.0 {
+        let mse: f64 = sq / ((n as f64) * 3.0)
+        psnr = 10.0 * math.log10(255.0 * 255.0 / mse)
+    }
+    (*out).psnr_x100 = (psnr * 100.0) as u64
+}
+
+// ---- CPU references -------------------------------------------------------------------------------------------
+fn solid_atlas() -> mc_texture.Atlas {
+    var a: mc_texture.Atlas = mc_texture.atlas_new(16, 4, 4)
+    let ox: i32 = mc_texture.atlas_tile_x(&a, 1 as u32)
+    let oy: i32 = mc_texture.atlas_tile_y(&a, 1 as u32)
+    var y: i32 = 0
+    while y < 16 {
+        var x: i32 = 0
+        while x < 16 {
+            rt.st32(a.px, ((oy + y) * a.w + ox + x) as usize, mc_texture.pack_pixel(230 as u32, 120 as u32, 40 as u32, 255 as u32))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return a
+}
+
+// view space vertex record (x, y, z, u, v, ao) = 6 f64
+fn view_vertex(p: u64, i: usize, x: f64, y: f64, z: f64) {
+    let q: u64 = p + ((i * 6 * 8) as u64)
+    *(q as *mut f64) = x
+    *((q + 8) as *mut f64) = y
+    *((q + 16) as *mut f64) = z
+}
+
+// mc_raster draws the flat triangle (view space (-3,-2,10) (3,-2,10) (0,3,10), tile 1, ao 0). Screen coordinates -> sx/sy.
+fn cpu_flat(clear: u32, out: u64, sx: *mut [f64; 3], sy: *mut [f64; 3]) {
+    var r: mc_raster.Raster = mc_raster.raster_new(W, H)
+    var at: mc_texture.Atlas = solid_atlas()
+    mc_raster.raster_set_atlas(&r, &at)
+    var cam: mc_camera.Camera = mc_camera.camera_new(W, H)
+    mc_camera.camera_update(&cam)
+    mc_raster.raster_set_camera(&r, &cam)
+    mc_raster.raster_set_cull(&r, false)
+    mc_raster.raster_clear(&r, clear)
+    let vb: u64 = rt.heap_alloc(3 * 6 * 8)
+    view_vertex(vb, 0, 0.0 - 3.0, 0.0 - 2.0, 10.0)
+    view_vertex(vb, 1, 3.0, 0.0 - 2.0, 10.0)
+    view_vertex(vb, 2, 0.0, 3.0, 10.0)
+    var i: usize = 0
+    while i < 3 {
+        let q: u64 = vb + ((i * 6 * 8) as u64)
+        let x: f64 = *(q as *mut f64)
+        let y: f64 = *((q + 8) as *mut f64)
+        let z: f64 = *((q + 16) as *mut f64)
+        (*sx)[i] = r.hw + (x / z) * r.fpx
+        (*sy)[i] = r.hh - (y / z) * r.fpy
+        i = i + 1
+    }
+    mc_raster.raster_draw_tri(&r, vb, vb + 48, vb + 96, 1 as u32, 3 as u32)
+    rt.mem_copy(out, r.color, (W as usize) * (H as usize) * 4)
+    rt.heap_free(vb, 3 * 6 * 8)
+    mc_raster.raster_free(&r)
+}
+
+// float reference for the colour gradient (pixel centres, barycentric, round to nearest); no fill rule needed for the PSNR
+fn cpu_gradient(clear: u32, out: u64, sx: *mut [f64; 3], sy: *mut [f64; 3], col: *mut [f64; 9]) {
+    var y: i32 = 0
+    while y < H {
+        var x: i32 = 0
+        while x < W {
+            let px: f64 = (x as f64) + 0.5
+            let py: f64 = (y as f64) + 0.5
+            let area: f64 = ((*sx)[1] - (*sx)[0]) * ((*sy)[2] - (*sy)[0]) - ((*sy)[1] - (*sy)[0]) * ((*sx)[2] - (*sx)[0])
+            let w0: f64 = (((*sx)[1] - px) * ((*sy)[2] - py) - ((*sy)[1] - py) * ((*sx)[2] - px)) / area
+            let w1: f64 = (((*sx)[2] - px) * ((*sy)[0] - py) - ((*sy)[2] - py) * ((*sx)[0] - px)) / area
+            let w2: f64 = 1.0 - w0 - w1
+            var pix: u32 = clear
+            if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                var rgb: u32 = 0xFF000000 as u32
+                var k: usize = 0
+                while k < 3 {
+                    let v: f64 = w0 * (*col)[k] + w1 * (*col)[3 + k] + w2 * (*col)[6 + k]
+                    var b: i64 = math.floor(v * 255.0 + 0.5) as i64
+                    if b < 0 as i64 { b = 0 as i64 }
+                    if b > 255 as i64 { b = 255 as i64 }
+                    rgb = rgb | ((b as u32) << ((k as u32) * 8 as u32))
+                    k = k + 1
+                }
+                pix = rgb
+            }
+            rt.st32(out, (y as usize) * (W as usize) + (x as usize), pix)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// vertex buffer data: x y (NDC, y down) r g b per vertex
+fn fill_vertices(vb: *mut vk.Buf, sx: *mut [f64; 3], sy: *mut [f64; 3], col: *mut [f64; 9], w: i32, h: i32) -> bool {
+    let tmp: u64 = rt.heap_alloc(60)
+    var i: usize = 0
+    while i < 3 {
+        putf(tmp, i * 5, (*sx)[i] / (w as f64) * 2.0 - 1.0)
+        putf(tmp, i * 5 + 1, (*sy)[i] / (h as f64) * 2.0 - 1.0)
+        putf(tmp, i * 5 + 2, (*col)[i * 3])
+        putf(tmp, i * 5 + 3, (*col)[i * 3 + 1])
+        putf(tmp, i * 5 + 4, (*col)[i * 3 + 2])
+        i = i + 1
+    }
+    let ok: bool = vk.buf_write(vb, tmp, 60)
+    rt.heap_free(tmp, 60)
+    return ok
+}
+
+fn report(name: str, c: *mut Cmp, min_psnr_x100: u64, max_cov_mm: u64) -> bool {
+    let ok: bool = (*c).psnr_x100 >= min_psnr_x100 && (*c).cov_mm <= max_cov_mm
+    io.print(name)
+    io.print(": psnr=")
+    print_f2(((*c).psnr_x100 as f64) / 100.0)
+    io.fmt_print(f" dB cov_a={(*c).cov_a} cov_b={(*c).cov_b} mismatch={(*c).cov_mm} max_diff={(*c).max_diff} ")
+    if ok { io.print("ok\n") } else { io.print("FAIL\n") }
+    return ok
+}
+
+fn pump(w: *mut window.Window, ms: i64) {
+    window.wait_event(w, ms)
+    var k: u32 = window.next_event(w)
+    var n: i32 = 0
+    while k != window.EV_NONE && n < 10000 {
+        n = n + 1
+        k = window.next_event(w)
+    }
+}
+
+// swapchain on the window, one surface kind (mode 0 xlib, 1 xcb). Compares the window contents with an offscreen render.
+fn swapchain_test(v: *mut vk.Vk, win: *mut window.Window, xid: u64, mode: i32, vb: *mut vk.Buf, ref_flat: u64, clear: u32) -> bool {
+    var name: str = "xlib"
+    if mode == 1 { name = "xcb" }
+    var s: vk.Sc = vk.sc_blank()
+    if !vk.sc_open(v, &s, xid, W, H, mode) {
+        io.print("swapchain ")
+        io.print(name)
+        io.print(": sc_open failed FAIL\n")
+        return false
+    }
+    var p: vk.Pipe = vk.pipe_blank()
+    if !vk.pipeline_tri(v, &p, s.rpass) {
+        io.print("swapchain: pipeline failed FAIL\n")
+        vk.sc_close(v, &s)
+        return false
+    }
+    var ok: bool = true
+    io.print("swapchain ")
+    io.print(name)
+    io.fmt_print(f": images={s.n} format={s.fmt} extent={s.w}x{s.h}\n")
+    var f: i32 = 0
+    var bad: i32 = 0
+    while f < 4 {
+        pump(win, 5)
+        let r: i32 = vk.sc_frame(v, &s, &p, vb, 3 as u64, clear)
+        if r != vk.FRAME_OK { bad = bad + 1 }
+        f = f + 1
+    }
+    let px: u64 = rt.heap_alloc((W as usize) * (H as usize) * 4)
+    var c: Cmp = Cmp { psnr_x100: 0 as u64, cov_a: 0 as u64, cov_b: 0 as u64, cov_mm: 0 as u64, max_diff: 0 as u32 }
+    if bad == 0 && s.w == W && s.h == H && vk.window_pixels(v, &s, px) {
+        compare(px, ref_flat, (W as usize) * (H as usize), clear, &c)
+        io.print("swapchain ")
+        io.print(name)
+        io.print(" window vs offscreen")
+        io.print(" -> ")
+        if !report("compare", &c, 4000 as u64, 50 as u64) { ok = false }
+    } else {
+        io.fmt_print(f"swapchain: frames failed={bad} (or size {s.w}x{s.h} / window read back) FAIL\n")
+        ok = false
+    }
+    // resize: the window grows to 400 x 240, the swapchain follows
+    if ok {
+        backend.r_set_size(&(*win).p, 400, 240)
+        var waited: i32 = 0
+        while (window.width(win) != 400 || window.height(win) != 240) && waited < 2000 {
+            pump(win, 20)
+            waited = waited + 20
+        }
+        var r: i32 = vk.sc_frame(v, &s, &p, vb, 3 as u64, clear)
+        io.fmt_print(f"swapchain: frame after resize result={r} (0 ok, 1 out of date) swapchain={s.w}x{s.h}\n")
+        if r == vk.FRAME_RESIZE || s.w != 400 || s.h != 240 {
+            if !vk.sc_resize(v, &s, 400, 240) {
+                io.print("swapchain: sc_resize failed FAIL\n")
+                ok = false
+            }
+            r = vk.sc_frame(v, &s, &p, vb, 3 as u64, clear)
+            r = vk.sc_frame(v, &s, &p, vb, 3 as u64, clear)
+        }
+        if ok && r == vk.FRAME_OK && s.w == 400 && s.h == 240 {
+            io.print("swapchain: resized to 400x240 ok\n")
+            var t2: vk.Target = vk.target_new_blank()
+            var p2: vk.Pipe = vk.pipe_blank()
+            if vk.target_new(v, &t2, 400, 240) && vk.pipeline_tri(v, &p2, t2.rpass) && vk.draw(v, &t2, &p2, vb, 3 as u64, clear) {
+                let ref2: u64 = rt.heap_alloc(400 * 240 * 4)
+                let px2: u64 = rt.heap_alloc(400 * 240 * 4)
+                vk.read_pixels(&t2, ref2)
+                if vk.window_pixels(v, &s, px2) {
+                    compare(px2, ref2, 400 * 240, clear, &c)
+                    io.print("swapchain after resize -> ")
+                    if !report("compare", &c, 4000 as u64, 50 as u64) { ok = false }
+                } else {
+                    io.print("swapchain: window read back after resize failed FAIL\n")
+                    ok = false
+                }
+                rt.heap_free(ref2, 400 * 240 * 4)
+                rt.heap_free(px2, 400 * 240 * 4)
+            } else {
+                io.print("swapchain: offscreen reference at 400x240 failed FAIL\n")
+                ok = false
+            }
+            vk.pipeline_free(v, &p2)
+            vk.target_free(v, &t2)
+        } else if ok {
+            io.fmt_print(f"swapchain: resize failed (frame result={r} size={s.w}x{s.h}) FAIL\n")
+            ok = false
+        }
+        // the window is back to 320x180 for the next surface kind
+        backend.r_set_size(&(*win).p, W as usize, H as usize)
+        waited = 0
+        while (window.width(win) != (W as usize) || window.height(win) != (H as usize)) && waited < 2000 {
+            pump(win, 20)
+            waited = waited + 20
+        }
+    }
+    rt.heap_free(px, (W as usize) * (H as usize) * 4)
+    vk.pipeline_free(v, &p)
+    vk.sc_close(v, &s)
+    return ok
+}
+
+fn main(start: u64) -> i32 {
+    var v: vk.Vk = vk.vk_new()
+    if rt.arg_count(start) >= 2 {
+        // "nolib": the only mode argument
+        let opened: bool = vk.open(&v, false, true)
+        if opened || v.step != vk.STEP_NO_LOADER {
+            io.fmt_print(f"nolib: open={opened} step={v.step} FAIL\n")
+            return 3
+        }
+        io.print("nolib: open returned false, step=NO_LOADER ok\n")
+        return 0
+    }
+    let want_surface: bool = env.has("DISPLAY")
+    let t0: u64 = time.monotonic_ns()
+    if !vk.open(&v, want_surface, true) {
+        io.fmt_print(f"open failed step={v.step}\n")
+        if v.step == vk.STEP_NO_LOADER || v.step == vk.STEP_NO_DEVICE || v.step == vk.STEP_NO_INSTANCE { return 4 }
+        return 3
+    }
+    let t1: u64 = time.monotonic_ns()
+    io.print("device: ")
+    io.print_c(vk.device_name(&v))
+    let api: u64 = vk.api_version(&v)
+    io.fmt_print(f" type={vk.device_type(&v)} cpu={vk.is_cpu(&v)} api={api >> 22}.{(api >> 12) & 1023} open_ms={(t1 - t0) / 1000000}\n")
+    io.fmt_print(f"surface_ext={vk.has_surface_ext(&v)} swapchain_ext={vk.has_swapchain(&v)}\n")
+    var fails: i32 = 0
+    let clear: u32 = 0xFFE6BE96 as u32
+    let n: usize = (W as usize) * (H as usize)
+
+    var tgt: vk.Target = vk.target_new_blank()
+    if !vk.target_new(&v, &tgt, W, H) {
+        io.print("target_new failed FAIL\n")
+        return 3
+    }
+    // ---- bad SPIR-V sizes are refused before the driver sees them
+    var pbad: vk.Pipe = vk.pipe_blank()
+    if vk.pipeline_new(&v, &pbad, tgt.rpass, 0, 0, 0, 0) || vk.pipeline_new(&v, &pbad, tgt.rpass, 4096, 7, 4096, 7) {
+        io.print("pipeline with empty / odd sized SPIR-V accepted FAIL\n")
+        fails = fails + 1
+    } else {
+        io.print("pipeline with empty / odd sized SPIR-V refused ok\n")
+    }
+
+    // ---- scene 1: flat triangle vs mc_raster
+    var sx: [f64; 3] = [0.0; 3]
+    var sy: [f64; 3] = [0.0; 3]
+    let cpu: u64 = rt.heap_alloc(n * 4)
+    let gpu: u64 = rt.heap_alloc(n * 4)
+    cpu_flat(clear, cpu, &sx, &sy)
+    let cxi: usize = ((sx[0] + sx[1] + sx[2]) / 3.0) as usize
+    let cyi: usize = ((sy[0] + sy[1] + sy[2]) / 3.0) as usize
+    let flat: u32 = rt.ld32(cpu, cyi * (W as usize) + cxi)
+    var col: [f64; 9] = [0.0; 9]
+    var k: usize = 0
+    while k < 3 {
+        col[k * 3] = ((flat & (255 as u32)) as f64) / 255.0
+        col[k * 3 + 1] = (((flat >> (8 as u32)) & (255 as u32)) as f64) / 255.0
+        col[k * 3 + 2] = (((flat >> (16 as u32)) & (255 as u32)) as f64) / 255.0
+        k = k + 1
+    }
+    var pl: vk.Pipe = vk.pipe_blank()
+    var vb: vk.Buf = vk.buf_blank()
+    if !vk.pipeline_tri(&v, &pl, tgt.rpass) || !vk.buf_new(&v, &vb, 60) || !fill_vertices(&vb, &sx, &sy, &col, W, H) {
+        io.print("pipeline / vertex buffer failed FAIL\n")
+        return 3
+    }
+    var c: Cmp = Cmp { psnr_x100: 0 as u64, cov_a: 0 as u64, cov_b: 0 as u64, cov_mm: 0 as u64, max_diff: 0 as u32 }
+    if !vk.draw(&v, &tgt, &pl, &vb, 3 as u64, clear) || !vk.read_pixels(&tgt, gpu) {
+        io.print("draw failed FAIL\n")
+        return 3
+    }
+    compare(cpu, gpu, n, clear, &c)
+    io.print("scene flat triangle, Vulkan vs mc_raster -> ")
+    if report("compare", &c, 3400 as u64, 60 as u64) {
+        io.fmt_print(f"metric vk_flat_psnr_x100={c.psnr_x100}\n")
+    } else {
+        fails = fails + 1
+    }
+    if rt.ld32(gpu, 0) == clear { io.print("corner pixel = clear colour ok\n") } else { io.print("corner pixel differs from the clear colour FAIL\n"); fails = fails + 1 }
+    let ref_flat: u64 = rt.heap_alloc(n * 4)
+    rt.mem_copy(ref_flat, gpu, n * 4)
+
+    // ---- scene 2: colour gradient vs the float CPU reference
+    var gcol: [f64; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    let ref_g: u64 = rt.heap_alloc(n * 4)
+    cpu_gradient(clear, ref_g, &sx, &sy, &gcol)
+    fill_vertices(&vb, &sx, &sy, &gcol, W, H)
+    if !vk.draw(&v, &tgt, &pl, &vb, 3 as u64, clear) || !vk.read_pixels(&tgt, gpu) {
+        io.print("draw (gradient) failed FAIL\n")
+        return 3
+    }
+    compare(ref_g, gpu, n, clear, &c)
+    io.print("scene gradient triangle, Vulkan vs float CPU reference -> ")
+    if report("compare", &c, 3400 as u64, 80 as u64) {
+        io.fmt_print(f"metric vk_gradient_psnr_x100={c.psnr_x100}\n")
+    } else {
+        fails = fails + 1
+    }
+
+    // ---- time per frame (offscreen, with read back; lavapipe is a CPU renderer: NOT a GPU number)
+    var f: i32 = 0
+    let tf0: u64 = time.monotonic_ns()
+    while f < 50 {
+        vk.draw(&v, &tgt, &pl, &vb, 3 as u64, clear)
+        f = f + 1
+    }
+    let tf1: u64 = time.monotonic_ns()
+    io.fmt_print(f"offscreen draw + read back: {(tf1 - tf0) / 50000} us/frame (50 frames, {W}x{H})\n")
+
+    // ---- swapchain on an X11 window (the flat scene; reference = the flat offscreen picture)
+    fill_vertices(&vb, &sx, &sy, &col, W, H)
+    if want_surface && vk.has_swapchain(&v) {
+        var win: window.Window = window.window_new()
+        if window.open_window(&win, 0) && window.make(&win, W as usize, H as usize) {
+            window.title(&win, "vk probe".p as u64, "vk probe".n)
+            window.show_window(&win)
+            pump(&win, 100)
+            let xid: u64 = backend.r_native(&win.p)
+            var m: i32 = 0
+            while m < 2 {
+                if !swapchain_test(&v, &win, xid, m, &vb, ref_flat, clear) { fails = fails + 1 }
+                m = m + 1
+            }
+            window.close_window(&win)
+        } else {
+            io.print("SKIP swapchain: no X11 window (DISPLAY unusable)\n")
+        }
+    } else {
+        io.print("SKIP swapchain: no DISPLAY or the device has no VK_KHR_swapchain / surface extensions\n")
+    }
+
+    vk.buf_free(&v, &vb)
+    vk.pipeline_free(&v, &pl)
+    vk.target_free(&v, &tgt)
+    vk.close(&v)
+    io.fmt_print(f"RESULT fails={fails}\n")
+    if fails == 0 { return 0 }
+    return 3
+}

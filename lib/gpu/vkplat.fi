@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/vkplat.fi -- gpu.vkplat: the platform part of gpu.vk (Linux/X11). Windows twin: vkplat.windows.fi.
+//
+//     let lib: u64 = vkplat.lib_open()                 // libvulkan.so.1, 0 = no Vulkan loader on this machine
+//     vkplat.surface_ext_count() / surface_ext_name(i) // instance extensions that give a window surface
+//     vkplat.surface_create(&p, gipa, inst, mask, native, mode, scratch, out)  // VkSurfaceKHR of a native window
+//
+// Linux: the surface comes from VK_KHR_xlib_surface (mode 0, Display* + XID) or VK_KHR_xcb_surface (mode 1,
+// xcb_connection_t* out of libX11-xcb + XID). The Display is opened here (a second connection, like glctx does for EGL);
+// the XID is the one of the Firn window of lib/window (an XID is global on the server).
+//
+// THREADS: main thread only (docs/FFI.md).
+
+import std.rt
+import std.dynlib
+import std.env
+
+export {
+    PlatState, plat_new, plat_close, lib_open, surface_ext_count, surface_ext_name, surface_create, read_window, plat_name,
+}
+
+struct PlatState {
+    x11: u64, // libX11 handle
+    xcbx: u64, // libX11-xcb handle
+    dpy: u64, // Display*
+    conn: u64, // xcb_connection_t*
+}
+
+fn plat_new() -> PlatState {
+    return PlatState { x11: 0, xcbx: 0, dpy: 0, conn: 0 }
+}
+
+fn plat_name() -> str {
+    return "x11"
+}
+
+// FIRN_VK_LIB (a library name or path) replaces the default: tests use it for the "no loader" path.
+fn lib_open() -> u64 {
+    if env.has("FIRN_VK_LIB") {
+        return dynlib.open(env.get("FIRN_VK_LIB"))
+    }
+    var h: u64 = dynlib.open("libvulkan.so.1")
+    if h == 0 {
+        h = dynlib.open("libvulkan.so")
+    }
+    return h
+}
+
+// 0 = VK_KHR_surface, 1 = xlib, 2 = xcb
+fn surface_ext_count() -> i32 {
+    return 3
+}
+
+fn surface_ext_name(i: i32) -> str {
+    if i == 0 {
+        return "VK_KHR_surface"
+    }
+    if i == 1 {
+        return "VK_KHR_xlib_surface"
+    }
+    return "VK_KHR_xcb_surface"
+}
+
+fn call6(f: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    var a: [u64; 8] = [0; 8]
+    a[0] = a0
+    a[1] = a1
+    a[2] = a2
+    a[3] = a3
+    a[4] = a4
+    a[5] = a5
+    return dynlib.callx(f, "iiiiii", (&a[0]) as u64, false)
+}
+
+fn put_name(p: u64, s: str) {
+    let n: usize = s.length()
+    var i: usize = 0
+    while i < n {
+        rt.st8(p, i, s.chars(i))
+        i = i + 1
+    }
+    rt.st8(p, n, 0 as u8)
+}
+
+fn open_display(p: *mut PlatState) -> bool {
+    if (*p).dpy != 0 {
+        return true
+    }
+    (*p).x11 = dynlib.open("libX11.so.6")
+    if (*p).x11 == 0 {
+        return false
+    }
+    let f: u64 = dynlib.sym((*p).x11, "XOpenDisplay")
+    if f == 0 {
+        return false
+    }
+    (*p).dpy = call6(f, 0, 0, 0, 0, 0, 0)
+    return (*p).dpy != 0
+}
+
+// Creates the surface of the native window `native` (an XID). `mask` = bit i set when surface extension i was enabled on the instance.
+// `scratch` = at least 256 zeroed bytes, `out` = where the VkSurfaceKHR (8 bytes) goes. mode 0 = xlib, 1 = xcb.
+fn surface_create(p: *mut PlatState, gipa: u64, inst: u64, mask: u64, native: u64, mode: i32, scratch: u64, out: u64) -> bool {
+    if !open_display(p) {
+        return false
+    }
+    rt.mem_set(scratch, 0 as u8, 256)
+    if mode == 1 {
+        if (mask & 4) == 0 {
+            return false
+        }
+        if (*p).conn == 0 {
+            (*p).xcbx = dynlib.open("libX11-xcb.so.1")
+            if (*p).xcbx == 0 {
+                return false
+            }
+            let g: u64 = dynlib.sym((*p).xcbx, "XGetXCBConnection")
+            if g == 0 {
+                return false
+            }
+            (*p).conn = call6(g, (*p).dpy, 0, 0, 0, 0, 0)
+        }
+        if (*p).conn == 0 {
+            return false
+        }
+        put_name(scratch + 128, "vkCreateXcbSurfaceKHR")
+        let f: u64 = call6(gipa, inst, scratch + 128, 0, 0, 0, 0)
+        if f == 0 {
+            return false
+        }
+        rt.st32(scratch, 0, 1000005000 as u32) // VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR
+        rt.st64(scratch, 3, (*p).conn)
+        rt.st32(scratch, 8, native as u32)
+        let r: u64 = call6(f, inst, scratch, 0, out, 0, 0)
+        return (r & 0xFFFFFFFF) == 0
+    }
+    if (mask & 2) == 0 {
+        return false
+    }
+    put_name(scratch + 128, "vkCreateXlibSurfaceKHR")
+    let f: u64 = call6(gipa, inst, scratch + 128, 0, 0, 0, 0)
+    if f == 0 {
+        return false
+    }
+    rt.st32(scratch, 0, 1000004000 as u32) // VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR
+    rt.st64(scratch, 3, (*p).dpy)
+    rt.st64(scratch, 4, native)
+    let r: u64 = call6(f, inst, scratch, 0, out, 0, 0)
+    return (r & 0xFFFFFFFF) == 0
+}
+
+// Reads the CURRENT contents of the window (XGetImage on the same Display connection, so it is ordered after the
+// present) into `out` as w*h RGBA octets (row 0 = top). Only for 24/32 bit ZPixmap visuals (BGRX in memory).
+fn read_window(p: *mut PlatState, xid: u64, w: i32, h: i32, out: u64) -> bool {
+    if !open_display(p) {
+        return false
+    }
+    let sync: u64 = dynlib.sym((*p).x11, "XSync")
+    let getimg: u64 = dynlib.sym((*p).x11, "XGetImage")
+    let destroy: u64 = dynlib.sym((*p).x11, "XDestroyImage")
+    if getimg == 0 || sync == 0 {
+        return false
+    }
+    call6(sync, (*p).dpy, 0, 0, 0, 0, 0)
+    // XGetImage has 8 arguments: (dpy, d, x, y, w, h, plane_mask, format) -> 6 in registers, 2 on the stack
+    var b: [u64; 8] = [0; 8]
+    b[0] = (*p).dpy
+    b[1] = xid
+    b[2] = 0
+    b[3] = 0
+    b[4] = w as u64
+    b[5] = h as u64
+    b[6] = 0xFFFFFFFFFFFFFFFF
+    b[7] = 2 // ZPixmap
+    let img: u64 = dynlib.callx(getimg, "iiiiiiii", (&b[0]) as u64, false)
+    if img == 0 {
+        return false
+    }
+    let data: u64 = rt.ld64(img, 2) // offset 16
+    let bpl: u32 = rt.ld32(img, 11) // offset 44
+    let bpp: u32 = rt.ld32(img, 12) // offset 48
+    var ok: bool = data != 0 && bpp == (32 as u32)
+    if ok {
+        var y: i32 = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                let o: usize = (y as usize) * (bpl as usize) + (x as usize) * 4
+                let d: usize = ((y as usize) * (w as usize) + (x as usize)) * 4
+                rt.st8(out, d, rt.ld8(data, o + 2))
+                rt.st8(out, d + 1, rt.ld8(data, o + 1))
+                rt.st8(out, d + 2, rt.ld8(data, o))
+                rt.st8(out, d + 3, 255 as u8)
+                x = x + 1
+            }
+            y = y + 1
+        }
+    }
+    if destroy != 0 {
+        call6(destroy, img, 0, 0, 0, 0, 0)
+    }
+    return ok
+}
+
+fn plat_close(p: *mut PlatState) {
+    if (*p).dpy != 0 && (*p).x11 != 0 {
+        let f: u64 = dynlib.sym((*p).x11, "XCloseDisplay")
+        if f != 0 {
+            call6(f, (*p).dpy, 0, 0, 0, 0, 0)
+        }
+    }
+    (*p).dpy = 0
+    (*p).conn = 0
+}
