@@ -1,11 +1,11 @@
 # AUDIO -- `audio.engine`: Aulos design in Firn
 
-
-Device/stream registry (defaults, hot-plug, volume/mute, per-app mixer, microphone mute, levels): see `docs/AUDIO-HUB.md` (`audio.hub`).
 `lib/audio/engine.fi` rebuilds the C++ engine AULOS (`/root/projects/aulos`, used by Daidalos `dai_audio.cpp`)
 in Firn: events, voices, buses, mute/volume per bus, master limiter, 3D (pan, distance, Doppler), parameter curves,
 low pass, voice stealing, `max_instances`. Output goes to any `audio.sink` (PulseAudio, waveOut, file) via `engine_pump`,
 or offline via `engine_render`. Older, simpler layer stays: `audio.mixer` (integer, 32 voices, bit exact against Python).
+
+Device/stream registry (defaults, hot-plug, volume/mute, per-app mixer, microphone mute, levels): see `docs/AUDIO-HUB.md` (`audio.hub`).
 
 ## Parity table (Aulos -> Firn)
 | Aulos | Firn (`import audio.engine`) |
