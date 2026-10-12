@@ -1,0 +1,573 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/synth_recipe.fi -- audio.synth_recipe: renders a sound RECIPE (JSON graph) to samples.
+//
+//     import audio.synth_recipe
+//     var out: synth_recipe.Sound = synth_recipe.sound_zero()
+//     var err: rt.Buf = rt.buf_new()
+//     if synth_recipe.recipe_render(&json_doc, sound_obj, 44100, variant, &out, &err) { ... out.samples (f64 * out.n) ... }
+//
+// A recipe SOUND is a JSON object (full format and examples: docs/audio/SYNTH.md):
+//   { "id": "block.stone.step", "duration_ms": 220, "seed": 1234, "variants": 3, "peak_db": -4,
+//     "fade_in_ms": 1, "fade_out_ms": 10, "out": "mix", "nodes": [ {"id":"n","type":"noise",...}, ... ] }
+// Nodes run in order; each makes one signal (an array of f64) that later nodes name in "in" / "src" / "pm".
+// Node types: osc, noise, env, adsr, filter, gain, mul, mix, delay, reverb, clip, limit, crush, shift, pluck, notes.
+// PARAMETER forms (freq, cutoff, q, gain, ...): a number | "node-id" (that signal, sample by sample) |
+//   {"rand":[lo,hi]} (random per variant) | {"note":midi} (Hz) | {"sweep":[a,b],"ms":T,"curve":c,"log":true,"unit":"note"}
+//   | {"src":"node-id","base":b,"depth":d}  (= b + d * signal; e.g. an envelope modulating the cutoff).
+// VARIANTS: variant k uses the seed mix(seed, k); every node draws from its own stream mix(variant seed, node index),
+// so "rand" values and noise differ per variant but are the same on every run and platform.
+//
+// HONEST
+// R1  Rendering is offline (whole buffers, f64): fine for sounds up to some minutes, not a real time engine.
+// R2  Same determinism rules as synth_osc: the output of a recipe is bit for bit the same everywhere.
+import std.rt
+import std.str
+import std.json
+import std.math
+import audio.synth_osc
+import audio.synth_fx
+
+export { Sound, sound_zero, sound_free, recipe_render, name_is, jmember, jnum, jstr, log2f }
+
+struct Sound {
+    samples: u64, // f64 array
+    n: usize,
+    rate: u32,
+    peak: f64, // linear peak after normalising
+    rms: f64,
+    hits: usize, // samples at +-32767 after quantisation
+}
+
+fn sound_zero() -> Sound {
+    return Sound { samples: 0, n: 0, rate: 44100 as u32, peak: 0.0, rms: 0.0, hits: 0 }
+}
+
+fn sound_free(s: *mut Sound) {
+    if (*s).samples != 0 {
+        synth_osc.sig_free((*s).samples, (*s).n)
+    }
+    (*s).samples = 0
+    (*s).n = 0
+}
+
+const MAX_NODES: usize = 96
+
+struct Ctx {
+    d: *mut json.Json,
+    n: usize,
+    rate: f64,
+    seed: u64, // variant seed
+    reg: u64, // MAX_NODES * 3 u64: name pointer, name length, buffer
+    count: usize,
+    err: *mut rt.Buf,
+    bad: bool,
+}
+
+// ------------------------------------------------------------------------------------------------ json helpers
+
+fn jmember(d: *mut json.Json, obj: u32, key: str) -> u32 {
+    if obj == json.JSON_NONE || json.json_kind(d, obj) != json.JSON_OBJECT {
+        return json.JSON_NONE
+    }
+    return json.json_get(d, obj, key.p as u64, key.length())
+}
+
+fn jnum(d: *mut json.Json, obj: u32, key: str, fb: f64) -> f64 {
+    let v: u32 = jmember(d, obj, key)
+    if v == json.JSON_NONE { return fb }
+    let k: u8 = json.json_kind(d, v)
+    if k == json.JSON_NUMBER { return json.json_number(d, v) }
+    if k == json.JSON_TRUE { return 1.0 }
+    if k == json.JSON_FALSE { return 0.0 }
+    return fb
+}
+
+fn jstr(d: *mut json.Json, obj: u32, key: str, fb: str) -> str {
+    let v: u32 = jmember(d, obj, key)
+    if v == json.JSON_NONE || json.json_kind(d, v) != json.JSON_STRING { return fb }
+    let sp: str.Span = json.json_string(d, v)
+    return str { p: sp.p, n: sp.n }
+}
+
+fn name_is(s: str, lit: str) -> bool {
+    if s.length() != lit.length() { return false }
+    return rt.mem_eq(s.p as u64, lit.p as u64, s.length())
+}
+
+fn log2f(x: f64) -> f64 {
+    var m: f64 = x
+    var e: f64 = 0.0
+    if m <= 0.0 { return 0.0 }
+    while m >= 2.0 {
+        m = m * 0.5
+        e = e + 1.0
+    }
+    while m < 1.0 {
+        m = m * 2.0
+        e = e - 1.0
+    }
+    let t: f64 = (m - 1.0) / (m + 1.0)
+    let t2: f64 = t * t
+    var term: f64 = t
+    var sum: f64 = 0.0
+    var k: i64 = 1
+    while k <= 41 {
+        sum = sum + term / (k as f64)
+        term = term * t2
+        k = k + 2
+    }
+    return e + 2.0 * sum / 0.6931471805599453
+}
+
+fn fail(c: *mut Ctx, a: str, b: str) {
+    if (*c).bad { return }
+    (*c).bad = true
+    rt.buf_push_bytes((*c).err, a.p as u64, a.length())
+    rt.buf_push_bytes((*c).err, b.p as u64, b.length())
+}
+
+fn note_hz(m: f64) -> f64 {
+    return 440.0 * synth_osc.pow2((m - 69.0) / 12.0)
+}
+
+// ------------------------------------------------------------------------------------------------ registry
+
+fn reg_find(c: *mut Ctx, name: str) -> i32 {
+    var i: usize = 0
+    while i < (*c).count {
+        let ln: usize = rt.ld64((*c).reg, i * 3 + 1) as usize
+        if ln == name.length() && rt.mem_eq(rt.ld64((*c).reg, i * 3), name.p as u64, ln) {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// signal of node `name`; 0 and an error when unknown
+fn sig_of(c: *mut Ctx, name: str) -> u64 {
+    let k: i32 = reg_find(c, name)
+    if k < 0 {
+        fail(c, "unknown node: ", name)
+        return 0
+    }
+    return rt.ld64((*c).reg, (k as usize) * 3 + 2)
+}
+
+// signal named by string member `key`; 0 when the member is missing or unknown
+fn sig_member(c: *mut Ctx, obj: u32, key: str) -> u64 {
+    let nm: str = jstr((*c).d, obj, key, "")
+    if nm.length() == 0 { return 0 }
+    return sig_of(c, nm)
+}
+
+// ------------------------------------------------------------------------------------------------ parameters
+
+// scalar: number | {"rand":[lo,hi]} | {"note":m}
+fn scalar(c: *mut Ctx, v: u32, r: *mut synth_osc.Rng, fb: f64) -> f64 {
+    let d: *mut json.Json = (*c).d
+    if v == json.JSON_NONE { return fb }
+    let k: u8 = json.json_kind(d, v)
+    if k == json.JSON_NUMBER { return json.json_number(d, v) }
+    if k == json.JSON_OBJECT {
+        let rv: u32 = jmember(d, v, "rand")
+        if rv != json.JSON_NONE && json.json_count(d, rv) >= 2 {
+            let lo: f64 = json.json_number(d, json.json_child_at(d, rv, 0))
+            let hi: f64 = json.json_number(d, json.json_child_at(d, rv, 1))
+            return synth_osc.rng_range(r, lo, hi)
+        }
+        let nv: u32 = jmember(d, v, "note")
+        if nv != json.JSON_NONE {
+            return note_hz(scalar(c, nv, r, 60.0))
+        }
+    }
+    return fb
+}
+
+fn sc(c: *mut Ctx, obj: u32, key: str, r: *mut synth_osc.Rng, fb: f64) -> f64 {
+    return scalar(c, jmember((*c).d, obj, key), r, fb)
+}
+
+// A parameter as a NEW per-sample array (caller frees with sig_free(p, n)).
+fn param(c: *mut Ctx, obj: u32, key: str, r: *mut synth_osc.Rng, fb: f64) -> u64 {
+    let d: *mut json.Json = (*c).d
+    let n: usize = (*c).n
+    let v: u32 = jmember(d, obj, key)
+    if v == json.JSON_NONE { return synth_osc.sig_const(n, fb) }
+    let k: u8 = json.json_kind(d, v)
+    if k == json.JSON_NUMBER { return synth_osc.sig_const(n, json.json_number(d, v)) }
+    if k == json.JSON_STRING {
+        let sp: str.Span = json.json_string(d, v)
+        let s: u64 = sig_of(c, str { p: sp.p, n: sp.n })
+        if s == 0 { return synth_osc.sig_const(n, fb) }
+        return synth_osc.sig_copy(s, n)
+    }
+    if k == json.JSON_OBJECT {
+        let sw: u32 = jmember(d, v, "sweep")
+        if sw != json.JSON_NONE && json.json_count(d, sw) >= 2 {
+            var a: f64 = scalar(c, json.json_child_at(d, sw, 0), r, fb)
+            var b: f64 = scalar(c, json.json_child_at(d, sw, 1), r, fb)
+            let unit_note: bool = name_is(jstr(d, v, "unit", ""), "note")
+            let islog: bool = jnum(d, v, "log", 0.0) != 0.0
+            let cv: f64 = jnum(d, v, "curve", 0.0)
+            var ms: f64 = jnum(d, v, "ms", 0.0)
+            let total: f64 = (n as f64) * 1000.0 / (*c).rate
+            if ms <= 0.0 || ms > total { ms = total }
+            let out: u64 = synth_osc.sig_new(n)
+            var la: f64 = 0.0
+            var lr: f64 = 0.0
+            if islog && !unit_note && a > 0.0 && b > 0.0 {
+                la = a
+                lr = log2f(b / a)
+            }
+            var i: usize = 0
+            while i < n {
+                var u: f64 = ((i as f64) * 1000.0 / (*c).rate) / ms
+                if u > 1.0 { u = 1.0 }
+                let s: f64 = synth_osc.shape(u, cv)
+                var x: f64 = a + (b - a) * s
+                if lr != 0.0 {
+                    x = la * synth_osc.pow2(lr * s)
+                }
+                if unit_note { x = note_hz(x) }
+                synth_osc.pf(out, i, x)
+                i = i + 1
+            }
+            a = 0.0
+            b = 0.0
+            return out
+        }
+        let sn: str = jstr(d, v, "src", "")
+        if sn.length() > 0 {
+            let s: u64 = sig_of(c, sn)
+            if s == 0 { return synth_osc.sig_const(n, fb) }
+            let base: f64 = scalar(c, jmember(d, v, "base"), r, 0.0)
+            let depth: f64 = scalar(c, jmember(d, v, "depth"), r, 1.0)
+            let out: u64 = synth_osc.sig_new(n)
+            var i: usize = 0
+            while i < n {
+                synth_osc.pf(out, i, base + depth * synth_osc.gf(s, i))
+                i = i + 1
+            }
+            return out
+        }
+        return synth_osc.sig_const(n, scalar(c, v, r, fb))
+    }
+    return synth_osc.sig_const(n, fb)
+}
+
+// ------------------------------------------------------------------------------------------------ nodes
+
+fn wave_of(s: str) -> i32 {
+    if name_is(s, "tri") || name_is(s, "triangle") { return synth_osc.WAVE_TRI }
+    if name_is(s, "saw") { return synth_osc.WAVE_SAW }
+    if name_is(s, "square") { return synth_osc.WAVE_SQUARE }
+    if name_is(s, "pulse") { return synth_osc.WAVE_PULSE }
+    return synth_osc.WAVE_SINE
+}
+
+fn kind_of(s: str) -> i32 {
+    if name_is(s, "hp") || name_is(s, "highpass") { return synth_fx.FILT_HP }
+    if name_is(s, "bp") || name_is(s, "bandpass") { return synth_fx.FILT_BP }
+    if name_is(s, "notch") { return synth_fx.FILT_NOTCH }
+    return synth_fx.FILT_LP
+}
+
+fn node_notes(c: *mut Ctx, obj: u32, r: *mut synth_osc.Rng, out: u64) {
+    let d: *mut json.Json = (*c).d
+    let n: usize = (*c).n
+    let rate: f64 = (*c).rate
+    let root: f64 = sc(c, obj, "root", r, 57.0)
+    let step_ms: f64 = sc(c, obj, "step_ms", r, 500.0)
+    let dens: f64 = sc(c, obj, "density", r, 0.5)
+    let atk: f64 = sc(c, obj, "attack_ms", r, 20.0)
+    let dec: f64 = sc(c, obj, "decay_ms", r, 800.0)
+    let h2: f64 = sc(c, obj, "h2", r, 0.3)
+    let h3: f64 = sc(c, obj, "h3", r, 0.1)
+    let gain: f64 = sc(c, obj, "gain", r, 0.3)
+    let octs: usize = sc(c, obj, "octaves", r, 2.0) as usize
+    let sv: u32 = jmember(d, obj, "scale")
+    var degs: [f64; 16] = [0.0; 16]
+    var nd: usize = 0
+    if sv != json.JSON_NONE && json.json_kind(d, sv) == json.JSON_ARRAY {
+        var ch: u32 = json.json_child(d, sv)
+        while ch != json.JSON_NONE && nd < 16 {
+            degs[nd] = json.json_number(d, ch)
+            nd = nd + 1
+            ch = json.json_next(d, ch)
+        }
+    }
+    if nd == 0 {
+        degs[0] = 0.0
+        degs[1] = 2.0
+        degs[2] = 4.0
+        degs[3] = 7.0
+        degs[4] = 9.0
+        nd = 5
+    }
+    var o: usize = octs
+    if o < 1 { o = 1 }
+    let steps: usize = ((n as f64) * 1000.0 / rate / step_ms) as usize
+    var s: usize = 0
+    while s < steps {
+        let roll: f64 = synth_osc.rng_f64(r)
+        let pick: usize = (synth_osc.rng_next(r) % ((nd * o) as u64)) as usize
+        let vel: f64 = 0.6 + 0.4 * synth_osc.rng_f64(r)
+        if roll < dens {
+            let m: f64 = root + 12.0 * ((pick / nd) as f64) + degs[pick % nd]
+            let at: usize = ((s as f64) * step_ms * rate / 1000.0) as usize
+            synth_osc.add_voice(out, n, rate, at, note_hz(m), gain * vel, atk, dec, h2, h3)
+        }
+        s = s + 1
+    }
+}
+
+// Renders node `obj` into a new buffer; 0 on error.
+fn render_node(c: *mut Ctx, obj: u32, idx: usize) -> u64 {
+    let d: *mut json.Json = (*c).d
+    let n: usize = (*c).n
+    let rate: f64 = (*c).rate
+    let ty: str = jstr(d, obj, "type", "")
+    var r: synth_osc.Rng = synth_osc.rng_new(synth_osc.mix_seed((*c).seed, (idx + 1) as u64))
+    let out: u64 = synth_osc.sig_new(n)
+    if name_is(ty, "osc") {
+        let fr: u64 = param(c, obj, "freq", &r, 440.0)
+        let pm: u64 = sig_member(c, obj, "pm")
+        let wv: i32 = wave_of(jstr(d, obj, "wave", "sine"))
+        let w: f64 = sc(c, obj, "width", &r, 0.5)
+        let ph: f64 = sc(c, obj, "phase", &r, 0.0)
+        let depth: f64 = sc(c, obj, "pm_depth", &r, 1.0)
+        synth_osc.osc_fill(out, n, rate, wv, fr, pm, depth, w, ph)
+        synth_osc.sig_free(fr, n)
+        let scl: f64 = sc(c, obj, "scale", &r, 1.0)
+        let off: f64 = sc(c, obj, "offset", &r, 0.0)
+        if scl != 1.0 || off != 0.0 {
+            var i: usize = 0
+            while i < n {
+                synth_osc.pf(out, i, synth_osc.gf(out, i) * scl + off)
+                i = i + 1
+            }
+        }
+    } else if name_is(ty, "noise") {
+        var col: i32 = synth_osc.NOISE_WHITE
+        let cs: str = jstr(d, obj, "color", "white")
+        if name_is(cs, "pink") { col = synth_osc.NOISE_PINK }
+        if name_is(cs, "brown") { col = synth_osc.NOISE_BROWN }
+        synth_osc.noise_fill(out, n, col, synth_osc.rng_next(&r))
+    } else if name_is(ty, "env") || name_is(ty, "adsr") {
+        var pts: [f64; 48] = [0.0; 48]
+        var np: usize = 0
+        if name_is(ty, "env") {
+            let pv: u32 = jmember(d, obj, "points")
+            if pv != json.JSON_NONE && json.json_kind(d, pv) == json.JSON_ARRAY {
+                var ch: u32 = json.json_child(d, pv)
+                while ch != json.JSON_NONE && np < 16 {
+                    pts[np * 3] = scalar(c, json.json_child_at(d, ch, 0), &r, 0.0)
+                    pts[np * 3 + 1] = scalar(c, json.json_child_at(d, ch, 1), &r, 0.0)
+                    pts[np * 3 + 2] = scalar(c, json.json_child_at(d, ch, 2), &r, 0.0)
+                    np = np + 1
+                    ch = json.json_next(d, ch)
+                }
+            }
+        } else {
+            let at: f64 = sc(c, obj, "at", &r, 0.0)
+            let a: f64 = sc(c, obj, "a", &r, 5.0)
+            let dd: f64 = sc(c, obj, "d", &r, 50.0)
+            let s: f64 = sc(c, obj, "s", &r, 0.0)
+            let hold: f64 = sc(c, obj, "hold", &r, 0.0)
+            let rel: f64 = sc(c, obj, "r", &r, 50.0)
+            let pk: f64 = sc(c, obj, "peak", &r, 1.0)
+            pts[0] = 0.0
+            pts[3] = at
+            pts[6] = at + a
+            pts[7] = pk
+            pts[8] = sc(c, obj, "ac", &r, 0.0)
+            pts[9] = at + a + dd
+            pts[10] = s * pk
+            pts[11] = sc(c, obj, "dc", &r, 0.0 - 3.0)
+            pts[12] = at + a + dd + hold
+            pts[13] = s * pk
+            pts[15] = at + a + dd + hold + rel
+            pts[17] = sc(c, obj, "rc", &r, 0.0 - 3.0)
+            np = 6
+        }
+        let pa: u64 = synth_osc.sig_new(np * 3)
+        var i: usize = 0
+        while i < np * 3 {
+            synth_osc.pf(pa, i, pts[i])
+            i = i + 1
+        }
+        synth_osc.env_fill(out, n, rate, pa, np)
+        synth_osc.sig_free(pa, np * 3)
+    } else if name_is(ty, "filter") {
+        let src: u64 = sig_member(c, obj, "in")
+        let cut: u64 = param(c, obj, "cutoff", &r, 1000.0)
+        let q: u64 = param(c, obj, "q", &r, 0.707)
+        let kd: i32 = kind_of(jstr(d, obj, "kind", "lp"))
+        if src != 0 {
+            if name_is(jstr(d, obj, "mode", "svf"), "biquad") {
+                synth_fx.fx_biquad(src, out, n, rate, kd, cut, q)
+            } else {
+                synth_fx.fx_svf(src, out, n, rate, kd, cut, q)
+            }
+        }
+        synth_osc.sig_free(cut, n)
+        synth_osc.sig_free(q, n)
+    } else if name_is(ty, "gain") {
+        let src: u64 = sig_member(c, obj, "in")
+        let g: u64 = param(c, obj, "gain", &r, 1.0)
+        if src != 0 {
+            var i: usize = 0
+            while i < n {
+                synth_osc.pf(out, i, synth_osc.gf(src, i) * synth_osc.gf(g, i))
+                i = i + 1
+            }
+        }
+        synth_osc.sig_free(g, n)
+    } else if name_is(ty, "mul") || name_is(ty, "mix") {
+        let ismul: bool = name_is(ty, "mul")
+        let lv: u32 = jmember(d, obj, "in")
+        if ismul {
+            var i: usize = 0
+            while i < n {
+                synth_osc.pf(out, i, 1.0)
+                i = i + 1
+            }
+        }
+        if lv != json.JSON_NONE && json.json_kind(d, lv) == json.JSON_ARRAY {
+            var ch: u32 = json.json_child(d, lv)
+            while ch != json.JSON_NONE {
+                var s: u64 = 0
+                var g: f64 = 1.0
+                if json.json_kind(d, ch) == json.JSON_STRING {
+                    let sp: str.Span = json.json_string(d, ch)
+                    s = sig_of(c, str { p: sp.p, n: sp.n })
+                } else {
+                    s = sig_member(c, ch, "src")
+                    g = sc(c, ch, "gain", &r, 1.0)
+                }
+                if s != 0 {
+                    var i: usize = 0
+                    while i < n {
+                        if ismul {
+                            synth_osc.pf(out, i, synth_osc.gf(out, i) * synth_osc.gf(s, i))
+                        } else {
+                            synth_osc.pf(out, i, synth_osc.gf(out, i) + g * synth_osc.gf(s, i))
+                        }
+                        i = i + 1
+                    }
+                }
+                ch = json.json_next(d, ch)
+            }
+        }
+        let og: f64 = sc(c, obj, "gain", &r, 1.0)
+        if og != 1.0 { synth_fx.fx_scale(out, n, og) }
+    } else if name_is(ty, "delay") {
+        let src: u64 = sig_member(c, obj, "in")
+        if src != 0 {
+            synth_fx.fx_delay(src, out, n, rate, sc(c, obj, "time", &r, 120.0), sc(c, obj, "feedback", &r, 0.4), sc(c, obj, "mix", &r, 0.5))
+        }
+    } else if name_is(ty, "reverb") {
+        let src: u64 = sig_member(c, obj, "in")
+        if src != 0 {
+            synth_fx.fx_reverb(src, out, n, rate, sc(c, obj, "room", &r, 0.5), sc(c, obj, "damp", &r, 0.5), sc(c, obj, "mix", &r, 0.3))
+        }
+    } else if name_is(ty, "clip") {
+        let src: u64 = sig_member(c, obj, "in")
+        if src != 0 { synth_fx.fx_softclip(src, out, n, sc(c, obj, "drive", &r, 2.0)) }
+    } else if name_is(ty, "limit") {
+        let src: u64 = sig_member(c, obj, "in")
+        if src != 0 { synth_fx.fx_limit(src, out, n, rate, sc(c, obj, "threshold", &r, 0.9), sc(c, obj, "release_ms", &r, 50.0)) }
+    } else if name_is(ty, "crush") {
+        let src: u64 = sig_member(c, obj, "in")
+        if src != 0 { synth_fx.fx_crush(src, out, n, sc(c, obj, "bits", &r, 8.0), sc(c, obj, "hold", &r, 1.0) as usize) }
+    } else if name_is(ty, "shift") {
+        let src: u64 = sig_member(c, obj, "in")
+        if src != 0 { synth_fx.fx_shift(src, out, n, rate, sc(c, obj, "ms", &r, 0.0)) }
+    } else if name_is(ty, "pluck") {
+        let at: usize = (sc(c, obj, "at", &r, 0.0) * rate / 1000.0) as usize
+        let fq: f64 = sc(c, obj, "freq", &r, 220.0)
+        let dp: f64 = sc(c, obj, "damp", &r, 0.3)
+        let g: f64 = sc(c, obj, "gain", &r, 1.0)
+        synth_osc.pluck_fill(out, n, rate, at, fq, dp, g, synth_osc.rng_next(&r))
+    } else if name_is(ty, "notes") {
+        node_notes(c, obj, &r, out)
+    } else {
+        fail(c, "unknown node type: ", ty)
+    }
+    return out
+}
+
+// ------------------------------------------------------------------------------------------------ sound
+
+// Renders variant `variant` of `sound` (an object in the recipe document). false + text in `err` on failure.
+fn recipe_render(d: *mut json.Json, sound: u32, rate: u32, variant: u32, out: *mut Sound, err: *mut rt.Buf) -> bool {
+    let dur: f64 = jnum(d, sound, "duration_ms", 0.0)
+    var nn: usize = (dur * (rate as f64) / 1000.0) as usize
+    if nn < 8 {
+        rt.buf_push_bytes(err, "duration_ms missing or too small".p as u64, 31)
+        return false
+    }
+    var c: Ctx = Ctx { d: d, n: nn, rate: rate as f64, seed: 0, reg: rt.heap_alloc(MAX_NODES * 24), count: 0, err: err, bad: false }
+    let base_seed: u64 = jnum(d, sound, "seed", 1.0) as u64
+    c.seed = synth_osc.mix_seed(base_seed, variant as u64)
+    let nodes: u32 = jmember(d, sound, "nodes")
+    if nodes == json.JSON_NONE || json.json_kind(d, nodes) != json.JSON_ARRAY {
+        fail(&c, "sound has no nodes", "")
+    }
+    var idx: usize = 0
+    var ch: u32 = json.JSON_NONE
+    if !c.bad { ch = json.json_child(d, nodes) }
+    while ch != json.JSON_NONE && !c.bad {
+        if idx >= MAX_NODES {
+            fail(&c, "too many nodes", "")
+        } else {
+            let nm: str = jstr(d, ch, "id", "")
+            if nm.length() == 0 {
+                fail(&c, "node without id", "")
+            } else {
+                let buf: u64 = render_node(&c, ch, idx)
+                rt.st64(c.reg, idx * 3, nm.p as u64)
+                rt.st64(c.reg, idx * 3 + 1, nm.length() as u64)
+                rt.st64(c.reg, idx * 3 + 2, buf)
+                c.count = idx + 1
+                idx = idx + 1
+            }
+        }
+        ch = json.json_next(d, ch)
+    }
+    var res: u64 = 0
+    if !c.bad {
+        let on: str = jstr(d, sound, "out", "")
+        res = sig_of(&c, on)
+    }
+    var ok: bool = false
+    if !c.bad && res != 0 {
+        let fin: u64 = synth_osc.sig_copy(res, nn)
+        if jnum(d, sound, "remove_mean", 1.0) != 0.0 {
+            let m: f64 = synth_fx.fx_mean(fin, nn)
+            var i: usize = 0
+            while i < nn {
+                synth_osc.pf(fin, i, synth_osc.gf(fin, i) - m)
+                i = i + 1
+            }
+        }
+        synth_fx.fx_fade(fin, nn, c.rate, jnum(d, sound, "fade_in_ms", 1.0), jnum(d, sound, "fade_out_ms", 8.0))
+        let target: f64 = synth_osc.db_to_gain(jnum(d, sound, "peak_db", 0.0 - 3.0))
+        synth_fx.fx_normalize(fin, nn, target)
+        (*out).samples = fin
+        (*out).n = nn
+        (*out).rate = rate
+        (*out).peak = synth_fx.fx_peak(fin, nn)
+        (*out).rms = synth_fx.fx_rms(fin, nn)
+        ok = true
+    }
+    var i: usize = 0
+    while i < c.count {
+        let b: u64 = rt.ld64(c.reg, i * 3 + 2)
+        if b != 0 { synth_osc.sig_free(b, nn) }
+        i = i + 1
+    }
+    rt.heap_free(c.reg, MAX_NODES * 24)
+    return ok
+}
