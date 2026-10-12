@@ -1,0 +1,177 @@
+// lib/mc/mc_terrain.fi -- a small deterministic test / benchmark world: rolling hills (value noise), tunnels and caverns.
+//
+// Pure function of (x, y, z): terrain_block(x, y, z, nsec) is the block id at any world position, so tests can build
+// padded arrays and chunk columns without storing a world. World height = nsec * 16 blocks from y = 0 (min_y 0).
+// Ids: 0 air, 1 stone, 2 dirt, 3 grass block. Tiles: stone 1, dirt 2, grass top 3 / side 4 / bottom 2.
+// No claim to look like Minecraft; it only has to have surface, overhangs and connected caves for the culling /
+// streaming / LOD measurements (docs/mc/cull.md, stream.md).
+
+import std.rt
+import std.math
+import mc.mc_mesh
+
+export {
+    terrain_height, terrain_block, terrain_column, terrain_tables, terrain_free_tables, terrain_hash,
+}
+
+fn terrain_hash(a: i32, b: i32, c: i32) -> u64 {
+    var h: u64 = (a as u64) *% 0x9E3779B97F4A7C15 as u64
+    h = (h ^ (b as u64)) *% 0xBF58476D1CE4E5B9 as u64
+    h = (h ^ (c as u64)) *% 0x94D049BB133111EB as u64
+    h = h ^ (h >> 31 as u64)
+    return h
+}
+
+fn lattice(ix: i32, iz: i32, seed: i32) -> f64 {
+    return ((terrain_hash(ix, iz, seed) >> 11 as u64) & 1048575 as u64) as f64 / 1048576.0
+}
+
+fn smooth(t: f64) -> f64 {
+    return t * t * (3.0 - 2.0 * t)
+}
+
+fn floor_i(v: f64) -> i32 {
+    var x: i32 = v as i32
+    if (x as f64) > v { x = x - 1 }
+    return x
+}
+
+fn floor_div(a: i32, b: i32) -> i32 {
+    var q: i32 = a / b
+    if (a % b != 0) && ((a < 0) != (b < 0)) { q = q - 1 }
+    return q
+}
+
+fn value_noise(x: f64, z: f64, seed: i32) -> f64 {
+    let ix: i32 = floor_i(x)
+    let iz: i32 = floor_i(z)
+    let fx: f64 = smooth(x - (ix as f64))
+    let fz: f64 = smooth(z - (iz as f64))
+    let a: f64 = lattice(ix, iz, seed)
+    let b: f64 = lattice(ix + 1, iz, seed)
+    let c: f64 = lattice(ix, iz + 1, seed)
+    let d: f64 = lattice(ix + 1, iz + 1, seed)
+    let r0: f64 = a + (b - a) * fx
+    let r1: f64 = c + (d - c) * fx
+    return r0 + (r1 - r0) * fz
+}
+
+// Surface height (first air block y) of the column (x, z) in a world of `nsec` sections.
+fn terrain_height(x: i32, z: i32, nsec: i32) -> i32 {
+    let fx: f64 = x as f64
+    let fz: f64 = z as f64
+    let n: f64 = 0.65 * value_noise(fx / 48.0, fz / 48.0, 11) + 0.35 * value_noise(fx / 16.0, fz / 16.0, 29)
+    var top: i32 = nsec * 16 - 12
+    if top < 20 { top = 20 }
+    return 18 + (n * ((top - 18) as f64)) as i32
+}
+
+// Cave shapes: X tunnels every 40 z, Z tunnels every 56 x, caverns on a 48 grid.
+fn carved(x: i32, y: i32, z: i32, h: i32) -> bool {
+    if y < 3 || y > h - 4 { return false }
+    let bz: i32 = floor_div(z + 20, 40)
+    let dz: i32 = z - bz * 40
+    let yc: i32 = 8 + ((terrain_hash(bz, 1, 7) >> 20 as u64) % 18 as u64) as i32
+    let dy: i32 = y - yc
+    if dz >= -2 && dz <= 2 && dy >= -2 && dy <= 2 {
+        return true
+    }
+    let bx: i32 = floor_div(x + 28, 56)
+    let ex: i32 = x - bx * 56
+    let yc2: i32 = 12 + ((terrain_hash(bx, 2, 9) >> 20 as u64) % 20 as u64) as i32
+    let dy2: i32 = y - yc2
+    if ex >= -2 && ex <= 2 && dy2 >= -2 && dy2 <= 2 {
+        return true
+    }
+    let gx: i32 = floor_div(x, 48)
+    let gz: i32 = floor_div(z, 48)
+    let hh: u64 = terrain_hash(gx, gz, 5)
+    let cx: i32 = gx * 48 + 12 + ((hh >> 8 as u64) % 24 as u64) as i32
+    let cz: i32 = gz * 48 + 12 + ((hh >> 24 as u64) % 24 as u64) as i32
+    let cy: i32 = 10 + ((hh >> 40 as u64) % 16 as u64) as i32
+    let ax: i32 = x - cx
+    let ay: i32 = y - cy
+    let az: i32 = z - cz
+    if ax * ax + ay * ay + az * az <= 36 { return true }
+    return false
+}
+
+// Block id at world position (x, y, z) for a world of `nsec` sections (below the world: stone, above: air).
+fn terrain_block(x: i32, y: i32, z: i32, nsec: i32) -> u16 {
+    if y < 0 { return 1 as u16 }
+    if y >= nsec * 16 { return 0 as u16 }
+    let h: i32 = terrain_height(x, z, nsec)
+    if y >= h { return 0 as u16 }
+    if carved(x, y, z, h) { return 0 as u16 }
+    if y == h - 1 { return 3 as u16 }
+    if y >= h - 4 { return 2 as u16 }
+    return 1 as u16
+}
+
+// Fills `ids` (u16 [nsec * 4096], section after section, index (y*16 + z)*16 + x per section) with the column (cx, cz).
+fn terrain_column(cx: i32, cz: i32, nsec: i32, ids: u64) {
+    var z: i32 = 0
+    while z < 16 {
+        var x: i32 = 0
+        while x < 16 {
+            let wx: i32 = cx * 16 + x
+            let wz: i32 = cz * 16 + z
+            let h: i32 = terrain_height(wx, wz, nsec)
+            var y: i32 = 0
+            while y < nsec * 16 {
+                var id: u16 = 0 as u16
+                if y < h {
+                    id = 1 as u16
+                    if y == h - 1 {
+                        id = 3 as u16
+                    } else if y >= h - 4 {
+                        id = 2 as u16
+                    }
+                    if carved(wx, y, wz, h) { id = 0 as u16 }
+                }
+                let s: i32 = y / 16
+                let ly: i32 = y - s * 16
+                rt.st16(ids, (s * 4096 + (ly * 16 + z) * 16 + x) as usize, id)
+                y = y + 1
+            }
+            x = x + 1
+        }
+        z = z + 1
+    }
+}
+
+// Mesh tables for the ids above (allocates; terrain_free_tables releases).
+fn terrain_tables(t: *mut mc_mesh.MeshTables) {
+    (*t).opaque = rt.heap_alloc(32768)
+    (*t).tiles = rt.heap_alloc(32768 * 6 * 2)
+    var i: usize = 0
+    while i < 32768 {
+        rt.st8((*t).opaque, i, 0 as u8)
+        i = i + 1
+    }
+    i = 0
+    while i < 32768 * 6 {
+        rt.st16((*t).tiles, i, 0 as u16)
+        i = i + 1
+    }
+    var f: usize = 0
+    while f < 6 {
+        rt.st16((*t).tiles, 6 + f, 1 as u16) // stone
+        rt.st16((*t).tiles, 12 + f, 2 as u16) // dirt
+        var g: u16 = 4 as u16 // grass side
+        if f == 3 { g = 3 as u16 }
+        if f == 2 { g = 2 as u16 }
+        rt.st16((*t).tiles, 18 + f, g)
+        f = f + 1
+    }
+    rt.st8((*t).opaque, 1, 1 as u8)
+    rt.st8((*t).opaque, 2, 1 as u8)
+    rt.st8((*t).opaque, 3, 1 as u8)
+}
+
+fn terrain_free_tables(t: *mut mc_mesh.MeshTables) {
+    rt.heap_free((*t).opaque, 32768)
+    rt.heap_free((*t).tiles, 32768 * 6 * 2)
+    (*t).opaque = 0
+    (*t).tiles = 0
+}

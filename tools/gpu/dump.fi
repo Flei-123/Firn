@@ -304,6 +304,125 @@ fn median(v: *mut [u64; 32], n: usize) -> u64 {
     return (*v)[n / 2]
 }
 
+// ---- world path: pool / multi draw / budget / defrag must give the SAME pixels as one VAO per section -------------------
+fn fnv(px: u64, n: usize) -> u64 {
+    var h: u64 = 7 as u64
+    var i: usize = 0
+    while i < n {
+        h = (h * 131 as u64 + (rt.ld8(px, i) as u64) + 1 as u64) % 4294967291 as u64
+        i = i + 1
+    }
+    return h
+}
+
+// Same operations on every variant: 12 sections uploaded, the odd ones freed, 6 more uploaded (reuse of freed room), optional
+// defrag, then the live ones drawn on a 4 x n grid. Returns the checksum of the frame; prints the pool / draw statistics.
+fn world_variant(label: str, mode: i32, pagev: usize, budget: usize, defrag: bool, da: *mut mc_texture.Atlas,
+    verts: u64, nv: usize, idx: u64, ni: usize, clear: u32) -> u64 {
+    var g: gl_mc.GlBackend = gl_mc.glbe_open(TW, TH)
+    if !g.ok { return 0 as u64 }
+    let am: i32 = gl_mc.glbe_set_mode(&g, mode)
+    if pagev > 0 { gl_mc.glbe_set_page_verts(&g, pagev) }
+    gl_mc.glbe_set_upload_budget(&g, budget)
+    var b: mc_backend.Backend = gl_mc.glbe_backend(&g)
+    b.upload_atlas(b.obj, (da as u64))
+    var hs: [usize; 18] = [0; 18]
+    var live: [bool; 18] = [false; 18]
+    var i: usize = 0
+    while i < 12 {
+        hs[i] = b.mesh_upload(b.obj, i as u64, verts, nv, idx, ni)
+        live[i] = true
+        i = i + 1
+    }
+    i = 1
+    while i < 12 {
+        b.mesh_free(b.obj, hs[i])
+        live[i] = false
+        i = i + 2
+    }
+    while i < 18 {
+        hs[i] = b.mesh_upload(b.obj, i as u64, verts, nv, idx, ni)
+        live[i] = true
+        i = i + 1
+    }
+    var dfr: usize = 0
+    if defrag { dfr = gl_mc.glbe_defrag(&g, 1) }
+    var cam: mc_camera.Camera = mc_camera.camera_new(TW, TH)
+    mc_camera.camera_set_pos(&cam, 40.0, 14.0, 20.0)
+    mc_camera.camera_set_angles(&cam, 0.0, 40.0)
+    mc_camera.camera_update(&cam)
+    var frames: usize = 0
+    var sum: u64 = 0 as u64
+    var stg: usize = gl_mc.glbe_staged(&g)
+    while frames < 40 {
+        b.begin(b.obj, (&cam) as u64, clear)
+        var k: usize = 0
+        while k < 18 {
+            if live[k] { b.draw(b.obj, hs[k], ((k % 4) * 16) as f64, 0.0, ((k / 4) * 16) as f64) }
+            k = k + 1
+        }
+        b.end(b.obj)
+        frames = frames + 1
+        if gl_mc.glbe_staged(&g) == 0 { break }
+    }
+    sum = fnv(b.present(b.obj), (TW as usize) * (TH as usize) * 4)
+    io.print("world ")
+    io.print(label)
+    io.fmt_print(f" mode={am} pages={gl_mc.glbe_pages(&g)} defrag_pages={dfr} staged_at_start={stg} frames_to_upload={frames} calls={gl_mc.glbe_calls(&g)} draws={gl_mc.glbe_draws(&g)} pool_used_kb={gl_mc.glbe_pool_used_bytes(&g) / 1024} pool_frag_permille={gl_mc.glbe_pool_frag_permille(&g)} checksum={sum}\n")
+    gl_mc.glbe_close(&g)
+    return sum
+}
+
+// Time per frame for `mode` with 25 SEPARATE sections (a real world has one slot per section), median of 21 frames.
+fn bench_mode(label: str, mode: i32, da: *mut mc_texture.Atlas, verts: u64, nv: usize, idx: u64, ni: usize, clear: u32) {
+    var g: gl_mc.GlBackend = gl_mc.glbe_open(TW, TH)
+    if !g.ok { return }
+    let am: i32 = gl_mc.glbe_set_mode(&g, mode)
+    var b: mc_backend.Backend = gl_mc.glbe_backend(&g)
+    b.upload_atlas(b.obj, (da as u64))
+    var hs: [usize; 25] = [0; 25]
+    let u0: u64 = time.monotonic_ns()
+    var i: usize = 0
+    while i < 25 {
+        hs[i] = b.mesh_upload(b.obj, i as u64, verts, nv, idx, ni)
+        i = i + 1
+    }
+    gl33.gl_finish(gl_mc.glbe_gl(&g))
+    let up_us: u64 = (time.monotonic_ns() - u0) / 1000 as u64
+    var cam: mc_camera.Camera = mc_camera.camera_new(TW, TH)
+    mc_camera.camera_set_pos(&cam, 40.0, 14.0, 20.0)
+    mc_camera.camera_set_angles(&cam, 0.0, 40.0)
+    mc_camera.camera_update(&cam)
+    var tm: [u64; 32] = [0; 32]
+    var f: usize = 0
+    var cpu: [u64; 32] = [0; 32]
+    gl_mc.glbe_reset_stats(&g)
+    while f < 23 {
+        let t0: u64 = time.monotonic_ns()
+        b.begin(b.obj, (&cam) as u64, clear)
+        var k: usize = 0
+        while k < 25 {
+            b.draw(b.obj, hs[k], ((k % 5) * 16) as f64, 0.0, ((k / 5) * 16) as f64)
+            k = k + 1
+        }
+        b.end(b.obj)
+        let t1: u64 = time.monotonic_ns()
+        gl33.gl_finish(gl_mc.glbe_gl(&g))
+        let t2: u64 = time.monotonic_ns()
+        if f >= 2 {
+            tm[f - 2] = (t2 - t0) / 1000 as u64
+            cpu[f - 2] = (t1 - t0) / 1000 as u64
+        }
+        f = f + 1
+    }
+    let med: u64 = median(&tm, 21)
+    let medc: u64 = median(&cpu, 21)
+    io.print("metric world ")
+    io.print(label)
+    io.fmt_print(f" mode={am} sections=25 draws_per_frame={gl_mc.glbe_draws(&g) / 23 as u64} gl_calls_per_frame={gl_mc.glbe_calls(&g) / 23 as u64} tris_per_frame={gl_mc.glbe_tris(&g) / 23 as u64} frame_us={med} submit_us={medc} upload_25_us={up_us} upload_kb={gl_mc.glbe_upload_bytes(&g) / 1024} vbo_bytes_per_section={nv * 8} ibo_bytes_per_section={ni * 4}\n")
+    gl_mc.glbe_close(&g)
+}
+
 fn main(start: u64) -> i32 {
     var dir: u64 = 0
     var dirn: usize = 0
@@ -453,6 +572,28 @@ fn main(start: u64) -> i32 {
     } else {
         io.fmt_print(f"no 640x360 context: step={g2.step}\n")
         s.fails = s.fails + 1
+    }
+    // ---- 6. world path: identical pixels in every storage / draw mode, then Vorher / Nachher
+    {
+        let ref_sum: u64 = world_variant("legacy", gl_mc.MODE_LEGACY, 0, 0, false, &da, m.verts, m.nverts as usize, m.idx, m.nidx as usize, clear)
+        let others: u64 = world_variant("pool_single", gl_mc.MODE_POOL, 0, 0, false, &da, m.verts, m.nverts as usize, m.idx, m.nidx as usize, clear)
+        let multi: u64 = world_variant("multi", gl_mc.MODE_MULTI, 0, 0, false, &da, m.verts, m.nverts as usize, m.idx, m.nidx as usize, clear)
+        let small: u64 = world_variant("multi_small_pages", gl_mc.MODE_MULTI, 16384, 0, false, &da, m.verts, m.nverts as usize, m.idx, m.nidx as usize, clear)
+        let dfr: u64 = world_variant("multi_small_pages_defrag", gl_mc.MODE_MULTI, 16384, 0, true, &da, m.verts, m.nverts as usize, m.idx, m.nidx as usize, clear)
+        let ind: u64 = world_variant("indirect", gl_mc.MODE_INDIRECT, 0, 0, false, &da, m.verts, m.nverts as usize, m.idx, m.nidx as usize, clear)
+        let bud: u64 = world_variant("multi_budget_32k", gl_mc.MODE_MULTI, 0, 32768, false, &da, m.verts, m.nverts as usize, m.idx, m.nidx as usize, clear)
+        var wok: bool = ref_sum != 0 as u64
+        if others != ref_sum || multi != ref_sum || small != ref_sum || dfr != ref_sum || ind != ref_sum || bud != ref_sum { wok = false }
+        if wok {
+            io.print("world modes: identical frames ok\n")
+        } else {
+            io.print("world modes: FRAMES DIFFER FAIL\n")
+            s.fails = s.fails + 1
+        }
+        bench_mode("legacy", gl_mc.MODE_LEGACY, &da, m.verts, m.nverts as usize, m.idx, m.nidx as usize, clear)
+        bench_mode("pool_single", gl_mc.MODE_POOL, &da, m.verts, m.nverts as usize, m.idx, m.nidx as usize, clear)
+        bench_mode("multi", gl_mc.MODE_MULTI, &da, m.verts, m.nverts as usize, m.idx, m.nidx as usize, clear)
+        bench_mode("indirect", gl_mc.MODE_INDIRECT, &da, m.verts, m.nverts as usize, m.idx, m.nidx as usize, clear)
     }
     if s.fails > 0 { return 3 }
     return 0

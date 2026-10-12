@@ -1,0 +1,253 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/glpool.fi -- gpu.glpool: a range allocator (best fit, free list, coalescing) for sub-allocating one big GL buffer.
+// NO GL import: it only hands out offsets, so it is testable without a context (tests/2770_gpu_pool.fi).
+//
+//     let p: u64 = glpool.pool_new(1048576, 64)          // 1 M units, every block starts at a multiple of 64
+//     let off: usize = glpool.pool_alloc(p, 3000)        // NONE (all ones) = does not fit
+//     glpool.pool_free(p, off, 3000)
+//     glpool.pool_free_all(p)                            // forget all blocks (after a defrag rebuild)
+//     glpool.pool_destroy(p)
+//
+// Sizes are rounded up to `align` inside the pool (alloc and free use the same rounding, so give free the SAME n).
+// Header (u64 words): 0 cap, 1 align, 2 nfree (ranges), 3 range capacity, 4 ranges address, 5 used units.
+// Ranges (pairs off, len) are sorted by offset and never adjacent (free merges neighbours).
+
+import std.rt
+
+export {
+    NONE, pool_new, pool_destroy, pool_alloc, pool_free, pool_free_all, pool_cap, pool_used, pool_free_total,
+    pool_largest, pool_ranges, pool_frag_permille,
+}
+
+const NONE: usize = 0xFFFFFFFFFFFFFFFF as usize
+const H_CAP: usize = 0
+const H_ALIGN: usize = 1
+const H_NFREE: usize = 2
+const H_RCAP: usize = 3
+const H_RANGES: usize = 4
+const H_USED: usize = 5
+const HW: usize = 6
+
+fn round_up(n: usize, a: usize) -> usize {
+    if a <= 1 {
+        return n
+    }
+    return ((n + a - 1) / a) * a
+}
+
+// New pool of `cap` units; every block is a multiple of `align` units (align >= 1, cap is rounded down to it).
+// Returns the handle (address of the header), 0 on failure.
+fn pool_new(cap: usize, align: usize) -> u64 {
+    var a: usize = align
+    if a < 1 {
+        a = 1
+    }
+    let h: u64 = rt.heap_alloc(HW * 8)
+    if h == 0 {
+        return 0
+    }
+    let rc: usize = 64
+    let r: u64 = rt.heap_alloc(rc * 16)
+    if r == 0 {
+        rt.heap_free(h, HW * 8)
+        return 0
+    }
+    let c: usize = (cap / a) * a
+    rt.st64(h, H_CAP, c as u64)
+    rt.st64(h, H_ALIGN, a as u64)
+    rt.st64(h, H_RCAP, rc as u64)
+    rt.st64(h, H_RANGES, r)
+    rt.st64(h, H_USED, 0 as u64)
+    pool_free_all(h)
+    return h
+}
+
+fn pool_destroy(p: u64) {
+    if p == 0 {
+        return
+    }
+    rt.heap_free(rt.ld64(p, H_RANGES), (rt.ld64(p, H_RCAP) as usize) * 16)
+    rt.heap_free(p, HW * 8)
+}
+
+// All of the pool free again.
+fn pool_free_all(p: u64) {
+    let r: u64 = rt.ld64(p, H_RANGES)
+    let c: usize = rt.ld64(p, H_CAP) as usize
+    if c > 0 {
+        rt.st64(r, 0, 0 as u64)
+        rt.st64(r, 1, c as u64)
+        rt.st64(p, H_NFREE, 1 as u64)
+    } else {
+        rt.st64(p, H_NFREE, 0 as u64)
+    }
+    rt.st64(p, H_USED, 0 as u64)
+}
+
+fn pool_cap(p: u64) -> usize {
+    return rt.ld64(p, H_CAP) as usize
+}
+
+fn pool_used(p: u64) -> usize {
+    return rt.ld64(p, H_USED) as usize
+}
+
+fn pool_free_total(p: u64) -> usize {
+    return pool_cap(p) - pool_used(p)
+}
+
+fn pool_ranges(p: u64) -> usize {
+    return rt.ld64(p, H_NFREE) as usize
+}
+
+// Size of the largest free range.
+fn pool_largest(p: u64) -> usize {
+    let r: u64 = rt.ld64(p, H_RANGES)
+    let n: usize = rt.ld64(p, H_NFREE) as usize
+    var best: usize = 0
+    var i: usize = 0
+    while i < n {
+        let l: usize = rt.ld64(r, i * 2 + 1) as usize
+        if l > best {
+            best = l
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// Fragmentation in 1/1000: 1000 * (1 - largest free range / total free). 0 = one free range (or nothing free).
+fn pool_frag_permille(p: u64) -> usize {
+    let f: usize = pool_free_total(p)
+    if f == 0 {
+        return 0
+    }
+    return 1000 - (pool_largest(p) * 1000) / f
+}
+
+// Block of n units (rounded up to the alignment): best fit. Returns the offset or NONE.
+fn pool_alloc(p: u64, n: usize) -> usize {
+    let a: usize = rt.ld64(p, H_ALIGN) as usize
+    var need: usize = round_up(n, a)
+    if need == 0 {
+        need = a
+    }
+    let r: u64 = rt.ld64(p, H_RANGES)
+    let nf: usize = rt.ld64(p, H_NFREE) as usize
+    var bi: usize = NONE
+    var bl: usize = NONE
+    var i: usize = 0
+    while i < nf {
+        let l: usize = rt.ld64(r, i * 2 + 1) as usize
+        if l >= need && l < bl {
+            bl = l
+            bi = i
+            if l == need {
+                break
+            }
+        }
+        i = i + 1
+    }
+    if bi == NONE {
+        return NONE
+    }
+    let off: usize = rt.ld64(r, bi * 2) as usize
+    if bl == need {
+        // remove the range
+        var j: usize = bi
+        while j + 1 < nf {
+            rt.st64(r, j * 2, rt.ld64(r, (j + 1) * 2))
+            rt.st64(r, j * 2 + 1, rt.ld64(r, (j + 1) * 2 + 1))
+            j = j + 1
+        }
+        rt.st64(p, H_NFREE, (nf - 1) as u64)
+    } else {
+        rt.st64(r, bi * 2, (off + need) as u64)
+        rt.st64(r, bi * 2 + 1, (bl - need) as u64)
+    }
+    rt.st64(p, H_USED, rt.ld64(p, H_USED) + need as u64)
+    return off
+}
+
+// Gives the block [off, off + n) back (n as given to pool_alloc). Merges with free neighbours. False if the
+// range is outside the pool (a double free of an overlapping block is NOT detected).
+fn pool_free(p: u64, off: usize, n: usize) -> bool {
+    let a: usize = rt.ld64(p, H_ALIGN) as usize
+    var len: usize = round_up(n, a)
+    if len == 0 {
+        len = a
+    }
+    let cap: usize = rt.ld64(p, H_CAP) as usize
+    if off + len > cap {
+        return false
+    }
+    var r: u64 = rt.ld64(p, H_RANGES)
+    var nf: usize = rt.ld64(p, H_NFREE) as usize
+    // first range with offset > off
+    var k: usize = 0
+    while k < nf && (rt.ld64(r, k * 2) as usize) < off {
+        k = k + 1
+    }
+    var merge_prev: bool = false
+    var merge_next: bool = false
+    if k > 0 {
+        let po: usize = rt.ld64(r, (k - 1) * 2) as usize
+        let pl: usize = rt.ld64(r, (k - 1) * 2 + 1) as usize
+        if po + pl == off {
+            merge_prev = true
+        }
+    }
+    if k < nf {
+        if off + len == (rt.ld64(r, k * 2) as usize) {
+            merge_next = true
+        }
+    }
+    rt.st64(p, H_USED, rt.ld64(p, H_USED) - len as u64)
+    if merge_prev && merge_next {
+        let nl: usize = rt.ld64(r, (k - 1) * 2 + 1) as usize + len + (rt.ld64(r, k * 2 + 1) as usize)
+        rt.st64(r, (k - 1) * 2 + 1, nl as u64)
+        var j: usize = k
+        while j + 1 < nf {
+            rt.st64(r, j * 2, rt.ld64(r, (j + 1) * 2))
+            rt.st64(r, j * 2 + 1, rt.ld64(r, (j + 1) * 2 + 1))
+            j = j + 1
+        }
+        rt.st64(p, H_NFREE, (nf - 1) as u64)
+        return true
+    }
+    if merge_prev {
+        rt.st64(r, (k - 1) * 2 + 1, rt.ld64(r, (k - 1) * 2 + 1) + len as u64)
+        return true
+    }
+    if merge_next {
+        rt.st64(r, k * 2, off as u64)
+        rt.st64(r, k * 2 + 1, rt.ld64(r, k * 2 + 1) + len as u64)
+        return true
+    }
+    // insert a new range at k (grow the range array when full)
+    let rc: usize = rt.ld64(p, H_RCAP) as usize
+    if nf == rc {
+        let nrc: usize = rc * 2
+        let nr: u64 = rt.heap_alloc(nrc * 16)
+        if nr == 0 {
+            rt.st64(p, H_USED, rt.ld64(p, H_USED) + len as u64)
+            return false
+        }
+        rt.mem_copy(nr, r, nf * 16)
+        rt.heap_free(r, rc * 16)
+        r = nr
+        rt.st64(p, H_RANGES, nr)
+        rt.st64(p, H_RCAP, nrc as u64)
+    }
+    var j: usize = nf
+    while j > k {
+        rt.st64(r, j * 2, rt.ld64(r, (j - 1) * 2))
+        rt.st64(r, j * 2 + 1, rt.ld64(r, (j - 1) * 2 + 1))
+        j = j - 1
+    }
+    rt.st64(r, k * 2, off as u64)
+    rt.st64(r, k * 2 + 1, len as u64)
+    nf = nf + 1
+    rt.st64(p, H_NFREE, nf as u64)
+    return true
+}
