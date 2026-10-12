@@ -210,7 +210,8 @@ def verdict(path, minc):
     after = [r[2] for r in z[v:]]
     monotone = all(b >= a for a, b in zip(after, after[1:])) and after[-1] > after[0]
     # Threshold: a 5 % increase of the median counts as a leak.
-    grew = rssl > rss2 * 1.05
+    # absolute floor: the GC variant lives in ~1.6 MB and its RSS steps in 256 KiB pages (5 % alone is one page)
+    grew = rssl > rss2 * 1.05 and (rssl - rss2) > 512
     return {
         'path': path, 'cycles': cycles, 'samples': n, 'done': done,
         'rss2': rss2, 'rssl': rssl, 'live2': live2, 'livel': livel,
