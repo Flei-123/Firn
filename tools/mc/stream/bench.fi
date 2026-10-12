@@ -1,0 +1,446 @@
+// tools/mc/stream/bench.fi -- benchmark of lib/mc/mc_cull.fi + lib/mc/mc_stream.fi on the terrain world of mc_terrain.
+// Usage: bench [radius=5] [nsec=8] [mode=all|cull|load]
+// Output: `RESULT <key> <value> <unit>` lines (mc_perf.perf_emit), collected by tools/mc/perf (mc-p3).
+//   cull:  sections per frame with frustum culling only vs frustum + cave culling (avg over 16 camera poses),
+//          triangles drawn, search time, draw time (CPU rasterizer 160x90 -- NOT a GPU number)
+//   load:  loading the whole window from an empty stream with 0 (inline) / 1 / 4 / 8 worker threads: wall time, columns/s,
+//          sections/s, summed meshing time of the workers, snapshot time on the render thread; plus an asynchronous load with
+//          the frame time budgets (worst frame, worst upload)
+// The server is shared: numbers carry the load of the machine (mc-p3 records /proc/loadavg).
+import std.rt
+import std.io
+import std.time
+import jobs.jobs
+import mc.mc_perf
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import mc.mc_cull
+import mc.mc_terrain
+import mc.mc_render_world
+import mc.mc_stream
+import mc.mc_lod
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND {
+        return jobs.worker_main(arg)
+    }
+    return 0
+}
+
+static mut g_rad: i32 = 5
+static mut g_nsec: i32 = 8
+
+struct LoadRes {
+    wall: u64, // 1000 * value
+    cols: u64,
+    secs: u64,
+    mesh: u64,
+    snap: u64,
+    up: u64,
+    jobs: u64,
+}
+
+fn emit_load(w: u64, r: *mut LoadRes) {
+    if w == 0 as u64 {
+        mc_perf.perf_emit("load_w0_wall_ms", (*r).wall, "ms")
+        mc_perf.perf_emit("load_w0_columns_per_s", (*r).cols, "columns/s")
+        mc_perf.perf_emit("load_w0_sections_per_s", (*r).secs, "sections/s")
+        mc_perf.perf_emit("load_w0_mesh_cpu_ms", (*r).mesh, "ms (sum of all workers)")
+        mc_perf.perf_emit("load_w0_snapshot_ms", (*r).snap, "ms (render thread, snapshot + submit)")
+        mc_perf.perf_emit("load_w0_upload_ms", (*r).up, "ms (render thread)")
+        mc_perf.perf_emit("load_w0_jobs", (*r).jobs, "jobs")
+    }
+    if w == 1 as u64 {
+        mc_perf.perf_emit("load_w1_wall_ms", (*r).wall, "ms")
+        mc_perf.perf_emit("load_w1_columns_per_s", (*r).cols, "columns/s")
+        mc_perf.perf_emit("load_w1_sections_per_s", (*r).secs, "sections/s")
+        mc_perf.perf_emit("load_w1_mesh_cpu_ms", (*r).mesh, "ms (sum of all workers)")
+        mc_perf.perf_emit("load_w1_snapshot_ms", (*r).snap, "ms (render thread, snapshot + submit)")
+        mc_perf.perf_emit("load_w1_upload_ms", (*r).up, "ms (render thread)")
+        mc_perf.perf_emit("load_w1_jobs", (*r).jobs, "jobs")
+    }
+    if w == 4 as u64 {
+        mc_perf.perf_emit("load_w4_wall_ms", (*r).wall, "ms")
+        mc_perf.perf_emit("load_w4_columns_per_s", (*r).cols, "columns/s")
+        mc_perf.perf_emit("load_w4_sections_per_s", (*r).secs, "sections/s")
+        mc_perf.perf_emit("load_w4_mesh_cpu_ms", (*r).mesh, "ms (sum of all workers)")
+        mc_perf.perf_emit("load_w4_snapshot_ms", (*r).snap, "ms (render thread, snapshot + submit)")
+        mc_perf.perf_emit("load_w4_upload_ms", (*r).up, "ms (render thread)")
+        mc_perf.perf_emit("load_w4_jobs", (*r).jobs, "jobs")
+    }
+    if w == 8 as u64 {
+        mc_perf.perf_emit("load_w8_wall_ms", (*r).wall, "ms")
+        mc_perf.perf_emit("load_w8_columns_per_s", (*r).cols, "columns/s")
+        mc_perf.perf_emit("load_w8_sections_per_s", (*r).secs, "sections/s")
+        mc_perf.perf_emit("load_w8_mesh_cpu_ms", (*r).mesh, "ms (sum of all workers)")
+        mc_perf.perf_emit("load_w8_snapshot_ms", (*r).snap, "ms (render thread, snapshot + submit)")
+        mc_perf.perf_emit("load_w8_upload_ms", (*r).up, "ms (render thread)")
+        mc_perf.perf_emit("load_w8_jobs", (*r).jobs, "jobs")
+    }
+}
+
+fn fl(v: f64) -> i32 {
+    var x: i32 = v as i32
+    if (x as f64) > v { x = x - 1 }
+    return x
+}
+
+fn atoi(p: u64, dflt: i32) -> i32 {
+    var v: i32 = 0
+    var i: usize = 0
+    if rt.ld8(p, 0) == 0 as u8 { return dflt }
+    while rt.ld8(p, i) != 0 as u8 {
+        let c: i32 = rt.ld8(p, i) as i32
+        if c < 48 || c > 57 { return dflt }
+        v = v * 10 + c - 48
+        i = i + 1
+    }
+    return v
+}
+
+#[allow_escape]
+fn load_all(w: *mut mc_world.World, s: *mut mc_stream.Stream, ids: u64) -> usize {
+    var n: usize = 0
+    var cz: i32 = 0 - g_rad
+    while cz <= g_rad {
+        var cx: i32 = 0 - g_rad
+        while cx <= g_rad {
+            mc_terrain.terrain_column(cx, cz, g_nsec, ids)
+            if !mc_world.world_put(w, mc_render_world.wr_make_chunk(cx, cz, g_nsec as usize, ids)) { return n }
+            mc_stream.stream_chunk_loaded(s, w, cx, cz)
+            n = n + 1
+            cx = cx + 1
+        }
+        cz = cz + 1
+    }
+    return n
+}
+
+#[allow_escape]
+fn one_frame(s: *mut mc_stream.Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera) -> u64 {
+    (*b).begin((*b).obj, cam as u64, 0xFF3C2814 as u32)
+    let t: u64 = mc_stream.stream_frame(s, w, b, cam)
+    (*b).end((*b).obj)
+    return t
+}
+
+#[allow_escape]
+fn bench_cull(tb: *mut mc_mesh.MeshTables, a: *mut mc_texture.Atlas, ids: u64) {
+    var r: mc_raster.Raster = mc_raster.raster_new(160, 90)
+    mc_raster.backend_upload_atlas(&r, a)
+    var b: mc_backend.Backend = mc_backend.backend_cpu(&r)
+    var w: mc_world.World = mc_world.world_new()
+    var s: mc_stream.Stream = mc_stream.stream_new(0, g_nsec, g_rad + 1, tb, 0)
+    var cam: mc_camera.Camera = mc_camera.camera_new(160, 90)
+    mc_camera.camera_set_lens(&cam, 70.0, 0.05, 16.0 * (g_rad as f64 + 1.0))
+    load_all(&w, &s, ids)
+    mc_camera.camera_set_pos(&cam, 8.0, (mc_terrain.terrain_height(8, 8, g_nsec) + 3) as f64, 8.0)
+    mc_camera.camera_set_angles(&cam, 0.0, 0.0)
+    mc_camera.camera_update(&cam)
+    mc_stream.stream_flush(&s, &w, &b, &cam, 400)
+    mc_perf.perf_emit_u("stream_sections_total", mc_stream.stream_sections(&s) as u64, "sections")
+    var vis_cull: u64 = 0
+    var vis_fr: u64 = 0
+    var tris_cull: u64 = 0
+    var tris_fr: u64 = 0
+    var cull_us: u64 = 0
+    var cullf_us: u64 = 0
+    var draw_cull: u64 = 0
+    var draw_fr: u64 = 0
+    var n: u64 = 0
+    var pi: i32 = 0
+    while pi < 16 {
+        // half of the poses on the surface, the other half low inside the terrain (caves / tunnels)
+        var py: f64 = (mc_terrain.terrain_height(8, 8, g_nsec) + 3) as f64
+        if pi % 2 == 1 { py = 14.0 }
+        var guard: i32 = 0
+        while mc_terrain.terrain_block(8, fl(py), 8, g_nsec) != 0 as u16 && guard < 100 {
+            py = py + 1.0
+            guard = guard + 1
+        }
+        mc_camera.camera_set_pos(&cam, 8.0, py, 8.0)
+        mc_camera.camera_set_angles(&cam, (pi as f64) * 22.5, 0.0 - 5.0)
+        mc_camera.camera_update(&cam)
+        mc_stream.stream_flush(&s, &w, &b, &cam, 400)
+        s.use_cull = true
+        let t1: u64 = one_frame(&s, &w, &b, &cam)
+        vis_cull = vis_cull + s.st.visible as u64
+        tris_cull = tris_cull + t1
+        cull_us = cull_us + s.st.cull_us
+        draw_cull = draw_cull + s.st.draw_us
+        s.use_cull = false
+        let t2: u64 = one_frame(&s, &w, &b, &cam)
+        vis_fr = vis_fr + s.st.visible as u64
+        tris_fr = tris_fr + t2
+        cullf_us = cullf_us + s.st.cull_us
+        draw_fr = draw_fr + s.st.draw_us
+        n = n + 1
+        pi = pi + 1
+    }
+    mc_perf.perf_emit("cull_sections_frustum", vis_fr * 1000 / n, "sections/frame")
+    mc_perf.perf_emit("cull_sections_cave", vis_cull * 1000 / n, "sections/frame")
+    mc_perf.perf_emit("cull_tris_frustum", tris_fr * 1000 / n, "tris/frame")
+    mc_perf.perf_emit("cull_tris_cave", tris_cull * 1000 / n, "tris/frame")
+    mc_perf.perf_emit("cull_search_frustum_us", cullf_us * 1000 / n, "us")
+    mc_perf.perf_emit("cull_search_cave_us", cull_us * 1000 / n, "us")
+    mc_perf.perf_emit("cull_draw_frustum_us", draw_fr * 1000 / n, "us (CPU raster 160x90)")
+    mc_perf.perf_emit("cull_draw_cave_us", draw_cull * 1000 / n, "us (CPU raster 160x90)")
+    mc_perf.perf_emit("cull_sections_saved", (vis_fr - vis_cull) * 100000 / vis_fr, "percent")
+    mc_stream.stream_free(&s, &b)
+    mc_world.world_free(&w)
+}
+
+// loads the whole window with `workers` threads (0 = inline). Synchronous frames: measures the pipeline throughput.
+#[allow_escape]
+fn bench_load(tb: *mut mc_mesh.MeshTables, a: *mut mc_texture.Atlas, ids: u64, workers: u64) {
+    var pool: jobs.Jobs = jobs.Jobs { blk: 0 }
+    var pa: u64 = 0
+    if workers > 0 as u64 {
+        pool = jobs.create(workers)
+        pa = (&pool) as *mut jobs.Jobs as u64
+    }
+    var r: mc_raster.Raster = mc_raster.raster_new(160, 90)
+    mc_raster.backend_upload_atlas(&r, a)
+    var b: mc_backend.Backend = mc_backend.backend_cpu(&r)
+    var w: mc_world.World = mc_world.world_new()
+    var s: mc_stream.Stream = mc_stream.stream_new(0, g_nsec, g_rad + 1, tb, pa)
+    s.nbr_wait = 2 as u32
+    var cam: mc_camera.Camera = mc_camera.camera_new(160, 90)
+    mc_camera.camera_set_lens(&cam, 70.0, 0.05, 16.0 * (g_rad as f64 + 1.0))
+    mc_camera.camera_set_pos(&cam, 8.0, (mc_terrain.terrain_height(8, 8, g_nsec) + 3) as f64, 8.0)
+    mc_camera.camera_set_angles(&cam, 30.0, 0.0)
+    mc_camera.camera_update(&cam)
+    let cols: usize = load_all(&w, &s, ids)
+    s.sync = true
+    s.max_submit = mc_stream.STREAM_NREC
+    s.max_inflight = mc_stream.STREAM_NREC
+    s.snap_budget_us = 1000000000 as u64
+    var frames: usize = 0
+    var res: LoadRes = LoadRes { wall: 0 as u64, cols: 0 as u64, secs: 0 as u64, mesh: 0 as u64, snap: 0 as u64, up: 0 as u64, jobs: 0 as u64 }
+    var mesh_ns: u64 = 0
+    var snap_us: u64 = 0
+    var up_us: u64 = 0
+    var jobs_n: u64 = 0
+    var skipped: u64 = 0
+    let t0: u64 = time.monotonic_ns()
+    while frames < 4000 {
+        one_frame(&s, &w, &b, &cam)
+        frames = frames + 1
+        mesh_ns = mesh_ns + s.st.mesh_ns
+        snap_us = snap_us + s.st.submit_us
+        up_us = up_us + s.st.upload_us
+        jobs_n = jobs_n + s.st.uploaded as u64
+        skipped = skipped + s.st.skipped_empty as u64
+        if mc_stream.stream_pending(&s) == 0 && s.inflight == 0 { break }
+        if s.st.submitted == 0 as u32 && s.st.uploaded == 0 as u32 && s.st.skipped_empty == 0 as u32 && s.st.deferred_nbr == 0 as u32 && s.inflight == 0 { break }
+    }
+    let wall_ns: u64 = time.monotonic_ns() - t0
+    res.wall = wall_ns / 1000
+    res.cols = cols as u64 * 1000000000 * 1000 / wall_ns
+    res.secs = (jobs_n + skipped) * 1000000000 * 1000 / wall_ns
+    res.mesh = mesh_ns / 1000
+    res.snap = snap_us
+    res.up = up_us
+    res.jobs = jobs_n * 1000
+    emit_load(workers, &res)
+    mc_stream.stream_free(&s, &b)
+    mc_world.world_free(&w)
+    if workers > 0 as u64 { jobs.destroy(&pool) }
+}
+
+// asynchronous load: normal frames with the budgets; the worst frame is what a player feels as a hitch
+#[allow_escape]
+fn bench_async(tb: *mut mc_mesh.MeshTables, a: *mut mc_texture.Atlas, ids: u64) {
+    var pool: jobs.Jobs = jobs.create(4)
+    var r: mc_raster.Raster = mc_raster.raster_new(160, 90)
+    mc_raster.backend_upload_atlas(&r, a)
+    var b: mc_backend.Backend = mc_backend.backend_cpu(&r)
+    var w: mc_world.World = mc_world.world_new()
+    var s: mc_stream.Stream = mc_stream.stream_new(0, g_nsec, g_rad + 1, tb, (&pool) as *mut jobs.Jobs as u64)
+    s.nbr_wait = 2 as u32
+    var cam: mc_camera.Camera = mc_camera.camera_new(160, 90)
+    mc_camera.camera_set_lens(&cam, 70.0, 0.05, 16.0 * (g_rad as f64 + 1.0))
+    mc_camera.camera_set_pos(&cam, 8.0, (mc_terrain.terrain_height(8, 8, g_nsec) + 3) as f64, 8.0)
+    mc_camera.camera_set_angles(&cam, 30.0, 0.0)
+    mc_camera.camera_update(&cam)
+    load_all(&w, &s, ids)
+    var frames: u64 = 0
+    var max_frame: u64 = 0
+    var max_up: u64 = 0
+    var max_snap: u64 = 0
+    var sum_frame: u64 = 0
+    let t0: u64 = time.monotonic_ns()
+    while frames < 100000 {
+        let f0: u64 = time.monotonic_ns()
+        one_frame(&s, &w, &b, &cam)
+        let ft: u64 = time.monotonic_ns() - f0
+        frames = frames + 1
+        sum_frame = sum_frame + ft
+        if ft > max_frame { max_frame = ft }
+        if s.st.upload_us > max_up { max_up = s.st.upload_us }
+        if s.st.submit_us > max_snap { max_snap = s.st.submit_us }
+        if mc_stream.stream_pending(&s) == 0 && s.inflight == 0 { break }
+        if s.st.submitted == 0 as u32 && s.st.uploaded == 0 as u32 && s.st.skipped_empty == 0 as u32 && s.st.deferred_nbr == 0 as u32 && s.inflight == 0 { break }
+    }
+    let wall_ns: u64 = time.monotonic_ns() - t0
+    mc_perf.perf_emit_u("stream_async_frames", frames, "frames")
+    mc_perf.perf_emit("stream_async_wall_ms", wall_ns / 1000, "ms")
+    mc_perf.perf_emit("stream_async_frame_avg_ms", sum_frame / frames / 1000, "ms (incl. CPU raster draw)")
+    mc_perf.perf_emit("stream_async_frame_max_ms", max_frame / 1000, "ms")
+    mc_perf.perf_emit("stream_async_upload_max_us", max_up * 1000, "us (budget 2000)")
+    mc_perf.perf_emit("stream_async_submit_max_us", max_snap * 1000, "us (snapshot budget 1500)")
+    mc_stream.stream_free(&s, &b)
+    mc_world.world_free(&w)
+    jobs.destroy(&pool)
+}
+
+fn world_pad_t(cx: i32, sy: i32, cz: i32, pad: u64) {
+    var py: i32 = 0
+    while py < 18 {
+        var pz: i32 = 0
+        while pz < 18 {
+            var px: i32 = 0
+            while px < 18 {
+                let y: i32 = sy * 16 + py - 1
+                var id: u16 = 65535 as u16
+                if y >= 0 && y < g_nsec * 16 { id = mc_terrain.terrain_block(cx * 16 + px - 1, y, cz * 16 + pz - 1, g_nsec) }
+                rt.st16(pad, ((py * 18 + pz) * 18 + px) as usize, id)
+                px = px + 1
+            }
+            pz = pz + 1
+        }
+        py = py + 1
+    }
+}
+
+fn emit_lod_total(r: i32, full_tris: u64, lod4_tris: u64, lod2_tris: u64, full_b: u64, lod4_b: u64, lod2_b: u64) {
+    if r == 8 {
+        mc_perf.perf_emit_u("lod_r8_tris_full", full_tris, "tris")
+        mc_perf.perf_emit_u("lod_r8_tris_lod4", lod4_tris, "tris")
+        mc_perf.perf_emit_u("lod_r8_tris_lod2", lod2_tris, "tris")
+        mc_perf.perf_emit_u("lod_r8_bytes_full", full_b, "bytes")
+        mc_perf.perf_emit_u("lod_r8_bytes_lod4", lod4_b, "bytes")
+        mc_perf.perf_emit_u("lod_r8_bytes_lod2", lod2_b, "bytes")
+    } else if r == 16 {
+        mc_perf.perf_emit_u("lod_r16_tris_full", full_tris, "tris")
+        mc_perf.perf_emit_u("lod_r16_tris_lod4", lod4_tris, "tris")
+        mc_perf.perf_emit_u("lod_r16_tris_lod2", lod2_tris, "tris")
+        mc_perf.perf_emit_u("lod_r16_bytes_full", full_b, "bytes")
+        mc_perf.perf_emit_u("lod_r16_bytes_lod4", lod4_b, "bytes")
+        mc_perf.perf_emit_u("lod_r16_bytes_lod2", lod2_b, "bytes")
+    } else {
+        mc_perf.perf_emit_u("lod_r32_tris_full", full_tris, "tris")
+        mc_perf.perf_emit_u("lod_r32_tris_lod4", lod4_tris, "tris")
+        mc_perf.perf_emit_u("lod_r32_tris_lod2", lod2_tris, "tris")
+        mc_perf.perf_emit_u("lod_r32_bytes_full", full_b, "bytes")
+        mc_perf.perf_emit_u("lod_r32_bytes_lod4", lod4_b, "bytes")
+        mc_perf.perf_emit_u("lod_r32_bytes_lod2", lod2_b, "bytes")
+    }
+}
+
+// Samples a 7 x 7 grid of columns (stride 4: the terrain is statistically uniform), measures the average full-detail mesh
+// and the LOD meshes (bin 4 / bin 2) per column and extrapolates to view distance 8 / 16 / 32: columns up to 4 away from
+// the camera stay full detail, the rest uses the LOD (without LOD: all columns full detail).
+#[allow_escape]
+fn bench_lod(tb: *mut mc_mesh.MeshTables, ids: u64) {
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    let hs: u64 = rt.heap_alloc(512)
+    let hi: u64 = rt.heap_alloc(512)
+    let bh: u64 = rt.heap_alloc(512)
+    let bi: u64 = rt.heap_alloc(512)
+    var m: mc_mesh.Mesher = mc_mesh.mesher_new()
+    var ml: mc_mesh.Mesher = mc_mesh.mesher_new()
+    var ft: u64 = 0
+    var fb: u64 = 0
+    var l4t: u64 = 0
+    var l4b: u64 = 0
+    var l2t: u64 = 0
+    var l2b: u64 = 0
+    var full_ns: u64 = 0
+    var lod_ns: u64 = 0
+    var n: u64 = 0
+    var gz: i32 = 0 - 3
+    while gz <= 3 {
+        var gx: i32 = 0 - 3
+        while gx <= 3 {
+            let cx: i32 = gx * 4
+            let cz: i32 = gz * 4
+            mc_terrain.terrain_column(cx, cz, g_nsec, ids)
+            let ch: u64 = mc_render_world.wr_make_chunk(cx, cz, g_nsec as usize, ids)
+            var sy: i32 = 0
+            while sy < g_nsec {
+                world_pad_t(cx, sy, cz, pad)
+                let t0: u64 = time.monotonic_ns()
+                mc_mesh.mesh_padded(&m, pad, tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+                full_ns = full_ns + (time.monotonic_ns() - t0)
+                ft = ft + (m.nidx / 3 as u32) as u64
+                fb = fb + mc_mesh.mesh_used_bytes(&m) as u64
+                sy = sy + 1
+            }
+            let t1: u64 = time.monotonic_ns()
+            mc_lod.lod_heights(ch as *mut mc_chunk.Chunk, tb, hs, hi)
+            mc_lod.lod_bin(hs, hi, 4, bh, bi)
+            mc_lod.lod_mesh(&ml, tb, 4, bh, bi, 0)
+            lod_ns = lod_ns + (time.monotonic_ns() - t1)
+            l4t = l4t + mc_lod.lod_tris(&ml) as u64
+            l4b = l4b + mc_mesh.mesh_used_bytes(&ml) as u64
+            mc_lod.lod_bin(hs, hi, 2, bh, bi)
+            mc_lod.lod_mesh(&ml, tb, 2, bh, bi, 0)
+            l2t = l2t + mc_lod.lod_tris(&ml) as u64
+            l2b = l2b + mc_mesh.mesh_used_bytes(&ml) as u64
+            mc_chunk.chunk_release(ch)
+            n = n + 1
+            gx = gx + 1
+        }
+        gz = gz + 1
+    }
+    mc_perf.perf_emit("lod_avg_tris_full_column", ft * 1000 / n, "tris/column")
+    mc_perf.perf_emit("lod_avg_tris_lod4_column", l4t * 1000 / n, "tris/column")
+    mc_perf.perf_emit("lod_avg_tris_lod2_column", l2t * 1000 / n, "tris/column")
+    mc_perf.perf_emit("lod_build_full_us_column", full_ns / n, "us (meshing the sections only)")
+    mc_perf.perf_emit("lod_build_lod_us_column", lod_ns / n, "us (heights + bin + mesh)")
+    var r: i32 = 8
+    while r <= 32 {
+        let cols: u64 = ((2 * r + 1) * (2 * r + 1)) as u64
+        let near: u64 = 81 as u64 // 9 x 9 columns stay full detail
+        let far: u64 = cols - near
+        emit_lod_total(r, cols * ft / n, (near * ft + far * l4t) / n, (near * ft + far * l2t) / n,
+            cols * fb / n, (near * fb + far * l4b) / n, (near * fb + far * l2b) / n)
+        r = r * 2
+    }
+    mc_mesh.mesher_free(&m)
+    mc_mesh.mesher_free(&ml)
+}
+
+fn main(start: u64) -> i32 {
+    let argc: usize = rt.arg_count(start)
+    if argc > 1 { g_rad = atoi(rt.arg_ptr(start, 1), 5) }
+    if argc > 2 { g_nsec = atoi(rt.arg_ptr(start, 2), 8) }
+    var mode: i32 = 0 // 0 all, 1 cull, 2 load, 3 lod
+    if argc > 3 {
+        let p3: u64 = rt.arg_ptr(start, 3)
+        if rt.ld8(p3, 0) == 99 as u8 { mode = 1 }
+        if rt.ld8(p3, 0) == 108 as u8 && rt.ld8(p3, 2) == 97 as u8 { mode = 2 }
+        if rt.ld8(p3, 0) == 108 as u8 && rt.ld8(p3, 2) == 100 as u8 { mode = 3 }
+    }
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_terrain.terrain_tables(&tb)
+    var a: mc_texture.Atlas = mc_texture.atlas_default()
+    let ids: u64 = rt.heap_alloc(g_nsec as usize * 4096 * 2)
+    mc_perf.perf_emit_u("stream_radius", g_rad as u64, "columns")
+    if mode == 0 || mode == 1 { bench_cull(&tb, &a, ids) }
+    if mode == 0 || mode == 3 { bench_lod(&tb, ids) }
+    if mode == 0 || mode == 2 {
+        bench_load(&tb, &a, ids, 0 as u64)
+        bench_load(&tb, &a, ids, 1 as u64)
+        bench_load(&tb, &a, ids, 4 as u64)
+        bench_load(&tb, &a, ids, 8 as u64)
+        bench_async(&tb, &a, ids)
+    }
+    return 0
+}

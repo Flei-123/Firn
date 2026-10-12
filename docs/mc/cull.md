@@ -4,3 +4,5 @@
 * Test `tests/2772_mc_cull.fi`: 36 poses in `mc_terrain` (hills + tunnels + caverns): image with culling == image of all frustum sections (byte identical) with and without the set-back rule; a graph with every conn 0 gives different images (counter-check). Run: `bash tools/mc/cull/run.sh`.
 * Fixture trap found: a camera inside a solid block (block coordinate by truncation instead of floor) makes any culler look wrong.
 * NOT done: Measurements (sections/frame), see docs/mc/stream.md "Open".
+
+Note (mc_stream, 12.10.): with the set-back rule one of 12 random poses in tests/2773 hid a visible section; mc_stream defaults to setback = false (exact, byte-identical images).

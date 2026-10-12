@@ -1,0 +1,314 @@
+// expect_exit: 0
+// tests/2774_mc_lod.fi -- mc_lod: distant terrain as a few quads.
+// A  flat column: heights, bin 4 -> 16 top quads (vertex layout checked)
+// B  a step in the column -> skirt quads; neighbour column lower -> skirts toward it; unknown neighbour -> none
+// C  bin takes the maximum of the cells
+// D  terrain world: heights == direct scan with terrain_block; LOD uses far fewer triangles than the full meshes
+// E  flat world: image of the LOD columns (bin 4) == image of the full section meshes (top faces only)
+import std.rt
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_terrain
+import mc.mc_render_world
+import mc.mc_lod
+
+const NSEC: i32 = 6
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+fn floor_div16(v: i32) -> i32 {
+    var q: i32 = v / 16
+    if v % 16 != 0 && v < 0 { q = q - 1 }
+    return q
+}
+
+// column with stone (id 1) up to height hfn(x) (x = 0..15): hstep = 0 -> flat `h0`, else x >= 8 has h1
+fn make_col(cx: i32, cz: i32, h0: i32, h1: i32, ids: u64) -> u64 {
+    var y: i32 = 0
+    while y < NSEC * 16 {
+        let s: i32 = y / 16
+        let ly: i32 = y - s * 16
+        var z: i32 = 0
+        while z < 16 {
+            var x: i32 = 0
+            while x < 16 {
+                var h: i32 = h0
+                if x >= 8 { h = h1 }
+                var id: u16 = 0 as u16
+                if y < h { id = 1 as u16 }
+                rt.st16(ids, (s * 4096 + (ly * 16 + z) * 16 + x) as usize, id)
+                x = x + 1
+            }
+            z = z + 1
+        }
+        y = y + 1
+    }
+    return mc_render_world.wr_make_chunk(cx, cz, NSEC as usize, ids)
+}
+
+fn tables() -> mc_mesh.MeshTables {
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_terrain.terrain_tables(&tb)
+    return tb
+}
+
+fn fill_u16(p: u64, n: usize, v: u16) {
+    var i: usize = 0
+    while i < n {
+        rt.st16(p, i, v)
+        i = i + 1
+    }
+}
+
+fn part_abc(tb: *mut mc_mesh.MeshTables, ids: u64) {
+    let hs: u64 = rt.heap_alloc(512)
+    let hi: u64 = rt.heap_alloc(512)
+    let bh: u64 = rt.heap_alloc(512)
+    let bi: u64 = rt.heap_alloc(512)
+    var m: mc_mesh.Mesher = mc_mesh.mesher_new()
+    // A
+    let c0: u64 = make_col(0, 0, 40, 40, ids)
+    check(c0 != 0, 1)
+    mc_lod.lod_heights(c0 as *mut mc_chunk.Chunk, tb, hs, hi)
+    var k: usize = 0
+    while k < 256 {
+        check(rt.ld16(hs, k) == 40 as u16 && rt.ld16(hi, k) == 1 as u16, 2)
+        k = k + 1
+    }
+    mc_lod.lod_bin(hs, hi, 4, bh, bi)
+    let y0: i32 = mc_lod.lod_mesh(&m, tb, 4, bh, bi, 0)
+    check(y0 == 40, 3)
+    check(m.nquads == 16 as u32 && m.nverts == 64 as u32 && m.nidx == 96 as u32 && mc_lod.lod_tris(&m) == 32 as u32, 4)
+    k = 0
+    while k < 64 {
+        let w0: u32 = rt.ld32(m.verts, k * 2)
+        check(mc_mesh.vtx_face(w0) == 3 as u32 && mc_mesh.vtx_y(w0) == 0 as u32 && mc_mesh.vtx_x(w0) <= 16 as u32 && mc_mesh.vtx_z(w0) <= 16 as u32, 5)
+        check(mc_mesh.vtx_tile(rt.ld32(m.verts, k * 2 + 1)) == 1 as u32, 6) // tile of id 1 (terrain_tables)
+        k = k + 1
+    }
+    // B: step x >= 8 is 44 high (bin 4: cells i = 2, 3)
+    let c1: u64 = make_col(0, 0, 40, 44, ids)
+    mc_lod.lod_heights(c1 as *mut mc_chunk.Chunk, tb, hs, hi)
+    mc_lod.lod_bin(hs, hi, 4, bh, bi)
+    let yb: i32 = mc_lod.lod_mesh(&m, tb, 4, bh, bi, 0)
+    check(yb == 40, 7)
+    check(m.nquads == 16 as u32 + 4 as u32, 8) // 4 skirts (-x face of cells i = 2, rows j = 0..3)
+    // neighbour column +x with height 30 (flat): 4 more skirts of the cells i = 3, 4 rows
+    let nb: u64 = rt.heap_alloc(32)
+    let nh: u64 = rt.heap_alloc(512)
+    fill_u16(nh, 16, 30 as u16)
+    rt.st64(nb, 0, 0 as u64)
+    rt.st64(nb, 1, nh)
+    rt.st64(nb, 2, 0 as u64)
+    rt.st64(nb, 3, 0 as u64)
+    mc_lod.lod_mesh(&m, tb, 4, bh, bi, nb)
+    check(m.nquads == 16 as u32 + 4 as u32 + 4 as u32, 9)
+    // a neighbour of the same height or higher: nothing; unknown (0 pointers) was nothing above
+    fill_u16(nh, 16, 44 as u16)
+    mc_lod.lod_mesh(&m, tb, 4, bh, bi, nb)
+    check(m.nquads == 16 as u32 + 4 as u32, 10)
+    // C: a pillar in the bin takes the maximum
+    mc_lod.lod_heights(c0 as *mut mc_chunk.Chunk, tb, hs, hi)
+    rt.st16(hs, 5 * 16 + 6, 50 as u16) // x = 6, z = 5 -> cell (1, 1)
+    mc_lod.lod_bin(hs, hi, 4, bh, bi)
+    check(rt.ld16(bh, 1 * 4 + 1) == 50 as u16 && rt.ld16(bh, 0) == 40 as u16, 11)
+    mc_lod.lod_bin(hs, hi, 2, bh, bi)
+    check(rt.ld16(bh, 2 * 8 + 3) == 50 as u16, 12)
+    mc_chunk.chunk_release(c0)
+    mc_chunk.chunk_release(c1)
+    mc_mesh.mesher_free(&m)
+}
+
+fn scan_h(x: i32, z: i32, tb: *mut mc_mesh.MeshTables) -> i32 {
+    var y: i32 = NSEC * 16 - 1
+    while y >= 0 {
+        let id: u16 = mc_terrain.terrain_block(x, y, z, NSEC)
+        if id != 0 as u16 && rt.ld16((*tb).tiles, (id as usize) * 6 + 3) != 0 as u16 { return y + 1 }
+        y = y - 1
+    }
+    return 0
+}
+
+fn world_pad(cx: i32, sy: i32, cz: i32, pad: u64) {
+    var py: i32 = 0
+    while py < 18 {
+        var pz: i32 = 0
+        while pz < 18 {
+            var px: i32 = 0
+            while px < 18 {
+                let x: i32 = cx * 16 + px - 1
+                let y: i32 = sy * 16 + py - 1
+                let z: i32 = cz * 16 + pz - 1
+                var id: u16 = 65535 as u16
+                if y >= 0 && y < NSEC * 16 { id = mc_terrain.terrain_block(x, y, z, NSEC) }
+                rt.st16(pad, ((py * 18 + pz) * 18 + px) as usize, id)
+                px = px + 1
+            }
+            pz = pz + 1
+        }
+        py = py + 1
+    }
+}
+
+fn part_d(tb: *mut mc_mesh.MeshTables, ids: u64) {
+    let hs: u64 = rt.heap_alloc(512)
+    let hi: u64 = rt.heap_alloc(512)
+    let bh: u64 = rt.heap_alloc(512)
+    let bi: u64 = rt.heap_alloc(512)
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    var m: mc_mesh.Mesher = mc_mesh.mesher_new()
+    var ml: mc_mesh.Mesher = mc_mesh.mesher_new()
+    var tris_full: u64 = 0
+    var tris_lod2: u64 = 0
+    var tris_lod4: u64 = 0
+    var cz: i32 = 0 - 2
+    while cz <= 2 {
+        var cx: i32 = 0 - 2
+        while cx <= 2 {
+            mc_terrain.terrain_column(cx, cz, NSEC, ids)
+            let ch: u64 = mc_render_world.wr_make_chunk(cx, cz, NSEC as usize, ids)
+            mc_lod.lod_heights(ch as *mut mc_chunk.Chunk, tb, hs, hi)
+            var z: i32 = 0
+            while z < 16 {
+                var x: i32 = 0
+                while x < 16 {
+                    check(rt.ld16(hs, (z * 16 + x) as usize) as i32 == scan_h(cx * 16 + x, cz * 16 + z, tb), 20)
+                    x = x + 1
+                }
+                z = z + 1
+            }
+            var sy: i32 = 0
+            while sy < NSEC {
+                world_pad(cx, sy, cz, pad)
+                mc_mesh.mesh_padded(&m, pad, tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+                tris_full = tris_full + (m.nidx / 3 as u32) as u64
+                sy = sy + 1
+            }
+            mc_lod.lod_bin(hs, hi, 2, bh, bi)
+            mc_lod.lod_mesh(&ml, tb, 2, bh, bi, 0)
+            tris_lod2 = tris_lod2 + mc_lod.lod_tris(&ml) as u64
+            mc_lod.lod_bin(hs, hi, 4, bh, bi)
+            mc_lod.lod_mesh(&ml, tb, 4, bh, bi, 0)
+            tris_lod4 = tris_lod4 + mc_lod.lod_tris(&ml) as u64
+            mc_chunk.chunk_release(ch)
+            cx = cx + 1
+        }
+        cz = cz + 1
+    }
+    check(tris_lod4 < tris_lod2 && tris_lod2 < tris_full, 21)
+    check(tris_lod4 * 3 < tris_full, 22)
+    mc_mesh.mesher_free(&m)
+    mc_mesh.mesher_free(&ml)
+}
+
+// flat world 3 x 3 columns, height 40
+fn flat_pad(cx: i32, sy: i32, cz: i32, pad: u64) {
+    var py: i32 = 0
+    while py < 18 {
+        var pz: i32 = 0
+        while pz < 18 {
+            var px: i32 = 0
+            while px < 18 {
+                let x: i32 = cx * 16 + px - 1
+                let y: i32 = sy * 16 + py - 1
+                let z: i32 = cz * 16 + pz - 1
+                let colx: i32 = floor_div16(x)
+                let colz: i32 = floor_div16(z)
+                var id: u16 = 65535 as u16
+                if colx >= 0 - 1 && colx <= 1 && colz >= 0 - 1 && colz <= 1 && y >= 0 {
+                    id = 0 as u16
+                    if y < 40 { id = 1 as u16 }
+                }
+                rt.st16(pad, ((py * 18 + pz) * 18 + px) as usize, id)
+                px = px + 1
+            }
+            pz = pz + 1
+        }
+        py = py + 1
+    }
+}
+
+fn same_hash(a: u64, b: u64) -> bool {
+    var i: usize = 0
+    while i < 64 {
+        if rt.ld8(a, i) != rt.ld8(b, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn part_e(tb: *mut mc_mesh.MeshTables, ids: u64) {
+    var a: mc_texture.Atlas = mc_texture.atlas_default()
+    var r1: mc_raster.Raster = mc_raster.raster_new(96, 54)
+    var r2: mc_raster.Raster = mc_raster.raster_new(96, 54)
+    mc_raster.backend_upload_atlas(&r1, &a)
+    mc_raster.backend_upload_atlas(&r2, &a)
+    var cam: mc_camera.Camera = mc_camera.camera_new(96, 54)
+    mc_camera.camera_set_lens(&cam, 70.0, 0.05, 160.0)
+    mc_camera.camera_set_pos(&cam, 8.5, 60.0, 8.5)
+    mc_camera.camera_set_angles(&cam, 20.0, 0.0 - 50.0)
+    mc_camera.camera_update(&cam)
+    mc_raster.backend_begin(&r1, &cam, 0xFF3C2814 as u32)
+    mc_raster.backend_begin(&r2, &cam, 0xFF3C2814 as u32)
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    let hs: u64 = rt.heap_alloc(512)
+    let hi: u64 = rt.heap_alloc(512)
+    let bh: u64 = rt.heap_alloc(512)
+    let bi: u64 = rt.heap_alloc(512)
+    var m: mc_mesh.Mesher = mc_mesh.mesher_new()
+    var ml: mc_mesh.Mesher = mc_mesh.mesher_new()
+    var drawn_full: u32 = 0 as u32
+    var cz: i32 = 0 - 1
+    while cz <= 1 {
+        var cx: i32 = 0 - 1
+        while cx <= 1 {
+            var sy: i32 = 0
+            while sy < NSEC {
+                flat_pad(cx, sy, cz, pad)
+                mc_mesh.mesh_padded(&m, pad, tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+                if m.nverts > 0 as u32 {
+                    let h: usize = mc_raster.backend_mesh_upload(&r1, 1 as u64, m.verts, m.nverts as usize, m.idx, m.nidx as usize)
+                    mc_raster.backend_draw(&r1, h, (cx * 16) as f64, (sy * 16) as f64, (cz * 16) as f64)
+                    drawn_full = drawn_full + 1 as u32
+                }
+                sy = sy + 1
+            }
+            let ch: u64 = make_col(cx, cz, 40, 40, ids)
+            mc_lod.lod_heights(ch as *mut mc_chunk.Chunk, tb, hs, hi)
+            mc_lod.lod_bin(hs, hi, 4, bh, bi)
+            let y0: i32 = mc_lod.lod_mesh(&ml, tb, 4, bh, bi, 0)
+            let h2: usize = mc_raster.backend_mesh_upload(&r2, 2 as u64, ml.verts, ml.nverts as usize, ml.idx, ml.nidx as usize)
+            mc_raster.backend_draw(&r2, h2, (cx * 16) as f64, y0 as f64, (cz * 16) as f64)
+            mc_chunk.chunk_release(ch)
+            cx = cx + 1
+        }
+        cz = cz + 1
+    }
+    mc_raster.backend_end(&r1)
+    mc_raster.backend_end(&r2)
+    check(drawn_full == 9 as u32, 30) // only the section with the surface has faces
+    let h1: u64 = rt.heap_alloc(64)
+    let h2: u64 = rt.heap_alloc(64)
+    mc_raster.raster_hash_hex(&r1, h1)
+    mc_raster.raster_hash_hex(&r2, h2)
+    check(same_hash(h1, h2), 31)
+    mc_mesh.mesher_free(&m)
+    mc_mesh.mesher_free(&ml)
+}
+
+fn main() -> i32 {
+    var tb: mc_mesh.MeshTables = tables()
+    let ids: u64 = rt.heap_alloc(NSEC as usize * 4096 * 2)
+    part_abc(&tb, ids)
+    part_d(&tb, ids)
+    part_e(&tb, ids)
+    return 0
+}
