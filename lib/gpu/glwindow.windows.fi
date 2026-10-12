@@ -1,28 +1,17 @@
 // SPDX-License-Identifier: MPL-2.0
-// lib/gpu/glwin.fi -- gpu.glwin: an OpenGL 3.3 core WINDOW on Linux/X11 (round gpu-a).
+// lib/gpu/glwindow.windows.fi -- gpu.glwindow on Windows (round gpu-a): the twin of lib/gpu/glwindow.fi, same names.
 //
-//     import gpu.glwin
-//     var g: glwin.GlWin = glwin.glwin_new()
-//     if !glwin.open(&g, 640, 360, "title", glwin.opts_default()) { ... g.step says what failed ... }
-//     // g.ctx is current on this thread: load GL with gl33.gl_load(&g.ctx, &gl) and draw
-//     while !g.closed {
-//         glwin.pump(&g, 0)          // events, EV_CONFIGURE -> g.w / g.h / g.resized
-//         if g.resized { glwin.resize_done(&g) }   // viewport follows the window
-//         ... draw into the default framebuffer ...
-//         glwin.swap(&g)
-//     }
-//     glwin.close(&g)
+//     import gpu.glwindow
+//     var g: glwindow.GlWin = glwindow.glwindow_new()
+//     if !glwindow.open(&g, 640, 360, "title", glwindow.opts_default()) { ... g.step says what failed ... }
+//     while !g.closed { glwindow.pump(&g, 0); if g.resized { glwindow.resize_done(&g) }; ...draw...; glwindow.swap(&g) }
+//     glwindow.close(&g)
 //
-// THE WAY (decided with measurements in docs/GPU.md): the window is the Firn window of lib/window (its own X11
-// protocol: events, input, DPI, clipboard, drops, fullscreen request stay there). Only the GL context is added:
-// glctx.ctx_attach_x11 = a second Xlib connection that exists ONLY for Mesa's EGL X11 platform and an EGL window
-// surface on the Firn window's XID (an XID is global on the server, it may belong to another connection);
-// glctx.ctx_attach_glx = the same through libGL's GLX (glXCreateContextAttribsARB) as a fallback / on request.
-// opts.api: 0 = EGL, then GLX; 1 = EGL only; 2 = GLX only.
-//
-// The twin for Windows (lib/gpu/glwin.windows.fi, wgl) exports the same names.
-//
-// THREADS: call from the main thread only (docs/FFI.md, glibc TLS); the GL context is current on it.
+// THE WAY: the window is the Firn window of lib/window (win32 back end: messages, input, DPI, full screen stay
+// there); the GL 3.3 core context is the one the window makes for its own HWND (window.gpu_gl -> WGL, lib/gpu/
+// wgl.windows.fi, depth 24 / stencil 8). `g.ctx` is a borrowed gpu.glctx context: gl33.gl_load(&g.ctx, &gl) works,
+// swap goes through window.gpu_swap. opts.api and opts.display are ignored (there is only WGL).
+// TESTED UNDER WINE + MESA ONLY (tools/gpu/win/run.sh, section Wine); real Windows with a real driver: UNTESTED.
 import std.rt
 import std.dynlib
 import window.window
@@ -30,9 +19,9 @@ import window.backend
 import gpu.glctx
 
 export {
-    GlWin, Opts, opts_default, glwin_new, open, close, make_current, swap, swap_interval, swap_interval_get,
+    GlWin, Opts, opts_default, glwindow_new, open, close, make_current, swap, swap_interval, swap_interval_get,
     pump, resize, resize_done, set_fullscreen, is_fullscreen, dpi, surface_size, api_name, take_ctx, viewport,
-    API_AUTO, API_EGL, API_GLX, USED_EGL, USED_GLX,
+    API_AUTO, API_EGL, API_GLX, USED_EGL, USED_GLX, USED_WGL,
 }
 
 const API_AUTO: i32 = 0
@@ -40,6 +29,7 @@ const API_EGL: i32 = 1
 const API_GLX: i32 = 2
 const USED_EGL: i32 = 1
 const USED_GLX: i32 = 2
+const USED_WGL: i32 = 3
 
 struct Opts {
     api: i32, // API_AUTO / API_EGL / API_GLX
@@ -65,19 +55,17 @@ struct GlWin {
     fs: bool,
     f_viewport: u64,
     frames: u64,
+    ival: i32, // swap interval in force (0 / 1)
 }
 
-fn glwin_new() -> GlWin {
+fn glwindow_new() -> GlWin {
     return GlWin { ok: false, step: 0, api: 0, win: window.window_new(), ctx: glctx.ctx_blank(), lent: false,
-        w: 0, h: 0, closed: false, resized: false, fs: false, f_viewport: 0, frames: 0 }
+        w: 0, h: 0, closed: false, resized: false, fs: false, f_viewport: 0, frames: 0, ival: 1 }
 }
 
 fn api_name(g: *mut GlWin) -> str {
-    if (*g).api == 1 {
-        return "egl"
-    }
-    if (*g).api == 2 {
-        return "glx"
+    if (*g).api == 3 {
+        return "wgl"
     }
     return "none"
 }
@@ -97,31 +85,19 @@ fn open(g: *mut GlWin, w: i32, h: i32, title: str, o: Opts) -> bool {
     window.show_window(&(*g).win)
     (*g).w = window.width(&(*g).win) as i32
     (*g).h = window.height(&(*g).win) as i32
-    let xid: u64 = backend.r_native(&(*g).win.p)
-    let vis: u64 = backend.r_native_visual(&(*g).win.p)
-    var used: i32 = 0
-    if o.api != 2 {
-        (*g).ctx = glctx.ctx_attach_x11(xid, vis, (*g).w, (*g).h)
-        if (*g).ctx.ok {
-            used = 1
-        } else {
-            glctx.ctx_close(&(*g).ctx)
-        }
-    }
-    if used == 0 && o.api != 1 {
-        (*g).ctx = glctx.ctx_attach_glx(xid, vis, (*g).w, (*g).h)
-        if (*g).ctx.ok {
-            used = 2
-        } else {
-            glctx.ctx_close(&(*g).ctx)
-        }
-    }
-    if used == 0 {
+    if !window.gpu_gl(&(*g).win, 3 as u32, 3 as u32, 24 as u32, 8 as u32) {
         (*g).step = 3
         window.close_window(&(*g).win)
         return false
     }
-    (*g).api = used
+    (*g).ctx = glctx.ctx_borrow()
+    if !(*g).ctx.ok {
+        (*g).step = 3
+        window.gpu_close(&(*g).win)
+        window.close_window(&(*g).win)
+        return false
+    }
+    (*g).api = USED_WGL
     (*g).ok = true
     (*g).step = 0
     swap_interval(g, o.vsync)
@@ -135,42 +111,34 @@ fn take_ctx(g: *mut GlWin) -> glctx.GlCtx {
 }
 
 fn make_current(g: *mut GlWin) -> bool {
-    return glctx.ctx_make_current(&(*g).ctx)
+    return window.gpu_gl(&(*g).win, 3 as u32, 3 as u32, 24 as u32, 8 as u32)
 }
 
 fn swap(g: *mut GlWin) -> bool {
     (*g).frames = (*g).frames + 1
-    return glctx.ctx_swap(&(*g).ctx)
+    return window.gpu_swap(&(*g).win)
 }
 
-// Sets the swap interval: 0 = no wait, 1 = vertical blank, -1 = adaptive (GLX_EXT_swap_control_tear only, else 1).
-// The value is clamped to what the driver allows. Returns the interval now in force, -99 if the driver cannot.
+// Sets the swap interval: 0 = no wait, otherwise (1, -1 adaptive) = vertical blank. WGL has two states here.
+// Returns the interval now in force, -99 if the driver cannot (no WGL_EXT_swap_control).
 fn swap_interval(g: *mut GlWin, n: i32) -> i32 {
-    var want: i32 = n
-    if want < 0 {
-        if glctx.ctx_swap_interval(&(*g).ctx, want) {
-            return glctx.ctx_interval_get(&(*g).ctx)
-        }
-        want = 1
+    var on: bool = true
+    if n == 0 {
+        on = false
     }
-    var lo: i32 = 0
-    var hi: i32 = 1
-    if !(*g).ctx.glx && glctx.ctx_swap_range(&(*g).ctx, &lo, &hi) {
-        if want < lo {
-            want = lo
-        }
-        if want > hi {
-            want = hi
-        }
-    }
-    if !glctx.ctx_swap_interval(&(*g).ctx, want) {
+    if !window.gpu_vsync(&(*g).win, on) {
         return 0 - 99
     }
-    return glctx.ctx_interval_get(&(*g).ctx)
+    if on {
+        (*g).ival = 1
+    } else {
+        (*g).ival = 0
+    }
+    return (*g).ival
 }
 
 fn swap_interval_get(g: *mut GlWin) -> i32 {
-    return glctx.ctx_interval_get(&(*g).ctx)
+    return (*g).ival
 }
 
 // Waits up to `ms` for window events (0 = only look) and handles all of them: EV_CONFIGURE sets w/h/resized,
@@ -214,7 +182,7 @@ fn resize_done(g: *mut GlWin) {
     viewport(g, (*g).w, (*g).h)
 }
 
-// Asks the X server for a new window size and waits (at most `ms`) for the matching EV_CONFIGURE; then viewport.
+// Asks the system for a new client size and waits (at most `ms`) for the matching EV_CONFIGURE; then viewport.
 // False if the size did not arrive (the window manager may refuse or change it: g.w / g.h hold what we got).
 fn resize(g: *mut GlWin, w: i32, h: i32, ms: i64) -> bool {
     if !backend.r_set_size(&(*g).win.p, w as usize, h as usize) {
@@ -229,7 +197,7 @@ fn resize(g: *mut GlWin, w: i32, h: i32, ms: i64) -> bool {
     return (*g).w == w && (*g).h == h
 }
 
-// Full screen request (EWMH _NET_WM_STATE_FULLSCREEN, or by hand without a window manager). True = request sent;
+// Full screen request (borderless over the monitor). True = request sent;
 // the size arrives as EV_CONFIGURE (pump).
 fn set_fullscreen(g: *mut GlWin, on: bool) -> bool {
     let ok: bool = window.fullscreen(&(*g).win, on)
@@ -245,14 +213,16 @@ fn dpi(g: *mut GlWin) -> usize {
     return window.dpi(&(*g).win)
 }
 
-// The size the GL surface really has (EGL_WIDTH/HEIGHT, GLX_WIDTH/HEIGHT); false if unknown.
+// The size the GL surface has: the client area of the window (WGL has no separate surface).
 fn surface_size(g: *mut GlWin, w: *mut i32, h: *mut i32) -> bool {
-    return glctx.ctx_surface_size(&(*g).ctx, w, h)
+    *w = window.width(&(*g).win) as i32
+    *h = window.height(&(*g).win) as i32
+    return true
 }
 
 fn close(g: *mut GlWin) {
     if !(*g).lent {
-        glctx.ctx_close(&(*g).ctx)
+        window.gpu_close(&(*g).win)
     }
     window.close_window(&(*g).win)
     (*g).ok = false

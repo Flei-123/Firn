@@ -1982,15 +1982,16 @@ else
     bad "tools/input/read_run.sh failed (see .test-work/rawinput.log)"
     grep -E 'FAIL' "$WORK/rawinput.log" | head -12 | sed 's/^/   /' || true
 echo "== 122. GL 3.3 core window on X11: EGL on the Firn window's XID + GLX fallback (tools/gpu/win/run.sh, lib/gpu/glwin.fi, docs/GPU.md) =="
+echo "== 122. GL 3.3 core window on X11 + Windows twin under Wine: EGL on the Firn window's XID + GLX fallback (tools/gpu/win/run.sh, lib/gpu/glwindow.fi, docs/GPU.md) =="
 # Xvfb + Mesa llvmpipe: open, clear + read back the window framebuffer, swap, swap interval, resize, full screen request, DPI.
 # A missing libEGL / Xvfb is SKIP. Only Mesa is proven; a real GPU driver is UNTESTED.
-FIRNC="$FIRNC" bash tools/gpu/win/run.sh > "$WORK/glwin.log" 2>&1 && GWRC=0 || GWRC=$?
+FIRNC="$FIRNC" bash tools/gpu/win/run.sh > "$WORK/glwindow.log" 2>&1 && GWRC=0 || GWRC=$?
 if [ "$GWRC" -eq 0 ]; then
     ok
-    grep -E '^   (ok|SKIP)|metric' "$WORK/glwin.log" | sed 's/^/ /'
+    grep -E '^   (ok|SKIP)|metric' "$WORK/glwindow.log" | sed 's/^/ /'
 else
-    bad "tools/gpu/win/run.sh failed (see .test-work/glwin.log)"
-    grep -E 'FAIL' "$WORK/glwin.log" | head -12 | sed 's/^/   /' || true
+    bad "tools/gpu/win/run.sh failed (see .test-work/glwindow.log)"
+    grep -E 'FAIL' "$WORK/glwindow.log" | head -12 | sed 's/^/   /' || true
 fi
 
 echo "== 122. lib/gpu building blocks: gl_ext/gl_prog/gl_tex/gl_fbo/gl_query on llvmpipe + gpu.cull vs brute force (tools/gpu/ext/run.sh, docs/GPU.md) =="

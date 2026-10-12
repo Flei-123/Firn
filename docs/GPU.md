@@ -79,19 +79,19 @@ needs ~40 structs/handles by pointer, no GL context; real renderer would need SP
 GL image hash (PSNR) for the new paths is not added: the byte-equality checks above are on GL itself. SSBO shader test, `prog_poll` edit test,
 `MODE_ELAPSED` test, real GPU, indirect `baseInstance` (needs GL 4.2 `ARB_shader_draw_parameters` semantics) untested.
 
-## GL window on X11 (round gpu-a, 2026-10-12) -- `lib/gpu/glwin.fi`, `glshow.fi`, `tools/gpu/win/run.sh` (gate 122)
+## GL window on X11 (round gpu-a, 2026-10-12) -- `lib/gpu/glwindow.fi`, `glshow.fi`, `tools/gpu/win/run.sh` (gate 122)
 Decision: **(a) the Firn window of `lib/window` + a GL context on its XID**. The window keeps events, input, DPI,
 clipboard, drops and the EWMH full screen request; only the context is new (`glctx.ctx_attach_x11` = EGL window surface via a
 second Xlib connection that exists only for Mesa's X11 platform; `glctx.ctx_attach_glx` = libGL GLX fallback,
 `glXCreateContextAttribsARB` 3.3 core, FBConfig chosen by the window's visual id). **An XID of another connection works on
 Mesa (EGL and GLX), proven.** (b) `ctx_open_x11` (its own Xlib window) would need XNextEvent -> window.EV_* translation,
 DPI, input and fullscreen again: more code, less function. Not run in the gate (still "compiled only").
-API (`import gpu.glwin`): `open(&g,w,h,title,opts)`, `make_current`, `swap`, `swap_interval(n)` (0/1/-1; clamped to the
+API (`import gpu.glwindow`): `open(&g,w,h,title,opts)`, `make_current`, `swap`, `swap_interval(n)` (0/1/-1; clamped to the
 driver's range, returns the value in force or -99), `pump(ms)` (events -> `g.w/g.h/g.resized/g.closed`), `resize(w,h,ms)`
 (ConfigureWindow + wait for EV_CONFIGURE + glViewport), `set_fullscreen/is_fullscreen` (EWMH `_NET_WM_STATE_FULLSCREEN`
 when a WM runs, else the window is sized over the screen), `dpi`, `surface_size`, `take_ctx` (hand the context to a
 `GlBackend`), `close`. `glshow` draws a texture (`glbe_fbo_texture`) or a CPU image (BGRX/RGBA, top row first) over the
-default framebuffer: the frame path **without read back** = `show_pixels` + `glwin.swap` instead of `window.image`.
+default framebuffer: the frame path **without read back** = `show_pixels` + `glwindow.swap` instead of `window.image`.
 `gl_mc.glbe_resize` makes the FBO again after a resize. Window additions: `r_native/r_native_visual/r_set_size`
 (x11.fi, win32.fi), `r_fullscreen/r_is_fullscreen` now real on X11.
 Measured (Xvfb 800x600 -dpi 120, Mesa llvmpipe, busy host): open 86-109 ms; clear+swap per frame: EGL ~1000 us (min swap
@@ -99,7 +99,9 @@ interval of Mesa's EGL X11 swrast is 1: `swap_interval(0)` reports 1), GLX ~480-
 under Xvfb, so VSync on/off cannot be told apart here. EGL `-1` (adaptive) falls back to 1; GLX only with
 GLX_EXT_swap_control_tear. dpi = 120 (from Xvfb -dpi), surface size = window size after resize (EGL_WIDTH/HEIGHT).
 GLX cannot ask the surface size (`glXQueryDrawable` crashes on a plain X window with Mesa's dispatch): use `g.w/g.h`.
-**Only Mesa/Xvfb proven. Real GPU, a real window manager (EWMH path) and real Windows are UNTESTED.** NOT done: Windows
-twin `glwin.windows.fi` (the pieces exist: `window.gpu_gl`, `gpu_vsync`, `fullscreen`, `r_set_size`), the pixel-hash
-comparison of the window framebuffer against mc_raster, the fUi host variant (hook `window.image` in `lib/plat/fuiwin.fi`
-to `glshow.show_pixels` + `glwin.swap`).
+**Only Mesa/Xvfb proven. Real GPU, a real window manager (EWMH path) and real Windows are UNTESTED.**
+Module name is `glwindow` (not `glwin`: `lib/plat/glwin.fi` = fUi's GlApi table for Windows/Android has that name and
+module names are global). Windows twin `lib/gpu/glwindow.windows.fi` (same names; window = Firn window of lib/window, context =
+`window.gpu_gl` WGL 3.3 core, depth 24/stencil 8, `g.ctx` is a borrowed `glctx` context, swap = `window.gpu_swap`,
+`swap_interval` has two states, `api_name` = "wgl"): `winprobe.exe wgl` under Wine + Xvfb + Mesa is green (open, clear + read
+back, resize via `r_set_size`, fullscreen on/off), part of gate 122 (SKIP without Wine/mingw ld). Real Windows UNTESTED.
