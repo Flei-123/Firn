@@ -1,0 +1,259 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/gl_prog.fi -- gpu.gl_prog: shader programs with an error log, a uniform cache and hot reload (docs/GPU.md).
+//
+//     import gpu.gl_ext
+//     import gpu.gl_prog
+//     var p: gl_prog.Prog = gl_prog.prog_new()
+//     if !gl_prog.prog_build(&x, &p, vs, vs_len, fs, fs_len) { gl_prog.prog_print_log(&p) }        // from memory
+//     if !gl_prog.prog_build_files(&x, &p, "a.vert", "a.frag") { ... }                              // from files
+//     gl_prog.prog_use(&x, &p)
+//     gl_prog.u_2i(&x, &p, "u_tiles", 16, 16)                // location looked up ONCE per name (cache), then glUniform2i
+//     // each frame (cheap: two file reads + hashes): true when the sources changed AND the new program linked
+//     if gl_prog.prog_poll(&x, &p) { ... uniforms are cached for the NEW program ... }
+//
+// ERROR LOG. A failed build leaves the OLD program in place (or id 0 on the first build) and fills `p.log` (NUL
+// terminated, 2 KiB): the driver's compile/link text. Hot reload therefore never breaks a running frame: a typo in a
+// shader file shows up in the log, rendering continues with the last good program, and the next successful edit swaps.
+//
+// UNIFORM CACHE. 64 entries (FNV-1a 64-bit hash of the name -> location, including -1 for "not active"), cleared on
+// every successful (re)build because locations belong to a program. The setters bind the program first (glUseProgram,
+// cheap) so they may be called in any order. A hash collision (probability ~2^-58 per pair) would return the wrong
+// location; names that differ only in one character still hash differently, the test checks the 30 names it uses.
+
+import std.rt
+import std.io
+import gpu.gl33
+import gpu.gl_ext
+
+export {
+    Prog, prog_new, prog_build, prog_build_files, prog_poll, prog_use, prog_free, prog_loc, prog_print_log,
+    u_1i, u_2i, u_3i, u_4i, u_1f, u_2f, u_3f, u_4f, u_mat4, LOG_CAP, CACHE_N,
+}
+
+const LOG_CAP: usize = 2048
+const CACHE_N: usize = 64
+
+struct Prog {
+    id: u32, // 0 = none yet
+    ok: bool, // last build/reload succeeded
+    log: [u8; 2048], // the log of the LAST attempt ("" = none)
+    keys: [u64; 64],
+    locs: [i32; 64],
+    n_cache: usize,
+    cache_hits: u64,
+    cache_misses: u64,
+    builds: u32, // successful builds
+    fails: u32, // failed builds
+    src_hash: u64, // FNV of vs+fs of the last SUCCESSFUL build (files: content)
+    vs_path: [u8; 256],
+    fs_path: [u8; 256],
+    has_files: bool,
+}
+
+fn prog_new() -> Prog {
+    return Prog {
+        id: 0 as u32, ok: false, log: [0; 2048], keys: [0; 64], locs: [0; 64], n_cache: 0, cache_hits: 0, cache_misses: 0,
+        builds: 0 as u32, fails: 0 as u32, src_hash: 0, vs_path: [0; 256], fs_path: [0; 256], has_files: false,
+    }
+}
+
+fn fnv_bytes(h0: u64, p: u64, n: usize) -> u64 {
+    var h: u64 = h0
+    var i: usize = 0
+    while i < n {
+        h = (h ^ (rt.ld8(p, i) as u64)) * (0x100000001B3 as u64)
+        i = i + 1
+    }
+    return h
+}
+
+fn fnv_str(name: str) -> u64 {
+    var h: u64 = 0xCBF29CE484222325 as u64
+    let n: usize = name.length()
+    var i: usize = 0
+    while i < n {
+        h = (h ^ (name.chars(i) as u64)) * (0x100000001B3 as u64)
+        i = i + 1
+    }
+    return h
+}
+
+// Builds a program from the two sources (address, length) and, on success, replaces `p`'s program (deleting the old
+// one, clearing the uniform cache). On failure `p` keeps its old program and `p.log` has the driver text.
+fn prog_build(x: *mut gl_ext.GlX, p: *mut Prog, vs: u64, vlen: usize, fs: u64, flen: usize) -> bool {
+    rt.mem_set(((&(*p).log[0]) as u64), 0 as u8, LOG_CAP)
+    let id: u32 = gl33.gl_program(&(*x).g, vs, vlen, fs, flen, ((&(*p).log[0]) as u64), LOG_CAP)
+    if id == 0 as u32 {
+        (*p).fails = (*p).fails + (1 as u32)
+        if (*p).id == 0 as u32 {
+            (*p).ok = false
+        }
+        return false
+    }
+    if (*p).id != 0 as u32 {
+        gl33.gl_delete_program(&(*x).g, (*p).id)
+    }
+    (*p).id = id
+    (*p).ok = true
+    (*p).builds = (*p).builds + (1 as u32)
+    (*p).n_cache = 0
+    var h: u64 = fnv_bytes(0xCBF29CE484222325 as u64, vs, vlen)
+    h = fnv_bytes(h, fs, flen)
+    (*p).src_hash = h
+    return true
+}
+
+fn copy_path(name: str, dst: u64) {
+    let n: usize = name.length()
+    var i: usize = 0
+    while i < n && i < 255 {
+        rt.st8(dst, i, name.chars(i))
+        i = i + 1
+    }
+    rt.st8(dst, i, 0 as u8)
+}
+
+// Reads both files; `h` receives the content hash. False if a file cannot be read.
+fn read_pair(p: *mut Prog, vb: *mut rt.Buf, fb: *mut rt.Buf, h: *mut u64) -> bool {
+    if !rt.read_file(((&(*p).vs_path[0]) as u64), vb) {
+        return false
+    }
+    if !rt.read_file(((&(*p).fs_path[0]) as u64), fb) {
+        return false
+    }
+    var hh: u64 = fnv_bytes(0xCBF29CE484222325 as u64, rt.buf_ptr(vb), rt.buf_len(vb))
+    hh = fnv_bytes(hh, rt.buf_ptr(fb), rt.buf_len(fb))
+    *h = hh
+    return true
+}
+
+// Builds from two files and remembers the paths for prog_poll.
+fn prog_build_files(x: *mut gl_ext.GlX, p: *mut Prog, vs_path: str, fs_path: str) -> bool {
+    copy_path(vs_path, ((&(*p).vs_path[0]) as u64))
+    copy_path(fs_path, ((&(*p).fs_path[0]) as u64))
+    (*p).has_files = true
+    var vb: rt.Buf = rt.buf_new()
+    var fb: rt.Buf = rt.buf_new()
+    var h: u64 = 0
+    var ok: bool = false
+    if read_pair(p, &vb, &fb, &h) {
+        ok = prog_build(x, p, rt.buf_ptr(&vb), rt.buf_len(&vb), rt.buf_ptr(&fb), rt.buf_len(&fb))
+    } else {
+        rt.mem_set(((&(*p).log[0]) as u64), 0 as u8, LOG_CAP)
+        copy_path("cannot read shader file", ((&(*p).log[0]) as u64))
+        (*p).fails = (*p).fails + (1 as u32)
+    }
+    rt.buf_free(&vb)
+    rt.buf_free(&fb)
+    return ok
+}
+
+// Hot reload: re-reads the files; if their content differs from the last SUCCESSFUL build, builds again.
+// True only when a NEW program is now active. A failed attempt keeps the old program (see `p.log`, `p.fails`) and
+// is retried only when the files change again (the failed content's hash is not remembered as good).
+fn prog_poll(x: *mut gl_ext.GlX, p: *mut Prog) -> bool {
+    if !(*p).has_files {
+        return false
+    }
+    var vb: rt.Buf = rt.buf_new()
+    var fb: rt.Buf = rt.buf_new()
+    var h: u64 = 0
+    var changed: bool = false
+    if read_pair(p, &vb, &fb, &h) {
+        if h != (*p).src_hash {
+            changed = prog_build(x, p, rt.buf_ptr(&vb), rt.buf_len(&vb), rt.buf_ptr(&fb), rt.buf_len(&fb))
+            if !changed {
+                // do not rebuild the same broken text every frame: remember it as "seen"
+                (*p).src_hash = h
+            }
+        }
+    }
+    rt.buf_free(&vb)
+    rt.buf_free(&fb)
+    return changed
+}
+
+fn prog_use(x: *mut gl_ext.GlX, p: *mut Prog) {
+    gl33.gl_use(&(*x).g, (*p).id)
+}
+
+fn prog_free(x: *mut gl_ext.GlX, p: *mut Prog) {
+    if (*p).id != 0 as u32 {
+        gl33.gl_delete_program(&(*x).g, (*p).id)
+    }
+    (*p).id = 0 as u32
+    (*p).ok = false
+    (*p).n_cache = 0
+}
+
+// Cached uniform location (-1 = not active in the program).
+fn prog_loc(x: *mut gl_ext.GlX, p: *mut Prog, name: str) -> i32 {
+    let k: u64 = fnv_str(name)
+    var i: usize = 0
+    while i < (*p).n_cache {
+        if (*p).keys[i] == k {
+            (*p).cache_hits = (*p).cache_hits + 1
+            return (*p).locs[i]
+        }
+        i = i + 1
+    }
+    (*p).cache_misses = (*p).cache_misses + 1
+    let loc: i32 = gl33.gl_uniform_loc(&(*x).g, (*p).id, name)
+    if (*p).n_cache < CACHE_N {
+        (*p).keys[(*p).n_cache] = k
+        (*p).locs[(*p).n_cache] = loc
+        (*p).n_cache = (*p).n_cache + 1
+    }
+    return loc
+}
+
+fn prog_print_log(p: *mut Prog) {
+    io.print_c(((&(*p).log[0]) as u64))
+    io.new_line()
+}
+
+fn u_1i(x: *mut gl_ext.GlX, p: *mut Prog, name: str, a: i32) {
+    prog_use(x, p)
+    gl33.gl_u1i(&(*x).g, prog_loc(x, p, name), a)
+}
+
+fn u_2i(x: *mut gl_ext.GlX, p: *mut Prog, name: str, a: i32, b: i32) {
+    prog_use(x, p)
+    gl_ext.glx_u2i(x, prog_loc(x, p, name), a, b)
+}
+
+fn u_3i(x: *mut gl_ext.GlX, p: *mut Prog, name: str, a: i32, b: i32, c: i32) {
+    prog_use(x, p)
+    gl_ext.glx_u3i(x, prog_loc(x, p, name), a, b, c)
+}
+
+fn u_4i(x: *mut gl_ext.GlX, p: *mut Prog, name: str, a: i32, b: i32, c: i32, d: i32) {
+    prog_use(x, p)
+    gl_ext.glx_u4i(x, prog_loc(x, p, name), a, b, c, d)
+}
+
+fn u_1f(x: *mut gl_ext.GlX, p: *mut Prog, name: str, a: f64) {
+    prog_use(x, p)
+    gl33.gl_u1f(&(*x).g, prog_loc(x, p, name), a)
+}
+
+fn u_2f(x: *mut gl_ext.GlX, p: *mut Prog, name: str, a: f64, b: f64) {
+    prog_use(x, p)
+    gl33.gl_u2f(&(*x).g, prog_loc(x, p, name), a, b)
+}
+
+fn u_3f(x: *mut gl_ext.GlX, p: *mut Prog, name: str, a: f64, b: f64, c: f64) {
+    prog_use(x, p)
+    gl33.gl_u3f(&(*x).g, prog_loc(x, p, name), a, b, c)
+}
+
+fn u_4f(x: *mut gl_ext.GlX, p: *mut Prog, name: str, a: f64, b: f64, c: f64, d: f64) {
+    prog_use(x, p)
+    gl33.gl_u4f(&(*x).g, prog_loc(x, p, name), a, b, c, d)
+}
+
+// 16 f32 at `m32p` (column-major).
+fn u_mat4(x: *mut gl_ext.GlX, p: *mut Prog, name: str, m32p: u64) {
+    prog_use(x, p)
+    gl33.gl_uniform_mat4(&(*x).g, prog_loc(x, p, name), m32p)
+}
