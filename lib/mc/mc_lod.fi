@@ -1,0 +1,237 @@
+// lib/mc/mc_lod.fi -- distant terrain as a few quads (docs/mc/lod.md).
+//
+// A far column is not meshed section by section. Instead
+//   lod_heights  scans the column once: for every (x, z) the height of the highest visible block (blocks above min_y,
+//                0 = nothing) and its id,
+//   lod_bin      bins that 16 x 16 map to (16/bin)^2 cells (bin 2, 4, 8): cell height = maximum of the bin, id of that block,
+//   lod_mesh     turns the cells into ONE mesh per column: a top quad per cell plus skirt quads on the sides where a
+//                neighbour cell is lower (so there are no gaps in the surface; with `nbr` the skirts also close the gaps
+//                to the neighbour columns).
+// The mesh uses the vertex layout of mc_mesh (8 bytes, face / tile / u / v), so every back end draws it like a section:
+// origin (cx * 16, min_y + y0, cz * 16) where y0 is the value lod_mesh returns. Coordinates are 8 bit: a column whose
+// cells differ by more than 255 blocks is clipped at y0 (the skirts stop there).
+// Cost: at most 2 * (16/bin)^2 + skirts quads per column instead of up to 24 sections of greedy quads.
+
+import std.rt
+import mc.mc_chunk
+import mc.mc_mesh
+
+export { lod_heights, lod_bin, lod_mesh, lod_cells, lod_tris }
+
+// number of cells per side
+fn lod_cells(bin: i32) -> i32 { return 16 / bin }
+
+fn lod_tris(m: *mut mc_mesh.Mesher) -> u32 { return (*m).nidx / 3 as u32 }
+
+fn top_visible(t: *mut mc_mesh.MeshTables, id: u16) -> bool {
+    if id == 0 as u16 { return false }
+    if id >= 32768 as u16 { return false }
+    return rt.ld16((*t).tiles, (id as usize) * 6 + 3) != 0 as u16
+}
+
+fn side_tile(t: *mut mc_mesh.MeshTables, id: u16, f: usize) -> u32 {
+    var tile: u16 = rt.ld16((*t).tiles, (id as usize) * 6 + f)
+    if tile == 0 as u16 { tile = rt.ld16((*t).tiles, (id as usize) * 6 + 3) }
+    return tile as u32
+}
+
+// hs: u16 [256] heights (blocks above the lowest section, 0 = nothing visible), ids: u16 [256] (index z * 16 + x)
+fn lod_heights(ch: *mut mc_chunk.Chunk, t: *mut mc_mesh.MeshTables, hs: u64, ids: u64) {
+    var z: usize = 0
+    while z < 16 {
+        var x: usize = 0
+        while x < 16 {
+            var found: bool = false
+            var sy: i32 = ((*ch).nsec as i32) - 1
+            while sy >= 0 && !found {
+                let sec: *mut mc_chunk.Section = mc_chunk.chunk_section(ch, sy as usize)
+                if mc_chunk.container_bits(&(*sec).blocks) == 0 as u32 {
+                    let id0: u16 = mc_chunk.container_get(&(*sec).blocks, 0)
+                    if top_visible(t, id0) {
+                        rt.st16(hs, z * 16 + x, (sy * 16 + 16) as u16)
+                        rt.st16(ids, z * 16 + x, id0)
+                        found = true
+                    }
+                } else {
+                    var ly: i32 = 15
+                    while ly >= 0 && !found {
+                        let id: u16 = mc_chunk.container_get(&(*sec).blocks, ((ly * 16 + (z as i32)) * 16 + (x as i32)) as usize)
+                        if top_visible(t, id) {
+                            rt.st16(hs, z * 16 + x, (sy * 16 + ly + 1) as u16)
+                            rt.st16(ids, z * 16 + x, id)
+                            found = true
+                        }
+                        ly = ly - 1
+                    }
+                }
+                sy = sy - 1
+            }
+            if !found {
+                rt.st16(hs, z * 16 + x, 0 as u16)
+                rt.st16(ids, z * 16 + x, 0 as u16)
+            }
+            x = x + 1
+        }
+        z = z + 1
+    }
+}
+
+// bins the 16 x 16 map: out_h / out_id: u16 [(16/bin)^2] (index j * n + i, j = z cell, i = x cell)
+fn lod_bin(hs: u64, ids: u64, bin: i32, out_h: u64, out_id: u64) {
+    let n: i32 = 16 / bin
+    var j: i32 = 0
+    while j < n {
+        var i: i32 = 0
+        while i < n {
+            var best: u16 = 0 as u16
+            var bid: u16 = 0 as u16
+            var dz: i32 = 0
+            while dz < bin {
+                var dx: i32 = 0
+                while dx < bin {
+                    let k: usize = ((j * bin + dz) * 16 + i * bin + dx) as usize
+                    let h: u16 = rt.ld16(hs, k)
+                    if h > best {
+                        best = h
+                        bid = rt.ld16(ids, k)
+                    }
+                    dx = dx + 1
+                }
+                dz = dz + 1
+            }
+            rt.st16(out_h, (j * n + i) as usize, best)
+            rt.st16(out_id, (j * n + i) as usize, bid)
+            i = i + 1
+        }
+        j = j + 1
+    }
+}
+
+fn put_quad(m: *mut mc_mesh.Mesher, f: usize, pc: usize, u0: usize, v0: usize, w: usize, h: usize, tile: u32) {
+    let axis: usize = f / 2
+    let ua: usize = (axis + 1) % 3
+    let va: usize = (axis + 2) % 3
+    let vbase: u32 = (*m).nverts
+    var k: usize = 0
+    while k < 4 {
+        var su: usize = 0
+        var sv: usize = 0
+        if k == 1 {
+            su = 1
+        } else if k == 2 {
+            su = 1
+            sv = 1
+        } else if k == 3 {
+            sv = 1
+        }
+        var pos: [usize; 3] = [0, 0, 0]
+        pos[axis] = pc
+        pos[ua] = u0 + su * w
+        pos[va] = v0 + sv * h
+        let w0: u32 = (pos[0] as u32) | ((pos[1] as u32) << 8 as u32) | ((pos[2] as u32) << 16 as u32) |
+        ((f as u32) << 24 as u32) | ((3 as u32) << 27 as u32)
+        let w1: u32 = tile | (((su * w) as u32) << 16 as u32) | (((sv * h) as u32) << 24 as u32)
+        let vi: usize = (((*m).nverts) as usize) * 2
+        rt.st32((*m).verts, vi, w0)
+        rt.st32((*m).verts, vi + 1, w1)
+        (*m).nverts = (*m).nverts + 1 as u32
+        k = k + 1
+    }
+    var q: [u32; 6] = [0 as u32, 1 as u32, 2 as u32, 0 as u32, 2 as u32, 3 as u32]
+    var ii: usize = 0
+    while ii < 6 {
+        var e: u32 = q[ii]
+        if f % 2 == 0 {
+            let r: usize = ii % 3
+            if r == 1 { e = q[ii + 1] }
+            if r == 2 { e = q[ii - 1] }
+        }
+        rt.st32((*m).idx, ((*m).nidx as usize) + ii, vbase + e)
+        ii = ii + 1
+    }
+    (*m).nidx = (*m).nidx + 6 as u32
+    (*m).nquads = (*m).nquads + 1 as u32
+}
+
+// Meshes the binned column (bh / bid from lod_bin) into `m` (a mesher_new; its pad is not used). `nbr` = address of
+// 4 u64 = binned height arrays of the neighbour columns (-x +x -z +z, same bin) or 0 (unknown: no skirt toward it).
+// Returns y0: draw the mesh at (cx * 16, min_y + y0, cz * 16).
+fn lod_mesh(m: *mut mc_mesh.Mesher, t: *mut mc_mesh.MeshTables, bin: i32, bh: u64, bid: u64, nbr: u64) -> i32 {
+    (*m).nverts = 0 as u32
+    (*m).nidx = 0 as u32
+    (*m).nquads = 0 as u32
+    (*m).nfaces = 0 as u32
+    let n: i32 = 16 / bin
+    var lo: i32 = 65535
+    var hi: i32 = 0
+    var c: i32 = 0
+    while c < n * n {
+        let h: i32 = rt.ld16(bh, c as usize) as i32
+        if h > 0 {
+            if h < lo { lo = h }
+            if h > hi { hi = h }
+        }
+        c = c + 1
+    }
+    if hi == 0 { return 0 }
+    var y0: i32 = lo
+    if hi - y0 > 255 { y0 = hi - 255 }
+    var j: i32 = 0
+    while j < n {
+        var i: i32 = 0
+        while i < n {
+            let cell: usize = (j * n + i) as usize
+            let h: i32 = rt.ld16(bh, cell) as i32
+            if h > 0 {
+                let id: u16 = rt.ld16(bid, cell)
+                var top: i32 = h - y0
+                if top < 0 { top = 0 }
+                put_quad(m, 3, top as usize, (j * bin) as usize, (i * bin) as usize, bin as usize, bin as usize, side_tile(t, id, 3))
+                var f: usize = 0
+                while f < 4 {
+                    // f: 0 -x, 1 +x, 2 -z, 3 +z
+                    var ni: i32 = i
+                    var nj: i32 = j
+                    var np: u64 = bh
+                    var known: bool = true
+                    if f == 0 { ni = i - 1 }
+                    if f == 1 { ni = i + 1 }
+                    if f == 2 { nj = j - 1 }
+                    if f == 3 { nj = j + 1 }
+                    if ni < 0 || ni >= n || nj < 0 || nj >= n {
+                        known = false
+                        if nbr != 0 && rt.ld64(nbr, f) != 0 {
+                            np = rt.ld64(nbr, f)
+                            known = true
+                            if ni < 0 { ni = n - 1 }
+                            if ni >= n { ni = 0 }
+                            if nj < 0 { nj = n - 1 }
+                            if nj >= n { nj = 0 }
+                        }
+                    }
+                    if known {
+                        let nh: i32 = rt.ld16(np, (nj * n + ni) as usize) as i32
+                        var low: i32 = nh - y0
+                        if low < 0 { low = 0 }
+                        if nh == 0 { low = 0 }
+                        if top > low {
+                            if f == 0 {
+                                put_quad(m, 0, (i * bin) as usize, low as usize, (j * bin) as usize, (top - low) as usize, bin as usize, side_tile(t, id, 0))
+                            } else if f == 1 {
+                                put_quad(m, 1, ((i + 1) * bin) as usize, low as usize, (j * bin) as usize, (top - low) as usize, bin as usize, side_tile(t, id, 1))
+                            } else if f == 2 {
+                                put_quad(m, 4, (j * bin) as usize, (i * bin) as usize, low as usize, bin as usize, (top - low) as usize, side_tile(t, id, 4))
+                            } else {
+                                put_quad(m, 5, ((j + 1) * bin) as usize, (i * bin) as usize, low as usize, bin as usize, (top - low) as usize, side_tile(t, id, 5))
+                            }
+                        }
+                    }
+                    f = f + 1
+                }
+            }
+            i = i + 1
+        }
+        j = j + 1
+    }
+    return y0
+}
