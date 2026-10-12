@@ -12,7 +12,7 @@ The gateway only copies bytes (frames of the MC protocol are already length-pref
 * Online login: browser cannot hold the MS token safely -> device-code flow on a page, token kept in memory; the gateway must NOT see it (the MC session join is client -> sessionserver; CORS is the open point).
 
 ## Gateway
-* Small server (Firn or any): `wss://gw/ws?target=host:port`, binary frames <-> TCP stream, backpressure both ways.
+* Small server (Firn: `lib/ws/ws.fi` + `lib/http/server.fi` exist, or any): `wss://gw/ws?target=host:port`, binary frames <-> TCP stream, backpressure both ways.
 * Auth: signed short-lived token (JWT-like) issued by our site; gateway checks it before connecting. No open proxy.
 * Target allow-list (default only configured servers; block private ranges 10/8, 127/8, 169.254/16, 192.168/16, ::1, fc00::/7 -> SSRF).
 * Limits: connections per IP/account, bytes/s per connection, max frame size, idle + handshake timeouts, global connection cap.
