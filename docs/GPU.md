@@ -79,7 +79,7 @@ needs ~40 structs/handles by pointer, no GL context; real renderer would need SP
 GL image hash (PSNR) for the new paths is not added: the byte-equality checks above are on GL itself. SSBO shader test, `prog_poll` edit test,
 `MODE_ELAPSED` test, real GPU, indirect `baseInstance` (needs GL 4.2 `ARB_shader_draw_parameters` semantics) untested.
 
-## GL window on X11 (round gpu-a, 2026-10-12) -- `lib/gpu/glwindow.fi`, `glshow.fi`, `tools/gpu/win/run.sh` (gate 122)
+## GL window on X11 (round gpu-a, 2026-10-12) -- `lib/gpu/glwindow.fi`, `glshow.fi`, `tools/gpu/win/run.sh` (gate 125)
 Decision: **(a) the Firn window of `lib/window` + a GL context on its XID**. The window keeps events, input, DPI,
 clipboard, drops and the EWMH full screen request; only the context is new (`glctx.ctx_attach_x11` = EGL window surface via a
 second Xlib connection that exists only for Mesa's X11 platform; `glctx.ctx_attach_glx` = libGL GLX fallback,
@@ -104,4 +104,4 @@ Module name is `glwindow` (not `glwin`: `lib/plat/glwin.fi` = fUi's GlApi table 
 module names are global). Windows twin `lib/gpu/glwindow.windows.fi` (same names; window = Firn window of lib/window, context =
 `window.gpu_gl` WGL 3.3 core, depth 24/stencil 8, `g.ctx` is a borrowed `glctx` context, swap = `window.gpu_swap`,
 `swap_interval` has two states, `api_name` = "wgl"): `winprobe.exe wgl` under Wine + Xvfb + Mesa is green (open, clear + read
-back, resize via `r_set_size`, fullscreen on/off), part of gate 122 (SKIP without Wine/mingw ld). Real Windows UNTESTED.
+back, resize via `r_set_size`, fullscreen on/off), part of gate 125 (SKIP without Wine/mingw ld). Real Windows UNTESTED.
