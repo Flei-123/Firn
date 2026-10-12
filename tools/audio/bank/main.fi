@@ -1,0 +1,101 @@
+// tools/audio/bank/main.fi -- audio.bank (JSON with comments/trailing commas), stream voice, lock free + audio thread.
+import std.rt
+import std.io
+import audio.engine
+import audio.bank
+import audio.ring
+import audio.sink
+import std.time
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == engine.AUDIO_KIND { return engine.audio_main(arg) }
+    return 0
+}
+
+fn tone(e: *mut engine.Engine, frames: usize, v: f32) -> i32 {
+    let p: u64 = rt.heap_alloc(frames * 4)
+    var i: usize = 0
+    while i < frames {
+        *((p + (i * 4) as u64) as *mut f32) = v
+        i = i + 1
+    }
+    return engine.engine_add_sample(e, p, frames as u64, 1 as u32)
+}
+
+fn check(ok: bool, what: str, fails: *mut i32) {
+    if ok {
+        io.fmt_print(f"ok   {what}\n")
+    } else {
+        io.fmt_print(f"FAIL {what}\n")
+        *fails = *fails + 1
+    }
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var fails: i32 = 0
+    var e: engine.Engine = engine.engine_new(48000 as u32, 32 as u32)
+    var b: bank.Bank = bank.bank_new()
+    bank.bank_setup_buses(&e)
+    let sa: i32 = tone(&e, 4800, 0.5)
+    let sb: i32 = tone(&e, 4800, 0.25)
+    bank.bank_provide(&b, "a.wav", sa)
+    bank.bank_provide(&b, "b.wav", sb)
+    let text: str = "// comment\n{\n \"buses\": [ {\"name\": \"sfx\", \"parent\": \"master\", \"volume\": 0.5,}, /* block */ {\"name\":\"ui\",\"volume\":0.8}, ],\n \"events\": [\n  { \"name\": \"hit\", \"bus\": \"sfx\", \"samples\": [\"a.wav\", \"b.wav\",], \"volume\": 0.9, \"priority\": 10, \"max_distance\": 0.5, \"rolloff\": \"linear\",\n    \"parameters\": [ {\"name\": \"p\", \"target\": \"pitch\", \"curve\": [[2.0, 3.0], [0.0, 1.0]], } ], },\n  { \"name\": \"hit\", \"sample\": \"a.wav\", \"volume\": 0.7, },\n ],\n}\n"
+    let r: i32 = bank.bank_load_text(&b, &e, text.p as u64, text.length(), "")
+    check(r == bank.BANK_OK, "bank loads (comments, trailing commas)", &fails)
+    let ev: i32 = engine.engine_find_event(&e, "hit")
+    check(ev >= 0, "event found", &fails)
+    let d: *mut engine.EventDef = engine.engine_event(&e, ev)
+    check((*d).sample_n == 1 as u32 && (*d).volume > 0.69 && (*d).volume < 0.71, "second definition replaced the first", &fails)
+    check(engine.engine_get_bus_volume(&e, "sfx") == 0.5 && engine.engine_get_bus_volume(&e, "ui") == 0.8, "bus volumes", &fails)
+    let bad: str = "{\"events\":[{\"name\":\"x\",\"sample\":\"a.wav\",\"parameters\":[{\"name\":\"q\"}]}]}"
+    check(bank.bank_load_text(&b, &e, bad.p as u64, bad.length(), "") == bank.BANK_ERR_PARSE, "empty curve is an error", &fails)
+    let bad2: str = "{\"events\":[}"
+    check(bank.bank_load_text(&b, &e, bad2.p as u64, bad2.length(), "") == bank.BANK_ERR_PARSE, "broken JSON is an error", &fails)
+
+    // stream voice: 4800 frames of 0.5 (mono s16 16384) at the engine rate -> exact copy times gain
+    var rg: ring.Ring = ring.ring_new(8192, 1)
+    let pcm: u64 = rt.heap_alloc(4800 * 2)
+    var i: usize = 0
+    while i < 4800 {
+        rt.st16(pcm, i, 16384 as u16)
+        i = i + 1
+    }
+    ring.ring_write(&rg, pcm, 4800)
+    ring.ring_close_write(&rg)
+    let sh: u32 = engine.engine_play_stream(&e, &rg, 48000 as u32, bank.BUS_SFX, 1.0, 0.0)
+    check(sh != 0 as u32, "stream handle", &fails)
+    let out: u64 = rt.heap_alloc(6000 * 8)
+    engine.engine_render(&e, out, 6000)
+    let mid: f32 = *((out + (2000 * 8) as u64) as *mut f32)
+    // 0.5 (s16 16384/32768) * centre pan 0.70710677 * sfx bus 0.5 (master 1.0)
+    check(mid > 0.1767 && mid < 0.1769, "stream sample value", &fails)
+    check(!engine.engine_stream_playing(&e, sh), "stream ended after the ring drained", &fails)
+
+    // lock free + audio thread into a null sink, control thread plays and stops meanwhile
+    var sk: sink.Sink = sink.sink_open_file("/dev/null", 48000 as u32, 2 as u32, false)
+    check(engine.engine_audio_start(&e, &sk, 512), "audio thread starts", &fails)
+    var k: i32 = 0
+    while k < 400 {
+        let h: u32 = bank.bank_play(&e, ev, bank.BUS_EVENT)
+        engine.engine_set_volume(&e, h, 0.5)
+        engine.engine_set_listener(&e, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 - 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+        engine.engine_update(&e)
+        if k % 50 == 0 {
+            engine.engine_stop_all(&e, 0.0)
+        }
+        k = k + 1
+        time.sleep_ms(1 as u64)
+    }
+    let au: engine.AudioStats = engine.engine_audio_stats(&e)
+    check(au.running && au.frames > 4800 as u64, "audio thread rendered", &fails)
+    let frames: u64 = engine.engine_audio_stop(&e)
+    check(frames > 0 as u64 && !engine.engine_is_lockfree(&e), "audio thread joined", &fails)
+    let st: engine.Stats = engine.engine_stats(&e)
+    check(st.started > 100 as u64 && st.commands_dropped == 0 as u64, "no commands lost", &fails)
+    io.fmt_print(f"frames={frames} started={st.started} dropped={st.dropped}\n")
+    sink.sink_close(&sk)
+    if fails > 0 { return 1 }
+    return 0
+}

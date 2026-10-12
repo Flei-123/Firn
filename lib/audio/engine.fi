@@ -37,6 +37,8 @@ import std.rt
 import std.math
 import std.str
 import audio.sink
+import audio.ring
+import std.time
 import ton.mp3
 import ton.mp3_tab
 
@@ -51,6 +53,14 @@ export {
     engine_set_position, engine_set_volume, engine_set_pitch, engine_set_param,
     engine_update, engine_render, engine_pump, engine_stats,
     PARAM_VOLUME, PARAM_PITCH, PARAM_LOWPASS,
+    // E1 helpers for audio.bank (names as pointer + length)
+    engine_bus_make, engine_bus_init, engine_bus_set_parent, engine_bus_rebuild, engine_event_replace,
+    AudioStats,
+    // E2: lock free mode, audio thread
+    engine_set_lockfree, engine_is_lockfree, engine_audio_start, engine_audio_stop, engine_audio_running,
+    engine_audio_stats, audio_main, AUDIO_KIND,
+    // PCM streaming voices (audio.ring)
+    engine_play_stream, engine_stream_stop, engine_stream_set, engine_stream_playing, MAX_STREAMS,
 }
 
 const BLOCK: usize = 128
@@ -71,6 +81,13 @@ const CMD_SET_POSITION: u32 = 3
 const CMD_SET_VOLUME: u32 = 4
 const CMD_SET_PITCH: u32 = 5
 const CMD_SET_PARAM: u32 = 6
+const CMD_LISTENER: u32 = 7
+const CMD_STREAM_START: u32 = 8
+const CMD_STREAM_STOP: u32 = 9
+const CMD_STREAM_SET: u32 = 10
+const MAX_STREAMS: usize = 16
+const STREAM_CAP: usize = 1024 // frames buffered per stream voice (stereo f32)
+const AUDIO_KIND: u64 = 1634952804 // thread kind for the dispatcher, see engine_audio_start
 
 struct Sample {
     data: u64, // f32, interleaved
@@ -164,6 +181,31 @@ struct Cmd {
     f0: f32, f1: f32,
     px: f32, py: f32, pz: f32,
     vx: f32, vy: f32, vz: f32,
+    fx: f32, fy: f32, fz: f32, // listener only: forward
+    ux: f32, uy: f32, uz: f32, // listener only: up
+    ptr: u64, // stream start: ring block
+}
+
+// One PCM streaming voice (audio thread owns it). Source: an audio.ring of S16LE frames.
+struct Stream {
+    active: bool,
+    stopping: bool,
+    primed: bool,
+    generation: u32,
+    blk: u64,
+    channels: u32,
+    src_rate: u32,
+    bus: i32,
+    volume: f32,
+    pan: f32,
+    fade: f32,
+    fade_delta: f32,
+    gain_l: f32,
+    gain_r: f32,
+    cursor: f64,
+    fill: usize,
+    buf: u64, // STREAM_CAP stereo f32 frames
+    tmp: u64, // STREAM_CAP stereo s16 frames
 }
 
 struct Reclaim {
@@ -180,6 +222,7 @@ struct Stats {
     commands_dropped: u64,
     peak_left: f32,
     peak_right: f32,
+    stream_underruns: u64,
 }
 
 struct Engine {
@@ -209,6 +252,13 @@ struct Engine {
     peak_l: f32, peak_r: f32,
     scratch: u64, // 4096 stereo f32 for pump
     pcm_out: u64, // 4096 stereo s16 for pump
+    lockfree: bool, // true = no mutex (one control thread + one audio thread), see engine_set_lockfree
+    streams: u64, // MAX_STREAMS * Stream
+    stream_claim: u64, // u64 per slot: last generation handed out (control thread)
+    stream_done: u64, // u64 per slot: generation that ended (audio thread)
+    underruns: usize,
+    audio: u64, // control block of the audio thread (0 = none)
+    audio_handle: u64,
 }
 
 // ----------------------------------------------------------------- memory helpers
@@ -277,11 +327,37 @@ fn absf(v: f32) -> f32 {
 }
 
 fn lock(e: *mut Engine) {
+    if (*e).lockfree {
+        return
+    }
     thread_lock((*e).lock as *mut u64)
 }
 
 fn unlock(e: *mut Engine) {
+    if (*e).lockfree {
+        return
+    }
     thread_unlock((*e).lock as *mut u64)
+}
+
+// Atomic load = `lock xadd [p], 0` (a full barrier on x86-64, ldaxr/stlxr loop on aarch64): everything the
+// other side wrote BEFORE it published this word is visible afterwards.
+fn ld_acq(p: *mut usize) -> usize {
+    return __atomic_add(p as *mut u64, 0 as u64) as usize
+}
+
+// Publish `v` into a word that only THIS thread writes (`old` = its current value). `lock cmpxchg` is a full barrier:
+// all stores before it are visible to a thread that reads the new value with ld_acq.
+fn st_rel(p: *mut usize, old: usize, v: usize) {
+    __atomic_swap(p as *mut u64, old as u64, v as u64)
+}
+
+fn ld_acq64(p: u64) -> u64 {
+    return __atomic_add(p as *mut u64, 0 as u64)
+}
+
+fn st_rel64(p: u64, v: u64) {
+    __atomic_swap(p as *mut u64, ld_acq64(p), v)
 }
 
 // ------------------------------------------------------------------------ lifetime
@@ -318,6 +394,16 @@ fn engine_new(rate: u32, max_voices: u32) -> Engine {
         started: 0, stolen: 0, dropped: 0, cmd_dropped: 0, active: 0 as u32,
         lim_gain: 1.0, peak_l: 0.0, peak_r: 0.0,
         scratch: rt.heap_alloc(4096 * 2 * 4), pcm_out: rt.heap_alloc(4096 * 2 * 2),
+        lockfree: false, streams: alloc_zero[Stream](MAX_STREAMS),
+        stream_claim: alloc_zero[u64](MAX_STREAMS), stream_done: alloc_zero[u64](MAX_STREAMS),
+        underruns: 0, audio: 0, audio_handle: 0,
+    }
+    var si: usize = 0
+    while si < MAX_STREAMS {
+        let st: *mut Stream = at[Stream](e.streams, si)
+        (*st).buf = alloc_zero[f32](STREAM_CAP * 2)
+        (*st).tmp = alloc_zero[i16](STREAM_CAP * 2)
+        si = si + 1
     }
     // slot 0 is handed out first, like Aulos' free list (filled back to front)
     var i: u32 = 0 as u32
@@ -388,6 +474,16 @@ fn engine_free(e: *mut Engine) {
     rt.heap_free((*e).reclaims, bytes_of[Reclaim](CMD_CAP))
     rt.heap_free((*e).scratch, 4096 * 2 * 4)
     rt.heap_free((*e).pcm_out, 4096 * 2 * 2)
+    var sf: usize = 0
+    while sf < MAX_STREAMS {
+        let st: *mut Stream = at[Stream]((*e).streams, sf)
+        rt.heap_free((*st).buf, STREAM_CAP * 2 * 4)
+        rt.heap_free((*st).tmp, STREAM_CAP * 2 * 2)
+        sf = sf + 1
+    }
+    rt.heap_free((*e).streams, bytes_of[Stream](MAX_STREAMS))
+    rt.heap_free((*e).stream_claim, MAX_STREAMS * 8)
+    rt.heap_free((*e).stream_done, MAX_STREAMS * 8)
     (*e).n_samples = 0
     (*e).n_buses = 0
     (*e).n_events = 0
@@ -980,31 +1076,38 @@ fn evaluate_curve(e: *mut Engine, first: u32, n: u32, x: f32, fallback: f32) -> 
 
 // ------------------------------------------------------------------------- commands
 
+// Control thread = producer of the command ring, audio thread = consumer. The slot is written first, the head is
+// published with a full barrier afterwards (st_rel), the consumer reads the head with ld_acq. Single producer, single
+// consumer: no CAS retry loop is needed, st_rel only uses cmpxchg as a "store + full barrier".
 fn push_cmd(e: *mut Engine, c: Cmd) -> bool {
-    let next: usize = ((*e).cmd_head + 1) % CMD_CAP
-    if next == (*e).cmd_tail {
+    let head: usize = (*e).cmd_head
+    let next: usize = (head + 1) % CMD_CAP
+    if next == ld_acq(&(*e).cmd_tail) {
         (*e).cmd_dropped = (*e).cmd_dropped + 1
         return false
     }
-    *at[Cmd]((*e).cmds, (*e).cmd_head) = c
-    (*e).cmd_head = next
+    *at[Cmd]((*e).cmds, head) = c
+    st_rel(&(*e).cmd_head, head, next)
     return true
 }
 
 fn new_cmd(kind: u32) -> Cmd {
     return Cmd { kind: kind, slot: 0 as u32, generation: 0 as u32, a: 0, b: 0, bus_override: -1,
-        f0: 0.0, f1: 0.0, px: 0.0, py: 0.0, pz: 0.0, vx: 0.0, vy: 0.0, vz: 0.0 }
+        f0: 0.0, f1: 0.0, px: 0.0, py: 0.0, pz: 0.0, vx: 0.0, vy: 0.0, vz: 0.0,
+        fx: 0.0, fy: 0.0, fz: 0.0, ux: 0.0, uy: 0.0, uz: 0.0, ptr: 0 }
 }
 
+// Audio thread = producer of the reclaim ring, control thread (engine_update) = consumer.
 fn push_reclaim(e: *mut Engine, slot: u32, generation: u32) {
-    let next: usize = ((*e).rc_head + 1) % CMD_CAP
-    if next == (*e).rc_tail {
+    let head: usize = (*e).rc_head
+    let next: usize = (head + 1) % CMD_CAP
+    if next == ld_acq(&(*e).rc_tail) {
         return
     }
-    let r: *mut Reclaim = at[Reclaim]((*e).reclaims, (*e).rc_head)
+    let r: *mut Reclaim = at[Reclaim]((*e).reclaims, head)
     (*r).slot = slot
     (*r).generation = generation
-    (*e).rc_head = next
+    st_rel(&(*e).rc_head, head, next)
 }
 
 // A handle is (slot + 1) | generation << 16; stale handles are no-ops. Returns the slot or -1.
@@ -1317,30 +1420,34 @@ fn engine_set_param(e: *mut Engine, h: u32, name: str, value: f32) {
 // Aulos: aul_set_listener. Right handed, looks down its forward axis, right = cross(forward, up).
 fn engine_set_listener(e: *mut Engine, px: f32, py: f32, pz: f32, fx: f32, fy: f32, fz: f32,
     ux: f32, uy: f32, uz: f32, vx: f32, vy: f32, vz: f32) {
+    // a command, so the 12 numbers arrive together at the start of a render call (no torn listener)
+    var c: Cmd = new_cmd(CMD_LISTENER)
+    c.px = px
+    c.py = py
+    c.pz = pz
+    c.fx = fx
+    c.fy = fy
+    c.fz = fz
+    c.ux = ux
+    c.uy = uy
+    c.uz = uz
+    c.vx = vx
+    c.vy = vy
+    c.vz = vz
     lock(e)
-    (*e).lx = px
-    (*e).ly = py
-    (*e).lz = pz
-    (*e).fx = fx
-    (*e).fy = fy
-    (*e).fz = fz
-    (*e).ux = ux
-    (*e).uy = uy
-    (*e).uz = uz
-    (*e).lvx = vx
-    (*e).lvy = vy
-    (*e).lvz = vz
+    push_cmd(e, c)
     unlock(e)
 }
 
 // Aulos: aul_update. Once per frame: finished voices go back to the free list.
 fn engine_update(e: *mut Engine) {
     lock(e)
-    while (*e).rc_tail != (*e).rc_head {
+    let rc_end: usize = ld_acq(&(*e).rc_head)
+    while (*e).rc_tail != rc_end {
         let r: *mut Reclaim = at[Reclaim]((*e).reclaims, (*e).rc_tail)
         let slot: u32 = (*r).slot
         let g: u32 = (*r).generation
-        (*e).rc_tail = ((*e).rc_tail + 1) % CMD_CAP
+        st_rel(&(*e).rc_tail, (*e).rc_tail, ((*e).rc_tail + 1) % CMD_CAP)
         if slot >= (*e).max_voices {
             continue
         }
@@ -1363,7 +1470,510 @@ fn engine_update(e: *mut Engine) {
 fn engine_stats(e: *mut Engine) -> Stats {
     return Stats { active_voices: (*e).active, max_voices: (*e).max_voices, started: (*e).started,
         stolen: (*e).stolen, dropped: (*e).dropped, commands_dropped: (*e).cmd_dropped,
-        peak_left: (*e).peak_l, peak_right: (*e).peak_r }
+        peak_left: (*e).peak_l, peak_right: (*e).peak_r, stream_underruns: ld_acq(&(*e).underruns) as u64 }
+}
+
+
+// ------------------------------------------------------------- PCM streaming voices (audio.ring)
+
+fn end_stream(e: *mut Engine, k: usize) {
+    let st: *mut Stream = at[Stream]((*e).streams, k)
+    (*st).active = false
+    st_rel64((*e).stream_done + (k * 8) as u64, (*st).generation as u64)
+}
+
+fn stream_begin_stop(e: *mut Engine, k: usize, fade: f32) {
+    let st: *mut Stream = at[Stream]((*e).streams, k)
+    if fade <= 0.0 {
+        end_stream(e, k)
+    } else {
+        (*st).stopping = true
+        (*st).fade_delta = 0.0 - 1.0 / (fade * ((*e).rate as f32))
+    }
+}
+
+fn stop_all_streams(e: *mut Engine, fade: f32) {
+    var k: usize = 0
+    while k < MAX_STREAMS {
+        if (*at[Stream]((*e).streams, k)).active {
+            stream_begin_stop(e, k, fade)
+        }
+        k = k + 1
+    }
+}
+
+fn process_stream_cmd(e: *mut Engine, c: *mut Cmd) {
+    let k: usize = (*c).slot as usize
+    if k >= MAX_STREAMS {
+        return
+    }
+    let st: *mut Stream = at[Stream]((*e).streams, k)
+    if (*c).kind == CMD_STREAM_START {
+        var r: ring.Ring = ring.Ring { blk: (*c).ptr }
+        (*st).active = true
+        (*st).stopping = false
+        (*st).primed = false
+        (*st).generation = (*c).generation
+        (*st).blk = (*c).ptr
+        (*st).channels = ring.ring_channels(&r)
+        (*st).src_rate = (*c).b as u32
+        (*st).bus = (*c).a
+        if (*st).bus < 0 || (*st).bus as usize >= (*e).n_buses {
+            (*st).bus = 0
+        }
+        (*st).volume = (*c).f0
+        (*st).pan = (*c).f1
+        (*st).fade = 1.0
+        (*st).fade_delta = 0.0
+        (*st).gain_l = 0.0
+        (*st).gain_r = 0.0
+        (*st).cursor = 0.0
+        (*st).fill = 0
+        return
+    }
+    if !(*st).active || (*st).generation != (*c).generation {
+        return
+    }
+    if (*c).kind == CMD_STREAM_STOP {
+        stream_begin_stop(e, k, (*c).f0)
+    } else if (*c).kind == CMD_STREAM_SET {
+        (*st).volume = (*c).f0
+        (*st).pan = (*c).f1
+    }
+}
+
+fn s16_to_f32(x: u16) -> f32 {
+    var v: i32 = x as i32
+    if v >= 32768 {
+        v = v - 65536
+    }
+    return (v as f32) / 32768.0
+}
+
+// Adds every active stream voice to its bus for one block. Reads the ring (this thread is the ring's consumer),
+// converts S16 to f32, resamples linearly to the engine rate, applies volume/pan with a gain ramp over the block.
+// A dry ring is a gap (silence) and counted; a finished and drained ring ends the voice.
+fn render_streams(e: *mut Engine, frames: usize) {
+    let pi: f32 = 3.14159265358979323846
+    let ff: f32 = frames as f32
+    let out_rate: f64 = (*e).rate as f64
+    var k: usize = 0
+    while k < MAX_STREAMS {
+        let st: *mut Stream = at[Stream]((*e).streams, k)
+        k = k + 1
+        if !(*st).active {
+            continue
+        }
+        var r: ring.Ring = ring.Ring { blk: (*st).blk }
+        let channels: usize = (*st).channels as usize
+        let space: usize = STREAM_CAP - (*st).fill
+        if space > 0 {
+            let got: usize = ring.ring_read(&r, (*st).tmp, space)
+            var q: usize = 0
+            while q < got {
+                var l: f32 = 0.0
+                var rr: f32 = 0.0
+                if channels == 1 {
+                    l = s16_to_f32(rt.ld16((*st).tmp, q))
+                    rr = l
+                } else {
+                    l = s16_to_f32(rt.ld16((*st).tmp, q * 2))
+                    rr = s16_to_f32(rt.ld16((*st).tmp, q * 2 + 1))
+                }
+                stf((*st).buf, ((*st).fill + q) * 2, l)
+                stf((*st).buf, ((*st).fill + q) * 2 + 1, rr)
+                q = q + 1
+            }
+            (*st).fill = (*st).fill + got
+        }
+        let fin: bool = ring.ring_is_finished(&r)
+        let volume: f32 = (*st).volume * (*st).fade
+        var pl: f32 = 1.0
+        var pr: f32 = 1.0
+        if channels >= 2 {
+            if (*st).pan > 0.0 {
+                pl = 1.0 - (*st).pan
+            } else if (*st).pan < 0.0 {
+                pr = 1.0 + (*st).pan
+            }
+        } else {
+            let angle: f32 = (clampf((*st).pan, 0.0 - 1.0, 1.0) + 1.0) * (pi * 0.25)
+            pl = cosf(angle)
+            pr = sinf(angle)
+        }
+        let tl: f32 = volume * pl
+        let tr: f32 = volume * pr
+        if !(*st).primed {
+            (*st).gain_l = tl
+            (*st).gain_r = tr
+            (*st).primed = true
+        }
+        let step_l: f32 = (tl - (*st).gain_l) / ff
+        let step_r: f32 = (tr - (*st).gain_r) / ff
+        let ratio: f64 = ((*st).src_rate as f64) / out_rate
+        let dst: u64 = (*at[Bus]((*e).buses, (*st).bus as usize)).buffer
+        var ended: bool = false
+        var under: bool = false
+        var n: usize = 0
+        while n < frames {
+            let i0: usize = (*st).cursor as usize
+            if i0 >= (*st).fill {
+                if fin {
+                    ended = true
+                } else {
+                    under = true
+                }
+                break
+            }
+            var i1: usize = i0 + 1
+            let frac: f32 = ((*st).cursor - (i0 as f64)) as f32
+            if i1 >= (*st).fill {
+                if frac > 0.0 && !fin {
+                    under = true
+                    break
+                }
+                i1 = i0
+            }
+            let a0: f32 = ldf((*st).buf, i0 * 2)
+            let b0: f32 = ldf((*st).buf, i1 * 2)
+            let a1: f32 = ldf((*st).buf, i0 * 2 + 1)
+            let b1: f32 = ldf((*st).buf, i1 * 2 + 1)
+            let left: f32 = a0 + (b0 - a0) * frac
+            let right: f32 = a1 + (b1 - a1) * frac
+            (*st).gain_l = (*st).gain_l + step_l
+            (*st).gain_r = (*st).gain_r + step_r
+            stf(dst, n * 2, ldf(dst, n * 2) + left * (*st).gain_l)
+            stf(dst, n * 2 + 1, ldf(dst, n * 2 + 1) + right * (*st).gain_r)
+            (*st).cursor = (*st).cursor + ratio
+            if (*st).stopping {
+                (*st).fade = (*st).fade + (*st).fade_delta
+                if (*st).fade <= 0.0 {
+                    (*st).fade = 0.0
+                    ended = true
+                    break
+                }
+            }
+            n = n + 1
+        }
+        // drop what was consumed
+        var used: usize = (*st).cursor as usize
+        if used > (*st).fill {
+            used = (*st).fill
+        }
+        if used > 0 {
+            var m: usize = 0
+            while m < ((*st).fill - used) * 2 {
+                stf((*st).buf, m, ldf((*st).buf, used * 2 + m))
+                m = m + 1
+            }
+            (*st).fill = (*st).fill - used
+            (*st).cursor = (*st).cursor - (used as f64)
+        }
+        if !ended && fin && (*st).fill == 0 {
+            ended = true
+        }
+        if under {
+            (*e).underruns = (*e).underruns + 1
+        }
+        if ended {
+            end_stream(e, k - 1)
+        }
+    }
+}
+
+// Plays PCM from an `audio.ring` (S16LE, 1 or 2 channels, any rate between rate/16 and 4 x rate of the engine) on a
+// bus (-1 = master). The caller keeps writing into the ring (producer); the engine reads it on the audio thread.
+// Close the ring (`ring_close_write`) to let the voice end after the last frame. Returns a stream handle, 0 = none.
+fn engine_play_stream(e: *mut Engine, r: *mut ring.Ring, rate: u32, bus: i32, volume: f32, pan: f32) -> u32 {
+    if ring.ring_blk(r) == 0 || rate == 0 as u32 {
+        return 0 as u32
+    }
+    let ratio: f64 = (rate as f64) / ((*e).rate as f64)
+    if ratio > 4.0 || ratio < 0.0625 {
+        return 0 as u32
+    }
+    lock(e)
+    var slot: i64 = -1
+    var old: u64 = 0
+    var k: usize = 0
+    while k < MAX_STREAMS {
+        let c: u64 = ld_acq64((*e).stream_claim + (k * 8) as u64)
+        let d: u64 = ld_acq64((*e).stream_done + (k * 8) as u64)
+        if c == d {
+            slot = k as i64
+            old = c
+            break
+        }
+        k = k + 1
+    }
+    if slot < 0 {
+        unlock(e)
+        return 0 as u32
+    }
+    var g: u64 = (old + 1) & 16777215
+    if g == 0 {
+        g = 1
+    }
+    var cmd: Cmd = new_cmd(CMD_STREAM_START)
+    cmd.slot = slot as u32
+    cmd.generation = g as u32
+    cmd.ptr = ring.ring_blk(r)
+    cmd.a = bus
+    cmd.b = rate as i32
+    cmd.f0 = volume
+    cmd.f1 = pan
+    if !push_cmd(e, cmd) {
+        unlock(e)
+        return 0 as u32
+    }
+    st_rel64((*e).stream_claim + (slot as usize * 8) as u64, g)
+    unlock(e)
+    return ((slot as u32) + 1 as u32) | ((g as u32) << 8)
+}
+
+fn stream_slot(e: *mut Engine, h: u32, g: *mut u64) -> i64 {
+    if h == 0 as u32 {
+        return -1
+    }
+    let k: u32 = (h & 255 as u32)
+    if k == 0 as u32 || k as usize > MAX_STREAMS {
+        return -1
+    }
+    let gen: u64 = (h >> 8) as u64
+    if ld_acq64((*e).stream_claim + ((k as usize - 1) * 8) as u64) != gen {
+        return -1
+    }
+    *g = gen
+    return (k - 1 as u32) as i64
+}
+
+fn engine_stream_stop(e: *mut Engine, h: u32, fade_seconds: f32) {
+    var g: u64 = 0
+    lock(e)
+    let k: i64 = stream_slot(e, h, &g)
+    if k >= 0 {
+        var c: Cmd = new_cmd(CMD_STREAM_STOP)
+        c.slot = k as u32
+        c.generation = g as u32
+        if fade_seconds > 0.0 {
+            c.f0 = fade_seconds
+        }
+        push_cmd(e, c)
+    }
+    unlock(e)
+}
+
+fn engine_stream_set(e: *mut Engine, h: u32, volume: f32, pan: f32) {
+    var g: u64 = 0
+    lock(e)
+    let k: i64 = stream_slot(e, h, &g)
+    if k >= 0 {
+        var c: Cmd = new_cmd(CMD_STREAM_SET)
+        c.slot = k as u32
+        c.generation = g as u32
+        c.f0 = volume
+        c.f1 = pan
+        if volume < 0.0 {
+            c.f0 = 0.0
+        }
+        push_cmd(e, c)
+    }
+    unlock(e)
+}
+
+// True from engine_play_stream until the voice ended (ring drained after close, or stopped).
+fn engine_stream_playing(e: *mut Engine, h: u32) -> bool {
+    var g: u64 = 0
+    let k: i64 = stream_slot(e, h, &g)
+    if k < 0 {
+        return false
+    }
+    return ld_acq64((*e).stream_done + (k as usize * 8) as u64) != g
+}
+
+// ---------------------------------------------------------------- lock free mode + audio thread
+//
+// engine_set_lockfree(true): no mutex. Rules (the same as Aulos): ONE control thread calls the API (play, stop, set_*,
+// update, listener, bus volume/mute, streams), ONE audio thread calls engine_render / engine_pump. They only share
+// the command ring (control -> audio), the reclaim ring (audio -> control), the stream done words and a few aligned
+// 32/64 bit values (bus volume/mute, stats). Configuration (buses, events, samples, bank loading) must happen while
+// no audio thread runs (engine_audio_stop first) -- Aulos stops its device for that, too.
+fn engine_set_lockfree(e: *mut Engine, on: bool) {
+    (*e).lockfree = on
+}
+
+fn engine_is_lockfree(e: *mut Engine) -> bool {
+    return (*e).lockfree
+}
+
+// control block of the audio thread, in 64 bit words
+const AU_ENGINE: u64 = 0
+const AU_SINK: u64 = 1
+const AU_STOP: u64 = 2
+const AU_FRAMES: u64 = 3
+const AU_LOOPS: u64 = 4
+const AU_SLEEPS: u64 = 5
+const AU_RUNNING: u64 = 6
+const AU_NS_TOTAL: u64 = 7
+const AU_NS_MAX: u64 = 8
+const AU_PUMPS: u64 = 9
+const AU_CHUNK: u64 = 10
+const AU_WORDS: usize = 12
+
+struct AudioStats {
+    running: bool,
+    frames: u64,
+    pumps: u64,
+    sleeps: u64,
+    render_ns_total: u64,
+    render_ns_max: u64,
+}
+
+fn au_word(blk: u64, w: u64) -> u64 {
+    return blk + w * 8
+}
+
+// What the program's `__thread_work(kind, arg)` dispatcher calls for AUDIO_KIND:
+//     fn __thread_work(kind: u64, arg: u64) -> u64 {
+//         if kind == engine.AUDIO_KIND { return engine.audio_main(arg) }
+//         return 0
+//     }
+// (a library cannot define the dispatcher: there is one per program, see std.pool.)
+fn audio_main(blk: u64) -> u64 {
+    let e: *mut Engine = ld_acq64(au_word(blk, AU_ENGINE)) as *mut Engine
+    let s: *mut sink.Sink = ld_acq64(au_word(blk, AU_SINK)) as *mut sink.Sink
+    let chunk: usize = ld_acq64(au_word(blk, AU_CHUNK)) as usize
+    st_rel64(au_word(blk, AU_RUNNING), 1)
+    while ld_acq64(au_word(blk, AU_STOP)) == 0 {
+        let t0: u64 = time.monotonic_ns()
+        let n: usize = engine_pump(e, s, chunk)
+        if n > 0 {
+            let dt: u64 = time.monotonic_ns() - t0
+            st_rel64(au_word(blk, AU_FRAMES), ld_acq64(au_word(blk, AU_FRAMES)) + n as u64)
+            st_rel64(au_word(blk, AU_PUMPS), ld_acq64(au_word(blk, AU_PUMPS)) + 1)
+            st_rel64(au_word(blk, AU_NS_TOTAL), ld_acq64(au_word(blk, AU_NS_TOTAL)) + dt)
+            if dt > ld_acq64(au_word(blk, AU_NS_MAX)) {
+                st_rel64(au_word(blk, AU_NS_MAX), dt)
+            }
+        } else {
+            st_rel64(au_word(blk, AU_SLEEPS), ld_acq64(au_word(blk, AU_SLEEPS)) + 1)
+            thread_sleep(1 as u64)
+        }
+    }
+    st_rel64(au_word(blk, AU_RUNNING), 0)
+    return 0
+}
+
+// Starts the audio thread: it renders into `s` (stereo) whenever the sink has room (chunks of at most `chunk`
+// frames, 64 .. 4096) and sleeps 1 ms otherwise. Switches the engine to lock free mode. Call from the control thread
+// with no API call of another thread in flight. `e` and `s` must stay alive (and in place) until engine_audio_stop.
+fn engine_audio_start(e: *mut Engine, s: *mut sink.Sink, chunk: usize) -> bool {
+    if (*e).audio != 0 || sink.sink_channels(s) != 2 as u32 {
+        return false
+    }
+    var ch: usize = chunk
+    if ch < 64 {
+        ch = 64
+    }
+    if ch > 4096 {
+        ch = 4096
+    }
+    let blk: u64 = alloc_zero[u64](AU_WORDS)
+    if blk == 0 {
+        return false
+    }
+    rt.st64(blk, AU_ENGINE as usize, e as u64)
+    rt.st64(blk, AU_SINK as usize, s as u64)
+    rt.st64(blk, AU_CHUNK as usize, ch as u64)
+    (*e).lockfree = true
+    let h: u64 = thread_start(AUDIO_KIND, blk)
+    if h == 0 {
+        (*e).lockfree = false
+        rt.heap_free(blk, AU_WORDS * 8)
+        return false
+    }
+    (*e).audio = blk
+    (*e).audio_handle = h
+    return true
+}
+
+fn engine_audio_running(e: *mut Engine) -> bool {
+    if (*e).audio == 0 {
+        return false
+    }
+    return ld_acq64(au_word((*e).audio, AU_RUNNING)) != 0
+}
+
+fn engine_audio_stats(e: *mut Engine) -> AudioStats {
+    if (*e).audio == 0 {
+        return AudioStats { running: false, frames: 0, pumps: 0, sleeps: 0, render_ns_total: 0, render_ns_max: 0 }
+    }
+    let b: u64 = (*e).audio
+    return AudioStats { running: ld_acq64(au_word(b, AU_RUNNING)) != 0, frames: ld_acq64(au_word(b, AU_FRAMES)),
+        pumps: ld_acq64(au_word(b, AU_PUMPS)), sleeps: ld_acq64(au_word(b, AU_SLEEPS)),
+        render_ns_total: ld_acq64(au_word(b, AU_NS_TOTAL)), render_ns_max: ld_acq64(au_word(b, AU_NS_MAX)) }
+}
+
+// Stops and joins the audio thread, back to the mutex mode. Returns the frames it rendered.
+fn engine_audio_stop(e: *mut Engine) -> u64 {
+    if (*e).audio == 0 {
+        return 0
+    }
+    let b: u64 = (*e).audio
+    st_rel64(au_word(b, AU_STOP), 1)
+    thread_wait((*e).audio_handle)
+    let frames: u64 = ld_acq64(au_word(b, AU_FRAMES))
+    rt.heap_free(b, AU_WORDS * 8)
+    (*e).audio = 0
+    (*e).audio_handle = 0
+    (*e).lockfree = false
+    return frames
+}
+
+// ------------------------------------------------------------ helpers for audio.bank (E1)
+
+// Bus by name, created when missing (no parent). -1 = table full. Call the rebuild after parents changed.
+fn engine_bus_make(e: *mut Engine, name: str) -> i32 {
+    lock(e)
+    let id: i32 = find_or_create_bus(e, name)
+    unlock(e)
+    return id
+}
+
+// Volume without a ramp (target and current), like Aulos does at bank load.
+fn engine_bus_init(e: *mut Engine, id: i32, volume: f32) {
+    if id < 0 || id as usize >= (*e).n_buses {
+        return
+    }
+    let b: *mut Bus = at[Bus]((*e).buses, id as usize)
+    (*b).target = volume
+    (*b).current = volume
+}
+
+fn engine_bus_set_parent(e: *mut Engine, id: i32, parent: i32) {
+    if id < 0 || id as usize >= (*e).n_buses || parent == id || parent >= (*e).n_buses as i32 {
+        return
+    }
+    (*at[Bus]((*e).buses, id as usize)).parent = parent
+}
+
+fn engine_bus_rebuild(e: *mut Engine) {
+    rebuild_bus_order(e)
+}
+
+// Makes the LAST event (just built) the definition of event `old` (same name): voices that play `old` continue
+// with the new definition, the table gets no duplicate. Sample/param pools are index based, so this is a move.
+fn engine_event_replace(e: *mut Engine, old: i32) -> bool {
+    if old < 0 || (old as usize) + 1 >= (*e).n_events {
+        return false
+    }
+    let last: usize = (*e).n_events - 1
+    let dst: *mut EventDef = at[EventDef]((*e).events, old as usize)
+    let src: *mut EventDef = at[EventDef]((*e).events, last)
+    rt.heap_free((*dst).name_p, (*dst).name_n + 1)
+    *dst = *src
+    (*e).n_events = last
+    return true
 }
 
 // ------------------------------------------------------------------- audio thread
@@ -1415,9 +2025,38 @@ fn start_stop(e: *mut Engine, v: *mut Voice, slot: u32, fade: f32) {
 }
 
 fn process_commands(e: *mut Engine) {
-    while (*e).cmd_tail != (*e).cmd_head {
+    let end: usize = ld_acq(&(*e).cmd_head)
+    while (*e).cmd_tail != end {
         let c: *mut Cmd = at[Cmd]((*e).cmds, (*e).cmd_tail)
-        (*e).cmd_tail = ((*e).cmd_tail + 1) % CMD_CAP
+        let tail0: usize = (*e).cmd_tail
+        // the slot may be reused by the producer once the tail moved on: copy what we need first
+        var cmd: Cmd = *c
+        st_rel(&(*e).cmd_tail, tail0, (tail0 + 1) % CMD_CAP)
+        process_one(e, &cmd)
+    }
+}
+
+fn process_one(e: *mut Engine, c: *mut Cmd) {
+    {
+        if (*c).kind == CMD_LISTENER {
+            (*e).lx = (*c).px
+            (*e).ly = (*c).py
+            (*e).lz = (*c).pz
+            (*e).fx = (*c).fx
+            (*e).fy = (*c).fy
+            (*e).fz = (*c).fz
+            (*e).ux = (*c).ux
+            (*e).uy = (*c).uy
+            (*e).uz = (*c).uz
+            (*e).lvx = (*c).vx
+            (*e).lvy = (*c).vy
+            (*e).lvz = (*c).vz
+            return
+        }
+        if (*c).kind >= CMD_STREAM_START {
+            process_stream_cmd(e, c)
+            return
+        }
         if (*c).kind == CMD_STOP_ALL {
             var i: u32 = 0 as u32
             while i < (*e).max_voices {
@@ -1427,10 +2066,11 @@ fn process_commands(e: *mut Engine) {
                 }
                 i = i + 1 as u32
             }
-            continue
+            stop_all_streams(e, (*c).f0)
+            return
         }
         if (*c).slot >= (*e).max_voices {
-            continue
+            return
         }
         let v: *mut Voice = at[Voice]((*e).voices, (*c).slot as usize)
         if (*c).kind == CMD_START {
@@ -1459,10 +2099,10 @@ fn process_commands(e: *mut Engine) {
                 (*v).param_values[p] = (*at[ParamMap]((*e).params, (*def).param_first as usize + p)).default_value
                 p = p + 1
             }
-            continue
+            return
         }
         if !(*v).playing || (*v).generation != (*c).generation {
-            continue
+            return
         }
         if (*c).kind == CMD_STOP {
             start_stop(e, v, (*c).slot, (*c).f0)
@@ -1726,6 +2366,8 @@ fn render_block(e: *mut Engine, out: u64, frames: usize) {
             push_reclaim(e, i - 1 as u32, (*v).generation)
         }
     }
+
+    render_streams(e, frames)
 
     // fold buses into their parents, deepest first
     var k: usize = 0

@@ -1,0 +1,643 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/bank.fi -- audio.bank: the AULOS JSON event bank for audio.engine (docs/AUDIO.md E1).
+//
+//     import audio.engine
+//     import audio.bank
+//
+//     var e: engine.Engine = engine.engine_new(48000 as u32, 64 as u32)
+//     var b: bank.Bank = bank.bank_new()
+//     bank.bank_provide(&b, "step_a.wav", sample_id)           // optional: samples from memory (resource pack, synth)
+//     if bank.bank_load_file(&b, &e, "assets/bank.json") != bank.BANK_OK {
+//         // bank.bank_error(&b) = "event \"x\" has no samples", "bank is not valid JSON: ...", ...
+//     }
+//     let ev: i32 = engine.engine_find_event(&e, "footstep")
+//     bank.bank_play(&e, ev, bank.BUS_SFX)                      // Daidalos bus numbers, BUS_EVENT = the event's own
+//
+// FORMAT = the Aulos bank (see /root/projects/aulos/examples/demo_bank.json): `buses` [{name, volume, parent}],
+// `events` [{name, bus, sample | samples[], volume, volume_random, pitch, pitch_random, loop, priority, spatial,
+// min_distance, max_distance, rolloff ("inverse"|"linear"), rolloff_factor, doppler, max_instances, lowpass,
+// parameters[{name, target ("volume"|"pitch"|"lowpass"), default, curve [[x, y], ...]}]}].
+// Like Aulos' own reader the text may contain // line comments, /* block comments */ and trailing commas.
+// The comments and commas are blanked out (same byte positions), then `std.json` parses the rest -- error
+// lines/columns therefore point at the real place in the file.
+//
+// SAME AS AULOS: buses first (volume, then parents, order in the file does not matter), an event that already
+// exists is REPLACED (same id; running voices continue with the new definition), unknown fields are ignored,
+// `max_distance <= min_distance` becomes `min + 0.001`, curves are sorted by x, an event without samples, a
+// parameter without curve points or more than 8 parameters are errors, the sample is looked up by file name
+// relative to the bank's directory and cached by name.
+// DIFFERENT (honest):
+// B1  Samples: WAV and MP3 (by extension). OGG waits for lib/ton (MC-H). `bank_provide` registers samples that are
+//     already in the engine under a name; those win over files.
+// B2  The engine limits apply (16 samples/event, 8 params, 16 curve points, 512 samples/events, 32 buses): above
+//     them the load fails with a message instead of truncating.
+// B3  The bank must not be loaded while the audio thread runs (engine_audio_stop first); loading refuses with
+//     BANK_ERR_BUSY. Aulos stops the device for that, too.
+// B4  A bank that fails half way keeps what was loaded before the error (Aulos does the same).
+import std.rt
+import std.str
+import std.json
+import audio.engine
+
+export {
+    Bank, bank_new, bank_free, bank_provide, bank_load_text, bank_load_file, bank_error, bank_clean,
+    bank_play, bank_bus_name, bank_setup_buses,
+    BANK_OK, BANK_ERR_FILE, BANK_ERR_PARSE, BANK_ERR_ARG, BANK_ERR_BUSY,
+    BUS_MASTER, BUS_MUSIC, BUS_SFX, BUS_UI, BUS_COUNT, BUS_EVENT,
+}
+
+const BANK_OK: i32 = 0
+const BANK_ERR_FILE: i32 = 1
+const BANK_ERR_PARSE: i32 = 2
+const BANK_ERR_ARG: i32 = 3
+const BANK_ERR_BUSY: i32 = 4
+
+// bus numbers of Daidalos (dai_audio.h), names as in dai_audio.cpp
+const BUS_MASTER: i32 = 0
+const BUS_MUSIC: i32 = 1
+const BUS_SFX: i32 = 2
+const BUS_UI: i32 = 3
+const BUS_COUNT: i32 = 4
+const BUS_EVENT: i32 = -1
+
+const MAX_NAMES: usize = 1024
+
+struct Bank {
+    names: u64, // MAX_NAMES * 3 words: name pointer, name length, sample id
+    count: usize,
+    dir: rt.Buf, // base directory for sample files ("" = as given)
+    err: rt.Buf,
+}
+
+fn bank_new() -> Bank {
+    let t: u64 = rt.heap_alloc(MAX_NAMES * 3 * 8)
+    if t != 0 {
+        rt.mem_set(t, 0 as u8, MAX_NAMES * 3 * 8)
+    }
+    return Bank { names: t, count: 0, dir: rt.buf_new(), err: rt.buf_new() }
+}
+
+fn bank_free(b: *mut Bank) {
+    var i: usize = 0
+    while i < (*b).count {
+        rt.heap_free(rt.ld64((*b).names, i * 3), rt.ld64((*b).names, i * 3 + 1) as usize + 1)
+        i = i + 1
+    }
+    if (*b).names != 0 {
+        rt.heap_free((*b).names, MAX_NAMES * 3 * 8)
+    }
+    (*b).names = 0
+    (*b).count = 0
+    rt.buf_free(&(*b).dir)
+    rt.buf_free(&(*b).err)
+}
+
+// The text of the last error ("no error" after a good load).
+fn bank_error(b: *mut Bank) -> str {
+    if rt.buf_len(&(*b).err) == 0 {
+        return "no error"
+    }
+    return str { p: rt.buf_data(&(*b).err), n: rt.buf_len(&(*b).err) }
+}
+
+fn set_err(b: *mut Bank, a: str, name: str, c: str) {
+    rt.buf_clear(&(*b).err)
+    rt.buf_push_bytes(&(*b).err, a.p as u64, a.length())
+    rt.buf_push_bytes(&(*b).err, name.p as u64, name.length())
+    rt.buf_push_bytes(&(*b).err, c.p as u64, c.length())
+}
+
+fn find_name(b: *mut Bank, p: u64, n: usize) -> i32 {
+    var i: usize = 0
+    while i < (*b).count {
+        let np: u64 = rt.ld64((*b).names, i * 3)
+        let nn: usize = rt.ld64((*b).names, i * 3 + 1) as usize
+        if nn == n && rt.mem_eq(np, p, n) {
+            return rt.ld64((*b).names, i * 3 + 2) as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn remember(b: *mut Bank, p: u64, n: usize, id: i32) {
+    if (*b).count >= MAX_NAMES || (*b).names == 0 {
+        return
+    }
+    let q: u64 = rt.heap_alloc(n + 1)
+    if q == 0 {
+        return
+    }
+    rt.mem_copy(q, p, n)
+    rt.st64((*b).names, (*b).count * 3, q)
+    rt.st64((*b).names, (*b).count * 3 + 1, n as u64)
+    rt.st64((*b).names, (*b).count * 3 + 2, id as u64)
+    (*b).count = (*b).count + 1
+}
+
+// Registers a sample that is already in the engine under the file name the bank will use.
+fn bank_provide(b: *mut Bank, name: str, sample_id: i32) {
+    if find_name(b, name.p as u64, name.length()) < 0 {
+        remember(b, name.p as u64, name.length(), sample_id)
+    }
+}
+
+// ----------------------------------------------------------------------------- text cleaning
+
+// Blanks out comments and trailing commas (same length, same line breaks) so that strict JSON remains.
+fn bank_clean(p: u64, n: usize, out: *mut rt.Buf) {
+    var i: usize = 0
+    var in_str: bool = false
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if in_str {
+            rt.buf_push(out, c)
+            if c == 92 as u8 && i + 1 < n { // backslash
+                rt.buf_push(out, rt.ld8(p, i + 1))
+                i = i + 1
+            } else if c == 34 as u8 {
+                in_str = false
+            }
+            i = i + 1
+            continue
+        }
+        if c == 34 as u8 {
+            in_str = true
+            rt.buf_push(out, c)
+            i = i + 1
+            continue
+        }
+        if c == 47 as u8 && i + 1 < n && rt.ld8(p, i + 1) == 47 as u8 { // //
+            while i < n && rt.ld8(p, i) != 10 as u8 {
+                rt.buf_push(out, 32 as u8)
+                i = i + 1
+            }
+            continue
+        }
+        if c == 47 as u8 && i + 1 < n && rt.ld8(p, i + 1) == 42 as u8 { // /* */
+            rt.buf_push(out, 32 as u8)
+            rt.buf_push(out, 32 as u8)
+            i = i + 2
+            while i < n && !(rt.ld8(p, i) == 42 as u8 && i + 1 < n && rt.ld8(p, i + 1) == 47 as u8) {
+                var d: u8 = rt.ld8(p, i)
+                if d != 10 as u8 && d != 13 as u8 {
+                    d = 32 as u8
+                }
+                rt.buf_push(out, d)
+                i = i + 1
+            }
+            if i < n {
+                rt.buf_push(out, 32 as u8)
+                rt.buf_push(out, 32 as u8)
+                i = i + 2
+            }
+            continue
+        }
+        rt.buf_push(out, c)
+        i = i + 1
+    }
+    // trailing commas: a comma whose next non-blank byte closes the array or object
+    let q: u64 = rt.buf_ptr(out)
+    let m: usize = rt.buf_len(out)
+    in_str = false
+    i = 0
+    while i < m {
+        let c: u8 = rt.ld8(q, i)
+        if in_str {
+            if c == 92 as u8 {
+                i = i + 1
+            } else if c == 34 as u8 {
+                in_str = false
+            }
+        } else if c == 34 as u8 {
+            in_str = true
+        } else if c == 44 as u8 {
+            var j: usize = i + 1
+            while j < m && (rt.ld8(q, j) == 32 as u8 || rt.ld8(q, j) == 9 as u8 || rt.ld8(q, j) == 10 as u8 || rt.ld8(q, j) == 13 as u8) {
+                j = j + 1
+            }
+            if j < m && (rt.ld8(q, j) == 93 as u8 || rt.ld8(q, j) == 125 as u8) {
+                rt.st8(q, i, 32 as u8)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ----------------------------------------------------------------------------------- helpers
+
+fn member(d: *mut json.Json, obj: u32, key: str) -> u32 {
+    if json.json_kind(d, obj) != json.JSON_OBJECT {
+        return json.JSON_NONE
+    }
+    return json.json_get(d, obj, key.p as u64, key.length())
+}
+
+fn num_or(d: *mut json.Json, v: u32, fallback: f64) -> f64 {
+    if v == json.JSON_NONE {
+        return fallback
+    }
+    let k: u8 = json.json_kind(d, v)
+    if k == json.JSON_NUMBER {
+        return json.json_number(d, v)
+    }
+    if k == json.JSON_TRUE {
+        return 1.0
+    }
+    if k == json.JSON_FALSE {
+        return 0.0
+    }
+    return fallback
+}
+
+fn member_num(d: *mut json.Json, obj: u32, key: str, fallback: f64) -> f64 {
+    return num_or(d, member(d, obj, key), fallback)
+}
+
+fn member_bool(d: *mut json.Json, obj: u32, key: str, fallback: bool) -> bool {
+    let v: u32 = member(d, obj, key)
+    if v == json.JSON_NONE {
+        return fallback
+    }
+    let k: u8 = json.json_kind(d, v)
+    if k == json.JSON_TRUE {
+        return true
+    }
+    if k == json.JSON_FALSE {
+        return false
+    }
+    if k == json.JSON_NUMBER {
+        return json.json_number(d, v) != 0.0
+    }
+    return fallback
+}
+
+fn member_str(d: *mut json.Json, obj: u32, key: str, fallback: str) -> str {
+    let v: u32 = member(d, obj, key)
+    if v == json.JSON_NONE || json.json_kind(d, v) != json.JSON_STRING {
+        return fallback
+    }
+    let sp: str.Span = json.json_string(d, v)
+    return str { p: sp.p, n: sp.n }
+}
+
+fn ends_with(p: u64, n: usize, suffix: str) -> bool {
+    let m: usize = suffix.length()
+    if n < m {
+        return false
+    }
+    var i: usize = 0
+    while i < m {
+        var a: u8 = rt.ld8(p, n - m + i)
+        if a >= 65 as u8 && a <= 90 as u8 {
+            a = a + 32 as u8
+        }
+        if a != rt.ld8(suffix.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Sample by file name: provided / cached / read from disk. -1 and the error text set when it fails.
+fn sample_for(b: *mut Bank, e: *mut engine.Engine, name: str) -> i32 {
+    let known: i32 = find_name(b, name.p as u64, name.length())
+    if known >= 0 {
+        return known
+    }
+    var path: rt.Buf = rt.buf_new()
+    if rt.buf_len(&(*b).dir) > 0 {
+        rt.buf_push_bytes(&path, rt.buf_ptr(&(*b).dir), rt.buf_len(&(*b).dir))
+        rt.buf_push(&path, 47 as u8)
+    }
+    rt.buf_push_bytes(&path, name.p as u64, name.length())
+    rt.buf_push(&path, 0 as u8)
+    var data: rt.Buf = rt.buf_new()
+    var id: i32 = -1
+    if !rt.read_file(rt.buf_ptr(&path), &data) {
+        set_err(b, "cannot open sample: ", name, "")
+    } else if ends_with(name.p as u64, name.length(), ".wav") {
+        id = engine.engine_load_wav(e, rt.buf_ptr(&data), rt.buf_len(&data))
+        if id < 0 {
+            set_err(b, "cannot decode sample: ", name, "")
+        }
+    } else if ends_with(name.p as u64, name.length(), ".mp3") {
+        id = engine.engine_load_mp3(e, rt.buf_ptr(&data), rt.buf_len(&data))
+        if id < 0 {
+            set_err(b, "cannot decode sample: ", name, "")
+        }
+    } else {
+        set_err(b, "unsupported sample format (WAV or MP3): ", name, "")
+    }
+    rt.buf_free(&path)
+    rt.buf_free(&data)
+    if id >= 0 {
+        remember(b, name.p as u64, name.length(), id)
+    }
+    return id
+}
+
+fn f32_bits_at(p: u64, i: usize) -> f32 {
+    return *((p + (i * 4) as u64) as *mut f32)
+}
+
+fn f32_put(p: u64, i: usize, v: f32) {
+    *((p + (i * 4) as u64) as *mut f32) = v
+}
+
+// ---------------------------------------------------------------------------------- loading
+
+// Aulos: aul_load_bank from memory. `dir` = directory the sample file names are relative to ("" = as written).
+fn bank_load_text(b: *mut Bank, e: *mut engine.Engine, p: u64, n: usize, dir: str) -> i32 {
+    if engine.engine_audio_running(e) {
+        set_err(b, "stop the audio thread before loading a bank", "", "")
+        return BANK_ERR_BUSY
+    }
+    rt.buf_clear(&(*b).dir)
+    rt.buf_push_bytes(&(*b).dir, dir.p as u64, dir.length())
+    var clean: rt.Buf = rt.buf_new()
+    bank_clean(p, n, &clean)
+    var j: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&j, rt.buf_ptr(&clean), rt.buf_len(&clean)) catch false
+    rt.buf_free(&clean)
+    if !ok {
+        rt.buf_clear(&(*b).err)
+        rt.buf_push_bytes(&(*b).err, "bank is not valid JSON: line ".p as u64, 29)
+        rt.buf_push_dec_u64(&(*b).err, json.json_err_line(&j) as u64)
+        rt.buf_push_bytes(&(*b).err, ", column ".p as u64, 9)
+        rt.buf_push_dec_u64(&(*b).err, json.json_err_col(&j) as u64)
+        rt.buf_push_bytes(&(*b).err, ": ".p as u64, 2)
+        json.json_err_text(&j, &(*b).err)
+        json.json_free(&j)
+        return BANK_ERR_PARSE
+    }
+    let r: i32 = load_tree(b, e, &j)
+    json.json_free(&j)
+    if r == BANK_OK {
+        rt.buf_clear(&(*b).err)
+    }
+    return r
+}
+
+fn bank_load_file(b: *mut Bank, e: *mut engine.Engine, path: str) -> i32 {
+    var cp: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&cp, path.p as u64, path.length())
+    rt.buf_push(&cp, 0 as u8)
+    var data: rt.Buf = rt.buf_new()
+    if !rt.read_file(rt.buf_ptr(&cp), &data) {
+        set_err(b, "cannot open bank: ", path, "")
+        rt.buf_free(&cp)
+        rt.buf_free(&data)
+        return BANK_ERR_FILE
+    }
+    // directory of the bank file
+    var cut: usize = 0
+    var i: usize = 0
+    while i < path.length() {
+        if rt.ld8(path.p as u64, i) == 47 as u8 {
+            cut = i
+        }
+        i = i + 1
+    }
+    var dir: str = ""
+    if cut > 0 {
+        dir = str { p: path.p, n: cut }
+    }
+    let r: i32 = bank_load_text(b, e, rt.buf_ptr(&data), rt.buf_len(&data), dir)
+    rt.buf_free(&cp)
+    rt.buf_free(&data)
+    return r
+}
+
+fn load_tree(b: *mut Bank, e: *mut engine.Engine, d: *mut json.Json) -> i32 {
+    let root: u32 = json.json_root(d)
+    if json.json_kind(d, root) != json.JSON_OBJECT {
+        set_err(b, "bank root must be an object", "", "")
+        return BANK_ERR_PARSE
+    }
+    // buses first: create + volume, then parents (the order in the file does not matter)
+    let buses: u32 = member(d, root, "buses")
+    if buses != json.JSON_NONE && json.json_kind(d, buses) == json.JSON_ARRAY {
+        var it: u32 = json.json_child(d, buses)
+        while it != json.JSON_NONE {
+            let nm: str = member_str(d, it, "name", "")
+            if nm.length() > 0 {
+                let id: i32 = engine.engine_bus_make(e, nm)
+                if id < 0 {
+                    set_err(b, "too many buses: ", nm, "")
+                    return BANK_ERR_PARSE
+                }
+                engine.engine_bus_init(e, id, member_num(d, it, "volume", 1.0) as f32)
+            }
+            it = json.json_next(d, it)
+        }
+        it = json.json_child(d, buses)
+        while it != json.JSON_NONE {
+            let nm: str = member_str(d, it, "name", "")
+            let parent: str = member_str(d, it, "parent", "")
+            if nm.length() > 0 && parent.length() > 0 && !(nm.length() == parent.length() && rt.mem_eq(nm.p as u64, parent.p as u64, nm.length())) {
+                let pid: i32 = engine.engine_bus_make(e, parent)
+                engine.engine_bus_set_parent(e, engine.engine_bus_make(e, nm), pid)
+            }
+            it = json.json_next(d, it)
+        }
+    }
+    engine.engine_bus_rebuild(e)
+
+    let events: u32 = member(d, root, "events")
+    if events == json.JSON_NONE || json.json_kind(d, events) != json.JSON_ARRAY {
+        set_err(b, "bank has no \"events\" array", "", "")
+        return BANK_ERR_PARSE
+    }
+    var ev: u32 = json.json_child(d, events)
+    while ev != json.JSON_NONE {
+        let r: i32 = load_event(b, e, d, ev)
+        if r != BANK_OK {
+            return r
+        }
+        ev = json.json_next(d, ev)
+    }
+    return BANK_OK
+}
+
+fn load_event(b: *mut Bank, e: *mut engine.Engine, d: *mut json.Json, ev: u32) -> i32 {
+    let name: str = member_str(d, ev, "name", "")
+    if name.length() == 0 {
+        set_err(b, "an event has no name", "", "")
+        return BANK_ERR_PARSE
+    }
+    // samples
+    var ids: [i32; 16] = [0 - 1; 16]
+    var n_ids: usize = 0
+    let many: u32 = member(d, ev, "samples")
+    let one: u32 = member(d, ev, "sample")
+    if many != json.JSON_NONE && json.json_kind(d, many) == json.JSON_ARRAY {
+        var s: u32 = json.json_child(d, many)
+        while s != json.JSON_NONE {
+            if json.json_kind(d, s) == json.JSON_STRING {
+                if n_ids >= 16 {
+                    set_err(b, "event \"", name, "\" has more than 16 samples")
+                    return BANK_ERR_PARSE
+                }
+                let sp: str.Span = json.json_string(d, s)
+                let id: i32 = sample_for(b, e, str { p: sp.p, n: sp.n })
+                if id < 0 {
+                    return BANK_ERR_FILE
+                }
+                ids[n_ids] = id
+                n_ids = n_ids + 1
+            }
+            s = json.json_next(d, s)
+        }
+    } else if one != json.JSON_NONE && json.json_kind(d, one) == json.JSON_STRING {
+        let sp: str.Span = json.json_string(d, one)
+        let id: i32 = sample_for(b, e, str { p: sp.p, n: sp.n })
+        if id < 0 {
+            return BANK_ERR_FILE
+        }
+        ids[0] = id
+        n_ids = 1
+    }
+    if n_ids == 0 {
+        set_err(b, "event \"", name, "\" has no samples")
+        return BANK_ERR_PARSE
+    }
+    var bus_name: str = member_str(d, ev, "bus", "master")
+    let bus: i32 = engine.engine_bus_make(e, bus_name)
+    engine.engine_bus_rebuild(e)
+    let old: i32 = engine.engine_find_event(e, name)
+    let id: i32 = engine.engine_add_event(e, name, bus)
+    if id < 0 {
+        set_err(b, "too many events (", name, ")")
+        return BANK_ERR_PARSE
+    }
+    var k: usize = 0
+    while k < n_ids {
+        engine.engine_event_add_sample(e, id, ids[k])
+        k = k + 1
+    }
+    let def: *mut engine.EventDef = engine.engine_event(e, id)
+    (*def).volume = member_num(d, ev, "volume", 1.0) as f32
+    (*def).volume_random = member_num(d, ev, "volume_random", 0.0) as f32
+    (*def).pitch = member_num(d, ev, "pitch", 1.0) as f32
+    (*def).pitch_random = member_num(d, ev, "pitch_random", 0.0) as f32
+    (*def).looping = member_bool(d, ev, "loop", false)
+    (*def).priority = member_num(d, ev, "priority", 128.0) as i32
+    (*def).spatial = member_bool(d, ev, "spatial", false)
+    (*def).min_distance = member_num(d, ev, "min_distance", 1.0) as f32
+    (*def).max_distance = member_num(d, ev, "max_distance", 100.0) as f32
+    (*def).rolloff_factor = member_num(d, ev, "rolloff_factor", 1.0) as f32
+    (*def).doppler = member_num(d, ev, "doppler", 0.0) as f32
+    (*def).max_instances = member_num(d, ev, "max_instances", 0.0) as i32
+    (*def).lowpass_hz = member_num(d, ev, "lowpass", 22000.0) as f32
+    let ro: str = member_str(d, ev, "rolloff", "inverse")
+    (*def).rolloff = 0
+    if ro.length() == 6 && rt.mem_eq(ro.p as u64, "linear".p as u64, 6) {
+        (*def).rolloff = 1
+    }
+    if (*def).max_distance <= (*def).min_distance {
+        (*def).max_distance = (*def).min_distance + 0.001
+    }
+    // parameters
+    let params: u32 = member(d, ev, "parameters")
+    if params != json.JSON_NONE && json.json_kind(d, params) == json.JSON_ARRAY {
+        var count: usize = 0
+        var pm: u32 = json.json_child(d, params)
+        while pm != json.JSON_NONE {
+            let pn: str = member_str(d, pm, "name", "")
+            if pn.length() > 0 {
+                if count >= 8 {
+                    set_err(b, "event \"", name, "\" declares more than 8 parameters")
+                    return BANK_ERR_PARSE
+                }
+                count = count + 1
+                let tg: str = member_str(d, pm, "target", "volume")
+                var target: u32 = engine.PARAM_VOLUME
+                if tg.length() == 5 && rt.mem_eq(tg.p as u64, "pitch".p as u64, 5) {
+                    target = engine.PARAM_PITCH
+                } else if tg.length() == 7 && rt.mem_eq(tg.p as u64, "lowpass".p as u64, 7) {
+                    target = engine.PARAM_LOWPASS
+                }
+                let xs: u64 = rt.heap_alloc(16 * 4)
+                let ys: u64 = rt.heap_alloc(16 * 4)
+                var np: usize = 0
+                let cv: u32 = member(d, pm, "curve")
+                if cv != json.JSON_NONE && json.json_kind(d, cv) == json.JSON_ARRAY {
+                    var pt: u32 = json.json_child(d, cv)
+                    while pt != json.JSON_NONE {
+                        if json.json_kind(d, pt) == json.JSON_ARRAY && json.json_count(d, pt) >= 2 {
+                            if np >= 16 {
+                                set_err(b, "parameter \"", pn, "\" has more than 16 curve points")
+                                rt.heap_free(xs, 64)
+                                rt.heap_free(ys, 64)
+                                return BANK_ERR_PARSE
+                            }
+                            let px: f32 = num_or(d, json.json_child_at(d, pt, 0), 0.0) as f32
+                            let py: f32 = num_or(d, json.json_child_at(d, pt, 1), 0.0) as f32
+                            // insertion by x (stable: equal x keeps file order)
+                            var at: usize = np
+                            while at > 0 && f32_bits_at(xs, at - 1) > px {
+                                f32_put(xs, at, f32_bits_at(xs, at - 1))
+                                f32_put(ys, at, f32_bits_at(ys, at - 1))
+                                at = at - 1
+                            }
+                            f32_put(xs, at, px)
+                            f32_put(ys, at, py)
+                            np = np + 1
+                        }
+                        pt = json.json_next(d, pt)
+                    }
+                }
+                if np == 0 {
+                    set_err(b, "parameter \"", pn, "\" has an empty curve")
+                    rt.heap_free(xs, 64)
+                    rt.heap_free(ys, 64)
+                    return BANK_ERR_PARSE
+                }
+                let dflt: f32 = member_num(d, pm, "default", f32_bits_at(xs, 0) as f64) as f32
+                engine.engine_event_add_param(e, id, pn, target, dflt, np, xs, ys)
+                rt.heap_free(xs, 64)
+                rt.heap_free(ys, 64)
+            }
+            pm = json.json_next(d, pm)
+        }
+    }
+    if old >= 0 {
+        engine.engine_event_replace(e, old)
+    }
+    return BANK_OK
+}
+
+// ------------------------------------------------------------------------- Daidalos buses
+
+fn bank_bus_name(bus: i32) -> str {
+    if bus == BUS_MUSIC {
+        return "music"
+    }
+    if bus == BUS_SFX {
+        return "sfx"
+    }
+    if bus == BUS_UI {
+        return "ui"
+    }
+    return "master"
+}
+
+// The four buses of Daidalos exist even if the bank is minimal (dai_audio_create does the same): master, and
+// music / sfx / ui under it.
+fn bank_setup_buses(e: *mut engine.Engine) {
+    engine.engine_ensure_bus(e, "master", "")
+    engine.engine_ensure_bus(e, "music", "master")
+    engine.engine_ensure_bus(e, "sfx", "master")
+    engine.engine_ensure_bus(e, "ui", "master")
+}
+
+// dai_audio_play_ex: `bus` = BUS_EVENT (-1) keeps the event's own bus. Returns the handle (0 = nothing started).
+fn bank_play(e: *mut engine.Engine, event: i32, bus: i32) -> u32 {
+    var id: i32 = -1
+    if bus >= 0 && bus < BUS_COUNT {
+        id = engine.engine_bus_id(e, bank_bus_name(bus))
+    }
+    return engine.engine_play(e, event, id)
+}
