@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: MPL-2.0
+// sound_pkts.fi -- decodes recorded sound packets with lib/mc/mc_audio.fi, for tools/mc/audio/check_wire.py.
+//
+// stdin, one packet per line:   <protocol> <packet name> <body hex>
+//   packet name = sound_effect | named_sound_effect | entity_sound_effect | stop_sound | world_event
+// stdout, one line per packet (integers only, floats as value * 65536 truncated):
+//   S <idx> <protocol> <kind> id=<registry id or -1> name=<inline name or -> cat=<c> ent=<e> x8=<x*8> y8=<y*8> z8=<z*8> vol=<v*65536> pitch=<p*65536> range=<r*65536 or -1>
+//   T <idx> <protocol> flags=<f> cat=<c> name=<name or ->
+//   W <idx> <protocol> effect=<e> x=<x> y=<y> z=<z> data=<d>
+//   BAD <idx> <protocol> <packet name>          (decoder says broken)
+import std.rt
+import std.io
+import std.bytes
+import mc.mc_audio
+import mc.mc_packet
+
+fn hexval(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 { return (c - 48 as u8) as i32 }
+    if c >= 97 as u8 && c <= 102 as u8 { return (c - 97 as u8) as i32 + 10 }
+    if c >= 65 as u8 && c <= 70 as u8 { return (c - 65 as u8) as i32 + 10 }
+    return 0 - 1
+}
+
+// decodes the hex run p[0..n) into `out` (a Buf); false on an odd length / non hex digit
+fn hex_to_buf(p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    if n % 2 != 0 { return false }
+    var i: usize = 0
+    while i < n {
+        let a: i32 = hexval(rt.ld8(p, i))
+        let b: i32 = hexval(rt.ld8(p, i + 1))
+        if a < 0 || b < 0 { return false }
+        rt.buf_push(out, ((a * 16 + b) as u8))
+        i = i + 2
+    }
+    return true
+}
+
+fn next_tok(p: u64, n: usize, pos: *mut usize, tp: *mut u64, tn: *mut usize) -> bool {
+    var i: usize = *pos
+    while i < n && rt.ld8(p, i) == 32 as u8 {
+        i = i + 1
+    }
+    if i >= n { return false }
+    let s: usize = i
+    while i < n && rt.ld8(p, i) != 32 as u8 {
+        i = i + 1
+    }
+    *tp = p + s as u64
+    *tn = i - s
+    *pos = i
+    return true
+}
+
+fn tok_is(p: u64, n: usize, s: str) -> bool {
+    if n != s.length() { return false }
+    return rt.mem_eq(p, s.p as u64, n)
+}
+
+fn tok_int(p: u64, n: usize) -> i32 {
+    var v: i32 = 0
+    var i: usize = 0
+    while i < n {
+        v = v * 10 + ((rt.ld8(p, i) - 48 as u8) as i32)
+        i = i + 1
+    }
+    return v
+}
+
+fn say_name(p: u64, n: usize) {
+    if n == 0 {
+        io.fmt_print(f"-")
+        return
+    }
+    io.print_bytes(p, n)
+}
+
+fn fx(v: f32) -> i64 {
+    return ((v as f64) * 65536.0) as i64
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var inb: rt.Buf = rt.buf_new()
+    io.read_stdin(&inb)
+    var lr: io.LineReader = io.lines_of_buf(&inb)
+    var idx: i32 = 0
+    var lp: u64 = 0
+    var ln: usize = 0
+    while io.lines_next(&lr, &lp, &ln) {
+        var pos: usize = 0
+        var tp: u64 = 0
+        var tn: usize = 0
+        if !next_tok(lp, ln, &pos, &tp, &tn) { continue }
+        let proto: i32 = tok_int(tp, tn)
+        var np: u64 = 0
+        var nn: usize = 0
+        next_tok(lp, ln, &pos, &np, &nn)
+        var hp: u64 = 0
+        var hn: usize = 0
+        var hb: rt.Buf = rt.buf_new()
+        if next_tok(lp, ln, &pos, &hp, &hn) {
+            hex_to_buf(hp, hn, &hb)
+        }
+        let body: u64 = rt.buf_ptr(&hb)
+        let bn: usize = rt.buf_len(&hb)
+        let fmt: i32 = mc_audio.mca_sound_format(proto)
+        var kind: i32 = 0 - 1
+        if tok_is(np, nn, "sound_effect") { kind = mc_audio.SK_SOUND }
+        if tok_is(np, nn, "named_sound_effect") { kind = mc_audio.SK_NAMED }
+        if tok_is(np, nn, "entity_sound_effect") { kind = mc_audio.SK_ENTITY }
+        if kind >= 0 {
+            var sp: mc_audio.SoundPkt = mc_audio.SoundPkt { id: 0, name_p: 0, name_n: 0, has_range: false, range: 0.0, category: 0, entity: 0,
+                x: 0.0, y: 0.0, z: 0.0, volume: 0.0, pitch: 0.0, seed: 0 as i64 }
+            if mc_audio.mca_decode_sound_v(fmt, proto, kind, body, bn, &sp) {
+                var rg: i64 = 0 - 1 as i64
+                if sp.has_range { rg = fx(sp.range) }
+                io.fmt_print(f"S {idx} {proto} {kind} id={sp.id} name=")
+                say_name(sp.name_p, sp.name_n)
+                io.fmt_print(f" cat={sp.category} ent={sp.entity} x8={(sp.x * 8.0) as i64} y8={(sp.y * 8.0) as i64} z8={(sp.z * 8.0) as i64} vol={fx(sp.volume)} pitch={fx(sp.pitch)} range={rg}\n")
+            } else {
+                io.fmt_print(f"BAD {idx} {proto} sound\n")
+            }
+        } else if tok_is(np, nn, "stop_sound") {
+            var st: mc_audio.StopPkt = mc_audio.StopPkt { flags: 0, category: 0 - 1, name_p: 0, name_n: 0 }
+            if mc_audio.mca_decode_stop_sound(body, bn, &st) {
+                io.fmt_print(f"T {idx} {proto} flags={st.flags} cat={st.category} name=")
+                say_name(st.name_p, st.name_n)
+                io.fmt_print(f"\n")
+            } else {
+                io.fmt_print(f"BAD {idx} {proto} stop\n")
+            }
+        } else if tok_is(np, nn, "world_event") {
+            var r: mc_packet.Reader = mc_packet.Reader { b: bytes.bytes_new(), err: 0 as u32 }
+            mc_packet.reader_init(&r, body, bn)
+            let eff: i32 = mc_packet.rd_i32(&r)
+            var bx: i32 = 0
+            var by: i32 = 0
+            var bz: i32 = 0
+            mc_packet.rd_position(&r, &bx, &by, &bz)
+            let data: i32 = mc_packet.rd_i32(&r)
+            mc_packet.rd_u8(&r)
+            if mc_packet.rd_ok(&r) && mc_packet.rd_remaining(&r) == 0 {
+                io.fmt_print(f"W {idx} {proto} effect={eff} x={bx} y={by} z={bz} data={data}\n")
+            } else {
+                io.fmt_print(f"BAD {idx} {proto} world_event\n")
+            }
+        }
+        rt.buf_free(&hb)
+        idx = idx + 1
+    }
+    rt.buf_free(&inb)
+    return 0
+}

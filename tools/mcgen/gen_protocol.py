@@ -88,7 +88,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import gen_registry  # noqa: E402
+import gen_registry
+import gen_sounds  # noqa: E402
 import gen_entity  # noqa: E402
 
 FORMAT = 2
@@ -925,6 +926,7 @@ def main():
             os.makedirs(d, exist_ok=True)
             generate(data_dir, vkey, os.path.join(d, "mc_proto_v%d.fi" % pver))
             gen_registry.generate(data_dir, vkey, os.path.join(d, "mc_reg_v%d.fi" % pver))
+            gen_sounds.generate(data_dir, vkey, os.path.join(d, "mc_snd_v%d.fi" % pver), pver)
             entries.append((pver, vkey))
         write_registry(os.path.join(libdir, "mc_versions.fi"), entries)
         gen_entity.generate(data_dir, [e[1] for e in entries], load_protocol, os.path.join(libdir, "mc_entity_layout.fi"))
