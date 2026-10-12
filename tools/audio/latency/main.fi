@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/audio/latency/main.fi -- measures the latency of an audio.pulse playback stream.
+//
+//   main <tlength_ms> <prebuf_ms> <minreq_ms> <adjust 0|1> <keep_ms> <seconds>
+//
+// -1 for a *_ms means "server default". `keep_ms` = 0: write every grant the server makes
+// (the buffer stays full to tlength); > 0: write only when less than keep_ms is queued and
+// then up to keep_ms (a lean writer, the way a game engine feeds an SFX stream).
+// Samples GET_PLAYBACK_LATENCY about every 2 ms and prints one line:
+//   LAT <tlength B> <prebuf B> <minreq B> <sink us> <min us> <mean us> <max us> <samples> <starved samples> <first play ms> <queued min us> <queued max us>
+import std.rt
+import std.io
+import std.str
+import std.time
+import audio.pulse
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn parse(s: str) -> i64 {
+    var v: i64 = 0
+    var i: usize = 0
+    var neg: bool = false
+    if s.length() > 0 && s.chars(0) == 45 as u8 {
+        neg = true
+        i = 1
+    }
+    while i < s.length() {
+        v = v * 10 + (s.chars(i) - 48 as u8) as i64
+        i = i + 1
+    }
+    if neg {
+        return 0 - v
+    }
+    return v
+}
+
+fn num(v: i64) {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, v)
+    io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+fn say(s: str) {
+    syscall(1, 1, s.p as i64, s.length() as i64, 0, 0, 0)
+}
+
+fn sp() {
+    say(" ")
+}
+
+fn main(start: u64) -> i32 {
+    let tl: i64 = parse(arg(start, 1))
+    let pb: i64 = parse(arg(start, 2))
+    let mr: i64 = parse(arg(start, 3))
+    let adj: bool = parse(arg(start, 4)) != 0
+    let keep_ms: i64 = parse(arg(start, 5))
+    let seconds: i64 = parse(arg(start, 6))
+    var p: pulse.Pulse = pulse.pulse_connect("Firn latency test")
+    if !pulse.pulse_is_open(&p) {
+        say("NOSERVER\n")
+        return 1
+    }
+    if !pulse.pulse_open_stream_ex(&p, 44100 as u32, 2 as u32, "Firn latency test", "game", tl, pb, mr, adj) {
+        say("NOSTREAM\n")
+        return 1
+    }
+    // a quiet 440 Hz-ish square wave block source
+    var chunk: rt.Buf = rt.buf_new()
+    let t0: u64 = time.monotonic_ns()
+    var first_play: i64 = -1
+    var lmin: i64 = 1 << 60
+    var lmax: i64 = 0
+    var lsum: i64 = 0
+    var samples: i64 = 0
+    var starved: i64 = 0
+    var qmin: i64 = 1 << 60
+    var qmax: i64 = 0
+    var phase: usize = 0
+    var info: pulse.PulseLatency = pulse.PulseLatency { sink_us: 0, queued: 0, playing: 0, read_index: 0, underrun_us: 0 }
+    let end_ns: u64 = t0 + (seconds as u64) * 1000000000
+    let keep_b: i64 = keep_ms * 44100 / 1000 * 4
+    var written: i64 = 0
+    while time.monotonic_ns() < end_ns {
+        var want: i64 = pulse.pulse_writable(&p) as i64
+        if keep_b > 0 {
+            // lean writer: top the queue up to keep_ms, never more
+            let lat: i64 = pulse.pulse_latency_info(&p, &info)
+            if lat >= 0 {
+                var room: i64 = keep_b - info.queued
+                if room < 0 {
+                    room = 0
+                }
+                if want > room {
+                    want = room
+                }
+            }
+        }
+        want = want / 4 * 4
+        if want > 0 {
+            rt.buf_clear(&chunk)
+            var i: i64 = 0
+            while i < want / 4 {
+                var v: u32 = 2000 as u32
+                if (phase / 50) % 2 == 1 {
+                    v = 63536 as u32
+                }
+                rt.buf_push(&chunk, (v & 255 as u32) as u8)
+                rt.buf_push(&chunk, (v >> 8) as u8)
+                rt.buf_push(&chunk, (v & 255 as u32) as u8)
+                rt.buf_push(&chunk, (v >> 8) as u8)
+                phase = phase + 1
+                i = i + 1
+            }
+            if !pulse.pulse_write(&p, rt.buf_ptr(&chunk), want as usize) {
+                say("WRITEFAIL\n")
+                return 2
+            }
+            written = written + want
+        }
+        let lat2: i64 = pulse.pulse_latency_info(&p, &info)
+        if lat2 >= 0 {
+            if info.playing == 1 && first_play < 0 {
+                first_play = ((time.monotonic_ns() - t0) / 1000000) as i64
+            }
+            // measure only once playing, after the first 300 ms (start-up settling)
+            if first_play >= 0 && time.monotonic_ns() > t0 + 300000000 {
+                samples = samples + 1
+                lsum = lsum + lat2
+                if lat2 < lmin {
+                    lmin = lat2
+                }
+                if lat2 > lmax {
+                    lmax = lat2
+                }
+                let qus: i64 = info.queued * 1000000 / (44100 * 4)
+                if qus < qmin {
+                    qmin = qus
+                }
+                if qus > qmax {
+                    qmax = qus
+                }
+                if info.playing == 0 || info.queued == 0 {
+                    starved = starved + 1
+                }
+            }
+        }
+        time.sleep_ms(2 as u64)
+    }
+    say("LAT ")
+    num(pulse.pulse_tlength(&p) as i64)
+    sp()
+    num(pulse.pulse_prebuf(&p) as i64)
+    sp()
+    num(pulse.pulse_minreq(&p) as i64)
+    sp()
+    num(pulse.pulse_sink_latency(&p))
+    sp()
+    if samples == 0 {
+        say("0 0 0 0 0 ")
+    } else {
+        num(lmin)
+        sp()
+        num(lsum / samples)
+        sp()
+        num(lmax)
+        sp()
+        num(samples)
+        sp()
+        num(starved)
+        sp()
+    }
+    num(first_play)
+    sp()
+    if samples == 0 {
+        say("0 0")
+    } else {
+        num(qmin)
+        sp()
+        num(qmax)
+    }
+    say("\n")
+    pulse.pulse_close(&p)
+    return 0
+}
