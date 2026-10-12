@@ -1488,14 +1488,14 @@ else
 fi
 
 echo "== 68. input (uinput in a VM with the real kernel) and examples/phone_remote end to end (round NET-REMOTE) =="
-bash tools/input/read_run.sh > "$WORK/input.log" 2>&1 && INRC=0 || INRC=$?
+bash tools/input/run.sh > "$WORK/input.log" 2>&1 && INRC=0 || INRC=$?
 grep -E '^(INPUT|SKIP)|events compared' "$WORK/input.log" | sed 's/^/   /'
 bash tools/phone_remote/run.sh > "$WORK/phone_remote.log" 2>&1 && PRRC2=0 || PRRC2=$?
 grep -E 'PHONE REMOTE|SKIP|builds' "$WORK/phone_remote.log" | sed 's/^/   /'
 if [ "$INRC" -eq 0 ] && [ "$PRRC2" -eq 0 ]; then
     ok
 else
-    bad "tools/input/read_run.sh or tools/phone_remote/run.sh failed (see .test-work/input.log, phone_remote.log)"
+    bad "tools/input/run.sh or tools/phone_remote/run.sh failed (see .test-work/input.log, phone_remote.log)"
     grep -E 'FAIL' "$WORK/input.log" "$WORK/phone_remote.log" | head -12 | sed 's/^/   /' || true
 fi
 
@@ -1974,13 +1974,13 @@ else
 fi
 
 echo "== 124. lib/input: raw keys / mouse state machine, relative mouse grab (X11 raw motion + warp fallback) under Xvfb+xdotool (tools/input/read_run.sh, docs/INPUT.md) =="
-FIRNC="$FIRNC" bash tools/input/read_run.sh > "$WORK/input.log" 2>&1 && INRC=0 || INRC=$?
-if [ "$INRC" -eq 0 ]; then
+FIRNC="$FIRNC" bash tools/input/read_run.sh > "$WORK/rawinput.log" 2>&1 && RAWINRC=0 || RAWINRC=$?
+if [ "$RAWINRC" -eq 0 ]; then
     ok
-    grep -E '^ *(ok|SKIP)' "$WORK/input.log" | sed 's/^/ /'
+    grep -E '^ *(ok|SKIP)' "$WORK/rawinput.log" | sed 's/^/ /'
 else
-    bad "tools/input/read_run.sh failed (see .test-work/input.log)"
-    grep -E 'FAIL' "$WORK/input.log" | head -12 | sed 's/^/   /' || true
+    bad "tools/input/read_run.sh failed (see .test-work/rawinput.log)"
+    grep -E 'FAIL' "$WORK/rawinput.log" | head -12 | sed 's/^/   /' || true
 fi
 
 echo "== 121. mc_audio: Minecraft listener/sources/blocks/categories/packets on audio.engine (tools/mc/audio/run.sh, docs/mc/audio.md) =="
