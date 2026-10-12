@@ -87,7 +87,7 @@ Fix `compiler/src/regalloc.rs` (Sqrt/Bits stay in the register path) built and v
   `FIRN_RA_WARN=1` on the raster bench at release-fast: the only RA-BASE functions left are the `accel.*` AES/SHA-NI ones
   (vector instructions outside the narrow set), none in mc_*/math_*. Raster bench (640x360) release-fast: 21-25 ms/frame.
 * Signed `/ 2^L` and `% 2^L` (L <= 30) in the register path: `emit_div_const` now emits shift + sign correction
-  (`mov; sar; shr; add; sar`, remainder via `and -2^L`) instead of the magic-number `imul`. Result: correct (test 2797, identity
+  (`mov; sar; shr; add; sar`, remainder via `and -2^L`) instead of the magic-number `imul`. Result: correct (test 2798, identity
   q*k+r==x at four build levels), but NO measurable speed change on the raster bench (min of 7 interleaved: 21 ms old and new).
   The remaining `idiv` in the raster bench are divisions by VARIABLES (`atlas_texel` / texture size modulo), not by 256.
 * The pixel loop's `divsd` (zinv = sum / area2f, u/v/ao = (...) / sum) stay: replacing three `/ sum` by one `1/sum` and multiplies changes the
