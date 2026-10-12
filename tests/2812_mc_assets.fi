@@ -1,0 +1,146 @@
+// expect_exit: 0
+// tests/2812_mc_assets.fi -- mc_assets: self-built test packs (own pixel patterns, no Mojang files):
+// priority, fallback, resampling, broken ZIPs -> error codes without crashing.
+import std.rt
+import zip.zip
+import pack.icons
+import mc.mc_texture
+import mc.mc_assets
+
+// size x size PNG: left half colour (r,g,b), right half (b,g,r)
+fn mk_png(size: usize, r: u32, g: u32, b: u32, out: *mut rt.Buf) -> bool {
+    let px: u64 = rt.heap_alloc(size * size * 4)
+    var y: usize = 0
+    while y < size {
+        var x: usize = 0
+        while x < size {
+            let i: usize = (y * size + x) * 4
+            if x < size / 2 {
+                rt.st8(px, i, r as u8)
+                rt.st8(px, i + 1, g as u8)
+                rt.st8(px, i + 2, b as u8)
+            } else {
+                rt.st8(px, i, b as u8)
+                rt.st8(px, i + 1, g as u8)
+                rt.st8(px, i + 2, r as u8)
+            }
+            rt.st8(px, i + 3, 255 as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let ok: bool = icons.png_encode(px, size, size, out)
+    rt.heap_free(px, size * size * 4)
+    return ok
+}
+
+fn add_str(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    var ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn add_png(w: *mut zip.ZipWriter, name: str, size: usize, r: u32, g: u32, b: u32) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    var ok: bool = mk_png(size, r, g, b, &p)
+    if ok { ok = zip.zip_add(w, name, rt.buf_ptr(&p), rt.buf_len(&p), true) catch | e | (false) }
+    rt.buf_free(&p)
+    return ok
+}
+
+fn fin(w: *mut zip.ZipWriter) -> bool {
+    var n: usize = zip.zip_finish(w) catch | e | (0)
+    return n > 0
+}
+
+fn main() -> i32 {
+    let meta: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+    // pack A (top): stone 16x16 colour (200,10,10)
+    var ba: rt.Buf = rt.buf_new()
+    var wa: zip.ZipWriter = zip.zip_writer_new(&ba)
+    if !add_str(&wa, "pack.mcmeta", meta) { return 1 }
+    if !add_png(&wa, "assets/minecraft/textures/block/stone.png", 16, 200, 10, 10) { return 2 }
+    if !fin(&wa) { return 3 }
+    zip.zip_writer_free(&wa)
+    // pack B (lower): stone (loses), dirt 32x32 (10,20,230), broken grass png (garbage bytes)
+    var bb: rt.Buf = rt.buf_new()
+    var wb: zip.ZipWriter = zip.zip_writer_new(&bb)
+    if !add_str(&wb, "pack.mcmeta", meta) { return 4 }
+    if !add_png(&wb, "assets/minecraft/textures/block/stone.png", 16, 1, 2, 3) { return 5 }
+    if !add_png(&wb, "assets/minecraft/textures/block/dirt.png", 32, 10, 20, 230) { return 6 }
+    if !add_str(&wb, "assets/minecraft/textures/block/sand.png", "not a png at all") { return 7 }
+    if !fin(&wb) { return 8 }
+    zip.zip_writer_free(&wb)
+
+    var s: mc_assets.PackStack = mc_assets.stack_new()
+    var pa: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pa, rt.buf_ptr(&ba), rt.buf_len(&ba)) != mc_assets.ASSET_OK { return 10 }
+    if pa.format != 15 { return 11 }
+    if mc_assets.stack_push(&s, &pa) != mc_assets.ASSET_OK { return 12 }
+    var pb: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pb, rt.buf_ptr(&bb), rt.buf_len(&bb)) != mc_assets.ASSET_OK { return 13 }
+    if mc_assets.stack_push(&s, &pb) != mc_assets.ASSET_OK { return 14 }
+
+    var a: mc_texture.Atlas = mc_texture.atlas_default()
+    var d: mc_texture.Atlas = mc_texture.atlas_default()
+    let n: i32 = mc_assets.assets_apply(&s, &a)
+    if n != 2 { return 20 }
+    // priority: stone from A, left half (200,10,10), right half (10,10,200)
+    if mc_texture.atlas_texel(&a, mc_texture.T_STONE, 2, 2) != mc_texture.pack_pixel(200 as u32, 10 as u32, 10 as u32, 255 as u32) { return 21 }
+    if mc_texture.atlas_texel(&a, mc_texture.T_STONE, 13, 2) != mc_texture.pack_pixel(10 as u32, 10 as u32, 200 as u32, 255 as u32) { return 22 }
+    // dirt only in B, 32 -> 16 resampled
+    if mc_texture.atlas_texel(&a, mc_texture.T_DIRT, 2, 2) != mc_texture.pack_pixel(10 as u32, 20 as u32, 230 as u32, 255 as u32) { return 23 }
+    // sand: broken PNG in B -> default stays; untouched tiles equal the default atlas
+    if mc_texture.atlas_texel(&a, mc_texture.T_SAND, 4, 4) != mc_texture.atlas_texel(&d, mc_texture.T_SAND, 4, 4) { return 24 }
+    if mc_texture.atlas_texel(&a, mc_texture.T_GRAVEL, 9, 9) != mc_texture.atlas_texel(&d, mc_texture.T_GRAVEL, 9, 9) { return 25 }
+    // larger atlas tile (32): stone is resampled up
+    var a32: mc_texture.Atlas = mc_texture.atlas_new(32, 16, 16)
+    if mc_assets.assets_apply(&s, &a32) != 2 { return 26 }
+    if mc_texture.atlas_texel(&a32, mc_texture.T_STONE, 3, 3) != mc_texture.pack_pixel(200 as u32, 10 as u32, 10 as u32, 255 as u32) { return 27 }
+    // empty stack: nothing replaced
+    var es: mc_assets.PackStack = mc_assets.stack_new()
+    if mc_assets.assets_apply(&es, &d) != 0 { return 28 }
+
+    // broken inputs
+    var bad: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&bad, 0, 0) != mc_assets.ASSET_ERR_IO { return 30 }
+    var junk: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 300 {
+        rt.buf_push(&junk, ((i * 7 + 3) & 255) as u8)
+        i = i + 1
+    }
+    if mc_assets.pack_open_mem(&bad, rt.buf_ptr(&junk), rt.buf_len(&junk)) != mc_assets.ASSET_ERR_ZIP { return 31 }
+    // truncated valid ZIP (end record cut off)
+    if mc_assets.pack_open_mem(&bad, rt.buf_ptr(&ba), rt.buf_len(&ba) - 10) != mc_assets.ASSET_ERR_ZIP { return 32 }
+    // ZIP without pack.mcmeta
+    var bn: rt.Buf = rt.buf_new()
+    var wn: zip.ZipWriter = zip.zip_writer_new(&bn)
+    if !add_str(&wn, "x.txt", "hi") { return 33 }
+    if !fin(&wn) { return 34 }
+    zip.zip_writer_free(&wn)
+    if mc_assets.pack_open_mem(&bad, rt.buf_ptr(&bn), rt.buf_len(&bn)) != mc_assets.ASSET_ERR_NO_MCMETA { return 35 }
+    // pack.mcmeta without pack_format
+    var bm: rt.Buf = rt.buf_new()
+    var wm: zip.ZipWriter = zip.zip_writer_new(&bm)
+    if !add_str(&wm, "pack.mcmeta", "{\"pack\":{}}") { return 36 }
+    if !fin(&wm) { return 37 }
+    zip.zip_writer_free(&wm)
+    if mc_assets.pack_open_mem(&bad, rt.buf_ptr(&bm), rt.buf_len(&bm)) != mc_assets.ASSET_ERR_BAD_MCMETA { return 38 }
+    // missing file
+    if mc_assets.pack_open_file(&bad, "/nonexistent/none.zip") != mc_assets.ASSET_ERR_IO { return 39 }
+    // stack full
+    var fs: mc_assets.PackStack = mc_assets.stack_new()
+    var k: usize = 0
+    while k < 8 {
+        var q: mc_assets.Pack = mc_assets.pack_empty()
+        if mc_assets.pack_open_mem(&q, rt.buf_ptr(&ba), rt.buf_len(&ba)) != mc_assets.ASSET_OK { return 40 }
+        if mc_assets.stack_push(&fs, &q) != mc_assets.ASSET_OK { return 41 }
+        k = k + 1
+    }
+    var q9: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&q9, rt.buf_ptr(&ba), rt.buf_len(&ba)) != mc_assets.ASSET_OK { return 42 }
+    if mc_assets.stack_push(&fs, &q9) != mc_assets.ASSET_ERR_FULL { return 43 }
+    mc_assets.stack_free(&fs)
+    mc_assets.stack_free(&s)
+    return 0
+}
