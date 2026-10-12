@@ -1,0 +1,279 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_assets.fi -- local resource packs (ZIP with pack.mcmeta + assets/minecraft/textures/block/*.png).
+// The PLAYER supplies packs at run time; nothing from any pack is stored in this repository.
+// Priority: pack 0 is the TOP pack and wins. Tiles no pack provides keep the default (mc_texture) tile.
+// Docs: docs/mc/resourcepacks.md. Minimum: block tiles only (models/blockstates/animation/sounds = later).
+import std.rt
+import std.fs
+import zip.zip
+import paint.png
+import mc.mc_texture
+
+const ASSET_OK: i32 = 0
+const ASSET_ERR_IO: i32 = -1 // file unreadable or empty
+const ASSET_ERR_ZIP: i32 = -2 // not a valid ZIP
+const ASSET_ERR_NO_MCMETA: i32 = -3 // no pack.mcmeta entry
+const ASSET_ERR_BAD_MCMETA: i32 = -4 // no readable "pack_format" number
+const ASSET_ERR_FULL: i32 = -5 // stack holds MAX_PACKS already
+const MAX_PACKS: usize = 8
+const MAX_PNG_PIXELS: u64 = 16777216 // 4096 x 4096
+
+struct Pack {
+    data: rt.Buf, // the whole ZIP (the reader points into it)
+    z: zip.ZipReader,
+    format: i32, // pack_format from pack.mcmeta
+    open: bool,
+}
+
+struct PackStack {
+    packs: [Pack; 8],
+    n: usize,
+}
+
+fn pack_empty() -> Pack {
+    return Pack { data: rt.buf_new(), z: zip.zip_reader_empty(), format: 0, open: false }
+}
+
+fn stack_new() -> PackStack {
+    var s: PackStack = PackStack { packs: [pack_empty(); 8], n: 0 }
+    return s
+}
+
+fn pack_close(p: *mut Pack) {
+    if (*p).open {
+        zip.zip_reader_free(&(*p).z)
+        rt.buf_free(&(*p).data)
+        (*p).open = false
+    }
+}
+
+fn stack_free(s: *mut PackStack) {
+    var i: usize = 0
+    while i < (*s).n {
+        pack_close(&(*s).packs[i])
+        i = i + 1
+    }
+    (*s).n = 0
+}
+
+// Index of the entry whose name is exactly the n bytes at p; -1 if none.
+fn pack_find_bytes(p: *mut Pack, name: u64, n: usize) -> i64 {
+    let cnt: usize = zip.zip_entry_count(&(*p).z)
+    var i: usize = 0
+    while i < cnt {
+        let nm: str = zip.zip_entry_name(&(*p).z, i)
+        if nm.length() == n && rt.mem_eq(nm.p as u64, name, n) { return i as i64 }
+        i = i + 1
+    }
+    return -1
+}
+
+fn pack_find(p: *mut Pack, name: str) -> i64 {
+    return pack_find_bytes(p, name.p as u64, name.length())
+}
+
+// "pack_format" : <digits>  -> value, or -1. Plain scan (no JSON tree needed for the one number).
+fn parse_pack_format(p: u64, n: usize) -> i32 {
+    let key: str = "pack_format"
+    let kl: usize = key.length()
+    if n < kl + 2 { return -1 }
+    var i: usize = 0
+    while i + kl < n {
+        if rt.mem_eq(p + i as u64, key.p as u64, kl) {
+            var j: usize = i + kl
+            while j < n && (rt.ld8(p, j) == 34 as u8 || rt.ld8(p, j) == 32 as u8 || rt.ld8(p, j) == 58 as u8 || rt.ld8(p, j) == 9 as u8 || rt.ld8(p, j) == 10 as u8 || rt.ld8(p, j) == 13 as u8) {
+                j = j + 1
+            }
+            var v: i32 = 0
+            var got: bool = false
+            while j < n && rt.ld8(p, j) >= 48 as u8 && rt.ld8(p, j) <= 57 as u8 && v < 100000 {
+                v = v * 10 + (rt.ld8(p, j) as i32 - 48)
+                got = true
+                j = j + 1
+            }
+            if got { return v }
+            return -1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn fail_open(e: ZipError, why: *mut i32) -> zip.ZipReader {
+    *why = ASSET_ERR_ZIP
+    return zip.zip_reader_empty()
+}
+
+// Opens a pack from ZIP bytes (copied). Returns ASSET_OK or a negative code; never crashes on garbage.
+fn pack_open_mem(p: *mut Pack, src: u64, n: usize) -> i32 {
+    *p = pack_empty()
+    if n == 0 { return ASSET_ERR_IO }
+    rt.buf_push_bytes(&(*p).data, src, n)
+    var why: i32 = 0
+    (*p).z = zip.zip_reader_open(rt.buf_ptr(&(*p).data), rt.buf_len(&(*p).data)) catch | e | (fail_open(e, &why))
+    if why != 0 {
+        rt.buf_free(&(*p).data)
+        return why
+    }
+    (*p).open = true
+    let mi: i64 = pack_find(p, "pack.mcmeta")
+    if mi < 0 {
+        pack_close(p)
+        return ASSET_ERR_NO_MCMETA
+    }
+    var meta: rt.Buf = rt.buf_new()
+    var got: usize = zip.zip_extract(&(*p).z, mi as usize, &meta) catch | e | (0)
+    var fmt: i32 = -1
+    if got > 0 { fmt = parse_pack_format(rt.buf_ptr(&meta), rt.buf_len(&meta)) }
+    rt.buf_free(&meta)
+    if fmt < 0 {
+        pack_close(p)
+        return ASSET_ERR_BAD_MCMETA
+    }
+    (*p).format = fmt
+    return ASSET_OK
+}
+
+fn pack_open_file(p: *mut Pack, path: str) -> i32 {
+    var b: rt.Buf = rt.buf_new()
+    var got: usize = fs.read_file(path, &b) catch | e | (0)
+    var rc: i32 = ASSET_ERR_IO
+    if got > 0 { rc = pack_open_mem(p, rt.buf_ptr(&b), rt.buf_len(&b)) }
+    rt.buf_free(&b)
+    return rc
+}
+
+// Appends as the NEXT lower priority (first added = top). Takes ownership of the opened pack.
+fn stack_push(s: *mut PackStack, p: *mut Pack) -> i32 {
+    if (*s).n >= MAX_PACKS {
+        pack_close(p)
+        return ASSET_ERR_FULL
+    }
+    (*s).packs[(*s).n] = *p
+    (*s).n = (*s).n + 1
+    return ASSET_OK
+}
+
+// File name (without extension) of a default tile under assets/minecraft/textures/block/; "" = no pack name.
+fn tile_file(t: u32) -> str {
+    if t == 1 { return "stone" }
+    if t == 2 { return "dirt" }
+    if t == 3 { return "grass_block_top" }
+    if t == 4 { return "grass_block_side" }
+    if t == 5 { return "sand" }
+    if t == 6 { return "gravel" }
+    if t == 7 { return "oak_log" }
+    if t == 8 { return "oak_log_top" }
+    if t == 9 { return "oak_planks" }
+    if t == 10 { return "oak_leaves" }
+    if t == 11 { return "water_still" }
+    if t == 12 { return "cobblestone" }
+    if t == 13 { return "bedrock" }
+    if t == 14 { return "snow" }
+    if t == 15 { return "ice" }
+    if t == 16 { return "glass" }
+    if t == 17 { return "sandstone" }
+    if t == 18 { return "iron_ore" }
+    if t == 19 { return "lava_still" }
+    if t == 20 { return "bricks" }
+    if t == 21 { return "netherrack" }
+    if t == 22 { return "clay" }
+    if t == 23 { return "deepslate" }
+    if t == 24 { return "terracotta" }
+    if t == 25 { return "white_wool" }
+    if t == 26 { return "orange_wool" }
+    if t == 27 { return "magenta_wool" }
+    if t == 28 { return "light_blue_wool" }
+    if t == 29 { return "yellow_wool" }
+    if t == 30 { return "lime_wool" }
+    if t == 31 { return "pink_wool" }
+    if t == 32 { return "gray_wool" }
+    if t == 33 { return "light_gray_wool" }
+    if t == 34 { return "cyan_wool" }
+    if t == 35 { return "purple_wool" }
+    if t == 36 { return "blue_wool" }
+    if t == 37 { return "brown_wool" }
+    if t == 38 { return "green_wool" }
+    if t == 39 { return "red_wool" }
+    if t == 40 { return "black_wool" }
+    return ""
+}
+
+// Decodes assets/minecraft/textures/block/<name>.png from one pack. Must be square or a vertical
+// strip (height multiple of width, first frame used). false = absent or undecodable.
+fn pack_load_block(p: *mut Pack, name: str, im: *mut png.Image) -> bool {
+    var path: rt.Buf = rt.buf_new()
+    let pre: str = "assets/minecraft/textures/block/"
+    rt.buf_push_bytes(&path, pre.p as u64, pre.length())
+    rt.buf_push_bytes(&path, name.p as u64, name.length())
+    let ext: str = ".png"
+    rt.buf_push_bytes(&path, ext.p as u64, ext.length())
+    let idx: i64 = pack_find_bytes(p, rt.buf_ptr(&path), rt.buf_len(&path))
+    rt.buf_free(&path)
+    if idx < 0 { return false }
+    var raw: rt.Buf = rt.buf_new()
+    var got: usize = zip.zip_extract(&(*p).z, idx as usize, &raw) catch | e | (0)
+    var ok: bool = false
+    if got > 0 { ok = png.decode_png_limited(rt.buf_ptr(&raw), rt.buf_len(&raw), MAX_PNG_PIXELS, im) }
+    rt.buf_free(&raw)
+    if !ok { return false }
+    let w: usize = png.image_width(im)
+    let h: usize = png.image_height(im)
+    if w == 0 || h < w || h % w != 0 {
+        png.image_free(im)
+        return false
+    }
+    return true
+}
+
+// Nearest-neighbour resample of the first w x w frame to ts x ts, into RGBA8 bytes (R low byte).
+fn resample_tile(im: *mut png.Image, ts: i32, out: u64) {
+    let w: usize = png.image_width(im)
+    var y: i32 = 0
+    while y < ts {
+        var x: i32 = 0
+        while x < ts {
+            let sx: usize = ((x as usize) * w) / (ts as usize)
+            let sy: usize = ((y as usize) * w) / (ts as usize)
+            let v: u32 = png.image_pixel(im, sx, sy) // 0xAARRGGBB
+            let r: u32 = (v >> 16 as u32) & 255 as u32
+            let g: u32 = (v >> 8 as u32) & 255 as u32
+            let b: u32 = v & 255 as u32
+            let a: u32 = (v >> 24 as u32) & 255 as u32
+            rt.st32(out, (y * ts + x) as usize, mc_texture.pack_pixel(r, g, b, a))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// Highest-priority pack that has the tile wins; others/fallback keep the atlas content. Returns the
+// number of tiles replaced. Atlas tile size is the caller's choice (images are resampled to it).
+fn assets_apply(s: *mut PackStack, a: *mut mc_texture.Atlas) -> i32 {
+    let ts: i32 = (*a).tile
+    let tmp: u64 = rt.heap_alloc((ts as usize) * (ts as usize) * 4)
+    var replaced: i32 = 0
+    var t: u32 = 1
+    while t <= mc_texture.DEFAULT_TILES {
+        let name: str = tile_file(t)
+        if name.length() > 0 {
+            var pi: usize = 0
+            var done: bool = false
+            while pi < (*s).n && !done {
+                var im: png.Image = png.image_new()
+                if pack_load_block(&(*s).packs[pi], name, &im) {
+                    resample_tile(&im, ts, tmp)
+                    png.image_free(&im)
+                    if mc_texture.atlas_set_tile(a, t, tmp) {
+                        replaced = replaced + 1
+                        done = true
+                    }
+                }
+                pi = pi + 1
+            }
+        }
+        t = t + 1
+    }
+    rt.heap_free(tmp, (ts as usize) * (ts as usize) * 4)
+    return replaced
+}
