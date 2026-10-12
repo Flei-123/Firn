@@ -1,0 +1,568 @@
+// lib/mc/mc_cull.fi -- which 16^3 sections can the camera see? Frustum culling + cave (occlusion) culling.
+//
+// Two parts (docs/mc/cull.md):
+//   1. CONNECTIVITY of one section (cull_conn): flood fill through the non-opaque blocks of the section; every
+//      connected air region touches some of the 6 faces, and every PAIR of faces touched by the same region is
+//      "connected" (15 bits). Computed once per meshing, from the padded 18^3 array of mc_mesh (inner 16^3 only).
+//      Face numbering = mc_mesh: 0 -x, 1 +x, 2 -y, 3 +y, 4 -z, 5 +z. Pair (a < b) -> bit start(a) + b - a - 1.
+//   2. VISIBILITY SEARCH (cull_run): breadth first from the camera section over the 6 neighbours. A step out of
+//      face f of section s is allowed when the ray could have entered s through a face i with conn(s, i, f) (the
+//      camera section allows every face), when the neighbour section touches the frustum, and when it does not go
+//      BACK (the "set-back rule": a straight ray never steps +x and later -x, so a step opposite to a step
+//      already taken is dropped). A section is re-queued when a new entry face or a shorter step history shows
+//      up, so the result does not depend on the order of the search. The search is conservative for straight
+//      rays: every section a view ray crosses before it hits something opaque is in the result.
+// Sections the graph does not know (never meshed, not loaded, above the column) are OPEN (all 15 bits): the search
+// flows through them. The result is sorted front to back (squared distance of the section centre, then key) --
+// the same order as mc_render_world.
+//
+// f64 camera, section boxes in world blocks (mc_camera.camera_section_visible). No GPU, no threads inside.
+
+import std.rt
+import std.math
+import mc.mc_camera
+import mc.mc_world
+
+export {
+    Cull, CullStats, CONN_ALL, cull_new, cull_free, cull_conn, cull_pair_bit, cull_connected,
+    cull_set, cull_get, cull_remove_column, cull_clear, cull_known, cull_run, cull_run_frustum,
+    cull_out_key, cull_out_cx, cull_out_sy, cull_out_cz, cull_pack,
+}
+
+const CONN_ALL: u32 = 32767
+const F_QUEUED: u32 = 4096
+const F_VISITED: u32 = 8192
+const F_START: u32 = 16384
+const F_OUT: u32 = 32768 // rejected by the frustum
+
+struct CullStats {
+    visited: u32, // sections reached by the search (= result length)
+    frustum_tests: u32,
+    frustum_out: u32, // neighbours rejected by the frustum
+    blocked: u32, // steps refused by connectivity or the set-back rule
+    known: u32, // result sections with a known connectivity (meshed)
+    ncells: u32, // window cells
+}
+
+struct Cull {
+    min_y: i32,
+    nsec: i32, // sections per column the search covers
+    tbl: u64, // hash: [key, value] u64 pairs; value 0 = empty, 1 = deleted, else conn | 65536
+    cap: usize,
+    used: usize, // non-empty slots (incl. deleted)
+    live: usize,
+    nodes: u64, // u16 per window cell
+    queue: u64, // u32 ring of window cells
+    qcap: usize,
+    cells: usize, // allocated window cells
+    out: u64, // [key, dist2] u64 pairs
+    nout: usize,
+    ocap: usize,
+    st: CullStats,
+}
+
+fn cull_new(min_y: i32, nsec: i32) -> Cull {
+    return Cull { min_y: min_y, nsec: nsec, tbl: 0, cap: 0, used: 0, live: 0, nodes: 0, queue: 0, qcap: 0, cells: 0,
+        out: 0, nout: 0, ocap: 0,
+        st: CullStats { visited: 0 as u32, frustum_tests: 0 as u32, frustum_out: 0 as u32, blocked: 0 as u32,
+            known: 0 as u32, ncells: 0 as u32 } }
+}
+
+fn cull_free(c: *mut Cull) {
+    if (*c).tbl != 0 { rt.heap_free((*c).tbl, (*c).cap * 16) }
+    if (*c).nodes != 0 { rt.heap_free((*c).nodes, (*c).cells * 2) }
+    if (*c).queue != 0 { rt.heap_free((*c).queue, (*c).qcap * 4) }
+    if (*c).out != 0 { rt.heap_free((*c).out, (*c).ocap * 16) }
+    (*c).tbl = 0
+    (*c).nodes = 0
+    (*c).queue = 0
+    (*c).out = 0
+    (*c).cap = 0
+    (*c).used = 0
+    (*c).live = 0
+    (*c).cells = 0
+    (*c).qcap = 0
+    (*c).ocap = 0
+    (*c).nout = 0
+}
+
+fn cull_pack(cx: i32, sy: i32, cz: i32) -> u64 {
+    return ((cx + 1048576) as u64) | (((cz + 1048576) as u64) << 21 as u64) | ((sy as u64) << 42 as u64)
+}
+
+fn cull_out_key(c: *mut Cull, i: usize) -> u64 { return rt.ld64((*c).out, i * 2) }
+fn cull_out_cx(key: u64) -> i32 { return ((key & 2097151 as u64) as i32) - 1048576 }
+fn cull_out_cz(key: u64) -> i32 { return (((key >> 21 as u64) & 2097151 as u64) as i32) - 1048576 }
+fn cull_out_sy(key: u64) -> i32 { return ((key >> 42 as u64) & 255 as u64) as i32 }
+
+// ---- connectivity of one section -----------------------------------------------------------------
+
+// Bit of the face pair (a, b), a != b: start(lo) + hi - lo - 1 with start(lo) = 5 lo - lo (lo - 1) / 2.
+fn cull_pair_bit(a: usize, b: usize) -> u32 {
+    var lo: usize = a
+    var hi: usize = b
+    if a > b {
+        lo = b
+        hi = a
+    }
+    var s: usize = 0
+    var k: usize = 0
+    while k < lo {
+        s = s + (5 - k)
+        k = k + 1
+    }
+    return (1 as u32) << ((s + hi - lo - 1) as u32)
+}
+
+// Are the faces a and b of a section connected (conn from cull_conn)?
+fn cull_connected(conn: u32, a: usize, b: usize) -> bool {
+    if a == b { return false }
+    return (conn & cull_pair_bit(a, b)) != 0 as u32
+}
+
+fn pairs_of(mask: u32) -> u32 {
+    var r: u32 = 0 as u32
+    var a: usize = 0
+    while a < 6 {
+        if ((mask >> (a as u32)) & 1 as u32) != 0 as u32 {
+            var b: usize = a + 1
+            while b < 6 {
+                if ((mask >> (b as u32)) & 1 as u32) != 0 as u32 { r = r | cull_pair_bit(a, b) }
+                b = b + 1
+            }
+        }
+        a = a + 1
+    }
+    return r
+}
+
+fn pad_solid(pad: u64, opaque: u64, x: usize, y: usize, z: usize) -> bool {
+    let id: u16 = rt.ld16(pad, ((y + 1) * 18 + (z + 1)) * 18 + x + 1)
+    if id >= 32768 as u16 { return false }
+    return rt.ld8(opaque, id as usize) != 0 as u8
+}
+
+// 15 bit face connectivity of the section in the padded array `pad` (u16 [18^3], mc_mesh layout; only the inner 16^3 is
+// read). `opaque` = MeshTables.opaque. `scr` = 12288 bytes of scratch (any content, one per thread).
+fn cull_conn(pad: u64, opaque: u64, scr: u64) -> u32 {
+    var i: usize = 0
+    while i < 4096 {
+        rt.st8(scr, i, 0 as u8)
+        i = i + 1
+    }
+    let stack: u64 = scr + 4096 as u64
+    var conn: u32 = 0 as u32
+    var start: usize = 0
+    while start < 4096 {
+        if conn == CONN_ALL { break }
+        let sx: usize = start & 15
+        let sz: usize = (start >> 4) & 15
+        let sy: usize = start >> 8
+        if rt.ld8(scr, start) == 0 as u8 && !pad_solid(pad, opaque, sx, sy, sz) {
+            var mask: u32 = 0 as u32
+            var sp: usize = 0
+            rt.st16(stack, 0, start as u16)
+            sp = 1
+            rt.st8(scr, start, 1 as u8)
+            while sp > 0 {
+                sp = sp - 1
+                let cell: usize = rt.ld16(stack, sp) as usize
+                let x: usize = cell & 15
+                let z: usize = (cell >> 4) & 15
+                let y: usize = cell >> 8
+                if x == 0 { mask = mask | 1 as u32 }
+                if x == 15 { mask = mask | 2 as u32 }
+                if y == 0 { mask = mask | 4 as u32 }
+                if y == 15 { mask = mask | 8 as u32 }
+                if z == 0 { mask = mask | 16 as u32 }
+                if z == 15 { mask = mask | 32 as u32 }
+                var d: usize = 0
+                while d < 6 {
+                    var nx: usize = x
+                    var ny: usize = y
+                    var nz: usize = z
+                    var ok: bool = true
+                    if d == 0 {
+                        if x == 0 { ok = false } else { nx = x - 1 }
+                    } else if d == 1 {
+                        if x == 15 { ok = false } else { nx = x + 1 }
+                    } else if d == 2 {
+                        if y == 0 { ok = false } else { ny = y - 1 }
+                    } else if d == 3 {
+                        if y == 15 { ok = false } else { ny = y + 1 }
+                    } else if d == 4 {
+                        if z == 0 { ok = false } else { nz = z - 1 }
+                    } else {
+                        if z == 15 { ok = false } else { nz = z + 1 }
+                    }
+                    if ok {
+                        let ncell: usize = (ny * 16 + nz) * 16 + nx
+                        if rt.ld8(scr, ncell) == 0 as u8 && !pad_solid(pad, opaque, nx, ny, nz) {
+                            rt.st8(scr, ncell, 1 as u8)
+                            rt.st16(stack, sp, ncell as u16)
+                            sp = sp + 1
+                        }
+                    }
+                    d = d + 1
+                }
+            }
+            conn = conn | pairs_of(mask)
+        }
+        start = start + 1
+    }
+    return conn
+}
+
+// ---- the graph (hash key -> conn) ---------------------------------------------------------------
+
+fn hash_key(k: u64) -> u64 {
+    var h: u64 = k *% 0x9E3779B97F4A7C15 as u64
+    h = h ^ (h >> 29 as u64)
+    return h
+}
+
+// slot holding `key`, or -1 (as usize::MAX) when absent
+fn find_slot(c: *mut Cull, key: u64) -> i64 {
+    if (*c).cap == 0 { return 0 - 1 }
+    let mask: usize = (*c).cap - 1
+    var i: usize = (hash_key(key) as usize) & mask
+    while true {
+        let v: u64 = rt.ld64((*c).tbl, i * 2 + 1)
+        if v == 0 as u64 { return 0 - 1 }
+        if v > 1 as u64 && rt.ld64((*c).tbl, i * 2) == key { return i as i64 }
+        i = (i + 1) & mask
+    }
+    return 0 - 1
+}
+
+fn rebuild(c: *mut Cull, ncap: usize) {
+    let ot: u64 = (*c).tbl
+    let ocap: usize = (*c).cap
+    let nt: u64 = rt.heap_alloc(ncap * 16)
+    var i: usize = 0
+    while i < ncap * 2 {
+        rt.st64(nt, i, 0 as u64)
+        i = i + 1
+    }
+    (*c).tbl = nt
+    (*c).cap = ncap
+    (*c).used = 0
+    (*c).live = 0
+    i = 0
+    while i < ocap {
+        let v: u64 = rt.ld64(ot, i * 2 + 1)
+        if v > 1 as u64 {
+            insert_raw(c, rt.ld64(ot, i * 2), v)
+        }
+        i = i + 1
+    }
+    if ot != 0 { rt.heap_free(ot, ocap * 16) }
+}
+
+fn insert_raw(c: *mut Cull, key: u64, v: u64) {
+    let mask: usize = (*c).cap - 1
+    var i: usize = (hash_key(key) as usize) & mask
+    while rt.ld64((*c).tbl, i * 2 + 1) != 0 as u64 {
+        i = (i + 1) & mask
+    }
+    rt.st64((*c).tbl, i * 2, key)
+    rt.st64((*c).tbl, i * 2 + 1, v)
+    (*c).used = (*c).used + 1
+    (*c).live = (*c).live + 1
+}
+
+// Records the connectivity of a section (CONN_ALL for an air section). Replaces an earlier value.
+fn cull_set(c: *mut Cull, cx: i32, sy: i32, cz: i32, conn: u32) {
+    let key: u64 = cull_pack(cx, sy, cz)
+    let v: u64 = (conn as u64) | 65536 as u64
+    let s: i64 = find_slot(c, key)
+    if s >= 0 {
+        rt.st64((*c).tbl, (s as usize) * 2 + 1, v)
+        return
+    }
+    if (*c).cap == 0 {
+        rebuild(c, 1024)
+    } else if ((*c).used + 1) * 2 > (*c).cap {
+        var ncap: usize = (*c).cap
+        if ((*c).live + 1) * 4 > (*c).cap { ncap = (*c).cap * 2 }
+        rebuild(c, ncap)
+    }
+    insert_raw(c, key, v)
+}
+
+// Connectivity of a section, or 0xFFFFFFFF when the graph does not know it.
+fn cull_get(c: *mut Cull, cx: i32, sy: i32, cz: i32) -> u32 {
+    let s: i64 = find_slot(c, cull_pack(cx, sy, cz))
+    if s < 0 { return 4294967295 as u32 }
+    return (rt.ld64((*c).tbl, (s as usize) * 2 + 1) & 65535 as u64) as u32
+}
+
+fn cull_known(c: *mut Cull) -> usize { return (*c).live }
+
+// Forgets the sections 0..nsec-1 of a chunk column (it was unloaded).
+fn cull_remove_column(c: *mut Cull, cx: i32, cz: i32) {
+    var sy: i32 = 0
+    while sy < (*c).nsec {
+        let s: i64 = find_slot(c, cull_pack(cx, sy, cz))
+        if s >= 0 {
+            rt.st64((*c).tbl, (s as usize) * 2 + 1, 1 as u64)
+            (*c).live = (*c).live - 1
+        }
+        sy = sy + 1
+    }
+}
+
+fn cull_clear(c: *mut Cull) {
+    if (*c).tbl != 0 {
+        var i: usize = 0
+        while i < (*c).cap * 2 {
+            rt.st64((*c).tbl, i, 0 as u64)
+            i = i + 1
+        }
+    }
+    (*c).used = 0
+    (*c).live = 0
+}
+
+// ---- the search --------------------------------------------------------------------------------------
+
+fn out_push(c: *mut Cull, key: u64, d: u64) {
+    if (*c).nout >= (*c).ocap {
+        var nc: usize = (*c).ocap * 2
+        if nc == 0 { nc = 4096 }
+        let nv: u64 = rt.heap_alloc(nc * 16)
+        if (*c).out != 0 {
+            rt.mem_copy(nv, (*c).out, (*c).ocap * 16)
+            rt.heap_free((*c).out, (*c).ocap * 16)
+        }
+        (*c).out = nv
+        (*c).ocap = nc
+    }
+    rt.st64((*c).out, (*c).nout * 2, key)
+    rt.st64((*c).out, (*c).nout * 2 + 1, d)
+    (*c).nout = (*c).nout + 1
+}
+
+// shell sort by distance, ties by key (the order of mc_render_world)
+fn out_sort(c: *mut Cull) {
+    let n: usize = (*c).nout
+    var gap: usize = n / 2
+    while gap > 0 {
+        var i: usize = gap
+        while i < n {
+            let s: u64 = rt.ld64((*c).out, i * 2)
+            let d: u64 = rt.ld64((*c).out, i * 2 + 1)
+            var j: usize = i
+            while j >= gap && (rt.ld64((*c).out, (j - gap) * 2 + 1) > d
+                || (rt.ld64((*c).out, (j - gap) * 2 + 1) == d && rt.ld64((*c).out, (j - gap) * 2) > s)) {
+                rt.st64((*c).out, j * 2, rt.ld64((*c).out, (j - gap) * 2))
+                rt.st64((*c).out, j * 2 + 1, rt.ld64((*c).out, (j - gap) * 2 + 1))
+                j = j - gap
+            }
+            rt.st64((*c).out, j * 2, s)
+            rt.st64((*c).out, j * 2 + 1, d)
+            i = i + 1
+        }
+        gap = gap / 2
+    }
+}
+
+fn floor_i(v: f64) -> i32 {
+    var x: i32 = v as i32
+    if (x as f64) > v { x = x - 1 }
+    return x
+}
+
+fn ensure_window(c: *mut Cull, cells: usize) {
+    if (*c).cells < cells {
+        if (*c).nodes != 0 { rt.heap_free((*c).nodes, (*c).cells * 2) }
+        if (*c).queue != 0 { rt.heap_free((*c).queue, (*c).qcap * 4) }
+        (*c).nodes = rt.heap_alloc(cells * 2)
+        (*c).queue = rt.heap_alloc(cells * 4)
+        (*c).cells = cells
+        (*c).qcap = cells
+    }
+    var i: usize = 0
+    while i < cells {
+        rt.st16((*c).nodes, i, 0 as u16)
+        i = i + 1
+    }
+}
+
+fn center_d2(cam: *mut mc_camera.Camera, min_y: i32, cx: i32, sy: i32, cz: i32) -> u64 {
+    let ox: f64 = (cx * 16 + 8) as f64 - (*cam).x
+    let oy: f64 = (min_y + sy * 16 + 8) as f64 - (*cam).y
+    let oz: f64 = (cz * 16 + 8) as f64 - (*cam).z
+    return (ox * ox + oy * oy + oz * oz) as u64
+}
+
+// Frustum culling only: every section of the window (|dx|, |dz| <= dist columns around the camera, 0 <= sy < nsec) that
+// intersects the frustum. Result in c.out (front to back). The "before" of cull_run.
+fn cull_run_frustum(c: *mut Cull, cam: *mut mc_camera.Camera, dist: i32) -> usize {
+    (*c).nout = 0
+    (*c).st = CullStats { visited: 0 as u32, frustum_tests: 0 as u32, frustum_out: 0 as u32, blocked: 0 as u32,
+        known: 0 as u32, ncells: 0 as u32 }
+    let ccx: i32 = mc_world.block_to_chunk(floor_i((*cam).x))
+    let ccz: i32 = mc_world.block_to_chunk(floor_i((*cam).z))
+    var dz: i32 = 0 - dist
+    while dz <= dist {
+        var dx: i32 = 0 - dist
+        while dx <= dist {
+            var sy: i32 = 0
+            while sy < (*c).nsec {
+                (*c).st.frustum_tests = (*c).st.frustum_tests + 1 as u32
+                if mc_camera.camera_section_visible(cam, ccx + dx, sy, ccz + dz, (*c).min_y) != 0 {
+                    out_push(c, cull_pack(ccx + dx, sy, ccz + dz), center_d2(cam, (*c).min_y, ccx + dx, sy, ccz + dz))
+                }
+                sy = sy + 1
+            }
+            dx = dx + 1
+        }
+        dz = dz + 1
+    }
+    out_sort(c)
+    (*c).st.visited = (*c).nout as u32
+    return (*c).nout
+}
+
+fn node_enqueue(c: *mut Cull, cell: usize, qh: *mut usize, qn: *mut usize) {
+    let nb: u32 = rt.ld16((*c).nodes, cell) as u32
+    if (nb & F_QUEUED) != 0 as u32 { return }
+    rt.st16((*c).nodes, cell, (nb | F_QUEUED) as u16)
+    let pos: usize = ((*qh) + (*qn)) % (*c).qcap
+    rt.st32((*c).queue, pos, cell as u32)
+    (*qn) = (*qn) + 1
+}
+
+// The visibility search. `dist` = window radius in columns (as mc_render_world), the camera section is the start.
+// `setback` false drops the set-back rule (slower to cull, strictly more conservative). Result in c.out (front to back),
+// c.st has the numbers. Returns the number of visible sections.
+fn cull_run(c: *mut Cull, cam: *mut mc_camera.Camera, dist: i32, setback: bool) -> usize {
+    (*c).nout = 0
+    (*c).st = CullStats { visited: 0 as u32, frustum_tests: 0 as u32, frustum_out: 0 as u32, blocked: 0 as u32,
+        known: 0 as u32, ncells: 0 as u32 }
+    let w: i32 = dist * 2 + 1
+    let nsec: i32 = (*c).nsec
+    let cells: usize = ((w * w) as usize) * (nsec as usize)
+    (*c).st.ncells = cells as u32
+    ensure_window(c, cells)
+    let ccx: i32 = mc_world.block_to_chunk(floor_i((*cam).x))
+    let ccz: i32 = mc_world.block_to_chunk(floor_i((*cam).z))
+    let ox: i32 = ccx - dist
+    let oz: i32 = ccz - dist
+    var csy: i32 = mc_world.section_index(floor_i((*cam).y), (*c).min_y)
+    if csy < 0 { csy = 0 }
+    if csy >= nsec { csy = nsec - 1 }
+    let ww: usize = w as usize
+    let start: usize = ((csy as usize) * ww + (dist as usize)) * ww + (dist as usize)
+    var qh: usize = 0
+    var qn: usize = 0
+    rt.st16((*c).nodes, start, (F_START | F_VISITED) as u16) // empty step history
+    out_push(c, cull_pack(ccx, csy, ccz), center_d2(cam, (*c).min_y, ccx, csy, ccz))
+    node_enqueue(c, start, &qh, &qn)
+    while qn > 0 {
+        let cell: usize = rt.ld32((*c).queue, qh) as usize
+        qh = (qh + 1) % (*c).qcap
+        qn = qn - 1
+        let nb: u32 = rt.ld16((*c).nodes, cell) as u32
+        rt.st16((*c).nodes, cell, (nb & (65535 as u32 - F_QUEUED)) as u16)
+        let inc: u32 = nb & 63 as u32
+        let trav: u32 = (nb >> 6 as u32) & 63 as u32
+        let isstart: bool = (nb & F_START) != 0 as u32
+        let ix: i32 = (cell % ww) as i32
+        let iz: i32 = ((cell / ww) % ww) as i32
+        let isy: i32 = (cell / (ww * ww)) as i32
+        let cx: i32 = ox + ix
+        let cz: i32 = oz + iz
+        var conn: u32 = cull_get(c, cx, isy, cz)
+        if conn == 4294967295 as u32 { conn = CONN_ALL }
+        var f: usize = 0
+        while f < 6 {
+            let fb: u32 = (1 as u32) << (f as u32)
+            let opp: u32 = (1 as u32) << ((f ^ 1) as u32)
+            // set-back: never step opposite to an earlier step
+            if setback && (trav & opp) != 0 as u32 {
+                f = f + 1
+                continue
+            }
+            var allowed: bool = isstart
+            if !allowed {
+                var i: usize = 0
+                while i < 6 {
+                    if i != f && (inc & ((1 as u32) << (i as u32))) != 0 as u32 && (conn & cull_pair_bit(i, f)) != 0 as u32 {
+                        allowed = true
+                        break
+                    }
+                    i = i + 1
+                }
+            }
+            if !allowed {
+                (*c).st.blocked = (*c).st.blocked + 1 as u32
+                f = f + 1
+                continue
+            }
+            var nx: i32 = ix
+            var ny: i32 = isy
+            var nz: i32 = iz
+            if f == 0 {
+                nx = ix - 1
+            } else if f == 1 {
+                nx = ix + 1
+            } else if f == 2 {
+                ny = isy - 1
+            } else if f == 3 {
+                ny = isy + 1
+            } else if f == 4 {
+                nz = iz - 1
+            } else {
+                nz = iz + 1
+            }
+            if nx < 0 || nx >= w || nz < 0 || nz >= w || ny < 0 || ny >= nsec {
+                f = f + 1
+                continue
+            }
+            let ncell: usize = ((ny as usize) * ww + (nz as usize)) * ww + (nx as usize)
+            let mut_nb: u32 = rt.ld16((*c).nodes, ncell) as u32
+            if (mut_nb & F_OUT) != 0 as u32 {
+                f = f + 1
+                continue
+            }
+            if (mut_nb & F_VISITED) == 0 as u32 {
+                (*c).st.frustum_tests = (*c).st.frustum_tests + 1 as u32
+                if mc_camera.camera_section_visible(cam, ox + nx, ny, oz + nz, (*c).min_y) == 0 {
+                    (*c).st.frustum_out = (*c).st.frustum_out + 1 as u32
+                    rt.st16((*c).nodes, ncell, (mut_nb | F_OUT) as u16)
+                    f = f + 1
+                    continue
+                }
+                // first visit: inc = entry face, trav = step history
+                rt.st16((*c).nodes, ncell, (F_VISITED | opp | (((trav | fb) & 63 as u32) << 6 as u32)) as u16)
+                out_push(c, cull_pack(ox + nx, ny, oz + nz), center_d2(cam, (*c).min_y, ox + nx, ny, oz + nz))
+                node_enqueue(c, ncell, &qh, &qn)
+            } else {
+                var ninc: u32 = mut_nb & 63 as u32
+                var ntrav: u32 = (mut_nb >> 6 as u32) & 63 as u32
+                let ninc2: u32 = ninc | opp
+                let ntrav2: u32 = ntrav & (trav | fb)
+                if ninc2 != ninc || ntrav2 != ntrav {
+                    ninc = ninc2
+                    ntrav = ntrav2
+                    rt.st16((*c).nodes, ncell, ((mut_nb & (F_QUEUED | F_VISITED | F_START)) | ninc | (ntrav << 6 as u32)) as u16)
+                    node_enqueue(c, ncell, &qh, &qn)
+                }
+            }
+            f = f + 1
+        }
+    }
+    out_sort(c)
+    (*c).st.visited = (*c).nout as u32
+    var k: usize = 0
+    var kn: u32 = 0 as u32
+    while k < (*c).nout {
+        let key: u64 = rt.ld64((*c).out, k * 2)
+        if cull_get(c, cull_out_cx(key), cull_out_sy(key), cull_out_cz(key)) != 4294967295 as u32 { kn = kn + 1 as u32 }
+        k = k + 1
+    }
+    (*c).st.known = kn
+    return (*c).nout
+}

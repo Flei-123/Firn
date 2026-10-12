@@ -1,0 +1,1033 @@
+// lib/mc/mc_stream.fi -- chunk streaming and threaded section meshing for the voxel client (docs/mc/stream.md).
+//
+// The render thread owns the world, the section table and EVERY back end call (GL lives there). Per frame, stream_frame
+//   1. runs the visibility search (mc_cull: frustum + cave culling) -> sections front to back,
+//   2. cancels queued mesh jobs that are now behind the camera and far away (camera moved),
+//   3. picks the sections that need a mesh -- visible ones first, nearest first, then the nearest hidden ones --
+//      takes a SNAPSHOT of their 18^3 neighbourhood on the render thread (the world may change while workers run, so
+//      workers never touch it) and hands them to lib/jobs; at most `max_inflight` jobs are queued at any time, so a
+//      new camera position re-prioritises within a few jobs; a section waits for its 8 neighbour columns (AO and
+//      border faces need them) for at most `nbr_wait` frames,
+//   4. uploads finished meshes (mesh_upload of the back end) while the `upload_budget_us` of the frame lasts,
+//   5. draws the visible sections through the back end table (mc_backend).
+// Workers: one mesher per thread (a pool of slots claimed with a CAS), they produce vertex / index copies and the 15 bit
+// face connectivity (mc_cull.cull_conn) and publish them with a state word. No GL, no world access, no locks.
+// Uniform air / solid sections never become jobs.
+//
+// CONTRACT with the caller: after mc_world.world_put / world_apply of a column call stream_chunk_loaded (also when a
+// column is REPLACED: the stream keeps the chunk pointer); before or after mc_world.world_remove call
+// stream_chunk_unloaded. Block changes: stream_mark_block. Without a jobs pool (pool = 0) everything runs inline.
+
+import std.rt
+import std.time
+import jobs.jobs
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_backend
+import mc.mc_cull
+
+export {
+    Stream, StreamStats, stream_new, stream_free, stream_chunk_loaded, stream_chunk_unloaded, stream_drop_far,
+    stream_mark_block, stream_frame, stream_flush, stream_pending, stream_sections, STREAM_NREC,
+}
+
+const STREAM_NREC: usize = 64
+const NSLOT: usize = 32
+const SLOT_WORDS: usize = 8 // busy, pad, mask, verts, idx, scratch
+const EW: usize = 7 // section entry: key, handle, state, seq, job, quads, flags
+const CW: usize = 4 // column entry: key, chunk, frame, state
+const REC_WORDS: usize = 16
+const ST_EMPTY: u64 = 0
+const ST_CLEAN: u64 = 1
+const ST_DIRTY: u64 = 2
+const ST_TOMB: u64 = 9
+const R_STATE: usize = 0 // 0 free, 1 queued, 2 running, 3 done
+const R_KEY: usize = 1
+const R_SEQ: usize = 2
+const R_PAD: usize = 3
+const R_VERTS: usize = 4
+const R_NV: usize = 5
+const R_IDX: usize = 6
+const R_NI: usize = 7
+const R_NQ: usize = 8
+const R_CONN: usize = 9
+const R_NS: usize = 10 // meshing time in ns
+const R_EMPTY: usize = 11 // 1 = decided on the render thread (no mesh)
+
+struct StreamStats {
+    visible: u32, // sections in the draw list
+    frustum: u32, // sections a frustum-only search would keep (measurement, only with measure = true)
+    drawn: u32,
+    tris: u64,
+    submitted: u32,
+    uploaded: u32,
+    canceled: u32,
+    inflight: u32,
+    pending: u32, // sections that still need a mesh
+    skipped_empty: u32, // uniform air / solid sections that needed no job
+    deferred_nbr: u32, // candidates held back until the neighbour columns are there
+    upload_bytes: u64,
+    cull_us: u64,
+    submit_us: u64,
+    upload_us: u64,
+    draw_us: u64,
+    mesh_ns: u64, // summed meshing time of the jobs finished this frame
+}
+
+struct Stream {
+    min_y: i32,
+    nsec: i32,
+    dist: i32,
+    flags: u32,
+    tables: mc_mesh.MeshTables,
+    pool: u64, // *mut jobs.Jobs or 0
+    group: u64,
+    max_inflight: usize,
+    max_submit: usize,
+    snap_budget_us: u64,
+    upload_budget_us: u64,
+    nbr_wait: u32,
+    sync: bool,
+    setback: bool,
+    use_cull: bool,
+    measure: bool,
+    frame: u32,
+    inflight: usize,
+    tbl: u64,
+    cap: usize,
+    used: usize,
+    live: usize,
+    ctbl: u64,
+    ccap: usize,
+    cused: usize,
+    clive: usize,
+    pend: u64,
+    npend: usize,
+    pcap: usize,
+    recs: u64,
+    slots: u64,
+    sp: u64, // 27 words scratch of the snapshot
+    rr: usize,
+    cull: mc_cull.Cull,
+    st: StreamStats,
+}
+
+fn now_ns() -> u64 {
+    return time.monotonic_ns()
+}
+
+fn zero_stats() -> StreamStats {
+    return StreamStats { visible: 0 as u32, frustum: 0 as u32, drawn: 0 as u32, tris: 0 as u64, submitted: 0 as u32,
+        uploaded: 0 as u32, canceled: 0 as u32, inflight: 0 as u32, pending: 0 as u32, skipped_empty: 0 as u32,
+        deferred_nbr: 0 as u32, upload_bytes: 0 as u64, cull_us: 0 as u64, submit_us: 0 as u64, upload_us: 0 as u64,
+        draw_us: 0 as u64, mesh_ns: 0 as u64 }
+}
+
+// `nsec` = most sections of any column (24 for 1.20.1), `dist` = radius in columns, `t` the mesh tables, `pool` a
+// jobs.Jobs address (0 = mesh inline on the caller).
+fn stream_new(min_y: i32, nsec: i32, dist: i32, t: *mut mc_mesh.MeshTables, pool: u64) -> Stream {
+    var s: Stream = Stream { min_y: min_y, nsec: nsec, dist: dist, flags: mc_mesh.F_AO | mc_mesh.F_GREEDY,
+        tables: mc_mesh.MeshTables { opaque: (*t).opaque, tiles: (*t).tiles }, pool: pool, group: 0,
+        max_inflight: 16, max_submit: 8, snap_budget_us: 1500 as u64, upload_budget_us: 2000 as u64, nbr_wait: 30 as u32,
+        sync: false, setback: true, use_cull: true, measure: false, frame: 0 as u32, inflight: 0,
+        tbl: 0, cap: 0, used: 0, live: 0, ctbl: 0, ccap: 0, cused: 0, clive: 0, pend: 0, npend: 0, pcap: 0,
+        recs: 0, slots: 0, sp: 0, rr: 0, cull: mc_cull.cull_new(min_y, nsec), st: zero_stats() }
+    s.recs = rt.heap_alloc(STREAM_NREC * REC_WORDS * 8)
+    var i: usize = 0
+    while i < STREAM_NREC * REC_WORDS {
+        rt.st64(s.recs, i, 0 as u64)
+        i = i + 1
+    }
+    i = 0
+    while i < STREAM_NREC {
+        rt.st64(s.recs, i * REC_WORDS + R_PAD, rt.heap_alloc(5832 * 2))
+        i = i + 1
+    }
+    s.slots = rt.heap_alloc(NSLOT * SLOT_WORDS * 8)
+    i = 0
+    while i < NSLOT {
+        var m: mc_mesh.Mesher = mc_mesh.mesher_new()
+        rt.st64(s.slots, i * SLOT_WORDS, 0 as u64)
+        rt.st64(s.slots, i * SLOT_WORDS + 1, m.pad)
+        rt.st64(s.slots, i * SLOT_WORDS + 2, m.mask)
+        rt.st64(s.slots, i * SLOT_WORDS + 3, m.verts)
+        rt.st64(s.slots, i * SLOT_WORDS + 4, m.idx)
+        rt.st64(s.slots, i * SLOT_WORDS + 5, rt.heap_alloc(12288))
+        i = i + 1
+    }
+    s.sp = rt.heap_alloc(27 * 8)
+    if pool != 0 { s.group = jobs.group_new(pool as *mut jobs.Jobs) }
+    return s
+}
+
+// Frees everything the stream owns. Finish the jobs first (stream_flush). The back end meshes are freed when `b` is given.
+fn stream_free(s: *mut Stream, b: *mut mc_backend.Backend) {
+    if (*s).pool != 0 && (*s).group != 0 {
+        jobs.group_wait((*s).pool as *mut jobs.Jobs, (*s).group)
+        jobs.group_free((*s).pool as *mut jobs.Jobs, (*s).group)
+    }
+    var i: usize = 0
+    while i < (*s).cap {
+        if rt.ld64((*s).tbl, i * EW + 2) == ST_CLEAN || rt.ld64((*s).tbl, i * EW + 2) == ST_DIRTY {
+            let h: usize = rt.ld64((*s).tbl, i * EW + 1) as usize
+            if h != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, h) }
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < STREAM_NREC {
+        free_result((*s).recs, i)
+        rt.heap_free(rt.ld64((*s).recs, i * REC_WORDS + R_PAD), 5832 * 2)
+        i = i + 1
+    }
+    rt.heap_free((*s).recs, STREAM_NREC * REC_WORDS * 8)
+    i = 0
+    while i < NSLOT {
+        var m: mc_mesh.Mesher = mc_mesh.Mesher { pad: rt.ld64((*s).slots, i * SLOT_WORDS + 1), mask: rt.ld64((*s).slots, i * SLOT_WORDS + 2),
+            verts: rt.ld64((*s).slots, i * SLOT_WORDS + 3), idx: rt.ld64((*s).slots, i * SLOT_WORDS + 4),
+            nverts: 0 as u32, nidx: 0 as u32, nquads: 0 as u32, nfaces: 0 as u32 }
+        mc_mesh.mesher_free(&m)
+        rt.heap_free(rt.ld64((*s).slots, i * SLOT_WORDS + 5), 12288)
+        i = i + 1
+    }
+    rt.heap_free((*s).slots, NSLOT * SLOT_WORDS * 8)
+    rt.heap_free((*s).sp, 27 * 8)
+    if (*s).tbl != 0 { rt.heap_free((*s).tbl, (*s).cap * EW * 8) }
+    if (*s).ctbl != 0 { rt.heap_free((*s).ctbl, (*s).ccap * CW * 8) }
+    if (*s).pend != 0 { rt.heap_free((*s).pend, (*s).pcap * 8) }
+    mc_cull.cull_free(&(*s).cull)
+    (*s).tbl = 0
+    (*s).ctbl = 0
+    (*s).pend = 0
+    (*s).cap = 0
+    (*s).ccap = 0
+    (*s).pcap = 0
+}
+
+fn free_result(recs: u64, r: usize) {
+    let v: u64 = rt.ld64(recs, r * REC_WORDS + R_VERTS)
+    if v != 0 { rt.heap_free(v, (rt.ld64(recs, r * REC_WORDS + R_NV) as usize) * 8) }
+    let ix: u64 = rt.ld64(recs, r * REC_WORDS + R_IDX)
+    if ix != 0 { rt.heap_free(ix, (rt.ld64(recs, r * REC_WORDS + R_NI) as usize) * 4) }
+    rt.st64(recs, r * REC_WORDS + R_VERTS, 0 as u64)
+    rt.st64(recs, r * REC_WORDS + R_IDX, 0 as u64)
+    rt.st64(recs, r * REC_WORDS + R_NV, 0 as u64)
+    rt.st64(recs, r * REC_WORDS + R_NI, 0 as u64)
+}
+
+fn key_cx(key: u64) -> i32 { return ((key & 2097151 as u64) as i32) - 1048576 }
+fn key_cz(key: u64) -> i32 { return (((key >> 21 as u64) & 2097151 as u64) as i32) - 1048576 }
+fn key_sy(key: u64) -> i32 { return ((key >> 42 as u64) & 255 as u64) as i32 }
+
+fn hash_key(k: u64) -> u64 {
+    var h: u64 = k *% 0x9E3779B97F4A7C15 as u64
+    h = h ^ (h >> 29 as u64)
+    return h
+}
+
+// ---- section table ---------------------------------------------------------------------------------
+
+fn sec_find(s: *mut Stream, key: u64) -> i64 {
+    if (*s).cap == 0 { return 0 - 1 }
+    let mask: usize = (*s).cap - 1
+    var i: usize = (hash_key(key) as usize) & mask
+    while true {
+        let st: u64 = rt.ld64((*s).tbl, i * EW + 2)
+        if st == ST_EMPTY { return 0 - 1 }
+        if st != ST_TOMB && rt.ld64((*s).tbl, i * EW) == key { return i as i64 }
+        i = (i + 1) & mask
+    }
+    return 0 - 1
+}
+
+fn sec_rebuild(s: *mut Stream, ncap: usize) {
+    let ot: u64 = (*s).tbl
+    let ocap: usize = (*s).cap
+    let nt: u64 = rt.heap_alloc(ncap * EW * 8)
+    var i: usize = 0
+    while i < ncap * EW {
+        rt.st64(nt, i, 0 as u64)
+        i = i + 1
+    }
+    (*s).tbl = nt
+    (*s).cap = ncap
+    (*s).used = 0
+    (*s).live = 0
+    i = 0
+    while i < ocap {
+        let st: u64 = rt.ld64(ot, i * EW + 2)
+        if st != ST_EMPTY && st != ST_TOMB {
+            let slot: usize = sec_free_slot(s, rt.ld64(ot, i * EW))
+            var k: usize = 0
+            while k < EW {
+                rt.st64(nt, slot * EW + k, rt.ld64(ot, i * EW + k))
+                k = k + 1
+            }
+            (*s).used = (*s).used + 1
+            (*s).live = (*s).live + 1
+        }
+        i = i + 1
+    }
+    if ot != 0 { rt.heap_free(ot, ocap * EW * 8) }
+}
+
+// first empty slot on the probe path of key (only valid while the table has no tombstones to reuse: rebuild path)
+fn sec_free_slot(s: *mut Stream, key: u64) -> usize {
+    let mask: usize = (*s).cap - 1
+    var i: usize = (hash_key(key) as usize) & mask
+    while rt.ld64((*s).tbl, i * EW + 2) != ST_EMPTY {
+        i = (i + 1) & mask
+    }
+    return i
+}
+
+// entry for key; creates a DIRTY one when absent. Returns its slot.
+fn sec_entry(s: *mut Stream, key: u64) -> usize {
+    let f: i64 = sec_find(s, key)
+    if f >= 0 { return f as usize }
+    if (*s).cap == 0 {
+        sec_rebuild(s, 1024)
+    } else if ((*s).used + 1) * 2 > (*s).cap {
+        var ncap: usize = (*s).cap
+        if ((*s).live + 1) * 4 > (*s).cap { ncap = (*s).cap * 2 }
+        sec_rebuild(s, ncap)
+    }
+    let slot: usize = sec_free_slot(s, key)
+    rt.st64((*s).tbl, slot * EW, key)
+    rt.st64((*s).tbl, slot * EW + 1, 0 as u64)
+    rt.st64((*s).tbl, slot * EW + 2, ST_DIRTY)
+    rt.st64((*s).tbl, slot * EW + 3, 1 as u64)
+    rt.st64((*s).tbl, slot * EW + 4, 0 as u64)
+    rt.st64((*s).tbl, slot * EW + 5, 0 as u64)
+    rt.st64((*s).tbl, slot * EW + 6, 0 as u64)
+    (*s).used = (*s).used + 1
+    (*s).live = (*s).live + 1
+    pend_add(s, slot)
+    return slot
+}
+
+fn pend_add(s: *mut Stream, slot: usize) {
+    if (rt.ld64((*s).tbl, slot * EW + 6) & 1 as u64) != 0 as u64 { return }
+    rt.st64((*s).tbl, slot * EW + 6, rt.ld64((*s).tbl, slot * EW + 6) | 1 as u64)
+    if (*s).npend >= (*s).pcap {
+        var nc: usize = (*s).pcap * 2
+        if nc == 0 { nc = 4096 }
+        let nv: u64 = rt.heap_alloc(nc * 8)
+        if (*s).pend != 0 {
+            rt.mem_copy(nv, (*s).pend, (*s).pcap * 8)
+            rt.heap_free((*s).pend, (*s).pcap * 8)
+        }
+        (*s).pend = nv
+        (*s).pcap = nc
+    }
+    rt.st64((*s).pend, (*s).npend, rt.ld64((*s).tbl, slot * EW))
+    (*s).npend = (*s).npend + 1
+}
+
+// dirty an existing entry (keeps an old mesh until the new one is ready)
+fn sec_mark(s: *mut Stream, key: u64) {
+    let f: i64 = sec_find(s, key)
+    if f < 0 { return }
+    let slot: usize = f as usize
+    rt.st64((*s).tbl, slot * EW + 3, rt.ld64((*s).tbl, slot * EW + 3) + 1 as u64)
+    rt.st64((*s).tbl, slot * EW + 2, ST_DIRTY)
+    pend_add(s, slot)
+}
+
+// ---- column index -----------------------------------------------------------------------------------
+
+fn col_key(cx: i32, cz: i32) -> u64 {
+    return ((cx + 1048576) as u64) | (((cz + 1048576) as u64) << 21 as u64)
+}
+
+fn col_find(s: *mut Stream, key: u64) -> i64 {
+    if (*s).ccap == 0 { return 0 - 1 }
+    let mask: usize = (*s).ccap - 1
+    var i: usize = (hash_key(key) as usize) & mask
+    while true {
+        let st: u64 = rt.ld64((*s).ctbl, i * CW + 3)
+        if st == 0 as u64 { return 0 - 1 }
+        if st != ST_TOMB && rt.ld64((*s).ctbl, i * CW) == key { return i as i64 }
+        i = (i + 1) & mask
+    }
+    return 0 - 1
+}
+
+fn col_free_slot(s: *mut Stream, key: u64) -> usize {
+    let mask: usize = (*s).ccap - 1
+    var i: usize = (hash_key(key) as usize) & mask
+    while rt.ld64((*s).ctbl, i * CW + 3) != 0 as u64 {
+        i = (i + 1) & mask
+    }
+    return i
+}
+
+fn col_rebuild(s: *mut Stream, ncap: usize) {
+    let ot: u64 = (*s).ctbl
+    let ocap: usize = (*s).ccap
+    let nt: u64 = rt.heap_alloc(ncap * CW * 8)
+    var i: usize = 0
+    while i < ncap * CW {
+        rt.st64(nt, i, 0 as u64)
+        i = i + 1
+    }
+    (*s).ctbl = nt
+    (*s).ccap = ncap
+    (*s).cused = 0
+    (*s).clive = 0
+    i = 0
+    while i < ocap {
+        let st: u64 = rt.ld64(ot, i * CW + 3)
+        if st != 0 as u64 && st != ST_TOMB {
+            let slot: usize = col_free_slot(s, rt.ld64(ot, i * CW))
+            var k: usize = 0
+            while k < CW {
+                rt.st64(nt, slot * CW + k, rt.ld64(ot, i * CW + k))
+                k = k + 1
+            }
+            (*s).cused = (*s).cused + 1
+            (*s).clive = (*s).clive + 1
+        }
+        i = i + 1
+    }
+    if ot != 0 { rt.heap_free(ot, ocap * CW * 8) }
+}
+
+// chunk pointer of the column or 0
+fn col_chunk(s: *mut Stream, cx: i32, cz: i32) -> u64 {
+    let f: i64 = col_find(s, col_key(cx, cz))
+    if f < 0 { return 0 }
+    return rt.ld64((*s).ctbl, (f as usize) * CW + 1)
+}
+
+fn col_put(s: *mut Stream, cx: i32, cz: i32, chunk: u64) -> bool {
+    let key: u64 = col_key(cx, cz)
+    let f: i64 = col_find(s, key)
+    if f >= 0 {
+        rt.st64((*s).ctbl, (f as usize) * CW + 1, chunk)
+        return false
+    }
+    if (*s).ccap == 0 {
+        col_rebuild(s, 256)
+    } else if ((*s).cused + 1) * 2 > (*s).ccap {
+        var ncap: usize = (*s).ccap
+        if ((*s).clive + 1) * 4 > (*s).ccap { ncap = (*s).ccap * 2 }
+        col_rebuild(s, ncap)
+    }
+    let slot: usize = col_free_slot(s, key)
+    rt.st64((*s).ctbl, slot * CW, key)
+    rt.st64((*s).ctbl, slot * CW + 1, chunk)
+    rt.st64((*s).ctbl, slot * CW + 2, (*s).frame as u64)
+    rt.st64((*s).ctbl, slot * CW + 3, 1 as u64)
+    (*s).cused = (*s).cused + 1
+    (*s).clive = (*s).clive + 1
+    return true
+}
+
+// ---- loading / unloading -----------------------------------------------------------------------------
+
+fn mark_column(s: *mut Stream, cx: i32, cz: i32) {
+    let ch: u64 = col_chunk(s, cx, cz)
+    if ch == 0 { return }
+    let n: usize = (*(ch as *mut mc_chunk.Chunk)).nsec
+    var sy: usize = 0
+    while sy < n {
+        sec_mark(s, mc_cull.cull_pack(cx, sy as i32, cz))
+        sy = sy + 1
+    }
+}
+
+// The column (cx, cz) is in the world (new or replaced): its sections become candidates, the 8 neighbour columns are
+// remeshed (their border faces / AO now see this column). Returns false when the world does not have it.
+fn stream_chunk_loaded(s: *mut Stream, w: *mut mc_world.World, cx: i32, cz: i32) -> bool {
+    let ch: u64 = mc_world.world_find(w, cx, cz)
+    if ch == 0 { return false }
+    col_put(s, cx, cz, ch)
+    let n: usize = (*(ch as *mut mc_chunk.Chunk)).nsec
+    var sy: usize = 0
+    while sy < n {
+        let key: u64 = mc_cull.cull_pack(cx, sy as i32, cz)
+        if sec_find(s, key) >= 0 {
+            sec_mark(s, key)
+        } else {
+            sec_entry(s, key)
+        }
+        sy = sy + 1
+    }
+    var dz: i32 = 0 - 1
+    while dz <= 1 {
+        var dx: i32 = 0 - 1
+        while dx <= 1 {
+            if dx != 0 || dz != 0 { mark_column(s, cx + dx, cz + dz) }
+            dx = dx + 1
+        }
+        dz = dz + 1
+    }
+    return true
+}
+
+// A column leaves the stream: back end meshes freed (`b`, 0 = skip), entries and connectivity dropped. The caller removes
+// the chunk from the world. Neighbour sections are NOT remeshed (their faces toward the gap stay as they were).
+fn stream_chunk_unloaded(s: *mut Stream, b: *mut mc_backend.Backend, cx: i32, cz: i32) {
+    let f: i64 = col_find(s, col_key(cx, cz))
+    if f >= 0 {
+        rt.st64((*s).ctbl, (f as usize) * CW + 3, ST_TOMB)
+        (*s).clive = (*s).clive - 1
+    }
+    var sy: i32 = 0
+    while sy < (*s).nsec {
+        let key: u64 = mc_cull.cull_pack(cx, sy, cz)
+        let e: i64 = sec_find(s, key)
+        if e >= 0 {
+            let slot: usize = e as usize
+            let h: usize = rt.ld64((*s).tbl, slot * EW + 1) as usize
+            if h != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, h) }
+            let job: u64 = rt.ld64((*s).tbl, slot * EW + 4)
+            if job != 0 as u64 { cancel_rec(s, (job - 1 as u64) as usize) }
+            rt.st64((*s).tbl, slot * EW + 2, ST_TOMB)
+            (*s).live = (*s).live - 1
+        }
+        sy = sy + 1
+    }
+    mc_cull.cull_remove_column(&(*s).cull, cx, cz)
+}
+
+// Unloads (stream data, and the chunk from the world when `drop_world`) up to `max_cols` columns farther than
+// dist + extra columns from the camera column. Returns how many.
+fn stream_drop_far(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera,
+    extra: i32, max_cols: usize, drop_world: bool) -> usize {
+    let ccx: i32 = mc_world.block_to_chunk(floor_i((*cam).x))
+    let ccz: i32 = mc_world.block_to_chunk(floor_i((*cam).z))
+    var n: usize = 0
+    var i: usize = 0
+    while i < (*s).ccap && n < max_cols {
+        let st: u64 = rt.ld64((*s).ctbl, i * CW + 3)
+        if st != 0 as u64 && st != ST_TOMB {
+            let key: u64 = rt.ld64((*s).ctbl, i * CW)
+            let kx: i32 = key_cx(key)
+            let kz: i32 = key_cz(key)
+            var ax: i32 = kx - ccx
+            var az: i32 = kz - ccz
+            if ax < 0 { ax = 0 - ax }
+            if az < 0 { az = 0 - az }
+            if ax > (*s).dist + extra || az > (*s).dist + extra {
+                stream_chunk_unloaded(s, b, kx, kz)
+                if drop_world { mc_world.world_remove(w, kx, kz) }
+                n = n + 1
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Block (x, y, z) changed: dirty its section and the neighbours that see it in their 18^3 shell.
+fn stream_mark_block(s: *mut Stream, x: i32, y: i32, z: i32) {
+    var dz: i32 = 0 - 1
+    while dz <= 1 {
+        var dy: i32 = 0 - 1
+        while dy <= 1 {
+            var dx: i32 = 0 - 1
+            while dx <= 1 {
+                sec_mark(s, mc_cull.cull_pack(mc_world.block_to_chunk(x + dx), mc_world.section_index(y + dy, (*s).min_y),
+                        mc_world.block_to_chunk(z + dz)))
+                dx = dx + 1
+            }
+            dy = dy + 1
+        }
+        dz = dz + 1
+    }
+}
+
+fn stream_pending(s: *mut Stream) -> usize { return (*s).npend }
+fn stream_sections(s: *mut Stream) -> usize { return (*s).live }
+
+fn floor_i(v: f64) -> i32 {
+    var x: i32 = v as i32
+    if (x as f64) > v { x = x - 1 }
+    return x
+}
+
+// ---- jobs ------------------------------------------------------------------------------------------------
+
+fn rec_addr(recs: u64, r: usize, f: usize) -> u64 {
+    return recs + ((r * REC_WORDS + f) * 8) as u64
+}
+
+fn claim_slot(slots: u64) -> usize {
+    while true {
+        var i: usize = 0
+        while i < NSLOT {
+            if __atomic_swap((slots + ((i * SLOT_WORDS) * 8) as u64) as *mut u64, 0 as u64, 1 as u64) == 0 as u64 {
+                return i
+            }
+            i = i + 1
+        }
+    }
+    return 0
+}
+
+fn release_slot(slots: u64, i: usize) {
+    __atomic_swap((slots + ((i * SLOT_WORDS) * 8) as u64) as *mut u64, 1 as u64, 0 as u64)
+}
+
+// Runs on any thread: mesh the snapshot of record r. A record whose job was canceled is skipped.
+fn mesh_one(s: *mut Stream, r: usize) {
+    let recs: u64 = (*s).recs
+    if __atomic_swap(rec_addr(recs, r, R_STATE) as *mut u64, 1 as u64, 2 as u64) != 1 as u64 { return }
+    let t0: u64 = now_ns()
+    let si: usize = claim_slot((*s).slots)
+    let sb: usize = si * SLOT_WORDS
+    var m: mc_mesh.Mesher = mc_mesh.Mesher { pad: rt.ld64((*s).slots, sb + 1), mask: rt.ld64((*s).slots, sb + 2),
+        verts: rt.ld64((*s).slots, sb + 3), idx: rt.ld64((*s).slots, sb + 4),
+        nverts: 0 as u32, nidx: 0 as u32, nquads: 0 as u32, nfaces: 0 as u32 }
+    let pad: u64 = rt.ld64(recs, r * REC_WORDS + R_PAD)
+    mc_mesh.mesh_padded(&m, pad, &(*s).tables, (*s).flags)
+    let conn: u32 = mc_cull.cull_conn(pad, (*s).tables.opaque, rt.ld64((*s).slots, sb + 5))
+    var verts: u64 = 0
+    var idx: u64 = 0
+    if m.nverts > 0 as u32 {
+        verts = rt.heap_alloc((m.nverts as usize) * 8)
+        idx = rt.heap_alloc((m.nidx as usize) * 4)
+        rt.mem_copy(verts, m.verts, (m.nverts as usize) * 8)
+        rt.mem_copy(idx, m.idx, (m.nidx as usize) * 4)
+    }
+    rt.st64(recs, r * REC_WORDS + R_VERTS, verts)
+    rt.st64(recs, r * REC_WORDS + R_NV, m.nverts as u64)
+    rt.st64(recs, r * REC_WORDS + R_IDX, idx)
+    rt.st64(recs, r * REC_WORDS + R_NI, m.nidx as u64)
+    rt.st64(recs, r * REC_WORDS + R_NQ, m.nquads as u64)
+    rt.st64(recs, r * REC_WORDS + R_CONN, conn as u64)
+    rt.st64(recs, r * REC_WORDS + R_NS, now_ns() - t0)
+    release_slot((*s).slots, si)
+    __atomic_add(rec_addr(recs, r, R_STATE) as *mut u64, 1 as u64) // 2 -> 3 = done (publishes the fields)
+}
+
+fn mesh_body(ctx: u64, lo: u64, hi: u64) {
+    var r: u64 = lo
+    while r < hi {
+        mesh_one(ctx as *mut Stream, r as usize)
+        r = r + 1 as u64
+    }
+}
+
+fn rec_free_index(s: *mut Stream) -> usize {
+    var i: usize = 0
+    while i < STREAM_NREC {
+        if rt.ld64((*s).recs, i * REC_WORDS + R_STATE) == 0 as u64 { return i }
+        i = i + 1
+    }
+    return STREAM_NREC
+}
+
+// Cancels a queued job (not yet picked up by a worker). A running one is left to finish; its result is dropped when the
+// entry is gone.
+fn cancel_rec(s: *mut Stream, r: usize) {
+    if r >= STREAM_NREC { return }
+    let st: u64 = __atomic_add(rec_addr((*s).recs, r, R_STATE) as *mut u64, 0 as u64)
+    if st == 1 as u64 {
+        if __atomic_swap(rec_addr((*s).recs, r, R_STATE) as *mut u64, 1 as u64, 4 as u64) == 1 as u64 {
+            // the worker will see state 4 (or a reused record) and skip; free the record at once
+            rt.st64((*s).recs, r * REC_WORDS + R_STATE, 0 as u64)
+            (*s).inflight = (*s).inflight - 1
+            (*s).st.canceled = (*s).st.canceled + 1 as u32
+            let e: i64 = sec_find(s, rt.ld64((*s).recs, r * REC_WORDS + R_KEY))
+            if e >= 0 { rt.st64((*s).tbl, (e as usize) * EW + 4, 0 as u64) }
+        }
+    } else if st == 2 as u64 || st == 3 as u64 {
+        // drop the result when it arrives: forget the entry link
+        let e: i64 = sec_find(s, rt.ld64((*s).recs, r * REC_WORDS + R_KEY))
+        if e >= 0 { rt.st64((*s).tbl, (e as usize) * EW + 4, 0 as u64) }
+        rt.st64((*s).recs, r * REC_WORDS + R_KEY, 0 as u64)
+    }
+}
+
+// ---- snapshot --------------------------------------------------------------------------------------------
+
+fn is_invisible(s: *mut Stream, id: u16) -> bool {
+    var f: usize = 0
+    while f < 6 {
+        if rt.ld16((*s).tables.tiles, (id as usize) * 6 + f) != 0 as u16 { return false }
+        f = f + 1
+    }
+    return true
+}
+
+fn id_opaque(s: *mut Stream, id: u16) -> bool {
+    if id >= 32768 as u16 { return false }
+    return rt.ld8((*s).tables.opaque, id as usize) != 0 as u8
+}
+
+// Builds the padded 18^3 array of the section from the 27 sections around it (columns from the stream's own index).
+// Returns 0 = uniform invisible (air), 2 = uniform opaque and fully enclosed (no faces), 1 = a job is needed.
+fn snapshot(s: *mut Stream, cx: i32, sy: i32, cz: i32, pad: u64) -> i32 {
+    let sp: u64 = (*s).sp
+    var dz: i32 = 0 - 1
+    while dz <= 1 {
+        var dx: i32 = 0 - 1
+        while dx <= 1 {
+            let c: u64 = col_chunk(s, cx + dx, cz + dz)
+            var dy: i32 = 0 - 1
+            while dy <= 1 {
+                var p: u64 = 0
+                if c != 0 {
+                    let q: i32 = sy + dy
+                    let cp: *mut mc_chunk.Chunk = c as *mut mc_chunk.Chunk
+                    if q >= 0 && (q as usize) < (*cp).nsec { p = mc_chunk.chunk_section(cp, q as usize) as u64 }
+                }
+                rt.st64(sp, ((dy + 1) * 9 + (dz + 1) * 3 + (dx + 1)) as usize, p)
+                dy = dy + 1
+            }
+            dx = dx + 1
+        }
+        dz = dz + 1
+    }
+    let mid: u64 = rt.ld64(sp, 13)
+    if mid == 0 { return 0 }
+    let ms: *mut mc_chunk.Section = mid as *mut mc_chunk.Section
+    if mc_chunk.container_bits(&(*ms).blocks) == 0 as u32 {
+        let id0: u16 = mc_chunk.container_get(&(*ms).blocks, 0)
+        if is_invisible(s, id0) { return 0 }
+        if id_opaque(s, id0) {
+            // enclosed by six uniform opaque neighbours: nothing to draw
+            var enclosed: bool = true
+            var f: usize = 0
+            while f < 6 && enclosed {
+                var idx: usize = 12
+                if f == 1 { idx = 14 } else if f == 2 { idx = 4 } else if f == 3 { idx = 22 } else if f == 4 { idx = 10 } else if f == 5 { idx = 16 }
+                let np: u64 = rt.ld64(sp, idx)
+                if np == 0 {
+                    enclosed = false
+                } else {
+                    let ns: *mut mc_chunk.Section = np as *mut mc_chunk.Section
+                    if mc_chunk.container_bits(&(*ns).blocks) != 0 as u32 || !id_opaque(s, mc_chunk.container_get(&(*ns).blocks, 0)) {
+                        enclosed = false
+                    }
+                }
+                f = f + 1
+            }
+            if enclosed { return 2 }
+        }
+    }
+    var py: i32 = 0
+    while py < 18 {
+        let gy: i32 = py - 1
+        var ddy: i32 = 0
+        if gy < 0 { ddy = 0 - 1 }
+        if gy > 15 { ddy = 1 }
+        let ly: i32 = gy - ddy * 16
+        var pz: i32 = 0
+        while pz < 18 {
+            let gz: i32 = pz - 1
+            var ddz: i32 = 0
+            if gz < 0 { ddz = 0 - 1 }
+            if gz > 15 { ddz = 1 }
+            let lz: i32 = gz - ddz * 16
+            var px: i32 = 0
+            while px < 18 {
+                let gx: i32 = px - 1
+                var ddx: i32 = 0
+                if gx < 0 { ddx = 0 - 1 }
+                if gx > 15 { ddx = 1 }
+                let lx: i32 = gx - ddx * 16
+                let p: u64 = rt.ld64(sp, ((ddy + 1) * 9 + (ddz + 1) * 3 + (ddx + 1)) as usize)
+                var id: u16 = mc_mesh.UNKNOWN_ID
+                if p != 0 {
+                    id = mc_chunk.container_get(&(*(p as *mut mc_chunk.Section)).blocks, ((ly * 16 + lz) * 16 + lx) as usize)
+                }
+                rt.st16(pad, ((py * 18 + pz) * 18 + px) as usize, id)
+                px = px + 1
+            }
+            pz = pz + 1
+        }
+        py = py + 1
+    }
+    return 1
+}
+
+// ---- the frame ----------------------------------------------------------------------------------------------
+
+fn nbr_ready(s: *mut Stream, cx: i32, cz: i32) -> bool {
+    var dz: i32 = 0 - 1
+    while dz <= 1 {
+        var dx: i32 = 0 - 1
+        while dx <= 1 {
+            if (dx != 0 || dz != 0) && col_find(s, col_key(cx + dx, cz + dz)) < 0 {
+                // missing neighbour: wait, but not longer than nbr_wait frames after the column arrived
+                let f: i64 = col_find(s, col_key(cx, cz))
+                if f < 0 { return false }
+                let born: u64 = rt.ld64((*s).ctbl, (f as usize) * CW + 2)
+                if ((*s).frame as u64) < born + ((*s).nbr_wait as u64) { return false }
+                return true
+            }
+            dx = dx + 1
+        }
+        dz = dz + 1
+    }
+    return true
+}
+
+// Tries to start the mesh of the section at entry slot e. Returns true when a job (or an inline mesh) was started or the
+// section was settled without one.
+fn try_submit(s: *mut Stream, b: *mut mc_backend.Backend, e: usize) -> bool {
+    let key: u64 = rt.ld64((*s).tbl, e * EW)
+    let cx: i32 = key_cx(key)
+    let cz: i32 = key_cz(key)
+    let sy: i32 = key_sy(key)
+    if col_chunk(s, cx, cz) == 0 { return false }
+    if !nbr_ready(s, cx, cz) {
+        (*s).st.deferred_nbr = (*s).st.deferred_nbr + 1 as u32
+        return false
+    }
+    let r: usize = rec_free_index(s)
+    if r >= STREAM_NREC { return false }
+    let pad: u64 = rt.ld64((*s).recs, r * REC_WORDS + R_PAD)
+    let kind: i32 = snapshot(s, cx, sy, cz, pad)
+    if kind != 1 {
+        // settled on the render thread: no faces at all
+        let h: usize = rt.ld64((*s).tbl, e * EW + 1) as usize
+        if h != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, h) }
+        rt.st64((*s).tbl, e * EW + 1, 0 as u64)
+        rt.st64((*s).tbl, e * EW + 5, 0 as u64)
+        rt.st64((*s).tbl, e * EW + 2, ST_CLEAN)
+        var conn: u32 = mc_cull.CONN_ALL
+        if kind == 2 { conn = 0 as u32 }
+        mc_cull.cull_set(&(*s).cull, cx, sy, cz, conn)
+        (*s).st.skipped_empty = (*s).st.skipped_empty + 1 as u32
+        return true
+    }
+    rt.st64((*s).recs, r * REC_WORDS + R_KEY, key)
+    rt.st64((*s).recs, r * REC_WORDS + R_SEQ, rt.ld64((*s).tbl, e * EW + 3))
+    rt.st64((*s).tbl, e * EW + 4, (r + 1) as u64)
+    (*s).inflight = (*s).inflight + 1
+    (*s).st.submitted = (*s).st.submitted + 1 as u32
+    __atomic_add(rec_addr((*s).recs, r, R_STATE) as *mut u64, 1 as u64) // 0 -> 1 queued (publishes the snapshot)
+    if (*s).pool != 0 {
+        jobs.group_go((*s).pool as *mut jobs.Jobs, (*s).group, r as u64, (r + 1) as u64, 1 as u64, mesh_body, s as u64)
+    } else {
+        mesh_one(s, r)
+    }
+    return true
+}
+
+// needs a new job: a DIRTY entry without one
+fn wants_mesh(s: *mut Stream, e: usize) -> bool {
+    return rt.ld64((*s).tbl, e * EW + 2) == ST_DIRTY && rt.ld64((*s).tbl, e * EW + 4) == 0 as u64
+}
+
+fn behind_far(cam: *mut mc_camera.Camera, min_y: i32, key: u64) -> bool {
+    let ox: f64 = (key_cx(key) * 16 + 8) as f64 - (*cam).x
+    let oy: f64 = (min_y + key_sy(key) * 16 + 8) as f64 - (*cam).y
+    let oz: f64 = (key_cz(key) * 16 + 8) as f64 - (*cam).z
+    let d: f64 = ox * (*cam).fx + oy * (*cam).fy + oz * (*cam).fz
+    return d < -26.0 && ox * ox + oy * oy + oz * oz > 2304.0
+}
+
+// Uploads the finished jobs, nearest records first in round-robin order, until `deadline_ns` (at least one per call).
+fn consume(s: *mut Stream, b: *mut mc_backend.Backend, deadline_ns: u64) {
+    var n: usize = 0
+    var k: usize = 0
+    while k < STREAM_NREC {
+        let r: usize = ((*s).rr + k) % STREAM_NREC
+        k = k + 1
+        if __atomic_add(rec_addr((*s).recs, r, R_STATE) as *mut u64, 0 as u64) != 3 as u64 { continue }
+        if n > 0 && now_ns() > deadline_ns { break }
+        n = n + 1
+        let key: u64 = rt.ld64((*s).recs, r * REC_WORDS + R_KEY)
+        let e: i64 = sec_find(s, key)
+        if e >= 0 && key != 0 as u64 {
+            let slot: usize = e as usize
+            let old: usize = rt.ld64((*s).tbl, slot * EW + 1) as usize
+            if old != 0 { (*b).mesh_free((*b).obj, old) }
+            var h: usize = 0
+            let nv: usize = rt.ld64((*s).recs, r * REC_WORDS + R_NV) as usize
+            let ni: usize = rt.ld64((*s).recs, r * REC_WORDS + R_NI) as usize
+            if nv > 0 {
+                h = (*b).mesh_upload((*b).obj, key, rt.ld64((*s).recs, r * REC_WORDS + R_VERTS), nv,
+                    rt.ld64((*s).recs, r * REC_WORDS + R_IDX), ni)
+                (*s).st.upload_bytes = (*s).st.upload_bytes + (nv * 8 + ni * 4) as u64
+            }
+            rt.st64((*s).tbl, slot * EW + 1, h as u64)
+            rt.st64((*s).tbl, slot * EW + 5, rt.ld64((*s).recs, r * REC_WORDS + R_NQ))
+            rt.st64((*s).tbl, slot * EW + 4, 0 as u64)
+            if rt.ld64((*s).tbl, slot * EW + 3) == rt.ld64((*s).recs, r * REC_WORDS + R_SEQ) {
+                rt.st64((*s).tbl, slot * EW + 2, ST_CLEAN)
+            } else {
+                rt.st64((*s).tbl, slot * EW + 2, ST_DIRTY)
+            }
+            mc_cull.cull_set(&(*s).cull, key_cx(key), key_sy(key), key_cz(key), rt.ld64((*s).recs, r * REC_WORDS + R_CONN) as u32)
+            (*s).st.uploaded = (*s).st.uploaded + 1 as u32
+        }
+        (*s).st.mesh_ns = (*s).st.mesh_ns + rt.ld64((*s).recs, r * REC_WORDS + R_NS)
+        free_result((*s).recs, r)
+        rt.st64((*s).recs, r * REC_WORDS + R_STATE, 0 as u64)
+        (*s).inflight = (*s).inflight - 1
+    }
+    (*s).rr = ((*s).rr + 1) % STREAM_NREC
+}
+
+// One frame: search, schedule, upload, draw. Call b.begin before and b.end after. Returns the triangles drawn.
+fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera) -> u64 {
+    (*s).frame = (*s).frame + 1 as u32
+    let keep_up: u64 = (*s).st.upload_bytes
+    (*s).st = zero_stats()
+    (*s).st.upload_bytes = keep_up
+    let t0: u64 = now_ns()
+    // 1 visibility
+    var nvis: usize = 0
+    if (*s).use_cull {
+        nvis = mc_cull.cull_run(&(*s).cull, cam, (*s).dist, (*s).setback)
+    } else {
+        nvis = mc_cull.cull_run_frustum(&(*s).cull, cam, (*s).dist)
+    }
+    let t1: u64 = now_ns()
+    (*s).st.cull_us = (t1 - t0) / 1000 as u64
+    (*s).st.visible = nvis as u32
+    // 2 stale queued jobs (camera moved)
+    var r: usize = 0
+    while r < STREAM_NREC {
+        if rt.ld64((*s).recs, r * REC_WORDS + R_STATE) == 1 as u64 {
+            if behind_far(cam, (*s).min_y, rt.ld64((*s).recs, r * REC_WORDS + R_KEY)) { cancel_rec(s, r) }
+        }
+        r = r + 1
+    }
+    // 3 schedule: visible sections front to back, then the nearest pending ones
+    let snap_deadline: u64 = t1 + (*s).snap_budget_us * 1000 as u64
+    var started: usize = 0
+    var k: usize = 0
+    while k < nvis && started < (*s).max_submit && (*s).inflight < (*s).max_inflight {
+        let key: u64 = mc_cull.cull_out_key(&(*s).cull, k)
+        k = k + 1
+        let e: i64 = sec_find(s, key)
+        if e >= 0 && wants_mesh(s, e as usize) {
+            if try_submit(s, b, e as usize) { started = started + 1 }
+            if now_ns() > snap_deadline { break }
+        }
+    }
+    if started < (*s).max_submit && (*s).inflight < (*s).max_inflight && now_ns() <= snap_deadline && (*s).npend > 0 {
+        // pending sections outside the draw list (behind the camera, culled): nearest first
+        while started < (*s).max_submit && (*s).inflight < (*s).max_inflight && now_ns() <= snap_deadline {
+            var best: usize = 0
+            var bestd: u64 = 0 - 1 as u64
+            var found: bool = false
+            var i: usize = 0
+            while i < (*s).npend {
+                let key: u64 = rt.ld64((*s).pend, i)
+                let e: i64 = sec_find(s, key)
+                if e >= 0 && wants_mesh(s, e as usize) {
+                    let ox: f64 = (key_cx(key) * 16 + 8) as f64 - (*cam).x
+                    let oz: f64 = (key_cz(key) * 16 + 8) as f64 - (*cam).z
+                    let oy: f64 = ((*s).min_y + key_sy(key) * 16 + 8) as f64 - (*cam).y
+                    let d: u64 = (ox * ox + oy * oy + oz * oz) as u64
+                    var ax: i32 = key_cx(key) - mc_world.block_to_chunk(floor_i((*cam).x))
+                    var az: i32 = key_cz(key) - mc_world.block_to_chunk(floor_i((*cam).z))
+                    if ax < 0 { ax = 0 - ax }
+                    if az < 0 { az = 0 - az }
+                    if ax <= (*s).dist && az <= (*s).dist && (!found || d < bestd) && nbr_peek(s, key) {
+                        found = true
+                        bestd = d
+                        best = e as usize
+                    }
+                }
+                i = i + 1
+            }
+            if !found { break }
+            if try_submit(s, b, best) { started = started + 1 } else { break }
+        }
+    }
+    let t2: u64 = now_ns()
+    (*s).st.submit_us = (t2 - t1) / 1000 as u64
+    // 4 inline wait (tests / no pool)
+    if (*s).sync && (*s).pool != 0 {
+        jobs.group_wait((*s).pool as *mut jobs.Jobs, (*s).group)
+    }
+    // 5 uploads within the budget
+    let t3: u64 = now_ns()
+    if (*s).sync {
+        consume(s, b, 0 - 1 as u64)
+    } else {
+        consume(s, b, t3 + (*s).upload_budget_us * 1000 as u64)
+    }
+    let t4: u64 = now_ns()
+    (*s).st.upload_us = (t4 - t3) / 1000 as u64
+    // compact the pending list (entries that are clean or gone)
+    var wi: usize = 0
+    var ri: usize = 0
+    while ri < (*s).npend {
+        let key: u64 = rt.ld64((*s).pend, ri)
+        let e: i64 = sec_find(s, key)
+        if e >= 0 {
+            if rt.ld64((*s).tbl, (e as usize) * EW + 2) == ST_DIRTY {
+                rt.st64((*s).pend, wi, key)
+                wi = wi + 1
+            } else {
+                rt.st64((*s).tbl, (e as usize) * EW + 6, rt.ld64((*s).tbl, (e as usize) * EW + 6) & 0xFFFFFFFFFFFFFFFE as u64)
+            }
+        }
+        ri = ri + 1
+    }
+    (*s).npend = wi
+    (*s).st.pending = wi as u32
+    (*s).st.inflight = (*s).inflight as u32
+    // 6 draw (front to back)
+    var tris: u64 = 0
+    var drawn: u32 = 0 as u32
+    k = 0
+    while k < nvis {
+        let key: u64 = mc_cull.cull_out_key(&(*s).cull, k)
+        k = k + 1
+        let e: i64 = sec_find(s, key)
+        if e >= 0 {
+            let h: usize = rt.ld64((*s).tbl, (e as usize) * EW + 1) as usize
+            if h != 0 {
+                tris = tris + (*b).draw((*b).obj, h, (key_cx(key) * 16) as f64, ((*s).min_y + key_sy(key) * 16) as f64,
+                    (key_cz(key) * 16) as f64)
+                drawn = drawn + 1 as u32
+            }
+        }
+    }
+    (*s).st.drawn = drawn
+    (*s).st.tris = tris
+    (*s).st.draw_us = (now_ns() - t4) / 1000 as u64
+    if (*s).measure {
+        let keepc: u32 = (*s).cull.st.visited
+        let nf: usize = mc_cull.cull_run_frustum(&(*s).cull, cam, (*s).dist)
+        (*s).st.frustum = nf as u32
+        let _unused: u32 = keepc
+    }
+    return tris
+}
+
+// is the neighbourhood of the section ready (or waited long enough)? (for the pending scan)
+fn nbr_peek(s: *mut Stream, key: u64) -> bool {
+    return nbr_ready(s, key_cx(key), key_cz(key))
+}
+
+// Runs frames until nothing is pending or in flight (or `max_frames` passed). Synchronous: waits for the workers every
+// frame. For tests and the loading screen. Returns the frames used.
+fn stream_flush(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera,
+    max_frames: usize) -> usize {
+    let old_sync: bool = (*s).sync
+    let old_submit: usize = (*s).max_submit
+    let old_infl: usize = (*s).max_inflight
+    let old_wait: u32 = (*s).nbr_wait
+    let old_snap: u64 = (*s).snap_budget_us
+    (*s).sync = true
+    (*s).max_submit = STREAM_NREC
+    (*s).max_inflight = STREAM_NREC
+    (*s).snap_budget_us = 1000000000 as u64
+    var n: usize = 0
+    while n < max_frames {
+        stream_frame(s, w, b, cam)
+        n = n + 1
+        if (*s).npend == 0 && (*s).inflight == 0 { break }
+    }
+    (*s).sync = old_sync
+    (*s).max_submit = old_submit
+    (*s).max_inflight = old_infl
+    (*s).nbr_wait = old_wait
+    (*s).snap_budget_us = old_snap
+    return n
+}
