@@ -1,0 +1,268 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/input/evdev.fi -- input.evdev: the Linux input event interface, READ ONLY (/dev/input/event*, js*, inotify).
+//
+// Pure syscalls (no library, the program stays a static ELF). x86_64 syscall numbers like lib/input/uinput.fi.
+// Used by lib/input/padsys.fi (gamepads) and lib/input/rawdev.fi (raw keyboard / mouse). NOT for Windows: the
+// Windows builds take the `.windows.fi` twins of those two modules and never import this file.
+//
+// struct input_event on a 64 bit kernel: timeval (2 x 8), u16 type, u16 code, i32 value = 24 octets.
+// struct js_event (joydev): u32 time ms, i16 value, u8 type, u8 number = 8 octets.
+import std.rt
+
+export {
+    ev_open, js_open, ev_close, ev_read, ev_name, ev_id, ev_bits, ev_absinfo, ev_key_state, js_name, js_counts,
+    js_btnmap, js_axmap, bit_test, ev_list, inotify_open, inotify_watch, inotify_drain, DEV_DIR,
+    EV_SYN, EV_KEY, EV_REL, EV_ABS, REL_X, REL_Y, REL_HWHEEL, REL_WHEEL, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, KEY_MAX,
+    ERR_AGAIN, ERR_NODEV,
+}
+
+const DEV_DIR: str = "/dev/input"
+const SYS_READ: i64 = 0
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const SYS_IOCTL: i64 = 16
+const SYS_GETDENTS64: i64 = 217
+const SYS_INOTIFY_ADD_WATCH: i64 = 254
+const SYS_INOTIFY_INIT1: i64 = 294
+const O_NONBLOCK: i64 = 2048
+const O_DIRECTORY: i64 = 65536
+const O_CLOEXEC: i64 = 524288
+
+const ERR_AGAIN: i64 = 0 - 11
+const ERR_NODEV: i64 = 0 - 19
+
+const EV_SYN: u32 = 0
+const EV_KEY: u32 = 1
+const EV_REL: u32 = 2
+const EV_ABS: u32 = 3
+const REL_X: u32 = 0
+const REL_Y: u32 = 1
+const REL_HWHEEL: u32 = 6
+const REL_WHEEL: u32 = 8
+const BTN_LEFT: u32 = 272
+const BTN_RIGHT: u32 = 273
+const BTN_MIDDLE: u32 = 274
+const KEY_MAX: u32 = 767
+
+// _IOC(dir, type, nr, size): dir 2 = read
+fn ioc_r(ty: i64, nr: i64, size: i64) -> i64 {
+    return (2 << 30) | (size << 16) | (ty << 8) | nr
+}
+
+// open a path (0-terminated at p) read only and non blocking; negative errno on failure
+fn open_path(p: u64) -> i64 {
+    return syscall(SYS_OPEN, p as i64, O_NONBLOCK | O_CLOEXEC, 0, 0, 0, 0)
+}
+
+// "/dev/input/event<n>"
+fn node_path(prefix: u64, plen: usize, n: u32, out: u64) {
+    var i: usize = 0
+    while i < plen {
+        rt.st8(out, i, rt.ld8(prefix, i))
+        i = i + 1
+    }
+    var digits: [u8; 10] = [0 as u8; 10]
+    var nd: usize = 0
+    var v: u32 = n
+    if v == 0 as u32 {
+        digits[0] = 48 as u8
+        nd = 1
+    }
+    while v > 0 as u32 {
+        digits[nd] = (48 as u32 + v % 10 as u32) as u8
+        nd = nd + 1
+        v = v / 10 as u32
+    }
+    var k: usize = 0
+    while k < nd {
+        rt.st8(out, i + k, digits[nd - 1 - k])
+        k = k + 1
+    }
+    rt.st8(out, i + nd, 0 as u8)
+}
+
+fn ev_open(n: u32) -> i64 {
+    var pre: [u8; 17] = "/dev/input/event\0"
+    var path: [u8; 40] = [0 as u8; 40]
+    node_path((&pre[0]) as u64, 16, n, (&path[0]) as u64)
+    return open_path((&path[0]) as u64)
+}
+
+fn js_open(n: u32) -> i64 {
+    var pre: [u8; 14] = "/dev/input/js\0"
+    var path: [u8; 40] = [0 as u8; 40]
+    node_path((&pre[0]) as u64, 13, n, (&path[0]) as u64)
+    return open_path((&path[0]) as u64)
+}
+
+fn ev_close(fd: i64) {
+    if fd >= 0 {
+        syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    }
+}
+
+// read events: octets read, 0 = end / device gone, ERR_AGAIN = nothing now, other negatives = errno
+fn ev_read(fd: i64, buf: u64, cap: usize) -> i64 {
+    return syscall(SYS_READ, fd, buf as i64, cap as i64, 0, 0, 0)
+}
+
+// EVIOCGNAME(len): the device name into out (always 0-terminated); length
+fn ev_name(fd: i64, out: u64, cap: usize) -> usize {
+    if cap < 2 { return 0 }
+    rt.st8(out, 0, 0 as u8)
+    let r: i64 = syscall(SYS_IOCTL, fd, ioc_r(69, 6, cap as i64), out as i64, 0, 0, 0)
+    if r < 0 {
+        rt.st8(out, 0, 0 as u8)
+        return 0
+    }
+    rt.st8(out, cap - 1, 0 as u8)
+    return rt.c_length(out)
+}
+
+// EVIOCGID: bus, vendor, product, version as 4 x u16 into id[0..4]
+fn ev_id(fd: i64, id: u64) -> bool {
+    return syscall(SYS_IOCTL, fd, ioc_r(69, 2, 8), id as i64, 0, 0, 0) >= 0
+}
+
+// EVIOCGBIT(ev, len): which codes of event type `ev` the device has (ev 0 = which types)
+fn ev_bits(fd: i64, ev: u32, out: u64, len: usize) -> bool {
+    return syscall(SYS_IOCTL, fd, ioc_r(69, 32 + ev as i64, len as i64), out as i64, 0, 0, 0) >= 0
+}
+
+// EVIOCGABS(code): struct input_absinfo = value, minimum, maximum, fuzz, flat, resolution (6 x i32)
+fn ev_absinfo(fd: i64, code: u32, out: u64) -> bool {
+    return syscall(SYS_IOCTL, fd, ioc_r(69, 64 + code as i64, 24), out as i64, 0, 0, 0) >= 0
+}
+
+// EVIOCGKEY: the bit field of the keys held right now (KEY_MAX / 8 + 1 = 96 octets)
+fn ev_key_state(fd: i64, out: u64) -> bool {
+    return syscall(SYS_IOCTL, fd, ioc_r(69, 24, 96), out as i64, 0, 0, 0) >= 0
+}
+
+fn bit_test(bits: u64, nr: u32) -> bool {
+    return (rt.ld8(bits, (nr / 8 as u32) as usize) >> ((nr % 8 as u32) as u8)) & 1 as u8 != 0 as u8
+}
+
+// joydev: JSIOCGNAME(len) = _IOC(read, 'j', 0x13, len); JSIOCGAXES 0x11, JSIOCGBUTTONS 0x12 (u8 each),
+// JSIOCGAXMAP 0x32 (u8[ABS_CNT = 64]), JSIOCGBTNMAP 0x34 (u16[KEY_MAX - BTN_MISC + 1 = 512])
+fn js_name(fd: i64, out: u64, cap: usize) -> usize {
+    if cap < 2 { return 0 }
+    rt.st8(out, 0, 0 as u8)
+    if syscall(SYS_IOCTL, fd, ioc_r(106, 19, cap as i64), out as i64, 0, 0, 0) < 0 {
+        rt.st8(out, 0, 0 as u8)
+        return 0
+    }
+    rt.st8(out, cap - 1, 0 as u8)
+    return rt.c_length(out)
+}
+
+// axes and buttons count
+fn js_counts(fd: i64, out: u64) -> bool {
+    var a: [u8; 2] = [0 as u8; 2]
+    if syscall(SYS_IOCTL, fd, ioc_r(106, 17, 1), (&a[0]) as i64, 0, 0, 0) < 0 { return false }
+    if syscall(SYS_IOCTL, fd, ioc_r(106, 18, 1), (&a[1]) as i64, 0, 0, 0) < 0 { return false }
+    rt.st8(out, 0, a[0])
+    rt.st8(out, 1, a[1])
+    return true
+}
+
+fn js_axmap(fd: i64, out: u64) -> bool {
+    return syscall(SYS_IOCTL, fd, ioc_r(106, 50, 64), out as i64, 0, 0, 0) >= 0
+}
+
+fn js_btnmap(fd: i64, out: u64) -> bool {
+    return syscall(SYS_IOCTL, fd, ioc_r(106, 52, 1024), out as i64, 0, 0, 0) >= 0
+}
+
+// numbers n of the nodes "<prefix><n>" in /dev/input (prefix "event" or "js"), ascending, up to cap. Count; 0 when the
+// directory does not exist.
+fn ev_list(prefix: u64, plen: usize, out: u64, cap: usize) -> usize {
+    var dir: [u8; 12] = "/dev/input\0\0"
+    let fd: i64 = syscall(SYS_OPEN, (&dir[0]) as i64, O_DIRECTORY | O_CLOEXEC, 0, 0, 0, 0)
+    if fd < 0 {
+        return 0
+    }
+    let buf: u64 = rt.heap_alloc(8192)
+    var count: usize = 0
+    var running: bool = true
+    while running {
+        let n: i64 = syscall(SYS_GETDENTS64, fd, buf as i64, 8192, 0, 0, 0)
+        if n <= 0 {
+            running = false
+        } else {
+            var o: usize = 0
+            while o < n as usize {
+                // struct linux_dirent64: u64 ino, i64 off, u16 reclen, u8 type, char name[]
+                let reclen: usize = rt.ld16(buf + o as u64, 8 + 0) as usize
+                let name: u64 = buf + (o + 19) as u64
+                var same: bool = true
+                var i: usize = 0
+                while i < plen {
+                    if rt.ld8(name, i) != rt.ld8(prefix, i) {
+                        same = false
+                    }
+                    i = i + 1
+                }
+                if same {
+                    var v: u32 = 0 as u32
+                    var any: bool = false
+                    var d: u8 = rt.ld8(name, plen)
+                    var k: usize = plen
+                    while d >= 48 as u8 && d <= 57 as u8 && k < plen + 9 {
+                        v = v * 10 as u32 + (d - 48 as u8) as u32
+                        any = true
+                        k = k + 1
+                        d = rt.ld8(name, k)
+                    }
+                    if any && d == 0 as u8 && count < cap {
+                        rt.st32(out, count, v)
+                        count = count + 1
+                    }
+                }
+                o = o + reclen
+            }
+        }
+    }
+    rt.heap_free(buf, 8192)
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    // ascending (insertion sort)
+    var i: usize = 1
+    while i < count {
+        let v: u32 = rt.ld32(out, i)
+        var j: usize = i
+        while j > 0 && rt.ld32(out, j - 1) > v {
+            rt.st32(out, j, rt.ld32(out, j - 1))
+            j = j - 1
+        }
+        rt.st32(out, j, v)
+        i = i + 1
+    }
+    return count
+}
+
+// inotify on /dev/input for nodes appearing / vanishing. fd or negative errno.
+fn inotify_open() -> i64 {
+    return syscall(SYS_INOTIFY_INIT1, O_NONBLOCK | O_CLOEXEC, 0, 0, 0, 0, 0)
+}
+
+// watch /dev/input for IN_CREATE | IN_DELETE | IN_ATTRIB (a udev rule may change the permissions after creation)
+fn inotify_watch(fd: i64) -> bool {
+    var dir: [u8; 12] = "/dev/input\0\0"
+    return syscall(SYS_INOTIFY_ADD_WATCH, fd, (&dir[0]) as i64, 0x100 | 0x200 | 4, 0, 0, 0) >= 0
+}
+
+// swallow what is pending; true when there was anything
+fn inotify_drain(fd: i64) -> bool {
+    var buf: [u8; 1024] = [0 as u8; 1024]
+    var any: bool = false
+    var running: bool = true
+    while running {
+        let n: i64 = syscall(SYS_READ, fd, (&buf[0]) as i64, 1024, 0, 0, 0)
+        if n <= 0 {
+            running = false
+        } else {
+            any = true
+        }
+    }
+    return any
+}

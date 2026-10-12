@@ -1,0 +1,323 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/input/padsys.fi -- input.padsys: the gamepad back end of LINUX. evdev (/dev/input/event*) first, joydev
+// (/dev/input/js*) for devices evdev did not deliver; hot-plug through inotify on /dev/input (plus a slow rescan
+// when inotify is not available). Windows takes lib/input/padsys.windows.fi (XInput) with the same surface.
+//
+// Syscalls only (no library): the program stays a static ELF. Reading is non blocking; nothing here waits.
+// NOT proven on real hardware: /dev/input does not exist on the build machine, so the tests feed the very same
+// read path through a PIPE that carries input_event bytes (tests/2795). Rumble / force feedback: not done.
+import std.rt
+import input.evdev
+import input.padcore
+import input.padset
+
+export { sys_open, sys_scan, sys_poll, sys_read_slot, sys_close, sys_name, sys_describe_evdev, sys_describe_js }
+
+const RESCAN_EVERY: i64 = 240 // polls, when inotify is not there
+const SETTLE: i64 = 20        // polls to wait after a change (udev fixes the permissions a moment after the node appears)
+
+fn sys_name() -> str { return "evdev/joydev" }
+
+// inotify + first scan; true when /dev/input could be listed (even if empty)
+fn sys_open(s: *mut padset.PadSet) -> bool {
+    (*s).ino = evdev.inotify_open()
+    if (*s).ino >= 0 && !evdev.inotify_watch((*s).ino) {
+        evdev.ev_close((*s).ino)
+        (*s).ino = 0 - 1
+    }
+    sys_scan(s)
+    return true
+}
+
+fn sys_close(s: *mut padset.PadSet) {
+    var i: usize = 0
+    while i < padset.MAXPADS {
+        if padset.padset_active(s, i) {
+            evdev.ev_close(padset.padset_fd(s, i))
+            padset.padset_detach(s, i)
+        }
+        i = i + 1
+    }
+    if (*s).ino >= 0 {
+        evdev.ev_close((*s).ino)
+        (*s).ino = 0 - 1
+    }
+}
+
+// Describe an open evdev node in `p` (name, id, keys, axes with their ranges, mapping). False = not a gamepad.
+fn sys_describe_evdev(fd: i64, p: *mut padcore.Pad) -> bool {
+    var types: [u8; 8] = [0 as u8; 8]
+    if !evdev.ev_bits(fd, 0 as u32, (&types[0]) as u64, 8) {
+        return false
+    }
+    let tp: u64 = (&types[0]) as u64
+    if !evdev.bit_test(tp, evdev.EV_KEY) || !evdev.bit_test(tp, evdev.EV_ABS) {
+        return false
+    }
+    var keys: [u8; 96] = [0 as u8; 96]
+    if !evdev.ev_bits(fd, evdev.EV_KEY, (&keys[0]) as u64, 96) {
+        return false
+    }
+    let kp: u64 = (&keys[0]) as u64
+    // a gamepad / joystick button (BTN_JOYSTICK .. BTN_THUMBR); mice, touchpads and keyboards have none
+    var joy: bool = false
+    var c: u32 = 288 as u32
+    while c <= 318 as u32 {
+        if evdev.bit_test(kp, c) { joy = true }
+        c = c + 1 as u32
+    }
+    if !joy {
+        return false
+    }
+    var absb: [u8; 8] = [0 as u8; 8]
+    if !evdev.ev_bits(fd, evdev.EV_ABS, (&absb[0]) as u64, 8) {
+        return false
+    }
+    let ap: u64 = (&absb[0]) as u64
+    if !evdev.bit_test(ap, 0 as u32) && !evdev.bit_test(ap, 16 as u32) {
+        return false // no stick and no hat
+    }
+    var nm: [u8; 64] = [0 as u8; 64]
+    let nl: usize = evdev.ev_name(fd, (&nm[0]) as u64, 64)
+    padcore.pad_set_name(p, (&nm[0]) as u64, nl)
+    var id: [u16; 4] = [0 as u16; 4]
+    if evdev.ev_id(fd, (&id[0]) as u64) {
+        padcore.pad_set_identity(p, id[0] as u32, id[1] as u32, id[2] as u32, id[3] as u32)
+    }
+    c = 0 as u32
+    while c <= evdev.KEY_MAX {
+        if evdev.bit_test(kp, c) {
+            padcore.pad_add_key(p, c)
+        }
+        c = c + 1 as u32
+    }
+    padcore.pad_finish_keys(p)
+    var info: [i32; 6] = [0 as i32; 6]
+    c = 0 as u32
+    while c < 64 as u32 {
+        if evdev.bit_test(ap, c) && evdev.ev_absinfo(fd, c, (&info[0]) as u64) {
+            padcore.pad_set_abs(p, c, info[1], info[2], info[4], info[0])
+        }
+        c = c + 1 as u32
+    }
+    // the keys held right now (a pad plugged in with a button down)
+    var held: [u8; 96] = [0 as u8; 96]
+    if evdev.ev_key_state(fd, (&held[0]) as u64) {
+        c = 0 as u32
+        while c <= evdev.KEY_MAX {
+            if evdev.bit_test((&held[0]) as u64, c) {
+                padcore.pad_feed_evdev_one(p, evdev.EV_KEY, c, 1 as i32)
+            }
+            c = c + 1 as u32
+        }
+    }
+    padcore.pad_apply_default(p)
+    return true
+}
+
+// joydev node: names, counts, maps; every axis is -32767..32767 (the driver scales), hats are axes with that range
+fn sys_describe_js(fd: i64, p: *mut padcore.Pad) -> bool {
+    var cnt: [u8; 2] = [0 as u8; 2]
+    if !evdev.js_counts(fd, (&cnt[0]) as u64) {
+        return false
+    }
+    var axm: [u8; 64] = [0 as u8; 64]
+    var btm: [u16; 512] = [0 as u16; 512]
+    if !evdev.js_axmap(fd, (&axm[0]) as u64) || !evdev.js_btnmap(fd, (&btm[0]) as u64) {
+        return false
+    }
+    var nm: [u8; 64] = [0 as u8; 64]
+    let nl: usize = evdev.js_name(fd, (&nm[0]) as u64, 64)
+    padcore.pad_set_name(p, (&nm[0]) as u64, nl)
+    let na: usize = cnt[0] as usize
+    let nb: usize = cnt[1] as usize
+    var i: usize = 0
+    while i < nb && i < 128 {
+        padcore.pad_add_key(p, btm[i] as u32)
+        i = i + 1
+    }
+    padcore.pad_finish_keys(p)
+    i = 0
+    while i < na && i < 64 {
+        padcore.pad_set_abs(p, axm[i] as u32, 0 - 32767, 32767, 0, 0)
+        i = i + 1
+    }
+    padcore.pad_js_maps(p, nb, (&btm[0]) as u64, na, (&axm[0]) as u64)
+    padcore.pad_apply_default(p)
+    return true
+}
+
+fn same_name(a: *mut padcore.Pad, b: *mut padcore.Pad) -> bool {
+    if (*a).name_len != (*b).name_len || (*a).name_len == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < (*a).name_len {
+        if (*a).name[i] != (*b).name[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// (re)discover: open every new gamepad node, attach it. Nodes already open are kept.
+fn sys_scan(s: *mut padset.PadSet) {
+    (*s).idle = 0
+    var nodes: [u32; 64] = [0 as u32; 64]
+    var pre: [u8; 6] = "event\0"
+    let n: usize = evdev.ev_list((&pre[0]) as u64, 5, (&nodes[0]) as u64, 64)
+    var i: usize = 0
+    while i < n {
+        if padset.padset_find_node(s, padset.KIND_EVDEV, nodes[i]) < 0 {
+            let fd: i64 = evdev.ev_open(nodes[i])
+            if fd < 0 {
+                if fd == 0 - 13 { (*s).denied = (*s).denied + 1 as u64 }
+            } else {
+                var tmp: padcore.Pad = padcore.pad_new()
+                if sys_describe_evdev(fd, &tmp) {
+                    let slot: i64 = padset.padset_attach(s, padset.KIND_EVDEV, fd, nodes[i])
+                    if slot >= 0 {
+                        (*s).pad[slot as usize] = tmp
+                        padset.padset_db_apply(s, &(*s).pad[slot as usize])
+                        padcore.pad_update(&(*s).pad[slot as usize])
+                        (*s).pad[slot as usize].ev_head = 0
+                        (*s).pad[slot as usize].ev_tail = 0
+                        padcore.pad_event_push(&(*s).pad[slot as usize], padcore.PE_CONNECTED, 0 as u32, 1.0)
+                    } else {
+                        evdev.ev_close(fd)
+                    }
+                } else {
+                    evdev.ev_close(fd)
+                }
+            }
+        }
+        i = i + 1
+    }
+    // joydev: only for devices evdev did not give us (same name = the same pad)
+    var jpre: [u8; 3] = "js\0"
+    let jn: usize = evdev.ev_list((&jpre[0]) as u64, 2, (&nodes[0]) as u64, 64)
+    i = 0
+    while i < jn {
+        if padset.padset_find_node(s, padset.KIND_JOYDEV, nodes[i]) < 0 {
+            let fd: i64 = evdev.js_open(nodes[i])
+            if fd >= 0 {
+                var tmp: padcore.Pad = padcore.pad_new()
+                var take: bool = sys_describe_js(fd, &tmp)
+                var k: usize = 0
+                while take && k < padset.MAXPADS {
+                    if padset.padset_active(s, k) && same_name(&tmp, &(*s).pad[k]) {
+                        take = false
+                    }
+                    k = k + 1
+                }
+                if take {
+                    let slot: i64 = padset.padset_attach(s, padset.KIND_JOYDEV, fd, nodes[i])
+                    if slot >= 0 {
+                        (*s).pad[slot as usize] = tmp
+                        (*s).pad[slot as usize].ev_head = 0
+                        (*s).pad[slot as usize].ev_tail = 0
+                        padcore.pad_event_push(&(*s).pad[slot as usize], padcore.PE_CONNECTED, 0 as u32, 1.0)
+                    } else {
+                        evdev.ev_close(fd)
+                    }
+                } else {
+                    evdev.ev_close(fd)
+                }
+            } else if fd == 0 - 13 {
+                (*s).denied = (*s).denied + 1 as u64
+            }
+        }
+        i = i + 1
+    }
+}
+
+// after SYN_DROPPED: the kernel lost events, read the true state of the keys and axes again
+fn resync(fd: i64, p: *mut padcore.Pad) {
+    var held: [u8; 96] = [0 as u8; 96]
+    if evdev.ev_key_state(fd, (&held[0]) as u64) {
+        var i: usize = 0
+        while i < (*p).nkeys {
+            let down: bool = evdev.bit_test((&held[0]) as u64, (*p).key_code[i])
+            if down { (*p).key_down[i] = 1 as u8 } else { (*p).key_down[i] = 0 as u8 }
+            i = i + 1
+        }
+    }
+    var info: [i32; 6] = [0 as i32; 6]
+    var c: u32 = 0 as u32
+    while c < 64 as u32 {
+        if padcore.pad_has_abs(p, c) && evdev.ev_absinfo(fd, c, (&info[0]) as u64) {
+            (*p).abs_val[c as usize] = info[0]
+        }
+        c = c + 1 as u32
+    }
+    padcore.pad_update(p)
+}
+
+// read everything pending from slot i and feed it. A vanished device is detached.
+fn sys_read_slot(s: *mut padset.PadSet, i: usize) {
+    if !padset.padset_active(s, i) {
+        return
+    }
+    let fd: i64 = padset.padset_fd(s, i)
+    let kind: u8 = padset.padset_kind(s, i)
+    // 4080 = 170 x 24 = 510 x 8: reads end on an event boundary (the kernel gives whole events; so does a pipe of whole writes)
+    let buf: u64 = rt.heap_alloc(4096)
+    var rounds: usize = 0
+    var running: bool = true
+    while running && rounds < 16 {
+        let r: i64 = evdev.ev_read(fd, buf, 4080)
+        if r == evdev.ERR_AGAIN {
+            running = false
+        } else if r <= 0 {
+            // end of file / ENODEV / any other error: the device is gone
+            evdev.ev_close(fd)
+            padset.padset_detach(s, i)
+            running = false
+        } else {
+            var lost: bool = false
+            if kind == padset.KIND_JOYDEV {
+                padcore.pad_feed_joydev(&(*s).pad[i], buf, r as usize)
+            } else {
+                // SYN_DROPPED anywhere in the chunk?
+                var o: usize = 0
+                while o + 24 <= r as usize {
+                    if rt.ld16(buf + o as u64, 8) == 0 as u16 && rt.ld16(buf + o as u64, 9) == 3 as u16 {
+                        lost = true
+                    }
+                    o = o + 24
+                }
+                padcore.pad_feed_evdev(&(*s).pad[i], buf, r as usize)
+            }
+            if lost {
+                resync(fd, &(*s).pad[i])
+            }
+        }
+        rounds = rounds + 1
+    }
+    rt.heap_free(buf, 4096)
+}
+
+// one poll: hot-plug check, then read every open device
+fn sys_poll(s: *mut padset.PadSet) {
+    if (*s).ino >= 0 {
+        if evdev.inotify_drain((*s).ino) {
+            (*s).settle = SETTLE
+            sys_scan(s)
+        }
+    } else {
+        (*s).idle = (*s).idle + 1
+        if (*s).idle >= RESCAN_EVERY {
+            sys_scan(s)
+        }
+    }
+    if (*s).settle > 0 {
+        (*s).settle = (*s).settle - 1
+        if (*s).settle == 0 {
+            sys_scan(s)
+        }
+    }
+    var i: usize = 0
+    while i < padset.MAXPADS {
+        sys_read_slot(s, i)
+        i = i + 1
+    }
+}

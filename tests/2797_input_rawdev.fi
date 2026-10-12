@@ -1,0 +1,153 @@
+// expect_exit: 0
+// tests/2797_input_rawdev.fi -- lib/input/rawdev.fi + raw.raw_feed_ev: keyboard and mouse straight from evdev bytes
+// (a pipe carries the fake input_event stream): keys, repeat (value 2) dropped, mouse buttons, relative motion, wheel,
+// a quick tap inside one frame, unplug; 2000 random frames against a model.
+import std.rt
+import input.raw
+import input.rawdev
+import input.padcore
+
+static mut SEED: u64 = 31337
+
+fn rnd() -> u64 {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return SEED / 65536
+}
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+static mut T: u64 = 0
+
+fn put_ev(buf: u64, i: usize, t: u32, c: u32, v: i32) {
+    let q: u64 = buf + (i * 24) as u64
+    T = T + 1000 as u64
+    rt.st64(q, 0, T / 1000000 as u64)
+    rt.st64(q, 1, T % 1000000 as u64)
+    rt.st16(q, 8, t as u16)
+    rt.st16(q, 9, c as u16)
+    rt.st32(q, 5, padcore.u32_of_i32(v))
+}
+
+fn send(fd: i64, p: u64, n: usize) {
+    check(syscall(1, fd, p as i64, n as i64, 0, 0, 0) == n as i64, 80)
+}
+
+fn main() -> i32 {
+    var fds: [i32; 2] = [0 as i32; 2]
+    check(syscall(293, (&fds[0]) as i64, 2048, 0, 0, 0, 0) == 0, 1)
+    var d: rawdev.RawDev = rawdev.rawdev_new()
+    check(rawdev.rawdev_attach(&d, fds[0] as i64, 5 as u32) && rawdev.rawdev_count(&d) == 1, 2)
+    var r: raw.Raw = raw.raw_new()
+    var b: [u8; 480] = [0 as u8; 480]
+    let bp: u64 = (&b[0]) as u64
+
+    // frame 1: W down, repeat, mouse move + left button + wheel
+    raw.raw_begin(&r)
+    put_ev(bp, 0, 1 as u32, 17 as u32, 1 as i32)
+    put_ev(bp, 1, 1 as u32, 17 as u32, 2 as i32) // auto-repeat: ignored
+    put_ev(bp, 2, 2 as u32, 0 as u32, 5 as i32)
+    put_ev(bp, 3, 2 as u32, 1 as u32, 0 - 3)
+    put_ev(bp, 4, 1 as u32, 272 as u32, 1 as i32)
+    put_ev(bp, 5, 2 as u32, 8 as u32, 2 as i32)
+    put_ev(bp, 6, 0 as u32, 0 as u32, 0 as i32)
+    send(fds[1] as i64, bp, 7 * 24)
+    rawdev.rawdev_pump(&d, &r)
+    raw.raw_end(&r)
+    check(raw.key_pressed(&r, raw.KEY_W) && raw.key_down(&r, raw.KEY_W), 3)
+    check(raw.mouse_dx(&r) == 5 && raw.mouse_dy(&r) == 0 - 3 && raw.wheel_y(&r) == 2, 4)
+    check(raw.mouse_pressed(&r, raw.MB_LEFT) && raw.mouse_down(&r, raw.MB_LEFT) && !raw.mouse_down(&r, raw.MB_RIGHT), 5)
+    // frame 2: W up, right button down, tap of A inside one frame
+    raw.raw_begin(&r)
+    put_ev(bp, 0, 1 as u32, 17 as u32, 0 as i32)
+    put_ev(bp, 1, 1 as u32, 273 as u32, 1 as i32)
+    put_ev(bp, 2, 1 as u32, 30 as u32, 1 as i32)
+    put_ev(bp, 3, 1 as u32, 30 as u32, 0 as i32)
+    put_ev(bp, 4, 1 as u32, 272 as u32, 0 as i32)
+    put_ev(bp, 5, 0 as u32, 0 as u32, 0 as i32)
+    send(fds[1] as i64, bp, 6 * 24)
+    rawdev.rawdev_pump(&d, &r)
+    raw.raw_end(&r)
+    check(raw.key_released(&r, raw.KEY_W) && !raw.key_down(&r, raw.KEY_W), 6)
+    check(raw.key_pressed(&r, raw.KEY_A) && raw.key_released(&r, raw.KEY_A) && !raw.key_down(&r, raw.KEY_A), 7)
+    check(raw.mouse_released(&r, raw.MB_LEFT) && raw.mouse_down(&r, raw.MB_RIGHT) && raw.mouse_dx(&r) == 0, 8)
+    // a button/key event of a code that is none of ours changes nothing
+    raw.raw_begin(&r)
+    put_ev(bp, 0, 1 as u32, 400 as u32, 1 as i32)
+    put_ev(bp, 1, 1 as u32, 275 as u32, 1 as i32) // BTN_SIDE
+    put_ev(bp, 2, 2 as u32, 11 as u32, 120 as i32) // REL_WHEEL_HI_RES
+    send(fds[1] as i64, bp, 3 * 24)
+    rawdev.rawdev_pump(&d, &r)
+    raw.raw_end(&r)
+    check(raw.wheel_y(&r) == 0 && !raw.mouse_down(&r, 3 as u32), 9)
+
+    // 2000 random frames against a model
+    var mkey: [u8; 256] = [0 as u8; 256]
+    var mrel: [i64; 2] = [0; 2]
+    var f: usize = 0
+    while f < 2000 {
+        raw.raw_begin(&r)
+        let cnt: usize = (rnd() % 12) as usize
+        var i: usize = 0
+        var pressed_w: u8 = 0 as u8
+        var dx: i64 = 0
+        var dy: i64 = 0
+        var wy: i64 = 0
+        var npress: [u8; 8] = [0 as u8; 8]
+        while i < cnt {
+            let k: u64 = rnd() % 8
+            if k < 3 {
+                let sc: u32 = 16 as u32 + (rnd() % 8) as u32
+                let v: i32 = (rnd() % 3) as i32
+                put_ev(bp, i, 1 as u32, sc, v)
+                if v == 1 as i32 {
+                    if mkey[sc as usize] == 0 as u8 && sc < 24 as u32 { npress[(sc - 16 as u32) as usize] = 1 as u8 }
+                    mkey[sc as usize] = 1 as u8
+                }
+                if v == 0 as i32 { mkey[sc as usize] = 0 as u8 }
+            } else if k < 6 {
+                let v: i32 = (rnd() % 21) as i32 - 10
+                var rc: u32 = 1 as u32
+                if k == 3 { dx = dx + v as i64
+                    rc = 0 as u32 }
+                else { dy = dy + v as i64 }
+                put_ev(bp, i, 2 as u32, rc, v)
+            } else {
+                let v: i32 = (rnd() % 5) as i32 - 2
+                wy = wy + v as i64
+                put_ev(bp, i, 2 as u32, 8 as u32, v)
+            }
+            i = i + 1
+        }
+        if cnt > 0 {
+            send(fds[1] as i64, bp, cnt * 24)
+        }
+        rawdev.rawdev_pump(&d, &r)
+        raw.raw_end(&r)
+        check(raw.mouse_dx(&r) == dx && raw.mouse_dy(&r) == dy && raw.wheel_y(&r) == wy, 20)
+        i = 0
+        while i < 8 {
+            let sc: u32 = 16 as u32 + i as u32
+            check(raw.key_down(&r, sc) == (mkey[sc as usize] != 0 as u8), 21)
+            i = i + 1
+        }
+        f = f + 1
+    }
+    // unplug: EOF removes the source
+    syscall(3, fds[1] as i64, 0, 0, 0, 0, 0)
+    raw.raw_begin(&r)
+    rawdev.rawdev_pump(&d, &r)
+    raw.raw_end(&r)
+    check(rawdev.rawdev_count(&d) == 0, 30)
+    syscall(3, fds[0] as i64, 0, 0, 0, 0, 0)
+    // the real scan: no /dev/input here -> opens nothing, does not crash
+    var live: rawdev.RawDev = rawdev.rawdev_new()
+    rawdev.rawdev_open(&live)
+    raw.raw_begin(&r)
+    rawdev.rawdev_pump(&live, &r)
+    rawdev.rawdev_close(&live)
+    return 0
+}

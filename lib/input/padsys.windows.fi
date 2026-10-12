@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/input/padsys.windows.fi -- input.padsys on WINDOWS: XInput (xinput1_4.dll, then 1_3, then 9_1_0) through
+// std.dynlib (LoadLibraryA + the Win64 call gate). The compiler takes this file instead of padsys.fi for
+// x86_64-windows. Same surface as the Linux twin. Up to 4 pads (XInput's limit).
+// BUILT ONLY: neither run on real Windows nor under Wine yet (Wine ships XInput, but no pad is plugged in).
+// Pads that are not XInput (DirectInput / HID only) are not seen -- roadmap.
+import std.rt
+import std.dynlib
+import input.padcore
+import input.padset
+
+export { sys_open, sys_scan, sys_poll, sys_read_slot, sys_close, sys_name }
+
+fn sys_name() -> str { return "XInput" }
+
+fn try_dll(name: str) -> u64 {
+    return dynlib.open(name)
+}
+
+fn sys_open(s: *mut padset.PadSet) -> bool {
+    var h: u64 = try_dll("xinput1_4.dll")
+    if h == 0 as u64 { h = try_dll("xinput1_3.dll") }
+    if h == 0 as u64 { h = try_dll("xinput9_1_0.dll") }
+    if h == 0 as u64 {
+        return false
+    }
+    (*s).xdll = h
+    (*s).xget = dynlib.sym(h, "XInputGetState")
+    if (*s).xget == 0 as u64 {
+        return false
+    }
+    sys_scan(s)
+    return true
+}
+
+fn sys_close(s: *mut padset.PadSet) {
+    var i: usize = 0
+    while i < padset.MAXPADS {
+        if padset.padset_active(s, i) {
+            padset.padset_detach(s, i)
+        }
+        i = i + 1
+    }
+    if (*s).xdll != 0 as u64 {
+        dynlib.close((*s).xdll)
+        (*s).xdll = 0 as u64
+        (*s).xget = 0 as u64
+    }
+}
+
+// XINPUT_STATE: u32 packet, u16 buttons, u8 lt, u8 rt, i16 lx ly rx ry = 16 octets; 0 = ERROR_SUCCESS
+fn query(s: *mut padset.PadSet, user: u32, st: u64) -> bool {
+    if (*s).xget == 0 as u64 {
+        return false
+    }
+    return dynlib.ci2((*s).xget, user as u64, st) == 0 as u64
+}
+
+fn sys_scan(s: *mut padset.PadSet) {
+    if (*s).xget == 0 as u64 {
+        return
+    }
+    var st: [u64; 2] = [0 as u64; 2]
+    var u: u32 = 0 as u32
+    while u < 4 as u32 {
+        if padset.padset_find_node(s, padset.KIND_XINPUT, u) < 0 && query(s, u, (&st[0]) as u64) {
+            let slot: i64 = padset.padset_attach(s, padset.KIND_XINPUT, 0 - 1, u)
+            if slot >= 0 {
+                var nm: [u8; 8] = "XInput\0\0"
+                padcore.pad_set_name(&(*s).pad[slot as usize], (&nm[0]) as u64, 6)
+                (*s).pad[slot as usize].direct = true
+            }
+        }
+        u = u + 1 as u32
+    }
+}
+
+fn sys_read_slot(s: *mut padset.PadSet, i: usize) {
+    if !padset.padset_active(s, i) {
+        return
+    }
+    var st: [u64; 2] = [0 as u64; 2]
+    let q: u64 = (&st[0]) as u64
+    if !query(s, (*s).node[i], q) {
+        padset.padset_detach(s, i)
+        return
+    }
+    padcore.pad_feed_xinput(&(*s).pad[i], rt.ld16(q, 2) as u32, rt.ld8(q, 6) as u32, rt.ld8(q, 7) as u32,
+        padcore.s16(rt.ld16(q, 4)), padcore.s16(rt.ld16(q, 5)), padcore.s16(rt.ld16(q, 6)), padcore.s16(rt.ld16(q, 7)))
+}
+
+fn sys_poll(s: *mut padset.PadSet) {
+    (*s).idle = (*s).idle + 1
+    if (*s).idle >= 60 { // XInput has no notification: look for new pads once in a while (a poll of a missing pad is slow)
+        (*s).idle = 0
+        sys_scan(s)
+    }
+    var i: usize = 0
+    while i < padset.MAXPADS {
+        sys_read_slot(s, i)
+        i = i + 1
+    }
+}
