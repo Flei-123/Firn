@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/ton/vorbis_file.fi -- whole Ogg Vorbis file in memory -> interleaved PCM.
+//
+//     import ton.vorbis_file
+//
+//     var pcm: rt.Buf = rt.buf_new()
+//     var info: vorbis_file.VfInfo = vorbis_file.vf_info()
+//     let st: i32 = vorbis_file.vf_decode_f32(data, len, &pcm, &info)   // 0 = ok, < 0 = error
+//     // pcm: info.frames * info.channels f32 values, -1.0 .. 1.0
+//
+// The final frame count is trimmed to the granule position of the last page
+// (the encoder's true length). Only the first logical stream is decoded.
+// A damaged packet is skipped (counted in info.bad_packets); the decode goes on.
+// ERROR CODES: -1 not Ogg Vorbis / headers damaged, -4 out of memory.
+import std.rt
+import ton.ogg
+import ton.vorbis
+
+export {
+    VfInfo, vf_info, vf_decode_f32, vf_decode_i16,
+}
+
+struct VfInfo {
+    rate: i32,
+    channels: i32,
+    frames: i64,
+    bad_packets: i32,
+}
+
+fn vf_info() -> VfInfo {
+    return VfInfo { rate: 0, channels: 0, frames: 0, bad_packets: 0 }
+}
+
+// out: f32 (as_i16 false) or i16 (as_i16 true) interleaved samples.
+fn vf_run(data: u64, len: usize, out: *mut rt.Buf, info: *mut VfInfo, as_i16: bool) -> i32 {
+    var rd: ogg.OggReader = ogg.ogg_new(data, len)
+    let v: *mut vorbis.Vorbis = vorbis.vorbis_new()
+    if v as u64 == 0 {
+        ogg.ogg_free(&rd)
+        return -4
+    }
+    var header: i32 = 0
+    var bad: i32 = 0
+    var frames: i64 = 0
+    var last_granule: i64 = -1
+    var scratch: u64 = 0
+    var scratch_n: usize = 0
+    var status: i32 = 0
+    let unit: usize = if as_i16 { 2 } else { 4 }
+    while status == 0 && ogg.ogg_next(&rd) == 1 {
+        if rd.granule >= 0 {
+            last_granule = rd.granule
+        }
+        if header < 3 {
+            if vorbis.vorbis_header(v, ogg.ogg_pkt_ptr(&rd), ogg.ogg_pkt_len(&rd)) != 0 {
+                status = -1
+            } else {
+                header = header + 1
+                if header == 3 {
+                    (*info).rate = vorbis.vorbis_rate(v)
+                    (*info).channels = vorbis.vorbis_channels(v)
+                    scratch_n = 8192 * ((*info).channels as usize) * unit
+                    scratch = rt.heap_alloc(scratch_n)
+                    if scratch == 0 {
+                        status = -4
+                    }
+                }
+            }
+        } else {
+            let n: i32 = vorbis.vorbis_decode(v, ogg.ogg_pkt_ptr(&rd), ogg.ogg_pkt_len(&rd))
+            if n < 0 {
+                bad = bad + 1
+            } else if n > 0 {
+                if as_i16 {
+                    vorbis.vorbis_to_i16(v, n, scratch)
+                } else {
+                    vorbis.vorbis_to_f32(v, n, scratch)
+                }
+                rt.buf_push_bytes(out, scratch, (n as usize) * ((*info).channels as usize) * unit)
+                frames = frames + (n as i64)
+            }
+        }
+    }
+    if status == 0 && header < 3 {
+        status = -1
+    }
+    if status == 0 && last_granule >= 0 && last_granule < frames {
+        frames = last_granule
+        rt.buf_set_len(out, (frames as usize) * ((*info).channels as usize) * unit)
+    }
+    (*info).frames = frames
+    (*info).bad_packets = bad
+    if scratch != 0 {
+        rt.heap_free(scratch, scratch_n)
+    }
+    vorbis.vorbis_free(v)
+    ogg.ogg_free(&rd)
+    return status
+}
+
+fn vf_decode_f32(data: u64, len: usize, out: *mut rt.Buf, info: *mut VfInfo) -> i32 {
+    return vf_run(data, len, out, info, false)
+}
+
+fn vf_decode_i16(data: u64, len: usize, out: *mut rt.Buf, info: *mut VfInfo) -> i32 {
+    return vf_run(data, len, out, info, true)
+}
