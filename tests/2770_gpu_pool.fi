@@ -1,0 +1,166 @@
+// expect_exit: 0
+// tests/2770_gpu_pool.fi -- lib/gpu/glpool.fi (range allocator behind the GL vertex / index pools, docs/mc/gpu-world.md):
+// random alloc / free against a shadow bitmap (no overlap, alignment, used counter), coalescing back to ONE range,
+// best fit, out-of-space = NONE, range array growth, free_all.
+import std.rt
+import gpu.glpool
+
+const CAP: usize = 4096
+const ALIGN: usize = 8
+const MAXB: usize = 256
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+static mut seed: u64 = 88172645463325252
+
+fn rnd() -> u64 {
+    seed = seed ^ (seed << 13 as u64)
+    seed = seed ^ (seed >> 7 as u64)
+    seed = seed ^ (seed << 17 as u64)
+    return seed
+}
+
+fn rup(n: usize) -> usize {
+    return ((n + ALIGN - 1) / ALIGN) * ALIGN
+}
+
+// marks [off, off+len) in the shadow (1 byte per unit); false when a unit was already taken / free
+fn mark(sh: u64, off: usize, len: usize, v: u8) -> bool {
+    var i: usize = 0
+    var ok: bool = true
+    while i < len {
+        if rt.ld8(sh, off + i) == v {
+            ok = false
+        }
+        rt.st8(sh, off + i, v)
+        i = i + 1
+    }
+    return ok
+}
+
+fn main() -> i32 {
+    let p: u64 = glpool.pool_new(CAP, ALIGN)
+    check(p != 0, 1)
+    check(glpool.pool_cap(p) == CAP && glpool.pool_used(p) == 0 && glpool.pool_ranges(p) == 1, 2)
+    let sh: u64 = rt.heap_alloc(CAP)
+    rt.mem_set(sh, 0 as u8, CAP)
+    let boff: u64 = rt.heap_alloc(MAXB * 8)
+    let blen: u64 = rt.heap_alloc(MAXB * 8)
+    var i: usize = 0
+    while i < MAXB {
+        rt.st64(boff, i, 0 as u64)
+        rt.st64(blen, i, 0 as u64)
+        i = i + 1
+    }
+    var live: usize = 0
+    var used: usize = 0
+    var fails: usize = 0
+    var step: usize = 0
+    while step < 20000 {
+        step = step + 1
+        let k: usize = (rnd() % (MAXB as u64)) as usize
+        let len: usize = rt.ld64(blen, k) as usize
+        if len == 0 {
+            let n: usize = 1 + ((rnd() % 200 as u64) as usize)
+            let off: usize = glpool.pool_alloc(p, n)
+            if off == glpool.NONE {
+                fails = fails + 1
+                // must be a real failure: no free range can hold it
+                check(glpool.pool_largest(p) < rup(n), 3)
+            } else {
+                check(off % ALIGN == 0, 4)
+                check(off + rup(n) <= CAP, 5)
+                check(mark(sh, off, rup(n), 1 as u8), 6) // overlap with a live block
+                rt.st64(boff, k, off as u64)
+                rt.st64(blen, k, n as u64)
+                live = live + 1
+                used = used + rup(n)
+            }
+        } else {
+            let off: usize = rt.ld64(boff, k) as usize
+            check(mark(sh, off, rup(len), 0 as u8), 7)
+            check(glpool.pool_free(p, off, len), 8)
+            rt.st64(blen, k, 0 as u64)
+            live = live - 1
+            used = used - rup(len)
+        }
+        check(glpool.pool_used(p) == used, 9)
+        check(glpool.pool_used(p) + glpool.pool_free_total(p) == CAP, 10)
+    }
+    check(fails > 0, 11) // the pool really ran full during the test
+    // free the rest: everything coalesces to ONE range
+    i = 0
+    while i < MAXB {
+        let len: usize = rt.ld64(blen, i) as usize
+        if len != 0 {
+            check(glpool.pool_free(p, rt.ld64(boff, i) as usize, len), 12)
+        }
+        i = i + 1
+    }
+    check(glpool.pool_used(p) == 0 && glpool.pool_ranges(p) == 1 && glpool.pool_largest(p) == CAP, 13)
+    check(glpool.pool_frag_permille(p) == 0, 14)
+
+    // fragmentation: 64 blocks of 64, free every second one -> 32 holes of 64, a 65 does not fit, a 64 does
+    var offs: [usize; 64] = [0; 64]
+    i = 0
+    while i < 64 {
+        offs[i] = glpool.pool_alloc(p, 64)
+        check(offs[i] == i * 64, 15)
+        i = i + 1
+    }
+    check(glpool.pool_alloc(p, 8) == glpool.NONE, 16) // full
+    i = 0
+    while i < 64 {
+        check(glpool.pool_free(p, offs[i], 64), 17)
+        i = i + 2
+    }
+    check(glpool.pool_ranges(p) == 32 && glpool.pool_free_total(p) == 2048 && glpool.pool_largest(p) == 64, 18)
+    check(glpool.pool_frag_permille(p) > 900, 19)
+    check(glpool.pool_alloc(p, 65) == glpool.NONE, 20)
+    check(glpool.pool_alloc(p, 64) == 0, 21)
+    check(glpool.pool_free(p, 0, 64), 22)
+    // best fit: holes 8 and 24 (units) next to each other with a live block between
+    glpool.pool_free_all(p)
+    let a0: usize = glpool.pool_alloc(p, 24)
+    let a1: usize = glpool.pool_alloc(p, 8)
+    let a2: usize = glpool.pool_alloc(p, 8)
+    let a3: usize = glpool.pool_alloc(p, 8)
+    check(a0 == 0 && a1 == 24 && a2 == 32 && a3 == 40, 23)
+    check(glpool.pool_free(p, a0, 24), 24)
+    check(glpool.pool_free(p, a2, 8), 25)
+    // holes: [0,24) and [32,40) and the tail -> a request of 8 takes the 8-hole (best fit), not the 24-hole
+    check(glpool.pool_alloc(p, 8) == 32, 26)
+    check(glpool.pool_alloc(p, 16) == 0, 27) // then the 24 hole is the smallest that fits 16
+    // range array growth: more than 64 holes
+    glpool.pool_free_all(p)
+    var q: [usize; 400] = [0; 400]
+    i = 0
+    while i < 400 {
+        q[i] = glpool.pool_alloc(p, 8)
+        i = i + 1
+    }
+    check(q[399] == 399 * 8, 28)
+    i = 0
+    while i < 400 {
+        check(glpool.pool_free(p, q[i], 8), 29)
+        i = i + 2
+    }
+    check(glpool.pool_ranges(p) >= 200, 30)
+    i = 1
+    while i < 400 {
+        check(glpool.pool_free(p, q[i], 8), 31)
+        i = i + 2
+    }
+    check(glpool.pool_ranges(p) == 1 && glpool.pool_used(p) == 0, 32)
+    // free outside the pool is refused
+    check(!glpool.pool_free(p, CAP, 8), 33)
+    glpool.pool_destroy(p)
+    rt.heap_free(sh, CAP)
+    rt.heap_free(boff, MAXB * 8)
+    rt.heap_free(blen, MAXB * 8)
+    return 0
+}

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-// lib/gpu/gl_mc.fi -- gpu.gl_mc: the OpenGL 3.3 back end of the voxel client (docs/GPU.md, docs/MC-RENDER.md 4).
+// lib/gpu/gl_mc.fi -- gpu.gl_mc: the OpenGL 3.3 back end of the voxel client (docs/GPU.md, docs/mc/gpu-world.md).
 //
 //     import gpu.gl_mc
 //     var gb: gl_mc.GlBackend = gl_mc.glbe_open(640, 360)        // EGL / wgl context + FBO + program
@@ -16,8 +16,20 @@
 // Rendering goes into an FBO (RGBA8 colour texture + D24); `present` reads it back top-down, so a window layer
 // shows the frame exactly like the CPU rasterizer's colour buffer (variant b of docs/FFI.md: Firn window + PutImage).
 // Shaders: lib/gpu/mc_vs.glsl + mc_fs.glsl (embedded). Camera: u_rv = projection * view rotation (no translation,
-// f64 -> f32), u_origin = section origin - camera position computed in f64 on the CPU (small f32 values, no jitter
+// f64 -> f32), the section origin minus the camera position is computed in f64 on the CPU (small f32 values, no jitter
 // far from the world origin). Call from the thread that made the context (docs/FFI.md).
+//
+// MESH STORAGE / DRAW MODES (glbe_set_mode, before the first upload; default MODE_MULTI):
+//   MODE_LEGACY   one VAO + VBO + IBO per section, one glDrawElements per section (the old path, kept as fallback + baseline)
+//   MODE_POOL     sections are blocks inside a few big VBO / IBO "pages" (glpool.fi free lists), one
+//                 glDrawElementsBaseVertex per section
+//   MODE_MULTI    like POOL but all sections of a page in ONE glMultiDrawElementsBaseVertex (the section origin comes from
+//                 a buffer texture, see mc_vs.glsl); the draws are collected by `draw` and submitted by `end`
+//   MODE_INDIRECT like MULTI with glMultiDrawElementsIndirect (GL >= 4.3, otherwise MULTI)
+// Upload: immediate, or with glbe_set_upload_budget(bytes) the mesh data is staged on the CPU and `begin` uploads at most
+// `bytes` per frame (a staged section is not drawn until uploaded). glbe_defrag compacts fragmented pages.
+// Textures: a texture array (layer = tile - 1). Default NEAREST without mips = the raster's texel fetch;
+// glbe_set_filter(mip, aniso) switches to mipmaps + anisotropic filtering.
 
 import std.rt
 import mc.mc_backend
@@ -26,17 +38,60 @@ import mc.mc_texture
 import mc.mc_math
 import gpu.glctx
 import gpu.gl33
+import gpu.glpool
 
 export {
     GlBackend, glbe_open, glbe_open_with, glbe_close, glbe_backend, glbe_set_fog, glbe_set_cull,
     glbe_gl, glbe_renderer, glbe_draws, glbe_tris,
+    MODE_LEGACY, MODE_POOL, MODE_MULTI, MODE_INDIRECT,
+    glbe_set_mode, glbe_mode, glbe_set_page_verts, glbe_set_upload_budget, glbe_set_filter, glbe_defrag,
+    glbe_calls, glbe_upload_bytes, glbe_frame_upload_bytes, glbe_staged, glbe_pages, glbe_pool_used_bytes,
+    glbe_pool_cap_bytes, glbe_pool_frag_permille, glbe_defrags, glbe_reset_stats, glbe_flush_uploads,
 }
 
 const VS_SRC: str = __include_str("mc_vs.glsl")
 const FS_SRC: str = __include_str("mc_fs.glsl")
 
-// mesh slot: vao, vbo, ibo, nidx, used, key
-const SLOT_WORDS: usize = 6
+const MODE_LEGACY: i32 = 0
+const MODE_POOL: i32 = 1
+const MODE_MULTI: i32 = 2
+const MODE_INDIRECT: i32 = 3
+
+const GRAN: usize = 64 // vertices per granule of a page (the section lookup table of the shader, mc_vs.glsl)
+const DEFAULT_PAGE_VERTS: usize = 1048576 // 8 MB of vertices + 6 MB of indices per page
+const NONE: usize = 0xFFFFFFFFFFFFFFFF as usize
+
+// mesh slot (words): vao, vbo, ibo (legacy only), nidx, used, key, page, voff, ioff, nverts, staged, stage_v, stage_i, scratch, stamp
+const SLOT_WORDS: usize = 15
+const S_VAO: usize = 0
+const S_VBO: usize = 1
+const S_IBO: usize = 2
+const S_NIDX: usize = 3
+const S_USED: usize = 4
+const S_KEY: usize = 5
+const S_PAGE: usize = 6
+const S_VOFF: usize = 7
+const S_IOFF: usize = 8
+const S_NV: usize = 9
+const S_STAGED: usize = 10
+const S_SV: usize = 11
+const S_SI: usize = 12
+const S_OLDI: usize = 13 // defrag scratch: old index offset
+const S_STAMP: usize = 14 // batch number of the last collected draw (a slot drawn twice in one batch splits the batch)
+
+// page (words): vbo, ibo, vao, vertex pool, index pool, granule buffer, granule texture, granule CPU copy, vcap, icap, live
+const PAGE_WORDS: usize = 12
+const P_VBO: usize = 0
+const P_IBO: usize = 1
+const P_VAO: usize = 2
+const P_VPOOL: usize = 3
+const P_IPOOL: usize = 4
+const P_GBUF: usize = 5
+const P_GTEX: usize = 6
+const P_GCPU: usize = 7
+const P_VCAP: usize = 8
+const P_ICAP: usize = 9
+const P_LIVE: usize = 10
 
 struct GlBackend {
     ok: bool,
@@ -45,13 +100,17 @@ struct GlBackend {
     g: gl33.Gl,
     fbo: gl33.Fbo,
     prog: u32,
-    atlas_tex: u32,
+    atlas_tex: u32, // texture array, layer = tile - 1
     l_rv: i32,
     l_origin: i32,
     l_atlas: i32,
     l_tiles: i32,
     l_fog: i32,
     l_fogc: i32,
+    l_pool: i32,
+    l_gran: i32,
+    l_org: i32,
+    l_filter: i32,
     w: i32,
     h: i32,
     atile: i32,
@@ -72,18 +131,54 @@ struct GlBackend {
     pix: u64, // w*h*4, the read back frame
     tmp: u64, // w*h*4 scratch of the flip
     fresh: bool, // pix holds the current frame
-    draws: u64,
+    draws: u64, // logical section draws
     tris: u64,
+    calls: u64, // GL draw calls really issued
     log: [u8; 512], // shader / link log of a failed open
+    // ---- pool
+    mode: i32,
+    page_verts: usize,
+    pages: u64,
+    npages: usize,
+    page_cap: usize,
+    cur_vao: u32,
+    defrags: u64,
+    // ---- multi draw: origins per slot (buffer texture) + the draws of the frame
+    org_cpu: u64, // f32 x 4 per slot
+    org_buf: u32,
+    org_tex: u32,
+    org_cap: usize,
+    org_max: usize,
+    pend: u64, // slot index per collected draw
+    pend_n: usize,
+    pend_cap: usize,
+    sc_counts: u64, // scratch: i32 per draw
+    sc_offs: u64, // scratch: u64 per draw (byte offset into the index buffer)
+    sc_bv: u64, // scratch: i32 per draw (base vertex); indirect: 5 x u32 per draw
+    ind_buf: u32,
+    batch: u64, // batch counter (see S_STAMP)
+    // ---- textures
+    mip: bool,
+    aniso: f64,
+    // ---- upload
+    budget: usize, // bytes per frame, 0 = immediate
+    staged: usize,
+    up_bytes: u64,
+    frame_up: u64,
 }
 
 fn empty(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
     return GlBackend { ok: false, step: 0, ctx: c, g: gl33.gl_new(),
         fbo: gl33.Fbo { fbo: 0 as u32, color: 0 as u32, depth: 0 as u32, w: w, h: h },
         prog: 0 as u32, atlas_tex: 0 as u32, l_rv: 0 - 1, l_origin: 0 - 1, l_atlas: 0 - 1, l_tiles: 0 - 1, l_fog: 0 - 1,
-        l_fogc: 0 - 1, w: w, h: h, atile: 16, acols: 16, cx: 0.0, cy: 0.0, cz: 0.0, rv: [0.0 as f32; 16],
+        l_fogc: 0 - 1, l_pool: 0 - 1, l_gran: 0 - 1, l_org: 0 - 1, l_filter: 0 - 1,
+        w: w, h: h, atile: 16, acols: 16, cx: 0.0, cy: 0.0, cz: 0.0, rv: [0.0 as f32; 16],
         fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0.0, fog_g: 0.0, fog_b: 0.0, cull: true,
-        slots: 0, slot_cap: 0, pix: 0, tmp: 0, fresh: false, draws: 0, tris: 0, log: [0; 512] }
+        slots: 0, slot_cap: 0, pix: 0, tmp: 0, fresh: false, draws: 0, tris: 0, calls: 0, log: [0; 512],
+        mode: MODE_MULTI, page_verts: DEFAULT_PAGE_VERTS, pages: 0, npages: 0, page_cap: 0, cur_vao: 0 as u32, defrags: 0,
+        org_cpu: 0, org_buf: 0 as u32, org_tex: 0 as u32, org_cap: 0, org_max: 0, pend: 0, pend_n: 0, pend_cap: 0,
+        sc_counts: 0, sc_offs: 0, sc_bv: 0, ind_buf: 0 as u32, batch: 1 as u64, mip: false, aniso: 1.0, budget: 0, staged: 0,
+        up_bytes: 0, frame_up: 0 }
 }
 
 // Opens a headless context (EGL surfaceless / pbuffer on Linux, a hidden window + wgl on Windows) of w x h and
@@ -115,6 +210,10 @@ fn glbe_open_with(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
     gb.l_tiles = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_tiles")
     gb.l_fog = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_fog")
     gb.l_fogc = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_fogc")
+    gb.l_pool = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_pool")
+    gb.l_gran = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_gran")
+    gb.l_org = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_org")
+    gb.l_filter = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_filter")
     gb.fbo = gl33.gl_fbo_new(&gb.g, w, h)
     if gb.fbo.fbo == 0 as u32 {
         gb.step = 4
@@ -148,7 +247,121 @@ fn glbe_tris(gb: *mut GlBackend) -> u64 {
     return (*gb).tris
 }
 
-// Linear fog like mc_raster.raster_set_fog (colour channels 0..255, distance along the view direction).
+// GL draw calls really issued (MODE_MULTI: one per page and frame; LEGACY / POOL: one per section).
+fn glbe_calls(gb: *mut GlBackend) -> u64 {
+    return (*gb).calls
+}
+
+fn glbe_upload_bytes(gb: *mut GlBackend) -> u64 {
+    return (*gb).up_bytes
+}
+
+// Bytes uploaded by the last begin / flush (the budget counter of the current frame).
+fn glbe_frame_upload_bytes(gb: *mut GlBackend) -> u64 {
+    return (*gb).frame_up
+}
+
+// Sections staged on the CPU, not yet uploaded (upload budget).
+fn glbe_staged(gb: *mut GlBackend) -> usize {
+    return (*gb).staged
+}
+
+fn glbe_pages(gb: *mut GlBackend) -> usize {
+    return (*gb).npages
+}
+
+fn glbe_defrags(gb: *mut GlBackend) -> u64 {
+    return (*gb).defrags
+}
+
+fn glbe_reset_stats(gb: *mut GlBackend) {
+    (*gb).draws = 0 as u64
+    (*gb).tris = 0 as u64
+    (*gb).calls = 0 as u64
+    (*gb).up_bytes = 0 as u64
+}
+
+fn glbe_mode(gb: *mut GlBackend) -> i32 {
+    return (*gb).mode
+}
+
+fn live_slots(gb: *mut GlBackend) -> usize {
+    var n: usize = 0
+    var s: usize = 0
+    while s < (*gb).slot_cap {
+        if rt.ld64((*gb).slots, s * SLOT_WORDS + S_USED) != 0 as u64 {
+            n = n + 1
+        }
+        s = s + 1
+    }
+    return n
+}
+
+// Chooses the storage / draw mode. Only allowed while no section is uploaded; MODE_INDIRECT needs GL >= 4.3 and becomes
+// MODE_MULTI otherwise. Returns the mode that is now active.
+fn glbe_set_mode(gb: *mut GlBackend, mode: i32) -> i32 {
+    if live_slots(gb) != 0 {
+        return (*gb).mode
+    }
+    var m: i32 = mode
+    if m < MODE_LEGACY {
+        m = MODE_LEGACY
+    }
+    if m > MODE_INDIRECT {
+        m = MODE_INDIRECT
+    }
+    if m == MODE_INDIRECT && !(*gb).g.has_indirect {
+        m = MODE_MULTI
+    }
+    (*gb).mode = m
+    return m
+}
+
+// Vertices per page (default 1048576 = 8 MB); before the first upload. Rounded down to a multiple of 64, minimum 4096.
+fn glbe_set_page_verts(gb: *mut GlBackend, n: usize) {
+    if (*gb).npages != 0 {
+        return
+    }
+    var v: usize = (n / GRAN) * GRAN
+    if v < 4096 {
+        v = 4096
+    }
+    (*gb).page_verts = v
+}
+
+// 0 = upload at once; else `begin` uploads at most this many bytes of staged sections per frame.
+fn glbe_set_upload_budget(gb: *mut GlBackend, bytes: usize) {
+    (*gb).budget = bytes
+}
+
+// mip = mipmaps (+ cut-out at alpha 0.5 on the filtered sample); aniso >= 2 = anisotropic filtering (limited by the
+// driver, gl.max_aniso). (false, 1.0) = the raster-exact texel fetch.
+fn glbe_set_filter(gb: *mut GlBackend, mip: bool, aniso: f64) {
+    (*gb).mip = mip
+    (*gb).aniso = aniso
+    if (*gb).atlas_tex != 0 as u32 {
+        apply_filter(gb)
+    }
+}
+
+fn filtered(gb: *mut GlBackend) -> bool {
+    return (*gb).mip || (*gb).aniso > 1.0
+}
+
+fn apply_filter(gb: *mut GlBackend) {
+    var minf: u32 = gl33.GL_NEAREST
+    var magf: u32 = gl33.GL_NEAREST
+    if (*gb).mip {
+        minf = gl33.GL_LINEAR_MIPMAP_LINEAR
+    } else if (*gb).aniso > 1.0 {
+        minf = gl33.GL_LINEAR
+    }
+    if (*gb).aniso > 1.0 {
+        magf = gl33.GL_LINEAR
+    }
+    gl33.gl_tex_array_filter(&(*gb).g, (*gb).atlas_tex, minf, magf, (*gb).aniso)
+}
+
 fn glbe_set_fog(gb: *mut GlBackend, on: bool, start: f64, end: f64, r: u32, g: u32, b: u32) {
     (*gb).fog_on = on
     (*gb).fog_start = start
@@ -169,6 +382,20 @@ fn glbe_close(gb: *mut GlBackend) {
             free_slot(gb, s + 1)
             s = s + 1
         }
+        var p: usize = 0
+        while p < (*gb).npages {
+            page_destroy(gb, p)
+            p = p + 1
+        }
+        if (*gb).org_buf != 0 as u32 {
+            gl33.gl_delete_buffer(&(*gb).g, (*gb).org_buf)
+        }
+        if (*gb).org_tex != 0 as u32 {
+            gl33.gl_delete_tex(&(*gb).g, (*gb).org_tex)
+        }
+        if (*gb).ind_buf != 0 as u32 {
+            gl33.gl_delete_buffer(&(*gb).g, (*gb).ind_buf)
+        }
         if (*gb).atlas_tex != 0 as u32 {
             gl33.gl_delete_tex(&(*gb).g, (*gb).atlas_tex)
         }
@@ -188,15 +415,347 @@ fn glbe_close(gb: *mut GlBackend) {
     if (*gb).slots != 0 {
         rt.heap_free((*gb).slots, (*gb).slot_cap * SLOT_WORDS * 8)
     }
+    if (*gb).pages != 0 {
+        rt.heap_free((*gb).pages, (*gb).page_cap * PAGE_WORDS * 8)
+    }
+    if (*gb).org_cpu != 0 {
+        rt.heap_free((*gb).org_cpu, (*gb).org_cap * 16)
+    }
+    if (*gb).pend != 0 {
+        rt.heap_free((*gb).pend, (*gb).pend_cap * 8)
+        rt.heap_free((*gb).sc_counts, (*gb).pend_cap * 4)
+        rt.heap_free((*gb).sc_offs, (*gb).pend_cap * 8)
+        rt.heap_free((*gb).sc_bv, (*gb).pend_cap * 20)
+    }
     (*gb).pix = 0
     (*gb).tmp = 0
     (*gb).slots = 0
     (*gb).slot_cap = 0
+    (*gb).pages = 0
+    (*gb).npages = 0
+    (*gb).org_cpu = 0
+    (*gb).pend = 0
     (*gb).ok = false
+}
+
+// ---- pages (pool storage) ---------------------------------------------------------------------------
+
+fn pw(gb: *mut GlBackend, p: usize, w: usize) -> u64 {
+    return rt.ld64((*gb).pages, p * PAGE_WORDS + w)
+}
+
+fn pset(gb: *mut GlBackend, p: usize, w: usize, v: u64) {
+    rt.st64((*gb).pages, p * PAGE_WORDS + w, v)
+}
+
+// (Re)points the page's VAO at its VBO / IBO.
+fn page_bind_vao(gb: *mut GlBackend, p: usize) {
+    let g: *mut gl33.Gl = &(*gb).g
+    gl33.gl_bind_vao(g, pw(gb, p, P_VAO) as u32)
+    gl33.gl_bind_buffer(g, gl33.GL_ARRAY_BUFFER, pw(gb, p, P_VBO) as u32)
+    gl33.gl_enable_attrib(g, 0 as u32)
+    gl33.gl_attrib_i(g, 0 as u32, 2, gl33.GL_UNSIGNED_INT, 8, 0)
+    gl33.gl_bind_buffer(g, gl33.GL_ELEMENT_ARRAY_BUFFER, pw(gb, p, P_IBO) as u32)
+    gl33.gl_bind_vao(g, 0 as u32)
+    (*gb).cur_vao = 0 as u32
+}
+
+// New empty page of vcap vertices and icap indices. Returns its number or NONE.
+fn page_new(gb: *mut GlBackend, vcap: usize, icap: usize) -> usize {
+    if (*gb).npages == (*gb).page_cap {
+        let ncap: usize = (*gb).page_cap * 2 + 4
+        let np: u64 = rt.heap_alloc(ncap * PAGE_WORDS * 8)
+        if np == 0 {
+            return NONE
+        }
+        var i: usize = 0
+        while i < ncap * PAGE_WORDS {
+            var v: u64 = 0
+            if i < (*gb).page_cap * PAGE_WORDS {
+                v = rt.ld64((*gb).pages, i)
+            }
+            rt.st64(np, i, v)
+            i = i + 1
+        }
+        if (*gb).pages != 0 {
+            rt.heap_free((*gb).pages, (*gb).page_cap * PAGE_WORDS * 8)
+        }
+        (*gb).pages = np
+        (*gb).page_cap = ncap
+    }
+    let p: usize = (*gb).npages
+    let vpool: u64 = glpool.pool_new(vcap, GRAN)
+    let ipool: u64 = glpool.pool_new(icap, 1)
+    let ng: usize = vcap / GRAN
+    let gcpu: u64 = rt.heap_alloc(ng * 4)
+    if vpool == 0 || ipool == 0 || gcpu == 0 {
+        return NONE
+    }
+    rt.mem_set(gcpu, 0 as u8, ng * 4)
+    let g: *mut gl33.Gl = &(*gb).g
+    let vbo: u32 = gl33.gl_gen_buffer(g)
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_WRITE_BUFFER, vbo)
+    gl33.gl_buffer_data(g, gl33.GL_COPY_WRITE_BUFFER, 0, vcap * 8, gl33.GL_STATIC_DRAW)
+    let ibo: u32 = gl33.gl_gen_buffer(g)
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_WRITE_BUFFER, ibo)
+    gl33.gl_buffer_data(g, gl33.GL_COPY_WRITE_BUFFER, 0, icap * 4, gl33.GL_STATIC_DRAW)
+    let gbuf: u32 = gl33.gl_gen_buffer(g)
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_WRITE_BUFFER, gbuf)
+    gl33.gl_buffer_data(g, gl33.GL_COPY_WRITE_BUFFER, gcpu, ng * 4, gl33.GL_DYNAMIC_DRAW)
+    let gtex: u32 = gl33.gl_gen_texture(g)
+    gl33.gl_tex_buffer(g, gtex, gl33.GL_R32UI, gbuf)
+    let vao: u32 = gl33.gl_gen_vao(g)
+    pset(gb, p, P_VBO, vbo as u64)
+    pset(gb, p, P_IBO, ibo as u64)
+    pset(gb, p, P_VAO, vao as u64)
+    pset(gb, p, P_VPOOL, vpool)
+    pset(gb, p, P_IPOOL, ipool)
+    pset(gb, p, P_GBUF, gbuf as u64)
+    pset(gb, p, P_GTEX, gtex as u64)
+    pset(gb, p, P_GCPU, gcpu)
+    pset(gb, p, P_VCAP, vcap as u64)
+    pset(gb, p, P_ICAP, icap as u64)
+    pset(gb, p, P_LIVE, 0 as u64)
+    page_bind_vao(gb, p)
+    (*gb).npages = p + 1
+    return p
+}
+
+fn page_destroy(gb: *mut GlBackend, p: usize) {
+    let g: *mut gl33.Gl = &(*gb).g
+    gl33.gl_delete_vao(g, pw(gb, p, P_VAO) as u32)
+    gl33.gl_delete_buffer(g, pw(gb, p, P_VBO) as u32)
+    gl33.gl_delete_buffer(g, pw(gb, p, P_IBO) as u32)
+    gl33.gl_delete_buffer(g, pw(gb, p, P_GBUF) as u32)
+    gl33.gl_delete_tex(g, pw(gb, p, P_GTEX) as u32)
+    glpool.pool_destroy(pw(gb, p, P_VPOOL))
+    glpool.pool_destroy(pw(gb, p, P_IPOOL))
+    rt.heap_free(pw(gb, p, P_GCPU), ((pw(gb, p, P_VCAP) as usize) / GRAN) * 4)
+}
+
+// Writes granules [first, first+n) of the CPU copy to the GL buffer.
+fn gran_upload(gb: *mut GlBackend, p: usize, first: usize, n: usize) {
+    let g: *mut gl33.Gl = &(*gb).g
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_WRITE_BUFFER, pw(gb, p, P_GBUF) as u32)
+    gl33.gl_buffer_sub_data(g, gl33.GL_COPY_WRITE_BUFFER, first * 4, n * 4, pw(gb, p, P_GCPU) + (first * 4) as u64)
+}
+
+fn gran_set(gb: *mut GlBackend, p: usize, voff: usize, nverts: usize, slot: usize) {
+    let first: usize = voff / GRAN
+    let n: usize = (nverts + GRAN - 1) / GRAN
+    var i: usize = 0
+    while i < n {
+        rt.st32(pw(gb, p, P_GCPU), first + i, slot as u32)
+        i = i + 1
+    }
+    gran_upload(gb, p, first, n)
+}
+
+// Tries to give slot `s` (nverts / nidx) a block in page p. Returns true and sets page / offsets.
+fn page_place(gb: *mut GlBackend, p: usize, s: usize, nverts: usize, nidx: usize) -> bool {
+    let vp: u64 = pw(gb, p, P_VPOOL)
+    let ip: u64 = pw(gb, p, P_IPOOL)
+    let vo: usize = glpool.pool_alloc(vp, nverts)
+    if vo == NONE {
+        return false
+    }
+    let io: usize = glpool.pool_alloc(ip, nidx)
+    if io == NONE {
+        glpool.pool_free(vp, vo, nverts)
+        return false
+    }
+    let b: usize = s * SLOT_WORDS
+    rt.st64((*gb).slots, b + S_PAGE, p as u64)
+    rt.st64((*gb).slots, b + S_VOFF, vo as u64)
+    rt.st64((*gb).slots, b + S_IOFF, io as u64)
+    rt.st64((*gb).slots, b + S_NV, nverts as u64)
+    pset(gb, p, P_LIVE, pw(gb, p, P_LIVE) + 1 as u64)
+    gran_set(gb, p, vo, nverts, s)
+    return true
+}
+
+// Compacts page p: new buffers, live blocks copied back to back (glCopyBufferSubData), slots / granules / VAO updated.
+// Returns false if something failed (the page is left as it was).
+// Live pool section of page p?
+fn in_page(gb: *mut GlBackend, s: usize, p: usize) -> bool {
+    let b: usize = s * SLOT_WORDS
+    if rt.ld64((*gb).slots, b + S_USED) == 0 as u64 {
+        return false
+    }
+    if rt.ld64((*gb).slots, b + S_PAGE) != p as u64 {
+        return false
+    }
+    return rt.ld64((*gb).slots, b + S_NIDX) != 0 as u64 && rt.ld64((*gb).slots, b + S_NV) != 0 as u64
+}
+
+fn page_defrag(gb: *mut GlBackend, p: usize) -> bool {
+    let g: *mut gl33.Gl = &(*gb).g
+    let vcap: usize = pw(gb, p, P_VCAP) as usize
+    let icap: usize = pw(gb, p, P_ICAP) as usize
+    let old_v: u32 = pw(gb, p, P_VBO) as u32
+    let old_i: u32 = pw(gb, p, P_IBO) as u32
+    let nv: u32 = gl33.gl_gen_buffer(g)
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_WRITE_BUFFER, nv)
+    gl33.gl_buffer_data(g, gl33.GL_COPY_WRITE_BUFFER, 0, vcap * 8, gl33.GL_STATIC_DRAW)
+    let ni: u32 = gl33.gl_gen_buffer(g)
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_WRITE_BUFFER, ni)
+    gl33.gl_buffer_data(g, gl33.GL_COPY_WRITE_BUFFER, 0, icap * 4, gl33.GL_STATIC_DRAW)
+    let vp: u64 = pw(gb, p, P_VPOOL)
+    let ip: u64 = pw(gb, p, P_IPOOL)
+    glpool.pool_free_all(vp)
+    glpool.pool_free_all(ip)
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_READ_BUFFER, old_v)
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_WRITE_BUFFER, nv)
+    var s: usize = 0
+    while s < (*gb).slot_cap {
+        let b: usize = s * SLOT_WORDS
+        if in_page(gb, s, p) {
+            let nvv: usize = rt.ld64((*gb).slots, b + S_NV) as usize
+            let nidx: usize = rt.ld64((*gb).slots, b + S_NIDX) as usize
+            let ov: usize = rt.ld64((*gb).slots, b + S_VOFF) as usize
+            let vo: usize = glpool.pool_alloc(vp, nvv)
+            let io: usize = glpool.pool_alloc(ip, nidx)
+            if vo == NONE || io == NONE {
+                return false // cannot happen: the live blocks fit into an empty page of the same size
+            }
+            if rt.ld64((*gb).slots, b + S_STAGED) == 0 as u64 {
+                gl33.gl_copy_buffer(g, ov * 8, vo * 8, nvv * 8)
+            }
+            rt.st64((*gb).slots, b + S_VOFF, vo as u64)
+            // index copy is done below (second pass over the same slots in the same order)
+            rt.st64((*gb).slots, b + S_OLDI, rt.ld64((*gb).slots, b + S_IOFF)) // spare word: old index offset
+            rt.st64((*gb).slots, b + S_IOFF, io as u64)
+        }
+        s = s + 1
+    }
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_READ_BUFFER, old_i)
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_WRITE_BUFFER, ni)
+    s = 0
+    while s < (*gb).slot_cap {
+        let b: usize = s * SLOT_WORDS
+        if in_page(gb, s, p) {
+            if rt.ld64((*gb).slots, b + S_STAGED) == 0 as u64 {
+                let oi: usize = rt.ld64((*gb).slots, b + S_OLDI) as usize
+                let ni2: usize = rt.ld64((*gb).slots, b + S_IOFF) as usize
+                let nidx: usize = rt.ld64((*gb).slots, b + S_NIDX) as usize
+                gl33.gl_copy_buffer(g, oi * 4, ni2 * 4, nidx * 4)
+            }
+            gran_set_cpu(gb, p, rt.ld64((*gb).slots, b + S_VOFF) as usize, rt.ld64((*gb).slots, b + S_NV) as usize, s)
+        }
+        s = s + 1
+    }
+    gl33.gl_delete_buffer(g, old_v)
+    gl33.gl_delete_buffer(g, old_i)
+    pset(gb, p, P_VBO, nv as u64)
+    pset(gb, p, P_IBO, ni as u64)
+    page_bind_vao(gb, p)
+    gran_upload(gb, p, 0, vcap / GRAN)
+    (*gb).defrags = (*gb).defrags + 1 as u64
+    return true
+}
+
+fn gran_set_cpu(gb: *mut GlBackend, p: usize, voff: usize, nverts: usize, slot: usize) {
+    let first: usize = voff / GRAN
+    let n: usize = (nverts + GRAN - 1) / GRAN
+    var i: usize = 0
+    while i < n {
+        rt.st32(pw(gb, p, P_GCPU), first + i, slot as u32)
+        i = i + 1
+    }
+}
+
+// Compacts every page whose free space is fragmented by at least `min_permille` (1/1000 of the free units not in the
+// largest free block). Returns the number of pages rebuilt.
+fn glbe_defrag(gb: *mut GlBackend, min_permille: usize) -> usize {
+    var n: usize = 0
+    var p: usize = 0
+    while p < (*gb).npages {
+        let fv: usize = glpool.pool_frag_permille(pw(gb, p, P_VPOOL))
+        let fi: usize = glpool.pool_frag_permille(pw(gb, p, P_IPOOL))
+        if fv >= min_permille || fi >= min_permille {
+            if glpool.pool_free_total(pw(gb, p, P_VPOOL)) > 0 && page_defrag(gb, p) {
+                n = n + 1
+            }
+        }
+        p = p + 1
+    }
+    return n
+}
+
+// Finds room for slot s: first page that fits; else defrag a page that has enough free units but too fragmented; else a new page.
+fn place_slot(gb: *mut GlBackend, s: usize, nverts: usize, nidx: usize) -> bool {
+    var p: usize = 0
+    while p < (*gb).npages {
+        if page_place(gb, p, s, nverts, nidx) {
+            return true
+        }
+        p = p + 1
+    }
+    p = 0
+    while p < (*gb).npages {
+        let vp: u64 = pw(gb, p, P_VPOOL)
+        let ip: u64 = pw(gb, p, P_IPOOL)
+        let room: bool = glpool.pool_free_total(vp) >= nverts + GRAN && glpool.pool_free_total(ip) >= nidx
+        let split: bool = glpool.pool_largest(vp) < nverts || glpool.pool_largest(ip) < nidx
+        if room && split {
+            if page_defrag(gb, p) && page_place(gb, p, s, nverts, nidx) {
+                return true
+            }
+        }
+        p = p + 1
+    }
+    var vcap: usize = (*gb).page_verts
+    if vcap < nverts + GRAN {
+        vcap = ((nverts + GRAN - 1) / GRAN) * GRAN
+    }
+    var icap: usize = (vcap / 4) * 6
+    if icap < nidx {
+        icap = nidx
+    }
+    let np: usize = page_new(gb, vcap, icap)
+    if np == NONE {
+        return false
+    }
+    return page_place(gb, np, s, nverts, nidx)
+}
+
+fn glbe_pool_used_bytes(gb: *mut GlBackend) -> usize {
+    var n: usize = 0
+    var p: usize = 0
+    while p < (*gb).npages {
+        n = n + glpool.pool_used(pw(gb, p, P_VPOOL)) * 8 + glpool.pool_used(pw(gb, p, P_IPOOL)) * 4
+        p = p + 1
+    }
+    return n
+}
+
+fn glbe_pool_cap_bytes(gb: *mut GlBackend) -> usize {
+    var n: usize = 0
+    var p: usize = 0
+    while p < (*gb).npages {
+        n = n + glpool.pool_cap(pw(gb, p, P_VPOOL)) * 8 + glpool.pool_cap(pw(gb, p, P_IPOOL)) * 4
+        p = p + 1
+    }
+    return n
+}
+
+// Worst fragmentation of any page's vertex pool, 1/1000.
+fn glbe_pool_frag_permille(gb: *mut GlBackend) -> usize {
+    var m: usize = 0
+    var p: usize = 0
+    while p < (*gb).npages {
+        let f: usize = glpool.pool_frag_permille(pw(gb, p, P_VPOOL))
+        if f > m {
+            m = f
+        }
+        p = p + 1
+    }
+    return m
 }
 
 // ---- Backend table ----------------------------------------------------------------------------------
 
+// Texture array out of the atlas: layer l = tile l + 1 (col = l % cols, row = l / cols), tile x tile texels.
 fn be_atlas(o: u64, a: u64) {
     let gb: *mut GlBackend = o as *mut GlBackend
     let at: *mut mc_texture.Atlas = a as *mut mc_texture.Atlas
@@ -205,70 +764,188 @@ fn be_atlas(o: u64, a: u64) {
     }
     if (*gb).atlas_tex != 0 as u32 {
         gl33.gl_delete_tex(&(*gb).g, (*gb).atlas_tex)
+        (*gb).atlas_tex = 0 as u32
     }
-    (*gb).atlas_tex = gl33.gl_tex_rgba8(&(*gb).g, (*at).w, (*at).h, (*at).px, gl33.GL_NEAREST, gl33.GL_NEAREST)
+    let t: usize = (*at).tile as usize
+    let layers: usize = ((*at).cols as usize) * ((*at).rows as usize)
+    let row: usize = t * 4
+    let lbytes: usize = t * row
+    let buf: u64 = rt.heap_alloc(layers * lbytes)
+    if buf == 0 {
+        return
+    }
+    let stride: usize = ((*at).w as usize) * 4
+    var l: usize = 0
+    while l < layers {
+        let col: usize = l % ((*at).cols as usize)
+        let rw: usize = l / ((*at).cols as usize)
+        var y: usize = 0
+        while y < t {
+            rt.mem_copy(buf + (l * lbytes + y * row) as u64, (*at).px + ((rw * t + y) * stride + col * row) as u64, row)
+            y = y + 1
+        }
+        l = l + 1
+    }
+    var minf: u32 = gl33.GL_NEAREST
+    var magf: u32 = gl33.GL_NEAREST
+    if (*gb).mip {
+        minf = gl33.GL_LINEAR_MIPMAP_LINEAR
+    } else if (*gb).aniso > 1.0 {
+        minf = gl33.GL_LINEAR
+    }
+    if (*gb).aniso > 1.0 {
+        magf = gl33.GL_LINEAR
+    }
+    (*gb).atlas_tex = gl33.gl_tex_array_rgba8(&(*gb).g, (*at).tile, (*at).tile, layers as i32, buf, minf, magf, (*gb).aniso)
+    rt.heap_free(buf, layers * lbytes)
     (*gb).atile = (*at).tile
     (*gb).acols = (*at).cols
 }
 
-fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize) -> usize {
-    let gb: *mut GlBackend = o as *mut GlBackend
+// Returns a free slot index (the table grows by doubling), NONE on failure.
+fn alloc_slot(gb: *mut GlBackend) -> usize {
     var s: usize = 0
-    var found: bool = false
     while s < (*gb).slot_cap {
-        if rt.ld64((*gb).slots, s * SLOT_WORDS + 4) == 0 as u64 {
-            found = true
-            break
+        if rt.ld64((*gb).slots, s * SLOT_WORDS + S_USED) == 0 as u64 {
+            return s
         }
         s = s + 1
     }
-    if !found {
-        let ncap: usize = (*gb).slot_cap * 2 + 64
-        let ns: u64 = rt.heap_alloc(ncap * SLOT_WORDS * 8)
-        if ns == 0 {
-            return 0
+    let ncap: usize = (*gb).slot_cap * 2 + 64
+    let ns: u64 = rt.heap_alloc(ncap * SLOT_WORDS * 8)
+    if ns == 0 {
+        return NONE
+    }
+    var i: usize = 0
+    while i < ncap * SLOT_WORDS {
+        var v: u64 = 0
+        if i < (*gb).slot_cap * SLOT_WORDS {
+            v = rt.ld64((*gb).slots, i)
         }
-        var i: usize = 0
-        while i < ncap * SLOT_WORDS {
-            var v: u64 = 0
-            if i < (*gb).slot_cap * SLOT_WORDS {
-                v = rt.ld64((*gb).slots, i)
-            }
-            rt.st64(ns, i, v)
-            i = i + 1
-        }
-        if (*gb).slots != 0 {
-            rt.heap_free((*gb).slots, (*gb).slot_cap * SLOT_WORDS * 8)
-        }
-        s = (*gb).slot_cap
-        (*gb).slots = ns
-        (*gb).slot_cap = ncap
+        rt.st64(ns, i, v)
+        i = i + 1
+    }
+    if (*gb).slots != 0 {
+        rt.heap_free((*gb).slots, (*gb).slot_cap * SLOT_WORDS * 8)
+    }
+    s = (*gb).slot_cap
+    (*gb).slots = ns
+    (*gb).slot_cap = ncap
+    return s
+}
+
+// Copies the mesh bytes of slot s into its pool block.
+fn upload_block(gb: *mut GlBackend, s: usize, verts: u64, idx: u64) {
+    let b: usize = s * SLOT_WORDS
+    let p: usize = rt.ld64((*gb).slots, b + S_PAGE) as usize
+    let nv: usize = rt.ld64((*gb).slots, b + S_NV) as usize
+    let ni: usize = rt.ld64((*gb).slots, b + S_NIDX) as usize
+    let vo: usize = rt.ld64((*gb).slots, b + S_VOFF) as usize
+    let io: usize = rt.ld64((*gb).slots, b + S_IOFF) as usize
+    let g: *mut gl33.Gl = &(*gb).g
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_WRITE_BUFFER, pw(gb, p, P_VBO) as u32)
+    gl33.gl_buffer_sub_data(g, gl33.GL_COPY_WRITE_BUFFER, vo * 8, nv * 8, verts)
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_WRITE_BUFFER, pw(gb, p, P_IBO) as u32)
+    gl33.gl_buffer_sub_data(g, gl33.GL_COPY_WRITE_BUFFER, io * 4, ni * 4, idx)
+    let bytes: u64 = (nv * 8 + ni * 4) as u64
+    (*gb).up_bytes = (*gb).up_bytes + bytes
+    (*gb).frame_up = (*gb).frame_up + bytes
+}
+
+fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize) -> usize {
+    let gb: *mut GlBackend = o as *mut GlBackend
+    let s: usize = alloc_slot(gb)
+    if s == NONE {
+        return 0
     }
     let b: usize = s * SLOT_WORDS
-    var vao: u32 = 0 as u32
-    var vbo: u32 = 0 as u32
-    var ibo: u32 = 0 as u32
-    if nverts > 0 && nidx > 0 {
+    var i: usize = 0
+    while i < SLOT_WORDS {
+        rt.st64((*gb).slots, b + i, 0 as u64)
+        i = i + 1
+    }
+    rt.st64((*gb).slots, b + S_KEY, key)
+    if nverts == 0 || nidx == 0 {
+        rt.st64((*gb).slots, b + S_USED, 1 as u64) // empty section: nothing to draw
+        return s + 1
+    }
+    if (*gb).mode == MODE_LEGACY {
         let g: *mut gl33.Gl = &(*gb).g
-        vao = gl33.gl_gen_vao(g)
+        let vao: u32 = gl33.gl_gen_vao(g)
         gl33.gl_bind_vao(g, vao)
-        vbo = gl33.gl_gen_buffer(g)
+        let vbo: u32 = gl33.gl_gen_buffer(g)
         gl33.gl_bind_buffer(g, gl33.GL_ARRAY_BUFFER, vbo)
         gl33.gl_buffer_data(g, gl33.GL_ARRAY_BUFFER, verts, nverts * 8, gl33.GL_STATIC_DRAW)
         gl33.gl_enable_attrib(g, 0 as u32)
         gl33.gl_attrib_i(g, 0 as u32, 2, gl33.GL_UNSIGNED_INT, 8, 0)
-        ibo = gl33.gl_gen_buffer(g)
+        let ibo: u32 = gl33.gl_gen_buffer(g)
         gl33.gl_bind_buffer(g, gl33.GL_ELEMENT_ARRAY_BUFFER, ibo)
         gl33.gl_buffer_data(g, gl33.GL_ELEMENT_ARRAY_BUFFER, idx, nidx * 4, gl33.GL_STATIC_DRAW)
         gl33.gl_bind_vao(g, 0 as u32)
+        (*gb).cur_vao = 0 as u32
+        rt.st64((*gb).slots, b + S_VAO, vao as u64)
+        rt.st64((*gb).slots, b + S_VBO, vbo as u64)
+        rt.st64((*gb).slots, b + S_IBO, ibo as u64)
+        rt.st64((*gb).slots, b + S_NIDX, nidx as u64)
+        rt.st64((*gb).slots, b + S_USED, 1 as u64)
+        let bytes: u64 = (nverts * 8 + nidx * 4) as u64
+        (*gb).up_bytes = (*gb).up_bytes + bytes
+        return s + 1
     }
-    rt.st64((*gb).slots, b, vao as u64)
-    rt.st64((*gb).slots, b + 1, vbo as u64)
-    rt.st64((*gb).slots, b + 2, ibo as u64)
-    rt.st64((*gb).slots, b + 3, nidx as u64)
-    rt.st64((*gb).slots, b + 4, 1 as u64)
-    rt.st64((*gb).slots, b + 5, key)
+    rt.st64((*gb).slots, b + S_NIDX, nidx as u64)
+    rt.st64((*gb).slots, b + S_USED, 1 as u64)
+    if !place_slot(gb, s, nverts, nidx) {
+        rt.st64((*gb).slots, b + S_USED, 0 as u64)
+        return 0
+    }
+    if (*gb).budget > 0 {
+        // stage the bytes on the CPU; begin uploads them within the per-frame budget
+        let sv: u64 = rt.heap_alloc(nverts * 8)
+        let si: u64 = rt.heap_alloc(nidx * 4)
+        if sv != 0 && si != 0 {
+            rt.mem_copy(sv, verts, nverts * 8)
+            rt.mem_copy(si, idx, nidx * 4)
+            rt.st64((*gb).slots, b + S_SV, sv)
+            rt.st64((*gb).slots, b + S_SI, si)
+            rt.st64((*gb).slots, b + S_STAGED, 1 as u64)
+            (*gb).staged = (*gb).staged + 1
+            return s + 1
+        }
+        if sv != 0 { rt.heap_free(sv, nverts * 8) }
+        if si != 0 { rt.heap_free(si, nidx * 4) }
+    }
+    upload_block(gb, s, verts, idx)
     return s + 1
+}
+
+// Uploads staged sections (slot order) until `budget` bytes of this frame are used (at least one per call, so a big
+// section cannot starve). budget 0 = all. Returns the number of sections uploaded.
+fn glbe_flush_uploads(gb: *mut GlBackend, budget: usize) -> usize {
+    var n: usize = 0
+    if (*gb).staged == 0 {
+        return 0
+    }
+    var s: usize = 0
+    while s < (*gb).slot_cap && (*gb).staged > 0 {
+        let b: usize = s * SLOT_WORDS
+        if rt.ld64((*gb).slots, b + S_USED) != 0 as u64 && rt.ld64((*gb).slots, b + S_STAGED) != 0 as u64 {
+            if budget > 0 && n > 0 && (*gb).frame_up >= budget as u64 {
+                break
+            }
+            let sv: u64 = rt.ld64((*gb).slots, b + S_SV)
+            let si: u64 = rt.ld64((*gb).slots, b + S_SI)
+            upload_block(gb, s, sv, si)
+            rt.heap_free(sv, (rt.ld64((*gb).slots, b + S_NV) as usize) * 8)
+            rt.heap_free(si, (rt.ld64((*gb).slots, b + S_NIDX) as usize) * 4)
+            rt.st64((*gb).slots, b + S_STAGED, 0 as u64)
+            rt.st64((*gb).slots, b + S_SV, 0 as u64)
+            rt.st64((*gb).slots, b + S_SI, 0 as u64)
+            (*gb).staged = (*gb).staged - 1
+            n = n + 1
+        }
+        s = s + 1
+    }
+    return n
 }
 
 fn free_slot(gb: *mut GlBackend, handle: usize) {
@@ -276,13 +953,13 @@ fn free_slot(gb: *mut GlBackend, handle: usize) {
         return
     }
     let b: usize = (handle - 1) * SLOT_WORDS
-    if rt.ld64((*gb).slots, b + 4) == 0 as u64 {
+    if rt.ld64((*gb).slots, b + S_USED) == 0 as u64 {
         return
     }
     let g: *mut gl33.Gl = &(*gb).g
-    let vao: u32 = rt.ld64((*gb).slots, b) as u32
-    let vbo: u32 = rt.ld64((*gb).slots, b + 1) as u32
-    let ibo: u32 = rt.ld64((*gb).slots, b + 2) as u32
+    let vao: u32 = rt.ld64((*gb).slots, b + S_VAO) as u32
+    let vbo: u32 = rt.ld64((*gb).slots, b + S_VBO) as u32
+    let ibo: u32 = rt.ld64((*gb).slots, b + S_IBO) as u32
     if vao != 0 as u32 {
         gl33.gl_delete_vao(g, vao)
     }
@@ -292,11 +969,69 @@ fn free_slot(gb: *mut GlBackend, handle: usize) {
     if ibo != 0 as u32 {
         gl33.gl_delete_buffer(g, ibo)
     }
-    rt.st64((*gb).slots, b + 4, 0 as u64)
+    let nv: usize = rt.ld64((*gb).slots, b + S_NV) as usize
+    if nv != 0 && (*gb).mode != MODE_LEGACY {
+        let p: usize = rt.ld64((*gb).slots, b + S_PAGE) as usize
+        glpool.pool_free(pw(gb, p, P_VPOOL), rt.ld64((*gb).slots, b + S_VOFF) as usize, nv)
+        glpool.pool_free(pw(gb, p, P_IPOOL), rt.ld64((*gb).slots, b + S_IOFF) as usize, rt.ld64((*gb).slots, b + S_NIDX) as usize)
+        pset(gb, p, P_LIVE, pw(gb, p, P_LIVE) - 1 as u64)
+    }
+    if rt.ld64((*gb).slots, b + S_STAGED) != 0 as u64 {
+        rt.heap_free(rt.ld64((*gb).slots, b + S_SV), nv * 8)
+        rt.heap_free(rt.ld64((*gb).slots, b + S_SI), (rt.ld64((*gb).slots, b + S_NIDX) as usize) * 4)
+        (*gb).staged = (*gb).staged - 1
+    }
+    rt.st64((*gb).slots, b + S_USED, 0 as u64)
+    rt.st64((*gb).slots, b + S_NV, 0 as u64)
+    rt.st64((*gb).slots, b + S_STAGED, 0 as u64)
 }
 
 fn be_free(o: u64, h: usize) {
     free_slot(o as *mut GlBackend, h)
+}
+
+// Origin buffer texture: 16 bytes per slot (xyz = section origin - camera, f32).
+fn ensure_org(gb: *mut GlBackend) {
+    if (*gb).org_cap >= (*gb).slot_cap {
+        return
+    }
+    if (*gb).org_cpu != 0 {
+        rt.heap_free((*gb).org_cpu, (*gb).org_cap * 16)
+    }
+    let g: *mut gl33.Gl = &(*gb).g
+    (*gb).org_cap = (*gb).slot_cap
+    (*gb).org_cpu = rt.heap_alloc((*gb).org_cap * 16)
+    rt.mem_set((*gb).org_cpu, 0 as u8, (*gb).org_cap * 16)
+    if (*gb).org_buf == 0 as u32 {
+        (*gb).org_buf = gl33.gl_gen_buffer(g)
+        (*gb).org_tex = gl33.gl_gen_texture(g)
+    }
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_WRITE_BUFFER, (*gb).org_buf)
+    gl33.gl_buffer_data(g, gl33.GL_COPY_WRITE_BUFFER, 0, (*gb).org_cap * 16, gl33.GL_DYNAMIC_DRAW)
+    gl33.gl_tex_buffer(g, (*gb).org_tex, gl33.GL_RGBA32F, (*gb).org_buf)
+}
+
+fn ensure_pend(gb: *mut GlBackend) {
+    if (*gb).pend_n < (*gb).pend_cap {
+        return
+    }
+    let ncap: usize = (*gb).pend_cap * 2 + 256
+    let np: u64 = rt.heap_alloc(ncap * 8)
+    let nc: u64 = rt.heap_alloc(ncap * 4)
+    let no: u64 = rt.heap_alloc(ncap * 8)
+    let nb: u64 = rt.heap_alloc(ncap * 20)
+    if (*gb).pend != 0 {
+        rt.mem_copy(np, (*gb).pend, (*gb).pend_n * 8)
+        rt.heap_free((*gb).pend, (*gb).pend_cap * 8)
+        rt.heap_free((*gb).sc_counts, (*gb).pend_cap * 4)
+        rt.heap_free((*gb).sc_offs, (*gb).pend_cap * 8)
+        rt.heap_free((*gb).sc_bv, (*gb).pend_cap * 20)
+    }
+    (*gb).pend = np
+    (*gb).sc_counts = nc
+    (*gb).sc_offs = no
+    (*gb).sc_bv = nb
+    (*gb).pend_cap = ncap
 }
 
 fn be_begin(o: u64, cam: u64, rgba: u32) {
@@ -306,7 +1041,11 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
     (*gb).cx = (*c).x
     (*gb).cy = (*c).y
     (*gb).cz = (*c).z
-    // projection * view rotation: the camera translation is applied on the CPU per draw (u_origin)
+    (*gb).frame_up = 0 as u64
+    if (*gb).staged > 0 {
+        glbe_flush_uploads(gb, (*gb).budget)
+    }
+    // projection * view rotation: the camera translation is applied on the CPU per draw (origin)
     var rot: mc_math.Mat4 = (*c).view
     rot.m[12] = 0.0
     rot.m[13] = 0.0
@@ -336,13 +1075,39 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
     gl33.gl_clear_color(g, r, gr, b, a)
     gl33.gl_clear(g, gl33.GL_COLOR_BUFFER_BIT | gl33.GL_DEPTH_BUFFER_BIT)
     gl33.gl_use(g, (*gb).prog)
-    gl33.gl_bind_tex(g, 0 as u32, (*gb).atlas_tex)
+    gl33.gl_bind_tex_target(g, 0 as u32, gl33.GL_TEXTURE_2D_ARRAY, (*gb).atlas_tex)
     gl33.gl_u1i(g, (*gb).l_atlas, 0)
+    gl33.gl_u1i(g, (*gb).l_gran, 1)
+    gl33.gl_u1i(g, (*gb).l_org, 2)
+    var pool: i32 = 0
+    if (*gb).mode >= MODE_MULTI {
+        pool = 1
+        ensure_org(gb)
+        gl33.gl_bind_tex_target(g, 2 as u32, gl33.GL_TEXTURE_BUFFER, (*gb).org_tex)
+    }
+    gl33.gl_u1i(g, (*gb).l_pool, pool)
+    var fl: i32 = 0
+    if filtered(gb) {
+        fl = 1
+    }
+    gl33.gl_u1i(g, (*gb).l_filter, fl)
     gl33.gl_uniform_mat4(g, (*gb).l_rv, (&(*gb).rv[0]) as u64)
     gl33.gl_u2f(g, (*gb).l_tiles, (*gb).atile as f64, (*gb).acols as f64)
     gl33.gl_u4f(g, (*gb).l_fog, if (*gb).fog_on { 1.0 } else { 0.0 }, (*gb).fog_start, (*gb).fog_end, 0.0)
     gl33.gl_u3f(g, (*gb).l_fogc, (*gb).fog_r, (*gb).fog_g, (*gb).fog_b)
+    (*gb).pend_n = 0
+    (*gb).org_max = 0
+    (*gb).batch = (*gb).batch + 1 as u64
+    gl33.gl_bind_vao(g, 0 as u32)
+    (*gb).cur_vao = 0 as u32
     (*gb).fresh = false
+}
+
+fn bind_vao(gb: *mut GlBackend, v: u32) {
+    if (*gb).cur_vao != v {
+        gl33.gl_bind_vao(&(*gb).g, v)
+        (*gb).cur_vao = v
+    }
 }
 
 fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
@@ -351,26 +1116,117 @@ fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
         return 0 as u64
     }
     let b: usize = (h - 1) * SLOT_WORDS
-    if rt.ld64((*gb).slots, b + 4) == 0 as u64 {
+    if rt.ld64((*gb).slots, b + S_USED) == 0 as u64 || rt.ld64((*gb).slots, b + S_STAGED) != 0 as u64 {
         return 0 as u64
     }
-    let nidx: usize = rt.ld64((*gb).slots, b + 3) as usize
+    let nidx: usize = rt.ld64((*gb).slots, b + S_NIDX) as usize
     if nidx < 3 {
         return 0 as u64
     }
     let g: *mut gl33.Gl = &(*gb).g
-    gl33.gl_u3f(g, (*gb).l_origin, ox - (*gb).cx, oy - (*gb).cy, oz - (*gb).cz)
-    gl33.gl_bind_vao(g, rt.ld64((*gb).slots, b) as u32)
-    gl33.gl_draw_elements(g, gl33.GL_TRIANGLES, nidx as i32, gl33.GL_UNSIGNED_INT, 0)
     let t: u64 = (nidx / 3) as u64
     (*gb).draws = (*gb).draws + 1 as u64
     (*gb).tris = (*gb).tris + t
+    if (*gb).mode >= MODE_MULTI {
+        // collected, submitted by be_end in ONE call per page; the origin goes to the origin table
+        if rt.ld64((*gb).slots, b + S_STAMP) == (*gb).batch {
+            flush_batch(gb) // the same section twice in one batch (two origins): submit what is collected first
+        }
+        rt.st64((*gb).slots, b + S_STAMP, (*gb).batch)
+        ensure_org(gb)
+        ensure_pend(gb)
+        let q: u64 = (*gb).org_cpu + ((h - 1) * 16) as u64
+        *(q as *mut f32) = (ox - (*gb).cx) as f32
+        *((q + 4 as u64) as *mut f32) = (oy - (*gb).cy) as f32
+        *((q + 8 as u64) as *mut f32) = (oz - (*gb).cz) as f32
+        rt.st64((*gb).pend, (*gb).pend_n, (h - 1) as u64)
+        (*gb).pend_n = (*gb).pend_n + 1
+        if h > (*gb).org_max {
+            (*gb).org_max = h
+        }
+        return t
+    }
+    gl33.gl_u3f(g, (*gb).l_origin, ox - (*gb).cx, oy - (*gb).cy, oz - (*gb).cz)
+    if (*gb).mode == MODE_LEGACY {
+        bind_vao(gb, rt.ld64((*gb).slots, b + S_VAO) as u32)
+        gl33.gl_draw_elements(g, gl33.GL_TRIANGLES, nidx as i32, gl33.GL_UNSIGNED_INT, 0)
+    } else {
+        let p: usize = rt.ld64((*gb).slots, b + S_PAGE) as usize
+        bind_vao(gb, pw(gb, p, P_VAO) as u32)
+        gl33.gl_draw_elements_bv(g, gl33.GL_TRIANGLES, nidx as i32, gl33.GL_UNSIGNED_INT,
+            (rt.ld64((*gb).slots, b + S_IOFF) as usize) * 4, rt.ld64((*gb).slots, b + S_VOFF) as i32)
+    }
+    (*gb).calls = (*gb).calls + 1 as u64
     return t
+}
+
+// Submits the collected draws: per page ONE multi draw (or one indirect call).
+fn flush_batch(gb: *mut GlBackend) {
+    let g: *mut gl33.Gl = &(*gb).g
+    if (*gb).pend_n == 0 {
+        return
+    }
+    ensure_org(gb)
+    gl33.gl_bind_buffer(g, gl33.GL_COPY_WRITE_BUFFER, (*gb).org_buf)
+    gl33.gl_buffer_sub_data(g, gl33.GL_COPY_WRITE_BUFFER, 0, (*gb).org_max * 16, (*gb).org_cpu)
+    gl33.gl_bind_tex_target(g, 2 as u32, gl33.GL_TEXTURE_BUFFER, (*gb).org_tex)
+    var p: usize = 0
+    while p < (*gb).npages {
+        var n: usize = 0
+        var k: usize = 0
+        while k < (*gb).pend_n {
+            let s: usize = rt.ld64((*gb).pend, k) as usize
+            let b: usize = s * SLOT_WORDS
+            if rt.ld64((*gb).slots, b + S_PAGE) == p as u64 {
+                let cnt: u32 = rt.ld64((*gb).slots, b + S_NIDX) as u32
+                let io: u32 = rt.ld64((*gb).slots, b + S_IOFF) as u32
+                let vo: u32 = rt.ld64((*gb).slots, b + S_VOFF) as u32
+                if (*gb).mode == MODE_INDIRECT {
+                    // command: count, instance count, first index, base vertex, base instance
+                    let c: u64 = (*gb).sc_bv + (n * 20) as u64
+                    rt.st32(c, 0, cnt)
+                    rt.st32(c, 1, 1 as u32)
+                    rt.st32(c, 2, io)
+                    rt.st32(c, 3, vo)
+                    rt.st32(c, 4, 0 as u32)
+                } else {
+                    rt.st32((*gb).sc_counts, n, cnt)
+                    rt.st64((*gb).sc_offs, n, (io as u64) * (4 as u64))
+                    rt.st32((*gb).sc_bv, n, vo)
+                }
+                n = n + 1
+            }
+            k = k + 1
+        }
+        if n > 0 {
+            bind_vao(gb, pw(gb, p, P_VAO) as u32)
+            gl33.gl_bind_tex_target(g, 1 as u32, gl33.GL_TEXTURE_BUFFER, pw(gb, p, P_GTEX) as u32)
+            if (*gb).mode == MODE_INDIRECT {
+                if (*gb).ind_buf == 0 as u32 {
+                    (*gb).ind_buf = gl33.gl_gen_buffer(g)
+                }
+                gl33.gl_bind_buffer(g, gl33.GL_DRAW_INDIRECT_BUFFER, (*gb).ind_buf)
+                gl33.gl_buffer_data(g, gl33.GL_DRAW_INDIRECT_BUFFER, (*gb).sc_bv, n * 20, gl33.GL_STREAM_DRAW)
+                gl33.gl_multi_draw_indirect(g, gl33.GL_TRIANGLES, gl33.GL_UNSIGNED_INT, 0, n as i32, 0)
+            } else {
+                gl33.gl_multi_draw_elements_bv(g, gl33.GL_TRIANGLES, (*gb).sc_counts, gl33.GL_UNSIGNED_INT,
+                    (*gb).sc_offs, n as i32, (*gb).sc_bv)
+            }
+            (*gb).calls = (*gb).calls + 1 as u64
+        }
+        p = p + 1
+    }
+    (*gb).pend_n = 0
+    (*gb).org_max = 0
+    (*gb).batch = (*gb).batch + 1 as u64
 }
 
 fn be_end(o: u64) {
     let gb: *mut GlBackend = o as *mut GlBackend
-    gl33.gl_bind_vao(&(*gb).g, 0 as u32)
+    if (*gb).mode >= MODE_MULTI {
+        flush_batch(gb)
+    }
+    bind_vao(gb, 0 as u32)
     gl33.gl_flush(&(*gb).g)
 }
 
