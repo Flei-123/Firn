@@ -1984,6 +1984,28 @@ else
     grep -E 'FAIL' "$WORK/vk.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 128. fUi window host over a GL window: present hook (lib/plat/fuiwin.fi) + lib/plat/fuiwingl.fi, X11 EGL/GLX and WGL (Wine) against the PutImage path (tools/gpu/fuigl/run.sh, docs/GPU.md) =="
+# Xvfb + Mesa llvmpipe: the X server's picture of the GL path equals the CPU path (PSNR >= 34, byte equal in practice), also after a resize;
+# a failing GL hook falls back to the CPU path; repaint time of both paths. A missing libEGL / Xvfb / xwd is SKIP. Only Mesa is proven.
+FIRNC="$FIRNC" bash tools/gpu/fuigl/run.sh > "$WORK/fuigl.log" 2>&1 && FGRC=0 || FGRC=$?
+if [ "$FGRC" -eq 0 ]; then
+    ok
+    grep -E '^   (ok|SKIP)|metric' "$WORK/fuigl.log" | sed 's/^/ /'
+else
+    bad "tools/gpu/fuigl/run.sh failed (see .test-work/fuigl.log)"
+    grep -E 'FAIL' "$WORK/fuigl.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 129. EWMH under a real window manager (openbox on Xvfb): _NET_WM_STATE_FULLSCREEN on/off + focus events of a GL window (tools/gpu/win/wm_run.sh, docs/GPU.md) =="
+FIRNC="$FIRNC" bash tools/gpu/win/wm_run.sh > "$WORK/wmprobe.log" 2>&1 && WMRC=0 || WMRC=$?
+if [ "$WMRC" -eq 0 ]; then
+    ok
+    grep -E '^   (ok|SKIP)|window manager' "$WORK/wmprobe.log" | sed 's/^/ /'
+else
+    bad "tools/gpu/win/wm_run.sh failed (see .test-work/wmprobe.log)"
+    grep -E 'FAIL' "$WORK/wmprobe.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 125. GL 3.3 core window: X11 (EGL on the Firn window's XID + GLX fallback) + Windows twin under Wine (tools/gpu/win/run.sh, lib/gpu/glwindow.fi, docs/GPU.md) =="
 # Xvfb + Mesa llvmpipe: open, clear + read back the window framebuffer, swap, swap interval, resize, full screen request, DPI.
 # A missing libEGL / Xvfb is SKIP (Wine part: SKIP without wine / mingw ld). Only Mesa is proven; a real GPU driver is UNTESTED.

@@ -138,3 +138,36 @@ Measured (lavapipe, 320x180): flat triangle vs `mc_raster` (same vertices projec
 RGB gradient vs a float CPU reference: 87.95 dB (max diff 1); swapchain (xlib and xcb surface, BGRA8, 3 images, FIFO): window read back with XGetImage equals the offscreen render (99 dB), also after a resize to 400x240 (`sc_resize`);
 offscreen draw + read back ~0.4-0.45 ms/frame (CPU renderer, NOT a GPU number).
 Not done: depth/textures/descriptors/push constants/uniform buffers, mc_backend table on Vulkan, memory suballocation, validation layers, Android (`VK_KHR_android_surface`), Wayland, real Windows, real GPU, `OUT_OF_DATE` is only handled, not provoked by a test.
+
+## fUi over a GL window (round gpu-f, 2026-10-12, roadmap r422) -- `lib/plat/fuiwingl.fi`, `tools/gpu/fuigl/run.sh` (gate 128)
+fUi still paints on the CPU into a canvas; only the LAST step changes. `fuiwin.window_set_present(fx, ud, f)` is a present hook:
+`f(ud, rgba_pixels, w, h) -> bool` replaces RGBA->BGRX + `window.image` + `window.present` in `window_step` (`window_clear_present`
+undoes it, `window_present_hooked` asks). A hook that returns false is dropped for good and THAT frame is painted on the CPU path, so
+a broken GL never leaves the window empty. `fuiwingl.glhost_attach(&gh, &fx)` (after `window_open`) makes a GL 3.3 core context
+on the XID of the window lib/window made (`window_window(fx)`; EGL, GLX as fallback), loads `gl33`, inits `glshow`, sets the hook;
+it returns false (nothing changed) if GL does not start. Per frame: `glshow.show_pixels(.., bgrx = false)` (one texture updated in
+place, one triangle) + `ctx_swap`. `glhost_detach` BEFORE `window_close`; `glhost_set_interval`, `glhost_api`, `glhost_renderer`.
+Windows twin `lib/plat/fuiwingl.windows.fi` (WGL through `window.gpu_gl`, borrowed context, swap = `window.gpu_swap`).
+```
+var gh: fuiwingl.GlHost = fuiwingl.glhost_new()
+fuiwin.window_open(&fx, ...)
+fuiwingl.glhost_attach(&gh, &fx)        // false: stays on PutImage
+... window_step loop ... ; fuiwingl.glhost_detach(&gh, &fx); fuiwin.window_close(&fx)
+```
+Test `tools/gpu/fuigl/fuigl.fi` (= hello_lowlevel + switch `cpu|gl|glbreak`) under Xvfb + llvmpipe: the X server's own picture (`xwd -root`)
+of the GL path equals its canvas AND the CPU path's picture (0 differing pixels, PSNR 99; need >= 34), also after a resize
+640x400 -> 500x300 (new canvas, new texture); `glbreak` (hook fails on purpose) falls back to the CPU path with an intact picture;
+WGL under Wine: hook in use, canvas identical to the CPU run. Repaint time (forced repaints incl. fUi painting, 1280x800, min of 3,
+busy shared host, llvmpipe: software GL does the upload copy on the CPU too): see the `metric` line of the gate log -- cpu ~7.8 ms,
+gl ~7.0 ms in the run that was written down; **no real GPU measured**, so no claim about GPU speed-up. Real GPU, real Windows UNTESTED.
+Not done: damage regions (the whole canvas is uploaded; `gl_tex_update` could take a sub-rectangle), vsync-paced loop, HiDPI scale of the
+texture (the canvas is window size), `fui.gpu` (painting ON the GPU) for desktop.
+
+### EWMH under openbox (gate 129, `tools/gpu/win/wm_run.sh`, `wmprobe.fi`)
+openbox on Xvfb (`openbox --sm-disable`): (1) `set_fullscreen(true)` -> `_NET_WM_STATE_FULLSCREEN` ClientMessage -> window = screen size
+within 20 ms (EV_CONFIGURE), `is_fullscreen` true, and from OUTSIDE `xprop -id` shows `_NET_WM_STATE_FULLSCREEN` and `xwininfo` the
+screen size; the GL surface follows (1024x768); off -> 320x200 again, property gone. (2) The WM focuses the new window (`xdotool
+getwindowfocus`); `xdotool windowfocus` to a second window and back arrives as EV_FOCUS out=1 / in=1 (needs `window.raw_input(true)`).
+Note: the first FocusIn happens while `glwindow.open` maps the window, i.e. BEFORE a program can call `raw_input` -- ask the server
+(`getwindowfocus`) for the initial state, not the event. Only openbox tried; other WMs (mutter, kwin, i3) and real displays UNTESTED.
+
