@@ -5538,6 +5538,26 @@ fn emit_div_const(
         if k == 0 || k == 1 || k == -1 || k.abs() >= (1i128 << (bits - 1)) {
             return false;
         }
+        // Signed division by 2^L (L <= 30, so the mask fits an imm32): no multiplication.
+        // q = (x + ((x >> (bits-1)) >>> (bits-L))) >> L  rounds towards zero like `idiv`;
+        // x % 2^L = x - (q << L) = x - ((x + bias) & -2^L).
+        if k > 1 && (k & (k - 1)) == 0 && k <= (1i128 << 30) {
+            let l = k.trailing_zeros();
+            ra.load_ext(e, "rcx", a, ty, bits);
+            e.line(&format!("mov {}, {}", ra_w("rax"), ra_w("rcx")));
+            e.line(&format!("sar {}, {}", ra_w("rax"), bits - 1));
+            e.line(&format!("shr {}, {}", ra_w("rax"), bits - l));
+            e.line(&format!("add {}, {}", ra_w("rax"), ra_w("rcx")));
+            if rem {
+                e.line(&format!("and {}, {}", ra_w("rax"), -(k as i64)));
+                e.line(&format!("sub {}, {}", ra_w("rcx"), ra_w("rax")));
+                ra.store_dst(e, d, "rcx");
+            } else {
+                e.line(&format!("sar {}, {}", ra_w("rax"), l));
+                ra.store_dst(e, d, "rax");
+            }
+            return true;
+        }
         let (m, sh) = magic_s(k, bits);
         let ms = as_signed(m, bits);
         ra.load_ext(e, "rcx", a, ty, bits);
