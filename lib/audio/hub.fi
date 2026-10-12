@@ -1,0 +1,1038 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/hub.fi -- audio.hub: the device and stream registry of a sound server.
+//
+// A back end (PulseAudio, waveOut/WASAPI, the OrientOS HD-Audio driver, a test source) REPORTS what it sees
+// (`hub_add_device` / `hub_remove_device` = hot-plug); an audio service or a UI ASKS and SETS (default device,
+// volume, mute, per-app mixer, microphone mute); a stream's samples go through `hub_apply`, which applies
+// the effective gain, silences muted streams and measures the level. The hub itself makes no sound and
+// opens no device: it is the state and the policy, so every platform gets the same answers.
+//
+//     import audio.hub
+//     var h: hub.Hub = hub.hub_new()
+//     let spk: u64 = hub.hub_add_device(&h, "Speakers", hub.DIR_OUT, hub.K_BUILTIN, 48000, 2)
+//     let usb: u64 = hub.hub_add_device(&h, "USB Headset", hub.DIR_OUT, hub.K_USB, 48000, 2)  // becomes default
+//     let s: u64 = hub.hub_stream_open(&h, "player", 17, hub.DIR_OUT, 0, 48000)             // 0 = follow default
+//     hub.hub_apply(&h, s, pcm_ptr, frames, 2)       // gain + mute + level, in place (S16LE interleaved)
+//     hub.hub_remove_device(&h, usb)                 // default falls back to Speakers, event EV_DEFAULT
+//
+// POLICY (the same on every platform)
+// P1  The first device of a direction becomes its default. A device of a HIGHER priority than the default
+//     (speaker 1 < HDMI 2 < jack/USB/Bluetooth 3) takes the default when it appears, like a headset
+//     does on Windows -- unless the user pinned a default (P2).
+// P2  `hub_set_default` PINS the choice by name + direction. While a pinned device exists it stays the
+//     default; when it is unplugged the best remaining device takes over, and when a device of the same name
+//     comes back it is the default again. The pin is remembered by a name hash, not by id.
+// P3  Removing the default device hands the default to the best remaining device (highest priority, then
+//     oldest), or 0 when there is none. Streams that asked for a removed device follow the default.
+// P4  Gain of a stream = device volume x app volume x stream volume (each 0..100, integer, in permille).
+//     Muted device, app or stream = 0. A muted MICROPHONE (`hub_mic_mute`, systemwide) makes every
+//     capture stream read silence and level 0, whatever the back end delivers.
+// P5  Per-app mixer: streams with the same owner name share one app entry (volume + mute) that outlives
+//     the streams, so a restarted player keeps its volume.
+//
+// HONEST
+// H1  Not thread safe. ONE owner thread calls everything except `hub_apply` / `hub_peak_*`, which an audio
+//     thread may call for its own stream: they read aligned 64 bit words and write only the level words,
+//     so a race can show a stale level or gain for one block, never corrupt memory.
+// H2  Fixed capacities: 16 devices, 32 streams, 16 apps, 64 queued events (the oldest event is dropped).
+//     Names are cut at 47 octets (apps 55).
+// H3  The level is the peak of the samples AFTER gain, 0..32767; `hub_peak_take` returns and clears it.
+// H4  Memory is not garbage collected: `hub_free` is the owner's job.
+import std.rt
+
+export {
+    Hub, HubEvent, hub_new, hub_free, hub_ok, hub_gen,
+    hub_add_device, hub_remove_device, hub_device_count, hub_device_at, hub_device_name, hub_device_dir,
+    hub_device_kind, hub_device_present, hub_device_rate, hub_device_channels,
+    hub_default, hub_set_default, hub_set_volume, hub_volume, hub_set_mute, hub_muted,
+    hub_mic_mute, hub_mic_muted,
+    hub_stream_open, hub_stream_close, hub_stream_count, hub_stream_at, hub_stream_owner, hub_stream_pid,
+    hub_stream_dir, hub_stream_device, hub_stream_move, hub_stream_set_volume, hub_stream_volume,
+    hub_stream_set_mute, hub_stream_muted,
+    hub_app_set_volume, hub_app_volume, hub_app_set_mute, hub_app_muted,
+    hub_gain_permille, hub_apply, hub_peak_peek, hub_peak_take, hub_device_peak_take, hub_stream_peak_take,
+    hub_mic_app_count, hub_mic_app_name,
+    hub_event_pop, hub_event_count,
+    DIR_OUT, DIR_IN, K_BUILTIN, K_HDMI, K_JACK, K_USB, K_BT, K_TEST,
+    EV_DEV_ADDED, EV_DEV_REMOVED, EV_DEFAULT, EV_VOLUME, EV_MUTE, EV_STREAM_OPEN, EV_STREAM_CLOSE,
+    EV_MICMUTE, EV_STREAM_MOVED,
+}
+
+const DIR_OUT: u64 = 0
+const DIR_IN: u64 = 1
+
+const K_BUILTIN: u64 = 0 // built-in speaker / microphone
+const K_HDMI: u64 = 1
+const K_JACK: u64 = 2 // headphones / line in on the jack (jack sense)
+const K_USB: u64 = 3
+const K_BT: u64 = 4
+const K_TEST: u64 = 5 // virtual: loopback, test source, null sink (priority 0)
+
+const EV_DEV_ADDED: u64 = 1 // a = device id, b = direction
+const EV_DEV_REMOVED: u64 = 2 // a = device id, b = direction
+const EV_DEFAULT: u64 = 3 // a = direction, b = new default id (0 = none)
+const EV_VOLUME: u64 = 4 // a = device id, b = volume
+const EV_MUTE: u64 = 5 // a = device id, b = 0/1
+const EV_STREAM_OPEN: u64 = 6 // a = stream id, b = direction
+const EV_STREAM_CLOSE: u64 = 7 // a = stream id, b = direction
+const EV_MICMUTE: u64 = 8 // a = 0/1
+const EV_STREAM_MOVED: u64 = 9 // a = stream id, b = device id now used
+
+const DEVMAX: usize = 16
+const STRMAX: usize = 32
+const APPMAX: usize = 16
+const EVMAX: usize = 64
+const NONE: usize = 65535
+
+// header words
+const H_NEXT_DEV: usize = 0
+const H_NEXT_STR: usize = 1
+const H_DEF_OUT: usize = 2
+const H_DEF_IN: usize = 3
+const H_PIN_OUT: usize = 4 // name hash of the pinned default, 0 = none
+const H_PIN_IN: usize = 5
+const H_MICMUTE: usize = 6
+const H_GEN: usize = 7
+const H_EV_W: usize = 8
+const H_EV_R: usize = 9
+const H_WORDS: usize = 16
+
+// device record
+const D_ID: usize = 0
+const D_DIR: usize = 1
+const D_KIND: usize = 2
+const D_VOL: usize = 3
+const D_MUTE: usize = 4
+const D_RATE: usize = 5
+const D_CH: usize = 6
+const D_PEAK: usize = 7
+const D_PRIO: usize = 8
+const D_HASH: usize = 9
+const D_NAME: usize = 10 // 6 words = 48 octets
+const DEVW: usize = 16
+
+// stream record
+const S_ID: usize = 0
+const S_DIR: usize = 1
+const S_DEV: usize = 2 // requested device, 0 = follow the default
+const S_VOL: usize = 3
+const S_MUTE: usize = 4
+const S_PEAK: usize = 5
+const S_PID: usize = 6
+const S_APP: usize = 7 // app slot + 1
+const S_RATE: usize = 8
+const STRW: usize = 10
+
+// app record
+const A_USED: usize = 0
+const A_VOL: usize = 1
+const A_MUTE: usize = 2
+const A_NAME: usize = 3 // 7 words = 56 octets
+const APPW: usize = 10
+
+const EVW: usize = 3
+
+const O_DEV: usize = H_WORDS
+const O_STR: usize = O_DEV + DEVMAX * DEVW
+const O_APP: usize = O_STR + STRMAX * STRW
+const O_EV: usize = O_APP + APPMAX * APPW
+const TOTAL: usize = O_EV + EVMAX * EVW
+
+struct Hub {
+    blk: u64, // 0 = could not be created
+}
+
+struct HubEvent {
+    kind: u64,
+    a: u64,
+    b: u64,
+}
+
+fn hub_new() -> Hub {
+    let blk: u64 = rt.heap_alloc(TOTAL * 8)
+    if blk == 0 {
+        return Hub { blk: 0 }
+    }
+    rt.mem_set(blk, 0 as u8, TOTAL * 8)
+    rt.st64(blk, H_NEXT_DEV, 1)
+    rt.st64(blk, H_NEXT_STR, 1)
+    return Hub { blk: blk }
+}
+
+fn hub_free(h: *mut Hub) {
+    if (*h).blk != 0 {
+        rt.heap_free((*h).blk, TOTAL * 8)
+        (*h).blk = 0
+    }
+}
+
+fn hub_ok(h: *mut Hub) -> bool {
+    return (*h).blk != 0
+}
+
+// Counts every change of the registry; a UI polls this one word and redraws when it moved.
+fn hub_gen(h: *mut Hub) -> u64 {
+    return rt.ld64((*h).blk, H_GEN)
+}
+
+fn bump(b: u64) {
+    rt.st64(b, H_GEN, rt.ld64(b, H_GEN) + 1)
+}
+
+// ---------------------------------------------------------------- events
+
+fn push_event(b: u64, kind: u64, a: u64, c: u64) {
+    var w: u64 = rt.ld64(b, H_EV_W)
+    let r: u64 = rt.ld64(b, H_EV_R)
+    if w - r >= EVMAX as u64 {
+        rt.st64(b, H_EV_R, r + 1) // full: drop the oldest
+    }
+    let at: usize = O_EV + ((w % EVMAX as u64) as usize) * EVW
+    rt.st64(b, at, kind)
+    rt.st64(b, at + 1, a)
+    rt.st64(b, at + 2, c)
+    w = w + 1
+    rt.st64(b, H_EV_W, w)
+    bump(b)
+}
+
+fn hub_event_count(h: *mut Hub) -> usize {
+    return (rt.ld64((*h).blk, H_EV_W) - rt.ld64((*h).blk, H_EV_R)) as usize
+}
+
+fn hub_event_pop(h: *mut Hub, out: *mut HubEvent) -> bool {
+    let b: u64 = (*h).blk
+    let r: u64 = rt.ld64(b, H_EV_R)
+    if b == 0 || r >= rt.ld64(b, H_EV_W) {
+        return false
+    }
+    let at: usize = O_EV + ((r % EVMAX as u64) as usize) * EVW
+    (*out).kind = rt.ld64(b, at)
+    (*out).a = rt.ld64(b, at + 1)
+    (*out).b = rt.ld64(b, at + 2)
+    rt.st64(b, H_EV_R, r + 1)
+    return true
+}
+
+// ---------------------------------------------------------------- strings
+
+fn cstr_copy(dst: u64, src: u64, n: usize, cap: usize) {
+    var m: usize = n
+    if m > cap {
+        m = cap
+    }
+    rt.mem_copy(dst, src, m)
+    rt.st8(dst, m, 0 as u8)
+}
+
+fn name_hash(dir: u64, p: u64, n: usize) -> u64 {
+    var x: u64 = dir + 1
+    var i: usize = 0
+    while i < n {
+        x = ((x * 31) + rt.ld8(p, i) as u64) & 281474976710655 // 48 bits, no overflow
+        i = i + 1
+    }
+    if x == 0 {
+        x = 1
+    }
+    return x
+}
+
+fn cstr_eq(a: u64, b: u64) -> bool {
+    var i: usize = 0
+    while i < 64 {
+        let x: u8 = rt.ld8(a, i)
+        if x != rt.ld8(b, i) {
+            return false
+        }
+        if x == 0 as u8 {
+            return true
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- devices
+
+fn dbase(s: usize) -> usize {
+    return O_DEV + s * DEVW
+}
+
+fn dev_slot(b: u64, id: u64) -> usize {
+    if id == 0 {
+        return NONE
+    }
+    var s: usize = 0
+    while s < DEVMAX {
+        if rt.ld64(b, dbase(s) + D_ID) == id {
+            return s
+        }
+        s = s + 1
+    }
+    return NONE
+}
+
+fn dev_get(b: u64, id: u64, f: usize) -> u64 {
+    let s: usize = dev_slot(b, id)
+    if s == NONE {
+        return 0
+    }
+    return rt.ld64(b, dbase(s) + f)
+}
+
+fn def_word(dir: u64) -> usize {
+    if dir == DIR_IN {
+        return H_DEF_IN
+    }
+    return H_DEF_OUT
+}
+
+fn pin_word(dir: u64) -> usize {
+    if dir == DIR_IN {
+        return H_PIN_IN
+    }
+    return H_PIN_OUT
+}
+
+fn prio_of(kind: u64) -> u64 {
+    if kind == K_BUILTIN { return 1 }
+    if kind == K_HDMI { return 2 }
+    if kind == K_JACK || kind == K_USB || kind == K_BT { return 3 }
+    return 0
+}
+
+// Best present device of a direction: highest priority, then the oldest (smallest id). 0 = none.
+fn best_of(b: u64, dir: u64, skip: u64) -> u64 {
+    var best: u64 = 0
+    var bp: u64 = 0
+    var s: usize = 0
+    while s < DEVMAX {
+        let at: usize = dbase(s)
+        let id: u64 = rt.ld64(b, at + D_ID)
+        if id != 0 && id != skip && rt.ld64(b, at + D_DIR) == dir {
+            let p: u64 = rt.ld64(b, at + D_PRIO)
+            if best == 0 || p > bp || (p == bp && id < best) {
+                best = id
+                bp = p
+            }
+        }
+        s = s + 1
+    }
+    return best
+}
+
+fn pinned_dev(b: u64, dir: u64) -> u64 {
+    let pin: u64 = rt.ld64(b, pin_word(dir))
+    if pin == 0 {
+        return 0
+    }
+    var s: usize = 0
+    while s < DEVMAX {
+        let at: usize = dbase(s)
+        if rt.ld64(b, at + D_ID) != 0 && rt.ld64(b, at + D_DIR) == dir && rt.ld64(b, at + D_HASH) == pin {
+            return rt.ld64(b, at + D_ID)
+        }
+        s = s + 1
+    }
+    return 0
+}
+
+fn set_def(b: u64, dir: u64, id: u64) {
+    if rt.ld64(b, def_word(dir)) != id {
+        rt.st64(b, def_word(dir), id)
+        push_event(b, EV_DEFAULT, dir, id)
+    }
+}
+
+// Reports a device that appeared. Returns its id (never 0, never reused) or 0 when the table is full.
+fn hub_add_device(h: *mut Hub, name: str, dir: u64, kind: u64, rate: u64, channels: u64) -> u64 {
+    let b: u64 = (*h).blk
+    if b == 0 || (dir != DIR_OUT && dir != DIR_IN) {
+        return 0
+    }
+    var s: usize = 0
+    while s < DEVMAX && rt.ld64(b, dbase(s) + D_ID) != 0 {
+        s = s + 1
+    }
+    if s == DEVMAX {
+        return 0
+    }
+    let at: usize = dbase(s)
+    rt.mem_set(b + (at * 8) as u64, 0 as u8, DEVW * 8)
+    let id: u64 = rt.ld64(b, H_NEXT_DEV)
+    rt.st64(b, H_NEXT_DEV, id + 1)
+    rt.st64(b, at + D_ID, id)
+    rt.st64(b, at + D_DIR, dir)
+    rt.st64(b, at + D_KIND, kind)
+    rt.st64(b, at + D_VOL, 100)
+    rt.st64(b, at + D_RATE, rate)
+    rt.st64(b, at + D_CH, channels)
+    rt.st64(b, at + D_PRIO, prio_of(kind))
+    rt.st64(b, at + D_HASH, name_hash(dir, name.p as u64, name.length()))
+    cstr_copy(b + ((at + D_NAME) * 8) as u64, name.p as u64, name.length(), 47)
+    push_event(b, EV_DEV_ADDED, id, dir)
+    // default policy P1 / P2
+    let cur: u64 = rt.ld64(b, def_word(dir))
+    let pinned: u64 = pinned_dev(b, dir)
+    if pinned != 0 {
+        set_def(b, dir, pinned)
+    } else if rt.ld64(b, pin_word(dir)) == 0 {
+        if cur == 0 || prio_of(kind) > dev_get(b, cur, D_PRIO) {
+            set_def(b, dir, id)
+        }
+    } else if cur == 0 {
+        set_def(b, dir, id) // pinned device absent: anything beats silence
+    }
+    return id
+}
+
+// Reports that a device went away (unplugged / disabled). Streams that asked for it follow the default.
+fn hub_remove_device(h: *mut Hub, id: u64) -> bool {
+    let b: u64 = (*h).blk
+    let s: usize = dev_slot(b, id)
+    if s == NONE {
+        return false
+    }
+    let at: usize = dbase(s)
+    let dir: u64 = rt.ld64(b, at + D_DIR)
+    rt.mem_set(b + (at * 8) as u64, 0 as u8, DEVW * 8)
+    push_event(b, EV_DEV_REMOVED, id, dir)
+    if rt.ld64(b, def_word(dir)) == id {
+        rt.st64(b, def_word(dir), 0)
+        set_def(b, dir, best_of(b, dir, id))
+    }
+    var k: usize = 0
+    while k < STRMAX {
+        let sa: usize = O_STR + k * STRW
+        if rt.ld64(b, sa + S_ID) != 0 && rt.ld64(b, sa + S_DEV) == id {
+            rt.st64(b, sa + S_DEV, 0)
+            push_event(b, EV_STREAM_MOVED, rt.ld64(b, sa + S_ID), stream_dev(b, k))
+        }
+        k = k + 1
+    }
+    return true
+}
+
+fn hub_device_count(h: *mut Hub, dir: u64) -> usize {
+    var n: usize = 0
+    var s: usize = 0
+    while s < DEVMAX {
+        let at: usize = dbase(s)
+        if rt.ld64((*h).blk, at + D_ID) != 0 && rt.ld64((*h).blk, at + D_DIR) == dir {
+            n = n + 1
+        }
+        s = s + 1
+    }
+    return n
+}
+
+// The idx-th present device of a direction in order of plugging (id ascending). 0 = out of range.
+fn hub_device_at(h: *mut Hub, dir: u64, idx: usize) -> u64 {
+    let b: u64 = (*h).blk
+    var last: u64 = 0
+    var n: usize = 0
+    while true {
+        var next: u64 = 0
+        var s: usize = 0
+        while s < DEVMAX {
+            let at: usize = dbase(s)
+            let id: u64 = rt.ld64(b, at + D_ID)
+            if id > last && rt.ld64(b, at + D_DIR) == dir && (next == 0 || id < next) {
+                next = id
+            }
+            s = s + 1
+        }
+        if next == 0 {
+            return 0
+        }
+        if n == idx {
+            return next
+        }
+        n = n + 1
+        last = next
+    }
+    return 0
+}
+
+// Pointer to the NUL terminated name inside the hub (valid until the device is removed); 0 = unknown id.
+fn hub_device_name(h: *mut Hub, id: u64) -> u64 {
+    let s: usize = dev_slot((*h).blk, id)
+    if s == NONE {
+        return 0
+    }
+    return (*h).blk + ((dbase(s) + D_NAME) * 8) as u64
+}
+
+fn hub_device_present(h: *mut Hub, id: u64) -> bool {
+    return dev_slot((*h).blk, id) != NONE
+}
+
+fn hub_device_dir(h: *mut Hub, id: u64) -> u64 {
+    return dev_get((*h).blk, id, D_DIR)
+}
+
+fn hub_device_kind(h: *mut Hub, id: u64) -> u64 {
+    return dev_get((*h).blk, id, D_KIND)
+}
+
+fn hub_device_rate(h: *mut Hub, id: u64) -> u64 {
+    return dev_get((*h).blk, id, D_RATE)
+}
+
+fn hub_device_channels(h: *mut Hub, id: u64) -> u64 {
+    return dev_get((*h).blk, id, D_CH)
+}
+
+fn hub_default(h: *mut Hub, dir: u64) -> u64 {
+    return rt.ld64((*h).blk, def_word(dir))
+}
+
+// The user's choice: sets AND pins the default of the device's direction (P2).
+fn hub_set_default(h: *mut Hub, id: u64) -> bool {
+    let b: u64 = (*h).blk
+    let s: usize = dev_slot(b, id)
+    if s == NONE {
+        return false
+    }
+    let dir: u64 = rt.ld64(b, dbase(s) + D_DIR)
+    rt.st64(b, pin_word(dir), rt.ld64(b, dbase(s) + D_HASH))
+    set_def(b, dir, id)
+    bump(b)
+    return true
+}
+
+fn hub_set_volume(h: *mut Hub, id: u64, v: u64) -> bool {
+    let b: u64 = (*h).blk
+    let s: usize = dev_slot(b, id)
+    if s == NONE {
+        return false
+    }
+    var x: u64 = v
+    if x > 100 {
+        x = 100
+    }
+    if rt.ld64(b, dbase(s) + D_VOL) != x {
+        rt.st64(b, dbase(s) + D_VOL, x)
+        push_event(b, EV_VOLUME, id, x)
+    }
+    return true
+}
+
+fn hub_volume(h: *mut Hub, id: u64) -> u64 {
+    return dev_get((*h).blk, id, D_VOL)
+}
+
+fn hub_set_mute(h: *mut Hub, id: u64, on: bool) -> bool {
+    let b: u64 = (*h).blk
+    let s: usize = dev_slot(b, id)
+    if s == NONE {
+        return false
+    }
+    var v: u64 = 0
+    if on {
+        v = 1
+    }
+    if rt.ld64(b, dbase(s) + D_MUTE) != v {
+        rt.st64(b, dbase(s) + D_MUTE, v)
+        push_event(b, EV_MUTE, id, v)
+    }
+    return true
+}
+
+fn hub_muted(h: *mut Hub, id: u64) -> bool {
+    return dev_get((*h).blk, id, D_MUTE) != 0
+}
+
+// Systemwide microphone mute (P4): every capture stream reads silence.
+fn hub_mic_mute(h: *mut Hub, on: bool) {
+    var v: u64 = 0
+    if on {
+        v = 1
+    }
+    if rt.ld64((*h).blk, H_MICMUTE) != v {
+        rt.st64((*h).blk, H_MICMUTE, v)
+        push_event((*h).blk, EV_MICMUTE, v, 0)
+    }
+}
+
+fn hub_mic_muted(h: *mut Hub) -> bool {
+    return rt.ld64((*h).blk, H_MICMUTE) != 0
+}
+
+// ---------------------------------------------------------------- apps (per-app mixer)
+
+fn abase(a: usize) -> usize {
+    return O_APP + a * APPW
+}
+
+// Finds or creates the app entry of an owner name; NONE when the table is full.
+fn app_find(b: u64, name: str, create: bool) -> usize {
+    var tmp: u64 = rt.heap_alloc(64)
+    if tmp == 0 {
+        return NONE
+    }
+    rt.mem_set(tmp, 0 as u8, 64)
+    cstr_copy(tmp, name.p as u64, name.length(), 55)
+    var free: usize = NONE
+    var found: usize = NONE
+    var a: usize = 0
+    while a < APPMAX {
+        let at: usize = abase(a)
+        if rt.ld64(b, at + A_USED) == 0 {
+            if free == NONE {
+                free = a
+            }
+        } else if found == NONE && cstr_eq(tmp, b + ((at + A_NAME) * 8) as u64) {
+            found = a
+        }
+        a = a + 1
+    }
+    if found == NONE && create && free != NONE {
+        let at: usize = abase(free)
+        rt.mem_set(b + (at * 8) as u64, 0 as u8, APPW * 8)
+        rt.st64(b, at + A_USED, 1)
+        rt.st64(b, at + A_VOL, 100)
+        rt.mem_copy(b + ((at + A_NAME) * 8) as u64, tmp, 56)
+        found = free
+    }
+    rt.heap_free(tmp, 64)
+    return found
+}
+
+fn hub_app_set_volume(h: *mut Hub, app: str, v: u64) -> bool {
+    let b: u64 = (*h).blk
+    let a: usize = app_find(b, app, true)
+    if a == NONE {
+        return false
+    }
+    var x: u64 = v
+    if x > 100 {
+        x = 100
+    }
+    rt.st64(b, abase(a) + A_VOL, x)
+    bump(b)
+    return true
+}
+
+// 100 for an app that has no entry yet.
+fn hub_app_volume(h: *mut Hub, app: str) -> u64 {
+    let a: usize = app_find((*h).blk, app, false)
+    if a == NONE {
+        return 100
+    }
+    return rt.ld64((*h).blk, abase(a) + A_VOL)
+}
+
+fn hub_app_set_mute(h: *mut Hub, app: str, on: bool) -> bool {
+    let b: u64 = (*h).blk
+    let a: usize = app_find(b, app, true)
+    if a == NONE {
+        return false
+    }
+    var v: u64 = 0
+    if on {
+        v = 1
+    }
+    rt.st64(b, abase(a) + A_MUTE, v)
+    bump(b)
+    return true
+}
+
+fn hub_app_muted(h: *mut Hub, app: str) -> bool {
+    let a: usize = app_find((*h).blk, app, false)
+    if a == NONE {
+        return false
+    }
+    return rt.ld64((*h).blk, abase(a) + A_MUTE) != 0
+}
+
+// ---------------------------------------------------------------- streams
+
+fn sbase(k: usize) -> usize {
+    return O_STR + k * STRW
+}
+
+fn str_slot(b: u64, id: u64) -> usize {
+    if id == 0 {
+        return NONE
+    }
+    var k: usize = 0
+    while k < STRMAX {
+        if rt.ld64(b, sbase(k) + S_ID) == id {
+            return k
+        }
+        k = k + 1
+    }
+    return NONE
+}
+
+// The device a stream really uses now: the requested one if it is present, else the default (0 = none).
+fn stream_dev(b: u64, k: usize) -> u64 {
+    let at: usize = sbase(k)
+    let want: u64 = rt.ld64(b, at + S_DEV)
+    if want != 0 && dev_slot(b, want) != NONE {
+        return want
+    }
+    return rt.ld64(b, def_word(rt.ld64(b, at + S_DIR)))
+}
+
+// Opens a stream for an app. `dev` = 0 follows the default device of the direction. Returns the stream id or 0.
+fn hub_stream_open(h: *mut Hub, owner: str, pid: u64, dir: u64, dev: u64, rate: u64) -> u64 {
+    let b: u64 = (*h).blk
+    if b == 0 || (dir != DIR_OUT && dir != DIR_IN) {
+        return 0
+    }
+    var k: usize = 0
+    while k < STRMAX && rt.ld64(b, sbase(k) + S_ID) != 0 {
+        k = k + 1
+    }
+    if k == STRMAX {
+        return 0
+    }
+    let app: usize = app_find(b, owner, true)
+    let at: usize = sbase(k)
+    rt.mem_set(b + (at * 8) as u64, 0 as u8, STRW * 8)
+    let id: u64 = rt.ld64(b, H_NEXT_STR)
+    rt.st64(b, H_NEXT_STR, id + 1)
+    rt.st64(b, at + S_ID, id)
+    rt.st64(b, at + S_DIR, dir)
+    rt.st64(b, at + S_DEV, dev)
+    rt.st64(b, at + S_VOL, 100)
+    rt.st64(b, at + S_PID, pid)
+    if app != NONE {
+        rt.st64(b, at + S_APP, app as u64 + 1)
+    }
+    rt.st64(b, at + S_RATE, rate)
+    push_event(b, EV_STREAM_OPEN, id, dir)
+    return id
+}
+
+fn hub_stream_close(h: *mut Hub, sid: u64) -> bool {
+    let b: u64 = (*h).blk
+    let k: usize = str_slot(b, sid)
+    if k == NONE {
+        return false
+    }
+    let dir: u64 = rt.ld64(b, sbase(k) + S_DIR)
+    rt.mem_set(b + (sbase(k) * 8) as u64, 0 as u8, STRW * 8)
+    push_event(b, EV_STREAM_CLOSE, sid, dir)
+    return true
+}
+
+fn hub_stream_count(h: *mut Hub, dir: u64) -> usize {
+    var n: usize = 0
+    var k: usize = 0
+    while k < STRMAX {
+        if rt.ld64((*h).blk, sbase(k) + S_ID) != 0 && rt.ld64((*h).blk, sbase(k) + S_DIR) == dir {
+            n = n + 1
+        }
+        k = k + 1
+    }
+    return n
+}
+
+// The idx-th open stream of a direction (id ascending). 0 = out of range.
+fn hub_stream_at(h: *mut Hub, dir: u64, idx: usize) -> u64 {
+    let b: u64 = (*h).blk
+    var last: u64 = 0
+    var n: usize = 0
+    while true {
+        var next: u64 = 0
+        var k: usize = 0
+        while k < STRMAX {
+            let id: u64 = rt.ld64(b, sbase(k) + S_ID)
+            if id > last && rt.ld64(b, sbase(k) + S_DIR) == dir && (next == 0 || id < next) {
+                next = id
+            }
+            k = k + 1
+        }
+        if next == 0 {
+            return 0
+        }
+        if n == idx {
+            return next
+        }
+        n = n + 1
+        last = next
+    }
+    return 0
+}
+
+fn str_get(b: u64, sid: u64, f: usize) -> u64 {
+    let k: usize = str_slot(b, sid)
+    if k == NONE {
+        return 0
+    }
+    return rt.ld64(b, sbase(k) + f)
+}
+
+// Owner name of a stream (pointer into the hub, NUL terminated); 0 = unknown stream.
+fn hub_stream_owner(h: *mut Hub, sid: u64) -> u64 {
+    let b: u64 = (*h).blk
+    let app: u64 = str_get(b, sid, S_APP)
+    if app == 0 {
+        return 0
+    }
+    return b + ((abase((app - 1) as usize) + A_NAME) * 8) as u64
+}
+
+fn hub_stream_pid(h: *mut Hub, sid: u64) -> u64 {
+    return str_get((*h).blk, sid, S_PID)
+}
+
+fn hub_stream_dir(h: *mut Hub, sid: u64) -> u64 {
+    return str_get((*h).blk, sid, S_DIR)
+}
+
+// The device the stream really uses now (see P3); 0 = none.
+fn hub_stream_device(h: *mut Hub, sid: u64) -> u64 {
+    let k: usize = str_slot((*h).blk, sid)
+    if k == NONE {
+        return 0
+    }
+    return stream_dev((*h).blk, k)
+}
+
+// Per-app output (or input) device: dev = 0 goes back to following the default. The device must have the
+// stream's direction.
+fn hub_stream_move(h: *mut Hub, sid: u64, dev: u64) -> bool {
+    let b: u64 = (*h).blk
+    let k: usize = str_slot(b, sid)
+    if k == NONE {
+        return false
+    }
+    if dev != 0 && dev_get(b, dev, D_DIR) != rt.ld64(b, sbase(k) + S_DIR) {
+        return false
+    }
+    if dev != 0 && dev_slot(b, dev) == NONE {
+        return false
+    }
+    rt.st64(b, sbase(k) + S_DEV, dev)
+    push_event(b, EV_STREAM_MOVED, sid, stream_dev(b, k))
+    return true
+}
+
+fn hub_stream_set_volume(h: *mut Hub, sid: u64, v: u64) -> bool {
+    let k: usize = str_slot((*h).blk, sid)
+    if k == NONE {
+        return false
+    }
+    var x: u64 = v
+    if x > 100 {
+        x = 100
+    }
+    rt.st64((*h).blk, sbase(k) + S_VOL, x)
+    bump((*h).blk)
+    return true
+}
+
+fn hub_stream_volume(h: *mut Hub, sid: u64) -> u64 {
+    return str_get((*h).blk, sid, S_VOL)
+}
+
+fn hub_stream_set_mute(h: *mut Hub, sid: u64, on: bool) -> bool {
+    let k: usize = str_slot((*h).blk, sid)
+    if k == NONE {
+        return false
+    }
+    var v: u64 = 0
+    if on {
+        v = 1
+    }
+    rt.st64((*h).blk, sbase(k) + S_MUTE, v)
+    bump((*h).blk)
+    return true
+}
+
+fn hub_stream_muted(h: *mut Hub, sid: u64) -> bool {
+    return str_get((*h).blk, sid, S_MUTE) != 0
+}
+
+// ---------------------------------------------------------------- gain, samples, levels
+
+// Effective gain of a stream in permille (0..1000) after P4. 0 for an unknown stream, a stream without
+// any device, or a muted device / app / stream / microphone.
+fn hub_gain_permille(h: *mut Hub, sid: u64) -> u64 {
+    let b: u64 = (*h).blk
+    let k: usize = str_slot(b, sid)
+    if k == NONE {
+        return 0
+    }
+    let at: usize = sbase(k)
+    let dir: u64 = rt.ld64(b, at + S_DIR)
+    if dir == DIR_IN && rt.ld64(b, H_MICMUTE) != 0 {
+        return 0
+    }
+    let dev: u64 = stream_dev(b, k)
+    if dev == 0 || dev_get(b, dev, D_MUTE) != 0 || rt.ld64(b, at + S_MUTE) != 0 {
+        return 0
+    }
+    var avol: u64 = 100
+    let app: u64 = rt.ld64(b, at + S_APP)
+    if app != 0 {
+        if rt.ld64(b, abase((app - 1) as usize) + A_MUTE) != 0 {
+            return 0
+        }
+        avol = rt.ld64(b, abase((app - 1) as usize) + A_VOL)
+    }
+    return (dev_get(b, dev, D_VOL) * avol * rt.ld64(b, at + S_VOL)) / 1000
+}
+
+fn peak_max(b: u64, idx: usize, v: u64) {
+    if rt.ld64(b, idx) < v {
+        rt.st64(b, idx, v)
+    }
+}
+
+// Runs a block of S16LE interleaved samples (playback: before the device; capture: before the app) through
+// the stream's gain, in place. Muted = the block becomes zeros. Updates the stream and device level.
+// Returns the peak of the block after the gain (0..32767).
+fn hub_apply(h: *mut Hub, sid: u64, p: u64, frames: usize, channels: u64) -> u64 {
+    let b: u64 = (*h).blk
+    let k: usize = str_slot(b, sid)
+    if k == NONE {
+        return 0
+    }
+    let n: usize = frames * channels as usize
+    let g: u64 = hub_gain_permille(h, sid)
+    var peak: u64 = 0
+    if g == 0 {
+        rt.mem_set(p, 0 as u8, n * 2)
+    } else {
+        var i: usize = 0
+        while i < n {
+            var v: i64 = rt.ld16(p, i) as i64
+            if v >= 32768 {
+                v = v - 65536
+            }
+            if g != 1000 {
+                v = (v * g as i64) / 1000
+                var u: u64 = 0
+                if v < 0 {
+                    u = (0 - v) as u64
+                    rt.st16(p, i, ((v + 65536) & 65535) as u16)
+                } else {
+                    u = v as u64
+                    rt.st16(p, i, v as u16)
+                }
+                if u > peak {
+                    peak = u
+                }
+            } else {
+                var u: u64 = v as u64
+                if v < 0 {
+                    u = (0 - v) as u64
+                }
+                if u > peak {
+                    peak = u
+                }
+            }
+            i = i + 1
+        }
+    }
+    if peak > 32767 {
+        peak = 32767
+    }
+    peak_max(b, sbase(k) + S_PEAK, peak)
+    let dev: u64 = stream_dev(b, k)
+    let ds: usize = dev_slot(b, dev)
+    if ds != NONE {
+        peak_max(b, dbase(ds) + D_PEAK, peak)
+    }
+    return peak
+}
+
+fn hub_peak_peek(h: *mut Hub, dev: u64) -> u64 {
+    return dev_get((*h).blk, dev, D_PEAK)
+}
+
+// Level of a device since the last take (the UI calls it once per frame); clears it.
+fn hub_peak_take(h: *mut Hub, dev: u64) -> u64 {
+    let s: usize = dev_slot((*h).blk, dev)
+    if s == NONE {
+        return 0
+    }
+    let v: u64 = rt.ld64((*h).blk, dbase(s) + D_PEAK)
+    rt.st64((*h).blk, dbase(s) + D_PEAK, 0)
+    return v
+}
+
+fn hub_device_peak_take(h: *mut Hub, dev: u64) -> u64 {
+    return hub_peak_take(h, dev)
+}
+
+fn hub_stream_peak_take(h: *mut Hub, sid: u64) -> u64 {
+    let k: usize = str_slot((*h).blk, sid)
+    if k == NONE {
+        return 0
+    }
+    let v: u64 = rt.ld64((*h).blk, sbase(k) + S_PEAK)
+    rt.st64((*h).blk, sbase(k) + S_PEAK, 0)
+    return v
+}
+
+// ---------------------------------------------------------------- microphone users (indicator)
+
+// Number of DIFFERENT apps with an open capture stream (the "microphone in use" indicator).
+fn hub_mic_app_count(h: *mut Hub) -> usize {
+    let b: u64 = (*h).blk
+    var seen: u64 = 0 // bit per app slot
+    var n: usize = 0
+    var k: usize = 0
+    while k < STRMAX {
+        let at: usize = sbase(k)
+        if rt.ld64(b, at + S_ID) != 0 && rt.ld64(b, at + S_DIR) == DIR_IN {
+            let app: u64 = rt.ld64(b, at + S_APP)
+            if app == 0 || (seen & (1 << (app - 1))) == 0 {
+                n = n + 1
+                if app != 0 {
+                    seen = seen | (1 << (app - 1))
+                }
+            }
+        }
+        k = k + 1
+    }
+    return n
+}
+
+// Name of the idx-th app that captures (open order of its first stream); 0 = out of range. NUL terminated.
+fn hub_mic_app_name(h: *mut Hub, idx: usize) -> u64 {
+    let b: u64 = (*h).blk
+    var seen: u64 = 0
+    var n: usize = 0
+    var last: u64 = 0
+    while true {
+        var next: u64 = 0
+        var nk: usize = NONE
+        var k: usize = 0
+        while k < STRMAX {
+            let at: usize = sbase(k)
+            let id: u64 = rt.ld64(b, at + S_ID)
+            if id > last && rt.ld64(b, at + S_DIR) == DIR_IN && (next == 0 || id < next) {
+                next = id
+                nk = k
+            }
+            k = k + 1
+        }
+        if next == 0 {
+            return 0
+        }
+        last = next
+        let app: u64 = rt.ld64(b, sbase(nk) + S_APP)
+        if app != 0 && (seen & (1 << (app - 1))) != 0 {
+            continue
+        }
+        if app != 0 {
+            seen = seen | (1 << (app - 1))
+        }
+        if n == idx {
+            if app == 0 {
+                return 0
+            }
+            return b + ((abase((app - 1) as usize) + A_NAME) * 8) as u64
+        }
+        n = n + 1
+    }
+    return 0
+}

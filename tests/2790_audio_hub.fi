@@ -1,0 +1,215 @@
+// expect_exit: 0
+// lib/audio/hub.fi -- device/stream registry of a sound server (devices, hot-plug, defaults + pin, volume/mute,
+// per-app mixer, microphone mute, levels, mic users, events, capacities).
+//  A  first device = default; higher priority wins; lower priority does not
+//  B  hot-unplug of the default falls back; streams follow; plugging the pinned device back wins again
+//  C  volume / mute per device, gain in permille, apply() in place, level, mute = zeros
+//  D  per-app mixer: shared entry, survives stream close; per-stream device (move) and wrong direction
+//  E  systemwide microphone mute: capture reads silence and level 0, playback is untouched
+//  F  mic users: distinct apps, names; events in order; capacity limits; stale ids
+import std.rt
+import std.io
+import audio.hub
+
+struct T {
+    fails: i32,
+    checks: i32,
+}
+
+fn check(t: *mut T, ok: bool, what: str) {
+    (*t).checks = (*t).checks + 1
+    if ok {
+        io.fmt_print(f"ok   {what}\n")
+    } else {
+        io.fmt_print(f"FAIL {what}\n")
+        (*t).fails = (*t).fails + 1
+    }
+}
+
+fn name_is(p: u64, s: str) -> bool {
+    if p == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < s.length() {
+        if rt.ld8(p, i) != rt.ld8(s.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return rt.ld8(p, i) == 0 as u8
+}
+
+fn fill(buf: u64, frames: usize, v: i16) {
+    var i: usize = 0
+    while i < frames * 2 {
+        rt.st16(buf, i, (v as i32 & 65535) as u16)
+        i = i + 1
+    }
+}
+
+fn first16(buf: u64) -> i32 {
+    var v: i32 = rt.ld16(buf, 0) as i32
+    if v >= 32768 {
+        v = v - 65536
+    }
+    return v
+}
+
+fn main() -> i32 {
+    var t: T = T { fails: 0, checks: 0 }
+    var h: hub.Hub = hub.hub_new()
+    check(&t, hub.hub_ok(&h), "hub created")
+
+    // ---- A defaults by priority
+    let spk: u64 = hub.hub_add_device(&h, "Speakers", hub.DIR_OUT, hub.K_BUILTIN, 48000, 2)
+    let mic: u64 = hub.hub_add_device(&h, "Internal Mic", hub.DIR_IN, hub.K_BUILTIN, 48000, 1)
+    check(&t, spk != 0 && mic != 0 && spk != mic, "ids non-zero and distinct")
+    check(&t, hub.hub_default(&h, hub.DIR_OUT) == spk, "A first output = default")
+    check(&t, hub.hub_default(&h, hub.DIR_IN) == mic, "A first input = default")
+    let test: u64 = hub.hub_add_device(&h, "Null sink", hub.DIR_OUT, hub.K_TEST, 48000, 2)
+    check(&t, hub.hub_default(&h, hub.DIR_OUT) == spk, "A virtual device (prio 0) does not take the default")
+    let hdmi: u64 = hub.hub_add_device(&h, "HDMI Monitor", hub.DIR_OUT, hub.K_HDMI, 48000, 2)
+    check(&t, hub.hub_default(&h, hub.DIR_OUT) == hdmi, "A HDMI (prio 2) beats built-in speakers (prio 1)")
+    let usb: u64 = hub.hub_add_device(&h, "USB Headset", hub.DIR_OUT, hub.K_USB, 48000, 2)
+    check(&t, hub.hub_default(&h, hub.DIR_OUT) == usb, "A USB headset (prio 3) becomes default")
+    check(&t, hub.hub_device_count(&h, hub.DIR_OUT) == 4 && hub.hub_device_count(&h, hub.DIR_IN) == 1, "A counts per direction")
+    check(&t, hub.hub_device_at(&h, hub.DIR_OUT, 0) == spk && hub.hub_device_at(&h, hub.DIR_OUT, 3) == usb && hub.hub_device_at(&h, hub.DIR_OUT, 4) == 0, "A device_at in plugging order")
+    check(&t, name_is(hub.hub_device_name(&h, usb), "USB Headset"), "A name readable")
+    check(&t, hub.hub_device_rate(&h, usb) == 48000 && hub.hub_device_channels(&h, mic) == 1, "A rate + channels")
+    let g0: u64 = hub.hub_gen(&h)
+
+    // ---- B unplug / replug / pin
+    let sA: u64 = hub.hub_stream_open(&h, "player", 17, hub.DIR_OUT, 0, 48000)
+    let sB: u64 = hub.hub_stream_open(&h, "game", 18, hub.DIR_OUT, spk, 48000)
+    check(&t, hub.hub_stream_device(&h, sA) == usb, "B stream without device follows the default")
+    check(&t, hub.hub_stream_device(&h, sB) == spk, "B stream with device uses it")
+    check(&t, hub.hub_remove_device(&h, usb), "B unplug USB")
+    check(&t, hub.hub_default(&h, hub.DIR_OUT) == hdmi, "B default falls back to the best remaining (HDMI)")
+    check(&t, hub.hub_stream_device(&h, sA) == hdmi, "B following stream moved with the default")
+    check(&t, !hub.hub_device_present(&h, usb) && !hub.hub_remove_device(&h, usb), "B stale id is gone")
+    check(&t, hub.hub_set_default(&h, spk), "B user pins Speakers")
+    let usb2: u64 = hub.hub_add_device(&h, "USB Headset", hub.DIR_OUT, hub.K_USB, 48000, 2)
+    check(&t, usb2 != usb && hub.hub_default(&h, hub.DIR_OUT) == spk, "B pinned default stays when a better device appears; new id")
+    check(&t, hub.hub_remove_device(&h, spk), "B unplug the pinned device")
+    check(&t, hub.hub_default(&h, hub.DIR_OUT) == usb2, "B fallback to best remaining (USB)")
+    check(&t, hub.hub_stream_device(&h, sB) == usb2, "B stream that asked for the removed device follows the default")
+    let spk2: u64 = hub.hub_add_device(&h, "Speakers", hub.DIR_OUT, hub.K_BUILTIN, 48000, 2)
+    check(&t, hub.hub_default(&h, hub.DIR_OUT) == spk2, "B pinned device returns (same name) and is default again")
+    check(&t, hub.hub_gen(&h) > g0, "B generation counter moved")
+
+    // ---- C volume, mute, gain, apply
+    check(&t, hub.hub_volume(&h, spk2) == 100 && !hub.hub_muted(&h, spk2), "C defaults 100 / not muted")
+    check(&t, hub.hub_set_volume(&h, spk2, 50) && hub.hub_volume(&h, spk2) == 50, "C set volume")
+    hub.hub_set_volume(&h, spk2, 250)
+    check(&t, hub.hub_volume(&h, spk2) == 100, "C volume clamps to 100")
+    hub.hub_set_volume(&h, spk2, 50)
+    let sC: u64 = hub.hub_stream_open(&h, "player", 17, hub.DIR_OUT, 0, 48000)
+    check(&t, hub.hub_gain_permille(&h, sC) == 500, "C gain = dev 50 x app 100 x stream 100 = 500 permille")
+    let buf: u64 = rt.heap_alloc(64 * 4)
+    fill(buf, 64, 10000 as i16)
+    let pk: u64 = hub.hub_apply(&h, sC, buf, 64, 2)
+    check(&t, pk == 5000 && first16(buf) == 5000, "C apply halves the samples, peak 5000")
+    check(&t, hub.hub_peak_peek(&h, spk2) == 5000 && hub.hub_peak_take(&h, spk2) == 5000 && hub.hub_peak_take(&h, spk2) == 0, "C device level, take clears it")
+    fill(buf, 64, -10000 as i16)
+    hub.hub_apply(&h, sC, buf, 64, 2)
+    check(&t, first16(buf) == -5000, "C negative samples scale symmetrically")
+    hub.hub_set_volume(&h, spk2, 100)
+    fill(buf, 64, 12345 as i16)
+    check(&t, hub.hub_apply(&h, sC, buf, 64, 2) == 12345 && first16(buf) == 12345, "C unity gain leaves samples alone")
+    hub.hub_set_mute(&h, spk2, true)
+    fill(buf, 64, 12345 as i16)
+    check(&t, hub.hub_apply(&h, sC, buf, 64, 2) == 0 && first16(buf) == 0 && hub.hub_gain_permille(&h, sC) == 0, "C muted device: zeros, level 0")
+    hub.hub_set_mute(&h, spk2, false)
+    check(&t, hub.hub_gain_permille(&h, 99999) == 0, "C unknown stream: gain 0")
+
+    // ---- D per-app mixer
+    check(&t, hub.hub_app_volume(&h, "player") == 100 && hub.hub_app_volume(&h, "nobody") == 100, "D app volume default 100")
+    check(&t, hub.hub_app_set_volume(&h, "player", 40), "D set app volume")
+    check(&t, hub.hub_gain_permille(&h, sC) == 400 && hub.hub_gain_permille(&h, sA) == 400, "D both streams of one app follow its volume")
+    check(&t, hub.hub_gain_permille(&h, sB) == 1000, "D another app is untouched")
+    hub.hub_stream_set_volume(&h, sC, 50)
+    check(&t, hub.hub_gain_permille(&h, sC) == 200 && hub.hub_gain_permille(&h, sA) == 400, "D stream volume is per stream (100 x 40 x 50 = 200)")
+    hub.hub_stream_close(&h, sC)
+    hub.hub_stream_close(&h, sA)
+    let sD: u64 = hub.hub_stream_open(&h, "player", 99, hub.DIR_OUT, 0, 44100)
+    check(&t, hub.hub_app_volume(&h, "player") == 40 && hub.hub_gain_permille(&h, sD) == 400, "D app volume survives a restart of the player")
+    hub.hub_app_set_mute(&h, "player", true)
+    check(&t, hub.hub_app_muted(&h, "player") && hub.hub_gain_permille(&h, sD) == 0, "D app mute")
+    hub.hub_app_set_mute(&h, "player", false)
+    check(&t, name_is(hub.hub_stream_owner(&h, sD), "player") && hub.hub_stream_pid(&h, sD) == 99, "D owner + pid of a stream")
+    check(&t, hub.hub_stream_move(&h, sD, hdmi) && hub.hub_stream_device(&h, sD) == hdmi, "D per-app output device")
+    check(&t, !hub.hub_stream_move(&h, sD, mic), "D a capture device is refused for a playback stream")
+    check(&t, hub.hub_stream_move(&h, sD, 0) && hub.hub_stream_device(&h, sD) == spk2, "D back to the default")
+    hub.hub_stream_set_mute(&h, sD, true)
+    check(&t, hub.hub_stream_muted(&h, sD) && hub.hub_gain_permille(&h, sD) == 0, "D stream mute")
+    hub.hub_stream_close(&h, sD)
+
+    // ---- E microphone mute
+    let c1: u64 = hub.hub_stream_open(&h, "voice", 31, hub.DIR_IN, 0, 48000)
+    check(&t, hub.hub_stream_device(&h, c1) == mic && hub.hub_gain_permille(&h, c1) == 1000, "E capture stream on the default input")
+    fill(buf, 64, 8000 as i16)
+    check(&t, hub.hub_apply(&h, c1, buf, 64, 2) == 8000, "E capture passes while the mic is live")
+    hub.hub_mic_mute(&h, true)
+    check(&t, hub.hub_mic_muted(&h) && hub.hub_gain_permille(&h, c1) == 0, "E mic mute -> gain 0")
+    fill(buf, 64, 8000 as i16)
+    check(&t, hub.hub_apply(&h, c1, buf, 64, 2) == 0 && first16(buf) == 0, "E capture reads silence, level 0")
+    let sE: u64 = hub.hub_stream_open(&h, "player", 17, hub.DIR_OUT, 0, 48000)
+    check(&t, hub.hub_gain_permille(&h, sE) > 0, "E playback is not affected by the mic mute")
+    hub.hub_mic_mute(&h, false)
+    check(&t, hub.hub_gain_permille(&h, c1) == 1000, "E unmute")
+
+    // ---- F mic users, events
+    let c2: u64 = hub.hub_stream_open(&h, "voice", 31, hub.DIR_IN, 0, 16000)
+    let c3: u64 = hub.hub_stream_open(&h, "recorder", 40, hub.DIR_IN, 0, 48000)
+    check(&t, hub.hub_mic_app_count(&h) == 2 && hub.hub_stream_count(&h, hub.DIR_IN) == 3, "F 3 capture streams of 2 apps")
+    check(&t, name_is(hub.hub_mic_app_name(&h, 0), "voice") && name_is(hub.hub_mic_app_name(&h, 1), "recorder") && hub.hub_mic_app_name(&h, 2) == 0, "F mic app names in open order")
+    hub.hub_stream_close(&h, c1)
+    hub.hub_stream_close(&h, c2)
+    check(&t, hub.hub_mic_app_count(&h) == 1 && name_is(hub.hub_mic_app_name(&h, 0), "recorder"), "F voice stopped, recorder remains")
+    hub.hub_stream_close(&h, c3)
+    check(&t, hub.hub_mic_app_count(&h) == 0, "F no capture, no indicator")
+    var ev: hub.HubEvent = hub.HubEvent { kind: 0, a: 0, b: 0 }
+    var seen_added: bool = false
+    var seen_def: bool = false
+    var seen_micmute: bool = false
+    var n: usize = 0
+    while hub.hub_event_pop(&h, &ev) {
+        n = n + 1
+        if ev.kind == hub.EV_DEV_ADDED { seen_added = true }
+        if ev.kind == hub.EV_DEFAULT { seen_def = true }
+        if ev.kind == hub.EV_MICMUTE && ev.a == 1 { seen_micmute = true }
+    }
+    check(&t, n > 0 && n <= 64 && seen_def && seen_micmute, "F events: queue bounded at 64, default and mic-mute events seen")
+    check(&t, hub.hub_event_count(&h) == 0, "F queue empty after popping")
+    hub.hub_set_volume(&h, spk2, 30)
+    check(&t, hub.hub_event_pop(&h, &ev) && ev.kind == hub.EV_VOLUME && ev.a == spk2 && ev.b == 30, "F volume event")
+    check(&t, seen_added || n == 64, "F device-added event or oldest dropped by the bound")
+
+    // capacity: 16 devices, 32 streams
+    var made: usize = 0
+    var i: usize = 0
+    while i < 30 {
+        if hub.hub_add_device(&h, "extra", hub.DIR_IN, hub.K_TEST, 48000, 1) != 0 {
+            made = made + 1
+        }
+        i = i + 1
+    }
+    check(&t, made == 11, "F device table is full at 16 (5 were already there)")
+    var opened: usize = 0
+    i = 0
+    while i < 40 {
+        if hub.hub_stream_open(&h, "flood", 1, hub.DIR_OUT, 0, 48000) != 0 {
+            opened = opened + 1
+        }
+        i = i + 1
+    }
+    check(&t, opened > 0 && opened < 40, "F stream table is bounded")
+    hub.hub_free(&h)
+    check(&t, !hub.hub_ok(&h), "freed")
+    io.fmt_print(f"checks={t.checks} fails={t.fails}\n")
+    if t.fails != 0 {
+        return 1
+    }
+    return 0
+}
