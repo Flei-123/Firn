@@ -1,0 +1,1894 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/ton/vorbis.fi -- Vorbis I DECODER (packets in, PCM out), in Firn.
+//
+//     import ton.vorbis
+//
+//     let v: *mut vorbis.Vorbis = vorbis.vorbis_new()
+//     vorbis.vorbis_header(v, id_ptr, id_len)        // 1st packet of the stream: identification
+//     vorbis.vorbis_header(v, cm_ptr, cm_len)        // 2nd: comments
+//     vorbis.vorbis_header(v, su_ptr, su_len)        // 3rd: setup (codebooks, floors, residues, ...)
+//     // for every audio packet:
+//     let frames: i32 = vorbis.vorbis_decode(v, pkt_ptr, pkt_len)   // >= 0 frames, < 0 error
+//     vorbis.vorbis_to_i16(v, frames, dst)           // interleaved 16 bit, or
+//     vorbis.vorbis_to_f32(v, frames, dst)           // interleaved f32, -1.0 .. 1.0
+//     vorbis.vorbis_free(v)
+//
+// The Ogg container is `ton.ogg`; `ton.vorbis_file` glues both (whole file ->
+// PCM). This file knows nothing about Ogg: it takes the PACKETS.
+//
+// WHAT IS IN. Everything a Vorbis I stream needs: identification / comment /
+// setup headers, codebooks (Huffman trees, lookup types 1 and 2), FLOOR TYPE 1,
+// residue types 0, 1 and 2, mappings with submaps and square-polar channel
+// coupling, up to 255 channels, both block sizes (64 .. 8192), the power
+// complementary window with all four long/short neighbour shapes, the inverse
+// MDCT (N/4 point complex FFT, O(N log N)) and the overlap-add. The first audio
+// packet yields no samples (as in the format); afterwards a packet yields
+// blocksize_prev/4 + blocksize_this/4 frames.
+//
+// HONESTLY, WHAT IS NOT:
+//  * FLOOR TYPE 0 (the LSP floor) is rejected with an error. No encoder in
+//    use writes it (libvorbis never did since 2000, ffmpeg does not), and
+//    stb_vorbis does not decode it either.
+//  * Chained and multiplexed streams are handled one level up (ton.ogg /
+//    ton.vorbis_file), not here.
+//  * It decodes with f32 like the reference decoder (libvorbis); results
+//    agree to float rounding, not to the bit (see docs/VORBIS.md for numbers).
+//
+// ROBUSTNESS. A damaged packet never reads or writes out of bounds: every
+// bit read is bounds checked, every index coming from the stream is validated
+// at setup time or clamped, memory is bounded by a budget. A packet that runs
+// out of bits in the middle decodes what was there (the rest is zero), as the
+// specification demands. The setup of a damaged stream fails with an error
+// code instead (never a crash).
+//
+// ERROR CODES (negative):
+//   -1 malformed / unsupported stream     -2 not an audio packet (header packet)
+//   -3 decoder not ready (headers missing) -4 out of memory     -5 floor type 0
+import std.rt
+import std.math
+import ton.vorbis_tab
+
+export {
+    Vorbis,
+    vorbis_new, vorbis_free, vorbis_header, vorbis_decode, vorbis_reset,
+    vorbis_channels, vorbis_rate, vorbis_ready, vorbis_blocksizes,
+    vorbis_out_ptr, vorbis_to_i16, vorbis_to_f32,
+    BLOCK_MIN, BLOCK_MAX,
+}
+
+const BLOCK_MIN: i32 = 64
+const BLOCK_MAX: i32 = 8192
+const MAX_BOOKS: i32 = 256
+const MAX_FLOORS: i32 = 64
+const MAX_RES: i32 = 64
+const MAX_MAPS: i32 = 64
+const MAX_MODES: i32 = 64
+const MAX_CH: i32 = 255
+const FAST_BITS: i32 = 9
+const FAST_SIZE: i32 = 512
+const FLOOR_MAX_VALS: i32 = 66
+const BUDGET: i64 = 8388608 // 8 Mi values of codebook entries / lookup floats over the whole setup
+
+// ====================================================================
+// MEMORY HELPERS (raw addresses; every index is checked by the caller)
+// ====================================================================
+
+fn adr(p: u64, i: i64, size: u64) -> u64 {
+    return p +% ((i as u64) *% size)
+}
+
+fn ldi(p: u64, i: i64) -> i32 {
+    return *(adr(p, i, 4) as *mut i32)
+}
+
+fn sti(p: u64, i: i64, v: i32) {
+    *(adr(p, i, 4) as *mut i32) = v
+}
+
+fn ldf(p: u64, i: i64) -> f32 {
+    return *(adr(p, i, 4) as *mut f32)
+}
+
+fn stf(p: u64, i: i64, v: f32) {
+    *(adr(p, i, 4) as *mut f32) = v
+}
+
+fn ldu64(p: u64, i: i64) -> u64 {
+    return *(adr(p, i, 8) as *mut u64)
+}
+
+fn ldb(p: u64, i: i64) -> u8 {
+    return *((p +% (i as u64)) as *mut u8)
+}
+
+fn ilog(x: i32) -> i32 {
+    var n: i32 = 0
+    var v: i32 = x
+    while v > 0 {
+        n = n + 1
+        v = v >> 1
+    }
+    return n
+}
+
+// ====================================================================
+// THE BIT READER -- Vorbis packs bits LSB first
+// ====================================================================
+
+struct Br {
+    buf: u64,
+    nbits: i64,
+    pos: i64,
+    eop: bool, // a read went past the end of the packet
+}
+
+fn br_init(b: *mut Br, p: u64, n: usize) {
+    (*b).buf = p
+    (*b).nbits = (n as i64) * 8
+    (*b).pos = 0
+    (*b).eop = false
+}
+
+// `n` bits (0 .. 32). Past the end: zero and `eop`.
+fn br_read(b: *mut Br, n: i32) -> u32 {
+    if n <= 0 {
+        return 0 as u32
+    }
+    let end: i64 = (*b).pos + (n as i64)
+    if end > (*b).nbits {
+        (*b).pos = (*b).nbits
+        (*b).eop = true
+        return 0 as u32
+    }
+    var acc: u64 = 0
+    var got: i64 = 0
+    var p: i64 = (*b).pos
+    let want: i64 = n as i64
+    while got < want {
+        let byte: u64 = ldb((*b).buf, p >> 3) as u64
+        let sh: i64 = p & 7
+        var take: i64 = 8 - sh
+        if take > want - got {
+            take = want - got
+        }
+        let part: u64 = (byte >> (sh as u64)) & (((1 as u64) << (take as u64)) - (1 as u64))
+        acc = acc | (part << (got as u64))
+        got = got + take
+        p = p + take
+    }
+    (*b).pos = end
+    return acc as u32
+}
+
+// The next `n` bits (n <= 24) without consuming them; zeros past the end.
+fn br_peek(b: *mut Br, n: i32) -> u32 {
+    let p: i64 = (*b).pos
+    let bi: i64 = p >> 3
+    let nbytes: i64 = (*b).nbits >> 3
+    var w: u64 = 0
+    var k: i64 = 0
+    while k < 4 {
+        if bi + k < nbytes {
+            w = w | ((ldb((*b).buf, bi + k) as u64) << ((k * 8) as u64))
+        }
+        k = k + 1
+    }
+    return ((w >> ((p & 7) as u64)) & (((1 as u64) << (n as u64)) - (1 as u64))) as u32
+}
+
+fn br_skip(b: *mut Br, n: i32) {
+    (*b).pos = (*b).pos + (n as i64)
+    if (*b).pos > (*b).nbits {
+        (*b).pos = (*b).nbits
+        (*b).eop = true
+    }
+}
+
+fn br_bit(b: *mut Br) -> i32 {
+    return br_read(b, 1) as i32
+}
+
+// ====================================================================
+// THE STRUCTURES OF A DECODER
+// ====================================================================
+
+struct Codebook {
+    dims: i32,
+    entries: i32,
+    ltype: i32,   // 0 = no lookup (scalar only), 1 / 2 = vector lookup
+    fast: u64,    // i32[512]: (entry << 5 | length) for codes <= 9 bits, else -1
+    tree: u64,    // i32[2 * nodes]: 0 = hole, > 0 = node, < 0 = leaf -(entry + 1)
+    nodes: i32,
+    vq: u64,      // f32[entries * dims] (ltype != 0)
+}
+
+struct Floor1 {
+    partitions: i32,
+    nvals: i32,
+    mult: i32,
+    range: i32,
+    rangebits: i32,
+    part_class: [i32; 32],
+    class_dim: [i32; 16],
+    class_sub: [i32; 16],
+    class_master: [i32; 16],
+    class_book: [i32; 128],
+    xl: [i32; 66],
+    sorted: [i32; 66],
+    lo: [i32; 66],
+    hi: [i32; 66],
+}
+
+struct Residue {
+    rtype: i32,
+    begin: i32,
+    end: i32,
+    psize: i32,
+    classes: i32,
+    classbook: i32,
+    book: [i32; 512], // [class * 8 + pass], -1 = none
+    pass_used: [bool; 8],
+}
+
+struct Mapping {
+    submaps: i32,
+    coupling: i32,
+    mag: [i32; 256],
+    ang: [i32; 256],
+    mux: [i32; 256],
+    sub_floor: [i32; 16],
+    sub_res: [i32; 16],
+}
+
+struct Mode {
+    blockflag: i32,
+    mapping: i32,
+}
+
+// Tables for the inverse MDCT of one block size.
+struct Mdct {
+    n: i32,
+    pre_c: u64,
+    pre_s: u64,
+    post_c: u64,
+    post_s: u64,
+    w_re: u64,
+    w_im: u64,
+    rev: u64,
+}
+
+struct Vorbis {
+    stage: i32,        // 0 = wait for identification, 1 = comment, 2 = setup, 3 = ready
+    channels: i32,
+    rate: i32,
+    bs0: i32,
+    bs1: i32,
+    nbooks: i32,
+    nfloors: i32,
+    nres: i32,
+    nmaps: i32,
+    nmodes: i32,
+    budget: i64,
+    books: [Codebook; 256],
+    floors: [Floor1; 64],
+    res: [Residue; 64],
+    maps: [Mapping; 64],
+    modes: [Mode; 64],
+    mdct: [Mdct; 2],
+    slope: [u64; 2],   // f32[bs/2] each: the rising half of the window for bs0 and bs1
+    db: [f32; 256],
+    allocs: rt.Buf,    // (ptr, size) pairs of everything allocated
+    // run time
+    prev_n: i32,       // block size of the previous block, 0 = none yet
+    prev: u64,         // channels * (bs1 / 2) f32: the windowed second half of the previous block
+    spec: u64,         // channels * (bs1 / 2) f32
+    curve: u64,        // channels * (bs1 / 2) f32: floor curves
+    ybuf: u64,         // bs1 f32: IMDCT output
+    cbuf: u64,         // bs1 / 2 f32: DCT-IV result
+    fre: u64,          // bs1 / 4 f32
+    fim: u64,          // bs1 / 4 f32
+    res2: u64,         // channels * (bs1 / 2) f32: interleaved residue of type 2
+    cls: u64,          // channels * (bs1 / 2) + 64 i32: residue classifications
+    out: u64,          // channels * (bs1 / 2) f32: planar output of the last packet
+    out_frames: i32,
+    nz: [bool; 256],   // floor used
+    nz2: [bool; 256],  // after coupling: residue to decode
+    last_error: i32,
+}
+
+// ---------------------------------------------------------------- allocation
+
+fn valloc(v: *mut Vorbis, n: usize) -> u64 {
+    if n == 0 {
+        return 0
+    }
+    let p: u64 = rt.heap_alloc(n)
+    if p == 0 {
+        return 0
+    }
+    rt.buf_push_bytes(&(*v).allocs, (&p) as u64, 8)
+    let sz: u64 = n as u64
+    rt.buf_push_bytes(&(*v).allocs, (&sz) as u64, 8)
+    return p
+}
+
+fn vorbis_new() -> *mut Vorbis {
+    let p: u64 = rt.heap_alloc(size_of[Vorbis]())
+    if p == 0 {
+        return 0 as *mut Vorbis
+    }
+    let v: *mut Vorbis = p as *mut Vorbis
+    (*v).allocs = rt.buf_new()
+    (*v).stage = 0
+    (*v).budget = BUDGET
+    (*v).db = vorbis_tab.vorbis_db_table()
+    return v
+}
+
+fn vorbis_free(v: *mut Vorbis) {
+    if v as u64 == 0 {
+        return
+    }
+    let a: u64 = rt.buf_ptr(&(*v).allocs)
+    let n: usize = rt.buf_len(&(*v).allocs) / 16
+    var i: usize = 0
+    while i < n {
+        let p: u64 = *((a + (i * 16) as u64) as *mut u64)
+        let s: u64 = *((a + (i * 16 + 8) as u64) as *mut u64)
+        rt.heap_free(p, s as usize)
+        i = i + 1
+    }
+    rt.buf_free(&(*v).allocs)
+    rt.heap_free(v as u64, size_of[Vorbis]())
+}
+
+fn vorbis_ready(v: *mut Vorbis) -> bool {
+    return (*v).stage == 3
+}
+
+fn vorbis_channels(v: *mut Vorbis) -> i32 {
+    return (*v).channels
+}
+
+fn vorbis_rate(v: *mut Vorbis) -> i32 {
+    return (*v).rate
+}
+
+fn vorbis_blocksizes(v: *mut Vorbis, which: i32) -> i32 {
+    if which == 0 {
+        return (*v).bs0
+    }
+    return (*v).bs1
+}
+
+// Pointer to the planar output of channel `ch` after `vorbis_decode` (f32 each).
+fn vorbis_out_ptr(v: *mut Vorbis, ch: i32) -> u64 {
+    return (*v).out + (ch as u64) * (((*v).bs1 / 2) as u64) * 4
+}
+
+// Forget the overlap state (call before decoding an unrelated position/stream).
+fn vorbis_reset(v: *mut Vorbis) {
+    (*v).prev_n = 0
+    (*v).out_frames = 0
+}
+
+// ====================================================================
+// CODEBOOKS
+// ====================================================================
+
+fn f32_unpack(x: u32) -> f32 {
+    var mant: f64 = (x & 2097151 as u32) as f64
+    if (x & 2147483648 as u32) != 0 as u32 {
+        mant = 0.0 - mant
+    }
+    let e: i64 = (((x & 2145386496 as u32) >> 21) as i64) - 788
+    return (mant * math.powi(2.0, e)) as f32
+}
+
+// r ^ dims <= limit ?
+fn ipow_le(r: i64, dims: i32, limit: i64) -> bool {
+    var acc: i64 = 1
+    var i: i32 = 0
+    while i < dims {
+        acc = acc * r
+        if acc > limit {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The greatest r with r ^ dims <= entries.
+fn lookup1_values(entries: i32, dims: i32) -> i64 {
+    var lo: i64 = 1
+    var hi: i64 = entries as i64
+    while lo < hi {
+        let mid: i64 = (lo + hi + 1) / 2
+        if ipow_le(mid, dims, entries as i64) {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    return lo
+}
+
+// Adds the code (left justified in 32 bits, `len` bits long) of `entry` to the tree.
+fn tree_insert(tb: *mut rt.Buf, fast: u64, res: u32, len: i32, entry: i32) -> bool {
+    var node: i32 = 0
+    var k: i32 = 0
+    while k < len {
+        let bit: i32 = ((res >> ((31 - k) as u32)) & 1 as u32) as i32
+        let slot: i64 = (node as i64) * 2 + (bit as i64)
+        let child: i32 = ldi(rt.buf_ptr(tb), slot)
+        if k == len - 1 {
+            if child != 0 {
+                return false
+            }
+            sti(rt.buf_ptr(tb), slot, 0 - (entry + 1))
+        } else {
+            if child < 0 {
+                return false
+            }
+            if child == 0 {
+                let nn: i32 = (rt.buf_len(tb) / 8) as i32
+                var z8: i32 = 0
+                while z8 < 8 {
+                    rt.buf_push(tb, 0 as u8)
+                    z8 = z8 + 1
+                }
+                sti(rt.buf_ptr(tb), slot, nn)
+                node = nn
+            } else {
+                node = child
+            }
+        }
+        k = k + 1
+    }
+    if len <= FAST_BITS {
+        // reverse the code bits: stream bit i is the code's bit (len - 1 - i)
+        var r: i32 = 0
+        var i: i32 = 0
+        while i < len {
+            let bit: i32 = ((res >> ((31 - i) as u32)) & 1 as u32) as i32
+            r = r | (bit << i)
+            i = i + 1
+        }
+        let fill: i32 = 1 << (FAST_BITS - len)
+        var j: i32 = 0
+        while j < fill {
+            sti(fast, (r | (j << len)) as i64, (entry << 5) | len)
+            j = j + 1
+        }
+    }
+    return true
+}
+
+// Parses one codebook from the setup packet into books[idx].
+fn parse_codebook(v: *mut Vorbis, br: *mut Br, idx: i32) -> i32 {
+    let cb: *mut Codebook = &(*v).books[idx as usize]
+    if br_read(br, 24) != 5653314 as u32 { // "BCV"
+        return -1
+    }
+    let dims: i32 = br_read(br, 16) as i32
+    let entries: i32 = br_read(br, 24) as i32
+    if dims < 1 || entries < 1 || entries > 4194304 {
+        return -1
+    }
+    (*v).budget = (*v).budget - (entries as i64)
+    if (*v).budget < 0 {
+        return -1
+    }
+    let ordered: i32 = br_bit(br)
+    // an unordered book needs at least 1 bit per entry, a sparse one at least 1 bit (flag)
+    if ordered == 0 && (*br).nbits - (*br).pos < (entries as i64) {
+        return -1
+    }
+    let lens: u64 = rt.heap_alloc(entries as usize)
+    if lens == 0 {
+        return -4
+    }
+    var status: i32 = 0
+    if ordered == 0 {
+        let sparse: i32 = br_bit(br)
+        var i: i32 = 0
+        while i < entries {
+            if sparse != 0 {
+                if br_bit(br) != 0 {
+                    rt.st8(lens, i as usize, (br_read(br, 5) + 1 as u32) as u8)
+                } else {
+                    rt.st8(lens, i as usize, 0 as u8)
+                }
+            } else {
+                rt.st8(lens, i as usize, (br_read(br, 5) + 1 as u32) as u8)
+            }
+            i = i + 1
+        }
+    } else {
+        var cur: i32 = 0
+        var curlen: i32 = (br_read(br, 5) + 1 as u32) as i32
+        while cur < entries && status == 0 {
+            let number: i32 = br_read(br, ilog(entries - cur)) as i32
+            if cur + number > entries || curlen > 32 {
+                status = -1
+            } else {
+                var i: i32 = 0
+                while i < number {
+                    rt.st8(lens, (cur + i) as usize, curlen as u8)
+                    i = i + 1
+                }
+                cur = cur + number
+                curlen = curlen + 1
+            }
+            if (*br).eop {
+                status = -1
+            }
+        }
+    }
+    if (*br).eop {
+        status = -1
+    }
+    // ---- Huffman tree and fast table
+    var tb: rt.Buf = rt.buf_new()
+    if status == 0 {
+        let fast: u64 = valloc(v, (FAST_SIZE as usize) * 4)
+        if fast == 0 {
+            status = -4
+        } else {
+            var i: i32 = 0
+            while i < FAST_SIZE {
+                sti(fast, i as i64, -1)
+                i = i + 1
+            }
+            (*cb).fast = fast
+            // root node
+            var z: i32 = 0
+            while z < 8 {
+                rt.buf_push(&tb, 0 as u8)
+                z = z + 1
+            }
+            var avail: [u32; 33] = [0; 33]
+            var k: i32 = 0
+            while k < entries && rt.ld8(lens, k as usize) == 0 as u8 {
+                k = k + 1
+            }
+            if k < entries {
+                let l0: i32 = rt.ld8(lens, k as usize) as i32
+                if !tree_insert(&tb, fast, 0 as u32, l0, k) {
+                    status = -1
+                }
+                var q: i32 = 1
+                while q <= l0 {
+                    avail[q as usize] = (1 as u32) << ((32 - q) as u32)
+                    q = q + 1
+                }
+                var e: i32 = k + 1
+                while e < entries && status == 0 {
+                    let le: i32 = rt.ld8(lens, e as usize) as i32
+                    if le != 0 {
+                        var zz: i32 = le
+                        while zz > 0 && avail[zz as usize] == 0 as u32 {
+                            zz = zz - 1
+                        }
+                        if zz == 0 {
+                            status = -1 // over-specified tree
+                        } else {
+                            let res: u32 = avail[zz as usize]
+                            avail[zz as usize] = 0 as u32
+                            if !tree_insert(&tb, fast, res, le, e) {
+                                status = -1
+                            } else {
+                                var y: i32 = le
+                                while y > zz {
+                                    avail[y as usize] = res +% ((1 as u32) << ((32 - y) as u32))
+                                    y = y - 1
+                                }
+                            }
+                        }
+                    }
+                    e = e + 1
+                }
+            }
+            if status == 0 {
+                let tn: usize = rt.buf_len(&tb)
+                let tp: u64 = valloc(v, tn)
+                if tp == 0 {
+                    status = -4
+                } else {
+                    rt.mem_copy(tp, rt.buf_ptr(&tb), tn)
+                    (*cb).tree = tp
+                    (*cb).nodes = (tn / 8) as i32
+                }
+            }
+        }
+    }
+    rt.buf_free(&tb)
+    rt.heap_free(lens, entries as usize)
+    if status != 0 {
+        return status
+    }
+    (*cb).dims = dims
+    (*cb).entries = entries
+    // ---- lookup table
+    let ltype: i32 = br_read(br, 4) as i32
+    (*cb).ltype = ltype
+    if ltype > 2 {
+        return -1
+    }
+    if ltype != 0 {
+        let minv: f32 = f32_unpack(br_read(br, 32))
+        let delta: f32 = f32_unpack(br_read(br, 32))
+        let vbits: i32 = (br_read(br, 4) + 1 as u32) as i32
+        let seq: i32 = br_bit(br)
+        var lvals: i64 = 0
+        if ltype == 1 {
+            lvals = lookup1_values(entries, dims)
+        } else {
+            lvals = (entries as i64) * (dims as i64)
+        }
+        let total: i64 = (entries as i64) * (dims as i64)
+        (*v).budget = (*v).budget - total
+        if (*v).budget < 0 || (*br).nbits - (*br).pos < lvals * (vbits as i64) {
+            return -1
+        }
+        let mults: u64 = rt.heap_alloc((lvals as usize) * 4)
+        if mults == 0 {
+            return -4
+        }
+        var m: i64 = 0
+        while m < lvals {
+            sti(mults, m, br_read(br, vbits) as i32)
+            m = m + 1
+        }
+        let vq: u64 = valloc(v, (total as usize) * 4)
+        if vq == 0 {
+            rt.heap_free(mults, (lvals as usize) * 4)
+            return -4
+        }
+        (*cb).vq = vq
+        var e: i64 = 0
+        while e < (entries as i64) {
+            var last: f32 = 0.0
+            var div: i64 = 1
+            var d: i64 = 0
+            while d < (dims as i64) {
+                var q: i32 = 0
+                if ltype == 1 {
+                    q = ldi(mults, (e / div) % lvals)
+                } else {
+                    q = ldi(mults, e * (dims as i64) + d)
+                }
+                var val: f32 = (q as f32) * delta
+                val = val + minv
+                val = val + last
+                if seq != 0 {
+                    last = val
+                }
+                stf(vq, e * (dims as i64) + d, val)
+                if ltype == 1 {
+                    div = div * lvals
+                }
+                d = d + 1
+            }
+            e = e + 1
+        }
+        rt.heap_free(mults, (lvals as usize) * 4)
+    }
+    if (*br).eop {
+        return -1
+    }
+    return 0
+}
+
+// Decodes one scalar (the entry number) with the Huffman code of `cb`. -1 at the end of the packet.
+fn cb_decode(b: *mut Br, cb: *mut Codebook) -> i32 {
+    let f: i32 = ldi((*cb).fast, br_peek(b, FAST_BITS) as i64)
+    if f >= 0 {
+        br_skip(b, f & 31)
+        if (*b).eop {
+            return -1
+        }
+        return f >> 5
+    }
+    var node: i32 = 0
+    while true {
+        let bit: i32 = br_bit(b)
+        if (*b).eop {
+            return -1
+        }
+        let c: i32 = ldi((*cb).tree, (node as i64) * 2 + (bit as i64))
+        if c == 0 {
+            return -1
+        }
+        if c < 0 {
+            return 0 - c - 1
+        }
+        node = c
+    }
+    return -1
+}
+
+// ====================================================================
+// FLOOR 1 -- setup
+// ====================================================================
+
+fn parse_floor1(v: *mut Vorbis, br: *mut Br, idx: i32) -> i32 {
+    let f: *mut Floor1 = &(*v).floors[idx as usize]
+    let parts: i32 = br_read(br, 5) as i32
+    (*f).partitions = parts
+    var maxclass: i32 = -1
+    var i: i32 = 0
+    while i < parts {
+        let c: i32 = br_read(br, 4) as i32
+        (*f).part_class[i as usize] = c
+        if c > maxclass {
+            maxclass = c
+        }
+        i = i + 1
+    }
+    i = 0
+    while i <= maxclass {
+        (*f).class_dim[i as usize] = (br_read(br, 3) + 1 as u32) as i32
+        let sub: i32 = br_read(br, 2) as i32
+        (*f).class_sub[i as usize] = sub
+        if sub != 0 {
+            let mb: i32 = br_read(br, 8) as i32
+            if mb >= (*v).nbooks {
+                return -1
+            }
+            (*f).class_master[i as usize] = mb
+        }
+        var j: i32 = 0
+        while j < (1 << sub) {
+            let b: i32 = (br_read(br, 8) as i32) - 1
+            if b >= (*v).nbooks {
+                return -1
+            }
+            (*f).class_book[(i * 8 + j) as usize] = b
+            j = j + 1
+        }
+        i = i + 1
+    }
+    (*f).mult = (br_read(br, 2) + 1 as u32) as i32
+    let rb: i32 = br_read(br, 4) as i32
+    (*f).rangebits = rb
+    if (*f).mult == 1 {
+        (*f).range = 256
+    } else {
+        if (*f).mult == 2 {
+            (*f).range = 128
+        } else {
+            if (*f).mult == 3 {
+                (*f).range = 86
+            } else {
+                (*f).range = 64
+            }
+        }
+    }
+    (*f).xl[0] = 0
+    (*f).xl[1] = 1 << rb
+    var nv: i32 = 2
+    i = 0
+    while i < parts {
+        let c: i32 = (*f).part_class[i as usize]
+        var j: i32 = 0
+        while j < (*f).class_dim[c as usize] {
+            if nv >= FLOOR_MAX_VALS - 1 {
+                return -1
+            }
+            (*f).xl[nv as usize] = br_read(br, rb) as i32
+            nv = nv + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    (*f).nvals = nv
+    if (*br).eop {
+        return -1
+    }
+    // sorted order (insertion sort on index) and the uniqueness check
+    i = 0
+    while i < nv {
+        (*f).sorted[i as usize] = i
+        i = i + 1
+    }
+    i = 1
+    while i < nv {
+        let key: i32 = (*f).sorted[i as usize]
+        var j: i32 = i - 1
+        while j >= 0 && (*f).xl[(*f).sorted[j as usize] as usize] > (*f).xl[key as usize] {
+            (*f).sorted[(j + 1) as usize] = (*f).sorted[j as usize]
+            j = j - 1
+        }
+        (*f).sorted[(j + 1) as usize] = key
+        i = i + 1
+    }
+    i = 1
+    while i < nv {
+        if (*f).xl[(*f).sorted[i as usize] as usize] == (*f).xl[(*f).sorted[(i - 1) as usize] as usize] {
+            return -1
+        }
+        i = i + 1
+    }
+    // neighbours: the nearest smaller / larger X among the earlier points
+    i = 2
+    while i < nv {
+        var lo: i32 = 0
+        var hi: i32 = 1
+        var j: i32 = 0
+        while j < i {
+            let x: i32 = (*f).xl[j as usize]
+            if x < (*f).xl[i as usize] && x > (*f).xl[lo as usize] {
+                lo = j
+            }
+            if x > (*f).xl[i as usize] && x < (*f).xl[hi as usize] {
+                hi = j
+            }
+            j = j + 1
+        }
+        (*f).lo[i as usize] = lo
+        (*f).hi[i as usize] = hi
+        i = i + 1
+    }
+    return 0
+}
+
+// ====================================================================
+// RESIDUE / MAPPING / MODES -- setup
+// ====================================================================
+
+fn parse_residue(v: *mut Vorbis, br: *mut Br, idx: i32, rtype: i32) -> i32 {
+    let r: *mut Residue = &(*v).res[idx as usize]
+    (*r).rtype = rtype
+    (*r).begin = br_read(br, 24) as i32
+    (*r).end = br_read(br, 24) as i32
+    (*r).psize = (br_read(br, 24) + 1 as u32) as i32
+    (*r).classes = (br_read(br, 6) + 1 as u32) as i32
+    (*r).classbook = br_read(br, 8) as i32
+    if (*r).classbook >= (*v).nbooks || (*r).end < (*r).begin {
+        return -1
+    }
+    if (*v).books[(*r).classbook as usize].entries < 1 {
+        return -1
+    }
+    var cascade: [i32; 64] = [0; 64]
+    var i: i32 = 0
+    while i < (*r).classes {
+        let low: i32 = br_read(br, 3) as i32
+        var high: i32 = 0
+        if br_bit(br) != 0 {
+            high = br_read(br, 5) as i32
+        }
+        cascade[i as usize] = high * 8 + low
+        i = i + 1
+    }
+    i = 0
+    while i < (*r).classes {
+        var j: i32 = 0
+        while j < 8 {
+            var b: i32 = -1
+            if (cascade[i as usize] & (1 << j)) != 0 {
+                b = br_read(br, 8) as i32
+                if b >= (*v).nbooks {
+                    return -1
+                }
+                // the vectors come from the lookup table: a book without one cannot be used
+                if (*v).books[b as usize].ltype == 0 {
+                    return -1
+                }
+                (*r).pass_used[j as usize] = true
+            }
+            (*r).book[(i * 8 + j) as usize] = b
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if (*br).eop {
+        return -1
+    }
+    return 0
+}
+
+fn parse_mapping(v: *mut Vorbis, br: *mut Br, idx: i32) -> i32 {
+    let m: *mut Mapping = &(*v).maps[idx as usize]
+    if br_read(br, 16) != 0 as u32 {
+        return -1
+    }
+    var submaps: i32 = 1
+    if br_bit(br) != 0 {
+        submaps = (br_read(br, 4) + 1 as u32) as i32
+    }
+    (*m).submaps = submaps
+    let ch: i32 = (*v).channels
+    if br_bit(br) != 0 {
+        let steps: i32 = (br_read(br, 8) + 1 as u32) as i32
+        (*m).coupling = steps
+        let bits: i32 = ilog(ch - 1)
+        var i: i32 = 0
+        while i < steps {
+            let mg: i32 = br_read(br, bits) as i32
+            let an: i32 = br_read(br, bits) as i32
+            if mg == an || mg >= ch || an >= ch {
+                return -1
+            }
+            (*m).mag[i as usize] = mg
+            (*m).ang[i as usize] = an
+            i = i + 1
+        }
+    }
+    if br_read(br, 2) != 0 as u32 {
+        return -1
+    }
+    if submaps > 1 {
+        var i: i32 = 0
+        while i < ch {
+            let mx: i32 = br_read(br, 4) as i32
+            if mx >= submaps {
+                return -1
+            }
+            (*m).mux[i as usize] = mx
+            i = i + 1
+        }
+    }
+    var s: i32 = 0
+    while s < submaps {
+        br_read(br, 8) // the time configuration, unused
+        let fl: i32 = br_read(br, 8) as i32
+        let rs: i32 = br_read(br, 8) as i32
+        if fl >= (*v).nfloors || rs >= (*v).nres {
+            return -1
+        }
+        (*m).sub_floor[s as usize] = fl
+        (*m).sub_res[s as usize] = rs
+        s = s + 1
+    }
+    if (*br).eop {
+        return -1
+    }
+    return 0
+}
+
+// ====================================================================
+// MDCT TABLES, WINDOW SLOPES
+// ====================================================================
+
+fn mdct_setup(v: *mut Vorbis, which: i32, n: i32) -> bool {
+    let m: *mut Mdct = &(*v).mdct[which as usize]
+    let mm: i32 = n / 2
+    let h: i32 = n / 4
+    (*m).n = n
+    (*m).pre_c = valloc(v, (h as usize) * 4)
+    (*m).pre_s = valloc(v, (h as usize) * 4)
+    (*m).post_c = valloc(v, (h as usize) * 4)
+    (*m).post_s = valloc(v, (h as usize) * 4)
+    (*m).w_re = valloc(v, (h as usize) * 4)
+    (*m).w_im = valloc(v, (h as usize) * 4)
+    (*m).rev = valloc(v, (h as usize) * 4)
+    if (*m).pre_c == 0 || (*m).pre_s == 0 || (*m).post_c == 0 || (*m).post_s == 0
+        || (*m).w_re == 0 || (*m).w_im == 0 || (*m).rev == 0 {
+        return false
+    }
+    let pi: f64 = math.PI()
+    var j: i32 = 0
+    while j < h {
+        let a: f64 = pi * ((4 * j + 1) as f64) / ((4 * mm) as f64)
+        stf((*m).pre_c, j as i64, math.cos(a) as f32)
+        stf((*m).pre_s, j as i64, math.sin(a) as f32)
+        let b: f64 = pi * (j as f64) / (mm as f64)
+        stf((*m).post_c, j as i64, math.cos(b) as f32)
+        stf((*m).post_s, j as i64, math.sin(b) as f32)
+        let w: f64 = 2.0 * pi * (j as f64) / (h as f64)
+        stf((*m).w_re, j as i64, math.cos(w) as f32)
+        stf((*m).w_im, j as i64, (0.0 - math.sin(w)) as f32)
+        j = j + 1
+    }
+    let bits: i32 = ilog(h) - 1 // h is a power of two
+    j = 0
+    while j < h {
+        var r: i32 = 0
+        var k: i32 = 0
+        while k < bits {
+            r = r | (((j >> k) & 1) << (bits - 1 - k))
+            k = k + 1
+        }
+        sti((*m).rev, j as i64, r)
+        j = j + 1
+    }
+    return true
+}
+
+// The rising half of the window: sin(pi/2 * sin^2(pi * (i + 0.5) / n)), i < n/2.
+fn slope_setup(v: *mut Vorbis, which: i32, n: i32) -> bool {
+    let half: i32 = n / 2
+    let p: u64 = valloc(v, (half as usize) * 4)
+    if p == 0 {
+        return false
+    }
+    (*v).slope[which as usize] = p
+    let pi: f64 = math.PI()
+    var i: i32 = 0
+    while i < half {
+        let s: f64 = math.sin(pi * ((i as f64) + 0.5) / (n as f64))
+        stf(p, i as i64, math.sin(pi / 2.0 * s * s) as f32)
+        i = i + 1
+    }
+    return true
+}
+
+// ====================================================================
+// HEADER PACKETS
+// ====================================================================
+
+fn check_magic(br: *mut Br, kind: i32) -> bool {
+    if br_read(br, 8) != (kind as u32) {
+        return false
+    }
+    // "vorbis"
+    if br_read(br, 8) != 118 as u32 || br_read(br, 8) != 111 as u32 || br_read(br, 8) != 114 as u32
+        || br_read(br, 8) != 98 as u32 || br_read(br, 8) != 105 as u32 || br_read(br, 8) != 115 as u32 {
+        return false
+    }
+    return true
+}
+
+fn parse_identification(v: *mut Vorbis, br: *mut Br) -> i32 {
+    if br_read(br, 32) != 0 as u32 {
+        return -1
+    }
+    let ch: i32 = br_read(br, 8) as i32
+    let rate: u32 = br_read(br, 32)
+    br_read(br, 32)
+    br_read(br, 32)
+    br_read(br, 32)
+    let b0: i32 = br_read(br, 4) as i32
+    let b1: i32 = br_read(br, 4) as i32
+    let framing: i32 = br_bit(br)
+    if (*br).eop || framing == 0 || ch < 1 || rate == 0 as u32 || rate > 2147483647 as u32 {
+        return -1
+    }
+    if b0 < 6 || b0 > 13 || b1 < 6 || b1 > 13 || b0 > b1 {
+        return -1
+    }
+    (*v).channels = ch
+    (*v).rate = rate as i32
+    (*v).bs0 = 1 << b0
+    (*v).bs1 = 1 << b1
+    return 0
+}
+
+fn parse_setup(v: *mut Vorbis, br: *mut Br) -> i32 {
+    var i: i32 = 0
+    var st: i32 = 0
+    // codebooks
+    (*v).nbooks = (br_read(br, 8) + 1 as u32) as i32
+    i = 0
+    while i < (*v).nbooks {
+        st = parse_codebook(v, br, i)
+        if st != 0 {
+            return st
+        }
+        i = i + 1
+    }
+    // time domain transforms (placeholders, all zero)
+    let tc: i32 = (br_read(br, 6) + 1 as u32) as i32
+    i = 0
+    while i < tc {
+        if br_read(br, 16) != 0 as u32 {
+            return -1
+        }
+        i = i + 1
+    }
+    // floors
+    (*v).nfloors = (br_read(br, 6) + 1 as u32) as i32
+    i = 0
+    while i < (*v).nfloors {
+        let ft: i32 = br_read(br, 16) as i32
+        if ft == 0 {
+            return -5
+        }
+        if ft != 1 {
+            return -1
+        }
+        st = parse_floor1(v, br, i)
+        if st != 0 {
+            return st
+        }
+        i = i + 1
+    }
+    // residues
+    (*v).nres = (br_read(br, 6) + 1 as u32) as i32
+    i = 0
+    while i < (*v).nres {
+        let rt_: i32 = br_read(br, 16) as i32
+        if rt_ > 2 {
+            return -1
+        }
+        st = parse_residue(v, br, i, rt_)
+        if st != 0 {
+            return st
+        }
+        i = i + 1
+    }
+    // mappings
+    (*v).nmaps = (br_read(br, 6) + 1 as u32) as i32
+    i = 0
+    while i < (*v).nmaps {
+        st = parse_mapping(v, br, i)
+        if st != 0 {
+            return st
+        }
+        i = i + 1
+    }
+    // modes
+    (*v).nmodes = (br_read(br, 6) + 1 as u32) as i32
+    i = 0
+    while i < (*v).nmodes {
+        let bf: i32 = br_bit(br)
+        let wt: i32 = br_read(br, 16) as i32
+        let tt: i32 = br_read(br, 16) as i32
+        let mp: i32 = br_read(br, 8) as i32
+        if wt != 0 || tt != 0 || mp >= (*v).nmaps {
+            return -1
+        }
+        (*v).modes[i as usize].blockflag = bf
+        (*v).modes[i as usize].mapping = mp
+        i = i + 1
+    }
+    if br_bit(br) == 0 || (*br).eop {
+        return -1
+    }
+    return 0
+}
+
+// Allocates the run-time buffers once the setup is known.
+fn runtime_setup(v: *mut Vorbis) -> i32 {
+    let ch: usize = (*v).channels as usize
+    let half: usize = ((*v).bs1 / 2) as usize
+    if !mdct_setup(v, 0, (*v).bs0) || !mdct_setup(v, 1, (*v).bs1) {
+        return -4
+    }
+    if !slope_setup(v, 0, (*v).bs0) || !slope_setup(v, 1, (*v).bs1) {
+        return -4
+    }
+    (*v).prev = valloc(v, ch * half * 4)
+    (*v).spec = valloc(v, ch * half * 4)
+    (*v).curve = valloc(v, ch * half * 4)
+    (*v).ybuf = valloc(v, ((*v).bs1 as usize) * 4)
+    (*v).cbuf = valloc(v, half * 4)
+    (*v).fre = valloc(v, (half / 2) * 4)
+    (*v).fim = valloc(v, (half / 2) * 4)
+    (*v).res2 = valloc(v, ch * half * 4)
+    (*v).cls = valloc(v, (ch * half + 64) * 4)
+    (*v).out = valloc(v, ch * half * 4)
+    if (*v).prev == 0 || (*v).spec == 0 || (*v).curve == 0 || (*v).ybuf == 0 || (*v).cbuf == 0
+        || (*v).fre == 0 || (*v).fim == 0 || (*v).res2 == 0 || (*v).cls == 0 || (*v).out == 0 {
+        return -4
+    }
+    (*v).prev_n = 0
+    return 0
+}
+
+// Feeds the next header packet (identification, comment, setup -- in this order).
+// 0 = ok (`vorbis_ready` turns true after the third), < 0 = error.
+fn vorbis_header(v: *mut Vorbis, p: u64, n: usize) -> i32 {
+    var br: Br = Br { buf: 0, nbits: 0, pos: 0, eop: false }
+    br_init(&br, p, n)
+    if (*v).stage == 0 {
+        if !check_magic(&br, 1) {
+            return -1
+        }
+        let st: i32 = parse_identification(v, &br)
+        if st != 0 {
+            return st
+        }
+        (*v).stage = 1
+        return 0
+    }
+    if (*v).stage == 1 {
+        if !check_magic(&br, 3) {
+            return -1
+        }
+        (*v).stage = 2
+        return 0
+    }
+    if (*v).stage == 2 {
+        if !check_magic(&br, 5) {
+            return -1
+        }
+        var st: i32 = parse_setup(v, &br)
+        if st == 0 {
+            st = runtime_setup(v)
+        }
+        if st != 0 {
+            return st
+        }
+        (*v).stage = 3
+        return 0
+    }
+    return -1
+}
+
+// ====================================================================
+// FLOOR 1 -- decoding one packet
+// ====================================================================
+
+fn render_point(x0: i32, y0: i32, x1: i32, y1: i32, x: i32) -> i32 {
+    let dy: i32 = y1 - y0
+    let adx: i32 = x1 - x0
+    var ady: i32 = dy
+    if ady < 0 {
+        ady = 0 - ady
+    }
+    let err: i32 = ady * (x - x0)
+    let off: i32 = err / adx
+    if dy < 0 {
+        return y0 - off
+    }
+    return y0 + off
+}
+
+fn render_line(v: *mut Vorbis, curve: u64, n2: i32, x0: i32, y0: i32, x1: i32, y1: i32) {
+    if x0 >= n2 || x1 <= x0 {
+        return
+    }
+    let dy: i32 = y1 - y0
+    let adx: i32 = x1 - x0
+    var ady: i32 = dy
+    if ady < 0 {
+        ady = 0 - ady
+    }
+    let base: i32 = dy / adx
+    var absb: i32 = base
+    if absb < 0 {
+        absb = 0 - absb
+    }
+    var sy: i32 = base + 1
+    if dy < 0 {
+        sy = base - 1
+    }
+    ady = ady - absb * adx
+    var x: i32 = x0
+    var y: i32 = y0
+    var err: i32 = 0
+    var end: i32 = x1
+    if end > n2 {
+        end = n2
+    }
+    var yy: i32 = y
+    if yy < 0 {
+        yy = 0
+    }
+    if yy > 255 {
+        yy = 255
+    }
+    stf(curve, x as i64, (*v).db[yy as usize])
+    x = x + 1
+    while x < end {
+        err = err + ady
+        if err >= adx {
+            err = err - adx
+            y = y + sy
+        } else {
+            y = y + base
+        }
+        yy = y
+        if yy < 0 {
+            yy = 0
+        }
+        if yy > 255 {
+            yy = 255
+        }
+        stf(curve, x as i64, (*v).db[yy as usize])
+        x = x + 1
+    }
+}
+
+// Decodes the floor of one channel into `curve` (n2 values). false = floor unused.
+fn floor1_decode(v: *mut Vorbis, br: *mut Br, fl: *mut Floor1, curve: u64, n2: i32) -> bool {
+    if br_bit(br) == 0 {
+        return false
+    }
+    var y: [i32; 66] = [0; 66]
+    var fy: [i32; 66] = [0; 66]
+    var st2: [bool; 66] = [false; 66]
+    let range: i32 = (*fl).range
+    let nv: i32 = (*fl).nvals
+    let ybits: i32 = ilog(range - 1)
+    y[0] = br_read(br, ybits) as i32
+    y[1] = br_read(br, ybits) as i32
+    var off: i32 = 2
+    var i: i32 = 0
+    while i < (*fl).partitions {
+        let cls: i32 = (*fl).part_class[i as usize]
+        let cdim: i32 = (*fl).class_dim[cls as usize]
+        let cbits: i32 = (*fl).class_sub[cls as usize]
+        let csub: i32 = (1 << cbits) - 1
+        var cval: i32 = 0
+        if cbits > 0 {
+            cval = cb_decode(br, &(*v).books[(*fl).class_master[cls as usize] as usize])
+            if cval < 0 {
+                return false
+            }
+        }
+        var j: i32 = 0
+        while j < cdim {
+            let bk: i32 = (*fl).class_book[(cls * 8 + (cval & csub)) as usize]
+            cval = cval >> cbits
+            if bk >= 0 {
+                let e: i32 = cb_decode(br, &(*v).books[bk as usize])
+                if e < 0 {
+                    return false
+                }
+                y[(off + j) as usize] = e
+            } else {
+                y[(off + j) as usize] = 0
+            }
+            j = j + 1
+        }
+        off = off + cdim
+        i = i + 1
+    }
+    if (*br).eop {
+        return false
+    }
+    // step 2: amplitude synthesis
+    fy[0] = y[0]
+    fy[1] = y[1]
+    st2[0] = true
+    st2[1] = true
+    i = 2
+    while i < nv {
+        let lo: i32 = (*fl).lo[i as usize]
+        let hi: i32 = (*fl).hi[i as usize]
+        let pred: i32 = render_point((*fl).xl[lo as usize], fy[lo as usize], (*fl).xl[hi as usize],
+            fy[hi as usize], (*fl).xl[i as usize])
+        let val: i32 = y[i as usize]
+        let highroom: i32 = range - pred
+        let lowroom: i32 = pred
+        var room: i32 = lowroom * 2
+        if highroom < lowroom {
+            room = highroom * 2
+        }
+        if val != 0 {
+            st2[lo as usize] = true
+            st2[hi as usize] = true
+            st2[i as usize] = true
+            if val >= room {
+                if highroom > lowroom {
+                    fy[i as usize] = val - lowroom + pred
+                } else {
+                    fy[i as usize] = pred - val + highroom - 1
+                }
+            } else {
+                if (val & 1) != 0 {
+                    fy[i as usize] = pred - ((val + 1) >> 1)
+                } else {
+                    fy[i as usize] = pred + (val >> 1)
+                }
+            }
+        } else {
+            st2[i as usize] = false
+            fy[i as usize] = pred
+        }
+        // valid streams stay in 0 .. range-1; a damaged one must not leave it
+        if fy[i as usize] < 0 {
+            fy[i as usize] = 0
+        }
+        if fy[i as usize] > range - 1 {
+            fy[i as usize] = range - 1
+        }
+        i = i + 1
+    }
+    // step 3: the piecewise linear curve over the sorted points
+    var lx: i32 = 0
+    var ly: i32 = fy[(*fl).sorted[0] as usize] * (*fl).mult
+    var hx: i32 = 0
+    var hy: i32 = 0
+    i = 1
+    while i < nv {
+        let idx: i32 = (*fl).sorted[i as usize]
+        if st2[idx as usize] {
+            hy = fy[idx as usize] * (*fl).mult
+            hx = (*fl).xl[idx as usize]
+            render_line(v, curve, n2, lx, ly, hx, hy)
+            lx = hx
+            ly = hy
+        }
+        i = i + 1
+    }
+    if hx < n2 {
+        render_line(v, curve, n2, hx, hy, n2, hy)
+    }
+    return true
+}
+
+// ====================================================================
+// RESIDUE -- decoding
+// ====================================================================
+
+// Decodes one partition of residue type 0 (interleaved) or 1/2 (sequential) into
+// vec[offset .. offset+psize). false = end of packet.
+fn res_partition(v: *mut Vorbis, br: *mut Br, cb: *mut Codebook, rtype: i32, vec: u64, offset: i32,
+    psize: i32, actual: i32) -> bool {
+    let dim: i32 = (*cb).dims
+    if rtype == 0 {
+        let step: i32 = psize / dim
+        var i: i32 = 0
+        while i < step {
+            let e: i32 = cb_decode(br, cb)
+            if e < 0 {
+                return false
+            }
+            let vq: u64 = (*cb).vq + ((e as u64) * (dim as u64) * 4)
+            var j: i32 = 0
+            while j < dim {
+                let idx: i32 = offset + i + j * step
+                if idx < actual {
+                    stf(vec, idx as i64, ldf(vec, idx as i64) + ldf(vq, j as i64))
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+    } else {
+        var i: i32 = 0
+        while i < psize {
+            let e: i32 = cb_decode(br, cb)
+            if e < 0 {
+                return false
+            }
+            let vq: u64 = (*cb).vq + ((e as u64) * (dim as u64) * 4)
+            var j: i32 = 0
+            while j < dim {
+                let idx: i32 = offset + i + j
+                if idx < actual {
+                    stf(vec, idx as i64, ldf(vec, idx as i64) + ldf(vq, j as i64))
+                }
+                j = j + 1
+            }
+            i = i + dim
+        }
+    }
+    return true
+}
+
+// The common loop of residue types 0, 1 and 2 over `nvec` vectors of `actual` values.
+fn res_core(v: *mut Vorbis, br: *mut Br, r: *mut Residue, rtype: i32, nvec: i32, vecs: u64,
+    dnd: u64, actual: i32) {
+    var rbegin: i32 = (*r).begin
+    var rend: i32 = (*r).end
+    if rbegin > actual {
+        rbegin = actual
+    }
+    if rend > actual {
+        rend = actual
+    }
+    let psize: i32 = (*r).psize
+    let n_to_read: i32 = rend - rbegin
+    if n_to_read <= 0 {
+        return
+    }
+    let parts: i32 = n_to_read / psize
+    if parts <= 0 {
+        return
+    }
+    let cbk: *mut Codebook = &(*v).books[(*r).classbook as usize]
+    let cdim: i32 = (*cbk).dims
+    let ncls: i32 = (*r).classes
+    let cls: u64 = (*v).cls
+    var pass: i32 = 0
+    while pass < 8 {
+        if pass == 0 || (*r).pass_used[pass as usize] {
+            var pc: i32 = 0
+            while pc < parts {
+                if pass == 0 {
+                    var j: i32 = 0
+                    while j < nvec {
+                        if ldb(dnd, j as i64) == 0 as u8 {
+                            var temp: i32 = cb_decode(br, cbk)
+                            if temp < 0 {
+                                return
+                            }
+                            var i: i32 = cdim - 1
+                            while i >= 0 {
+                                if pc + i < parts {
+                                    sti(cls, (j as i64) * (parts as i64) + ((pc + i) as i64), temp % ncls)
+                                }
+                                temp = temp / ncls
+                                i = i - 1
+                            }
+                        }
+                        j = j + 1
+                    }
+                }
+                var i: i32 = 0
+                while i < cdim && pc < parts {
+                    var j: i32 = 0
+                    while j < nvec {
+                        if ldb(dnd, j as i64) == 0 as u8 {
+                            let c: i32 = ldi(cls, (j as i64) * (parts as i64) + (pc as i64))
+                            let bk: i32 = (*r).book[(c * 8 + pass) as usize]
+                            if bk >= 0 {
+                                let off: i32 = rbegin + pc * psize
+                                if !res_partition(v, br, &(*v).books[bk as usize], rtype, ldu64(vecs, j as i64),
+                                    off, psize, actual) {
+                                    return
+                                }
+                            }
+                        }
+                        j = j + 1
+                    }
+                    i = i + 1
+                    pc = pc + 1
+                }
+            }
+        }
+        pass = pass + 1
+    }
+}
+
+// ====================================================================
+// THE INVERSE MDCT
+// ====================================================================
+
+// x: n/2 spectral values -> y: n time values (unwindowed), the textbook sum
+// y[t] = sum_k x[k] cos(2 pi / n * (t + 1/2 + n/4) * (k + 1/2)), via a DCT-IV
+// built from an n/4 point complex FFT.
+fn imdct(v: *mut Vorbis, which: i32, x: u64, y: u64) {
+    let m: *mut Mdct = &(*v).mdct[which as usize]
+    let n: i32 = (*m).n
+    let mm: i32 = n / 2
+    let h: i32 = n / 4
+    let fre: u64 = (*v).fre
+    let fim: u64 = (*v).fim
+    var j: i32 = 0
+    while j < h {
+        let a: f32 = ldf(x, (2 * j) as i64)
+        let b: f32 = ldf(x, (mm - 1 - 2 * j) as i64)
+        let c: f32 = ldf((*m).pre_c, j as i64)
+        let s: f32 = ldf((*m).pre_s, j as i64)
+        let tr: f32 = a * c + b * s
+        let ti: f32 = b * c - a * s
+        let r: i64 = ldi((*m).rev, j as i64) as i64
+        stf(fre, r, tr)
+        stf(fim, r, ti)
+        j = j + 1
+    }
+    var len: i32 = 2
+    while len <= h {
+        let half: i32 = len / 2
+        let step: i32 = h / len
+        var start: i32 = 0
+        while start < h {
+            var k: i32 = 0
+            while k < half {
+                let wr: f32 = ldf((*m).w_re, (k * step) as i64)
+                let wi: f32 = ldf((*m).w_im, (k * step) as i64)
+                let i1: i64 = (start + k) as i64
+                let i2: i64 = (start + k + half) as i64
+                let br2: f32 = ldf(fre, i2)
+                let bi2: f32 = ldf(fim, i2)
+                let xr: f32 = br2 * wr - bi2 * wi
+                let xi: f32 = br2 * wi + bi2 * wr
+                let ar: f32 = ldf(fre, i1)
+                let ai: f32 = ldf(fim, i1)
+                stf(fre, i2, ar - xr)
+                stf(fim, i2, ai - xi)
+                stf(fre, i1, ar + xr)
+                stf(fim, i1, ai + xi)
+                k = k + 1
+            }
+            start = start + len
+        }
+        len = len * 2
+    }
+    // post twiddle -> DCT-IV result c[0 .. mm)
+    let cb: u64 = (*v).cbuf
+    j = 0
+    while j < h {
+        let tr: f32 = ldf(fre, j as i64)
+        let ti: f32 = ldf(fim, j as i64)
+        let pc: f32 = ldf((*m).post_c, j as i64)
+        let ps: f32 = ldf((*m).post_s, j as i64)
+        let ur: f32 = tr * pc + ti * ps
+        let ui: f32 = ti * pc - tr * ps
+        stf(cb, (2 * j) as i64, ur)
+        stf(cb, (mm - 1 - 2 * j) as i64, 0.0 - ui)
+        j = j + 1
+    }
+    // unfold to n values
+    let q: i32 = n / 4
+    var t: i32 = 0
+    while t < q {
+        stf(y, t as i64, ldf(cb, (t + q) as i64))
+        t = t + 1
+    }
+    while t < 3 * q {
+        stf(y, t as i64, 0.0 - ldf(cb, (3 * q - 1 - t) as i64))
+        t = t + 1
+    }
+    while t < n {
+        stf(y, t as i64, 0.0 - ldf(cb, (t - 3 * q) as i64))
+        t = t + 1
+    }
+}
+
+// ====================================================================
+// ONE AUDIO PACKET
+// ====================================================================
+
+// Decodes an audio packet. Returns the number of frames now readable through
+// `vorbis_out_ptr` (0 for the very first packet), or a negative error.
+fn vorbis_decode(v: *mut Vorbis, p: u64, n: usize) -> i32 {
+    (*v).out_frames = 0
+    if (*v).stage != 3 {
+        return -3
+    }
+    var br: Br = Br { buf: 0, nbits: 0, pos: 0, eop: false }
+    br_init(&br, p, n)
+    if br_bit(&br) != 0 {
+        return -2
+    }
+    let mi: i32 = br_read(&br, ilog((*v).nmodes - 1)) as i32
+    if br.eop || mi >= (*v).nmodes {
+        return -1
+    }
+    let blk: i32 = (*v).modes[mi as usize].blockflag
+    let mp: *mut Mapping = &(*v).maps[(*v).modes[mi as usize].mapping as usize]
+    var nn: i32 = (*v).bs0
+    var pflag: i32 = 0
+    var nflag: i32 = 0
+    if blk != 0 {
+        nn = (*v).bs1
+        pflag = br_bit(&br)
+        nflag = br_bit(&br)
+    }
+    let n2: i32 = nn / 2
+    let stride: i64 = ((*v).bs1 / 2) as i64
+    let chn: i32 = (*v).channels
+
+    // ---- floors
+    var c: i32 = 0
+    while c < chn {
+        let sm: i32 = (*mp).mux[c as usize]
+        let fl: *mut Floor1 = &(*v).floors[(*mp).sub_floor[sm as usize] as usize]
+        let cv: u64 = (*v).curve + (((c as i64) * stride) as u64) * 4
+        let used: bool = floor1_decode(v, &br, fl, cv, n2)
+        (*v).nz[c as usize] = used
+        (*v).nz2[c as usize] = used
+        // the spectrum of this channel starts as zero
+        rt.mem_set((*v).spec + (((c as i64) * stride) as u64) * 4, 0 as u8, (n2 as usize) * 4)
+        c = c + 1
+    }
+    // ---- coupling can make an unused channel "dirty"
+    var s: i32 = 0
+    while s < (*mp).coupling {
+        let mg: i32 = (*mp).mag[s as usize]
+        let an: i32 = (*mp).ang[s as usize]
+        if (*v).nz2[mg as usize] || (*v).nz2[an as usize] {
+            (*v).nz2[mg as usize] = true
+            (*v).nz2[an as usize] = true
+        }
+        s = s + 1
+    }
+    // ---- residues, submap by submap
+    var sub: i32 = 0
+    while sub < (*mp).submaps {
+        let r: *mut Residue = &(*v).res[(*mp).sub_res[sub as usize] as usize]
+        var vecs: [u64; 256] = [0; 256]
+        var dnd: [u8; 256] = [0; 256]
+        var cnt: i32 = 0
+        var any: bool = false
+        c = 0
+        while c < chn {
+            if (*mp).mux[c as usize] == sub {
+                vecs[cnt as usize] = (*v).spec + (((c as i64) * stride) as u64) * 4
+                dnd[cnt as usize] = 0
+                if !(*v).nz2[c as usize] {
+                    dnd[cnt as usize] = 1
+                }
+                if (*v).nz2[c as usize] {
+                    any = true
+                }
+                cnt = cnt + 1
+            }
+            c = c + 1
+        }
+        if any {
+            if (*r).rtype == 2 {
+                // one interleaved vector of cnt * n2 values
+                let tot: i32 = cnt * n2
+                rt.mem_set((*v).res2, 0 as u8, (tot as usize) * 4)
+                var v2: [u64; 256] = [0; 256]
+                var d2: [u8; 256] = [0; 256]
+                v2[0] = (*v).res2
+                res_core(v, &br, r, 2, 1, (&v2[0]) as u64, (&d2[0]) as u64, tot)
+                var i: i32 = 0
+                while i < n2 {
+                    var j: i32 = 0
+                    while j < cnt {
+                        stf(vecs[j as usize], i as i64, ldf((*v).res2, (i * cnt + j) as i64))
+                        j = j + 1
+                    }
+                    i = i + 1
+                }
+            } else {
+                res_core(v, &br, r, (*r).rtype, cnt, (&vecs[0]) as u64, (&dnd[0]) as u64, n2)
+            }
+        }
+        sub = sub + 1
+    }
+    // ---- inverse coupling, last step first
+    s = (*mp).coupling - 1
+    while s >= 0 {
+        let mg: u64 = (*v).spec + ((((*mp).mag[s as usize] as i64) * stride) as u64) * 4
+        let an: u64 = (*v).spec + ((((*mp).ang[s as usize] as i64) * stride) as u64) * 4
+        var k: i32 = 0
+        while k < n2 {
+            let m: f32 = ldf(mg, k as i64)
+            let a: f32 = ldf(an, k as i64)
+            var nm: f32 = m
+            var na: f32 = a
+            if m > 0.0 {
+                if a > 0.0 {
+                    na = m - a
+                } else {
+                    na = m
+                    nm = m + a
+                }
+            } else {
+                if a > 0.0 {
+                    na = m + a
+                } else {
+                    na = m
+                    nm = m - a
+                }
+            }
+            stf(mg, k as i64, nm)
+            stf(an, k as i64, na)
+            k = k + 1
+        }
+        s = s - 1
+    }
+    // ---- apply the floor, inverse MDCT, window, overlap-add
+    var left_start: i32 = 0
+    var left_end: i32 = n2
+    var right_start: i32 = n2
+    var right_end: i32 = nn
+    if blk != 0 {
+        if pflag == 0 {
+            left_start = nn / 4 - (*v).bs0 / 4
+            left_end = nn / 4 + (*v).bs0 / 4
+        }
+        if nflag == 0 {
+            right_start = 3 * nn / 4 - (*v).bs0 / 4
+            right_end = 3 * nn / 4 + (*v).bs0 / 4
+        }
+    }
+    let which: i32 = blk
+    var llen: i32 = left_end - left_start
+    var slope_l: u64 = (*v).slope[0]
+    if llen == (*v).bs1 / 2 {
+        slope_l = (*v).slope[1]
+    }
+    var rlen: i32 = right_end - right_start
+    var slope_r: u64 = (*v).slope[0]
+    if rlen == (*v).bs1 / 2 {
+        slope_r = (*v).slope[1]
+    }
+    let prev_n: i32 = (*v).prev_n
+    var outn: i32 = 0
+    if prev_n != 0 {
+        outn = prev_n / 4 + nn / 4
+    }
+    c = 0
+    while c < chn {
+        let sp: u64 = (*v).spec + (((c as i64) * stride) as u64) * 4
+        let yb: u64 = (*v).ybuf
+        if (*v).nz[c as usize] {
+            let cv: u64 = (*v).curve + (((c as i64) * stride) as u64) * 4
+            var k: i32 = 0
+            while k < n2 {
+                stf(sp, k as i64, ldf(sp, k as i64) * ldf(cv, k as i64))
+                k = k + 1
+            }
+            imdct(v, which, sp, yb)
+            // window
+            var t: i32 = 0
+            while t < left_start {
+                stf(yb, t as i64, 0.0)
+                t = t + 1
+            }
+            while t < left_end {
+                stf(yb, t as i64, ldf(yb, t as i64) * ldf(slope_l, (t - left_start) as i64))
+                t = t + 1
+            }
+            t = right_start
+            while t < right_end {
+                stf(yb, t as i64, ldf(yb, t as i64) * ldf(slope_r, (right_end - 1 - t) as i64))
+                t = t + 1
+            }
+            while t < nn {
+                stf(yb, t as i64, 0.0)
+                t = t + 1
+            }
+        } else {
+            rt.mem_set(yb, 0 as u8, (nn as usize) * 4)
+        }
+        let pv: u64 = (*v).prev + (((c as i64) * stride) as u64) * 4
+        let ov: u64 = (*v).out + (((c as i64) * stride) as u64) * 4
+        if outn > 0 {
+            let phalf: i32 = prev_n / 2
+            let cstart: i32 = nn / 2 - outn
+            var t: i32 = 0
+            while t < outn {
+                var acc: f32 = 0.0
+                if t < phalf {
+                    acc = ldf(pv, t as i64)
+                }
+                let ci: i32 = cstart + t
+                if ci >= 0 {
+                    acc = acc + ldf(yb, ci as i64)
+                }
+                stf(ov, t as i64, acc)
+                t = t + 1
+            }
+        }
+        // keep the second half of this block for the next packet
+        rt.mem_copy(pv, yb + ((n2 as u64) * 4), (n2 as usize) * 4)
+        c = c + 1
+    }
+    (*v).prev_n = nn
+    (*v).out_frames = outn
+    return outn
+}
+
+// ====================================================================
+// OUTPUT CONVERSION
+// ====================================================================
+
+// Interleaved 16 bit (round to nearest, clamped) for `frames` frames of the last packet.
+fn vorbis_to_i16(v: *mut Vorbis, frames: i32, dst: u64) {
+    let chn: i32 = (*v).channels
+    var c: i32 = 0
+    while c < chn {
+        let src: u64 = vorbis_out_ptr(v, c)
+        var i: i32 = 0
+        while i < frames {
+            var t: f32 = ldf(src, i as i64) * 32768.0
+            var q: i32 = 0
+            if t >= 32767.0 {
+                q = 32767
+            } else {
+                if t <= -32768.0 {
+                    q = -32768
+                } else {
+                    if t >= 0.0 {
+                        q = (t + 0.5) as i32
+                    } else {
+                        q = (t - 0.5) as i32
+                    }
+                }
+            }
+            *((dst +% ((((i * chn + c) as i64) as u64) *% 2)) as *mut i16) = q as i16
+            i = i + 1
+        }
+        c = c + 1
+    }
+}
+
+// Interleaved f32 (-1.0 .. 1.0 nominal; not clamped).
+fn vorbis_to_f32(v: *mut Vorbis, frames: i32, dst: u64) {
+    let chn: i32 = (*v).channels
+    var c: i32 = 0
+    while c < chn {
+        let src: u64 = vorbis_out_ptr(v, c)
+        var i: i32 = 0
+        while i < frames {
+            stf(dst, (i * chn + c) as i64, ldf(src, i as i64))
+            i = i + 1
+        }
+        c = c + 1
+    }
+}
