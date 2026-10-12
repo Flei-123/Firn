@@ -1981,6 +1981,16 @@ if [ "$RAWINRC" -eq 0 ]; then
 else
     bad "tools/input/read_run.sh failed (see .test-work/rawinput.log)"
     grep -E 'FAIL' "$WORK/rawinput.log" | head -12 | sed 's/^/   /' || true
+echo "== 122. lib/gpu building blocks: gl_ext/gl_prog/gl_tex/gl_fbo/gl_query on llvmpipe + gpu.cull vs brute force (tools/gpu/ext/run.sh, docs/GPU.md) =="
+# Shader program + uniform cache + UBO + instancing + multi indirect + timer queries + mipmaps/aniso/atlas bleed + MRT/MSAA; CPU culling
+# (frustum, far origin, Hi-Z occlusion) against sampled references. Mesa llvmpipe only; no libEGL is SKIP for the GL half.
+FIRNC="$FIRNC" bash tools/gpu/ext/run.sh > "$WORK/gpuext.log" 2>&1 && GXRC=0 || GXRC=$?
+if [ "$GXRC" -eq 0 ]; then
+    ok
+    grep -E '^   (ok|SKIP)|metric' "$WORK/gpuext.log" | sed 's/^/ /'
+else
+    bad "tools/gpu/ext/run.sh failed (see .test-work/gpuext.log)"
+    grep -E 'FAIL' "$WORK/gpuext.log" | head -12 | sed 's/^/   /' || true
 fi
 
 echo "== 121. mc_audio: Minecraft listener/sources/blocks/categories/packets on audio.engine (tools/mc/audio/run.sh, docs/mc/audio.md) =="

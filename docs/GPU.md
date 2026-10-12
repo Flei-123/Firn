@@ -48,3 +48,33 @@ The same test as a Windows exe under Wine (wgl through the Win64 gate, Wine -> h
 * Run everything: `bash tools/gpu/run.sh [firnc]` (smoke + GL vs raster + Windows twin under Wine; SKIP when libEGL/Wine/Xvfb are missing).
 * Escape check: pointers to locals passed through the `Gl` scratch array need `#[allow_escape]` (`compile`, `gl_uniform_loc`).
 * Call GL from the main thread only (docs/FFI.md, TLS).
+
+## Renderer building blocks (2026-10-12, worker firn-gpu-b) -- `tools/gpu/ext/run.sh`, gate 122
+ALL numbers/"tested" below are Mesa llvmpipe (GL 4.5 core, requested as 3.3). Real GPU: UNTESTED. gl33.fi got one fix only
+(`gl_u1i` panicked for negative values); everything else is new files.
+| File | Content | State |
+|---|---|---|
+| `lib/gpu/gl_ext.fi` | `GlX` (embeds `gl33.Gl`) + probe (version, extension list, limits, flags `has_ubo/ssbo/indirect/multi_indirect/timer/msaa/aniso/tex_array`); `glUniform2i/3i/4i` (`u_tiles` may become an ivec2); UBO (`glx_block_index/binding/size`, `glx_ubo_new/update`, std140 helpers); SSBO (>= 4.3 or ARB_shader_storage_buffer_object, else "not available": `glx_ssbo_ok` false, calls return false/0); `glVertexAttribDivisor`, `glDrawElements/ArraysInstanced`; indirect (`glDrawElementsIndirect` >= 4.0, `glMultiDrawElementsIndirect` >= 4.3) | UBO, uniforms, instancing, multi indirect **tested**; SSBO **compiled only** (probe true on llvmpipe, no shader test written) |
+| `lib/gpu/gl_prog.fi` | program from memory or files, driver log in `p.log`, failed build keeps the old program, 64-entry uniform cache (FNV-1a name hash), `prog_poll` = hot reload by content hash | build/log/cache **tested**; `prog_poll` **compiled only** (no edit-and-reload test) |
+| `lib/gpu/gl_tex.fi` | RGBA8 2D + mips (trilinear), 2D array texture, `tex_array_from_atlas`, filter/wrap/max-level setters, anisotropy (`GL_EXT_texture_filter_anisotropic`, clamped to the driver max), sub-upload, level readback | mips, aniso set/get, array-from-atlas **tested** |
+| `lib/gpu/gl_fbo.fi` | `Target`: 1-4 RGBA8 colour textures (MRT), depth none / renderbuffer / **texture**, MSAA (renderbuffers + per-attachment `glBlitFramebuffer` resolve), resize | MRT, depth texture, resize, MSAA 4x **tested** |
+| `lib/gpu/gl_query.fi` | `Timer`: ring of 4 frames x 16 passes, `GL_TIMESTAMP` pairs or `GL_TIME_ELAPSED`, results polled with `GL_QUERY_RESULT_AVAILABLE` (never waits; unfinished sets are dropped and counted), `pass_ms/pass_avg_ms/pass_print` | timestamp mode **tested** (values > 0); `MODE_ELAPSED` compiled only |
+| `lib/gpu/cull.fi` | camera-relative f64 frustum culling (mc_math planes + frustum-corner bounding box), sphere, software Hi-Z occlusion (box occluders, shrunk coverage at silhouette edges only, max pyramid) | **tested** CPU only |
+
+### Atlas, mipmaps, bleeding
+Two bleed sources, measured in `tools/gpu/ext/gl.fi`: (1) the mip chain of a tile atlas mixes tiles below level log2(tile) (test: 2x2
+atlas, lowest level = grey 128/128/128); cure `GL_TEXTURE_MAX_LEVEL = atlas_max_level(tile)`. (2) bilinear taps across a tile border at every
+level; cure = `tex_array_from_atlas` (one layer per tile; test: lowest level of every layer keeps its own colour). Gutters are not implemented.
+
+### Measured (llvmpipe, 128 x 128 target, 256 quads, 6 frames)
+Instanced draw == 256 single draws: image byte equal. Wall time incl. `glFinish`: instanced ~1.9 ms vs single ~1.6 ms (llvmpipe is a CPU
+renderer, the per-draw driver cost that instancing saves is tiny there; NOT a GPU result). Timer queries: pass 0 ~0.09 ms, pass 1 ~0.05 ms (> 0).
+Cull (tools/gpu/ext/cull.fi): 72000 random boxes/spheres, 0 visible ones rejected; plain plane test keeps 120 outside boxes, refined test 90;
+verdicts identical 1,000,000 / -3,000,000 blocks from the origin (0 of 72000 differ); occlusion: 45000 boxes, 16246 occluded, 0 of them have a
+visible fragment in the reference raster (grown coverage), 0 differences far from the origin. Occluders are axis-aligned boxes only.
+
+### Not done
+Vulkan probe (`lib/gpu/vk.fi`; `libvulkan.so.1` + `lvp_icd` are installed here, so `vkCreateInstance`/`vkEnumeratePhysicalDevices` via dynlib is feasible:
+needs ~40 structs/handles by pointer, no GL context; real renderer would need SPIR-V compile (glslang) and a swapchain per window system).
+GL image hash (PSNR) for the new paths is not added: the byte-equality checks above are on GL itself. SSBO shader test, `prog_poll` edit test,
+`MODE_ELAPSED` test, real GPU, indirect `baseInstance` (needs GL 4.2 `ARB_shader_draw_parameters` semantics) untested.
