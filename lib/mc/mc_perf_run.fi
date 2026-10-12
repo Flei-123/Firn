@@ -1,0 +1,738 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_perf_run.fi -- the benchmark scenario of tools/mc/perf (docs/MC-PERF.md). Back end independent: the entry
+// program (tools/mc/perf/bench.fi = CPU raster, bench_gl.fi = OpenGL) creates the `Backend` and calls perf_run.
+//
+//   bench <world.mcw> <radius-chunks> [frames=100] [warm=10]     env: BENCH_W BENCH_H (640x360) BENCH_MAXMESH (16)
+//                                                                     BENCH_T0_NS (CLOCK_REALTIME ns at process launch)
+//   bench --stats <file>   : self test of the statistics (mc_perf) on the whitespace separated integers (ns) of <file>
+//
+// World: the 7x7 chunk column grid of a world file (fixture or a live server dump) is TILED periodically over a square of
+// (2 * (radius + 4) + 1)^2 chunks (seams every 7 chunks; the content is real terrain, the size is synthetic).
+// Phases: startup (empty world, first image) -> build world (chunk columns from block ids; offline stand-in for the packet
+// parse) -> mesh/upload components on a sample of sections (naive vs greedy, AO) -> load (yaw sweep, unlimited meshing) ->
+// warm-up frames (discarded) -> measured frames on a deterministic flight path (position, yaw, pitch are a function of the
+// frame number only). Every output line is `RESULT <key> <value> <unit>`.
+//
+// A frame = begin + wr_render_b (cull, mesh budget, draw) + end + present (for GL this includes the read back).
+// Not in a frame: sky, HUD, selection box (the CPU sky pass alone costs 2.4 ms at 640x360).
+
+import std.rt
+import std.io
+import std.env
+import std.core
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_registry
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_render_world
+import mc.mc_backend
+import mc.mc_perf
+
+export {
+    perf_run, perf_stats_selftest, perf_env_int, perf_now_ns, perf_real_ns,
+}
+
+const BORDER: i32 = 4 // chunks of world beyond the view radius (room for the flight)
+const SAMPLE_R: i32 = 5 // chunk radius of the mesh sample
+const FLIGHT_BLOCKS: f64 = 48.0
+
+fn perf_now_ns() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000000000 as u64 + (ts[1] as u64)
+}
+
+fn perf_real_ns() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 0, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000000000 as u64 + (ts[1] as u64)
+}
+
+fn parse_dec(p: u64, n: usize, fallback: i64) -> i64 {
+    if n == 0 {
+        return fallback
+    }
+    var neg: bool = false
+    var i: usize = 0
+    if rt.ld8(p, 0) == 45 as u8 {
+        neg = true
+        i = 1
+    }
+    if i >= n {
+        return fallback
+    }
+    var v: i64 = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return fallback
+        }
+        v = v * 10 + (c - 48 as u8) as i64
+        i = i + 1
+    }
+    if neg {
+        return 0 - v
+    }
+    return v
+}
+
+fn perf_env_int(name: str, fallback: i32) -> i32 {
+    if !env.has(name) {
+        return fallback
+    }
+    let v: str = env.get(name)
+    return parse_dec(v.p as u64, v.length(), fallback as i64) as i32
+}
+
+fn env_u64(name: str) -> u64 {
+    if !env.has(name) {
+        return 0 as u64
+    }
+    let v: str = env.get(name)
+    return parse_dec(v.p as u64, v.length(), 0) as u64
+}
+
+// ---- tokenizer + template world ------------------------------------------------------------------------
+
+struct Tok {
+    p: u64,
+    n: usize,
+    i: usize,
+    bad: bool,
+}
+
+fn tk_word(t: *mut Tok, s: *mut usize, n: *mut usize) -> bool {
+    while (*t).i < (*t).n {
+        let c: u8 = rt.ld8((*t).p, (*t).i)
+        if c == 32 as u8 || c == 10 as u8 || c == 13 as u8 || c == 9 as u8 {
+            (*t).i = (*t).i + 1
+        } else {
+            break
+        }
+    }
+    if (*t).i >= (*t).n {
+        (*t).bad = true
+        return false
+    }
+    *s = (*t).i
+    while (*t).i < (*t).n {
+        let c: u8 = rt.ld8((*t).p, (*t).i)
+        if c == 32 as u8 || c == 10 as u8 || c == 13 as u8 || c == 9 as u8 {
+            break
+        }
+        (*t).i = (*t).i + 1
+    }
+    *n = (*t).i - *s
+    return true
+}
+
+fn tk_is(t: *mut Tok, lit: str) -> bool {
+    var s: usize = 0
+    var n: usize = 0
+    if !tk_word(t, &s, &n) {
+        return false
+    }
+    if n != lit.n {
+        (*t).bad = true
+        return false
+    }
+    var k: usize = 0
+    while k < n {
+        if rt.ld8((*t).p, s + k) != lit.chars(k) {
+            (*t).bad = true
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+fn tk_int(t: *mut Tok) -> i64 {
+    var s: usize = 0
+    var n: usize = 0
+    if !tk_word(t, &s, &n) {
+        return 0
+    }
+    let v: i64 = parse_dec((*t).p + s as u64, n, 0 - 9999999999)
+    if v == 0 - 9999999999 {
+        (*t).bad = true
+        return 0
+    }
+    return v
+}
+
+fn tk_hex(t: *mut Tok) -> u64 {
+    var s: usize = 0
+    var n: usize = 0
+    if !tk_word(t, &s, &n) {
+        return 0 as u64
+    }
+    var v: u64 = 0
+    var k: usize = 0
+    while k < n {
+        let c: u8 = rt.ld8((*t).p, s + k)
+        var d: u64 = 0
+        if c >= 48 as u8 && c <= 57 as u8 {
+            d = (c - 48 as u8) as u64
+        } else if c >= 97 as u8 && c <= 102 as u8 {
+            d = (c - 87 as u8) as u64
+        } else {
+            (*t).bad = true
+            return 0 as u64
+        }
+        v = v * 16 as u64 + d
+        k = k + 1
+    }
+    return v
+}
+
+// The world file as a rectangle of chunk columns: ids = u16 [nx * nz * nsec * 4096], column (x0 + i, z0 + j) at (j * nx + i).
+struct Tpl {
+    protocol: i32,
+    min_y: i32,
+    x0: i32,
+    z0: i32,
+    nx: i32,
+    nz: i32,
+    nsec: usize,
+    ids: u64,
+    cam_x: f64,
+    cam_y: f64,
+    cam_z: f64,
+}
+
+fn tpl_col_ptr(t: *mut Tpl, i: i32, j: i32) -> u64 {
+    return (*t).ids + ((((j * (*t).nx + i) as usize) * (*t).nsec * 4096) * 2) as u64
+}
+
+fn tpl_parse(blob: u64, n: usize, t: *mut Tpl) -> bool {
+    var k: Tok = Tok { p: blob, n: n, i: 0, bad: false }
+    if !tk_is(&k, "mcworld") || tk_int(&k) != 1 { return false }
+    if !tk_is(&k, "protocol") { return false }
+    (*t).protocol = tk_int(&k) as i32
+    if !tk_is(&k, "min_y") { return false }
+    (*t).min_y = tk_int(&k) as i32
+    if !tk_is(&k, "cam") { return false }
+    (*t).cam_x = core.bits_f64(tk_hex(&k))
+    (*t).cam_y = core.bits_f64(tk_hex(&k))
+    (*t).cam_z = core.bits_f64(tk_hex(&k))
+    tk_hex(&k)
+    tk_hex(&k)
+    if !tk_is(&k, "view") { return false }
+    tk_int(&k)
+    if !tk_is(&k, "chunks") { return false }
+    let nch: i64 = tk_int(&k)
+    if k.bad || nch < 1 || nch > 4096 { return false }
+    // pass 1 would need the extent first: chunks come sorted by x then z, so read into a temporary list
+    let tmp: u64 = rt.heap_alloc((nch as usize) * 24 * 4096 * 2 + 64)
+    let xs: u64 = rt.heap_alloc((nch as usize) * 8 + 8)
+    let zs: u64 = rt.heap_alloc((nch as usize) * 8 + 8)
+    var nsec0: i64 = 0
+    var c: i64 = 0
+    while c < nch {
+        if !tk_is(&k, "C") { return false }
+        let cx: i32 = tk_int(&k) as i32
+        let cz: i32 = tk_int(&k) as i32
+        let nsec: i64 = tk_int(&k)
+        if k.bad || nsec < 1 || nsec > 24 { return false }
+        if nsec0 == 0 { nsec0 = nsec }
+        if nsec != nsec0 { return false }
+        rt.st64(xs, c as usize, (cx as i64) as u64)
+        rt.st64(zs, c as usize, (cz as i64) as u64)
+        let cbase: usize = (c as usize) * (nsec0 as usize) * 4096
+        var s: i64 = 0
+        while s < nsec {
+            var ws: usize = 0
+            var wn: usize = 0
+            if !tk_word(&k, &ws, &wn) || wn != 1 { return false }
+            let kind: u8 = rt.ld8(blob, ws)
+            let si: i64 = tk_int(&k)
+            if k.bad || si != s { return false }
+            let base: usize = cbase + (s as usize) * 4096
+            if kind == 85 as u8 {
+                let id: u16 = tk_int(&k) as u16
+                var i: usize = 0
+                while i < 4096 {
+                    rt.st16(tmp, base + i, id)
+                    i = i + 1
+                }
+            } else if kind == 82 as u8 {
+                let nr: i64 = tk_int(&k)
+                var at: usize = 0
+                var r: i64 = 0
+                while r < nr && !k.bad {
+                    let id: u16 = tk_int(&k) as u16
+                    let len: i64 = tk_int(&k)
+                    if len < 1 || at + (len as usize) > 4096 { return false }
+                    var q: i64 = 0
+                    while q < len {
+                        rt.st16(tmp, base + at, id)
+                        at = at + 1
+                        q = q + 1
+                    }
+                    r = r + 1
+                }
+                if at != 4096 { return false }
+            } else {
+                return false
+            }
+            if k.bad { return false }
+            s = s + 1
+        }
+        c = c + 1
+    }
+    var minx: i64 = 1000000
+    var minz: i64 = 1000000
+    var maxx: i64 = 0 - 1000000
+    var maxz: i64 = 0 - 1000000
+    c = 0
+    while c < nch {
+        let x: i64 = rt.ld64(xs, c as usize) as i64
+        let z: i64 = rt.ld64(zs, c as usize) as i64
+        if x < minx { minx = x }
+        if x > maxx { maxx = x }
+        if z < minz { minz = z }
+        if z > maxz { maxz = z }
+        c = c + 1
+    }
+    let nx: i64 = maxx - minx + 1
+    let nz: i64 = maxz - minz + 1
+    if nx * nz != nch { return false } // not a full rectangle
+    (*t).x0 = minx as i32
+    (*t).z0 = minz as i32
+    (*t).nx = nx as i32
+    (*t).nz = nz as i32
+    (*t).nsec = nsec0 as usize
+    let per: usize = (nsec0 as usize) * 4096
+    (*t).ids = rt.heap_alloc((nch as usize) * per * 2 + 64)
+    c = 0
+    while c < nch {
+        let i: i32 = ((rt.ld64(xs, c as usize) as i64) - minx) as i32
+        let j: i32 = ((rt.ld64(zs, c as usize) as i64) - minz) as i32
+        let dst: u64 = tpl_col_ptr(t, i, j)
+        var w: usize = 0
+        let words: usize = per / 4
+        let src: u64 = tmp + ((c as usize) * per * 2) as u64
+        while w < words {
+            rt.st64(dst, w, rt.ld64(src, w))
+            w = w + 1
+        }
+        c = c + 1
+    }
+    rt.heap_free(tmp, (nch as usize) * 24 * 4096 * 2 + 64)
+    rt.heap_free(xs, (nch as usize) * 8 + 8)
+    rt.heap_free(zs, (nch as usize) * 8 + 8)
+    return !k.bad
+}
+
+// The block id at world position (gx, gy, gz) of the periodically tiled world; UNKNOWN above / below the template.
+fn tpl_id(t: *mut Tpl, gx: i32, gy: i32, gz: i32) -> u16 {
+    let s: i32 = mc_world.floor_div(gy - (*t).min_y, 16)
+    if s < 0 || (s as usize) >= (*t).nsec {
+        return mc_mesh.UNKNOWN_ID
+    }
+    let cx: i32 = mc_world.floor_div(gx, 16)
+    let cz: i32 = mc_world.floor_div(gz, 16)
+    let lx: i32 = gx - cx * 16
+    let lz: i32 = gz - cz * 16
+    let ly: i32 = (gy - (*t).min_y) - s * 16
+    let i: i32 = mc_world.floor_mod(cx - (*t).x0, (*t).nx)
+    let j: i32 = mc_world.floor_mod(cz - (*t).z0, (*t).nz)
+    let col: u64 = tpl_col_ptr(t, i, j)
+    return rt.ld16(col, ((s as usize) * 4096) + ((ly * 16 + lz) * 16 + lx) as usize)
+}
+
+// ---- resident set size ---------------------------------------------------------------------------------
+
+// value of "<name>:   <n> kB" in /proc/self/status (0 when missing)
+fn status_kb(name: str) -> u64 {
+    var b: rt.Buf = rt.buf_new()
+    var path: [u8; 18] = "/proc/self/status\0"
+    if !rt.read_file((&path[0]) as u64, &b) {
+        rt.buf_free(&b)
+        return 0 as u64
+    }
+    let p: u64 = rt.buf_ptr(&b)
+    let n: usize = rt.buf_len(&b)
+    var i: usize = 0
+    var v: u64 = 0
+    while i + name.n + 1 < n {
+        var ok: bool = true
+        var k: usize = 0
+        while k < name.n {
+            if rt.ld8(p, i + k) != name.chars(k) {
+                ok = false
+                break
+            }
+            k = k + 1
+        }
+        if ok && rt.ld8(p, i + name.n) == 58 as u8 && (i == 0 || rt.ld8(p, i - 1) == 10 as u8) {
+            var j: usize = i + name.n + 1
+            while j < n && (rt.ld8(p, j) == 32 as u8 || rt.ld8(p, j) == 9 as u8) {
+                j = j + 1
+            }
+            while j < n && rt.ld8(p, j) >= 48 as u8 && rt.ld8(p, j) <= 57 as u8 {
+                v = v * 10 as u64 + (rt.ld8(p, j) - 48 as u8) as u64
+                j = j + 1
+            }
+            break
+        }
+        i = i + 1
+    }
+    rt.buf_free(&b)
+    return v
+}
+
+// ---- statistics self test ------------------------------------------------------------------------------
+
+// Reads the integers of the file and prints: n p50 p95 p99 p999 max mean low1_mean (all ns), one `key value` per line.
+fn perf_stats_selftest(path: u64) -> i32 {
+    var b: rt.Buf = rt.buf_new()
+    if !rt.read_file(path, &b) {
+        io.eprint_line("perf: cannot read the sample file")
+        return 3
+    }
+    let p: u64 = rt.buf_ptr(&b)
+    let len: usize = rt.buf_len(&b)
+    let a: u64 = rt.heap_alloc(len + 16)
+    var n: usize = 0
+    var i: usize = 0
+    var cur: u64 = 0
+    var in_num: bool = false
+    while i <= len {
+        var c: u8 = 32 as u8
+        if i < len {
+            c = rt.ld8(p, i)
+        }
+        if c >= 48 as u8 && c <= 57 as u8 {
+            cur = cur * 10 as u64 + (c - 48 as u8) as u64
+            in_num = true
+        } else if in_num {
+            rt.st64(a, n, cur)
+            n = n + 1
+            cur = 0
+            in_num = false
+        }
+        i = i + 1
+    }
+    mc_perf.perf_sort(a, n)
+    io.fmt_print(f"n {n}\n")
+    io.fmt_print(f"p50 {mc_perf.perf_percentile(a, n, 5000 as u64)}\n")
+    io.fmt_print(f"p95 {mc_perf.perf_percentile(a, n, 9500 as u64)}\n")
+    io.fmt_print(f"p99 {mc_perf.perf_percentile(a, n, 9900 as u64)}\n")
+    io.fmt_print(f"p999 {mc_perf.perf_percentile(a, n, 9990 as u64)}\n")
+    io.fmt_print(f"min {mc_perf.perf_percentile(a, n, 0 as u64)}\n")
+    io.fmt_print(f"max {mc_perf.perf_percentile(a, n, 10000 as u64)}\n")
+    io.fmt_print(f"mean {mc_perf.perf_mean(a, n)}\n")
+    io.fmt_print(f"low1_mean {mc_perf.perf_low1_mean(a, n)}\n")
+    io.fmt_print(f"low1_fps_x1000 {mc_perf.perf_fps_x1000(mc_perf.perf_low1_mean(a, n))}\n")
+    rt.heap_free(a, len + 16)
+    rt.buf_free(&b)
+    return 0
+}
+
+// ---- helpers -------------------------------------------------------------------------------------------
+
+fn fill_pad(t: *mut Tpl, cx: i32, sy: i32, cz: i32, pad: u64) {
+    var py: i32 = 0
+    while py < 18 {
+        var pz: i32 = 0
+        while pz < 18 {
+            var px: i32 = 0
+            while px < 18 {
+                rt.st16(pad, ((py * 18 + pz) * 18 + px) as usize,
+                    tpl_id(t, cx * 16 + px - 1, (*t).min_y + sy * 16 + py - 1, cz * 16 + pz - 1))
+                px = px + 1
+            }
+            pz = pz + 1
+        }
+        py = py + 1
+    }
+}
+
+fn clear_frame(b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera) -> u64 {
+    (*b).begin((*b).obj, cam as u64, 0xFFE6BE96 as u32)
+    (*b).end((*b).obj)
+    return (*b).present((*b).obj)
+}
+
+// camera on the flight path for frame f of n (f/n = t in [0, 1)): a line along +x with a triangle wave in z, one full turn
+fn path_cam(cam: *mut mc_camera.Camera, t: *mut Tpl, f: i32, n: i32) {
+    let u: f64 = (f as f64) / (n as f64)
+    var tri: f64 = u * 4.0
+    if tri > 1.0 { tri = 2.0 - tri }
+    if tri < 0.0 - 1.0 { tri = 0.0 - 2.0 - tri }
+    mc_camera.camera_set_pos(cam, (*t).cam_x + FLIGHT_BLOCKS * u, (*t).cam_y + 12.0, (*t).cam_z + 16.0 * tri)
+    mc_camera.camera_set_angles(cam, 360.0 * u, 15.0)
+    mc_camera.camera_update(cam)
+}
+
+// ---- the run -------------------------------------------------------------------------------------------
+
+// Args: start block of the process. Returns the exit code. `label` names the back end ("cpu" / "gl").
+fn perf_run(start: u64, b: *mut mc_backend.Backend, w: i32, h: i32, tstart: u64) -> i32 {
+    let t0_real: u64 = env_u64("BENCH_T0_NS")
+    let radius: i32 = parse_dec(rt.arg_ptr(start, 2), rt.c_length(rt.arg_ptr(start, 2)), 8) as i32
+    var frames: i32 = 100
+    var warm: i32 = 10
+    if rt.arg_count(start) > 3 {
+        frames = parse_dec(rt.arg_ptr(start, 3), rt.c_length(rt.arg_ptr(start, 3)), 100) as i32
+    }
+    if rt.arg_count(start) > 4 {
+        warm = parse_dec(rt.arg_ptr(start, 4), rt.c_length(rt.arg_ptr(start, 4)), 10) as i32
+    }
+    let max_mesh: i32 = perf_env_int("BENCH_MAXMESH", 16)
+    var blob: rt.Buf = rt.buf_new()
+    if !rt.read_file(rt.arg_ptr(start, 1), &blob) {
+        io.eprint_line("perf: cannot read the world file")
+        return 3
+    }
+    var tp: Tpl = Tpl { protocol: 0, min_y: 0, x0: 0, z0: 0, nx: 0, nz: 0, nsec: 0, ids: 0, cam_x: 0.0, cam_y: 0.0, cam_z: 0.0 }
+    if !tpl_parse(rt.buf_ptr(&blob), rt.buf_len(&blob), &tp) {
+        io.eprint_line("perf: bad world file (needs a full rectangle of chunk columns)")
+        return 4
+    }
+    rt.buf_free(&blob)
+    var ver: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(tp.protocol, &ver) {
+        io.eprint_line("perf: no tables for that protocol")
+        return 2
+    }
+    var atlas: mc_texture.Atlas = mc_texture.atlas_default()
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_texture.tex_alloc_tables(&tb)
+    var reg: mc_registry.Registry = ver.registry_of()
+    if !mc_registry.registry_ok(&reg) {
+        io.eprint_line("perf: registry of the protocol is not usable")
+        return 2
+    }
+    mc_texture.tex_build_tables(&reg, &tb)
+    (*b).upload_atlas((*b).obj, (&atlas) as u64)
+    var cam: mc_camera.Camera = mc_camera.camera_new(w, h)
+    path_cam(&cam, &tp, 0, frames)
+    // ---- startup: first image (empty world)
+    clear_frame(b, &cam)
+    let t_first_real: u64 = perf_real_ns()
+    if t0_real != 0 as u64 {
+        mc_perf.perf_emit("startup_first_image_ms", (t_first_real - t0_real) / 1000 as u64, "ms")
+    }
+    perf_emit_ms_since(tstart, "init_to_first_image_ms")
+    let rss0: u64 = status_kb("VmRSS")
+    // ---- world
+    let rb: i32 = radius + BORDER
+    var world: mc_world.World = mc_world.world_new()
+    let nbuild: usize = ((2 * rb + 1) * (2 * rb + 1)) as usize
+    let bt: u64 = rt.heap_alloc(nbuild * 8 + 8)
+    var nb: usize = 0
+    let ccx: i32 = mc_world.floor_div(tp.cam_x as i32, 16)
+    let ccz: i32 = mc_world.floor_div(tp.cam_z as i32, 16)
+    let tb0: u64 = perf_now_ns()
+    var dz: i32 = 0 - rb
+    while dz <= rb {
+        var dx: i32 = 0 - rb
+        while dx <= rb {
+            let cx: i32 = ccx + dx
+            let cz: i32 = ccz + dz
+            let i: i32 = mc_world.floor_mod(cx - tp.x0, tp.nx)
+            let j: i32 = mc_world.floor_mod(cz - tp.z0, tp.nz)
+            let s0: u64 = perf_now_ns()
+            let p: u64 = mc_render_world.wr_make_chunk(cx, cz, tp.nsec, tpl_col_ptr(&tp, i, j))
+            if p == 0 || !mc_world.world_put(&world, p) {
+                io.eprint_line("perf: cannot build the world")
+                return 5
+            }
+            rt.st64(bt, nb, perf_now_ns() - s0)
+            nb = nb + 1
+            dx = dx + 1
+        }
+        dz = dz + 1
+    }
+    let tb_total: u64 = perf_now_ns() - tb0
+    mc_perf.perf_sort(bt, nb)
+    mc_perf.perf_emit("build_chunk_p50", mc_perf.perf_percentile(bt, nb, 5000 as u64), "us")
+    mc_perf.perf_emit("build_chunk_p95", mc_perf.perf_percentile(bt, nb, 9500 as u64), "us")
+    mc_perf.perf_emit("build_chunks_per_s", (nb as u64) * 1000000000000 as u64 / tb_total, "chunks/s")
+    mc_perf.perf_emit_u("world_chunks", nb as u64, "chunks")
+    rt.heap_free(bt, nbuild * 8 + 8)
+    // ---- mesh + upload components on a sample (flags: naive+AO, greedy+AO, naive without AO)
+    if perf_env_int("BENCH_COMP", 0) == 1 {
+        perf_components(&tp, &tb, b, ccx, ccz)
+    }
+    // ---- load: yaw sweep with unlimited meshing = every section in range gets meshed + uploaded + drawn once
+    var wr: mc_render_world.WorldRender = mc_render_world.wr_new(tp.min_y, radius, &tb)
+    var sections_meshed: u64 = 0
+    let tl0: u64 = perf_now_ns()
+    var k: i32 = 0
+    while k < 8 {
+        mc_camera.camera_set_angles(&cam, (k * 45) as f64, 15.0)
+        mc_camera.camera_update(&cam)
+        (*b).begin((*b).obj, (&cam) as u64, 0xFFE6BE96 as u32)
+        mc_render_world.wr_render_b(&wr, &world, b, &cam, 0 - 1)
+        (*b).end((*b).obj)
+        (*b).present((*b).obj)
+        sections_meshed = sections_meshed + wr.st.meshed as u64
+        if k == 0 {
+            if t0_real != 0 as u64 {
+                mc_perf.perf_emit("startup_world_image_ms", (perf_real_ns() - t0_real) / 1000 as u64, "ms")
+            }
+        }
+        k = k + 1
+    }
+    let tl: u64 = perf_now_ns() - tl0
+    let range_chunks: u64 = ((2 * radius + 1) * (2 * radius + 1)) as u64
+    mc_perf.perf_emit("load_e2e_ms", tl / 1000 as u64, "ms")
+    mc_perf.perf_emit("load_e2e_chunks_per_s", range_chunks * 1000000000000 as u64 / tl, "chunks/s")
+    mc_perf.perf_emit_u("load_sections_meshed", sections_meshed, "sections")
+    mc_perf.perf_emit("load_e2e_sections_per_s", sections_meshed * 1000000000000 as u64 / tl, "sections/s")
+    let rss1: u64 = status_kb("VmRSS")
+    mc_perf.perf_emit("rss_start_mb", rss0 * 1000 as u64 / 1024 as u64, "MB")
+    mc_perf.perf_emit("rss_loaded_mb", rss1 * 1000 as u64 / 1024 as u64, "MB")
+    mc_perf.perf_emit("rss_peak_mb", status_kb("VmHWM") * 1000 as u64 / 1024 as u64, "MB")
+    // ---- warm-up + measured frames on the flight path
+    var f: i32 = 0 - warm
+    var tot_tris: u64 = 0
+    var tot_drawn: u64 = 0
+    var tot_meshed: u64 = 0
+    var tot_def: u64 = 0
+    let ft: u64 = rt.heap_alloc((frames as usize) * 8 + 8)
+    var nf: usize = 0
+    var t_sum: u64 = 0
+    while f < frames {
+        var fi: i32 = f
+        if fi < 0 { fi = 0 }
+        path_cam(&cam, &tp, fi, frames)
+        let a0: u64 = perf_now_ns()
+        (*b).begin((*b).obj, (&cam) as u64, 0xFFE6BE96 as u32)
+        mc_render_world.wr_render_b(&wr, &world, b, &cam, max_mesh)
+        (*b).end((*b).obj)
+        (*b).present((*b).obj)
+        let a1: u64 = perf_now_ns()
+        if f >= 0 {
+            rt.st64(ft, nf, a1 - a0)
+            nf = nf + 1
+            t_sum = t_sum + (a1 - a0)
+            tot_tris = tot_tris + wr.st.tris
+            tot_drawn = tot_drawn + wr.st.drawn as u64
+            tot_meshed = tot_meshed + wr.st.meshed as u64
+            tot_def = tot_def + wr.st.deferred as u64
+        }
+        f = f + 1
+    }
+    // unsorted copy for nothing: only sorted statistics are reported
+    mc_perf.perf_sort(ft, nf)
+    let p50: u64 = mc_perf.perf_percentile(ft, nf, 5000 as u64)
+    let p95: u64 = mc_perf.perf_percentile(ft, nf, 9500 as u64)
+    let p99: u64 = mc_perf.perf_percentile(ft, nf, 9900 as u64)
+    let pmax: u64 = mc_perf.perf_percentile(ft, nf, 10000 as u64)
+    let pmin: u64 = mc_perf.perf_percentile(ft, nf, 0 as u64)
+    mc_perf.perf_emit("frame_ms_p50", p50 / 1000 as u64, "ms")
+    mc_perf.perf_emit("frame_ms_p95", p95 / 1000 as u64, "ms")
+    mc_perf.perf_emit("frame_ms_p99", p99 / 1000 as u64, "ms")
+    mc_perf.perf_emit("frame_ms_min", pmin / 1000 as u64, "ms")
+    mc_perf.perf_emit("frame_ms_max", pmax / 1000 as u64, "ms")
+    mc_perf.perf_emit("fps_avg", (nf as u64) * 1000000000000 as u64 / t_sum, "fps")
+    mc_perf.perf_emit("fps_p50", mc_perf.perf_fps_x1000(p50), "fps")
+    mc_perf.perf_emit("fps_p99", mc_perf.perf_fps_x1000(p99), "fps")
+    mc_perf.perf_emit("fps_1pct_low", mc_perf.perf_fps_x1000(mc_perf.perf_low1_mean(ft, nf)), "fps")
+    mc_perf.perf_emit_u("frames", nf as u64, "frames")
+    mc_perf.perf_emit("tris_per_frame", tot_tris * 1000 as u64 / (nf as u64), "tris")
+    mc_perf.perf_emit("sections_drawn_per_frame", tot_drawn * 1000 as u64 / (nf as u64), "sections")
+    mc_perf.perf_emit("sections_meshed_per_frame", tot_meshed * 1000 as u64 / (nf as u64), "sections")
+    mc_perf.perf_emit_u("sections_deferred_total", tot_def, "sections")
+    mc_perf.perf_emit_u("view_radius", radius as u64, "chunks")
+    mc_perf.perf_emit_u("width", w as u64, "px")
+    mc_perf.perf_emit_u("height", h as u64, "px")
+    mc_perf.perf_emit_u("cached_sections", mc_render_world.wr_cached(&wr) as u64, "sections")
+    return 0
+}
+
+fn perf_emit_ms_since(t: u64, key: str) {
+    mc_perf.perf_emit(key, (perf_now_ns() - t) / 1000 as u64, "ms")
+}
+
+// Meshing + upload cost per section on the (2 * SAMPLE_R + 1)^2 columns around the start: the sections that have faces.
+fn perf_components(t: *mut Tpl, tb: *mut mc_mesh.MeshTables, b: *mut mc_backend.Backend, ccx: i32, ccz: i32) {
+    var m: mc_mesh.Mesher = mc_mesh.mesher_new()
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    let cap: usize = ((2 * SAMPLE_R + 1) * (2 * SAMPLE_R + 1)) as usize * (*t).nsec
+    let tn: u64 = rt.heap_alloc(cap * 8 + 8) // naive + AO
+    let tg: u64 = rt.heap_alloc(cap * 8 + 8) // greedy + AO
+    let tf: u64 = rt.heap_alloc(cap * 8 + 8) // naive, no AO
+    let tu: u64 = rt.heap_alloc(cap * 8 + 8) // upload + free of the greedy mesh
+    var n: usize = 0
+    var tris_n: u64 = 0
+    var tris_g: u64 = 0
+    var tris_f: u64 = 0
+    var bytes_g: u64 = 0
+    var dz: i32 = 0 - SAMPLE_R
+    while dz <= SAMPLE_R {
+        var dx: i32 = 0 - SAMPLE_R
+        while dx <= SAMPLE_R {
+            var sy: usize = 0
+            while sy < (*t).nsec {
+                fill_pad(t, ccx + dx, sy as i32, ccz + dz, pad)
+                let a0: u64 = perf_now_ns()
+                mc_mesh.mesh_padded(&m, pad, tb, mc_mesh.F_AO)
+                let a1: u64 = perf_now_ns()
+                let nidx_n: u32 = m.nidx
+                if nidx_n > 0 as u32 {
+                    mc_mesh.mesh_padded(&m, pad, tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+                    let a2: u64 = perf_now_ns()
+                    let nidx_g: u32 = m.nidx
+                    let nv_g: u32 = m.nverts
+                    var h: usize = 0
+                    if perf_env_int("BENCH_COMPUPLOAD", 0) == 1 {
+                        h = (*b).mesh_upload((*b).obj, 1 as u64, m.verts, m.nverts as usize, m.idx, m.nidx as usize)
+                    }
+                    let a3: u64 = perf_now_ns()
+                    if h != 0 && perf_env_int("BENCH_NOFREE", 0) == 0 {
+                        (*b).mesh_free((*b).obj, h)
+                    }
+                    let a4: u64 = perf_now_ns()
+                    mc_mesh.mesh_padded(&m, pad, tb, 0 as u32)
+                    let a5: u64 = perf_now_ns()
+                    rt.st64(tn, n, a1 - a0)
+                    rt.st64(tg, n, a2 - a1)
+                    rt.st64(tu, n, a4 - a2)
+                    rt.st64(tf, n, a5 - a4)
+                    tris_n = tris_n + (nidx_n / 3 as u32) as u64
+                    tris_g = tris_g + (nidx_g / 3 as u32) as u64
+                    tris_f = tris_f + (m.nidx / 3 as u32) as u64
+                    bytes_g = bytes_g + (nv_g as u64) * 8 as u64 + (nidx_g as u64) * 4 as u64
+                    n = n + 1
+                }
+                sy = sy + 1
+            }
+            dx = dx + 1
+        }
+        dz = dz + 1
+    }
+    if n > 0 {
+        mc_perf.perf_sort(tn, n)
+        mc_perf.perf_sort(tg, n)
+        mc_perf.perf_sort(tf, n)
+        mc_perf.perf_sort(tu, n)
+        mc_perf.perf_emit_u("mesh_sample_sections", n as u64, "sections")
+        mc_perf.perf_emit("mesh_naive_ao_p50", mc_perf.perf_percentile(tn, n, 5000 as u64), "us/section")
+        mc_perf.perf_emit("mesh_naive_ao_mean", mc_perf.perf_mean(tn, n), "us/section")
+        mc_perf.perf_emit("mesh_naive_noao_p50", mc_perf.perf_percentile(tf, n, 5000 as u64), "us/section")
+        mc_perf.perf_emit("mesh_greedy_ao_p50", mc_perf.perf_percentile(tg, n, 5000 as u64), "us/section")
+        mc_perf.perf_emit("mesh_greedy_ao_p95", mc_perf.perf_percentile(tg, n, 9500 as u64), "us/section")
+        mc_perf.perf_emit("mesh_greedy_ao_mean", mc_perf.perf_mean(tg, n), "us/section")
+        mc_perf.perf_emit("tris_per_section_naive", tris_n * 1000 as u64 / (n as u64), "tris")
+        mc_perf.perf_emit("tris_per_section_greedy", tris_g * 1000 as u64 / (n as u64), "tris")
+        mc_perf.perf_emit("tris_per_section_naive_noao", tris_f * 1000 as u64 / (n as u64), "tris")
+        mc_perf.perf_emit("mesh_bytes_per_section_greedy", bytes_g * 1000 as u64 / (n as u64), "bytes")
+        mc_perf.perf_emit("upload_free_p50", mc_perf.perf_percentile(tu, n, 5000 as u64), "us/section")
+    }
+    rt.heap_free(tn, cap * 8 + 8)
+    rt.heap_free(tg, cap * 8 + 8)
+    rt.heap_free(tf, cap * 8 + 8)
+    rt.heap_free(tu, cap * 8 + 8)
+    rt.heap_free(pad, 5832 * 2)
+    mc_mesh.mesher_free(&m)
+}
