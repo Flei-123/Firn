@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/input/padset.fi -- input.padset: the table of connected gamepads plus the SDL mapping database.
+//
+// Pure data (no syscall): lib/input/padsys.fi (Linux) / padsys.windows.fi (XInput) fill it, lib/input/pad.fi is the
+// front door. A slot keeps its Pad (state + event ring) after the device left, so the PE_DISCONNECTED event can
+// still be read; the slot is reused by the next device once its ring is empty.
+import std.rt
+import input.padcore
+
+export {
+    PadSet, padset_new, padset_attach, padset_detach, padset_pad, padset_active, padset_count, padset_begin,
+    padset_find_node, padset_kind, padset_fd, padset_db_add, padset_db_load, padset_db_apply, padset_db_size,
+    MAXPADS, KIND_NONE, KIND_EVDEV, KIND_JOYDEV, KIND_XINPUT,
+}
+
+const MAXPADS: usize = 8
+const KIND_NONE: u8 = 0
+const KIND_EVDEV: u8 = 1 // also what the tests attach (a pipe carrying evdev bytes)
+const KIND_JOYDEV: u8 = 2
+const KIND_XINPUT: u8 = 3
+
+struct PadSet {
+    pad: [padcore.Pad; 8],
+    active: [u8; 8],
+    kind: [u8; 8],
+    fd: [i64; 8],
+    node: [u32; 8],
+    used: [u8; 8],
+    ino: i64,       // inotify descriptor (-1: none)
+    settle: i64,    // polls until the next rescan after a /dev/input change
+    idle: i64,      // polls since the last rescan (fallback without inotify)
+    denied: u64,    // device nodes that could not be opened (permission)
+    xdll: u64,      // XInput: the loaded library (Windows)
+    xget: u64,      // XInput: XInputGetState
+    db: rt.Buf,     // SDL GameControllerDB text
+}
+
+fn padset_new() -> PadSet {
+    return PadSet { pad: [padcore.pad_new(); 8], active: [0 as u8; 8], kind: [0 as u8; 8], fd: [0 - 1; 8],
+        node: [0 as u32; 8], used: [0 as u8; 8], ino: 0 - 1, settle: 0, idle: 0, denied: 0 as u64, xdll: 0 as u64,
+        xget: 0 as u64, db: rt.buf_new() }
+}
+
+fn padset_pad(s: *mut PadSet, i: usize) -> *mut padcore.Pad { return &(*s).pad[i] }
+fn padset_active(s: *mut PadSet, i: usize) -> bool { return i < MAXPADS && (*s).active[i] != 0 as u8 }
+fn padset_kind(s: *mut PadSet, i: usize) -> u8 { return (*s).kind[i] }
+fn padset_fd(s: *mut PadSet, i: usize) -> i64 { return (*s).fd[i] }
+
+fn padset_count(s: *mut PadSet) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < MAXPADS {
+        if (*s).active[i] != 0 as u8 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// frame start: clear the edges of every pad
+fn padset_begin(s: *mut PadSet) {
+    var i: usize = 0
+    while i < MAXPADS {
+        padcore.pad_begin(&(*s).pad[i])
+        i = i + 1
+    }
+}
+
+// slot of the active device of this kind and node number, or -1
+fn padset_find_node(s: *mut PadSet, kind: u8, node: u32) -> i64 {
+    var i: usize = 0
+    while i < MAXPADS {
+        if (*s).active[i] != 0 as u8 && (*s).kind[i] == kind && (*s).node[i] == node {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// a free slot (a slot whose events were all read first), or -1 when all 8 are taken. The Pad is reset, the
+// caller describes the device in it, then pad_event PE_CONNECTED is queued by padset_attach itself.
+fn padset_attach(s: *mut PadSet, kind: u8, fd: i64, node: u32) -> i64 {
+    var pick: i64 = 0 - 1
+    var i: usize = 0
+    while i < MAXPADS && pick < 0 {
+        if (*s).active[i] == 0 as u8 && (*s).used[i] == 0 as u8 {
+            pick = i as i64
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < MAXPADS && pick < 0 {
+        if (*s).active[i] == 0 as u8 && (*s).pad[i].ev_head == (*s).pad[i].ev_tail {
+            pick = i as i64
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < MAXPADS && pick < 0 {
+        if (*s).active[i] == 0 as u8 {
+            pick = i as i64
+        }
+        i = i + 1
+    }
+    if pick < 0 {
+        return 0 - 1
+    }
+    let k: usize = pick as usize
+    padcore.pad_reset(&(*s).pad[k])
+    (*s).active[k] = 1 as u8
+    (*s).used[k] = 1 as u8
+    (*s).kind[k] = kind
+    (*s).fd[k] = fd
+    (*s).node[k] = node
+    padcore.pad_event_force(&(*s).pad[k], padcore.PE_CONNECTED, 0 as u32, 1.0)
+    return pick
+}
+
+// the device is gone: the slot stays readable (its events) but inactive. Queues PE_DISCONNECTED.
+fn padset_detach(s: *mut PadSet, i: usize) {
+    if i >= MAXPADS || (*s).active[i] == 0 as u8 {
+        return
+    }
+    (*s).active[i] = 0 as u8
+    (*s).fd[i] = 0 - 1
+    // release everything that was held
+    let held: u32 = (*s).pad[i].buttons
+    var b: usize = 0
+    while b < padcore.PB_COUNT {
+        if ((held >> (b as u32)) & (1 as u32)) != (0 as u32) {
+            padcore.pad_event_push(&(*s).pad[i], padcore.PE_BUTTON_UP, b as u32, 0.0)
+        }
+        b = b + 1
+    }
+    (*s).pad[i].released = (*s).pad[i].released | held
+    (*s).pad[i].buttons = 0 as u32
+    var a: usize = 0
+    while a < padcore.PA_COUNT {
+        (*s).pad[i].axes[a] = 0.0
+        a = a + 1
+    }
+    padcore.pad_event_force(&(*s).pad[i], padcore.PE_DISCONNECTED, 0 as u32, 0.0)
+}
+
+// ---- the SDL GameControllerDB ----------------------------------------------------------------------------------
+fn padset_db_size(s: *mut PadSet) -> usize { return rt.buf_len(&(*s).db) }
+
+// append text holding any number of lines (one SDL mapping per line; '#' comments are skipped at lookup)
+fn padset_db_add(s: *mut PadSet, text: u64, n: usize) {
+    rt.buf_push_bytes(&(*s).db, text, n)
+    if n > 0 && rt.ld8(text, n - 1) != 10 as u8 {
+        rt.buf_push(&(*s).db, 10 as u8)
+    }
+}
+
+// a gamecontrollerdb.txt file (path 0-terminated); false when unreadable
+fn padset_db_load(s: *mut PadSet, path: u64) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    if !rt.read_file(path, &b) {
+        rt.buf_free(&b)
+        return false
+    }
+    padset_db_add(s, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    return true
+}
+
+// lines of the database: the n-th line start / end (end = index of '\n' or len); false past the last line
+fn line_end(p: u64, len: usize, from: usize) -> usize {
+    var e: usize = from
+    while e < len && rt.ld8(p, e) != 10 as u8 {
+        e = e + 1
+    }
+    return e
+}
+
+// the same hex digits? (case-insensitive) over `n` characters of a at ao and b at bo
+fn hex_eq(a: u64, ao: usize, b: u64, bo: usize, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        var x: u8 = rt.ld8(a, ao + i)
+        var y: u8 = rt.ld8(b, bo + i)
+        if x >= 65 as u8 && x <= 70 as u8 { x = x + 32 as u8 }
+        if y >= 65 as u8 && y <= 70 as u8 { y = y + 32 as u8 }
+        if x != y {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Looks the device up (full GUID first, then bus + vendor + product) and applies the first matching Linux line.
+// True when a database line was applied.
+fn padset_db_apply(s: *mut PadSet, p: *mut padcore.Pad) -> bool {
+    let len: usize = rt.buf_len(&(*s).db)
+    if len == 0 {
+        return false
+    }
+    let db: u64 = rt.buf_ptr(&(*s).db)
+    var g: [u8; 40] = [0 as u8; 40]
+    padcore.pad_sdl_guid(p, (&g[0]) as u64)
+    let gp: u64 = (&g[0]) as u64
+    var pass: usize = 0
+    while pass < 2 {
+        var at: usize = 0
+        while at < len {
+            let e: usize = line_end(db, len, at)
+            let n: usize = e - at
+            if n > 34 && rt.ld8(db, at + 32) == 44 as u8 && rt.ld8(db, at) != 35 as u8 {
+                var hit: bool = false
+                if pass == 0 {
+                    hit = hex_eq(db, at, gp, 0, 32)
+                } else {
+                    // bus (0..4), vendor (8..12), product (16..20)
+                    hit = hex_eq(db, at, gp, 0, 4) && hex_eq(db, at + 8, gp, 8, 4) && hex_eq(db, at + 16, gp, 16, 4)
+                }
+                if hit && padcore.pad_apply_sdl(p, db + at as u64, n) {
+                    return true
+                }
+            }
+            at = e + 1
+        }
+        pass = pass + 1
+    }
+    return false
+}

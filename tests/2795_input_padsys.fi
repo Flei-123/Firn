@@ -1,0 +1,221 @@
+// expect_exit: 0
+// tests/2795_input_padsys.fi -- lib/input/padsys.fi + padset.fi: the REAL read path (non blocking read(2), chunking,
+// SYN_DROPPED, EOF = unplug) on a PIPE that carries fake input_event / js_event bytes (there is no /dev/uinput
+// here), against the pure core fed with the same bytes; the SDL database lookup; hot-plug scan without /dev/input.
+import std.rt
+import std.str
+import input.padcore
+import input.padset
+import input.padsys
+import input.pad
+
+static mut SEED: u64 = 424242
+
+fn rnd() -> u64 {
+    SEED = (SEED * 1103515245 + 12345) % 2147483648
+    return SEED / 65536
+}
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+fn put_ev(buf: u64, i: usize, t: u32, c: u32, v: i32) {
+    let q: u64 = buf + (i * 24) as u64
+    rt.st64(q, 0, 1000 as u64)
+    rt.st64(q, 1, 0 as u64)
+    rt.st16(q, 8, t as u16)
+    rt.st16(q, 9, c as u16)
+    rt.st32(q, 5, padcore.u32_of_i32(v))
+}
+
+fn describe(p: *mut padcore.Pad) {
+    padcore.pad_reset(p)
+    padcore.pad_set_identity(p, 3 as u32, 0x045e as u32, 0x028e as u32, 0x0114 as u32)
+    var codes: [u32; 11] = [304 as u32, 305 as u32, 307 as u32, 308 as u32, 310 as u32, 311 as u32, 314 as u32, 315 as u32, 316 as u32, 317 as u32, 318 as u32]
+    var i: usize = 0
+    while i < 11 {
+        padcore.pad_add_key(p, codes[i])
+        i = i + 1
+    }
+    padcore.pad_finish_keys(p)
+    padcore.pad_set_abs(p, 0 as u32, 0 - 32768, 32767, 128, 0)
+    padcore.pad_set_abs(p, 1 as u32, 0 - 32768, 32767, 128, 0)
+    padcore.pad_set_abs(p, 2 as u32, 0, 255, 0, 0)
+    padcore.pad_set_abs(p, 3 as u32, 0 - 32768, 32767, 128, 0)
+    padcore.pad_set_abs(p, 4 as u32, 0 - 32768, 32767, 128, 0)
+    padcore.pad_set_abs(p, 5 as u32, 0, 255, 0, 0)
+    padcore.pad_set_abs(p, 16 as u32, 0 - 1, 1, 0, 0)
+    padcore.pad_set_abs(p, 17 as u32, 0 - 1, 1, 0, 0)
+    padcore.pad_apply_default(p)
+}
+
+fn write_all(fd: i64, p: u64, n: usize) {
+    check(syscall(1, fd, p as i64, n as i64, 0, 0, 0) == n as i64, 80)
+}
+
+fn same_state(a: *mut padcore.Pad, b: *mut padcore.Pad) -> bool {
+    if (*a).buttons != (*b).buttons { return false }
+    var i: usize = 0
+    while i < 6 {
+        if (*a).axes[i] != (*b).axes[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn main() -> i32 {
+    // ---- a pipe as the device
+    var fds: [i32; 2] = [0 as i32; 2]
+    check(syscall(293, (&fds[0]) as i64, 2048, 0, 0, 0, 0) == 0, 1)
+    let rfd: i64 = fds[0] as i64
+    let wfd: i64 = fds[1] as i64
+    var s: padset.PadSet = padset.padset_new()
+    let slot: i64 = padset.padset_attach(&s, padset.KIND_EVDEV, rfd, 7 as u32)
+    check(slot == 0 && padset.padset_count(&s) == 1, 2)
+    check(padset.padset_find_node(&s, padset.KIND_EVDEV, 7 as u32) == 0 && padset.padset_find_node(&s, padset.KIND_EVDEV, 8 as u32) < 0, 3)
+    describe(&s.pad[0])
+    var model: padcore.Pad = padcore.pad_new()
+    describe(&model)
+    // nothing written: EAGAIN, nothing happens, still attached
+    padsys.sys_read_slot(&s, 0)
+    check(padset.padset_active(&s, 0), 4)
+
+    // ---- 3000 random events in random chunk sizes; after every chunk the pad equals the model
+    var evb: [u8; 2400] = [0 as u8; 2400] // 100 events
+    var codes: [u32; 11] = [304 as u32, 305 as u32, 307 as u32, 308 as u32, 310 as u32, 311 as u32, 314 as u32, 315 as u32, 316 as u32, 317 as u32, 318 as u32]
+    var acodes: [u32; 8] = [0 as u32, 1 as u32, 2 as u32, 3 as u32, 4 as u32, 5 as u32, 16 as u32, 17 as u32]
+    var total: usize = 0
+    while total < 3000 {
+        let cnt: usize = 1 + (rnd() % 100) as usize
+        var i: usize = 0
+        while i < cnt {
+            let r: u64 = rnd() % 10
+            if r < 4 {
+                put_ev((&evb[0]) as u64, i, 1 as u32, codes[(rnd() % 11) as usize], (rnd() % 3) as i32)
+            } else if r < 8 {
+                let ai: usize = (rnd() % 8) as usize
+                var v: i64 = 0
+                if ai < 2 || ai == 3 || ai == 4 { v = (rnd() % 65536) as i64 - 32768 }
+                else if ai == 2 || ai == 5 { v = (rnd() % 256) as i64 }
+                else { v = (rnd() % 3) as i64 - 1 }
+                put_ev((&evb[0]) as u64, i, 3 as u32, acodes[ai], v as i32)
+            } else {
+                put_ev((&evb[0]) as u64, i, 0 as u32, 0 as u32, 0 as i32)
+            }
+            i = i + 1
+        }
+        // terminate the chunk with a SYN_REPORT unless the last was one
+        put_ev((&evb[0]) as u64, cnt, 0 as u32, 0 as u32, 0 as i32)
+        write_all(wfd, (&evb[0]) as u64, (cnt + 1) * 24)
+        padcore.pad_feed_evdev(&model, (&evb[0]) as u64, (cnt + 1) * 24)
+        padsys.sys_read_slot(&s, 0)
+        check(same_state(&s.pad[0], &model), 10)
+        total = total + cnt + 1
+    }
+    // more than one 4096-octet read: 170 events fit, write 400 at once
+    var big: [u8; 9600] = [0 as u8; 9600]
+    var j: usize = 0
+    while j < 400 {
+        put_ev((&big[0]) as u64, j, 1 as u32, codes[(rnd() % 11) as usize], (rnd() % 2) as i32)
+        j = j + 1
+    }
+    put_ev((&big[0]) as u64, 399, 0 as u32, 0 as u32, 0 as i32)
+    write_all(wfd, (&big[0]) as u64, 9600)
+    padcore.pad_feed_evdev(&model, (&big[0]) as u64, 9600)
+    padsys.sys_read_slot(&s, 0)
+    check(same_state(&s.pad[0], &model), 11)
+
+    // ---- unplug: the writer closes -> EOF -> detached, held buttons are released, PE_DISCONNECTED queued
+    padcore.pad_begin(&s.pad[0])
+    put_ev((&evb[0]) as u64, 0, 1 as u32, 304 as u32, 1 as i32)
+    put_ev((&evb[0]) as u64, 1, 0 as u32, 0 as u32, 0 as i32)
+    write_all(wfd, (&evb[0]) as u64, 48)
+    padsys.sys_read_slot(&s, 0)
+    check(padcore.pad_down(&s.pad[0], padcore.PB_A), 20)
+    syscall(3, wfd, 0, 0, 0, 0, 0)
+    padsys.sys_read_slot(&s, 0)
+    check(!padset.padset_active(&s, 0) && padset.padset_count(&s) == 0, 21)
+    check(!padcore.pad_down(&s.pad[0], padcore.PB_A) && padcore.pad_released(&s.pad[0], padcore.PB_A), 22)
+    var idx: u32 = 0 as u32
+    var val: f64 = 0.0
+    check(s.pad[0].ev_lost > 0 as u64, 25) // 3000 undrained events overflowed the ring (counted, newest dropped) ...
+    var got_disc: bool = false
+    var last: u32 = 0 as u32
+    var k: u32 = padcore.pad_event_next(&s.pad[0], &idx, &val)
+    while k != 0 as u32 {
+        if k == padcore.PE_DISCONNECTED { got_disc = true }
+        last = k
+        k = padcore.pad_event_next(&s.pad[0], &idx, &val)
+    }
+    check(got_disc && last == padcore.PE_DISCONNECTED, 23) // ... but the disconnect still got in
+    // the slot is free again: a second device takes a fresh one (slot 1 was never used, so it goes first)
+    let s2: i64 = padset.padset_attach(&s, padset.KIND_EVDEV, 0 - 1, 9 as u32)
+    check(s2 == 1, 24)
+    padset.padset_detach(&s, 1)
+
+    // ---- joydev bytes through a pipe
+    var jf: [i32; 2] = [0 as i32; 2]
+    check(syscall(293, (&jf[0]) as i64, 2048, 0, 0, 0, 0) == 0, 30)
+    let js: i64 = padset.padset_attach(&s, padset.KIND_JOYDEV, jf[0] as i64, 3 as u32)
+    check(js >= 0, 31)
+    let jp: *mut padcore.Pad = padset.padset_pad(&s, js as usize)
+    describe(jp)
+    var bm: [u16; 2] = [304 as u16, 305 as u16]
+    var am: [u8; 2] = [0 as u8, 16 as u8]
+    padcore.pad_js_maps(jp, 2, (&bm[0]) as u64, 2, (&am[0]) as u64)
+    var je: [u8; 16] = [0 as u8; 16]
+    rt.st16((&je[0]) as u64, 2, 1 as u16)
+    je[6] = 1 as u8
+    je[7] = 0 as u8 // button 0 down -> BTN_SOUTH -> a
+    rt.st16((&je[0]) as u64, 6, 32767 as u16)
+    je[14] = 2 as u8
+    je[15] = 1 as u8 // axis 1 -> ABS_HAT0X = +max -> dpright
+    write_all(jf[1] as i64, (&je[0]) as u64, 16)
+    padsys.sys_read_slot(&s, js as usize)
+    check(padcore.pad_down(jp, padcore.PB_A) && padcore.pad_down(jp, padcore.PB_DRIGHT), 32)
+    syscall(3, jf[1] as i64, 0, 0, 0, 0, 0)
+    syscall(3, jf[0] as i64, 0, 0, 0, 0, 0)
+    syscall(3, rfd, 0, 0, 0, 0, 0)
+
+    // ---- the SDL database: exact GUID, then vendor/product, no match, a comment line, Windows lines skipped
+    var db: padset.PadSet = padset.padset_new()
+    var text: str = "# comment\n03000000aaaa0000bbbb000000000000,Other,a:b3,platform:Linux,\n030000005e0400008e02000014010000,Xbox 360 Controller,a:b0,b:b1,dpup:h0.1,platform:Linux,\n"
+    var tb: [u8; 300] = [0 as u8; 300]
+    let tn: usize = text.length()
+    var q: usize = 0
+    while q < tn {
+        tb[q] = text.chars(q)
+        q = q + 1
+    }
+    padset.padset_db_add(&db, (&tb[0]) as u64, tn)
+    var dp: padcore.Pad = padcore.pad_new()
+    describe(&dp)
+    check(padset.padset_db_apply(&db, &dp) && padcore.pad_mapped(&dp), 40)
+    check(dp.map_code[padcore.PB_A] == 304 as u32 && dp.map_code[padcore.PB_B] == 305 as u32, 41)
+    // another firmware revision + crc: found by bus/vendor/product
+    padcore.pad_set_identity(&dp, 3 as u32, 0x045e as u32, 0x028e as u32, 0x0999 as u32)
+    padcore.pad_apply_default(&dp)
+    check(padset.padset_db_apply(&db, &dp) && padcore.pad_mapped(&dp), 42)
+    // another device: unchanged
+    padcore.pad_set_identity(&dp, 3 as u32, 0x1234 as u32, 0x5678 as u32, 0 as u32)
+    padcore.pad_apply_default(&dp)
+    check(!padset.padset_db_apply(&db, &dp) && !padcore.pad_mapped(&dp), 43)
+    // the device whose line says a:b3 (index 3 of its keys = BTN_WEST, the 4th in SDL order)
+    padcore.pad_set_identity(&dp, 3 as u32, 0xaaaa as u32, 0xbbbb as u32, 0 as u32)
+    check(padset.padset_db_apply(&db, &dp) && dp.map_code[padcore.PB_A] == 308 as u32, 44)
+    // a file that does not exist
+    var np: [u8; 16] = "/no/such/file\0\0\0"
+    check(!padset.padset_db_load(&db, (&np[0]) as u64), 45)
+
+    // ---- the real scan on this machine: /dev/input may not exist; must not crash, finds nothing or something
+    var live: padset.PadSet = pad.pad_new()
+    check(pad.pad_open(&live), 50)
+    pad.pad_poll(&live)
+    pad.pad_frame(&live)
+    pad.pad_close(&live)
+    check(padset.padset_count(&live) == 0, 51)
+    return 0
+}

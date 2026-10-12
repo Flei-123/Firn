@@ -1996,6 +1996,17 @@ else
     grep -E 'FAIL' "$WORK/glwindow.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 127. lib/input gamepads (evdev/joydev/XInput, SDL mapping, deadzone, hot-plug) + evdev raw keyboard/mouse, fake byte streams through a pipe (tools/input/pad_run.sh, docs/INPUT.md) =="
+# No /dev/input and no /dev/uinput on the build machine: the read path is driven by a pipe carrying input_event bytes.
+FIRNC="$FIRNC" bash tools/input/pad_run.sh > "$WORK/pad.log" 2>&1 && PADRC=0 || PADRC=$?
+if [ "$PADRC" -eq 0 ]; then
+    ok
+    grep -E '^   (ok|SKIP)' "$WORK/pad.log" | sed 's/^/ /'
+else
+    bad "tools/input/pad_run.sh failed (see .test-work/pad.log)"
+    grep -E 'FAIL' "$WORK/pad.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 124. lib/input: raw keys / mouse state machine, relative mouse grab (X11 raw motion + warp fallback) under Xvfb+xdotool (tools/input/read_run.sh, docs/INPUT.md) =="
 FIRNC="$FIRNC" bash tools/input/read_run.sh > "$WORK/rawinput.log" 2>&1 && RAWINRC=0 || RAWINRC=$?
 if [ "$RAWINRC" -eq 0 ]; then
