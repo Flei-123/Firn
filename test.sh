@@ -1973,6 +1973,17 @@ else
     grep -E 'FAIL|scene .*FAIL' "$WORK/gpu.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 120. mc_audio: Minecraft listener/sources/blocks/categories/packets on audio.engine (tools/mc/audio/run.sh, docs/mc/audio.md) =="
+# Pan, attenuation, Minecraft gain and pan law bit for bit against numpy float32 (3 stages), then tests/2766_mc_audio.fi through the real engine.
+FIRNC="$FIRNC" bash tools/mc/audio/run.sh > "$WORK/mcaudio.log" 2>&1 && MARC=0 || MARC=$?
+if [ "$MARC" -eq 0 ]; then
+    ok
+    grep -E 'cases:|RESULT' "$WORK/mcaudio.log" | sed 's/^/ /'
+else
+    bad "tools/mc/audio/run.sh failed (see .test-work/mcaudio.log)"
+    grep -E 'FAIL' "$WORK/mcaudio.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

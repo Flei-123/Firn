@@ -1,0 +1,507 @@
+// expect_exit: 0
+// lib/mc/mc_audio.fi through the REAL audio.engine with synthetic sounds (audio.synth sine + DC samples):
+//  A  block name -> sound type table, event names, categories
+//  B  listener = mc_camera: pan (right of the camera = right channel), Minecraft distance gain, out of range = culled
+//  C  category volume and mute (bus calls, running voices follow), unknown event = silence, 2D ui sound
+//  D  block sounds from a real chunk (mc_world + registry 1.20.1), walker: steps per distance, landing
+//  E  entity bound source follows the entity (mc_entity.Store, 1.20.1 spawn / relative move packets)
+//  F  Sound Effect / Entity Sound Effect / Stop Sound packets: decode, errors, apply; numeric ids; fuzz
+//  G  origin rebase: same gain and pan 3 000 000 blocks from the origin
+import std.rt
+import std.io
+import std.bytes
+import std.math
+import audio.engine
+import audio.bank
+import audio.synth
+import mc.mc_audio
+import mc.mc_camera
+import mc.mc_registry
+import mc.mc_world
+import mc.mc_chunk
+import mc.mc_entity
+import mc.mc_render_world
+import mc.mc_sem
+import mc.mc_version
+import mc.v763.mc_proto_v763
+import mc.v763.mc_reg_v763
+
+struct T {
+    fails: i32,
+    checks: i32,
+}
+
+fn check(t: *mut T, ok: bool, what: str) {
+    (*t).checks = (*t).checks + 1
+    if ok {
+        io.fmt_print(f"ok   {what}\n")
+    } else {
+        io.fmt_print(f"FAIL {what}\n")
+        (*t).fails = (*t).fails + 1
+    }
+}
+
+fn absf(v: f32) -> f32 {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+fn near(a: f32, b: f32) -> bool {
+    return absf(a - b) < 0.0002
+}
+
+fn dc(e: *mut engine.Engine, frames: usize, v: f32) -> i32 {
+    let p: u64 = rt.heap_alloc(frames * 4)
+    var i: usize = 0
+    while i < frames {
+        *((p + (i * 4) as u64) as *mut f32) = v
+        i = i + 1
+    }
+    return engine.engine_add_sample(e, p, frames as u64, 1 as u32)
+}
+
+// 440 Hz sine from audio.synth (S16, mono) as an f32 sample
+fn tone(e: *mut engine.Engine, frames: usize) -> i32 {
+    let s16: u64 = rt.heap_alloc(frames * 2)
+    synth.sine_fill(s16, frames, 1 as u32, 440, 48000 as u32, 20000 as u32, 0 as u32)
+    let p: u64 = rt.heap_alloc(frames * 4)
+    var i: usize = 0
+    while i < frames {
+        var v: i32 = rt.ld16(s16, i) as i32
+        if v >= 32768 { v = v - 65536 }
+        *((p + (i * 4) as u64) as *mut f32) = (v as f32) / 32768.0
+        i = i + 1
+    }
+    rt.heap_free(s16, frames * 2)
+    return engine.engine_add_sample(e, p, frames as u64, 1 as u32)
+}
+
+// renders `frames` frames and returns the last frame (L, R)
+fn render_last(e: *mut engine.Engine, out: u64, frames: usize, l: *mut f32, r: *mut f32) {
+    engine.engine_render(e, out, frames)
+    *l = *((out + ((frames - 1) * 8) as u64) as *mut f32)
+    *r = *((out + ((frames - 1) * 8 + 4) as u64) as *mut f32)
+}
+
+fn peak(out: u64, frames: usize) -> f32 {
+    var pk: f32 = 0.0
+    var i: usize = 0
+    while i < frames * 2 {
+        let v: f32 = absf(*((out + (i * 4) as u64) as *mut f32))
+        if v > pk { pk = v }
+        i = i + 1
+    }
+    return pk
+}
+
+fn cam_at(c: *mut mc_camera.Camera, x: f64, y: f64, z: f64, yaw: f64) {
+    mc_camera.camera_set_pos(c, x, y, z)
+    mc_camera.camera_set_angles(c, yaw, 0.0)
+    mc_camera.camera_update(c)
+}
+
+// settle: stop everything, render a few blocks so the buses reach their target
+fn settle(m: *mut mc_audio.McAudio, e: *mut engine.Engine, out: u64) {
+    mc_audio.mca_stop_all(m, 0.0)
+    engine.engine_render(e, out, 1024)
+    engine.engine_update(e)
+}
+
+fn mat(name: str) -> i32 {
+    return mc_audio.mca_material_of_name(name.p as u64, name.length())
+}
+
+fn feed(s: *mut mc_entity.Store, ver: *mut mc_version.Version, sem: usize, b: *mut bytes.Bytes) -> bool {
+    bytes.bytes_set_pos(b, 0)
+    let id: i32 = (*ver).sem[sem]
+    let r: bool = mc_entity.entity_on_packet(s, ver, id, b)
+    bytes.bytes_clear(b)
+    return r
+}
+
+fn put_name(b: *mut bytes.Bytes, s: str) {
+    bytes.put_string(b, s.p as u64, s.length())
+}
+
+struct Gen { x: u64 }
+
+fn next(g: *mut Gen) -> u64 {
+    (*g).x = (*g).x *% 6364136223846793005 as u64 +% 1442695040888963407 as u64
+    var z: u64 = (*g).x
+    z = (z ^ (z >> 29)) *% 0xBF58476D1CE4E5B9 as u64
+    return z ^ (z >> 32)
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var t: T = T { fails: 0, checks: 0 }
+    var e: engine.Engine = engine.engine_new(48000 as u32, 64 as u32)
+    var b: bank.Bank = bank.bank_new()
+    var m: mc_audio.McAudio = mc_audio.mca_new(&e)
+    let out: u64 = rt.heap_alloc(4096 * 8)
+
+    // ---------------------------------------------------------------- A  tables
+    check(&t, mat("stone") == mc_audio.MAT_STONE && mat("minecraft:cobblestone") == mc_audio.MAT_STONE, "A stone, cobblestone")
+    check(&t, mat("oak_planks") == mc_audio.MAT_WOOD && mat("spruce_stairs") == mc_audio.MAT_WOOD && mat("crafting_table") == mc_audio.MAT_WOOD, "A wood")
+    check(&t, mat("dirt") == mc_audio.MAT_GRAVEL && mat("gravel") == mc_audio.MAT_GRAVEL && mat("clay") == mc_audio.MAT_GRAVEL, "A gravel (dirt too)")
+    check(&t, mat("grass_block") == mc_audio.MAT_GRASS && mat("oak_leaves") == mc_audio.MAT_GRASS && mat("tall_grass") == mc_audio.MAT_GRASS, "A grass")
+    check(&t, mat("sand") == mc_audio.MAT_SAND && mat("sandstone") == mc_audio.MAT_STONE && mat("red_sand") == mc_audio.MAT_SAND, "A sand vs sandstone")
+    check(&t, mat("snow_block") == mc_audio.MAT_SNOW && mat("glass_pane") == mc_audio.MAT_GLASS && mat("blue_ice") == mc_audio.MAT_GLASS, "A snow, glass, ice")
+    check(&t, mat("red_wool") == mc_audio.MAT_WOOL && mat("white_carpet") == mc_audio.MAT_WOOL && mat("bedrock") == mc_audio.MAT_STONE, "A wool, carpet, bedrock is stone")
+    check(&t, mat("iron_block") == mc_audio.MAT_METAL && mat("iron_ore") == mc_audio.MAT_STONE && mat("deepslate_iron_ore") == mc_audio.MAT_DEEPSLATE, "A metal, ore is stone, deepslate ore")
+    check(&t, mat("netherrack") == mc_audio.MAT_NETHERRACK && mat("slime_block") == mc_audio.MAT_SLIME && mat("bone_block") == mc_audio.MAT_BONE, "A netherrack, slime, bone")
+    check(&t, mat("air") == mc_audio.MAT_NONE && mat("water") == mc_audio.MAT_NONE && mat("cave_air") == mc_audio.MAT_NONE, "A air, water: no sound")
+    check(&t, mc_audio.mca_category_of_name("blocks".p as u64, 6) == mc_audio.CAT_BLOCKS && mc_audio.mca_category_of_name("player".p as u64, 6) == mc_audio.CAT_PLAYERS
+        && mc_audio.mca_category_of_name("nope".p as u64, 4) == 0 - 1, "A category names")
+    check(&t, mc_audio.mca_category_of_event("minecraft:block.stone.step".p as u64, 26) == mc_audio.CAT_BLOCKS
+        && mc_audio.mca_category_of_event("entity.zombie.ambient".p as u64, 21) == mc_audio.CAT_HOSTILE
+        && mc_audio.mca_category_of_event("entity.cow.ambient".p as u64, 18) == mc_audio.CAT_NEUTRAL
+        && mc_audio.mca_category_of_event("music_disc.cat".p as u64, 14) == mc_audio.CAT_RECORD
+        && mc_audio.mca_category_of_event("ui.button.click".p as u64, 15) == mc_audio.CAT_UI, "A category of an event name")
+    let nm: str = mc_audio.mca_block_sound_name(&m, mc_audio.MAT_WOOD, mc_audio.ACT_BREAK)
+    check(&t, nm.length() == 16 && rt.mem_eq(nm.p as u64, "block.wood.break".p as u64, 16), "A event name block.wood.break")
+    check(&t, engine.engine_bus_id(&e, "mc.blocks") >= 0 && engine.engine_bus_id(&e, "mc.record") >= 0 && engine.engine_bus_id(&e, "mc.ui") >= 0
+        && engine.engine_bus_id(&e, "sfx") >= 0, "A buses exist")
+
+    // ---------------------------------------------------------------- bank with synthetic sounds
+    let s_dc: i32 = dc(&e, 48000, 0.5)
+    let s_tone: i32 = tone(&e, 48000)
+    bank.bank_provide(&b, "dc.wav", s_dc)
+    bank.bank_provide(&b, "tone.wav", s_tone)
+    let text: str = "{ \"events\": [ { \"name\": \"test.dc\", \"sample\": \"dc.wav\" }, { \"name\": \"block.stone.step\", \"sample\": \"dc.wav\" }, { \"name\": \"block.stone.break\", \"sample\": \"dc.wav\" }, { \"name\": \"block.wood.step\", \"sample\": \"dc.wav\" }, { \"name\": \"entity.zombie.ambient\", \"sample\": \"tone.wav\", \"loop\": true }, { \"name\": \"ui.click\", \"sample\": \"dc.wav\" } ] }"
+    let lr: i32 = mc_audio.mca_bank_load_text(&m, &b, text.p as u64, text.length(), "")
+    check(&t, lr == bank.BANK_OK, "bank loads")
+
+    // ---------------------------------------------------------------- B  listener, pan, distance
+    var cam: mc_camera.Camera = mc_camera.camera_new(160, 90)
+    cam_at(&cam, 0.0, 0.0, 0.0, 0.0)
+    mc_audio.mca_update(&m, &cam, 0.05)
+    var l: f32 = 0.0
+    var r: f32 = 0.0
+    // yaw 0 looks +z, the right hand is -x: a source at x = -5 is on the right
+    let h1: u32 = mc_audio.mca_play_at(&m, "test.dc", mc_audio.CAT_BLOCKS, -5.0, 0.0, 0.0, 1.0, 1.0)
+    check(&t, h1 != 0 as u32, "B play_at returns a handle")
+    render_last(&e, out, 1024, &l, &r)
+    let g5: f32 = mc_audio.mca_mc_gain(1.0, 5.0, 16.0)
+    var pl: f32 = 0.0
+    var pr: f32 = 0.0
+    mc_audio.mca_pan_lr(mc_audio.mca_pan(-5.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0), &pl, &pr)
+    check(&t, r > l && l > 0.0 - 0.0001, "B source on the right: right channel louder")
+    check(&t, near(l, 0.5 * g5 * pl) && near(r, 0.5 * g5 * pr), "B engine output = 0.5 * mc_gain * pan law")
+    settle(&m, &e, out)
+    let h2: u32 = mc_audio.mca_play_at(&m, "minecraft:test.dc", mc_audio.CAT_BLOCKS, 3.0, 0.0, 0.0, 1.0, 1.0)
+    render_last(&e, out, 1024, &l, &r)
+    check(&t, h2 != 0 as u32 && l > r, "B \"minecraft:\" prefix works, x = +3 is on the left")
+    settle(&m, &e, out)
+    let h3: u32 = mc_audio.mca_play_at(&m, "test.dc", mc_audio.CAT_BLOCKS, 0.0, 0.0, 6.0, 1.0, 1.0)
+    render_last(&e, out, 1024, &l, &r)
+    check(&t, h3 != 0 as u32 && near(l, r) && near(l, 0.5 * mc_audio.mca_mc_gain(1.0, 6.0, 16.0) * 0.70710678), "B straight ahead: equal channels, gain at 6 blocks")
+    settle(&m, &e, out)
+    let culled0: u64 = m.n_culled
+    let h4: u32 = mc_audio.mca_play_at(&m, "test.dc", mc_audio.CAT_BLOCKS, 0.0, 0.0, 20.0, 1.0, 1.0)
+    check(&t, h4 == 0 as u32 && m.n_culled == culled0 + 1 as u64, "B beyond 16 blocks: not started (culled)")
+    check(&t, mc_audio.mca_set_range(&m, "test.dc", 64.0), "B set_range")
+    let h5: u32 = mc_audio.mca_play_at(&m, "test.dc", mc_audio.CAT_BLOCKS, 0.0, 0.0, 20.0, 1.0, 1.0)
+    render_last(&e, out, 1024, &l, &r)
+    check(&t, h5 != 0 as u32 && near(l, 0.5 * mc_audio.mca_mc_gain(1.0, 20.0, 64.0) * 0.70710678), "B range 64: audible at 20 blocks")
+    settle(&m, &e, out)
+
+    // ---------------------------------------------------------------- C  volume, mute, silence, ui
+    mc_audio.mca_set_category_volume(&m, mc_audio.CAT_BLOCKS, 0.5)
+    check(&t, engine.engine_get_bus_volume(&e, "mc.blocks") == 0.5 && mc_audio.mca_get_category_volume(&m, mc_audio.CAT_BLOCKS) == 0.5, "C category volume is a bus volume")
+    mc_audio.mca_play_at(&m, "test.dc", mc_audio.CAT_BLOCKS, 0.0, 0.0, 6.0, 1.0, 1.0)
+    render_last(&e, out, 2048, &l, &r)
+    check(&t, near(l, 0.25 * mc_audio.mca_mc_gain(1.0, 6.0, 64.0) * 0.70710678), "C blocks at 0.5: half the level")
+    // the same voice follows a change while it plays
+    mc_audio.mca_set_category_volume(&m, mc_audio.CAT_BLOCKS, 0.0)
+    render_last(&e, out, 2048, &l, &r)
+    check(&t, absf(l) < 0.0002 && absf(r) < 0.0002, "C blocks at 0: the running voice is silent")
+    mc_audio.mca_set_category_volume(&m, mc_audio.CAT_BLOCKS, 1.0)
+    settle(&m, &e, out)
+    mc_audio.mca_set_muted(&m, true)
+    let muted0: u64 = m.n_muted
+    let hm: u32 = mc_audio.mca_play_at(&m, "test.dc", mc_audio.CAT_BLOCKS, 0.0, 0.0, 4.0, 1.0, 1.0)
+    check(&t, hm == 0 as u32 && m.n_muted == muted0 + 1 as u64 && mc_audio.mca_is_muted(&m), "C muted: nothing starts")
+    mc_audio.mca_set_muted(&m, false)
+    let hu: u32 = mc_audio.mca_play_at(&m, "test.dc", mc_audio.CAT_BLOCKS, 0.0, 0.0, 4.0, 1.0, 1.0)
+    check(&t, hu != 0 as u32 && !mc_audio.mca_is_muted(&m), "C unmuted: starts again")
+    settle(&m, &e, out)
+    let miss0: u64 = m.n_missing
+    let hx: u32 = mc_audio.mca_play_at(&m, "block.nothing.step", mc_audio.CAT_BLOCKS, 0.0, 0.0, 4.0, 1.0, 1.0)
+    check(&t, hx == 0 as u32 && m.n_missing == miss0 + 1 as u64, "C unknown event = silence, counted")
+    let hui: u32 = mc_audio.mca_play_ui(&m, "ui.click", 1.0, 1.0)
+    render_last(&e, out, 1024, &l, &r)
+    check(&t, hui != 0 as u32 && near(l, r) && near(l, 0.5 * 0.70710678), "C ui click: 2D, centre, ui bus")
+    settle(&m, &e, out)
+
+    // ---------------------------------------------------------------- D  blocks from a chunk, walker
+    var reg: mc_registry.Registry = mc_reg_v763.registry_make()
+    let b_stone: i32 = mc_registry.reg_block_by_name(&reg, "stone".p as u64, 5)
+    let b_planks: i32 = mc_registry.reg_block_by_name(&reg, "oak_planks".p as u64, 10)
+    let b_air: i32 = mc_registry.reg_block_by_name(&reg, "air".p as u64, 3)
+    let st_stone: i32 = mc_registry.reg_block_default_state(&reg, b_stone)
+    let st_planks: i32 = mc_registry.reg_block_default_state(&reg, b_planks)
+    let st_air: i32 = mc_registry.reg_block_default_state(&reg, b_air)
+    check(&t, b_stone >= 0 && b_planks >= 0 && b_air >= 0, "D registry 1.20.1 has stone, oak_planks, air")
+    var w: mc_world.World = mc_world.world_new()
+    let ids: u64 = rt.heap_alloc(2 * 4096 * 2)
+    var i: usize = 0
+    while i < 8192 {
+        rt.st16(ids, i, st_air as u16)
+        i = i + 1
+    }
+    i = 0
+    while i < 4 * 256 {
+        rt.st16(ids, i, st_stone as u16)   // floor y = 0..3 stone
+        i = i + 1
+    }
+    i = 0
+    while i < 256 {
+        rt.st16(ids, 3 * 256 + i, st_planks as u16)   // top layer y = 3: planks for x >= 8
+        i = i + 1
+    }
+    var z: usize = 0
+    while z < 16 {
+        var x: usize = 0
+        while x < 8 {
+            rt.st16(ids, 3 * 256 + z * 16 + x, st_stone as u16)
+            x = x + 1
+        }
+        z = z + 1
+    }
+    check(&t, mc_world.world_put(&w, mc_render_world.wr_make_chunk(0, 0, 2, ids)), "D chunk stored")
+    check(&t, mc_audio.mca_state_at(&w, 0, 2, 3, 2) == st_stone && mc_audio.mca_state_at(&w, 0, 12, 3, 2) == st_planks
+        && mc_audio.mca_state_at(&w, 0, 2, 5, 2) == st_air && mc_audio.mca_state_at(&w, 0, 99, 3, 2) == 0 - 1
+        && mc_audio.mca_state_at(&w, 0, 2, 40, 2) == 0 - 1, "D state_at (stone, planks, air, unloaded chunk, above the column)")
+    cam_at(&cam, 8.0, 5.0, 8.0, 0.0)
+    mc_audio.mca_update(&m, &cam, 0.05)
+    let hb: u32 = mc_audio.mca_block_sound(&m, &reg, st_stone, mc_audio.ACT_BREAK, 8, 3, 12)
+    render_last(&e, out, 1024, &l, &r)
+    check(&t, hb != 0 as u32 && peak(out, 1024) > 0.05, "D break sound of stone plays")
+    settle(&m, &e, out)
+    check(&t, mc_audio.mca_block_sound(&m, &reg, st_air, mc_audio.ACT_BREAK, 8, 3, 12) == 0 as u32, "D air has no sound")
+    let miss1: u64 = m.n_missing
+    check(&t, mc_audio.mca_block_sound(&m, &reg, st_planks, mc_audio.ACT_HIT, 8, 3, 12) == 0 as u32 && m.n_missing == miss1 + 1 as u64, "D planks hit: not in the bank = silence")
+    // walker over stone (x 0..7) then planks (x 8..)
+    var wk: mc_audio.Walker = mc_audio.mca_walker_new()
+    cam_at(&cam, 0.0, 4.0, 8.0, 0.0)
+    mc_audio.mca_update(&m, &cam, 0.05)
+    var steps: i32 = 0
+    var px: f64 = 0.0
+    while px < 10.0 {
+        steps = steps + mc_audio.mca_walk(&m, &wk, &reg, &w, 0, px, 4.0, 8.0, true, false)
+        px = px + 0.25
+    }
+    check(&t, steps >= 5 && steps <= 6, "D walker: one step per 1.67 blocks (10 blocks = 5..6 steps)")
+    var wk2: mc_audio.Walker = mc_audio.mca_walker_new()
+    var sneak: i32 = 0
+    px = 0.0
+    while px < 10.0 {
+        sneak = sneak + mc_audio.mca_walk(&m, &wk2, &reg, &w, 0, px, 4.0, 8.0, true, true)
+        px = px + 0.25
+    }
+    check(&t, sneak == 0, "D sneaking: no steps")
+    var wk3: mc_audio.Walker = mc_audio.mca_walker_new()
+    mc_audio.mca_walk(&m, &wk3, &reg, &w, 0, 2.0, 4.0, 8.0, true, false)
+    mc_audio.mca_walk(&m, &wk3, &reg, &w, 0, 2.0, 7.0, 8.0, false, false)
+    let miss2: u64 = m.n_missing
+    mc_audio.mca_walk(&m, &wk3, &reg, &w, 0, 2.0, 4.0, 8.0, true, false)
+    check(&t, m.n_missing == miss2 + 1 as u64, "D landing after a 3 block fall asks for block.stone.fall")
+    settle(&m, &e, out)
+
+    // ---------------------------------------------------------------- E  entity bound source
+    var ver: mc_version.Version = mc_proto_v763.version_make()
+    var es: mc_entity.Store = mc_entity.store_new()
+    var pb: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&pb, 7)
+    bytes.put_uuid(&pb, 1 as u64, 1 as u64)
+    bytes.put_varint(&pb, 5)
+    bytes.put_f64(&pb, 0.0)
+    bytes.put_f64(&pb, 0.0)
+    bytes.put_f64(&pb, 5.0)
+    bytes.put_i8(&pb, 0 as i8)
+    bytes.put_u8(&pb, 0 as u8)
+    bytes.put_i8(&pb, 0 as i8)
+    bytes.put_varint(&pb, 0)
+    bytes.put_i16(&pb, 0 as i16)
+    bytes.put_i16(&pb, 0 as i16)
+    bytes.put_i16(&pb, 0 as i16)
+    check(&t, feed(&es, &ver, mc_sem.SEM_PLAY_S2C_SPAWN_ENTITY, &pb), "E entity 7 spawned at (0, 0, 5)")
+    cam_at(&cam, 0.0, 0.0, 0.0, 0.0)
+    mc_audio.mca_update(&m, &cam, 0.05)
+    check(&t, mc_audio.mca_play_entity(&m, &es, 99, "entity.zombie.ambient", mc_audio.CAT_HOSTILE, 1.0, 1.0) == 0 as u32, "E unknown entity: nothing")
+    let he: u32 = mc_audio.mca_play_entity(&m, &es, 7, "entity.zombie.ambient", mc_audio.CAT_HOSTILE, 1.0, 1.0)
+    render_last(&e, out, 2048, &l, &r)
+    check(&t, he != 0 as u32 && near(l, r) && peak(out, 2048) > 0.01, "E zombie tone (audio.synth sine) straight ahead")
+    // move 6 blocks to the right-hand side (-x): relative move of -6.0 = -24576 in 1/4096
+    bytes.put_varint(&pb, 7)
+    bytes.put_i16(&pb, 0 - 24576 as i16)
+    bytes.put_i16(&pb, 0 as i16)
+    bytes.put_i16(&pb, 0 as i16)
+    bytes.put_bool(&pb, true)
+    check(&t, feed(&es, &ver, mc_sem.SEM_PLAY_S2C_REL_ENTITY_MOVE, &pb), "E entity moved by -6 in x")
+    mc_audio.mca_update_entities(&m, &es)
+    // the loop is a sine: compare the energy of the two channels over a stretch
+    engine.engine_render(&e, out, 2048)
+    var el: f32 = 0.0
+    var er: f32 = 0.0
+    i = 0
+    while i < 2048 {
+        let a: f32 = *((out + (i * 8) as u64) as *mut f32)
+        let c: f32 = *((out + (i * 8 + 4) as u64) as *mut f32)
+        el = el + a * a
+        er = er + c * c
+        i = i + 1
+    }
+    check(&t, er > el * 4.0, "E after the entity moved to the right the right channel dominates")
+    mc_audio.mca_stop_entity(&m, 7, 0.0)
+    settle(&m, &e, out)
+    check(&t, !engine.engine_is_playing(&e, he), "E stop_entity stops the voice")
+
+    // ---------------------------------------------------------------- F  packets
+    var pk: bytes.Bytes = bytes.bytes_new()
+    var sp: mc_audio.SoundPkt = mc_audio.SoundPkt { id: 0, name_p: 0, name_n: 0, has_range: false, range: 0.0, category: 0, entity: 0,
+        x: 0.0, y: 0.0, z: 0.0, volume: 0.0, pitch: 0.0, seed: 0 as i64 }
+    // inline name, no range, category blocks, position (-5, 0.5, 2.125), volume 1, pitch 0.8
+    bytes.put_varint(&pk, 0)
+    put_name(&pk, "minecraft:block.stone.break")
+    bytes.put_bool(&pk, false)
+    bytes.put_varint(&pk, 4)
+    bytes.put_i32(&pk, 0 - 40)
+    bytes.put_i32(&pk, 4)
+    bytes.put_i32(&pk, 17)
+    bytes.put_f32(&pk, 1.0)
+    bytes.put_f32(&pk, 0.8)
+    bytes.put_i64(&pk, 123456789 as i64)
+    check(&t, mc_audio.mca_decode_sound_effect(bytes.bytes_data(&pk), bytes.bytes_len(&pk), &sp), "F sound effect decodes")
+    check(&t, sp.id == 0 - 1 && sp.name_n == 27 && sp.category == 4 && sp.x == 0.0 - 5.0 && sp.y == 0.5 && sp.z == 2.125
+        && sp.volume == 1.0 && sp.pitch == 0.8 && sp.seed == 123456789 as i64 && !sp.has_range, "F sound effect fields")
+    cam_at(&cam, 0.0, 0.0, 0.0, 0.0)
+    mc_audio.mca_update(&m, &cam, 0.05)
+    check(&t, mc_audio.mca_apply_sound(&m, &sp, &es) != 0 as u32, "F inline named sound plays")
+    // truncated / extended / bad category
+    var cut: usize = 0
+    var all_cut_rejected: bool = true
+    while cut < bytes.bytes_len(&pk) {
+        if mc_audio.mca_decode_sound_effect(bytes.bytes_data(&pk), cut, &sp) { all_cut_rejected = false }
+        cut = cut + 1
+    }
+    check(&t, all_cut_rejected, "F every truncation is rejected")
+    bytes.put_u8(&pk, 0 as u8)
+    check(&t, !mc_audio.mca_decode_sound_effect(bytes.bytes_data(&pk), bytes.bytes_len(&pk), &sp), "F trailing octet is rejected")
+    bytes.bytes_clear(&pk)
+    // registry id 5 (wire 6), range given inline is covered by the next packet; category 12 is wrong
+    mc_audio.mca_sound_id_set(&m, 5, "block.wood.step")
+    check(&t, mc_audio.mca_sound_name(&m, 5).length() == 15 && mc_audio.mca_sound_name(&m, 6).length() == 0, "F sound id table")
+    bytes.put_varint(&pk, 6)
+    bytes.put_varint(&pk, 4)
+    bytes.put_i32(&pk, 16)
+    bytes.put_i32(&pk, 0)
+    bytes.put_i32(&pk, 16)
+    bytes.put_f32(&pk, 0.15)
+    bytes.put_f32(&pk, 1.0)
+    bytes.put_i64(&pk, 0 as i64)
+    check(&t, mc_audio.mca_decode_sound_effect(bytes.bytes_data(&pk), bytes.bytes_len(&pk), &sp) && sp.id == 5, "F registry id decodes (wire id - 1)")
+    check(&t, mc_audio.mca_apply_sound(&m, &sp, &es) != 0 as u32, "F registry id plays through the table")
+    sp.id = 77
+    let miss3: u64 = m.n_missing
+    check(&t, mc_audio.mca_apply_sound(&m, &sp, &es) == 0 as u32 && m.n_missing == miss3 + 1 as u64, "F unknown registry id = silence, counted")
+    bytes.bytes_clear(&pk)
+    bytes.put_varint(&pk, 6)
+    bytes.put_varint(&pk, 12)
+    bytes.put_i32(&pk, 0)
+    bytes.put_i32(&pk, 0)
+    bytes.put_i32(&pk, 0)
+    bytes.put_f32(&pk, 1.0)
+    bytes.put_f32(&pk, 1.0)
+    bytes.put_i64(&pk, 0 as i64)
+    check(&t, !mc_audio.mca_decode_sound_effect(bytes.bytes_data(&pk), bytes.bytes_len(&pk), &sp), "F category 12 is rejected")
+    bytes.bytes_clear(&pk)
+    // inline with range
+    bytes.put_varint(&pk, 0)
+    put_name(&pk, "block.stone.step")
+    bytes.put_bool(&pk, true)
+    bytes.put_f32(&pk, 40.0)
+    bytes.put_varint(&pk, 4)
+    bytes.put_i32(&pk, 0)
+    bytes.put_i32(&pk, 0)
+    bytes.put_i32(&pk, 0)
+    bytes.put_f32(&pk, 1.0)
+    bytes.put_f32(&pk, 1.0)
+    bytes.put_i64(&pk, 0 as i64)
+    check(&t, mc_audio.mca_decode_sound_effect(bytes.bytes_data(&pk), bytes.bytes_len(&pk), &sp) && sp.has_range && sp.range == 40.0, "F inline sound with fixed range")
+    bytes.bytes_clear(&pk)
+    // entity sound
+    bytes.put_varint(&pk, 0)
+    put_name(&pk, "entity.zombie.ambient")
+    bytes.put_bool(&pk, false)
+    bytes.put_varint(&pk, 5)
+    bytes.put_varint(&pk, 7)
+    bytes.put_f32(&pk, 1.0)
+    bytes.put_f32(&pk, 1.0)
+    bytes.put_i64(&pk, 5 as i64)
+    check(&t, mc_audio.mca_decode_entity_sound(bytes.bytes_data(&pk), bytes.bytes_len(&pk), &sp) && sp.entity == 7 && sp.category == 5, "F entity sound decodes")
+    mc_audio.mca_update(&m, &cam, 0.05)
+    check(&t, mc_audio.mca_apply_sound(&m, &sp, &es) != 0 as u32, "F entity sound plays at the entity")
+    bytes.bytes_clear(&pk)
+    // stop: category 5 (hostile) only; the earlier block sounds stay
+    mc_audio.mca_play_at(&m, "test.dc", mc_audio.CAT_BLOCKS, 0.0, 0.0, 4.0, 1.0, 1.0)
+    var sp2: mc_audio.StopPkt = mc_audio.StopPkt { flags: 0, category: 0, name_p: 0, name_n: 0 }
+    bytes.put_i8(&pk, 1 as i8)
+    bytes.put_varint(&pk, 5)
+    check(&t, mc_audio.mca_decode_stop_sound(bytes.bytes_data(&pk), bytes.bytes_len(&pk), &sp2) && sp2.category == 5, "F stop sound (category) decodes")
+    check(&t, mc_audio.mca_apply_stop(&m, &sp2) == 1, "F stop hostile: exactly the zombie voice")
+    bytes.bytes_clear(&pk)
+    bytes.put_i8(&pk, 3 as i8)
+    bytes.put_varint(&pk, 4)
+    put_name(&pk, "minecraft:test.dc")
+    check(&t, mc_audio.mca_decode_stop_sound(bytes.bytes_data(&pk), bytes.bytes_len(&pk), &sp2) && sp2.category == 4 && sp2.name_n == 17, "F stop sound (category + name) decodes")
+    check(&t, mc_audio.mca_apply_stop(&m, &sp2) >= 1, "F stop blocks + test.dc stops the voice")
+    bytes.bytes_clear(&pk)
+    bytes.put_i8(&pk, 0 as i8)
+    check(&t, mc_audio.mca_decode_stop_sound(bytes.bytes_data(&pk), bytes.bytes_len(&pk), &sp2) && sp2.category == 0 - 1, "F stop all decodes")
+    // fuzz: random octets never crash and valid-looking packets never read past the end
+    var g: Gen = Gen { x: 12345 as u64 }
+    var fz: i32 = 0
+    var k: i32 = 0
+    while k < 3000 {
+        let n: usize = (next(&g) % 60) as usize
+        bytes.bytes_clear(&pk)
+        var j: usize = 0
+        while j < n {
+            bytes.put_u8(&pk, (next(&g) & 255) as u8)
+            j = j + 1
+        }
+        if mc_audio.mca_decode_sound_effect(bytes.bytes_data(&pk), n, &sp) { fz = fz + 1 }
+        mc_audio.mca_decode_entity_sound(bytes.bytes_data(&pk), n, &sp)
+        mc_audio.mca_decode_stop_sound(bytes.bytes_data(&pk), n, &sp2)
+        k = k + 1
+    }
+    check(&t, true, "F 3000 random bodies through all three decoders without a crash")
+    settle(&m, &e, out)
+
+    // ---------------------------------------------------------------- G  origin rebase
+    cam_at(&cam, 0.0, 0.0, 0.0, 0.0)
+    mc_audio.mca_update(&m, &cam, 0.05)
+    let rb0: u64 = m.n_rebase
+    cam_at(&cam, 3000000.0, 70.0, 0.0 - 3000000.0, 0.0)
+    mc_audio.mca_update(&m, &cam, 0.05)
+    check(&t, m.n_rebase == rb0 + 1 as u64, "G far move: the origin followed")
+    mc_audio.mca_play_at(&m, "test.dc", mc_audio.CAT_BLOCKS, 3000000.0 - 5.0, 70.0, 0.0 - 3000000.0, 1.0, 1.0)
+    render_last(&e, out, 1024, &l, &r)
+    let g5b: f32 = mc_audio.mca_mc_gain(1.0, 5.0, 64.0) // test.dc has range 64 since B
+    check(&t, near(l, 0.5 * g5b * pl) && near(r, 0.5 * g5b * pr), "G 3 000 000 blocks away: same gain and pan as at the origin")
+    settle(&m, &e, out)
+    // a running source is re-sent when the origin moves
+    mc_audio.mca_play_at(&m, "entity.zombie.ambient", mc_audio.CAT_HOSTILE, 3000000.0 - 6.0, 70.0, 0.0 - 3000000.0, 1.0, 1.0)
+    cam_at(&cam, 3003000.0, 70.0, 0.0 - 3000000.0, 0.0)
+    mc_audio.mca_update(&m, &cam, 0.05)
+    check(&t, m.n_rebase == rb0 + 2 as u64, "G second rebase")
+    mc_audio.mca_update(&m, &cam, 0.05)
+    mc_audio.mca_stop_all(&m, 0.0)
+
+    io.fmt_print(f"{t.checks} checks, {t.fails} failed; played {m.n_played} culled {m.n_culled} missing {m.n_missing} muted {m.n_muted}\n")
+    mc_audio.mca_free(&m)
+    if t.fails > 0 { return 1 }
+    return 0
+}
