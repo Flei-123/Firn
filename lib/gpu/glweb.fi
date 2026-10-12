@@ -1,0 +1,588 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/glweb.fi -- gpu.glweb: the WebGL2 back end of the voxel client (docs/WEBGL2.md).
+//
+// The browser twin of lib/gpu/gl_mc.fi: the SAME mc_backend.Backend table (upload_atlas / mesh_upload / mesh_free /
+// begin / draw / end / present / read_pixels), the same shading arithmetic (integer shading of mc_raster, GLSL ES 3.00
+// variants lib/gpu/glweb_vs.glsl + glweb_fs.glsl), the same names with the prefix `glweb_` instead of `glbe_`.
+//
+//     import gpu.glweb                                  // only for --target=wasm32-browser
+//     var gw: glweb.GlWeb = glweb.glweb_open(640, 360)  // WebGL2 context on the page's canvas + FBO + program
+//     if gw.ok {
+//         var b: mc_backend.Backend = glweb.glweb_backend(&gw)   // same table as gl_mc.glbe_backend
+//         b.upload_atlas(b.obj, (&atlas) as u64)
+//         b.begin(b.obj, (&cam) as u64, 0xFFE6BE96 as u32)
+//         let h: usize = b.mesh_upload(b.obj, key, verts, nverts, idx, nidx)
+//         b.draw(b.obj, h, ox, oy, oz)
+//         b.end(b.obj)
+//         glweb.glweb_show(&gw)                         // FBO -> the canvas (blitFramebuffer, no readback)
+//         let px: u64 = b.present(b.obj)                // OR: w*h*4 bytes RGBA, row 0 = top (readPixels)
+//     }
+//
+// HOST CALLS. Every `firn_glw_*` below is answered by demos/mcweb/glweb.js with the WebGL2 call of the same name,
+// 1:1 and without logic (objects are small integers on this side, the host keeps the table of WebGL objects; 0 = none /
+// the default framebuffer). They are imports of module `env`; a host that does not provide them cannot instantiate the
+// program -- this file is for the browser build only, a native program imports gpu.gl_mc instead.
+//
+// WHAT THIS FILE DOES NOT HAVE (docs/WEBGL2.md section 2): buffer textures, base vertex / multi draw / indirect (no pool
+// modes, one VAO + VBO + IBO per section = MODE_LEGACY), mapped buffers, timer queries (an extension, not in the
+// prototype), the filtered texture path, MSAA, context loss handling. Camera: u_rv = projection * view rotation, the
+// section origin minus the camera position is computed in f64 on the CPU, exactly as in gl_mc.fi.
+
+import std.rt
+import mc.mc_backend
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_math
+
+export {
+    GlWeb, glweb_open, glweb_close, glweb_backend, glweb_show, glweb_set_fog, glweb_set_cull, glweb_resize,
+    glweb_draws, glweb_tris, glweb_finish, glweb_calls, glweb_upload_bytes, glweb_error, glweb_width, glweb_height,
+}
+
+// ---- the host (demos/mcweb/glweb.js) --------------------------------------------------------------------------
+extern fn firn_glw_init(w: i32, h: i32, flags: i32) -> i32;
+extern fn firn_glw_size(w: i32, h: i32);
+extern fn firn_glw_program(vp: u32, vn: u32, fp: u32, fnn: u32, lp: u32, lcap: u32) -> i32;
+extern fn firn_glw_delete_program(p: i32);
+extern fn firn_glw_use_program(p: i32);
+extern fn firn_glw_uniform_location(p: i32, np: u32, nn: u32) -> i32;
+extern fn firn_glw_uniform1i(l: i32, v: i32);
+extern fn firn_glw_uniform2f(l: i32, a: f64, b: f64);
+extern fn firn_glw_uniform3f(l: i32, a: f64, b: f64, c: f64);
+extern fn firn_glw_uniform4f(l: i32, a: f64, b: f64, c: f64, d: f64);
+extern fn firn_glw_uniform_matrix4fv(l: i32, p: u32);
+extern fn firn_glw_create_buffer() -> i32;
+extern fn firn_glw_bind_buffer(t: i32, b: i32);
+extern fn firn_glw_buffer_data(t: i32, p: u32, n: u32, usage: i32);
+extern fn firn_glw_delete_buffer(b: i32);
+extern fn firn_glw_create_vao() -> i32;
+extern fn firn_glw_bind_vao(v: i32);
+extern fn firn_glw_delete_vao(v: i32);
+extern fn firn_glw_enable_attrib(i: i32);
+extern fn firn_glw_attrib_ipointer(i: i32, size: i32, ty: i32, stride: i32, off: i32);
+extern fn firn_glw_create_texture() -> i32;
+extern fn firn_glw_bind_texture(t: i32, tex: i32);
+extern fn firn_glw_active_texture(unit: i32);
+extern fn firn_glw_tex_image_2d(t: i32, l: i32, ifmt: i32, w: i32, h: i32, fmt: i32, ty: i32, p: u32);
+extern fn firn_glw_tex_image_3d(t: i32, l: i32, ifmt: i32, w: i32, h: i32, d: i32, fmt: i32, ty: i32, p: u32);
+extern fn firn_glw_tex_parameteri(t: i32, pn: i32, v: i32);
+extern fn firn_glw_pixel_storei(pn: i32, v: i32);
+extern fn firn_glw_delete_texture(tex: i32);
+extern fn firn_glw_create_framebuffer() -> i32;
+extern fn firn_glw_bind_framebuffer(t: i32, f: i32);
+extern fn firn_glw_framebuffer_texture_2d(t: i32, at: i32, tt: i32, tex: i32, l: i32);
+extern fn firn_glw_framebuffer_renderbuffer(t: i32, at: i32, rbt: i32, rb: i32);
+extern fn firn_glw_check_framebuffer_status(t: i32) -> i32;
+extern fn firn_glw_delete_framebuffer(f: i32);
+extern fn firn_glw_create_renderbuffer() -> i32;
+extern fn firn_glw_bind_renderbuffer(t: i32, rb: i32);
+extern fn firn_glw_renderbuffer_storage(t: i32, fmt: i32, w: i32, h: i32);
+extern fn firn_glw_delete_renderbuffer(rb: i32);
+extern fn firn_glw_blit_framebuffer(sx0: i32, sy0: i32, sx1: i32, sy1: i32, dx0: i32, dy0: i32, dx1: i32, dy1: i32, mask: i32, filter: i32);
+extern fn firn_glw_viewport(x: i32, y: i32, w: i32, h: i32);
+extern fn firn_glw_enable(c: i32);
+extern fn firn_glw_disable(c: i32);
+extern fn firn_glw_depth_func(f: i32);
+extern fn firn_glw_depth_mask(b: i32);
+extern fn firn_glw_color_mask(r: i32, g: i32, b: i32, a: i32);
+extern fn firn_glw_cull_face(m: i32);
+extern fn firn_glw_front_face(m: i32);
+extern fn firn_glw_clear_color(r: f64, g: f64, b: f64, a: f64);
+extern fn firn_glw_clear(mask: i32);
+extern fn firn_glw_draw_elements(mode: i32, count: i32, ty: i32, off: i32);
+extern fn firn_glw_read_pixels(x: i32, y: i32, w: i32, h: i32, p: u32);
+extern fn firn_glw_flush();
+extern fn firn_glw_finish();
+extern fn firn_glw_get_error() -> i32;
+extern fn firn_glw_present(w: i32, h: i32);
+
+// ---- GL constants (the numbers of WebGL2 = GL ES 3.0 = GL 3.3 for these) --------------------------------------
+const GL_DEPTH_BUFFER_BIT: i32 = 0x100
+const GL_COLOR_BUFFER_BIT: i32 = 0x4000
+const GL_TRIANGLES: i32 = 4
+const GL_LESS: i32 = 0x201
+const GL_DEPTH_TEST: i32 = 0xB71
+const GL_CULL_FACE: i32 = 0xB44
+const GL_BLEND: i32 = 0xBE2
+const GL_SCISSOR_TEST: i32 = 0xC11
+const GL_BACK: i32 = 0x405
+const GL_CCW: i32 = 0x901
+const GL_ARRAY_BUFFER: i32 = 0x8892
+const GL_ELEMENT_ARRAY_BUFFER: i32 = 0x8893
+const GL_STATIC_DRAW: i32 = 0x88E4
+const GL_UNSIGNED_BYTE: i32 = 0x1401
+const GL_UNSIGNED_INT: i32 = 0x1405
+const GL_RGBA: i32 = 0x1908
+const GL_RGBA8: i32 = 0x8058
+const GL_TEXTURE_2D: i32 = 0xDE1
+const GL_TEXTURE_2D_ARRAY: i32 = 0x8C1A
+const GL_NEAREST: i32 = 0x2600
+const GL_TEXTURE_MAG_FILTER: i32 = 0x2800
+const GL_TEXTURE_MIN_FILTER: i32 = 0x2801
+const GL_TEXTURE_WRAP_S: i32 = 0x2802
+const GL_TEXTURE_WRAP_T: i32 = 0x2803
+const GL_REPEAT: i32 = 0x2901
+const GL_CLAMP_TO_EDGE: i32 = 0x812F
+const GL_FRAMEBUFFER: i32 = 0x8D40
+const GL_READ_FRAMEBUFFER: i32 = 0x8CA8
+const GL_DRAW_FRAMEBUFFER: i32 = 0x8CA9
+const GL_RENDERBUFFER: i32 = 0x8D41
+const GL_COLOR_ATTACHMENT0: i32 = 0x8CE0
+const GL_DEPTH_ATTACHMENT: i32 = 0x8D00
+const GL_DEPTH_COMPONENT24: i32 = 0x81A6
+const GL_FRAMEBUFFER_COMPLETE: i32 = 0x8CD5
+const GL_UNPACK_ALIGNMENT: i32 = 0xCF5
+const GL_TEXTURE0: i32 = 0x84C0
+
+// mesh slot (words): vao, vbo, ibo, nidx, used
+const SLOT_WORDS: usize = 5
+const S_VAO: usize = 0
+const S_VBO: usize = 1
+const S_IBO: usize = 2
+const S_NIDX: usize = 3
+const S_USED: usize = 4
+
+struct GlWeb {
+    ok: bool,
+    step: i32, // 0 = ok, 1 no WebGL2 context, 2 program, 3 framebuffer, 4 memory
+    w: i32,
+    h: i32,
+    prog: i32,
+    l_rv: i32,
+    l_origin: i32,
+    l_atlas: i32,
+    l_tiles: i32,
+    l_fog: i32,
+    l_fogc: i32,
+    fbo: i32,
+    color: i32, // RGBA8 texture
+    depth: i32, // DEPTH24 renderbuffer
+    atlas_tex: i32, // texture array, layer = tile - 1
+    atile: i32,
+    acols: i32,
+    slots: u64,
+    slot_cap: usize,
+    cx: f64,
+    cy: f64,
+    cz: f64,
+    rv: [f32; 16],
+    fog_on: bool,
+    fog_start: f64,
+    fog_end: f64,
+    fog_r: f64,
+    fog_g: f64,
+    fog_b: f64,
+    cull: bool,
+    pix: u64, // w*h*4 bytes, row 0 = top (present)
+    tmp: u64,
+    fresh: bool, // pix is the finished frame
+    cur_vao: i32,
+    draws: u64,
+    tris: u64,
+    calls: u64,
+    up_bytes: u64,
+    log: [u8; 512], // shader / link log of a failed open
+}
+
+fn empty(w: i32, h: i32) -> GlWeb {
+    return GlWeb { ok: false, step: 0, w: w, h: h, prog: 0, l_rv: 0 - 1, l_origin: 0 - 1, l_atlas: 0 - 1, l_tiles: 0 - 1,
+        l_fog: 0 - 1, l_fogc: 0 - 1, fbo: 0, color: 0, depth: 0, atlas_tex: 0, atile: 16, acols: 16, slots: 0, slot_cap: 0,
+        cx: 0.0, cy: 0.0, cz: 0.0, rv: [0.0 as f32; 16], fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0.0,
+        fog_g: 0.0, fog_b: 0.0, cull: true, pix: 0, tmp: 0, fresh: false, cur_vao: 0, draws: 0, tris: 0, calls: 0,
+        up_bytes: 0, log: [0; 512] }
+}
+
+const VS_SRC: str = __include_str("glweb_vs.glsl")
+const FS_SRC: str = __include_str("glweb_fs.glsl")
+
+fn uloc(gw: *mut GlWeb, name: str) -> i32 {
+    return firn_glw_uniform_location((*gw).prog, name.p as u32, name.n as u32)
+}
+
+// (Re)creates colour texture + depth renderbuffer + FBO of w x h. False = incomplete.
+fn make_fbo(gw: *mut GlWeb, w: i32, h: i32) -> bool {
+    (*gw).color = firn_glw_create_texture()
+    firn_glw_bind_texture(GL_TEXTURE_2D, (*gw).color)
+    firn_glw_tex_image_2d(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE, 0 as u32)
+    firn_glw_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+    firn_glw_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+    firn_glw_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    firn_glw_tex_parameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    (*gw).depth = firn_glw_create_renderbuffer()
+    firn_glw_bind_renderbuffer(GL_RENDERBUFFER, (*gw).depth)
+    firn_glw_renderbuffer_storage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h)
+    (*gw).fbo = firn_glw_create_framebuffer()
+    firn_glw_bind_framebuffer(GL_FRAMEBUFFER, (*gw).fbo)
+    firn_glw_framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, (*gw).color, 0)
+    firn_glw_framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, (*gw).depth)
+    return firn_glw_check_framebuffer_status(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE
+}
+
+fn free_fbo(gw: *mut GlWeb) {
+    if (*gw).fbo != 0 { firn_glw_delete_framebuffer((*gw).fbo) }
+    if (*gw).color != 0 { firn_glw_delete_texture((*gw).color) }
+    if (*gw).depth != 0 { firn_glw_delete_renderbuffer((*gw).depth) }
+    (*gw).fbo = 0
+    (*gw).color = 0
+    (*gw).depth = 0
+}
+
+// Asks the host for a WebGL2 context on the page's canvas (w x h device pixels), builds program + FBO.
+// `ok` false = see `step` (1: the browser has no WebGL2 / blocks it, 2: shader compile or link failed, 3: FBO incomplete).
+#[allow_escape]
+fn glweb_open(w: i32, h: i32) -> GlWeb {
+    var gw: GlWeb = empty(w, h)
+    if firn_glw_init(w, h, 0) == 0 {
+        gw.step = 1
+        return gw
+    }
+    gw.prog = firn_glw_program(VS_SRC.p as u32, VS_SRC.n as u32, FS_SRC.p as u32, FS_SRC.n as u32,
+        (&gw.log[0]) as u32, 512 as u32)
+    if gw.prog == 0 {
+        gw.step = 2
+        return gw
+    }
+    gw.l_rv = uloc(&gw, "u_rv")
+    gw.l_origin = uloc(&gw, "u_origin")
+    gw.l_atlas = uloc(&gw, "u_atlas")
+    gw.l_tiles = uloc(&gw, "u_tiles")
+    gw.l_fog = uloc(&gw, "u_fog")
+    gw.l_fogc = uloc(&gw, "u_fogc")
+    if !make_fbo(&gw, w, h) {
+        gw.step = 3
+        return gw
+    }
+    let n: usize = (w as usize) * (h as usize) * 4
+    gw.pix = rt.heap_alloc(n)
+    gw.tmp = rt.heap_alloc(n)
+    if gw.pix == 0 || gw.tmp == 0 {
+        gw.step = 4
+        return gw
+    }
+    gw.ok = true
+    return gw
+}
+
+fn glweb_width(gw: *mut GlWeb) -> i32 { return (*gw).w }
+fn glweb_height(gw: *mut GlWeb) -> i32 { return (*gw).h }
+fn glweb_draws(gw: *mut GlWeb) -> u64 { return (*gw).draws }
+fn glweb_tris(gw: *mut GlWeb) -> u64 { return (*gw).tris }
+fn glweb_calls(gw: *mut GlWeb) -> u64 { return (*gw).calls }
+fn glweb_upload_bytes(gw: *mut GlWeb) -> u64 { return (*gw).up_bytes }
+fn glweb_error(gw: *mut GlWeb) -> i32 { return firn_glw_get_error() }
+fn glweb_finish(gw: *mut GlWeb) { firn_glw_finish() }
+
+fn glweb_set_fog(gw: *mut GlWeb, on: bool, start: f64, end: f64, r: u32, g: u32, b: u32) {
+    (*gw).fog_on = on
+    (*gw).fog_start = start
+    (*gw).fog_end = end
+    (*gw).fog_r = r as f64
+    (*gw).fog_g = g as f64
+    (*gw).fog_b = b as f64
+}
+
+fn glweb_set_cull(gw: *mut GlWeb, on: bool) {
+    (*gw).cull = on
+}
+
+// New frame size (canvas resize): FBO and read back buffers are made again; meshes, atlas and program stay.
+// The caller adapts its camera (mc_camera aspect) itself. False = the new FBO is incomplete (back end not ok then).
+fn glweb_resize(gw: *mut GlWeb, w: i32, h: i32) -> bool {
+    if !(*gw).ok || w <= 0 || h <= 0 { return false }
+    free_fbo(gw)
+    if (*gw).pix != 0 { rt.heap_free((*gw).pix, ((*gw).w as usize) * ((*gw).h as usize) * 4) }
+    if (*gw).tmp != 0 { rt.heap_free((*gw).tmp, ((*gw).w as usize) * ((*gw).h as usize) * 4) }
+    (*gw).w = w
+    (*gw).h = h
+    firn_glw_size(w, h)
+    (*gw).ok = false
+    if !make_fbo(gw, w, h) {
+        (*gw).step = 3
+        return false
+    }
+    let n: usize = (w as usize) * (h as usize) * 4
+    (*gw).pix = rt.heap_alloc(n)
+    (*gw).tmp = rt.heap_alloc(n)
+    if (*gw).pix == 0 || (*gw).tmp == 0 {
+        (*gw).step = 4
+        return false
+    }
+    (*gw).fresh = false
+    (*gw).ok = true
+    return true
+}
+
+fn glweb_close(gw: *mut GlWeb) {
+    if (*gw).slots != 0 {
+        var s: usize = 0
+        while s < (*gw).slot_cap {
+            free_slot(gw, s + 1)
+            s = s + 1
+        }
+        rt.heap_free((*gw).slots, (*gw).slot_cap * SLOT_WORDS * 8)
+        (*gw).slots = 0
+        (*gw).slot_cap = 0
+    }
+    if (*gw).atlas_tex != 0 { firn_glw_delete_texture((*gw).atlas_tex) }
+    (*gw).atlas_tex = 0
+    free_fbo(gw)
+    if (*gw).prog != 0 { firn_glw_delete_program((*gw).prog) }
+    (*gw).prog = 0
+    if (*gw).pix != 0 { rt.heap_free((*gw).pix, ((*gw).w as usize) * ((*gw).h as usize) * 4) }
+    if (*gw).tmp != 0 { rt.heap_free((*gw).tmp, ((*gw).w as usize) * ((*gw).h as usize) * 4) }
+    (*gw).pix = 0
+    (*gw).tmp = 0
+    (*gw).ok = false
+}
+
+// ---- Backend table ---------------------------------------------------------------------------------------------
+
+// The atlas as a texture ARRAY (layer = tile - 1), NEAREST, REPEAT -- the same copy loop as gl_mc.fi be_atlas.
+fn be_atlas(o: u64, a: u64) {
+    let gw: *mut GlWeb = o as *mut GlWeb
+    let at: *mut mc_texture.Atlas = a as *mut mc_texture.Atlas
+    if (*at).px == 0 { return }
+    if (*gw).atlas_tex != 0 {
+        firn_glw_delete_texture((*gw).atlas_tex)
+        (*gw).atlas_tex = 0
+    }
+    let t: usize = (*at).tile as usize
+    let layers: usize = ((*at).cols as usize) * ((*at).rows as usize)
+    let row: usize = t * 4
+    let lbytes: usize = t * row
+    let buf: u64 = rt.heap_alloc(layers * lbytes)
+    if buf == 0 { return }
+    let stride: usize = ((*at).w as usize) * 4
+    var l: usize = 0
+    while l < layers {
+        let col: usize = l % ((*at).cols as usize)
+        let rw: usize = l / ((*at).cols as usize)
+        var y: usize = 0
+        while y < t {
+            rt.mem_copy(buf + (l * lbytes + y * row) as u64, (*at).px + ((rw * t + y) * stride + col * row) as u64, row)
+            y = y + 1
+        }
+        l = l + 1
+    }
+    let id: i32 = firn_glw_create_texture()
+    firn_glw_bind_texture(GL_TEXTURE_2D_ARRAY, id)
+    firn_glw_pixel_storei(GL_UNPACK_ALIGNMENT, 1)
+    firn_glw_tex_parameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+    firn_glw_tex_parameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+    firn_glw_tex_parameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT)
+    firn_glw_tex_parameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_REPEAT)
+    firn_glw_tex_image_3d(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, (*at).tile, (*at).tile, layers as i32, GL_RGBA, GL_UNSIGNED_BYTE, buf as u32)
+    rt.heap_free(buf, layers * lbytes)
+    (*gw).atlas_tex = id
+    (*gw).atile = (*at).tile
+    (*gw).acols = (*at).cols
+}
+
+// Returns a free slot index (the table grows by doubling), NONE (all ones) on failure.
+fn alloc_slot(gw: *mut GlWeb) -> usize {
+    var s: usize = 0
+    while s < (*gw).slot_cap {
+        if rt.ld64((*gw).slots, s * SLOT_WORDS + S_USED) == 0 as u64 { return s }
+        s = s + 1
+    }
+    let ncap: usize = (*gw).slot_cap * 2 + 64
+    let ns: u64 = rt.heap_alloc(ncap * SLOT_WORDS * 8)
+    if ns == 0 { return 0xFFFFFFFFFFFFFFFF as usize }
+    var i: usize = 0
+    while i < ncap * SLOT_WORDS {
+        var v: u64 = 0
+        if i < (*gw).slot_cap * SLOT_WORDS { v = rt.ld64((*gw).slots, i) }
+        rt.st64(ns, i, v)
+        i = i + 1
+    }
+    if (*gw).slots != 0 { rt.heap_free((*gw).slots, (*gw).slot_cap * SLOT_WORDS * 8) }
+    s = (*gw).slot_cap
+    (*gw).slots = ns
+    (*gw).slot_cap = ncap
+    return s
+}
+
+// verts = 2 x u32 per vertex (mc_mesh), idx = u32. Handle = slot + 1, 0 = failed.
+fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize) -> usize {
+    let gw: *mut GlWeb = o as *mut GlWeb
+    let s: usize = alloc_slot(gw)
+    if s == 0xFFFFFFFFFFFFFFFF as usize { return 0 }
+    let b: usize = s * SLOT_WORDS
+    var i: usize = 0
+    while i < SLOT_WORDS {
+        rt.st64((*gw).slots, b + i, 0 as u64)
+        i = i + 1
+    }
+    if nverts == 0 || nidx == 0 {
+        rt.st64((*gw).slots, b + S_USED, 1 as u64) // empty section: nothing to draw
+        return s + 1
+    }
+    let vao: i32 = firn_glw_create_vao()
+    firn_glw_bind_vao(vao)
+    let vbo: i32 = firn_glw_create_buffer()
+    firn_glw_bind_buffer(GL_ARRAY_BUFFER, vbo)
+    firn_glw_buffer_data(GL_ARRAY_BUFFER, verts as u32, (nverts * 8) as u32, GL_STATIC_DRAW)
+    firn_glw_enable_attrib(0)
+    firn_glw_attrib_ipointer(0, 2, GL_UNSIGNED_INT, 8, 0)
+    let ibo: i32 = firn_glw_create_buffer()
+    firn_glw_bind_buffer(GL_ELEMENT_ARRAY_BUFFER, ibo) // recorded in the VAO
+    firn_glw_buffer_data(GL_ELEMENT_ARRAY_BUFFER, idx as u32, (nidx * 4) as u32, GL_STATIC_DRAW)
+    firn_glw_bind_vao(0)
+    (*gw).cur_vao = 0
+    rt.st64((*gw).slots, b + S_VAO, vao as u64)
+    rt.st64((*gw).slots, b + S_VBO, vbo as u64)
+    rt.st64((*gw).slots, b + S_IBO, ibo as u64)
+    rt.st64((*gw).slots, b + S_NIDX, nidx as u64)
+    rt.st64((*gw).slots, b + S_USED, 1 as u64)
+    (*gw).up_bytes = (*gw).up_bytes + ((nverts * 8 + nidx * 4) as u64)
+    return s + 1
+}
+
+fn free_slot(gw: *mut GlWeb, handle: usize) {
+    if handle < 1 || handle > (*gw).slot_cap { return }
+    let b: usize = (handle - 1) * SLOT_WORDS
+    if rt.ld64((*gw).slots, b + S_USED) == 0 as u64 { return }
+    let vao: i32 = rt.ld64((*gw).slots, b + S_VAO) as i32
+    let vbo: i32 = rt.ld64((*gw).slots, b + S_VBO) as i32
+    let ibo: i32 = rt.ld64((*gw).slots, b + S_IBO) as i32
+    if vao != 0 { firn_glw_delete_vao(vao) }
+    if vbo != 0 { firn_glw_delete_buffer(vbo) }
+    if ibo != 0 { firn_glw_delete_buffer(ibo) }
+    rt.st64((*gw).slots, b + S_USED, 0 as u64)
+}
+
+fn be_free(o: u64, h: usize) {
+    free_slot(o as *mut GlWeb, h)
+}
+
+fn be_begin(o: u64, cam: u64, rgba: u32) {
+    let gw: *mut GlWeb = o as *mut GlWeb
+    let c: *mut mc_camera.Camera = cam as *mut mc_camera.Camera
+    (*gw).cx = (*c).x
+    (*gw).cy = (*c).y
+    (*gw).cz = (*c).z
+    // projection * view rotation: the camera translation is applied on the CPU per draw (origin)
+    var rot: mc_math.Mat4 = (*c).view
+    rot.m[12] = 0.0
+    rot.m[13] = 0.0
+    rot.m[14] = 0.0
+    var rv: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
+    mc_math.mat4_mul(&rv, &(*c).proj, &rot)
+    var i: usize = 0
+    while i < 16 {
+        (*gw).rv[i] = rv.m[i] as f32
+        i = i + 1
+    }
+    firn_glw_bind_framebuffer(GL_FRAMEBUFFER, (*gw).fbo)
+    firn_glw_viewport(0, 0, (*gw).w, (*gw).h)
+    firn_glw_disable(GL_BLEND)
+    firn_glw_disable(GL_SCISSOR_TEST)
+    firn_glw_enable(GL_DEPTH_TEST)
+    firn_glw_depth_func(GL_LESS)
+    firn_glw_depth_mask(1)
+    firn_glw_color_mask(1, 1, 1, 1)
+    firn_glw_front_face(GL_CCW)
+    if (*gw).cull {
+        firn_glw_enable(GL_CULL_FACE)
+        firn_glw_cull_face(GL_BACK)
+    } else {
+        firn_glw_disable(GL_CULL_FACE)
+    }
+    let r: f64 = ((rgba & 255 as u32) as f64) / 255.0
+    let gr: f64 = (((rgba >> 8 as u32) & 255 as u32) as f64) / 255.0
+    let b: f64 = (((rgba >> 16 as u32) & 255 as u32) as f64) / 255.0
+    let a: f64 = (((rgba >> 24 as u32) & 255 as u32) as f64) / 255.0
+    firn_glw_clear_color(r, gr, b, a)
+    firn_glw_clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    // program, atlas, uniforms
+    firn_glw_use_program((*gw).prog)
+    firn_glw_active_texture(GL_TEXTURE0)
+    firn_glw_bind_texture(GL_TEXTURE_2D_ARRAY, (*gw).atlas_tex)
+    firn_glw_uniform1i((*gw).l_atlas, 0)
+    firn_glw_uniform_matrix4fv((*gw).l_rv, ((&(*gw).rv[0]) as u64) as u32)
+    firn_glw_uniform2f((*gw).l_tiles, (*gw).atile as f64, (*gw).acols as f64)
+    var fogf: f64 = 0.0
+    if (*gw).fog_on { fogf = 1.0 }
+    firn_glw_uniform4f((*gw).l_fog, fogf, (*gw).fog_start, (*gw).fog_end, 0.0)
+    firn_glw_uniform3f((*gw).l_fogc, (*gw).fog_r, (*gw).fog_g, (*gw).fog_b)
+    firn_glw_bind_vao(0)
+    (*gw).cur_vao = 0
+    (*gw).fresh = false
+}
+
+fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
+    let gw: *mut GlWeb = o as *mut GlWeb
+    if h < 1 || h > (*gw).slot_cap { return 0 as u64 }
+    let b: usize = (h - 1) * SLOT_WORDS
+    if rt.ld64((*gw).slots, b + S_USED) == 0 as u64 { return 0 as u64 }
+    let nidx: usize = rt.ld64((*gw).slots, b + S_NIDX) as usize
+    if nidx < 3 { return 0 as u64 }
+    let t: u64 = (nidx / 3) as u64
+    (*gw).draws = (*gw).draws + 1 as u64
+    (*gw).tris = (*gw).tris + t
+    firn_glw_uniform3f((*gw).l_origin, ox - (*gw).cx, oy - (*gw).cy, oz - (*gw).cz)
+    let vao: i32 = rt.ld64((*gw).slots, b + S_VAO) as i32
+    if vao != (*gw).cur_vao {
+        firn_glw_bind_vao(vao)
+        (*gw).cur_vao = vao
+    }
+    firn_glw_draw_elements(GL_TRIANGLES, nidx as i32, GL_UNSIGNED_INT, 0)
+    (*gw).calls = (*gw).calls + 1 as u64
+    return t
+}
+
+fn be_end(o: u64) {
+    let gw: *mut GlWeb = o as *mut GlWeb
+    firn_glw_bind_vao(0)
+    (*gw).cur_vao = 0
+    firn_glw_flush()
+}
+
+// Reads the finished frame back (blocks until the GPU is done): w*h*4 bytes RGBA, row 0 = top.
+fn be_present(o: u64) -> u64 {
+    let gw: *mut GlWeb = o as *mut GlWeb
+    if !(*gw).fresh {
+        firn_glw_bind_framebuffer(GL_FRAMEBUFFER, (*gw).fbo)
+        firn_glw_read_pixels(0, 0, (*gw).w, (*gw).h, (*gw).tmp as u32)
+        let row: usize = ((*gw).w as usize) * 4
+        var y: usize = 0
+        while y < ((*gw).h as usize) {
+            rt.mem_copy((*gw).pix + ((((*gw).h as usize) - 1 - y) * row) as u64, (*gw).tmp + (y * row) as u64, row)
+            y = y + 1
+        }
+        (*gw).fresh = true
+    }
+    return (*gw).pix
+}
+
+fn be_read(o: u64, out: u64) {
+    let gw: *mut GlWeb = o as *mut GlWeb
+    let p: u64 = be_present(o)
+    rt.mem_copy(out, p, ((*gw).w as usize) * ((*gw).h as usize) * 4)
+}
+
+// The finished frame onto the page's canvas: blitFramebuffer FBO -> default framebuffer, 1:1, no readback.
+// Then the host is told (`firn_glw_present`), e.g. to take a snapshot in a test.
+fn glweb_show(gw: *mut GlWeb) {
+    firn_glw_bind_framebuffer(GL_READ_FRAMEBUFFER, (*gw).fbo)
+    firn_glw_bind_framebuffer(GL_DRAW_FRAMEBUFFER, 0)
+    firn_glw_blit_framebuffer(0, 0, (*gw).w, (*gw).h, 0, 0, (*gw).w, (*gw).h, GL_COLOR_BUFFER_BIT, GL_NEAREST)
+    firn_glw_bind_framebuffer(GL_FRAMEBUFFER, 0)
+    firn_glw_present((*gw).w, (*gw).h)
+}
+
+// The WebGL2 back end as a mc_backend.Backend table. `gw` must outlive the table.
+fn glweb_backend(gw: *mut GlWeb) -> mc_backend.Backend {
+    var b: mc_backend.Backend = mc_backend.backend_new()
+    b.kind = mc_backend.KIND_GL
+    b.obj = gw as u64
+    b.upload_atlas = be_atlas
+    b.mesh_upload = be_upload
+    b.mesh_free = be_free
+    b.begin = be_begin
+    b.draw = be_draw
+    b.end = be_end
+    b.present = be_present
+    b.read_pixels = be_read
+    return b
+}

@@ -2006,6 +2006,17 @@ else
     grep -E 'FAIL' "$WORK/wmprobe.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 131. WebGL2 back end (lib/gpu/glweb.fi) in headless Chromium: same mc_backend.Backend table as gl_mc, voxel scenes vs mc_raster in-module + canvas snapshots vs native frames, PSNR >= 34 (tools/gpu/web/run.sh, docs/WEBGL2.md) =="
+# Chromium WebGL2 on SwiftShader (software; no GPU on this server). A missing chromium / numpy / PIL is SKIP. A real GPU, Firefox, Safari and mobile browsers are UNTESTED.
+FIRNC="$FIRNC" bash tools/gpu/web/run.sh > "$WORK/webgl2.log" 2>&1 && WGRC=0 || WGRC=$?
+if [ "$WGRC" -eq 0 ]; then
+    ok
+    grep -E '^   (ok|SKIP)|RESULT|canvas vs native' "$WORK/webgl2.log" | sed 's/^/ /'
+else
+    bad "tools/gpu/web/run.sh failed (see .test-work/webgl2.log)"
+    grep -E 'FAIL' "$WORK/webgl2.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 125. GL 3.3 core window: X11 (EGL on the Firn window's XID + GLX fallback) + Windows twin under Wine (tools/gpu/win/run.sh, lib/gpu/glwindow.fi, docs/GPU.md) =="
 # Xvfb + Mesa llvmpipe: open, clear + read back the window framebuffer, swap, swap interval, resize, full screen request, DPI.
 # A missing libEGL / Xvfb is SKIP (Wine part: SKIP without wine / mingw ld). Only Mesa is proven; a real GPU driver is UNTESTED.

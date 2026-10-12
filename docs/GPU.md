@@ -171,3 +171,9 @@ getwindowfocus`); `xdotool windowfocus` to a second window and back arrives as E
 Note: the first FocusIn happens while `glwindow.open` maps the window, i.e. BEFORE a program can call `raw_input` -- ask the server
 (`getwindowfocus`) for the initial state, not the event. Only openbox tried; other WMs (mutter, kwin, i3) and real displays UNTESTED.
 
+
+## WebGL2 back end for the browser (round gpu-m, 2026-10-12, roadmap r425) -- `lib/gpu/glweb.fi`, gate 131
+Same `mc_backend.Backend` table as `gl_mc` on WebGL2 (`--target=wasm32-browser`, JS host `demos/mcweb/glweb.js`, ES 3.00 shaders `glweb_vs/fs.glsl`),
+legacy draw mode only. Headless Chromium on SwiftShader: 7 scenes vs mc_raster, PSNR 46-99 dB (need >= 34). Plan, missing features
+(buffer textures, base vertex, mapped buffers, indirect, timer queries, Hi-Z), the `lib/@web/` twin idea and untested items: `docs/WEBGL2.md`.
+Real GPU, Firefox, Safari, mobile UNTESTED.
