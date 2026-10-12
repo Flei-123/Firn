@@ -1,0 +1,248 @@
+// tools/gpu/win/shot.fi -- the WINDOW framebuffer against the CPU rasterizer (lib/gpu/glwindow.fi, glshow.fi, gl_mc.fi).
+// Three hand made scenes are drawn by mc_raster (CPU) and by the GL back end that lives on the WINDOW's context.
+//   A. the CPU image goes through glshow.show_pixels into the window (no read back on the way in), then the window
+//      framebuffer is read back: it must equal the CPU image BYTE FOR BYTE (RGB).
+//   B. the GL back end's FBO texture is drawn into the window (glshow.show_draw), the window framebuffer is read back
+//      and compared with mc_raster: PSNR >= 34 dB (the GL rasterizer is float, mc_raster snaps to 1/16 px).
+// usage: shot egl|glx|wgl   Exit 0 = all scenes ok.
+import std.rt
+import std.io
+import std.math
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import gpu.gl33
+import gpu.gl_mc
+import gpu.glwindow
+import gpu.glshow
+
+const W: i32 = 320
+const H: i32 = 180
+
+fn print_f2(v: f64) {
+    var x: f64 = v
+    if x < 0.0 { x = 0.0 }
+    let i: i64 = x as i64
+    var f: i64 = ((x - (i as f64)) * 100.0 + 0.5) as i64
+    var ii: i64 = i
+    if f >= 100 as i64 {
+        f = f - 100 as i64
+        ii = ii + 1 as i64
+    }
+    if f < 10 as i64 {
+        io.fmt_print(f"{ii}.0{f}")
+    } else {
+        io.fmt_print(f"{ii}.{f}")
+    }
+}
+
+// ---- atlas for the hand made scenes -----------------------------------------------------------------
+fn put(a: *mut mc_texture.Atlas, tile: u32, x: i32, y: i32, rgba: u32) {
+    let ox: i32 = mc_texture.atlas_tile_x(a, tile)
+    let oy: i32 = mc_texture.atlas_tile_y(a, tile)
+    rt.st32((*a).px, ((oy + y) * (*a).w + ox + x) as usize, rgba)
+}
+
+// tile 1 solid orange, tile 2 four coloured quadrants + white top row + black left column, tile 3 left half transparent
+fn test_atlas() -> mc_texture.Atlas {
+    var a: mc_texture.Atlas = mc_texture.atlas_new(16, 4, 4)
+    var y: i32 = 0
+    while y < 16 {
+        var x: i32 = 0
+        while x < 16 {
+            put(&a, 1 as u32, x, y, mc_texture.pack_pixel(230 as u32, 120 as u32, 40 as u32, 255 as u32))
+            var c: u32 = mc_texture.pack_pixel(220 as u32, 30 as u32, 30 as u32, 255 as u32)
+            if x >= 8 && y < 8 { c = mc_texture.pack_pixel(30 as u32, 200 as u32, 30 as u32, 255 as u32) }
+            if x < 8 && y >= 8 { c = mc_texture.pack_pixel(30 as u32, 60 as u32, 230 as u32, 255 as u32) }
+            if x >= 8 && y >= 8 { c = mc_texture.pack_pixel(240 as u32, 230 as u32, 30 as u32, 255 as u32) }
+            if y == 0 { c = mc_texture.pack_pixel(255 as u32, 255 as u32, 255 as u32, 255 as u32) }
+            if x == 0 { c = mc_texture.pack_pixel(0 as u32, 0 as u32, 0 as u32, 255 as u32) }
+            put(&a, 2 as u32, x, y, c)
+            var al: u32 = 255 as u32
+            if x < 8 { al = 0 as u32 }
+            put(&a, 3 as u32, x, y, mc_texture.pack_pixel(30 as u32, 220 as u32, 220 as u32, al))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return a
+}
+
+// ---- hand made meshes -------------------------------------------------------------------------------
+fn vw0(x: u32, y: u32, z: u32, face: u32, ao: u32) -> u32 {
+    return x | (y << 8 as u32) | (z << 16 as u32) | (face << 24 as u32) | (ao << 27 as u32)
+}
+
+fn vw1(tile: u32, u: u32, v: u32) -> u32 {
+    return tile | (u << 16 as u32) | (v << 24 as u32)
+}
+
+fn put_vtx(vp: u64, i: usize, w0: u32, w1: u32) {
+    rt.st32(vp, i * 2, w0)
+    rt.st32(vp, i * 2 + 1, w1)
+}
+
+
+// RGB-only comparison: max channel difference, number of differing pixels, PSNR x100 (99.00 = identical).
+struct Diff {
+    diff_px: u64,
+    max_diff: u32,
+    psnr_x100: u64,
+}
+
+fn diff_rgb(a: u64, b: u64, n: usize) -> Diff {
+    var d: Diff = Diff { diff_px: 0 as u64, max_diff: 0 as u32, psnr_x100: 9900 as u64 }
+    var sq: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let pa: u32 = rt.ld32(a, i)
+        let pb: u32 = rt.ld32(b, i)
+        if (pa & 0xFFFFFF as u32) != (pb & 0xFFFFFF as u32) {
+            d.diff_px = d.diff_px + 1 as u64
+            var k: u32 = 0 as u32
+            while k < 3 as u32 {
+                let ba: i32 = ((pa >> (k * 8 as u32)) & 255 as u32) as i32
+                let bb: i32 = ((pb >> (k * 8 as u32)) & 255 as u32) as i32
+                var x: i32 = ba - bb
+                if x < 0 { x = 0 - x }
+                sq = sq + (x * x) as f64
+                if (x as u32) > d.max_diff { d.max_diff = x as u32 }
+                k = k + 1 as u32
+            }
+        }
+        i = i + 1
+    }
+    if sq > 0.0 {
+        let mse: f64 = sq / ((n as f64) * 3.0)
+        d.psnr_x100 = (10.0 * math.log10(255.0 * 255.0 / mse) * 100.0) as u64
+    }
+    return d
+}
+
+struct Sc {
+    r: mc_raster.Raster,
+    gb: gl_mc.GlBackend,
+    bc: mc_backend.Backend,
+    bg: mc_backend.Backend,
+    cam: mc_camera.Camera,
+    win: glwindow.GlWin,
+    sh: glshow.Show,
+    rb: u64, // window read back (top row first)
+    tmp: u64,
+    fails: i32,
+}
+
+fn frame(b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera, clear: u32, h: usize) {
+    (*b).begin((*b).obj, (cam as u64), clear)
+    (*b).draw((*b).obj, h, 0.0, 0.0, 0.0)
+    (*b).end((*b).obj)
+}
+
+fn scene(s: *mut Sc, name: str, verts: u64, nv: usize, idx: u64, ni: usize, clear: u32) {
+    mc_camera.camera_update(&(*s).cam)
+    let hc: usize = (*s).bc.mesh_upload((*s).bc.obj, 1, verts, nv, idx, ni)
+    let hg: usize = (*s).bg.mesh_upload((*s).bg.obj, 1, verts, nv, idx, ni)
+    frame(&(*s).bc, &(*s).cam, clear, hc)
+    frame(&(*s).bg, &(*s).cam, clear, hg)
+    let pc: u64 = (*s).bc.present((*s).bc.obj)
+    let n: usize = (W as usize) * (H as usize)
+    let g: *mut gl33.Gl = gl_mc.glbe_gl(&(*s).gb)
+    // A. CPU image -> window (show_pixels) -> read back: byte equal
+    glshow.show_pixels(&(*s).sh, g, pc, W, H, false, W, H)
+    gl33.gl_read_rgba_top_down(g, W, H, (*s).rb, (*s).tmp)
+    let da: Diff = diff_rgb(pc, (*s).rb, n)
+    // B. GL back end texture -> window (show_draw) -> read back: against mc_raster
+    glshow.show_draw(&(*s).sh, g, gl_mc.glbe_fbo_texture(&(*s).gb), false, false, W, H)
+    gl33.gl_read_rgba_top_down(g, W, H, (*s).rb, (*s).tmp)
+    let db: Diff = diff_rgb(pc, (*s).rb, n)
+    glwindow.swap(&(*s).win)
+    (*s).bc.mesh_free((*s).bc.obj, hc)
+    (*s).bg.mesh_free((*s).bg.obj, hg)
+    var ok: bool = da.diff_px == 0 as u64 && db.psnr_x100 >= 3400 as u64
+    io.print("shot ")
+    io.print(name)
+    io.fmt_print(f" path_a_diff_px={da.diff_px} path_b_diff_px={db.diff_px} path_b_max_diff={db.max_diff} path_b_psnr=")
+    print_f2((db.psnr_x100 as f64) / 100.0)
+    if ok {
+        io.print(" ok\n")
+    } else {
+        io.print(" FAIL\n")
+        (*s).fails = (*s).fails + 1
+    }
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var o: glwindow.Opts = glwindow.opts_default()
+    o.vsync = 0
+    if rt.arg_count(start) >= 2 {
+        if rt.ld8(rt.arg_ptr(start, 1), 0) == 103 as u8 { o.api = glwindow.API_GLX } else { o.api = glwindow.API_EGL }
+    }
+    var w: glwindow.GlWin = glwindow.glwindow_new()
+    if !glwindow.open(&w, W, H, "glwindow shot", o) {
+        io.fmt_print(f"open failed step={w.step}\n")
+        return 10 + w.step
+    }
+    if w.w != W || w.h != H {
+        io.fmt_print(f"window is {w.w}x{w.h}, not {W}x{H}\n")
+        return 5
+    }
+    let api: str = glwindow.api_name(&w)
+    // the back end runs on the window's context; its FBO is W x H; the window framebuffer is only shown to
+    var gb: gl_mc.GlBackend = gl_mc.glbe_open_with(glwindow.take_ctx(&w), W, H)
+    if !gb.ok {
+        io.fmt_print(f"back end failed step={gb.step}\n")
+        return 4
+    }
+    io.print("api=")
+    io.print(api)
+    io.print(" renderer=")
+    io.print_c(gl_mc.glbe_renderer(&gb))
+    io.new_line()
+    var s: Sc = Sc { r: mc_raster.raster_new(W, H), gb: gb, bc: mc_backend.backend_new(), bg: mc_backend.backend_new(),
+        cam: mc_camera.camera_new(W, H), win: w, sh: glshow.show_new(), rb: rt.heap_alloc((W as usize) * (H as usize) * 4),
+        tmp: rt.heap_alloc((W as usize) * (H as usize) * 4), fails: 0 }
+    s.bc = mc_backend.backend_cpu(&s.r)
+    s.bg = gl_mc.glbe_backend(&s.gb)
+    if !glshow.show_init(&s.sh, gl_mc.glbe_gl(&s.gb)) {
+        io.print("show_init failed\n")
+        return 6
+    }
+    var ta: mc_texture.Atlas = test_atlas()
+    s.bc.upload_atlas(s.bc.obj, (&ta) as u64)
+    s.bg.upload_atlas(s.bg.obj, (&ta) as u64)
+    let clear: u32 = 0xFFE6BE96 as u32
+    let tv: u64 = rt.heap_alloc(3 * 8)
+    let ti: u64 = rt.heap_alloc(3 * 4)
+    put_vtx(tv, 0, vw0(12 as u32, 3 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    put_vtx(tv, 1, vw0(4 as u32, 3 as u32, 10 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    put_vtx(tv, 2, vw0(8 as u32, 13 as u32, 10 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    rt.st32(ti, 0, 0 as u32)
+    rt.st32(ti, 1, 1 as u32)
+    rt.st32(ti, 2, 2 as u32)
+    mc_camera.camera_set_pos(&s.cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&s.cam, 0.0, 0.0)
+    scene(&s, "triangle", tv, 3, ti, 3, clear)
+    let qv: u64 = rt.heap_alloc(4 * 8)
+    let qi: u64 = rt.heap_alloc(6 * 4)
+    put_vtx(qv, 0, vw0(12 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 0 as u32, 2 as u32))
+    put_vtx(qv, 1, vw0(4 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 2 as u32, 2 as u32))
+    put_vtx(qv, 2, vw0(4 as u32, 14 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 2 as u32, 0 as u32))
+    put_vtx(qv, 3, vw0(12 as u32, 14 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 0 as u32, 0 as u32))
+    rt.st32(qi, 0, 0 as u32)
+    rt.st32(qi, 1, 1 as u32)
+    rt.st32(qi, 2, 2 as u32)
+    rt.st32(qi, 3, 0 as u32)
+    rt.st32(qi, 4, 2 as u32)
+    rt.st32(qi, 5, 3 as u32)
+    mc_camera.camera_set_pos(&s.cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&s.cam, 0.0, 0.0)
+    scene(&s, "quad", qv, 4, qi, 6, clear)
+    mc_camera.camera_set_pos(&s.cam, 14.0, 9.0, 1.0)
+    mc_camera.camera_set_angles(&s.cam, 25.0, 8.0)
+    scene(&s, "quad_angled", qv, 4, qi, 6, clear)
+    io.fmt_print(f"RESULT fails={s.fails}\n")
+    return s.fails
+}

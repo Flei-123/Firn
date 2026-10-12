@@ -105,3 +105,6 @@ module names are global). Windows twin `lib/gpu/glwindow.windows.fi` (same names
 `window.gpu_gl` WGL 3.3 core, depth 24/stencil 8, `g.ctx` is a borrowed `glctx` context, swap = `window.gpu_swap`,
 `swap_interval` has two states, `api_name` = "wgl"): `winprobe.exe wgl` under Wine + Xvfb + Mesa is green (open, clear + read
 back, resize via `r_set_size`, fullscreen on/off), part of gate 125 (SKIP without Wine/mingw ld). Real Windows UNTESTED.
+Window framebuffer vs mc_raster (`tools/gpu/win/shot.fi`, EGL, GLX and wgl/Wine, same numbers): (A) CPU image through `glshow.show_pixels` into
+the window and read back = byte equal (RGB); (B) GL back end FBO texture through `glshow.show_draw` into the window = mc_raster with PSNR
+79.1 / 99.0 / 42.8 dB (triangle / quad / quad_angled; threshold 34).
