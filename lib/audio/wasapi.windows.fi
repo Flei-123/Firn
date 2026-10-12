@@ -1,0 +1,667 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/wasapi.windows.fi -- audio.wasapi, Windows: WASAPI (mmdevapi) shared mode, polling.
+//
+//     import audio.wasapi
+//
+//     var w: wasapi.Wasapi = wasapi.wasapi_open("My App", 44100, 2, 40)   // 40 ms engine buffer
+//     if wasapi.wasapi_is_open(&w) {
+//         wasapi.wasapi_write(&w, pcm_ptr, frames)      // S16LE interleaved; waits while the buffer is full
+//         wasapi.wasapi_drain(&w)
+//     }
+//     wasapi.wasapi_close(&w)
+//
+// The same operations as audio.dev (open / is_open / writable / write / drain / flush / pause / close),
+// with the `wasapi_` prefix; `audio.dev` (dev.windows.fi) can use it instead of waveOut with
+// FIRN_WIN_AUDIO=wasapi (default stays waveOut until this has run on a real Windows machine).
+//
+// NO COMPILER PATCH, NO IMPORT TABLE: COM is plain function pointers. ole32.dll (CoInitializeEx,
+// CoCreateInstance) is found with LoadLibraryA/GetProcAddress and called through the Win64 gate
+// (`win64_call`, the same as lib/gpu/wgl.windows.fi and docs/WINDOWS_GPU.md); every interface method is
+// `call*(vtable[slot], this, args...)` with the slot numbers of the Windows SDK headers (mmdeviceapi.h,
+// audioclient.h). Sequence of `wasapi_open`:
+//   CoInitializeEx -> CoCreateInstance(CLSID_MMDeviceEnumerator) -> IMMDeviceEnumerator::GetDefaultAudioEndpoint
+//   (eRender, eConsole) -> IMMDevice::Activate(IID_IAudioClient) -> IAudioClient::Initialize(SHARED,
+//   AUTOCONVERTPCM | SRC_DEFAULT_QUALITY, 16 bit PCM at the caller's rate, buffer ms) -> GetBufferSize ->
+//   GetService(IID_IAudioRenderClient). `Start` comes with the first write (after its data is in the buffer).
+// `wasapi_list` names the active render endpoints (IMMDeviceEnumerator::EnumAudioEndpoints +
+// IPropertyStore, PKEY_Device_FriendlyName).
+//
+// HONEST
+// W1  Tested under Wine 8.0 only (winealsa through ALSA's file plugin, no sound card, tools/audio/wasapi/run.sh):
+//     what Wine's mmdevapi does is documented in docs/AUDIO.md. REAL WINDOWS: UNTESTED. Hence waveOut stays the default.
+// W2  Polling, not event driven: `wasapi_write` sleeps 2 ms while the buffer is full. Event mode
+//     (AUDCLNT_STREAMFLAGS_EVENTCALLBACK + SetEventHandle + WaitForSingleObject) saves those wake-ups and is open.
+// W3  Shared mode only, default render device only (`wasapi_list` shows the names; choosing one is open).
+//     Format: signed 16 bit PCM, 1 or 2 channels; AUTOCONVERTPCM makes the system mixer convert it to the
+//     device's mix format (Windows 7 and later).
+// W4  No device-change handling (IMMNotificationClient): when the default device goes away `wasapi_write`
+//     returns false (AUDCLNT_E_DEVICE_INVALIDATED); reopen.
+// W5  Call from the thread that opened it (COM apartment of that thread); COINIT_MULTITHREADED.
+import std.rt
+import std.time
+
+export {
+    Wasapi, wasapi_null, wasapi_open, wasapi_is_open, wasapi_writable, wasapi_write, wasapi_drain, wasapi_flush,
+    wasapi_pause, wasapi_close, wasapi_list, wasapi_buffer_frames, wasapi_latency_us, wasapi_error_step, wasapi_hresult,
+    WS_NONE, WS_COM, WS_ENUM, WS_DEFAULT, WS_ACTIVATE, WS_FORMAT, WS_INIT, WS_SERVICE,
+}
+
+extern fn LoadLibraryA(name: u64) -> u64;
+extern fn GetProcAddress(h: u64, name: u64) -> u64;
+extern fn win64_call(f: u64, argv: u64, n: u64) -> u64;
+
+// where `wasapi_open` stopped (wasapi_error_step)
+const WS_NONE: i32 = 0
+const WS_COM: i32 = 1 // ole32 / CoInitializeEx / CoCreateInstance(MMDeviceEnumerator)
+const WS_ENUM: i32 = 2
+const WS_DEFAULT: i32 = 3 // no default render endpoint (no sound device)
+const WS_ACTIVATE: i32 = 4
+const WS_FORMAT: i32 = 5 // GetMixFormat / unsupported
+const WS_INIT: i32 = 6 // IAudioClient::Initialize
+const WS_SERVICE: i32 = 7 // GetBufferSize / IAudioRenderClient
+
+struct Wasapi {
+    enumr: u64, // IMMDeviceEnumerator*
+    dev: u64, // IMMDevice*
+    client: u64, // IAudioClient*
+    render: u64, // IAudioRenderClient*
+    buf_frames: u32, // size of the engine buffer
+    rate: u32,
+    channels: u32,
+    started: bool, // IAudioClient::Start was called
+    paused: bool,
+    open: bool,
+    com: bool, // CoInitializeEx succeeded (balance with CoUninitialize)
+    step: i32,
+    hr: u32,
+}
+
+fn wasapi_null() -> Wasapi {
+    return Wasapi { enumr: 0, dev: 0, client: 0, render: 0, buf_frames: 0 as u32, rate: 0 as u32,
+        channels: 2 as u32, started: false, paused: false, open: false, com: false, step: WS_NONE, hr: 0 as u32 }
+}
+
+static mut G_OLE32: u64 = 0
+static mut G_COINIT: u64 = 0
+static mut G_COUNINIT: u64 = 0
+static mut G_COCREATE: u64 = 0
+static mut G_PVCLEAR: u64 = 0
+static mut G_NAME: [u8; 64] = [0 as u8; 64]
+
+fn cname(s: str) -> u64 {
+    let n: usize = s.length()
+    if n > 63 {
+        return 0
+    }
+    var i: usize = 0
+    while i < n {
+        G_NAME[i] = s.chars(i)
+        i = i + 1
+    }
+    G_NAME[n] = 0 as u8
+    return (&G_NAME[0]) as u64
+}
+
+fn sym(h: u64, name: str) -> u64 {
+    if h == 0 {
+        return 0
+    }
+    return GetProcAddress(h, cname(name))
+}
+
+fn init_ole() -> bool {
+    if G_COCREATE != 0 {
+        return true
+    }
+    let h: u64 = LoadLibraryA(cname("ole32.dll"))
+    if h == 0 {
+        return false
+    }
+    G_COINIT = sym(h, "CoInitializeEx")
+    G_COUNINIT = sym(h, "CoUninitialize")
+    G_COCREATE = sym(h, "CoCreateInstance")
+    G_PVCLEAR = sym(h, "PropVariantClear")
+    G_OLE32 = h
+    return G_COINIT != 0 && G_COUNINIT != 0 && G_COCREATE != 0
+}
+
+// ---------------------------------------------------------------- the Win64 gate
+fn call1(f: u64, a0: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 1] = [0; 1]
+    v[0] = a0
+    return win64_call(f, (&v[0]) as u64, 1)
+}
+
+fn call2(f: u64, a0: u64, a1: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 2] = [0; 2]
+    v[0] = a0
+    v[1] = a1
+    return win64_call(f, (&v[0]) as u64, 2)
+}
+
+fn call3(f: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 3] = [0; 3]
+    v[0] = a0
+    v[1] = a1
+    v[2] = a2
+    return win64_call(f, (&v[0]) as u64, 3)
+}
+
+fn call4(f: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 4] = [0; 4]
+    v[0] = a0
+    v[1] = a1
+    v[2] = a2
+    v[3] = a3
+    return win64_call(f, (&v[0]) as u64, 4)
+}
+
+fn call5(f: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 5] = [0; 5]
+    v[0] = a0
+    v[1] = a1
+    v[2] = a2
+    v[3] = a3
+    v[4] = a4
+    return win64_call(f, (&v[0]) as u64, 5)
+}
+
+fn call7(f: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
+    if f == 0 {
+        return 0
+    }
+    var v: [u64; 7] = [0; 7]
+    v[0] = a0
+    v[1] = a1
+    v[2] = a2
+    v[3] = a3
+    v[4] = a4
+    v[5] = a5
+    v[6] = a6
+    return win64_call(f, (&v[0]) as u64, 7)
+}
+
+// ---------------------------------------------------------------- COM helpers
+// The function pointer of method `slot` of the COM object `obj` (its first octets point at the vtable).
+fn method(obj: u64, slot: usize) -> u64 {
+    return rt.ld64(rt.ld64(obj, 0), slot)
+}
+
+// S_OK / S_FALSE / any value with the top bit clear is success.
+fn hr_ok(r: u64) -> bool {
+    return (r & 2147483648 as u64) == 0 as u64
+}
+
+fn release(obj: u64) {
+    if obj != 0 {
+        call1(method(obj, 2), obj)
+    }
+}
+
+fn hex1(c: u8) -> u32 {
+    if c >= 97 as u8 {
+        return (c - 87 as u8) as u32
+    }
+    if c >= 65 as u8 {
+        return (c - 55 as u8) as u32
+    }
+    return (c - 48 as u8) as u32
+}
+
+fn hexn(s: str, at: usize, n: usize) -> u32 {
+    var v: u32 = 0 as u32
+    var i: usize = 0
+    while i < n {
+        v = (v << 4) | hex1(s.chars(at + i))
+        i = i + 1
+    }
+    return v
+}
+
+// "BCDE0395-E52F-467C-8E3D-C4579291692E" -> the 16 octets of a GUID struct (Data1..3 little endian).
+fn guid(s: str, out: u64) {
+    let d1: u32 = hexn(s, 0, 8)
+    let d2: u32 = hexn(s, 9, 4)
+    let d3: u32 = hexn(s, 14, 4)
+    rt.st32(out, 0, d1)
+    rt.st8(out, 4, (d2 & 255 as u32) as u8)
+    rt.st8(out, 5, (d2 >> 8) as u8)
+    rt.st8(out, 6, (d3 & 255 as u32) as u8)
+    rt.st8(out, 7, (d3 >> 8) as u8)
+    rt.st8(out, 8, hexn(s, 19, 2) as u8)
+    rt.st8(out, 9, hexn(s, 21, 2) as u8)
+    var i: usize = 0
+    while i < 6 {
+        rt.st8(out, 10 + i, hexn(s, 24 + i * 2, 2) as u8)
+        i = i + 1
+    }
+}
+
+fn put16(p: *mut u8, i: usize, v: u32) {
+    *((p as u64 + i as u64) as *mut u8) = (v & 255 as u32) as u8
+    *((p as u64 + (i + 1) as u64) as *mut u8) = ((v >> 8) & 255 as u32) as u8
+}
+
+fn put32(p: *mut u8, i: usize, v: u32) {
+    put16(p, i, v & 65535 as u32)
+    put16(p, i + 2, v >> 16)
+}
+
+// CoInitializeEx(NULL, COINIT_MULTITHREADED); true when it must be balanced (S_OK or S_FALSE).
+// RPC_E_CHANGED_MODE (the thread already has a single threaded apartment) is no failure: COM works.
+fn com_begin(w: *mut Wasapi) -> bool {
+    if !init_ole() {
+        (*w).step = WS_COM
+        return false
+    }
+    let r: u64 = call2(G_COINIT, 0, 0)
+    (*w).com = hr_ok(r)
+    return true
+}
+
+fn com_create_enumerator(w: *mut Wasapi) -> bool {
+    var clsid: [u8; 16] = [0; 16]
+    var iid: [u8; 16] = [0; 16]
+    guid("BCDE0395-E52F-467C-8E3D-C4579291692E", (&clsid[0]) as u64)
+    guid("A95664D2-9614-4F35-A746-DE8DB63617E6", (&iid[0]) as u64)
+    var out: [u64; 1] = [0]
+    // CLSCTX_ALL = 0x17
+    let r: u64 = call5(G_COCREATE, (&clsid[0]) as u64, 0, 23 as u64, (&iid[0]) as u64, (&out[0]) as u64)
+    (*w).hr = (r & 4294967295 as u64) as u32
+    if !hr_ok(r) || out[0] == 0 {
+        (*w).step = WS_COM
+        return false
+    }
+    (*w).enumr = out[0]
+    return true
+}
+
+fn wasapi_is_open(w: *mut Wasapi) -> bool {
+    return (*w).open
+}
+
+// 0 = open worked, else the WS_* step that failed; with wasapi_hresult the HRESULT of that call.
+fn wasapi_error_step(w: *mut Wasapi) -> i32 {
+    return (*w).step
+}
+
+fn wasapi_hresult(w: *mut Wasapi) -> u32 {
+    return (*w).hr
+}
+
+fn wasapi_buffer_frames(w: *mut Wasapi) -> usize {
+    return (*w).buf_frames as usize
+}
+
+// Opens the default render device in shared mode: `rate` Hz, 1 or 2 channels, signed 16 bit,
+// an engine buffer of `buffer_ms` ms (the shared engine period is 10 ms: use >= 20; 0 = 40 ms).
+fn wasapi_open(app: str, rate: u32, channels: u32, buffer_ms: u32) -> Wasapi {
+    var w: Wasapi = wasapi_null()
+    w.channels = channels
+    w.rate = rate
+    if (channels != 1 as u32 && channels != 2 as u32) || rate < 8000 as u32 || rate > 192000 as u32 {
+        w.step = WS_FORMAT
+        return w
+    }
+    if !com_begin(&w) {
+        return w
+    }
+    if !com_create_enumerator(&w) {
+        wasapi_close(&w)
+        return w
+    }
+    // IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender = 0, eConsole = 0, &dev): slot 4
+    var pdev: [u64; 1] = [0]
+    var r: u64 = call4(method(w.enumr, 4), w.enumr, 0, 0, (&pdev[0]) as u64)
+    w.hr = (r & 4294967295 as u64) as u32
+    if !hr_ok(r) || pdev[0] == 0 {
+        w.step = WS_DEFAULT
+        wasapi_close(&w)
+        return w
+    }
+    w.dev = pdev[0]
+    // IMMDevice::Activate(IID_IAudioClient, CLSCTX_ALL, NULL, &client): slot 3
+    var iidc: [u8; 16] = [0; 16]
+    guid("1CB9AD4C-DBFA-4C32-B178-C2F568A703B2", (&iidc[0]) as u64)
+    var pcl: [u64; 1] = [0]
+    r = call5(method(w.dev, 3), w.dev, (&iidc[0]) as u64, 23 as u64, 0, (&pcl[0]) as u64)
+    w.hr = (r & 4294967295 as u64) as u32
+    if !hr_ok(r) || pcl[0] == 0 {
+        w.step = WS_ACTIVATE
+        wasapi_close(&w)
+        return w
+    }
+    w.client = pcl[0]
+    // WAVEFORMATEX: PCM, channels, rate, bytes per second, block align, 16 bit
+    var fmt: [u8; 18] = [0; 18]
+    put16(&fmt[0], 0, 1 as u32)
+    put16(&fmt[0], 2, channels)
+    put32(&fmt[0], 4, rate)
+    put32(&fmt[0], 8, rate * channels * 2 as u32)
+    put16(&fmt[0], 12, channels * 2 as u32)
+    put16(&fmt[0], 14, 16 as u32)
+    put16(&fmt[0], 16, 0 as u32)
+    var ms: u32 = buffer_ms
+    if ms == 0 as u32 {
+        ms = 40 as u32
+    }
+    // IAudioClient::Initialize(AUDCLNT_SHAREMODE_SHARED = 0, AUTOCONVERTPCM | SRC_DEFAULT_QUALITY,
+    //   hnsBufferDuration (100 ns units), hnsPeriodicity = 0, &fmt, NULL): slot 3
+    let flags: u64 = 2147483648 as u64 + 134217728 as u64
+    r = call7(method(w.client, 3), w.client, 0, flags, ms as u64 * 10000 as u64, 0, (&fmt[0]) as u64, 0)
+    w.hr = (r & 4294967295 as u64) as u32
+    if !hr_ok(r) {
+        w.step = WS_INIT
+        wasapi_close(&w)
+        return w
+    }
+    // GetBufferSize(&frames): slot 4
+    var bf: [u32; 2] = [0 as u32; 2]
+    r = call2(method(w.client, 4), w.client, (&bf[0]) as u64)
+    if !hr_ok(r) || bf[0] == 0 as u32 {
+        w.hr = (r & 4294967295 as u64) as u32
+        w.step = WS_SERVICE
+        wasapi_close(&w)
+        return w
+    }
+    w.buf_frames = bf[0]
+    // GetService(IID_IAudioRenderClient, &render): slot 14
+    var iidr: [u8; 16] = [0; 16]
+    guid("F294ACFC-3146-4483-A7BF-ADDCA7C260E2", (&iidr[0]) as u64)
+    var prc: [u64; 1] = [0]
+    r = call3(method(w.client, 14), w.client, (&iidr[0]) as u64, (&prc[0]) as u64)
+    w.hr = (r & 4294967295 as u64) as u32
+    if !hr_ok(r) || prc[0] == 0 {
+        w.step = WS_SERVICE
+        wasapi_close(&w)
+        return w
+    }
+    w.render = prc[0]
+    w.step = WS_NONE
+    w.open = true
+    return w
+}
+
+// Frames the engine buffer holds right now (GetCurrentPadding, slot 6); -1 = failed.
+fn padding(w: *mut Wasapi) -> i64 {
+    var pad: [u32; 2] = [0 as u32; 2]
+    let r: u64 = call2(method((*w).client, 6), (*w).client, (&pad[0]) as u64)
+    if !hr_ok(r) {
+        (*w).hr = (r & 4294967295 as u64) as u32
+        return -1
+    }
+    return pad[0] as i64
+}
+
+// Frames that fit right now without waiting.
+fn wasapi_writable(w: *mut Wasapi) -> usize {
+    if !(*w).open {
+        return 0
+    }
+    let p: i64 = padding(w)
+    if p < 0 || p >= (*w).buf_frames as i64 {
+        return 0
+    }
+    return ((*w).buf_frames as i64 - p) as usize
+}
+
+fn start_if_needed(w: *mut Wasapi) -> bool {
+    if (*w).started || (*w).paused {
+        return true
+    }
+    // IAudioClient::Start: slot 10
+    let r: u64 = call1(method((*w).client, 10), (*w).client)
+    if !hr_ok(r) {
+        (*w).hr = (r & 4294967295 as u64) as u32
+        return false
+    }
+    (*w).started = true
+    return true
+}
+
+// Takes `frames` frames; waits (polling every 2 ms) while the engine buffer is full.
+// false = the device is gone (AUDCLNT_E_DEVICE_INVALIDATED ...) or stuck for a minute.
+fn wasapi_write(w: *mut Wasapi, p: u64, frames: usize) -> bool {
+    if !(*w).open {
+        return false
+    }
+    let fb: usize = (*w).channels as usize * 2
+    var left: usize = frames
+    var at: u64 = p
+    var waited: u32 = 0
+    while left > 0 {
+        let pad: i64 = padding(w)
+        if pad < 0 {
+            (*w).open = false
+            return false
+        }
+        let avail: usize = ((*w).buf_frames as i64 - pad) as usize
+        if avail == 0 {
+            // a full buffer plays: make sure it does
+            if !start_if_needed(w) {
+                (*w).open = false
+                return false
+            }
+            time.sleep_ms(2 as u64)
+            waited = waited + 1 as u32
+            if waited > 30000 as u32 {
+                (*w).open = false
+                return false
+            }
+            continue
+        }
+        waited = 0
+        var n: usize = left
+        if n > avail {
+            n = avail
+        }
+        // IAudioRenderClient::GetBuffer(frames, &data): slot 3; ReleaseBuffer(frames, flags): slot 4
+        var pd: [u64; 1] = [0]
+        let r: u64 = call3(method((*w).render, 3), (*w).render, n as u64, (&pd[0]) as u64)
+        if !hr_ok(r) || pd[0] == 0 {
+            (*w).hr = (r & 4294967295 as u64) as u32
+            (*w).open = false
+            return false
+        }
+        rt.mem_copy(pd[0], at, n * fb)
+        let r2: u64 = call3(method((*w).render, 4), (*w).render, n as u64, 0)
+        if !hr_ok(r2) {
+            (*w).hr = (r2 & 4294967295 as u64) as u32
+            (*w).open = false
+            return false
+        }
+        at = at + (n * fb) as u64
+        left = left - n
+    }
+    // the data is in the buffer: let it play
+    if !start_if_needed(w) {
+        (*w).open = false
+        return false
+    }
+    return true
+}
+
+// Waits until everything written has been handed to the sound system and played.
+fn wasapi_drain(w: *mut Wasapi) -> bool {
+    if !(*w).open {
+        return false
+    }
+    if !start_if_needed(w) {
+        return false
+    }
+    var spins: u32 = 0
+    while spins < 30000 as u32 {
+        let pad: i64 = padding(w)
+        if pad < 0 {
+            return false
+        }
+        if pad == 0 {
+            // the last period is still on its way to the device
+            time.sleep_ms(30 as u64)
+            return true
+        }
+        if (*w).paused {
+            return false // would wait for ever
+        }
+        time.sleep_ms(2 as u64)
+        spins = spins + 1 as u32
+    }
+    return false
+}
+
+// Drops what is queued (a quick stop): Stop + Reset (slots 11, 12); the next write starts again.
+fn wasapi_flush(w: *mut Wasapi) -> bool {
+    if !(*w).open {
+        return false
+    }
+    call1(method((*w).client, 11), (*w).client)
+    let r: u64 = call1(method((*w).client, 12), (*w).client)
+    (*w).started = false
+    return hr_ok(r)
+}
+
+// Holds the playing (on) or lets it go on (off); the queued frames stay.
+fn wasapi_pause(w: *mut Wasapi, on: bool) -> bool {
+    if !(*w).open {
+        return false
+    }
+    if on {
+        if (*w).started {
+            let r: u64 = call1(method((*w).client, 11), (*w).client)
+            (*w).started = false
+            (*w).paused = true
+            return hr_ok(r)
+        }
+        (*w).paused = true
+        return true
+    }
+    (*w).paused = false
+    return start_if_needed(w)
+}
+
+// Latency write -> loudspeaker in microseconds as far as the engine knows: the stream latency
+// (IAudioClient::GetStreamLatency, slot 5) plus the frames still waiting in the buffer. -1 = failed.
+fn wasapi_latency_us(w: *mut Wasapi) -> i64 {
+    if !(*w).open {
+        return -1
+    }
+    var lat: [u64; 1] = [0]
+    let r: u64 = call2(method((*w).client, 5), (*w).client, (&lat[0]) as u64)
+    if !hr_ok(r) {
+        return -1
+    }
+    let pad: i64 = padding(w)
+    if pad < 0 {
+        return -1
+    }
+    return (lat[0] / 10 as u64) as i64 + pad * 1000000 / (*w).rate as i64
+}
+
+fn wasapi_close(w: *mut Wasapi) {
+    if (*w).started {
+        call1(method((*w).client, 11), (*w).client)
+        (*w).started = false
+    }
+    release((*w).render)
+    release((*w).client)
+    release((*w).dev)
+    release((*w).enumr)
+    (*w).render = 0
+    (*w).client = 0
+    (*w).dev = 0
+    (*w).enumr = 0
+    if (*w).com {
+        call1(G_COUNINIT, 0)
+        (*w).com = false
+    }
+    (*w).open = false
+}
+
+// Appends the friendly names of the active render endpoints to `out`, one per line;
+// returns how many there are (-1 = COM / the enumerator failed). The first one is not necessarily the default.
+fn wasapi_list(out: *mut rt.Buf) -> i32 {
+    var w: Wasapi = wasapi_null()
+    if !com_begin(&w) {
+        return -1
+    }
+    if !com_create_enumerator(&w) {
+        wasapi_close(&w)
+        return -1
+    }
+    // EnumAudioEndpoints(eRender = 0, DEVICE_STATE_ACTIVE = 1, &collection): slot 3
+    var pc: [u64; 1] = [0]
+    let r: u64 = call4(method(w.enumr, 3), w.enumr, 0, 1, (&pc[0]) as u64)
+    if !hr_ok(r) || pc[0] == 0 {
+        wasapi_close(&w)
+        return -1
+    }
+    let coll: u64 = pc[0]
+    // IMMDeviceCollection::GetCount(&n): slot 3; Item(i, &dev): slot 4
+    var cnt: [u32; 2] = [0 as u32; 2]
+    call2(method(coll, 3), coll, (&cnt[0]) as u64)
+    var key: [u8; 32] = [0; 32]
+    // PKEY_Device_FriendlyName = {a45c254e-df1c-4efd-8020-67d146a850e0}, 14
+    guid("A45C254E-DF1C-4EFD-8020-67D146A850E0", (&key[0]) as u64)
+    rt.st32((&key[0]) as u64, 4, 14 as u32)
+    var i: u32 = 0 as u32
+    var found: i32 = 0
+    while i < cnt[0] {
+        var pd: [u64; 1] = [0]
+        let r2: u64 = call3(method(coll, 4), coll, i as u64, (&pd[0]) as u64)
+        if hr_ok(r2) && pd[0] != 0 {
+            // IMMDevice::OpenPropertyStore(STGM_READ = 0, &store): slot 4; IPropertyStore::GetValue(&key, &pv): slot 5
+            var ps: [u64; 1] = [0]
+            let r3: u64 = call3(method(pd[0], 4), pd[0], 0, (&ps[0]) as u64)
+            var name_done: bool = false
+            if hr_ok(r3) && ps[0] != 0 {
+                var pv: [u64; 3] = [0; 3]
+                let r4: u64 = call3(method(ps[0], 5), ps[0], (&key[0]) as u64, (&pv[0]) as u64)
+                // PROPVARIANT: vt (u16) at 0, pwszVal at 8; VT_LPWSTR = 31
+                if hr_ok(r4) && (pv[0] & 65535 as u64) == 31 as u64 && pv[1] != 0 {
+                    var k: usize = 0
+                    while k < 255 {
+                        let ch: u16 = rt.ld16(pv[1], k)
+                        if ch == 0 as u16 {
+                            break
+                        }
+                        if ch < 128 as u16 {
+                            rt.buf_push(out, ch as u8)
+                        } else {
+                            rt.buf_push(out, 63 as u8)
+                        }
+                        k = k + 1
+                    }
+                    rt.buf_push(out, 10 as u8)
+                    name_done = true
+                    call1(G_PVCLEAR, (&pv[0]) as u64)
+                }
+                release(ps[0])
+            }
+            if !name_done {
+                let un: str = "(unnamed)\n"
+                rt.buf_push_bytes(out, un.p as u64, un.length())
+            }
+            found = found + 1
+            release(pd[0])
+        }
+        i = i + 1 as u32
+    }
+    release(coll)
+    wasapi_close(&w)
+    return found
+}

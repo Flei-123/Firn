@@ -1,0 +1,356 @@
+// expect_exit: 0
+// tests/2790_jobs_lockfree.fi -- the tests of 2764_jobs.fi on the LOCK-FREE pool (jobs.create_lf, J8):
+// parallel_for, groups, futures, nesting. Plus K: the ring itself (overflow into the locked queue,
+// futures through the ring, many tiny batches).
+//
+// A  parallel_for over 1,000,000 items: every index is visited exactly once
+//    and the result array equals the sequential one (disjoint chunks)
+// B  parallel_each: 3000 heavy items, results exact
+// C  200 futures (spawn), joined in reverse order, results exact
+// D  two groups with different bodies in flight at the same time
+// E  NESTED: a chunk waits for a parallel_for of its own, on 2 workers (no deadlock)
+// F  create(0): the same code path runs on the caller, same result
+// G  chunks that allocate in the garbage collected heap while collections are forced
+// H  stress: 3000 small parallel_for calls on 8 workers, each checked
+// I  create / destroy 40 times (thread table entries are reused)
+// J  the work is really shared: with 4 workers + caller, more than one thread ran chunks
+import std.rt
+import jobs.jobs
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND {
+        return jobs.worker_main(arg)
+    }
+    return 0
+}
+
+gc class Cell {
+    next: Gc[Cell],
+    value: u64,
+}
+
+static mut g_blk: u64 = 0
+static mut g_bad: u64 = 0
+static mut g_acc1: u64 = 0
+static mut g_acc2: u64 = 0
+static mut g_cnt: u64 = 0
+static mut g_total: u64 = 0
+
+fn xs(v: u64) -> u64 {
+    var x: u64 = v ^ 88172645463325252
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    return x
+}
+
+fn mix(i: u64) -> u64 {
+    return (i * 2654435761 + 12345) % 1000003
+}
+
+// A -------------------------------------------------------------------
+fn body_fill(ctx: u64, lo: u64, hi: u64) {
+    // ctx: [0] = results, [1] = visits
+    let res: u64 = rt.ld64(ctx, 0)
+    let vis: u64 = rt.ld64(ctx, 1)
+    var i: u64 = lo
+    while i < hi {
+        rt.st64(res, i as usize, mix(i))
+        __atomic_add((vis + i * 8) as *mut u64, 1)
+        i = i + 1
+    }
+}
+
+fn check_fill(n: u64, ctxa: u64) -> bool {
+    let res: u64 = rt.ld64(ctxa, 0)
+    let vis: u64 = rt.ld64(ctxa, 1)
+    var i: u64 = 0
+    while i < n {
+        if rt.ld64(res, i as usize) != mix(i) || rt.ld64(vis, i as usize) != 1 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn run_fill(j: *mut jobs.Jobs, n: u64, chunk: u64) -> bool {
+    let res: u64 = rt.heap_alloc(n as usize * 8)
+    let vis: u64 = rt.heap_alloc(n as usize * 8)
+    let ctxa: u64 = rt.heap_alloc(16)
+    rt.mem_set(res, 0 as u8, n as usize * 8)
+    rt.mem_set(vis, 0 as u8, n as usize * 8)
+    rt.st64(ctxa, 0, res)
+    rt.st64(ctxa, 1, vis)
+    jobs.parallel_for(j, 0, n, chunk, body_fill, ctxa)
+    let ok: bool = check_fill(n, ctxa)
+    rt.heap_free(res, n as usize * 8)
+    rt.heap_free(vis, n as usize * 8)
+    rt.heap_free(ctxa, 16)
+    return ok
+}
+
+// B -------------------------------------------------------------------
+fn body_heavy(ctx: u64, lo: u64, hi: u64) {
+    var i: u64 = lo
+    while i < hi {
+        var x: u64 = i
+        var k: u64 = 0
+        while k < 2000 {
+            x = xs(x)
+            k = k + 1
+        }
+        rt.st64(ctx, i as usize, x)
+        i = i + 1
+    }
+}
+
+fn heavy_ref(i: u64) -> u64 {
+    var x: u64 = i
+    var k: u64 = 0
+    while k < 2000 {
+        x = xs(x)
+        k = k + 1
+    }
+    return x
+}
+
+// C -------------------------------------------------------------------
+fn fut(arg: u64) -> u64 {
+    return heavy_ref(arg) ^ arg
+}
+
+// D -------------------------------------------------------------------
+fn body_add1(ctx: u64, lo: u64, hi: u64) {
+    var i: u64 = lo
+    while i < hi {
+        __atomic_add(ctx as *mut u64, i)
+        i = i + 1
+    }
+}
+
+fn body_add2(ctx: u64, lo: u64, hi: u64) {
+    var i: u64 = lo
+    while i < hi {
+        __atomic_add(ctx as *mut u64, i * 2)
+        i = i + 1
+    }
+}
+
+// E -------------------------------------------------------------------
+fn body_inner(ctx: u64, lo: u64, hi: u64) {
+    var i: u64 = lo
+    while i < hi {
+        __atomic_add(ctx as *mut u64, 1)
+        i = i + 1
+    }
+}
+
+fn body_outer(ctx: u64, lo: u64, hi: u64) {
+    var jj: jobs.Jobs = jobs.Jobs { blk: g_blk }
+    var i: u64 = lo
+    while i < hi {
+        jobs.parallel_for(&jj, 0, 100, 7, body_inner, ctx)
+        i = i + 1
+    }
+}
+
+// G -------------------------------------------------------------------
+fn mk(i: u64, next: Gc[Cell]) -> AllocError!Gc[Cell] {
+    let c: Gc[Cell] = try gc Cell { next: next, value: i }
+    return c
+}
+
+fn body_gc(ctx: u64, lo: u64, hi: u64) {
+    var i: u64 = lo
+    while i < hi {
+        var head: Gc[Cell] = gc_null[Cell]()
+        var k: u64 = 0
+        while k < 200 {
+            head = mk(i + k, head) catch gc_null[Cell]()
+            k = k + 1
+        }
+        var sum: u64 = 0
+        var cur: Gc[Cell] = head
+        var guard: u64 = 0
+        while cur != gc_null[Cell]() && guard < 1000 {
+            sum = sum + cur.value
+            cur = cur.next
+            guard = guard + 1
+        }
+        // sum of (i + k) for k in 0..200 = 200*i + 19900
+        if sum != 200 * i + 19900 {
+            __atomic_add((&g_bad) as *mut u64, 1)
+        }
+        if i % 16 == 0 {
+            gc_collect()
+        }
+        i = i + 1
+    }
+}
+
+// J -------------------------------------------------------------------
+fn body_tid(ctx: u64, lo: u64, hi: u64) {
+    var i: u64 = lo
+    while i < hi {
+        var k: u64 = 0
+        var x: u64 = i
+        while k < 20000 {
+            x = xs(x + 1)
+            k = k + 1
+        }
+        rt.st64(ctx, i as usize, thread_tid() + (x & 0))
+        i = i + 1
+    }
+}
+
+fn main() -> i32 {
+    var j: jobs.Jobs = jobs.create_lf(7)
+    if jobs.worker_count(&j) != 7 {
+        return 1
+    }
+    g_blk = j.blk
+
+    // A: several chunk sizes, including odd ones and chunk > range
+    if !run_fill(&j, 1000000, 997) { return 10 }
+    if !run_fill(&j, 12345, 1) { return 11 }
+    if !run_fill(&j, 999, 100000) { return 12 }
+    if !run_fill(&j, 1, 1) { return 13 }
+    if !run_fill(&j, 0, 5) { return 14 }
+
+    // B
+    let hn: u64 = 3000
+    let hres: u64 = rt.heap_alloc(hn as usize * 8)
+    jobs.parallel_each(&j, hn, body_heavy, hres)
+    var i: u64 = 0
+    while i < hn {
+        if rt.ld64(hres, i as usize) != heavy_ref(i) { return 20 }
+        i = i + 1
+    }
+    rt.heap_free(hres, hn as usize * 8)
+
+    // C
+    var tasks: [u64; 200] = [0; 200]
+    i = 0
+    while i < 200 {
+        tasks[i as usize] = jobs.spawn(&j, fut, i)
+        if tasks[i as usize] == 0 { return 30 }
+        i = i + 1
+    }
+    i = 200
+    while i > 0 {
+        i = i - 1
+        let r: u64 = jobs.join(&j, tasks[i as usize])
+        if r != (heavy_ref(i) ^ i) { return 31 }
+    }
+
+    // D
+    let g1: u64 = jobs.group_new(&j)
+    let g2: u64 = jobs.group_new(&j)
+    jobs.group_go(&j, g1, 0, 100000, 64, body_add1, (&g_acc1) as u64)
+    jobs.group_go(&j, g2, 0, 50000, 33, body_add2, (&g_acc2) as u64)
+    jobs.group_go(&j, g1, 0, 1000, 9, body_add1, (&g_acc1) as u64)
+    jobs.group_wait(&j, g2)
+    jobs.group_wait(&j, g1)
+    if jobs.group_pending(g1) != 0 || jobs.group_pending(g2) != 0 { return 40 }
+    jobs.group_free(&j, g1)
+    jobs.group_free(&j, g2)
+    // sum 0..99999 + sum 0..999 ; 2 * sum 0..49999
+    if g_acc1 != 4999950000 + 499500 { return 41 }
+    if g_acc2 != 2 * 1249975000 { return 42 }
+
+    jobs.destroy(&j)
+    if j.blk != 0 { return 2 }
+
+    // E: nested on 2 workers
+    var j2: jobs.Jobs = jobs.create_lf(2)
+    g_blk = j2.blk
+    jobs.parallel_for(&j2, 0, 64, 1, body_outer, (&g_cnt) as u64)
+    if g_cnt != 6400 { return 50 }
+    jobs.destroy(&j2)
+
+    // F: no workers
+    var j0: jobs.Jobs = jobs.create_lf(0)
+    if !run_fill(&j0, 54321, 77) { return 60 }
+    let t0: u64 = jobs.spawn(&j0, fut, 9)
+    if jobs.join(&j0, t0) != (heavy_ref(9) ^ 9) { return 61 }
+    jobs.destroy(&j0)
+
+    // G: collector running while chunks allocate
+    var j3: jobs.Jobs = jobs.create_lf(4)
+    jobs.parallel_for(&j3, 0, 2000, 8, body_gc, 0)
+    if g_bad != 0 { return 70 }
+
+    // J: more than one thread ran chunks
+    let tn: u64 = 64
+    let tres: u64 = rt.heap_alloc(tn as usize * 8)
+    jobs.parallel_for(&j3, 0, tn, 1, body_tid, tres)
+    var distinct: u64 = 0
+    i = 0
+    while i < tn {
+        let t: u64 = rt.ld64(tres, i as usize)
+        var seen: bool = false
+        var k: u64 = 0
+        while k < i {
+            if rt.ld64(tres, k as usize) == t { seen = true }
+            k = k + 1
+        }
+        if !seen { distinct = distinct + 1 }
+        i = i + 1
+    }
+    rt.heap_free(tres, tn as usize * 8)
+    if distinct < 2 { return 80 }
+    jobs.destroy(&j3)
+
+    // H: stress
+    var j4: jobs.Jobs = jobs.create_lf(8)
+    var round: u64 = 0
+    while round < 3000 {
+        g_total = 0
+        let n: u64 = 1 + (round * 37) % 500
+        let chunk: u64 = 1 + (round * 11) % 40
+        jobs.parallel_for(&j4, 0, n, chunk, body_add1, (&g_total) as u64)
+        if g_total != n * (n - 1) / 2 { return 90 }
+        round = round + 1
+    }
+    jobs.destroy(&j4)
+
+    // I: create / destroy
+    round = 0
+    while round < 40 {
+        var j5: jobs.Jobs = jobs.create_lf(16)
+        if jobs.worker_count(&j5) != 16 { return 100 }
+        g_total = 0
+        jobs.parallel_for(&j5, 0, 1000, 10, body_add1, (&g_total) as u64)
+        if g_total != 499500 { return 101 }
+        jobs.destroy(&j5)
+        round = round + 1
+    }
+
+    // K: the ring itself: a batch of more than RING/2 chunks (locked queue), a batch that overflows the full ring, futures through the ring
+    var j6: jobs.Jobs = jobs.create_lf(4)
+    if !jobs.lockfree(&j6) { return 110 }
+    g_total = 0
+    jobs.parallel_for(&j6, 0, 20000, 1, body_add1, (&g_total) as u64)
+    if g_total != 20000 * 19999 / 2 { return 111 }
+    g_total = 0
+    let ga: u64 = jobs.group_new(&j6)
+    let gb: u64 = jobs.group_new(&j6)
+    jobs.group_go(&j6, ga, 0, 500, 1, body_add1, (&g_total) as u64)
+    jobs.group_go(&j6, gb, 500, 1000, 1, body_add1, (&g_total) as u64)
+    jobs.group_wait(&j6, ga)
+    jobs.group_wait(&j6, gb)
+    jobs.group_free(&j6, ga)
+    jobs.group_free(&j6, gb)
+    if g_total != 1000 * 999 / 2 { return 112 }
+    var fs: u64 = 0
+    var q: u64 = 0
+    while q < 3000 {
+        let h: u64 = jobs.spawn(&j6, fut, q)
+        fs = fs + (jobs.join(&j6, h) ^ heavy_ref(q) ^ q)
+        q = q + 1
+    }
+    if fs != 0 { return 113 }
+    jobs.destroy(&j6)
+    return 0
+}

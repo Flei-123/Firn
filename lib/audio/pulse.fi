@@ -27,7 +27,7 @@
 // `m` channel map, `v` volume, `P` property list, `x` bytes, `0`/`1` booleans).
 // AUTH (command 8, protocol version and the 256 octet cookie), SET_CLIENT_NAME
 // (9), CREATE_PLAYBACK_STREAM (3), DRAIN_PLAYBACK_STREAM (12),
-// DELETE_PLAYBACK_STREAM (4). The server grants room with REQUEST (61, bytes);
+// DELETE_PLAYBACK_STREAM (4), GET_PLAYBACK_LATENCY (14, `pulse_latency`). The server grants room with REQUEST (61, bytes);
 // audio goes out as packets on the stream's channel. `pulse_write` honours
 // that grant (it blocks until the server has asked for more), which is the
 // whole flow control.
@@ -39,7 +39,8 @@
 //     samples by `audio.pcm` before they are sent (identical on every
 //     back end and testable bit for bit).
 // P2  No shared memory transport (memfd/SHM): the samples travel through the
-//     socket. Fine for music; not for low latency work.
+//     socket. Fine for music and, with `pulse_open_stream_ex` + `adjust_latency`, for
+//     SFX streams of 15-20 ms (measured, docs/AUDIO.md "Latency"); not for sub-10 ms work.
 // P3  The default server is found as PulseAudio's own client library finds it:
 //     `PULSE_SERVER` (`unix:/path` or a path), else `$XDG_RUNTIME_DIR/pulse/native`,
 //     else `/run/user/<uid>/pulse/native`, else `/var/run/pulse/native`. TCP
@@ -59,8 +60,10 @@ import std.env
 import net.unix
 
 export {
-    Pulse, pulse_null, pulse_flush, pulse_cork, pulse_connect, pulse_connect_path, pulse_is_open, pulse_open_stream, pulse_write,
+    Pulse, PulseLatency, pulse_null, pulse_flush, pulse_cork, pulse_connect, pulse_connect_path, pulse_is_open, pulse_open_stream, pulse_write,
     pulse_writable, pulse_drain, pulse_close, pulse_stream_open, pulse_error,
+    pulse_open_stream_ex, pulse_latency, pulse_latency_info, pulse_tlength, pulse_prebuf, pulse_minreq, pulse_maxlength,
+    pulse_sink_latency, pulse_queued,
     PA_OK, PA_NO_SERVER, PA_AUTH, PA_PROTOCOL, PA_STREAM, PA_KILLED, PA_IO,
 }
 
@@ -79,6 +82,7 @@ const CMD_DELETE_PLAYBACK_STREAM: u32 = 4
 const CMD_AUTH: u32 = 8
 const CMD_SET_CLIENT_NAME: u32 = 9
 const CMD_DRAIN_PLAYBACK_STREAM: u32 = 12
+const CMD_GET_PLAYBACK_LATENCY: u32 = 14
 const CMD_CORK_PLAYBACK_STREAM: u32 = 41
 const CMD_FLUSH_PLAYBACK_STREAM: u32 = 42
 const CMD_REQUEST: u32 = 61
@@ -87,6 +91,15 @@ const CMD_PLAYBACK_STREAM_KILLED: u32 = 64
 const VERSION: u32 = 15
 const CONTROL: u32 = 4294967295
 const CHUNK: usize = 16384
+
+// What GET_PLAYBACK_LATENCY reports (see pulse_latency_info).
+struct PulseLatency {
+    sink_us: i64,
+    queued: i64,
+    playing: i64,
+    read_index: i64,
+    underrun_us: i64,
+}
 
 struct Pulse {
     fd: i32,
@@ -100,13 +113,18 @@ struct Pulse {
     channels: u32,
     err: i32,
     pk: rt.Buf, // scratch for incoming payloads
+    maxlength: u32, // buffer attributes the server really granted (octets), 0 = unknown
+    tlength: u32,
+    prebuf: u32,
+    minreq: u32,
+    sink_us: i64, // the sink's configured latency in microseconds (protocol 13+), -1 = unknown
 }
 
 // A connection that is not one (what a `Pulse` holds before `pulse_connect`).
 fn pulse_null() -> Pulse {
     return Pulse { fd: -1, tag: 0 as u32, version: 0 as u32, chan: 0 as u32, stream: 0 as u32,
         has_stream: false, requested: 0, rate: 0 as u32, channels: 0 as u32, err: PA_NO_SERVER,
-        pk: rt.buf_new() }
+        pk: rt.buf_new(), maxlength: 0 as u32, tlength: 0 as u32, prebuf: 0 as u32, minreq: 0 as u32, sink_us: -1 }
 }
 
 fn pulse_is_open(p: *mut Pulse) -> bool {
@@ -551,8 +569,73 @@ fn connect_to(p: *mut Pulse, path: str, app: str) -> bool {
     return true
 }
 
-// Creates the playback stream (S16LE, `rate` Hz, 1 or 2 channels).
+// Creates the playback stream (S16LE, `rate` Hz, 1 or 2 channels) with the
+// defaults of a music player: a quarter second of buffer, the server's choice for the rest.
 fn pulse_open_stream(p: *mut Pulse, rate: u32, channels: u32, media_name: str) -> bool {
+    return pulse_open_stream_ex(p, rate, channels, media_name, "music", 250, -1, -1, false)
+}
+
+fn ms_bytes(rate: u32, channels: u32, ms: i64) -> u32 {
+    if ms < 0 {
+        return CONTROL // "server default"
+    }
+    return (rate as u64 * ms as u64 / 1000) as u32 * channels * 2 as u32
+}
+
+// Skips a string item ('t' ... NUL or 'N'); false when it is neither.
+fn skip_str(p: u64, n: usize, pos: *mut usize) -> bool {
+    if *pos >= n {
+        return false
+    }
+    let t: u8 = rt.ld8(p, *pos)
+    if t == 78 as u8 {
+        *pos = *pos + 1
+        return true
+    }
+    if t != 116 as u8 {
+        return false
+    }
+    var i: usize = *pos + 1
+    while i < n && rt.ld8(p, i) != 0 as u8 {
+        i = i + 1
+    }
+    if i >= n {
+        return false
+    }
+    *pos = i + 1
+    return true
+}
+
+// Reads a 64 bit item (`tag` is 'r' s64, 'U' usec or 'R' u64: tag octet + hi + lo).
+fn rd_64(p: u64, n: usize, pos: *mut usize, ok: *mut bool, tag: u8) -> i64 {
+    if *pos + 9 > n || rt.ld8(p, *pos) != tag {
+        *ok = false
+        return -1
+    }
+    let hi: u64 = get_be32(p + (*pos + 1) as u64) as u64
+    let lo: u64 = get_be32(p + (*pos + 5) as u64) as u64
+    *pos = *pos + 9
+    return ((hi << 32) | lo) as i64
+}
+
+// Skips a timeval item ('T' + sec + usec).
+fn skip_timeval(p: u64, n: usize, pos: *mut usize, ok: *mut bool) {
+    if *pos + 9 > n || rt.ld8(p, *pos) != 84 as u8 {
+        *ok = false
+        return
+    }
+    *pos = *pos + 9
+}
+
+// Like `pulse_open_stream`, with the buffer attributes the caller wants.
+//   tlength_ms  target length of the server side buffer (-1 = server default, about 2 s).
+//               With `adjust_latency` the sink's own buffer is shrunk to match it.
+//   prebuf_ms   how much must be queued before playing starts (-1 = tlength, 0 = start at once).
+//   minreq_ms   the smallest grant the server makes (-1 = server default).
+//   role        "music", "game", "event", "phone" ... (stream restore and routing policy).
+// The attributes the server really granted are read back (`pulse_tlength` ...).
+fn pulse_open_stream_ex(p: *mut Pulse, rate: u32, channels: u32, media_name: str, role: str, tlength_ms: i64,
+    prebuf_ms: i64, minreq_ms: i64, adjust_latency: bool) -> bool {
     if (*p).fd < 0 || (*p).has_stream || (channels != 1 as u32 && channels != 2 as u32)
     || rate < 8000 as u32 || rate > 192000 as u32 {
         return false
@@ -567,10 +650,9 @@ fn pulse_open_stream(p: *mut Pulse, rate: u32, channels: u32, media_name: str) -
     ts_null(&b) // sink name
     ts_u32(&b, CONTROL) // maxlength
     ts_bool(&b, false) // corked
-    // tlength: a quarter of a second keeps `drain` short and the grant steady
-    ts_u32(&b, rate * channels * 2 / 4)
-    ts_u32(&b, CONTROL) // prebuf
-    ts_u32(&b, CONTROL) // minreq
+    ts_u32(&b, ms_bytes(rate, channels, tlength_ms))
+    ts_u32(&b, ms_bytes(rate, channels, prebuf_ms))
+    ts_u32(&b, ms_bytes(rate, channels, minreq_ms))
     ts_u32(&b, 0 as u32) // sync id
     ts_cvolume(&b, channels, 65536 as u32)
     // v12: no_remap, no_remix, fix_format, fix_rate, fix_channels, no_move, variable_rate
@@ -583,8 +665,8 @@ fn pulse_open_stream(p: *mut Pulse, rate: u32, channels: u32, media_name: str) -
     ts_bool(&b, false)
     // v13: muted, adjust_latency, proplist
     ts_bool(&b, false)
-    ts_bool(&b, false)
-    ts_proplist2(&b, "media.name", media_name, "media.role", "music")
+    ts_bool(&b, adjust_latency)
+    ts_proplist2(&b, "media.name", media_name, "media.role", role)
     // v14: volume_set, early_requests
     ts_bool(&b, true)
     ts_bool(&b, false)
@@ -612,6 +694,46 @@ fn pulse_open_stream(p: *mut Pulse, rate: u32, channels: u32, media_name: str) -
         (*p).err = PA_PROTOCOL
         return false
     }
+    // the attributes the server granted (protocol 9+), then the sink description (12+, 13+)
+    (*p).maxlength = 0 as u32
+    (*p).tlength = 0 as u32
+    (*p).prebuf = 0 as u32
+    (*p).minreq = 0 as u32
+    (*p).sink_us = -1
+    if (*p).version >= 9 as u32 {
+        var ok2: bool = true
+        let ml: u32 = rd_u32(base, n, &pos, &ok2)
+        let tl: u32 = rd_u32(base, n, &pos, &ok2)
+        let pb: u32 = rd_u32(base, n, &pos, &ok2)
+        let mr: u32 = rd_u32(base, n, &pos, &ok2)
+        if ok2 {
+            (*p).maxlength = ml
+            (*p).tlength = tl
+            (*p).prebuf = pb
+            (*p).minreq = mr
+            if (*p).version >= 12 as u32 {
+                // sample spec 'a' (7), channel map 'm' (2 + channels), device index, device name, suspended
+                if pos + 7 <= n && rt.ld8(base, pos) == 97 as u8 {
+                    pos = pos + 7
+                    if pos + 2 <= n && rt.ld8(base, pos) == 109 as u8 {
+                        pos = pos + 2 + rt.ld8(base, pos + 1) as usize
+                        var ok3: bool = true
+                        rd_u32(base, n, &pos, &ok3) // sink index
+                        if ok3 && skip_str(base, n, &pos) && pos < n {
+                            pos = pos + 1 // suspended
+                            if (*p).version >= 13 as u32 {
+                                var ok4: bool = true
+                                let us: i64 = rd_64(base, n, &pos, &ok4, 85 as u8)
+                                if ok4 {
+                                    (*p).sink_us = us
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     (*p).chan = ch
     (*p).stream = idx
     (*p).requested = req as usize
@@ -619,6 +741,111 @@ fn pulse_open_stream(p: *mut Pulse, rate: u32, channels: u32, media_name: str) -
     (*p).channels = channels
     (*p).has_stream = true
     return true
+}
+
+// Granted buffer attributes in octets (0 = the server did not say); see pulse_open_stream_ex.
+fn pulse_tlength(p: *mut Pulse) -> usize {
+    return (*p).tlength as usize
+}
+
+fn pulse_prebuf(p: *mut Pulse) -> usize {
+    return (*p).prebuf as usize
+}
+
+fn pulse_minreq(p: *mut Pulse) -> usize {
+    return (*p).minreq as usize
+}
+
+fn pulse_maxlength(p: *mut Pulse) -> usize {
+    return (*p).maxlength as usize
+}
+
+// The sink's configured latency in microseconds as announced at stream creation (-1 = unknown).
+fn pulse_sink_latency(p: *mut Pulse) -> i64 {
+    return (*p).sink_us
+}
+
+// GET_PLAYBACK_LATENCY (the native protocol's pa_stream_get_latency). On success fills
+//   sink_us     = sink latency in us (device side, as reported by the server),
+//   queued      = write index - read index in octets (queued on the server, not yet played),
+//   playing     = 1 when the stream is playing, 0 when it is waiting for prebuf or has run dry,
+//   read_index  = octets played so far,
+//   underrun_us = microseconds the stream has been starving (underrun_for, protocol 13+, else 0)
+// and returns the latency from `write` to the speaker in us: queued/rate + sink latency.
+// -1 = the call failed.
+fn pulse_latency_info(p: *mut Pulse, out: *mut PulseLatency) -> i64 {
+    if (*p).fd < 0 || !(*p).has_stream {
+        return -1
+    }
+    var b: rt.Buf = rt.buf_new()
+    let tag: u32 = next_tag(p)
+    ts_u32(&b, CMD_GET_PLAYBACK_LATENCY)
+    ts_u32(&b, tag)
+    ts_u32(&b, (*p).chan)
+    rt.buf_push(&b, 84 as u8) // 'T': a timeval, echoed back (we do not need it)
+    put_be32(&b, 0 as u32)
+    put_be32(&b, 0 as u32)
+    let sent: bool = send_packet(p, CONTROL, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+    var start: usize = 0
+    if !sent || !wait_reply(p, tag, &start) {
+        return -1
+    }
+    let base: u64 = rt.buf_ptr(&(*p).pk)
+    let n: usize = rt.buf_len(&(*p).pk)
+    var pos: usize = start
+    var ok: bool = true
+    let sink_us: i64 = rd_64(base, n, &pos, &ok, 85 as u8)
+    rd_64(base, n, &pos, &ok, 85 as u8) // source latency
+    if !ok || pos >= n {
+        return -1
+    }
+    var playing: i64 = 0
+    if rt.ld8(base, pos) == 49 as u8 {
+        playing = 1
+    }
+    pos = pos + 1
+    skip_timeval(base, n, &pos, &ok)
+    skip_timeval(base, n, &pos, &ok)
+    let wi: i64 = rd_64(base, n, &pos, &ok, 114 as u8)
+    let ri: i64 = rd_64(base, n, &pos, &ok, 114 as u8)
+    if !ok {
+        return -1
+    }
+    var under: i64 = 0
+    if (*p).version >= 13 as u32 {
+        var ok5: bool = true
+        let u: i64 = rd_64(base, n, &pos, &ok5, 82 as u8)
+        if ok5 {
+            under = u
+        }
+    }
+    var queued: i64 = wi - ri
+    if queued < 0 {
+        queued = 0
+    }
+    (*out).sink_us = sink_us
+    (*out).queued = queued
+    (*out).playing = playing
+    (*out).read_index = ri
+    (*out).underrun_us = under
+    let frame: i64 = (*p).channels as i64 * 2
+    return queued * 1000000 / (frame * (*p).rate as i64) + sink_us
+}
+
+// Latency in microseconds (-1 = failed), see pulse_latency_info.
+fn pulse_latency(p: *mut Pulse) -> i64 {
+    var t: PulseLatency = PulseLatency { sink_us: 0, queued: 0, playing: 0, read_index: 0, underrun_us: 0 }
+    return pulse_latency_info(p, &t)
+}
+
+// Octets queued on the server right now (written, not yet played); -1 = failed.
+fn pulse_queued(p: *mut Pulse) -> i64 {
+    var t: PulseLatency = PulseLatency { sink_us: 0, queued: 0, playing: 0, read_index: 0, underrun_us: 0 }
+    if pulse_latency_info(p, &t) < 0 {
+        return -1
+    }
+    return t.queued
 }
 
 // Drains control packets that are already there, then reports how many octets
