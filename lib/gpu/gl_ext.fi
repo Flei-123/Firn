@@ -1,0 +1,662 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/gl_ext.fi -- gpu.gl_ext: additions to gpu.gl33 (docs/GPU.md "Renderer building blocks").
+//
+//     import gpu.gl_ext
+//     var x: gl_ext.GlX = gl_ext.glx_new()
+//     if gl_ext.glx_load(&c, &x) { ... }          // loads gl33 (x.g) + the extra functions below
+//
+// What is here: the shared handle `GlX` (embeds a gl33.Gl, own function table), feature probe (GL version, extension
+// list, limits, "available" flags), integer uniforms (2i/3i/4i), uniform blocks (UBO, std140 helpers), shader storage
+// buffers (only on >= 4.3 / ARB_shader_storage_buffer_object, else a clean "not available"), instanced draws, indirect
+// draws (single always on >= 4.0, multi only on >= 4.3 / ARB_multi_draw_indirect), and the generic call helpers gx1..gx9
+// the sibling files (gl_tex, gl_fbo, gl_query, gl_prog) use. gl33.fi itself is untouched.
+//
+// Every optional function is looked up only when the probe says it can exist and the matching flag is set in `GlX`;
+// calling a wrapper whose feature is missing returns false / 0 and sets no GL error. TESTED = ran on Mesa llvmpipe
+// (GL 4.5 core context); compiled-only features are named in docs/GPU.md. Call from the context's thread.
+
+import std.rt
+import std.dynlib
+import gpu.glctx
+import gpu.gl33
+
+export {
+    GlX, glx_new, glx_load, glx_has_ext, glx_at_least, glx_version_text,
+    gx1, gx2, gx3, gx4, gx5, gx7, gx9, gx10, gxi, gx_fb, gx_m32, gx_fn_ok,
+    glx_u2i, glx_u3i, glx_u4i, glx_get_ui, glx_get_uf,
+    glx_block_index, glx_block_binding, glx_block_size, glx_buf_base, glx_buf_range,
+    glx_ubo_new, glx_ubo_update, std140_align, std140_vec4_count,
+    glx_ssbo_ok, glx_ssbo_new, glx_ssbo_bind, glx_ssbo_block_binding, glx_ssbo_update, glx_buffer_read,
+    glx_attrib_divisor, glx_draw_elements_instanced, glx_draw_arrays_instanced,
+    glx_indirect_ok, glx_multi_indirect_ok, glx_indirect_buffer, glx_draw_elements_indirect,
+    glx_multi_draw_elements_indirect, glx_cmd_write,
+    GL_UNIFORM_BUFFER, GL_SHADER_STORAGE_BUFFER, GL_DRAW_INDIRECT_BUFFER, GL_EXTENSIONS, GL_NUM_EXTENSIONS,
+    GL_MAX_TEXTURE_SIZE, GL_MAX_ARRAY_TEXTURE_LAYERS, GL_MAX_COLOR_ATTACHMENTS, GL_MAX_DRAW_BUFFERS, GL_MAX_SAMPLES,
+    GL_MAX_UNIFORM_BLOCK_SIZE, GL_UNIFORM_BLOCK_DATA_SIZE, GL_MAX_ELEMENTS_VERTICES, GL_TRIANGLE_STRIP,
+    GL_LINES, GL_POINTS, GL_TRIANGLE_FAN, GL_FUNC_COUNT,
+    X_GET_STRINGI, X_GET_FLOATV, X_UNIFORM2I, X_UNIFORM3I, X_UNIFORM4I, X_GET_UBLOCK_INDEX, X_UBLOCK_BINDING, X_BIND_BUFFER_BASE, X_BIND_BUFFER_RANGE, X_GET_ACTIVE_UBLOCKIV, X_DRAW_ELEMENTS_INST, X_DRAW_ARRAYS_INST, X_ATTRIB_DIVISOR, X_DRAW_ELEMENTS_INDIRECT, X_MULTI_DRAW_ELEMENTS_INDIRECT, X_SSBO_BLOCK_BINDING, X_TEX_IMAGE3D, X_TEX_SUB_IMAGE3D, X_TEX_PARAMETERF, X_GET_TEX_IMAGE, X_GET_TEX_PARAMETERIV, X_GET_TEX_PARAMETERFV, X_DRAW_BUFFERS, X_READ_BUFFER, X_RENDERBUFFER_STORAGE_MS, X_BLIT_FRAMEBUFFER, X_GEN_QUERIES, X_DELETE_QUERIES, X_BEGIN_QUERY, X_END_QUERY, X_QUERY_COUNTER, X_GET_QUERY_OBJECTIV, X_GET_QUERY_OBJECTUI64V, X_GET_QUERY_OBJECTUIV, X_FRAMEBUFFER_TEXTURE_LAYER, X_TEX_IMAGE2D_MS, X_GET_UNIFORMIV, X_GET_UNIFORMFV, X_BIND_TEXTURE, X_TEX_PARAMETERI, X_TEX_IMAGE2D, X_TEX_SUB_IMAGE2D, X_GEN_TEXTURES, X_DELETE_TEXTURES, X_ACTIVE_TEXTURE, X_GENERATE_MIPMAP, X_GEN_FRAMEBUFFERS, X_BIND_FRAMEBUFFER, X_DELETE_FRAMEBUFFERS, X_FRAMEBUFFER_TEXTURE2D, X_FRAMEBUFFER_RENDERBUFFER, X_CHECK_FRAMEBUFFER_STATUS, X_GEN_RENDERBUFFERS, X_BIND_RENDERBUFFER, X_RENDERBUFFER_STORAGE, X_DELETE_RENDERBUFFERS, X_GEN_BUFFERS, X_BIND_BUFFER, X_BUFFER_DATA, X_BUFFER_SUB_DATA, X_DELETE_BUFFERS, X_GET_BUFFER_SUB_DATA, X_USE_PROGRAM, X_GET_INTEGERV, X_GET_ERROR, X_VIEWPORT, X_CLEAR, X_CLEAR_COLOR, X_DRAW_ARRAYS, X_DISABLE, X_ENABLE, X_CLEAR_BUFFERFV, X_READ_PIXELS, X_PIXEL_STOREI, X_GET_FRAMEBUFFER_ATTACHMENT_IV, X_COUNT,
+}
+
+const GL_UNIFORM_BUFFER: u32 = 0x8A11
+const GL_SHADER_STORAGE_BUFFER: u32 = 0x90D2
+const GL_DRAW_INDIRECT_BUFFER: u32 = 0x8F3F
+const GL_EXTENSIONS: u32 = 0x1F03
+const GL_NUM_EXTENSIONS: u32 = 0x821D
+const GL_MAX_TEXTURE_SIZE: u32 = 0xD33
+const GL_MAX_ARRAY_TEXTURE_LAYERS: u32 = 0x88FF
+const GL_MAX_COLOR_ATTACHMENTS: u32 = 0x8CDF
+const GL_MAX_DRAW_BUFFERS: u32 = 0x8824
+const GL_MAX_SAMPLES: u32 = 0x8D57
+const GL_MAX_UNIFORM_BLOCK_SIZE: u32 = 0x8A30
+const GL_UNIFORM_BLOCK_DATA_SIZE: u32 = 0x8A40
+const GL_MAX_ELEMENTS_VERTICES: u32 = 0x80E8
+const GL_TRIANGLE_STRIP: u32 = 5
+const GL_TRIANGLE_FAN: u32 = 6
+const GL_LINES: u32 = 1
+const GL_POINTS: u32 = 0
+
+// ---- function slots (own table; gl33 keeps its 71) ---------------------------------------------------------
+const X_GET_STRINGI: usize = 0
+const X_GET_FLOATV: usize = 1
+const X_UNIFORM2I: usize = 2
+const X_UNIFORM3I: usize = 3
+const X_UNIFORM4I: usize = 4
+const X_GET_UBLOCK_INDEX: usize = 5
+const X_UBLOCK_BINDING: usize = 6
+const X_BIND_BUFFER_BASE: usize = 7
+const X_BIND_BUFFER_RANGE: usize = 8
+const X_GET_ACTIVE_UBLOCKIV: usize = 9
+const X_DRAW_ELEMENTS_INST: usize = 10
+const X_DRAW_ARRAYS_INST: usize = 11
+const X_ATTRIB_DIVISOR: usize = 12
+const X_DRAW_ELEMENTS_INDIRECT: usize = 13
+const X_MULTI_DRAW_ELEMENTS_INDIRECT: usize = 14
+const X_SSBO_BLOCK_BINDING: usize = 15
+const X_TEX_IMAGE3D: usize = 16
+const X_TEX_SUB_IMAGE3D: usize = 17
+const X_TEX_PARAMETERF: usize = 18
+const X_GET_TEX_IMAGE: usize = 19
+const X_GET_TEX_PARAMETERIV: usize = 20
+const X_GET_TEX_PARAMETERFV: usize = 21
+const X_DRAW_BUFFERS: usize = 22
+const X_READ_BUFFER: usize = 23
+const X_RENDERBUFFER_STORAGE_MS: usize = 24
+const X_BLIT_FRAMEBUFFER: usize = 25
+const X_GEN_QUERIES: usize = 26
+const X_DELETE_QUERIES: usize = 27
+const X_BEGIN_QUERY: usize = 28
+const X_END_QUERY: usize = 29
+const X_QUERY_COUNTER: usize = 30
+const X_GET_QUERY_OBJECTIV: usize = 31
+const X_GET_QUERY_OBJECTUI64V: usize = 32
+const X_GET_QUERY_OBJECTUIV: usize = 33
+const X_FRAMEBUFFER_TEXTURE_LAYER: usize = 34
+const X_TEX_IMAGE2D_MS: usize = 35
+const X_GET_UNIFORMIV: usize = 36
+const X_GET_UNIFORMFV: usize = 37
+const X_BIND_TEXTURE: usize = 38
+const X_TEX_PARAMETERI: usize = 39
+const X_TEX_IMAGE2D: usize = 40
+const X_TEX_SUB_IMAGE2D: usize = 41
+const X_GEN_TEXTURES: usize = 42
+const X_DELETE_TEXTURES: usize = 43
+const X_ACTIVE_TEXTURE: usize = 44
+const X_GENERATE_MIPMAP: usize = 45
+const X_GEN_FRAMEBUFFERS: usize = 46
+const X_BIND_FRAMEBUFFER: usize = 47
+const X_DELETE_FRAMEBUFFERS: usize = 48
+const X_FRAMEBUFFER_TEXTURE2D: usize = 49
+const X_FRAMEBUFFER_RENDERBUFFER: usize = 50
+const X_CHECK_FRAMEBUFFER_STATUS: usize = 51
+const X_GEN_RENDERBUFFERS: usize = 52
+const X_BIND_RENDERBUFFER: usize = 53
+const X_RENDERBUFFER_STORAGE: usize = 54
+const X_DELETE_RENDERBUFFERS: usize = 55
+const X_GEN_BUFFERS: usize = 56
+const X_BIND_BUFFER: usize = 57
+const X_BUFFER_DATA: usize = 58
+const X_BUFFER_SUB_DATA: usize = 59
+const X_DELETE_BUFFERS: usize = 60
+const X_GET_BUFFER_SUB_DATA: usize = 61
+const X_USE_PROGRAM: usize = 62
+const X_GET_INTEGERV: usize = 63
+const X_GET_ERROR: usize = 64
+const X_VIEWPORT: usize = 65
+const X_CLEAR: usize = 66
+const X_CLEAR_COLOR: usize = 67
+const X_DRAW_ARRAYS: usize = 68
+const X_DISABLE: usize = 69
+const X_ENABLE: usize = 70
+const X_CLEAR_BUFFERFV: usize = 71
+const X_READ_PIXELS: usize = 72
+const X_PIXEL_STOREI: usize = 73
+const X_GET_FRAMEBUFFER_ATTACHMENT_IV: usize = 74
+const X_COUNT: usize = 75
+
+const GL_FUNC_COUNT: usize = 75
+
+struct GlX {
+    ok: bool,
+    g: gl33.Gl, // the base 3.3 table (state, buffers, VAO, textures, FBO, shaders, uniforms, draw, read back)
+    fns: [u64; 128],
+    args: [u64; 16],
+    tmp: [u32; 16],
+    major: i32,
+    minor: i32,
+    missing: i32, // optional functions that were looked up and not found (informational)
+    n_ext: i32,
+    // feature flags (set by glx_load)
+    has_aniso: bool, // GL_EXT_texture_filter_anisotropic
+    has_ubo: bool, // always true on >= 3.1
+    has_ssbo: bool, // >= 4.3 or ARB_shader_storage_buffer_object
+    has_indirect: bool, // >= 4.0 or ARB_draw_indirect
+    has_multi_indirect: bool, // >= 4.3 or ARB_multi_draw_indirect
+    has_timer: bool, // >= 3.3 or ARB_timer_query
+    has_msaa: bool, // GL_MAX_SAMPLES >= 2 and glBlitFramebuffer + glRenderbufferStorageMultisample exist
+    has_tex_array: bool,
+    max_samples: i32,
+    max_color_att: i32,
+    max_draw_buf: i32,
+    max_tex_size: i32,
+    max_layers: i32,
+    max_aniso_x100: i32, // GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT * 100 (0 = none)
+}
+
+fn glx_new() -> GlX {
+    return GlX {
+        ok: false, g: gl33.gl_new(), fns: [0; 128], args: [0; 16], tmp: [0; 16], major: 0, minor: 0, missing: 0,
+        n_ext: 0, has_aniso: false, has_ubo: false, has_ssbo: false, has_indirect: false, has_multi_indirect: false,
+        has_timer: false, has_msaa: false, has_tex_array: false, max_samples: 0, max_color_att: 0, max_draw_buf: 0,
+        max_tex_size: 0, max_layers: 0, max_aniso_x100: 0,
+    }
+}
+
+// ---- call helpers (shared with gl_tex / gl_fbo / gl_query / gl_prog) --------------------------------------------
+fn gx_fn_ok(x: *mut GlX, id: usize) -> bool {
+    return (*x).fns[id] != 0
+}
+
+fn gxi(x: *mut GlX, id: usize, sig: str) -> u64 {
+    return dynlib.callx((*x).fns[id], sig, (&(*x).args[0]) as u64, false)
+}
+
+fn gx1(x: *mut GlX, id: usize, a0: u64) -> u64 {
+    (*x).args[0] = a0
+    return gxi(x, id, "i")
+}
+
+fn gx2(x: *mut GlX, id: usize, a0: u64, a1: u64) -> u64 {
+    (*x).args[0] = a0
+    (*x).args[1] = a1
+    return gxi(x, id, "ii")
+}
+
+fn gx3(x: *mut GlX, id: usize, a0: u64, a1: u64, a2: u64) -> u64 {
+    (*x).args[0] = a0
+    (*x).args[1] = a1
+    (*x).args[2] = a2
+    return gxi(x, id, "iii")
+}
+
+fn gx4(x: *mut GlX, id: usize, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    (*x).args[0] = a0
+    (*x).args[1] = a1
+    (*x).args[2] = a2
+    (*x).args[3] = a3
+    return gxi(x, id, "iiii")
+}
+
+fn gx5(x: *mut GlX, id: usize, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    (*x).args[0] = a0
+    (*x).args[1] = a1
+    (*x).args[2] = a2
+    (*x).args[3] = a3
+    (*x).args[4] = a4
+    return gxi(x, id, "iiiii")
+}
+
+fn gx7(x: *mut GlX, id: usize, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
+    (*x).args[0] = a0
+    (*x).args[1] = a1
+    (*x).args[2] = a2
+    (*x).args[3] = a3
+    (*x).args[4] = a4
+    (*x).args[5] = a5
+    (*x).args[6] = a6
+    return gxi(x, id, "iiiiiii")
+}
+
+fn gx9(x: *mut GlX, id: usize, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64) -> u64 {
+    (*x).args[0] = a0
+    (*x).args[1] = a1
+    (*x).args[2] = a2
+    (*x).args[3] = a3
+    (*x).args[4] = a4
+    (*x).args[5] = a5
+    (*x).args[6] = a6
+    (*x).args[7] = a7
+    (*x).args[8] = a8
+    return gxi(x, id, "iiiiiiiii")
+}
+
+fn gx10(x: *mut GlX, id: usize, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64,
+        a9: u64) -> u64 {
+    (*x).args[0] = a0
+    (*x).args[1] = a1
+    (*x).args[2] = a2
+    (*x).args[3] = a3
+    (*x).args[4] = a4
+    (*x).args[5] = a5
+    (*x).args[6] = a6
+    (*x).args[7] = a7
+    (*x).args[8] = a8
+    (*x).args[9] = a9
+    return gxi(x, id, "iiiiiiiiii")
+}
+
+fn gx_fb(v: f64) -> u64 {
+    return __bits(v as f32) as u64
+}
+
+fn gx_m32(v: u64) -> u32 {
+    return (v & 0xFFFFFFFF as u64) as u32
+}
+
+// ---- loading ------------------------------------------------------------------------------------------------
+fn xreg(c: *mut glctx.GlCtx, x: *mut GlX, id: usize, name: str) {
+    let p: u64 = glctx.ctx_proc(c, name)
+    (*x).fns[id] = p
+    if p == 0 {
+        (*x).missing = (*x).missing + 1
+    }
+}
+
+// Loads gl33 into x.g, then the extra functions, then runs the probe. False if gl33 failed (no 3.3 core).
+// Optional functions that the driver does not give stay 0; the matching `has_*` flag is false then.
+fn glx_load(c: *mut glctx.GlCtx, x: *mut GlX) -> bool {
+    (*x).ok = false
+    if !gl33.gl_load(c, &(*x).g) {
+        return false
+    }
+    (*x).major = (*x).g.major
+    (*x).minor = (*x).g.minor
+    (*x).missing = 0
+    xreg(c, x, X_GET_STRINGI, "glGetStringi")
+    xreg(c, x, X_GET_FLOATV, "glGetFloatv")
+    xreg(c, x, X_UNIFORM2I, "glUniform2i")
+    xreg(c, x, X_UNIFORM3I, "glUniform3i")
+    xreg(c, x, X_UNIFORM4I, "glUniform4i")
+    xreg(c, x, X_GET_UBLOCK_INDEX, "glGetUniformBlockIndex")
+    xreg(c, x, X_UBLOCK_BINDING, "glUniformBlockBinding")
+    xreg(c, x, X_BIND_BUFFER_BASE, "glBindBufferBase")
+    xreg(c, x, X_BIND_BUFFER_RANGE, "glBindBufferRange")
+    xreg(c, x, X_GET_ACTIVE_UBLOCKIV, "glGetActiveUniformBlockiv")
+    xreg(c, x, X_DRAW_ELEMENTS_INST, "glDrawElementsInstanced")
+    xreg(c, x, X_DRAW_ARRAYS_INST, "glDrawArraysInstanced")
+    xreg(c, x, X_ATTRIB_DIVISOR, "glVertexAttribDivisor")
+    xreg(c, x, X_TEX_IMAGE3D, "glTexImage3D")
+    xreg(c, x, X_TEX_SUB_IMAGE3D, "glTexSubImage3D")
+    xreg(c, x, X_TEX_PARAMETERF, "glTexParameterf")
+    xreg(c, x, X_GET_TEX_IMAGE, "glGetTexImage")
+    xreg(c, x, X_GET_TEX_PARAMETERIV, "glGetTexParameteriv")
+    xreg(c, x, X_GET_TEX_PARAMETERFV, "glGetTexParameterfv")
+    xreg(c, x, X_DRAW_BUFFERS, "glDrawBuffers")
+    xreg(c, x, X_READ_BUFFER, "glReadBuffer")
+    xreg(c, x, X_RENDERBUFFER_STORAGE_MS, "glRenderbufferStorageMultisample")
+    xreg(c, x, X_BLIT_FRAMEBUFFER, "glBlitFramebuffer")
+    xreg(c, x, X_GEN_QUERIES, "glGenQueries")
+    xreg(c, x, X_DELETE_QUERIES, "glDeleteQueries")
+    xreg(c, x, X_BEGIN_QUERY, "glBeginQuery")
+    xreg(c, x, X_END_QUERY, "glEndQuery")
+    xreg(c, x, X_QUERY_COUNTER, "glQueryCounter")
+    xreg(c, x, X_GET_QUERY_OBJECTIV, "glGetQueryObjectiv")
+    xreg(c, x, X_GET_QUERY_OBJECTUI64V, "glGetQueryObjectui64v")
+    xreg(c, x, X_GET_QUERY_OBJECTUIV, "glGetQueryObjectuiv")
+    xreg(c, x, X_FRAMEBUFFER_TEXTURE_LAYER, "glFramebufferTextureLayer")
+    xreg(c, x, X_TEX_IMAGE2D_MS, "glTexImage2DMultisample")
+    xreg(c, x, X_GET_UNIFORMIV, "glGetUniformiv")
+    xreg(c, x, X_GET_UNIFORMFV, "glGetUniformfv")
+    xreg(c, x, X_BIND_TEXTURE, "glBindTexture")
+    xreg(c, x, X_TEX_PARAMETERI, "glTexParameteri")
+    xreg(c, x, X_TEX_IMAGE2D, "glTexImage2D")
+    xreg(c, x, X_TEX_SUB_IMAGE2D, "glTexSubImage2D")
+    xreg(c, x, X_GEN_TEXTURES, "glGenTextures")
+    xreg(c, x, X_DELETE_TEXTURES, "glDeleteTextures")
+    xreg(c, x, X_ACTIVE_TEXTURE, "glActiveTexture")
+    xreg(c, x, X_GENERATE_MIPMAP, "glGenerateMipmap")
+    xreg(c, x, X_GEN_FRAMEBUFFERS, "glGenFramebuffers")
+    xreg(c, x, X_BIND_FRAMEBUFFER, "glBindFramebuffer")
+    xreg(c, x, X_DELETE_FRAMEBUFFERS, "glDeleteFramebuffers")
+    xreg(c, x, X_FRAMEBUFFER_TEXTURE2D, "glFramebufferTexture2D")
+    xreg(c, x, X_FRAMEBUFFER_RENDERBUFFER, "glFramebufferRenderbuffer")
+    xreg(c, x, X_CHECK_FRAMEBUFFER_STATUS, "glCheckFramebufferStatus")
+    xreg(c, x, X_GEN_RENDERBUFFERS, "glGenRenderbuffers")
+    xreg(c, x, X_BIND_RENDERBUFFER, "glBindRenderbuffer")
+    xreg(c, x, X_RENDERBUFFER_STORAGE, "glRenderbufferStorage")
+    xreg(c, x, X_DELETE_RENDERBUFFERS, "glDeleteRenderbuffers")
+    xreg(c, x, X_GEN_BUFFERS, "glGenBuffers")
+    xreg(c, x, X_BIND_BUFFER, "glBindBuffer")
+    xreg(c, x, X_BUFFER_DATA, "glBufferData")
+    xreg(c, x, X_BUFFER_SUB_DATA, "glBufferSubData")
+    xreg(c, x, X_DELETE_BUFFERS, "glDeleteBuffers")
+    xreg(c, x, X_GET_BUFFER_SUB_DATA, "glGetBufferSubData")
+    xreg(c, x, X_USE_PROGRAM, "glUseProgram")
+    xreg(c, x, X_GET_INTEGERV, "glGetIntegerv")
+    xreg(c, x, X_GET_ERROR, "glGetError")
+    xreg(c, x, X_VIEWPORT, "glViewport")
+    xreg(c, x, X_CLEAR, "glClear")
+    xreg(c, x, X_CLEAR_COLOR, "glClearColor")
+    xreg(c, x, X_DRAW_ARRAYS, "glDrawArrays")
+    xreg(c, x, X_DISABLE, "glDisable")
+    xreg(c, x, X_ENABLE, "glEnable")
+    xreg(c, x, X_CLEAR_BUFFERFV, "glClearBufferfv")
+    xreg(c, x, X_READ_PIXELS, "glReadPixels")
+    xreg(c, x, X_PIXEL_STOREI, "glPixelStorei")
+    xreg(c, x, X_GET_FRAMEBUFFER_ATTACHMENT_IV, "glGetFramebufferAttachmentParameteriv")
+    (*x).n_ext = 0
+    if (*x).fns[X_GET_STRINGI] != 0 {
+        (*x).n_ext = gl33.gl_get_int(&(*x).g, GL_NUM_EXTENSIONS)
+    }
+    // Function pointers of core entry points that are only valid in a newer context are looked up lazily:
+    // eglGetProcAddress may return a pointer for ANY name, so presence of the pointer proves nothing -- version and
+    // extension string decide.
+    (*x).has_ubo = glx_at_least(x, 3, 1) && (*x).fns[X_BIND_BUFFER_BASE] != 0 && (*x).fns[X_GET_UBLOCK_INDEX] != 0
+    (*x).has_tex_array = glx_at_least(x, 3, 0) && (*x).fns[X_TEX_IMAGE3D] != 0
+    (*x).has_timer = (glx_at_least(x, 3, 3) || glx_has_ext(x, "GL_ARB_timer_query")) && (*x).fns[X_QUERY_COUNTER] != 0
+    (*x).has_indirect = glx_at_least(x, 4, 0) || glx_has_ext(x, "GL_ARB_draw_indirect")
+    (*x).has_multi_indirect = glx_at_least(x, 4, 3) || glx_has_ext(x, "GL_ARB_multi_draw_indirect")
+    (*x).has_ssbo = glx_at_least(x, 4, 3) || glx_has_ext(x, "GL_ARB_shader_storage_buffer_object")
+    if (*x).has_indirect || (*x).has_multi_indirect || (*x).has_ssbo {
+        let c2: *mut glctx.GlCtx = c
+        xreg(c2, x, X_DRAW_ELEMENTS_INDIRECT, "glDrawElementsIndirect")
+        xreg(c2, x, X_MULTI_DRAW_ELEMENTS_INDIRECT, "glMultiDrawElementsIndirect")
+        xreg(c2, x, X_SSBO_BLOCK_BINDING, "glShaderStorageBlockBinding")
+        if (*x).fns[X_DRAW_ELEMENTS_INDIRECT] == 0 {
+            (*x).has_indirect = false
+        }
+        if (*x).fns[X_MULTI_DRAW_ELEMENTS_INDIRECT] == 0 {
+            (*x).has_multi_indirect = false
+        }
+        if (*x).fns[X_SSBO_BLOCK_BINDING] == 0 {
+            (*x).has_ssbo = false
+        }
+    }
+    (*x).has_aniso = glx_has_ext(x, "GL_EXT_texture_filter_anisotropic") || glx_has_ext(x, "GL_ARB_texture_filter_anisotropic")
+    (*x).max_aniso_x100 = 0
+    if (*x).has_aniso && (*x).fns[X_GET_FLOATV] != 0 {
+        (*x).tmp[0] = 0 as u32
+        gx2(x, X_GET_FLOATV, 0x84FF as u64, (&(*x).tmp[0]) as u64)
+        let mx: f32 = *(((&(*x).tmp[0]) as u64) as *mut f32)
+        (*x).max_aniso_x100 = ((mx as f64) * 100.0) as i32
+        if (*x).max_aniso_x100 < 100 {
+            (*x).has_aniso = false
+            (*x).max_aniso_x100 = 0
+        }
+    }
+    (*x).max_tex_size = gl33.gl_get_int(&(*x).g, GL_MAX_TEXTURE_SIZE)
+    (*x).max_layers = gl33.gl_get_int(&(*x).g, GL_MAX_ARRAY_TEXTURE_LAYERS)
+    (*x).max_color_att = gl33.gl_get_int(&(*x).g, GL_MAX_COLOR_ATTACHMENTS)
+    (*x).max_draw_buf = gl33.gl_get_int(&(*x).g, GL_MAX_DRAW_BUFFERS)
+    (*x).max_samples = gl33.gl_get_int(&(*x).g, GL_MAX_SAMPLES)
+    (*x).has_msaa = (*x).max_samples >= 2 && (*x).fns[X_BLIT_FRAMEBUFFER] != 0 && (*x).fns[X_RENDERBUFFER_STORAGE_MS] != 0
+    gl33.gl_get_error(&(*x).g)
+    (*x).ok = true
+    return true
+}
+
+fn glx_at_least(x: *mut GlX, major: i32, minor: i32) -> bool {
+    if (*x).major > major {
+        return true
+    }
+    return (*x).major == major && (*x).minor >= minor
+}
+
+// Address of the NUL-terminated GL_VERSION text.
+fn glx_version_text(x: *mut GlX) -> u64 {
+    return gl33.gl_string(&(*x).g, gl33.GL_VERSION)
+}
+
+fn c_eq(p: u64, name: str) -> bool {
+    let n: usize = name.length()
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) != name.chars(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return rt.ld8(p, n) == (0 as u8)
+}
+
+// True if the context lists extension `name` (exact match, e.g. "GL_EXT_texture_filter_anisotropic").
+fn glx_has_ext(x: *mut GlX, name: str) -> bool {
+    if (*x).fns[X_GET_STRINGI] == 0 {
+        return false
+    }
+    var i: i32 = 0
+    while i < (*x).n_ext {
+        let p: u64 = gx2(x, X_GET_STRINGI, GL_EXTENSIONS as u64, i as u64)
+        if p != 0 && c_eq(p, name) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// two's-complement 32 bits of v as a call argument (a plain `as u32` panics for negative values)
+fn bits32(v: i32) -> u64 {
+    return ((v as i64) & (0xFFFFFFFF as i64)) as u64
+}
+
+// ---- integer uniforms (u_tiles can be an ivec2) ---------------------------------------------------------------
+fn glx_u2i(x: *mut GlX, loc: i32, a: i32, b: i32) {
+    if loc < 0 {
+        return
+    }
+    gx3(x, X_UNIFORM2I, (loc as u32) as u64, bits32(a), bits32(b))
+}
+
+fn glx_u3i(x: *mut GlX, loc: i32, a: i32, b: i32, c: i32) {
+    if loc < 0 {
+        return
+    }
+    gx4(x, X_UNIFORM3I, (loc as u32) as u64, bits32(a), bits32(b), bits32(c))
+}
+
+fn glx_u4i(x: *mut GlX, loc: i32, a: i32, b: i32, c: i32, d: i32) {
+    if loc < 0 {
+        return
+    }
+    gx5(x, X_UNIFORM4I, (loc as u32) as u64, bits32(a), bits32(b), bits32(c), bits32(d))
+}
+
+// Reads back an int uniform (glGetUniformiv) -- used by the tests. components land at `out`.
+fn glx_get_ui(x: *mut GlX, prog: u32, loc: i32, out: u64) {
+    gx3(x, X_GET_UNIFORMIV, prog as u64, (loc as u32) as u64, out)
+}
+
+fn glx_get_uf(x: *mut GlX, prog: u32, loc: i32, out: u64) {
+    gx3(x, X_GET_UNIFORMFV, prog as u64, (loc as u32) as u64, out)
+}
+
+// ---- uniform blocks (UBO) ---------------------------------------------------------------------------------------
+// Block index by name; 0xFFFFFFFF (GL_INVALID_INDEX) = no such block.
+#[allow_escape]
+fn glx_block_index(x: *mut GlX, prog: u32, name: str) -> u32 {
+    if !(*x).has_ubo {
+        return 0xFFFFFFFF as u32
+    }
+    var b: [u8; 128] = [0; 128]
+    let n: usize = name.length()
+    if n > 126 {
+        return 0xFFFFFFFF as u32
+    }
+    var i: usize = 0
+    while i < n {
+        b[i] = name.chars(i)
+        i = i + 1
+    }
+    b[n] = 0 as u8
+    return gx_m32(gx2(x, X_GET_UBLOCK_INDEX, prog as u64, (&b[0]) as u64))
+}
+
+// Attach block `index` of `prog` to binding point `binding`.
+fn glx_block_binding(x: *mut GlX, prog: u32, index: u32, binding: u32) {
+    if (*x).has_ubo {
+        gx3(x, X_UBLOCK_BINDING, prog as u64, index as u64, binding as u64)
+    }
+}
+
+// Minimum buffer size in bytes of block `index` (GL_UNIFORM_BLOCK_DATA_SIZE).
+fn glx_block_size(x: *mut GlX, prog: u32, index: u32) -> i32 {
+    if !(*x).has_ubo {
+        return 0
+    }
+    (*x).tmp[0] = 0 as u32
+    gx4(x, X_GET_ACTIVE_UBLOCKIV, prog as u64, index as u64, GL_UNIFORM_BLOCK_DATA_SIZE as u64, (&(*x).tmp[0]) as u64)
+    return (*x).tmp[0] as i32
+}
+
+// Whole buffer / range of a buffer to an indexed binding point of `target` (GL_UNIFORM_BUFFER / GL_SHADER_STORAGE_BUFFER).
+fn glx_buf_base(x: *mut GlX, target: u32, binding: u32, buf: u32) {
+    gx3(x, X_BIND_BUFFER_BASE, target as u64, binding as u64, buf as u64)
+}
+
+fn glx_buf_range(x: *mut GlX, target: u32, binding: u32, buf: u32, offset: usize, bytes: usize) {
+    gx5(x, X_BIND_BUFFER_RANGE, target as u64, binding as u64, buf as u64, offset as u64, bytes as u64)
+}
+
+// New uniform buffer of `bytes` (dynamic, from `data`; 0 = allocate only), bound to binding point `binding`.
+// Returns the buffer id (0 = no UBO support).
+fn glx_ubo_new(x: *mut GlX, bytes: usize, data: u64, binding: u32) -> u32 {
+    if !(*x).has_ubo {
+        return 0 as u32
+    }
+    let b: u32 = gl33.gl_gen_buffer(&(*x).g)
+    gl33.gl_bind_buffer(&(*x).g, GL_UNIFORM_BUFFER, b)
+    gl33.gl_buffer_data(&(*x).g, GL_UNIFORM_BUFFER, data, bytes, gl33.GL_DYNAMIC_DRAW)
+    glx_buf_base(x, GL_UNIFORM_BUFFER, binding, b)
+    return b
+}
+
+fn glx_ubo_update(x: *mut GlX, buf: u32, offset: usize, bytes: usize, data: u64) {
+    gl33.gl_bind_buffer(&(*x).g, GL_UNIFORM_BUFFER, buf)
+    gl33.gl_buffer_sub_data(&(*x).g, GL_UNIFORM_BUFFER, offset, bytes, data)
+}
+
+// std140: round `off` up to `align` (16 for vec3/vec4/mat4 columns/array elements, 8 vec2, 4 scalars).
+fn std140_align(off: usize, align: usize) -> usize {
+    return ((off + align - 1) / align) * align
+}
+
+// Size in bytes of `n` vec4-sized array elements / mat4 columns in std140 (16 each).
+fn std140_vec4_count(n: usize) -> usize {
+    return n * 16
+}
+
+// ---- shader storage buffers (>= 4.3) ----------------------------------------------------------------------------
+// False on contexts older than 4.3 without ARB_shader_storage_buffer_object: every glx_ssbo_* then does nothing / returns 0.
+fn glx_ssbo_ok(x: *mut GlX) -> bool {
+    return (*x).has_ssbo
+}
+
+fn glx_ssbo_new(x: *mut GlX, bytes: usize, data: u64, binding: u32) -> u32 {
+    if !(*x).has_ssbo {
+        return 0 as u32
+    }
+    let b: u32 = gl33.gl_gen_buffer(&(*x).g)
+    gl33.gl_bind_buffer(&(*x).g, GL_SHADER_STORAGE_BUFFER, b)
+    gl33.gl_buffer_data(&(*x).g, GL_SHADER_STORAGE_BUFFER, data, bytes, gl33.GL_DYNAMIC_DRAW)
+    glx_buf_base(x, GL_SHADER_STORAGE_BUFFER, binding, b)
+    return b
+}
+
+fn glx_ssbo_bind(x: *mut GlX, binding: u32, buf: u32) -> bool {
+    if !(*x).has_ssbo {
+        return false
+    }
+    glx_buf_base(x, GL_SHADER_STORAGE_BUFFER, binding, buf)
+    return true
+}
+
+fn glx_ssbo_update(x: *mut GlX, buf: u32, offset: usize, bytes: usize, data: u64) -> bool {
+    if !(*x).has_ssbo {
+        return false
+    }
+    gl33.gl_bind_buffer(&(*x).g, GL_SHADER_STORAGE_BUFFER, buf)
+    gl33.gl_buffer_sub_data(&(*x).g, GL_SHADER_STORAGE_BUFFER, offset, bytes, data)
+    return true
+}
+
+// Shader storage block `index` -> binding point (glShaderStorageBlockBinding); index from the program's resource
+// interface (the shader may use `layout(std430, binding = N)` instead, then this is not needed).
+fn glx_ssbo_block_binding(x: *mut GlX, prog: u32, index: u32, binding: u32) -> bool {
+    if !(*x).has_ssbo {
+        return false
+    }
+    gx3(x, X_SSBO_BLOCK_BINDING, prog as u64, index as u64, binding as u64)
+    return true
+}
+
+// Copies `bytes` from buffer `buf` (bound to `target`) at `offset` into `out` (glGetBufferSubData; a stall).
+fn glx_buffer_read(x: *mut GlX, target: u32, buf: u32, offset: usize, bytes: usize, out: u64) {
+    gl33.gl_bind_buffer(&(*x).g, target, buf)
+    gx4(x, X_GET_BUFFER_SUB_DATA, target as u64, offset as u64, bytes as u64, out)
+}
+
+// ---- instancing + indirect ------------------------------------------------------------------------------------
+// glVertexAttribDivisor: attribute `idx` advances once per `div` instances (0 = per vertex). Core in 3.3.
+fn glx_attrib_divisor(x: *mut GlX, idx: u32, div: u32) {
+    gx2(x, X_ATTRIB_DIVISOR, idx as u64, div as u64)
+}
+
+// Like gl33.gl_draw_elements, `inst` times; gl_InstanceID / divisor attributes pick the instance.
+fn glx_draw_elements_instanced(x: *mut GlX, mode: u32, count: i32, ty: u32, offset: usize, inst: i32) {
+    gx5(x, X_DRAW_ELEMENTS_INST, mode as u64, count as u64, ty as u64, offset as u64, inst as u64)
+}
+
+fn glx_draw_arrays_instanced(x: *mut GlX, mode: u32, first: i32, count: i32, inst: i32) {
+    gx4(x, X_DRAW_ARRAYS_INST, mode as u64, first as u64, count as u64, inst as u64)
+}
+
+fn glx_indirect_ok(x: *mut GlX) -> bool {
+    return (*x).has_indirect
+}
+
+fn glx_multi_indirect_ok(x: *mut GlX) -> bool {
+    return (*x).has_multi_indirect
+}
+
+// Binds `buf` as GL_DRAW_INDIRECT_BUFFER (the source of the commands below).
+fn glx_indirect_buffer(x: *mut GlX, buf: u32) {
+    gl33.gl_bind_buffer(&(*x).g, GL_DRAW_INDIRECT_BUFFER, buf)
+}
+
+// DrawElementsIndirectCommand i of an array at `p` (5 u32 = 20 bytes): count, instanceCount, firstIndex,
+// baseVertex, baseInstance.
+fn glx_cmd_write(p: u64, i: usize, count: u32, inst: u32, first: u32, base_vertex: u32, base_inst: u32) {
+    rt.st32(p, i * 5, count)
+    rt.st32(p, i * 5 + 1, inst)
+    rt.st32(p, i * 5 + 2, first)
+    rt.st32(p, i * 5 + 3, base_vertex)
+    rt.st32(p, i * 5 + 4, base_inst)
+}
+
+// One indirect draw from the bound GL_DRAW_INDIRECT_BUFFER at byte `offset` (>= 4.0). False when unavailable.
+fn glx_draw_elements_indirect(x: *mut GlX, mode: u32, ty: u32, offset: usize) -> bool {
+    if !(*x).has_indirect {
+        return false
+    }
+    gx3(x, X_DRAW_ELEMENTS_INDIRECT, mode as u64, ty as u64, offset as u64)
+    return true
+}
+
+// `drawcount` commands, `stride` bytes apart (0 = tightly packed, 20) (>= 4.3 / ARB_multi_draw_indirect). False when unavailable.
+fn glx_multi_draw_elements_indirect(x: *mut GlX, mode: u32, ty: u32, offset: usize, drawcount: i32, stride: i32) -> bool {
+    if !(*x).has_multi_indirect {
+        return false
+    }
+    gx5(x, X_MULTI_DRAW_ELEMENTS_INDIRECT, mode as u64, ty as u64, offset as u64, drawcount as u64, stride as u64)
+    return true
+}

@@ -1,0 +1,396 @@
+// tools/sounds/gen/main.fi -- sound generator: recipe JSON -> WAV files + bank JSON + MANIFEST (+ preview WAV).
+//
+//     gen <recipe.json> <outdir> [--bank NAME] [--manifest NAME] [--preview FILE] [--rate N] [--only PREFIX] [--list]
+//
+// Writes <outdir>/<id>.wav (one variant) or <outdir>/<id>_<k>.wav (k = 1..variants), S16 mono, the rate of the
+// recipe (default 44100), <outdir>/bank.json (audio.bank format) and <outdir>/manifest.json (name, source
+// 'synth:<id>', license, seed, SHA256, duration, peak, rms). Exit code 0 only if every sound rendered, did not clip
+// and the manifest was written. Format and examples: docs/audio/SYNTH.md.
+import std.rt
+import std.io
+import std.str
+import std.json
+import std.fs
+import std.crypto.sha256
+import audio.pcm
+import audio.synth_osc
+import audio.synth_fx
+import audio.synth_recipe
+
+struct Opts {
+    recipe: u64,
+    outdir: u64,
+    bank: u64,
+    manifest: u64,
+    preview: u64,
+    only: u64,
+    rate: u32,
+    list: bool,
+}
+
+fn cstr(p: u64) -> str {
+    return str { p: rt.ptr_of(p), n: rt.c_length(p) }
+}
+
+fn push(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.length())
+}
+
+fn push_q(b: *mut rt.Buf, s: str) {
+    rt.buf_push(b, 34 as u8)
+    var i: usize = 0
+    while i < s.length() {
+        let ch: u8 = rt.ld8(s.p as u64, i)
+        if ch == 34 as u8 || ch == 92 as u8 {
+            rt.buf_push(b, 92 as u8)
+        }
+        rt.buf_push(b, ch)
+        i = i + 1
+    }
+    rt.buf_push(b, 34 as u8)
+}
+
+// v with 2 decimals (|v| < 1e9)
+fn push_f2(b: *mut rt.Buf, v0: f64) {
+    var v: f64 = v0
+    if v < 0.0 {
+        rt.buf_push(b, 45 as u8)
+        v = 0.0 - v
+    }
+    let c: i64 = (v * 100.0 + 0.5) as i64
+    rt.buf_push_dec_u64(b, (c / 100) as u64)
+    rt.buf_push(b, 46 as u8)
+    let fr: i64 = c % 100
+    if fr < 10 { rt.buf_push(b, 48 as u8) }
+    rt.buf_push_dec_u64(b, fr as u64)
+}
+
+fn push_f3(b: *mut rt.Buf, v: f64) {
+    let c: i64 = (v * 1000.0 + 0.5) as i64
+    rt.buf_push_dec_u64(b, (c / 1000) as u64)
+    rt.buf_push(b, 46 as u8)
+    let fr: i64 = c % 1000
+    if fr < 100 { rt.buf_push(b, 48 as u8) }
+    if fr < 10 { rt.buf_push(b, 48 as u8) }
+    rt.buf_push_dec_u64(b, fr as u64)
+}
+
+fn db_of(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 - 200.0 }
+    return 6.020599913279624 * synth_recipe.log2f(x)
+}
+
+fn path_cat(dir: u64, name: str) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, dir, rt.c_length(dir))
+    rt.buf_push(&b, 47 as u8)
+    rt.buf_push_bytes(&b, name.p as u64, name.length())
+    rt.buf_push(&b, 0 as u8)
+    return b
+}
+
+fn write_out(dir: u64, name: str, data: *mut rt.Buf) -> bool {
+    var pth: rt.Buf = path_cat(dir, name)
+    let ok: bool = rt.write_file(rt.buf_ptr(&pth), rt.buf_ptr(data), rt.buf_len(data))
+    rt.buf_free(&pth)
+    return ok
+}
+
+fn sha_hex(p: u64, n: usize, out: *mut rt.Buf) {
+    var h: [u8; 32] = [0; 32]
+    sha256.sha256(p, n, (&h[0]) as u64)
+    var i: usize = 0
+    while i < 32 {
+        rt.buf_push_hex_u64(out, h[i] as u64, 2)
+        i = i + 1
+    }
+}
+
+fn starts(s: str, pre: str) -> bool {
+    if pre.length() > s.length() { return false }
+    return rt.mem_eq(s.p as u64, pre.p as u64, pre.length())
+}
+
+// copy the event fields that the bank understands
+fn push_event_fields(b: *mut rt.Buf, d: *mut json.Json, ev: u32) {
+    if ev == json.JSON_NONE { return }
+    let nums: [str; 8] = ["volume", "volume_random", "pitch", "pitch_random", "priority", "min_distance", "max_distance", "max_instances"]
+    let bus: str = synth_recipe.jstr(d, ev, "bus", "")
+    if bus.length() > 0 {
+        push(b, ", \"bus\": ")
+        push_q(b, bus)
+    }
+    var i: usize = 0
+    while i < 8 {
+        let v: u32 = synth_recipe.jmember(d, ev, nums[i])
+        if v != json.JSON_NONE && json.json_kind(d, v) == json.JSON_NUMBER {
+            push(b, ", ")
+            push_q(b, nums[i])
+            push(b, ": ")
+            push_f3(b, json.json_number(d, v))
+        }
+        i = i + 1
+    }
+    let lp: u32 = synth_recipe.jmember(d, ev, "loop")
+    if lp != json.JSON_NONE && json.json_kind(d, lp) == json.JSON_TRUE {
+        push(b, ", \"loop\": true")
+    }
+    let sp: u32 = synth_recipe.jmember(d, ev, "spatial")
+    if sp != json.JSON_NONE && json.json_kind(d, sp) == json.JSON_TRUE {
+        push(b, ", \"spatial\": true")
+    }
+}
+
+fn push_event(b: *mut rt.Buf, d: *mut json.Json, ev: u32, name: str, files: *mut rt.Buf, first: bool) {
+    if !first { push(b, ",\n") }
+    push(b, "    { \"name\": ")
+    push_q(b, name)
+    push(b, ", \"samples\": [")
+    push(b, str { p: rt.buf_data(files), n: rt.buf_len(files) })
+    push(b, "]")
+    push_event_fields(b, d, ev)
+    push(b, " }")
+}
+
+fn run(o: *mut Opts) -> i32 {
+    var data: rt.Buf = rt.buf_new()
+    if !rt.read_file((*o).recipe, &data) {
+        io.fmt_print(f"gen: cannot read recipe\n")
+        return 2
+    }
+    var j: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&j, rt.buf_ptr(&data), rt.buf_len(&data)) catch false
+    if !ok {
+        io.fmt_print(f"gen: recipe is not valid JSON: line {json.json_err_line(&j) as i64}, column {json.json_err_col(&j) as i64}\n")
+        return 2
+    }
+    let d: *mut json.Json = &j
+    let root: u32 = json.json_root(d)
+    var rate: u32 = synth_recipe.jnum(d, root, "rate", 44100.0) as u32
+    if (*o).rate != 0 as u32 { rate = (*o).rate }
+    let sounds: u32 = synth_recipe.jmember(d, root, "sounds")
+    if sounds == json.JSON_NONE {
+        io.fmt_print(f"gen: recipe has no sounds\n")
+        return 2
+    }
+    if !(*o).list {
+        fs.mkdir_all(cstr((*o).outdir)) catch false
+    }
+    let lic_default: str = synth_recipe.jstr(d, root, "license", "own")
+    var man: rt.Buf = rt.buf_new()
+    var bank: rt.Buf = rt.buf_new()
+    var prev: rt.Buf = rt.buf_new() // S16 preview samples
+    var gap: usize = (rate as usize) * 35 / 100
+    push(&man, "{\n  \"format\": \"synth-manifest-1\",\n  \"generator\": \"tools/sounds/gen\",\n  \"recipe\": ")
+    push_q(&man, synth_recipe.jstr(d, root, "name", "recipe"))
+    push(&man, ",\n  \"rate\": ")
+    rt.buf_push_dec_u64(&man, rate as u64)
+    push(&man, ",\n  \"files\": [\n")
+    push(&bank, "// generated by tools/sounds/gen from synthesis recipes (own IP, no samples copied)\n{\n  \"buses\": [")
+    // buses: copied as written
+    let bs: u32 = synth_recipe.jmember(d, root, "buses")
+    var firstbus: bool = true
+    if bs != json.JSON_NONE && json.json_kind(d, bs) == json.JSON_ARRAY {
+        var b: u32 = json.json_child(d, bs)
+        while b != json.JSON_NONE {
+            if !firstbus { push(&bank, ",") }
+            push(&bank, "\n    { \"name\": ")
+            push_q(&bank, synth_recipe.jstr(d, b, "name", "master"))
+            let par: str = synth_recipe.jstr(d, b, "parent", "")
+            if par.length() > 0 {
+                push(&bank, ", \"parent\": ")
+                push_q(&bank, par)
+            }
+            push(&bank, ", \"volume\": ")
+            push_f3(&bank, synth_recipe.jnum(d, b, "volume", 1.0))
+            push(&bank, " }")
+            firstbus = false
+            b = json.json_next(d, b)
+        }
+    }
+    push(&bank, "\n  ],\n  \"events\": [\n")
+    var firstev: bool = true
+    var firstfile: bool = true
+    var fails: i32 = 0
+    var nfiles: i32 = 0
+    var sd: u32 = json.json_child(d, sounds)
+    while sd != json.JSON_NONE {
+        let cur: u32 = sd
+        sd = json.json_next(d, sd)
+        let id: str = synth_recipe.jstr(d, cur, "id", "")
+        if id.length() == 0 { continue }
+        if (*o).only != 0 && !starts(id, cstr((*o).only)) { continue }
+        if (*o).list {
+            io.fmt_print(f"{id}\n")
+            continue
+        }
+        var nv: i32 = synth_recipe.jnum(d, cur, "variants", 1.0) as i32
+        if nv < 1 { nv = 1 }
+        var files: rt.Buf = rt.buf_new()
+        var k: i32 = 0
+        while k < nv {
+            var snd: synth_recipe.Sound = synth_recipe.sound_zero()
+            var err: rt.Buf = rt.buf_new()
+            if !synth_recipe.recipe_render(d, cur, rate, k as u32, &snd, &err) {
+                let etxt: str = str { p: rt.buf_data(&err), n: rt.buf_len(&err) }
+                io.fmt_print(f"gen: FAIL {id}: {etxt}\n")
+                fails = fails + 1
+                rt.buf_free(&err)
+                k = k + 1
+                continue
+            }
+            rt.buf_free(&err)
+            // S16 + WAV
+            let pbuf: u64 = rt.heap_alloc(snd.n * 2 + 8)
+            let hits: usize = synth_fx.fx_to_s16(snd.samples, snd.n, pbuf)
+            var wav: rt.Buf = rt.buf_new()
+            pcm.wav_header(&wav, rate, 1 as u32, (snd.n * 2) as u32)
+            rt.buf_push_bytes(&wav, pbuf, snd.n * 2)
+            var fname: rt.Buf = rt.buf_new()
+            push(&fname, id)
+            if nv > 1 {
+                rt.buf_push(&fname, 95 as u8)
+                rt.buf_push_dec_u64(&fname, (k + 1) as u64)
+            }
+            push(&fname, ".wav")
+            let fs_name: str = str { p: rt.buf_data(&fname), n: rt.buf_len(&fname) }
+            if !write_out((*o).outdir, fs_name, &wav) {
+                io.fmt_print(f"gen: cannot write {fs_name}\n")
+                fails = fails + 1
+            }
+            if hits > 2 {
+                io.fmt_print(f"gen: FAIL {id}: {hits as i64} clipped samples\n")
+                fails = fails + 1
+            }
+            if !firstfile { push(&man, ",\n") }
+            firstfile = false
+            push(&man, "    { \"file\": ")
+            push_q(&man, fs_name)
+            push(&man, ", \"event\": ")
+            push_q(&man, id)
+            push(&man, ", \"variant\": ")
+            rt.buf_push_dec_u64(&man, (k + 1) as u64)
+            push(&man, ", \"source\": \"synth:")
+            push(&man, id)
+            push(&man, "\", \"license\": ")
+            push_q(&man, synth_recipe.jstr(d, cur, "license", lic_default))
+            push(&man, ", \"seed\": ")
+            rt.buf_push_dec_u64(&man, synth_recipe.jnum(d, cur, "seed", 1.0) as u64)
+            push(&man, ", \"sha256\": \"")
+            sha_hex(rt.buf_ptr(&wav), rt.buf_len(&wav), &man)
+            push(&man, "\", \"duration_ms\": ")
+            push_f2(&man, (snd.n as f64) * 1000.0 / (rate as f64))
+            push(&man, ", \"peak_dbfs\": ")
+            push_f2(&man, db_of(snd.peak))
+            push(&man, ", \"rms_dbfs\": ")
+            push_f2(&man, db_of(snd.rms))
+            push(&man, " }")
+            if k > 0 { rt.buf_push_bytes(&files, ", ".p as u64, 2) }
+            rt.buf_push(&files, 34 as u8)
+            rt.buf_push_bytes(&files, rt.buf_data(&fname) as u64, rt.buf_len(&fname))
+            rt.buf_push(&files, 34 as u8)
+            // preview: first variant of every short sound
+            if k == 0 && ((snd.n as f64) * 1000.0 / (rate as f64) <= 8000.0) && synth_recipe.jnum(d, cur, "preview", 1.0) != 0.0 {
+                rt.buf_push_bytes(&prev, pbuf, snd.n * 2)
+                var g: usize = 0
+                while g < gap {
+                    rt.buf_push(&prev, 0 as u8)
+                    rt.buf_push(&prev, 0 as u8)
+                    g = g + 1
+                }
+            }
+            nfiles = nfiles + 1
+            rt.buf_free(&fname)
+            rt.buf_free(&wav)
+            rt.heap_free(pbuf, snd.n * 2 + 8)
+            synth_recipe.sound_free(&snd)
+            k = k + 1
+        }
+        // bank events: the id and every alias
+        let evo: u32 = synth_recipe.jmember(d, cur, "event")
+        push_event(&bank, d, evo, id, &files, firstev)
+        firstev = false
+        let al: u32 = synth_recipe.jmember(d, cur, "aliases")
+        if al != json.JSON_NONE && json.json_kind(d, al) == json.JSON_ARRAY {
+            var a: u32 = json.json_child(d, al)
+            while a != json.JSON_NONE {
+                let sp: str.Span = json.json_string(d, a)
+                push_event(&bank, d, evo, str { p: sp.p, n: sp.n }, &files, false)
+                a = json.json_next(d, a)
+            }
+        }
+        rt.buf_free(&files)
+    }
+    if (*o).list { return 0 }
+    push(&man, "\n  ]\n}\n")
+    push(&bank, "\n  ]\n}\n")
+    var bn: str = "bank.json"
+    if (*o).bank != 0 { bn = cstr((*o).bank) }
+    var mn: str = "manifest.json"
+    if (*o).manifest != 0 { mn = cstr((*o).manifest) }
+    if !write_out((*o).outdir, bn, &bank) || !write_out((*o).outdir, mn, &man) {
+        io.fmt_print(f"gen: cannot write bank / manifest\n")
+        fails = fails + 1
+    }
+    if (*o).preview != 0 {
+        var w: rt.Buf = rt.buf_new()
+        pcm.wav_header(&w, rate, 1 as u32, rt.buf_len(&prev) as u32)
+        rt.buf_push_bytes(&w, rt.buf_ptr(&prev), rt.buf_len(&prev))
+        if !write_out((*o).outdir, cstr((*o).preview), &w) { fails = fails + 1 }
+        rt.buf_free(&w)
+    }
+    json.json_free(&j)
+    rt.buf_free(&data)
+    io.fmt_print(f"gen: {nfiles as i64} wav files, {fails as i64} problems\n")
+    if fails > 0 { return 1 }
+    return 0
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var o: Opts = Opts { recipe: 0, outdir: 0, bank: 0, manifest: 0, preview: 0, only: 0, rate: 0 as u32, list: false }
+    var pos: usize = 0
+    var i: usize = 1
+    let argc: usize = rt.arg_count(start)
+    while i < argc {
+        let a: u64 = rt.arg_ptr(start, i)
+        let s: str = cstr(a)
+        if starts(s, "--bank") && i + 1 < argc {
+            o.bank = rt.arg_ptr(start, i + 1)
+            i = i + 1
+        } else if starts(s, "--manifest") && i + 1 < argc {
+            o.manifest = rt.arg_ptr(start, i + 1)
+            i = i + 1
+        } else if starts(s, "--preview") && i + 1 < argc {
+            o.preview = rt.arg_ptr(start, i + 1)
+            i = i + 1
+        } else if starts(s, "--only") && i + 1 < argc {
+            o.only = rt.arg_ptr(start, i + 1)
+            i = i + 1
+        } else if starts(s, "--rate") && i + 1 < argc {
+            let r: str = cstr(rt.arg_ptr(start, i + 1))
+            var v: u32 = 0 as u32
+            var q: usize = 0
+            while q < r.length() {
+                v = v * 10 as u32 + ((rt.ld8(r.p as u64, q) - 48 as u8) as u32)
+                q = q + 1
+            }
+            o.rate = v
+            i = i + 1
+        } else if starts(s, "--list") {
+            o.list = true
+        } else if pos == 0 {
+            o.recipe = a
+            pos = 1
+        } else {
+            o.outdir = a
+            pos = 2
+        }
+        i = i + 1
+    }
+    if o.recipe == 0 || (o.outdir == 0 && !o.list) {
+        io.fmt_print(f"usage: gen <recipe.json> <outdir> [--bank NAME] [--manifest NAME] [--preview FILE] [--rate N] [--only PREFIX] [--list]\n")
+        return 2
+    }
+    return run(&o)
+}

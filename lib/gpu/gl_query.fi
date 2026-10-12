@@ -1,0 +1,251 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/gl_query.fi -- gpu.gl_query: GPU time per render pass without a pipeline stall (docs/GPU.md).
+//
+//     import gpu.gl_ext
+//     import gpu.gl_query
+//     var t: gl_query.Timer = gl_query.timer_new(&x, gl_query.MODE_STAMP)   // or MODE_ELAPSED
+//     // every frame:
+//     gl_query.timer_frame(&x, &t)                  // advances the ring, collects what the GPU has finished
+//     gl_query.pass_begin(&x, &t, 0)  ... draw terrain ...  gl_query.pass_end(&x, &t, 0)
+//     gl_query.pass_begin(&x, &t, 1)  ... draw sky ...      gl_query.pass_end(&x, &t, 1)
+//     let ms: f64 = gl_query.pass_ms(&t, 0)         // last finished value of pass 0 (a few frames old)
+//     gl_query.pass_print(&t, 0, "terrain")         // "terrain: 1.234 ms (avg 1.180)"
+//
+// RING. Query results arrive a few frames after the commands were issued. Asking for one right away would stall the
+// CPU until the GPU is done. So each pass owns RING (4) sets of queries, one per frame in flight: `timer_frame` first
+// collects (GL_QUERY_RESULT_AVAILABLE, then the 64-bit result) every finished set of the previous frames, never
+// waits, and drops a set that is still not ready when its slot is reused (counted in `dropped`).
+// MODE_STAMP: two glQueryCounter(GL_TIMESTAMP) per pass (begin, end; passes may nest). MODE_ELAPSED: one
+// GL_TIME_ELAPSED query per pass (passes must not overlap: GL allows one active query of that target).
+// A driver without timer queries (has_timer false) makes every call a no-op and pass_ms returns 0.
+// Mesa llvmpipe provides both modes; the values are CPU-renderer times, not GPU times.
+
+import std.rt
+import std.io
+import gpu.gl33
+import gpu.gl_ext
+
+export {
+    Timer, timer_new, timer_free, timer_frame, pass_begin, pass_end, pass_ms, pass_avg_ms, pass_samples, pass_print,
+    timer_now_ns, MODE_STAMP, MODE_ELAPSED, MAX_PASSES, RING,
+}
+
+const MODE_STAMP: i32 = 0
+const MODE_ELAPSED: i32 = 1
+const MAX_PASSES: usize = 16
+const RING: usize = 4
+const GL_TIME_ELAPSED: u32 = 0x88BF
+const GL_TIMESTAMP: u32 = 0x8E28
+const GL_QUERY_RESULT: u32 = 0x8866
+const GL_QUERY_RESULT_AVAILABLE: u32 = 0x8867
+const GL_TIMESTAMP_VALUE: u32 = 0x8E28
+
+struct Timer {
+    ok: bool,
+    mode: i32,
+    frame: u64, // frame counter (timer_frame calls)
+    q: [u32; 128], // [slot][pass][2] : RING * MAX_PASSES * 2
+    issued: [u32; 4], // bit mask of passes issued in slot (bit p of begin AND end issued => complete)
+    began: [u32; 4],
+    last_ns: [u64; 16],
+    sum_ns: [u64; 16],
+    n_samples: [u32; 16],
+    dropped: u32,
+    collected: u32,
+}
+
+#[allow_escape]
+fn timer_new(x: *mut gl_ext.GlX, mode: i32) -> Timer {
+    var t: Timer = Timer {
+        ok: false, mode: mode, frame: 0, q: [0 as u32; 128], issued: [0 as u32; 4], began: [0 as u32; 4],
+        last_ns: [0; 16], sum_ns: [0; 16], n_samples: [0 as u32; 16], dropped: 0 as u32, collected: 0 as u32,
+    }
+    if !(*x).has_timer {
+        return t
+    }
+    // 128 query ids; GL_TIMESTAMP/TIME_ELAPSED objects are created by glGenQueries and typed on first use
+    var i: usize = 0
+    var batch: [u32; 128] = [0 as u32; 128]
+    gl_ext.gx2(x, gl_ext.X_GEN_QUERIES, 128, (&batch[0]) as u64)
+    while i < 128 {
+        t.q[i] = batch[i]
+        i = i + 1
+    }
+    t.ok = t.q[0] != 0 as u32
+    return t
+}
+
+fn timer_free(x: *mut gl_ext.GlX, t: *mut Timer) {
+    if !(*t).ok {
+        return
+    }
+    gl_ext.gx2(x, gl_ext.X_DELETE_QUERIES, 128, (&(*t).q[0]) as u64)
+    (*t).ok = false
+}
+
+fn qidx(slot: usize, pass: usize, which: usize) -> usize {
+    return (slot * MAX_PASSES + pass) * 2 + which
+}
+
+// Non-blocking: moves the result of query `id` into *out and returns true when the GPU has it.
+fn try_result(x: *mut gl_ext.GlX, id: u32, out: *mut u64) -> bool {
+    (*x).tmp[0] = 0 as u32
+    gl_ext.gx3(x, gl_ext.X_GET_QUERY_OBJECTUIV, id as u64, GL_QUERY_RESULT_AVAILABLE as u64, (&(*x).tmp[0]) as u64)
+    if (*x).tmp[0] == 0 as u32 {
+        return false
+    }
+    *out = 0
+    gl_ext.gx3(x, gl_ext.X_GET_QUERY_OBJECTUI64V, id as u64, GL_QUERY_RESULT as u64, (out as u64))
+    return true
+}
+
+// Collects every finished pass of the slots that are not the current frame's slot.
+#[allow_escape]
+fn collect_slot(x: *mut gl_ext.GlX, t: *mut Timer, slot: usize) {
+    let iss: u32 = (*t).issued[slot]
+    if iss == (0 as u32) {
+        return
+    }
+    var p: usize = 0
+    var left: u32 = iss
+    while p < MAX_PASSES {
+        let bit: u32 = (1 as u32) << (p as u32)
+        if (iss & bit) != (0 as u32) {
+            var ok: bool = false
+            var dt: u64 = 0
+            if (*t).mode == MODE_ELAPSED {
+                var v: u64 = 0
+                if try_result(x, (*t).q[qidx(slot, p, 0)], &v) {
+                    dt = v
+                    ok = true
+                }
+            } else {
+                var a: u64 = 0
+                var b: u64 = 0
+                if try_result(x, (*t).q[qidx(slot, p, 0)], &a) {
+                    if try_result(x, (*t).q[qidx(slot, p, 1)], &b) {
+                        if b >= a {
+                            dt = b - a
+                        }
+                        ok = true
+                    }
+                }
+            }
+            if ok {
+                (*t).last_ns[p] = dt
+                (*t).sum_ns[p] = (*t).sum_ns[p] + dt
+                (*t).n_samples[p] = (*t).n_samples[p] + (1 as u32)
+                (*t).collected = (*t).collected + (1 as u32)
+                left = left & (~bit)
+            }
+        }
+        p = p + 1
+    }
+    (*t).issued[slot] = left
+}
+
+// Call once per frame BEFORE the first pass_begin: collects finished results of the older slots (never waits), then makes the
+// slot of this frame free. A set that is still unfinished when its slot comes round again is dropped.
+#[allow_escape]
+fn timer_frame(x: *mut gl_ext.GlX, t: *mut Timer) {
+    if !(*t).ok {
+        return
+    }
+    var s: usize = 0
+    while s < RING {
+        collect_slot(x, t, s)
+        s = s + 1
+    }
+    (*t).frame = (*t).frame + 1
+    let slot: usize = ((*t).frame % (RING as u64)) as usize
+    if (*t).issued[slot] != (0 as u32) {
+        var p: usize = 0
+        while p < MAX_PASSES {
+            if ((*t).issued[slot] & ((1 as u32) << (p as u32))) != (0 as u32) {
+                (*t).dropped = (*t).dropped + (1 as u32)
+            }
+            p = p + 1
+        }
+        (*t).issued[slot] = 0 as u32
+    }
+    (*t).began[slot] = 0 as u32
+}
+
+fn cur_slot(t: *mut Timer) -> usize {
+    return ((*t).frame % (RING as u64)) as usize
+}
+
+// Start of pass `pass` (0..15) in the current frame.
+fn pass_begin(x: *mut gl_ext.GlX, t: *mut Timer, pass: usize) {
+    if !(*t).ok || pass >= MAX_PASSES {
+        return
+    }
+    let slot: usize = cur_slot(t)
+    if (*t).mode == MODE_ELAPSED {
+        gl_ext.gx2(x, gl_ext.X_BEGIN_QUERY, GL_TIME_ELAPSED as u64, (*t).q[qidx(slot, pass, 0)] as u64)
+    } else {
+        gl_ext.gx2(x, gl_ext.X_QUERY_COUNTER, (*t).q[qidx(slot, pass, 0)] as u64, GL_TIMESTAMP as u64)
+    }
+    (*t).began[slot] = (*t).began[slot] | ((1 as u32) << (pass as u32))
+}
+
+fn pass_end(x: *mut gl_ext.GlX, t: *mut Timer, pass: usize) {
+    if !(*t).ok || pass >= MAX_PASSES {
+        return
+    }
+    let slot: usize = cur_slot(t)
+    let bit: u32 = (1 as u32) << (pass as u32)
+    if ((*t).began[slot] & bit) == (0 as u32) {
+        return
+    }
+    if (*t).mode == MODE_ELAPSED {
+        gl_ext.gx1(x, gl_ext.X_END_QUERY, GL_TIME_ELAPSED as u64)
+    } else {
+        gl_ext.gx2(x, gl_ext.X_QUERY_COUNTER, (*t).q[qidx(slot, pass, 1)] as u64, GL_TIMESTAMP as u64)
+    }
+    (*t).issued[slot] = (*t).issued[slot] | bit
+}
+
+// Last finished measurement of the pass in milliseconds (0 until the first one arrived).
+fn pass_ms(t: *mut Timer, pass: usize) -> f64 {
+    if pass >= MAX_PASSES {
+        return 0.0
+    }
+    return ((*t).last_ns[pass] as f64) / 1000000.0
+}
+
+fn pass_avg_ms(t: *mut Timer, pass: usize) -> f64 {
+    if pass >= MAX_PASSES || (*t).n_samples[pass] == (0 as u32) {
+        return 0.0
+    }
+    return (((*t).sum_ns[pass] as f64) / ((*t).n_samples[pass] as f64)) / 1000000.0
+}
+
+fn pass_samples(t: *mut Timer, pass: usize) -> u32 {
+    if pass >= MAX_PASSES {
+        return 0 as u32
+    }
+    return (*t).n_samples[pass]
+}
+
+// "label: 1.234 ms (avg 1.180, n=57)" on stdout.
+fn pass_print(t: *mut Timer, pass: usize, label: str) {
+    let ms: f64 = pass_ms(t, pass)
+    let av: f64 = pass_avg_ms(t, pass)
+    let n: u32 = pass_samples(t, pass)
+    io.fmt_print(f"{label}: {ms} ms (avg {av}, n={n})\n")
+}
+
+// The GPU clock now, in ns (glGetInteger64v(GL_TIMESTAMP) through a counter query: a stall; for calibration only).
+#[allow_escape]
+fn timer_now_ns(x: *mut gl_ext.GlX, t: *mut Timer) -> u64 {
+    if !(*t).ok {
+        return 0
+    }
+    let id: u32 = (*t).q[qidx(0, MAX_PASSES - 1, 1)]
+    gl_ext.gx2(x, gl_ext.X_QUERY_COUNTER, id as u64, GL_TIMESTAMP as u64)
+    var v: u64 = 0
+    (*x).tmp[0] = 0 as u32
+    gl_ext.gx3(x, gl_ext.X_GET_QUERY_OBJECTUI64V, id as u64, GL_QUERY_RESULT as u64, ((&v) as u64))
+    return v
+}

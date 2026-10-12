@@ -1,0 +1,534 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/cull.fi -- gpu.cull: CPU visibility culling for the GL back end (docs/GPU.md "CPU culling").
+//
+//     import gpu.cull
+//     var c: cull.Cull = cull.cull_new(128, 72)                    // depth buffer for occlusion, 128 x 72
+//     cull.cull_begin(&c, &vp_rot, cam_x, cam_y, cam_z, near, false) // vp_rot = proj * view ROTATION (no translation)
+//     cull.cull_clear_depth(&c)
+//     cull.cull_add_occluder(&c, x0, y0, z0, x1, y1, z1)           // big solid boxes (terrain sections, buildings)
+//     cull.cull_build_hiz(&c)
+//     let r: i32 = cull.cull_box(&c, x0, y0, z0, x1, y1, z1)       // CULL_FRUSTUM / CULL_OCCLUDED / CULL_VISIBLE
+//
+// CAMERA-RELATIVE f64. World boxes are in f64 world coordinates; the camera position is subtracted in f64 BEFORE any
+// matrix maths, so the result is the same 1,000,000 blocks from the origin as near it (tools/gpu/ext/cull.fi checks this).
+// The matrix is the same `u_rv` that gl_mc uploads (projection * view rotation).
+//
+// FRUSTUM. mc_math's plane test (never rejects a box that has a point inside) plus a second, tighter test: a box that
+// misses the bounding box of the 8 frustum corners is outside too (removes the classic "big box beside the frustum edge"
+// false positives). Sphere variant included.
+//
+// OCCLUSION (software Hi-Z). `cull_add_occluder` rasterizes a box into a W x H buffer of view depth (clip w = distance
+// along the view axis, f64), pixel centres, perspective-correct, nearest wins, **shrunk** coverage (a pixel counts only
+// if its centre is inside the triangle by a small margin) -- an occluder never covers more than the real raster does.
+// `cull_build_hiz` makes a max-pyramid (farthest depth of each 2x2 block). `cull_occluded_box` projects the 8 corners of a
+// candidate (any corner at or behind the near plane => not occludable), takes the pixel rectangle expanded by one pixel,
+// reads the pyramid level whose cells cover the rectangle with <= 2 x 2 cells, and calls the box occluded only if its
+// NEAREST corner depth is farther than the FARTHEST occluder depth of the covered cells (+ a relative margin). Pixels that no
+// occluder covers hold +infinity, so a partly covered rectangle never hides anything. Rules that keep it conservative:
+// shrunk occluder coverage, expanded candidate rectangle, max over a >= rectangle region, nearest corner of the candidate
+// (w is linear in position, so the box minimum is at a corner), skipped occluders that touch the near plane.
+// What it cannot do: occluder = AXIS-ALIGNED BOXES only (no arbitrary meshes), and it is a CPU cost per frame.
+
+import std.math
+import std.rt
+import mc.mc_math
+
+export {
+    Cull, cull_new, cull_free, cull_begin, cull_clear_depth, cull_add_occluder, cull_build_hiz, cull_frustum_box,
+    cull_frustum_sphere, cull_occluded_box, cull_box, raster_box_fragments,
+    CULL_FRUSTUM, CULL_OCCLUDED, CULL_VISIBLE,
+}
+
+const CULL_FRUSTUM: i32 = 0
+const CULL_OCCLUDED: i32 = 1
+const CULL_VISIBLE: i32 = 2
+const INF: f64 = 1.0e300
+const MAX_LEVELS: usize = 8
+
+struct Cull {
+    fr: mc_math.Frustum,
+    vp: mc_math.Mat4, // projection * view rotation (camera-relative world -> clip)
+    cx: f64,
+    cy: f64,
+    cz: f64,
+    near: f64,
+    zero_to_one: bool,
+    // bounding box of the 8 frustum corners (camera-relative)
+    fx0: f64, fy0: f64, fz0: f64, fx1: f64, fy1: f64, fz1: f64,
+    w: i32,
+    h: i32,
+    lv_ptr: [u64; 8], // f64 buffers, level 0 = the depth buffer
+    lv_w: [i32; 8],
+    lv_h: [i32; 8],
+    nlev: usize,
+    // statistics
+    n_frustum: u64,
+    n_occluded: u64,
+    n_visible: u64,
+    n_occluders: u64,
+}
+
+fn cull_new(w: i32, h: i32) -> Cull {
+    var c: Cull = Cull {
+        fr: mc_math.Frustum { p: [0.0; 24] }, vp: mc_math.Mat4 { m: [0.0; 16] }, cx: 0.0, cy: 0.0, cz: 0.0, near: 0.1,
+        zero_to_one: false, fx0: 0.0, fy0: 0.0, fz0: 0.0, fx1: 0.0, fy1: 0.0, fz1: 0.0, w: w, h: h,
+        lv_ptr: [0; 8], lv_w: [0; 8], lv_h: [0; 8], nlev: 0, n_frustum: 0, n_occluded: 0, n_visible: 0, n_occluders: 0,
+    }
+    var lw: i32 = w
+    var lh: i32 = h
+    var k: usize = 0
+    while k < MAX_LEVELS {
+        c.lv_w[k] = lw
+        c.lv_h[k] = lh
+        c.lv_ptr[k] = rt.heap_alloc((lw as usize) * (lh as usize) * 8)
+        k = k + 1
+        c.nlev = k
+        if lw <= 1 && lh <= 1 {
+            k = MAX_LEVELS
+        }
+        lw = (lw + 1) / 2
+        lh = (lh + 1) / 2
+    }
+    return c
+}
+
+fn cull_free(c: *mut Cull) {
+    var k: usize = 0
+    while k < (*c).nlev {
+        rt.heap_free((*c).lv_ptr[k], ((*c).lv_w[k] as usize) * ((*c).lv_h[k] as usize) * 8)
+        (*c).lv_ptr[k] = 0
+        k = k + 1
+    }
+    (*c).nlev = 0
+}
+
+fn ldd(p: u64, i: usize) -> f64 {
+    return *((p + (i as u64) * (8 as u64)) as *mut f64)
+}
+
+fn stdd(p: u64, i: usize, v: f64) {
+    *((p + (i as u64) * (8 as u64)) as *mut f64) = v
+}
+
+// Sets the camera: `vp_rot` = projection * view rotation (16 f64 column-major), the camera position in world f64, the
+// near distance (view-axis distance of the near plane), zero_to_one = the projection's clip depth convention.
+// Derives the frustum planes and the corner bounding box.
+fn cull_begin(c: *mut Cull, vp_rot: *mut mc_math.Mat4, cx: f64, cy: f64, cz: f64, near: f64, zero_to_one: bool) {
+    var i: usize = 0
+    while i < 16 {
+        (*c).vp.m[i] = (*vp_rot).m[i]
+        i = i + 1
+    }
+    (*c).cx = cx
+    (*c).cy = cy
+    (*c).cz = cz
+    (*c).near = near
+    (*c).zero_to_one = zero_to_one
+    mc_math.frustum_from_matrix(&(*c).fr, &(*c).vp, zero_to_one)
+    var inv: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
+    var okinv: bool = mc_math.mat4_invert(&inv, &(*c).vp)
+    (*c).fx0 = 0.0 - INF
+    (*c).fy0 = 0.0 - INF
+    (*c).fz0 = 0.0 - INF
+    (*c).fx1 = INF
+    (*c).fy1 = INF
+    (*c).fz1 = INF
+    if !okinv {
+        return // no bounding box: only the plane test runs
+    }
+    var mnx: f64 = INF
+    var mny: f64 = INF
+    var mnz: f64 = INF
+    var mxx: f64 = 0.0 - INF
+    var mxy: f64 = 0.0 - INF
+    var mxz: f64 = 0.0 - INF
+    var k: usize = 0
+    while k < 8 {
+        var nx: f64 = -1.0
+        var ny: f64 = -1.0
+        var nz: f64 = -1.0
+        if (k & 1) != 0 { nx = 1.0 }
+        if (k & 2) != 0 { ny = 1.0 }
+        if (k & 4) != 0 { nz = 1.0 }
+        if zero_to_one && nz < 0.0 { nz = 0.0 }
+        var p: mc_math.Vec3 = mc_math.Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+        let w: f64 = mc_math.mat4_transform_point(&inv, nx, ny, nz, &p)
+        if w != 0.0 {
+            let px: f64 = p.x / w
+            let py: f64 = p.y / w
+            let pz: f64 = p.z / w
+            if px < mnx { mnx = px }
+            if py < mny { mny = py }
+            if pz < mnz { mnz = pz }
+            if px > mxx { mxx = px }
+            if py > mxy { mxy = py }
+            if pz > mxz { mxz = pz }
+        }
+        k = k + 1
+    }
+    // a small safety margin (the inverse is not exact)
+    let m: f64 = 1.0e-6 * (1.0 + math.fabs(mxx - mnx) + math.fabs(mxy - mny) + math.fabs(mxz - mnz))
+    (*c).fx0 = mnx - m
+    (*c).fy0 = mny - m
+    (*c).fz0 = mnz - m
+    (*c).fx1 = mxx + m
+    (*c).fy1 = mxy + m
+    (*c).fz1 = mxz + m
+}
+
+// 0 = the box is outside the frustum, 1 = (possibly) visible. World f64 box.
+fn cull_frustum_box(c: *mut Cull, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> bool {
+    let rx0: f64 = x0 - (*c).cx
+    let ry0: f64 = y0 - (*c).cy
+    let rz0: f64 = z0 - (*c).cz
+    let rx1: f64 = x1 - (*c).cx
+    let ry1: f64 = y1 - (*c).cy
+    let rz1: f64 = z1 - (*c).cz
+    if mc_math.frustum_test_box(&(*c).fr, rx0, ry0, rz0, rx1, ry1, rz1) == 0 {
+        return false
+    }
+    if rx1 < (*c).fx0 || rx0 > (*c).fx1 || ry1 < (*c).fy0 || ry0 > (*c).fy1 || rz1 < (*c).fz0 || rz0 > (*c).fz1 {
+        return false
+    }
+    return true
+}
+
+fn cull_frustum_sphere(c: *mut Cull, sx: f64, sy: f64, sz: f64, r: f64) -> bool {
+    return mc_math.frustum_test_sphere(&(*c).fr, sx - (*c).cx, sy - (*c).cy, sz - (*c).cz, r) != 0
+}
+
+// ---- projection of a box -------------------------------------------------------------------------------------------
+fn cull_clear_depth(c: *mut Cull) {
+    var i: usize = 0
+    let n: usize = ((*c).w as usize) * ((*c).h as usize)
+    while i < n {
+        stdd((*c).lv_ptr[0], i, INF)
+        i = i + 1
+    }
+}
+
+// Rasterizes one screen triangle (pixel coordinates + view depth w per vertex) into the depth buffer, perspective-correct
+// (1/w is linear in screen space), nearest wins. `margin` > 0 shrinks the covered area (occluders), < 0 grows it
+// (reference fragments) -- per edge (a-b, b-c, c-a). With `write` false nothing is stored; the return value is the number of pixels whose centre is
+// covered AND nearer than what the buffer holds ("visible fragments").
+fn raster_tri(c: *mut Cull, ax: f64, ay: f64, aw: f64, bx: f64, by: f64, bw: f64, cxx: f64, cyy: f64, cw: f64,
+        m_ab: f64, m_bc: f64, m_ca: f64, write: bool) -> u64 {
+    let area: f64 = (bx - ax) * (cyy - ay) - (by - ay) * (cxx - ax)
+    if area == 0.0 {
+        return 0
+    }
+    var minx: f64 = ax
+    var maxx: f64 = ax
+    var miny: f64 = ay
+    var maxy: f64 = ay
+    if bx < minx { minx = bx }
+    if cxx < minx { minx = cxx }
+    if bx > maxx { maxx = bx }
+    if cxx > maxx { maxx = cxx }
+    if by < miny { miny = by }
+    if cyy < miny { miny = cyy }
+    if by > maxy { maxy = by }
+    if cyy > maxy { maxy = cyy }
+    var x0: i32 = math.floor(minx - 0.5) as i32
+    var x1: i32 = math.ceil(maxx + 0.5) as i32
+    var y0: i32 = math.floor(miny - 0.5) as i32
+    var y1: i32 = math.ceil(maxy + 0.5) as i32
+    if x0 < 0 { x0 = 0 }
+    if y0 < 0 { y0 = 0 }
+    if x1 > (*c).w - 1 { x1 = (*c).w - 1 }
+    if y1 > (*c).h - 1 { y1 = (*c).h - 1 }
+    let ia: f64 = 1.0 / aw
+    let ib: f64 = 1.0 / bw
+    let ic: f64 = 1.0 / cw
+    let g_ab: f64 = m_ab * math.fabs(area)
+    let g_bc: f64 = m_bc * math.fabs(area)
+    let g_ca: f64 = m_ca * math.fabs(area)
+    var sgn: f64 = 1.0
+    if area < 0.0 { sgn = -1.0 }
+    var seen: u64 = 0
+    var y: i32 = y0
+    while y <= y1 {
+        var x: i32 = x0
+        while x <= x1 {
+            let px: f64 = (x as f64) + 0.5
+            let py: f64 = (y as f64) + 0.5
+            // barycentric numerators (signed like `area`)
+            let w0: f64 = ((bx - px) * (cyy - py) - (by - py) * (cxx - px)) * sgn // weight of a
+            let w1: f64 = ((cxx - px) * (ay - py) - (cyy - py) * (ax - px)) * sgn // weight of b
+            let w2: f64 = ((ax - px) * (by - py) - (ay - py) * (bx - px)) * sgn // weight of c
+            let aa: f64 = math.fabs(area)
+            if w2 >= g_ab && w0 >= g_bc && w1 >= g_ca {
+                let l0: f64 = w0 / aa
+                let l1: f64 = w1 / aa
+                let l2: f64 = w2 / aa
+                let inv_w: f64 = l0 * ia + l1 * ib + l2 * ic
+                var d: f64 = INF
+                if inv_w > 0.0 {
+                    d = 1.0 / inv_w
+                }
+                let idx: usize = (y as usize) * ((*c).w as usize) + (x as usize)
+                let cur: f64 = ldd((*c).lv_ptr[0], idx)
+                if d < cur {
+                    seen = seen + 1
+                    if write {
+                        stdd((*c).lv_ptr[0], idx, d)
+                    }
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return seen
+}
+
+// Screen position of a corner: pixel x/y and view depth. False if the corner is at/behind the near plane.
+fn corner_screen(c: *mut Cull, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64, k: usize, sx: *mut f64,
+        sy: *mut f64, sw: *mut f64) -> bool {
+    var px: f64 = x0
+    var py: f64 = y0
+    var pz: f64 = z0
+    if (k & 1) != 0 { px = x1 }
+    if (k & 2) != 0 { py = y1 }
+    if (k & 4) != 0 { pz = z1 }
+    let m: *mut mc_math.Mat4 = &(*c).vp
+    let cxw: f64 = (*m).m[0] * px + (*m).m[4] * py + (*m).m[8] * pz + (*m).m[12]
+    let cyw: f64 = (*m).m[1] * px + (*m).m[5] * py + (*m).m[9] * pz + (*m).m[13]
+    let w: f64 = (*m).m[3] * px + (*m).m[7] * py + (*m).m[11] * pz + (*m).m[15]
+    if w <= (*c).near {
+        return false
+    }
+    *sx = (cxw / w * 0.5 + 0.5) * ((*c).w as f64)
+    *sy = (0.5 - cyw / w * 0.5) * ((*c).h as f64)
+    *sw = w
+    return true
+}
+
+// 12 triangles of a box, as corner index triples (corner bit0 = x, bit1 = y, bit2 = z).
+fn box_tri(t: usize, k: usize) -> usize {
+    // faces: -x (0,2,6,4) +x (1,3,7,5) -y (0,1,5,4) +y (2,3,7,6) -z (0,1,3,2) +z (4,5,7,6); each as two triangles
+    var q: [usize; 24] = [0, 2, 6, 4, 1, 3, 7, 5, 0, 1, 5, 4, 2, 3, 7, 6, 0, 1, 3, 2, 4, 5, 7, 6]
+    let face: usize = t / 2
+    let half: usize = t % 2
+    if half == 0 {
+        if k == 0 { return q[face * 4] }
+        if k == 1 { return q[face * 4 + 1] }
+        return q[face * 4 + 2]
+    }
+    if k == 0 { return q[face * 4] }
+    if k == 1 { return q[face * 4 + 2] }
+    return q[face * 4 + 3]
+}
+
+// Corner `k` (0..3) of face f (0 -x, 1 +x, 2 -y, 3 +y, 4 -z, 5 +z); corner bit0 = x, bit1 = y, bit2 = z.
+fn face_corner(f: usize, k: usize) -> usize {
+    var q: [usize; 24] = [0, 2, 6, 4, 1, 3, 7, 5, 0, 1, 5, 4, 2, 3, 7, 6, 0, 1, 3, 2, 4, 5, 7, 6]
+    return q[f * 4 + k]
+}
+
+// Margin of the edge u-v of front face f: 1e-6 (shrunk) if the face across the edge is NOT front-facing (silhouette), else 0.
+fn edge_margin(f: usize, u: usize, v: usize, front: u32) -> f64 {
+    let axis: usize = f / 2
+    let diff: usize = u ^ v // the bit along the edge
+    var eb: usize = 0
+    if diff == 2 { eb = 1 }
+    if diff == 4 { eb = 2 }
+    let d: usize = 3 - axis - eb // the third axis: the neighbour face lies on it
+    let side: usize = (u >> d) & 1
+    let nb: usize = d * 2 + side
+    if (front & ((1 as u32) << (nb as u32))) != (0 as u32) {
+        return 0.0
+    }
+    return 1.0e-6
+}
+
+// Rasterizes the box as shrunk-coverage occluder. False if it was skipped (a corner at/behind the near plane).
+fn cull_add_occluder(c: *mut Cull, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> bool {
+    let rx0: f64 = x0 - (*c).cx
+    let ry0: f64 = y0 - (*c).cy
+    let rz0: f64 = z0 - (*c).cz
+    let rx1: f64 = x1 - (*c).cx
+    let ry1: f64 = y1 - (*c).cy
+    let rz1: f64 = z1 - (*c).cz
+    var sx: [f64; 8] = [0.0; 8]
+    var sy: [f64; 8] = [0.0; 8]
+    var sw: [f64; 8] = [0.0; 8]
+    var k: usize = 0
+    while k < 8 {
+        if !corner_screen(c, rx0, ry0, rz0, rx1, ry1, rz1, k, &sx[k], &sy[k], &sw[k]) {
+            return false
+        }
+        k = k + 1
+    }
+    // Only the FRONT-facing faces are drawn (camera outside the box); the coverage of a front face is shrunk (margin) at
+    // its SILHOUETTE edges only. Edges shared with another front face and the diagonal of the quad are inclusive, so the
+    // seams of the box leave no holes (a pixel centre exactly on a seam would otherwise be lost in both triangles).
+    var front: u32 = 0
+    if rx0 > 0.0 { front = front | (1 as u32) }
+    if rx1 < 0.0 { front = front | (2 as u32) }
+    if ry0 > 0.0 { front = front | (4 as u32) }
+    if ry1 < 0.0 { front = front | (8 as u32) }
+    if rz0 > 0.0 { front = front | (16 as u32) }
+    if rz1 < 0.0 { front = front | (32 as u32) }
+    var f: usize = 0
+    while f < 6 {
+        if (front & ((1 as u32) << (f as u32))) != (0 as u32) {
+            let q0: usize = face_corner(f, 0)
+            let q1: usize = face_corner(f, 1)
+            let q2: usize = face_corner(f, 2)
+            let q3: usize = face_corner(f, 3)
+            let m01: f64 = edge_margin(f, q0, q1, front)
+            let m12: f64 = edge_margin(f, q1, q2, front)
+            let m23: f64 = edge_margin(f, q2, q3, front)
+            let m30: f64 = edge_margin(f, q3, q0, front)
+            raster_tri(c, sx[q0], sy[q0], sw[q0], sx[q1], sy[q1], sw[q1], sx[q2], sy[q2], sw[q2], m01, m12, 0.0, true)
+            raster_tri(c, sx[q0], sy[q0], sw[q0], sx[q2], sy[q2], sw[q2], sx[q3], sy[q3], sw[q3], 0.0, m23, m30, true)
+        }
+        f = f + 1
+    }
+    (*c).n_occluders = (*c).n_occluders + 1
+    return true
+}
+
+// Number of fragments of the box (grown coverage, depth test against the current buffer, nothing written) that would
+// be visible: the brute-force reference for cull_occluded_box. Boxes touching the near plane count as "unknown" = 2^40.
+fn raster_box_fragments(c: *mut Cull, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> u64 {
+    let rx0: f64 = x0 - (*c).cx
+    let ry0: f64 = y0 - (*c).cy
+    let rz0: f64 = z0 - (*c).cz
+    let rx1: f64 = x1 - (*c).cx
+    let ry1: f64 = y1 - (*c).cy
+    let rz1: f64 = z1 - (*c).cz
+    var sx: [f64; 8] = [0.0; 8]
+    var sy: [f64; 8] = [0.0; 8]
+    var sw: [f64; 8] = [0.0; 8]
+    var k: usize = 0
+    while k < 8 {
+        if !corner_screen(c, rx0, ry0, rz0, rx1, ry1, rz1, k, &sx[k], &sy[k], &sw[k]) {
+            return 1099511627776
+        }
+        k = k + 1
+    }
+    var total: u64 = 0
+    var t: usize = 0
+    while t < 12 {
+        let a: usize = box_tri(t, 0)
+        let b: usize = box_tri(t, 1)
+        let d: usize = box_tri(t, 2)
+        total = total + raster_tri(c, sx[a], sy[a], sw[a], sx[b], sy[b], sw[b], sx[d], sy[d], sw[d], -1.0e-6, -1.0e-6, -1.0e-6, false)
+        t = t + 1
+    }
+    return total
+}
+
+// Builds the max pyramid (level k+1 cell = max of the up-to-2x2 cells of level k below it).
+fn cull_build_hiz(c: *mut Cull) {
+    var k: usize = 1
+    while k < (*c).nlev {
+        let pw: i32 = (*c).lv_w[k - 1]
+        let ph: i32 = (*c).lv_h[k - 1]
+        let w: i32 = (*c).lv_w[k]
+        let h: i32 = (*c).lv_h[k]
+        var y: i32 = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                var m: f64 = 0.0 - INF
+                var dy: i32 = 0
+                while dy < 2 {
+                    var dx: i32 = 0
+                    while dx < 2 {
+                        let sxp: i32 = x * 2 + dx
+                        let syp: i32 = y * 2 + dy
+                        if sxp < pw && syp < ph {
+                            let v: f64 = ldd((*c).lv_ptr[k - 1], (syp as usize) * (pw as usize) + (sxp as usize))
+                            if v > m { m = v }
+                        }
+                        dx = dx + 1
+                    }
+                    dy = dy + 1
+                }
+                stdd((*c).lv_ptr[k], (y as usize) * (w as usize) + (x as usize), m)
+                x = x + 1
+            }
+            y = y + 1
+        }
+        k = k + 1
+    }
+}
+
+// True when the box is certainly hidden behind the occluders added so far (see the header). World f64 box.
+fn cull_occluded_box(c: *mut Cull, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> bool {
+    let rx0: f64 = x0 - (*c).cx
+    let ry0: f64 = y0 - (*c).cy
+    let rz0: f64 = z0 - (*c).cz
+    let rx1: f64 = x1 - (*c).cx
+    let ry1: f64 = y1 - (*c).cy
+    let rz1: f64 = z1 - (*c).cz
+    var minx: f64 = INF
+    var maxx: f64 = 0.0 - INF
+    var miny: f64 = INF
+    var maxy: f64 = 0.0 - INF
+    var minw: f64 = INF
+    var k: usize = 0
+    while k < 8 {
+        var sx: f64 = 0.0
+        var sy: f64 = 0.0
+        var sw: f64 = 0.0
+        if !corner_screen(c, rx0, ry0, rz0, rx1, ry1, rz1, k, &sx, &sy, &sw) {
+            return false
+        }
+        if sx < minx { minx = sx }
+        if sx > maxx { maxx = sx }
+        if sy < miny { miny = sy }
+        if sy > maxy { maxy = sy }
+        if sw < minw { minw = sw }
+        k = k + 1
+    }
+    // pixel rectangle, expanded by one pixel, clamped to the buffer
+    var px0: i32 = (math.floor(minx) as i32) - 1
+    var px1: i32 = (math.floor(maxx) as i32) + 1
+    var py0: i32 = (math.floor(miny) as i32) - 1
+    var py1: i32 = (math.floor(maxy) as i32) + 1
+    if px0 < 0 { px0 = 0 }
+    if py0 < 0 { py0 = 0 }
+    if px1 > (*c).w - 1 { px1 = (*c).w - 1 }
+    if py1 > (*c).h - 1 { py1 = (*c).h - 1 }
+    if px0 > px1 || py0 > py1 {
+        return false // completely off screen: the frustum test decides, not the occlusion test
+    }
+    // level whose cells cover the rectangle with <= 2 x 2 cells
+    var lvl: usize = 0
+    while lvl + 1 < (*c).nlev && ((px1 >> (lvl as i32)) - (px0 >> (lvl as i32)) >= 2 || (py1 >> (lvl as i32)) - (py0 >> (lvl as i32)) >= 2) {
+        lvl = lvl + 1
+    }
+    var far: f64 = 0.0 - INF
+    var cy: i32 = py0 >> (lvl as i32)
+    while cy <= (py1 >> (lvl as i32)) {
+        var cxp: i32 = px0 >> (lvl as i32)
+        while cxp <= (px1 >> (lvl as i32)) {
+            let v: f64 = ldd((*c).lv_ptr[lvl], (cy as usize) * ((*c).lv_w[lvl] as usize) + (cxp as usize))
+            if v > far { far = v }
+            cxp = cxp + 1
+        }
+        cy = cy + 1
+    }
+    if far >= INF * 0.5 {
+        return false
+    }
+    return minw > far * (1.0 + 1.0e-7) + 1.0e-7
+}
+
+// Frustum, then occlusion. CULL_FRUSTUM / CULL_OCCLUDED / CULL_VISIBLE; counts the three outcomes.
+fn cull_box(c: *mut Cull, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> i32 {
+    if !cull_frustum_box(c, x0, y0, z0, x1, y1, z1) {
+        (*c).n_frustum = (*c).n_frustum + 1
+        return CULL_FRUSTUM
+    }
+    if cull_occluded_box(c, x0, y0, z0, x1, y1, z1) {
+        (*c).n_occluded = (*c).n_occluded + 1
+        return CULL_OCCLUDED
+    }
+    (*c).n_visible = (*c).n_visible + 1
+    return CULL_VISIBLE
+}

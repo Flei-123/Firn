@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tools/input/read_run.sh -- lib/input (docs/INPUT.md):
-#   1. tests/2792_input_raw.fi: the key / mouse state machine (scripted + 2000 random frames vs a model)
+#   1. tests/2793_input_raw.fi: the key / mouse state machine (scripted + 2000 random frames vs a model)
 #   2. the relative mouse grab on a private Xvfb, driven by xdotool (XTest): XInput2 raw motion AND the
 #      warp-to-centre fallback must both sum 5 x (10,-4) + 3 x (-7,20) = (29,40); raw keys: scancode + keysym
 #   3. the same grab program built for Windows (compile only; Wine ran into MAKE-FAILED here)
@@ -14,7 +14,7 @@ XPID=""
 cleanup() { [ -n "$XPID" ] && kill "$XPID" 2>/dev/null; rm -rf "$D" 2>/dev/null || { sleep 2; rm -rf "$D"; }; }
 trap cleanup EXIT
 fail=0
-"$FIRNC" -o "$D/raw" tests/2792_input_raw.fi || { echo "   FAIL: compile 2792"; exit 1; }
+"$FIRNC" -o "$D/raw" tests/2793_input_raw.fi || { echo "   FAIL: compile 2793"; exit 1; }
 if "$D/raw"; then echo "   ok:   raw.fi state machine (scripted + 2000 random frames)"; else echo "   FAIL: raw.fi state machine exit $?"; fail=1; fi
 if ! command -v Xvfb >/dev/null 2>&1 || ! command -v xdotool >/dev/null 2>&1; then
     echo "   SKIP: grab test (Xvfb or xdotool missing)"

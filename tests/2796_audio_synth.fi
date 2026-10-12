@@ -1,0 +1,195 @@
+// expect_exit: 0
+// audio.synth_osc / synth_fx / synth_recipe: oscillators, noise, envelopes, filters, effects, recipe determinism.
+import std.rt
+import std.io
+import std.json
+import audio.synth_osc
+import audio.synth_fx
+import audio.synth_recipe
+
+fn check(ok: bool, what: str, fails: *mut i32) {
+    if !ok {
+        io.fmt_print(f"FAIL {what}\n")
+        *fails = *fails + 1
+    }
+}
+
+// power of one frequency (Goertzel via a direct sum), in linear units
+fn power_at(p: u64, n: usize, rate: f64, hz: f64) -> f64 {
+    var re: f64 = 0.0
+    var im: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let ph: f64 = hz * (i as f64) / rate
+        re = re + synth_osc.gf(p, i) * synth_osc.cos_turn(ph)
+        im = im + synth_osc.gf(p, i) * synth_osc.sin_turn(ph)
+        i = i + 1
+    }
+    return (re * re + im * im) / ((n as f64) * (n as f64))
+}
+
+fn sine_buf(n: usize, hz: f64) -> u64 {
+    let b: u64 = synth_osc.sig_new(n)
+    let f: u64 = synth_osc.sig_const(n, hz)
+    synth_osc.osc_fill(b, n, 44100.0, synth_osc.WAVE_SINE, f, 0, 0.0, 0.5, 0.0)
+    synth_osc.sig_free(f, n)
+    return b
+}
+
+fn hash_sig(p: u64, n: usize) -> u64 {
+    var h: u64 = 14695981039346656037
+    var i: usize = 0
+    while i < n {
+        h = (h ^ rt.ld64(p, i)) *% 1099511628211
+        i = i + 1
+    }
+    return h
+}
+
+fn filter_gain_db(kind: i32, cut: f64, hz: f64) -> f64 {
+    let n: usize = 8820
+    let src: u64 = sine_buf(n, hz)
+    let out: u64 = synth_osc.sig_new(n)
+    let c: u64 = synth_osc.sig_const(n, cut)
+    let q: u64 = synth_osc.sig_const(n, 0.707)
+    synth_fx.fx_svf(src, out, n, 44100.0, kind, c, q)
+    // measure the second half (settled)
+    let a: f64 = synth_fx.fx_rms(out + (4410 * 8) as u64, 4410)
+    let b: f64 = synth_fx.fx_rms(src + (4410 * 8) as u64, 4410)
+    synth_osc.sig_free(src, n)
+    synth_osc.sig_free(out, n)
+    synth_osc.sig_free(c, n)
+    synth_osc.sig_free(q, n)
+    return 20.0 * (synth_recipe.log2f(a / b) * 0.30102999566398114)
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var fails: i32 = 0
+    // math: pow2 and sine table against known values
+    check(synth_osc.fabs(synth_osc.pow2(0.5) - 1.4142135623730951) < 1e-12, "pow2(0.5)", &fails)
+    check(synth_osc.fabs(synth_osc.pow2(0.0 - 3.0) - 0.125) < 1e-12, "pow2(-3)", &fails)
+    check(synth_osc.fabs(synth_osc.sin_turn(0.125) - 0.7071067811865476) < 1e-6, "sin_turn(1/8)", &fails)
+    check(synth_osc.fabs(synth_osc.sin_turn(0.0 - 0.25) + 1.0) < 1e-6, "sin_turn(-1/4)", &fails)
+    check(synth_osc.fabs(synth_recipe.log2f(1024.0) - 10.0) < 1e-9, "log2f(1024)", &fails)
+    // oscillators: range, mean, frequency
+    let n: usize = 44100
+    let fr: u64 = synth_osc.sig_const(n, 440.0)
+    var w: i32 = 0
+    while w < 5 {
+        let b: u64 = synth_osc.sig_new(n)
+        synth_osc.osc_fill(b, n, 44100.0, w, fr, 0, 0.0, 0.3, 0.0)
+        check(synth_fx.fx_peak(b, n) < 1.05, "oscillator range", &fails)
+        if w != synth_osc.WAVE_PULSE {
+            check(synth_osc.fabs(synth_fx.fx_mean(b, n)) < 0.01, "oscillator mean", &fails)
+        }
+        check(power_at(b, n, 44100.0, 440.0) > 0.05, "oscillator fundamental", &fails)
+        synth_osc.sig_free(b, n)
+        w = w + 1
+    }
+    synth_osc.sig_free(fr, n)
+    // noise: deterministic, zero mean, pink has less treble than white
+    let n1: u64 = synth_osc.sig_new(n)
+    let n2: u64 = synth_osc.sig_new(n)
+    synth_osc.noise_fill(n1, n, synth_osc.NOISE_WHITE, 42)
+    synth_osc.noise_fill(n2, n, synth_osc.NOISE_WHITE, 42)
+    check(hash_sig(n1, n) == hash_sig(n2, n), "noise: same seed, same samples", &fails)
+    synth_osc.noise_fill(n2, n, synth_osc.NOISE_WHITE, 43)
+    check(hash_sig(n1, n) != hash_sig(n2, n), "noise: other seed differs", &fails)
+    check(synth_osc.fabs(synth_fx.fx_mean(n1, n)) < 0.02, "white noise mean", &fails)
+    synth_osc.noise_fill(n2, n, synth_osc.NOISE_PINK, 42)
+    let wl: f64 = power_at(n1, n, 44100.0, 200.0) + power_at(n1, n, 44100.0, 230.0)
+    let wh: f64 = power_at(n1, n, 44100.0, 8000.0) + power_at(n1, n, 44100.0, 8030.0)
+    let pl: f64 = power_at(n2, n, 44100.0, 200.0) + power_at(n2, n, 44100.0, 230.0)
+    let ph: f64 = power_at(n2, n, 44100.0, 8000.0) + power_at(n2, n, 44100.0, 8030.0)
+    check(pl / ph > 4.0 * (wl / wh), "pink noise: bass over treble", &fails)
+    synth_osc.sig_free(n1, n)
+    synth_osc.sig_free(n2, n)
+    // filters: pass band stays, stop band falls, notch kills the centre
+    check(filter_gain_db(synth_fx.FILT_LP, 500.0, 100.0) > 0.0 - 1.0, "svf lowpass passes 100 Hz", &fails)
+    check(filter_gain_db(synth_fx.FILT_LP, 500.0, 5000.0) < 0.0 - 30.0, "svf lowpass stops 5 kHz", &fails)
+    check(filter_gain_db(synth_fx.FILT_HP, 2000.0, 8000.0) > 0.0 - 1.0, "svf highpass passes 8 kHz", &fails)
+    check(filter_gain_db(synth_fx.FILT_HP, 2000.0, 200.0) < 0.0 - 30.0, "svf highpass stops 200 Hz", &fails)
+    check(filter_gain_db(synth_fx.FILT_BP, 1000.0, 1000.0) > 0.0 - 1.0, "svf bandpass passes the centre", &fails)
+    check(filter_gain_db(synth_fx.FILT_BP, 1000.0, 100.0) < 0.0 - 15.0, "svf bandpass stops 100 Hz", &fails)
+    check(filter_gain_db(synth_fx.FILT_NOTCH, 1000.0, 1000.0) < 0.0 - 25.0, "svf notch kills the centre", &fails)
+    // envelope: linear points, exponential segment end values
+    let ev: u64 = synth_osc.sig_new(4410)
+    let pts: u64 = synth_osc.sig_new(9)
+    synth_osc.pf(pts, 0, 0.0)
+    synth_osc.pf(pts, 1, 0.0)
+    synth_osc.pf(pts, 3, 10.0)
+    synth_osc.pf(pts, 4, 1.0)
+    synth_osc.pf(pts, 6, 60.0)
+    synth_osc.pf(pts, 8, 0.0 - 3.0)
+    synth_osc.env_fill(ev, 4410, 44100.0, pts, 3)
+    check(synth_osc.fabs(synth_osc.gf(ev, 220) - 0.5) < 0.01, "envelope: halfway up", &fails)
+    check(synth_osc.fabs(synth_osc.gf(ev, 441) - 1.0) < 0.01, "envelope: peak", &fails)
+    check(synth_osc.gf(ev, 2600) < 0.02 && synth_osc.gf(ev, 4000) == 0.0, "envelope: decays to 0 and stays", &fails)
+    // effects: softclip / limiter bounds, crush levels, delay echo
+    let big: u64 = sine_buf(4410, 300.0)
+    synth_fx.fx_scale(big, 4410, 5.0)
+    let cl: u64 = synth_osc.sig_new(4410)
+    synth_fx.fx_softclip(big, cl, 4410, 1.0)
+    check(synth_fx.fx_peak(cl, 4410) <= 1.0, "softclip stays within 1", &fails)
+    synth_fx.fx_limit(big, cl, 4410, 44100.0, 0.5, 30.0)
+    check(synth_fx.fx_peak(cl, 4410) <= 0.5000001, "limiter keeps the threshold", &fails)
+    let one: u64 = sine_buf(4410, 300.0)
+    synth_fx.fx_crush(one, cl, 4410, 3.0, 1)
+    var distinct: i32 = 0
+    var seen: [f64; 16] = [0.0; 16]
+    var i: usize = 0
+    while i < 4410 {
+        let v: f64 = synth_osc.gf(cl, i)
+        var found: bool = false
+        var k: i32 = 0
+        while k < distinct {
+            if seen[k as usize] == v { found = true }
+            k = k + 1
+        }
+        if !found && distinct < 16 {
+            seen[distinct as usize] = v
+            distinct = distinct + 1
+        }
+        i = i + 1
+    }
+    check(distinct <= 9, "crush: few distinct levels", &fails)
+    let imp: u64 = synth_osc.sig_new(4410)
+    synth_osc.pf(imp, 0, 1.0)
+    let de: u64 = synth_osc.sig_new(4410)
+    synth_fx.fx_delay(imp, de, 4410, 44100.0, 10.0, 0.5, 1.0)
+    check(synth_osc.gf(de, 0) == 1.0 && synth_osc.fabs(synth_osc.gf(de, 441) - 1.0) < 1e-12 && synth_osc.fabs(synth_osc.gf(de, 882) - 0.5) < 1e-12, "delay: echo at 10 ms, feedback 0.5", &fails)
+    let rv: u64 = synth_osc.sig_new(44100)
+    synth_osc.pf(rv, 0, 1.0)
+    synth_fx.fx_reverb(rv, rv, 44100, 44100.0, 0.7, 0.5, 1.0)
+    check(synth_fx.fx_rms(rv + (2000 * 8) as u64, 2000) > 0.0 && synth_fx.fx_rms(rv + (40000 * 8) as u64, 2000) < synth_fx.fx_rms(rv + (2000 * 8) as u64, 2000), "reverb: tail exists and decays", &fails)
+    // recipe: renders twice to the same bits, peak exactly as asked, unknown node is an error
+    let txt: str = "{\"duration_ms\":100,\"seed\":9,\"peak_db\":-6,\"fade_out_ms\":5,\"out\":\"g\",\"nodes\":[{\"id\":\"n\",\"type\":\"noise\"},{\"id\":\"e\",\"type\":\"adsr\",\"a\":2,\"d\":40},{\"id\":\"g\",\"type\":\"gain\",\"in\":\"n\",\"gain\":\"e\"}]}"
+    var j: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&j, txt.p as u64, txt.length()) catch false
+    check(ok, "recipe json parses", &fails)
+    var s1: synth_recipe.Sound = synth_recipe.sound_zero()
+    var s2: synth_recipe.Sound = synth_recipe.sound_zero()
+    var s3: synth_recipe.Sound = synth_recipe.sound_zero()
+    var err: rt.Buf = rt.buf_new()
+    check(synth_recipe.recipe_render(&j, json.json_root(&j), 44100 as u32, 0 as u32, &s1, &err), "recipe renders", &fails)
+    check(synth_recipe.recipe_render(&j, json.json_root(&j), 44100 as u32, 0 as u32, &s2, &err), "recipe renders again", &fails)
+    check(synth_recipe.recipe_render(&j, json.json_root(&j), 44100 as u32, 1 as u32, &s3, &err), "recipe variant renders", &fails)
+    check(hash_sig(s1.samples, s1.n) == hash_sig(s2.samples, s2.n), "recipe: same variant, same bits", &fails)
+    check(hash_sig(s1.samples, s1.n) != hash_sig(s3.samples, s3.n), "recipe: other variant differs", &fails)
+    check(synth_osc.fabs(s1.peak - synth_osc.db_to_gain(0.0 - 6.0)) < 1e-9, "recipe: peak == peak_db", &fails)
+    check(s1.n == 4410, "recipe: length from duration_ms", &fails)
+    synth_recipe.sound_free(&s1)
+    synth_recipe.sound_free(&s2)
+    synth_recipe.sound_free(&s3)
+    let bad: str = "{\"duration_ms\":100,\"out\":\"x\",\"nodes\":[{\"id\":\"x\",\"type\":\"wobble\"}]}"
+    var jb: json.Json = json.json_new()
+    let ok2: bool = json.json_parse(&jb, bad.p as u64, bad.length()) catch false
+    var s4: synth_recipe.Sound = synth_recipe.sound_zero()
+    rt.buf_clear(&err)
+    check(ok2 && !synth_recipe.recipe_render(&jb, json.json_root(&jb), 44100 as u32, 0 as u32, &s4, &err) && rt.buf_len(&err) > 0, "recipe: unknown node type is an error", &fails)
+    if fails == 0 {
+        io.fmt_print(f"audio synth: all checks passed\n")
+    }
+    return fails
+}

@@ -1,0 +1,429 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/synth_fx.fi -- audio.synth_fx: filters and effects on f64 signals (see audio.synth_osc for the signals).
+//
+//     import audio.synth_fx
+//     let cut: u64 = synth_osc.sig_const(n, 800.0)
+//     let q: u64 = synth_osc.sig_const(n, 0.9)
+//     synth_fx.fx_svf(src, dst, n, 44100.0, synth_fx.FILT_LP, cut, q)       // cutoff / Q per sample
+//     synth_fx.fx_normalize(dst, n, synth_osc.db_to_gain(0.0 - 3.0))        // peak -3 dBFS
+//
+// All functions work with in == out (sample by sample) unless noted. Same determinism rules as synth_osc:
+// f64 + - * / only, no libm, no FMA.
+//
+// FILTERS: fx_biquad = RBJ cookbook biquad (transposed direct form II), fx_svf = Zavalishin TPT state variable
+// filter (stable under fast cutoff modulation). Both: kind LP / HP / BP (0 dB at the centre) / NOTCH. The coefficients are
+// recomputed every 8 samples from the per-sample cutoff / Q arrays (a constant array costs the same).
+//
+// HONEST
+// F1  Reverb is mono Freeverb (8 combs + 4 allpasses, tunings scaled from 44.1 kHz): fine for room tails, not a
+//     studio reverb. The tail is cut at the end of the buffer (give the sound enough duration).
+// F2  The limiter has an instant attack and a linear release: no overshoot, but it can sound "pumpy" for strong
+//     reduction. Bitcrush is plain quantisation + sample hold (no dither).
+import std.rt
+import std.math
+import audio.synth_osc
+
+export {
+    FILT_LP, FILT_HP, FILT_BP, FILT_NOTCH,
+    fx_svf, fx_biquad, fx_dcblock, fx_delay, fx_reverb, fx_softclip, fx_limit, fx_crush,
+    fx_peak, fx_rms, fx_scale, fx_normalize, fx_fade, fx_add, fx_shift, fx_mean, fx_to_s16,
+}
+
+const FILT_LP: i32 = 0
+const FILT_HP: i32 = 1
+const FILT_BP: i32 = 2
+const FILT_NOTCH: i32 = 3
+
+fn clamp_cut(fc: f64, rate: f64) -> f64 {
+    var f: f64 = fc
+    if f < 10.0 { f = 10.0 }
+    if f > rate * 0.45 { f = rate * 0.45 }
+    return f
+}
+
+fn clamp_q(q: f64) -> f64 {
+    if q < 0.1 { return 0.1 }
+    return q
+}
+
+// ------------------------------------------------------------------------------------------------ filters
+
+fn fx_svf(inp: u64, out: u64, n: usize, rate: f64, kind: i32, cutoff: u64, q: u64) {
+    var ic1: f64 = 0.0
+    var ic2: f64 = 0.0
+    var a1: f64 = 0.0
+    var a2: f64 = 0.0
+    var a3: f64 = 0.0
+    var k: f64 = 1.0
+    var i: usize = 0
+    while i < n {
+        if i % 8 == 0 {
+            let g: f64 = synth_osc.tan_pi(clamp_cut(synth_osc.gf(cutoff, i), rate) / rate)
+            k = 1.0 / clamp_q(synth_osc.gf(q, i))
+            a1 = 1.0 / (1.0 + g * (g + k))
+            a2 = g * a1
+            a3 = g * a2
+        }
+        let x: f64 = synth_osc.gf(inp, i)
+        let v3: f64 = x - ic2
+        let v1: f64 = a1 * ic1 + a2 * v3
+        let v2: f64 = ic2 + a2 * ic1 + a3 * v3
+        ic1 = 2.0 * v1 - ic1
+        ic2 = 2.0 * v2 - ic2
+        var y: f64 = v2
+        if kind == FILT_HP {
+            y = x - k * v1 - v2
+        } else if kind == FILT_BP {
+            y = k * v1
+        } else if kind == FILT_NOTCH {
+            y = x - k * v1
+        }
+        synth_osc.pf(out, i, y)
+        i = i + 1
+    }
+}
+
+fn fx_biquad(inp: u64, out: u64, n: usize, rate: f64, kind: i32, cutoff: u64, q: u64) {
+    var z1: f64 = 0.0
+    var z2: f64 = 0.0
+    var b0: f64 = 1.0
+    var b1: f64 = 0.0
+    var b2: f64 = 0.0
+    var a1: f64 = 0.0
+    var a2: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        if i % 8 == 0 {
+            let w: f64 = clamp_cut(synth_osc.gf(cutoff, i), rate) / rate
+            let sn: f64 = synth_osc.sin_turn(w)
+            let cs: f64 = synth_osc.cos_turn(w)
+            let alpha: f64 = sn / (2.0 * clamp_q(synth_osc.gf(q, i)))
+            var c0: f64 = 0.0
+            var c1: f64 = 0.0
+            var c2: f64 = 0.0
+            if kind == FILT_LP {
+                c0 = (1.0 - cs) * 0.5
+                c1 = 1.0 - cs
+                c2 = c0
+            } else if kind == FILT_HP {
+                c0 = (1.0 + cs) * 0.5
+                c1 = 0.0 - (1.0 + cs)
+                c2 = c0
+            } else if kind == FILT_BP {
+                c0 = alpha
+                c1 = 0.0
+                c2 = 0.0 - alpha
+            } else {
+                c0 = 1.0
+                c1 = 0.0 - 2.0 * cs
+                c2 = 1.0
+            }
+            let a0: f64 = 1.0 + alpha
+            b0 = c0 / a0
+            b1 = c1 / a0
+            b2 = c2 / a0
+            a1 = (0.0 - 2.0 * cs) / a0
+            a2 = (1.0 - alpha) / a0
+        }
+        let x: f64 = synth_osc.gf(inp, i)
+        let y: f64 = b0 * x + z1
+        z1 = b1 * x - a1 * y + z2
+        z2 = b2 * x - a2 * y
+        synth_osc.pf(out, i, y)
+        i = i + 1
+    }
+}
+
+// y[n] = x[n] - x[n-1] + 0.995 y[n-1]
+fn fx_dcblock(inp: u64, out: u64, n: usize) {
+    var x1: f64 = 0.0
+    var y1: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let x: f64 = synth_osc.gf(inp, i)
+        let y: f64 = x - x1 + 0.995 * y1
+        x1 = x
+        y1 = y
+        synth_osc.pf(out, i, y)
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ effects
+
+// Echo: out = in + mix * delayed, the delay line feeds back `feedback` (0 .. 0.95).
+fn fx_delay(inp: u64, out: u64, n: usize, rate: f64, time_ms: f64, feedback: f64, mix: f64) {
+    var len: usize = (time_ms * rate / 1000.0) as usize
+    if len < 1 { len = 1 }
+    var fb: f64 = feedback
+    if fb > 0.95 { fb = 0.95 }
+    let line: u64 = synth_osc.sig_new(len)
+    var pos: usize = 0
+    var i: usize = 0
+    while i < n {
+        let x: f64 = synth_osc.gf(inp, i)
+        let d: f64 = synth_osc.gf(line, pos)
+        synth_osc.pf(line, pos, x + fb * d)
+        synth_osc.pf(out, i, x + mix * d)
+        pos = pos + 1
+        if pos >= len { pos = 0 }
+        i = i + 1
+    }
+    synth_osc.sig_free(line, len)
+}
+
+fn comb_len(base: usize, rate: f64) -> usize {
+    var l: usize = ((base as f64) * rate / 44100.0) as usize
+    if l < 2 { l = 2 }
+    return l
+}
+
+// Freeverb style mono reverb. room 0..1 (tail length), damp 0..1 (dark tail), mix 0..1 (wet).
+fn fx_reverb(inp: u64, out: u64, n: usize, rate: f64, room: f64, damp: f64, mix: f64) {
+    let ct: u64 = synth_osc.sig_new(8)
+    let at: u64 = synth_osc.sig_new(4)
+    synth_osc.pf(ct, 0, 1116.0)
+    synth_osc.pf(ct, 1, 1188.0)
+    synth_osc.pf(ct, 2, 1277.0)
+    synth_osc.pf(ct, 3, 1356.0)
+    synth_osc.pf(ct, 4, 1422.0)
+    synth_osc.pf(ct, 5, 1491.0)
+    synth_osc.pf(ct, 6, 1557.0)
+    synth_osc.pf(ct, 7, 1617.0)
+    synth_osc.pf(at, 0, 556.0)
+    synth_osc.pf(at, 1, 441.0)
+    synth_osc.pf(at, 2, 341.0)
+    synth_osc.pf(at, 3, 225.0)
+    let fb: f64 = 0.7 + 0.28 * room
+    let d: f64 = damp * 0.4
+    // one allocation per line + state
+    var cbuf: [u64; 8] = [0; 8]
+    var clen: [usize; 8] = [0; 8]
+    var cpos: [usize; 8] = [0; 8]
+    var cst: [f64; 8] = [0.0; 8]
+    var abuf: [u64; 4] = [0; 4]
+    var alen: [usize; 4] = [0; 4]
+    var apos: [usize; 4] = [0; 4]
+    var j: usize = 0
+    while j < 8 {
+        clen[j] = comb_len(synth_osc.gf(ct, j) as usize, rate)
+        cbuf[j] = synth_osc.sig_new(clen[j])
+        j = j + 1
+    }
+    j = 0
+    while j < 4 {
+        alen[j] = comb_len(synth_osc.gf(at, j) as usize, rate)
+        abuf[j] = synth_osc.sig_new(alen[j])
+        j = j + 1
+    }
+    var i: usize = 0
+    while i < n {
+        let x: f64 = synth_osc.gf(inp, i)
+        let inx: f64 = x * 0.015
+        var wet: f64 = 0.0
+        j = 0
+        while j < 8 {
+            let o: f64 = synth_osc.gf(cbuf[j], cpos[j])
+            cst[j] = o * (1.0 - d) + cst[j] * d
+            synth_osc.pf(cbuf[j], cpos[j], inx + cst[j] * fb)
+            cpos[j] = cpos[j] + 1
+            if cpos[j] >= clen[j] { cpos[j] = 0 }
+            wet = wet + o
+            j = j + 1
+        }
+        j = 0
+        while j < 4 {
+            let bo: f64 = synth_osc.gf(abuf[j], apos[j])
+            let y: f64 = bo - wet
+            synth_osc.pf(abuf[j], apos[j], wet + bo * 0.5)
+            apos[j] = apos[j] + 1
+            if apos[j] >= alen[j] { apos[j] = 0 }
+            wet = y
+            j = j + 1
+        }
+        synth_osc.pf(out, i, x * (1.0 - mix) + wet * 3.0 * mix)
+        i = i + 1
+    }
+    j = 0
+    while j < 8 {
+        synth_osc.sig_free(cbuf[j], clen[j])
+        j = j + 1
+    }
+    j = 0
+    while j < 4 {
+        synth_osc.sig_free(abuf[j], alen[j])
+        j = j + 1
+    }
+    synth_osc.sig_free(ct, 8)
+    synth_osc.sig_free(at, 4)
+}
+
+// Rational soft clipper: x * (27 + x^2) / (27 + 9 x^2), exactly +-1 from |x| = 3. Output stays within -1 .. 1.
+fn fx_softclip(inp: u64, out: u64, n: usize, drive: f64) {
+    var i: usize = 0
+    while i < n {
+        let x: f64 = synth_osc.gf(inp, i) * drive
+        var y: f64 = 1.0
+        if x < 0.0 - 3.0 {
+            y = 0.0 - 1.0
+        } else if x < 3.0 {
+            y = x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
+        }
+        synth_osc.pf(out, i, y)
+        i = i + 1
+    }
+}
+
+// Instant attack, linear release limiter: |out| <= threshold.
+fn fx_limit(inp: u64, out: u64, n: usize, rate: f64, threshold: f64, release_ms: f64) {
+    var g: f64 = 1.0
+    var rel: f64 = release_ms * rate / 1000.0
+    if rel < 1.0 { rel = 1.0 }
+    var i: usize = 0
+    while i < n {
+        let x: f64 = synth_osc.gf(inp, i)
+        let a: f64 = synth_osc.fabs(x)
+        var target: f64 = 1.0
+        if a > threshold { target = threshold / a }
+        if target < g {
+            g = target
+        } else {
+            g = g + (target - g) / rel
+            if g > 1.0 { g = 1.0 }
+        }
+        synth_osc.pf(out, i, x * g)
+        i = i + 1
+    }
+}
+
+// Quantise to `bits` (1 .. 16) bits and hold every `hold`-th sample.
+fn fx_crush(inp: u64, out: u64, n: usize, bits: f64, hold: usize) {
+    var lv: f64 = synth_osc.pow2(bits - 1.0)
+    if lv < 1.0 { lv = 1.0 }
+    var h: usize = hold
+    if h < 1 { h = 1 }
+    var held: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        if i % h == 0 {
+            let x: f64 = synth_osc.gf(inp, i) * lv
+            var r: f64 = synth_osc.ffloor(x + 0.5)
+            held = r / lv
+            r = 0.0
+        }
+        synth_osc.pf(out, i, held)
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ levels
+
+fn fx_peak(p: u64, n: usize) -> f64 {
+    var m: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let a: f64 = synth_osc.fabs(synth_osc.gf(p, i))
+        if a > m { m = a }
+        i = i + 1
+    }
+    return m
+}
+
+fn fx_mean(p: u64, n: usize) -> f64 {
+    var s: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        s = s + synth_osc.gf(p, i)
+        i = i + 1
+    }
+    if n == 0 { return 0.0 }
+    return s / (n as f64)
+}
+
+// sqrt(mean(x^2))
+fn fx_rms(p: u64, n: usize) -> f64 {
+    var s: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let x: f64 = synth_osc.gf(p, i)
+        s = s + x * x
+        i = i + 1
+    }
+    if n == 0 { return 0.0 }
+    return math.sqrt(s / (n as f64))
+}
+
+fn fx_scale(p: u64, n: usize, g: f64) {
+    var i: usize = 0
+    while i < n {
+        synth_osc.pf(p, i, synth_osc.gf(p, i) * g)
+        i = i + 1
+    }
+}
+
+// Scales so that the peak equals `target` (linear). Silence stays silence. Returns the gain used.
+fn fx_normalize(p: u64, n: usize, target: f64) -> f64 {
+    let pk: f64 = fx_peak(p, n)
+    if pk <= 0.0 { return 1.0 }
+    let g: f64 = target / pk
+    fx_scale(p, n, g)
+    return g
+}
+
+// Quarter sine ramps (click free) at the start and the end.
+fn fx_fade(p: u64, n: usize, rate: f64, in_ms: f64, out_ms: f64) {
+    let li: usize = (in_ms * rate / 1000.0) as usize
+    let lo: usize = (out_ms * rate / 1000.0) as usize
+    var i: usize = 0
+    while i < li && i < n {
+        synth_osc.pf(p, i, synth_osc.gf(p, i) * synth_osc.sin_turn(0.25 * (i as f64) / (li as f64)))
+        i = i + 1
+    }
+    i = 0
+    while i < lo && i < n {
+        let k: usize = n - 1 - i
+        synth_osc.pf(p, k, synth_osc.gf(p, k) * synth_osc.sin_turn(0.25 * (i as f64) / (lo as f64)))
+        i = i + 1
+    }
+}
+
+// dst += g * src
+fn fx_add(dst: u64, src: u64, n: usize, g: f64) {
+    var i: usize = 0
+    while i < n {
+        synth_osc.pf(dst, i, synth_osc.gf(dst, i) + g * synth_osc.gf(src, i))
+        i = i + 1
+    }
+}
+
+// out = in delayed by `ms` (zeros come in); not in place.
+fn fx_shift(inp: u64, out: u64, n: usize, rate: f64, ms: f64) {
+    let d: usize = (ms * rate / 1000.0) as usize
+    var i: usize = 0
+    while i < n {
+        if i >= d {
+            synth_osc.pf(out, i, synth_osc.gf(inp, i - d))
+        } else {
+            synth_osc.pf(out, i, 0.0)
+        }
+        i = i + 1
+    }
+}
+
+// S16LE bytes (round half away from zero, clamp to +-32767) into `dst` (2 bytes per sample).
+// Returns the number of samples that hit +-32767.
+fn fx_to_s16(p: u64, n: usize, dst: u64) -> usize {
+    var hits: usize = 0
+    var i: usize = 0
+    while i < n {
+        var v: f64 = synth_osc.gf(p, i) * 32767.0
+        if v >= 0.0 { v = v + 0.5 } else { v = v - 0.5 }
+        var q: i64 = v as i64
+        if q > 32767 { q = 32767 }
+        if q < 0 - 32767 { q = 0 - 32767 }
+        if q == 32767 || q == 0 - 32767 { hits = hits + 1 }
+        rt.st16(dst, i, (q & 65535) as u16)
+        i = i + 1
+    }
+    return hits
+}

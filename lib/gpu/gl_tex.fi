@@ -1,0 +1,284 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/gl_tex.fi -- gpu.gl_tex: textures beyond gl33's RGBA8 helper (docs/GPU.md).
+//
+//     import gpu.gl_ext
+//     import gpu.gl_tex
+//     let id: u32 = gl_tex.tex2d_new(&x, w, h, px, true)          // RGBA8, full mip chain, trilinear, repeat
+//     gl_tex.tex_aniso(&x, gl_tex.GL_TEXTURE_2D, id, 1600)          // 16.0x if the driver has it (clamped), else false
+//     let arr: u32 = gl_tex.tex_array_from_atlas(&x, atlas_w, atlas_h, atlas_px, tile, true)   // one layer per tile
+//
+// ATLAS AND MIPMAPS (why the array exists). A tile atlas (T x T tiles, T = 2^n) bleeds at two places:
+//   1. MIP CHAIN: below level n a texel covers more than one tile, so a distant block shows its neighbours' colours.
+//      Fix (cheap): `tex_max_level(.., n)` = the chain stops at the level where one texel = one tile (`atlas_max_level`).
+//      Levels 0..n never mix tiles because the tiles are aligned to the grid.
+//   2. BILINEAR / TRILINEAR TAPS across a tile border read the neighbour tile's texel at EVERY level (the border of a
+//      tile at level k is 2^k texels wide). Fix (exact): a 2D ARRAY TEXTURE, one layer per tile, wrap mode per layer
+//      (`tex_array_from_atlas`); the layers have their own full chains, so nothing leaks and GL_REPEAT works per tile.
+//      The alternative (gutter of 2^n texels around each tile, extruded edge) wastes memory and is not done here.
+// tools/gpu/ext/tex.fi measures both: the atlas bleeds a measurable amount with a full chain, nothing with the
+// clamped chain at a tile-centred sample (level n), and the array has zero bleed at the border even at level 0.
+//
+// Anisotropy: GL_EXT_texture_filter_anisotropic (core in 4.6) is probed in glx_load (`has_aniso`, `max_aniso_x100`).
+// Call from the context's thread.
+
+import std.rt
+import gpu.gl33
+import gpu.gl_ext
+
+export {
+    tex_levels, atlas_max_level, tex2d_new, tex_array_new, tex_array_from_atlas, tex_array_set_layer,
+    tex_array_gen_mips, tex_bind, tex_free, tex_filter, tex_wrap, tex_max_level, tex_aniso, tex_get_aniso_x100,
+    tex_sub_2d, tex_gen_mips, tex_get_level, px_mean, tex_param_i,
+    GL_TEXTURE_2D, GL_TEXTURE_2D_ARRAY, GL_REPEAT, GL_CLAMP_TO_EDGE, GL_MIRRORED_REPEAT,
+}
+
+const GL_TEXTURE_2D: u32 = 0xDE1
+const GL_TEXTURE_2D_ARRAY: u32 = 0x8C1A
+const GL_REPEAT: u32 = 0x2901
+const GL_CLAMP_TO_EDGE: u32 = 0x812F
+const GL_MIRRORED_REPEAT: u32 = 0x8370
+const GL_TEXTURE_MAG_FILTER: u32 = 0x2800
+const GL_TEXTURE_MIN_FILTER: u32 = 0x2801
+const GL_TEXTURE_WRAP_S: u32 = 0x2802
+const GL_TEXTURE_WRAP_T: u32 = 0x2803
+const GL_TEXTURE_MAX_LEVEL: u32 = 0x813D
+const GL_TEXTURE_MAX_ANISOTROPY: u32 = 0x84FE
+const GL_TEXTURE0: u32 = 0x84C0
+const GL_RGBA: u32 = 0x1908
+const GL_RGBA8: u32 = 0x8058
+const GL_UNSIGNED_BYTE: u32 = 0x1401
+const GL_UNPACK_ALIGNMENT: u32 = 0xCF5
+const GL_UNPACK_ROW_LENGTH: u32 = 0xCF2
+const GL_LINEAR: u32 = 0x2601
+const GL_LINEAR_MIPMAP_LINEAR: u32 = 0x2703
+
+// Number of mip levels of a w x h texture (down to 1 x 1): floor(log2(max(w, h))) + 1.
+fn tex_levels(w: i32, h: i32) -> i32 {
+    var m: i32 = w
+    if h > m {
+        m = h
+    }
+    var n: i32 = 1
+    while m > 1 {
+        m = m / 2
+        n = n + 1
+    }
+    return n
+}
+
+// Deepest mip level at which a texel still lies inside ONE tile of a tile-aligned atlas: log2(tile). Use as
+// GL_TEXTURE_MAX_LEVEL so the chain never mixes tiles (bleed source 1 above).
+fn atlas_max_level(tile: i32) -> i32 {
+    var n: i32 = 0
+    var t: i32 = tile
+    while t > 1 {
+        t = t / 2
+        n = n + 1
+    }
+    return n
+}
+
+fn tex_bind(x: *mut gl_ext.GlX, target: u32, unit: u32, id: u32) {
+    gl_ext.gx1(x, gl_ext.X_ACTIVE_TEXTURE, (GL_TEXTURE0 + unit) as u64)
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, target as u64, id as u64)
+}
+
+fn tex_free(x: *mut gl_ext.GlX, id: u32) {
+    gl33.gl_delete_tex(&(*x).g, id)
+}
+
+fn tex_param_i(x: *mut gl_ext.GlX, target: u32, pname: u32, v: u32) {
+    gl_ext.gx3(x, gl_ext.X_TEX_PARAMETERI, target as u64, pname as u64, v as u64)
+}
+
+// Filters of texture `id` (min: GL_NEAREST ... GL_LINEAR_MIPMAP_LINEAR = trilinear; mag: GL_NEAREST / GL_LINEAR).
+fn tex_filter(x: *mut gl_ext.GlX, target: u32, id: u32, min_f: u32, mag_f: u32) {
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, target as u64, id as u64)
+    tex_param_i(x, target, GL_TEXTURE_MIN_FILTER, min_f)
+    tex_param_i(x, target, GL_TEXTURE_MAG_FILTER, mag_f)
+}
+
+fn tex_wrap(x: *mut gl_ext.GlX, target: u32, id: u32, ws: u32, wt: u32) {
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, target as u64, id as u64)
+    tex_param_i(x, target, GL_TEXTURE_WRAP_S, ws)
+    tex_param_i(x, target, GL_TEXTURE_WRAP_T, wt)
+}
+
+// Last mip level that sampling may use (GL_TEXTURE_MAX_LEVEL); `atlas_max_level(tile)` for atlases.
+fn tex_max_level(x: *mut gl_ext.GlX, target: u32, id: u32, level: i32) {
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, target as u64, id as u64)
+    tex_param_i(x, target, GL_TEXTURE_MAX_LEVEL, level as u32)
+}
+
+// Anisotropic filtering, `aniso_x100` = 100 * N (1600 = 16x). Clamped to the driver maximum. False (and nothing set)
+// when GL_EXT_texture_filter_anisotropic is missing. The value actually set is readable with tex_get_aniso_x100.
+fn tex_aniso(x: *mut gl_ext.GlX, target: u32, id: u32, aniso_x100: i32) -> bool {
+    if !(*x).has_aniso {
+        return false
+    }
+    var v: i32 = aniso_x100
+    if v > (*x).max_aniso_x100 {
+        v = (*x).max_aniso_x100
+    }
+    if v < 100 {
+        v = 100
+    }
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, target as u64, id as u64)
+    (*x).args[0] = target as u64
+    (*x).args[1] = GL_TEXTURE_MAX_ANISOTROPY as u64
+    (*x).args[2] = gl_ext.gx_fb((v as f64) / 100.0)
+    gl_ext.gxi(x, gl_ext.X_TEX_PARAMETERF, "iif")
+    return true
+}
+
+// The anisotropy currently set on `id`, x100 (0 = not supported).
+fn tex_get_aniso_x100(x: *mut gl_ext.GlX, target: u32, id: u32) -> i32 {
+    if !(*x).has_aniso {
+        return 0
+    }
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, target as u64, id as u64)
+    (*x).tmp[0] = 0 as u32
+    gl_ext.gx3(x, gl_ext.X_GET_TEX_PARAMETERFV, target as u64, GL_TEXTURE_MAX_ANISOTROPY as u64, (&(*x).tmp[0]) as u64)
+    let f: f32 = *(((&(*x).tmp[0]) as u64) as *mut f32)
+    return (((f as f64) * 100.0) + 0.5) as i32
+}
+
+fn tex_gen_mips(x: *mut gl_ext.GlX, target: u32, id: u32) {
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, target as u64, id as u64)
+    gl_ext.gx1(x, gl_ext.X_GENERATE_MIPMAP, target as u64)
+}
+
+// RGBA8 2D texture. mips = true: full chain + trilinear min filter; false: NEAREST/NEAREST. Wrap = GL_REPEAT.
+fn tex2d_new(x: *mut gl_ext.GlX, w: i32, h: i32, px: u64, mips: bool) -> u32 {
+    (*x).tmp[0] = 0 as u32
+    gl_ext.gx2(x, gl_ext.X_GEN_TEXTURES, 1, (&(*x).tmp[0]) as u64)
+    let id: u32 = (*x).tmp[0]
+    if id == 0 as u32 {
+        return 0 as u32
+    }
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, GL_TEXTURE_2D as u64, id as u64)
+    gl33.gl_pixel_store(&(*x).g, GL_UNPACK_ALIGNMENT, 1)
+    gl_ext.gx9(x, gl_ext.X_TEX_IMAGE2D, GL_TEXTURE_2D as u64, 0, GL_RGBA8 as u64, w as u64, h as u64, 0,
+        GL_RGBA as u64, GL_UNSIGNED_BYTE as u64, px)
+    tex_wrap(x, GL_TEXTURE_2D, id, GL_REPEAT, GL_REPEAT)
+    if mips {
+        tex_filter(x, GL_TEXTURE_2D, id, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR)
+        gl_ext.gx1(x, gl_ext.X_GENERATE_MIPMAP, GL_TEXTURE_2D as u64)
+    } else {
+        tex_filter(x, GL_TEXTURE_2D, id, gl33.GL_NEAREST, gl33.GL_NEAREST)
+    }
+    return id
+}
+
+// Sub-rectangle upload into level `level` of a 2D texture: `px` = w*h*4 bytes (tightly packed rows).
+// `regen`: rebuild the mip chain afterwards (only valid for level 0).
+fn tex_sub_2d(x: *mut gl_ext.GlX, id: u32, level: i32, xo: i32, yo: i32, w: i32, h: i32, px: u64, regen: bool) {
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, GL_TEXTURE_2D as u64, id as u64)
+    gl33.gl_pixel_store(&(*x).g, GL_UNPACK_ALIGNMENT, 1)
+    gl_ext.gx9(x, gl_ext.X_TEX_SUB_IMAGE2D, GL_TEXTURE_2D as u64, level as u64, xo as u64, yo as u64, w as u64,
+        h as u64, GL_RGBA as u64, GL_UNSIGNED_BYTE as u64, px)
+    if regen && level == 0 {
+        gl_ext.gx1(x, gl_ext.X_GENERATE_MIPMAP, GL_TEXTURE_2D as u64)
+    }
+}
+
+// Reads level `level` of texture `id` (glGetTexImage, RGBA8) into `out` (w*h*4 bytes of THAT level). A stall; tests only.
+fn tex_get_level(x: *mut gl_ext.GlX, target: u32, id: u32, level: i32, out: u64) {
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, target as u64, id as u64)
+    gl33.gl_pixel_store(&(*x).g, 0xD05, 1)
+    gl_ext.gx5(x, gl_ext.X_GET_TEX_IMAGE, target as u64, level as u64, GL_RGBA as u64, GL_UNSIGNED_BYTE as u64, out)
+}
+
+// Mean of channel `ch` (0..3) over `n` RGBA pixels at `p`, in 0..255.
+fn px_mean(p: u64, n: usize, ch: usize) -> f64 {
+    var s: u64 = 0
+    var i: usize = 0
+    while i < n {
+        s = s + (rt.ld8(p, i * 4 + ch) as u64)
+        i = i + 1
+    }
+    return (s as f64) / (n as f64)
+}
+
+// ---- 2D array texture ---------------------------------------------------------------------------------------------
+// w x h x `layers` RGBA8 array. `px` = layers * w*h*4 bytes (layer after layer) or 0 (allocate only; all levels).
+// mips = true: trilinear + full chain of every layer. Wrap = GL_REPEAT. 0 when the context has no 2D arrays or
+// layers > GL_MAX_ARRAY_TEXTURE_LAYERS.
+fn tex_array_new(x: *mut gl_ext.GlX, w: i32, h: i32, layers: i32, px: u64, mips: bool) -> u32 {
+    if !(*x).has_tex_array || layers > (*x).max_layers || layers < 1 {
+        return 0 as u32
+    }
+    (*x).tmp[0] = 0 as u32
+    gl_ext.gx2(x, gl_ext.X_GEN_TEXTURES, 1, (&(*x).tmp[0]) as u64)
+    let id: u32 = (*x).tmp[0]
+    if id == 0 as u32 {
+        return 0 as u32
+    }
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, GL_TEXTURE_2D_ARRAY as u64, id as u64)
+    gl33.gl_pixel_store(&(*x).g, GL_UNPACK_ALIGNMENT, 1)
+    gl_ext.gx10(x, gl_ext.X_TEX_IMAGE3D, GL_TEXTURE_2D_ARRAY as u64, 0, GL_RGBA8 as u64, w as u64, h as u64,
+        layers as u64, 0, GL_RGBA as u64, GL_UNSIGNED_BYTE as u64, px)
+    tex_wrap(x, GL_TEXTURE_2D_ARRAY, id, GL_REPEAT, GL_REPEAT)
+    if mips {
+        tex_filter(x, GL_TEXTURE_2D_ARRAY, id, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR)
+        if px != 0 {
+            gl_ext.gx1(x, gl_ext.X_GENERATE_MIPMAP, GL_TEXTURE_2D_ARRAY as u64)
+        }
+    } else {
+        tex_filter(x, GL_TEXTURE_2D_ARRAY, id, gl33.GL_NEAREST, gl33.GL_NEAREST)
+    }
+    return id
+}
+
+// Replaces layer `layer` (w*h*4 bytes). Rebuild the chain afterwards with tex_array_gen_mips (once per batch).
+fn tex_array_set_layer(x: *mut gl_ext.GlX, id: u32, layer: i32, w: i32, h: i32, px: u64) {
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, GL_TEXTURE_2D_ARRAY as u64, id as u64)
+    gl33.gl_pixel_store(&(*x).g, GL_UNPACK_ALIGNMENT, 1)
+    (*x).args[0] = GL_TEXTURE_2D_ARRAY as u64
+    (*x).args[1] = 0
+    (*x).args[2] = 0
+    (*x).args[3] = 0
+    (*x).args[4] = layer as u64
+    (*x).args[5] = w as u64
+    (*x).args[6] = h as u64
+    (*x).args[7] = 1
+    (*x).args[8] = GL_RGBA as u64
+    (*x).args[9] = GL_UNSIGNED_BYTE as u64
+    (*x).args[10] = px
+    gl_ext.gxi(x, gl_ext.X_TEX_SUB_IMAGE3D, "iiiiiiiiiii")
+}
+
+fn tex_array_gen_mips(x: *mut gl_ext.GlX, id: u32) {
+    tex_gen_mips(x, GL_TEXTURE_2D_ARRAY, id)
+}
+
+// Atlas (aw x ah RGBA8, rows top-down, tile x tile tiles row by row) -> array texture with one layer per tile
+// (layer = row * cols + col). The cure for the bilinear bleed across tile borders (see the header). 0 on failure.
+fn tex_array_from_atlas(x: *mut gl_ext.GlX, aw: i32, ah: i32, px: u64, tile: i32, mips: bool) -> u32 {
+    let cols: i32 = aw / tile
+    let rows: i32 = ah / tile
+    let layers: i32 = cols * rows
+    let tbytes: usize = (tile as usize) * (tile as usize) * 4
+    let buf: u64 = rt.heap_alloc(tbytes * (layers as usize))
+    if buf == 0 {
+        return 0 as u32
+    }
+    var ty: i32 = 0
+    while ty < rows {
+        var tx: i32 = 0
+        while tx < cols {
+            let layer: usize = ((ty * cols + tx) as usize)
+            var r: i32 = 0
+            while r < tile {
+                let src: u64 = px + ((((ty * tile + r) * aw + tx * tile) as usize) * 4) as u64
+                rt.mem_copy(buf + ((layer * tbytes + (r as usize) * (tile as usize) * 4) as u64), src, (tile as usize) * 4)
+                r = r + 1
+            }
+            tx = tx + 1
+        }
+        ty = ty + 1
+    }
+    let id: u32 = tex_array_new(x, tile, tile, layers, buf, mips)
+    rt.heap_free(buf, tbytes * (layers as usize))
+    return id
+}
