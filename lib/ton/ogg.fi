@@ -1,0 +1,336 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/ton/ogg.fi -- the OGG container (RFC 3533): pages in, packets out.
+//
+//     import ton.ogg
+//
+//     var rd: ogg.OggReader = ogg.ogg_new(data_ptr, data_len)
+//     while ogg.ogg_next(&rd) == 1 {
+//         // ogg.ogg_pkt_ptr(&rd), ogg.ogg_pkt_len(&rd): the packet octets
+//         // rd.granule: granule position of the page this packet ENDS on (or -1)
+//         // rd.eos / rd.bos: the page carried the end / begin flag
+//     }
+//     ogg.ogg_free(&rd)
+//
+// WHAT IT DOES. Finds "OggS", checks version and CRC-32 of the whole page,
+// reads the lacing table and glues the segments into PACKETS -- also across
+// page boundaries (a packet of 255 octets segments + a final smaller one; a
+// packet may continue on the next page). Only ONE logical bitstream is
+// followed: the serial number of the first page that carries the begin flag.
+// Pages of other serial numbers (multiplexed video, a second audio track)
+// are skipped. `ogg_next_link` jumps to the next chained link (the next
+// begin-of-stream page after the end-of-stream page).
+//
+// ROBUSTNESS. A page with a wrong CRC, a wrong version or a lacing table
+// that points past the end of the data is NOT a page: the reader moves one
+// octet on and searches for the next "OggS" (`lost` counts those events).
+// A packet that was started on a page and is not continued on the next one
+// (hole in the file) is dropped, not delivered half. The reader never
+// reads outside `data .. data+len`; no input can make it fail.
+//
+// NOT HERE: seeking (the reader only walks forward), page-granule based
+// time stamps for single packets (only the granule of the page's LAST packet
+// is known, as in the format), Ogg Skeleton, multiplexing logic.
+import std.rt
+
+export {
+    OggReader,
+    ogg_new, ogg_free, ogg_next, ogg_next_link, ogg_pkt_ptr, ogg_pkt_len,
+    ogg_crc,
+}
+
+const FLAG_CONTINUED: i32 = 1
+const FLAG_BOS: i32 = 2
+const FLAG_EOS: i32 = 4
+
+static mut OGG_CRC_TABLE: [u32; 256] = [0; 256]
+static mut OGG_CRC_READY: bool = false
+
+fn crc_init() {
+    var n: u32 = 0 as u32
+    while n < 256 as u32 {
+        var c: u32 = n << 24
+        var k: i32 = 0
+        while k < 8 {
+            if (c & 2147483648 as u32) != 0 as u32 {
+                c = (c << 1) ^ 79764919 as u32 // 0x04C11DB7
+            } else {
+                c = c << 1
+            }
+            k = k + 1
+        }
+        OGG_CRC_TABLE[n as usize] = c
+        n = n + 1 as u32
+    }
+    OGG_CRC_READY = true
+}
+
+// Ogg's CRC-32: polynomial 0x04C11DB7, NOT reflected, start value 0, no final xor.
+// `crc` is the running value (0 at the start).
+fn ogg_crc(crc: u32, p: u64, n: usize) -> u32 {
+    if !OGG_CRC_READY {
+        crc_init()
+    }
+    var c: u32 = crc
+    var i: usize = 0
+    while i < n {
+        c = (c << 8) ^ OGG_CRC_TABLE[(((c >> 24) ^ (rt.ld8(p, i) as u32)) & 255 as u32) as usize]
+        i = i + 1
+    }
+    return c
+}
+
+struct OggReader {
+    data: u64,
+    len: usize,
+    pos: usize,           // next octet to look at (start of the next page)
+    serial: u32,
+    serial_set: bool,
+    ended: bool,          // the end-of-stream page of the followed link was seen
+    // the page being consumed
+    in_page: bool,
+    seg_count: i32,
+    seg_next: i32,        // next lacing value to consume
+    seg_pos: usize,       // offset of the next segment's octets
+    seg_table: usize,     // offset of the lacing table
+    page_flags: i32,
+    page_granule: i64,
+    page_seq: u32,
+    partial: bool,        // a packet is assembled in `pkt` and continues on the next page
+    pkt: rt.Buf,
+    // the last delivered packet
+    granule: i64,         // granule of the page this packet ends on, -1 else
+    eos: bool,
+    bos: bool,
+    // statistics
+    pages: i32,
+    lost: i32,
+}
+
+fn ogg_new(data: u64, len: usize) -> OggReader {
+    return OggReader {
+        data: data, len: len, pos: 0, serial: 0 as u32, serial_set: false, ended: false,
+        in_page: false, seg_count: 0, seg_next: 0, seg_pos: 0, seg_table: 0,
+        page_flags: 0, page_granule: -1, page_seq: 0 as u32, partial: false,
+        pkt: rt.buf_new(), granule: -1, eos: false, bos: false, pages: 0, lost: 0,
+    }
+}
+
+fn ogg_free(rd: *mut OggReader) {
+    rt.buf_free(&(*rd).pkt)
+}
+
+fn ogg_pkt_ptr(rd: *mut OggReader) -> u64 {
+    return rt.buf_ptr(&(*rd).pkt)
+}
+
+fn ogg_pkt_len(rd: *mut OggReader) -> usize {
+    return rt.buf_len(&(*rd).pkt)
+}
+
+fn le32(p: u64, o: usize) -> u32 {
+    return (rt.ld8(p, o) as u32) | ((rt.ld8(p, o + 1) as u32) << 8)
+        | ((rt.ld8(p, o + 2) as u32) << 16) | ((rt.ld8(p, o + 3) as u32) << 24)
+}
+
+// Tries to take a page at `rd.pos`. Returns true and fills the page fields
+// when a valid page of the followed stream is there; false = not a page at
+// this position (the caller moves one octet on).
+fn page_at(rd: *mut OggReader, skip_other: *mut bool) -> bool {
+    *skip_other = false
+    let d: u64 = (*rd).data
+    let at: usize = (*rd).pos
+    let len: usize = (*rd).len
+    if at + 27 > len {
+        return false
+    }
+    if rt.ld8(d, at) != 79 as u8 || rt.ld8(d, at + 1) != 103 as u8 || rt.ld8(d, at + 2) != 103 as u8
+        || rt.ld8(d, at + 3) != 83 as u8 {
+        return false
+    }
+    if rt.ld8(d, at + 4) != 0 as u8 {
+        return false
+    }
+    let nseg: usize = rt.ld8(d, at + 26) as usize
+    let hdr: usize = 27 + nseg
+    if at + hdr > len {
+        return false
+    }
+    var body: usize = 0
+    var i: usize = 0
+    while i < nseg {
+        body = body + (rt.ld8(d, at + 27 + i) as usize)
+        i = i + 1
+    }
+    if at + hdr + body > len {
+        return false
+    }
+    // CRC over the whole page with the four checksum octets counted as zeros
+    let stored: u32 = le32(d, at + 22)
+    var z: u32 = ogg_crc(0 as u32, d + (at as u64), 22)
+    var k: i32 = 0
+    while k < 4 {
+        z = (z << 8) ^ OGG_CRC_TABLE[((z >> 24) & 255 as u32) as usize]
+        k = k + 1
+    }
+    z = ogg_crc(z, d + ((at + 26) as u64), hdr - 26 + body)
+    if z != stored {
+        return false
+    }
+    let flags: i32 = rt.ld8(d, at + 5) as i32
+    let serial: u32 = le32(d, at + 14)
+    if (flags & FLAG_BOS) != 0 && !(*rd).serial_set {
+        (*rd).serial = serial
+        (*rd).serial_set = true
+        (*rd).ended = false
+    }
+    if !(*rd).serial_set || serial != (*rd).serial {
+        // valid page, other stream: step over it as a whole
+        *skip_other = true
+        (*rd).pos = at + hdr + body
+        return true
+    }
+    var g: i64 = 0
+    var b: i32 = 7
+    while b >= 0 {
+        g = (g << 8) | (rt.ld8(d, at + 6 + (b as usize)) as i64)
+        b = b - 1
+    }
+    (*rd).page_flags = flags
+    (*rd).page_granule = g
+    (*rd).page_seq = le32(d, at + 18)
+    (*rd).seg_count = nseg as i32
+    (*rd).seg_next = 0
+    (*rd).seg_table = at + 27
+    (*rd).seg_pos = at + hdr
+    (*rd).pos = at + hdr + body
+    (*rd).in_page = true
+    (*rd).pages = (*rd).pages + 1
+    return true
+}
+
+// Next packet of the followed stream. 1 = packet in `ogg_pkt_ptr/len`, 0 = end
+// of data (or of the link).
+fn ogg_next(rd: *mut OggReader) -> i32 {
+    if (*rd).ended {
+        return 0
+    }
+    if !(*rd).partial {
+        rt.buf_clear(&(*rd).pkt)
+    }
+    return next_packet(rd)
+}
+
+fn next_packet(rd: *mut OggReader) -> i32 {
+    while true {
+        if !(*rd).in_page {
+            // find the next page
+            var found: bool = false
+            while !found {
+                if (*rd).pos + 27 > (*rd).len {
+                    return 0
+                }
+                var other: bool = false
+                if page_at(rd, &other) {
+                    if !other {
+                        found = true
+                    }
+                } else {
+                    (*rd).pos = (*rd).pos + 1
+                    (*rd).lost = (*rd).lost + 1
+                    // look for the next 'O'
+                    while (*rd).pos < (*rd).len && rt.ld8((*rd).data, (*rd).pos) != 79 as u8 {
+                        (*rd).pos = (*rd).pos + 1
+                    }
+                    // a packet being assembled lost its continuation
+                    if (*rd).partial {
+                        (*rd).partial = false
+                        rt.buf_clear(&(*rd).pkt)
+                    }
+                }
+            }
+            if ((*rd).page_flags & FLAG_CONTINUED) == 0 && (*rd).partial {
+                // hole: the old packet never ended
+                (*rd).partial = false
+                rt.buf_clear(&(*rd).pkt)
+            }
+            if ((*rd).page_flags & FLAG_CONTINUED) != 0 && !(*rd).partial {
+                // continuation of a packet we do not have: skip its tail
+                var skipping: bool = true
+                while skipping && (*rd).seg_next < (*rd).seg_count {
+                    let l: usize = rt.ld8((*rd).data, (*rd).seg_table + ((*rd).seg_next as usize)) as usize
+                    (*rd).seg_pos = (*rd).seg_pos + l
+                    (*rd).seg_next = (*rd).seg_next + 1
+                    if l < 255 {
+                        skipping = false
+                    }
+                }
+            }
+        }
+        // consume lacing values of the current page
+        while (*rd).seg_next < (*rd).seg_count {
+            let l: usize = rt.ld8((*rd).data, (*rd).seg_table + ((*rd).seg_next as usize)) as usize
+            rt.buf_push_bytes(&(*rd).pkt, (*rd).data + ((*rd).seg_pos as u64), l)
+            (*rd).seg_pos = (*rd).seg_pos + l
+            (*rd).seg_next = (*rd).seg_next + 1
+            if l < 255 {
+                (*rd).partial = false
+                (*rd).granule = -1
+                (*rd).bos = false
+                (*rd).eos = false
+                if (*rd).seg_next >= (*rd).seg_count {
+                    // last packet that ends on this page
+                    (*rd).granule = (*rd).page_granule
+                    (*rd).in_page = false
+                    if ((*rd).page_flags & FLAG_EOS) != 0 {
+                        (*rd).eos = true
+                        (*rd).ended = true
+                    }
+                }
+                if ((*rd).page_flags & FLAG_BOS) != 0 && (*rd).seg_next == 1 {
+                    (*rd).bos = true
+                }
+                return 1
+            }
+        }
+        // the page ended inside a packet (last lacing value 255)
+        (*rd).in_page = false
+        (*rd).partial = true
+        if ((*rd).page_flags & FLAG_EOS) != 0 {
+            // a link ending in an unfinished packet: drop it
+            (*rd).partial = false
+            rt.buf_clear(&(*rd).pkt)
+            (*rd).ended = true
+            return 0
+        }
+    }
+    return 0
+}
+
+// After the end of a link: go on with the next chained link (the next page
+// with the begin flag). false = no further link.
+fn ogg_next_link(rd: *mut OggReader) -> bool {
+    (*rd).serial_set = false
+    (*rd).ended = false
+    (*rd).in_page = false
+    (*rd).partial = false
+    rt.buf_clear(&(*rd).pkt)
+    // search for a BOS page
+    while (*rd).pos + 27 <= (*rd).len {
+        let at: usize = (*rd).pos
+        var other: bool = false
+        // page_at takes the page as the new stream when it carries BOS
+        let save_pos: usize = at
+        if rt.ld8((*rd).data, at) == 79 as u8 && (rt.ld8((*rd).data, at + 5) as i32 & FLAG_BOS) != 0 {
+            if page_at(rd, &other) {
+                if (*rd).serial_set {
+                    // rewind: the page has to be delivered by ogg_next
+                    (*rd).pos = save_pos
+                    (*rd).in_page = false
+                    return true
+                }
+            }
+        }
+        (*rd).pos = at + 1
+    }
+    return false
+}

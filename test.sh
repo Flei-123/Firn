@@ -1982,6 +1982,21 @@ if [ "$MARC" -eq 0 ]; then
 else
     bad "tools/mc/audio/run.sh failed (see .test-work/mcaudio.log)"
     grep -E 'FAIL' "$WORK/mcaudio.log" | head -12 | sed 's/^/   /' || true
+echo "== 120. Ogg Vorbis decoder (lib/ton/vorbis*.fi, ogg.fi) against libsndfile, <= 1 LSB, plus mutation fuzz (tools/vorbis/run.sh, docs/VORBIS.md) =="
+# tests/2780_vorbis.fi runs in every build stage above; this one holds the decoder against the reference (python3 soundfile)
+# and feeds it mutated / truncated files (CRC repaired, so the damage reaches the decoder). No python soundfile: SKIP.
+if python3 -c "import soundfile, numpy" > /dev/null 2>&1; then
+    FIRNC="$FIRNC" bash tools/vorbis/run.sh 600 > "$WORK/vorbis.log" 2>&1 && VBRC=0 || VBRC=$?
+    if [ "$VBRC" -eq 0 ]; then
+        ok
+        tail -n 1 "$WORK/vorbis.log" | sed 's/^/   /'
+    else
+        bad "tools/vorbis/run.sh failed (see .test-work/vorbis.log)"
+        tail -n 8 "$WORK/vorbis.log" | sed 's/^/   /' || true
+    fi
+else
+    ok
+    echo "   SKIP (python3 soundfile/numpy missing)"
 fi
 
 TOTAL=$((PASS + FAIL))
