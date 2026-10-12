@@ -1973,6 +1973,28 @@ else
     grep -E 'FAIL|scene .*FAIL' "$WORK/gpu.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 124. lib/input: raw keys / mouse state machine, relative mouse grab (X11 raw motion + warp fallback) under Xvfb+xdotool (tools/input/read_run.sh, docs/INPUT.md) =="
+FIRNC="$FIRNC" bash tools/input/read_run.sh > "$WORK/rawinput.log" 2>&1 && RAWINRC=0 || RAWINRC=$?
+if [ "$RAWINRC" -eq 0 ]; then
+    ok
+    grep -E '^ *(ok|SKIP)' "$WORK/rawinput.log" | sed 's/^/ /'
+else
+    bad "tools/input/read_run.sh failed (see .test-work/rawinput.log)"
+    grep -E 'FAIL' "$WORK/rawinput.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 122. lib/gpu building blocks: gl_ext/gl_prog/gl_tex/gl_fbo/gl_query on llvmpipe + gpu.cull vs brute force (tools/gpu/ext/run.sh, docs/GPU.md) =="
+# Shader program + uniform cache + UBO + instancing + multi indirect + timer queries + mipmaps/aniso/atlas bleed + MRT/MSAA; CPU culling
+# (frustum, far origin, Hi-Z occlusion) against sampled references. Mesa llvmpipe only; no libEGL is SKIP for the GL half.
+FIRNC="$FIRNC" bash tools/gpu/ext/run.sh > "$WORK/gpuext.log" 2>&1 && GXRC=0 || GXRC=$?
+if [ "$GXRC" -eq 0 ]; then
+    ok
+    grep -E '^   (ok|SKIP)|metric' "$WORK/gpuext.log" | sed 's/^/ /'
+else
+    bad "tools/gpu/ext/run.sh failed (see .test-work/gpuext.log)"
+    grep -E 'FAIL' "$WORK/gpuext.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 121. mc_audio: Minecraft listener/sources/blocks/categories/packets on audio.engine (tools/mc/audio/run.sh, docs/mc/audio.md) =="
 # Pan, attenuation, Minecraft gain and pan law bit for bit against numpy float32 (3 stages), then tests/2766_mc_audio.fi through the real engine.
 FIRNC="$FIRNC" bash tools/mc/audio/run.sh > "$WORK/mcaudio.log" 2>&1 && MARC=0 || MARC=$?

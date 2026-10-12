@@ -1,0 +1,6 @@
+# mc_cull -- frustum + cave culling (lib/mc/mc_cull.fi)
+* `cull_conn(pad, opaque, scratch)`: 15 bit face connectivity of one section (flood fill through non-opaque blocks of the 16^3 core of an mc_mesh padded array).
+* `cull_run(cull, cam, dist, setback)`: BFS from the camera section over face neighbours; step out of face f only if an entry face i has conn(i,f), the neighbour touches the frustum and (setback) the step does not reverse an earlier step. Nodes are re-queued when entry faces grow or the step history shrinks, so the result is order independent. Unknown sections (never meshed / not loaded) are open. Result `c.out` front to back (same order as mc_render_world). `cull_run_frustum` = frustum only (the "before").
+* Test `tests/2772_mc_cull.fi`: 36 poses in `mc_terrain` (hills + tunnels + caverns): image with culling == image of all frustum sections (byte identical) with and without the set-back rule; a graph with every conn 0 gives different images (counter-check). Run: `bash tools/mc/cull/run.sh`.
+* Fixture trap found: a camera inside a solid block (block coordinate by truncation instead of floor) makes any culler look wrong.
+* NOT done: Measurements (sections/frame), see docs/mc/stream.md "Open".

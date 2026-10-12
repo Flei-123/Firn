@@ -30,8 +30,23 @@ mc_audio.mca_decode_sound_effect / _entity_sound / _stop_sound + mca_apply_sound
 
 ## Honest limits
 - M1 sound types come from the block NAME (the registry has none); wrong for odd blocks (rules in `mca_material_of_name`).
-- M2 numeric sound ids need the id -> name list of the version (`mca_sound_id_set`); not generated yet (minecraft-data has `sounds.json` only from 1.21 on in this checkout). Inline named sounds work.
+- M2 numeric sound ids: names come from `tools/mcgen/gen_sounds.py` (lib/mc/vNNN/mc_snd_vNNN.fi, names only). Verified against real vanilla servers 1.20.1 and 1.21.4 (wire holder = registry id + 1 = minecraft-data id; `sound_id_shift` -1 in versions.json from protocol 761). 1.12.2 / 1.16.5 ids (wire id = registry id, from 0) and 1.20.2/1.21.1/1.21.8/1.21.11/26.1 are generated the same way but NOT verified live. 1.8.9 has no table (named sounds only). Protocol 48..209 and 755..760 (1.9-1.9.4, 1.17-1.19.2 partly) are not decoded (`SF_NONE`/classic layout unchecked).
 - M3 the range is per event; volume > 1 does not widen it per voice.
 - M4 no occlusion, reverb, block-sound velocity; Doppler only if the bank asks.
 - M5 `spatial` is an engine flag of the EVENT: an event played at a point is spatial for all later plays.
-- M6 the packet decoders are not wired into the client dispatch (`mc_sem` has no sound entries yet): the host feeds the body.
+- M6 `mca_on_packet` is the client hook; the demos (mcclient/mcview) do not call it yet (no audio device in them).
+- M7 node-minecraft-protocol mis-parses INLINE sound holders (its raw buffer is cut short), so the recorded fixtures only hold registered sounds (mob sounds), stop sounds and world events; inline decoding is covered by the synthetic packets of tests/2766.
+- M8 Not done: `lib/mc/mc_assets.fi` (optional local asset import, `sounds=synth|original|both`), bank cross-check against mc-p4 (missing events list), audio.hub + bank test. Sound packets for the sound source itself (entity position) need the entity in the store.
+
+## Sound ids, packets, world events (mc-p5)
+```
+import mc.v763.mc_snd_v763
+mc_audio.mca_sound_table_load(&m, mc_snd_v763.SND_BLOB.p as u64, mc_snd_v763.SND_COUNT, mc_snd_v763.SND_FIRST)
+mc_audio.mca_on_packet(&m, &ver, id, &body, &entity_store)   // true = was a sound packet (played / stopped), cursor not moved
+```
+- Semantic packets (semantic.json, generated): `SOUND_EFFECT`, `NAMED_SOUND_EFFECT`, `ENTITY_SOUND_EFFECT`, `STOP_SOUND`, `WORLD_EVENT`.
+- Layouts by protocol: `SF_LEGACY` (47, named only, u8 pitch), `SF_CLASSIC` (210..760, id or name + category + 1/8 position + f32 pitch, seed from 759), `SF_HOLDER` (761+, holder + seed).
+- World events: 2001 = block break (state in data, flattened versions) -> `block.<type>.break`; doors / trapdoors / gates / dispenser / fire extinguish (1000-1014, 1036, 1037) -> their event names.
+- `mca_set_block_change_sounds` + `mca_on_block_change` (off by default): solid->air = break, air->solid = place, call before the world applies the change. A vanilla server already sends the event / sound packet, so leave it off there.
+- `mca_ambient_tick` (`Ambient`): cave mood (dark for ~60 s -> `ambient.cave` 4..16 blocks away). Approximation of the game's mood sound, deterministic.
+- Tests: `bash tools/mc/audio/run.sh` also checks recorded REAL server packets (`tools/mc/audio/fixtures/sounds_*.jsonl`, made by `tools/mc/audio/sounds_live.sh`, needs a JVM + the vanilla jar as black box) against node-minecraft-protocol (`check_wire.py`), and `tests/2792_mc_audio_wire.fi` (tables of 5 versions, dispatch).

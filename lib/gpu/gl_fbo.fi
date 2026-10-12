@@ -1,0 +1,315 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/gl_fbo.fi -- gpu.gl_fbo: framebuffers beyond gl33.Fbo (docs/GPU.md).
+//
+//     import gpu.gl_ext
+//     import gpu.gl_fbo
+//     var f: gl_fbo.Target = gl_fbo.target_new(&x, 640, 360, 2, gl_fbo.DEPTH_TEXTURE, 0)   // 2 colour + depth TEXTURE
+//     gl_fbo.target_bind(&x, &f)          // viewport + glDrawBuffers(n)
+//     ... draw ...                        // fragment shader: layout(location = 0/1) out vec4 ...
+//     gl_fbo.target_resolve(&x, &f)       // MSAA -> the textures (no-op without MSAA)
+//     gl_fbo.target_resize(&x, &f, 800, 450)
+//
+// Colour attachments are RGBA8 textures (`color[i]`); depth is none / a D24 renderbuffer / a D24 TEXTURE (`depth_tex`,
+// sampleable). samples > 0 with `has_msaa`: the draw framebuffer uses multisample renderbuffers and `target_resolve`
+// blits (glBlitFramebuffer) into the textures; without MSAA support `samples` falls back to 0 (read f.samples).
+// Everything is created for the CURRENT size; `target_resize` rebuilds it (new texture ids).
+
+import std.rt
+import gpu.gl33
+import gpu.gl_ext
+
+export {
+    Target, target_new, target_free, target_bind, target_unbind, target_resolve, target_resize, target_read_color,
+    target_read_depth, blit_fbo,
+    DEPTH_NONE, DEPTH_RENDERBUFFER, DEPTH_TEXTURE,
+}
+
+const DEPTH_NONE: i32 = 0
+const DEPTH_RENDERBUFFER: i32 = 1
+const DEPTH_TEXTURE: i32 = 2
+
+const GL_FRAMEBUFFER: u32 = 0x8D40
+const GL_READ_FRAMEBUFFER: u32 = 0x8CA8
+const GL_DRAW_FRAMEBUFFER: u32 = 0x8CA9
+const GL_RENDERBUFFER: u32 = 0x8D41
+const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0
+const GL_DEPTH_ATTACHMENT: u32 = 0x8D00
+const GL_DEPTH_COMPONENT24: u32 = 0x81A6
+const GL_DEPTH_COMPONENT: u32 = 0x1902
+const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5
+const GL_TEXTURE_2D: u32 = 0xDE1
+const GL_RGBA: u32 = 0x1908
+const GL_RGBA8: u32 = 0x8058
+const GL_UNSIGNED_BYTE: u32 = 0x1401
+const GL_FLOAT: u32 = 0x1406
+const GL_NEAREST: u32 = 0x2600
+const GL_TEXTURE_MIN_FILTER: u32 = 0x2801
+const GL_TEXTURE_MAG_FILTER: u32 = 0x2800
+const GL_TEXTURE_WRAP_S: u32 = 0x2802
+const GL_TEXTURE_WRAP_T: u32 = 0x2803
+const GL_CLAMP_TO_EDGE: u32 = 0x812F
+const GL_COLOR_BUFFER_BIT: u32 = 0x4000
+const GL_DEPTH_BUFFER_BIT: u32 = 0x100
+
+struct Target {
+    ok: bool,
+    w: i32,
+    h: i32,
+    n_color: i32, // 1..4
+    depth_mode: i32,
+    samples: i32, // 0 = no MSAA (also after a fallback)
+    fbo: u32, // the framebuffer to DRAW into (multisample renderbuffers when samples > 0, else = the textures)
+    rfbo: u32, // resolve framebuffer with the textures (== fbo when samples == 0)
+    color: [u32; 4], // RGBA8 textures (the resolved result)
+    msrb: [u32; 4], // multisample colour renderbuffers
+    depth_tex: u32, // D24 texture (resolved, sampleable)
+    depth_rb: u32, // D24 renderbuffer (the draw depth: multisample when samples > 0)
+}
+
+fn new_tex(x: *mut gl_ext.GlX, w: i32, h: i32, depth: bool) -> u32 {
+    (*x).tmp[0] = 0 as u32
+    gl_ext.gx2(x, gl_ext.X_GEN_TEXTURES, 1, (&(*x).tmp[0]) as u64)
+    let id: u32 = (*x).tmp[0]
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, GL_TEXTURE_2D as u64, id as u64)
+    if depth {
+        gl_ext.gx9(x, gl_ext.X_TEX_IMAGE2D, GL_TEXTURE_2D as u64, 0, GL_DEPTH_COMPONENT24 as u64, w as u64, h as u64, 0,
+            GL_DEPTH_COMPONENT as u64, GL_FLOAT as u64, 0)
+    } else {
+        gl_ext.gx9(x, gl_ext.X_TEX_IMAGE2D, GL_TEXTURE_2D as u64, 0, GL_RGBA8 as u64, w as u64, h as u64, 0,
+            GL_RGBA as u64, GL_UNSIGNED_BYTE as u64, 0)
+    }
+    gl_ext.gx3(x, gl_ext.X_TEX_PARAMETERI, GL_TEXTURE_2D as u64, GL_TEXTURE_MIN_FILTER as u64, GL_NEAREST as u64)
+    gl_ext.gx3(x, gl_ext.X_TEX_PARAMETERI, GL_TEXTURE_2D as u64, GL_TEXTURE_MAG_FILTER as u64, GL_NEAREST as u64)
+    gl_ext.gx3(x, gl_ext.X_TEX_PARAMETERI, GL_TEXTURE_2D as u64, GL_TEXTURE_WRAP_S as u64, GL_CLAMP_TO_EDGE as u64)
+    gl_ext.gx3(x, gl_ext.X_TEX_PARAMETERI, GL_TEXTURE_2D as u64, GL_TEXTURE_WRAP_T as u64, GL_CLAMP_TO_EDGE as u64)
+    return id
+}
+
+fn new_rb(x: *mut gl_ext.GlX, fmt: u32, w: i32, h: i32, samples: i32) -> u32 {
+    (*x).tmp[0] = 0 as u32
+    gl_ext.gx2(x, gl_ext.X_GEN_RENDERBUFFERS, 1, (&(*x).tmp[0]) as u64)
+    let id: u32 = (*x).tmp[0]
+    gl_ext.gx2(x, gl_ext.X_BIND_RENDERBUFFER, GL_RENDERBUFFER as u64, id as u64)
+    if samples > 0 {
+        gl_ext.gx5(x, gl_ext.X_RENDERBUFFER_STORAGE_MS, GL_RENDERBUFFER as u64, samples as u64, fmt as u64, w as u64, h as u64)
+    } else {
+        gl_ext.gx4(x, gl_ext.X_RENDERBUFFER_STORAGE, GL_RENDERBUFFER as u64, fmt as u64, w as u64, h as u64)
+    }
+    return id
+}
+
+fn new_fb(x: *mut gl_ext.GlX) -> u32 {
+    (*x).tmp[0] = 0 as u32
+    gl_ext.gx2(x, gl_ext.X_GEN_FRAMEBUFFERS, 1, (&(*x).tmp[0]) as u64)
+    return (*x).tmp[0]
+}
+
+fn complete(x: *mut gl_ext.GlX) -> bool {
+    return gl_ext.gx_m32(gl_ext.gx1(x, gl_ext.X_CHECK_FRAMEBUFFER_STATUS, GL_FRAMEBUFFER as u64)) == GL_FRAMEBUFFER_COMPLETE
+}
+
+// Builds the attachments for (w, h) into `t` (which already holds n_color / depth_mode / samples).
+fn build(x: *mut gl_ext.GlX, t: *mut Target) -> bool {
+    let w: i32 = (*t).w
+    let h: i32 = (*t).h
+    let n: i32 = (*t).n_color
+    var i: i32 = 0
+    while i < n {
+        (*t).color[i as usize] = new_tex(x, w, h, false)
+        i = i + 1
+    }
+    if (*t).depth_mode == DEPTH_TEXTURE {
+        (*t).depth_tex = new_tex(x, w, h, true)
+    }
+    // resolve framebuffer: the textures
+    (*t).rfbo = new_fb(x)
+    gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_FRAMEBUFFER as u64, (*t).rfbo as u64)
+    i = 0
+    while i < n {
+        gl_ext.gx5(x, gl_ext.X_FRAMEBUFFER_TEXTURE2D, GL_FRAMEBUFFER as u64, (GL_COLOR_ATTACHMENT0 + (i as u32)) as u64,
+            GL_TEXTURE_2D as u64, (*t).color[i as usize] as u64, 0)
+        i = i + 1
+    }
+    if (*t).depth_mode == DEPTH_TEXTURE {
+        gl_ext.gx5(x, gl_ext.X_FRAMEBUFFER_TEXTURE2D, GL_FRAMEBUFFER as u64, GL_DEPTH_ATTACHMENT as u64, GL_TEXTURE_2D as u64,
+            (*t).depth_tex as u64, 0)
+    } else if (*t).depth_mode == DEPTH_RENDERBUFFER && (*t).samples == 0 {
+        (*t).depth_rb = new_rb(x, GL_DEPTH_COMPONENT24, w, h, 0)
+        gl_ext.gx4(x, gl_ext.X_FRAMEBUFFER_RENDERBUFFER, GL_FRAMEBUFFER as u64, GL_DEPTH_ATTACHMENT as u64,
+            GL_RENDERBUFFER as u64, (*t).depth_rb as u64)
+    }
+    var ok: bool = complete(x)
+    if (*t).samples == 0 {
+        (*t).fbo = (*t).rfbo
+        return ok
+    }
+    // multisample draw framebuffer
+    (*t).fbo = new_fb(x)
+    gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_FRAMEBUFFER as u64, (*t).fbo as u64)
+    i = 0
+    while i < n {
+        (*t).msrb[i as usize] = new_rb(x, GL_RGBA8, w, h, (*t).samples)
+        gl_ext.gx4(x, gl_ext.X_FRAMEBUFFER_RENDERBUFFER, GL_FRAMEBUFFER as u64, (GL_COLOR_ATTACHMENT0 + (i as u32)) as u64,
+            GL_RENDERBUFFER as u64, (*t).msrb[i as usize] as u64)
+        i = i + 1
+    }
+    if (*t).depth_mode != DEPTH_NONE {
+        (*t).depth_rb = new_rb(x, GL_DEPTH_COMPONENT24, w, h, (*t).samples)
+        gl_ext.gx4(x, gl_ext.X_FRAMEBUFFER_RENDERBUFFER, GL_FRAMEBUFFER as u64, GL_DEPTH_ATTACHMENT as u64,
+            GL_RENDERBUFFER as u64, (*t).depth_rb as u64)
+    }
+    if !complete(x) {
+        ok = false
+    }
+    return ok
+}
+
+// New render target with `n_color` (1..4) RGBA8 colour textures, depth mode DEPTH_*, and `samples` MSAA samples
+// (0 = off; clamped to GL_MAX_SAMPLES; no MSAA support -> 0). Check `.ok`. Leaves the default framebuffer bound.
+fn target_new(x: *mut gl_ext.GlX, w: i32, h: i32, n_color: i32, depth_mode: i32, samples: i32) -> Target {
+    var t: Target = Target {
+        ok: false, w: w, h: h, n_color: n_color, depth_mode: depth_mode, samples: 0, fbo: 0 as u32, rfbo: 0 as u32,
+        color: [0 as u32; 4], msrb: [0 as u32; 4], depth_tex: 0 as u32, depth_rb: 0 as u32,
+    }
+    if n_color < 1 || n_color > 4 || n_color > (*x).max_color_att || n_color > (*x).max_draw_buf {
+        return t
+    }
+    var s: i32 = samples
+    if s > 0 {
+        if !(*x).has_msaa {
+            s = 0
+        } else if s > (*x).max_samples {
+            s = (*x).max_samples
+        }
+    }
+    t.samples = s
+    t.ok = build(x, &t)
+    gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_FRAMEBUFFER as u64, 0)
+    return t
+}
+
+fn del_one(x: *mut gl_ext.GlX, id: usize, v: u32) {
+    if v != 0 as u32 {
+        (*x).tmp[0] = v
+        gl_ext.gx2(x, id, 1, (&(*x).tmp[0]) as u64)
+    }
+}
+
+fn target_free(x: *mut gl_ext.GlX, t: *mut Target) {
+    if (*t).fbo != (*t).rfbo {
+        del_one(x, gl_ext.X_DELETE_FRAMEBUFFERS, (*t).fbo)
+    }
+    del_one(x, gl_ext.X_DELETE_FRAMEBUFFERS, (*t).rfbo)
+    var i: usize = 0
+    while i < 4 {
+        del_one(x, gl_ext.X_DELETE_TEXTURES, (*t).color[i])
+        del_one(x, gl_ext.X_DELETE_RENDERBUFFERS, (*t).msrb[i])
+        (*t).color[i] = 0 as u32
+        (*t).msrb[i] = 0 as u32
+        i = i + 1
+    }
+    del_one(x, gl_ext.X_DELETE_TEXTURES, (*t).depth_tex)
+    del_one(x, gl_ext.X_DELETE_RENDERBUFFERS, (*t).depth_rb)
+    (*t).depth_tex = 0 as u32
+    (*t).depth_rb = 0 as u32
+    (*t).fbo = 0 as u32
+    (*t).rfbo = 0 as u32
+    (*t).ok = false
+}
+
+// Binds the draw framebuffer, sets the viewport to the whole target and enables all colour attachments (glDrawBuffers).
+#[allow_escape]
+fn target_bind(x: *mut gl_ext.GlX, t: *mut Target) {
+    gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_FRAMEBUFFER as u64, (*t).fbo as u64)
+    gl_ext.gx4(x, gl_ext.X_VIEWPORT, 0, 0, (*t).w as u64, (*t).h as u64)
+    var bufs: [u32; 4] = [0 as u32; 4]
+    var i: usize = 0
+    while i < ((*t).n_color as usize) {
+        bufs[i] = GL_COLOR_ATTACHMENT0 + (i as u32)
+        i = i + 1
+    }
+    gl_ext.gx2(x, gl_ext.X_DRAW_BUFFERS, (*t).n_color as u64, (&bufs[0]) as u64)
+}
+
+fn target_unbind(x: *mut gl_ext.GlX) {
+    gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_FRAMEBUFFER as u64, 0)
+}
+
+// glBlitFramebuffer between two framebuffer objects (w x h, same size, NEAREST): `mask` = GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT.
+fn blit_fbo(x: *mut gl_ext.GlX, src: u32, dst: u32, w: i32, h: i32, mask: u32) -> bool {
+    if (*x).fns[gl_ext.X_BLIT_FRAMEBUFFER] == 0 {
+        return false
+    }
+    gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_READ_FRAMEBUFFER as u64, src as u64)
+    gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_DRAW_FRAMEBUFFER as u64, dst as u64)
+    gl_ext.gx10(x, gl_ext.X_BLIT_FRAMEBUFFER, 0, 0, w as u64, h as u64, 0, 0, w as u64, h as u64, mask as u64, GL_NEAREST as u64)
+    return true
+}
+
+// MSAA: resolves every colour attachment (and depth when there is any) into the textures. Without MSAA: nothing to do.
+// Each colour attachment is blitted on its own (glReadBuffer/glDrawBuffers i -> i), because a blit with several
+// draw buffers copies read buffer 0 into all of them.
+#[allow_escape]
+fn target_resolve(x: *mut gl_ext.GlX, t: *mut Target) -> bool {
+    if (*t).samples == 0 {
+        return true
+    }
+    var i: usize = 0
+    while i < ((*t).n_color as usize) {
+        let att: u32 = GL_COLOR_ATTACHMENT0 + (i as u32)
+        gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_READ_FRAMEBUFFER as u64, (*t).fbo as u64)
+        gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_DRAW_FRAMEBUFFER as u64, (*t).rfbo as u64)
+        gl_ext.gx1(x, gl_ext.X_READ_BUFFER, att as u64)
+        var one: [u32; 1] = [att]
+        gl_ext.gx2(x, gl_ext.X_DRAW_BUFFERS, 1, (&one[0]) as u64)
+        gl_ext.gx10(x, gl_ext.X_BLIT_FRAMEBUFFER, 0, 0, (*t).w as u64, (*t).h as u64, 0, 0, (*t).w as u64, (*t).h as u64,
+            GL_COLOR_BUFFER_BIT as u64, GL_NEAREST as u64)
+        i = i + 1
+    }
+    if (*t).depth_mode != DEPTH_NONE && (*t).depth_tex != 0 as u32 {
+        gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_READ_FRAMEBUFFER as u64, (*t).fbo as u64)
+        gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_DRAW_FRAMEBUFFER as u64, (*t).rfbo as u64)
+        gl_ext.gx10(x, gl_ext.X_BLIT_FRAMEBUFFER, 0, 0, (*t).w as u64, (*t).h as u64, 0, 0, (*t).w as u64, (*t).h as u64,
+            GL_DEPTH_BUFFER_BIT as u64, GL_NEAREST as u64)
+    }
+    gl_ext.gx1(x, gl_ext.X_READ_BUFFER, GL_COLOR_ATTACHMENT0 as u64)
+    gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_FRAMEBUFFER as u64, 0)
+    return true
+}
+
+// Rebuilds the target for a new size (same attachments / samples). The texture ids change. Returns t.ok.
+fn target_resize(x: *mut gl_ext.GlX, t: *mut Target, w: i32, h: i32) -> bool {
+    let n: i32 = (*t).n_color
+    let dm: i32 = (*t).depth_mode
+    let s: i32 = (*t).samples
+    target_free(x, t)
+    (*t).w = w
+    (*t).h = h
+    (*t).n_color = n
+    (*t).depth_mode = dm
+    (*t).samples = s
+    (*t).ok = build(x, t)
+    gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_FRAMEBUFFER as u64, 0)
+    return (*t).ok
+}
+
+// RGBA8 pixels (bottom-up rows) of colour attachment `i` of the RESOLVED textures into `out` (w*h*4 bytes).
+// Call target_resolve first when samples > 0.
+fn target_read_color(x: *mut gl_ext.GlX, t: *mut Target, i: i32, out: u64) {
+    gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_FRAMEBUFFER as u64, (*t).rfbo as u64)
+    gl_ext.gx1(x, gl_ext.X_READ_BUFFER, (GL_COLOR_ATTACHMENT0 + (i as u32)) as u64)
+    gl33.gl_read_rgba(&(*x).g, 0, 0, (*t).w, (*t).h, out)
+    gl_ext.gx1(x, gl_ext.X_READ_BUFFER, GL_COLOR_ATTACHMENT0 as u64)
+    gl_ext.gx2(x, gl_ext.X_BIND_FRAMEBUFFER, GL_FRAMEBUFFER as u64, 0)
+}
+
+// Depth texture as f32 (w*h*4 bytes, rows bottom-up). False without a depth texture.
+fn target_read_depth(x: *mut gl_ext.GlX, t: *mut Target, out: u64) -> bool {
+    if (*t).depth_tex == 0 as u32 {
+        return false
+    }
+    gl_ext.gx2(x, gl_ext.X_BIND_TEXTURE, GL_TEXTURE_2D as u64, (*t).depth_tex as u64)
+    gl33.gl_pixel_store(&(*x).g, 0xD05, 1)
+    gl_ext.gx5(x, gl_ext.X_GET_TEX_IMAGE, GL_TEXTURE_2D as u64, 0, GL_DEPTH_COMPONENT as u64, GL_FLOAT as u64, out)
+    return true
+}

@@ -1,0 +1,244 @@
+// tools/gpu/ext/cull.fi -- gpu.cull against brute-force references on random scenes (CPU only, no GL).
+//   1. frustum boxes/spheres: a box with ANY sampled point inside the frustum must never be culled (violations = 0);
+//      tightness: plain mc_math plane test vs cull_frustum_box (bounding-box refinement) false-positive counts
+//   2. far from the origin (camera + scene shifted by 1e6 / -3e6 blocks): same verdicts
+//   3. occlusion: every box reported occluded must have ZERO visible fragments in the reference raster (grown coverage);
+//      efficacy (share of boxes occluded) must be > 0; explicit wall / beside-the-wall cases
+import std.rt
+import std.io
+import std.math
+import mc.mc_math
+import gpu.cull
+
+struct Rng { s: u64 }
+
+fn rnd(r: *mut Rng) -> f64 {
+    var x: u64 = (*r).s
+    x = x ^ (x << (13 as u64))
+    x = x ^ (x >> (7 as u64))
+    x = x ^ (x << (17 as u64))
+    (*r).s = x
+    return ((x >> (11 as u64)) as f64) / 9007199254740992.0
+}
+
+fn rr(r: *mut Rng, lo: f64, hi: f64) -> f64 {
+    return lo + (hi - lo) * rnd(r)
+}
+
+// projection * view rotation for a camera looking along (yaw, pitch) in radians
+fn make_vp(o: *mut mc_math.Mat4, yaw: f64, pitch: f64, fov_deg: f64, aspect: f64, near: f64, far: f64) {
+    var proj: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
+    var view: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
+    mc_math.mat4_perspective(&proj, fov_deg * 3.14159265358979 / 180.0, aspect, near, far, false)
+    let fx: f64 = math.cos(pitch) * math.sin(yaw)
+    let fy: f64 = math.sin(pitch)
+    let fz: f64 = math.cos(pitch) * math.cos(yaw)
+    mc_math.mat4_look_at(&view, 0.0, 0.0, 0.0, fx, fy, fz, 0.0, 1.0, 0.0)
+    mc_math.mat4_mul(o, &proj, &view)
+}
+
+// true if world point p (relative to the camera already) is inside the frustum (GL clip volume)
+fn inside(vp: *mut mc_math.Mat4, x: f64, y: f64, z: f64) -> bool {
+    var p: mc_math.Vec3 = mc_math.Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    let w: f64 = mc_math.mat4_transform_point(vp, x, y, z, &p)
+    if w <= 0.0 { return false }
+    return p.x >= 0.0 - w && p.x <= w && p.y >= 0.0 - w && p.y <= w && p.z >= 0.0 - w && p.z <= w
+}
+
+// Any of the 8 corners + n random points of the box inside the frustum?
+fn box_sample_inside(vp: *mut mc_math.Mat4, r: *mut Rng, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64, n: i32) -> bool {
+    var k: i32 = 0
+    while k < 8 {
+        var px: f64 = x0
+        var py: f64 = y0
+        var pz: f64 = z0
+        if (k & 1) != 0 { px = x1 }
+        if (k & 2) != 0 { py = y1 }
+        if (k & 4) != 0 { pz = z1 }
+        if inside(vp, px, py, pz) { return true }
+        k = k + 1
+    }
+    var i: i32 = 0
+    while i < n {
+        if inside(vp, rr(r, x0, x1), rr(r, y0, y1), rr(r, z0, z1)) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn main() -> i32 {
+    var rng: Rng = Rng { s: 88172645463325252 as u64 }
+    var fails: i32 = 0
+    var total_boxes: u64 = 0
+    var viol_box: u64 = 0
+    var viol_sph: u64 = 0
+    var visible_ref: u64 = 0 // boxes with a sampled point inside
+    var fp_plain: u64 = 0 // not inside by sampling, plain plane test says "visible"
+    var fp_refined: u64 = 0
+    var far_mismatch: u64 = 0
+    var far_total: u64 = 0
+    var cam: i32 = 0
+    while cam < 24 {
+        var vp: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
+        let yaw: f64 = rr(&rng, 0.0, 6.2831853)
+        let pitch: f64 = rr(&rng, -1.2, 1.2)
+        make_vp(&vp, yaw, pitch, rr(&rng, 50.0, 100.0), rr(&rng, 1.0, 2.0), 0.1, rr(&rng, 80.0, 300.0))
+        var cx: f64 = rr(&rng, -50.0, 50.0)
+        var cy: f64 = rr(&rng, 0.0, 200.0)
+        var cz: f64 = rr(&rng, -50.0, 50.0)
+        var c: cull.Cull = cull.cull_new(64, 36)
+        var c2: cull.Cull = cull.cull_new(64, 36)
+        cull.cull_begin(&c, &vp, cx, cy, cz, 0.1, false)
+        let sx: f64 = 1000000.0 + 0.25
+        let sz: f64 = 0.0 - 3000000.0 - 0.5
+        cull.cull_begin(&c2, &vp, cx + sx, cy, cz + sz, 0.1, false)
+        var fr: mc_math.Frustum = mc_math.Frustum { p: [0.0; 24] }
+        mc_math.frustum_from_matrix(&fr, &vp, false)
+        var i: i32 = 0
+        while i < 3000 {
+            let w: f64 = rr(&rng, 0.2, 30.0)
+            let h: f64 = rr(&rng, 0.2, 30.0)
+            let d: f64 = rr(&rng, 0.2, 30.0)
+            let x0: f64 = cx + rr(&rng, -150.0, 150.0)
+            let y0: f64 = cy + rr(&rng, -150.0, 150.0)
+            let z0: f64 = cz + rr(&rng, -150.0, 150.0)
+            // camera-relative reference
+            let inside_s: bool = box_sample_inside(&vp, &rng, x0 - cx, y0 - cy, z0 - cz, x0 - cx + w, y0 - cy + h, z0 - cz + d, 48)
+            let vis: bool = cull.cull_frustum_box(&c, x0, y0, z0, x0 + w, y0 + h, z0 + d)
+            let plain: i32 = mc_math.frustum_test_box(&fr, x0 - cx, y0 - cy, z0 - cz, x0 - cx + w, y0 - cy + h, z0 - cz + d)
+            total_boxes = total_boxes + 1
+            if inside_s {
+                visible_ref = visible_ref + 1
+                if !vis { viol_box = viol_box + 1 }
+            } else {
+                if plain != 0 { fp_plain = fp_plain + 1 }
+                if vis { fp_refined = fp_refined + 1 }
+            }
+            let vis2: bool = cull.cull_frustum_box(&c2, x0 + sx, y0, z0 + sz, x0 + sx + w, y0 + h, z0 + sz + d)
+            far_total = far_total + 1
+            if vis2 != vis { far_mismatch = far_mismatch + 1 }
+            // sphere: centre + radius
+            let r: f64 = rr(&rng, 0.2, 20.0)
+            let scx: f64 = x0
+            let scy: f64 = y0
+            let scz: f64 = z0
+            var s_in: bool = inside(&vp, scx - cx, scy - cy, scz - cz)
+            var k: i32 = 0
+            while k < 40 && !s_in {
+                // random point in the ball (rejection)
+                let px: f64 = rr(&rng, -1.0, 1.0)
+                let py: f64 = rr(&rng, -1.0, 1.0)
+                let pz: f64 = rr(&rng, -1.0, 1.0)
+                if px * px + py * py + pz * pz <= 1.0 {
+                    if inside(&vp, scx - cx + px * r, scy - cy + py * r, scz - cz + pz * r) { s_in = true }
+                }
+                k = k + 1
+            }
+            if s_in && !cull.cull_frustum_sphere(&c, scx, scy, scz, r) { viol_sph = viol_sph + 1 }
+            i = i + 1
+        }
+        cull.cull_free(&c)
+        cull.cull_free(&c2)
+        cam = cam + 1
+    }
+    let n_out: u64 = total_boxes - visible_ref
+    io.fmt_print(f"frustum boxes={total_boxes} sampled_visible={visible_ref} violations_box={viol_box} violations_sphere={viol_sph}\n")
+    io.fmt_print(f"frustum tightness: not-visible boxes={n_out} kept_by_plain_plane_test={fp_plain} kept_by_refined_test={fp_refined}\n")
+    io.fmt_print(f"far origin: verdicts compared={far_total} different={far_mismatch}\n")
+    if viol_box != 0 || viol_sph != 0 { io.print("FAIL: frustum culling rejected a visible box/sphere\n"); fails = fails + 1 }
+    if fp_refined > fp_plain { io.print("FAIL: refined test worse than plain\n"); fails = fails + 1 }
+    if far_mismatch * 10000 > far_total { io.print("FAIL: far-origin verdicts differ (> 1 per 10000)\n"); fails = fails + 1 }
+
+    // ---- occlusion
+    var occ_total: u64 = 0
+    var occ_culled: u64 = 0
+    var occ_viol: u64 = 0
+    var occ_unknown: u64 = 0
+    var occ_far_mismatch: u64 = 0
+    var scene: i32 = 0
+    while scene < 30 {
+        var vp: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
+        let yaw: f64 = rr(&rng, 0.0, 6.2831853)
+        let pitch: f64 = rr(&rng, -0.5, 0.5)
+        make_vp(&vp, yaw, pitch, 70.0, 16.0 / 9.0, 0.1, 400.0)
+        let cx: f64 = rr(&rng, -20.0, 20.0)
+        let cy: f64 = rr(&rng, 60.0, 80.0)
+        let cz: f64 = rr(&rng, -20.0, 20.0)
+        let fx: f64 = math.cos(pitch) * math.sin(yaw)
+        let fy: f64 = math.sin(pitch)
+        let fz: f64 = math.cos(pitch) * math.cos(yaw)
+        var c: cull.Cull = cull.cull_new(128, 72)
+        var cf: cull.Cull = cull.cull_new(128, 72)
+        cull.cull_begin(&c, &vp, cx, cy, cz, 0.1, false)
+        let ox: f64 = 2000000.0
+        let oz: f64 = 0.0 - 1000000.0
+        cull.cull_begin(&cf, &vp, cx + ox, cy, cz + oz, 0.1, false)
+        cull.cull_clear_depth(&c)
+        cull.cull_clear_depth(&cf)
+        var o: i32 = 0
+        while o < 8 {
+            let dist: f64 = rr(&rng, 8.0, 70.0)
+            let ex: f64 = cx + fx * dist + rr(&rng, -20.0, 20.0)
+            let ey: f64 = cy + fy * dist + rr(&rng, -20.0, 20.0)
+            let ez: f64 = cz + fz * dist + rr(&rng, -20.0, 20.0)
+            let sw: f64 = rr(&rng, 4.0, 40.0)
+            let sh: f64 = rr(&rng, 4.0, 40.0)
+            let sd: f64 = rr(&rng, 4.0, 40.0)
+            cull.cull_add_occluder(&c, ex, ey, ez, ex + sw, ey + sh, ez + sd)
+            cull.cull_add_occluder(&cf, ex + ox, ey, ez + oz, ex + sw + ox, ey + sh, ez + sd + oz)
+            o = o + 1
+        }
+        cull.cull_build_hiz(&c)
+        cull.cull_build_hiz(&cf)
+        var i: i32 = 0
+        while i < 1500 {
+            let dist: f64 = rr(&rng, 10.0, 200.0)
+            let x0: f64 = cx + fx * dist + rr(&rng, -60.0, 60.0)
+            let y0: f64 = cy + fy * dist + rr(&rng, -60.0, 60.0)
+            let z0: f64 = cz + fz * dist + rr(&rng, -60.0, 60.0)
+            let w: f64 = rr(&rng, 0.3, 10.0)
+            let h: f64 = rr(&rng, 0.3, 10.0)
+            let d: f64 = rr(&rng, 0.3, 10.0)
+            let res: i32 = cull.cull_box(&c, x0, y0, z0, x0 + w, y0 + h, z0 + d)
+            let resf: i32 = cull.cull_box(&cf, x0 + ox, y0, z0 + oz, x0 + w + ox, y0 + h, z0 + d + oz)
+            if res != resf { occ_far_mismatch = occ_far_mismatch + 1 }
+            if res == cull.CULL_OCCLUDED {
+                occ_culled = occ_culled + 1
+                let frag: u64 = cull.raster_box_fragments(&c, x0, y0, z0, x0 + w, y0 + h, z0 + d)
+                if frag != 0 { occ_viol = occ_viol + 1 }
+            }
+            occ_total = occ_total + 1
+            i = i + 1
+        }
+        cull.cull_free(&c)
+        cull.cull_free(&cf)
+        scene = scene + 1
+    }
+    io.fmt_print(f"occlusion boxes={occ_total} occluded={occ_culled} violations={occ_viol} far_origin_different={occ_far_mismatch}\n")
+    if occ_viol != 0 { io.print("FAIL: an occluded box still has visible fragments\n"); fails = fails + 1 }
+    if occ_culled == 0 { io.print("FAIL: occlusion culled nothing\n"); fails = fails + 1 }
+    if occ_far_mismatch * 1000 > occ_total { io.print("FAIL: far-origin occlusion verdicts differ\n"); fails = fails + 1 }
+
+    // ---- explicit: a wall in front, one box behind it, one beside it
+    {
+        var vp: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
+        make_vp(&vp, 0.0, 0.0, 70.0, 16.0 / 9.0, 0.1, 200.0) // looks along +z
+        var c: cull.Cull = cull.cull_new(128, 72)
+        cull.cull_begin(&c, &vp, 0.0, 0.0, 0.0, 0.1, false)
+        cull.cull_clear_depth(&c)
+        cull.cull_add_occluder(&c, -20.0, -20.0, 10.0, 20.0, 20.0, 12.0)
+        cull.cull_build_hiz(&c)
+        let behind: i32 = cull.cull_box(&c, -2.0, -2.0, 30.0, 2.0, 2.0, 34.0)
+        let beside: i32 = cull.cull_box(&c, 2.0, 0.0, 4.0, 3.0, 1.0, 6.0)
+        let front: i32 = cull.cull_box(&c, -2.0, -2.0, 4.0, 2.0, 2.0, 6.0)
+        let behind_cam: i32 = cull.cull_box(&c, -2.0, -2.0, -34.0, 2.0, 2.0, -30.0)
+        io.fmt_print(f"wall: behind={behind} (1=occluded) beside_in_front={beside} (2) front={front} (2) behind_camera={behind_cam} (0)\n")
+        if behind != cull.CULL_OCCLUDED { io.print("FAIL: box behind the wall not occluded\n"); fails = fails + 1 }
+        if front != cull.CULL_VISIBLE { io.print("FAIL: box in front of the wall not visible\n"); fails = fails + 1 }
+        if behind_cam != cull.CULL_FRUSTUM { io.print("FAIL: box behind the camera not frustum-culled\n"); fails = fails + 1 }
+        if beside != cull.CULL_VISIBLE { io.print("FAIL: box in front of the wall (off-centre) not visible\n"); fails = fails + 1 }
+        cull.cull_free(&c)
+    }
+    if fails == 0 { io.print("cull: all checks ok\n") }
+    return fails
+}

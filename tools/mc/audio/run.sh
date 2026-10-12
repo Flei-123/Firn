@@ -45,5 +45,24 @@ if $FIRNC -o "$W/t" tests/2766_mc_audio.fi 2>"$W/err"; then
 else
     echo "  FAIL  tests/2766_mc_audio.fi does not compile"; head -10 "$W/err"; ERR=1
 fi
+# real server packets (fixtures recorded by tools/mc/audio/sounds_live.sh from vanilla 1.20.1 / 1.21.4): mc_audio's decode must equal
+# node-minecraft-protocol's parse (check_wire.py). tests/2792_mc_audio_wire.fi covers the generated id tables + dispatch.
+if $FIRNC -o "$W/pkts" tools/mc/audio/sound_pkts.fi 2>"$W/err"; then
+    for pair in "1.20.1 763" "1.21.4 769"; do
+        set -- $pair; fx="tools/mc/audio/fixtures/sounds_${1//./_}.jsonl"
+        python3 -I -c 'import json,sys
+for l in open(sys.argv[2]):
+    j=json.loads(l)
+    if j["hex"]: print(sys.argv[1], j["pkt"], j["hex"])' "$2" "$fx" | "$W/pkts" > "$W/wire.$1" 2>"$W/stderr"
+        python3 -I tools/mc/audio/check_wire.py "$1" "$fx" "$W/wire.$1" || ERR=1
+    done
+else
+    echo "  FAIL  sound_pkts.fi does not compile"; head -10 "$W/err"; ERR=1
+fi
+if $FIRNC -o "$W/t2" tests/2792_mc_audio_wire.fi 2>"$W/err" && "$W/t2" > "$W/t2.out" 2>&1; then
+    echo "  ok    tests/2792_mc_audio_wire.fi: $(grep -c '^ok' "$W/t2.out") checks"
+else
+    echo "  FAIL  tests/2792_mc_audio_wire.fi"; head -10 "$W/err"; grep -v '^ok' "$W/t2.out" | head; ERR=1
+fi
 [ $ERR -eq 0 ] && echo "RESULT mc-audio: ok" || echo "RESULT mc-audio: FAIL"
 exit $ERR
