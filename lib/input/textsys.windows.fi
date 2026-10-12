@@ -1,0 +1,160 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/input/textsys.windows.fi -- input.textsys, Windows twin: IMM32 (imm32.dll via std.dynlib). BUILT, NOT RUN (no Windows here).
+//
+// What is real: the window messages WM_IME_COMPOSITION / ENDCOMPOSITION are turned into textcore calls by `sys_ime_message`
+// (composition string = UTF-16 -> pre-edit text with ATTR_* -> feedback, GCS_CURSORPOS -> caret, GCS_RESULTSTR -> commit), and the
+// cursor rectangle goes to ImmSetCompositionWindow / ImmSetCandidateWindow.
+// What is NOT done: lib/window/win32.fi does not forward WM_IME_* yet (roadmap r433b): until it calls `sys_ime_message` from its
+// wndproc, no pre-edit text arrives; WM_CHAR still delivers the finished characters as EV_CHAR. TSF is not used.
+import std.rt
+import std.dynlib
+import input.textcore
+
+export { TextSys, sys_new, sys_open, sys_close, sys_key, sys_pump, sys_spot, sys_focus, sys_ok, sys_ime_message, sys_step, sys_attach }
+
+struct TextSys {
+    ok: bool,
+    step: u32,
+    imm: u64,
+    hwnd: u64,
+    f_get: u64,
+    f_release: u64,
+    f_str: u64,
+    f_comp: u64,
+    f_cand: u64,
+    f_notify: u64,
+}
+
+fn sys_new() -> TextSys {
+    return TextSys { ok: false, step: 0 as u32, imm: 0, hwnd: 0, f_get: 0, f_release: 0, f_str: 0, f_comp: 0, f_cand: 0, f_notify: 0 }
+}
+
+fn sys_ok(s: *mut TextSys) -> bool { return (*s).ok }
+fn sys_step(s: *mut TextSys) -> u32 { return (*s).step }
+
+// `hwnd` is set with sys_attach by the host later; sys_open only loads imm32.dll
+fn sys_open(s: *mut TextSys, t: *mut textcore.Text) -> bool {
+    (*s).imm = dynlib.open("imm32.dll")
+    if (*s).imm == 0 {
+        (*s).step = 1 as u32
+        return false
+    }
+    (*s).f_get = dynlib.sym((*s).imm, "ImmGetContext")
+    (*s).f_release = dynlib.sym((*s).imm, "ImmReleaseContext")
+    (*s).f_str = dynlib.sym((*s).imm, "ImmGetCompositionStringW")
+    (*s).f_comp = dynlib.sym((*s).imm, "ImmSetCompositionWindow")
+    (*s).f_cand = dynlib.sym((*s).imm, "ImmSetCandidateWindow")
+    (*s).f_notify = dynlib.sym((*s).imm, "ImmNotifyIME")
+    (*s).ok = (*s).f_get != 0 && (*s).f_str != 0
+    if !(*s).ok { (*s).step = 2 as u32 }
+    return (*s).ok
+}
+
+// the window the IME context belongs to (HWND of lib/window's window)
+fn sys_attach(s: *mut TextSys, hwnd: u64) { (*s).hwnd = hwnd }
+
+fn sys_close(s: *mut TextSys) {
+    (*s).ok = false
+}
+
+// Windows has no key replay: WM_CHAR / WM_IME_* carry the text. Always "not eaten".
+fn sys_key(s: *mut TextSys, t: *mut textcore.Text, down: bool, keycode: u32, state: u32, time_ms: u32) -> bool { return false }
+fn sys_pump(s: *mut TextSys, t: *mut textcore.Text) {}
+fn sys_focus(s: *mut TextSys, t: *mut textcore.Text, on: bool) { textcore.text_set_active(t, on) }
+
+const GCS_COMPATTR: u64 = 16
+const GCS_COMPSTR: u64 = 8
+const GCS_CURSORPOS: u64 = 128
+const GCS_RESULTSTR: u64 = 2048
+
+// The window procedure's WM_IME_COMPOSITION (0x10F, `lp` = GCS_* flags) and WM_IME_ENDCOMPOSITION (0x10E): reads the strings from
+// the context of `hwnd` and feeds the Text. Returns true if the message was handled (do not call DefWindowProc for composition).
+fn sys_ime_message(s: *mut TextSys, t: *mut textcore.Text, hwnd: u64, msg: u64, lp: u64) -> bool {
+    if !(*s).ok { return false }
+    if msg == 270 as u64 { // WM_IME_ENDCOMPOSITION
+        textcore.text_preedit_cancel(t)
+        return true
+    }
+    if msg != 271 as u64 { return false }
+    let himc: u64 = dynlib.ci1((*s).f_get, hwnd)
+    if himc == 0 { return false }
+    var w: [u16; 256] = [0 as u16; 256]
+    var cps: [u32; 256] = [0 as u32; 256]
+    if (lp & GCS_RESULTSTR) != 0 as u64 {
+        let nb: u64 = call5((*s).f_str, himc, GCS_RESULTSTR, (&w[0]) as u64, 510, 0) & 4294967295
+        if nb > 0 as u64 && nb <= 510 as u64 {
+            let n: usize = textcore.utf16_decode((&w[0]) as u64, (nb / 2 as u64) as usize, (&cps[0]) as u64, 256)
+            textcore.text_commit(t, (&cps[0]) as u64, n)
+        }
+    }
+    if (lp & GCS_COMPSTR) != 0 as u64 {
+        let nb: u64 = call5((*s).f_str, himc, GCS_COMPSTR, (&w[0]) as u64, 510, 0) & 4294967295
+        if nb > 0 as u64 && nb <= 510 as u64 {
+            let units: usize = (nb / 2 as u64) as usize
+            var attr: [u8; 256] = [0 as u8; 256]
+            let na: u64 = call5((*s).f_str, himc, GCS_COMPATTR, (&attr[0]) as u64, 255, 0) & 4294967295
+            let cur: u64 = call5((*s).f_str, himc, GCS_CURSORPOS, 0, 0, 0) & 65535
+            // per UTF-16 unit -> per code point (a surrogate pair counts once)
+            var fb: [u32; 256] = [0 as u32; 256]
+            var n: usize = 0
+            var i: usize = 0
+            var caret: usize = 0
+            while i < units && n < 256 {
+                let u: u32 = rt.ld16((&w[0]) as u64, i) as u32
+                var a: u32 = 0 as u32
+                if (i as u64) < na { a = attr[i] as u32 }
+                fb[n] = textcore.fb_of_imm_attr(a)
+                if (i as u64) == cur { caret = n }
+                if u >= 55296 as u32 && u <= 56319 as u32 && i + 1 < units { i = i + 1 }
+                n = n + 1
+                i = i + 1
+            }
+            if cur >= units as u64 { caret = n }
+            let m: usize = textcore.utf16_decode((&w[0]) as u64, units, (&cps[0]) as u64, 256)
+            textcore.text_preedit_set(t, (&cps[0]) as u64, m, (&fb[0]) as u64, caret)
+        } else {
+            textcore.text_preedit_cancel(t)
+        }
+    }
+    dynlib.ci2((*s).f_release, hwnd, himc)
+    return true
+}
+
+fn call5(f: u64, a: u64, b: u64, c: u64, d: u64, e: u64) -> u64 {
+    var v: [u64; 5] = [0; 5]
+    v[0] = a
+    v[1] = b
+    v[2] = c
+    v[3] = d
+    v[4] = e
+    return dynlib.callx(f, "iiiii", (&v[0]) as u64, false)
+}
+
+// Cursor rectangle -> the composition window and the candidate list (POINT in client coordinates).
+// COMPOSITIONFORM { DWORD dwStyle; POINT ptCurrentPos; RECT rcArea } = 28 octets; CANDIDATEFORM { DWORD dwIndex; DWORD dwStyle;
+// POINT ptCurrentPos; RECT rcArea } = 32 octets. CFS_POINT = 2, CFS_CANDIDATEPOS = 64.
+fn sys_spot(s: *mut TextSys, t: *mut textcore.Text) {
+    if !(*s).ok || (*s).hwnd == 0 || (*s).f_comp == 0 { return }
+    var r: [i32; 4] = [0 as i32; 4]
+    if !textcore.text_spot_take(t, &r) { return }
+    let himc: u64 = dynlib.ci1((*s).f_get, (*s).hwnd)
+    if himc == 0 { return }
+    var cf: [u32; 8] = [0 as u32; 8]
+    cf[0] = 2 as u32
+    var px: i32 = r[0]
+    var py: i32 = r[1]
+    if px < 0 as i32 { px = 0 as i32 }
+    if py < 0 as i32 { py = 0 as i32 }
+    cf[1] = px as u32
+    cf[2] = (py + r[3]) as u32
+    dynlib.ci2((*s).f_comp, himc, (&cf[0]) as u64)
+    if (*s).f_cand != 0 {
+        var cd: [u32; 8] = [0 as u32; 8]
+        cd[0] = 0 as u32
+        cd[1] = 64 as u32
+        cd[2] = cf[1]
+        cd[3] = cf[2]
+        dynlib.ci3((*s).f_cand, himc, 0, (&cd[0]) as u64)
+    }
+    dynlib.ci2((*s).f_release, (*s).hwnd, himc)
+}

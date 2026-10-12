@@ -2040,6 +2040,16 @@ else
     grep -E 'FAIL' "$WORK/pad.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 130. lib/input text input / IME: pre-edit + commit events, dead keys + Compose engine, XIM pre-edit callbacks through C addresses, XIM (@im=none) on Xvfb, IMM32 twin builds (tools/input/text_run.sh, docs/INPUT.md) =="
+FIRNC="$FIRNC" bash tools/input/text_run.sh > "$WORK/textinput.log" 2>&1 && TXTRC=0 || TXTRC=$?
+if [ "$TXTRC" -eq 0 ]; then
+    ok
+    grep -E '^   (ok|SKIP)' "$WORK/textinput.log" | sed 's/^/ /'
+else
+    bad "tools/input/text_run.sh failed (see .test-work/textinput.log)"
+    grep -E 'FAIL' "$WORK/textinput.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 124. lib/input: raw keys / mouse state machine, relative mouse grab (X11 raw motion + warp fallback) under Xvfb+xdotool (tools/input/read_run.sh, docs/INPUT.md) =="
 FIRNC="$FIRNC" bash tools/input/read_run.sh > "$WORK/rawinput.log" 2>&1 && RAWINRC=0 || RAWINRC=$?
 if [ "$RAWINRC" -eq 0 ]; then
