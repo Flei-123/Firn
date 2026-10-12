@@ -36,3 +36,10 @@ Section: 4084 vertices = 32672 B VBO + 24504 B IBO (test chunk). Not implemented
 - 6 instanced entities: NOT started (wrappers `gl_draw_elements_instanced`, `gl_attrib_divisor` exist, untested).
 - persistent mapped buffers (`gl_buffer_storage`, `gl_map_range`, fences are wrapped, unused/untested).
 - real GPU, mip/aniso image test. The Windows twin under Wine (tools/gpu/run.sh) ran and gave the same scene statistics.
+
+## Note from gpu-h (2026-10-12)
+* Vertex format: unchanged (8 bytes, light 4+4 bit NOT added). Entities / HUD / sky use their own programs and do not touch it.
+* "Pool upload 6x slower" (427 us legacy vs 2541 us pool for 25 sections, llvmpipe): cause NOT found this round. Per section the
+  pool path does 3 `glBufferSubData` (granule table ~2 KB, VBO 32 KB, IBO 24 KB) + 3 binds into 8 MB / 6 MB buffers against 2
+  `glBufferData` calls; first-touch page faults of the fresh big buffers are the first suspect (unmeasured: upload the same sections
+  twice and compare). Not a real-GPU claim either way.

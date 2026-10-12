@@ -108,3 +108,22 @@ back, resize via `r_set_size`, fullscreen on/off), part of gate 125 (SKIP withou
 Window framebuffer vs mc_raster (`tools/gpu/win/shot.fi`, EGL, GLX and wgl/Wine, same numbers): (A) CPU image through `glshow.show_pixels` into
 the window and read back = byte equal (RGB); (B) GL back end FBO texture through `glshow.show_draw` into the window = mc_raster with PSNR
 79.1 / 99.0 / 42.8 dB (triangle / quad / quad_angled; threshold 34).
+
+## Scene layer groundwork (round gpu-h, 2026-10-12) -- PARTIAL
+`lib/gpu/gl_mc.fi` keeps the `mc_backend.Backend` table and every existing `glbe_*` name unchanged (a WebGL2 twin only has to
+match the table). Additions (all additive; `tools/gpu/dump.fi` still gives the same 9 scene lines and identical world checksums):
+* `glbe_x(gb)` -> the `gl_ext.GlX` table loaded next to the base table (instancing, queries, MSAA blit); `glbe_width/height`.
+* `glbe_bind_draw(gb)` = bind the draw target + full viewport; `glbe_rebind(gb)` = put the voxel pass state back after a pass
+  with its own program (sky, entities, HUD). In `MODE_MULTI` the collected draws stay queued until `b.end`.
+* `glbe_camera_rv(gb, out, &cx, &cy, &cz)` = the frame's `u_rv` (f32, 16 values) + camera position (f64) for extra passes.
+* MSAA: `glbe_set_msaa(gb, samples)` (0 = off; returns samples in force, 0 when the driver has none) builds a `gl_fbo.Target`
+  (renderbuffers) that all passes draw into; `glbe_resolve(gb)` blits it into the plain FBO; `present` and `glbe_fbo_texture`
+  resolve by themselves; `glbe_resize` rebuilds both. NOT yet run in an image test (compiled + default path unchanged only).
+* `mc_hud.hud_record(&buf)` (lib/mc/mc_hud.fi): with a record buffer set `hud_rect` / `hud_invert` append the CLIPPED rectangle as
+  6 u32 (x0 y0 x1 y1 colour mode) instead of drawing, so a GPU overlay reuses all layout code (glyphs, hotbar, crosshair,
+  debug block). `hud_record(0)` = draw again. tests/2762 unchanged and green.
+* Shader sources written, NOT yet wired/compiled by a program: `gl_sky_{vs,fs}.glsl` (mc_sky background per pixel, integer lerps),
+  `gl_tint_fs.glsl` (light tint, blend DST_COLOR/ZERO at depth 1.0 with GL_GREATER), `gl_ent_{vs,fs}.glsl` (instanced entity
+  boxes, shading = mc_raster with ao 3, fog), `gl_hud_{vs,fs}.glsl` (instanced rectangles, blend or invert).
+Still to do (roadmap): `lib/gpu/gl_scene.fi` (sky/tint/entity/HUD passes, timer ring per pass, cull.fi wrapper, glshow window
+present), the PSNR test for sky/HUD/entity scenes, gate 126. No real GPU here (`/dev/dri` missing): every time is llvmpipe.
