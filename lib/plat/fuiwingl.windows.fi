@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/fuiwingl.windows.fi -- plat.fuiwingl on Windows (r422): the twin of lib/plat/fuiwingl.fi, same names.
+// (The X11 file says what this is.) Here the WGL 3.3 core context is the one the window makes for its own HWND
+// (window.gpu_gl -> lib/gpu/wgl.windows.fi), borrowed as a gpu.glctx context; swap = window.gpu_swap.
+// TESTED UNDER WINE + MESA ONLY (tools/gpu/fuigl/run.sh); real Windows with a real driver: UNTESTED.
+// Original header of the X11 file follows.
+// lib/plat/fuiwingl.fi -- plat.fuiwingl: the fUi window host over an OpenGL 3.3 window (roadmap r422).
+//
+// lib/plat/fuiwin.fi paints fUi on the CPU into a canvas and then does RGBA -> BGRX + PutImage. This file replaces that
+// last step: the canvas (RGBA, top row first) is uploaded as ONE texture, drawn over the window with one triangle
+// (gpu.glshow) and swapped. The painter, the layout, the events stay exactly as they are -- only the way to the screen
+// changes. (The other GPU route, fui.gpu = painting ON the GPU, exists for Android and is not touched.)
+//
+//     var gh: fuiwingl.GlHost = fuiwingl.glhost_new()
+//     if !fuiwin.window_open(&fx, ...) { ... }
+//     if fuiwingl.glhost_attach(&gh, &fx) { ... GL is in use ... }   // false: nothing changed, the CPU path stays
+//     ... window_step loop as always ...
+//     fuiwingl.glhost_detach(&gh, &fx)                               // BEFORE window_close
+//
+// THE WAY: the GL context lives on the XID of the very window lib/window made (window_window(fx)): EGL first, GLX as
+// the fallback (gpu.glctx). Nothing else is created, so EV_CONFIGURE / input / DPI keep coming from lib/window. The
+// hook (fuiwin.window_set_present) draws with `show_pixels(.., bgrx = false)` and swaps. If GL cannot start, attach
+// returns false and the window stays on the CPU path; if a frame fails later, fuiwin drops the hook and paints that
+// frame on the CPU. Windows has its own twin: fuiwingl.windows.fi (same names).
+// TESTED ON MESA llvmpipe (Xvfb) ONLY (tools/gpu/fuigl/run.sh); a real GPU driver is UNTESTED.
+import std.rt
+import window.window
+import gpu.glctx
+import gpu.gl33
+import gpu.glshow
+import plat.fuiwin
+
+export {
+    GlHost, glhost_new, glhost_attach, glhost_detach, glhost_active, glhost_frames, glhost_api, glhost_set_interval,
+    glhost_renderer,
+}
+
+struct GlHost {
+    ok: bool,
+    api: i32, // 0 none, 3 WGL
+    ctx: glctx.GlCtx,
+    gl: gl33.Gl,
+    sh: glshow.Show,
+    frames: u64,
+    fails: u64,
+    win: *mut window.Window,
+    w: i32, // the window size the viewport follows (the canvas size)
+    h: i32,
+}
+
+fn glhost_new() -> GlHost {
+    return GlHost { ok: false, api: 0, ctx: glctx.ctx_blank(), gl: gl33.gl_new(), sh: glshow.show_new(), frames: 0 as u64,
+        fails: 0 as u64, win: 0 as u64 as *mut window.Window, w: 0, h: 0 }
+}
+
+fn glhost_active(gh: *mut GlHost) -> bool { return (*gh).ok }
+fn glhost_frames(gh: *mut GlHost) -> u64 { return (*gh).frames }
+fn glhost_api(gh: *mut GlHost) -> str {
+    if (*gh).api == 3 { return "wgl" }
+    return "none"
+}
+
+// n = 0: no wait for the vertical blank (for measuring), 1: wait (default). The driver may refuse; the answer is ignored.
+fn glhost_set_interval(gh: *mut GlHost, n: i32) {
+    if (*gh).ok {
+        let r: bool = window.gpu_vsync((*gh).win, n != 0)
+    }
+}
+
+// Address of the NUL-terminated GL_RENDERER string of the context (llvmpipe / the GPU name); 0 if GL is not in use.
+fn glhost_renderer(gh: *mut GlHost) -> u64 {
+    if !(*gh).ok {
+        return 0
+    }
+    return gl33.gl_string(&(*gh).gl, gl33.GL_RENDERER)
+}
+
+// The hook fuiwin calls instead of rgba_to_bgrx + the window's image step. ud = the GlHost.
+fn present(ud: u64, px: u64, w: usize, h: usize) -> bool {
+    let gh: *mut GlHost = ud as *mut GlHost
+    if !(*gh).ok {
+        return false
+    }
+    glshow.show_pixels(&(*gh).sh, &(*gh).gl, px, w as i32, h as i32, false, w as i32, h as i32)
+    if !window.gpu_swap((*gh).win) {
+        (*gh).fails = (*gh).fails + 1 as u64
+        return false
+    }
+    (*gh).frames = (*gh).frames + 1 as u64
+    return true
+}
+
+// Makes a WGL 3.3 core context on the window and hooks the present step of `fx`. False = GL did not start, nothing
+// was changed (the window keeps its CPU path). Call after fuiwin.window_open.
+#[allow_escape]
+fn glhost_attach(gh: *mut GlHost, fx: *mut fuiwin.Window) -> bool {
+    (*gh).ok = false
+    let f: *mut window.Window = fuiwin.window_window(fx)
+    if !window.gpu_gl(f, 3 as u32, 3 as u32, 24 as u32, 8 as u32) {
+        return false
+    }
+    (*gh).ctx = glctx.ctx_borrow()
+    if !(*gh).ctx.ok {
+        window.gpu_close(f)
+        return false
+    }
+    (*gh).gl = gl33.gl_new()
+    (*gh).sh = glshow.show_new()
+    if !gl33.gl_load(&(*gh).ctx, &(*gh).gl) || !glshow.show_init(&(*gh).sh, &(*gh).gl) {
+        window.gpu_close(f)
+        return false
+    }
+    (*gh).win = f
+    (*gh).api = 3
+    (*gh).w = fuiwin.window_w(fx) as i32
+    (*gh).h = fuiwin.window_h(fx) as i32
+    (*gh).ok = true
+    fuiwin.window_set_present(fx, gh as u64, present)
+    return true
+}
+
+// Takes the hook away and closes the context. Call BEFORE fuiwin.window_close (the window must still exist).
+fn glhost_detach(gh: *mut GlHost, fx: *mut fuiwin.Window) {
+    if !(*gh).ok {
+        return
+    }
+    fuiwin.window_clear_present(fx)
+    glshow.show_free(&(*gh).sh, &(*gh).gl)
+    window.gpu_close((*gh).win)
+    (*gh).ok = false
+}

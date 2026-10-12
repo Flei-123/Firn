@@ -1,0 +1,185 @@
+// tools/gpu/fuigl/fuigl.fi -- the fUi window host over a GL window (lib/plat/fuiwingl.fi, roadmap r422) against the CPU
+// path (PutImage), on X11. It is examples/fui/lowlevel/hello_lowlevel.fi plus a switch:
+//
+//     fuigl cpu|gl|glbreak [frames] [width] [height] [hold: x100 ms on screen after READY]
+//
+//   * path=...    which present path is really in use ("gl" needs the attach to work; else it says cpu and why)
+//   * canvas.rgba the last canvas (RGBA, top row first, w*h*4 octets) is written into the working directory
+//   * READY       printed once the first frames are on the screen; the program then waits 4 s (run.sh takes an X screenshot)
+//   * bench       `frames` forced repaints (host_touch + window_step): ms per frame; 'zeit' lines of the host are not used
+import std.rt
+import std.io
+import std.fs
+import paint.canvas
+import std.time
+import font.metrics
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.scene
+import fui.sheet
+import fui.flex
+import fui.widget
+import window.window
+import plat.fuiwirt
+import plat.fuiwin
+import plat.fuiwingl
+import plat.sysfont
+
+struct App {
+    sc: scene.Scene,
+    sh: sheet.Sheet,
+    m: theme.Theme,
+    c: render.Ctx,
+    w: fuiwirt.Host,
+    close: usize,
+    quit: bool,
+}
+
+fn paint(ud: u64, fx: *mut fuiwin.Window) {
+    let a: *mut App = ud as *mut App
+    let f: *mut theme.Colors = theme.theme_colors(&(*a).m)
+    painter.painter_clear(fuiwin.window_painter(fx), theme.opaque((*f).base))
+    scene.scene_run(&(*a).sc, &(*a).c, &(*a).sh, 0.0, 0.0,
+        fuiwin.window_w(fx) as f64, fuiwin.window_h(fx) as f64)
+}
+
+fn act(ud: u64, fx: *mut fuiwin.Window, node: usize) {
+    let a: *mut App = ud as *mut App
+    if node == (*a).close {
+        (*a).quit = true
+    }
+}
+
+fn arg_num(start: u64, i: usize, dflt: i64) -> i64 {
+    if rt.arg_count(start) <= i {
+        return dflt
+    }
+    let p: u64 = rt.arg_ptr(start, i)
+    var v: i64 = 0
+    var k: usize = 0
+    while rt.ld8(p, k) != 0 as u8 {
+        v = v * 10 + (rt.ld8(p, k) as i64 - 48)
+        k = k + 1
+    }
+    return v
+}
+
+fn main(start: u64) -> i32 {
+    var want_gl: bool = false
+    if rt.arg_count(start) >= 2 && rt.ld8(rt.arg_ptr(start, 1), 0) == 103 as u8 {
+        want_gl = true
+    }
+    // "glbreak": GL attaches, then the hook is made to fail -> fuiwin must fall back to the CPU path by itself
+    var brk: bool = false
+    if want_gl && rt.ld8(rt.arg_ptr(start, 1), 2) == 98 as u8 {
+        brk = true
+    }
+    let frames: i64 = arg_num(start, 2, 200)
+    let bw: i64 = arg_num(start, 3, 640)
+    let bh: i64 = arg_num(start, 4, 400)
+    let hold: i64 = arg_num(start, 5, 40)
+    let fset: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    if !sysfont.sysfont_load(fset) {
+        return 9
+    }
+    var fx: fuiwin.Window = fuiwin.window_new()
+    fuiwin.window_set_font(&fx, fset as u64)
+    var a: App = App { sc: scene.scene_new(), sh: sheet.sheet_new(),
+        m: theme.theme_new(false),
+        c: render.ctx_new(0 as u64 as *mut theme.Theme,
+            0 as u64 as *mut painter.Painter),
+        w: fuiwirt.host_new(0 as u64 as *mut scene.Scene,
+            0 as u64 as *mut render.Ctx),
+        close: 0, quit: false }
+    a.c = render.ctx_new(&a.m, fuiwin.window_painter(&fx))
+    a.w = fuiwirt.host_new(&a.sc, &a.c)
+    let root: usize = scene.scene_box(&a.sc, scene.SCENE_NONE, 0 as u32,
+        flex.FLEX_COLUMN, flex.JUSTIFY_CENTER, flex.AL_CENTER)
+    scene.node_set_gap(&a.sc, root, 20, 0)
+    let label: usize = scene.scene_add(&a.sc, root, scene.N_TEXT)
+    let msg: str = "Hello, this is a test window!"
+    scene.node_set_text(&a.sc, label, msg.p as u64, msg.n)
+    scene.node_set_id(&a.sc, label, 1 as u32)
+    let r: usize = sheet.sheet_rule(&a.sh, sheet.sel_id(1 as u32),
+        style.style_set_font(style.style_new(), 0, 16))
+    let cl: str = "Close"
+    a.close = scene.scene_widget(&a.sc, root, widget.KIND_BUTTON, cl.p as u64,
+        cl.n)
+    fuiwirt.host_bind(&a.w)
+    let t: str = "fUi over GL"
+    if !fuiwin.window_open(&fx, &a.w, &a.m, 0, bw as usize, bh as usize, t.p as u64, t.n) {
+        io.print("open failed\n")
+        return 1
+    }
+    var gh: fuiwingl.GlHost = fuiwingl.glhost_new()
+    if want_gl {
+        if fuiwingl.glhost_attach(&gh, &fx) {
+            fuiwingl.glhost_set_interval(&gh, 0)
+            io.print("path=gl api=")
+            io.print(fuiwingl.glhost_api(&gh))
+            io.print(" renderer=")
+            io.print_c(fuiwingl.glhost_renderer(&gh))
+            io.print("\n")
+        } else {
+            io.print("path=cpu (GL attach failed, fallback)\n")
+        }
+    } else {
+        io.print("path=cpu\n")
+    }
+    // first frames
+    var guard: i32 = 0
+    while fuiwin.window_images(&fx) < 3 as u64 && guard < 100 && !a.quit {
+        let e: bool = window.wait_event(fuiwin.window_window(&fx), 50)
+        if !fuiwin.window_step(&fx, &a.w, &a.m, paint, act, (&a) as u64) {
+            a.quit = true
+        }
+        guard = guard + 1
+    }
+    if brk {
+        gh.ok = false
+        fuiwirt.host_touch(&a.w)
+        let e3: bool = fuiwin.window_step(&fx, &a.w, &a.m, paint, act, (&a) as u64)
+        fuiwirt.host_touch(&a.w)
+        let e4: bool = fuiwin.window_step(&fx, &a.w, &a.m, paint, act, (&a) as u64)
+    }
+    let sz: usize = fuiwin.window_w(&fx) * fuiwin.window_h(&fx) * 4
+    let wr: usize = fs.write_file("canvas.rgba", canvas.canvas_pixels(fuiwin.window_canvas(&fx)) as u64, sz) catch 0
+    io.fmt_print(f"size={fuiwin.window_w(&fx)}x{fuiwin.window_h(&fx)} images={fuiwin.window_images(&fx)} hooked={fuiwin.window_present_hooked(&fx)} dumped={wr}\n")
+    io.print("READY\n")
+    // keep the window up for the screenshot
+    var t4: i64 = 0
+    while t4 < hold && !a.quit {
+        let e2: bool = window.wait_event(fuiwin.window_window(&fx), 100)
+        if !fuiwin.window_step(&fx, &a.w, &a.m, paint, act, (&a) as u64) {
+            a.quit = true
+        }
+        t4 = t4 + 1
+    }
+    // after the screenshot run.sh resized the window (xdotool): the canvas is new, dump it again for the second compare
+    let sz2: usize = fuiwin.window_w(&fx) * fuiwin.window_h(&fx) * 4
+    let wr2: usize = fs.write_file("canvas2.rgba", canvas.canvas_pixels(fuiwin.window_canvas(&fx)) as u64, sz2) catch 0
+    io.fmt_print(f"size2={fuiwin.window_w(&fx)}x{fuiwin.window_h(&fx)} hooked={fuiwin.window_present_hooked(&fx)} dumped2={wr2}\n")
+    // bench: forced repaints
+    let b0: u64 = time.monotonic_ns()
+    var n: i64 = 0
+    while n < frames && !a.quit {
+        fuiwirt.host_touch(&a.w)
+        if !fuiwin.window_step(&fx, &a.w, &a.m, paint, act, (&a) as u64) {
+            a.quit = true
+        }
+        n = n + 1
+    }
+    let b1: u64 = time.monotonic_ns()
+    if n > 0 {
+        let us: u64 = (b1 - b0) / 1000 as u64 / (n as u64)
+        io.fmt_print(f"bench frames={n} us_per_frame={us} hooked={fuiwin.window_present_hooked(&fx)}\n")
+    }
+    if want_gl {
+        fuiwingl.glhost_detach(&gh, &fx)
+    }
+    fuiwin.window_close(&fx)
+    io.print("DONE\n")
+    return 0
+}

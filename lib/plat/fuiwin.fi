@@ -56,6 +56,8 @@ export {
     window_set_input_hook, window_set_escape_closes,
     // r111: real pointers (every finger with its id) into the event router
     window_use_pointers,
+    // r422: a present hook (lib/plat/fuiwingl.fi: the canvas goes through an OpenGL window instead of PutImage)
+    window_set_present, window_clear_present, window_present_hooked,
 }
 
 struct Window {
@@ -92,10 +94,39 @@ struct Window {
     // keeps the old events (X11 XInput2, Win32 WM_POINTER)
     rmouse: bool,
     pdown: usize,
+    // THE PRESENT HOOK (window_set_present): 0 = none, the CPU path (RGBA -> BGRX, PutImage)
+    pres_on: bool,
+    pres_ud: u64,
+    pres: fn(u64, u64, usize, usize) -> bool,
 }
 
 fn hook_none(ud: u64, kind: u32, a: u32, st: u32, x: f64, y: f64) -> bool {
     return false
+}
+
+fn pres_none(ud: u64, px: u64, w: usize, h: usize) -> bool {
+    return false
+}
+
+// THE PRESENT HOOK (r422). `f(ud, pixels, w, h)` gets the finished canvas (RGBA octets, top row first, packed
+// w * h * 4) instead of RGBA -> BGRX + `window.image` + `window.present`, and brings it to the screen itself
+// (lib/plat/fuiwingl.fi: upload as a texture, draw, swap -- on an OpenGL context of this very window). It returns
+// true if the frame is on the screen. False = the hook is dropped for good and THIS frame takes the CPU path, so a
+// broken GL never leaves the window empty. window_clear_present goes back to the CPU path.
+fn window_set_present(fx: *mut Window, ud: u64, f: fn(u64, u64, usize, usize) -> bool) {
+    (*fx).pres_on = true
+    (*fx).pres_ud = ud
+    (*fx).pres = f
+}
+
+fn window_clear_present(fx: *mut Window) {
+    (*fx).pres_on = false
+    (*fx).pres_ud = 0
+    (*fx).pres = pres_none
+}
+
+fn window_present_hooked(fx: *mut Window) -> bool {
+    return (*fx).pres_on
 }
 
 // THE INPUT HOOK. `f(ud, kind, a, state, x, y)` sees every EV_KEY, EV_CHAR
@@ -157,7 +188,8 @@ fn window_new() -> Window {
         z: painter.painter_new(), fm: 0, bgrx: 0, cap: 0, w: 0, h: 0,
         full: false, log: false, images: 0, open: false, esc_zu: true,
         gpu_will: true, gpu_an: false, gl: gl.gl_api_new(), gp: gpu.gpu_new(),
-        hook_on: false, hook_ud: 0, hook: hook_none, real: false, rmouse: false, pdown: 0 }
+        hook_on: false, hook_ud: 0, hook: hook_none, real: false, rmouse: false, pdown: 0,
+        pres_on: false, pres_ud: 0, pres: pres_none }
 }
 
 // ============================================================ ON THE GPU
@@ -429,6 +461,7 @@ fn window_clip_write(p: u64, n: usize) -> bool {
 }
 
 fn window_close(fx: *mut Window) {
+    window_clear_present(fx)
     if (*fx).gpu_an {
         gpu.gpu_detach(&(*fx).gp, &(*fx).cv)
         window.gpu_close(&(*fx).f)
@@ -683,6 +716,21 @@ fn window_step(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
                 gpu_start(fx)
                 fuiwirt.host_touch(w)
             }
+        } else if (*fx).pres_on {
+            // THE PRESENT HOOK: the canvas goes to the screen through the hook (OpenGL window)
+            times(ud, fx)
+            q1 = now_ms()
+            q2 = q1
+            let shown: bool = (*fx).pres((*fx).pres_ud, canvas.canvas_pixels(&(*fx).cv) as u64, (*fx).w, (*fx).h)
+            if !shown {
+                // the hook failed: gone for good, this frame takes the CPU path
+                window_clear_present(fx)
+                fuiwirt.rgba_to_bgrx(canvas.canvas_pixels(&(*fx).cv) as u64,
+                    (*fx).bgrx, (*fx).w * (*fx).h)
+                let ok4: bool = window.image(f, (*fx).bgrx, (*fx).w, (*fx).h, 0, 0)
+                let ok5: bool = window.present(f)
+            }
+            q3 = now_ms()
         } else {
             times(ud, fx)
             q1 = now_ms()
