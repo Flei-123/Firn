@@ -34,8 +34,9 @@
 //
 // HONEST (docs/mc/audio.md)
 // M1  The block registry has no sound type: it is derived from the block NAME (rules in `mca_material_of_name`).
-// M2  The numeric sound id of a packet needs the id -> name list of the version (not in the repo for 1.20.1): fill it with
-//     `mca_sound_id_set`; inline (named) sounds work without it.
+// M2  The numeric sound id of a packet needs the id -> name list of the version: generated per version by
+//     tools/mcgen/gen_sounds.py (lib/mc/vNNN/mc_snd_vNNN.fi), loaded with `mca_sound_table_load`; inline (named) sounds
+//     work without it.
 // M3  The range is per EVENT (volume > 1 does not widen it per voice); `mca_set_range` widens an event (thunder).
 // M5  The engine's `spatial` flag belongs to the EVENT: an event played at a point becomes spatial for all later plays.
 // M4  No occlusion, no reverb, no velocity for block sounds. Doppler only if the bank asks for it.
@@ -50,6 +51,8 @@ import mc.mc_world
 import mc.mc_chunk
 import mc.mc_entity
 import mc.mc_packet
+import mc.mc_sem
+import mc.mc_version
 
 export {
     McAudio, SoundPkt, StopPkt, Walker,
@@ -62,6 +65,9 @@ export {
     mca_mc_gain, mca_atten, mca_pan, mca_pan_lr,
     mca_sound_id_set, mca_sound_name, mca_decode_sound_effect, mca_decode_entity_sound, mca_decode_stop_sound,
     mca_apply_sound, mca_apply_stop,
+    mca_sound_table_load, mca_sound_format, mca_decode_sound_v, mca_on_packet, mca_on_block_change, mca_set_block_change_sounds,
+    mca_world_event_sound, Ambient, mca_ambient_new, mca_ambient_tick,
+    SF_NONE, SF_LEGACY, SF_CLASSIC, SF_HOLDER, SK_SOUND, SK_NAMED, SK_ENTITY,
     CAT_MASTER, CAT_MUSIC, CAT_RECORD, CAT_WEATHER, CAT_BLOCKS, CAT_HOSTILE, CAT_NEUTRAL, CAT_PLAYERS, CAT_AMBIENT,
     CAT_VOICE, CAT_UI, CAT_COUNT,
     ACT_STEP, ACT_BREAK, ACT_PLACE, ACT_HIT, ACT_FALL,
@@ -136,6 +142,8 @@ struct McAudio {
     sid_names: rt.Buf,
     // counters
     n_played: u64, n_missing: u64, n_culled: u64, n_muted: u64, n_full: u64, n_rebase: u64,
+    n_pkt: u64, n_bad: u64,
+    bc_sounds: bool, // block change heuristics on (default off: the server's world event / sound packets already say it)
 }
 
 // -------------------------------------------------------------------------------------------- small helpers
@@ -320,8 +328,8 @@ fn action_pitch(act: i32) -> f32 {
 
 fn wood_species(p: u64, n: usize) -> bool {
     return starts(p, n, "oak_") || starts(p, n, "spruce_") || starts(p, n, "birch_") || starts(p, n, "jungle_")
-        || starts(p, n, "acacia_") || starts(p, n, "dark_oak_") || starts(p, n, "mangrove_") || starts(p, n, "cherry_")
-        || starts(p, n, "crimson_") || starts(p, n, "warped_") || starts(p, n, "stripped_") || starts(p, n, "bamboo_")
+    || starts(p, n, "acacia_") || starts(p, n, "dark_oak_") || starts(p, n, "mangrove_") || starts(p, n, "cherry_")
+    || starts(p, n, "crimson_") || starts(p, n, "warped_") || starts(p, n, "stripped_") || starts(p, n, "bamboo_")
 }
 
 // M1: sound type from the block name ("stone", "oak_planks", "minecraft:glass_pane" ...). MAT_NONE = no sound
@@ -335,7 +343,7 @@ fn mca_material_of_name(p0: u64, n0: usize) -> i32 {
     }
     if n == 0 { return MAT_NONE }
     if same(p, n, "air") || same(p, n, "cave_air") || same(p, n, "void_air") || same(p, n, "water") || same(p, n, "lava")
-        || same(p, n, "light") || same(p, n, "barrier") || same(p, n, "structure_void") || same(p, n, "bubble_column") {
+    || same(p, n, "light") || same(p, n, "barrier") || same(p, n, "structure_void") || same(p, n, "bubble_column") {
         return MAT_NONE
     }
     if has(p, n, "deepslate") { return MAT_DEEPSLATE }
@@ -351,25 +359,25 @@ fn mca_material_of_name(p0: u64, n0: usize) -> i32 {
     if has(p, n, "wool") || has(p, n, "carpet") || has(p, n, "_bed") || has(p, n, "banner") { return MAT_WOOL }
     if has(p, n, "sand") { return MAT_SAND }
     if has(p, n, "gravel") || has(p, n, "dirt") || has(p, n, "clay") || has(p, n, "farmland") || has(p, n, "podzol")
-        || has(p, n, "mycelium") || has(p, n, "mud") {
+    || has(p, n, "mycelium") || has(p, n, "mud") {
         return MAT_GRAVEL
     }
     if has(p, n, "grass") || has(p, n, "leaves") || has(p, n, "fern") || has(p, n, "sapling") || has(p, n, "vine")
-        || has(p, n, "tulip") || has(p, n, "poppy") || has(p, n, "dandelion") || has(p, n, "orchid") || has(p, n, "allium")
-        || has(p, n, "cornflower") || has(p, n, "lily") || has(p, n, "peony") || has(p, n, "lilac") || has(p, n, "rose_bush")
-        || has(p, n, "wheat") || has(p, n, "carrots") || has(p, n, "potatoes") || has(p, n, "beetroots")
-        || has(p, n, "sugar_cane") || has(p, n, "moss") || has(p, n, "azalea") {
+    || has(p, n, "tulip") || has(p, n, "poppy") || has(p, n, "dandelion") || has(p, n, "orchid") || has(p, n, "allium")
+    || has(p, n, "cornflower") || has(p, n, "lily") || has(p, n, "peony") || has(p, n, "lilac") || has(p, n, "rose_bush")
+    || has(p, n, "wheat") || has(p, n, "carrots") || has(p, n, "potatoes") || has(p, n, "beetroots")
+    || has(p, n, "sugar_cane") || has(p, n, "moss") || has(p, n, "azalea") {
         return MAT_GRASS
     }
     if has(p, n, "iron") || has(p, n, "gold_block") || has(p, n, "copper") || has(p, n, "chain") || has(p, n, "anvil")
-        || has(p, n, "lantern") || has(p, n, "bell") || has(p, n, "hopper") || has(p, n, "cauldron") || has(p, n, "rail")
-        || has(p, n, "netherite") || has(p, n, "diamond_block") || has(p, n, "emerald_block") {
+    || has(p, n, "lantern") || has(p, n, "bell") || has(p, n, "hopper") || has(p, n, "cauldron") || has(p, n, "rail")
+    || has(p, n, "netherite") || has(p, n, "diamond_block") || has(p, n, "emerald_block") {
         return MAT_METAL
     }
     if wood_species(p, n) || has(p, n, "planks") || has(p, n, "chest") || has(p, n, "barrel") || has(p, n, "bookshelf")
-        || has(p, n, "crafting_table") || has(p, n, "note_block") || has(p, n, "jukebox") || has(p, n, "ladder")
-        || has(p, n, "scaffolding") || has(p, n, "_sign") || has(p, n, "composter") || has(p, n, "loom")
-        || has(p, n, "lectern") || has(p, n, "fletching") || has(p, n, "cartography") || has(p, n, "smithing") {
+    || has(p, n, "crafting_table") || has(p, n, "note_block") || has(p, n, "jukebox") || has(p, n, "ladder")
+    || has(p, n, "scaffolding") || has(p, n, "_sign") || has(p, n, "composter") || has(p, n, "loom")
+    || has(p, n, "lectern") || has(p, n, "fletching") || has(p, n, "cartography") || has(p, n, "smithing") {
         return MAT_WOOD
     }
     return MAT_STONE
@@ -408,9 +416,9 @@ fn mca_category_of_event(p0: u64, n0: usize) -> i32 {
     if starts(p, n, "entity.player.") { return CAT_PLAYERS }
     if starts(p, n, "entity.") {
         if has(p, n, ".zombie") || has(p, n, ".skeleton") || has(p, n, ".creeper") || has(p, n, ".spider") || has(p, n, ".enderman")
-            || has(p, n, ".witch") || has(p, n, ".blaze") || has(p, n, ".ghast") || has(p, n, ".phantom") || has(p, n, ".drowned")
-            || has(p, n, ".husk") || has(p, n, ".stray") || has(p, n, ".pillager") || has(p, n, ".vindicator") || has(p, n, ".warden")
-            || has(p, n, ".wither") || has(p, n, ".slime") || has(p, n, ".guardian") || has(p, n, ".silverfish") {
+        || has(p, n, ".witch") || has(p, n, ".blaze") || has(p, n, ".ghast") || has(p, n, ".phantom") || has(p, n, ".drowned")
+        || has(p, n, ".husk") || has(p, n, ".stray") || has(p, n, ".pillager") || has(p, n, ".vindicator") || has(p, n, ".warden")
+        || has(p, n, ".wither") || has(p, n, ".slime") || has(p, n, ".guardian") || has(p, n, ".silverfish") {
             return CAT_HOSTILE
         }
         return CAT_NEUTRAL
@@ -481,6 +489,7 @@ fn mca_new(e: *mut engine.Engine) -> McAudio {
         s_x: [0.0; 128], s_y: [0.0; 128], s_z: [0.0; 128], dt: 0.016,
         name: rt.buf_new(), sid_tab: 0, sid_cap: 0, sid_names: rt.buf_new(),
         n_played: 0 as u64, n_missing: 0 as u64, n_culled: 0 as u64, n_muted: 0 as u64, n_full: 0 as u64, n_rebase: 0 as u64,
+        n_pkt: 0 as u64, n_bad: 0 as u64, bc_sounds: false,
     }
     make_buses(&m)
     return m
@@ -1034,4 +1043,258 @@ fn mca_apply_stop(m: *mut McAudio, p: *mut StopPkt) -> i32 {
         i = i + 1
     }
     return k
+}
+
+// ------------------------------------------------------------------------- sound table (generated per version)
+
+// Loads the id -> name table of a version: `blob` is SND_BLOB.p of lib/mc/vNNN/mc_snd_vNNN.fi (names, NUL terminated,
+// registry order), `first` = SND_FIRST (registry id of entry 0). Returns how many names were stored.
+fn mca_sound_table_load(m: *mut McAudio, blob: u64, count: usize, first: i32) -> usize {
+    var off: usize = 0
+    var i: usize = 0
+    while i < count {
+        var n: usize = 0
+        while ld_b(blob, off + n) != 0 as u8 {
+            n = n + 1
+        }
+        if !mca_sound_id_set(m, first + (i as i32), mk(blob + off as u64, n)) { return i }
+        off = off + n + 1
+        i = i + 1
+    }
+    return count
+}
+
+// -------------------------------------------------------------------------- versioned sound packets
+
+// Wire layouts of the sound packets (the field lists are in minecraft-data protocol.json):
+//   SF_LEGACY  protocol <= 47 (1.8): only Named Sound Effect: name, x y z (i32 1/8), volume f32, pitch u8 (/63), no category
+//   SF_CLASSIC 210..760 (1.10 - 1.19.2): Sound Effect = varint id; Named = identifier; category varint; x y z;
+//              volume f32; pitch f32; seed i64 from 759 (1.19). Entity Sound Effect (1.14+) = id, category, entity varint, volume, pitch
+//   SF_HOLDER  761+ (1.19.3+): holder (id + 1 or inline name + range), category, ..., seed (mca_decode_sound_effect)
+const SF_NONE: i32 = 0
+const SF_LEGACY: i32 = 1
+const SF_CLASSIC: i32 = 2
+const SF_HOLDER: i32 = 3
+const SK_SOUND: i32 = 0
+const SK_NAMED: i32 = 1
+const SK_ENTITY: i32 = 2
+
+fn mca_sound_format(proto: i32) -> i32 {
+    if proto <= 0 { return SF_NONE }
+    if proto <= 47 { return SF_LEGACY }
+    if proto < 210 { return SF_NONE } // 1.9 - 1.9.4: byte pitch, not checked
+    if proto < 761 { return SF_CLASSIC }
+    return SF_HOLDER
+}
+
+// Decodes one sound packet body of `kind` (SK_*) in the layout `fmt` (mca_sound_format of the protocol). false = broken
+// / unsupported. An inline name points into `body`.
+fn mca_decode_sound_v(fmt: i32, proto: i32, kind: i32, body: u64, n: usize, o: *mut SoundPkt) -> bool {
+    if fmt == SF_HOLDER {
+        if kind == SK_SOUND { return mca_decode_sound_effect(body, n, o) }
+        if kind == SK_ENTITY { return mca_decode_entity_sound(body, n, o) }
+        return false
+    }
+    if fmt != SF_LEGACY && fmt != SF_CLASSIC { return false }
+    if fmt == SF_LEGACY && kind != SK_NAMED { return false }
+    var r: mc_packet.Reader = mc_packet.Reader { b: bytes.bytes_new(), err: 0 as u32 }
+    mc_packet.reader_init(&r, body, n)
+    *o = empty_sound()
+    if kind == SK_NAMED {
+        var l: usize = 0
+        (*o).name_p = mc_packet.rd_identifier(&r, &l)
+        (*o).name_n = l
+    } else {
+        let sid: i32 = mc_packet.rd_varint(&r)
+        if sid < 0 { mc_packet.rd_fail(&r, mc_packet.PE_NEGATIVE) }
+        (*o).id = sid
+    }
+    if fmt == SF_CLASSIC {
+        (*o).category = mc_packet.rd_varint(&r)
+    }
+    if kind == SK_ENTITY {
+        (*o).entity = mc_packet.rd_varint(&r)
+    } else {
+        (*o).x = (mc_packet.rd_i32(&r) as f64) / 8.0
+        (*o).y = (mc_packet.rd_i32(&r) as f64) / 8.0
+        (*o).z = (mc_packet.rd_i32(&r) as f64) / 8.0
+    }
+    (*o).volume = mc_packet.rd_f32(&r)
+    if fmt == SF_LEGACY {
+        (*o).pitch = (mc_packet.rd_u8(&r) as f32) / 63.0
+    } else {
+        (*o).pitch = mc_packet.rd_f32(&r)
+    }
+    if fmt == SF_CLASSIC && proto >= 759 {
+        (*o).seed = mc_packet.rd_i64(&r)
+    }
+    if !mc_packet.rd_ok(&r) || mc_packet.rd_remaining(&r) != 0 { return false }
+    if fmt == SF_LEGACY {
+        (*o).category = mca_category_of_event((*o).name_p, (*o).name_n)
+    }
+    if (*o).category < 0 || (*o).category > CAT_VOICE { return false }
+    if (*o).entity < 0 && kind == SK_ENTITY { return false }
+    return true
+}
+
+// World event (effect id) -> sound event name, "" = none. Only the sounds the client itself makes for an event.
+fn world_event_name(eff: i32) -> str {
+    if eff == 1000 { return "block.dispenser.dispense" }
+    if eff == 1001 { return "block.dispenser.fail" }
+    if eff == 1002 { return "block.dispenser.launch" }
+    if eff == 1005 { return "block.iron_door.open" }
+    if eff == 1006 { return "block.wooden_door.open" }
+    if eff == 1007 { return "block.wooden_trapdoor.open" }
+    if eff == 1008 { return "block.fence_gate.open" }
+    if eff == 1009 { return "block.fire.extinguish" }
+    if eff == 1011 { return "block.iron_door.close" }
+    if eff == 1012 { return "block.wooden_door.close" }
+    if eff == 1013 { return "block.wooden_trapdoor.close" }
+    if eff == 1014 { return "block.fence_gate.close" }
+    if eff == 1036 { return "block.iron_trapdoor.open" }
+    if eff == 1037 { return "block.iron_trapdoor.close" }
+    return ""
+}
+
+// World event 2001 = block break (data = block state, flattened versions) -> break sound of that block; 1000.. = see above.
+// `reg` may be null for everything but 2001. Returns the voice handle (0 = none).
+fn mca_world_event_sound(m: *mut McAudio, reg: *mut mc_registry.Registry, eff: i32, data: i32, bx: i32, by: i32, bz: i32) -> u32 {
+    if eff == 2001 {
+        if reg as u64 == 0 { return 0 as u32 }
+        return mca_block_sound(m, reg, data, ACT_BREAK, bx, by, bz)
+    }
+    let nm: str = world_event_name(eff)
+    if nm.length() == 0 { return 0 as u32 }
+    return mca_play_at(m, nm, CAT_BLOCKS, (bx as f64) + 0.5, (by as f64) + 0.5, (bz as f64) + 0.5, 1.0, 1.0)
+}
+
+// Client dispatch: call for every play packet (server to client) with its wire id and the body cursor. Returns true when
+// `id` is a sound packet of this version (Sound Effect, Named Sound Effect, Entity Sound Effect, Stop Sound, World Event),
+// which is then decoded and played / stopped; false = not ours (nothing consumed). A packet that does not parse changes
+// nothing and counts in n_bad. The cursor is not moved.
+fn mca_on_packet(m: *mut McAudio, v: *mut mc_version.Version, id: i32, body: *mut bytes.Bytes, st: *mut mc_entity.Store) -> bool {
+    if id < 0 { return false }
+    var kind: i32 = 0 - 1
+    if (*v).sem[mc_sem.SEM_PLAY_S2C_SOUND_EFFECT] == id {
+        kind = SK_SOUND
+    } else if (*v).sem[mc_sem.SEM_PLAY_S2C_NAMED_SOUND_EFFECT] == id {
+        kind = SK_NAMED
+    } else if (*v).sem[mc_sem.SEM_PLAY_S2C_ENTITY_SOUND_EFFECT] == id {
+        kind = SK_ENTITY
+    } else if (*v).sem[mc_sem.SEM_PLAY_S2C_STOP_SOUND] == id {
+        kind = 10
+    } else if (*v).sem[mc_sem.SEM_PLAY_S2C_WORLD_EVENT] == id {
+        kind = 11
+    }
+    if kind < 0 { return false }
+    let pos: usize = bytes.bytes_pos(body)
+    let n: usize = bytes.bytes_len(body) - pos
+    let p: u64 = bytes.bytes_ptr(body) + pos as u64
+    (*m).n_pkt = (*m).n_pkt + 1 as u64
+    if kind <= SK_ENTITY {
+        var sp: SoundPkt = empty_sound()
+        if !mca_decode_sound_v(mca_sound_format((*v).protocol), (*v).protocol, kind, p, n, &sp) {
+            (*m).n_bad = (*m).n_bad + 1 as u64
+            return true
+        }
+        mca_apply_sound(m, &sp, st)
+        return true
+    }
+    if kind == 10 {
+        var stp: StopPkt = StopPkt { flags: 0, category: 0 - 1, name_p: 0, name_n: 0 }
+        if !mca_decode_stop_sound(p, n, &stp) {
+            (*m).n_bad = (*m).n_bad + 1 as u64
+            return true
+        }
+        mca_apply_stop(m, &stp)
+        return true
+    }
+    var r: mc_packet.Reader = mc_packet.Reader { b: bytes.bytes_new(), err: 0 as u32 }
+    mc_packet.reader_init(&r, p, n)
+    let eff: i32 = mc_packet.rd_i32(&r)
+    var bx: i32 = 0
+    var by: i32 = 0
+    var bz: i32 = 0
+    mc_packet.rd_position(&r, &bx, &by, &bz)
+    let data: i32 = mc_packet.rd_i32(&r)
+    mc_packet.rd_u8(&r)
+    if !mc_packet.rd_ok(&r) || mc_packet.rd_remaining(&r) != 0 {
+        (*m).n_bad = (*m).n_bad + 1 as u64
+        return true
+    }
+    if eff == 2001 && mc_version.version_has(v, mc_version.FLAG_FLATTENING) {
+        var reg: mc_registry.Registry = (*v).registry_of()
+        mca_world_event_sound(m, &reg, eff, data, bx, by, bz)
+    } else if eff != 2001 {
+        mca_world_event_sound(m, 0 as *mut mc_registry.Registry, eff, data, bx, by, bz)
+    }
+    return true
+}
+
+// ------------------------------------------------------------------------- block changes (optional)
+
+fn state_material(reg: *mut mc_registry.Registry, state: i32) -> i32 {
+    if state < 0 { return MAT_NONE }
+    let b: i32 = mc_registry.reg_block_of_state(reg, state)
+    if b < 0 { return MAT_NONE }
+    var n: usize = 0
+    let p: u64 = mc_registry.reg_block_name(reg, b, &n)
+    return mca_material_of_name(p, n)
+}
+
+// Block change heuristics (off by default: a vanilla server already sends the break event / place sound, a second sound
+// would double it): for servers or hosts that predict. Solid -> air = break sound of the old block, air -> solid = place
+// sound of the new one. Call BEFORE the change is applied to the world (the old state is read from it). Returns the handle.
+fn mca_set_block_change_sounds(m: *mut McAudio, on: bool) {
+    (*m).bc_sounds = on
+}
+
+fn mca_on_block_change(m: *mut McAudio, reg: *mut mc_registry.Registry, world: *mut mc_world.World, min_y: i32,
+    x: i32, y: i32, z: i32, new_state: i32) -> u32 {
+    if !(*m).bc_sounds { return 0 as u32 }
+    let old: i32 = mca_state_at(world, min_y, x, y, z)
+    if old == new_state { return 0 as u32 }
+    let om: i32 = state_material(reg, old)
+    let nm: i32 = state_material(reg, new_state)
+    if om != MAT_NONE && nm == MAT_NONE { return mca_block_sound(m, reg, old, ACT_BREAK, x, y, z) }
+    if om == MAT_NONE && nm != MAT_NONE { return mca_block_sound(m, reg, new_state, ACT_PLACE, x, y, z) }
+    return 0 as u32
+}
+
+// ------------------------------------------------------------------------------------------ ambient
+
+// Cave ambience (approximation of the game's mood sound): "mood" rises while the listener is in the dark and falls in the
+// light; at 1.0 `ambient.cave` plays 4..16 blocks from the listener and the mood starts again. The host decides `dark`
+// (light level at the feet). Deterministic: own LCG, no clock.
+struct Ambient {
+    mood: f64,
+    rng: i64,
+    n_played: u32,
+}
+
+fn mca_ambient_new(seed: i64) -> Ambient {
+    return Ambient { mood: 0.0, rng: seed % 2147483648 as i64, n_played: 0 as u32 }
+}
+
+fn ambient_next(a: *mut Ambient) -> f64 {
+    (*a).rng = ((*a).rng * 1103515245 as i64 + 12345 as i64) % 2147483648 as i64
+    return ((*a).rng as f64) / 2147483648.0
+}
+
+// dt in seconds. Returns the voice handle when the cave sound started (0 = none).
+fn mca_ambient_tick(m: *mut McAudio, a: *mut Ambient, dark: bool, dt: f64) -> u32 {
+    if dark {
+        (*a).mood = (*a).mood + dt / 60.0
+    } else {
+        (*a).mood = (*a).mood - dt / 20.0
+        if (*a).mood < 0.0 { (*a).mood = 0.0 }
+    }
+    if (*a).mood < 1.0 || !(*m).has_listener { return 0 as u32 }
+    (*a).mood = 0.0
+    let ang: f64 = ambient_next(a) * 6.283185307179586
+    let dist: f64 = 4.0 + ambient_next(a) * 12.0
+    let h: u32 = mca_play_at(m, "ambient.cave", CAT_AMBIENT, (*m).lx + math.cos(ang) * dist, (*m).ly + (ambient_next(a) - 0.5) * 4.0,
+        (*m).lz + math.sin(ang) * dist, 1.0, 1.0)
+    if h != 0 as u32 { (*a).n_played = (*a).n_played + 1 as u32 }
+    return h
 }
