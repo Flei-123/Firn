@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_perf.fi -- statistics + result lines of the Minecraft client benchmark (tools/mc/perf, docs/MC-PERF.md).
+//
+// All times are integer NANOSECONDS in u64 arrays. Definitions (the python self test compares them with numpy):
+//   percentile q (0..10000 = 0..100 %): sorted ascending a[0..n), pos = (n-1) * q / 10000, i = floor(pos), f = pos - i,
+//       value = a[i] + (a[i+1] - a[i]) * f, rounded to the nearest ns  (== numpy.percentile(..., method="linear"))
+//   low1_fps: average FPS of the slowest 1 % of the frames: k = max(1, ceil(n / 100)) slowest frames, fps = 1e9 / mean(k slowest)
+//   p99_fps:  1e9 / p99 frame time
+// Result lines are `RESULT <key> <value> <unit>` with a fixed point value (3 decimals) so no float formatting is needed.
+
+import std.rt
+import std.io
+
+export {
+    perf_sort, perf_percentile, perf_mean, perf_low1_mean, perf_fps_x1000, perf_emit, perf_emit_u, perf_emit_text,
+}
+
+// Shell sort (gaps of Ciura) ascending, in place: a = u64 array of n values.
+fn perf_sort(a: u64, n: usize) {
+    var gaps: [usize; 8] = [701, 301, 132, 57, 23, 10, 4, 1]
+    var gi: usize = 0
+    while gi < 8 {
+        let g: usize = gaps[gi]
+        gi = gi + 1
+        if g >= n {
+            continue
+        }
+        var i: usize = g
+        while i < n {
+            let v: u64 = rt.ld64(a, i)
+            var j: usize = i
+            while j >= g {
+                let w: u64 = rt.ld64(a, j - g)
+                if w > v {
+                    rt.st64(a, j, w)
+                    j = j - g
+                } else {
+                    break
+                }
+            }
+            rt.st64(a, j, v)
+            i = i + 1
+        }
+    }
+}
+
+// Linear interpolation percentile of the SORTED array a (n >= 1). q in 0..10000 (hundredths of a percent).
+fn perf_percentile(a: u64, n: usize, q: u64) -> u64 {
+    if n == 0 {
+        return 0 as u64
+    }
+    if n == 1 {
+        return rt.ld64(a, 0)
+    }
+    let num: u64 = ((n - 1) as u64) * q // pos = num / 10000
+    let i: usize = (num / 10000 as u64) as usize
+    if i + 1 >= n {
+        return rt.ld64(a, n - 1)
+    }
+    let rem: u64 = num % 10000 as u64
+    let lo: u64 = rt.ld64(a, i)
+    let hi: u64 = rt.ld64(a, i + 1)
+    // lo + (hi - lo) * rem / 10000 rounded to nearest (hi >= lo because sorted)
+    let d: u64 = (hi - lo) * rem
+    return lo + (d + 5000 as u64) / 10000 as u64
+}
+
+fn perf_mean(a: u64, n: usize) -> u64 {
+    if n == 0 {
+        return 0 as u64
+    }
+    var s: u64 = 0
+    var i: usize = 0
+    while i < n {
+        s = s + rt.ld64(a, i)
+        i = i + 1
+    }
+    return (s + (n / 2) as u64) / (n as u64)
+}
+
+// Mean of the slowest max(1, ceil(n/100)) values of the SORTED array (the 1 % low frame time).
+fn perf_low1_mean(a: u64, n: usize) -> u64 {
+    if n == 0 {
+        return 0 as u64
+    }
+    var k: usize = (n + 99) / 100
+    if k < 1 {
+        k = 1
+    }
+    var s: u64 = 0
+    var i: usize = n - k
+    while i < n {
+        s = s + rt.ld64(a, i)
+        i = i + 1
+    }
+    return (s + (k / 2) as u64) / (k as u64)
+}
+
+// fps * 1000 from a frame time in ns (0 -> 0)
+fn perf_fps_x1000(ns: u64) -> u64 {
+    if ns == 0 {
+        return 0 as u64
+    }
+    return 1000000000000 as u64 / ns
+}
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+// `RESULT <key> <v/1000 with 3 decimals> <unit>\n`
+fn perf_emit(key: str, v1000: u64, unit: str) {
+    var b: rt.Buf = rt.buf_new()
+    put(&b, "RESULT ")
+    put(&b, key)
+    rt.buf_push(&b, 32 as u8)
+    rt.buf_push_dec_u64(&b, v1000 / 1000 as u64)
+    rt.buf_push(&b, 46 as u8)
+    let fr: u64 = v1000 % 1000 as u64
+    if fr < 100 as u64 {
+        rt.buf_push(&b, 48 as u8)
+    }
+    if fr < 10 as u64 {
+        rt.buf_push(&b, 48 as u8)
+    }
+    rt.buf_push_dec_u64(&b, fr)
+    rt.buf_push(&b, 32 as u8)
+    put(&b, unit)
+    rt.buf_push(&b, 10 as u8)
+    io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+// integer value
+fn perf_emit_u(key: str, v: u64, unit: str) {
+    perf_emit(key, v * 1000 as u64, unit)
+}
+
+// `RESULT <key> <text> -`
+fn perf_emit_text(key: str, text: str) {
+    var b: rt.Buf = rt.buf_new()
+    put(&b, "RESULT ")
+    put(&b, key)
+    rt.buf_push(&b, 32 as u8)
+    put(&b, text)
+    put(&b, " -\n")
+    io.print_bytes(rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
