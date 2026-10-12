@@ -1,0 +1,361 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/gpu/web/webscene.fi -- the scenes of the WebGL2 gate (docs/WEBGL2.md), shared by the browser build
+// (web_main.fi: mc_raster + gpu.glweb in ONE wasm module) and the native reference (native_main.fi: mc_raster only).
+// The scene code (atlas, hand made meshes, hills chunk, compare) is copied from tools/gpu/dump.fi (the GL 3.3 gate);
+// the cameras and thresholds are the same ones, so "WebGL2 vs mc_raster" and "GL 3.3 vs mc_raster" measure the same thing.
+import std.rt
+import std.io
+import std.math
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_backend
+
+export {
+    W, H, CLEAR, Cmp, World, Sc, NSCENES, world_new, scene_name, scene_setup, frame, compare, print_f2,
+}
+
+const W: i32 = 320
+const H: i32 = 180
+const CLEAR: u32 = 0xFFE6BE96 as u32
+const NSCENES: usize = 7
+
+struct Cmp {
+    npx: u64,
+    diff_px: u64, // any channel differs
+    big_px: u64, // max channel difference > 16
+    max_diff: u32,
+    cov_cpu: u64, // pixels that are not the clear colour
+    cov_gpu: u64,
+    cov_mm: u64, // exactly one of the two covered the pixel
+    psnr_x100: u64,
+}
+
+
+fn print_f2(v: f64) {
+    var x: f64 = v
+    if x < 0.0 { x = 0.0 }
+    let i: i64 = x as i64
+    var f: i64 = ((x - (i as f64)) * 100.0 + 0.5) as i64
+    var ii: i64 = i
+    if f >= 100 as i64 {
+        f = f - 100 as i64
+        ii = ii + 1 as i64
+    }
+    if f < 10 as i64 {
+        io.fmt_print(f"{ii}.0{f}")
+    } else {
+        io.fmt_print(f"{ii}.{f}")
+    }
+}
+
+
+// ---- atlas for the hand made scenes -----------------------------------------------------------------
+fn put(a: *mut mc_texture.Atlas, tile: u32, x: i32, y: i32, rgba: u32) {
+    let ox: i32 = mc_texture.atlas_tile_x(a, tile)
+    let oy: i32 = mc_texture.atlas_tile_y(a, tile)
+    rt.st32((*a).px, ((oy + y) * (*a).w + ox + x) as usize, rgba)
+}
+
+// tile 1 solid orange, tile 2 four coloured quadrants + white top row + black left column, tile 3 left half transparent
+fn test_atlas() -> mc_texture.Atlas {
+    var a: mc_texture.Atlas = mc_texture.atlas_new(16, 4, 4)
+    var y: i32 = 0
+    while y < 16 {
+        var x: i32 = 0
+        while x < 16 {
+            put(&a, 1 as u32, x, y, mc_texture.pack_pixel(230 as u32, 120 as u32, 40 as u32, 255 as u32))
+            var c: u32 = mc_texture.pack_pixel(220 as u32, 30 as u32, 30 as u32, 255 as u32)
+            if x >= 8 && y < 8 { c = mc_texture.pack_pixel(30 as u32, 200 as u32, 30 as u32, 255 as u32) }
+            if x < 8 && y >= 8 { c = mc_texture.pack_pixel(30 as u32, 60 as u32, 230 as u32, 255 as u32) }
+            if x >= 8 && y >= 8 { c = mc_texture.pack_pixel(240 as u32, 230 as u32, 30 as u32, 255 as u32) }
+            if y == 0 { c = mc_texture.pack_pixel(255 as u32, 255 as u32, 255 as u32, 255 as u32) }
+            if x == 0 { c = mc_texture.pack_pixel(0 as u32, 0 as u32, 0 as u32, 255 as u32) }
+            put(&a, 2 as u32, x, y, c)
+            var al: u32 = 255 as u32
+            if x < 8 { al = 0 as u32 }
+            put(&a, 3 as u32, x, y, mc_texture.pack_pixel(30 as u32, 220 as u32, 220 as u32, al))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return a
+}
+
+// ---- hand made meshes -------------------------------------------------------------------------------
+fn vw0(x: u32, y: u32, z: u32, face: u32, ao: u32) -> u32 {
+    return x | (y << 8 as u32) | (z << 16 as u32) | (face << 24 as u32) | (ao << 27 as u32)
+}
+
+fn vw1(tile: u32, u: u32, v: u32) -> u32 {
+    return tile | (u << 16 as u32) | (v << 24 as u32)
+}
+
+fn put_vtx(vp: u64, i: usize, w0: u32, w1: u32) {
+    rt.st32(vp, i * 2, w0)
+    rt.st32(vp, i * 2 + 1, w1)
+}
+
+// ---- compare ----------------------------------------------------------------------------------------
+fn compare(a: u64, b: u64, n: usize, clear: u32, out: *mut Cmp) {
+    (*out).npx = n as u64
+    (*out).diff_px = 0 as u64
+    (*out).big_px = 0 as u64
+    (*out).max_diff = 0 as u32
+    (*out).cov_cpu = 0 as u64
+    (*out).cov_gpu = 0 as u64
+    (*out).cov_mm = 0 as u64
+    var sq: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let pa: u32 = rt.ld32(a, i)
+        let pb: u32 = rt.ld32(b, i)
+        var ca: bool = pa != clear
+        var cb: bool = pb != clear
+        if ca { (*out).cov_cpu = (*out).cov_cpu + 1 as u64 }
+        if cb { (*out).cov_gpu = (*out).cov_gpu + 1 as u64 }
+        if ca != cb { (*out).cov_mm = (*out).cov_mm + 1 as u64 }
+        if pa != pb {
+            (*out).diff_px = (*out).diff_px + 1 as u64
+            var mx: u32 = 0 as u32
+            var k: u32 = 0 as u32
+            while k < 4 as u32 {
+                let ba: i32 = ((pa >> (k * 8 as u32)) & 255 as u32) as i32
+                let bb: i32 = ((pb >> (k * 8 as u32)) & 255 as u32) as i32
+                var d: i32 = ba - bb
+                if d < 0 { d = 0 - d }
+                if k < 3 as u32 { sq = sq + (d * d) as f64 }
+                if (d as u32) > mx { mx = d as u32 }
+                k = k + 1 as u32
+            }
+            if mx > (*out).max_diff { (*out).max_diff = mx }
+            if mx > 16 as u32 { (*out).big_px = (*out).big_px + 1 as u64 }
+        }
+        i = i + 1
+    }
+    var psnr: f64 = 99.0
+    if sq > 0.0 {
+        let mse: f64 = sq / ((n as f64) * 3.0)
+        psnr = 10.0 * math.log10(255.0 * 255.0 / mse)
+    }
+    (*out).psnr_x100 = (psnr * 100.0) as u64
+}
+
+fn frame(b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera, clear: u32, h: usize, nx: i32, nz: i32,
+    ox: f64, oy: f64, oz: f64) -> u64 {
+    var tris: u64 = 0 as u64
+    (*b).begin((*b).obj, (cam as u64), clear)
+    var sx: i32 = 0
+    while sx < nx {
+        var sz: i32 = 0
+        while sz < nz {
+            tris = tris + (*b).draw((*b).obj, h, ox + ((sx * 16) as f64), oy, oz + ((sz * 16) as f64))
+            sz = sz + 1
+        }
+        sx = sx + 1
+    }
+    (*b).end((*b).obj)
+    return tris
+}
+
+// Renders a scene on both back ends, compares, prints one line, checks the thresholds.
+// ---- voxel tables / padded sections (as tools/mc/raster/dump.fi) ----------------------------------------------
+fn tables(t: *mut mc_mesh.MeshTables) {
+    let opaque: u64 = rt.heap_alloc(32768)
+    let tiles: u64 = rt.heap_alloc(32768 * 6 * 2)
+    var i: usize = 0
+    while i < 32768 {
+        rt.st8(opaque, i, 0 as u8)
+        i = i + 1
+    }
+    i = 0
+    while i < 32768 * 6 {
+        rt.st16(tiles, i, 0 as u16)
+        i = i + 1
+    }
+    // 1 grass block (side 4, bottom 2, top 3), 2 test tile, 3 leaves (cutout, not opaque), 4 stone, 5 bricks
+    let g: [u16; 6] = [4 as u16, 4 as u16, 2 as u16, 3 as u16, 4 as u16, 4 as u16]
+    var f: usize = 0
+    while f < 6 {
+        rt.st16(tiles, 1 * 6 + f, g[f])
+        rt.st16(tiles, 2 * 6 + f, 58 as u16)
+        rt.st16(tiles, 3 * 6 + f, 10 as u16)
+        rt.st16(tiles, 4 * 6 + f, 1 as u16)
+        rt.st16(tiles, 5 * 6 + f, 20 as u16)
+        f = f + 1
+    }
+    rt.st8(opaque, 1, 1 as u8)
+    rt.st8(opaque, 2, 1 as u8)
+    rt.st8(opaque, 4, 1 as u8)
+    rt.st8(opaque, 5, 1 as u8)
+    (*t).opaque = opaque
+    (*t).tiles = tiles
+}
+
+fn pad_set(pad: u64, x: i32, y: i32, z: i32, id: u16) {
+    rt.st16(pad, (((y + 1) * 18 + (z + 1)) * 18 + (x + 1)) as usize, id)
+}
+
+// rolling hills like tools/mc/raster/bench.fi plus leaf cut-out cubes and a bricks pillar
+fn fill_hills(pad: u64) {
+    var i: usize = 0
+    while i < 5832 {
+        rt.st16(pad, i, 0 as u16)
+        i = i + 1
+    }
+    var x: i32 = 0
+    while x < 16 {
+        var z: i32 = 0
+        while z < 16 {
+            let h: i32 = 2 + ((x * 7 + z * 13) % 5) / 2
+            var y: i32 = 0
+            while y <= h {
+                var id: u16 = 1 as u16
+                if y < h - 1 { id = 4 as u16 }
+                pad_set(pad, x, y, z, id)
+                y = y + 1
+            }
+            if (x * 5 + z * 3) % 11 == 0 { pad_set(pad, x, h + 1, z, 3 as u16) }
+            z = z + 1
+        }
+        x = x + 1
+    }
+    var py: i32 = 0
+    while py < 9 {
+        pad_set(pad, 7, py, 7, 5 as u16)
+        py = py + 1
+    }
+}
+
+
+// ---- the scenes ---------------------------------------------------------------------------------------------------
+struct World {
+    ta: mc_texture.Atlas, // hand made scenes: tile 1 solid, 2 quadrants, 3 half transparent
+    da: mc_texture.Atlas, // atlas_default for the voxel chunk
+    m: mc_mesh.Mesher, // the hills chunk
+    tv: u64, // triangle: 3 vertices, 3 indices
+    ti: u64,
+    qv: u64, // quad: 4 vertices, 6 indices
+    qi: u64,
+}
+
+// What one scene needs from the host program: which atlas, which mesh, how often it is drawn, fog, threshold.
+struct Sc {
+    atlas: i32, // 0 = World.ta, 1 = World.da
+    verts: u64,
+    nv: usize,
+    idx: u64,
+    ni: usize,
+    nx: i32,
+    nz: i32,
+    ox: f64,
+    oy: f64,
+    oz: f64,
+    fog: bool,
+    min_psnr_x100: u64, // PSNR floor in dB x 100 (same numbers as tools/gpu/dump.fi)
+}
+
+fn world_new() -> World {
+    var w: World = World { ta: test_atlas(), da: mc_texture.atlas_default(), m: mc_mesh.mesher_new(),
+        tv: rt.heap_alloc(3 * 8), ti: rt.heap_alloc(3 * 4), qv: rt.heap_alloc(4 * 8), qi: rt.heap_alloc(6 * 4) }
+    rt.st32(w.ti, 0, 0 as u32)
+    rt.st32(w.ti, 1, 1 as u32)
+    rt.st32(w.ti, 2, 2 as u32)
+    rt.st32(w.qi, 0, 0 as u32)
+    rt.st32(w.qi, 1, 1 as u32)
+    rt.st32(w.qi, 2, 2 as u32)
+    rt.st32(w.qi, 3, 0 as u32)
+    rt.st32(w.qi, 4, 2 as u32)
+    rt.st32(w.qi, 5, 3 as u32)
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    tables(&tb)
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    fill_hills(pad)
+    mc_mesh.mesh_padded(&w.m, pad, &tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+    return w
+}
+
+fn scene_name(i: usize) -> str {
+    if i == 0 { return "triangle" }
+    if i == 1 { return "quad_angled" }
+    if i == 2 { return "cutout" }
+    if i == 3 { return "fog_flat" }
+    if i == 4 { return "chunk" }
+    if i == 5 { return "chunk_fog" }
+    return "chunk_far"
+}
+
+// Puts scene `i` together: camera (set + updated), the mesh and its parameters.
+fn scene_setup(w: *mut World, i: usize, cam: *mut mc_camera.Camera, out: *mut Sc) {
+    (*out).atlas = 0
+    (*out).nx = 1
+    (*out).nz = 1
+    (*out).ox = 0.0
+    (*out).oy = 0.0
+    (*out).oz = 0.0
+    (*out).fog = false
+    (*out).min_psnr_x100 = 4000 as u64
+    (*out).verts = (*w).qv
+    (*out).nv = 4
+    (*out).idx = (*w).qi
+    (*out).ni = 6
+    if i == 0 {
+        put_vtx((*w).tv, 0, vw0(12 as u32, 3 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+        put_vtx((*w).tv, 1, vw0(4 as u32, 3 as u32, 10 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+        put_vtx((*w).tv, 2, vw0(8 as u32, 13 as u32, 10 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+        (*out).verts = (*w).tv
+        (*out).nv = 3
+        (*out).idx = (*w).ti
+        (*out).ni = 3
+        mc_camera.camera_set_pos(cam, 8.0, 8.0, 0.0)
+        mc_camera.camera_set_angles(cam, 0.0, 0.0)
+    } else if i == 1 {
+        // textured quad: tile 2 repeated 2 x 2, seen at an angle
+        put_vtx((*w).qv, 0, vw0(12 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 0 as u32, 2 as u32))
+        put_vtx((*w).qv, 1, vw0(4 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 2 as u32, 2 as u32))
+        put_vtx((*w).qv, 2, vw0(4 as u32, 14 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 2 as u32, 0 as u32))
+        put_vtx((*w).qv, 3, vw0(12 as u32, 14 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 0 as u32, 0 as u32))
+        mc_camera.camera_set_pos(cam, 14.0, 9.0, 1.0)
+        mc_camera.camera_set_angles(cam, 25.0, 8.0)
+    } else if i == 2 {
+        // cut-out quad (tile 3: left half transparent)
+        put_vtx((*w).qv, 0, vw0(12 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(3 as u32, 0 as u32, 1 as u32))
+        put_vtx((*w).qv, 1, vw0(4 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(3 as u32, 1 as u32, 1 as u32))
+        put_vtx((*w).qv, 2, vw0(4 as u32, 14 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(3 as u32, 1 as u32, 0 as u32))
+        put_vtx((*w).qv, 3, vw0(12 as u32, 14 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(3 as u32, 0 as u32, 0 as u32))
+        mc_camera.camera_set_pos(cam, 8.0, 8.0, 0.0)
+        mc_camera.camera_set_angles(cam, 0.0, 0.0)
+    } else if i == 3 {
+        // fog on a flat colour: a long quad receding from the camera
+        put_vtx((*w).qv, 0, vw0(16 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+        put_vtx((*w).qv, 1, vw0(0 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+        put_vtx((*w).qv, 2, vw0(0 as u32, 2 as u32, 26 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+        put_vtx((*w).qv, 3, vw0(16 as u32, 2 as u32, 26 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+        (*out).fog = true
+        (*out).min_psnr_x100 = 7500 as u64
+        mc_camera.camera_set_pos(cam, 8.0, 12.0, 0.0 - 14.0)
+        mc_camera.camera_set_angles(cam, 0.0, 22.0)
+    } else {
+        // the hills chunk, 2 x 2 sections
+        (*out).atlas = 1
+        (*out).verts = (*w).m.verts
+        (*out).nv = (*w).m.nverts as usize
+        (*out).idx = (*w).m.idx
+        (*out).ni = (*w).m.nidx as usize
+        (*out).nx = 2
+        (*out).nz = 2
+        (*out).min_psnr_x100 = 3400 as u64
+        if i == 4 || i == 5 {
+            (*out).fog = i == 5
+            mc_camera.camera_set_pos(cam, 20.0, 12.0, 0.0 - 10.0)
+            mc_camera.camera_set_angles(cam, 10.0, 25.0)
+        } else {
+            // far from the world origin: the camera-relative origin keeps the f32 vertices exact
+            (*out).ox = 1000000.0
+            (*out).oz = 0.0 - 2000000.0
+            mc_camera.camera_set_pos(cam, 1000020.0, 12.0, 0.0 - 2000010.0)
+            mc_camera.camera_set_angles(cam, 10.0, 25.0)
+        }
+    }
+    mc_camera.camera_update(cam)
+}
