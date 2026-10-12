@@ -24,7 +24,7 @@ import std.dynlib
 
 export {
     GlCtx, ctx_open, ctx_open_x11, ctx_close, ctx_proc, ctx_swap, ctx_swap_interval,
-    ctx_x11_pending, ctx_x11_pump,
+    ctx_x11_pending, ctx_x11_pump, ctx_attach_x11, ctx_attach_glx, ctx_surface_size, ctx_swap_range, ctx_interval_get, ctx_make_current, ctx_blank,
 }
 
 // failure steps (GlCtx.step): 0 = ok
@@ -63,6 +63,17 @@ struct GlCtx {
     f_xnextevent: u64,
     w: i32,
     h: i32,
+    visual: u64, // wanted native visual id for window configs (0 = first config)
+    // GLX mode (ctx_attach_glx): ctx = GLXContext, xwin = the drawable, the EGL fields stay 0
+    glx: bool,
+    f_glx_swap: u64,
+    f_glx_make: u64,
+    f_glx_destroy: u64,
+    f_glx_swapint: u64, // glXSwapIntervalEXT / MESA / SGI
+    glx_kind: i32, // 0 = none, 1 = EXT (drawable, interval), 2 = MESA (uint), 3 = SGI (int)
+    glx_tear: bool, // GLX_EXT_swap_control_tear: interval -1 = adaptive
+    f_glx_query: u64, // glXQueryDrawable
+    interval: i32, // the swap interval last set (-99 = never)
 }
 
 fn cs(s: str, buf: *mut [u8; 256]) -> bool {
@@ -93,7 +104,13 @@ fn call(f: u64, sig: str, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) 
 fn new_ctx(w: i32, h: i32) -> GlCtx {
     return GlCtx { ok: false, step: 0, window: false, surfaceless: false, egl: 0, glib: 0, getproc: 0, dpy: 0, cfg: 0,
         surf: 0, ctx: 0, f_swap: 0, f_interval: 0, f_make: 0, f_destroy_ctx: 0, f_destroy_surf: 0, f_terminate: 0,
-        x11: 0, xdpy: 0, xwin: 0, f_xpending: 0, f_xnextevent: 0, w: w, h: h }
+        x11: 0, xdpy: 0, xwin: 0, f_xpending: 0, f_xnextevent: 0, w: w, h: h, visual: 0, glx: false, f_glx_swap: 0,
+        f_glx_make: 0, f_glx_destroy: 0, f_glx_swapint: 0, glx_kind: 0, glx_tear: false, f_glx_query: 0, interval: 0 - 99 }
+}
+
+// An empty, not-ok context (placeholder inside structs; ctx_close on it is a no-op).
+fn ctx_blank() -> GlCtx {
+    return new_ctx(0, 0)
 }
 
 // Address of the GL (or EGL extension) function `name`, 0 if the driver does not have it. Needs the context
@@ -189,13 +206,26 @@ fn make_context(c: *mut GlCtx, want_window: bool, native_window: u64) -> bool {
     }
     // SURFACE_TYPE, RENDERABLE_TYPE = OPENGL_BIT, R G B A 8, DEPTH 24, NONE
     var cattr: [i32; 15] = [0x3033, surf_bit, 0x3040, 8, 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3025, 24, 0x3038]
-    var cfg: [u64; 1] = [0; 1]
+    var cfg: [u64; 64] = [0; 64]
     var ncfg: [i32; 1] = [0; 1]
-    if call(choose, "iiiii", (*c).dpy, (&cattr[0]) as u64, (&cfg[0]) as u64, 1, (&ncfg[0]) as u64, 0) == 0 || ncfg[0] < 1 {
+    if call(choose, "iiiii", (*c).dpy, (&cattr[0]) as u64, (&cfg[0]) as u64, 64, (&ncfg[0]) as u64, 0) == 0 || ncfg[0] < 1 {
         (*c).step = S_NO_CONFIG
         return false
     }
     (*c).cfg = cfg[0]
+    if want_window && (*c).visual != 0 {
+        // the window was created with a fixed X visual: the config must use the same one (EGL_NATIVE_VISUAL_ID)
+        let getattr: u64 = dynlib.sym((*c).egl, "eglGetConfigAttrib")
+        var k: i32 = 0
+        while getattr != 0 && k < ncfg[0] {
+            var vid: [i32; 1] = [0; 1]
+            if call(getattr, "iiii", (*c).dpy, cfg[k as usize], 0x302E, (&vid[0]) as u64, 0, 0) != 0 && (vid[0] as u64) == (*c).visual {
+                (*c).cfg = cfg[k as usize]
+                k = ncfg[0]
+            }
+            k = k + 1
+        }
+    }
     if want_window {
         if mkwin == 0 {
             (*c).step = S_NO_SURFACE
@@ -309,6 +339,230 @@ fn ctx_open_x11(w: i32, h: i32) -> GlCtx {
     return c
 }
 
+// Context for an EXISTING X11 window (`xid`, created with `visual` by someone else, e.g. lib/window's own X11
+// protocol): a second Xlib connection (DISPLAY) is opened only for EGL (Mesa's X11 platform needs a Display*;
+// a window id is global on the server, so it may belong to another connection). No window is created.
+fn ctx_attach_x11(xid: u64, visual: u64, w: i32, h: i32) -> GlCtx {
+    var c: GlCtx = new_ctx(w, h)
+    c.visual = visual
+    if !load_egl(&c) {
+        return c
+    }
+    c.x11 = dynlib.open("libX11.so.6")
+    if c.x11 == 0 {
+        c.step = S_NO_X11
+        return c
+    }
+    let f_open: u64 = dynlib.sym(c.x11, "XOpenDisplay")
+    if f_open == 0 {
+        c.step = S_NO_X11
+        return c
+    }
+    c.xdpy = call(f_open, "i", 0, 0, 0, 0, 0, 0)
+    if c.xdpy == 0 {
+        c.step = S_NO_X11
+        return c
+    }
+    c.f_xpending = dynlib.sym(c.x11, "XPending")
+    c.f_xnextevent = dynlib.sym(c.x11, "XNextEvent")
+    // EGL_PLATFORM_X11_KHR = 0x31D5 first, then the legacy eglGetDisplay(Display*)
+    let f_plat: u64 = dynlib.sym(c.egl, "eglGetPlatformDisplay")
+    if f_plat != 0 {
+        c.dpy = call(f_plat, "iii", 0x31D5, c.xdpy, 0, 0, 0, 0)
+    }
+    if c.dpy == 0 {
+        c.dpy = call(dynlib.sym(c.egl, "eglGetDisplay"), "i", c.xdpy, 0, 0, 0, 0, 0)
+    }
+    if c.dpy == 0 {
+        c.step = S_NO_DISPLAY
+        return c
+    }
+    var ver: [i32; 2] = [0; 2]
+    if call(dynlib.sym(c.egl, "eglInitialize"), "iii", c.dpy, (&ver[0]) as u64, (&ver[1]) as u64, 0, 0, 0) == 0 {
+        c.step = S_NO_INIT
+        return c
+    }
+    if !make_context(&c, true, xid) {
+        return c
+    }
+    c.window = true
+    c.ok = true
+    return c
+}
+
+// True when the C string at `p` contains `needle`.
+fn cstr_has(p: u64, needle: str) -> bool {
+    if p == 0 {
+        return false
+    }
+    let n: usize = needle.length()
+    var i: usize = 0
+    while rt.ld8(p, i) != 0 as u8 {
+        var k: usize = 0
+        while k < n && rt.ld8(p, i + k) == needle.chars(k) {
+            k = k + 1
+        }
+        if k == n {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// GLX variant for an EXISTING X11 window: libGL.so.1 (Mesa/NVIDIA GLX), FBConfig with the window's visual,
+// glXCreateContextAttribsARB (3.3 core), the window itself is the drawable. Same GlCtx API afterwards
+// (ctx_swap / ctx_swap_interval / ctx_proc / ctx_close dispatch on `glx`).
+fn ctx_attach_glx(xid: u64, visual: u64, w: i32, h: i32) -> GlCtx {
+    var c: GlCtx = new_ctx(w, h)
+    c.visual = visual
+    c.glib = dynlib.open("libGL.so.1")
+    c.x11 = dynlib.open("libX11.so.6")
+    if c.glib == 0 || c.x11 == 0 {
+        c.step = S_NO_EGL
+        return c
+    }
+    let f_open: u64 = dynlib.sym(c.x11, "XOpenDisplay")
+    let f_scr: u64 = dynlib.sym(c.x11, "XDefaultScreen")
+    c.getproc = dynlib.sym(c.glib, "glXGetProcAddressARB")
+    if c.getproc == 0 {
+        c.getproc = dynlib.sym(c.glib, "glXGetProcAddress")
+    }
+    let f_choose: u64 = dynlib.sym(c.glib, "glXChooseFBConfig")
+    let f_attr: u64 = dynlib.sym(c.glib, "glXGetFBConfigAttrib")
+    c.f_glx_swap = dynlib.sym(c.glib, "glXSwapBuffers")
+    c.f_glx_make = dynlib.sym(c.glib, "glXMakeCurrent")
+    c.f_glx_destroy = dynlib.sym(c.glib, "glXDestroyContext")
+    let f_exts: u64 = dynlib.sym(c.glib, "glXQueryExtensionsString")
+    if f_open == 0 || f_scr == 0 || c.getproc == 0 || f_choose == 0 || f_attr == 0 || c.f_glx_swap == 0
+        || c.f_glx_make == 0 || c.f_glx_destroy == 0 {
+        c.step = S_NO_EGL
+        return c
+    }
+    c.xdpy = call(f_open, "i", 0, 0, 0, 0, 0, 0)
+    if c.xdpy == 0 {
+        c.step = S_NO_X11
+        return c
+    }
+    let scr: u64 = call(f_scr, "i", c.xdpy, 0, 0, 0, 0, 0)
+    // X_RENDERABLE 1, DRAWABLE_TYPE = WINDOW_BIT, RENDER_TYPE = RGBA_BIT, DOUBLEBUFFER 1, R G B A 8, DEPTH 24, None
+    var at: [i32; 21] = [0x8012, 1, 0x8010, 1, 0x8011, 1, 5, 1, 8, 8, 9, 8, 10, 8, 11, 8, 12, 24, 0, 0, 0]
+    var n: [i32; 1] = [0; 1]
+    let cfgs: u64 = call(f_choose, "iiii", c.xdpy, scr, (&at[0]) as u64, (&n[0]) as u64, 0, 0)
+    if cfgs == 0 || n[0] < 1 {
+        c.step = S_NO_CONFIG
+        return c
+    }
+    var chosen: u64 = *(cfgs as *mut u64)
+    var k: i32 = 0
+    while k < n[0] && visual != 0 {
+        let cf: u64 = *((cfgs + (k as u64) * 8) as *mut u64)
+        var vid: [i32; 1] = [0; 1]
+        if call(f_attr, "iiii", c.xdpy, cf, 0x800B, (&vid[0]) as u64, 0, 0) == 0 && (vid[0] as u64) == visual {
+            chosen = cf
+            k = n[0]
+        }
+        k = k + 1
+    }
+    var nm: [u8; 256] = [0; 256]
+    if !cs("glXCreateContextAttribsARB", &nm) {
+        return c
+    }
+    let f_ctx: u64 = call(c.getproc, "i", (&nm[0]) as u64, 0, 0, 0, 0, 0)
+    if f_ctx == 0 {
+        c.step = S_NO_CONTEXT
+        return c
+    }
+    // CONTEXT_MAJOR 3, CONTEXT_MINOR 3, PROFILE_MASK = CORE_PROFILE_BIT, None
+    var ca: [i32; 7] = [0x2091, 3, 0x2092, 3, 0x9126, 1, 0]
+    c.ctx = call(f_ctx, "iiiii", c.xdpy, chosen, 0, 1, (&ca[0]) as u64, 0)
+    if c.ctx == 0 {
+        c.step = S_NO_CONTEXT
+        return c
+    }
+    if call(c.f_glx_make, "iii", c.xdpy, xid, c.ctx, 0, 0, 0) == 0 {
+        c.step = S_NO_CURRENT
+        return c
+    }
+    // swap control: EXT (per drawable) > MESA > SGI
+    var nm2: [u8; 256] = [0; 256]
+    if cs("glXSwapIntervalEXT", &nm2) {
+        c.f_glx_swapint = call(c.getproc, "i", (&nm2[0]) as u64, 0, 0, 0, 0, 0)
+    }
+    if c.f_glx_swapint != 0 {
+        c.glx_kind = 1
+    } else {
+        if cs("glXSwapIntervalMESA", &nm2) {
+            c.f_glx_swapint = call(c.getproc, "i", (&nm2[0]) as u64, 0, 0, 0, 0, 0)
+        }
+        if c.f_glx_swapint != 0 {
+            c.glx_kind = 2
+        } else {
+            if cs("glXSwapIntervalSGI", &nm2) {
+                c.f_glx_swapint = call(c.getproc, "i", (&nm2[0]) as u64, 0, 0, 0, 0, 0)
+            }
+            if c.f_glx_swapint != 0 {
+                c.glx_kind = 3
+            }
+        }
+    }
+    if f_exts != 0 {
+        c.glx_tear = cstr_has(call(f_exts, "ii", c.xdpy, scr, 0, 0, 0, 0), "GLX_EXT_swap_control_tear")
+    }
+    c.f_glx_query = dynlib.sym(c.glib, "glXQueryDrawable")
+    c.xwin = xid
+    c.glx = true
+    c.window = true
+    c.ok = true
+    return c
+}
+
+// The swap interval the driver reports for the window (GLX: glXQueryDrawable(GLX_SWAP_INTERVAL_EXT); EGL has no
+// query: the value last accepted by ctx_swap_interval, -99 if never set).
+fn ctx_interval_get(c: *mut GlCtx) -> i32 {
+    // glXQueryDrawable is not usable on a plain X window (Mesa's dispatch is null for it): the value last accepted
+    return (*c).interval
+}
+
+// The size EGL reports for the window surface (EGL_WIDTH / EGL_HEIGHT); false if it cannot be asked.
+fn ctx_surface_size(c: *mut GlCtx, w: *mut i32, h: *mut i32) -> bool {
+    if (*c).glx {
+        return false // no query on a plain X window; the window size is the Firn window's
+    }
+    let q: u64 = dynlib.sym((*c).egl, "eglQuerySurface")
+    if q == 0 || (*c).surf == 0 {
+        return false
+    }
+    var v: [i32; 2] = [0; 2]
+    if call(q, "iiii", (*c).dpy, (*c).surf, 0x3057, (&v[0]) as u64, 0, 0) == 0 {
+        return false
+    }
+    if call(q, "iiii", (*c).dpy, (*c).surf, 0x3056, (&v[1]) as u64, 0, 0) == 0 {
+        return false
+    }
+    *w = v[0]
+    *h = v[1]
+    return true
+}
+
+// The swap interval range the config allows (EGL_MIN_SWAP_INTERVAL / EGL_MAX_SWAP_INTERVAL).
+fn ctx_swap_range(c: *mut GlCtx, lo: *mut i32, hi: *mut i32) -> bool {
+    let q: u64 = dynlib.sym((*c).egl, "eglGetConfigAttrib")
+    if q == 0 || (*c).cfg == 0 {
+        return false
+    }
+    var v: [i32; 2] = [0; 2]
+    if call(q, "iiii", (*c).dpy, (*c).cfg, 0x303B, (&v[0]) as u64, 0, 0) == 0 {
+        return false
+    }
+    if call(q, "iiii", (*c).dpy, (*c).cfg, 0x303C, (&v[1]) as u64, 0, 0) == 0 {
+        return false
+    }
+    *lo = v[0]
+    *hi = v[1]
+    return true
+}
+
 // Number of X events waiting (0 if this is not an X11 window context).
 fn ctx_x11_pending(c: *mut GlCtx) -> i32 {
     if (*c).xdpy == 0 || (*c).f_xpending == 0 {
@@ -331,8 +585,23 @@ fn ctx_x11_pump(c: *mut GlCtx) -> i32 {
     return n
 }
 
+// Makes the context current on this thread again (window contexts, EGL and GLX).
+fn ctx_make_current(c: *mut GlCtx) -> bool {
+    if (*c).glx {
+        return call((*c).f_glx_make, "iii", (*c).xdpy, (*c).xwin, (*c).ctx, 0, 0, 0) != 0
+    }
+    if (*c).f_make == 0 || (*c).dpy == 0 {
+        return false
+    }
+    return call((*c).f_make, "iiii", (*c).dpy, (*c).surf, (*c).surf, (*c).ctx, 0, 0) != 0
+}
+
 // Shows the frame (window contexts); a pbuffer context has nothing to swap, returns false.
 fn ctx_swap(c: *mut GlCtx) -> bool {
+    if (*c).glx {
+        call((*c).f_glx_swap, "ii", (*c).xdpy, (*c).xwin, 0, 0, 0, 0)
+        return true
+    }
     if !(*c).window || (*c).f_swap == 0 {
         return false
     }
@@ -341,13 +610,39 @@ fn ctx_swap(c: *mut GlCtx) -> bool {
 
 // 0 = do not wait for the vertical blank, 1 = wait (window contexts).
 fn ctx_swap_interval(c: *mut GlCtx, n: i32) -> bool {
-    if (*c).f_interval == 0 {
+    if (*c).glx {
+        var ok: bool = false
+        if n < 0 && !(*c).glx_tear {
+            return false
+        }
+        if (*c).glx_kind == 1 {
+            call((*c).f_glx_swapint, "iii", (*c).xdpy, (*c).xwin, n as u64, 0, 0, 0)
+            ok = true
+        }
+        if (*c).glx_kind == 2 || (*c).glx_kind == 3 {
+            ok = call((*c).f_glx_swapint, "i", n as u64, 0, 0, 0, 0, 0) == 0
+        }
+        if ok {
+            (*c).interval = n
+        }
+        return ok
+    }
+    if (*c).f_interval == 0 || n < 0 {
         return false
     }
-    return call((*c).f_interval, "ii", (*c).dpy, n as u64, 0, 0, 0, 0) != 0
+    let ok: bool = call((*c).f_interval, "ii", (*c).dpy, n as u64, 0, 0, 0, 0) != 0
+    if ok {
+        (*c).interval = n
+    }
+    return ok
 }
 
 fn ctx_close(c: *mut GlCtx) {
+    if (*c).glx {
+        call((*c).f_glx_make, "iii", (*c).xdpy, 0, 0, 0, 0, 0)
+        call((*c).f_glx_destroy, "ii", (*c).xdpy, (*c).ctx, 0, 0, 0, 0)
+        (*c).glx = false
+    }
     if (*c).dpy != 0 && (*c).f_make != 0 {
         call((*c).f_make, "iiii", (*c).dpy, 0, 0, 0, 0, 0)
         if (*c).ctx != 0 && (*c).f_destroy_ctx != 0 {

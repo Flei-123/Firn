@@ -129,6 +129,7 @@ export {
     r_gpu_open, r_gpu_swap, r_gpu_close, r_gpu_place, r_gpu_lost,
     r_gpu_gl, r_gpu_proc, r_gpu_vsync, r_fullscreen, r_is_fullscreen, r_cursor_mode, r_cursor_delta,
     r_raw_input, r_cursor_shape, r_cursor_raw, r_cursor_is_raw,
+    r_native, r_native_visual, r_set_size,
     r_dragging,
     Platte, surface_new,
     r_open, r_make, r_show, r_title, r_close, r_is_open,
@@ -4440,12 +4441,150 @@ fn r_gpu_vsync(x: *mut Platte, on: bool) -> bool {
     return false
 }
 
+// ---- FULL SCREEN (glwin round): EWMH _NET_WM_STATE_FULLSCREEN when a window manager runs, else the
+// window is moved/sized over the screen by hand (no WM = nobody else decides). The EWMH request only
+// works on a MAPPED window (call after show_window); EV_CONFIGURE follows when the WM resizes it.
+static mut G_FS_ON: bool = false
+static mut G_FS_W: usize = 0
+static mut G_FS_H: usize = 0
+
+// ConfigureWindow(12) of our window: `mask` bits x=1 y=2 width=4 height=8; the values follow in that order.
+fn configure_window(x: *mut Platte, mask: u32, v0: u32, v1: u32, v2: u32, v3: u32) -> bool {
+    var nv: u32 = 0
+    var m: u32 = mask
+    while m != 0 {
+        nv = nv + (m & 1)
+        m = m >> 1
+    }
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 12 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 3 + nv)
+    put32(&r, (*x).win)
+    put16(&r, mask)
+    put16(&r, 0 as u32)
+    if nv > 0 { put32(&r, v0) }
+    if nv > 1 { put32(&r, v1) }
+    if nv > 2 { put32(&r, v2) }
+    if nv > 3 { put32(&r, v3) }
+    let ok: bool = send_request(x, &r)
+    return ok
+}
+
+// A ClientMessage for the window manager: SendEvent to the root window with SubstructureRedirect | Notify.
+fn send_wm_message(x: *mut Platte, mtype: u32, d0: u32, d1: u32, d2: u32, d3: u32, d4: u32) -> bool {
+    var r: rt.Buf = rt.buf_new()
+    rt.buf_push(&r, 25 as u8)
+    rt.buf_push(&r, 0 as u8)
+    put16(&r, 11 as u32)
+    put32(&r, (*x).root)
+    put32(&r, 1572864 as u32) // 0x180000
+    rt.buf_push(&r, 33 as u8)
+    rt.buf_push(&r, 32 as u8)
+    put16(&r, 0 as u32)
+    put32(&r, (*x).win)
+    put32(&r, mtype)
+    put32(&r, d0)
+    put32(&r, d1)
+    put32(&r, d2)
+    put32(&r, d3)
+    put32(&r, d4)
+    let ok: bool = send_request(x, &r)
+    return ok
+}
+
+// True when an EWMH window manager runs (_NET_SUPPORTING_WM_CHECK on the root window).
+fn wm_running(x: *mut Platte) -> bool {
+    let a: u32 = intern_live(x, "_NET_SUPPORTING_WM_CHECK")
+    if a == 0 {
+        return false
+    }
+    var v: rt.Buf = rt.buf_new()
+    var t: u32 = 0
+    var ok: bool = get_prop_any(x, (*x).root, a, false, &v, &t)
+    if ok && rt.buf_len(&v) < 4 {
+        ok = false
+    }
+    rt.buf_free(&v)
+    return ok
+}
+
 fn r_fullscreen(x: *mut Platte, on: bool) -> bool {
-    return false
+    if !(*x).open || (*x).win == 0 {
+        return false
+    }
+    if wm_running(x) {
+        let st: u32 = intern_live(x, "_NET_WM_STATE")
+        let fs: u32 = intern_live(x, "_NET_WM_STATE_FULLSCREEN")
+        if st == 0 || fs == 0 {
+            return false
+        }
+        var act: u32 = 0
+        if on { act = 1 }
+        return send_wm_message(x, st, act, fs, 0 as u32, 1 as u32, 0 as u32)
+    }
+    if on {
+        if G_FS_ON {
+            return true
+        }
+        if (*x).schirm_w == 0 || (*x).schirm_h == 0 {
+            return false
+        }
+        G_FS_W = (*x).w
+        G_FS_H = (*x).h
+        G_FS_ON = true
+        return configure_window(x, 15 as u32, 0 as u32, 0 as u32, (*x).schirm_w as u32, (*x).schirm_h as u32)
+    }
+    if !G_FS_ON {
+        return true
+    }
+    G_FS_ON = false
+    return configure_window(x, 12 as u32, G_FS_W as u32, G_FS_H as u32, 0 as u32, 0 as u32)
 }
 
 fn r_is_fullscreen(x: *mut Platte) -> bool {
-    return false
+    if !(*x).open || (*x).win == 0 {
+        return false
+    }
+    if !wm_running(x) {
+        return G_FS_ON
+    }
+    let st: u32 = intern_live(x, "_NET_WM_STATE")
+    let fs: u32 = intern_live(x, "_NET_WM_STATE_FULLSCREEN")
+    if st == 0 || fs == 0 {
+        return false
+    }
+    var v: rt.Buf = rt.buf_new()
+    var t: u32 = 0
+    var found: bool = false
+    if get_prop_any(x, (*x).win, st, false, &v, &t) {
+        var i: usize = 0
+        while i + 4 <= rt.buf_len(&v) {
+            if ld32le(rt.buf_ptr(&v), i) == fs {
+                found = true
+            }
+            i = i + 4
+        }
+    }
+    rt.buf_free(&v)
+    return found
+}
+
+// ---- native handles for lib/gpu/glwin.fi: the window id (XID) and the visual it was created with.
+fn r_native(x: *mut Platte) -> u64 {
+    return (*x).win as u64
+}
+
+fn r_native_visual(x: *mut Platte) -> u64 {
+    return (*x).visual as u64
+}
+
+// Sets the size of the WINDOW (ConfigureWindow); EV_CONFIGURE follows with the size the server really gave.
+fn r_set_size(x: *mut Platte, w: usize, h: usize) -> bool {
+    if !(*x).open || (*x).win == 0 || w == 0 || h == 0 {
+        return false
+    }
+    return configure_window(x, 12 as u32, w as u32, h as u32, 0 as u32, 0 as u32)
 }
 
 // ===================================================================

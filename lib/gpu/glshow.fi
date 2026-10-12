@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/glshow.fi -- gpu.glshow: draws a texture or a CPU pixel buffer over the whole DEFAULT framebuffer (the
+// window) with one full-screen triangle. This is the frame path of a GL window without read back:
+//
+//   * GlBackend frame (lib/gpu/gl_mc.fi): the FBO colour texture `gb.fbo.color` -> show_draw(.., flip = false)
+//   * fUi / CPU canvas (BGRX or RGBA octets, top row first): show_pixels(..) uploads (one texture, updated in place)
+//     and draws it flipped -> then glwin.swap. Replaces `window.image` (PutImage) in a host.
+//
+//     var sh: glshow.Show = glshow.show_new()
+//     glshow.show_init(&sh, &gl)                       // once, context current
+//     glshow.show_pixels(&sh, &gl, px, w, h, true, g.w, g.h)   // true = BGRX
+//     glwin.swap(&g)
+import std.rt
+import gpu.gl33
+
+export { Show, show_new, show_init, show_draw, show_pixels, show_free }
+
+const VS: str = "#version 330 core\nuniform float u_flip;\nout vec2 uv;\nvoid main() {\n    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n    uv = vec2(p.x, mix(p.y, 1.0 - p.y, u_flip));\n    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n}\n"
+const FS: str = "#version 330 core\nuniform sampler2D u_tex;\nuniform float u_bgr;\nin vec2 uv;\nout vec4 o;\nvoid main() {\n    vec3 c = texture(u_tex, uv).rgb;\n    o = vec4(mix(c, c.bgr, u_bgr), 1.0);\n}\n"
+
+struct Show {
+    ok: bool,
+    prog: u32,
+    vao: u32,
+    l_tex: i32,
+    l_flip: i32,
+    l_bgr: i32,
+    tex: u32, // the texture show_pixels owns (0 = none yet)
+    tw: i32,
+    th: i32,
+}
+
+fn show_new() -> Show {
+    return Show { ok: false, prog: 0 as u32, vao: 0 as u32, l_tex: 0 - 1, l_flip: 0 - 1, l_bgr: 0 - 1, tex: 0 as u32, tw: 0, th: 0 }
+}
+
+#[allow_escape]
+fn show_init(s: *mut Show, g: *mut gl33.Gl) -> bool {
+    var log: [u8; 256] = [0; 256]
+    (*s).prog = gl33.gl_program(g, VS.p as u64, VS.n, FS.p as u64, FS.n, (&log[0]) as u64, 256)
+    if (*s).prog == 0 as u32 {
+        return false
+    }
+    (*s).l_tex = gl33.gl_uniform_loc(g, (*s).prog, "u_tex")
+    (*s).l_flip = gl33.gl_uniform_loc(g, (*s).prog, "u_flip")
+    (*s).l_bgr = gl33.gl_uniform_loc(g, (*s).prog, "u_bgr")
+    (*s).vao = gl33.gl_gen_vao(g)
+    (*s).ok = (*s).vao != 0 as u32
+    return (*s).ok
+}
+
+// Draws texture `tex` (any size, sampled 0..1) over the window framebuffer of vw x vh pixels. flip = true: the
+// texture's first row is the TOP (a CPU image); false: the first row is the bottom (an FBO colour texture).
+// bgr = true swaps red and blue (BGRX data uploaded as RGBA). Depth test and blending are switched off.
+fn show_draw(s: *mut Show, g: *mut gl33.Gl, tex: u32, flip: bool, bgr: bool, vw: i32, vh: i32) {
+    gl33.gl_fbo_unbind(g)
+    gl33.gl_viewport(g, 0, 0, vw, vh)
+    gl33.gl_disable(g, gl33.GL_DEPTH_TEST)
+    gl33.gl_disable(g, gl33.GL_BLEND)
+    gl33.gl_disable(g, gl33.GL_CULL_FACE)
+    gl33.gl_use(g, (*s).prog)
+    gl33.gl_bind_tex(g, 0 as u32, tex)
+    gl33.gl_u1i(g, (*s).l_tex, 0)
+    var f: f64 = 0.0
+    if flip { f = 1.0 }
+    gl33.gl_u1f(g, (*s).l_flip, f)
+    var b: f64 = 0.0
+    if bgr { b = 1.0 }
+    gl33.gl_u1f(g, (*s).l_bgr, b)
+    gl33.gl_bind_vao(g, (*s).vao)
+    gl33.gl_draw_arrays(g, gl33.GL_TRIANGLES, 0, 3)
+}
+
+// Uploads a CPU image (w x h, 4 octets per pixel, top row first) and draws it over the window (vw x vh).
+fn show_pixels(s: *mut Show, g: *mut gl33.Gl, px: u64, w: i32, h: i32, bgrx: bool, vw: i32, vh: i32) {
+    if (*s).tex == 0 as u32 || (*s).tw != w || (*s).th != h {
+        if (*s).tex != 0 as u32 {
+            gl33.gl_delete_tex(g, (*s).tex)
+        }
+        (*s).tex = gl33.gl_tex_rgba8(g, w, h, px, gl33.GL_NEAREST, gl33.GL_NEAREST)
+        (*s).tw = w
+        (*s).th = h
+    } else {
+        gl33.gl_tex_update(g, (*s).tex, w, h, px, false)
+    }
+    show_draw(s, g, (*s).tex, true, bgrx, vw, vh)
+}
+
+fn show_free(s: *mut Show, g: *mut gl33.Gl) {
+    if (*s).tex != 0 as u32 {
+        gl33.gl_delete_tex(g, (*s).tex)
+    }
+    if (*s).prog != 0 as u32 {
+        gl33.gl_delete_program(g, (*s).prog)
+    }
+    if (*s).vao != 0 as u32 {
+        gl33.gl_delete_vao(g, (*s).vao)
+    }
+    (*s).ok = false
+    (*s).tex = 0 as u32
+    (*s).prog = 0 as u32
+    (*s).vao = 0 as u32
+}
