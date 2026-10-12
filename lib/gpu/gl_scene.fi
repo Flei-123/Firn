@@ -1,0 +1,629 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/gl_scene.fi -- gpu.gl_scene: the passes AROUND the voxel pass of lib/gpu/gl_mc.fi (docs/GPU.md "Scene layer").
+//
+//     import gpu.gl_scene
+//     var gb: gl_mc.GlBackend = gl_mc.glbe_open(640, 360)
+//     var sc: gl_scene.Scene = gl_scene.scene_open(&gb)               // 4 programs, cube + instance buffers, timer ring, cull
+//     // every frame (the camera has been camera_update'd):
+//     gl_scene.scene_frame(&sc)                                       // timer ring: collect finished passes
+//     b.begin(b.obj, cam, clear)                                      // clears, voxel state
+//     gl_scene.scene_sky(&sc, &cam, &sky)                             // background (mc_sky) per pixel, depth untouched
+//     b.draw(...) ...; b.end(b.obj)                                   // the voxel sections
+//     gl_scene.scene_ent_add(&sc, &e) ...; gl_scene.scene_ent_flush(&sc, &cam)    // instanced boxes (frustum + Hi-Z culled)
+//     gl_scene.scene_tint(&sc, &sky)                                  // light tint of everything that has depth
+//     mc_hud.hud_record(&rec); mc_hud.hud_frame(..); mc_hud.hud_record(0)         // CPU layout code -> rectangles
+//     gl_scene.scene_hud(&sc, &rec)                                   // the rectangles on the GPU, in order
+//     gl_scene.scene_present_window(&sc, &show, w, h)                 // FBO texture -> window framebuffer, NO read back
+//     glwindow.swap(&win)
+//
+// Same pass order as the CPU path (raster_clear -> sky_draw -> world -> entities -> sky_tint_frame -> hud), so a frame from the
+// GL path can be compared with the one from mc_raster (tools/gpu/mc/scene.fi: PSNR >= 34 dB).
+//
+// PASSES. Each public pass is bracketed by a timer pair (gl_query ring, PASS_*), never waits for the GPU. Every pass first calls
+// glbe_flush (collected voxel draws are issued with the voxel state) and, when done, glbe_rebind (voxel state is back, so further
+// b.draw calls still work; `auto_rebind` false skips that for the last pass of a frame).
+// ENTITIES are boxes (centre, size, yaw about Y, colour). One unit cube (24 vertices) + one instance record per box
+// (12 f32: centre minus camera [f64 -> f32], yaw sine, size, yaw cosine, colour). Shading = mc_raster with ao 3 (channel * face_k >> 8)
+// and the same fog. CULLING (scene_set_cull, default on): a box outside the frustum or hidden behind the OCCLUDER boxes (software
+// Hi-Z of gpu.cull, 128 x 72) is not sent; the frame is identical with and without culling (the occluder test is conservative,
+// occluders are drawn like any entity). Only unrotated boxes (yaw 0) count as occluders (a rotated box would not fill its AABB).
+// HUD. mc_hud.hud_record collects clipped rectangles (6 u32 each); scene_hud draws them as instanced strips in the recorded order
+// (a run of one blend mode = one instanced draw). Blend: SRC_ALPHA / ONE_MINUS_SRC_ALPHA; invert: ONE_MINUS_DST_COLOR / ZERO.
+// Destination alpha is never written (colour mask), so the read back alpha stays 255 like the CPU path.
+// Call from the thread that owns the context. NOT measured on a real GPU (llvmpipe only).
+
+import std.rt
+import std.math
+import mc.mc_camera
+import mc.mc_math
+import mc.mc_sky
+import gpu.gl33
+import gpu.gl_ext
+import gpu.gl_prog
+import gpu.gl_query
+import gpu.cull
+import gpu.gl_mc
+import gpu.glshow
+
+export {
+    Scene, Ent, scene_open, scene_close, scene_frame, scene_pass_begin, scene_pass_end, scene_pass_name, scene_pass_ms,
+    scene_print_timers, scene_set_cull, scene_set_rebind, scene_sky, scene_tint, ent_new, scene_ent_add, scene_ent_occluder,
+    scene_ent_flush, scene_ent_clear, scene_hud, scene_present_window,
+    PASS_TERRAIN, PASS_SKY, PASS_ENT, PASS_TINT, PASS_HUD, PASS_RESOLVE, PASS_PRESENT, PASS_COUNT,
+}
+
+const SKY_VS: str = __include_str("gl_sky_vs.glsl")
+const SKY_FS: str = __include_str("gl_sky_fs.glsl")
+const TINT_FS: str = __include_str("gl_tint_fs.glsl")
+const ENT_VS: str = __include_str("gl_ent_vs.glsl")
+const ENT_FS: str = __include_str("gl_ent_fs.glsl")
+const HUD_VS: str = __include_str("gl_hud_vs.glsl")
+const HUD_FS: str = __include_str("gl_hud_fs.glsl")
+
+// timer passes (gl_query ring index)
+const PASS_TERRAIN: usize = 0 // the caller brackets the voxel pass with scene_pass_begin / scene_pass_end
+const PASS_SKY: usize = 1
+const PASS_ENT: usize = 2
+const PASS_TINT: usize = 3
+const PASS_HUD: usize = 4
+const PASS_RESOLVE: usize = 5
+const PASS_PRESENT: usize = 6
+const PASS_COUNT: usize = 7
+
+const GL_TRIANGLE_STRIP: u32 = 5
+const GL_GREATER: u32 = 0x204
+const GL_ZERO: u32 = 0
+const GL_DST_COLOR: u32 = 0x306
+const GL_ONE_MINUS_DST_COLOR: u32 = 0x307
+
+const ENT_WORDS: usize = 12 // f64 per queued entity: x y z sx sy sz sin cos r g b flags
+const ENT_BYTES: usize = 96
+const INST_F32: usize = 12
+const HUD_REC_BYTES: usize = 24
+
+struct Ent {
+    x: f64, y: f64, z: f64, // centre (world)
+    sx: f64, sy: f64, sz: f64, // size along the box axes before the yaw
+    yaw_sin: f64, yaw_cos: f64,
+    r: u32, g: u32, b: u32, // colour 0..255
+}
+
+struct Scene {
+    ok: bool,
+    step: i32, // 0 = ok, 1 back end not ok, 2 program (see log), 3 buffers
+    gb: *mut gl_mc.GlBackend,
+    sky_p: gl_prog.Prog,
+    tint_p: gl_prog.Prog,
+    ent_p: gl_prog.Prog,
+    hud_p: gl_prog.Prog,
+    vao0: u32, // empty VAO for the attribute-less strips
+    ent_vao: u32,
+    cube_vbo: u32,
+    cube_ibo: u32,
+    inst_vbo: u32,
+    hud_vao: u32,
+    hud_vbo: u32,
+    ents: rt.Buf, // queued entities, ENT_WORDS f64 each
+    inst: u64, // scratch of the instance records (f32)
+    inst_cap: usize, // entities it holds
+    tm: gl_query.Timer,
+    cu: cull.Cull,
+    cull_on: bool,
+    auto_rebind: bool,
+    // statistics of the last scene_ent_flush / scene_hud
+    st_in: u32,
+    st_drawn: u32,
+    st_frustum: u32,
+    st_occ: u32,
+    st_hud_rects: u32,
+    st_hud_runs: u32,
+}
+
+// ---- entities --------------------------------------------------------------------------------------------------------
+
+// `yaw` in radians (rotation about +Y; the same sine/cosine goes to the GPU and to a CPU reference).
+fn ent_new(x: f64, y: f64, z: f64, sx: f64, sy: f64, sz: f64, yaw: f64, r: u32, g: u32, b: u32) -> Ent {
+    return Ent { x: x, y: y, z: z, sx: sx, sy: sy, sz: sz, yaw_sin: math.sin(yaw), yaw_cos: math.cos(yaw), r: r, g: g, b: b }
+}
+
+fn wf(p: u64, i: usize, v: f64) {
+    *((p + (i as u64) * (8 as u64)) as *mut f64) = v
+}
+
+fn rf(p: u64, i: usize) -> f64 {
+    return *((p + (i as u64) * (8 as u64)) as *mut f64)
+}
+
+fn wf32(p: u64, i: usize, v: f64) {
+    *((p + (i as u64) * (4 as u64)) as *mut f32) = v as f32
+}
+
+fn push_ent(sc: *mut Scene, e: *mut Ent, occluder: bool) {
+    var w: [f64; 12] = [(*e).x, (*e).y, (*e).z, (*e).sx, (*e).sy, (*e).sz, (*e).yaw_sin, (*e).yaw_cos,
+        (*e).r as f64, (*e).g as f64, (*e).b as f64, 0.0]
+    if occluder {
+        w[11] = 1.0
+    }
+    rt.buf_push_bytes(&(*sc).ents, (&w[0]) as u64, ENT_BYTES)
+}
+
+// Queues a box for the next scene_ent_flush.
+fn scene_ent_add(sc: *mut Scene, e: *mut Ent) {
+    push_ent(sc, e, false)
+}
+
+// Queues a box that is also an occluder for the culling of the other boxes (it is always drawn itself). Only yaw 0 boxes occlude.
+fn scene_ent_occluder(sc: *mut Scene, e: *mut Ent) {
+    push_ent(sc, e, true)
+}
+
+fn scene_ent_clear(sc: *mut Scene) {
+    rt.buf_clear(&(*sc).ents)
+}
+
+fn scene_set_cull(sc: *mut Scene, on: bool) {
+    (*sc).cull_on = on
+}
+
+fn scene_set_rebind(sc: *mut Scene, on: bool) {
+    (*sc).auto_rebind = on
+}
+
+// ---- timers ----------------------------------------------------------------------------------------------------------
+
+// Once per frame BEFORE the first pass: collects what the GPU has finished (never waits).
+fn scene_frame(sc: *mut Scene) {
+    gl_query.timer_frame(gl_mc.glbe_x((*sc).gb), &(*sc).tm)
+}
+
+fn scene_pass_begin(sc: *mut Scene, pass: usize) {
+    gl_query.pass_begin(gl_mc.glbe_x((*sc).gb), &(*sc).tm, pass)
+}
+
+fn scene_pass_end(sc: *mut Scene, pass: usize) {
+    gl_query.pass_end(gl_mc.glbe_x((*sc).gb), &(*sc).tm, pass)
+}
+
+fn scene_pass_ms(sc: *mut Scene, pass: usize) -> f64 {
+    return gl_query.pass_avg_ms(&(*sc).tm, pass)
+}
+
+fn scene_pass_name(pass: usize) -> str {
+    if pass == PASS_TERRAIN { return "terrain" }
+    if pass == PASS_SKY { return "sky" }
+    if pass == PASS_ENT { return "entities" }
+    if pass == PASS_TINT { return "tint" }
+    if pass == PASS_HUD { return "hud" }
+    if pass == PASS_RESOLVE { return "resolve" }
+    return "present"
+}
+
+fn scene_print_timers(sc: *mut Scene) {
+    var p: usize = 0
+    while p < PASS_COUNT {
+        if gl_query.pass_samples(&(*sc).tm, p) > 0 as u32 {
+            gl_query.pass_print(&(*sc).tm, p, scene_pass_name(p))
+        }
+        p = p + 1
+    }
+}
+
+// ---- open / close ----------------------------------------------------------------------------------------------------
+
+fn build_one(x: *mut gl_ext.GlX, p: *mut gl_prog.Prog, vs: str, fs: str) -> bool {
+    return gl_prog.prog_build(x, p, vs.p as u64, vs.n, fs.p as u64, fs.n)
+}
+
+// Writes the 24 vertices (x y z face as f32) and the 36 u16 indices of the unit cube (-0.5 .. 0.5). Faces: -x +x -y +y -z +z.
+fn cube_data(vp: u64, ip: u64) {
+    var f: usize = 0
+    while f < 6 {
+        let axis: usize = f / 2
+        var sgn: f64 = 0.0 - 0.5
+        if f % 2 == 1 { sgn = 0.5 }
+        var k: usize = 0
+        while k < 4 {
+            var a: f64 = 0.0 - 0.5
+            if k % 2 == 1 { a = 0.5 }
+            var b: f64 = 0.0 - 0.5
+            if k / 2 == 1 { b = 0.5 }
+            var c: [f64; 3] = [0.0, 0.0, 0.0]
+            c[axis] = sgn
+            c[(axis + 1) % 3] = a
+            c[(axis + 2) % 3] = b
+            let v: usize = f * 4 + k
+            wf32(vp, v * 4, c[0])
+            wf32(vp, v * 4 + 1, c[1])
+            wf32(vp, v * 4 + 2, c[2])
+            wf32(vp, v * 4 + 3, f as f64)
+            k = k + 1
+        }
+        let base: u16 = (f * 4) as u16
+        let o: u64 = ip + (f as u64) * (12 as u64)
+        *((o) as *mut u16) = base
+        *((o + 2 as u64) as *mut u16) = base + 1 as u16
+        *((o + 4 as u64) as *mut u16) = base + 3 as u16
+        *((o + 6 as u64) as *mut u16) = base
+        *((o + 8 as u64) as *mut u16) = base + 3 as u16
+        *((o + 10 as u64) as *mut u16) = base + 2 as u16
+        f = f + 1
+    }
+}
+
+fn scene_empty(gb: *mut gl_mc.GlBackend) -> Scene {
+    var x: *mut gl_ext.GlX = gl_mc.glbe_x(gb)
+    return Scene { ok: false, step: 0, gb: gb, sky_p: gl_prog.prog_new(), tint_p: gl_prog.prog_new(), ent_p: gl_prog.prog_new(),
+        hud_p: gl_prog.prog_new(), vao0: 0 as u32, ent_vao: 0 as u32, cube_vbo: 0 as u32, cube_ibo: 0 as u32, inst_vbo: 0 as u32,
+        hud_vao: 0 as u32, hud_vbo: 0 as u32, ents: rt.buf_new(), inst: 0, inst_cap: 0,
+        tm: gl_query.timer_new(x, gl_query.MODE_STAMP), cu: cull.cull_new(128, 72), cull_on: true, auto_rebind: true,
+        st_in: 0 as u32, st_drawn: 0 as u32, st_frustum: 0 as u32, st_occ: 0 as u32, st_hud_rects: 0 as u32, st_hud_runs: 0 as u32 }
+}
+
+// Builds the scene layer on an open back end (its context must be current). `ok` false: `step` says what failed
+// (program logs: sc.sky_p.log ...). The back end must outlive the scene.
+#[allow_escape]
+fn scene_open(gb: *mut gl_mc.GlBackend) -> Scene {
+    var sc: Scene = scene_empty(gb)
+    if !(*gb).ok || !(*gb).xok {
+        sc.step = 1
+        return sc
+    }
+    let x: *mut gl_ext.GlX = gl_mc.glbe_x(gb)
+    let g: *mut gl33.Gl = gl_mc.glbe_gl(gb)
+    if !build_one(x, &sc.sky_p, SKY_VS, SKY_FS) || !build_one(x, &sc.tint_p, SKY_VS, TINT_FS)
+        || !build_one(x, &sc.ent_p, ENT_VS, ENT_FS) || !build_one(x, &sc.hud_p, HUD_VS, HUD_FS) {
+        sc.step = 2
+        return sc
+    }
+    sc.vao0 = gl33.gl_gen_vao(g)
+    // ---- entity cube + instance buffer
+    let vp: u64 = rt.heap_alloc(24 * 16)
+    let ip: u64 = rt.heap_alloc(36 * 2)
+    cube_data(vp, ip)
+    sc.ent_vao = gl33.gl_gen_vao(g)
+    gl33.gl_bind_vao(g, sc.ent_vao)
+    sc.cube_vbo = gl33.gl_gen_buffer(g)
+    gl33.gl_bind_buffer(g, gl33.GL_ARRAY_BUFFER, sc.cube_vbo)
+    gl33.gl_buffer_data(g, gl33.GL_ARRAY_BUFFER, vp, 24 * 16, gl33.GL_STATIC_DRAW)
+    gl33.gl_enable_attrib(g, 0 as u32)
+    gl33.gl_attrib_f(g, 0 as u32, 3, gl33.GL_FLOAT, false, 16, 0)
+    gl33.gl_enable_attrib(g, 1 as u32)
+    gl33.gl_attrib_f(g, 1 as u32, 1, gl33.GL_FLOAT, false, 16, 12)
+    sc.cube_ibo = gl33.gl_gen_buffer(g)
+    gl33.gl_bind_buffer(g, gl33.GL_ELEMENT_ARRAY_BUFFER, sc.cube_ibo)
+    gl33.gl_buffer_data(g, gl33.GL_ELEMENT_ARRAY_BUFFER, ip, 36 * 2, gl33.GL_STATIC_DRAW)
+    sc.inst_vbo = gl33.gl_gen_buffer(g)
+    gl33.gl_bind_buffer(g, gl33.GL_ARRAY_BUFFER, sc.inst_vbo)
+    gl33.gl_buffer_data(g, gl33.GL_ARRAY_BUFFER, 0, 1024, gl33.GL_STREAM_DRAW)
+    var a: u32 = 2 as u32
+    while a < 5 as u32 {
+        gl33.gl_enable_attrib(g, a)
+        gl33.gl_attrib_f(g, a, 4, gl33.GL_FLOAT, false, 48, ((a - 2 as u32) as usize) * 16)
+        gl33.gl_attrib_divisor(g, a, 1 as u32)
+        a = a + 1 as u32
+    }
+    gl33.gl_bind_vao(g, 0 as u32)
+    rt.heap_free(vp, 24 * 16)
+    rt.heap_free(ip, 36 * 2)
+    // ---- HUD rectangles
+    sc.hud_vao = gl33.gl_gen_vao(g)
+    gl33.gl_bind_vao(g, sc.hud_vao)
+    sc.hud_vbo = gl33.gl_gen_buffer(g)
+    gl33.gl_bind_buffer(g, gl33.GL_ARRAY_BUFFER, sc.hud_vbo)
+    gl33.gl_buffer_data(g, gl33.GL_ARRAY_BUFFER, 0, 1024, gl33.GL_STREAM_DRAW)
+    gl33.gl_enable_attrib(g, 0 as u32)
+    gl33.gl_attrib_i(g, 0 as u32, 4, gl33.GL_UNSIGNED_INT, 24, 0)
+    gl33.gl_attrib_divisor(g, 0 as u32, 1 as u32)
+    gl33.gl_enable_attrib(g, 1 as u32)
+    gl33.gl_attrib_i(g, 1 as u32, 1, gl33.GL_UNSIGNED_INT, 24, 16)
+    gl33.gl_attrib_divisor(g, 1 as u32, 1 as u32)
+    gl33.gl_bind_vao(g, 0 as u32)
+    if sc.vao0 == 0 as u32 || sc.ent_vao == 0 as u32 || sc.hud_vao == 0 as u32 || sc.inst_vbo == 0 as u32 {
+        sc.step = 3
+        return sc
+    }
+    sc.ok = true
+    return sc
+}
+
+fn scene_close(sc: *mut Scene) {
+    if !(*sc).ok {
+        return
+    }
+    let x: *mut gl_ext.GlX = gl_mc.glbe_x((*sc).gb)
+    let g: *mut gl33.Gl = gl_mc.glbe_gl((*sc).gb)
+    gl_query.timer_free(x, &(*sc).tm)
+    gl_prog.prog_free(x, &(*sc).sky_p)
+    gl_prog.prog_free(x, &(*sc).tint_p)
+    gl_prog.prog_free(x, &(*sc).ent_p)
+    gl_prog.prog_free(x, &(*sc).hud_p)
+    gl33.gl_delete_vao(g, (*sc).vao0)
+    gl33.gl_delete_vao(g, (*sc).ent_vao)
+    gl33.gl_delete_vao(g, (*sc).hud_vao)
+    gl33.gl_delete_buffer(g, (*sc).cube_vbo)
+    gl33.gl_delete_buffer(g, (*sc).cube_ibo)
+    gl33.gl_delete_buffer(g, (*sc).inst_vbo)
+    gl33.gl_delete_buffer(g, (*sc).hud_vbo)
+    cull.cull_free(&(*sc).cu)
+    rt.buf_free(&(*sc).ents)
+    if (*sc).inst != 0 {
+        rt.heap_free((*sc).inst, (*sc).inst_cap * INST_F32 * 4)
+        (*sc).inst = 0
+        (*sc).inst_cap = 0
+    }
+    (*sc).ok = false
+}
+
+// ---- pass plumbing ---------------------------------------------------------------------------------------------------
+
+// Start of an extra pass: issue collected voxel draws, bind the draw target, state neutral (no depth / cull / blend).
+fn pass_enter(sc: *mut Scene, pass: usize) {
+    let gb: *mut gl_mc.GlBackend = (*sc).gb
+    let g: *mut gl33.Gl = gl_mc.glbe_gl(gb)
+    gl_mc.glbe_flush(gb)
+    scene_pass_begin(sc, pass)
+    gl_mc.glbe_bind_draw(gb)
+    gl33.gl_disable(g, gl33.GL_BLEND)
+    gl33.gl_disable(g, gl33.GL_CULL_FACE)
+    gl33.gl_disable(g, gl33.GL_DEPTH_TEST)
+    gl33.gl_disable(g, gl33.GL_SCISSOR_TEST)
+    gl33.gl_depth_mask(g, false)
+    gl33.gl_color_mask(g, true, true, true, true)
+}
+
+fn pass_leave(sc: *mut Scene, pass: usize) {
+    scene_pass_end(sc, pass)
+    if (*sc).auto_rebind {
+        gl_mc.glbe_rebind((*sc).gb)
+    }
+}
+
+// ---- sky -------------------------------------------------------------------------------------------------------------
+
+// The background of mc_sky.sky_draw_plain on the GPU: one full-screen strip, colour only (depth and the clear colour of b.begin
+// stay), so call it right after b.begin and before the first b.draw. Float maths in the shader: a pixel may differ by one level.
+fn scene_sky(sc: *mut Scene, cam: *mut mc_camera.Camera, sky: *mut mc_sky.Sky) {
+    if !(*sc).ok { return }
+    let gb: *mut gl_mc.GlBackend = (*sc).gb
+    let x: *mut gl_ext.GlX = gl_mc.glbe_x(gb)
+    let g: *mut gl33.Gl = gl_mc.glbe_gl(gb)
+    let p: *mut gl_prog.Prog = &(*sc).sky_p
+    pass_enter(sc, PASS_SKY)
+    gl_prog.prog_use(x, p)
+    let w: f64 = gl_mc.glbe_width(gb) as f64
+    let h: f64 = gl_mc.glbe_height(gb) as f64
+    let hw: f64 = w * 0.5
+    let hh: f64 = h * 0.5
+    gl_prog.u_3f(x, p, "u_r", (*cam).rx, (*cam).ry, (*cam).rz)
+    gl_prog.u_3f(x, p, "u_u", (*cam).ux, (*cam).uy, (*cam).uz)
+    gl_prog.u_3f(x, p, "u_f", (*cam).fx, (*cam).fy, (*cam).fz)
+    gl_prog.u_4f(x, p, "u_cam", hw, hh, hw / (*cam).tan_x, hh / (*cam).tan_y)
+    gl_prog.u_1f(x, p, "u_h", h)
+    gl_prog.u_3f(x, p, "u_zen", (*sky).zr as f64, (*sky).zg as f64, (*sky).zb as f64)
+    gl_prog.u_3f(x, p, "u_hor", (*sky).hr as f64, (*sky).hg as f64, (*sky).hb as f64)
+    gl_prog.u_3f(x, p, "u_glc", (*sky).lr as f64, (*sky).lg as f64, (*sky).lb as f64)
+    gl_prog.u_4f(x, p, "u_sun", (*sky).sunx, (*sky).suny, (*sky).sunz, (*sky).glow as f64)
+    var d: i32 = 0
+    if (*sky).discs { d = 1 }
+    gl_prog.u_1i(x, p, "u_discs", d)
+    gl33.gl_bind_vao(g, (*sc).vao0)
+    gl33.gl_draw_arrays(g, GL_TRIANGLE_STRIP, 0, 4)
+    gl33.gl_bind_vao(g, 0 as u32)
+    pass_leave(sc, PASS_SKY)
+}
+
+// mc_sky.sky_tint_frame on the GPU: multiplies every pixel that has geometry (depth < 1) by tint / 256. Call after the world (and
+// the entities), before the HUD. Identity tints (256) draw nothing.
+fn scene_tint(sc: *mut Scene, sky: *mut mc_sky.Sky) {
+    if !(*sc).ok { return }
+    if (*sky).tr >= 256 && (*sky).tg >= 256 && (*sky).tb >= 256 { return }
+    let gb: *mut gl_mc.GlBackend = (*sc).gb
+    let x: *mut gl_ext.GlX = gl_mc.glbe_x(gb)
+    let g: *mut gl33.Gl = gl_mc.glbe_gl(gb)
+    let p: *mut gl_prog.Prog = &(*sc).tint_p
+    pass_enter(sc, PASS_TINT)
+    gl33.gl_enable(g, gl33.GL_DEPTH_TEST)
+    gl33.gl_depth_func(g, GL_GREATER)
+    gl33.gl_enable(g, gl33.GL_BLEND)
+    gl33.gl_blend_func(g, GL_DST_COLOR, GL_ZERO)
+    gl_prog.prog_use(x, p)
+    gl_prog.u_3f(x, p, "u_tint", ((*sky).tr as f64) / 256.0, ((*sky).tg as f64) / 256.0, ((*sky).tb as f64) / 256.0)
+    gl33.gl_bind_vao(g, (*sc).vao0)
+    gl33.gl_draw_arrays(g, GL_TRIANGLE_STRIP, 0, 4)
+    gl33.gl_bind_vao(g, 0 as u32)
+    gl33.gl_depth_func(g, gl33.GL_LESS)
+    pass_leave(sc, PASS_TINT)
+}
+
+// ---- entities --------------------------------------------------------------------------------------------------------
+
+fn ensure_inst(sc: *mut Scene, n: usize) {
+    if (*sc).inst_cap >= n {
+        return
+    }
+    var cap: usize = (*sc).inst_cap * 2
+    if cap < n { cap = n }
+    if cap < 64 { cap = 64 }
+    let p: u64 = rt.heap_alloc(cap * INST_F32 * 4)
+    if (*sc).inst != 0 {
+        rt.heap_free((*sc).inst, (*sc).inst_cap * INST_F32 * 4)
+    }
+    (*sc).inst = p
+    (*sc).inst_cap = cap
+}
+
+// World AABB of the queued entity `i` (yaw about Y: the extents of the rotated box).
+fn ent_box(e: u64, lo: *mut [f64; 3], hi: *mut [f64; 3]) {
+    let s: f64 = math.fabs(rf(e, 6))
+    let c: f64 = math.fabs(rf(e, 7))
+    let hx: f64 = (c * rf(e, 3) + s * rf(e, 5)) * 0.5
+    let hy: f64 = rf(e, 4) * 0.5
+    let hz: f64 = (s * rf(e, 3) + c * rf(e, 5)) * 0.5
+    (*lo)[0] = rf(e, 0) - hx
+    (*lo)[1] = rf(e, 1) - hy
+    (*lo)[2] = rf(e, 2) - hz
+    (*hi)[0] = rf(e, 0) + hx
+    (*hi)[1] = rf(e, 1) + hy
+    (*hi)[2] = rf(e, 2) + hz
+}
+
+// Draws the queued boxes (scene_ent_add / scene_ent_occluder) in ONE instanced call and clears the queue. Depth-tested against
+// the voxel pass (same depth buffer), no face culling. Call after b.end (the voxel draws must be in the depth buffer).
+#[allow_escape]
+fn scene_ent_flush(sc: *mut Scene, cam: *mut mc_camera.Camera) {
+    if !(*sc).ok { return }
+    let n: usize = rt.buf_len(&(*sc).ents) / ENT_BYTES
+    (*sc).st_in = n as u32
+    (*sc).st_drawn = 0 as u32
+    (*sc).st_frustum = 0 as u32
+    (*sc).st_occ = 0 as u32
+    if n == 0 { return }
+    let gb: *mut gl_mc.GlBackend = (*sc).gb
+    let x: *mut gl_ext.GlX = gl_mc.glbe_x(gb)
+    let g: *mut gl33.Gl = gl_mc.glbe_gl(gb)
+    let base: u64 = rt.buf_ptr(&(*sc).ents)
+    var rv: [f32; 16] = [0.0 as f32; 16]
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var cz: f64 = 0.0
+    gl_mc.glbe_camera_rv(gb, (&rv[0]) as u64, &cx, &cy, &cz)
+    var lo: [f64; 3] = [0.0, 0.0, 0.0]
+    var hi: [f64; 3] = [0.0, 0.0, 0.0]
+    if (*sc).cull_on {
+        var vp: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
+        var k: usize = 0
+        while k < 16 {
+            vp.m[k] = rv[k] as f64
+            k = k + 1
+        }
+        cull.cull_begin(&(*sc).cu, &vp, cx, cy, cz, (*cam).near, false)
+        cull.cull_clear_depth(&(*sc).cu)
+        var i: usize = 0
+        while i < n {
+            let e: u64 = base + (i * ENT_BYTES) as u64
+            if rf(e, 11) > 0.5 && math.fabs(rf(e, 6)) < 1.0e-9 {
+                ent_box(e, &lo, &hi)
+                cull.cull_add_occluder(&(*sc).cu, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2])
+            }
+            i = i + 1
+        }
+        cull.cull_build_hiz(&(*sc).cu)
+    }
+    ensure_inst(sc, n)
+    var m: usize = 0
+    var i: usize = 0
+    while i < n {
+        let e: u64 = base + (i * ENT_BYTES) as u64
+        var draw: bool = true
+        if (*sc).cull_on && rf(e, 11) < 0.5 {
+            ent_box(e, &lo, &hi)
+            let r: i32 = cull.cull_box(&(*sc).cu, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2])
+            if r == cull.CULL_FRUSTUM {
+                draw = false
+                (*sc).st_frustum = (*sc).st_frustum + 1 as u32
+            } else if r == cull.CULL_OCCLUDED {
+                draw = false
+                (*sc).st_occ = (*sc).st_occ + 1 as u32
+            }
+        }
+        if draw {
+            let o: usize = m * INST_F32
+            wf32((*sc).inst, o, rf(e, 0) - cx)
+            wf32((*sc).inst, o + 1, rf(e, 1) - cy)
+            wf32((*sc).inst, o + 2, rf(e, 2) - cz)
+            wf32((*sc).inst, o + 3, rf(e, 6))
+            wf32((*sc).inst, o + 4, rf(e, 3))
+            wf32((*sc).inst, o + 5, rf(e, 4))
+            wf32((*sc).inst, o + 6, rf(e, 5))
+            wf32((*sc).inst, o + 7, rf(e, 7))
+            wf32((*sc).inst, o + 8, rf(e, 8))
+            wf32((*sc).inst, o + 9, rf(e, 9))
+            wf32((*sc).inst, o + 10, rf(e, 10))
+            wf32((*sc).inst, o + 11, 0.0)
+            m = m + 1
+        }
+        i = i + 1
+    }
+    (*sc).st_drawn = m as u32
+    rt.buf_clear(&(*sc).ents)
+    if m == 0 { return }
+    let p: *mut gl_prog.Prog = &(*sc).ent_p
+    pass_enter(sc, PASS_ENT)
+    gl33.gl_enable(g, gl33.GL_DEPTH_TEST)
+    gl33.gl_depth_func(g, gl33.GL_LESS)
+    gl33.gl_depth_mask(g, true)
+    gl_prog.prog_use(x, p)
+    gl_prog.u_mat4(x, p, "u_rv", (&rv[0]) as u64)
+    var fo: f64 = 0.0
+    if (*gb).fog_on { fo = 1.0 }
+    gl_prog.u_4f(x, p, "u_fog", fo, (*gb).fog_start, (*gb).fog_end, 0.0)
+    gl_prog.u_3f(x, p, "u_fogc", (*gb).fog_r, (*gb).fog_g, (*gb).fog_b)
+    gl33.gl_bind_vao(g, (*sc).ent_vao)
+    gl33.gl_bind_buffer(g, gl33.GL_ARRAY_BUFFER, (*sc).inst_vbo)
+    gl33.gl_buffer_data(g, gl33.GL_ARRAY_BUFFER, (*sc).inst, m * INST_F32 * 4, gl33.GL_STREAM_DRAW)
+    gl_ext.glx_draw_elements_instanced(x, gl33.GL_TRIANGLES, 36, gl33.GL_UNSIGNED_SHORT, 0, m as i32)
+    gl33.gl_bind_vao(g, 0 as u32)
+    pass_leave(sc, PASS_ENT)
+}
+
+// ---- HUD -------------------------------------------------------------------------------------------------------------
+
+// Draws the rectangles recorded by mc_hud.hud_record (6 u32 each: x0 y0 x1 y1 colour mode) over the frame, in the recorded order.
+fn scene_hud(sc: *mut Scene, rec: *mut rt.Buf) {
+    if !(*sc).ok { return }
+    let n: usize = rt.buf_len(rec) / HUD_REC_BYTES
+    (*sc).st_hud_rects = n as u32
+    (*sc).st_hud_runs = 0 as u32
+    if n == 0 { return }
+    let gb: *mut gl_mc.GlBackend = (*sc).gb
+    let x: *mut gl_ext.GlX = gl_mc.glbe_x(gb)
+    let g: *mut gl33.Gl = gl_mc.glbe_gl(gb)
+    let p: *mut gl_prog.Prog = &(*sc).hud_p
+    let data: u64 = rt.buf_ptr(rec)
+    pass_enter(sc, PASS_HUD)
+    gl33.gl_color_mask(g, true, true, true, false)
+    gl33.gl_enable(g, gl33.GL_BLEND)
+    gl_prog.prog_use(x, p)
+    gl_prog.u_2f(x, p, "u_size", gl_mc.glbe_width(gb) as f64, gl_mc.glbe_height(gb) as f64)
+    gl33.gl_bind_vao(g, (*sc).hud_vao)
+    gl33.gl_bind_buffer(g, gl33.GL_ARRAY_BUFFER, (*sc).hud_vbo)
+    gl33.gl_buffer_data(g, gl33.GL_ARRAY_BUFFER, data, n * HUD_REC_BYTES, gl33.GL_STREAM_DRAW)
+    var i: usize = 0
+    while i < n {
+        let mode: u32 = rt.ld32(data, i * 6 + 5)
+        var j: usize = i + 1
+        while j < n && rt.ld32(data, j * 6 + 5) == mode {
+            j = j + 1
+        }
+        gl33.gl_attrib_i(g, 0 as u32, 4, gl33.GL_UNSIGNED_INT, 24, i * HUD_REC_BYTES)
+        gl33.gl_attrib_i(g, 1 as u32, 1, gl33.GL_UNSIGNED_INT, 24, i * HUD_REC_BYTES + 16)
+        if mode == 1 as u32 {
+            gl33.gl_blend_func(g, GL_ONE_MINUS_DST_COLOR, GL_ZERO)
+            gl_prog.u_1i(x, p, "u_invert", 1)
+        } else {
+            gl33.gl_blend_func(g, gl33.GL_SRC_ALPHA, gl33.GL_ONE_MINUS_SRC_ALPHA)
+            gl_prog.u_1i(x, p, "u_invert", 0)
+        }
+        gl_ext.glx_draw_arrays_instanced(x, GL_TRIANGLE_STRIP, 0, 4, (j - i) as i32)
+        (*sc).st_hud_runs = (*sc).st_hud_runs + 1 as u32
+        i = j
+    }
+    gl33.gl_bind_vao(g, 0 as u32)
+    pass_leave(sc, PASS_HUD)
+}
+
+// ---- window ----------------------------------------------------------------------------------------------------------
+
+// The frame goes to the WINDOW without a read back: the multisample target is resolved on the GPU, the FBO colour texture is drawn
+// over the window framebuffer (vw x vh). The caller swaps (glwindow.swap). glshow.show_init must have run on the back end's GL.
+fn scene_present_window(sc: *mut Scene, sh: *mut glshow.Show, vw: i32, vh: i32) {
+    if !(*sc).ok { return }
+    let gb: *mut gl_mc.GlBackend = (*sc).gb
+    gl_mc.glbe_flush(gb)
+    scene_pass_begin(sc, PASS_RESOLVE)
+    gl_mc.glbe_resolve(gb)
+    scene_pass_end(sc, PASS_RESOLVE)
+    scene_pass_begin(sc, PASS_PRESENT)
+    glshow.show_draw(sh, gl_mc.glbe_gl(gb), gl_mc.glbe_fbo_texture(gb), false, false, vw, vh)
+    scene_pass_end(sc, PASS_PRESENT)
+}

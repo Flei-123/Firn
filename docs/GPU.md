@@ -177,3 +177,11 @@ Same `mc_backend.Backend` table as `gl_mc` on WebGL2 (`--target=wasm32-browser`,
 legacy draw mode only. Headless Chromium on SwiftShader: 7 scenes vs mc_raster, PSNR 46-99 dB (need >= 34). Plan, missing features
 (buffer textures, base vertex, mapped buffers, indirect, timer queries, Hi-Z), the `lib/@web/` twin idea and untested items: `docs/WEBGL2.md`.
 Real GPU, Firefox, Safari, mobile UNTESTED.
+
+### Scene layer: lib/gpu/gl_scene.fi (round gpu-l, 2026-10-12) -- PARTIAL (module + smoke run; PSNR tests, gate, MSAA image test still open)
+`gpu.gl_scene` wires the shaders `gl_{sky,tint,ent,hud}_*.glsl`: `scene_open(&gb)`, `scene_frame` (timer ring), `scene_sky(&sc,&cam,&sky)` (after b.begin),
+`scene_ent_add/scene_ent_occluder` + `scene_ent_flush(&sc,&cam)` (ONE instanced draw; frustum + Hi-Z culling via gpu.cull, occluders = yaw-0 boxes),
+`scene_tint` (depth < 1 pixels, blend DST_COLOR/ZERO), `scene_hud(&sc,&rec)` (mc_hud.hud_record rectangles, runs per blend mode, alpha not written),
+`scene_present_window` (resolve + FBO texture -> window, no read back; caller swaps). Timer passes PASS_* (stamp queries, never waits).
+gl_mc addition: `glbe_flush` (issue collected MODE_MULTI draws before an extra pass; `glbe_rebind` alone forgets them).
+Smoke run `tools/gpu/mc/scene_smoke.fi` (llvmpipe): all 4 programs link, sky + 1 entity + 136 HUD rects (2 runs) draw. NOT yet compared with mc_raster.
