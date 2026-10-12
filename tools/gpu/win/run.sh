@@ -11,6 +11,7 @@ export FIRNLIB="$(pwd)/lib"
 D=$(mktemp -d); XP=""
 trap '[ -n "$XP" ] && kill "$XP" 2>/dev/null; WINEPREFIX="$D/wineprefix" wineserver -k >/dev/null 2>&1; sleep 1; rm -rf "$D"' EXIT
 "$FIRNC" -o "$D/wp" tools/gpu/win/winprobe.fi 2>"$D/err" || { echo "   FAIL: compile winprobe.fi"; head -5 "$D/err"; exit 1; }
+"$FIRNC" -o "$D/shot" tools/gpu/win/shot.fi 2>"$D/err2" || { echo "   FAIL: compile shot.fi"; head -5 "$D/err2"; exit 1; }
 mkfifo "$D/disp"; Xvfb -displayfd 3 -screen 0 800x600x24 -dpi 120 -nolisten tcp 3>"$D/disp" >/dev/null 2>&1 & XP=$!
 read -r -t 20 n <"$D/disp" || { echo "   SKIP: Xvfb did not start"; exit 0; }
 export DISPLAY=":$n"
@@ -23,6 +24,16 @@ for m in egl glx; do
         echo "   ok:   GL window through $m"
     else
         echo "   FAIL: GL window through $m (exit $rc)"; fail=1
+    fi
+done
+# window framebuffer against the CPU rasterizer (tools/gpu/win/shot.fi): show_pixels byte equal, GL back end PSNR >= 34
+for m in egl glx; do
+    timeout 120 "$D/shot" $m >"$D/s$m.txt" 2>&1; rc=$?
+    sed "s/^/   shot $m: /" "$D/s$m.txt" | grep -v "renderer="
+    if [ "$rc" -eq 0 ] && [ "$(grep -c '^shot .* ok$' "$D/s$m.txt")" -eq 3 ] && grep -q "^RESULT fails=0" "$D/s$m.txt"; then
+        echo "   ok:   window framebuffer vs mc_raster through $m (3 scenes)"
+    else
+        echo "   FAIL: window framebuffer vs mc_raster through $m (exit $rc)"; fail=1
     fi
 done
 # ---- Windows twin (lib/gpu/glwindow.windows.fi: window.gpu_gl -> WGL) under Wine + Xvfb: winprobe.exe wgl
@@ -41,6 +52,17 @@ else
         echo "   ok:   GL window through wgl (Wine)"
     else
         echo "   FAIL: GL window through wgl under Wine (exit $rc)"; fail=1
+    fi
+    if "$FIRNC" --target=x86_64-windows -o "$D/shotw.exe" tools/gpu/win/shot.fi 2>"$D/errs"; then
+        timeout 240 env WINEPREFIX="$D/wineprefix" WINEDEBUG=-all "$WINE" "$D/shotw.exe" wgl >"$D/swgl.txt" 2>&1; rc=$?
+        sed "s/^/   shot wgl: /" "$D/swgl.txt" | grep -v "renderer="
+        if [ "$rc" -eq 0 ] && [ "$(grep -c '^shot .* ok$' "$D/swgl.txt")" -eq 3 ] && grep -q "^RESULT fails=0" "$D/swgl.txt"; then
+            echo "   ok:   window framebuffer vs mc_raster through wgl (Wine, 3 scenes)"
+        else
+            echo "   FAIL: window framebuffer vs mc_raster through wgl under Wine (exit $rc)"; fail=1
+        fi
+    else
+        echo "   FAIL: compile shot.fi for Windows"; head -5 "$D/errs"; fail=1
     fi
 fi
 [ "$fail" -eq 0 ] && echo "RESULT glwin: ok" || echo "RESULT glwin: FAIL"
