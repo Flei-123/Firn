@@ -1,0 +1,273 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/input/raw.fi -- READ the keyboard and the mouse: state per frame (down / pressed / released),
+// scancode and keysym kept apart, wheel, position, relative movement.
+//
+//     import input.raw
+//     var r: raw.Raw = raw.raw_new()
+//     window.raw_input(&w, true)                      // EV_RAWKEY / EV_FOCUS from the window layer
+//     while running {
+//         raw.raw_begin(&r)                           // clears pressed / released / wheel / delta
+//         raw.raw_pump(&r, &w)                        // takes every event out of the window
+//         raw.raw_end(&r)                             // commits releases (auto-repeat filter)
+//         if raw.key_pressed(&r, raw.KEY_SPACE) { jump() }
+//         look(raw.mouse_dx(&r), raw.mouse_dy(&r))    // with window.cursor_mode(CURSOR_CAPTURED)
+//     }
+//
+// SCANCODES are Linux's (linux/input-event-codes.h: KEY_A = 30) on every system; the keysym is the
+// X11 keysym of the key without modifiers. AUTO-REPEAT: X11 sends release+press with the SAME time
+// for a held key, Windows sends presses without a release; both are filtered, so `pressed` is
+// true exactly once per physical press. FOCUS LOSS releases every key and button (they come out
+// as `released`). The pure state machine (raw_feed) takes plain numbers: tests/2792 drives it with
+// random sequences.
+import std.rt
+import window.window
+
+export {
+    Raw, raw_new, raw_begin, raw_feed, raw_end, raw_pump, raw_clear,
+    key_down, key_pressed, key_released, sym_of, sym_down,
+    mouse_down, mouse_pressed, mouse_released, mouse_x, mouse_y, mouse_dx, mouse_dy,
+    wheel_y, wheel_x, has_focus, text_events,
+    KEY_ESC, KEY_W, KEY_A, KEY_S, KEY_D, KEY_Q, KEY_SPACE, KEY_LEFTSHIFT, KEY_LEFTCTRL, KEY_ENTER,
+    MB_LEFT, MB_MIDDLE, MB_RIGHT,
+}
+
+const KEY_ESC: u32 = 1
+const KEY_Q: u32 = 16
+const KEY_W: u32 = 17
+const KEY_ENTER: u32 = 28
+const KEY_LEFTCTRL: u32 = 29
+const KEY_A: u32 = 30
+const KEY_S: u32 = 31
+const KEY_D: u32 = 32
+const KEY_LEFTSHIFT: u32 = 42
+const KEY_SPACE: u32 = 57
+const MB_LEFT: u32 = 0
+const MB_MIDDLE: u32 = 1
+const MB_RIGHT: u32 = 2
+
+struct Raw {
+    down: [u8; 256],
+    pressed: [u8; 256],
+    released: [u8; 256],
+    pend: [u8; 256], // a release waiting for the auto-repeat decision
+    pend_t: [u32; 256],
+    sym: [u32; 256],
+    mdown: [u8; 8],
+    mpressed: [u8; 8],
+    mreleased: [u8; 8],
+    mx: i64,
+    my: i64,
+    dx: i64,
+    dy: i64,
+    wx: i64,
+    wy: i64,
+    focus: bool,
+    chars: u64,
+}
+
+fn raw_new() -> Raw {
+    return Raw { down: [0 as u8; 256], pressed: [0 as u8; 256], released: [0 as u8; 256],
+        pend: [0 as u8; 256], pend_t: [0 as u32; 256], sym: [0 as u32; 256],
+        mdown: [0 as u8; 8], mpressed: [0 as u8; 8], mreleased: [0 as u8; 8],
+        mx: 0, my: 0, dx: 0, dy: 0, wx: 0, wy: 0, focus: true, chars: 0 }
+}
+
+fn raw_clear(r: *mut Raw) {
+    var i: usize = 0
+    while i < 256 {
+        (*r).down[i] = 0 as u8
+        (*r).pressed[i] = 0 as u8
+        (*r).released[i] = 0 as u8
+        (*r).pend[i] = 0 as u8
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        (*r).mdown[i] = 0 as u8
+        (*r).mpressed[i] = 0 as u8
+        (*r).mreleased[i] = 0 as u8
+        i = i + 1
+    }
+}
+
+// a new frame: the per-frame flags and sums are cleared, the held state stays
+fn raw_begin(r: *mut Raw) {
+    var i: usize = 0
+    while i < 256 {
+        (*r).pressed[i] = 0 as u8
+        (*r).released[i] = 0 as u8
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        (*r).mpressed[i] = 0 as u8
+        (*r).mreleased[i] = 0 as u8
+        i = i + 1
+    }
+    (*r).dx = 0
+    (*r).dy = 0
+    (*r).wx = 0
+    (*r).wy = 0
+    (*r).chars = 0
+}
+
+fn key_up_now(r: *mut Raw, sc: usize) {
+    if (*r).down[sc] != 0 as u8 {
+        (*r).down[sc] = 0 as u8
+        (*r).released[sc] = 1 as u8
+    }
+}
+
+fn release_all(r: *mut Raw) {
+    var i: usize = 0
+    while i < 256 {
+        (*r).pend[i] = 0 as u8
+        key_up_now(r, i)
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        if (*r).mdown[i] != 0 as u8 {
+            (*r).mdown[i] = 0 as u8
+            (*r).mreleased[i] = 1 as u8
+        }
+        i = i + 1
+    }
+}
+
+// One window event as plain numbers (kind = window.EV_*, a, x, y, s = ev_a, ev_x, ev_y, ev_state).
+fn raw_feed(r: *mut Raw, kind: u32, a: u32, x: u32, y: u32, s: u32) {
+    if kind == window.EV_RAWKEY {
+        if a >= 256 as u32 {
+            return
+        }
+        let sc: usize = a as usize
+        (*r).sym[sc] = x
+        if (*r).pend[sc] != 0 as u8 {
+            (*r).pend[sc] = 0 as u8
+            if (*r).pend_t[sc] == y {
+                return // the release+press pair of an auto-repeat: the key never went up
+            }
+            key_up_now(r, sc)
+        }
+        if (*r).down[sc] == 0 as u8 {
+            (*r).down[sc] = 1 as u8
+            (*r).pressed[sc] = 1 as u8
+        }
+        return
+    }
+    if kind == window.EV_RAWKEY_UP {
+        if a >= 256 as u32 {
+            return
+        }
+        let sc: usize = a as usize
+        if (*r).down[sc] != 0 as u8 && (*r).pend[sc] == 0 as u8 {
+            (*r).pend[sc] = 1 as u8
+            (*r).pend_t[sc] = y
+        }
+        return
+    }
+    if kind == window.EV_BUTTON {
+        if a >= 1 as u32 && a <= 3 as u32 {
+            let b: usize = (a - 1 as u32) as usize
+            if (*r).mdown[b] == 0 as u8 {
+                (*r).mdown[b] = 1 as u8
+                (*r).mpressed[b] = 1 as u8
+            }
+        } else if a == 4 as u32 {
+            (*r).wy = (*r).wy + 1
+        } else if a == 5 as u32 {
+            (*r).wy = (*r).wy - 1
+        } else if a == 6 as u32 {
+            (*r).wx = (*r).wx - 1
+        } else if a == 7 as u32 {
+            (*r).wx = (*r).wx + 1
+        }
+        (*r).mx = x as i64
+        (*r).my = y as i64
+        return
+    }
+    if kind == window.EV_RELEASE {
+        if a >= 1 as u32 && a <= 3 as u32 {
+            let b: usize = (a - 1 as u32) as usize
+            if (*r).mdown[b] != 0 as u8 {
+                (*r).mdown[b] = 0 as u8
+                (*r).mreleased[b] = 1 as u8
+            }
+        }
+        return
+    }
+    if kind == window.EV_MOTION {
+        (*r).mx = x as i64
+        (*r).my = y as i64
+        return
+    }
+    if kind == window.EV_CHAR {
+        (*r).chars = (*r).chars + 1
+        return
+    }
+    if kind == window.EV_FOCUS {
+        if a == 0 as u32 {
+            release_all(r)
+            (*r).focus = false
+        } else {
+            (*r).focus = true
+        }
+        return
+    }
+}
+
+// end of the frame's events: the releases that were not auto-repeat become real
+fn raw_end(r: *mut Raw) {
+    var i: usize = 0
+    while i < 256 {
+        if (*r).pend[i] != 0 as u8 {
+            (*r).pend[i] = 0 as u8
+            key_up_now(r, i)
+        }
+        i = i + 1
+    }
+}
+
+// take every event out of the window (non blocking) and the relative movement of a captured pointer
+fn raw_pump(r: *mut Raw, w: *mut window.Window) {
+    var k: u32 = window.next_event(w)
+    while k != window.EV_NONE {
+        raw_feed(r, k, window.ev_a(w), window.ev_x(w), window.ev_y(w), window.ev_state(w))
+        k = window.next_event(w)
+    }
+    var d: [i64; 2] = [0; 2]
+    if window.cursor_delta(w, (&d[0]) as u64) {
+        (*r).dx = (*r).dx + d[0]
+        (*r).dy = (*r).dy + d[1]
+    }
+}
+
+fn key_down(r: *mut Raw, sc: u32) -> bool { return sc < 256 as u32 && (*r).down[sc as usize] != 0 as u8 }
+fn key_pressed(r: *mut Raw, sc: u32) -> bool { return sc < 256 as u32 && (*r).pressed[sc as usize] != 0 as u8 }
+fn key_released(r: *mut Raw, sc: u32) -> bool { return sc < 256 as u32 && (*r).released[sc as usize] != 0 as u8 }
+// the keysym last seen on this scancode (0 = never)
+fn sym_of(r: *mut Raw, sc: u32) -> u32 { if sc < 256 as u32 { return (*r).sym[sc as usize] } return 0 as u32 }
+// is some key with this keysym held?
+fn sym_down(r: *mut Raw, sym: u32) -> bool {
+    var i: usize = 0
+    while i < 256 {
+        if (*r).down[i] != 0 as u8 && (*r).sym[i] == sym {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+fn mouse_down(r: *mut Raw, b: u32) -> bool { return b < 8 as u32 && (*r).mdown[b as usize] != 0 as u8 }
+fn mouse_pressed(r: *mut Raw, b: u32) -> bool { return b < 8 as u32 && (*r).mpressed[b as usize] != 0 as u8 }
+fn mouse_released(r: *mut Raw, b: u32) -> bool { return b < 8 as u32 && (*r).mreleased[b as usize] != 0 as u8 }
+fn mouse_x(r: *mut Raw) -> i64 { return (*r).mx }
+fn mouse_y(r: *mut Raw) -> i64 { return (*r).my }
+fn mouse_dx(r: *mut Raw) -> i64 { return (*r).dx }
+fn mouse_dy(r: *mut Raw) -> i64 { return (*r).dy }
+fn wheel_y(r: *mut Raw) -> i64 { return (*r).wy }
+fn wheel_x(r: *mut Raw) -> i64 { return (*r).wx }
+fn has_focus(r: *mut Raw) -> bool { return (*r).focus }
+// how many EV_CHAR text events arrived this frame (the text itself: window.ev_a per event)
+fn text_events(r: *mut Raw) -> u64 { return (*r).chars }
