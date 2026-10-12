@@ -1266,7 +1266,7 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
                 let def_ok = matches!(
                     &inst.op,
                     Op::Const(_) | Op::Bin(..) | Op::Cast { .. } | Op::Load { .. } | Op::Copy { .. }
-                ) || matches!(&inst.op, Op::Un(UnOp::Neg, _))
+                ) || matches!(&inst.op, Op::Un(UnOp::Neg | UnOp::Sqrt | UnOp::Bits, _))
                     // ROUND TEMPO 4: the vector instructions of this path.
                     || matches!(&inst.op, Op::Simd { kind, .. } if v128_ra_kind(*kind));
                 if !def_ok && (d as usize) < nv {
@@ -1298,6 +1298,9 @@ fn fp_taugt(f: &Func) -> Vec<bool> {
                 // they fell out of the allocator and ran through the frame.
                 Op::Copy { .. } => sse_class(inst.ty),
                 Op::Un(UnOp::Neg, _) => inst.ty.is_float(),
+                // ROUND RFAST: `sqrt` reads a float, `bits` reads a float or an
+                // integer -- both through `fp_into` / `load_full` below.
+                Op::Un(UnOp::Sqrt | UnOp::Bits, _) => true,
                 Op::Cmp { ty, .. } => ty.is_float(),
                 Op::Cast { from, .. } => from.is_float() || inst.ty.is_float(),
                 // On a store the VALUE is a floating-point number, the address never
@@ -4671,17 +4674,15 @@ fn unsupported_basic(f: &Func) -> Option<String> {
     if debug_vars_active(f) {
         return Some("variable debug information active".into());
     }
-    // Round GAPS: `__sqrt` (fsqrt.rs) is emitted by the base path only. On
-    // main every function with a float already goes there (below); this
-    // check keeps it so once a float register class lands (branch xmm-ra),
-    // instead of hitting "sqrt in the integer register path".
-    if f
-        .blocks
-        .iter()
-        .any(|b| b.insts.iter().any(|i| matches!(i.op, Op::Un(UnOp::Sqrt | UnOp::Bits, _))))
-    {
-        return Some("__sqrt / __bits".into());
-    }
+    // ROUND RFAST: `__sqrt` (fsqrt.rs) and `__bits` (fbits.rs) are emitted by
+    // this path now (see `Op::Un` in `emit_inst`). Until then ONE of them
+    // anywhere in a function sent the WHOLE function to the base path (every
+    // value in a frame slot of its own). `math.floor`, `math.trunc`,
+    // `math.fabs` and `math.sqrt` all contain one, so at `release-safe` and
+    // `release-fast` -- the levels that inline -- every hot loop that calls
+    // one of them lost its register allocation the moment the inliner pulled
+    // the call in (docs/RELEASE-FAST-REGRESSION.md: the pixel loop of
+    // `mc_raster` was 2.2 times slower than with the call left standing).
     // FLOATING POINT: this allocator knows only the integer registers. `f64`
     // lives in the SSE registers and needs a second register class with
     // intervals of its own. As long as that is missing, a function containing
@@ -4718,7 +4719,8 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                 // basic path catches that with its error message.
                 Op::Un(op, x) => {
                     let fp = f.val_ty(*x).is_float() || i.ty.is_float();
-                    if fp && !matches!(op, UnOp::Neg) {
+                    // ROUND RFAST: `Sqrt` and `Bits` are emitted here too.
+                    if fp && !matches!(op, UnOp::Neg | UnOp::Sqrt | UnOp::Bits) {
                         return Some("unary operation with float".into());
                     }
                 }
@@ -6719,15 +6721,46 @@ fn emit_inst(
             }
             ra.fp_out(e, d, target, single);
         }
+        // ROUND RFAST -- the square root: one SSE instruction, computed in
+        // `xmm0` like the base path does (`codegen_x86.rs`). Correctly rounded,
+        // no partial-register dependency: `xmm0` is fully written by the load.
+        Op::Un(UnOp::Sqrt, x) if ty.is_float() => {
+            let d = i.dst.ok_or("internal error: unary operation without target")?;
+            let single = ty == FTy::F32;
+            ra.fp_into(e, "xmm0", *x, single);
+            e.line(if single { "sqrtss xmm0, xmm0" } else { "sqrtsd xmm0, xmm0" });
+            ra.fp_out(e, d, "xmm0", single);
+        }
+        // ROUND RFAST -- `__bits` / `__f64_from_bits` / `__f32_from_bits`: the
+        // bit pattern changes the register class, nothing else. The target
+        // type is the instruction type, the source keeps its own (same width).
+        Op::Un(UnOp::Bits, x) => {
+            let d = i.dst.ok_or("internal error: unary operation without target")?;
+            let single = ty.bits() <= 32;
+            if ra.f.val_ty(*x).is_float() {
+                // float -> integer: `movq rax, xmm0` / `movd eax, xmm0` (the
+                // 32-bit form clears the upper half of `rax`).
+                ra.fp_into(e, "xmm0", *x, single);
+                e.line(if single { "movd eax, xmm0" } else { "movq rax, xmm0" });
+                ra.store_dst(e, d, "rax");
+            } else {
+                // integer -> float
+                ra.load_full(e, "rax", *x);
+                if single {
+                    e.line("movd xmm0, eax");
+                } else {
+                    e.line("movq xmm0, rax");
+                }
+                ra.fp_out(e, d, "xmm0", single);
+            }
+        }
         Op::Un(op, x) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
             let bits = if ty.bits() > 32 { 64 } else { 32 };
             if matches!(op, UnOp::Sqrt | UnOp::Bits) {
-                // Floats never reach this allocator (`unsupported`: "f64 in
-                // the value set"), sqrt exists only on floats, and a
-                // function with `__bits` is sent to the base path
-                // (`unsupported_basic`).
-                return Err("internal error: sqrt/bits in the integer register path".into());
+                // `Sqrt` on a non-float and the like: no such FIR is produced
+                // (sema rejects it), and the two valid forms are matched above.
+                return Err("internal error: sqrt/bits of an unexpected type".into());
             }
             ra.load_full(e, "rax", *x);
             match op {
