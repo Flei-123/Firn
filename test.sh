@@ -1973,7 +1973,7 @@ else
     grep -E 'FAIL|scene .*FAIL' "$WORK/gpu.log" | head -12 | sed 's/^/   /' || true
 fi
 
-echo "== 120. mc_audio: Minecraft listener/sources/blocks/categories/packets on audio.engine (tools/mc/audio/run.sh, docs/mc/audio.md) =="
+echo "== 121. mc_audio: Minecraft listener/sources/blocks/categories/packets on audio.engine (tools/mc/audio/run.sh, docs/mc/audio.md) =="
 # Pan, attenuation, Minecraft gain and pan law bit for bit against numpy float32 (3 stages), then tests/2766_mc_audio.fi through the real engine.
 FIRNC="$FIRNC" bash tools/mc/audio/run.sh > "$WORK/mcaudio.log" 2>&1 && MARC=0 || MARC=$?
 if [ "$MARC" -eq 0 ]; then
@@ -1982,6 +1982,8 @@ if [ "$MARC" -eq 0 ]; then
 else
     bad "tools/mc/audio/run.sh failed (see .test-work/mcaudio.log)"
     grep -E 'FAIL' "$WORK/mcaudio.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 120. Ogg Vorbis decoder (lib/ton/vorbis*.fi, ogg.fi) against libsndfile, <= 1 LSB, plus mutation fuzz (tools/vorbis/run.sh, docs/VORBIS.md) =="
 # tests/2780_vorbis.fi runs in every build stage above; this one holds the decoder against the reference (python3 soundfile)
 # and feeds it mutated / truncated files (CRC repaired, so the damage reaches the decoder). No python soundfile: SKIP.

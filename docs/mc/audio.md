@@ -24,7 +24,7 @@ mc_audio.mca_decode_sound_effect / _entity_sound / _stop_sound + mca_apply_sound
 | Packets | 1.20.1 Sound Effect, Entity Sound Effect, Stop Sound (holder: id+1 or inline name + optional range). Bodies only: the packet ids come from the connection |
 
 ## Tests
-`bash tools/mc/audio/run.sh` (gate 120 in test.sh):
+`bash tools/mc/audio/run.sh` (gate 121 in test.sh):
 - `tools/mc/audio/dump.fi` + `check.py`: attenuation (linear/inverse), Minecraft gain, pan and pan law, 3 seeds x 400 cases each, built release-fast / --no-opt / dev-fast (dumps byte-identical), compared with numpy float32 in the engine's order of operations: **bit identical** (cos/sin 800/800 exact, max 0 ulp).
 - `tests/2766_mc_audio.fi`: 67 checks through the real engine with synthetic sounds (DC samples, `audio.synth` sine): block table, pan/gain in the rendered output, culling, range, category volume on a running voice, mute, ui, chunk + registry 1.20.1, walker, entity following (mc_entity, 1.20.1 packets), packets (truncations, trailing octet, bad category, 3000 random bodies), rebase.
 
