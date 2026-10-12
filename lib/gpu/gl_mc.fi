@@ -39,6 +39,8 @@ import mc.mc_math
 import gpu.glctx
 import gpu.gl33
 import gpu.glpool
+import gpu.gl_ext
+import gpu.gl_fbo
 
 export {
     GlBackend, glbe_open, glbe_open_with, glbe_close, glbe_backend, glbe_set_fog, glbe_set_cull,
@@ -47,6 +49,8 @@ export {
     glbe_set_mode, glbe_mode, glbe_set_page_verts, glbe_set_upload_budget, glbe_set_filter, glbe_defrag,
     glbe_calls, glbe_upload_bytes, glbe_frame_upload_bytes, glbe_staged, glbe_pages, glbe_pool_used_bytes,
     glbe_pool_cap_bytes, glbe_pool_frag_permille, glbe_defrags, glbe_reset_stats, glbe_flush_uploads,
+    // scene layer (lib/gpu/gl_scene.fi): extra passes around the Backend table, MSAA, resolve
+    glbe_x, glbe_rebind, glbe_bind_draw, glbe_set_msaa, glbe_msaa, glbe_resolve, glbe_width, glbe_height, glbe_camera_rv,
 }
 
 const VS_SRC: str = __include_str("mc_vs.glsl")
@@ -165,6 +169,12 @@ struct GlBackend {
     staged: usize,
     up_bytes: u64,
     frame_up: u64,
+    // ---- extension table (gl_ext: instancing, queries, MSAA) + multisample target
+    x: gl_ext.GlX,
+    xok: bool,
+    msaa: i32, // samples in force (0 = off)
+    mt: gl_fbo.Target, // multisample draw target (colour renderbuffer + D24 renderbuffer); resolved into `fbo`
+    dirty: bool, // an MSAA frame was drawn and not resolved yet
 }
 
 fn empty(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
@@ -178,7 +188,9 @@ fn empty(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
         mode: MODE_MULTI, page_verts: DEFAULT_PAGE_VERTS, pages: 0, npages: 0, page_cap: 0, cur_vao: 0 as u32, defrags: 0,
         org_cpu: 0, org_buf: 0 as u32, org_tex: 0 as u32, org_cap: 0, org_max: 0, pend: 0, pend_n: 0, pend_cap: 0,
         sc_counts: 0, sc_offs: 0, sc_bv: 0, ind_buf: 0 as u32, batch: 1 as u64, mip: false, aniso: 1.0, budget: 0, staged: 0,
-        up_bytes: 0, frame_up: 0 }
+        up_bytes: 0, frame_up: 0, x: gl_ext.glx_new(), xok: false, msaa: 0,
+        mt: gl_fbo.Target { ok: false, w: w, h: h, n_color: 1, depth_mode: gl_fbo.DEPTH_RENDERBUFFER, samples: 0, fbo: 0 as u32,
+            rfbo: 0 as u32, color: [0 as u32; 4], msrb: [0 as u32; 4], depth_tex: 0 as u32, depth_rb: 0 as u32 }, dirty: false }
 }
 
 // Opens a headless context (EGL surfaceless / pbuffer on Linux, a hidden window + wgl on Windows) of w x h and
@@ -199,6 +211,7 @@ fn glbe_open_with(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
         gb.step = 2
         return gb
     }
+    gb.xok = gl_ext.glx_load(&gb.ctx, &gb.x)
     gb.prog = gl33.gl_program(&gb.g, VS_SRC.p as u64, VS_SRC.n, FS_SRC.p as u64, FS_SRC.n, (&gb.log[0]) as u64, 512)
     if gb.prog == 0 as u32 {
         gb.step = 3
@@ -396,12 +409,19 @@ fn glbe_resize(gb: *mut GlBackend, w: i32, h: i32) -> bool {
     (*gb).w = w
     (*gb).h = h
     (*gb).fresh = false
+    (*gb).dirty = false
+    if (*gb).msaa > 0 {
+        if !gl_fbo.target_resize(&(*gb).x, &(*gb).mt, w, h) {
+            (*gb).msaa = 0
+        }
+    }
     return (*gb).pix != 0 && (*gb).tmp != 0
 }
 
 // The colour texture of the frame (bottom row first): glshow.show_draw(.., flip = false) puts it into a window
 // without read back.
 fn glbe_fbo_texture(gb: *mut GlBackend) -> u32 {
+    glbe_resolve(gb)
     return (*gb).fbo.color
 }
 
@@ -431,6 +451,10 @@ fn glbe_close(gb: *mut GlBackend) {
         }
         if (*gb).prog != 0 as u32 {
             gl33.gl_delete_program(&(*gb).g, (*gb).prog)
+        }
+        if (*gb).msaa > 0 {
+            gl_fbo.target_free(&(*gb).x, &(*gb).mt)
+            (*gb).msaa = 0
         }
         gl33.gl_fbo_free(&(*gb).g, &(*gb).fbo)
         glctx.ctx_close(&(*gb).ctx)
@@ -1083,8 +1107,9 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
     var rv: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
     mc_math.mat4_mul(&rv, &(*c).proj, &rot)
     gl33.gl_mat4_f64_to_f32((&rv.m[0]) as u64, (&(*gb).rv[0]) as u64)
-    gl33.gl_fbo_bind(g, &(*gb).fbo)
+    draw_fbo_bind(gb)
     gl33.gl_viewport(g, 0, 0, (*gb).w, (*gb).h)
+    (*gb).dirty = (*gb).msaa > 0
     gl33.gl_disable(g, gl33.GL_BLEND)
     gl33.gl_disable(g, gl33.GL_SCISSOR_TEST)
     gl33.gl_enable(g, gl33.GL_DEPTH_TEST)
@@ -1104,6 +1129,13 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
     let a: f64 = (((rgba >> 24 as u32) & 255 as u32) as f64) / 255.0
     gl33.gl_clear_color(g, r, gr, b, a)
     gl33.gl_clear(g, gl33.GL_COLOR_BUFFER_BIT | gl33.GL_DEPTH_BUFFER_BIT)
+    bind_state(gb)
+}
+
+// Program, textures and uniforms of the voxel pass (everything be_begin sets after the clear). The scene layer calls it
+// through glbe_rebind after its own passes changed the program / VAO / blend state.
+fn bind_state(gb: *mut GlBackend) {
+    let g: *mut gl33.Gl = &(*gb).g
     gl33.gl_use(g, (*gb).prog)
     gl33.gl_bind_tex_target(g, 0 as u32, gl33.GL_TEXTURE_2D_ARRAY, (*gb).atlas_tex)
     gl33.gl_u1i(g, (*gb).l_atlas, 0)
@@ -1131,6 +1163,96 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
     gl33.gl_bind_vao(g, 0 as u32)
     (*gb).cur_vao = 0 as u32
     (*gb).fresh = false
+}
+
+// The framebuffer the passes draw into: the multisample target while MSAA is on, else the plain FBO.
+fn draw_fbo_bind(gb: *mut GlBackend) {
+    var f: gl33.Fbo = (*gb).fbo
+    if (*gb).msaa > 0 {
+        f.fbo = (*gb).mt.fbo
+    }
+    gl33.gl_fbo_bind(&(*gb).g, &f)
+}
+
+// Scene layer: bind the draw target + full viewport (a pass of its own starts here).
+fn glbe_bind_draw(gb: *mut GlBackend) {
+    draw_fbo_bind(gb)
+    gl33.gl_viewport(&(*gb).g, 0, 0, (*gb).w, (*gb).h)
+}
+
+// Scene layer: put the voxel pass state back (call after a sky / entity / HUD pass, before the next b.draw).
+// The batch of MODE_MULTI is NOT flushed by this: draws collected so far stay queued and are issued at b.end.
+fn glbe_rebind(gb: *mut GlBackend) {
+    let g: *mut gl33.Gl = &(*gb).g
+    glbe_bind_draw(gb)
+    gl33.gl_disable(g, gl33.GL_BLEND)
+    gl33.gl_enable(g, gl33.GL_DEPTH_TEST)
+    gl33.gl_depth_func(g, gl33.GL_LESS)
+    gl33.gl_depth_mask(g, true)
+    gl33.gl_color_mask(g, true, true, true, true)
+    if (*gb).cull {
+        gl33.gl_enable(g, gl33.GL_CULL_FACE)
+    } else {
+        gl33.gl_disable(g, gl33.GL_CULL_FACE)
+    }
+    bind_state(gb)
+}
+
+fn glbe_x(gb: *mut GlBackend) -> *mut gl_ext.GlX {
+    return &(*gb).x
+}
+
+fn glbe_width(gb: *mut GlBackend) -> i32 {
+    return (*gb).w
+}
+
+fn glbe_height(gb: *mut GlBackend) -> i32 {
+    return (*gb).h
+}
+
+// projection * view rotation of the current frame, column-major f32 (the `u_rv` of the voxel pass); camera position f64.
+fn glbe_camera_rv(gb: *mut GlBackend, out: u64, cx: *mut f64, cy: *mut f64, cz: *mut f64) {
+    rt.mem_copy(out, (&(*gb).rv[0]) as u64, 64)
+    *cx = (*gb).cx
+    *cy = (*gb).cy
+    *cz = (*gb).cz
+}
+
+// MSAA: samples 0 = off, else the multisample target is built with min(samples, driver max). Returns the samples in force
+// (0 when the driver cannot do it). Draw passes go to the multisample target; `present`, `glbe_fbo_texture` and
+// `glbe_resolve` resolve it into the plain FBO first. Needs a current context; call between frames.
+fn glbe_set_msaa(gb: *mut GlBackend, samples: i32) -> i32 {
+    if !(*gb).ok || !(*gb).xok {
+        return 0
+    }
+    if (*gb).msaa > 0 {
+        gl_fbo.target_free(&(*gb).x, &(*gb).mt)
+        (*gb).msaa = 0
+    }
+    (*gb).dirty = false
+    if samples <= 0 {
+        return 0
+    }
+    (*gb).mt = gl_fbo.target_new(&(*gb).x, (*gb).w, (*gb).h, 1, gl_fbo.DEPTH_RENDERBUFFER, samples)
+    if !(*gb).mt.ok || (*gb).mt.samples <= 0 {
+        gl_fbo.target_free(&(*gb).x, &(*gb).mt)
+        return 0
+    }
+    (*gb).msaa = (*gb).mt.samples
+    return (*gb).msaa
+}
+
+fn glbe_msaa(gb: *mut GlBackend) -> i32 {
+    return (*gb).msaa
+}
+
+// Resolves the multisample target into the plain FBO colour texture (no-op without MSAA or when already resolved).
+fn glbe_resolve(gb: *mut GlBackend) {
+    if (*gb).msaa > 0 && (*gb).dirty {
+        gl_fbo.blit_fbo(&(*gb).x, (*gb).mt.fbo, (*gb).fbo.fbo, (*gb).w, (*gb).h, gl33.GL_COLOR_BUFFER_BIT)
+        (*gb).dirty = false
+        (*gb).fresh = false
+    }
 }
 
 fn bind_vao(gb: *mut GlBackend, v: u32) {
@@ -1263,6 +1385,7 @@ fn be_end(o: u64) {
 // Reads the finished frame back (blocks until the GPU is done): w*h*4 bytes RGBA, row 0 = top.
 fn be_present(o: u64) -> u64 {
     let gb: *mut GlBackend = o as *mut GlBackend
+    glbe_resolve(gb)
     if !(*gb).fresh {
         gl33.gl_fbo_bind(&(*gb).g, &(*gb).fbo)
         gl33.gl_read_rgba_top_down(&(*gb).g, (*gb).w, (*gb).h, (*gb).pix, (*gb).tmp)
