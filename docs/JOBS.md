@@ -51,7 +51,7 @@ Gleiche API, gleiche Ergebnisse; nur der Entnahmeweg aendert sich. Ein beschraen
 ab (Batch mit mehr als 512 Chunks oder voller Ring: der Rest geht wie bisher in die gelockte Queue), `spawn` einen Task. Wer Arbeit sucht, probiert zuerst den Ring (kein
 Lock, kein Futex), dann die gelockte Queue. Sequenzwoerter werden mit gelocktem Add gelesen/geschrieben (Vollbarriere, auch auf aarch64; aarch64 nicht getestet).
 
-Tests: `tests/2764_jobs.fi` (unveraendert, gruen) und `tests/2790_jobs_lockfree.fi` (gleiche Faelle A-J mit `create_lf` + K: Batch > 512 Chunks, Ueberlauf in die gelockte Queue,
+Tests: `tests/2764_jobs.fi` (unveraendert, gruen) und `tests/2791_jobs_lockfree.fi` (gleiche Faelle A-J mit `create_lf` + K: Batch > 512 Chunks, Ueberlauf in die gelockte Queue,
 3000 Futures durch den Ring), beide Exit 0.
 
 Messung (`tools/jobs/scale.fi T 5 LF`, release-fast, Host-Last 4-10 durch andere Laeufe, 2 Durchgaenge, Median von 5):
