@@ -37,11 +37,16 @@
 // back the others, which is what stealing buys, without per-thread deques.
 //
 // HONEST
-// J1  NO WORK STEALING (deque per thread). Firn has `__atomic_add` and
-//     `__atomic_swap` but no compare-and-swap, so a Chase-Lev deque is not
-//     possible; one locked queue with chunk claiming replaces it. It stays
-//     cheap while one chunk runs for more than ~1 us; `docs/JOBS.md` has the
-//     measured per-task cost. Pick `chunk` so a chunk is >= 20 us of work.
+// J1  NO WORK STEALING (deque per thread), and the default queue is one LOCKED
+//     queue with chunk claiming. Firn DOES have compare-and-swap:
+//     `__atomic_swap(p, expected, new)` (compiler/src/thread.rs, x86-64 and
+//     aarch64) returns the old value and stores `new` when it equals
+//     `expected`. What is missing is the memory-reclamation half of a
+//     Chase-Lev deque: a batch record that threads read while another frees it
+//     needs hazard pointers or epochs. So `create` keeps the locked queue (it
+//     is cheap while a chunk runs for more than ~1 us; `docs/JOBS.md` has the
+//     measured per-task cost; pick `chunk` so a chunk is >= 20 us of work) and
+//     `create_lf` adds a LOCK-FREE FAST PATH in front of it, see J8.
 // J2  `ctx`, the arguments and everything `body` touches are numbers /
 //     addresses. They must stay alive until the group is waited for; the
 //     collector does not look into the queue (as in std.pool Q1). The thread
@@ -59,12 +64,24 @@
 //     Counters in futex words stay below 2^32 (items per group < 4 billion).
 // J7  `destroy` needs all groups waited for. A worker that is still inside a
 //     `body` is joined, not killed.
+// J8  `create_lf(workers)`: a bounded MPMC ring (Vyukov: one sequence word per
+//     slot, enqueue/dequeue positions moved with `__atomic_swap` CAS) of CHUNK
+//     DESCRIPTORS sits in front of the locked queue. `group_go` pushes one
+//     descriptor per chunk (a batch of more than RING/2 chunks, or a ring that
+//     is full, sends the rest to the locked queue as before); `spawn` pushes a
+//     task descriptor. A thread takes work from the ring with no lock and no
+//     futex, then from the locked queue. Slots are never freed (the ring is one
+//     block), so no reclamation problem; every slot access is ordered by its
+//     sequence word (a locked add = full barrier, also on aarch64). Same API,
+//     same results; only the take path changes. The ring is a fast path for
+//     many small chunks, not a load balancer of its own: dynamic balance
+//     still comes from chunk-sized descriptors.
 
 import std.rt
 
 export {
     Jobs, WORKER_KIND,
-    create, destroy, worker_main, worker_count,
+    create, create_lf, lockfree, destroy, worker_main, worker_count,
     parallel_for, parallel_each,
     group_new, group_free, group_go, group_wait, group_pending,
     spawn, join, task_done,
@@ -87,7 +104,24 @@ const P_WORKERS: usize = 5
 const P_EXEC_W: usize = 6 // chunks run by workers
 const P_EXEC_C: usize = 7 // chunks run by callers while waiting
 const P_HANDLES: usize = 8 // up to 255 thread handles
-const P_WORDS: usize = 264
+const P_RING: usize = 264 // lock-free ring block (create_lf), 0 = locked queue only
+const P_WORDS: usize = 272
+
+// lock-free ring (J8): header words, then RING_SLOTS slots of SLOT_WORDS words
+const R_ENQ: usize = 0 // next position to enqueue
+const R_DEQ: usize = 16 // next position to dequeue (another cache line)
+const R_MASK: usize = 32
+const R_SLOTS: usize = 48 // first slot
+const RING_SLOTS: u64 = 1024
+const SLOT_WORDS: usize = 8
+const S_SEQ: usize = 0 // sequence word: pos = free for enqueue at pos, pos + 1 = filled, pos + RING_SLOTS = free again
+const S_FN: usize = 1
+const S_CTX: usize = 2
+const S_LO: usize = 3
+const S_HI: usize = 4
+const S_GROUP: usize = 5
+const S_KIND: usize = 6
+const RING_WORDS: usize = 48 + 8 * 1024
 
 // batch record, in words
 const B_FN: usize = 0
@@ -119,6 +153,19 @@ fn word_addr(base: u64, w: usize) -> u64 {
 
 // Starts `workers` threads (0 to 255). `Jobs.blk == 0` when it did not work.
 fn create(workers: u64) -> Jobs {
+    return create_with(workers, false)
+}
+
+// Same, with the lock-free fast path of J8.
+fn create_lf(workers: u64) -> Jobs {
+    return create_with(workers, true)
+}
+
+fn lockfree(j: *mut Jobs) -> bool {
+    return (*j).blk != 0 && rt.ld64((*j).blk, P_RING) != 0
+}
+
+fn create_with(workers: u64, lf: bool) -> Jobs {
     var w: u64 = workers
     if w > WORKERS_MAX {
         w = WORKERS_MAX
@@ -128,6 +175,20 @@ fn create(workers: u64) -> Jobs {
         return Jobs { blk: 0 }
     }
     rt.mem_set(blk, 0 as u8, P_WORDS * 8)
+    if lf {
+        // before the first worker exists: they read P_RING without a lock
+        let ring: u64 = rt.heap_alloc(RING_WORDS * 8)
+        if ring != 0 {
+            rt.mem_set(ring, 0 as u8, RING_WORDS * 8)
+            rt.st64(ring, R_MASK, RING_SLOTS - 1)
+            var i: u64 = 0
+            while i < RING_SLOTS {
+                rt.st64(ring, R_SLOTS + i as usize * SLOT_WORDS + S_SEQ, i)
+                i = i + 1
+            }
+            rt.st64(blk, P_RING, ring)
+        }
+    }
     var started: u64 = 0
     while started < w {
         let h: u64 = thread_start(WORKER_KIND, blk)
@@ -162,9 +223,104 @@ fn executed_by_callers(j: *mut Jobs) -> u64 {
     return rt.ld64((*j).blk, P_EXEC_C)
 }
 
-// Takes the next chunk of the front batch and runs it. False when the queue
+// ---------------------------------------------------------------- lock-free ring (J8)
+// Acquire load: a locked add of 0 is a full barrier on x86-64 and aarch64.
+fn aload(p: u64) -> u64 {
+    return __atomic_add(p as *mut u64, 0)
+}
+
+fn slot_addr(ring: u64, pos: u64) -> u64 {
+    return ring + ((R_SLOTS + (pos & (RING_SLOTS - 1)) as usize * SLOT_WORDS) * 8) as u64
+}
+
+// Queues one chunk descriptor. false = the ring is full.
+fn ring_push(ring: u64, f: u64, ctx: u64, lo: u64, hi: u64, g: u64, kind: u64) -> bool {
+    let enq: u64 = word_addr(ring, R_ENQ)
+    var pos: u64 = rt.ld64(ring, R_ENQ)
+    while true {
+        let slot: u64 = slot_addr(ring, pos)
+        let seq: u64 = aload(slot)
+        if seq == pos {
+            // free: claim the position
+            if __atomic_swap(enq as *mut u64, pos, pos + 1) == pos {
+                break
+            }
+            pos = rt.ld64(ring, R_ENQ)
+        } else if seq < pos {
+            return false // the slot still holds an entry of the previous lap: full
+        } else {
+            pos = rt.ld64(ring, R_ENQ) // somebody else took this position
+        }
+    }
+    let slot: u64 = slot_addr(ring, pos)
+    rt.st64(slot, S_FN, f)
+    rt.st64(slot, S_CTX, ctx)
+    rt.st64(slot, S_LO, lo)
+    rt.st64(slot, S_HI, hi)
+    rt.st64(slot, S_GROUP, g)
+    rt.st64(slot, S_KIND, kind)
+    __atomic_add(slot as *mut u64, 1) // seq: pos -> pos + 1 = filled (the locked add publishes the fields)
+    return true
+}
+
+// Takes one descriptor; false = empty. Fields come back in `out` (6 words: fn, ctx, lo, hi, group, kind).
+fn ring_pop(ring: u64, out: u64) -> bool {
+    let deq: u64 = word_addr(ring, R_DEQ)
+    var pos: u64 = rt.ld64(ring, R_DEQ)
+    while true {
+        let slot: u64 = slot_addr(ring, pos)
+        let seq: u64 = aload(slot)
+        if seq == pos + 1 {
+            if __atomic_swap(deq as *mut u64, pos, pos + 1) == pos {
+                break
+            }
+            pos = rt.ld64(ring, R_DEQ)
+        } else if seq < pos + 1 {
+            return false // not filled yet: empty
+        } else {
+            pos = rt.ld64(ring, R_DEQ)
+        }
+    }
+    let slot: u64 = slot_addr(ring, pos)
+    rt.st64(out, 0, rt.ld64(slot, S_FN))
+    rt.st64(out, 1, rt.ld64(slot, S_CTX))
+    rt.st64(out, 2, rt.ld64(slot, S_LO))
+    rt.st64(out, 3, rt.ld64(slot, S_HI))
+    rt.st64(out, 4, rt.ld64(slot, S_GROUP))
+    rt.st64(out, 5, rt.ld64(slot, S_KIND))
+    __atomic_add(slot as *mut u64, RING_SLOTS - 1) // seq: pos + 1 -> pos + RING_SLOTS = free for the next lap
+    return true
+}
+
+// Runs one chunk and counts its items into the group.
+fn run_chunk(blk: u64, counter: usize, f: u64, ctx: u64, g: u64, kind: u64, lo: u64, hi: u64) {
+    __atomic_add(word_addr(blk, counter) as *mut u64, 1)
+    if kind == 0 {
+        let body: fn(u64, u64, u64) = f as fn(u64, u64, u64)
+        body(ctx, lo, hi)
+    } else {
+        let fr: fn(u64) -> u64 = f as fn(u64) -> u64
+        rt.st64(g, G_RESULT, fr(ctx))
+    }
+    // count the items; the locked add orders the body's writes before it
+    let n: u64 = hi - lo
+    let old: u64 = __atomic_add(word_addr(g, G_PENDING) as *mut u64, MINUS1 - n + 1)
+    if old == n {
+        __thread_futex_wake(word_addr(g, G_PENDING), 1024)
+    }
+}
+
+// Takes the next chunk of the front batch (after the ring, J8) and runs it. False when the queue
 // is empty. `counter` is P_EXEC_W or P_EXEC_C.
 fn run_one(blk: u64, counter: usize) -> bool {
+    let ring: u64 = rt.ld64(blk, P_RING)
+    if ring != 0 {
+        var d: [u64; 6] = [0; 6]
+        if ring_pop(ring, (&d[0]) as u64) {
+            run_chunk(blk, counter, d[0], d[1], d[4], d[5], d[2], d[3])
+            return true
+        }
+    }
     let lock: *mut u64 = lock_of(blk)
     thread_lock(lock)
     let b: u64 = rt.ld64(blk, P_HEAD)
@@ -198,20 +354,7 @@ fn run_one(blk: u64, counter: usize) -> bool {
     if gone {
         rt.heap_free(b, BATCH_WORDS * 8)
     }
-    __atomic_add(word_addr(blk, counter) as *mut u64, 1)
-    if kind == 0 {
-        let body: fn(u64, u64, u64) = f as fn(u64, u64, u64)
-        body(ctx, lo, hi)
-    } else {
-        let fr: fn(u64) -> u64 = f as fn(u64) -> u64
-        rt.st64(g, G_RESULT, fr(ctx))
-    }
-    // count the items; the locked add orders the body's writes before it
-    let n: u64 = hi - lo
-    let old: u64 = __atomic_add(word_addr(g, G_PENDING) as *mut u64, MINUS1 - n + 1)
-    if old == n {
-        __thread_futex_wake(word_addr(g, G_PENDING), 1024)
-    }
+    run_chunk(blk, counter, f, ctx, g, kind, lo, hi)
     return true
 }
 
@@ -232,6 +375,12 @@ fn worker_main(blk: u64) -> u64 {
         __thread_blocked_out()
     }
     return 0
+}
+
+// Announces new work to sleeping workers (the ring path: no lock).
+fn announce(blk: u64, wake: u64) {
+    __atomic_add(word_addr(blk, P_SEQ) as *mut u64, 1)
+    __thread_futex_wake(word_addr(blk, P_SEQ), wake)
 }
 
 fn push_batch(blk: u64, b: u64, wake: u64) {
@@ -271,6 +420,58 @@ fn group_pending(g: u64) -> u64 {
     return rt.ld64(g, G_PENDING)
 }
 
+// Counts `n` finished items into the group (wakes the waiter when it was the last).
+fn finish_items(g: u64, n: u64) {
+    let old: u64 = __atomic_add(word_addr(g, G_PENDING) as *mut u64, MINUS1 - n + 1)
+    if old == n {
+        __thread_futex_wake(word_addr(g, G_PENDING), 1024)
+    }
+}
+
+// group_go through the lock-free ring (J8): one descriptor per chunk; what does not fit goes to the locked queue.
+fn group_go_ring(blk: u64, ring: u64, g: u64, begin: u64, end: u64, c: u64, body: fn(u64, u64, u64), ctx: u64) -> bool {
+    __atomic_add(word_addr(g, G_PENDING) as *mut u64, end - begin)
+    var lo: u64 = begin
+    var chunks: u64 = 0
+    while lo < end {
+        var hi: u64 = lo + c
+        if hi > end {
+            hi = end
+        }
+        if !ring_push(ring, body as u64, ctx, lo, hi, g, 0) {
+            break
+        }
+        chunks = chunks + 1
+        lo = hi
+    }
+    if lo < end {
+        // the ring is full: the rest as one batch in the locked queue
+        let b: u64 = rt.heap_alloc(BATCH_WORDS * 8)
+        if b == 0 {
+            run_inline(lo, end, c, body, ctx)
+            finish_items(g, end - lo)
+        } else {
+            rt.st64(b, B_FN, body as u64)
+            rt.st64(b, B_CTX, ctx)
+            rt.st64(b, B_NEXT_LO, lo)
+            rt.st64(b, B_END, end)
+            rt.st64(b, B_CHUNK, c)
+            rt.st64(b, B_GROUP, g)
+            rt.st64(b, B_KIND, 0)
+            push_batch(blk, b, rt.ld64(blk, P_WORKERS))
+        }
+    }
+    var wake: u64 = chunks
+    let nw: u64 = rt.ld64(blk, P_WORKERS)
+    if wake > nw {
+        wake = nw
+    }
+    if wake > 0 {
+        announce(blk, wake)
+    }
+    return true
+}
+
 // Adds the loop [begin, end) in chunks of `chunk` items to the group and
 // returns at once. Result false: out of memory (nothing was queued).
 fn group_go(j: *mut Jobs, g: u64, begin: u64, end: u64, chunk: u64, body: fn(u64, u64, u64), ctx: u64) -> bool {
@@ -284,6 +485,10 @@ fn group_go(j: *mut Jobs, g: u64, begin: u64, end: u64, chunk: u64, body: fn(u64
     var c: u64 = chunk
     if c < 1 {
         c = 1
+    }
+    let ring: u64 = rt.ld64(blk, P_RING)
+    if ring != 0 && (end - begin + c - 1) / c <= RING_SLOTS / 2 {
+        return group_go_ring(blk, ring, g, begin, end, c, body, ctx)
     }
     let b: u64 = rt.heap_alloc(BATCH_WORDS * 8)
     if b == 0 {
@@ -390,6 +595,15 @@ fn spawn(j: *mut Jobs, f: fn(u64) -> u64, arg: u64) -> u64 {
     if g == 0 {
         return 0
     }
+    let ring: u64 = rt.ld64(blk, P_RING)
+    if ring != 0 {
+        __atomic_add(word_addr(g, G_PENDING) as *mut u64, 1)
+        if ring_push(ring, f as u64, arg, 0, 1, g, 1) {
+            announce(blk, 1)
+            return g
+        }
+        __atomic_add(word_addr(g, G_PENDING) as *mut u64, MINUS1) // ring full: the locked queue below
+    }
     let b: u64 = rt.heap_alloc(BATCH_WORDS * 8)
     if b == 0 {
         group_free(j, g)
@@ -449,6 +663,10 @@ fn destroy(j: *mut Jobs) {
         let nx: u64 = rt.ld64(b, B_LINK)
         rt.heap_free(b, BATCH_WORDS * 8)
         b = nx
+    }
+    let ring: u64 = rt.ld64(blk, P_RING)
+    if ring != 0 {
+        rt.heap_free(ring, RING_WORDS * 8)
     }
     rt.heap_free(blk, P_WORDS * 8)
     (*j).blk = 0
