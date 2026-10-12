@@ -1973,6 +1973,17 @@ else
     grep -E 'FAIL|scene .*FAIL' "$WORK/gpu.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 126. Vulkan 1.0 layer (lib/gpu/vk.fi): loader via dynlib, offscreen triangle vs mc_raster / float CPU reference, X11 swapchain (xlib + xcb), no-loader path (tools/gpu/vk/run.sh, docs/GL-VS-VULKAN.md) =="
+# Mesa lavapipe + Xvfb. A missing libvulkan / ICD / Xvfb is SKIP. Only lavapipe is proven; a real GPU driver is UNTESTED.
+FIRNC="$FIRNC" bash tools/gpu/vk/run.sh > "$WORK/vk.log" 2>&1 && VKRC=0 || VKRC=$?
+if [ "$VKRC" -eq 0 ]; then
+    ok
+    grep -E '^   (ok|SKIP)|metric' "$WORK/vk.log" | sed 's/^/ /'
+else
+    bad "tools/gpu/vk/run.sh failed (see .test-work/vk.log)"
+    grep -E 'FAIL' "$WORK/vk.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 125. GL 3.3 core window: X11 (EGL on the Firn window's XID + GLX fallback) + Windows twin under Wine (tools/gpu/win/run.sh, lib/gpu/glwindow.fi, docs/GPU.md) =="
 # Xvfb + Mesa llvmpipe: open, clear + read back the window framebuffer, swap, swap interval, resize, full screen request, DPI.
 # A missing libEGL / Xvfb is SKIP (Wine part: SKIP without wine / mingw ld). Only Mesa is proven; a real GPU driver is UNTESTED.

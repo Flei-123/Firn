@@ -41,7 +41,7 @@ The same test as a Windows exe under Wine (wgl through the Win64 gate, Wine -> h
 2. No real GPU run (only llvmpipe): ms/frame on a GPU, GL ES / driver quirks, core profile on NVIDIA/AMD/Intel is untested.
 3. Entities / sky / HUD still go through the CPU (`mc_sky`, `mc_hud`) and are not part of the Backend table; the GL back end only
    draws the voxel meshes. Textures use NEAREST (no mipmaps) like the raster; fog is set by `glbe_set_fog`, not through the table.
-4. Vulkan: only an option (`libvulkan.so.1` loads the same way; no probe written, no plan beyond this line).
+4. Vulkan: `lib/gpu/vk.fi` exists (round gpu-g, gate 126, below + `docs/GL-VS-VULKAN.md`); it is a probe layer, not a renderer.
 
 ## Build notes
 * `firnc` of the main checkout (Oct 8) is too old (`link_lib` unknown): build `compiler/` (`cargo build --release`, 23 s, through `/root/jarvis/bin/heavy`).
@@ -127,3 +127,14 @@ match the table). Additions (all additive; `tools/gpu/dump.fi` still gives the s
   boxes, shading = mc_raster with ao 3, fog), `gl_hud_{vs,fs}.glsl` (instanced rectangles, blend or invert).
 Still to do (roadmap): `lib/gpu/gl_scene.fi` (sky/tint/entity/HUD passes, timer ring per pass, cull.fi wrapper, glshow window
 present), the PSNR test for sky/HUD/entity scenes, gate 126. No real GPU here (`/dev/dri` missing): every time is llvmpipe.
+
+## Vulkan probe (round gpu-g, 2026-10-12) -- `lib/gpu/vk.fi`, `vkplat.fi`, `tools/gpu/vk/run.sh`, gate 126
+Decision paper: `docs/GL-VS-VULKAN.md`. ALL numbers are Mesa lavapipe (CPU, Vulkan 1.3 device, requested 1.0). Real GPU: UNTESTED.
+* `gpu.vk`: loader (dlopen `libvulkan.so.1`, override `FIRN_VK_LIB`), instance (+ `VK_KHR_surface/xlib/xcb` when present), best device (discrete > integrated > virtual > other > CPU; CPU only with `allow_cpu`), queue, command pool/buffer, fence; offscreen `Target` (RGBA8 image, render pass, framebuffer, mapped read back buffer), `Pipe` from SPIR-V (dynamic viewport/scissor, vertex = vec2 + vec3), host visible `Buf`, `draw`, swapchain `Sc` (`sc_open` by XID, `sc_frame`, `sc_resize`, `window_pixels` = XGetImage).
+* `gpu.vkplat` (Linux) / `vkplat.windows.fi` (vulkan-1.dll + `VK_KHR_win32_surface`; BUILD ONLY, not run): the platform part. Without a loader `open` returns false with `STEP_NO_LOADER` (tested with `FIRN_VK_LIB`).
+* Shaders: `lib/gpu/spv/tri.vert|frag` (GLSL 450) -> committed `.spv` (`build.sh` needs glslangValidator + spirv-val; the tests do not), embedded with `__include_str`.
+* Struct layouts are byte offsets of the Vulkan 1.0 headers (x86_64); wrong offsets would crash lavapipe, so the green run is the check. No validation layer was run.
+Measured (lavapipe, 320x180): flat triangle vs `mc_raster` (same vertices projected with the raster's own formulas, colour = the raster's pixel): PSNR 99 dB, 0 coverage mismatch, byte equal;
+RGB gradient vs a float CPU reference: 87.95 dB (max diff 1); swapchain (xlib and xcb surface, BGRA8, 3 images, FIFO): window read back with XGetImage equals the offscreen render (99 dB), also after a resize to 400x240 (`sc_resize`);
+offscreen draw + read back ~0.4-0.45 ms/frame (CPU renderer, NOT a GPU number).
+Not done: depth/textures/descriptors/push constants/uniform buffers, mc_backend table on Vulkan, memory suballocation, validation layers, Android (`VK_KHR_android_surface`), Wayland, real Windows, real GPU, `OUT_OF_DATE` is only handled, not provoked by a test.
