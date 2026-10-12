@@ -73,3 +73,10 @@ it stays correct.
 Everything numeric built at release-safe / release-fast that calls `math.floor/trunc/fabs/sqrt/round/ceil` or
 `__bits` (NaN-boxing in the JS engine, hashing of numbers, `frexp/ldexp`) from a function with real loops. Check any
 function with `FIRN_RA_WARN=1 firnc ... 2>&1 | grep RA-BASE`.
+
+## RESULT (2026-10-12, merged 28eb2bb3d)
+Fix `compiler/src/regalloc.rs` (Sqrt/Bits stay in the register path) built and verified:
+* `tools/perf/rf_repro.sh`: no RA-BASE line any more; frame `shade` 176 B (was 2416 B); min user time dev-fast 1.16 s, release-safe 0.51 s, release-fast 0.43 s (before: release-fast 1.87 s vs dev-fast 1.46 s); checksum identical in all 4 stages.
+* `tools/mc/raster/run.sh` and `tools/mc/sky/run.sh`: all scenes bit-identical (hashes), counter-checks fire.
+* 102 float-using tests (tests/*.fi, tests/opt) x release-fast / release-safe / dev-fast: 306 runs, 0 failures.
+* NOT run: full `test.sh`, cargo test, fir/sema compare (front end untouched). Machine was busy (load 8-17); times are min of 5.
