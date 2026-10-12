@@ -178,10 +178,10 @@ legacy draw mode only. Headless Chromium on SwiftShader: 7 scenes vs mc_raster, 
 (buffer textures, base vertex, mapped buffers, indirect, timer queries, Hi-Z), the `lib/@web/` twin idea and untested items: `docs/WEBGL2.md`.
 Real GPU, Firefox, Safari, mobile UNTESTED.
 
-### Scene layer: lib/gpu/gl_scene.fi (round gpu-l, 2026-10-12) -- PARTIAL (module + smoke run; PSNR tests, gate, MSAA image test still open)
+### Scene layer: lib/gpu/gl_scene.fi (round gpu-l, 2026-10-12) -- gate 132 (`tools/gpu/mc/run.sh`)
 `gpu.gl_scene` wires the shaders `gl_{sky,tint,ent,hud}_*.glsl`: `scene_open(&gb)`, `scene_frame` (timer ring), `scene_sky(&sc,&cam,&sky)` (after b.begin),
 `scene_ent_add/scene_ent_occluder` + `scene_ent_flush(&sc,&cam)` (ONE instanced draw; frustum + Hi-Z culling via gpu.cull, occluders = yaw-0 boxes),
 `scene_tint` (depth < 1 pixels, blend DST_COLOR/ZERO), `scene_hud(&sc,&rec)` (mc_hud.hud_record rectangles, runs per blend mode, alpha not written),
 `scene_present_window` (resolve + FBO texture -> window, no read back; caller swaps). Timer passes PASS_* (stamp queries, never waits).
 gl_mc addition: `glbe_flush` (issue collected MODE_MULTI draws before an extra pass; `glbe_rebind` alone forgets them).
-Smoke run `tools/gpu/mc/scene_smoke.fi` (llvmpipe): all 4 programs link, sky + 1 entity + 136 HUD rects (2 runs) draw. NOT yet compared with mc_raster.
+Smoke run `tools/gpu/mc/scene_smoke.fi`. Image tests `tools/gpu/mc/scene.fi` (llvmpipe, 320x180, CPU = mc_raster + mc_sky + mc_hud, entities = 12 mc_raster triangles per box, solid tiles, ao 3): sky 99 dB (byte equal); world+sky+fog+tint+HUD 53.5 dB; HUD only 57.4 dB (max diff 1); entities 56.3 dB, +fog 59.5 dB, +wall 58.9 dB; MSAA x4 vs CPU 43.7 dB (354 edge pixels differ from the plain frame); window present (EGL and GLX, FBO texture -> window, read back) 55.6 dB. Cull on/off: byte-identical frames (2 of 6 boxes sent: 1 frustum, 3 occluded). Gate 132 also prints `upload_probe.fi` (see docs/mc/gpu-world.md). Only Mesa llvmpipe / Xvfb; real GPU, real WM and Windows (WGL) untested for this layer.

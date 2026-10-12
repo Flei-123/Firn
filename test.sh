@@ -2017,6 +2017,17 @@ else
     grep -E 'FAIL' "$WORK/webgl2.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 132. GL scene layer (lib/gpu/gl_scene.fi: sky, tint, entity instancing + cull, HUD, MSAA, window present) against the CPU path, PSNR >= 34, cull on/off byte equal (tools/gpu/mc/run.sh, docs/GPU.md) =="
+# Mesa llvmpipe / Xvfb only; a real GPU is UNTESTED. Missing libEGL / Xvfb is SKIP.
+FIRNC="$FIRNC" bash tools/gpu/mc/run.sh > "$WORK/glscene.log" 2>&1 && GSRC=0 || GSRC=$?
+if [ "$GSRC" -eq 0 ]; then
+    ok
+    grep -E '^   (ok|SKIP)' "$WORK/glscene.log" | sed 's/^/ /'
+else
+    bad "tools/gpu/mc/run.sh failed (see .test-work/glscene.log)"
+    grep -E 'FAIL' "$WORK/glscene.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 125. GL 3.3 core window: X11 (EGL on the Firn window's XID + GLX fallback) + Windows twin under Wine (tools/gpu/win/run.sh, lib/gpu/glwindow.fi, docs/GPU.md) =="
 # Xvfb + Mesa llvmpipe: open, clear + read back the window framebuffer, swap, swap interval, resize, full screen request, DPI.
 # A missing libEGL / Xvfb is SKIP (Wine part: SKIP without wine / mingw ld). Only Mesa is proven; a real GPU driver is UNTESTED.

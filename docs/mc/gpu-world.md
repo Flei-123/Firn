@@ -43,3 +43,8 @@ Section: 4084 vertices = 32672 B VBO + 24504 B IBO (test chunk). Not implemented
   pool path does 3 `glBufferSubData` (granule table ~2 KB, VBO 32 KB, IBO 24 KB) + 3 binds into 8 MB / 6 MB buffers against 2
   `glBufferData` calls; first-touch page faults of the fresh big buffers are the first suspect (unmeasured: upload the same sections
   twice and compare). Not a real-GPU claim either way.
+
+## Upload probe (gpu-l, 2026-10-12, `tools/gpu/mc/upload_probe.fi`, llvmpipe)
+* Raw GL, no gl_mc: 8 MB `BufferData(NULL)` + 25 x `SubData(32 KB)`: first pass ~130 us, second/third ~30-35 us (first touch of the pages is ~4x). 25 x `BufferData(32 KB)` on 25 buffers (legacy): first ~650-770 us, then ~40-50 us. 75 x `SubData(2 KB)`: ~24 us.
+* So raw SubData into a pool is NOT slower than legacy; the "pool 6x slower" (2541 vs 427 us) is not the upload itself. Remaining suspects: pool bookkeeping in gl_mc (granule table), the extra binds, or the measurement including first touch of the 8/6 MB buffers on a cold run. Next step: time the pool path inside gl_mc with a warm second pass.
+* Not a real-GPU statement.

@@ -1,0 +1,468 @@
+// tools/gpu/mc/scene.fi -- the scene layer (lib/gpu/gl_scene.fi: sky, tint, entities, HUD) against the CPU path (mc_raster + mc_sky + mc_hud).
+// Same pass order on both sides. Scenes: sky, world+sky+fog+tint+HUD, HUD only, entities, cull on/off (byte equal), MSAA.
+// Exit 0 = all above the thresholds, 3 = a check failed, 4 = no GL context (gate prints SKIP).
+import std.rt
+import std.io
+import std.math
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import mc.mc_sky
+import mc.mc_hud
+import gpu.gl_mc
+import gpu.gl_scene
+import gpu.gl33
+import gpu.glwindow
+import gpu.glshow
+
+const W: i32 = 320
+const H: i32 = 180
+const MIN_PSNR_X100: u64 = 3400
+
+struct Cmp {
+    diff_px: u64,
+    big_px: u64,
+    max_diff: u32,
+    cov_cpu: u64,
+    cov_gpu: u64,
+    psnr_x100: u64,
+}
+
+struct Sc {
+    r: mc_raster.Raster,
+    gb: gl_mc.GlBackend,
+    sc: gl_scene.Scene,
+    bc: mc_backend.Backend,
+    bg: mc_backend.Backend,
+    cam: mc_camera.Camera,
+    sky: mc_sky.Sky,
+    fails: i32,
+}
+
+fn print_f2(v: f64) {
+    var x: f64 = v
+    if x < 0.0 { x = 0.0 }
+    let i: i64 = x as i64
+    var f: i64 = ((x - (i as f64)) * 100.0 + 0.5) as i64
+    var ii: i64 = i
+    if f >= 100 as i64 {
+        f = f - 100 as i64
+        ii = ii + 1 as i64
+    }
+    if f < 10 as i64 {
+        io.fmt_print(f"{ii}.0{f}")
+    } else {
+        io.fmt_print(f"{ii}.{f}")
+    }
+}
+
+fn compare(a: u64, b: u64, n: usize, clear: u32, out: *mut Cmp) {
+    (*out).diff_px = 0 as u64
+    (*out).big_px = 0 as u64
+    (*out).max_diff = 0 as u32
+    (*out).cov_cpu = 0 as u64
+    (*out).cov_gpu = 0 as u64
+    var sq: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let pa: u32 = rt.ld32(a, i)
+        let pb: u32 = rt.ld32(b, i)
+        if pa != clear { (*out).cov_cpu = (*out).cov_cpu + 1 as u64 }
+        if pb != clear { (*out).cov_gpu = (*out).cov_gpu + 1 as u64 }
+        if pa != pb {
+            (*out).diff_px = (*out).diff_px + 1 as u64
+            var mx: u32 = 0 as u32
+            var k: u32 = 0 as u32
+            while k < 4 as u32 {
+                let ba: i32 = ((pa >> (k * 8 as u32)) & 255 as u32) as i32
+                let bb: i32 = ((pb >> (k * 8 as u32)) & 255 as u32) as i32
+                var d: i32 = ba - bb
+                if d < 0 { d = 0 - d }
+                if k < 3 as u32 { sq = sq + (d * d) as f64 }
+                if (d as u32) > mx { mx = d as u32 }
+                k = k + 1 as u32
+            }
+            if mx > (*out).max_diff { (*out).max_diff = mx }
+            if mx > 16 as u32 { (*out).big_px = (*out).big_px + 1 as u64 }
+        }
+        i = i + 1
+    }
+    var psnr: f64 = 99.0
+    if sq > 0.0 {
+        let mse: f64 = sq / ((n as f64) * 3.0)
+        psnr = 10.0 * math.log10(255.0 * 255.0 / mse)
+    }
+    (*out).psnr_x100 = (psnr * 100.0) as u64
+}
+
+// tiles: 1 orange (world), 2..5 solid entity colours
+fn scene_atlas() -> mc_texture.Atlas {
+    var a: mc_texture.Atlas = mc_texture.atlas_new(16, 4, 4)
+    var t: u32 = 1 as u32
+    while t <= 5 as u32 {
+        var c: u32 = mc_texture.pack_pixel(230 as u32, 120 as u32, 40 as u32, 255 as u32)
+        if t == 2 as u32 { c = mc_texture.pack_pixel(200 as u32, 80 as u32, 40 as u32, 255 as u32) }
+        if t == 3 as u32 { c = mc_texture.pack_pixel(40 as u32, 160 as u32, 220 as u32, 255 as u32) }
+        if t == 4 as u32 { c = mc_texture.pack_pixel(90 as u32, 200 as u32, 60 as u32, 255 as u32) }
+        if t == 5 as u32 { c = mc_texture.pack_pixel(230 as u32, 230 as u32, 50 as u32, 255 as u32) }
+        let ox: i32 = mc_texture.atlas_tile_x(&a, t)
+        let oy: i32 = mc_texture.atlas_tile_y(&a, t)
+        var y: i32 = 0
+        while y < 16 {
+            var x: i32 = 0
+            while x < 16 {
+                rt.st32(a.px, ((oy + y) * a.w + ox + x) as usize, c)
+                x = x + 1
+            }
+            y = y + 1
+        }
+        t = t + 1 as u32
+    }
+    return a
+}
+
+fn vw0(x: u32, y: u32, z: u32, face: u32, ao: u32) -> u32 {
+    return x | (y << 8 as u32) | (z << 16 as u32) | (face << 24 as u32) | (ao << 27 as u32)
+}
+
+fn vw1(tile: u32, u: u32, v: u32) -> u32 {
+    return tile | (u << 16 as u32) | (v << 24 as u32)
+}
+
+fn put_vtx(vp: u64, i: usize, w0: u32, w1: u32) {
+    rt.st32(vp, i * 2, w0)
+    rt.st32(vp, i * 2 + 1, w1)
+}
+
+fn stf(p: u64, i: usize, v: f64) {
+    *((p + (i as u64) * (8 as u64)) as *mut f64) = v
+}
+
+// CPU reference of one box: 6 faces x 2 triangles, the same corner order and face_k as gl_scene (FK 204 204 128 256 153 153).
+fn cpu_ent(r: *mut mc_raster.Raster, cam: *mut mc_camera.Camera, e: *mut gl_scene.Ent, tile: u32) {
+    let fkt: [u32; 6] = [204 as u32, 204 as u32, 128 as u32, 256 as u32, 153 as u32, 153 as u32]
+    var vb: [f64; 24] = [0.0; 24]
+    var f: usize = 0
+    while f < 6 {
+        let axis: usize = f / 2
+        var sgn: f64 = 0.0 - 0.5
+        if f % 2 == 1 { sgn = 0.5 }
+        var k: usize = 0
+        while k < 4 {
+            var a: f64 = 0.0 - 0.5
+            if k % 2 == 1 { a = 0.5 }
+            var b: f64 = 0.0 - 0.5
+            if k / 2 == 1 { b = 0.5 }
+            var c: [f64; 3] = [0.0, 0.0, 0.0]
+            c[axis] = sgn
+            c[(axis + 1) % 3] = a
+            c[(axis + 2) % 3] = b
+            let qx: f64 = c[0] * (*e).sx
+            let qy: f64 = c[1] * (*e).sy
+            let qz: f64 = c[2] * (*e).sz
+            let wx: f64 = qx * (*e).yaw_cos + qz * (*e).yaw_sin + (*e).x - (*cam).x
+            let wy: f64 = qy + (*e).y - (*cam).y
+            let wz: f64 = 0.0 - qx * (*e).yaw_sin + qz * (*e).yaw_cos + (*e).z - (*cam).z
+            vb[k * 6] = wx * (*cam).rx + wy * (*cam).ry + wz * (*cam).rz
+            vb[k * 6 + 1] = wx * (*cam).ux + wy * (*cam).uy + wz * (*cam).uz
+            vb[k * 6 + 2] = wx * (*cam).fx + wy * (*cam).fy + wz * (*cam).fz
+            vb[k * 6 + 3] = 0.5
+            vb[k * 6 + 4] = 0.5
+            vb[k * 6 + 5] = 3.0
+            k = k + 1
+        }
+        let p: u64 = (&vb[0]) as u64
+        mc_raster.raster_draw_tri(r, p, p + 48 as u64, p + 144 as u64, tile, fkt[f])
+        mc_raster.raster_draw_tri(r, p, p + 144 as u64, p + 96 as u64, tile, fkt[f])
+        f = f + 1
+    }
+}
+
+// Entity list used by the scenes. kind 0 = no wall, 1 = wall (occluder) + hidden box + box behind the camera.
+struct Ents {
+    a: gl_scene.Ent, b: gl_scene.Ent, c: gl_scene.Ent, wall: gl_scene.Ent, hid: gl_scene.Ent, back: gl_scene.Ent,
+}
+
+fn ents_new() -> Ents {
+    return Ents {
+        a: gl_scene.ent_new(8.0, 8.0, 6.0, 2.0, 2.0, 2.0, 0.5, 200 as u32, 80 as u32, 40 as u32),
+        b: gl_scene.ent_new(11.5, 9.0, 8.0, 1.5, 3.0, 1.0, 1.1, 40 as u32, 160 as u32, 220 as u32),
+        c: gl_scene.ent_new(5.0, 7.0, 12.0, 2.0, 1.0, 3.0, 0.0, 90 as u32, 200 as u32, 60 as u32),
+        wall: gl_scene.ent_new(8.0, 8.0, 3.0, 5.0, 5.0, 0.5, 0.0, 230 as u32, 230 as u32, 50 as u32),
+        hid: gl_scene.ent_new(8.0, 8.0, 9.0, 1.0, 1.0, 1.0, 0.0, 200 as u32, 80 as u32, 40 as u32),
+        back: gl_scene.ent_new(8.0, 8.0, -6.0, 1.0, 1.0, 1.0, 0.0, 40 as u32, 160 as u32, 220 as u32),
+    }
+}
+
+// ---- one frame on both sides ----------------------------------------------------------------------------------------
+// flags: 1 sky, 2 world quad, 4 fog, 8 tint, 16 HUD, 32 entities (a b c), 64 wall + hidden + back entities
+fn frame_cpu(s: *mut Sc, clear: u32, flags: u32, en: *mut Ents) -> u64 {
+    mc_camera.camera_update(&(*s).cam)
+    (*s).bc.begin((*s).bc.obj, ((&(*s).cam) as u64), clear)
+    if (flags & 1 as u32) != 0 as u32 { mc_sky.sky_draw_plain(&(*s).sky, &(*s).r) }
+    if (flags & 2 as u32) != 0 as u32 { (*s).bc.draw((*s).bc.obj, 1, 0.0, 0.0, 0.0) }
+    (*s).bc.end((*s).bc.obj)
+    if (flags & 32 as u32) != 0 as u32 {
+        cpu_ent(&(*s).r, &(*s).cam, &(*en).a, 2 as u32)
+        cpu_ent(&(*s).r, &(*s).cam, &(*en).b, 3 as u32)
+        cpu_ent(&(*s).r, &(*s).cam, &(*en).c, 4 as u32)
+    }
+    if (flags & 64 as u32) != 0 as u32 {
+        cpu_ent(&(*s).r, &(*s).cam, &(*en).wall, 5 as u32)
+        cpu_ent(&(*s).r, &(*s).cam, &(*en).hid, 2 as u32)
+        cpu_ent(&(*s).r, &(*s).cam, &(*en).back, 3 as u32)
+    }
+    if (flags & 8 as u32) != 0 as u32 { mc_sky.sky_tint_frame(&(*s).sky, &(*s).r) }
+    if (flags & 16 as u32) != 0 as u32 {
+        var dbg: mc_hud.HudDebug = mc_hud.hud_debug_new()
+        mc_hud.hud_frame(&(*s).r, 2, mc_hud.HUD_CROSSHAIR | mc_hud.HUD_HOTBAR | mc_hud.HUD_DEBUG, 3, &dbg)
+    }
+    return (*s).bc.present((*s).bc.obj)
+}
+
+#[allow_escape]
+fn gpu_draw(s: *mut Sc, clear: u32, flags: u32, en: *mut Ents) {
+    gl_scene.scene_frame(&(*s).sc)
+    (*s).bg.begin((*s).bg.obj, ((&(*s).cam) as u64), clear)
+    if (flags & 1 as u32) != 0 as u32 { gl_scene.scene_sky(&(*s).sc, &(*s).cam, &(*s).sky) }
+    if (flags & 2 as u32) != 0 as u32 { (*s).bg.draw((*s).bg.obj, 1, 0.0, 0.0, 0.0) }
+    (*s).bg.end((*s).bg.obj)
+    if (flags & 32 as u32) != 0 as u32 {
+        gl_scene.scene_ent_add(&(*s).sc, &(*en).a)
+        gl_scene.scene_ent_add(&(*s).sc, &(*en).b)
+        gl_scene.scene_ent_add(&(*s).sc, &(*en).c)
+    }
+    if (flags & 64 as u32) != 0 as u32 {
+        gl_scene.scene_ent_occluder(&(*s).sc, &(*en).wall)
+        gl_scene.scene_ent_add(&(*s).sc, &(*en).hid)
+        gl_scene.scene_ent_add(&(*s).sc, &(*en).back)
+    }
+    gl_scene.scene_ent_flush(&(*s).sc, &(*s).cam)
+    if (flags & 8 as u32) != 0 as u32 { gl_scene.scene_tint(&(*s).sc, &(*s).sky) }
+    if (flags & 16 as u32) != 0 as u32 {
+        var scratch: mc_raster.Raster = mc_raster.raster_new(W, H)
+        var rec: rt.Buf = rt.buf_new()
+        mc_hud.hud_record(&rec)
+        var dbg: mc_hud.HudDebug = mc_hud.hud_debug_new()
+        mc_hud.hud_frame(&scratch, 2, mc_hud.HUD_CROSSHAIR | mc_hud.HUD_HOTBAR | mc_hud.HUD_DEBUG, 3, &dbg)
+        mc_hud.hud_record(0 as *mut rt.Buf)
+        gl_scene.scene_hud(&(*s).sc, &rec)
+        rt.buf_free(&rec)
+        mc_raster.raster_free(&scratch)
+    }
+}
+
+fn frame_gpu(s: *mut Sc, clear: u32, flags: u32, en: *mut Ents) -> u64 {
+    gpu_draw(s, clear, flags, en)
+    return (*s).bg.present((*s).bg.obj)
+}
+
+fn set_fog(s: *mut Sc, on: bool) {
+    mc_raster.raster_set_fog(&(*s).r, on, 8.0, 40.0, (*s).sky.fr as u32, (*s).sky.fg as u32, (*s).sky.fb as u32)
+    gl_mc.glbe_set_fog(&(*s).gb, on, 8.0, 40.0, (*s).sky.fr as u32, (*s).sky.fg as u32, (*s).sky.fb as u32)
+}
+
+fn report(s: *mut Sc, name: str, c: *mut Cmp, ok: bool) {
+    io.print("scene ")
+    io.print(name)
+    io.fmt_print(f" cov_cpu={(*c).cov_cpu} cov_gpu={(*c).cov_gpu} diff_px={(*c).diff_px} big_px={(*c).big_px} max_diff={(*c).max_diff} psnr=")
+    print_f2(((*c).psnr_x100 as f64) / 100.0)
+    if ok {
+        io.print(" ok\n")
+    } else {
+        io.print(" FAIL\n")
+        (*s).fails = (*s).fails + 1
+    }
+}
+
+// Renders `flags` on both sides and checks PSNR >= 34 plus (when `need_cov`) that something was drawn.
+fn scene(s: *mut Sc, name: str, clear: u32, flags: u32, en: *mut Ents, need_cov: bool) {
+    let pc: u64 = frame_cpu(s, clear, flags, en)
+    let pg: u64 = frame_gpu(s, clear, flags, en)
+    var c: Cmp = Cmp { diff_px: 0 as u64, big_px: 0 as u64, max_diff: 0 as u32, cov_cpu: 0 as u64, cov_gpu: 0 as u64, psnr_x100: 0 as u64 }
+    compare(pc, pg, (W as usize) * (H as usize), clear, &c)
+    var ok: bool = c.psnr_x100 >= MIN_PSNR_X100
+    if need_cov && (c.cov_cpu == 0 as u64 || c.cov_gpu == 0 as u64) { ok = false }
+    report(s, name, &c, ok)
+}
+
+fn copy_px(src: u64, n: usize) -> u64 {
+    let d: u64 = rt.heap_alloc(n * 4)
+    var i: usize = 0
+    while i < n {
+        rt.st32(d, i, rt.ld32(src, i))
+        i = i + 1
+    }
+    return d
+}
+
+fn open_gb(windowed: bool, win: *mut glwindow.GlWin) -> gl_mc.GlBackend {
+    if windowed { return gl_mc.glbe_open_with(glwindow.take_ctx(win), W, H) }
+    return gl_mc.glbe_open(W, H)
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var windowed: bool = false
+    var o: glwindow.Opts = glwindow.opts_default()
+    o.vsync = 0
+    if rt.arg_count(start) >= 2 {
+        windowed = true
+        if rt.ld8(rt.arg_ptr(start, 1), 0) == 103 as u8 { o.api = glwindow.API_GLX } else { o.api = glwindow.API_EGL }
+    }
+    var win: glwindow.GlWin = glwindow.glwindow_new()
+    if windowed {
+        if !glwindow.open(&win, W, H, "scene layer", o) {
+            io.fmt_print(f"window open failed step={win.step}\n")
+            return 10 + win.step
+        }
+    }
+    var gb: gl_mc.GlBackend = open_gb(windowed, &win)
+    if !gb.ok {
+        io.fmt_print(f"no GL context: step={gb.step}\n")
+        return 4
+    }
+    io.print("renderer: ")
+    io.print_c(gl_mc.glbe_renderer(&gb))
+    io.new_line()
+    var s: Sc = Sc { r: mc_raster.raster_new(W, H), gb: gb, sc: gl_scene.scene_empty(&gb), bc: mc_backend.backend_new(),
+        bg: mc_backend.backend_new(), cam: mc_camera.camera_new(W, H), sky: mc_sky.sky_new(), fails: 0 }
+    s.sc = gl_scene.scene_open(&s.gb)
+    if !s.sc.ok {
+        io.fmt_print(f"scene_open failed step={s.sc.step}\n")
+        return 3
+    }
+    mc_raster.raster_set_cull(&s.r, false)
+    s.bc = mc_backend.backend_cpu(&s.r)
+    s.bg = gl_mc.glbe_backend(&s.gb)
+    var ta: mc_texture.Atlas = scene_atlas()
+    s.bc.upload_atlas(s.bc.obj, (&ta) as u64)
+    s.bg.upload_atlas(s.bg.obj, (&ta) as u64)
+    mc_camera.camera_set_pos(&s.cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&s.cam, 0.0, 0.0)
+    s.sky.discs = false
+    // world: one quad (tile 1) at z = 10, a second one lower and nearer, both with the AO gradient
+    let qv: u64 = rt.heap_alloc(8 * 8)
+    let qi: u64 = rt.heap_alloc(12 * 4)
+    put_vtx(qv, 0, vw0(14 as u32, 1 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 2 as u32))
+    put_vtx(qv, 1, vw0(2 as u32, 1 as u32, 10 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 2 as u32, 2 as u32))
+    put_vtx(qv, 2, vw0(2 as u32, 13 as u32, 10 as u32, 3 as u32, 1 as u32), vw1(1 as u32, 2 as u32, 0 as u32))
+    put_vtx(qv, 3, vw0(14 as u32, 13 as u32, 10 as u32, 3 as u32, 2 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    put_vtx(qv, 4, vw0(14 as u32, 0 as u32, 14 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 0 as u32, 2 as u32))
+    put_vtx(qv, 5, vw0(2 as u32, 0 as u32, 14 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 2 as u32, 2 as u32))
+    put_vtx(qv, 6, vw0(2 as u32, 4 as u32, 14 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 2 as u32, 0 as u32))
+    put_vtx(qv, 7, vw0(14 as u32, 4 as u32, 14 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    var k: usize = 0
+    while k < 2 {
+        let o: usize = k * 6
+        let b: u32 = (k * 4) as u32
+        rt.st32(qi, o, b)
+        rt.st32(qi, o + 1, b + 1 as u32)
+        rt.st32(qi, o + 2, b + 2 as u32)
+        rt.st32(qi, o + 3, b)
+        rt.st32(qi, o + 4, b + 2 as u32)
+        rt.st32(qi, o + 5, b + 3 as u32)
+        k = k + 1
+    }
+    let hc: usize = s.bc.mesh_upload(s.bc.obj, 1, qv, 8, qi, 12)
+    let hg: usize = s.bg.mesh_upload(s.bg.obj, 1, qv, 8, qi, 12)
+    if hc != 1 || hg != 1 {
+        // the scenes draw handle 1; the back ends hand out 1 for the first mesh
+        io.fmt_print(f"unexpected mesh handles {hc} {hg}\n")
+        return 3
+    }
+    var en: Ents = ents_new()
+    let clear: u32 = 0xFF302010 as u32
+
+    set_fog(&s, false)
+    scene(&s, "sky", clear, 1 as u32, &en, true)
+    s.sky.tr = 200
+    s.sky.tg = 220
+    s.sky.tb = 256
+    set_fog(&s, true)
+    scene(&s, "world+sky+fog+tint+hud", clear, (1 | 2 | 4 | 8 | 16 | 32) as u32, &en, true)
+    set_fog(&s, false)
+    scene(&s, "hud", clear, 16 as u32, &en, true)
+    scene(&s, "entities", clear, 32 as u32, &en, true)
+    set_fog(&s, true)
+    scene(&s, "entities+fog", clear, (1 | 4 | 32) as u32, &en, true)
+    set_fog(&s, false)
+
+    // ---- cull on / off: byte-equal frames; the wall hides one box, one box is behind the camera
+    let n: usize = (W as usize) * (H as usize)
+    gl_scene.scene_set_cull(&s.sc, true)
+    let pon: u64 = copy_px(frame_gpu(&s, clear, (2 | 32 | 64) as u32, &en), n)
+    let st_f: u32 = s.sc.st_frustum
+    let st_o: u32 = s.sc.st_occ
+    let st_d: u32 = s.sc.st_drawn
+    gl_scene.scene_set_cull(&s.sc, false)
+    let poff: u64 = copy_px(frame_gpu(&s, clear, (2 | 32 | 64) as u32, &en), n)
+    let st_d_off: u32 = s.sc.st_drawn
+    var diff: u64 = 0 as u64
+    var i: usize = 0
+    while i < n {
+        if rt.ld32(pon, i) != rt.ld32(poff, i) { diff = diff + 1 as u64 }
+        i = i + 1
+    }
+    var cok: bool = diff == 0 as u64 && st_f > 0 as u32 && st_o > 0 as u32 && st_d < st_d_off
+    io.fmt_print(f"scene cull drawn_on={st_d} drawn_off={st_d_off} frustum={st_f} occluded={st_o} byte_diff_px={diff}")
+    if cok {
+        io.print(" ok\n")
+    } else {
+        io.print(" FAIL\n")
+        s.fails = s.fails + 1
+    }
+    gl_scene.scene_set_cull(&s.sc, true)
+    // the culled frame against the CPU reference too
+    scene(&s, "entities+wall", clear, (2 | 32 | 64) as u32, &en, true)
+
+    // ---- MSAA
+    let plain: u64 = copy_px(frame_gpu(&s, clear, 32 as u32, &en), n)
+    let ms: i32 = gl_mc.glbe_set_msaa(&s.gb, 4)
+    if ms <= 0 {
+        io.print("scene msaa SKIP (driver gives no multisample target)\n")
+    } else {
+        let pc: u64 = frame_cpu(&s, clear, 32 as u32, &en)
+        let pm: u64 = frame_gpu(&s, clear, 32 as u32, &en)
+        var c: Cmp = Cmp { diff_px: 0 as u64, big_px: 0 as u64, max_diff: 0 as u32, cov_cpu: 0 as u64, cov_gpu: 0 as u64, psnr_x100: 0 as u64 }
+        compare(pc, pm, n, clear, &c)
+        var d2: u64 = 0 as u64
+        i = 0
+        while i < n {
+            if rt.ld32(plain, i) != rt.ld32(pm, i) { d2 = d2 + 1 as u64 }
+            i = i + 1
+        }
+        io.fmt_print(f"scene msaa samples={ms} edge_px_changed={d2} ")
+        report(&s, "msaa-vs-cpu", &c, c.psnr_x100 >= MIN_PSNR_X100 && d2 > 0 as u64)
+        gl_mc.glbe_set_msaa(&s.gb, 0)
+    }
+    if windowed {
+        // window path: the frame goes FBO texture -> window framebuffer (no read back on the way), read back from the window here
+        var sh: glshow.Show = glshow.show_new()
+        if !glshow.show_init(&sh, gl_mc.glbe_gl(&s.gb)) {
+            io.print("show_init failed\n")
+            return 6
+        }
+        set_fog(&s, true)
+        let fl: u32 = (1 | 4 | 8 | 16 | 32) as u32
+        let pc: u64 = copy_px(frame_cpu(&s, clear, fl, &en), n)
+        gpu_draw(&s, clear, fl, &en)
+        gl_scene.scene_present_window(&s.sc, &sh, W, H)
+        let rb: u64 = rt.heap_alloc(n * 4)
+        let tmp: u64 = rt.heap_alloc(n * 4)
+        gl33.gl_read_rgba_top_down(gl_mc.glbe_gl(&s.gb), W, H, rb, tmp)
+        glwindow.swap(&win)
+        var c: Cmp = Cmp { diff_px: 0 as u64, big_px: 0 as u64, max_diff: 0 as u32, cov_cpu: 0 as u64, cov_gpu: 0 as u64, psnr_x100: 0 as u64 }
+        // the window read back has alpha 255 like the CPU frame
+        compare(pc, rb, n, clear, &c)
+        report(&s, "window-vs-cpu", &c, c.psnr_x100 >= MIN_PSNR_X100 && c.cov_gpu > 0 as u64)
+    }
+    gl_scene.scene_close(&s.sc)
+    if s.fails > 0 {
+        io.fmt_print(f"FAILED: {s.fails}\n")
+        return 3
+    }
+    io.print("scene layer: all ok\n")
+    return 0
+}
