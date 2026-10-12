@@ -1981,6 +1981,8 @@ if [ "$RAWINRC" -eq 0 ]; then
 else
     bad "tools/input/read_run.sh failed (see .test-work/rawinput.log)"
     grep -E 'FAIL' "$WORK/rawinput.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 122. lib/gpu building blocks: gl_ext/gl_prog/gl_tex/gl_fbo/gl_query on llvmpipe + gpu.cull vs brute force (tools/gpu/ext/run.sh, docs/GPU.md) =="
 # Shader program + uniform cache + UBO + instancing + multi indirect + timer queries + mipmaps/aniso/atlas bleed + MRT/MSAA; CPU culling
 # (frustum, far origin, Hi-Z occlusion) against sampled references. Mesa llvmpipe only; no libEGL is SKIP for the GL half.
