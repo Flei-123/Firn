@@ -35,15 +35,15 @@ fi
 # LESSON from rounds 35/45/46: never reuse a binary just because
 # it exists. If `firnc0` or a source is younger, `.firnc1` is rebuilt
 # -- otherwise this run measures a compiler that no longer exists.
-neu_bauen=0
-[ -x "$FC1" ] || neu_bauen=1
+rebuild=0
+[ -x "$FC1" ] || rebuild=1
 if [ -x "$FC1" ]; then
-    [ "$FIRNC" -nt "$FC1" ] && neu_bauen=1
+    [ "$FIRNC" -nt "$FC1" ] && rebuild=1
     while IFS= read -r q; do
-        [ "$q" -nt "$FC1" ] && { neu_bauen=1; break; }
+        [ "$q" -nt "$FC1" ] && { rebuild=1; break; }
     done < <(find bin lib -name '*.fi' -not -type l)
 fi
-if [ "$neu_bauen" -eq 1 ]; then
+if [ "$rebuild" -eq 1 ]; then
     "$FIRNC" bin/firnc1.fi -o "$FC1" || { echo "firnc1 cannot be built"; exit 1; }
 fi
 
@@ -201,15 +201,15 @@ expect_error foreign "package 'secret' is not a dependency of package 'app'"
 # --- 7: package cycle ----------------------------------------------------
 
 check "a package cycle is reported"
-P=$(kopie f_zyklus)
+P=$(kopie f_cycle)
 printf 'needs app ../app\n' >> "$P/geo/firn.package"
-beide cycle --package "$P/app" -o "$WORK/f_zyklus.bin"
+beide cycle --package "$P/app" -o "$WORK/f_cycle.bin"
 expect_error cycle "package cycle: app -> geo -> app"
 
 # --- 8: dependency without a manifest ------------------------------------
 
 check "a dependency without a manifest is reported"
-P=$(kopie f_kein_manifest)
+P=$(kopie f_no_manifest)
 rm -f "$P/geo/firn.package"
 beide nomanifest --package "$P/app" -o "$WORK/f_km.bin"
 expect_error nomanifest "dependency 'geo' has no manifest"
@@ -233,7 +233,7 @@ expect_error version "invalid version '0.2' (expected number.number.number)"
 # --- 11: unknown key -----------------------------------------------------
 
 check "unknown key in the manifest"
-P=$(kopie f_schluessel)
+P=$(kopie f_key)
 sed -i 's/^public  *geo dot$/publi   geo dot/' "$P/geo/firn.package"
 beide schluessel --package "$P/app" -o "$WORK/f_sch.bin"
 expect_error schluessel "unknown key 'publi'"
@@ -241,7 +241,7 @@ expect_error schluessel "unknown key 'publi'"
 # --- 12: missing mandatory line ------------------------------------------
 
 check "manifest without a 'package' line"
-P=$(kopie f_ohne_paket)
+P=$(kopie f_no_package)
 sed -i 's/^package  *app$//' "$P/app/firn.package"
 beide ohnepaket --package "$P/app" -o "$WORK/f_op.bin"
 expect_error ohnepaket "the manifest needs a line 'package <name>'"
@@ -351,7 +351,7 @@ fi
 # --- 19: the manifest is found UPWARDS from the source file --------------
 
 check "the manifest is found upwards even without --package"
-P=$(kopie f_aufwaerts)
+P=$(kopie f_upwards)
 "$FIRNC" "$P/app/src/main.fi" -o "$WORK/f_auf0.bin" >/dev/null 2>&1
 r0=$?
 "$FC1" "$P/app/src/main.fi" -o "$WORK/f_auf1.bin" >/dev/null 2>&1

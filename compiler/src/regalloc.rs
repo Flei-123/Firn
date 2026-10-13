@@ -2121,7 +2121,7 @@ pub fn allocate(f: &Func) -> Alloc {
             continue;
         }
         if fconst.contains_key(&(v as Val)) {
-            continue; // steht in `.rodata`, braucht kein Register (fpool.rs)
+            continue; // lives in `.rodata`, needs no register (fpool.rs)
         }
         if start[v] == usize::MAX || f.is_secret(v as Val) {
             continue;

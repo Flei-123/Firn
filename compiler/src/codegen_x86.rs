@@ -730,7 +730,7 @@ fn vexify(s: &str) -> Option<String> {
         None => (s, ""),
     };
     if mn.starts_with('v') {
-        return None; // schon VEX (die Rechnung schreibt sie selbst)
+        return None; // already VEX (the computation writes it itself)
     }
     let ops: Vec<&str> = rest.split(", ").map(|x| x.trim()).collect();
     let is_reg = |o: &str| o.starts_with("xmm");
