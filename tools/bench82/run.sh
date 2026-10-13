@@ -193,16 +193,47 @@ echo
 
 # --------------------------------------------- 5. the compiler on itself
 echo "== the compiler on itself =="
-if "$FIRNC" --timings --opt-level=release-fast -o "$W/self.bin" bin/firnc1.fi \
-        2>"$W/timings.txt" >/dev/null; then
+# Measured as CPU TIME of the compiler process (user+system, getrusage), not as
+# wall time: on a shared machine the wall clock also counts every moment the
+# process waited for a core. The remaining speed of the machine is divided out
+# by a reference (below), so the limit is a RATIO and not a number of ms.
+SELF_MS=$(python3 - "$FIRNC" "$W/self.bin" "$W/timings.txt" <<'PY'
+import resource, subprocess, sys
+firnc, out, timings = sys.argv[1:4]
+def cpu_ms():
+    r = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return (r.ru_utime + r.ru_stime) * 1000.0
+before = cpu_ms()
+with open(timings, "w") as err:
+    rc = subprocess.run([firnc, "--timings", "--opt-level=release-fast", "-o", out,
+                         "bin/firnc1.fi"], stdout=subprocess.DEVNULL, stderr=err).returncode
+print("%.0f" % (cpu_ms() - before) if rc == 0 else "999999")
+PY
+)
+if [ "$SELF_MS" != "999999" ]; then
     grep -E '^  ' "$W/timings.txt" | head -14
-    SELF_MS=$(grep -E '^total ' "$W/timings.txt" | awk '{print $2}')
-    echo "  total: ${SELF_MS} ms for bin/firnc1.fi (30,643 lines of Firn)"
+    echo "  cpu time: ${SELF_MS} ms for bin/firnc1.fi"
 else
     report "firnc --timings over bin/firnc1.fi"
-    SELF_MS=999999
-    cat "$W/timings.txt" | head -5
+    head -5 "$W/timings.txt"
 fi
+# The reference: a fixed pure-Python loop, CPU time, best of five. It slows down
+# with the machine (busy neighbours, SMT, frequency) exactly like the compiler,
+# but does not depend on the compiler, so a slower compiler still shows.
+REF_MS=$(python3 - <<'PY'
+import resource, subprocess, sys
+def cpu_ms():
+    r = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return (r.ru_utime + r.ru_stime) * 1000.0
+best = 1e12
+for _ in range(5):
+    b = cpu_ms()
+    subprocess.run([sys.executable, "-c", "x=0\nfor i in range(8000000): x=(x*31+i)&0xffffffff"])
+    best = min(best, cpu_ms() - b)
+print("%.0f" % best)
+PY
+)
+echo "  reference loop: ${REF_MS} ms cpu"
 echo
 
 # ------------------------------------------------------- 6. the limits
@@ -232,25 +263,18 @@ limit minquota_aes_dec.txt  "$AESD" "AES-CBC dec"
 limit minquota_cfb8.txt     "$CFB"  "AES-CFB8"
 limit minquota_deflate.txt  "$DEF"  "DEFLATE -6"
 
-# The self compile is a CEILING, not a floor: it must not get slower.
-if [ -f tools/bench82/maxquota_self_ms.txt ]; then
-    MAXSELF=$(cat tools/bench82/maxquota_self_ms.txt)
-    # The ceiling is wall time on a shared machine: scale it with the load
-    # (1-minute average per core), so that a busy server does not look like a
-    # slower compiler. An idle machine keeps the ceiling as it is.
-    MAXSELF=$(python3 - "$MAXSELF" "$(cut -d' ' -f1 /proc/loadavg)" "$(nproc)" <<'PY'
+# The self compile is a CEILING on the RATIO self-compile CPU time / reference
+# CPU time (tools/bench82/maxquota_self_ratio.txt): it must not get slower, and
+# it does not care how busy the machine is (README_QUOTAS.md).
+if [ -f tools/bench82/maxquota_self_ratio.txt ]; then
+    MAXRATIO=$(cat tools/bench82/maxquota_self_ratio.txt)
+    python3 - "$SELF_MS" "$REF_MS" "$MAXRATIO" <<'PY'
 import sys
-mx, load, cores = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
-print(int(mx * max(1.0, 1.0 + load / cores)))
-PY
-)
-    echo "  (ceiling for this load: $MAXSELF ms)"
-    python3 - "$SELF_MS" "$MAXSELF" <<'PY'
-import sys
-got, mx = float(sys.argv[1]), float(sys.argv[2])
-if got > mx:
-    print("  %-16s %8.0f ms  ABOVE THE LIMIT %.0f ms" % ("self compile", got, mx)); sys.exit(1)
-print("  %-16s %8.0f ms  <= %.0f ms  ok" % ("self compile", got, mx))
+got, ref, mx = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
+ratio = got / ref if ref > 0 else 1e9
+if ratio > mx:
+    print("  %-16s %8.2f x reference  ABOVE THE LIMIT %.2f" % ("self compile", ratio, mx)); sys.exit(1)
+print("  %-16s %8.2f x reference  <= %.2f  ok" % ("self compile", ratio, mx))
 PY
     [ $? -eq 0 ] || report "the self compile got slower"
 fi
