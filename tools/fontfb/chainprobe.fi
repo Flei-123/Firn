@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fontfb/chainprobe.fi -- font chain probe for the image / run tests.
+//   chainprobe seg   <font>... -- <text>           "run <off> <len> <font>" lines, "width <px*1000>" at 100 px
+//   chainprobe paint <px> <W> <H> <x0> <base> <bg> <font>... -- <text>
+//       paints the chain into a W x H buffer filled with the colour <bg> (0xAABBGGRR, decimal) and
+//       writes the raw buffer (R G B A per pixel) to standard output
+//   chainprobe glyph <font> <cp> <px> <W> <H> <x0> <base> <bg>
+//       paints ONE bitmap glyph (cbdt only) the same way
+// A <font> is a path, or "e:<path>" for a K_EMOJI font. Text colour is opaque black.
+import std.rt
+import font.ttf
+import font.cbdt
+import font.fallback
+
+fn word(o: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(o, s.p as u64, s.n)
+}
+
+fn num(start: u64, i: usize) -> u64 {
+    let p: u64 = rt.arg_ptr(start, i)
+    let n: usize = rt.c_length(p)
+    var v: u64 = 0
+    var k: usize = 0
+    while k < n {
+        v = v * 10 + ((rt.ld8(p, k) as u64) - 48)
+        k = k + 1
+    }
+    return v
+}
+
+fn is_dash(start: u64, i: usize) -> bool {
+    let p: u64 = rt.arg_ptr(start, i)
+    return rt.c_length(p) == 2 && rt.ld8(p, 0) == 45 as u8 && rt.ld8(p, 1) == 45 as u8
+}
+
+fn load(path: u64, f: *mut ttf.Font) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    if !rt.read_file(path, &b) {
+        return false
+    }
+    return ttf.font_init(f, b.ptr as *mut u8, b.len)
+}
+
+fn fill(w: i32, h: i32, bg: u32) -> u64 {
+    let pix: u64 = rt.heap_alloc((w as usize) * (h as usize) * 4)
+    var q: usize = 0
+    while q < (w as usize) * (h as usize) {
+        rt.st32(pix, q, bg)
+        q = q + 1
+    }
+    return pix
+}
+
+fn main(start: u64) -> i32 {
+    let mode: u64 = rt.arg_ptr(start, 1)
+    let m0: u8 = rt.ld8(mode, 0)
+    var out: rt.Buf = rt.buf_new()
+    if m0 == 103 as u8 { // glyph
+        var f: ttf.Font = ttf.font_new()
+        if !load(rt.arg_ptr(start, 2), &f) {
+            return 2
+        }
+        let cp: u32 = num(start, 3) as u32
+        let px: f64 = num(start, 4) as f64
+        let w: i32 = num(start, 5) as i32
+        let h: i32 = num(start, 6) as i32
+        let x0: f64 = num(start, 7) as f64
+        let base: f64 = num(start, 8) as f64
+        let pix: u64 = fill(w, h, num(start, 9) as u32)
+        let k: usize = cbdt.cbdt_pick(&f, px)
+        if k == cbdt.CB_NONE || !cbdt.cbdt_paint(&f, k, ttf.font_glyph_for(&f, cp), px, x0, base, pix, w, h) {
+            return 3
+        }
+        rt.write_everything(1, pix, (w as usize) * (h as usize) * 4)
+        return 0
+    }
+    var fonts: [ttf.Font; 6] = [ttf.font_new(); 6]
+    var c: fallback.Chain = fallback.chain_new()
+    var first: usize = 2
+    if m0 == 112 as u8 { // paint
+        first = 8
+    }
+    var i: usize = first
+    var nf: usize = 0
+    while !is_dash(start, i) {
+        var p: u64 = rt.arg_ptr(start, i)
+        var kind: u32 = fallback.K_LATIN
+        if rt.ld8(p, 0) == 101 as u8 && rt.ld8(p, 1) == 58 as u8 {
+            kind = fallback.K_EMOJI
+            p = p + 2
+        }
+        if nf >= 6 || !load(p, &fonts[nf]) {
+            return 2
+        }
+        fallback.chain_add(&c, &fonts[nf], kind)
+        nf = nf + 1
+        i = i + 1
+    }
+    let tp: u64 = rt.arg_ptr(start, i + 1)
+    let tn: usize = rt.c_length(tp)
+    if m0 == 115 as u8 { // seg
+        var runs: [fallback.Run; 64] = [fallback.Run { off: 0, len: 0, font: 0 }; 64]
+        let nr: usize = fallback.chain_segment(&c, tp, tn, &runs, 64)
+        var r: usize = 0
+        while r < nr {
+            word(&out, "run ")
+            rt.buf_push_dec_u64(&out, runs[r].off as u64)
+            rt.buf_push(&out, 32 as u8)
+            rt.buf_push_dec_u64(&out, runs[r].len as u64)
+            rt.buf_push(&out, 32 as u8)
+            rt.buf_push_dec_u64(&out, runs[r].font as u64)
+            rt.buf_push(&out, 10 as u8)
+            r = r + 1
+        }
+        word(&out, "width ")
+        rt.buf_push_dec_u64(&out, (fallback.chain_width(&c, tp, tn, 100.0) * 1000.0 + 0.5) as u64)
+        rt.buf_push(&out, 10 as u8)
+        rt.write_everything(1, out.ptr, out.len)
+        return 0
+    }
+    let px: f64 = num(start, 2) as f64
+    let w: i32 = num(start, 3) as i32
+    let h: i32 = num(start, 4) as i32
+    let x0: f64 = num(start, 5) as f64
+    let base: f64 = num(start, 6) as f64
+    let pix: u64 = fill(w, h, num(start, 7) as u32)
+    var cx: fallback.PaintCtx = fallback.ctx_new()
+    fallback.chain_paint(&cx, &c, tp, tn, px, x0, base, 0xFF000000 as u32, 0 as u32, pix, w, h)
+    rt.write_everything(1, pix, (w as usize) * (h as usize) * 4)
+    return 0
+}
