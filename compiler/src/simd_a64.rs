@@ -208,6 +208,23 @@ fn bin(e: &mut Emitter, fr: &Frame, mn: &str, sfx: &str, d: Val, a: Val, b: Val)
     vstore(e, fr, d, VR);
 }
 
+/// A one-operand `.4s` instruction (`fsqrt`, `frecpe`, `frsqrte`).
+fn un4s(e: &mut Emitter, fr: &Frame, mn: &str, d: Val, a: Val) {
+    vload(e, fr, VA, a);
+    e.line(&format!("{} {}.4s, {}.4s", mn, VR, VA));
+    vstore(e, fr, d, VR);
+}
+
+/// Narrow two vectors into one (`sqxtn` + `sqxtn2`): `a` fills the low half, `b` the high half.
+/// `lo` = arrangement of the low result, `full` = of the whole result, `src` = of the sources.
+fn narrow2(e: &mut Emitter, fr: &Frame, mn: &str, lo: &str, full: &str, src: &str, d: Val, a: Val, b: Val) {
+    vload(e, fr, VA, a);
+    vload(e, fr, VB, b);
+    e.line(&format!("{} {}.{}, {}.{}", mn, VR, lo, VA, src));
+    e.line(&format!("{}2 {}.{}, {}.{}", mn, VR, full, VB, src));
+    vstore(e, fr, d, VR);
+}
+
 /// A shift by an immediate at the element width `sfx`. `ushr` cannot encode
 /// a shift of zero (its range is 1..=width), so that case is a move — which
 /// is what x86's `psrld xmm, 0` does as well.
@@ -481,6 +498,83 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
         SimdKind::MulLo32 => bin(e, fr, "mul", "4s", need(dst)?, args[0], args[1]),
         SimdKind::AddSatU8 => bin(e, fr, "uqadd", "16b", need(dst)?, args[0], args[1]),
         SimdKind::SubSatU8 => bin(e, fr, "uqsub", "16b", need(dst)?, args[0], args[1]),
+        // --- G6 (way E) ---------------------------------------------------
+        SimdKind::SqrtF32 => un4s(e, fr, "fsqrt", need(dst)?, args[0]),
+        // Estimates: NEON gives ~8 bit, x86 ~12 bit. Not bit-equal across targets (documented).
+        SimdKind::RcpF32 => un4s(e, fr, "frecpe", need(dst)?, args[0]),
+        SimdKind::RsqrtF32 => un4s(e, fr, "frsqrte", need(dst)?, args[0]),
+        // `shufps(a, b, imm)`: lanes 0,1 pick from `a`, lanes 2,3 from `b`. Two `tbl` (an index >= 16 gives
+        // zero) and an `orr`.
+        SimdKind::ShufF32 => {
+            let d = need(dst)?;
+            let mut ia = [0xffu8; 16];
+            let mut ib = [0xffu8; 16];
+            for lane in 0..4usize {
+                let src = ((imm >> (2 * lane)) & 3) as u8;
+                let t = if lane < 2 { &mut ia } else { &mut ib };
+                for b in 0..4usize {
+                    t[4 * lane + b] = 4 * src + b as u8;
+                }
+            }
+            vload(e, fr, VA, args[0]);
+            vload(e, fr, VB, args[1]);
+            let (lo, hi) = bytes128(&ia);
+            vconst(e, VT, lo, hi);
+            e.line(&format!("tbl {}, {{{}}}, {}", b16(VR), b16(VA), b16(VT)));
+            let (lo, hi) = bytes128(&ib);
+            vconst(e, VT, lo, hi);
+            e.line(&format!("tbl {}, {{{}}}, {}", b16(VZ), b16(VB), b16(VT)));
+            e.line(&format!("orr {}, {}, {}", b16(VR), b16(VR), b16(VZ)));
+            vstore(e, fr, d, VR);
+        }
+        // `movmskps`: sign bit of each f32 lane -> bits 0..3. Shift the sign down, weigh by 1,2,4,8, add across.
+        SimdKind::MoveMaskF32 => {
+            let d = need(dst)?;
+            vload(e, fr, VA, args[0]);
+            e.line(&format!("ushr {}.4s, {}.4s, #31", VT, VA));
+            vconst(e, VZ, 0x0000_0002_0000_0001, 0x0000_0008_0000_0004);
+            e.line(&format!("mul {}.4s, {}.4s, {}.4s", VT, VT, VZ));
+            e.line(&format!("addv s{}, {}.4s", &VR[1..], VT));
+            e.line(&format!("umov {}, {}.s[0]", w(A), VR));
+            store_dst(e, fr, d, A);
+        }
+        // `pmovmskb`: top bit of each byte -> bits 0..15. Per half: mask the bytes with 1,2,4..128, add across.
+        SimdKind::MoveMask8 => {
+            let d = need(dst)?;
+            vload(e, fr, VA, args[0]);
+            e.line(&format!("cmlt {}.16b, {}.16b, #0", VT, VA));
+            vconst(e, VZ, 0x8040_2010_0804_0201, 0x8040_2010_0804_0201);
+            e.line(&format!("and {}, {}, {}", b16(VT), b16(VT), b16(VZ)));
+            e.line(&format!("addv b{}, {}.8b", &VR[1..], VT));
+            e.line(&format!("umov {}, {}.b[0]", w(A), VR));
+            e.line(&format!("ext {}, {}, {}, #8", b16(VT), b16(VT), b16(VT)));
+            e.line(&format!("addv b{}, {}.8b", &VR[1..], VT));
+            e.line(&format!("umov {}, {}.b[0]", w(B), VR));
+            e.line(&format!("orr {}, {}, {}, lsl #8", w(A), w(A), w(B)));
+            store_dst(e, fr, d, A);
+        }
+        SimdKind::UnpackLo16 => bin(e, fr, "zip1", "8h", need(dst)?, args[0], args[1]),
+        SimdKind::UnpackHi16 => bin(e, fr, "zip2", "8h", need(dst)?, args[0], args[1]),
+        // `packssdw` / `packusdw` / `packsswb`: `a` in the low half, `b` in the high half, saturating.
+        SimdKind::Packs32 => narrow2(e, fr, "sqxtn", "4h", "8h", "4s", need(dst)?, args[0], args[1]),
+        SimdKind::Packus32 => narrow2(e, fr, "sqxtun", "4h", "8h", "4s", need(dst)?, args[0], args[1]),
+        SimdKind::Packs16 => narrow2(e, fr, "sqxtn", "8b", "16b", "8h", need(dst)?, args[0], args[1]),
+        SimdKind::MinI16 => bin(e, fr, "smin", "8h", need(dst)?, args[0], args[1]),
+        SimdKind::MaxI16 => bin(e, fr, "smax", "8h", need(dst)?, args[0], args[1]),
+        SimdKind::MinI32 => bin(e, fr, "smin", "4s", need(dst)?, args[0], args[1]),
+        SimdKind::MaxI32 => bin(e, fr, "smax", "4s", need(dst)?, args[0], args[1]),
+        SimdKind::CmpEq8 => bin(e, fr, "cmeq", "16b", need(dst)?, args[0], args[1]),
+        SimdKind::CmpEq16 => bin(e, fr, "cmeq", "8h", need(dst)?, args[0], args[1]),
+        // `pmulhw`: high 16 bits of the signed 16x16 product. Widen both halves, take the odd 16-bit lanes.
+        SimdKind::MulHi16 => {
+            let d = need(dst)?;
+            vload(e, fr, VA, args[0]);
+            vload(e, fr, VB, args[1]);
+            e.line(&format!("smull {}.4s, {}.4h, {}.4h", VT, VA, VB));
+            e.line(&format!("smull2 {}.4s, {}.8h, {}.8h", VR, VA, VB));
+            e.line(&format!("uzp2 {}.8h, {}.8h, {}.8h", VR, VT, VR));
+            vstore(e, fr, d, VR);
+        }
         SimdKind::UnpackLo32 => bin(e, fr, "zip1", "4s", need(dst)?, args[0], args[1]),
         SimdKind::UnpackHi32 => bin(e, fr, "zip2", "4s", need(dst)?, args[0], args[1]),
         SimdKind::UnpackLo64 => bin(e, fr, "zip1", "2d", need(dst)?, args[0], args[1]),

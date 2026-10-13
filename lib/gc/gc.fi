@@ -4167,6 +4167,9 @@ const FT_FREIN: u64 = 240
 const FT_DETACH: u64 = 248
 // Why the last `thread_start` of THIS thread returned 0 (THREAD_ERR_*).
 const FT_ERR: u64 = 256
+// 1 = a HOST thread (a pthread of the program that loaded the shared object) registered by
+// `thread_attach`: it has no stack of ours and its end is `thread_host_detach`, not `__thread_entry`.
+const FT_HOST: u64 = 264
 const FT_BYTES: u64 = 512
 
 // The number of entries of the thread table (the main thread holds entry 0,
@@ -4674,6 +4677,7 @@ fn thread_start(kind: u64, arg: u64) -> u64 {
     __gc_st64(tcb + FT_FREIN, 0)
     __gc_st64(tcb + FT_DETACH, 0)
     __gc_st64(tcb + FT_ERR, 0)
+    __gc_st64(tcb + FT_HOST, 0)
     var i: u64 = 0
     while i < 6 {
         __gc_st64(tcb + FT_REGS + i * 8, 0)
@@ -4710,6 +4714,143 @@ fn thread_start(kind: u64, arg: u64) -> u64 {
     }
     __thread_unlock(st + S_TSPERRE)
     return (tcb - __gc_ld64(st + S_THREAD_TAB)) / FT_BYTES
+}
+
+// ------------------------------------------------------------ Host threads
+//
+// A shared object (`firnc --shared`) is called by threads the Firn runtime did not create. The
+// FIRST of them that reaches the runtime becomes the main thread (entry 0, `thread_init`). Every
+// other host thread registers itself once with `thread_attach()` and leaves with
+// `thread_host_detach()` before it ends. `thread_attach` works with an empty `gs` (it is the call
+// that sets it): no access to the own thread block before the entry exists.
+//
+// HOST MODE: between two calls into the library the thread runs host code that never reaches a
+// safepoint, so it must count as BLOCKED (the collector scans its stack and does not wait for it).
+// `thread_attach` therefore returns in host mode, and every export brackets its work:
+//     thread_blocking_out()  ...  thread_blocking_an()
+// Exports without the bracket are only safe on a thread that is never idle in host code.
+//
+// Same lock as `thread_start` (S_TSPERRE), but a variant that never touches the thread block.
+fn __thread_lock_plain(a: u64) {
+    var c: u64 = __atomic_swap(a as *mut u64, 0, 1)
+    if c == 0 {
+        return
+    }
+    c = __thread_swap(a, 2)
+    while c != 0 {
+        __thread_futex_wait(a, 2)
+        c = __thread_swap(a, 2)
+    }
+}
+
+// Register the calling host thread. true = registered (or was already), the thread is in host mode.
+// false = table full, no stack bounds, no memory.
+fn thread_attach() -> bool {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_THREAD_TAB) == 0 {
+        // First user of the runtime: this thread becomes the main thread.
+        if !thread_init() {
+            return false
+        }
+        __thread_blocked_an()
+        return true
+    }
+    let tid: u64 = __thread_gettid()
+    let sp: u64 = __gc_sp_below(0)
+    let tab: u64 = __gc_ld64(st + S_THREAD_TAB)
+    __thread_lock_plain(st + S_TSPERRE)
+    let hi: u64 = __gc_ld64(st + S_THREAD_HI)
+    var i: u64 = 0
+    while i < hi {
+        let t: u64 = tab + i * FT_BYTES
+        let z: u64 = __gc_ld64(t + FT_STATE)
+        if z != Z_FREE && z != Z_DEAD && __gc_ld32(t + FT_TID) as u64 == tid {
+            __thread_unlock(st + S_TSPERRE)
+            return true
+        }
+        i = i + 1
+    }
+    var bottom: u64 = __gc_stack_bottom_maps(sp)
+    if bottom == 0 || bottom <= sp {
+        __thread_unlock(st + S_TSPERRE)
+        return false
+    }
+    let tcb: u64 = __thread_slot_new(st)
+    if tcb == 0 {
+        __thread_unlock(st + S_TSPERRE)
+        return false
+    }
+    __gc_st64(tcb + FT_SELF, tcb)
+    __gc_st64(tcb + FT_STACK, 0)
+    __gc_st64(tcb + FT_STAPELN, 0)
+    __gc_st64(tcb + FT_BOTTOM, bottom)
+    __gc_st64(tcb + FT_SP, sp)
+    __gc_st64(tcb + FT_ARG, 0)
+    __gc_st64(tcb + FT_KIND, 0)
+    __gc_st64(tcb + FT_RES, 0)
+    __gc_st64(tcb + FT_TID, tid)
+    __gc_st64(tcb + FT_FREIN, 0)
+    __gc_st64(tcb + FT_DETACH, 0)
+    __gc_st64(tcb + FT_ERR, 0)
+    __gc_st64(tcb + FT_HOST, 1)
+    var r: u64 = 0
+    while r < 6 {
+        __gc_st64(tcb + FT_REGS + r * 8, 0)
+        r = r + 1
+    }
+    var k: u64 = 0
+    while k < CLASSES {
+        __gc_st64(tcb + FT_FREE + k * 8, 0)
+        k = k + 1
+    }
+    // Host mode from the first moment: a collection may scan [sp, bottom) right away.
+    __gc_st64(tcb + FT_STATE, Z_BLOCKED)
+    __atomic_add((st + S_THREAD_N) as *mut u64, 1)
+    __gc_st64(st + S_THREAD_TOTAL, __gc_ld64(st + S_THREAD_TOTAL) + 1)
+    __gc_st64(st + S_MULTI, 1)
+    // The thread block base of THIS thread (gs in a shared object, see compiler/src/thread.rs).
+    syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, tcb as i64, 0, 0, 0, 0)
+    __thread_unlock(st + S_TSPERRE)
+    return true
+}
+
+// The calling host thread leaves the runtime for good (call it before the thread ends). Its free
+// lists go back, the entry is recycled by the next `thread_attach`/`thread_start`, `gs` is cleared
+// again. false = the thread was not attached (the main thread cannot detach: it must outlive the
+// others, its stack is the one the collector knows from `gc_init`).
+fn thread_host_detach() -> bool {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_THREAD_TAB)
+    if tab == 0 {
+        return false
+    }
+    let tid: u64 = __thread_gettid()
+    var tcb: u64 = 0
+    var i: u64 = 1
+    let hi: u64 = __gc_ld64(st + S_THREAD_HI)
+    while i < hi {
+        let t: u64 = tab + i * FT_BYTES
+        let z: u64 = __gc_ld64(t + FT_STATE)
+        if z != Z_FREE && z != Z_DEAD && __gc_ld64(t + FT_HOST) == 1 && __gc_ld32(t + FT_TID) as u64 == tid {
+            tcb = t
+        }
+        i = i + 1
+    }
+    if tcb == 0 {
+        return false
+    }
+    // Running again first: the lists are touched, and a collection that runs now would dissolve
+    // them too (it only skips the lists of threads it waited for).
+    __thread_blocked_out()
+    __thread_lists_back(tcb)
+    __gc_st64(tcb + FT_RES, 0)
+    __gc_st64(tcb + FT_HOST, 0)
+    __gc_st64(tcb + FT_TID, 0)
+    __gc_st64(tcb + FT_DETACH, 1)
+    syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, 0, 0, 0, 0, 0)
+    __gc_st64(tcb + FT_STATE, Z_DEAD)
+    __atomic_add((st + S_THREAD_N) as *mut u64, THREAD_MINUS1)
+    return true
 }
 
 // The entry point the child calls out of the `clone` sequence

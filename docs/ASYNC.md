@@ -197,6 +197,6 @@ build level; 2122 takes 17 s of the `--no-opt` level).
   sees the read that returns 0.
 * `EV_ET` (EPOLLET): edge triggered, epoll backend only. The poll backend masks the bit away and stays level
   (check `is_epoll`). With ET the callback must drain until EAGAIN.
-* `tests/2867_async_epoll_flags.fi`; `tools/net/epoll.sh` diffs its output against Python `select.epoll` /
+* `tests/2870_async_epoll_flags.fi`; `tools/net/epoll.sh` diffs its output against Python `select.epoll` /
   `select.poll` (12 lines, 3 build stages). Loopback TCP only.
 * Capturing closures as callbacks: `async.fnpin` keeps the closure record alive (see docs/CLOSURES.md).

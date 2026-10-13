@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MPL-2.0
-"""Reference output for tests/2867_async_epoll_flags.fi: the same scenarios
+"""Reference output for tests/2870_async_epoll_flags.fi: the same scenarios
 with Python's select.epoll and select.poll over loopback. The kernel is the
 judge; both sides must print the same lines."""
 import select, socket, sys

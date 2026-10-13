@@ -1724,6 +1724,20 @@ fn sse_table(m: &str) -> Option<(u8, u8, u8, SseForm)> {
         "punpckhdq" => (0x66, 0, 0x6A, Rm),
         "punpcklqdq" => (0x66, 0, 0x6C, Rm),
         "punpckhqdq" => (0x66, 0, 0x6D, Rm),
+        "rcpps" => (0x00, 0, 0x53, Rm),
+        "rsqrtps" => (0x00, 0, 0x52, Rm),
+        "movmskps" => (0x00, 0, 0x50, Rm),
+        "pmovmskb" => (0x66, 0, 0xD7, Rm),
+        "punpcklwd" => (0x66, 0, 0x61, Rm),
+        "punpckhwd" => (0x66, 0, 0x69, Rm),
+        "packssdw" => (0x66, 0, 0x6B, Rm),
+        "packsswb" => (0x66, 0, 0x63, Rm),
+        "pminsw" => (0x66, 0, 0xEA, Rm),
+        "pmaxsw" => (0x66, 0, 0xEE, Rm),
+        "pminsd" => (0x66, 0x38, 0x39, Rm),
+        "pmaxsd" => (0x66, 0x38, 0x3D, Rm),
+        "pcmpeqw" => (0x66, 0, 0x75, Rm),
+        "pmulhw" => (0x66, 0, 0xE5, Rm),
         "packusdw" => (0x66, 0x38, 0x2B, Rm),
         "pshufb" => (0x66, 0x38, 0x00, Rm),
         "ptest" => (0x66, 0x38, 0x17, Rm),
@@ -1901,6 +1915,37 @@ mod tests {
             ("psrlw xmm3, 8", "66 0f 71 d3 08"),
             ("paddw xmm1, xmm2", "66 0f fd ca"),
             ("psubw xmm9, xmm2", "66 44 0f f9 ca"),
+        ];
+        for (src, want) in cases {
+            assert_eq!(&text_of(src), want, "{}", src);
+        }
+    }
+
+    /// The G6 intrinsics (sqrt / rcp / rsqrt, movemask, 16/32-bit pack and unpack, min/max, cmpeq, mulhi);
+    /// octets from `as` + `objdump`.
+    #[test]
+    fn g6_simd_operations_match_as() {
+        let cases: &[(&str, &str)] = &[
+            ("sqrtps xmm1, xmm2", "0f 51 ca"),
+            ("rcpps xmm1, xmm2", "0f 53 ca"),
+            ("rsqrtps xmm8, xmm2", "44 0f 52 c2"),
+            ("shufps xmm1, xmm2, 0x1b", "0f c6 ca 1b"),
+            ("movmskps eax, xmm3", "0f 50 c3"),
+            ("movmskps eax, xmm9", "41 0f 50 c1"),
+            ("pmovmskb eax, xmm3", "66 0f d7 c3"),
+            ("pmovmskb ecx, xmm1", "66 0f d7 c9"),
+            ("punpcklwd xmm1, xmm2", "66 0f 61 ca"),
+            ("punpckhwd xmm8, xmm2", "66 44 0f 69 c2"),
+            ("packssdw xmm1, xmm2", "66 0f 6b ca"),
+            ("packsswb xmm1, xmm9", "66 41 0f 63 c9"),
+            ("packusdw xmm1, xmm2", "66 0f 38 2b ca"),
+            ("pminsw xmm1, xmm2", "66 0f ea ca"),
+            ("pmaxsw xmm3, xmm4", "66 0f ee dc"),
+            ("pminsd xmm1, xmm2", "66 0f 38 39 ca"),
+            ("pmaxsd xmm8, xmm1", "66 44 0f 38 3d c1"),
+            ("pcmpeqb xmm1, xmm2", "66 0f 74 ca"),
+            ("pcmpeqw xmm1, xmm2", "66 0f 75 ca"),
+            ("pmulhw xmm1, xmm2", "66 0f e5 ca"),
         ];
         for (src, want) in cases {
             assert_eq!(&text_of(src), want, "{}", src);

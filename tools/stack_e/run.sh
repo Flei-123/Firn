@@ -38,10 +38,28 @@ for lvl in dev-fast release-safe release-fast; do
     [ "$(probe 'l.se_gc_probe(3)')" = "1600 0 0" ] && echo "ok  GC on 4 threads in .so, ctypes ($lvl)" || { echo "FAIL GC probe in .so (ctypes)"; rc=1; }
     gcc -O1 -fstack-protector-all -pthread -o "$D/hostrt" tools/stack_e/host_rt.c -ldl || { echo "FAIL gcc host_rt"; rc=1; continue; }
     timeout 120 "$D/hostrt" "$D/librt.so" | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL host_rt ($lvl)"; rc=1; }
+    # G1b: several host threads call into the .so (thread_attach / thread_host_detach), C and ctypes
+    gcc -O1 -fstack-protector-all -pthread -o "$D/hostatt" tools/stack_e/host_attach.c -ldl || { echo "FAIL gcc host_attach"; rc=1; continue; }
+    timeout 120 "$D/hostatt" "$D/librt.so" | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL host_attach C ($lvl)"; rc=1; }
+    timeout 120 python3 -I tools/stack_e/host_attach.py "$D/librt.so" || { echo "FAIL host_attach ctypes ($lvl)"; rc=1; }
 done
 # the new v128 intrinsics, all stages
 for st in "--opt-level=dev-fast" "--opt-level=release-safe" "--opt-level=release-fast" "--opt-level=release-fast --asm-intern"; do
     "$FIRNC" $st -o "$D/t2860" tests/2860_simd_minmax.fi 2> "$D/err" && "$D/t2860" && echo "ok  tests/2860 $st" || { echo "FAIL tests/2860 $st"; head -3 "$D/err"; rc=1; }
+done
+# G6: sqrt/rcp/rsqrt, shufps, movemask, packs/unpacks, min/max, cmpeq, mulhi -- scalar reference tests (x86 all stages, NEON under qemu), numpy cross-check
+for t in tests/2870_simd_g6.fi tests/2871_std_simd.fi; do
+    for st in "--opt-level=dev-fast" "--opt-level=release-safe" "--opt-level=release-fast" "--opt-level=release-fast --asm-intern"; do
+        "$FIRNC" $st -o "$D/tg6" $t 2> "$D/err" && "$D/tg6" && echo "ok  $t $st" || { echo "FAIL $t $st"; head -3 "$D/err"; rc=1; }
+    done
+    if command -v qemu-aarch64 >/dev/null; then
+        for st in "--opt-level=dev-fast" "--opt-level=release-fast"; do
+            "$FIRNC" --target=aarch64-linux $st -o "$D/tg6a" $t 2> "$D/err" && qemu-aarch64 "$D/tg6a" && echo "ok  $t aarch64/qemu $st" || { echo "FAIL $t aarch64 $st"; head -3 "$D/err"; rc=1; }
+        done
+    fi
+done
+for lvl in dev-fast release-fast; do
+    "$FIRNC" --shared --opt-level=$lvl -o "$D/libsimd.so" tools/stack_e/lib_simd.fi && python3 -I tools/stack_e/host_simd.py "$D/libsimd.so" || { echo "FAIL host_simd ($lvl)"; rc=1; }
 done
 if "$FIRNC" --opt-level=release-fast -o "$D/sb" tools/stack_e/simd_bench.fi 2> "$D/err"; then "$D/sb" | sed 's/^/  /'; else echo "FAIL simd_bench"; rc=1; fi
 [ $rc = 0 ] && echo "RESULT stack_e: ok" || echo "RESULT stack_e: FAIL"
