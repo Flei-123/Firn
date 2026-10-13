@@ -1514,7 +1514,13 @@ impl<'a> Lower<'a> {
                 // the first place where an i32 meets an i64 parameter
                 // (`io.fmt_number`), and the upper half of the register has
                 // to be right for that.
-                if let (Some(pt), Some(at)) = (sig.params.get(i), scalar_fty(&t)) {
+                // r115: with a function value out of a field the receiver is
+                // not in `sig.params`, so the argument index is one ahead of
+                // the parameter index (the widening below picked the type of
+                // the NEXT parameter: a u32 went in as u64, and the wasm32
+                // call_indirect signature no longer matched the callee).
+                let pi = if skip_receiver { i - 1 } else { i };
+                if let (Some(pt), Some(at)) = (sig.params.get(pi), scalar_fty(&t)) {
                     if t.is_concrete_int() && pt.is_concrete_int() && pt.bits() > t.bits() {
                         if let Some(want) = scalar_fty(pt) {
                             if want != at {
