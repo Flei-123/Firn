@@ -88,7 +88,11 @@ try:
         line = p.stdout.readline().strip()
         dt = time.time() - t1
         (ok if line == "CLOSED" and dt < 1.0 else fail)("closing the window is seen at once (%s after %.0f ms)" % (line, dt * 1000))
-        rest = p.communicate(timeout=10)[0].split("\n")
+        # Read through the file object: readline() above may already have pulled the later lines
+        # (ROUNDS, DONE) into its buffer, and communicate() would not see that buffer (lost line
+        # under load).
+        rest = p.stdout.read().split("\n")
+        p.wait(timeout=10)
         rest = [x.strip() for x in rest if x.strip()]
         rounds = [x for x in rest if x.startswith("ROUNDS")]
         done = "DONE" in rest

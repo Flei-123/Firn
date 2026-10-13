@@ -32,12 +32,25 @@ skip() { echo "   SKIP: $1"; }
 start_xvfb() {
     DISP=""
     command -v Xvfb >/dev/null 2>&1 || return 0
-    local fifo="$D/disp.$1"
-    mkfifo "$fifo" 2>/dev/null || return 0
-    Xvfb -displayfd 3 -screen 0 800x600x24 -nolisten tcp 3>"$fifo" >/dev/null 2>&1 &
-    XPIDS="$XPIDS $!"
-    read -r -t 20 n <"$fifo" || n=""
-    [ -n "$n" ] && DISP=":$n"
+    local try fifo pid n
+    # -displayfd makes the server pick a free display number itself. Other
+    # runs on the same machine can still race for the lock file, so a server
+    # that dies right after start is retried with a fresh fifo (up to 3 times).
+    for try in 1 2 3; do
+        fifo="$D/disp.$1.$try"
+        mkfifo "$fifo" 2>/dev/null || return 0
+        Xvfb -displayfd 3 -screen 0 800x600x24 -nolisten tcp 3>"$fifo" >/dev/null 2>&1 &
+        pid=$!
+        XPIDS="$XPIDS $pid"
+        n=""
+        read -r -t 20 n <"$fifo" || n=""
+        if [ -n "$n" ] && kill -0 "$pid" 2>/dev/null; then
+            DISP=":$n"
+            return 0
+        fi
+        kill "$pid" 2>/dev/null
+        sleep 1
+    done
 }
 
 echo "-- Linux: libc and libm through dlopen / dlsym, four build levels"
