@@ -23,9 +23,9 @@ else
 fi
 python3 -I tools/mc/mesh/verify.py emit random50 3 "$W/b50.bin"
 python3 -I tools/mc/mesh/verify.py emit terrain 3 "$W/terrain.bin"
-for f in 2 3; do
+for f in 2 3 10 11; do
     for w in b50 terrain; do
-        echo "  metric $w flags=$f: $("$W/prog" bench "$W/$w.bin" $f 300)"
+        echo "  metric $w flags=$f: $("$W/prog" bench "$W/$w.bin" $f 300 "$W/$w.bin.l")"
     done
 done
 # counter-check: a damaged mesher must be caught -- patch the AO rule (darker corner) and expect a failure
@@ -38,6 +38,20 @@ if FIRNLIB="$W/badlib" $FIRNC -o "$W/prog_bad" tools/mc/mesh/prog.fi 2>/dev/null
     fi
 else
     echo "  FAIL  counter-check build"; ERR=1
+fi
+# counter-check 2: a damaged light rule (average rounds down instead of half up) must be caught as well
+cp lib/mc/mc_mesh.fi "$W/badlib/mc/mc_mesh.fi"
+sed -i 's/let sky: u32 = (ss \* 2 as u32 + n) \/ (n \* 2 as u32)/let sky: u32 = ss \/ n/' "$W/badlib/mc/mc_mesh.fi"
+if cmp -s lib/mc/mc_mesh.fi "$W/badlib/mc/mc_mesh.fi"; then
+    echo "  FAIL  counter-check 2: the damage did not apply"; ERR=1
+elif FIRNLIB="$W/badlib" $FIRNC -o "$W/prog_bad2" tools/mc/mesh/prog.fi 2>/dev/null; then
+    if python3 -I tools/mc/mesh/verify.py "$W/prog_bad2" "$W" > "$W/bad2.txt" 2>&1; then
+        echo "  FAIL  counter-check 2: a damaged light rule passed"; ERR=1
+    else
+        echo "  ok    counter-check: a damaged light rule is detected"
+    fi
+else
+    echo "  FAIL  counter-check 2 build"; ERR=1
 fi
 [ $ERR -eq 0 ] && echo "RESULT mc-mesh: ok" || echo "RESULT mc-mesh: FAIL"
 exit $ERR

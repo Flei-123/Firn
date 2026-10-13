@@ -13,7 +13,11 @@
 //      perspective correct u, v, ao (f64, fixed operation order), nearest texel from mc_texture's atlas
 //      (tile-local wrap, so greedy quads repeat), alpha < 128 = cutout (no write), shading, fog
 //   Shading (all integer): fq = floor(100 + 52 * ao) in 100..256, total = fq * face_k >> 8,
-//   channel = channel * total >> 8, face_k = 204 (-x +x) 128 (-y) 256 (+y) 153 (-z +z).
+//   channel = channel * total_c >> 8, face_k = 204 (-x +x) 128 (-y) 256 (+y) 153 (-z +z).
+//   LIGHT (vertex sky / block nibbles 0..15, interpolated perspective correct like ao, docs/mc/light.md):
+//   s256 = floor(sky * day / 15 + 0.5), b256 = floor(block * 256 / 15 + 0.5) (day 0..256, raster_set_light),
+//   per channel c: lum = max(s256, b256 * tint_c >> 8), lf_c = 24 + (lum * 232 >> 8), total_c = total * lf_c >> 8.
+//   sky 15 / block 0 / day 256 gives lf = 256: the image is the same as without light.
 //   Fog: t = clamp((z - start) / (end - start), 0, 1), f = floor(t * 256), colour = (c*(256-f) + fog*f) >> 8.
 //
 // The coverage rule makes the output a pure function of the inputs: same bits on every build stage,
@@ -34,7 +38,7 @@ import mc.mc_texture
 
 export {
     Raster, Stats, raster_new, raster_free, raster_clear, raster_set_camera, raster_set_atlas,
-    raster_set_fog, raster_set_cull, raster_draw_mesh, raster_draw_tri, raster_pixel,
+    raster_set_fog, raster_set_cull, raster_set_light, raster_draw_mesh, raster_draw_tri, raster_draw_tri8, VREC, raster_pixel,
     raster_hash, raster_hash_hex, raster_write_ppm, raster_write_png, raster_stats_reset,
     face_shade,
     backend_upload_atlas, backend_mesh_upload, backend_mesh_free, backend_begin, backend_draw,
@@ -75,16 +79,25 @@ struct Raster {
     fog_end: f64,
     fog_r: u32, fog_g: u32, fog_b: u32,
     cull: bool,
+    // light (raster_set_light)
+    day: i64, // sky light multiplier 0..256
+    tint_r: i64, tint_g: i64, tint_b: i64, // block light tint per channel 0..256
     // scratch
-    vbuf: u64, // f64 [vcap * 6]
+    vbuf: u64, // f64 [vcap * 8]
     vcap: usize,
-    pa: u64, // f64 [8 * 6] clip input
-    pb: u64, // f64 [8 * 6] clip output
+    pa: u64, // f64 [8 * 8] clip input
+    pb: u64, // f64 [8 * 8] clip output
+    pc: u64, // f64 [3 * 8] raster_draw_tri converts 6 f64 records here
     // mesh slots (backend_mesh_upload): SLOT_WORDS u64 per slot = verts, nverts, idx, nidx, used, key
     slots: u64,
     slot_cap: usize,
     st: Stats,
 }
+
+// Vertex record = VREC f64: view x, view y, view z, u, v (tile units), ao, sky, block.
+const VREC: usize = 8
+// Darkest light factor out of 256 (sky 0 and block 0): caves are dim, not black.
+const LIGHT_MIN: i64 = 24
 
 fn ldd(p: u64, i: usize) -> f64 {
     return *((p + (i as u64) * (8 as u64)) as *mut f64)
@@ -101,15 +114,17 @@ fn raster_new(w: i32, h: i32) -> Raster {
         fx: 0.0, fy: 0.0, fz: 1.0, near: 0.05, hw: 0.0, hh: 0.0, fpx: 1.0, fpy: 1.0,
         apx: 0, atile: 16, acols: 16, aw: 256,
         fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0 as u32, fog_g: 0 as u32, fog_b: 0 as u32,
-        cull: true, vbuf: 0, vcap: 0, pa: 0, pb: 0, slots: 0, slot_cap: 0,
+        cull: true, day: 256, tint_r: 256, tint_g: 224, tint_b: 176, vbuf: 0, vcap: 0, pa: 0, pb: 0, pc: 0,
+        slots: 0, slot_cap: 0,
         st: Stats { tris_in: 0 as u64, tris_drawn: 0 as u64, tris_culled: 0 as u64, tris_clipped: 0 as u64, pixels: 0 as u64 },
     }
     if w < 1 || h < 1 { return r }
     let n: usize = (w as usize) * (h as usize)
     r.color = rt.heap_alloc(n * 4)
     r.depth = rt.heap_alloc(n * 8)
-    r.pa = rt.heap_alloc(8 * 6 * 8)
-    r.pb = rt.heap_alloc(8 * 6 * 8)
+    r.pa = rt.heap_alloc(8 * VREC * 8)
+    r.pb = rt.heap_alloc(8 * VREC * 8)
+    r.pc = rt.heap_alloc(3 * VREC * 8)
     raster_clear(&r, 0xFF000000 as u32)
     return r
 }
@@ -119,10 +134,11 @@ fn raster_free(r: *mut Raster) {
         let n: usize = ((*r).w as usize) * ((*r).h as usize)
         rt.heap_free((*r).color, n * 4)
         rt.heap_free((*r).depth, n * 8)
-        rt.heap_free((*r).pa, 8 * 6 * 8)
-        rt.heap_free((*r).pb, 8 * 6 * 8)
+        rt.heap_free((*r).pa, 8 * VREC * 8)
+        rt.heap_free((*r).pb, 8 * VREC * 8)
+        rt.heap_free((*r).pc, 3 * VREC * 8)
     }
-    if (*r).vbuf != 0 { rt.heap_free((*r).vbuf, (*r).vcap * 6 * 8) }
+    if (*r).vbuf != 0 { rt.heap_free((*r).vbuf, (*r).vcap * VREC * 8) }
     if (*r).slots != 0 { rt.heap_free((*r).slots, (*r).slot_cap * SLOT_WORDS * 8) }
     (*r).color = 0
     (*r).depth = 0
@@ -181,6 +197,28 @@ fn raster_set_fog(r: *mut Raster, on: bool, start: f64, end: f64, rgb_r: u32, rg
     (*r).fog_b = rgb_b
 }
 
+// Light uniforms: day = sky light multiplier 0..256 (256 = full day, e.g. mc_sky.sky_light_day), tint = block
+// light colour multipliers per channel 0..256 (warm: 256 224 176).
+fn raster_set_light(r: *mut Raster, day: i32, tint_r: i32, tint_g: i32, tint_b: i32) {
+    (*r).day = clamp256(day as i64)
+    (*r).tint_r = clamp256(tint_r as i64)
+    (*r).tint_g = clamp256(tint_g as i64)
+    (*r).tint_b = clamp256(tint_b as i64)
+}
+
+fn clamp256(v: i64) -> i64 {
+    if v < 0 as i64 { return 0 as i64 }
+    if v > 256 as i64 { return 256 as i64 }
+    return v
+}
+
+// light factor 24..256 of one channel (see the header): s256 = sky part, bl = block part (0..256), tint 0..256
+fn light_factor(s256: i64, bl: i64, tint: i64) -> i64 {
+    var lum: i64 = (bl * tint) / 256 as i64
+    if s256 > lum { lum = s256 }
+    return LIGHT_MIN + (lum * (256 as i64 - LIGHT_MIN)) / 256 as i64
+}
+
 fn raster_set_cull(r: *mut Raster, on: bool) {
     (*r).cull = on
 }
@@ -200,7 +238,6 @@ fn face_shade(face: u32) -> u32 {
 
 // ---- triangle ------------------------------------------------------------------------
 
-// Vertex record = 6 f64 at address p: view x, view y, view z, u, v, ao (u, v in tile units).
 fn snap(v: f64) -> i64 {
     return math.floor(v * 16.0 + 0.5) as i64
 }
@@ -249,6 +286,12 @@ fn draw_clipped_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) 
     var oa: f64 = ldd(a, 5) * iz0
     var ob: f64 = ldd(b, 5) * iz1
     var oc: f64 = ldd(c, 5) * iz2
+    var ka: f64 = ldd(a, 6) * iz0
+    var kb: f64 = ldd(b, 6) * iz1
+    var kc: f64 = ldd(c, 6) * iz2
+    var la: f64 = ldd(a, 7) * iz0
+    var lb: f64 = ldd(b, 7) * iz1
+    var lc: f64 = ldd(c, 7) * iz2
     if area2 < 0 as i64 {
         let tx: i64 = bx
         let ty: i64 = by
@@ -268,6 +311,12 @@ fn draw_clipped_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) 
         let to: f64 = ob
         ob = oc
         oc = to
+        let tk: f64 = kb
+        kb = kc
+        kc = tk
+        let tl: f64 = lb
+        lb = lc
+        lc = tl
         area2 = 0 as i64 - area2
     }
     (*r).st.tris_drawn = (*r).st.tris_drawn + 1 as u64
@@ -319,6 +368,7 @@ fn draw_clipped_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) 
     let toy: i64 = trow * (tsz as i64)
     let aw: i64 = (*r).aw as i64
     let fogd: f64 = (*r).fog_end - (*r).fog_start
+    let dayf: f64 = (*r).day as f64
     var y: i64 = py0
     while y <= py1 {
         let pyf: i64 = y * 16 as i64 + 8 as i64
@@ -342,6 +392,8 @@ fn draw_clipped_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) 
                     let u: f64 = (f0 * ua + f1 * ub + f2 * uc) / sum
                     let v: f64 = (f0 * va + f1 * vb + f2 * vc) / sum
                     let ao: f64 = (f0 * oa + f1 * ob + f2 * oc) / sum
+                    let sk: f64 = (f0 * ka + f1 * kb + f2 * kc) / sum
+                    let bk: f64 = (f0 * la + f1 * lb + f2 * lc) / sum
                     let tx: i64 = (math.floor(u * tszf) as i64) & tmask
                     let ty: i64 = (math.floor(v * tszf) as i64) & tmask
                     let tp: u32 = rt.ld32((*r).apx, ((toy + ty) * aw + tox + tx) as usize)
@@ -350,9 +402,16 @@ fn draw_clipped_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) 
                         if fq < 0 as i64 { fq = 0 }
                         if fq > 256 as i64 { fq = 256 }
                         let total: i64 = (fq * (fk as i64)) / 256 as i64
-                        var cr: i64 = (((tp & 255 as u32) as i64) * total) / 256 as i64
-                        var cg: i64 = ((((tp >> 8 as u32) & 255 as u32) as i64) * total) / 256 as i64
-                        var cb: i64 = ((((tp >> 16 as u32) & 255 as u32) as i64) * total) / 256 as i64
+                        var s256: i64 = math.floor(sk * dayf / 15.0 + 0.5) as i64
+                        var b256: i64 = math.floor(bk * 256.0 / 15.0 + 0.5) as i64
+                        s256 = clamp256(s256)
+                        b256 = clamp256(b256)
+                        let tr: i64 = (total * light_factor(s256, b256, (*r).tint_r)) / 256 as i64
+                        let tg: i64 = (total * light_factor(s256, b256, (*r).tint_g)) / 256 as i64
+                        let tb: i64 = (total * light_factor(s256, b256, (*r).tint_b)) / 256 as i64
+                        var cr: i64 = (((tp & 255 as u32) as i64) * tr) / 256 as i64
+                        var cg: i64 = ((((tp >> 8 as u32) & 255 as u32) as i64) * tg) / 256 as i64
+                        var cb: i64 = ((((tp >> 16 as u32) & 255 as u32) as i64) * tb) / 256 as i64
                         if (*r).fog_on {
                             let z: f64 = 1.0 / zinv
                             var t: f64 = (z - (*r).fog_start) / fogd
@@ -381,15 +440,36 @@ fn draw_clipped_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) 
 
 fn copy_vtx(dst: u64, di: usize, src: u64, si: usize) {
     var k: usize = 0
-    while k < 6 {
-        stf(dst, di * 6 + k, ldd(src, si * 6 + k))
+    while k < VREC {
+        stf(dst, di * VREC + k, ldd(src, si * VREC + k))
         k = k + 1
     }
 }
 
-// Triangle from three view-space vertex records (6 f64 each, at addresses a, b, c). Clips against the
-// near plane, culls, rasterizes. `tile` = atlas tile, `fk` = face brightness (face_shade).
+// Triangle from three view-space vertex records of 6 f64 each (x y z u v ao, at addresses a, b, c): no
+// light attributes, the light is sky 15 / block 0. Clips against the near plane, culls, rasterizes.
+// `tile` = atlas tile, `fk` = face brightness (face_shade).
 fn raster_draw_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) {
+    let pc: u64 = (*r).pc
+    var i: usize = 0
+    while i < 3 {
+        var src: u64 = a
+        if i == 1 { src = b }
+        if i == 2 { src = c }
+        var k: usize = 0
+        while k < 6 {
+            stf(pc, i * VREC + k, ldd(src, k))
+            k = k + 1
+        }
+        stf(pc, i * VREC + 6, 15.0)
+        stf(pc, i * VREC + 7, 0.0)
+        i = i + 1
+    }
+    raster_draw_tri8(r, pc, pc + (VREC * 8) as u64, pc + (VREC * 16) as u64, tile, fk)
+}
+
+// Same with 8 f64 records (x y z u v ao sky block).
+fn raster_draw_tri8(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) {
     (*r).st.tris_in = (*r).st.tris_in + 1 as u64
     if tile == 0 as u32 { return }
     let near: f64 = (*r).near
@@ -415,8 +495,8 @@ fn raster_draw_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) {
     var i: usize = 0
     while i < 3 {
         let j: usize = (i + 1) % 3
-        let zi: f64 = ldd(pa, i * 6 + 2)
-        let zj: f64 = ldd(pa, j * 6 + 2)
+        let zi: f64 = ldd(pa, i * VREC + 2)
+        let zj: f64 = ldd(pa, j * VREC + 2)
         let ini: bool = zi >= near
         let inj: bool = zj >= near
         if ini {
@@ -426,22 +506,22 @@ fn raster_draw_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) {
         if ini != inj {
             let t: f64 = (near - zi) / (zj - zi)
             var k: usize = 0
-            while k < 6 {
-                let vi: f64 = ldd(pa, i * 6 + k)
-                let vj: f64 = ldd(pa, j * 6 + k)
-                stf(pb, n * 6 + k, vi + (vj - vi) * t)
+            while k < VREC {
+                let vi: f64 = ldd(pa, i * VREC + k)
+                let vj: f64 = ldd(pa, j * VREC + k)
+                stf(pb, n * VREC + k, vi + (vj - vi) * t)
                 k = k + 1
             }
-            stf(pb, n * 6 + 2, near)
+            stf(pb, n * VREC + 2, near)
             n = n + 1
         }
         i = i + 1
     }
     if n >= 3 {
-        draw_clipped_tri(r, pb, pb + (6 * 8) as u64, pb + (12 * 8) as u64, tile, fk)
+        draw_clipped_tri(r, pb, pb + (VREC * 8) as u64, pb + (VREC * 16) as u64, tile, fk)
     }
     if n >= 4 {
-        draw_clipped_tri(r, pb, pb + (12 * 8) as u64, pb + (18 * 8) as u64, tile, fk)
+        draw_clipped_tri(r, pb, pb + (VREC * 16) as u64, pb + (VREC * 24) as u64, tile, fk)
     }
 }
 
@@ -452,8 +532,8 @@ fn ensure_vbuf(r: *mut Raster, nverts: usize) {
     var cap: usize = (*r).vcap
     if cap < 256 { cap = 256 }
     while cap < nverts { cap = cap * 2 }
-    if (*r).vbuf != 0 { rt.heap_free((*r).vbuf, (*r).vcap * 6 * 8) }
-    (*r).vbuf = rt.heap_alloc(cap * 6 * 8)
+    if (*r).vbuf != 0 { rt.heap_free((*r).vbuf, (*r).vcap * VREC * 8) }
+    (*r).vbuf = rt.heap_alloc(cap * VREC * 8)
     (*r).vcap = cap
 }
 
@@ -473,12 +553,14 @@ fn raster_draw_mesh(r: *mut Raster, verts: u64, nverts: usize, idx: u64, nidx: u
         let rx: f64 = wx - (*r).cx
         let ry: f64 = wy - (*r).cy
         let rz: f64 = wz - (*r).cz
-        stf(vb, i * 6, rx * (*r).rx + ry * (*r).ry + rz * (*r).rz)
-        stf(vb, i * 6 + 1, rx * (*r).ux + ry * (*r).uy + rz * (*r).uz)
-        stf(vb, i * 6 + 2, rx * (*r).fx + ry * (*r).fy + rz * (*r).fz)
-        stf(vb, i * 6 + 3, ((w1 >> 16 as u32) & 255 as u32) as f64)
-        stf(vb, i * 6 + 4, ((w1 >> 24 as u32) & 255 as u32) as f64)
-        stf(vb, i * 6 + 5, ((w0 >> 27 as u32) & 3 as u32) as f64)
+        stf(vb, i * VREC, rx * (*r).rx + ry * (*r).ry + rz * (*r).rz)
+        stf(vb, i * VREC + 1, rx * (*r).ux + ry * (*r).uy + rz * (*r).uz)
+        stf(vb, i * VREC + 2, rx * (*r).fx + ry * (*r).fy + rz * (*r).fz)
+        stf(vb, i * VREC + 3, ((w1 >> 14 as u32) & 31 as u32) as f64)
+        stf(vb, i * VREC + 4, ((w1 >> 19 as u32) & 31 as u32) as f64)
+        stf(vb, i * VREC + 5, ((w0 >> 27 as u32) & 3 as u32) as f64)
+        stf(vb, i * VREC + 6, ((w1 >> 24 as u32) & 15 as u32) as f64)
+        stf(vb, i * VREC + 7, ((w1 >> 28 as u32) & 15 as u32) as f64)
         i = i + 1
     }
     var t: usize = 0
@@ -490,7 +572,8 @@ fn raster_draw_mesh(r: *mut Raster, verts: u64, nverts: usize, idx: u64, nidx: u
             let w0: u32 = rt.ld32(verts, i0 * 2)
             let w1: u32 = rt.ld32(verts, i0 * 2 + 1)
             let fk: u32 = face_shade((w0 >> 24 as u32) & 7 as u32)
-            raster_draw_tri(r, vb + (i0 * 48) as u64, vb + (i1 * 48) as u64, vb + (i2 * 48) as u64, w1 & 65535 as u32, fk)
+            raster_draw_tri8(r, vb + (i0 * VREC * 8) as u64, vb + (i1 * VREC * 8) as u64, vb + (i2 * VREC * 8) as u64,
+                w1 & 16383 as u32, fk)
         }
         t = t + 3
     }

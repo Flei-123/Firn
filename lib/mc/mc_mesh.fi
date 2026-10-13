@@ -21,16 +21,31 @@
 // OUTPUT (in the Mesher): 8 byte vertices + u32 indices (6 per quad).
 //   word0 = x | y<<8 | z<<16 | face<<24 | ao<<27     x,y,z = 0..16 (block units
 //                                                      inside the section)
-//   word1 = tile | u<<16 | v<<24                      u,v = 0..w / 0..h of the quad
-//                                                      (repeat the tile with them)
+//   word1 = tile | u<<14 | v<<19 | sky<<24 | block<<28
+//           tile  14 bit, 1..16383 (MAX_TILE; a larger id from the tables is clamped to
+//                 MAX_TILE; the GL texture array holds far fewer layers anyway:
+//                 GL_MAX_ARRAY_TEXTURE_LAYERS is 256 minimum, 2048 typical)
+//           u, v  5 bit, 0..w / 0..h of the quad (repeat the tile with them; a greedy
+//                 quad is at most 16 long, so 5 bit are enough)
+//           sky, block  4 bit each, 0..15: light of THIS corner (smooth lighting, see below)
+// The vertex stays 8 bytes (VBO bytes per section unchanged; a 12 byte format would
+// cost +50 % VBO for nothing, see docs/mc/light.md).
 // face: 0 -x, 1 +x, 2 -y, 3 +y, 4 -z, 5 +z. ao: 0..3, 3 = fully lit, 0 = darkest.
 // Vertex order of a quad (u axis = (axis+1)%3, v axis = (axis+2)%3): (0,0) (1,0)
 // (1,1) (0,1); front faces are counter-clockwise seen from outside. The quad is
 // split along the diagonal that joins the brighter pair of corners (anisotropy flip).
 //
+// LIGHT (F_LIGHT): the caller gives a padded light array next to the padded blocks
+// (mesh_padded_lit): u8 [5832], same index as the blocks, sky = high nibble, block = low
+// nibble. The light of a face corner = average of the non-opaque cells of the 2x2 cell
+// patch in FRONT of the face that touches the corner (front cell, the two side cells, the
+// diagonal cell; the diagonal is skipped when both side cells are opaque; unknown cells are
+// skipped), sky and block separately, rounded half up. AO stays a separate 2 bit value; the
+// shader multiplies both. Without F_LIGHT every corner is sky 15, block 0 (= the old look).
+//
 // MODES (flags): F_GREEDY merges equal faces into rectangles. Two faces merge when
-// tile and AO of all four corners are equal AND the AO is constant along the
-// direction of the merge (otherwise interpolation across the merged quad would
+// tile and AO AND LIGHT of all four corners are equal AND the corner value is constant along
+// the direction of the merge (otherwise interpolation across the merged quad would
 // shade differently from the single faces). Without F_GREEDY every visible face
 // is one 1x1 quad (the reference). F_AO computes AO; without it all ao = 3 and
 // merging is unrestricted. F_CULL_SAME hides the faces between two identical
@@ -41,15 +56,20 @@ import mc.mc_chunk
 
 export {
     MeshTables, Mesher,
-    F_GREEDY, F_AO, F_CULL_SAME, MISSING_AIR, MISSING_UNKNOWN, UNKNOWN_ID, MAX_QUADS,
-    mesher_new, mesher_free, mesh_section, mesh_padded, mesh_used_bytes,
-    vtx_x, vtx_y, vtx_z, vtx_face, vtx_ao, vtx_tile, vtx_u, vtx_v,
+    F_GREEDY, F_AO, F_CULL_SAME, F_LIGHT, MISSING_AIR, MISSING_UNKNOWN, UNKNOWN_ID, MAX_QUADS,
+    MAX_TILE, LIGHT_DEFAULT,
+    mesher_new, mesher_free, mesh_section, mesh_padded, mesh_padded_lit, mesh_used_bytes,
+    vtx_x, vtx_y, vtx_z, vtx_face, vtx_ao, vtx_tile, vtx_u, vtx_v, vtx_sky, vtx_block,
     section_pack, section_free,
 }
 
 const F_GREEDY: u32 = 1
 const F_AO: u32 = 2
 const F_CULL_SAME: u32 = 4
+const F_LIGHT: u32 = 8
+const MAX_TILE: u32 = 16383
+// Padded light byte of a cell nobody lit: full sky light, no block light.
+const LIGHT_DEFAULT: u8 = 240 as u8
 const MISSING_AIR: u32 = 0
 const MISSING_UNKNOWN: u32 = 1
 const UNKNOWN_ID: u16 = 65535
@@ -65,7 +85,8 @@ struct MeshTables {
 
 struct Mesher {
     pad: u64, // u16 [5832]
-    mask: u64, // u32 [256]
+    mask: u64, // u64 [256]
+    lpad: u64, // u8 [5832] padded light, sky << 4 | block
     verts: u64, // u32 [MAX_QUADS * 4 * 2]
     idx: u64, // u32 [MAX_QUADS * 6]
     nverts: u32,
@@ -75,10 +96,11 @@ struct Mesher {
 }
 
 fn mesher_new() -> Mesher {
-    var m: Mesher = Mesher { pad: 0, mask: 0, verts: 0, idx: 0, nverts: 0 as u32, nidx: 0 as u32,
+    var m: Mesher = Mesher { pad: 0, mask: 0, lpad: 0, verts: 0, idx: 0, nverts: 0 as u32, nidx: 0 as u32,
         nquads: 0 as u32, nfaces: 0 as u32 }
     m.pad = rt.heap_alloc(PADN * 2)
-    m.mask = rt.heap_alloc(256 * 4)
+    m.mask = rt.heap_alloc(256 * 8)
+    m.lpad = rt.heap_alloc(PADN)
     m.verts = rt.heap_alloc(MAX_QUADS * 4 * 8)
     m.idx = rt.heap_alloc(MAX_QUADS * 6 * 4)
     return m
@@ -86,11 +108,13 @@ fn mesher_new() -> Mesher {
 
 fn mesher_free(m: *mut Mesher) {
     rt.heap_free((*m).pad, PADN * 2)
-    rt.heap_free((*m).mask, 256 * 4)
+    rt.heap_free((*m).mask, 256 * 8)
+    rt.heap_free((*m).lpad, PADN)
     rt.heap_free((*m).verts, MAX_QUADS * 4 * 8)
     rt.heap_free((*m).idx, MAX_QUADS * 6 * 4)
     (*m).pad = 0
     (*m).mask = 0
+    (*m).lpad = 0
     (*m).verts = 0
     (*m).idx = 0
 }
@@ -106,9 +130,11 @@ fn vtx_y(w0: u32) -> u32 { return (w0 >> 8 as u32) & 255 as u32 }
 fn vtx_z(w0: u32) -> u32 { return (w0 >> 16 as u32) & 255 as u32 }
 fn vtx_face(w0: u32) -> u32 { return (w0 >> 24 as u32) & 7 as u32 }
 fn vtx_ao(w0: u32) -> u32 { return (w0 >> 27 as u32) & 3 as u32 }
-fn vtx_tile(w1: u32) -> u32 { return w1 & 65535 as u32 }
-fn vtx_u(w1: u32) -> u32 { return (w1 >> 16 as u32) & 255 as u32 }
-fn vtx_v(w1: u32) -> u32 { return (w1 >> 24 as u32) & 255 as u32 }
+fn vtx_tile(w1: u32) -> u32 { return w1 & 16383 as u32 }
+fn vtx_u(w1: u32) -> u32 { return (w1 >> 14 as u32) & 31 as u32 }
+fn vtx_v(w1: u32) -> u32 { return (w1 >> 19 as u32) & 31 as u32 }
+fn vtx_sky(w1: u32) -> u32 { return (w1 >> 24 as u32) & 15 as u32 }
+fn vtx_block(w1: u32) -> u32 { return (w1 >> 28 as u32) & 15 as u32 }
 
 // ---- padded array ----------------------------------------------------------------
 
@@ -182,12 +208,65 @@ fn occludes(t: *mut MeshTables, id: u16) -> u32 {
     return 0 as u32
 }
 
+// ---- corner values -----------------------------------------------------------------
+
+// Brightness estimate of a corner value (ao | sky << 2 | block << 6): the larger light level
+// times the AO factor of the shaders. With constant light it orders corners exactly like AO.
+fn corner_bright(cv: u32) -> u32 {
+    var l: u32 = (cv >> 2 as u32) & 15 as u32
+    let b: u32 = (cv >> 6 as u32) & 15 as u32
+    if b > l { l = b }
+    return l * (100 as u32 + 52 as u32 * (cv & 3 as u32))
+}
+
+// Light of one face corner: cells a (front), b, c (the two side cells), d (diagonal) of the
+// padded array at the given indexes. See the header: opaque / unknown cells are skipped, d is
+// skipped when b and c are both opaque, average rounded half up. Returns sky << 2 | block << 6
+// (the AO bits are left 0).
+fn corner_light(m: *mut Mesher, t: *mut MeshTables, a: usize, b: usize, c: usize, d: usize) -> u32 {
+    var ss: u32 = 0 as u32
+    var sb: u32 = 0 as u32
+    var n: u32 = 0 as u32
+    let la: u32 = rt.ld8((*m).lpad, a) as u32
+    ss = ss + (la >> 4 as u32)
+    sb = sb + (la & 15 as u32)
+    n = n + 1 as u32
+    let ib: u16 = rt.ld16((*m).pad, b)
+    let ic: u16 = rt.ld16((*m).pad, c)
+    let ob: bool = ib == UNKNOWN_ID || is_opaque(t, ib)
+    let oc: bool = ic == UNKNOWN_ID || is_opaque(t, ic)
+    if !ob {
+        let lb: u32 = rt.ld8((*m).lpad, b) as u32
+        ss = ss + (lb >> 4 as u32)
+        sb = sb + (lb & 15 as u32)
+        n = n + 1 as u32
+    }
+    if !oc {
+        let lc: u32 = rt.ld8((*m).lpad, c) as u32
+        ss = ss + (lc >> 4 as u32)
+        sb = sb + (lc & 15 as u32)
+        n = n + 1 as u32
+    }
+    if !(ob && oc) {
+        let id: u16 = rt.ld16((*m).pad, d)
+        if id != UNKNOWN_ID && !is_opaque(t, id) {
+            let ld: u32 = rt.ld8((*m).lpad, d) as u32
+            ss = ss + (ld >> 4 as u32)
+            sb = sb + (ld & 15 as u32)
+            n = n + 1 as u32
+        }
+    }
+    let sky: u32 = (ss * 2 as u32 + n) / (n * 2 as u32)
+    let blk: u32 = (sb * 2 as u32 + n) / (n * 2 as u32)
+    return (sky << 2 as u32) | (blk << 6 as u32)
+}
+
 // ---- emit -----------------------------------------------------------------------
 
 // One quad: face f, plane coordinate pc, rectangle (u0, v0, w, h), tile and the
-// four corner AO values (corner order (0,0) (1,0) (1,1) (0,1)).
+// four corner values (corner order (0,0) (1,0) (1,1) (0,1)): cv = ao | sky << 2 | block << 6.
 fn emit_quad(m: *mut Mesher, f: usize, pc: usize, u0: usize, v0: usize, w: usize, h: usize,
-    tile: u32, a0: u32, a1: u32, a2: u32, a3: u32) {
+    tile: u32, c0: u32, c1: u32, c2: u32, c3: u32) {
     let axis: usize = f / 2
     let ua: usize = (axis + 1) % 3
     let va: usize = (axis + 2) % 3
@@ -196,34 +275,36 @@ fn emit_quad(m: *mut Mesher, f: usize, pc: usize, u0: usize, v0: usize, w: usize
     while k < 4 {
         var su: usize = 0
         var sv: usize = 0
-        var ao: u32 = a0
+        var cv: u32 = c0
         if k == 1 {
             su = 1
-            ao = a1
+            cv = c1
         } else if k == 2 {
             su = 1
             sv = 1
-            ao = a2
+            cv = c2
         } else if k == 3 {
             sv = 1
-            ao = a3
+            cv = c3
         }
+        let ao: u32 = cv & 3 as u32
         var pos: [usize; 3] = [0, 0, 0]
         pos[axis] = pc
         pos[ua] = u0 + su * w
         pos[va] = v0 + sv * h
         let w0: u32 = (pos[0] as u32) | ((pos[1] as u32) << 8 as u32) | ((pos[2] as u32) << 16 as u32) |
         ((f as u32) << 24 as u32) | (ao << 27 as u32)
-        let w1: u32 = tile | (((su * w) as u32) << 16 as u32) | (((sv * h) as u32) << 24 as u32)
+        let w1: u32 = tile | (((su * w) as u32) << 14 as u32) | (((sv * h) as u32) << 19 as u32) |
+        (((cv >> 2 as u32) & 255 as u32) << 24 as u32)
         let vi: usize = (((*m).nverts) as usize) * 2
         rt.st32((*m).verts, vi, w0)
         rt.st32((*m).verts, vi + 1, w1)
         (*m).nverts = (*m).nverts + 1 as u32
         k = k + 1
     }
-    // diagonal: join the brighter pair of corners
+    // diagonal: join the brighter pair of corners (brightness = light level * AO factor)
     var q: [u32; 6] = [0 as u32, 1 as u32, 2 as u32, 0 as u32, 2 as u32, 3 as u32]
-    if a1 + a3 > a0 + a2 {
+    if corner_bright(c1) + corner_bright(c3) > corner_bright(c0) + corner_bright(c2) {
         q = [1 as u32, 2 as u32, 3 as u32, 1 as u32, 3 as u32, 0 as u32]
     }
     var ii: usize = 0
@@ -253,6 +334,7 @@ fn mesh_run(m: *mut Mesher, t: *mut MeshTables, flags: u32) {
     let greedy: bool = (flags & F_GREEDY) != 0 as u32
     let use_ao: bool = (flags & F_AO) != 0 as u32
     let cull_same: bool = (flags & F_CULL_SAME) != 0 as u32
+    let use_light: bool = (flags & F_LIGHT) != 0 as u32
     let strides: [usize; 3] = [1, 324, 18]
     var f: usize = 0
     while f < 6 {
@@ -273,10 +355,11 @@ fn mesh_run(m: *mut Mesher, t: *mut MeshTables, flags: u32) {
                 while i < 16 {
                     let p: usize = (s + 1) * sa + (i + 1) * su + (j + 1) * sv
                     let a: u16 = rt.ld16((*m).pad, p)
-                    var key: u32 = 0 as u32
+                    var key: u64 = 0 as u64
                     if a < 32768 as u16 {
-                        let tile: u16 = rt.ld16((*t).tiles, (a as usize) * 6 + f)
-                        if tile != 0 as u16 {
+                        var tile: u32 = rt.ld16((*t).tiles, (a as usize) * 6 + f) as u32
+                        if tile > MAX_TILE { tile = MAX_TILE }
+                        if tile != 0 as u32 {
                             var fr: usize = p - sa
                             if pos_face { fr = p + sa }
                             let b: u16 = rt.ld16((*m).pad, fr)
@@ -289,10 +372,11 @@ fn mesh_run(m: *mut Mesher, t: *mut MeshTables, flags: u32) {
                                 hidden = true
                             }
                             if !hidden {
-                                var ao0: u32 = 3 as u32
-                                var ao1: u32 = 3 as u32
-                                var ao2: u32 = 3 as u32
-                                var ao3: u32 = 3 as u32
+                                // corner values: ao | sky << 2 | block << 6 (default: ao 3, sky 15, block 0)
+                                var cv0: u32 = 3 as u32 | (15 as u32 << 2 as u32)
+                                var cv1: u32 = cv0
+                                var cv2: u32 = cv0
+                                var cv3: u32 = cv0
                                 if use_ao {
                                     let um: u32 = occludes(t, rt.ld16((*m).pad, fr - su))
                                     let up: u32 = occludes(t, rt.ld16((*m).pad, fr + su))
@@ -302,19 +386,30 @@ fn mesh_run(m: *mut Mesher, t: *mut MeshTables, flags: u32) {
                                     let c10: u32 = occludes(t, rt.ld16((*m).pad, fr + su - sv))
                                     let c11: u32 = occludes(t, rt.ld16((*m).pad, fr + su + sv))
                                     let c01: u32 = occludes(t, rt.ld16((*m).pad, fr - su + sv))
-                                    ao0 = ao_level(um, vm, c00)
-                                    ao1 = ao_level(up, vm, c10)
-                                    ao2 = ao_level(up, vp, c11)
-                                    ao3 = ao_level(um, vp, c01)
+                                    cv0 = (cv0 & 0xFFFFFFFC as u32) | ao_level(um, vm, c00)
+                                    cv1 = (cv1 & 0xFFFFFFFC as u32) | ao_level(up, vm, c10)
+                                    cv2 = (cv2 & 0xFFFFFFFC as u32) | ao_level(up, vp, c11)
+                                    cv3 = (cv3 & 0xFFFFFFFC as u32) | ao_level(um, vp, c01)
                                 }
-                                key = (tile as u32) | (ao0 << 16 as u32) | (ao1 << 18 as u32) |
-                                (ao2 << 20 as u32) | (ao3 << 22 as u32) | (1 as u32 << 24 as u32)
+                                if use_light {
+                                    // the 2x2 patch in front of the face per corner: (front, u side, v side, diagonal)
+                                    let l00: u32 = corner_light(m, t, fr, fr - su, fr - sv, fr - su - sv)
+                                    let l10: u32 = corner_light(m, t, fr, fr + su, fr - sv, fr + su - sv)
+                                    let l11: u32 = corner_light(m, t, fr, fr + su, fr + sv, fr + su + sv)
+                                    let l01: u32 = corner_light(m, t, fr, fr - su, fr + sv, fr - su + sv)
+                                    cv0 = (cv0 & 3 as u32) | l00
+                                    cv1 = (cv1 & 3 as u32) | l10
+                                    cv2 = (cv2 & 3 as u32) | l11
+                                    cv3 = (cv3 & 3 as u32) | l01
+                                }
+                                key = (tile as u64) | ((cv0 as u64) << 16 as u64) | ((cv1 as u64) << 26 as u64) |
+                                ((cv2 as u64) << 36 as u64) | ((cv3 as u64) << 46 as u64) | (1 as u64 << 56 as u64)
                                 (*m).nfaces = (*m).nfaces + 1 as u32
                                 any = true
                             }
                         }
                     }
-                    rt.st32((*m).mask, j * 16 + i, key)
+                    rt.st64((*m).mask, j * 16 + i, key)
                     i = i + 1
                 }
                 j = j + 1
@@ -326,19 +421,19 @@ fn mesh_run(m: *mut Mesher, t: *mut MeshTables, flags: u32) {
                 while j < 16 {
                     var i: usize = 0
                     while i < 16 {
-                        let key: u32 = rt.ld32((*m).mask, j * 16 + i)
-                        if key == 0 as u32 {
+                        let key: u64 = rt.ld64((*m).mask, j * 16 + i)
+                        if key == 0 as u64 {
                             i = i + 1
                         } else {
-                            let ao0: u32 = (key >> 16 as u32) & 3 as u32
-                            let ao1: u32 = (key >> 18 as u32) & 3 as u32
-                            let ao2: u32 = (key >> 20 as u32) & 3 as u32
-                            let ao3: u32 = (key >> 22 as u32) & 3 as u32
+                            let ao0: u32 = ((key >> 16 as u64) & 1023 as u64) as u32
+                            let ao1: u32 = ((key >> 26 as u64) & 1023 as u64) as u32
+                            let ao2: u32 = ((key >> 36 as u64) & 1023 as u64) as u32
+                            let ao3: u32 = ((key >> 46 as u64) & 1023 as u64) as u32
                             var w: usize = 1
                             var h: usize = 1
                             if greedy {
                                 if ao0 == ao1 && ao3 == ao2 {
-                                    while i + w < 16 && rt.ld32((*m).mask, j * 16 + i + w) == key {
+                                    while i + w < 16 && rt.ld64((*m).mask, j * 16 + i + w) == key {
                                         w = w + 1
                                     }
                                 }
@@ -347,7 +442,7 @@ fn mesh_run(m: *mut Mesher, t: *mut MeshTables, flags: u32) {
                                     while grow && j + h < 16 {
                                         var q: usize = 0
                                         while q < w {
-                                            if rt.ld32((*m).mask, (j + h) * 16 + i + q) != key { grow = false }
+                                            if rt.ld64((*m).mask, (j + h) * 16 + i + q) != key { grow = false }
                                             q = q + 1
                                         }
                                         if grow { h = h + 1 }
@@ -358,13 +453,13 @@ fn mesh_run(m: *mut Mesher, t: *mut MeshTables, flags: u32) {
                                 while rj < h {
                                     var ri: usize = 0
                                     while ri < w {
-                                        rt.st32((*m).mask, (j + rj) * 16 + i + ri, 0 as u32)
+                                        rt.st64((*m).mask, (j + rj) * 16 + i + ri, 0 as u64)
                                         ri = ri + 1
                                     }
                                     rj = rj + 1
                                 }
                             }
-                            emit_quad(m, f, pc, i, j, w, h, key & 65535 as u32, ao0, ao1, ao2, ao3)
+                            emit_quad(m, f, pc, i, j, w, h, (key & 65535 as u64) as u32, ao0, ao1, ao2, ao3)
                             i = i + w
                         }
                     }
@@ -387,6 +482,15 @@ fn ao_level(s1: u32, s2: u32, c: u32) -> u32 {
 // The array is copied; the Mesher keeps no pointer to it.
 fn mesh_padded(m: *mut Mesher, pad: u64, t: *mut MeshTables, flags: u32) {
     rt.mem_copy((*m).pad, pad, PADN * 2)
+    rt.mem_set((*m).lpad, LIGHT_DEFAULT, PADN)
+    mesh_run(m, t, flags)
+}
+
+// Like mesh_padded plus a padded light array (u8 [5832], same index, sky << 4 | block); the
+// light is only used when `flags` contains F_LIGHT. Also copied.
+fn mesh_padded_lit(m: *mut Mesher, pad: u64, lpad: u64, t: *mut MeshTables, flags: u32) {
+    rt.mem_copy((*m).pad, pad, PADN * 2)
+    rt.mem_copy((*m).lpad, lpad, PADN)
     mesh_run(m, t, flags)
 }
 
@@ -398,6 +502,7 @@ fn mesh_padded(m: *mut Mesher, pad: u64, t: *mut MeshTables, flags: u32) {
 // as well.
 fn mesh_section(m: *mut Mesher, sec: *mut mc_chunk.Section, nbrs: u64, missing: u32,
     t: *mut MeshTables, flags: u32) {
+    rt.mem_set((*m).lpad, LIGHT_DEFAULT, PADN)
     if missing == MISSING_UNKNOWN {
         pad_fill(m, UNKNOWN_ID)
     } else {
