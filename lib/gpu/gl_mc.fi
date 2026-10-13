@@ -47,7 +47,7 @@ export {
     glbe_gl, glbe_renderer, glbe_draws, glbe_tris, glbe_resize, glbe_fbo_texture,
     MODE_LEGACY, MODE_POOL, MODE_MULTI, MODE_INDIRECT,
     glbe_set_mode, glbe_mode, glbe_set_page_verts, glbe_set_upload_budget, glbe_set_filter, glbe_defrag,
-    glbe_calls, glbe_upload_bytes, glbe_frame_upload_bytes, glbe_staged, glbe_pages, glbe_pool_used_bytes,
+    glbe_max_layers, glbe_layers_lost, glbe_calls, glbe_upload_bytes, glbe_frame_upload_bytes, glbe_staged, glbe_pages, glbe_pool_used_bytes,
     glbe_pool_cap_bytes, glbe_pool_frag_permille, glbe_defrags, glbe_reset_stats, glbe_flush_uploads,
     // scene layer (lib/gpu/gl_scene.fi): extra passes around the Backend table, MSAA, resolve
     glbe_x, glbe_near, glbe_rebind, glbe_flush, glbe_bind_draw, glbe_set_msaa, glbe_msaa, glbe_resolve, glbe_width, glbe_height, glbe_camera_rv,
@@ -124,6 +124,8 @@ struct GlBackend {
     h: i32,
     atile: i32,
     acols: i32,
+    max_layers: i32, // GL_MAX_ARRAY_TEXTURE_LAYERS of the driver (read on the first atlas upload; GL 3.3 only guarantees 256)
+    layers_lost: i32, // layers of the last atlas that did not fit (0 = all uploaded); those tiles read the last layer
     cx: f64,
     cy: f64,
     cz: f64,
@@ -189,7 +191,7 @@ fn empty(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
         fbo: gl33.Fbo { fbo: 0 as u32, color: 0 as u32, depth: 0 as u32, w: w, h: h },
         prog: 0 as u32, atlas_tex: 0 as u32, l_rv: 0 - 1, l_origin: 0 - 1, l_atlas: 0 - 1, l_tiles: 0 - 1, l_fog: 0 - 1,
         l_fogc: 0 - 1, l_light: 0 - 1, l_pool: 0 - 1, l_gran: 0 - 1, l_org: 0 - 1, l_filter: 0 - 1, l_trans: 0 - 1, trans_pass: false, near: 0.05,
-        w: w, h: h, atile: 16, acols: 16, cx: 0.0, cy: 0.0, cz: 0.0, rv: [0.0 as f32; 16],
+        w: w, h: h, atile: 16, acols: 16, max_layers: 0, layers_lost: 0, cx: 0.0, cy: 0.0, cz: 0.0, rv: [0.0 as f32; 16],
         fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0.0, fog_g: 0.0, fog_b: 0.0, day: 256.0, tint_r: 256.0, tint_g: 224.0, tint_b: 176.0, cull: true,
         slots: 0, slot_cap: 0, pix: 0, tmp: 0, fresh: false, draws: 0, tris: 0, calls: 0, log: [0; 512],
         mode: MODE_MULTI, page_verts: DEFAULT_PAGE_VERTS, pages: 0, npages: 0, page_cap: 0, cur_vao: 0 as u32, defrags: 0,
@@ -850,7 +852,18 @@ fn be_atlas(o: u64, a: u64) {
         (*gb).atlas_tex = 0 as u32
     }
     let t: usize = (*at).tile as usize
-    let layers: usize = ((*at).cols as usize) * ((*at).rows as usize)
+    var layers: usize = ((*at).cols as usize) * ((*at).rows as usize)
+    // driver limit: more layers than GL_MAX_ARRAY_TEXTURE_LAYERS would make glTexImage3D fail (a black world). Upload what fits and
+    // report the rest (glbe_layers_lost); a real fallback (second array / atlas pages) is open, mesa llvmpipe allows 2048.
+    if (*gb).max_layers == 0 {
+        (*gb).max_layers = gl33.gl_get_int(&(*gb).g, 0x88FF as u32)
+        if (*gb).max_layers < 256 { (*gb).max_layers = 256 }
+    }
+    (*gb).layers_lost = 0
+    if layers > ((*gb).max_layers as usize) {
+        (*gb).layers_lost = (layers as i32) - (*gb).max_layers
+        layers = (*gb).max_layers as usize
+    }
     let row: usize = t * 4
     let lbytes: usize = t * row
     let buf: u64 = rt.heap_alloc(layers * lbytes)
@@ -1226,6 +1239,14 @@ fn be_set_pass(o: u64, pass: i32) {
     }
     (*gb).trans_pass = want
     apply_pass(gb)
+}
+
+fn glbe_max_layers(gb: *mut GlBackend) -> i32 {
+    return (*gb).max_layers
+}
+
+fn glbe_layers_lost(gb: *mut GlBackend) -> i32 {
+    return (*gb).layers_lost
 }
 
 fn glbe_near(gb: *mut GlBackend) -> f64 {
