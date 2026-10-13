@@ -406,6 +406,13 @@ def main():
             ip = socket.gethostbyname(host)
         except OSError:
             continue
+        # no route to the host (offline sandbox, firewall): skip with a clear
+        # message instead of reporting a failure of this client (r478)
+        try:
+            socket.create_connection((ip, 443), timeout=8).close()
+        except OSError as e:
+            print("  (real host %s unreachable: %s -- skipped)" % (host, e))
+            continue
         dump = os.path.join(WORK, "net-%s.bin" % host)
         try:
             got = run(binary, ip, 443, host,

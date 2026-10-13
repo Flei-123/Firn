@@ -47,7 +47,8 @@ case "$TARGET" in
     linux) EXT=""; ART=bin; ZIEL=linux-x86_64; TF="" ;;
     *) echo "target: windows or linux"; exit 2 ;;
 esac
-PORT=18765
+# APPKIT_KIT_PORT: the test run picks a free port (parallel runs, r479); the shipped kit keeps 18765
+PORT=${APPKIT_KIT_PORT:-18765}
 W=$(mktemp -d "${TMPDIR:-/tmp}/appkit-winkit.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 K=$W/appkit-kit

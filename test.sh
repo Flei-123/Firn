@@ -1627,7 +1627,7 @@ bash tools/appkit/e2e.sh > "$WORK/appkit_e2e.log" 2>&1 || AKRC=1
 bash tools/appkit/newapp_test.sh > "$WORK/appkit_newapp.log" 2>&1 || AKRC=1
 # the kit for another machine (tools/appkit/winkit.sh): built for Linux and run here
 ( kitdir=$(mktemp -d "${TMPDIR:-/tmp}/appkit-kit.XXXXXX") && trap 'rm -rf "$kitdir"' EXIT \
-  && bash tools/appkit/winkit.sh linux "$kitdir/kit.zip" \
+  && APPKIT_KIT_PORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1])") bash tools/appkit/winkit.sh linux "$kitdir/kit.zip" \
   && python3 -c "import sys,zipfile;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$kitdir/kit.zip" "$kitdir" \
   && python3 "$kitdir/appkit-kit/run.py" ) > "$WORK/appkit_kit.log" 2>&1 || AKRC=1
 if [ "${APPKIT_E2E_WINDOWS:-0}" = "1" ]; then

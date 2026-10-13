@@ -50,8 +50,11 @@ fail=0
 same=0
 note() { echo "FAIL  $1"; fail=$((fail + 1)); }
 
-# the two renderings are compared as they are, marker width included
-norm() { cat "$1"; }
+# the two renderings are compared as they are, marker width included -- except
+# for the trailer line that firnc1 prints after the diagnostics since its exit
+# code names the failing stage (bin/firnc1.fi, "stage 1 prints no details";
+# the same filter as tools/escape/run.sh). r478.
+norm() { grep -v '^error: .* reported errors; stage 1 prints no details for it$' "$1" || true; }
 
 # ---------------------------------------------------------------- refused
 for f in tests/neg/move_*.fi tests/neg/drop_*.fi; do
