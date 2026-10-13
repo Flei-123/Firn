@@ -16,6 +16,8 @@
 // the block tables of every state id of the world, the Firn image hash, metrics), atlas.bin.
 // tools/mc/view/ref_render.py renders the same world with its OWN mesher + the python rasterizer and compares.
 //
+// Resource packs (off by default): --pack=a.zip,b.zip and/or env MC_PACKS / MC_PACK_CONFIG / MC_PACK_AUTO / MC_PACK_DIR / MC_PACK_TILE (see
+//              mc_packs.res_setup_env). Extra: MCVIEW_PACK_TICK=n (animation tick), MCVIEW_PACK_RELOAD=1 (hot reload between frames 1 and 2).
 // Environment: MCVIEW_GREEDY=1 (greedy meshing; default 0 = one quad per face, the python reference needs this)
 //              MCVIEW_FOG=0 (fog off; default on)   MCVIEW_W / MCVIEW_H (image size, default 640x360)
 //              MCVIEW_TICKS (time of day 0..23999, default 2000)  MCVIEW_RAIN (0..256, default 0)  MCVIEW_REACH (pick reach in
@@ -54,6 +56,8 @@ import mc.mc_render_world
 import mc.mc_sky
 import mc.mc_input
 import mc.mc_hud
+import mc.mc_packs
+import mc.mc_backend
 
 const DEFAULT_VIEW: i32 = 6
 const DEFAULT_SETTLE_MS: u64 = 3000
@@ -233,6 +237,8 @@ fn post_flags(start: u64) -> u32 {
             f = f | PF_HUD
         } else if c_eq(p, "--all") {
             f = f | PF_SKY | PF_BOX | PF_HUD
+        } else if pack_flag_at(p) != 0 {
+            f = f | 0 as u32 // --pack=<list>: handled by pack_flag
         } else {
             f = f | PF_BAD
         }
@@ -614,21 +620,77 @@ struct Gfx {
     r: mc_raster.Raster,
     wr: mc_render_world.WorldRender,
     ok: bool,
+    res: mc_packs.ResMgr, // resource packs (only used when use_res)
+    use_res: bool,
 }
 
-fn gfx_new(w: i32, h: i32, ver: *mut mc_version.Version, min_y: i32, view: i32) -> Gfx {
+// Resource packs are wanted when MC_PACKS / MC_PACK_CONFIG / MC_PACK_AUTO is set or a --pack=a.zip,b.zip flag is given
+// (mc_packs.res_setup_env documents the variables). Then the block tables use the extended tile ids (64 + i) and the atlas
+// belongs to the ResMgr; without packs everything is exactly as before (python reference hash).
+fn pack_flag_at(p: u64) -> u64 {
+    if rt.c_length(p) > 7 && rt.ld8(p, 0) == 45 as u8 && rt.ld8(p, 1) == 45 as u8 && rt.ld8(p, 2) == 112 as u8 && rt.ld8(p, 3) == 97 as u8
+        && rt.ld8(p, 4) == 99 as u8 && rt.ld8(p, 5) == 107 as u8 && rt.ld8(p, 6) == 61 as u8 {
+        return p + 7 as u64
+    }
+    return 0
+}
+
+fn pack_flag(start: u64) -> u64 {
+    var i: usize = 0
+    while i < rt.arg_count(start) {
+        let q: u64 = pack_flag_at(rt.arg_ptr(start, i))
+        i = i + 1
+        if q != 0 { return q }
+    }
+    return 0
+}
+
+fn gfx_new(w: i32, h: i32, ver: *mut mc_version.Version, min_y: i32, view: i32, use_res: bool) -> Gfx {
     var atlas: mc_texture.Atlas = mc_texture.atlas_default()
     var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
     mc_texture.tex_alloc_tables(&tb)
     var reg: mc_registry.Registry = ver.registry_of()
     let ok: bool = mc_registry.registry_ok(&reg)
+    var res: mc_packs.ResMgr = mc_packs.res_new()
     if ok {
-        mc_texture.tex_build_tables(&reg, &tb)
+        if use_res {
+            mc_packs.res_build_tables(&res, &reg, &tb)
+        } else {
+            mc_texture.tex_build_tables(&reg, &tb)
+        }
     }
     var r: mc_raster.Raster = mc_raster.raster_new(w, h)
     mc_raster.backend_upload_atlas(&r, &atlas)
     var wr: mc_render_world.WorldRender = mc_render_world.wr_new(min_y, view, &tb)
-    return Gfx { atlas: atlas, tb: tb, r: r, wr: wr, ok: ok }
+    return Gfx { atlas: atlas, tb: tb, r: r, wr: wr, ok: ok, res: res, use_res: use_res }
+}
+
+// Loads the packs (env + optional --pack list) into the manager and uploads the atlas. Warnings go to stderr.
+fn gfx_packs_load(g: *mut Gfx, protocol: i32, packs_flag: u64) {
+    mc_packs.res_setup_env(&(*g).res, protocol)
+    if packs_flag != 0 {
+        let s: str = str { p: packs_flag as *mut u8, n: rt.c_length(packs_flag) }
+        mc_packs.res_add_list(&(*g).res, s)
+    }
+    gfx_packs_reload(g)
+}
+
+// Hot reload (the live client calls this from its reload key via mc_packs.res_on_key): re-reads the packs, new atlas, upload.
+// Block tile ids do not change, so cached meshes stay valid.
+fn gfx_packs_reload(g: *mut Gfx) -> i32 {
+    var be: mc_backend.Backend = mc_backend.backend_cpu(&(*g).r)
+    let n: i32 = mc_packs.res_reload_upload(&(*g).res, &be)
+    if mc_packs.res_warn_count(&(*g).res) > 0 {
+        let wt: str = mc_packs.res_warn_text(&(*g).res)
+        io.eprint_line(wt)
+    }
+    return n
+}
+
+// Animated tiles for game tick `tick` (once per game tick in a live client).
+fn gfx_packs_tick(g: *mut Gfx, tick: i64) -> i32 {
+    var be: mc_backend.Backend = mc_backend.backend_cpu(&(*g).r)
+    return mc_packs.res_tick(&(*g).res, tick, &be)
 }
 
 // Pick table for the selection box: a block state is targetable when any face is drawn (so fluids that have a texture are
@@ -727,12 +789,20 @@ fn render(w: *mut mc_world.World, cfg: *mut Cfg, ver: *mut mc_version.Version, d
     var itb: mc_input.InputTables = pick_tables(&(*g).tb)
     var pk: mc_input.Pick = mc_input.Pick { x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, dist: 0.0, id: 0 }
 
+    if (*g).use_res {
+        gfx_packs_tick(g, env_int("MCVIEW_PACK_TICK", 0) as i64)
+    }
     let t0: u64 = now_ns()
     frame(g, w, &cam, cfg, &sky, &itb, clear, fog_start, fog_end, 0, &pk)
     let t1: u64 = now_ns()
     let st1: mc_render_world.RenderStats = (*g).wr.st
     var h1: rt.Buf = rt.buf_new()
     hex_of(r, &h1)
+    // MCVIEW_PACK_RELOAD=1: hot reload between the frames (what the reload key does); the cached frame must still be identical
+    if (*g).use_res && env_flag("MCVIEW_PACK_RELOAD", false) {
+        gfx_packs_reload(g)
+        gfx_packs_tick(g, env_int("MCVIEW_PACK_TICK", 0) as i64)
+    }
     frame(g, w, &cam, cfg, &sky, &itb, clear, fog_start, fog_end, 0, &pk)
     let t2: u64 = now_ns()
     var h2: rt.Buf = rt.buf_new()
@@ -890,7 +960,9 @@ fn render(w: *mut mc_world.World, cfg: *mut Cfg, ver: *mut mc_version.Version, d
     rt.buf_push_bytes(&txt, rt.buf_ptr(&m), rt.buf_len(&m))
 
     var ok: bool = write_to(dir, "view.txt", rt.buf_ptr(&txt), rt.buf_len(&txt))
-    ok = write_to(dir, "atlas.bin", (*g).atlas.px, ((*g).atlas.w as usize) * ((*g).atlas.h as usize) * 4) && ok
+    var ap: *mut mc_texture.Atlas = &(*g).atlas
+    if (*g).use_res { ap = &(*g).res.atlas }
+    ok = write_to(dir, "atlas.bin", (*ap).px, ((*ap).w as usize) * ((*ap).h as usize) * 4) && ok
     ok = write_to(dir, "view.rgba", mc_raster.backend_present(r), ((*cfg).w as usize) * ((*cfg).h as usize) * 4) && ok
     var pp: rt.Buf = rt.buf_new()
     path_of(&pp, dir, "view.png")
@@ -1017,7 +1089,7 @@ fn finish_cfg(cfg: *mut Cfg, post: u32) {
 fn main_replay(start: u64) -> i32 {
     let post: u32 = post_flags(start)
     if argn(start) < 4 || (post & PF_BAD) != 0 as u32 {
-        io.eprint_line("usage: mcview [--sky] [--box] [--hud] [--all] --replay <out-dir> <world-file> [yaw] [pitch]")
+        io.eprint_line("usage: mcview [--sky] [--box] [--hud] [--all] [--pack=a.zip,b.zip] --replay <out-dir> <world-file> [yaw] [pitch]")
         return 2
     }
     let dir: u64 = argp(start, 2)
@@ -1048,7 +1120,10 @@ fn main_replay(start: u64) -> i32 {
         io.eprint_line("mcview: no tables for that protocol number")
         return 2
     }
-    var g: Gfx = gfx_new(cfg.w, cfg.h, &ver, cfg.min_y, cfg.view)
+    let pf: u64 = pack_flag(start)
+    let use_res: bool = pf != 0 || mc_packs.res_env_wanted()
+    var g: Gfx = gfx_new(cfg.w, cfg.h, &ver, cfg.min_y, cfg.view, use_res)
+    if use_res { gfx_packs_load(&g, cfg.protocol, pf) }
     let rc: i32 = render(&world, &cfg, &ver, dir, &g)
     mc_render_world.wr_free(&g.wr, &g.r)
     mc_world.world_free(&world)
@@ -1074,7 +1149,7 @@ fn main(start: u64) -> i32 {
     }
     let post: u32 = post_flags(start)
     if argn(start) < 5 || (post & PF_BAD) != 0 as u32 {
-        io.eprint_line("usage: mcview [--sky] [--box] [--hud] [--all] <host-ipv4> <port> <name> <out-dir> [view=6] [settle-ms=3000] [yaw=0] [pitch=20] [protocol=763] [up=2]")
+        io.eprint_line("usage: mcview [--sky] [--box] [--hud] [--all] [--pack=a.zip,b.zip] <host-ipv4> <port> <name> <out-dir> [view=6] [settle-ms=3000] [yaw=0] [pitch=20] [protocol=763] [up=2]")
         io.eprint_line("       mcview [flags] --replay <out-dir> <world-file> [yaw] [pitch]")
         return 2
     }
@@ -1132,7 +1207,10 @@ fn main(start: u64) -> i32 {
     var cfg0: Cfg = Cfg { protocol: proto, min_y: 0, view: view, w: 640, h: 360, flags: 0 as u32, fog: true,
         cx: 0.0, cy: 0.0, cz: 0.0, yaw: 0.0, pitch: 0.0, post: 0 as u32, ticks: 0, rain: 0, fps: 0 - 1, reach: 0, slot: 0 }
     finish_cfg(&cfg0, post)
-    var g: Gfx = gfx_new(cfg0.w, cfg0.h, &ver, 0, view)
+    let pf: u64 = pack_flag(start)
+    let use_res: bool = pf != 0 || mc_packs.res_env_wanted()
+    var g: Gfx = gfx_new(cfg0.w, cfg0.h, &ver, 0, view, use_res)
+    if use_res { gfx_packs_load(&g, proto, pf) }
     var cl: mc_client.Client = mc_client.client_new(conn, ver)
     var world: mc_world.World = mc_world.world_new()
     var sc: mc_chunk.Scratch = mc_chunk.scratch_new()
