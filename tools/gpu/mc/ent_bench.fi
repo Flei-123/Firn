@@ -1,0 +1,149 @@
+// tools/gpu/mc/ent_bench.fi -- entity boxes: ONE instanced call (draw_entities with n records) against n calls with one record,
+// plus the CPU rasterizer. 640x360, llvmpipe = software rasterizer, NOT a GPU: the numbers show call counts and relative CPU-side
+// cost only. Prints `metric ents ...` lines (median of 21 frames, microseconds, glFinish included).
+import std.rt
+import std.io
+import std.math
+import std.time
+import mc.mc_camera
+import mc.mc_backend
+import mc.mc_raster
+import gpu.gl33
+import gpu.gl_mc
+import gpu.gl_scene
+
+const TW: i32 = 640
+const TH: i32 = 360
+
+fn stf(p: u64, i: usize, v: f64) {
+    *((p + (i as u64) * (8 as u64)) as *mut f64) = v
+}
+
+// n boxes on a grid, varied size / yaw / colour (deterministic)
+fn make_recs(n: usize) -> u64 {
+    let recs: u64 = rt.heap_alloc(n * mc_backend.ENT_BYTES)
+    var i: usize = 0
+    while i < n {
+        let e: u64 = recs + (i * mc_backend.ENT_BYTES) as u64
+        let gx: i32 = (i % 40) as i32
+        let gz: i32 = (i / 40) as i32
+        let yaw: f64 = ((i * 37 % 100) as f64) * 0.0628
+        stf(e, 0, (gx as f64) * 1.5)
+        stf(e, 1, 2.0 + ((i % 3) as f64) * 0.3)
+        stf(e, 2, (gz as f64) * 1.5)
+        stf(e, 3, 0.6 + ((i % 5) as f64) * 0.1)
+        stf(e, 4, 1.0 + ((i % 4) as f64) * 0.3)
+        stf(e, 5, 0.6)
+        stf(e, 6, math.sin(yaw))
+        stf(e, 7, math.cos(yaw))
+        stf(e, 8, (60 + (i * 53) % 190) as f64)
+        stf(e, 9, (60 + (i * 97) % 190) as f64)
+        stf(e, 10, (60 + (i * 29) % 190) as f64)
+        stf(e, 11, 0.0)
+        i = i + 1
+    }
+    return recs
+}
+
+fn median(v: *mut [u64; 32], n: usize) -> u64 {
+    var i: usize = 1
+    while i < n {
+        let k: u64 = (*v)[i]
+        var j: usize = i
+        while j > 0 && (*v)[j - 1] > k {
+            (*v)[j] = (*v)[j - 1]
+            j = j - 1
+        }
+        (*v)[j] = k
+        i = i + 1
+    }
+    return (*v)[n / 2]
+}
+
+// individual = true: n draw_entities calls with 1 record each
+fn run_gl(gb: *mut gl_mc.GlBackend, b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera, recs: u64, n: usize,
+    individual: bool, label: str) -> u64 {
+    var tm: [u64; 32] = [0; 32]
+    var drawn: u64 = 0 as u64
+    var f: usize = 0
+    while f < 23 {
+        let t0: u64 = time.monotonic_ns()
+        (*b).begin((*b).obj, (cam as u64), 0xFFE6BE96 as u32)
+        if individual {
+            drawn = 0 as u64
+            var i: usize = 0
+            while i < n {
+                drawn = drawn + (*b).draw_entities((*b).ent_obj, recs + (i * mc_backend.ENT_BYTES) as u64, 1)
+                i = i + 1
+            }
+        } else {
+            drawn = (*b).draw_entities((*b).ent_obj, recs, n)
+        }
+        (*b).end((*b).obj)
+        gl33.gl_finish(gl_mc.glbe_gl(gb))
+        if f >= 2 { tm[f - 2] = (time.monotonic_ns() - t0) / (1000 as u64) }
+        f = f + 1
+    }
+    let med: u64 = median(&tm, 21)
+    var calls: usize = 1
+    if individual { calls = n }
+    io.print("metric ents ")
+    io.print(label)
+    io.fmt_print(f" boxes={n} drawn={drawn} draw_calls_per_frame={calls} frame_us={med}\n")
+    return med
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var gb: gl_mc.GlBackend = gl_mc.glbe_open(TW, TH)
+    if !gb.ok {
+        io.fmt_print(f"no GL context: step={gb.step}\n")
+        return 4
+    }
+    io.print("renderer: ")
+    io.print_c(gl_mc.glbe_renderer(&gb))
+    io.new_line()
+    var b: mc_backend.Backend = gl_mc.glbe_backend(&gb)
+    var sc: gl_scene.Scene = gl_scene.scene_open(&gb)
+    if !sc.ok {
+        io.fmt_print(f"scene layer: step={sc.step}\n")
+        return 3
+    }
+    gl_scene.scene_attach(&sc, &b)
+    var cam: mc_camera.Camera = mc_camera.camera_new(TW, TH)
+    mc_camera.camera_set_pos(&cam, 30.0, 14.0, 0.0 - 16.0)
+    mc_camera.camera_set_angles(&cam, 0.0, 35.0)
+    mc_camera.camera_update(&cam)
+    var r: mc_raster.Raster = mc_raster.raster_new(TW, TH)
+    var bc: mc_backend.Backend = mc_backend.backend_cpu(&r)
+    var fails: i32 = 0
+    var n: usize = 100
+    while n <= 1000 {
+        let recs: u64 = make_recs(n)
+        gl_scene.scene_set_cull(&sc, false)
+        let ti: u64 = run_gl(&gb, &b, &cam, recs, n, false, "gl_instanced")
+        let td: u64 = run_gl(&gb, &b, &cam, recs, n, true, "gl_individual")
+        gl_scene.scene_set_cull(&sc, true)
+        run_gl(&gb, &b, &cam, recs, n, false, "gl_instanced_cull")
+        // CPU rasterizer, same records
+        var tm: [u64; 32] = [0; 32]
+        var f: usize = 0
+        while f < 23 {
+            let t0: u64 = time.monotonic_ns()
+            bc.begin(bc.obj, (&cam) as u64, 0xFFE6BE96 as u32)
+            bc.draw_entities(bc.ent_obj, recs, n)
+            bc.end(bc.obj)
+            if f >= 2 { tm[f - 2] = (time.monotonic_ns() - t0) / (1000 as u64) }
+            f = f + 1
+        }
+        io.fmt_print(f"metric ents cpu_raster boxes={n} drawn={n} frame_us={median(&tm, 21)}\n")
+        if n == 1000 {
+            io.fmt_print(f"ents summary boxes=1000 instanced_us={ti} individual_us={td}\n")
+        }
+        rt.heap_free(recs, n * mc_backend.ENT_BYTES)
+        if n == 100 { n = 1000 } else { n = 2000 }
+    }
+    gl_scene.scene_close(&sc)
+    gl_mc.glbe_close(&gb)
+    return fails
+}

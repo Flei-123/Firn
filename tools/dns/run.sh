@@ -38,6 +38,12 @@ done
 echo "   dns_main and http_main built: opt, --no-opt, dev-fast"
 python3 tools/dns/check.py "$WORK/dns_main_opt" "$WORK/http_main_opt" || rc=1
 python3 tools/dns/check6.py "$WORK/dns_main_opt" || rc=1  # IPv6 name server on [::1]
+python3 tools/dns/edns_check.py "$WORK/dns_main_opt" || rc=1  # EDNS0, search list / ndots, IDN (r216)
+if "$FIRNC" -o "$WORK/idn_tool" tools/dns/idn_main.fi 2> "$WORK/i.log"; then
+    python3 tools/dns/idn_check.py "$WORK/idn_tool" || rc=1  # Punycode vs Python codecs (r216)
+else
+    echo "  FAIL tools/dns/idn_main.fi does not build"; rc=1
+fi
 echo "== the same checks, dev-fast build =="
 python3 tools/dns/check.py "$WORK/dns_main_dev" "$WORK/http_main_dev" | grep -v "^  OK" || rc=1
 

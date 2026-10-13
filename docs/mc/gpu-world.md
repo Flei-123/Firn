@@ -73,3 +73,15 @@ Section: 4084 vertices = 32672 B VBO + 24504 B IBO (test chunk). Not implemented
   routes it through the existing instanced pass (ONE glDrawElementsInstanced, frustum + HiZ culling of scene_ent_flush) - compiled, NOT rendered/compared.
   `mc_entity_draw`: Store -> boxes (humanoid 6 boxes, object 1, LOD 1 box beyond far_lod, frustum culling per entity); test 2775. No skin tile (no textures).
 * Not done: GL-vs-CPU PSNR scenes for water/glass/boxes, 1000-entity instanced-vs-individual draw call measurement, persistent mapped buffers / fences.
+
+## mc-s3 (2026-10-13): GL-vs-CPU transparency/entities, entity benchmark, layer limit (llvmpipe only, NOT a GPU)
+* r94 `tools/gpu/dump.fi` scenes `water_glass`, `water_glass_fog`, `boxes` (PASS_TRANS via `set_pass`, entity boxes via `gl_scene.scene_attach`, entity culling off):
+  PSNR 42.3 / 43.4 / 42.4 dB, coverage mismatch 6-10 px of 57600, threshold 38 dB (same float-vs-1/16-pixel-snap + texture-sampling difference as the chunk scenes, 37-43 dB).
+  Visual check: images equal by eye. Note: dump.fi still builds vertex word1 in the OLD layout (u<<16, v<<24), CPU and GL read it the same way, so it compares fine (open item).
+* r95 `tools/gpu/mc/ent_bench.fi` (640x360, median of 21, busy server): 100 boxes instanced 4.0 ms / individual (100 calls) 9.4 ms / CPU raster 4.9 ms;
+  1000 boxes instanced (1 glDrawElementsInstanced) 10.3 ms / individual (1000 calls) 54.2 ms / HiZ+frustum culling 8.2 ms (991 drawn) / CPU raster 20.5 ms.
+  Persistent mapped buffers / fences NOT built: on llvmpipe the upload is not the bottleneck, nothing measurable to justify them.
+* r99 `tools/gpu/mc/layers.fi`: llvmpipe GL_MAX_ARRAY_TEXTURE_LAYERS = 2048 (GL 3.3 only guarantees 256). 1120 layers (mc_texext 64+i) at tile 16 and 64 render the same
+  colours as the CPU (upload 6 ms / 89-125 ms). `be_atlas` now reads the limit (`glbe_max_layers`) and uploads only what fits (`glbe_layers_lost`); tiles beyond read the
+  last layer. A real fallback (2nd array / atlas pages) is open. Defrag with 24 unequal sections (1-7 x 4 quads, holes): frag 408 -> 0 permille, frame checksum equal to legacy.
+  Mip/aniso: 1-px checker luma stddev nearest 49.5, mip 4.0, mip+aniso8 1.4 (smoother as expected; no CPU reference for mip).
