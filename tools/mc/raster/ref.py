@@ -151,7 +151,7 @@ class Scene:
         oa, ob, oc = va[5] * za, vb[5] * zb, vc[5] * zc
         ka, kb, kc = va[6] * za, vb[6] * zb, vc[6] * zc
         la, lb, lc = va[7] * za, vb[7] * zb, vc[7] * zc
-        day, tint_r, tint_g, tint_b = self.sc["light"]
+        day, tint_r, tint_g, tint_b = self.sc.get("light", (256, 256, 224, 176))
         dayf = float(day)
         # edges (p -> q) opposite to vertex 0, 1, 2
         edges = [((bx, by), (cx, cy)), ((cx, cy), (ax, ay)), ((ax, ay), (bx, by))]

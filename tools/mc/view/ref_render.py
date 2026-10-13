@@ -199,7 +199,7 @@ def mesh_section(P, opq_tab, tiles_tab, use_ao, cull_same):
                 pos[ua] = c[ua] + su
                 pos[va] = c[va] + sv
                 w0 = pos[0] | (pos[1] << 8) | (pos[2] << 16) | (f << 24) | (ao[k] << 27)
-                w1 = int(tile[y, z, x]) | (su << 16) | (sv << 24)
+                w1 = int(tile[y, z, x]) | (su << 14) | (sv << 19) | (15 << 24)
                 verts.append((w0, w1))
             a0, a1, a2, a3 = ao
             q = [0, 1, 2, 0, 2, 3]
