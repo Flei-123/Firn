@@ -14,5 +14,17 @@ Test tests/2774_mc_lod.fi (layout, skirts, bin max, heights == terrain scan, ima
 | 32 | 4,998,433 / 140.0 MB | 408,742 / 11.4 MB | 1,367,105 / 38.3 MB |
 Per column: 1183 tris full, 75.5 (bin 4), 307 (bin 2); building the LOD column 0.2 ms vs 4.1 ms for the sections.
 
+## Stream integration (mc_stream, 13.10., `s.lod_dist > 0`; set it BEFORE loading columns; default 0 = off)
+- Per column mode (column table words C_*): 0 full detail, 1 LOD only (sections neither meshed nor drawn, their meshes freed), 2 drawn as LOD while the sections mesh again.
+- Switch rules (no hole by construction): full -> LOD only when the LOD mesh is uploaded; LOD -> full only when every section of the column is meshed
+  (`lod_col_ready`); the old representation stays on screen until then. Hysteresis `lod_hyst` (1): full -> LOD beyond `dist + hyst`, LOD -> full within `dist`.
+  LOD meshes are built from distance `dist + 1` on (own budget `lod_budget_us`, nearest first, 64 per frame), bin 4 up to `lod_far_at` (24) columns, bin 8 beyond (hysteresis too).
+- Skirts toward neighbours from their binned height maps (4 neighbours, same bin); height maps cached per column (1 KB), invalidated by stream_chunk_loaded / stream_mark_block / unload.
+- The cull window is `dist + hyst`; `stream_drop_far` must be called with `extra >= lod_dist - dist` when LOD is on. LOD columns are frustum-tested per column (sections of its height range).
+- Test tests/2861_mc_stream_lod.fi: modes, hysteresis (A, B), flight with 3 submits/frame (C), triangles (D), free (E).
+
 ## Open
-- no switching/blending between LOD and full detail (pop at the ring), no LOD for water/trees, no stream integration yet (stream draws sections only).
+- FLIGHT HOLES (measured, NOT solved): in tests/2861 C (70 frames, 3 mesh submits / frame) the stream shows up to 351 of 5184 px clear colour where the converged stream
+  has terrain (total 3058 px over the flight; no-LOD control 83413). After a flush 75 px remain (far hill silhouette). Modes/handles of the columns look right
+  (all LOD columns have handles), cull is not the cause (use_cull=false identical). Next: dump the LOD columns per frame, check frustum test / bin heights vs the converged image.
+- no blending (pop at bin switches), no LOD for water/trees, LOD builds run on the render thread (0.2 ms/column).

@@ -23,7 +23,7 @@ else
         fs=()
         for i in $(seq 1 "${PERF_RUNS:-3}"); do
             LOAD=$(cut -d' ' -f1 /proc/loadavg)
-            BENCH_T0_NS=$(date +%s%N) "$W/bench" tools/mc/view/fixture/world.mcw "$R" "${PERF_FRAMES:-100}" 10 > "$W/r${R}_$i.txt" 2>&1
+            BENCH_COMP=1 BENCH_COMPUPLOAD=1 BENCH_T0_NS=$(date +%s%N) "$W/bench" tools/mc/view/fixture/world.mcw "$R" "${PERF_FRAMES:-100}" 10 > "$W/r${R}_$i.txt" 2>&1
             echo "RESULT server_load $LOAD load" >> "$W/r${R}_$i.txt"; fs+=("$W/r${R}_$i.txt")
         done
         echo "{\"backend\":\"cpu-raster\",\"gpu\":\"none (CPU rasterizer, single thread)\",\"radius\":$R,\"host\":\"$(hostname)\",\"cores\":$(nproc),\"world\":\"fixture tiled\",\"stamp\":\"$STAMP\"}" > "$W/meta.json"
