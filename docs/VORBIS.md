@@ -16,10 +16,16 @@ Engine: `load_ogg.ogg_load(&e, ptr, len)` -> sample id or -1 (max. 2 channels, l
 Packet level API (headers, `vorbis_decode`, `vorbis_to_i16/f32`) is described at the top of `lib/ton/vorbis.fi`.
 
 ## What is in / not in
-- In: all Vorbis I streams with floor 1 (all libvorbis / ffmpeg output), residue 0/1/2, coupling, 1..255 channels,
-  both block sizes 64..8192, codebook lookup 1/2. Final length trimmed to the last page's granule position.
-- Not in: floor 0 (error -5; no encoder writes it), seeking, chained links in `vorbis_file` (only the first logical
-  stream; `ogg_next_link` exists), Ogg Skeleton.
+- In: all Vorbis I streams: floor 0 (LSP) and floor 1, residue 0/1/2, coupling, 1..255 channels, both block sizes 64..8192,
+  codebook lookup 1/2. Final length trimmed to the last page's granule position.
+- Floor 0: no encoder writes it, so it is tested with SYNTHETIC streams (`tools/vorbis/floor0_gen.py`: mono order 8,
+  stereo order 7 with coupling, type 1 lattice book, residue 1/2): libvorbis (soundfile) decodes them, max deviation 0.11 LSB.
+  Untested: lookup type 2 floor books, order > 8, several floor-0 books, real-world floor 0 files (old Vorbis betas).
+- Streaming (`lib/ton/vorbis_stream.fi`, `vorbis_stream_fd.fi`): pull decoder over a `VsSource` (read/seek callbacks, memory
+  or fd/pipe), one Ogg page in memory at a time; chained links (new rate/channels, `VS_LINK` return); `vs_seek(frame)` inside
+  the current link by page bisection (exact, verified against a full decode). `tools/vorbis/stream_main.fi` is the driver.
+- Not in: seeking across links, streams with a non-zero first granule, `vorbis_file` (whole-file API) still decodes only the
+  first link, Ogg Skeleton.
 
 ## Accuracy (vs libsndfile, f32 output)
 Method: `tools/vorbis/compare.py`, 8 files (mono/stereo/3ch/5.1, 8-48 kHz, q-1..q10, impulse, pink/white/brown noise,
@@ -39,5 +45,5 @@ error code (-1 malformed, -2 header packet, -3 not ready, -4 memory, -5 floor 0)
 
 ## Tests
 `tests/2780_vorbis.fi` (every build stage: metadata, |x| sum, 24 samples vs libsndfile, engine load + resample, damaged
-input), `tools/vorbis/run.sh` (gate 120 in `test.sh`; needs python3 soundfile + numpy, else SKIP).
+input), `tools/vorbis/run.sh` (gate 120 in `test.sh`; needs python3 soundfile + numpy, else SKIP; also runs the floor 0 files and `tools/vorbis/stream_check.py`: 85 checks = file + pipe sources, chained 3 links, 6 seek targets per file).
 Test files in `tests/data/vorbis/` (ffmpeg/libvorbis); `tools/vorbis/gen_test.py` regenerates the test.
