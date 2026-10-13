@@ -2175,6 +2175,16 @@ else
     echo "   SKIP (python3 soundfile/numpy missing)"
 fi
 
+echo "== 138. x86-64 frame layout: callee-saved save slots 8-aligned in every function (objdump-free --emit=asm check, mutation-proof) + deterministic layoutb2 GC reproducer (tools/frame/check.sh, r476/r477) =="
+FIRNC="$FIRNC" bash tools/frame/check.sh > "$WORK/frame138.log" 2>&1 && F138RC=0 || F138RC=$?
+if [ "$F138RC" -eq 0 ]; then
+    ok
+    grep -E '^ +ok' "$WORK/frame138.log" | sed 's/^/ /'
+else
+    bad "tools/frame/check.sh failed (see .test-work/frame138.log)"
+    grep -E 'FAIL|BAD|crash' "$WORK/frame138.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
