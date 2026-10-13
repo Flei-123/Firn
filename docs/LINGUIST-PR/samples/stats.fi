@@ -1,0 +1,927 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/stats.fi -- std.stats: descriptive statistics on f64 (SKRIPT-LIBS r316).
+//
+// What a check script needs from Python's `statistics` and a little numpy:
+// the mean, the median, a percentile, the spread, a histogram -- over a plain
+// array of f64 (`*mut f64` + count) or over a `Vec[f64]`.
+//
+//     import std.stats
+//
+//     var data: Vec[f64] = vec_new[f64]()
+//     defer vec_free[f64](&data)
+//     vec_push[f64](&data, 3.0)
+//     vec_push[f64](&data, 1.0)
+//     vec_push[f64](&data, 2.0)
+//     let m: f64 = stats.median_vec(&data)               // 2.0, `data` is not touched
+//     let p95: f64 = stats.percentile_vec(&data, 95.0)   // 2.9 (numpy default)
+//     let s: f64 = stats.stdev_vec(&data)                // 1.0  (sample, n-1)
+//
+//     var counts: Vec[u64] = ...                         // `bins` zeroes, or any *mut u64 of `bins` slots
+//     stats.histogram_vec(&data, 4, 0.0, 4.0, vec_elem_ptr[u64](&counts, 0))
+//
+// The `*_vec` form of every function reads a `Vec[f64]`; the plain form takes
+// `p: *mut f64, n: usize`. They are the same code.
+//
+// THE RULES (as Python `statistics` / numpy, written down once)
+//
+//   * mean / sum are COMPENSATED (Neumaier): the rounding error of every
+//     addition is collected and added back once. `sum([0.1]*10)` is 1.0, not
+//     0.9999999999999999. The result is the one of `statistics.fmean` /
+//     `math.fsum` to within a rounding of the last bit on ordinary data; the
+//     measured deviation is in tools/stats_cross (see HONEST H3).
+//   * median / percentile use LINEAR INTERPOLATION between the two nearest
+//     order statistics: position = (n-1)*p/100 -- numpy's default method and
+//     `statistics.quantiles(method="inclusive")`. The even-count median is
+//     (a+b)/2 as `statistics.median`.
+//   * variance / stdev are the SAMPLE form (divide by n-1) as
+//     `statistics.variance`; `pvariance` / `pstdev` divide by n.
+//   * histogram has numpy.histogram's rules: `bins` equal-width bins over
+//     [lo, hi], the last bin is closed at the right end, values outside and
+//     NaN are not counted.
+//
+// WHAT HAPPENS ON BAD INPUT (never a trap, never an abort, always a number):
+//
+//   empty set           -> NaN (sum of the empty set is 0.0, as in Python)
+//   too few values      -> NaN (variance / stdev need n >= 2, pvariance n >= 1)
+//   a NaN in the data   -> NaN (min, max, mean, sum, median, percentile,
+//                              variance ... -- numpy's behaviour; Python's
+//                              `statistics` leaves it undefined)
+//   +inf and -inf       -> propagate by IEEE rules (sum of +inf and -inf is NaN,
+//                          variance of data with an inf is NaN)
+//   p outside [0,100]   -> NaN, so does a NaN p (numpy raises)
+//   out of memory       -> NaN from median/percentile (they need a copy);
+//                          the `_inplace` forms need no memory and cannot fail
+//   null pointer, n == 0 -> treated as the empty set
+//
+// SORTING. The data is NEVER reordered by the plain forms: `median` and
+// `percentile` work on a private copy (n * 8 octets, freed before return).
+// The `_inplace` forms use the input array itself as the working space and
+// leave it PERMUTED (not sorted; some elements moved by the selection). Use
+// them when the order of the data does not matter afterwards. `sort(p, n)`
+// sorts in place by the TOTAL order of f64 (`math.total_cmp`: -NaN < -inf <
+// ... < -0.0 < +0.0 < ... < +inf < +NaN), O(n log n) worst case.
+//
+// HONEST (what this does NOT do)
+//
+// H1 NO EXACT ARITHMETIC. Python's `statistics.mean/variance` compute with
+//    fractions and round once at the end. This module computes in doubles
+//    with compensation: variance is the corrected two-pass algorithm. On
+//    well-conditioned data the result is within a few ulp of the exact
+//    value; on data whose variance is tiny against its mean (1e9 + 1e-3
+//    noise) a double cannot hold the difference and the result is
+//    correspondingly worse. tools/stats_cross measures it against
+//    `statistics` and numpy and reports the largest deviation in ulp.
+// H2 OVERFLOW IS NOT AVOIDED. sum and mean add up the values as they are;
+//    two values of 1e308 give +inf for sum and mean (numpy does the same,
+//    `math.fsum` raises OverflowError). The median avoids it for its
+//    (a+b)/2 (a/2 + b/2 when the sum overflows).
+// H3 `sum` / `mean` are Neumaier, not `math.fsum`: the result is exact as long
+//    as the running error term does not round itself, i.e. unless terms of
+//    wildly different magnitude (1e30 against 1) cancel. For those
+//    `sum_exact` / `mean_exact` (Shewchuk partials = `math.fsum` /
+//    `statistics.fmean`, exactly rounded) are there. tools/stats_cross
+//    measures both against Python and prints the deviation in ulp.
+// H4 -0.0 and +0.0 are equal for min/max/sum, but different in `sort`
+//    (total order) and therefore may swap places in a median: the median of
+//    [-0.0, 0.0] is +0.0.
+// H5 NO WEIGHTS, NO MODE, NO CORRELATION; one dimension only (SKRIPT-LIBS
+//    ndarray is a draft, docs/NDARRAY.md).
+// H6 SINGLE THREAD; the module has no global state.
+
+import rt
+import vec
+import math
+
+export {
+    sum, mean, sum_exact, mean_exact, min, max, median, median_inplace, percentile, percentile_inplace,
+    variance, stdev, pvariance, pstdev, histogram, sort,
+    sum_vec, mean_vec, sum_exact_vec, mean_exact_vec, min_vec, max_vec, median_vec, median_vec_inplace,
+    percentile_vec, percentile_vec_inplace, variance_vec, stdev_vec,
+    pvariance_vec, pstdev_vec, histogram_vec, sort_vec,
+}
+
+// ------------------------------------------------------------ raw access
+
+#[allow_fp]
+fn ld(a: u64, i: usize) -> f64 {
+    return *((a + i as u64 * 8) as *mut f64)
+}
+
+#[allow_fp]
+fn st(a: u64, i: usize, v: f64) {
+    *((a + i as u64 * 8) as *mut f64) = v
+}
+
+// The data pointer as a bare address; null and n == 0 mean "empty".
+fn base(p: *mut f64, n: usize) -> u64 {
+    if n == 0 {
+        return 0
+    }
+    return p as u64
+}
+
+fn vbase(v: *mut Vec[f64]) -> u64 {
+    return vec_ptr[f64](v)
+}
+
+#[allow_fp]
+fn nan() -> f64 {
+    return math.NAN()
+}
+
+#[allow_fp]
+fn has_nan(a: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        let x: f64 = ld(a, i)
+        if x != x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ------------------------------------------------------- sum and mean
+
+// Neumaier's variant of Kahan summation. `s` is the running sum, `c` the
+// sum of the rounding errors; the result is s + c. If the running sum left
+// the finite range the plain value is returned (the error term would be
+// inf - inf = NaN there).
+#[allow_fp]
+fn sum_raw(a: u64, n: usize) -> f64 {
+    var s: f64 = 0.0
+    var c: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let x: f64 = ld(a, i)
+        let t: f64 = s + x
+        if math.fabs(s) >= math.fabs(x) {
+            c = c + ((s - t) + x)
+        } else {
+            c = c + ((x - t) + s)
+        }
+        s = t
+        i = i + 1
+    }
+    if !math.is_finite(s) {
+        return s
+    }
+    return s + c
+}
+
+#[allow_fp]
+fn mean_raw(a: u64, n: usize) -> f64 {
+    if n == 0 {
+        return nan()
+    }
+    return sum_raw(a, n) / (n as f64)
+}
+
+// Sum of the n values (compensated). The empty set sums to 0.0.
+#[allow_fp]
+fn sum(p: *mut f64, n: usize) -> f64 {
+    return sum_raw(base(p, n), n)
+}
+
+// Arithmetic mean (compensated sum / n). NaN for the empty set.
+#[allow_fp]
+fn mean(p: *mut f64, n: usize) -> f64 {
+    return mean_raw(base(p, n), n)
+}
+
+// EXACTLY ROUNDED sum (Shewchuk's algorithm = CPython's `math.fsum`): the
+// running sum is kept as a list of non-overlapping partial sums that
+// together hold the exact value; the result is rounded once at the end.
+// At most 39 partials can exist in binary64, 64 slots are reserved. Cost:
+// one 512 octet allocation and about 5x the time of `sum`. If the
+// allocation fails, or the sum leaves the finite range, the compensated
+// `sum` answer is returned instead (inf/NaN by IEEE rules, no OverflowError).
+#[allow_fp]
+fn sum_exact_raw(a: u64, n: usize) -> f64 {
+    let fallback: f64 = sum_raw(a, n)
+    if n == 0 || !math.is_finite(fallback) {
+        return fallback
+    }
+    let w: u64 = rt.heap_alloc(512)
+    if w == 0 {
+        return fallback
+    }
+    var np: usize = 0
+    var i: usize = 0
+    var ok: bool = true
+    while i < n && ok {
+        var x: f64 = ld(a, i)
+        var j: usize = 0
+        var k: usize = 0
+        while j < np {
+            var y: f64 = ld(w, j)
+            if math.fabs(x) < math.fabs(y) {
+                let t: f64 = x
+                x = y
+                y = t
+            }
+            let hi: f64 = x + y
+            let lo: f64 = y - (hi - x)
+            if lo != 0.0 {
+                st(w, k, lo)
+                k = k + 1
+            }
+            x = hi
+            j = j + 1
+        }
+        if !math.is_finite(x) {
+            ok = false
+        } else {
+            st(w, k, x)
+            np = k + 1
+        }
+        i = i + 1
+    }
+    if !ok {
+        rt.heap_free(w, 512)
+        return fallback
+    }
+    // round the partials from the top, correcting for a half-way case
+    var hi: f64 = 0.0
+    if np > 0 {
+        var m: usize = np - 1
+        hi = ld(w, m)
+        var lo: f64 = 0.0
+        var done: bool = false
+        while m > 0 && !done {
+            m = m - 1
+            let x: f64 = hi
+            let y: f64 = ld(w, m)
+            hi = x + y
+            lo = y - (hi - x)
+            if lo != 0.0 {
+                done = true
+            }
+        }
+        if m > 0 && ((lo < 0.0 && ld(w, m - 1) < 0.0) || (lo > 0.0 && ld(w, m - 1) > 0.0)) {
+            let y2: f64 = lo * 2.0
+            let x2: f64 = hi + y2
+            if y2 == x2 - hi {
+                hi = x2
+            }
+        }
+    }
+    rt.heap_free(w, 512)
+    return hi
+}
+
+// The exactly rounded sum of the n values (`math.fsum`). See above.
+#[allow_fp]
+fn sum_exact(p: *mut f64, n: usize) -> f64 {
+    return sum_exact_raw(base(p, n), n)
+}
+
+// The exactly rounded sum divided by n (`statistics.fmean`). NaN if empty.
+#[allow_fp]
+fn mean_exact(p: *mut f64, n: usize) -> f64 {
+    if n == 0 {
+        return nan()
+    }
+    return sum_exact_raw(base(p, n), n) / (n as f64)
+}
+
+// ---------------------------------------------------------- min and max
+
+#[allow_fp]
+fn min_raw(a: u64, n: usize) -> f64 {
+    if n == 0 {
+        return nan()
+    }
+    var m: f64 = ld(a, 0)
+    var i: usize = 1
+    while i < n {
+        let x: f64 = ld(a, i)
+        if x != x {
+            return x
+        }
+        if x < m {
+            m = x
+        }
+        i = i + 1
+    }
+    return m
+}
+
+#[allow_fp]
+fn max_raw(a: u64, n: usize) -> f64 {
+    if n == 0 {
+        return nan()
+    }
+    var m: f64 = ld(a, 0)
+    var i: usize = 1
+    while i < n {
+        let x: f64 = ld(a, i)
+        if x != x {
+            return x
+        }
+        if x > m {
+            m = x
+        }
+        i = i + 1
+    }
+    return m
+}
+
+// The smallest value; NaN for the empty set and when any value is NaN.
+#[allow_fp]
+fn min(p: *mut f64, n: usize) -> f64 {
+    return min_raw(base(p, n), n)
+}
+
+// The largest value; NaN for the empty set and when any value is NaN.
+#[allow_fp]
+fn max(p: *mut f64, n: usize) -> f64 {
+    return max_raw(base(p, n), n)
+}
+
+// ------------------------------------------- sorting on the total order
+//
+// f64 values are turned into unsigned KEYS in place (the monotone map of
+// `math.total_key`), sorted as plain u64 (introsort: quicksort with a median
+// of three, insertion sort for short runs, heap sort when the recursion gets
+// too deep -- O(n log n) in the worst case), and turned back. So NaN and
+// -0.0 need no special case and the comparison is one integer compare.
+
+fn key_of(b: u64) -> u64 {
+    if (b & 9223372036854775808) != 0 {
+        return b ^ 18446744073709551615
+    }
+    return b | 9223372036854775808
+}
+
+fn bits_of(k: u64) -> u64 {
+    if (k & 9223372036854775808) != 0 {
+        return k & 9223372036854775807
+    }
+    return k ^ 18446744073709551615
+}
+
+fn to_keys(a: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.st64(a, i, key_of(rt.ld64(a, i)))
+        i = i + 1
+    }
+}
+
+fn from_keys(a: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.st64(a, i, bits_of(rt.ld64(a, i)))
+        i = i + 1
+    }
+}
+
+fn swap_k(a: u64, i: usize, j: usize) {
+    let t: u64 = rt.ld64(a, i)
+    rt.st64(a, i, rt.ld64(a, j))
+    rt.st64(a, j, t)
+}
+
+// Insertion sort of the keys in [lo, hi).
+fn insertion_k(a: u64, lo: usize, hi: usize) {
+    var i: usize = lo + 1
+    while i < hi {
+        let v: u64 = rt.ld64(a, i)
+        var j: usize = i
+        while j > lo && rt.ld64(a, j - 1) > v {
+            rt.st64(a, j, rt.ld64(a, j - 1))
+            j = j - 1
+        }
+        rt.st64(a, j, v)
+        i = i + 1
+    }
+}
+
+// Heap sort of the keys in [lo, lo + n): the fallback with a hard bound.
+fn sift_k(a: u64, lo: usize, root: usize, n: usize) {
+    var r: usize = root
+    var go: bool = true
+    while go {
+        var child: usize = 2 * r + 1
+        if child >= n {
+            go = false
+        } else {
+            if child + 1 < n && rt.ld64(a, lo + child) < rt.ld64(a, lo + child + 1) {
+                child = child + 1
+            }
+            if rt.ld64(a, lo + r) < rt.ld64(a, lo + child) {
+                swap_k(a, lo + r, lo + child)
+                r = child
+            } else {
+                go = false
+            }
+        }
+    }
+}
+
+fn heapsort_k(a: u64, lo: usize, n: usize) {
+    if n < 2 {
+        return
+    }
+    var i: usize = n / 2
+    while i > 0 {
+        i = i - 1
+        sift_k(a, lo, i, n)
+    }
+    var e: usize = n
+    while e > 1 {
+        e = e - 1
+        swap_k(a, lo, lo + e)
+        sift_k(a, lo, 0, e)
+    }
+}
+
+// The median of three keys at lo, mid, hi (inclusive).
+fn pivot_k(a: u64, lo: usize, hi: usize) -> u64 {
+    let x: u64 = rt.ld64(a, lo)
+    let y: u64 = rt.ld64(a, lo + (hi - lo) / 2)
+    let z: u64 = rt.ld64(a, hi)
+    if x < y {
+        if y < z {
+            return y
+        }
+        if x < z {
+            return z
+        }
+        return x
+    }
+    if x < z {
+        return x
+    }
+    if y < z {
+        return z
+    }
+    return y
+}
+
+// Hoare partition of [lo, hi] (inclusive, as i64 so that j may reach -1).
+// Afterwards every key in [lo, j] is <= pivot, every key in [i, hi] is
+// >= pivot, and the keys between j and i equal the pivot.
+fn partition_k(a: u64, lo: i64, hi: i64, pivot: u64, pi: *mut i64, pj: *mut i64) {
+    var i: i64 = lo
+    var j: i64 = hi
+    while i <= j {
+        while rt.ld64(a, i as usize) < pivot {
+            i = i + 1
+        }
+        while rt.ld64(a, j as usize) > pivot {
+            j = j - 1
+        }
+        if i <= j {
+            swap_k(a, i as usize, j as usize)
+            i = i + 1
+            j = j - 1
+        }
+    }
+    *pi = i
+    *pj = j
+}
+
+fn quicksort_k(a: u64, lo0: usize, hi0: usize, depth0: usize) {
+    var lo: usize = lo0
+    var hi: usize = hi0
+    var depth: usize = depth0
+    while hi - lo > 16 {
+        if depth == 0 {
+            heapsort_k(a, lo, hi - lo)
+            return
+        }
+        depth = depth - 1
+        var i: i64 = 0
+        var j: i64 = 0
+        partition_k(a, lo as i64, (hi - 1) as i64, pivot_k(a, lo, hi - 1), &i, &j)
+        // recurse into the smaller side, loop on the larger one
+        let left: i64 = j + 1 - (lo as i64)
+        let right: i64 = (hi as i64) - i
+        if left < right {
+            if left > 1 {
+                quicksort_k(a, lo, (j + 1) as usize, depth)
+            }
+            lo = i as usize
+        } else {
+            if right > 1 {
+                quicksort_k(a, i as usize, hi, depth)
+            }
+            hi = (j + 1) as usize
+        }
+    }
+    if hi - lo > 1 {
+        insertion_k(a, lo, hi)
+    }
+}
+
+fn sort_keys(a: u64, n: usize) {
+    if n < 2 {
+        return
+    }
+    quicksort_k(a, 0, n, 2 * (math.ilog2(n as u64) + 1))
+}
+
+// Selects the k-th smallest key (0-based) of the n keys: afterwards a[k] is
+// the k-th order statistic, everything before it is <= and everything after
+// it >= (quickselect, expected O(n); too many rounds fall back to a full
+// sort, so the worst case is O(n log n)).
+fn select_k(a: u64, n: usize, k: usize) {
+    var lo: i64 = 0
+    var hi: i64 = (n as i64) - 1
+    var rounds: usize = 0
+    let limit: usize = 4 * (math.ilog2(n as u64) + 1)
+    while lo < hi {
+        if rounds >= limit {
+            sort_keys(a, n)
+            return
+        }
+        rounds = rounds + 1
+        var i: i64 = 0
+        var j: i64 = 0
+        partition_k(a, lo, hi, pivot_k(a, lo as usize, hi as usize), &i, &j)
+        if (k as i64) <= j {
+            hi = j
+        } else {
+            if (k as i64) >= i {
+                lo = i
+            } else {
+                return
+            }
+        }
+    }
+}
+
+// Sorts the n values in place by the total order of f64 (see above).
+fn sort(p: *mut f64, n: usize) {
+    let a: u64 = base(p, n)
+    if n < 2 {
+        return
+    }
+    to_keys(a, n)
+    sort_keys(a, n)
+    from_keys(a, n)
+}
+
+// ------------------------------------------------ median and percentile
+
+// The (a+b)/2 of the median, without overflow to inf for finite a and b.
+#[allow_fp]
+fn midpoint(x: f64, y: f64) -> f64 {
+    let s: f64 = x + y
+    if math.is_infinite(s) && math.is_finite(x) && math.is_finite(y) {
+        return x / 2.0 + y / 2.0
+    }
+    return s / 2.0
+}
+
+// numpy's `lerp(a, b, t)`: a + (b - a) * t, mirrored from the other end for
+// t >= 0.5 so that the result is exact at both ends and monotone in t.
+#[allow_fp]
+fn lerp(x: f64, y: f64, t: f64) -> f64 {
+    let d: f64 = y - x
+    if t >= 0.5 {
+        return y - d * (1.0 - t)
+    }
+    return x + d * t
+}
+
+// Order statistic k of the n values at `a` as f64 (a[k] after select_k).
+#[allow_fp]
+fn key_value(a: u64, i: usize) -> f64 {
+    return math.math_f64(bits_of(rt.ld64(a, i)))
+}
+
+// Percentile on a working array whose f64 slots may be scrambled: `a` holds
+// n values, none of them NaN (checked by the caller). Linear interpolation
+// between order statistics k and k+1 at position (n-1)*pct/100.
+#[allow_fp]
+fn percentile_work(a: u64, n: usize, pct: f64, as_median: bool) -> f64 {
+    if n == 1 {
+        return ld(a, 0)
+    }
+    let q: f64 = pct / 100.0
+    let pos: f64 = ((n - 1) as f64) * q
+    var k: usize = math.floor(pos) as usize
+    if k > n - 1 {
+        k = n - 1
+    }
+    let t: f64 = pos - (k as f64)
+    to_keys(a, n)
+    select_k(a, n, k)
+    let lo: f64 = key_value(a, k)
+    if k + 1 >= n || t == 0.0 {
+        from_keys(a, n)
+        return lo
+    }
+    // the (k+1)-th order statistic is the smallest key right of k
+    var m: u64 = rt.ld64(a, k + 1)
+    var i: usize = k + 2
+    while i < n {
+        let c: u64 = rt.ld64(a, i)
+        if c < m {
+            m = c
+        }
+        i = i + 1
+    }
+    let hi: f64 = math.math_f64(bits_of(m))
+    from_keys(a, n)
+    if as_median {
+        return midpoint(lo, hi)
+    }
+    return lerp(lo, hi, t)
+}
+
+#[allow_fp]
+fn percentile_checked(a: u64, n: usize, pct: f64, as_median: bool) -> f64 {
+    if n == 0 || pct != pct || pct < 0.0 || pct > 100.0 {
+        return nan()
+    }
+    if has_nan(a, n) {
+        return nan()
+    }
+    return percentile_work(a, n, pct, as_median)
+}
+
+// The same on a private copy: the input stays untouched.
+#[allow_fp]
+fn percentile_copy(a: u64, n: usize, pct: f64, as_median: bool) -> f64 {
+    if n == 0 || pct != pct || pct < 0.0 || pct > 100.0 || has_nan(a, n) {
+        return nan()
+    }
+    let w: u64 = rt.heap_alloc(n * 8)
+    if w == 0 {
+        return nan()
+    }
+    rt.mem_copy(w, a, n * 8)
+    let r: f64 = percentile_work(w, n, pct, as_median)
+    rt.heap_free(w, n * 8)
+    return r
+}
+
+// The p-th percentile (0 <= p <= 100) with linear interpolation; works on a
+// private copy, `p` is not modified. NaN on bad input (see the header).
+#[allow_fp]
+fn percentile(p: *mut f64, n: usize, pct: f64) -> f64 {
+    return percentile_copy(base(p, n), n, pct, false)
+}
+
+// As `percentile`, but uses the input as working space: no allocation, and
+// the n values are left PERMUTED.
+#[allow_fp]
+fn percentile_inplace(p: *mut f64, n: usize, pct: f64) -> f64 {
+    return percentile_checked(base(p, n), n, pct, false)
+}
+
+// The median (even count: mean of the two middle values); a copy is sorted.
+#[allow_fp]
+fn median(p: *mut f64, n: usize) -> f64 {
+    return percentile_copy(base(p, n), n, 50.0, true)
+}
+
+// As `median`, but the input is the working space (left permuted).
+#[allow_fp]
+fn median_inplace(p: *mut f64, n: usize) -> f64 {
+    return percentile_checked(base(p, n), n, 50.0, true)
+}
+
+// ------------------------------------------------------------ variance
+
+// Sum of squared deviations from the mean (corrected two-pass):
+//   S = sum((x-m)^2) - (sum(x-m))^2 / n
+// the second term repairs the rounding error of the mean `m`. Both sums are
+// compensated. n >= 1.
+#[allow_fp]
+fn sumsq_dev(a: u64, n: usize) -> f64 {
+    let m: f64 = mean_raw(a, n)
+    var s1: f64 = 0.0
+    var c1: f64 = 0.0
+    var s2: f64 = 0.0
+    var c2: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let d: f64 = ld(a, i) - m
+        let q: f64 = d * d
+        var t: f64 = s1 + d
+        if math.fabs(s1) >= math.fabs(d) {
+            c1 = c1 + ((s1 - t) + d)
+        } else {
+            c1 = c1 + ((d - t) + s1)
+        }
+        s1 = t
+        t = s2 + q
+        if math.fabs(s2) >= math.fabs(q) {
+            c2 = c2 + ((s2 - t) + q)
+        } else {
+            c2 = c2 + ((q - t) + s2)
+        }
+        s2 = t
+        i = i + 1
+    }
+    let d1: f64 = s1 + c1
+    let d2: f64 = s2 + c2
+    if !math.is_finite(d2) {
+        return d2
+    }
+    let r: f64 = d2 - d1 * d1 / (n as f64)
+    if r < 0.0 {
+        return 0.0
+    }
+    return r
+}
+
+// Sample variance (divide by n-1). NaN for fewer than two values.
+#[allow_fp]
+fn variance(p: *mut f64, n: usize) -> f64 {
+    if n < 2 {
+        return nan()
+    }
+    return sumsq_dev(base(p, n), n) / ((n - 1) as f64)
+}
+
+#[allow_fp]
+fn stdev(p: *mut f64, n: usize) -> f64 {
+    return math.sqrt(variance(p, n))
+}
+
+// Population variance (divide by n). NaN for the empty set, 0.0 for one value.
+#[allow_fp]
+fn pvariance(p: *mut f64, n: usize) -> f64 {
+    if n == 0 {
+        return nan()
+    }
+    return sumsq_dev(base(p, n), n) / (n as f64)
+}
+
+#[allow_fp]
+fn pstdev(p: *mut f64, n: usize) -> f64 {
+    return math.sqrt(pvariance(p, n))
+}
+
+// ----------------------------------------------------------- histogram
+
+// numpy's bin edge i of `bins` equal bins over [lo, hi]: i*step + lo, the
+// last edge exactly hi (numpy.linspace).
+#[allow_fp]
+fn edge(i: usize, bins: usize, lo: f64, hi: f64, step: f64) -> f64 {
+    if i >= bins {
+        return hi
+    }
+    return (i as f64) * step + lo
+}
+
+// Counts the values of `p[0..n]` into `bins` equal-width bins over [lo, hi]
+// and writes the counts to counts[0..bins] (set to zero first). The last
+// bin includes `hi`; values below lo, above hi, and NaN are not counted.
+// lo == hi widens the range to [lo-0.5, hi+0.5] as numpy does. Returns the
+// number of values counted; 0 (and zeroed counts) for bins == 0, lo > hi or
+// a non-finite lo/hi or hi-lo, and for a null `counts` (nothing is written).
+// The bin of every value is decided by comparing it with the computed edges
+// (as numpy does), so the result is the same as numpy.histogram's.
+#[allow_fp]
+fn histogram_raw(a: u64, n: usize, bins: usize, lo0: f64, hi0: f64, counts: *mut u64) -> usize {
+    if bins == 0 || (counts as u64) == 0 {
+        return 0
+    }
+    let c: u64 = counts as u64
+    rt.mem_set(c, 0, bins * 8)
+    var lo: f64 = lo0
+    var hi: f64 = hi0
+    if !math.is_finite(lo) || !math.is_finite(hi) || lo > hi {
+        return 0
+    }
+    if lo == hi {
+        lo = lo - 0.5
+        hi = hi + 0.5
+    }
+    if !math.is_finite(hi - lo) {
+        return 0
+    }
+    let step: f64 = (hi - lo) / (bins as f64)
+    let span: f64 = hi - lo
+    let nb: f64 = bins as f64
+    var counted: usize = 0
+    var i: usize = 0
+    while i < n {
+        let x: f64 = ld(a, i)
+        i = i + 1
+        if !(x >= lo && x <= hi) {
+            continue
+        }
+        // first guess, then fix it against the exact edges
+        // (x-lo)/span*bins as numpy does it (a division first, so a span in
+        // the denormal range cannot make the factor overflow)
+        var f: f64 = (x - lo) / span * nb
+        if !(f >= 0.0) {
+            f = 0.0
+        }
+        var b: usize = 0
+        if f < nb {
+            b = f as usize
+        } else {
+            b = bins - 1
+        }
+        if x < edge(b, bins, lo, hi, step) && b > 0 {
+            b = b - 1
+        } else {
+            if x >= edge(b + 1, bins, lo, hi, step) && b != bins - 1 {
+                b = b + 1
+            }
+        }
+        rt.st64(c, b, rt.ld64(c, b) + 1)
+        counted = counted + 1
+    }
+    return counted
+}
+
+fn histogram(p: *mut f64, n: usize, bins: usize, lo: f64, hi: f64, counts: *mut u64) -> usize {
+    return histogram_raw(base(p, n), n, bins, lo, hi, counts)
+}
+
+// ------------------------------------------------------- Vec[f64] forms
+
+#[allow_fp]
+fn sum_vec(v: *mut Vec[f64]) -> f64 {
+    return sum_raw(vbase(v), vec_len[f64](v))
+}
+
+#[allow_fp]
+fn sum_exact_vec(v: *mut Vec[f64]) -> f64 {
+    return sum_exact_raw(vbase(v), vec_len[f64](v))
+}
+
+#[allow_fp]
+fn mean_exact_vec(v: *mut Vec[f64]) -> f64 {
+    return mean_exact(vec_elem_ptr[f64](v, 0), vec_len[f64](v))
+}
+
+#[allow_fp]
+fn mean_vec(v: *mut Vec[f64]) -> f64 {
+    return mean_raw(vbase(v), vec_len[f64](v))
+}
+
+#[allow_fp]
+fn min_vec(v: *mut Vec[f64]) -> f64 {
+    return min_raw(vbase(v), vec_len[f64](v))
+}
+
+#[allow_fp]
+fn max_vec(v: *mut Vec[f64]) -> f64 {
+    return max_raw(vbase(v), vec_len[f64](v))
+}
+
+#[allow_fp]
+fn median_vec(v: *mut Vec[f64]) -> f64 {
+    return median(vec_elem_ptr[f64](v, 0), vec_len[f64](v))
+}
+
+#[allow_fp]
+fn median_vec_inplace(v: *mut Vec[f64]) -> f64 {
+    return percentile_checked(vbase(v), vec_len[f64](v), 50.0, true)
+}
+
+#[allow_fp]
+fn percentile_vec(v: *mut Vec[f64], pct: f64) -> f64 {
+    return percentile(vec_elem_ptr[f64](v, 0), vec_len[f64](v), pct)
+}
+
+#[allow_fp]
+fn percentile_vec_inplace(v: *mut Vec[f64], pct: f64) -> f64 {
+    return percentile_checked(vbase(v), vec_len[f64](v), pct, false)
+}
+
+#[allow_fp]
+fn variance_vec(v: *mut Vec[f64]) -> f64 {
+    return variance(vec_elem_ptr[f64](v, 0), vec_len[f64](v))
+}
+
+#[allow_fp]
+fn stdev_vec(v: *mut Vec[f64]) -> f64 {
+    return stdev(vec_elem_ptr[f64](v, 0), vec_len[f64](v))
+}
+
+#[allow_fp]
+fn pvariance_vec(v: *mut Vec[f64]) -> f64 {
+    return pvariance(vec_elem_ptr[f64](v, 0), vec_len[f64](v))
+}
+
+#[allow_fp]
+fn pstdev_vec(v: *mut Vec[f64]) -> f64 {
+    return pstdev(vec_elem_ptr[f64](v, 0), vec_len[f64](v))
+}
+
+fn histogram_vec(v: *mut Vec[f64], bins: usize, lo: f64, hi: f64, counts: *mut u64) -> usize {
+    return histogram_raw(vbase(v), vec_len[f64](v), bins, lo, hi, counts)
+}
+
+fn sort_vec(v: *mut Vec[f64]) {
+    let n: usize = vec_len[f64](v)
+    if n < 2 {
+        return
+    }
+    to_keys(vbase(v), n)
+    sort_keys(vbase(v), n)
+    from_keys(vbase(v), n)
+}

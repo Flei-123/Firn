@@ -1,0 +1,767 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/csv.fi -- std.csv: a reader, a table and a writer for CSV, behaving
+// like Python's `csv` module (dialect: delimiter, quotechar, doublequote,
+// lineterminator).
+//
+// Round SKRIPT-LIBS (docs/SKRIPT-LIBS.md, r313). A check script that reads a
+// report written by another program should not need a hundred lines of
+// hand written state machine (tools/script_port/check_lists.fi had one).
+//
+//     import std.csv
+//     var r: csv.Reader = csv.reader(p, n)               // over memory
+//     csv.set_delimiter(&r, 59)                          // ';' (default ',')
+//     while csv.next_row(&r) {                           // false at the end or on an error
+//         let k: usize = csv.field_count(&r)
+//         let f: str = csv.field(&r, 0)                  // unescaped, valid until the next next_row
+//     }
+//     if csv.error_code(&r) != csv.E_NONE { ... csv.error_row(&r) ... }
+//     csv.reader_free(&r)
+//
+//     var s: csv.Reader = csv.reader_fd(0)               // streaming from a descriptor
+//
+//     var t: csv.Table = csv.table_parse(p, n)           // header + rows
+//     csv.cell(&t, 0, "name")                            // row 0 (first after the header), column "name"
+//
+//     var w: csv.Writer = csv.writer(&out)               // out: rt.Buf; QUOTE_MINIMAL
+//     csv.put(&w, "a,b")
+//     csv.put(&w, "x")
+//     csv.end_row(&w)                                    // out: "\"a,b\",x\r\n"
+//
+// THE READER IS PYTHON'S. It is the state machine of `Modules/_csv.c`
+// (START_RECORD, START_FIELD, IN_FIELD, IN_QUOTED_FIELD, QUOTE_IN_QUOTED_FIELD)
+// fed with bytes, and tools/csv_cross/run.sh holds it against `csv.reader` on
+// thousands of random inputs:
+//
+//   * a blank line is an EMPTY row (zero fields), not a row with one empty
+//     field; the Table skips it
+//   * a row ends at LF, CR or CRLF (a lone CR ends a row, like a file opened
+//     with newline='')
+//   * a quoted field may hold the delimiter, CR and LF, and `""` is one quote
+//   * a quote inside an UNQUOTED field is an ordinary byte
+//   * the input needs no final newline; `a,` is the row ["a", ""]
+//   * STRICT (the default here; Python's default is the opposite, set_strict
+//     false gives it): a quoted field that is never closed, or a byte after
+//     the closing quote that is neither the delimiter nor a line end, is an
+//     ERROR with the number of the row and of the line
+//
+// STREAMING. `reader_fd` reads 64 KiB at a time and keeps only the current row:
+// memory is the longest row, not the file. The row buffer grows as the row
+// needs (a 3 MiB cell is fine) and keeps its size for the next row.
+//
+// HONEST
+// C1  The reader works on BYTES. A field is whatever octets stand between the
+//     separators; nothing checks UTF-8, and there is no field size limit
+//     (Python stops at 131072 characters by default).
+// C2  A NUL byte is data (Python 3.11 and later, too).
+// C3  `escapechar`, `skipinitialspace`, QUOTE_ALL / NONNUMERIC / NONE and
+//     `delimiter` of more than one byte are not there. The delimiter and the
+//     quote character must not be CR or LF (the setters return false).
+// C4  The writer implements QUOTE_MINIMAL only, with the quote character
+//     doubled. With `set_doublequote(&w, false)` a field that holds the quote
+//     character cannot be written (Python: "need to escape, but no
+//     escapechar set"): `put` returns false and `end_row` drops the row.
+// C5  The line terminator of the writer is at most 15 bytes. As in Python a
+//     field is quoted when it holds the delimiter, the quote character or a
+//     byte of the terminator: with the terminator "\n" a lone CR is NOT
+//     quoted and a reader (which ends a row at CR) will split it.
+// C6  The writer appends to an `rt.Buf`; it does not write a file. `rt.write_file`
+//     or `rt.write_everything` takes the buffer from there.
+// C7  The Table keeps every cell in memory. Use the Reader for files that do not fit.
+// C8  Row and line numbers count from 1. The line number is the physical line
+//     (LF, CR and CRLF each end one); Python's `reader.line_num` is the same
+//     number.
+// C9  Tests 2300-2302 also pass for --target=aarch64-linux (qemu) and
+//     --target=x86_64-windows (wine); the streaming reader uses the same
+//     `read` the rest of std uses.
+
+import rt
+import vec
+
+export {
+    Reader, Writer, Table,
+    E_NONE, E_UNTERMINATED, E_BAD_QUOTE, E_IO, NO_COL,
+    reader, reader_str, reader_fd, reader_fd_sized, reader_free,
+    set_delimiter, set_quote, set_doublequote, set_strict,
+    next_row, field_count, field, error_code, error_text, error_row, error_line, error_errno, rows_read,
+    table_parse, table_load, table_free,
+    rows, cols, header, col, cell, cell_at, has_cell, row_len, table_error, table_error_row, table_error_line,
+    writer, set_writer_delimiter, set_writer_quote, set_writer_doublequote, set_terminator,
+    put, put_bytes, put_i64, end_row,
+}
+
+const E_NONE: u32 = 0
+const E_UNTERMINATED: u32 = 1 // a quoted field is not closed at the end of the input
+const E_BAD_QUOTE: u32 = 2 // a byte other than the delimiter or a line end after the closing quote
+const E_IO: u32 = 3 // read() failed (streaming only)
+
+const CSV_CHUNK: usize = 65536
+const CSV_LF: u8 = 10
+const CSV_CR: u8 = 13
+const CSV_SYS_READ: i64 = 0
+const CSV_EINTR: i64 = 4
+
+const ST_RECORD: u8 = 0
+const ST_FIELD: u8 = 1
+const ST_IN_FIELD: u8 = 2
+const ST_IN_QUOTED: u8 = 3
+const ST_QUOTE_IN_QUOTED: u8 = 4
+
+// Not a column: what `col` answers for a name that is not in the header.
+const NO_COL: usize = 18446744073709551615
+
+// A reader over memory or over a descriptor. Create it with `reader`,
+// `reader_str` or `reader_fd`, give it back with `reader_free`.
+struct Reader {
+    mem: *mut u8, // the bytes being read: the caller's memory, or the chunk buffer
+    n: usize, // bytes in `mem`
+    i: usize, // read position
+    fd: i64,
+    stream: bool, // true: read `fd` in chunks; false: `mem` is the whole input
+    chunk: rt.Buf,
+    chunk_cap: usize, // bytes asked of read() at a time (64 KiB; reader_fd_sized changes it)
+    at_eof: bool,
+    delim: u8,
+    quote: u8,
+    doublequote: bool,
+    strict: bool,
+    row: rt.Buf, // the unescaped bytes of all fields of the current row
+    ends: Vec[usize], // end offset (in `row`) of every field of the current row
+    err: u32,
+    err_row: usize,
+    err_line: usize,
+    io_errno: i64,
+    nrows: usize, // rows delivered so far
+    lines: usize, // physical lines started so far
+    eat_lf: bool, // the last row ended at a CR: a LF right behind it belongs to it
+    line_start: bool,
+    prev_cr: bool,
+}
+
+fn new_reader(mem: *mut u8, n: usize, fd: i64) -> Reader {
+    return Reader {
+        mem: mem, n: n, i: 0, fd: fd, stream: false, chunk: rt.buf_new(), chunk_cap: CSV_CHUNK, at_eof: false,
+        delim: 44 as u8, quote: 34 as u8, doublequote: true, strict: true,
+        row: rt.buf_new(), ends: vec_new[usize](), err: 0, err_row: 0, err_line: 0,
+        io_errno: 0, nrows: 0, lines: 0, eat_lf: false, line_start: true, prev_cr: false,
+    }
+}
+
+// A reader over `n` bytes at `p`. The memory has to stay alive and unchanged
+// while the reader is used.
+fn reader(p: *mut u8, n: usize) -> Reader {
+    return new_reader(p, n, -1)
+}
+
+fn reader_str(s: str) -> Reader {
+    return new_reader(s.p, s.n, -1)
+}
+
+// A reader that reads descriptor `fd` (a file, a pipe, a socket, 0 = stdin) in
+// chunks of 64 KiB until it ends. The descriptor stays open and is the
+// caller's to close.
+fn reader_fd(fd: i64) -> Reader {
+    return reader_fd_sized(fd, CSV_CHUNK)
+}
+
+// `reader_fd` with a read size of your own (1 to 1 MiB; used by the tests to
+// make every row cross a chunk boundary).
+fn reader_fd_sized(fd: i64, chunk: usize) -> Reader {
+    var r: Reader = new_reader(0 as *mut u8, 0, fd)
+    var size: usize = chunk
+    if size < 1 {
+        size = 1
+    }
+    if size > 1048576 {
+        size = 1048576
+    }
+    r.chunk_cap = size
+    r.stream = true
+    rt.buf_reserve(&r.chunk, size)
+    if rt.buf_ptr(&r.chunk) == 0 {
+        r.err = E_IO
+        r.at_eof = true
+    }
+    return r
+}
+
+// Gives the memory of the reader back (not the descriptor, not the caller's bytes).
+fn reader_free(r: *mut Reader) {
+    rt.buf_free(&(*r).chunk)
+    rt.buf_free(&(*r).row)
+    vec_free[usize](&(*r).ends)
+    (*r).n = 0
+    (*r).i = 0
+    (*r).at_eof = true
+}
+
+// `;` for German spreadsheets, TAB for TSV. false (and no change) for CR, LF.
+fn set_delimiter(r: *mut Reader, c: u8) -> bool {
+    if c == CSV_LF || c == CSV_CR {
+        return false
+    }
+    (*r).delim = c
+    return true
+}
+
+fn set_quote(r: *mut Reader, c: u8) -> bool {
+    if c == CSV_LF || c == CSV_CR {
+        return false
+    }
+    (*r).quote = c
+    return true
+}
+
+// true (default): `""` inside a quoted field is one quote. false: a quote ends
+// the quoted part, the rest of the field is taken as it stands.
+fn set_doublequote(r: *mut Reader, on: bool) {
+    (*r).doublequote = on
+}
+
+// true (default here): errors as described at the top. false: what Python does
+// by default -- an unclosed quote at the end of the input just ends the field,
+// and a byte after the closing quote is appended to the field.
+fn set_strict(r: *mut Reader, on: bool) {
+    (*r).strict = on
+}
+
+// The next byte, or -1 at the end of the input (or after a read error).
+fn read_byte(r: *mut Reader) -> i32 {
+    if (*r).i >= (*r).n {
+        if !refill(r) {
+            return -1
+        }
+    }
+    let b: u8 = *((*r).mem + (*r).i)
+    (*r).i = (*r).i + 1
+    // line accounting: a line starts with its first byte; the LF of a CRLF belongs to the line before
+    if (*r).line_start {
+        if !((*r).prev_cr && b == CSV_LF) {
+            (*r).lines = (*r).lines + 1
+        }
+        (*r).line_start = false
+    }
+    if b == CSV_LF || b == CSV_CR {
+        (*r).line_start = true
+    }
+    (*r).prev_cr = b == CSV_CR
+    return b as i32
+}
+
+fn refill(r: *mut Reader) -> bool {
+    if !(*r).stream || (*r).at_eof {
+        return false
+    }
+    while true {
+        let got: i64 = syscall(CSV_SYS_READ, (*r).fd, rt.buf_ptr(&(*r).chunk) as i64, (*r).chunk_cap as i64, 0, 0, 0)
+        if got == 0 - CSV_EINTR {
+            continue
+        }
+        if got < 0 {
+            (*r).err = E_IO
+            (*r).io_errno = 0 - got
+            (*r).at_eof = true
+            return false
+        }
+        if got == 0 {
+            (*r).at_eof = true
+            return false
+        }
+        (*r).mem = rt.buf_data(&(*r).chunk)
+        (*r).n = got as usize
+        (*r).i = 0
+        return true
+    }
+    return false
+}
+
+fn save_field(r: *mut Reader) {
+    vec_push[usize](&(*r).ends, rt.buf_len(&(*r).row))
+}
+
+fn fail(r: *mut Reader, code: u32) -> bool {
+    (*r).err = code
+    (*r).err_row = (*r).nrows + 1
+    (*r).err_line = (*r).lines
+    return false
+}
+
+// Reads the next row. true: `field_count` and `field` describe it. false: the
+// input has ended (`error_code` is E_NONE) or went wrong (`error_code` says how); once
+// false, it stays false.
+fn next_row(r: *mut Reader) -> bool {
+    if (*r).err != 0 {
+        return false
+    }
+    rt.buf_clear(&(*r).row)
+    vec_clear[usize](&(*r).ends)
+    var state: u8 = ST_RECORD
+    while true {
+        let ci: i32 = read_byte(r)
+        if ci < 0 {
+            // the end of the input acts as a line end -- but not inside a quoted field
+            if (*r).err != 0 {
+                return false
+            }
+            if state == ST_RECORD {
+                return false
+            }
+            if state == ST_IN_QUOTED && (*r).strict {
+                return fail(r, E_UNTERMINATED)
+            }
+            save_field(r)
+            (*r).nrows = (*r).nrows + 1
+            return true
+        }
+        let c: u8 = ci as u8
+        if (*r).eat_lf {
+            (*r).eat_lf = false
+            if c == CSV_LF {
+                continue
+            }
+        }
+        let eol: bool = c == CSV_LF || c == CSV_CR
+        if state == ST_RECORD {
+            if eol {
+                (*r).nrows = (*r).nrows + 1
+                (*r).eat_lf = c == CSV_CR
+                return true
+            }
+            state = ST_FIELD
+        }
+        if state == ST_FIELD {
+            if eol {
+                save_field(r)
+                (*r).nrows = (*r).nrows + 1
+                (*r).eat_lf = c == CSV_CR
+                return true
+            } else if c == (*r).quote {
+                state = ST_IN_QUOTED
+            } else if c == (*r).delim {
+                save_field(r)
+            } else {
+                rt.buf_push(&(*r).row, c)
+                state = ST_IN_FIELD
+            }
+        } else if state == ST_IN_FIELD {
+            if eol {
+                save_field(r)
+                (*r).nrows = (*r).nrows + 1
+                (*r).eat_lf = c == CSV_CR
+                return true
+            } else if c == (*r).delim {
+                save_field(r)
+                state = ST_FIELD
+            } else {
+                rt.buf_push(&(*r).row, c)
+            }
+        } else if state == ST_IN_QUOTED {
+            if c == (*r).quote {
+                if (*r).doublequote {
+                    state = ST_QUOTE_IN_QUOTED
+                } else {
+                    state = ST_IN_FIELD
+                }
+            } else {
+                rt.buf_push(&(*r).row, c)
+            }
+        } else {
+            // a quote was seen inside a quoted field
+            if c == (*r).quote {
+                rt.buf_push(&(*r).row, c)
+                state = ST_IN_QUOTED
+            } else if c == (*r).delim {
+                save_field(r)
+                state = ST_FIELD
+            } else if eol {
+                save_field(r)
+                (*r).nrows = (*r).nrows + 1
+                (*r).eat_lf = c == CSV_CR
+                return true
+            } else if (*r).strict {
+                return fail(r, E_BAD_QUOTE)
+            } else {
+                rt.buf_push(&(*r).row, c)
+                state = ST_IN_FIELD
+            }
+        }
+    }
+    return false
+}
+
+// Number of fields of the current row (0 for a blank line).
+fn field_count(r: *mut Reader) -> usize {
+    return vec_len[usize](&(*r).ends)
+}
+
+// Field `i` of the current row, unescaped; "" past the last field. Valid until
+// the next `next_row` or `reader_free`.
+fn field(r: *mut Reader, i: usize) -> str {
+    if i >= vec_len[usize](&(*r).ends) {
+        return ""
+    }
+    var start: usize = 0
+    if i > 0 {
+        start = vec_at[usize](&(*r).ends, i - 1)
+    }
+    let end: usize = vec_at[usize](&(*r).ends, i)
+    return str { p: rt.buf_data(&(*r).row) + start, n: end - start }
+}
+
+// E_NONE while everything is fine, else E_UNTERMINATED, E_BAD_QUOTE or E_IO.
+fn error_code(r: *mut Reader) -> u32 {
+    return (*r).err
+}
+
+fn error_text(code: u32) -> str {
+    if code == E_UNTERMINATED { return "unexpected end of data: a quoted field is not closed" }
+    if code == E_BAD_QUOTE { return "delimiter expected after the closing quote" }
+    if code == E_IO { return "read error" }
+    return ""
+}
+
+// The number (from 1) of the row in which the error happened.
+fn error_row(r: *mut Reader) -> usize {
+    return (*r).err_row
+}
+
+// The number (from 1) of the physical line in which the error was found; for
+// an unclosed quote that is the last line of the input.
+fn error_line(r: *mut Reader) -> usize {
+    return (*r).err_line
+}
+
+// The errno of a failed read (E_IO), else 0.
+fn error_errno(r: *mut Reader) -> i64 {
+    return (*r).io_errno
+}
+
+// Rows delivered so far.
+fn rows_read(r: *mut Reader) -> usize {
+    return (*r).nrows
+}
+
+// ------------------------------------------------------------------ table
+
+// A header and its rows, all in memory. Blank lines are skipped. A row may
+// have fewer or more fields than the header: `cell` gives "" for a field
+// that is not there, `row_len` says how many there are.
+struct Table {
+    text: rt.Buf, // all cell bytes
+    ends: Vec[usize], // end offset (in `text`) of every cell
+    first: Vec[usize], // index in `ends` of the first cell of every row; row 0 is the header
+    err: u32,
+    err_row: usize,
+    err_line: usize,
+}
+
+// Reads every row of `r` (with the dialect set on it) into a table. The first
+// non-blank row is the header. On an error the table holds the rows before
+// it and `table_error` says what happened.
+fn table_load(r: *mut Reader) -> Table {
+    var t: Table = Table {
+        text: rt.buf_new(), ends: vec_new[usize](), first: vec_new[usize](),
+        err: 0, err_row: 0, err_line: 0,
+    }
+    while next_row(r) {
+        let k: usize = field_count(r)
+        if k == 0 {
+            continue
+        }
+        vec_push[usize](&t.first, vec_len[usize](&t.ends))
+        var i: usize = 0
+        while i < k {
+            let f: str = field(r, i)
+            rt.buf_push_bytes(&t.text, f.p as u64, f.n)
+            vec_push[usize](&t.ends, rt.buf_len(&t.text))
+            i = i + 1
+        }
+    }
+    t.err = (*r).err
+    t.err_row = (*r).err_row
+    t.err_line = (*r).err_line
+    return t
+}
+
+// A table out of `n` bytes at `p`, default dialect.
+fn table_parse(p: *mut u8, n: usize) -> Table {
+    var r: Reader = reader(p, n)
+    let t: Table = table_load(&r)
+    reader_free(&r)
+    return t
+}
+
+fn table_free(t: *mut Table) {
+    rt.buf_free(&(*t).text)
+    vec_free[usize](&(*t).ends)
+    vec_free[usize](&(*t).first)
+}
+
+// Number of data rows (without the header).
+fn rows(t: *mut Table) -> usize {
+    let k: usize = vec_len[usize](&(*t).first)
+    if k == 0 {
+        return 0
+    }
+    return k - 1
+}
+
+// Number of columns of the header.
+fn cols(t: *mut Table) -> usize {
+    return row_of_len(t, 0)
+}
+
+fn row_of_len(t: *mut Table, row: usize) -> usize {
+    let k: usize = vec_len[usize](&(*t).first)
+    if row >= k {
+        return 0
+    }
+    var stop: usize = vec_len[usize](&(*t).ends)
+    if row + 1 < k {
+        stop = vec_at[usize](&(*t).first, row + 1)
+    }
+    return stop - vec_at[usize](&(*t).first, row)
+}
+
+fn cell_of(t: *mut Table, row: usize, c: usize) -> str {
+    if c >= row_of_len(t, row) {
+        return ""
+    }
+    let idx: usize = vec_at[usize](&(*t).first, row) + c
+    var start: usize = 0
+    if idx > 0 {
+        start = vec_at[usize](&(*t).ends, idx - 1)
+    }
+    let end: usize = vec_at[usize](&(*t).ends, idx)
+    return str { p: rt.buf_data(&(*t).text) + start, n: end - start }
+}
+
+// Number of fields of data row `row` (from 0).
+fn row_len(t: *mut Table, row: usize) -> usize {
+    return row_of_len(t, row + 1)
+}
+
+// Header field `c`, "" when there is none.
+fn header(t: *mut Table, c: usize) -> str {
+    return cell_of(t, 0, c)
+}
+
+// The index of the column called `name` (the first one if the header repeats
+// it), or NO_COL.
+fn col(t: *mut Table, name: str) -> usize {
+    let k: usize = cols(t)
+    var c: usize = 0
+    while c < k {
+        let h: str = cell_of(t, 0, c)
+        if h.n == name.n && rt.mem_eq(h.p as u64, name.p as u64, h.n) {
+            return c
+        }
+        c = c + 1
+    }
+    return NO_COL
+}
+
+// Cell of data row `row` (from 0) in column `c`; "" when the row is shorter
+// or the row does not exist.
+fn cell_at(t: *mut Table, row: usize, c: usize) -> str {
+    if row >= rows(t) {
+        return ""
+    }
+    return cell_of(t, row + 1, c)
+}
+
+// Cell of data row `row` (from 0) in the column called `name`; "" when there
+// is no such column, row or field.
+fn cell(t: *mut Table, row: usize, name: str) -> str {
+    let c: usize = col(t, name)
+    if c == NO_COL {
+        return ""
+    }
+    return cell_at(t, row, c)
+}
+
+// true when data row `row` has a field in column `name` (tells "" from "missing").
+fn has_cell(t: *mut Table, row: usize, name: str) -> bool {
+    let c: usize = col(t, name)
+    if c == NO_COL || row >= rows(t) {
+        return false
+    }
+    return c < row_of_len(t, row + 1)
+}
+
+fn table_error(t: *mut Table) -> u32 {
+    return (*t).err
+}
+
+fn table_error_row(t: *mut Table) -> usize {
+    return (*t).err_row
+}
+
+fn table_error_line(t: *mut Table) -> usize {
+    return (*t).err_line
+}
+
+// ----------------------------------------------------------------- writer
+
+// Writes rows as CSV into an `rt.Buf`, QUOTE_MINIMAL: a field is quoted only
+// when it holds the delimiter, the quote character or a byte of the line
+// terminator (default CRLF).
+struct Writer {
+    out: *mut rt.Buf,
+    delim: u8,
+    quote: u8,
+    doublequote: bool,
+    term: [u8; 16],
+    term_n: usize,
+    nfields: usize, // fields of the current row
+    row_start: usize, // length of `out` when the row began
+    bytes: usize, // field bytes written in the current row (delimiters count)
+    bad: bool, // a field of the current row could not be written
+}
+
+// A writer that appends to `out`. Nothing to free: the buffer is the caller's.
+fn writer(out: *mut rt.Buf) -> Writer {
+    var w: Writer = Writer {
+        out: out, delim: 44 as u8, quote: 34 as u8, doublequote: true,
+        term: [0 as u8; 16], term_n: 2, nfields: 0, row_start: rt.buf_len(out), bytes: 0, bad: false,
+    }
+    w.term[0] = CSV_CR
+    w.term[1] = CSV_LF
+    return w
+}
+
+fn set_writer_delimiter(w: *mut Writer, c: u8) -> bool {
+    if c == CSV_LF || c == CSV_CR {
+        return false
+    }
+    (*w).delim = c
+    return true
+}
+
+fn set_writer_quote(w: *mut Writer, c: u8) -> bool {
+    if c == CSV_LF || c == CSV_CR {
+        return false
+    }
+    (*w).quote = c
+    return true
+}
+
+fn set_writer_doublequote(w: *mut Writer, on: bool) {
+    (*w).doublequote = on
+}
+
+// The line terminator written by `end_row` ("\r\n" by default). At most 15
+// bytes; false (and no change) for a longer one.
+fn set_terminator(w: *mut Writer, s: str) -> bool {
+    if s.n > 15 {
+        return false
+    }
+    var i: usize = 0
+    while i < s.n {
+        (*w).term[i] = *(s.p + i)
+        i = i + 1
+    }
+    (*w).term_n = s.n
+    return true
+}
+
+fn needs_quote(w: *mut Writer, c: u8) -> bool {
+    if c == (*w).delim || c == (*w).quote {
+        return true
+    }
+    var i: usize = 0
+    while i < (*w).term_n {
+        if (*w).term[i] == c {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Appends one field to the current row. false when it could not be written
+// (the quote character in a field with doublequote off); the row is then
+// dropped by `end_row`.
+fn put_bytes(w: *mut Writer, p: *mut u8, n: usize) -> bool {
+    if (*w).bad {
+        return false
+    }
+    if (*w).nfields == 0 {
+        (*w).row_start = rt.buf_len((*w).out)
+    }
+    if (*w).nfields > 0 {
+        rt.buf_push((*w).out, (*w).delim)
+        (*w).bytes = (*w).bytes + 1
+    }
+    (*w).nfields = (*w).nfields + 1
+    var quoted: bool = false
+    var i: usize = 0
+    while i < n {
+        let c: u8 = *(p + i)
+        if needs_quote(w, c) {
+            if c == (*w).quote && !(*w).doublequote {
+                (*w).bad = true
+                return false
+            }
+            quoted = true
+        }
+        i = i + 1
+    }
+    if quoted {
+        rt.buf_push((*w).out, (*w).quote)
+        i = 0
+        while i < n {
+            let c: u8 = *(p + i)
+            if c == (*w).quote {
+                rt.buf_push((*w).out, c)
+            }
+            rt.buf_push((*w).out, c)
+            i = i + 1
+        }
+        rt.buf_push((*w).out, (*w).quote)
+        (*w).bytes = (*w).bytes + n + 2
+    } else if n > 0 {
+        rt.buf_push_bytes((*w).out, p as u64, n)
+        (*w).bytes = (*w).bytes + n
+    }
+    return true
+}
+
+fn put(w: *mut Writer, s: str) -> bool {
+    return put_bytes(w, s.p, s.n)
+}
+
+// A decimal number as a field.
+fn put_i64(w: *mut Writer, v: i64) -> bool {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&t, v)
+    let ok: bool = put_bytes(w, rt.buf_data(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+    return ok
+}
+
+// Ends the row with the terminator. A row of exactly one empty field is written
+// as `""` (so that it is not a blank line), a row of no field as the terminator
+// alone. false when a field could not be written: the row is then removed from
+// the buffer again.
+fn end_row(w: *mut Writer) -> bool {
+    var ok: bool = true
+    if (*w).bad {
+        rt.buf_set_len((*w).out, (*w).row_start)
+        ok = false
+    } else {
+        if (*w).nfields == 1 && (*w).bytes == 0 {
+            rt.buf_push((*w).out, (*w).quote)
+            rt.buf_push((*w).out, (*w).quote)
+        }
+        var i: usize = 0
+        while i < (*w).term_n {
+            rt.buf_push((*w).out, (*w).term[i])
+            i = i + 1
+        }
+    }
+    (*w).nfields = 0
+    (*w).bytes = 0
+    (*w).bad = false
+    (*w).row_start = rt.buf_len((*w).out)
+    return ok
+}
