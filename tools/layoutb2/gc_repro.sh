@@ -2,7 +2,9 @@
 # tools/layoutb2/gc_repro.sh -- DETERMINISTIC reproducer for the sporadic
 # "engine exited with -11" / "reflow differs" of tools/layoutb2 (roadmap r461).
 #
-# It is NOT part of test.sh: it fails as long as the collector bug is open.
+# FIXED (r476): the save slots of callee-saved registers were unaligned in frames with an
+# odd sized byte local (regalloc.rs layout), so the conservative scan could not see them.
+# The time budget argument (arg 2) makes the slicing independent of the clock.
 #
 # What it does: builds lib/layout/b2_main.fi with one extra thing -- the first
 # argument is passed to gc_set_limit() (collection threshold in octets) -- and
@@ -37,6 +39,26 @@ code = """    if rt.arg_count(start) > 1 {
             gc_set_limit(lim)
         }
     }
+    if rt.arg_count(start) > 2 {
+        let ap2: u64 = rt.arg_ptr(start, 2)
+        var v2: u64 = 0
+        var q2: usize = 0
+        while rt.ld8(ap2, q2) >= 48 && rt.ld8(ap2, q2) <= 57 {
+            v2 = v2 * 10 + (rt.ld8(ap2, q2) - 48) as u64
+            q2 = q2 + 1
+        }
+        gc_set_time_budget(v2)
+    }
+    if rt.arg_count(start) > 3 {
+        let ap3: u64 = rt.arg_ptr(start, 3)
+        var v3: u64 = 0
+        var q3: usize = 0
+        while rt.ld8(ap3, q3) >= 48 && rt.ld8(ap3, q3) <= 57 {
+            v3 = v3 * 10 + (rt.ld8(ap3, q3) - 48) as u64
+            q3 = q3 + 1
+        }
+        gc_set_slice(v3)
+    }
 """
 assert anchor in s
 open("lib/layout/b2_gcrepro.fi", "w").write(s.replace(anchor, code + anchor, 1))
@@ -52,11 +74,11 @@ PY
 "$FIRNC" -o "$W/engine" lib/layout/b2_gcrepro.fi
 bad=0
 for L in $(seq 1500 100 3000); do
-    if "$W/engine" "$L" < "$W/chunk.bin" > /dev/null 2>&1; then
+    if "$W/engine" "$L" 1000000000000 < "$W/chunk.bin" > /dev/null 2>&1; then
         echo "  limit $L: ok"
     else
         echo "  limit $L: CRASH (rc $?)"; bad=$((bad + 1))
     fi
 done
-echo "crashing thresholds: $bad of 16 (some are expected while the collector bug is open)"
+echo "crashing thresholds: $bad of 16 (must be 0)"
 [ "$bad" -eq 0 ]

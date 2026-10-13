@@ -588,6 +588,14 @@ fn layout(f: &Func, extra_slots: u64) -> (Frame, Vec<(&'static str, u64)>) {
             }
         }
     }
+    // r476: an alloca of an odd size and alignment 1 (a `bool`, a `[u8; 5]`)
+    // leaves `cursor` off by up to seven. The save slots of the callee-saved
+    // registers came out UNALIGNED, and the conservative stack scan of the
+    // collector reads aligned words only -- a `Gc` pointer that lived only in a
+    // callee-saved register of the caller was invisible and got collected
+    // (layoutb2 SIGSEGV in sel.match_simple, parse_complex saved rbx at
+    // rbp-0x69).
+    cursor = align_up(cursor, 8);
     let mut saved = Vec::new();
     for k in 0..extra_slots {
         cursor += 8;
@@ -3115,6 +3123,8 @@ fn compact_frame(
             }
         }
     }
+    // r476: keep the save slots 8-aligned (see layout()).
+    cursor = align_up(cursor, 8);
     let mut saved: Vec<(&'static str, u64)> = Vec::new();
     for r in used_saved {
         cursor += 8;
