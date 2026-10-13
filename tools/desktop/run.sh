@@ -33,7 +33,7 @@ run() { "$@" || rc=1; }
 
 if [ "$WHICH" = all ] || [ "$WHICH" = linux ]; then
     step "1. build the Linux drivers in three stages (release-fast, --no-opt, dev-fast)"
-    for SRC in dbus_main tray_main notify_main autostart_main audio_main sink_main drop_main clip_main clipboard_main; do
+    for SRC in dbus_main tray_main notify_main winnotify_main autostart_main audio_main sink_main drop_main clip_main clipboard_main; do
         for STAGE in "opt:--opt-level=release-fast" "noopt:--no-opt" "dev:--opt-level=dev-fast"; do
             build "${STAGE#*:}" "$W/${SRC}_${STAGE%%:*}" "tools/desktop/$SRC.fi" || true
         done
@@ -58,6 +58,10 @@ if [ "$WHICH" = all ] || [ "$WHICH" = linux ]; then
             run python3 tools/desktop/tray_check.py "$W/tray_main_$STAGE"
             step "5. desktop.notify against a notification server in libdbus ($STAGE)"
             run python3 tools/desktop/notify_check.py "$W/notify_main_$STAGE"
+            if have Xvfb; then
+                step "5b. window.notify on X11 (Xvfb + notification server in libdbus, $STAGE)"
+                run python3 tools/desktop/winnotify_check.py "$W/winnotify_main_$STAGE"
+            fi
         done
     else
         echo "  SKIP  dbus-daemon or python3 dbus/gi missing: net.dbus, tray and notify were not checked"
