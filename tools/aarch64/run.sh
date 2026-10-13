@@ -105,6 +105,19 @@ if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
 fi
 export FOREIGN_EXEC
 
+# Does the resident size of the runner grow although the guest only maps and
+# unmaps? (tests/2189 reads /proc/self/statm, which under qemu-user is the HOST
+# process.) Decides the entries of environment.txt that name `mmap-rss-growth`.
+MMAP_RSS=unknown
+if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+    if aarch64-linux-gnu-gcc -static -O0 -o "$WORK/probe_rss" tools/aarch64/qemu_rss_probe.c 2>/dev/null; then
+        PROBE_OUT=$("$QEMU" "$WORK/probe_rss" 2>&1)
+        if [ $? -eq 0 ]; then MMAP_RSS=no; else MMAP_RSS=yes; fi
+        echo "  probe: $PROBE_OUT"
+    fi
+fi
+export MMAP_RSS
+
 # ---------------------------------------------------------------- one case
 # Writes exactly ONE result line to standard output:
 #   SAME <file> | DIFF <file> :: <why> | NOTSUP <file> :: <why>
@@ -124,6 +137,10 @@ differs() {   # $1 = file, $2 = why
             return
         fi
         if [ "$probe" = "foreign-exec" ] && [ "${FOREIGN_EXEC:-unknown}" = "no" ]; then
+            echo "ENVIRON $1 :: $reason"
+            return
+        fi
+        if [ "$probe" = "mmap-rss-growth" ] && [ "${MMAP_RSS:-unknown}" = "yes" ]; then
             echo "ENVIRON $1 :: $reason"
             return
         fi
@@ -211,7 +228,7 @@ one_case() {
     echo "SAME $file"
 }
 export -f one_case
-export FIRNC QEMU WORK FLAGS ROOT FIRNLIB FOREIGN_EXEC MMAP_REUSE
+export FIRNC QEMU WORK FLAGS ROOT FIRNLIB FOREIGN_EXEC MMAP_REUSE MMAP_RSS
 
 LIST="$WORK/list.txt"
 ls tests/*.fi > "$LIST"
