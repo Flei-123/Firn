@@ -1,0 +1,482 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/idn.fi -- PUNYCODE (RFC 3492) and international host names.
+//
+// `idn_to_ascii("bücher.example")` -> `xn--bcher-kva.example`, the form a
+// DNS question needs (lib/net/dns.fi refuses octets >= 128, D4). The
+// reverse, `idn_to_unicode`, turns `xn--` labels back into UTF-8.
+//
+// ---------------------------------------------------------------- HONEST
+//
+// I1  THIS IS PUNYCODE PLUS A SMALL CASE MAP, NOT FULL IDNA. Before
+//     encoding a label is lower-cased for ASCII, Latin-1, Latin Extended-A,
+//     Greek (basic) and Cyrillic (basic). There is NO Unicode
+//     normalisation (NFKC), NO full case folding (German sharp s stays,
+//     it does not become `ss`), NO mapping of
+//     full-width or ideographic dots, NO bidi / contextual rules and NO
+//     IDNA2008 repertoire check. Names that are already NFC and lower case
+//     (what browsers send for typed names in most scripts) encode exactly
+//     like Python's `str.encode("idna")` -- that is what the cross-check
+//     proves (tools/dns/idn_check.py); anything outside that set is not
+//     promised.
+// I2  A label that is pure ASCII is only lower-cased, never validated here
+//     (lib/net/dns.fi `dns_name_valid` does that).
+// I3  Limits: label <= 63 octets after encoding, whole name <= 253.
+import std.rt
+
+export {
+    puny_encode, puny_decode, idn_to_ascii, idn_to_unicode, idn_has_non_ascii,
+}
+
+const BASE: u64 = 36
+const TMIN: u64 = 1
+const TMAX: u64 = 26
+const SKEW: u64 = 38
+const DAMP: u64 = 700
+const INITIAL_BIAS: u64 = 72
+const INITIAL_N: u64 = 128
+const MAX_CP: usize = 64
+const MAX_NAME: usize = 253
+const MAX_LABEL: usize = 63
+
+fn adapt(delta_in: u64, numpoints: u64, first: bool) -> u64 {
+    var delta: u64 = delta_in
+    if first {
+        delta = delta / DAMP
+    } else {
+        delta = delta / 2
+    }
+    delta = delta + delta / numpoints
+    var k: u64 = 0
+    while delta > ((BASE - TMIN) * TMAX) / 2 {
+        delta = delta / (BASE - TMIN)
+        k = k + BASE
+    }
+    return k + ((BASE - TMIN + 1) * delta) / (delta + SKEW)
+}
+
+fn threshold(k: u64, bias: u64) -> u64 {
+    if k <= bias {
+        return TMIN
+    }
+    if k >= bias + TMAX {
+        return TMAX
+    }
+    return k - bias
+}
+
+fn digit_char(d: u64) -> u8 {
+    if d < 26 {
+        return (97 + d) as u8
+    }
+    return (22 + d) as u8 // '0' + (d - 26)
+}
+
+fn char_digit(c: u8) -> u64 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c as u64) - 22
+    }
+    if c >= 97 as u8 && c <= 122 as u8 {
+        return (c as u64) - 97
+    }
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return (c as u64) - 65
+    }
+    return 99
+}
+
+// Encodes `n` code points as the Punycode string (no `xn--` prefix).
+fn puny_encode(cp: *mut [u64; 64], n: usize, out: *mut rt.Buf) -> bool {
+    var b: usize = 0
+    var i: usize = 0
+    while i < n {
+        if (*cp)[i] < 128 {
+            rt.buf_push(out, (*cp)[i] as u8)
+            b = b + 1
+        }
+        i = i + 1
+    }
+    var h: usize = b
+    if b > 0 {
+        rt.buf_push(out, 45 as u8)
+    }
+    var nn: u64 = INITIAL_N
+    var delta: u64 = 0
+    var bias: u64 = INITIAL_BIAS
+    while h < n {
+        var m: u64 = 0x7FFFFFFF
+        var j: usize = 0
+        while j < n {
+            let c: u64 = (*cp)[j]
+            if c >= nn && c < m {
+                m = c
+            }
+            j = j + 1
+        }
+        delta = delta + (m - nn) * ((h + 1) as u64)
+        nn = m
+        j = 0
+        while j < n {
+            let c2: u64 = (*cp)[j]
+            if c2 < nn {
+                delta = delta + 1
+            }
+            if c2 == nn {
+                var q: u64 = delta
+                var k: u64 = BASE
+                var go: bool = true
+                while go {
+                    let t: u64 = threshold(k, bias)
+                    if q < t {
+                        go = false
+                    } else {
+                        rt.buf_push(out, digit_char(t + (q - t) % (BASE - t)))
+                        q = (q - t) / (BASE - t)
+                        k = k + BASE
+                    }
+                }
+                rt.buf_push(out, digit_char(q))
+                bias = adapt(delta, (h + 1) as u64, h == b)
+                delta = 0
+                h = h + 1
+            }
+            j = j + 1
+        }
+        delta = delta + 1
+        nn = nn + 1
+    }
+    return true
+}
+
+// Decodes Punycode text (no prefix) into code points. False on any
+// malformed input (bad digit, overflow, more than 64 points).
+fn puny_decode(p: u64, n: usize, cp: *mut [u64; 64], outn: *mut usize) -> bool {
+    var cnt: usize = 0
+    var b: usize = 0
+    var i0: usize = 0
+    while i0 < n {
+        if rt.ld8(p, i0) == 45 as u8 {
+            b = i0
+        }
+        i0 = i0 + 1
+    }
+    var j: usize = 0
+    while j < b {
+        let c: u8 = rt.ld8(p, j)
+        if c >= 128 as u8 || cnt >= MAX_CP {
+            return false
+        }
+        (*cp)[cnt] = c as u64
+        cnt = cnt + 1
+        j = j + 1
+    }
+    var inp: usize = 0
+    if b > 0 {
+        inp = b + 1
+    }
+    var nn: u64 = INITIAL_N
+    var i: u64 = 0
+    var bias: u64 = INITIAL_BIAS
+    while inp < n {
+        let oldi: u64 = i
+        var w: u64 = 1
+        var k: u64 = BASE
+        var go: bool = true
+        while go {
+            if inp >= n {
+                return false
+            }
+            let d: u64 = char_digit(rt.ld8(p, inp))
+            inp = inp + 1
+            if d >= BASE {
+                return false
+            }
+            if d > (0x7FFFFFFF - i) / w {
+                return false
+            }
+            i = i + d * w
+            let t: u64 = threshold(k, bias)
+            if d < t {
+                go = false
+            } else {
+                if w > 0x7FFFFFFF / (BASE - t) {
+                    return false
+                }
+                w = w * (BASE - t)
+                k = k + BASE
+            }
+        }
+        let outl: u64 = (cnt + 1) as u64
+        bias = adapt(i - oldi, outl, oldi == 0)
+        if i / outl > 0x7FFFFFFF - nn {
+            return false
+        }
+        nn = nn + i / outl
+        i = i % outl
+        if nn > 0x10FFFF || (nn >= 0xD800 && nn <= 0xDFFF) || cnt >= MAX_CP {
+            return false
+        }
+        var s: usize = cnt
+        while s > (i as usize) {
+            (*cp)[s] = (*cp)[s - 1]
+            s = s - 1
+        }
+        (*cp)[i as usize] = nn
+        cnt = cnt + 1
+        i = i + 1
+    }
+    *outn = cnt
+    return true
+}
+
+// Simple lower-casing, see I1.
+fn cp_lower(c: u64) -> u64 {
+    if c >= 65 && c <= 90 {
+        return c + 32
+    }
+    if c < 128 {
+        return c
+    }
+    if c >= 0xC0 && c <= 0xDE && c != 0xD7 {
+        return c + 32
+    }
+    if c >= 0x100 && c <= 0x137 && c != 0x130 && c != 0x131 {
+        if c % 2 == 0 {
+            return c + 1
+        }
+        return c
+    }
+    if c >= 0x139 && c <= 0x148 {
+        if c % 2 == 1 {
+            return c + 1
+        }
+        return c
+    }
+    if c >= 0x14A && c <= 0x177 {
+        if c % 2 == 0 {
+            return c + 1
+        }
+        return c
+    }
+    if c == 0x178 {
+        return 0xFF
+    }
+    if c >= 0x179 && c <= 0x17E {
+        if c % 2 == 1 {
+            return c + 1
+        }
+        return c
+    }
+    if c == 0x3C2 {
+        return 0x3C3 // final sigma folds to sigma
+    }
+    if c >= 0x391 && c <= 0x3A9 && c != 0x3A2 {
+        return c + 32
+    }
+    if c >= 0x410 && c <= 0x42F {
+        return c + 32
+    }
+    if c >= 0x400 && c <= 0x40F {
+        return c + 80
+    }
+    return c
+}
+
+// One UTF-8 sequence at p[i..n]; strict (no overlong forms, no surrogates,
+// <= U+10FFFF). Returns the length, 0 when malformed.
+fn utf8_next(p: u64, i: usize, n: usize, cp: *mut u64) -> usize {
+    let b0: u64 = rt.ld8(p, i) as u64
+    if b0 < 0x80 {
+        *cp = b0
+        return 1
+    }
+    var need: usize = 0
+    var v: u64 = 0
+    var minv: u64 = 0
+    if b0 >= 0xC2 && b0 <= 0xDF {
+        need = 1
+        v = b0 & 0x1F
+        minv = 0x80
+    } else if b0 >= 0xE0 && b0 <= 0xEF {
+        need = 2
+        v = b0 & 0x0F
+        minv = 0x800
+    } else if b0 >= 0xF0 && b0 <= 0xF4 {
+        need = 3
+        v = b0 & 0x07
+        minv = 0x10000
+    } else {
+        return 0
+    }
+    if i + need >= n {
+        return 0
+    }
+    var k: usize = 1
+    while k <= need {
+        let b: u64 = rt.ld8(p, i + k) as u64
+        if (b & 0xC0) != 0x80 {
+            return 0
+        }
+        v = (v << 6) | (b & 0x3F)
+        k = k + 1
+    }
+    if v < minv || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF) {
+        return 0
+    }
+    *cp = v
+    return need + 1
+}
+
+fn push_utf8(out: *mut rt.Buf, c: u64) {
+    if c < 0x80 {
+        rt.buf_push(out, c as u8)
+    } else if c < 0x800 {
+        rt.buf_push(out, (0xC0 | (c >> 6)) as u8)
+        rt.buf_push(out, (0x80 | (c & 0x3F)) as u8)
+    } else if c < 0x10000 {
+        rt.buf_push(out, (0xE0 | (c >> 12)) as u8)
+        rt.buf_push(out, (0x80 | ((c >> 6) & 0x3F)) as u8)
+        rt.buf_push(out, (0x80 | (c & 0x3F)) as u8)
+    } else {
+        rt.buf_push(out, (0xF0 | (c >> 18)) as u8)
+        rt.buf_push(out, (0x80 | ((c >> 12) & 0x3F)) as u8)
+        rt.buf_push(out, (0x80 | ((c >> 6) & 0x3F)) as u8)
+        rt.buf_push(out, (0x80 | (c & 0x3F)) as u8)
+    }
+}
+
+fn idn_has_non_ascii(p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) >= 128 as u8 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Host name (UTF-8, labels separated by '.') -> ASCII with `xn--` labels.
+// A trailing dot is kept. False on malformed UTF-8, an empty label, or a
+// limit (I3). `out` is appended to.
+fn idn_to_ascii(p: u64, n_in: usize, out: *mut rt.Buf) -> bool {
+    var n: usize = n_in
+    var root: bool = false
+    if n > 1 && rt.ld8(p, n - 1) == 46 as u8 {
+        root = true
+        n = n - 1
+    }
+    if n == 0 {
+        return false
+    }
+    let base: usize = (*out).len
+    var start: usize = 0
+    var i: usize = 0
+    while i <= n {
+        if i == n || rt.ld8(p, i) == 46 as u8 {
+            if i == start {
+                return false
+            }
+            var cps: [u64; 64] = [0; 64]
+            var cn: usize = 0
+            var ascii: bool = true
+            var k: usize = start
+            while k < i {
+                var c: u64 = 0
+                let l: usize = utf8_next(p, k, i, &c)
+                if l == 0 || cn >= MAX_CP {
+                    return false
+                }
+                if c >= 128 {
+                    ascii = false
+                }
+                cps[cn] = cp_lower(c)
+                cn = cn + 1
+                k = k + l
+            }
+            var lab: rt.Buf = rt.buf_new()
+            if ascii {
+                var m: usize = 0
+                while m < cn {
+                    rt.buf_push(&lab, cps[m] as u8)
+                    m = m + 1
+                }
+            } else {
+                rt.buf_push(&lab, 120 as u8) // x
+                rt.buf_push(&lab, 110 as u8) // n
+                rt.buf_push(&lab, 45 as u8)
+                rt.buf_push(&lab, 45 as u8)
+                if !puny_encode(&cps, cn, &lab) {
+                    rt.buf_free(&lab)
+                    return false
+                }
+            }
+            if lab.len > MAX_LABEL {
+                rt.buf_free(&lab)
+                return false
+            }
+            rt.buf_push_bytes(out, lab.ptr, lab.len)
+            rt.buf_free(&lab)
+            if i < n {
+                rt.buf_push(out, 46 as u8)
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if (*out).len - base > MAX_NAME {
+        return false
+    }
+    if root {
+        rt.buf_push(out, 46 as u8)
+    }
+    return true
+}
+
+// ASCII host name with `xn--` labels -> UTF-8. Labels that do not start
+// with `xn--` are copied lower-cased. False when a Punycode label is
+// malformed.
+fn idn_to_unicode(p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    var start: usize = 0
+    var i: usize = 0
+    while i <= n {
+        if i == n || rt.ld8(p, i) == 46 as u8 {
+            let ll: usize = i - start
+            var pre: bool = false
+            if ll > 4 {
+                let a: u8 = rt.ld8(p, start) | 32 as u8
+                let b: u8 = rt.ld8(p, start + 1) | 32 as u8
+                pre = a == 120 as u8 && b == 110 as u8
+                && rt.ld8(p, start + 2) == 45 as u8
+                && rt.ld8(p, start + 3) == 45 as u8
+            }
+            if pre {
+                var cps: [u64; 64] = [0; 64]
+                var cn: usize = 0
+                if !puny_decode(p + (start + 4) as u64, ll - 4, &cps, &cn) {
+                    return false
+                }
+                var m: usize = 0
+                while m < cn {
+                    push_utf8(out, cps[m])
+                    m = m + 1
+                }
+            } else {
+                var k: usize = start
+                while k < i {
+                    var c: u8 = rt.ld8(p, k)
+                    if c >= 65 as u8 && c <= 90 as u8 {
+                        c = c + 32 as u8
+                    }
+                    rt.buf_push(out, c)
+                    k = k + 1
+                }
+            }
+            if i < n {
+                rt.buf_push(out, 46 as u8)
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return true
+}
