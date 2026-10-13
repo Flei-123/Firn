@@ -27,7 +27,10 @@
         const u8 = (p, n) => new Uint8Array(memory.buffer, p >>> 0, n >>> 0);
         const str = (p, n) => dec.decode(u8(p, n));
         const t0 = performance.now();
-        const run = { text: '', exit_code: -1, gl: null, error: null };
+        const run = { text: '', exit_code: -1, gl: null, error: null, loop: false, frames: 0, ctx_lost_count: 0, ctx_restored_count: 0, stop: null };
+        let ctxLost = false;                    // between webglcontextlost and webglcontextrestored
+        let ctxGen = 0;                         // +1 per restore; the Firn side recreates its objects when it changes
+        let instance = null;
 
         const firn = {
             write(fd, p, n) {
@@ -55,6 +58,16 @@
                     preserveDrawingBuffer: true, powerPreference: 'high-performance',
                 });
                 if (!gl) return 0;
+                canvas.addEventListener('webglcontextlost', (e) => {
+                    e.preventDefault();         // allows the browser to restore the context later
+                    ctxLost = true; run.ctx_lost_count++;
+                    if (opts.onContext) opts.onContext('lost');
+                });
+                canvas.addEventListener('webglcontextrestored', () => {
+                    O.length = 1;               // every id from before is dead
+                    ctxLost = false; ctxGen++; run.ctx_restored_count++;
+                    if (opts.onContext) opts.onContext('restored');
+                });
                 const info = gl.getExtension('WEBGL_debug_renderer_info');
                 run.gl = {
                     version: gl.getParameter(gl.VERSION),
@@ -93,6 +106,15 @@
                 const l = gl.getUniformLocation(get(p), str(np, nn));
                 return l ? obj(l) : -1;
             },
+            firn_glw_ctx_state() { return ctxLost || (gl && gl.isContextLost()) ? 1 : 0; },
+            firn_glw_ctx_gen() { return ctxGen; },
+            firn_glw_uniform1f(l, a) { if (l >= 0) gl.uniform1f(O[l], a); },
+            firn_glw_attrib_pointer(i, size, ty, norm, stride, off) { gl.vertexAttribPointer(i, size, ty, !!norm, stride, off); },
+            firn_glw_attrib_divisor(i, d) { gl.vertexAttribDivisor(i, d); },
+            firn_glw_blend_func(s, d) { gl.blendFunc(s, d); },
+            firn_glw_draw_arrays(mode, first, count) { gl.drawArrays(mode, first, count); },
+            firn_glw_draw_arrays_instanced(mode, first, count, n) { gl.drawArraysInstanced(mode, first, count, n); },
+            firn_glw_draw_elements_instanced(mode, count, ty, off, n) { gl.drawElementsInstanced(mode, count, ty, off, n); },
             firn_glw_uniform1i(l, v) { if (l >= 0) gl.uniform1i(O[l], v); },
             firn_glw_uniform2f(l, a, b) { if (l >= 0) gl.uniform2f(O[l], a, b); },
             firn_glw_uniform3f(l, a, b, c) { if (l >= 0) gl.uniform3f(O[l], a, b, c); },
@@ -159,17 +181,116 @@
                 return () => { throw new Error('the program imports env.' + String(name) + ', which this host does not provide'); };
             },
         });
+        // ---- input: Pointer Lock + keyboard + mouse -> exports of lib/input/webraw.fi (same events as lib/input/raw) ----------
+        glw.firn_in_lock = (on) => {
+            if (on) { if (canvas.requestPointerLock) canvas.requestPointerLock(); }
+            else if (document.exitPointerLock) document.exitPointerLock();
+        };
         try {
-            const { instance } = await WebAssembly.instantiate(bytes, { firn, env });
+            const r = await WebAssembly.instantiate(bytes, { firn, env });
+            instance = r.instance;
             memory = instance.exports.memory;
             instance.exports._start();
             run.exit_code = 0;
         } catch (e) {
             if (e instanceof Exit) run.exit_code = e.code;
             else { run.exit_code = 134; run.error = (e && e.stack) ? e.stack : String(e); }
+            return run;
         }
+        const x = instance.exports;
+        if (typeof x.firn_mc_frame !== 'function') return run;   // one-shot program (gate 131 scenes)
+
+        // ---- frame loop: requestAnimationFrame -> firn_mc_frame(ms) -> 0 = stop, else keep going ----
+        run.loop = true;
+        let raf = 0, stopped = false;
+        const guard = (f) => (...a) => {
+            if (stopped) return;
+            try { f(...a); } catch (e) {
+                if (e instanceof Exit) run.exit_code = e.code; else { run.exit_code = 134; run.error = (e && e.stack) ? e.stack : String(e); }
+                stop();
+            }
+        };
+        const tick = guard((ms) => {
+            raf = 0;
+            const r = x.firn_mc_frame(ms);
+            run.frames++;
+            if (r !== 0 && !stopped) raf = requestAnimationFrame(tick);
+            else stop();
+        });
+        const dprMilli = () => Math.round((window.devicePixelRatio || 1) * 1000);
+        const sendResize = guard(() => {
+            if (typeof x.firn_mc_resize !== 'function') return;
+            const r = canvas.getBoundingClientRect();
+            x.firn_mc_resize(Math.max(1, Math.round(r.width)), Math.max(1, Math.round(r.height)), dprMilli());
+        });
+        const cleanup = [];
+        const on = (t, ev, f, o) => { t.addEventListener(ev, f, o); cleanup.push(() => t.removeEventListener(ev, f, o)); };
+        function stop() {
+            if (stopped) return;
+            stopped = true;
+            if (raf) cancelAnimationFrame(raf);
+            for (const c of cleanup) c();
+            if (opts.onStop) opts.onStop(run);
+        }
+        run.stop = stop;
+        run.pump = () => { if (!raf && !stopped) raf = requestAnimationFrame(tick); };   // restart after a paused loop
+
+        if (typeof ResizeObserver !== 'undefined') {
+            const ro = new ResizeObserver(sendResize); ro.observe(canvas); cleanup.push(() => ro.disconnect());
+        }
+        if (window.matchMedia) {                // devicePixelRatio changes (zoom, monitor switch)
+            const mq = window.matchMedia('(resolution: ' + (window.devicePixelRatio || 1) + 'dppx)');
+            const h = () => sendResize();
+            if (mq.addEventListener) { mq.addEventListener('change', h); cleanup.push(() => mq.removeEventListener('change', h)); }
+        }
+        if (typeof x.firn_in_key === 'function' && opts.input !== false) {
+            const dpr = () => (window.devicePixelRatio || 1);
+            const KEYS = run.keymap = SCANCODES;
+            const sym = (e) => (e.key && e.key.length === 1) ? e.key.codePointAt(0) : 0;
+            on(window, 'keydown', guard((e) => {
+                const sc = KEYS[e.code]; if (sc === undefined || e.repeat) { if (sc !== undefined && opts.captureKeys) e.preventDefault(); return; }
+                x.firn_in_key(1, sc, sym(e), e.timeStamp >>> 0);
+                if (opts.captureKeys) e.preventDefault();
+            }));
+            on(window, 'keyup', guard((e) => {
+                const sc = KEYS[e.code]; if (sc === undefined) return;
+                x.firn_in_key(0, sc, sym(e), e.timeStamp >>> 0);
+                if (opts.captureKeys) e.preventDefault();
+            }));
+            const pos = (e) => { const r = canvas.getBoundingClientRect(); return [Math.round((e.clientX - r.left) * dpr()), Math.round((e.clientY - r.top) * dpr())]; };
+            on(canvas, 'mousedown', guard((e) => { const p = pos(e); x.firn_in_button(1, e.button + 1, p[0], p[1]); if (opts.lockOnClick && !document.pointerLockElement && canvas.requestPointerLock) canvas.requestPointerLock(); }));
+            on(window, 'mouseup', guard((e) => { const p = pos(e); x.firn_in_button(0, e.button + 1, p[0], p[1]); }));
+            on(window, 'mousemove', guard((e) => { const p = pos(e); x.firn_in_motion(p[0], p[1], Math.round(e.movementX * dpr()), Math.round(e.movementY * dpr())); }));
+            on(canvas, 'wheel', guard((e) => { x.firn_in_wheel(e.deltaY < 0 ? 1 : (e.deltaY > 0 ? -1 : 0), e.deltaX < 0 ? -1 : (e.deltaX > 0 ? 1 : 0)); e.preventDefault(); }), { passive: false });
+            on(window, 'blur', guard(() => x.firn_in_focus(0)));
+            on(window, 'focus', guard(() => x.firn_in_focus(1)));
+            on(document, 'pointerlockchange', guard(() => x.firn_in_lock_state(document.pointerLockElement === canvas ? 1 : 0)));
+            on(canvas, 'contextmenu', (e) => { if (document.pointerLockElement === canvas) e.preventDefault(); });
+            // for tests: events as plain calls (no DOM event needed)
+            run.input = {
+                key: (down, code, key) => x.firn_in_key(down, KEYS[code], key ? key.codePointAt(0) : 0, (performance.now() | 0) >>> 0),
+                button: (down, b, px, py) => x.firn_in_button(down, b, px, py),
+                motion: (px, py, dx, dy) => x.firn_in_motion(px, py, dx, dy),
+                wheel: (dy, dx) => x.firn_in_wheel(dy, dx || 0),
+                lock_state: (on_) => x.firn_in_lock_state(on_ ? 1 : 0),
+            };
+        }
+        sendResize();
+        raf = requestAnimationFrame(tick);
         return run;
     }
+
+    // KeyboardEvent.code -> Linux scancode (linux/input-event-codes.h), the numbers lib/input/raw uses on every system.
+    const SCANCODES = {
+        Escape: 1, Digit1: 2, Digit2: 3, Digit3: 4, Digit4: 5, Digit5: 6, Digit6: 7, Digit7: 8, Digit8: 9, Digit9: 10, Digit0: 11,
+        Minus: 12, Equal: 13, Backspace: 14, Tab: 15, KeyQ: 16, KeyW: 17, KeyE: 18, KeyR: 19, KeyT: 20, KeyY: 21, KeyU: 22, KeyI: 23,
+        KeyO: 24, KeyP: 25, BracketLeft: 26, BracketRight: 27, Enter: 28, ControlLeft: 29, KeyA: 30, KeyS: 31, KeyD: 32, KeyF: 33,
+        KeyG: 34, KeyH: 35, KeyJ: 36, KeyK: 37, KeyL: 38, Semicolon: 39, Quote: 40, Backquote: 41, ShiftLeft: 42, Backslash: 43,
+        KeyZ: 44, KeyX: 45, KeyC: 46, KeyV: 47, KeyB: 48, KeyN: 49, KeyM: 50, Comma: 51, Period: 52, Slash: 53, ShiftRight: 54,
+        NumpadMultiply: 55, AltLeft: 56, Space: 57, CapsLock: 58, F1: 59, F2: 60, F3: 61, F4: 62, F5: 63, F6: 64, F7: 65, F8: 66,
+        F9: 67, F10: 68, F11: 87, F12: 88, ControlRight: 97, AltRight: 100, Home: 102, ArrowUp: 103, PageUp: 104, ArrowLeft: 105,
+        ArrowRight: 106, End: 107, ArrowDown: 108, PageDown: 109, Insert: 110, Delete: 111, MetaLeft: 125, MetaRight: 126,
+    };
 
     root.startMcWeb = startMcWeb;
 })(typeof window !== 'undefined' ? window : globalThis);

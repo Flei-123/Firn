@@ -37,6 +37,9 @@ import mc.mc_math
 export {
     GlWeb, glweb_open, glweb_close, glweb_backend, glweb_show, glweb_set_fog, glweb_set_cull, glweb_resize,
     glweb_draws, glweb_tris, glweb_finish, glweb_calls, glweb_upload_bytes, glweb_error, glweb_width, glweb_height,
+    glweb_camera_rv, glweb_fog_on, glweb_fog_start, glweb_fog_end, glweb_fog_r, glweb_fog_g, glweb_fog_b,
+    glweb_rebind, glweb_poll_context, glweb_recreate, glweb_keep_meshes, glweb_lost_meshes, glweb_fbo,
+    CTX_OK, CTX_LOST, CTX_RESTORED,
 }
 
 // ---- the host (demos/mcweb/glweb.js) --------------------------------------------------------------------------
@@ -95,6 +98,8 @@ extern fn firn_glw_flush();
 extern fn firn_glw_finish();
 extern fn firn_glw_get_error() -> i32;
 extern fn firn_glw_present(w: i32, h: i32);
+extern fn firn_glw_ctx_state() -> i32; // 0 = context alive, 1 = webglcontextlost seen and not yet restored
+extern fn firn_glw_ctx_gen() -> i32; // +1 on every webglcontextrestored (all WebGL object ids from before are dead)
 
 // ---- GL constants (the numbers of WebGL2 = GL ES 3.0 = GL 3.3 for these) --------------------------------------
 const GL_DEPTH_BUFFER_BIT: i32 = 0x100
@@ -135,7 +140,10 @@ const GL_UNPACK_ALIGNMENT: i32 = 0xCF5
 const GL_TEXTURE0: i32 = 0x84C0
 
 // mesh slot (words): vao, vbo, ibo, nidx, used
-const SLOT_WORDS: usize = 5
+const SLOT_WORDS: usize = 8
+const S_VCOPY: usize = 5 // CPU copy of the vertices (only with keep_meshes, for context restore)
+const S_ICOPY: usize = 6
+const S_NV: usize = 7
 const S_VAO: usize = 0
 const S_VBO: usize = 1
 const S_IBO: usize = 2
@@ -181,6 +189,10 @@ struct GlWeb {
     tris: u64,
     calls: u64,
     up_bytes: u64,
+    gen: i32, // host context generation this object set was created for
+    keep: bool, // keep CPU copies of every mesh (restore after context loss)
+    lost_meshes: u32, // meshes dropped by the last glweb_recreate (no CPU copy)
+    atlas_src: u64, // the mc_texture.Atlas last given to upload_atlas (must stay alive; re-uploaded on restore)
     log: [u8; 512], // shader / link log of a failed open
 }
 
@@ -189,7 +201,7 @@ fn empty(w: i32, h: i32) -> GlWeb {
         l_fog: 0 - 1, l_fogc: 0 - 1, fbo: 0, color: 0, depth: 0, atlas_tex: 0, atile: 16, acols: 16, slots: 0, slot_cap: 0,
         cx: 0.0, cy: 0.0, cz: 0.0, rv: [0.0 as f32; 16], fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0.0,
         fog_g: 0.0, fog_b: 0.0, cull: true, pix: 0, tmp: 0, fresh: false, cur_vao: 0, draws: 0, tris: 0, calls: 0,
-        up_bytes: 0, log: [0; 512] }
+        up_bytes: 0, gen: 0, keep: true, lost_meshes: 0, atlas_src: 0, log: [0; 512] }
 }
 
 const VS_SRC: str = __include_str("glweb_vs.glsl")
@@ -236,22 +248,9 @@ fn glweb_open(w: i32, h: i32) -> GlWeb {
         gw.step = 1
         return gw
     }
-    gw.prog = firn_glw_program(VS_SRC.p as u32, VS_SRC.n as u32, FS_SRC.p as u32, FS_SRC.n as u32,
-        (&gw.log[0]) as u32, 512 as u32)
-    if gw.prog == 0 {
-        gw.step = 2
-        return gw
-    }
-    gw.l_rv = uloc(&gw, "u_rv")
-    gw.l_origin = uloc(&gw, "u_origin")
-    gw.l_atlas = uloc(&gw, "u_atlas")
-    gw.l_tiles = uloc(&gw, "u_tiles")
-    gw.l_fog = uloc(&gw, "u_fog")
-    gw.l_fogc = uloc(&gw, "u_fogc")
-    if !make_fbo(&gw, w, h) {
-        gw.step = 3
-        return gw
-    }
+    gw.gen = firn_glw_ctx_gen()
+    gw.step = make_gpu_objects(&gw)
+    if gw.step != 0 { return gw }
     let n: usize = (w as usize) * (h as usize) * 4
     gw.pix = rt.heap_alloc(n)
     gw.tmp = rt.heap_alloc(n)
@@ -261,6 +260,21 @@ fn glweb_open(w: i32, h: i32) -> GlWeb {
     }
     gw.ok = true
     return gw
+}
+
+// Program + uniform locations + FBO (the objects that die with a lost context). 0 = ok, 2 program, 3 FBO.
+fn make_gpu_objects(gw: *mut GlWeb) -> i32 {
+    (*gw).prog = firn_glw_program(VS_SRC.p as u32, VS_SRC.n as u32, FS_SRC.p as u32, FS_SRC.n as u32,
+        (&(*gw).log[0]) as u32, 512 as u32)
+    if (*gw).prog == 0 { return 2 }
+    (*gw).l_rv = uloc(gw, "u_rv")
+    (*gw).l_origin = uloc(gw, "u_origin")
+    (*gw).l_atlas = uloc(gw, "u_atlas")
+    (*gw).l_tiles = uloc(gw, "u_tiles")
+    (*gw).l_fog = uloc(gw, "u_fog")
+    (*gw).l_fogc = uloc(gw, "u_fogc")
+    if !make_fbo(gw, (*gw).w, (*gw).h) { return 3 }
+    return 0
 }
 
 fn glweb_width(gw: *mut GlWeb) -> i32 { return (*gw).w }
@@ -342,6 +356,7 @@ fn be_atlas(o: u64, a: u64) {
     let gw: *mut GlWeb = o as *mut GlWeb
     let at: *mut mc_texture.Atlas = a as *mut mc_texture.Atlas
     if (*at).px == 0 { return }
+    (*gw).atlas_src = a
     if (*gw).atlas_tex != 0 {
         firn_glw_delete_texture((*gw).atlas_tex)
         (*gw).atlas_tex = 0
@@ -417,6 +432,26 @@ fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize)
         rt.st64((*gw).slots, b + S_USED, 1 as u64) // empty section: nothing to draw
         return s + 1
     }
+    if (*gw).keep {
+        let vc: u64 = rt.heap_alloc(nverts * 8)
+        let ic: u64 = rt.heap_alloc(nidx * 4)
+        if vc != 0 && ic != 0 {
+            rt.mem_copy(vc, verts, nverts * 8)
+            rt.mem_copy(ic, idx, nidx * 4)
+            rt.st64((*gw).slots, b + S_VCOPY, vc)
+            rt.st64((*gw).slots, b + S_ICOPY, ic)
+        } else {
+            if vc != 0 { rt.heap_free(vc, nverts * 8) }
+            if ic != 0 { rt.heap_free(ic, nidx * 4) }
+        }
+    }
+    rt.st64((*gw).slots, b + S_NV, nverts as u64)
+    gpu_mesh(gw, b, verts, nverts, idx, nidx)
+    return s + 1
+}
+
+// Creates VAO + VBO + IBO of slot word base `b` from CPU data.
+fn gpu_mesh(gw: *mut GlWeb, b: usize, verts: u64, nverts: usize, idx: u64, nidx: usize) {
     let vao: i32 = firn_glw_create_vao()
     firn_glw_bind_vao(vao)
     let vbo: i32 = firn_glw_create_buffer()
@@ -435,7 +470,6 @@ fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize)
     rt.st64((*gw).slots, b + S_NIDX, nidx as u64)
     rt.st64((*gw).slots, b + S_USED, 1 as u64)
     (*gw).up_bytes = (*gw).up_bytes + ((nverts * 8 + nidx * 4) as u64)
-    return s + 1
 }
 
 fn free_slot(gw: *mut GlWeb, handle: usize) {
@@ -448,11 +482,64 @@ fn free_slot(gw: *mut GlWeb, handle: usize) {
     if vao != 0 { firn_glw_delete_vao(vao) }
     if vbo != 0 { firn_glw_delete_buffer(vbo) }
     if ibo != 0 { firn_glw_delete_buffer(ibo) }
+    drop_copies(gw, b)
     rt.st64((*gw).slots, b + S_USED, 0 as u64)
+}
+
+fn drop_copies(gw: *mut GlWeb, b: usize) {
+    let vc: u64 = rt.ld64((*gw).slots, b + S_VCOPY)
+    let ic: u64 = rt.ld64((*gw).slots, b + S_ICOPY)
+    let nv: usize = rt.ld64((*gw).slots, b + S_NV) as usize
+    let ni: usize = rt.ld64((*gw).slots, b + S_NIDX) as usize
+    if vc != 0 { rt.heap_free(vc, nv * 8) }
+    if ic != 0 { rt.heap_free(ic, ni * 4) }
+    rt.st64((*gw).slots, b + S_VCOPY, 0 as u64)
+    rt.st64((*gw).slots, b + S_ICOPY, 0 as u64)
 }
 
 fn be_free(o: u64, h: usize) {
     free_slot(o as *mut GlWeb, h)
+}
+
+// The voxel pass state (FBO, depth, cull) without clearing.
+fn voxel_state(gw: *mut GlWeb) {
+    firn_glw_bind_framebuffer(GL_FRAMEBUFFER, (*gw).fbo)
+    firn_glw_viewport(0, 0, (*gw).w, (*gw).h)
+    firn_glw_disable(GL_BLEND)
+    firn_glw_disable(GL_SCISSOR_TEST)
+    firn_glw_enable(GL_DEPTH_TEST)
+    firn_glw_depth_func(GL_LESS)
+    firn_glw_depth_mask(1)
+    firn_glw_color_mask(1, 1, 1, 1)
+    firn_glw_front_face(GL_CCW)
+    if (*gw).cull {
+        firn_glw_enable(GL_CULL_FACE)
+        firn_glw_cull_face(GL_BACK)
+    } else {
+        firn_glw_disable(GL_CULL_FACE)
+    }
+}
+
+// Program, atlas and per-frame uniforms of the voxel pass.
+fn voxel_program(gw: *mut GlWeb) {
+    firn_glw_use_program((*gw).prog)
+    firn_glw_active_texture(GL_TEXTURE0)
+    firn_glw_bind_texture(GL_TEXTURE_2D_ARRAY, (*gw).atlas_tex)
+    firn_glw_uniform1i((*gw).l_atlas, 0)
+    firn_glw_uniform_matrix4fv((*gw).l_rv, ((&(*gw).rv[0]) as u64) as u32)
+    firn_glw_uniform2f((*gw).l_tiles, (*gw).atile as f64, (*gw).acols as f64)
+    var fogf: f64 = 0.0
+    if (*gw).fog_on { fogf = 1.0 }
+    firn_glw_uniform4f((*gw).l_fog, fogf, (*gw).fog_start, (*gw).fog_end, 0.0)
+    firn_glw_uniform3f((*gw).l_fogc, (*gw).fog_r, (*gw).fog_g, (*gw).fog_b)
+    firn_glw_bind_vao(0)
+    (*gw).cur_vao = 0
+}
+
+// After another pass (gpu.glweb_scene) drew: voxel state is back, further b.draw calls work (glbe_rebind twin).
+fn glweb_rebind(gw: *mut GlWeb) {
+    voxel_state(gw)
+    voxel_program(gw)
 }
 
 fn be_begin(o: u64, cam: u64, rgba: u32) {
@@ -473,40 +560,14 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
         (*gw).rv[i] = rv.m[i] as f32
         i = i + 1
     }
-    firn_glw_bind_framebuffer(GL_FRAMEBUFFER, (*gw).fbo)
-    firn_glw_viewport(0, 0, (*gw).w, (*gw).h)
-    firn_glw_disable(GL_BLEND)
-    firn_glw_disable(GL_SCISSOR_TEST)
-    firn_glw_enable(GL_DEPTH_TEST)
-    firn_glw_depth_func(GL_LESS)
-    firn_glw_depth_mask(1)
-    firn_glw_color_mask(1, 1, 1, 1)
-    firn_glw_front_face(GL_CCW)
-    if (*gw).cull {
-        firn_glw_enable(GL_CULL_FACE)
-        firn_glw_cull_face(GL_BACK)
-    } else {
-        firn_glw_disable(GL_CULL_FACE)
-    }
+    voxel_state(gw)
     let r: f64 = ((rgba & 255 as u32) as f64) / 255.0
     let gr: f64 = (((rgba >> 8 as u32) & 255 as u32) as f64) / 255.0
     let b: f64 = (((rgba >> 16 as u32) & 255 as u32) as f64) / 255.0
     let a: f64 = (((rgba >> 24 as u32) & 255 as u32) as f64) / 255.0
     firn_glw_clear_color(r, gr, b, a)
     firn_glw_clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-    // program, atlas, uniforms
-    firn_glw_use_program((*gw).prog)
-    firn_glw_active_texture(GL_TEXTURE0)
-    firn_glw_bind_texture(GL_TEXTURE_2D_ARRAY, (*gw).atlas_tex)
-    firn_glw_uniform1i((*gw).l_atlas, 0)
-    firn_glw_uniform_matrix4fv((*gw).l_rv, ((&(*gw).rv[0]) as u64) as u32)
-    firn_glw_uniform2f((*gw).l_tiles, (*gw).atile as f64, (*gw).acols as f64)
-    var fogf: f64 = 0.0
-    if (*gw).fog_on { fogf = 1.0 }
-    firn_glw_uniform4f((*gw).l_fog, fogf, (*gw).fog_start, (*gw).fog_end, 0.0)
-    firn_glw_uniform3f((*gw).l_fogc, (*gw).fog_r, (*gw).fog_g, (*gw).fog_b)
-    firn_glw_bind_vao(0)
-    (*gw).cur_vao = 0
+    voxel_program(gw)
     (*gw).fresh = false
 }
 
@@ -585,4 +646,100 @@ fn glweb_backend(gw: *mut GlWeb) -> mc_backend.Backend {
     b.present = be_present
     b.read_pixels = be_read
     return b
+}
+
+// ---- context loss (webglcontextlost / webglcontextrestored) ---------------------------------------------------
+// The host (demos/mcweb/glweb.js) calls preventDefault on `webglcontextlost`, so the browser may restore the context; while
+// it is lost every WebGL call of the host is a no-op and `firn_glw_ctx_state` says 1. On `webglcontextrestored` the host
+// forgets ALL object ids (they are dead) and raises `firn_glw_ctx_gen`. The frame loop calls glweb_poll_context first:
+//     CTX_LOST     skip the frame (nothing is drawn, nothing is uploaded)
+//     CTX_RESTORED the context came back and glweb_recreate has rebuilt program, FBO, atlas and the meshes that have a CPU
+//                  copy (keep_meshes, default on) -- recreate your own objects too (gpu.glweb_scene: wscene_recreate)
+//     CTX_OK       draw
+const CTX_OK: i32 = 0
+const CTX_LOST: i32 = 1
+const CTX_RESTORED: i32 = 2
+
+fn glweb_keep_meshes(gw: *mut GlWeb, on: bool) {
+    (*gw).keep = on
+}
+
+// Meshes without a CPU copy that the last glweb_recreate had to drop (their handles draw nothing; re-upload them).
+fn glweb_lost_meshes(gw: *mut GlWeb) -> u32 {
+    return (*gw).lost_meshes
+}
+
+fn glweb_fbo(gw: *mut GlWeb) -> i32 {
+    return (*gw).fbo
+}
+
+// Rebuilds everything that lived in the dead context. The ids in the struct are stale and are NOT deleted (the host dropped them).
+fn glweb_recreate(gw: *mut GlWeb) -> bool {
+    (*gw).gen = firn_glw_ctx_gen()
+    (*gw).prog = 0
+    (*gw).fbo = 0
+    (*gw).color = 0
+    (*gw).depth = 0
+    (*gw).atlas_tex = 0
+    (*gw).cur_vao = 0
+    (*gw).fresh = false
+    (*gw).lost_meshes = 0 as u32
+    (*gw).ok = false
+    firn_glw_size((*gw).w, (*gw).h)
+    let st: i32 = make_gpu_objects(gw)
+    if st != 0 {
+        (*gw).step = st
+        return false
+    }
+    if (*gw).atlas_src != 0 {
+        be_atlas(gw as u64, (*gw).atlas_src)
+    }
+    var s: usize = 0
+    while s < (*gw).slot_cap {
+        let b: usize = s * SLOT_WORDS
+        if rt.ld64((*gw).slots, b + S_USED) != 0 as u64 && rt.ld64((*gw).slots, b + S_NIDX) != 0 as u64 {
+            let vc: u64 = rt.ld64((*gw).slots, b + S_VCOPY)
+            let ic: u64 = rt.ld64((*gw).slots, b + S_ICOPY)
+            if vc != 0 && ic != 0 {
+                gpu_mesh(gw, b, vc, rt.ld64((*gw).slots, b + S_NV) as usize, ic, rt.ld64((*gw).slots, b + S_NIDX) as usize)
+            } else {
+                rt.st64((*gw).slots, b + S_VAO, 0 as u64)
+                rt.st64((*gw).slots, b + S_VBO, 0 as u64)
+                rt.st64((*gw).slots, b + S_IBO, 0 as u64)
+                rt.st64((*gw).slots, b + S_NIDX, 0 as u64)
+                (*gw).lost_meshes = (*gw).lost_meshes + 1 as u32
+            }
+        }
+        s = s + 1
+    }
+    (*gw).ok = true
+    return true
+}
+
+fn glweb_poll_context(gw: *mut GlWeb) -> i32 {
+    if firn_glw_ctx_state() != 0 { return CTX_LOST }
+    if firn_glw_ctx_gen() != (*gw).gen {
+        if !glweb_recreate(gw) {
+            (*gw).gen = 0 - 1 // try again next poll
+            return CTX_LOST
+        }
+        return CTX_RESTORED
+    }
+    return CTX_OK
+}
+
+// ---- accessors for gpu.glweb_scene ---------------------------------------------------------------------------
+fn glweb_fog_on(gw: *mut GlWeb) -> bool { return (*gw).fog_on }
+fn glweb_fog_start(gw: *mut GlWeb) -> f64 { return (*gw).fog_start }
+fn glweb_fog_end(gw: *mut GlWeb) -> f64 { return (*gw).fog_end }
+fn glweb_fog_r(gw: *mut GlWeb) -> f64 { return (*gw).fog_r }
+fn glweb_fog_g(gw: *mut GlWeb) -> f64 { return (*gw).fog_g }
+fn glweb_fog_b(gw: *mut GlWeb) -> f64 { return (*gw).fog_b }
+
+// The camera of the last begin: projection * view rotation (16 f32 to `rv`) and the position the origins are relative to.
+fn glweb_camera_rv(gw: *mut GlWeb, rv: u64, cx: *mut f64, cy: *mut f64, cz: *mut f64) {
+    rt.mem_copy(rv, (&(*gw).rv[0]) as u64, 64)
+    *cx = (*gw).cx
+    *cy = (*gw).cy
+    *cz = (*gw).cz
 }

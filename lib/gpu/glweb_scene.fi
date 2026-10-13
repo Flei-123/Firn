@@ -1,0 +1,559 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/glweb_scene.fi -- gpu.glweb_scene: the WebGL2 twin of lib/gpu/gl_scene.fi (sky, light tint, entity instancing, HUD).
+//
+//     import gpu.glweb
+//     import gpu.glweb_scene
+//     var gw: glweb.GlWeb = glweb.glweb_open(640, 360)
+//     var sc: glweb_scene.WScene = glweb_scene.wscene_open(&gw)
+//     // every frame (camera updated), same order as gl_scene / the CPU path:
+//     b.begin(b.obj, cam, clear)
+//     glweb_scene.wscene_sky(&sc, &cam, &sky)            // background (mc_sky) per pixel, depth untouched
+//     b.draw(...) ...; b.end(b.obj)                      // voxel sections
+//     glweb_scene.wscene_ent_add(&sc, &e) ...; glweb_scene.wscene_ent_flush(&sc, &cam)   // instanced boxes, CPU culled
+//     glweb_scene.wscene_tint(&sc, &sky)
+//     mc_hud.hud_record(&rec); mc_hud.hud_frame(..); mc_hud.hud_record(0)
+//     glweb_scene.wscene_hud(&sc, &rec)
+//     glweb.glweb_show(&gw)                              // FBO -> canvas
+//
+// The semantics are those of gl_scene.fi (same pass order, same statistics, same uniform values), with these WebGL2 differences:
+//   * shaders are the ES 3.00 files lib/gpu/glweb_{sky_vs,sky_fs,tint_fs,ent_vs,ent_fs,hud_vs,hud_fs}.glsl (copies of gl_*.glsl with
+//     a new header; the HUD rectangle attribute is `uvec4` because ES checks the attribute base type);
+//   * glbe_flush is a no-op: glweb draws immediately (MODE_LEGACY), nothing is collected;
+//   * Hi-Z/frustum culling (gpu.cull) is pure Firn and works unchanged; Hi-Z on the GPU (compute) does not exist in WebGL2;
+//   * timer queries: NOT implemented. wscene_timers() is false and wscene_pass_ms() is 0.0 (EXT_disjoint_timer_query_webgl2 is
+//     often blocked and coarse; `firn_glw_*` has no timer imports yet). Honest false, no fake numbers;
+//   * MSAA / resolve / scene_present_window: not here (glweb.glweb_show blits the FBO to the canvas);
+//   * the entity type `Ent` is its own struct (same fields as gl_scene.Ent): gl_scene itself cannot be imported in the browser
+//     until the lib/@web/gpu twins exist (docs/WEBGL2.md section 4).
+// Context loss: wscene_recreate rebuilds programs and buffers after glweb.glweb_poll_context returned CTX_RESTORED.
+// NOT measured on a real GPU (SwiftShader only).
+
+import std.rt
+import std.math
+import mc.mc_camera
+import mc.mc_math
+import mc.mc_sky
+import gpu.glweb
+import gpu.cull
+
+export {
+    WScene, Ent, ent_new, wscene_empty, wscene_open, wscene_close, wscene_recreate, wscene_set_cull, wscene_sky, wscene_tint,
+    wscene_ent_add, wscene_ent_occluder, wscene_ent_flush, wscene_ent_clear, wscene_hud, wscene_timers, wscene_pass_ms,
+}
+
+extern fn firn_glw_program(vp: u32, vn: u32, fp: u32, fnn: u32, lp: u32, lcap: u32) -> i32;
+extern fn firn_glw_delete_program(p: i32);
+extern fn firn_glw_use_program(p: i32);
+extern fn firn_glw_uniform_location(p: i32, np: u32, nn: u32) -> i32;
+extern fn firn_glw_uniform1i(l: i32, v: i32);
+extern fn firn_glw_uniform2f(l: i32, a: f64, b: f64);
+extern fn firn_glw_uniform3f(l: i32, a: f64, b: f64, c: f64);
+extern fn firn_glw_uniform4f(l: i32, a: f64, b: f64, c: f64, d: f64);
+extern fn firn_glw_uniform1f(l: i32, a: f64);
+extern fn firn_glw_uniform_matrix4fv(l: i32, p: u32);
+extern fn firn_glw_create_buffer() -> i32;
+extern fn firn_glw_bind_buffer(t: i32, b: i32);
+extern fn firn_glw_buffer_data(t: i32, p: u32, n: u32, usage: i32);
+extern fn firn_glw_delete_buffer(b: i32);
+extern fn firn_glw_create_vao() -> i32;
+extern fn firn_glw_bind_vao(v: i32);
+extern fn firn_glw_delete_vao(v: i32);
+extern fn firn_glw_enable_attrib(i: i32);
+extern fn firn_glw_attrib_ipointer(i: i32, size: i32, ty: i32, stride: i32, off: i32);
+extern fn firn_glw_attrib_pointer(i: i32, size: i32, ty: i32, norm: i32, stride: i32, off: i32);
+extern fn firn_glw_attrib_divisor(i: i32, d: i32);
+extern fn firn_glw_bind_framebuffer(t: i32, f: i32);
+extern fn firn_glw_viewport(x: i32, y: i32, w: i32, h: i32);
+extern fn firn_glw_enable(c: i32);
+extern fn firn_glw_disable(c: i32);
+extern fn firn_glw_depth_func(f: i32);
+extern fn firn_glw_depth_mask(b: i32);
+extern fn firn_glw_color_mask(r: i32, g: i32, b: i32, a: i32);
+extern fn firn_glw_blend_func(s: i32, d: i32);
+extern fn firn_glw_draw_arrays(mode: i32, first: i32, count: i32);
+extern fn firn_glw_draw_arrays_instanced(mode: i32, first: i32, count: i32, n: i32);
+extern fn firn_glw_draw_elements_instanced(mode: i32, count: i32, ty: i32, off: i32, n: i32);
+
+const SKY_VS: str = __include_str("glweb_sky_vs.glsl")
+const SKY_FS: str = __include_str("glweb_sky_fs.glsl")
+const TINT_FS: str = __include_str("glweb_tint_fs.glsl")
+const ENT_VS: str = __include_str("glweb_ent_vs.glsl")
+const ENT_FS: str = __include_str("glweb_ent_fs.glsl")
+const HUD_VS: str = __include_str("glweb_hud_vs.glsl")
+const HUD_FS: str = __include_str("glweb_hud_fs.glsl")
+
+const GL_FRAMEBUFFER: i32 = 0x8D40
+const GL_TRIANGLES: i32 = 4
+const GL_TRIANGLE_STRIP: i32 = 5
+const GL_LESS: i32 = 0x201
+const GL_GREATER: i32 = 0x204
+const GL_DEPTH_TEST: i32 = 0xB71
+const GL_CULL_FACE: i32 = 0xB44
+const GL_BLEND: i32 = 0xBE2
+const GL_SCISSOR_TEST: i32 = 0xC11
+const GL_ARRAY_BUFFER: i32 = 0x8892
+const GL_ELEMENT_ARRAY_BUFFER: i32 = 0x8893
+const GL_STATIC_DRAW: i32 = 0x88E4
+const GL_STREAM_DRAW: i32 = 0x88E0
+const GL_FLOAT: i32 = 0x1406
+const GL_UNSIGNED_INT: i32 = 0x1405
+const GL_UNSIGNED_SHORT: i32 = 0x1403
+const GL_ZERO: i32 = 0
+const GL_SRC_ALPHA: i32 = 0x302
+const GL_ONE_MINUS_SRC_ALPHA: i32 = 0x303
+const GL_DST_COLOR: i32 = 0x306
+const GL_ONE_MINUS_DST_COLOR: i32 = 0x307
+
+const ENT_WORDS: usize = 12
+const ENT_BYTES: usize = 96
+const INST_F32: usize = 12
+const HUD_REC_BYTES: usize = 24
+
+struct Ent {
+    x: f64, y: f64, z: f64, // centre (world)
+    sx: f64, sy: f64, sz: f64, // size along the box axes before the yaw
+    yaw_sin: f64, yaw_cos: f64,
+    r: u32, g: u32, b: u32, // colour 0..255
+}
+
+struct WScene {
+    ok: bool,
+    step: i32, // 0 = ok, 1 back end not ok, 2 program (see gw.log), 3 buffers
+    gw: *mut glweb.GlWeb,
+    sky_p: i32, tint_p: i32, ent_p: i32, hud_p: i32,
+    // uniform locations (cached: the host allocates an id per lookup)
+    sky_l: [i32; 10], // u_r u_u u_f u_cam u_h u_zen u_hor u_glc u_sun u_discs
+    tint_l: i32, // u_tint
+    ent_l: [i32; 3], // u_rv u_fog u_fogc
+    hud_l: [i32; 2], // u_size u_invert
+    vao0: i32,
+    ent_vao: i32, cube_vbo: i32, cube_ibo: i32, inst_vbo: i32,
+    hud_vao: i32, hud_vbo: i32,
+    ents: rt.Buf,
+    inst: u64,
+    inst_cap: usize,
+    cu: cull.Cull,
+    cull_on: bool,
+    st_in: u32, st_drawn: u32, st_frustum: u32, st_occ: u32, st_hud_rects: u32, st_hud_runs: u32,
+}
+
+fn ent_new(x: f64, y: f64, z: f64, sx: f64, sy: f64, sz: f64, yaw: f64, r: u32, g: u32, b: u32) -> Ent {
+    return Ent { x: x, y: y, z: z, sx: sx, sy: sy, sz: sz, yaw_sin: math.sin(yaw), yaw_cos: math.cos(yaw), r: r, g: g, b: b }
+}
+
+fn wf(p: u64, i: usize, v: f64) {
+    *((p + (i as u64) * (8 as u64)) as *mut f64) = v
+}
+
+fn rf(p: u64, i: usize) -> f64 {
+    return *((p + (i as u64) * (8 as u64)) as *mut f64)
+}
+
+fn wf32(p: u64, i: usize, v: f64) {
+    *((p + (i as u64) * (4 as u64)) as *mut f32) = v as f32
+}
+
+fn push_ent(sc: *mut WScene, e: *mut Ent, occluder: bool) {
+    var w: [f64; 12] = [(*e).x, (*e).y, (*e).z, (*e).sx, (*e).sy, (*e).sz, (*e).yaw_sin, (*e).yaw_cos,
+        (*e).r as f64, (*e).g as f64, (*e).b as f64, 0.0]
+    if occluder { w[11] = 1.0 }
+    rt.buf_push_bytes(&(*sc).ents, (&w[0]) as u64, ENT_BYTES)
+}
+
+fn wscene_ent_add(sc: *mut WScene, e: *mut Ent) { push_ent(sc, e, false) }
+fn wscene_ent_occluder(sc: *mut WScene, e: *mut Ent) { push_ent(sc, e, true) }
+fn wscene_ent_clear(sc: *mut WScene) { rt.buf_clear(&(*sc).ents) }
+fn wscene_set_cull(sc: *mut WScene, on: bool) { (*sc).cull_on = on }
+fn wscene_timers(sc: *mut WScene) -> bool { return false }
+fn wscene_pass_ms(sc: *mut WScene, pass: usize) -> f64 { return 0.0 }
+
+fn wscene_empty(gw: *mut glweb.GlWeb) -> WScene {
+    return WScene { ok: false, step: 0, gw: gw, sky_p: 0, tint_p: 0, ent_p: 0, hud_p: 0,
+        sky_l: [0 - 1; 10], tint_l: 0 - 1, ent_l: [0 - 1; 3], hud_l: [0 - 1; 2],
+        vao0: 0, ent_vao: 0, cube_vbo: 0, cube_ibo: 0, inst_vbo: 0, hud_vao: 0, hud_vbo: 0,
+        ents: rt.buf_new(), inst: 0, inst_cap: 0, cu: cull.cull_new(128, 72), cull_on: true,
+        st_in: 0 as u32, st_drawn: 0 as u32, st_frustum: 0 as u32, st_occ: 0 as u32, st_hud_rects: 0 as u32, st_hud_runs: 0 as u32 }
+}
+
+fn build(vs: str, fs: str) -> i32 {
+    return firn_glw_program(vs.p as u32, vs.n as u32, fs.p as u32, fs.n as u32, 0 as u32, 0 as u32)
+}
+
+fn loc(p: i32, name: str) -> i32 {
+    return firn_glw_uniform_location(p, name.p as u32, name.n as u32)
+}
+
+// Unit cube: 24 vertices (x y z face as f32) and 36 u16 indices -- the same loop as gl_scene.cube_data.
+fn cube_data(vp: u64, ip: u64) {
+    var f: usize = 0
+    while f < 6 {
+        let axis: usize = f / 2
+        var sgn: f64 = 0.0 - 0.5
+        if f % 2 == 1 { sgn = 0.5 }
+        var k: usize = 0
+        while k < 4 {
+            var a: f64 = 0.0 - 0.5
+            if k % 2 == 1 { a = 0.5 }
+            var b: f64 = 0.0 - 0.5
+            if k / 2 == 1 { b = 0.5 }
+            var c: [f64; 3] = [0.0, 0.0, 0.0]
+            c[axis] = sgn
+            c[(axis + 1) % 3] = a
+            c[(axis + 2) % 3] = b
+            let v: usize = f * 4 + k
+            wf32(vp, v * 4, c[0])
+            wf32(vp, v * 4 + 1, c[1])
+            wf32(vp, v * 4 + 2, c[2])
+            wf32(vp, v * 4 + 3, f as f64)
+            k = k + 1
+        }
+        let base: u16 = (f * 4) as u16
+        let o: u64 = ip + (f as u64) * (12 as u64)
+        *((o) as *mut u16) = base
+        *((o + 2 as u64) as *mut u16) = base + 1 as u16
+        *((o + 4 as u64) as *mut u16) = base + 3 as u16
+        *((o + 6 as u64) as *mut u16) = base
+        *((o + 8 as u64) as *mut u16) = base + 3 as u16
+        *((o + 10 as u64) as *mut u16) = base + 2 as u16
+        f = f + 1
+    }
+}
+
+// Programs + uniform locations + VAOs/VBOs (everything that dies with a lost context). 0 = ok, 2 program, 3 buffers.
+fn make_objects(sc: *mut WScene) -> i32 {
+    (*sc).sky_p = build(SKY_VS, SKY_FS)
+    (*sc).tint_p = build(SKY_VS, TINT_FS)
+    (*sc).ent_p = build(ENT_VS, ENT_FS)
+    (*sc).hud_p = build(HUD_VS, HUD_FS)
+    if (*sc).sky_p == 0 || (*sc).tint_p == 0 || (*sc).ent_p == 0 || (*sc).hud_p == 0 { return 2 }
+    let sp: i32 = (*sc).sky_p
+    (*sc).sky_l[0] = loc(sp, "u_r")
+    (*sc).sky_l[1] = loc(sp, "u_u")
+    (*sc).sky_l[2] = loc(sp, "u_f")
+    (*sc).sky_l[3] = loc(sp, "u_cam")
+    (*sc).sky_l[4] = loc(sp, "u_h")
+    (*sc).sky_l[5] = loc(sp, "u_zen")
+    (*sc).sky_l[6] = loc(sp, "u_hor")
+    (*sc).sky_l[7] = loc(sp, "u_glc")
+    (*sc).sky_l[8] = loc(sp, "u_sun")
+    (*sc).sky_l[9] = loc(sp, "u_discs")
+    (*sc).tint_l = loc((*sc).tint_p, "u_tint")
+    (*sc).ent_l[0] = loc((*sc).ent_p, "u_rv")
+    (*sc).ent_l[1] = loc((*sc).ent_p, "u_fog")
+    (*sc).ent_l[2] = loc((*sc).ent_p, "u_fogc")
+    (*sc).hud_l[0] = loc((*sc).hud_p, "u_size")
+    (*sc).hud_l[1] = loc((*sc).hud_p, "u_invert")
+    (*sc).vao0 = firn_glw_create_vao()
+    // ---- entity cube + instance buffer
+    let vp: u64 = rt.heap_alloc(24 * 16)
+    let ip: u64 = rt.heap_alloc(36 * 2)
+    cube_data(vp, ip)
+    (*sc).ent_vao = firn_glw_create_vao()
+    firn_glw_bind_vao((*sc).ent_vao)
+    (*sc).cube_vbo = firn_glw_create_buffer()
+    firn_glw_bind_buffer(GL_ARRAY_BUFFER, (*sc).cube_vbo)
+    firn_glw_buffer_data(GL_ARRAY_BUFFER, vp as u32, (24 * 16) as u32, GL_STATIC_DRAW)
+    firn_glw_enable_attrib(0)
+    firn_glw_attrib_pointer(0, 3, GL_FLOAT, 0, 16, 0)
+    firn_glw_enable_attrib(1)
+    firn_glw_attrib_pointer(1, 1, GL_FLOAT, 0, 16, 12)
+    (*sc).cube_ibo = firn_glw_create_buffer()
+    firn_glw_bind_buffer(GL_ELEMENT_ARRAY_BUFFER, (*sc).cube_ibo)
+    firn_glw_buffer_data(GL_ELEMENT_ARRAY_BUFFER, ip as u32, (36 * 2) as u32, GL_STATIC_DRAW)
+    (*sc).inst_vbo = firn_glw_create_buffer()
+    firn_glw_bind_buffer(GL_ARRAY_BUFFER, (*sc).inst_vbo)
+    firn_glw_buffer_data(GL_ARRAY_BUFFER, 0 as u32, 1024 as u32, GL_STREAM_DRAW)
+    var a: i32 = 2
+    while a < 5 {
+        firn_glw_enable_attrib(a)
+        firn_glw_attrib_pointer(a, 4, GL_FLOAT, 0, 48, (a - 2) * 16)
+        firn_glw_attrib_divisor(a, 1)
+        a = a + 1
+    }
+    firn_glw_bind_vao(0)
+    rt.heap_free(vp, 24 * 16)
+    rt.heap_free(ip, 36 * 2)
+    // ---- HUD rectangles
+    (*sc).hud_vao = firn_glw_create_vao()
+    firn_glw_bind_vao((*sc).hud_vao)
+    (*sc).hud_vbo = firn_glw_create_buffer()
+    firn_glw_bind_buffer(GL_ARRAY_BUFFER, (*sc).hud_vbo)
+    firn_glw_buffer_data(GL_ARRAY_BUFFER, 0 as u32, 1024 as u32, GL_STREAM_DRAW)
+    firn_glw_enable_attrib(0)
+    firn_glw_attrib_ipointer(0, 4, GL_UNSIGNED_INT, 24, 0)
+    firn_glw_attrib_divisor(0, 1)
+    firn_glw_enable_attrib(1)
+    firn_glw_attrib_ipointer(1, 1, GL_UNSIGNED_INT, 24, 16)
+    firn_glw_attrib_divisor(1, 1)
+    firn_glw_bind_vao(0)
+    if (*sc).vao0 == 0 || (*sc).ent_vao == 0 || (*sc).hud_vao == 0 || (*sc).inst_vbo == 0 { return 3 }
+    return 0
+}
+
+// Builds the scene layer on an open WebGL2 back end. `ok` false: `step` says what failed (shader log: gw.log).
+fn wscene_open(gw: *mut glweb.GlWeb) -> WScene {
+    var sc: WScene = wscene_empty(gw)
+    if !(*gw).ok {
+        sc.step = 1
+        return sc
+    }
+    sc.step = make_objects(&sc)
+    if sc.step != 0 { return sc }
+    sc.ok = true
+    return sc
+}
+
+// After glweb_poll_context returned CTX_RESTORED: the old ids are dead, build programs and buffers again.
+fn wscene_recreate(sc: *mut WScene) -> bool {
+    (*sc).ok = false
+    let st: i32 = make_objects(sc)
+    (*sc).step = st
+    if st != 0 { return false }
+    (*sc).ok = true
+    return true
+}
+
+fn wscene_close(sc: *mut WScene) {
+    if !(*sc).ok { return }
+    firn_glw_delete_program((*sc).sky_p)
+    firn_glw_delete_program((*sc).tint_p)
+    firn_glw_delete_program((*sc).ent_p)
+    firn_glw_delete_program((*sc).hud_p)
+    firn_glw_delete_vao((*sc).vao0)
+    firn_glw_delete_vao((*sc).ent_vao)
+    firn_glw_delete_vao((*sc).hud_vao)
+    firn_glw_delete_buffer((*sc).cube_vbo)
+    firn_glw_delete_buffer((*sc).cube_ibo)
+    firn_glw_delete_buffer((*sc).inst_vbo)
+    firn_glw_delete_buffer((*sc).hud_vbo)
+    cull.cull_free(&(*sc).cu)
+    rt.buf_free(&(*sc).ents)
+    if (*sc).inst != 0 {
+        rt.heap_free((*sc).inst, (*sc).inst_cap * INST_F32 * 4)
+        (*sc).inst = 0
+        (*sc).inst_cap = 0
+    }
+    (*sc).ok = false
+}
+
+// Start of an extra pass: draw target = the back end's FBO, state neutral (no depth / cull / blend). glweb draws immediately, so
+// there is nothing to flush (glbe_flush of gl_scene).
+fn pass_enter(sc: *mut WScene) {
+    let gw: *mut glweb.GlWeb = (*sc).gw
+    firn_glw_bind_framebuffer(GL_FRAMEBUFFER, glweb.glweb_fbo(gw))
+    firn_glw_viewport(0, 0, glweb.glweb_width(gw), glweb.glweb_height(gw))
+    firn_glw_disable(GL_BLEND)
+    firn_glw_disable(GL_CULL_FACE)
+    firn_glw_disable(GL_DEPTH_TEST)
+    firn_glw_disable(GL_SCISSOR_TEST)
+    firn_glw_depth_mask(0)
+    firn_glw_color_mask(1, 1, 1, 1)
+}
+
+fn pass_leave(sc: *mut WScene) {
+    glweb.glweb_rebind((*sc).gw)
+}
+
+fn wscene_sky(sc: *mut WScene, cam: *mut mc_camera.Camera, sky: *mut mc_sky.Sky) {
+    if !(*sc).ok { return }
+    let gw: *mut glweb.GlWeb = (*sc).gw
+    pass_enter(sc)
+    firn_glw_use_program((*sc).sky_p)
+    let w: f64 = glweb.glweb_width(gw) as f64
+    let h: f64 = glweb.glweb_height(gw) as f64
+    let hw: f64 = w * 0.5
+    let hh: f64 = h * 0.5
+    firn_glw_uniform3f((*sc).sky_l[0], (*cam).rx, (*cam).ry, (*cam).rz)
+    firn_glw_uniform3f((*sc).sky_l[1], (*cam).ux, (*cam).uy, (*cam).uz)
+    firn_glw_uniform3f((*sc).sky_l[2], (*cam).fx, (*cam).fy, (*cam).fz)
+    firn_glw_uniform4f((*sc).sky_l[3], hw, hh, hw / (*cam).tan_x, hh / (*cam).tan_y)
+    firn_glw_uniform1f((*sc).sky_l[4], h)
+    firn_glw_uniform3f((*sc).sky_l[5], (*sky).zr as f64, (*sky).zg as f64, (*sky).zb as f64)
+    firn_glw_uniform3f((*sc).sky_l[6], (*sky).hr as f64, (*sky).hg as f64, (*sky).hb as f64)
+    firn_glw_uniform3f((*sc).sky_l[7], (*sky).lr as f64, (*sky).lg as f64, (*sky).lb as f64)
+    firn_glw_uniform4f((*sc).sky_l[8], (*sky).sunx, (*sky).suny, (*sky).sunz, (*sky).glow as f64)
+    var d: i32 = 0
+    if (*sky).discs { d = 1 }
+    firn_glw_uniform1i((*sc).sky_l[9], d)
+    firn_glw_bind_vao((*sc).vao0)
+    firn_glw_draw_arrays(GL_TRIANGLE_STRIP, 0, 4)
+    firn_glw_bind_vao(0)
+    pass_leave(sc)
+}
+
+fn wscene_tint(sc: *mut WScene, sky: *mut mc_sky.Sky) {
+    if !(*sc).ok { return }
+    if (*sky).tr >= 256 && (*sky).tg >= 256 && (*sky).tb >= 256 { return }
+    pass_enter(sc)
+    firn_glw_enable(GL_DEPTH_TEST)
+    firn_glw_depth_func(GL_GREATER)
+    firn_glw_enable(GL_BLEND)
+    firn_glw_blend_func(GL_DST_COLOR, GL_ZERO)
+    firn_glw_use_program((*sc).tint_p)
+    firn_glw_uniform3f((*sc).tint_l, ((*sky).tr as f64) / 256.0, ((*sky).tg as f64) / 256.0, ((*sky).tb as f64) / 256.0)
+    firn_glw_bind_vao((*sc).vao0)
+    firn_glw_draw_arrays(GL_TRIANGLE_STRIP, 0, 4)
+    firn_glw_bind_vao(0)
+    firn_glw_depth_func(GL_LESS)
+    pass_leave(sc)
+}
+
+fn ensure_inst(sc: *mut WScene, n: usize) {
+    if (*sc).inst_cap >= n { return }
+    var cap: usize = (*sc).inst_cap * 2
+    if cap < n { cap = n }
+    if cap < 64 { cap = 64 }
+    let p: u64 = rt.heap_alloc(cap * INST_F32 * 4)
+    if (*sc).inst != 0 { rt.heap_free((*sc).inst, (*sc).inst_cap * INST_F32 * 4) }
+    (*sc).inst = p
+    (*sc).inst_cap = cap
+}
+
+fn ent_box(e: u64, lo: *mut [f64; 3], hi: *mut [f64; 3]) {
+    let s: f64 = math.fabs(rf(e, 6))
+    let c: f64 = math.fabs(rf(e, 7))
+    let hx: f64 = (c * rf(e, 3) + s * rf(e, 5)) * 0.5
+    let hy: f64 = rf(e, 4) * 0.5
+    let hz: f64 = (s * rf(e, 3) + c * rf(e, 5)) * 0.5
+    (*lo)[0] = rf(e, 0) - hx
+    (*lo)[1] = rf(e, 1) - hy
+    (*lo)[2] = rf(e, 2) - hz
+    (*hi)[0] = rf(e, 0) + hx
+    (*hi)[1] = rf(e, 1) + hy
+    (*hi)[2] = rf(e, 2) + hz
+}
+
+// Draws the queued boxes in ONE instanced call and clears the queue (frustum + software Hi-Z culling as in gl_scene).
+fn wscene_ent_flush(sc: *mut WScene, cam: *mut mc_camera.Camera) {
+    if !(*sc).ok { return }
+    let n: usize = rt.buf_len(&(*sc).ents) / ENT_BYTES
+    (*sc).st_in = n as u32
+    (*sc).st_drawn = 0 as u32
+    (*sc).st_frustum = 0 as u32
+    (*sc).st_occ = 0 as u32
+    if n == 0 { return }
+    let gw: *mut glweb.GlWeb = (*sc).gw
+    let base: u64 = rt.buf_ptr(&(*sc).ents)
+    var rv: [f32; 16] = [0.0 as f32; 16]
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var cz: f64 = 0.0
+    glweb.glweb_camera_rv(gw, (&rv[0]) as u64, &cx, &cy, &cz)
+    var lo: [f64; 3] = [0.0, 0.0, 0.0]
+    var hi: [f64; 3] = [0.0, 0.0, 0.0]
+    if (*sc).cull_on {
+        var vp: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
+        var k: usize = 0
+        while k < 16 {
+            vp.m[k] = rv[k] as f64
+            k = k + 1
+        }
+        cull.cull_begin(&(*sc).cu, &vp, cx, cy, cz, (*cam).near, false)
+        cull.cull_clear_depth(&(*sc).cu)
+        var i: usize = 0
+        while i < n {
+            let e: u64 = base + (i * ENT_BYTES) as u64
+            if rf(e, 11) > 0.5 && math.fabs(rf(e, 6)) < 1.0e-9 {
+                ent_box(e, &lo, &hi)
+                cull.cull_add_occluder(&(*sc).cu, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2])
+            }
+            i = i + 1
+        }
+        cull.cull_build_hiz(&(*sc).cu)
+    }
+    ensure_inst(sc, n)
+    var m: usize = 0
+    var i: usize = 0
+    while i < n {
+        let e: u64 = base + (i * ENT_BYTES) as u64
+        var draw: bool = true
+        if (*sc).cull_on && rf(e, 11) < 0.5 {
+            ent_box(e, &lo, &hi)
+            let r: i32 = cull.cull_box(&(*sc).cu, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2])
+            if r == cull.CULL_FRUSTUM {
+                draw = false
+                (*sc).st_frustum = (*sc).st_frustum + 1 as u32
+            } else if r == cull.CULL_OCCLUDED {
+                draw = false
+                (*sc).st_occ = (*sc).st_occ + 1 as u32
+            }
+        }
+        if draw {
+            let o: usize = m * INST_F32
+            wf32((*sc).inst, o, rf(e, 0) - cx)
+            wf32((*sc).inst, o + 1, rf(e, 1) - cy)
+            wf32((*sc).inst, o + 2, rf(e, 2) - cz)
+            wf32((*sc).inst, o + 3, rf(e, 6))
+            wf32((*sc).inst, o + 4, rf(e, 3))
+            wf32((*sc).inst, o + 5, rf(e, 4))
+            wf32((*sc).inst, o + 6, rf(e, 5))
+            wf32((*sc).inst, o + 7, rf(e, 7))
+            wf32((*sc).inst, o + 8, rf(e, 8))
+            wf32((*sc).inst, o + 9, rf(e, 9))
+            wf32((*sc).inst, o + 10, rf(e, 10))
+            wf32((*sc).inst, o + 11, 0.0)
+            m = m + 1
+        }
+        i = i + 1
+    }
+    (*sc).st_drawn = m as u32
+    rt.buf_clear(&(*sc).ents)
+    if m == 0 { return }
+    pass_enter(sc)
+    firn_glw_enable(GL_DEPTH_TEST)
+    firn_glw_depth_func(GL_LESS)
+    firn_glw_depth_mask(1)
+    firn_glw_use_program((*sc).ent_p)
+    firn_glw_uniform_matrix4fv((*sc).ent_l[0], ((&rv[0]) as u64) as u32)
+    var fo: f64 = 0.0
+    if glweb.glweb_fog_on(gw) { fo = 1.0 }
+    firn_glw_uniform4f((*sc).ent_l[1], fo, glweb.glweb_fog_start(gw), glweb.glweb_fog_end(gw), 0.0)
+    firn_glw_uniform3f((*sc).ent_l[2], glweb.glweb_fog_r(gw), glweb.glweb_fog_g(gw), glweb.glweb_fog_b(gw))
+    firn_glw_bind_vao((*sc).ent_vao)
+    firn_glw_bind_buffer(GL_ARRAY_BUFFER, (*sc).inst_vbo)
+    firn_glw_buffer_data(GL_ARRAY_BUFFER, (*sc).inst as u32, (m * INST_F32 * 4) as u32, GL_STREAM_DRAW)
+    firn_glw_draw_elements_instanced(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, 0, m as i32)
+    firn_glw_bind_vao(0)
+    pass_leave(sc)
+}
+
+// Draws the rectangles recorded by mc_hud.hud_record (6 u32 each) in the recorded order; a run of one blend mode = one instanced draw.
+fn wscene_hud(sc: *mut WScene, rec: *mut rt.Buf) {
+    if !(*sc).ok { return }
+    let n: usize = rt.buf_len(rec) / HUD_REC_BYTES
+    (*sc).st_hud_rects = n as u32
+    (*sc).st_hud_runs = 0 as u32
+    if n == 0 { return }
+    let gw: *mut glweb.GlWeb = (*sc).gw
+    let data: u64 = rt.buf_ptr(rec)
+    pass_enter(sc)
+    firn_glw_color_mask(1, 1, 1, 0)
+    firn_glw_enable(GL_BLEND)
+    firn_glw_use_program((*sc).hud_p)
+    firn_glw_uniform2f((*sc).hud_l[0], glweb.glweb_width(gw) as f64, glweb.glweb_height(gw) as f64)
+    firn_glw_bind_vao((*sc).hud_vao)
+    firn_glw_bind_buffer(GL_ARRAY_BUFFER, (*sc).hud_vbo)
+    firn_glw_buffer_data(GL_ARRAY_BUFFER, data as u32, (n * HUD_REC_BYTES) as u32, GL_STREAM_DRAW)
+    var i: usize = 0
+    while i < n {
+        let mode: u32 = rt.ld32(data, i * 6 + 5)
+        var j: usize = i + 1
+        while j < n && rt.ld32(data, j * 6 + 5) == mode {
+            j = j + 1
+        }
+        firn_glw_attrib_ipointer(0, 4, GL_UNSIGNED_INT, 24, (i * HUD_REC_BYTES) as i32)
+        firn_glw_attrib_ipointer(1, 1, GL_UNSIGNED_INT, 24, (i * HUD_REC_BYTES + 16) as i32)
+        if mode == 1 as u32 {
+            firn_glw_blend_func(GL_ONE_MINUS_DST_COLOR, GL_ZERO)
+            firn_glw_uniform1i((*sc).hud_l[1], 1)
+        } else {
+            firn_glw_blend_func(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            firn_glw_uniform1i((*sc).hud_l[1], 0)
+        }
+        firn_glw_draw_arrays_instanced(GL_TRIANGLE_STRIP, 0, 4, (j - i) as i32)
+        (*sc).st_hud_runs = (*sc).st_hud_runs + 1 as u32
+        i = j
+    }
+    firn_glw_bind_vao(0)
+    pass_leave(sc)
+}
