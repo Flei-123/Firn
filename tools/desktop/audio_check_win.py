@@ -41,6 +41,12 @@ def run(exe, *args):
     data = open(raw, "rb").read() if os.path.exists(raw) else b""
     return r, data
 
+def lead_zeros(b):
+    n = 0
+    while n < len(b) and b[n] == 0:
+        n += 1
+    return n
+
 def padded(data, ref):
     """The song as the sound system received it. Every song of ours starts with silence (the MP3 decoder's
     delay: 1336 frames of zeros), and a program that is still decoding its second frame while the device
@@ -95,7 +101,11 @@ try:
         r, data = run(audio_exe, z(mp3), str(pc), "play")
         check("MP3 at %d %% through waveOut: samples scaled by the formula" % pc, padded(data, scale(ref, pc)), (len(data), len(ref)))
     r, data = run(audio_exe, z(mp3), "100", "stop")
-    check("stop: a proper prefix of the song reached the device", 0 < len(data) < len(ref) and ref.startswith(data), (len(data), len(ref)))
+    # Wine's ALSA driver may put one extra silent period (10 ms) in front of the song (measured: 1764 octets
+    # more leading zeros, everything after them identical), so the prefix is compared past the leading zeros.
+    ld, lr = lead_zeros(data), lead_zeros(ref)
+    check("stop: a proper prefix of the song reached the device (leading silence aside)",
+          0 < len(data) and len(data) - ld < len(ref) - lr and ld >= lr and ld - lr <= 4410 * 4 and ref[lr:].startswith(data[ld:]), (len(data), len(ref), ld, lr))
     r, data = run(audio_exe, z(mp3), "100", "pause")
     check("pause: nothing lost, nothing repeated, no gap (waveOutPause)", padded(data, ref) and "PAUSE ok" in r.stdout, (len(data), len(ref), r.stdout))
     # no device at all (an ALSA configuration without any PCM): the sink says so, the program does not crash
