@@ -1,0 +1,388 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/font/cbdt.fi -- colour bitmap glyphs: CBLC / CBDT (PNG strikes), e.g. Noto Color Emoji.
+//
+// CBLC says which glyph lives in which STRIKE (one bitmap size, "ppem") and where its record is
+// in CBDT; CBDT holds the records: metrics + an embedded PNG. The font has NO outlines.
+//
+//   cbdt_ok(f)                          the font has CBLC and CBDT
+//   cbdt_strikes(f)                     number of strikes
+//   cbdt_ppem(f, k)                     bitmap size (pixels per em) of strike k
+//   cbdt_pick(f, px)                    best strike for `px`: the smallest ppem >= px, else the largest;
+//                                       CB_NONE if the font has no strike
+//   cbdt_find(f, k, gid, &g)            record of `gid` in strike k (false: no bitmap for it)
+//   cbdt_paint(f, k, gid, px, pen, base, dst, dw, dh) -> bool
+//                                       decode the PNG and paint it, scaled by px / ppem, with its
+//                                       bearings: left = pen + bearingX * s, top = base - bearingY * s.
+//                                       dst = 0xAABBGGRR pixels (u32), source-over. Shrinking uses an
+//                                       exact area average (premultiplied), enlarging bilinear.
+//
+// Index sub-table formats 1 (u32 offsets), 2 (constant size + big metrics), 3 (u16 offsets) and 5
+// (constant size + glyph id array) are read; image formats 17 (small metrics), 18 (big metrics) and
+// 19 (metrics from the index) -- the PNG ones. Index format 4 and the old non-PNG image formats
+// (1, 2, 5, 6, 7 -- 1/8 bit monochrome and byte-aligned bitmaps) are NOT supported (false).
+// Not covered: sbix, COLR v1, SVG glyphs. See docs/FONT-FALLBACK.md.
+import std.rt
+import font.ttf
+import paint.png
+
+export {
+    CbGlyph, cbdt_ok, cbdt_strikes, cbdt_ppem, cbdt_pick, cbdt_find, cbdt_paint, CB_NONE,
+}
+
+const CB_NONE: usize = 255
+
+struct CbGlyph {
+    ppem: u32,
+    w: u32,
+    h: u32,
+    bx: i32,
+    by: i32,
+    adv: u32,
+    png: u64,
+    png_len: usize,
+}
+
+fn tbl(f: *mut ttf.Font, a: u32, b: u32, c: u32, d: u32) -> usize {
+    var off: usize = 0
+    var len: usize = 0
+    if !ttf.font_table(f, a, b, c, d, &off, &len) {
+        return 0
+    }
+    return off
+}
+
+fn cblc(f: *mut ttf.Font) -> usize {
+    return tbl(f, 67 as u32, 66 as u32, 76 as u32, 67 as u32)
+}
+
+fn cbdt(f: *mut ttf.Font) -> usize {
+    return tbl(f, 67 as u32, 66 as u32, 68 as u32, 84 as u32)
+}
+
+fn cbdt_ok(f: *mut ttf.Font) -> bool {
+    let l: usize = cblc(f)
+    return l != 0 && cbdt(f) != 0 && ttf.font_u16(f, l) >= 2 as u32
+}
+
+fn cbdt_strikes(f: *mut ttf.Font) -> usize {
+    let l: usize = cblc(f)
+    if l == 0 {
+        return 0
+    }
+    let n: usize = ttf.font_u32(f, l + 4) as usize
+    if n > 64 {
+        return 64
+    }
+    return n
+}
+
+fn cbdt_ppem(f: *mut ttf.Font, k: usize) -> u32 {
+    let l: usize = cblc(f)
+    if l == 0 || k >= cbdt_strikes(f) {
+        return 0 as u32
+    }
+    return ttf.font_u8(f, l + 8 + k * 48 + 45)
+}
+
+fn cbdt_pick(f: *mut ttf.Font, px: f64) -> usize {
+    let n: usize = cbdt_strikes(f)
+    var best: usize = CB_NONE
+    var k: usize = 0
+    while k < n {
+        let p: u32 = cbdt_ppem(f, k)
+        if p != 0 as u32 {
+            if best == CB_NONE {
+                best = k
+            } else {
+                let bp: u32 = cbdt_ppem(f, best)
+                let big_enough: bool = (p as f64) >= px
+                let best_big: bool = (bp as f64) >= px
+                if big_enough && (!best_big || p < bp) {
+                    best = k
+                } else if !big_enough && !best_big && p > bp {
+                    best = k
+                }
+            }
+        }
+        k = k + 1
+    }
+    return best
+}
+
+fn s8(v: u32) -> i32 {
+    if v >= 128 as u32 {
+        return (v as i32) - 256
+    }
+    return v as i32
+}
+
+// Reads the glyph record at CBDT offset `rec` (absolute font offset) of image format `fmt`.
+// `bm` = absolute offset of the big metrics of the index (formats 2 / 5), or 0.
+fn read_record(f: *mut ttf.Font, rec: usize, fmt: u32, bm: usize, g: *mut CbGlyph) -> bool {
+    var dl: usize = 0
+    if fmt == 17 as u32 {
+        (*g).h = ttf.font_u8(f, rec)
+        (*g).w = ttf.font_u8(f, rec + 1)
+        (*g).bx = s8(ttf.font_u8(f, rec + 2))
+        (*g).by = s8(ttf.font_u8(f, rec + 3))
+        (*g).adv = ttf.font_u8(f, rec + 4)
+        dl = rec + 5
+    } else if fmt == 18 as u32 {
+        (*g).h = ttf.font_u8(f, rec)
+        (*g).w = ttf.font_u8(f, rec + 1)
+        (*g).bx = s8(ttf.font_u8(f, rec + 2))
+        (*g).by = s8(ttf.font_u8(f, rec + 3))
+        (*g).adv = ttf.font_u8(f, rec + 4)
+        dl = rec + 8
+    } else if fmt == 19 as u32 {
+        if bm == 0 {
+            return false
+        }
+        (*g).h = ttf.font_u8(f, bm)
+        (*g).w = ttf.font_u8(f, bm + 1)
+        (*g).bx = s8(ttf.font_u8(f, bm + 2))
+        (*g).by = s8(ttf.font_u8(f, bm + 3))
+        (*g).adv = ttf.font_u8(f, bm + 4)
+        dl = rec
+    } else {
+        return false
+    }
+    let n: usize = ttf.font_u32(f, dl) as usize
+    if n == 0 || dl + 4 + n > ttf.font_data_len(f) {
+        return false
+    }
+    (*g).png = ttf.font_data_ptr(f, dl + 4)
+    (*g).png_len = n
+    return true
+}
+
+fn cbdt_find(f: *mut ttf.Font, k: usize, gid: u32, g: *mut CbGlyph) -> bool {
+    let l: usize = cblc(f)
+    let d: usize = cbdt(f)
+    if l == 0 || d == 0 || k >= cbdt_strikes(f) {
+        return false
+    }
+    let sz: usize = l + 8 + k * 48
+    let arr: usize = l + (ttf.font_u32(f, sz) as usize)
+    let nsub: usize = ttf.font_u32(f, sz + 8) as usize
+    (*g).ppem = ttf.font_u8(f, sz + 45)
+    var i: usize = 0
+    while i < nsub && i < 4096 {
+        let e: usize = arr + i * 8
+        let first: u32 = ttf.font_u16(f, e)
+        let last: u32 = ttf.font_u16(f, e + 2)
+        if gid >= first && gid <= last {
+            let sub: usize = arr + (ttf.font_u32(f, e + 4) as usize)
+            let ifmt: u32 = ttf.font_u16(f, sub)
+            let imfmt: u32 = ttf.font_u16(f, sub + 2)
+            let data: usize = d + (ttf.font_u32(f, sub + 4) as usize)
+            let idx: usize = (gid - first) as usize
+            if ifmt == 1 as u32 || ifmt == 3 as u32 {
+                var a: usize = 0
+                var b: usize = 0
+                if ifmt == 1 as u32 {
+                    a = ttf.font_u32(f, sub + 8 + idx * 4) as usize
+                    b = ttf.font_u32(f, sub + 8 + idx * 4 + 4) as usize
+                } else {
+                    a = ttf.font_u16(f, sub + 8 + idx * 2) as usize
+                    b = ttf.font_u16(f, sub + 8 + idx * 2 + 2) as usize
+                }
+                if b <= a {
+                    return false
+                }
+                return read_record(f, data + a, imfmt, 0, g)
+            }
+            if ifmt == 2 as u32 {
+                let isz: usize = ttf.font_u32(f, sub + 8) as usize
+                return read_record(f, data + idx * isz, imfmt, sub + 12, g)
+            }
+            if ifmt == 5 as u32 {
+                let isz: usize = ttf.font_u32(f, sub + 8) as usize
+                let ng: usize = ttf.font_u32(f, sub + 20) as usize
+                var lo: usize = 0
+                var hi: usize = ng
+                while lo < hi {
+                    let mid: usize = (lo + hi) / 2
+                    let v: u32 = ttf.font_u16(f, sub + 24 + mid * 2)
+                    if v == gid {
+                        return read_record(f, data + mid * isz, imfmt, sub + 12, g)
+                    }
+                    if v < gid {
+                        lo = mid + 1
+                    } else {
+                        hi = mid
+                    }
+                }
+                return false
+            }
+            return false
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Source-over of straight colour (r, g, b) with alpha `a` (0..1) onto a 0xAABBGGRR pixel.
+fn put(dst: u64, dw: i32, dh: i32, x: i32, y: i32, r: f64, g: f64, b: f64, a: f64) {
+    if x < 0 || y < 0 || x >= dw || y >= dh || a <= 0.0 {
+        return
+    }
+    let at: usize = (y as usize) * (dw as usize) + (x as usize)
+    let d: u32 = rt.ld32(dst, at)
+    let dr: f64 = (d & 255 as u32) as f64
+    let dg: f64 = ((d >> 8 as u32) & 255 as u32) as f64
+    let db: f64 = ((d >> 16 as u32) & 255 as u32) as f64
+    let nr: u32 = ((r * a + dr * (1.0 - a)) + 0.5) as u32
+    let ng: u32 = ((g * a + dg * (1.0 - a)) + 0.5) as u32
+    let nb: u32 = ((b * a + db * (1.0 - a)) + 0.5) as u32
+    rt.st32(dst, at, 0xFF000000 as u32 | (nb << 16 as u32) | (ng << 8 as u32) | nr)
+}
+
+fn floor_i(x: f64) -> i32 {
+    var v: f64 = x
+    if v > 100000.0 {
+        v = 100000.0
+    }
+    if v < 0.0 - 100000.0 {
+        v = 0.0 - 100000.0
+    }
+    let i: i32 = v as i32
+    if (i as f64) > v {
+        return i - 1
+    }
+    return i
+}
+
+// One source pixel as premultiplied floats (r, g, b, a in 0..255*a); outside the bitmap = transparent.
+fn src_px(im: *mut png.Image, x: i32, y: i32, out: *mut [f64; 4]) {
+    (*out)[0] = 0.0
+    (*out)[1] = 0.0
+    (*out)[2] = 0.0
+    (*out)[3] = 0.0
+    if x < 0 || y < 0 || (x as usize) >= png.image_width(im) || (y as usize) >= png.image_height(im) {
+        return
+    }
+    let p: u32 = png.image_pixel(im, x as usize, y as usize)
+    let a: f64 = ((p >> 24 as u32) & 255 as u32) as f64 / 255.0
+    (*out)[0] = (((p >> 16 as u32) & 255 as u32) as f64) * a
+    (*out)[1] = (((p >> 8 as u32) & 255 as u32) as f64) * a
+    (*out)[2] = ((p & 255 as u32) as f64) * a
+    (*out)[3] = a
+}
+
+fn cbdt_paint(f: *mut ttf.Font, k: usize, gid: u32, px: f64, pen: f64, base: f64, dst: u64,
+    dw: i32, dh: i32) -> bool {
+    var g: CbGlyph = CbGlyph { ppem: 0 as u32, w: 0 as u32, h: 0 as u32, bx: 0, by: 0, adv: 0 as u32,
+        png: 0, png_len: 0 }
+    if !cbdt_find(f, k, gid, &g) || g.ppem == 0 as u32 {
+        return false
+    }
+    var im: png.Image = png.image_new()
+    if !png.decode_png(g.png, g.png_len, &im) {
+        return false
+    }
+    let s: f64 = px / (g.ppem as f64)
+    let iw: i32 = png.image_width(&im) as i32
+    let ih: i32 = png.image_height(&im) as i32
+    let left: f64 = pen + (g.bx as f64) * s
+    let top: f64 = base - (g.by as f64) * s
+    let right: f64 = left + (iw as f64) * s
+    let bottom: f64 = top + (ih as f64) * s
+    let x0: i32 = floor_i(left)
+    let y0: i32 = floor_i(top)
+    let x1: i32 = floor_i(right) + 1
+    let y1: i32 = floor_i(bottom) + 1
+    var sp: [f64; 4] = [0.0; 4]
+    var yy: i32 = y0
+    while yy < y1 {
+        var xx: i32 = x0
+        while xx < x1 {
+            var sr: f64 = 0.0
+            var sg: f64 = 0.0
+            var sb: f64 = 0.0
+            var sa: f64 = 0.0
+            if s <= 1.0 {
+                // exact area average over [u0,u1) x [v0,v1) in source pixels
+                let u0: f64 = ((xx as f64) - left) / s
+                let u1: f64 = ((xx as f64) + 1.0 - left) / s
+                let v0: f64 = ((yy as f64) - top) / s
+                let v1: f64 = ((yy as f64) + 1.0 - top) / s
+                let area: f64 = (u1 - u0) * (v1 - v0)
+                var sy: i32 = floor_i(v0)
+                while (sy as f64) < v1 {
+                    var wy: f64 = 1.0
+                    if (sy as f64) < v0 {
+                        wy = wy - (v0 - (sy as f64))
+                    }
+                    if ((sy + 1) as f64) > v1 {
+                        wy = wy - (((sy + 1) as f64) - v1)
+                    }
+                    var sx: i32 = floor_i(u0)
+                    while (sx as f64) < u1 {
+                        var wx: f64 = 1.0
+                        if (sx as f64) < u0 {
+                            wx = wx - (u0 - (sx as f64))
+                        }
+                        if ((sx + 1) as f64) > u1 {
+                            wx = wx - (((sx + 1) as f64) - u1)
+                        }
+                        src_px(&im, sx, sy, &sp)
+                        let wgt: f64 = wx * wy
+                        sr = sr + sp[0] * wgt
+                        sg = sg + sp[1] * wgt
+                        sb = sb + sp[2] * wgt
+                        sa = sa + sp[3] * wgt
+                        sx = sx + 1
+                    }
+                    sy = sy + 1
+                }
+                sr = sr / area
+                sg = sg / area
+                sb = sb / area
+                sa = sa / area
+            } else {
+                // bilinear at the pixel centre, edges clamp to transparent
+                let u: f64 = ((xx as f64) + 0.5 - left) / s - 0.5
+                let v: f64 = ((yy as f64) + 0.5 - top) / s - 0.5
+                if u > 0.0 - 1.0 && v > 0.0 - 1.0 && u < (iw as f64) && v < (ih as f64) {
+                    let ix: i32 = floor_i(u)
+                    let iy: i32 = floor_i(v)
+                    let fx: f64 = u - (ix as f64)
+                    let fy: f64 = v - (iy as f64)
+                    var q: i32 = 0
+                    while q < 4 {
+                        var dx: i32 = 0
+                        var dy: i32 = 0
+                        var wgt: f64 = 0.0
+                        if q == 0 {
+                            wgt = (1.0 - fx) * (1.0 - fy)
+                        } else if q == 1 {
+                            dx = 1
+                            wgt = fx * (1.0 - fy)
+                        } else if q == 2 {
+                            dy = 1
+                            wgt = (1.0 - fx) * fy
+                        } else {
+                            dx = 1
+                            dy = 1
+                            wgt = fx * fy
+                        }
+                        src_px(&im, ix + dx, iy + dy, &sp)
+                        sr = sr + sp[0] * wgt
+                        sg = sg + sp[1] * wgt
+                        sb = sb + sp[2] * wgt
+                        sa = sa + sp[3] * wgt
+                        q = q + 1
+                    }
+                }
+            }
+            if sa > 0.0 {
+                put(dst, dw, dh, xx, yy, sr / sa, sg / sa, sb / sa, sa)
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    png.image_free(&im)
+    return true
+}

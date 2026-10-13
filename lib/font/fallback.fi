@@ -3,9 +3,12 @@
 //
 // A CHAIN is an ordered list of fonts (Latin, CJK, symbols, emoji ...). For each
 // code point the FIRST font whose cmap maps it to a real glyph (gid != 0) wins.
-// Text is cut into RUNS of one font; a ZWJ / variation selector / skin tone
-// modifier / combining mark stays with the code point before it. A code point
-// that NO font has is drawn with font 0's .notdef.
+// Text is cut into RUNS of one font, and a run never splits an extended grapheme
+// cluster (UAX #29, lib/str/grapheme.fi): ZWJ sequences, variation selectors, skin
+// tone modifiers, flags, combining marks, Hangul syllables stay together. The font of
+// a cluster is the first one that has its first code point; a cluster that asks for
+// emoji presentation (U+FE0F, ZWJ, skin tone, flag, keycap) takes the K_EMOJI font
+// first. A code point that NO font has is drawn with font 0's .notdef.
 //
 //   chain_new / chain_add(c, font, kind)     up to 6 fonts; kind K_LATIN/K_CJK/K_SYMBOL/K_EMOJI
 //   chain_pick(c, cp, prefer_emoji)          index of the font that draws `cp`, or NO_FONT
@@ -13,20 +16,23 @@
 //   chain_width(c, ctx, p, n, px)            advance in pixels (whole text)
 //   chain_paint(ctx, c, p, n, px, x, base, fg, shadow, dst, dw, dh)
 //                                            paint into a 0xAABBGGRR pixel buffer (u32 per pixel),
-//                                            source-over; COLR v0 glyphs in their palette colours
+//                                            source-over; COLR v0 glyphs in their palette colours,
+//                                            CBDT/CBLC bitmap glyphs (lib/font/cbdt.fi) scaled
+//   chain_free(c)                            releases the grapheme table (chain_new maps it)
 //
-// HONEST LIMITS: no shaping across fonts (no GSUB ligatures: a ZWJ emoji family is drawn
-// as its parts side by side), no bidi, no kerning across runs, bitmap emoji fonts
-// (CBDT/sbix, e.g. Noto Color Emoji) are NOT drawn -- they have no outlines (their code
-// points come out as .notdef); use a COLR font. See docs/FONT-FALLBACK.md.
+// HONEST LIMITS: no shaping (no GSUB ligatures: a ZWJ emoji family or a flag is drawn as
+// its parts side by side), no bidi, no kerning across runs; sbix and COLR v1 are NOT drawn.
+// See docs/FONT-FALLBACK.md.
 import std.rt
 import font.ttf
 import font.raster
 import font.colr
+import font.cbdt
+import str.grapheme
 
 export {
     Chain, Run, PaintCtx, chain_new, chain_add, chain_pick, chain_segment,
-    chain_width, chain_paint, ctx_new, ctx_free, utf8_next,
+    chain_width, chain_paint, chain_free, ctx_new, ctx_free, utf8_next,
     K_LATIN, K_CJK, K_SYMBOL, K_EMOJI, NO_FONT, CHAIN_MAX,
 }
 
@@ -43,6 +49,7 @@ struct Chain {
     n: usize,
     fonts: [*mut ttf.Font; 6],
     kind: [u32; 6],
+    gb: u64,
 }
 
 struct Run {
@@ -59,7 +66,12 @@ struct PaintCtx {
 }
 
 fn chain_new() -> Chain {
-    return Chain { n: 0, fonts: [0 as *mut ttf.Font; 6], kind: [0; 6] }
+    return Chain { n: 0, fonts: [0 as *mut ttf.Font; 6], kind: [0; 6], gb: grapheme.gb_map() }
+}
+
+fn chain_free(c: *mut Chain) {
+    grapheme.gb_free((*c).gb)
+    (*c).gb = 0
 }
 
 fn chain_add(c: *mut Chain, f: *mut ttf.Font, kind: u32) -> bool {
@@ -72,50 +84,19 @@ fn chain_add(c: *mut Chain, f: *mut ttf.Font, kind: u32) -> bool {
     return true
 }
 
-// Decodes one UTF-8 sequence at `i`. Malformed input gives U+FFFD and advances 1.
+// Decodes one UTF-8 sequence at `i` (strict: no overlongs, no surrogates). Malformed input gives
+// U+FFFD and advances 1. The same decoder the cluster finder uses, so runs and clusters agree.
 fn utf8_next(p: u64, n: usize, i: usize, len: *mut usize) -> u32 {
-    let b0: u32 = rt.ld8(p, i) as u32
-    *len = 1
-    if b0 < 128 as u32 {
-        return b0
-    }
-    var need: usize = 0
-    var cp: u32 = 0
-    if b0 >= 194 as u32 && b0 < 224 as u32 {
-        need = 1
-        cp = b0 & 31 as u32
-    } else if b0 >= 224 as u32 && b0 < 240 as u32 {
-        need = 2
-        cp = b0 & 15 as u32
-    } else if b0 >= 240 as u32 && b0 < 245 as u32 {
-        need = 3
-        cp = b0 & 7 as u32
-    } else {
-        return 65533 as u32
-    }
-    if i + need >= n {
-        return 65533 as u32
-    }
-    var k: usize = 1
-    while k <= need {
-        let b: u32 = rt.ld8(p, i + k) as u32
-        if (b & 192 as u32) != 128 as u32 {
-            return 65533 as u32
-        }
-        cp = (cp << 6 as u32) | (b & 63 as u32)
-        k = k + 1
-    }
-    *len = need + 1
-    return cp
+    return grapheme.gb_decode(p, n, i, len)
 }
 
-// Code points that never start a run of their own.
+// Code points inside a cluster that draw nothing of their own (the base glyph carries them).
 fn is_extender(cp: u32) -> bool {
     return cp == 8205 as u32 // ZWJ
     || (cp >= 65024 as u32 && cp <= 65039 as u32) // variation selectors
     || (cp >= 127995 as u32 && cp <= 127999 as u32) // skin tones
-    || (cp >= 768 as u32 && cp <= 879 as u32) // combining diacritics
     || (cp >= 917760 as u32 && cp <= 917999 as u32)
+    || (cp >= 917536 as u32 && cp <= 917631 as u32) // tag characters (subdivision flags)
     || cp == 8419 as u32 // combining enclosing keycap
 }
 
@@ -139,38 +120,46 @@ fn chain_pick(c: *mut Chain, cp: u32, prefer_emoji: bool) -> usize {
     return NO_FONT
 }
 
+// Does the cluster [off, off+len) ask for emoji presentation? (VS16, ZWJ, skin tone, flag, keycap)
+fn wants_emoji(p: u64, n: usize, off: usize, len: usize) -> bool {
+    var j: usize = 0
+    while j < len {
+        var l: usize = 1
+        let cp: u32 = utf8_next(p, n, off + j, &l)
+        if cp == 65039 as u32 || cp == 8205 as u32 || cp == 8419 as u32
+        || (cp >= 127995 as u32 && cp <= 127999 as u32)
+        || (cp >= 127462 as u32 && cp <= 127487 as u32) {
+            return true
+        }
+        j = j + l
+    }
+    return false
+}
+
 fn chain_segment(c: *mut Chain, p: u64, n: usize, runs: *mut [Run; 64], max: usize) -> usize {
     var nr: usize = 0
     var i: usize = 0
     while i < n {
+        var k: usize = grapheme.gb_next((*c).gb, p, n, i)
+        if k == 0 {
+            k = 1
+        }
         var l: usize = 1
         let cp: u32 = utf8_next(p, n, i, &l)
-        // emoji presentation selector right behind this code point?
-        var pref: bool = false
-        if i + l < n {
-            var l2: usize = 1
-            if utf8_next(p, n, i + l, &l2) == 65039 as u32 {
-                pref = true
-            }
-        }
-        if is_extender(cp) && nr > 0 {
-            (*runs)[nr - 1].len = (*runs)[nr - 1].len + l
-            i = i + l
-            continue
-        }
+        let pref: bool = wants_emoji(p, n, i, k)
         var fi: usize = chain_pick(c, cp, pref)
         if fi == NO_FONT {
             fi = 0
         }
         if nr > 0 && (*runs)[nr - 1].font == fi && !pref {
-            (*runs)[nr - 1].len = (*runs)[nr - 1].len + l
+            (*runs)[nr - 1].len = (*runs)[nr - 1].len + k
         } else if nr < max {
             (*runs)[nr].off = i
-            (*runs)[nr].len = l
+            (*runs)[nr].len = k
             (*runs)[nr].font = fi
             nr = nr + 1
         }
-        i = i + l
+        i = i + k
     }
     return nr
 }
@@ -249,7 +238,9 @@ fn paint_outline(x: *mut PaintCtx, f: *mut ttf.Font, gid: u32, px: f64, penx: f6
     let asc: i32 = ttf.font_ascent(f)
     let des: i32 = ttf.font_descent(f)
     var top: f64 = base - (asc as f64) * sc - 2.0
-    var wy: f64 = (asc as f64 - des as f64) * sc + 5.0
+    // font_descent is kept POSITIVE: the window is ascent + descent tall (it was ascent - descent,
+    // which cut every glyph off a few pixels above the baseline)
+    var wy: f64 = (asc as f64 + des as f64) * sc + 5.0
     var wx: f64 = (ttf.font_advance(f, gid) as f64) * sc + 6.0
     var left: f64 = penx - 2.0
     if wx > (WIN_MAX as f64) {
@@ -295,6 +286,10 @@ fn chain_paint(x: *mut PaintCtx, c: *mut Chain, p: u64, n: usize, px: f64, x0: f
     while r < nr {
         let f: *mut ttf.Font = (*c).fonts[runs[r].font]
         let colour_font: bool = colr.colr_ok(f)
+        var cbk: usize = cbdt.CB_NONE
+        if cbdt.cbdt_ok(f) {
+            cbk = cbdt.cbdt_pick(f, px)
+        }
         var j: usize = 0
         while j < runs[r].len {
             var l: usize = 1
@@ -307,10 +302,16 @@ fn chain_paint(x: *mut PaintCtx, c: *mut Chain, p: u64, n: usize, px: f64, x0: f
             var gids: [u32; 32] = [0; 32]
             var idx: [u32; 32] = [0; 32]
             var nl: usize = 0
-            if colour_font {
+            var bitmap: bool = false
+            if cbk != cbdt.CB_NONE {
+                bitmap = cbdt.cbdt_paint(f, cbk, gid, px, pen, base, dst, dw, dh)
+            }
+            if colour_font && !bitmap {
                 nl = colr.colr_layers(f, gid, &gids, &idx)
             }
-            if nl > 0 {
+            if bitmap {
+                // pixels already in place
+            } else if nl > 0 {
                 var k: usize = 0
                 while k < nl {
                     var col: u32 = fg

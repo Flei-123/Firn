@@ -2049,6 +2049,17 @@ else
     grep -E 'FAIL' "$WORK/stack_e.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 135. Font fallback chain + CBDT/CBLC bitmap emoji + grapheme clusters (Pillow/FreeType, fontTools, regex \\X, GraphemeBreakTest; tools/fontfb/run.sh, docs/FONT-FALLBACK.md) =="
+FIRNC="$FIRNC" bash tools/fontfb/run.sh > "$WORK/fontfb.log" 2>&1 && FFRC=0 || FFRC=$?
+if [ "$FFRC" -eq 0 ]; then
+    ok
+    grep -E '^(RESULT|  (A|B|C|D|E|GraphemeBreakTest|random))' "$WORK/fontfb.log" | head -14 | sed 's/^/ /'
+    grep -E 'SKIP' "$WORK/fontfb.log" | head -3 | sed 's/^/ /' || true
+else
+    bad "tools/fontfb/run.sh failed (see .test-work/fontfb.log)"
+    grep -E 'FAIL|DIFF' "$WORK/fontfb.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 125. GL 3.3 core window: X11 (EGL on the Firn window's XID + GLX fallback) + Windows twin under Wine (tools/gpu/win/run.sh, lib/gpu/glwindow.fi, docs/GPU.md) =="
 # Xvfb + Mesa llvmpipe: open, clear + read back the window framebuffer, swap, swap interval, resize, full screen request, DPI.
 # A missing libEGL / Xvfb is SKIP (Wine part: SKIP without wine / mingw ld). Only Mesa is proven; a real GPU driver is UNTESTED.

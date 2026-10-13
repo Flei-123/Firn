@@ -85,7 +85,7 @@ der Testwerkzeuge.** Am Dell wurde nichts geändert.
 | # | Punkt | Status | Beleg | Aufwand | Nutzen |
 |---|---|---|---|---|---|
 | E1 | Unicode/UTF-8/WTF-8 im Text | **vorhanden** | `textbuf.fi:236` | — | 5 |
-| E2 | **Emoji (Farbe)** | **fehlt** (kein COLR/CPAL/sbix/CBDT-Leser; Treffer nur Kommentar in `plat/sysfont.fi`) | `grep -ril 'colr\|cbdt\|sbix' lib` | L | 4 |
+| E2 | **Emoji (Farbe)** | **fehlt** (kein COLR/CPAL/sbix/CBDT-Leser; Treffer nur Kommentar in `plat/sysfont.fi`) | `grep -ril 'colr\|cbdt\|sbix' lib` | L | 4 | Stand 13.10.2026: ERLEDIGT teilweise (Kette, COLR v0, CBDT/CBLC, Graphem-Cluster; offen: sbix, COLR v1, Shaping) -- docs/FONT-FALLBACK.md
 | E3 | **OS-IME / Komposition** | **teilweise**: eigene Eingabetabellen Romaji→Kana (176), Hangul, Pinyin (3883 Zeichen) im Feld (`ime.fi`, 1514 Z.); Android-Bildschirmtastatur (Emulator); Web: verstecktes `<textarea>`. **Windows: kein WM_IME_*/IMM/TSF** (`win32.fi`: nur WM_CHAR), **X11: kein XIM/ibus/fcitx** (grep → 0). Pinyin nur Einzelzeichen (r16) | `ime.fi`, `win32.fi:1194`, `docs/fui-real-devices.md` | M (Win), M (Linux) | 4 (CJK) / 2 (DE/EN) |
 | E4 | Bidi/RTL, Spiegelung | **vorhanden** (UAX#9: BidiCharacterTest 91707/91707, BidiTest 770241/770241); bidi-Cursorbewegung im Textarea fehlt | r10, r11, r127 | S | 3 |
 | E5 | Tastaturnavigation | **teilweise**: Tab/Shift+Tab, Enter/Leertaste, Pfeile im Kit, Fokusfalle im Modal; **Fokusmodell für Listenzeilen fehlt (r134)**; Shortcuts/Mnemonics nicht gefunden; Esc schließt Fenster nicht (Doc) | `control.fi`, `kit.fi` | M | 5 |
@@ -124,7 +124,7 @@ der Testwerkzeuge.** Am Dell wurde nichts geändert.
 | S3 | Subpixel/LCD-Glättung | **fehlt** (nur Graustufen; grep → nur Viertelpixel-Platzierung) | `painter.fi:528` | M | 2 |
 | S4 | **GPOS-Kerning, GSUB-Kontext 5/6**, Texte > 4096 Zeichen im LTR-Pfad | **teilweise/fehlt** ("modern fonts put kerning in GPOS … this reader finds none") | `ttf.fi:21–27`, r13 | M | 4 |
 | S5 | **Variable Fonts** | **fehlt**: nur die Default-Instanz wird gelesen (Doc-Kommentar "right by accident") | `lib/plat/sysfont.fi` | M | 3 |
-| S6 | **Schrift-Fallback-Kette** (Latein → CJK → Symbole → Emoji) | **fehlt**: ein `FontSet`, ein Font je Painter; kein Fallback | `painter.fi:1813`, `font/metrics.fi` | M | **5** (jede mehrsprachige App) |
+| S6 | **Schrift-Fallback-Kette** (Latein → CJK → Symbole → Emoji) | **fehlt**: ein `FontSet`, ein Font je Painter; kein Fallback | `painter.fi:1813`, `font/metrics.fi` | M | **5** (jede mehrsprachige App) | Stand 13.10.2026: ERLEDIGT teilweise (Kette, COLR v0, CBDT/CBLC, Graphem-Cluster; offen: sbix, COLR v1, Shaping) -- docs/FONT-FALLBACK.md
 | S7 | Systemschriften wählen/auflisten | **teilweise**: feste Pfade je OS (Linux DejaVu; Windows Segoe UI→Arial→Tahoma; Android Roboto) — keine Aufzählung, keine Auswahl durch den Nutzer | `sysfont.fi` | S | 3 |
 | S8 | Web: Schriften subsetten (1,8 MB TTF) | **fehlt** | r84 | S | 2 |
 

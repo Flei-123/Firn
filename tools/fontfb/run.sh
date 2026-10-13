@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# tools/fontfb/run.sh -- font fallback chain + COLR v0 against fontTools.
+# tools/fontfb/run.sh -- gate 135: font fallback chain, COLR v0, CBDT/CBLC bitmap emoji, grapheme clusters.
+#   1. probe.fi      runs + COLR v0 layers vs fontTools (as before)
+#   2. chainprobe.fi + chain_check.py: bitmap glyphs vs Pillow/FreeType, PNG, numpy; runs/width vs
+#      fontTools + regex \X (needs python3 with PIL, numpy, fontTools; `regex` is pip-installed
+#      into a temp dir if missing, else part E is SKIPPED loudly)
+#   3. tools/grapheme/run.sh (UAX #29 table + GraphemeBreakTest + regex cross-check)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
-FIRNC=${FIRNC:-/root/firn-w-r5/compiler/target/release/firnc}
-[ -x "$FIRNC" ] || FIRNC=compiler/target/release/firnc
+FIRNC=${FIRNC:-compiler/target/release/firnc}
+[ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
+export FIRNLIB="$(pwd)/lib"
+RC=0
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
-FIRNLIB="$(pwd)/lib" "$FIRNC" --opt-level=dev-fast -o "$D/probe" tools/fontfb/probe.fi || exit 1
+"$FIRNC" --opt-level=dev-fast -o "$D/probe" tools/fontfb/probe.fi || exit 1
 python3 - "$D/probe" <<'PY'
 import subprocess, sys
 from fontTools.ttLib import TTFont
@@ -63,3 +70,11 @@ print("  colour glyphs checked: %d, paint smoke: %s" % (n_lay, paint[0] if paint
 print("RESULT fontfb: %s (%d checks, %d failed)" % ("ok" if not fails else "FAIL", checks, fails))
 sys.exit(1 if fails else 0)
 PY
+[ $? -eq 0 ] || RC=1
+"$FIRNC" --opt-level=dev-fast -o "$D/chainprobe" tools/fontfb/chainprobe.fi || { echo "FAIL compile chainprobe"; exit 1; }
+if ! python3 -I -c "import regex" 2>/dev/null; then
+    timeout 90 python3 -m pip install -q --disable-pip-version-check --target "$D/pk" regex >/dev/null 2>&1
+fi
+PYTHONPATH="$D/pk" python3 -u tools/fontfb/chain_check.py "$D/chainprobe" || RC=1
+bash tools/grapheme/run.sh || RC=1
+exit $RC
