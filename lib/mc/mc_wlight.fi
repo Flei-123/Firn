@@ -1,0 +1,303 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_wlight.fi -- light for a CHUNK based world: padded light arrays for the mesher + an editable region volume.
+//
+//     wl_pad(wl, chunks, cx, sy, cz, out)          -> bool  fills out (u8 [5832], sky << 4 | block); true = real light data was used
+//     wl_new / wl_free / wl_set_tables(wl, op, emit)
+//     wl_region_load(wl, world, cx0, cz0, ncx, ncz, from_packets) -> columns loaded
+//     wl_edit(wl, world, x, y, z, id)               world_set_block + incremental mc_light update
+//     wl_take_dirty(wl, out, max)                   -> n region-local (sx, sy, sz) u32 triples whose padded light changed (+ wl.cx0 / cz0)
+//
+// Light sources of one cell, in this order (the first one that knows the cell wins):
+//   1. the region volume of the WorldLight (mc_light.LightVol over ncx x ncz columns; editable, incremental)
+//   2. Chunk.light of the column (mc_lightpkt.LightData of a 1.18+ map_chunk with Scratch.keep_light, or update_light)
+//   3. unknown: 0xF0 (sky 15, block 0) = the old look. Chunk not loaded or section beyond the arrays count as unknown.
+// Inside a LightData a section that is neither in the mask nor in the "empty" mask has sky 15 / block 0 (unknown), one in the
+// empty mask has 0 / 0.
+//
+// `chunks` = address of 9 u64 (mc_chunk.Chunk pointers or 0), index (dz + 1) * 3 + (dx + 1) around the column of the section.
+// The section bit of LightData is (section index relative to min_y) + 1; bit 0 is the section below the world.
+import std.rt
+import mc.mc_chunk
+import mc.mc_light
+import mc.mc_lightpkt
+import mc.mc_world
+import mc.mc_blockset
+import mc.mc_registry
+
+export { WorldLight, wl_new, wl_free, wl_set_tables, wl_set_tables_registry, wl_pad, wl_region_load, wl_region_covers, wl_edit, wl_take_dirty, wl_active, wl_chunks }
+
+const DEFAULT_LIGHT: u8 = 240 as u8
+
+struct WorldLight {
+    min_y: i32,
+    nsec: i32,
+    on: bool, // the region volume exists
+    cx0: i32, cz0: i32, ncx: i32, ncz: i32,
+    vol: mc_light.LightVol,
+    op: u64, // u8 [32768] filterLight per block state id (0..15)
+    emit: u64, // u8 [32768] emitLight per block state id (0..15)
+    scratch: u64, // 3 i32 per dirty section
+}
+
+fn wl_new(min_y: i32, nsec: i32) -> WorldLight {
+    var wl: WorldLight = WorldLight { min_y: min_y, nsec: nsec, on: false, cx0: 0, cz0: 0, ncx: 0, ncz: 0,
+        vol: mc_light.light_new(16, 16, 16), op: rt.heap_alloc(32768), emit: rt.heap_alloc(32768), scratch: rt.heap_alloc(27 * 5 * 8) }
+    var i: usize = 0
+    while i < 32768 {
+        rt.st8(wl.op, i, 0 as u8)
+        rt.st8(wl.emit, i, 0 as u8)
+        i = i + 1
+    }
+    return wl
+}
+
+fn wl_free(wl: *mut WorldLight) {
+    mc_light.light_free(&(*wl).vol)
+    rt.heap_free((*wl).op, 32768)
+    rt.heap_free((*wl).emit, 32768)
+    rt.heap_free((*wl).scratch, 27 * 5 * 8)
+    (*wl).on = false
+}
+
+fn wl_active(wl: *mut WorldLight) -> bool { return (*wl).on }
+
+// Copies the two u8 [32768] tables (op = light filter 0..15, emit = light emission 0..15) per block state id.
+fn wl_set_tables(wl: *mut WorldLight, op: u64, emit: u64) {
+    rt.mem_copy((*wl).op, op, 32768)
+    rt.mem_copy((*wl).emit, emit, 32768)
+}
+
+// Tables from the registry flags (bits 4-7 filterLight, bits 8-11 emitLight); states >= 32768 are ignored.
+fn wl_set_tables_registry(wl: *mut WorldLight, r: *mut mc_registry.Registry) {
+    var b: i32 = 0
+    while b < mc_registry.reg_block_count(r) as i32 {
+        let f: u32 = mc_registry.reg_block_flags(r, b)
+        let fl: u8 = ((f >> 4 as u32) & 15 as u32) as u8
+        let em: u8 = ((f >> 8 as u32) & 15 as u32) as u8
+        var st: i32 = mc_registry.reg_block_min_state(r, b)
+        while st <= mc_registry.reg_block_max_state(r, b) {
+            if st >= 0 && st < 32768 {
+                rt.st8((*wl).op, st as usize, fl)
+                rt.st8((*wl).emit, st as usize, em)
+            }
+            st = st + 1
+        }
+        b = b + 1
+    }
+}
+
+fn wl_region_covers(wl: *mut WorldLight, cx: i32, cz: i32) -> bool {
+    return (*wl).on && cx >= (*wl).cx0 && cz >= (*wl).cz0 && cx < (*wl).cx0 + (*wl).ncx && cz < (*wl).cz0 + (*wl).ncz
+}
+
+// ---- padded light for the mesher --------------------------------------------------------------------------------
+
+fn nib(arr: u64, i: usize) -> u8 {
+    let by: u8 = rt.ld8(arr, i >> 1)
+    if (i & 1) == 0 { return by & 15 as u8 }
+    return by >> 4 as u8
+}
+
+// Fills out (u8 [5832], index (y * 18 + z) * 18 + x) with the light of section (cx, sy, cz) and its shell. Returns false when
+// no cell had real light data (the caller may then mesh without F_LIGHT: the result is identical and cheaper).
+fn wl_pad(wl: *mut WorldLight, chunks: u64, cx: i32, sy: i32, cz: i32, out: u64) -> bool {
+    let nsec: i32 = (*wl).nsec
+    // per neighbour section block (27): [0] has arrays, [1] sky array, [2] block array, [3] sky empty, [4] block empty
+    let sc: u64 = (*wl).scratch
+    var any: bool = false
+    var dz: i32 = 0 - 1
+    while dz <= 1 {
+        var dx: i32 = 0 - 1
+        while dx <= 1 {
+            let cp: u64 = rt.ld64(chunks, ((dz + 1) * 3 + (dx + 1)) as usize)
+            var dy: i32 = 0 - 1
+            while dy <= 1 {
+                let ci: usize = ((dy + 1) * 9 + (dz + 1) * 3 + (dx + 1)) as usize
+                let q: i32 = sy + dy
+                rt.st64(sc, ci * 5, 0 as u64)
+                rt.st64(sc, ci * 5 + 1, 0 as u64)
+                rt.st64(sc, ci * 5 + 2, 0 as u64)
+                rt.st64(sc, ci * 5 + 3, 0 as u64)
+                rt.st64(sc, ci * 5 + 4, 0 as u64)
+                if cp != 0 && q >= 0 && q < nsec {
+                    let c: *mut mc_chunk.Chunk = cp as *mut mc_chunk.Chunk
+                    if (*c).light != 0 {
+                        let ld: *mut mc_lightpkt.LightData = (*c).light as *mut mc_lightpkt.LightData
+                        let bit: i32 = q + 1
+                        rt.st64(sc, ci * 5, 1 as u64)
+                        rt.st64(sc, ci * 5 + 1, mc_lightpkt.lightdata_sky_array(ld, bit))
+                        rt.st64(sc, ci * 5 + 2, mc_lightpkt.lightdata_block_array(ld, bit))
+                        rt.st64(sc, ci * 5 + 3, (((*ld).empty_sky >> (bit as u64)) & 1 as u64))
+                        rt.st64(sc, ci * 5 + 4, (((*ld).empty_block >> (bit as u64)) & 1 as u64))
+                        any = true
+                    }
+                }
+                dy = dy + 1
+            }
+            dx = dx + 1
+        }
+        dz = dz + 1
+    }
+    var py: i32 = 0
+    while py < 18 {
+        let gy: i32 = py - 1
+        var ddy: i32 = 0
+        if gy < 0 { ddy = 0 - 1 }
+        if gy > 15 { ddy = 1 }
+        let ly: i32 = gy - ddy * 16
+        let q: i32 = sy + ddy
+        var pz: i32 = 0
+        while pz < 18 {
+            let gz: i32 = pz - 1
+            var ddz: i32 = 0
+            if gz < 0 { ddz = 0 - 1 }
+            if gz > 15 { ddz = 1 }
+            let lz: i32 = gz - ddz * 16
+            var px: i32 = 0
+            while px < 18 {
+                let gx: i32 = px - 1
+                var ddx: i32 = 0
+                if gx < 0 { ddx = 0 - 1 }
+                if gx > 15 { ddx = 1 }
+                let lx: i32 = gx - ddx * 16
+                let ccx: i32 = cx + ddx
+                let ccz: i32 = cz + ddz
+                var v: u8 = DEFAULT_LIGHT
+                if q >= 0 && q < nsec && wl_region_covers(wl, ccx, ccz) {
+                    v = mc_light.light_get(&(*wl).vol, (ccx - (*wl).cx0) * 16 + lx, q * 16 + ly, (ccz - (*wl).cz0) * 16 + lz)
+                    any = true
+                } else {
+                    let ci: usize = ((ddy + 1) * 9 + (ddz + 1) * 3 + (ddx + 1)) as usize
+                    if rt.ld64(sc, ci * 5) != 0 as u64 {
+                        let ix: usize = ((ly * 16 + lz) * 16 + lx) as usize
+                        var sk: u8 = 15 as u8
+                        let sa: u64 = rt.ld64(sc, ci * 5 + 1)
+                        if sa != 0 {
+                            sk = nib(sa, ix)
+                        } else if rt.ld64(sc, ci * 5 + 3) != 0 as u64 {
+                            sk = 0 as u8
+                        }
+                        var bk: u8 = 0 as u8
+                        let ba: u64 = rt.ld64(sc, ci * 5 + 2)
+                        if ba != 0 { bk = nib(ba, ix) }
+                        v = (sk << 4 as u8) | bk
+                    }
+                }
+                rt.st8(out, ((py * 18 + pz) * 18 + px) as usize, v)
+                px = px + 1
+            }
+            pz = pz + 1
+        }
+        py = py + 1
+    }
+    return any
+}
+
+// Gathers the 9 column pointers around (cx, cz) from a World into out (u64 [9]).
+fn wl_chunks(w: *mut mc_world.World, cx: i32, cz: i32, out: u64) {
+    var dz: i32 = 0 - 1
+    while dz <= 1 {
+        var dx: i32 = 0 - 1
+        while dx <= 1 {
+            rt.st64(out, ((dz + 1) * 3 + (dx + 1)) as usize, mc_world.world_find(w, cx + dx, cz + dz))
+            dx = dx + 1
+        }
+        dz = dz + 1
+    }
+}
+
+// ---- region volume ------------------------------------------------------------------------------------------------
+
+// Builds the region volume over the columns cx0 .. cx0+ncx-1 x cz0 .. cz0+ncz-1 of the world (unloaded columns = open air):
+// cell data from the block ids, light = full computation; with from_packets the Chunk.light arrays of the loaded columns then
+// overwrite the computed values (the server light wins, the computed one only supplies the sky-direct flags for later edits).
+// Returns the number of loaded columns. Memory: 5 octets per cell (ncx*16 * nsec*16 * ncz*16).
+fn wl_region_load(wl: *mut WorldLight, w: *mut mc_world.World, cx0: i32, cz0: i32, ncx: i32, ncz: i32, from_packets: bool) -> usize {
+    if (*wl).on { mc_light.light_free(&(*wl).vol) }
+    (*wl).vol = mc_light.light_new(ncx * 16, (*wl).nsec * 16, ncz * 16)
+    (*wl).cx0 = cx0
+    (*wl).cz0 = cz0
+    (*wl).ncx = ncx
+    (*wl).ncz = ncz
+    (*wl).on = true
+    let v: *mut mc_light.LightVol = &(*wl).vol
+    var loaded: usize = 0
+    var iz: i32 = 0
+    while iz < ncz {
+        var ix: i32 = 0
+        while ix < ncx {
+            let cp: u64 = mc_world.world_find(w, cx0 + ix, cz0 + iz)
+            if cp != 0 {
+                loaded = loaded + 1
+                let c: *mut mc_chunk.Chunk = cp as *mut mc_chunk.Chunk
+                var q: usize = 0
+                while q < (*c).nsec && (q as i32) < (*wl).nsec {
+                    let sec: *mut mc_chunk.Section = mc_chunk.chunk_section(c, q)
+                    var y: i32 = 0
+                    while y < 16 {
+                        var z: i32 = 0
+                        while z < 16 {
+                            var x: i32 = 0
+                            while x < 16 {
+                                let id: u16 = mc_chunk.container_get(&(*sec).blocks, ((y * 16 + z) * 16 + x) as usize)
+                                if id != 0 as u16 {
+                                    mc_light.light_set_raw(v, ix * 16 + x, (q as i32) * 16 + y, iz * 16 + z,
+                                        rt.ld8((*wl).op, (id & 32767 as u16) as usize), rt.ld8((*wl).emit, (id & 32767 as u16) as usize))
+                                }
+                                x = x + 1
+                            }
+                            z = z + 1
+                        }
+                        y = y + 1
+                    }
+                    q = q + 1
+                }
+            }
+            ix = ix + 1
+        }
+        iz = iz + 1
+    }
+    mc_light.light_full(v)
+    if from_packets {
+        iz = 0
+        while iz < ncz {
+            var ix: i32 = 0
+            while ix < ncx {
+                let cp: u64 = mc_world.world_find(w, cx0 + ix, cz0 + iz)
+                if cp != 0 && (*(cp as *mut mc_chunk.Chunk)).light != 0 {
+                    let ld: *mut mc_lightpkt.LightData = (*(cp as *mut mc_chunk.Chunk)).light as *mut mc_lightpkt.LightData
+                    mc_lightpkt.lightdata_apply(v, ld, ix * 16, iz * 16)
+                }
+                ix = ix + 1
+            }
+            iz = iz + 1
+        }
+    }
+    // the load itself is not an edit: forget the dirty marks
+    let nd: usize = ((*v).nsx as usize) * ((*v).nsy as usize) * ((*v).nsz as usize)
+    rt.mem_set((*v).dirty, 0 as u8, nd)
+    return loaded
+}
+
+// Sets a block in the world (mc_blockset.world_set_block, result = old id / negative error) and repairs the region light
+// incrementally. The caller then marks the renderer: wl_take_dirty -> stream / wr mark sections.
+fn wl_edit(wl: *mut WorldLight, w: *mut mc_world.World, x: i32, y: i32, z: i32, id: i32) -> i32 {
+    let old: i32 = mc_blockset.world_set_block(w, (*wl).min_y, x, y, z, id)
+    if old < 0 { return old }
+    if !(*wl).on { return old }
+    let cx: i32 = mc_world.block_to_chunk(x)
+    let cz: i32 = mc_world.block_to_chunk(z)
+    if !wl_region_covers(wl, cx, cz) { return old }
+    let ly: i32 = y - (*wl).min_y
+    if ly < 0 || ly >= (*wl).nsec * 16 { return old }
+    mc_light.light_set_block(&(*wl).vol, x - (*wl).cx0 * 16, ly, z - (*wl).cz0 * 16,
+        rt.ld8((*wl).op, (id & 32767) as usize), rt.ld8((*wl).emit, (id & 32767) as usize))
+    return old
+}
+
+// Dirty sections since the last call as REGION-LOCAL (sx, sy, sz) u32 triples (sy relative to min_y) into out (`max` entries);
+// the global column is (wl.cx0 + sx, wl.cz0 + sz) (negative columns do not fit an unsigned slot, so the caller adds the origin).
+fn wl_take_dirty(wl: *mut WorldLight, out: u64, max: usize) -> usize {
+    if !(*wl).on { return 0 }
+    return mc_light.light_take_dirty(&(*wl).vol, out, max)
+}

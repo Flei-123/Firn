@@ -14,7 +14,7 @@ import os
 
 # The order = the atom id (1-based). Do NOT re-sort, only append at the
 # end -- otherwise all the constants change.
-NAMEN = [
+NAMES = [
     # --- basic skeleton
     "html", "head", "body", "frameset", "frame", "noframes", "title",
     # --- "in head"
@@ -77,21 +77,21 @@ def main():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     target = os.path.join(root, "lib", "browser", "tag.fi")
 
-    if len(set(NAMEN)) != len(NAMEN):
-        dupes = [x for x in NAMEN if NAMEN.count(x) > 1]
+    if len(set(NAMES)) != len(NAMES):
+        dupes = [x for x in NAMES if NAMES.count(x) > 1]
         raise SystemExit("duplicate names: %s" % sorted(set(dupes)))
 
-    def konst(name):
+    def const(name):
         return "M_" + name.upper().replace("-", "_")
 
-    consts = ", ".join(konst(x) for x in NAMEN)
-    text = " ".join(NAMEN)
+    consts = ", ".join(const(x) for x in NAMES)
+    text = " ".join(NAMES)
     raw = text.encode("ascii")
 
-    out = [HEAD.format(n=len(NAMEN), consts=consts)]
-    out.append("const M_LETZTES_FEST: u32 = %d\n\n" % len(NAMEN))
-    for i, name in enumerate(NAMEN, start=1):
-        out.append("const %s: u32 = %d\n" % (konst(name), i))
+    out = [HEAD.format(n=len(NAMES), consts=consts)]
+    out.append("const M_LETZTES_FEST: u32 = %d\n\n" % len(NAMES))
+    for i, name in enumerate(NAMES, start=1):
+        out.append("const %s: u32 = %d\n" % (const(name), i))
     out.append("\n")
     out.append(
         "// The names, separated by a space. `namen_init` splits them.\n"
@@ -111,7 +111,7 @@ def main():
 
     with open(target, "w", encoding="utf-8") as fh:
         fh.write("".join(out))
-    print("written: %s (%d names, %d bytes of text)" % (target, len(NAMEN), len(raw)))
+    print("written: %s (%d names, %d bytes of text)" % (target, len(NAMES), len(raw)))
 
 
 if __name__ == "__main__":

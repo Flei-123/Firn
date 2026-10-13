@@ -86,3 +86,14 @@ pass/stop band gains, envelope, softclip/limiter bounds, crush levels, delay ech
 * Reverb tails are cut at the end of the buffer; loops (`ambient.*`, `music.*`) are made loopable by fade in/out, not by
   a seamless crossfade. Music is generative pentatonic notes, not composition.
 * Rendering is offline whole-buffer f64 (the 32 s music takes ~2 s); not a real time engine.
+
+## OrientOS event names (proposal, r61)
+The 18 sounds of `orientos.json` are the ids `login logout lock unlock notification message error warning success click hover volume_ping usb_in usb_out mic_on mic_off shutdown boot`. Proposal for the OrientOS side (NOT agreed with the OrientOS department yet; they decide):
+* Event name = `orientos.<id>` on bus `ui` (e.g. `orientos.login`); the bank ids stay unprefixed, the prefix is added by the OrientOS sound service when it loads the bank (so Minecraft names `ui.*` never collide).
+* ACTION-BUS today knows only `sound.volume` / `sound.mute`; the proposal adds `sound.play {event}` -> the 18 names above. Triggers: session login/logout/lock/unlock, notification centre (notification, message, error, warning, success), UI click/hover, volume change (`volume_ping`), USB plug (`usb_in/out`), microphone (`mic_on/off`), power (`boot`, `shutdown`).
+* Open: sound theme switching and per-event volume belong to OrientOS settings, not to this bank.
+
+## Coverage against the id table (r72/r76)
+`python3 tools/mc/audio/coverage.py lib/mc/v763/mc_snd_v763.fi tools/sounds/mc.json [--top N] [--check --allow N]` ranks the events of a version's id table that have NO synth sound by a heuristic tier (1 = constantly heard: block step/break/place/hit/fall, player, generic, items, doors/chests/fire/water, UI, weather; 2 = common mobs; 3 = rest). Measured 13.10.: tier 1 726 events / 76 covered, tier 2 189 / 12, tier 3 559 / 1 (the tier-1 count includes ~600 `block.<type>.*` events of types the bank has no own recipe for).
+* Fix without new samples: `mc_audio.mca_find` maps `block.<type>.<action>` of an unknown type to the nearest of the 13 materials (`mca_type_material`, heuristic by name), so cherry_wood / tuff / azalea_leaves ... are no longer silent. Exact event names always win.
+* NOT done: recipes for player (hurt, death, eat, burp, splash), doors / chests / levers, arrows, skeleton / creeper / spider ..., fire / water / lava ambience. Engine limit 512 events+samples per bank leaves ~200 events of room (pack sounds share it).

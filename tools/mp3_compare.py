@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MPL-2.0
-"""mp3_compare.py -- misst zwei PCM-Dateien (s16le) gegeneinander.
+"""mp3_compare.py -- measures two PCM files (s16le) against each other.
 
-Gibt aus: Zahl der Werte, groesster Absolutfehler, quadratisches Mittel
-des Fehlers und den Signal-Rausch-Abstand in dB. Bit-genau heisst
-max = 0. Alles andere ist ein Befund, keine Meinung.
+Prints: number of values, largest absolute error, mean square
+of the error and the signal-to-noise ratio in dB. Bit-exact means
+max = 0. Anything else is a finding, not an opinion.
 """
 import sys
 import array
 import math
 
 
-def lade(pfad):
+def lade(fpath):
     a = array.array('h')
-    with open(pfad, 'rb') as f:
+    with open(fpath, 'rb') as f:
         roh = f.read()
     a.frombytes(roh[:len(roh) // 2 * 2])
     return a
@@ -27,27 +27,27 @@ def main():
         print('LEER')
         return 1
     maxf = 0
-    summe = 0.0
+    total = 0.0
     signal = 0.0
-    erste = -1
-    anzahl_ungleich = 0
+    first_diff = -1
+    count_unequal = 0
     for i in range(n):
         d = a[i] - b[i]
         if d:
-            anzahl_ungleich += 1
-            if erste < 0:
-                erste = i
+            count_unequal += 1
+            if first_diff < 0:
+                first_diff = i
         if abs(d) > maxf:
             maxf = abs(d)
-        summe += d * d
+        total += d * d
         signal += float(a[i]) * a[i]
-    rms = math.sqrt(summe / n)
-    if summe == 0:
+    rms = math.sqrt(total / n)
+    if total == 0:
         snr = float('inf')
     else:
-        snr = 10 * math.log10(signal / summe) if signal > 0 else 0.0
+        snr = 10 * math.log10(signal / total) if signal > 0 else 0.0
     print('werte    %d (Referenz %d, Pruefling %d)' % (n, len(a), len(b)))
-    print('ungleich %d (%.4f %%), erster bei %d' % (anzahl_ungleich, 100.0 * anzahl_ungleich / n, erste))
+    print('ungleich %d (%.4f %%), erster bei %d' % (count_unequal, 100.0 * count_unequal / n, first_diff))
     print('maxfehler %d' % maxf)
     print('rms       %.4f' % rms)
     print('snr       %.1f dB' % snr)

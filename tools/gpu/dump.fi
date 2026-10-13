@@ -15,6 +15,7 @@ import mc.mc_raster
 import mc.mc_backend
 import gpu.gl33
 import gpu.gl_mc
+import gpu.gl_scene
 
 const W: i32 = 320
 const H: i32 = 180
@@ -244,14 +245,29 @@ fn tables(t: *mut mc_mesh.MeshTables) {
         rt.st16(tiles, 3 * 6 + f, 10 as u16)
         rt.st16(tiles, 4 * 6 + f, 1 as u16)
         rt.st16(tiles, 5 * 6 + f, 20 as u16)
+        rt.st16(tiles, 6 * 6 + f, 11 as u16)
+        rt.st16(tiles, 7 * 6 + f, 16 as u16)
+        rt.st16(tiles, 8 * 6 + f, 15 as u16)
         f = f + 1
     }
+    // 6 water, 7 glass, 8 ice: translucent (bit 1 of the opaque table, mc_mesh.F_TRANS pass)
+    rt.st8(opaque, 6, 2 as u8)
+    rt.st8(opaque, 7, 2 as u8)
+    rt.st8(opaque, 8, 2 as u8)
     rt.st8(opaque, 1, 1 as u8)
     rt.st8(opaque, 2, 1 as u8)
     rt.st8(opaque, 4, 1 as u8)
     rt.st8(opaque, 5, 1 as u8)
     (*t).opaque = opaque
     (*t).tiles = tiles
+}
+
+fn pad_clear_all(pad: u64) {
+    var i: usize = 0
+    while i < 5832 {
+        rt.st16(pad, i, 0 as u16)
+        i = i + 1
+    }
 }
 
 fn pad_set(pad: u64, x: i32, y: i32, z: i32, id: u16) {
@@ -437,6 +453,90 @@ fn bench_mode(label: str, mode: i32, da: *mut mc_texture.Atlas, verts: u64, nv: 
     gl_mc.glbe_close(&g)
 }
 
+
+// ---- translucent pass + entity boxes: one frame on one back end ----------------------------------------------------
+// opaque mesh `ho`, then (ht != 0) the F_TRANS mesh in PASS_TRANS, then n entity boxes through the back end hook.
+fn frame_t(b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera, clear: u32, ho: usize, ht: usize, recs: u64, n: usize) {
+    (*b).begin((*b).obj, (cam as u64), clear)
+    (*b).draw((*b).obj, ho, 0.0, 0.0, 0.0)
+    if ht != 0 {
+        (*b).set_pass((*b).obj, mc_backend.PASS_TRANS)
+        (*b).draw((*b).obj, ht, 0.0, 0.0, 0.0)
+        (*b).set_pass((*b).obj, mc_backend.PASS_OPAQUE)
+    }
+    if n > 0 { (*b).draw_entities((*b).ent_obj, recs, n) }
+    (*b).end((*b).obj)
+}
+
+// Same comparison as scene(), for a translucent mesh and/or entity boxes. Mesh vertex buffers are uploaded right here (the
+// mesher reuses its buffers), so the caller passes the two meshes' bytes.
+fn scene_t(s: *mut Sc, name: str, ov: u64, onv: usize, oi: u64, oni: usize, tv: u64, tnv: usize, ti: u64, tni: usize,
+    recs: u64, nrec: usize, fog: bool, fs: f64, fe: f64, clear: u32, min_psnr_x100: u64, max_mm_permille: u64) {
+    mc_camera.camera_update(&(*s).cam)
+    mc_raster.raster_set_fog(&(*s).r, fog, fs, fe, 150 as u32, 190 as u32, 230 as u32)
+    gl_mc.glbe_set_fog(&(*s).gb, fog, fs, fe, 150 as u32, 190 as u32, 230 as u32)
+    let hoc: usize = (*s).bc.mesh_upload((*s).bc.obj, 1, ov, onv, oi, oni)
+    let hog: usize = (*s).bg.mesh_upload((*s).bg.obj, 1, ov, onv, oi, oni)
+    var htc: usize = 0
+    var htg: usize = 0
+    if tnv > 0 {
+        htc = (*s).bc.mesh_upload((*s).bc.obj, 2, tv, tnv, ti, tni)
+        htg = (*s).bg.mesh_upload((*s).bg.obj, 2, tv, tnv, ti, tni)
+    }
+    frame_t(&(*s).bc, &(*s).cam, clear, hoc, htc, recs, nrec)
+    frame_t(&(*s).bg, &(*s).cam, clear, hog, htg, recs, nrec)
+    let pc: u64 = (*s).bc.present((*s).bc.obj)
+    let pg: u64 = (*s).bg.present((*s).bg.obj)
+    var c: Cmp = Cmp { npx: 0 as u64, diff_px: 0 as u64, big_px: 0 as u64, max_diff: 0 as u32, cov_cpu: 0 as u64,
+        cov_gpu: 0 as u64, cov_mm: 0 as u64, psnr_x100: 0 as u64 }
+    let n: usize = (W as usize) * (H as usize)
+    compare(pc, pg, n, clear, &c)
+    write_raw(s, name, "cpu", pc, n)
+    write_raw(s, name, "gpu", pg, n)
+    (*s).bc.mesh_free((*s).bc.obj, hoc)
+    (*s).bg.mesh_free((*s).bg.obj, hog)
+    if tnv > 0 {
+        (*s).bc.mesh_free((*s).bc.obj, htc)
+        (*s).bg.mesh_free((*s).bg.obj, htg)
+    }
+    let mm_permille: u64 = c.cov_mm * 1000 as u64 / c.npx
+    var ok: bool = c.cov_cpu > 0 as u64 && c.cov_gpu > 0 as u64
+    if c.psnr_x100 < min_psnr_x100 { ok = false }
+    if mm_permille > max_mm_permille { ok = false }
+    io.print("scene ")
+    io.print(name)
+    io.fmt_print(f" ents={nrec} cov_cpu={c.cov_cpu} cov_gpu={c.cov_gpu} cov_mismatch={c.cov_mm} ({mm_permille} permille) diff_px={c.diff_px} big_px={c.big_px} max_diff={c.max_diff} psnr=")
+    print_f2((c.psnr_x100 as f64) / 100.0)
+    io.print(" min_psnr=")
+    print_f2((min_psnr_x100 as f64) / 100.0)
+    if ok {
+        io.print(" ok\n")
+    } else {
+        io.print(" FAIL\n")
+        (*s).fails = (*s).fails + 1
+    }
+}
+
+fn stf(p: u64, i: usize, v: f64) {
+    *((p + (i as u64) * (8 as u64)) as *mut f64) = v
+}
+
+fn ent_rec(recs: u64, i: usize, x: f64, y: f64, z: f64, sx: f64, sy: f64, sz: f64, yaw: f64, r: u32, g: u32, b: u32) {
+    let e: u64 = recs + (i * mc_backend.ENT_BYTES) as u64
+    stf(e, 0, x)
+    stf(e, 1, y)
+    stf(e, 2, z)
+    stf(e, 3, sx)
+    stf(e, 4, sy)
+    stf(e, 5, sz)
+    stf(e, 6, math.sin(yaw))
+    stf(e, 7, math.cos(yaw))
+    stf(e, 8, r as f64)
+    stf(e, 9, g as f64)
+    stf(e, 10, b as f64)
+    stf(e, 11, 0.0)
+}
+
 fn main(start: u64) -> i32 {
     var dir: u64 = 0
     var dirn: usize = 0
@@ -535,6 +635,79 @@ fn main(start: u64) -> i32 {
     mc_camera.camera_set_pos(&s.cam, 1000020.0, 12.0, 0.0 - 2000010.0)
     mc_camera.camera_set_angles(&s.cam, 10.0, 25.0)
     scene(&s, "chunk_far", m.verts, m.nverts as usize, m.idx, m.nidx as usize, 2, 2, 1000000.0, 0.0, 0.0 - 2000000.0, false, clear, 3400 as u64, 5 as u64)
+
+
+    // ---- 7. translucent pass + entity boxes (r94): the scenes of tools/mc/raster/dump.fi, GL against CPU. The entity pass is
+    // drawn with the culling of gl_scene OFF (the CPU has none; HiZ culling is checked separately in tools/gpu/mc).
+    var sc: gl_scene.Scene = gl_scene.scene_open(&s.gb)
+    if !sc.ok {
+        io.fmt_print(f"scene layer: step={sc.step}\n")
+        s.fails = s.fails + 1
+    } else {
+        gl_scene.scene_set_cull(&sc, false)
+        gl_scene.scene_attach(&sc, &s.bg)
+        mc_camera.camera_set_lens(&s.cam, 70.0, 0.05, 512.0)
+        pad_clear_all(pad)
+        var tx: i32 = 0
+        while tx < 14 {
+            var tz: i32 = 0
+            while tz < 14 {
+                pad_set(pad, tx, 0, tz, 4 as u16)
+                pad_set(pad, tx, 1, tz, 4 as u16)
+                tz = tz + 1
+            }
+            tx = tx + 1
+        }
+        tx = 2
+        while tx < 9 {
+            var tz: i32 = 3
+            while tz < 10 {
+                pad_set(pad, tx, 1, tz, 6 as u16)
+                tz = tz + 1
+            }
+            tx = tx + 1
+        }
+        pad_set(pad, 5, 1, 5, 4 as u16)
+        pad_set(pad, 5, 2, 5, 4 as u16)
+        pad_set(pad, 12, 2, 4, 5 as u16)
+        pad_set(pad, 12, 3, 4, 5 as u16)
+        pad_set(pad, 11, 2, 4, 7 as u16)
+        pad_set(pad, 11, 3, 4, 7 as u16)
+        pad_set(pad, 11, 2, 7, 8 as u16)
+        var mt: mc_mesh.Mesher = mc_mesh.mesher_new()
+        mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+        mc_mesh.mesh_padded(&mt, pad, &tb, mc_mesh.F_AO | mc_mesh.F_GREEDY | mc_mesh.F_TRANS)
+        mc_camera.camera_set_pos(&s.cam, 4.0, 5.5, 0.0 - 3.0)
+        mc_camera.camera_set_angles(&s.cam, 0.0 - 15.0, 28.0)
+        let recs: u64 = rt.heap_alloc(8 * mc_backend.ENT_BYTES)
+        scene_t(&s, "water_glass", m.verts, m.nverts as usize, m.idx, m.nidx as usize, mt.verts, mt.nverts as usize, mt.idx,
+            mt.nidx as usize, recs, 0, false, 0.0, 1.0, clear, 3800 as u64, 5 as u64)
+        scene_t(&s, "water_glass_fog", m.verts, m.nverts as usize, m.idx, m.nidx as usize, mt.verts, mt.nverts as usize, mt.idx,
+            mt.nidx as usize, recs, 0, true, 4.0, 26.0, 0xFF96BEE6 as u32, 3800 as u64, 5 as u64)
+        // boxes: floor + pillar, five boxes (yaw, fog, one behind the floor, one cut by the near plane)
+        pad_clear_all(pad)
+        tx = 0
+        while tx < 14 {
+            var tz: i32 = 0
+            while tz < 14 {
+                pad_set(pad, tx, 1, tz, 1 as u16)
+                tz = tz + 1
+            }
+            tx = tx + 1
+        }
+        pad_set(pad, 6, 2, 6, 4 as u16)
+        pad_set(pad, 6, 3, 6, 4 as u16)
+        mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+        mc_camera.camera_set_pos(&s.cam, 5.0, 4.2, 0.5)
+        mc_camera.camera_set_angles(&s.cam, 12.0, 20.0)
+        ent_rec(recs, 0, 4.0, 3.0, 5.0, 0.6, 1.8, 0.6, 0.0, 200 as u32, 60 as u32, 60 as u32)
+        ent_rec(recs, 1, 7.5, 3.0, 5.5, 0.6, 1.8, 0.6, 0.7, 60 as u32, 200 as u32, 90 as u32)
+        ent_rec(recs, 2, 6.2, 3.0, 8.5, 1.4, 1.0, 0.8, 2.1, 70 as u32, 90 as u32, 230 as u32)
+        ent_rec(recs, 3, 9.0, 2.6, 12.0, 0.5, 0.5, 0.5, 4.0, 240 as u32, 220 as u32, 40 as u32)
+        ent_rec(recs, 4, 6.6, 3.5, 3.0, 0.4, 0.4, 0.4, 1.0, 255 as u32, 255 as u32, 255 as u32)
+        scene_t(&s, "boxes", m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0, 0, recs, 5, true, 8.0, 40.0,
+            0xFF96BEE6 as u32, 3800 as u64, 5 as u64)
+    }
 
     gl_mc.glbe_close(&s.gb)
     io.fmt_print(f"scenes done, failed={s.fails}\n")

@@ -1,0 +1,520 @@
+// expect_exit: 0
+// tests/2885_mc_stream_light.fi -- light in mc_stream + mc_render_world (mc_wlight).
+//
+// Terrain world 7x7 columns. The reference is built WITHOUT stream / wr: world_pad + mc_light.light_pad_section of a
+// region volume -> mesh_padded_lit, drawn for the frustum list of mc_cull.
+// A  stream (inline), light on, region volume (computed light): image == reference for 5 poses, day 256 and day 90;
+//    the lit image differs from the unlit one; day != night; repeated render == same hash
+// B  mc_render_world (wr_set_light): image == reference
+// C  Chunk.light only (no region volume, LightData built from the volume): stream with 4 workers == reference
+// D  no light data at all: light on == the old unlit reference (byte identical)
+// E  edit: wl_edit places an emitter, stream_light_sync + stream_mark_block, image == reference rebuilt from the
+//    incrementally updated volume; the volume == a full recompute of the edited world (light_equal)
+import std.rt
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import mc.mc_cull
+import mc.mc_terrain
+import mc.mc_render_world
+import mc.mc_stream
+import mc.mc_light
+import mc.mc_lightpkt
+import mc.mc_wlight
+import jobs.jobs
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND {
+        return jobs.worker_main(arg)
+    }
+    return 0
+}
+
+const NSEC: i32 = 6
+const RAD: i32 = 3
+const WIN: i32 = 6
+const LAMP: u16 = 4 as u16
+
+static mut g_edit_on: bool = false
+static mut g_ex: i32 = 0
+static mut g_ey: i32 = 0
+static mut g_ez: i32 = 0
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+fn floor_div16(v: i32) -> i32 {
+    var q: i32 = v / 16
+    if v % 16 != 0 && v < 0 { q = q - 1 }
+    return q
+}
+
+fn fl(v: f64) -> i32 {
+    var x: i32 = v as i32
+    if (x as f64) > v { x = x - 1 }
+    return x
+}
+
+fn blk(x: i32, y: i32, z: i32) -> u16 {
+    if g_edit_on && x == g_ex && y == g_ey && z == g_ez { return LAMP }
+    return mc_terrain.terrain_block(x, y, z, NSEC)
+}
+
+fn world_pad(cx: i32, sy: i32, cz: i32, pad: u64) {
+    var py: i32 = 0
+    while py < 18 {
+        var pz: i32 = 0
+        while pz < 18 {
+            var px: i32 = 0
+            while px < 18 {
+                let x: i32 = cx * 16 + px - 1
+                let y: i32 = sy * 16 + py - 1
+                let z: i32 = cz * 16 + pz - 1
+                let colx: i32 = floor_div16(x)
+                let colz: i32 = floor_div16(z)
+                var id: u16 = 65535 as u16
+                if colx >= 0 - RAD && colx <= RAD && colz >= 0 - RAD && colz <= RAD && y >= 0 && y < NSEC * 16 {
+                    id = blk(x, y, z)
+                }
+                rt.st16(pad, ((py * 18 + pz) * 18 + px) as usize, id)
+                px = px + 1
+            }
+            pz = pz + 1
+        }
+        py = py + 1
+    }
+}
+
+fn cell(cx: i32, sy: i32, cz: i32) -> usize {
+    return (((cz + RAD) * (RAD * 2 + 1) + cx + RAD) * NSEC + sy) as usize
+}
+
+// reference handles; vol = 0 -> unlit mesh
+fn build_ref(r: *mut mc_raster.Raster, tb: *mut mc_mesh.MeshTables, hs: u64, vol: *mut mc_light.LightVol) {
+    var m: mc_mesh.Mesher = mc_mesh.mesher_new()
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    let lpad: u64 = rt.heap_alloc(5832)
+    var cz: i32 = 0 - RAD
+    while cz <= RAD {
+        var cx: i32 = 0 - RAD
+        while cx <= RAD {
+            var sy: i32 = 0
+            while sy < NSEC {
+                world_pad(cx, sy, cz, pad)
+                if vol as u64 != 0 {
+                    mc_light.light_pad_section(vol, cx + RAD, sy, cz + RAD, lpad)
+                    mc_mesh.mesh_padded_lit(&m, pad, lpad, tb, mc_mesh.F_AO | mc_mesh.F_GREEDY | mc_mesh.F_LIGHT)
+                } else {
+                    mc_mesh.mesh_padded(&m, pad, tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+                }
+                let old: usize = rt.ld64(hs, cell(cx, sy, cz)) as usize
+                if old != 0 { mc_raster.backend_mesh_free(r, old) }
+                var hd: usize = 0
+                if m.nverts > 0 as u32 {
+                    hd = mc_raster.backend_mesh_upload(r, mc_cull.cull_pack(cx, sy, cz), m.verts, m.nverts as usize, m.idx, m.nidx as usize)
+                }
+                rt.st64(hs, cell(cx, sy, cz), hd as u64)
+                sy = sy + 1
+            }
+            cx = cx + 1
+        }
+        cz = cz + 1
+    }
+    mc_mesh.mesher_free(&m)
+    rt.heap_free(pad, 5832 * 2)
+    rt.heap_free(lpad, 5832)
+}
+
+fn ref_image(r: *mut mc_raster.Raster, cam: *mut mc_camera.Camera, c: *mut mc_cull.Cull, hs: u64, h: u64, day: i32) {
+    let n: usize = mc_cull.cull_run_frustum(c, cam, WIN)
+    mc_raster.raster_set_light(r, day, 256, 224, 176)
+    mc_raster.backend_begin(r, cam, 0xFF3C2814 as u32)
+    var k: usize = 0
+    while k < n {
+        let key: u64 = mc_cull.cull_out_key(c, k)
+        let cx: i32 = mc_cull.cull_out_cx(key)
+        let cz: i32 = mc_cull.cull_out_cz(key)
+        let sy: i32 = mc_cull.cull_out_sy(key)
+        k = k + 1
+        if cx < 0 - RAD || cx > RAD || cz < 0 - RAD || cz > RAD { continue }
+        let hd: usize = rt.ld64(hs, cell(cx, sy, cz)) as usize
+        if hd != 0 {
+            mc_raster.backend_draw(r, hd, (cx * 16) as f64, (sy * 16) as f64, (cz * 16) as f64)
+        }
+    }
+    mc_raster.backend_end(r)
+    mc_raster.raster_hash_hex(r, h)
+}
+
+#[allow_escape]
+fn stream_image(s: *mut mc_stream.Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, r: *mut mc_raster.Raster,
+    cam: *mut mc_camera.Camera, h: u64, day: i32) {
+    mc_stream.stream_set_daylight(s, b, day)
+    (*b).begin((*b).obj, cam as u64, 0xFF3C2814 as u32)
+    mc_stream.stream_frame(s, w, b, cam)
+    (*b).end((*b).obj)
+    mc_raster.raster_hash_hex(r, h)
+}
+
+#[allow_escape]
+fn wr_image(wr: *mut mc_render_world.WorldRender, w: *mut mc_world.World, b: *mut mc_backend.Backend, r: *mut mc_raster.Raster,
+    cam: *mut mc_camera.Camera, h: u64, day: i32) {
+    mc_render_world.wr_set_daylight(b, day)
+    (*b).begin((*b).obj, cam as u64, 0xFF3C2814 as u32)
+    mc_render_world.wr_render_b(wr, w, b, cam, 100000)
+    (*b).end((*b).obj)
+    mc_raster.raster_hash_hex(r, h)
+}
+
+fn same_hash(a: u64, b: u64) -> bool {
+    var i: usize = 0
+    while i < 64 {
+        if rt.ld8(a, i) != rt.ld8(b, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn fold(h: u64) -> u64 {
+    var v: u64 = 14695981039346656037 as u64
+    var i: usize = 0
+    while i < 64 {
+        v = (v ^ (rt.ld8(h, i) as u64)) *% 1099511628211 as u64
+        i = i + 1
+    }
+    return v
+}
+
+fn copy_hash(dst: u64, src2: u64) {
+    var i: usize = 0
+    while i < 64 {
+        rt.st8(dst, i, rt.ld8(src2, i))
+        i = i + 1
+    }
+}
+
+#[allow_escape]
+fn load_column(w: *mut mc_world.World, s: *mut mc_stream.Stream, cx: i32, cz: i32, ids: u64, vol: *mut mc_light.LightVol) {
+    mc_terrain.terrain_column(cx, cz, NSEC, ids)
+    let p: u64 = mc_render_world.wr_make_chunk(cx, cz, NSEC as usize, ids)
+    check(p != 0, 50)
+    if vol as u64 != 0 {
+        // Chunk.light from the volume: sky + block arrays for the sections 0..NSEC-1 (bits 1..NSEC)
+        let lp: u64 = mc_lightpkt.lightdata_alloc()
+        let ld: *mut mc_lightpkt.LightData = lp as *mut mc_lightpkt.LightData
+        let n: usize = NSEC as usize
+        (*ld).sky_mask = ((1 as u64 << (n as u64)) - 1 as u64) << 1 as u64
+        (*ld).block_mask = (*ld).sky_mask
+        (*ld).sky_n = n
+        (*ld).block_n = n
+        (*ld).sky = rt.heap_alloc(n * 2048)
+        (*ld).block = rt.heap_alloc(n * 2048)
+        var q: i32 = 0
+        while q < NSEC {
+            var i: usize = 0
+            while i < 2048 {
+                var sv: u8 = 0 as u8
+                var bv: u8 = 0 as u8
+                var h: usize = 0
+                while h < 2 {
+                    let ci: usize = i * 2 + h
+                    let lx: i32 = (ci & 15) as i32
+                    let lz: i32 = ((ci >> 4) & 15) as i32
+                    let ly: i32 = (ci >> 8) as i32
+                    let gx: i32 = (cx + RAD) * 16 + lx
+                    let gz: i32 = (cz + RAD) * 16 + lz
+                    let sk: u8 = mc_light.light_sky(vol, gx, q * 16 + ly, gz)
+                    let bk: u8 = mc_light.light_block(vol, gx, q * 16 + ly, gz)
+                    if h == 0 { sv = sv | sk; bv = bv | bk } else { sv = sv | (sk << 4 as u8); bv = bv | (bk << 4 as u8) }
+                    h = h + 1
+                }
+                rt.st8((*ld).sky, (q as usize) * 2048 + i, sv)
+                rt.st8((*ld).block, (q as usize) * 2048 + i, bv)
+                i = i + 1
+            }
+            q = q + 1
+        }
+        (*(p as *mut mc_chunk.Chunk)).light = lp
+    }
+    check(mc_world.world_put(w, p), 51)
+    if s as u64 != 0 { check(mc_stream.stream_chunk_loaded(s, w, cx, cz), 52) }
+}
+
+#[allow_escape]
+fn load_all(w: *mut mc_world.World, s: *mut mc_stream.Stream, ids: u64, vol: *mut mc_light.LightVol) {
+    var cz: i32 = 0 - RAD
+    while cz <= RAD {
+        var cx: i32 = 0 - RAD
+        while cx <= RAD {
+            load_column(w, s, cx, cz, ids, vol)
+            cx = cx + 1
+        }
+        cz = cz + 1
+    }
+}
+
+static mut g_seed: u64 = 4242
+
+fn rnd_f(lo: f64, hi: f64) -> f64 {
+    g_seed = g_seed *% 6364136223846793005 as u64 +% 1442695040888963407 as u64
+    return lo + (hi - lo) * (((g_seed >> 33 as u64) % 100000 as u64) as f64 / 100000.0)
+}
+
+fn pose(cam: *mut mc_camera.Camera, i: i32) {
+    var px: f64 = rnd_f(0.0 - 30.0, 30.0)
+    var pz: f64 = rnd_f(0.0 - 30.0, 30.0)
+    var py: f64 = (mc_terrain.terrain_height(fl(px), fl(pz), NSEC) + 3) as f64
+    if i % 2 == 1 { py = rnd_f(6.0, 30.0) }
+    var guard: i32 = 0
+    while mc_terrain.terrain_block(fl(px), fl(py), fl(pz), NSEC) != 0 as u16 && guard < 80 {
+        py = py + 1.0
+        guard = guard + 1
+    }
+    mc_camera.camera_set_pos(cam, px, py, pz)
+    mc_camera.camera_set_angles(cam, rnd_f(0.0 - 180.0, 180.0), rnd_f(0.0 - 25.0, 25.0))
+    mc_camera.camera_update(cam)
+}
+
+fn fresh_raster(a: *mut mc_texture.Atlas) -> mc_raster.Raster {
+    var r: mc_raster.Raster = mc_raster.raster_new(96, 54)
+    mc_raster.backend_upload_atlas(&r, a)
+    return r
+}
+
+fn setup_wl(wl: *mut mc_wlight.WorldLight) {
+    let op: u64 = rt.heap_alloc(32768)
+    let em: u64 = rt.heap_alloc(32768)
+    var i: usize = 0
+    while i < 32768 {
+        rt.st8(op, i, 0 as u8)
+        rt.st8(em, i, 0 as u8)
+        i = i + 1
+    }
+    rt.st8(op, 1, 15 as u8)
+    rt.st8(op, 2, 15 as u8)
+    rt.st8(op, 3, 15 as u8)
+    rt.st8(op, 4, 1 as u8) // lamp: nearly transparent, emits 14
+    rt.st8(em, 4, 14 as u8)
+    mc_wlight.wl_set_tables(wl, op, em)
+    rt.heap_free(op, 32768)
+    rt.heap_free(em, 32768)
+}
+
+// 5 poses: stream image (day d) == reference image; returns the hash of pose 0 into h0
+#[allow_escape]
+fn poses_equal(s: *mut mc_stream.Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, r: *mut mc_raster.Raster,
+    rr: *mut mc_raster.Raster, cam: *mut mc_camera.Camera, c: *mut mc_cull.Cull, hs: u64, day: i32, code: i32, h0: u64) {
+    let h1: u64 = rt.heap_alloc(64)
+    let h2: u64 = rt.heap_alloc(64)
+    g_seed = 4242
+    var i: i32 = 0
+    while i < 5 {
+        pose(cam, i)
+        let nfl: usize = mc_stream.stream_flush(s, w, b, cam, 200)
+        check(nfl < 200, code)
+        check(mc_stream.stream_pending(s) == 0, code + 1)
+        ref_image(rr, cam, c, hs, h1, day)
+        stream_image(s, w, b, r, cam, h2, day)
+        check(same_hash(h1, h2), code + 2 + i)
+        if i == 0 { copy_hash(h0, h2) }
+        i = i + 1
+    }
+    rt.heap_free(h1, 64)
+    rt.heap_free(h2, 64)
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_terrain.terrain_tables(&tb)
+    var f: usize = 0
+    while f < 6 {
+        rt.st16(tb.tiles, 24 + f, 5 as u16) // lamp tile
+        f = f + 1
+    }
+    var a: mc_texture.Atlas = mc_texture.atlas_default()
+    var rr: mc_raster.Raster = fresh_raster(&a)
+    var cam: mc_camera.Camera = mc_camera.camera_new(96, 54)
+    mc_camera.camera_set_lens(&cam, 70.0, 0.05, 160.0)
+    var c: mc_cull.Cull = mc_cull.cull_new(0, NSEC)
+    let ids: u64 = rt.heap_alloc(NSEC as usize * 4096 * 2)
+    let hs: u64 = rt.heap_alloc(7 * 7 * NSEC as usize * 8)
+    let hs0: u64 = rt.heap_alloc(7 * 7 * NSEC as usize * 8)
+    rt.mem_set(hs, 0 as u8, 7 * 7 * NSEC as usize * 8)
+    rt.mem_set(hs0, 0 as u8, 7 * 7 * NSEC as usize * 8)
+    let hd0: u64 = rt.heap_alloc(64) // lit day pose 0
+    let hn0: u64 = rt.heap_alloc(64) // lit night pose 0
+    let hu0: u64 = rt.heap_alloc(64) // unlit pose 0
+    let hx: u64 = rt.heap_alloc(64)
+
+    // light volume of the plain terrain world (also the source of Chunk.light in C)
+    var w0: mc_world.World = mc_world.world_new()
+    var wl0: mc_wlight.WorldLight = mc_wlight.wl_new(0, NSEC)
+    setup_wl(&wl0)
+    load_all(&w0, 0 as u64 as *mut mc_stream.Stream, ids, 0 as u64 as *mut mc_light.LightVol)
+    check(mc_wlight.wl_region_load(&wl0, &w0, 0 - RAD, 0 - RAD, 7, 7, false) == 49, 1)
+    check(mc_light.light_sky(&wl0.vol, 24, 90, 24) == 15 as u8, 2) // open sky above the terrain
+    check(mc_light.light_sky(&wl0.vol, 24, 0, 24) < 15 as u8, 3) // buried
+    build_ref(&rr, &tb, hs, &wl0.vol)
+    build_ref(&rr, &tb, hs0, 0 as u64 as *mut mc_light.LightVol)
+
+    // ---- A: stream inline, region volume
+    {
+        var r: mc_raster.Raster = fresh_raster(&a)
+        var b: mc_backend.Backend = mc_backend.backend_cpu(&r)
+        var w: mc_world.World = mc_world.world_new()
+        var wl: mc_wlight.WorldLight = mc_wlight.wl_new(0, NSEC)
+        setup_wl(&wl)
+        var s: mc_stream.Stream = mc_stream.stream_new(0, NSEC, WIN, &tb, 0)
+        s.nbr_wait = 3 as u32
+        mc_stream.stream_set_light(&s, true, (&wl) as *mut mc_wlight.WorldLight as u64)
+        load_all(&w, &s, ids, 0 as u64 as *mut mc_light.LightVol)
+        check(mc_wlight.wl_region_load(&wl, &w, 0 - RAD, 0 - RAD, 7, 7, false) == 49, 4)
+        mc_stream.stream_set_light(&s, true, (&wl) as *mut mc_wlight.WorldLight as u64) // remesh everything with the volume
+        poses_equal(&s, &w, &b, &r, &rr, &cam, &c, hs, 256, 10, hd0)
+        poses_equal(&s, &w, &b, &r, &rr, &cam, &c, hs, 90, 20, hn0)
+        // lit != unlit in some pose (shadowed cells only), day != night, repeat == same hash
+        {
+            let hl: u64 = rt.heap_alloc(64)
+            let hu: u64 = rt.heap_alloc(64)
+            var diffs: i32 = 0
+            g_seed = 4242
+            var pi: i32 = 0
+            while pi < 5 {
+                pose(&cam, pi)
+                ref_image(&rr, &cam, &c, hs, hl, 256)
+                ref_image(&rr, &cam, &c, hs0, hu, 256)
+                if !same_hash(hl, hu) { diffs = diffs + 1 }
+                pi = pi + 1
+            }
+            check(diffs > 0, 30)
+            rt.heap_free(hl, 64)
+            rt.heap_free(hu, 64)
+        }
+        g_seed = 4242
+        pose(&cam, 0)
+        check(!same_hash(hd0, hn0), 31)
+        // fixed hashes: day / night image of pose 0 are the same in every build mode
+        check((fold(hd0) & 4294967295 as u64) == 2571670125 as u64, 34)
+        check((fold(hn0) & 4294967295 as u64) == 2160466827 as u64, 35)
+        stream_image(&s, &w, &b, &r, &cam, hx, 256)
+        check(same_hash(hx, hd0), 32)
+        stream_image(&s, &w, &b, &r, &cam, hx, 256)
+        check(same_hash(hx, hd0), 33)
+        mc_stream.stream_free(&s, &b)
+        mc_world.world_free(&w)
+        mc_wlight.wl_free(&wl)
+    }
+
+    // ---- B: mc_render_world
+    {
+        var r: mc_raster.Raster = fresh_raster(&a)
+        var b: mc_backend.Backend = mc_backend.backend_cpu(&r)
+        var wr: mc_render_world.WorldRender = mc_render_world.wr_new(0, WIN, &tb)
+        mc_render_world.wr_set_light(&wr, (&wl0) as *mut mc_wlight.WorldLight as u64)
+        let h1: u64 = rt.heap_alloc(64)
+        let h2: u64 = rt.heap_alloc(64)
+        g_seed = 4242
+        var i: i32 = 0
+        while i < 3 {
+            pose(&cam, i)
+            ref_image(&rr, &cam, &c, hs, h1, 256 - i * 60)
+            wr_image(&wr, &w0, &b, &r, &cam, h2, 256 - i * 60)
+            check(same_hash(h1, h2), 40 + i)
+            i = i + 1
+        }
+        rt.heap_free(h1, 64)
+        rt.heap_free(h2, 64)
+        mc_render_world.wr_free_b(&wr, &b)
+    }
+
+    // ---- C: Chunk.light only, 4 workers
+    var pool: jobs.Jobs = jobs.create(4)
+    check(jobs.worker_count(&pool) > 0 as u64, 8)
+    {
+        var r: mc_raster.Raster = fresh_raster(&a)
+        var b: mc_backend.Backend = mc_backend.backend_cpu(&r)
+        var w: mc_world.World = mc_world.world_new()
+        var wl: mc_wlight.WorldLight = mc_wlight.wl_new(0, NSEC) // no region
+        setup_wl(&wl)
+        var s: mc_stream.Stream = mc_stream.stream_new(0, NSEC, WIN, &tb, (&pool) as *mut jobs.Jobs as u64)
+        s.nbr_wait = 3 as u32
+        mc_stream.stream_set_light(&s, true, (&wl) as *mut mc_wlight.WorldLight as u64)
+        load_all(&w, &s, ids, &wl0.vol)
+        let h3: u64 = rt.heap_alloc(64)
+        poses_equal(&s, &w, &b, &r, &rr, &cam, &c, hs, 256, 50, h3)
+        check(same_hash(h3, hd0), 60)
+        mc_stream.stream_free(&s, &b)
+        mc_world.world_free(&w)
+        mc_wlight.wl_free(&wl)
+        rt.heap_free(h3, 64)
+    }
+
+    // ---- D: no light data: light on == the old unlit image
+    {
+        var r: mc_raster.Raster = fresh_raster(&a)
+        var b: mc_backend.Backend = mc_backend.backend_cpu(&r)
+        var w: mc_world.World = mc_world.world_new()
+        var wl: mc_wlight.WorldLight = mc_wlight.wl_new(0, NSEC)
+        setup_wl(&wl)
+        var s: mc_stream.Stream = mc_stream.stream_new(0, NSEC, WIN, &tb, 0)
+        s.nbr_wait = 3 as u32
+        mc_stream.stream_set_light(&s, true, (&wl) as *mut mc_wlight.WorldLight as u64)
+        load_all(&w, &s, ids, 0 as u64 as *mut mc_light.LightVol)
+        poses_equal(&s, &w, &b, &r, &rr, &cam, &c, hs0, 256, 70, hx)
+        mc_stream.stream_free(&s, &b)
+        mc_world.world_free(&w)
+        mc_wlight.wl_free(&wl)
+    }
+
+    // ---- E: edit
+    {
+        var r: mc_raster.Raster = fresh_raster(&a)
+        var b: mc_backend.Backend = mc_backend.backend_cpu(&r)
+        var w: mc_world.World = mc_world.world_new()
+        var wl: mc_wlight.WorldLight = mc_wlight.wl_new(0, NSEC)
+        setup_wl(&wl)
+        var s: mc_stream.Stream = mc_stream.stream_new(0, NSEC, WIN, &tb, 0)
+        s.nbr_wait = 3 as u32
+        mc_stream.stream_set_light(&s, true, (&wl) as *mut mc_wlight.WorldLight as u64)
+        load_all(&w, &s, ids, 0 as u64 as *mut mc_light.LightVol)
+        check(mc_wlight.wl_region_load(&wl, &w, 0 - RAD, 0 - RAD, 7, 7, false) == 49, 80)
+        mc_stream.stream_set_light(&s, true, (&wl) as *mut mc_wlight.WorldLight as u64)
+        poses_equal(&s, &w, &b, &r, &rr, &cam, &c, hs, 256, 81, hx)
+        // place an emitter two blocks above the ground of column (5, 5), and a roof block next to it
+        let ex: i32 = 5
+        let ez: i32 = 5
+        let ey: i32 = mc_terrain.terrain_height(ex, ez, NSEC) + 1
+        check(mc_terrain.terrain_block(ex, ey, ez, NSEC) == 0 as u16, 90)
+        check(mc_wlight.wl_edit(&wl, &w, ex, ey, ez, LAMP as i32) == 0, 91)
+        g_edit_on = true
+        g_ex = ex
+        g_ey = ey
+        g_ez = ez
+        mc_stream.stream_mark_block(&s, ex, ey, ez)
+        check(mc_stream.stream_light_sync(&s) > 0, 92)
+        check(mc_light.light_block(&wl.vol, ex - (0 - RAD) * 16, ey, ez - (0 - RAD) * 16) == 14 as u8, 93)
+        build_ref(&rr, &tb, hs, &wl.vol) // reference from the INCREMENTALLY updated volume
+        poses_equal(&s, &w, &b, &r, &rr, &cam, &c, hs, 256, 94, hx)
+        // incremental == full recompute of the edited world
+        var wl2: mc_wlight.WorldLight = mc_wlight.wl_new(0, NSEC)
+        setup_wl(&wl2)
+        check(mc_wlight.wl_region_load(&wl2, &w, 0 - RAD, 0 - RAD, 7, 7, false) == 49, 100)
+        check(mc_light.light_equal(&wl.vol, &wl2.vol) == 0, 101)
+        mc_wlight.wl_free(&wl2)
+        mc_stream.stream_free(&s, &b)
+        mc_world.world_free(&w)
+        mc_wlight.wl_free(&wl)
+    }
+    mc_world.world_free(&w0)
+    mc_wlight.wl_free(&wl0)
+    jobs.destroy(&pool)
+    return 0
+}
