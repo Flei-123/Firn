@@ -48,7 +48,7 @@ for st in "--opt-level=dev-fast" "--opt-level=release-safe" "--opt-level=release
     "$FIRNC" $st -o "$D/t2860" tests/2860_simd_minmax.fi 2> "$D/err" && "$D/t2860" && echo "ok  tests/2860 $st" || { echo "FAIL tests/2860 $st"; head -3 "$D/err"; rc=1; }
 done
 # G6: sqrt/rcp/rsqrt, shufps, movemask, packs/unpacks, min/max, cmpeq, mulhi -- scalar reference tests (x86 all stages, NEON under qemu), numpy cross-check
-for t in tests/2867_simd_g6.fi tests/2868_std_simd.fi; do
+for t in tests/2870_simd_g6.fi tests/2871_std_simd.fi; do
     for st in "--opt-level=dev-fast" "--opt-level=release-safe" "--opt-level=release-fast" "--opt-level=release-fast --asm-intern"; do
         "$FIRNC" $st -o "$D/tg6" $t 2> "$D/err" && "$D/tg6" && echo "ok  $t $st" || { echo "FAIL $t $st"; head -3 "$D/err"; rc=1; }
     done
