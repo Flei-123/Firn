@@ -2093,7 +2093,7 @@ else
     grep -E 'FAIL' "$WORK/textinput.log" | head -12 | sed 's/^/   /' || true
 fi
 
-echo "== 135. fUi window text input through the platform input method (apphost wiring r444b, opt-in plat.fuiime): typing, dead key + Compose, pre-edit + commit, click / Tab during pre-edit, XIM @im=none on Xvfb + xdotool; rumble is in gate 127 (tools/input/apphost_run.sh, docs/INPUT.md) =="
+echo "== 136. fUi window text input through the platform input method (apphost wiring r444b, opt-in plat.fuiime): typing, dead key + Compose, pre-edit + commit, click / Tab during pre-edit, XIM @im=none on Xvfb + xdotool; rumble is in gate 127 (tools/input/apphost_run.sh, docs/INPUT.md) =="
 FIRNC="$FIRNC" bash tools/input/apphost_run.sh > "$WORK/apphost_ime.log" 2>&1 && AIMRC=0 || AIMRC=$?
 if [ "$AIMRC" -eq 0 ]; then
     ok
