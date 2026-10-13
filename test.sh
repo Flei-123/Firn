@@ -2039,6 +2039,16 @@ else
     grep -E 'FAIL' "$WORK/glscene.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 134. Graphics stack way E: Firn .so with C ABI (dlopen from C + ctypes), v128 min/max/div/sat/mul intrinsics (tools/stack_e/run.sh, docs/GRAPHICS-STACK-E-REQUIREMENTS.md) =="
+FIRNC="$FIRNC" bash tools/stack_e/run.sh > "$WORK/stack_e.log" 2>&1 && SERC=0 || SERC=$?
+if [ "$SERC" -eq 0 ]; then
+    ok
+    grep -E '^(ok|C host|Python host|known gap|metric|  metric)' "$WORK/stack_e.log" | sort -u | head -12 | sed 's/^/ /'
+else
+    bad "tools/stack_e/run.sh failed (see .test-work/stack_e.log)"
+    grep -E 'FAIL' "$WORK/stack_e.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 125. GL 3.3 core window: X11 (EGL on the Firn window's XID + GLX fallback) + Windows twin under Wine (tools/gpu/win/run.sh, lib/gpu/glwindow.fi, docs/GPU.md) =="
 # Xvfb + Mesa llvmpipe: open, clear + read back the window framebuffer, swap, swap interval, resize, full screen request, DPI.
 # A missing libEGL / Xvfb is SKIP (Wine part: SKIP without wine / mingw ld). Only Mesa is proven; a real GPU driver is UNTESTED.

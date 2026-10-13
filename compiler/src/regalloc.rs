@@ -117,6 +117,14 @@ pub(crate) fn v128_ra_kind(k: crate::simd::SimdKind) -> bool {
             | K::Add16
             | K::Sub16
             | K::Packus16
+            | K::MinF32
+            | K::MaxF32
+            | K::DivF32
+            | K::MinU8
+            | K::MaxU8
+            | K::MulLo32
+            | K::AddSatU8
+            | K::SubSatU8
             | K::AddF32
             | K::SubF32
             | K::MulF32
@@ -171,6 +179,14 @@ pub(crate) fn two_address_simd(k: crate::simd::SimdKind) -> bool {
             | K::Add16
             | K::Sub16
             | K::Packus16
+            | K::MinF32
+            | K::MaxF32
+            | K::DivF32
+            | K::MinU8
+            | K::MaxU8
+            | K::MulLo32
+            | K::AddSatU8
+            | K::SubSatU8
     )
 }
 
@@ -6222,7 +6238,15 @@ fn emit_inst(
                 | K::MulLo16
                 | K::Add16
                 | K::Sub16
-                | K::Packus16 => {
+                | K::Packus16
+                | K::MinF32
+                | K::MaxF32
+                | K::DivF32
+                | K::MinU8
+                | K::MaxU8
+                | K::MulLo32
+                | K::AddSatU8
+                | K::SubSatU8 => {
                     let d = i.dst.ok_or("internal error: vector arithmetic without target")?;
                     let m = match kind {
                         K::AddF32 => "addps",
@@ -6247,6 +6271,14 @@ fn emit_inst(
                         K::Add16 => "paddw",
                         K::Sub16 => "psubw",
                         K::Packus16 => "packuswb",
+                        K::MinF32 => "minps",
+                        K::MaxF32 => "maxps",
+                        K::DivF32 => "divps",
+                        K::MinU8 => "pminub",
+                        K::MaxU8 => "pmaxub",
+                        K::MulLo32 => "pmulld",
+                        K::AddSatU8 => "paddusb",
+                        K::SubSatU8 => "psubusb",
                         _ => "psubd",
                     };
                     let w = ra.v_work(d);
