@@ -64,7 +64,7 @@ The 8-block frame times include on-demand meshing along the flight (budget 16 se
 ## 5. Known problems / open
 * `BENCH_COMP=1 BENCH_COMPUPLOAD=1` (mesh + upload components per section): the reported crash in `mc_raster.backend_mesh_upload` does
   **NOT reproduce** on main (13.10.): 915 upload/free cycles at radius 8 and 16, with and without free (`BENCH_NOFREE=1`), with both firnc builds
-  (8 Oct and w-r5), no crash. Regression test tests/2860_mc_upload_cycles.fi (6000 cycles, random sizes, 300 live handles, slot table growth, content
+  (8 Oct and w-r5), no crash. Regression test tests/2862_mc_upload_cycles.fi (6000 cycles, random sizes, 300 live handles, slot table growth, content
   patterns + all-zero check of every allocation). The original crash was probably the pre-q1 build / a fixed environment problem; code reading found
   no size mismatch in alloc/free pairs (slot table, verts, idx). `run.sh --offline` now runs the components. Measured (R 8, 915 sections, server load ~15, 640x360 not involved):
   naive+AO p50 738 us, naive no AO 695 us, greedy+AO p50 727 us / p95 2607 us, upload+free p50 146 us per section (single runs, noisy).
