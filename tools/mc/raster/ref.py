@@ -40,8 +40,12 @@ def parse(path):
         elif t[0] == "light":
             cur["light"] = tuple(int(x) for x in t[1:5])    # day, tint r, g, b
         elif t[0] == "mesh":
-            mesh = dict(o=[int(t[1]) - 1000000, int(t[2]) - 1000000, int(t[3]) - 1000000], verts=[], idx=[])
+            mesh = dict(o=[int(t[1]) - 1000000, int(t[2]) - 1000000, int(t[3]) - 1000000], verts=[], idx=[],
+                        trans=len(t) > 6 and t[6] == "1")
             cur["meshes"].append(mesh)
+        elif t[0] == "box":
+            v = [f64(x) for x in t[1:9]]
+            cur["meshes"].append(dict(box=v, rgb=(int(t[9]), int(t[10]), int(t[11]))))
         elif t[0] == "v":
             mesh["verts"].append((int(t[1], 16), int(t[2], 16)))
         elif t[0] == "i":
@@ -74,6 +78,8 @@ class Scene:
         clear = sc["clear"]
         self.color = [clear] * (self.w * self.h)
         self.depth = [0.0] * (self.w * self.h)
+        self.trans = False
+        self.flat = None
 
     # ---- view space
     def to_view(self, wx, wy, wz):
@@ -86,7 +92,49 @@ class Scene:
                 rx * u[0] + ry * u[1] + rz * u[2],
                 rx * f[0] + ry * f[1] + rz * f[2])
 
+    def draw_box(self, item):
+        x, y, z, sx, sy, sz, ys, yc = item["box"]
+        r, g, b = item["rgb"]
+        self.flat = (r & 255) | ((g & 255) << 8) | ((b & 255) << 16)
+        half = [sx * 0.5, sy * 0.5, sz * 0.5]
+        for f in range(6):
+            axis = f // 2
+            ua = (axis + 1) % 3
+            va = (axis + 2) % 3
+            sgn = 1.0 if f % 2 == 1 else -1.0
+            vs = []
+            for k in range(4):
+                su = 1.0 if k in (1, 2) else -1.0
+                sv = 1.0 if k in (2, 3) else -1.0
+                q = [0.0, 0.0, 0.0]
+                q[axis] = sgn * half[axis]
+                q[ua] = su * half[ua]
+                q[va] = sv * half[va]
+                wx = x + (q[0] * yc + q[2] * ys)
+                wy = y + q[1]
+                wz = z + (0.0 - q[0] * ys + q[2] * yc)
+                vx, vy, vz = self.to_view(wx, wy, wz)
+                vs.append([vx, vy, vz, 0.0, 0.0, 3.0, 15.0, 0.0])
+            fk = FACE_K[f]
+            if f % 2 == 1:
+                self.triangle([vs[0][:], vs[1][:], vs[2][:]], 1, fk)
+                self.triangle([vs[0][:], vs[2][:], vs[3][:]], 1, fk)
+            else:
+                self.triangle([vs[0][:], vs[2][:], vs[1][:]], 1, fk)
+                self.triangle([vs[0][:], vs[3][:], vs[2][:]], 1, fk)
+        self.flat = None
+
     def draw_mesh(self, mesh):
+        if "box" in mesh:
+            self.draw_box(mesh)
+            return
+        self.trans = mesh.get("trans", False)
+        try:
+            self.draw_mesh_inner(mesh)
+        finally:
+            self.trans = False
+
+    def draw_mesh_inner(self, mesh):
         ox, oy, oz = mesh["o"]
         vs = []
         for w0, w1 in mesh["verts"]:
@@ -196,8 +244,12 @@ class Scene:
                 bk = (f0 * la + f1 * lb + f2 * lc) / s
                 tx = int(math.floor(u * T)) & (T - 1)
                 ty = int(math.floor(v * T)) & (T - 1)
-                tp = self.texel(tile, tx, ty)
-                if (tp >> 24) < 128:
+                if self.flat is not None:
+                    tp = self.flat | 0xFF000000
+                else:
+                    tp = self.texel(tile, tx, ty)
+                alpha = tp >> 24
+                if alpha < (1 if self.trans else 128):
                     continue
                 fq = min(256, max(0, int(math.floor(100.0 + 52.0 * ao))))
                 total = (fq * fk) // 256
@@ -218,7 +270,13 @@ class Scene:
                     r = (r * (256 - fg) + fr * fg) // 256
                     g = (g * (256 - fg) + fgc * fg) // 256
                     b = (b * (256 - fg) + fb * fg) // 256
-                self.depth[i] = zinv
+                if self.trans:
+                    d = self.color[i]
+                    r = (r * alpha + (d & 255) * (255 - alpha) + 127) // 255
+                    g = (g * alpha + ((d >> 8) & 255) * (255 - alpha) + 127) // 255
+                    b = (b * alpha + ((d >> 16) & 255) * (255 - alpha) + 127) // 255
+                else:
+                    self.depth[i] = zinv
                 self.color[i] = r | (g << 8) | (b << 16) | 0xFF000000
 
     def texel(self, tile, tx, ty):

@@ -42,7 +42,7 @@ export {
     raster_hash, raster_hash_hex, raster_write_ppm, raster_write_png, raster_stats_reset,
     face_shade,
     backend_upload_atlas, backend_mesh_upload, backend_mesh_free, backend_begin, backend_draw,
-    backend_end, backend_present, backend_read_pixels,
+    backend_end, backend_present, backend_read_pixels, backend_set_pass, backend_draw_entities, raster_draw_box,
 }
 
 const SLOT_WORDS: usize = 6
@@ -82,6 +82,9 @@ struct Raster {
     // light (raster_set_light)
     day: i64, // sky light multiplier 0..256
     tint_r: i64, tint_g: i64, tint_b: i64, // block light tint per channel 0..256
+    trans: bool, // translucent pass: alpha blend over the colour buffer, depth test but NO depth write, alpha 0 = no write
+    flat_on: bool, // flat colour mode (entity boxes): no texel fetch, colour flat_rgb (R | G << 8 | B << 16)
+    flat_rgb: u32,
     // scratch
     vbuf: u64, // f64 [vcap * 8]
     vcap: usize,
@@ -114,8 +117,8 @@ fn raster_new(w: i32, h: i32) -> Raster {
         fx: 0.0, fy: 0.0, fz: 1.0, near: 0.05, hw: 0.0, hh: 0.0, fpx: 1.0, fpy: 1.0,
         apx: 0, atile: 16, acols: 16, aw: 256,
         fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0 as u32, fog_g: 0 as u32, fog_b: 0 as u32,
-        cull: true, day: 256, tint_r: 256, tint_g: 224, tint_b: 176, vbuf: 0, vcap: 0, pa: 0, pb: 0, pc: 0,
-        slots: 0, slot_cap: 0,
+        cull: true, day: 256, tint_r: 256, tint_g: 224, tint_b: 176, trans: false, flat_on: false, flat_rgb: 0 as u32,
+        vbuf: 0, vcap: 0, pa: 0, pb: 0, pc: 0, slots: 0, slot_cap: 0,
         st: Stats { tris_in: 0 as u64, tris_drawn: 0 as u64, tris_culled: 0 as u64, tris_clipped: 0 as u64, pixels: 0 as u64 },
     }
     if w < 1 || h < 1 { return r }
@@ -394,10 +397,16 @@ fn draw_clipped_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) 
                     let ao: f64 = (f0 * oa + f1 * ob + f2 * oc) / sum
                     let sk: f64 = (f0 * ka + f1 * kb + f2 * kc) / sum
                     let bk: f64 = (f0 * la + f1 * lb + f2 * lc) / sum
-                    let tx: i64 = (math.floor(u * tszf) as i64) & tmask
-                    let ty: i64 = (math.floor(v * tszf) as i64) & tmask
-                    let tp: u32 = rt.ld32((*r).apx, ((toy + ty) * aw + tox + tx) as usize)
-                    if (tp >> 24 as u32) >= 128 as u32 {
+                    var tp: u32 = (*r).flat_rgb | 0xFF000000 as u32
+                    if !(*r).flat_on {
+                        let tx: i64 = (math.floor(u * tszf) as i64) & tmask
+                        let ty: i64 = (math.floor(v * tszf) as i64) & tmask
+                        tp = rt.ld32((*r).apx, ((toy + ty) * aw + tox + tx) as usize)
+                    }
+                    let alpha: u32 = tp >> 24 as u32
+                    var visible: bool = alpha >= 128 as u32
+                    if (*r).trans { visible = alpha >= 1 as u32 }
+                    if visible {
                         var fq: i64 = math.floor(100.0 + 52.0 * ao) as i64
                         if fq < 0 as i64 { fq = 0 }
                         if fq > 256 as i64 { fq = 256 }
@@ -422,7 +431,16 @@ fn draw_clipped_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) 
                             cg = (cg * (256 as i64 - fg) + ((*r).fog_g as i64) * fg) / 256 as i64
                             cb = (cb * (256 as i64 - fg) + ((*r).fog_b as i64) * fg) / 256 as i64
                         }
-                        stf((*r).depth, idx, zinv)
+                        if (*r).trans {
+                            // src-alpha blend: (src * a + dst * (255 - a) + 127) / 255 per channel, depth is not written
+                            let dst: u32 = rt.ld32((*r).color, idx)
+                            let a: i64 = alpha as i64
+                            cr = (cr * a + ((dst & 255 as u32) as i64) * (255 as i64 - a) + 127 as i64) / 255 as i64
+                            cg = (cg * a + (((dst >> 8 as u32) & 255 as u32) as i64) * (255 as i64 - a) + 127 as i64) / 255 as i64
+                            cb = (cb * a + (((dst >> 16 as u32) & 255 as u32) as i64) * (255 as i64 - a) + 127 as i64) / 255 as i64
+                        } else {
+                            stf((*r).depth, idx, zinv)
+                        }
                         rt.st32((*r).color, idx, (cr as u32) | ((cg as u32) << 8 as u32) | ((cb as u32) << 16 as u32) | 0xFF000000 as u32)
                         (*r).st.pixels = (*r).st.pixels + 1 as u64
                     }
@@ -730,4 +748,81 @@ fn backend_present(r: *mut Raster) -> u64 {
 
 fn backend_read_pixels(r: *mut Raster, out: u64) {
     rt.mem_copy(out, (*r).color, ((*r).w as usize) * ((*r).h as usize) * 4)
+}
+
+// PASS_OPAQUE (0) / PASS_TRANS (1): see mc_backend. The translucent pass blends over the colour buffer and keeps the depth.
+fn backend_set_pass(r: *mut Raster, pass: i32) {
+    (*r).trans = pass == 1
+}
+
+// ---- entity boxes ---------------------------------------------------------------------------
+
+// One flat coloured box (the reference of the instanced GL entity pass, lib/gpu/gl_ent_vs.glsl): centre (x, y, z) in world
+// coordinates, size (sx, sy, sz) along the box axes, rotated about +Y by the yaw whose sine / cosine are given
+// (p = (qx*c + qz*s, qy, -qx*s + qz*c)), colour 0..255. Shading = the world's with ao 3: channel * face_k >> 8, then fog.
+// Faces and winding are those of mc_mesh (-x +x -y +y -z +z, counter clockwise from outside), so culling works.
+fn raster_draw_box(r: *mut Raster, x: f64, y: f64, z: f64, sx: f64, sy: f64, sz: f64, ys: f64, yc: f64,
+    cr: u32, cg: u32, cb: u32) {
+    ensure_vbuf(r, 4)
+    let vb: u64 = (*r).vbuf
+    let saved_on: bool = (*r).flat_on
+    let saved_rgb: u32 = (*r).flat_rgb
+    (*r).flat_on = true
+    (*r).flat_rgb = (cr & 255 as u32) | ((cg & 255 as u32) << 8 as u32) | ((cb & 255 as u32) << 16 as u32)
+    let half: [f64; 3] = [sx * 0.5, sy * 0.5, sz * 0.5]
+    var f: usize = 0
+    while f < 6 {
+        let axis: usize = f / 2
+        let ua: usize = (axis + 1) % 3
+        let va: usize = (axis + 2) % 3
+        var sgn: f64 = 0.0 - 1.0
+        if f % 2 == 1 { sgn = 1.0 }
+        var k: usize = 0
+        while k < 4 {
+            var su: f64 = 0.0 - 1.0
+            var sv: f64 = 0.0 - 1.0
+            if k == 1 || k == 2 { su = 1.0 }
+            if k == 2 || k == 3 { sv = 1.0 }
+            var q: [f64; 3] = [0.0, 0.0, 0.0]
+            q[axis] = sgn * half[axis]
+            q[ua] = su * half[ua]
+            q[va] = sv * half[va]
+            let wx: f64 = x + (q[0] * yc + q[2] * ys)
+            let wy: f64 = y + q[1]
+            let wz: f64 = z + (0.0 - q[0] * ys + q[2] * yc)
+            let rx: f64 = wx - (*r).cx
+            let ry: f64 = wy - (*r).cy
+            let rz: f64 = wz - (*r).cz
+            stf(vb, k * 6, rx * (*r).rx + ry * (*r).ry + rz * (*r).rz)
+            stf(vb, k * 6 + 1, rx * (*r).ux + ry * (*r).uy + rz * (*r).uz)
+            stf(vb, k * 6 + 2, rx * (*r).fx + ry * (*r).fy + rz * (*r).fz)
+            stf(vb, k * 6 + 3, 0.0)
+            stf(vb, k * 6 + 4, 0.0)
+            stf(vb, k * 6 + 5, 3.0)
+            k = k + 1
+        }
+        let fk: u32 = face_shade(f as u32)
+        if f % 2 == 1 {
+            raster_draw_tri(r, vb, vb + 48 as u64, vb + 96 as u64, 1 as u32, fk)
+            raster_draw_tri(r, vb, vb + 96 as u64, vb + 144 as u64, 1 as u32, fk)
+        } else {
+            raster_draw_tri(r, vb, vb + 96 as u64, vb + 48 as u64, 1 as u32, fk)
+            raster_draw_tri(r, vb, vb + 144 as u64, vb + 96 as u64, 1 as u32, fk)
+        }
+        f = f + 1
+    }
+    (*r).flat_on = saved_on
+    (*r).flat_rgb = saved_rgb
+}
+
+// n boxes of mc_backend.ENT_WORDS f64 each (x y z sx sy sz sin cos r g b flags). Returns n.
+fn backend_draw_entities(r: *mut Raster, recs: u64, n: usize) -> u64 {
+    var i: usize = 0
+    while i < n {
+        let e: u64 = recs + (i * 96) as u64
+        raster_draw_box(r, ldd(e, 0), ldd(e, 1), ldd(e, 2), ldd(e, 3), ldd(e, 4), ldd(e, 5), ldd(e, 6), ldd(e, 7),
+            ldd(e, 8) as u32, ldd(e, 9) as u32, ldd(e, 10) as u32)
+        i = i + 1
+    }
+    return n as u64
 }

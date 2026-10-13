@@ -9,6 +9,7 @@ uniform sampler2DArray u_atlas;
 uniform vec2 u_tiles;   // x = tile edge in texels (power of two), y = unused (kept for the host code)
 uniform vec4 u_fog;     // x = 1 fog on, y = start, z = end
 uniform vec3 u_fogc;    // fog colour 0..255
+uniform int u_trans;    // 1 = translucent pass: discard only alpha 0, output alpha = texel alpha (blend SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
 uniform int u_filter;   // 0 = exact texelFetch like mc_raster, 1 = filtered (mipmaps / anisotropy)
 uniform vec4 u_light;   // x = day (sky light multiplier 0..256), yzw = block light tint per channel 0..256
 in vec2 v_light;
@@ -24,10 +25,10 @@ void main() {
         int tx = int(floor(v_uvao.x * float(tsz))) & (tsz - 1);
         int ty = int(floor(v_uvao.y * float(tsz))) & (tsz - 1);
         t = ivec4(texelFetch(u_atlas, ivec3(tx, ty, v_tile - 1), 0) * 255.0 + 0.5);
-        if (t.a < 128) discard;
+        if (u_trans == 0 ? t.a < 128 : t.a < 1) discard;
     } else {
         vec4 s = texture(u_atlas, vec3(v_uvao.xy, float(v_tile - 1)));
-        if (s.a < 0.5) discard;
+        if (u_trans == 0 ? s.a < 0.5 : s.a < 0.004) discard;
         t = ivec4(s * 255.0 + 0.5);
     }
     int fq = clamp(int(floor(100.0 + 52.0 * v_uvao.z)), 0, 256);
@@ -44,5 +45,5 @@ void main() {
         int f = int(floor(tt * 256.0));
         c = (c * (256 - f) + ivec3(u_fogc) * f) >> 8;
     }
-    o_color = vec4(vec3(c) / 255.0, 1.0);
+    o_color = vec4(vec3(c) / 255.0, u_trans == 0 ? 1.0 : float(t.a) / 255.0);
 }

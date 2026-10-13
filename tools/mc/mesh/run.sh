@@ -23,7 +23,7 @@ else
 fi
 python3 -I tools/mc/mesh/verify.py emit random50 3 "$W/b50.bin"
 python3 -I tools/mc/mesh/verify.py emit terrain 3 "$W/terrain.bin"
-for f in 2 3 10 11; do
+for f in 2 3 18 19; do
     for w in b50 terrain; do
         echo "  metric $w flags=$f: $("$W/prog" bench "$W/$w.bin" $f 300 "$W/$w.bin.l")"
     done

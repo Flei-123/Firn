@@ -1,0 +1,101 @@
+// expect_exit: 0
+// mc_mesh F_TRANS: translucent blocks (opaque table bit 1) are split off into their own pass; raster blend keeps depth.
+import std.rt
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_raster
+import mc.mc_backend
+import mc.mc_texture
+
+fn pad_set(pad: u64, x: i32, y: i32, z: i32, id: u16) {
+    rt.st16(pad, (((y + 1) * 18 + (z + 1)) * 18 + (x + 1)) as usize, id)
+}
+
+fn main() -> i32 {
+    let opq: u64 = rt.heap_alloc(32768)
+    let tiles: u64 = rt.heap_alloc(32768 * 6 * 2)
+    var i: usize = 0
+    while i < 32768 { rt.st8(opq, i, 0 as u8)
+        i = i + 1 }
+    i = 0
+    while i < 32768 * 6 { rt.st16(tiles, i, 0 as u16)
+        i = i + 1 }
+    var f: usize = 0
+    while f < 6 {
+        rt.st16(tiles, 4 * 6 + f, 1 as u16) // stone
+        rt.st16(tiles, 6 * 6 + f, 11 as u16) // water
+        f = f + 1
+    }
+    rt.st8(opq, 4, 1 as u8)
+    rt.st8(opq, 6, 2 as u8) // translucent
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: opq, tiles: tiles }
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    i = 0
+    while i < 5832 { rt.st16(pad, i, 0 as u16)
+        i = i + 1 }
+    // 4x4 stone floor at y 0, a 2x2x2 water body on top (y 1..2)
+    var x: i32 = 0
+    while x < 4 {
+        var z: i32 = 0
+        while z < 4 { pad_set(pad, x, 0, z, 4 as u16)
+            z = z + 1 }
+        x = x + 1
+    }
+    x = 1
+    while x < 3 {
+        var z: i32 = 1
+        while z < 3 {
+            pad_set(pad, x, 1, z, 6 as u16)
+            pad_set(pad, x, 2, z, 6 as u16)
+            z = z + 1
+        }
+        x = x + 1
+    }
+    var m: mc_mesh.Mesher = mc_mesh.mesher_new()
+    // naive quads: opaque pass = floor top 16 - 4 covered by water? water does NOT hide the floor top (not opaque): 16 top faces +
+    // 4 side faces * 4 + bottom 16 ... only check relations
+    mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO)
+    let q_opaque: u32 = m.nquads
+    mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO | mc_mesh.F_TRANS)
+    let q_trans: u32 = m.nquads
+    // water body 2x2x2 seen from outside: surface faces only = 4 top + 4*... sides: 4 sides * (2x2) = 16, top 4, bottom 4 (floor below is
+    // opaque -> hidden) -> 4 + 16 = 20 quads
+    if q_trans != 20 as u32 { return 1 }
+    // all-in-one (no F_TRANS, plain table without bit 1) must equal opaque pass + opaque-look of water: just check opaque pass has no water tile
+    var k: u32 = 0 as u32
+    while k < m.nverts { k = k + 1 as u32 }
+    mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO)
+    var water_in_opaque: bool = false
+    k = 0 as u32
+    while k < m.nverts {
+        if mc_mesh.vtx_tile(rt.ld32(m.verts, (k as usize) * 2 + 1)) == 11 as u32 { water_in_opaque = true }
+        k = k + 1 as u32
+    }
+    if water_in_opaque { return 2 }
+    if q_opaque == 0 as u32 { return 3 }
+    // raster: a translucent quad over a clear colour blends (tile 11 alpha 190) and leaves the depth buffer untouched
+    var r: mc_raster.Raster = mc_raster.raster_new(32, 24)
+    var cam: mc_camera.Camera = mc_camera.camera_new(32, 24)
+    mc_camera.camera_set_pos(&cam, 2.0, 6.0, 2.0)
+    mc_camera.camera_set_angles(&cam, 0.0, 89.0)
+    mc_camera.camera_update(&cam)
+    var at: mc_texture.Atlas = mc_texture.atlas_default()
+    var b: mc_backend.Backend = mc_backend.backend_cpu(&r)
+    b.upload_atlas(b.obj, (&at) as u64)
+    b.begin(b.obj, (&cam) as u64, 0xFF0000FF as u32) // clear = red
+    mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO | mc_mesh.F_TRANS)
+    let h: usize = b.mesh_upload(b.obj, 1, m.verts, m.nverts as usize, m.idx, m.nidx as usize)
+    b.set_pass(b.obj, mc_backend.PASS_TRANS)
+    b.draw(b.obj, h, 0.0, 0.0, 0.0)
+    b.set_pass(b.obj, mc_backend.PASS_OPAQUE)
+    if r.st.pixels == 0 as u64 { return 4 }
+    let center: u32 = mc_raster.raster_pixel(&r, 16, 12)
+    // blended: no longer pure red, red channel still dominates less than clear (255) but > 0
+    if center == 0xFF0000FF as u32 { return 5 }
+    var dsum: f64 = 0.0
+    i = 0
+    while i < 32 * 24 { dsum = dsum + *((r.depth + (i as u64) * (8 as u64)) as *mut f64)
+        i = i + 1 }
+    if dsum != 0.0 { return 6 } // depth never written by the translucent pass
+    return 0
+}

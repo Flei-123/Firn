@@ -189,7 +189,7 @@ def run(prog, path, flags, lpath):
 
 
 def check(a, lt, flags, res):
-    greedy, use_ao, cull, use_light = bool(flags & 1), bool(flags & 2), bool(flags & 4), bool(flags & 8)
+    greedy, use_ao, cull, use_light = bool(flags & 1), bool(flags & 2), bool(flags & 4), bool(flags & 16)
     stats, quads, tris = res
     want = {}
     for x in range(1, 17):
@@ -270,7 +270,7 @@ def main():
             lt = make_light(mode, seed, lkind)
             lpath = "%s/in.l" % work
             open(lpath, "wb").write(bytes(lt))
-            for flags in range(16):
+            for flags in list(range(8)) + list(range(16, 24)):
                 res = run(prog, path, flags, lpath)
                 try:
                     counts[flags] = check(a, lt, flags, res)
@@ -278,10 +278,10 @@ def main():
                     print("FAIL mode=%s seed=%d flags=%d: %s" % (mode, seed, flags, e)); sys.exit(1)
                 total += 1
             # greedy never needs more quads than naive for the same AO / cull setting
-            for f2 in range(0, 16, 2):
+            for f2 in (0, 2, 4, 6, 16, 18, 20, 22):
                 assert counts[f2 | 1][0] <= counts[f2][0], "greedy produced more quads than naive (%s)" % mode
                 assert counts[f2][0] == counts[f2][1], "naive quad count != visible faces"
-            print("  ok    %-14s seed %d: 16 flag combinations (light %s); quads naive/greedy (AO on): %d / %d, with light %d / %d for %d visible faces" % (mode, seed, lkind, counts[2][0], counts[3][0], counts[10][0], counts[11][0], counts[2][1]))
+            print("  ok    %-14s seed %d: 16 flag combinations (light=bit 16) (light %s); quads naive/greedy (AO on): %d / %d, with light %d / %d for %d visible faces" % (mode, seed, lkind, counts[2][0], counts[3][0], counts[18][0], counts[19][0], counts[2][1]))
     print("verified %d meshes against the brute force" % total)
 
 

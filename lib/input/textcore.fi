@@ -33,6 +33,9 @@ export {
     text_preedit_len, text_preedit_cp, text_preedit_fb, text_preedit_caret_pos, text_preedit_seg_count, text_preedit_seg,
     text_preedit_utf8, text_preedit_caret_bytes, text_composing,
     text_key, text_event_next, text_events_lost, text_set_spot, text_spot_take, text_spot,
+    text_set_surrounding, text_clear_surrounding, text_surround_known, text_surround_len, text_surround_cursor,
+    text_surround_anchor, text_surround_base, text_surround_text, text_surround_cursor_cp, text_surround_cursor_utf16,
+    text_delete_surrounding, SURMAX, SU_BYTES, SU_UTF16, SU_CP, TE_DELETE_SURROUNDING,
     utf8_decode, utf8_encode, utf16_decode, keysym_cp, dead_index, is_modifier_keysym, fb_class, fb_of_imm_attr,
     dead_lookup, seq_lookup,
     TE_NONE, TE_PREEDIT_BEGIN, TE_PREEDIT, TE_PREEDIT_END, TE_COMMIT,
@@ -47,6 +50,8 @@ const TE_PREEDIT_BEGIN: u32 = 1
 const TE_PREEDIT: u32 = 2
 const TE_PREEDIT_END: u32 = 3
 const TE_COMMIT: u32 = 4
+// the IME wants text around the caret deleted: cp[0] = octets before the caret, cp[1] = octets after it (see text_delete_surrounding)
+const TE_DELETE_SURROUNDING: u32 = 5
 
 // text_key results
 const KR_PASS: u32 = 0 // not for the engine: handle the key as usual
@@ -68,6 +73,11 @@ const SEG_TARGET: u32 = 2
 const MAXPRE: usize = 256
 const EVCP: usize = 32
 const EVQ: usize = 128
+const SURMAX: usize = 1024
+// units of text_delete_surrounding: octets (Wayland), UTF-16 units (Android), code points
+const SU_BYTES: u32 = 0
+const SU_UTF16: u32 = 1
+const SU_CP: u32 = 2
 
 const KS_MULTI_KEY: u32 = 65312 // 0xFF20
 const KS_ESCAPE: u32 = 65307
@@ -100,6 +110,13 @@ struct Text {
     q_head: usize,
     q_tail: usize,
     q_lost: u64,
+    // surrounding text (set by the text field, read by IMEs: Android getTextBeforeCursor, Wayland text-input surrounding_text)
+    sur: [u8; 1024],
+    sur_n: usize,
+    sur_cur: usize,
+    sur_anc: usize,
+    sur_base: usize,
+    sur_on: bool,
 }
 
 struct TextEvent {
@@ -112,7 +129,8 @@ fn text_new() -> Text {
     return Text { on: true, pre: [0 as u32; 256], fb: [0 as u32; 256], pn: 0, caret: 0,
         cmode: 0 as u32, cdead: 0 as u32, ck: [0 as u32; 3], cn: 0,
         sx: 0 as i32, sy: 0 as i32, sw: 0 as i32, sh: 0 as i32, spot_dirty: false,
-        q_kind: [0 as u8; 128], q_n: [0 as u8; 128], q_cp: [0 as u32; 4096], q_head: 0, q_tail: 0, q_lost: 0 }
+        q_kind: [0 as u8; 128], q_n: [0 as u8; 128], q_cp: [0 as u32; 4096], q_head: 0, q_tail: 0, q_lost: 0,
+        sur: [0 as u8; 1024], sur_n: 0, sur_cur: 0, sur_anc: 0, sur_base: 0, sur_on: false }
 }
 
 // ---- UTF helpers -------------------------------------------------------------------------------------------------
@@ -655,6 +673,165 @@ fn text_spot_take(t: *mut Text, out: *mut [i32; 4]) -> bool {
     if !(*t).spot_dirty { return false }
     (*t).spot_dirty = false
     text_spot(t, out)
+    return true
+}
+
+
+// ---- surrounding text ----------------------------------------------------------------------------------------------
+//
+// The text field tells the Text what stands around the caret (WITHOUT the pre-edit text): `text_set_surrounding(p, n, cursor,
+// anchor)` with the whole field text as UTF-8 and octet offsets. At most SURMAX octets are kept: a window around the caret that
+// starts and ends on code point borders (text_surround_base = octet offset of the window in the field). An IME that wants to delete
+// text around the caret (Android deleteSurroundingText, Wayland delete_surrounding_text) calls text_delete_surrounding; the
+// result is the event TE_DELETE_SURROUNDING (octets before / after the caret) that the field applies to its own buffer.
+
+fn is_cont(b: u8) -> bool { return (b & 192 as u8) == 128 as u8 }
+
+fn text_clear_surrounding(t: *mut Text) {
+    (*t).sur_on = false
+    (*t).sur_n = 0
+    (*t).sur_cur = 0
+    (*t).sur_anc = 0
+    (*t).sur_base = 0
+}
+
+fn text_set_surrounding(t: *mut Text, p: u64, n: usize, cursor0: usize, anchor0: usize) {
+    var cursor: usize = cursor0
+    var anchor: usize = anchor0
+    if cursor > n { cursor = n }
+    if anchor > n { anchor = n }
+    var a: usize = 0
+    var b: usize = n
+    if n > SURMAX {
+        if cursor > SURMAX / 2 { a = cursor - SURMAX / 2 }
+        b = a + SURMAX
+        if b > n {
+            b = n
+            a = n - SURMAX
+        }
+        while a < n && is_cont(rt.ld8(p, a)) { a = a + 1 }
+        while b > a && b < n && is_cont(rt.ld8(p, b)) { b = b - 1 }
+    }
+    if cursor < a { cursor = a }
+    if cursor > b { cursor = b }
+    if anchor < a { anchor = a }
+    if anchor > b { anchor = b }
+    var i: usize = 0
+    while i < b - a {
+        (*t).sur[i] = rt.ld8(p, a + i)
+        i = i + 1
+    }
+    (*t).sur_n = b - a
+    (*t).sur_cur = cursor - a
+    (*t).sur_anc = anchor - a
+    (*t).sur_base = a
+    (*t).sur_on = true
+}
+
+fn text_surround_known(t: *mut Text) -> bool { return (*t).sur_on }
+fn text_surround_len(t: *mut Text) -> usize { return (*t).sur_n }
+fn text_surround_cursor(t: *mut Text) -> usize { return (*t).sur_cur }
+fn text_surround_anchor(t: *mut Text) -> usize { return (*t).sur_anc }
+fn text_surround_base(t: *mut Text) -> usize { return (*t).sur_base }
+
+// copy the window (at most cap octets) to `out`; returns the octet count
+fn text_surround_text(t: *mut Text, out: u64, cap: usize) -> usize {
+    var n: usize = (*t).sur_n
+    if n > cap { n = cap }
+    var i: usize = 0
+    while i < n {
+        rt.st8(out, i, (*t).sur[i])
+        i = i + 1
+    }
+    return n
+}
+
+// units from the window start to the cursor, as code points / UTF-16 units
+fn units_before(t: *mut Text, utf16: bool) -> usize {
+    var u: usize = 0
+    var i: usize = 0
+    while i < (*t).sur_cur {
+        let b: u8 = (*t).sur[i]
+        if !is_cont(b) {
+            u = u + 1
+            if utf16 && b >= 240 as u8 { u = u + 1 }
+        }
+        i = i + 1
+    }
+    return u
+}
+fn text_surround_cursor_cp(t: *mut Text) -> usize { return units_before(t, false) }
+fn text_surround_cursor_utf16(t: *mut Text) -> usize { return units_before(t, true) }
+
+fn seq_len(b: u8) -> usize {
+    if b < 128 as u8 { return 1 }
+    if b >= 240 as u8 { return 4 }
+    if b >= 224 as u8 { return 3 }
+    if b >= 192 as u8 { return 2 }
+    return 1
+}
+
+// The IME wants `before` units deleted before the caret and `after` units behind it (units: SU_*). Clamped to the known window and
+// never cut inside a code point (a UTF-16 pair that does not fit stays). Queues TE_DELETE_SURROUNDING with the octet counts and
+// returns true if something is to be deleted. Without known surrounding text only SU_BYTES works (taken as asked).
+fn text_delete_surrounding(t: *mut Text, before: usize, after: usize, unit: u32) -> bool {
+    var nb: usize = 0
+    var na: usize = 0
+    if !(*t).sur_on {
+        if unit != SU_BYTES { return false }
+        nb = before
+        na = after
+    } else if unit == SU_BYTES {
+        nb = before
+        if nb > (*t).sur_cur { nb = (*t).sur_cur }
+        while nb > 0 && is_cont((*t).sur[(*t).sur_cur - nb]) { nb = nb - 1 }
+        na = after
+        if na > (*t).sur_n - (*t).sur_cur { na = (*t).sur_n - (*t).sur_cur }
+        while na > 0 && (*t).sur_cur + na < (*t).sur_n && is_cont((*t).sur[(*t).sur_cur + na]) { na = na - 1 }
+    } else {
+        var i: usize = (*t).sur_cur
+        var count: usize = 0
+        while i > 0 && count < before {
+            var j: usize = i - 1
+            while j > 0 && is_cont((*t).sur[j]) { j = j - 1 }
+            var need: usize = 1
+            if unit == SU_UTF16 && (*t).sur[j] >= 240 as u8 { need = 2 }
+            if count + need > before { break }
+            count = count + need
+            i = j
+        }
+        nb = (*t).sur_cur - i
+        var k: usize = (*t).sur_cur
+        count = 0
+        while k < (*t).sur_n && count < after {
+            let l: usize = seq_len((*t).sur[k])
+            var need2: usize = 1
+            if unit == SU_UTF16 && l == 4 { need2 = 2 }
+            if count + need2 > after || k + l > (*t).sur_n { break }
+            count = count + need2
+            k = k + l
+        }
+        na = k - (*t).sur_cur
+    }
+    if nb == 0 && na == 0 { return false }
+    var ev: [u32; 2] = [0 as u32; 2]
+    ev[0] = nb as u32
+    ev[1] = na as u32
+    q_push(t, TE_DELETE_SURROUNDING, (&ev[0]) as u64, 2)
+    // the cached window follows the deletion, so a second request sees the new text
+    if (*t).sur_on {
+        let c: usize = (*t).sur_cur
+        var w: usize = c - nb
+        var r: usize = c + na
+        while r < (*t).sur_n {
+            (*t).sur[w] = (*t).sur[r]
+            w = w + 1
+            r = r + 1
+        }
+        (*t).sur_n = w
+        (*t).sur_cur = c - nb
+        (*t).sur_anc = (*t).sur_cur
+    }
     return true
 }
 

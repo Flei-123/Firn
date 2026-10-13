@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/input/webraw.fi -- input.webraw: keyboard, mouse and Pointer Lock of a browser page as the SAME state machine as lib/input/raw.
+//
+//     import input.webraw
+//     var raw: raw.Raw = raw.raw_new()
+//     // every frame (inside the exported frame function):
+//     webraw.webraw_poll(&raw)                      // raw_begin + the queued browser events (raw_feed) + raw_end
+//     if raw.key_pressed(&raw, raw.KEY_SPACE) { jump() }
+//     look(raw.mouse_dx(&raw), raw.mouse_dy(&raw))  // only while the pointer is locked (webraw_lock(true))
+//     webraw.webraw_lock(true)                      // from a click/key handler of the page only (browser rule: user gesture)
+//
+// The host (demos/mcweb/glweb.js, `startMcWeb`) listens to the DOM and calls the `firn_in_*` exports below; they only queue plain
+// numbers (kind, a, x, y, state) in a ring in module memory -- exactly the arguments of raw.raw_feed -- and add up the relative
+// mouse movement. Nothing is processed between frames, so a frame sees a consistent set (like window.next_event). Names are those of
+// lib/input/raw: scancodes are Linux's (the host maps KeyboardEvent.code), the keysym is the Unicode code point of KeyboardEvent.key
+// for single characters (0 otherwise), mouse buttons 1/2/3 = left/middle/right, wheel = buttons 4/5 (up/down) and 6/7 (left/right),
+// focus loss releases everything (EV_FOCUS 0). Browser auto-repeat (keydown with repeat) is dropped by the host.
+// Ring full (1024 events in one frame): the oldest events are NOT kept, new ones are dropped and counted (webraw_dropped).
+// Pointer Lock itself is requested by the host (`firn_in_lock` import -> canvas.requestPointerLock); `firn_in_lock_state` reports
+// pointerlockchange. Relative movement counts only while locked (the same rule as window.cursor_delta with CURSOR_CAPTURED).
+
+import std.rt
+import input.raw
+import window.window
+
+export { webraw_poll, webraw_lock, webraw_locked, webraw_dropped, webraw_events }
+
+extern fn firn_in_lock(on: i32);
+
+const RING_CAP: usize = 1024
+const EV_WORDS: usize = 5
+
+static mut G_RING: u64 = 0
+static mut G_HEAD: usize = 0 // events queued since the last poll
+static mut G_DROPPED: u64 = 0
+static mut G_EVENTS: u64 = 0
+static mut G_LOCKED: bool = false
+static mut G_DX: i64 = 0
+static mut G_DY: i64 = 0
+
+fn ring() -> u64 {
+    if G_RING == 0 {
+        G_RING = rt.heap_alloc(RING_CAP * EV_WORDS * 4)
+    }
+    return G_RING
+}
+
+fn push(kind: u32, a: u32, x: u32, y: u32, s: u32) {
+    let r: u64 = ring()
+    if r == 0 || G_HEAD >= RING_CAP {
+        G_DROPPED = G_DROPPED + 1 as u64
+        return
+    }
+    rt.st32(r, G_HEAD * EV_WORDS, kind)
+    rt.st32(r, G_HEAD * EV_WORDS + 1, a)
+    rt.st32(r, G_HEAD * EV_WORDS + 2, x)
+    rt.st32(r, G_HEAD * EV_WORDS + 3, y)
+    rt.st32(r, G_HEAD * EV_WORDS + 4, s)
+    G_HEAD = G_HEAD + 1
+    G_EVENTS = G_EVENTS + 1 as u64
+}
+
+// ---- host -> Firn ----------------------------------------------------------------------------------------------------
+
+// A key went down (down 1) or up (0): Linux scancode, keysym (0 = none), time in ms (low 32 bits; only used to pair auto-repeats).
+#[export_c]
+fn firn_in_key(down: u32, scancode: u32, keysym: u32, time_ms: u32) {
+    if down != 0 as u32 {
+        push(window.EV_RAWKEY, scancode, keysym, time_ms, 0 as u32)
+    } else {
+        push(window.EV_RAWKEY_UP, scancode, keysym, time_ms, 0 as u32)
+    }
+}
+
+// Mouse button 1/2/3 at (x, y) device pixels.
+#[export_c]
+fn firn_in_button(down: u32, button: u32, x: i32, y: i32) {
+    var kind: u32 = window.EV_RELEASE
+    if down != 0 as u32 { kind = window.EV_BUTTON }
+    push(kind, button, x as u32, y as u32, 0 as u32)
+}
+
+// Pointer position (device pixels, canvas origin) and the relative movement since the last event.
+#[export_c]
+fn firn_in_motion(x: i32, y: i32, dx: i32, dy: i32) {
+    push(window.EV_MOTION, 0 as u32, x as u32, y as u32, 0 as u32)
+    if G_LOCKED {
+        G_DX = G_DX + (dx as i64)
+        G_DY = G_DY + (dy as i64)
+    }
+}
+
+// One wheel notch: dy +1 = up (button 4), -1 = down (5); dx -1 = left (6), +1 = right (7).
+#[export_c]
+fn firn_in_wheel(dy: i32, dx: i32) {
+    if dy > 0 { push(window.EV_BUTTON, 4 as u32, 0 as u32, 0 as u32, 0 as u32) }
+    if dy < 0 { push(window.EV_BUTTON, 5 as u32, 0 as u32, 0 as u32, 0 as u32) }
+    if dx < 0 { push(window.EV_BUTTON, 6 as u32, 0 as u32, 0 as u32, 0 as u32) }
+    if dx > 0 { push(window.EV_BUTTON, 7 as u32, 0 as u32, 0 as u32, 0 as u32) }
+}
+
+#[export_c]
+fn firn_in_focus(on: u32) {
+    push(window.EV_FOCUS, on, 0 as u32, 0 as u32, 0 as u32)
+}
+
+// pointerlockchange: 1 = the canvas holds the lock now.
+#[export_c]
+fn firn_in_lock_state(on: u32) {
+    G_LOCKED = on != 0 as u32
+    G_DX = 0
+    G_DY = 0
+}
+
+// ---- Firn side -------------------------------------------------------------------------------------------------------
+
+// Once per frame: raw_begin, every queued event through raw_feed, the relative movement, raw_end.
+fn webraw_poll(r: *mut raw.Raw) {
+    raw.raw_begin(r)
+    let q: u64 = ring()
+    var i: usize = 0
+    while i < G_HEAD {
+        raw.raw_feed(r, rt.ld32(q, i * EV_WORDS), rt.ld32(q, i * EV_WORDS + 1), rt.ld32(q, i * EV_WORDS + 2),
+            rt.ld32(q, i * EV_WORDS + 3), rt.ld32(q, i * EV_WORDS + 4))
+        i = i + 1
+    }
+    G_HEAD = 0
+    (*r).dx = (*r).dx + G_DX
+    (*r).dy = (*r).dy + G_DY
+    G_DX = 0
+    G_DY = 0
+    raw.raw_end(r)
+}
+
+// Asks the page for Pointer Lock (true) or gives it back. Browsers only grant it inside a user gesture; the answer arrives
+// later as firn_in_lock_state -- check webraw_locked.
+fn webraw_lock(on: bool) {
+    if on { firn_in_lock(1) } else { firn_in_lock(0) }
+}
+
+fn webraw_locked() -> bool { return G_LOCKED }
+fn webraw_dropped() -> u64 { return G_DROPPED }
+// events received since the start (all kinds)
+fn webraw_events() -> u64 { return G_EVENTS }
