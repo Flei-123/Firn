@@ -93,6 +93,16 @@ the parent of the root.
 * `tar_add_tree(w, dir, prefix)` packs a directory (byte-wise sorted, links not
   followed, mtime and mode kept), `targz_compress` makes the `.tar.gz`.
 
+### Streaming extraction (r206)
+
+`tar.tar_extract_stream(fd, dest, opts, limits)` (and `tar_extract_stream_file`, or the push form
+`tar_stream_new` / `tar_stream_feed` / `tar_stream_finish` / `tar_stream_free`) extracts a plain tar while it
+arrives: file content goes straight to disk through `sf_open_file` / `sf_finish_file`, memory is one header,
+one metadata block and the names seen. Same name, link, type and limit rules as `tar_extract_all`, but judged
+entry by entry: entries before a bad one stay on disk. No tar.gz (no streaming inflate); the reader stops at
+the first zero block. Proven by tests/2905 and `tools/stdarchive` (chunks of 1 .. 64 KiB against GNU tar and
+Python tarfile, same verdicts as the whole-archive extractor).
+
 ## std.hashfile
 
 ```firn

@@ -1,0 +1,255 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+// tests/2905_tar_extract_stream.fi -- tar_stream_* / tar_extract_stream (r206):
+// a tar fed in pieces of 1, 7, 512, 513, 4096 octets and in one piece extracts
+// the same tree as tar_extract_all (names, content, modes, mtimes, link);
+// a cut archive is Truncated, a flipped header octet is Checksum, junk is
+// NotArchive, a second feed after an error repeats the error, and the
+// descriptor form reads a file.
+import std.rt
+import std.fs
+import std.tar
+import std.safefs
+
+static mut fails: u32 = 0
+
+fn check(ok: bool, code: u32) {
+    if !ok {
+        fails = fails + 1
+        var d: [u8; 8] = "FAIL 000"
+        d[5] = (48 + (code / 100) % 10) as u8
+        d[6] = (48 + (code / 10) % 10) as u8
+        d[7] = (48 + code % 10) as u8
+        syscall(1, 2, (&d[0]) as i64, 8, 0, 0, 0)
+    }
+}
+
+fn mtime_of(path: str) -> i64 {
+    let st: fs.FileInfo = fs.stat(path) catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    return st.mtime_ns / 1000000000
+}
+
+fn mode_of(path: str) -> u32 {
+    let st: fs.FileInfo = fs.stat(path) catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0, mtime_ns: 0 }
+    return st.mode & 511 as u32
+}
+
+fn fill(b: *mut rt.Buf, n: usize, seed: u32) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(b, ((i as u32 * 31 + seed + (i as u32 / 251)) & 255 as u32) as u8)
+        i = i + 1
+    }
+}
+
+fn same_file(path: str, n: usize, seed: u32) -> bool {
+    var want: rt.Buf = rt.buf_new()
+    fill(&want, n, seed)
+    var got: rt.Buf = rt.buf_new()
+    var ok: bool = true
+    fs.read_file(path, &got) catch | e | (nope(&ok))
+    if ok {
+        ok = rt.buf_len(&got) == n && rt.mem_eq(rt.buf_ptr(&got), rt.buf_ptr(&want), n)
+    }
+    rt.buf_free(&want)
+    rt.buf_free(&got)
+    return ok
+}
+
+fn nope(ok: *mut bool) -> usize {
+    *ok = false
+    return 0
+}
+
+fn add_sized(w: *mut tar.TarWriter, name: str, n: usize, seed: u32, mode: u32, mtime: i64) {
+    var b: rt.Buf = rt.buf_new()
+    fill(&b, n, seed)
+    tar.tar_add_file(w, name, rt.buf_ptr(&b), n, mode, mtime) catch false
+    rt.buf_free(&b)
+}
+
+fn zero_stats() -> safefs.ExtractStats {
+    return safefs.ExtractStats { files: 99, dirs: 99, links: 99, bytes: 0 }
+}
+
+// feeds `n` octets at `p` in pieces of `chunk`
+fn stream_try(p: u64, n: usize, chunk: usize, dest: str, opts: safefs.ExtractOptions) -> ArchiveError!safefs.ExtractStats {
+    var s: tar.TarStream = try tar.tar_stream_new(dest, opts, tar.tar_limits_default())
+    var off: usize = 0
+    while off < n {
+        var take: usize = chunk
+        if take > n - off {
+            take = n - off
+        }
+        try tar.tar_stream_feed(&s, p + off as u64, take)
+        off = off + take
+    }
+    let st: safefs.ExtractStats = try tar.tar_stream_finish(&s)
+    tar.tar_stream_free(&s)
+    return st
+}
+
+fn run_stream(p: u64, n: usize, chunk: usize, dest: str, opts: safefs.ExtractOptions, why: *mut ArchiveError) -> safefs.ExtractStats {
+    var bad: bool = false
+    return stream_try(p, n, chunk, dest, opts) catch | e | (set_stats(e, why, &bad))
+}
+
+fn set_why(e: ArchiveError, why: *mut ArchiveError, bad: *mut bool) -> bool {
+    *why = e
+    *bad = true
+    return false
+}
+
+fn set_stats(e: ArchiveError, why: *mut ArchiveError, bad: *mut bool) -> safefs.ExtractStats {
+    *why = e
+    *bad = true
+    return zero_stats()
+}
+
+fn check_tree(root: str, base: u32) {
+    check(same_file(root + "/top/empty", 0, 1), base + 1)
+    check(same_file(root + "/top/one", 1, 2), base + 2)
+    check(same_file(root + "/top/b511", 511, 3), base + 3)
+    check(same_file(root + "/top/b512", 512, 4), base + 4)
+    check(same_file(root + "/top/b513", 513, 5), base + 5)
+    check(same_file(root + "/top/sub/big", 200000, 6), base + 6)
+    check(mode_of(root + "/top/b512") == 493 as u32, base + 7) // 0755
+    check(mode_of(root + "/top/one") == 420 as u32, base + 8) // 0644
+    check(mtime_of(root + "/top/one") == 1500000200, base + 9)
+    check(mtime_of(root + "/top/sub") == 1500000100, base + 10)
+    check(same_file(root + "/top/sub/" + longname(), 33, 7), base + 11)
+    let l: str = fs.readlink(root + "/top/lnk") catch "?"
+    check(l == "sub/big", base + 12)
+}
+
+fn dname(k: usize) -> str {
+    if k == 0 { return "/s0" }
+    if k == 1 { return "/s1" }
+    if k == 2 { return "/s2" }
+    if k == 3 { return "/s3" }
+    if k == 4 { return "/s4" }
+    return "/s5"
+}
+
+fn longname() -> str {
+    var s: str = "long"
+    var i: usize = 0
+    while i < 12 {
+        s = s + "_0123456789"
+        i = i + 1
+    }
+    return s // 148 octets: goes through a pax record
+}
+
+fn body() -> ArchiveError!bool {
+    var out: rt.Buf = rt.buf_new()
+    var w: tar.TarWriter = tar.tar_writer_new(&out)
+    tar.tar_add_dir(&w, "top", 493 as u32, 1500000000) catch false
+    tar.tar_add_dir(&w, "top/sub", 493 as u32, 1500000100) catch false
+    add_sized(&w, "top/empty", 0, 1, 420 as u32, 1500000200)
+    add_sized(&w, "top/one", 1, 2, 420 as u32, 1500000200)
+    add_sized(&w, "top/b511", 511, 3, 420 as u32, 1500000200)
+    add_sized(&w, "top/b512", 512, 4, 493 as u32, 1500000200)
+    add_sized(&w, "top/b513", 513, 5, 420 as u32, 1500000200)
+    add_sized(&w, "top/sub/big", 200000, 6, 420 as u32, 1500000200)
+    add_sized(&w, "top/sub/" + longname(), 33, 7, 420 as u32, 1500000200)
+    tar.tar_add_symlink(&w, "top/lnk", "sub/big", 1500000200) catch false
+    tar.tar_finish(&w) catch 0
+    let p: u64 = rt.buf_ptr(&out)
+    let n: usize = rt.buf_len(&out)
+
+    let base: str = fs.temp_name_for("tarstream")
+    var o: safefs.ExtractOptions = safefs.extract_options_default()
+    o.keep_times = true
+    var why: ArchiveError = ArchiveError::Io
+
+    // the reference: all in memory
+    var r: tar.TarReader = try tar.tar_reader_open(p, n)
+    let ref: safefs.ExtractStats = tar.tar_extract_all(&r, base + "/ref", o) catch zero_stats()
+    check(ref.files == 7 && ref.dirs == 2 && ref.links == 1, 1)
+    check_tree(base + "/ref", 10)
+
+    // the stream, in different pieces
+    var sizes: [usize; 6] = [1, 7, 512, 513, 4096, 1000000]
+    var k: usize = 0
+    while k < 6 {
+        let d: str = base + dname(k)
+        let st: safefs.ExtractStats = run_stream(p, n, sizes[k], d, o, &why)
+        check(st.files == ref.files && st.dirs == ref.dirs && st.links == ref.links && st.bytes == ref.bytes, 100 + k as u32)
+        check_tree(d, 110 + 20 * k as u32)
+        k = k + 1
+    }
+
+    // a cut archive
+    run_stream(p, 700, 512, base + "/cut1", o, &why)
+    check(why == ArchiveError::Truncated, 300)
+    why = ArchiveError::Io
+    run_stream(p, 512 * 3 + 100, 4096, base + "/cut2", o, &why)
+    check(why == ArchiveError::Truncated, 301)
+
+    // an archive without its zero blocks, cut at an entry boundary, is fine
+    why = ArchiveError::Io
+    let stb: safefs.ExtractStats = run_stream(p, 1024, 512, base + "/bnd", o, &why)
+    check(stb.dirs == 2 && why == ArchiveError::Io, 302)
+
+    // a damaged header
+    var bad: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&bad, p, n)
+    let bp: u64 = rt.buf_ptr(&bad)
+    rt.st8(bp, 1024 + 5, (rt.ld8(bp, 1024 + 5) + 1 as u8))
+    why = ArchiveError::Io
+    run_stream(bp, n, 4096, base + "/bad", o, &why)
+    check(why == ArchiveError::Checksum, 310)
+
+    // junk
+    var junk: rt.Buf = rt.buf_new()
+    fill(&junk, 2000, 9)
+    why = ArchiveError::Io
+    run_stream(rt.buf_ptr(&junk), 2000, 500, base + "/junk", o, &why)
+    check(why == ArchiveError::NotArchive, 311)
+    why = ArchiveError::Io
+    run_stream(rt.buf_ptr(&junk), 100, 50, base + "/junk2", o, &why)
+    check(why == ArchiveError::NotArchive, 312)
+
+    // after an error every call repeats it
+    var bad2: bool = false
+    var s: tar.TarStream = try tar.tar_stream_new(base + "/rep", o, tar.tar_limits_default())
+    tar.tar_stream_feed(&s, rt.buf_ptr(&junk), 600) catch | e | (set_why(e, &why, &bad2))
+    check(bad2, 313)
+    bad2 = false
+    why = ArchiveError::Io
+    tar.tar_stream_feed(&s, rt.buf_ptr(&junk), 10) catch | e | (set_why(e, &why, &bad2))
+    check(bad2 && why == ArchiveError::NotArchive, 314)
+    tar.tar_stream_free(&s)
+
+    // the descriptor form
+    fs.mkdir_all(base) catch false
+    fs.write_file(base + "/in.tar", p, n) catch 0
+    let st2: safefs.ExtractStats = tar.tar_extract_stream_file(base + "/in.tar", base + "/fd", o, tar.tar_limits_default()) catch zero_stats()
+    check(st2.files == ref.files && st2.bytes == ref.bytes, 320)
+    check_tree(base + "/fd", 330)
+
+    // limits
+    var lim: tar.TarLimits = tar.tar_limits_default()
+    lim.max_entry_size = 1000
+    var bad3: bool = false
+    var s3: tar.TarStream = try tar.tar_stream_new(base + "/lim", o, lim)
+    tar.tar_stream_feed(&s3, p, n) catch | e | (set_why(e, &why, &bad3))
+    check(bad3 && why == ArchiveError::TooLarge, 340)
+    tar.tar_stream_free(&s3)
+
+    fs.remove_tree(base) catch false
+    tar.tar_reader_free(&r)
+    rt.buf_free(&bad)
+    rt.buf_free(&junk)
+    rt.buf_free(&out)
+    return true
+}
+
+fn main() -> i32 {
+    let ok: bool = body() catch false
+    if ok && fails == 0 {
+        return 0
+    }
+    return 1
+}

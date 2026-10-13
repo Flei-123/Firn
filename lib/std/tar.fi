@@ -63,6 +63,13 @@
 //   T5 A NAME TWICE IS REFUSED (`Duplicate`), although GNU tar would
 //      extract both and let the last win. Archives made by `tar -r` that
 //      replace entries need a tool that merges them first.
+//   T7 STREAMING (`tar_extract_stream`, `TarStream`, r206) JUDGES ENTRY BY
+//      ENTRY: the all-before-the-first-byte guarantee of `tar_extract_all`
+//      cannot hold for input that is not there yet. Entries before a bad one
+//      stay on disk (a partly written file too); the same rules apply to
+//      each entry. Plain tar only: tar.gz / .zst / .xz go through
+//      `tar_open_auto` (T1, no streaming decoder). The names seen (not the
+//      content) are kept in memory for the duplicate and hard-link checks.
 //   T6 THE WRITER stores no owner (uid/gid 0, empty names) and clamps a
 //      modification time outside 0 .. 8589934591 to 0.
 
@@ -85,6 +92,8 @@ export {
     tar_entry_count, tar_entry_name, tar_entry_link, tar_entry_kind,
     tar_entry_mode, tar_entry_size, tar_entry_mtime, tar_entry_data,
     tar_find, tar_extract, tar_extract_all, tar_name_is_safe,
+    TarStream, tar_stream_new, tar_stream_feed, tar_stream_finish, tar_stream_free,
+    tar_extract_stream, tar_extract_stream_file,
     tar_writer_new, tar_add_file, tar_add_dir, tar_add_symlink, tar_add_tree, tar_finish,
 }
 
@@ -907,6 +916,635 @@ fn note_ae(e: ArchiveError, why: *mut ArchiveError, err: *mut u32) -> bool {
     *why = e
     *err = 1 as u32
     return false
+}
+
+// ------------------------------------------------------------ streaming extraction
+
+// `tar_extract_stream` / `TarStream`: extract a plain tar WHILE it arrives.
+// Octets are pushed in with `tar_stream_feed` (any chunk size, down to one
+// octet); file content goes to disk as it comes, so memory is bounded by
+// one header, one metadata block (<= 1 MiB) and the list of names seen
+// (needed for duplicate and hard-link checks), not by the archive.
+//
+//     var s: tar.TarStream = tar.tar_stream_new("/opt/x", safefs.extract_options_default(), tar.tar_limits_default()) catch |e| ...
+//     while more { tar.tar_stream_feed(&s, p, n) catch |e| ... }
+//     let st: safefs.ExtractStats = tar.tar_stream_finish(&s) catch |e| ...
+//     tar.tar_stream_free(&s)
+//
+// Same safety rules and same names/links/limits as `tar_extract_all`, but
+// they are judged entry by entry, so an archive with a bad entry in the
+// middle leaves the entries before it on disk (S1 below).
+
+const TS_HEADER: u32 = 0
+const TS_META: u32 = 1
+const TS_DATA: u32 = 2
+const TS_SKIP: u32 = 3
+const TS_DONE: u32 = 4
+
+struct StreamName {
+    off: usize, // in `seen_names`: the name after strip/clean (a directory keeps its "/")
+    len: usize,
+    kind: u32,
+    mode: u32,
+    mtime: i64,
+}
+
+struct TarStream {
+    w: safefs.SfWalker,
+    opts: safefs.ExtractOptions,
+    lim: TarLimits,
+    stats: safefs.ExtractStats,
+    state: u32,
+    hdr: rt.Buf, // the header (512) or the metadata block being collected
+    want: usize, // octets to collect in `hdr`
+    left: u64, // octets still to write (DATA) or to skip (SKIP)
+    meta_typ: u8,
+    meta_size: u64,
+    have_path: bool,
+    path: rt.Buf,
+    have_link: bool,
+    link: rt.Buf,
+    have_size: bool,
+    size: u64,
+    have_mtime: bool,
+    mtime: i64,
+    fd: i64, // the open file in DATA, else -1
+    cur_rel: rt.Buf, // its name (trimmed)
+    cur_mode: u32,
+    cur_mtime: i64,
+    cur_size: u64,
+    scratch: rt.Buf, // name building
+    scratch2: rt.Buf, // link target building
+    seen: Vec[StreamName],
+    seen_names: rt.Buf,
+    names: Map[u64, u64], // name hash -> seen index + 1
+    files: Map[u64, u64], // name hash -> seen index + 1 (FILE entries, for hard links)
+    consumed: u64,
+    total: u64,
+    nentries: usize,
+    err: bool,
+    why: ArchiveError,
+}
+
+fn tar_stream_new(dest: str, opts: safefs.ExtractOptions, lim: TarLimits) -> ArchiveError!TarStream {
+    var bad: bool = false
+    var why: ArchiveError = ArchiveError::Io
+    fs.mkdir_all(dest) catch | er | (note_mk(er, &why, &bad))
+    if bad {
+        return why
+    }
+    return TarStream { w: safefs.sf_walker_new(dest), opts: opts, lim: lim,
+        stats: safefs.ExtractStats { files: 0, dirs: 0, links: 0, bytes: 0 },
+        state: TS_HEADER, hdr: rt.buf_new(), want: 512, left: 0, meta_typ: 0 as u8, meta_size: 0,
+        have_path: false, path: rt.buf_new(), have_link: false, link: rt.buf_new(),
+        have_size: false, size: 0, have_mtime: false, mtime: 0, fd: 0 - 1,
+        cur_rel: rt.buf_new(), cur_mode: 0 as u32, cur_mtime: 0, cur_size: 0,
+        scratch: rt.buf_new(), scratch2: rt.buf_new(),
+        seen: vec_new[StreamName](), seen_names: rt.buf_new(),
+        names: map_new[u64, u64](), files: map_new[u64, u64](),
+        consumed: 0, total: 0, nentries: 0, err: false, why: ArchiveError::Io }
+}
+
+fn tar_stream_free(s: *mut TarStream) {
+    if (*s).fd >= 0 {
+        fs.close_fd((*s).fd)
+        (*s).fd = 0 - 1
+    }
+    rt.buf_free(&(*s).hdr)
+    rt.buf_free(&(*s).path)
+    rt.buf_free(&(*s).link)
+    rt.buf_free(&(*s).cur_rel)
+    rt.buf_free(&(*s).scratch)
+    rt.buf_free(&(*s).scratch2)
+    rt.buf_free(&(*s).seen_names)
+    vec_free[StreamName](&(*s).seen)
+    map_free[u64, u64](&(*s).names)
+    map_free[u64, u64](&(*s).files)
+}
+
+fn ts_fail(s: *mut TarStream, e: ArchiveError) {
+    if !(*s).err {
+        (*s).err = true
+        (*s).why = e
+    }
+}
+
+fn ts_view(b: *mut rt.Buf, off: usize, len: usize) -> str {
+    return str { p: rt.ptr_of(rt.buf_ptr(b) + off as u64), n: len }
+}
+
+// skip `n` octets (the padding), then the next header
+fn ts_skip(s: *mut TarStream, n: u64) {
+    if n == 0 {
+        (*s).state = TS_HEADER
+        (*s).want = 512
+    } else {
+        (*s).state = TS_SKIP
+        (*s).left = n
+    }
+}
+
+fn ts_pending_reset(s: *mut TarStream) {
+    (*s).have_path = false
+    (*s).have_link = false
+    (*s).have_size = false
+    (*s).have_mtime = false
+    rt.buf_clear(&(*s).path)
+    rt.buf_clear(&(*s).link)
+}
+
+fn ts_seen_add(s: *mut TarStream, rel: str, kind: u32, mode: u32, mtime: i64) -> usize {
+    let at: usize = rt.buf_len(&(*s).seen_names)
+    rt.buf_push_bytes(&(*s).seen_names, rel.p as u64, rel.length())
+    vec_push[StreamName](&(*s).seen, StreamName { off: at, len: rel.length(), kind: kind, mode: mode, mtime: mtime })
+    return vec_len[StreamName](&(*s).seen)
+}
+
+fn ts_seen_name(s: *mut TarStream, i: usize) -> str {
+    let e: *mut StreamName = vec_elem_ptr[StreamName](&(*s).seen, i)
+    return ts_view(&(*s).seen_names, (*e).off, (*e).len)
+}
+
+// a metadata block (pax 'x', GNU 'L' / 'K', global 'g') is complete in `hdr`
+fn ts_meta_done(s: *mut TarStream) {
+    let p: u64 = rt.buf_ptr(&(*s).hdr)
+    let sz: usize = (*s).meta_size as usize
+    let typ: u8 = (*s).meta_typ
+    if typ == 120 as u8 {
+        var lp: Pending = pending_new()
+        if !pax_parse(p, 0, sz, &lp) {
+            ts_fail(s, ArchiveError::Corrupt)
+        } else {
+            if lp.have_path {
+                (*s).have_path = true
+                rt.buf_clear(&(*s).path)
+                rt.buf_push_bytes(&(*s).path, p + lp.path_off as u64, lp.path_len)
+            }
+            if lp.have_link {
+                (*s).have_link = true
+                rt.buf_clear(&(*s).link)
+                rt.buf_push_bytes(&(*s).link, p + lp.link_off as u64, lp.link_len)
+            }
+            if lp.have_size {
+                (*s).have_size = true
+                (*s).size = lp.size
+            }
+            if lp.have_mtime {
+                (*s).have_mtime = true
+                (*s).mtime = lp.mtime
+            }
+        }
+    } else if typ == 76 as u8 || typ == 75 as u8 {
+        var ln: usize = 0
+        while ln < sz && rt.ld8(p, ln) != 0 as u8 {
+            ln = ln + 1
+        }
+        if typ == 76 as u8 {
+            (*s).have_path = true
+            rt.buf_clear(&(*s).path)
+            rt.buf_push_bytes(&(*s).path, p, ln)
+        } else {
+            (*s).have_link = true
+            rt.buf_clear(&(*s).link)
+            rt.buf_push_bytes(&(*s).link, p, ln)
+        }
+    }
+    ts_skip(s, round512(sz as u64) - sz as u64)
+}
+
+// the file in DATA is complete
+fn ts_file_done(s: *mut TarStream) {
+    let rel: str = ts_view(&(*s).cur_rel, 0, rt.buf_len(&(*s).cur_rel))
+    safefs.sf_finish_file(&(*s).w, rel, (*s).fd, (*s).cur_mode, (*s).cur_mtime, (*s).opts.keep_times)
+    (*s).fd = 0 - 1
+    (*s).stats.files = (*s).stats.files + 1
+    (*s).stats.bytes = (*s).stats.bytes + (*s).cur_size
+    ts_skip(s, round512((*s).cur_size) - (*s).cur_size)
+}
+
+// a complete 512 octet header sits in `hdr`
+fn ts_header(s: *mut TarStream) {
+    let h: u64 = rt.buf_ptr(&(*s).hdr)
+    if block_is_zero(h) {
+        (*s).state = TS_DONE
+        return
+    }
+    let want: i64 = num_field(h, 148, 8)
+    if want < 0 || (header_sum(h, false) != want && header_sum(h, true) != want) {
+        if (*s).nentries == 0 && (*s).consumed == 512 {
+            ts_fail(s, ArchiveError::NotArchive)
+        } else {
+            ts_fail(s, ArchiveError::Checksum)
+        }
+        return
+    }
+    let typ: u8 = rt.ld8(h, 156)
+    var sz: i64 = num_field(h, 124, 12)
+    if sz < 0 {
+        ts_fail(s, ArchiveError::Corrupt)
+        return
+    }
+    if typ == 120 as u8 || typ == 103 as u8 || typ == 76 as u8 || typ == 75 as u8 {
+        if sz as u64 > 1048576 {
+            ts_fail(s, ArchiveError::TooLarge)
+            return
+        }
+        (*s).meta_typ = typ
+        (*s).meta_size = sz as u64
+        rt.buf_clear(&(*s).hdr)
+        if sz == 0 {
+            ts_meta_done(s)
+        } else {
+            (*s).state = TS_META
+            (*s).want = sz as usize
+        }
+        return
+    }
+    if typ == 83 as u8 {
+        ts_fail(s, ArchiveError::Unsupported)
+        return
+    }
+    var kind: u32 = TAR_OTHER
+    if typ == 48 as u8 || typ == 0 as u8 || typ == 55 as u8 {
+        kind = TAR_FILE
+    } else if typ == 53 as u8 {
+        kind = TAR_DIR
+    } else if typ == 50 as u8 {
+        kind = TAR_SYMLINK
+    } else if typ == 49 as u8 {
+        kind = TAR_HARDLINK
+    }
+    if (*s).have_size {
+        if (*s).size > 4611686018427387904 {
+            ts_fail(s, ArchiveError::Corrupt)
+            return
+        }
+        sz = (*s).size as i64
+    }
+    var has_data: bool = false
+    if kind == TAR_FILE || kind == TAR_OTHER {
+        has_data = true
+    } else {
+        sz = 0
+    }
+    if (*s).nentries >= (*s).lim.max_entries {
+        ts_fail(s, ArchiveError::TooLarge)
+        return
+    }
+    if kind == TAR_FILE {
+        if sz as u64 > (*s).lim.max_entry_size {
+            ts_fail(s, ArchiveError::TooLarge)
+            return
+        }
+        (*s).total = (*s).total + sz as u64
+        if (*s).total > (*s).lim.max_total_size {
+            ts_fail(s, ArchiveError::TooLarge)
+            return
+        }
+    }
+    let mode: i64 = num_field(h, 100, 8)
+    if mode < 0 {
+        ts_fail(s, ArchiveError::Corrupt)
+        return
+    }
+    var mt: i64 = num_field(h, 136, 12)
+    if mt < 0 {
+        mt = 0
+    }
+    if (*s).have_mtime {
+        mt = (*s).mtime
+    }
+    // the name
+    rt.buf_clear(&(*s).scratch)
+    if (*s).have_path {
+        if rt.buf_len(&(*s).path) > 4096 {
+            ts_fail(s, ArchiveError::TooLarge)
+            return
+        }
+        rt.buf_push_bytes(&(*s).scratch, rt.buf_ptr(&(*s).path), rt.buf_len(&(*s).path))
+    } else {
+        var pf: usize = 0
+        let posix: bool = rt.ld8(h, 257) == 117 as u8 && rt.ld8(h, 258) == 115 as u8
+        && rt.ld8(h, 259) == 116 as u8 && rt.ld8(h, 260) == 97 as u8
+        && rt.ld8(h, 261) == 114 as u8 && rt.ld8(h, 262) == 0 as u8
+        if posix {
+            pf = field_len(h, 345, 155)
+        }
+        if pf > 0 {
+            rt.buf_push_bytes(&(*s).scratch, h + 345, pf)
+            rt.buf_push(&(*s).scratch, 47 as u8)
+        }
+        rt.buf_push_bytes(&(*s).scratch, h, field_len(h, 0, 100))
+    }
+    // the link target
+    rt.buf_clear(&(*s).scratch2)
+    if kind == TAR_SYMLINK || kind == TAR_HARDLINK {
+        if (*s).have_link {
+            if rt.buf_len(&(*s).link) > 4096 {
+                ts_fail(s, ArchiveError::TooLarge)
+                return
+            }
+            rt.buf_push_bytes(&(*s).scratch2, rt.buf_ptr(&(*s).link), rt.buf_len(&(*s).link))
+        } else {
+            rt.buf_push_bytes(&(*s).scratch2, h + 157, field_len(h, 157, 100))
+        }
+    }
+    (*s).nentries = (*s).nentries + 1
+    let emode: u32 = (mode as u64 & 4095) as u32
+    ts_pending_reset(s)
+    rt.buf_clear(&(*s).hdr)
+    (*s).want = 512
+    let windows: bool = osinfo.is_windows()
+    let rel: str = safefs.sf_strip(safefs.sf_clean(ts_view(&(*s).scratch, 0, rt.buf_len(&(*s).scratch))), (*s).opts.strip)
+    let relt: str = safefs.sf_trim_slash(rel)
+    if relt.length() == 0 {
+        // nothing to extract (the archive root "./" or fully stripped)
+        if has_data {
+            ts_skip(s, round512(sz as u64))
+        } else {
+            ts_skip(s, 0)
+        }
+        return
+    }
+    if kind == TAR_OTHER {
+        ts_fail(s, ArchiveError::UnsafeType)
+        return
+    }
+    if !safefs.sf_name_ok(rel, windows) {
+        ts_fail(s, ArchiveError::UnsafeName)
+        return
+    }
+    let hsh: u64 = safefs.sf_hash_name(rel, windows)
+    if map_has[u64, u64](&(*s).names, hsh) {
+        let other: usize = map_get[u64, u64](&(*s).names, hsh) as usize - 1
+        if safefs.sf_names_equal(ts_seen_name(s, other), rel, windows) {
+            ts_fail(s, ArchiveError::Duplicate)
+            return
+        }
+    }
+    let link: str = ts_view(&(*s).scratch2, 0, rt.buf_len(&(*s).scratch2))
+    if kind == TAR_SYMLINK {
+        if !safefs.sf_link_ok(link, safefs.sf_depth(rel), windows) {
+            ts_fail(s, ArchiveError::UnsafeLink)
+            return
+        }
+    }
+    var target: usize = 0
+    var lrel: str = ""
+    if kind == TAR_HARDLINK {
+        lrel = safefs.sf_strip(safefs.sf_clean(link), (*s).opts.strip)
+        if !safefs.sf_name_ok(lrel, windows) {
+            ts_fail(s, ArchiveError::BadLink)
+            return
+        }
+        let lh: u64 = safefs.sf_hash_name(lrel, windows)
+        if !map_has[u64, u64](&(*s).files, lh) {
+            ts_fail(s, ArchiveError::BadLink)
+            return
+        }
+        target = map_get[u64, u64](&(*s).files, lh) as usize - 1
+        if !safefs.sf_names_equal(ts_seen_name(s, target), lrel, windows) {
+            ts_fail(s, ArchiveError::BadLink)
+            return
+        }
+    }
+    // the entry is acceptable: remember it, then write it
+    let idx: usize = ts_seen_add(s, rel, kind, emode, mt)
+    if !map_has[u64, u64](&(*s).names, hsh) {
+        map_set[u64, u64](&(*s).names, hsh, idx as u64)
+    }
+    var bad: bool = false
+    var why: ArchiveError = ArchiveError::Io
+    var err: u32 = 0
+    if kind == TAR_DIR {
+        let ok: bool = safefs.sf_make_dir(&(*s).w, relt, emode) catch | ae | (note_ae(ae, &why, &err))
+        (*s).stats.dirs = (*s).stats.dirs + 1
+        ts_skip(s, 0)
+    } else if kind == TAR_SYMLINK {
+        let ok: bool = safefs.sf_make_symlink(&(*s).w, relt, link, (*s).opts.overwrite) catch | ae | (note_ae(ae, &why, &err))
+        (*s).stats.links = (*s).stats.links + 1
+        ts_skip(s, 0)
+    } else if kind == TAR_HARDLINK {
+        // a hard link is written as a copy of the earlier file
+        let trel: str = safefs.sf_trim_slash(ts_seen_name(s, target))
+        var copy: rt.Buf = rt.buf_new()
+        if !safefs.sf_read_back(&(*s).w, trel, &copy) {
+            err = 1 as u32
+            why = ArchiveError::BadLink
+        } else {
+            let tm: u32 = (*vec_elem_ptr[StreamName](&(*s).seen, target)).mode
+            let ok: bool = safefs.sf_write_file(&(*s).w, relt, rt.buf_ptr(&copy), rt.buf_len(&copy), tm, (*s).opts.overwrite) catch | ae | (note_ae(ae, &why, &err))
+            if err == 0 {
+                (*s).stats.files = (*s).stats.files + 1
+                (*s).stats.bytes = (*s).stats.bytes + rt.buf_len(&copy) as u64
+                map_set[u64, u64](&(*s).files, hsh, idx as u64)
+            }
+        }
+        rt.buf_free(&copy)
+        ts_skip(s, 0)
+    } else {
+        let fd: i64 = safefs.sf_open_file(&(*s).w, relt, emode, (*s).opts.overwrite) catch | ae | (note_fd(ae, &why, &err))
+        if err == 0 {
+            map_set[u64, u64](&(*s).files, hsh, idx as u64)
+            (*s).fd = fd
+            rt.buf_clear(&(*s).cur_rel)
+            rt.buf_push_bytes(&(*s).cur_rel, relt.p as u64, relt.length())
+            (*s).cur_mode = emode
+            (*s).cur_mtime = mt
+            (*s).cur_size = sz as u64
+            (*s).state = TS_DATA
+            (*s).left = sz as u64
+            if sz == 0 {
+                ts_file_done(s)
+            }
+        }
+    }
+    if err != 0 {
+        ts_fail(s, why)
+    }
+}
+
+fn note_fd(e: ArchiveError, why: *mut ArchiveError, err: *mut u32) -> i64 {
+    *why = e
+    *err = 1 as u32
+    return 0 - 1
+}
+
+// Pushes `n` octets at `p` into the extraction. `true` = fine so far.
+// After an error every further call answers the same error.
+fn tar_stream_feed(s: *mut TarStream, p: u64, n: usize) -> ArchiveError!bool {
+    if (*s).err {
+        return (*s).why
+    }
+    if (*s).consumed + n as u64 > (*s).lim.max_archive_size as u64 && (*s).state != TS_DONE {
+        ts_fail(s, ArchiveError::TooLarge)
+        return (*s).why
+    }
+    var off: usize = 0
+    while off < n && !(*s).err && (*s).state != TS_DONE {
+        let avail: usize = n - off
+        if (*s).state == TS_DATA {
+            var take: usize = avail
+            if (take as u64) > (*s).left {
+                take = (*s).left as usize
+            }
+            var bad: bool = false
+            var why: ArchiveError = ArchiveError::Io
+            fs.write_fd_all((*s).fd, p + off as u64, take) catch | er | (note_mk(er, &why, &bad))
+            if bad {
+                ts_fail(s, why)
+            } else {
+                (*s).left = (*s).left - take as u64
+                off = off + take
+                (*s).consumed = (*s).consumed + take as u64
+                if (*s).left == 0 {
+                    ts_file_done(s)
+                }
+            }
+        } else if (*s).state == TS_SKIP {
+            var take: usize = avail
+            if (take as u64) > (*s).left {
+                take = (*s).left as usize
+            }
+            (*s).left = (*s).left - take as u64
+            off = off + take
+            (*s).consumed = (*s).consumed + take as u64
+            if (*s).left == 0 {
+                ts_skip(s, 0)
+            }
+        } else {
+            let have: usize = rt.buf_len(&(*s).hdr)
+            var take: usize = (*s).want - have
+            if take > avail {
+                take = avail
+            }
+            rt.buf_push_bytes(&(*s).hdr, p + off as u64, take)
+            off = off + take
+            (*s).consumed = (*s).consumed + take as u64
+            if rt.buf_len(&(*s).hdr) == (*s).want {
+                if (*s).state == TS_HEADER {
+                    ts_header(s)
+                } else {
+                    ts_meta_done(s)
+                    rt.buf_clear(&(*s).hdr)
+                }
+            }
+        }
+    }
+    if (*s).err {
+        return (*s).why
+    }
+    return true
+}
+
+// The end of the input. Fails (`Truncated`) when it came in the middle of
+// an entry; an archive without its zero blocks, ended at an entry
+// boundary, is fine. Sets the directory modes/times last (see
+// `tar_extract_all`). The answer is the statistics.
+fn tar_stream_finish(s: *mut TarStream) -> ArchiveError!safefs.ExtractStats {
+    if (*s).err {
+        return (*s).why
+    }
+    let clean: bool = (*s).state == TS_DONE || ((*s).state == TS_HEADER && rt.buf_len(&(*s).hdr) == 0)
+    if !clean {
+        if (*s).nentries == 0 && (*s).consumed < 512 {
+            return ArchiveError::NotArchive
+        }
+        return ArchiveError::Truncated
+    }
+    if (*s).nentries == 0 && (*s).consumed == 0 {
+        return ArchiveError::NotArchive
+    }
+    if (*s).opts.keep_times || (*s).opts.exact_dir_modes {
+        var d: usize = vec_len[StreamName](&(*s).seen)
+        while d > 0 {
+            d = d - 1
+            let de: *mut StreamName = vec_elem_ptr[StreamName](&(*s).seen, d)
+            if (*de).kind == TAR_DIR {
+                let drel: str = safefs.sf_trim_slash(ts_view(&(*s).seen_names, (*de).off, (*de).len))
+                if drel.length() > 0 {
+                    safefs.sf_set_dir_meta(&(*s).w, drel, (*de).mode, (*de).mtime, (*s).opts.exact_dir_modes, (*s).opts.keep_times)
+                }
+            }
+        }
+    }
+    return (*s).stats
+}
+
+// Reads the open descriptor `fd` (a file, a pipe, a socket) to its end in
+// 64 KiB pieces and extracts it into `dest`. Does not close `fd`.
+fn tar_extract_stream(fd: i64, dest: str, opts: safefs.ExtractOptions, lim: TarLimits) -> ArchiveError!safefs.ExtractStats {
+    var s: TarStream = try tar_stream_new(dest, opts, lim)
+    var chunk: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&chunk, 65536)
+    var bad: bool = false
+    var why: ArchiveError = ArchiveError::Io
+    var done: bool = false
+    while !done {
+        let got: usize = fs.read_fd(fd, rt.buf_ptr(&chunk), 65536) catch | er | (note_n_fs(er, &why, &bad))
+        if bad {
+            break
+        }
+        if got == 0 {
+            done = true
+        } else {
+            tar_stream_feed(&s, rt.buf_ptr(&chunk), got) catch | ae | (note_bad_ae(ae, &why, &bad))
+            if bad {
+                break
+            }
+        }
+    }
+    rt.buf_free(&chunk)
+    if bad {
+        tar_stream_free(&s)
+        return why
+    }
+    let st: safefs.ExtractStats = tar_stream_finish(&s) catch | ae | (note_stats(ae, &why, &bad))
+    tar_stream_free(&s)
+    if bad {
+        return why
+    }
+    return st
+}
+
+// Like `tar_extract_stream`, from a file path.
+fn tar_extract_stream_file(path: str, dest: str, opts: safefs.ExtractOptions, lim: TarLimits) -> ArchiveError!safefs.ExtractStats {
+    var bad: bool = false
+    var why: ArchiveError = ArchiveError::Io
+    let fd: i64 = fs.open_read(path) catch | er | (note_fd_fs(er, &why, &bad))
+    if bad {
+        return why
+    }
+    let st: safefs.ExtractStats = tar_extract_stream(fd, dest, opts, lim) catch | ae | (note_stats(ae, &why, &bad))
+    fs.close_fd(fd)
+    if bad {
+        return why
+    }
+    return st
+}
+
+fn note_n_fs(e: FsError, why: *mut ArchiveError, bad: *mut bool) -> usize {
+    *why = safefs.sf_fs_error(e)
+    *bad = true
+    return 0
+}
+
+fn note_fd_fs(e: FsError, why: *mut ArchiveError, bad: *mut bool) -> i64 {
+    *why = safefs.sf_fs_error(e)
+    *bad = true
+    return 0 - 1
+}
+
+fn note_bad_ae(e: ArchiveError, why: *mut ArchiveError, bad: *mut bool) -> bool {
+    *why = e
+    *bad = true
+    return false
+}
+
+fn note_stats(e: ArchiveError, why: *mut ArchiveError, bad: *mut bool) -> safefs.ExtractStats {
+    *why = e
+    *bad = true
+    return safefs.ExtractStats { files: 0, dirs: 0, links: 0, bytes: 0 }
 }
 
 // ------------------------------------------------------------ writing
