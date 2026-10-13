@@ -38,6 +38,10 @@ for lvl in dev-fast release-safe release-fast; do
     [ "$(probe 'l.se_gc_probe(3)')" = "1600 0 0" ] && echo "ok  GC on 4 threads in .so, ctypes ($lvl)" || { echo "FAIL GC probe in .so (ctypes)"; rc=1; }
     gcc -O1 -fstack-protector-all -pthread -o "$D/hostrt" tools/stack_e/host_rt.c -ldl || { echo "FAIL gcc host_rt"; rc=1; continue; }
     timeout 120 "$D/hostrt" "$D/librt.so" | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL host_rt ($lvl)"; rc=1; }
+    # G1b: several host threads call into the .so (thread_attach / thread_host_detach), C and ctypes
+    gcc -O1 -fstack-protector-all -pthread -o "$D/hostatt" tools/stack_e/host_attach.c -ldl || { echo "FAIL gcc host_attach"; rc=1; continue; }
+    timeout 120 "$D/hostatt" "$D/librt.so" | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL host_attach C ($lvl)"; rc=1; }
+    timeout 120 python3 -I tools/stack_e/host_attach.py "$D/librt.so" || { echo "FAIL host_attach ctypes ($lvl)"; rc=1; }
 done
 # the new v128 intrinsics, all stages
 for st in "--opt-level=dev-fast" "--opt-level=release-safe" "--opt-level=release-fast" "--opt-level=release-fast --asm-intern"; do
