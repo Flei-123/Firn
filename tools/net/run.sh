@@ -28,7 +28,15 @@
 set -uo pipefail
 set +m
 cd "$(dirname "$0")/../.."
-FIRNC=compiler/target/release/firnc
+FIRNC=${FIRNC:-compiler/target/release/firnc}
+# r96: under systemd (no tty, minimal PATH) this script used to die without a
+# word. Say what is missing, and never exit silently.
+echo "tools/net/run.sh: start (pid $$, firnc $FIRNC)"
+PATH="$PATH:/usr/bin:/bin:/usr/local/bin"
+for tool in nc curl md5sum timeout awk stat; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "RESULT net: FAIL  missing tool: $tool"; exit 2; }
+done
+[ -x "$FIRNC" ] || { echo "RESULT net: FAIL  compiler not found: $FIRNC"; exit 2; }
 W=$(mktemp -d /tmp/firn-net.XXXXXX)
 trap 'rm -rf "$W"; jobs -p | xargs -r kill 2>/dev/null' EXIT
 ERRORS=0

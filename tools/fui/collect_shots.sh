@@ -32,7 +32,7 @@ fi
 mkdir -p "$ZIEL"
 
 # The table: <delivered name without .png>:<painted name without .png>
-TAFEL="
+BOARD="
 01-wave1-grundelemente-hell:fui-wave1-light
 02-wave1-grundelemente-dunkel:fui-wave1-dark
 03-wave2-widgets-hell:fui-wave2-light
@@ -62,7 +62,7 @@ TAFEL="
 "
 
 n=0
-for e in $TAFEL; do
+for e in $BOARD; do
     ziel="${e%%:*}"
     quelle="${e#*:}"
     if [ ! -r "$Z/$quelle.png" ]; then

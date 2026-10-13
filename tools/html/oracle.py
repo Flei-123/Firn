@@ -24,7 +24,7 @@ import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-FAELLE = os.path.join(ROOT, "tools", "html", "cases")
+CASES = os.path.join(ROOT, "tools", "html", "cases")
 GAPS = os.path.join(ROOT, "tools", "html", "gaps")
 
 NS = {
@@ -72,7 +72,7 @@ def load_dat(path):
 
 
 def serialisiere(dom):
-    zeilen = []
+    rows = []
 
     def attr_name(a):
         if a.namespaceURI in ATTR_NS:
@@ -83,24 +83,24 @@ def serialisiere(dom):
         pre = "| " + "  " * depth
         t = n.nodeType
         if t == n.ELEMENT_NODE:
-            praefix = NS.get(n.namespaceURI, "")
-            zeilen.append("%s<%s%s>" % (pre, praefix, n.localName or n.tagName))
+            prefix = NS.get(n.namespaceURI, "")
+            rows.append("%s<%s%s>" % (pre, prefix, n.localName or n.tagName))
             attrs = []
             if n.attributes:
                 for i in range(n.attributes.length):
                     a = n.attributes.item(i)
                     attrs.append((attr_name(a), a.value))
-            for name, wert in sorted(attrs):
-                zeilen.append('| %s%s="%s"' % ("  " * (depth + 1), name, wert))
+            for name, val in sorted(attrs):
+                rows.append('| %s%s="%s"' % ("  " * (depth + 1), name, val))
         elif t == n.TEXT_NODE:
-            zeilen.append('%s"%s"' % (pre, n.data))
+            rows.append('%s"%s"' % (pre, n.data))
         elif t == n.COMMENT_NODE:
-            zeilen.append("%s<!-- %s -->" % (pre, n.data))
+            rows.append("%s<!-- %s -->" % (pre, n.data))
         elif t == n.DOCUMENT_TYPE_NODE:
             s = "%s<!DOCTYPE %s" % (pre, n.name or "")
             if n.publicId or n.systemId:
                 s += ' "%s" "%s"' % (n.publicId or "", n.systemId or "")
-            zeilen.append(s + ">")
+            rows.append(s + ">")
         for k in merged(n.childNodes):
             walk(k, depth + 1)
 
@@ -119,10 +119,10 @@ def serialisiere(dom):
 
     for k in merged(dom.childNodes):
         walk(k, 0)
-    return "\n".join(zeilen)
+    return "\n".join(rows)
 
 
-def referenz(data, context=None):
+def reference(data, context=None):
     import html5lib
     from html5lib.treebuilders import getTreeBuilder
 
@@ -135,20 +135,20 @@ def referenz(data, context=None):
 
 
 def main():
-    files = sys.argv[1:] or (sorted(glob.glob(os.path.join(FAELLE, "*.dat")))
+    files = sys.argv[1:] or (sorted(glob.glob(os.path.join(CASES, "*.dat")))
                                + sorted(glob.glob(os.path.join(GAPS, "*.dat"))))
     ges = 0
-    schlecht = 0
+    bad = 0
     nachlaeufer = 0
     for path in files:
         for i, (data, expected, known, context) in enumerate(load_dat(path)):
             ges += 1
-            got = referenz(data, context)
+            got = reference(data, context)
             if got != expected and known:
                 nachlaeufer += 1
                 continue
             if got != expected:
-                schlecht += 1
+                bad += 1
                 print("DEVIATION %s #%d  input=%r" % (os.path.basename(path), i, data))
                 print("--- meine Erwartung ---")
                 print(expected)
@@ -158,8 +158,8 @@ def main():
     print("%d cases checked, %d deviations from html5lib 1.1 "
           "(%d known: html5lib 1.1 follows an older version of the "
           "standard there, noted with '#oracle-deviation')"
-          % (ges, schlecht, nachlaeufer))
-    return 1 if schlecht else 0
+          % (ges, bad, nachlaeufer))
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":

@@ -2135,18 +2135,6 @@ else
     grep -E 'FAIL' "$WORK/gpuext.log" | head -12 | sed 's/^/   /' || true
 fi
 
-echo "== 122. lib/gpu building blocks: gl_ext/gl_prog/gl_tex/gl_fbo/gl_query on llvmpipe + gpu.cull vs brute force (tools/gpu/ext/run.sh, docs/GPU.md) =="
-# Shader program + uniform cache + UBO + instancing + multi indirect + timer queries + mipmaps/aniso/atlas bleed + MRT/MSAA; CPU culling
-# (frustum, far origin, Hi-Z occlusion) against sampled references. Mesa llvmpipe only; no libEGL is SKIP for the GL half.
-FIRNC="$FIRNC" bash tools/gpu/ext/run.sh > "$WORK/gpuext.log" 2>&1 && GXRC=0 || GXRC=$?
-if [ "$GXRC" -eq 0 ]; then
-    ok
-    grep -E '^   (ok|SKIP)|metric' "$WORK/gpuext.log" | sed 's/^/ /'
-else
-    bad "tools/gpu/ext/run.sh failed (see .test-work/gpuext.log)"
-    grep -E 'FAIL' "$WORK/gpuext.log" | head -12 | sed 's/^/   /' || true
-fi
-
 echo "== 121. mc_audio: Minecraft listener/sources/blocks/categories/packets on audio.engine (tools/mc/audio/run.sh, docs/mc/audio.md) =="
 # Pan, attenuation, Minecraft gain and pan law bit for bit against numpy float32 (3 stages), then tests/2766_mc_audio.fi through the real engine.
 FIRNC="$FIRNC" bash tools/mc/audio/run.sh > "$WORK/mcaudio.log" 2>&1 && MARC=0 || MARC=$?
@@ -2183,6 +2171,23 @@ if [ "$F138RC" -eq 0 ]; then
 else
     bad "tools/frame/check.sh failed (see .test-work/frame138.log)"
     grep -E 'FAIL|BAD|crash' "$WORK/frame138.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 139. wasm: the same programs native and as WebAssembly under node, text form via wat2wasm, dispatch fallback, collector soak (tools/wasm/run.sh, r93) =="
+# Long (every tests/*.fi, tests/opt/*.fi, examples/*.fi, 4 build levels); run it as its own stage/etappe.
+# SKIP (ok) without node or wat2wasm.
+if command -v node >/dev/null 2>&1 && command -v wat2wasm >/dev/null 2>&1; then
+    FIRNC="$FIRNC" bash tools/wasm/run.sh > "$WORK/wasm139.log" 2>&1 && W139RC=0 || W139RC=$?
+    if [ "$W139RC" -eq 0 ]; then
+        ok
+        tail -n 6 "$WORK/wasm139.log" | sed 's/^/   /'
+    else
+        bad "tools/wasm/run.sh failed (see .test-work/wasm139.log)"
+        grep -E 'DIFFERENT|NATIVE|FAIL' "$WORK/wasm139.log" | head -12 | sed 's/^/   /' || true
+    fi
+else
+    ok
+    echo "   SKIP (node or wat2wasm missing)"
 fi
 
 TOTAL=$((PASS + FAIL))

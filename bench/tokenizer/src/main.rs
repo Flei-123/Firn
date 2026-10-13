@@ -1,26 +1,26 @@
-//! Messlatte fuer den HTML5-Tokenizer aus `lib/html/` (in Firn).
+//! Benchmark bar for the HTML5 tokenizer from `lib/html/` (in Firn).
 //!
-//! GETRENNT VOM COMPILER: dieses Verzeichnis ist ein eigenes Cargo-Projekt und
-//! niemals eine Abhaengigkeit von `compiler/`. Es dient allein dazu, denselben
-//! Eingabekorpus mit `html5ever` zu tokenisieren und die Zeit zu messen.
+//! SEPARATE FROM THE COMPILER: this directory is its own Cargo project and
+//! never a dependency of `compiler/`. Its only purpose is to tokenize the same
+//! input corpus with `html5ever` and to measure the time.
 //!
 //!     cargo build --release --manifest-path bench/tokenizer/Cargo.toml
 //!     bench/tokenizer/target/release/html5ever_bench .tokenizer-work/korpus.html
 //!
-//! Ausgabe: eine Zeile `tokens=<n> bytes=<n> sekunden=<x.xxx>`.
-//! `tools/tokenizer/throughput.sh` ruft das Binary automatisch auf, sobald es
-//! gebaut ist, und stellt die MB/s neben die des Firn-Tokenizers.
+//! Output: one line `tokens=<n> bytes=<n> sekunden=<x.xxx>`.
+//! `tools/tokenizer/throughput.sh` calls the binary automatically as soon as it
+//! is built and puts its MB/s next to those of the Firn tokenizer.
 //!
-//! Vergleichbarkeit — ehrlich benannt:
-//!   * Beide Seiten lesen DENSELBEN Korpus (.tokenizer-work/korpus.html).
-//!   * Beide Seiten laufen die volle Zustandsmaschine inkl. Zeichenreferenzen.
-//!   * html5ever bekommt den Text als `StrTendril` (UTF-8), der Firn-Tokenizer
-//!     dekodiert WTF-8 selbst nach Codepunkten — dieser Schritt gehoert bei
-//!     ihm zur gemessenen Zeit.
-//!   * Der Firn-Treiber schreibt zusaetzlich html5lib-JSON auf die Ausgabe;
-//!     diese Senke zaehlt hier nur die Token. Die gemessene Firn-Zeit enthaelt
-//!     also Arbeit, die html5ever nicht leistet — der ausgewiesene Faktor ist
-//!     fuer Firn eher zu SCHLECHT als zu guenstig gerechnet.
+//! Comparability — honestly stated:
+//!   * Both sides read the SAME corpus (.tokenizer-work/korpus.html).
+//!   * Both sides run the full state machine incl. character references.
+//!   * html5ever gets the text as `StrTendril` (UTF-8), the Firn tokenizer
+//!     decodes WTF-8 itself into code points -- this step is part of
+//!     its measured time.
+//!   * The Firn driver additionally writes html5lib JSON to the output;
+//!     this sink only counts the tokens here. The measured Firn time therefore contains
+//!     work that html5ever does not do -- the reported factor is
+//!     computed more BAD than favourable for Firn.
 
 use std::time::Instant;
 
@@ -29,7 +29,7 @@ use html5ever::tokenizer::{
     BufferQueue, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
 };
 
-/// Zaehlt Token — das Gegenstueck zur Ausgabesenke des Firn-Tokenizers.
+/// Counts tokens -- the counterpart of the Firn tokenizer's output sink.
 struct Counter {
     tokens: u64,
     chars: u64,

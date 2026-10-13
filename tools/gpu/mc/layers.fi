@@ -1,0 +1,349 @@
+// tools/gpu/mc/layers.fi -- GL texture array with ~1100 layers (mc_texext tile ids 64 + i), the driver layer limit, defrag with
+// unequal section sizes, mip / anisotropy image test (r99 / r63). llvmpipe = software rasterizer, NOT a GPU.
+//   exit 0 = all ok, 3 = a check failed, 4 = no GL context. Prints `check ...` lines.
+import std.rt
+import std.io
+import std.math
+import std.time
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import gpu.gl33
+import gpu.gl_mc
+
+const W: i32 = 240
+const H: i32 = 135
+
+fn tile_rgba(t: u32) -> u32 {
+    return mc_texture.pack_pixel(((t * 37 as u32) & 255 as u32), ((t * 91 as u32 + 40 as u32) & 255 as u32), ((t * 53 as u32 + 90 as u32) & 255 as u32), 255 as u32)
+}
+
+// cols x rows atlas, tile `ts` px; tile t (1-based) is one flat unique colour, except `checker` (1-px black / white)
+fn make_atlas(ts: i32, cols: i32, rows: i32, checker: u32) -> mc_texture.Atlas {
+    var a: mc_texture.Atlas = mc_texture.atlas_new(ts, cols, rows)
+    var t: u32 = 1 as u32
+    let n: u32 = (cols * rows) as u32
+    while t <= n {
+        let ox: i32 = mc_texture.atlas_tile_x(&a, t)
+        let oy: i32 = mc_texture.atlas_tile_y(&a, t)
+        var y: i32 = 0
+        while y < ts {
+            var x: i32 = 0
+            while x < ts {
+                var c: u32 = tile_rgba(t)
+                if t == checker {
+                    if ((x + y) & 1) == 0 { c = 0xFFFFFFFF as u32 } else { c = 0xFF000000 as u32 }
+                }
+                rt.st32(a.px, ((oy + y) * a.w + ox + x) as usize, c)
+                x = x + 1
+            }
+            y = y + 1
+        }
+        t = t + 1 as u32
+    }
+    mc_texture.atlas_build_avg(&a)
+    return a
+}
+
+fn vw0(x: u32, y: u32, z: u32, face: u32, ao: u32) -> u32 {
+    return x | (y << 8 as u32) | (z << 16 as u32) | (face << 24 as u32) | (ao << 27 as u32)
+}
+
+fn vw1(tile: u32, u: u32, v: u32) -> u32 {
+    return tile | (u << 14 as u32) | (v << 19 as u32) | (15 as u32 << 24 as u32)
+}
+
+fn put_vtx(vp: u64, i: usize, w0: u32, w1: u32) {
+    rt.st32(vp, i * 2, w0)
+    rt.st32(vp, i * 2 + 1, w1)
+}
+
+// quad k of a mesh: centre xc, rows y0..y1, depth z, tile, uv repeats `rep`
+fn put_quad(vp: u64, ip: u64, k: usize, xc: u32, y0: u32, y1: u32, z: u32, tile: u32, rep: u32) {
+    let b: usize = k * 4
+    put_vtx(vp, b, vw0(xc + 1 as u32, y0, z, 3 as u32, 0 as u32), vw1(tile, 0 as u32, rep))
+    put_vtx(vp, b + 1, vw0(xc - 1 as u32, y0, z, 3 as u32, 0 as u32), vw1(tile, rep, rep))
+    put_vtx(vp, b + 2, vw0(xc - 1 as u32, y1, z, 3 as u32, 0 as u32), vw1(tile, rep, 0 as u32))
+    put_vtx(vp, b + 3, vw0(xc + 1 as u32, y1, z, 3 as u32, 0 as u32), vw1(tile, 0 as u32, 0 as u32))
+    let i: usize = k * 6
+    let ob: u32 = b as u32
+    rt.st32(ip, i, ob)
+    rt.st32(ip, i + 1, ob + 1 as u32)
+    rt.st32(ip, i + 2, ob + 2 as u32)
+    rt.st32(ip, i + 3, ob)
+    rt.st32(ip, i + 4, ob + 2 as u32)
+    rt.st32(ip, i + 5, ob + 3 as u32)
+}
+
+fn fnv(px: u64, n: usize) -> u64 {
+    var h: u64 = 7 as u64
+    var i: usize = 0
+    while i < n {
+        h = (h * 131 as u64 + (rt.ld8(px, i) as u64) + 1 as u64) % 4294967291 as u64
+        i = i + 1
+    }
+    return h
+}
+
+fn lum(p: u32) -> f64 {
+    return (((p & 255 as u32) + ((p >> 8 as u32) & 255 as u32) + ((p >> 16 as u32) & 255 as u32)) as f64) / 3.0
+}
+
+// stddev of the luminance of the covered (non clear) pixels
+fn lum_std(px: u64, n: usize, clear: u32) -> f64 {
+    var s: f64 = 0.0
+    var s2: f64 = 0.0
+    var c: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let p: u32 = rt.ld32(px, i)
+        if p != clear {
+            let l: f64 = lum(p)
+            s = s + l
+            s2 = s2 + l * l
+            c = c + 1.0
+        }
+        i = i + 1
+    }
+    if c < 1.0 { return 0.0 }
+    let m: f64 = s / c
+    return math.sqrt(s2 / c - m * m)
+}
+
+fn ck(name: str, ok: bool, fails: *mut i32) {
+    io.print("check ")
+    io.print(name)
+    if ok {
+        io.print(" ok\n")
+    } else {
+        io.print(" FAIL\n")
+        *fails = *fails + 1
+    }
+}
+
+// five quads with tile ids `t0..t4` through CPU and GL; true when the frames agree (flat colours: coverage + pixel max diff <= 2
+// away from the quad edges is not needed, we compare the colour at each quad centre)
+fn layer_scene(ts: i32, cols: i32, rows: i32, label: str, fails: *mut i32) {
+    let clear: u32 = 0xFFE6BE96 as u32
+    var at: mc_texture.Atlas = make_atlas(ts, cols, rows, 0 as u32)
+    let total: u32 = (cols * rows) as u32
+    var gb: gl_mc.GlBackend = gl_mc.glbe_open(W, H)
+    var r: mc_raster.Raster = mc_raster.raster_new(W, H)
+    var bc: mc_backend.Backend = mc_backend.backend_cpu(&r)
+    var bg: mc_backend.Backend = gl_mc.glbe_backend(&gb)
+    let t0: u64 = time.monotonic_ns()
+    bg.upload_atlas(bg.obj, (&at) as u64)
+    gl33.gl_finish(gl_mc.glbe_gl(&gb))
+    let up_us: u64 = (time.monotonic_ns() - t0) / (1000 as u64)
+    bc.upload_atlas(bc.obj, (&at) as u64)
+    let vp: u64 = rt.heap_alloc(20 * 8)
+    let ip: u64 = rt.heap_alloc(30 * 4)
+    var tiles: [u32; 5] = [1 as u32, 64 as u32, 500 as u32, 1100 as u32, total]
+    var k: usize = 0
+    while k < 5 {
+        put_quad(vp, ip, k, (2 + 3 * k) as u32, 5 as u32, 11 as u32, 10 as u32, tiles[k], 1 as u32)
+        k = k + 1
+    }
+    var cam: mc_camera.Camera = mc_camera.camera_new(W, H)
+    mc_camera.camera_set_pos(&cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&cam, 0.0, 0.0)
+    mc_camera.camera_update(&cam)
+    let hc: usize = bc.mesh_upload(bc.obj, 1, vp, 20, ip, 30)
+    let hg: usize = bg.mesh_upload(bg.obj, 1, vp, 20, ip, 30)
+    bc.begin(bc.obj, (&cam) as u64, clear)
+    bc.draw(bc.obj, hc, 0.0, 0.0, 0.0)
+    bc.end(bc.obj)
+    bg.begin(bg.obj, (&cam) as u64, clear)
+    bg.draw(bg.obj, hg, 0.0, 0.0, 0.0)
+    bg.end(bg.obj)
+    let pc: u64 = bc.present(bc.obj)
+    let pg: u64 = bg.present(bg.obj)
+    // the five quads are separated by 1-block gaps: along the middle row there are 5 runs of covered pixels (left to right on
+    // screen = quad 4 .. 0, x grows to the left); compare the GL pixel at the middle of each run with the CPU pixel
+    var same: i32 = 0
+    var seen: i32 = 0
+    var runs: i32 = 0
+    var x: usize = 0
+    var start_x: usize = 0
+    var inrun: bool = false
+    var prev: u32 = 0 as u32
+    let row: usize = ((H / 2) as usize) * (W as usize)
+    while x <= (W as usize) {
+        var cov: bool = false
+        if x < (W as usize) { cov = rt.ld32(pc, row + x) != clear }
+        if cov && !inrun {
+            inrun = true
+            start_x = x
+        }
+        if !cov && inrun {
+            inrun = false
+            runs = runs + 1
+            let mid: usize = (start_x + x) / 2
+            let a: u32 = rt.ld32(pg, row + mid)
+            let c: u32 = rt.ld32(pc, row + mid)
+            var md: u32 = 0 as u32
+            var kb: u32 = 0 as u32
+            while kb < 24 as u32 {
+                let ba: i32 = ((a >> kb) & 255 as u32) as i32
+                let bb: i32 = ((c >> kb) & 255 as u32) as i32
+                var d: i32 = ba - bb
+                if d < 0 { d = 0 - d }
+                if (d as u32) > md { md = d as u32 }
+                kb = kb + 8 as u32
+            }
+            if md <= 2 as u32 && a != clear { same = same + 1 }
+            if a != clear && a != prev { seen = seen + 1 }
+            prev = a
+        }
+        x = x + 1
+    }
+    io.print("metric layers ")
+    io.print(label)
+    io.fmt_print(f" layers={total} tile_px={ts} max_layers={gl_mc.glbe_max_layers(&gb)} layers_lost={gl_mc.glbe_layers_lost(&gb)} upload_us={up_us} runs={runs} distinct_runs_gpu={seen} same_as_cpu={same}/5 gl_error={gl33.gl_get_error(gl_mc.glbe_gl(&gb))}\n")
+    var lost: i32 = gl_mc.glbe_layers_lost(&gb)
+    ck(label, (lost == 0 && same == 5 && runs == 5) || (lost > 0 && same >= 4 && runs == 5), fails)
+    bg.mesh_free(bg.obj, hg)
+    gl_mc.glbe_close(&gb)
+    mc_texture.atlas_free(&at)
+}
+
+// n quads mesh (varied size): section k of a world has `1 + k % 7` x 4 quads, drawn on a grid; the checksum of the frame must not
+// change when the pool is compacted
+fn defrag_test(fails: *mut i32) {
+    let clear: u32 = 0xFFE6BE96 as u32
+    var at: mc_texture.Atlas = make_atlas(16, 16, 4, 0 as u32)
+    var cks: [u64; 3] = [0 as u64; 3]
+    var frag0: usize = 0
+    var frag1: usize = 0
+    var moved: usize = 0
+    var mode_i: usize = 0
+    while mode_i < 3 {
+        var gb: gl_mc.GlBackend = gl_mc.glbe_open(W, H)
+        // 0 = legacy reference, 1 = multi small pages without defrag, 2 = multi small pages + defrag
+        if mode_i == 0 { gl_mc.glbe_set_mode(&gb, gl_mc.MODE_LEGACY) } else { gl_mc.glbe_set_mode(&gb, gl_mc.MODE_MULTI) }
+        if mode_i > 0 { gl_mc.glbe_set_page_verts(&gb, 2048) }
+        var b: mc_backend.Backend = gl_mc.glbe_backend(&gb)
+        b.upload_atlas(b.obj, (&at) as u64)
+        var hs: [usize; 24] = [0; 24]
+        var live: [bool; 24] = [false; 24]
+        var k: usize = 0
+        while k < 24 {
+            let nq: usize = (1 + k % 7) * 4
+            let vp: u64 = rt.heap_alloc(nq * 4 * 8)
+            let ip: u64 = rt.heap_alloc(nq * 6 * 4)
+            var q: usize = 0
+            while q < nq {
+                put_quad(vp, ip, q, (2 + (q % 4) * 4) as u32, (1 + (q / 4) * 2) as u32, (2 + (q / 4) * 2) as u32, 4 as u32, (1 + (k * 3 + q) % 60) as u32, 1 as u32)
+                q = q + 1
+            }
+            hs[k] = b.mesh_upload(b.obj, k as u64, vp, nq * 4, ip, nq * 6)
+            live[k] = true
+            rt.heap_free(vp, nq * 4 * 8)
+            rt.heap_free(ip, nq * 6 * 4)
+            k = k + 1
+        }
+        // free every second + every third section, then upload 6 new (different sizes) into the holes
+        k = 0
+        while k < 24 {
+            if k % 2 == 1 || k % 3 == 0 {
+                b.mesh_free(b.obj, hs[k])
+                live[k] = false
+            }
+            k = k + 1
+        }
+        if mode_i > 0 { frag0 = gl_mc.glbe_pool_frag_permille(&gb) }
+        if mode_i == 2 { moved = gl_mc.glbe_defrag(&gb, 1) }
+        if mode_i > 0 { frag1 = gl_mc.glbe_pool_frag_permille(&gb) }
+        var cam: mc_camera.Camera = mc_camera.camera_new(W, H)
+        mc_camera.camera_set_pos(&cam, 8.0, 8.0, 0.0 - 6.0)
+        mc_camera.camera_set_angles(&cam, 0.0, 0.0)
+        mc_camera.camera_update(&cam)
+        var f: usize = 0
+        while f < 3 {
+            b.begin(b.obj, (&cam) as u64, clear)
+            k = 0
+            while k < 24 {
+                if live[k] { b.draw(b.obj, hs[k], ((k % 6) * 0) as f64, 0.0, 0.0) }
+                k = k + 1
+            }
+            b.end(b.obj)
+            f = f + 1
+        }
+        cks[mode_i] = fnv(b.present(b.obj), (W as usize) * (H as usize) * 4)
+        gl_mc.glbe_close(&gb)
+        mode_i = mode_i + 1
+    }
+    io.fmt_print(f"metric defrag unequal_sections=24 frag_before_permille={frag0} frag_after_permille={frag1} pages_rebuilt={moved} sum_legacy={cks[0]} sum_multi={cks[1]} sum_defrag={cks[2]}\n")
+    ck("defrag_unequal_same_pixels", cks[0] != 0 as u64 && cks[0] == cks[1] && cks[1] == cks[2], fails)
+    mc_texture.atlas_free(&at)
+}
+
+// 1-px checker tile on a quad seen at a flat angle: nearest = noisy, mip (+ aniso) = smooth. Metric: stddev of the luminance
+fn filter_test(fails: *mut i32) {
+    let clear: u32 = 0xFFE6BE96 as u32
+    var at: mc_texture.Atlas = make_atlas(16, 4, 4, 2 as u32)
+    var gb: gl_mc.GlBackend = gl_mc.glbe_open(W, H)
+    var b: mc_backend.Backend = gl_mc.glbe_backend(&gb)
+    b.upload_atlas(b.obj, (&at) as u64)
+    let vp: u64 = rt.heap_alloc(4 * 8)
+    let ip: u64 = rt.heap_alloc(6 * 4)
+    // floor quad: lies flat (y = 1), receding in z: use face 2 (bottom/top) vertices x 0..16, z 2..60 is out of 8 bit: use 0..16 repeated 8x
+    put_vtx(vp, 0, vw0(16 as u32, 1 as u32, 4 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 0 as u32, 0 as u32))
+    put_vtx(vp, 1, vw0(0 as u32, 1 as u32, 4 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 16 as u32, 0 as u32))
+    put_vtx(vp, 2, vw0(0 as u32, 1 as u32, 16 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 16 as u32, 16 as u32))
+    put_vtx(vp, 3, vw0(16 as u32, 1 as u32, 16 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 0 as u32, 16 as u32))
+    rt.st32(ip, 0, 0 as u32)
+    rt.st32(ip, 1, 1 as u32)
+    rt.st32(ip, 2, 2 as u32)
+    rt.st32(ip, 3, 0 as u32)
+    rt.st32(ip, 4, 2 as u32)
+    rt.st32(ip, 5, 3 as u32)
+    let h: usize = b.mesh_upload(b.obj, 1, vp, 4, ip, 6)
+    var cam: mc_camera.Camera = mc_camera.camera_new(W, H)
+    mc_camera.camera_set_pos(&cam, 8.0, 7.0, 2.0)
+    mc_camera.camera_set_angles(&cam, 0.0, 50.0)
+    mc_camera.camera_update(&cam)
+    var stds: [f64; 3] = [0.0; 3]
+    var v: usize = 0
+    while v < 3 {
+        if v == 0 { gl_mc.glbe_set_filter(&gb, false, 1.0) }
+        if v == 1 { gl_mc.glbe_set_filter(&gb, true, 1.0) }
+        if v == 2 { gl_mc.glbe_set_filter(&gb, true, 8.0) }
+        b.begin(b.obj, (&cam) as u64, clear)
+        b.draw(b.obj, h, 0.0, 0.0, 0.0)
+        b.end(b.obj)
+        stds[v] = lum_std(b.present(b.obj), (W as usize) * (H as usize), clear)
+        v = v + 1
+    }
+    io.print("metric filter checker_luma_std nearest=")
+    io.fmt_print(f"{(stds[0] * 10.0) as i64}")
+    io.fmt_print(f"/10 mip={(stds[1] * 10.0) as i64}/10 mip_aniso8={(stds[2] * 10.0) as i64}/10\n")
+    ck("mip_smoother_than_nearest", stds[0] > 40.0 && stds[1] < stds[0] * 0.8, fails)
+    ck("aniso_not_worse_than_mip", stds[2] <= stds[1] + 5.0, fails)
+    gl_mc.glbe_close(&gb)
+    mc_texture.atlas_free(&at)
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var probe: gl_mc.GlBackend = gl_mc.glbe_open(W, H)
+    if !probe.ok {
+        io.fmt_print(f"no GL context: step={probe.step}\n")
+        return 4
+    }
+    io.print("renderer: ")
+    io.print_c(gl_mc.glbe_renderer(&probe))
+    io.new_line()
+    io.fmt_print(f"metric limits GL_MAX_ARRAY_TEXTURE_LAYERS={gl33.gl_get_int(gl_mc.glbe_gl(&probe), 0x88FF as u32)} GL_MAX_TEXTURE_SIZE={gl33.gl_get_int(gl_mc.glbe_gl(&probe), 0x0D33 as u32)}\n")
+    gl_mc.glbe_close(&probe)
+    var fails: i32 = 0
+    layer_scene(16, 32, 35, "ext_1120_tile16", &fails)
+    layer_scene(64, 32, 35, "ext_1120_tile64", &fails)
+    layer_scene(4, 64, 70, "over_limit_4480_tile4", &fails)
+    defrag_test(&fails)
+    filter_test(&fails)
+    if fails > 0 { return 3 }
+    io.print("layers: all ok\n")
+    return 0
+}
