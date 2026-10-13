@@ -107,6 +107,9 @@ thread_local! {
     /// library (`.so`). Default OFF — the path for programmes and for
     /// Osum stays character for character the one it was.
     static PIC: Cell<bool> = const { Cell::new(false) };
+    /// `--shared`: the output is a shared object; a program without `fn main`
+    /// is fine (the exports are the entry points).
+    static SHARED: Cell<bool> = const { Cell::new(false) };
     /// FIRN r64: the program runs as an Android app. On x86_64 that
     /// changes the SYSTEM CALLS: Android's seccomp filter for apps kills a
     /// process on the legacy calls bionic itself never makes (measured in
@@ -173,6 +176,16 @@ pub fn android() -> bool {
 /// interfaces and of the function values.
 pub fn pic_set(on: bool) {
     PIC.with(|p| p.set(on));
+}
+
+/// `--shared`: build a shared object (see `main.rs::link_shared`).
+pub fn shared_set(on: bool) {
+    SHARED.with(|p| p.set(on));
+}
+
+/// Is a shared object being built?
+pub fn shared() -> bool {
+    SHARED.with(|p| p.get())
 }
 
 /// Is this compilation position independent?
@@ -266,6 +279,7 @@ pub fn align(bytes: u64) -> String {
 pub fn reset() {
     ACTIVE.with(|a| a.set(Target::X86_64));
     PIC.with(|p| p.set(false));
+    SHARED.with(|p| p.set(false));
     ANDROID.with(|a| a.set(false));
     WINDOWS.with(|w| w.set(false));
 }

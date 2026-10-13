@@ -1658,7 +1658,28 @@ impl<'a> Lower<'a> {
                 out.push(self.push(FTy::I64, Op::Cast { src: v, from: ft }));
             }
         }
+        self.retarget_thread_base(&mut out);
         Some(out)
+    }
+
+    /// In a shared object the thread block lives behind `gs`, not `fs` (see
+    /// `thread::use_gs`): `arch_prctl(ARCH_SET_FS, p)` with constant operands
+    /// becomes `arch_prctl(ARCH_SET_GS, p)`. Anything else is left alone.
+    fn retarget_thread_base(&mut self, args: &mut [Val]) {
+        if args.len() < 3 || !crate::thread::use_gs() {
+            return;
+        }
+        let const_val = |me: &Self, v: Val| -> Option<i128> {
+            me.f.blocks[me.cur as usize]
+                .insts
+                .iter()
+                .rev()
+                .find(|i| i.dst == Some(v))
+                .and_then(|i| if let Op::Const(c) = i.op { Some(c) } else { None })
+        };
+        if const_val(self, args[0]) == Some(158) && const_val(self, args[1]) == Some(crate::thread::ARCH_SET_FS as i128) {
+            args[1] = self.constant(FTy::I64, crate::thread::ARCH_SET_GS as i128);
+        }
     }
 
     // ---- statements ----------------------------------------------------

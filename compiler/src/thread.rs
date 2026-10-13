@@ -411,7 +411,33 @@ pub(crate) fn cas_sequence(e: &mut crate::codegen_x86::Emitter) {
 /// The instruction sequence for `Op::ThreadSelf`: the self pointer out of
 /// the thread block. Precondition: none. Postcondition: `rax` = thread block.
 pub(crate) fn self_sequence(e: &mut crate::codegen_x86::Emitter) {
-    e.line("mov rax, qword ptr fs:0");
+    if use_gs() {
+        e.line("mov rax, qword ptr gs:0");
+    } else {
+        e.line("mov rax, qword ptr fs:0");
+    }
+}
+
+/// `arch_prctl` request numbers of the two segment bases.
+pub(crate) const ARCH_SET_GS: i64 = 0x1001;
+pub(crate) const ARCH_SET_FS: i64 = 0x1002;
+
+/// Does this compilation keep its thread block behind `gs` instead of `fs`?
+///
+/// Yes for a position independent x86-64 Linux build (`--pic`, i.e. a shared
+/// object): `fs` belongs to the HOST. glibc keeps its own TCB there (stack
+/// protector canary at `fs:0x28`, `errno`, locale ...), so
+/// `arch_prctl(ARCH_SET_FS, ...)` from inside a `.so` destroyed the host
+/// the moment the first thread was started. `gs` is not used by glibc on
+/// x86-64 Linux, so the runtime may own it. Executables (no `--pic`) keep
+/// `fs`: the byte-for-byte code of every normal program stays as it was.
+/// Windows (TEB slot), Android (bionic owns `fs` too, but its own seam
+/// rewrites the call) and aarch64 (`tpidr_el0`) are not affected.
+pub(crate) fn use_gs() -> bool {
+    crate::target::pic()
+        && !crate::target::windows()
+        && !crate::target::android()
+        && matches!(crate::target::active(), crate::target::Target::X86_64)
 }
 
 #[cfg(test)]

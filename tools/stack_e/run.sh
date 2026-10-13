@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tools/stack_e/run.sh -- gate 134: Firn shared object with C ABI (graphics stack way E, step 1).
-# firnc --pic -c -> ld -shared -> dlopen from C and ctypes from Python.
+# firnc --shared (one command) -> dlopen from C and ctypes from Python; --header=<file> -> C header check;
+# G1: the Firn runtime (threads, GC, jobs) works INSIDE the .so (thread block behind gs, never the host's fs).
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}
@@ -9,28 +10,35 @@ D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
 export FIRNLIB="$(pwd)/lib"
 rc=0
 for lvl in dev-fast release-safe release-fast; do
-    "$FIRNC" --pic --opt-level=$lvl -c -o "$D/lib_e.o" tools/stack_e/lib_e.fi || { echo "FAIL compile $lvl"; rc=1; continue; }
-    printf '{ global: se_*; local: *; };\n' > "$D/exp.ver"
-    ld -shared -Bsymbolic --version-script="$D/exp.ver" -z noexecstack -soname libfirne.so -o "$D/libfirne.so" "$D/lib_e.o" || { echo "FAIL link $lvl"; rc=1; continue; }
+    "$FIRNC" --shared --header="$D/lib_e.h" --opt-level=$lvl -o "$D/libfirne.so" tools/stack_e/lib_e.fi || { echo "FAIL --shared $lvl"; rc=1; continue; }
+    [ -e "$D/libfirne.o" ] || [ -e "$D/libfirne.ver" ] && { echo "FAIL $lvl: --shared left temp files"; rc=1; }
+    nm -D --defined-only "$D/libfirne.so" | grep -qv ' se_' && { echo "FAIL $lvl: non-se_ symbol exported"; rc=1; }
+    gcc -std=c11 -Wall -Werror -fsyntax-only -I"$D" tools/stack_e/hdr_check.c || { echo "FAIL $lvl: generated header does not compile"; rc=1; }
     readelf -d "$D/libfirne.so" | grep -q TEXTREL && { echo "FAIL $lvl: TEXTREL"; rc=1; }
     gcc -O1 -o "$D/host" tools/stack_e/host.c -ldl -lm || { echo "FAIL gcc"; rc=1; continue; }
     echo "== $lvl"
     "$D/host" "$D/libfirne.so" || rc=1
     python3 -I tools/stack_e/host.py "$D/libfirne.so" || rc=1
 done
-# runtime inside a .so: heap + jobs without workers must work; jobs WITH workers is a KNOWN GAP (fs:0 TLS clash with glibc)
-"$FIRNC" --pic --opt-level=release-safe -c -o "$D/lib_rt.o" tools/stack_e/lib_rt.fi \
-  && ld -shared -Bsymbolic --version-script="$D/exp.ver" -z noexecstack -soname librt.so -o "$D/librt.so" "$D/lib_rt.o" || { echo "FAIL lib_rt build"; rc=1; }
+# runtime inside a .so: heap, jobs with and without workers, GC on several threads -- from C (with host threads of its own) and ctypes
+printf '{ global: se_*; local: *; };\n' > "$D/exp.ver"
 probe() { # $1 = call expression
     python3 -I -c "
 import ctypes as C
-l=C.CDLL('$D/librt.so'); l.se_heap_probe.restype=C.c_uint64; l.se_jobs_probe.restype=C.c_uint64
+l=C.CDLL('$D/librt.so'); l.se_heap_probe.restype=C.c_uint64; l.se_jobs_probe.restype=C.c_uint64; l.se_gc_probe.restype=C.c_uint64
 buf=(C.c_uint32*8192)(); r=$1; print(r, buf[100], buf[4095])" 2>&1
 }
-[ "$(probe 'l.se_heap_probe(1000)')" = "499500 0 0" ] && echo "ok  heap_alloc in .so" || { echo "FAIL heap_alloc in .so"; rc=1; }
-[ "$(probe 'l.se_jobs_probe(buf,4096,0)')" = "4096 300 12285" ] && echo "ok  jobs.parallel_for, 0 workers, in .so" || { echo "FAIL jobs 0 workers in .so"; rc=1; }
-if [ "$(probe 'l.se_jobs_probe(buf,4096,3)')" = "4096 300 12285" ]; then echo "GAP CLOSED: jobs with workers works in a .so -- update docs/GRAPHICS-STACK-E-REQUIREMENTS.md"
-else echo "known gap G1: jobs with workers in a .so corrupts the host (Firn TLS fs:0 vs glibc TCB)"; fi
+for lvl in dev-fast release-safe release-fast; do
+    "$FIRNC" --shared --opt-level=$lvl -o "$D/librt.so" tools/stack_e/lib_rt.fi || { echo "FAIL lib_rt --shared $lvl"; rc=1; continue; }
+    objdump -d "$D/librt.so" | grep -q '%fs:' && { echo "FAIL $lvl: .so still reads the host's fs"; rc=1; }
+    [ "$(probe 'l.se_heap_probe(1000)')" = "499500 0 0" ] && echo "ok  heap_alloc in .so ($lvl)" || { echo "FAIL heap_alloc in .so"; rc=1; }
+    [ "$(probe 'l.se_jobs_probe(buf,4096,0)')" = "4096 300 12285" ] && echo "ok  jobs.parallel_for, 0 workers, in .so ($lvl)" || { echo "FAIL jobs 0 workers in .so"; rc=1; }
+    if [ "$(probe 'l.se_jobs_probe(buf,4096,3)')" = "4096 300 12285" ]; then echo "GAP CLOSED: jobs with 3 workers == 0 workers in a .so, ctypes ($lvl)"
+    else echo "FAIL G1: jobs with workers in a .so breaks the host ($lvl)"; rc=1; fi
+    [ "$(probe 'l.se_gc_probe(3)')" = "1600 0 0" ] && echo "ok  GC on 4 threads in .so, ctypes ($lvl)" || { echo "FAIL GC probe in .so (ctypes)"; rc=1; }
+    gcc -O1 -fstack-protector-all -pthread -o "$D/hostrt" tools/stack_e/host_rt.c -ldl || { echo "FAIL gcc host_rt"; rc=1; continue; }
+    timeout 120 "$D/hostrt" "$D/librt.so" | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL host_rt ($lvl)"; rc=1; }
+done
 # the new v128 intrinsics, all stages
 for st in "--opt-level=dev-fast" "--opt-level=release-safe" "--opt-level=release-fast" "--opt-level=release-fast --asm-intern"; do
     "$FIRNC" $st -o "$D/t2860" tests/2860_simd_minmax.fi 2> "$D/err" && "$D/t2860" && echo "ok  tests/2860 $st" || { echo "FAIL tests/2860 $st"; head -3 "$D/err"; rc=1; }

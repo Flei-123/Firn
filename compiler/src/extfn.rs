@@ -45,6 +45,7 @@
 //! symbol** becomes the bare Firn name instead of `_F0.name` — so `gcc`
 //! can call it. `codegen_x86.rs::label()` asks `is_exported` for that.
 
+use crate::ast::{StructDecl, TypeExpr};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -57,9 +58,26 @@ thread_local! {
     static LIBS: RefCell<Vec<String>> = RefCell::new(Vec::new());
 }
 
+/// One `#[export_c]` function as the C header needs it.
+#[derive(Clone)]
+struct ExportSig {
+    c_name: String,
+    params: Vec<(String, TypeExpr, u8)>,
+    ret: Option<TypeExpr>,
+}
+
+thread_local! {
+    /// exported signatures, in source order (for `--header` / `--shared`)
+    static SIGS: RefCell<Vec<ExportSig>> = RefCell::new(Vec::new());
+    /// every struct declaration of the program, by source name
+    static STRUCTS: RefCell<HashMap<String, StructDecl>> = RefCell::new(HashMap::new());
+}
+
 /// Only for self tests, which compile several programs in ONE process.
 #[cfg(test)]
 pub(crate) fn reset() {
+    SIGS.with(|e| e.borrow_mut().clear());
+    STRUCTS.with(|e| e.borrow_mut().clear());
     EXTERNS.with(|e| e.borrow_mut().clear());
     EXPORTED.with(|e| e.borrow_mut().clear());
     LIBS.with(|e| e.borrow_mut().clear());
@@ -120,6 +138,12 @@ pub fn export_link_name(name: &str) -> Option<String> {
 /// has already happened in `modules.rs::build_program`, which runs before
 /// `sema::check` at all).
 pub fn register(prog: &crate::ast::Program) {
+    STRUCTS.with(|m| {
+        let mut m = m.borrow_mut();
+        for st in &prog.structs {
+            m.insert(source_name(&st.name), st.clone());
+        }
+    });
     for f in &prog.funcs {
         for a in f.attrs.iter().filter(|a| a.name == "link_lib") {
             if let Some(l) = a.args.first() {
@@ -136,6 +160,13 @@ pub fn register(prog: &crate::ast::Program) {
             mark_extern(&f.name, &link);
         } else if f.attrs.iter().any(|a| a.name == "export_c") {
             mark_exported(&f.name, &source_name(&f.name));
+            SIGS.with(|v| {
+                v.borrow_mut().push(ExportSig {
+                    c_name: source_name(&f.name),
+                    params: f.params.iter().map(|p| (p.name.clone(), p.ty.clone(), p.refk)).collect(),
+                    ret: f.ret.clone(),
+                })
+            });
         }
         // ROUND CERTUS-WINDOWS: a function Windows is allowed to call back.
         // The arity is recorded here because the thunk cannot be written
@@ -144,6 +175,120 @@ pub fn register(prog: &crate::ast::Program) {
             crate::win::mark_callback(&f.name, f.params.len() as u32);
         }
     }
+}
+
+/// The export symbols of this compilation, in source order (`--shared`
+/// builds the linker version script from them).
+pub fn export_names() -> Vec<String> {
+    SIGS.with(|v| v.borrow().iter().map(|s| s.c_name.clone()).collect())
+}
+
+/// C spelling of a Firn scalar type name, `None` if it is not one.
+fn c_scalar(n: &str) -> Option<&'static str> {
+    Some(match n {
+        "i8" => "int8_t",
+        "i16" => "int16_t",
+        "i32" => "int32_t",
+        "i64" => "int64_t",
+        "u8" => "uint8_t",
+        "u16" => "uint16_t",
+        "u32" => "uint32_t",
+        "u64" => "uint64_t",
+        "usize" => "size_t",
+        "isize" => "ptrdiff_t",
+        "bool" => "bool",
+        "f32" => "float",
+        "f64" => "double",
+        "v128" => "firn_v128",
+        _ => return None,
+    })
+}
+
+/// C spelling of a type; struct names met on the way land in `need`.
+fn c_type(t: &TypeExpr, need: &mut Vec<String>) -> String {
+    match t {
+        TypeExpr::Named(n, _) => {
+            if let Some(c) = c_scalar(n) {
+                return c.to_string();
+            }
+            let n = source_name(n);
+            if !need.contains(&n) {
+                need.push(n.clone());
+            }
+            n
+        }
+        TypeExpr::Ptr { mutable, inner, .. } => {
+            let i = match &**inner {
+                TypeExpr::Named(n, _) if c_scalar(n).is_none() && !STRUCTS.with(|m| m.borrow().contains_key(&source_name(n))) => {
+                    "void".to_string()
+                }
+                other => c_type(other, need),
+            };
+            if *mutable { format!("{}*", i) } else { format!("const {}*", i) }
+        }
+        // an array parameter decays; function values are records, C sees an address
+        TypeExpr::Array { elem, .. } => format!("{}*", c_type(elem, need)),
+        TypeExpr::Fn { .. } | TypeExpr::Tuple(..) => "void*".to_string(),
+    }
+}
+
+fn emit_struct(name: &str, done: &mut Vec<String>, out: &mut String) {
+    if done.iter().any(|d| d == name) {
+        return;
+    }
+    done.push(name.to_string());
+    let Some(sd) = STRUCTS.with(|m| m.borrow().get(name).cloned()) else {
+        return;
+    };
+    let mut need = Vec::new();
+    let mut lines = String::new();
+    for (fname, fty, _) in &sd.fields {
+        match fty {
+            TypeExpr::Array { elem, len, .. } => {
+                lines.push_str(&format!("    {} {}[{}];\n", c_type(elem, &mut need), fname, len))
+            }
+            other => lines.push_str(&format!("    {} {};\n", c_type(other, &mut need), fname)),
+        }
+    }
+    for n in need {
+        // pointers to a struct only need the tag; by value needs the body. Emit the body first (a cycle is cut by `done`).
+        emit_struct(&n, done, out);
+    }
+    out.push_str(&format!("typedef struct {} {{\n{}}} {};\n\n", name, lines, name));
+}
+
+/// The C header for every `#[export_c]` function: scalar types from
+/// `<stdint.h>`, structs as plain C structs (Firn lays fields out like C),
+/// function values and tuples as `void*`. `guard` is the include guard.
+pub fn header_text(guard: &str) -> String {
+    let sigs = SIGS.with(|v| v.borrow().clone());
+    let mut need = Vec::new();
+    let mut protos = String::new();
+    for s in &sigs {
+        let ret = match &s.ret {
+            Some(t) => c_type(t, &mut need),
+            None => "void".to_string(),
+        };
+        let mut ps: Vec<String> = Vec::new();
+        for (n, t, refk) in &s.params {
+            let ty = c_type(t, &mut need);
+            let ty = if *refk == 1 { format!("{}*", ty) } else { ty };
+            ps.push(format!("{} {}", ty, n));
+        }
+        let args = if ps.is_empty() { "void".to_string() } else { ps.join(", ") };
+        protos.push_str(&format!("{} {}({});\n", ret, s.c_name, args));
+    }
+    let mut structs = String::new();
+    let mut done = Vec::new();
+    for n in need {
+        emit_struct(&n, &mut done, &mut structs);
+    }
+    format!(
+        "/* C header written by the Firn compiler with --header; regenerate it, never edit it. */\n#ifndef {g}\n#define {g}\n\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n\n#ifdef __cplusplus\nextern \"C\" {{\n#endif\n\ntypedef float firn_v128 __attribute__((vector_size(16)));\n\n{s}{p}\n#ifdef __cplusplus\n}}\n#endif\n\n#endif /* {g} */\n",
+        g = guard,
+        s = structs,
+        p = protos
+    )
 }
 
 /// Strips a module rewrite (`modules.rs`: `module__name`) back to the bare
@@ -187,6 +332,17 @@ mod tests {
         mark_exported("firn_add", "firn_add");
         assert_eq!(export_link_name("firn_add"), Some("firn_add".to_string()));
         assert_eq!(extern_link_name("firn_add"), None);
+    }
+
+    #[test]
+    fn header_maps_scalars_and_pointers() {
+        reset();
+        let mut need = Vec::new();
+        let u = TypeExpr::Named("u32".into(), crate::diag::Span::none());
+        assert_eq!(c_type(&u, &mut need), "uint32_t");
+        let p = TypeExpr::Ptr { mutable: false, inner: Box::new(u), span: crate::diag::Span::none() };
+        assert_eq!(c_type(&p, &mut need), "const uint32_t*");
+        assert!(need.is_empty());
     }
 
     #[test]

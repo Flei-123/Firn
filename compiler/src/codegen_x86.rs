@@ -344,6 +344,8 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // a linker script pulls in — `_start`, setting up `rsp` and the
     // `exit` system call would be wrong there.
     let freestanding = crate::prof::is_kernel();
+    // `--shared` without a `fn main`: no `_start` (nothing would call `main`).
+    let no_start = crate::target::shared() && !m.funcs.iter().any(|f| f.name == "main");
     // ROUND WINDOWS: the entry point is a different one. The loader hands
     // over no stack block, `exit` is not a system call, and the standard
     // handles have to be fetched before anything can report an error --
@@ -361,7 +363,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
             &label("main"),
         ));
     }
-    if !freestanding && !crate::target::windows() {
+    if !freestanding && !no_start && !crate::target::windows() {
     e.raw(".globl _start");
     e.raw("_start:");
     e.line("xor rbp, rbp");
@@ -410,7 +412,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     e.line("hlt");
     }
 
-    if !freestanding && !m.funcs.iter().any(|f| f.name == "main") {
+    if !freestanding && !no_start && !m.funcs.iter().any(|f| f.name == "main") {
         return Err("no entry point: 'fn main() -> i32' is missing".to_string());
     }
 
