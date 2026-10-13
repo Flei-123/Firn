@@ -78,3 +78,14 @@ on the curve (`ecdsa.point_valid`).
 * `tools/dns/run.sh`: fake DNS in Python (server log counted), the real network, https by name against a hermetic
   Python TLS server with counter-checks, `piston-meta.mojang.com` / `api.modrinth.com` / GitHub against curl, then
   the Windows build under Wine.
+
+## IPv6 name servers (round Y, 13.10.2026)
+
+* `nameserver ::1` / `2001:db8::53` lines in resolv.conf are kept (file order, duplicates dropped, max 4):
+  `dns_parse_resolv_conf_all`. `resolver_add_server6(r, ptr16)` adds one by hand; `dns_main -s '[::1]:5353'`
+  (brackets with a port, or a bare `::1`).
+* UDP over `AF_INET6` (`net.udp`: `udp6_open/bind/sendto/recvfrom`) and the TC fallback over `net.connect6`.
+  The sender check compares all 16 octets and the port.
+* Proof: `tests/2868_dns_resolv6.fi` (parser), `tools/dns/check6.py` (fake DNS on `[::1]`: A, AAAA, CNAME chain,
+  TC -> TCP, NXDOMAIN, SERVFAIL, silent -> Timeout). LOOPBACK ONLY: no real IPv6 route, no real IPv6 resolver tried.
+* Not done: zone ids, Windows (the seam has no tested v6 datagram path), EDNS0, search list.

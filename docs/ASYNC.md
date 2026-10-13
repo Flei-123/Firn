@@ -189,3 +189,14 @@ bash tools/async/winkit.sh [out.zip]     # the kit for a Windows machine (needs 
 
 `test.sh` section 77 runs the first; tests 2120-2125 are in section 3 (every
 build level; 2122 takes 17 s of the `--no-opt` level).
+
+## EV_RDHUP and EV_ET (round Y, 13.10.2026)
+
+* `EV_RDHUP` (EPOLLRDHUP / POLLRDHUP, 0x2000): ask for it in `watch_add(.., EV_READ | EV_RDHUP, ..)`; a peer
+  `shutdown(WR)` or `close()` is then reported as READ + RDHUP at once, both backends. Without it the loop only
+  sees the read that returns 0.
+* `EV_ET` (EPOLLET): edge triggered, epoll backend only. The poll backend masks the bit away and stays level
+  (check `is_epoll`). With ET the callback must drain until EAGAIN.
+* `tests/2867_async_epoll_flags.fi`; `tools/net/epoll.sh` diffs its output against Python `select.epoll` /
+  `select.poll` (12 lines, 3 build stages). Loopback TCP only.
+* Capturing closures as callbacks: `async.fnpin` keeps the closure record alive (see docs/CLOSURES.md).

@@ -4,11 +4,12 @@
 
 Written in Python with `struct` and nothing else: it shares no code and no
 reading of RFC 1035 with lib/net/dns.fi, which is the point of using it.
-UDP and TCP on 127.0.0.1, the port is printed as `port N` on the first line.
+UDP and TCP on 127.0.0.1 (argument `6`: on [::1]), the port is printed as `port N` on the first line.
 
 Behaviour by name (all under `.test`):
 
   plain.test      A 192.0.2.1 ttl 60
+  dual.test       A 192.0.2.7, AAAA 2001:db8::7 (ttl 60)
   chain.test      CNAME mid.test -> end.test (A 192.0.2.2), compressed names
   big.test        UDP: TC, no records.  TCP: eleven A records
   hermetic.test   A 127.0.0.1               (the https test)
@@ -33,7 +34,9 @@ A = {
     'hermetic.test': ['127.0.0.1'],
     'other.test': ['127.0.0.1'],
     'counted.test': ['192.0.2.9'],
+    'dual.test': ['192.0.2.7'],
 }
+AAAA = {'dual.test': ['2001:db8::7']}
 CNAMES = {'chain.test': 'mid.test', 'mid.test': 'end.test'}
 BIG = ['192.0.2.%d' % (100 + i) for i in range(11)]
 
@@ -99,6 +102,9 @@ def answer(req, tcp):
         if qtype == 1:
             for a in A[name]:
                 rrs.append(b'\xc0\x0c' + struct.pack('>HHIH', 1, 1, 60, 4) + socket.inet_aton(a))
+        elif qtype == 28:
+            for a in AAAA.get(name, []):
+                rrs.append(b'\xc0\x0c' + struct.pack('>HHIH', 28, 1, 60, 16) + socket.inet_pton(socket.AF_INET6, a))
     else:
         rcode = 3
     hdr = struct.pack('>HHHHHH', ident, fl | rcode, 1, len(rrs), 0, 0)
@@ -140,13 +146,23 @@ class ThreadedTCP(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
 
 
+class ThreadedUDP6(ThreadedUDP):
+    address_family = socket.AF_INET6
+
+
+class ThreadedTCP6(ThreadedTCP):
+    address_family = socket.AF_INET6
+
+
 def main():
     port = 0
+    v6 = len(sys.argv) > 1 and sys.argv[1] == '6'  # "6": listen on [::1] instead
+    host, TcpCls, UdpCls = ('::1', ThreadedTCP6, ThreadedUDP6) if v6 else ('127.0.0.1', ThreadedTCP, ThreadedUDP)
     for _ in range(100):
-        tcp = ThreadedTCP(('127.0.0.1', 0), TCP)
+        tcp = TcpCls((host, 0), TCP)
         port = tcp.server_address[1]
         try:
-            udp = ThreadedUDP(('127.0.0.1', port), UDP)
+            udp = UdpCls((host, port), UDP)
             break
         except OSError:
             tcp.server_close()

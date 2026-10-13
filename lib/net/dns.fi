@@ -44,9 +44,11 @@
 //
 // ---------------------------------------------------------------- HONEST
 //
-// D1  IPv4 TRANSPORT ONLY. AAAA records are PARSED and handed back
-//     (`Resolved.addr6`, `dns_resolve(.., T_AAAA, ..)`), but the queries
-//     travel over IPv4 and std.net cannot dial an IPv6 address anyway.
+// D1  IPv6 NAME SERVERS WORK (Linux): `nameserver ::1` in resolv.conf and
+//     `resolver_add_server6` queries over a v6 socket, UDP and the TCP
+//     fallback. Loopback tested only (tools/dns/check6.py), no zone ids
+//     (fe80::1%eth0 is skipped), Windows seam untested. AAAA records are
+//     parsed and handed back (`Resolved.addr6`, `dns_resolve(.., T_AAAA, ..)`).
 // D2  NO DNSSEC, NO DoT/DoH, NO EDNS0. Without EDNS the classic limit of
 //     512 octets applies and a bigger answer arrives with TC, which the
 //     TCP fallback then fetches -- slower, not wrong. What protects
@@ -76,6 +78,7 @@ import std.rt
 import std.net
 import std.crypto.random
 import net.udp
+import net.ip6
 import net.dnsconf
 
 export {
@@ -89,7 +92,8 @@ export {
     resolved_new,
     dns_resolve, dns_resolve_a, dns_lookup_a, dns_err_num, dns_err_name,
     dns_build_query, dns_parse_reply, reply_new, dns_name_valid,
-    dns_parse_ipv4, dns_parse_resolv_conf, dns_hosts_lookup,
+    dns_parse_ipv4, dns_parse_resolv_conf, dns_parse_resolv_conf_all, dns_hosts_lookup,
+    resolver_add_server6, resolver_server_is_v6,
     T_A, T_CNAME, T_AAAA, T_SRV,
     SrvSet, srvset_new, dns_resolve_srv, srv_target,
     VIA_NUMERIC, VIA_LOCALHOST, VIA_HOSTS, VIA_CACHE, VIA_UDP, VIA_TCP,
@@ -708,6 +712,77 @@ fn dns_parse_resolv_conf(p: u64, n: usize, out: *mut [u32; 4]) -> usize {
     return found
 }
 
+// Like `dns_parse_resolv_conf` but keeps IPv6 name servers too, in file
+// order: `v4[i]` / `v6[i*16 ..]` and `fam[i]` (4 or 6). A zone id
+// (fe80::1%eth0) is refused, such a line is skipped. Max 4 servers.
+fn dns_parse_resolv_conf_all(p: u64, n: usize, v4: *mut [u32; 4],
+    v6: *mut [u8; 64], fam: *mut [u8; 4]) -> usize {
+    var found: usize = 0
+    var i: usize = 0
+    var kw: [u8; 10] = "nameserver"
+    while i < n && found < MAX_SERVERS {
+        var e: usize = i
+        while e < n && rt.ld8(p, e) != 10 as u8 {
+            e = e + 1
+        }
+        let le: usize = line_end(p, i, e)
+        var t1e: usize = 0
+        let t1: usize = next_token(p, i, le, &t1e)
+        if t1e - t1 == 10 && name_eq(p + t1 as u64, 10, (&kw[0]) as u64, 10) {
+            var t2e: usize = 0
+            let t2: usize = next_token(p, t1e, le, &t2e)
+            var ip: u32 = 0
+            var a6: [u8; 16] = [0; 16]
+            if t2e > t2 && dns_parse_ipv4(p + t2 as u64, t2e - t2, &ip) {
+                var dup: bool = false
+                var k: usize = 0
+                while k < found {
+                    if (*fam)[k] == 4 as u8 && (*v4)[k] == ip {
+                        dup = true
+                    }
+                    k = k + 1
+                }
+                if !dup {
+                    (*v4)[found] = ip
+                    (*fam)[found] = 4 as u8
+                    found = found + 1
+                }
+            } else if t2e > t2 && ip6.ip6_parse(p + t2 as u64, t2e - t2, &a6) {
+                var dup6: bool = false
+                var k6: usize = 0
+                while k6 < found {
+                    if (*fam)[k6] == 6 as u8 {
+                        var same: bool = true
+                        var b: usize = 0
+                        while b < 16 {
+                            if (*v6)[k6 * 16 + b] != a6[b] {
+                                same = false
+                            }
+                            b = b + 1
+                        }
+                        if same {
+                            dup6 = true
+                        }
+                    }
+                    k6 = k6 + 1
+                }
+                if !dup6 {
+                    var b2: usize = 0
+                    while b2 < 16 {
+                        (*v6)[found * 16 + b2] = a6[b2]
+                        b2 = b2 + 1
+                    }
+                    (*v4)[found] = 0 as u32
+                    (*fam)[found] = 6 as u8
+                    found = found + 1
+                }
+            }
+        }
+        i = e + 1
+    }
+    return found
+}
+
 // The first hosts line that lists `name` (case-insensitive) after an IPv4
 // address. Lines whose address is not IPv4 (`::1 localhost`) are skipped.
 fn dns_hosts_lookup(p: u64, n: usize, name: u64, nlen: usize,
@@ -773,6 +848,8 @@ fn resolved_reset(o: *mut Resolved) {
 
 struct Resolver {
     servers: [u32; 4],
+    fam: [u8; 4], // 0 / 4 = IPv4 (servers[i]), 6 = IPv6 (servers6[i*16 ..])
+    servers6: [u8; 64],
     nservers: usize,
     port: u16,
     timeout_ms: u64,
@@ -797,7 +874,7 @@ struct Resolver {
 }
 
 fn resolver_new() -> Resolver {
-    return Resolver { servers: [0; 4], nservers: 0, port: 53 as u16,
+    return Resolver { servers: [0; 4], fam: [0; 4], servers6: [0; 64], nservers: 0, port: 53 as u16,
         timeout_ms: 2000 as u64, retries: 2 as u32, use_cache: true,
         use_hosts: true, hosts: rt.buf_new(), have_hosts: false,
         c_name: [0; 3072], c_nlen: [0; 32], c_addr: [0; 256], c_n: [0; 32],
@@ -819,13 +896,16 @@ fn resolver_init(r: *mut Resolver) -> bool {
     var conf: rt.Buf = rt.buf_new()
     var found: usize = 0
     if conf_resolv_text(&conf) {
-        found = dns_parse_resolv_conf(conf.ptr, conf.len, &(*r).servers)
+        found = dns_parse_resolv_conf_all(conf.ptr, conf.len, &(*r).servers,
+            &(*r).servers6, &(*r).fam)
     }
     rt.buf_free(&conf)
     (*r).nservers = found
     if found == 0 {
         (*r).servers[0] = net.ipv4(1 as u8, 1 as u8, 1 as u8, 1 as u8)
         (*r).servers[1] = net.ipv4(8 as u8, 8 as u8, 8 as u8, 8 as u8)
+        (*r).fam[0] = 4 as u8
+        (*r).fam[1] = 4 as u8
         (*r).nservers = 2
     }
     rt.buf_clear(&(*r).hosts)
@@ -851,8 +931,30 @@ fn resolver_add_server(r: *mut Resolver, addr: u32) -> bool {
         return false
     }
     (*r).servers[(*r).nservers] = addr
+    (*r).fam[(*r).nservers] = 4 as u8
     (*r).nservers = (*r).nservers + 1
     return true
+}
+
+// An IPv6 name server (16 octets, network order, pointer). Queries to it go
+// over a v6 socket, UDP and the TCP fallback. Linux only.
+fn resolver_add_server6(r: *mut Resolver, addr: u64) -> bool {
+    if (*r).nservers >= MAX_SERVERS {
+        return false
+    }
+    var i: usize = 0
+    while i < 16 {
+        (*r).servers6[(*r).nservers * 16 + i] = rt.ld8(addr, i)
+        i = i + 1
+    }
+    (*r).servers[(*r).nservers] = 0 as u32
+    (*r).fam[(*r).nservers] = 6 as u8
+    (*r).nservers = (*r).nservers + 1
+    return true
+}
+
+fn resolver_server_is_v6(r: *mut Resolver, i: usize) -> bool {
+    return i < (*r).nservers && (*r).fam[i] == 6 as u8
 }
 
 fn resolver_set_port(r: *mut Resolver, port: u16) { (*r).port = port }
@@ -938,9 +1040,17 @@ fn cache_put(r: *mut Resolver, name: u64, n: usize, kind: u32,
 // from that server and port, a well formed reply with our ID and our
 // question. Everything else is ignored (at most 16 stray datagrams, and
 // never past the deadline). The reply lands in `rep`.
-fn exchange_udp(r: *mut Resolver, server: u32, q: *mut rt.Buf, id: u32,
+fn exchange_udp(r: *mut Resolver, si: usize, q: *mut rt.Buf, id: u32,
     name: u64, nlen: usize, qtype: u32, ms: u64, rep: *mut Reply) -> i32 {
-    let fd: i64 = udp.udp_open()
+    let server: u32 = (*r).servers[si]
+    let v6: bool = (*r).fam[si] == 6 as u8
+    let a6: u64 = ((&(*r).servers6[0]) as u64) + (si * 16) as u64
+    var fd: i64 = 0
+    if v6 {
+        fd = udp.udp6_open()
+    } else {
+        fd = udp.udp_open()
+    }
     if fd < 0 {
         return X_NET
     }
@@ -949,7 +1059,12 @@ fn exchange_udp(r: *mut Resolver, server: u32, q: *mut rt.Buf, id: u32,
         return X_NET
     }
     let t0: u64 = now_ms()
-    let sent: i64 = udp.udp_sendto(fd, (*q).ptr, (*q).len, server, (*r).port)
+    var sent: i64 = 0
+    if v6 {
+        sent = udp.udp6_sendto(fd, (*q).ptr, (*q).len, a6, (*r).port)
+    } else {
+        sent = udp.udp_sendto(fd, (*q).ptr, (*q).len, server, (*r).port)
+    }
     (*r).n_udp = (*r).n_udp + 1 as u64
     if sent < 0 {
         udp.udp_close(fd)
@@ -961,15 +1076,32 @@ fn exchange_udp(r: *mut Resolver, server: u32, q: *mut rt.Buf, id: u32,
     var go: bool = true
     while go {
         var fa: u32 = 0
+        var fa6: [u8; 16] = [0; 16]
         var fp: u16 = 0 as u16
-        let k: i64 = udp.udp_recvfrom(fd, (&buf[0]) as u64, 4096, &fa, &fp)
+        var k: i64 = 0
+        if v6 {
+            k = udp.udp6_recvfrom(fd, (&buf[0]) as u64, 4096, (&fa6[0]) as u64, &fp)
+        } else {
+            k = udp.udp_recvfrom(fd, (&buf[0]) as u64, 4096, &fa, &fp)
+        }
         if k < 0 {
             if !udp.udp_is_timeout(k) {
                 status = X_NET
             }
             go = false
         } else {
-            var mine: bool = fa == server && fp == (*r).port
+            var mine: bool = fp == (*r).port
+            if v6 {
+                var j: usize = 0
+                while j < 16 {
+                    if fa6[j] != rt.ld8(a6, j) {
+                        mine = false
+                    }
+                    j = j + 1
+                }
+            } else {
+                mine = mine && fa == server
+            }
             if mine {
                 mine = dns_parse_reply((&buf[0]) as u64, k as usize, name,
                     nlen, qtype, rep)
@@ -991,10 +1123,17 @@ fn exchange_udp(r: *mut Resolver, server: u32, q: *mut rt.Buf, id: u32,
 
 // The same question over TCP (RFC 1035 4.2.2): a two octet length, then
 // the message; the answer comes the same way. Used when UDP said TC.
-fn exchange_tcp(r: *mut Resolver, server: u32, q: *mut rt.Buf, id: u32,
+fn exchange_tcp(r: *mut Resolver, si: usize, q: *mut rt.Buf, id: u32,
     name: u64, nlen: usize, qtype: u32, ms: u64, rep: *mut Reply) -> i32 {
-    var c: net.Conn = net.connect_tcp_timeout(server, (*r).port, ms)
-    catch net.conn_from_fd(0 - 1)
+    let server: u32 = (*r).servers[si]
+    var c: net.Conn = net.conn_from_fd(0 - 1)
+    if (*r).fam[si] == 6 as u8 {
+        c = net.connect6(((&(*r).servers6[0]) as u64) + (si * 16) as u64, (*r).port)
+        catch net.conn_from_fd(0 - 1)
+    } else {
+        c = net.connect_tcp_timeout(server, (*r).port, ms)
+        catch net.conn_from_fd(0 - 1)
+    }
     if !net.conn_is_open(&c) {
         return X_NET
     }
@@ -1067,11 +1206,11 @@ fn ask(r: *mut Resolver, name: u64, nlen: usize, qtype: u32,
                 rt.buf_free(&q)
                 return X_FORMAT
             }
-            var st: i32 = exchange_udp(r, server, &q, id, name, nlen, qtype,
+            var st: i32 = exchange_udp(r, s, &q, id, name, nlen, qtype,
                 ms, rep)
             (*out).via = VIA_UDP
             if st == X_OK && (*rep).truncated {
-                st = exchange_tcp(r, server, &q, id, name, nlen, qtype, ms, rep)
+                st = exchange_tcp(r, s, &q, id, name, nlen, qtype, ms, rep)
                 (*out).via = VIA_TCP
             }
             rt.buf_free(&q)

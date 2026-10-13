@@ -1,0 +1,241 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+// tests/2867_async_epoll_flags.fi -- async.loop: EV_RDHUP and EV_ET.
+// Both backends run the same scenarios; the output lines are compared with
+// Python's select.epoll / select.poll by tools/net/epoll.sh (loopback only).
+//
+// A  EV_RDHUP asked: a peer shutdown(WR) reports READ + RDHUP, no HUP
+// B  EV_RDHUP not asked: the same shutdown reports READ only
+// C  level triggered: unread data is reported in every round
+// D  EV_ET: epoll reports unread data once, again after NEW data; the poll
+//    backend ignores EV_ET and stays level
+// E  peer close(): READ + RDHUP, still no HUP (we have not shut down)
+import std.rt
+import std.net
+import async.loop
+
+static mut fails: u32 = 0
+static mut last_rev: u32 = 0
+static mut calls: u32 = 0
+
+fn say(s: str) {
+    syscall(1, 1, s.p as i64, s.n as i64, 0, 0, 0)
+}
+
+fn say_num(v: u32) {
+    var b: [u8; 4] = [48, 32, 32, 10]
+    b[0] = (48 + v % 10) as u8
+    syscall(1, 1, (&b[0]) as i64, 1, 0, 0, 0)
+}
+
+fn check(ok: bool, code: u32) {
+    if !ok {
+        fails = fails + 1
+        say("FAIL ")
+        say_num(code % 10)
+    }
+}
+
+fn on_ev(l: *mut loop.Loop, ud: u64, ev: u32) {
+    calls = calls + 1
+    last_rev = ev
+}
+
+fn bit(v: u32, m: u32) -> u32 {
+    if (v & m) != 0 as u32 {
+        return 1
+    }
+    return 0
+}
+
+// One connected pair; `srv` is non-blocking.
+struct Pair {
+    lst: net.Listener,
+    srv: net.Conn,
+    cli: net.Conn,
+}
+
+fn pair_open(p: *mut Pair) -> bool {
+    (*p).lst = net.listen_tcp(net.ADDR_LOCAL, 0 as u16) catch net.listener_from_fd(0 - 1)
+    if !net.listener_is_open(&(*p).lst) {
+        return false
+    }
+    (*p).cli = net.connect_tcp(net.ADDR_LOCAL, net.listener_port(&(*p).lst)) catch net.conn_from_fd(0 - 1)
+    (*p).srv = net.accept(&(*p).lst) catch net.conn_from_fd(0 - 1)
+    net.close_listener(&(*p).lst)
+    if !net.conn_is_open(&(*p).cli) || !net.conn_is_open(&(*p).srv) {
+        return false
+    }
+    net.set_nonblocking_fd((*p).srv.fd, true)
+    return true
+}
+
+fn pair_close(p: *mut Pair) {
+    net.close(&(*p).cli)
+    net.close(&(*p).srv)
+}
+
+fn send_n(c: *mut net.Conn, n: usize) {
+    var b: [u8; 16] = [65; 16]
+    net.write(c, (&b[0]) as u64, n) catch 0
+}
+
+fn out_line(backend: str, name: str, rev: u32) {
+    var b: [u8; 64] = [0; 64]
+    var n: usize = 0
+    var i: usize = 0
+    while i < backend.n {
+        b[n] = *(backend.p + i)
+        n = n + 1
+        i = i + 1
+    }
+    b[n] = 58 as u8
+    n = n + 1
+    i = 0
+    while i < name.n {
+        b[n] = *(name.p + i)
+        n = n + 1
+        i = i + 1
+    }
+    // " read=R rdhup=D hup=H err=E\n"
+    var tail: [u8; 28] = " read=0 rdhup=0 hup=0 err=0\n"
+    tail[6] = (48 + bit(rev, loop.EV_READ)) as u8
+    tail[14] = (48 + bit(rev, loop.EV_RDHUP)) as u8
+    tail[20] = (48 + bit(rev, loop.EV_HUP)) as u8
+    tail[26] = (48 + bit(rev, loop.EV_ERR)) as u8
+    i = 0
+    while i < 28 {
+        b[n] = tail[i]
+        n = n + 1
+        i = i + 1
+    }
+    syscall(1, 1, (&b[0]) as i64, n as i64, 0, 0, 0)
+}
+
+fn count_line(backend: str, name: str, v: u32) {
+    var b: [u8; 64] = [0; 64]
+    var n: usize = 0
+    var i: usize = 0
+    while i < backend.n {
+        b[n] = *(backend.p + i)
+        n = n + 1
+        i = i + 1
+    }
+    b[n] = 58 as u8
+    n = n + 1
+    i = 0
+    while i < name.n {
+        b[n] = *(name.p + i)
+        n = n + 1
+        i = i + 1
+    }
+    b[n] = 61 as u8
+    b[n + 1] = (48 + v) as u8
+    b[n + 2] = 10 as u8
+    syscall(1, 1, (&b[0]) as i64, (n + 3) as i64, 0, 0, 0)
+}
+
+fn rounds(l: *mut loop.Loop, k: u32) {
+    var i: u32 = 0
+    while i < k {
+        loop.run_once(l, 60)
+        i = i + 1
+    }
+}
+
+fn suite(use_poll: bool) {
+    var l: loop.Loop = loop.loop_new()
+    var ok: bool = false
+    var backend: str = "epoll"
+    if use_poll {
+        ok = loop.loop_init_poll(&l)
+        backend = "poll"
+    } else {
+        ok = loop.loop_init(&l)
+    }
+    check(ok, 1)
+    if !ok {
+        return
+    }
+    check(loop.is_epoll(&l) != use_poll, 2)
+    var p: Pair = Pair { lst: net.listener_from_fd(0 - 1), srv: net.conn_from_fd(0 - 1),
+        cli: net.conn_from_fd(0 - 1) }
+
+    // A
+    check(pair_open(&p), 3)
+    var h: u64 = loop.watch_add(&l, p.srv.fd, loop.EV_READ | loop.EV_RDHUP, on_ev, 0)
+    calls = 0
+    loop.run_once(&l, 0)
+    check(calls == 0, 4)
+    net.shutdown_write(&p.cli)
+    calls = 0
+    rounds(&l, 1)
+    check(calls == 1, 5)
+    check(bit(last_rev, loop.EV_READ) == 1 && bit(last_rev, loop.EV_RDHUP) == 1
+        && bit(last_rev, loop.EV_HUP) == 0, 6)
+    out_line(backend, "rdhup_on", last_rev)
+    loop.watch_del(&l, h)
+    pair_close(&p)
+
+    // B
+    check(pair_open(&p), 7)
+    h = loop.watch_add(&l, p.srv.fd, loop.EV_READ, on_ev, 0)
+    net.shutdown_write(&p.cli)
+    rounds(&l, 1)
+    check(bit(last_rev, loop.EV_READ) == 1 && bit(last_rev, loop.EV_RDHUP) == 0, 8)
+    out_line(backend, "rdhup_off", last_rev)
+    loop.watch_del(&l, h)
+    pair_close(&p)
+
+    // C
+    check(pair_open(&p), 9)
+    h = loop.watch_add(&l, p.srv.fd, loop.EV_READ, on_ev, 0)
+    send_n(&p.cli, 10)
+    calls = 0
+    rounds(&l, 3)
+    check(calls == 3, 10)
+    count_line(backend, "level", calls)
+    loop.watch_del(&l, h)
+    pair_close(&p)
+
+    // D
+    check(pair_open(&p), 11)
+    h = loop.watch_add(&l, p.srv.fd, loop.EV_READ | loop.EV_ET, on_ev, 0)
+    send_n(&p.cli, 10)
+    calls = 0
+    rounds(&l, 3)
+    let n1: u32 = calls
+    send_n(&p.cli, 5)
+    rounds(&l, 3)
+    let n2: u32 = calls
+    if use_poll {
+        check(n1 == 3 && n2 == 6, 12)
+    } else {
+        check(n1 == 1 && n2 == 2, 12)
+    }
+    count_line(backend, "edge_first", n1)
+    count_line(backend, "edge_total", n2)
+    loop.watch_del(&l, h)
+    pair_close(&p)
+
+    // E
+    check(pair_open(&p), 13)
+    h = loop.watch_add(&l, p.srv.fd, loop.EV_READ | loop.EV_RDHUP, on_ev, 0)
+    net.close(&p.cli)
+    rounds(&l, 1)
+    check(bit(last_rev, loop.EV_READ) == 1 && bit(last_rev, loop.EV_RDHUP) == 1
+        && bit(last_rev, loop.EV_HUP) == 0, 14)
+    out_line(backend, "peer_close", last_rev)
+    loop.watch_del(&l, h)
+    pair_close(&p)
+    loop.loop_free(&l)
+}
+
+fn main() -> i32 {
+    suite(false)
+    suite(true)
+    if fails != 0 {
+        return 1
+    }
+    return 0
+}

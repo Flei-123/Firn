@@ -1,0 +1,103 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+// tests/2869_async_closure_pin.fi -- a CAPTURING closure as a loop timer
+// callback survives garbage collections when pinned with async.fnpin.
+// Counter-check: tools/net/pin_mutation.sh removes the pin call and expects
+// the program to fail.
+import std.rt
+import async.loop
+import async.fnpin
+
+gc class Cell { value: u64, next: Gc[Cell] }
+
+static mut seen: u64 = 0
+static mut fired: u32 = 0
+
+fn make(v: u64, ud_slot: *mut usize) -> AllocError!fn(*mut loop.Loop, u64) {
+    let c: Gc[Cell] = try gc Cell { value: v, next: gc_null[Cell]() }
+    let f: fn(*mut loop.Loop, u64) = try gc fn(l: *mut loop.Loop, ud: u64) {
+        seen = c.value + ud
+        fired = fired + 1
+    }
+    *ud_slot = fnpin.pin(f as u64) //PIN
+    return f
+}
+
+fn scrub(n: u64) {
+    var buffer: [u64; 256] = [0; 256]
+    let p: u64 = (&buffer) as u64
+    var i: u64 = 0
+    while i < 256 {
+        *((p + i * 8) as *mut u64) = 0
+        i = i + 1
+    }
+    if n > 0 {
+        scrub(n - 1)
+    }
+}
+
+fn churn(n: u64) -> AllocError!u64 {
+    var i: u64 = 0
+    var s: u64 = 0
+    while i < n {
+        let d: Gc[Cell] = try gc Cell { value: 999999, next: gc_null[Cell]() }
+        s = s + d.value
+        i = i + 1
+    }
+    return s
+}
+
+// The closure is created here and only its ADDRESS goes to the loop.
+fn arm(l: *mut loop.Loop, slot: *mut usize) -> AllocError!u64 {
+    let f: fn(*mut loop.Loop, u64) = try make(4711, slot)
+    return loop.timer_after(l, 20, f, 5)
+}
+
+fn run() -> AllocError!i32 {
+    var l: loop.Loop = loop.loop_new()
+    if !loop.loop_init(&l) {
+        return 1
+    }
+    var slot: usize = fnpin.NONE
+    let t: u64 = try arm(&l, &slot)
+    if t == 0 || slot == fnpin.NONE {
+        return 2
+    }
+    scrub(4)
+    var k: u64 = 0
+    while k < 5 {
+        gc_collect()
+        let s: u64 = try churn(300)
+        if s == 0 {
+            return 3
+        }
+        gc_collect()
+        k = k + 1
+    }
+    scrub(4)
+    gc_collect()
+    var rounds: u32 = 0
+    while fired == 0 && rounds < 50 {
+        loop.run_once(&l, 20)
+        rounds = rounds + 1
+    }
+    if fired != 1 {
+        return 4
+    }
+    if seen != 4716 {
+        return 5
+    }
+    fnpin.unpin(slot)
+    if fnpin.pinned_count() != 0 {
+        return 6
+    }
+    loop.loop_free(&l)
+    return 0
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    return run() catch 91
+}
