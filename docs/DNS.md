@@ -86,6 +86,6 @@ on the curve (`ecdsa.point_valid`).
   (brackets with a port, or a bare `::1`).
 * UDP over `AF_INET6` (`net.udp`: `udp6_open/bind/sendto/recvfrom`) and the TC fallback over `net.connect6`.
   The sender check compares all 16 octets and the port.
-* Proof: `tests/2871_dns_resolv6.fi` (parser), `tools/dns/check6.py` (fake DNS on `[::1]`: A, AAAA, CNAME chain,
+* Proof: `tests/2868_dns_resolv6.fi` (parser), `tools/dns/check6.py` (fake DNS on `[::1]`: A, AAAA, CNAME chain,
   TC -> TCP, NXDOMAIN, SERVFAIL, silent -> Timeout). LOOPBACK ONLY: no real IPv6 route, no real IPv6 resolver tried.
 * Not done: zone ids, Windows (the seam has no tested v6 datagram path), EDNS0, search list.
