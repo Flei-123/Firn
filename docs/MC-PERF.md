@@ -1,6 +1,6 @@
 # MC-PERF -- Performance measurement of the Voxel client
 
-Owner: worker mc-p3 (12.10.2026). Status: **harness + CPU baseline exist, GL / live / Windows / Vanilla comparison OPEN**.
+Owner: worker mc-p3 (12.10.2026). Status: **harness + CPU baseline exist; Windows cross build works (build_win.sh); GL / live / Vanilla comparison OPEN**.
 Rule: only real measurements go into the tables; empty = not measured.
 
 ## 1. Harness (`bash tools/mc/perf/run.sh [--offline]`)
@@ -25,12 +25,12 @@ Rule: only real measurements go into the tables; empty = not measured.
   chunk column; offline stand-in for the packet parse, NOT a network decode), load e2e (parse excluded; mesh+upload+draw),
   RSS start / loaded / peak, startup.
 
-## 2. Measurement method Vanilla comparison (NOT yet run)
+## 2. Measurement method Vanilla comparison (NOT yet run) -- full method: tools/mc/perf/vanilla_compare.md
 * Vanilla runs on the owner's PC FLEI-ONE (Windows, FleiLauncher). Same world/seed, view distance (8/16/32), resolution,
   hardware. Frame times by PresentMon (CSV) or the game's own profiler / log. Only after the owner's OK per run
   (`project_needs`: "Darf ich auf deinem PC kurz Minecraft Vanilla zum Benchmark starten?") and only when the Windows
   harness is ready: `firnc --target=x86_64-windows -o bench.exe tools/mc/perf/bench.fi` (cross build prepared in principle,
-  **not built, not run**). No Mojang files are copied or read; Vanilla is only started as a measured object.
+  built: `bash tools/mc/perf/build_win.sh <dir>` (bench.exe, wine smoke test ok 13.10.), NOT run on FLEI-ONE). No Mojang files are copied or read; Vanilla is only started as a measured object.
 * Alternative: published reference values WITH source, date and hardware (not collected yet; nothing is quoted without a source).
 
 ## 3. Levers (status = honest)
@@ -62,10 +62,12 @@ Series 8 / 16 / 32 with 3 runs: started via heavy (queue), results in `reports/p
 The 8-block frame times include on-demand meshing along the flight (budget 16 sections / frame) -- that is deliberate (p99).
 
 ## 5. Known problems / open
-* `BENCH_COMP=1` (mesh + upload components per section) **crashes in `mc_raster.backend_mesh_upload`** (heap block cache
-  corrupted after ~290 upload/free cycles; naive/greedy meshing alone is fine, the isolated alloc/free pattern is fine). Cause not
-  found -- off by default. The mesh ms numbers (naive vs greedy+AO) are therefore NOT measured here; `tools/mc/mesh/run.sh` has
-  sections/s for the mesher.
+* `BENCH_COMP=1 BENCH_COMPUPLOAD=1` (mesh + upload components per section): the reported crash in `mc_raster.backend_mesh_upload` does
+  **NOT reproduce** on main (13.10.): 915 upload/free cycles at radius 8 and 16, with and without free (`BENCH_NOFREE=1`), with both firnc builds
+  (8 Oct and w-r5), no crash. Regression test tests/2862_mc_upload_cycles.fi (6000 cycles, random sizes, 300 live handles, slot table growth, content
+  patterns + all-zero check of every allocation). The original crash was probably the pre-q1 build / a fixed environment problem; code reading found
+  no size mismatch in alloc/free pairs (slot table, verts, idx). `run.sh --offline` now runs the components. Measured (R 8, 915 sections, server load ~15, 640x360 not involved):
+  naive+AO p50 738 us, naive no AO 695 us, greedy+AO p50 727 us / p95 2607 us, upload+free p50 146 us per section (single runs, noisy).
 * GL path: `bench_gl.fi` not written; the compiler build was blocked by the disk (89 %), the old firnc (8 Oct) has no `link_lib`.
   Once written, results must carry "NO REAL GPU (Mesa llvmpipe)".
 * `--live`: join time (handshake -> last chunk) needs `t_last` + parse time printed by `demos/mcview`; not wired.

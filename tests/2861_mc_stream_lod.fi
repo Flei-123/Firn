@@ -1,0 +1,223 @@
+// expect_exit: 0
+// tests/2861_mc_stream_lod.fi -- mc_stream + mc_lod: ring switch full detail <-> LOD per column.
+// A  modes: fresh far columns are LOD (mode 1), near ones full (0); LOD triangles are drawn; far sections are not meshed
+// B  hysteresis: a column at distance dist + 1 keeps its mode (0 coming from inside, 1 coming from outside)
+// C  camera flight with small budgets (holes are MEASURED; only 'much better than no LOD' is asserted, pop-free is OPEN): every pixel that the converged stream (same config, flushed every frame) covers is
+//    covered (no holes at the ring switches); a stream WITHOUT lod (same near window) leaves many holes, so the metric is sensitive
+// D  converged streams draw identical triangle counts (determinism)
+// E  stream_free / unload with LOD meshes (no crash, back end empty afterwards)
+import std.rt
+import std.io
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import mc.mc_terrain
+import mc.mc_render_world
+import mc.mc_stream
+
+const NSEC: i32 = 6
+const R: i32 = 9 // loaded columns: -R..R
+const DIST: i32 = 2 // full detail radius
+const CLEAR: u32 = 0xFF3C2814 as u32
+
+fn check(c: bool, code: i32) {
+    if !c {
+        io.fmt_print_line(f"FAIL code {code}")
+        rt.finish(code as i64)
+    }
+}
+
+fn fl(v: f64) -> i32 {
+    var x: i32 = v as i32
+    if (x as f64) > v { x = x - 1 }
+    return x
+}
+
+#[allow_escape]
+fn load_all(w: *mut mc_world.World, s: *mut mc_stream.Stream, ids: u64) {
+    var cz: i32 = 0 - R
+    while cz <= R {
+        var cx: i32 = 0 - R
+        while cx <= R {
+            mc_terrain.terrain_column(cx, cz, NSEC, ids)
+            check(mc_world.world_put(w, mc_render_world.wr_make_chunk(cx, cz, NSEC as usize, ids)), 50)
+            check(mc_stream.stream_chunk_loaded(s, w, cx, cz), 51)
+            cx = cx + 1
+        }
+        cz = cz + 1
+    }
+}
+
+fn fresh_raster(a: *mut mc_texture.Atlas) -> mc_raster.Raster {
+    var r: mc_raster.Raster = mc_raster.raster_new(96, 54)
+    mc_raster.backend_upload_atlas(&r, a)
+    return r
+}
+
+#[allow_escape]
+fn frame(s: *mut mc_stream.Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera) -> u64 {
+    (*b).begin((*b).obj, cam as u64, CLEAR)
+    let tris: u64 = mc_stream.stream_frame(s, w, b, cam)
+    (*b).end((*b).obj)
+    return tris
+}
+
+fn pose(cam: *mut mc_camera.Camera, x: f64, z: f64) {
+    let y: f64 = (mc_terrain.terrain_height(fl(x), fl(z), NSEC) + 8) as f64
+    mc_camera.camera_set_pos(cam, x, y, z)
+    mc_camera.camera_look_at(cam, x + 60.0, y - 6.0, z + 6.0)
+    mc_camera.camera_update(cam)
+}
+
+// pixels that are clear colour in `a` but not in `b`
+fn holes(a: *mut mc_raster.Raster, b: *mut mc_raster.Raster) -> i32 {
+    var n: i32 = 0
+    var y: i32 = 0
+    while y < 54 {
+        var x: i32 = 0
+        while x < 96 {
+            if mc_raster.raster_pixel(a, x, y) == CLEAR && mc_raster.raster_pixel(b, x, y) != CLEAR { n = n + 1 }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_terrain.terrain_tables(&tb)
+    var a: mc_texture.Atlas = mc_texture.atlas_default()
+    let ids: u64 = rt.heap_alloc(NSEC as usize * 4096 * 2)
+    var cam: mc_camera.Camera = mc_camera.camera_new(96, 54)
+    mc_camera.camera_set_lens(&cam, 70.0, 0.05, 900.0)
+
+    // lod stream
+    var r1: mc_raster.Raster = fresh_raster(&a)
+    var b1: mc_backend.Backend = mc_backend.backend_cpu(&r1)
+    var w1: mc_world.World = mc_world.world_new()
+    var s1: mc_stream.Stream = mc_stream.stream_new(0, NSEC, DIST, &tb, 0)
+    s1.lod_dist = R
+    s1.nbr_wait = 3 as u32
+    // converged reference: same config, flushed every frame
+    var r2: mc_raster.Raster = fresh_raster(&a)
+    var b2: mc_backend.Backend = mc_backend.backend_cpu(&r2)
+    var w2: mc_world.World = mc_world.world_new()
+    var s2: mc_stream.Stream = mc_stream.stream_new(0, NSEC, DIST, &tb, 0)
+    s2.lod_dist = R
+    s2.nbr_wait = 3 as u32
+    // no lod, near window only (negative control)
+    var r3: mc_raster.Raster = fresh_raster(&a)
+    var b3: mc_backend.Backend = mc_backend.backend_cpu(&r3)
+    var w3: mc_world.World = mc_world.world_new()
+    var s3: mc_stream.Stream = mc_stream.stream_new(0, NSEC, DIST, &tb, 0)
+    s3.nbr_wait = 3 as u32
+    load_all(&w1, &s1, ids)
+    load_all(&w2, &s2, ids)
+    load_all(&w3, &s3, ids)
+
+    // ---- A
+    pose(&cam, 0.0 - 100.0, 0.0)
+    mc_stream.stream_flush(&s1, &w1, &b1, &cam, 400)
+    mc_stream.stream_flush(&s2, &w2, &b2, &cam, 400)
+    mc_stream.stream_flush(&s3, &w3, &b3, &cam, 400)
+    var tris1: u64 = frame(&s1, &w1, &b1, &cam)
+    var tris2: u64 = frame(&s2, &w2, &b2, &cam)
+    var tris3: u64 = frame(&s3, &w3, &b3, &cam)
+    io.fmt_print_line(f"A: tris lod {tris1} full {tris2} near-only {tris3} lod_cols {s1.st.lod_cols} lod_tris {s1.st.lod_tris}")
+    check(s1.st.lod_cols > 20 as u32 && s1.st.lod_tris > 0 as u64, 1)
+    // camera column is -7 (x = -100): column -7 full, column 5 far away LOD
+    check(mc_stream.stream_lod_mode(&s1, 0 - 7, 0) == 0 as u64, 2)
+    check(mc_stream.stream_lod_mode(&s1, 5, 0) == 1 as u64, 3)
+    check(mc_stream.stream_lod_mode(&s1, 0 - 4, 0) == 1 as u64, 4) // distance 3 from the start: LOD
+    check(mc_stream.stream_pending(&s1) == 0, 5)
+    check(holes(&r1, &r2) < 30, 7)
+    check(holes(&r3, &r2) > 100, 8) // the near-only stream has big holes (sensitivity of the metric)
+
+    // ---- B hysteresis at column -4 (distance 3 = dist + 1 from column -7)
+    // coming from outside it stays LOD; step to column -5 (distance 2): becomes full; step back to -7: stays full (distance 3)
+    pose(&cam, 0.0 - 5.0 * 16.0 + 8.0, 0.0)
+    mc_stream.stream_flush(&s1, &w1, &b1, &cam, 400)
+    frame(&s1, &w1, &b1, &cam)
+    check(mc_stream.stream_lod_mode(&s1, 0 - 4, 0) == 0 as u64, 10)
+    pose(&cam, 0.0 - 7.0 * 16.0 + 8.0, 0.0)
+    mc_stream.stream_flush(&s1, &w1, &b1, &cam, 400)
+    frame(&s1, &w1, &b1, &cam)
+    check(mc_stream.stream_lod_mode(&s1, 0 - 4, 0) == 0 as u64, 11) // distance 3: hysteresis keeps it full
+    pose(&cam, 0.0 - 8.0 * 16.0 + 8.0, 0.0)
+    mc_stream.stream_flush(&s1, &w1, &b1, &cam, 400)
+    frame(&s1, &w1, &b1, &cam)
+    check(mc_stream.stream_lod_mode(&s1, 0 - 4, 0) == 1 as u64, 12) // distance 4: LOD only
+    check(mc_stream.stream_lod_mode(&s1, 0 - 5, 0) == 0 as u64, 13) // distance 3: kept full
+
+    // ---- C flight with small budgets
+    pose(&cam, 0.0 - 120.0, 4.0)
+    mc_stream.stream_flush(&s1, &w1, &b1, &cam, 400)
+    mc_stream.stream_flush(&s3, &w3, &b3, &cam, 400)
+    s1.max_submit = 3
+    s1.max_inflight = 4
+    s3.max_submit = 3
+    s3.max_inflight = 4
+    var worst: i32 = 0
+    var total: i32 = 0
+    var total_ctl: i32 = 0
+    var f: i32 = 0
+    var switches: i32 = 0
+    var last_mode: u64 = 9 as u64
+    while f < 70 {
+        let x: f64 = 0.0 - 120.0 + (f as f64) * 3.0
+        pose(&cam, x, 4.0 + (f % 20) as f64)
+        frame(&s1, &w1, &b1, &cam)
+        frame(&s3, &w3, &b3, &cam)
+        mc_stream.stream_flush(&s2, &w2, &b2, &cam, 400)
+        frame(&s2, &w2, &b2, &cam)
+        let h: i32 = holes(&r1, &r2)
+        if h > worst { worst = h }
+        total = total + h
+        total_ctl = total_ctl + holes(&r3, &r2)
+        let m: u64 = mc_stream.stream_lod_mode(&s1, 0 - 3, 0)
+        if m != last_mode { switches = switches + 1 }
+        last_mode = m
+        f = f + 1
+    }
+    io.fmt_print_line(f"C: holes worst {worst} total {total} (no-lod control total {total_ctl}) mode switches of column -3: {switches}")
+    check(switches >= 2, 20) // the column really switched during the flight
+    // OPEN (docs/mc/lod.md): while sections lag behind (3 submits / frame) holes remain in mid distance; measured, not asserted
+    check(total * 10 < total_ctl * 2, 22) // still far better than no LOD
+    // settle: after the flight everything converges to the ground truth coverage
+    mc_stream.stream_flush(&s1, &w1, &b1, &cam, 400)
+    frame(&s1, &w1, &b1, &cam)
+    frame(&s2, &w2, &b2, &cam)
+    check(holes(&r1, &r2) < 100, 23)
+
+    // ---- D triangles: far camera over the LOD columns
+    pose(&cam, 100.0, 0.0)
+    mc_stream.stream_flush(&s1, &w1, &b1, &cam, 400)
+    mc_stream.stream_flush(&s2, &w2, &b2, &cam, 400)
+    frame(&s1, &w1, &b1, &cam)
+    tris1 = frame(&s1, &w1, &b1, &cam)
+    tris2 = frame(&s2, &w2, &b2, &cam)
+    io.fmt_print_line(f"D: tris lod {tris1} full {tris2}")
+    check(tris1 > 0 as u64 && s1.st.lod_tris > 0 as u64 && tris1 == tris2, 30)
+
+    // ---- E free
+    mc_stream.stream_chunk_unloaded(&s1, &b1, 0, 0)
+    mc_world.world_remove(&w1, 0, 0)
+    mc_stream.stream_chunk_unloaded(&s1, &b1, 5, 0)
+    mc_world.world_remove(&w1, 5, 0)
+    mc_stream.stream_flush(&s1, &w1, &b1, &cam, 400)
+    frame(&s1, &w1, &b1, &cam)
+    mc_stream.stream_free(&s1, &b1)
+    mc_stream.stream_free(&s2, &b2)
+    mc_stream.stream_free(&s3, &b3)
+    mc_world.world_free(&w1)
+    mc_world.world_free(&w2)
+    mc_world.world_free(&w3)
+    io.fmt_print_line(f"ok")
+    return 0
+}
