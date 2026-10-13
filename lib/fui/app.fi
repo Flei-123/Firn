@@ -154,6 +154,9 @@ struct App {
     // the text fields: their editor, their node, their hint
     ed: [editor.Editor; 8],
     ed_node: [usize; 8],
+    // r444b: where the focused field's caret was painted last (x, y, height in window pixels) -> the input method's candidate window
+    spot: [f64; 3],
+    spot_ok: bool,
     hint: [str; 8],
     // a text area is a slot of the same table (several lines, textarea.fi)
     area: [bool; 8],
@@ -247,7 +250,7 @@ fn app_blank() -> App {
         stack: [0; 16], depth: 0,
         cb: [cb_none; 128], has_cb: [false; 128], texts: 0,
         tlen: [0; 128], wrapped: [false; 128],
-        ed: [editor.editor_new(); 8], ed_node: [NONE; 8], hint: [""; 8],
+        ed: [editor.editor_new(); 8], ed_node: [NONE; 8], spot: [0.0; 3], spot_ok: false, hint: [""; 8],
         area: [false; 8], lines: [textarea.ta_new(); 8], drag_k: NONE,
         touch_k: NONE, touch_x: 0.0, touch_y: 0.0, touch_moved: false,
         ptr_x: 0.0, ptr_y: 0.0,
@@ -677,6 +680,7 @@ fn window(title: str, w: usize, h: usize) -> *mut App {
     apphost.hooks_set_buf(&(*a).hk, app_entry_buf)
     apphost.hooks_set_edited(&(*a).hk, app_entry_edited)
     apphost.hooks_set_popups(&(*a).hk, app_popups)
+    apphost.hooks_set_ime(&(*a).hk, app_ime_pre, app_ime_commit, app_ime_end, app_ime_del, app_ime_confirm, app_ime_spot)
     return a
 }
 
@@ -1203,6 +1207,30 @@ fn slot_of(a: *mut App, i: usize) -> usize {
     return NONE
 }
 
+// r444b: the caret of the focused field in window pixels (for the input method's candidate window). The scroll of the field
+// may still move while it is painted (scroll_to_caret), so this is the value of the frame before; it is current by the next turn.
+fn note_spot(a: *mut App, k: usize, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let ed: *mut editor.Editor = &(*a).ed[k]
+    let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
+    if (*a).area[k] {
+        var bx: f64 = 0.0
+        var by: f64 = 0.0
+        var bh: f64 = 0.0
+        textarea.ta_caret_box(&(*a).lines[k], ed, &bx, &by, &bh)
+        (*a).spot[0] = render.field_text_x0(c, e) + bx
+        (*a).spot[1] = widget.w_y(e) + render.pady_of(c, e) + by
+        (*a).spot[2] = bh
+    } else {
+        var top: f64 = 0.0
+        var lh: f64 = 0.0
+        let bl: f64 = render.field_line(c, e, &top, &lh)
+        (*a).spot[0] = render.field_caret_x(c, e, t, editor.editor_scroll(ed))
+        (*a).spot[1] = top
+        (*a).spot[2] = lh
+    }
+    (*a).spot_ok = true
+}
+
 // The field over the button base that wave3 already painted: text, caret,
 // selection (render.draw_textfield) -- or the dimmed hint.
 fn draw_entry(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
@@ -1213,6 +1241,9 @@ fn draw_entry(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
     }
     let ed: *mut editor.Editor = &(*a).ed[k]
     let focus: bool = widget.w_is_focus(e)
+    if focus {
+        note_spot(a, k, c, e)
+    }
     if (*a).area[k] {
         textarea.ta_draw(c, e, ed, &(*a).lines[k], focus)
         let ha: str = (*a).hint[k]
@@ -1765,5 +1796,69 @@ fn app_entry_box(ud: u64, out: *mut [f64; 4]) -> bool {
     (*out)[1] = scene.node_y(&(*a).sc, i)
     (*out)[2] = scene.node_w(&(*a).sc, i)
     (*out)[3] = scene.node_h(&(*a).sc, i)
+    return true
+}
+
+// ---- r444b: the input method's sink (lib/plat/fuitext.fi) -- pre-edit text, commit, cancel, delete-surrounding of the FOCUSED field.
+// Each answers true when a field took it. A field that is a text area keeps its lines in step through edit_done.
+
+fn ime_field(a: *mut App) -> usize {
+    return focused_slot(a)
+}
+
+fn ime_done(a: *mut App, k: usize, r: u32) -> bool {
+    if r == editor.RES_NONE {
+        return false
+    }
+    fuiwirt.host_touch(&(*a).w)
+    edit_done(a, k)
+    return true
+}
+
+fn app_ime_pre(ud: u64, p: u64, n: usize, caret: usize) -> bool {
+    let a: *mut App = ud as *mut App
+    let k: usize = ime_field(a)
+    if k == NONE { return false }
+    return ime_done(a, k, editor.editor_ime_preedit(&(*a).ed[k], p, n, caret))
+}
+
+fn app_ime_commit(ud: u64, p: u64, n: usize) -> bool {
+    let a: *mut App = ud as *mut App
+    let k: usize = ime_field(a)
+    if k == NONE { return false }
+    return ime_done(a, k, editor.editor_ime_commit(&(*a).ed[k], p, n))
+}
+
+fn app_ime_end(ud: u64) {
+    let a: *mut App = ud as *mut App
+    let k: usize = ime_field(a)
+    if k == NONE { return }
+    let ok: bool = ime_done(a, k, editor.editor_ime_cancel(&(*a).ed[k]))
+}
+
+fn app_ime_del(ud: u64, before: usize, after: usize) -> bool {
+    let a: *mut App = ud as *mut App
+    let k: usize = ime_field(a)
+    if k == NONE { return false }
+    return ime_done(a, k, editor.editor_delete_surrounding(&(*a).ed[k], before, after))
+}
+
+// A mouse click (or the focus moved to another field) while pre-edit text stands: the field takes the text as it is.
+fn app_ime_confirm(ud: u64) {
+    let a: *mut App = ud as *mut App
+    let k: usize = ime_field(a)
+    if k == NONE { return }
+    editor.editor_ime_end(&(*a).ed[k])
+    fuiwirt.host_touch(&(*a).w)
+    edit_done(a, k)
+}
+
+// The caret of the focused field; false = no field has the focus.
+fn app_ime_spot(ud: u64, out: *mut [f64; 3]) -> bool {
+    let a: *mut App = ud as *mut App
+    if !(*a).spot_ok || ime_field(a) == NONE { return false }
+    (*out)[0] = (*a).spot[0]
+    (*out)[1] = (*a).spot[1]
+    (*out)[2] = (*a).spot[2]
     return true
 }

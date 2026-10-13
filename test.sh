@@ -2093,6 +2093,16 @@ else
     grep -E 'FAIL' "$WORK/textinput.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 136. fUi window text input through the platform input method (apphost wiring r444b, opt-in plat.fuiime): typing, dead key + Compose, pre-edit + commit, click / Tab during pre-edit, XIM @im=none on Xvfb + xdotool; rumble is in gate 127 (tools/input/apphost_run.sh, docs/INPUT.md) =="
+FIRNC="$FIRNC" bash tools/input/apphost_run.sh > "$WORK/apphost_ime.log" 2>&1 && AIMRC=0 || AIMRC=$?
+if [ "$AIMRC" -eq 0 ]; then
+    ok
+    grep -E '^   (ok|SKIP)' "$WORK/apphost_ime.log" | sed 's/^/ /'
+else
+    bad "tools/input/apphost_run.sh failed (see .test-work/apphost_ime.log)"
+    grep -E 'FAIL' "$WORK/apphost_ime.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 124. lib/input: raw keys / mouse state machine, relative mouse grab (X11 raw motion + warp fallback) under Xvfb+xdotool (tools/input/read_run.sh, docs/INPUT.md) =="
 FIRNC="$FIRNC" bash tools/input/read_run.sh > "$WORK/rawinput.log" 2>&1 && RAWINRC=0 || RAWINRC=$?
 if [ "$RAWINRC" -eq 0 ]; then

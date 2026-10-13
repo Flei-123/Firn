@@ -8,8 +8,13 @@ import std.rt
 import std.dynlib
 import input.padcore
 import input.padset
+import input.padff
+import std.time
 
-export { sys_open, sys_scan, sys_poll, sys_read_slot, sys_close, sys_name }
+export {
+    sys_open, sys_scan, sys_poll, sys_read_slot, sys_close, sys_name,
+    sys_rumble_supported, sys_rumble, sys_rumble_stop, sys_rumble_gain, sys_ff_tap,
+}
 
 fn sys_name() -> str { return "XInput" }
 
@@ -26,6 +31,7 @@ fn sys_open(s: *mut padset.PadSet) -> bool {
     }
     (*s).xdll = h
     (*s).xget = dynlib.sym(h, "XInputGetState")
+    (*s).xset = dynlib.sym(h, "XInputSetState")
     if (*s).xget == 0 as u64 {
         return false
     }
@@ -37,6 +43,7 @@ fn sys_close(s: *mut padset.PadSet) {
     var i: usize = 0
     while i < padset.MAXPADS {
         if padset.padset_active(s, i) {
+            let q: bool = send(s, i, 0 as u32, 0 as u32)
             padset.padset_detach(s, i)
         }
         i = i + 1
@@ -45,6 +52,7 @@ fn sys_close(s: *mut padset.PadSet) {
         dynlib.close((*s).xdll)
         (*s).xdll = 0 as u64
         (*s).xget = 0 as u64
+        (*s).xset = 0 as u64
     }
 }
 
@@ -69,6 +77,7 @@ fn sys_scan(s: *mut padset.PadSet) {
                 var nm: [u8; 7] = "XInput\0"
                 padcore.pad_set_name(&(*s).pad[slot as usize], (&nm[0]) as u64, 6)
                 (*s).pad[slot as usize].direct = true
+                padset.padset_set_ff_cap(s, slot as usize, (*s).xset != 0 as u64)
             }
         }
         u = u + 1 as u32
@@ -90,6 +99,17 @@ fn sys_read_slot(s: *mut padset.PadSet, i: usize) {
 }
 
 fn sys_poll(s: *mut padset.PadSet) {
+    // XInput's vibration has no duration: the rumble that ran out is stopped here
+    let now: u64 = time.monotonic_ns() / 1000000 as u64
+    var k: usize = 0
+    while k < padset.MAXPADS {
+        let until: u64 = padset.padset_ff_until(s, k)
+        if until != 0 as u64 && now >= until && padset.padset_active(s, k) {
+            let q: bool = send(s, k, 0 as u32, 0 as u32)
+            padset.padset_set_ff_until(s, k, 0 as u64)
+        }
+        k = k + 1
+    }
     (*s).idle = (*s).idle + 1
     if (*s).idle >= 60 { // XInput has no notification: look for new pads once in a while (a poll of a missing pad is slow)
         (*s).idle = 0
@@ -100,4 +120,65 @@ fn sys_poll(s: *mut padset.PadSet) {
         sys_read_slot(s, i)
         i = i + 1
     }
+}
+
+// ===================================================================================================================
+// RUMBLE (r434): XInputSetState(user, XINPUT_VIBRATION { u16 left = the big low-frequency motor, u16 right = the small one }).
+// BUILT ONLY: not run on real Windows, not even under Wine. XInput has no duration and no effect objects: the end of a
+// rumble is a deadline checked in sys_poll, the master gain is applied here to the two magnitudes.
+// ===================================================================================================================
+
+// no tap on Windows (the test seam of padsys.fi is Linux only)
+fn sys_ff_tap(fd: i64) {}
+
+fn sys_rumble_supported(s: *mut padset.PadSet, i: usize) -> bool {
+    return padset.padset_active(s, i) && padset.padset_kind(s, i) == padset.KIND_XINPUT && padset.padset_ff_cap(s, i)
+}
+
+fn scaled(v: u32, gain: u32) -> u32 {
+    return ((v as u64) * (gain as u64) / 65535 as u64) as u32
+}
+
+// the two magnitudes (already 0..65535) go to the pad times its gain; true = XInputSetState said ERROR_SUCCESS
+fn send(s: *mut padset.PadSet, i: usize, strong: u32, weak: u32) -> bool {
+    if (*s).xset == 0 as u64 || !padset.padset_active(s, i) {
+        return false
+    }
+    let g: u32 = padset.padset_ff_gain(s, i)
+    var vib: [u16; 2] = [0 as u16; 2]
+    vib[0] = scaled(strong, g) as u16
+    vib[1] = scaled(weak, g) as u16
+    return dynlib.ci2((*s).xset, (*s).node[i] as u64, (&vib[0]) as u64) == 0 as u64
+}
+
+fn sys_rumble(s: *mut padset.PadSet, i: usize, strong: u32, weak: u32, ms: u32) -> bool {
+    if !sys_rumble_supported(s, i) {
+        return false
+    }
+    if strong == 0 as u32 && weak == 0 as u32 {
+        return sys_rumble_stop(s, i)
+    }
+    if !send(s, i, strong, weak) {
+        return false
+    }
+    let now: u64 = time.monotonic_ns() / 1000000 as u64
+    padset.padset_set_ff_until(s, i, now + padff.ff_clamp_ms(ms) as u64)
+    return true
+}
+
+fn sys_rumble_stop(s: *mut padset.PadSet, i: usize) -> bool {
+    if !sys_rumble_supported(s, i) {
+        return false
+    }
+    padset.padset_set_ff_until(s, i, 0 as u64)
+    return send(s, i, 0 as u32, 0 as u32)
+}
+
+// the gain is kept for the next rumble (XInput has no master gain: the magnitudes are scaled)
+fn sys_rumble_gain(s: *mut padset.PadSet, i: usize, gain: u32) -> bool {
+    if !sys_rumble_supported(s, i) {
+        return false
+    }
+    padset.padset_set_ff_gain(s, i, gain)
+    return true
 }
