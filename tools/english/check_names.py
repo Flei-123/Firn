@@ -51,7 +51,9 @@ ERLAUBT = {'kernel', 'start', 'core', 'min', 'max', 'lib', 'bin', 'src',
            'gitattributes',
            # `der` is the ASN.1 encoding (lib/tls/the.fi), `mit` is the MIT
            # license (LICENSES/MIT.old.txt) -- not German words here.
-           'der', 'mit'}
+           'der', 'mit',
+           # `grab` is the English verb (mouse/pointer grab, lib/input/grab.fi), not the German "Grab".
+           'grab'}
 # Runde 65: englische GANZE Woerter, in denen ein deutsches Morphem als
 # Zeichenfolge steckt ('absolute' enthaelt 'absolut'). Die Suche im
 # Wortinneren darf hier nicht anschlagen; als ganzes Teil geprueft, nicht

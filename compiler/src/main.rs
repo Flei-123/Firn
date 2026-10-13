@@ -1400,6 +1400,11 @@ fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
 
 fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
     let t = target::active();
+    if t == target::Target::Aarch64 && !extfn::link_libs().is_empty() {
+        // Dynamic linking exists for x86_64 only; say so instead of letting `ld` fail on dlopen/dlsym.
+        eprintln!("error: `#[link_lib]` (dynamic linking, std.dynlib) is not supported on aarch64");
+        return Err(3);
+    }
     assemble(asm, obj)?;
     // `-n` (`--nmagic`) switches OFF the page alignment of the sections and
     // puts everything into ONE loadable segment. That was free as long as

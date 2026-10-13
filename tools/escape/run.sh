@@ -112,9 +112,12 @@ for f in tools/escape/reject/*.fi; do
         note "$name: the message has no help"
         continue
     fi
-    if ! cmp -s "$WORK/$name.c0" "$WORK/$name.c1"; then
+    # firnc1's driver appends one summary line (stage_failed in bin/firnc1.fi)
+    # after the diagnostic block; it is not part of the block itself.
+    grep -v '^error: .* reported errors; stage 1 prints no details for it$' "$WORK/$name.c1" > "$WORK/$name.c1f"
+    if ! cmp -s "$WORK/$name.c0" "$WORK/$name.c1f"; then
         note "$name: the two compilers say something different"
-        diff "$WORK/$name.c0" "$WORK/$name.c1" | head -8 | sed 's/^/        /'
+        diff "$WORK/$name.c0" "$WORK/$name.c1f" | head -8 | sed 's/^/        /'
         continue
     fi
     same=$((same + 1))
