@@ -2039,7 +2039,7 @@ else
     grep -E 'FAIL' "$WORK/glscene.log" | head -12 | sed 's/^/   /' || true
 fi
 
-echo "== 133. Graphics stack way E: Firn .so with C ABI (dlopen from C + ctypes), v128 min/max/div/sat/mul intrinsics (tools/stack_e/run.sh, docs/GRAPHICS-STACK-E-REQUIREMENTS.md) =="
+echo "== 134. Graphics stack way E: Firn .so with C ABI (dlopen from C + ctypes), v128 min/max/div/sat/mul intrinsics (tools/stack_e/run.sh, docs/GRAPHICS-STACK-E-REQUIREMENTS.md) =="
 FIRNC="$FIRNC" bash tools/stack_e/run.sh > "$WORK/stack_e.log" 2>&1 && SERC=0 || SERC=$?
 if [ "$SERC" -eq 0 ]; then
     ok

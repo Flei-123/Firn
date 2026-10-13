@@ -2,7 +2,7 @@
 
 OrientOS plans "way E": its own GL ES 3 / Vulkan subset as a **shared library written in Firn**, a **multi-core / SIMD
 CPU rasterizer**, and a **shader core as SPIR-V interpreter / JIT**. This file is the inventory (evidence, not
-promises) and the plan. Gate 133 = `tools/stack_e/run.sh`. Everything below was run on 13.10.2026 on x86-64 Linux
+promises) and the plan. Gate 134 = `tools/stack_e/run.sh`. Everything below was run on 13.10.2026 on x86-64 Linux
 (busy host, load 16-24) unless it says otherwise.
 
 ## 1. What works today (measured)
@@ -16,7 +16,7 @@ promises) and the plan. Gate 133 = `tools/stack_e/run.sh`. Everything below was 
 | **callbacks** C -> Firn (exports) and Firn -> C (call a C function pointer) | works, with a trick: `(*h).f(i)` is rejected ("pointer calls are not supported in stage 0"); bind `let f: fn(i64) -> i64 = ...` and wrap the C address into a record (a Firn `fn` value is a pointer to a record whose first word is the code address) | `se_call_cb`: C function pointer and a Python `CFUNCTYPE` both called 10x, sum correct |
 | module state in a global (`static mut`) | works (PIC, RIP-relative) | `se_count_inc` 1, 2 |
 | v128 SIMD in a PIC object | works | `se_fma4_f32` vs C and numpy, bit-identical; `mc_blend.mix_span/blend_span` inside the `.so` vs C and numpy, every weight / alpha |
-| runtime pieces without threads | `rt.heap_alloc` (mmap) and `jobs.parallel_for` with **0 workers** work in a `.so` | `lib_rt.fi`, gate 133 |
+| runtime pieces without threads | `rt.heap_alloc` (mmap) and `jobs.parallel_for` with **0 workers** work in a `.so` | `lib_rt.fi`, gate 134 |
 | fast float paths | release-fast is fast again (MC-FLOATS, RELEASE-FAST-REGRESSION): Raster bench 640x360 fast 21 ms / safe 26 / dev-fast 55 | KNOWLEDGE.md compiler section |
 | SIMD (v128) | SSE2 / SSE4.1 / SSSE3 / AES / SHA via `__v128_*` intrinsics, NEON twin for aarch64, `__cpu_features()` | docs/ROUND82.md, MC-FLOATS.md section 2 |
 
@@ -59,7 +59,7 @@ Eight new `v128` binary intrinsics (compiler: `simd.rs`, `simd_a64.rs`, `regallo
 
 ## 4. Plan (order, each step has its own proof)
 
-1. **G1 first** (blocks multi-core in a `.so`): shared mode TLS via `gs`; proof: `tools/stack_e/lib_rt.fi` `se_jobs_probe` with 3 workers equals the 0-worker result from C and ctypes; gate 133 prints "GAP CLOSED".
+1. **G1 first** (blocks multi-core in a `.so`): shared mode TLS via `gs`; proof: `tools/stack_e/lib_rt.fi` `se_jobs_probe` with 3 workers equals the 0-worker result from C and ctypes; gate 134 prints "GAP CLOSED".
 2. G2 + G3 (`firnc --shared`, header output, `std.cfn`): proof: the existing `lib_e.fi` builds without a manual `ld` line.
 3. G6 in the order the rasterizer needs it: `sqrt/rcp/rsqrt f32`, `shufps`, `cmpeq 8/16`, `movemask`, `mulhi16`, min/max i16/i32; then a `std.simd` wrapper with `f32x4` / `i32x4` / `u8x16`. Every addition: scalar cross-check test like 2860 + NEON twin under qemu.
 4. G9: SIMD edge functions in `mc_raster` (first real consumer; compare against current hash/PSNR of Raster/Sky).

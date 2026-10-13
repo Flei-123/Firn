@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/stack_e/run.sh -- gate 133: Firn shared object with C ABI (graphics stack way E, step 1).
+# tools/stack_e/run.sh -- gate 134: Firn shared object with C ABI (graphics stack way E, step 1).
 # firnc --pic -c -> ld -shared -> dlopen from C and ctypes from Python.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
