@@ -3,7 +3,8 @@
 #   1. smoke.fi: headless EGL GL 3.3 core context (Mesa llvmpipe), clear, readback
 #   2. dump.fi: the OpenGL back end (lib/gpu/gl_mc.fi, shaders mc_vs/mc_fs.glsl) against the CPU rasterizer
 #      (lib/mc/mc_raster.fi) on 8 scenes (triangle, textured quad x2, cut-out, voxel chunk, fog, camera inside, far
-#      from the origin): coverage mismatch + PSNR thresholds; ms/frame GPU (llvmpipe) vs CPU raster
+#      from the origin) + 3 translucent / entity scenes water_glass, water_glass_fog, boxes (PASS_TRANS, instanced entity boxes
+#      through gl_scene.scene_attach, r94; PSNR ~42 dB measured on llvmpipe, threshold 38): coverage mismatch + PSNR thresholds; ms/frame GPU (llvmpipe) vs CPU raster
 #   3. the same dump.fi built for Windows (lib/gpu/glctx.windows.fi, wgl) under Wine + Xvfb; its scene lines must be
 #      IDENTICAL to the Linux ones
 # Prints SKIP (exit 0) when libEGL is missing / no Wine. Usage: bash tools/gpu/run.sh [firnc]
