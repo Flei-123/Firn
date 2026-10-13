@@ -59,8 +59,9 @@ and the range (`supported_formats` number | [a,b] | {min_inclusive,max_inclusive
 * **Animation:** `<tex>.png.mcmeta` `animation` {frametime, frames [n | {index,time}], interpolate} on a vertical strip; frames resampled once; `res_tick(m, tick, &backend)`
   picks the frame per game tick (interpolation = integer blend, deterministic) and re-uploads the whole atlas when something changed (partial upload = later). Strips WITHOUT
   an `animation` object stay static (first frame) -- vanilla behaviour not verified. Square frames only.
-* **Not done yet:** wiring into `demos/mcview` / the live client entry (env/args -> ResMgr), pack sounds (OGG -> bank_provide; config flag `sounds=` is parsed and exposed via `res_sounds_mode`),
-  folder packs, models/blockstates (non-cubes still full cubes of their material; plants/torches have names in the table but no faces), `lang`, GUI textures.
+* **mcview wiring (13.10., s5):** `--pack=a.zip,b.zip` or env `MC_PACKS` / `MC_PACK_CONFIG` / `MC_PACK_AUTO` (+ `MC_PACK_DIR`, `MC_PACK_TILE`) -> `mc_packs.res_setup_env`; extended tile tables; `MCVIEW_PACK_TICK=n` (animation tick), `MCVIEW_PACK_RELOAD=1` (hot reload between frames). A windowed client calls `res_tick` once per game tick and `res_on_key(m, &backend, RES_KEY_RELOAD)` from its key handler. Offline test: `bash tools/mc/view/run.sh --offline` (fixture packs from `tools/mc/view/mkpack.py`: hash != default, deterministic, reload keeps the image, flag == env, 32 px != 16 px, priority, broken pack warns). Without packs the image is unchanged (python reference hash). Not compared with the python renderer when packs are on.
+* **Pack sounds (`lib/mc/mc_packsnd.fi`, test 2895):** `sounds.json` + `sounds/**.ogg` of every pack -> Aulos bank events (`packsnd_apply`, mode from `res_sounds_mode`: synth = nothing, original/both = pack events; first pack that defines an event wins it whole; weight/stream ignored; <= 400 files). Animation: partial atlas upload still whole-atlas.
+* **Not done yet:** folder packs, models/blockstates (non-cubes still full cubes of their material; plants/torches have names in the table but no faces), `lang`, GUI textures.
 
 ## Later
 * **Animated textures:** `<tile>.png.mcmeta` (`animation`: frametime, frames, interpolate); strip PNG (height = n * width); needs per-frame atlas upload or layer cycling.

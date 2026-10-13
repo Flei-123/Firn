@@ -94,5 +94,38 @@ EOF
         if [ -n "${MCVIEW_PNG_OUT:-}" ]; then cp "$W/live_all/view.png" "$MCVIEW_PNG_OUT"; cp "$W/live_all/world.mcw" "${MCVIEW_PNG_OUT%.png}.mcw" 2>/dev/null; echo "  PNG: $MCVIEW_PNG_OUT"; fi
     fi
 fi
+# resource packs (offline, fixture packs from tools/mc/view/mkpack.py): hash differs from the plain image, is deterministic, survives a
+# hot reload between frames, tile size 32 differs from 16, env == --pack flag, bad pack = warning + default look.
+pack_hash() { grep -m1 '^metric hash=' "$1" | sed 's/^metric hash=//'; }
+if [ "$MODE" = both ] || [ "$MODE" = --offline ]; then
+    python3 -I tools/mc/view/mkpack.py "$W/pa.zip" 16 0 && python3 -I tools/mc/view/mkpack.py "$W/pb.zip" 32 1 || { echo "  FAIL  mkpack"; ERR=1; }
+    echo "garbage" > "$W/bad.zip"
+    pk() { # <label> <extra env> <flags>
+        local lab=$1 envs=$2 flags=$3
+        mkdir -p "$W/pk_$lab"
+        # shellcheck disable=SC2086
+        env MCVIEW_FPS=60 $envs "$W/mcview" $flags --replay "$W/pk_$lab" tools/mc/view/fixture/world.mcw > "$W/pk_$lab.out" 2>&1 || { echo "  FAIL  mcview packs ($lab)"; head -5 "$W/pk_$lab.out"; ERR=1; }
+    }
+    pk plain "" ""
+    pk a1 "MC_PACKS=$W/pa.zip" ""
+    pk a2 "MC_PACKS=$W/pa.zip" ""
+    pk areload "MC_PACKS=$W/pa.zip MCVIEW_PACK_RELOAD=1" ""
+    pk aflag "" "--pack=$W/pa.zip"
+    pk b "MC_PACKS=$W/pb.zip" ""
+    pk top "MC_PACKS=$W/pb.zip,$W/pa.zip" ""
+    pk bad "MC_PACKS=$W/bad.zip" ""
+    HP=$(pack_hash "$W/pk_plain.out"); HA=$(pack_hash "$W/pk_a1.out"); HB=$(pack_hash "$W/pk_b.out")
+    chk() { if [ "$2" = "$3" ]; then echo "  ok    packs: $1"; else echo "  FAIL  packs: $1 ($2 vs $3)"; ERR=1; fi; }
+    chkne() { if [ -n "$2" ] && [ "$2" != "$3" ]; then echo "  ok    packs: $1"; else echo "  FAIL  packs: $1"; ERR=1; fi; }
+    chkne "pack image != default image" "$HA" "$HP"
+    chk "deterministic (2 runs)" "$HA" "$(pack_hash "$W/pk_a2.out")"
+    chk "hot reload between frames keeps the image" "$HA" "$(pack_hash "$W/pk_areload.out")"
+    chk "--pack flag == MC_PACKS" "$HA" "$(pack_hash "$W/pk_aflag.out")"
+    chkne "32 px pack differs from 16 px pack" "$HB" "$HA"
+    chk "priority: first pack wins" "$HB" "$(pack_hash "$W/pk_top.out")"
+    grep -q "cannot use pack" "$W/pk_bad.out" && echo "  ok    packs: broken pack warns" || { echo "  FAIL  packs: no warning for the broken pack"; ERR=1; }
+    # a broken pack must not change the look away from the extended default (== no pack at all, but extended tile ids)
+    [ -s "$W/pk_a1/view.png" ] || { echo "  FAIL  packs: no PNG"; ERR=1; }
+fi
 [ $ERR -eq 0 ] && echo "RESULT mc-view: ok" || echo "RESULT mc-view: FAIL"
 exit $ERR

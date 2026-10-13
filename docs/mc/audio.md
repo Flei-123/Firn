@@ -50,3 +50,7 @@ mc_audio.mca_on_packet(&m, &ver, id, &body, &entity_store)   // true = was a sou
 - `mca_set_block_change_sounds` + `mca_on_block_change` (off by default): solid->air = break, air->solid = place, call before the world applies the change. A vanilla server already sends the event / sound packet, so leave it off there.
 - `mca_ambient_tick` (`Ambient`): cave mood (dark for ~60 s -> `ambient.cave` 4..16 blocks away). Approximation of the game's mood sound, deterministic.
 - Tests: `bash tools/mc/audio/run.sh` also checks recorded REAL server packets (`tools/mc/audio/fixtures/sounds_*.jsonl`, made by `tools/mc/audio/sounds_live.sh`, needs a JVM + the vanilla jar as black box) against node-minecraft-protocol (`check_wire.py`), and `tests/2792_mc_audio_wire.fi` (tables of 5 versions, dispatch).
+
+## Block-type fallback + pack sounds (s5, 13.10.)
+* `mca_find(m, name)`: exact event first, else `block.<type>.<action>` -> `block.<material>.<action>` (`mca_type_material`, 13 materials). Used by `mca_play_at/_entity/_ui`, stop-sound and sound packets. Unknown non-block names stay silent (`n_missing`).
+* `mc_packsnd.packsnd_apply` loads resource-pack sounds (docs/mc/resourcepacks.md). Coverage tool + gap list: docs/audio/SYNTH.md.
