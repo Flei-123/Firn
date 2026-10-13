@@ -17,7 +17,7 @@ what a lost optimisation looks like — and not the noise.
 | `minquota_aes_dec.txt` | 685.3 MiB/s | 320 | unchanged |
 | `minquota_cfb8.txt` | 25.7 MiB/s | 14 | unchanged |
 | `minquota_deflate.txt` | 11.5 MiB/s | 6.5 | unchanged — round 87's DEFLATE work shows on real text, not on this generated corpus (docs/ROUND87.md §2) |
-| `maxquota_self_ms.txt` | **3,323 ms** | **5,000** | **round 87: was 40,000.** The self compile took 5,615 ms before this round, so a limit of 5,000 catches a return to that state, and it still leaves 50 % headroom over what was measured. |
+| `maxquota_self_ratio.txt` | **6.8 x** (11.4 s CPU / 1.7 s reference, load average 9) | **10.0** | **round 87 limit was 5,000 ms wall; the input has since grown (41,616 lines in lib/firnc1 alone) and the same compiler needs 11-12 s on the old and the new main, so that wall limit (scaled by load) was red on every run.** Now the ceiling is a RATIO of CPU times: the self compile (user+system of the process) divided by a fixed pure-Python loop (best of five). A busy machine slows both; a slower compiler only the numerator. |
 
 Raising a limit that the round did not move would only add flakiness without
 protecting anything new, so the crypto and DEFLATE limits stay where round 82
@@ -31,3 +31,12 @@ at all:
 |---|---:|---:|---|
 | `tools/bench87/minquota_json_float.txt` | 15.1 MiB/s | 7.0 | half of it, like the others |
 | `tools/bench87/maxsize_deflate6.txt` | 150,357 octets | 150,357 | **exact.** The compression ratio is not a measurement, it is a number the program computes; it does not fluctuate, so its limit does not have to. One octet more and the run fails. |
+
+## Why CPU time, not wall time (round after 13.10.2026)
+
+Wall time counts every moment a process waits for a core; on this shared server
+that was the whole "bench82 is red under load" problem (r460). `speed.fi` now
+reads `CLOCK_PROCESS_CPUTIME_ID`, and the self compile is measured with
+`getrusage`. CPU time still grows a little on a busy host (shared caches, SMT),
+which is why the throughput minimums sit at half of the measurement and the
+compile ceiling at 1.5 x its ratio.
