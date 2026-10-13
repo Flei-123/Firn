@@ -160,7 +160,9 @@ echo "== round 66: abandoned generators, promises, BigInts -- RSS stays flat =="
 measure "$WORK/gen.js" "gen" | tee "$WORK/gen.log"
 echo
 echo "== the counter check: the same objects, held onto -- RSS MUST grow =="
-GENLEAKR=$((ROUNDS / 10 + 2000))
+# The sampler skips the first samples (start-up) and polls every 50 ms: at ROUNDS/10+2000 the run took 0.3 s on a
+# faster engine and no sample saw the growth (counter check "grew 0 KiB"). Five times the rounds keep it above ~1 s.
+GENLEAKR=$((ROUNDS / 2 + 4000))
 sed -i "s|^var rounds = .*;|var rounds = $GENLEAKR;|" "$WORK/genleak.js"
 measure "$WORK/genleak.js" "genleak" | tee "$WORK/genleak.log"
 
