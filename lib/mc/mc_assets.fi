@@ -7,7 +7,9 @@ import std.rt
 import std.fs
 import zip.zip
 import paint.png
+import std.json
 import mc.mc_texture
+import mc.mc_texext
 
 const ASSET_OK: i32 = 0
 const ASSET_ERR_IO: i32 = -1 // file unreadable or empty
@@ -21,7 +23,9 @@ const MAX_PNG_PIXELS: u64 = 16777216 // 4096 x 4096
 struct Pack {
     data: rt.Buf, // the whole ZIP (the reader points into it)
     z: zip.ZipReader,
-    format: i32, // pack_format from pack.mcmeta
+    format: i32, // pack_format from pack.mcmeta (min_format when only that exists)
+    fmin: i32, // first supported format (supported_formats / min_format), = format when not declared
+    fmax: i32,
     open: bool,
 }
 
@@ -31,7 +35,7 @@ struct PackStack {
 }
 
 fn pack_empty() -> Pack {
-    return Pack { data: rt.buf_new(), z: zip.zip_reader_empty(), format: 0, open: false }
+    return Pack { data: rt.buf_new(), z: zip.zip_reader_empty(), format: 0, fmin: 0, fmax: 0, open: false }
 }
 
 fn stack_new() -> PackStack {
@@ -99,6 +103,73 @@ fn parse_pack_format(p: u64, n: usize) -> i32 {
     return -1
 }
 
+// First number of a JSON value that is a number or an array of numbers ([major, minor]); -1 otherwise.
+fn jfirst(d: *mut json.Json, v: u32) -> i32 {
+    if v == json.JSON_NONE { return 0 - 1 }
+    let k: u8 = json.json_kind(d, v)
+    if k == json.JSON_NUMBER { return json.json_int(d, v) as i32 }
+    if k == json.JSON_ARRAY && json.json_count(d, v) > 0 {
+        let c: u32 = json.json_child(d, v)
+        if json.json_kind(d, c) == json.JSON_NUMBER { return json.json_int(d, c) as i32 }
+    }
+    return 0 - 1
+}
+
+// Optional format range of pack.mcmeta: supported_formats (number | [min,max] | {min_inclusive,max_inclusive}) or
+// min_format / max_format (1.21.9+). Fills *fmt when pack_format is absent. Any parse problem leaves the defaults.
+fn parse_formats(p: u64, n: usize, fmt: *mut i32, fmin: *mut i32, fmax: *mut i32) {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, p, n) catch false
+    if !ok {
+        json.json_free(&d)
+        return
+    }
+    let root: u32 = json.json_root(&d)
+    let pk: u32 = json.json_get(&d, root, "pack".p as u64, 4)
+    if pk != json.JSON_NONE && json.json_kind(&d, pk) == json.JSON_OBJECT {
+        let mn: u32 = json.json_get(&d, pk, "min_format".p as u64, 10)
+        let mx: u32 = json.json_get(&d, pk, "max_format".p as u64, 10)
+        let sf: u32 = json.json_get(&d, pk, "supported_formats".p as u64, 17)
+        if *fmt < 0 && mn != json.JSON_NONE {
+            let v: i32 = jfirst(&d, mn)
+            if v >= 0 { *fmt = v }
+        }
+        if *fmt >= 0 {
+            *fmin = *fmt
+            *fmax = *fmt
+        }
+        if sf != json.JSON_NONE {
+            let k: u8 = json.json_kind(&d, sf)
+            if k == json.JSON_NUMBER {
+                *fmin = json.json_int(&d, sf) as i32
+                *fmax = *fmin
+            } else if k == json.JSON_ARRAY && json.json_count(&d, sf) >= 2 {
+                *fmin = json.json_int(&d, json.json_child_at(&d, sf, 0)) as i32
+                *fmax = json.json_int(&d, json.json_child_at(&d, sf, 1)) as i32
+            } else if k == json.JSON_OBJECT {
+                let a: u32 = json.json_get(&d, sf, "min_inclusive".p as u64, 13)
+                let b: u32 = json.json_get(&d, sf, "max_inclusive".p as u64, 13)
+                if a != json.JSON_NONE { *fmin = json.json_int(&d, a) as i32 }
+                if b != json.JSON_NONE { *fmax = json.json_int(&d, b) as i32 }
+            }
+        } else if mn != json.JSON_NONE {
+            let v: i32 = jfirst(&d, mn)
+            if v >= 0 { *fmin = v }
+            if mx != json.JSON_NONE {
+                let w: i32 = jfirst(&d, mx)
+                if w >= 0 { *fmax = w }
+            }
+        }
+    }
+    json.json_free(&d)
+}
+
+// true when the pack declares support for the pack_format `expected` (expected < 0 = unknown = no complaint).
+fn pack_format_ok(p: *mut Pack, expected: i32) -> bool {
+    if expected < 0 { return true }
+    return expected >= (*p).fmin && expected <= (*p).fmax
+}
+
 fn fail_open(e: ZipError, why: *mut i32) -> zip.ZipReader {
     *why = ASSET_ERR_ZIP
     return zip.zip_reader_empty()
@@ -124,13 +195,22 @@ fn pack_open_mem(p: *mut Pack, src: u64, n: usize) -> i32 {
     var meta: rt.Buf = rt.buf_new()
     var got: usize = zip.zip_extract(&(*p).z, mi as usize, &meta) catch | e | (0)
     var fmt: i32 = -1
-    if got > 0 { fmt = parse_pack_format(rt.buf_ptr(&meta), rt.buf_len(&meta)) }
+    var fmin: i32 = -1
+    var fmax: i32 = -1
+    if got > 0 {
+        fmt = parse_pack_format(rt.buf_ptr(&meta), rt.buf_len(&meta))
+        parse_formats(rt.buf_ptr(&meta), rt.buf_len(&meta), &fmt, &fmin, &fmax)
+    }
     rt.buf_free(&meta)
     if fmt < 0 {
         pack_close(p)
         return ASSET_ERR_BAD_MCMETA
     }
     (*p).format = fmt
+    if fmin < 0 { fmin = fmt }
+    if fmax < 0 { fmax = fmt }
+    (*p).fmin = fmin
+    (*p).fmax = fmax
     return ASSET_OK
 }
 
@@ -199,15 +279,21 @@ fn tile_file(t: u32) -> str {
     return ""
 }
 
+// ---------------------------------------------------------------- tile loading
+
+// Appends assets/minecraft/textures/block/<name><ext> to `path`.
+fn block_path(np: u64, nl: usize, ext: str, path: *mut rt.Buf) {
+    let pre: str = "assets/minecraft/textures/block/"
+    rt.buf_push_bytes(path, pre.p as u64, pre.length())
+    rt.buf_push_bytes(path, np, nl)
+    rt.buf_push_bytes(path, ext.p as u64, ext.length())
+}
+
 // Decodes assets/minecraft/textures/block/<name>.png from one pack. Must be square or a vertical
 // strip (height multiple of width, first frame used). false = absent or undecodable.
-fn pack_load_block(p: *mut Pack, name: str, im: *mut png.Image) -> bool {
+fn pack_load_block_bytes(p: *mut Pack, np: u64, nl: usize, im: *mut png.Image) -> bool {
     var path: rt.Buf = rt.buf_new()
-    let pre: str = "assets/minecraft/textures/block/"
-    rt.buf_push_bytes(&path, pre.p as u64, pre.length())
-    rt.buf_push_bytes(&path, name.p as u64, name.length())
-    let ext: str = ".png"
-    rt.buf_push_bytes(&path, ext.p as u64, ext.length())
+    block_path(np, nl, ".png", &path)
     let idx: i64 = pack_find_bytes(p, rt.buf_ptr(&path), rt.buf_len(&path))
     rt.buf_free(&path)
     if idx < 0 { return false }
@@ -226,15 +312,19 @@ fn pack_load_block(p: *mut Pack, name: str, im: *mut png.Image) -> bool {
     return true
 }
 
-// Nearest-neighbour resample of the first w x w frame to ts x ts, into RGBA8 bytes (R low byte).
-fn resample_tile(im: *mut png.Image, ts: i32, out: u64) {
+fn pack_load_block(p: *mut Pack, name: str, im: *mut png.Image) -> bool {
+    return pack_load_block_bytes(p, name.p as u64, name.length(), im)
+}
+
+// Nearest-neighbour resample of frame `fr` (a w x w square of the vertical strip) to ts x ts, into RGBA8 bytes (R low byte).
+fn resample_frame(im: *mut png.Image, fr: usize, ts: i32, out: u64) {
     let w: usize = png.image_width(im)
     var y: i32 = 0
     while y < ts {
         var x: i32 = 0
         while x < ts {
             let sx: usize = ((x as usize) * w) / (ts as usize)
-            let sy: usize = ((y as usize) * w) / (ts as usize)
+            let sy: usize = ((y as usize) * w) / (ts as usize) + fr * w
             let v: u32 = png.image_pixel(im, sx, sy) // 0xAARRGGBB
             let r: u32 = (v >> 16 as u32) & 255 as u32
             let g: u32 = (v >> 8 as u32) & 255 as u32
@@ -247,11 +337,258 @@ fn resample_tile(im: *mut png.Image, ts: i32, out: u64) {
     }
 }
 
-// Highest-priority pack that has the tile wins; others/fallback keep the atlas content. Returns the
-// number of tiles replaced. Atlas tile size is the caller's choice (images are resampled to it).
-fn assets_apply(s: *mut PackStack, a: *mut mc_texture.Atlas) -> i32 {
-    let ts: i32 = (*a).tile
-    let tmp: u64 = rt.heap_alloc((ts as usize) * (ts as usize) * 4)
+// Nearest-neighbour resample of the first w x w frame to ts x ts.
+fn resample_tile(im: *mut png.Image, ts: i32, out: u64) {
+    resample_frame(im, 0, ts, out)
+}
+
+// ---------------------------------------------------------------- animated textures
+// <name>.png.mcmeta {"animation": {"frametime": N, "interpolate": bool, "frames": [0, {"index": 2, "time": 5}, ...]}} next to a
+// vertical strip PNG (n square frames). Without an "animation" object a strip stays static (first frame). Square frames only
+// (animation.width/height are ignored). Time is counted in game ticks; every frame is resampled to the atlas tile size once.
+// Interpolation is integer (deterministic): out = (a * (256 - f) + b * f) / 256 per channel.
+
+const MAX_ANIM: usize = 128
+const MAX_ANIM_FRAMES: usize = 512
+
+struct Anim {
+    tile: u32,
+    nf: usize, // frames in the strip
+    ts: i32,
+    px: u64, // nf * ts * ts * 4 bytes
+    tmp: u64, // ts * ts * 4 bytes (interpolated frame)
+    seq: u64, // u16 per entry: frame index
+    dur: u64, // u16 per entry: ticks
+    len: usize, // entries in use
+    cap: usize, // allocated entries (seq / dur)
+    total: u64, // ticks of one cycle
+    interp: bool,
+    last: i64, // key of the frame state written last (-1 = nothing yet)
+}
+
+struct AnimSet {
+    a: [Anim; 128],
+    n: usize,
+}
+
+fn anim_empty() -> Anim {
+    return Anim { tile: 0 as u32, nf: 0, ts: 0, px: 0, tmp: 0, seq: 0, dur: 0, len: 0, cap: 0, total: 0 as u64, interp: false, last: 0 - 1 }
+}
+
+fn animset_new() -> AnimSet {
+    var s: AnimSet = AnimSet { a: [anim_empty(); 128], n: 0 }
+    return s
+}
+
+fn anim_free(an: *mut Anim) {
+    if (*an).px != 0 {
+        rt.heap_free((*an).px, (*an).nf * ((*an).ts as usize) * ((*an).ts as usize) * 4)
+        rt.heap_free((*an).tmp, ((*an).ts as usize) * ((*an).ts as usize) * 4)
+        rt.heap_free((*an).seq, (*an).cap * 2)
+        rt.heap_free((*an).dur, (*an).cap * 2)
+    }
+    (*an).px = 0
+}
+
+fn animset_free(s: *mut AnimSet) {
+    var i: usize = 0
+    while i < (*s).n {
+        anim_free(&(*s).a[i])
+        i = i + 1
+    }
+    (*s).n = 0
+}
+
+fn animset_count(s: *mut AnimSet) -> usize { return (*s).n }
+
+// Parses the mcmeta bytes; fills seq / dur / total / interp of `an` (nf already set). false = no usable "animation" object.
+fn anim_parse(p: u64, n: usize, an: *mut Anim) -> bool {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, p, n) catch false
+    if !ok {
+        json.json_free(&d)
+        return false
+    }
+    let root: u32 = json.json_root(&d)
+    let am: u32 = json.json_get(&d, root, "animation".p as u64, 9)
+    if am == json.JSON_NONE || json.json_kind(&d, am) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return false
+    }
+    var ft: i64 = 1
+    let ftn: u32 = json.json_get(&d, am, "frametime".p as u64, 9)
+    if ftn != json.JSON_NONE && json.json_kind(&d, ftn) == json.JSON_NUMBER { ft = json.json_int(&d, ftn) }
+    if ft < 1 { ft = 1 }
+    if ft > 65535 { ft = 65535 }
+    (*an).interp = false
+    let ip: u32 = json.json_get(&d, am, "interpolate".p as u64, 11)
+    if ip != json.JSON_NONE { (*an).interp = json.json_bool(&d, ip) }
+    let fr: u32 = json.json_get(&d, am, "frames".p as u64, 6)
+    var cnt: usize = (*an).nf
+    var listed: bool = false
+    if fr != json.JSON_NONE && json.json_kind(&d, fr) == json.JSON_ARRAY && json.json_count(&d, fr) > 0 {
+        cnt = json.json_count(&d, fr)
+        listed = true
+    }
+    if cnt > MAX_ANIM_FRAMES { cnt = MAX_ANIM_FRAMES }
+    (*an).seq = rt.heap_alloc(cnt * 2)
+    (*an).dur = rt.heap_alloc(cnt * 2)
+    (*an).cap = cnt
+    var used: usize = 0
+    var total: u64 = 0 as u64
+    var i: usize = 0
+    while i < cnt {
+        var idx: i64 = i as i64
+        var tm: i64 = ft
+        if listed {
+            let c: u32 = json.json_child_at(&d, fr, i)
+            let k: u8 = json.json_kind(&d, c)
+            if k == json.JSON_NUMBER {
+                idx = json.json_int(&d, c)
+            } else if k == json.JSON_OBJECT {
+                let ix: u32 = json.json_get(&d, c, "index".p as u64, 5)
+                let tn: u32 = json.json_get(&d, c, "time".p as u64, 4)
+                if ix != json.JSON_NONE { idx = json.json_int(&d, ix) } else { idx = 0 - 1 }
+                if tn != json.JSON_NONE { tm = json.json_int(&d, tn) }
+            } else {
+                idx = 0 - 1
+            }
+        }
+        if tm < 1 { tm = 1 }
+        if tm > 65535 { tm = 65535 }
+        if idx >= 0 && idx < ((*an).nf as i64) {
+            rt.st16((*an).seq, used, idx as u16)
+            rt.st16((*an).dur, used, tm as u16)
+            total = total + (tm as u64)
+            used = used + 1
+        }
+        i = i + 1
+    }
+    json.json_free(&d)
+    if used == 0 {
+        rt.heap_free((*an).seq, cnt * 2)
+        rt.heap_free((*an).dur, cnt * 2)
+        (*an).seq = 0
+        (*an).dur = 0
+        return false
+    }
+    (*an).cap = cnt
+    (*an).len = used
+    (*an).total = total
+    (*an).last = 0 - 1
+    return true
+}
+
+// Writes the frame state of tick `tick` into the atlas tile; returns true when the tile content changed.
+fn anim_step(an: *mut Anim, a: *mut mc_texture.Atlas, tick: i64) -> bool {
+    var pos: u64 = (tick as u64) % (*an).total
+    var e: usize = 0
+    var start: u64 = 0 as u64
+    while e + 1 < (*an).len {
+        let dd: u64 = rt.ld16((*an).dur, e) as u64
+        if pos < start + dd { break }
+        start = start + dd
+        e = e + 1
+    }
+    let dur: u64 = rt.ld16((*an).dur, e) as u64
+    let fa: usize = rt.ld16((*an).seq, e) as usize
+    let frame_bytes: usize = ((*an).ts as usize) * ((*an).ts as usize) * 4
+    if !(*an).interp {
+        let key: i64 = e as i64
+        if key == (*an).last { return false }
+        (*an).last = key
+        mc_texture.atlas_set_tile(a, (*an).tile, (*an).px + (fa * frame_bytes) as u64)
+        return true
+    }
+    let f: u64 = ((pos - start) * 256 as u64) / dur
+    let key: i64 = (e as i64) * 256 + (f as i64)
+    if key == (*an).last { return false }
+    (*an).last = key
+    var nx: usize = e + 1
+    if nx >= (*an).len { nx = 0 }
+    let fb: usize = rt.ld16((*an).seq, nx) as usize
+    let pa: u64 = (*an).px + (fa * frame_bytes) as u64
+    let pb: u64 = (*an).px + (fb * frame_bytes) as u64
+    let npx: usize = ((*an).ts as usize) * ((*an).ts as usize)
+    let fi: u32 = f as u32
+    var i: usize = 0
+    while i < npx {
+        let va: u32 = rt.ld32(pa, i)
+        let vb: u32 = rt.ld32(pb, i)
+        var o: u32 = 0 as u32
+        var sh: u32 = 0 as u32
+        while sh < 32 as u32 {
+            let ca: u32 = (va >> sh) & 255 as u32
+            let cb: u32 = (vb >> sh) & 255 as u32
+            o = o | ((((ca * (256 as u32 - fi)) + (cb * fi)) >> 8 as u32) & 255 as u32) << sh
+            sh = sh + 8 as u32
+        }
+        rt.st32((*an).tmp, i, o)
+        i = i + 1
+    }
+    mc_texture.atlas_set_tile(a, (*an).tile, (*an).tmp)
+    return true
+}
+
+// Advances every animated tile to game tick `tick` (call once per tick, or less often). Returns how many tiles changed; if > 0 the
+// caller re-uploads the atlas through the backend (upload_atlas; a partial upload is a later optimisation).
+fn anim_update(s: *mut AnimSet, a: *mut mc_texture.Atlas, tick: i64) -> i32 {
+    var changed: i32 = 0
+    var i: usize = 0
+    while i < (*s).n {
+        if anim_step(&(*s).a[i], a, tick) { changed = changed + 1 }
+        i = i + 1
+    }
+    return changed
+}
+
+// Reads <name>.png.mcmeta of the same pack; when it holds an animation for the strip `im`, registers the tile in `s` (all frames
+// resampled to ts). Returns true when registered.
+fn anim_register(p: *mut Pack, np: u64, nl: usize, im: *mut png.Image, ts: i32, tile: u32, s: *mut AnimSet) -> bool {
+    let nf: usize = png.image_height(im) / png.image_width(im)
+    if nf < 2 || nf > MAX_ANIM_FRAMES || (*s).n >= MAX_ANIM { return false }
+    var path: rt.Buf = rt.buf_new()
+    block_path(np, nl, ".png.mcmeta", &path)
+    let idx: i64 = pack_find_bytes(p, rt.buf_ptr(&path), rt.buf_len(&path))
+    rt.buf_free(&path)
+    if idx < 0 { return false }
+    var meta: rt.Buf = rt.buf_new()
+    var got: usize = zip.zip_extract(&(*p).z, idx as usize, &meta) catch | e | (0)
+    var an: Anim = anim_empty()
+    an.nf = nf
+    var ok: bool = false
+    if got > 0 { ok = anim_parse(rt.buf_ptr(&meta), rt.buf_len(&meta), &an) }
+    rt.buf_free(&meta)
+    if !ok { return false }
+    an.ts = ts
+    an.tile = tile
+    let fbytes: usize = (ts as usize) * (ts as usize) * 4
+    an.px = rt.heap_alloc(nf * fbytes)
+    an.tmp = rt.heap_alloc(fbytes)
+    var f: usize = 0
+    while f < nf {
+        resample_frame(im, f, ts, an.px + (f * fbytes) as u64)
+        f = f + 1
+    }
+    (*s).a[(*s).n] = an
+    (*s).n = (*s).n + 1
+    return true
+}
+
+// ---------------------------------------------------------------- apply to the atlas
+
+// Tries one candidate name in one pack; on success the tile is set (first frame) and, with `use_anim`, animation is registered.
+fn try_name(p: *mut Pack, np: u64, nl: usize, a: *mut mc_texture.Atlas, tile: u32, tmp: u64, s: *mut AnimSet, use_anim: bool) -> bool {
+    var im: png.Image = png.image_new()
+    if !pack_load_block_bytes(p, np, nl, &im) { return false }
+    resample_frame(&im, 0, (*a).tile, tmp)
+    var ok: bool = mc_texture.atlas_set_tile(a, tile, tmp)
+    if ok && use_anim { anim_register(p, np, nl, &im, (*a).tile, tile, s) }
+    png.image_free(&im)
+    return ok
+}
+
+fn apply_default_tiles(s: *mut PackStack, a: *mut mc_texture.Atlas, tmp: u64, an: *mut AnimSet, use_anim: bool) -> i32 {
     var replaced: i32 = 0
     var t: u32 = 1
     while t <= mc_texture.DEFAULT_TILES {
@@ -260,20 +597,59 @@ fn assets_apply(s: *mut PackStack, a: *mut mc_texture.Atlas) -> i32 {
             var pi: usize = 0
             var done: bool = false
             while pi < (*s).n && !done {
-                var im: png.Image = png.image_new()
-                if pack_load_block(&(*s).packs[pi], name, &im) {
-                    resample_tile(&im, ts, tmp)
-                    png.image_free(&im)
-                    if mc_texture.atlas_set_tile(a, t, tmp) {
-                        replaced = replaced + 1
-                        done = true
-                    }
+                if try_name(&(*s).packs[pi], name.p as u64, name.length(), a, t, tmp, an, use_anim) {
+                    replaced = replaced + 1
+                    done = true
                 }
                 pi = pi + 1
             }
         }
         t = t + 1
     }
+    return replaced
+}
+
+// Highest-priority pack that has the tile wins; others/fallback keep the atlas content. Returns the
+// number of tiles replaced. Atlas tile size is the caller's choice (images are resampled to it).
+fn assets_apply(s: *mut PackStack, a: *mut mc_texture.Atlas) -> i32 {
+    let ts: i32 = (*a).tile
+    let tmp: u64 = rt.heap_alloc((ts as usize) * (ts as usize) * 4)
+    var an: AnimSet = animset_new()
+    let r: i32 = apply_default_tiles(s, a, tmp, &an, false)
     rt.heap_free(tmp, (ts as usize) * (ts as usize) * 4)
+    return r
+}
+
+// Packs -> atlas for the extended tile layout (mc_texext): the default tiles 1..40 by their own names, then every extended tile by its
+// candidate list (first pack in priority order that has ANY candidate wins; inside a pack the candidates are tried in order).
+// Animations (see above) are registered into `an` (reset first) and set to tick 0. Returns the number of tiles replaced.
+fn assets_apply_ext(s: *mut PackStack, a: *mut mc_texture.Atlas, ex: *mut mc_texext.TexExt, an: *mut AnimSet) -> i32 {
+    let ts: i32 = (*a).tile
+    let tmp: u64 = rt.heap_alloc((ts as usize) * (ts as usize) * 4)
+    animset_free(an)
+    var replaced: i32 = apply_default_tiles(s, a, tmp, an, true)
+    var i: usize = 0
+    while i < mc_texext.texext_count(ex) {
+        let tile: u32 = mc_texext.texext_tile_id(i)
+        var pi: usize = 0
+        var done: bool = false
+        while pi < (*s).n && !done {
+            var k: usize = 0
+            var cp: u64 = 0
+            var cl: usize = 0
+            while !done && mc_texext.texext_cand(ex, i, k, &cp, &cl) {
+                if try_name(&(*s).packs[pi], cp, cl, a, tile, tmp, an, true) {
+                    replaced = replaced + 1
+                    done = true
+                }
+                k = k + 1
+            }
+            pi = pi + 1
+        }
+        i = i + 1
+    }
+    rt.heap_free(tmp, (ts as usize) * (ts as usize) * 4)
+    anim_update(an, a, 0)
+    mc_texture.atlas_build_avg(a)
     return replaced
 }
