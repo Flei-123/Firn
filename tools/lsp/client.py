@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""tools/lsp/client.py — ein echter LSP-Klient fuer die Gegenprobe.
+"""tools/lsp/client.py — a real LSP client for the cross-check.
 
-Er spricht mit `firnc --lsp` ueber Standardein- und -ausgabe, genau so wie ein
-Editor es taete: `Content-Length`-Kopf, JSON-Rumpf, Anfragen mit Nummer,
-Benachrichtigungen ohne. Er prueft die Antworten gegen Erwartungen und gibt
-am Ende PASSED/FAILED je Fall aus.
+It talks to `firnc --lsp` over standard input and output, exactly as an
+editor would: `Content-Length` header, JSON body, requests with a number,
+notifications without. It checks the answers against expectations and prints
+PASSED/FAILED per case at the end.
 
-Aufruf:  client.py <pfad-zu-firnc> <pfad-zur-testdatei>
+Usage:  client.py <path-to-firnc> <path-to-test-file>
 """
 import json
 import os

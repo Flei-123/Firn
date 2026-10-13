@@ -24,10 +24,10 @@ FIRNC="${FIRNC:-$(pwd)/compiler/target/release/firnc}"
 # Now the substitute check is NAMED and itself checked
 # (see section 1); if it fails, the run aborts.
 NONE_T="--target=x86_64-none"
-FREISTEHEND_ZIEL="ja"
+FREESTANDING_TARGET="ja"
 if ! "$FIRNC" --help 2>&1 | grep -q "x86_64-none"; then
     NONE_T=""
-    FREISTEHEND_ZIEL="nein"
+    FREESTANDING_TARGET="nein"
 fi
 W="${W:-/tmp/fui-acceptance}"
 mkdir -p "$W"
@@ -51,7 +51,7 @@ echo "== 1. THE CORE BUILDS FREESTANDING (profile kernel) =="
 # instructions" further below would be a coincidence of the source text. If
 # this substitute proof fails, the run has NOT passed -- it does not
 # silently continue any more.
-if [ "$FREISTEHEND_ZIEL" = "ja" ]; then
+if [ "$FREESTANDING_TARGET" = "ja" ]; then
     echo "  Freistehend-Ziel x86_64-none vorhanden, es wird gebaut     OK"
 else
     echo "  dieser Compiler kennt kein Freistehend-Ziel (x86_64-none);"
@@ -885,13 +885,13 @@ echo "== 19c. BESCHREIBEN IST KUERZER ALS MALEN, IN ZAHLEN =="
 # leeway; if one breaks, either a mark has slipped
 # or the statement in the head of gallery9_main.fi is no longer true -- and
 # a number that is no longer true is worse than none.
-zaehle_code() {
+count_code() {
     sed -e 's/^[[:space:]]*//' "$1" | grep -c -v -e '^$' -e '^//'
 }
-ohne_text() {
+no_text() {
     grep -v -e 'var [tu][0-9]: \[u8;' -e 'w_set_text(' -e 'node_set_text('
 }
-ohne_aussehen() {
+no_look() {
     grep -v -e 'painter\.round_rect' -e 'painter\.round_ring' \
         -e 'theme\.opaque' -e 'style\.style_set' -e 'style\.color_token' \
         -e 'let rs:' -e 'sheet\.decl_new' -e 'style\.style_new' \
@@ -903,19 +903,19 @@ sed -n '/>>> TOOLBAR/,/<<< TOOLBAR/p' \
     tools/fui/gallery9_main.fi > "$W/beschrieben.txt"
 sed -n '/>>> BAR RULES/,/<<< BAR RULES/p' \
     tools/fui/gallery9_main.fi >> "$W/beschrieben.txt"
-ohne_text < "$W/gemalt.txt" > "$W/gemalt_a.txt"
-ohne_text < "$W/beschrieben.txt" > "$W/beschrieben_a.txt"
-ohne_aussehen < "$W/gemalt_a.txt" > "$W/gemalt_b.txt"
-ohne_aussehen < "$W/beschrieben_a.txt" > "$W/beschrieben_b.txt"
-gemalt=$(zaehle_code "$W/gemalt.txt")
-beschrieben=$(zaehle_code "$W/beschrieben.txt")
-gemalt_a=$(zaehle_code "$W/gemalt_a.txt")
-beschrieben_a=$(zaehle_code "$W/beschrieben_a.txt")
-gemalt_b=$(zaehle_code "$W/gemalt_b.txt")
-beschrieben_b=$(zaehle_code "$W/beschrieben_b.txt")
+no_text < "$W/gemalt.txt" > "$W/painted_a.txt"
+no_text < "$W/beschrieben.txt" > "$W/beschrieben_a.txt"
+no_look < "$W/painted_a.txt" > "$W/painted_b.txt"
+no_look < "$W/beschrieben_a.txt" > "$W/beschrieben_b.txt"
+gemalt=$(count_code "$W/gemalt.txt")
+beschrieben=$(count_code "$W/beschrieben.txt")
+painted_a=$(count_code "$W/painted_a.txt")
+beschrieben_a=$(count_code "$W/beschrieben_a.txt")
+painted_b=$(count_code "$W/painted_b.txt")
+beschrieben_b=$(count_code "$W/beschrieben_b.txt")
 echo "  roh: gemalt $gemalt Zeilen, beschrieben $beschrieben Zeilen"
-echo "  A (ohne Texte): gemalt $gemalt_a, beschrieben $beschrieben_a"
-echo "  B (ohne Texte und Aussehen): gemalt $gemalt_b, beschrieben $beschrieben_b"
+echo "  A (ohne Texte): gemalt $painted_a, beschrieben $beschrieben_a"
+echo "  B (ohne Texte und Aussehen): gemalt $painted_b, beschrieben $beschrieben_b"
 if [ "$gemalt" -lt 40 ] || [ "$beschrieben" -lt 30 ]; then
     echo "  FEHLER: eine der beiden Seiten wurde nicht gefunden."
     echo "  Es fehlen die Marken TOOLBAR/BAR RULES in"
@@ -923,8 +923,8 @@ if [ "$gemalt" -lt 40 ] || [ "$beschrieben" -lt 30 ]; then
     echo "  demos/fuidemo/main.fi."
     exit 1
 fi
-if [ "$gemalt_b" -lt 30 ] || [ "$beschrieben_b" -lt 15 ]; then
-    echo "  FEHLER: die Filter ohne_text/ohne_aussehen haben zu viel"
+if [ "$painted_b" -lt 30 ] || [ "$beschrieben_b" -lt 15 ]; then
+    echo "  FEHLER: die Filter no_text/no_look haben zu viel"
     echo "  weggenommen -- der Zuschnitt B ist damit keine Messung mehr."
     exit 1
 fi
@@ -953,17 +953,17 @@ fi
 # writes colour and radius ONCE for the whole page, in this
 # comparison that counts against it nevertheless. Demanded are at most
 # two thirds (measured on 22.09.2026: 30 of 54, so 56 %).
-if [ $((beschrieben_a * 3)) -gt $((gemalt_a * 2)) ]; then
+if [ $((beschrieben_a * 3)) -gt $((painted_a * 2)) ]; then
     echo "  FEHLER: beschrieben ist mit dem Aussehen nicht mehr kuerzer"
-    echo "  als gemalt ($beschrieben_a von $gemalt_a Zeilen)."
+    echo "  als gemalt ($beschrieben_a von $painted_a Zeilen)."
     exit 1
 fi
 # Cut B: the structure itself. Demanded here too is at most
 # half (measured on 23.09.2026: 16 of 46, so
 # 35 %).
-if [ $((beschrieben_b * 2)) -gt "$gemalt_b" ]; then
+if [ $((beschrieben_b * 2)) -gt "$painted_b" ]; then
     echo "  FEHLER: die beschriebene Gliederung braucht mehr als die"
-    echo "  Haelfte der gemalten ($beschrieben_b von $gemalt_b Zeilen)."
+    echo "  Haelfte der gemalten ($beschrieben_b von $painted_b Zeilen)."
     exit 1
 fi
 echo "  beschrieben ist in beiden Zuschnitten kuerzer als gemalt   OK"
@@ -1001,7 +1001,7 @@ echo "== 19d. DIESELBE LEISTE, DIESELBE DATEI, ZWEI FASSUNGEN =="
 # including its class names -- that is the look there) what remains
 # is WHAT stands there. There the description saves the measuring, the distribution,
 # the setting of each rectangle and the own drawing loop.
-ohne_aussehen_d() {
+no_look_d() {
     grep -v -e 'painter\.round_rect' -e 'painter\.round_ring' \
         -e 'theme\.opaque' -e 'theme\.theme_colors' \
         -e 'render\.ctx_painter' -e 'style\.style_set' \
@@ -1015,16 +1015,16 @@ sed -n '/>>> TOOLBAR DESCRIBED/,/<<< TOOLBAR DESCRIBED/p' \
     demos/fuidemo/main.fi > "$W/leiste_b.txt"
 sed -n '/>>> TOOLBAR PAINTED/,/<<< TOOLBAR PAINTED/p' \
     demos/fuidemo/main.fi > "$W/leiste_g.txt"
-ohne_text < "$W/leiste_b.txt" > "$W/leiste_ba.txt"
-ohne_text < "$W/leiste_g.txt" > "$W/leiste_ga.txt"
-ohne_aussehen_d < "$W/leiste_ba.txt" > "$W/leiste_bb.txt"
-ohne_aussehen_d < "$W/leiste_ga.txt" > "$W/leiste_gb.txt"
-lb=$(zaehle_code "$W/leiste_b.txt")
-lg=$(zaehle_code "$W/leiste_g.txt")
-lba=$(zaehle_code "$W/leiste_ba.txt")
-lga=$(zaehle_code "$W/leiste_ga.txt")
-lbb=$(zaehle_code "$W/leiste_bb.txt")
-lgb=$(zaehle_code "$W/leiste_gb.txt")
+no_text < "$W/leiste_b.txt" > "$W/leiste_ba.txt"
+no_text < "$W/leiste_g.txt" > "$W/leiste_ga.txt"
+no_look_d < "$W/leiste_ba.txt" > "$W/leiste_bb.txt"
+no_look_d < "$W/leiste_ga.txt" > "$W/leiste_gb.txt"
+lb=$(count_code "$W/leiste_b.txt")
+lg=$(count_code "$W/leiste_g.txt")
+lba=$(count_code "$W/leiste_ba.txt")
+lga=$(count_code "$W/leiste_ga.txt")
+lbb=$(count_code "$W/leiste_bb.txt")
+lgb=$(count_code "$W/leiste_gb.txt")
 echo "  roh: beschrieben $lb Zeilen, gemalt $lg Zeilen"
 echo "  A (ohne Texte): beschrieben $lba, gemalt $lga"
 echo "  B (nur Gliederung): beschrieben $lbb, gemalt $lgb"
@@ -1313,18 +1313,18 @@ if [ "$1" = "--images" ]; then
     # rejects by name.) The program itself checks that every shown
     # character has a glyph, that nothing overlaps and nothing runs out of
     # its box, and otherwise writes no PNG.
-    SCHRIFT_CJK="${SCHRIFT_CJK:-/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc}"
-    if [ ! -r "$SCHRIFT_CJK" ]; then
-        echo "  FEHLER: die CJK-Schrift \"$SCHRIFT_CJK\" ist nicht lesbar."
+    FONT_CJK="${FONT_CJK:-/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc}"
+    if [ ! -r "$FONT_CJK" ]; then
+        echo "  FEHLER: die CJK-Schrift \"$FONT_CJK\" ist nicht lesbar."
         echo "  Ohne CJK-Glyphen zeigt der IME-Beleg leere Kaesten. Installiere"
-        echo "  fonts-wqy-zenhei oder setze SCHRIFT_CJK auf eine TrueType-Datei"
+        echo "  fonts-wqy-zenhei oder setze FONT_CJK auf eine TrueType-Datei"
         echo "  (glyf-Umrisse) mit Kana, Hangul und Hanzi."
         exit 1
     fi
     build imebeleg
     kette imebeleg 1000
-    "$W/imebeleg" "$Z/fui-ime-hell.png" light "$SCHRIFT_CJK"
-    "$W/imebeleg" "$Z/fui-ime-dunkel.png" dark "$SCHRIFT_CJK"
+    "$W/imebeleg" "$Z/fui-ime-hell.png" light "$FONT_CJK"
+    "$W/imebeleg" "$Z/fui-ime-dunkel.png" dark "$FONT_CJK"
     beleg "$Z/fui-ime-hell.png" 1000 400 485 200 40 1
     beleg "$Z/fui-ime-dunkel.png" 1000 400 485 200 40 1
     ls -la "$Z"

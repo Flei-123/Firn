@@ -30,11 +30,11 @@ WORK=.bench-instr
 OPT="${OPT:-release-fast}"
 mkdir -p "$WORK"
 
-QUELLEN=()
+SOURCES=()
 if [ "$#" -gt 0 ]; then
-    for n in "$@"; do QUELLEN+=("bench/firn/$n.fi"); done
+    for n in "$@"; do SOURCES+=("bench/firn/$n.fi"); done
 else
-    for f in bench/firn/*.fi; do QUELLEN+=("$f"); done
+    for f in bench/firn/*.fi; do SOURCES+=("$f"); done
 fi
 
 # Count the instructions of one program. Empty output = failed.
@@ -51,7 +51,7 @@ printf '%-14s %16s %16s %10s\n' PROGRAM OLD NEW CHANGE
 echo "-------------------------------------------------------------"
 sa=0
 sn=0
-for src in "${QUELLEN[@]}"; do
+for src in "${SOURCES[@]}"; do
     name=$(basename "$src" .fi)
     if ! "$OLD" --opt-level="$OPT" "$src" -o "$WORK/$name.old" 2>/dev/null; then
         printf '%-14s   BUILD ERROR (old)\n' "$name"

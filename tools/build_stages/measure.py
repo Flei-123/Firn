@@ -24,15 +24,15 @@ def measure(binary):
 
 
 def main():
-    quellen = sorted(glob.glob("bench/firn/*.fi"))
-    if not quellen:
+    sources = sorted(glob.glob("bench/firn/*.fi"))
+    if not sources:
         raise SystemExit("keine Benchmarks unter bench/firn/ gefunden")
     print(f"build stage comparison, {RUNS} runs per program, median\n")
     print(f"{'Benchmark':<14}{'dev':>10}{'dev-fast':>11}{'release':>10}"
           f"{'dev-fast/rel':>14}{'dev/rel':>10}")
     print("-" * 69)
     ratio_df, ratio_dev, errs = [], [], 0
-    for q in quellen:
+    for q in sources:
         name = os.path.basename(q)[:-3]
         times, output = {}, {}
         for st in STUFEN:

@@ -18,13 +18,13 @@ cd "$(dirname "$0")/.."
 
 OLD="${1:?first firnc missing}"
 NEW="${2:?second firnc missing}"
-LAEUFE="${3:-9}"
+RUNS="${3:-9}"
 WORK=.bench-ab
 rm -rf "$WORK"; mkdir -p "$WORK"
 
 beste() {
     local best="" i a b t
-    for ((i = 0; i < LAEUFE; i++)); do
+    for ((i = 0; i < RUNS; i++)); do
         a=$(date +%s.%N)
         "$@" >/dev/null 2>&1
         b=$(date +%s.%N)
@@ -36,8 +36,8 @@ beste() {
 
 printf '%-14s %10s %10s %9s\n' PROGRAM OLD NEW CHANGE
 echo "---------------------------------------------------"
-summe_alt=0
-summe_neu=0
+sum_old=0
+sum_new=0
 for src in bench/firn/*.fi; do
     name=$(basename "$src" .fi)
     if ! "$OLD" "$src" -o "$WORK/$name.old" 2>"$WORK/$name.old.err"; then
@@ -55,11 +55,11 @@ for src in bench/firn/*.fi; do
     fi
     ta=$(beste "$WORK/$name.old")
     tn=$(beste "$WORK/$name.new")
-    summe_alt=$(awk -v a="$summe_alt" -v b="$ta" 'BEGIN{print a+b}')
-    summe_neu=$(awk -v a="$summe_neu" -v b="$tn" 'BEGIN{print a+b}')
+    sum_old=$(awk -v a="$sum_old" -v b="$ta" 'BEGIN{print a+b}')
+    sum_new=$(awk -v a="$sum_new" -v b="$tn" 'BEGIN{print a+b}')
     awk -v n="$name" -v a="$ta" -v b="$tn" \
         'BEGIN{printf "%-14s %9.4fs %9.4fs %+8.1f%%\n", n, a, b, (b-a)/a*100}'
 done
 echo "---------------------------------------------------"
-awk -v a="$summe_alt" -v b="$summe_neu" \
+awk -v a="$sum_old" -v b="$sum_new" \
     'BEGIN{printf "%-14s %9.4fs %9.4fs %+8.1f%%\n", "TOTAL", a, b, (b-a)/a*100}'
