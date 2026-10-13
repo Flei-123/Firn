@@ -73,7 +73,7 @@ cases = [
 ]
 ns = [500, 1000, 2000, 4000]
 bad = 0
-print("  regex: worst case, microseconds for one scan of \"a\" x n (best of 3), and the growth per doubling of n")
+print("  regex: worst case, microseconds for one scan of \"a\" x n (best of 5, process CPU time), and the growth per doubling of n")
 print("  %-28s %-38s %s   %s" % ("pattern", "what", "  ".join("%9d" % n for n in ns), "growth (limit)"))
 for pat, what, limit in cases:
     t = [int(subprocess.run([worst, pat, str(n)], capture_output=True, text=True, check=True).stdout) for n in ns]
