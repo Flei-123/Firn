@@ -99,3 +99,27 @@ WebGL2 context loss, frame time (the `--dump-dom` run uses virtual time; no hone
 3. Scene layer (sky/tint/entity/HUD shaders) in ES 3.00, MSAA, filtered texture path.
 4. Frame-time measurement with a real browser session (CDP `Performance`, rAF timestamps), Firefox/Safari smoke, real GPU run.
 5. Context-loss recovery, WebSocket gateway interface, AudioWorklet sink.
+
+## 9. Scene layer, frame loop, input, context loss (round gpu-q, 2026-10-13, gate 133)
+
+**Scene layer** `lib/gpu/glweb_scene.fi` (`gpu.glweb_scene`, `wscene_*`): twin of `gl_scene.fi` -- sky, light tint, entity instancing (frustum + software Hi-Z
+culling by `gpu.cull`, pure Firn), HUD rectangles from `mc_hud.hud_record`. ES 3.00 shaders `glweb_{sky_vs,sky_fs,tint_fs,ent_vs,ent_fs,hud_vs,hud_fs}.glsl`
+(copies of `gl_*.glsl`, new header; HUD rect attribute `uvec4` because ES checks the attribute base type -- **a change in `gl_*.glsl` must be mirrored**).
+`glweb.glweb_rebind` (voxel state back after a pass) and `glweb_camera_rv` are the `glbe_rebind` / `glbe_camera_rv` twins. `glbe_flush` is a no-op (legacy mode draws at once).
+Not there: timer queries (`wscene_timers()` is false, `wscene_pass_ms` 0.0; EXT_disjoint_timer_query_webgl2 not wired), MSAA/resolve, `scene_present_window`.
+Gate 133 (`tools/gpu/web/run_scene.sh`, scenes in `sceneref.fi`): 7 scenes in headless Chromium/SwiftShader vs mc_raster+mc_sky+mc_hud, in-module PSNR 54-99 dB
+(sky byte equal, max channel diff 2), canvas PNG vs native frames 54-99 dB, cull on/off byte equal (drawn 2 vs 6). Threshold 34 dB.
+
+**Frame loop / input / resize**: `startMcWeb` (glweb.js) now runs a `requestAnimationFrame` loop when the module exports `firn_mc_frame(ms) -> u32` (0 = stop) and calls
+`firn_mc_resize(cssW, cssH, dprMilli)` (ResizeObserver + dpr change); the program calls `glweb_resize(round(css*dpr))`. Input: `lib/input/webraw.fi` (`input.webraw`) exports
+`firn_in_key/button/motion/wheel/focus/lock_state`, queues the arguments of `raw.raw_feed` in a ring and `webraw_poll(&raw)` = raw_begin + feed + raw_end, so game code is the
+same as with `lib/window` (`raw.key_pressed`, `raw.mouse_dx`). Pointer Lock: `webraw_lock(true)` -> `canvas.requestPointerLock` (user gesture only), delta counts only while locked.
+**Context loss**: host keeps `ctxLost/ctxGen` (`webglcontextlost` preventDefault, restored drops all ids); `glweb_poll_context` returns CTX_LOST (skip frame) / CTX_RESTORED
+(program, FBO, atlas, meshes with CPU copy rebuilt; `keep_meshes` default on) -- then call `wscene_recreate`. **These three (loop, input, loss) compile but have NO automated browser test yet**
+(pointer lock cannot run headless; rAF/loss test page is the next step).
+
+**Minecraft browser build (interface only)**: entry = `main` builds world/back end once, exports `firn_mc_frame` (rAF), `firn_mc_resize`; input = `webraw_poll`; assets = host `fetch`
+-> wasm memory (`firn_web_alloc` style) feeding `mc_assets` (no file system); network = WebSocket gateway imports `net_open/net_send/net_poll/net_close` (section 6), not built.
+
+**@web twins (section 4)**: still NOT done. `gl_mc.fi` pulls gl33 (1011 lines), gl_ext (662), glctx (669), gl_fbo, gl_tex, gl_prog, gl_query, glpool = ~3500 lines of `dynlib` wrappers to re-implement on `firn_glw_*`.
+Smallest clean step: `lib/@web/gpu/gl33.fi` + `gl_ext.fi` twins with identical exports; until then `glweb.fi` + `glweb_scene.fi` are the maintained twins.
