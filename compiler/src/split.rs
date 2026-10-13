@@ -139,7 +139,7 @@ pub(crate) fn split_at_loops(f: &mut Func) -> usize {
         Err(_) => 3,
     };
     let mut inserted = 0usize;
-    let mut already: HashSet<usize> = HashSet::new(); // Kopf schon bearbeitet
+    let mut already: HashSet<usize> = HashSet::new(); // head already processed
 
     for (head, body) in loops {
         if !already.insert(head) {

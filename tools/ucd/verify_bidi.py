@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""tools/ucd/verify_bidi.py -- die Gegenrechnung zur Bidi-Tabelle.
+"""tools/ucd/verify_bidi.py -- the counter-computation for the Bidi table.
 
-Ein ZWEITER Zerleger fuer dieselben fuenf Dateien der UCD, in einer
-zweiten Sprache, ohne eine Zeile aus tools/ucd/pack_bidi.fi. Er rechnet
-fuer jeden der 1.114.112 Codepunkte aus, was in der Tabelle stehen MUSS,
-und vergleicht es mit dem, was tools/ucd/probe_bidi.fi ueber
-lib/str/ucd_bidi.fi aus der Tabelle HERAUSLIEST.
+A SECOND parser for the same five UCD files, in a
+second language, without a single line from tools/ucd/pack_bidi.fi. For
+each of the 1,114,112 code points it computes what MUST be in the table,
+and compares it with what tools/ucd/probe_bidi.fi READS OUT of the table via
+lib/str/ucd_bidi.fi.
 
-Stimmt eine einzige Zeile nicht, endet es mit 1 und nennt sie.
-tools/ucd/build_bidi.sh faelscht zur Gegenprobe absichtlich eine Zeile
-und verlangt, dass dieses Skript dann anschlaegt -- eine Pruefung, die
-nicht scheitern kann, beweist nichts.
+If a single line does not match, it ends with 1 and names it.
+tools/ucd/build_bidi.sh deliberately forges a line as a control
+and requires that this script then raises an alarm -- a check that
+cannot fail proves nothing.
 
-Aufruf:  python3 tools/ucd/verify_bidi.py <ausgabe von probe_bidi> <ucd-ordner>
+Usage:  python3 tools/ucd/verify_bidi.py <output of probe_bidi> <ucd-folder>
 """
 import os
 import sys
