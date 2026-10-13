@@ -91,6 +91,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gen_registry
 import gen_sounds  # noqa: E402
 import gen_entity  # noqa: E402
+import gen_blocktex  # noqa: E402
 
 FORMAT = 2
 
@@ -930,6 +931,7 @@ def main():
             entries.append((pver, vkey))
         write_registry(os.path.join(libdir, "mc_versions.fi"), entries)
         gen_entity.generate(data_dir, [e[1] for e in entries], load_protocol, os.path.join(libdir, "mc_entity_layout.fi"))
+        gen_blocktex.generate(data_dir, libdir)
         return
     if len(sys.argv) != 4:
         raise SystemExit(__doc__)
