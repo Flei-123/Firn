@@ -49,21 +49,21 @@ fi
 
 echo "== soak run: $THREADS threads, ${SECS}s, LOCAL=$LOCAL_LISTS =="
 set +e
-timeout $((SECS + 120)) "$WORK/stress" > "$WORK/aus.tsv" 2>"$WORK/err2"
+timeout $((SECS + 120)) "$WORK/stress" > "$WORK/out.tsv" 2>"$WORK/err2"
 rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
     echo "FAILED: return value $rc"
     echo "  1 = a thread found a destroyed chain (the collector collected something live)"
     echo "  2/3/4 = a counter is wrong * 5 = a thread was left over * 124 = timeout"
-    tail -5 "$WORK/aus.tsv"
+    tail -5 "$WORK/out.tsv"
     head -5 "$WORK/err2"
     exit 1
 fi
 
-sed 's/^/  /' "$WORK/aus.tsv"
+sed 's/^/  /' "$WORK/out.tsv"
 
-get() { awk -v c="$1" '$1=="Q" && $2==c {print $3}' "$WORK/aus.tsv"; }
+get() { awk -v c="$1" '$1=="Q" && $2==c {print $3}' "$WORK/out.tsv"; }
 errword=$(get 0)
 rounds=$(get 1)
 with_lock=$(get 2)
@@ -73,9 +73,9 @@ rss_end=$(get 5)
 runs=$(get 6)
 stw=$(get 7)
 
-rss_min=$(awk '$1=="S" {print $3}' "$WORK/aus.tsv" | sort -n | head -1)
-rss_max=$(awk '$1=="S" {print $3}' "$WORK/aus.tsv" | sort -n | tail -1)
-samples=$(grep -c '^S' "$WORK/aus.tsv" || true)
+rss_min=$(awk '$1=="S" {print $3}' "$WORK/out.tsv" | sort -n | head -1)
+rss_max=$(awk '$1=="S" {print $3}' "$WORK/out.tsv" | sort -n | tail -1)
+samples=$(grep -c '^S' "$WORK/out.tsv" || true)
 
 echo
 echo "  rounds           $rounds"

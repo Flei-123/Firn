@@ -50,7 +50,7 @@ fn vectors(n: usize, seed: u64) -> Vec<u64> {
         let bits = rng.next();
         let exp = (bits >> 52) & 0x7FF;
         if exp == 0x7FF {
-            continue; // NaN/Inf haben keine Zifferndarstellung
+            continue; // NaN/Inf have no digit form
         }
         if bits << 1 == 0 {
             continue; // +-0 ist gesondert geprueft (305_dtoa_hardcases)
@@ -137,8 +137,8 @@ fn ecma(x: f64) -> String {
     let neg = x.is_sign_negative();
     // {:e} yields the shortest form with a guarantee of conversion back.
     let s = format!("{:e}", x.abs());
-    let (mant, exp) = s.split_once('e').expect("{:e} hat immer ein e");
-    let exp: i64 = exp.parse().expect("exponent ist eine zahl");
+    let (mant, exp) = s.split_once('e').expect("{:e} always has an e");
+    let exp: i64 = exp.parse().expect("exponent is a number");
     let digits: String = mant.chars().filter(|c| *c != '.').collect();
     let digits = digits.trim_end_matches('0');
     let digits = if digits.is_empty() { "0" } else { digits };
@@ -182,7 +182,7 @@ fn main() {
     let n: usize = args[2].parse().unwrap_or(0);
     let seed: u64 = args[3].parse().unwrap_or(1);
     if n == 0 {
-        eprintln!("N muss > 0 sein");
+        eprintln!("N must be > 0");
         std::process::exit(2);
     }
     let v = vectors(n, seed);
@@ -199,7 +199,7 @@ fn main() {
             std::io::stdin().read_to_string(&mut text).expect("lesen");
             let lines: Vec<&str> = text.lines().collect();
             if lines.len() != n {
-                eprintln!("erwartet {} zeilen, bekommen {}", n, lines.len());
+                eprintln!("expected {} lines, got {}", n, lines.len());
                 std::process::exit(1);
             }
             let mut bad = 0usize;
@@ -219,7 +219,7 @@ fn main() {
                     _ => {
                         roundtrip_bad += 1;
                         if roundtrip_bad <= 10 {
-                            eprintln!("  #{} bits={:#018x}: '{}' faellt nicht zurueck", i, bits, line);
+                            eprintln!("  #{} bits={:#018x}: '{}' does not fall back", i, bits, line);
                         }
                     }
                 }
