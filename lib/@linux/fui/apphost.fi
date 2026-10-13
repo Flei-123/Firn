@@ -32,7 +32,7 @@ import plat.fuipopup
 import fui.menuview
 
 export {
-    Hooks, hooks_blank, hooks_new, hooks_set_audit, hooks_set_buf, hooks_set_edited, hooks_set_popups, run,
+    Hooks, hooks_blank, hooks_new, hooks_set_audit, hooks_set_buf, hooks_set_edited, hooks_set_popups, hooks_set_ime, ImeBind, ime_install, run,
     PLATFORM,
     PLATFORM_LINUX, PLATFORM_WEB,
 }
@@ -77,6 +77,60 @@ struct Hooks {
     // THE MENU VIEW (r168): the program's lib/fui/menuview.fi, 0 = none yet; this
     // host gives its menus windows of their own on the screen
     popups: fn(u64) -> u64,
+    // THE INPUT METHOD (r444b, lib/plat/fuitext.fi): pre-edit text / commit / cancel / delete-surrounding of the focused field, "the
+    // field takes the pending pre-edit text as it is" (a click), and the caret (x, y, height in window pixels) for the candidate window
+    ime_pre: fn(u64, u64, usize, usize) -> bool,
+    ime_commit: fn(u64, u64, usize) -> bool,
+    ime_end: fn(u64),
+    ime_del: fn(u64, usize, usize) -> bool,
+    ime_confirm: fn(u64),
+    ime_spot: fn(u64, *mut [f64; 3]) -> bool,
+}
+
+// THE INPUT METHOD TABLE (r444b). apphost does NOT import plat.fuitext: that pulls in std.dynlib (libX11), which makes the image a
+// dynamically linked ELF on Linux and does not build for aarch64, so every fUi program would lose its static image. A program that
+// wants XIM / IMM32 text input imports plat.fuiime and calls `fuiime.enable()` before app.run; that installs this table. Without
+// it every call below is skipped and the window sends plain EV_CHAR as before.
+struct ImeBind {
+    open: fn(*mut window.Window) -> bool,
+    set_sink: fn(u64, fn(u64, u64, usize, usize) -> bool, fn(u64, u64, usize) -> bool, fn(u64), fn(u64, usize, usize) -> bool),
+    event: fn(u32, u32, u32, f64, f64),
+    swallow: fn(u32, u32, u32) -> bool,
+    pump: fn(),
+    fd: fn() -> i32,
+    reset: fn(),
+    spot: fn(f64, f64, f64),
+    on: fn() -> bool,
+    close: fn(),
+}
+
+static mut IME_TABLE: u64 = 0
+
+fn ime_install(b: *mut ImeBind) {
+    IME_TABLE = b as u64
+}
+
+fn ime_tab() -> *mut ImeBind {
+    return IME_TABLE as *mut ImeBind
+}
+
+fn ime_pre_none(ud: u64, p: u64, n: usize, caret: usize) -> bool {
+    return false
+}
+
+fn ime_commit_none(ud: u64, p: u64, n: usize) -> bool {
+    return false
+}
+
+fn ime_end_none(ud: u64) {
+}
+
+fn ime_del_none(ud: u64, before: usize, after: usize) -> bool {
+    return false
+}
+
+fn ime_spot_none(ud: u64, out: *mut [f64; 3]) -> bool {
+    return false
 }
 
 fn audit_none(ud: u64) -> i32 {
@@ -123,7 +177,9 @@ fn hooks_blank() -> Hooks {
         paint: paint_none, key: key_none, text: key_none, press: press_none,
         act: act_none, done: done_none, field: field_none, title: "",
         w: 0, h: 0, audit: audit_none, has_audit: false, buf: buf_none,
-        edited: edited_none, popups: popups_none }
+        edited: edited_none, popups: popups_none, ime_pre: ime_pre_none,
+        ime_commit: ime_commit_none, ime_end: ime_end_none, ime_del: ime_del_none, ime_confirm: ime_end_none,
+        ime_spot: ime_spot_none }
 }
 
 fn hooks_new(ud: u64, m: *mut theme.Theme, host: *mut fuiwirt.Host,
@@ -136,7 +192,9 @@ fn hooks_new(ud: u64, m: *mut theme.Theme, host: *mut fuiwirt.Host,
         paint: paint, key: key, text: text, press: press, act: act,
         done: done, field: field, title: title, w: w, h: h,
         audit: audit_none, has_audit: false, buf: buf_none,
-        edited: edited_none, popups: popups_none }
+        edited: edited_none, popups: popups_none, ime_pre: ime_pre_none,
+        ime_commit: ime_commit_none, ime_end: ime_end_none, ime_del: ime_del_none, ime_confirm: ime_end_none,
+        ime_spot: ime_spot_none }
 }
 
 fn hooks_set_audit(h: *mut Hooks, f: fn(u64) -> i32) {
@@ -154,6 +212,16 @@ fn hooks_set_edited(h: *mut Hooks, f: fn(u64)) {
 
 fn hooks_set_popups(h: *mut Hooks, f: fn(u64) -> u64) {
     (*h).popups = f
+}
+
+fn hooks_set_ime(h: *mut Hooks, pre: fn(u64, u64, usize, usize) -> bool, commit: fn(u64, u64, usize) -> bool, end: fn(u64),
+    del: fn(u64, usize, usize) -> bool, confirm: fn(u64), spot: fn(u64, *mut [f64; 3]) -> bool) {
+    (*h).ime_pre = pre
+    (*h).ime_commit = commit
+    (*h).ime_end = end
+    (*h).ime_del = del
+    (*h).ime_confirm = confirm
+    (*h).ime_spot = spot
 }
 
 // The keys of the window system -> the keys of a text field (editor.fi).
@@ -188,6 +256,21 @@ static mut G_PRESSED: bool = false
 fn on_input(ud: u64, kind: u32, a: u32, st: u32, x: f64, y: f64) -> bool {
     let h: *mut Hooks = ud as *mut Hooks
     let mods: u32 = st & (editor.MOD_SHIFT | editor.MOD_CTRL | editor.MOD_ALT)
+    // r444b: the raw keys, the focus and (Windows) the IME messages go to the input method; the EV_KEY / EV_CHAR that follow a key
+    // the input method ate or whose text it already committed into the field are dropped (no double text)
+    if kind == window.EV_RAWKEY || kind == window.EV_RAWKEY_UP || kind == window.EV_FOCUS || kind == window.EV_IME {
+        if IME_TABLE != 0 {
+            let ev: fn(u32, u32, u32, f64, f64) = (*ime_tab()).event
+            ev(kind, a, st, x, y)
+        }
+        return false
+    }
+    if IME_TABLE != 0 && (kind == window.EV_KEY || kind == window.EV_CHAR) {
+        let sw: fn(u32, u32, u32) -> bool = (*ime_tab()).swallow
+        if sw(kind, a, st) {
+            return true
+        }
+    }
     if kind == window.EV_KEY {
         let k: u32 = edit_key(a)
         if k == 0 as u32 {
@@ -202,6 +285,15 @@ fn on_input(ud: u64, kind: u32, a: u32, st: u32, x: f64, y: f64) -> bool {
         return (*h).text((*h).ud, a, mods)
     }
     if kind == window.EV_BUTTON && a == window.BTN_LEFT {
+        // a click while pre-edit text stands: the field keeps the text as it is, the input method forgets it
+        if IME_TABLE != 0 {
+            let on: fn() -> bool = (*ime_tab()).on
+            if on() {
+                (*h).ime_confirm((*h).ud)
+                let rs: fn() = (*ime_tab()).reset
+                rs()
+            }
+        }
         (*h).press((*h).ud, x, y)
         G_PRESSED = true
     }
@@ -256,6 +348,21 @@ fn run(h: *mut Hooks) -> i32 {
         theme.theme_set_dark(m, window.dark(f))
         fuiwirt.host_touch(w)
     }
+    // r444b: text input through the platform input method (XIM / IMM32). false (no libX11, no XIM, FUI_NO_IME set) = the window
+    // keeps sending plain EV_CHAR and everything works as before.
+    var ime_up: bool = false
+    if IME_TABLE != 0 && !envvar.env_has("FUI_NO_IME") {
+        let op: fn(*mut window.Window) -> bool = (*ime_tab()).open
+        if op(f) {
+            let ss: fn(u64, fn(u64, u64, usize, usize) -> bool, fn(u64, u64, usize) -> bool, fn(u64), fn(u64, usize, usize) -> bool) = (*ime_tab()).set_sink
+            ss((*h).ud, (*h).ime_pre, (*h).ime_commit, (*h).ime_end, (*h).ime_del)
+            ime_up = true
+        }
+    }
+    var imebuf: u64 = 0
+    var spot_x: f64 = 0.0 - 1.0
+    var spot_y: f64 = 0.0 - 1.0
+    var spot_h: f64 = 0.0
     var open: bool = true
     // r168: the windows of a menu (see lib/plat/fuipopup.fi)
     let ph: *mut fuipopup.PopupHost = fuipopup.ph_new()
@@ -266,11 +373,24 @@ fn run(h: *mut Hooks) -> i32 {
     while open && !(*h).done((*h).ud) {
         let ms: i64 = fuiwirt.host_wait_ms(w)
         if ms != 0 {
+            var xfd: i32 = 0 - 1
+            if ime_up {
+                let fdf: fn() -> i32 = (*ime_tab()).fd
+                xfd = fdf()
+            }
             if ph as u64 != 0 {
-                fuipopup.ph_wait(ph, f, ms)
+                // the XIM connection is watched too: an IME (ibus ...) commits on it by itself
+                let got: bool = fuipopup.ph_wait_fd(ph, f, ms, xfd)
+            } else if xfd >= 0 {
+                let wins: [u64; 8] = [f as u64, 0, 0, 0, 0, 0, 0, 0]
+                let hit: i64 = window.wait_any_fd(&wins, 1, xfd, ms)
             } else {
                 let e: bool = window.wait_event(f, ms)
             }
+        }
+        if ime_up {
+            let pf: fn() = (*ime_tab()).pump
+            pf()
         }
         open = fuiwin.window_step(&fx, w, m, on_paint, on_act, h as u64)
         if ph as u64 != 0 {
@@ -283,6 +403,28 @@ fn run(h: *mut Hooks) -> i32 {
             }
         }
         let tb: u64 = (*h).buf((*h).ud)
+        if ime_up {
+            // another field got the focus (Tab, a program call): the pre-edit text of the old one is over
+            if tb != imebuf {
+                if imebuf != 0 as u64 {
+                    (*h).ime_confirm((*h).ud)
+                    let rs2: fn() = (*ime_tab()).reset
+                    rs2()
+                }
+                imebuf = tb
+                spot_x = 0.0 - 1.0
+            }
+            if tb != 0 as u64 {
+                var sp: [f64; 3] = [0.0; 3]
+                if (*h).ime_spot((*h).ud, &sp) && (sp[0] != spot_x || sp[1] != spot_y || sp[2] != spot_h) {
+                    spot_x = sp[0]
+                    spot_y = sp[1]
+                    spot_h = sp[2]
+                    let sp2: fn(f64, f64, f64) = (*ime_tab()).spot
+                    sp2(spot_x, spot_y, spot_h)
+                }
+            }
+        }
         let pressed: bool = G_PRESSED
         G_PRESSED = false
         if tb != 0 as u64 {
@@ -307,6 +449,10 @@ fn run(h: *mut Hooks) -> i32 {
     }
     if kbuf != 0 as u64 {
         let down2: bool = window.text_input(f, false, false, 0 as u64)
+    }
+    if ime_up {
+        let cl: fn() = (*ime_tab()).close
+        cl()
     }
     fuiwin.window_close(&fx)
     return 0

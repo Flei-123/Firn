@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
-// lib/input/evdev.fi -- input.evdev: the Linux input event interface, READ ONLY (/dev/input/event*, js*, inotify).
+// lib/input/evdev.fi -- input.evdev: the Linux input event interface (/dev/input/event*, js*, inotify). Reading; and for force feedback
+// (rumble) writing: `ev_open_rw`, `ev_write`, `ev_ff_*` (the bytes come from lib/input/padff.fi).
 //
 // Pure syscalls (no library, the program stays a static ELF). x86_64 syscall numbers like lib/input/uinput.fi.
 // Used by lib/input/padsys.fi (gamepads) and lib/input/rawdev.fi (raw keyboard / mouse). NOT for Windows: the
@@ -8,12 +9,14 @@
 // struct input_event on a 64 bit kernel: timeval (2 x 8), u16 type, u16 code, i32 value = 24 octets.
 // struct js_event (joydev): u32 time ms, i16 value, u8 type, u8 number = 8 octets.
 import std.rt
+import input.padff
 
 export {
     ev_open, js_open, ev_close, ev_read, ev_name, ev_id, ev_bits, ev_absinfo, ev_key_state, js_name, js_counts,
     js_btnmap, js_axmap, bit_test, ev_list, inotify_open, inotify_watch, inotify_drain, DEV_DIR,
     EV_SYN, EV_KEY, EV_REL, EV_ABS, REL_X, REL_Y, REL_HWHEEL, REL_WHEEL, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, KEY_MAX,
     ERR_AGAIN, ERR_NODEV,
+    ev_open_rw, ev_write, ev_ff_upload, ev_ff_remove, ev_ff_rumble,
 }
 
 const DEV_DIR: str = "/dev/input"
@@ -86,6 +89,50 @@ fn ev_open(n: u32) -> i64 {
     var path: [u8; 40] = [0 as u8; 40]
     node_path((&pre[0]) as u64, 16, n, (&path[0]) as u64)
     return open_path((&path[0]) as u64)
+}
+
+// the same node for READING AND WRITING (force feedback needs write access); falls back to read only when write is refused
+// (EACCES / EROFS ...): then `rw` stays false and the caller does not offer rumble.
+fn ev_open_rw(n: u32, rw: *mut bool) -> i64 {
+    var pre: [u8; 17] = "/dev/input/event\0"
+    var path: [u8; 40] = [0 as u8; 40]
+    node_path((&pre[0]) as u64, 16, n, (&path[0]) as u64)
+    let fd: i64 = syscall(SYS_OPEN, (&path[0]) as i64, 2 | O_NONBLOCK | O_CLOEXEC, 0, 0, 0, 0)
+    if fd >= 0 {
+        *rw = true
+        return fd
+    }
+    *rw = false
+    return open_path((&path[0]) as u64)
+}
+
+// write whole bytes (input_events) to the device: octets written or a negative errno
+fn ev_write(fd: i64, p: u64, n: usize) -> i64 {
+    return syscall(1, fd, p as i64, n as i64, 0, 0, 0)
+}
+
+// EVIOCSFF: upload / update the effect (48 octets, padff.ff_rumble_effect); the kernel writes the id into octet 2..4.
+// Returns the effect id, or a negative errno.
+fn ev_ff_upload(fd: i64, p: u64) -> i64 {
+    let r: i64 = syscall(SYS_IOCTL, fd, padff.EVIOCSFF, p as i64, 0, 0, 0)
+    if r < 0 {
+        return r
+    }
+    return rt.ld16(p, 1) as i64
+}
+
+// EVIOCRMFF: erase an uploaded effect (the id goes by value)
+fn ev_ff_remove(fd: i64, id: i64) -> bool {
+    return syscall(SYS_IOCTL, fd, padff.EVIOCRMFF, id, 0, 0, 0) >= 0
+}
+
+// does the device have FF_RUMBLE? (EVIOCGBIT(EV_FF))
+fn ev_ff_rumble(fd: i64) -> bool {
+    var bits: [u8; 16] = [0 as u8; 16]
+    if syscall(SYS_IOCTL, fd, padff.ff_ioc_bits(), (&bits[0]) as i64, 0, 0, 0) < 0 {
+        return false
+    }
+    return bit_test((&bits[0]) as u64, padff.FF_RUMBLE)
 }
 
 fn js_open(n: u32) -> i64 {

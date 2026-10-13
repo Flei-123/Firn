@@ -5,13 +5,18 @@
 //
 // Syscalls only (no library): the program stays a static ELF. Reading is non blocking; nothing here waits.
 // NOT proven on real hardware: /dev/input does not exist on the build machine, so the tests feed the very same
-// read path through a PIPE that carries input_event bytes (tests/2795). Rumble / force feedback: not done.
+// read path through a PIPE that carries input_event bytes (tests/2795). Rumble (evdev force feedback, r434) is sent through
+// sys_ff_tap in the tests: the real ioctl / write calls are NOT proven on a real pad.
 import std.rt
 import input.evdev
 import input.padcore
 import input.padset
+import input.padff
 
-export { sys_open, sys_scan, sys_poll, sys_read_slot, sys_close, sys_name, sys_describe_evdev, sys_describe_js }
+export {
+    sys_open, sys_scan, sys_poll, sys_read_slot, sys_close, sys_name, sys_describe_evdev, sys_describe_js,
+    sys_rumble_supported, sys_rumble, sys_rumble_stop, sys_rumble_gain, sys_ff_tap,
+}
 
 const RESCAN_EVERY: i64 = 240 // polls, when inotify is not there
 const SETTLE: i64 = 20 // polls to wait after a change (udev fixes the permissions a moment after the node appears)
@@ -33,6 +38,7 @@ fn sys_close(s: *mut padset.PadSet) {
     var i: usize = 0
     while i < padset.MAXPADS {
         if padset.padset_active(s, i) {
+            ff_cleanup(s, i)
             evdev.ev_close(padset.padset_fd(s, i))
             padset.padset_detach(s, i)
         }
@@ -168,7 +174,8 @@ fn sys_scan(s: *mut padset.PadSet) {
     var i: usize = 0
     while i < n {
         if padset.padset_find_node(s, padset.KIND_EVDEV, nodes[i]) < 0 {
-            let fd: i64 = evdev.ev_open(nodes[i])
+            var rw: bool = false
+            let fd: i64 = evdev.ev_open_rw(nodes[i], &rw)
             if fd < 0 {
                 if fd == 0 - 13 { (*s).denied = (*s).denied + 1 as u64 }
             } else {
@@ -182,6 +189,8 @@ fn sys_scan(s: *mut padset.PadSet) {
                         (*s).pad[slot as usize].ev_head = 0
                         (*s).pad[slot as usize].ev_tail = 0
                         padcore.pad_event_push(&(*s).pad[slot as usize], padcore.PE_CONNECTED, 0 as u32, 1.0)
+                        // rumble: the node opened for writing and the device has FF_RUMBLE
+                        padset.padset_set_ff_cap(s, slot as usize, rw && evdev.ev_ff_rumble(fd))
                     } else {
                         evdev.ev_close(fd)
                     }
@@ -320,4 +329,142 @@ fn sys_poll(s: *mut padset.PadSet) {
         sys_read_slot(s, i)
         i = i + 1
     }
+}
+
+// ===================================================================================================================
+// RUMBLE (r434): evdev force feedback. Only evdev pads that opened read+write and have FF_RUMBLE can do it; a joydev node has no
+// force feedback in its interface (the kernel's joydev is read only), so the answer there is an honest false.
+// The byte blocks come from input.padff; the calls are ioctl(EVIOCSFF / EVIOCRMFF) and write(2) of input_events on the same fd.
+// ===================================================================================================================
+
+static mut FF_TAP: i64 = 0 - 1
+static mut FF_FAKE: i64 = 0
+
+const TAP_UPLOAD: u32 = 1
+const TAP_REMOVE: u32 = 2
+const TAP_WRITE: u32 = 3
+
+// TEST SEAM (tests/2866): with fd >= 0 no ioctl / write goes to the device; every one is appended to `fd` instead as a record
+// { u32 tag (1 upload, 2 remove, 3 write), u32 length, payload } in the order the real calls would happen, and an upload gets
+// a fake effect id (0, 1, 2 ...). -1 = off (the default).
+fn sys_ff_tap(fd: i64) {
+    FF_TAP = fd
+    FF_FAKE = 0
+}
+
+fn tap_put(tag: u32, p: u64, n: usize) {
+    var rec: [u64; 8] = [0 as u64; 8]
+    let b: u64 = (&rec[0]) as u64
+    rt.st32(b, 0, tag)
+    rt.st32(b, 1, n as u32)
+    var k: usize = 0
+    while k < n && k < 56 {
+        rt.st8(b, 8 + k, rt.ld8(p, k))
+        k = k + 1
+    }
+    syscall(1, FF_TAP, b as i64, (8 + n) as i64, 0, 0, 0)
+}
+
+// upload / update: the effect id, or a negative errno
+fn ff_upload(fd: i64, p: u64) -> i64 {
+    if FF_TAP >= 0 {
+        tap_put(TAP_UPLOAD, p, padff.FF_EFFECT_BYTES)
+        var id: i64 = rt.ld16(p, 1) as i64
+        if id == 65535 {
+            id = FF_FAKE
+            FF_FAKE = FF_FAKE + 1
+            rt.st16(p, 1, id as u16)
+        }
+        return id
+    }
+    return evdev.ev_ff_upload(fd, p)
+}
+
+fn ff_remove(fd: i64, id: i64) -> bool {
+    if FF_TAP >= 0 {
+        var b: [u64; 1] = [id as u64]
+        tap_put(TAP_REMOVE, (&b[0]) as u64, 8)
+        return true
+    }
+    return evdev.ev_ff_remove(fd, id)
+}
+
+// one EV_FF input_event: play (code = id, value 1), stop (value 0) or the gain (code FF_GAIN)
+fn ff_send(fd: i64, code: u32, value: u32) -> bool {
+    var ev: [u64; 3] = [0 as u64; 3]
+    let b: u64 = (&ev[0]) as u64
+    padff.ff_event(b, code, value)
+    if FF_TAP >= 0 {
+        tap_put(TAP_WRITE, b, padff.EVENT_BYTES)
+        return true
+    }
+    return evdev.ev_write(fd, b, padff.EVENT_BYTES) == padff.EVENT_BYTES as i64
+}
+
+fn sys_rumble_supported(s: *mut padset.PadSet, i: usize) -> bool {
+    return padset.padset_active(s, i) && padset.padset_kind(s, i) == padset.KIND_EVDEV && padset.padset_ff_cap(s, i)
+}
+
+// Rumble: `strong` = the big (low frequency) motor, `weak` = the small one, both 0..65535, `ms` = how long (0 = the longest the kernel takes,
+// 65535 ms). Both 0 = stop. A running rumble is changed in place (same effect id, uploaded again, played again). False = not sent.
+fn sys_rumble(s: *mut padset.PadSet, i: usize, strong: u32, weak: u32, ms: u32) -> bool {
+    if !sys_rumble_supported(s, i) {
+        return false
+    }
+    if strong == 0 as u32 && weak == 0 as u32 {
+        return sys_rumble_stop(s, i)
+    }
+    let fd: i64 = padset.padset_fd(s, i)
+    var eff: [u64; 6] = [0 as u64; 6]
+    let b: u64 = (&eff[0]) as u64
+    padff.ff_rumble_effect(b, padset.padset_ff_id(s, i), strong, weak, ms)
+    var id: i64 = ff_upload(fd, b)
+    if id < 0 && padset.padset_ff_id(s, i) >= 0 {
+        // the kernel does not know the old id any more (device reset): start over with a new one
+        padset.padset_set_ff_id(s, i, 0 - 1)
+        padff.ff_rumble_effect(b, 0 - 1, strong, weak, ms)
+        id = ff_upload(fd, b)
+    }
+    if id < 0 {
+        return false
+    }
+    padset.padset_set_ff_id(s, i, id as i32)
+    return ff_send(fd, id as u32, 1 as u32)
+}
+
+// stop playing (the effect stays uploaded for the next rumble); true when nothing was running or the stop was sent
+fn sys_rumble_stop(s: *mut padset.PadSet, i: usize) -> bool {
+    if !sys_rumble_supported(s, i) {
+        return false
+    }
+    let id: i32 = padset.padset_ff_id(s, i)
+    if id < 0 {
+        return true
+    }
+    return ff_send(padset.padset_fd(s, i), id as u32, 0 as u32)
+}
+
+// master gain 0..65535 of the device (the kernel scales every effect by it)
+fn sys_rumble_gain(s: *mut padset.PadSet, i: usize, gain: u32) -> bool {
+    if !sys_rumble_supported(s, i) {
+        return false
+    }
+    padset.padset_set_ff_gain(s, i, gain)
+    return ff_send(padset.padset_fd(s, i), padff.FF_GAIN, gain)
+}
+
+// before the fd is closed: stop and erase the uploaded effect (the kernel would drop it at close too; being explicit keeps the
+// order visible and the device quiet)
+fn ff_cleanup(s: *mut padset.PadSet, i: usize) {
+    if !sys_rumble_supported(s, i) {
+        return
+    }
+    let id: i32 = padset.padset_ff_id(s, i)
+    if id < 0 {
+        return
+    }
+    let fd: i64 = padset.padset_fd(s, i)
+    let st: bool = ff_send(fd, id as u32, 0 as u32)
+    let rm: bool = ff_remove(fd, id as i64)
+    padset.padset_set_ff_id(s, i, 0 - 1)
 }
