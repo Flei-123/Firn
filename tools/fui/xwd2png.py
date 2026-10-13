@@ -15,10 +15,10 @@ import struct, sys
 from PIL import Image
 
 data = open(sys.argv[1], "rb").read()
-kopf = struct.unpack(">25I", data[:100])
+head = struct.unpack(">25I", data[:100])
 (hsize, version, fmt, depth, w, h, xoff, byte_order, bunit, bbo, bpad,
  bpp, bpl, vclass, rmask, gmask, bmask, bprgb, cmap_n, ncolors,
- ww, wh, wx, wy, bw) = kopf
+ ww, wh, wx, wy, bw) = head
 if version != 7 or fmt != 2 or bpp not in (24, 32):
     raise SystemExit("nicht unterstuetzt: version %d format %d bpp %d"
                      % (version, fmt, bpp))
@@ -38,20 +38,20 @@ def schieb(m):
 rs, gs, bs = schieb(rmask), schieb(gmask), schieb(bmask)
 out = bytearray(w * h * 3)
 for y in range(h):
-    zeile = px[y * bpl:(y + 1) * bpl]
+    row = px[y * bpl:(y + 1) * bpl]
     for x in range(w):
         o = x * bpp8
         if byte_order == 0:
-            v = int.from_bytes(zeile[o:o + bpp8], "little")
+            v = int.from_bytes(row[o:o + bpp8], "little")
         else:
-            v = int.from_bytes(zeile[o:o + bpp8], "big")
+            v = int.from_bytes(row[o:o + bpp8], "big")
         i = (y * w + x) * 3
         out[i] = (v & rmask) >> rs
         out[i + 1] = (v & gmask) >> gs
         out[i + 2] = (v & bmask) >> bs
-bild = Image.frombytes("RGB", (w, h), bytes(out))
+image = Image.frombytes("RGB", (w, h), bytes(out))
 if len(sys.argv) >= 7:
     x, y, cw, ch = (int(a) for a in sys.argv[3:7])
-    bild = bild.crop((x, y, x + cw, y + ch))
-bild.save(sys.argv[2])
+    image = image.crop((x, y, x + cw, y + ch))
+image.save(sys.argv[2])
 print("%s: %dx%d, Tiefe %d, %d Bit je Punkt" % (sys.argv[2], w, h, depth, bpp))

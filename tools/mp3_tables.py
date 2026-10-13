@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: CC0-1.0
 """
-mp3_tables.py -- erzeugt lib/ton/mp3_tab.fi aus minimp3.h.
+mp3_tables.py -- generates lib/ton/mp3_tab.fi from minimp3.h.
 
 WHY A GENERATOR. The tables of the MP3 decoder are over 2500 numbers,
 among them the packed Huffman tree (`tabs`, ~2100 int16). Whoever types them in
@@ -18,93 +18,93 @@ import re
 import sys
 
 
-def hole(text, name, zeile=0):
-    """Den Klammerinhalt der Deklaration `name` als flache Zahlenliste.
+def hole(text, name, row=0):
+    """The bracket contents of the declaration `name` as a flat list of numbers.
 
-    `zeile` > 0: die Tabelle ist zweidimensional und JEDE innere Zeile wird
-    auf diese Breite mit Nullen aufgefuellt -- genau das, was C mit einer
-    zu kurz geschriebenen Initialisierung tut (g_scf_mixed hat Zeilen mit
-    37 statt 40 Werten). Ohne das Auffuellen verrutscht die ganze Tabelle.
+    `row` > 0: the table is two-dimensional and EVERY inner row is
+    padded with zeros to this width -- exactly what C does with an
+    initializer written too short (g_scf_mixed has rows with
+    37 instead of 40 values). Without the padding the whole table shifts.
     """
     i = text.index(name)
     a = text.index('{', i)
-    tiefe = 0
+    depth = 0
     for j in range(a, len(text)):
         if text[j] == '{':
-            tiefe += 1
+            depth += 1
         elif text[j] == '}':
-            tiefe -= 1
-            if tiefe == 0:
+            depth -= 1
+            if depth == 0:
                 roh = text[a:j + 1]
                 break
     roh = re.sub(r'/\*.*?\*/', '', roh, flags=re.S)
-    if zeile > 0:
+    if row > 0:
         aus = []
-        for teil in re.findall(r'\{([^{}]*)\}', roh[1:-1]):
-            werte = [w.strip() for w in teil.split(',') if w.strip()]
-            if len(werte) > zeile:
-                sys.exit('Zeile in %s hat %d > %d Werte' % (name, len(werte), zeile))
-            aus.extend(werte + ['0'] * (zeile - len(werte)))
+        for part in re.findall(r'\{([^{}]*)\}', roh[1:-1]):
+            vals = [w.strip() for w in part.split(',') if w.strip()]
+            if len(vals) > row:
+                sys.exit('Zeile in %s hat %d > %d Werte' % (name, len(vals), row))
+            aus.extend(vals + ['0'] * (row - len(vals)))
         return aus
     roh = roh.replace('{', ' ').replace('}', ' ')
-    werte = [w.strip() for w in roh.split(',')]
-    return [w for w in werte if w]
+    vals = [w.strip() for w in roh.split(',')]
+    return [w for w in vals if w]
 
 
-def zahl(w):
+def number(w):
     w = w.rstrip('fF') if re.match(r'^-?[0-9.]+[fF]$', w) else w
     return w
 
 
-def ganz(werte):
-    return [str(int(float(zahl(w)))) for w in werte]
+def whole(vals):
+    return [str(int(float(number(w)))) for w in vals]
 
 
-def komma(werte):
+def comma(vals):
     """Fliesskomma im Firn-Format: `1.5f` (f32-Literal)."""
     aus = []
-    for w in werte:
-        s = zahl(w)
+    for w in vals:
+        s = number(w)
         if '.' not in s and 'e' not in s and 'E' not in s:
             s = s + '.0'
         aus.append(s + 'f')
     return aus
 
 
-def block(namen, werte, breite=12):
-    zeilen = []
-    for i in range(0, len(werte), breite):
-        zeilen.append('        ' + ', '.join(werte[i:i + breite]) + ',')
-    return '    ' + namen + ': [\n' + '\n'.join(zeilen) + '\n    ],'
+def block(names_, vals, width=12):
+    rows = []
+    for i in range(0, len(vals), width):
+        rows.append('        ' + ', '.join(vals[i:i + width]) + ',')
+    return '    ' + names_ + ': [\n' + '\n'.join(rows) + '\n    ],'
 
 
 def main():
-    quelle = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+    source = open(sys.argv[1], encoding='utf-8', errors='replace').read()
 
     # integers
-    scf_long = ganz(hole(quelle, 'g_scf_long[8][23]', 23))
-    scf_short = ganz(hole(quelle, 'g_scf_short[8][40]', 40))
-    scf_mixed = ganz(hole(quelle, 'g_scf_mixed[8][40]', 40))
-    partitions = ganz(hole(quelle, 'g_scf_partitions[3][28]', 28))
-    scfc = ganz(hole(quelle, 'g_scfc_decode[16]'))
-    gmod = ganz(hole(quelle, 'g_mod[6*4]'))
-    preamp = ganz(hole(quelle, 'g_preamp[10]'))
-    tabs = ganz(hole(quelle, 'int16_t tabs[]'))
-    tab32 = ganz(hole(quelle, 'tab32[]'))
-    tab33 = ganz(hole(quelle, 'tab33[]'))
-    tabindex = ganz(hole(quelle, 'tabindex[2*16]'))
-    linbits = ganz(hole(quelle, 'g_linbits[]'))
-    halfrate = ganz(hole(quelle, 'halfrate[2][3][15]', 15))
+    scf_long = whole(hole(source, 'g_scf_long[8][23]', 23))
+    scf_short = whole(hole(source, 'g_scf_short[8][40]', 40))
+    scf_mixed = whole(hole(source, 'g_scf_mixed[8][40]', 40))
+    partitions = whole(hole(source, 'g_scf_partitions[3][28]', 28))
+    scfc = whole(hole(source, 'g_scfc_decode[16]'))
+    gmod = whole(hole(source, 'g_mod[6*4]'))
+    preamp = whole(hole(source, 'g_preamp[10]'))
+    tabs = whole(hole(source, 'int16_t tabs[]'))
+    tab32 = whole(hole(source, 'tab32[]'))
+    tab33 = whole(hole(source, 'tab33[]'))
+    tabindex = whole(hole(source, 'tabindex[2*16]'))
+    linbits = whole(hole(source, 'g_linbits[]'))
+    halfrate = whole(hole(source, 'halfrate[2][3][15]', 15))
 
     # floating point
-    pow43 = komma(hole(quelle, 'g_pow43[129 + 16]'))
-    pan = komma(hole(quelle, 'g_pan[7*2]'))
-    aa = komma(hole(quelle, 'g_aa[2][8]', 8))
-    twid9 = komma(hole(quelle, 'g_twid9[18]'))
-    twid3 = komma(hole(quelle, 'g_twid3[6]'))
-    fenster = komma(hole(quelle, 'g_mdct_window[2][18]', 18))
-    sec = komma(hole(quelle, 'g_sec[24]'))
-    win = komma(hole(quelle, 'g_win[]'))
+    pow43 = comma(hole(source, 'g_pow43[129 + 16]'))
+    pan = comma(hole(source, 'g_pan[7*2]'))
+    aa = comma(hole(source, 'g_aa[2][8]', 8))
+    twid9 = comma(hole(source, 'g_twid9[18]'))
+    twid3 = comma(hole(source, 'g_twid3[6]'))
+    window = comma(hole(source, 'g_mdct_window[2][18]', 18))
+    sec = comma(hole(source, 'g_sec[24]'))
+    win = comma(hole(source, 'g_win[]'))
 
     masse = {
         'scf_long': (len(scf_long), 8 * 23), 'scf_short': (len(scf_short), 8 * 40),
@@ -114,14 +114,14 @@ def main():
         'tabindex': (len(tabindex), 32), 'linbits': (len(linbits), 32),
         'halfrate': (len(halfrate), 90), 'pow43': (len(pow43), 145),
         'pan': (len(pan), 14), 'aa': (len(aa), 16), 'twid9': (len(twid9), 18),
-        'twid3': (len(twid3), 6), 'fenster': (len(fenster), 36), 'sec': (len(sec), 24),
+        'twid3': (len(twid3), 6), 'fenster': (len(window), 36), 'sec': (len(sec), 24),
         'win': (len(win), 240),
     }
-    for k, (ist, soll) in masse.items():
-        if ist != soll:
-            sys.exit('Tabelle %s hat %d statt %d Werte' % (k, ist, soll))
+    for k, (ist, expected) in masse.items():
+        if ist != expected:
+            sys.exit('Tabelle %s hat %d statt %d Werte' % (k, ist, expected))
 
-    kopf = '''// SPDX-License-Identifier: MPL-2.0
+    head = '''// SPDX-License-Identifier: MPL-2.0
 // lib/ton/mp3_tab.fi -- THE TABLES OF THE MP3 DECODER. GENERATED, NOT TYPED.
 //
 // This file is generated by `tools/mp3_tables.py` from the original minimp3
@@ -141,7 +141,7 @@ export { Tabs, tabs_new }
 struct Tabs {
 ''' % ((len(tabs) * 2 + len(win) * 4) // 1024, len(tabs), len(win), len(pow43))
 
-    felder = [
+    fields = [
         ('scf_long', 'u8', 8 * 23), ('scf_short', 'u8', 8 * 40),
         ('scf_mixed', 'u8', 8 * 40), ('partitions', 'u8', 3 * 28),
         ('scfc_decode', 'u8', 16), ('modulo', 'u8', 24), ('preamp', 'u8', 10),
@@ -151,22 +151,22 @@ struct Tabs {
         ('twid9', 'f32', 18), ('twid3', 'f32', 6), ('fenster', 'f32', 36),
         ('sec', 'f32', 24), ('win', 'f32', 240),
     ]
-    aus = [kopf]
-    for name, typ, n in felder:
+    aus = [head]
+    for name, typ, n in fields:
         aus.append('    %s: [%s; %d],' % (name, typ, n))
     aus.append('}\n')
     aus.append('fn tabs_new() -> Tabs {')
     aus.append('    return Tabs {')
-    daten = [
+    payload = [
         ('scf_long', scf_long), ('scf_short', scf_short), ('scf_mixed', scf_mixed),
         ('partitions', partitions), ('scfc_decode', scfc), ('modulo', gmod),
         ('preamp', preamp), ('tabs', tabs), ('tab32', tab32), ('tab33', tab33),
         ('tabindex', tabindex), ('linbits', linbits), ('halfrate', halfrate),
         ('pow43', pow43), ('pan', pan), ('aa', aa), ('twid9', twid9),
-        ('twid3', twid3), ('fenster', fenster), ('sec', sec), ('win', win),
+        ('twid3', twid3), ('fenster', window), ('sec', sec), ('win', win),
     ]
-    for name, werte in daten:
-        aus.append(block(name, werte))
+    for name, vals in payload:
+        aus.append(block(name, vals))
     aus.append('    }')
     aus.append('}')
     print('\n'.join(aus))

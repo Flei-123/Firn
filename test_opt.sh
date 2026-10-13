@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
-# Nachweis, dass der Optimierer (compiler/src/opt.rs) wirklich wirkt.
+# Proof that the optimizer (compiler/src/opt.rs) really has an effect.
 #
-# Fuer jedes Programm in tests/opt/ wird die FIR VOR (--emit=fir-raw) und NACH
-# (--emit=fir-opt) der Optimierung erzeugt und geprueft:
+# For every program in tests/opt/ the FIR BEFORE (--emit=fir-raw) and AFTER
+# (--emit=fir-opt) optimization is produced and checked:
 #   (a) die Instruktionszahl sinkt,
 #   (b) die erwartete gefaltete Konstante steht im Opt-Dump,
-#   (c) ein Block, der im Raw-Dump noch da ist (erkennbar an einer eindeutigen
-#       Marke), ist im Opt-Dump verschwunden und die Blockzahl sinkt.
+#   (c) a block that is still present in the raw dump (recognizable by a unique
+#       marker) is gone in the opt dump and the block count drops.
 # Runde 2 zusaetzlich:
-#   (d) Mustertabelle: eine FIR-Zeile, die im Raw-Dump mindestens n-mal
-#       vorkommt, darf im Opt-Dump hoechstens m-mal vorkommen (mem2reg,
-#       tote Speicherung, Inlining, CSE, Bereichspruefung, Blockverschmelzung).
-#   (e) Assembler-Nachweis der Registerzuteilung: der heisse Schleifenblock
-#       enthaelt KEINEN Stackzugriff, benutzt callee-saved Register und
-#       sichert/restauriert sie ordnungsgemaess.
-# Zusaetzlich laufen die Modul-Tests aus opt.rs (cargo test opt::).
+#   (d) pattern table: an FIR line that occurs at least n times in the raw dump
+#       may occur at most m times in the opt dump (mem2reg,
+#       dead store, inlining, CSE, bounds check, block merging).
+#   (e) assembler proof of register allocation: the hot loop block
+#       contains NO stack access, uses callee-saved registers and
+#       saves/restores them properly.
+# In addition the module tests from opt.rs run (cargo test opt::).
 #
-# Kein '|| true', keine geschluckten Exit-Codes: set -euo pipefail.
-# Die Gleichheit der LAUFZEITergebnisse mit und ohne Optimierung prueft die
-# grosse Testsuite (test.sh), die jedes Programm zweimal uebersetzt und ausfuehrt.
+# No '|| true', no swallowed exit codes: set -euo pipefail.
+# Equality of the RUNTIME results with and without optimization is checked by the
+# large test suite (test.sh), which compiles and runs every program twice.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 ROOT=$(pwd)
-# FIRNC_BIN kann auf einen anderen Compiler zeigen (Selbstpruefung des Skripts).
+# FIRNC_BIN may point to another compiler (self-check of the script).
 FIRNC="${FIRNC_BIN:-$ROOT/compiler/target/release/firnc}"
 # ROUND 72: the build level this script proves, made explicit.
 #
@@ -69,7 +69,7 @@ bad() {
     echo "  FAIL $1"
 }
 
-# Faelle: datei | erwartete gefaltete Konstante | Marke des toten Blocks ('-' = keine)
+# Cases: file | expected folded constant | marker of the dead block ('-' = none)
 CASES="
 tests/opt/fold_arith.fi|const.i32 42|-
 tests/opt/fold_cast_shift.fi|const.i32 100|-
@@ -116,7 +116,7 @@ while IFS='|' read -r FILE WANT MARK; do
         else
             bad "$FILE: toter Block mit Marke $MARK nicht entfernt (Bloecke $b_raw -> $b_opt)"
         fi
-        # Terminatoren duerfen nur auf existierende Bloecke zeigen
+        # terminators may only point to existing blocks
         maxbb=$((b_opt - 1))
         if awk -v max="$maxbb" '
             /^  br bb/      { if (substr($2,3)+0 > max) bad=1 }
@@ -188,7 +188,7 @@ else
         bad "regalloc: keine zugeteilten Register im Schleifenrumpf"
     fi
 fi
-# callee-saved Register muessen gesichert UND zurueckgeholt werden
+# callee-saved registers must be saved AND restored
 for R in rbx r12 r13 r14 r15; do
     SAVE=$(grep -cE "mov qword ptr \[rbp-[0-9]+\], $R\$" "$ASM" || true)
     LOAD=$(grep -cE "mov $R, qword ptr \[rbp-[0-9]+\]\$" "$ASM" || true)
@@ -201,8 +201,8 @@ for R in rbx r12 r13 r14 r15; do
     fi
 done
 
-# Optimierung darf das Ergebnis nie aendern: jedes Optimierertestprogramm
-# einmal mit und einmal ohne Optimierer ausfuehren und vergleichen.
+# Optimization must never change the result: run every optimizer test program
+# once with and once without the optimizer and compare.
 echo "== gleiches Ergebnis mit und ohne Optimierer =="
 for FILE in tests/opt/*.fi; do
     base=$(basename "$FILE" .fi)
@@ -220,31 +220,31 @@ for FILE in tests/opt/*.fi; do
 done
 
 # ------------------------------------------------------------------ (g) ---
-# LICM: schleifeninvariante Rechnung wandert in den Vorkopf. Der Nachweis
-# vergleicht ZWEI Bloecke desselben FIR-Dumps — die Instruktion verschwindet
-# nicht, sie zieht um. Eine reine Zaehlung ueber die ganze Funktion wuerde das
-# gar nicht bemerken.
+# LICM: loop-invariant computation moves into the preheader. The proof
+# compares TWO blocks of the same FIR dump -- the instruction does not
+# disappear, it moves. A plain count over the whole function would not
+# notice that at all.
 echo "== LICM: schleifeninvariante Rechnung im Vorkopf =="
 LIC="$WORK/licm_hoist.opt.fir"
 "$FIRNC" $LVL --emit=fir-opt tests/opt/licm_hoist.fi > "$LIC"
 RAW="$WORK/licm_hoist.raw.fir"
 "$FIRNC" $LVL --emit=fir-raw tests/opt/licm_hoist.fi > "$RAW"
-rumpf_roh=$(awk '/^bb2:/{f=1;next} /^bb3:/{f=0} f' "$RAW" | grep -c 'mul\.u64' || true)
-rumpf_opt=$(awk '/^bb2:/{f=1;next} /^bb3:/{f=0} f' "$LIC" | grep -c 'mul\.u64' || true)
-vorkopf_opt=$(awk '/^bb0:/{f=1;next} /^bb1:/{f=0} f' "$LIC" | grep -c 'mul\.u64' || true)
-if [ "$rumpf_roh" -ge 1 ]; then
-    ok "licm: unoptimiert steht die Multiplikation im Schleifenrumpf ($rumpf_roh)"
+body_raw=$(awk '/^bb2:/{f=1;next} /^bb3:/{f=0} f' "$RAW" | grep -c 'mul\.u64' || true)
+body_opt=$(awk '/^bb2:/{f=1;next} /^bb3:/{f=0} f' "$LIC" | grep -c 'mul\.u64' || true)
+preheader_opt=$(awk '/^bb0:/{f=1;next} /^bb1:/{f=0} f' "$LIC" | grep -c 'mul\.u64' || true)
+if [ "$body_raw" -ge 1 ]; then
+    ok "licm: unoptimiert steht die Multiplikation im Schleifenrumpf ($body_raw)"
 else
     bad "licm: der Testfall hat unoptimiert gar keine Multiplikation im Rumpf"
 fi
-if [ "$rumpf_opt" -eq 0 ]; then
+if [ "$body_opt" -eq 0 ]; then
     ok "licm: nach der Optimierung steht keine mehr im Rumpf"
 else
-    bad "licm: es steht noch eine Multiplikation im Schleifenrumpf ($rumpf_opt)"
+    bad "licm: es steht noch eine Multiplikation im Schleifenrumpf ($body_opt)"
     awk '/^bb2:/{f=1;next} /^bb3:/{f=0} f' "$LIC" | sed 's/^/        /'
 fi
-if [ "$vorkopf_opt" -ge 1 ]; then
-    ok "licm: sie steht jetzt im Vorkopf ($vorkopf_opt)"
+if [ "$preheader_opt" -ge 1 ]; then
+    ok "licm: sie steht jetzt im Vorkopf ($preheader_opt)"
 else
     bad "licm: im Vorkopf ist keine Multiplikation angekommen"
 fi

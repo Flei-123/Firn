@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_play.fi -- window free play logic for demos/mcplay: key map, block face numbers, Block Update decoding and the
+// serverbound senders (position, dig, place, hotbar slot, swing). Everything here runs without a window or a GPU.
+//
+//     mc_play.key_bit(scancode)            -> mc_input.K_* bit (0 = not a movement key); Linux evdev scancodes (input.raw)
+//     mc_play.hotbar_of(scancode)          -> 0..8 for the keys 1..9, else -1
+//     mc_play.face_of(nx, ny, nz)          -> protocol face 0..5 (0 -Y, 1 +Y, 2 -Z, 3 +Z, 4 -X, 5 +X), -1 for no face
+//     mc_play.decode_block_change(b, &x, &y, &z, &state)                    Block Update (1.9+): u64 position + varint state
+//     mc_play.multi_begin(b, protocol, &x0, &y0, &z0, &n); multi_next(b, &x, &y, &z, &state)   Multi Block Change
+//
+// 1.20.1 layouts (protocol 763; minecraft-data, see docs/mc/play.md): Block Update = position u64 (x26 z26 y12) + varint state.
+// Multi Block Change = u64 section (x22 z22 y20, signed) + varint n + n * varlong (state << 12 | lx << 8 | lz << 4 | ly); protocols
+// 751..762 have a bool (trust edges) between the section and the count. Pre-1.9 (protocol < 107) is not decoded here.
+import std.rt
+import std.bytes
+import mc.mc_client
+import mc.mc_encode
+import mc.mc_sem
+import mc.mc_version
+import mc.mc_input
+
+export {
+    key_bit, hotbar_of, face_of, decode_block_change, multi_begin, multi_next,
+    send_pos_look, send_dig, send_place, send_slot, send_swing, section_of,
+    DIG_START, DIG_CANCEL, DIG_FINISH, HAND_MAIN,
+}
+
+const DIG_START: i32 = 0
+const DIG_CANCEL: i32 = 1
+const DIG_FINISH: i32 = 2
+const HAND_MAIN: i32 = 0
+
+// Linux evdev scancodes (input.raw): W 17, A 30, S 31, D 32, Space 57, LShift 42, LCtrl 29, digits 2..10.
+fn key_bit(sc: u32) -> u32 {
+    if sc == 17 as u32 { return mc_input.K_FORWARD }
+    if sc == 31 as u32 { return mc_input.K_BACK }
+    if sc == 30 as u32 { return mc_input.K_LEFT }
+    if sc == 32 as u32 { return mc_input.K_RIGHT }
+    if sc == 57 as u32 { return mc_input.K_JUMP }
+    if sc == 42 as u32 { return mc_input.K_SNEAK }
+    if sc == 29 as u32 { return mc_input.K_SPRINT }
+    return 0 as u32
+}
+
+fn hotbar_of(sc: u32) -> i32 {
+    if sc >= 2 as u32 && sc <= 10 as u32 { return (sc as i32) - 2 }
+    return 0 - 1
+}
+
+// Face that was entered by the pick ray (Pick.nx/ny/nz points back to the ray origin) -> the face number of the dig / place packets.
+fn face_of(nx: i32, ny: i32, nz: i32) -> i32 {
+    if ny < 0 { return 0 }
+    if ny > 0 { return 1 }
+    if nz < 0 { return 2 }
+    if nz > 0 { return 3 }
+    if nx < 0 { return 4 }
+    if nx > 0 { return 5 }
+    return 0 - 1
+}
+
+fn decode_block_change(b: *mut bytes.Bytes, x: *mut i32, y: *mut i32, z: *mut i32, state: *mut i32) -> bool {
+    let ok: bool = bytes.get_position(b, x, y, z) catch false
+    if !ok { return false }
+    let s: i32 = bytes.get_varint(b) catch (0 - 1)
+    if s < 0 { return false }
+    *state = s
+    return true
+}
+
+// Section coordinates (sx, sy, sz) of a Multi Block Change header, signed fields of the u64 (x22 z22 y20).
+fn section_of(v: u64, sx: *mut i32, sy: *mut i32, sz: *mut i32) {
+    var x: i64 = (v >> 42 as u64) as i64
+    var z: i64 = ((v >> 20 as u64) & 4194303 as u64) as i64
+    var y: i64 = (v & 1048575 as u64) as i64
+    if x >= 2097152 { x = x - 4194304 }
+    if z >= 2097152 { z = z - 4194304 }
+    if y >= 524288 { y = y - 1048576 }
+    *sx = x as i32
+    *sy = y as i32
+    *sz = z as i32
+}
+
+// Reads the header; returns the number of records (-1 = bad packet). (x0, y0, z0) = block origin of the section.
+fn multi_begin(b: *mut bytes.Bytes, protocol: i32, x0: *mut i32, y0: *mut i32, z0: *mut i32) -> i32 {
+    let v: u64 = bytes.get_u64(b) catch 0
+    var sx: i32 = 0
+    var sy: i32 = 0
+    var sz: i32 = 0
+    section_of(v, &sx, &sy, &sz)
+    *x0 = sx * 16
+    *y0 = sy * 16
+    *z0 = sz * 16
+    if protocol >= 751 && protocol < 763 {
+        bytes.get_bool(b) catch false
+    }
+    let n: i32 = bytes.get_varint(b) catch (0 - 1)
+    if n < 0 || n > 4096 { return 0 - 1 }
+    return n
+}
+
+// One record: absolute block position + state id. false when the packet ends early.
+fn multi_next(b: *mut bytes.Bytes, x0: i32, y0: i32, z0: i32, x: *mut i32, y: *mut i32, z: *mut i32, state: *mut i32) -> bool {
+    var bad: bool = false
+    let r: i64 = bytes.get_varlong(b) catch 0 - 1
+    if r < 0 { bad = true }
+    if bad { return false }
+    *state = (r >> 12 as i64) as i32
+    *x = x0 + (((r >> 8 as i64) & 15 as i64) as i32)
+    *z = z0 + (((r >> 4 as i64) & 15 as i64) as i32)
+    *y = y0 + ((r & 15 as i64) as i32)
+    return true
+}
+
+// ---------------------------------------------------------------- senders (schema driven, any version with the packet)
+
+fn send_pos_look(cl: *mut mc_client.Client, x: f64, y: f64, z: f64, yaw: f64, pitch: f64, on_ground: bool) -> bool {
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_f64(&v, "x", x)
+    mc_encode.vals_f64(&v, "y", y)
+    mc_encode.vals_f64(&v, "z", z)
+    mc_encode.vals_f32(&v, "yaw", yaw as f32)
+    mc_encode.vals_f32(&v, "pitch", pitch as f32)
+    mc_encode.vals_bool(&v, "onGround", on_ground)
+    let ok: bool = mc_client.client_send_values(cl, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_POSITION_LOOK, &v)
+    rt.buf_free(&v)
+    return ok
+}
+
+fn send_dig(cl: *mut mc_client.Client, status: i32, x: i32, y: i32, z: i32, face: i32, seq: i32) -> bool {
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_i64(&v, "status", status as i64)
+    mc_encode.vals_i64(&v, "location.x", x as i64)
+    mc_encode.vals_i64(&v, "location.y", y as i64)
+    mc_encode.vals_i64(&v, "location.z", z as i64)
+    mc_encode.vals_i64(&v, "face", face as i64)
+    mc_encode.vals_i64(&v, "sequence", seq as i64)
+    let ok: bool = mc_client.client_send_values(cl, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_BLOCK_DIG, &v)
+    rt.buf_free(&v)
+    return ok
+}
+
+// Place against the block (x, y, z) on its `face`; the cursor is the middle of the face.
+fn send_place(cl: *mut mc_client.Client, x: i32, y: i32, z: i32, face: i32, seq: i32) -> bool {
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_i64(&v, "hand", HAND_MAIN as i64)
+    mc_encode.vals_i64(&v, "location.x", x as i64)
+    mc_encode.vals_i64(&v, "location.y", y as i64)
+    mc_encode.vals_i64(&v, "location.z", z as i64)
+    mc_encode.vals_i64(&v, "direction", face as i64)
+    mc_encode.vals_f32(&v, "cursorX", 0.5f)
+    mc_encode.vals_f32(&v, "cursorY", 0.5f)
+    mc_encode.vals_f32(&v, "cursorZ", 0.5f)
+    mc_encode.vals_bool(&v, "insideBlock", false)
+    mc_encode.vals_i64(&v, "sequence", seq as i64)
+    let ok: bool = mc_client.client_send_values(cl, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_BLOCK_PLACE, &v)
+    rt.buf_free(&v)
+    return ok
+}
+
+fn send_slot(cl: *mut mc_client.Client, slot: i32) -> bool {
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_i64(&v, "slotId", slot as i64)
+    let ok: bool = mc_client.client_send_values(cl, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_HELD_ITEM_SLOT, &v)
+    rt.buf_free(&v)
+    return ok
+}
+
+fn send_swing(cl: *mut mc_client.Client, seq: i32) -> bool {
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_i64(&v, "hand", HAND_MAIN as i64)
+    mc_encode.vals_i64(&v, "sequence", seq as i64)
+    let ok: bool = mc_client.client_send_values(cl, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_ARM_ANIMATION, &v)
+    rt.buf_free(&v)
+    return ok
+}
