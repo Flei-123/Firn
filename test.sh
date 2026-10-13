@@ -2093,6 +2093,16 @@ else
     grep -E 'FAIL' "$WORK/textinput.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 137. Net: async.loop EV_RDHUP/EV_ET vs Python select.epoll/poll, IPv6 DNS name server on [::1] vs fake DNS, closure pin counter-check (tools/net/gate_run.sh, docs/ASYNC.md, docs/DNS.md, docs/CLOSURES.md; loopback only) =="
+FIRNC="$FIRNC" bash tools/net/gate_run.sh > "$WORK/net137.log" 2>&1 && N137RC=0 || N137RC=$?
+if [ "$N137RC" -eq 0 ]; then
+    ok
+    grep -E '^ +(ok|SKIP)' "$WORK/net137.log" | sed 's/^/ /'
+else
+    bad "tools/net/gate_run.sh failed (see .test-work/net137.log)"
+    grep -E 'FAIL' "$WORK/net137.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 136. fUi window text input through the platform input method (apphost wiring r444b, opt-in plat.fuiime): typing, dead key + Compose, pre-edit + commit, click / Tab during pre-edit, XIM @im=none on Xvfb + xdotool; rumble is in gate 127 (tools/input/apphost_run.sh, docs/INPUT.md) =="
 FIRNC="$FIRNC" bash tools/input/apphost_run.sh > "$WORK/apphost_ime.log" 2>&1 && AIMRC=0 || AIMRC=$?
 if [ "$AIMRC" -eq 0 ]; then

@@ -37,6 +37,7 @@ done
 [ $rc -eq 0 ] || exit 1
 echo "   dns_main and http_main built: opt, --no-opt, dev-fast"
 python3 tools/dns/check.py "$WORK/dns_main_opt" "$WORK/http_main_opt" || rc=1
+python3 tools/dns/check6.py "$WORK/dns_main_opt" || rc=1  # IPv6 name server on [::1]
 echo "== the same checks, dev-fast build =="
 python3 tools/dns/check.py "$WORK/dns_main_dev" "$WORK/http_main_dev" | grep -v "^  OK" || rc=1
 

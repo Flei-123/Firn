@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/async/fnpin.fi -- keep CAPTURING closures alive while the loop owns them.
+//
+// PROBLEM. `async.loop` stores callbacks as plain addresses in memory the
+// collector does not scan (loop.fi A2). A capturing closure (`gc fn`, ROUND58)
+// is a GC object: once nothing the collector can see points at it, it is swept
+// and the loop calls freed memory. A bare `fn` without captures is fine.
+//
+// FIX (library only, no compiler change). A table of 64 words that IS a
+// collector root (`gc_root_register`): pin the closure's record address
+// before you hand it to the loop, unpin it when the watch / timer is gone.
+//
+//     let f: fn(*mut loop.Loop, u64) = try gc fn(l: *mut loop.Loop, ud: u64) { ... c ... }
+//     let slot: usize = fnpin.pin(f as u64)
+//     loop.timer_after(&l, 100, f, 0)
+//     ... after it fired or was cancelled:  fnpin.unpin(slot)
+//
+// HONEST. One process-wide table, 64 pins, not thread-safe (loop thread only,
+// like the loop). `pin` returns NONE (usize max) when the table is full or
+// the root cannot be registered. Pinned closures leak until `unpin`.
+import std.rt
+
+export { pin, unpin, pinned_count, NONE, CAPACITY }
+
+const CAPACITY: usize = 64
+const NONE: usize = 18446744073709551615
+
+static mut table: [u64; 64] = [0; 64]
+static mut registered: bool = false
+static mut count: usize = 0
+
+fn pin(rec: u64) -> usize {
+    if rec == 0 {
+        return NONE
+    }
+    if !registered {
+        if !gc_root_register((&table[0]) as *mut u8, 512) {
+            return NONE
+        }
+        registered = true
+    }
+    var i: usize = 0
+    while i < 64 {
+        if table[i] == 0 {
+            table[i] = rec
+            count = count + 1
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn unpin(slot: usize) {
+    if slot < 64 && table[slot] != 0 {
+        table[slot] = 0
+        count = count - 1
+    }
+}
+
+fn pinned_count() -> usize { return count }
