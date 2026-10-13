@@ -52,6 +52,7 @@ export {
     extract_options_default,
     sf_name_ok, sf_link_ok, sf_clean, sf_strip, sf_depth, sf_trim_slash,
     sf_walker_new, sf_ensure_dirs, sf_make_dir, sf_write_file, sf_make_symlink,
+    sf_open_file, sf_finish_file, sf_set_dir_meta, sf_set_file_time, sf_read_back,
     sf_hash_name, sf_names_equal, sf_fs_error,
 }
 
@@ -82,10 +83,12 @@ error ArchiveError {
 struct ExtractOptions {
     strip: usize, // leading path components to drop (tar --strip-components)
     overwrite: bool, // replace existing files and links (never directories)
+    keep_times: bool, // apply the modification time of files and directories (Linux; default off)
+    exact_dir_modes: bool, // after the last entry set directories to their EXACT archive mode (default off: mode | 0700)
 }
 
 fn extract_options_default() -> ExtractOptions {
-    return ExtractOptions { strip: 0, overwrite: false }
+    return ExtractOptions { strip: 0, overwrite: false, keep_times: false, exact_dir_modes: false }
 }
 
 struct ExtractStats {
@@ -542,6 +545,69 @@ fn clear_way(full: str, overwrite: bool) -> ArchiveError!bool {
         return why
     }
     return true
+}
+
+// Opens `rel` for STREAMED writing (parents made and checked, the way
+// cleared, created exclusively with `mode`, never through a link). The
+// answer is the descriptor: write with fs.write_fd_all, end with
+// `sf_finish_file`.
+fn sf_open_file(w: *mut SfWalker, rel: str, mode: u32, overwrite: bool) -> ArchiveError!i64 {
+    try sf_ensure_dirs(w, rel_parent(rel))
+    let full: str = full_path(w, rel)
+    try clear_way(full, overwrite)
+    var bad: bool = false
+    var why: ArchiveError = ArchiveError::Io
+    let fd: i64 = fs.create_excl(full, mode & 511 as u32) catch | er | (note_n64(er, &why, &bad))
+    if bad {
+        return why
+    }
+    return fd
+}
+
+fn note_n64(e: FsError, why: *mut ArchiveError, bad: *mut bool) -> i64 {
+    *why = sf_fs_error(e)
+    *bad = true
+    return 0 - 1
+}
+
+// Closes a file from `sf_open_file`, sets the exact permission bits and,
+// when `keep_times`, the modification time.
+fn sf_finish_file(w: *mut SfWalker, rel: str, fd: i64, mode: u32, mtime: i64, keep_times: bool) {
+    fs.close_fd(fd)
+    let full: str = full_path(w, rel)
+    fs.chmod(full, mode & 511 as u32) catch false
+    if keep_times {
+        fs.set_mtime(full, mtime, true) catch false
+    }
+}
+
+fn sf_set_file_time(w: *mut SfWalker, rel: str, mtime: i64) {
+    fs.set_mtime(full_path(w, rel), mtime, true) catch false
+}
+
+// The last touch of a directory (after everything inside it was written):
+// `exact_mode` = the archive mode (all 12 bits that are safe: no setuid,
+// setgid, sticky) instead of mode | 0700; `keep_times` = its mtime.
+fn sf_set_dir_meta(w: *mut SfWalker, rel: str, mode: u32, mtime: i64, exact_mode: bool, keep_times: bool) {
+    let full: str = full_path(w, rel)
+    if exact_mode {
+        fs.chmod(full, mode & 511 as u32) catch false
+    }
+    if keep_times {
+        fs.set_mtime(full, mtime, true) catch false
+    }
+}
+
+// Reads the file `rel` (written earlier) back: a hard link is a copy.
+fn sf_read_back(w: *mut SfWalker, rel: str, out: *mut rt.Buf) -> bool {
+    var ok: bool = true
+    fs.read_file(full_path(w, rel), out) catch | er | (note_false(er, &ok))
+    return ok
+}
+
+fn note_false(e: FsError, ok: *mut bool) -> usize {
+    *ok = false
+    return 0
 }
 
 // Writes the file `rel` with `n` octets from `p`. Mode: the permission

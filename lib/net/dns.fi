@@ -49,17 +49,24 @@
 //     fallback. Loopback tested only (tools/dns/check6.py), no zone ids
 //     (fe80::1%eth0 is skipped), Windows seam untested. AAAA records are
 //     parsed and handed back (`Resolved.addr6`, `dns_resolve(.., T_AAAA, ..)`).
-// D2  NO DNSSEC, NO DoT/DoH, NO EDNS0. Without EDNS the classic limit of
-//     512 octets applies and a bigger answer arrives with TC, which the
-//     TCP fallback then fetches -- slower, not wrong. What protects
+// D2  NO DNSSEC, NO DoT/DoH. EDNS0 (RFC 6891) IS ON: every question carries an
+//     OPT record that advertises a 1232 octet UDP payload (`resolver_set_edns`
+//     changes it, 0 turns it off), so answers up to that size need no TCP
+//     fallback. A server that answers FORMERR is asked again WITHOUT the
+//     option. No DO bit, no cookies, no client subnet. What protects
 //     against a forged answer is the 16 bit ID, the random source port the
 //     kernel picks, the sender and question check -- not cryptography. 0x20
 //     case randomisation is not done.
-// D3  NO SEARCH LIST, NO `ndots`. `intranet` is asked for as `intranet`.
-//     resolv.conf `search`/`domain`/`options` lines are ignored; so is
-//     the DomainName of Windows.
-// D4  NO INTERNATIONAL NAMES. A name with an octet >= 128 is `Name`; the
-//     caller converts to punycode first (xn--...). Nothing here does.
+// D3  SEARCH LIST AND `ndots` ONLY IN `dns_resolve_search`. resolv.conf
+//     `search` / `domain` (the last one wins) and `options ndots:n` (max 15,
+//     default 1) are read by `resolver_init` on Linux; the DomainName of
+//     Windows is not. `dns_resolve` itself still asks for exactly the name
+//     it is given. A resolv.conf with neither line gets no search list (glibc
+//     would take the domain part of the host name -- not done).
+// D4  INTERNATIONAL NAMES ONLY IN `dns_resolve_search`: a name with an octet
+//     >= 128 is converted by lib/net/idn.fi (Punycode, small case map, NO
+//     NFKC -- see idn.fi I1) before anything is asked. `dns_resolve` and
+//     `dns_name_valid` still refuse such a name.
 // D5  NO ITERATIVE RESOLUTION. The servers are RECURSIVE resolvers; their
 //     answers are taken as they come, except that records which do not
 //     belong to the CNAME chain of the question are dropped (so a
@@ -80,6 +87,7 @@ import std.crypto.random
 import net.udp
 import net.ip6
 import net.dnsconf
+import net.idn
 
 export {
     DnsError, Resolver, Resolved, Reply,
@@ -94,6 +102,8 @@ export {
     dns_build_query, dns_parse_reply, reply_new, dns_name_valid,
     dns_parse_ipv4, dns_parse_resolv_conf, dns_parse_resolv_conf_all, dns_hosts_lookup,
     resolver_add_server6, resolver_server_is_v6,
+    resolver_set_edns, resolver_set_ndots, resolver_set_search, resolver_search_text,
+    dns_parse_search, dns_resolve_search, dns_build_query_edns, resolver_edns_sent,
     T_A, T_CNAME, T_AAAA, T_SRV,
     SrvSet, srvset_new, dns_resolve_srv, srv_target,
     VIA_NUMERIC, VIA_LOCALHOST, VIA_HOSTS, VIA_CACHE, VIA_UDP, VIA_TCP,
@@ -137,6 +147,10 @@ const CACHE_NAME: usize = 96
 const TTL_NONE: u32 = 4294967295 as u32
 const NEG_TTL_S: u64 = 30
 const TTL_MAX_S: u32 = 3600
+const EDNS_PAYLOAD: u32 = 1232
+const SEARCH_MAX: usize = 255
+const NDOTS_MAX: u32 = 15
+const T_OPT: u32 = 41
 
 // Outcomes of one exchange with one server.
 const X_OK: i32 = 0
@@ -304,10 +318,18 @@ fn dns_name_valid(p: u64, n: usize) -> bool {
 
 // ---------------------------------------------------------------- The query
 
-// One question, recursion desired, no EDNS (D2). `name` may end in one
-// dot. False when the name is not valid.
+// One question, recursion desired, no EDNS. `name` may end in one dot.
+// False when the name is not valid.
 fn dns_build_query(out: *mut rt.Buf, id: u32, name: u64, n: usize,
     qtype: u32) -> bool {
+    return dns_build_query_edns(out, id, name, n, qtype, 0 as u32)
+}
+
+// The same, plus an EDNS0 OPT record (RFC 6891: root name, TYPE 41, CLASS =
+// the UDP payload size we accept, TTL 0 = version 0 and no flags, no
+// options) when `payload` is not 0.
+fn dns_build_query_edns(out: *mut rt.Buf, id: u32, name: u64, n: usize,
+    qtype: u32, payload: u32) -> bool {
     var nl: usize = n
     if nl > 0 && rt.ld8(name, nl - 1) == 46 as u8 {
         nl = nl - 1
@@ -320,7 +342,11 @@ fn dns_build_query(out: *mut rt.Buf, id: u32, name: u64, n: usize,
     push16(out, 1 as u32) // QDCOUNT
     push16(out, 0 as u32)
     push16(out, 0 as u32)
-    push16(out, 0 as u32)
+    if payload != 0 as u32 {
+        push16(out, 1 as u32) // ARCOUNT
+    } else {
+        push16(out, 0 as u32)
+    }
     var start: usize = 0
     var i: usize = 0
     while i <= nl {
@@ -335,6 +361,14 @@ fn dns_build_query(out: *mut rt.Buf, id: u32, name: u64, n: usize,
     rt.buf_push(out, 0 as u8)
     push16(out, qtype)
     push16(out, CLASS_IN)
+    if payload != 0 as u32 {
+        rt.buf_push(out, 0 as u8) // root
+        push16(out, T_OPT)
+        push16(out, payload)
+        push16(out, 0 as u32) // extended RCODE, version
+        push16(out, 0 as u32) // flags (DO = 0)
+        push16(out, 0 as u32) // RDLENGTH
+    }
     return true
 }
 
@@ -783,6 +817,106 @@ fn dns_parse_resolv_conf_all(p: u64, n: usize, v4: *mut [u32; 4],
     return found
 }
 
+// `search a b c` / `domain a` (the LAST of either wins, resolv.conf(5)) and
+// `options ndots:n [..]` (n clamped to 15). The domains go to `out` as one
+// blank separated text; returns its length. `*ndots` is only touched when an
+// `ndots:` option is present.
+fn dns_parse_search(p: u64, n: usize, out: *mut [u8; 256], ndots: *mut u32) -> usize {
+    var total: usize = 0
+    var i: usize = 0
+    var kws: [u8; 6] = "search"
+    var kwd: [u8; 6] = "domain"
+    var kwo: [u8; 7] = "options"
+    var kwn: [u8; 6] = "ndots:"
+    while i < n {
+        var e: usize = i
+        while e < n && rt.ld8(p, e) != 10 as u8 {
+            e = e + 1
+        }
+        let le: usize = line_end(p, i, e)
+        var t1e: usize = 0
+        let t1: usize = next_token(p, i, le, &t1e)
+        let l1: usize = t1e - t1
+        let is_search: bool = l1 == 6 && name_eq(p + t1 as u64, 6, (&kws[0]) as u64, 6)
+        let is_domain: bool = l1 == 6 && name_eq(p + t1 as u64, 6, (&kwd[0]) as u64, 6)
+        let is_opts: bool = l1 == 7 && name_eq(p + t1 as u64, 7, (&kwo[0]) as u64, 7)
+        if is_search || is_domain {
+            total = 0
+            var pos: usize = t1e
+            var cnt: usize = 0
+            var more: bool = true
+            while more {
+                var te: usize = 0
+                let ts: usize = next_token(p, pos, le, &te)
+                if te == ts {
+                    more = false
+                } else {
+                    var tl: usize = te - ts
+                    if tl > 0 && rt.ld8(p, te - 1) == 46 as u8 {
+                        tl = tl - 1 // a root dot adds nothing
+                    }
+                    if tl > 0 && cnt < 6 && total + tl + 1 <= SEARCH_MAX {
+                        if total > 0 {
+                            (*out)[total] = 32 as u8
+                            total = total + 1
+                        }
+                        var k: usize = 0
+                        while k < tl {
+                            let c: u8 = rt.ld8(p, ts + k)
+                            var lc: u8 = c
+                            if c >= 65 as u8 && c <= 90 as u8 {
+                                lc = c + 32 as u8
+                            }
+                            (*out)[total + k] = lc
+                            k = k + 1
+                        }
+                        total = total + tl
+                        cnt = cnt + 1
+                    }
+                    pos = te
+                    if is_domain {
+                        more = false // `domain` takes one name
+                    }
+                }
+            }
+        } else if is_opts {
+            var pos2: usize = t1e
+            var more2: bool = true
+            while more2 {
+                var te2: usize = 0
+                let ts2: usize = next_token(p, pos2, le, &te2)
+                if te2 == ts2 {
+                    more2 = false
+                } else {
+                    if te2 - ts2 > 6 && name_eq(p + ts2 as u64, 6, (&kwn[0]) as u64, 6) {
+                        var v: u32 = 0
+                        var j: usize = ts2 + 6
+                        var okn: bool = true
+                        while j < te2 {
+                            let d: u8 = rt.ld8(p, j)
+                            if d >= 48 as u8 && d <= 57 as u8 && v < 1000 as u32 {
+                                v = v * 10 as u32 + ((d - 48 as u8) as u32)
+                            } else {
+                                okn = false
+                            }
+                            j = j + 1
+                        }
+                        if okn {
+                            if v > NDOTS_MAX {
+                                v = NDOTS_MAX
+                            }
+                            *ndots = v
+                        }
+                    }
+                    pos2 = te2
+                }
+            }
+        }
+        i = e + 1
+    }
+    return total
+}
+
 // The first hosts line that lists `name` (case-insensitive) after an IPv4
 // address. Lines whose address is not IPv4 (`::1 localhost`) are skipped.
 fn dns_hosts_lookup(p: u64, n: usize, name: u64, nlen: usize,
@@ -871,6 +1005,11 @@ struct Resolver {
     n_udp: u64,
     n_tcp: u64,
     last_err: u32,
+    edns: u32, // advertised UDP payload, 0 = no EDNS (D2)
+    n_edns: u64, // questions sent with an OPT record
+    ndots: u32,
+    search: [u8; 256], // domains separated by one blank (D3)
+    nsearch: usize,
 }
 
 fn resolver_new() -> Resolver {
@@ -880,7 +1019,9 @@ fn resolver_new() -> Resolver {
         c_name: [0; 3072], c_nlen: [0; 32], c_addr: [0; 256], c_n: [0; 32],
         c_exp: [0; 32], c_kind: [0; 32], c_next: 0,
         n_queries: 0 as u64, n_hits: 0 as u64, n_udp: 0 as u64,
-        n_tcp: 0 as u64, last_err: 0 as u32 }
+        n_tcp: 0 as u64, last_err: 0 as u32,
+        edns: EDNS_PAYLOAD, n_edns: 0 as u64, ndots: 1 as u32, search: [0; 256],
+        nsearch: 0 }
 }
 
 fn resolver_free(r: *mut Resolver) {
@@ -898,6 +1039,7 @@ fn resolver_init(r: *mut Resolver) -> bool {
     if conf_resolv_text(&conf) {
         found = dns_parse_resolv_conf_all(conf.ptr, conf.len, &(*r).servers,
             &(*r).servers6, &(*r).fam)
+        (*r).nsearch = dns_parse_search(conf.ptr, conf.len, &(*r).search, &(*r).ndots)
     }
     rt.buf_free(&conf)
     (*r).nservers = found
@@ -968,6 +1110,33 @@ fn resolver_queries(r: *mut Resolver) -> u64 { return (*r).n_queries }
 fn resolver_cache_hits(r: *mut Resolver) -> u64 { return (*r).n_hits }
 fn resolver_udp_sent(r: *mut Resolver) -> u64 { return (*r).n_udp }
 fn resolver_tcp_used(r: *mut Resolver) -> u64 { return (*r).n_tcp }
+
+fn resolver_set_edns(r: *mut Resolver, payload: u32) { (*r).edns = payload }
+fn resolver_set_ndots(r: *mut Resolver, n: u32) {
+    if n > NDOTS_MAX {
+        (*r).ndots = NDOTS_MAX
+    } else {
+        (*r).ndots = n
+    }
+}
+fn resolver_edns_sent(r: *mut Resolver) -> u64 { return (*r).n_edns }
+
+// The search list as text: domains separated by one blank ("" = none).
+fn resolver_search_text(r: *mut Resolver) -> u64 { return ((&(*r).search[0]) as u64) }
+
+// Sets the search list from text (blank separated, at most 255 octets).
+fn resolver_set_search(r: *mut Resolver, p: u64, n: usize) -> bool {
+    if n > SEARCH_MAX {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        (*r).search[i] = rt.ld8(p, i)
+        i = i + 1
+    }
+    (*r).nsearch = n
+    return true
+}
 
 fn resolver_flush(r: *mut Resolver) {
     var i: usize = 0
@@ -1202,13 +1371,26 @@ fn ask(r: *mut Resolver, name: u64, nlen: usize, qtype: u32,
             }
             let id: u32 = ((idb[0] as u32) << 8) | (idb[1] as u32)
             var q: rt.Buf = rt.buf_new()
-            if !dns_build_query(&q, id, name, nlen, qtype) {
+            if !dns_build_query_edns(&q, id, name, nlen, qtype, (*r).edns) {
                 rt.buf_free(&q)
                 return X_FORMAT
+            }
+            if (*r).edns != 0 as u32 {
+                (*r).n_edns = (*r).n_edns + 1 as u64
             }
             var st: i32 = exchange_udp(r, s, &q, id, name, nlen, qtype,
                 ms, rep)
             (*out).via = VIA_UDP
+            if st == X_OK && (*rep).rcode == 1 as u32 && (*r).edns != 0 as u32 {
+                // FORMERR: a server that does not know EDNS. Ask again
+                // without the OPT record (RFC 6891 7).
+                rt.buf_clear(&q)
+                if !dns_build_query_edns(&q, id, name, nlen, qtype, 0 as u32) {
+                    rt.buf_free(&q)
+                    return X_FORMAT
+                }
+                st = exchange_udp(r, s, &q, id, name, nlen, qtype, ms, rep)
+            }
             if st == X_OK && (*rep).truncated {
                 st = exchange_tcp(r, s, &q, id, name, nlen, qtype, ms, rep)
                 (*out).via = VIA_TCP
@@ -1421,6 +1603,133 @@ fn dns_resolve(r: *mut Resolver, name: u64, nlen: usize, qtype: u32,
         cache_put(r, q, nl, 1 as u32, &(*out).addr, rep.naddr, ttl as u64, now)
     }
     return true
+}
+
+fn err_of(code: u32) -> DnsError {
+    if code == 1 as u32 { return DnsError::Name }
+    if code == 2 as u32 { return DnsError::NoServers }
+    if code == 3 as u32 { return DnsError::Timeout }
+    if code == 4 as u32 { return DnsError::Network }
+    if code == 5 as u32 { return DnsError::Format }
+    if code == 6 as u32 { return DnsError::ServerFail }
+    if code == 7 as u32 { return DnsError::NxDomain }
+    if code == 8 as u32 { return DnsError::NoData }
+    if code == 9 as u32 { return DnsError::CnameLoop }
+    return DnsError::Random
+}
+
+// `dns_resolve` the way a C library asks (D3, D4):
+//   * a name with an octet >= 128 is converted to Punycode first;
+//   * a name ending in a dot is absolute: asked as it is;
+//   * a name with at least `ndots` dots is asked as it is FIRST, then with
+//     each search domain appended; fewer dots: the search domains first,
+//     the bare name last;
+//   * NXDOMAIN / NODATA / SERVFAIL / a bad candidate name move on to the
+//     next candidate; a timeout or a network failure stops (every
+//     candidate would wait just as long).
+// With no search list this is `dns_resolve` plus the Punycode step.
+fn dns_resolve_search(r: *mut Resolver, name: u64, nlen: usize, qtype: u32,
+    out: *mut Resolved) -> DnsError!bool {
+    var base: rt.Buf = rt.buf_new()
+    if idn.idn_has_non_ascii(name, nlen) {
+        if !idn.idn_to_ascii(name, nlen, &base) {
+            rt.buf_free(&base)
+            resolved_reset(out)
+            (*r).last_err = 1 as u32
+            return DnsError::Name
+        }
+    } else {
+        rt.buf_push_bytes(&base, name, nlen)
+    }
+    var bl: usize = base.len
+    var absolute: bool = false
+    if bl > 0 && rt.ld8(base.ptr, bl - 1) == 46 as u8 {
+        absolute = true
+        bl = bl - 1
+    }
+    var dots: u32 = 0
+    var di: usize = 0
+    while di < bl {
+        if rt.ld8(base.ptr, di) == 46 as u8 {
+            dots = dots + 1 as u32
+        }
+        di = di + 1
+    }
+    if absolute || (*r).nsearch == 0 || bl == 0 {
+        let ok0: bool = dns_resolve(r, base.ptr, bl, qtype, out) catch false
+        let code0: u32 = (*r).last_err
+        rt.buf_free(&base)
+        if ok0 {
+            return true
+        }
+        return err_of(code0)
+    }
+    // candidates: index 0 = the bare name, 1.. = the search domains
+    var cand: usize = 0
+    var ncand: usize = 1
+    var si: usize = 0
+    while si < (*r).nsearch {
+        if (*r).search[si] == 32 as u8 {
+            ncand = ncand + 1
+        }
+        si = si + 1
+    }
+    ncand = ncand + 1 // domains = blanks + 1, plus the bare name
+    let bare_first: bool = dots >= (*r).ndots
+    var step: usize = 0
+    var last_code: u32 = 7 as u32
+    while step < ncand {
+        // step -> candidate: bare first = 0,1,2..; bare last = 1,2,..,0
+        var idx: usize = 0
+        if bare_first {
+            idx = step
+        } else if step + 1 == ncand {
+            idx = 0
+        } else {
+            idx = step + 1
+        }
+        var q: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&q, base.ptr, bl)
+        if idx > 0 {
+            // the idx-th domain of the list
+            var seen: usize = 1
+            var from: usize = 0
+            var pos: usize = 0
+            while pos < (*r).nsearch && seen < idx {
+                if (*r).search[pos] == 32 as u8 {
+                    seen = seen + 1
+                    from = pos + 1
+                }
+                pos = pos + 1
+            }
+            var to: usize = from
+            while to < (*r).nsearch && (*r).search[to] != 32 as u8 {
+                to = to + 1
+            }
+            rt.buf_push(&q, 46 as u8)
+            var t: usize = from
+            while t < to {
+                rt.buf_push(&q, (*r).search[t])
+                t = t + 1
+            }
+        }
+        let ok: bool = dns_resolve(r, q.ptr, q.len, qtype, out) catch false
+        let code: u32 = (*r).last_err
+        rt.buf_free(&q)
+        if ok {
+            rt.buf_free(&base)
+            return true
+        }
+        last_code = code
+        if code == 2 as u32 || code == 3 as u32 || code == 4 as u32 || code == 10 as u32 {
+            step = ncand // stop
+        } else {
+            step = step + 1
+        }
+    }
+    rt.buf_free(&base)
+    (*r).last_err = last_code
+    return err_of(last_code)
 }
 
 fn dns_resolve_a(r: *mut Resolver, name: u64, nlen: usize,
