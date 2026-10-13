@@ -13,6 +13,7 @@ D=$(mktemp -d); XP=""
 trap '[ -n "$XP" ] && kill "$XP" 2>/dev/null; rm -rf "$D"' EXIT
 "$FIRNC" -o "$D/scene" tools/gpu/mc/scene.fi 2>"$D/err" || { echo "   FAIL: compile scene.fi"; head -5 "$D/err"; exit 1; }
 "$FIRNC" -o "$D/eb" tools/gpu/mc/ent_bench.fi 2>"$D/err" || { echo "   FAIL: compile ent_bench.fi"; head -5 "$D/err"; exit 1; }
+"$FIRNC" -o "$D/ly" tools/gpu/mc/layers.fi 2>"$D/err" || { echo "   FAIL: compile layers.fi"; head -5 "$D/err"; exit 1; }
 "$FIRNC" -o "$D/up" tools/gpu/mc/upload_probe.fi 2>"$D/err" || { echo "   FAIL: compile upload_probe.fi"; head -5 "$D/err"; exit 1; }
 fail=0
 env -u DISPLAY -u EGL_PLATFORM timeout 180 "$D/scene" >"$D/h.txt" 2>&1; rc=$?
@@ -24,6 +25,9 @@ else
 fi
 env -u DISPLAY -u EGL_PLATFORM timeout 120 "$D/up" 2>&1 | sed 's/^/   upload: /'
 env -u DISPLAY -u EGL_PLATFORM timeout 200 "$D/eb" 2>&1 | grep -E "^(renderer|metric ents|ents summary)" | sed 's/^/   ents: /'
+env -u DISPLAY -u EGL_PLATFORM timeout 200 "$D/ly" >"$D/ly.txt" 2>&1; rc=$?
+grep -E "^(metric|check|layers)" "$D/ly.txt" | sed 's/^/   layers: /'
+if [ "$rc" -eq 0 ] && grep -q "^layers: all ok" "$D/ly.txt"; then echo "   ok:   texture array 1120 layers / layer limit / unequal-section defrag / mip+aniso"; else echo "   FAIL: layers.fi (exit $rc)"; fail=1; fi
 if command -v Xvfb >/dev/null 2>&1; then
     mkfifo "$D/disp"; Xvfb -displayfd 3 -screen 0 800x600x24 -nolisten tcp 3>"$D/disp" >/dev/null 2>&1 & XP=$!
     read -r -t 20 n <"$D/disp" || n=""
