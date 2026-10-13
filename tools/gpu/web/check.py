@@ -16,6 +16,11 @@ web, ref = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
 MIN = float(sys.argv[3]) if len(sys.argv) > 3 else 34.0
 W, H = 320, 180
 CLEAR = (0x96, 0xBE, 0xE6)  # 0xFFE6BE96 = A B G R
+# gate 133 (scene layer) reuses this script: GATE_WASM / GATE_CLEAR (RRGGBB) / GATE_MIN_SCENES / GATE_LABEL
+WASM = os.environ.get("GATE_WASM", "mcscene.wasm")
+if os.environ.get("GATE_CLEAR"): CLEAR = tuple(int(os.environ["GATE_CLEAR"][i:i + 2], 16) for i in (0, 2, 4))
+MIN_SCENES = int(os.environ.get("GATE_MIN_SCENES", "7"))
+LABEL = os.environ.get("GATE_LABEL", "webgl2")
 
 s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
 class Quiet(http.server.SimpleHTTPRequestHandler):
@@ -26,7 +31,7 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 try:
     dom = subprocess.run(
         ["chromium", "--headless=new", "--no-sandbox", "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
-         "--ignore-gpu-blocklist", "--virtual-time-budget=30000", "--dump-dom", "http://127.0.0.1:%d/index.html" % port],
+         "--ignore-gpu-blocklist", "--virtual-time-budget=30000", "--dump-dom", "http://127.0.0.1:%d/index.html?wasm=%s" % (port, WASM)],
         capture_output=True, text=True, timeout=120).stdout
 finally:
     srv.shutdown()
@@ -37,8 +42,10 @@ out = m.group(1) if m else ""
 import html
 out = html.unescape(out)
 print("\n".join("   " + l for l in out.strip().splitlines()))
-scenes = re.findall(r"^scene (\S+) .* (ok|FAIL)$", out, re.M)
-if len(scenes) < 7 or any(r != "ok" for _, r in scenes): fail.append("in-module compare: %d scenes, not all ok" % len(scenes))
+scenes = re.findall(r"^scene (\S+) .*psnr=.* (ok|FAIL)$", out, re.M)
+extra = re.findall(r"^scene cull .* (ok|FAIL)$", out, re.M)
+if os.environ.get("GATE_CULL") and extra != ["ok"]: fail.append("cull check: %s" % extra)
+if len(scenes) < MIN_SCENES or any(r != "ok" for _, r in scenes): fail.append("in-module compare: %d scenes, not all ok" % len(scenes))
 if "exit=0" not in out: fail.append("exit code not 0")
 if "WebGL 2.0" not in out: fail.append("no WebGL2 renderer line")
 imgs = re.findall(r'<img src="data:image/png;base64,([^"]+)"', dom)
@@ -57,5 +64,5 @@ for n, b in zip(names, imgs):
     ok = psnr >= MIN and mm <= 5
     print("   canvas vs native %-12s psnr=%.2f cov_browser=%d cov_native=%d %s" % (n, psnr, cov_b, cov_n, "ok" if ok else "FAIL"))
     if not ok: fail.append("%s: psnr %.2f cov mm %d" % (n, psnr, mm))
-print("RESULT webgl2: " + ("ok" if not fail else "FAIL " + "; ".join(fail)))
+print("RESULT %s: " % LABEL + ("ok" if not fail else "FAIL " + "; ".join(fail)))
 sys.exit(1 if fail else 0)
