@@ -25,6 +25,9 @@ OLD="${1:?first firnc missing}"
 NEW="${2:?second firnc missing}"
 shift 2
 WORK=.bench-instr
+# Build level of both compilers (default release-fast = what the benchmarks ship;
+# the CLI default dev-fast would measure the wrong code). Override: OPT=dev-fast.
+OPT="${OPT:-release-fast}"
 mkdir -p "$WORK"
 
 QUELLEN=()
@@ -37,7 +40,7 @@ fi
 # Count the instructions of one program. Empty output = failed.
 zaehle() {
     local bin="$1" tag="$2"
-    if ! timeout 900 valgrind --tool=callgrind \
+    if ! timeout "${INSTR_TIMEOUT:-900}" valgrind --tool=callgrind \
         --callgrind-out-file="$WORK/$tag.cg" "$bin" >/dev/null 2>"$WORK/$tag.log"; then
         return 1
     fi
@@ -50,11 +53,11 @@ sa=0
 sn=0
 for src in "${QUELLEN[@]}"; do
     name=$(basename "$src" .fi)
-    if ! "$OLD" "$src" -o "$WORK/$name.old" 2>/dev/null; then
+    if ! "$OLD" --opt-level="$OPT" "$src" -o "$WORK/$name.old" 2>/dev/null; then
         printf '%-14s   BUILD ERROR (old)\n' "$name"
         continue
     fi
-    if ! "$NEW" "$src" -o "$WORK/$name.new" 2>/dev/null; then
+    if ! "$NEW" --opt-level="$OPT" "$src" -o "$WORK/$name.new" 2>/dev/null; then
         printf '%-14s   BUILD ERROR (new)\n' "$name"
         continue
     fi
@@ -67,8 +70,8 @@ for src in "${QUELLEN[@]}"; do
     sa=$(awk -v x="$sa" -v y="$a" 'BEGIN{printf "%.0f", x+y}')
     sn=$(awk -v x="$sn" -v y="$n" 'BEGIN{printf "%.0f", x+y}')
     awk -v x="$name" -v a="$a" -v b="$n" \
-        'BEGIN{printf "%-14s %16d %16d %+9.2f%%\n", x, a, b, (b-a)/a*100}'
+        'BEGIN{printf "%-14s %16.0f %16.0f %+9.2f%%\n", x, a, b, (b-a)/a*100}'
 done
 echo "-------------------------------------------------------------"
 awk -v a="$sa" -v b="$sn" \
-    'BEGIN{if(a>0) printf "%-14s %16d %16d %+9.2f%%\n", "TOTAL", a, b, (b-a)/a*100}'
+    'BEGIN{if(a>0) printf "%-14s %16.0f %16.0f %+9.2f%%\n", "TOTAL", a, b, (b-a)/a*100}'

@@ -100,8 +100,21 @@ sys.exit(0 if p.returncode == 0 else 1)
 PY
 }
 
+# r168/r82: the "must not grow" runs (no leak expected) are measured THREE times
+# and judged by the MEDIAN growth: one run's RSS growth scatters by several
+# MiB with the load of the machine, but a real leak grows in every run. The
+# 8 MiB limits stay as they are; the counter-checks (leak runs) are unchanged.
+measure3() {
+    local i rc=0
+    for i in 1 2 3; do measure "$@" || rc=1; done
+    return $rc
+}
+median_growth() {
+    awk '/growth/ {print $(NF-1)}' "$1" | tr -d '+' | sort -n | awk '{a[NR]=$1} END{if (NR) print a[int((NR+1)/2)]}'
+}
+
 echo "== the clean run: cycles are collected, RSS stays flat =="
-measure "$WORK/clean.js" "clean" | tee "$WORK/clean.log"
+measure3 "$WORK/clean.js" "clean" | tee "$WORK/clean.log"
 echo
 echo "== the counter check: the same graph, held onto -- RSS MUST grow =="
 # The counter check only has to SHOW the growth, not run as long: it holds
@@ -159,7 +172,7 @@ PY
 
 echo
 echo "== round 66: abandoned generators, promises, BigInts -- RSS stays flat =="
-measure "$WORK/gen.js" "gen" | tee "$WORK/gen.log"
+measure3 "$WORK/gen.js" "gen" | tee "$WORK/gen.log"
 echo
 echo "== the counter check: the same objects, held onto -- RSS MUST grow =="
 # The sampler skips the first samples (start-up) and polls every 50 ms: at ROUNDS/10+2000 the run took 0.3 s on a
@@ -168,7 +181,7 @@ GENLEAKR=$((ROUNDS / 2 + 4000))
 sed -i "s|^var rounds = .*;|var rounds = $GENLEAKR;|" "$WORK/genleak.js"
 measure "$WORK/genleak.js" "genleak" | tee "$WORK/genleak.log"
 
-gen_growth=$(awk '/growth/ {print $(NF-1)}' "$WORK/gen.log" | tr -d '+')
+gen_growth=$(median_growth "$WORK/gen.log")
 genleak_growth=$(awk '/growth/ {print $(NF-1)}' "$WORK/genleak.log" | tr -d '+')
 echo
 echo "gen     growth: ${gen_growth} KiB"
@@ -210,8 +223,8 @@ print("jobs", rounds, acc);
 JS
 echo
 echo "== the promises over $JOBN jobs: every queue is drained, RSS stays flat =="
-measure "$WORK/jobs.js" "jobs" "$JOBN" | tee "$WORK/jobs.log"
-jobs_growth=$(awk '/growth/ {print $(NF-1)}' "$WORK/jobs.log" | tr -d '+')
+measure3 "$WORK/jobs.js" "jobs" "$JOBN" | tee "$WORK/jobs.log"
+jobs_growth=$(median_growth "$WORK/jobs.log")
 echo "jobs    growth: ${jobs_growth} KiB"
 if [ "${jobs_growth:-0}" -gt 8192 ]; then
     echo "FAILED: the promise run grew by more than 8 MiB -- that is a leak."
@@ -219,7 +232,7 @@ if [ "${jobs_growth:-0}" -gt 8192 ]; then
 fi
 echo "OK: settled promises, reactions and async frames are collected (${jobs_growth} KiB)."
 
-clean_growth=$(awk '/growth/ {print $(NF-1)}' "$WORK/clean.log" | tr -d '+')
+clean_growth=$(median_growth "$WORK/clean.log")
 leak_growth=$(awk '/growth/ {print $(NF-1)}' "$WORK/leak.log" | tr -d '+')
 echo
 echo "clean growth: ${clean_growth} KiB"
