@@ -25,9 +25,20 @@ Executables are unchanged byte for byte.
 
 Rules:
 
-* The thread that first reaches the runtime (first `thread_start`/`jobs.create`/GC call that initialises it) becomes
-  the Firn "main thread" and gets the `gs` base. **Call a runtime-using `.so` from that one host thread.** Another host
-  thread has `gs = 0` and crashes on the first runtime access (known limit, roadmap: `thread_attach`).
+* The thread that first reaches the runtime (first `thread_start`/`jobs.create`/GC call, or `thread_attach()`) becomes the
+  Firn "main thread" and gets the `gs` base. It must outlive every other host thread (its stack is the one the collector
+  knows from `gc_init`; it cannot detach).
+* **Other host threads (G1b, `thread_attach`)**: every further host thread calls `thread_attach()` ONCE before any other
+  runtime use (it works with `gs = 0`; it gets its own table entry, stack bounds from `/proc/self/maps`, its own `gs`
+  base) and `thread_host_detach()` before it ends (free lists back, entry recycled, `gs` cleared). Both are plain Firn
+  functions: export them (`#[export_c] fn se_attach() -> u64 { ... }`). A second `thread_attach()` on the same thread
+  returns true and changes nothing. A host thread that was not attached crashes on its first runtime access (`gs = 0`).
+* **Host mode**: `thread_attach()` returns with the thread counted as BLOCKED (its stack is scanned, the collector does
+  not wait for it while it runs host code that never reaches a safepoint). Every export that touches the runtime on such a
+  thread brackets its work: `thread_blocking_out()` ... `thread_blocking_an()`. Without the bracket, a thread idling in host
+  code would stall every stop of the world. Proof: `tools/stack_e/host_attach.c` / `host_attach.py` (4 host threads, two
+  waves so entries are recycled, one thread idles in host code while the others collect; jobs with 0/3 workers, GC chains,
+  threads of their own), 3 opt levels, C and ctypes.
 * Threads started by the library itself (`thread_start`, `jobs`) are fine, also while the host runs threads of its own.
 * The collector scans the Firn threads and the stack of the Firn main thread; host memory is not scanned.
   Do not keep the only reference to a `gc` object in host-owned memory.

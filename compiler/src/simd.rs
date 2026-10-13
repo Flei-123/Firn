@@ -192,6 +192,30 @@ pub enum SimdKind {
     MulLo32,
     AddSatU8,
     SubSatU8,
+    // --- G6 (way E): sqrt / reciprocal, float shuffle, movemask, 16/32-bit pack + unpack, min/max/cmp/mulhi ---
+    //
+    // `RcpF32` / `RsqrtF32` are ESTIMATES with the precision of the machine (x86 ~12 bit, NEON ~8 bit): the
+    // result differs between targets and is only good as a start for a Newton step. `SqrtF32` is exact (IEEE).
+    // `ShufF32(a, b, imm)` = `shufps`: lanes 0,1 from `a`, lanes 2,3 from `b`, two index bits each.
+    // `MoveMaskF32` = `movmskps` (bit i = sign of f32 lane i), `MoveMask8` = `pmovmskb` (bit i = top bit of byte i).
+    SqrtF32,
+    RcpF32,
+    RsqrtF32,
+    ShufF32,
+    MoveMaskF32,
+    MoveMask8,
+    UnpackLo16,
+    UnpackHi16,
+    Packs32,
+    Packus32,
+    Packs16,
+    MinI16,
+    MaxI16,
+    MinI32,
+    MaxI32,
+    CmpEq8,
+    CmpEq16,
+    MulHi16,
     // --- shuffling and shifting ---------------------------------------
     ShuffleB,
     Shuffle32,
@@ -322,6 +346,24 @@ static TABLE: &[Sig] = &[
     s("__v128_mullo32", SimdKind::MulLo32, &[P::V, P::V], None, Some(P::V)),
     s("__v128_addsat_u8", SimdKind::AddSatU8, &[P::V, P::V], None, Some(P::V)),
     s("__v128_subsat_u8", SimdKind::SubSatU8, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_sqrtf32", SimdKind::SqrtF32, &[P::V], None, Some(P::V)),
+    s("__v128_rcpf32", SimdKind::RcpF32, &[P::V], None, Some(P::V)),
+    s("__v128_rsqrtf32", SimdKind::RsqrtF32, &[P::V], None, Some(P::V)),
+    s("__v128_shuf_f32", SimdKind::ShufF32, &[P::V, P::V], Some(255), Some(P::V)),
+    s("__v128_movemask_f32", SimdKind::MoveMaskF32, &[P::V], None, Some(P::U32)),
+    s("__v128_movemask8", SimdKind::MoveMask8, &[P::V], None, Some(P::U32)),
+    s("__v128_unpacklo16", SimdKind::UnpackLo16, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_unpackhi16", SimdKind::UnpackHi16, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_packs32", SimdKind::Packs32, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_packus32", SimdKind::Packus32, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_packs16", SimdKind::Packs16, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_mini16", SimdKind::MinI16, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_maxi16", SimdKind::MaxI16, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_mini32", SimdKind::MinI32, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_maxi32", SimdKind::MaxI32, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_cmpeq8", SimdKind::CmpEq8, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_cmpeq16", SimdKind::CmpEq16, &[P::V, P::V], None, Some(P::V)),
+    s("__v128_mulhi16", SimdKind::MulHi16, &[P::V, P::V], None, Some(P::V)),
     s("__v128_shuffle8", SimdKind::ShuffleB, &[P::V, P::V], None, Some(P::V)),
     s("__v128_shuffle32", SimdKind::Shuffle32, &[P::V], Some(255), Some(P::V)),
     s("__v128_alignr", SimdKind::AlignR, &[P::V, P::V], Some(31), Some(P::V)),
@@ -1257,6 +1299,29 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
         SimdKind::MulLo32 => bin(e, fr, "pmulld", need(dst)?, args[0], args[1]),
         SimdKind::AddSatU8 => bin(e, fr, "paddusb", need(dst)?, args[0], args[1]),
         SimdKind::SubSatU8 => bin(e, fr, "psubusb", need(dst)?, args[0], args[1]),
+        SimdKind::SqrtF32 => un_src(e, fr, "sqrtps", need(dst)?, args[0], None),
+        SimdKind::RcpF32 => un_src(e, fr, "rcpps", need(dst)?, args[0], None),
+        SimdKind::RsqrtF32 => un_src(e, fr, "rsqrtps", need(dst)?, args[0], None),
+        SimdKind::ShufF32 => bin_imm(e, fr, "shufps", need(dst)?, args[0], args[1], imm),
+        SimdKind::MoveMaskF32 | SimdKind::MoveMask8 => {
+            let d = need(dst)?;
+            let ra = xget(e, fr, args[0]);
+            let m = if kind == SimdKind::MoveMask8 { "pmovmskb" } else { "movmskps" };
+            e.line(&format!("{} eax, {}", m, ra));
+            store_dst(e, fr, d, "rax");
+        }
+        SimdKind::UnpackLo16 => bin(e, fr, "punpcklwd", need(dst)?, args[0], args[1]),
+        SimdKind::UnpackHi16 => bin(e, fr, "punpckhwd", need(dst)?, args[0], args[1]),
+        SimdKind::Packs32 => bin(e, fr, "packssdw", need(dst)?, args[0], args[1]),
+        SimdKind::Packus32 => bin(e, fr, "packusdw", need(dst)?, args[0], args[1]),
+        SimdKind::Packs16 => bin(e, fr, "packsswb", need(dst)?, args[0], args[1]),
+        SimdKind::MinI16 => bin(e, fr, "pminsw", need(dst)?, args[0], args[1]),
+        SimdKind::MaxI16 => bin(e, fr, "pmaxsw", need(dst)?, args[0], args[1]),
+        SimdKind::MinI32 => bin(e, fr, "pminsd", need(dst)?, args[0], args[1]),
+        SimdKind::MaxI32 => bin(e, fr, "pmaxsd", need(dst)?, args[0], args[1]),
+        SimdKind::CmpEq8 => bin(e, fr, "pcmpeqb", need(dst)?, args[0], args[1]),
+        SimdKind::CmpEq16 => bin(e, fr, "pcmpeqw", need(dst)?, args[0], args[1]),
+        SimdKind::MulHi16 => bin(e, fr, "pmulhw", need(dst)?, args[0], args[1]),
         SimdKind::UnpackLo32 => bin(e, fr, "punpckldq", need(dst)?, args[0], args[1]),
         SimdKind::UnpackHi32 => bin(e, fr, "punpckhdq", need(dst)?, args[0], args[1]),
         SimdKind::UnpackLo64 => bin(e, fr, "punpcklqdq", need(dst)?, args[0], args[1]),
