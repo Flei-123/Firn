@@ -33,6 +33,7 @@ import random
 import stat
 import subprocess
 import sys
+import glob
 import tarfile
 import zipfile
 
@@ -336,6 +337,53 @@ def hostile():
           "a symlink already in the target is not written through (%s)" % so.strip()[:40])
 
 
+def streaming():
+    print("-- tar: streaming extraction (tar_stream_feed) against GNU tar and Python tarfile")
+    src = os.path.join(W, "src")
+    # plain tars from GNU tar (three formats) and Python tarfile (pax with long names)
+    archives = []
+    for name, fmt in (("gnu", "gnu"), ("pax", "pax")):
+        out = os.path.join(W, "st-%s.tar" % name)
+        if sh("tar --format=%s -cf %s -C %s ." % (fmt, out, src)).returncode == 0:
+            archives.append((name, out))
+    out = os.path.join(W, "st-py.tar")
+    with tarfile.open(out, "w", format=tarfile.PAX_FORMAT) as t:
+        for d, dirs, files in os.walk(src):
+            for n in sorted(dirs + files):
+                full = os.path.join(d, n)
+                t.add(full, arcname="top/" + os.path.relpath(full, src), recursive=False)
+    archives.append(("py", out))
+    for name, arc in archives:
+        ref = os.path.join(W, "stref-" + name)
+        os.makedirs(ref)
+        sh("tar -xf %s -C %s" % (arc, ref))
+        for chunk in (1, 511, 4097, 65536):
+            dest = os.path.join(W, "stx-%s-%d" % (name, chunk))
+            rc, so, se = probe("stream", arc, dest, 0, "-", chunk)
+            check(rc == 0 and so.startswith("OK"), "stream %s chunk %d: extracted (%s)" % (name, chunk, so.strip()[:60]))
+            same_tree(ref, dest, "stream %s chunk %d: tree equals what GNU tar extracts" % (name, chunk))
+    # the same archives through the in-memory extractor: identical statistics
+    for name, arc in archives:
+        rc1, so1, _ = probe("stream", arc, os.path.join(W, "stq1-" + name), 0, "-", 333)
+        rc2, so2, _ = probe("extract", arc, os.path.join(W, "stq2-" + name))
+        check(rc1 == 0 and so1 == so2, "stream %s: same stats as extract (%s / %s)" % (name, so1.strip(), so2.strip()))
+    # refused archives: the same verdicts as the whole-archive extractor
+    for path in sorted(glob.glob(os.path.join(W, "h-*.tar")) + glob.glob(os.path.join(W, "d-*.tar"))):
+        nm = os.path.basename(path)
+        rc1, so1, _ = probe("extract", path, os.path.join(W, "sv1-" + nm), 0, "overwrite")
+        rc2, so2, _ = probe("stream", path, os.path.join(W, "sv2-" + nm), 0, "overwrite", 700)
+        # judged entry by entry, the stream may name a different reason for the same refusal:
+        # a size lie (TooLarge instead of Truncated) and a link over a directory (IsDir instead of UnsafeLink)
+        v1, v2 = so1.split(" ")[-1].strip(), so2.split(" ")[-1].strip()
+        same = (v1 == v2) or (v1, v2) in (("Truncated", "TooLarge"), ("UnsafeLink", "IsDir"))
+        check(rc1 == rc2 and (rc1 == 0 or same),
+              "stream %s: verdict equals extract (%s / %s)" % (nm, so1.strip()[:30], so2.strip()[:30]))
+    # strip + a symlink in the way, as for the in-memory extractor
+    dest = os.path.join(W, "sts")
+    rc, so, se = probe("stream", os.path.join(W, "st-py.tar"), dest, 1, "-", 1000)
+    check(rc == 0 and os.path.isfile(os.path.join(dest, "bin/java")), "stream: strip 1 works (%s)" % so.strip()[:40])
+
+
 # ----------------------------------------------------------------- zip
 
 def zips():
@@ -595,6 +643,7 @@ def main():
     os.makedirs(W, exist_ok=True)
     tar_both_ways()
     hostile()
+    streaming()
     zips()
     hashes()
     vaults()
