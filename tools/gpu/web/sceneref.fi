@@ -1,0 +1,213 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/gpu/web/sceneref.fi -- the scene-layer scenes of the WebGL2 gate (gate 133), CPU side. Shared by the browser build
+// (web_scene_main.fi: mc_raster + sky + HUD reference AND gpu.glweb_scene in one wasm module) and the native reference
+// (native_scene_main.fi). Same scenes, atlas, boxes and pass order as tools/gpu/mc/scene.fi (the GL 3.3 scene gate), 320x180.
+import std.rt
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import mc.mc_sky
+import mc.mc_hud
+import std.math
+import webscene
+
+export {
+    NS, RefEnt, Ents, Scn, ents_new, scene_atlas, build_quad, frame_cpu, spec, cam_setup, set_fog_cpu, CLEAR_COLOR,
+    F_SKY, F_WORLD, F_FOG, F_TINT, F_HUD, F_ENT, F_WALL,
+}
+
+const NS: usize = 7
+const CLEAR_COLOR: u32 = 0xFF302010 as u32
+const F_SKY: u32 = 1 as u32
+const F_WORLD: u32 = 2 as u32
+const F_FOG: u32 = 4 as u32
+const F_TINT: u32 = 8 as u32
+const F_HUD: u32 = 16 as u32
+const F_ENT: u32 = 32 as u32 // boxes a b c
+const F_WALL: u32 = 64 as u32 // wall (occluder) + hidden box + box behind the camera
+
+struct RefEnt {
+    x: f64, y: f64, z: f64, sx: f64, sy: f64, sz: f64, yaw_sin: f64, yaw_cos: f64, tile: u32, r: u32, g: u32, b: u32,
+}
+
+struct Ents {
+    a: RefEnt, b: RefEnt, c: RefEnt, wall: RefEnt, hid: RefEnt, back: RefEnt,
+}
+
+// One scene: its name, pass flags, whether the light tint is on, the GPU culling mode (cull scenes only).
+struct Scn {
+    name: str,
+    flags: u32,
+    tint: bool,
+    cull: i32, // 1 = culling on, 0 = off
+}
+
+fn mk(x: f64, y: f64, z: f64, sx: f64, sy: f64, sz: f64, yaw: f64, tile: u32, r: u32, g: u32, b: u32) -> RefEnt {
+    return RefEnt { x: x, y: y, z: z, sx: sx, sy: sy, sz: sz, yaw_sin: math.sin(yaw), yaw_cos: math.cos(yaw), tile: tile, r: r, g: g, b: b }
+}
+
+fn ents_new() -> Ents {
+    return Ents {
+        a: mk(8.0, 8.0, 6.0, 2.0, 2.0, 2.0, 0.5, 2 as u32, 200 as u32, 80 as u32, 40 as u32),
+        b: mk(11.5, 9.0, 8.0, 1.5, 3.0, 1.0, 1.1, 3 as u32, 40 as u32, 160 as u32, 220 as u32),
+        c: mk(5.0, 7.0, 12.0, 2.0, 1.0, 3.0, 0.0, 4 as u32, 90 as u32, 200 as u32, 60 as u32),
+        wall: mk(8.0, 8.0, 3.0, 5.0, 5.0, 0.5, 0.0, 5 as u32, 230 as u32, 230 as u32, 50 as u32),
+        hid: mk(8.0, 8.0, 9.0, 1.0, 1.0, 1.0, 0.0, 2 as u32, 200 as u32, 80 as u32, 40 as u32),
+        back: mk(8.0, 8.0, 0.0 - 6.0, 1.0, 1.0, 1.0, 0.0, 3 as u32, 40 as u32, 160 as u32, 220 as u32),
+    }
+}
+
+// tiles: 1 orange (world), 2..5 solid entity colours
+fn scene_atlas() -> mc_texture.Atlas {
+    var a: mc_texture.Atlas = mc_texture.atlas_new(16, 4, 4)
+    var t: u32 = 1 as u32
+    while t <= 5 as u32 {
+        var c: u32 = mc_texture.pack_pixel(230 as u32, 120 as u32, 40 as u32, 255 as u32)
+        if t == 2 as u32 { c = mc_texture.pack_pixel(200 as u32, 80 as u32, 40 as u32, 255 as u32) }
+        if t == 3 as u32 { c = mc_texture.pack_pixel(40 as u32, 160 as u32, 220 as u32, 255 as u32) }
+        if t == 4 as u32 { c = mc_texture.pack_pixel(90 as u32, 200 as u32, 60 as u32, 255 as u32) }
+        if t == 5 as u32 { c = mc_texture.pack_pixel(230 as u32, 230 as u32, 50 as u32, 255 as u32) }
+        let ox: i32 = mc_texture.atlas_tile_x(&a, t)
+        let oy: i32 = mc_texture.atlas_tile_y(&a, t)
+        var y: i32 = 0
+        while y < 16 {
+            var x: i32 = 0
+            while x < 16 {
+                rt.st32(a.px, ((oy + y) * a.w + ox + x) as usize, c)
+                x = x + 1
+            }
+            y = y + 1
+        }
+        t = t + 1 as u32
+    }
+    return a
+}
+
+fn vw0(x: u32, y: u32, z: u32, face: u32, ao: u32) -> u32 {
+    return x | (y << 8 as u32) | (z << 16 as u32) | (face << 24 as u32) | (ao << 27 as u32)
+}
+
+fn vw1(tile: u32, u: u32, v: u32) -> u32 {
+    return tile | (u << 16 as u32) | (v << 24 as u32)
+}
+
+fn put_vtx(vp: u64, i: usize, w0: u32, w1: u32) {
+    rt.st32(vp, i * 2, w0)
+    rt.st32(vp, i * 2 + 1, w1)
+}
+
+// Two quads of the world (tile 1) with the AO gradient: 8 vertices, 12 indices. Caller frees with rt.heap_free (8*8, 12*4).
+fn build_quad(vp: *mut u64, ip: *mut u64) {
+    let qv: u64 = rt.heap_alloc(8 * 8)
+    let qi: u64 = rt.heap_alloc(12 * 4)
+    put_vtx(qv, 0, vw0(14 as u32, 1 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 2 as u32))
+    put_vtx(qv, 1, vw0(2 as u32, 1 as u32, 10 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 2 as u32, 2 as u32))
+    put_vtx(qv, 2, vw0(2 as u32, 13 as u32, 10 as u32, 3 as u32, 1 as u32), vw1(1 as u32, 2 as u32, 0 as u32))
+    put_vtx(qv, 3, vw0(14 as u32, 13 as u32, 10 as u32, 3 as u32, 2 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    put_vtx(qv, 4, vw0(14 as u32, 0 as u32, 14 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 0 as u32, 2 as u32))
+    put_vtx(qv, 5, vw0(2 as u32, 0 as u32, 14 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 2 as u32, 2 as u32))
+    put_vtx(qv, 6, vw0(2 as u32, 4 as u32, 14 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 2 as u32, 0 as u32))
+    put_vtx(qv, 7, vw0(14 as u32, 4 as u32, 14 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    var k: usize = 0
+    while k < 2 {
+        let o: usize = k * 6
+        let b: u32 = (k * 4) as u32
+        rt.st32(qi, o, b)
+        rt.st32(qi, o + 1, b + 1 as u32)
+        rt.st32(qi, o + 2, b + 2 as u32)
+        rt.st32(qi, o + 3, b)
+        rt.st32(qi, o + 4, b + 2 as u32)
+        rt.st32(qi, o + 5, b + 3 as u32)
+        k = k + 1
+    }
+    *vp = qv
+    *ip = qi
+}
+
+fn cam_setup(cam: *mut mc_camera.Camera) {
+    mc_camera.camera_set_pos(cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(cam, 0.0, 0.0)
+}
+
+fn spec(i: usize, out: *mut Scn) {
+    (*out).tint = false
+    (*out).cull = 1
+    if i == 0 { (*out).name = "sky"; (*out).flags = F_SKY }
+    else if i == 1 { (*out).name = "world_sky_fog_tint_hud"; (*out).flags = F_SKY | F_WORLD | F_FOG | F_TINT | F_HUD | F_ENT; (*out).tint = true }
+    else if i == 2 { (*out).name = "hud"; (*out).flags = F_HUD; (*out).tint = true }
+    else if i == 3 { (*out).name = "entities"; (*out).flags = F_ENT; (*out).tint = true }
+    else if i == 4 { (*out).name = "entities_fog"; (*out).flags = F_SKY | F_FOG | F_ENT; (*out).tint = true }
+    else if i == 5 { (*out).name = "entities_wall_cull_on"; (*out).flags = F_WORLD | F_ENT | F_WALL; (*out).tint = true }
+    else { (*out).name = "entities_wall_cull_off"; (*out).flags = F_WORLD | F_ENT | F_WALL; (*out).tint = true; (*out).cull = 0 }
+}
+
+fn set_fog_cpu(r: *mut mc_raster.Raster, sky: *mut mc_sky.Sky, on: bool) {
+    mc_raster.raster_set_fog(r, on, 8.0, 40.0, (*sky).fr as u32, (*sky).fg as u32, (*sky).fb as u32)
+}
+
+// CPU reference of one box: 6 faces x 2 triangles, same corner order and face_k as gl_scene (FK 204 204 128 256 153 153).
+fn cpu_ent(r: *mut mc_raster.Raster, cam: *mut mc_camera.Camera, e: *mut RefEnt) {
+    let fkt: [u32; 6] = [204 as u32, 204 as u32, 128 as u32, 256 as u32, 153 as u32, 153 as u32]
+    var vb: [f64; 24] = [0.0; 24]
+    var f: usize = 0
+    while f < 6 {
+        let axis: usize = f / 2
+        var sgn: f64 = 0.0 - 0.5
+        if f % 2 == 1 { sgn = 0.5 }
+        var k: usize = 0
+        while k < 4 {
+            var a: f64 = 0.0 - 0.5
+            if k % 2 == 1 { a = 0.5 }
+            var b: f64 = 0.0 - 0.5
+            if k / 2 == 1 { b = 0.5 }
+            var c: [f64; 3] = [0.0, 0.0, 0.0]
+            c[axis] = sgn
+            c[(axis + 1) % 3] = a
+            c[(axis + 2) % 3] = b
+            let qx: f64 = c[0] * (*e).sx
+            let qy: f64 = c[1] * (*e).sy
+            let qz: f64 = c[2] * (*e).sz
+            let wx: f64 = qx * (*e).yaw_cos + qz * (*e).yaw_sin + (*e).x - (*cam).x
+            let wy: f64 = qy + (*e).y - (*cam).y
+            let wz: f64 = 0.0 - qx * (*e).yaw_sin + qz * (*e).yaw_cos + (*e).z - (*cam).z
+            vb[k * 6] = wx * (*cam).rx + wy * (*cam).ry + wz * (*cam).rz
+            vb[k * 6 + 1] = wx * (*cam).ux + wy * (*cam).uy + wz * (*cam).uz
+            vb[k * 6 + 2] = wx * (*cam).fx + wy * (*cam).fy + wz * (*cam).fz
+            vb[k * 6 + 3] = 0.5
+            vb[k * 6 + 4] = 0.5
+            vb[k * 6 + 5] = 3.0
+            k = k + 1
+        }
+        let p: u64 = (&vb[0]) as u64
+        mc_raster.raster_draw_tri(r, p, p + 48 as u64, p + 144 as u64, (*e).tile, fkt[f])
+        mc_raster.raster_draw_tri(r, p, p + 144 as u64, p + 96 as u64, (*e).tile, fkt[f])
+        f = f + 1
+    }
+}
+
+// One frame through mc_raster + mc_sky + mc_hud (the CPU path); `bc` is the CPU Backend on `r`. Returns the RGBA pixels (row 0 = top).
+fn frame_cpu(r: *mut mc_raster.Raster, bc: *mut mc_backend.Backend, cam: *mut mc_camera.Camera, sky: *mut mc_sky.Sky,
+    flags: u32, en: *mut Ents) -> u64 {
+    mc_camera.camera_update(cam)
+    (*bc).begin((*bc).obj, (cam as u64), CLEAR_COLOR)
+    if (flags & F_SKY) != 0 as u32 { mc_sky.sky_draw_plain(sky, r) }
+    if (flags & F_WORLD) != 0 as u32 { (*bc).draw((*bc).obj, 1, 0.0, 0.0, 0.0) }
+    (*bc).end((*bc).obj)
+    if (flags & F_ENT) != 0 as u32 {
+        cpu_ent(r, cam, &(*en).a)
+        cpu_ent(r, cam, &(*en).b)
+        cpu_ent(r, cam, &(*en).c)
+    }
+    if (flags & F_WALL) != 0 as u32 {
+        cpu_ent(r, cam, &(*en).wall)
+        cpu_ent(r, cam, &(*en).hid)
+        cpu_ent(r, cam, &(*en).back)
+    }
+    if (flags & F_TINT) != 0 as u32 { mc_sky.sky_tint_frame(sky, r) }
+    if (flags & F_HUD) != 0 as u32 {
+        var dbg: mc_hud.HudDebug = mc_hud.hud_debug_new()
+        mc_hud.hud_frame(r, 2, mc_hud.HUD_CROSSHAIR | mc_hud.HUD_HOTBAR | mc_hud.HUD_DEBUG, 3, &dbg)
+    }
+    return (*bc).present((*bc).obj)
+}
