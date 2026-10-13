@@ -23,8 +23,14 @@ Per column: 1183 tris full, 75.5 (bin 4), 307 (bin 2); building the LOD column 0
 - The cull window is `dist + hyst`; `stream_drop_far` must be called with `extra >= lod_dist - dist` when LOD is on. LOD columns are frustum-tested per column (sections of its height range).
 - Test tests/2861_mc_stream_lod.fi: modes, hysteresis (A, B), flight with 3 submits/frame (C), triangles (D), free (E).
 
+## Flight holes (r101, 13.10., FIXED)
+Cause (found by rendering single columns): LOD cells are MAXIMA of their bin. In the near ring (mode 2: LOD is drawn while the sections mesh) the bin-4 surface bulges
+over the real terrain and the eye sits inside / below it, so the real ground in front of the camera stayed uncovered (351 px). Two fixes:
+- `lod_bin_near` (default 1) for columns up to dist + hyst + 1 (+1 hysteresis): exact height field + skirts, ~2.5x the triangles of bin 4 for ~25 columns; the scratch of lod_build is sized for it.
+- `lod_ahead` (default 2): LOD meshes are built that many columns beyond `lod_dist` (drawn only inside it), so the far edge does not wait for the build budget.
+tests/2861 C (70 frames, 3 submits/frame, loaded server): worst 351 -> 17 px, total 3098 -> ~100 of 5184 x 70 (no-LOD control ~90000); asserted worst < 100, total < 600.
+`stream_drop_far` keeps the whole LOD window (lod_dist + lod_ahead) by itself, whatever `extra` is passed.
+
 ## Open
-- FLIGHT HOLES (measured, NOT solved): in tests/2861 C (70 frames, 3 mesh submits / frame) the stream shows up to 351 of 5184 px clear colour where the converged stream
-  has terrain (total 3058 px over the flight; no-LOD control 83413). After a flush 75 px remain (far hill silhouette). Modes/handles of the columns look right
-  (all LOD columns have handles), cull is not the cause (use_cull=false identical). Next: dump the LOD columns per frame, check frustum test / bin heights vs the converged image.
-- no blending (pop at bin switches), no LOD for water/trees, LOD builds run on the render thread (0.2 ms/column).
+- no blending (pop at bin switches incl. bin 1 <-> 4), no LOD for water/trees, LOD builds run on the render thread (0.2 ms/column at bin 4, more at bin 1).
+- remaining flight holes (<= 17 px) come from the build budget (wall clock) at ring switches.

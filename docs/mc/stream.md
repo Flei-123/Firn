@@ -25,6 +25,12 @@ uploads within `upload_budget_us` -> draw. Neighbour wait (`nbr_wait` frames), u
 | async load with budgets: worst frame / worst upload / worst snapshot+submit | 13.9 ms (incl. raster draw) / 1.1 ms / 1.6 ms |
 Cave culling pays off only where caves/tunnels hide big volumes; on a hilly surface the frustum does most of the work.
 
+## Translucent pass (r96, 13.10.)
+`stream_set_translucent(s, true, T_WATER, T_ICE, T_GLASS)` before the first frame: the job meshes a second mesh (F_TRANS) per section (EW word 7, records R_T*),
+the render thread uploads it with the opaque one, `stream_frame` draws all opaque sections + LOD, then `set_pass(PASS_TRANS)` and the translucent meshes BACK TO FRONT, then PASS_OPAQUE.
+`tables.opaque` bit 0 = opaque (cull_conn / id_opaque look at bit 0 only). Columns shown as LOD have no water. Test tests/2886: image == wr_render (0 / 0 / 1 px), visible vs single pass.
+GL path not rendered (CPU back end only); quad sorting inside a section not done.
+
 ## Open
 - snapshot is serial (render thread, ~0.2 ms per section): a copy-on-write or per-column palette read on the worker would scale better.
 - light: see docs/mc/light.md ("Light in Stream / Render"): `stream_set_light`, region volume + Chunk.light, `stream_light_sync` after edits. Moving region and update_light wiring open.

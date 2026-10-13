@@ -32,14 +32,14 @@ import mc.mc_wlight
 
 export {
     Stream, StreamStats, stream_new, stream_free, stream_chunk_loaded, stream_chunk_unloaded, stream_drop_far,
-    stream_mark_block, stream_frame, stream_flush, stream_pending, stream_sections, stream_lod_mode, stream_lod_handle, STREAM_NREC,
+    stream_mark_block, stream_frame, stream_flush, stream_pending, stream_sections, stream_lod_mode, stream_lod_handle, stream_set_translucent, STREAM_NREC,
     stream_set_light, stream_set_daylight, stream_mark_section, stream_light_sync,
 }
 
 const STREAM_NREC: usize = 64
 const NSLOT: usize = 32
 const SLOT_WORDS: usize = 8 // busy, pad, mask, verts, idx, scratch, lpad
-const EW: usize = 7 // section entry: key, handle, state, seq, job, quads, flags
+const EW: usize = 8 // section entry: key, handle, state, seq, job, quads, flags, translucent handle (0 = none)
 const CW: usize = 12 // column entry: key, chunk, frame, state, then the LOD words (C_*)
 const C_MODE: usize = 4 // 0 full detail, 1 LOD (sections not meshed / not drawn), 2 LOD drawn while the sections mesh
 const C_LH: usize = 5 // back end handle of the LOD mesh (0 = none / nothing visible)
@@ -49,7 +49,7 @@ const C_RAW: usize = 8 // heap block: u16 heights [256] + u16 ids [256]
 const C_BIN: usize = 9 // bin the LOD mesh was built with, 0 = not built yet
 const C_HI: usize = 10 // top of the LOD mesh above min_y (blocks)
 const LOD_MAXQ: usize = 64 // build candidates per frame
-const REC_WORDS: usize = 16
+const REC_WORDS: usize = 18
 const ST_EMPTY: u64 = 0
 const ST_CLEAN: u64 = 1
 const ST_DIRTY: u64 = 2
@@ -68,11 +68,16 @@ const R_NS: usize = 10 // meshing time in ns
 const R_EMPTY: usize = 11 // 1 = decided on the render thread (no mesh)
 const R_LPAD: usize = 12 // heap block: u8 [5832] padded light of the snapshot
 const R_LIT: usize = 13 // 1 = the light pad holds real light data (mesh with F_LIGHT)
+const R_TVERTS: usize = 14 // translucent mesh (only with trans_tab): same layout as R_VERTS..R_NI
+const R_TNV: usize = 15
+const R_TIDX: usize = 16
+const R_TNI: usize = 17
 
 struct StreamStats {
     visible: u32, // sections in the draw list
     frustum: u32, // sections a frustum-only search would keep (measurement, only with measure = true)
     drawn: u32,
+    drawn_trans: u32, // sections drawn in the translucent pass
     tris: u64,
     submitted: u32,
     uploaded: u32,
@@ -130,11 +135,15 @@ struct Stream {
     rr: usize,
     cull: mc_cull.Cull,
     st: StreamStats,
+    trans_tab: u64, // u8 [32768] opaque table with bit 1 = translucent (0 = single pass, see stream_set_translucent)
+    src_opaque: u64,
     lod_dist: i32, // 0 = no LOD; else columns up to this radius are drawn as LOD beyond `dist` (set before loading columns)
     lod_hyst: i32, // ring hysteresis in columns: full -> LOD beyond dist + hyst, LOD -> full within dist
+    lod_bin_near: i32, // LOD cell size for the near ring (<= dist + hyst + 1 columns): 1 = exact height field, no bulge around the camera
     lod_bin: i32, // LOD cell size (2, 4, 8) up to lod_far_at columns
     lod_bin_far: i32, // cell size beyond lod_far_at + lod_hyst columns
     lod_far_at: i32,
+    lod_ahead: i32, // LOD meshes are built this many columns BEYOND lod_dist (not drawn yet): no pop-in at the far edge while flying
     lod_budget_us: u64,
     lodm: mc_mesh.Mesher,
     lsc: u64, // scratch: neighbour pointers, binned arrays
@@ -149,7 +158,7 @@ fn now_ns() -> u64 {
 }
 
 fn zero_stats() -> StreamStats {
-    return StreamStats { visible: 0 as u32, frustum: 0 as u32, drawn: 0 as u32, tris: 0 as u64, submitted: 0 as u32,
+    return StreamStats { visible: 0 as u32, frustum: 0 as u32, drawn: 0 as u32, drawn_trans: 0 as u32, tris: 0 as u64, submitted: 0 as u32,
         uploaded: 0 as u32, canceled: 0 as u32, inflight: 0 as u32, pending: 0 as u32, skipped_empty: 0 as u32,
         deferred_nbr: 0 as u32, lod_cols: 0 as u32, lod_tris: 0 as u64, lod_built: 0 as u32, lod_todo: 0 as u32,
         lod_us: 0 as u64, upload_bytes: 0 as u64, cull_us: 0 as u64, submit_us: 0 as u64, upload_us: 0 as u64,
@@ -165,7 +174,7 @@ fn stream_new(min_y: i32, nsec: i32, dist: i32, t: *mut mc_mesh.MeshTables, pool
         sync: false, setback: false, use_cull: true, measure: false, frame: 0 as u32, inflight: 0,
         tbl: 0, cap: 0, used: 0, live: 0, ctbl: 0, ccap: 0, cused: 0, clive: 0, pend: 0, npend: 0, pcap: 0,
         recs: 0, slots: 0, sp: 0, rr: 0, cull: mc_cull.cull_new(min_y, nsec), st: zero_stats(),
-        lod_dist: 0, lod_hyst: 1, lod_bin: 4, lod_bin_far: 8, lod_far_at: 24, lod_budget_us: 1500 as u64,
+        trans_tab: 0, src_opaque: 0, lod_dist: 0, lod_hyst: 1, lod_bin_near: 1, lod_bin: 4, lod_bin_far: 8, lod_far_at: 24, lod_ahead: 2, lod_budget_us: 1500 as u64,
         lodm: mc_mesh.mesher_new(), lsc: rt.heap_alloc(4096), lcand: rt.heap_alloc(LOD_MAXQ * 8), lncand: 0, light: false, wl: 0 }
     s.recs = rt.heap_alloc(STREAM_NREC * REC_WORDS * 8)
     var i: usize = 0
@@ -206,8 +215,7 @@ fn stream_free(s: *mut Stream, b: *mut mc_backend.Backend) {
     var i: usize = 0
     while i < (*s).cap {
         if rt.ld64((*s).tbl, i * EW + 2) == ST_CLEAN || rt.ld64((*s).tbl, i * EW + 2) == ST_DIRTY {
-            let h: usize = rt.ld64((*s).tbl, i * EW + 1) as usize
-            if h != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, h) }
+            free_sec_meshes(s, b, i)
         }
         i = i + 1
     }
@@ -243,6 +251,11 @@ fn stream_free(s: *mut Stream, b: *mut mc_backend.Backend) {
     rt.heap_free((*s).lsc, 4096)
     rt.heap_free((*s).lcand, LOD_MAXQ * 8)
     mc_cull.cull_free(&(*s).cull)
+    if (*s).trans_tab != 0 {
+        (*s).tables.opaque = (*s).src_opaque
+        rt.heap_free((*s).trans_tab, 32768)
+        (*s).trans_tab = 0
+    }
     (*s).tbl = 0
     (*s).ctbl = 0
     (*s).pend = 0
@@ -251,11 +264,29 @@ fn stream_free(s: *mut Stream, b: *mut mc_backend.Backend) {
     (*s).pcap = 0
 }
 
+// frees the back end meshes (opaque + translucent) of the section entry `slot` and clears both handles
+fn free_sec_meshes(s: *mut Stream, b: *mut mc_backend.Backend, slot: usize) {
+    let h: usize = rt.ld64((*s).tbl, slot * EW + 1) as usize
+    if h != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, h) }
+    let ht: usize = rt.ld64((*s).tbl, slot * EW + 7) as usize
+    if ht != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, ht) }
+    rt.st64((*s).tbl, slot * EW + 1, 0 as u64)
+    rt.st64((*s).tbl, slot * EW + 7, 0 as u64)
+}
+
 fn free_result(recs: u64, r: usize) {
     let v: u64 = rt.ld64(recs, r * REC_WORDS + R_VERTS)
     if v != 0 { rt.heap_free(v, (rt.ld64(recs, r * REC_WORDS + R_NV) as usize) * 8) }
     let ix: u64 = rt.ld64(recs, r * REC_WORDS + R_IDX)
     if ix != 0 { rt.heap_free(ix, (rt.ld64(recs, r * REC_WORDS + R_NI) as usize) * 4) }
+    let tv: u64 = rt.ld64(recs, r * REC_WORDS + R_TVERTS)
+    if tv != 0 { rt.heap_free(tv, (rt.ld64(recs, r * REC_WORDS + R_TNV) as usize) * 8) }
+    let tix: u64 = rt.ld64(recs, r * REC_WORDS + R_TIDX)
+    if tix != 0 { rt.heap_free(tix, (rt.ld64(recs, r * REC_WORDS + R_TNI) as usize) * 4) }
+    rt.st64(recs, r * REC_WORDS + R_TVERTS, 0 as u64)
+    rt.st64(recs, r * REC_WORDS + R_TIDX, 0 as u64)
+    rt.st64(recs, r * REC_WORDS + R_TNV, 0 as u64)
+    rt.st64(recs, r * REC_WORDS + R_TNI, 0 as u64)
     rt.st64(recs, r * REC_WORDS + R_VERTS, 0 as u64)
     rt.st64(recs, r * REC_WORDS + R_IDX, 0 as u64)
     rt.st64(recs, r * REC_WORDS + R_NV, 0 as u64)
@@ -347,6 +378,7 @@ fn sec_entry(s: *mut Stream, key: u64) -> usize {
     rt.st64((*s).tbl, slot * EW + 4, 0 as u64)
     rt.st64((*s).tbl, slot * EW + 5, 0 as u64)
     rt.st64((*s).tbl, slot * EW + 6, 0 as u64)
+    rt.st64((*s).tbl, slot * EW + 7, 0 as u64)
     (*s).used = (*s).used + 1
     (*s).live = (*s).live + 1
     pend_add(s, slot)
@@ -532,8 +564,7 @@ fn stream_chunk_unloaded(s: *mut Stream, b: *mut mc_backend.Backend, cx: i32, cz
         let e: i64 = sec_find(s, key)
         if e >= 0 {
             let slot: usize = e as usize
-            let h: usize = rt.ld64((*s).tbl, slot * EW + 1) as usize
-            if h != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, h) }
+            free_sec_meshes(s, b, slot)
             let job: u64 = rt.ld64((*s).tbl, slot * EW + 4)
             if job != 0 as u64 { cancel_rec(s, (job - 1 as u64) as usize) }
             rt.st64((*s).tbl, slot * EW + 2, ST_TOMB)
@@ -547,7 +578,10 @@ fn stream_chunk_unloaded(s: *mut Stream, b: *mut mc_backend.Backend, cx: i32, cz
 // Unloads (stream data, and the chunk from the world when `drop_world`) up to `max_cols` columns farther than
 // dist + extra columns from the camera column. Returns how many.
 fn stream_drop_far(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera,
-    extra: i32, max_cols: usize, drop_world: bool) -> usize {
+    extra_in: i32, max_cols: usize, drop_world: bool) -> usize {
+    // with LOD the window reaches lod_dist + lod_ahead: those columns are kept whatever `extra` says
+    var extra: i32 = extra_in
+    if (*s).lod_dist > 0 && (*s).lod_dist + (*s).lod_ahead - (*s).dist > extra { extra = (*s).lod_dist + (*s).lod_ahead - (*s).dist }
     let ccx: i32 = mc_world.block_to_chunk(floor_i((*cam).x))
     let ccz: i32 = mc_world.block_to_chunk(floor_i((*cam).z))
     var n: usize = 0
@@ -571,6 +605,35 @@ fn stream_drop_far(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Ba
         i = i + 1
     }
     return n
+}
+
+// Transparency pass on / off (like mc_render_world.wr_set_translucent): block states whose face tile is `water`, `ice` or `glass`
+// are meshed separately (F_TRANS) into a second mesh per section and drawn after everything opaque, back to front, via
+// Backend.set_pass. Call BEFORE the first stream_frame (sections that are already meshed keep their single mesh until remeshed).
+// `tables.opaque` bit 0 = opaque (the cave search and the shortcuts only look at bit 0).
+fn stream_set_translucent(s: *mut Stream, on: bool, water: u32, ice: u32, glass: u32) {
+    if (*s).trans_tab != 0 {
+        rt.heap_free((*s).trans_tab, 32768)
+        (*s).trans_tab = 0
+        (*s).tables.opaque = (*s).src_opaque
+    }
+    if !on { return }
+    (*s).src_opaque = (*s).tables.opaque
+    let tab: u64 = rt.heap_alloc(32768)
+    var id: usize = 0
+    while id < 32768 {
+        var v: u8 = rt.ld8((*s).src_opaque, id)
+        var f: usize = 0
+        while f < 6 {
+            let tl: u32 = rt.ld16((*s).tables.tiles, id * 6 + f) as u32
+            if tl != 0 as u32 && (tl == water || tl == ice || tl == glass) { v = (v & 1 as u8) | 2 as u8 }
+            f = f + 1
+        }
+        rt.st8(tab, id, v)
+        id = id + 1
+    }
+    (*s).trans_tab = tab
+    (*s).tables.opaque = tab
 }
 
 // Light on / off. `wl` = a mc_wlight.WorldLight (same min_y / nsec as the stream; its region volume and the Chunk.light of the
@@ -700,11 +763,34 @@ fn mesh_one(s: *mut Stream, r: usize) {
         rt.mem_copy(verts, m.verts, (m.nverts as usize) * 8)
         rt.mem_copy(idx, m.idx, (m.nidx as usize) * 4)
     }
+    let nq: u32 = m.nquads
+    let nv0: u32 = m.nverts
+    let ni0: u32 = m.nidx
+    // translucent pass (water, glass, ice): a second mesh of the same snapshot, drawn after all opaque sections
+    var tverts: u64 = 0
+    var tidx: u64 = 0
+    var tnv: u32 = 0 as u32
+    var tni: u32 = 0 as u32
+    if (*s).trans_tab != 0 {
+        mc_mesh.mesh_padded(&m, pad, &(*s).tables, (*s).flags | mc_mesh.F_TRANS)
+        if m.nverts > 0 as u32 {
+            tverts = rt.heap_alloc((m.nverts as usize) * 8)
+            tidx = rt.heap_alloc((m.nidx as usize) * 4)
+            rt.mem_copy(tverts, m.verts, (m.nverts as usize) * 8)
+            rt.mem_copy(tidx, m.idx, (m.nidx as usize) * 4)
+            tnv = m.nverts
+            tni = m.nidx
+        }
+    }
     rt.st64(recs, r * REC_WORDS + R_VERTS, verts)
-    rt.st64(recs, r * REC_WORDS + R_NV, m.nverts as u64)
+    rt.st64(recs, r * REC_WORDS + R_NV, nv0 as u64)
     rt.st64(recs, r * REC_WORDS + R_IDX, idx)
-    rt.st64(recs, r * REC_WORDS + R_NI, m.nidx as u64)
-    rt.st64(recs, r * REC_WORDS + R_NQ, m.nquads as u64)
+    rt.st64(recs, r * REC_WORDS + R_NI, ni0 as u64)
+    rt.st64(recs, r * REC_WORDS + R_TVERTS, tverts)
+    rt.st64(recs, r * REC_WORDS + R_TNV, tnv as u64)
+    rt.st64(recs, r * REC_WORDS + R_TIDX, tidx)
+    rt.st64(recs, r * REC_WORDS + R_TNI, tni as u64)
+    rt.st64(recs, r * REC_WORDS + R_NQ, nq as u64)
     rt.st64(recs, r * REC_WORDS + R_CONN, conn as u64)
     rt.st64(recs, r * REC_WORDS + R_NS, now_ns() - t0)
     release_slot((*s).slots, si)
@@ -763,7 +849,7 @@ fn is_invisible(s: *mut Stream, id: u16) -> bool {
 
 fn id_opaque(s: *mut Stream, id: u16) -> bool {
     if id >= 32768 as u16 { return false }
-    return rt.ld8((*s).tables.opaque, id as usize) != 0 as u8
+    return (rt.ld8((*s).tables.opaque, id as usize) & 1 as u8) != 0 as u8
 }
 
 // Builds the padded 18^3 array of the section from the 27 sections around it (columns from the stream's own index).
@@ -906,9 +992,7 @@ fn try_submit(s: *mut Stream, b: *mut mc_backend.Backend, e: usize) -> bool {
     let kind: i32 = snapshot(s, cx, sy, cz, pad)
     if kind != 1 {
         // settled on the render thread: no faces at all
-        let h: usize = rt.ld64((*s).tbl, e * EW + 1) as usize
-        if h != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, h) }
-        rt.st64((*s).tbl, e * EW + 1, 0 as u64)
+        free_sec_meshes(s, b, e)
         rt.st64((*s).tbl, e * EW + 5, 0 as u64)
         rt.st64((*s).tbl, e * EW + 2, ST_CLEAN)
         var conn: u32 = mc_cull.CONN_ALL
@@ -972,7 +1056,10 @@ fn consume(s: *mut Stream, b: *mut mc_backend.Backend, deadline_ns: u64) {
             let slot: usize = e as usize
             let old: usize = rt.ld64((*s).tbl, slot * EW + 1) as usize
             if old != 0 { (*b).mesh_free((*b).obj, old) }
+            let oldt: usize = rt.ld64((*s).tbl, slot * EW + 7) as usize
+            if oldt != 0 { (*b).mesh_free((*b).obj, oldt) }
             var h: usize = 0
+            var ht: usize = 0
             let nv: usize = rt.ld64((*s).recs, r * REC_WORDS + R_NV) as usize
             let ni: usize = rt.ld64((*s).recs, r * REC_WORDS + R_NI) as usize
             var lodcol: bool = false // the column went back to LOD while the job ran: drop the mesh
@@ -982,7 +1069,15 @@ fn consume(s: *mut Stream, b: *mut mc_backend.Backend, deadline_ns: u64) {
                     rt.ld64((*s).recs, r * REC_WORDS + R_IDX), ni)
                 (*s).st.upload_bytes = (*s).st.upload_bytes + (nv * 8 + ni * 4) as u64
             }
+            let tnv: usize = rt.ld64((*s).recs, r * REC_WORDS + R_TNV) as usize
+            let tni: usize = rt.ld64((*s).recs, r * REC_WORDS + R_TNI) as usize
+            if tnv > 0 && !lodcol {
+                ht = (*b).mesh_upload((*b).obj, key, rt.ld64((*s).recs, r * REC_WORDS + R_TVERTS), tnv,
+                    rt.ld64((*s).recs, r * REC_WORDS + R_TIDX), tni)
+                (*s).st.upload_bytes = (*s).st.upload_bytes + (tnv * 8 + tni * 4) as u64
+            }
             rt.st64((*s).tbl, slot * EW + 1, h as u64)
+            rt.st64((*s).tbl, slot * EW + 7, ht as u64)
             rt.st64((*s).tbl, slot * EW + 5, rt.ld64((*s).recs, r * REC_WORDS + R_NQ))
             rt.st64((*s).tbl, slot * EW + 4, 0 as u64)
             if rt.ld64((*s).tbl, slot * EW + 3) == rt.ld64((*s).recs, r * REC_WORDS + R_SEQ) {
@@ -1134,6 +1229,25 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
         }
     }
     tris = tris + lod_draw(s, b, cam)
+    if (*s).trans_tab != 0 {
+        // translucent pass: every opaque mesh and LOD column is in the frame; sections BACK TO FRONT (the draw list reversed)
+        (*b).set_pass((*b).obj, mc_backend.PASS_TRANS)
+        var kt: usize = nvis
+        while kt > 0 {
+            kt = kt - 1
+            let tkey: u64 = mc_cull.cull_out_key(&(*s).cull, kt)
+            let te: i64 = sec_find(s, tkey)
+            if te >= 0 && !((*s).lod_dist > 0 && col_mode(s, key_cx(tkey), key_cz(tkey)) != 0 as u64) {
+                let th: usize = rt.ld64((*s).tbl, (te as usize) * EW + 7) as usize
+                if th != 0 {
+                    tris = tris + (*b).draw((*b).obj, th, (key_cx(tkey) * 16) as f64, ((*s).min_y + key_sy(tkey) * 16) as f64,
+                        (key_cz(tkey) * 16) as f64)
+                    (*s).st.drawn_trans = (*s).st.drawn_trans + 1 as u32
+                }
+            }
+        }
+        (*b).set_pass((*b).obj, mc_backend.PASS_OPAQUE)
+    }
     (*s).st.drawn = drawn
     (*s).st.tris = tris
     (*s).st.draw_us = (now_ns() - t4) / 1000 as u64
@@ -1257,9 +1371,7 @@ fn lod_free_sections(s: *mut Stream, b: *mut mc_backend.Backend, cx: i32, cz: i3
     while sy < (*s).nsec {
         let e: i64 = sec_find(s, mc_cull.cull_pack(cx, sy, cz))
         if e >= 0 {
-            let h: usize = rt.ld64((*s).tbl, (e as usize) * EW + 1) as usize
-            if h != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, h) }
-            rt.st64((*s).tbl, (e as usize) * EW + 1, 0 as u64)
+            free_sec_meshes(s, b, e as usize)
             rt.st64((*s).tbl, (e as usize) * EW + 5, 0 as u64)
         }
         sy = sy + 1
@@ -1283,6 +1395,11 @@ fn lod_col_ready(s: *mut Stream, cx: i32, cz: i32) -> bool {
 
 fn lod_want_bin(s: *mut Stream, ci: usize, d: i32) -> i32 {
     let built: i32 = rt.ld64((*s).ctbl, ci * CW + C_BIN) as i32
+    // near ring: exact height field (bin 1); the cells of coarser bins are MAXIMA, so around the camera they bulge over the
+    // real terrain (the eye sits inside a cell, tests/2861 holes)
+    var near_lim: i32 = (*s).dist + (*s).lod_hyst + 1
+    if built == (*s).lod_bin_near { near_lim = near_lim + 1 }
+    if d <= near_lim { return (*s).lod_bin_near }
     if built == (*s).lod_bin_far {
         if d > (*s).lod_far_at { return (*s).lod_bin_far }
         return (*s).lod_bin
@@ -1325,7 +1442,7 @@ fn lod_modes(s: *mut Stream, b: *mut mc_backend.Backend, cam: *mut mc_camera.Cam
                 rt.st64((*s).ctbl, i * CW + C_MODE, 1 as u64)
                 lod_free_sections(s, b, kx, kz)
             }
-            if d > (*s).dist && d <= (*s).lod_dist && rt.ld64((*s).ctbl, i * CW + 1) != 0 as u64 {
+            if d > (*s).dist && d <= (*s).lod_dist + (*s).lod_ahead && rt.ld64((*s).ctbl, i * CW + 1) != 0 as u64 {
                 let flags: u64 = rt.ld64((*s).ctbl, i * CW + C_FLAGS)
                 if !built || (flags & 1 as u64) != 0 as u64 || lod_want_bin(s, i, d) != (rt.ld64((*s).ctbl, i * CW + C_BIN) as i32) {
                     todo = todo + 1 as u32
@@ -1381,9 +1498,9 @@ fn lod_build(s: *mut Stream, b: *mut mc_backend.Backend, ci: usize, bin: i32) {
         return
     }
     let sc: u64 = (*s).lsc
-    let own_h: u64 = sc + 64 as u64
-    let own_id: u64 = sc + 192 as u64
-    let tmp_id: u64 = sc + 832 as u64
+    let own_h: u64 = sc + 64 as u64 // 512 B each (bin 1 = 256 cells)
+    let own_id: u64 = sc + 576 as u64
+    let tmp_id: u64 = sc + 1088 as u64
     mc_lod.lod_bin(raw, raw + 512 as u64, bin, own_h, own_id)
     var f: usize = 0
     while f < 4 {
@@ -1398,7 +1515,7 @@ fn lod_build(s: *mut Stream, b: *mut mc_backend.Backend, ci: usize, bin: i32) {
         if nf >= 0 {
             let nraw: u64 = lod_raw(s, nf as usize)
             if nraw != 0 {
-                let nh: u64 = sc + 320 as u64 + (f as u64) * 128 as u64
+                let nh: u64 = sc + 1600 as u64 + (f as u64) * 512 as u64
                 mc_lod.lod_bin(nraw, nraw + 512 as u64, bin, nh, tmp_id)
                 rt.st64(sc, f, nh)
             }
