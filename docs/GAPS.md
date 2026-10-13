@@ -57,7 +57,7 @@ Effect is estimated as T (speed), C (amount of code / workaround), F
 | B16 | closed on branch `w-ffi`, see `docs/FFI.md`: `LoadLibraryA/W` + `FreeLibrary` + the generic Win64 call gate (`win64_call`) behind `std.dynlib` -- a new Win32 call needs no compiler patch (merges into firnc-gc with r68) | |
 | B17 | **`lib/fui` patches that no longer apply** (0001-fui-painter-fontreq, 0002, 0004; uipaint<->painter rename) -- Certus freezes copies (`.fui-c073`) | confirmed (bauen-win.sh:17-24) | certus build scripts | 0 | 2 | 3 |
 | B18 | closed, see A10 | | | | | |
-| B19 | **No SIMD multiply** (vector blending) | not re-checked | certus `docs/RUNDE-RASTERN.md:43` | 2 | 0 | 0 |
+| B19 | **No SIMD multiply** (vector blending) | closed 11.10. (7 intrinsics, MC-FLOATS.md) + 13.10. min/max/div/sat/mullo32 (GRAPHICS-STACK-E-REQUIREMENTS.md); AVX2 + SIMD wrapper open | certus `docs/RUNDE-RASTERN.md:43` | 2 | 0 | 0 |
 | B20 | **No conditional compilation** | confirmed (by design: module choice per target) | certus `window/window.fi:20`, `tools/window/bau.sh:7` | 0 | 1 | 0 |
 | B21 | closed, see A14 | | | | | |
 | B22 | **No destructors** (by design, SPEC) | by design | `rt/vec.fi:14`, `rt/map.fi:30`, `std/json.fi:1353` | 0 | 1 | 2 |

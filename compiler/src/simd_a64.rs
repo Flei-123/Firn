@@ -473,6 +473,14 @@ pub(crate) fn emit(e: &mut Emitter, fr: &Frame, i: &Inst) -> Result<(), String> 
             e.line(&format!("sqxtun2 {}.16b, {}.8h", VR, VB));
             vstore(e, fr, d, VR);
         }
+        SimdKind::MinF32 => bin(e, fr, "fmin", "4s", need(dst)?, args[0], args[1]),
+        SimdKind::MaxF32 => bin(e, fr, "fmax", "4s", need(dst)?, args[0], args[1]),
+        SimdKind::DivF32 => bin(e, fr, "fdiv", "4s", need(dst)?, args[0], args[1]),
+        SimdKind::MinU8 => bin(e, fr, "umin", "16b", need(dst)?, args[0], args[1]),
+        SimdKind::MaxU8 => bin(e, fr, "umax", "16b", need(dst)?, args[0], args[1]),
+        SimdKind::MulLo32 => bin(e, fr, "mul", "4s", need(dst)?, args[0], args[1]),
+        SimdKind::AddSatU8 => bin(e, fr, "uqadd", "16b", need(dst)?, args[0], args[1]),
+        SimdKind::SubSatU8 => bin(e, fr, "uqsub", "16b", need(dst)?, args[0], args[1]),
         SimdKind::UnpackLo32 => bin(e, fr, "zip1", "4s", need(dst)?, args[0], args[1]),
         SimdKind::UnpackHi32 => bin(e, fr, "zip2", "4s", need(dst)?, args[0], args[1]),
         SimdKind::UnpackLo64 => bin(e, fr, "zip1", "2d", need(dst)?, args[0], args[1]),

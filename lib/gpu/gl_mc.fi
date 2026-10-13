@@ -50,7 +50,7 @@ export {
     glbe_calls, glbe_upload_bytes, glbe_frame_upload_bytes, glbe_staged, glbe_pages, glbe_pool_used_bytes,
     glbe_pool_cap_bytes, glbe_pool_frag_permille, glbe_defrags, glbe_reset_stats, glbe_flush_uploads,
     // scene layer (lib/gpu/gl_scene.fi): extra passes around the Backend table, MSAA, resolve
-    glbe_x, glbe_rebind, glbe_flush, glbe_bind_draw, glbe_set_msaa, glbe_msaa, glbe_resolve, glbe_width, glbe_height, glbe_camera_rv,
+    glbe_x, glbe_near, glbe_rebind, glbe_flush, glbe_bind_draw, glbe_set_msaa, glbe_msaa, glbe_resolve, glbe_width, glbe_height, glbe_camera_rv,
 }
 
 const VS_SRC: str = __include_str("mc_vs.glsl")
@@ -116,6 +116,9 @@ struct GlBackend {
     l_gran: i32,
     l_org: i32,
     l_filter: i32,
+    l_trans: i32,
+    trans_pass: bool, // PASS_TRANS is active (blend on, depth write off)
+    near: f64, // camera near plane of the last begin (entity culling in gl_scene)
     w: i32,
     h: i32,
     atile: i32,
@@ -182,7 +185,7 @@ fn empty(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
     return GlBackend { ok: false, step: 0, ctx: c, g: gl33.gl_new(),
         fbo: gl33.Fbo { fbo: 0 as u32, color: 0 as u32, depth: 0 as u32, w: w, h: h },
         prog: 0 as u32, atlas_tex: 0 as u32, l_rv: 0 - 1, l_origin: 0 - 1, l_atlas: 0 - 1, l_tiles: 0 - 1, l_fog: 0 - 1,
-        l_fogc: 0 - 1, l_pool: 0 - 1, l_gran: 0 - 1, l_org: 0 - 1, l_filter: 0 - 1,
+        l_fogc: 0 - 1, l_pool: 0 - 1, l_gran: 0 - 1, l_org: 0 - 1, l_filter: 0 - 1, l_trans: 0 - 1, trans_pass: false, near: 0.05,
         w: w, h: h, atile: 16, acols: 16, cx: 0.0, cy: 0.0, cz: 0.0, rv: [0.0 as f32; 16],
         fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0.0, fog_g: 0.0, fog_b: 0.0, cull: true,
         slots: 0, slot_cap: 0, pix: 0, tmp: 0, fresh: false, draws: 0, tris: 0, calls: 0, log: [0; 512],
@@ -228,6 +231,7 @@ fn glbe_open_with(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
     gb.l_gran = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_gran")
     gb.l_org = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_org")
     gb.l_filter = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_filter")
+    gb.l_trans = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_trans")
     gb.fbo = gl33.gl_fbo_new(&gb.g, w, h)
     if gb.fbo.fbo == 0 as u32 {
         gb.step = 4
@@ -1109,6 +1113,8 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
     (*gb).cy = (*c).y
     (*gb).cz = (*c).z
     (*gb).frame_up = 0 as u64
+    (*gb).near = (*c).near
+    (*gb).trans_pass = false
     if (*gb).staged > 0 {
         glbe_flush_uploads(gb, (*gb).budget)
     }
@@ -1166,6 +1172,7 @@ fn bind_state(gb: *mut GlBackend) {
         fl = 1
     }
     gl33.gl_u1i(g, (*gb).l_filter, fl)
+    apply_pass(gb)
     gl33.gl_uniform_mat4(g, (*gb).l_rv, (&(*gb).rv[0]) as u64)
     gl33.gl_u2f(g, (*gb).l_tiles, (*gb).atile as f64, (*gb).acols as f64)
     gl33.gl_u4f(g, (*gb).l_fog, if (*gb).fog_on { 1.0 } else { 0.0 }, (*gb).fog_start, (*gb).fog_end, 0.0)
@@ -1176,6 +1183,40 @@ fn bind_state(gb: *mut GlBackend) {
     gl33.gl_bind_vao(g, 0 as u32)
     (*gb).cur_vao = 0 as u32
     (*gb).fresh = false
+}
+
+// Blend / depth write / u_trans of the active pass (PASS_OPAQUE: no blend, depth write; PASS_TRANS: src-alpha blend, depth test only,
+// colour alpha channel untouched so the frame stays opaque like the CPU reference).
+fn apply_pass(gb: *mut GlBackend) {
+    let g: *mut gl33.Gl = &(*gb).g
+    if (*gb).trans_pass {
+        gl33.gl_enable(g, gl33.GL_BLEND)
+        gl33.gl_blend_func(g, gl33.GL_SRC_ALPHA, gl33.GL_ONE_MINUS_SRC_ALPHA)
+        gl33.gl_depth_mask(g, false)
+        gl33.gl_color_mask(g, true, true, true, false)
+        gl33.gl_u1i(g, (*gb).l_trans, 1)
+    } else {
+        gl33.gl_disable(g, gl33.GL_BLEND)
+        gl33.gl_depth_mask(g, true)
+        gl33.gl_color_mask(g, true, true, true, true)
+        gl33.gl_u1i(g, (*gb).l_trans, 0)
+    }
+}
+
+// mc_backend set_pass: submits what MODE_MULTI / MODE_INDIRECT collected (it belongs to the old pass), then switches the state.
+fn be_set_pass(o: u64, pass: i32) {
+    let gb: *mut GlBackend = o as *mut GlBackend
+    let want: bool = pass == mc_backend.PASS_TRANS
+    if want == (*gb).trans_pass { return }
+    if (*gb).mode >= MODE_MULTI {
+        flush_batch(gb)
+    }
+    (*gb).trans_pass = want
+    apply_pass(gb)
+}
+
+fn glbe_near(gb: *mut GlBackend) -> f64 {
+    return (*gb).near
 }
 
 // The framebuffer the passes draw into: the multisample target while MSAA is on, else the plain FBO.
@@ -1302,6 +1343,13 @@ fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
     (*gb).tris = (*gb).tris + t
     if (*gb).mode >= MODE_MULTI {
         // collected, submitted by be_end in ONE call per page; the origin goes to the origin table
+        if (*gb).trans_pass && (*gb).pend_n > 0 {
+            // translucent draws must stay in submission order (back to front): a page change ends the batch
+            let last: usize = rt.ld64((*gb).pend, (*gb).pend_n - 1) as usize
+            if rt.ld64((*gb).slots, last * SLOT_WORDS + S_PAGE) != rt.ld64((*gb).slots, b + S_PAGE) {
+                flush_batch(gb)
+            }
+        }
         if rt.ld64((*gb).slots, b + S_STAMP) == (*gb).batch {
             flush_batch(gb) // the same section twice in one batch (two origins): submit what is collected first
         }
@@ -1434,5 +1482,6 @@ fn glbe_backend(gb: *mut GlBackend) -> mc_backend.Backend {
     b.end = be_end
     b.present = be_present
     b.read_pixels = be_read
+    b.set_pass = be_set_pass
     return b
 }

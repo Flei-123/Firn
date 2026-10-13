@@ -2017,6 +2017,17 @@ else
     grep -E 'FAIL' "$WORK/webgl2.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 133. WebGL2 scene layer (lib/gpu/glweb_scene.fi: sky, tint, entity instancing + cull, HUD) in headless Chromium against mc_raster + mc_sky + mc_hud, PSNR >= 34, cull on/off byte equal (tools/gpu/web/run_scene.sh, docs/WEBGL2.md) =="
+# Chromium WebGL2 on SwiftShader only. Missing chromium / numpy / PIL is SKIP. Real GPU, Firefox, Safari, mobile and timer queries are UNTESTED / not implemented.
+FIRNC="$FIRNC" bash tools/gpu/web/run_scene.sh > "$WORK/webgl2scene.log" 2>&1 && WSRC=0 || WSRC=$?
+if [ "$WSRC" -eq 0 ]; then
+    ok
+    grep -E '^   (ok|SKIP)|RESULT|canvas vs native' "$WORK/webgl2scene.log" | sed 's/^/ /'
+else
+    bad "tools/gpu/web/run_scene.sh failed (see .test-work/webgl2scene.log)"
+    grep -E 'FAIL' "$WORK/webgl2scene.log" | head -12 | sed 's/^/   /' || true
+fi
+
 echo "== 132. GL scene layer (lib/gpu/gl_scene.fi: sky, tint, entity instancing + cull, HUD, MSAA, window present) against the CPU path, PSNR >= 34, cull on/off byte equal (tools/gpu/mc/run.sh, docs/GPU.md) =="
 # Mesa llvmpipe / Xvfb only; a real GPU is UNTESTED. Missing libEGL / Xvfb is SKIP.
 FIRNC="$FIRNC" bash tools/gpu/mc/run.sh > "$WORK/glscene.log" 2>&1 && GSRC=0 || GSRC=$?
@@ -2026,6 +2037,16 @@ if [ "$GSRC" -eq 0 ]; then
 else
     bad "tools/gpu/mc/run.sh failed (see .test-work/glscene.log)"
     grep -E 'FAIL' "$WORK/glscene.log" | head -12 | sed 's/^/   /' || true
+fi
+
+echo "== 134. Graphics stack way E: Firn .so with C ABI (dlopen from C + ctypes), v128 min/max/div/sat/mul intrinsics (tools/stack_e/run.sh, docs/GRAPHICS-STACK-E-REQUIREMENTS.md) =="
+FIRNC="$FIRNC" bash tools/stack_e/run.sh > "$WORK/stack_e.log" 2>&1 && SERC=0 || SERC=$?
+if [ "$SERC" -eq 0 ]; then
+    ok
+    grep -E '^(ok|C host|Python host|known gap|metric|  metric)' "$WORK/stack_e.log" | sort -u | head -12 | sed 's/^/ /'
+else
+    bad "tools/stack_e/run.sh failed (see .test-work/stack_e.log)"
+    grep -E 'FAIL' "$WORK/stack_e.log" | head -12 | sed 's/^/   /' || true
 fi
 
 echo "== 125. GL 3.3 core window: X11 (EGL on the Firn window's XID + GLX fallback) + Windows twin under Wine (tools/gpu/win/run.sh, lib/gpu/glwindow.fi, docs/GPU.md) =="

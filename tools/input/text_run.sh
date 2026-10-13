@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tools/input/text_run.sh -- text input / IME (docs/INPUT.md):
 #   tests/2810 textcore (pure: UTF-8/16, compose tables, dead keys, Compose sequences, pre-edit edits, 30000 random ops vs a model)
+#   tests/2813 surrounding text (text_set_surrounding, text_delete_surrounding, editor_delete_surrounding)
 #   tests/2811 textsys callbacks (XIM pre-edit callbacks called THROUGH C ADDRESSES with hand-made call data)
 #   tools/input/xim_probe.fi under a private Xvfb with XMODIFIERS=@im=none (Xlib's built-in input method): synthetic XKeyEvents
 #   replayed into a second Xlib connection -> commits; dead keys + the Compose key through XFilterEvent
@@ -14,7 +15,7 @@ D=$(mktemp -d)
 XPID=""
 trap '[ -n "$XPID" ] && kill "$XPID" 2>/dev/null; rm -rf "$D"' EXIT
 fail=0
-for t in 2810_input_textcore 2811_input_textsys_cb; do
+for t in 2810_input_textcore 2811_input_textsys_cb 2813_input_surround; do
     if "$FIRNC" -o "$D/t" "tests/$t.fi" 2>"$D/err" && "$D/t"; then echo "   ok:   tests/$t"
     else echo "   FAIL: tests/$t (exit $?)"; head -5 "$D/err"; fail=1; fi
 done

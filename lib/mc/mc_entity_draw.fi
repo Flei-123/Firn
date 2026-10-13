@@ -1,0 +1,132 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_entity_draw.fi -- entity store (mc_entity) -> generic box models -> ONE record list for the back end.
+//
+// Every entity becomes a few flat coloured boxes of our own geometry (NO Mojang models / textures): living things and
+// players = 6 boxes (head, body, 2 arms, 2 legs), objects = 1 box. Entities beyond `far_lod` blocks are a single box.
+// Entities outside the camera frustum are skipped (one AABB test per entity, mc_math.frustum_test_box).
+// The records (mc_backend.ENT_WORDS f64: x y z sx sy sz sin cos r g b flags) go to b.draw_entities: CPU = mc_raster.raster_draw_box
+// (the reference), GL = ONE glDrawElementsInstanced for all boxes (gl_scene.scene_attach).
+//
+//     var l: mc_entity_draw.EntList = mc_entity_draw.entlist_new()
+//     mc_entity_draw.entlist_build(&l, &store, &cam, 64.0, 24.0)
+//     let drawn: u64 = mc_entity_draw.entlist_draw(&l, &backend)      // after the world draws
+//     mc_entity_draw.entlist_free(&l)
+
+import std.rt
+import std.math
+import mc.mc_entity
+import mc.mc_camera
+import mc.mc_math
+import mc.mc_backend
+
+export {
+    EntList, entlist_new, entlist_free, entlist_clear, entlist_add_model, entlist_build, entlist_draw, entlist_boxes,
+}
+
+struct EntList {
+    buf: rt.Buf, // ENT_BYTES per box
+    n_in: u32, // entities seen by the last entlist_build
+    n_culled: u32, // outside the frustum / too far
+    n_lod: u32, // drawn as one box
+}
+
+fn entlist_new() -> EntList {
+    return EntList { buf: rt.buf_new(), n_in: 0 as u32, n_culled: 0 as u32, n_lod: 0 as u32 }
+}
+
+fn entlist_free(l: *mut EntList) {
+    rt.buf_free(&(*l).buf)
+}
+
+fn entlist_clear(l: *mut EntList) {
+    rt.buf_clear(&(*l).buf)
+    (*l).n_in = 0 as u32
+    (*l).n_culled = 0 as u32
+    (*l).n_lod = 0 as u32
+}
+
+fn entlist_boxes(l: *mut EntList) -> usize {
+    return rt.buf_len(&(*l).buf) / mc_backend.ENT_BYTES
+}
+
+fn push_box(l: *mut EntList, x: f64, y: f64, z: f64, sx: f64, sy: f64, sz: f64, ys: f64, yc: f64, r: i32, g: i32, b: i32) {
+    var rec: [f64; 12] = [x, y, z, sx, sy, sz, ys, yc, r as f64, g as f64, b as f64, 0.0]
+    rt.buf_push_bytes(&(*l).buf, (&rec[0]) as u64, mc_backend.ENT_BYTES)
+}
+
+fn clamp255(v: i32) -> i32 {
+    if v < 0 { return 0 }
+    if v > 255 { return 255 }
+    return v
+}
+
+// A part at local offset (dx, dz) from the feet position, rotated by the entity yaw (sin / cos).
+fn part(l: *mut EntList, x: f64, y: f64, z: f64, ys: f64, yc: f64, dx: f64, dy: f64, dz: f64, sx: f64, sy: f64, sz: f64,
+    r: i32, g: i32, b: i32) {
+    push_box(l, x + (dx * yc + dz * ys), y + dy, z + (0.0 - dx * ys + dz * yc), sx, sy, sz, ys, yc,
+        clamp255(r), clamp255(g), clamp255(b))
+}
+
+// Adds the box model of one entity. (x, y, z) = feet, yaw in degrees, `seed` picks the tint (deterministic), humanoid = 6 boxes.
+fn entlist_add_model(l: *mut EntList, x: f64, y: f64, z: f64, yaw_deg: f64, seed: u64, humanoid: bool, lod: bool) {
+    let rad: f64 = yaw_deg * 0.017453292519943295
+    let ys: f64 = math.sin(rad)
+    let yc: f64 = math.cos(rad)
+    let h: u64 = (seed *% 11400714819323198485) >> 40
+    let r: i32 = 60 + ((h & 127 as u64) as i32)
+    let g: i32 = 60 + (((h >> 7 as u64) & 127 as u64) as i32)
+    let b: i32 = 60 + (((h >> 14 as u64) & 127 as u64) as i32)
+    if !humanoid {
+        part(l, x, y, z, ys, yc, 0.0, 0.25, 0.0, 0.5, 0.5, 0.5, r, g, b)
+        return
+    }
+    if lod {
+        part(l, x, y, z, ys, yc, 0.0, 0.9, 0.0, 0.6, 1.8, 0.6, r, g, b)
+        return
+    }
+    part(l, x, y, z, ys, yc, 0.0 - 0.125, 0.375, 0.0, 0.25, 0.75, 0.25, r - 30, g - 30, b - 30)
+    part(l, x, y, z, ys, yc, 0.125, 0.375, 0.0, 0.25, 0.75, 0.25, r - 30, g - 30, b - 30)
+    part(l, x, y, z, ys, yc, 0.0, 1.125, 0.0, 0.5, 0.75, 0.25, r, g, b)
+    part(l, x, y, z, ys, yc, 0.0 - 0.375, 1.125, 0.0, 0.25, 0.75, 0.25, r + 20, g + 20, b + 20)
+    part(l, x, y, z, ys, yc, 0.375, 1.125, 0.0, 0.25, 0.75, 0.25, r + 20, g + 20, b + 20)
+    part(l, x, y, z, ys, yc, 0.0, 1.75, 0.0, 0.5, 0.5, 0.5, r + 60, g + 60, b + 60)
+}
+
+// Replaces the list by the visible entities of `s`: frustum culling with the camera, `max_dist` blocks (0 = no limit),
+// single box beyond `far_lod` blocks.
+fn entlist_build(l: *mut EntList, s: *mut mc_entity.Store, cam: *mut mc_camera.Camera, max_dist: f64, far_lod: f64) {
+    entlist_clear(l)
+    let cap: usize = mc_entity.store_slot_cap(s)
+    var i: usize = 0
+    while i < cap {
+        let e: *mut mc_entity.Entity = mc_entity.store_at(s, i)
+        i = i + 1
+        if e as u64 == 0 { continue }
+        (*l).n_in = (*l).n_in + 1 as u32
+        let dx: f64 = (*e).x - (*cam).x
+        let dy: f64 = (*e).y - (*cam).y
+        let dz: f64 = (*e).z - (*cam).z
+        let d2: f64 = dx * dx + dy * dy + dz * dz
+        if max_dist > 0.0 && d2 > max_dist * max_dist {
+            (*l).n_culled = (*l).n_culled + 1 as u32
+            continue
+        }
+        if mc_math.frustum_test_box(&(*cam).frustum, (*e).x - 0.6, (*e).y, (*e).z - 0.6, (*e).x + 0.6, (*e).y + 2.0, (*e).z + 0.6) == 0 {
+            (*l).n_culled = (*l).n_culled + 1 as u32
+            continue
+        }
+        var lod: bool = false
+        if far_lod > 0.0 && d2 > far_lod * far_lod {
+            lod = true
+            (*l).n_lod = (*l).n_lod + 1 as u32
+        }
+        entlist_add_model(l, (*e).x, (*e).y, (*e).z, (*e).yaw, ((*e).id as u64) + 1 as u64, (*e).kind != mc_entity.KIND_OBJECT, lod)
+    }
+}
+
+// Hands the list to the back end (b.draw_entities); returns the boxes drawn (0 on a back end without entity support).
+fn entlist_draw(l: *mut EntList, b: *mut mc_backend.Backend) -> u64 {
+    let n: usize = entlist_boxes(l)
+    if n == 0 { return 0 as u64 }
+    return (*b).draw_entities((*b).ent_obj, rt.buf_ptr(&(*l).buf), n)
+}

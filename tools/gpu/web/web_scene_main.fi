@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/gpu/web/web_scene_main.fi -- gate 133: the WebGL2 SCENE LAYER (lib/gpu/glweb_scene.fi: sky, tint, entities, HUD) in the browser.
+// One wasm module holds the reference (mc_raster + mc_sky + mc_hud, sceneref.fi) and the WebGL2 path; per scene both frames are
+// compared (PSNR >= 34 dB, coverage) and one line printed; after each scene the WebGL2 frame is put on the canvas (host takes a PNG
+// that check_scene.py compares with the NATIVE frames of native_scene_main.fi). Cull on/off must give byte-equal frames.
+// Exit 0 = all held, 3 = a check failed, 4 = no WebGL2.
+import std.rt
+import std.io
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import mc.mc_sky
+import mc.mc_hud
+import gpu.glweb
+import gpu.glweb_scene
+import webscene
+import sceneref
+
+const MIN_PSNR_X100: u64 = 3400
+
+fn to_gpu(e: *mut sceneref.RefEnt) -> glweb_scene.Ent {
+    return glweb_scene.Ent { x: (*e).x, y: (*e).y, z: (*e).z, sx: (*e).sx, sy: (*e).sy, sz: (*e).sz, yaw_sin: (*e).yaw_sin,
+        yaw_cos: (*e).yaw_cos, r: (*e).r, g: (*e).g, b: (*e).b }
+}
+
+#[allow_escape]
+fn gpu_frame(gw: *mut glweb.GlWeb, sc: *mut glweb_scene.WScene, bg: *mut mc_backend.Backend, cam: *mut mc_camera.Camera,
+    sky: *mut mc_sky.Sky, flags: u32, en: *mut sceneref.Ents) -> u64 {
+    (*bg).begin((*bg).obj, (cam as u64), sceneref.CLEAR_COLOR)
+    if (flags & sceneref.F_SKY) != 0 as u32 { glweb_scene.wscene_sky(sc, cam, sky) }
+    if (flags & sceneref.F_WORLD) != 0 as u32 { (*bg).draw((*bg).obj, 1, 0.0, 0.0, 0.0) }
+    (*bg).end((*bg).obj)
+    if (flags & sceneref.F_ENT) != 0 as u32 {
+        var a: glweb_scene.Ent = to_gpu(&(*en).a)
+        var b: glweb_scene.Ent = to_gpu(&(*en).b)
+        var c: glweb_scene.Ent = to_gpu(&(*en).c)
+        glweb_scene.wscene_ent_add(sc, &a)
+        glweb_scene.wscene_ent_add(sc, &b)
+        glweb_scene.wscene_ent_add(sc, &c)
+    }
+    if (flags & sceneref.F_WALL) != 0 as u32 {
+        var w: glweb_scene.Ent = to_gpu(&(*en).wall)
+        var h: glweb_scene.Ent = to_gpu(&(*en).hid)
+        var k: glweb_scene.Ent = to_gpu(&(*en).back)
+        glweb_scene.wscene_ent_occluder(sc, &w)
+        glweb_scene.wscene_ent_add(sc, &h)
+        glweb_scene.wscene_ent_add(sc, &k)
+    }
+    glweb_scene.wscene_ent_flush(sc, cam)
+    if (flags & sceneref.F_TINT) != 0 as u32 { glweb_scene.wscene_tint(sc, sky) }
+    if (flags & sceneref.F_HUD) != 0 as u32 {
+        var scratch: mc_raster.Raster = mc_raster.raster_new(webscene.W, webscene.H)
+        var rec: rt.Buf = rt.buf_new()
+        mc_hud.hud_record(&rec)
+        var dbg: mc_hud.HudDebug = mc_hud.hud_debug_new()
+        mc_hud.hud_frame(&scratch, 2, mc_hud.HUD_CROSSHAIR | mc_hud.HUD_HOTBAR | mc_hud.HUD_DEBUG, 3, &dbg)
+        mc_hud.hud_record(0 as *mut rt.Buf)
+        glweb_scene.wscene_hud(sc, &rec)
+        rt.buf_free(&rec)
+        mc_raster.raster_free(&scratch)
+    }
+    return (*bg).present((*bg).obj)
+}
+
+fn copy_px(src: u64, n: usize) -> u64 {
+    let d: u64 = rt.heap_alloc(n * 4)
+    var i: usize = 0
+    while i < n {
+        rt.st32(d, i, rt.ld32(src, i))
+        i = i + 1
+    }
+    return d
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var gw: glweb.GlWeb = glweb.glweb_open(webscene.W, webscene.H)
+    if !gw.ok {
+        io.fmt_print(f"no WebGL2: step={gw.step}\n")
+        io.print_c((&gw.log[0]) as u64)
+        io.new_line()
+        return 4
+    }
+    var sc: glweb_scene.WScene = glweb_scene.wscene_open(&gw)
+    if !sc.ok {
+        io.fmt_print(f"wscene_open failed step={sc.step}\n")
+        io.print_c((&gw.log[0]) as u64)
+        io.new_line()
+        return 3
+    }
+    var r: mc_raster.Raster = mc_raster.raster_new(webscene.W, webscene.H)
+    mc_raster.raster_set_cull(&r, false)
+    var bc: mc_backend.Backend = mc_backend.backend_cpu(&r)
+    var bg: mc_backend.Backend = glweb.glweb_backend(&gw)
+    var cam: mc_camera.Camera = mc_camera.camera_new(webscene.W, webscene.H)
+    var sky: mc_sky.Sky = mc_sky.sky_new()
+    var ta: mc_texture.Atlas = sceneref.scene_atlas()
+    bc.upload_atlas(bc.obj, (&ta) as u64)
+    bg.upload_atlas(bg.obj, (&ta) as u64)
+    var qv: u64 = 0
+    var qi: u64 = 0
+    sceneref.build_quad(&qv, &qi)
+    let hc: usize = bc.mesh_upload(bc.obj, 1, qv, 8, qi, 12)
+    let hg: usize = bg.mesh_upload(bg.obj, 1, qv, 8, qi, 12)
+    if hc != 1 || hg != 1 {
+        io.fmt_print(f"unexpected mesh handles {hc} {hg}\n")
+        return 3
+    }
+    sceneref.cam_setup(&cam)
+    sky.discs = false
+    var en: sceneref.Ents = sceneref.ents_new()
+    let n: usize = (webscene.W as usize) * (webscene.H as usize)
+    var fails: i32 = 0
+    var prev_on: u64 = 0
+    var st_f: u32 = 0 as u32
+    var st_o: u32 = 0 as u32
+    var st_d_on: u32 = 0 as u32
+    var i: usize = 0
+    while i < sceneref.NS {
+        var sp: sceneref.Scn = sceneref.Scn { name: "", flags: 0 as u32, tint: false, cull: 1 }
+        sceneref.spec(i, &sp)
+        if sp.tint {
+            sky.tr = 200
+            sky.tg = 220
+            sky.tb = 256
+        } else {
+            sky.tr = 256
+            sky.tg = 256
+            sky.tb = 256
+        }
+        let fog: bool = (sp.flags & sceneref.F_FOG) != 0 as u32
+        sceneref.set_fog_cpu(&r, &sky, fog)
+        glweb.glweb_set_fog(&gw, fog, 8.0, 40.0, sky.fr as u32, sky.fg as u32, sky.fb as u32)
+        glweb_scene.wscene_set_cull(&sc, sp.cull != 0)
+        let pc: u64 = sceneref.frame_cpu(&r, &bc, &cam, &sky, sp.flags, &en)
+        let pg: u64 = gpu_frame(&gw, &sc, &bg, &cam, &sky, sp.flags, &en)
+        glweb.glweb_show(&gw)
+        var c: webscene.Cmp = webscene.Cmp { npx: 0 as u64, diff_px: 0 as u64, big_px: 0 as u64, max_diff: 0 as u32,
+            cov_cpu: 0 as u64, cov_gpu: 0 as u64, cov_mm: 0 as u64, psnr_x100: 0 as u64 }
+        webscene.compare(pc, pg, n, sceneref.CLEAR_COLOR, &c)
+        var ok: bool = c.psnr_x100 >= MIN_PSNR_X100 && c.cov_cpu > 0 as u64 && c.cov_gpu > 0 as u64 && glweb.glweb_error(&gw) == 0
+        io.print("scene ")
+        io.print(sp.name)
+        io.fmt_print(f" cov_cpu={c.cov_cpu} cov_gpu={c.cov_gpu} diff_px={c.diff_px} big_px={c.big_px} max_diff={c.max_diff} psnr=")
+        webscene.print_f2((c.psnr_x100 as f64) / 100.0)
+        if ok {
+            io.print(" ok\n")
+        } else {
+            io.print(" FAIL\n")
+            fails = fails + 1
+        }
+        if i == 5 {
+            prev_on = copy_px(pg, n)
+            st_f = sc.st_frustum
+            st_o = sc.st_occ
+            st_d_on = sc.st_drawn
+        }
+        if i == 6 {
+            var diff: u64 = 0 as u64
+            var k: usize = 0
+            while k < n {
+                if rt.ld32(prev_on, k) != rt.ld32(pg, k) { diff = diff + 1 as u64 }
+                k = k + 1
+            }
+            let cok: bool = diff == 0 as u64 && st_f > 0 as u32 && st_o > 0 as u32 && st_d_on < sc.st_drawn
+            io.fmt_print(f"scene cull drawn_on={st_d_on} drawn_off={sc.st_drawn} frustum={st_f} occluded={st_o} byte_diff_px={diff}")
+            if cok {
+                io.print(" ok\n")
+            } else {
+                io.print(" FAIL\n")
+                fails = fails + 1
+            }
+        }
+        i = i + 1
+    }
+    io.print("timers: ")
+    if glweb_scene.wscene_timers(&sc) { io.print("yes\n") } else { io.print("no (not implemented in WebGL2 twin)\n") }
+    glweb_scene.wscene_close(&sc)
+    glweb.glweb_close(&gw)
+    io.fmt_print(f"scenes done, failed={fails}\n")
+    if fails > 0 { return 3 }
+    return 0
+}
