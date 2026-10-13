@@ -32,8 +32,8 @@ for 8 bits; it needs a third word (12 B/vertex) or u/v narrowed (greedy quads re
 Section: 4084 vertices = 32672 B VBO + 24504 B IBO (test chunk). Not implemented, only analysed.
 
 ## Not done
-- 5 transparency pass (water/glass sorted back to front, alpha blend): NOT started (mesher has no opaque/water split).
-- 6 instanced entities: NOT started (wrappers `gl_draw_elements_instanced`, `gl_attrib_divisor` exist, untested).
+- 5 transparency pass: built, see mc-r3 below (GL vs CPU image comparison still open).
+- 6 instanced entities: scene-layer instancing existed (gl_scene); mc-r3 added the backend hook + box models (see below); draw-call measurement open.
 - persistent mapped buffers (`gl_buffer_storage`, `gl_map_range`, fences are wrapped, unused/untested).
 - real GPU, mip/aniso image test. The Windows twin under Wine (tools/gpu/run.sh) ran and gave the same scene statistics.
 
@@ -53,3 +53,23 @@ Section: 4084 vertices = 32672 B VBO + 24504 B IBO (test chunk). Not implemented
 * Pool upload cause FOUND: the cold "25 sections" time was dominated by creating the first 8 MB + 6 MB page (BufferData zero-fill), NOT by SubData/binds. Warm (free all + upload again, new metric `upload_25_warm_us`): legacy 237-292 us, pool 145-161 us, multi 148-192 us, indirect 128-162 us -> warm pool is ~1.8x FASTER than VAO-per-section.
 * Fix: default first page = 128K vertices (1 MB + 0.75 MB), further pages x4 up to 1M (`MAX_PAGE_VERTS`); explicit `glbe_set_page_verts` keeps fixed size. Cold 25 sections: pool 2458/2506 us -> 678/1041 us, multi 3762/2688 -> 1090/549, indirect 2869/2961 -> 1022/660 (legacy 417-487; llvmpipe, +-15 % noise).
 * Vertex light DESIGN (not built; the mesher has no light input yet): word1 = tile 14 bit (<=16383) | u 5 | v 5 | sky 4 | block 4 = 32 bit; word0 unchanged (bits 29..31 stay free). u,v reach 16 in a greedy quad -> 5 bit enough. Steps when built: mc_mesh pack/vtx_* accessors, mc_raster unpack (2 places), mc_vs.glsl + glweb_vs.glsl shifts, light sampler in the mesher (section + 1 border), tests 'mesh' + image gate. Image equality holds as long as light = 15/0 default.
+
+## mc-r3 (2026-10-13): transparency pass + entity boxes (llvmpipe/CPU only, NOT a GPU)
+* Mesher split: `mc_mesh.F_TRANS`. MeshTables.opaque is now a bit field: bit 0 = opaque, bit 1 = translucent (plain 0/1 tables behave as before).
+  Without F_TRANS translucent blocks are skipped; with F_TRANS only they are meshed (face hidden by an opaque neighbour or by a translucent
+  neighbour with the same tile -> a water body keeps only its surface). Leaves stay cut-out (alpha 128).
+* `mc_render_world`: `wr_set_translucent(wr, on, water, ice, glass)` builds a private table (tile ids -> bit 1) and meshes each section twice
+  (second handle in cache word 4, own mesh object; GL: same pool, own slot). Off = old behaviour, identical frames (tests 2753/2763 green).
+  Draw order: opaque front to back, then `b.set_pass(PASS_TRANS)`, translucent sections BACK TO FRONT (section centre distance, stable ties by slot),
+  `set_pass(PASS_OPAQUE)`. Order INSIDE a section is the index order (no quad sort) - CPU and GL use the same order, so they still agree.
+* CPU reference (`mc_raster`): `Raster.trans`: alpha >= 1 passes, blend `(src*a + dst*(255-a) + 127) / 255` per channel after shading + fog, depth test
+  strict, NO depth write. python reference `tools/mc/raster/ref.py` extended: scenes `water_glass`, `water_glass_fog` byte-identical (RESULT mc-raster ok).
+* GL (`gl_mc`): `be_set_pass` flushes the collected multi-draw batch, enables SRC_ALPHA/ONE_MINUS_SRC_ALPHA, depth mask off, colour alpha masked
+  (frame stays opaque like the CPU), `u_trans` in mc_fs.glsl (discard alpha 0 only, output alpha). In MULTI/INDIRECT mode a page change ends the batch
+  in the translucent pass (draw order across pages = submission order). Existing gate scenes unchanged (tools/gpu/run.sh ok). NOT yet rendered
+  against the CPU reference (no GL translucent scene written) - the new shader path is compiled and the opaque path proven unchanged only.
+* Entities: `Backend.draw_entities(ent_obj, records, n)` (record = ENT_WORDS f64: centre, size, yaw sin/cos, rgb, flags), CPU = `mc_raster.raster_draw_box`
+  (flat colour, mc_mesh face winding/shading with ao 3, fog, depth; python reference scenes `boxes` byte-identical). GL = `gl_scene.scene_attach(sc, &b)`
+  routes it through the existing instanced pass (ONE glDrawElementsInstanced, frustum + HiZ culling of scene_ent_flush) - compiled, NOT rendered/compared.
+  `mc_entity_draw`: Store -> boxes (humanoid 6 boxes, object 1, LOD 1 box beyond far_lod, frustum culling per entity); test 2775. No skin tile (no textures).
+* Not done: GL-vs-CPU PSNR scenes for water/glass/boxes, 1000-entity instanced-vs-individual draw call measurement, persistent mapped buffers / fences.
