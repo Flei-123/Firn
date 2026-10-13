@@ -21,10 +21,12 @@ import mc.mc_mesh
 import mc.mc_camera
 import mc.mc_raster
 import mc.mc_backend
+import mc.mc_wlight
 
 export {
     WorldRender, RenderStats, wr_set_flags, wr_new, wr_free, wr_clear, wr_mark_block, wr_mark_chunk, wr_render,
     wr_cached, wr_make_chunk, wr_drop_chunk, wr_clear_b, wr_free_b, wr_drop_chunk_b, wr_render_b, wr_set_translucent,
+    wr_set_light, wr_set_daylight, wr_mark_section, wr_light_sync,
 }
 
 const EW: usize = 5 // words per cache entry: key, handle, state, quads, translucent handle (0 = none)
@@ -59,6 +61,8 @@ struct WorldRender {
     vis: u64, // u64 [vcap * 2]: entry slot, squared distance
     vcap: usize,
     st: RenderStats,
+    wl: u64, // *mut mc_wlight.WorldLight or 0 (wr_set_light)
+    lpad: u64, // u8 [5832] light pad of the section being meshed
 }
 
 fn wr_new(min_y: i32, dist: i32, t: *mut mc_mesh.MeshTables) -> WorldRender {
@@ -67,6 +71,7 @@ fn wr_new(min_y: i32, dist: i32, t: *mut mc_mesh.MeshTables) -> WorldRender {
         mesher: mc_mesh.mesher_new(), pad: rt.heap_alloc(5832 * 2), cache: 0, cap: 0, n: 0, vis: 0, vcap: 0,
         st: RenderStats { chunks: 0 as u32, far_chunks: 0 as u32, sections: 0 as u32, culled: 0 as u32,
             meshed: 0 as u32, deferred: 0 as u32, drawn: 0 as u32, drawn_trans: 0 as u32, tris: 0 as u64 },
+        wl: 0, lpad: 0,
     }
     return w
 }
@@ -145,6 +150,10 @@ fn wr_free_b(wr: *mut WorldRender, b: *mut mc_backend.Backend) {
 }
 
 fn wr_free_rest(wr: *mut WorldRender) {
+    if (*wr).lpad != 0 {
+        rt.heap_free((*wr).lpad, 5832)
+        (*wr).lpad = 0
+    }
     if (*wr).trans_tab != 0 {
         rt.heap_free((*wr).trans_tab, 32768)
         (*wr).trans_tab = 0
@@ -401,6 +410,42 @@ fn gather(wr: *mut WorldRender, w: *mut mc_world.World, cx: i32, sy: i32, cz: i3
     return true
 }
 
+// Light on / off: sections are meshed with F_LIGHT from `wl` (region volume, else Chunk.light, else sky 15) - see mc_wlight. Call
+// before the first wr_render or follow with wr_clear; a section without light data around it is meshed exactly like before.
+fn wr_set_light(wr: *mut WorldRender, wl: u64) {
+    (*wr).wl = wl
+    if wl != 0 && (*wr).lpad == 0 { (*wr).lpad = rt.heap_alloc(5832) }
+}
+
+// Day/night: light uniforms of the back end (mc_sky.daylight 0..256); no remesh.
+fn wr_set_daylight(b: *mut mc_backend.Backend, day: i32) {
+    (*b).set_light((*b).obj, day, 256, 224, 176)
+}
+
+fn wr_mark_section(wr: *mut WorldRender, cx: i32, sy: i32, cz: i32) {
+    mark_section(wr, cx, sy, cz)
+}
+
+// Marks the dirty sections of the region volume (edits through mc_wlight.wl_edit). Returns how many.
+fn wr_light_sync(wr: *mut WorldRender) -> usize {
+    if (*wr).wl == 0 { return 0 }
+    let wl: *mut mc_wlight.WorldLight = (*wr).wl as *mut mc_wlight.WorldLight
+    let buf: u64 = rt.heap_alloc(256 * 12)
+    var total: usize = 0
+    var n: usize = 1
+    while n > 0 {
+        n = mc_wlight.wl_take_dirty(wl, buf, 256)
+        var i: usize = 0
+        while i < n {
+            mark_section(wr, (*wl).cx0 + (rt.ld32(buf, i * 3) as i32), rt.ld32(buf, i * 3 + 1) as i32, (*wl).cz0 + (rt.ld32(buf, i * 3 + 2) as i32))
+            i = i + 1
+        }
+        total = total + n
+    }
+    rt.heap_free(buf, 256 * 12)
+    return total
+}
+
 fn mesh_entry(wr: *mut WorldRender, w: *mut mc_world.World, b: *mut mc_backend.Backend, slot: usize,
     cx: i32, sy: i32, cz: i32) {
     let old: usize = rt.ld64((*wr).cache, slot * EW + 1) as usize
@@ -412,14 +457,30 @@ fn mesh_entry(wr: *mut WorldRender, w: *mut mc_world.World, b: *mut mc_backend.B
     var nq: u64 = 0
     let sp: u64 = rt.heap_alloc(27 * 8)
     if gather(wr, w, cx, sy, cz, sp) {
-        mc_mesh.mesh_padded(&(*wr).mesher, (*wr).pad, &(*wr).tables, (*wr).flags)
+        var lit: bool = false
+        if (*wr).wl != 0 {
+            let ch: u64 = rt.heap_alloc(9 * 8)
+            mc_wlight.wl_chunks(w, cx, cz, ch)
+            lit = mc_wlight.wl_pad((*wr).wl as *mut mc_wlight.WorldLight, ch, cx, sy, cz, (*wr).lpad)
+            rt.heap_free(ch, 9 * 8)
+        }
+        let fl: u32 = ((*wr).flags | mc_mesh.F_LIGHT) ^ mc_mesh.F_LIGHT
+        if lit {
+            mc_mesh.mesh_padded_lit(&(*wr).mesher, (*wr).pad, (*wr).lpad, &(*wr).tables, fl | mc_mesh.F_LIGHT)
+        } else {
+            mc_mesh.mesh_padded(&(*wr).mesher, (*wr).pad, &(*wr).tables, fl)
+        }
         if (*wr).mesher.nverts > 0 as u32 {
             handle = (*b).mesh_upload((*b).obj, rt.ld64((*wr).cache, slot * EW), (*wr).mesher.verts,
                 (*wr).mesher.nverts as usize, (*wr).mesher.idx, (*wr).mesher.nidx as usize)
             nq = (*wr).mesher.nquads as u64
         }
         if (*wr).trans_tab != 0 {
-            mc_mesh.mesh_padded(&(*wr).mesher, (*wr).pad, &(*wr).tables, (*wr).flags | mc_mesh.F_TRANS)
+            if lit {
+                mc_mesh.mesh_padded_lit(&(*wr).mesher, (*wr).pad, (*wr).lpad, &(*wr).tables, fl | mc_mesh.F_LIGHT | mc_mesh.F_TRANS)
+            } else {
+                mc_mesh.mesh_padded(&(*wr).mesher, (*wr).pad, &(*wr).tables, fl | mc_mesh.F_TRANS)
+            }
             if (*wr).mesher.nverts > 0 as u32 {
                 handle_t = (*b).mesh_upload((*b).obj, rt.ld64((*wr).cache, slot * EW), (*wr).mesher.verts,
                     (*wr).mesher.nverts as usize, (*wr).mesher.idx, (*wr).mesher.nidx as usize)
