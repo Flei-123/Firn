@@ -641,7 +641,7 @@ pub fn inline_module_requested_only(m: &mut Module) -> usize {
 /// (everywhere in the compiler `b.id as usize == i`, see `mem2reg.rs`,
 /// `opt.rs`, `regalloc.rs`), so number, jump targets and the block operands
 /// of every `phi` have to be rewritten together.
-fn reorder_blocks(f: &mut Func, after: usize, new_ids: &[u32]) {
+pub(crate) fn reorder_blocks(f: &mut Func, after: usize, new_ids: &[u32]) {
     let n = f.blocks.len();
     if new_ids.is_empty() || after >= n {
         return;

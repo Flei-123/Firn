@@ -67,6 +67,10 @@
 //! copies, splitting has to come with it; that is written down in
 //! docs/ROUND92.md and not left to be rediscovered.
 //!
+//! **Exception (r481):** when the copies of one edge would overwrite a phi value
+//! that the OTHER edge of the same block still reads (its own copies run
+//! after them), the edges of that block are split. See `split_hazard_edges`.
+//!
 //! ## What the copies cost, and the one place they are given back
 //!
 //! A phi per loop variable means a copy per back edge, and a copy nobody
@@ -158,6 +162,10 @@ pub(crate) fn eliminate_func(f: &mut Func) -> Result<(), String> {
 
     // ROUND 92 -- collapse the chains of phis first; see `coalesce_chains`.
     coalesce_chains(f);
+
+    // r481 -- split the critical edges whose copies would destroy a value the
+    // other edge still needs; see `split_hazard_edges`.
+    split_hazard_edges(f);
 
     let nb = f.blocks.len();
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
@@ -253,6 +261,224 @@ pub(crate) fn eliminate_func(f: &mut Func) -> Result<(), String> {
         b.insts.retain(|i| !matches!(i.op, Op::Phi { .. }));
     }
     Ok(())
+}
+
+/// **r481 -- the one case where a critical edge MUST be split.**
+///
+/// The copies of an edge are appended to the END of its predecessor `p`. That
+/// is only right while the phi values they write are dead on every other path
+/// leaving `p`. When `p` branches two ways and both targets have phis, that
+/// can fail: the copies of the edge `p -> S` write the phi values of `S`
+/// (`D_S`), and the code on the way to `T` (the other successor) may still
+/// read one of them -- either in `T`'s own copies (they run AFTER the copies
+/// of `S`, in the same block) or in code that follows `T`.
+///
+/// Found by `tests/2813_mc_assets_ext.fi` at `--opt-level=release-fast`
+/// (SIGFPE in `mc_assets.anim_step`): after inlining and loop rotation the
+/// block `bb1` ended in `brcond bb2 / bb3` with phis in both targets, the
+/// copy for `bb2` overwrote `%393`, and the copy for `bb3` then read the
+/// overwritten `%393`. The index of the table entry was `e + 1` instead of
+/// `e`, the duration read from the wrong slot was 0 and `div` trapped.
+///
+/// Test: for a block `p` with at least two distinct successors, an edge into
+/// a block with phis is hazardous when one of the phi values `D_S` is live
+/// into another successor `T`, is a source of the copies of `T`'s edge, or is
+/// the condition / selector of `p`'s terminator. A hazardous block gets a
+/// fresh empty block (placed right behind it) on every edge that carries
+/// copies; the copies then go there. Everything else stays as before, so the
+/// hot loops without the shape keep their code.
+fn split_hazard_edges(f: &mut Func) {
+    if std::env::var_os("FIRN_NO_PHI_SPLIT").is_some() {
+        return; // debugging switch: reproduces r481
+    }
+    // Every split removes the hazard of its block for good (the new blocks
+    // have a single successor), so the loop ends after at most one round per
+    // block.
+    let mut rounds = 0usize;
+    while let Some(p) = find_hazard_block(f) {
+        let mut zs: Vec<u32> = Vec::new();
+        let mut done: Vec<usize> = Vec::new();
+        for s in f.blocks[p].term.successors() {
+            let s = s as usize;
+            if done.contains(&s) || f.blocks[s].phi_count() == 0 {
+                continue;
+            }
+            done.push(s);
+            let z = crate::promote::split_edge(f, p, s);
+            if std::env::var_os("FIRN_PHI_SPLIT_DEBUG").is_some() {
+                eprintln!("phi-split: @{} bb{} -> bb{}", f.name, p, s);
+            }
+            zs.push(z as u32);
+        }
+        crate::inline::reorder_blocks(f, p, &zs);
+        rounds += 1;
+        if rounds > f.blocks.len() + 8 {
+            break; // cannot happen; never loop forever
+        }
+    }
+}
+
+fn bit_set(v: &mut [u64], i: usize) {
+    v[i / 64] |= 1u64 << (i % 64);
+}
+
+fn bit_has(v: &[u64], i: usize) -> bool {
+    v[i / 64] & (1u64 << (i % 64)) != 0
+}
+
+/// First block (by number) that has the hazard described at `split_hazard_edges`.
+fn find_hazard_block(f: &Func) -> Option<usize> {
+    let nb = f.blocks.len();
+    // Cheap pre-filter: a block with two distinct successors, one with phis.
+    let mut cand: Vec<usize> = Vec::new();
+    for (i, b) in f.blocks.iter().enumerate() {
+        let mut ss = b.term.successors();
+        ss.sort();
+        ss.dedup();
+        if ss.len() >= 2 && ss.iter().any(|&s| (s as usize) < nb && f.blocks[s as usize].phi_count() > 0) {
+            cand.push(i);
+        }
+    }
+    if cand.is_empty() {
+        return None;
+    }
+    // Index of every phi value.
+    let mut idx: std::collections::HashMap<Val, usize> = std::collections::HashMap::new();
+    for b in f.blocks.iter() {
+        for i in b.insts.iter() {
+            if let (Some(d), Op::Phi { .. }) = (i.dst, &i.op) {
+                let n = idx.len();
+                idx.entry(d).or_insert(n);
+            }
+        }
+    }
+    let nv = idx.len();
+    let w = nv / 64 + 1;
+    let mut use_b: Vec<Vec<u64>> = vec![vec![0u64; w]; nb];
+    let mut def_b: Vec<Vec<u64>> = vec![vec![0u64; w]; nb];
+    let mut buf: Vec<Val> = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for i in b.insts.iter() {
+            if let Op::Phi { .. } = &i.op {
+                if let Some(d) = i.dst {
+                    bit_set(&mut def_b[bi], idx[&d]);
+                }
+                continue;
+            }
+            buf.clear();
+            i.op.uses(&mut buf);
+            for v in buf.iter() {
+                if let Some(&k) = idx.get(v) {
+                    bit_set(&mut use_b[bi], k);
+                }
+            }
+        }
+        if let Some(v) = term_operand(&b.term) {
+            if let Some(&k) = idx.get(&v) {
+                bit_set(&mut use_b[bi], k);
+            }
+        }
+    }
+    // The phi values the edge `p -> s` reads.
+    let edge_srcs = |p: usize, s: usize| -> Vec<usize> {
+        let mut out = Vec::new();
+        for i in f.blocks[s].insts.iter() {
+            match &i.op {
+                Op::Phi { incoming } => {
+                    for (q, v) in incoming.iter() {
+                        if *q as usize == p {
+                            if let Some(&k) = idx.get(v) {
+                                out.push(k);
+                            }
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        out
+    };
+    // Backward liveness of the phi values to a fixpoint.
+    let mut live_in: Vec<Vec<u64>> = vec![vec![0u64; w]; nb];
+    let mut live_out: Vec<Vec<u64>> = vec![vec![0u64; w]; nb];
+    let mut changed = true;
+    let mut guard = 0usize;
+    while changed && guard < 10_000 {
+        changed = false;
+        guard += 1;
+        for bi in (0..nb).rev() {
+            let mut out = vec![0u64; w];
+            for s in f.blocks[bi].term.successors() {
+                let s = s as usize;
+                if s >= nb {
+                    continue;
+                }
+                for k in 0..w {
+                    out[k] |= live_in[s][k];
+                }
+                if f.blocks[s].phi_count() > 0 {
+                    for k in edge_srcs(bi, s) {
+                        bit_set(&mut out, k);
+                    }
+                }
+            }
+            let mut inn = vec![0u64; w];
+            for k in 0..w {
+                inn[k] = (use_b[bi][k] | out[k]) & !def_b[bi][k];
+            }
+            if out != live_out[bi] || inn != live_in[bi] {
+                live_out[bi] = out;
+                live_in[bi] = inn;
+                changed = true;
+            }
+        }
+    }
+    for &p in &cand {
+        let mut ss = f.blocks[p].term.successors();
+        ss.sort();
+        ss.dedup();
+        let cond_k = term_operand(&f.blocks[p].term).and_then(|v| idx.get(&v).copied());
+        for &s in &ss {
+            let s = s as usize;
+            if s >= nb || f.blocks[s].phi_count() == 0 {
+                continue;
+            }
+            // the phi values the copies of this edge write
+            let writes: Vec<usize> = f.blocks[s]
+                .insts
+                .iter()
+                .take_while(|i| matches!(i.op, Op::Phi { .. }))
+                .filter_map(|i| i.dst.and_then(|d| idx.get(&d).copied()))
+                .collect();
+            if let Some(c) = cond_k {
+                if writes.contains(&c) {
+                    return Some(p);
+                }
+            }
+            for &t in &ss {
+                let t = t as usize;
+                if t == s || t >= nb {
+                    continue;
+                }
+                let srcs = if f.blocks[t].phi_count() > 0 { edge_srcs(p, t) } else { Vec::new() };
+                for &k in &writes {
+                    if bit_has(&live_in[t], k) || srcs.contains(&k) {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn term_operand(t: &Term) -> Option<Val> {
+    match t {
+        Term::BrCond { cond, .. } => Some(*cond),
+        Term::Switch { val, .. } => Some(*val),
+        Term::Ret(Some(v)) => Some(*v),
+        _ => None,
+    }
 }
 
 /// **ROUND 92 — the chains of phis, and why they have to go.**

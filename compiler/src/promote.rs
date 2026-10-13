@@ -266,7 +266,7 @@ fn rename_phi_pred(f: &mut Func, b: usize, old: BlockId, new: BlockId) {
 }
 
 /// Puts a fresh, empty block on the edge `from -> to`. Yields its number.
-fn split_edge(f: &mut Func, from: usize, to: usize) -> usize {
+pub(crate) fn split_edge(f: &mut Func, from: usize, to: usize) -> usize {
     let z = f.add_block() as usize;
     f.blocks[z].term = Term::Br(to as BlockId);
     retarget(&mut f.blocks[from].term, to as BlockId, z as BlockId);
