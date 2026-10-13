@@ -1,0 +1,185 @@
+// expect_exit: 0
+// mc_lightpkt: update_light decoding (1.18+ shape with counts, 1.16.5 shape with int masks), the light tail of a 1.18+ map_chunk
+// (Scratch.keep_light) and applying the arrays to a mc_light.LightVol (nibble order, empty masks, section offset by one bit).
+import std.rt
+import std.bytes
+import mc.mc_light
+import mc.mc_lightpkt
+import mc.mc_chunk
+
+// byte i of array number `a` (deterministic pattern, nibbles differ)
+fn pat(a: usize, i: usize) -> u8 {
+    return (((a * 37 + i * 13 + 5) & 255) as u8)
+}
+
+fn put_arrays(b: *mut bytes.Bytes, first: usize, n: usize) {
+    var a: usize = 0
+    while a < n {
+        bytes.put_varint(b, 2048)
+        var i: usize = 0
+        while i < 2048 {
+            bytes.put_u8(b, pat(first + a, i))
+            i = i + 1
+        }
+        a = a + 1
+    }
+}
+
+// 1.18+ light tail: sky mask 0b01110 (bits 1,2,3), block mask 0b00100 (bit 2), empty sky 0b10000 (bit 4), empty block 0b00010 (bit 1)
+fn put_tail_118(b: *mut bytes.Bytes) {
+    bytes.put_varint(b, 1)
+    bytes.put_i64(b, 14 as i64)
+    bytes.put_varint(b, 1)
+    bytes.put_i64(b, 4 as i64)
+    bytes.put_varint(b, 1)
+    bytes.put_i64(b, 16 as i64)
+    bytes.put_varint(b, 1)
+    bytes.put_i64(b, 2 as i64)
+    bytes.put_varint(b, 3)
+    put_arrays(b, 0, 3)
+    bytes.put_varint(b, 1)
+    put_arrays(b, 10, 1)
+}
+
+fn check_ld(ld: *mut mc_lightpkt.LightData) -> i32 {
+    if (*ld).sky_mask != 14 as u64 || (*ld).block_mask != 4 as u64 || (*ld).empty_sky != 16 as u64 || (*ld).empty_block != 2 as u64 { return 1 }
+    if (*ld).sky_n != 3 || (*ld).block_n != 1 { return 2 }
+    if mc_lightpkt.lightdata_sky_array(ld, 0) != 0 || mc_lightpkt.lightdata_sky_array(ld, 4) != 0 { return 3 }
+    let s2: u64 = mc_lightpkt.lightdata_sky_array(ld, 2)
+    if s2 == 0 || rt.ld8(s2, 77) != pat(1, 77) || rt.ld8(s2, 2047) != pat(1, 2047) { return 4 }
+    let s3: u64 = mc_lightpkt.lightdata_sky_array(ld, 3)
+    if s3 == 0 || rt.ld8(s3, 0) != pat(2, 0) { return 5 }
+    let b2: u64 = mc_lightpkt.lightdata_block_array(ld, 2)
+    if b2 == 0 || rt.ld8(b2, 5) != pat(10, 5) { return 6 }
+    if mc_lightpkt.lightdata_block_array(ld, 1) != 0 { return 7 }
+    return 0
+}
+
+fn t_update_118() -> i32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&b, 0 - 3)
+    bytes.put_varint(&b, 9)
+    put_tail_118(&b)
+    var ld: mc_lightpkt.LightData = mc_lightpkt.lightdata_new()
+    bytes.bytes_set_pos(&b, 0)
+    let ok: bool = mc_lightpkt.lightdata_decode_118(&b, &ld, true) catch false
+    if !ok { return 1 }
+    if ld.x != 0 - 3 || ld.z != 9 { return 2 }
+    if bytes.bytes_remaining(&b) != 0 { return 3 }
+    let r: i32 = check_ld(&ld)
+    if r != 0 { return 10 + r }
+    // apply: a volume of 16 x 64 x 16 (4 sections); volume section s = bit s + 1 -> sky sections 0,1,2 from bits 1,2,3,
+    // section 3 (bit 4) is masked empty (0); block section 1 (bit 2) from the block array, section 0 (bit 1) empty
+    var v: mc_light.LightVol = mc_light.light_new(16, 64, 16)
+    rt.mem_set(v.sky, 7 as u8, v.n)
+    rt.mem_set(v.blk, 7 as u8, v.n)
+    let w: usize = mc_lightpkt.lightdata_apply(&v, &ld, 0, 0)
+    if w != 6 { return 20 }
+    // sky section 0 = array a0 (bit 1): cell (x=3, y=2, z=1) -> index (2*16+1)*16+3 = 531
+    let want0: u8 = mc_lightpkt.nibble_get(mc_lightpkt.lightdata_sky_array(&ld, 1), 531)
+    if mc_light.light_sky(&v, 3, 2, 1) != want0 { return 21 }
+    // sky section 1 = a1: cell (15, 15, 15), index 4095
+    let want1: u8 = mc_lightpkt.nibble_get(mc_lightpkt.lightdata_sky_array(&ld, 2), 4095)
+    if mc_light.light_sky(&v, 15, 16 + 15, 15) != want1 { return 22 }
+    if mc_light.light_sky(&v, 0, 48 + 3, 0) != 0 as u8 { return 23 } // masked empty
+    if mc_light.light_block(&v, 4, 0, 4) != 0 as u8 { return 24 } // masked empty (bit 1)
+    let wb: u8 = mc_lightpkt.nibble_get(mc_lightpkt.lightdata_block_array(&ld, 2), 4 * 256 + 4 * 16 + 9)
+    if mc_light.light_block(&v, 9, 16 + 4, 4) != wb { return 25 }
+    if mc_light.light_block(&v, 4, 40, 4) != 7 as u8 { return 26 } // absent section untouched
+    var dl: u64 = rt.heap_alloc(64 * 12)
+    let nd: usize = mc_light.light_take_dirty(&v, dl, 64)
+    if nd != 4 { return 27 }
+    mc_light.light_free(&v)
+    mc_lightpkt.lightdata_free(&ld)
+    bytes.bytes_free(&b)
+    return 0
+}
+
+fn t_update_114() -> i32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&b, 5)
+    bytes.put_varint(&b, 0 - 8)
+    bytes.put_bool(&b, true)
+    bytes.put_varint(&b, 14)
+    bytes.put_varint(&b, 4)
+    bytes.put_varint(&b, 16)
+    bytes.put_varint(&b, 2)
+    put_arrays(&b, 0, 3) // no count prefix
+    put_arrays(&b, 10, 1)
+    var ld: mc_lightpkt.LightData = mc_lightpkt.lightdata_new()
+    bytes.bytes_set_pos(&b, 0)
+    let ok: bool = mc_lightpkt.lightdata_decode_114(&b, &ld, true) catch false
+    if !ok { return 1 }
+    if ld.x != 5 || ld.z != 0 - 8 { return 2 }
+    if bytes.bytes_remaining(&b) != 0 { return 3 }
+    let r: i32 = check_ld(&ld)
+    if r != 0 { return 10 + r }
+    // truncated input must fail, not read garbage
+    var t: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&t, 5)
+    bytes.put_varint(&t, 0 - 8)
+    bytes.put_bool(&t, false)
+    bytes.put_varint(&t, 1)
+    bytes.put_varint(&t, 0)
+    bytes.put_varint(&t, 0)
+    bytes.put_varint(&t, 0)
+    bytes.put_varint(&t, 2048)
+    bytes.put_zero(&t, 100)
+    bytes.bytes_set_pos(&t, 0)
+    let ok2: bool = mc_lightpkt.lightdata_decode_114(&t, &ld, true) catch false
+    if ok2 { return 4 }
+    mc_lightpkt.lightdata_free(&ld)
+    bytes.bytes_free(&b)
+    bytes.bytes_free(&t)
+    return 0
+}
+
+// A 1.18+ map_chunk with one air section, with the light tail, decoded with keep_light.
+fn t_chunk_tail() -> i32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_i32(&b, 2)
+    bytes.put_i32(&b, 0 - 1)
+    bytes.put_varint(&b, 0) // heightmaps (varint keyed map, 1.21.5+ shape): none
+    bytes.put_varint(&b, 6) // chunkData length: one air section (count 0, blocks: single value 0, biomes: single value 0; 1.21.5+ shape has no data length)
+    bytes.put_i16(&b, 0 as i16)
+    bytes.put_u8(&b, 0 as u8)
+    bytes.put_varint(&b, 0)
+    bytes.put_u8(&b, 0 as u8)
+    bytes.put_varint(&b, 0)
+    bytes.put_varint(&b, 0) // block entities
+    put_tail_118(&b)
+    var sc: mc_chunk.Scratch = mc_chunk.scratch_new()
+    // default: counts + hash only, no light object
+    let p0: u64 = mc_chunk.chunk_alloc()
+    bytes.bytes_set_pos(&b, 0)
+    let ok0: bool = mc_chunk.chunk_decode_118(&b, &sc, p0 as *mut mc_chunk.Chunk, 1, true, true) catch false
+    if !ok0 { return 1 }
+    let c0: *mut mc_chunk.Chunk = p0 as *mut mc_chunk.Chunk
+    if (*c0).light != 0 || (*c0).sky_n != 3 || (*c0).block_n != 1 { return 2 }
+    let h0: u64 = (*c0).light_hash
+    mc_chunk.chunk_release(p0)
+    // keep_light: the same counts / hash plus the arrays
+    mc_chunk.scratch_set_keep_light(&sc, true)
+    let p1: u64 = mc_chunk.chunk_alloc()
+    bytes.bytes_set_pos(&b, 0)
+    let ok1: bool = mc_chunk.chunk_decode_118(&b, &sc, p1 as *mut mc_chunk.Chunk, 1, true, true) catch false
+    if !ok1 { return 3 }
+    let c1: *mut mc_chunk.Chunk = p1 as *mut mc_chunk.Chunk
+    if (*c1).light == 0 || (*c1).sky_n != 3 || (*c1).block_n != 1 || (*c1).light_hash != h0 { return 4 }
+    let r: i32 = check_ld((*c1).light as *mut mc_lightpkt.LightData)
+    if r != 0 { return 10 + r }
+    mc_chunk.chunk_release(p1)
+    mc_chunk.scratch_free(&sc)
+    bytes.bytes_free(&b)
+    return 0
+}
+
+fn main() -> i32 {
+    let a: i32 = t_update_118()
+    if a != 0 { return 100 + a }
+    let b: i32 = t_update_114()
+    if b != 0 { return 200 + b }
+    let c: i32 = t_chunk_tail()
+    if c != 0 { return 300 + c }
+    return 0
+}

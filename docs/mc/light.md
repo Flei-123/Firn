@@ -18,7 +18,17 @@ Greedy merge key = tile + (ao, sky, block) of all 4 corners; merging along an ax
 s256 = floor(sky * day / 15 + 0.5), b256 = floor(block * 256 / 15 + 0.5); per channel lum = max(s256, b256 * tint_c >> 8), lf = 24 + (lum * 232 >> 8); total_c = (fq * face_k >> 8) * lf >> 8.
 Uniforms: day 0..256 (sky light multiplier, e.g. mc_sky daylight), tint r g b 0..256 (default 256 224 176 = warm block light). `raster_set_light`, `glbe_set_light`, `glweb_set_light`. day 256 + sky 15 + block 0 gives lf = 256: old images are byte identical.
 
+## Light engine (lib/mc/mc_light.fi)
+Dense volume (`LightVol`, local cell coordinates, per cell op 0..15 / emit 0..15 / sky / block). The light is the unique fixpoint
+`L(c) = max(base(c), max_n L(n) - max(1, op(c)))`; block base = emit, sky base = 15 for SKY-DIRECT cells (op 0 for the cell and everything above it in the column; open sky above the volume). Nothing flows in from outside the volume.
+`light_set_block(v, x, y, z, op, emit)`: removal pass (cells derived from the old value are cleared or fall back to their own base, the brighter rest becomes a source) then add pass (queue flood fill). A sky-direct flip re-lights the air column below the cell. `light_full` = oracle / initial load. `light_take_dirty` returns the 16^3 sections whose padded 18^3 light may have changed (cell + neighbour sections on a section face); `light_pad_section` writes the u8 [5832] for `mesh_padded_lit` (outside the volume = 0xF0).
+Tests: tests/2831_mc_light_fuzz.fi (6 seeds x 120 steps of 1-3 random edits on a 32^3 volume, incremental == full recompute, dirty covers every changed padded section, hand-computed values), counter-check in `bash tools/mc/light/run.sh` (`RESULT mc-light: ok`).
+Measured (llvmpipe box, 64^3 terrain, release): full recompute 47 ms (262144 cells); single break/place near the surface ~6 us (~18 cells written); torch place + remove ~1.6 ms per pair.
+
+## Light from packets (lib/mc/mc_lightpkt.fi)
+`lightdata_decode_118` (update_light 1.18+ with position; also the light tail of a 1.18+ map_chunk without position), `lightdata_decode_114` (1.14 - 1.16.5 update_light, int masks, no count prefix). Mask bit i = section i-1 (bit 0 = section below the world), arrays 2048 octets, even cell index in the low nibble. `lightdata_apply(vol, ld, cell_x0, cell_z0)` copies the arrays into a LightVol (volume section s = bit s+1; masked-empty = 0; absent sections untouched) and marks sections dirty. `mc_chunk.scratch_set_keep_light(sc, true)` keeps the light of a 1.18+ column in `Chunk.light` (default off: counts + hash only, memory). Test tests/2832_mc_light_packet.fi (hand-built packets; no live server fixture yet).
+
 ## Not done yet (roadmap)
-* Light from packets (update_light, chunk light arrays) -> padded light arrays.
-* mc_light.fi: incremental BFS light (add / remove), fuzz against full recompute, dirty sections for mc_stream.
-* mc_render_world / mc_stream still mesh without F_LIGHT (no light source yet).
+* mc_render_world / mc_stream still mesh without F_LIGHT: stream snapshots need a light pad per job (from Chunk.light / a LightVol per loaded region), `raster_set_light(day)` from mc_sky.daylight.
+* Live check of the light arrays against a real 1.16.5 / 1.20.1 server (tools/mcclient/compare); update_light for 1.14/1.15/1.17 variants.
+* GL rendering of the lit scenes is not compared with the CPU image (only the default light).
