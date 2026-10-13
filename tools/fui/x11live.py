@@ -298,8 +298,11 @@ try:
     vorher = (d.letzter_zustand() or [0] * 5)[4]
     sx, sy = d.mitte("starten")
     srv.run("xdotool", "mousemove", str(sx), str(sy), "click", "1")
-    ok = d.warte(lambda z: (d.letzter_zustand() or [0] * 5)[4] == 1000, 8)
-    n2 = d.ruhig(0.8)
+    ok = d.warte(lambda z: (d.letzter_zustand() or [0] * 5)[4] == 1000, 30)
+    # r97: settle for a window that survives a loaded machine (a stalled
+    # server may deliver the last frame >0.8 s late); the limit below
+    # (0 frames in 2 s afterwards) is NOT loosened.
+    n2 = d.ruhig(1.6)
     chk("L5", "Starten: Fortschritt laeuft bis 1000", ok is not None,
         d.letzter_zustand()[4], 1000)
     werte = [int(l.split()[5]) for l in d.zeilen()

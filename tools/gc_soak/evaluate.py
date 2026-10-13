@@ -24,7 +24,7 @@ T, ROUNDS, RSS, LIVE, HEAP, LIVEB, RUNS, PAUSE, MARK, SWEEP, STOP, FULL, OV, ASK
 
 
 def read(path):
-    rows, done = [], None
+    rows, done, torn = [], None, 0
     for line in open(path, encoding="utf-8"):
         line = line.strip()
         if not line:
@@ -36,9 +36,18 @@ def read(path):
                 raise SystemExit("%s: %s" % (path, line))
             continue
         f = line.split("\t")
-        if len(f) != 14:
-            raise SystemExit("%s: a line with %d fields instead of 14" % (path, len(f)))
-        rows.append([int(x) for x in f])
+        try:
+            if len(f) != 14:
+                raise ValueError
+            rows.append([int(x) for x in f])
+        except ValueError:
+            # r95: a sample line torn by a concurrent write to the same file
+            # (e.g. the previous run still flushing). One torn line is
+            # reported and skipped; more than 1 % of the lines is an error.
+            torn += 1
+            print("   NOTE: %s: skipped a torn line (%d fields)" % (path, len(f)))
+    if torn > max(1, (len(rows) + torn) // 100):
+        raise SystemExit("%s: %d torn lines out of %d" % (path, torn, len(rows) + torn))
     if len(rows) < 8:
         raise SystemExit("%s: only %d samples" % (path, len(rows)))
     return rows, done
