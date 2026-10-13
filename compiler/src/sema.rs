@@ -3141,11 +3141,19 @@ constants declared before it, and '+ - * /'"
                 },
             },
             ExprKind::Binary(op, l, r) => {
+                // r176: probe the left operand ONCE. Probing it twice (pointer
+                // test, then the float rule) doubled the work per nesting
+                // level of a left-leaning `a + b + c + ...` chain: 2^n.
+                let left_probe = if op.is_cmp() || op.is_logic() {
+                    None
+                } else {
+                    self.probe_d(l, d + 1)
+                };
                 if op.is_cmp() || op.is_logic() {
                     Some(Type::Bool)
                 } else if matches!(op, BinOp::Shl | BinOp::Shr) {
-                    self.probe_d(l, d + 1)
-                } else if let Some(lp) = self.probe_d(l, d + 1).filter(|t| t.is_ptr() && !crate::gc::is_gc_ptr(t)) {
+                    left_probe
+                } else if let Some(lp) = left_probe.clone().filter(|t| t.is_ptr() && !crate::gc::is_gc_ptr(t)) {
                     // Round GAPS (ptrarith.rs): `p +/- n` is the pointer,
                     // `p - q` the distance in i64.
                     let rp = self.probe_d(r, d + 1);
@@ -3160,7 +3168,7 @@ constants declared before it, and '+ - * /'"
                     // one is what comes out. Otherwise `a_f32 + b_f64` would
                     // probe as `f32` and the literal next to it would get
                     // the wrong type.
-                    float_want(self.probe_d(l, d + 1), self.probe_d(r, d + 1))
+                    float_want(left_probe, self.probe_d(r, d + 1))
                 }
             }
             ExprKind::Field(base, name, _) => {
