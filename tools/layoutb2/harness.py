@@ -327,7 +327,7 @@ def measure(binary, tests, ua_text, chunk=20, verbose=False):
     return results
 
 
-def reflow_check(binary, tests, ua_text, chunk=20):
+def reflow_counts(binary, tests, ua_text, chunk=20):
     """THE PROOF OF THE SPLIT: a second layout of the same tree at another
     width and back has to give the very same tree as the first one.
 
@@ -351,9 +351,10 @@ def reflow_check(binary, tests, ua_text, chunk=20):
                 first_bad.append((part[0]["name"], str(exc)[:100]))
                 continue
             for one in part:
-                sub = reflow_check(binary, [one], ua_text, 1)
+                sub = reflow_counts(binary, [one], ua_text, 1)
                 same += sub[0]
                 differ += sub[1]
+                first_bad.extend(sub[2])
             continue
         for t, a, b in zip(part, plain, again):
             if a == b:
@@ -363,9 +364,14 @@ def reflow_check(binary, tests, ua_text, chunk=20):
                 if len(first_bad) < 5:
                     diff = [(x, y) for x, y in zip(a, b) if x != y][:2]
                     first_bad.append((t["name"], diff))
+    return same, differ, first_bad
+
+
+def reflow_check(binary, tests, ua_text, chunk=20):
+    same, differ, first_bad = reflow_counts(binary, tests, ua_text, chunk)
     print("REFLOW: %d of %d documents identical after 800 -> 400 -> 800"
           % (same, same + differ))
-    for name, d in first_bad:
+    for name, d in first_bad[:5]:
         print("   DIFFERS %s %s" % (name, d))
     return 0 if differ == 0 else 1
 
