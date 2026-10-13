@@ -26,9 +26,8 @@
 // blocksize_prev/4 + blocksize_this/4 frames.
 //
 // HONESTLY, WHAT IS NOT:
-//  * FLOOR TYPE 0 (the LSP floor) is rejected with an error. No encoder in
-//    use writes it (libvorbis never did since 2000, ffmpeg does not), and
-//    stb_vorbis does not decode it either.
+//  * (Floor type 0, the LSP floor, IS decoded -- see FLOOR 0 below. No common encoder
+//    writes it, so it is tested with synthetic streams only: tools/vorbis/floor0_gen.py.)
 //  * Chained and multiplexed streams are handled one level up (ton.ogg /
 //    ton.vorbis_file), not here.
 //  * It decodes with f32 like the reference decoder (libvorbis); results
@@ -219,6 +218,18 @@ struct Floor1 {
     hi: [i32; 66],
 }
 
+// Floor type 0 (LSP): header values and the Bark maps of both block sizes.
+struct Floor0 {
+    order: i32,
+    rate: i32,
+    bark: i32,
+    abits: i32,
+    aoff: i32,
+    nbooks: i32,
+    book: [i32; 16],
+    map: [u64; 2],   // i32[bs / 2] each: Bark map index of every spectrum line
+}
+
 struct Residue {
     rtype: i32,
     begin: i32,
@@ -271,6 +282,8 @@ struct Vorbis {
     budget: i64,
     books: [Codebook; 256],
     floors: [Floor1; 64],
+    floors0: [Floor0; 64],
+    ftype: [i32; 64],   // 0 = LSP floor, 1 = piecewise linear floor
     res: [Residue; 64],
     maps: [Mapping; 64],
     modes: [Mode; 64],
@@ -718,6 +731,32 @@ fn cb_decode(b: *mut Br, cb: *mut Codebook) -> i32 {
 // FLOOR 1 -- setup
 // ====================================================================
 
+fn parse_floor0(v: *mut Vorbis, br: *mut Br, idx: i32) -> i32 {
+    let f: *mut Floor0 = &(*v).floors0[idx as usize]
+    (*f).order = br_read(br, 8) as i32
+    (*f).rate = br_read(br, 16) as i32
+    (*f).bark = br_read(br, 16) as i32
+    (*f).abits = br_read(br, 6) as i32
+    (*f).aoff = br_read(br, 8) as i32
+    (*f).nbooks = (br_read(br, 4) + 1 as u32) as i32
+    if (*f).order < 1 || (*f).rate < 1 || (*f).bark < 1 || (*f).abits < 1 || (*br).eop {
+        return -1
+    }
+    var i: i32 = 0
+    while i < (*f).nbooks {
+        let b: i32 = br_read(br, 8) as i32
+        // a floor 0 book must be a vector book
+        if b >= (*v).nbooks || (*v).books[b as usize].ltype == 0 || (*v).books[b as usize].dims < 1 {
+            return -1
+        }
+        (*f).book[i as usize] = b
+        i = i + 1
+    }
+    (*f).map[0] = 0
+    (*f).map[1] = 0
+    return 0
+}
+
 fn parse_floor1(v: *mut Vorbis, br: *mut Br, idx: i32) -> i32 {
     let f: *mut Floor1 = &(*v).floors[idx as usize]
     let parts: i32 = br_read(br, 5) as i32
@@ -1089,13 +1128,15 @@ fn parse_setup(v: *mut Vorbis, br: *mut Br) -> i32 {
     i = 0
     while i < (*v).nfloors {
         let ft: i32 = br_read(br, 16) as i32
-        if ft == 0 {
-            return -5
-        }
-        if ft != 1 {
+        if ft != 0 && ft != 1 {
             return -1
         }
-        st = parse_floor1(v, br, i)
+        (*v).ftype[i as usize] = ft
+        if ft == 0 {
+            st = parse_floor0(v, br, i)
+        } else {
+            st = parse_floor1(v, br, i)
+        }
         if st != 0 {
             return st
         }
@@ -1171,6 +1212,23 @@ fn runtime_setup(v: *mut Vorbis) -> i32 {
         return -4
     }
     (*v).prev_n = 0
+    var fi: i32 = 0
+    while fi < (*v).nfloors {
+        if (*v).ftype[fi as usize] == 0 {
+            var w: i32 = 0
+            while w < 2 {
+                let n2: i32 = (if w == 0 { (*v).bs0 } else { (*v).bs1 }) / 2
+                let mp: u64 = valloc(v, ((n2 + 1) as usize) * 4)
+                if mp == 0 {
+                    return -4
+                }
+                floor0_map(&(*v).floors0[fi as usize], mp, n2)
+                (*v).floors0[fi as usize].map[w as usize] = mp
+                w = w + 1
+            }
+        }
+        fi = fi + 1
+    }
     return 0
 }
 
@@ -1287,6 +1345,121 @@ fn render_line(v: *mut Vorbis, curve: u64, n2: i32, x0: i32, y0: i32, x1: i32, y
         stf(curve, x as i64, (*v).db[yy as usize])
         x = x + 1
     }
+}
+
+// ====================================================================
+// FLOOR 0 (LSP) -- Bark map, packet decode, curve synthesis (spec 6.2)
+// ====================================================================
+
+fn bark(x: f64) -> f64 {
+    return 13.1 * math.atan(0.00074 * x) + 2.24 * math.atan(1.85e-8 * x * x) + 0.0001 * x
+}
+
+// map[i] (i < n) = Bark band of spectrum line i, map[n] = -1.
+fn floor0_map(f: *mut Floor0, map: u64, n: i32) {
+    let scale: f64 = ((*f).bark as f64) / bark(0.5 * ((*f).rate as f64))
+    var i: i32 = 0
+    while i < n {
+        var m: i64 = math.floor(bark(((*f).rate as f64) * (i as f64) / (2.0 * (n as f64))) * scale) as i64
+        if m > ((*f).bark - 1) as i64 {
+            m = ((*f).bark - 1) as i64
+        }
+        if m < 0 {
+            m = 0
+        }
+        sti(map, i as i64, m as i32)
+        i = i + 1
+    }
+    sti(map, n as i64, -1)
+}
+
+// Decodes floor 0 of one channel into `curve` (n2 linear values). false = unused / undecodable.
+fn floor0_decode(v: *mut Vorbis, br: *mut Br, f: *mut Floor0, which: i32, curve: u64, n2: i32) -> bool {
+    let araw: u32 = br_read(br, (*f).abits)
+    if araw == 0 as u32 || (*br).eop {
+        return false
+    }
+    let bn: i32 = br_read(br, ilog((*f).nbooks)) as i32
+    if bn >= (*f).nbooks || (*br).eop {
+        return false
+    }
+    let cb: *mut Codebook = &(*v).books[(*f).book[bn as usize] as usize]
+    let order: i32 = (*f).order
+    var coef: [f64; 256] = [0.0; 256]
+    var last: f64 = 0.0
+    var j: i32 = 0
+    while j < order {
+        let e: i32 = cb_decode(br, cb)
+        if e < 0 {
+            return false
+        }
+        var nl: f64 = last
+        var k: i32 = 0
+        while k < (*cb).dims {
+            nl = (ldf((*cb).vq, (e as i64) * ((*cb).dims as i64) + (k as i64)) as f64) + last
+            if j + k < order {
+                coef[(j + k) as usize] = nl
+            }
+            k = k + 1
+        }
+        last = nl
+        j = j + (*cb).dims
+    }
+    var cs: [f64; 256] = [0.0; 256]
+    j = 0
+    while j < order {
+        cs[j as usize] = math.cos(coef[j as usize])
+        j = j + 1
+    }
+    let maxv: f64 = ((1 as i64) << ((*f).abits as i64)) as f64 - 1.0
+    let amp: f64 = (araw as f64) * ((*f).aoff as f64) / maxv
+    let map: u64 = (*f).map[which as usize]
+    let pi: f64 = 3.14159265358979323846
+    var i: i32 = 0
+    while i < n2 {
+        let k: i32 = ldi(map, i as i64)
+        let w: f64 = math.cos(pi * (k as f64) / ((*f).bark as f64))
+        var p: f64 = 1.0
+        var q: f64 = 1.0
+        var t: i32 = 0
+        if order % 2 == 1 {
+            p = 1.0 - w * w
+            q = 0.25
+            while t <= (order - 3) / 2 {
+                let d: f64 = cs[(2 * t + 1) as usize] - w
+                p = p * 4.0 * d * d
+                t = t + 1
+            }
+            t = 0
+            while t <= (order - 1) / 2 {
+                let d: f64 = cs[(2 * t) as usize] - w
+                q = q * 4.0 * d * d
+                t = t + 1
+            }
+        } else {
+            p = (1.0 - w) * 0.5
+            q = (1.0 + w) * 0.5
+            while t < order / 2 {
+                let d1: f64 = cs[(2 * t + 1) as usize] - w
+                let d0: f64 = cs[(2 * t) as usize] - w
+                p = p * 4.0 * d1 * d1
+                q = q * 4.0 * d0 * d0
+                t = t + 1
+            }
+        }
+        var pq: f64 = p + q
+        if pq < 1.0e-300 {
+            pq = 1.0e-300
+        }
+        let val: f32 = math.exp(0.11512925 * (amp / math.sqrt(pq) - ((*f).aoff as f64))) as f32
+        stf(curve, i as i64, val)
+        i = i + 1
+        while i < n2 && ldi(map, i as i64) == k {
+            stf(curve, i as i64, val)
+            i = i + 1
+        }
+    }
+    return true
 }
 
 // Decodes the floor of one channel into `curve` (n2 values). false = floor unused.
@@ -1657,9 +1830,14 @@ fn vorbis_decode(v: *mut Vorbis, p: u64, n: usize) -> i32 {
     var c: i32 = 0
     while c < chn {
         let sm: i32 = (*mp).mux[c as usize]
-        let fl: *mut Floor1 = &(*v).floors[(*mp).sub_floor[sm as usize] as usize]
+        let fidx: usize = (*mp).sub_floor[sm as usize] as usize
         let cv: u64 = (*v).curve + (((c as i64) * stride) as u64) * 4
-        let used: bool = floor1_decode(v, &br, fl, cv, n2)
+        var used: bool = false
+        if (*v).ftype[fidx] == 0 {
+            used = floor0_decode(v, &br, &(*v).floors0[fidx], blk, cv, n2)
+        } else {
+            used = floor1_decode(v, &br, &(*v).floors[fidx], cv, n2)
+        }
         (*v).nz[c as usize] = used
         (*v).nz2[c as usize] = used
         // the spectrum of this channel starts as zero

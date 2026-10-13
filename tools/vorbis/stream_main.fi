@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/vorbis/stream_main.fi -- driver for ton.vorbis_stream.
+//   stream_main <in.ogg|-> <out.raw> [chunk] [seek_frame count]
+// in = "-" reads stdin (pipe, not seekable). Decodes all links (f32 interleaved, link after link) in `chunk`-frame
+// calls (default 1000). Prints one line per link: "link <n> <rate> <channels> <frames>", then "bad <n>".
+// With seek_frame/count: seeks to seek_frame (in the first link), writes `count` frames, prints "tell <pos>".
+import std.rt
+import std.io
+import ton.vorbis_stream
+import ton.vorbis_stream_fd
+
+fn num(p: u64) -> i64 {
+    var v: i64 = 0
+    var i: usize = 0
+    while rt.ld8(p, i) != 0 as u8 {
+        v = v * 10 + ((rt.ld8(p, i) as i64) - 48)
+        i = i + 1
+    }
+    return v
+}
+
+fn line3(b: *mut rt.Buf, a: i64, c: i64, d: i64, e: i64) {
+    rt.buf_push_dec_i64(b, a)
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_dec_i64(b, c)
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_dec_i64(b, d)
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_dec_i64(b, e)
+    rt.buf_push(b, 10 as u8)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        io.print_line("usage: stream_main <in.ogg|-> <out.raw> [chunk] [seek_frame count]")
+        return 2
+    }
+    var chunk: i64 = 1000
+    if rt.arg_count(start) >= 4 {
+        chunk = num(rt.arg_ptr(start, 3))
+    }
+    var src: vorbis_stream.VsSource = vorbis_stream_fd.vs_source_fd(0)
+    let inp: u64 = rt.arg_ptr(start, 1)
+    if !(rt.ld8(inp, 0) == 45 as u8 && rt.ld8(inp, 1) == 0 as u8) {
+        let fd: i64 = syscall(2, inp as i64, 0, 0, 0, 0, 0)
+        if fd < 0 {
+            io.print_line("input not readable")
+            return 3
+        }
+        src = vorbis_stream_fd.vs_source_fd(fd)
+    }
+    let s: *mut vorbis_stream.VStream = vorbis_stream.vs_open(src)
+    if s as u64 == 0 {
+        io.print_line("open failed")
+        return 5
+    }
+    var out: rt.Buf = rt.buf_new()
+    var log: rt.Buf = rt.buf_new()
+    var mx: usize = 1
+    var pcm: u64 = rt.heap_alloc((chunk as usize) * 4 * 256)
+    var link_frames: i64 = 0
+    var link_no: i64 = 0
+    if rt.arg_count(start) >= 6 {
+        let want: i64 = num(rt.arg_ptr(start, 4))
+        let cnt: i64 = num(rt.arg_ptr(start, 5))
+        if vorbis_stream.vs_seek(s, want) != 0 {
+            io.print_line("seek failed")
+            return 6
+        }
+        var got: i64 = 0
+        while got < cnt {
+            let n: i64 = vorbis_stream.vs_read_f32(s, pcm, ((cnt - got) as usize))
+            if n <= 0 {
+                break
+            }
+            rt.buf_push_bytes(&out, pcm, (n as usize) * (vorbis_stream.vs_channels(s) as usize) * 4)
+            got = got + n
+        }
+        line3(&log, vorbis_stream.vs_tell(s), got, 0, 0)
+        io.print_bytes(rt.buf_ptr(&log), rt.buf_len(&log))
+        rt.write_file(rt.arg_ptr(start, 2), rt.buf_ptr(&out), rt.buf_len(&out))
+        return 0
+    }
+    var run: bool = true
+    var rate: i64 = vorbis_stream.vs_rate(s) as i64
+    var chn: i64 = vorbis_stream.vs_channels(s) as i64
+    while run {
+        let n: i64 = vorbis_stream.vs_read_f32(s, pcm, chunk as usize)
+        if n == 0 {
+            run = false
+        } else if n == vorbis_stream.VS_LINK {
+            line3(&log, link_no, rate, chn, link_frames)
+            link_no = link_no + 1
+            link_frames = 0
+            rate = vorbis_stream.vs_rate(s) as i64
+            chn = vorbis_stream.vs_channels(s) as i64
+        } else if n < 0 {
+            io.print_line("read error")
+            return 7
+        } else {
+            rt.buf_push_bytes(&out, pcm, (n as usize) * (vorbis_stream.vs_channels(s) as usize) * 4)
+            link_frames = link_frames + n
+        }
+    }
+    line3(&log, link_no, rate, chn, link_frames)
+    rt.buf_push_dec_i64(&log, vorbis_stream.vs_bad_packets(s) as i64)
+    rt.buf_push(&log, 10 as u8)
+    io.print_bytes(rt.buf_ptr(&log), rt.buf_len(&log))
+    rt.write_file(rt.arg_ptr(start, 2), rt.buf_ptr(&out), rt.buf_len(&out))
+    return 0
+}
