@@ -1,0 +1,781 @@
+// demos/mcplay/main.fi -- playable prototype: joins a Minecraft server (offline mode), opens a window, renders the streamed world
+// and lets you walk / fly, break and place blocks.
+//
+//   mcplay <host-ipv4> <port> <name>
+//
+// Controls: mouse look (captured), W A S D, Space (jump / up), Shift (sneak / down), Ctrl (sprint), 1-9 / wheel (hotbar),
+// LMB break (creative: instant, otherwise hold MCPLAY_DIG_MS), RMB place, F fly on/off, N noclip, F11 fullscreen, Esc release the
+// mouse (click captures again), Alt+F4 / window close quits.
+//
+// Environment (all optional):
+//   MCPLAY_GL=1        GL path (not wired yet: see docs/mc/play.md; the demo then says so and uses the CPU path)
+//   MCPLAY_VIEW=6      view distance in chunks            MCPLAY_PROTOCOL=763   protocol number
+//   MCPLAY_W / MCPLAY_H window size (default 854x480)     MCPLAY_FULLSCREEN=1   start fullscreen
+//   MCPLAY_FPS=60      frame cap (0 = uncapped)           MCPLAY_VSYNC=1        swap interval for the GL path (CPU path: no-op)
+//   MCPLAY_CREATIVE=1  the server is creative: fly allowed and the creative reach (6 blocks)
+//   MCPLAY_TICKS=2000  time of day for the sky (the time update packet is not decoded yet)
+//   MCPLAY_DIG_MS=700  hold time before the "finish digging" packet in survival (there is no hardness table yet)
+//   MCPLAY_PLACE_ID=0  block state id painted locally on a place click (0 = wait for the server's Block Update)
+//   MCPLAY_RUN_S=0     quit after N seconds (tests)       MCPLAY_SHOT=<file.png>  write the last frame as PNG on exit + print its hash
+//   MCPLAY_AUDIO=0     sound: 0 off, 1 on (FIRN_AUDIO=null|file:<path>|device selects the sink)
+//
+// Frame order: pump events -> network (chunks, block updates) -> 20 Hz ticks (movement, position packets) -> pick -> mouse actions ->
+// clear, sky, world, light tint, selection box, HUD -> present. Packets are applied as they arrive: Block Update / Multi Block
+// Change change the world (mc_blockset) and dirty the mesh cache (wr_mark_block).
+import std.net
+import std.bytes
+import std.rt
+import std.io
+import std.env
+import std.core
+import std.math
+import window.window
+import input.raw
+import mc.mc_codec
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_client
+import mc.mc_dimension
+import mc.mc_sem
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_registry
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_render_world
+import mc.mc_sky
+import mc.mc_input
+import mc.mc_hud
+import mc.mc_blockset
+import mc.mc_play
+
+const LOGIN_WAITS: i32 = 200
+const FOG_R: u32 = 150
+const FOG_G: u32 = 190
+const FOG_B: u32 = 230
+const BOX_RGBA: u32 = 0xFF000000
+const TICK_MS: u64 = 50
+const SC_ESC: u32 = 1
+const SC_F: u32 = 33
+const SC_N: u32 = 49
+const SC_F11: u32 = 87
+
+fn now_ns() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return (ts[0] as u64) * 1000000000 as u64 + (ts[1] as u64)
+}
+
+fn now_ms() -> u64 {
+    return now_ns() / 1000000 as u64
+}
+
+fn say(f: io.Fmt) {
+    io.fmt_print(f)
+}
+
+// signed decimal of the C string at p; fallback on any other character
+fn parse_dec(p: u64, n: usize, fallback: i64) -> i64 {
+    if n == 0 {
+        return fallback
+    }
+    var neg: bool = false
+    var i: usize = 0
+    if rt.ld8(p, 0) == 45 as u8 {
+        neg = true
+        i = 1
+    }
+    if i >= n {
+        return fallback
+    }
+    var v: i64 = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return fallback
+        }
+        v = v * 10 + (c - 48 as u8) as i64
+        i = i + 1
+    }
+    if neg {
+        return 0 - v
+    }
+    return v
+}
+
+fn parse_ipv4(p: u64) -> u32 {
+    let n: usize = rt.c_length(p)
+    var parts: [i64; 4] = [0; 4]
+    var k: usize = 0
+    var cur: i64 = 0
+    var digits: usize = 0
+    var i: usize = 0
+    while i <= n {
+        var c: u8 = 46 as u8
+        if i < n {
+            c = rt.ld8(p, i)
+        }
+        if c == 46 as u8 {
+            if digits == 0 || k >= 4 || cur > 255 {
+                return 0 as u32
+            }
+            parts[k] = cur
+            k = k + 1
+            cur = 0
+            digits = 0
+        } else if c >= 48 as u8 && c <= 57 as u8 {
+            cur = cur * 10 + (c - 48 as u8) as i64
+            digits = digits + 1
+        } else {
+            return 0 as u32
+        }
+        i = i + 1
+    }
+    if k != 4 {
+        return 0 as u32
+    }
+    return net.ipv4(parts[0] as u8, parts[1] as u8, parts[2] as u8, parts[3] as u8)
+}
+
+fn env_flag(name: str, fallback: bool) -> bool {
+    if !env.has(name) {
+        return fallback
+    }
+    let v: str = env.get(name)
+    if v.length() == 0 {
+        return fallback
+    }
+    return v.chars(0) == 49 as u8
+}
+
+fn env_int(name: str, fallback: i32) -> i32 {
+    if !env.has(name) {
+        return fallback
+    }
+    let v: str = env.get(name)
+    return parse_dec(v.p as u64, v.length(), fallback as i64) as i32
+}
+
+// ---- command line: flags (--sky --box --hud --all) are skipped by argn/argp so the positional layout stays as before
+
+fn path_buf(out: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(out, s.p as u64, s.n)
+    var z: [u8; 1] = [0 as u8; 1]
+    rt.buf_push_bytes(out, (&z[0]) as u64, 1)
+}
+
+// ---- graphics ------------------------------------------------------------------------------------
+
+struct Gfx {
+    atlas: mc_texture.Atlas,
+    tb: mc_mesh.MeshTables,
+    r: mc_raster.Raster,
+    wr: mc_render_world.WorldRender,
+    ok: bool,
+}
+
+fn gfx_new(w: i32, h: i32, ver: *mut mc_version.Version, min_y: i32, view: i32) -> Gfx {
+    var atlas: mc_texture.Atlas = mc_texture.atlas_default()
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_texture.tex_alloc_tables(&tb)
+    var reg: mc_registry.Registry = ver.registry_of()
+    let ok: bool = mc_registry.registry_ok(&reg)
+    if ok {
+        mc_texture.tex_build_tables(&reg, &tb)
+    }
+    var r: mc_raster.Raster = mc_raster.raster_new(w, h)
+    mc_raster.backend_upload_atlas(&r, &atlas)
+    var wr: mc_render_world.WorldRender = mc_render_world.wr_new(min_y, view, &tb)
+    return Gfx { atlas: atlas, tb: tb, r: r, wr: wr, ok: ok }
+}
+
+// Pick table: a block state is targetable when any face is drawn, solid = opaque (same as demos/mcview).
+fn pick_tables(tb: *mut mc_mesh.MeshTables) -> mc_input.InputTables {
+    let pk: u64 = rt.heap_alloc(32768)
+    let so: u64 = rt.heap_alloc(32768)
+    var id: usize = 0
+    while id < 32768 {
+        var any: u8 = 0 as u8
+        var f: usize = 0
+        while f < 6 {
+            if rt.ld16((*tb).tiles, id * 6 + f) != 0 as u16 { any = 1 as u8 }
+            f = f + 1
+        }
+        rt.st8(pk, id, any)
+        rt.st8(so, id, rt.ld8((*tb).opaque, id))
+        id = id + 1
+    }
+    return mc_input.InputTables { pick: pk, solid: so, n: 32768 }
+}
+
+// ---- game state ----------------------------------------------------------------------------------
+
+struct Ctx {
+    cl: mc_client.Client,
+    world: mc_world.World,
+    sc: mc_chunk.Scratch,
+    dim: mc_dimension.Dimension,
+    g: Gfx,
+    itb: mc_input.InputTables,
+    cam: mc_camera.Camera,
+    sky: mc_sky.Sky,
+    pl: mc_input.Player,
+    rw: raw.Raw,
+    win: window.Window,
+    pk: mc_input.Pick,
+    bg: u64, // BGRX copy of the frame for the window
+    w: i32,
+    h: i32,
+    view: i32,
+    protocol: i32,
+    // flags
+    join: bool,
+    have_pos: bool,
+    last_tp: u64,
+    grab: bool,
+    closed: bool,
+    resized: bool,
+    fullscreen: bool,
+    hit: bool,
+    creative: bool,
+    // input accumulated between ticks
+    acc_dx: f64,
+    acc_dy: f64,
+    want_fly: bool,
+    want_noclip: bool,
+    sent_slot: i32,
+    // digging
+    digging: bool,
+    dig_x: i32,
+    dig_y: i32,
+    dig_z: i32,
+    dig_t0: u64,
+    dig_ms: u64,
+    seq: i32,
+    place_id: i32,
+    ticks_day: i32,
+    // counters
+    n_chunks: u64,
+    n_unload: u64,
+    n_bchange: u64,
+    n_mchange: u64,
+    n_dig: u64,
+    n_place: u64,
+    n_ticks: u64,
+    n_frames: u64,
+    n_kick: u64,
+    fps: i32,
+}
+
+fn mark_air(c: *mut Ctx, x: i32, y: i32, z: i32, id: i32) {
+    let old: i32 = mc_blockset.world_set_block(&(*c).world, (*c).dim.min_y, x, y, z, id)
+    if old >= 0 && old != id {
+        mc_render_world.wr_mark_block(&(*c).g.wr, x, y, z)
+    }
+}
+
+fn on_map_chunk(c: *mut Ctx) {
+    let p: u64 = mc_chunk.chunk_alloc()
+    if p == 0 { return }
+    let ch: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+    let ok: bool = mc_chunk.chunk_decode_for(&(*c).cl.ver, mc_client.client_body(&(*c).cl), &(*c).sc, ch, mc_dimension.dim_sections(&(*c).dim)) catch false
+    if !ok || (*ch).ground_up == 0 {
+        mc_chunk.chunk_release(p)
+        return
+    }
+    let cx: i32 = (*ch).x
+    let cz: i32 = (*ch).z
+    if !mc_world.world_put(&(*c).world, p) {
+        mc_chunk.chunk_release(p)
+        return
+    }
+    mc_render_world.wr_mark_chunk(&(*c).g.wr, cx, cz)
+    (*c).n_chunks = (*c).n_chunks + 1 as u64
+}
+
+fn on_unload(c: *mut Ctx) {
+    let b: *mut bytes.Bytes = mc_client.client_body(&(*c).cl)
+    let first: i32 = bytes.get_i32(b) catch 0
+    let second: i32 = bytes.get_i32(b) catch 0
+    var cx: i32 = first
+    var cz: i32 = second
+    if (*c).cl.ver.protocol >= 764 {
+        cx = second
+        cz = first
+    }
+    mc_render_world.wr_drop_chunk(&(*c).g.wr, &(*c).g.r, cx, cz)
+    if mc_world.world_remove(&(*c).world, cx, cz) {
+        (*c).n_unload = (*c).n_unload + 1 as u64
+    }
+}
+
+fn on_block_change(c: *mut Ctx) {
+    var x: i32 = 0
+    var y: i32 = 0
+    var z: i32 = 0
+    var s: i32 = 0
+    if mc_play.decode_block_change(mc_client.client_body(&(*c).cl), &x, &y, &z, &s) {
+        mark_air(c, x, y, z, s)
+        (*c).n_bchange = (*c).n_bchange + 1 as u64
+    }
+}
+
+fn on_multi_change(c: *mut Ctx) {
+    let b: *mut bytes.Bytes = mc_client.client_body(&(*c).cl)
+    var x0: i32 = 0
+    var y0: i32 = 0
+    var z0: i32 = 0
+    let n: i32 = mc_play.multi_begin(b, (*c).cl.ver.protocol, &x0, &y0, &z0)
+    var i: i32 = 0
+    while i < n {
+        var x: i32 = 0
+        var y: i32 = 0
+        var z: i32 = 0
+        var s: i32 = 0
+        if !mc_play.multi_next(b, x0, y0, z0, &x, &y, &z, &s) { return }
+        mark_air(c, x, y, z, s)
+        i = i + 1
+    }
+    (*c).n_mchange = (*c).n_mchange + 1 as u64
+}
+
+// One packet.
+fn on_packet(c: *mut Ctx, id: i32) {
+    let cl: *mut mc_client.Client = &(*c).cl
+    if mc_client.client_auto_reply(cl, id) {
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_JOIN_GAME) {
+        if !(*c).join {
+            (*c).join = true
+            mc_dimension.dim_from_join(&(*cl).ver, id, mc_client.client_body(cl), &(*c).dim)
+            (*c).g.wr.min_y = (*c).dim.min_y
+            mc_client.client_send_settings(cl, (*c).view)
+        }
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_MAP_CHUNK) {
+        on_map_chunk(c)
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_UNLOAD_CHUNK) {
+        on_unload(c)
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_BLOCK_CHANGE) {
+        on_block_change(c)
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_MULTI_BLOCK_CHANGE) {
+        on_multi_change(c)
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_KICK_DISCONNECT) {
+        (*c).n_kick = (*c).n_kick + 1 as u64
+        (*c).closed = true
+    }
+}
+
+// Applies waiting packets (at most `limit`, stops at the first timeout). false = connection lost.
+fn net_drain(c: *mut Ctx, limit: i32) -> bool {
+    var n: i32 = 0
+    while n < limit {
+        let id: i32 = mc_client.client_next(&(*c).cl)
+        if id == mc_client.CL_TIMEOUT { return true }
+        if id < 0 { return false }
+        on_packet(c, id)
+        n = n + 1
+    }
+    return true
+}
+
+// ---- events ----------------------------------------------------------------------------------------
+
+fn grab_mouse(c: *mut Ctx, on: bool) {
+    if on {
+        window.cursor_mode(&(*c).win, window.CURSOR_CAPTURED)
+    } else {
+        window.cursor_mode(&(*c).win, window.CURSOR_NORMAL)
+    }
+    (*c).grab = on
+}
+
+// Own event pump (raw.raw_pump drops EV_CONFIGURE / EV_CLOSED): keys + mouse go to raw_feed, resize / close are noted, the captured
+// pointer's relative movement is accumulated until the next tick.
+fn pump(c: *mut Ctx) {
+    raw.raw_begin(&(*c).rw)
+    var k: u32 = window.next_event(&(*c).win)
+    var guard: i32 = 0
+    while k != window.EV_NONE && guard < 20000 {
+        guard = guard + 1
+        if k == window.EV_CONFIGURE {
+            (*c).resized = true
+        } else if k == window.EV_CLOSED {
+            (*c).closed = true
+        } else {
+            raw.raw_feed(&(*c).rw, k, window.ev_a(&(*c).win), window.ev_x(&(*c).win), window.ev_y(&(*c).win), window.ev_state(&(*c).win))
+        }
+        k = window.next_event(&(*c).win)
+    }
+    var d: [i64; 2] = [0; 2]
+    if window.cursor_delta(&(*c).win, (&d[0]) as u64) {
+        if (*c).grab {
+            (*c).acc_dx = (*c).acc_dx + (d[0] as f64)
+            (*c).acc_dy = (*c).acc_dy + (d[1] as f64)
+        }
+    }
+    raw.raw_end(&(*c).rw)
+}
+
+fn keys_now(c: *mut Ctx) -> u32 {
+    var m: u32 = 0 as u32
+    var sc: u32 = 0 as u32
+    while sc < 90 as u32 {
+        if raw.key_down(&(*c).rw, sc) { m = m | mc_play.key_bit(sc) }
+        sc = sc + 1 as u32
+    }
+    return m
+}
+
+fn gfx_resize(c: *mut Ctx, w: i32, h: i32) {
+    mc_render_world.wr_clear(&(*c).g.wr, &(*c).g.r)
+    mc_raster.raster_free(&(*c).g.r)
+    (*c).g.r = mc_raster.raster_new(w, h)
+    mc_raster.backend_upload_atlas(&(*c).g.r, &(*c).g.atlas)
+    if (*c).bg != 0 { rt.heap_free((*c).bg, ((*c).w as usize) * ((*c).h as usize) * 4) }
+    (*c).bg = rt.heap_alloc((w as usize) * (h as usize) * 4)
+    (*c).w = w
+    (*c).h = h
+    mc_camera.camera_resize(&(*c).cam, w, h)
+}
+
+// Window events that change state: resize, fullscreen, mouse capture, quit key.
+fn handle_window(c: *mut Ctx) {
+    if (*c).resized {
+        (*c).resized = false
+        let nw: i32 = window.width(&(*c).win) as i32
+        let nh: i32 = window.height(&(*c).win) as i32
+        if nw >= 64 && nh >= 48 && (nw != (*c).w || nh != (*c).h) {
+            gfx_resize(c, nw, nh)
+        }
+    }
+    if raw.key_pressed(&(*c).rw, raw.KEY_ESC) {
+        grab_mouse(c, !(*c).grab)
+    }
+    if raw.key_pressed(&(*c).rw, SC_F11 as u32) {
+        (*c).fullscreen = !(*c).fullscreen
+        window.fullscreen(&(*c).win, (*c).fullscreen)
+    }
+}
+
+// Hotbar: number keys + wheel (up = previous slot), HELD_ITEM_SLOT on change.
+fn handle_hotbar(c: *mut Ctx) {
+    var sc: u32 = 2 as u32
+    while sc <= 10 as u32 {
+        if raw.key_pressed(&(*c).rw, sc) { (*c).pl.slot = mc_play.hotbar_of(sc) }
+        sc = sc + 1 as u32
+    }
+    let wy: i64 = raw.wheel_y(&(*c).rw)
+    if wy != 0 && (*c).grab {
+        (*c).pl.slot = mc_world.floor_mod((*c).pl.slot - (wy as i32), 9)
+    }
+    if (*c).pl.slot != (*c).sent_slot {
+        mc_play.send_slot(&(*c).cl, (*c).pl.slot)
+        (*c).sent_slot = (*c).pl.slot
+    }
+    if raw.key_pressed(&(*c).rw, SC_F as u32) { (*c).want_fly = true }
+    if raw.key_pressed(&(*c).rw, SC_N as u32) { (*c).want_noclip = true }
+}
+
+// ---- ticks (20 Hz): movement + position packet -----------------------------------------------------
+
+fn do_tick(c: *mut Ctx) {
+    var ev: mc_input.InputEvents = mc_input.input_events_new()
+    ev.dx = (*c).acc_dx
+    ev.dy = (*c).acc_dy
+    ev.keys = keys_now(c)
+    ev.toggle_fly = (*c).want_fly && (*c).creative
+    ev.toggle_noclip = (*c).want_noclip && (*c).creative
+    (*c).acc_dx = 0.0
+    (*c).acc_dy = 0.0
+    (*c).want_fly = false
+    (*c).want_noclip = false
+    mc_input.player_tick(&(*c).pl, &ev, &(*c).world, &(*c).itb, (*c).dim.min_y)
+    mc_play.send_pos_look(&(*c).cl, (*c).pl.x, (*c).pl.y, (*c).pl.z, (*c).pl.yaw, (*c).pl.pitch, (*c).pl.on_ground)
+    (*c).n_ticks = (*c).n_ticks + 1 as u64
+}
+
+// The server moved us (join, teleport): take its position.
+fn sync_position(c: *mut Ctx) {
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var z: f64 = 0.0
+    if !mc_client.client_position(&(*c).cl, &x, &y, &z) { return }
+    if !(*c).have_pos || (*c).cl.teleports != (*c).last_tp {
+        (*c).have_pos = true
+        (*c).last_tp = (*c).cl.teleports
+        (*c).pl.x = x
+        (*c).pl.y = y
+        (*c).pl.z = z
+        (*c).pl.vy = 0.0
+    }
+}
+
+// ---- mouse actions: break / place ------------------------------------------------------------------
+
+fn break_local(c: *mut Ctx, x: i32, y: i32, z: i32) {
+    mark_air(c, x, y, z, 0)
+    (*c).n_dig = (*c).n_dig + 1 as u64
+}
+
+fn handle_mouse(c: *mut Ctx) {
+    let lmb: bool = raw.mouse_down(&(*c).rw, raw.MB_LEFT)
+    let lp: bool = raw.mouse_pressed(&(*c).rw, raw.MB_LEFT)
+    let rp: bool = raw.mouse_pressed(&(*c).rw, raw.MB_RIGHT)
+    if !(*c).grab {
+        if lp { grab_mouse(c, true) }
+        return
+    }
+    if !(*c).have_pos { return }
+    let cl: *mut mc_client.Client = &(*c).cl
+    if lp && (*c).hit {
+        let face: i32 = mc_play.face_of((*c).pk.nx, (*c).pk.ny, (*c).pk.nz)
+        (*c).seq = (*c).seq + 1
+        mc_play.send_swing(cl, (*c).seq)
+        mc_play.send_dig(cl, mc_play.DIG_START, (*c).pk.x, (*c).pk.y, (*c).pk.z, face, (*c).seq)
+        if (*c).creative {
+            break_local(c, (*c).pk.x, (*c).pk.y, (*c).pk.z)
+        } else {
+            (*c).digging = true
+            (*c).dig_x = (*c).pk.x
+            (*c).dig_y = (*c).pk.y
+            (*c).dig_z = (*c).pk.z
+            (*c).dig_t0 = now_ms()
+        }
+    }
+    if (*c).digging {
+        let same: bool = (*c).hit && (*c).pk.x == (*c).dig_x && (*c).pk.y == (*c).dig_y && (*c).pk.z == (*c).dig_z
+        let face2: i32 = mc_play.face_of((*c).pk.nx, (*c).pk.ny, (*c).pk.nz)
+        if !lmb || !same {
+            (*c).seq = (*c).seq + 1
+            mc_play.send_dig(cl, mc_play.DIG_CANCEL, (*c).dig_x, (*c).dig_y, (*c).dig_z, face2, (*c).seq)
+            (*c).digging = false
+        } else if now_ms() - (*c).dig_t0 >= (*c).dig_ms {
+            (*c).seq = (*c).seq + 1
+            mc_play.send_dig(cl, mc_play.DIG_FINISH, (*c).dig_x, (*c).dig_y, (*c).dig_z, face2, (*c).seq)
+            break_local(c, (*c).dig_x, (*c).dig_y, (*c).dig_z)
+            (*c).digging = false
+        }
+    }
+    if rp && (*c).hit {
+        let face3: i32 = mc_play.face_of((*c).pk.nx, (*c).pk.ny, (*c).pk.nz)
+        (*c).seq = (*c).seq + 1
+        mc_play.send_place(cl, (*c).pk.x, (*c).pk.y, (*c).pk.z, face3, (*c).seq)
+        mc_play.send_swing(cl, (*c).seq)
+        (*c).n_place = (*c).n_place + 1 as u64
+        if (*c).place_id > 0 {
+            mark_air(c, (*c).pk.x + (*c).pk.nx, (*c).pk.y + (*c).pk.ny, (*c).pk.z + (*c).pk.nz, (*c).place_id)
+        }
+    }
+}
+
+// ---- drawing -----------------------------------------------------------------------------------------
+
+fn draw_frame(c: *mut Ctx) {
+    let r: *mut mc_raster.Raster = &(*c).g.r
+    let view: f64 = (*c).view as f64
+    let fog_start: f64 = view * 16.0 * 0.5
+    let fog_end: f64 = view * 16.0 + 8.0
+    mc_raster.raster_set_fog(r, true, fog_start, fog_end, FOG_R, FOG_G, FOG_B)
+    let clear: u32 = (255 as u32 << 24 as u32) | (FOG_B << 16 as u32) | (FOG_G << 8 as u32) | FOG_R
+    mc_raster.backend_begin(r, &(*c).cam, clear)
+    mc_sky.sky_draw(&(*c).sky, r)
+    mc_sky.sky_set_raster_fog(&(*c).sky, r, fog_start, fog_end)
+    if (*c).have_pos {
+        mc_render_world.wr_render(&(*c).g.wr, &(*c).world, r, &(*c).cam, 0 - 1)
+    }
+    mc_sky.sky_tint_frame(&(*c).sky, r)
+    if (*c).hit {
+        mc_input.input_draw_box(r, (*c).pk.x, (*c).pk.y, (*c).pk.z, BOX_RGBA)
+    }
+    var d: mc_hud.HudDebug = mc_hud.hud_debug_new()
+    d.fps = (*c).fps
+    d.x = (*c).pl.x
+    d.y = (*c).pl.y
+    d.z = (*c).pl.z
+    d.yaw = (*c).pl.yaw
+    d.pitch = (*c).pl.pitch
+    d.has_block = (*c).hit
+    if (*c).hit {
+        d.bx = (*c).pk.x
+        d.by = (*c).pk.y
+        d.bz = (*c).pk.z
+        d.id = (*c).pk.id
+        d.nx = (*c).pk.nx
+        d.ny = (*c).pk.ny
+        d.nz = (*c).pk.nz
+    }
+    mc_hud.hud_frame(r, mc_hud.hud_scale((*c).w, (*c).h), mc_hud.HUD_CROSSHAIR | mc_hud.HUD_HOTBAR | mc_hud.HUD_DEBUG, (*c).pl.slot, &d)
+}
+
+fn present(c: *mut Ctx) {
+    window.to_bgrx((*c).g.r.color, (*c).bg, ((*c).w as usize) * ((*c).h as usize))
+    window.image(&(*c).win, (*c).bg, (*c).w as usize, (*c).h as usize, 0, 0)
+    window.present(&(*c).win)
+}
+
+// ---- main ----------------------------------------------------------------------------------------------
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 4 {
+        io.eprint_line("usage: mcplay <host-ipv4> <port> <name>   (options: environment, see the header of demos/mcplay/main.fi)")
+        return 2
+    }
+    let host: u64 = rt.arg_ptr(start, 1)
+    let pp: u64 = rt.arg_ptr(start, 2)
+    let name: u64 = rt.arg_ptr(start, 3)
+    let port: i64 = parse_dec(pp, rt.c_length(pp), 0 - 1)
+    let addr: u32 = parse_ipv4(host)
+    if addr == 0 as u32 || port <= 0 || port > 65535 {
+        io.eprint_line("mcplay: bad host or port (IPv4 literal expected)")
+        return 2
+    }
+    let view: i32 = env_int("MCPLAY_VIEW", 6)
+    let proto: i32 = env_int("MCPLAY_PROTOCOL", 763)
+    let w0: i32 = env_int("MCPLAY_W", 854)
+    let h0: i32 = env_int("MCPLAY_H", 480)
+    let fps_cap: i32 = env_int("MCPLAY_FPS", 60)
+    let run_s: i32 = env_int("MCPLAY_RUN_S", 0)
+    if env_flag("MCPLAY_GL", false) {
+        io.eprint_line("mcplay: MCPLAY_GL=1 -- the GL path is not wired into this demo yet, using the CPU rasterizer")
+    }
+    var ver: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(proto, &ver) || ver.chunk_format == mc_version.CF_LEGACY_8 {
+        io.eprint_line("mcplay: unsupported protocol number")
+        return 2
+    }
+    var conn: net.Conn = net.connect_tcp(addr, port as u16) catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&conn) {
+        io.eprint_line("mcplay: connect failed")
+        return 3
+    }
+    net.set_no_delay(&conn, true) catch false
+    var c: Ctx = Ctx {
+        cl: mc_client.client_new(conn, ver),
+        world: mc_world.world_new(),
+        sc: mc_chunk.scratch_new(),
+        dim: mc_dimension.dim_default_overworld(),
+        g: gfx_new(w0, h0, &ver, 0, view),
+        itb: mc_input.InputTables { pick: 0, solid: 0, n: 0 },
+        cam: mc_camera.camera_new(w0, h0),
+        sky: mc_sky.sky_new(),
+        pl: mc_input.player_new(0.0, 0.0, 0.0),
+        rw: raw.raw_new(),
+        win: window.window_new(),
+        pk: mc_input.Pick { x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, dist: 0.0, id: 0 },
+        bg: 0, w: w0, h: h0, view: view, protocol: proto,
+        join: false, have_pos: false, last_tp: 0, grab: false, closed: false, resized: false, fullscreen: false, hit: false,
+        creative: env_flag("MCPLAY_CREATIVE", true),
+        acc_dx: 0.0, acc_dy: 0.0, want_fly: false, want_noclip: false, sent_slot: 0 - 1,
+        digging: false, dig_x: 0, dig_y: 0, dig_z: 0, dig_t0: 0, dig_ms: env_int("MCPLAY_DIG_MS", 700) as u64, seq: 0,
+        place_id: env_int("MCPLAY_PLACE_ID", 0), ticks_day: env_int("MCPLAY_TICKS", 2000),
+        n_chunks: 0, n_unload: 0, n_bchange: 0, n_mchange: 0, n_dig: 0, n_place: 0, n_ticks: 0, n_frames: 0, n_kick: 0, fps: 0,
+    }
+    if !c.g.ok {
+        io.eprint_line("mcplay: this version has no block registry")
+        return 5
+    }
+    c.itb = pick_tables(&c.g.tb)
+    c.pl.creative = c.creative
+    c.bg = rt.heap_alloc((w0 as usize) * (h0 as usize) * 4)
+    mc_camera.camera_set_lens(&c.cam, 70.0, 0.05, (view as f64 + 2.0) * 16.0 * 1.5)
+    mc_sky.sky_set_time(&c.sky, c.ticks_day as i64, 0)
+    mc_render_world.wr_set_flags(&c.g.wr, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+    mc_codec.wire_timeout(&c.cl.w, 2)
+    if !mc_client.client_handshake(&c.cl, host, port as u16, 2) {
+        io.eprint_line("mcplay: could not send the handshake")
+        return 4
+    }
+    let lr: i32 = mc_client.client_login_offline(&c.cl, name, LOGIN_WAITS)
+    if lr != 0 {
+        say(f"mcplay: login failed ({lr})\n")
+        return 5
+    }
+    // window (CPU path): full_input BEFORE make so that button releases, motion and raw keys arrive
+    if !window.open_window(&c.win, 0) {
+        io.eprint_line("mcplay: cannot open the display")
+        return 6
+    }
+    window.full_input(&c.win, true)
+    if !window.make(&c.win, w0 as usize, h0 as usize) {
+        io.eprint_line("mcplay: cannot create the window")
+        return 6
+    }
+    window.raw_input(&c.win, true)
+    let ttl: str = "mcplay"
+    window.title(&c.win, ttl.p as u64, ttl.n)
+    window.show_window(&c.win)
+    if env_flag("MCPLAY_FULLSCREEN", false) {
+        c.fullscreen = true
+        window.fullscreen(&c.win, true)
+    }
+    grab_mouse(&c, true)
+    c.sent_slot = 0
+    let t_start: u64 = now_ms()
+    var t_tick: u64 = t_start
+    var t_fps: u64 = t_start
+    var f_fps: i32 = 0
+    var frame_ns: u64 = 1000000000 as u64 / 60 as u64
+    if fps_cap > 0 { frame_ns = 1000000000 as u64 / (fps_cap as u64) } else { frame_ns = 0 as u64 }
+    var alive: bool = true
+    while !c.closed && alive {
+        let f0: u64 = now_ns()
+        pump(&c)
+        handle_window(&c)
+        alive = net_drain(&c, 400)
+        sync_position(&c)
+        handle_hotbar(&c)
+        let nowm: u64 = now_ms()
+        var nt: i32 = 0
+        while nowm >= t_tick + TICK_MS && nt < 5 {
+            t_tick = t_tick + TICK_MS
+            if c.have_pos { do_tick(&c) }
+            nt = nt + 1
+        }
+        if nowm > t_tick + 250 as u64 { t_tick = nowm }
+        if c.have_pos {
+            mc_input.player_set_camera(&c.pl, &c.cam)
+            c.hit = mc_input.input_pick_camera(&c.world, c.dim.min_y, &c.itb, &c.cam, mc_input.player_reach(&c.pl), &c.pk)
+        }
+        handle_mouse(&c)
+        draw_frame(&c)
+        present(&c)
+        c.n_frames = c.n_frames + 1 as u64
+        f_fps = f_fps + 1
+        if nowm - t_fps >= 500 as u64 {
+            c.fps = (f_fps as u64 * 1000 as u64 / (nowm - t_fps)) as i32
+            f_fps = 0
+            t_fps = nowm
+        }
+        if run_s > 0 && nowm - t_start >= (run_s as u64) * 1000 as u64 { c.closed = true }
+        let spent: u64 = now_ns() - f0
+        if frame_ns > spent {
+            window.wait_event(&c.win, ((frame_ns - spent) / 1000000 as u64) as i64)
+        }
+    }
+    say(f"mcplay: end frames={c.n_frames} ticks={c.n_ticks} chunks={c.n_chunks} unloads={c.n_unload} block_updates={c.n_bchange} multi_updates={c.n_mchange} dig={c.n_dig} place={c.n_place} kicked={c.n_kick} alive={alive}\n")
+    say(f"mcplay: pos x={c.pl.x as i64} y={c.pl.y as i64} z={c.pl.z as i64} fps={c.fps}\n")
+    var rc: i32 = 0
+    if env.has("MCPLAY_SHOT") {
+        let sp: str = env.get("MCPLAY_SHOT")
+        var pb: rt.Buf = rt.buf_new()
+        path_buf(&pb, sp)
+        if !mc_raster.raster_write_png(&c.g.r, rt.buf_ptr(&pb)) {
+            io.eprint_line("mcplay: cannot write the screenshot")
+            rc = 7
+        }
+        let hb: u64 = rt.heap_alloc(64)
+        mc_raster.raster_hash_hex(&c.g.r, hb)
+        io.print("mcplay: hash=")
+        io.print_bytes(hb, 64)
+        io.print("\n")
+        rt.heap_free(hb, 64)
+        rt.buf_free(&pb)
+    }
+    window.close_window(&c.win)
+    mc_render_world.wr_free(&c.g.wr, &c.g.r)
+    mc_world.world_free(&c.world)
+    mc_chunk.scratch_free(&c.sc)
+    mc_client.client_free(&c.cl)
+    return rc
+}
