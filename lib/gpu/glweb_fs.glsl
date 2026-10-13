@@ -11,6 +11,8 @@ uniform sampler2DArray u_atlas;
 uniform vec2 u_tiles;   // x = tile edge in texels (power of two)
 uniform vec4 u_fog;     // x = 1 fog on, y = start, z = end
 uniform vec3 u_fogc;    // fog colour 0..255
+uniform vec4 u_light;   // x = day (sky light multiplier 0..256), yzw = block light tint per channel 0..256
+in vec2 v_light;
 in vec3 v_uvao;
 flat in int v_tile;
 flat in int v_fk;
@@ -24,7 +26,13 @@ void main() {
     if (t.a < 128) discard;
     int fq = clamp(int(floor(100.0 + 52.0 * v_uvao.z)), 0, 256);
     int total = (fq * v_fk) >> 8;
-    ivec3 c = (t.rgb * total) >> 8;
+    // light: same integer arithmetic as mc_raster.fi (s256 / b256 / per channel factor 24..256)
+    int s256 = clamp(int(floor(v_light.x * u_light.x / 15.0 + 0.5)), 0, 256);
+    int b256 = clamp(int(floor(v_light.y * 256.0 / 15.0 + 0.5)), 0, 256);
+    ivec3 lum = max(ivec3(s256), (b256 * ivec3(u_light.yzw)) >> 8);
+    ivec3 lf = 24 + ((lum * 232) >> 8);
+    ivec3 tot = (total * lf) >> 8;
+    ivec3 c = (t.rgb * tot) >> 8;
     if (u_fog.x > 0.5) {
         float tt = clamp((v_depth - u_fog.y) / (u_fog.z - u_fog.y), 0.0, 1.0);
         int f = int(floor(tt * 256.0));

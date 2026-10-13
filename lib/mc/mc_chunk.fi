@@ -35,11 +35,12 @@ import std.bytes
 import std.rt
 import std.nbt
 import mc.mc_version
+import mc.mc_lightpkt
 
 export {
     Container, Section, Chunk, Scratch,
     scratch_new, scratch_free, scratch_set_sky,
-    chunk_decode, chunk_decode_anon, chunk_decode_118, chunk_decode_19, chunk_decode_114, chunk_decode_legacy8, chunk_is_unload_legacy8, Legacy8Bulk, legacy8_bulk_open, legacy8_bulk_next, legacy8_bulk_complete, legacy8_bulk_free, legacy8_data_len, chunk_decode_for, container_remap, chunk_remap_blocks, chunk_merge_update, chunk_format_supported, chunk_free, chunk_section, chunk_alloc, chunk_release, section_size,
+    chunk_decode, chunk_decode_anon, chunk_decode_118, chunk_decode_19, chunk_decode_114, chunk_decode_legacy8, chunk_is_unload_legacy8, Legacy8Bulk, legacy8_bulk_open, legacy8_bulk_next, legacy8_bulk_complete, legacy8_bulk_free, legacy8_data_len, chunk_decode_for, container_remap, chunk_remap_blocks, chunk_merge_update, chunk_format_supported, chunk_free, scratch_set_keep_light, chunk_section, chunk_alloc, chunk_release, section_size,
     container_get, container_bits, container_palette_size,
     BLOCKS_PER_SECTION, BIOMES_PER_SECTION, HM_ENTRIES, HM_MAX, HM_NAME_MAX,
 }
@@ -90,6 +91,7 @@ struct Chunk {
     bio: u64, // 256 biome octets of a ground-up CF_SECTIONS_19 column (index z*16+x), or 0
     ground_up: i32, // CF_SECTIONS_19: 1 = whole column, 0 = section update (the caller must not replace a column with it)
     sec_mask: i32, // CF_SECTIONS_19 / 114: bit i = section i was sent in this packet (other formats: 65535)
+    light: u64, // mc_lightpkt.LightData of a CF_CONTAINERS_118 column (only when Scratch.keep_light), else 0
 }
 
 // Reusable scratch memory for the decoder (one per decoding thread).
@@ -101,10 +103,11 @@ struct Scratch {
     wd: u64, // u64 [1024] raw long words of one legacy section (CF_SECTIONS_19)
     sky: bool, // the dimension has sky light (CF_SECTIONS_19 sections carry a sky light array then)
     nolen: bool, // 1.21.5+ (FLAG_HM_MAP): containers carry no data array length (it follows from the bits per entry)
+    keep_light: bool, // keep the light arrays of a 1.18+ map_chunk in Chunk.light (default off: only counts + hash)
 }
 
 fn scratch_new() -> Scratch {
-    var s: Scratch = Scratch { ids: 0, map: 0, pal: 0, idx: 0, wd: 0, sky: true, nolen: false }
+    var s: Scratch = Scratch { ids: 0, map: 0, pal: 0, idx: 0, wd: 0, sky: true, nolen: false, keep_light: false }
     s.ids = rt.heap_alloc(BLOCKS_PER_SECTION * 2)
     s.map = rt.heap_alloc(32768 * 2)
     s.pal = rt.heap_alloc(BLOCKS_PER_SECTION * 2)
@@ -123,6 +126,11 @@ fn scratch_new() -> Scratch {
 // Tells the decoder whether the dimension of the next chunks has sky light (CF_SECTIONS_19 only).
 fn scratch_set_sky(s: *mut Scratch, sky: bool) {
     (*s).sky = sky
+}
+
+// Keep the light arrays of CF_CONTAINERS_118 columns in Chunk.light (mc_lightpkt.LightData; memory ~ 2 x 2 KiB per section).
+fn scratch_set_keep_light(s: *mut Scratch, on: bool) {
+    (*s).keep_light = on
 }
 
 fn scratch_free(s: *mut Scratch) {
@@ -368,6 +376,10 @@ fn chunk_free(c: *mut Chunk) {
     if (*c).bio != 0 {
         rt.heap_free((*c).bio, 256)
     }
+    if (*c).light != 0 {
+        mc_lightpkt.lightdata_release((*c).light)
+    }
+    (*c).light = 0
     (*c).bio = 0
     (*c).secs = 0
     (*c).hm_val = 0
@@ -380,7 +392,7 @@ fn chunk_free(c: *mut Chunk) {
 fn chunk_size() -> usize {
     var a: [Chunk; 2] = [Chunk { x: 0, z: 0, nsec: 0, secs: 0, nbe: 0, nhm: 0,
             hm_name: [0; 128], hm_nlen: [0; 4], hm_val: 0, sky_n: 0, block_n: 0,
-            light_hash: 0 as u64, bio: 0, ground_up: 1, sec_mask: 65535 }; 2]
+            light_hash: 0 as u64, bio: 0, ground_up: 1, sec_mask: 65535, light: 0 }; 2]
     return ((&a[1]) as u64 - (&a[0]) as u64) as usize
 }
 
@@ -403,6 +415,7 @@ fn chunk_alloc() -> u64 {
     (*c).bio = 0
     (*c).ground_up = 1
     (*c).sec_mask = 65535
+    (*c).light = 0
     var i: usize = 0
     while i < 4 {
         (*c).hm_nlen[i] = 0
@@ -739,6 +752,15 @@ fn chunk_decode_118(b: *mut bytes.Bytes, sc: *mut Scratch, c: *mut Chunk, nsec: 
     }
     (*c).nbe = nbe
     // four masks (counts only), then the sky and block light arrays
+    if (*sc).keep_light {
+        let lp: usize = bytes.bytes_pos(b)
+        let lptr: u64 = mc_lightpkt.lightdata_alloc()
+        if lptr == 0 { return BytesError::Range }
+        if (*c).light != 0 { mc_lightpkt.lightdata_release((*c).light) }
+        (*c).light = lptr
+        try mc_lightpkt.lightdata_decode_118(b, lptr as *mut mc_lightpkt.LightData, false)
+        bytes.bytes_set_pos(b, lp)
+    }
     try skip_long_array(b)
     try skip_long_array(b)
     try skip_long_array(b)

@@ -1,0 +1,529 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_light.fi -- incremental sky + block light on a dense volume (docs/mc/light.md, "Light engine").
+//
+// A LightVol is a box of sx*sy*sz cells (local coordinates 0..s-1) with, per cell:
+//   op   0..15  light absorption (0 = air, 15 = opaque, water ~2); entering a cell costs max(1, op)
+//   emit 0..15  block light the cell emits
+//   sky, blk    the computed light 0..15
+// The light is the UNIQUE fixpoint
+//     L(c) = max(base(c), max over the 6 neighbours n of L(n) - max(1, op(c)))   (clamped at 0)
+//   block channel: base = emit(c)
+//   sky channel:   base = 15 if the cell is SKY DIRECT (op = 0 for the cell and every cell above it in its column up to
+//                  the top of the volume; the space above the volume is open sky), else 0.
+// Cells outside the volume contribute nothing (no light flows in from the sides or from below).
+//
+//   light_full(v)                       recompute everything (also the test oracle)
+//   light_set_block(v, x, y, z, op, e)  change one cell and repair the light with a removal pass followed by an add pass
+//                                       (classic flood fill, both with a queue); only cells whose light MIGHT have depended on
+//                                       the old value are touched
+//   light_take_dirty(v, out, max)       sections (16^3, 3 x i32 section coords per entry) whose padded 18^3 light may have
+//                                       changed since the last call; the caller remeshes them (mc_stream mark_block)
+//   light_pad_section(v, sx, sy, sz, out)  padded u8 [5832] (sky << 4 | block) for mc_mesh.mesh_padded_lit; cells outside
+//                                       the volume = OUTSIDE_LIGHT
+import std.rt
+
+export {
+    LightVol, OUTSIDE_LIGHT, light_new, light_free, light_set_raw, light_full, light_set_block, light_sky, light_block,
+    light_get, light_take_dirty, light_pad_section, light_mark_section, light_equal, light_idx, light_counters,
+}
+
+const OUTSIDE_LIGHT: u8 = 240 as u8 // sky 15, block 0: unknown space looks like open sky (the old look)
+
+struct Queue {
+    idx: u64, // u32 [cap] cell indexes
+    val: u64, // u8 [cap] light value (removal queue only)
+    cap: usize,
+    head: usize,
+    tail: usize,
+}
+
+struct LightVol {
+    sx: i32, sy: i32, sz: i32,
+    n: usize,
+    op: u64, emit: u64, sd: u64, // u8 [n]
+    sky: u64, blk: u64, // u8 [n]
+    nsx: i32, nsy: i32, nsz: i32, // section counts (ceil(s / 16))
+    dirty: u64, // u8 [nsx*nsy*nsz]
+    qa: Queue, // add queue
+    qr: Queue, // removal queue
+    touched: u64, // statistics: cells written by the repair passes
+    ops: u64,
+}
+
+fn q_new() -> Queue {
+    let cap: usize = 4096
+    return Queue { idx: rt.heap_alloc(cap * 4), val: rt.heap_alloc(cap), cap: cap, head: 0, tail: 0 }
+}
+
+fn q_free(q: *mut Queue) {
+    rt.heap_free((*q).idx, (*q).cap * 4)
+    rt.heap_free((*q).val, (*q).cap)
+}
+
+fn q_push(q: *mut Queue, c: usize, val: u8) {
+    if (*q).head == (*q).tail {
+        (*q).head = 0
+        (*q).tail = 0
+    }
+    if (*q).tail == (*q).cap {
+        if (*q).head >= (*q).cap / 2 {
+            // compact: move the live part to the front (forward copy, ranges may overlap)
+            var i: usize = 0
+            let live: usize = (*q).tail - (*q).head
+            while i < live {
+                rt.st32((*q).idx, i, rt.ld32((*q).idx, (*q).head + i))
+                rt.st8((*q).val, i, rt.ld8((*q).val, (*q).head + i))
+                i = i + 1
+            }
+            (*q).head = 0
+            (*q).tail = live
+        } else {
+            let ncap: usize = (*q).cap * 2
+            let ni: u64 = rt.heap_alloc(ncap * 4)
+            let nv: u64 = rt.heap_alloc(ncap)
+            rt.mem_copy(ni, (*q).idx, (*q).cap * 4)
+            rt.mem_copy(nv, (*q).val, (*q).cap)
+            rt.heap_free((*q).idx, (*q).cap * 4)
+            rt.heap_free((*q).val, (*q).cap)
+            (*q).idx = ni
+            (*q).val = nv
+            (*q).cap = ncap
+        }
+    }
+    rt.st32((*q).idx, (*q).tail, c as u32)
+    rt.st8((*q).val, (*q).tail, val)
+    (*q).tail = (*q).tail + 1
+}
+
+fn q_empty(q: *mut Queue) -> bool { return (*q).head == (*q).tail }
+
+fn q_pop_idx(q: *mut Queue) -> usize {
+    let c: usize = rt.ld32((*q).idx, (*q).head) as usize
+    return c
+}
+
+fn alloc_zero(n: usize) -> u64 {
+    let p: u64 = rt.heap_alloc(n)
+    rt.mem_set(p, 0 as u8, n)
+    return p
+}
+
+// Volume of sx*sy*sz cells, all air, no light (call light_full once the cells are filled).
+fn light_new(sx: i32, sy: i32, sz: i32) -> LightVol {
+    let n: usize = (sx as usize) * (sy as usize) * (sz as usize)
+    let nsx: i32 = (sx + 15) / 16
+    let nsy: i32 = (sy + 15) / 16
+    let nsz: i32 = (sz + 15) / 16
+    let nd: usize = (nsx as usize) * (nsy as usize) * (nsz as usize)
+    return LightVol {
+        sx: sx, sy: sy, sz: sz, n: n,
+        op: alloc_zero(n), emit: alloc_zero(n), sd: alloc_zero(n), sky: alloc_zero(n), blk: alloc_zero(n),
+        nsx: nsx, nsy: nsy, nsz: nsz, dirty: alloc_zero(nd),
+        qa: q_new(), qr: q_new(), touched: 0 as u64, ops: 0 as u64
+    }
+}
+
+fn light_free(v: *mut LightVol) {
+    rt.heap_free((*v).op, (*v).n)
+    rt.heap_free((*v).emit, (*v).n)
+    rt.heap_free((*v).sd, (*v).n)
+    rt.heap_free((*v).sky, (*v).n)
+    rt.heap_free((*v).blk, (*v).n)
+    rt.heap_free((*v).dirty, ((*v).nsx as usize) * ((*v).nsy as usize) * ((*v).nsz as usize))
+    q_free(&(*v).qa)
+    q_free(&(*v).qr)
+}
+
+// index of local cell (x, y, z): (y * sz + z) * sx + x
+fn light_idx(v: *mut LightVol, x: i32, y: i32, z: i32) -> usize {
+    return (((y as usize) * ((*v).sz as usize)) + (z as usize)) * ((*v).sx as usize) + (x as usize)
+}
+
+fn in_vol(v: *mut LightVol, x: i32, y: i32, z: i32) -> bool {
+    return x >= 0 && y >= 0 && z >= 0 && x < (*v).sx && y < (*v).sy && z < (*v).sz
+}
+
+// Sets the cell data only (bulk load); the caller runs light_full afterwards.
+fn light_set_raw(v: *mut LightVol, x: i32, y: i32, z: i32, op: u8, emit: u8) {
+    let c: usize = light_idx(v, x, y, z)
+    rt.st8((*v).op, c, op)
+    rt.st8((*v).emit, c, emit)
+}
+
+fn light_sky(v: *mut LightVol, x: i32, y: i32, z: i32) -> u8 {
+    if !in_vol(v, x, y, z) { return 15 as u8 }
+    return rt.ld8((*v).sky, light_idx(v, x, y, z))
+}
+
+fn light_block(v: *mut LightVol, x: i32, y: i32, z: i32) -> u8 {
+    if !in_vol(v, x, y, z) { return 0 as u8 }
+    return rt.ld8((*v).blk, light_idx(v, x, y, z))
+}
+
+fn light_get(v: *mut LightVol, x: i32, y: i32, z: i32) -> u8 {
+    if !in_vol(v, x, y, z) { return OUTSIDE_LIGHT }
+    let c: usize = light_idx(v, x, y, z)
+    return (rt.ld8((*v).sky, c) << 4 as u8) | rt.ld8((*v).blk, c)
+}
+
+fn light_counters(v: *mut LightVol) -> u64 { return (*v).touched }
+
+// ---- dirty sections ---------------------------------------------------------------------------------------------
+
+fn light_mark_section(v: *mut LightVol, sx: i32, sy: i32, sz: i32) {
+    if sx < 0 || sy < 0 || sz < 0 || sx >= (*v).nsx || sy >= (*v).nsy || sz >= (*v).nsz { return }
+    let d: usize = (((sy as usize) * ((*v).nsz as usize)) + (sz as usize)) * ((*v).nsx as usize) + (sx as usize)
+    rt.st8((*v).dirty, d, 1 as u8)
+}
+
+// The padded array of a neighbouring section reads this cell too when it lies on a section face.
+fn mark_cell(v: *mut LightVol, c: usize) {
+    let sxs: usize = (*v).sx as usize
+    let x: i32 = (c % sxs) as i32
+    let z: i32 = ((c / sxs) % ((*v).sz as usize)) as i32
+    let y: i32 = (c / (sxs * ((*v).sz as usize))) as i32
+    let bx: i32 = x >> 4
+    let by: i32 = y >> 4
+    let bz: i32 = z >> 4
+    var dx: i32 = 0
+    var dy: i32 = 0
+    var dz: i32 = 0
+    light_mark_section(v, bx, by, bz)
+    let lx: i32 = x & 15
+    let ly: i32 = y & 15
+    let lz: i32 = z & 15
+    var ax: i32 = 0
+    var ay: i32 = 0
+    var az: i32 = 0
+    if lx == 0 { ax = 0 - 1 }
+    if lx == 15 { ax = 1 }
+    if ly == 0 { ay = 0 - 1 }
+    if ly == 15 { ay = 1 }
+    if lz == 0 { az = 0 - 1 }
+    if lz == 15 { az = 1 }
+    // every non-empty subset of the touched axes (up to 7 neighbours)
+    dx = 0
+    while dx < 2 {
+        dy = 0
+        while dy < 2 {
+            dz = 0
+            while dz < 2 {
+                if dx + dy + dz > 0 {
+                    var ok: bool = true
+                    if dx == 1 && ax == 0 { ok = false }
+                    if dy == 1 && ay == 0 { ok = false }
+                    if dz == 1 && az == 0 { ok = false }
+                    if ok {
+                        light_mark_section(v, bx + dx * ax, by + dy * ay, bz + dz * az)
+                    }
+                }
+                dz = dz + 1
+            }
+            dy = dy + 1
+        }
+        dx = dx + 1
+    }
+}
+
+// Copies up to `max` dirty sections as (sx, sy, sz) i32 triples into `out` and clears them. Returns the count.
+fn light_take_dirty(v: *mut LightVol, out: u64, max: usize) -> usize {
+    var cnt: usize = 0
+    var sy: i32 = 0
+    while sy < (*v).nsy {
+        var sz: i32 = 0
+        while sz < (*v).nsz {
+            var sx: i32 = 0
+            while sx < (*v).nsx {
+                let d: usize = (((sy as usize) * ((*v).nsz as usize)) + (sz as usize)) * ((*v).nsx as usize) + (sx as usize)
+                if rt.ld8((*v).dirty, d) != 0 as u8 && cnt < max {
+                    rt.st32(out, cnt * 3, sx as u32)
+                    rt.st32(out, cnt * 3 + 1, sy as u32)
+                    rt.st32(out, cnt * 3 + 2, sz as u32)
+                    rt.st8((*v).dirty, d, 0 as u8)
+                    cnt = cnt + 1
+                }
+                sx = sx + 1
+            }
+            sz = sz + 1
+        }
+        sy = sy + 1
+    }
+    return cnt
+}
+
+// Padded 18^3 light of section (bx, by, bz): index (y * 18 + z) * 18 + x, section cell (cx, cy, cz) is padded (cx+1, cy+1, cz+1).
+fn light_pad_section(v: *mut LightVol, bx: i32, by: i32, bz: i32, out: u64) {
+    var y: i32 = 0
+    while y < 18 {
+        var z: i32 = 0
+        while z < 18 {
+            var x: i32 = 0
+            while x < 18 {
+                rt.st8(out, ((y * 18 + z) * 18 + x) as usize, light_get(v, bx * 16 + x - 1, by * 16 + y - 1, bz * 16 + z - 1))
+                x = x + 1
+            }
+            z = z + 1
+        }
+        y = y + 1
+    }
+}
+
+// ---- propagation ------------------------------------------------------------------------------------------------
+
+// Neighbour of cell c in direction d (0..5: -x +x -y +y -z +z) or -1 outside the volume.
+fn nbr(v: *mut LightVol, c: usize, d: i32) -> i64 {
+    let sxs: usize = (*v).sx as usize
+    let szs: usize = (*v).sz as usize
+    let plane: usize = sxs * szs
+    let x: usize = c % sxs
+    let z: usize = (c / sxs) % szs
+    let y: usize = c / plane
+    if d == 0 {
+        if x == 0 { return 0 - 1 as i64 }
+        return (c - 1) as i64
+    }
+    if d == 1 {
+        if x + 1 >= sxs { return 0 - 1 as i64 }
+        return (c + 1) as i64
+    }
+    if d == 2 {
+        if y == 0 { return 0 - 1 as i64 }
+        return (c - plane) as i64
+    }
+    if d == 3 {
+        if y + 1 >= ((*v).sy as usize) { return 0 - 1 as i64 }
+        return (c + plane) as i64
+    }
+    if d == 4 {
+        if z == 0 { return 0 - 1 as i64 }
+        return (c - sxs) as i64
+    }
+    if z + 1 >= szs { return 0 - 1 as i64 }
+    return (c + sxs) as i64
+}
+
+fn chan(v: *mut LightVol, ch: i32) -> u64 {
+    if ch == 0 { return (*v).sky }
+    return (*v).blk
+}
+
+fn base_of(v: *mut LightVol, ch: i32, c: usize) -> u8 {
+    if ch == 0 {
+        if rt.ld8((*v).sd, c) != 0 as u8 { return 15 as u8 }
+        return 0 as u8
+    }
+    return rt.ld8((*v).emit, c)
+}
+
+fn att_of(v: *mut LightVol, c: usize) -> u8 {
+    let o: u8 = rt.ld8((*v).op, c)
+    if o < 1 as u8 { return 1 as u8 }
+    return o
+}
+
+fn wr(v: *mut LightVol, lv: u64, c: usize, val: u8) {
+    rt.st8(lv, c, val)
+    (*v).touched = (*v).touched + 1 as u64
+    mark_cell(v, c)
+}
+
+// Add pass: every cell in the add queue spreads its light to the neighbours until nothing gets brighter.
+fn add_pass(v: *mut LightVol, ch: i32) {
+    let lv: u64 = chan(v, ch)
+    while !q_empty(&(*v).qa) {
+        let p: usize = q_pop_idx(&(*v).qa)
+        (*v).qa.head = (*v).qa.head + 1
+        let lp: u8 = rt.ld8(lv, p)
+        if lp > 1 as u8 {
+            var d: i32 = 0
+            while d < 6 {
+                let nn: i64 = nbr(v, p, d)
+                if nn >= 0 as i64 {
+                    let n: usize = nn as usize
+                    let a: u8 = att_of(v, n)
+                    if lp > a {
+                        let cand: u8 = lp - a
+                        if cand > rt.ld8(lv, n) {
+                            wr(v, lv, n, cand)
+                            q_push(&(*v).qa, n, 0 as u8)
+                        }
+                    }
+                }
+                d = d + 1
+            }
+        }
+    }
+}
+
+// Removal pass: cells whose light was derived from a removed value are zeroed (or fall back to their own base), the
+// remaining brighter neighbours become sources of the add pass.
+fn removal_pass(v: *mut LightVol, ch: i32) {
+    let lv: u64 = chan(v, ch)
+    while !q_empty(&(*v).qr) {
+        let p: usize = q_pop_idx(&(*v).qr)
+        let lp: u8 = rt.ld8((*v).qr.val, (*v).qr.head)
+        (*v).qr.head = (*v).qr.head + 1
+        var d: i32 = 0
+        while d < 6 {
+            let nn: i64 = nbr(v, p, d)
+            if nn >= 0 as i64 {
+                let n: usize = nn as usize
+                let ln: u8 = rt.ld8(lv, n)
+                if ln != 0 as u8 {
+                    let b: u8 = base_of(v, ch, n)
+                    if ln < lp && ln > b {
+                        // derived from the removed light: clear, it falls back to its own base (re-lit by the add pass)
+                        wr(v, lv, n, b)
+                        q_push(&(*v).qr, n, ln)
+                        if b != 0 as u8 { q_push(&(*v).qa, n, 0 as u8) }
+                    } else {
+                        q_push(&(*v).qa, n, 0 as u8)
+                    }
+                }
+            }
+            d = d + 1
+        }
+    }
+}
+
+// Repairs one channel after the cell data (op / emit / sd) of `cells` (u32 indexes) changed.
+fn relight_cells(v: *mut LightVol, ch: i32, cells: u64, ncells: usize) {
+    let lv: u64 = chan(v, ch)
+    var i: usize = 0
+    while i < ncells {
+        let c: usize = rt.ld32(cells, i) as usize
+        let old: u8 = rt.ld8(lv, c)
+        if old != 0 as u8 {
+            wr(v, lv, c, 0 as u8)
+            q_push(&(*v).qr, c, old)
+        }
+        i = i + 1
+    }
+    removal_pass(v, ch)
+    i = 0
+    while i < ncells {
+        let c: usize = rt.ld32(cells, i) as usize
+        let b: u8 = base_of(v, ch, c)
+        if b > rt.ld8(lv, c) {
+            wr(v, lv, c, b)
+        }
+        if rt.ld8(lv, c) != 0 as u8 { q_push(&(*v).qa, c, 0 as u8) }
+        // the neighbours feed the cell (its absorption changed): they are sources too
+        var d: i32 = 0
+        while d < 6 {
+            let nn: i64 = nbr(v, c, d)
+            if nn >= 0 as i64 {
+                if rt.ld8(lv, nn as usize) != 0 as u8 { q_push(&(*v).qa, nn as usize, 0 as u8) }
+            }
+            d = d + 1
+        }
+        i = i + 1
+    }
+    add_pass(v, ch)
+}
+
+// Sky-direct flags of the whole volume.
+fn compute_sd(v: *mut LightVol) {
+    var x: i32 = 0
+    while x < (*v).sx {
+        var z: i32 = 0
+        while z < (*v).sz {
+            var open: bool = true
+            var y: i32 = (*v).sy - 1
+            while y >= 0 {
+                let c: usize = light_idx(v, x, y, z)
+                if rt.ld8((*v).op, c) != 0 as u8 { open = false }
+                if open {
+                    rt.st8((*v).sd, c, 1 as u8)
+                } else {
+                    rt.st8((*v).sd, c, 0 as u8)
+                }
+                y = y - 1
+            }
+            z = z + 1
+        }
+        x = x + 1
+    }
+}
+
+// Full recompute (initial load, and the oracle of the tests): all light cleared, sources queued, one add pass per channel.
+fn light_full(v: *mut LightVol) {
+    compute_sd(v)
+    rt.mem_set((*v).sky, 0 as u8, (*v).n)
+    rt.mem_set((*v).blk, 0 as u8, (*v).n)
+    var ch: i32 = 0
+    while ch < 2 {
+        let lv: u64 = chan(v, ch)
+        var c: usize = 0
+        while c < (*v).n {
+            let b: u8 = base_of(v, ch, c)
+            if b != 0 as u8 {
+                rt.st8(lv, c, b)
+                q_push(&(*v).qa, c, 0 as u8)
+            }
+            c = c + 1
+        }
+        add_pass(v, ch)
+        ch = ch + 1
+    }
+    // everything may have changed
+    var s: usize = 0
+    let nd: usize = ((*v).nsx as usize) * ((*v).nsy as usize) * ((*v).nsz as usize)
+    while s < nd {
+        rt.st8((*v).dirty, s, 1 as u8)
+        s = s + 1
+    }
+}
+
+// Changes one cell and repairs the light incrementally. op 0..15, emit 0..15.
+fn light_set_block(v: *mut LightVol, x: i32, y: i32, z: i32, op: u8, emit: u8) {
+    if !in_vol(v, x, y, z) { return }
+    let c: usize = light_idx(v, x, y, z)
+    if rt.ld8((*v).op, c) == op && rt.ld8((*v).emit, c) == emit { return }
+    (*v).ops = (*v).ops + 1 as u64
+    // sky-direct before / after for this cell; the cells below it (while air) follow the cell
+    var above_open: bool = true
+    if y + 1 < (*v).sy { above_open = rt.ld8((*v).sd, light_idx(v, x, y + 1, z)) != 0 as u8 }
+    let sd_old: bool = rt.ld8((*v).sd, c) != 0 as u8
+    let sd_new: bool = above_open && op == 0 as u8
+    // collect the changed cells: the cell itself (block channel) and, if its sky-direct flag flips, the air column below it
+    let cap: usize = (*v).sy as usize + 1
+    let cells: u64 = rt.heap_alloc(cap * 4)
+    var nc: usize = 1
+    rt.st32(cells, 0, c as u32)
+    if sd_old != sd_new {
+        var yy: i32 = y - 1
+        while yy >= 0 {
+            let b: usize = light_idx(v, x, yy, z)
+            if rt.ld8((*v).op, b) != 0 as u8 { yy = 0 - 1 } else {
+                rt.st32(cells, nc, b as u32)
+                nc = nc + 1
+                yy = yy - 1
+            }
+        }
+    }
+    // mutate the cell data first (the repair reads only the new data and the OLD light arrays)
+    rt.st8((*v).op, c, op)
+    rt.st8((*v).emit, c, emit)
+    var k: usize = 0
+    while k < nc {
+        let b: usize = rt.ld32(cells, k) as usize
+        if sd_new { rt.st8((*v).sd, b, 1 as u8) } else { rt.st8((*v).sd, b, 0 as u8) }
+        k = k + 1
+    }
+    relight_cells(v, 0, cells, nc)
+    relight_cells(v, 1, cells, 1)
+    rt.heap_free(cells, cap * 4)
+    mark_cell(v, c)
+}
+
+// Compares the light arrays of two volumes of the same size. Returns the number of differing cells.
+fn light_equal(a: *mut LightVol, b: *mut LightVol) -> usize {
+    var diff: usize = 0
+    var c: usize = 0
+    while c < (*a).n {
+        if rt.ld8((*a).sky, c) != rt.ld8((*b).sky, c) || rt.ld8((*a).blk, c) != rt.ld8((*b).blk, c) { diff = diff + 1 }
+        c = c + 1
+    }
+    return diff
+}

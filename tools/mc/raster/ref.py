@@ -31,11 +31,14 @@ def parse(path):
             continue
         if t[0] == "scene":
             cur = dict(name=t[1], w=int(t[2]), h=int(t[3]), cull=t[4] == "1", fog=t[5] == "1",
-                       fs=f64(t[6]), fe=f64(t[7]), clear=int(t[8], 16), meshes=[], hash=None)
+                       fs=f64(t[6]), fe=f64(t[7]), clear=int(t[8], 16), meshes=[], hash=None,
+                       light=(256, 256, 224, 176))
             scenes.append(cur)
         elif t[0] == "cam":
             v = [f64(x) for x in t[1:]]
             cur["cam"] = dict(pos=v[0:3], right=v[3:6], up=v[6:9], fwd=v[9:12], near=v[12], tan_x=v[13], tan_y=v[14])
+        elif t[0] == "light":
+            cur["light"] = tuple(int(x) for x in t[1:5])    # day, tint r, g, b
         elif t[0] == "mesh":
             mesh = dict(o=[int(t[1]) - 1000000, int(t[2]) - 1000000, int(t[3]) - 1000000], verts=[], idx=[],
                         trans=len(t) > 6 and t[6] == "1")
@@ -53,6 +56,12 @@ def parse(path):
 
 
 FACE_K = [204, 204, 128, 256, 153, 153]
+LIGHT_MIN = 24
+
+
+def light_factor(s256, b256, tint):
+    lum = max(s256, (b256 * tint) // 256)
+    return LIGHT_MIN + (lum * (256 - LIGHT_MIN)) // 256
 
 
 class Scene:
@@ -105,7 +114,7 @@ class Scene:
                 wy = y + q[1]
                 wz = z + (0.0 - q[0] * ys + q[2] * yc)
                 vx, vy, vz = self.to_view(wx, wy, wz)
-                vs.append([vx, vy, vz, 0.0, 0.0, 3.0])
+                vs.append([vx, vy, vz, 0.0, 0.0, 3.0, 15.0, 0.0])
             fk = FACE_K[f]
             if f % 2 == 1:
                 self.triangle([vs[0][:], vs[1][:], vs[2][:]], 1, fk)
@@ -133,14 +142,15 @@ class Scene:
             y = float(oy + ((w0 >> 8) & 255))
             z = float(oz + ((w0 >> 16) & 255))
             vx, vy, vz = self.to_view(x, y, z)
-            vs.append([vx, vy, vz, float((w1 >> 16) & 255), float((w1 >> 24) & 255), float((w0 >> 27) & 3)])
+            vs.append([vx, vy, vz, float((w1 >> 14) & 31), float((w1 >> 19) & 31), float((w0 >> 27) & 3),
+                       float((w1 >> 24) & 15), float((w1 >> 28) & 15)])
         idx = mesh["idx"]
         n = len(mesh["verts"])
         for t in range(0, len(idx) - 2, 3):
             a, b, c = idx[t], idx[t + 1], idx[t + 2]
             if a < n and b < n and c < n:
                 w0, w1 = mesh["verts"][a]
-                self.triangle([vs[a][:], vs[b][:], vs[c][:]], w1 & 65535, FACE_K[(w0 >> 24) & 7])
+                self.triangle([vs[a][:], vs[b][:], vs[c][:]], w1 & 16383, FACE_K[(w0 >> 24) & 7])
 
     # ---- near clipping, Sutherland-Hodgman against z >= near
     def triangle(self, tri, tile, fk):
@@ -155,7 +165,7 @@ class Scene:
                 poly.append(p)
             if pin != qin:
                 s = (near - p[2]) / (q[2] - p[2])
-                o = [p[k] + (q[k] - p[k]) * s for k in range(6)]
+                o = [p[k] + (q[k] - p[k]) * s for k in range(8)]
                 o[2] = near
                 poly.append(o)
         if len(poly) >= 3:
@@ -187,6 +197,10 @@ class Scene:
         ua, ub, uc = va[3] * za, vb[3] * zb, vc[3] * zc
         vva, vvb, vvc = va[4] * za, vb[4] * zb, vc[4] * zc
         oa, ob, oc = va[5] * za, vb[5] * zb, vc[5] * zc
+        ka, kb, kc = va[6] * za, vb[6] * zb, vc[6] * zc
+        la, lb, lc = va[7] * za, vb[7] * zb, vc[7] * zc
+        day, tint_r, tint_g, tint_b = self.sc.get("light", (256, 256, 224, 176))
+        dayf = float(day)
         # edges (p -> q) opposite to vertex 0, 1, 2
         edges = [((bx, by), (cx, cy)), ((cx, cy), (ax, ay)), ((ax, ay), (bx, by))]
 
@@ -226,6 +240,8 @@ class Scene:
                 u = (f0 * ua + f1 * ub + f2 * uc) / s
                 v = (f0 * vva + f1 * vvb + f2 * vvc) / s
                 ao = (f0 * oa + f1 * ob + f2 * oc) / s
+                sk = (f0 * ka + f1 * kb + f2 * kc) / s
+                bk = (f0 * la + f1 * lb + f2 * lc) / s
                 tx = int(math.floor(u * T)) & (T - 1)
                 ty = int(math.floor(v * T)) & (T - 1)
                 if self.flat is not None:
@@ -237,9 +253,14 @@ class Scene:
                     continue
                 fq = min(256, max(0, int(math.floor(100.0 + 52.0 * ao))))
                 total = (fq * fk) // 256
-                r = ((tp & 255) * total) // 256
-                g = (((tp >> 8) & 255) * total) // 256
-                b = (((tp >> 16) & 255) * total) // 256
+                s256 = min(256, max(0, int(math.floor(sk * dayf / 15.0 + 0.5))))
+                b256 = min(256, max(0, int(math.floor(bk * 256.0 / 15.0 + 0.5))))
+                tr = (total * light_factor(s256, b256, tint_r)) // 256
+                tg = (total * light_factor(s256, b256, tint_g)) // 256
+                tb = (total * light_factor(s256, b256, tint_b)) // 256
+                r = ((tp & 255) * tr) // 256
+                g = (((tp >> 8) & 255) * tg) // 256
+                b = (((tp >> 16) & 255) * tb) // 256
                 if fog:
                     z = 1.0 / zinv
                     t = (z - self.sc["fs"]) / (self.sc["fe"] - self.sc["fs"])

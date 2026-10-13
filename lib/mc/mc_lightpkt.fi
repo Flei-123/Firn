@@ -1,0 +1,248 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_lightpkt.fi -- light data of the protocol (update_light packet, light tail of a 1.18+ map_chunk).
+//
+//   lightdata_decode_118(b, ld, with_pos)   1.18+ shape: [x z varint], 4 masks as counted i64 arrays (sky, block, empty sky,
+//                                           empty block), then sky arrays and block arrays: varint count (= bits set in the mask),
+//                                           each array varint length 2048 + 2048 octets. `with_pos` = update_light packet
+//                                           (starts with chunk x / z); the map_chunk tail has no position (call it at the masks).
+//   lightdata_decode_114(b, ld, trust_edges) 1.14 - 1.16.5 update_light: x z varint, [trustEdges bool, 1.16+], 4 masks as VARINT
+//                                           (int bitmasks), then per set bit of the sky mask / block mask one array
+//                                           (varint length 2048 + octets), no count prefix.
+//   lightdata_apply(vol, ld, cell_x0, cell_z0)  copy the arrays into a mc_light.LightVol: the 16x16 column of the chunk starts
+//                                           at volume cell (cell_x0, cell_z0); volume section s = mask bit s + 1 (bit 0 = the
+//                                           section below the world). Masked-empty sections become 0, absent sections stay as they are.
+// Mask bit i = section i - 1 counted from the lowest world section. A nibble array is 2048 octets, cell (x, y, z) of the
+// section at index (y * 16 + z) * 16 + x, the even index in the low nibble. Only the first 64 bits of a mask are kept (a
+// dimension has at most 26 + 2 sections in practice); a set bit above 63 is an error (BytesError::Range).
+import std.rt
+import std.bytes
+import mc.mc_light
+
+export {
+    LightData, lightdata_alloc, lightdata_release, lightdata_new, lightdata_free, lightdata_decode_118, lightdata_decode_114, lightdata_apply,
+    lightdata_sky_array, lightdata_block_array, popcount64, nibble_get,
+}
+
+struct LightData {
+    x: i32, z: i32,
+    sky_mask: u64, block_mask: u64, empty_sky: u64, empty_block: u64,
+    sky_n: usize, block_n: usize, // arrays held
+    sky: u64, // u8 [sky_n * 2048], arrays in ascending bit order
+    block: u64,
+}
+
+fn lightdata_new() -> LightData {
+    return LightData { x: 0, z: 0, sky_mask: 0 as u64, block_mask: 0 as u64, empty_sky: 0 as u64, empty_block: 0 as u64,
+        sky_n: 0, block_n: 0, sky: 0, block: 0 }
+}
+
+fn lightdata_size() -> usize {
+    var a: [LightData; 2] = [LightData { x: 0, z: 0, sky_mask: 0 as u64, block_mask: 0 as u64, empty_sky: 0 as u64,
+        empty_block: 0 as u64, sky_n: 0, block_n: 0, sky: 0, block: 0 }; 2]
+    return ((&a[1]) as u64 - (&a[0]) as u64) as usize
+}
+
+// A heap allocated LightData (the Chunk keeps a pointer); lightdata_release frees it with its arrays.
+fn lightdata_alloc() -> u64 {
+    let p: u64 = rt.heap_alloc(lightdata_size())
+    if p == 0 { return 0 }
+    let ld: *mut LightData = p as *mut LightData
+    *ld = lightdata_new()
+    return p
+}
+
+fn lightdata_release(p: u64) {
+    if p == 0 { return }
+    lightdata_free(p as *mut LightData)
+    rt.heap_free(p, lightdata_size())
+}
+
+fn lightdata_free(ld: *mut LightData) {
+    if (*ld).sky != 0 { rt.heap_free((*ld).sky, (*ld).sky_n * 2048) }
+    if (*ld).block != 0 { rt.heap_free((*ld).block, (*ld).block_n * 2048) }
+    (*ld).sky = 0
+    (*ld).block = 0
+    (*ld).sky_n = 0
+    (*ld).block_n = 0
+}
+
+fn popcount64(m: u64) -> usize {
+    var n: usize = 0
+    var v: u64 = m
+    while v != 0 as u64 {
+        v = v & (v - 1 as u64)
+        n = n + 1
+    }
+    return n
+}
+
+// Pointer to the array of section bit `bit` or 0 (bit not set in the mask).
+fn lightdata_sky_array(ld: *mut LightData, bit: i32) -> u64 {
+    if bit < 0 || bit > 63 { return 0 }
+    let m: u64 = (*ld).sky_mask
+    if ((m >> (bit as u64)) & 1 as u64) == 0 as u64 { return 0 }
+    let below: u64 = m & ((1 as u64 << (bit as u64)) - 1 as u64)
+    return (*ld).sky + (popcount64(below) as u64) * 2048 as u64
+}
+
+fn lightdata_block_array(ld: *mut LightData, bit: i32) -> u64 {
+    if bit < 0 || bit > 63 { return 0 }
+    let m: u64 = (*ld).block_mask
+    if ((m >> (bit as u64)) & 1 as u64) == 0 as u64 { return 0 }
+    let below: u64 = m & ((1 as u64 << (bit as u64)) - 1 as u64)
+    return (*ld).block + (popcount64(below) as u64) * 2048 as u64
+}
+
+fn nibble_get(arr: u64, i: usize) -> u8 {
+    let by: u8 = rt.ld8(arr, i >> 1)
+    if (i & 1) == 0 { return by & 15 as u8 }
+    return by >> 4 as u8
+}
+
+// A counted i64 array as one 64 bit mask; further longs must be zero.
+fn read_mask_long_array(b: *mut bytes.Bytes) -> BytesError!u64 {
+    let n: i32 = try bytes.get_varint(b)
+    if n < 0 || n > 4096 { return BytesError::Range }
+    var m: u64 = 0 as u64
+    var i: i32 = 0
+    while i < n {
+        let w: i64 = try bytes.get_i64(b)
+        if i == 0 { m = w as u64 } else {
+            if w != 0 as i64 { return BytesError::Range }
+        }
+        i = i + 1
+    }
+    return m
+}
+
+// `n` arrays of varint length 2048 + octets into one block of n * 2048 octets (returned; 0 when n == 0).
+fn read_arrays(b: *mut bytes.Bytes, n: usize) -> BytesError!u64 {
+    if n == 0 { return 0 as u64 }
+    if n > 64 { return BytesError::Range }
+    let out: u64 = rt.heap_alloc(n * 2048)
+    if out == 0 { return BytesError::Range }
+    var i: usize = 0
+    while i < n {
+        let l: i32 = bytes.get_varint(b) catch (0 - 1)
+        if l != 2048 {
+            rt.heap_free(out, n * 2048)
+            return BytesError::Range
+        }
+        let p: u64 = bytes.get_span(b, 2048) catch 0 as u64
+        if p == 0 {
+            rt.heap_free(out, n * 2048)
+            return BytesError::Underflow
+        }
+        rt.mem_copy(out + (i as u64) * 2048 as u64, p, 2048)
+        i = i + 1
+    }
+    return out
+}
+
+fn lightdata_decode_118(b: *mut bytes.Bytes, ld: *mut LightData, with_pos: bool) -> BytesError!bool {
+    lightdata_free(ld)
+    if with_pos {
+        (*ld).x = try bytes.get_varint(b)
+        (*ld).z = try bytes.get_varint(b)
+    }
+    (*ld).sky_mask = try read_mask_long_array(b)
+    (*ld).block_mask = try read_mask_long_array(b)
+    (*ld).empty_sky = try read_mask_long_array(b)
+    (*ld).empty_block = try read_mask_long_array(b)
+    let ns: i32 = try bytes.get_varint(b)
+    if ns < 0 || (ns as usize) != popcount64((*ld).sky_mask) { return BytesError::Range }
+    (*ld).sky = try read_arrays(b, ns as usize)
+    (*ld).sky_n = ns as usize
+    let nb: i32 = try bytes.get_varint(b)
+    if nb < 0 || (nb as usize) != popcount64((*ld).block_mask) { return BytesError::Range }
+    (*ld).block = try read_arrays(b, nb as usize)
+    (*ld).block_n = nb as usize
+    return true
+}
+
+fn lightdata_decode_114(b: *mut bytes.Bytes, ld: *mut LightData, trust_edges: bool) -> BytesError!bool {
+    lightdata_free(ld)
+    (*ld).x = try bytes.get_varint(b)
+    (*ld).z = try bytes.get_varint(b)
+    if trust_edges {
+        let _te: bool = try bytes.get_bool(b) // trustEdges only matters for the client's own light engine
+    }
+    let m0: i32 = try bytes.get_varint(b)
+    let m1: i32 = try bytes.get_varint(b)
+    let m2: i32 = try bytes.get_varint(b)
+    let m3: i32 = try bytes.get_varint(b)
+    (*ld).sky_mask = (m0 as u32) as u64
+    (*ld).block_mask = (m1 as u32) as u64
+    (*ld).empty_sky = (m2 as u32) as u64
+    (*ld).empty_block = (m3 as u32) as u64
+    let ns: usize = popcount64((*ld).sky_mask)
+    (*ld).sky = try read_arrays(b, ns)
+    (*ld).sky_n = ns
+    let nb: usize = popcount64((*ld).block_mask)
+    (*ld).block = try read_arrays(b, nb)
+    (*ld).block_n = nb
+    return true
+}
+
+// Copies the light of the packet into the volume (see the header). Returns the number of sections written.
+fn lightdata_apply(v: *mut mc_light.LightVol, ld: *mut LightData, cell_x0: i32, cell_z0: i32) -> usize {
+    var written: usize = 0
+    var s: i32 = 0
+    while s < (*v).nsy {
+        let bit: i32 = s + 1
+        var ch: i32 = 0
+        while ch < 2 {
+            var arr: u64 = 0
+            var empty: bool = false
+            var dst: u64 = (*v).sky
+            if ch == 0 {
+                arr = lightdata_sky_array(ld, bit)
+                empty = bit <= 63 && ((((*ld).empty_sky >> (bit as u64)) & 1 as u64) != 0 as u64)
+            } else {
+                arr = lightdata_block_array(ld, bit)
+                empty = bit <= 63 && ((((*ld).empty_block >> (bit as u64)) & 1 as u64) != 0 as u64)
+                dst = (*v).blk
+            }
+            if arr != 0 || empty {
+                var y: i32 = 0
+                while y < 16 {
+                    var z: i32 = 0
+                    while z < 16 {
+                        var x: i32 = 0
+                        while x < 16 {
+                            let cx: i32 = cell_x0 + x
+                            let cz: i32 = cell_z0 + z
+                            let cy: i32 = s * 16 + y
+                            if cx >= 0 && cz >= 0 && cx < (*v).sx && cz < (*v).sz && cy < (*v).sy {
+                                var val: u8 = 0 as u8
+                                if arr != 0 { val = nibble_get(arr, ((y * 16 + z) * 16 + x) as usize) }
+                                rt.st8(dst, mc_light.light_idx(v, cx, cy, cz), val)
+                            }
+                            x = x + 1
+                        }
+                        z = z + 1
+                    }
+                    y = y + 1
+                }
+                // dirty: this section and its neighbours (the padded arrays of the neighbours read the border cells)
+                var dx: i32 = 0 - 1
+                while dx <= 1 {
+                    var dz: i32 = 0 - 1
+                    while dz <= 1 {
+                        var dy: i32 = 0 - 1
+                        while dy <= 1 {
+                            mc_light.light_mark_section(v, ((cell_x0 >> 4) + dx), s + dy, ((cell_z0 >> 4) + dz))
+                            dy = dy + 1
+                        }
+                        dz = dz + 1
+                    }
+                    dx = dx + 1
+                }
+                written = written + 1
+            }
+            ch = ch + 1
+        }
+        s = s + 1
+    }
+    return written
+}

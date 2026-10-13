@@ -1,0 +1,168 @@
+// expect_exit: 0
+// mc_light: incremental sky + block light == full recompute after random edit sequences (fuzz, fixed seeds),
+// dirty sections cover every section whose padded light changed, and a few hand-computed values.
+import std.rt
+import mc.mc_light
+
+static mut RNG: u64 = 1
+
+fn rnd() -> u32 {
+    // xorshift64 (no overflowing arithmetic)
+    var x: u64 = RNG
+    x = x ^ (x << 13 as u64)
+    x = x ^ (x >> 7 as u64)
+    x = x ^ (x << 17 as u64)
+    RNG = x
+    return ((x >> 20 as u64) & 0x7FFFFFFF as u64) as u32
+}
+
+fn pick(n: u32) -> u32 { return rnd() % n }
+
+// one random cell kind: air, stone, water, leaves, torch, glowing stone
+fn random_kind(op: *mut u8, em: *mut u8) {
+    let k: u32 = pick(20)
+    *op = 0 as u8
+    *em = 0 as u8
+    if k >= 7 && k < 13 { *op = 15 as u8 }
+    if k >= 13 && k < 15 { *op = 2 as u8 }
+    if k == 15 { *op = 1 as u8 }
+    if k == 16 || k == 17 { *em = (8 + pick(8)) as u8 }
+    if k == 18 { *op = 15 as u8; *em = (1 + pick(15)) as u8 }
+}
+
+fn fill_random(v: *mut mc_light.LightVol, sx: i32, sy: i32, sz: i32) {
+    // heightfield terrain + random caves/lamps
+    var x: i32 = 0
+    while x < sx {
+        var z: i32 = 0
+        while z < sz {
+            let h: i32 = 6 + (pick(16)) as i32
+            var y: i32 = 0
+            while y < sy {
+                var op: u8 = 0 as u8
+                var em: u8 = 0 as u8
+                if y < h { op = 15 as u8 }
+                if y < h && pick(12) == 0 { op = 0 as u8 }
+                if pick(150) == 0 { em = (6 + pick(10)) as u8 }
+                mc_light.light_set_raw(v, x, y, z, op, em)
+                y = y + 1
+            }
+            z = z + 1
+        }
+        x = x + 1
+    }
+}
+
+fn copy_cells(dst: *mut mc_light.LightVol, src: *mut mc_light.LightVol) {
+    rt.mem_copy((*dst).op, (*src).op, (*src).n)
+    rt.mem_copy((*dst).emit, (*src).emit, (*src).n)
+}
+
+fn snapshot(v: *mut mc_light.LightVol, buf: u64) {
+    var s: i32 = 0
+    while s < 8 {
+        mc_light.light_pad_section(v, s & 1, (s >> 1) & 1, (s >> 2) & 1, buf + (s as u64) * 5832 as u64)
+        s = s + 1
+    }
+}
+
+fn fuzz(seed: u64, steps: i32) -> i32 {
+    RNG = seed
+    let n: i32 = 32
+    var a: mc_light.LightVol = mc_light.light_new(n, n, n)
+    var b: mc_light.LightVol = mc_light.light_new(n, n, n)
+    fill_random(&a, n, n, n)
+    copy_cells(&b, &a)
+    mc_light.light_full(&a)
+    mc_light.light_full(&b)
+    if mc_light.light_equal(&a, &b) != 0 { return 1 }
+    let before: u64 = rt.heap_alloc(8 * 5832)
+    let after: u64 = rt.heap_alloc(8 * 5832)
+    let dl: u64 = rt.heap_alloc(64 * 12)
+    let _c: usize = mc_light.light_take_dirty(&a, dl, 64) // clear the all-dirty flags of the initial full pass
+    var i: i32 = 0
+    var rc: i32 = 0
+    while i < steps && rc == 0 {
+        snapshot(&a, before)
+        // 1-3 edits per step; sometimes a whole column of edits (roof / shaft)
+        let ne: u32 = 1 as u32 + pick(3)
+        var e: u32 = 0 as u32
+        while e < ne {
+            var op: u8 = 0 as u8
+            var em: u8 = 0 as u8
+            random_kind(&op, &em)
+            mc_light.light_set_block(&a, pick(32) as i32, pick(32) as i32, pick(32) as i32, op, em)
+            e = e + 1 as u32
+        }
+        // oracle: same cells, full recompute
+        copy_cells(&b, &a)
+        mc_light.light_full(&b)
+        if mc_light.light_equal(&a, &b) != 0 { rc = 2 }
+        snapshot(&a, after)
+        let cnt: usize = mc_light.light_take_dirty(&a, dl, 64)
+        var seen: [u8; 8] = [0 as u8; 8]
+        var k: usize = 0
+        while k < cnt {
+            let sx: u32 = rt.ld32(dl, k * 3)
+            let sy: u32 = rt.ld32(dl, k * 3 + 1)
+            let sz: u32 = rt.ld32(dl, k * 3 + 2)
+            if sx < 2 as u32 && sy < 2 as u32 && sz < 2 as u32 { seen[(sx + sy * 2 as u32 + sz * 4 as u32) as usize] = 1 as u8 }
+            k = k + 1
+        }
+        var s: usize = 0
+        while s < 8 {
+            if !rt.mem_eq(before + (s as u64) * 5832 as u64, after + (s as u64) * 5832 as u64, 5832) && seen[s] == 0 as u8 { rc = 3 }
+            s = s + 1
+        }
+        i = i + 1
+    }
+    rt.heap_free(before, 8 * 5832)
+    rt.heap_free(after, 8 * 5832)
+    rt.heap_free(dl, 64 * 12)
+    mc_light.light_free(&a)
+    mc_light.light_free(&b)
+    return rc
+}
+
+fn hand_values() -> i32 {
+    // open sky, flat air column volume 16x16x16
+    var v: mc_light.LightVol = mc_light.light_new(16, 16, 16)
+    mc_light.light_full(&v)
+    if mc_light.light_sky(&v, 3, 0, 3) != 15 as u8 { return 1 }
+    // a roof block on the top: the cell below is lit by its neighbours only (15 - 1)
+    mc_light.light_set_block(&v, 5, 15, 5, 15 as u8, 0 as u8)
+    if mc_light.light_sky(&v, 5, 14, 5) != 14 as u8 { return 2 }
+    if mc_light.light_sky(&v, 5, 0, 5) != 14 as u8 { return 3 }
+    mc_light.light_set_block(&v, 5, 15, 5, 0 as u8, 0 as u8)
+    if mc_light.light_sky(&v, 5, 14, 5) != 15 as u8 || mc_light.light_sky(&v, 5, 0, 5) != 15 as u8 { return 4 }
+    // torch (emit 14) in open air: 14 at the source, 13 next to it, 11 at distance 3
+    mc_light.light_set_block(&v, 8, 8, 8, 0 as u8, 14 as u8)
+    if mc_light.light_block(&v, 8, 8, 8) != 14 as u8 { return 5 }
+    if mc_light.light_block(&v, 9, 8, 8) != 13 as u8 { return 6 }
+    if mc_light.light_block(&v, 8, 8, 11) != 11 as u8 { return 7 }
+    if mc_light.light_block(&v, 10, 9, 8) != 11 as u8 { return 8 }
+    // removing it clears everything
+    mc_light.light_set_block(&v, 8, 8, 8, 0 as u8, 0 as u8)
+    var c: usize = 0
+    while c < v.n {
+        if rt.ld8(v.blk, c) != 0 as u8 { return 9 }
+        c = c + 1
+    }
+    // water absorbs 2: a water block under open sky
+    mc_light.light_set_block(&v, 2, 15, 2, 2 as u8, 0 as u8)
+    if mc_light.light_sky(&v, 2, 14, 2) != 14 as u8 { return 10 }
+    mc_light.light_free(&v)
+    return 0
+}
+
+fn main() -> i32 {
+    let h: i32 = hand_values()
+    if h != 0 { return 100 + h }
+    var seed: u64 = 1 as u64
+    while seed <= 6 as u64 {
+        let r: i32 = fuzz(seed * 7919 as u64, 120)
+        if r != 0 { return 10 * (seed as i32) + r }
+        seed = seed + 1 as u64
+    }
+    return 0
+}

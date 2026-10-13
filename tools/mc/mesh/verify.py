@@ -3,13 +3,14 @@
 program, and verifies the mesh by BRUTE FORCE (its own face visibility, its own ambient occlusion):
 
   * the quads cover exactly the visible block faces, each exactly once (no hidden face, none missing);
-  * every cell of a quad has the quad's tile and the quad's four corner AO values;
+  * every cell of a quad has the quad's tile and the quad's four corner values (AO + smooth light: the
+    average of the non-opaque cells of the 2x2 patch in front of the face per corner, sky and block);
   * naive mode: one 1x1 quad per visible face; greedy mode: never more quads than naive;
   * the index buffer: 6 indices per quad into the quad's own 4 vertices, the diagonal joins the brighter
     pair of corners, and every triangle is wound counter-clockwise seen from outside.
 
 usage: verify.py <firn-prog> <workdir>
-       verify.py emit <mode> <seed> <out.bin>      write one padded input (for the benchmark)
+       verify.py emit <mode> <seed> <out.bin>      write one padded input + <out.bin>.l the light (for the benchmark)
 """
 import itertools, random, struct, subprocess, sys
 
@@ -89,6 +90,24 @@ def make(mode, seed):
 NEIGH = [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)]
 
 
+def make_light(mode, seed, kind):
+    """padded light array (sky << 4 | block per cell). 'noise' = independent random nibbles everywhere
+    (also in opaque / unknown cells: they must be ignored), 'smooth' = a smooth gradient, 'flat' = 15 / 0."""
+    r = random.Random(seed * 31 + 7)
+    lt = [0] * (N ** 3)
+    for y in range(N):
+        for z in range(N):
+            for x in range(N):
+                if kind == "noise":
+                    v = (r.randrange(16) << 4) | r.randrange(16)
+                elif kind == "smooth":
+                    v = (max(0, 15 - (y // 2) - (x // 6)) << 4) | max(0, 12 - abs(x - 8) - abs(z - 8) - abs(y - 8) // 2)
+                else:
+                    v = 0xF0
+                lt[idx(x, y, z)] = v
+    return lt
+
+
 def cell(a, p):
     return a[idx(*p)]
 
@@ -124,14 +143,44 @@ def ao_corner(a, nb, f, cu, cv):
     return 0 if (s1 and s2) else 3 - (s1 + s2 + c)
 
 
-def unit_ao(a, nb, f, use_ao):
-    if not use_ao:
-        return (3, 3, 3, 3)
-    return (ao_corner(a, nb, f, 0, 0), ao_corner(a, nb, f, 1, 0), ao_corner(a, nb, f, 1, 1), ao_corner(a, nb, f, 0, 1))
+def light_corner(a, lt, nb, f, cu, cv):
+    """(sky, block) of one corner: front cell + side cells + diagonal; opaque / unknown cells skipped, the
+    diagonal skipped when both sides are opaque; average rounded half up."""
+    axis = f // 2
+    ua, va = (axis + 1) % 3, (axis + 2) % 3
+    su = 1 if cu else -1
+    sv = 1 if cv else -1
+    def off(du, dv):
+        p = list(nb); p[ua] += du; p[va] += dv; return tuple(p)
+    def solid(p):
+        v = cell(a, p)
+        return v == UNKNOWN or (v < 32768 and OPAQUE[v])
+    cells = [nb]
+    pb, pc, pd = off(su, 0), off(0, sv), off(su, sv)
+    if not solid(pb): cells.append(pb)
+    if not solid(pc): cells.append(pc)
+    if not (solid(pb) and solid(pc)) and not solid(pd): cells.append(pd)
+    n = len(cells)
+    ss = sum(lt[idx(*p)] >> 4 for p in cells)
+    sb = sum(lt[idx(*p)] & 15 for p in cells)
+    return (2 * ss + n) // (2 * n), (2 * sb + n) // (2 * n)
 
 
-def run(prog, path, flags):
-    out = subprocess.run([prog, "mesh", path, str(flags)], capture_output=True, text=True, check=True).stdout.split("\n")
+def unit_ao(a, lt, nb, f, use_ao, use_light):
+    out = []
+    for cu, cv in ((0, 0), (1, 0), (1, 1), (0, 1)):
+        ao = ao_corner(a, nb, f, cu, cv) if use_ao else 3
+        s, b = light_corner(a, lt, nb, f, cu, cv) if use_light else (15, 0)
+        out.append((ao, s, b))
+    return tuple(out)
+
+
+def bright(c):
+    return max(c[1], c[2]) * (100 + 52 * c[0])
+
+
+def run(prog, path, flags, lpath):
+    out = subprocess.run([prog, "mesh", path, str(flags), lpath], capture_output=True, text=True, check=True).stdout.split("\n")
     head = out[0].split()
     stats = dict(kv.split("=") for kv in head[1:])
     quads = [tuple(map(int, l.split()[1:])) for l in out if l.startswith("Q ")]
@@ -139,8 +188,8 @@ def run(prog, path, flags):
     return {k: int(v) for k, v in stats.items()}, quads, tris
 
 
-def check(a, flags, res):
-    greedy, use_ao, cull = bool(flags & 1), bool(flags & 2), bool(flags & 4)
+def check(a, lt, flags, res):
+    greedy, use_ao, cull, use_light = bool(flags & 1), bool(flags & 2), bool(flags & 4), bool(flags & 16)
     stats, quads, tris = res
     want = {}
     for x in range(1, 17):
@@ -149,11 +198,12 @@ def check(a, flags, res):
                 for f in range(6):
                     v = visible(a, x, y, z, f, cull)
                     if v:
-                        want[(x, y, z, f)] = (v[0], unit_ao(a, v[1], f, use_ao))
+                        want[(x, y, z, f)] = (v[0], unit_ao(a, lt, v[1], f, use_ao, use_light))
     assert stats["nfaces"] == len(want), "nfaces %d != brute force %d" % (stats["nfaces"], len(want))
     assert stats["nquads"] == len(quads) and stats["nverts"] == 4 * len(quads) and stats["nidx"] == 6 * len(quads), "counts"
     seen = {}
-    for qi, (f, pc, u0, v0, w, h, tile, a0, a1, a2, a3) in enumerate(quads):
+    for qi, (f, pc, u0, v0, w, h, tile, *cvs) in enumerate(quads):
+        cvs = tuple(tuple(cvs[3 * k:3 * k + 3]) for k in range(4))
         assert w >= 1 and h >= 1 and 0 <= u0 and u0 + w <= 16 and 0 <= v0 and v0 + h <= 16, "quad out of range %r" % ((f, pc, u0, v0, w, h),)
         axis = f // 2
         ua, va = (axis + 1) % 3, (axis + 2) % 3
@@ -169,19 +219,21 @@ def check(a, flags, res):
                 seen[key] = qi
                 wt, wao = want[key]
                 assert wt == tile, "tile %d != %d at %r" % (tile, wt, key)
-                assert wao == (a0, a1, a2, a3), "AO %r != quad %r at %r" % (wao, (a0, a1, a2, a3), key)
+                assert wao == cvs, "corner values (ao, sky, block) %r != quad %r at %r" % (wao, cvs, key)
         if not greedy:
             assert (w, h) == (1, 1), "naive mode made a merged quad"
     assert len(seen) == len(want), "%d visible faces, %d covered" % (len(want), len(seen))
     assert len(tris) == 2 * len(quads)
-    for qi, (f, pc, u0, v0, w, h, tile, a0, a1, a2, a3) in enumerate(quads):
+    for qi, (f, pc, u0, v0, w, h, tile, *cvs) in enumerate(quads):
+        cvs = tuple(tuple(cvs[3 * k:3 * k + 3]) for k in range(4))
+        c0, c1, c2, c3 = cvs
         t1, t2 = tris[2 * qi], tris[2 * qi + 1]
         ids = set(t1) | set(t2)
         assert ids == set(range(4 * qi, 4 * qi + 4)), "triangles of quad %d use foreign vertices" % qi
         diag = set(t1) & set(t2)
         base = 4 * qi
-        want_diag = {base + 1, base + 3} if (a1 + a3 > a0 + a2) else {base + 0, base + 2}
-        assert diag == want_diag, "diagonal %r != %r (ao %r)" % (diag, want_diag, (a0, a1, a2, a3))
+        want_diag = {base + 1, base + 3} if (bright(c1) + bright(c3) > bright(c0) + bright(c2)) else {base + 0, base + 2}
+        assert diag == want_diag, "diagonal %r != %r (corners %r)" % (diag, want_diag, cvs)
         # winding: positions of the 4 corners (u,v) -> 3D, normal of each triangle vs the face normal
         axis = f // 2
         ua, va = (axis + 1) % 3, (axis + 2) % 3
@@ -202,6 +254,7 @@ def main():
     if sys.argv[1] == "emit":
         a = make(sys.argv[2], int(sys.argv[3]))
         open(sys.argv[4], "wb").write(struct.pack("<%dH" % len(a), *a))
+        open(sys.argv[4] + ".l", "wb").write(bytes(make_light(sys.argv[2], int(sys.argv[3]), "smooth")))
         return
     prog, work = sys.argv[1], sys.argv[2]
     modes = ["empty", "full", "checker", "random20", "random50", "random80", "mixed_unknown", "terrain", "single", "glass_blob", "layers"]
@@ -213,18 +266,22 @@ def main():
             path = "%s/in.bin" % work
             open(path, "wb").write(struct.pack("<%dH" % len(a), *a))
             counts = {}
-            for flags in range(8):
-                res = run(prog, path, flags)
+            lkind = "noise" if seed == 1 else "smooth"
+            lt = make_light(mode, seed, lkind)
+            lpath = "%s/in.l" % work
+            open(lpath, "wb").write(bytes(lt))
+            for flags in list(range(8)) + list(range(16, 24)):
+                res = run(prog, path, flags, lpath)
                 try:
-                    counts[flags] = check(a, flags, res)
+                    counts[flags] = check(a, lt, flags, res)
                 except AssertionError as e:
                     print("FAIL mode=%s seed=%d flags=%d: %s" % (mode, seed, flags, e)); sys.exit(1)
                 total += 1
             # greedy never needs more quads than naive for the same AO / cull setting
-            for f2 in (0, 2, 4, 6):
+            for f2 in (0, 2, 4, 6, 16, 18, 20, 22):
                 assert counts[f2 | 1][0] <= counts[f2][0], "greedy produced more quads than naive (%s)" % mode
                 assert counts[f2][0] == counts[f2][1], "naive quad count != visible faces"
-            print("  ok    %-14s seed %d: 8 flag combinations; quads naive/greedy (AO on): %d / %d for %d visible faces" % (mode, seed, counts[2][0], counts[3][0], counts[2][1]))
+            print("  ok    %-14s seed %d: 16 flag combinations (light=bit 16) (light %s); quads naive/greedy (AO on): %d / %d, with light %d / %d for %d visible faces" % (mode, seed, lkind, counts[2][0], counts[3][0], counts[18][0], counts[19][0], counts[2][1]))
     print("verified %d meshes against the brute force" % total)
 
 
