@@ -2190,6 +2190,16 @@ else
     echo "   SKIP (node or wat2wasm missing)"
 fi
 
+echo "== 140. TOCTOU: no compiler-invented loads on attacker-writable memory (snapshot read exactly once; x86-64, aarch64, wasm32, all build levels; mutation-proof) + std.mem.read_once (tools/toctou/check.sh, docs/SECURITY-TOCTOU.md) =="
+FIRNC="$FIRNC" bash tools/toctou/check.sh > "$WORK/toctou140.log" 2>&1 && F140RC=0 || F140RC=$?
+if [ "$F140RC" -eq 0 ]; then
+    ok
+    grep -E '^ +ok' "$WORK/toctou140.log" | sed 's/^/ /'
+else
+    bad "tools/toctou/check.sh failed (see .test-work/toctou140.log)"
+    grep -E 'FAIL' "$WORK/toctou140.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
