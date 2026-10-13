@@ -27,5 +27,5 @@ Cave culling pays off only where caves/tunnels hide big volumes; on a hilly surf
 
 ## Open
 - snapshot is serial (render thread, ~0.2 ms per section): a copy-on-write or per-column palette read on the worker would scale better.
-- incremental light: not built. Idea: propagate block/sky light per section from a queue, remesh only sections whose light changed.
+- light: see docs/mc/light.md ("Light in Stream / Render"): `stream_set_light`, region volume + Chunk.light, `stream_light_sync` after edits. Moving region and update_light wiring open.
 - GL path uses stream_frame through mc_backend (not measured on a real GPU).

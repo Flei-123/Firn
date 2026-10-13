@@ -28,7 +28,20 @@ Measured (llvmpipe box, 64^3 terrain, release): full recompute 47 ms (262144 cel
 ## Light from packets (lib/mc/mc_lightpkt.fi)
 `lightdata_decode_118` (update_light 1.18+ with position; also the light tail of a 1.18+ map_chunk without position), `lightdata_decode_114` (1.14 - 1.16.5 update_light, int masks, no count prefix). Mask bit i = section i-1 (bit 0 = section below the world), arrays 2048 octets, even cell index in the low nibble. `lightdata_apply(vol, ld, cell_x0, cell_z0)` copies the arrays into a LightVol (volume section s = bit s+1; masked-empty = 0; absent sections untouched) and marks sections dirty. `mc_chunk.scratch_set_keep_light(sc, true)` keeps the light of a 1.18+ column in `Chunk.light` (default off: counts + hash only, memory). Test tests/2832_mc_light_packet.fi (hand-built packets; no live server fixture yet).
 
+## Light in Stream / Render (lib/mc/mc_wlight.fi, mc-s1)
+`mc_wlight.WorldLight` = light source of a chunk based world. Per padded cell the first source that knows it wins:
+1. **region volume** (`wl_region_load(wl, world, cx0, cz0, ncx, ncz, from_packets)`): a `mc_light.LightVol` over ncx x ncz columns, cell data from the block ids (`wl_set_tables` / `wl_set_tables_registry`: filterLight / emitLight per state id), light = `light_full`, then (from_packets) the `Chunk.light` arrays overwrite the computed values. 5 octets per cell (7x7 columns x 6 sections = 1.5 MB, 9x9 x 24 sections = 40 MB: size the region to the near ring).
+2. **Chunk.light** (`LightData` of a 1.18+ map_chunk with `scratch_set_keep_light`, or filled from update_light): bit q+1 = section q; array missing + not in the empty mask = sky 15 / block 0, empty mask = 0.
+3. unknown = 0xF0 (sky 15, block 0): column not loaded, no light data, section out of range.
+`wl_pad(wl, chunks[9], cx, sy, cz, out)` builds the u8 [5832] pad and returns false when nothing but defaults was seen: stream / wr then mesh WITHOUT F_LIGHT (identical vertices, cheaper) - so a world without light data renders byte identical to before (test D).
+* Stream: `stream_set_light(s, true, &wl)` (remeshes loaded columns), the snapshot (render thread) fills `R_LPAD` of the job record, `mesh_one` calls `mesh_padded_lit(.. | F_LIGHT)` when `R_LIT`. `stream_set_daylight(s, b, day)` -> `Backend.set_light` (CPU raster_set_light, GL glbe_set_light / glweb_set_light) each frame with `mc_sky.daylight`; no remesh.
+* mc_render_world: `wr_set_light(wr, &wl)`, `wr_set_daylight(b, day)`, `wr_mark_section`, `wr_light_sync`.
+* Edits: `wl_edit(wl, world, x, y, z, id)` = `mc_blockset.world_set_block` + `light_set_block` (incremental); then `stream_mark_block` (block shell) and `stream_light_sync(s)` / `wr_light_sync(wr)` (dirty light sections from `wl_take_dirty`) before the next frame.
+* Tests: tests/2885_mc_stream_light.fi (stream inline / 4 workers, wr, Chunk.light only, no light data, edit; all images == reference built from `light_pad_section` + `mesh_padded_lit`; fixed day / night hashes; incremental volume == full recompute after an edit).
+* Live: `MC_KEEP_LIGHT=1` makes demos/mcclient keep Chunk.light and print `LIGHTKEPT ok=N bad=M` (kept arrays hash == packet octets hash; the dump hash itself is compared with prismarine by tools/mcclient/run.sh).
+
 ## Not done yet (roadmap)
-* mc_render_world / mc_stream still mesh without F_LIGHT: stream snapshots need a light pad per job (from Chunk.light / a LightVol per loaded region), `raster_set_light(day)` from mc_sky.daylight.
-* Live check of the light arrays against a real 1.16.5 / 1.20.1 server (tools/mcclient/compare); update_light for 1.14/1.15/1.17 variants.
+* update_light (separate packet) is decoded (mc_lightpkt) but not wired into mc_client / the demo: 1.14 - 1.17 columns get no Chunk.light yet, so they render with sky 15 until the packet handler fills it.
+* A moving region (re-centre on the camera) does not exist; the region is loaded once.
 * GL rendering of the lit scenes is not compared with the CPU image (only the default light).
+* No live image check against a real client; llvmpipe/CPU only.
