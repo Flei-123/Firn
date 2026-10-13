@@ -149,6 +149,11 @@ struct Options {
     /// `-c` / `--object`: only assemble, do NOT link (round 52).
     /// Always on under the `kernel` profile anyway (SPEC §2: target is ELF object code).
     only_object: bool,
+    /// `--shared`: `--pic -c` plus the `ld -shared` step, one command for a
+    /// C-ABI shared object (x86-64 Linux). Exports = the `#[export_c]` functions.
+    shared: bool,
+    /// `--header=<file>`: write the C header of the `#[export_c]` functions.
+    header: Option<String>,
     /// **ROUND 82** — `--timings`: wall clock per phase to stderr.
     timings: bool,
     /// `--deps-out=<file>`: after the modules are resolved, write the
@@ -258,6 +263,9 @@ fn usage() -> String {
                                 packed by tools/android/build.sh)\n  \
          --win-subsystem=<s> console (default) | windows (no console window)\n  \
          --pic              position independent (shared library, round MOBIL)\n  \
+         --shared           C-ABI shared object in ONE step (x86-64 Linux): --pic -c + ld -shared,\n  \
+                            exports = the #[export_c] functions; -o lib.so\n  \
+         --header=<file>    write the C header (.h) of the #[export_c] functions\n  \
          --cpu=<level>      baseline (default, SSE2) | avx (three operand form)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
@@ -300,6 +308,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut stats = false;
     let mut optcfg = opt::OptConfig::default();
     let mut only_object = false;
+    let mut shared = false;
+    let mut header: Option<String> = None;
     let mut timings = false;
     let mut deps_out: Option<String> = None;
     let mut test_mode = false;
@@ -372,6 +382,13 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 }
             }
             "-c" | "--object" => only_object = true,
+            "--shared" => {
+                shared = true;
+                only_object = true;
+                target::pic_set(true);
+                target::shared_set(true);
+            }
+            _ if a.starts_with("--header=") => header = Some(a["--header=".len()..].to_string()),
             _ if a.starts_with("--profile=") => {
                 if let Err(e) = prof::flag_set(&a["--profile=".len()..]) {
                     return Err(e);
@@ -519,6 +536,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         stats,
         optcfg,
         only_object,
+        shared,
+        header,
         timings,
         deps_out,
         test_mode,
@@ -1165,6 +1184,17 @@ fn run(opts: &Options) -> i32 {
     };
 
     tm.mark("codegen");
+    if let Some(h) = &opts.header {
+        let stem = Path::new(h).file_stem().and_then(|x| x.to_str()).unwrap_or("firn");
+        let guard: String = format!("FIRN_{}_H", stem)
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+            .collect();
+        if let Err(e) = std::fs::write(h, extfn::header_text(&guard).as_bytes()) {
+            eprintln!("error: cannot write '{}': {}", h, e);
+            return 2;
+        }
+    }
     let out = opts
         .output
         .clone()
@@ -1201,6 +1231,25 @@ fn run(opts: &Options) -> i32 {
     if object {
         // Without `-o` the result is called `<input>.o`; with `-o` exactly as
         // written there (the name may then stay without a suffix).
+        if opts.shared {
+            let so = match &opts.output {
+                Some(p) => p.clone(),
+                None => out.with_extension("so"),
+            };
+            let obj_path = so.with_extension("o");
+            if let Err(code) = assemble(&asm_path, &obj_path) {
+                return code;
+            }
+            if !opts.keep_asm {
+                let _ = std::fs::remove_file(&asm_path);
+            }
+            let r = link_shared(&obj_path, &so);
+            let _ = std::fs::remove_file(&obj_path);
+            return match r {
+                Ok(()) => 0,
+                Err(code) => code,
+            };
+        }
         let obj_path = match &opts.output {
             Some(p) => p.clone(),
             None => out.with_extension("o"),
@@ -1322,6 +1371,54 @@ fn default_output(input: &Path) -> PathBuf {
 }
 
 /// Assemble only (`as --64 -o x.o x.s`) — the freestanding output.
+/// `--shared`: link the object into a C-ABI shared object. Only the
+/// `#[export_c]` symbols are visible (version script), calls inside the
+/// library never go through the PLT (`-Bsymbolic`).
+fn link_shared(obj: &Path, so: &Path) -> Result<(), i32> {
+    let t = target::active();
+    if !matches!(t, target::Target::X86_64) || target::windows() || target::android() {
+        eprintln!("error: --shared builds an x86-64 Linux shared object only");
+        return Err(2);
+    }
+    let names = extfn::export_names();
+    if names.is_empty() {
+        eprintln!("error: --shared: no #[export_c] function in the program");
+        return Err(2);
+    }
+    let ver = so.with_extension("ver");
+    let script = format!("{{ global: {}; local: *; }};\n", names.join("; "));
+    if let Err(e) = std::fs::write(&ver, script.as_bytes()) {
+        eprintln!("error: cannot write '{}': {}", ver.display(), e);
+        return Err(2);
+    }
+    let soname = so.file_name().and_then(|x| x.to_str()).unwrap_or("libfirn.so").to_string();
+    let mut cmd = Command::new(t.linker());
+    cmd.arg("-shared")
+        .arg("-Bsymbolic")
+        .arg(format!("--version-script={}", ver.display()))
+        .args(["-z", "noexecstack", "-soname"])
+        .arg(&soname)
+        .arg("-o")
+        .arg(so)
+        .arg(obj);
+    for l in extfn::link_libs() {
+        cmd.arg(extfn::link_lib_arg(&l));
+    }
+    let res = cmd.status();
+    let _ = std::fs::remove_file(&ver);
+    match res {
+        Ok(s) if s.success() => Ok(()),
+        Ok(_) => {
+            eprintln!("error: the linker failed");
+            Err(3)
+        }
+        Err(e) => {
+            eprintln!("error: cannot start '{}': {}", t.linker(), e);
+            Err(3)
+        }
+    }
+}
+
 fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
     let t = target::active();
     // ROUND KODIERER: the own way -- no process, no `as`.

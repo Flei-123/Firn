@@ -699,7 +699,7 @@ impl<'a> Checker<'a> {
                 // and nobody who would take an exit code — only an object
                 // file that a boot loader or a linker script pulls into
                 // place.
-                if crate::prof::is_kernel() {
+                if crate::prof::is_kernel() || crate::target::shared() {
                     return;
                 }
                 self.dg.error_note(
