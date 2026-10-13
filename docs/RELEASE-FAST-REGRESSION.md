@@ -93,3 +93,12 @@ Fix `compiler/src/regalloc.rs` (Sqrt/Bits stay in the register path) built and v
 * The pixel loop's `divsd` (zinv = sum / area2f, u/v/ao = (...) / sum) stay: replacing three `/ sum` by one `1/sum` and multiplies changes the
   rounding (floor of u*tsz can flip), so the images would no longer match `ref.py` bit for bit. The compiler may not do it (IEEE); it is a
   renderer algorithm change that needs an explicit tolerance decision (see MC-FLOATS section 3).
+
+## 7. r481: tests/2813 SIGFPE at release-fast was a phi-elimination bug (13.10.2026)
+
+* NOT bounds/div checks and not RFAST: `dur` can never be 0 (parser clamps to >= 1). The copies of two phi edges of one
+  block (`brcond bb2, bb3`, phis in both, after inlining + loop rotation) were appended one edge after the other; the
+  first overwrote `%393` that the second still read -> index e+1 -> duration slot 0 -> `div` trap.
+* Fix: `phi.rs::split_hazard_edges` splits those edges (only when a written phi value is live into / copied by the other
+  successor). 4 splits in 2813, 0 in 2753/2763 (bit-identical code there). Debug: `FIRN_PHI_SPLIT_DEBUG=1` lists splits,
+  `FIRN_NO_PHI_SPLIT=1` switches the fix off. Regression: tests/2873.
