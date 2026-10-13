@@ -28,10 +28,10 @@
 #   python3 tools/fui/pinyin_table.py > lib/fui/pinyin.fi
 import bz2, re, sys, unicodedata, collections
 
-QUELLE = "/usr/share/unicode/"
+SOURCE = "/usr/share/unicode/"
 
 def lies(name):
-    with bz2.open(QUELLE + name, "rt", encoding="utf-8") as f:
+    with bz2.open(SOURCE + name, "rt", encoding="utf-8") as f:
         for z in f:
             if not z.startswith("#") and z.strip():
                 yield z.rstrip("\n").split("\t")
@@ -39,39 +39,39 @@ def lies(name):
 # Which characters are the TRADITIONAL form of another? They have
 # a kSimplifiedVariant that points to another character.
 traditionell = set()
-for cp, feld, wert in lies("Unihan_Variants.txt.bz2"):
-    if feld == "kSimplifiedVariant":
-        eigen = cp
-        if any(v.split("<")[0] != eigen for v in wert.split()):
+for cp, field, val in lies("Unihan_Variants.txt.bz2"):
+    if field == "kSimplifiedVariant":
+        own = cp
+        if any(v.split("<")[0] != own for v in val.split()):
             traditionell.add(chr(int(cp[2:], 16)))
 
 silben = collections.defaultdict(dict)
-for cp, feld, wert in lies("Unihan_Readings.txt.bz2"):
-    if feld != "kHanyuPinlu":
+for cp, field, val in lies("Unihan_Readings.txt.bz2"):
+    if field != "kHanyuPinlu":
         continue
     z = chr(int(cp[2:], 16))
-    for m in re.finditer(r"(\S+?)\((\d+)\)", wert):
-        lesung, zahl = m.group(1), int(m.group(2))
+    for m in re.finditer(r"(\S+?)\((\d+)\)", val):
+        lesung, number = m.group(1), int(m.group(2))
         d = unicodedata.normalize("NFD", lesung).replace("ü", "v")
         d = "".join(c for c in d if not unicodedata.combining(c))
         if not re.fullmatch("[a-z]+", d):
             sys.exit("unerwartete Lesung %r bei %s" % (lesung, cp))
-        silben[d][z] = max(silben[d].get(z, 0), zahl)
+        silben[d][z] = max(silben[d].get(z, 0), number)
 
 # Each row of the table is ONE initial letter; an entry is
 # "syllable:character" and ends with a space. All characters lie
 # in the basic plane and are three bytes long in UTF-8 -- ime.fi relies
 # on that, and tools/fui/ime_main.fi checks it.
-zeilen = collections.defaultdict(list)
+rows = collections.defaultdict(list)
 for s in sorted(silben):
     zs = sorted(silben[s], key=lambda c: (-silben[s][c], c in traditionell, c))
     for c in zs:
         if len(c.encode("utf-8")) != 3:
             sys.exit("Zeichen %r ist nicht drei Bytes lang" % c)
-    zeilen[s[0]].append(s + ":" + "".join(zs) + " ")
+    rows[s[0]].append(s + ":" + "".join(zs) + " ")
 
 n_silben = len(silben)
-n_zeichen = sum(len(v) for v in silben.values())
+n_chars = sum(len(v) for v in silben.values())
 
 aus = sys.stdout
 aus.write("""// SPDX-License-Identifier: MPL-2.0
@@ -105,13 +105,13 @@ export {
 const PY_SILBEN: usize = %d
 const PY_ZEICHEN: usize = %d
 
-""" % (n_silben, n_zeichen, n_silben, n_zeichen))
+""" % (n_silben, n_chars, n_silben, n_chars))
 
-buchstaben = sorted(zeilen)
+buchstaben = sorted(rows)
 for b in buchstaben:
-    text = "".join(zeilen[b])
-    laenge = len(text.encode("utf-8"))
-    aus.write("static PY_%s: [u8; %d] = \"%s\"\n" % (b.upper(), laenge, text))
+    text = "".join(rows[b])
+    length = len(text.encode("utf-8"))
+    aus.write("static PY_%s: [u8; %d] = \"%s\"\n" % (b.upper(), length, text))
 
 aus.write("""
 // THE BLOCK OF AN INITIAL LETTER. The pointer to the row comes back
@@ -120,8 +120,8 @@ aus.write("""
 fn py_block(b: u8, n: *mut usize) -> u64 {
 """)
 for b in buchstaben:
-    text = "".join(zeilen[b])
-    laenge = len(text.encode("utf-8"))
+    text = "".join(rows[b])
+    length = len(text.encode("utf-8"))
     aus.write("    if b == %d as u8 {\n        *n = %d\n        return (&PY_%s[0]) as u64\n    }\n"
-              % (ord(b), laenge, b.upper()))
+              % (ord(b), length, b.upper()))
 aus.write("    *n = 0\n    return 0\n}\n")

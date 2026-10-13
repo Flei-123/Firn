@@ -26,15 +26,15 @@
 #     python3 tools/fui/x11_capture.py [target=testdata/x11] [display=61]
 import os, socket, struct, subprocess, sys, time
 
-ZIEL = sys.argv[1] if len(sys.argv) > 1 else "testdata/x11"
+TARGET = sys.argv[1] if len(sys.argv) > 1 else "testdata/x11"
 ANZ = sys.argv[2] if len(sys.argv) > 2 else "61"
-os.makedirs(ZIEL, exist_ok=True)
+os.makedirs(TARGET, exist_ok=True)
 env = dict(os.environ, DISPLAY=":" + ANZ)
 env.pop("XAUTHORITY", None)
 
 
-def schreibe(name, data):
-    with open(os.path.join(ZIEL, name), "wb") as f:
+def emit(name, data):
+    with open(os.path.join(TARGET, name), "wb") as f:
         f.write(data)
 
 
@@ -49,16 +49,16 @@ xvfb = subprocess.Popen(["Xvfb", ":" + ANZ, "-screen", "0", "1400x900x24",
                          "-dpi", "96", "-nolisten", "tcp"],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:
-    pfad = "/tmp/.X11-unix/X" + ANZ
+    fpath = "/tmp/.X11-unix/X" + ANZ
     for _ in range(100):
-        if os.path.exists(pfad):
+        if os.path.exists(fpath):
             break
         time.sleep(0.05)
     time.sleep(0.3)
     if xvfb.poll() is not None:
         raise SystemExit("Xvfb :%s ist nicht gestartet" % ANZ)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.connect(pfad)
+    s.connect(fpath)
 
     def lies(n):
         b = b""
@@ -71,9 +71,9 @@ try:
 
     # Connection setup without authorisation (Xvfb without -auth).
     s.sendall(struct.pack("<BxHHHHxx", 0x6C, 11, 0, 0, 0))
-    kopf = lies(8)
-    setup = kopf + lies(struct.unpack_from("<H", kopf, 6)[0] * 4)
-    schreibe("setup.bin", setup)
+    head = lies(8)
+    setup = head + lies(struct.unpack_from("<H", head, 6)[0] * 4)
+    emit("setup.bin", setup)
     id_base, id_mask = struct.unpack_from("<II", setup, 12)
     vlen = struct.unpack_from("<H", setup, 24)[0]
     nfmt = setup[29]
@@ -102,15 +102,15 @@ try:
         s.sendall(struct.pack("<BxH", 119, 1))
         return antwort()
 
-    schreibe("keymap_us.bin", keymap())
-    schreibe("modmap_us.bin", modmap())
-    schreibe("xmodmap_us.txt", subprocess.run(["xmodmap", "-pke"], env=env,
+    emit("keymap_us.bin", keymap())
+    emit("modmap_us.bin", modmap())
+    emit("xmodmap_us.txt", subprocess.run(["xmodmap", "-pke"], env=env,
              capture_output=True).stdout)
     subprocess.run(["setxkbmap", "de"], env=env, check=True)
     time.sleep(0.2)
-    schreibe("keymap_de.bin", keymap())
-    schreibe("modmap_de.bin", modmap())
-    schreibe("xmodmap_de.txt", subprocess.run(["xmodmap", "-pke"], env=env,
+    emit("keymap_de.bin", keymap())
+    emit("modmap_de.bin", modmap())
+    emit("xmodmap_de.txt", subprocess.run(["xmodmap", "-pke"], env=env,
              capture_output=True).stdout)
     subprocess.run(["setxkbmap", "us"], env=env, check=True)
     time.sleep(0.2)
@@ -118,13 +118,13 @@ try:
     subprocess.run(["xrdb", "-merge"], input=b"Xft.dpi: 144\n", env=env,
                    check=True)
     s.sendall(struct.pack("<BBHIIIII", 20, 0, 6, root, 23, 0, 0, 16384))
-    schreibe("resman.bin", antwort())
+    emit("resman.bin", antwort())
 
     # A window at (0,0), 200x100, with all events that x11.fi reads.
     wid = id_base | 1
-    maske = (1 | 2 | 4 | 8 | 16 | 32 | 64 | 32768 | 131072)
+    mask = (1 | 2 | 4 | 8 | 16 | 32 | 64 | 32768 | 131072)
     s.sendall(struct.pack("<BBHIIhhHHHHIIII", 1, 24, 10, wid, root, 0, 0,
-                          200, 100, 0, 1, root_visual, 2050, 0xFFFFFF, maske))
+                          200, 100, 0, 1, root_visual, 2050, 0xFFFFFF, mask))
     # WM_PROTOCOLS / WM_DELETE_WINDOW: fetch the atoms like x11.fi.
     def atom(name):
         nb = name.encode()
@@ -137,13 +137,13 @@ try:
     s.sendall(struct.pack("<BxHI", 8, 2, wid))  # MapWindow
     s.settimeout(3.0)
     ereignisse = []
-    namen = []
+    names_ = []
 
-    def sammle(name, bis_code, warte=2.0):
+    def gather(name, bis_code, wait_for=2.0):
         # Reads events until one with `bis_code` came; all are kept,
         # but only the first matching one gets the name.
-        ende = time.time() + warte
-        while time.time() < ende:
+        end_pos = time.time() + wait_for
+        while time.time() < end_pos:
             b = lies(32)
             code = b[0] & 127
             if code == 1:
@@ -151,49 +151,49 @@ try:
                 continue
             if code == bis_code:
                 ereignisse.append(b)
-                namen.append(name)
+                names_.append(name)
                 return b
         raise SystemExit("kein Ereignis %d fuer %s" % (bis_code, name))
 
-    sammle("expose", 12)
+    gather("expose", 12)
     time.sleep(0.2)
 
     def xdo(*a):
         subprocess.run(["xdotool"] + list(a), env=env, check=True)
 
     xdo("mousemove", "50", "40")
-    sammle("motion 50 40", 6)
+    gather("motion 50 40", 6)
     xdo("click", "1")
-    sammle("buttonpress 1", 4)
-    sammle("buttonrelease 1", 5)
+    gather("buttonpress 1", 4)
+    gather("buttonrelease 1", 5)
     xdo("click", "5")
-    sammle("buttonpress 5", 4)
-    sammle("buttonrelease 5", 5)
+    gather("buttonpress 5", 4)
+    gather("buttonrelease 5", 5)
     xdo("key", "a")
-    sammle("keypress a", 2)
-    sammle("keyrelease a", 3)
+    gather("keypress a", 2)
+    gather("keyrelease a", 3)
     xdo("key", "shift+a")
-    sammle("keypress shift", 2)
-    sammle("keypress shift+a", 2)
+    gather("keypress shift", 2)
+    gather("keypress shift+a", 2)
     xdo("key", "Tab")
-    sammle("keypress Tab", 2)
+    gather("keypress Tab", 2)
     xdo("key", "Escape")
-    sammle("keypress Escape", 2)
+    gather("keypress Escape", 2)
     xdo("mousemove", "600", "500")
-    sammle("leave", 8)
+    gather("leave", 8)
     xdo("mousemove", "20", "30")
-    sammle("enter", 7)
+    gather("enter", 7)
     # Fenstergroesse aendern: ConfigureWindow(12), Maske Breite|Hoehe.
     s.sendall(struct.pack("<BxHIHxxII", 12, 5, wid, 4 | 8, 320, 240))
-    sammle("configure 320x240", 22)
+    gather("configure 320x240", 22)
     # Closing, as a window manager does it: SendEvent(25) with a
     # ClientMessage(33) WM_PROTOCOLS / WM_DELETE_WINDOW to the window.
     cm = struct.pack("<BBHIII", 33, 32, 0, wid, a_prot, a_del) + b"\0" * 16
     s.sendall(struct.pack("<BBHII", 25, 0, 11, wid, 0) + cm)
-    sammle("clientmessage delete", 33)
-    schreibe("events.bin", b"".join(ereignisse))
-    with open(os.path.join(ZIEL, "events.txt"), "w") as f:
-        for i, n in enumerate(namen):
+    gather("clientmessage delete", 33)
+    emit("events.bin", b"".join(ereignisse))
+    with open(os.path.join(TARGET, "events.txt"), "w") as f:
+        for i, n in enumerate(names_):
             f.write("%d %s\n" % (i, n))
         f.write("atom WM_PROTOCOLS %d\natom WM_DELETE_WINDOW %d\nwindow %d\n"
                 % (a_prot, a_del, wid))
@@ -204,12 +204,12 @@ finally:
 
 # An Xauthority file that `xauth` writes -- three entries, so that the
 # selection by display number has something to decide.
-xa = os.path.join(ZIEL, "xauthority")
+xa = os.path.join(TARGET, "xauthority")
 if os.path.exists(xa):
     os.remove(xa)
-for anz, keks in (("rechner/unix:5", "00112233445566778899aabbccddeeff"),
+for anz, cookie in (("rechner/unix:5", "00112233445566778899aabbccddeeff"),
                   ("rechner/unix:7", "0f1e2d3c4b5a69788796a5b4c3d2e1f0"),
                   ("rechner/unix:12", "deadbeefdeadbeefdeadbeefdeadbeef")):
-    subprocess.run(["xauth", "-f", xa, "add", anz, "MIT-MAGIC-COOKIE-1", keks],
+    subprocess.run(["xauth", "-f", xa, "add", anz, "MIT-MAGIC-COOKIE-1", cookie],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-print("Mitschnitte in", ZIEL)
+print("Mitschnitte in", TARGET)

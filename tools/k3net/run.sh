@@ -330,7 +330,12 @@ PYEOF
         sed 's/^/        /' "$W/send.out" "$W/py1.out" 2>/dev/null | head -12
     fi
 
-    # --- 3f. tc netem, both directions --------------------------------
+    # r140: server start-up is waited for with a pause that grows with the load
+# (loadavg/10, 0.9 s .. 5 s) instead of a fixed 0.7/0.9 s -- on a busy machine a
+# fixed pause let the client connect before the listener existed. The limits
+# of the checks themselves are unchanged.
+settle() { awk '{s=0.9+$1/10; if (s>5) s=5; printf "%.1f", s}' /proc/loadavg; }
+# --- 3f. tc netem, both directions --------------------------------
     #
     # THE TIME LIMITS BELOW ARE GENEROUS ON PURPOSE. Every mode of
     # `drv.fi` leaves its loop the moment the connection is properly
@@ -360,7 +365,7 @@ PYEOF
         STEP=$SECONDS
         F sink 4711 $((LOSSKB * 1024)) 90 > "$W/lossin.out" 2>&1 &
         DRV=$!
-        sleep 0.7
+        sleep "$(settle)"
         L timeout 90 nc -q 3 "$FIP" 4711 < "$W/small.bin" > /dev/null 2>&1
         wait $DRV 2>/dev/null
         LRC=$?
@@ -379,7 +384,7 @@ PYEOF
         ip netns exec "$FNS" tc qdisc add dev "$FIF" root netem loss 20% >/dev/null 2>&1
         L python3 "$W/echo_srv.py" "$LIP" 9001 tcp > "$W/py2.out" 2>&1 &
         PY=$!
-        sleep 0.9
+        sleep "$(settle)"
         STEP=$SECONDS
         F send "$LIP" 9001 $((LOSSKB * 1024)) 90 > "$W/lossout.out" 2>&1
         ORC=$?
@@ -402,7 +407,7 @@ PYEOF
         # very same run with retransmission switched off HAS to fail.
         L python3 "$W/echo_srv.py" "$LIP" 9002 tcp > "$W/py3.out" 2>&1 &
         PY=$!
-        sleep 0.9
+        sleep "$(settle)"
         F send "$LIP" 9002 $((LOSSKB * 1024)) 15 norexmit > "$W/norex.out" 2>&1
         NRC=$?
         wait $PY 2>/dev/null

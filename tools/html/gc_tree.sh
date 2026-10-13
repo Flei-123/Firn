@@ -14,7 +14,7 @@
 #   BAUM_RUNDEN      rounds in the normal run (default 20000)
 #   BAUM_MS          time budget of the normal run in ms (default 8000)
 #   BAUM_LECK_RUNDEN rounds of the counter-check (default 4000)
-#   BAUM_LECK_MB     hard memory brake of the counter-check in MiB (default 1024)
+#   TREE_LEAK_MB     hard memory brake of the counter-check in MiB (default 1024)
 #   BAUM_DRIFT_KIB   allowed RSS increase in the normal run (default 256)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
@@ -25,7 +25,7 @@ WORK=.tree-work
 ROUNDS=${BAUM_RUNDEN:-20000}
 MS=${BAUM_MS:-8000}
 LEAK_ROUNDS=${BAUM_LECK_RUNDEN:-4000}
-LEAK_MB=${BAUM_LECK_MB:-1024}
+LEAK_MB=${TREE_LEAK_MB:-1024}
 DRIFT=${BAUM_DRIFT_KIB:-256}
 
 mkdir -p "$WORK"
