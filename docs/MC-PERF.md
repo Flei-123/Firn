@@ -100,3 +100,16 @@ Not a clean A/B (the load of the server changes between runs); the direction (ab
 * No GPU exists on this server; nothing here is a GPU number. The CPU renderer is the reference, not the end goal on desktop.
 * No Vanilla number exists yet. "Better than Vanilla" is NOT shown by this document.
 * The server is shared (load 10-30 during the runs): treat times as noisy; the harness stores the load per run.
+
+## Messserie 14.10. (u1, PERF_COMP an, 3 Laeufe, Median [min..max], 640x360, Fixture-Welt, Server-Load ~14-16)
+Hinweis: llvmpipe = Software-GL, KEINE echte GPU. Vanilla NICHT gemessen.
+
+| Backend | Radius | Frame p50 ms | p99 ms |
+|---|---|---|---|
+| CPU-Raster | 8 | 336 [319..339] | 531 [378..539] |
+| CPU-Raster | 16 | 1040 [989..1070] | 1205 [1090..1208] |
+| GL llvmpipe | 8 | 86 [82..87] | 117 [105..127] |
+| GL llvmpipe | 16 | 347 [341..367] | 540 [407..561] |
+
+Mesher (915 Sektionen, p50): naiv+AO 823 us, naiv ohne AO 780 us, greedy+AO 807 us (CPU-Lauf). Upload/Free p50 130 us/Sektion.
+Radius 32: Lauf gequeued (PERF_FRAMES=30), Ergebnis in reports/perf_*_r32.tsv.
