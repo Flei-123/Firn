@@ -17,6 +17,7 @@ import photo.par
 import jobs.jobs
 import std.rt
 import std.math
+import android.ndk
 
 static GLYPHS: [u8; 1652] = "0000000000000000000000000000000000181818181818001818000000000064646464000000000000000000000012167f242cfe68480000000010103c78703c1e167e3c101000000070d0d072184e0b0b0e0000000000386430307bcfce6e3f00000000001818181800000000000000000c181818103030101818180c000030101818180808181818103000000000185a3c3c5a18000000000000000000181818fefe18181800000000000000000000000018181830000000000000003c3c0000000000000000000000000000001818000000000006040c0c081810302060400000003c66667e7e6666663c000000000078181818181818187e00000000003c4c060e0c1830607e00000000003c46063c060606463c00000000000c1c3c6c4c7e0c0c0c00000000007c60607c4e06064e3c00000000003c60607c666666663c00000000007e060c0c1c1818303000000000003c66663c666666663c00000000003c6e66666e3e064c380000000000000018180000001818000000000000001818000000181818300000000000021e78e0781e020000000000000000fefe00fefe000000000000000040701e061e704000000000003c06060c181800181800000000003c625ed2b2b2b2d25e621e000000183c3c2c647e6646c300000000007c6666667c6666667c00000000001c326060606060321c00000000007c6e66666666666e7c00000000007e6060607e6060607e00000000007e6060607e6060606000000000001c7260606e6666363e0000000000666666667e6666666600000000007e181818181818187e00000000003c0c0c0c0c0c0c4c7c0000000000666c7c78786c6c6667000000000060606060606060607e0000000000e6e6fefedadac2c2c20000000000666676765e4e4e4e4600000000003c666666666666663c00000000007c666666667c60606000000000003c666666666666663c0e040000007c666666667c6c666700000000003c6260703c0e06463c00000000007e1818181818181818000000000066666666666666663c0000000000c6666666643c3c3c380000000000c3c3dbda5a7e6e66660000000000e6663c3c183c3c66c60000000000c7666e3c381818181800000000007e060e1c183870607e0000"
 
@@ -99,7 +100,15 @@ fn put_int(dst: u64, v: i64) -> usize {
 }
 
 const JOB_KIND: u64 = 77
-const BRACKET_ON: bool = false   // exposure bracket (exp_list batch) crashed in ACaptureRequest_free on the emulator: off until fixed
+const JOB_STACK: usize = 16 * 1024 * 1024    // job thread stack
+
+// The job thread is a bionic pthread that attaches to the Firn runtime (thread_attach): a raw-clone thread of
+// thread_start shares bionic's thread pointer and crashes the app on Android.
+extern fn pthread_create(tid: u64, attr: u64, start: u64, arg: u64) -> i32;
+extern fn usleep(us: u32) -> i32;
+extern fn pthread_attr_init(attr: u64) -> i32;
+extern fn pthread_attr_setstacksize(attr: u64, n: usize) -> i32;
+extern fn pthread_attr_setdetachstate(attr: u64, state: i32) -> i32;
 const BUDGET: usize = 400 * 1024 * 1024    // capture buffer budget of one shot
 
 const M_PHOTO: i32 = 0
@@ -142,6 +151,15 @@ struct App {
     ccap: usize,
     fbuf: u64,             // FrameInfo array of the running job
     stamp0: i64,
+    tattr: [u64; 16],      // pthread_attr_t
+    ttid: u64,
+    wreq: u64,             // job requests counter the job thread watches
+    stage: i32,            // 0 idle, 1 capturing (UI thread, one frame per loop), 2 processing (job thread)
+    cap_n: i32,
+    cap_i: i32,
+    cap_at: usize,
+    steps: [f32; 16],      // focus diopters of a focus stack
+    bs: [u64; 16],         // start of each captured frame
 }
 
 fn set_status(a: *mut App, s: str) {
@@ -361,131 +379,134 @@ fn want_frames(a: *mut App, raw: bool, steps: *mut [f32; 16]) -> i32 {
     return focus.plan_focus(&mt, 0.0f, (*a).info.min_focus_d, 8, &(*steps)[0])
 }
 
+// UI side, step 1: plan the shot, allocate; the frames are taken one per UI iteration (step_capture)
 fn start_job(a: *mut App) {
     if !(*a).ready || (*a).busy { return }
     let raw: bool = (*a).kind == camera.KIND_RAW
     let ji: *mut camera.CamInfo = &(*a).info
     let fb: usize = if raw { raw_frame_bytes(a) } else { (((*ji).jpeg_w as usize) * ((*ji).jpeg_h as usize) * 3) / 4 + 1048576 }
-    var steps: [f32; 16] = [0.0f; 16]
-    var n: i32 = want_frames(a, raw, &steps)
+    var n: i32 = want_frames(a, raw, &(*a).steps)
     while n > 1 && (n as usize) * fb > BUDGET { n = n - 1 }
     if (*a).mode == M_STACK && n < 2 { set_status(a, "NO FOCUS RANGE"); return }
+    if n > 16 { n = 16 }
     let cap: usize = fb * (n as usize)
     let buf: u64 = camera.camera_alloc(cap)
     let fra: u64 = camera.camera_alloc(camera.sizeof_frame() * 16)
     if buf == 0 || fra == 0 {
         if buf != 0 { camera.camera_free(buf, cap) }
+        if fra != 0 { camera.camera_free(fra, camera.sizeof_frame() * 16) }
         set_status(a, "NO MEMORY")
-        return
-    }
-    set_status(a, "CAPTURING")
-    var base: [u64; 2] = [buf, buf]
-    var bs: [u64; 16] = [0; 16]
-    var perframe: bool = false
-    var first: i32 = 0           // frames in batch 0
-    var total: i32 = 0
-    let fs: usize = camera.sizeof_frame()
-    var fptr: *mut camera.FrameInfo = fra as *mut camera.FrameInfo
-    if (*a).mode == M_STACK {
-        let c: i32 = camera.camera_capture(n, 0, (&steps[0]) as u64, 0, buf, cap, fptr)
-        first = if c > 0 { c } else { 0 }
-        total = first
-    } else {
-        var bracket: bool = false
-        if (*a).mode == M_PHOTO && raw && has_man_sensor(a) && n >= 4 && BRACKET_ON {
-            // learn the auto exposure from one frame, then shoot a bracket around it
-            let c1: i32 = camera.camera_capture(1, 0, 0, 0, buf, cap, fptr)
-            if c1 == 1 && (*fptr).exposure_ns > 0 as i64 && (*fptr).iso > 0 {
-                let used: usize = (*fptr).offset + (*fptr).size
-                let e0: f32 = (*fptr).exposure_ns as f32
-                var el: [i64; 16] = [0 as i64; 16]
-                var fac: [f32; 5] = [0.25f, 1.0f, 1.0f, 0.5f, 1.0f]
-                var i: i32 = 0
-                while i < n - 1 {
-                    var e: i64 = (e0 * fac[(i % 5) as usize]) as i64
-                    if e < (*ji).exp_min_ns { e = (*ji).exp_min_ns }
-                    if e > (*ji).exp_max_ns { e = (*ji).exp_max_ns }
-                    el[i as usize] = e
-                    i = i + 1
-                }
-                let c2: i32 = camera.camera_capture(n - 1, (&el[0]) as u64, 0, (*fptr).iso, buf + used as u64, cap - used,
-                                                   camera.frame_at(fptr, 1))
-                base[1] = buf + used as u64
-                first = 1
-                total = 1 + (if c2 > 0 { c2 } else { 0 })
-                bracket = true
-            } else if c1 == 1 {
-                first = 1
-                total = 1
-                bracket = true
-                // fall through: finish with a plain burst of the rest
-                let used: usize = (*fptr).offset + (*fptr).size
-                let c2: i32 = camera.camera_capture(n - 1, 0, 0, 0, buf + used as u64, cap - used, camera.frame_at(fptr, 1))
-                base[1] = buf + used as u64
-                total = 1 + (if c2 > 0 { c2 } else { 0 })
-            }
-        }
-        if !bracket {
-            // one request per call: the multi-frame batch path of camera_capture aborts on the emulator
-            var at: usize = 0
-            var k: i32 = 0
-            while k < n {
-                let c: i32 = camera.camera_capture(1, 0, 0, 0, buf + at as u64, cap - at, camera.frame_at(fptr, k))
-                if c < 1 { break }
-                let fk: *mut camera.FrameInfo = camera.frame_at(fptr, k)
-                bs[k as usize] = buf + at as u64
-                at = at + (*fk).offset + (*fk).size
-                k = k + 1
-            }
-            first = 0
-            total = k
-            perframe = true
-        }
-    }
-    if total < 1 {
-        set_status(a, "CAPTURE FAILED")
-        camera.camera_free(buf, cap)
-        camera.camera_free(fra, fs * 16)
         return
     }
     camjob.job_free(&(*a).job)
     (*a).job = camjob.job_new()
+    (*a).cbuf = buf
+    (*a).ccap = cap
+    (*a).fbuf = fra
+    (*a).cap_n = n
+    (*a).cap_i = 0
+    (*a).cap_at = 0
+    (*a).stage = 1
+    (*a).busy = true
+    set_status(a, "CAPTURING")
+}
+
+fn release_capture(a: *mut App) {
+    if (*a).cbuf != 0 { camera.camera_free((*a).cbuf, (*a).ccap) }
+    if (*a).fbuf != 0 { camera.camera_free((*a).fbuf, camera.sizeof_frame() * 16) }
+    (*a).cbuf = 0
+    (*a).fbuf = 0
+}
+
+// one frame per call (a capture is a few hundred ms; the UI keeps drawing between frames)
+fn step_capture(a: *mut App) {
+    let fptr: *mut camera.FrameInfo = (*a).fbuf as *mut camera.FrameInfo
+    let k: i32 = (*a).cap_i
+    let fk: *mut camera.FrameInfo = camera.frame_at(fptr, k)
+    var fp: u64 = 0
+    if (*a).mode == M_STACK { fp = (&(*a).steps[k as usize]) as u64 }
+    let c: i32 = camera.camera_capture(1, 0, fp, 0, (*a).cbuf + (*a).cap_at as u64, (*a).ccap - (*a).cap_at, fk)
+    if c >= 1 {
+        (*a).bs[k as usize] = (*a).cbuf + (*a).cap_at as u64
+        (*a).cap_at = (*a).cap_at + (*fk).offset + (*fk).size
+        (*a).cap_i = k + 1
+        (*a).job.progress = (((k + 1) * 25 / (*a).cap_n) as u64)
+    }
+    if c < 1 || (*a).cap_i >= (*a).cap_n {
+        if (*a).cap_i < 1 {
+            release_capture(a)
+            set_status(a, "CAPTURE FAILED")
+            (*a).busy = false
+            (*a).stage = 0
+            return
+        }
+        begin_process(a)
+    }
+}
+
+// step 2: hand the frames to the job thread
+fn begin_process(a: *mut App) {
+    let ji: *mut camera.CamInfo = &(*a).info
+    let fptr: *mut camera.FrameInfo = (*a).fbuf as *mut camera.FrameInfo
     (*a).job.mode = (*a).mode
     (*a).job.orientation = exif_orientation((*ji).orientation)
     var mt: meta.SensorMeta = meta.meta_default()
     camera.camera_meta((*fptr).slot, &mt)
     (*a).job.meta = mt
     var i: i32 = 0
-    while i < total {
+    while i < (*a).cap_i {
         let f: *mut camera.FrameInfo = camera.frame_at(fptr, i)
-        var b: u64 = if i < first { base[0] } else { base[1] }
-        if perframe { b = bs[i as usize] }
         var kind: i32 = camjob.SHOT_JPEG
         if (*f).kind == camera.KIND_RAW { kind = camjob.SHOT_RAW }
         if (*f).kind != camera.KIND_YUV {
-            camjob.job_add_shot(&(*a).job, kind, (*f).w, (*f).h, b + (*f).offset as u64, (*f).size, (*f).exposure_ns, (*f).iso)
+            camjob.job_add_shot(&(*a).job, kind, (*f).w, (*f).h, (*a).bs[i as usize] + (*f).offset as u64, (*f).size, (*f).exposure_ns, (*f).iso)
         }
         i = i + 1
     }
-    (*a).cbuf = buf
-    (*a).ccap = cap
-    (*a).fbuf = fra
-    if par.threads() == 1 { par.init(3) }    // pool is made on first use (not at startup)
-    (*a).busy = true
-    (*a).th = thread_start(JOB_KIND, (&(*a).job) as u64)
-    if (*a).th == 0 {
-        camjob.job_entry((&(*a).job) as u64)    // no thread: run here
-    }
+    (*a).stage = 2
     set_status(a, "PROCESSING")
+    if (*a).ttid == 0 {
+        pthread_attr_init((&(*a).tattr[0]) as u64)
+        pthread_attr_setstacksize((&(*a).tattr[0]) as u64, JOB_STACK)
+        pthread_attr_setdetachstate((&(*a).tattr[0]) as u64, 1)
+        let rc: i32 = pthread_create((&(*a).ttid) as u64, (&(*a).tattr[0]) as u64, ndk.code_of_thread(thread_job_main), a as u64)
+        if rc != 0 { (*a).ttid = 0 }
+    }
+    if (*a).ttid == 0 {
+        camjob.job_entry((&(*a).job) as u64)    // no thread: run here
+    } else {
+        __atomic_add((&(*a).wreq) as *mut u64, 1)
+    }
+}
+
+// The job thread lives as long as the app: it attaches to the Firn runtime once and never detaches (leaving a
+// thread that detached crashes the process on Android). Between jobs it sleeps in host mode (counted as blocked).
+fn thread_job_main(arg: u64) -> u64 {
+    let a: *mut App = arg as *mut App
+    if !thread_attach() { return 0 }
+    var seen: u64 = 0
+    while true {
+        let want: u64 = __atomic_add((&(*a).wreq) as *mut u64, 0)
+        if want != seen {
+            seen = want
+            thread_blocking_out()
+            camjob.job_entry((&(*a).job) as u64)
+            thread_blocking_an()
+        } else {
+            usleep(20000 as u32)
+        }
+    }
+    return 0
 }
 
 // UI side of a finished job: save, release, report
 fn poll_job(a: *mut App) {
-    if !(*a).busy || !camjob.job_finished(&(*a).job) { return }
-    if (*a).th != 0 { thread_wait((*a).th); (*a).th = 0 }
+    if !(*a).busy { return }
+    if (*a).stage == 1 { step_capture(a); return }
+    if !camjob.job_finished(&(*a).job) { return }
     var name: [u8; 48] = [0 as u8; 48]
     if (*a).job.ok {
-        name_into((&name[0]) as u64, "IMG_", ".jpg")
+            name_into((&name[0]) as u64, "IMG_", ".jpg")
         let mime: str = "image/jpeg\0"
         let r: i32 = camera.camera_save((*a).job.out, (*a).job.out_n, (&name[0]) as u64, mime.p as u64)
         if (*a).job.have_pdf {
@@ -495,15 +516,13 @@ fn poll_job(a: *mut App) {
             camera.camera_save_doc(rt.buf_ptr(&(*a).job.pdf), rt.buf_len(&(*a).job.pdf), (&pn[0]) as u64, pm.p as u64)
         }
         (*a).shots = (*a).shots + 1
-        report(a, r, "SAVED", "SAVED PRIVATE")
+            report(a, r, "SAVED", "SAVED PRIVATE")
     } else {
         set_status(a, "PROCESSING FAILED")
     }
     camjob.job_free(&(*a).job)
-    camera.camera_free((*a).cbuf, (*a).ccap)
-    camera.camera_free((*a).fbuf, camera.sizeof_frame() * 16)
-    (*a).cbuf = 0
-    (*a).fbuf = 0
+    release_capture(a)
+    (*a).stage = 0
     (*a).busy = false
 }
 
@@ -767,7 +786,7 @@ fn main() -> i32 {
         w: window.width(&f) as i32, h: window.height(&f) as i32, scr: 0, prev: 0, pw: 0, ph: 0,
         nlens: 0, lens: 0, mode: M_PHOTO, manual: false, sl: [500, 500, 0], drag: 0 - 1, kind: 0, ready: false,
         status: [0 as u8; 64], info: camera.zero_info(), shots: 0, recording: false,
-        job: camjob.job_new(), busy: false, th: 0, cbuf: 0, ccap: 0, fbuf: 0, stamp0: 0,
+        job: camjob.job_new(), busy: false, th: 0, cbuf: 0, ccap: 0, fbuf: 0, stamp0: 0, tattr: [0; 16], ttid: 0, wreq: 0, stage: 0, cap_n: 0, cap_i: 0, cap_at: 0, steps: [0.0f; 16], bs: [0; 16],
     }
     a.scr = camera.camera_alloc((a.w * a.h * 4) as usize)
     a.prev = camera.camera_alloc((a.w * a.h * 4) as usize)
