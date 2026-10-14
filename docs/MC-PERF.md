@@ -9,6 +9,7 @@ Rule: only real measurements go into the tables; empty = not measured.
 | statistics (sort, linear percentile, mean, 1 % low, `RESULT` lines) | `lib/mc/mc_perf.fi` |
 | scenario (world tiling, mesh/upload sample, load, flight path, frames, RSS) | `lib/mc/mc_perf_run.fi` |
 | entry CPU raster (`mc_raster` through `mc_backend`) | `tools/mc/perf/bench.fi` |
+| entry GL back end on EGL surfaceless = Mesa llvmpipe (software, NO real GPU), `PERF_BACKEND=gl` | `tools/mc/perf/bench_gl.fi` |
 | aggregation (median / min / max of N runs -> TSV + JSON) | `tools/mc/perf/agg.py` |
 | self test against numpy (5 sample sets, 8 statistics, tolerance 1 ns) | `tools/mc/perf/stats_check.py` |
 
@@ -61,6 +62,14 @@ Single run, radius 8, 640x360, 60 frames, fixture tiled, firnc of 8 Oct, `uptime
 Series 8 / 16 / 32 with 3 runs: started via heavy (queue), results in `reports/perf_*_cpu_r*.tsv` if finished -- otherwise OPEN.
 The 8-block frame times include on-demand meshing along the flight (budget 16 sections / frame) -- that is deliberate (p99).
 
+### 4a. Parallel snapshot (r103, 14.10., main 8c7eb2abc; tests/2915 async load from empty, 4 workers, 189 sections, server load ~30 -> noisy)
+| | before (serial pad fill on the render thread) | after (pad filled by workers / end-of-frame barrier) |
+|---|---|---|
+| snapshot+submit phase, sum over the load (median of 6 runs) | ~84 ms (0.44 ms / section) | ~36 ms (0.19 ms / section) |
+| worst submit phase of one frame (range of 6 runs) | 2.6 - 6.1 ms | 1.8 - 4.7 ms |
+| time at the end-of-frame barrier (sum over the load) | -- | 1.6 - 3.8 ms |
+Not a clean A/B (the load of the server changes between runs); the direction (about 2x less on the render thread) held in every pair. Frame budget test: >= 90 % of the frames inside `snap_budget_us` + 3 ms, no frame > 250 ms (CPU raster draw included).
+
 ## 5. Known problems / open
 * `BENCH_COMP=1 BENCH_COMPUPLOAD=1` (mesh + upload components per section): the reported crash in `mc_raster.backend_mesh_upload` does
   **NOT reproduce** on main (13.10.): 915 upload/free cycles at radius 8 and 16, with and without free (`BENCH_NOFREE=1`), with both firnc builds
@@ -68,8 +77,7 @@ The 8-block frame times include on-demand meshing along the flight (budget 16 se
   patterns + all-zero check of every allocation). The original crash was probably the pre-q1 build / a fixed environment problem; code reading found
   no size mismatch in alloc/free pairs (slot table, verts, idx). `run.sh --offline` now runs the components. Measured (R 8, 915 sections, server load ~15, 640x360 not involved):
   naive+AO p50 738 us, naive no AO 695 us, greedy+AO p50 727 us / p95 2607 us, upload+free p50 146 us per section (single runs, noisy).
-* GL path: `bench_gl.fi` not written; the compiler build was blocked by the disk (89 %), the old firnc (8 Oct) has no `link_lib`.
-  Once written, results must carry "NO REAL GPU (Mesa llvmpipe)".
+* GL path: `bench_gl.fi` exists since 14.10. (`PERF_BACKEND=gl bash tools/mc/perf/run.sh --offline`, needs FIRNC with link_lib, e.g. /root/firn-w-r5); results carry "NO REAL GPU (Mesa llvmpipe)".
 * `--live`: join time (handshake -> last chunk) needs `t_last` + parse time printed by `demos/mcview`; not wired.
 * After p1 / p2 are merged: repeat the series and fill "after".
 
