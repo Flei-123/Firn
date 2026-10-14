@@ -267,6 +267,16 @@ fn __win_sockerrno() -> i64 {
     return 0 - 5
 }
 
+// send/recv/sendto/recvfrom with SO_RCVTIMEO/SO_SNDTIMEO: Linux reports a
+// timed-out transfer as EAGAIN (11), Winsock as WSAETIMEDOUT (10060). Code
+// written for Linux tests EAGAIN, so data transfers map it that way.
+// (connect keeps ETIMEDOUT via __win_sockerrno.)
+fn __win_ioerrno() -> i64 {
+    let e: i64 = (WSAGetLastError() as i64) & 65535
+    if e == 10060 { return 0 - 11 }
+    return __win_sockerrno()
+}
+
 // ------------------------------------------------------------ UTF-16
 // UTF-8 -> UTF-16, NUL terminated. `/` becomes `\`.
 // Returns the number of u16 units written, or -1 if `cap` is too small.
@@ -656,7 +666,7 @@ fn __win_write(fd: i64, buf: u64, n: i64) -> i64 {
     if k == 2 {
         let r: i64 = send(__win_handle(fd), buf, n, 0) as i64
         if r < 0 {
-            return __win_sockerrno()
+            return __win_ioerrno()
         }
         return r
     }
@@ -697,7 +707,7 @@ fn __win_read(fd: i64, buf: u64, n: i64) -> i64 {
     if k == 2 {
         let r: i64 = recv(__win_handle(fd), buf, n, 0) as i64
         if r < 0 {
-            return __win_sockerrno()
+            return __win_ioerrno()
         }
         return r
     }
@@ -1516,7 +1526,7 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
         let sa: u64 = __win_sa_out(a5 as u64, a6, (&sab[0]) as u64)
         let r: i64 = sendto(__win_handle(a1), a2 as u64, a3, a4, sa, a6) as i64
         if r < 0 {
-            return __win_sockerrno()
+            return __win_ioerrno()
         }
         return r
     }
@@ -1531,7 +1541,7 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
         let r: i64 = recvfrom(__win_handle(a1), a2 as u64, a3, a4,
             a5 as u64, a6 as u64) as i64
         if r < 0 {
-            return __win_sockerrno()
+            return __win_ioerrno()
         }
         let lp: *mut i32 = a6 as *mut i32
         __win_sa_in(a5 as u64, (*lp) as i64)

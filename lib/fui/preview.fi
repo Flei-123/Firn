@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/preview.fi -- THE LIVE PREVIEW WIDGET: a camera frame that COVERS a rectangle.
+//
+// The camera logic (lib/plat/android/camera.fi) and the UI (examples/firncam/ui.fi) know nothing about each other;
+// this is the seam between them. A producer fills a `Src` and hands it over, the widget draws it:
+//
+//   kind SRC_NONE  nothing yet                       -> the rectangle stays black
+//   kind SRC_RGBA  `px` = premultiplied RGBA, `stride` octets a row, `w` x `h`, ALREADY UPRIGHT
+//                  (`rot` 0). `key` names the frame: the same key is not uploaded twice, key 0 = always upload.
+//   kind SRC_TEX   a texture of the GPU-preview path (`tex` = GL texture name, `ext` = it is an external OES
+//                  texture, `rot` = degrees clockwise to turn the sensor image upright: 0/90/180/270, `mirror`).
+//                  NOT drawn yet: preview_draw answers false and paints nothing. The GPU-preview worker fills the
+//                  `draw_tex` stub below; the signature of preview_draw does not change.
+//
+// COVER, NOT STRETCH: the frame is scaled until it fills the rectangle on both axes, the overhang is cut away at
+// the centre (CSS `object-fit: cover`) -- no bars, no distortion. `zoom` >= 1 cuts a smaller central window
+// (digital zoom of the preview); (`cx`, `cy`) in -1..1 moves that window.
+import paint.canvas
+import fui.painter
+import fui.gpu
+
+export { Src, src_none, src_rgba, preview_draw, preview_aspect, SRC_NONE, SRC_RGBA, SRC_TEX }
+
+const SRC_NONE: i32 = 0
+const SRC_RGBA: i32 = 1
+const SRC_TEX: i32 = 2
+
+struct Src {
+    kind: i32,
+    px: u64,
+    stride: usize,
+    w: i32,          // upright size for SRC_RGBA; sensor size for SRC_TEX
+    h: i32,
+    rot: i32,
+    mirror: bool,
+    tex: u32,
+    ext: bool,
+    key: u64,
+}
+
+fn src_none() -> Src {
+    return Src { kind: SRC_NONE, px: 0, stride: 0, w: 0, h: 0, rot: 0, mirror: false, tex: 0 as u32, ext: false, key: 0 }
+}
+
+fn src_rgba(px: u64, w: i32, h: i32, key: u64) -> Src {
+    return Src { kind: SRC_RGBA, px: px, stride: (w as usize) * 4, w: w, h: h, rot: 0, mirror: false,
+        tex: 0 as u32, ext: false, key: key }
+}
+
+// width / height of the picture as the user sees it (after the rotation)
+fn preview_aspect(s: *mut Src) -> f64 {
+    if (*s).w <= 0 || (*s).h <= 0 { return 0.0 }
+    if (*s).rot == 90 || (*s).rot == 270 { return ((*s).h as f64) / ((*s).w as f64) }
+    return ((*s).w as f64) / ((*s).h as f64)
+}
+
+// the texture path of the GPU-preview worker plugs in here
+fn draw_tex(g: *mut gpu.Gpu, s: *mut Src, x: f64, y: f64, w: f64, h: f64, zoom: f64) -> bool {
+    return false
+}
+
+// Draws the frame over (x, y, w, h) of the canvas, cover fit. False = nothing was drawn.
+fn preview_draw(z: *mut painter.Painter, g: *mut gpu.Gpu, s: *mut Src, x: f64, y: f64, w: f64, h: f64,
+    zoom: f64, cx: f64, cy: f64) -> bool {
+    if (*s).kind == SRC_NONE || w <= 0.0 || h <= 0.0 { return false }
+    if (*s).kind == SRC_TEX {
+        if g as u64 == 0 { return false }
+        return draw_tex(g, s, x, y, w, h, zoom)
+    }
+    let iw: f64 = (*s).w as f64
+    let ih: f64 = (*s).h as f64
+    if iw <= 0.0 || ih <= 0.0 || (*s).px == 0 { return false }
+    // the visible part of the frame, in texels: same aspect as the rectangle
+    var vw: f64 = iw
+    var vh: f64 = ih
+    if iw * h > ih * w {
+        vw = ih * w / h
+    } else {
+        vh = iw * h / w
+    }
+    var zm: f64 = zoom
+    if zm < 1.0 { zm = 1.0 }
+    vw = vw / zm
+    vh = vh / zm
+    var sx0: f64 = (iw - vw) / 2.0 + cx * (iw - vw) / 2.0
+    var sy0: f64 = (ih - vh) / 2.0 + cy * (ih - vh) / 2.0
+    if sx0 < 0.0 { sx0 = 0.0 }
+    if sy0 < 0.0 { sy0 = 0.0 }
+    if g as u64 != 0 {
+        gpu.gpu_draw_photo(g, (*s).key, (*s).px, (*s).stride, (*s).w, (*s).h, x, y, x + w, y + h,
+            sx0, sy0, sx0 + vw, sy0 + vh, 255 as u32)
+        return true
+    }
+    // no GPU: nearest neighbour into the canvas (a fallback; the phone has the GPU path)
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    var yy: f64 = y
+    while yy < y + h {
+        var xx: f64 = x
+        while xx < x + w {
+            let tx: i32 = (sx0 + (xx - x) * vw / w) as i32
+            let ty: i32 = (sy0 + (yy - y) * vh / h) as i32
+            if tx >= 0 && ty >= 0 && tx < (*s).w && ty < (*s).h {
+                let c: u32 = *(((*s).px + ((ty as usize) * (*s).stride + (tx as usize) * 4) as u64) as *mut u32)
+                canvas.canvas_set_raw(cv, xx as usize, yy as usize, c)
+            }
+            xx = xx + 1.0
+        }
+        yy = yy + 1.0
+    }
+    return true
+}
