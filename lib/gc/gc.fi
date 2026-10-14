@@ -364,6 +364,10 @@ const S_VDSO: u64 = 2336
 // Both words 0 = the default 1/1 (see `gc_set_growth`).
 const S_GROWN: u64 = 2344
 const S_GROWD: u64 = 2352
+// r566: the last gap between two chunks that a lookup found empty: [S_GAPLO,
+// S_GAPHI). Both 0 = none. Reset whenever a chunk enters or leaves the index.
+const S_GAPLO: u64 = 2360
+const S_GAPHI: u64 = 2368
 
 // The state word of a block header (see the comment at the top).
 const M_MARK: u32 = 3
@@ -1153,6 +1157,9 @@ fn __gc_idx_pos(a: u64) -> u64 {
 
 fn __gc_idx_add(c: u64) {
     let st: u64 = __gc_state() as u64
+    *((st +% S_GAPLO) as *mut u64) = 0
+    *((st +% S_GAPHI) as *mut u64) = 0
+    __gc_gap_clear()
     if __gc_ld64(st + S_IDXBAD) != 0 {
         return
     }
@@ -1175,6 +1182,9 @@ fn __gc_idx_add(c: u64) {
 
 fn __gc_idx_del(c: u64) {
     let st: u64 = __gc_state() as u64
+    *((st +% S_GAPLO) as *mut u64) = 0
+    *((st +% S_GAPHI) as *mut u64) = 0
+    __gc_gap_clear()
     if __gc_ld64(st + S_IDXBAD) != 0 {
         return
     }
@@ -1207,25 +1217,29 @@ fn __gc_idx_chunk(a: u64) -> u64 {
     if base == 0 || n == 0 {
         return 0
     }
-    var k: u64 = __gc_idx_pos(a)
-    if k >= n {
-        k = n - 1
-    } else {
-        if (*((base + k * 8) as *mut u64)) > a {
-            if k == 0 {
-                return 0
-            }
-            k = k - 1
+    let k: u64 = __gc_idx_pos(a)
+    // r566: no chunk holds `a`: remember the whole gap around it. The words of
+    // a root area (Vec buffers) mostly point into non-GC memory that lies
+    // between the chunks, so the next lookups land in the same gap.
+    var next: u64 = 18446744073709551615
+    if k < n {
+        next = (*((base + k * 8) as *mut u64))
+        if next == a {
+            return next
         }
     }
-    let c: u64 = (*((base + k * 8) as *mut u64))
-    if a < c {
-        return 0
+    var gap_lo: u64 = 0
+    if k > 0 {
+        let c: u64 = (*((base + (k - 1) * 8) as *mut u64))
+        let end: u64 = c + (*((c + 8) as *mut u64))
+        if a < end {
+            return c
+        }
+        gap_lo = end
     }
-    if a >= c + (*((c + 8) as *mut u64)) {
-        return 0
-    }
-    return c
+    *((st +% S_GAPLO) as *mut u64) = gap_lo
+    *((st +% S_GAPHI) as *mut u64) = next
+    return 0
 }
 
 // ROUND TK2 (Certus): the table of the block-of cache, made on first use.
@@ -1236,7 +1250,7 @@ fn __gc_bocache() -> u64 {
     if t != 0 {
         return t
     }
-    let p: u64 = __gc_mmap(BOCACHE_N * 8)
+    let p: u64 = __gc_mmap(BOCACHE_N * 24)
     if p == 0 {
         __gc_st64(st + S_BOCACHE, 1)
         return 1
@@ -1246,6 +1260,21 @@ fn __gc_bocache() -> u64 {
 }
 
 // A chunk is about to be unmapped: no slot may name it any more.
+// r566: the gap table (second and third part of the block-of table) forgets
+// everything -- a chunk entered or left the index, so a remembered gap may
+// have a chunk in it now.
+fn __gc_gap_clear() {
+    let t: u64 = __gc_ld64(__gc_state() as u64 + S_BOCACHE)
+    if t <= 1 {
+        return
+    }
+    var i: u64 = BOCACHE_N
+    while i < BOCACHE_N * 3 {
+        *((t +% i * 8) as *mut u64) = 0
+        i = i + 1
+    }
+}
+
 fn __gc_bocache_drop(c: u64) {
     let t: u64 = __gc_ld64(__gc_state() as u64 + S_BOCACHE)
     if t <= 1 {
@@ -1281,6 +1310,10 @@ fn __gc_block_of(a: u64) -> u64 {
             return data0 + (a - data0) / (*((cc + 16) as *mut u64)) * (*((cc + 16) as *mut u64))
         }
     }
+    // r566: inside the last gap found empty -- no chunk, out in four instructions.
+    if a >= (*((st + S_GAPLO) as *mut u64)) && a < (*((st + S_GAPHI) as *mut u64)) {
+        return 0
+    }
     // CERTUS ROUND M1: binary search in the address index instead of a walk
     // over all chunks.
     if (*((st + S_IDXBAD) as *mut u64)) == 0 {
@@ -1310,9 +1343,17 @@ fn __gc_block_of(a: u64) -> u64 {
                     return data2 + (a - data2) / block2 * block2
                 }
             }
+            // r566: the gap remembered for this granule -- no chunk in it.
+            if a >= (*((slot + BOCACHE_N * 8) as *mut u64)) && a < (*((slot + BOCACHE_N * 16) as *mut u64)) {
+                return 0
+            }
         }
         let ci: u64 = __gc_idx_chunk(a)
         if ci == 0 {
+            if slot != 0 {
+                *((slot + BOCACHE_N * 8) as *mut u64) = (*((st + S_GAPLO) as *mut u64))
+                *((slot + BOCACHE_N * 16) as *mut u64) = (*((st + S_GAPHI) as *mut u64))
+            }
             return 0
         }
         let datai: u64 = ci + CHUNK_HEADER
@@ -1589,10 +1630,19 @@ fn __gc_scan(lo: u64, hi: u64) {
     let stb: u64 = __gc_state() as u64
     let hlo: u64 = *((stb +% S_HEAPLO) as *mut u64)
     let hhi: u64 = *((stb +% S_HEAPHI) as *mut u64)
+    // r566: most words in the heap bounds point into non-GC memory between the
+    // chunks. The gap the last lookup found empty is checked here, before the
+    // calls (reloaded after each mark: a lookup may remember a new gap).
+    var gap_lo: u64 = *((stb +% S_GAPLO) as *mut u64)
+    var gap_hi: u64 = *((stb +% S_GAPHI) as *mut u64)
     while a + 8 <= hi {
         let v: u64 = *(a as *mut u64)
         if v >= hlo && v < hhi {
-            __gc_mark(v)
+            if v < gap_lo || v >= gap_hi {
+                __gc_mark(v)
+                gap_lo = *((stb +% S_GAPLO) as *mut u64)
+                gap_hi = *((stb +% S_GAPHI) as *mut u64)
+            }
         }
         a = a + 8
     }
