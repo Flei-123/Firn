@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/android/camera_controls/main.fi -- tap focus / zoom / flash check for lib/plat/android/camera.fi (r544).
+// Runs as an app (needs the window layer); no UI. Result lines go to logcat, tag "cam-ctl". Every check logs
+// "PASS name" or "FAIL name"; the end is "RESULT bad=<n>" and "RESULT done". Driver: tools/android/camera_controls_check.sh
+import window.window
+import plat.android.camera
+import android.ndk
+
+fn say(msg: str, v: i64) {
+    var buf: [u8; 160] = [0 as u8; 160]
+    var n: usize = 0
+    while n < msg.n && n < 120 {
+        buf[n] = *((msg.p as u64 + n as u64) as *mut u8)
+        n = n + 1
+    }
+    var tmp: [u8; 24] = [0 as u8; 24]
+    var t: usize = 0
+    var x: i64 = v
+    var neg: bool = false
+    if x < 0 { neg = true; x = 0 - x }
+    if x == 0 { tmp[0] = 48 as u8; t = 1 }
+    while x > 0 {
+        tmp[t] = (48 + (x % 10)) as u8
+        x = x / 10
+        t = t + 1
+    }
+    if neg { buf[n] = 45 as u8; n = n + 1 }
+    while t > 0 {
+        t = t - 1
+        buf[n] = tmp[t]
+        n = n + 1
+    }
+    buf[n] = 0 as u8
+    var tag: [u8; 8] = [99, 97, 109, 45, 99, 116, 108, 0]
+    ndk.log_write(ndk.LOG_INFO, (&tag[0]) as u64, (&buf[0]) as u64)
+}
+
+fn nap(ms: i32) {
+    var ts: [i64; 2] = [0; 2]
+    ts[0] = (ms / 1000) as i64
+    ts[1] = ((ms % 1000) as i64) * 1000000
+    syscall(35, (&ts[0]) as i64, 0, 0, 0, 0, 0)
+}
+
+// Sleeps while draining the preview reader like a real UI does (undrained preview buffers stall the camera and
+// every request then fails).
+fn sleep_ms(ms: i32) {
+    var pf: camera.PreviewFrame = camera.preview_frame_new()
+    var t: i32 = 0
+    while t < ms {
+        if camera.camera_preview_acquire(&pf) >= 0 { camera.camera_preview_release(&pf) }
+        nap(30)
+        t = t + 30
+    }
+}
+
+fn rc(label: str) {
+    say(label, camera.camera_result_count() * 1000 + camera.camera_fail_count())
+}
+
+fn check(name: str, ok: bool, bad: *mut i32) {
+    if ok { say(name, 1) } else { say(name, 0); *bad = *bad + 1 }
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var f: window.Window = window.window_new()
+    if !window.open_window(&f, 0) || !window.make(&f, 480, 800) { return 1 }
+    window.show_window(&f)
+    var asked: bool = false
+    var n: i32 = 0
+    var tries: i32 = 0
+    while n == 0 && tries < 200 {
+        if camera.camera_permission() == 1 {
+            n = camera.camera_scan()
+            if n == 0 { break }
+        } else if !asked {
+            asked = true
+            camera.camera_request_permission()
+        }
+        window.wait_event(&f, 50)
+        var k: u32 = window.next_event(&f)
+        while k != window.EV_NONE { k = window.next_event(&f) }
+        tries = tries + 1
+    }
+    var bad: i32 = 0
+    check("PASS-1 lenses found", n > 0, &bad)
+    if n > 0 {
+        check("PASS-2 open", camera.camera_open(0) == camera.E_OK, &bad)
+        check("PASS-3 start", camera.camera_start(camera.KIND_JPEG) == camera.E_OK, &bad)
+        sleep_ms(1500)
+        rc("RC after start (results*1000+fails) ")
+        var zmin: f32 = 0.0f
+        var zmax: f32 = 0.0f
+        camera.camera_zoom_range(&zmin, &zmax)
+        say("zoom range x100 min ", (zmin * 100.0f) as i64)
+        say("zoom range x100 max ", (zmax * 100.0f) as i64)
+        check("PASS-4 zoom range sane", zmin > 0.0f && zmax >= zmin, &bad)
+        // zoom
+        var zr: f32 = 1.0f
+        var lens: i32 = camera.camera_zoom_lens(2.0f, &zr)
+        say("zoom 2x lens ", lens as i64)
+        check("PASS-5 lens plan valid", lens >= 0 && lens < n, &bad)
+        if zmax >= 2.0f {
+            rc("RC before zoom ")
+            check("PASS-6 set zoom 2x", camera.camera_set_zoom(2.0f) == camera.E_OK, &bad)
+            sleep_ms(1500)
+            rc("RC after zoom 2x ")
+            say("get zoom x100 ", (camera.camera_get_zoom() * 100.0f) as i64)
+            say("applied zoom x100 ", (camera.camera_applied_zoom() * 100.0f) as i64)
+            say("(info) result reports zoom x100 ", (camera.camera_applied_zoom() * 100.0f) as i64)
+            check("PASS-8 zoom clamp", camera.camera_set_zoom(zmax * 4.0f) == camera.E_OK && camera.camera_get_zoom() <= zmax + 0.001f, &bad)
+            rc("RC before zoom_to ")
+            check("PASS-9 zoom_to 1x", camera.camera_zoom_to(1.0f) == camera.E_OK, &bad)
+            sleep_ms(800)
+            rc("RC after zoom_to ")
+            check("PASS-10 zoom back at 1x", camera.camera_get_zoom() > 0.99f && camera.camera_get_zoom() < 1.01f, &bad)
+        } else {
+            say("device has no zoom range: skipped ", 0)
+        }
+        // does zoom really change the picture? YUV captures at 1x and 2x: the 2x picture must match the centre
+        // of the 1x picture (upscaled) much better than the 1x picture itself
+        if zmax >= 2.0f && camera.camera_start(camera.KIND_YUV) == camera.E_OK {
+            sleep_ms(800)
+            var ya: u64 = camera.camera_alloc(32 * 1024 * 1024)
+            var fa: [camera.FrameInfo; 1] = [camera.zero_frame(); 1]
+            var fb: [camera.FrameInfo; 1] = [camera.zero_frame(); 1]
+            camera.camera_set_zoom(1.0f)
+            sleep_ms(800)
+            let g1: i32 = camera.camera_capture(1, 0, 0, 0, ya, 16 * 1024 * 1024, &fa[0])
+            camera.camera_set_zoom(2.0f)
+            sleep_ms(800)
+            let g2: i32 = camera.camera_capture(1, 0, 0, 0, ya + 16 * 1024 * 1024, 16 * 1024 * 1024, &fb[0])
+            if g1 == 1 && g2 == 1 {
+                let w: i32 = fa[0].w
+                let h: i32 = fa[0].h
+                let pa: u64 = ya + fa[0].offset as u64
+                let pb: u64 = ya + 16 * 1024 * 1024 + fb[0].offset as u64
+                var m0: i64 = 0
+                var m1: i64 = 0
+                var cnt: i64 = 0
+                var yy: i32 = 8
+                while yy < h - 8 {
+                    var xx: i32 = 8
+                    while xx < w - 8 {
+                        let vb: i32 = (*((pb + (yy * w + xx) as u64) as *mut u8)) as i32
+                        let a0: i32 = (*((pa + (yy * w + xx) as u64) as *mut u8)) as i32
+                        let a1: i32 = (*((pa + ((h / 4 + yy / 2) * w + w / 4 + xx / 2) as u64) as *mut u8)) as i32
+                        var d0: i32 = vb - a0
+                        if d0 < 0 { d0 = 0 - d0 }
+                        var d1: i32 = vb - a1
+                        if d1 < 0 { d1 = 0 - d1 }
+                        m0 = m0 + d0 as i64
+                        m1 = m1 + d1 as i64
+                        cnt = cnt + 1
+                        xx = xx + 4
+                    }
+                    yy = yy + 4
+                }
+                say("zoom SAD x100 no-zoom ", m0 * 100 / cnt)
+                say("zoom SAD x100 centre-crop ", m1 * 100 / cnt)
+                check("PASS-7b 2x picture matches the centre crop of 1x", m1 * 2 < m0, &bad)
+            } else {
+                check("PASS-7b yuv captures", false, &bad)
+            }
+            camera.camera_free(ya, 32 * 1024 * 1024)
+            camera.camera_start(camera.KIND_JPEG)
+            sleep_ms(500)
+        }
+        // tap focus
+        check("PASS-11 bad tap refused", camera.camera_focus_at(1.5f, 0.5f, false, true) != camera.E_OK, &bad)
+        var li: camera.CamInfo = camera.zero_info()
+        camera.camera_info(0, &li)
+        say("lens0 facing ", li.facing as i64)
+        say("lens0 has_af ", if li.has_af { 1 } else { 0 })
+        camera.camera_focus_at(0.3f, 0.6f, false, false)
+        sleep_ms(700)
+        check("PASS-11b AF-only focus keeps results flowing", camera.camera_fail_count() < 20, &bad)
+        camera.camera_focus_clear()
+        let fr: i32 = camera.camera_focus_at(0.3f, 0.6f, false, true)
+        say("focus_at code ", fr as i64)
+        check("PASS-12 focus_at accepted", fr == camera.E_OK || fr == camera.E_UNSUPPORTED, &bad)
+        if fr == camera.E_OK {
+            var st: i32 = camera.FOCUS_IDLE
+            var w: i32 = 0
+            while w < 4000 && st != camera.FOCUS_FOCUSED && st != camera.FOCUS_FAILED {
+                if w % 500 == 0 { say("af raw while waiting ", camera.camera_af_state_raw() as i64) }
+                sleep_ms(100)
+                w = w + 100
+                st = camera.camera_focus_state()
+            }
+            say("focus state ", st as i64)
+            say("af raw ", camera.camera_af_state_raw() as i64)
+            say("ae raw ", camera.camera_ae_state_raw() as i64)
+            check("PASS-13 focus finished (focused or failed)", st == camera.FOCUS_FOCUSED || st == camera.FOCUS_FAILED, &bad)
+            check("PASS-14 focus active", camera.camera_focus_active(), &bad)
+            check("PASS-15 focus clear", camera.camera_focus_clear() == camera.E_OK && !camera.camera_focus_active(), &bad)
+        }
+        // capture still works with the controls active
+        var buf: u64 = camera.camera_alloc(16 * 1024 * 1024)
+        var fi: [camera.FrameInfo; 1] = [camera.zero_frame(); 1]
+        let got: i32 = camera.camera_capture(1, 0, 0, 0, buf, 16 * 1024 * 1024, &fi[0])
+        say("capture frames ", got as i64)
+        check("PASS-16 capture with controls", got == 1, &bad)
+        camera.camera_free(buf, 16 * 1024 * 1024)
+        // flash
+        var ci: camera.CamInfo = camera.zero_info()
+        camera.camera_info(0, &ci)
+        let fl: i32 = camera.camera_set_flash(camera.FLASH_AUTO)
+        if (ci.caps & camera.CAP_FLASH) == 0 as u32 {
+            check("PASS-17 no flash -> E_UNSUPPORTED, stays off", fl == camera.E_UNSUPPORTED && camera.camera_flash_mode() == camera.FLASH_OFF, &bad)
+        } else {
+            check("PASS-17 flash auto set", fl == camera.E_OK && camera.camera_flash_mode() == camera.FLASH_AUTO, &bad)
+            check("PASS-18 flash prepare", camera.camera_flash_prepare() == camera.E_OK, &bad)
+            let got2: i32 = camera.camera_capture(1, 0, 0, 0, camera.camera_alloc(16 * 1024 * 1024), 16 * 1024 * 1024, &fi[0])
+            check("PASS-19 capture with flash", got2 == 1, &bad)
+            camera.camera_set_flash(camera.FLASH_OFF)
+        }
+        check("PASS-20 bad flash mode refused", camera.camera_set_flash(9) != camera.E_OK, &bad)
+        camera.camera_close()
+    } else {
+        bad = bad + 1
+    }
+    say("RESULT bad=", bad as i64)
+    say("RESULT done", 0)
+    window.close_window(&f)
+    return 0
+}

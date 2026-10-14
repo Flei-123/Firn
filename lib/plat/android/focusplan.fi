@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // lib/plat/android/focusplan.fi -- pure focus-stack planning (no device access, testable on the host).
-export { focus_plan }
+export { focus_plan, tap_region, zoom_crop, zoom_pick }
 
 // Focus positions (diopters) for a focus stack, near to far, as a PURE function of the lens facts:
 // near_d = LENS_INFO_MINIMUM_FOCUS_DISTANCE, far_d = hyperfocal (or 0 = infinity), step_d = how far apart
@@ -29,3 +29,116 @@ fn focus_plan(near_d: f32, far_d: f32, step_d: f32, nmax: i32, out: u64) -> i32 
     return n
 }
 
+
+// ------------------------------------------------------------ tap to focus / zoom (pure)
+
+// Tap point -> metering region. (nx, ny) is a point in 0..1 of the UPRIGHT preview (the sensor picture rotated
+// `rot` degrees clockwise, as camera_preview_bgrx(rot = orientation) shows it; mirror = the preview is flipped
+// horizontally, front camera). The zoom window is the centre 1/zoom of the active array; the region keeps the same
+// share of the VISIBLE picture (size_frac of its shorter side, e.g. 0.15) and is clamped into the array.
+// Writes out[0..4) = xmin, ymin, xmax, ymax (i32, active-array pixels, android.control.afRegions order).
+#[no_gc]
+fn tap_region(nx: f32, ny: f32, rot: i32, mirror: bool, zoom: f32, aw: i32, ah: i32, size_frac: f32, out: u64) -> bool {
+    if aw <= 8 || ah <= 8 { return false }
+    if nx < 0.0f || nx > 1.0f || ny < 0.0f || ny > 1.0f { return false }
+    var ux: f32 = nx
+    if mirror { ux = 1.0f - nx }
+    var sx: f32 = ux
+    var sy: f32 = ny
+    let r: i32 = ((rot % 360) + 360) % 360
+    if r == 90 {
+        sx = ny
+        sy = 1.0f - ux
+    } else if r == 180 {
+        sx = 1.0f - ux
+        sy = 1.0f - ny
+    } else if r == 270 {
+        sx = 1.0f - ny
+        sy = ux
+    }
+    var z: f32 = zoom
+    if z < 1.0f { z = 1.0f }
+    let cx: f32 = (0.5f + (sx - 0.5f) / z) * (aw as f32)
+    let cy: f32 = (0.5f + (sy - 0.5f) / z) * (ah as f32)
+    // the region is square in SENSOR pixels, sized from the shorter side of the visible window
+    var short: f32 = aw as f32
+    if (ah as f32) < short { short = ah as f32 }
+    var frac: f32 = size_frac
+    if frac < 0.02f { frac = 0.02f }
+    if frac > 1.0f { frac = 1.0f }
+    let half: f32 = short * frac / z * 0.5f
+    var x0: i32 = (cx - half) as i32
+    var y0: i32 = (cy - half) as i32
+    var x1: i32 = (cx + half) as i32
+    var y1: i32 = (cy + half) as i32
+    if x0 < 0 { x0 = 0 }
+    if y0 < 0 { y0 = 0 }
+    if x1 > aw - 1 { x1 = aw - 1 }
+    if y1 > ah - 1 { y1 = ah - 1 }
+    if x1 <= x0 { x1 = x0 + 1 }
+    if y1 <= y0 { y1 = y0 + 1 }
+    *((out) as *mut i32) = x0
+    *((out + 4) as *mut i32) = y0
+    *((out + 8) as *mut i32) = x1
+    *((out + 12) as *mut i32) = y1
+    return true
+}
+
+// Centre crop for SCALER_CROP_REGION (devices without CONTROL_ZOOM_RATIO): out[0..4) = left, top, width, height
+// (even numbers, never outside the array).
+#[no_gc]
+fn zoom_crop(zoom: f32, aw: i32, ah: i32, out: u64) {
+    var z: f32 = zoom
+    if z < 1.0f { z = 1.0f }
+    var w: i32 = ((aw as f32) / z) as i32
+    var h: i32 = ((ah as f32) / z) as i32
+    w = w - (w % 2)
+    h = h - (h % 2)
+    if w < 2 { w = 2 }
+    if h < 2 { h = 2 }
+    if w > aw { w = aw }
+    if h > ah { h = ah }
+    *((out) as *mut i32) = (aw - w) / 2
+    *((out + 4) as *mut i32) = (ah - h) / 2
+    *((out + 8) as *mut i32) = w
+    *((out + 12) as *mut i32) = h
+}
+
+// Which lens serves zoom `zoom` (1.0 = the main lens `ref_idx`). equiv[0..n) = 35 mm equivalent focal length of
+// each candidate lens (0 = not a candidate, e.g. other facing). The target equivalent is equiv[ref] * zoom; the lens
+// with the longest equivalent that is not (more than 5 %) above the target wins -- so a tele lens takes over exactly
+// where its own zoom factor starts; below every lens the shortest one is used. *out_ratio = the remaining
+// CONTROL_ZOOM_RATIO for that lens (target / equiv[lens]). Returns the lens index, or -1 (no candidate / bad input).
+#[no_gc]
+fn zoom_pick(equiv: u64, n: i32, ref_idx: i32, zoom: f32, out_ratio: u64) -> i32 {
+    if n <= 0 || ref_idx < 0 || ref_idx >= n || zoom <= 0.0f { return 0 - 1 }
+    let ref_e: f32 = *((equiv + ((ref_idx * 4) as u64)) as *mut f32)
+    if ref_e <= 0.0f { return 0 - 1 }
+    let target: f32 = ref_e * zoom
+    var best: i32 = 0 - 1
+    var best_e: f32 = 0.0f
+    var short: i32 = 0 - 1
+    var short_e: f32 = 0.0f
+    var i: i32 = 0
+    while i < n {
+        let e: f32 = *((equiv + ((i * 4) as u64)) as *mut f32)
+        if e > 0.0f {
+            if e <= target * 1.05f && e > best_e {
+                best = i
+                best_e = e
+            }
+            if short < 0 || e < short_e {
+                short = i
+                short_e = e
+            }
+        }
+        i = i + 1
+    }
+    if best < 0 {
+        best = short
+        best_e = short_e
+    }
+    if best < 0 { return 0 - 1 }
+    *((out_ratio) as *mut f32) = target / best_e
+    return best
+}
