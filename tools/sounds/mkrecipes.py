@@ -783,6 +783,551 @@ def coverage_sounds():
 
 
 # events that are a stand-in on a sound which already exists (no new sample)
+# ------------------------------------------------------------------------------------------------ tier 3 (r166)
+# The 558 rare events (tools/mc/audio/coverage.py tier 3). Same archetypes as before (voice / perc / whoosh / tone / crackle), driven by tables.
+# Own seed range 30000+ (ns()) so NO existing recipe changes (their hashes stay). Rare variants of an action are ALIASES (an alias costs an
+# engine event, no sample). Order of the tables = order of seeds: only append at the END of a table.
+_T3 = [30000]
+
+
+def ns():
+    _T3[0] += 3
+    return _T3[0]
+
+
+def Nz(kind, cut, dec, g=0.8, at=0, color="white", q=1.5):
+    return (color, kind, cut, q, dec, g, at)
+
+
+# event -> (dur ms, f0 Hz, f1 Hz, wave, formant Hz, formant Q, vibrato, noise)
+T3_VOICES = {
+    "entity.allay.ambient_with_item": (450, 1000, 1400, "sine", 2800, 3, 0.05, 0.03),
+    "entity.allay.ambient_without_item": (400, 800, 1000, "sine", 2400, 3, 0.05, 0.03),
+    "entity.allay.hurt": (200, 1600, 1000, "sine", 3000, 3, 0.0, 0.03),
+    "entity.allay.death": (500, 1400, 500, "sine", 2600, 3, 0.03, 0.03),
+    "entity.axolotl.attack": (200, 500, 800, "pulse", 1300, 3, 0.0, 0.15),
+    "entity.axolotl.death": (450, 700, 250, "pulse", 1100, 3, 0.02, 0.15),
+    "entity.axolotl.hurt": (250, 900, 600, "pulse", 1300, 3, 0.0, 0.15),
+    "entity.axolotl.idle_air": (400, 700, 900, "pulse", 1500, 3, 0.04, 0.1),
+    "entity.axolotl.idle_water": (500, 450, 600, "sine", 900, 3, 0.05, 0.15),
+    "entity.bat.takeoff": (180, 2400, 4000, "pulse", 4400, 4, 0.0, 0.08),
+    "entity.camel.ambient": (1000, 150, 200, "saw", 600, 3, 0.03, 0.15),
+    "entity.camel.death": (1300, 300, 80, "saw", 700, 3, 0.03, 0.15),
+    "entity.camel.hurt": (500, 430, 260, "saw", 800, 3, 0.0, 0.15),
+    "entity.camel.dash": (500, 200, 320, "saw", 700, 3, 0.03, 0.2),
+    "entity.camel.dash_ready": (300, 260, 340, "saw", 800, 3, 0.0, 0.15),
+    "entity.cat.stray_ambient": (800, 520, 820, "saw", 1600, 4, 0.03, 0.1),
+    "entity.cat.beg_for_food": (600, 600, 950, "saw", 1700, 4, 0.05, 0.08),
+    "entity.cat.purr": (1400, 50, 46, "saw", 200, 2, 0.0, 0.5),
+    "entity.cat.purreow": (900, 520, 900, "saw", 1600, 3, 0.04, 0.1),
+    "entity.donkey.angry": (700, 650, 280, "saw", 1100, 3, 0.05, 0.1),
+    "entity.dolphin.play": (450, 2800, 4200, "sine", 3600, 3, 0.05, 0.06),
+    "entity.enderman.scream": (900, 300, 1100, "saw", 1000, 2, 0.06, 0.3),
+    "entity.enderman.stare": (1100, 420, 330, "saw", 800, 3, 0.05, 0.25),
+    "entity.evoker.ambient": (800, 190, 160, "pulse", 850, 4, 0.02, 0.15),
+    "entity.evoker.hurt": (380, 320, 200, "pulse", 1000, 4, 0.0, 0.15),
+    "entity.evoker.death": (1000, 260, 70, "pulse", 800, 4, 0.02, 0.18),
+    "entity.evoker.celebrate": (900, 200, 420, "saw", 900, 3, 0.1, 0.12),
+    "entity.evoker.prepare_attack": (1000, 150, 320, "saw", 700, 3, 0.04, 0.2),
+    "entity.evoker.prepare_summon": (1100, 120, 280, "saw", 600, 3, 0.05, 0.3),
+    "entity.evoker.prepare_wololo": (1200, 180, 360, "saw", 800, 3, 0.12, 0.2),
+    "entity.fox.aggro": (500, 900, 1500, "saw", 2200, 3, 0.03, 0.15),
+    "entity.fox.screech": (700, 1400, 2300, "saw", 2400, 3, 0.06, 0.15),
+    "entity.fox.sleep": (900, 300, 230, "sine", 700, 3, 0.03, 0.4),
+    "entity.frog.ambient": (350, 150, 240, "pulse", 520, 3, 0.0, 0.2),
+    "entity.frog.death": (500, 130, 60, "pulse", 450, 3, 0.02, 0.25),
+    "entity.frog.hurt": (250, 200, 120, "pulse", 520, 3, 0.0, 0.25),
+    "entity.frog.lay_spawn": (900, 120, 90, "pulse", 420, 3, 0.05, 0.3),
+    "entity.ghast.scream": (1200, 900, 500, "saw", 1700, 3, 0.08, 0.15),
+    "entity.ghast.warn": (700, 450, 720, "saw", 1400, 3, 0.05, 0.12),
+    "entity.goat.ambient": (750, 420, 340, "saw", 1400, 4, 0.12, 0.05),
+    "entity.goat.death": (800, 520, 160, "saw", 1300, 4, 0.1, 0.06),
+    "entity.goat.hurt": (400, 680, 430, "saw", 1500, 4, 0.06, 0.06),
+    "entity.horse.breathe": (600, 200, 190, "sine", 500, 2, 0.0, 0.8),
+    "entity.hostile.death": (700, 200, 60, "saw", 500, 3, 0.01, 0.3),
+    "entity.hostile.hurt": (350, 260, 150, "saw", 600, 3, 0.0, 0.3),
+    "entity.panda.cant_breed": (500, 320, 220, "saw", 800, 3, 0.04, 0.1),
+    "entity.panda.aggressive_ambient": (700, 170, 250, "saw", 700, 3, 0.05, 0.15),
+    "entity.panda.worried_ambient": (700, 430, 320, "sine", 1000, 3, 0.05, 0.1),
+    "entity.puffer_fish.ambient": (300, 700, 600, "pulse", 1400, 3, 0.0, 0.2),
+    "entity.ravager.roar": (1800, 80, 190, "saw", 420, 2, 0.03, 0.4),
+    "entity.ravager.stunned": (900, 130, 90, "saw", 500, 3, 0.06, 0.3),
+    "entity.shulker.ambient": (600, 300, 260, "pulse", 1000, 3, 0.03, 0.15),
+    "entity.shulker.death": (600, 260, 90, "pulse", 800, 3, 0.02, 0.2),
+    "entity.shulker.hurt": (250, 360, 220, "pulse", 1000, 3, 0.0, 0.2),
+    "entity.sniffer.idle": (800, 110, 150, "saw", 420, 3, 0.03, 0.25),
+    "entity.sniffer.hurt": (400, 220, 140, "saw", 500, 3, 0.0, 0.25),
+    "entity.sniffer.death": (1000, 180, 60, "saw", 420, 3, 0.02, 0.3),
+    "entity.sniffer.happy": (600, 130, 200, "saw", 450, 3, 0.04, 0.2),
+    "entity.sniffer.searching": (700, 100, 130, "saw", 400, 3, 0.03, 0.3),
+    "entity.vex.ambient": (500, 900, 1100, "saw", 1800, 3, 0.06, 0.12),
+    "entity.vex.charge": (600, 600, 1600, "saw", 1800, 3, 0.05, 0.15),
+    "entity.vex.death": (500, 1000, 300, "saw", 1500, 3, 0.04, 0.15),
+    "entity.vex.hurt": (250, 1300, 800, "saw", 1900, 3, 0.0, 0.15),
+    "entity.villager.celebrate": (800, 230, 400, "pulse", 1100, 3, 0.06, 0.12),
+    "entity.villager.no": (500, 260, 170, "pulse", 950, 3, 0.02, 0.12),
+    "entity.villager.trade": (450, 240, 320, "pulse", 1050, 3, 0.02, 0.12),
+    "entity.villager.yes": (400, 210, 310, "pulse", 1000, 3, 0.02, 0.12),
+    "entity.vindicator.ambient": (800, 150, 120, "saw", 650, 4, 0.02, 0.2),
+    "entity.vindicator.celebrate": (900, 160, 300, "saw", 700, 4, 0.08, 0.2),
+    "entity.vindicator.death": (900, 210, 70, "saw", 650, 4, 0.02, 0.2),
+    "entity.vindicator.hurt": (380, 250, 150, "saw", 800, 4, 0.0, 0.2),
+    "entity.warden.agitated": (1000, 70, 95, "saw", 250, 2, 0.03, 0.35),
+    "entity.warden.ambient": (1500, 60, 52, "saw", 230, 2, 0.01, 0.35),
+    "entity.warden.angry": (1000, 65, 110, "saw", 260, 2, 0.04, 0.4),
+    "entity.warden.death": (2000, 70, 28, "saw", 240, 2, 0.02, 0.45),
+    "entity.warden.hurt": (500, 110, 60, "saw", 280, 2, 0.0, 0.4),
+    "entity.ender_dragon.growl": (1500, 90, 60, "saw", 300, 2, 0.02, 0.4),
+    "entity.warden.listening": (900, 75, 85, "saw", 240, 2, 0.02, 0.3),
+    "entity.warden.listening_angry": (900, 70, 100, "saw", 260, 2, 0.04, 0.35),
+    "entity.warden.roar": (2200, 55, 110, "saw", 250, 2, 0.03, 0.45),
+    "entity.wolf.growl": (800, 115, 90, "saw", 600, 3, 0.05, 0.2),
+    "entity.wolf.howl": (2400, 380, 520, "sine", 900, 3, 0.03, 0.08),
+    "entity.wolf.whine": (700, 750, 420, "saw", 1300, 3, 0.05, 0.1),
+    "entity.wither.spawn": (3500, 45, 130, "saw", 320, 2, 0.02, 0.45),
+    "block.sculk_shrieker.shriek": (2000, 1300, 2700, "saw", 2300, 2, 0.08, 0.35),
+    # imitation bases (not events)
+    "imitate.creeper": (500, 400, 250, "pulse", 900, 2, 0.0, 0.7),
+    "imitate.skeleton": (600, 200, 160, "pulse", 1200, 4, 0.0, 0.4),
+    "imitate.spider": (400, 700, 500, "saw", 1500, 2, 0.0, 0.6),
+}
+T3_LOOP_VOICES = {
+    "entity.bat.loop": (500, 3200, 3800, "saw", 4200, 4, 0.0, 0.05),
+    "entity.bee.loop": (400, 200, 215, "saw", 700, 3, 0.04, 0.25),
+    "entity.bee.loop_aggressive": (400, 250, 300, "saw", 900, 3, 0.06, 0.3),
+}
+# new event -> (base event/row, pitch factor, duration factor, formant factor)   (resolved in order: a base may be an earlier derived one)
+T3_DERIVED = [
+    ("entity.endermite.ambient", "entity.silverfish.ambient", 0.85, 1.3, 0.9), ("entity.endermite.hurt", "entity.silverfish.hurt", 0.85, 1.3, 0.9),
+    ("entity.endermite.death", "entity.silverfish.death", 0.85, 1.3, 0.9),
+    ("entity.elder_guardian.ambient", "entity.guardian.ambient", 0.6, 1.4, 0.7), ("entity.elder_guardian.ambient_land", "entity.guardian.ambient_land", 0.6, 1.4, 0.7),
+    ("entity.elder_guardian.curse", "entity.guardian.attack", 0.5, 2.2, 0.6), ("entity.elder_guardian.death", "entity.guardian.death", 0.6, 1.4, 0.7),
+    ("entity.elder_guardian.death_land", "entity.guardian.death_land", 0.6, 1.4, 0.7), ("entity.elder_guardian.hurt", "entity.guardian.hurt", 0.6, 1.3, 0.7),
+    ("entity.elder_guardian.hurt_land", "entity.guardian.hurt_land", 0.6, 1.3, 0.7),
+    ("entity.goat.screaming.ambient", "entity.goat.ambient", 1.7, 0.8, 1.5), ("entity.goat.screaming.death", "entity.goat.death", 1.7, 0.8, 1.5),
+    ("entity.goat.screaming.hurt", "entity.goat.hurt", 1.7, 0.8, 1.5),
+    ("entity.hoglin.angry", "entity.hoglin.hurt", 0.9, 1.3, 0.9), ("entity.hoglin.converted_to_zombified", "entity.hoglin.death", 1.1, 0.8, 1.0),
+    ("entity.hoglin.retreat", "entity.hoglin.ambient", 1.3, 0.7, 1.1),
+    ("entity.horse.angry", "entity.horse.hurt", 0.85, 1.3, 0.9), ("entity.husk.converted_to_zombie", "entity.husk.death", 1.1, 0.7, 1.0),
+    ("entity.illusioner.ambient", "entity.evoker.ambient", 0.85, 1.0, 0.9), ("entity.illusioner.hurt", "entity.evoker.hurt", 0.85, 1.0, 0.9),
+    ("entity.illusioner.death", "entity.evoker.death", 0.85, 1.0, 0.9), ("entity.illusioner.prepare_blindness", "entity.evoker.prepare_attack", 0.9, 1.0, 0.9),
+    ("entity.illusioner.prepare_mirror", "entity.evoker.prepare_summon", 0.9, 1.0, 0.9),
+    ("entity.llama.angry", "entity.llama.hurt", 0.8, 1.5, 0.9), ("entity.mule.angry", "entity.donkey.angry", 0.9, 1.0, 0.95),
+    ("entity.piglin.admiring_item", "entity.piglin.ambient", 1.1, 1.4, 0.9), ("entity.piglin.angry", "entity.piglin.hurt", 0.85, 1.5, 0.9),
+    ("entity.piglin.celebrate", "entity.piglin.ambient", 1.25, 1.5, 1.0), ("entity.piglin.jealous", "entity.piglin.ambient", 0.8, 1.3, 1.0),
+    ("entity.piglin.retreat", "entity.piglin.hurt", 1.15, 0.9, 1.1), ("entity.piglin.converted_to_zombified", "entity.piglin.death", 1.0, 1.3, 0.9),
+    ("entity.piglin_brute.ambient", "entity.piglin.ambient", 0.75, 1.1, 0.9), ("entity.piglin_brute.angry", "entity.piglin.hurt", 0.7, 1.5, 0.9),
+    ("entity.piglin_brute.death", "entity.piglin.death", 0.75, 1.2, 0.9), ("entity.piglin_brute.hurt", "entity.piglin.hurt", 0.75, 1.0, 0.9),
+    ("entity.piglin_brute.converted_to_zombified", "entity.piglin.death", 0.75, 1.3, 0.9),
+    ("entity.pillager.celebrate", "entity.pillager.ambient", 1.2, 1.2, 1.0), ("entity.polar_bear.warning", "entity.polar_bear.hurt", 0.8, 1.8, 1.0),
+    ("entity.puffer_fish.death", "entity.cod.death", 0.8, 1.2, 0.9), ("entity.puffer_fish.hurt", "entity.cod.hurt", 0.8, 1.0, 0.9),
+    ("entity.ravager.ambient", "entity.hoglin.ambient", 0.6, 1.5, 0.9), ("entity.ravager.attack", "entity.hoglin.hurt", 0.55, 1.2, 0.9),
+    ("entity.ravager.celebrate", "entity.hoglin.ambient", 0.5, 1.6, 0.9), ("entity.ravager.death", "entity.hoglin.death", 0.55, 1.4, 0.9),
+    ("entity.ravager.hurt", "entity.hoglin.hurt", 0.6, 1.1, 0.9),
+    ("entity.glow_squid.ambient", "entity.squid.ambient", 1.25, 1.0, 1.1), ("entity.glow_squid.death", "entity.squid.death", 1.25, 1.0, 1.1),
+    ("entity.glow_squid.hurt", "entity.squid.hurt", 1.25, 1.0, 1.1),
+    ("entity.skeleton_horse.ambient", "entity.horse.ambient", 1.4, 0.8, 1.3), ("entity.skeleton_horse.death", "entity.horse.death", 1.4, 0.8, 1.3),
+    ("entity.skeleton_horse.hurt", "entity.horse.hurt", 1.4, 0.8, 1.3),
+    ("entity.strider.happy", "entity.strider.ambient", 1.1, 0.7, 1.0), ("entity.strider.retreat", "entity.strider.hurt", 1.15, 0.9, 1.0),
+    ("entity.stray.ambient", "entity.wither_skeleton.ambient", 1.25, 0.9, 1.2), ("entity.stray.hurt", "entity.wither_skeleton.hurt", 1.25, 1.0, 1.2),
+    ("entity.stray.death", "entity.wither_skeleton.death", 1.25, 1.0, 1.2),
+    ("entity.tadpole.death", "entity.frog.death", 1.9, 0.5, 1.4), ("entity.tadpole.hurt", "entity.frog.hurt", 1.9, 0.6, 1.4),
+    ("entity.tropical_fish.ambient", "entity.cod.ambient", 1.3, 1.0, 1.2), ("entity.tropical_fish.death", "entity.cod.death", 1.3, 1.0, 1.2),
+    ("entity.tropical_fish.hurt", "entity.cod.hurt", 1.3, 1.0, 1.2),
+    ("entity.wandering_trader.ambient", "entity.villager.ambient", 0.8, 1.2, 0.9), ("entity.wandering_trader.death", "entity.villager.death", 0.8, 1.1, 0.9),
+    ("entity.wandering_trader.hurt", "entity.villager.hurt", 0.8, 1.1, 0.9), ("entity.wandering_trader.no", "entity.villager.no", 0.8, 1.1, 0.9),
+    ("entity.wandering_trader.yes", "entity.villager.yes", 0.8, 1.1, 0.9), ("entity.wandering_trader.trade", "entity.villager.trade", 0.8, 1.1, 0.9),
+    ("entity.witch.celebrate", "entity.witch.ambient", 1.2, 1.4, 1.1),
+    ("entity.zoglin.ambient", "entity.hoglin.ambient", 0.9, 1.0, 0.95), ("entity.zoglin.angry", "entity.hoglin.hurt", 0.85, 1.3, 0.95),
+    ("entity.zoglin.attack", "entity.hoglin.attack", 0.85, 1.0, 0.95), ("entity.zoglin.death", "entity.hoglin.death", 0.85, 1.0, 0.95),
+    ("entity.zoglin.hurt", "entity.hoglin.hurt", 0.85, 1.0, 0.95),
+    ("entity.zombie.converted_to_drowned", "entity.drowned.ambient", 1.0, 1.3, 0.8), ("entity.zombie.infect", "entity.zombie_villager.ambient", 0.8, 1.2, 0.9),
+    ("entity.zombie_horse.ambient", "entity.horse.ambient", 0.75, 1.1, 0.8), ("entity.zombie_horse.death", "entity.horse.death", 0.75, 1.1, 0.8),
+    ("entity.zombie_horse.hurt", "entity.horse.hurt", 0.75, 1.1, 0.8),
+    ("entity.zombified_piglin.ambient", "entity.piglin.ambient", 0.8, 1.2, 0.9), ("entity.zombified_piglin.angry", "entity.piglin.hurt", 0.8, 1.4, 0.9),
+    ("entity.zombified_piglin.death", "entity.piglin.death", 0.8, 1.2, 0.9), ("entity.zombified_piglin.hurt", "entity.piglin.hurt", 0.8, 1.0, 0.9),
+    ("entity.zombie_villager.converted", "entity.zombie_villager.ambient", 1.3, 1.3, 1.1), ("entity.zombie_villager.cure", "entity.zombie_villager.hurt", 1.2, 1.6, 1.0),
+]
+# parrot imitations: the mob's ambient voice, pitched up and short
+T3_IMITATE = {
+    "blaze": "entity.blaze.ambient", "creeper": "imitate.creeper", "drowned": "entity.drowned.ambient", "elder_guardian": "entity.elder_guardian.ambient",
+    "ender_dragon": "entity.ender_dragon.ambient", "endermite": "entity.endermite.ambient", "evoker": "entity.evoker.ambient", "ghast": "entity.ghast.ambient",
+    "guardian": "entity.guardian.ambient", "hoglin": "entity.hoglin.ambient", "husk": "entity.husk.ambient", "illusioner": "entity.illusioner.ambient",
+    "magma_cube": "entity.magma_cube.hurt", "phantom": "entity.phantom.ambient", "piglin": "entity.piglin.ambient", "piglin_brute": "entity.piglin_brute.ambient",
+    "pillager": "entity.pillager.ambient", "ravager": "entity.ravager.ambient", "shulker": "entity.shulker.ambient", "silverfish": "entity.silverfish.ambient",
+    "skeleton": "imitate.skeleton", "slime": "entity.slime.hurt", "spider": "imitate.spider", "stray": "entity.stray.ambient", "vex": "entity.vex.ambient",
+    "vindicator": "entity.vindicator.ambient", "warden": "entity.warden.ambient", "witch": "entity.witch.ambient", "wither": "entity.wither.ambient",
+    "wither_skeleton": "entity.wither_skeleton.ambient", "zoglin": "entity.zoglin.ambient", "zombie": "entity.zombie.ambient",
+    "zombie_villager": "entity.zombie_villager.ambient",
+}
+
+
+def t3_voices():
+    rows = {}
+    for mob in MOB_VOICES:
+        for call in MOB_VOICES[mob]:
+            rows["entity.%s.%s" % (mob, call)] = MOB_VOICES[mob][call]
+    for sid, (mob, call, pf, df, ff) in MOB_DERIVED.items():
+        if mob in MOB_VOICES:
+            d_, a_, b_, w_, fo_, fq_, vb_, nz_ = MOB_VOICES[mob][call]
+            rows[sid] = (int(d_ * df), a_ * pf, b_ * pf, w_, fo_ * ff, fq_, vb_, nz_)
+    rows["entity.zombie.hurt"] = (330, 170, 110, "saw", 650, 4, 0.0, 0.2)
+    rows["entity.zombie.ambient"] = (900, 140, 100, "saw", 600, 4, 0.02, 0.2)
+    rows.update(T3_VOICES)
+    o = []
+    for name, (dur, f0, f1, wave, form, fq, vib, nz) in T3_VOICES.items():
+        if not name.startswith("imitate."):
+            o.append(voice(name, ns(), dur, f0, f1, wave, form, fq, vib=vib, noise_amt=nz, variants=2, peak=-6 if wave == "sine" else -4))
+    for name, (dur, f0, f1, wave, form, fq, vib, nz) in T3_LOOP_VOICES.items():
+        o.append(loopify(voice(name, ns(), dur, f0, f1, wave, form, fq, vib=vib, noise_amt=nz, variants=1), 60))
+    for new, base, pf, df, ff in T3_DERIVED:
+        dur, f0, f1, wave, form, fq, vib, nz = rows[base]
+        rows[new] = (int(dur * df), f0 * pf, f1 * pf, wave, form * ff, fq, vib, nz)
+        o.append(voice(new, ns(), rows[new][0], rows[new][1], rows[new][2], wave, rows[new][4], fq, vib=vib, noise_amt=nz, variants=1,
+                       peak=-6 if wave == "sine" else -4))
+    for mob, base in T3_IMITATE.items():
+        dur, f0, f1, wave, form, fq, vib, nz = rows[base]
+        pf = max(2.0, min(8.0, 520.0 / f0))
+        o.append(voice("entity.parrot.imitate." + mob, ns(), int(dur * 0.6), f0 * pf, f1 * pf, wave, min(form * 1.8, 5200), fq, vib=vib, noise_amt=nz, variants=1))
+    return o
+
+
+# name -> (dur, [noise layers Nz()], body (f0, f1, decay, gain, at) | None, [partials (f, gain, decay, at)], peak)
+def _Pc(*a):
+    return a
+
+
+T3_PERC = [
+    ("item.axe.strip", 220, [Nz("bp", 1800, 60, 0.8, 0, "white", 1.2), Nz("bp", 900, 50, 0.6, 60)], (200, 110, 60, 0.6, 0), [], -6),
+    ("item.axe.scrape", 300, [Nz("bp", 2400, 120, 0.7, 0, "pink", 1.0)], None, [], -8),
+    ("item.axe.wax_off", 260, [Nz("hp", 3000, 70, 0.6, 0, "white", 0.8), Nz("bp", 1600, 60, 0.5, 90)], None, [], -8),
+    ("item.shovel.flatten", 240, [Nz("bp", 600, 90, 0.9, 0, "brown", 0.8)], (140, 80, 80, 0.8, 0), [], -6),
+    ("item.hoe.till", 220, [Nz("bp", 800, 70, 0.8, 0, "brown", 0.9)], (180, 100, 60, 0.7, 0), [], -6),
+    ("item.crop.plant", 180, [Nz("bp", 700, 60, 0.7, 0, "brown", 1.5)], (150, 90, 40, 0.5, 0), [], -8),
+    ("block.growing_plant.crop", 200, [Nz("hp", 3500, 40, 0.6, 0, "pink"), Nz("bp", 900, 50, 0.6, 50, "brown")], None, [], -9),
+    ("item.bone_meal.use", 250, [Nz("hp", 4000, 30, 0.5, 0, "white", 0.8), Nz("bp", 2500, 40, 0.5, 80), Nz("bp", 3000, 40, 0.4, 150)], None, [], -9),
+    ("item.dye.use", 260, [Nz("bp", 1800, 160, 0.7, 0, "pink", 0.7)], None, [], -9),
+    ("item.ink_sac.use", 280, [Nz("bp", 1200, 150, 0.8, 0, "brown", 0.7)], (300, 120, 90, 0.4, 0), [], -8),
+    ("item.glow_ink_sac.use", 300, [Nz("bp", 1200, 150, 0.8, 0, "brown", 0.7)], (300, 120, 90, 0.4, 0), [(1800, 0.25, 150, 60)], -8),
+    ("item.honeycomb.wax_on", 260, [Nz("bp", 1500, 100, 0.7, 0, "pink", 0.8)], (260, 160, 80, 0.4, 40), [], -8),
+    ("item.honey_bottle.drink", 560, [Nz("bp", 500, 80, 0.7, 0, "brown", 0.8), Nz("bp", 450, 80, 0.7, 170, "brown", 0.8), Nz("bp", 400, 90, 0.7, 340, "brown", 0.8)],
+     (180, 110, 60, 0.7, 0), [], -7),
+    ("item.book.page_turn", 220, [Nz("hp", 3500, 90, 0.8, 0, "white", 0.7), Nz("bp", 5000, 50, 0.4, 110)], None, [], -9),
+    ("item.book.put", 160, [Nz("bp", 1200, 40, 0.8)], (170, 100, 40, 0.7, 0), [], -7),
+    ("item.bundle.insert", 200, [Nz("bp", 1400, 80, 0.8, 0, "pink", 0.8)], (240, 140, 40, 0.4, 60), [], -8),
+    ("item.bundle.remove_one", 200, [Nz("bp", 1700, 70, 0.8, 0, "pink", 0.8)], (280, 170, 40, 0.4, 20), [], -8),
+    ("item.bundle.drop_contents", 340, [Nz("bp", 1100, 200, 0.8, 0, "pink", 0.8), Nz("bp", 1500, 80, 0.5, 120, "pink")], (220, 120, 60, 0.4, 40), [], -8),
+    ("block.cake.add_candle", 180, [Nz("bp", 1300, 50, 0.7, 0, "pink")], (320, 200, 40, 0.5, 0), [], -8),
+    ("entity.chicken.egg", 200, [Nz("bp", 2000, 20, 0.5)], (400, 200, 60, 0.8, 0), [], -7),
+    ("entity.cow.milk", 420, [Nz("bp", 900, 70, 0.7, 0, "pink", 0.9), Nz("bp", 1000, 70, 0.7, 130, "pink", 0.9), Nz("bp", 1100, 70, 0.7, 260, "pink", 0.9)], None, [], -9),
+    ("block.chiseled_bookshelf.insert", 200, [Nz("bp", 1100, 50, 0.8), Nz("hp", 4000, 40, 0.3, 30)], (230, 130, 50, 0.7, 0), [], -7),
+    ("block.chiseled_bookshelf.insert.enchanted", 400, [Nz("bp", 1100, 50, 0.8), Nz("hp", 4000, 40, 0.3, 30)], (230, 130, 50, 0.7, 0), [(2600, 0.25, 300, 40), (3900, 0.15, 250, 60)], -7),
+    ("block.chiseled_bookshelf.pickup", 200, [Nz("bp", 1300, 50, 0.8), Nz("hp", 4500, 40, 0.3, 20)], (260, 160, 40, 0.6, 0), [], -7),
+    ("block.chiseled_bookshelf.pickup.enchanted", 400, [Nz("bp", 1300, 50, 0.8), Nz("hp", 4500, 40, 0.3, 20)], (260, 160, 40, 0.6, 0), [(3100, 0.25, 300, 30), (4100, 0.15, 250, 50)], -7),
+    ("block.decorated_pot.shatter", 420, [Nz("hp", 3000, 90, 0.9, 0, "white", 0.8), Nz("bp", 2000, 60, 0.6, 70)], None, [(2200, 0.3, 120, 0), (3100, 0.2, 90, 20)], -6),
+    ("block.comparator.click", 120, [Nz("bp", 2600, 8, 0.8), Nz("bp", 2000, 10, 0.6, 30)], (800, 380, 25, 0.5, 0), [], -7),
+    ("block.metal_pressure_plate.click_on", 120, [Nz("bp", 3500, 10, 0.8)], (1400, 700, 40, 0.5, 0), [(2600, 0.3, 80, 0)], -7),
+    ("block.metal_pressure_plate.click_off", 110, [Nz("bp", 3000, 9, 0.8)], (1100, 560, 40, 0.5, 0), [(2300, 0.3, 70, 0)], -8),
+    ("block.pointed_dripstone.land", 300, [Nz("bp", 1500, 30, 0.8)], (200, 120, 50, 0.8, 0), [(2200, 0.3, 150, 0)], -6),
+    ("block.big_dripleaf.tilt_down", 260, [Nz("bp", 800, 100, 0.7, 0, "pink", 0.9)], (200, 110, 60, 0.7, 0), [], -8),
+    ("block.big_dripleaf.tilt_up", 260, [Nz("bp", 1000, 100, 0.7, 0, "pink", 0.9)], (260, 150, 50, 0.6, 0), [], -8),
+    ("entity.evoker_fangs.attack", 260, [Nz("bp", 3000, 30, 0.9)], (350, 120, 60, 0.8, 0), [(900, 0.3, 100, 0)], -5),
+    ("block.pumpkin.carve", 260, [Nz("bp", 3000, 40, 0.8), Nz("bp", 2500, 40, 0.6, 70)], (260, 160, 50, 0.4, 0), [], -7),
+    ("entity.sheep.shear", 200, [Nz("bp", 5000, 30, 0.8), Nz("bp", 4500, 30, 0.7, 80)], None, [], -8),
+    ("block.sign.waxed_interact_fail", 120, [Nz("bp", 1800, 12, 0.8), Nz("bp", 1500, 12, 0.7, 45)], (300, 180, 30, 0.5, 0), [], -8),
+    ("entity.iron_golem.damage", 320, [Nz("bp", 2800, 40, 0.8), Nz("bp", 2000, 60, 0.6, 90)], (200, 100, 70, 0.8, 0), [(900, 0.3, 200, 0), (1500, 0.2, 140, 0)], -5),
+    ("entity.iron_golem.repair", 420, [Nz("bp", 3000, 30, 0.5)], None, [(1100, 0.5, 300, 0), (2200, 0.25, 220, 0)], -7),
+    ("entity.horse.armor", 240, [Nz("bp", 3200, 40, 0.7), Nz("bp", 2600, 40, 0.6, 70)], None, [(1700, 0.3, 120, 0)], -8),
+    ("entity.horse.saddle", 240, [Nz("bp", 900, 70, 0.8, 0, "pink", 0.9)], (200, 100, 50, 0.6, 0), [], -7),
+    ("entity.horse.jump", 260, [Nz("bp", 700, 60, 0.6, 0, "pink", 0.9)], (170, 80, 80, 0.8, 0), [], -6),
+    ("entity.horse.land", 300, [Nz("bp", 600, 90, 0.8, 0, "brown", 0.9)], (130, 60, 120, 1.0, 0), [], -5),
+    ("entity.horse.gallop", 420, [Nz("bp", 1500, 25, 0.8, 0), Nz("bp", 1400, 25, 0.8, 110), Nz("bp", 1500, 25, 0.8, 210), Nz("bp", 1400, 25, 0.8, 320)],
+     (150, 90, 30, 0.8, 0), [(170, 0.7, 40, 110), (150, 0.7, 40, 210), (160, 0.7, 40, 320)], -7),
+    ("entity.donkey.chest", 280, [Nz("bp", 1200, 40, 0.7), Nz("bp", 3000, 30, 0.4, 60)], (220, 120, 50, 0.7, 0), [(1900, 0.2, 100, 60)], -7),
+    ("entity.horse.eat", 520, [Nz("bp", 1100, 30, 0.8, 0, "brown", 1.5), Nz("bp", 1000, 30, 0.7, 130, "brown", 1.5), Nz("bp", 1200, 30, 0.8, 260, "brown", 1.5),
+                              Nz("bp", 1000, 30, 0.7, 390, "brown", 1.5)], None, [], -9),
+    ("entity.fox.eat", 360, [Nz("bp", 2400, 20, 0.8, 0, "pink", 2.0), Nz("bp", 2200, 20, 0.7, 90, "pink", 2.0), Nz("bp", 2500, 20, 0.7, 180, "pink", 2.0)], None, [], -10),
+    ("entity.fox.bite", 200, [Nz("bp", 2000, 15, 0.8), Nz("bp", 1700, 15, 0.5, 40)], (250, 150, 40, 0.8, 0), [], -6),
+    ("entity.llama.swag", 260, [Nz("bp", 900, 90, 0.8, 0, "pink", 0.8)], (180, 100, 60, 0.4, 0), [], -9),
+    ("entity.llama.spit", 220, [Nz("bp", 2500, 40, 0.7, 0, "white", 1.0)], (900, 400, 60, 0.5, 0), [], -8),
+    ("entity.camel.sit", 380, [Nz("bp", 700, 120, 0.8, 0, "brown", 0.9)], (120, 60, 150, 1.0, 0), [], -6),
+    ("entity.camel.stand", 380, [Nz("bp", 800, 120, 0.8, 0, "brown", 0.9)], (140, 70, 130, 1.0, 40), [], -6),
+    ("entity.camel.step_sand", 220, [Nz("bp", 600, 90, 0.9, 0, "brown", 0.8)], (110, 60, 80, 0.8, 0), [], -8),
+    ("entity.pig.saddle", 240, [Nz("bp", 900, 70, 0.8, 0, "pink", 0.9)], (220, 110, 50, 0.6, 0), [(1500, 0.15, 50, 40)], -7),
+    ("entity.rabbit.jump", 140, [Nz("bp", 700, 40, 0.6, 0, "pink", 1.0)], (200, 100, 40, 0.7, 0), [], -10),
+    ("entity.cod.flop", 220, [Nz("bp", 1500, 30, 0.8, 0, "pink", 1.0), Nz("bp", 1300, 30, 0.6, 90, "pink", 1.0)], (260, 120, 40, 0.5, 0), [], -9),
+    ("entity.bee.sting", 140, [Nz("bp", 4000, 20, 0.8)], (1500, 700, 50, 0.5, 0), [], -8),
+    ("entity.bee.pollinate", 260, [Nz("bp", 1500, 50, 0.2)], None, [(660, 0.5, 200, 0), (990, 0.3, 160, 40)], -12),
+    ("block.beehive.shear", 200, [Nz("bp", 4500, 30, 0.8), Nz("bp", 4000, 30, 0.7, 70)], (240, 140, 40, 0.3, 0), [], -8),
+    ("block.beehive.work", 320, [Nz("bp", 1800, 50, 0.4, 0, "pink", 1.0)], None, [(190, 0.4, 250, 0)], -14),
+    ("entity.turtle.lay_egg", 380, [Nz("bp", 700, 120, 0.8, 0, "brown", 0.9), Nz("bp", 900, 60, 0.5, 150, "brown", 0.9)], (140, 70, 100, 0.8, 0), [], -7),
+    ("entity.turtle.egg_crack", 160, [Nz("bp", 2500, 15, 0.8)], (700, 400, 20, 0.4, 0), [], -8),
+    ("entity.turtle.egg_break", 240, [Nz("bp", 2200, 30, 0.8), Nz("bp", 3000, 25, 0.5, 40)], (500, 250, 40, 0.5, 0), [], -7),
+    ("entity.turtle.egg_hatch", 320, [Nz("bp", 2000, 40, 0.8), Nz("bp", 2800, 40, 0.5, 80)], (400, 200, 60, 0.5, 0), [(1600, 0.2, 160, 80)], -7),
+    ("entity.turtle.shamble", 240, [Nz("bp", 700, 80, 0.8, 0, "brown", 0.9)], (150, 80, 80, 0.8, 0), [], -9),
+    ("block.sniffer_egg.plop", 260, [Nz("bp", 700, 90, 0.8, 0, "brown", 0.9)], (180, 90, 90, 0.9, 0), [], -7),
+    ("block.sniffer_egg.crack", 200, [Nz("bp", 2200, 20, 0.8)], (600, 300, 30, 0.4, 0), [], -8),
+    ("block.sniffer_egg.hatch", 340, [Nz("bp", 2000, 40, 0.8), Nz("bp", 2800, 40, 0.5, 90)], (350, 170, 70, 0.6, 0), [], -7),
+    ("entity.sniffer.drop_seed", 200, [Nz("bp", 1200, 40, 0.7, 0, "pink", 1.0)], (300, 150, 40, 0.5, 0), [(1900, 0.2, 100, 20)], -9),
+    ("block.frogspawn.hatch", 240, [Nz("bp", 1200, 80, 0.7, 0, "pink", 1.0)], (400, 200, 60, 0.6, 0), [], -9),
+    ("entity.frog.eat", 200, [Nz("bp", 1600, 30, 0.7, 0, "pink", 1.2)], (500, 250, 50, 0.7, 0), [], -8),
+    ("entity.frog.long_jump", 240, [Nz("bp", 900, 60, 0.6, 0, "pink", 1.0)], (300, 140, 70, 0.8, 0), [], -8),
+    ("entity.frog.step", 140, [Nz("bp", 900, 25, 0.8, 0, "pink", 1.2)], (250, 130, 30, 0.7, 0), [], -11),
+    ("entity.ravager.step", 340, [Nz("bp", 500, 100, 0.8, 0, "brown", 0.9)], (100, 45, 160, 1.0, 0), [], -5),
+    ("entity.warden.step", 420, [Nz("bp", 400, 140, 0.8, 0, "brown", 0.9)], (80, 35, 200, 1.0, 0), [], -4),
+    ("entity.warden.attack_impact", 520, [Nz("bp", 500, 160, 0.9, 0, "brown", 0.9)], (90, 35, 260, 1.0, 0), [(55, 0.6, 300, 0)], -3),
+    ("entity.warden.heartbeat", 700, [Nz("bp", 300, 80, 0.4, 0, "brown", 0.9)], (65, 40, 120, 1.0, 0), [(50, 0.8, 120, 220)], -4),
+    ("entity.warden.nearby_close", 900, [Nz("bp", 300, 80, 0.4, 0, "brown", 0.9)], (65, 40, 120, 1.0, 0), [(50, 0.8, 120, 300)], -7),
+    ("entity.warden.nearby_closer", 720, [Nz("bp", 300, 80, 0.5, 0, "brown", 0.9)], (65, 40, 120, 1.0, 0), [(50, 0.8, 120, 240)], -5),
+    ("entity.warden.nearby_closest", 560, [Nz("bp", 300, 80, 0.6, 0, "brown", 0.9)], (65, 40, 120, 1.0, 0), [(50, 0.9, 120, 180)], -3),
+    ("entity.wither.break_block", 600, [Nz("bp", 800, 300, 0.9, 0, "brown", 0.7)], (120, 40, 300, 1.0, 0), [], -3),
+    ("entity.zombie.break_wooden_door", 520, [Nz("bp", 1200, 150, 0.9, 0, "white", 0.8), Nz("bp", 900, 120, 0.8, 80, "white", 0.8)], (140, 70, 150, 1.0, 0), [], -4),
+    ("entity.zombie.destroy_egg", 200, [Nz("bp", 2200, 40, 0.8, 0, "pink", 1.2)], (500, 250, 40, 0.4, 0), [], -8),
+    ("block.sculk_sensor.clicking", 100, [Nz("bp", 3200, 8, 0.8)], (1100, 560, 20, 0.5, 0), [], -8),
+    ("block.sculk_sensor.clicking_stop", 100, [Nz("bp", 2400, 8, 0.7)], (800, 400, 20, 0.5, 0), [], -10),
+    ("block.smithing_table.use", 360, [Nz("bp", 3000, 40, 0.8), Nz("bp", 2600, 40, 0.8, 160)], None, [(1700, 0.4, 200, 0), (1500, 0.4, 200, 160)], -6),
+    ("item.crossbow.quick_charge_1", 260, [Nz("bp", 2800, 10, 0.8), Nz("bp", 2400, 10, 0.7, 70), Nz("bp", 3000, 12, 0.8, 150)], (300, 200, 20, 0.2, 0), [], -8),
+    ("item.crossbow.quick_charge_2", 300, [Nz("bp", 2800, 10, 0.8), Nz("bp", 2400, 10, 0.7, 60), Nz("bp", 3000, 10, 0.7, 120), Nz("bp", 2600, 12, 0.8, 190)], (320, 210, 20, 0.2, 0), [], -8),
+    ("item.crossbow.quick_charge_3", 340, [Nz("bp", 2800, 10, 0.8), Nz("bp", 2400, 10, 0.7, 50), Nz("bp", 3000, 10, 0.7, 100), Nz("bp", 2600, 10, 0.7, 150),
+                                           Nz("bp", 3200, 12, 0.8, 220)], (340, 220, 20, 0.2, 0), [], -8),
+    ("item.crossbow.loading_start", 200, [Nz("bp", 1500, 40, 0.7), Nz("bp", 2500, 12, 0.7, 90)], (300, 200, 50, 0.4, 0), [], -8),
+    ("item.crossbow.loading_middle", 160, [Nz("bp", 1800, 30, 0.7), Nz("bp", 2800, 10, 0.6, 70)], (350, 220, 40, 0.4, 0), [], -8),
+    ("item.crossbow.loading_end", 140, [Nz("bp", 3000, 10, 0.9), Nz("bp", 2200, 20, 0.6, 40)], (500, 250, 30, 0.6, 0), [], -7),
+    ("entity.villager.work_armorer", 520, [Nz("bp", 2800, 40, 0.8), Nz("bp", 2600, 40, 0.8, 240)], (400, 200, 60, 0.4, 0), [(1800, 0.4, 200, 0), (1600, 0.4, 200, 240)], -6),
+    ("entity.villager.work_weaponsmith", 560, [Nz("bp", 3200, 40, 0.8), Nz("bp", 3000, 40, 0.8, 200), Nz("bp", 3400, 40, 0.8, 380)], (300, 150, 60, 0.4, 0),
+     [(2400, 0.35, 220, 0), (2100, 0.35, 220, 200), (2600, 0.3, 220, 380)], -6),
+    ("entity.villager.work_butcher", 420, [Nz("bp", 900, 50, 0.8), Nz("bp", 800, 50, 0.8, 180)], (180, 90, 60, 0.9, 0), [(160, 0.7, 60, 180)], -6),
+    ("entity.villager.work_cleric", 520, [Nz("bp", 800, 60, 0.4, 0, "pink", 1.0)], None, [(500, 0.4, 100, 0), (700, 0.4, 100, 130), (900, 0.4, 100, 260)], -10),
+    ("entity.villager.work_fletcher", 340, [Nz("bp", 1800, 25, 0.8), Nz("bp", 1600, 25, 0.7, 120)], (400, 200, 30, 0.6, 0), [], -8),
+    ("entity.villager.work_leatherworker", 360, [Nz("bp", 1000, 90, 0.8, 0, "pink", 0.8), Nz("bp", 900, 80, 0.7, 160, "pink", 0.8)], (200, 110, 50, 0.4, 0), [], -8),
+    ("entity.villager.work_mason", 420, [Nz("bp", 1400, 40, 0.8), Nz("bp", 1300, 40, 0.8, 200)], (260, 130, 60, 0.8, 0), [(1900, 0.25, 120, 0)], -6),
+    ("entity.slime.squish", 260, [Nz("bp", 700, 80, 0.7, 0, "pink", 0.9)], (250, 90, 110, 1.0, 0), [], -7),
+    ("entity.slime.jump", 240, [Nz("bp", 800, 60, 0.5, 0, "pink", 0.9)], (110, 320, 90, 0.9, 0), [], -7),
+    ("entity.slime.squish_small", 160, [Nz("bp", 1000, 50, 0.7, 0, "pink", 0.9)], (400, 150, 70, 0.9, 0), [], -8),
+    ("entity.slime.jump_small", 150, [Nz("bp", 1100, 40, 0.5, 0, "pink", 0.9)], (200, 520, 60, 0.9, 0), [], -8),
+    ("entity.magma_cube.squish", 280, [Nz("bp", 500, 100, 0.8, 0, "brown", 0.9)], (200, 70, 130, 1.0, 0), [], -6),
+    ("entity.magma_cube.jump", 260, [Nz("bp", 600, 70, 0.6, 0, "brown", 0.9)], (90, 260, 100, 0.9, 0), [], -6),
+    ("entity.magma_cube.squish_small", 180, [Nz("bp", 800, 60, 0.7, 0, "brown", 0.9)], (320, 120, 80, 0.9, 0), [], -7),
+    ("block.sweet_berry_bush.pick_berries", 220, [Nz("bp", 3000, 70, 0.8, 0, "pink", 0.8), Nz("bp", 2200, 60, 0.6, 60, "pink", 0.8)], None, [], -9),
+    ("entity.shulker.open", 300, [Nz("bp", 1400, 50, 0.7), Nz("bp", 2000, 30, 0.6, 90)], (240, 140, 80, 0.8, 0), [(900, 0.2, 120, 0)], -7),
+    ("entity.shulker.close", 260, [Nz("bp", 1300, 40, 0.8, 0), Nz("bp", 2200, 20, 0.5, 80)], (200, 90, 70, 0.9, 0), [], -6),
+    ("entity.shulker.hurt_closed", 200, [Nz("bp", 1800, 30, 0.8)], (300, 140, 60, 0.8, 0), [(700, 0.3, 120, 0)], -7),
+    ("entity.shulker_bullet.hit", 240, [Nz("bp", 2500, 40, 0.8), Nz("bp", 1500, 60, 0.5, 20)], (500, 200, 70, 0.7, 0), [(1300, 0.3, 120, 0)], -7),
+    ("entity.shulker_bullet.hurt", 200, [Nz("bp", 3000, 25, 0.8)], (700, 300, 50, 0.6, 0), [(1800, 0.3, 100, 0)], -8),
+    ("entity.puffer_fish.sting", 160, [Nz("bp", 3500, 20, 0.8)], (900, 400, 40, 0.5, 0), [], -8),
+    ("item.brush.brushing.sand.complete", 280, [Nz("bp", 2400, 60, 0.7, 0, "pink", 0.8)], (180, 100, 60, 0.5, 40), [(1200, 0.15, 100, 40)], -9),
+    ("item.brush.brushing.gravel.complete", 300, [Nz("bp", 1500, 70, 0.8, 0, "brown", 0.8), Nz("bp", 2500, 20, 0.5, 60)], (200, 110, 60, 0.6, 40), [], -9),
+]
+
+# name -> (dur, cutoff0, cutoff1, color, kind, q, attack, peak, level, sub | None)   noise sweeps
+T3_WHOOSH = [
+    ("block.candle.extinguish", 350, 5000, 2500, "white", "hp", 0.8, 10, -9, 0.6, None),
+    ("item.chorus_fruit.teleport", 600, 500, 3500, "pink", "bp", 1.2, 40, -6, 0.7, (300, 1400)),
+    ("entity.enderman.teleport", 350, 400, 3000, "white", "bp", 1.5, 10, -6, 0.7, (200, 1200)),
+    ("entity.fox.sniff", 300, 2500, 4000, "white", "hp", 0.8, 40, -12, 0.5, None),
+    ("entity.fox.spit", 200, 2500, 1500, "white", "bp", 1.0, 5, -8, 1.0, None),
+    ("entity.dolphin.jump", 500, 800, 2200, "white", "bp", 0.9, 40, -8, 0.8, None),
+    ("entity.squid.squirt", 300, 1500, 500, "pink", "bp", 0.9, 5, -7, 1.0, None),
+    ("entity.ender_dragon.flap", 600, 200, 500, "pink", "lp", 0.7, 80, -5, 1.0, (60, 40)),
+    ("entity.phantom.flap", 400, 300, 700, "pink", "bp", 0.8, 60, -8, 0.8, None),
+    ("entity.phantom.swoop", 700, 500, 2200, "white", "bp", 0.9, 150, -6, 0.9, None),
+    ("entity.parrot.fly", 200, 1800, 2800, "white", "bp", 1.0, 30, -10, 0.8, None),
+    ("entity.ghast.shoot", 700, 300, 1800, "white", "bp", 0.8, 20, -5, 0.8, (120, 50)),
+    ("entity.blaze.shoot", 500, 800, 2800, "white", "bp", 0.9, 10, -6, 0.7, (300, 150)),
+    ("entity.ender_dragon.shoot", 700, 300, 1200, "pink", "bp", 0.8, 20, -5, 0.8, (150, 60)),
+    ("entity.wither.shoot", 600, 400, 2000, "white", "bp", 0.8, 10, -5, 0.8, (180, 70)),
+    ("entity.snow_golem.shoot", 180, 2000, 3500, "white", "bp", 1.0, 5, -8, 1.0, None),
+    ("entity.shulker.shoot", 300, 600, 2400, "white", "bp", 1.5, 5, -7, 0.6, (500, 1500)),
+    ("entity.evoker.cast_spell", 900, 500, 3000, "pink", "bp", 1.5, 80, -7, 0.8, (220, 440)),
+    ("entity.illusioner.mirror_move", 400, 2000, 800, "white", "bp", 1.2, 10, -8, 1.0, None),
+    ("entity.warden.sniff", 600, 2200, 1000, "white", "bp", 0.8, 100, -9, 0.5, None),
+    ("entity.warden.sonic_boom", 700, 3000, 300, "white", "bp", 1.2, 5, -3, 1.0, (900, 40)),
+    ("entity.sniffer.scenting", 500, 1800, 2600, "white", "hp", 0.8, 80, -10, 0.6, None),
+    ("entity.sniffer.sniffing", 400, 2500, 3500, "white", "hp", 0.8, 50, -10, 0.6, None),
+    ("particle.soul_escape", 800, 900, 2400, "pink", "bp", 1.8, 200, -10, 0.5, (300, 500)),
+    ("block.sculk.charge", 600, 300, 2500, "pink", "bp", 1.5, 100, -9, 0.7, (150, 300)),
+    ("block.redstone_torch.burnout", 500, 6000, 2500, "white", "hp", 0.8, 5, -10, 0.7, None),
+    ("block.smoker.smoke", 700, 3500, 2000, "white", "hp", 0.7, 100, -14, 0.5, None),
+    ("entity.mooshroom.convert", 700, 500, 2500, "pink", "bp", 1.0, 20, -7, 0.8, (200, 600)),
+    ("entity.wandering_trader.disappeared", 600, 600, 2800, "pink", "bp", 1.0, 30, -7, 0.7, (300, 1000)),
+    ("entity.wandering_trader.reappeared", 600, 2800, 600, "pink", "bp", 1.0, 30, -7, 0.7, (1000, 300)),
+    ("block.end_gateway.spawn", 1200, 200, 3000, "pink", "bp", 1.0, 200, -6, 0.8, (70, 300)),
+    ("block.end_portal.spawn", 1500, 150, 2000, "pink", "bp", 1.0, 250, -6, 0.8, (50, 200)),
+    ("entity.ender_eye.launch", 400, 800, 2600, "white", "bp", 1.0, 10, -8, 0.6, (500, 1800)),
+    ("entity.cat.hiss", 400, 3000, 5000, "white", "hp", 0.7, 10, -8, 1.0, None),
+    ("entity.panda.pre_sneeze", 400, 1000, 3000, "white", "bp", 1.0, 300, -12, 0.8, None),
+    ("entity.panda.sneeze", 250, 3500, 1500, "white", "bp", 0.8, 5, -5, 0.8, (300, 150)),
+    ("block.honey_block.slide", 600, 300, 200, "brown", "bp", 0.8, 50, -10, 0.9, None),
+    ("block.grindstone.use", 520, 2500, 3500, "white", "bp", 3.0, 30, -9, 1.0, None),
+    ("entity.frog.tongue", 150, 2000, 4000, "white", "bp", 1.0, 5, -9, 1.0, None),
+    ("item.crossbow.shoot", 260, 800, 2200, "white", "bp", 1.2, 8, -6, 0.5, (220, 150)),
+    ("block.beehive.enter", 280, 900, 1500, "pink", "bp", 1.0, 40, -12, 0.8, None),
+    ("block.beehive.exit", 280, 1500, 900, "pink", "bp", 1.0, 20, -12, 0.8, None),
+    ("item.elytra.flying", 900, 600, 1800, "pink", "bp", 0.7, 200, -12, 0.7, None),
+    ("entity.puffer_fish.blow_up", 500, 400, 1500, "white", "bp", 0.9, 80, -8, 0.8, (200, 500)),
+    ("entity.puffer_fish.blow_out", 400, 1500, 500, "white", "bp", 0.9, 10, -8, 0.8, (500, 200)),
+    ("entity.witch.throw", 250, 800, 2000, "white", "bp", 1.0, 8, -8, 0.8, (300, 200)),
+]
+
+# name -> dict of tone() arguments (sid and seed added)
+T3_TONES = [
+    ("block.amethyst_block.chime", dict(dur=900, f=1568, harm=[(2.0, 0.4, 700), (3.01, 0.25, 400)], dec=700, nz=("white", "hp", 6000, 1, 10, 0.3), var=2, peak=-8)),
+    ("block.amethyst_block.resonate", dict(dur=1300, f=1046, harm=[(1.5, 0.5, 1000), (2.0, 0.4, 900), (3.0, 0.2, 600)], dec=1000, vib=0.004, var=2, peak=-8)),
+    ("block.chorus_flower.grow", dict(dur=400, f=520, harm=[(1.5, 0.3, 300)], dec=300, peak=-10)),
+    ("block.chorus_flower.death", dict(dur=500, f=400, sweep=(400, 200, 400), dec=400, peak=-8)),
+    ("block.conduit.activate", dict(dur=1000, f=220, sweep=(110, 440, 900), harm=[(2.0, 0.4, 800)], dec=900, att=60, peak=-7)),
+    ("block.conduit.deactivate", dict(dur=1000, f=220, sweep=(440, 110, 900), harm=[(2.0, 0.4, 800)], dec=900, att=20, peak=-7)),
+    ("block.conduit.ambient", dict(dur=3000, f=110, harm=[(2.0, 0.3, 2500), (3.0, 0.15, 2500)], dec=2600, att=600, vib=0.004, peak=-14)),
+    ("block.conduit.ambient.short", dict(dur=1500, f=110, harm=[(2.0, 0.3, 1200), (3.0, 0.15, 1200)], dec=1300, att=300, vib=0.004, peak=-14)),
+    ("block.conduit.attack.target", dict(dur=500, f=880, sweep=(880, 300, 400), harm=[(1.5, 0.3, 300)], dec=400, peak=-7)),
+    ("item.lodestone_compass.lock", dict(dur=600, f=660, harm=[(2.0, 0.3, 400), (3.0, 0.2, 300)], dec=450, peak=-8)),
+    ("item.totem.use", dict(dur=1800, f=330, sweep=(300, 900, 1000), harm=[(1.5, 0.5, 1500), (2.0, 0.4, 1400), (2.5, 0.2, 1200)], att=100, dec=1500,
+                            nz=("white", "bp", 3000, 1, 300, 0.3), peak=-5)),
+    ("item.spyglass.use", dict(dur=250, f=1200, sweep=(900, 1400, 200), dec=150, nz=("white", "hp", 4000, 1, 8, 0.4), peak=-10)),
+    ("item.spyglass.stop_using", dict(dur=250, f=1200, sweep=(1400, 900, 200), dec=150, nz=("white", "hp", 4000, 1, 8, 0.4), peak=-10)),
+    ("block.respawn_anchor.charge", dict(dur=1200, f=110, wave="saw", lp=1200, sweep=(110, 330, 1000), harm=[(2.0, 0.3, 900)], dec=1000, att=40, peak=-7)),
+    ("block.respawn_anchor.deplete", dict(dur=1100, f=110, wave="saw", lp=1000, sweep=(330, 80, 900), harm=[(2.0, 0.3, 800)], dec=900, att=20, peak=-7)),
+    ("block.respawn_anchor.set_spawn", dict(dur=1000, f=440, harm=[(1.5, 0.5, 800), (2.0, 0.3, 800)], dec=800, peak=-7)),
+    ("block.respawn_anchor.ambient", dict(dur=3000, f=80, wave="saw", lp=400, harm=[(2.0, 0.2, 2500)], dec=2600, att=800, vib=0.006, peak=-16)),
+    ("block.end_portal_frame.fill", dict(dur=500, f=700, harm=[(1.5, 0.4, 350)], dec=300, nz=("white", "bp", 2500, 2, 30, 0.8), peak=-7)),
+    ("entity.allay.item_given", dict(dur=300, f=1300, sweep=(1000, 1600, 200), dec=220, vib=0.01, peak=-10)),
+    ("entity.allay.item_taken", dict(dur=300, f=1300, sweep=(1600, 1000, 200), dec=220, vib=0.01, peak=-10)),
+    ("entity.allay.item_thrown", dict(dur=250, f=1500, sweep=(1200, 1800, 150), dec=150, peak=-10)),
+    ("entity.tadpole.grow_up", dict(dur=400, f=500, sweep=(400, 800, 300), harm=[(1.5, 0.3, 250)], dec=300, peak=-9)),
+    ("event.raid.horn", dict(dur=3000, f=233, wave="saw", lp=900, att=150, dec=2400, harm=[(1.5, 0.3, 2000), (2.0, 0.5, 2200)], vib=0.006, fo=400, peak=-5)),
+    ("entity.warden.sonic_charge", dict(dur=2800, f=300, wave="saw", lp=2500, sweep=(200, 1400, 2800), harm=[(2.0, 0.3, 2400)], att=400, dec=2500, vib=0.01, peak=-6)),
+    ("block.pointed_dripstone.drip_water_into_cauldron", dict(dur=300, f=1200, sweep=(900, 1500, 80), harm=[(2.0, 0.2, 120)], dec=150, peak=-11)),
+    ("block.pointed_dripstone.drip_lava_into_cauldron", dict(dur=360, f=650, sweep=(500, 800, 100), dec=200, nz=("brown", "bp", 700, 1.5, 120, 0.4), peak=-11)),
+    ("block.pointed_dripstone.drip_lava", dict(dur=260, f=800, sweep=(600, 1000, 60), dec=120, nz=("pink", "bp", 1000, 1.5, 40, 0.3), peak=-11)),
+    ("block.sculk_catalyst.bloom", dict(dur=700, f=90, sweep=(90, 200, 200), harm=[(2.0, 0.4, 500)], dec=500, nz=("pink", "bp", 800, 1.5, 300, 0.4), peak=-7)),
+    ("block.beehive.drip", dict(dur=260, f=550, sweep=(420, 700, 70), harm=[(2.0, 0.2, 100)], dec=140, nz=("pink", "bp", 800, 1.5, 40, 0.3), peak=-11)),
+]
+T3_GOAT_HORN = [329.6, 392.0, 440.0, 493.9, 523.3, 587.3, 659.3, 784.0]
+
+# name -> (dur, grains n, cutoff, color, decay, pitch|None)
+T3_CRACKLE = [
+    ("block.candle.ambient", 700, 3, 3500, "white", 12, None),
+    ("block.sculk.spread", 400, 4, 700, "brown", 30, None),
+    ("entity.warden.dig", 1000, 14, 500, "brown", 40, None),
+    ("entity.warden.emerge", 1800, 22, 400, "brown", 60, None),
+    ("entity.warden.tendril_clicks", 700, 10, 3500, "white", 6, None),
+    ("entity.wolf.pant", 900, 5, 2500, "white", 90, None),
+    ("entity.wolf.shake", 500, 14, 3000, "white", 10, None),
+    ("entity.sniffer.digging", 700, 8, 600, "brown", 50, None),
+    ("entity.sniffer.digging_stop", 300, 3, 600, "brown", 40, None),
+    ("item.brush.brushing.generic", 600, 8, 3500, "pink", 15, None),
+    ("item.brush.brushing.sand", 600, 9, 3000, "pink", 18, None),
+    ("item.brush.brushing.gravel", 600, 9, 1800, "brown", 22, None),
+    ("entity.skeleton.converted_to_stray", 800, 12, 2500, "white", 20, None),
+]
+
+# music discs: name -> (root note, scale, step ms, density, attack, decay, h2)
+T3_DISCS = [
+    ("13", 52, [0, 3, 5, 7, 10], 900, 0.5, 30, 1800, 0.2), ("cat", 60, [0, 4, 7, 9], 420, 0.8, 10, 900, 0.3),
+    ("blocks", 57, [0, 2, 3, 7, 9], 300, 0.9, 5, 500, 0.4), ("chirp", 64, [0, 2, 4, 7, 9], 260, 0.85, 5, 600, 0.35),
+    ("far", 62, [0, 2, 5, 7, 9], 700, 0.6, 20, 1600, 0.25), ("mall", 60, [0, 4, 7, 11], 380, 0.8, 8, 900, 0.3),
+    ("mellohi", 55, [0, 3, 7, 10], 600, 0.6, 30, 1800, 0.2), ("stal", 50, [0, 3, 5, 6, 7, 10], 520, 0.6, 20, 1400, 0.25),
+    ("strad", 65, [0, 2, 4, 5, 7, 9, 11], 340, 0.9, 6, 700, 0.35), ("ward", 48, [0, 2, 3, 7, 8], 800, 0.55, 40, 2000, 0.2),
+    ("11", 45, [0, 1, 6], 1100, 0.35, 20, 2400, 0.1), ("wait", 59, [0, 2, 4, 7, 9], 450, 0.75, 12, 1100, 0.3),
+    ("pigstep", 47, [0, 3, 5, 7, 10], 280, 0.9, 4, 700, 0.3), ("otherside", 56, [0, 2, 3, 5, 7, 8], 500, 0.7, 15, 1500, 0.25),
+    ("5", 51, [0, 2, 3, 6, 7], 650, 0.6, 25, 1700, 0.15), ("relic", 58, [0, 3, 5, 7, 9], 560, 0.65, 18, 1600, 0.25),
+]
+
+
+def t3_disc(name, root, scale, step, density, attack, decay, h2):
+    nodes = [
+        {"id": "m1", "type": "notes", "root": root + 12, "scale": scale, "octaves": 2, "step_ms": step, "density": density,
+         "attack_ms": attack, "decay_ms": decay, "h2": h2, "h3": 0.08, "gain": 0.3},
+        {"id": "m2", "type": "notes", "root": root - 12, "scale": scale[:3], "octaves": 1, "step_ms": step * 4, "density": 0.9,
+         "attack_ms": attack * 4, "decay_ms": decay * 2, "h2": 0.1, "h3": 0.0, "gain": 0.3},
+        {"id": "mx", "type": "mix", "in": [{"src": "m1", "gain": 1.0}, {"src": "m2", "gain": 0.8}]},
+        {"id": "o", "type": "reverb", "in": "mx", "room": 0.6, "damp": 0.5, "mix": 0.25},
+    ]
+    return sound("music_disc." + name, 14000, ns(), nodes, "o", variants=1, peak=-7, bus="music", fi=100, fo=600, preview=0)
+
+
+def tier3_sounds():
+    o = t3_voices()
+    for name, dur, nz, body, parts, peak in T3_PERC:
+        o.append(perc(name, ns(), dur, nz=nz, body=body, parts=parts, var=1, peak=peak))
+    for name, dur, c0, c1, color, kind, q, att, peak, level, sub in T3_WHOOSH:
+        o.append(whoosh(name, ns(), dur, c0, c1, color, kind, q, att=att, var=1, peak=peak, level=level, sub=sub))
+        if name == "item.elytra.flying":
+            loopify(o[-1], 150)
+    for name, kw in T3_TONES:
+        kw = dict(kw)
+        o.append(tone(name, ns(), kw.pop("dur"), kw.pop("f"), **kw))
+        if name in ("block.conduit.ambient", "block.conduit.ambient.short", "block.respawn_anchor.ambient"):
+            loopify(o[-1], 300)
+    for k, f in enumerate(T3_GOAT_HORN):
+        o.append(tone("item.goat_horn.sound.%d" % k, ns(), 2200, f, wave="saw", lp=2200, att=80, dec=1800, vib=0.008, harm=[(2.0, 0.3, 1400)], fo=300, peak=-6))
+    for name, dur, n, cut, color, dec, pitch in T3_CRACKLE:
+        o.append(crackle(name, ns(), dur, n, cut, color=color, dec=dec, var=1, peak=-8, pitch=pitch))
+    o.append(crackle("entity.blaze.burn", ns(), 700, 14, 1800, color="white", dec=14, var=1, peak=-8))
+    for name, root, scale, step, density, attack, decay, h2 in T3_DISCS:
+        o.append(t3_disc(name, root, scale, step, density, attack, decay, h2))
+    o.append(sound("intentionally_empty", 50, ns(), [noise("o")], "o", variants=1, peak=-50, fi=1, fo=1))
+    return o
+
+
+# existing/new target event -> new alias events (resolved against every event name, see mc()); a tuple = first candidate that exists
+T3_ALIASES = [
+    (("block.wooden_door.open",), ["block.%s_door.open" % w for w in ("bamboo_wood", "cherry_wood", "nether_wood")]),
+    (("block.wooden_door.close",), ["block.%s_door.close" % w for w in ("bamboo_wood", "cherry_wood", "nether_wood")]),
+    (("block.wooden_trapdoor.open",), ["block.%s_trapdoor.open" % w for w in ("bamboo_wood", "cherry_wood", "nether_wood")]),
+    (("block.wooden_trapdoor.close",), ["block.%s_trapdoor.close" % w for w in ("bamboo_wood", "cherry_wood", "nether_wood")]),
+    (("block.wooden_button.click_on",), ["block.%s_button.click_on" % w for w in ("bamboo_wood", "cherry_wood", "nether_wood")]),
+    (("block.wooden_button.click_off",), ["block.%s_button.click_off" % w for w in ("bamboo_wood", "cherry_wood", "nether_wood")]),
+    (("block.wooden_pressure_plate.click_on",), ["block.%s_pressure_plate.click_on" % w for w in ("bamboo_wood", "cherry_wood", "nether_wood")]),
+    (("block.wooden_pressure_plate.click_off",), ["block.%s_pressure_plate.click_off" % w for w in ("bamboo_wood", "cherry_wood", "nether_wood")]),
+    (("block.fence_gate.open",), ["block.%s_fence_gate.open" % w for w in ("bamboo_wood", "cherry_wood", "nether_wood")]),
+    (("block.fence_gate.close",), ["block.%s_fence_gate.close" % w for w in ("bamboo_wood", "cherry_wood", "nether_wood")]),
+    (("block.wood.hit",), ["entity.armor_stand.hit"]), (("block.wood.fall",), ["entity.armor_stand.fall"]),
+    (("block.wood.place",), ["entity.armor_stand.place", "entity.glow_item_frame.place"]),
+    (("block.wood.break",), ["entity.armor_stand.break", "entity.glow_item_frame.break"]),
+    (("entity.item_frame.add_item", "block.wood.place"), ["entity.glow_item_frame.add_item"]),
+    (("entity.item_frame.remove_item", "block.wood.break"), ["entity.glow_item_frame.remove_item"]),
+    (("entity.item_frame.rotate_item", "block.wood.hit"), ["entity.glow_item_frame.rotate_item"]),
+    (("block.fire.ambient",), ["block.blastfurnace.fire_crackle"]),
+    (("entity.horse.eat",), ["entity.goat.eat", "entity.camel.eat", "entity.donkey.eat", "entity.mule.eat", "entity.llama.eat",
+                                                         "entity.strider.eat", "entity.sniffer.eat", "entity.goat.screaming.eat"]),
+    (("entity.fox.eat",), ["entity.cat.eat", "entity.parrot.eat", "entity.panda.eat", "entity.dolphin.eat", "entity.mooshroom.eat"]),
+    (("entity.cow.milk",), ["entity.goat.milk", "entity.goat.screaming.milk", "entity.mooshroom.milk", "entity.mooshroom.suspicious_milk"]),
+    (("entity.sheep.shear",), ["entity.snow_golem.shear", "entity.mooshroom.shear"]),
+    (("entity.fox.bite",), ["entity.panda.bite", "entity.phantom.bite"]),
+    (("entity.donkey.chest",), ["entity.mule.chest", "entity.llama.chest"]),
+    (("entity.horse.saddle",), ["entity.camel.saddle", "entity.strider.saddle"]),
+    (("entity.cow.step",), ["entity.camel.step", "entity.sniffer.step", "entity.goat.step"]),
+    (("entity.zombie.step",), ["entity.zoglin.step", "entity.piglin_brute.step"]),
+    (("entity.spider.step",), ["entity.endermite.step"]), (("entity.skeleton.step",), ["entity.stray.step"]),
+    (("entity.generic.splash",), ["entity.dolphin.splash", "entity.axolotl.splash", "entity.hostile.splash", "entity.skeleton_horse.step_water",
+                                  "entity.skeleton_horse.gallop_water", "entity.skeleton_horse.jump_water", "entity.skeleton_horse.swim"]),
+    (("entity.generic.swim", "entity.generic.splash"), ["entity.dolphin.swim", "entity.axolotl.swim", "entity.hostile.swim", "entity.turtle.swim",
+                                                        "entity.drowned.swim", "entity.fish.swim"]),
+    (("entity.skeleton_horse.ambient",), ["entity.skeleton_horse.ambient_water"]),
+    (("entity.squid.squirt",), ["entity.glow_squid.squirt"]),
+    (("entity.enderman.teleport",), ["entity.fox.teleport", "entity.shulker.teleport"]),
+    (("entity.cod.flop",), ["entity.salmon.flop", "entity.tropical_fish.flop", "entity.puffer_fish.flop", "entity.guardian.flop", "entity.elder_guardian.flop",
+                            "entity.tadpole.flop"]),
+    (("entity.arrow.shoot",), ["entity.skeleton.shoot", "entity.drowned.shoot", "entity.experience_bottle.throw", "entity.lingering_potion.throw"]),
+    (("entity.arrow.hit",), ["item.crossbow.hit"]),
+    (("entity.evoker.cast_spell",), ["entity.illusioner.cast_spell"]),
+    (("item.honey_bottle.drink",), ["entity.wandering_trader.drink_milk", "entity.wandering_trader.drink_potion", "entity.witch.drink"]),
+    (("item.hoe.till",), ["entity.villager.work_farmer"]), (("entity.generic.splash",), ["entity.villager.work_fisherman"]),
+    (("item.book.page_turn",), ["entity.villager.work_librarian", "entity.villager.work_cartographer"]),
+    (("entity.sheep.shear",), ["entity.villager.work_shepherd"]), (("block.grindstone.use",), ["entity.villager.work_toolsmith"]),
+    (("item.crop.plant",), ["item.nether_wart.plant"]),
+    (("block.glass.break",), ["entity.ender_eye.death"]),
+    (("entity.generic.big_fall",), ["entity.hostile.big_fall"]), (("entity.generic.small_fall",), ["entity.hostile.small_fall"]),
+    (("entity.turtle.shamble",), ["entity.turtle.shamble_baby"]),
+    (("block.wood.break", "entity.item_frame.break"), ["entity.goat.horn_break", "entity.goat.screaming.horn_break"]),
+    (("block.sweet_berry_bush.pick_berries",), ["block.cave_vines.pick_berries"]),
+    (("item.goat_horn.sound.0",), ["item.goat_horn.play"]),
+    (("entity.player.big_fall", "entity.generic.big_fall"), ["entity.goat.prepare_ram", "entity.goat.ram_impact", "entity.goat.screaming.prepare_ram",
+                                                           "entity.goat.screaming.ram_impact", "entity.goat.long_jump", "entity.goat.screaming.long_jump"]),
+]
+
+
 MUSIC_NAMES = (["music.overworld." + x for x in ("deep_dark", "dripstone_caves", "grove", "jagged_peaks", "lush_caves", "swamp", "forest",
                 "old_growth_taiga", "meadow", "cherry_grove", "frozen_peaks", "snowy_slopes", "stony_peaks", "flower_forest", "desert", "badlands",
                 "jungle", "sparse_jungle", "bamboo_jungle")]
@@ -822,10 +1367,18 @@ def mc():
         for act in ACTS:
             s = block(mat, act)
             sounds.append(s)
-    sounds += ambience() + uisounds() + entities() + effects() + music() + coverage_sounds() + mob_voices()
+    sounds += ambience() + uisounds() + entities() + effects() + music() + coverage_sounds() + mob_voices() + tier3_sounds()
     byid = {x["id"]: x for x in sounds}
     for sid, names in EXTRA_ALIASES.items():
         byid[sid].setdefault("aliases", []).extend(names)
+    owner = {}
+    for x in sounds:
+        for nm in [x["id"]] + x.get("aliases", []):
+            owner.setdefault(nm, x)
+    for cands, names in T3_ALIASES:
+        tgt = next((owner[c] for c in cands if c in owner), None)
+        assert tgt is not None, "tier 3 alias target missing: %r" % (cands,)
+        tgt.setdefault("aliases", []).extend(names)
     seen = set()
     for x in sounds:
         for nm in [x["id"]] + x.get("aliases", []):
