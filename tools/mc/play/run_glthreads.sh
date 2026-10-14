@@ -53,10 +53,10 @@ ERR=0
 num() { grep -o "$2=[0-9]*" "$W/$1.out" | tail -1 | cut -d= -f2; }
 run_one() { # name, workers
     local name=$1 wk=$2
-    MCPLAY_GL=1 MCPLAY_WORKERS=$wk MCPLAY_VSYNC=0 FIRN_AUDIO=null MCPLAY_RUN_S=8 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/$name.png" \
-        timeout 120 "$W/mcplay" 127.0.0.1 "$PORT" "P$name" > "$W/$name.out" 2>&1 &
+    MCPLAY_GL=1 MCPLAY_WORKERS=$wk MCPLAY_VSYNC=0 FIRN_AUDIO=null MCPLAY_RUN_S=${GL_RUN_S:-8} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=${GL_W:-640} MCPLAY_H=${GL_H:-360} MCPLAY_SHOT="$W/$name.png" \
+        timeout "${GL_TIMEOUT:-120}" "$W/mcplay" 127.0.0.1 "$PORT" "P$name" > "$W/$name.out" 2>&1 &
     local pp=$!
-    wait $pp; local rc=$?
+    wait $pp; local rc=$?; [ -n "${GL_OUT_DIR:-}" ] && cp "$W/$name.out" "$GL_OUT_DIR/$name.out" 2>/dev/null
     [ $rc -eq 0 ] || { echo "  FAIL  $name (workers=$wk) exit code $rc"; ERR=1; return; }
     grep -q 'mcplay: gl renderer=' "$W/$name.out" || { echo "  FAIL  $name: GL path did not start"; ERR=1; }
     if [ "$wk" -gt 0 ]; then grep -q "stream workers=$wk pool=true" "$W/$name.out" || { echo "  FAIL  $name: no mesher pool (workers=$wk)"; ERR=1; }; fi
@@ -65,7 +65,7 @@ run_one() { # name, workers
     [ "$(stat -c %s "$W/$name.png" 2>/dev/null || echo 0)" -gt 1500 ] || { echo "  FAIL  $name: no screenshot"; ERR=1; }
     echo "  $name workers=$wk frames=${f:-?} chunks=${c:-?} $(grep 'world_draw' "$W/$name.out" | tail -1 | grep -o 'avg_us=[0-9]* max_us=[0-9]*') $(grep -o 'stream workers=.*' "$W/$name.out" | tail -1 | cut -c1-80)"
 }
-run_one inline 0
+[ "${GL_SKIP_INLINE:-0}" = 1 ] || run_one inline 0
 for i in $(seq 1 "$N"); do run_one t$i 3; done
 [ $ERR -eq 0 ] && echo "RESULT mc-play-glthreads: ok" || echo "RESULT mc-play-glthreads: FAIL"
 exit $ERR
