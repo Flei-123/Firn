@@ -116,7 +116,9 @@ def main():
         bad.append(f"only {len(ev)} logged events (< {min_events})")
 
     # noise floor from the dump: 20th percentile of block RMS, thresholded generously
-    floor = max(3.0, float(np.percentile(rms, 20)) * 3.0)
+    # 5th percentile: under load the sink is bursty and little of the dump is silent, so the 20th percentile lands INSIDE sound
+    # and the quiet probe events (stone.step peak ~1000) fell below the floor (r174)
+    floor = max(3.0, float(np.percentile(rms, 5)) * 3.0)
     lat = []
     cent = {}
     # Probe run: the 12 probe events are one CONTIGUOUS run in the log (mcplay holds the cave-mood clock back while the probe plays).

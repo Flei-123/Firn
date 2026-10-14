@@ -1734,6 +1734,19 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
                 return Ok(());
             }
         }
+        if let Some(v) = fr.consts.get(&given[0]) {
+            if *v as i64 == syscalls::ARCH_GET_TCB {
+                // The aarch64 `.so` finds its thread block by the stack pointer; it cannot tell "unattached".
+                load_full(e, fr, A, given[1]);
+                e.line(&format!("mov {}, -1", B));
+                e.line(&format!("str {}, [{}]", B, A));
+                if let Some(d) = i.dst {
+                    e.line(&format!("mov {}, xzr", A));
+                    store_dst(e, fr, d, A);
+                }
+                return Ok(());
+            }
+        }
         match fr.consts.get(&given[0]) {
             Some(v) if *v as i64 == syscalls::ARCH_SET_FS => {}
             _ => {

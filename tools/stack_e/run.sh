@@ -42,6 +42,9 @@ for lvl in dev-fast release-safe release-fast; do
     gcc -O1 -fstack-protector-all -pthread -o "$D/hostatt" tools/stack_e/host_attach.c -ldl || { echo "FAIL gcc host_attach"; rc=1; continue; }
     timeout 120 "$D/hostatt" "$D/librt.so" | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL host_attach C ($lvl)"; rc=1; }
     timeout 120 python3 -I tools/stack_e/host_attach.py "$D/librt.so" || { echo "FAIL host_attach ctypes ($lvl)"; rc=1; }
+    # r506: host threads that never call se_attach (export guard)
+    gcc -O1 -fstack-protector-all -pthread -o "$D/hostnoatt" tools/stack_e/host_noattach.c -ldl || { echo "FAIL gcc host_noattach"; rc=1; continue; }
+    timeout 120 "$D/hostnoatt" "$D/librt.so" | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL host_noattach ($lvl)"; rc=1; }
 done
 # G5: Windows DLL (Wine) and aarch64 .so (qemu): own script, it can run alone
 bash tools/stack_e/run_g5.sh || rc=1

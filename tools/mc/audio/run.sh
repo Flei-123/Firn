@@ -59,6 +59,11 @@ for l in open(sys.argv[2]):
 else
     echo "  FAIL  sound_pkts.fi does not compile"; head -10 "$W/err"; ERR=1
 fi
+if $FIRNC -o "$W/t3" tests/3010_mc_mobvoices.fi 2>"$W/err" && "$W/t3" > "$W/t3.out" 2>&1; then
+    echo "  ok    tests/3010_mc_mobvoices.fi: $(grep -c '^ok' "$W/t3.out") checks"
+else
+    echo "  FAIL  tests/3010_mc_mobvoices.fi"; head -10 "$W/err"; grep -v '^ok' "$W/t3.out" | head; ERR=1
+fi
 if $FIRNC -o "$W/t2" tests/2792_mc_audio_wire.fi 2>"$W/err" && "$W/t2" > "$W/t2.out" 2>&1; then
     echo "  ok    tests/2792_mc_audio_wire.fi: $(grep -c '^ok' "$W/t2.out") checks"
 else
@@ -66,6 +71,7 @@ else
 fi
 # synth bank vs sound id table (1.20.1): report gaps, tier 1 = heard constantly (heuristic ranking, see coverage.py); tier 1, 2 and 3 must have 0 gaps (block types count via the mca_find fallback)
 COV=$(python3 -I tools/mc/audio/coverage.py lib/mc/v763/mc_snd_v763.fi tools/sounds/mc.json --top 0 --check) || ERR=1
+python3 -I tools/mc/audio/mobvoices.py lib/mc/v763/mc_snd_v763.fi tools/sounds/mc.json || ERR=1
 echo "$COV" | sed 's/^/  /'
 [ $ERR -eq 0 ] && echo "RESULT mc-audio: ok" || echo "RESULT mc-audio: FAIL"
 exit $ERR
