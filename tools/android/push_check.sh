@@ -31,12 +31,12 @@ $ADB install -r "$APK" >/dev/null || { echo "install failed"; exit 1; }
 $ADB shell pm grant $PKG android.permission.POST_NOTIFICATIONS
 $ADB shell cmd notification cancel_all $PKG >/dev/null 2>&1 || true
 T=$(date +%s)
-relay "check-$T eins" "check-$T two"
+relay "check-$T one" "check-$T two"
 $ADB logcat -c
 $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null; sleep 10
 check "service is foreground (remoteMessaging)" \
     "$($ADB shell dumpsys activity services $PKG | grep -c 'isForeground=true.*types=0x00000200')" 1
-check "line 1 -> notification" "$(texts "check-$T eins")" 1
+check "line 1 -> notification" "$(texts "check-$T one")" 1
 check "line 2 -> notification" "$(texts "check-$T two")" 1
 P1=$($ADB shell pidof $PKG)
 $ADB shell input keyevent KEYCODE_BACK; sleep 3

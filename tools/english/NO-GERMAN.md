@@ -13,3 +13,6 @@ It checks the files `git ls-files` lists: **paths**, **identifiers**, **comments
 Precision on samples (audit 07.10.2026): strings and comments about 95 %, identifiers about 85 % (false hits: `short_circuit`, `digit_count`, `listen_*` -> `words`).
 
 Repos wired (07.10.2026): Firn (`test.sh` 21b), Certus (`tools/ci.sh`), Osum (`test.sh` 58b, next to its own ratchet), OpenPlan (`tools/ci.sh` 2c, next to `tools/english.py`), FirnChat (`tests/run.sh`), FreeViewer (`ci.sh`), OrientStore (`tests/check_english.sh`, first step of `tests/lauf.sh`), Daidalos (`tools/run_tests.sh`), FleiLauncher (`npm run check`), Cockpit (`npm test` via `pretest`), JARVIS (`npm run check`). LogicLab keeps its own `check:english`.
+
+## Allowed German words (no-german.json `words`/`lines`, 14.10.2026)
+Identifier hits are 0. The allowed words are NOT ours; they belong to the external OrientStore tool (`/root/orientstore/werkzeug/store`: flags `--adresse --ziel --kanal --mindest --fassung --immer --cutoff`, module `eingang`, store layout `speicher/`, key file `oeffentlich.key`, env `ORIENTSTORE_SCHLUESSEL`, OSUM key `braucht`), to FirnChat flags (`--zeit`, `--bilder-dir`) and to the x11demo scene labels (`schalter starten liste geschlossen`, shared by demos/x11demo, tools/fui/x11live.py, tools/android/gallery_check.sh). Rename them only together with their owners.

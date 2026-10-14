@@ -828,7 +828,7 @@ echo "== 19b. KEINE BESCHRIFTUNG WIRD UNTERWEGS ABGESCHNITTEN =="
 # it claims.
 #
 # tools/fui/belegpruef_main.fi now re-calculates that mechanically
-# (mode --ketten): for every painted chain `(&name[0]) as u64, M`
+# (mode --chains): for every painted chain `(&name[0]) as u64, M`
 # the declaration `var name: [u8; N] = "..."` is searched for and
 # N - padding <= M <= N is demanded. Here the length calculation runs over
 # EVERY source of the tree -- without font ("-") and without width (0), so that
@@ -836,7 +836,7 @@ echo "== 19b. KEINE BESCHRIFTUNG WIRD UNTERWEGS ABGESCHNITTEN =="
 # `render.pref_of` stands further below with the proof images, where the
 # canvas width of each sheet is known.
 build belegpruef
-"$W/belegpruef" --ketten - 0 tools/fui/*_main.fi demos/*/main.fi
+"$W/belegpruef" --chains - 0 tools/fui/*_main.fi demos/*/main.fi
 
 echo
 echo "== 19c. BESCHREIBEN IST KUERZER ALS MALEN, IN ZAHLEN =="
@@ -1138,7 +1138,7 @@ if [ "$1" = "--images" ]; then
     # The width is the SAME number that goes to `beleg` two lines further on
     # -- if it stands wrong once, it is noticed here or there.
     chain_check() {
-        "$W/belegpruef" --ketten "$FONT_TTF" "$2" "tools/fui/$1_main.fi"
+        "$W/belegpruef" --chains "$FONT_TTF" "$2" "tools/fui/$1_main.fi"
     }
     build gallery
     chain_check gallery 1200
@@ -1297,7 +1297,7 @@ if [ "$1" = "--images" ]; then
     # re-calculates itself that its phases do not overlap,
     # and otherwise ends with an error (set -e aborts the run).
     "$FIRNC" --opt-level=dev -o "$W/fuidemo" demos/fuidemo/main.fi
-    "$W/belegpruef" --ketten "$FONT_TTF" 1000 demos/fuidemo/main.fi
+    "$W/belegpruef" --chains "$FONT_TTF" 1000 demos/fuidemo/main.fi
     "$W/fuidemo" "$Z/fui-demo-hell.png" light
     "$W/fuidemo" "$Z/fui-demo-dunkel.png" dark
     beleg "$Z/fui-demo-hell.png" 1000 350 500 200 40 0

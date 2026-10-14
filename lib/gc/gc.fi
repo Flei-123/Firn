@@ -368,6 +368,20 @@ const S_GROWD: u64 = 2352
 // S_GAPHI). Both 0 = none. Reset whenever a chunk enters or leaves the index.
 const S_GAPLO: u64 = 2360
 const S_GAPHI: u64 = 2368
+// r563b: a page bitmap of the heap range for the root scan. One bit per 4 KiB
+// page of [S_HEAPLO, S_HEAPHI): 1 = the page lies in a chunk (chunks are
+// page aligned and page sized, so a page is in a chunk completely or not at
+// all). A root word that points into the gap between chunks (Vec buffers and
+// other non-GC memory) is then refused with a few instructions, without the
+// call into `__gc_mark`. S_PBM = the mapping (0 = none), S_PBMCAP = its size in
+// octets, S_PBMOK: 0 = stale (a chunk entered or left), 1 = valid, 2 = not
+// usable (heap range too wide or the mmap failed: the scan falls back to the
+// gap cache of r566). The bitmap is rebuilt at the start of the next scan.
+const S_PBM: u64 = 2376
+const S_PBMCAP: u64 = 2384
+const S_PBMOK: u64 = 2392
+// Largest bitmap in octets: 4 MiB = a heap range of 128 GiB.
+const PBM_MAX_BYTES: u64 = 4194304
 
 // The state word of a block header (see the comment at the top).
 const M_MARK: u32 = 3
@@ -1157,6 +1171,7 @@ fn __gc_idx_pos(a: u64) -> u64 {
 
 fn __gc_idx_add(c: u64) {
     let st: u64 = __gc_state() as u64
+    *((st +% S_PBMOK) as *mut u64) = 0
     *((st +% S_GAPLO) as *mut u64) = 0
     *((st +% S_GAPHI) as *mut u64) = 0
     __gc_gap_clear()
@@ -1182,6 +1197,7 @@ fn __gc_idx_add(c: u64) {
 
 fn __gc_idx_del(c: u64) {
     let st: u64 = __gc_state() as u64
+    *((st +% S_PBMOK) as *mut u64) = 0
     *((st +% S_GAPLO) as *mut u64) = 0
     *((st +% S_GAPHI) as *mut u64) = 0
     __gc_gap_clear()
@@ -1615,27 +1631,150 @@ fn __gc_catchup() {
     }
 }
 
+// r563b: set the bits [s, e) of the bitmap at `base`.
+fn __gc_pbm_set(base: u64, s: u64, e: u64) {
+    var i: u64 = s
+    while i < e && (i & 63) != 0 {
+        let w: u64 = base + (i >> 6) * 8
+        *(w as *mut u64) = (*(w as *mut u64)) | (1 << (i & 63))
+        i = i + 1
+    }
+    while i + 64 <= e {
+        *((base + (i >> 6) * 8) as *mut u64) = 18446744073709551615
+        i = i + 64
+    }
+    while i < e {
+        let w: u64 = base + (i >> 6) * 8
+        *(w as *mut u64) = (*(w as *mut u64)) | (1 << (i & 63))
+        i = i + 1
+    }
+}
+
+// r563b: (re)build the page bitmap from the chunk list. Sets S_PBMOK to 1
+// (valid) or 2 (not usable). Called at the start of a scan when a chunk
+// entered or left since the last build.
+fn __gc_pbm_build() {
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st + S_PBMOK, 2)
+    let lo: u64 = __gc_ld64(st + S_HEAPLO)
+    let hi: u64 = __gc_ld64(st + S_HEAPHI)
+    if lo >= hi {
+        return
+    }
+    let pages: u64 = (hi - lo + 4095) / 4096
+    let bytes: u64 = (pages + 63) / 64 * 8
+    if bytes > PBM_MAX_BYTES {
+        return
+    }
+    var p: u64 = __gc_ld64(st + S_PBM)
+    let cap: u64 = __gc_ld64(st + S_PBMCAP)
+    if p != 0 && bytes <= cap {
+        var k: u64 = 0
+        while k < bytes {
+            *((p +% k) as *mut u64) = 0
+            k = k + 8
+        }
+    } else {
+        if p != 0 {
+            __gc_munmap(p, cap)
+            __gc_st64(st + S_PBM, 0)
+            __gc_st64(st + S_PBMCAP, 0)
+        }
+        let ncap: u64 = (bytes * 2 + 4095) / 4096 * 4096
+        p = __gc_mmap(ncap)
+        if p == 0 {
+            return
+        }
+        __gc_st64(st + S_PBM, p)
+        __gc_st64(st + S_PBMCAP, ncap)
+    }
+    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    while c != 0 {
+        let s0: u64 = (c - lo) >> 12
+        __gc_pbm_set(p, s0, s0 + __gc_ld64(c + 8) / 4096)
+        c = __gc_ld64(c)
+    }
+    __gc_st64(st + S_PBMOK, 1)
+}
+
 // A conservative scan of a memory area (the stack, or the register save area).
 fn __gc_scan(lo: u64, hi: u64) {
     var a: u64 = (lo + 7) / 8 * 8
+    var n: u64 = 0
+    let stb: u64 = __gc_state() as u64
     if hi > a {
-        let stp: u64 = __gc_state() as u64
-        *((stp + S_SCANW) as *mut u64) = (*((stp + S_SCANW) as *mut u64)) + (hi - a) / 8
+        n = (hi - a) / 8
+        *((stb + S_SCANW) as *mut u64) = (*((stb + S_SCANW) as *mut u64)) + n
+    }
+    if n == 0 {
+        return
     }
     // r563: a word outside the heap bounds can never name a block, so it is
     // rejected here with two compares and no call. Most words of a root area
     // (Vec buffers: lengths, zero tails, pointers to non-GC memory) are such
     // words. The bounds only change when a chunk is added, which cannot
     // happen while this loop runs (marking allocates nothing).
-    let stb: u64 = __gc_state() as u64
+    if (*((stb +% S_PBMOK) as *mut u64)) == 0 {
+        __gc_pbm_build()
+    }
     let hlo: u64 = *((stb +% S_HEAPLO) as *mut u64)
     let hhi: u64 = *((stb +% S_HEAPHI) as *mut u64)
+    let end: u64 = a +% n * 8
+    if (*((stb +% S_PBMOK) as *mut u64)) == 1 {
+        // r563b: ONE unsigned compare is the heap range test, then the page
+        // bit. Four words per round: in the root areas nearly every word is
+        // outside the range, so the common round is 4 loads, 4 compares.
+        let span: u64 = hhi -% hlo
+        let pbm: u64 = *((stb +% S_PBM) as *mut u64)
+        while a +% 32 <= end {
+            let d0: u64 = (*(a as *mut u64)) -% hlo
+            if d0 < span {
+                let pg0: u64 = d0 >> 12
+                if (((*((pbm +% (pg0 >> 6) * 8) as *mut u64)) >> (pg0 & 63)) & 1) != 0 {
+                    __gc_mark(hlo +% d0)
+                }
+            }
+            let d8: u64 = (*((a +% 8) as *mut u64)) -% hlo
+            if d8 < span {
+                let pg8: u64 = d8 >> 12
+                if (((*((pbm +% (pg8 >> 6) * 8) as *mut u64)) >> (pg8 & 63)) & 1) != 0 {
+                    __gc_mark(hlo +% d8)
+                }
+            }
+            let d16: u64 = (*((a +% 16) as *mut u64)) -% hlo
+            if d16 < span {
+                let pg16: u64 = d16 >> 12
+                if (((*((pbm +% (pg16 >> 6) * 8) as *mut u64)) >> (pg16 & 63)) & 1) != 0 {
+                    __gc_mark(hlo +% d16)
+                }
+            }
+            let d24: u64 = (*((a +% 24) as *mut u64)) -% hlo
+            if d24 < span {
+                let pg24: u64 = d24 >> 12
+                if (((*((pbm +% (pg24 >> 6) * 8) as *mut u64)) >> (pg24 & 63)) & 1) != 0 {
+                    __gc_mark(hlo +% d24)
+                }
+            }
+            a = a +% 32
+        }
+        while a < end {
+            let d: u64 = (*(a as *mut u64)) -% hlo
+            if d < span {
+                let pg: u64 = d >> 12
+                if (((*((pbm +% (pg >> 6) * 8) as *mut u64)) >> (pg & 63)) & 1) != 0 {
+                    __gc_mark(hlo +% d)
+                }
+            }
+            a = a +% 8
+        }
+        return
+    }
     // r566: most words in the heap bounds point into non-GC memory between the
     // chunks. The gap the last lookup found empty is checked here, before the
     // calls (reloaded after each mark: a lookup may remember a new gap).
     var gap_lo: u64 = *((stb +% S_GAPLO) as *mut u64)
     var gap_hi: u64 = *((stb +% S_GAPHI) as *mut u64)
-    while a + 8 <= hi {
+    while a < end {
         let v: u64 = *(a as *mut u64)
         if v >= hlo && v < hhi {
             if v < gap_lo || v >= gap_hi {
@@ -1644,7 +1783,7 @@ fn __gc_scan(lo: u64, hi: u64) {
                 gap_hi = *((stb +% S_GAPHI) as *mut u64)
             }
         }
-        a = a + 8
+        a = a +% 8
     }
 }
 
