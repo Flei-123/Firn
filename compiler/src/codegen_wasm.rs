@@ -63,7 +63,11 @@
 //! frame right before that call. The collector's conservative scan of the
 //! shadow stack (from `__gc_sp_below` to the stack top) then sees exactly
 //! what the native scan sees in registers and stack slots. The liveness is
-//! computed per function; a call that provably cannot reach the collector
+//! computed per function; values that are never a heap address (stack
+//! slots and addresses inside them, constants, global/function/vtable
+//! addresses) are not spilled -- the frame is scanned as a whole, and
+//! spilling N live slot addresses at each of M calls was N*M stores of
+//! module size (OpenPlan r292: 9.1 MB -> about 4.7 MB); a call that provably cannot reach the collector
 //! (the call graph says so) spills nothing, and a program without the
 //! collector spills nothing at all. The collector is non-moving, so the
 //! value in the local stays valid after the call. `tools/wasm/gc_soak.sh`
@@ -1552,10 +1556,43 @@ impl<'a> Fx<'a> {
         let f = self.f;
         let n = f.val_types.len();
         // Candidates: the values that can hold an address.
+        // Not candidates: values that are never a heap address -- a stack slot
+        // (the frame itself is part of the scanned shadow stack), a constant, a
+        // global/function/vtable address. Spilling them is pure code size: a
+        // function with N allocas live over its whole body spilled N per call
+        // (quadratic; one 260-call palette setup alone was 660 KB of module).
+        let mut statics = vec![false; n];
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Some(d) = i.dst {
+                    if matches!(
+                        i.op,
+                        Op::Alloca { .. } | Op::Const(_) | Op::GlobalAddr { .. } | Op::FnRef { .. } | Op::VtabAddr { .. }
+                    ) {
+                        statics[d as usize] = true;
+                    }
+                }
+            }
+        }
+        // an address inside such a slot or global (ptradd of a static base) is as static
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let (Some(d), Op::PtrAdd { base, .. }) = (i.dst, &i.op) {
+                        if statics[*base as usize] && !statics[d as usize] {
+                            statics[d as usize] = true;
+                            grew = true;
+                        }
+                    }
+                }
+            }
+        }
         let mut idx = vec![usize::MAX; n];
         let mut cands: Vec<Val> = Vec::new();
         for v in 0..n {
-            if class(f.val_types[v]) == Some(VT::I64) && self.loc[v] != u32::MAX {
+            if !statics[v] && class(f.val_types[v]) == Some(VT::I64) && self.loc[v] != u32::MAX {
                 idx[v] = cands.len();
                 cands.push(v as Val);
             }
