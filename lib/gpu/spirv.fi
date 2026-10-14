@@ -19,6 +19,10 @@
 // word through spv_mem_set*, not via a std140 buffer image).
 // One invocation at a time, no recursion (values are static per id; Vulkan forbids recursion anyway).
 //
+// IMAGES + QUAD: spv_tex_set / spv_sampler_set fill CPU texture slots (slot = Binding of the shader variable); spv_quad_enable +
+// spv_lane + spv_run_quad run four lanes (2x2 quad) in lockstep at derivative / implicit-LOD instructions (see the section at
+// the end of this file and docs/SPIRV.md).
+//
 // WHAT IS SUPPORTED: see docs/SPIRV.md (and what is NOT). Unsupported opcodes stop the run with err = E_OP, err_op = opcode.
 //
 // SAFETY. Every read of the module is bounds checked (words, ids, values, memory): a damaged module sets `err`, it does not crash.
@@ -29,6 +33,9 @@ import std.math
 export {
     Spv, spv_zero, spv_new, spv_free, spv_reset, spv_find_entry, spv_run, spv_find_location, spv_find_builtin,
     spv_mem_get, spv_mem_set, spv_mem_get_f32, spv_mem_set_f32, spv_instr_count, spv_id_bound, spv_killed,
+    spv_killed_lane, spv_quad_enable, spv_lane, spv_run_quad, spv_tex_set, spv_tex_set_level, spv_tex_clear, spv_sampler_set,
+    spv_sampler_border, SPV_FMT_RGBA8, SPV_FMT_RGBA32F, SPV_FILTER_NEAREST, SPV_FILTER_LINEAR, SPV_MIP_NONE, SPV_MIP_NEAREST,
+    SPV_MIP_LINEAR, SPV_WRAP_REPEAT, SPV_WRAP_CLAMP, SPV_WRAP_MIRROR, SPV_WRAP_BORDER, SPV_MAX_TEX, SPV_MAX_LEVELS,
     E_SHORT, E_MAGIC, E_BROKEN, E_ID, E_TYPE, E_OP, E_OOM, E_ENTRY, E_STEPS, E_RANGE, E_DEPTH, E_EXT, E_VERSION, SPV_NONE,
 }
 
@@ -53,6 +60,23 @@ const TMP_WORDS: usize = 4096
 const MAX_BOUND: usize = 4194304
 const MAX_TYPE_WORDS: usize = 8192
 const MAX_TOTAL_WORDS: usize = 4194304
+const MAX_LANES: usize = 4
+const SPV_MAX_TEX: usize = 16
+const SPV_MAX_LEVELS: usize = 12
+const TEXW: usize = 40 // u64 words per texture slot: fmt, nlevels, then (ptr, w, h) per level
+const SMPW: usize = 12 // u32 words per sampler slot: min, mag, mip, wrap s, wrap t, border rgba
+const LSW: usize = 8 // u32 words per lane state: pc, depth, cur, prev, done, killed, blocked
+const SPV_FMT_RGBA8: u32 = 0
+const SPV_FMT_RGBA32F: u32 = 1
+const SPV_FILTER_NEAREST: u32 = 0
+const SPV_FILTER_LINEAR: u32 = 1
+const SPV_MIP_NONE: u32 = 0
+const SPV_MIP_NEAREST: u32 = 1
+const SPV_MIP_LINEAR: u32 = 2
+const SPV_WRAP_REPEAT: u32 = 0
+const SPV_WRAP_CLAMP: u32 = 1
+const SPV_WRAP_MIRROR: u32 = 2
+const SPV_WRAP_BORDER: u32 = 3
 
 struct Spv {
     code: u64, // copy of the module (u32 words)
@@ -76,11 +100,19 @@ struct Spv {
     killed: u32,
     steps: u64,
     ninstr: usize,
+    nl: usize, // lanes allocated (1, or 4 after spv_quad_enable)
+    lane: usize, // current lane: host accessors + the executing lane
+    vbase: usize, // lane * nvals
+    mbase: usize, // lane * nmem
+    tex: u64, // SPV_MAX_TEX texture slots (TEXW u64 words each)
+    smp: u64, // SPV_MAX_TEX sampler slots (SMPW u32 words each)
+    ls: u64, // lane states (LSW u32 words each)
 }
 
 fn spv_zero() -> Spv {
     return Spv { code: 0, nwords: 0, bound: 0, op: 0, at: 0, ty: 0, voff: 0, sz: 0, vals: 0, nvals: 0, mem: 0, nmem: 0,
-        stk_ret: 0, stk_res: 0, stk_lbl: 0, tmp: 0, err: 0, err_op: 0, killed: 0, steps: 0, ninstr: 0 }
+        stk_ret: 0, stk_res: 0, stk_lbl: 0, tmp: 0, err: 0, err_op: 0, killed: 0, steps: 0, ninstr: 0,
+        nl: 1, lane: 0, vbase: 0, mbase: 0, tex: 0, smp: 0, ls: 0 }
 }
 
 fn spv_instr_count(m: *mut Spv) -> usize {
@@ -93,6 +125,27 @@ fn spv_id_bound(m: *mut Spv) -> usize {
 
 fn spv_killed(m: *mut Spv) -> bool {
     return (*m).killed != 0
+}
+
+// OpKill seen by lane `l` in the last run
+fn spv_killed_lane(m: *mut Spv, l: usize) -> bool {
+    if (*m).ls == 0 || l >= (*m).nl {
+        return false
+    }
+    return rt.ld32((*m).ls, l * LSW + 5) != 0
+}
+
+// selects the lane that spv_mem_* / spv_run act on (0..3, only > 0 after spv_quad_enable)
+fn spv_lane(m: *mut Spv, l: usize) {
+    if l < (*m).nl {
+        set_lane(m, l)
+    }
+}
+
+fn set_lane(m: *mut Spv, l: usize) {
+    (*m).lane = l
+    (*m).vbase = l * (*m).nvals
+    (*m).mbase = l * (*m).nmem
 }
 
 fn fail(m: *mut Spv, code: u32, opc: u32) {
@@ -132,7 +185,7 @@ fn vget(m: *mut Spv, id: u32, k: usize) -> u32 {
         fail(m, E_RANGE, 0)
         return 0
     }
-    return rt.ld32((*m).vals, i)
+    return rt.ld32((*m).vals, (*m).vbase + i)
 }
 
 fn vput(m: *mut Spv, id: u32, k: usize, v: u32) {
@@ -141,7 +194,7 @@ fn vput(m: *mut Spv, id: u32, k: usize, v: u32) {
         fail(m, E_RANGE, 0)
         return
     }
-    rt.st32((*m).vals, i, v)
+    rt.st32((*m).vals, (*m).vbase + i, v)
 }
 
 fn fget(m: *mut Spv, id: u32, k: usize) -> f32 {
@@ -157,7 +210,7 @@ fn memget(m: *mut Spv, off: usize) -> u32 {
         fail(m, E_RANGE, 0)
         return 0
     }
-    return rt.ld32((*m).mem, off)
+    return rt.ld32((*m).mem, (*m).mbase + off)
 }
 
 fn memput(m: *mut Spv, off: usize, v: u32) {
@@ -165,7 +218,7 @@ fn memput(m: *mut Spv, off: usize, v: u32) {
         fail(m, E_RANGE, 0)
         return
     }
-    rt.st32((*m).mem, off, v)
+    rt.st32((*m).mem, (*m).mbase + off, v)
 }
 
 fn spv_mem_get(m: *mut Spv, base: usize, k: usize) -> u32 {
@@ -197,15 +250,24 @@ fn spv_free(m: *mut Spv) {
         rt.heap_free((*m).sz, nb)
     }
     if (*m).vals != 0 {
-        rt.heap_free((*m).vals, (*m).nvals * 4 + 4)
+        rt.heap_free((*m).vals, (*m).nvals * (*m).nl * 4 + 4)
     }
     if (*m).mem != 0 {
-        rt.heap_free((*m).mem, (*m).nmem * 4 + 4)
+        rt.heap_free((*m).mem, (*m).nmem * (*m).nl * 4 + 4)
     }
     if (*m).stk_ret != 0 {
-        rt.heap_free((*m).stk_ret, MAX_DEPTH * 4)
-        rt.heap_free((*m).stk_res, MAX_DEPTH * 4)
-        rt.heap_free((*m).stk_lbl, MAX_DEPTH * 4)
+        rt.heap_free((*m).stk_ret, MAX_DEPTH * MAX_LANES * 4)
+        rt.heap_free((*m).stk_res, MAX_DEPTH * MAX_LANES * 4)
+        rt.heap_free((*m).stk_lbl, MAX_DEPTH * MAX_LANES * 4)
+    }
+    if (*m).tex != 0 {
+        rt.heap_free((*m).tex, SPV_MAX_TEX * TEXW * 8)
+    }
+    if (*m).smp != 0 {
+        rt.heap_free((*m).smp, SPV_MAX_TEX * SMPW * 4)
+    }
+    if (*m).ls != 0 {
+        rt.heap_free((*m).ls, MAX_LANES * LSW * 4)
     }
     if (*m).tmp != 0 {
         rt.heap_free((*m).tmp, TMP_WORDS * 4)
@@ -267,6 +329,12 @@ fn tsize_raw(m: *mut Spv, t: u32) -> usize {
     }
     if o == 20 || o == 32 {
         return 1
+    }
+    if o == 25 || o == 26 {
+        return 1 // image / sampler: one word, the texture / sampler slot
+    }
+    if o == 27 {
+        return 2 // sampled image: texture slot + sampler slot
     }
     if o == 21 || o == 22 {
         if cw(m, a + 2) == 32 {
@@ -404,11 +472,21 @@ fn spv_new(code: u64, nbytes: usize, m: *mut Spv) -> bool {
     (*m).ty = rt.heap_alloc(nb)
     (*m).voff = rt.heap_alloc(nb)
     (*m).sz = rt.heap_alloc(nb)
-    (*m).stk_ret = rt.heap_alloc(MAX_DEPTH * 4)
-    (*m).stk_res = rt.heap_alloc(MAX_DEPTH * 4)
-    (*m).stk_lbl = rt.heap_alloc(MAX_DEPTH * 4)
+    (*m).stk_ret = rt.heap_alloc(MAX_DEPTH * MAX_LANES * 4)
+    (*m).stk_res = rt.heap_alloc(MAX_DEPTH * MAX_LANES * 4)
+    (*m).stk_lbl = rt.heap_alloc(MAX_DEPTH * MAX_LANES * 4)
     (*m).tmp = rt.heap_alloc(TMP_WORDS * 4)
-    if (*m).op == 0 || (*m).at == 0 || (*m).ty == 0 || (*m).voff == 0 || (*m).sz == 0 || (*m).stk_ret == 0 || (*m).stk_res == 0 || (*m).stk_lbl == 0 || (*m).tmp == 0 {
+    (*m).tex = rt.heap_alloc(SPV_MAX_TEX * TEXW * 8)
+    (*m).smp = rt.heap_alloc(SPV_MAX_TEX * SMPW * 4)
+    (*m).ls = rt.heap_alloc(MAX_LANES * LSW * 4)
+    if (*m).tex != 0 && (*m).smp != 0 {
+        rt.mem_set((*m).tex, 0, SPV_MAX_TEX * TEXW * 8)
+        rt.mem_set((*m).smp, 0, SPV_MAX_TEX * SMPW * 4)
+    }
+    if (*m).ls != 0 {
+        rt.mem_set((*m).ls, 0, MAX_LANES * LSW * 4)
+    }
+    if (*m).tex == 0 || (*m).smp == 0 || (*m).ls == 0 || (*m).op == 0 || (*m).at == 0 || (*m).ty == 0 || (*m).voff == 0 || (*m).sz == 0 || (*m).stk_ret == 0 || (*m).stk_res == 0 || (*m).stk_lbl == 0 || (*m).tmp == 0 {
         fail(m, E_OOM, 0)
         spv_free(m)
         return false
@@ -506,6 +584,7 @@ fn spv_new(code: u64, nbytes: usize, m: *mut Spv) -> bool {
         id = id + 1
     }
     init_constants(m)
+    init_handles(m)
     if (*m).err != 0 {
         spv_free_keep_err(m)
         return false
@@ -585,24 +664,88 @@ fn init_variable(m: *mut Spv, var_id: u32, init: u32) {
     }
 }
 
-// zero memory and re-apply initialisers of globals
-fn spv_reset(m: *mut Spv) {
-    rt.mem_set((*m).mem, 0, (*m).nmem * 4)
-    (*m).err = 0
-    (*m).err_op = 0
-    (*m).killed = 0
+// Binding decoration of a variable (0 if none)
+fn binding_of(m: *mut Spv, var_id: u32) -> u32 {
     var i: usize = 5
-    while i < (*m).nwords && (*m).err == 0 {
+    while i < (*m).nwords {
         let w: u32 = rt.ld32((*m).code, i)
         let wc: usize = (w >> 16) as usize
         if wc == 0 {
             break
         }
-        if (w & 0xffff) == 59 && wc >= 5 && cw(m, i + 3) != 7 {
-            init_variable(m, cw(m, i + 2), cw(m, i + 4))
+        if (w & 0xffff) == 71 && wc >= 4 && cw(m, i + 1) == var_id && cw(m, i + 2) == 33 {
+            return cw(m, i + 3)
         }
         i = i + wc
     }
+    return 0
+}
+
+fn is_handle_type(m: *mut Spv, t: u32) -> bool {
+    let o: u32 = tget(m, (*m).op, t) as u32
+    return o == 25 || o == 26 || o == 27
+}
+
+// UniformConstant variables of image / sampler / sampled image type (or an array of them): their memory words hold the
+// texture / sampler slot = Binding (+ array index). Applies to the current lane.
+fn init_handles(m: *mut Spv) {
+    var id: usize = 1
+    while id < (*m).bound && (*m).err == 0 {
+        if rt.ld32((*m).op, id) == 59 && cw(m, tget(m, (*m).at, id as u32) + 3) == 0 {
+            let pt: u32 = pointee(m, rt.ld32((*m).ty, id))
+            let base: usize = vget(m, id as u32, 0) as usize
+            let b: u32 = binding_of(m, id as u32)
+            if (*m).err == 0 && is_handle_type(m, pt) {
+                let n: usize = tsize(m, pt)
+                var j: usize = 0
+                while j < n {
+                    memput(m, base + j, b)
+                    j = j + 1
+                }
+            } else if (*m).err == 0 && tget(m, (*m).op, pt) == 28 && is_handle_type(m, tchild(m, pt, 0)) {
+                let cnt: usize = tcount(m, pt)
+                let es: usize = tsize(m, tchild(m, pt, 0))
+                var a: usize = 0
+                while a < cnt {
+                    var j: usize = 0
+                    while j < es {
+                        memput(m, base + a * es + j, b +% (a as u32))
+                        j = j + 1
+                    }
+                    a = a + 1
+                }
+            }
+        }
+        id = id + 1
+    }
+}
+
+// zero memory and re-apply initialisers of globals (every lane)
+fn spv_reset(m: *mut Spv) {
+    rt.mem_set((*m).mem, 0, (*m).nmem * (*m).nl * 4)
+    (*m).err = 0
+    (*m).err_op = 0
+    (*m).killed = 0
+    let host: usize = (*m).lane
+    var l: usize = 0
+    while l < (*m).nl {
+        set_lane(m, l)
+        var i: usize = 5
+        while i < (*m).nwords && (*m).err == 0 {
+            let w: u32 = rt.ld32((*m).code, i)
+            let wc: usize = (w >> 16) as usize
+            if wc == 0 {
+                break
+            }
+            if (w & 0xffff) == 59 && wc >= 5 && cw(m, i + 3) != 7 {
+                init_variable(m, cw(m, i + 2), cw(m, i + 4))
+            }
+            i = i + wc
+        }
+        init_handles(m)
+        l = l + 1
+    }
+    set_lane(m, host)
 }
 
 // ------------------------------------------------------------ queries
@@ -1035,6 +1178,10 @@ fn exec_glsl(m: *mut Spv, res: u32, rtype: u32, e: u32, a: usize) {
     let n: usize = tsize(m, rtype)
     let x: u32 = cw(m, a)
     var k: usize = 0
+    if e >= 54 && e <= 64 && e != 59 {
+        exec_pack(m, res, e, x)
+        return
+    }
     // one-operand floating point functions
     if e == 1 || e == 2 || e == 3 || e == 4 || e == 8 || e == 9 || e == 10 || e == 13 || e == 14 || e == 15 || e == 18 || (e >= 27 && e <= 32) {
         while k < n {
@@ -1271,27 +1418,97 @@ fn chain_offset(m: *mut Spv, base_ptr: u32, pc: usize, wc: usize) -> usize {
     return off
 }
 
-// runs OpFunction `fn_id` to its Return; true = finished without error
+// runs OpFunction `fn_id` on the current lane (spv_lane) to its Return; true = finished without error
 fn spv_run(m: *mut Spv, fn_id: u32, max_steps: u64) -> bool {
+    return run_lanes(m, fn_id, max_steps, (*m).lane, 1)
+}
+
+// runs the 2x2 quad (lanes 0..3, spv_quad_enable first) in lockstep at derivative / implicit-LOD instructions:
+// lane 0 = (x, y), 1 = (x + 1, y), 2 = (x, y + 1), 3 = (x + 1, y + 1). `max_steps` counts per lane.
+fn spv_run_quad(m: *mut Spv, fn_id: u32, max_steps: u64) -> bool {
+    if (*m).nl < MAX_LANES {
+        (*m).err = 0
+        (*m).err_op = 0
+        fail(m, E_ENTRY, 0)
+        return false
+    }
+    return run_lanes(m, fn_id, max_steps, 0, MAX_LANES)
+}
+
+// lanes first .. first + count - 1: each runs until it ends or waits at a sync instruction; the waiting ones are then
+// resolved together and everyone continues. Lanes that diverge never deadlock: a lane that ended just leaves stale values.
+fn run_lanes(m: *mut Spv, fn_id: u32, max_steps: u64, first: usize, count: usize) -> bool {
     (*m).err = 0
     (*m).err_op = 0
     (*m).killed = 0
     (*m).steps = 0
+    let host: usize = (*m).lane
     if fn_id == 0 || tget(m, (*m).op, fn_id) != 54 {
         fail(m, E_ENTRY, 0)
         return false
     }
-    var pc: usize = after_params(m, fn_id)
-    var depth: usize = 0
-    var cur: u32 = 0
-    var prev: u32 = 0
+    let start: usize = after_params(m, fn_id)
+    var i: usize = 0
+    while i < count {
+        let lb: usize = (first + i) * LSW
+        rt.st32((*m).ls, lb, start as u32)
+        var f: usize = 1
+        while f < LSW {
+            rt.st32((*m).ls, lb + f, 0)
+            f = f + 1
+        }
+        i = i + 1
+    }
+    let limit: u64 = max_steps *% (count as u64)
+    while (*m).err == 0 {
+        i = 0
+        while i < count && (*m).err == 0 {
+            let lb: usize = (first + i) * LSW
+            if rt.ld32((*m).ls, lb + 4) == 0 && rt.ld32((*m).ls, lb + 6) == 0 {
+                run_lane(m, first + i, limit)
+            }
+            i = i + 1
+        }
+        var waiting: usize = 0
+        i = 0
+        while i < count {
+            if rt.ld32((*m).ls, (first + i) * LSW + 6) != 0 {
+                waiting = waiting + 1
+            }
+            i = i + 1
+        }
+        if waiting == 0 || (*m).err != 0 {
+            break
+        }
+        i = 0
+        while i < count && (*m).err == 0 {
+            if rt.ld32((*m).ls, (first + i) * LSW + 6) != 0 {
+                resolve_sync(m, first + i, first, count)
+            }
+            i = i + 1
+        }
+    }
+    (*m).killed = rt.ld32((*m).ls, host * LSW + 5)
+    set_lane(m, host)
+    return (*m).err == 0
+}
+
+// runs lane `l` from its saved state until it ends (ls done = 1), waits (ls blocked = 1) or fails
+fn run_lane(m: *mut Spv, l: usize, limit: u64) {
+    set_lane(m, l)
+    let lb: usize = l * LSW
+    let sb: usize = l * MAX_DEPTH
+    var pc: usize = rt.ld32((*m).ls, lb) as usize
+    var depth: usize = rt.ld32((*m).ls, lb + 1) as usize
+    var cur: u32 = rt.ld32((*m).ls, lb + 2)
+    var prev: u32 = rt.ld32((*m).ls, lb + 3)
     while (*m).err == 0 {
         if pc >= (*m).nwords {
             fail(m, E_BROKEN, 0)
             break
         }
         (*m).steps = (*m).steps + 1
-        if (*m).steps > max_steps {
+        if (*m).steps > limit {
             fail(m, E_STEPS, 0)
             break
         }
@@ -1331,18 +1548,20 @@ fn spv_run(m: *mut Spv, fn_id: u32, max_steps: u64) -> bool {
             next = tget(m, (*m).at, target)
         } else if o == 253 || o == 254 {
             if o == 254 && depth > 0 {
-                let rid: u32 = rt.ld32((*m).stk_res, depth - 1)
+                let rid: u32 = rt.ld32((*m).stk_res, sb + depth - 1)
                 vcopy(m, rid, 0, cw(m, pc + 1), tsize(m, tyid(m, rid)))
             }
             if depth == 0 {
-                return (*m).err == 0
+                rt.st32((*m).ls, lb + 4, 1)
+                return
             }
             depth = depth - 1
-            next = rt.ld32((*m).stk_ret, depth) as usize
-            cur = rt.ld32((*m).stk_lbl, depth)
+            next = rt.ld32((*m).stk_ret, sb + depth) as usize
+            cur = rt.ld32((*m).stk_lbl, sb + depth)
         } else if o == 252 {
-            (*m).killed = 1
-            return true
+            rt.st32((*m).ls, lb + 5, 1)
+            rt.st32((*m).ls, lb + 4, 1)
+            return
         } else if o == 255 {
             fail(m, E_OP, o)
         } else if o == 57 {
@@ -1360,12 +1579,20 @@ fn spv_run(m: *mut Spv, fn_id: u32, max_steps: u64) -> bool {
                     pp = pp + (cw(m, pp) >> 16) as usize
                     ai = ai + 1
                 }
-                rt.st32((*m).stk_ret, depth, (pc + wc) as u32)
-                rt.st32((*m).stk_res, depth, cw(m, pc + 2))
-                rt.st32((*m).stk_lbl, depth, cur)
+                rt.st32((*m).stk_ret, sb + depth, (pc + wc) as u32)
+                rt.st32((*m).stk_res, sb + depth, cw(m, pc + 2))
+                rt.st32((*m).stk_lbl, sb + depth, cur)
                 depth = depth + 1
                 next = pp
             }
+        } else if o == 87 || o == 91 || o == 105 || (o >= 207 && o <= 215) {
+            // implicit-LOD sampling, LOD query, derivatives: the lanes of the quad meet here (resolve_sync)
+            rt.st32((*m).ls, lb, pc as u32)
+            rt.st32((*m).ls, lb + 1, depth as u32)
+            rt.st32((*m).ls, lb + 2, cur)
+            rt.st32((*m).ls, lb + 3, prev)
+            rt.st32((*m).ls, lb + 6, 1)
+            return
         } else if o == 245 {
             next = exec_phis(m, pc, prev)
         } else {
@@ -1373,7 +1600,6 @@ fn spv_run(m: *mut Spv, fn_id: u32, max_steps: u64) -> bool {
         }
         pc = next
     }
-    return false
 }
 
 // the first instruction after OpFunction and its OpFunctionParameters
@@ -1684,6 +1910,10 @@ fn exec_value(m: *mut Spv, pc: usize, wc: usize, o: u32) {
         exec_glsl(m, res, rtype, cw(m, pc + 4), pc + 5)
         return
     }
+    if o == 86 || o == 88 || o == 92 || o == 95 || o == 100 || o == 103 || o == 104 || o == 106 || o == 107 {
+        exec_image(m, pc, wc, o, res, rtype)
+        return
+    }
     fail(m, E_OP, o)
 }
 
@@ -1745,5 +1975,833 @@ fn exec_matmul(m: *mut Spv, pc: usize, o: u32, res: u32, rtype: u32) {
             i = i + 1
         }
         kcol = kcol + 1
+    }
+}
+
+// ------------------------------------------------------------ images + samplers (CPU textures)
+//
+// Handles: an image / sampler value is ONE word (texture / sampler slot), a sampled image two words (texture slot, sampler
+// slot). The slot of a UniformConstant variable is its `Binding` decoration (`DescriptorSet` is ignored), set by spv_new /
+// spv_reset (init_handles). The host fills the slots: spv_tex_set (+ spv_tex_set_level for mip levels), spv_sampler_set.
+// Only 2D, non-arrayed, non-multisampled images with a 32-bit float sampled type are supported.
+
+fn spv_tex_clear(m: *mut Spv, slot: usize) {
+    if slot < SPV_MAX_TEX && (*m).tex != 0 {
+        rt.mem_set((*m).tex + (slot * TEXW * 8) as u64, 0, TEXW * 8)
+    }
+}
+
+// level 0 of texture `slot`: fmt SPV_FMT_RGBA8 (4 bytes/texel) or SPV_FMT_RGBA32F (4 f32/texel), rows top to bottom
+// (row 0 = v 0); the pixels stay owned by the host and must outlive the run. Resets the other levels.
+fn spv_tex_set(m: *mut Spv, slot: usize, fmt: u32, px: u64, w: usize, h: usize) -> bool {
+    if slot >= SPV_MAX_TEX || fmt > 1 || (*m).tex == 0 {
+        return false
+    }
+    spv_tex_clear(m, slot)
+    rt.st64((*m).tex, slot * TEXW, fmt as u64)
+    return spv_tex_set_level(m, slot, 0, px, w, h)
+}
+
+// mip level `level` (sizes are the host's choice, normally max(1, w >> level)); the level count grows to level + 1
+fn spv_tex_set_level(m: *mut Spv, slot: usize, level: usize, px: u64, w: usize, h: usize) -> bool {
+    if slot >= SPV_MAX_TEX || level >= SPV_MAX_LEVELS || px == 0 || w == 0 || h == 0 || w > 16384 || h > 16384 || (*m).tex == 0 {
+        return false
+    }
+    let tb: usize = slot * TEXW
+    rt.st64((*m).tex, tb + 2 + 3 * level, px)
+    rt.st64((*m).tex, tb + 3 + 3 * level, w as u64)
+    rt.st64((*m).tex, tb + 4 + 3 * level, h as u64)
+    if rt.ld64((*m).tex, tb + 1) < (level + 1) as u64 {
+        rt.st64((*m).tex, tb + 1, (level + 1) as u64)
+    }
+    return true
+}
+
+// filters SPV_FILTER_*, mip mode SPV_MIP_*, wrap SPV_WRAP_*; default of a fresh module: nearest, nearest, no mips, repeat
+fn spv_sampler_set(m: *mut Spv, slot: usize, min_f: u32, mag_f: u32, mip: u32, wrap_s: u32, wrap_t: u32) -> bool {
+    if slot >= SPV_MAX_TEX || min_f > 1 || mag_f > 1 || mip > 2 || wrap_s > 3 || wrap_t > 3 || (*m).smp == 0 {
+        return false
+    }
+    let sb: usize = slot * SMPW
+    rt.st32((*m).smp, sb, min_f)
+    rt.st32((*m).smp, sb + 1, mag_f)
+    rt.st32((*m).smp, sb + 2, mip)
+    rt.st32((*m).smp, sb + 3, wrap_s)
+    rt.st32((*m).smp, sb + 4, wrap_t)
+    return true
+}
+
+fn spv_sampler_border(m: *mut Spv, slot: usize, r: f32, g: f32, b: f32, a: f32) -> bool {
+    if slot >= SPV_MAX_TEX || (*m).smp == 0 {
+        return false
+    }
+    let sb: usize = slot * SMPW + 5
+    rt.st32((*m).smp, sb, math.math_bits32(r))
+    rt.st32((*m).smp, sb + 1, math.math_bits32(g))
+    rt.st32((*m).smp, sb + 2, math.math_bits32(b))
+    rt.st32((*m).smp, sb + 3, math.math_bits32(a))
+    return true
+}
+
+fn tmpf(m: *mut Spv, i: usize) -> f32 {
+    return math.math_f32(rt.ld32((*m).tmp, i))
+}
+
+fn tmpput(m: *mut Spv, i: usize, x: f32) {
+    rt.st32((*m).tmp, i, math.math_bits32(x))
+}
+
+fn f2l(x: f32) -> i64 {
+    return (f2i(x) as% i32) as i64
+}
+
+// texel index i of a row / column of n texels after the wrap mode; -1 = border colour
+fn wrap_idx(i: i64, n: i64, mode: u32) -> i64 {
+    if mode == 0 {
+        var r: i64 = i % n
+        if r < 0 {
+            r = r + n
+        }
+        return r
+    }
+    if mode == 1 {
+        if i < 0 {
+            return 0
+        }
+        if i >= n {
+            return n - 1
+        }
+        return i
+    }
+    if mode == 2 {
+        let p: i64 = 2 * n
+        var r: i64 = i % p
+        if r < 0 {
+            r = r + p
+        }
+        if r >= n {
+            return p - 1 - r
+        }
+        return r
+    }
+    if i < 0 || i >= n {
+        return -1
+    }
+    return i
+}
+
+// texel (x, y) in range of level `lvl` -> tmp[o..o+4] (0,0,0,1 if the level has no pixels)
+fn texel_read(m: *mut Spv, tb: usize, lvl: usize, x: i64, y: i64, o: usize) {
+    let base: usize = tb + 2 + 3 * lvl
+    let ptr: u64 = rt.ld64((*m).tex, base)
+    let w: i64 = rt.ld64((*m).tex, base + 1) as i64
+    let h: i64 = rt.ld64((*m).tex, base + 2) as i64
+    if ptr == 0 || w <= 0 || h <= 0 || x < 0 || y < 0 || x >= w || y >= h {
+        tmpput(m, o, 0.0)
+        tmpput(m, o + 1, 0.0)
+        tmpput(m, o + 2, 0.0)
+        tmpput(m, o + 3, 1.0)
+        return
+    }
+    let idx: usize = (y * w + x) as usize
+    let fmt: u64 = rt.ld64((*m).tex, tb)
+    var c: usize = 0
+    while c < 4 {
+        if fmt == 0 {
+            tmpput(m, o + c, (rt.ld8(ptr, idx * 4 + c) as f32) / 255.0)
+        } else {
+            rt.st32((*m).tmp, o + c, rt.ld32(ptr, idx * 4 + c))
+        }
+        c = c + 1
+    }
+}
+
+// texel with the sampler's wrap modes / border colour -> tmp[o..o+4]
+fn texel_at(m: *mut Spv, tb: usize, sb: usize, lvl: usize, ix: i64, iy: i64, o: usize) {
+    let base: usize = tb + 2 + 3 * lvl
+    let w: i64 = rt.ld64((*m).tex, base + 1) as i64
+    let h: i64 = rt.ld64((*m).tex, base + 2) as i64
+    if w <= 0 || h <= 0 {
+        texel_read(m, tb, lvl, -1, -1, o)
+        return
+    }
+    let wx: i64 = wrap_idx(ix, w, rt.ld32((*m).smp, sb + 3))
+    let wy: i64 = wrap_idx(iy, h, rt.ld32((*m).smp, sb + 4))
+    if wx < 0 || wy < 0 {
+        var c: usize = 0
+        while c < 4 {
+            rt.st32((*m).tmp, o + c, rt.ld32((*m).smp, sb + 5 + c))
+            c = c + 1
+        }
+        return
+    }
+    texel_read(m, tb, lvl, wx, wy, o)
+}
+
+// one mip level, nearest (filt 0) or bilinear (1) -> tmp[o..o+4]; scratch tmp[SCR..SCR+4]
+fn sample_level(m: *mut Spv, tb: usize, sb: usize, lvl: usize, u: f32, v: f32, filt: u32, offx: i64, offy: i64, o: usize) {
+    let base: usize = tb + 2 + 3 * lvl
+    let wf: f32 = rt.ld64((*m).tex, base + 1) as f32
+    let hf: f32 = rt.ld64((*m).tex, base + 2) as f32
+    if filt == 0 {
+        let ix: i64 = f2l(math.floor32(u * wf)) + offx
+        let iy: i64 = f2l(math.floor32(v * hf)) + offy
+        texel_at(m, tb, sb, lvl, ix, iy, o)
+        return
+    }
+    let x: f32 = u * wf - 0.5
+    let y: f32 = v * hf - 0.5
+    let fx: f32 = math.floor32(x)
+    let fy: f32 = math.floor32(y)
+    let ax: f32 = x - fx
+    let ay: f32 = y - fy
+    let i0: i64 = f2l(fx) + offx
+    let j0: i64 = f2l(fy) + offy
+    let w00: f32 = (1.0 - ax) * (1.0 - ay)
+    let w10: f32 = ax * (1.0 - ay)
+    let w01: f32 = (1.0 - ax) * ay
+    let w11: f32 = ax * ay
+    var c: usize = 0
+    while c < 4 {
+        tmpput(m, o + c, 0.0)
+        c = c + 1
+    }
+    var t: usize = 0
+    while t < 4 {
+        var wgt: f32 = w00
+        var ti: i64 = i0
+        var tj: i64 = j0
+        if t == 1 {
+            wgt = w10
+            ti = i0 + 1
+        }
+        if t == 2 {
+            wgt = w01
+            tj = j0 + 1
+        }
+        if t == 3 {
+            wgt = w11
+            ti = i0 + 1
+            tj = j0 + 1
+        }
+        texel_at(m, tb, sb, lvl, ti, tj, SCR)
+        c = 0
+        while c < 4 {
+            tmpput(m, o + c, tmpf(m, o + c) + wgt * tmpf(m, SCR + c))
+            c = c + 1
+        }
+        t = t + 1
+    }
+}
+
+// full lookup at LOD `lambda` (<= 0: magnification) -> tmp[o..o+4]; scratch tmp[SCR..SCR+8]
+fn sample_lod(m: *mut Spv, tslot: usize, sslot: usize, u: f32, v: f32, lambda: f32, offx: i64, offy: i64, o: usize) {
+    let tb: usize = tslot * TEXW
+    let sb: usize = sslot * SMPW
+    let nlev: usize = rt.ld64((*m).tex, tb + 1) as usize
+    if nlev == 0 {
+        tmpput(m, o, 0.0)
+        tmpput(m, o + 1, 0.0)
+        tmpput(m, o + 2, 0.0)
+        tmpput(m, o + 3, 1.0)
+        return
+    }
+    let minf: u32 = rt.ld32((*m).smp, sb)
+    let magf: u32 = rt.ld32((*m).smp, sb + 1)
+    let mip: u32 = rt.ld32((*m).smp, sb + 2)
+    if !(lambda > 0.0) {
+        sample_level(m, tb, sb, 0, u, v, magf, offx, offy, o)
+        return
+    }
+    let qf: f32 = (nlev - 1) as f32
+    var d: f32 = lambda
+    if d > qf {
+        d = qf
+    }
+    if mip == 0 {
+        sample_level(m, tb, sb, 0, u, v, minf, offx, offy, o)
+        return
+    }
+    if mip == 1 {
+        var lv: i64 = f2l(math.ceil32(d + 0.5)) - 1
+        if lv < 0 {
+            lv = 0
+        }
+        if lv > (nlev - 1) as i64 {
+            lv = (nlev - 1) as i64
+        }
+        sample_level(m, tb, sb, lv as usize, u, v, minf, offx, offy, o)
+        return
+    }
+    let l0f: f32 = math.floor32(d)
+    let fr: f32 = d - l0f
+    let l0: usize = f2l(l0f) as usize
+    var l1: usize = l0 + 1
+    if l1 > nlev - 1 {
+        l1 = nlev - 1
+    }
+    sample_level(m, tb, sb, l0, u, v, minf, offx, offy, o)
+    var c: usize = 0
+    while c < 4 {
+        tmpput(m, o + 4 + c, tmpf(m, o + c))
+        c = c + 1
+    }
+    sample_level(m, tb, sb, l1, u, v, minf, offx, offy, o)
+    c = 0
+    while c < 4 {
+        tmpput(m, o + c, (1.0 - fr) * tmpf(m, o + 4 + c) + fr * tmpf(m, o + c))
+        c = c + 1
+    }
+}
+
+const SCR: usize = 64
+
+// log2 of the largest texel-space gradient of (u, v) at level 0 (GL 4.6 eq. 8.6 / 8.7); -1000 when there is no gradient
+fn lod_from_grads(m: *mut Spv, tslot: usize, dudx: f32, dvdx: f32, dudy: f32, dvdy: f32) -> f32 {
+    let tb: usize = tslot * TEXW
+    let w0: f32 = rt.ld64((*m).tex, tb + 3) as f32
+    let h0: f32 = rt.ld64((*m).tex, tb + 4) as f32
+    let px: f32 = dudx * w0
+    let py: f32 = dvdx * h0
+    let qx: f32 = dudy * w0
+    let qy: f32 = dvdy * h0
+    let rx: f32 = math.sqrt32(px * px + py * py)
+    let ry: f32 = math.sqrt32(qx * qx + qy * qy)
+    var rho: f32 = rx
+    if ry > rho {
+        rho = ry
+    }
+    if !(rho > 0.0) {
+        return -1000.0
+    }
+    return math.log2(rho as f64) as f32
+}
+
+// image type check: Dim2D, not arrayed, not multisampled, 32-bit float sampled type. `t` = image or sampled image type
+fn check_image_type(m: *mut Spv, t: u32) -> bool {
+    var it: u32 = t
+    if tget(m, (*m).op, t) == 27 {
+        it = cw(m, tget(m, (*m).at, t) + 2)
+    }
+    if tget(m, (*m).op, it) != 25 {
+        fail(m, E_TYPE, 25)
+        return false
+    }
+    let a: usize = tget(m, (*m).at, it)
+    let st: u32 = cw(m, a + 2)
+    if cw(m, a + 3) != 1 || cw(m, a + 5) != 0 || cw(m, a + 6) != 0 || tget(m, (*m).op, st) != 22 {
+        fail(m, E_TYPE, 25)
+        return false
+    }
+    return (*m).err == 0
+}
+
+fn vgetl_f(m: *mut Spv, lane: usize, id: u32, k: usize) -> f32 {
+    let i: usize = tget(m, (*m).voff, id) + k
+    if i >= (*m).nvals || lane >= (*m).nl {
+        fail(m, E_RANGE, 0)
+        return 0.0
+    }
+    return math.math_f32(rt.ld32((*m).vals, lane * (*m).nvals + i))
+}
+
+// coordinate component of `lane`, divided by the last component for projective lookups
+fn coord_uv(m: *mut Spv, lane: usize, cid: u32, proj: bool, nc: usize, which: usize) -> f32 {
+    let c: f32 = vgetl_f(m, lane, cid, which)
+    if proj {
+        return c / vgetl_f(m, lane, cid, nc - 1)
+    }
+    return c
+}
+
+// lanes (a, b) of the quad whose difference is the derivative of lane q along axis 1 (x) or 2 (y); packed a * 8 + b
+fn dpair(q: usize, axis: usize, coarse: bool, count: usize) -> usize {
+    var a: usize = 0
+    var b: usize = axis
+    if !coarse {
+        if (q & axis) == 0 {
+            a = q
+            b = q + axis
+        } else {
+            a = q - axis
+            b = q
+        }
+    }
+    if b >= count {
+        a = q
+        b = q
+    }
+    return a * 8 + b
+}
+
+// OpDPdx / OpDPdy / OpFwidth (+ Fine / Coarse): derivative from the neighbour lanes of the quad (0 without a quad)
+fn do_deriv(m: *mut Spv, pc: usize, o: u32, first: usize, count: usize, l: usize) {
+    let res: u32 = cw(m, pc + 2)
+    let src: u32 = cw(m, pc + 3)
+    let n: usize = tsize(m, cw(m, pc + 1))
+    let coarse: bool = o >= 213
+    let kind: u32 = (o - 207) % 3
+    let q: usize = l - first
+    var k: usize = 0
+    while k < n && (*m).err == 0 {
+        var dx: f32 = 0.0
+        var dy: f32 = 0.0
+        if kind != 1 {
+            let pk: usize = dpair(q, 1, coarse, count)
+            dx = vgetl_f(m, first + pk % 8, src, k) - vgetl_f(m, first + pk / 8, src, k)
+        }
+        if kind != 0 {
+            let pk: usize = dpair(q, 2, coarse, count)
+            dy = vgetl_f(m, first + pk % 8, src, k) - vgetl_f(m, first + pk / 8, src, k)
+        }
+        var r: f32 = dx
+        if kind == 1 {
+            r = dy
+        }
+        if kind == 2 {
+            r = math.fabs32(dx) + math.fabs32(dy)
+        }
+        fput(m, res, k, r)
+        k = k + 1
+    }
+}
+
+// OpImageSample{Implicit,Explicit}Lod, OpImageSampleProj{Implicit,Explicit}Lod, OpImageQueryLod on the current lane
+fn do_sample(m: *mut Spv, pc: usize, wc: usize, o: u32, first: usize, count: usize) {
+    let rtype: u32 = cw(m, pc + 1)
+    let res: u32 = cw(m, pc + 2)
+    let si: u32 = cw(m, pc + 3)
+    let cid: u32 = cw(m, pc + 4)
+    if !check_image_type(m, tyid(m, si)) {
+        return
+    }
+    let tslot: usize = vget(m, si, 0) as usize
+    let sslot: usize = vget(m, si, 1) as usize
+    if tslot >= SPV_MAX_TEX || sslot >= SPV_MAX_TEX {
+        fail(m, E_RANGE, o)
+        return
+    }
+    let query: bool = o == 105
+    let proj: bool = o == 91 || o == 92
+    let implicit: bool = o == 87 || o == 91 || query
+    let nc: usize = tsize(m, tyid(m, cid))
+    var need: usize = 2
+    if proj {
+        need = 3
+    }
+    if nc < need {
+        fail(m, E_TYPE, o)
+        return
+    }
+    let lane: usize = (*m).lane
+    let u: f32 = coord_uv(m, lane, cid, proj, nc, 0)
+    let v: f32 = coord_uv(m, lane, cid, proj, nc, 1)
+    var mask: u32 = 0
+    if wc > 5 && !query {
+        mask = cw(m, pc + 5)
+    }
+    if (mask & 0xffffffe0) != 0 {
+        fail(m, E_OP, o)
+        return
+    }
+    var ip: usize = pc + 6
+    var bias: f32 = 0.0
+    var lodv: f32 = 0.0
+    var has_lod: bool = false
+    var has_grad: bool = false
+    var gx: u32 = 0
+    var gy: u32 = 0
+    var offx: i64 = 0
+    var offy: i64 = 0
+    if (mask & 1) != 0 {
+        bias = fget(m, cw(m, ip), 0)
+        ip = ip + 1
+    }
+    if (mask & 2) != 0 {
+        lodv = fget(m, cw(m, ip), 0)
+        has_lod = true
+        ip = ip + 1
+    }
+    if (mask & 4) != 0 {
+        gx = cw(m, ip)
+        gy = cw(m, ip + 1)
+        has_grad = true
+        ip = ip + 2
+    }
+    if (mask & 24) != 0 {
+        // ConstOffset (8) or Offset (16): ivec2 (the ids are constants / values of this lane)
+        let oid: u32 = cw(m, ip)
+        offx = (vget(m, oid, 0) as% i32) as i64
+        offy = (vget(m, oid, 1) as% i32) as i64
+        ip = ip + 1
+    }
+    if ip > pc + 6 && ip > pc + wc && (*m).err == 0 {
+        fail(m, E_BROKEN, o)
+        return
+    }
+    var lambda: f32 = 0.0
+    if has_lod {
+        lambda = lodv
+    } else if has_grad {
+        lambda = lod_from_grads(m, tslot, fget(m, gx, 0), fget(m, gx, 1), fget(m, gy, 0), fget(m, gy, 1)) + bias
+    } else if implicit {
+        let q: usize = lane - first
+        let pkx: usize = dpair(q, 1, false, count)
+        let pky: usize = dpair(q, 2, false, count)
+        let dudx: f32 = coord_uv(m, first + pkx % 8, cid, proj, nc, 0) - coord_uv(m, first + pkx / 8, cid, proj, nc, 0)
+        let dvdx: f32 = coord_uv(m, first + pkx % 8, cid, proj, nc, 1) - coord_uv(m, first + pkx / 8, cid, proj, nc, 1)
+        let dudy: f32 = coord_uv(m, first + pky % 8, cid, proj, nc, 0) - coord_uv(m, first + pky / 8, cid, proj, nc, 0)
+        let dvdy: f32 = coord_uv(m, first + pky % 8, cid, proj, nc, 1) - coord_uv(m, first + pky / 8, cid, proj, nc, 1)
+        lambda = lod_from_grads(m, tslot, dudx, dvdx, dudy, dvdy) + bias
+    } else {
+        fail(m, E_OP, o)
+        return
+    }
+    if (*m).err != 0 {
+        return
+    }
+    let n: usize = tsize(m, rtype)
+    if query {
+        let nlev: usize = rt.ld64((*m).tex, tslot * TEXW + 1) as usize
+        var cl: f32 = lambda
+        if nlev > 0 && cl > (nlev - 1) as f32 {
+            cl = (nlev - 1) as f32
+        }
+        if cl < 0.0 {
+            cl = 0.0
+        }
+        if n >= 1 {
+            fput(m, res, 0, cl)
+        }
+        if n >= 2 {
+            fput(m, res, 1, lambda)
+        }
+        return
+    }
+    sample_lod(m, tslot, sslot, u, v, lambda, offx, offy, 16)
+    var k: usize = 0
+    while k < n && k < 4 {
+        vput(m, res, k, rt.ld32((*m).tmp, 16 + k))
+        k = k + 1
+    }
+}
+
+// a lane that waited at a sync instruction: compute its result, step past the instruction, wake it up
+fn resolve_sync(m: *mut Spv, l: usize, first: usize, count: usize) {
+    set_lane(m, l)
+    let lb: usize = l * LSW
+    let pc: usize = rt.ld32((*m).ls, lb) as usize
+    let w: u32 = cw(m, pc)
+    let wc: usize = (w >> 16) as usize
+    let o: u32 = w & 0xffff
+    if o >= 207 && o <= 215 {
+        do_deriv(m, pc, o, first, count, l)
+    } else {
+        do_sample(m, pc, wc, o, first, count)
+    }
+    rt.st32((*m).ls, lb, (pc + wc) as u32)
+    rt.st32((*m).ls, lb + 6, 0)
+}
+
+// size of mip level `lvl` of texture slot: (w, h) packed w * 65536 + h; 0 when the texture is empty
+fn level_size(m: *mut Spv, slot: usize, lvl: usize) -> usize {
+    let tb: usize = slot * TEXW
+    let nlev: usize = rt.ld64((*m).tex, tb + 1) as usize
+    if nlev == 0 {
+        return 0
+    }
+    if lvl < nlev && rt.ld64((*m).tex, tb + 2 + 3 * lvl) != 0 {
+        return (rt.ld64((*m).tex, tb + 3 + 3 * lvl) as usize) * 65536 + (rt.ld64((*m).tex, tb + 4 + 3 * lvl) as usize)
+    }
+    var w: usize = rt.ld64((*m).tex, tb + 3) as usize
+    var h: usize = rt.ld64((*m).tex, tb + 4) as usize
+    if lvl < 63 {
+        w = w >> lvl
+        h = h >> lvl
+    } else {
+        w = 0
+        h = 0
+    }
+    if w < 1 {
+        w = 1
+    }
+    if h < 1 {
+        h = 1
+    }
+    return w * 65536 + h
+}
+
+// non-synchronising image instructions: OpSampledImage, OpImage, explicit-LOD samples, OpImageFetch, queries
+fn exec_image(m: *mut Spv, pc: usize, wc: usize, o: u32, res: u32, rtype: u32) {
+    if o == 86 {
+        vput(m, res, 0, vget(m, cw(m, pc + 3), 0))
+        vput(m, res, 1, vget(m, cw(m, pc + 4), 0))
+        return
+    }
+    if o == 100 {
+        vput(m, res, 0, vget(m, cw(m, pc + 3), 0))
+        return
+    }
+    if o == 88 || o == 92 {
+        do_sample(m, pc, wc, o, (*m).lane, 1)
+        return
+    }
+    let img: u32 = cw(m, pc + 3)
+    if !check_image_type(m, tyid(m, img)) {
+        return
+    }
+    let slot: usize = vget(m, img, 0) as usize
+    if slot >= SPV_MAX_TEX {
+        fail(m, E_RANGE, o)
+        return
+    }
+    let n: usize = tsize(m, rtype)
+    var k: usize = 0
+    if o == 106 {
+        vput(m, res, 0, rt.ld64((*m).tex, slot * TEXW + 1) as u32)
+        return
+    }
+    if o == 107 {
+        vput(m, res, 0, 1)
+        return
+    }
+    if o == 103 || o == 104 {
+        var lvl: usize = 0
+        if o == 103 {
+            lvl = vget(m, cw(m, pc + 4), 0) as usize
+        }
+        let sz: usize = level_size(m, slot, lvl)
+        if n >= 1 {
+            vput(m, res, 0, (sz / 65536) as u32)
+        }
+        if n >= 2 {
+            vput(m, res, 1, (sz % 65536) as u32)
+        }
+        return
+    }
+    if o == 95 {
+        let cid: u32 = cw(m, pc + 4)
+        if tsize(m, tyid(m, cid)) < 2 {
+            fail(m, E_TYPE, o)
+            return
+        }
+        var mask: u32 = 0
+        if wc > 5 {
+            mask = cw(m, pc + 5)
+        }
+        if (mask & 0xffffffe5) != 0 {
+            fail(m, E_OP, o)
+            return
+        }
+        var ip: usize = pc + 6
+        var lvl: usize = 0
+        var offx: i64 = 0
+        var offy: i64 = 0
+        if (mask & 2) != 0 {
+            lvl = vget(m, cw(m, ip), 0) as usize
+            ip = ip + 1
+        }
+        if (mask & 24) != 0 {
+            let oid: u32 = cw(m, ip)
+            offx = (vget(m, oid, 0) as% i32) as i64
+            offy = (vget(m, oid, 1) as% i32) as i64
+            ip = ip + 1
+        }
+        if ip > pc + 6 && ip > pc + wc {
+            fail(m, E_BROKEN, o)
+            return
+        }
+        let x: i64 = (vget(m, cid, 0) as% i32) as i64 + offx
+        let y: i64 = (vget(m, cid, 1) as% i32) as i64 + offy
+        let tb: usize = slot * TEXW
+        let nlev: usize = rt.ld64((*m).tex, tb + 1) as usize
+        if lvl >= nlev {
+            while k < n {
+                vput(m, res, k, 0)
+                k = k + 1
+            }
+            return
+        }
+        // out of range reads give zeros (robust access)
+        let base: usize = tb + 2 + 3 * lvl
+        let w: i64 = rt.ld64((*m).tex, base + 1) as i64
+        let h: i64 = rt.ld64((*m).tex, base + 2) as i64
+        if x < 0 || y < 0 || x >= w || y >= h {
+            while k < n {
+                vput(m, res, k, 0)
+                k = k + 1
+            }
+            return
+        }
+        texel_read(m, tb, lvl, x, y, 16)
+        while k < n && k < 4 {
+            vput(m, res, k, rt.ld32((*m).tmp, 16 + k))
+            k = k + 1
+        }
+        return
+    }
+    fail(m, E_OP, o)
+}
+
+// opt-in 2x2 quad: gives the module four lanes (copies of lane 0 as it is now). false = out of memory.
+fn spv_quad_enable(m: *mut Spv) -> bool {
+    if (*m).vals == 0 || (*m).mem == 0 {
+        return false
+    }
+    if (*m).nl == MAX_LANES {
+        return true
+    }
+    let nv: usize = (*m).nvals
+    let nm: usize = (*m).nmem
+    let nvals: u64 = rt.heap_alloc((nv * MAX_LANES + 1) * 4)
+    let nmem: u64 = rt.heap_alloc((nm * MAX_LANES + 1) * 4)
+    if nvals == 0 || nmem == 0 {
+        if nvals != 0 {
+            rt.heap_free(nvals, (nv * MAX_LANES + 1) * 4)
+        }
+        if nmem != 0 {
+            rt.heap_free(nmem, (nm * MAX_LANES + 1) * 4)
+        }
+        return false
+    }
+    rt.mem_set(nvals, 0, (nv * MAX_LANES + 1) * 4)
+    rt.mem_set(nmem, 0, (nm * MAX_LANES + 1) * 4)
+    var l: usize = 0
+    while l < MAX_LANES {
+        rt.mem_copy(nvals + (l * nv * 4) as u64, (*m).vals, nv * 4)
+        rt.mem_copy(nmem + (l * nm * 4) as u64, (*m).mem, nm * 4)
+        l = l + 1
+    }
+    rt.heap_free((*m).vals, nv * 4 + 4)
+    rt.heap_free((*m).mem, nm * 4 + 4)
+    (*m).vals = nvals
+    (*m).mem = nmem
+    (*m).nl = MAX_LANES
+    set_lane(m, 0)
+    return true
+}
+
+// ------------------------------------------------------------ pack / unpack (GLSL.std.450 54..58, 60..64)
+
+fn f32_to_f16(x: f32) -> u32 {
+    let b: u32 = math.math_bits32(x)
+    let sign: u32 = (b >> 16) & 0x8000
+    let e: u32 = (b >> 23) & 0xff
+    let mant: u32 = b & 0x7fffff
+    if e == 255 {
+        if mant != 0 {
+            return sign | 0x7e00
+        }
+        return sign | 0x7c00
+    }
+    let exp: i32 = (e as i32) - 112
+    if exp >= 31 {
+        return sign | 0x7c00
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign
+        }
+        let mm: u32 = mant | 0x800000
+        let shift: u32 = (14 - exp) as u32
+        var half: u32 = mm >> shift
+        let rem: u32 = mm & ((1 << shift) - 1)
+        let mid: u32 = 1 << (shift - 1)
+        if rem > mid || (rem == mid && (half & 1) != 0) {
+            half = half + 1
+        }
+        return sign | half
+    }
+    var half: u32 = ((exp as u32) << 10) | (mant >> 13)
+    let rem: u32 = mant & 0x1fff
+    if rem > 0x1000 || (rem == 0x1000 && (half & 1) != 0) {
+        half = half + 1
+    }
+    return sign | half
+}
+
+fn f16_to_f32(h: u32) -> f32 {
+    let sign: u32 = (h & 0x8000) << 16
+    let e: u32 = (h >> 10) & 0x1f
+    let mant: u32 = h & 0x3ff
+    if e == 0 {
+        // zero or subnormal: mant * 2^-24
+        let f: f32 = (mant as f32) * (1.0 / 16777216.0)
+        if sign != 0 {
+            return 0.0 - f
+        }
+        return f
+    }
+    if e == 31 {
+        return math.math_f32(sign | 0x7f800000 | (mant << 13))
+    }
+    return math.math_f32(sign | ((e + 112) << 23) | (mant << 13))
+}
+
+fn clamp_f(x: f32, lo: f32, hi: f32) -> f32 {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+// packSnorm4x8 .. unpackHalf2x16; `x` = operand id
+fn exec_pack(m: *mut Spv, res: u32, e: u32, x: u32) {
+    if e >= 54 && e <= 58 {
+        var r: u32 = 0
+        var cnt: usize = 4
+        var bits: u32 = 8
+        if e >= 56 {
+            cnt = 2
+            bits = 16
+        }
+        var k: usize = 0
+        while k < cnt {
+            let f: f32 = fget(m, x, k)
+            var piece: u32 = 0
+            if e == 54 {
+                piece = f2i(math.round32(clamp_f(f, -1.0, 1.0) * 127.0)) & 0xff
+            } else if e == 55 {
+                piece = f2i(math.round32(clamp_f(f, 0.0, 1.0) * 255.0)) & 0xff
+            } else if e == 56 {
+                piece = f2i(math.round32(clamp_f(f, -1.0, 1.0) * 32767.0)) & 0xffff
+            } else if e == 57 {
+                piece = f2i(math.round32(clamp_f(f, 0.0, 1.0) * 65535.0)) & 0xffff
+            } else {
+                piece = f32_to_f16(f)
+            }
+            r = r | (piece << ((k as u32) * bits))
+            k = k + 1
+        }
+        vput(m, res, 0, r)
+        return
+    }
+    let v: u32 = vget(m, x, 0)
+    var cnt: usize = 2
+    var bits: u32 = 16
+    if e == 63 || e == 64 {
+        cnt = 4
+        bits = 8
+    }
+    var k: usize = 0
+    while k < cnt {
+        let raw: u32 = (v >> ((k as u32) * bits)) & ((1 << bits) - 1)
+        var f: f32 = 0.0
+        if e == 60 {
+            f = clamp_f(((raw ^ 0x8000) as f32 - 32768.0) / 32767.0, -1.0, 1.0)
+        } else if e == 61 {
+            f = (raw as f32) / 65535.0
+        } else if e == 62 {
+            f = f16_to_f32(raw)
+        } else if e == 63 {
+            f = clamp_f(((raw ^ 0x80) as f32 - 128.0) / 127.0, -1.0, 1.0)
+        } else {
+            f = (raw as f32) / 255.0
+        }
+        fput(m, res, k, f)
+        k = k + 1
     }
 }

@@ -1,0 +1,316 @@
+// expect_exit: 0
+// tests/2936_spirv_image.fi -- gpu.spirv images + samplers, ONE invocation (tex.frag, glslang): texture / textureLod /
+// texelFetch / textureSize / separate texture+sampler / offsets / textureGrad / textureProj / bias / textureQueryLod against an
+// independent f32 reference (nearest + linear, repeat / clamp / mirror / border, RGBA8 + RGBA32F, 4 mip levels, trilinear).
+// Derivatives are 0 without a quad (see 2937).
+import std.rt
+import std.math
+import gpu.spirv
+
+const SH: str = __include_str("../lib/gpu/spv/test/tex.frag.spv")
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+// ---- independent reference (plain Firn f32, written from the GL spec; shares no code with gpu.spirv) ----
+// texture 0: RGBA8, 8x8 with levels 8x8, 4x4, 2x2, 1x1; texture 1: RGBA32F 4x4
+
+static mut G_LIN: bool = false
+static mut G_WS: i32 = 2
+static mut G_WT: i32 = 1
+
+fn tex_byte(lvl: i32, x: i32, y: i32, c: i32) -> i32 {
+    return (x * 37 + y * 91 + c * 53 + lvl * 29) % 256
+}
+
+fn tex_f(x: i32, y: i32, c: i32) -> f32 {
+    return ((x * 5 + y * 3 + c * 7) % 16) as f32 / 16.0
+}
+
+fn fill_tex(m: *mut spirv.Spv) {
+    var lvl: i32 = 0
+    var w: i32 = 8
+    while lvl < 4 {
+        let px: u64 = rt.heap_alloc((w * w * 4) as usize)
+        var y: i32 = 0
+        while y < w {
+            var x: i32 = 0
+            while x < w {
+                var c: i32 = 0
+                while c < 4 {
+                    rt.st8(px, ((y * w + x) * 4 + c) as usize, tex_byte(lvl, x, y, c) as u8)
+                    c = c + 1
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        if lvl == 0 {
+            check(spirv.spv_tex_set(m, 0, spirv.SPV_FMT_RGBA8, px, 8, 8), 4)
+        } else {
+            check(spirv.spv_tex_set_level(m, 0, lvl as usize, px, w as usize, w as usize), 5)
+        }
+        w = w / 2
+        lvl = lvl + 1
+    }
+    let fp: u64 = rt.heap_alloc(4 * 4 * 4 * 4)
+    var y: i32 = 0
+    while y < 4 {
+        var x: i32 = 0
+        while x < 4 {
+            var c: i32 = 0
+            while c < 4 {
+                rt.st32(fp, ((y * 4 + x) * 4 + c) as usize, math.math_bits32(tex_f(x, y, c)))
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    check(spirv.spv_tex_set(m, 1, spirv.SPV_FMT_RGBA32F, fp, 4, 4), 6)
+    // binding 0: trilinear, repeat; binding 2: nearest, mirrored repeat in s / clamp in t
+    check(spirv.spv_sampler_set(m, 0, 1, 1, 2, 0, 0), 7)
+    check(spirv.spv_sampler_set(m, 2, 0, 0, 0, 2, 1), 8)
+}
+
+fn fdiv(a: i32, b: i32) -> i32 {
+    var q: i32 = a / b
+    if a % b != 0 && ((a < 0) != (b < 0)) {
+        q = q - 1
+    }
+    return q
+}
+
+// wrapped texel coordinate: repeat 0, clamp 1, mirror 2
+fn r_wrap(i: i32, n: i32, mode: i32) -> i32 {
+    if mode == 0 {
+        return i - fdiv(i, n) * n
+    }
+    if mode == 3 {
+        return i
+    }
+    if mode == 1 {
+        if i < 0 {
+            return 0
+        }
+        if i > n - 1 {
+            return n - 1
+        }
+        return i
+    }
+    let k: i32 = fdiv(i, n)
+    let r: i32 = i - k * n
+    if k % 2 != 0 {
+        return n - 1 - r
+    }
+    return r
+}
+
+fn r_texel(t: i32, lvl: i32, x: i32, y: i32, c: i32, ws: i32, wt: i32) -> f32 {
+    var n: i32 = 4
+    if t == 0 {
+        n = 8 / (1 << (lvl as u32))
+    }
+    if (ws == 3 && (x < 0 || x >= n)) || (wt == 3 && (y < 0 || y >= n)) {
+        return 0.25 + (c as f32) * 0.125
+    }
+    let xx: i32 = r_wrap(x, n, ws)
+    let yy: i32 = r_wrap(y, n, wt)
+    if t == 0 {
+        return tex_byte(lvl, xx, yy, c) as f32 / 255.0
+    }
+    return tex_f(xx, yy, c)
+}
+
+fn r_level(t: i32, lvl: i32, u: f32, v: f32, linear: bool, ox: i32, oy: i32, ws: i32, wt: i32, c: i32) -> f32 {
+    var n: i32 = 4
+    if t == 0 {
+        n = 8 / (1 << (lvl as u32))
+    }
+    let nf: f32 = n as f32
+    if !linear {
+        let i: i32 = math.floor32(u * nf) as i32 + ox
+        let j: i32 = math.floor32(v * nf) as i32 + oy
+        return r_texel(t, lvl, i, j, c, ws, wt)
+    }
+    let x: f32 = u * nf - 0.5
+    let y: f32 = v * nf - 0.5
+    let fx: f32 = math.floor32(x)
+    let fy: f32 = math.floor32(y)
+    let a: f32 = x - fx
+    let b: f32 = y - fy
+    let i0: i32 = fx as i32 + ox
+    let j0: i32 = fy as i32 + oy
+    var s: f32 = 0.0
+    s = s + (1.0 - a) * (1.0 - b) * r_texel(t, lvl, i0, j0, c, ws, wt)
+    s = s + a * (1.0 - b) * r_texel(t, lvl + 0, i0 + 1, j0, c, ws, wt)
+    s = s + (1.0 - a) * b * r_texel(t, lvl, i0, j0 + 1, c, ws, wt)
+    s = s + a * b * r_texel(t, lvl, i0 + 1, j0 + 1, c, ws, wt)
+    return s
+}
+
+// texture 0 with sampler (linear, linear, mip linear, repeat); texture 1 with sampler (nearest, nearest, none, mirror, clamp)
+fn r_lookup(t: i32, u: f32, v: f32, lambda: f32, ox: i32, oy: i32, c: i32) -> f32 {
+    if t == 1 {
+        return r_level(1, 0, u, v, G_LIN, ox, oy, G_WS, G_WT, c)
+    }
+    if !(lambda > 0.0) {
+        return r_level(0, 0, u, v, true, ox, oy, 0, 0, c)
+    }
+    var d: f32 = lambda
+    if d > 3.0 {
+        d = 3.0
+    }
+    let l0f: f32 = math.floor32(d)
+    let fr: f32 = d - l0f
+    let l0: i32 = l0f as i32
+    var l1: i32 = l0 + 1
+    if l1 > 3 {
+        l1 = 3
+    }
+    let a: f32 = r_level(0, l0, u, v, true, ox, oy, 0, 0, c)
+    let b: f32 = r_level(0, l1, u, v, true, ox, oy, 0, 0, c)
+    return (1.0 - fr) * a + fr * b
+}
+
+// LOD of (u, v) gradients on the 8x8 base level
+fn r_lambda(dudx: f32, dvdx: f32, dudy: f32, dvdy: f32) -> f32 {
+    let rx: f32 = math.sqrt32((dudx * 8.0) * (dudx * 8.0) + (dvdx * 8.0) * (dvdx * 8.0))
+    let ry: f32 = math.sqrt32((dudy * 8.0) * (dudy * 8.0) + (dvdy * 8.0) * (dvdy * 8.0))
+    var rho: f32 = rx
+    if ry > rho {
+        rho = ry
+    }
+    if !(rho > 0.0) {
+        return -1000.0
+    }
+    return math.log2(rho as f64) as f32
+}
+
+fn near(a: f32, b: f32) -> bool {
+    var d: f32 = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    var s: f32 = b
+    if s < 0.0 {
+        s = 0.0 - s
+    }
+    return d <= 3.0e-6 * (1.0 + s)
+}
+
+fn out_f(m: *mut spirv.Spv, loc: u32, k: usize) -> f32 {
+    return spirv.spv_mem_get_f32(m, spirv.spv_find_location(m, 3, loc), k)
+}
+
+fn main() -> i32 {
+    var m: spirv.Spv = spirv.spv_zero()
+    check(spirv.spv_new(SH.p as u64, SH.n, &m), 1)
+    let ent: u32 = spirv.spv_find_entry(&m, 4)
+    let luv: usize = spirv.spv_find_location(&m, 1, 0)
+    let llod: usize = spirv.spv_find_location(&m, 1, 1)
+    check(ent != 0 && luv != spirv.SPV_NONE && llod != spirv.SPV_NONE, 2)
+    // no texture bound yet: every lookup is (0, 0, 0, 1), fetch gives zeros, no crash
+    spirv.spv_mem_set_f32(&m, luv, 0, 0.3)
+    spirv.spv_mem_set_f32(&m, luv, 1, 0.6)
+    check(spirv.spv_run(&m, ent, 100000), 3)
+    check(out_f(&m, 0, 0) == 0.0 && out_f(&m, 0, 3) == 1.0 && out_f(&m, 2, 0) == 0.0 && out_f(&m, 2, 3) == 0.0, 3)
+    check(!spirv.spv_tex_set(&m, 16, 0, 1, 4, 4) && !spirv.spv_tex_set(&m, 0, 2, 1, 4, 4) && !spirv.spv_tex_set(&m, 0, 0, 0, 4, 4), 9)
+    check(!spirv.spv_sampler_set(&m, 0, 2, 0, 0, 0, 0) && !spirv.spv_sampler_set(&m, 16, 0, 0, 0, 0, 0), 10)
+    fill_tex(&m)
+    let uvs: [f32; 12] = [0.3, 0.7, 1.25, -0.4, 0.02, 0.98, 0.5, 0.5, -0.37, 2.61, 0.91, 0.13]
+    let lods: [f32; 6] = [0.0, 0.5, 1.0, 1.7, 2.5, 10.0]
+    var i: usize = 0
+    while i < 6 {
+        let u: f32 = uvs[i * 2]
+        let v: f32 = uvs[i * 2 + 1]
+        let lod: f32 = lods[i]
+        spirv.spv_mem_set_f32(&m, luv, 0, u)
+        spirv.spv_mem_set_f32(&m, luv, 1, v)
+        spirv.spv_mem_set_f32(&m, llod, 0, lod)
+        check(spirv.spv_run(&m, ent, 100000), 20)
+        let base: i32 = 1000 + (i as i32) * 100
+        var c: i32 = 0
+        while c < 4 {
+            let cu: usize = c as usize
+            check(near(out_f(&m, 0, cu), r_lookup(0, u, v, -1000.0, 0, 0, c)), base + c)
+            check(near(out_f(&m, 1, cu), r_lookup(0, u, v, lod, 0, 0, c)), base + 4 + c)
+            let ix: i32 = (u * 8.0) as i32
+            let iy: i32 = (v * 8.0) as i32
+            var fetch: f32 = 0.0
+            if ix >= 0 && iy >= 0 && ix < 4 && iy < 4 {
+                fetch = tex_byte(1, ix, iy, c) as f32 / 255.0
+            }
+            check(out_f(&m, 2, cu) == fetch, base + 8 + c)
+            check(near(out_f(&m, 4, cu), r_lookup(1, u, v, -1000.0, 0, 0, c)), base + 12 + c)
+            check(near(out_f(&m, 5, cu), r_lookup(0, u, v, -1000.0, 1, -1, c) + r_lookup(0, u, v, 0.0, -2, 3, c)), base + 16 + c)
+            check(near(out_f(&m, 6, cu), r_lookup(0, u, v, 1.0, 0, 0, c)), base + 20 + c)
+            check(out_f(&m, 7, cu) == 0.0 && out_f(&m, 8, cu) == 0.0 && out_f(&m, 9, cu) == 0.0, base + 24 + c)
+            let p: f32 = r_lookup(0, u, v, -1000.0, 0, 0, c)
+            check(near(out_f(&m, 10, cu), p + p), base + 28 + c)
+            c = c + 1
+        }
+        check(out_f(&m, 3, 0) == 8.0 && out_f(&m, 3, 1) == 8.0 && out_f(&m, 3, 2) == 4.0 && out_f(&m, 3, 3) == 4.0, base + 40)
+        check(out_f(&m, 11, 0) == 0.0 && out_f(&m, 11, 1) == -1000.0, base + 41)
+        i = i + 1
+    }
+    // sampler variants on the F32 texture (binding 2): filter x wrap
+    var v: i32 = 0
+    while v < 4 {
+        var lin: bool = false
+        var ws: i32 = 0
+        var wt: i32 = 0
+        if v == 0 {
+            ws = 0
+            wt = 0
+            lin = true
+        }
+        if v == 1 {
+            ws = 3
+            wt = 3
+            lin = true
+        }
+        if v == 2 {
+            ws = 1
+            wt = 0
+        }
+        if v == 3 {
+            ws = 2
+            wt = 2
+            lin = true
+        }
+        G_LIN = lin
+        G_WS = ws
+        G_WT = wt
+        var lf: u32 = 0
+        if lin {
+            lf = 1
+        }
+        check(spirv.spv_sampler_set(&m, 2, lf, lf, 0, ws as u32, wt as u32), 30)
+        check(spirv.spv_sampler_border(&m, 2, 0.25, 0.375, 0.5, 0.625), 31)
+        i = 0
+        while i < 6 {
+            spirv.spv_mem_set_f32(&m, luv, 0, uvs[i * 2])
+            spirv.spv_mem_set_f32(&m, luv, 1, uvs[i * 2 + 1])
+            check(spirv.spv_run(&m, ent, 100000), 32)
+            var c: i32 = 0
+            while c < 4 {
+                check(near(out_f(&m, 4, c as usize), r_lookup(1, uvs[i * 2], uvs[i * 2 + 1], -1000.0, 0, 0, c)), 5000 + v * 100 + (i as i32) * 4 + c)
+                c = c + 1
+            }
+            i = i + 1
+        }
+        v = v + 1
+    }
+    // reset keeps the slots: handles are re-applied
+    spirv.spv_reset(&m)
+    spirv.spv_mem_set_f32(&m, luv, 0, 0.3)
+    spirv.spv_mem_set_f32(&m, luv, 1, 0.7)
+    check(spirv.spv_run(&m, ent, 100000), 40)
+    check(near(out_f(&m, 0, 1), r_lookup(0, 0.3, 0.7, -1000.0, 0, 0, 1)), 41)
+    spirv.spv_free(&m)
+    return 0
+}
