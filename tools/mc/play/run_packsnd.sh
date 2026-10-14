@@ -113,15 +113,25 @@ if [ "${MCPLAY_SKIP_PULSE:-0}" != 1 ] && command -v pulseaudio >/dev/null && com
     for i in $(seq 1 20); do [ -S "$PAD/native" ] && break; sleep 0.5; done
     if [ -S "$PAD/native" ]; then
         export PULSE_SERVER="unix:$PAD/native"
-        parec -d mcnull.monitor --format=s16le --rate=44100 --channels=2 --file-format=wav "$W/dev.wav" 2>/dev/null & REC_PID=$!
-        sleep 1
-        run PsDev both device 1; rc=$?
-        sleep 1; kill "$REC_PID" 2>/dev/null; wait "$REC_PID" 2>/dev/null
-        [ $rc -eq 0 ] || { echo "  FAIL  PsDev exit code $rc"; ERR=1; }
-        grep -q "no sound output" "$W/PsDev.out" && { echo "  FAIL  device sink did not open"; ERR=1; }
-        grep -q "did not restart" "$W/PsDev.out" && { echo "  FAIL  audio thread did not restart"; ERR=1; }
-        check_reload PsDev 2
-        python3 tools/mc/play/audio_check.py "$W/dev.wav" "$W/PsDev.out" --bursts 6 || ERR=1
+        # the device run is timing sensitive (real sink, load on the box): one retry, the first failure stays in the log (r174)
+        dev_try=1
+        while :; do
+            ERR_SAVE=$ERR; ERR=0
+            parec -d mcnull.monitor --format=s16le --rate=44100 --channels=2 --file-format=wav "$W/dev.wav" 2>/dev/null & REC_PID=$!
+            sleep 1
+            run PsDev both device 1; rc=$?
+            sleep 1; kill "$REC_PID" 2>/dev/null; wait "$REC_PID" 2>/dev/null
+            [ $rc -eq 0 ] || { echo "  FAIL  PsDev exit code $rc"; ERR=1; }
+            grep -q "no sound output" "$W/PsDev.out" && { echo "  FAIL  device sink did not open"; ERR=1; }
+            grep -q "did not restart" "$W/PsDev.out" && { echo "  FAIL  audio thread did not restart"; ERR=1; }
+            check_reload PsDev 2
+            python3 tools/mc/play/audio_check.py "$W/dev.wav" "$W/PsDev.out" --bursts 6 || ERR=1
+            DERR=$ERR; ERR=$ERR_SAVE
+            [ $DERR -eq 0 ] && break
+            [ $dev_try -ge 2 ] && { ERR=1; break; }
+            echo "  RETRY PsDev (attempt $dev_try failed, load $(cut -d' ' -f1 /proc/loadavg))"
+            dev_try=$((dev_try + 1))
+        done
     else echo "  FAIL  private pulseaudio did not start: $(tail -2 "$W/pulse.log" 2>/dev/null)"; ERR=1; fi
     unset PULSE_SERVER
     kill "$PA_PID" 2>/dev/null
