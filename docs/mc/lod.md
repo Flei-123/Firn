@@ -39,3 +39,15 @@ tests/2861 C (70 frames, 3 submits/frame, loaded server): worst 351 -> 17 px, to
 `lod_bin_mid` (default 2, 0 = off) for `lod_mid_w` (5) columns beyond the near ring: bin steps are 1 -> 2 -> 4 -> 8 instead of 1 -> 4, so each switch changes the surface less (cells are maxima of their bin).
 Hysteresis +1 like the other rings. Test tests/2916_mc_lod_pop.fi: converged streams along a 40-frame flight (2 blocks/frame) against the full-detail image: differing pixels (sum over 40 frames of 5184 px)
 11932 -> ~10200 (-14 %), frame-to-frame change of that error ("pop") 2104 -> ~1880 (-11 %) with the mid ring (stderr line `LODPOP`). Still no blending: pops remain, only smaller. `stream_lod_bin` = built cell size of a column.
+
+## Seam cracks (u4, 14.10.)
+Metric: pixels that are clear colour in the converged LOD stream but terrain in the FULL-DETAIL image (tests/2917, 40-frame flight, 5184 px each; the old "holes" of tests/2861 compare
+against a converged LOD stream, so bulge differences counted as holes). Honest numbers before: 263 (mid ring) / 658 (no mid ring) holes over 40 frames.
+- Cause 1 (the big one): `lod_mesh` used the lowest OWN cell as mesh origin y0 (unsigned coordinates). A skirt toward a neighbour that is lower than every own cell was clamped to
+  height 0 and vanished -> a see-through slit along the column border (found by ray-marching the hole pixels back to world positions: all on x/z = 16k seams). y0 now also covers the
+  edge cells of the neighbour height maps (tests/2774 case D).
+- Cause 2: skirt heights toward a neighbour drawn at ANOTHER bin stopped at the neighbour's binned maximum -> crack between the coarse skirt bottom and the finer neighbour surface.
+  `mc_lod.lod_bin_min`: the neighbour arrays hold the exact MINIMUM of each span (never above any representation of the neighbour), so no stale-neighbour-bin bookkeeping is needed.
+- Result: tests/2917 holes 263 -> 80 (mid ring), 658 -> 64 (no mid ring), worst frame 8 px; tests/2861 flight worst 17 -> 3 px, total 79 -> 24 (of 5184 x 70).
+- Remaining holes are 1-px grazing cases (ray exactly on an integer block edge between two quads, also inside full-detail columns): rasterizer edge rounding, not LOD logic.
+- Blending in the sense of an alpha cross-fade needs a per-draw fade in the back end (CPU raster + GL); not built. The pop is reduced by the mid ring (tests/2916/2917: err 11570 -> 10052, pop 2083 -> 1852).
