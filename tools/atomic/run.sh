@@ -24,7 +24,7 @@ cd "$(dirname "$0")/../.."
 FIRNC="compiler/target/release/firnc"
 FC1=${FIRNC1:-./.firnc1}
 FDUMP=${FIRDUMP:-./.firdump}
-W=$(mktemp -d /tmp/firn-atomar.XXXXXX)
+W=$(mktemp -d /tmp/firn-atomic.XXXXXX)
 trap 'rm -rf "$W"' EXIT
 ERRORS=0
 report() { echo "ERROR: $1"; ERRORS=1; }

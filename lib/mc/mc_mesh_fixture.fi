@@ -1,0 +1,170 @@
+// lib/mc/mc_mesh_fixture.fi -- deterministic padded test sections + output hash for the mesher (tests/3060, tools/mc/perf/mesh_bench.fi).
+//
+// fixture_tables  : MeshTables with 8 block kinds (stone, dirt, grass, water, leaves, glass, invisible)
+// fixture_pad     : fills a padded 18^3 id array (u16) and light array (u8) for (kind, seed)
+// mesh_hash       : FNV-1a over the used vertex words, index words and the counters of a Mesher
+//
+// Section kinds (fixture_pad):
+//   0 hilly terrain with water, trees, glass, caves, invisible blocks; shell cells that are "unknown" on two faces
+//   1 all air (id 0)          2 all stone (everything hidden)       3 dense random mix of all block kinds (worst case)
+//   4 flat floor at y = 8     5 terrain, the whole shell unknown    6 thin checkerboard of two opaque blocks
+
+import std.rt
+import mc.mc_mesh
+
+export {
+    ID_AIR, ID_STONE, ID_DIRT, ID_GRASS, ID_WATER, ID_LEAVES, ID_GLASS, ID_INVIS, NKINDS,
+    fixture_tables, fixture_tables_free, fixture_pad, mesh_hash, fx_hash_u32,
+}
+
+const ID_AIR: u16 = 0
+const ID_STONE: u16 = 1
+const ID_DIRT: u16 = 2
+const ID_GRASS: u16 = 3
+const ID_WATER: u16 = 4
+const ID_LEAVES: u16 = 5
+const ID_GLASS: u16 = 6
+const ID_INVIS: u16 = 7
+const NKINDS: usize = 7
+
+// 32 bit integer hash held in a u64 (all products stay below 2^63: arithmetic is overflow checked)
+fn mix(x0: u64) -> u64 {
+    var x: u64 = x0 & 0xFFFFFFFF as u64
+    x = ((x ^ (x >> 15 as u64)) * 0x2c1b3c6d as u64) & 0xFFFFFFFF as u64
+    x = ((x ^ (x >> 12 as u64)) * 0x297a2d39 as u64) & 0xFFFFFFFF as u64
+    return x ^ (x >> 15 as u64)
+}
+
+fn fixture_tables(t: *mut mc_mesh.MeshTables) {
+    let opaque: u64 = rt.heap_alloc(32768)
+    let tiles: u64 = rt.heap_alloc(32768 * 6 * 2)
+    rt.mem_set(opaque, 0 as u8, 32768)
+    rt.mem_set(tiles, 0 as u8, 32768 * 6 * 2)
+    // opaque flags: bit 0 opaque, bit 1 translucent
+    rt.st8(opaque, ID_STONE as usize, 1 as u8)
+    rt.st8(opaque, ID_DIRT as usize, 1 as u8)
+    rt.st8(opaque, ID_GRASS as usize, 1 as u8)
+    rt.st8(opaque, ID_WATER as usize, 2 as u8)
+    rt.st8(opaque, ID_GLASS as usize, 2 as u8)
+    var f: usize = 0
+    while f < 6 {
+        rt.st16(tiles, (ID_STONE as usize) * 6 + f, 1 as u16)
+        rt.st16(tiles, (ID_DIRT as usize) * 6 + f, 2 as u16)
+        var g: u16 = 4 as u16 // grass side
+        if f == 3 { g = 3 as u16 }
+        if f == 2 { g = 2 as u16 }
+        rt.st16(tiles, (ID_GRASS as usize) * 6 + f, g)
+        rt.st16(tiles, (ID_WATER as usize) * 6 + f, 5 as u16)
+        rt.st16(tiles, (ID_LEAVES as usize) * 6 + f, 6 as u16)
+        rt.st16(tiles, (ID_GLASS as usize) * 6 + f, 7 as u16)
+        f = f + 1
+    }
+    // one block with a face on +y only (a slab-like cross) so the per-face tile test matters
+    rt.st16(tiles, 8 * 6 + 3, 9 as u16)
+    (*t).opaque = opaque
+    (*t).tiles = tiles
+}
+
+fn fixture_tables_free(t: *mut mc_mesh.MeshTables) {
+    rt.heap_free((*t).opaque, 32768)
+    rt.heap_free((*t).tiles, 32768 * 6 * 2)
+}
+
+// terrain height at world column (wx, wz)
+fn height(seed: u64, wx: i32, wz: i32) -> i32 {
+    let cx: i32 = wx >> 2
+    let cz: i32 = wz >> 2
+    let base: u64 = mix(seed * 31 as u64 + ((cx + 1000) as u64) * 7919 as u64 + ((cz + 1000) as u64) * 104729 as u64)
+    let fine: u64 = mix(seed + ((wx + 1000) as u64) * 15485 as u64 + ((wz + 1000) as u64) * 32452 as u64)
+    return 5 + ((base >> 8 as u64) % 6 as u64) as i32 + ((fine >> 12 as u64) & 1 as u64) as i32
+}
+
+fn fixture_pad(kind: usize, seed: u64, pad: u64, lpad: u64) {
+    var y: i32 = 0
+    while y < 18 {
+        var z: i32 = 0
+        while z < 18 {
+            var x: i32 = 0
+            while x < 18 {
+                let p: usize = ((y * 18 + z) * 18 + x) as usize
+                let h: u64 = mix(seed * 1000003 as u64 + (p as u64) * 265443 as u64)
+                var id: u16 = ID_AIR
+                if kind == 0 || kind == 5 {
+                    let ht: i32 = height(seed, x, z)
+                    if y < ht - 3 {
+                        id = ID_STONE
+                    } else if y < ht {
+                        id = ID_DIRT
+                    } else if y == ht {
+                        id = ID_GRASS
+                    } else if y <= 7 {
+                        id = ID_WATER
+                    }
+                    // caves, trees, glass, invisible blocks
+                    if id == ID_STONE && (h & 31 as u64) == 0 as u64 { id = ID_AIR }
+                    if y > ht && y <= ht + 3 && ((x * 5 + z * 3 + seed as i32) % 11) == 0 && ((h >> 5 as u64) & 3 as u64) != 0 as u64 { id = ID_LEAVES }
+                    if y == ht + 1 && ((h >> 9 as u64) & 63 as u64) == 0 as u64 { id = ID_GLASS }
+                    if id == ID_AIR && ((h >> 17 as u64) & 127 as u64) == 0 as u64 { id = ID_INVIS }
+                    if id == ID_AIR && ((h >> 3 as u64) & 255 as u64) == 0 as u64 { id = 8 as u16 }
+                } else if kind == 1 {
+                    id = ID_AIR
+                } else if kind == 2 {
+                    id = ID_STONE
+                } else if kind == 3 {
+                    id = ((h >> 4 as u64) % 9 as u64) as u16
+                } else if kind == 4 {
+                    if y <= 8 { id = ID_STONE }
+                } else if kind == 6 {
+                    id = ID_STONE
+                    if (x + y + z) % 2 == 1 { id = ID_DIRT }
+                    if (x * 3 + z) % 7 == 0 && y > 12 { id = ID_AIR }
+                }
+                if kind == 5 {
+                    if x == 0 || x == 17 || y == 0 || y == 17 || z == 0 || z == 17 { id = 65535 as u16 }
+                } else if kind == 0 || kind == 3 {
+                    if x == 0 && y > 9 { id = 65535 as u16 }
+                    if z == 17 && (y & 1) == 1 { id = 65535 as u16 }
+                }
+                rt.st16(pad, p, id)
+                // light: sky falls with depth below the terrain, block light spots
+                var sky: u64 = 15 as u64
+                var lh: i32 = 6
+                if kind == 0 || kind == 5 { lh = height(seed, x, z) }
+                if y < lh { sky = (((y * 15) / (lh + 1)) as u64) }
+                var blk: u64 = 0 as u64
+                if (h >> 20 as u64) % 17 as u64 == 0 as u64 { blk = (h >> 24 as u64) & 15 as u64 }
+                rt.st8(lpad, p, ((sky << 4 as u64) | blk) as u8)
+                x = x + 1
+            }
+            z = z + 1
+        }
+        y = y + 1
+    }
+}
+
+fn fx_hash_u32(h: u64, v: u32) -> u64 {
+    let x: u64 = ((h ^ (v as u64)) * 65599 as u64) & 0x3FFFFFFFFFFF as u64
+    return x ^ (x >> 23 as u64)
+}
+
+// FNV-1a style hash over all output words of the last mesh (vertices, indices, counters).
+fn mesh_hash(h0: u64, m: *mut mc_mesh.Mesher) -> u64 {
+    var h: u64 = h0
+    h = fx_hash_u32(h, (*m).nverts)
+    h = fx_hash_u32(h, (*m).nidx)
+    h = fx_hash_u32(h, (*m).nquads)
+    h = fx_hash_u32(h, (*m).nfaces)
+    var i: usize = 0
+    let nv: usize = ((*m).nverts as usize) * 2
+    while i < nv {
+        h = fx_hash_u32(h, rt.ld32((*m).verts, i))
+        i = i + 1
+    }
+    i = 0
+    let ni: usize = (*m).nidx as usize
+    while i < ni {
+        h = fx_hash_u32(h, rt.ld32((*m).idx, i))
+        i = i + 1
+    }
+    return h
+}

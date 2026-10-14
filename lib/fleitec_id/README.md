@@ -11,5 +11,5 @@ test vectors live next to it (`docs/fleitec-id/vectors.json`, copy in
 | `fleitec_id.cookie` | `fleitec_session` Cookie header / Set-Cookie |
 | `fleitec_id.relay` | FreeViewer relay URLs (`wss://host/fv/ws` -> account endpoints), token escaping |
 
-Test: `tests/2012_fleitec_id.fi` (runs with `test.sh` in all four build levels).
+Test: `tests/3209_fleitec_id.fi` (runs with `test.sh` in all four build levels).
 Not in this library: the HTTP client (use `net.http`), the address-book merge, password hashing.

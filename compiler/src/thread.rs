@@ -421,6 +421,8 @@ pub(crate) fn self_sequence(e: &mut crate::codegen_x86::Emitter) {
 /// `arch_prctl` request numbers of the two segment bases.
 pub(crate) const ARCH_SET_GS: i64 = 0x1001;
 pub(crate) const ARCH_SET_FS: i64 = 0x1002;
+pub(crate) const ARCH_GET_FS: i64 = 0x1003;
+pub(crate) const ARCH_GET_GS: i64 = 0x1004;
 
 /// Does this compilation keep its thread block behind `gs` instead of `fs`?
 ///

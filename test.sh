@@ -237,6 +237,9 @@ bad() { FAIL=$((FAIL + 1)); FAILED="$FAILED\n  $1"; echo "  FAIL  $1"; }
 echo "== 1. build the compiler =="
 cargo build --release --manifest-path compiler/Cargo.toml
 
+echo "== 1b. repository hygiene: gctext.fi fresh, no new duplicate test numbers (tools/hygiene/check.sh, r574) =="
+if bash tools/hygiene/check.sh; then ok; else bad "tools/hygiene/check.sh"; fi
+
 echo "== 2. module tests of the compiler =="
 cargo test --release --manifest-path compiler/Cargo.toml -- --test-threads=4 >/dev/null
 echo "   cargo test: ok"

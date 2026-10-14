@@ -94,7 +94,7 @@ expect_error() {
 }
 
 # A copy of its own of the example project per case.
-kopie() {
+copy_pkg() {
     rm -rf "$WORK/$1"
     cp -r demos/packages "$WORK/$1"
     echo "$WORK/$1"
@@ -125,7 +125,7 @@ done
 # --- 3: `--package` without `-o` puts the binary under the package name -----
 
 check "--package without -o names after the manifest"
-P=$(kopie f_name_aus)
+P=$(copy_pkg f_name_aus)
 if "$FIRNC" --package "$P/app" >/dev/null 2>&1 \
    && [ -x "$P/app/app" ] \
    && [ "$("$P/app/app")" = "12 14 3" ]; then
@@ -151,7 +151,7 @@ fi
 # --- 5: private module of a dependency -----------------------------------
 
 check "a private module of a dependency is rejected"
-P=$(kopie f_privat)
+P=$(copy_pkg f_privat)
 sed -i 's/^import geo.dot$/import geo.inner/' "$P/app/src/main.fi"
 beide private --package "$P/app" -o "$WORK/f_privat.bin"
 expect_error private "is not public in package 'geo'"
@@ -201,7 +201,7 @@ expect_error foreign "package 'secret' is not a dependency of package 'app'"
 # --- 7: package cycle ----------------------------------------------------
 
 check "a package cycle is reported"
-P=$(kopie f_cycle)
+P=$(copy_pkg f_cycle)
 printf 'needs app ../app\n' >> "$P/geo/firn.package"
 beide cycle --package "$P/app" -o "$WORK/f_cycle.bin"
 expect_error cycle "package cycle: app -> geo -> app"
@@ -209,7 +209,7 @@ expect_error cycle "package cycle: app -> geo -> app"
 # --- 8: dependency without a manifest ------------------------------------
 
 check "a dependency without a manifest is reported"
-P=$(kopie f_no_manifest)
+P=$(copy_pkg f_no_manifest)
 rm -f "$P/geo/firn.package"
 beide nomanifest --package "$P/app" -o "$WORK/f_km.bin"
 expect_error nomanifest "dependency 'geo' has no manifest"
@@ -217,7 +217,7 @@ expect_error nomanifest "dependency 'geo' has no manifest"
 # --- 9: a dependency points at a differently named package ---------------
 
 check "wrong package name in the dependency"
-P=$(kopie f_name)
+P=$(copy_pkg f_name)
 sed -i 's/^package  *geo$/package  geometry/' "$P/geo/firn.package"
 beide wrongname --package "$P/app" -o "$WORK/f_name.bin"
 expect_error wrongname "dependency 'geo' points to package 'geometry'"
@@ -225,7 +225,7 @@ expect_error wrongname "dependency 'geo' points to package 'geometry'"
 # --- 10: broken version entry --------------------------------------------
 
 check "invalid version in the manifest"
-P=$(kopie f_version)
+P=$(copy_pkg f_version)
 sed -i 's/^version  *0.2.0$/version  0.2/' "$P/geo/firn.package"
 beide version --package "$P/app" -o "$WORK/f_ver.bin"
 expect_error version "invalid version '0.2' (expected number.number.number)"
@@ -233,7 +233,7 @@ expect_error version "invalid version '0.2' (expected number.number.number)"
 # --- 11: unknown key -----------------------------------------------------
 
 check "unknown key in the manifest"
-P=$(kopie f_key)
+P=$(copy_pkg f_key)
 sed -i 's/^public  *geo dot$/publi   geo dot/' "$P/geo/firn.package"
 beide schluessel --package "$P/app" -o "$WORK/f_sch.bin"
 expect_error schluessel "unknown key 'publi'"
@@ -241,7 +241,7 @@ expect_error schluessel "unknown key 'publi'"
 # --- 12: missing mandatory line ------------------------------------------
 
 check "manifest without a 'package' line"
-P=$(kopie f_no_package)
+P=$(copy_pkg f_no_package)
 sed -i 's/^package  *app$//' "$P/app/firn.package"
 beide ohnepaket --package "$P/app" -o "$WORK/f_op.bin"
 expect_error ohnepaket "the manifest needs a line 'package <name>'"
@@ -249,7 +249,7 @@ expect_error ohnepaket "the manifest needs a line 'package <name>'"
 # --- 13: name conflict of two modules ------------------------------------
 
 check "two modules of the same name are reported"
-P=$(kopie f_konflikt)
+P=$(copy_pkg f_konflikt)
 cat > "$P/geo/src/help.fi" <<'EOF'
 export { value }
 fn value() -> i32 { return 7 }
@@ -283,7 +283,7 @@ expect_error leer "no manifest in"
 # --- 16: a private module INSIDE one's own package stays allowed ---------
 
 check "inside a package there is no barrier"
-P=$(kopie f_intern)
+P=$(copy_pkg f_intern)
 cat > "$P/app/src/main.fi" <<'EOF'
 import geo
 
@@ -322,7 +322,7 @@ fi
 # --- 18: search order -- one's own source wins ---------------------------
 
 check "the project source wins over a module of the same name in a dependency"
-P=$(kopie f_vorrang)
+P=$(copy_pkg f_vorrang)
 cat > "$P/app/src/number.fi" <<'EOF'
 export { value }
 fn value() -> i32 { return 1 }
@@ -351,7 +351,7 @@ fi
 # --- 19: the manifest is found UPWARDS from the source file --------------
 
 check "the manifest is found upwards even without --package"
-P=$(kopie f_upwards)
+P=$(copy_pkg f_upwards)
 "$FIRNC" "$P/app/src/main.fi" -o "$WORK/f_auf0.bin" >/dev/null 2>&1
 r0=$?
 "$FC1" "$P/app/src/main.fi" -o "$WORK/f_auf1.bin" >/dev/null 2>&1
@@ -367,7 +367,7 @@ fi
 # --- 20: several source directories in one package -----------------------
 
 check "a second 'source' directory is searched"
-P=$(kopie f_zweitquelle)
+P=$(copy_pkg f_zweitquelle)
 mkdir -p "$P/app/extra"
 printf 'source   extra\n' >> "$P/app/firn.package"
 cat > "$P/app/extra/extra_mod.fi" <<'EOF'
@@ -422,7 +422,7 @@ sum_pkg() {
 # --- 22: both compilers write the same lock file --------------------------
 
 check "--lock writes the same firn.lock in both compilers"
-P=$(kopie l_lock)
+P=$(copy_pkg l_lock)
 rm -f "$P/app/firn.lock" "$WORK/lock.0" "$WORK/lock.1"
 "$FIRNC" --package "$P/app" -o "$WORK/l0.bin" --lock > "$WORK/l0.log" 2>&1 \
     && cp "$P/app/firn.lock" "$WORK/lock.0"
@@ -498,13 +498,13 @@ else
     bad "message without the two note lines" "$(cat "$WORK/locknew.0.err")"
 fi
 # put the file back
-P2=$(kopie l_lock2)
+P2=$(copy_pkg l_lock2)
 cp "$WORK/lock.0" "$P2/app/firn.lock"
 
 # --- 26: --locked without a lock file ------------------------------------
 
 check "--locked without a lock file is an error"
-P3=$(kopie l_nolock)
+P3=$(copy_pkg l_nolock)
 rm -f "$P3/app/firn.lock"
 beide nolock --package "$P3/app" -o "$WORK/nolock.bin" --locked
 expect_error nolock "the lock file is missing"
@@ -515,7 +515,7 @@ expect_error nolock "the lock file is missing"
 # even when the sources did not change at all.
 
 check "a lock file edited by hand is caught"
-P4=$(kopie l_hand)
+P4=$(copy_pkg l_hand)
 sed 's/^total ./total 0/' "$WORK/lock.0" > "$P4/app/firn.lock"
 beide handlock --package "$P4/app" -o "$WORK/handlock.bin" --locked
 expect_error handlock "the lock file does not match the sources"
@@ -533,7 +533,7 @@ expect_error lockalone2 "--lock works only together with --package"
 # --- 29: a version wish that is met --------------------------------------
 
 check "a version wish that is met changes nothing"
-P5=$(kopie l_wish)
+P5=$(copy_pkg l_wish)
 sed -i 's|^needs    geo   ../geo$|needs    geo   ../geo 0.2.0|' "$P5/app/firn.package"
 "$FIRNC" --package "$P5/app" -o "$WORK/wish0.bin" > "$WORK/wish0.log" 2>&1
 w0=$?
@@ -560,7 +560,7 @@ fi
 # --- 30: a version wish that is not met ----------------------------------
 
 check "a version wish that is not met is an error"
-P6=$(kopie l_wish_bad)
+P6=$(copy_pkg l_wish_bad)
 sed -i 's|^needs    geo   ../geo$|needs    geo   ../geo 0.3.0|' "$P6/app/firn.package"
 beide wishbad --package "$P6/app" -o "$WORK/wishbad.bin" --locked
 expect_error wishbad "dependency 'geo' is version 0.2.0, needed is 0.3.0 or higher with the same first number"
@@ -568,7 +568,7 @@ expect_error wishbad "dependency 'geo' is version 0.2.0, needed is 0.3.0 or high
 # --- 31: one name, two directories, one version --------------------------
 
 check "the same package out of two directories is an error"
-P7=$(kopie l_twice)
+P7=$(copy_pkg l_twice)
 cp -r "$P7/geo" "$P7/geo2"
 printf 'needs    geo   ../geo2\n' >> "$P7/text/firn.package"
 beide twice --package "$P7/app" -o "$WORK/twice.bin"
@@ -581,7 +581,7 @@ expect_error twice "package 'geo' comes from two directories with version 0.2.0"
 # lock file has to say which directory it was.
 
 check "of two versions the higher one wins, in both compilers"
-P8=$(kopie l_higher)
+P8=$(copy_pkg l_higher)
 cp -r "$P8/geo" "$P8/geo2"
 sed -i 's/^version  0.2.0$/version  0.3.0/' "$P8/geo2/firn.package"
 printf 'needs    geo   ../geo2\n' >> "$P8/text/firn.package"
@@ -615,13 +615,13 @@ expect_error conflict "dependency 'geo' is version 0.3.0, needed is 1.0.0 or hig
 # --- 33/34: the two ways to get the fourth word wrong --------------------
 
 check "a broken version in 'needs' is reported"
-P9=$(kopie l_wish_broken)
+P9=$(copy_pkg l_wish_broken)
 sed -i 's|^needs    geo   ../geo$|needs    geo   ../geo 0.3|' "$P9/app/firn.package"
 beide wishbroken --package "$P9/app" -o "$WORK/wishbroken.bin"
 expect_error wishbroken "invalid version '0.3' (expected number.number.number)"
 
 check "a fifth word in 'needs' is reported"
-PA=$(kopie l_wish_extra)
+PA=$(copy_pkg l_wish_extra)
 sed -i 's|^needs    geo   ../geo$|needs    geo   ../geo 0.3.0 x|' "$PA/app/firn.package"
 beide wishextra --package "$PA/app" -o "$WORK/wishextra.bin"
 expect_error wishextra "'needs' expects at most one version behind the path"

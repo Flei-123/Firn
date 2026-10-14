@@ -155,6 +155,9 @@ struct Options {
     shared: bool,
     /// `--header=<file>`: write the C header of the `#[export_c]` functions.
     header: Option<String>,
+    /// `--def=<file>`: write a module-definition file (`LIBRARY` + `EXPORTS`) of the `#[export_c]` functions; with
+    /// `dlltool -d x.def -l x.lib` (or MSVC `lib /def:x.def`) it becomes the import library of a Windows DLL.
+    def_file: Option<String>,
     /// **ROUND 82** — `--timings`: wall clock per phase to stderr.
     timings: bool,
     /// `--deps-out=<file>`: after the modules are resolved, write the
@@ -267,6 +270,7 @@ fn usage() -> String {
          --shared           C-ABI shared object in ONE step (x86-64 Linux): --pic -c + ld -shared,\n  \
                             exports = the #[export_c] functions; -o lib.so\n  \
          --header=<file>    write the C header (.h) of the #[export_c] functions\n  \
+         --def=<file>       write a .def (LIBRARY/EXPORTS) of the #[export_c] functions (dlltool -> .lib)\n  \
          --cpu=<level>      baseline (default, SSE2) | avx (three operand form)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
@@ -311,6 +315,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut only_object = false;
     let mut shared = false;
     let mut header: Option<String> = None;
+    let mut def_file: Option<String> = None;
     let mut timings = false;
     let mut deps_out: Option<String> = None;
     let mut test_mode = false;
@@ -390,6 +395,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 target::shared_set(true);
             }
             _ if a.starts_with("--header=") => header = Some(a["--header=".len()..].to_string()),
+            _ if a.starts_with("--def=") => def_file = Some(a["--def=".len()..].to_string()),
             _ if a.starts_with("--profile=") => {
                 if let Err(e) = prof::flag_set(&a["--profile=".len()..]) {
                     return Err(e);
@@ -539,6 +545,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         only_object,
         shared,
         header,
+        def_file,
         timings,
         deps_out,
         test_mode,
@@ -1196,6 +1203,18 @@ fn run(opts: &Options) -> i32 {
             return 2;
         }
     }
+    if let Some(d) = &opts.def_file {
+        let dll = opts
+            .output
+            .as_deref()
+            .and_then(|o| Path::new(o).file_name().and_then(|x| x.to_str()))
+            .unwrap_or("firn.dll")
+            .to_string();
+        if let Err(e) = std::fs::write(d, extfn::def_text(&dll).as_bytes()) {
+            eprintln!("error: cannot write '{}': {}", d, e);
+            return 2;
+        }
+    }
     let out = opts
         .output
         .clone()
@@ -1426,17 +1445,6 @@ fn link_shared(obj: &Path, so: &Path) -> Result<(), i32> {
 /// `--shared --target=x86_64-windows`: a PE DLL. Exports = the Win64 thunks `win.rs` wrote under the
 /// bare `#[export_c]` names, listed in a `.def` file. Entry = `win::DLL_ENTRY`.
 fn link_dll(obj: &Path, dll: &Path, names: &[String]) -> Result<(), i32> {
-    for th in extfn::export_thunk_info() {
-        let c_name = &th.c_name;
-        if th.unsupported {
-            eprintln!(
-                "error: --shared (Windows DLL): '{}' has a v128 parameter that finds no xmm0-7 register \
-                 (more than 8 float / vector parameters); take a pointer instead",
-                c_name
-            );
-            return Err(2);
-        }
-    }
     let def = dll.with_extension("def");
     let libname = dll.file_name().and_then(|x| x.to_str()).unwrap_or("firn.dll");
     let text = format!("LIBRARY \"{}\"\nEXPORTS\n{}\n", libname, names.iter().map(|n| format!("    {}", n)).collect::<Vec<_>>().join("\n"));

@@ -172,6 +172,10 @@ if [ "$ENT" -eq 1 ]; then
   PIG=pig; CHICKEN=chicken; STAND=armor_stand; ITEM=item; PLAYER=player; EXEC_AT="execute at $NAME run"
   case "$MCV" in 1.8*) PIG=Pig; CHICKEN=Chicken; STAND=ArmorStand; ITEM=Item; PLAYER=Player ;; esac
   [ "$LEGACY" -eq 1 ] && EXEC_AT="execute $NAME ~ ~ ~"
+  # where the bot stands: the fixed spot (8.5 70 0.5) is next to the world spawn of most versions; the 1.14 - 1.17 worldgen puts the spawn
+  # elsewhere (1.14.4 seed 4242: about 61 / 120), so the bot would be out of the dumper's tracking range -> stand next to the dumper instead
+  BOT_TP="tp Bot 8.5 70 0.5"
+  [ "$PROTO" -ge 477 ] && [ "$PROTO" -le 756 ] && BOT_TP="$EXEC_AT tp Bot ~4 ~1 ~"
   [ "$IDLE" -lt 7000 ] && [ -z "${MC_IDLE_MS:-}" ] && IDLE=7000
   mkfifo "$W/botin"
   exec 4<>"$W/botin"
@@ -194,7 +198,7 @@ ent_script() { # $1 = number of the join line to wait for; then plays the events
   sleep 0.4
   echo "$EXEC_AT summon $PIG ~3 ~3 ~3 {NoAI:1b}" >&3; sleep 0.5
   echo "$EXEC_AT summon $STAND ~-2 ~ ~ {NoGravity:1b}" >&3; sleep 0.5
-  echo "tp Bot 8.5 70 0.5" >&3; sleep 0.6
+  echo "$BOT_TP" >&3; sleep 0.6
   echo "walk 6 0.25 0.125 120" >&4; sleep 1.1
   echo "$EXEC_AT tp @e[type=$PIG] ~ ~3 ~-3" >&3; sleep 0.5
   # MC_ENT_ROT=1: teleport the pig again WITH a rotation (yaw 90, pitch 30) to check the entity_teleport layout

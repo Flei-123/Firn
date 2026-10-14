@@ -11,9 +11,9 @@
 # If the counter-check stays flat, this script aborts.
 #
 # Environment:
-#   BAUM_RUNDEN      rounds in the normal run (default 20000)
+#   TREE_ROUNDS      rounds in the normal run (default 20000)
 #   BAUM_MS          time budget of the normal run in ms (default 8000)
-#   BAUM_LECK_RUNDEN rounds of the counter-check (default 4000)
+#   TREE_LEAK_ROUNDS rounds of the counter-check (default 4000)
 #   TREE_LEAK_MB     hard memory brake of the counter-check in MiB (default 1024)
 #   BAUM_DRIFT_KIB   allowed RSS increase in the normal run (default 256)
 set -uo pipefail
@@ -22,9 +22,9 @@ cd "$(dirname "$0")/../.."
 FIRNC=compiler/target/release/firnc
 export FIRNLIB="$(pwd)/lib"
 WORK=.tree-work
-ROUNDS=${BAUM_RUNDEN:-20000}
+ROUNDS=${TREE_ROUNDS:-20000}
 MS=${BAUM_MS:-8000}
-LEAK_ROUNDS=${BAUM_LECK_RUNDEN:-4000}
+LEAK_ROUNDS=${TREE_LEAK_ROUNDS:-4000}
 LEAK_MB=${TREE_LEAK_MB:-1024}
 DRIFT=${BAUM_DRIFT_KIB:-256}
 

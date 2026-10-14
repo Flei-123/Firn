@@ -878,7 +878,8 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     // other side. `place_args` is asked with the parameter VALUES (%0, %1,
     // ...), whose types are exactly `f.params`.
     let pvals: Vec<Val> = (0..f.params.len() as Val).collect();
-    let (spot, _stack) = place_args(f, &pvals);
+    let (spot, stack_vals) = place_args(f, &pvals);
+    let (stack_offs, _) = stack_offsets(f, &stack_vals);
     let mut stack_i = 0usize;
     for (i, _t) in f.params.iter().enumerate() {
         match spot[i] {
@@ -899,8 +900,14 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
                 e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[i], r));
             }
             None => {
-                let off = 16 + 8 * stack_i as u64;
+                let off = 16 + stack_offs[stack_i];
                 stack_i += 1;
+                if f.params[i] == FTy::V128 {
+                    // r570: a vector beyond xmm7 (16 octets, 16 aligned; rbp is 16 aligned). xmm8 is no parameter register.
+                    e.line(&format!("movups xmm8, xmmword ptr [rbp+{}]", off));
+                    crate::simd::slot_from_reg(e, &fr, i as Val, "xmm8");
+                    continue;
+                }
                 e.line(&format!("mov rax, qword ptr [rbp+{}]", off));
                 e.line(&format!("mov qword ptr [rbp-{}], rax", fr.slot[i]));
             }
@@ -1173,6 +1180,47 @@ pub(crate) fn place_args(f: &Func, args: &[Val]) -> (Vec<Option<&'static str>>, 
         stack.push(*a);
     }
     (spot, stack)
+}
+
+/// Offsets (from the first stack argument) of the arguments `place_args` sent to the stack, and the room they need
+/// (not yet rounded). System V and AAPCS64 agree: every argument takes a multiple of eight octets, and a `v128`
+/// takes sixteen octets AT a sixteen octet boundary (r570; before, a `v128` found its xmm register or was cut to
+/// one word). The area starts 16-aligned, both at the `call` (`rsp`) and in the callee (`rbp+16` / `x29+16`).
+pub(crate) fn stack_offsets(f: &Func, stack: &[Val]) -> (Vec<u64>, u64) {
+    let mut offs = Vec::with_capacity(stack.len());
+    let mut at = 0u64;
+    for a in stack {
+        if f.val_ty(*a) == FTy::V128 {
+            at = (at + 15) / 16 * 16;
+            offs.push(at);
+            at += 16;
+        } else {
+            offs.push(at);
+            at += 8;
+        }
+    }
+    (offs, at)
+}
+
+/// Opens the outgoing stack area of a call (16-aligned) and writes the stack arguments into it.
+/// Returns the number of octets to give back after the call.
+fn push_stack_args(e: &mut Emitter, f: &Func, fr: &Frame, stack: &[Val]) -> u64 {
+    let (offs, total) = stack_offsets(f, stack);
+    let adjust = (total + 15) / 16 * 16;
+    if adjust > 0 {
+        e.line(&format!("sub rsp, {}", adjust));
+        for (k, a) in stack.iter().enumerate() {
+            if f.val_ty(*a) == FTy::V128 {
+                // xmm8 is no argument register and the cache was flushed in front of the call.
+                crate::simd::reg_from_slot(e, fr, "xmm8", *a);
+                e.line(&format!("movups xmmword ptr [rsp+{}], xmm8", offs[k]));
+            } else {
+                load_full(e, fr, "rax", *a);
+                e.line(&format!("mov qword ptr [rsp+{}], rax", offs[k]));
+            }
+        }
+    }
+    adjust
 }
 
 /// Loads the arguments into their registers. SSE first: `rax` is the ferry
@@ -1602,17 +1650,7 @@ fn emit_inst(
             // immediately in front of the `call` at [rsp+8k]. The 16-byte
             // alignment survives (an odd number of words gets a padding word).
             let (spot, stack) = place_args(f, args);
-            let mut adjust = 8 * stack.len() as u64;
-            if stack.len() % 2 == 1 {
-                adjust += 8;
-            }
-            if adjust > 0 {
-                e.line(&format!("sub rsp, {}", adjust));
-                for (k, a) in stack.iter().enumerate() {
-                    load_full(e, fr, "rax", *a);
-                    e.line(&format!("mov qword ptr [rsp+{}], rax", 8 * k));
-                }
-            }
+            let adjust = push_stack_args(e, f, fr, &stack);
             load_args(e, f, fr, args, &spot);
             e.line(&format!("call {}", label(name)));
             if adjust > 0 {
@@ -1636,17 +1674,7 @@ fn emit_inst(
         Op::CallIndirect { target, args } => {
             crate::simd::xflush(e, fr);
             let (spot, stack) = place_args(f, args);
-            let mut adjust = 8 * stack.len() as u64;
-            if stack.len() % 2 == 1 {
-                adjust += 8;
-            }
-            if adjust > 0 {
-                e.line(&format!("sub rsp, {}", adjust));
-                for (k, a) in stack.iter().enumerate() {
-                    load_full(e, fr, "rax", *a);
-                    e.line(&format!("mov qword ptr [rsp+{}], rax", 8 * k));
-                }
-            }
+            let adjust = push_stack_args(e, f, fr, &stack);
             load_args(e, f, fr, args, &spot);
             load_full(e, fr, "rax", *target);
             e.line("call rax");
@@ -2190,6 +2218,16 @@ mod tests {
         let fr = layout(&f);
         assert_eq!(fr.size % 16, 0);
         assert!(fr.size >= 12);
+    }
+
+    /// r570: a `v128` on the stack takes 16 octets at a 16 octet boundary, everything else one word.
+    #[test]
+    fn stack_offsets_align_vectors() {
+        let f = Func::new("f", vec![FTy::I64, FTy::V128, FTy::V128, FTy::I64, FTy::F64, FTy::V128], FTy::Void);
+        let vals: Vec<Val> = (0..6).collect();
+        let (offs, total) = stack_offsets(&f, &vals);
+        assert_eq!(offs, vec![0, 16, 32, 48, 56, 64]);
+        assert_eq!(total, 80);
     }
 
     /// More than six parameters: the further ones sit on the stack of the

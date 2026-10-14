@@ -42,6 +42,17 @@ for lvl in dev-fast release-safe release-fast; do
     gcc -O1 -fstack-protector-all -pthread -o "$D/hostatt" tools/stack_e/host_attach.c -ldl || { echo "FAIL gcc host_attach"; rc=1; continue; }
     timeout 120 "$D/hostatt" "$D/librt.so" | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL host_attach C ($lvl)"; rc=1; }
     timeout 120 python3 -I tools/stack_e/host_attach.py "$D/librt.so" || { echo "FAIL host_attach ctypes ($lvl)"; rc=1; }
+    # r506: host threads that never call se_attach (export guard)
+    gcc -O1 -fstack-protector-all -pthread -o "$D/hostnoatt" tools/stack_e/host_noattach.c -ldl || { echo "FAIL gcc host_noattach"; rc=1; continue; }
+    timeout 120 "$D/hostnoatt" "$D/librt.so" | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL host_noattach ($lvl)"; rc=1; }
+    # r570: more than eight v128 parameters (stack: 16 octets, 16 aligned) against gcc's placement
+    "$FIRNC" --shared --opt-level=$lvl -o "$D/libv128s.so" tools/stack_e/lib_v128stack.fi || { echo "FAIL lib_v128stack ($lvl)"; rc=1; continue; }
+    gcc -O1 -o "$D/hostv128s" tools/stack_e/host_v128stack.c -ldl || { echo "FAIL gcc host_v128stack"; rc=1; continue; }
+    "$D/hostv128s" "$D/libv128s.so" | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL host_v128stack ($lvl)"; rc=1; }
+    # r577: v128 beyond the vector registers next to a struct (entry thunk), x86-64 here, aarch64 in run_g5.sh
+    "$FIRNC" --shared --opt-level=$lvl -o "$D/libv128st.so" tools/stack_e/lib_v128struct.fi || { echo "FAIL lib_v128struct ($lvl)"; rc=1; continue; }
+    gcc -O1 -o "$D/hostv128st" tools/stack_e/host_v128struct.c -ldl || { echo "FAIL gcc host_v128struct"; rc=1; continue; }
+    "$D/hostv128st" "$D/libv128st.so" | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL host_v128struct ($lvl)"; rc=1; }
 done
 # G5: Windows DLL (Wine) and aarch64 .so (qemu): own script, it can run alone
 bash tools/stack_e/run_g5.sh || rc=1

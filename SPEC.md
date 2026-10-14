@@ -1534,7 +1534,7 @@ reads reference parameters in all four places and rewrites the body while it
 parses; it does not check the "exactly one" rule or the read-only rule with
 messages (it only counts errors, as everywhere), the negative tests belong to
 `firnc0`.
-Proof: `tests/2000_ref_params.fi`, `tests/2002_ref_params_more.fi`,
+Proof: `tests/2000_ref_params.fi`, `tests/3207_ref_params_more.fi`,
 `tests/neg/ref_*.fi`, `tests/neg/inout_*_in_call.fi`.
 
 **Round REF2 (inclusive range).** `for i in a..=b` includes `b`. The `=` has to

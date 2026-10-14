@@ -185,7 +185,7 @@ fn zero_stats() -> StreamStats {
 fn stream_new(min_y: i32, nsec: i32, dist: i32, t: *mut mc_mesh.MeshTables, pool: u64) -> Stream {
     var s: Stream = Stream { min_y: min_y, nsec: nsec, dist: dist, flags: mc_mesh.F_AO | mc_mesh.F_GREEDY,
         tables: mc_mesh.MeshTables { opaque: (*t).opaque, tiles: (*t).tiles }, pool: pool, group: 0,
-        max_inflight: 16, max_submit: 8, snap_budget_us: 1500 as u64, upload_budget_us: 2000 as u64, nbr_wait: 30 as u32,
+        max_inflight: 64, max_submit: 32, snap_budget_us: 1500 as u64, upload_budget_us: 2000 as u64, nbr_wait: 30 as u32,
         sync: false, setback: false, use_cull: true, measure: false, frame: 0 as u32, inflight: 0,
         tbl: 0, cap: 0, used: 0, live: 0, ctbl: 0, ccap: 0, cused: 0, clive: 0, pend: 0, npend: 0, pcap: 0,
         recs: 0, slots: 0, sp: 0, rr: 0, cull: mc_cull.cull_new(min_y, nsec), st: zero_stats(),
@@ -1200,8 +1200,10 @@ fn consume(s: *mut Stream, b: *mut mc_backend.Backend, deadline_ns: u64) {
             let tnv: usize = rt.ld64((*s).recs, r * REC_WORDS + R_TNV) as usize
             let tni: usize = rt.ld64((*s).recs, r * REC_WORDS + R_TNI) as usize
             if tnv > 0 && !lodcol {
+                (*b).mesh_class((*b).obj, mc_backend.MESH_TRANS)
                 ht = (*b).mesh_upload((*b).obj, key, rt.ld64((*s).recs, r * REC_WORDS + R_TVERTS), tnv,
                     rt.ld64((*s).recs, r * REC_WORDS + R_TIDX), tni)
+                (*b).mesh_class((*b).obj, mc_backend.MESH_OPAQUE)
                 (*s).st.upload_bytes = (*s).st.upload_bytes + (tnv * 8 + tni * 4) as u64
             }
             rt.st64((*s).tbl, slot * EW + 1, h as u64)
@@ -1267,35 +1269,50 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
         }
     }
     if started < (*s).max_submit && (*s).inflight < (*s).max_inflight && now_ns() <= snap_deadline && (*s).npend > 0 {
-        // pending sections outside the draw list (behind the camera, culled): nearest first
-        while started < (*s).max_submit && (*s).inflight < (*s).max_inflight && now_ns() <= snap_deadline {
-            var best: usize = 0
-            var bestd: u64 = 0xFFFFFFFFFFFFFFFF as u64
-            var found: bool = false
-            var i: usize = 0
-            while i < (*s).npend {
-                let key: u64 = rt.ld64((*s).pend, i)
-                let e: i64 = sec_find(s, key)
-                if e >= 0 && wants_mesh(s, e as usize) {
-                    let ox: f64 = (key_cx(key) * 16 + 8) as f64 - (*cam).x
-                    let oz: f64 = (key_cz(key) * 16 + 8) as f64 - (*cam).z
-                    let oy: f64 = ((*s).min_y + key_sy(key) * 16 + 8) as f64 - (*cam).y
-                    let d: u64 = (ox * ox + oy * oy + oz * oz) as u64
+        // pending sections outside the draw list (behind the camera, culled): nearest first. ONE pass over the list collects
+        // the nearest candidates (sorted by distance, ties in list order = the order the one-by-one search would pick them).
+        var cap: usize = (*s).max_submit - started
+        if cap > 64 { cap = 64 }
+        let cd: u64 = rt.heap_alloc(64 * 8 * 2)
+        let ce: u64 = cd + (64 * 8) as u64
+        var nc: usize = 0
+        var i: usize = 0
+        while i < (*s).npend {
+            let key: u64 = rt.ld64((*s).pend, i)
+            i = i + 1
+            let e: i64 = sec_find(s, key)
+            if e >= 0 && wants_mesh(s, e as usize) {
+                let ox: f64 = (key_cx(key) * 16 + 8) as f64 - (*cam).x
+                let oz: f64 = (key_cz(key) * 16 + 8) as f64 - (*cam).z
+                let oy: f64 = ((*s).min_y + key_sy(key) * 16 + 8) as f64 - (*cam).y
+                let d: u64 = (ox * ox + oy * oy + oz * oz) as u64
+                if nc < cap || d < rt.ld64(cd, nc - 1) {
                     var ax: i32 = key_cx(key) - mc_world.block_to_chunk(floor_i((*cam).x))
                     var az: i32 = key_cz(key) - mc_world.block_to_chunk(floor_i((*cam).z))
                     if ax < 0 { ax = 0 - ax }
                     if az < 0 { az = 0 - az }
-                    if ax <= (*s).dist && az <= (*s).dist && (!found || d < bestd) && nbr_peek(s, key) {
-                        found = true
-                        bestd = d
-                        best = e as usize
+                    if ax <= (*s).dist && az <= (*s).dist && nbr_peek(s, key) {
+                        var pos: usize = nc
+                        if nc == cap { pos = nc - 1 } else { nc = nc + 1 }
+                        while pos > 0 && d < rt.ld64(cd, pos - 1) {
+                            rt.st64(cd, pos, rt.ld64(cd, pos - 1))
+                            rt.st64(ce, pos, rt.ld64(ce, pos - 1))
+                            pos = pos - 1
+                        }
+                        rt.st64(cd, pos, d)
+                        rt.st64(ce, pos, e as u64)
                     }
                 }
-                i = i + 1
             }
-            if !found { break }
-            if try_submit(s, b, best) { started = started + 1 } else { break }
         }
+        var ci: usize = 0
+        while ci < nc && started < (*s).max_submit && (*s).inflight < (*s).max_inflight && now_ns() <= snap_deadline {
+            let e: usize = rt.ld64(ce, ci) as usize
+            ci = ci + 1
+            if !wants_mesh(s, e) { continue }
+            if try_submit(s, b, e) { started = started + 1 } else { break }
+        }
+        rt.heap_free(cd, 64 * 8 * 2)
     }
     let t2: u64 = now_ns()
     (*s).st.submit_us = (t2 - t1) / 1000 as u64
@@ -1801,7 +1818,9 @@ fn lod_build(s: *mut Stream, b: *mut mc_backend.Backend, ci: usize, bin: i32) {
     }
     var h: usize = 0
     if (*s).lodm.nverts > 0 as u32 {
+        (*b).mesh_class((*b).obj, mc_backend.MESH_TRANS) // LOD meshes (skirts, overlaps): keep the index order
         h = (*b).mesh_upload((*b).obj, key, (*s).lodm.verts, (*s).lodm.nverts as usize, (*s).lodm.idx, (*s).lodm.nidx as usize)
+        (*b).mesh_class((*b).obj, mc_backend.MESH_OPAQUE)
         (*s).st.upload_bytes = (*s).st.upload_bytes + ((*s).lodm.nverts as u64) * 8 as u64 + ((*s).lodm.nidx as u64) * 4 as u64
     }
     rt.st64((*s).ctbl, ci * CW + C_LH, h as u64)

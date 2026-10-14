@@ -91,7 +91,13 @@ The client picks the version from the protocol number in the server-list ping.
 | **1.8.9** | **47** | yes | yes (448 packets x 4 stages) | `CF_LEGACY_8` **implemented** (`mc_chunk.chunk_decode_legacy8`, `legacy8_bulk_*`) | **yes** (11.10.2026: real 1.8.9 server, dump byte-identical to the reference client, 81 chunks) |
 | **1.12.2** | **340** | yes | yes (500) | `CF_SECTIONS_19` **implemented** (`mc_chunk.chunk_decode_19`) | **yes** (11.10.2026: real 1.12.2 server, dump byte-identical to the reference client, 81 chunks) |
 | **1.16.5** | **754** | yes | yes (616) | `CF_SECTIONS_114` **implemented** (`mc_chunk.chunk_decode_114`, protocols 751-754) | **yes** (11.10.2026: real 1.16.5 server, dump byte-identical to the reference client, 121 chunks) |
+| **1.14.4** | **498** | yes | n/a | `CF_SECTIONS_114` (dense longs, 256 biome ints behind the sections, `chunk_decode_114n`) | **chunks yes** (14.10.2026: real 1.14.4 server, dump byte-identical to the reference client, 121 chunks, walk_fail 0); entity scenario NOT proven (its commands fail on this version) |
+| **1.15.2** | **578** | yes | n/a | `CF_SECTIONS_114` (dense longs, 1024 biome ints as own field) | **chunks yes** (14.10.2026: real 1.15.2 server, byte-identical, 121 chunks, walk_fail 0); entity scenario NOT proven |
+| **1.17.1** | **756** | yes | n/a | `CF_SECTIONS_114` (BitSet mask, no groundUp, sections from the dimension) | **chunks yes** (14.10.2026: real 1.17.1 server, byte-identical, 121 chunks, walk_fail 0); entity scenario NOT proven |
 | **1.18.2** | **758** | yes | yes | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` **implemented** | **yes** (14.10.2026: real 1.18.2 server, dump byte-identical to the reference client, 121 chunks) |
+| **1.19** | **759** | yes | yes | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` **implemented** | **yes** (14.10.2026: real 1.19 server, dump byte-identical to the reference client, 121 chunks, light lines + entities equal) |
+| **1.19.2** | **760** | yes | yes | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` **implemented** | **yes** (14.10.2026: real 1.19.2 server, dump byte-identical to the reference client, 121 chunks, light lines + entities equal) |
+| **1.19.3** | **761** | yes | yes | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` **implemented** | **yes** (14.10.2026: real 1.19.3 server, dump byte-identical to the reference client, 121 chunks, light lines + entities equal) |
 | **1.19.4** | **762** | yes | yes | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` **implemented** | **yes** (14.10.2026: real 1.19.4 server, byte-identical, 121 chunks, entities equal) |
 | **1.20.1** | **763** | yes | yes (704) | `CF_CONTAINERS_118` **implemented** | in progress (M0) |
 | **1.20.2** | **764** | yes (has the Configuration state) | yes (788) | `CF_CONTAINERS_118` (same, nameless NBT roots) | **yes** (11.10.2026: real 1.20.2 server incl. configuration phase, dump byte-identical, 109 chunks) |
@@ -131,6 +137,9 @@ particle status (without it the server falls back to view distance 2: 49 instead
 | Version | Result |
 |---|---|
 | 1.18.2 (758) | **PASS (14.10.2026)**: A == A2, B == A, 121 chunks, checksum cddbe507a6b4. **Cause of `chunk_bad=121`**: map_chunk and update_light of 1.18 - 1.19.4 carry a `trustEdges` bool before the four light masks (minecraft-data lists it); the decoder did not read it, so the packet was not consumed exactly. Fix: `FLAG_TRUST_EDGES` (versions.json 1.18.2/1.19.4 -> `mc_chunk.Scratch.trust`, `lightdata_decode_118(.., trust_edges)`); test 2952. 1.20 (763) dropped the bool. |
+| 1.19 (759) | **PASS (14.10.2026)**: A == A2, B == A, 121 chunks, walk_fail 0, checksum af3c8fcff1df, L (light) lines and entities equal; added by r125 (versions.json only + generator, no decoder change). |
+| 1.19.2 (760) | **PASS (14.10.2026)**: A == A2, B == A, 121 chunks, walk_fail 0, checksum 07e46fcf26c5, L (light) lines and entities equal; added by r125 (versions.json only + generator, no decoder change). |
+| 1.19.3 (761) | **PASS (14.10.2026)**: A == A2, B == A, 121 chunks, walk_fail 0, checksum e6ac09767d8c, L (light) lines and entities equal; added by r125 (versions.json only + generator, no decoder change). |
 | 1.19.4 (762) | **PASS (14.10.2026)**: A == A2, B == A, 121 chunks, checksum 0fb83124ffed, entities equal; same fix. The earlier A != A2 did not reproduce with the existing gamerule block (randomTickSpeed 0, doMobSpawning false, doDaylightCycle false) and the default settle run. |
 | 1.21.1 (767) | PASS: A == A2, B == A, 109 chunks, byte identical |
 | 1.21.4 (769) | PASS: 117 chunks, byte identical |
@@ -266,7 +275,7 @@ view distance 4), `MC_VERSION=<release> bash tools/mcclient/run.sh <firn client>
 `Chunk.sec_mask` says which sections a packet carried. `mc_world.world_apply(w, p)` stores a whole column (`APPLY_STORED`), merges an update into the stored column
 (`APPLY_MERGED`, `mc_chunk.chunk_merge_update`: the sections of the mask replace the stored ones; biomes/heightmaps/block entities stay, `light_hash` stays that of
 the original packet) or drops an update for an unknown column (`APPLY_DROPPED`). `chunk_decode_19` now also requires the section data to be consumed exactly.
-`tests/2745_mc_chunk19.fi` covers decode (5/13/4 bit, spanning longs, sky/no sky, biomes, truncation) and the merge. **Open**: the demo client + `ref_dump.cjs` still drop updates
+`tests/3211_mc_chunk19.fi` covers decode (5/13/4 bit, spanning longs, sky/no sky, biomes, truncation) and the merge. **Open**: the demo client + `ref_dump.cjs` still drop updates
 (`partial_chunks`); switching both to merge changes the dump contract (done in r33, both clients at once, see 1.12.2 above).
 
 ## 9. Round 2026-10-11 (worker mc-w3-1-16-5-join-cf-sections-114)
@@ -310,3 +319,17 @@ the original packet) or drops an update for an unknown column (`APPLY_DROPPED`).
   Real server (official 1.8.9, Java 17, seed 4242, view 4, `MC_SETTLE_MS=40000`): PASS, A == A2 and Firn B == A byte identical,
   checksum `56c7050923f4...`, 81 chunks (80 columns in 8 `map_chunk_bulk` packets + 1 single `map_chunk`), walk_fail 0.
 * Section updates (groundUp = false) are counted and dropped in both clients, like for 1.12.2 (merge still open, r30).
+
+
+## 11. Round 2026-10-14 (worker mc-f2-chunk-decode-1-14-1-15-1-17-r3): 1.14.4 / 1.15.2 / 1.17.1
+
+* `mc_chunk.chunk_decode_114n(b, sc, c, protocol, nsec)` decodes four wire variants of `CF_SECTIONS_114` by protocol: 1.14 (477-498), 1.15 (573-578),
+  1.16.2-1.16.5 (751-754, unchanged), 1.17 (755-756). 1.14/1.15: entries SPAN two longs (also the 36-long heightmap), block bits < 4 = 4, direct ids >= 9 bits
+  (no palette). 1.14: biomes = 256 ints behind the sections (kept in `Chunk.bio`, dump has a `B` line, cells take the first column); 1.15: 1024 ints as an
+  own field. 1.17: no groundUp, bitMap = varint count + longs, biomes varint count = sections * 64, sections from the dimension (`mc_dimension.dim_from_join`
+  now reads the `dimension` element NBT of 1.16.2-1.17.1; 1.14-1.16 = 0..256). 1.17 update_light uses long-array masks (`world_update_light`).
+* Real servers (official jars, `MC_VERSION=<v> heavy bash tools/mcclient/run.sh`): 1.14.4 checksum 7c79e75439d9, 1.15.2 1d09db01f71f, 1.17.1 ea1e01fbc284:
+  A == A2 and B == A (full file, C/S/H, L lines), 121 chunks, walk_fail 0. run.sh still ends FAIL(1) because the entity scenario creates too few entities
+  (server: "Incorrect argument for command" for some scenario commands on 1.14-1.17) -> entities NOT proven for these versions (open).
+* Tests: `tests/3040_mc_chunk_old.fi` (hand-built packets of all three variants, error and truncation paths); `tests/2745` now refuses 735 instead of 755.
+* NOT covered: 1.16.0 / 1.16.1 (ignoreOldData bool, 1024 biome ints).

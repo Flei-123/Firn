@@ -83,6 +83,19 @@ const PADN: usize = 5832
 // (The old bound 13056 assumed one visible face per neighbour pair and overflowed the buffers
 // on leaf / glass sections: segfault in perf_components, tests/2950.)
 const MAX_QUADS: usize = 24576
+// The `mask` heap block holds the 16x16 slice mask (u64 [256]) followed by the scratch of mesh_run:
+//   cls   u8 [5832]    per padded cell: bit 0 occludes (AO), bit 1 hides the face of a neighbour (opaque or unknown), bit 2 translucent
+//   hrow  u32 [324]    per padded row (y * 18 + z): bit x = cell hides faces (cls bit 1)
+//   mrow  u32 [324]    per padded row: bit x = interior cell whose block can show a face in this pass
+//   cmask u16 [1536]   [(face * 16 + slice) * 16 + row]: bit column = face is visible
+//   tab   u32 [32]     bit position of a single set bit (de Bruijn)
+const MASK_BYTES: usize = 2048
+const CLS_OFS: usize = 2048
+const HROW_OFS: usize = 2048 + 5832
+const MROW_OFS: usize = 2048 + 5832 + 1296
+const CMASK_OFS: usize = 2048 + 5832 + 1296 + 1296
+const TAB_OFS: usize = 2048 + 5832 + 1296 + 1296 + 3072
+const MASK_ALLOC: usize = 2048 + 5832 + 1296 + 1296 + 3072 + 128
 
 struct MeshTables {
     opaque: u64,
@@ -91,7 +104,7 @@ struct MeshTables {
 
 struct Mesher {
     pad: u64, // u16 [5832]
-    mask: u64, // u64 [256]
+    mask: u64, // u64 [256] + scratch (MASK_ALLOC bytes)
     lpad: u64, // u8 [5832] padded light, sky << 4 | block
     verts: u64, // u32 [MAX_QUADS * 4 * 2]
     idx: u64, // u32 [MAX_QUADS * 6]
@@ -105,16 +118,28 @@ fn mesher_new() -> Mesher {
     var m: Mesher = Mesher { pad: 0, mask: 0, lpad: 0, verts: 0, idx: 0, nverts: 0 as u32, nidx: 0 as u32,
         nquads: 0 as u32, nfaces: 0 as u32 }
     m.pad = rt.heap_alloc(PADN * 2)
-    m.mask = rt.heap_alloc(256 * 8)
+    m.mask = rt.heap_alloc(MASK_ALLOC)
     m.lpad = rt.heap_alloc(PADN)
+    mesher_init_tab(m.mask)
     m.verts = rt.heap_alloc(MAX_QUADS * 4 * 8)
     m.idx = rt.heap_alloc(MAX_QUADS * 6 * 4)
     return m
 }
 
+// de Bruijn table for bit_index: slot ((lb * 0x077CB531) >> 27) holds log2(lb)
+fn mesher_init_tab(mask: u64) {
+    let tab: u64 = mask + TAB_OFS as u64
+    var k: usize = 0
+    while k < 32 {
+        let lb: u64 = 1 as u64 << (k as u32)
+        rt.st32(tab, (((lb * 0x077CB531 as u64) & 0xFFFFFFFF as u64) >> 27 as u64) as usize, k as u32)
+        k = k + 1
+    }
+}
+
 fn mesher_free(m: *mut Mesher) {
     rt.heap_free((*m).pad, PADN * 2)
-    rt.heap_free((*m).mask, 256 * 8)
+    rt.heap_free((*m).mask, MASK_ALLOC)
     rt.heap_free((*m).lpad, PADN)
     rt.heap_free((*m).verts, MAX_QUADS * 4 * 8)
     rt.heap_free((*m).idx, MAX_QUADS * 6 * 4)
@@ -242,10 +267,9 @@ fn corner_light(m: *mut Mesher, t: *mut MeshTables, a: usize, b: usize, c: usize
     ss = ss + (la >> 4 as u32)
     sb = sb + (la & 15 as u32)
     n = n + 1 as u32
-    let ib: u16 = rt.ld16((*m).pad, b)
-    let ic: u16 = rt.ld16((*m).pad, c)
-    let ob: bool = ib == UNKNOWN_ID || is_opaque(t, ib)
-    let oc: bool = ic == UNKNOWN_ID || is_opaque(t, ic)
+    let cls: u64 = (*m).mask + CLS_OFS as u64
+    let ob: bool = (rt.ld8(cls, b) & 2 as u8) != 0 as u8
+    let oc: bool = (rt.ld8(cls, c) & 2 as u8) != 0 as u8
     if !ob {
         let lb: u32 = rt.ld8((*m).lpad, b) as u32
         ss = ss + (lb >> 4 as u32)
@@ -259,8 +283,7 @@ fn corner_light(m: *mut Mesher, t: *mut MeshTables, a: usize, b: usize, c: usize
         n = n + 1 as u32
     }
     if !(ob && oc) {
-        let id: u16 = rt.ld16((*m).pad, d)
-        if id != UNKNOWN_ID && !is_opaque(t, id) {
+        if (rt.ld8(cls, d) & 2 as u8) == 0 as u8 {
             let ld: u32 = rt.ld8((*m).lpad, d) as u32
             ss = ss + (ld >> 4 as u32)
             sb = sb + (ld & 15 as u32)
@@ -279,64 +302,159 @@ fn corner_light(m: *mut Mesher, t: *mut MeshTables, a: usize, b: usize, c: usize
 fn emit_quad(m: *mut Mesher, f: usize, pc: usize, u0: usize, v0: usize, w: usize, h: usize,
     tile: u32, c0: u32, c1: u32, c2: u32, c3: u32) {
     let axis: usize = f / 2
-    let ua: usize = (axis + 1) % 3
-    let va: usize = (axis + 2) % 3
+    // the three coordinates sit at byte 0 (x), 1 (y), 2 (z) of word0: axis, u axis = (axis+1)%3, v axis = (axis+2)%3
+    var sha: u32 = 0 as u32
+    var shu: u32 = 8 as u32
+    var shv: u32 = 16 as u32
+    if axis == 1 {
+        sha = 8 as u32
+        shu = 16 as u32
+        shv = 0 as u32
+    } else if axis == 2 {
+        sha = 16 as u32
+        shu = 0 as u32
+        shv = 8 as u32
+    }
+    let base0: u32 = ((pc as u32) << sha) | ((f as u32) << 24 as u32)
+    let ul: u32 = (u0 as u32) << shu
+    let uh: u32 = ((u0 + w) as u32) << shu
+    let vl: u32 = (v0 as u32) << shv
+    let vh: u32 = ((v0 + h) as u32) << shv
+    let uw: u32 = (w as u32) << 14 as u32
+    let vw: u32 = (h as u32) << 19 as u32
     let vbase: u32 = (*m).nverts
-    var k: usize = 0
-    while k < 4 {
-        var su: usize = 0
-        var sv: usize = 0
-        var cv: u32 = c0
-        if k == 1 {
-            su = 1
-            cv = c1
-        } else if k == 2 {
-            su = 1
-            sv = 1
-            cv = c2
-        } else if k == 3 {
-            sv = 1
-            cv = c3
-        }
-        let ao: u32 = cv & 3 as u32
-        var pos: [usize; 3] = [0, 0, 0]
-        pos[axis] = pc
-        pos[ua] = u0 + su * w
-        pos[va] = v0 + sv * h
-        let w0: u32 = (pos[0] as u32) | ((pos[1] as u32) << 8 as u32) | ((pos[2] as u32) << 16 as u32) |
-        ((f as u32) << 24 as u32) | (ao << 27 as u32)
-        let w1: u32 = tile | (((su * w) as u32) << 14 as u32) | (((sv * h) as u32) << 19 as u32) |
-        (((cv >> 2 as u32) & 255 as u32) << 24 as u32)
-        let vi: usize = (((*m).nverts) as usize) * 2
-        rt.st32((*m).verts, vi, w0)
-        rt.st32((*m).verts, vi + 1, w1)
-        (*m).nverts = (*m).nverts + 1 as u32
-        k = k + 1
-    }
+    let vp: u64 = (*m).verts + (vbase as u64) * 8 as u64
+    // corner 0 (0,0), 1 (1,0), 2 (1,1), 3 (0,1)
+    rt.st32(vp, 0, base0 | ul | vl | ((c0 & 3 as u32) << 27 as u32))
+    rt.st32(vp, 1, tile | (((c0 >> 2 as u32) & 255 as u32) << 24 as u32))
+    rt.st32(vp, 2, base0 | uh | vl | ((c1 & 3 as u32) << 27 as u32))
+    rt.st32(vp, 3, tile | uw | (((c1 >> 2 as u32) & 255 as u32) << 24 as u32))
+    rt.st32(vp, 4, base0 | uh | vh | ((c2 & 3 as u32) << 27 as u32))
+    rt.st32(vp, 5, tile | uw | vw | (((c2 >> 2 as u32) & 255 as u32) << 24 as u32))
+    rt.st32(vp, 6, base0 | ul | vh | ((c3 & 3 as u32) << 27 as u32))
+    rt.st32(vp, 7, tile | vw | (((c3 >> 2 as u32) & 255 as u32) << 24 as u32))
     // diagonal: join the brighter pair of corners (brightness = light level * AO factor)
-    var q: [u32; 6] = [0 as u32, 1 as u32, 2 as u32, 0 as u32, 2 as u32, 3 as u32]
+    // triangles (0 1 2)(0 2 3) or flipped (1 2 3)(1 3 0); negative faces swap the 2nd and 3rd index of each triangle
+    var a0: u32 = 0 as u32
+    var a1: u32 = 1 as u32
+    var a2: u32 = 2 as u32
+    var a3: u32 = 3 as u32
     if corner_bright(c1) + corner_bright(c3) > corner_bright(c0) + corner_bright(c2) {
-        q = [1 as u32, 2 as u32, 3 as u32, 1 as u32, 3 as u32, 0 as u32]
+        a0 = 1 as u32
+        a1 = 2 as u32
+        a2 = 3 as u32
+        a3 = 0 as u32
     }
-    var ii: usize = 0
-    while ii < 6 {
-        var e: u32 = q[ii]
-        if f % 2 == 0 {
-            // negative faces: reverse the winding (swap the 2nd and 3rd index of each triangle)
-            let r: usize = ii % 3
-            if r == 1 { e = q[ii + 1] }
-            if r == 2 { e = q[ii - 1] }
-        }
-        rt.st32((*m).idx, ((*m).nidx as usize) + ii, vbase + e)
-        ii = ii + 1
+    // indices: (a0 a1 a2)(a0 a2 a3), the flipped diagonal reuses the same pattern with rotated corners
+    let ip: u64 = (*m).idx + ((*m).nidx as u64) * 4 as u64
+    rt.st32(ip, 0, vbase + a0)
+    if f % 2 == 0 {
+        rt.st32(ip, 1, vbase + a2)
+        rt.st32(ip, 2, vbase + a1)
+        rt.st32(ip, 3, vbase + a0)
+        rt.st32(ip, 4, vbase + a3)
+        rt.st32(ip, 5, vbase + a2)
+    } else {
+        rt.st32(ip, 1, vbase + a1)
+        rt.st32(ip, 2, vbase + a2)
+        rt.st32(ip, 3, vbase + a0)
+        rt.st32(ip, 4, vbase + a2)
+        rt.st32(ip, 5, vbase + a3)
     }
+    (*m).nverts = vbase + 4 as u32
     (*m).nidx = (*m).nidx + 6 as u32
     (*m).nquads = (*m).nquads + 1 as u32
 }
 
 // ---- the mesher -------------------------------------------------------------------
 
+// Number of set bits of a 16 bit value.
+fn popc16(v0: u32) -> u32 {
+    var v: u32 = v0 - ((v0 >> 1 as u32) & 0x5555 as u32)
+    v = (v & 0x3333 as u32) + ((v >> 2 as u32) & 0x3333 as u32)
+    v = (v + (v >> 4 as u32)) & 0x0F0F as u32
+    return (v + (v >> 8 as u32)) & 31 as u32
+}
+
+// Index (0..31) of the single set bit `lb` (de Bruijn table in the mesher scratch).
+fn bit_index(tab: u64, lb: u32) -> usize {
+    return rt.ld32(tab, ((((lb as u64) * 0x077CB531 as u64) & 0xFFFFFFFF as u64) >> 27 as u64) as usize) as usize
+}
+
+// padded index of the cell in front of face f of cell p
+fn front_of(p: usize, f: usize) -> usize {
+    if f == 0 { return p - 1 }
+    if f == 1 { return p + 1 }
+    if f == 2 { return p - 324 }
+    if f == 3 { return p + 324 }
+    if f == 4 { return p - 18 }
+    return p + 18
+}
+
+// Exact visibility of face f of cell p after the row bitmask pre-selection (which only knows "not hidden by an opaque /
+// unknown neighbour"): the block has a tile on this face, and neither F_CULL_SAME nor the translucent pass hides it.
+fn face_exact(m: *mut Mesher, t: *mut MeshTables, p: usize, f: usize, cull_same: bool, trans_pass: bool) -> bool {
+    let pad: u64 = (*m).pad
+    let a: u16 = rt.ld16(pad, p)
+    var tile: u32 = rt.ld16((*t).tiles, (a as usize) * 6 + f) as u32
+    if tile == 0 as u32 { return false }
+    let fr: usize = front_of(p, f)
+    let b: u16 = rt.ld16(pad, fr)
+    if cull_same && b == a { return false }
+    if trans_pass && (rt.ld8((*m).mask + CLS_OFS as u64, fr) & 4 as u8) != 0 as u8 {
+        if tile > MAX_TILE { tile = MAX_TILE }
+        if (rt.ld16((*t).tiles, (b as usize) * 6 + f) as u32) == tile { return false }
+    }
+    return true
+}
+
+// Mask key of the visible face f of cell p (fr = cell in front of it, su / sv = padded strides of the u / v axis):
+// tile | corner values (ao | sky << 2 | block << 6) of the four corners << 16, 26, 36, 46 | bit 56.
+fn face_key(m: *mut Mesher, t: *mut MeshTables, p: usize, f: usize, fr: usize, su: usize, sv: usize, use_ao: bool, use_light: bool) -> u64 {
+    let cls: u64 = (*m).mask + CLS_OFS as u64
+    let a: u16 = rt.ld16((*m).pad, p)
+    var tile: u32 = rt.ld16((*t).tiles, (a as usize) * 6 + f) as u32
+    if tile > MAX_TILE { tile = MAX_TILE }
+    // corner values: ao | sky << 2 | block << 6 (default: ao 3, sky 15, block 0)
+    var cv0: u32 = 3 as u32 | (15 as u32 << 2 as u32)
+    var cv1: u32 = cv0
+    var cv2: u32 = cv0
+    var cv3: u32 = cv0
+    if use_ao {
+        let um: u32 = (rt.ld8(cls, fr - su) & 1 as u8) as u32
+        let up: u32 = (rt.ld8(cls, fr + su) & 1 as u8) as u32
+        let vm: u32 = (rt.ld8(cls, fr - sv) & 1 as u8) as u32
+        let vp: u32 = (rt.ld8(cls, fr + sv) & 1 as u8) as u32
+        let c00: u32 = (rt.ld8(cls, fr - su - sv) & 1 as u8) as u32
+        let c10: u32 = (rt.ld8(cls, fr + su - sv) & 1 as u8) as u32
+        let c11: u32 = (rt.ld8(cls, fr + su + sv) & 1 as u8) as u32
+        let c01: u32 = (rt.ld8(cls, fr - su + sv) & 1 as u8) as u32
+        cv0 = (cv0 & 0xFFFFFFFC as u32) | ao_level(um, vm, c00)
+        cv1 = (cv1 & 0xFFFFFFFC as u32) | ao_level(up, vm, c10)
+        cv2 = (cv2 & 0xFFFFFFFC as u32) | ao_level(up, vp, c11)
+        cv3 = (cv3 & 0xFFFFFFFC as u32) | ao_level(um, vp, c01)
+    }
+    if use_light {
+        // the 2x2 patch in front of the face per corner: (front, u side, v side, diagonal)
+        let l00: u32 = corner_light(m, t, fr, fr - su, fr - sv, fr - su - sv)
+        let l10: u32 = corner_light(m, t, fr, fr + su, fr - sv, fr + su - sv)
+        let l11: u32 = corner_light(m, t, fr, fr + su, fr + sv, fr + su + sv)
+        let l01: u32 = corner_light(m, t, fr, fr - su, fr + sv, fr - su + sv)
+        cv0 = (cv0 & 3 as u32) | l00
+        cv1 = (cv1 & 3 as u32) | l10
+        cv2 = (cv2 & 3 as u32) | l11
+        cv3 = (cv3 & 3 as u32) | l01
+    }
+    return (tile as u64) | ((cv0 as u64) << 16 as u64) | ((cv1 as u64) << 26 as u64) |
+    ((cv2 as u64) << 36 as u64) | ((cv3 as u64) << 46 as u64) | (1 as u64 << 56 as u64)
+}
+
 // Meshes the interior of the padded array in (*m).pad. Clears the previous mesh.
+//
+// Pass 1 classifies every padded cell (cls) and builds, per padded row (y, z), two 18 bit masks: hide (opaque or unknown cell)
+// and mesh (interior cell of a block that can show a face in this pass). Pass 2 selects the visible faces of a whole row at once
+// (mesh & !hide of the neighbour row / shifted row) and files them by slice: cmask[face][slice][row] = bits of the column.
+// Pass 3 walks the slices in the order face, slice, row, column (the order of the quads in the buffers).
 fn mesh_run(m: *mut Mesher, t: *mut MeshTables, flags: u32) {
     (*m).nverts = 0 as u32
     (*m).nidx = 0 as u32
@@ -347,6 +465,168 @@ fn mesh_run(m: *mut Mesher, t: *mut MeshTables, flags: u32) {
     let cull_same: bool = (flags & F_CULL_SAME) != 0 as u32
     let use_light: bool = (flags & F_LIGHT) != 0 as u32
     let trans_pass: bool = (flags & F_TRANS) != 0 as u32
+    let pad: u64 = (*m).pad
+    let cls: u64 = (*m).mask + CLS_OFS as u64
+    let hrow: u64 = (*m).mask + HROW_OFS as u64
+    let mrow: u64 = (*m).mask + MROW_OFS as u64
+    let cmask: u64 = (*m).mask + CMASK_OFS as u64
+    let tab: u64 = (*m).mask + TAB_OFS as u64
+    let opq: u64 = (*t).opaque
+    let tiles: u64 = (*t).tiles
+
+    // ---- pass 1
+    var any_trans: bool = false
+    var partial: bool = false // some block of this pass has a tile on some faces only
+    var last_id: u32 = 65536 as u32
+    var last_cls: u8 = 0 as u8
+    var lid2: u32 = 65536 as u32
+    var ltm: u32 = 0 as u32
+    var y: usize = 0
+    while y < 18 {
+        var z: usize = 0
+        while z < 18 {
+            let rowp: usize = (y * 18 + z) * 18
+            let inner: bool = y >= 1 && y <= 16 && z >= 1 && z <= 16
+            var hb: u32 = 0 as u32
+            var mb: u32 = 0 as u32
+            var x: usize = 0
+            while x < 18 {
+                let id: u16 = rt.ld16(pad, rowp + x)
+                if (id as u32) != last_id {
+                    last_id = id as u32
+                    last_cls = 0 as u8
+                    if id == UNKNOWN_ID {
+                        last_cls = 2 as u8
+                    } else if id < 32768 as u16 {
+                        let fl: u8 = rt.ld8(opq, id as usize)
+                        if (fl & 1 as u8) != 0 as u8 { last_cls = 3 as u8 }
+                        if (fl & 2 as u8) != 0 as u8 {
+                            last_cls = last_cls | 4 as u8
+                            any_trans = true
+                        }
+                    }
+                }
+                rt.st8(cls, rowp + x, last_cls)
+                if (last_cls & 2 as u8) != 0 as u8 { hb = hb | (1 as u32 << (x as u32)) }
+                if inner && x >= 1 && x <= 16 && id < 32768 as u16 {
+                    if (id as u32) != lid2 {
+                        lid2 = id as u32
+                        ltm = 0 as u32
+                        // translucent blocks only in the translucent pass, the others only in the opaque pass
+                        if ((last_cls & 4 as u8) != 0 as u8) == trans_pass {
+                            var ff: usize = 0
+                            while ff < 6 {
+                                if rt.ld16(tiles, (id as usize) * 6 + ff) != 0 as u16 { ltm = ltm | (1 as u32 << (ff as u32)) }
+                                ff = ff + 1
+                            }
+                            if ltm != 0 as u32 && ltm != 63 as u32 { partial = true }
+                        }
+                    }
+                    if ltm != 0 as u32 { mb = mb | (1 as u32 << (x as u32)) }
+                }
+                x = x + 1
+            }
+            rt.st32(hrow, y * 18 + z, hb)
+            rt.st32(mrow, y * 18 + z, mb)
+            z = z + 1
+        }
+        y = y + 1
+    }
+    // the translucent pass of a section without any translucent block meshes nothing
+    if trans_pass && !any_trans { return }
+
+    // ---- pass 2
+    rt.mem_set(cmask, 0 as u8, 6 * 16 * 16 * 2)
+    let exact: bool = cull_same || trans_pass || partial
+    var nfaces: u32 = 0 as u32
+    y = 0
+    while y < 16 {
+        var z: usize = 0
+        while z < 16 {
+            let ri: usize = (y + 1) * 18 + (z + 1)
+            let mb: u32 = rt.ld32(mrow, ri)
+            if mb != 0 as u32 {
+                let hc: u32 = rt.ld32(hrow, ri)
+                // columns 1..16 -> bit 0..15
+                var c0: u32 = (mb & ((hc << 1 as u32) ^ 0x7FFFFFFF as u32)) >> 1 as u32
+                var c1: u32 = (mb & ((hc >> 1 as u32) ^ 0x7FFFFFFF as u32)) >> 1 as u32
+                var c2: u32 = 0 as u32
+                var c3: u32 = 0 as u32
+                var c4: u32 = 0 as u32
+                var c5: u32 = 0 as u32
+                c2 = (mb & (rt.ld32(hrow, ri - 18) ^ 0x7FFFFFFF as u32)) >> 1 as u32
+                c3 = (mb & (rt.ld32(hrow, ri + 18) ^ 0x7FFFFFFF as u32)) >> 1 as u32
+                c4 = (mb & (rt.ld32(hrow, ri - 1) ^ 0x7FFFFFFF as u32)) >> 1 as u32
+                c5 = (mb & (rt.ld32(hrow, ri + 1) ^ 0x7FFFFFFF as u32)) >> 1 as u32
+                c0 = c0 & 0xFFFF as u32
+                c1 = c1 & 0xFFFF as u32
+                c2 = c2 & 0xFFFF as u32
+                c3 = c3 & 0xFFFF as u32
+                c4 = c4 & 0xFFFF as u32
+                c5 = c5 & 0xFFFF as u32
+                let p0: usize = ((y + 1) * 18 + (z + 1)) * 18 + 1
+                // -x / +x: slice x, row z, column y
+                var f: usize = 0
+                while f < 2 {
+                    var c: u32 = c0
+                    if f == 1 { c = c1 }
+                    while c != 0 as u32 {
+                        let lb: u32 = c ^ (c & (c - 1 as u32))
+                        c = c ^ lb
+                        let x: usize = bit_index(tab, lb)
+                        if !exact || face_exact(m, t, p0 + x, f, cull_same, trans_pass) {
+                            let ci: usize = (f * 16 + x) * 16 + z
+                            rt.st16(cmask, ci, rt.ld16(cmask, ci) | (1 as u32 << (y as u32)) as u16)
+                            nfaces = nfaces + 1 as u32
+                        }
+                    }
+                    f = f + 1
+                }
+                // -y / +y: slice y, row x, column z
+                f = 2
+                while f < 4 {
+                    var c: u32 = c2
+                    if f == 3 { c = c3 }
+                    while c != 0 as u32 {
+                        let lb: u32 = c ^ (c & (c - 1 as u32))
+                        c = c ^ lb
+                        let x: usize = bit_index(tab, lb)
+                        if !exact || face_exact(m, t, p0 + x, f, cull_same, trans_pass) {
+                            let ci: usize = (f * 16 + y) * 16 + x
+                            rt.st16(cmask, ci, rt.ld16(cmask, ci) | (1 as u32 << (z as u32)) as u16)
+                            nfaces = nfaces + 1 as u32
+                        }
+                    }
+                    f = f + 1
+                }
+                // -z / +z: slice z, row y, column x = the row mask itself
+                f = 4
+                while f < 6 {
+                    var c: u32 = c4
+                    if f == 5 { c = c5 }
+                    if c != 0 as u32 {
+                        if exact {
+                            var rest: u32 = c
+                            while rest != 0 as u32 {
+                                let lb: u32 = rest ^ (rest & (rest - 1 as u32))
+                                rest = rest ^ lb
+                                if !face_exact(m, t, p0 + bit_index(tab, lb), f, cull_same, trans_pass) { c = c ^ lb }
+                            }
+                        }
+                        rt.st16(cmask, (f * 16 + z) * 16 + y, c as u16)
+                        nfaces = nfaces + popc16(c)
+                    }
+                    f = f + 1
+                }
+            }
+            z = z + 1
+        }
+        y = y + 1
+    }
+    (*m).nfaces = nfaces
+    if nfaces == 0 as u32 { return }
+
+    // ---- pass 3
     let strides: [usize; 3] = [1, 324, 18]
     var f: usize = 0
     while f < 6 {
@@ -359,101 +639,79 @@ fn mesh_run(m: *mut Mesher, t: *mut MeshTables, flags: u32) {
         let pos_face: bool = f % 2 == 1
         var s: usize = 0
         while s < 16 {
-            // ---- mask of the slice: key 0 = no face
-            var any: bool = false
+            let cb: usize = (f * 16 + s) * 16
+            var any: u32 = 0 as u32
             var j: usize = 0
             while j < 16 {
-                var i: usize = 0
-                while i < 16 {
-                    let p: usize = (s + 1) * sa + (i + 1) * su + (j + 1) * sv
-                    let a: u16 = rt.ld16((*m).pad, p)
-                    var key: u64 = 0 as u64
-                    if a < 32768 as u16 && is_trans(t, a) == trans_pass {
-                        var tile: u32 = rt.ld16((*t).tiles, (a as usize) * 6 + f) as u32
-                        if tile > MAX_TILE { tile = MAX_TILE }
-                        if tile != 0 as u32 {
-                            var fr: usize = p - sa
-                            if pos_face { fr = p + sa }
-                            let b: u16 = rt.ld16((*m).pad, fr)
-                            var hidden: bool = false
-                            if b == UNKNOWN_ID {
-                                hidden = true
-                            } else if is_opaque(t, b) {
-                                hidden = true
-                            } else if cull_same && b == a {
-                                hidden = true
-                            } else if trans_pass && is_trans(t, b) && (rt.ld16((*t).tiles, (b as usize) * 6 + f) as u32) == tile {
-                                hidden = true
-                            }
-                            if !hidden {
-                                // corner values: ao | sky << 2 | block << 6 (default: ao 3, sky 15, block 0)
-                                var cv0: u32 = 3 as u32 | (15 as u32 << 2 as u32)
-                                var cv1: u32 = cv0
-                                var cv2: u32 = cv0
-                                var cv3: u32 = cv0
-                                if use_ao {
-                                    let um: u32 = occludes(t, rt.ld16((*m).pad, fr - su))
-                                    let up: u32 = occludes(t, rt.ld16((*m).pad, fr + su))
-                                    let vm: u32 = occludes(t, rt.ld16((*m).pad, fr - sv))
-                                    let vp: u32 = occludes(t, rt.ld16((*m).pad, fr + sv))
-                                    let c00: u32 = occludes(t, rt.ld16((*m).pad, fr - su - sv))
-                                    let c10: u32 = occludes(t, rt.ld16((*m).pad, fr + su - sv))
-                                    let c11: u32 = occludes(t, rt.ld16((*m).pad, fr + su + sv))
-                                    let c01: u32 = occludes(t, rt.ld16((*m).pad, fr - su + sv))
-                                    cv0 = (cv0 & 0xFFFFFFFC as u32) | ao_level(um, vm, c00)
-                                    cv1 = (cv1 & 0xFFFFFFFC as u32) | ao_level(up, vm, c10)
-                                    cv2 = (cv2 & 0xFFFFFFFC as u32) | ao_level(up, vp, c11)
-                                    cv3 = (cv3 & 0xFFFFFFFC as u32) | ao_level(um, vp, c01)
-                                }
-                                if use_light {
-                                    // the 2x2 patch in front of the face per corner: (front, u side, v side, diagonal)
-                                    let l00: u32 = corner_light(m, t, fr, fr - su, fr - sv, fr - su - sv)
-                                    let l10: u32 = corner_light(m, t, fr, fr + su, fr - sv, fr + su - sv)
-                                    let l11: u32 = corner_light(m, t, fr, fr + su, fr + sv, fr + su + sv)
-                                    let l01: u32 = corner_light(m, t, fr, fr - su, fr + sv, fr - su + sv)
-                                    cv0 = (cv0 & 3 as u32) | l00
-                                    cv1 = (cv1 & 3 as u32) | l10
-                                    cv2 = (cv2 & 3 as u32) | l11
-                                    cv3 = (cv3 & 3 as u32) | l01
-                                }
-                                key = (tile as u64) | ((cv0 as u64) << 16 as u64) | ((cv1 as u64) << 26 as u64) |
-                                ((cv2 as u64) << 36 as u64) | ((cv3 as u64) << 46 as u64) | (1 as u64 << 56 as u64)
-                                (*m).nfaces = (*m).nfaces + 1 as u32
-                                any = true
-                            }
-                        }
-                    }
-                    rt.st64((*m).mask, j * 16 + i, key)
-                    i = i + 1
-                }
+                any = any | (rt.ld16(cmask, cb + j) as u32)
                 j = j + 1
             }
-            if any {
+            if any != 0 as u32 {
                 var pc: usize = s
                 if pos_face { pc = s + 1 }
-                j = 0
-                while j < 16 {
-                    var i: usize = 0
-                    while i < 16 {
-                        let key: u64 = rt.ld64((*m).mask, j * 16 + i)
-                        if key == 0 as u64 {
-                            i = i + 1
-                        } else {
+                if !greedy {
+                    // every face is one 1x1 quad
+                    j = 0
+                    while j < 16 {
+                        var c: u32 = rt.ld16(cmask, cb + j) as u32
+                        while c != 0 as u32 {
+                            let lb: u32 = c ^ (c & (c - 1 as u32))
+                            c = c ^ lb
+                            let i: usize = bit_index(tab, lb)
+                            let p: usize = (s + 1) * sa + (i + 1) * su + (j + 1) * sv
+                            var fr: usize = p - sa
+                            if pos_face { fr = p + sa }
+                            let key: u64 = face_key(m, t, p, f, fr, su, sv, use_ao, use_light)
+                            emit_quad(m, f, pc, i, j, 1, 1, (key & 65535 as u64) as u32,
+                                ((key >> 16 as u64) & 1023 as u64) as u32, ((key >> 26 as u64) & 1023 as u64) as u32,
+                                ((key >> 36 as u64) & 1023 as u64) as u32, ((key >> 46 as u64) & 1023 as u64) as u32)
+                        }
+                        j = j + 1
+                    }
+                } else {
+                    // keys of the slice cells that have a face (no clearing: the row bits in cmask say which keys are valid)
+                    j = 0
+                    while j < 16 {
+                        var c: u32 = rt.ld16(cmask, cb + j) as u32
+                        while c != 0 as u32 {
+                            let lb: u32 = c ^ (c & (c - 1 as u32))
+                            c = c ^ lb
+                            let i: usize = bit_index(tab, lb)
+                            let p: usize = (s + 1) * sa + (i + 1) * su + (j + 1) * sv
+                            var fr: usize = p - sa
+                            if pos_face { fr = p + sa }
+                            rt.st64((*m).mask, j * 16 + i, face_key(m, t, p, f, fr, su, sv, use_ao, use_light))
+                        }
+                        j = j + 1
+                    }
+                    // merge: walk the remaining face bits of every row (lowest first = same order as a 16 x 16 scan);
+                    // a merged rectangle clears its bits in cmask
+                    j = 0
+                    while j < 16 {
+                        var rowbits: u32 = rt.ld16(cmask, cb + j) as u32
+                        while rowbits != 0 as u32 {
+                            let lb: u32 = rowbits ^ (rowbits & (rowbits - 1 as u32))
+                            let i: usize = bit_index(tab, lb)
+                            let key: u64 = rt.ld64((*m).mask, j * 16 + i)
                             let ao0: u32 = ((key >> 16 as u64) & 1023 as u64) as u32
                             let ao1: u32 = ((key >> 26 as u64) & 1023 as u64) as u32
                             let ao2: u32 = ((key >> 36 as u64) & 1023 as u64) as u32
                             let ao3: u32 = ((key >> 46 as u64) & 1023 as u64) as u32
                             var w: usize = 1
                             var h: usize = 1
-                            if greedy {
-                                if ao0 == ao1 && ao3 == ao2 {
-                                    while i + w < 16 && rt.ld64((*m).mask, j * 16 + i + w) == key {
-                                        w = w + 1
-                                    }
+                            if ao0 == ao1 && ao3 == ao2 {
+                                while i + w < 16 && ((rowbits >> ((i + w) as u32)) & 1 as u32) != 0 as u32 &&
+                                    rt.ld64((*m).mask, j * 16 + i + w) == key {
+                                    w = w + 1
                                 }
-                                if ao0 == ao3 && ao1 == ao2 {
-                                    var grow: bool = true
-                                    while grow && j + h < 16 {
+                            }
+                            let wm: u32 = (((1 as u32) << (w as u32)) - 1 as u32) << (i as u32)
+                            if ao0 == ao3 && ao1 == ao2 {
+                                var grow: bool = true
+                                while grow && j + h < 16 {
+                                    if (((rt.ld16(cmask, cb + j + h) as u32) & wm) != wm) {
+                                        grow = false
+                                    } else {
                                         var q: usize = 0
                                         while q < w {
                                             if rt.ld64((*m).mask, (j + h) * 16 + i + q) != key { grow = false }
@@ -462,22 +720,18 @@ fn mesh_run(m: *mut Mesher, t: *mut MeshTables, flags: u32) {
                                         if grow { h = h + 1 }
                                     }
                                 }
-                                // clear the rectangle
-                                var rj: usize = 0
-                                while rj < h {
-                                    var ri: usize = 0
-                                    while ri < w {
-                                        rt.st64((*m).mask, (j + rj) * 16 + i + ri, 0 as u64)
-                                        ri = ri + 1
-                                    }
-                                    rj = rj + 1
-                                }
+                            }
+                            // clear the rectangle
+                            var rj: usize = 0
+                            while rj < h {
+                                rt.st16(cmask, cb + j + rj, ((rt.ld16(cmask, cb + j + rj) as u32) & (wm ^ 0xFFFF as u32)) as u16)
+                                rj = rj + 1
                             }
                             emit_quad(m, f, pc, i, j, w, h, (key & 65535 as u64) as u32, ao0, ao1, ao2, ao3)
-                            i = i + w
+                            rowbits = rt.ld16(cmask, cb + j) as u32
                         }
+                        j = j + 1
                     }
-                    j = j + 1
                 }
             }
             s = s + 1

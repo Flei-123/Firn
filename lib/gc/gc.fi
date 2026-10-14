@@ -364,6 +364,10 @@ const S_VDSO: u64 = 2336
 // Both words 0 = the default 1/1 (see `gc_set_growth`).
 const S_GROWN: u64 = 2344
 const S_GROWD: u64 = 2352
+// r566: the last gap between two chunks that a lookup found empty: [S_GAPLO,
+// S_GAPHI). Both 0 = none. Reset whenever a chunk enters or leaves the index.
+const S_GAPLO: u64 = 2360
+const S_GAPHI: u64 = 2368
 
 // The state word of a block header (see the comment at the top).
 const M_MARK: u32 = 3
@@ -1137,12 +1141,12 @@ fn __gc_idx_grow() -> bool {
 // The first position whose entry is >= a (binary search).
 fn __gc_idx_pos(a: u64) -> u64 {
     let st: u64 = __gc_state() as u64
-    let base: u64 = __gc_ld64(st + S_IDXP)
+    let base: u64 = (*((st + S_IDXP) as *mut u64))
     var lo: u64 = 0
-    var hi: u64 = __gc_ld64(st + S_IDXN)
+    var hi: u64 = (*((st + S_IDXN) as *mut u64))
     while lo < hi {
         let mid: u64 = lo + (hi - lo) / 2
-        if __gc_ld64(base + mid * 8) < a {
+        if (*((base + mid * 8) as *mut u64)) < a {
             lo = mid + 1
         } else {
             hi = mid
@@ -1153,6 +1157,9 @@ fn __gc_idx_pos(a: u64) -> u64 {
 
 fn __gc_idx_add(c: u64) {
     let st: u64 = __gc_state() as u64
+    *((st +% S_GAPLO) as *mut u64) = 0
+    *((st +% S_GAPHI) as *mut u64) = 0
+    __gc_gap_clear()
     if __gc_ld64(st + S_IDXBAD) != 0 {
         return
     }
@@ -1175,6 +1182,9 @@ fn __gc_idx_add(c: u64) {
 
 fn __gc_idx_del(c: u64) {
     let st: u64 = __gc_state() as u64
+    *((st +% S_GAPLO) as *mut u64) = 0
+    *((st +% S_GAPHI) as *mut u64) = 0
+    __gc_gap_clear()
     if __gc_ld64(st + S_IDXBAD) != 0 {
         return
     }
@@ -1202,30 +1212,34 @@ fn __gc_idx_del(c: u64) {
 // checked the heap bounds.
 fn __gc_idx_chunk(a: u64) -> u64 {
     let st: u64 = __gc_state() as u64
-    let base: u64 = __gc_ld64(st + S_IDXP)
-    let n: u64 = __gc_ld64(st + S_IDXN)
+    let base: u64 = (*((st + S_IDXP) as *mut u64))
+    let n: u64 = (*((st + S_IDXN) as *mut u64))
     if base == 0 || n == 0 {
         return 0
     }
-    var k: u64 = __gc_idx_pos(a)
-    if k >= n {
-        k = n - 1
-    } else {
-        if __gc_ld64(base + k * 8) > a {
-            if k == 0 {
-                return 0
-            }
-            k = k - 1
+    let k: u64 = __gc_idx_pos(a)
+    // r566: no chunk holds `a`: remember the whole gap around it. The words of
+    // a root area (Vec buffers) mostly point into non-GC memory that lies
+    // between the chunks, so the next lookups land in the same gap.
+    var next: u64 = 18446744073709551615
+    if k < n {
+        next = (*((base + k * 8) as *mut u64))
+        if next == a {
+            return next
         }
     }
-    let c: u64 = __gc_ld64(base + k * 8)
-    if a < c {
-        return 0
+    var gap_lo: u64 = 0
+    if k > 0 {
+        let c: u64 = (*((base + (k - 1) * 8) as *mut u64))
+        let end: u64 = c + (*((c + 8) as *mut u64))
+        if a < end {
+            return c
+        }
+        gap_lo = end
     }
-    if a >= c + __gc_ld64(c + 8) {
-        return 0
-    }
-    return c
+    *((st +% S_GAPLO) as *mut u64) = gap_lo
+    *((st +% S_GAPHI) as *mut u64) = next
+    return 0
 }
 
 // ROUND TK2 (Certus): the table of the block-of cache, made on first use.
@@ -1236,7 +1250,7 @@ fn __gc_bocache() -> u64 {
     if t != 0 {
         return t
     }
-    let p: u64 = __gc_mmap(BOCACHE_N * 8)
+    let p: u64 = __gc_mmap(BOCACHE_N * 24)
     if p == 0 {
         __gc_st64(st + S_BOCACHE, 1)
         return 1
@@ -1246,6 +1260,21 @@ fn __gc_bocache() -> u64 {
 }
 
 // A chunk is about to be unmapped: no slot may name it any more.
+// r566: the gap table (second and third part of the block-of table) forgets
+// everything -- a chunk entered or left the index, so a remembered gap may
+// have a chunk in it now.
+fn __gc_gap_clear() {
+    let t: u64 = __gc_ld64(__gc_state() as u64 + S_BOCACHE)
+    if t <= 1 {
+        return
+    }
+    var i: u64 = BOCACHE_N
+    while i < BOCACHE_N * 3 {
+        *((t +% i * 8) as *mut u64) = 0
+        i = i + 1
+    }
+}
+
 fn __gc_bocache_drop(c: u64) {
     let t: u64 = __gc_ld64(__gc_state() as u64 + S_BOCACHE)
     if t <= 1 {
@@ -1273,17 +1302,21 @@ fn __gc_block_of(a: u64) -> u64 {
     if a >= *((st +% S_HEAPHI) as *mut u64) {
         return 0
     }
-    let cc: u64 = __gc_ld64(st + S_CHUNK_CACHE)
+    let cc: u64 = (*((st + S_CHUNK_CACHE) as *mut u64))
     if cc != 0 {
         let data0: u64 = cc + CHUNK_HEADER
-        let end0: u64 = data0 + __gc_ld64(cc + 16) * __gc_ld64(cc + 24)
+        let end0: u64 = data0 + (*((cc + 16) as *mut u64)) * (*((cc + 24) as *mut u64))
         if a >= data0 && a < end0 {
-            return data0 + (a - data0) / __gc_ld64(cc + 16) * __gc_ld64(cc + 16)
+            return data0 + (a - data0) / (*((cc + 16) as *mut u64)) * (*((cc + 16) as *mut u64))
         }
+    }
+    // r566: inside the last gap found empty -- no chunk, out in four instructions.
+    if a >= (*((st + S_GAPLO) as *mut u64)) && a < (*((st + S_GAPHI) as *mut u64)) {
+        return 0
     }
     // CERTUS ROUND M1: binary search in the address index instead of a walk
     // over all chunks.
-    if __gc_ld64(st + S_IDXBAD) == 0 {
+    if (*((st + S_IDXBAD) as *mut u64)) == 0 {
         // ROUND TK2 (Certus): first the direct-mapped cache, one slot per
         // 256 KiB granule of the address (mod BOCACHE_N) holding the chunk
         // found there last. MEASURED (callgrind, one github.com load):
@@ -1294,51 +1327,59 @@ fn __gc_block_of(a: u64) -> u64 {
         // the one-entry cache (another chunk can share the granule), and
         // a released chunk leaves every slot before its munmap
         // (__gc_bocache_drop), so a slot never names unmapped memory.
-        var bt: u64 = __gc_ld64(st + S_BOCACHE)
+        var bt: u64 = (*((st + S_BOCACHE) as *mut u64))
         if bt == 0 {
             bt = __gc_bocache()
         }
         var slot: u64 = 0
         if bt > 1 {
             slot = bt + ((a >> 18) & (BOCACHE_N - 1)) * 8
-            let c2: u64 = __gc_ld64(slot)
+            let c2: u64 = (*((slot) as *mut u64))
             if c2 != 0 {
                 let data2: u64 = c2 + CHUNK_HEADER
-                let block2: u64 = __gc_ld64(c2 + 16)
-                if a >= data2 && a < data2 + block2 * __gc_ld64(c2 + 24) {
-                    __gc_st64(st + S_CHUNK_CACHE, c2)
+                let block2: u64 = (*((c2 + 16) as *mut u64))
+                if a >= data2 && a < data2 + block2 * (*((c2 + 24) as *mut u64)) {
+                    *((st + S_CHUNK_CACHE) as *mut u64) = c2
                     return data2 + (a - data2) / block2 * block2
                 }
+            }
+            // r566: the gap remembered for this granule -- no chunk in it.
+            if a >= (*((slot + BOCACHE_N * 8) as *mut u64)) && a < (*((slot + BOCACHE_N * 16) as *mut u64)) {
+                return 0
             }
         }
         let ci: u64 = __gc_idx_chunk(a)
         if ci == 0 {
+            if slot != 0 {
+                *((slot + BOCACHE_N * 8) as *mut u64) = (*((st + S_GAPLO) as *mut u64))
+                *((slot + BOCACHE_N * 16) as *mut u64) = (*((st + S_GAPHI) as *mut u64))
+            }
             return 0
         }
         let datai: u64 = ci + CHUNK_HEADER
-        let blocki: u64 = __gc_ld64(ci + 16)
-        let endi: u64 = datai + blocki * __gc_ld64(ci + 24)
+        let blocki: u64 = (*((ci + 16) as *mut u64))
+        let endi: u64 = datai + blocki * (*((ci + 24) as *mut u64))
         if a >= datai && a < endi {
-            __gc_st64(st + S_CHUNK_CACHE, ci)
+            *((st + S_CHUNK_CACHE) as *mut u64) = ci
             if slot != 0 {
-                __gc_st64(slot, ci)
+                *((slot) as *mut u64) = ci
             }
             return datai + (a - datai) / blocki * blocki
         }
         return 0
     }
-    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    var c: u64 = (*((st + S_CHUNKS) as *mut u64))
     while c != 0 {
         let data: u64 = c + CHUNK_HEADER
-        let block: u64 = __gc_ld64(c + 16)
-        let count: u64 = __gc_ld64(c + 24)
+        let block: u64 = (*((c + 16) as *mut u64))
+        let count: u64 = (*((c + 24) as *mut u64))
         let end: u64 = data + block * count
         if a >= data && a < end {
-            __gc_st64(st + S_CHUNK_CACHE, c)
+            *((st + S_CHUNK_CACHE) as *mut u64) = c
             let idx: u64 = (a - data) / block
             return data + idx * block
         }
-        c = __gc_ld64(c)
+        c = (*((c) as *mut u64))
     }
     return 0
 }
@@ -1396,15 +1437,15 @@ fn __gc_chunk_of(a: u64) -> u64 {
 
 fn __gc_mark_push(obj: u64) {
     let st: u64 = __gc_state() as u64
-    let len: u64 = __gc_ld64(st + S_MLEN)
-    let cap: u64 = __gc_ld64(st + S_MKAP)
+    let len: u64 = (*((st + S_MLEN) as *mut u64))
+    let cap: u64 = (*((st + S_MKAP) as *mut u64))
     if len >= cap {
-        __gc_st64(st + S_OVERFLOW, 1)
-        __gc_st64(st + S_NOV, __gc_ld64(st + S_NOV) + 1)
+        *((st + S_OVERFLOW) as *mut u64) = 1
+        *((st + S_NOV) as *mut u64) = (*((st + S_NOV) as *mut u64)) + 1
         return
     }
-    __gc_st64(__gc_ld64(st + S_MSTACK) + len * 8, obj)
-    __gc_st64(st + S_MLEN, len + 1)
+    *(((*((st + S_MSTACK) as *mut u64)) + len * 8) as *mut u64) = obj
+    *((st + S_MLEN) as *mut u64) = len + 1
 }
 
 // Mark a candidate (an interior pointer too).
@@ -1416,16 +1457,16 @@ fn __gc_mark(a: u64) {
     if b == 0 {
         return
     }
-    if __gc_ld32(b) == 0 {
+    if (*((b) as *mut u32)) == 0 {
         return
     }
     let st: u64 = __gc_state() as u64
     // Round 47: the mark is only the lowest two bits now.
-    let zw: u32 = __gc_ld32(b + 4)
-    if (zw & M_MARK) != __gc_ld64(st + S_PAR) as u32 {
+    let zw: u32 = (*((b + 4) as *mut u32))
+    if (zw & M_MARK) != (*((st + S_PAR) as *mut u64)) as u32 {
         return
     }
-    __gc_st32(b + 4, (zw & M_WITHOUT_MARK) | 1)
+    *((b + 4) as *mut u32) = (zw & M_WITHOUT_MARK) | 1
     __gc_mark_push(b + HEADER)
 }
 
@@ -1579,10 +1620,30 @@ fn __gc_scan(lo: u64, hi: u64) {
     var a: u64 = (lo + 7) / 8 * 8
     if hi > a {
         let stp: u64 = __gc_state() as u64
-        __gc_st64(stp + S_SCANW, __gc_ld64(stp + S_SCANW) + (hi - a) / 8)
+        *((stp + S_SCANW) as *mut u64) = (*((stp + S_SCANW) as *mut u64)) + (hi - a) / 8
     }
+    // r563: a word outside the heap bounds can never name a block, so it is
+    // rejected here with two compares and no call. Most words of a root area
+    // (Vec buffers: lengths, zero tails, pointers to non-GC memory) are such
+    // words. The bounds only change when a chunk is added, which cannot
+    // happen while this loop runs (marking allocates nothing).
+    let stb: u64 = __gc_state() as u64
+    let hlo: u64 = *((stb +% S_HEAPLO) as *mut u64)
+    let hhi: u64 = *((stb +% S_HEAPHI) as *mut u64)
+    // r566: most words in the heap bounds point into non-GC memory between the
+    // chunks. The gap the last lookup found empty is checked here, before the
+    // calls (reloaded after each mark: a lookup may remember a new gap).
+    var gap_lo: u64 = *((stb +% S_GAPLO) as *mut u64)
+    var gap_hi: u64 = *((stb +% S_GAPHI) as *mut u64)
     while a + 8 <= hi {
-        __gc_mark(__gc_ld64(a))
+        let v: u64 = *(a as *mut u64)
+        if v >= hlo && v < hhi {
+            if v < gap_lo || v >= gap_hi {
+                __gc_mark(v)
+                gap_lo = *((stb +% S_GAPLO) as *mut u64)
+                gap_hi = *((stb +% S_GAPHI) as *mut u64)
+            }
+        }
         a = a + 8
     }
 }
@@ -4220,6 +4281,9 @@ const SYS_FUTEX: i64 = 202
 const SYS_NANOSLEEP: i64 = 35
 const ARCH_SET_FS: i64 = 4098
 const ARCH_GET_FS: i64 = 4099
+// Compiler-translated request (compiler/src/lower.rs retarget_thread_base): the thread block base of the calling
+// thread as THIS target keeps it (`gs` in an x86-64 `.so`, a TLS slot in a DLL); the aarch64 `.so` looks the block up by stack range and answers entry 0 for a thread without one (r571).
+const ARCH_GET_TCB: i64 = 7937
 // FUTEX_WAIT/FUTEX_WAKE, each with FUTEX_PRIVATE_FLAG (128): the futex
 // belongs to this process only, and the kernel saves itself the mapping onto
 // a global key object.
@@ -4619,13 +4683,23 @@ fn __gc_threads_scan() {
             if z != Z_DEAD {
                 let sp: u64 = __gc_ld64(t + FT_SP)
                 let bottom: u64 = __gc_ld64(t + FT_BOTTOM)
-                if sp != 0 && bottom > sp {
+                // A host thread that ended without `thread_host_detach` leaves its entry behind and the host
+                // frees the stack: scanning that range would fault. madvise(MADV_NORMAL) says ENOMEM for it.
+                if sp != 0 && bottom > sp && (__gc_ld64(t + FT_HOST) != 1 || __thread_stack_mapped(sp, bottom)) {
                     __gc_scan(sp, bottom)
                 }
             }
         }
         i = i + 1
     }
+}
+
+// Is [sp, bottom) still mapped? Only an explicit ENOMEM (-12) says no; a target without madvise answers
+// something else (Windows seam: ENOSYS) and counts as mapped.
+fn __thread_stack_mapped(sp: u64, bottom: u64) -> bool {
+    let lo: u64 = sp - sp % 4096
+    let r: i64 = syscall(28, lo as i64, (bottom - lo) as i64, 0, 0, 0, 0)
+    return r != 0 - 12
 }
 
 // -------------------------------------------------------- The thread table
@@ -4856,14 +4930,35 @@ fn thread_attach() -> bool {
     __thread_lock_plain(st + S_TSPERRE)
     let hi: u64 = __gc_ld64(st + S_THREAD_HI)
     var i: u64 = 0
+    var stale: u64 = 0
     while i < hi {
         let t: u64 = tab + i * FT_BYTES
         let z: u64 = __gc_ld64(t + FT_STATE)
+        // r571: a host thread that ended without `thread_host_detach` leaves its entry behind, and a new thread may get
+        // the same stack (and a new id). An aarch64 `.so` finds a block by stack range, so that entry would shadow the
+        // new one. Live threads never share a stack: an entry of ANOTHER id that holds our `sp` is stale.
+        if z != Z_FREE && z != Z_DEAD && i > 0 && __gc_ld64(t + FT_HOST) == 1 && __gc_ld32(t + FT_TID) as u64 != tid {
+            let lo: u64 = __gc_ld64(t + FT_LO)
+            if lo != 0 && sp >= lo && sp < __gc_ld64(t + FT_BOTTOM) {
+                stale = t
+            }
+        }
         if z != Z_FREE && z != Z_DEAD && __gc_ld32(t + FT_TID) as u64 == tid {
             __thread_unlock(st + S_TSPERRE)
-            return true
+            if __thread_known() || __gc_ld64(t + FT_HOST) != 1 {
+                return true
+            }
+            // Same thread id but this thread has no thread block: the entry belongs to a host thread that ended
+            // without `thread_host_detach` and whose id was reused. Recycle it and register this thread afresh.
+            __thread_recycle_host(t)
+            return thread_attach()
         }
         i = i + 1
+    }
+    if stale != 0 {
+        __thread_unlock(st + S_TSPERRE)
+        __thread_recycle_host(stale)
+        return thread_attach()
     }
     var bottom: u64 = __gc_stack_bottom_maps(sp)
     if bottom == 0 || bottom <= sp {
@@ -4917,6 +5012,79 @@ fn thread_attach() -> bool {
     syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, tcb as i64, 0, 0, 0, 0)
     __thread_unlock(st + S_TSPERRE)
     return true
+}
+
+// Does the calling thread have a thread block of its own? (r571: answered on every target, aarch64 `.so` included.)
+fn __thread_known() -> bool {
+    var v: u64 = 0
+    let r: i64 = syscall(SYS_ARCH_PRCTL, ARCH_GET_TCB, (&v) as u64 as i64, 0, 0, 0, 0)
+    if v == 0 {
+        return false
+    }
+    // The Windows seam answers 1 (a TLS slot, never inherited).
+    if r == 1 {
+        return true
+    }
+    // aarch64 `.so`: the block is found by stack range and a thread without one gets entry 0 (the main thread's); on
+    // x86-64 fs/gs is INHERITED by a new thread. Both are caught by the id check below.
+    // (x86-64: clone without CLONE_SETTLS for gs): a pthread created by an attached
+    // thread starts with its creator's block. The block is its own only when it carries this thread's id.
+    return __gc_ld32(v + FT_TID) as u64 == __thread_gettid()
+}
+
+// Entry of a host thread that vanished without `thread_host_detach` (called with a stale entry, not the caller's own).
+fn __thread_recycle_host(t: u64) {
+    let st: u64 = __gc_state() as u64
+    __thread_lists_back(t)
+    __gc_st64(t + FT_RES, 0)
+    __gc_st64(t + FT_HOST, 0)
+    __gc_st64(t + FT_LO, 0)
+    __gc_st64(t + FT_TID, 0)
+    __gc_st64(t + FT_DETACH, 1)
+    __gc_st64(t + FT_STATE, Z_DEAD)
+    __atomic_add((st + S_THREAD_N) as *mut u64, THREAD_MINUS1)
+}
+
+// Entry guard of every `#[export_c]` function of a shared object (the compiler inserts it, compiler/src/lower.rs):
+// a host thread that never called `thread_attach` is registered here instead of crashing on its first runtime
+// access. Returns 0 = nothing to do (runtime not started yet, or the thread has a block), 1 = attached just now
+// and running; the export's exit then calls `thread_host_guard_end(1)`, which puts the thread back into host mode.
+// Such a thread has no `thread_host_detach`: its entry is recycled when its thread id shows up again, or call the
+// export that wraps `thread_host_detach` before the thread ends. Table full: aborts (code 71).
+fn thread_host_guard() -> u64 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_THREAD_TAB) == 0 {
+        return 0
+    }
+    if __thread_known() {
+        // An attached host thread that sits in host mode (BLOCKED) runs Firn code now: it must count as running for the
+        // whole export, on EVERY call (not only the one that attached it). Nested exports and threads the host
+        // brackets itself find it running already: token 0.
+        let me: u64 = __thread_tcb()
+        if me != 0 && __gc_ld64(me + FT_HOST) == 1 && __gc_ld64(me + FT_STATE) == Z_BLOCKED {
+            __thread_blocked_out()
+            return 1
+        }
+        return 0
+    }
+    if !thread_attach() {
+        var m: [u8; 40] = "firn: host thread could not be attached\n"
+        syscall(GC_SYS_WRITE, 2, (&m) as u64 as i64, 40, 0, 0, 0)
+        syscall(GC_SYS_EXIT_GROUP, 71, 0, 0, 0, 0, 0)
+    }
+    __thread_blocked_out()
+    return 1
+}
+
+fn thread_host_guard_end(t: u64) {
+    if t == 0 {
+        return
+    }
+    // The export may have detached the thread (`thread_host_detach`): no block, nothing to report.
+    if !__thread_known() {
+        return
+    }
+    __thread_blocked_an()
 }
 
 // The calling host thread leaves the runtime for good (call it before the thread ends). Its free

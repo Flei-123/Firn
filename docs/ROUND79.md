@@ -226,7 +226,7 @@ in the frame, and the frame is gone at the `return`. That is gap 9 of round
 the tree calls the function; it is exported, so anything outside the tree
 could have. It now copies into a buffer the caller owns
 (`fn nbt_type_name(t: u8, out: *mut u8, cap: usize) -> usize`), and
-`tests/1610_nbt_type_name.fi` checks all fourteen names, the length, the
+`tests/3201_nbt_type_name.fi` checks all fourteen names, the length, the
 terminating null octet and the cutting off. This is the one place where the
 answer was a signature change and not an `#[allow_escape]`.
 
@@ -280,7 +280,7 @@ lifetimes. It stays open and it stays named.
 ALREADY CLOSED, by round 68.** Round 66 reported it as open because that
 round deliberately did not touch the compiler; round 68 built function values
 in a struct field (`tools/fnfield/run.sh`, section 27 of `test.sh`) and
-thereby answered it without knowing. `tests/1613_fnfield_through_a_pointer.fi`
+thereby answered it without knowing. `tests/3203_fnfield_through_a_pointer.fi`
 is the shape round 66 named, character for character —
 `(*c).gen_start(r, f, env)` — so that this paragraph is a measurement and not
 an assertion. It compiles, it runs, the field can be exchanged and the call

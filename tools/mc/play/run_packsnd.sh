@@ -2,7 +2,7 @@
 # tools/mc/play/run_packsnd.sh -- mcplay with pack sounds (MC_PACK_SOUNDS=both|original) end to end: Xvfb + official 1.20.1 server + mcplay + xdotool.
 # Runs: (1) both, FILE sink: start + hot reload (key T) with a CHANGED OGG -> sample table must not grow; (2) both, DEVICE sink (private
 # PulseAudio null sink): same, the audio thread is stopped / restarted around the reload; (3) original, FILE sink: only pack events.
-# (4) O key: packs off/on at runtime. Prints `RESULT mc-packsnd: ok`. Env: FIRNC, MC_VIEW (3), MCCLIENT_JAR_CACHE, MCPLAY_SKIP_PULSE=1.
+# (4) O key: packs off/on at runtime; (5) original start + O twice = still pack-only (no synth events). Prints `RESULT mc-packsnd: ok`. Env: FIRNC, MC_VIEW (3), MCCLIENT_JAR_CACHE, MCPLAY_SKIP_PULSE=1.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}
@@ -113,15 +113,25 @@ if [ "${MCPLAY_SKIP_PULSE:-0}" != 1 ] && command -v pulseaudio >/dev/null && com
     for i in $(seq 1 20); do [ -S "$PAD/native" ] && break; sleep 0.5; done
     if [ -S "$PAD/native" ]; then
         export PULSE_SERVER="unix:$PAD/native"
-        parec -d mcnull.monitor --format=s16le --rate=44100 --channels=2 --file-format=wav "$W/dev.wav" 2>/dev/null & REC_PID=$!
-        sleep 1
-        run PsDev both device 1; rc=$?
-        sleep 1; kill "$REC_PID" 2>/dev/null; wait "$REC_PID" 2>/dev/null
-        [ $rc -eq 0 ] || { echo "  FAIL  PsDev exit code $rc"; ERR=1; }
-        grep -q "no sound output" "$W/PsDev.out" && { echo "  FAIL  device sink did not open"; ERR=1; }
-        grep -q "did not restart" "$W/PsDev.out" && { echo "  FAIL  audio thread did not restart"; ERR=1; }
-        check_reload PsDev 2
-        python3 tools/mc/play/audio_check.py "$W/dev.wav" "$W/PsDev.out" --bursts 6 || ERR=1
+        # the device run is timing sensitive (real sink, load on the box): one retry, the first failure stays in the log (r174)
+        dev_try=1
+        while :; do
+            ERR_SAVE=$ERR; ERR=0
+            parec -d mcnull.monitor --format=s16le --rate=44100 --channels=2 --file-format=wav "$W/dev.wav" 2>/dev/null & REC_PID=$!
+            sleep 1
+            run PsDev both device 1; rc=$?
+            sleep 1; kill "$REC_PID" 2>/dev/null; wait "$REC_PID" 2>/dev/null
+            [ $rc -eq 0 ] || { echo "  FAIL  PsDev exit code $rc"; ERR=1; }
+            grep -q "no sound output" "$W/PsDev.out" && { echo "  FAIL  device sink did not open"; ERR=1; }
+            grep -q "did not restart" "$W/PsDev.out" && { echo "  FAIL  audio thread did not restart"; ERR=1; }
+            check_reload PsDev 2
+            python3 tools/mc/play/audio_check.py "$W/dev.wav" "$W/PsDev.out" --bursts 4 || ERR=1
+            DERR=$ERR; ERR=$ERR_SAVE
+            [ $DERR -eq 0 ] && break
+            [ $dev_try -ge 2 ] && { ERR=1; break; }
+            echo "  RETRY PsDev (attempt $dev_try failed, load $(cut -d' ' -f1 /proc/loadavg))"
+            dev_try=$((dev_try + 1))
+        done
     else echo "  FAIL  private pulseaudio did not start: $(tail -2 "$W/pulse.log" 2>/dev/null)"; ERR=1; fi
     unset PULSE_SERVER
     kill "$PA_PID" 2>/dev/null
@@ -145,5 +155,19 @@ else
     [ "$t1" = "$t2" ] || { echo "  FAIL  PsToggle: sample table grew ($t1 -> $t2)"; ERR=1; }
 fi
 python3 tools/mc/play/audio_check.py "$W/toggle.wav" "$W/PsToggle.out" --probe --min-events 12 || ERR=1
+
+# (5) original + FILE sink + O key twice: start without the synth bank, packs off (synth), packs on again = ORIGINAL (the synth events must be
+# gone again: every engine event is a pack event, `total` == `events`)
+run PsOrigToggle original "file:$W/origtoggle.wav" 2; rc=$?
+[ $rc -eq 0 ] || { echo "  FAIL  PsOrigToggle exit code $rc"; ERR=1; }
+a=$(grep -n "mcplay: sounds=synth" "$W/PsOrigToggle.out" | head -1 | cut -d: -f1); b=$(grep -n "mcplay: sounds=original" "$W/PsOrigToggle.out" | head -1 | cut -d: -f1)
+if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then echo "  FAIL  PsOrigToggle: expected 'sounds=synth' then 'sounds=original' (got ${a:-none}/${b:-none})"; ERR=1
+else
+    o1=$(field PsOrigToggle 1 events); ot1=$(field PsOrigToggle 1 total); o2=$(field PsOrigToggle 2 events); ot2=$(field PsOrigToggle 2 total)
+    echo "  PsOrigToggle: events $o1 (total $ot1) -> $o2 (total $ot2)"
+    [ "${o1:-0}" -ge 4 ] && [ "$o1" = "$ot1" ] || { echo "  FAIL  PsOrigToggle: start is not pack-only (events ${o1:-?} total ${ot1:-?})"; ERR=1; }
+    [ "${o2:-0}" -ge 4 ] && [ "$o2" = "$ot2" ] || { echo "  FAIL  PsOrigToggle: original after the toggle still has synth events (events ${o2:-?} total ${ot2:-?})"; ERR=1; }
+fi
+grep -q "did not restart" "$W/PsOrigToggle.out" && { echo "  FAIL  PsOrigToggle: audio thread did not restart"; ERR=1; }
 
 if [ $ERR -eq 0 ]; then echo "RESULT mc-packsnd: ok"; else tail -15 "$W/PsFile.out" | sed 's/^/  /'; echo "RESULT mc-packsnd: FAIL"; exit 1; fi

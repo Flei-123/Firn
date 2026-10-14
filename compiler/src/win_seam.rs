@@ -178,6 +178,8 @@ extern fn SystemFunction036(buf: u64, n: i64) -> i32;
 // ROUND WIN-THREADS: the thread runtime's futex and thread block pointer.
 extern fn TlsAlloc() -> i32;
 extern fn TlsSetValue(i: i64, v: i64) -> i32;
+extern fn TlsGetValue(i: i64) -> i64;
+extern fn VirtualQuery(a: u64, b: u64, c: u64) -> u64;
 extern fn WaitOnAddress(a: u64, cmp: u64, n: i64, ms: i64) -> i32;
 extern fn WakeByAddressSingle(a: u64);
 extern fn WakeByAddressAll(a: u64);
@@ -1293,6 +1295,32 @@ fn __win_scratch_call(nr: i64) -> bool {
 }
 
 fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) -> i64 {
+    if nr == 28 {
+        // madvise(addr, len, MADV_NORMAL) as the collector's "is this range still mapped" probe (r506: the stack of a host
+        // thread that ended without detaching). r576: walk EVERY region of [addr, addr+len) -- the old probe looked at the
+        // first and the last page only and took "committed" for "mapped", so a range that the host had meanwhile given to
+        // something else (reserved, no-access or guard pages, or free in the middle) passed and the scan faulted.
+        // ENOMEM unless every page is committed and readable (MEM_COMMIT; not PAGE_NOACCESS 0x01, not PAGE_GUARD 0x100).
+        var mbi: [i64; 8] = [0; 8]
+        var p: i64 = a1
+        let end: i64 = a1 + a2
+        while p < end {
+            if VirtualQuery(p as u64, (&mbi[0]) as u64, 48) == 0 {
+                return 0 - 12
+            }
+            let state: i64 = mbi[4] & 4294967295
+            let prot: i64 = (mbi[4] >> 32) & 4294967295
+            if state != 4096 || (prot & 257) != 0 || (prot & 255) == 0 {
+                return 0 - 12
+            }
+            let next: i64 = mbi[0] + mbi[3]
+            if next <= p {
+                return 0 - 12
+            }
+            p = next
+        }
+        return 0
+    }
     if nr == 202 {
         // futex(addr, op, val): the thread runtime's wait and wake. WAIT
         // sleeps while the 32 bit word at `addr` still holds `val` (it
@@ -1735,6 +1763,16 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
         // call, which is the main thread's). `Op::ThreadSelf` reads the
         // slot straight out of the TEB. Slots 0..63 only: the TEB keeps
         // those inline, which is what makes the read one instruction.
+        if a1 == 7937 {
+            // ARCH_GET_TCB (r506): the thread block of the calling thread, 0 = none (an unattached host thread).
+            let out: *mut i64 = a2 as *mut i64
+            if __win_tlsset == 0 {
+                *out = 0
+                return 1
+            }
+            *out = TlsGetValue(__win_tlsidx as i64)
+            return 1
+        }
         if a1 != 4098 {
             return 0 - 22
         }

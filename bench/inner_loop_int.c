@@ -1,6 +1,6 @@
 #include <stdio.h>
 static long long kern(const long long*z, const long long*w, int n){
-    long long summe=0;
+    long long total=0;
     for(int r=0;r<n;r++){
         long long a0=0,a1=0,a2=0,a3=0;
         for(int k=0;k<8;k++){
@@ -12,9 +12,9 @@ static long long kern(const long long*z, const long long*w, int n){
             a2 += z2*w0 - z3*w1;
             a3 += z3*w1 + z2*w0;
         }
-        summe += a0+a1+a2+a3;
+        total += a0+a1+a2+a3;
     }
-    return summe;
+    return total;
 }
 int main(void){
     static long long z[4096], w[16];

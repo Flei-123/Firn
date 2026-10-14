@@ -9,6 +9,7 @@
 //
 // Environment (all optional):
 //   MCPLAY_GL=1        GL path: glwindow (EGL/GLX) + gl_mc/gl_scene back end, frame shown without read back; MCPLAY_VSYNC=0|1 (default 1); CPU stays the default
+//   MCPLAY_FACECULL=1  GL: opaque meshes sorted by face direction, a section draws only directions facing the camera (same image; 0 = off)
 //   MCPLAY_VIEW=6      view distance in chunks            MCPLAY_PROTOCOL=763   protocol number
 //   MCPLAY_LOD=<n>     LOD terrain beyond MCPLAY_VIEW up to n chunks (mc_stream + mc_lod, cross-fade at ring changes; asks the server for n chunks); 0 = off (default)
 //   MCPLAY_STREAM=0    old path: mc_render_world (inline meshing) instead of mc_stream. DEFAULT is mc_stream (frustum + cave culling, worker meshing)
@@ -26,6 +27,7 @@
 //          config file (MC_PACK_CONFIG) line `sounds=synth|original|both` does the same; O = switch pack sounds off/on while playing; pack "weight" entries are honoured
 //   MCPLAY_DIG_MS=700  hold time before the "finish digging" packet in survival (there is no hardness table yet)
 //   MCPLAY_PLACE_ID=0  block state id painted locally on a place click (0 = wait for the server's Block Update)
+//   MCPLAY_ENTITIES=0  do not draw entity boxes (spawn / move / destroy packets are still tracked; end line `mcplay: entities ...`)
 //   MCPLAY_RUN_S=0     quit after N seconds (tests)       MCPLAY_SHOT=<file.png>  write the last frame as PNG on exit + print its hash
 //   MCPLAY_AUDIO=0     sound: 0 off, 1 on (FIRN_AUDIO=null|file:<path>|device selects the sink)
 //
@@ -77,6 +79,7 @@ import gpu.gl_scene
 import gpu.glshow
 import mc.mc_audio
 import mc.mc_entity
+import mc.mc_entity_draw
 import mc.v763.mc_snd_v763
 import audio.engine
 import audio.bank
@@ -105,6 +108,10 @@ const SC_M: u32 = 50
 const SC_O: u32 = 24
 const AUDIO_RATE: u32 = 44100
 const PLACE_WAIT_MS: u64 = 1500
+const ENT_TAU: f64 = 0.05
+const ENT_SNAP: f64 = 8.0
+const ENT_MAX_DIST: f64 = 96.0
+const ENT_FAR_LOD: f64 = 40.0
 
 fn now_ns() -> u64 {
     var ts: [i64; 2] = [0; 2]
@@ -366,6 +373,15 @@ struct Ctx {
     ma: *mut mc_audio.McAudio,
     wk: mc_audio.Walker,
     ents: mc_entity.Store,
+    ents_on: bool, // MCPLAY_ENTITIES=0 switches the entity boxes off (packets are still tracked)
+    entl: mc_entity_draw.EntList,
+    ent_t: u64, // ns of the last interpolation step
+    ent_peak: usize, // most entities tracked at once
+    ent_vis_max: u32, // most entities that passed culling in one frame
+    ent_boxes: u64, // boxes handed to the back end, all frames
+    ent_frames: u64, // frames that drew at least one box
+    ent_moving: u64, // sum over frames of entities still interpolating
+    ent_resets: u64, // Respawn packets (store cleared)
     reg: mc_registry.Registry,
     pend_place: bool,
     pend_x: i32,
@@ -404,6 +420,16 @@ struct Ctx {
     click_phase: i32, // MCPLAY_CLICK_TEST script (Click Container against a real server)
     click_t: u64,
     click_src: i32,
+    ct2_phase: i32, // MCPLAY_CLICK_TEST2 script (shift click / drag / double click against a real server)
+    ct2_t: u64,
+    ct2_a: i32,
+    ct2_b: i32,
+    ct2_d: i32,
+    ct3_phase: i32, // MCPLAY_CHEST_TEST script (open a chest next to the player, shift click / pick up / drag, close; checked against the server)
+    ct3_t: u64,
+    ct3_tries: i32,
+    last_click_slot: i32, // double click detection in the inventory panel
+    last_click_t: u64,
 }
 
 // ---- mc_stream mode (MCPLAY_STREAM / MCPLAY_LOD) -------------------------------------------------------
@@ -694,10 +720,21 @@ fn on_packet(c: *mut Ctx, id: i32) {
         dump_raw_inv("items", (*cl).ver.protocol, mc_client.client_body(cl))
         mc_inv.inv_set_efficiency_id(&(*c).inv, mc_client.client_enchant_efficiency(cl))
         mc_inv.inv_on_window_items_v(&(*c).inv, &(*cl).ver, mc_client.client_body(cl))
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_OPEN_WINDOW) {
+        mc_inv.inv_on_open_window_v(&(*c).inv, &(*cl).ver, mc_client.client_body(cl))
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_CLOSE_WINDOW) {
+        mc_inv.inv_on_close_window_v(&(*c).inv, &(*cl).ver, mc_client.client_body(cl))
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_SET_SLOT) {
         dump_raw_inv("slot", (*cl).ver.protocol, mc_client.client_body(cl))
         mc_inv.inv_set_efficiency_id(&(*c).inv, mc_client.client_enchant_efficiency(cl))
         mc_inv.inv_on_set_slot_v(&(*c).inv, &(*cl).ver, mc_client.client_body(cl))
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_RESPAWN) {
+        // new dimension: the old entities are gone (the server sends no destroy for them)
+        mc_entity.store_clear(&(*c).ents)
+        (*c).ent_resets = (*c).ent_resets + 1 as u64
+    } else if mc_entity.entity_on_packet(&(*c).ents, &(*cl).ver, id, mc_client.client_body(cl)) {
+        let n: usize = mc_entity.store_count(&(*c).ents)
+        if n > (*c).ent_peak { (*c).ent_peak = n }
     } else if (*c).aud {
         if mc_audio.mca_on_packet((*c).ma, &(*cl).ver, id, mc_client.client_body(cl), &(*c).ents) {
             (*c).n_snd_pkt = (*c).n_snd_pkt + 1 as u64
@@ -862,6 +899,8 @@ fn handle_hotbar(c: *mut Ctx) {
     }
     if (*c).have_pos { give_items(c) }
     if (*c).have_pos && env_flag("MCPLAY_CLICK_TEST", false) { click_test(c) }
+    if (*c).have_pos && env_flag("MCPLAY_CLICK_TEST2", false) { click_test2(c) }
+    if (*c).have_pos && env_flag("MCPLAY_CHEST_TEST", false) { chest_test(c) }
     if raw.key_pressed(&(*c).rw, SC_F as u32) { (*c).want_fly = true }
     if raw.key_pressed(&(*c).rw, SC_N as u32) { (*c).want_noclip = true }
 }
@@ -1098,6 +1137,13 @@ fn ui_inv_click(c: *mut Ctx) {
     if slot == 0 - 1 { return }
     var mode: i32 = 0
     if raw.key_down(&(*c).rw, 42 as u32) && slot >= 0 { mode = 1 }
+    // a second left press on the same slot within 250 ms (hand not empty) collects equal stacks: Click Container mode 6
+    let now: u64 = now_ms()
+    if mode == 0 && btn == 0 && slot >= 0 && slot == (*c).last_click_slot && now - (*c).last_click_t < 250 as u64 && mc_inv.inv_cursor_item(&(*c).inv) >= 0 {
+        mode = 6
+    }
+    (*c).last_click_slot = slot
+    (*c).last_click_t = now
     mc_inv.inv_click(&(*c).cl, &(*c).inv, slot, btn, mode)
 }
 
@@ -1129,6 +1175,116 @@ fn click_test(c: *mut Ctx) {
     }
     (*c).click_phase = (*c).click_phase + 1
     (*c).click_t = now
+}
+
+// MCPLAY_CLICK_TEST2=1 (survival, after `give <name> stone 64`, `give <name> stone 40`, `give <name> dirt 10`): shift click (40 stone and the dirt
+// to the main inventory, the 64 stone then merges into the 40 and overflows), drag (40 stone over three slots), double click (collects them again)
+// -> expected: slot 9 = 40 stone, slot 10 = 10 dirt, slot 11 = 64 stone (the harness compares with the server's inventory).
+fn click_test2(c: *mut Ctx) {
+    let now: u64 = now_ms()
+    if (*c).ct2_phase >= 14 { return }
+    if (*c).ct2_phase > 0 && now - (*c).ct2_t < 450 as u64 { return }
+    let cl: *mut mc_client.Client = &(*c).cl
+    let v: *mut mc_inv.Inv = &(*c).inv
+    var ph: i32 = (*c).ct2_phase
+    if ph == 0 {
+        var k: i32 = 36
+        while k < 45 {
+            if mc_inv.inv_count(v, k) == 64 { (*c).ct2_a = k }
+            if mc_inv.inv_count(v, k) == 40 { (*c).ct2_b = k }
+            if mc_inv.inv_count(v, k) == 10 { (*c).ct2_d = k }
+            k = k + 1
+        }
+        if (*c).ct2_a < 0 || (*c).ct2_b < 0 || (*c).ct2_d < 0 { return }
+        mc_inv.inv_click(cl, v, (*c).ct2_b, 0, 1) // shift: the 40 stone -> slot 9
+    } else if ph == 1 {
+        mc_inv.inv_click(cl, v, (*c).ct2_d, 0, 1) // shift: dirt -> slot 10
+    } else if ph == 2 {
+        mc_inv.inv_click(cl, v, (*c).ct2_a, 0, 1) // shift: 64 stone -> merges into slot 9 (64), 40 left -> slot 11
+    } else if ph == 3 {
+        mc_inv.inv_click(cl, v, 11, 0, 0) // pick up the 40
+    } else if ph == 4 {
+        mc_inv.inv_drag_begin(cl, v, 0)
+    } else if ph == 5 {
+        mc_inv.inv_drag_add(cl, v, 12, 0)
+        mc_inv.inv_drag_add(cl, v, 13, 0)
+        mc_inv.inv_drag_add(cl, v, 14, 0)
+    } else if ph == 6 {
+        mc_inv.inv_drag_end(cl, v, 0) // 13 each, 1 stays in hand
+    } else if ph == 7 {
+        mc_inv.inv_click(cl, v, 15, 0, 0) // put the last one down
+    } else if ph == 8 {
+        mc_inv.inv_click(cl, v, 15, 0, 0) // pick it up again
+    } else if ph == 9 {
+        mc_inv.inv_click(cl, v, 15, 0, 6) // double click on the empty slot: collects 13 + 13 + 13, then 24 from the full stack in slot 9
+    } else if ph == 10 {
+        mc_inv.inv_click(cl, v, 11, 0, 0) // put the 64 into slot 11
+    } else if ph == 11 {
+        say(f"mcplay: clicktest2 s9={mc_inv.inv_item(v, 9)}x{mc_inv.inv_count(v, 9)} s10={mc_inv.inv_item(v, 10)}x{mc_inv.inv_count(v, 10)} s11={mc_inv.inv_item(v, 11)}x{mc_inv.inv_count(v, 11)} s12={mc_inv.inv_count(v, 12)} s15={mc_inv.inv_count(v, 15)} cursor={mc_inv.inv_cursor_item(v)}x{mc_inv.inv_cursor_count(v)} clicks={(*c).inv.n_clicks}\n")
+    }
+    (*c).ct2_phase = ph + 1
+    (*c).ct2_t = now
+}
+
+fn floor_i(x: f64) -> i32 {
+    let i: i32 = x as i32
+    if (i as f64) > x { return i - 1 }
+    return i
+}
+
+// MCPLAY_CHEST_TEST: the server puts a chest at the player's x+1 (run_inv.sh): right click it, wait for its items, then
+// shift click container -> player and player -> container, pick up / put down, drag over four container slots, close.
+// Window slots of a 9x3 chest: 0..26 container, 27..53 main inventory, 54..62 hotbar.
+fn chest_test(c: *mut Ctx) {
+    let now: u64 = now_ms()
+    if (*c).ct3_phase >= 9 { return }
+    if (*c).ct3_phase > 0 && now - (*c).ct3_t < 500 as u64 { return }
+    let cl: *mut mc_client.Client = &(*c).cl
+    let v: *mut mc_inv.Inv = &(*c).inv
+    let ph: i32 = (*c).ct3_phase
+    if ph == 0 {
+        // wait until the chest is open and its items arrived (container slot 0 = the stone), re-sending the right click now and then
+        if mc_inv.inv_window(v) != 0 && mc_inv.inv_win_item(v, 0) >= 0 && mc_inv.inv_item(v, 36) >= 0 && mc_inv.inv_item(v, 37) >= 0 {
+            say(f"mcplay: chesttest open win={mc_inv.inv_window(v)} slots={mc_inv.inv_window_slots(v)}\n")
+        } else {
+            if mc_inv.inv_item(v, 37) < 0 { return } // the /give commands have not arrived yet (the chest is set right after them)
+            if (*c).ct3_tries == 0 { (*c).ct3_tries = 1; (*c).ct3_t = now; return }
+            if now - (*c).ct3_t < 1500 as u64 { return }
+            (*c).ct3_t = now
+            (*c).ct3_tries = (*c).ct3_tries + 1
+            if (*c).ct3_tries > 12 { (*c).ct3_phase = 9; say(f"mcplay: chesttest FAIL chest did not open\n"); return }
+            let bx: i32 = floor_i((*c).pl.x + 1.0)
+            let by: i32 = floor_i((*c).pl.y)
+            let bz: i32 = floor_i((*c).pl.z)
+            mc_play.send_place(cl, bx, by, bz, 1, (*c).seq)
+            (*c).seq = (*c).seq + 1
+            return
+        }
+    } else if ph == 1 {
+        mc_inv.inv_click(cl, v, 0, 0, 1) // shift: container 0 (10 stone) -> merges into the hotbar stone
+    } else if ph == 2 {
+        mc_inv.inv_click(cl, v, 55, 0, 1) // shift: hotbar dirt -> merges into container slot 1
+    } else if ph == 3 {
+        mc_inv.inv_click(cl, v, 26, 0, 0) // pick up the 64 stone of container slot 26
+    } else if ph == 4 {
+        mc_inv.inv_click(cl, v, 5, 0, 0) // put it into container slot 5
+    } else if ph == 5 {
+        mc_inv.inv_click(cl, v, 54, 0, 0) // pick up the hotbar stone (30)
+        mc_inv.inv_drag_begin(cl, v, 0)
+        mc_inv.inv_drag_add(cl, v, 10, 0)
+        mc_inv.inv_drag_add(cl, v, 11, 0)
+        mc_inv.inv_drag_add(cl, v, 12, 0)
+        mc_inv.inv_drag_add(cl, v, 13, 0)
+    } else if ph == 6 {
+        mc_inv.inv_drag_end(cl, v, 0) // 7 each, 2 stay in the hand
+    } else if ph == 7 {
+        mc_inv.inv_click(cl, v, 54, 0, 0) // the 2 back to the hotbar
+    } else if ph == 8 {
+        say(f"mcplay: chesttest c1={mc_inv.inv_win_item(v, 1)}x{mc_inv.inv_win_count(v, 1)} c5={mc_inv.inv_win_item(v, 5)}x{mc_inv.inv_win_count(v, 5)} c10={mc_inv.inv_win_count(v, 10)} c13={mc_inv.inv_win_count(v, 13)} c0={mc_inv.inv_win_item(v, 0)} c26={mc_inv.inv_win_item(v, 26)} h0={mc_inv.inv_item(v, 36)}x{mc_inv.inv_count(v, 36)} h1={mc_inv.inv_item(v, 37)} cursor={mc_inv.inv_cursor_item(v)}x{mc_inv.inv_cursor_count(v)} clicks={(*c).inv.n_clicks}\n")
+        mc_inv.inv_close_window(cl, v)
+    }
+    (*c).ct3_phase = ph + 1
+    (*c).ct3_t = now
 }
 
 fn handle_mouse(c: *mut Ctx) {
@@ -1252,7 +1408,7 @@ fn audio_packs_apply(c: *mut Ctx, mode: i32) -> i32 {
     if n < 0 {
         io.eprint_line("mcplay: pack sounds: bank error -- keeping the old sounds")
     } else {
-        say(f"mcplay: pack sounds mode={mode} events={n} samples={engine.engine_sample_count((*c).eng)}\n")
+        say(f"mcplay: pack sounds mode={mode} events={n} samples={engine.engine_sample_count((*c).eng)} total={engine.engine_event_count((*c).eng)}\n")
     }
     return n
 }
@@ -1272,14 +1428,28 @@ fn audio_packs_reload(c: *mut Ctx) {
 
 // O key: pack sounds off (synth) <-> on (config `sounds=` / MC_PACK_SOUNDS, default both). Same rules as the reload: the audio thread is
 // stopped around the bank load. Going back to synth reloads the synth bank (its events replace the pack events one by one; the id pool
-// is reused, see engine_event_replace); pack-only events stay but nothing maps to them. A start with sounds=original has no synth bank
-// loaded, so switching packs on again afterwards is "both" in effect.
+// is reused, see engine_event_replace); pack-only events stay but nothing maps to them. Back to "on" in mode original (config /
+// MC_PACK_SOUNDS=original) clears the event table first (engine_events_clear), so the synth events are really gone: only the pack events
+// play, also after a start with sounds=synth or both.
 fn audio_sounds_toggle(c: *mut Ctx) {
     let mode: i32 = mc_packs.res_toggle_sounds(&(*c).g.res)
     if (*c).aud_thread { engine.engine_audio_stop((*c).eng) }
     if mode == mc_packs.SOUNDS_SYNTH {
         let r: i32 = audio_load_synth(c)
         if r != bank.BANK_OK { io.eprint_line("mcplay: sounds=synth: synth bank did not load -- keeping the current sounds") }
+    } else if mode == mc_packs.SOUNDS_ORIGINAL {
+        // original = ONLY the pack events: drop every event (synth + old pack ones) first; the samples stay in the engine and the bank
+        // finds them again by hash, so nothing is decoded twice. No pack sound at all -> the synth bank stays (same rule as at start).
+        mc_audio.mca_stop_all((*c).ma, 0.0)
+        if engine.engine_events_clear((*c).eng) {
+            let n: i32 = audio_packs_apply(c, mode)
+            if n <= 0 {
+                io.eprint_line("mcplay: sounds=original but the packs have no usable sounds -- using the synth bank")
+                audio_load_synth(c)
+            }
+        } else {
+            audio_packs_apply(c, mc_packs.SOUNDS_BOTH)
+        }
     } else {
         audio_packs_apply(c, mode)
     }
@@ -1472,6 +1642,28 @@ fn audio_stop(c: *mut Ctx) {
 
 // GL frame: same pass order as draw_frame (sky -> world -> selection box -> tint -> HUD), shown by present.
 #[allow_escape]
+// Entities: one interpolation step per frame (real time), then the visible ones become box records for the back end `b`.
+fn ents_step(c: *mut Ctx) {
+    let t: u64 = now_ns()
+    var dt: f64 = 0.0
+    if (*c).ent_t != 0 as u64 { dt = ((t - (*c).ent_t) as f64) / 1.0e9 }
+    (*c).ent_t = t
+    (*c).ent_moving = (*c).ent_moving + mc_entity.store_interp(&(*c).ents, dt, ENT_TAU, ENT_SNAP)
+}
+
+fn ents_draw(c: *mut Ctx, b: *mut mc_backend.Backend) {
+    if !(*c).ents_on || !(*c).have_pos { return }
+    mc_entity_draw.entlist_build_reg(&(*c).entl, &(*c).ents, &(*c).cam, ENT_MAX_DIST, ENT_FAR_LOD, &(*c).reg)
+    let vis: u32 = (*c).entl.n_in - (*c).entl.n_culled
+    if vis > (*c).ent_vis_max { (*c).ent_vis_max = vis }
+    let n: u64 = mc_entity_draw.entlist_draw(&(*c).entl, b)
+    if n > 0 as u64 {
+        (*c).ent_boxes = (*c).ent_boxes + n
+        (*c).ent_frames = (*c).ent_frames + 1 as u64
+    }
+}
+
+#[allow_escape]
 fn draw_frame_gl(c: *mut Ctx) {
     let view: f64 = far_view(c) as f64
     let fog_start: f64 = view * 16.0 * 0.5
@@ -1494,6 +1686,10 @@ fn draw_frame_gl(c: *mut Ctx) {
         }
     }
     (*c).be.end((*c).be.obj)
+    // entity boxes: ONE instanced call through the scene layer, after end (the world is in the depth buffer)
+    var ebe: mc_backend.Backend = (*c).be
+    gl_scene.scene_attach(&(*c).gsc, &ebe)
+    ents_draw(c, &ebe)
     if (*c).hit {
         // selection box = 12 thin boxes along the block edges
         let e: f64 = 0.03
@@ -1573,6 +1769,8 @@ fn draw_frame(c: *mut Ctx) {
             stream_time(c, now_ns() - ts0)
         }
     }
+    var ebe: mc_backend.Backend = mc_backend.backend_cpu(r)
+    ents_draw(c, &ebe)
     if !(*c).light { mc_sky.sky_tint_frame(&(*c).sky, r) }
     if (*c).hit {
         mc_input.input_draw_box(r, (*c).pk.x, (*c).pk.y, (*c).pk.z, BOX_RGBA)
@@ -1734,11 +1932,13 @@ fn main(start: u64) -> i32 {
         light: env_flag("MCPLAY_LIGHT", true), wl: mc_wlight.wl_new(0, 24), region_done: false, n_region_moves: 0 as u64, day_time: 0, day_fixed: false, n_time: 0,
         aud: false, aud_thread: false, aud_t0: 0, aud_owed: 0.0, aud_muted: false,
         eng: &eng, bnk: &bnk, snk: &snk, ma: &ma, wk: mc_audio.mca_walker_new(), ents: mc_entity.store_new(), reg: ver.registry_of(),
+        ents_on: env_flag("MCPLAY_ENTITIES", true), entl: mc_entity_draw.entlist_new(), ent_t: 0 as u64, ent_peak: 0, ent_vis_max: 0 as u32, ent_boxes: 0 as u64,
+        ent_frames: 0 as u64, ent_moving: 0 as u64, ent_resets: 0 as u64,
         pend_place: false, pend_x: 0, pend_y: 0, pend_z: 0, pend_t: 0, n_snd: 0, n_snd_pkt: 0,
         probe: env_flag("MCPLAY_AUDIO_PROBE", false), probe_i: 0, probe_next: 0 as u64, amb: mc_audio.mca_ambient_new(4242 as i64), amb_x: (env_int("MCPLAY_AMBIENT_X", 1) as f64), amb_dark: env_flag("MCPLAY_AMBIENT_DARK", false), n_amb: 0 as u64,
         n_chunks: 0, n_unload: 0, n_bchange: 0, n_mchange: 0, n_dig: 0, n_place: 0, n_ticks: 0, n_frames: 0, n_kick: 0, fps: 0,
         inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), show_inv: false, give_done: false, dig_total: 0,
-        fx: mc_effect.fx_new(), fx_ticks: 0 - 1, fx_plain: 0 - 1, click_phase: 0, click_t: 0 as u64, click_src: 0 - 1,
+        fx: mc_effect.fx_new(), fx_ticks: 0 - 1, fx_plain: 0 - 1, click_phase: 0, click_t: 0 as u64, click_src: 0 - 1, ct2_phase: 0, ct2_t: 0 as u64, ct2_a: 0 - 1, ct2_b: 0 - 1, ct2_d: 0 - 1, ct3_phase: 0, ct3_t: 0 as u64, ct3_tries: 0, last_click_slot: 0 - 1, last_click_t: 0 as u64,
     }
     if !c.g.ok {
         io.eprint_line("mcplay: this version has no block registry")
@@ -1773,6 +1973,7 @@ fn main(start: u64) -> i32 {
         return 5
     }
     mc_codec.wire_timeout(&c.cl.w, 2) // the frame loop must not block on the socket
+    mc_inv.inv_use_registry(&c.inv, &c.reg) // stack limits + armour slots for the click prediction
     // window: full_input BEFORE make so that button releases, motion and raw keys arrive
     if want_gl {
         var o: glwindow.Opts = glwindow.opts_default()
@@ -1794,6 +1995,7 @@ fn main(start: u64) -> i32 {
             io.eprint_line("mcplay: GL back end failed")
             return 6
         }
+        gl_mc.glbe_set_facecull(&c.gb, env_flag("MCPLAY_FACECULL", true)) // MCPLAY_FACECULL=0: no face-direction buckets (docs/MC-PERF.md 7)
         c.gsc = gl_scene.scene_open(&c.gb)
         if !c.gsc.ok || !glshow.show_init(&c.sh, gl_mc.glbe_gl(&c.gb)) {
             io.eprint_line("mcplay: GL scene layer failed")
@@ -1870,6 +2072,7 @@ fn main(start: u64) -> i32 {
         }
         handle_mouse(&c)
         audio_frame(&c)
+        ents_step(&c)
         draw_frame(&c)
         present(&c)
         c.n_frames = c.n_frames + 1 as u64
@@ -1902,6 +2105,22 @@ fn main(start: u64) -> i32 {
     say(f"mcplay: inv updates={c.inv.n_updates} bad={c.inv.bad} hotbar={mc_inv.inv_hotbar_item(&c.inv, 0)}x{mc_inv.inv_hotbar_count(&c.inv, 0)},{mc_inv.inv_hotbar_item(&c.inv, 1)}x{mc_inv.inv_hotbar_count(&c.inv, 1)},{mc_inv.inv_hotbar_item(&c.inv, 2)}x{mc_inv.inv_hotbar_count(&c.inv, 2)} dig_ms={c.dig_ms} dig_total={c.dig_total} dig_table={c.dg.nblocks}\n")
     say(f"mcplay: fx haste={mc_effect.fx_haste(&c.fx)} fatigue={mc_effect.fx_fatigue(&c.fx)} eff={mc_inv.inv_held_eff(&c.inv, c.pl.slot)} eff0={mc_inv.inv_held_eff(&c.inv, 0)} fx_ticks={c.fx_ticks} plain_ticks={c.fx_plain} clicks={c.inv.n_clicks} cursor={mc_inv.inv_cursor_item(&c.inv)}x{mc_inv.inv_cursor_count(&c.inv)} slot10={mc_inv.inv_count(&c.inv, 10)} slot11={mc_inv.inv_count(&c.inv, 11)}\n")
     say(f"mcplay: light={c.light} region={c.region_done} region_moves={c.n_region_moves} time_packets={c.n_time} day_time={c.day_time} daylight={c.sky.daylight}\n")
+    say(f"mcplay: entities count={mc_entity.store_count(&c.ents)} peak={c.ent_peak} players={mc_entity.store_player_count(&c.ents)} spawns={c.ents.spawns} moves={c.ents.moves} teleports={c.ents.teleports} looks={c.ents.looks} destroys={c.ents.destroys} velocities={c.ents.velocities} bad={c.ents.bad} misses={c.ents.misses} dropped={c.ents.dropped} resets={c.ent_resets} on={c.ents_on}\n")
+    say(f"mcplay: entities_draw boxes={c.ent_boxes} frames={c.ent_frames} vis_max={c.ent_vis_max} in={c.entl.n_in} culled={c.entl.n_culled} lod={c.entl.n_lod} interp_moving={c.ent_moving}\n")
+    if env_flag("MCPLAY_ENT_LIST", false) {
+        // up to 16 entities with network and render position (debug / tests)
+        var ei: usize = 0
+        var shown: i32 = 0
+        let ecap: usize = mc_entity.store_slot_cap(&c.ents)
+        while ei < ecap && shown < 16 {
+            let ee: *mut mc_entity.Entity = mc_entity.store_at(&c.ents, ei)
+            ei = ei + 1
+            if (ee as u64) == 0 as u64 { continue }
+            shown = shown + 1
+            say(f"mcplay: ent id={(*ee).id} kind={(*ee).kind} type={(*ee).type_id} x={(*ee).x} y={(*ee).y} z={(*ee).z} rx={(*ee).rx} ry={(*ee).ry} rz={(*ee).rz} yaw={(*ee).yaw}\n")
+        }
+        say(f"mcplay: cam x={c.cam.x} y={c.cam.y} z={c.cam.z} yaw={c.cam.yaw} pitch={c.cam.pitch} far={c.cam.far} fov={c.cam.fov}\n")
+    }
     say(f"mcplay: pos x={c.pl.x as i64} y={c.pl.y as i64} z={c.pl.z as i64} fps={c.fps}\n")
     var rc: i32 = 0
     if c.gl {
@@ -1940,6 +2159,8 @@ fn main(start: u64) -> i32 {
         mc_render_world.wr_free(&c.g.wr, &c.g.r)
     }
     window.close_window(c.wp)
+    mc_entity_draw.entlist_free(&c.entl)
+    mc_entity.store_free(&c.ents)
     mc_world.world_free(&c.world)
     mc_chunk.scratch_free(&c.sc)
     mc_client.client_free(&c.cl)

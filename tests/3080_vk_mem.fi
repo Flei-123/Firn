@@ -1,0 +1,90 @@
+// expect_exit: 0
+// gpu.vk_mem on Vulkan (lavapipe on this server, NO real GPU): suballocation (many buffers = few vkAllocateMemory calls), free list
+// coalescing, host visible mapping, an image. SKIP (exit 0) when no Vulkan loader / device exists.
+import std.rt
+import std.io
+import gpu.vk
+import gpu.vk_mem
+
+struct T { fails: i32, checks: i32 }
+
+fn check(t: *mut T, ok: bool, what: str) {
+    (*t).checks = (*t).checks + 1
+    if ok {
+        io.fmt_print(f"ok   {what}\n")
+    } else {
+        io.fmt_print(f"FAIL {what}\n")
+        (*t).fails = (*t).fails + 1
+    }
+}
+
+fn main(start: u64) -> i32 {
+    var t: T = T { fails: 0, checks: 0 }
+    var v: vk.Vk = vk.vk_new()
+    if !vk.open(&v, false, true) {
+        io.fmt_print(f"SKIP no Vulkan (step {v.step})\n")
+        return 0
+    }
+    var x: vk_mem.X = vk_mem.x_new()
+    check(&t, vk_mem.x_open(&x, &v), "function table + limits")
+    io.fmt_print(f"limits: layers={x.max_layers} dim={x.max_dim} push={x.max_push} allocs={x.max_alloc} ubo={x.max_ubo}\n")
+    check(&t, x.max_layers >= 256 && x.max_dim >= 4096 && x.max_push >= 128 && x.max_alloc >= 4096, "limits sane (layers/dim/push/allocs)")
+    // 200 buffers of mixed sizes out of ONE block
+    var bufs: [vk_mem.Buf; 200] = [vk_mem.buf_none(); 200]
+    var i: usize = 0
+    var ok: bool = true
+    while i < 200 {
+        bufs[i] = vk_mem.buf_make(&x, (4096 + (i * 977) % 50000) as u64, vk_mem.U_VERTEX | vk_mem.U_DST, vk_mem.MEM_DEVICE)
+        if !bufs[i].ok { ok = false }
+        i = i + 1
+    }
+    var st: [u64; 4] = [0; 4]
+    vk_mem.mem_stats(&x, &st)
+    check(&t, ok, "200 buffers allocated")
+    check(&t, st[3] == 1 && st[0] == 1, "200 buffers = 1 vkAllocateMemory (suballocation)")
+    // free the odd ones, then the even ones: everything coalesces back into one range
+    i = 1
+    while i < 200 {
+        vk_mem.buf_free(&x, &bufs[i])
+        i = i + 2
+    }
+    vk_mem.mem_stats(&x, &st)
+    check(&t, st[2] > 0 && st[2] < st[1], "half freed: live bytes drop")
+    i = 0
+    while i < 200 {
+        vk_mem.buf_free(&x, &bufs[i])
+        i = i + 2
+    }
+    vk_mem.mem_stats(&x, &st)
+    check(&t, st[2] == 0, "all freed: live bytes 0")
+    let big: vk_mem.Buf = vk_mem.buf_make(&x, 60000000 as u64, vk_mem.U_DST, vk_mem.MEM_DEVICE)
+    vk_mem.mem_stats(&x, &st)
+    check(&t, big.ok && st[3] == 1, "60 MB fits the coalesced block again (no new vkAllocateMemory)")
+    var big2: vk_mem.Buf = big
+    vk_mem.buf_free(&x, &big2)
+    // host visible staging: write + read back through the mapping
+    var s: vk_mem.Buf = vk_mem.buf_make(&x, 4096 as u64, vk_mem.U_SRC, vk_mem.MEM_STAGING)
+    check(&t, s.ok && s.ptr != 0, "staging buffer mapped")
+    if s.ok && s.ptr != 0 {
+        rt.st32(s.ptr, 7, 0xCAFE1234 as u32)
+        check(&t, rt.ld32(s.ptr, 7) == (0xCAFE1234 as u32), "staging write/read")
+    }
+    vk_mem.buf_free(&x, &s)
+    // two staging buffers do not overlap
+    var s1: vk_mem.Buf = vk_mem.buf_make(&x, 1000 as u64, vk_mem.U_SRC, vk_mem.MEM_STAGING)
+    var s2: vk_mem.Buf = vk_mem.buf_make(&x, 1000 as u64, vk_mem.U_SRC, vk_mem.MEM_STAGING)
+    check(&t, s1.ok && s2.ok && (s1.ptr + 1000 <= s2.ptr || s2.ptr + 1000 <= s1.ptr), "staging buffers disjoint")
+    vk_mem.buf_free(&x, &s1)
+    vk_mem.buf_free(&x, &s2)
+    // image: 64x64, 8 layers, sampled + transfer dst
+    var im: vk_mem.Img = vk_mem.img_make(&x, 64 as u32, 64 as u32, 8 as u32, 37 as u32, 0x6 as u64, 1 as u64)
+    check(&t, im.ok && im.view != 0, "image 64x64x8 RGBA8 + array view")
+    vk_mem.img_free(&x, &im)
+    vk_mem.mem_stats(&x, &st)
+    check(&t, st[2] == 0, "no leaked bytes")
+    vk_mem.x_close(&x)
+    vk.close(&v)
+    io.fmt_print(f"vk_mem: {t.checks} checks, {t.fails} failed\n")
+    if t.fails > 0 { return 3 }
+    return 0
+}

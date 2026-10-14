@@ -1,0 +1,173 @@
+// expect_exit: 0
+// tests/2994_mc_packsnd_slotfx.fi -- pack sounds: volume/pitch PER ENTRY (not only the first) survive weights and reloads, the engine applies
+// them per voice, the params pool does not leak on reload, engine_events_clear drops synth events (original mode without the synth bank).
+import std.rt
+import std.io
+import zip.zip
+import audio.engine
+import audio.bank
+import mc.mc_audio
+import mc.mc_assets
+import mc.mc_packs
+import mc.mc_packsnd
+
+struct T {
+    fails: i32,
+}
+
+fn check(t: *mut T, ok: bool, what: str) {
+    if ok {
+        io.fmt_print(f"ok   {what}\n")
+    } else {
+        io.fmt_print(f"FAIL {what}\n")
+        (*t).fails = (*t).fails + 1
+    }
+}
+
+fn ldf_at(p: u64, i: usize) -> f32 {
+    return *((p + (i * 4) as u64) as *mut f32)
+}
+
+fn near(a: f32, b: f32) -> bool {
+    return a > b - 0.002 && a < b + 0.002
+}
+
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+const OGG_A: str = "tests/data/vorbis/sine_m22k_q3.ogg"
+const OGG_B: str = "tests/data/vorbis/impulse_m44k_q4.ogg"
+
+fn add_str(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    var ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn add_file(w: *mut zip.ZipWriter, name: str, src: str) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&p, src.p as u64, src.length())
+    rt.buf_push(&p, 0 as u8)
+    var d: rt.Buf = rt.buf_new()
+    var ok: bool = rt.read_file(rt.buf_ptr(&p), &d)
+    if ok { ok = zip.zip_add(w, name, rt.buf_ptr(&d), rt.buf_len(&d), false) catch | e | (false) }
+    rt.buf_free(&p)
+    rt.buf_free(&d)
+    return ok
+}
+
+// Slot k of event `ev` -> sample id.
+fn slot_id(e: *mut engine.Engine, ev: i32, k: usize) -> i32 {
+    let d: *mut engine.EventDef = engine.engine_event(e, ev)
+    return *at[i32]((*e).sample_ids, (*d).sample_first as usize + k)
+}
+
+const SYNTH_BANK: str = "{\"events\":[{\"name\":\"syn.only\",\"samples\":[\"s.ogg\"]},{\"name\":\"syn.fx\",\"samples\":[\"s.ogg\"],\"parameters\":[{\"name\":\"d\",\"target\":\"volume\",\"curve\":[[0,1],[10,0.5],[20,0]]},{\"name\":\"p\",\"target\":\"pitch\",\"curve\":[[0,1],[1,2]]}]},{\"name\":\"block.fx\",\"samples\":[\"s.ogg\"],\"parameters\":[{\"name\":\"d\",\"target\":\"volume\",\"curve\":[[0,1],[10,0.5],[20,0]]}]}]}"
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var t: T = T { fails: 0 }
+    var e: engine.Engine = engine.engine_new(48000 as u32, 64 as u32)
+    var b: bank.Bank = bank.bank_new()
+    var m: mc_audio.McAudio = mc_audio.mca_new(&e)
+
+    // ---- bank text: sample_volume / sample_pitch (parallel to samples), missing entries = 1.0
+    let outb: u64 = rt.heap_alloc(128 * 2 * 4)
+    var pcm: u64 = rt.heap_alloc(480 * 4)
+    var i: usize = 0
+    while i < 480 { rt.st32(pcm, i, 0 as u32); i = i + 1 }
+    let s0: i32 = engine.engine_add_sample(&e, pcm, 480 as u64, 1 as u32)
+    bank.bank_provide(&b, "s.ogg", s0)
+    let bt: str = "{\"events\":[{\"name\":\"fx.two\",\"samples\":[\"s.ogg\",\"s.ogg\",\"s.ogg\"],\"sample_volume\":[0.25,0.5],\"sample_pitch\":[2.0,1.0,0.5]},{\"name\":\"fx.plain\",\"samples\":[\"s.ogg\"]}]}"
+    check(&t, mc_audio.mca_bank_load_text(&m, &b, bt.p as u64, bt.length(), "") == bank.BANK_OK, "bank with sample_volume / sample_pitch loads")
+    let f2: i32 = engine.engine_find_event(&e, "fx.two")
+    let fp: i32 = engine.engine_find_event(&e, "fx.plain")
+    check(&t, near(engine.engine_event_slot_volume(&e, f2, 0), 0.25) && near(engine.engine_event_slot_volume(&e, f2, 1), 0.5) && near(engine.engine_event_slot_volume(&e, f2, 2), 1.0), "slot volumes 0.25, 0.5, (missing) 1.0")
+    check(&t, near(engine.engine_event_slot_pitch(&e, f2, 0), 2.0) && near(engine.engine_event_slot_pitch(&e, f2, 1), 1.0) && near(engine.engine_event_slot_pitch(&e, f2, 2), 0.5), "slot pitches 2.0, 1.0, 0.5")
+    check(&t, near(engine.engine_event_slot_volume(&e, fp, 0), 1.0) && near(engine.engine_event_slot_pitch(&e, fp, 0), 1.0), "event without arrays = 1.0 / 1.0")
+
+    // ---- the engine applies the factors per voice: the first start picks a slot; the voice carries event * slot
+    var seen_q: bool = false
+    var seen_h: bool = false
+    var seen_one: bool = false
+    var k: i32 = 0
+    while k < 60 {
+        let h: u32 = engine.engine_play(&e, f2, 0 - 1)
+        if h != 0 as u32 {
+            // the command ring holds (volume, pitch); read them from the last command
+            let c: *mut engine.Cmd = at[engine.Cmd](e.cmds, (e.cmd_head + 4096 - 1) % 4096)
+            if near((*c).f0, 0.25) && near((*c).f1, 2.0) { seen_q = true }
+            if near((*c).f0, 0.5) && near((*c).f1, 1.0) { seen_h = true }
+            if near((*c).f0, 1.0) && near((*c).f1, 0.5) { seen_one = true }
+        }
+        engine.engine_stop_all(&e, 0.0)
+        engine.engine_render(&e, outb, 128)
+        k = k + 1
+    }
+    check(&t, seen_q && seen_h && seen_one, "voices start with event * slot volume / pitch (all 3 slots seen)")
+
+    // ---- pack events: per entry volume / pitch, with weights (a weighted file repeats its factors)
+    var stack: mc_assets.PackStack = mc_assets.stack_new()
+    var buf: rt.Buf = rt.buf_new()
+    var w: zip.ZipWriter = zip.zip_writer_new(&buf)
+    var ok: bool = add_str(&w, "pack.mcmeta", META)
+    ok = add_str(&w, "assets/minecraft/sounds.json", "{\"p.mix\":{\"sounds\":[{\"name\":\"custom/a\",\"volume\":0.5,\"pitch\":1.5,\"weight\":2},{\"name\":\"custom/b\",\"volume\":0.8,\"pitch\":0.75},\"custom/c\"]},\"p.dup\":{\"sounds\":[{\"name\":\"custom/a\",\"volume\":0.3},{\"name\":\"custom/a\",\"volume\":0.9}]},\"p.none\":{\"sounds\":[\"custom/a\",\"custom/b\"]},\"block.fx\":{\"sounds\":[\"custom/a\"]}}") && ok
+    ok = add_file(&w, "assets/minecraft/sounds/custom/a.ogg", OGG_A) && ok
+    ok = add_file(&w, "assets/minecraft/sounds/custom/b.ogg", OGG_B) && ok
+    ok = add_file(&w, "assets/minecraft/sounds/custom/c.ogg", OGG_B) && ok
+    var n: usize = zip.zip_finish(&w) catch | e2 | (0)
+    zip.zip_writer_free(&w)
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if n > 0 && mc_assets.pack_open_mem(&pk, rt.buf_ptr(&buf), rt.buf_len(&buf)) == mc_assets.ASSET_OK { ok = mc_assets.stack_push(&stack, &pk) == mc_assets.ASSET_OK && ok } else { ok = false }
+    check(&t, ok, "pack built")
+
+    // synth-like events with params, loaded BEFORE the pack (block.fx gets replaced by the pack)
+    let sb: str = SYNTH_BANK
+    check(&t, mc_audio.mca_bank_load_text(&m, &b, sb.p as u64, sb.length(), "") == bank.BANK_OK, "synth-like bank with params loads")
+
+    check(&t, mc_packsnd.packsnd_apply(&m, &b, &e, &stack, mc_packs.SOUNDS_BOTH) == 4, "4 pack events")
+    let pm: i32 = engine.engine_find_event(&e, "p.mix")
+    check(&t, (*engine.engine_event(&e, pm)).sample_n == 4, "p.mix: 2 + 1 + 1 slots")
+    check(&t, near(engine.engine_event_slot_volume(&e, pm, 0), 0.5) && near(engine.engine_event_slot_volume(&e, pm, 1), 0.5) && near(engine.engine_event_slot_pitch(&e, pm, 0), 1.5) && near(engine.engine_event_slot_pitch(&e, pm, 1), 1.5), "p.mix: weight-2 file repeats volume 0.5 / pitch 1.5")
+    check(&t, near(engine.engine_event_slot_volume(&e, pm, 2), 0.8) && near(engine.engine_event_slot_pitch(&e, pm, 2), 0.75), "p.mix: 2nd entry keeps ITS volume 0.8 / pitch 0.75 (not the first's)")
+    check(&t, near(engine.engine_event_slot_volume(&e, pm, 3), 1.0) && near(engine.engine_event_slot_pitch(&e, pm, 3), 1.0), "p.mix: plain entry = 1.0 / 1.0")
+    check(&t, slot_id(&e, pm, 0) == slot_id(&e, pm, 1) && slot_id(&e, pm, 1) != slot_id(&e, pm, 2), "p.mix: slot order = file order, weight repeats the same sample")
+    let pd: i32 = engine.engine_find_event(&e, "p.dup")
+    check(&t, (*engine.engine_event(&e, pd)).sample_n == 1 && near(engine.engine_event_slot_volume(&e, pd, 0), 0.3), "p.dup: same file twice = once, the first entry's volume 0.3 wins")
+    let pn: i32 = engine.engine_find_event(&e, "p.none")
+    check(&t, near(engine.engine_event_slot_volume(&e, pn, 1), 1.0) && near(engine.engine_event_slot_pitch(&e, pn, 0), 1.0), "p.none: no factors = 1.0")
+
+    // ---- reload: pools (sample ids AND params AND curve points) do not grow, factors survive
+    let ids0: usize = engine.engine_sample_id_pool_used(&e)
+    let par0: usize = engine.engine_param_pool_used(&e)
+    let cur0: usize = e.n_curve
+    check(&t, mc_packsnd.packsnd_apply(&m, &b, &e, &stack, mc_packs.SOUNDS_BOTH) == 4, "reload 1")
+    check(&t, mc_packsnd.packsnd_apply(&m, &b, &e, &stack, mc_packs.SOUNDS_BOTH) == 4, "reload 2")
+    check(&t, engine.engine_sample_id_pool_used(&e) == ids0, "reloads: sample id pool did not grow")
+    check(&t, engine.engine_param_pool_used(&e) == par0 && e.n_curve == cur0, "reloads: params / curve pool did not grow")
+    let pm2: i32 = engine.engine_find_event(&e, "p.mix")
+    check(&t, near(engine.engine_event_slot_volume(&e, pm2, 2), 0.8) && near(engine.engine_event_slot_pitch(&e, pm2, 0), 1.5), "reloads: factors survive")
+
+    // synth bank reloaded over a pack event that had params: the new params move into the old range, no growth
+    check(&t, mc_audio.mca_bank_load_text(&m, &b, sb.p as u64, sb.length(), "") == bank.BANK_OK, "synth bank again")
+    let par1: usize = engine.engine_param_pool_used(&e)
+    let cur1: usize = e.n_curve
+    check(&t, mc_audio.mca_bank_load_text(&m, &b, sb.p as u64, sb.length(), "") == bank.BANK_OK, "synth bank a 2nd time")
+    check(&t, mc_audio.mca_bank_load_text(&m, &b, sb.p as u64, sb.length(), "") == bank.BANK_OK, "synth bank a 3rd time")
+    check(&t, engine.engine_param_pool_used(&e) == par1 && e.n_curve == cur1, "bank reloads with params: pool did not grow")
+    let sf: *mut engine.EventDef = engine.engine_event(&e, engine.engine_find_event(&e, "syn.fx"))
+    check(&t, (*sf).param_n == 2, "syn.fx still has its 2 params")
+    var pmap: *mut engine.ParamMap = at[engine.ParamMap](e.params, (*sf).param_first as usize + 1)
+    check(&t, (*pmap).curve_n == 2 && near(ldf_at(e.curve_y, (*pmap).curve_first as usize + 1), 2.0), "syn.fx 2nd param curve intact after the moves")
+
+    // ---- original mode: events_clear drops the synth events, samples stay, the packs come back without decoding
+    let ns: usize = engine.engine_sample_count(&e)
+    check(&t, engine.engine_events_clear(&e), "events_clear")
+    check(&t, engine.engine_event_count(&e) == 0 && engine.engine_find_event(&e, "syn.only") < 0, "no synth event left")
+    check(&t, engine.engine_sample_id_pool_used(&e) == 0 && engine.engine_param_pool_used(&e) == 0 && e.n_curve == 0, "pools empty")
+    check(&t, mc_packsnd.packsnd_apply(&m, &b, &e, &stack, mc_packs.SOUNDS_ORIGINAL) == 4, "original: 4 pack events from an empty event table")
+    check(&t, engine.engine_event_count(&e) == 4 && engine.engine_find_event(&e, "syn.only") < 0, "exactly the 4 pack events, no synth event")
+    check(&t, engine.engine_sample_count(&e) == ns, "samples reused by hash (no decode, no growth)")
+    let pm3: i32 = engine.engine_find_event(&e, "p.mix")
+    check(&t, near(engine.engine_event_slot_volume(&e, pm3, 2), 0.8), "factors after the clear + re-apply")
+
+    io.fmt_print(f"failures: {t.fails}\n")
+    return t.fails
+}
