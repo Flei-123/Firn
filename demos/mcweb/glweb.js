@@ -214,8 +214,28 @@
                 stop();
             }
         };
+        // ---- gamepads (lib/input/webpad.fi): navigator.getGamepads() is polled once per frame, standard mapping only ----
+        const padOn = [false, false, false, false];
+        const pollPads = () => {
+            if (typeof x.firn_pad_state !== 'function' || !navigator.getGamepads) return;
+            const list = navigator.getGamepads();
+            for (let i = 0; i < 4; i++) {
+                const g = list && list[i];
+                if (g && g.connected && g.mapping === 'standard') {
+                    let m = 0;
+                    for (let b = 0; b < 17 && b < g.buttons.length; b++) if (g.buttons[b].pressed) m |= (1 << b);
+                    const tv = (b) => (g.buttons[b] ? Math.round(g.buttons[b].value * 1000) : 0);
+                    const ax = (a) => Math.round(Math.max(-1, Math.min(1, g.axes[a] || 0)) * 1000);
+                    x.firn_pad_state(i, m >>> 0, tv(6), tv(7), ax(0), ax(1), ax(2), ax(3));
+                    padOn[i] = true;
+                } else if (padOn[i]) {
+                    x.firn_pad_gone(i); padOn[i] = false;
+                }
+            }
+        };
         const tick = guard((ms) => {
             raf = 0;
+            pollPads();
             const r = x.firn_mc_frame(ms);
             run.frames++;
             if (r !== 0 && !stopped) raf = sched(tick);

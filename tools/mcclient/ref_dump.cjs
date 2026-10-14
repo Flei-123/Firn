@@ -28,6 +28,7 @@ const SECTIONS_114 = PROTOCOL >= 751 && PROTOCOL <= 754 // 1.16.2 - 1.16.5: CF_S
 const fs = require('fs')
 const crypto = require('crypto')
 const { EntityTracker } = require('./ref_entities.cjs')
+const RAW_NAMES = process.env.MC_RAW_NAMES ? new Set(process.env.MC_RAW_NAMES.split(',')) : null
 
 // ---------------------------------------------------------------- FNV-1a 64 (two 32-bit halves)
 class Fnv64 {
@@ -163,6 +164,7 @@ class Reader {
 }
 
 // 1.21.5+ (protocol 770): a paletted container has no data array length any more (derived from the bits per entry).
+const SEC_FLUID = Number(process.env.MC_PROTOCOL || 0) >= 775
 const NO_LEN = Number(process.env.MC_PROTOCOL || 0) >= 770
 
 // One paletted container. kind 'blocks' (4096, indirect 4..8) or 'biomes' (64, indirect 1..3).
@@ -214,6 +216,7 @@ function decodeSections (chunkData, numSections) {
   const sections = []
   while (sections.length < numSections) {
     const blockCount = r.i16()
+    if (SEC_FLUID) r.i16() // 26.1 (775): non-empty fluid count follows the block count (found by raw bytes of the real server)
     const blocks = readContainer(r, 'blocks')
     const biomes = readContainer(r, 'biomes')
     sections.push({ blockCount, blocksHash: hashU16(blocks), biomesHash: hashU16(biomes), distinct: new Set(blocks).size })
@@ -252,6 +255,38 @@ function unpackSpanning (longs, bits, count) {
   return out
 }
 
+// ---------------------------------------------------------------- flattening (MC_FLATTEN=1, 1.12.2 only)
+// The legacy table (id << 4 | meta -> 1.20.1 global state id) comes from the INDEPENDENT Node implementation
+// tools/mc/flat/ref_flat.cjs (rules: tools/mcgen/legacy_flat.json), not from the Firn generator output.
+let flatTable = null
+function loadFlatTable () {
+  const cp = require('child_process')
+  const path = require('path')
+  const root = path.join(__dirname, '..')
+  const out = cp.execFileSync(process.execPath, [path.join(root, 'mc', 'flat', 'ref_flat.cjs'), path.join(root, 'mcgen', 'legacy_flat.json')],
+    { encoding: 'utf8', env: process.env, maxBuffer: 1 << 24 })
+  const t = out.split('\n').filter((l) => l.trim() !== '').map((l) => parseInt(l, 10))
+  if (t.length !== 4096 || t.some((v) => !Number.isInteger(v))) throw new Error(`flat table has ${t.length} entries`)
+  return t
+}
+if (process.env.MC_FLATTEN && PROTOCOL === 340) flatTable = loadFlatTable()
+
+// A section update (groundUp = false) is MERGED into the stored column (the Firn client does the same with
+// mc_world.world_apply): the sections named in bitMap replace the stored ones; biomes, heightmaps, block
+// entities and the light hash stay those of the stored column; the light section counters add up.
+// An update for a column that is not stored is dropped (counted in partial_chunks).
+function mergeUpdate (stored, upd, bitMap) {
+  for (let i = 0; i < 16; i++) {
+    if (!(bitMap & (1 << i))) continue
+    const old = stored.sections[i]
+    const ns = upd.sections[i]
+    if (old.biomesHash !== undefined && ns.biomesHash !== undefined) ns.biomesHash = old.biomesHash
+    stored.sections[i] = ns
+  }
+  stored.light.sky += upd.light.sky
+  stored.light.block += upd.light.block
+}
+
 function decodeLegacyColumn (p, hasSky) {
   const r = new Reader(p.chunkData)
   const sections = []
@@ -279,6 +314,7 @@ function decodeLegacyColumn (p, hasSky) {
     for (const b of r.bytes(2048)) f.byte(b)
     blockN++
     if (hasSky) { for (const b of r.bytes(2048)) f.byte(b); skyN++ }
+    if (flatTable) { for (let k = 0; k < 4096; k++) ids[k] = ids[k] < 4096 ? flatTable[ids[k]] : 0 }
     let nonAir = 0
     for (const v of ids) if (v !== 0) nonAir++
     sections.push({ blockCount: nonAir, blocksHash: hashU16(ids), distinct: new Set(ids).size, ids })
@@ -521,7 +557,8 @@ function main () {
       walk_fail: walkFail + chunkErrors + lightBad,
       num_sections: numSections,
       partial_chunks: partialChunks,
-      update_light: { applied: lightApplied, orphan: lightOrphans, bad: lightBad },
+      merged_chunks: mergedChunks,
+      update_light: { applied: lightApplied, pending: lightPending, orphan: lightOrphans, bad: lightBad },
       bulk_packets: bulkPackets,
       bulk_columns: bulkColumns,
       trailing_nonzero_chunks: trailingNonZero,
@@ -551,13 +588,15 @@ function main () {
   })
   client.on('packet', (data, meta, buffer, full) => {
     packets++; walkOk++
+    if (RAW_NAMES && RAW_NAMES.has(meta.name) && buffer) fs.appendFileSync(dumpFile + '.raw', `${meta.name} ${buffer.toString('hex')}\n`) // MC_RAW_NAMES=a,b: raw bodies for layout checks
     try { tracker.onPacket(meta.name, data) } catch (e) { entityErrors++; console.error('entity packet ' + meta.name + ': ' + e.message) }
     bytesDec += (full || buffer || Buffer.alloc(0)).length
   })
 
   let hasSky = true
   let partialChunks = 0
-  let lightOrphans = 0; let lightApplied = 0; let lightBad = 0
+  let mergedChunks = 0
+  let lightOrphans = 0; let lightPending = 0; let lightApplied = 0; let lightBad = 0
   client.on('login', (p) => {
     m.join_ms = Date.now() - t0
     if (LEGACY_SECTIONS || LEGACY8) {
@@ -600,9 +639,17 @@ function main () {
       return
     }
     try {
-      if ((LEGACY_SECTIONS || SECTIONS_114) && !p.groundUp) { partialChunks++; armIdle(); return } // section-only update: ignored (documented)
       const c = LEGACY_SECTIONS ? decodeLegacyColumn(p, hasSky) : SECTIONS_114 ? decodeChunk114(p) : decodeChunk(p, numSections)
+      if ((LEGACY_SECTIONS || SECTIONS_114) && !p.groundUp) {
+        // section-only update: merged into the stored column (like mc_world.world_apply); unknown column = dropped
+        const stored = chunks.get(`${c.x},${c.z}`)
+        if (!stored) partialChunks++
+        else { mergeUpdate(stored, c, p.bitMap); mergedChunks++ }
+        armIdle()
+        return
+      }
       chunks.set(`${c.x},${c.z}`, c)
+      if (SECTIONS_114 && process.env.MC_KEEP_LIGHT) attachPending(c)
     } catch (e) {
       chunkErrors++
       console.error(`chunk decode failed at ${p.x},${p.z}: ${e.message}`)
@@ -616,13 +663,34 @@ function main () {
   // array replaces the one of the same section bit, an "empty" bit drops it) and hashes sky arrays then block arrays in
   // ascending bit order. Own parser (restBuffer), independent of the Firn decoder. A packet for an unknown column is
   // counted as orphan (the Firn client drops it too).
+  // Light for a column that is not stored yet (1.14 - 1.16.5 send update_light BEFORE the chunk) is kept per column and
+  // attached when the column arrives (counted as pending, then applied). A chunk sent again starts without light.
+  const pendingLight = new Map()
+  const lightHash = (st) => {
+    const f = new Fnv64()
+    for (const map of [st.sky, st.block]) {
+      for (const bit of [...map.keys()].sort((a, b) => a - b)) for (const b of map.get(bit)) f.byte(b)
+    }
+    return { sky: st.sky.size, block: st.block.size, h: f.hex() }
+  }
+  const attachPending = (c) => {
+    const k = `${c.x},${c.z}`
+    const st = pendingLight.get(k)
+    if (!st) return
+    pendingLight.delete(k)
+    c.lightState = st
+    c.light = lightHash(st)
+    lightApplied++
+  }
   client.on('update_light', (p) => {
     if (!SECTIONS_114 || !process.env.MC_KEEP_LIGHT) return
-    const c = chunks.get(`${p.chunkX},${p.chunkZ}`)
-    if (!c) { lightOrphans++; return }
+    const key = `${p.chunkX},${p.chunkZ}`
+    const c = chunks.get(key)
+    let st
+    if (c) st = c.lightState || (c.lightState = { sky: new Map(), block: new Map() })
+    else { st = pendingLight.get(key); if (!st) { st = { sky: new Map(), block: new Map() }; pendingLight.set(key, st) } }
     try {
       const r = new Reader(p.data)
-      const st = c.lightState || (c.lightState = { sky: new Map(), block: new Map() })
       const u32 = (v) => v >>> 0
       const readSet = (mask, empty, map) => {
         for (let bit = 0; bit < 32; bit++) {
@@ -638,12 +706,7 @@ function main () {
       readSet(p.skyLightMask, p.emptySkyLightMask, st.sky)
       readSet(p.blockLightMask, p.emptyBlockLightMask, st.block)
       if (!r.eof()) throw new Error('update_light: trailing octets')
-      const f = new Fnv64()
-      for (const map of [st.sky, st.block]) {
-        for (const bit of [...map.keys()].sort((a, b) => a - b)) for (const b of map.get(bit)) f.byte(b)
-      }
-      c.light = { sky: st.sky.size, block: st.block.size, h: f.hex() }
-      lightApplied++
+      if (c) { c.light = lightHash(st); lightApplied++ } else lightPending++
     } catch (e) { lightBad++; console.error(`update_light failed at ${p.chunkX},${p.chunkZ}: ${e.message}`) }
     armIdle()
   })

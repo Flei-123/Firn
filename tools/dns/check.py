@@ -199,17 +199,26 @@ def part_b():
             bad('%s did not resolve' % ln.split(' ')[0], ln)
             continue
         name, mine = m.group(1), set(m.group(5).split())
-        # what Python's resolver and 1.1.1.1/8.8.8.8 say (a CDN rotates: any overlap is a pass)
+        # A CDN rotates answers per query and per resolver: compare SETS. Pass when the answer sets
+        # intersect (Firn's answer lies in the union of getaddrinfo + dig answers); the union is
+        # accumulated over several rounds, and Firn is asked again each round.
         theirs = set()
-        for _ in range(3):
-            try:
-                theirs |= {a[4][0] for a in socket.getaddrinfo(name, 443, socket.AF_INET)}
-            except OSError:
-                pass
-            for ns in ('1.1.1.1', '8.8.8.8'):
-                r = sh('dig +short +time=3 +tries=1 A %s @%s' % (name, ns))
-                theirs |= {x for x in r.stdout.split() if re.fullmatch(r'\d+\.\d+\.\d+\.\d+', x)}
-        check(bool(mine & theirs), '%s -> %s agrees with getaddrinfo and dig' % (name, ' '.join(sorted(mine))),
+        for rnd in range(4):
+            for _ in range(2):
+                try:
+                    theirs |= {a[4][0] for a in socket.getaddrinfo(name, 443, socket.AF_INET)}
+                except OSError:
+                    pass
+                for ns in ('1.1.1.1', '8.8.8.8'):
+                    r = sh('dig +short +time=3 +tries=1 A %s @%s' % (name, ns))
+                    theirs |= {x for x in r.stdout.split() if re.fullmatch(r'\d+\.\d+\.\d+\.\d+', x)}
+            if mine & theirs:
+                break
+            again, _rc = run_dns([name])
+            m2 = re.match(r'(\S+) OK (udp|tcp|cache) (\d+) (\d+) (.*)', again[0]) if again else None
+            if m2:
+                mine |= set(m2.group(5).split())
+        check(bool(mine & theirs), '%s -> %s agrees with getaddrinfo and dig (set overlap)' % (name, ' '.join(sorted(mine))),
               'theirs: ' + ' '.join(sorted(theirs)))
     # the CNAME chain of www.microsoft.com is followed
     m = re.match(r'www\.microsoft\.com OK \w+ \d+ (\d+) ', [l for l in lines if l.startswith('www.microsoft.com')][0]) if any(l.startswith('www.microsoft.com') for l in lines) else None

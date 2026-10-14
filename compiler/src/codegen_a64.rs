@@ -79,6 +79,9 @@ use crate::regalloc_a64::{self, RaA64};
 use crate::syscalls;
 use std::collections::HashMap;
 
+/// `--shared` (aarch64 .so): the word that holds the Firn thread block pointer instead of `tpidr_el0`.
+const SHARED_TP: &str = "__firn_thread_ptr";
+
 /// Argument registers of AAPCS64, integer class.
 const ARG_REGS: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
 /// Argument registers of AAPCS64, floating point class (the `d` names; for
@@ -769,6 +772,10 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // and `__cpu_features()` answers it.
     e.raw(".arch armv8-a+crypto+crc");
     e.raw(".text");
+    // `--shared` without a `fn main`: no `_start` (nothing would call `main`).
+    let no_start = crate::target::shared() && !m.funcs.iter().any(|f| f.name == "main");
+    let auxv = crate::simd_a64::needs_auxv(m);
+    if !no_start {
     e.raw(".globl _start");
     e.raw("_start:");
     // At process start `sp` points at [argc][argv0]...[0][envp...]. That
@@ -781,7 +788,6 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // ROUND 91: the auxiliary vector, BEFORE anything else. `sp` still
     // points at it here; four instructions keep the pointer so that
     // `__cpu_features()` can read AT_HWCAP later (simd_a64.rs).
-    let auxv = crate::simd_a64::needs_auxv(m);
     if auxv {
         crate::simd_a64::emit_auxv_save(&mut e);
     }
@@ -798,8 +804,9 @@ pub fn emit(m: &Module) -> Result<String, String> {
     e.line("mov x8, #93"); // exit(2) — 60 on x86-64, 93 here
     e.line("svc #0");
     e.line("brk #0");
+    }
 
-    if !m.funcs.iter().any(|f| f.name == "main") {
+    if !no_start && !m.funcs.iter().any(|f| f.name == "main") {
         return Err("no entry point: 'fn main() -> i32' is missing".to_string());
     }
     for f in &m.funcs {
@@ -834,6 +841,9 @@ pub fn emit(m: &Module) -> Result<String, String> {
     }
     if auxv {
         e.raw(&crate::simd_a64::auxv_data_asm());
+    }
+    if crate::target::shared() {
+        e.raw(&format!(".bss\n.balign 8\n{}:\n    .zero 8", SHARED_TP));
     }
     e.raw(".section .note.GNU-stack,\"\",%progbits");
     Ok(e.out)
@@ -1504,6 +1514,13 @@ fn emit_inst(
         }
         Op::ThreadSpawn { arg, stack, ctid } => {
             let d = i.dst.ok_or("internal error: spawn without target")?;
+            if crate::target::shared() {
+                // aarch64 `.so`: no Firn threads (the per-thread register belongs to the host).
+                // The spawn "fails" like a refused `clone`: -ENOSYS.
+                e.line("movn x0, #37"); // -38
+                store_dst(e, fr, d, "x0");
+                return Ok(());
+            }
             load_full(e, fr, "x0", *arg);
             load_full(e, fr, "x1", *stack);
             load_full(e, fr, "x2", *ctid);
@@ -1518,7 +1535,14 @@ fn emit_inst(
             // the register is 0 — the same starting value `fs` has, which is
             // what `__thread_tcb` in lib/gc/gc.fi checks for.
             let d = i.dst.ok_or("internal error: threadself without target")?;
-            e.line(&format!("mrs {}, tpidr_el0", A));
+            if crate::target::shared() {
+                // `.so`: `tpidr_el0` belongs to the HOST (glibc TLS). The Firn thread
+                // block pointer lives in a private word of the library instead.
+                e.line(&format!("adrp {}, {}", ADDR, SHARED_TP));
+                e.line(&format!("ldr {}, [{}, :lo12:{}]", A, ADDR, SHARED_TP));
+            } else {
+                e.line(&format!("mrs {}, tpidr_el0", A));
+            }
             store_dst(e, fr, d, A);
         }
         Op::CopyMem { dst, src, size } => {
@@ -1669,7 +1693,12 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
             }
         }
         load_full(e, fr, A, given[1]);
-        e.line(&format!("msr tpidr_el0, {}", A));
+        if crate::target::shared() {
+            e.line(&format!("adrp {}, {}", ADDR, SHARED_TP));
+            e.line(&format!("str {}, [{}, :lo12:{}]", A, ADDR, SHARED_TP));
+        } else {
+            e.line(&format!("msr tpidr_el0, {}", A));
+        }
         if let Some(d) = i.dst {
             e.line(&format!("mov {}, xzr", A));
             store_dst(e, fr, d, A);

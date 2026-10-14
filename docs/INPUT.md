@@ -58,3 +58,8 @@ NOT proven: invisible cursor (visual), real mouse/keyboard, Windows at runtime (
 
 ## NOT done (roadmap)
 - real IME (ibus / fcitx) and Windows runs, `ft_surround` from apphost, Wayland text-input, DirectInput / HID-only pads, rumble on a real pad, trigger rumble (Xbox One impulse triggers).
+
+## Browser gamepads (`input.webpad`)
+
+See docs/WEBGL2.md section 10. `webpad_poll(slot, &pad)` = the Gamepad API (standard mapping only) as the same logical pad as `pad_poll`; test `tests/2930_input_webpad.fi`.
+Not done: rumble, non-standard mappings, real hardware.
