@@ -61,6 +61,6 @@ Screen-door (ordered dither) fade between two representations of a column, in th
   - `FK_TOFULL` (mode 2 -> 0): sections fade in over the LOD mesh, which fades out. Translucent (water/glass) meshes follow the same mask.
   - Coming back inside `dist` during FK_TOLOD cancels the fade (sections are still there).
 - `stream_flush` waits for `st.lod_fading == 0` (converged = no fade running), `stream_lod_fade` returns the kind. Draws reset the fade to off before the entity pass.
-- Measured (tests/2917 D, static camera, ring events dist 2->4, 4->2, far bin 4->8, 16 frames each, 96x54): worst frame-to-frame change 57 -> 20 px (-65 %), summed change equal (131 / 131), holes against the pre-event image 156 -> 124. Per-frame change is spread over the fade instead of one frame.
+- Measured (tests/2918, static camera, ring events dist 2->4, 4->2, far bin 4->8, 16 frames each, 96x54): worst frame-to-frame change 57 -> 20 px (-65 %), summed change equal (131 / 131), holes against the pre-event image 156 -> 124. Per-frame change is spread over the fade instead of one frame.
 - GL vs CPU (tools/gpu dump.fi scenes `fade_a` / `fade_b`, a = 24): coverage mismatch 2-3 px of ~12k / ~20k, PSNR 47 / 45 dB (llvmpipe).
 - Trade-off: error against the converged full-detail image is higher while fading (a fading column keeps its old look for `lod_fade_frames` frames).
