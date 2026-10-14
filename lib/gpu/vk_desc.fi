@@ -4,22 +4,25 @@
 // descriptor pool + sets, nearest sampler, pipeline layout with a push constant range, and the voxel graphics pipeline
 // (vertex = one uvec2 per vertex like lib/mc/mc_mesh.fi, depth LESS, optional alpha blend without depth write).
 //
-// Shader contract (lib/gpu/vkmc/mc.vert/.frag, VK2 replaces the SPIR-V behind the same interface): location 0 uvec2; set 0 binding 0
-// UBO (vertex + fragment), binding 1 combined image sampler (fragment); push constants PUSH_BYTES (vertex + fragment).
+// Shader contract (lib/gpu/vk_shaders.fi, VK2): location 0 uvec2; set 0: binding 0 dynamic UBO `Frame` (320 octets, vertex + fragment),
+// bindings 1..4 atlas pages (combined image sampler, 2D_ARRAY, fragment), bindings 5 / 6 uniform texel buffers (vertex, pool mode);
+// push constants PUSH_BYTES (vertex stage only: origin.xyz + pool).
 // THREADS: main thread only.
 
 import std.rt
 import gpu.vk_mem
 
 export {
-    Desc, VPipe, desc_new, desc_free, desc_write_ubo, desc_write_atlas, sampler_make, playout_make, rpass_voxel,
+    Desc, VPipe, desc_new, desc_free, desc_write_ubo, desc_write_atlas, desc_write_texel, bview_make, bview_free, sampler_make, playout_make, rpass_voxel,
     depth_make, fb_make2, shader_module, pipeline_voxel, vpipe_none, vpipe_free, desc_none,
-    PUSH_BYTES, FMT_RGBA8, FMT_D32, FINAL_TRANSFER_SRC, FINAL_PRESENT,
+    PUSH_BYTES, FMT_RGBA8, FMT_D32, FMT_R32UI, FMT_RGBA32F, FINAL_TRANSFER_SRC, FINAL_PRESENT,
 }
 
-const PUSH_BYTES: u64 = 48 // org.xyz + trans, fade, light (3 x vec4)
+const PUSH_BYTES: u64 = 16 // vec3 origin (minus camera) + int pool, vertex stage
 const FMT_RGBA8: u32 = 37 // R8G8B8A8_UNORM
 const FMT_D32: u32 = 126 // D32_SFLOAT
+const FMT_R32UI: u32 = 98 // R32_UINT (texel buffer u_gran)
+const FMT_RGBA32F: u32 = 109 // R32G32B32A32_SFLOAT (texel buffer u_org)
 const FINAL_TRANSFER_SRC: u64 = 6
 const FINAL_PRESENT: u64 = 1000001002
 
@@ -75,33 +78,46 @@ fn desc_new(x: *mut vk_mem.X, nsets: usize) -> Desc {
         return desc_none()
     }
     (*x).top = 0
-    let bd: u64 = vk_mem.xsa(x, 48)
-    vk_mem.w32(bd, 0, 0) // binding 0
-    vk_mem.w32(bd, 4, 6) // UNIFORM_BUFFER
+    let bd: u64 = vk_mem.xsa(x, 24 * 7) // 7 VkDescriptorSetLayoutBinding (24 octets each)
+    vk_mem.w32(bd, 0, 0) // binding 0: dynamic UBO `Frame`
+    vk_mem.w32(bd, 4, 8) // UNIFORM_BUFFER_DYNAMIC
     vk_mem.w32(bd, 8, 1)
     vk_mem.w32(bd, 12, 0x11) // VERTEX | FRAGMENT
-    vk_mem.w32(bd, 24, 1) // binding 1
-    vk_mem.w32(bd, 28, 1) // COMBINED_IMAGE_SAMPLER
-    vk_mem.w32(bd, 32, 1)
-    vk_mem.w32(bd, 36, 0x10) // FRAGMENT
+    var k: usize = 1
+    while k <= 4 {
+        vk_mem.w32(bd, k * 24, k as u64) // bindings 1..4: atlas pages
+        vk_mem.w32(bd, k * 24 + 4, 1) // COMBINED_IMAGE_SAMPLER
+        vk_mem.w32(bd, k * 24 + 8, 1)
+        vk_mem.w32(bd, k * 24 + 12, 0x10) // FRAGMENT
+        k = k + 1
+    }
+    while k <= 6 {
+        vk_mem.w32(bd, k * 24, k as u64) // bindings 5, 6: texel buffers (pool mode)
+        vk_mem.w32(bd, k * 24 + 4, 4) // UNIFORM_TEXEL_BUFFER (4; 5 = STORAGE_TEXEL_BUFFER)
+        vk_mem.w32(bd, k * 24 + 8, 1)
+        vk_mem.w32(bd, k * 24 + 12, 0x1) // VERTEX
+        k = k + 1
+    }
     let li: u64 = vk_mem.xsa(x, 32)
     vk_mem.w32(li, 0, 32) // DESCRIPTOR_SET_LAYOUT_CREATE_INFO
-    vk_mem.w32(li, 20, 2)
+    vk_mem.w32(li, 20, 7)
     vk_mem.w64(li, 24, bd)
     let out: u64 = vk_mem.xsa(x, 8)
     if !vk_mem.good(vk_mem.cx(x, vk_mem.X_CREATE_DSL, (*x).dev, li, 0, out, 0, 0, 0, 0, 0, 0)) {
         return desc_none()
     }
     d.dsl = vk_mem.r64(out, 0)
-    let ps: u64 = vk_mem.xsa(x, 16)
-    vk_mem.w32(ps, 0, 6)
+    let ps: u64 = vk_mem.xsa(x, 24)
+    vk_mem.w32(ps, 0, 8) // UNIFORM_BUFFER_DYNAMIC
     vk_mem.w32(ps, 4, nsets as u64)
-    vk_mem.w32(ps, 8, 1)
-    vk_mem.w32(ps, 12, nsets as u64)
+    vk_mem.w32(ps, 8, 1) // COMBINED_IMAGE_SAMPLER
+    vk_mem.w32(ps, 12, (nsets * 4) as u64)
+    vk_mem.w32(ps, 16, 4) // UNIFORM_TEXEL_BUFFER (4; 5 = STORAGE_TEXEL_BUFFER)
+    vk_mem.w32(ps, 20, (nsets * 2) as u64)
     let pi: u64 = vk_mem.xsa(x, 40)
     vk_mem.w32(pi, 0, 33) // DESCRIPTOR_POOL_CREATE_INFO
     vk_mem.w32(pi, 20, nsets as u64)
-    vk_mem.w32(pi, 24, 2)
+    vk_mem.w32(pi, 24, 3)
     vk_mem.w64(pi, 32, ps)
     if !vk_mem.good(vk_mem.cx(x, vk_mem.X_CREATE_DPOOL, (*x).dev, pi, 0, out, 0, 0, 0, 0, 0, 0)) {
         return desc_none()
@@ -158,33 +174,74 @@ fn desc_write_ubo(x: *mut vk_mem.X, d: *mut Desc, i: usize, buf: u64, range: u64
     vk_mem.w64(wr, 16, vk_mem.r64((*d).sets, i * 8))
     vk_mem.w32(wr, 24, 0)
     vk_mem.w32(wr, 32, 1)
-    vk_mem.w32(wr, 36, 6) // UNIFORM_BUFFER
+    vk_mem.w32(wr, 36, 8) // UNIFORM_BUFFER_DYNAMIC
     vk_mem.w64(wr, 48, bi)
     vk_mem.cx(x, vk_mem.X_UPDATE_DSETS, (*x).dev, 1, wr, 0, 0, 0, 0, 0, 0, 0)
 }
 
-// Binding 1 of set `i`: the atlas texture array (layout SHADER_READ_ONLY) + the sampler.
+// Bindings 1..4 of set `i`: the atlas texture array (layout SHADER_READ_ONLY) + the sampler. Unused pages bind the same view again.
 fn desc_write_atlas(x: *mut vk_mem.X, d: *mut Desc, i: usize, view: u64) {
     (*x).top = 0
     let ii: u64 = vk_mem.xsa(x, 24)
     vk_mem.w64(ii, 0, (*d).sampler)
     vk_mem.w64(ii, 8, view)
     vk_mem.w32(ii, 16, 5) // SHADER_READ_ONLY_OPTIMAL
+    let wr: u64 = vk_mem.xsa(x, 64 * 4)
+    var k: usize = 0
+    while k < 4 {
+        vk_mem.w32(wr, k * 64, 35)
+        vk_mem.w64(wr, k * 64 + 16, vk_mem.r64((*d).sets, i * 8))
+        vk_mem.w32(wr, k * 64 + 24, (k + 1) as u64)
+        vk_mem.w32(wr, k * 64 + 32, 1)
+        vk_mem.w32(wr, k * 64 + 36, 1) // COMBINED_IMAGE_SAMPLER
+        vk_mem.w64(wr, k * 64 + 40, ii)
+        k = k + 1
+    }
+    vk_mem.cx(x, vk_mem.X_UPDATE_DSETS, (*x).dev, 4, wr, 0, 0, 0, 0, 0, 0, 0)
+}
+
+// Binding `binding` (5 or 6) of set `i`: a uniform texel buffer view.
+fn desc_write_texel(x: *mut vk_mem.X, d: *mut Desc, i: usize, binding: u64, bview: u64) {
+    (*x).top = 0
+    let bv: u64 = vk_mem.xsa(x, 8)
+    vk_mem.w64(bv, 0, bview)
     let wr: u64 = vk_mem.xsa(x, 64)
     vk_mem.w32(wr, 0, 35)
     vk_mem.w64(wr, 16, vk_mem.r64((*d).sets, i * 8))
-    vk_mem.w32(wr, 24, 1)
+    vk_mem.w32(wr, 24, binding)
     vk_mem.w32(wr, 32, 1)
-    vk_mem.w32(wr, 36, 1) // COMBINED_IMAGE_SAMPLER
-    vk_mem.w64(wr, 40, ii)
+    vk_mem.w32(wr, 36, 4) // UNIFORM_TEXEL_BUFFER (4; 5 = STORAGE_TEXEL_BUFFER)
+    vk_mem.w64(wr, 56, bv)
     vk_mem.cx(x, vk_mem.X_UPDATE_DSETS, (*x).dev, 1, wr, 0, 0, 0, 0, 0, 0, 0)
 }
 
-// Pipeline layout: set layout `dsl` + one push constant range (VERTEX | FRAGMENT, offset 0, PUSH_BYTES).
+// Buffer view over `size` octets of `buf` (usage must include U_TEXEL). 0 = failed.
+fn bview_make(x: *mut vk_mem.X, buf: u64, fmt: u32, size: u64) -> u64 {
+    (*x).top = 0
+    let ci: u64 = vk_mem.xsa(x, 56)
+    vk_mem.w32(ci, 0, 13) // BUFFER_VIEW_CREATE_INFO
+    vk_mem.w64(ci, 24, buf)
+    vk_mem.w32(ci, 32, fmt as u64)
+    vk_mem.w64(ci, 40, 0)
+    vk_mem.w64(ci, 48, size)
+    let out: u64 = vk_mem.xsa(x, 8)
+    if !vk_mem.good(vk_mem.cx(x, vk_mem.X_CREATE_BVIEW, (*x).dev, ci, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return 0
+    }
+    return vk_mem.r64(out, 0)
+}
+
+fn bview_free(x: *mut vk_mem.X, v: u64) {
+    if v != 0 {
+        vk_mem.cx(x, vk_mem.X_DESTROY_BVIEW, (*x).dev, v, 0, 0, 0, 0, 0, 0, 0, 0)
+    }
+}
+
+// Pipeline layout: set layout `dsl` + one push constant range (VERTEX, offset 0, PUSH_BYTES).
 fn playout_make(x: *mut vk_mem.X, dsl: u64) -> u64 {
     (*x).top = 0
     let pr: u64 = vk_mem.xsa(x, 12)
-    vk_mem.w32(pr, 0, 0x11)
+    vk_mem.w32(pr, 0, 0x1)
     vk_mem.w32(pr, 4, 0)
     vk_mem.w32(pr, 8, PUSH_BYTES)
     let sl: u64 = vk_mem.xsa(x, 8)
@@ -310,8 +367,8 @@ fn shader_module(x: *mut vk_mem.X, code: u64, size: usize) -> u64 {
 }
 
 // The voxel pipeline: one binding, stride 8, location 0 = R32G32_UINT; triangle list, back-face culling (as GL and mc_raster), depth test LESS (write on, or off for
-// the translucent pass `trans`, which also blends SRC_ALPHA / ONE_MINUS_SRC_ALPHA); viewport + scissor dynamic.
-fn pipeline_voxel(x: *mut vk_mem.X, rpass: u64, playout: u64, vs: u64, vsn: usize, fs: u64, fsn: usize, trans: bool) -> VPipe {
+// the translucent pass `trans`, which also blends SRC_ALPHA / ONE_MINUS_SRC_ALPHA); viewport + scissor dynamic. `cache` = VkPipelineCache (v.cache, 0 = none).
+fn pipeline_voxel(x: *mut vk_mem.X, cache: u64, rpass: u64, playout: u64, vs: u64, vsn: usize, fs: u64, fsn: usize, trans: bool) -> VPipe {
     var p: VPipe = vpipe_none()
     p.vs = shader_module(x, vs, vsn)
     p.fs = shader_module(x, fs, fsn)
@@ -408,7 +465,7 @@ fn pipeline_voxel(x: *mut vk_mem.X, rpass: u64, playout: u64, vs: u64, vsn: usiz
     vk_mem.w64(gi, 104, playout)
     vk_mem.w64(gi, 112, rpass)
     vk_mem.w32(gi, 136, 0xFFFFFFFF)
-    if !vk_mem.good(vk_mem.cx(x, vk_mem.X_CREATE_GPIPE, (*x).dev, 0, 1, gi, 0, out, 0, 0, 0, 0)) {
+    if !vk_mem.good(vk_mem.cx(x, vk_mem.X_CREATE_GPIPE, (*x).dev, cache, 1, gi, 0, out, 0, 0, 0, 0)) {
         return p
     }
     p.pipe = vk_mem.r64(out, 0)
