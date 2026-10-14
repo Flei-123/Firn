@@ -62,6 +62,20 @@ Single run, radius 8, 640x360, 60 frames, fixture tiled, firnc of 8 Oct, `uptime
 Series 8 / 16 / 32 with 3 runs: started via heavy (queue), results in `reports/perf_*_cpu_r*.tsv` if finished -- otherwise OPEN.
 The 8-block frame times include on-demand meshing along the flight (budget 16 sections / frame) -- that is deliberate (p99).
 
+### 4b. Series 8 / 16 / 32 (14.10., 640x360, fixture tiled, main 8c7eb2abc; NO GPU: CPU raster vs Mesa llvmpipe GL, both software; Vanilla NOT measured)
+Single runs per radius (r8: 2 runs; 30 frames, warm 8; r8 40 frames), server load 13-19 (`uptime` at the start of each run). bench.fi has its own scenario (not mc_stream): the stream changes of 14.10. are not in these numbers.
+| radius (columns) | back end | frame p50 / p99 | tris per frame | sections drawn | load (end to end) | RSS loaded |
+|---|---|---|---|---|---|---|
+| 8 | CPU raster | 431 / 738 ms and 313 / 386 ms (2 runs) | 468,943 | 491 | 5.3-5.5 s | 151 MB |
+| 8 | GL llvmpipe | 102 / 130 ms and 84 / 129 ms | 468,943 | 491 | 3.0-3.1 s | 303-306 MB |
+| 16 | CPU raster | 1157 / 1602 ms | 1,994,822 | 2185 | 22.8 s | 463 MB |
+| 16 | GL llvmpipe | 331 / 385 ms | 1,994,822 | 2185 | 13.3 s | 630 MB |
+| 32 | CPU raster | 3550 / 4149 ms | 7,433,688 | 8088 | 156 s | 1634 MB |
+| 32 | GL llvmpipe | 1218 / 1511 ms | 7,433,688 | 8088 | 119 s | 1722 MB |
+llvmpipe uses all cores for rasterising, the CPU raster is one thread: the ratio (3-4x) says nothing about a real GPU. Frame times include on-demand meshing (budget 16 sections / frame).
+The 3-run series through `heavy` (reports/perf_20261014-0521*) FAILED to produce frame data: `BENCH_COMP=1` (component probe) segfaults intermittently in `perf_components` (R 8: 2 of 5 direct runs, every run under heavy) -> see section 5;
+run.sh now leaves the probe off (`PERF_COMP=1` enables it). The TSVs of that run only hold startup / build_chunk metrics (build_chunk p50 ~1.6-2.0 ms, ~490-620 chunks/s).
+
 ### 4a. Parallel snapshot (r103, 14.10., main 8c7eb2abc; tests/2915 async load from empty, 4 workers, 189 sections, server load ~30 -> noisy)
 | | before (serial pad fill on the render thread) | after (pad filled by workers / end-of-frame barrier) |
 |---|---|---|
@@ -71,6 +85,7 @@ The 8-block frame times include on-demand meshing along the flight (budget 16 se
 Not a clean A/B (the load of the server changes between runs); the direction (about 2x less on the render thread) held in every pair. Frame budget test: >= 90 % of the frames inside `snap_budget_us` + 3 ms, no frame > 250 ms (CPU raster draw included).
 
 ## 5. Known problems / open
+* **perf_components segfault (14.10., reproducible):** `BENCH_COMP=1 bench world.mcw 8 20 5` (with `BENCH_T0_NS` set) crashes after `world_chunks` (rc 139); the same command without T0 passed twice, so it is timing/heap dependent. The r4 note below ("does NOT reproduce") was too optimistic. Open: find the heap corruption (backend_mesh_upload / perf_components).
 * `BENCH_COMP=1 BENCH_COMPUPLOAD=1` (mesh + upload components per section): the reported crash in `mc_raster.backend_mesh_upload` does
   **NOT reproduce** on main (13.10.): 915 upload/free cycles at radius 8 and 16, with and without free (`BENCH_NOFREE=1`), with both firnc builds
   (8 Oct and w-r5), no crash. Regression test tests/2862_mc_upload_cycles.fi (6000 cycles, random sizes, 300 live handles, slot table growth, content
