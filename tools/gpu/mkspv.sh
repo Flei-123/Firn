@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/gpu/mkspv.sh -- builds the Vulkan SPIR-V of the MC renderer from lib/gpu/vk_glsl/*.glsl (docs/VK-SHADERS.md).
+# tools/gpu/mkspv.sh -- builds the Vulkan SPIR-V of the MC renderer from lib/gpu/vk_glsl/*.glsl (docs/VK-RENDERER.md (Shaders)).
 #   bash tools/gpu/mkspv.sh            regenerate lib/gpu/spv/vk_*.spv (glslangValidator -V, Vulkan 1.0) + spirv-val
 #   bash tools/gpu/mkspv.sh --check    build into a temp dir and compare BYTE-EQUAL with the committed .spv (needs the tools)
 #   bash tools/gpu/mkspv.sh --parity   compare the shader bodies with the OpenGL shaders (lib/gpu/*.glsl): the diff must be

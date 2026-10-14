@@ -18,8 +18,8 @@
 // set, command buffer, fence. `end` does not wait; `begin` waits for the slot it reuses; `present` waits for the newest frame.
 // Mesh upload: vertices + indices of one mesh in ONE device buffer; the copy is recorded into the upload command buffer of the next
 // frame slot (submitted before that frame, one barrier to vertex/index reads), staging buffers and freed meshes are released once the
-// frame that could use them has finished. Shaders: lib/gpu/vkmc/mc.vert|frag (SPIR-V embedded).
-// Not here yet (roadmap r180): sky, HUD, entities (draw_entities is a no-op), LOD cross fade works (fade in the push constants).
+// frame that could use them has finished. Shaders: lib/gpu/vk_shaders.fi (VK2, docs/VK-RENDERER.md): Frame UBO slices with dynamic offset,
+// push constants 16 B (origin), pipeline cache from gpu.vk_life. Not here yet (roadmap r180): sky, HUD, entities (draw_entities is a no-op).
 // THREADS: main thread only.
 
 import std.rt
@@ -32,18 +32,22 @@ import gpu.vk
 import gpu.vk_mem
 import gpu.vk_desc
 import gpu.vk_frame
+import gpu.vk_shaders
+import gpu.vk_life
 
 export {
-    VkBackend, vkbe_open, vkbe_close, vkbe_backend, vkbe_set_fog, vkbe_set_light, vkbe_resize, vkbe_device_name, vkbe_is_cpu,
+    VkBackend, vkbe_open, vkbe_open_cache, vkbe_on_rebuild, vkbe_close, vkbe_backend, vkbe_set_fog, vkbe_set_light, vkbe_resize, vkbe_device_name, vkbe_is_cpu,
     vkbe_draws, vkbe_tris, vkbe_frames, vkbe_layers_lost, vkbe_in_flight, vkbe_set_readback, vkbe_wait, vkbe_mem_stats,
     vkbe_live_meshes, vkbe_upload_bytes, vkbe_frame_ms,
 }
 
-const VS_SPV: str = __include_str("../gpu/vkmc/mc.vert.spv")
-const FS_SPV: str = __include_str("../gpu/vkmc/mc.frag.spv")
 
 const NFR: usize = 2 // frames in flight
-const UBO_BYTES: u64 = 112
+const UBO_STRIDE: usize = 512 // one `Frame` slice (320 octets used); >= minUniformBufferOffsetAlignment (256 at most)
+const UBO_SLICES: usize = 256 // slices per frame slot: one per (pass / fade / light) state change
+const UBO_BYTES: u64 = 131072 // UBO_STRIDE * UBO_SLICES
+const TB_BYTES: u64 = 256 // dummy texel buffers (pool mode off): zero filled
+const PAGEL_SINGLE: u64 = 1073741824 // u_pagel >= 1048576: the whole atlas is ONE array (page 0)
 const MW: usize = 8 // words per mesh slot
 const M_USED: usize = 0
 const M_BUF: usize = 1
@@ -76,6 +80,17 @@ struct VkBackend {
     x: vk_mem.X,
     fr: vk_frame.Frames,
     d: vk_desc.Desc,
+    life: vk_life.Life, // pipeline cache (v.cache) + device lost / swapchain bookkeeping
+    cache_path: str,
+    base: u64, // FRAME_SIZE octets: the per-frame part of the Frame UBO, copied into every slice
+    nslice: usize, // slices baked in the current frame
+    slice_off: u64, // dynamic offset of the newest slice
+    ubo_over: u64, // slices that did not fit (state changes beyond UBO_SLICES in one frame)
+    dirty: bool, // pass / fade / light changed since the last bake
+    gran: vk_mem.Buf, // dummy texel buffers for bindings 5 / 6
+    org: vk_mem.Buf,
+    gran_view: u64,
+    org_view: u64,
     w: i32,
     h: i32,
     rp: u64,
@@ -122,7 +137,7 @@ struct VkBackend {
     upload_bytes: u64,
     t0_ns: u64,
     frame_ns: u64,
-    push: u64, // 48 octets scratch for the push constants
+    push: u64, // 16 octets scratch for the push constants (origin.xyz + pool)
     vb: u64, // 8 octets: the vertex buffer handle for vkCmdBindVertexBuffers + offset
 }
 
@@ -133,7 +148,8 @@ fn fslot_none() -> FSlot {
 fn blank() -> VkBackend {
     return VkBackend { ok: false, step: 0, v: vk.vk_new(), x: vk_mem.x_new(),
         fr: vk_frame.Frames { ok: false, pool: 0, n: 0, w: 0, icmd: 0, ifence: 0, serial: 0, done: 0, tpending: false },
-        d: vk_desc.desc_none(), w: 0, h: 0, rp: 0, playout: 0, pipe_op: vk_desc.vpipe_none(), pipe_tr: vk_desc.vpipe_none(),
+        d: vk_desc.desc_none(), life: vk_life.life_new(), cache_path: "", base: 0, nslice: 0, slice_off: 0, ubo_over: 0, dirty: true,
+        gran: vk_mem.buf_none(), org: vk_mem.buf_none(), gran_view: 0, org_view: 0, w: 0, h: 0, rp: 0, playout: 0, pipe_op: vk_desc.vpipe_none(), pipe_tr: vk_desc.vpipe_none(),
         fs: [fslot_none(); 2], atlas: vk_mem.img_none(), tile: 0, layers_lost: 0, meshes: 0, mcap: 0, live: 0, dfr: 0, dcap: 0,
         dn: 0, cur: 0, next: 0, in_frame: false, has_last: false, last: 0, trec: false, readback: true, trans: false,
         cx: 0.0, cy: 0.0, cz: 0.0, fade_a: 64.0, fade_inv: 0.0, day: 256.0, tr: 256.0, tg: 256.0, tb: 256.0, fog_on: false,
@@ -175,7 +191,7 @@ fn targets_make(b: *mut VkBackend) -> bool {
             if !(*b).fs[i].ubo.ok {
                 return false
             }
-            vk_desc.desc_write_ubo(&(*b).x, &(*b).d, i, (*b).fs[i].ubo.buf, UBO_BYTES)
+            vk_desc.desc_write_ubo(&(*b).x, &(*b).d, i, (*b).fs[i].ubo.buf, vk_shaders.FRAME_SIZE as u64)
         }
         (*b).fs[i].rb = vk_mem.buf_make(&(*b).x, ((*b).w as u64) * ((*b).h as u64) * 4, vk_mem.U_DST, vk_mem.MEM_STAGING)
         if !(*b).fs[i].rb.ok {
@@ -186,10 +202,40 @@ fn targets_make(b: *mut VkBackend) -> bool {
     return true
 }
 
+// Bindings 5 / 6 (pool mode) are not used by this backend yet (one draw per section): zero filled dummy texel buffers keep the
+// descriptor sets complete.
+fn texel_dummies(b: *mut VkBackend) -> bool {
+    (*b).gran = vk_mem.buf_make(&(*b).x, TB_BYTES, vk_mem.U_TEXEL, vk_mem.MEM_STAGING)
+    (*b).org = vk_mem.buf_make(&(*b).x, TB_BYTES, vk_mem.U_TEXEL, vk_mem.MEM_STAGING)
+    if !(*b).gran.ok || !(*b).org.ok {
+        return false
+    }
+    rt.mem_set((*b).gran.ptr, 0 as u8, TB_BYTES as usize)
+    rt.mem_set((*b).org.ptr, 0 as u8, TB_BYTES as usize)
+    (*b).gran_view = vk_desc.bview_make(&(*b).x, (*b).gran.buf, vk_desc.FMT_R32UI, TB_BYTES)
+    (*b).org_view = vk_desc.bview_make(&(*b).x, (*b).org.buf, vk_desc.FMT_RGBA32F, TB_BYTES)
+    if (*b).gran_view == 0 || (*b).org_view == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < NFR {
+        vk_desc.desc_write_texel(&(*b).x, &(*b).d, i, vk_shaders.B_GRAN as u64, (*b).gran_view)
+        vk_desc.desc_write_texel(&(*b).x, &(*b).d, i, vk_shaders.B_ORG as u64, (*b).org_view)
+        i = i + 1
+    }
+    return true
+}
+
 fn vkbe_open(w: i32, h: i32) -> VkBackend {
+    return vkbe_open_cache(w, h, "")
+}
+
+// `cache_path` != "": the pipeline cache lives in that file (loaded now when valid for this device, saved by vkbe_close).
+fn vkbe_open_cache(w: i32, h: i32, cache_path: str) -> VkBackend {
     var b: VkBackend = blank()
     b.w = w
     b.h = h
+    b.cache_path = cache_path
     if !vk.open(&b.v, false, true) {
         b.step = 1
         return b
@@ -198,9 +244,18 @@ fn vkbe_open(w: i32, h: i32) -> VkBackend {
         b.step = 2
         return b
     }
+    if !vk_life.life_open(&b.v, &b.life) {
+        b.step = 2
+        return b
+    }
+    vk_life.cache_open(&b.v, &b.life, cache_path) // never fails the open: pipelines also work uncached
     b.fr = vk_frame.frames_new(&b.x, NFR)
     b.d = vk_desc.desc_new(&b.x, NFR)
     if !b.fr.ok || !b.d.ok {
+        b.step = 3
+        return b
+    }
+    if !texel_dummies(&b) {
         b.step = 3
         return b
     }
@@ -210,8 +265,10 @@ fn vkbe_open(w: i32, h: i32) -> VkBackend {
         b.step = 4
         return b
     }
-    b.pipe_op = vk_desc.pipeline_voxel(&b.x, b.rp, b.playout, VS_SPV.p as u64, VS_SPV.n, FS_SPV.p as u64, FS_SPV.n, false)
-    b.pipe_tr = vk_desc.pipeline_voxel(&b.x, b.rp, b.playout, VS_SPV.p as u64, VS_SPV.n, FS_SPV.p as u64, FS_SPV.n, true)
+    b.pipe_op = vk_desc.pipeline_voxel(&b.x, b.v.cache, b.rp, b.playout, vk_shaders.MC_VS.p as u64, vk_shaders.MC_VS.n,
+        vk_shaders.MC_FS.p as u64, vk_shaders.MC_FS.n, false)
+    b.pipe_tr = vk_desc.pipeline_voxel(&b.x, b.v.cache, b.rp, b.playout, vk_shaders.MC_VS.p as u64, vk_shaders.MC_VS.n,
+        vk_shaders.MC_FS.p as u64, vk_shaders.MC_FS.n, true)
     if !b.pipe_op.ok || !b.pipe_tr.ok {
         b.step = 6
         return b
@@ -222,6 +279,8 @@ fn vkbe_open(w: i32, h: i32) -> VkBackend {
     b.dcap = 1024
     b.dfr = rt.heap_alloc(b.dcap * DW * 8)
     b.push = rt.heap_alloc(64)
+    b.base = rt.heap_alloc(vk_shaders.FRAME_SIZE)
+    rt.mem_set(b.base, 0 as u8, vk_shaders.FRAME_SIZE)
     b.vb = rt.heap_alloc(32)
     if !targets_make(&b) {
         b.step = 5
@@ -287,6 +346,7 @@ fn vkbe_set_light(b: *mut VkBackend, day: i32, tr: i32, tg: i32, tb: i32) {
     (*b).tr = tr as f64
     (*b).tg = tg as f64
     (*b).tb = tb as f64
+    (*b).dirty = true
 }
 
 fn vkbe_set_fog(b: *mut VkBackend, on: bool, start: f64, end: f64, r: u32, g: u32, bl: u32) {
@@ -360,10 +420,14 @@ fn be_atlas(o: u64, a: u64) {
         (*b).layers_lost = (layers as i32) - ((*b).x.max_layers as i32)
         layers = (*b).x.max_layers as usize
     }
+    var alloc_layers: usize = layers
+    if alloc_layers < 2 {
+        alloc_layers = 2 // the shaders sample a 2D_ARRAY view: a 1-layer image would get a plain 2D view
+    }
     let row: usize = t * 4
     let lbytes: usize = t * row
     let stride: usize = ((*at).w as usize) * 4
-    var st: vk_mem.Buf = vk_mem.buf_make(&(*b).x, (layers * lbytes) as u64, vk_mem.U_SRC, vk_mem.MEM_STAGING)
+    var st: vk_mem.Buf = vk_mem.buf_make(&(*b).x, (alloc_layers * lbytes) as u64, vk_mem.U_SRC, vk_mem.MEM_STAGING)
     if !st.ok {
         return
     }
@@ -378,14 +442,14 @@ fn be_atlas(o: u64, a: u64) {
         }
         l = l + 1
     }
-    (*b).atlas = vk_mem.img_make(&(*b).x, (*at).tile as u32, (*at).tile as u32, layers as u32, vk_desc.FMT_RGBA8, 0x6 as u64, 1 as u64)
+    (*b).atlas = vk_mem.img_make(&(*b).x, (*at).tile as u32, (*at).tile as u32, alloc_layers as u32, vk_desc.FMT_RGBA8, 0x6 as u64, 1 as u64)
     if !(*b).atlas.ok {
         vk_mem.buf_free(&(*b).x, &st)
         return
     }
     let cmd: u64 = vk_frame.imm_begin(&(*b).x, &(*b).fr)
     // UNDEFINED -> TRANSFER_DST, copy all layers, -> SHADER_READ_ONLY (visible to the fragment shader)
-    vk_frame.image_barrier(&(*b).x, cmd, (*b).atlas.img, 1, layers as u64, vk_frame.LAYOUT_UNDEFINED, vk_frame.LAYOUT_TRANSFER_DST,
+    vk_frame.image_barrier(&(*b).x, cmd, (*b).atlas.img, 1, alloc_layers as u64, vk_frame.LAYOUT_UNDEFINED, vk_frame.LAYOUT_TRANSFER_DST,
         vk_frame.ST_TOP, vk_frame.ST_TRANSFER, 0, vk_frame.AC_TRANSFER_WRITE)
     (*b).x.top = 0
     let rg: u64 = vk_mem.xsa(&(*b).x, 56)
@@ -396,7 +460,7 @@ fn be_atlas(o: u64, a: u64) {
     vk_mem.w32(rg, 48, t as u64)
     vk_mem.w32(rg, 52, 1)
     vk_mem.cx(&(*b).x, vk_mem.X_CMD_COPY_B2I, cmd, st.buf, (*b).atlas.img, vk_frame.LAYOUT_TRANSFER_DST, 1, rg, 0, 0, 0, 0)
-    vk_frame.image_barrier(&(*b).x, cmd, (*b).atlas.img, 1, layers as u64, vk_frame.LAYOUT_TRANSFER_DST, vk_frame.LAYOUT_SHADER_READ,
+    vk_frame.image_barrier(&(*b).x, cmd, (*b).atlas.img, 1, alloc_layers as u64, vk_frame.LAYOUT_TRANSFER_DST, vk_frame.LAYOUT_SHADER_READ,
         vk_frame.ST_TRANSFER, vk_frame.ST_FRAGMENT, vk_frame.AC_TRANSFER_WRITE, vk_frame.AC_SHADER_READ)
     vk_frame.imm_submit(&(*b).x, &(*b).fr)
     vk_mem.buf_free(&(*b).x, &st)
@@ -518,21 +582,29 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
     rot.m[14] = 0.0
     var rv: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
     mc_math.mat4_mul(&rv, &(*c).proj, &rot)
-    let u: u64 = (*b).fs[s].ubo.ptr
+    // per-frame part of the Frame UBO (copied into a fresh slice whenever pass / fade / light change, see bake)
+    let u: u64 = (*b).base
     var i: usize = 0
     while i < 16 {
-        vk_mem.wf(u, i * 4, rv.m[i])
+        vk_mem.wf(u, vk_shaders.U_RV + i * 4, rv.m[i])
         i = i + 1
     }
     var fo: f64 = 0.0
     if (*b).fog_on { fo = 1.0 }
-    vk_mem.wf(u, 64, fo)
-    vk_mem.wf(u, 68, (*b).fog_start)
-    vk_mem.wf(u, 72, (*b).fog_end)
-    vk_mem.wf(u, 80, (*b).fog_r)
-    vk_mem.wf(u, 84, (*b).fog_g)
-    vk_mem.wf(u, 88, (*b).fog_b)
-    vk_mem.wf(u, 96, (*b).tile as f64)
+    vk_mem.wf(u, vk_shaders.U_FOG, fo)
+    vk_mem.wf(u, vk_shaders.U_FOG + 4, (*b).fog_start)
+    vk_mem.wf(u, vk_shaders.U_FOG + 8, (*b).fog_end)
+    vk_mem.wf(u, vk_shaders.U_FOGC, (*b).fog_r)
+    vk_mem.wf(u, vk_shaders.U_FOGC + 4, (*b).fog_g)
+    vk_mem.wf(u, vk_shaders.U_FOGC + 8, (*b).fog_b)
+    vk_mem.wf(u, vk_shaders.U_TILES, (*b).tile as f64)
+    vk_mem.wf(u, vk_shaders.U_SIZE, (*b).w as f64)
+    vk_mem.wf(u, vk_shaders.U_SIZE + 4, (*b).h as f64)
+    vk_mem.w32(u, vk_shaders.U_PAGEL, PAGEL_SINGLE)
+    vk_mem.w32(u, vk_shaders.U_FILTER, 0)
+    vk_mem.wf(u, vk_shaders.U_H, (*b).h as f64)
+    (*b).nslice = 0
+    (*b).dirty = true
     let cmd: u64 = vk_frame.frame_cmd(&(*b).fr, s)
     vk_frame.cmd_begin(&(*b).x, cmd)
     (*b).x.top = 0
@@ -552,9 +624,6 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
     vk_mem.w64(bi, 56, cv)
     vk_mem.cx(&(*b).x, vk_mem.X_CMD_BEGIN_RP, cmd, bi, 0, 0, 0, 0, 0, 0, 0, 0)
     vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_PIPE, cmd, 0, (*b).pipe_op.pipe, 0, 0, 0, 0, 0, 0, 0)
-    let ds: u64 = vk_mem.xsa(&(*b).x, 8)
-    vk_mem.w64(ds, 0, vk_mem.r64((*b).d.sets, s * 8))
-    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_DS, cmd, 0, (*b).playout, 0, 1, ds, 0, 0, 0, 0)
     let vp: u64 = vk_mem.xsa(&(*b).x, 24)
     vk_mem.wf(vp, 4, (*b).h as f64) // negative height = y flip (Vulkan 1.1), GL rasterisation rules
     vk_mem.wf(vp, 8, (*b).w as f64)
@@ -571,6 +640,37 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
     (*b).in_frame = true
 }
 
+// Bakes the current pass / fade / light state into a new UBO slice of the current frame slot and binds set 0 with its dynamic offset.
+fn bake(b: *mut VkBackend, cmd: u64) {
+    var n: usize = (*b).nslice
+    if n >= UBO_SLICES {
+        (*b).ubo_over = (*b).ubo_over + 1 as u64
+        n = UBO_SLICES - 1
+    } else {
+        (*b).nslice = n + 1
+    }
+    let off: usize = n * UBO_STRIDE
+    let dst: u64 = (*b).fs[(*b).cur].ubo.ptr + (off as u64)
+    rt.mem_copy(dst, (*b).base, vk_shaders.FRAME_SIZE)
+    vk_mem.wf(dst, vk_shaders.U_FADE, (*b).fade_a)
+    vk_mem.wf(dst, vk_shaders.U_FADE + 4, (*b).fade_inv)
+    vk_mem.wf(dst, vk_shaders.U_FADE + 8, (*b).h as f64)
+    vk_mem.wf(dst, vk_shaders.U_LIGHT, (*b).day)
+    vk_mem.wf(dst, vk_shaders.U_LIGHT + 4, (*b).tr)
+    vk_mem.wf(dst, vk_shaders.U_LIGHT + 8, (*b).tg)
+    vk_mem.wf(dst, vk_shaders.U_LIGHT + 12, (*b).tb)
+    var tf: u64 = 0
+    if (*b).trans { tf = 1 }
+    vk_mem.w32(dst, vk_shaders.U_TRANS, tf)
+    (*b).x.top = 0
+    let ds: u64 = vk_mem.xsa(&(*b).x, 8)
+    vk_mem.w64(ds, 0, vk_mem.r64((*b).d.sets, (*b).cur * 8))
+    let dyn: u64 = vk_mem.xsa(&(*b).x, 8)
+    vk_mem.w32(dyn, 0, off as u64)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_DS, cmd, 0, (*b).playout, 0, 1, ds, 1, dyn, 0, 0)
+    (*b).dirty = false
+}
+
 fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
     let b: *mut VkBackend = o as *mut VkBackend
     if !(*b).in_frame || h < 1 || h > (*b).mcap {
@@ -582,22 +682,15 @@ fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
     }
     let nidx: u64 = rt.ld64((*b).meshes, q + M_NIDX)
     let cmd: u64 = vk_frame.frame_cmd(&(*b).fr, (*b).cur)
+    if (*b).dirty {
+        bake(b, cmd)
+    }
     let p: u64 = (*b).push
     vk_mem.wf(p, 0, ox - (*b).cx)
     vk_mem.wf(p, 4, oy - (*b).cy)
     vk_mem.wf(p, 8, oz - (*b).cz)
-    var tf: f64 = 0.0
-    if (*b).trans { tf = 1.0 }
-    vk_mem.wf(p, 12, tf)
-    vk_mem.wf(p, 16, (*b).fade_a)
-    vk_mem.wf(p, 20, (*b).fade_inv)
-    vk_mem.wf(p, 24, 0.0)
-    vk_mem.wf(p, 28, 0.0)
-    vk_mem.wf(p, 32, (*b).day)
-    vk_mem.wf(p, 36, (*b).tr)
-    vk_mem.wf(p, 40, (*b).tg)
-    vk_mem.wf(p, 44, (*b).tb)
-    vk_mem.cx(&(*b).x, vk_mem.X_CMD_PUSH, cmd, (*b).playout, 0x11, 0, vk_desc.PUSH_BYTES, p, 0, 0, 0, 0)
+    vk_mem.w32(p, 12, 0) // u_pool: one draw per section
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_PUSH, cmd, (*b).playout, 0x1, 0, vk_desc.PUSH_BYTES, p, 0, 0, 0, 0)
     let buf: u64 = rt.ld64((*b).meshes, q + M_BUF)
     vk_mem.w64((*b).vb, 0, buf)
     vk_mem.w64((*b).vb, 8, 0)
@@ -620,6 +713,7 @@ fn be_set_pass(o: u64, pass: i32) {
         return
     }
     (*b).trans = tr
+    (*b).dirty = true
     var pipe: u64 = (*b).pipe_op.pipe
     if tr { pipe = (*b).pipe_tr.pipe }
     vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_PIPE, vk_frame.frame_cmd(&(*b).fr, (*b).cur), 0, pipe, 0, 0, 0, 0, 0, 0, 0)
@@ -633,6 +727,7 @@ fn be_set_fade(o: u64, a: i32, inv: i32) {
     let b: *mut VkBackend = o as *mut VkBackend
     (*b).fade_a = a as f64
     (*b).fade_inv = inv as f64
+    (*b).dirty = true
 }
 
 fn be_end(o: u64) {
@@ -715,6 +810,12 @@ fn vkbe_resize(b: *mut VkBackend, w: i32, h: i32) -> bool {
     return targets_make(b)
 }
 
+// vk_life.Life.on_rebuild adapter: set `l.ud = (address of the VkBackend)` and `l.on_rebuild = vkbe_on_rebuild`; the depth image (and colour,
+// framebuffer, read back) are re-created by vkbe_resize.
+fn vkbe_on_rebuild(ud: u64, w: i32, h: i32) {
+    let ok: bool = vkbe_resize(ud as *mut VkBackend, w, h)
+}
+
 fn vkbe_close(b: *mut VkBackend) {
     if !(*b).v.ok {
         return
@@ -733,6 +834,10 @@ fn vkbe_close(b: *mut VkBackend) {
         }
         targets_free(b)
         vk_mem.img_free(&(*b).x, &(*b).atlas)
+        vk_desc.bview_free(&(*b).x, (*b).gran_view)
+        vk_desc.bview_free(&(*b).x, (*b).org_view)
+        vk_mem.buf_free(&(*b).x, &(*b).gran)
+        vk_mem.buf_free(&(*b).x, &(*b).org)
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_op)
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_tr)
         if (*b).playout != 0 {
@@ -744,6 +849,14 @@ fn vkbe_close(b: *mut VkBackend) {
         vk_desc.desc_free(&(*b).x, &(*b).d)
         vk_frame.frames_free(&(*b).x, &(*b).fr)
         vk_mem.x_close(&(*b).x)
+    }
+    if (*b).life.ok {
+        vk_life.cache_save(&(*b).v, &(*b).life, (*b).cache_path)
+        vk_life.life_close(&(*b).v, &(*b).life)
+    }
+    if (*b).base != 0 {
+        rt.heap_free((*b).base, vk_shaders.FRAME_SIZE)
+        (*b).base = 0
     }
     vk.close(&(*b).v)
     (*b).ok = false
